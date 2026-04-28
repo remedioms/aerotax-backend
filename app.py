@@ -568,26 +568,31 @@ def parse_dienstplan_mit_ki(pdf_bytes_list):
 
     # ── FOLLOWME DIENSTPLANAUSWERTUNG (preferred — has pre-calculated values) ──
     if 'FollowMe' in combined or 'Dienstplanauswertung' in combined:
+        # Base values
         result = {
             'fahr_tage':     find_int(r'aufgesucht an\s+(\d+)\s+Tagen'),
             'km':            find_int(r'aufgesucht an\s+\d+\s+Tagen\s+(\d+)\s+km'),
             'arbeitstage':   find_int(r'Arbeitstage:\s+(\d+)'),
             'hotel_naechte': find_int(r'Hotelaufenthalte:\s+(\d+)'),
-            'vma_72_tage':   find_int(r'Zeile 72[^\d]+(\d+)\s+Tage'),
-            'vma_73_tage':   find_int(r'Zeile 73[^\d]+(\d+)\s+Tage'),
-            'vma_74_tage':   find_int(r'Zeile 74[^\d]+(\d+)\s+Tag'),
-            'vma_72':        find(r'Zeile 72[^€]+\s+(\d+)\s+Tage\s+([\d\.]+,\d{2})\s*€'),
-            'vma_73':        find(r'Zeile 73[^\d]+\d+\s+Tage\s+([\d\.]+,\d{2})\s*€'),
-            'vma_74':        find(r'Zeile 74[^\d]+\d+\s+Tag\s+([\d\.]+,\d{2})\s*€'),
-            'vma_aus':       find(r'Zeile 76[^\d]+([\d\.]+,\d{2})\s*€'),
+            'vma_72_tage': 0, 'vma_73_tage': 0, 'vma_74_tage': 0,
+            'vma_72': 0.0, 'vma_73': 0.0, 'vma_74': 0.0,
+            'vma_aus': find(r'Zeile 76[^\d]+([\d\.]+,\d{2})\s*€'),
             'ausland_touren': [],
         }
-        # vma_72 needs special handling (pattern returns second group)
-        m72 = re.search(r'Zeile 72[^\d]+(\d+)\s+Tage\s+([\d\.]+,\d{2})\s*€', combined, re.IGNORECASE)
+        # Z72: skip description "mehr als 8 Stunden" using DOTALL
+        m72 = re.search(r'Zeile 72:.*?(\d+)\s+Tage\s+([\d\.]+,\d{2})\s*€', combined, re.IGNORECASE|re.DOTALL)
         if m72:
             result['vma_72_tage'] = int(m72.group(1))
             result['vma_72'] = float(m72.group(2).replace('.','').replace(',','.'))
-        m74 = re.search(r'Zeile 74[^\d]+(\d+)\s+Tag[^\d]+([\d\.]+,\d{2})\s*€', combined, re.IGNORECASE)
+        # Z73
+        m73 = re.search(r'Zeile 73:.*?(\d+)\s+Tage\s+([\d\.]+,\d{2})\s*€', combined, re.IGNORECASE|re.DOTALL)
+        if not m73:
+            m73 = re.search(r'Zeile 73[^\d]+(\d+)\s+Tage[^\d]+([\d\.]+,\d{2})\s*€', combined, re.IGNORECASE)
+        if m73:
+            result['vma_73_tage'] = int(m73.group(1))
+            result['vma_73'] = float(m73.group(2).replace('.','').replace(',','.'))
+        # Z74: skip description "24 Stunden"
+        m74 = re.search(r'Zeile 74:.*?(\d+)\s+Tag\s+([\d\.]+,\d{2})\s*€', combined, re.IGNORECASE|re.DOTALL)
         if m74:
             result['vma_74_tage'] = int(m74.group(1))
             result['vma_74'] = float(m74.group(2).replace('.','').replace(',','.'))
@@ -682,66 +687,71 @@ def parse_optionale_belege(files):
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
     def file_to_claude_content(file_bytes, filename=''):
-        """Converts file bytes to Claude message content (text or image)."""
-        # Detect file type
+        """Converts file bytes to Claude message content block(s)."""
         ext = filename.lower().split('.')[-1] if '.' in filename else ''
-        
-        # Try as image first (JPG, PNG, WEBP, GIF)
-        img_types = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 
-                     'png': 'image/png', 'webp': 'image/webp', 'gif': 'image/gif'}
-        if ext in img_types:
-            b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-            return {
-                'type': 'image',
-                'source': {'type': 'base64', 'media_type': img_types[ext], 'data': b64}
-            }
-        
-        # Check magic bytes for image
-        if file_bytes[:3] == b'\xff\xd8\xff':  # JPEG
-            b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-            return {'type':'image','source':{'type':'base64','media_type':'image/jpeg','data':b64}}
-        if file_bytes[:8] == b'\x89PNG\r\n\x1a\n':  # PNG
-            b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-            return {'type':'image','source':{'type':'base64','media_type':'image/png','data':b64}}
-        
-        # Try as PDF
+        b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+
+        # JPEG / JPG
+        if file_bytes[:3] == b'\xff\xd8\xff' or ext in ('jpg','jpeg'):
+            return [{'type':'image','source':{'type':'base64','media_type':'image/jpeg','data':b64}}]
+        # PNG
+        if file_bytes[:8] == b'\x89PNG\r\n\x1a\n' or ext == 'png':
+            return [{'type':'image','source':{'type':'base64','media_type':'image/png','data':b64}}]
+        # WEBP
+        if file_bytes[8:12] == b'WEBP' or ext == 'webp':
+            return [{'type':'image','source':{'type':'base64','media_type':'image/webp','data':b64}}]
+        # PDF — send as document block (Claude can read scanned PDFs visually)
+        if file_bytes[:4] == b'%PDF' or ext == 'pdf':
+            return [{'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}}]
+        # HEIC/HEIF from iPhone — send as document, Claude handles it
+        if ext in ('heic','heif'):
+            return [{'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}}]
+        # Fallback: try to extract text from PDF, else send as image
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 text = ' '.join(p.extract_text() or '' for p in pdf.pages)
-                return {'type': 'text', 'text': text[:3000]}
+                if text.strip():
+                    return [{'type':'text','text':text[:4000]}]
         except:
             pass
-        
-        # Fallback: try as plain text
-        try:
-            return {'type': 'text', 'text': file_bytes.decode('utf-8', errors='ignore')[:3000]}
-        except:
-            return {'type': 'text', 'text': '[Datei konnte nicht gelesen werden]'}
+        # Last resort: treat as image
+        return [{'type':'image','source':{'type':'base64','media_type':'image/jpeg','data':b64}}]
 
     for key, info in WISO_PFADE.items():
         if not files.get(key):
             continue
 
         content_blocks = []
+        n_files = len(files[key])
         for i, file_bytes in enumerate(files[key]):
-            block = file_to_claude_content(file_bytes)
-            content_blocks.append(block)
+            blocks = file_to_claude_content(file_bytes)
+            content_blocks.extend(blocks)
 
         if not content_blocks:
             continue
 
         content_blocks.append({
             'type': 'text',
-            'text': f"""Analysiere diesen Beleg für: {info['name']}
-WISO-Eintrag: {info['wiso']}
+            'text': f"""Du siehst {n_files} Beleg(e)/Rechnung(en) für: {info['name']}
 
-Extrahiere:
-1. Den relevanten Jahresbetrag (Gesamtsumme)
-2. Zeitraum (z.B. "2025" oder "Jan-Dez 2025")
-3. Kurze Beschreibung (max. 8 Wörter)
+Deine Aufgabe: Berechne den JAHRESGESAMTBETRAG für 2025.
 
-Antworte NUR mit JSON (keine Backticks):
-{{"betrag": 245.80, "zeitraum": "2025", "beschreibung": "Monatliche Beiträge 2025"}}"""
+Denke Schritt für Schritt:
+1. Lies jeden Beleg und notiere Betrag + Zeitraum (welcher Monat/welche Monate)
+2. Wenn mehrere Anbieter oder Monate: addiere alle Beträge
+3. Wenn nur einzelne Monate vorhanden: addiere nur die vorhandenen Monate (kein Hochrechnen)
+4. Gib den Gesamtbetrag aller Belege zusammen an
+
+Beispiele:
+- Vodafone Jan-Jun (6×32€=192€) + O2 Jul-Dez (6×28€=168€) → betrag: 360.00
+- 3 Einzelrechnungen: 45€ + 38€ + 52€ → betrag: 135.00
+- Eine Jahresrechnung 480€ → betrag: 480.00
+- Nur November-Rechnung 39€ → betrag: 39.00
+
+Antworte NUR mit JSON, keine Erklärung, keine Backticks:
+{{"betrag": 360.00, "zeitraum": "2025", "beschreibung": "Vodafone + O2 Jan-Dez"}}
+
+Wenn du keinen klaren Betrag erkennst: {{"betrag": 0}}"""
         })
 
         try:
@@ -914,7 +924,7 @@ def berechne(form, files):
             # Check if all 12 months present
             months_found = len(se_data.get('abrechnungen', []))
             if months_found < 12:
-                missing.append(f'Streckeneinsatz: nur {months_found} von 12 Monaten gefunden')
+                notes.append(f'Streckeneinsatz: {months_found} von 12 Monaten hochgeladen — fehlende Monate wurden nicht berücksichtigt')
     else:
         missing.append('Streckeneinsatz-Abrechnungen (nicht hochgeladen)')
 
