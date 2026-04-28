@@ -271,11 +271,11 @@ def demo():
         'uploaded_summary': 'Demo-Modus — keine echten Dokumente',
         'not_uploaded': '',
         'abrechnungen': [
-            {'erstellt': f'{m:02d}.2025', 'bezeichnung': f'Monat {m}',
+            {'erstellt': f'{mon:02d}.2025', 'bezeichnung': f'Monat {mon}',
              'gesamt': round(spesen_g/12, 2),
              'steuerpflichtig': round(spesen_s/12, 2),
              'steuerfrei': round((spesen_g-spesen_s)/12, 2)}
-            for m in range(1, 13)
+            for mon in range(1, 13)
         ],
     }
 
@@ -1199,8 +1199,7 @@ def erstelle_pdf(d):
                 f"⚠️ {note}",
                 ps("note_warn", fontSize=9, textColor=HexColor("#fbbf24"),
                    fontName="Helvetica", leading=13, leftIndent=8,
-                   borderPad=6, borderColor=HexColor("#fbbf24"),
-                   borderWidth=0.5, backColor=HexColor("#1a1500"))))
+                   backColor=HexColor("#1a1500"))))
             S.append(Spacer(1, 0.15*cm))
         S.append(Spacer(1, 0.2*cm))
 
@@ -1209,7 +1208,7 @@ def erstelle_pdf(d):
 
     auf = [
         [Paragraph("Position", TH), Paragraph("Grundlage", TH), Paragraph("Betrag", THR)],
-        [Paragraph(f"Fahrtkosten Homebase ({d['km']} km × {d['fahr_tage']} Tage, einfache Strecke)", TD),
+        [Paragraph(f"Fahrtkosten Homebase ({d.get('km',0)} km × {d.get('fahr_tage',0)} Tage, einfache Strecke)", TD),
          Paragraph(f"0,30 €/km bis 20 km + 0,38 €/km ab 20 km", SM),
          Paragraph(eur(d['fahr']), TDR)],
         [Paragraph(f"Reinigungskosten ({d['arbeitstage']} Arbeitstage × 1,60 €)", TD),
