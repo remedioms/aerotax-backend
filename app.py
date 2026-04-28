@@ -598,6 +598,43 @@ def parse_dienstplan_mit_ki(pdf_bytes_list):
             result['vma_74'] = float(m74.group(2).replace('.','').replace(',','.'))
         
         if result.get('arbeitstage', 0) > 0:
+            # If ALL VMA values still 0, use Claude Vision as fallback
+            all_vma_zero = (result.get('vma_72',0)==0 and result.get('vma_73',0)==0
+                           and result.get('vma_74',0)==0 and result.get('vma_aus',0)==0)
+            if all_vma_zero and ANTHROPIC_KEY:
+                try:
+                    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+                    content = []
+                    for pb in pdf_bytes_list[:2]:
+                        b64 = base64.standard_b64encode(pb).decode()
+                        content.append({'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}})
+                    vma_prompt = (
+                        "Das ist eine Lufthansa FollowMe Dienstplanauswertung.\n"
+                        "Finde die Zeilen 72, 73, 74, 76 und extrahiere:\n"
+                        "Zeile 72: Anzahl Tage und Euro-Betrag\n"
+                        "Zeile 73: Anzahl Tage und Euro-Betrag\n"
+                        "Zeile 74: Anzahl Tage und Euro-Betrag\n"
+                        "Zeile 76: Euro-Betrag VMA Ausland\n\n"
+                        'Antworte NUR mit JSON (kein Text davor/danach):\n'
+                        '{"vma_72_tage":5,"vma_72":70.0,"vma_73_tage":11,"vma_73":154.0,'
+                        '"vma_74_tage":1,"vma_74":28.0,"vma_aus":4794.0}'
+                    )
+                    content.append({'type':'text','text':vma_prompt})
+                    resp = client.messages.create(
+                        model='claude-sonnet-4-20250514',
+                        max_tokens=300,
+                        messages=[{'role':'user','content':content}]
+                    )
+                    raw = re.sub(r'```json|```','',resp.content[0].text.strip()).strip()
+                    vma_data = json.loads(raw)
+                    for k,v in vma_data.items():
+                        if k.endswith('_tage'):
+                            result[k] = int(float(v))
+                        elif k.startswith('vma_'):
+                            result[k] = float(v)
+                    print(f"VMA Vision: {vma_data}")
+                except Exception as e:
+                    print(f"VMA Vision error: {e}")
             return result
 
     # ── LUFTHANSA FLUGSTUNDEN-ÜBERSICHTEN (raw data) ──
@@ -1385,25 +1422,18 @@ def erstelle_pdf(d):
     S.append(Spacer(1, 0.8*cm))
     S.append(HRFlowable(width="30%", thickness=0.4, color=LINE,
         hAlign='CENTER', spaceAfter=10))
+    # Erstellt am + optional fehlende Dokumente direkt darunter — gleiche Schrift
+    _not_upl = d.get('not_uploaded', '')
+    _show_warn = bool(_not_upl and 'Alle Pflichtdokumente' not in _not_upl)
     S.append(Paragraph(
         f"Erstellt am {d.get('datum','')}  ·  AeroTAX  ·  aerosteuer.de",
         ps("cf", fontSize=8, textColor=TEXT3, fontName="Helvetica",
-           leading=12, alignment=TA_CENTER)))
-
-
-
-
-    # ════════════════════════════════════════════════
-
-    # Fehlende Dokumente — unten auf Deckblatt
-    _not_upl = d.get('not_uploaded', '')
-    if _not_upl and 'Alle Pflichtdokumente' not in _not_upl:
-        S.append(Spacer(1, 0.4*cm))
-        S.append(HRFlowable(width='100%', thickness=0.3, color=LINE, spaceAfter=6))
+           leading=12, alignment=TA_CENTER, spaceAfter=0)))
+    if _show_warn:
         S.append(Paragraph(
             f'Fehlende Dokumente: {_not_upl}',
-            ps('warn_miss', fontSize=8, textColor=TEXT2,
-               fontName='Helvetica', leading=12)))
+            ps('warn_miss', fontSize=8, textColor=TEXT3,
+               fontName='Helvetica', leading=12, alignment=TA_CENTER)))
     # SEITE 2 — REISEKOSTEN & WEITERE KOSTEN
     # ════════════════════════════════════════════════
     S.append(PageBreak())
