@@ -198,7 +198,7 @@ def demo():
     netto       = round(gesamt - ag_z17 - z77, 2)
 
     result = {
-        'name': 'Beispiel Flugbegleiter',
+        'name': 'Max Mustermann',
         'year': 2025,
         'datum': datetime.now().strftime('%d.%m.%Y'),
         'km': km, 'fahr_tage': fahr_tage,
@@ -655,21 +655,23 @@ def _fallback_streck():
 # ══════════════════════════════════════════════════════════════════
 
 def erstelle_pdf(d):
-    NAVY  = HexColor("#0b1f3a")
-    LIGHT = HexColor("#e8eef5")
-    GREEN = HexColor("#0d6b3a")
-    GREENL= HexColor("#e6f4ed")
-    RED   = HexColor("#b91c1c")
-    REDL  = HexColor("#fee2e2")
-    AMBER = HexColor("#92400e")
-    AMBERL= HexColor("#fffbeb")
-    GOLD  = HexColor("#d4a017")
-    GREY  = HexColor("#f8fafd")
-    GREYB = HexColor("#e2e8f0")
-    TEXT  = HexColor("#0b1f3a")
-    TEXT2 = HexColor("#4a5f7a")
-    BLUE  = HexColor("#1a56db")
-    WHITE = white
+    # Dark premium palette matching website
+    NAVY  = HexColor("#080c18")   # page background
+    CARD  = HexColor("#0f1829")   # card background
+    LIGHT = HexColor("#1a2744")   # lighter card
+    GREEN = HexColor("#34d399")   # success green
+    GREENL= HexColor("#0a2a1f")   # green tint
+    RED   = HexColor("#f87171")   # error red
+    REDL  = HexColor("#2a0f0f")   # red tint
+    AMBER = HexColor("#fbbf24")   # gold/amber
+    AMBERL= HexColor("#1f1800")   # amber tint
+    GOLD  = HexColor("#fbbf24")
+    GREY  = HexColor("#0d1526")   # subtle row
+    GREYB = HexColor("#1e2d4a")   # border
+    TEXT  = HexColor("#e2e8f0")   # main text
+    TEXT2 = HexColor("#94a3b8")   # muted text
+    BLUE  = HexColor("#60a5fa")   # accent blue
+    WHITE = HexColor("#f1f5f9")   # near white
 
     base = getSampleStyleSheet()
     def ps(n,**kw): return ParagraphStyle(n,parent=base["Normal"],**kw)
@@ -686,8 +688,8 @@ def erstelle_pdf(d):
     TWISO= ps("twiso",fontSize=8,textColor=BLUE,  fontName="Helvetica-Bold",  leading=11, alignment=TA_RIGHT)
     SM   = ps("sm",  fontSize=8, textColor=TEXT2, fontName="Helvetica",       leading=11)
     NOTE = ps("note",fontSize=7.5,textColor=TEXT2,fontName="Helvetica",       leading=11)
-    H1   = ps("h1",  fontSize=20,textColor=NAVY,  fontName="Helvetica-Bold",  leading=24, spaceAfter=4)
-    H2   = ps("h2",  fontSize=12,textColor=NAVY,  fontName="Helvetica-Bold",  leading=16, spaceBefore=14, spaceAfter=6)
+    H1   = ps("h1",  fontSize=20,textColor=HexColor("#f1f5f9"),  fontName="Helvetica-Bold",  leading=24, spaceAfter=4)
+    H2   = ps("h2",  fontSize=12,textColor=HexColor("#60a5fa"),  fontName="Helvetica-Bold",  leading=16, spaceBefore=14, spaceAfter=6)
 
     def eur(n):
         v=float(n)
@@ -696,16 +698,25 @@ def erstelle_pdf(d):
 
     def on_page(canvas, doc):
         canvas.saveState()
-        canvas.setFillColor(NAVY)
-        canvas.rect(0, A4[1]-0.75*cm, A4[0], 0.75*cm, fill=1, stroke=0)
-        canvas.setFillColor(WHITE)
+        canvas.setFillColor(HexColor("#080c18"))
+        canvas.rect(0, A4[1]-0.85*cm, A4[0], 0.85*cm, fill=1, stroke=0)
+        # Gradient-like accent line
+        canvas.setFillColor(HexColor("#f97316"))
+        canvas.rect(0, A4[1]-0.85*cm, A4[0]*0.33, 0.03*cm, fill=1, stroke=0)
+        canvas.setFillColor(HexColor("#ec4899"))
+        canvas.rect(A4[0]*0.33, A4[1]-0.85*cm, A4[0]*0.33, 0.03*cm, fill=1, stroke=0)
+        canvas.setFillColor(HexColor("#2563eb"))
+        canvas.rect(A4[0]*0.66, A4[1]-0.85*cm, A4[0]*0.34, 0.03*cm, fill=1, stroke=0)
+        canvas.setFillColor(HexColor("#e2e8f0"))
         canvas.setFont("Helvetica-Bold", 8)
-        canvas.drawString(1.5*cm, A4[1]-0.5*cm, "AEROTAX — Werbungskosten-Auswertung 2025")
+        canvas.drawString(1.5*cm, A4[1]-0.58*cm, "AEROTAX — Werbungskosten-Auswertung 2025")
         canvas.setFont("Helvetica", 8)
         canvas.drawRightString(A4[0]-1.5*cm, A4[1]-0.5*cm, f"Seite {doc.page}  |  aerotax.de")
-        canvas.setFillColor(GREY)
+        canvas.setFillColor(HexColor("#080c18"))
+        canvas.rect(0, 0, A4[0], A4[1], fill=1, stroke=0)
+        canvas.setFillColor(HexColor("#0d1526"))
         canvas.rect(0, 0, A4[0], 0.65*cm, fill=1, stroke=0)
-        canvas.setFillColor(TEXT2)
+        canvas.setFillColor(HexColor("#94a3b8"))
         canvas.setFont("Helvetica", 6.5)
         canvas.drawString(1.5*cm, 0.22*cm,
             "Alle Angaben ohne Gewähr. Bei steuerrechtlichen Fragen wenden Sie sich an einen Steuerberater.")
@@ -736,7 +747,7 @@ def erstelle_pdf(d):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
         leftMargin=1.8*cm, rightMargin=1.8*cm,
-        topMargin=1.3*cm, bottomMargin=1.3*cm)
+        topMargin=1.5*cm, bottomMargin=1.3*cm)
     S = []
 
     # ── DECKBLATT ────────────────────────────────────────────────
@@ -745,7 +756,7 @@ def erstelle_pdf(d):
     S.append(Paragraph(
         f"{d['name']} — Anlage N / Werbungskosten · Deutsche Lufthansa AG",
         ps("sub", fontSize=10, textColor=TEXT2, fontName="Helvetica", leading=14)))
-    S.append(HRFlowable(width="100%", thickness=1.5, color=NAVY, spaceAfter=16))
+    S.append(HRFlowable(width="100%", thickness=1.5, color=HexColor("#1e2d4a"), spaceAfter=16))
 
     # ── SEKTION 1: AUFWENDUNGEN ───────────────────────────────────
     S.append(Paragraph("1. Errechnete Aufwendungen (aus Dienstplan-Übersichten)", H2))
