@@ -1119,6 +1119,15 @@ def _fallback_streck():
 
 
 
+
+
+
+
+
+
+
+
+
 def erstelle_pdf(d):
     # ── PALETTE: minimal, elegant ────────────────────────────
     BG     = HexColor("#060a16")
@@ -1278,7 +1287,7 @@ def erstelle_pdf(d):
     # ════════════════════════════════════════════════
     # SEITE 1 — DECKBLATT
     # ════════════════════════════════════════════════
-    S.append(Spacer(1, 2.8*cm))
+    S.append(Spacer(1, 1.8*cm))
 
     # AeroTAX logo — large, gradient colored via font coloring
     S.append(Paragraph(
@@ -1359,7 +1368,7 @@ def erstelle_pdf(d):
         ]))
         S.append(wrap)
 
-    S.append(Spacer(1, 2.2*cm))
+    S.append(Spacer(1, 0.8*cm))
     S.append(HRFlowable(width="30%", thickness=0.4, color=LINE,
         hAlign='CENTER', spaceAfter=10))
     S.append(Paragraph(
@@ -1367,7 +1376,20 @@ def erstelle_pdf(d):
         ps("cf", fontSize=8, textColor=TEXT3, fontName="Helvetica",
            leading=12, alignment=TA_CENTER)))
 
+
+
+
     # ════════════════════════════════════════════════
+
+    # Fehlende Dokumente — unten auf Deckblatt
+    _not_upl = d.get('not_uploaded', '')
+    if _not_upl and 'Alle Pflichtdokumente' not in _not_upl:
+        S.append(Spacer(1, 0.4*cm))
+        S.append(HRFlowable(width='100%', thickness=0.3, color=LINE, spaceAfter=6))
+        S.append(Paragraph(
+            f'Fehlende Dokumente: {_not_upl}',
+            ps('warn_miss', fontSize=8, textColor=TEXT2,
+               fontName='Helvetica', leading=12)))
     # SEITE 2 — REISEKOSTEN & WEITERE KOSTEN
     # ════════════════════════════════════════════════
     S.append(PageBreak())
