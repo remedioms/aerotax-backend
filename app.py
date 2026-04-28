@@ -18,8 +18,12 @@ from flask_cors import CORS
 import stripe
 import anthropic
 import pdfplumber
-from PIL import Image
 import base64
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib.colors import HexColor, white
@@ -247,7 +251,7 @@ def demo():
         ag_z17 = r(200, 450); spesen_g = r(4000, 7000); spesen_s = r(800, 2000)
         z77 = round(spesen_g - spesen_s, 2); netto = round(gesamt - ag_z17 - z77, 2)
         name = 'Max Mustermann'
-    r = r if 'r' in dir() else lambda a,b: round((a+b)/2, 2)
+    r = lambda a,b: round((a+b)/2, 2)  # safe fallback
     result = {
         'name': name,
         'year': 2025,
@@ -906,8 +910,7 @@ def erstelle_pdf(d):
         canvas.drawString(1.5*cm, A4[1]-0.58*cm, "AEROTAX — Werbungskosten-Auswertung 2025")
         canvas.setFont("Helvetica", 8)
         canvas.drawRightString(A4[0]-1.5*cm, A4[1]-0.5*cm, f"Seite {doc.page}  |  aerotax.de")
-        canvas.setFillColor(HexColor("#080c18"))
-        canvas.rect(0, 0, A4[0], A4[1], fill=1, stroke=0)
+        # Footer only — no full-page overlay
         canvas.setFillColor(HexColor("#0d1526"))
         canvas.rect(0, 0, A4[0], 0.65*cm, fill=1, stroke=0)
         canvas.setFillColor(HexColor("#94a3b8"))
