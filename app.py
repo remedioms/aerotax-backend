@@ -736,6 +736,7 @@ Antworte NUR mit JSON (keine Backticks):
                 'betrag': float(parsed.get('betrag', 0)),
                 'zeitraum': parsed.get('zeitraum', '2025'),
                 'beschreibung': parsed.get('beschreibung', ''),
+                'file_bytes_list': files[key],  # Store raw files for PDF embedding
             })
         except Exception as e:
             print(f'Optional doc {key} error: {e}')
@@ -744,6 +745,7 @@ Antworte NUR mit JSON (keine Backticks):
                 'wiso': info['wiso'], 'hint': info['hint'],
                 'betrag': 0, 'zeitraum': '2025',
                 'beschreibung': 'Betrag konnte nicht extrahiert werden',
+                'file_bytes_list': files[key],
             })
 
     return results
@@ -1087,420 +1089,454 @@ def _fallback_streck():
 #  Korrekter Aufbau nach FollowMe-Methode
 # ══════════════════════════════════════════════════════════════════
 
+
 def erstelle_pdf(d):
-    # Dark premium palette matching website
-    NAVY  = HexColor("#080c18")   # page background
-    CARD  = HexColor("#0f1829")   # card background
-    LIGHT = HexColor("#1a2744")   # lighter card
-    GREEN = HexColor("#34d399")   # success green
-    GREENL= HexColor("#0a2a1f")   # green tint
-    RED   = HexColor("#f87171")   # error red
-    REDL  = HexColor("#2a0f0f")   # red tint
-    AMBER = HexColor("#fbbf24")   # gold/amber
-    AMBERL= HexColor("#1f1800")   # amber tint
-    GOLD  = HexColor("#fbbf24")
-    GREY  = HexColor("#0d1526")   # subtle row
-    GREYB = HexColor("#1e2d4a")   # border
-    TEXT  = HexColor("#e2e8f0")   # main text
-    TEXT2 = HexColor("#94a3b8")   # muted text
-    BLUE  = HexColor("#60a5fa")   # accent blue
-    WHITE = HexColor("#f1f5f9")   # near white
-    TEXT2 = HexColor("#64748b")   # very muted text
+    BG    = HexColor("#060a16")
+    NAVY  = HexColor("#0a1628")
+    CARD  = HexColor("#0d1a2e")
+    CARD2 = HexColor("#0f1e35")
+    BORDER= HexColor("#1e3050")
+    G1=HexColor("#f97316"); G2=HexColor("#ec4899")
+    G3=HexColor("#8b5cf6"); G4=HexColor("#2563eb")
+    BLUE  = HexColor("#2563eb"); BLUE2 = HexColor("#60a5fa")
+    TEXT  = HexColor("#f1f5f9"); TEXT2 = HexColor("#94a3b8")
+    TEXT3 = HexColor("#64748b")
+    GREEN = HexColor("#34d399"); GREENMID = HexColor("#10b981")
+    GREENL= HexColor("#052818")
+    RED   = HexColor("#f87171"); REDL = HexColor("#1f0808")
+    AMBER = HexColor("#fbbf24"); AMBERL = HexColor("#1a1200")
+    WHITE = HexColor("#ffffff"); OFF = HexColor("#e2e8f0")
+    NAVY_HEADER = HexColor("#071120")
 
     base = getSampleStyleSheet()
-    def ps(n,**kw): return ParagraphStyle(n,parent=base["Normal"],**kw)
-
-    TH   = ps("th",  fontSize=9, textColor=WHITE, fontName="Helvetica-Bold",  leading=12)
-    THR  = ps("thr", fontSize=9, textColor=WHITE, fontName="Helvetica-Bold",  leading=12, alignment=TA_RIGHT)
-    TD   = ps("td",  fontSize=9, textColor=TEXT,  fontName="Helvetica",       leading=12)
-    TDB  = ps("tdb", fontSize=9, textColor=TEXT,  fontName="Helvetica-Bold",  leading=12)
-    TDR  = ps("tdr", fontSize=9, textColor=TEXT,  fontName="Helvetica",       leading=12, alignment=TA_RIGHT)
-    TDRB = ps("tdrb",fontSize=9, textColor=TEXT,  fontName="Helvetica-Bold",  leading=12, alignment=TA_RIGHT)
-    TRD  = ps("trd", fontSize=9, textColor=RED,   fontName="Helvetica",       leading=12, alignment=TA_RIGHT)
-    TGN  = ps("tgn", fontSize=11,textColor=GREEN, fontName="Helvetica-Bold",  leading=14, alignment=TA_RIGHT)
-    TGD  = ps("tgd", fontSize=9, textColor=GREEN, fontName="Helvetica-Bold",  leading=12, alignment=TA_RIGHT)
-    TWISO= ps("twiso",fontSize=8,textColor=BLUE,  fontName="Helvetica-Bold",  leading=11, alignment=TA_RIGHT)
-    SM   = ps("sm",  fontSize=8, textColor=TEXT2, fontName="Helvetica",       leading=11)
-    NOTE = ps("note",fontSize=7.5,textColor=TEXT2,fontName="Helvetica",       leading=11)
-    H1   = ps("h1",  fontSize=20,textColor=HexColor("#f1f5f9"),  fontName="Helvetica-Bold",  leading=24, spaceAfter=4)
-    H2   = ps("h2",  fontSize=12,textColor=HexColor("#60a5fa"),  fontName="Helvetica-Bold",  leading=16, spaceBefore=14, spaceAfter=6)
+    def ps(n, **kw): return ParagraphStyle(n, parent=base["Normal"], **kw)
 
     def eur(n):
-        v=float(n)
-        s=f"{abs(v):,.2f}".replace(",","X").replace(".",",").replace("X",".")
-        return ("- " if v<0 else "")+s+" €"
+        v = float(n or 0)
+        s = f"{abs(v):,.2f}".replace(",","X").replace(".",",").replace("X",".")
+        return ("− " if v < 0 else "") + s + " €"
 
-    def on_page(canvas, doc):
-        canvas.saveState()
-        canvas.setFillColor(HexColor("#080c18"))
-        canvas.rect(0, A4[1]-0.85*cm, A4[0], 0.85*cm, fill=1, stroke=0)
-        # Gradient-like accent line
-        canvas.setFillColor(HexColor("#f97316"))
-        canvas.rect(0, A4[1]-0.85*cm, A4[0]*0.33, 0.03*cm, fill=1, stroke=0)
-        canvas.setFillColor(HexColor("#ec4899"))
-        canvas.rect(A4[0]*0.33, A4[1]-0.85*cm, A4[0]*0.33, 0.03*cm, fill=1, stroke=0)
-        canvas.setFillColor(HexColor("#2563eb"))
-        canvas.rect(A4[0]*0.66, A4[1]-0.85*cm, A4[0]*0.34, 0.03*cm, fill=1, stroke=0)
-        canvas.setFillColor(HexColor("#e2e8f0"))
-        canvas.setFont("Helvetica-Bold", 8)
-        canvas.drawString(1.5*cm, A4[1]-0.58*cm, "AEROTAX — Werbungskosten-Auswertung 2025")
-        canvas.setFont("Helvetica", 8)
-        canvas.drawRightString(A4[0]-1.5*cm, A4[1]-0.5*cm, f"Seite {doc.page}  |  aerotax.de")
-        # Footer only — no full-page overlay
-        canvas.setFillColor(HexColor("#0d1526"))
-        canvas.rect(0, 0, A4[0], 0.65*cm, fill=1, stroke=0)
-        canvas.setFillColor(HexColor("#94a3b8"))
-        canvas.setFont("Helvetica", 6.5)
-        canvas.drawString(1.5*cm, 0.22*cm,
-            "Alle Angaben ohne Gewähr. Bei steuerrechtlichen Fragen wenden Sie sich an einen Steuerberater.")
-        canvas.restoreState()
+    def lbl(text):
+        return Paragraph(text.upper(), ps(f"L{id(text)}",
+            fontSize=7, textColor=TEXT3, fontName="Helvetica-Bold",
+            leading=9, spaceBefore=22, spaceAfter=8, letterSpacing=1.8))
 
-    def tbl(rows, widths, header_bg=NAVY, total_row=-1, red_rows=None, green_rows=None):
-        t = Table(rows, colWidths=widths)
-        cmds = [
-            ("BACKGROUND",    (0,0),(-1, 0), header_bg),
-            ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE,GREY]),
-            ("TOPPADDING",    (0,0),(-1,-1), 8),
-            ("BOTTOMPADDING", (0,0),(-1,-1), 8),
-            ("LEFTPADDING",   (0,0),(-1,-1), 12),
-            ("RIGHTPADDING",  (0,0),(-1,-1), 12),
-            ("LINEBELOW",     (0,0),(-1,-1), 0.5, GREYB),
-            ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+    TH  = ps("TH", fontSize=7.5,textColor=TEXT3, fontName="Helvetica-Bold",leading=10)
+    THR = ps("THR",fontSize=7.5,textColor=TEXT3, fontName="Helvetica-Bold",leading=10,alignment=TA_RIGHT)
+    TD  = ps("TD", fontSize=9,  textColor=TEXT,  fontName="Helvetica",     leading=12)
+    TDB = ps("TDB",fontSize=9,  textColor=WHITE, fontName="Helvetica-Bold",leading=12)
+    TDR = ps("TDR",fontSize=9,  textColor=TEXT,  fontName="Helvetica",     leading=12,alignment=TA_RIGHT)
+    TDRB= ps("TDRB",fontSize=9, textColor=WHITE, fontName="Helvetica-Bold",leading=12,alignment=TA_RIGHT)
+    TGNO= ps("TGNO",fontSize=14,textColor=GREEN, fontName="Helvetica-Bold",leading=18,alignment=TA_RIGHT)
+    TRD = ps("TRD",fontSize=9,  textColor=RED,   fontName="Helvetica",     leading=12,alignment=TA_RIGHT)
+    TGRN= ps("TGRN",fontSize=9, textColor=GREEN, fontName="Helvetica",     leading=12,alignment=TA_RIGHT)
+    TGRNB=ps("TGRNB",fontSize=9,textColor=GREEN, fontName="Helvetica-Bold",leading=12,alignment=TA_RIGHT)
+    TRED= ps("TRED",fontSize=9, textColor=RED,   fontName="Helvetica-Bold",leading=12,alignment=TA_RIGHT)
+    SM  = ps("SM", fontSize=8,  textColor=TEXT2, fontName="Helvetica",     leading=11)
+    SMC = ps("SMC",fontSize=8,  textColor=TEXT3, fontName="Helvetica",     leading=11,alignment=TA_CENTER)
+
+    def tbl(rows, widths, total_row=-1, red_rows=None, green_rows=None):
+        t = Table(rows, colWidths=widths, repeatRows=1)
+        s = [
+            ("BACKGROUND",    (0,0),(-1,0), HexColor("#081020")),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[CARD,CARD2]),
+            ("TOPPADDING",    (0,0),(-1,-1),9),
+            ("BOTTOMPADDING", (0,0),(-1,-1),9),
+            ("LEFTPADDING",   (0,0),(-1,-1),11),
+            ("RIGHTPADDING",  (0,0),(-1,-1),11),
+            ("VALIGN",        (0,0),(-1,-1),"MIDDLE"),
+            ("LINEBELOW",     (0,0),(-1,-1),0.3,BORDER),
         ]
-        if total_row >= 0:
-            cmds += [("BACKGROUND",(0,total_row),(-1,total_row), LIGHT),
-                     ("LINEABOVE", (0,total_row),(-1,total_row), 1.5, NAVY)]
-        for r in (red_rows or []):
-            cmds.append(("BACKGROUND",(0,r),(-1,r), REDL))
-        for r in (green_rows or []):
-            cmds.append(("BACKGROUND",(0,r),(-1,r), GREENL))
-        t.setStyle(TableStyle(cmds))
+        if total_row > 0:
+            s += [("BACKGROUND",(0,total_row),(-1,total_row),HexColor("#0c2040")),
+                  ("LINEABOVE",(0,total_row),(-1,total_row),1.5,BLUE)]
+        for r in (red_rows or []):  s.append(("BACKGROUND",(0,r),(-1,r),REDL))
+        for r in (green_rows or []): s.append(("BACKGROUND",(0,r),(-1,r),GREENL))
+        t.setStyle(TableStyle(s))
         return t
+
+    HEADER_H = 1.7*cm
+    FOOTER_H = 0.9*cm
+
+    def on_page(canv, doc):
+        canv.saveState()
+        W, H = A4
+        # Full dark bg
+        canv.setFillColor(BG)
+        canv.rect(0,0,W,H,fill=1,stroke=0)
+
+        # ── TOP HEADER: thick navy bar ────────────────────────
+        canv.setFillColor(NAVY_HEADER)
+        canv.rect(0, H-HEADER_H, W, HEADER_H, fill=1,stroke=0)
+        # Thin gradient rainbow strip at very top edge
+        sw = W/4
+        for i,col in enumerate([G1,G2,G3,G4]):
+            canv.setFillColor(col)
+            canv.rect(i*sw, H-0.14*cm, sw, 0.14*cm, fill=1,stroke=0)
+        # Subtle bottom border of header
+        canv.setFillColor(BORDER)
+        canv.rect(0, H-HEADER_H, W, 0.04*cm, fill=1,stroke=0)
+
+        # AeroTax wordmark — Aero white, Tax blue
+        canv.setFillColor(WHITE)
+        canv.setFont("Helvetica-Bold", 15)
+        canv.drawString(1.5*cm, H-1.05*cm, "Aero")
+        canv.setFillColor(BLUE2)
+        canv.drawString(3.22*cm, H-1.05*cm, "Tax")
+
+        # Divider dot
+        canv.setFillColor(TEXT3)
+        canv.setFont("Helvetica", 10)
+        canv.drawString(4.35*cm, H-1.08*cm, "·")
+
+        # Name + Steuerjahr
+        canv.setFillColor(OFF)
+        canv.setFont("Helvetica", 9)
+        canv.drawString(4.7*cm, H-1.05*cm,
+            f"{d.get('name','')}  ·  Steuerjahr {d.get('year',2025)}")
+
+        # Page right + date below
+        canv.setFillColor(TEXT3)
+        canv.setFont("Helvetica", 8)
+        canv.drawRightString(W-1.5*cm, H-0.95*cm, f"Seite {doc.page}")
+        canv.drawRightString(W-1.5*cm, H-1.35*cm, d.get('datum',''))
+
+        # ── BOTTOM FOOTER: thick navy bar ────────────────────
+        canv.setFillColor(NAVY_HEADER)
+        canv.rect(0, 0, W, FOOTER_H, fill=1,stroke=0)
+        # Top border of footer
+        canv.setFillColor(BORDER)
+        canv.rect(0, FOOTER_H, W, 0.04*cm, fill=1,stroke=0)
+
+        # Footer content
+        canv.setFillColor(WHITE)
+        canv.setFont("Helvetica-Bold", 7)
+        canv.drawString(1.5*cm, 0.52*cm, "AeroTax")
+        canv.setFillColor(BLUE2)
+        canv.drawString(2.75*cm, 0.52*cm, "·")
+        canv.setFillColor(TEXT2)
+        canv.setFont("Helvetica", 7)
+        canv.drawString(2.95*cm, 0.52*cm, "aerosteuer.de")
+
+        canv.setFillColor(TEXT3)
+        canv.setFont("Helvetica", 6.5)
+        canv.drawString(1.5*cm, 0.24*cm,
+            "Die Berechnungen beruhen auf deinen Dokumenten. "
+            "Bitte prüfe alle Angaben vor der Abgabe. "
+            "Du trägst die Verantwortung für die Richtigkeit deiner Steuererklärung.")
+        canv.restoreState()
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
-        leftMargin=1.8*cm, rightMargin=1.8*cm,
-        topMargin=1.5*cm, bottomMargin=1.3*cm)
+        leftMargin=1.6*cm, rightMargin=1.6*cm,
+        topMargin=2.0*cm, bottomMargin=1.1*cm,
+        onFirstPage=on_page, onLaterPages=on_page)
     S = []
+    S.append(Spacer(1,0.3*cm))
 
-    # ── DECKBLATT ────────────────────────────────────────────────
+    # ── DECKBLATT ─────────────────────────────────────────────
+    cov = [[
+        Paragraph(d['name'], ps("nm",fontSize=18,textColor=WHITE,
+            fontName="Helvetica-Bold",leading=22)),
+        Paragraph(f"Steuerjahr {d.get('year',2025)}",
+            ps("yr",fontSize=10,textColor=BLUE2,
+               fontName="Helvetica-Bold",leading=14,alignment=TA_RIGHT)),
+    ]]
+    ct = Table(cov, colWidths=[11*cm,5.8*cm])
+    ct.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),0)]))
+    S.append(ct)
+    S.append(Paragraph("Deutsche Lufthansa AG",
+        ps("ag",fontSize=8,textColor=TEXT3,fontName="Helvetica",
+           leading=12,spaceAfter=12)))
+    for note in d.get('notes',[]):
+        S.append(Paragraph(f"⚠  {note}",
+            ps(f"nw{id(note)}",fontSize=8.5,textColor=AMBER,
+               fontName="Helvetica",leading=13,leftIndent=10,
+               spaceAfter=5,backColor=AMBERL)))
+    if d.get('notes'): S.append(Spacer(1,0.1*cm))
+
+    # ── INHALTSVERZEICHNIS ────────────────────────────────────
+    S.append(lbl("Inhalt"))
+    opt = d.get('optionale_belege',[])
+    is_demo = d.get('_isDemo', False)
+    has_belege = bool(opt)
+    has_fotos = not is_demo and any(
+        b.get('file_bytes_list') for b in opt)
+
+    toc_items = [
+        ("1", "Dein Betrag & WISO-Anleitung", "Seite 1"),
+        ("2", "Belege — Weitere absetzbare Kosten",
+         "Seite 2" if has_belege else "—"),
+        ("3", "Berechnung — Zur Information",
+         "Seite 3" if has_belege else "Seite 2"),
+    ]
+    if has_fotos:
+        toc_items.insert(2, ("", "Hochgeladene Belege & Fotos", "ab Seite 3"))
+
+    toc_rows = []
+    for n, title, page in toc_items:
+        toc_rows.append([
+            Paragraph(n, ps(f"tn{n}",fontSize=9,textColor=BLUE2 if n else TEXT3,
+                fontName="Helvetica-Bold" if n else "Helvetica",
+                leading=12,alignment=TA_CENTER)),
+            Paragraph(title, ps(f"tt{id(title)}",fontSize=9,textColor=TEXT,
+                fontName="Helvetica",leading=12)),
+            Paragraph(page, ps(f"tp{id(page)}",fontSize=9,textColor=TEXT3,
+                fontName="Helvetica",leading=12,alignment=TA_RIGHT)),
+        ])
+    toc_t = Table(toc_rows, colWidths=[0.8*cm,13.5*cm,2.5*cm])
+    toc_t.setStyle(TableStyle([
+        ("ROWBACKGROUNDS",(0,0),(-1,-1),[CARD,CARD2]),
+        ("TOPPADDING",(0,0),(-1,-1),8),
+        ("BOTTOMPADDING",(0,0),(-1,-1),8),
+        ("LEFTPADDING",(0,0),(-1,-1),10),
+        ("RIGHTPADDING",(0,0),(-1,-1),10),
+        ("LINEBELOW",(0,0),(-1,-1),0.3,BORDER),
+        ("LINEABOVE",(0,0),(-1,0),1.5,BLUE),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+    ]))
+    S.append(toc_t)
+    S.append(Spacer(1,0.5*cm))
+
+    # ── NETTO: einmal, groß, klar ─────────────────────────────
+    S.append(lbl("Dein Betrag für die Steuererklärung"))
+    nt = Table([[
+        Paragraph("In WISO / Elster einzutragen unter Reisenebenkosten:",
+            ps("nl",fontSize=9,textColor=TEXT2,fontName="Helvetica",leading=12)),
+        Paragraph(eur(d['netto']),
+            ps("nv",fontSize=28,textColor=GREEN,fontName="Helvetica-Bold",
+               leading=32,alignment=TA_RIGHT)),
+    ]], colWidths=[10.2*cm,6.6*cm])
+    nt.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1),CARD),
+        ("LINEABOVE",(0,0),(-1,0),2.5,BLUE),
+        ("TOPPADDING",(0,0),(-1,-1),16),("BOTTOMPADDING",(0,0),(-1,-1),16),
+        ("LEFTPADDING",(0,0),(-1,-1),16),("RIGHTPADDING",(0,0),(-1,-1),16),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+    ]))
+    S.append(nt)
+    S.append(Spacer(1,0.5*cm))
+
+    # ── WISO SCHRITTE ─────────────────────────────────────────
+    S.append(lbl("So trägst du den Betrag ein"))
+    steps_data = [
+        (G1,"1","WISO / Elster öffnen",
+         "Ausgaben  →  Werbungskosten  →  Reisekosten  →  "
+         "Zusammengefasste Auswärtstätigkeiten  →  Neuer Eintrag"),
+        (GREENMID,"2","Beschreibung eingeben",
+         "Feld Beschreibung:  "
+         "Weitere Werbungskosten — Dienstplanauswertung AeroTax 2025"),
+        (BLUE2,"3",f"Betrag eintragen:  {eur(d['netto'])}",
+         "Reisenebenkosten = oben genannter Betrag. "
+         "Alle anderen Felder in diesem Abschnitt bleiben leer."),
+        (AMBER,"4","PDF hochladen und fertig!  ✈️  Bereit zum Abflug!",
+         "Dieses PDF als Nachweis beifügen — fertig! "
+         "Easy mit AeroTax, oder? ✓"),
+    ]
+    step_rows = [[
+        Paragraph(n, ps(f"sn{n}",fontSize=14,textColor=col,
+            fontName="Helvetica-Bold",leading=18,alignment=TA_CENTER)),
+        Paragraph(f"<b>{title}</b><br/><br/>{desc}",
+            ps(f"sd{n}",fontSize=9,textColor=TEXT,
+               fontName="Helvetica",leading=14)),
+    ] for col,n,title,desc in steps_data]
+    st = Table(step_rows, colWidths=[1.0*cm,15.8*cm])
+    st.setStyle(TableStyle([
+        ("ROWBACKGROUNDS",(0,0),(-1,-1),[CARD,CARD2]),
+        ("LINEBELOW",(0,0),(-1,-1),0.3,BORDER),
+        ("LINEABOVE",(0,0),(-1,0),1.5,G1),
+        ("TOPPADDING",(0,0),(-1,-1),12),("BOTTOMPADDING",(0,0),(-1,-1),12),
+        ("LEFTPADDING",(0,0),(-1,-1),10),("RIGHTPADDING",(0,0),(-1,-1),14),
+        ("VALIGN",(0,0),(-1,-1),"TOP"),
+    ]))
+    S.append(st)
     S.append(Spacer(1, 0.5*cm))
-    S.append(Paragraph("Steuerauswertung 2025", H1))
+
+    # ── FERTIG BANNER ─────────────────────────────────────────
+    fertig_rows = [[
+        Paragraph("✈️", ps("fp", fontSize=28, textColor=WHITE,
+            fontName="Helvetica-Bold", leading=32, alignment=TA_CENTER)),
+        Paragraph(
+            "<b>Bereit zum Abflug!</b><br/>"
+            "Du bist fertig. Einmal auf Absenden drücken — und deine Steuererklärung hebt ab. "
+            "Easy mit AeroTax. ✓",
+            ps("fd", fontSize=11, textColor=WHITE,
+               fontName="Helvetica", leading=16)),
+        Paragraph(eur(d['netto']),
+            ps("fv", fontSize=18, textColor=GREEN,
+               fontName="Helvetica-Bold", leading=22, alignment=TA_RIGHT)),
+    ]]
+    ft = Table(fertig_rows, colWidths=[1.4*cm, 11.2*cm, 4.2*cm])
+    ft.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), HexColor("#0c2040")),
+        ("LINEABOVE",     (0,0),(-1,0),  2.5, GREEN),
+        ("LINEBELOW",     (0,0),(-1,-1), 2.5, GREEN),
+        ("TOPPADDING",    (0,0),(-1,-1), 18),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 18),
+        ("LEFTPADDING",   (0,0),(-1,-1), 14),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 14),
+        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+    ]))
+    S.append(ft)
+
+    # ── SEITE 2: BELEGE ───────────────────────────────────────
+    if has_belege:
+        S.append(PageBreak())
+        S.append(lbl("Belege — Weitere absetzbare Kosten"))
+        S.append(Paragraph(
+            "Die folgenden Belege wurden aus deinen Fotos und PDFs ausgelesen. "
+            "Bitte prüfe die Beträge selbst — "
+            "du trägst die Verantwortung für die Richtigkeit deiner Steuererklärung.",
+            ps("bi",fontSize=8.5,textColor=TEXT2,fontName="Helvetica",
+               leading=13,spaceAfter=12)))
+        bel_rows = [[
+            Paragraph("Beleg",TH), Paragraph("WISO-Pfad",TH),
+            Paragraph("Betrag",THR), Paragraph("Hinweis",TH),
+        ]]
+        for b in opt:
+            # Skip if no betrag AND no files uploaded
+            has_doc = b.get('betrag',0) > 0
+            has_files = bool(b.get('file_bytes_list'))
+            if not has_doc and not has_files:
+                continue
+            bel_rows.append([
+                Paragraph(f"{b.get('icon','')}  <b>{b.get('name','')}</b>",
+                    ps(f"bn{id(b)}",fontSize=9,
+                       textColor=WHITE if has_doc else TEXT2,
+                       fontName="Helvetica-Bold" if has_doc else "Helvetica",leading=12)),
+                Paragraph(b.get('wiso',''),
+                    ps(f"bw{id(b)}",fontSize=8,
+                       textColor=BLUE2 if has_doc else TEXT3,
+                       fontName="Helvetica",leading=11)),
+                Paragraph(eur(b['betrag']) if has_doc else "⚠ Beleg fehlt",
+                    ps(f"bv{id(b)}",fontSize=9 if has_doc else 8.5,
+                       textColor=GREEN if has_doc else AMBER,
+                       fontName="Helvetica-Bold",leading=12,alignment=TA_RIGHT)),
+                Paragraph(f"💡 {b.get('hint','')}" if has_doc else "Foto / PDF hochladen",
+                    ps(f"bh{id(b)}",fontSize=7.5,
+                       textColor=TEXT2 if has_doc else AMBER,
+                       fontName="Helvetica",leading=11)),
+            ])
+        S.append(tbl(bel_rows,[3.8*cm,6.0*cm,2.8*cm,4.2*cm]))
+
+        # Embed uploaded files — only if NOT demo AND files exist
+        if has_fotos:
+            W_content = A4[0] - 3.2*cm
+            for b in opt:
+                file_bytes_list = b.get('file_bytes_list') or []
+                if not file_bytes_list:
+                    continue
+                betrag = b.get('betrag',0)
+                has_doc = betrag > 0
+                for fidx, fb in enumerate(file_bytes_list):
+                    S.append(PageBreak())
+                    S.append(Paragraph(
+                        f"{b.get('icon','')}  {b.get('name','')}",
+                        ps(f"bpn{id(b)}{fidx}",fontSize=13,textColor=WHITE,
+                           fontName="Helvetica-Bold",leading=16,spaceAfter=4)))
+                    S.append(Paragraph(
+                        f"WISO: {b.get('wiso','')}  ·  "
+                        +(f"Betrag: {eur(betrag)}" if has_doc else "⚠ Betrag nicht erkannt"),
+                        ps(f"bpp{id(b)}{fidx}",fontSize=8.5,
+                           textColor=BLUE2 if has_doc else AMBER,
+                           fontName="Helvetica",leading=12,spaceAfter=10)))
+                    S.append(HRFlowable(width="100%",thickness=0.4,color=BORDER,spaceAfter=10))
+                    try:
+                        magic = fb[:4]
+                        if magic[:3]==b'\xff\xd8\xff' or magic==b'\x89PNG':
+                            img = Image(io.BytesIO(fb))
+                            iw,ih = img.drawWidth,img.drawHeight
+                            scale = min(W_content/iw, 22*cm/ih, 1.0)
+                            img.drawWidth=iw*scale; img.drawHeight=ih*scale
+                            S.append(img)
+                        else:
+                            with pdfplumber.open(io.BytesIO(fb)) as pdoc:
+                                for pgi,pg in enumerate(pdoc.pages):
+                                    if pgi>0:
+                                        S.append(PageBreak())
+                                        S.append(Paragraph(
+                                            f"{b.get('name','')} — Seite {pgi+1}",
+                                            ps(f"pn{id(b)}{pgi}",fontSize=9,textColor=TEXT2,
+                                               fontName="Helvetica",leading=12,spaceAfter=6)))
+                                    txt = pg.extract_text() or ''
+                                    for line in txt.split('\n'):
+                                        if line.strip():
+                                            S.append(Paragraph(
+                                                line.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;'),
+                                                ps(f"pl{id(b)}{pgi}{id(line)}",fontSize=8.5,
+                                                   textColor=TEXT,fontName="Courier",leading=12)))
+                                        else:
+                                            S.append(Spacer(1,0.12*cm))
+                    except Exception as e:
+                        S.append(Paragraph(f"Datei konnte nicht eingebettet werden: {e}",
+                            ps(f"fe{id(b)}{fidx}",fontSize=9,textColor=AMBER,
+                               fontName="Helvetica",leading=12)))
+
+    # ── LETZTE SEITE: BERECHNUNG ──────────────────────────────
+    S.append(PageBreak())
+    S.append(lbl("Berechnung — Zur Information"))
     S.append(Paragraph(
-        f"{d['name']} — Anlage N / Werbungskosten · Deutsche Lufthansa AG",
-        ps("sub", fontSize=10, textColor=TEXT2, fontName="Helvetica", leading=14)))
-    S.append(HRFlowable(width="100%", thickness=1.5, color=HexColor("#1e2d4a"), spaceAfter=16))
-
-    # ── HINWEISE (geschätzte Werte) ───────────────────────────
-    notes = d.get('notes', [])
-    if notes:
-        for note in notes:
-            S.append(Paragraph(
-                f"⚠️ {note}",
-                ps("note_warn", fontSize=9, textColor=HexColor("#fbbf24"),
-                   fontName="Helvetica", leading=13, leftIndent=8,
-                   backColor=HexColor("#1a1500"))))
-            S.append(Spacer(1, 0.15*cm))
-        S.append(Spacer(1, 0.2*cm))
-
-    # ── SEKTION 1: AUFWENDUNGEN ───────────────────────────────────
-    S.append(Paragraph("1. Errechnete Aufwendungen (aus Dienstplan-Übersichten)", H2))
+        "Diese Seite zeigt wie der Betrag ermittelt wurde — nur zur Information. "
+        "Du musst hier nichts eintragen.",
+        ps("ci",fontSize=8.5,textColor=TEXT2,fontName="Helvetica",
+           leading=13,spaceAfter=12)))
 
     auf = [
-        [Paragraph("Position", TH), Paragraph("Grundlage", TH), Paragraph("Betrag", THR)],
-        [Paragraph(f"Fahrtkosten Homebase ({d.get('km',0)} km × {d.get('fahr_tage',0)} Tage, einfache Strecke)", TD),
-         Paragraph(f"0,30 €/km bis 20 km + 0,38 €/km ab 20 km", SM),
-         Paragraph(eur(d['fahr']), TDR)],
-        [Paragraph(f"Reinigungskosten ({d['arbeitstage']} Arbeitstage × 1,60 €)", TD),
-         Paragraph("Dienstkleidung pauschal", SM), Paragraph(eur(d['reinig']), TDR)],
-        [Paragraph(f"Trinkgelder ({d['hotel_naechte']} Hotelnächte × 3,60 €)", TD),
-         Paragraph("Reisenebenkosten pauschal", SM), Paragraph(eur(d['trink']), TDR)],
-        [Paragraph(f"VMA Inland >8h ({d['vma_72_tage']} Tage × 14 €) — Zeile 72", TD),
-         Paragraph("Eintagestouren ohne Übernachtung", SM), Paragraph(eur(d['vma_72']), TDR)],
-        [Paragraph(f"VMA An-/Abreisetage ({d['vma_73_tage']} Tage × 14 €) — Zeile 73", TD),
-         Paragraph("Mehrtäg. Einsätze mit Übernachtung", SM), Paragraph(eur(d['vma_73']), TDR)],
-        [Paragraph(f"VMA 24h Inland ({d['vma_74_tage']} Tag × 28 €) — Zeile 74", TD),
-         Paragraph("Volle Inlandstage", SM), Paragraph(eur(d['vma_74']), TDR)],
-        [Paragraph("VMA Ausland — Zeile 76", TD),
-         Paragraph("BMF-Pauschalen 2025 nach Land", SM), Paragraph(eur(d['vma_aus']), TDR)],
-        [Paragraph("Gesamtsumme der Aufwendungen (Brutto)", TDB),
-         Paragraph("", SM), Paragraph(eur(d['gesamt']), TDRB)],
+        [Paragraph("Position",TH),Paragraph("Anlage N",TH),Paragraph("Betrag",THR)],
+        [Paragraph(f"Fahrtkosten Homebase  ({d.get('km',0)} km × {d.get('fahr_tage',0)} Tage)",TD),
+         Paragraph("Zeilen 27–30",SMC),Paragraph(eur(d.get('fahr',0)),TDR)],
+        [Paragraph(f"Reinigungskosten  ({d.get('arbeitstage',0)} Tage × 1,60 €)",TD),
+         Paragraph("Zeile 62",SMC),Paragraph(eur(d.get('reinig',0)),TDR)],
+        [Paragraph(f"Trinkgelder  ({d.get('hotel_naechte',0)} Nächte × 3,60 €)",TD),
+         Paragraph("Zeile 68",SMC),Paragraph(eur(d.get('trink',0)),TDR)],
+        [Paragraph(f"VMA Inland >8h  ({d.get('vma_72_tage',0)} Tage × 14 €)",TD),
+         Paragraph("Zeile 72",SMC),Paragraph(eur(d.get('vma_72',0)),TDR)],
+        [Paragraph(f"VMA An-/Abreisetage  ({d.get('vma_73_tage',0)} Tage × 14 €)",TD),
+         Paragraph("Zeile 73",SMC),Paragraph(eur(d.get('vma_73',0)),TDR)],
+        [Paragraph(f"VMA 24h  ({d.get('vma_74_tage',0)} Tage × 28 €)",TD),
+         Paragraph("Zeile 74",SMC),Paragraph(eur(d.get('vma_74',0)),TDR)],
+        [Paragraph("VMA Ausland nach BMF-Pauschalen 2025",TD),
+         Paragraph("Zeile 76",SMC),Paragraph(eur(d.get('vma_aus',0)),TDR)],
+        [Paragraph("Summe aller Aufwendungen",TDB),
+         Paragraph("",SM),Paragraph(eur(d.get('gesamt',0)),TDRB)],
+        [Paragraph("Abzug: AG-Fahrkostenzuschuss  (Z17)",TD),
+         Paragraph("",SM),Paragraph(eur(-d.get('ag_z17',0)),TRD)],
+        [Paragraph("Abzug: Steuerfreie Spesen Lufthansa  (Z77)",TD),
+         Paragraph("",SM),Paragraph(eur(-d.get('z77',0)),TRD)],
+        [Paragraph("= Einzutragender Betrag",TDB),
+         Paragraph("",SM),Paragraph(eur(d.get('netto',0)),TGNO)],
     ]
-    S.append(tbl(auf, [9.5*cm, 4*cm, 3.7*cm], total_row=8))
+    S.append(tbl(auf,[10.6*cm,2.0*cm,4.2*cm],
+                 total_row=8,red_rows=[9,10],green_rows=[11]))
+    S.append(Spacer(1,0.4*cm))
 
-    # ── SEKTION 2: AG-ERSTATTUNGEN ────────────────────────────────
-    S.append(Paragraph("2. Steuerfreie Erstattungen Lufthansa (Abzüge)", H2))
-
-    se_rows = [
-        [Paragraph("Abrechnung / Zeitraum", TH),
-         Paragraph("Erstellt am", TH),
-         Paragraph("Steuerpflichtig", THR),
-         Paragraph("Steuerfrei (Z.77)", THR)],
-    ]
-    for a in d.get('abrechnungen',[]):
-        se_rows.append([
-            Paragraph(a.get('bezeichnung',''), TD),
-            Paragraph(a.get('erstellt',''), TD),
-            Paragraph(eur(a.get('steuerpflichtig',0)), ps("trd2",fontSize=9,textColor=RED,fontName="Helvetica",leading=12,alignment=TA_RIGHT)),
-            Paragraph(eur(a.get('steuerfrei',0)), TGD),
+    abrechnungen = d.get('abrechnungen',[])
+    if abrechnungen:
+        S.append(lbl("Streckeneinsatz-Abrechnungen — Alle Monate"))
+        mon_rows = [[
+            Paragraph("Monat",TH),Paragraph("Erstellt",TH),
+            Paragraph("Gesamt",THR),Paragraph("Steuerfrei (Z77)",THR),
+            Paragraph("Steuerpfl.",THR),
+        ]]
+        for a in abrechnungen:
+            mon_rows.append([
+                Paragraph(a.get('bezeichnung',''),TD),
+                Paragraph(a.get('erstellt',''),SM),
+                Paragraph(eur(a.get('gesamt',0)),TDR),
+                Paragraph(eur(a.get('steuerfrei',0)),TGRN),
+                Paragraph(eur(a.get('steuerpflichtig',0)),TRD),
+            ])
+        mon_rows.append([
+            Paragraph("Gesamt",TDB),Paragraph("",SM),
+            Paragraph(eur(d.get('spesen_gesamt',0)),TDRB),
+            Paragraph(eur(d.get('z77',0)),TGRNB),
+            Paragraph(eur(d.get('spesen_steuer',0)),TRED),
         ])
-    se_rows.append([
-        Paragraph("Summe Streckeneinsatz-Abrechnungen", TDB),
-        Paragraph("", TD),
-        Paragraph(eur(d['spesen_steuer']), ps("trd3",fontSize=9,textColor=RED,fontName="Helvetica-Bold",leading=12,alignment=TA_RIGHT)),
-        Paragraph(eur(d['z77']), TDRB),
-    ])
-    se_rows.append([
-        Paragraph("+ AG-Fahrkostenzuschuss Zeile 17 (Lohnsteuerbescheinigung)", TD),
-        Paragraph("", TD),
-        Paragraph("", TDR),
-        Paragraph(eur(d['ag_z17']),
-                  ps("az17",fontSize=9,textColor=RED,fontName="Helvetica",leading=12,alignment=TA_RIGHT)),
-    ])
-    S.append(tbl(se_rows, [7.5*cm, 2.5*cm, 3.5*cm, 3.7*cm],
-                 total_row=len(se_rows)-2))
+        S.append(tbl(mon_rows,[3.5*cm,2.8*cm,2.9*cm,4.0*cm,3.6*cm],
+                     total_row=len(mon_rows)-1))
 
-    # ── SEKTION 3: ERGEBNIS UND WISO-ANLEITUNG ───────────────────
-    S.append(Paragraph("3. Ergebnis — In WISO einzutragende Netto-Summe", H2))
-
-    diff = [
-        [Paragraph("Brutto-Aufwendungen gesamt", TD),
-         Paragraph(eur(d['gesamt']), TDR)],
-        [Paragraph("− AG-Fahrkostenzuschuss (Zeile 17)", TD),
-         Paragraph("− "+eur(d['ag_z17']), TRD)],
-        [Paragraph("− Steuerfreie Spesen Lufthansa (Zeile 77)", TD),
-         Paragraph("− "+eur(d['z77']), TRD)],
-        [Paragraph("= Einzutragender Betrag (Reisenebenkosten in WISO)", TDB),
-         Paragraph(eur(d['netto']), TGN)],
-    ]
-    dt = Table(diff, colWidths=[13.5*cm, 3.7*cm])
-    dt.setStyle(TableStyle([
-        ("ROWBACKGROUNDS",(0,0),(-1,-2), [WHITE,GREY]),
-        ("BACKGROUND",  (0,1),(-1, 2), REDL),
-        ("BACKGROUND",  (0,-1),(-1,-1), GREENL),
-        ("LINEBELOW",   (0,-1),(-1,-1), 2, GREEN),
-        ("LINEABOVE",   (0,-1),(-1,-1), 1, GREYB),
-        ("LINEBELOW",   (0,0),(-1,-2), 0.5, GREYB),
-        ("TOPPADDING",  (0,0),(-1,-1), 10),
-        ("BOTTOMPADDING",(0,0),(-1,-1), 10),
-        ("LEFTPADDING", (0,0),(-1,-1), 12),
-        ("RIGHTPADDING",(0,0),(-1,-1), 12),
-    ]))
-    S.append(dt)
-    S.append(Spacer(1, 0.3*cm))
-
-    # ── WISO-ANLEITUNG ────────────────────────────────────────────
-    S.append(PageBreak())
-    S.append(Paragraph("4. WISO-Anleitung — So trägst du den Betrag ein", H2))
-
-    wiso_steps = [
-        ("1", "WISO öffnen und navigieren",
-         "Ausgaben → Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten → Neuer Eintrag",
-         "", WHITE),
-        ("2", "Beschreibung eingeben",
-         'Im Feld "Beschreibung" eintragen:',
-         '"Weitere Werbungskosten gemäss Dienstplanauswertung AeroTax"',
-         WHITE),
-        ("3", "Betrag unter Reisenebenkosten eintragen",
-         'Bei "Fahrt- und Übernachtungskosten, Reisenebenkosten" → Reisenebenkosten eintragen:',
-         eur(d['netto']),
-         AMBERL),
-        ("4", "AeroTax-PDF als Nachweis beilegen",
-         'Da du auf die AeroTax-Auswertung verweist, dieses PDF dem Finanzamt einreichen. '
-         'Bei WISO Steuer:Versand nach dem Einreichen direkt nachreichen.',
-         "✓ Fertig",
-         GREENL),
-    ]
-
-    for nr, titel, pfad, wert, bg in wiso_steps:
-        val_color = GREEN if bg==GREENL else (AMBER if bg==AMBERL else TEXT)
-        row = Table([[
-            Paragraph(nr, ps(f"wn{nr}", fontSize=16, textColor=val_color,
-                fontName="Helvetica-Bold", alignment=TA_RIGHT, leading=20)),
-            Table([
-                [Paragraph(pfad, ps(f"wp{nr}", fontSize=8, textColor=BLUE,
-                    fontName="Helvetica-Bold", leading=11))],
-                [Paragraph(titel, ps(f"wt{nr}", fontSize=10, textColor=TEXT,
-                    fontName="Helvetica-Bold", leading=13))],
-            ] + ([
-                [Paragraph(wert, ps(f"wv{nr}", fontSize=14 if nr!='3' else 18,
-                    textColor=val_color, fontName="Helvetica-Bold", leading=18))]
-            ] if wert else []),
-            colWidths=[14*cm], style=[
-                ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3),
-                ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
-            ]),
-        ]], colWidths=[1.2*cm, 14*cm])
-        row.setStyle(TableStyle([
-            ("BACKGROUND",    (0,0),(-1,-1), bg),
-            ("BOX",           (0,0),(-1,-1), 0.8, GREYB if bg==WHITE else
-                              (GREEN if bg==GREENL else GOLD)),
-            ("TOPPADDING",    (0,0),(-1,-1), 14),
-            ("BOTTOMPADDING", (0,0),(-1,-1), 14),
-            ("LEFTPADDING",   (0,0),(-1,-1), 14),
-            ("RIGHTPADDING",  (0,0),(-1,-1), 14),
-            ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
-        ]))
-        S.append(row)
-        S.append(Spacer(1, 0.18*cm))
-
-    S.append(Spacer(1, 0.4*cm))
-    # ── SEKTION 4: BELEGE ─────────────────────────────
-    opt_belege = d.get('optionale_belege', [])
-    if opt_belege:
-        S.append(PageBreak())
-        S.append(Paragraph("4. Belege — WISO-Einträge", H2))
-        bel_rows = [
-            [Paragraph("Beleg", TH), Paragraph("WISO-Pfad", TH), Paragraph("Betrag", THR)]
-        ]
-        for b in opt_belege:
-            if b.get('betrag', 0) > 0:
-                bel_rows.append([
-                    Paragraph(b['icon'] + ' ' + b['name'], TD),
-                    Paragraph(b['wiso'], ps("bwiso", fontSize=8, textColor=BLUE, fontName="Helvetica", leading=11)),
-                    Paragraph(eur(b['betrag']), TDRB),
-                ])
-                if b.get('hint'):
-                    bel_rows.append([
-                        Paragraph('', SM),
-                        Paragraph('💡 ' + b['hint'], ps("bhint", fontSize=7.5, textColor=HexColor("#94a3b8"), fontName="Helvetica", leading=11)),
-                        Paragraph('', SM),
-                    ])
-        if len(bel_rows) > 1:
-            S.append(tbl(bel_rows, [5.5*cm, 8.5*cm, 3.2*cm]))
-            S.append(Spacer(1, 0.3*cm))
-            S.append(Paragraph(
-                "Hinweis: Die obigen Beträge wurden von der KI aus deinen hochgeladenen Belegen extrahiert. "
-                "Bitte prüfe die Angaben vor dem Einreichen beim Finanzamt.",
-                ps("belhinweis", fontSize=7.5, textColor=TEXT2, fontName="Helvetica", leading=11)
-            ))
-
-    S.append(HRFlowable(width="100%", thickness=0.5, color=GREYB, spaceAfter=8))
-    S.append(Paragraph(
-        f"Erstellt mit AeroTax · aerotax.de · {d['datum']}",
-        ps("foot", fontSize=8, textColor=TEXT2, fontName="Helvetica",
-           alignment=TA_CENTER, leading=12)))
-
-    # ── HOCHGELADENE DOKUMENTE SEITE ─────────────────────────────
-    S.append(PageBreak())
-    S.append(Spacer(1, 0.5*cm))
-
-    doc_h = ps("dh", fontSize=14, textColor=NAVY, fontName="Helvetica-Bold",
-                leading=18, spaceAfter=6)
-    doc_b = ps("db", fontSize=10, textColor=TEXT2, fontName="Helvetica",
-                leading=15, spaceAfter=4)
-    doc_g = ps("dg", fontSize=10, textColor=GREEN, fontName="Helvetica-Bold",
-                leading=14)
-    doc_r = ps("dr", fontSize=10, textColor=RED,   fontName="Helvetica-Bold",
-                leading=14)
-
-    S.append(Paragraph("Dokumenten-Nachweis", doc_h))
-    S.append(HRFlowable(width="100%", thickness=1, color=NAVY, spaceAfter=12))
-    S.append(Paragraph(
-        "Folgende Dokumente wurden vom Nutzer hochgeladen und zur Berechnung verwendet:",
-        doc_b))
-    S.append(Spacer(1, 0.2*cm))
-
-    for item in d.get('uploaded_summary','').split(', '):
-        if item.strip():
-            S.append(Paragraph("✓ " + item.strip(), doc_g))
-
-    not_up = d.get('not_uploaded','')
-    if not_up and not_up != 'Alle Pflichtdokumente vorhanden':
-        S.append(Spacer(1, 0.3*cm))
-        S.append(Paragraph("Nicht hochgeladene Dokumente:", doc_b))
-        for item in not_up.split(', '):
-            if item.strip():
-                S.append(Paragraph("✗ " + item.strip() + " — fehlend bei der Berechnung", doc_r))
-        S.append(Spacer(1, 0.2*cm))
-        S.append(Paragraph(
-            "HINWEIS: Da nicht alle Dokumente hochgeladen wurden, "
-            "kann AeroTax keine Garantie für die Vollständigkeit der Berechnung übernehmen. "
-            "Der Nutzer wurde auf fehlende Dokumente hingewiesen.",
-            ps("warn", fontSize=9, textColor=RED, fontName="Helvetica", leading=13)))
-    else:
-        S.append(Spacer(1, 0.2*cm))
-        S.append(Paragraph("✓ Alle Pflichtdokumente wurden hochgeladen.", doc_g))
-
-    # ── UNTERSCHRIFTSSEITE ───────────────────────────────────────
-    S.append(PageBreak())
-    S.append(Spacer(1, 1.5*cm))
-
-    # Header
-    sign_head = ps("sh", fontSize=14, textColor=NAVY,
-                   fontName="Helvetica-Bold", leading=18, spaceAfter=6)
-    sign_body = ps("sb", fontSize=10, textColor=TEXT2,
-                   fontName="Helvetica", leading=15, spaceAfter=4)
-    sign_small= ps("ss", fontSize=8.5, textColor=TEXT2,
-                   fontName="Helvetica", leading=12)
-
-    S.append(Paragraph("Bestätigung & Haftungsausschluss", sign_head))
-    S.append(HRFlowable(width="100%", thickness=1, color=NAVY, spaceAfter=16))
-
-    S.append(Paragraph(
-        f"Die vorliegende Steuerauswertung für das Jahr {d.get('year',2025)} "
-        f"wurde auf Basis der von <strong>{d['name']}</strong> hochgeladenen "
-        f"Originaldokumente erstellt und durch den Eigentümer geprüft und bestätigt.",
-        sign_body))
-    S.append(Spacer(1, 0.3*cm))
-
-    S.append(Paragraph(
-        "<strong>Haftungsausschluss:</strong> Diese Auswertung wurde mit größter Sorgfalt "
-        "erstellt und dient als Orientierungshilfe für die Steuererklärung. "
-        "AeroTax (aerosteuer.de) übernimmt keine Haftung für steuerliche Nachforderungen, "
-        "Bußgelder oder sonstige Schäden, die aus der Verwendung dieser Auswertung entstehen. "
-        "Diese Auswertung ersetzt keine steuerrechtliche Beratung durch einen zugelassenen "
-        "Steuerberater. Alle Angaben ohne Gewähr.",
-        sign_body))
-
-    S.append(Spacer(1, 1.2*cm))
-
-    # Signature table
-    from datetime import date
-    heute = date.today().strftime("%d.%m.%Y")
-    sig_tbl = Table([
-        [
-            Table([
-                [Paragraph("Datum", sign_small)],
-                [Paragraph(heute, ps("sd", fontSize=13, textColor=TEXT,
-                    fontName="Helvetica-Bold", leading=16))],
-            ], colWidths=[7*cm], style=[
-                ("LINEABOVE",(0,0),(-1,0),1,GREYB),
-                ("TOPPADDING",(0,0),(-1,-1),6),
-                ("LEFTPADDING",(0,0),(-1,-1),0),
-                ("RIGHTPADDING",(0,0),(-1,-1),0),
-            ]),
-            Spacer(1,1),
-            Table([
-                [Paragraph("Unterschrift " + d['name'], sign_small)],
-                [Paragraph("", ps("se", fontSize=13, textColor=TEXT,
-                    fontName="Helvetica-Bold", leading=16))],
-            ], colWidths=[9*cm], style=[
-                ("LINEABOVE",(0,0),(-1,0),1,NAVY),
-                ("TOPPADDING",(0,0),(-1,-1),6),
-                ("LEFTPADDING",(0,0),(-1,-1),0),
-                ("RIGHTPADDING",(0,0),(-1,-1),0),
-            ]),
-        ]
-    ], colWidths=[7*cm, 0.6*cm, 9*cm])
-    sig_tbl.setStyle(TableStyle([
-        ("VALIGN",(0,0),(-1,-1),"BOTTOM"),
-        ("LEFTPADDING",(0,0),(-1,-1),0),
-        ("RIGHTPADDING",(0,0),(-1,-1),0),
-    ]))
-    S.append(sig_tbl)
-    S.append(Spacer(1, 0.8*cm))
-
-    S.append(Paragraph(
-        f"Erstellt mit AeroTax · aerosteuer.de · {d.get('datum', heute)}",
-        ps("foot2", fontSize=8, textColor=TEXT2, fontName="Helvetica",
-           alignment=1, leading=11)))
-
-    doc.build(S, onFirstPage=on_page, onLaterPages=on_page)
+    doc.build(S)
     return buf.getvalue()
 
 
-if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
-    print(f"AeroTax Backend startet auf Port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
