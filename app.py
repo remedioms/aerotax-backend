@@ -418,86 +418,105 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
 def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
     """
     Liest Streckeneinsatz-Abrechnungen.
-    Strategie: zuerst robuste Regex-Extraktion, dann Claude als Fallback.
+    1. Versucht Regex-Extraktion (Text-PDFs)
+    2. Fallback: Claude Vision fuer gescannte/Image PDFs
     """
     if not pdf_bytes_list:
         return None
 
     abrechnungen = []
-    
-    for i, pdf_bytes in enumerate(pdf_bytes_list):
+    image_only_pages = []  # pages where text extraction failed
+
+    for pdf_bytes in pdf_bytes_list:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 for page in pdf.pages:
                     text = page.extract_text() or ''
-                    if not text.strip():
-                        continue
-                    
-                    # Extract creation date
-                    date_m = re.search(r'Erstellt\s+(\d{2}\.\d{2}\.\d{4})', text)
-                    erstellt = date_m.group(1) if date_m else f'{len(abrechnungen)+1:02d}.2025'
-                    
-                    # Extract month label
-                    monat_m = re.search(r'Erstellt\s+\d{2}\.(\d{2})\.\d{4}', text)
-                    monat_nr = int(monat_m.group(1)) if monat_m else len(abrechnungen)+1
-                    monat_name = date(2025, monat_nr, 1).strftime('%B') if 1 <= monat_nr <= 12 else f'Monat {monat_nr}'
-                    
-                    # Extract Summe line: "Summe: GESAMT  [STEUERFREI]  STEUER"
-                    summe_m = re.search(r'Summe:\s+([\d\.]+,[\d]+)\s+([\d\.]+,[\d]+)(?:\s+([\d\.]+,[\d]+))?', text)
-                    if summe_m:
-                        to_f = lambda s: float(s.replace('.','').replace(',','.')) if s else 0.0
-                        
-                        g = to_f(summe_m.group(1))
-                        v2 = to_f(summe_m.group(2))
-                        v3 = to_f(summe_m.group(3)) if summe_m.group(3) else 0.0
-                        
-                        # Column order: Gesamt | stfrei | Steuer  OR  Gesamt | Steuer
-                        steuer = v3 if v3 > 0 else v2
-                        steuerfrei = round(g - steuer, 2)
-                        
-                        abrechnungen.append({
-                            'erstellt': erstellt,
-                            'bezeichnung': monat_name,
-                            'gesamt': g,
-                            'steuerpflichtig': steuer,
-                            'steuerfrei': max(0, steuerfrei)
-                        })
+
+                    if text.strip():
+                        # Text PDF — use regex
+                        date_m = re.search(r'Erstellt\s+(\d{2}\.\d{2}\.\d{4})', text)
+                        erstellt = date_m.group(1) if date_m else ''
+
+                        monat_m = re.search(r'Erstellt\s+\d{2}\.(\d{2})\.\d{4}', text)
+                        monat_nr = int(monat_m.group(1)) if monat_m else len(abrechnungen)+1
+                        try:
+                            monat_name = __import__('datetime').date(2025, monat_nr, 1).strftime('%B')
+                        except:
+                            monat_name = f'Monat {monat_nr:02d}'
+
+                        summe_m = re.search(r'Summe:\s+([\d\.]+,[\d]+)\s+([\d\.]+,[\d]+)(?:\s+([\d\.]+,[\d]+))?', text)
+                        if summe_m:
+                            to_f = lambda s: float(s.replace('.','').replace(',','.')) if s else 0.0
+                            g = to_f(summe_m.group(1))
+                            v3 = to_f(summe_m.group(3)) if summe_m.group(3) else 0.0
+                            steuer = v3 if v3 > 0 else to_f(summe_m.group(2))
+                            abrechnungen.append({
+                                'erstellt': erstellt,
+                                'bezeichnung': monat_name,
+                                'gesamt': g,
+                                'steuerpflichtig': steuer,
+                                'steuerfrei': max(0, round(g - steuer, 2))
+                            })
+                    else:
+                        # Image-based page — collect for Claude Vision
+                        image_only_pages.append((pdf_bytes, len(abrechnungen)))
+
         except Exception as e:
-            print(f'Streckeneinsatz parse error page {i}: {e}')
-    
-    if not abrechnungen:
-        # Fallback to Claude
-        if not ANTHROPIC_KEY:
-            return None
+            print(f'SE parse error: {e}')
+
+    # If image pages found and Claude available, use Vision
+    if image_only_pages and ANTHROPIC_KEY:
         try:
             client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-            all_texts = []
-            for i, pdf_bytes in enumerate(pdf_bytes_list):
-                try:
-                    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                        text = ' '.join(p.extract_text() or '' for p in pdf.pages)
-                        all_texts.append(f"=== Abrechnung {i+1} ===\n{text[:3000]}")
-                except: pass
-            combined = '\n\n'.join(all_texts)
-            prompt = f"""Extrahiere aus diesen Streckeneinsatz-Abrechnungen für JEDE Abrechnung:
-{combined[:15000]}
+
+            # Convert PDF pages to images via pdf2image or just send raw PDF
+            content_blocks = []
+            for pdf_bytes, _ in image_only_pages[:6]:  # limit to 6 files
+                b64 = base64.standard_b64encode(pdf_bytes).decode('utf-8')
+                content_blocks.append({
+                    'type': 'document',
+                    'source': {
+                        'type': 'base64',
+                        'media_type': 'application/pdf',
+                        'data': b64
+                    }
+                })
+
+            content_blocks.append({
+                'type': 'text',
+                'text': """Diese PDFs sind Lufthansa Streckeneinsatz-Abrechnungen.
+Extrahiere fuer JEDE Abrechnung:
+- Erstellungsdatum (TT.MM.JJJJ)
+- Monat (z.B. Januar, Februar)
+- Summe Gesamt (letzte Zeile "Summe: X")
+- Davon steuerpflichtig
+- Steuerfrei = Gesamt - Steuerpflichtig
+
 Antworte NUR mit JSON:
-{{"abrechnungen":[{{"erstellt":"13.02.2025","bezeichnung":"Januar","gesamt":244.80,"steuerpflichtig":63.80,"steuerfrei":181.00}}],"summe_gesamt":0,"summe_steuerpflichtig":0,"summe_steuerfrei":0}}"""
+{"abrechnungen":[{"erstellt":"13.02.2025","bezeichnung":"Januar","gesamt":244.80,"steuerpflichtig":63.80,"steuerfrei":181.00}],"summe_gesamt":0,"summe_steuerpflichtig":0,"summe_steuerfrei":0}"""
+            })
+
             response = client.messages.create(
-                model='claude-sonnet-4-20250514', max_tokens=2000,
-                messages=[{'role':'user','content':prompt}]
+                model='claude-sonnet-4-20250514',
+                max_tokens=2000,
+                messages=[{'role': 'user', 'content': content_blocks}]
             )
-            text_resp = re.sub(r'```json|```', '', response.content[0].text.strip()).strip()
-            return json.loads(text_resp)
+            raw = re.sub(r'```json|```', '', response.content[0].text.strip()).strip()
+            vision_data = json.loads(raw)
+            abrechnungen.extend(vision_data.get('abrechnungen', []))
+            print(f"Claude Vision extracted {len(vision_data.get('abrechnungen',[]))} months from image PDFs")
+
         except Exception as e:
-            print(f'Streckeneinsatz Claude fallback error: {e}')
-            return None
-    
-    # Calculate totals
+            print(f'SE Vision fallback error: {e}')
+
+    if not abrechnungen:
+        return None
+
     summe_gesamt = round(sum(a['gesamt'] for a in abrechnungen), 2)
     summe_steuer = round(sum(a['steuerpflichtig'] for a in abrechnungen), 2)
-    summe_frei = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
-    
+    summe_frei   = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
+
     return {
         'abrechnungen': abrechnungen,
         'summe_gesamt': summe_gesamt,
