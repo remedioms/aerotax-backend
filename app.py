@@ -734,24 +734,28 @@ def parse_optionale_belege(files):
             'type': 'text',
             'text': f"""Du siehst {n_files} Beleg(e)/Rechnung(en) für: {info['name']}
 
-Deine Aufgabe: Berechne den JAHRESGESAMTBETRAG für 2025.
+Deine Aufgabe: Schätze den realistischen JAHRESGESAMTBETRAG für 2025.
 
 Denke Schritt für Schritt:
-1. Lies jeden Beleg und notiere Betrag + Zeitraum (welcher Monat/welche Monate)
-2. Wenn mehrere Anbieter oder Monate: addiere alle Beträge
-3. Wenn nur einzelne Monate vorhanden: addiere nur die vorhandenen Monate (kein Hochrechnen)
-4. Gib den Gesamtbetrag aller Belege zusammen an
+1. Lies jeden Beleg — notiere Anbieter, Betrag, Zeitraum
+2. Mehrere Belege → addiere alle
+3. Fehlende Monate → schließe aus den vorhandenen:
+   - Nur 1 Monat vorhanden → × 12 für ganzes Jahr
+   - Mehrere Monate selber Preis → Durchschnitt × 12
+   - Preisänderung erkennbar → jeden Zeitraum separat berechnen
+   - Lücken zwischen zwei Anbietern → aus Nachbarmonaten schätzen
+4. Gib den geschätzten Jahresbetrag an
 
 Beispiele:
-- Vodafone Jan-Jun (6×32€=192€) + O2 Jul-Dez (6×28€=168€) → betrag: 360.00
-- 3 Einzelrechnungen: 45€ + 38€ + 52€ → betrag: 135.00
-- Eine Jahresrechnung 480€ → betrag: 480.00
-- Nur November-Rechnung 39€ → betrag: 39.00
+- Nur Dezember 39€ → 39×12=468 → betrag: 468.00, beschreibung: "Geschätzt auf Basis Dez 39€×12"
+- Jan-Jun 32€, Jul-Dez 28€ → 192+168=360 → betrag: 360.00
+- Jan-März 45€/Monat, Apr-Dez fehlt → 45×12=540 → betrag: 540.00
+- Jahresrechnung 480€ → betrag: 480.00
 
-Antworte NUR mit JSON, keine Erklärung, keine Backticks:
-{{"betrag": 360.00, "zeitraum": "2025", "beschreibung": "Vodafone + O2 Jan-Dez"}}
+Antworte NUR mit JSON, keine Backticks:
+{{"betrag": 468.00, "zeitraum": "2025", "beschreibung": "Geschätzt auf Basis vorhandener Belege"}}
 
-Wenn du keinen klaren Betrag erkennst: {{"betrag": 0}}"""
+Wenn absolut kein Betrag erkennbar: {{"betrag": 0}}"""
         })
 
         try:
