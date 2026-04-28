@@ -92,6 +92,37 @@ def create_checkout():
     return jsonify({'checkout_url': session.url, 'ref': ref})
 
 
+@app.route('/api/create-payment-intent', methods=['POST'])
+def create_payment_intent():
+    """Creates a Stripe PaymentIntent for Stripe Elements (no redirect)."""
+    try:
+        data = request.get_json() or {}
+        amount = int(data.get('amount', 1999))
+        currency = data.get('currency', 'eur')
+        ref = str(uuid.uuid4())
+
+        # Save ref for later file processing
+        _store[ref] = {
+            'form': data,
+            'files': {},
+            'paid': False,
+            'expires': datetime.utcnow() + timedelta(hours=2),
+        }
+
+        intent = stripe.PaymentIntent.create(
+            amount=amount,
+            currency=currency,
+            automatic_payment_methods={'enabled': True},
+            metadata={'ref': ref},
+        )
+        return jsonify({
+            'client_secret': intent.client_secret,
+            'ref': ref
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/upload-files', methods=['POST'])
 def upload_files():
     ref = request.form.get('ref','')
@@ -116,7 +147,7 @@ def stripe_webhook():
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
-    if event['type'] == 'checkout.session.completed':
+    if event['type'] in ('checkout.session.completed', 'payment_intent.succeeded'):
         session = event['data']['object']
         ref     = session.get('metadata', {}).get('ref','')
 
