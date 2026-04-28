@@ -349,12 +349,18 @@ def process_real():
         # Return result (safe: only primitives)
         safe = {k: v for k, v in result.items()
                 if isinstance(v, (int, float, str))}
+        # Strip file_bytes_list before JSON serialization
+        opt_belege_safe = []
+        for b in result.get('optionale_belege', []):
+            b_safe = {k: v for k, v in b.items() if k != 'file_bytes_list'}
+            opt_belege_safe.append(b_safe)
+
         return jsonify({
             'status':       'ready',
             'download_url': f'/api/download/{token}',
             'data':         safe,
             'abrechnungen': result.get('abrechnungen', []),
-            'optionale_belege': result.get('optionale_belege', []),
+            'optionale_belege': opt_belege_safe,
             'notes':        result.get('notes', []),
         })
 
