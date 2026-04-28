@@ -1105,7 +1105,7 @@ def erstelle_pdf(d):
     TEXT2 = HexColor("#94a3b8")   # muted text
     BLUE  = HexColor("#60a5fa")   # accent blue
     WHITE = HexColor("#f1f5f9")   # near white
-    TEXT3 = HexColor("#64748b")   # very muted text
+    TEXT2 = HexColor("#64748b")   # very muted text
 
     base = getSampleStyleSheet()
     def ps(n,**kw): return ParagraphStyle(n,parent=base["Normal"],**kw)
@@ -1431,7 +1431,7 @@ def erstelle_pdf(d):
                    fontName="Helvetica-Bold", leading=18, spaceAfter=6)
     sign_body = ps("sb", fontSize=10, textColor=TEXT2,
                    fontName="Helvetica", leading=15, spaceAfter=4)
-    sign_small= ps("ss", fontSize=8.5, textColor=TEXT3,
+    sign_small= ps("ss", fontSize=8.5, textColor=TEXT2,
                    fontName="Helvetica", leading=12)
 
     S.append(Paragraph("Bestätigung & Haftungsausschluss", sign_head))
@@ -1493,7 +1493,7 @@ def erstelle_pdf(d):
 
     S.append(Paragraph(
         f"Erstellt mit AeroTax · aerosteuer.de · {d.get('datum', heute)}",
-        ps("foot2", fontSize=8, textColor=TEXT3, fontName="Helvetica",
+        ps("foot2", fontSize=8, textColor=TEXT2, fontName="Helvetica",
            alignment=1, leading=11)))
 
     doc.build(S, onFirstPage=on_page, onLaterPages=on_page)
