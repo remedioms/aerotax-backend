@@ -18,6 +18,8 @@ from flask_cors import CORS
 import stripe
 import anthropic
 import pdfplumber
+from PIL import Image
+import base64
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib.colors import HexColor, white
@@ -32,7 +34,7 @@ CORS(app, origins=[os.getenv('FRONTEND_URL','https://aerotax.de'), 'http://local
 
 stripe.api_key        = os.getenv('STRIPE_SECRET_KEY')
 WEBHOOK_SECRET        = os.getenv('STRIPE_WEBHOOK_SECRET')
-ANTHROPIC_KEY         = os.getenv('ANTHROPIC_API_KEY')
+ANTHROPIC_KEY = os.getenv('ANTHROPIC_API_KEY')
 PRICE_ID              = os.getenv('AEROTAX_PRICE_ID')
 FRONTEND_URL          = os.getenv('FRONTEND_URL','https://aerotax.de')
 
@@ -173,32 +175,50 @@ def download_pdf(token):
 # Demo ohne Zahlung (gibt Fallback-Werte zurück)
 @app.route('/api/demo', methods=['POST'])
 def demo():
-    """Demo mit zufälligen Beispielzahlen — keine echten Nutzerdaten, kein Tibor."""
+    """Demo — uses provided data or generates random Max Mustermann values."""
     import random
-    r = lambda a, b: round(random.uniform(a, b), 2)
-    ri = lambda a, b: random.randint(a, b)
-
-    km          = ri(15, 60)
-    fahr_tage   = ri(45, 70)
-    arbeitstage = ri(110, 150)
-    hotel_naechte = ri(50, 80)
-    vma_72      = ri(3, 8) * 14
-    vma_73      = ri(8, 15) * 14
-    vma_74      = ri(0, 2) * 28
-    vma_in      = vma_72 + vma_73 + vma_74
-    vma_aus     = r(3500, 6000)
-    fahr        = round(min(km,20)*fahr_tage*0.30 + max(0,km-20)*fahr_tage*0.38, 2)
-    reinig      = round(arbeitstage * 1.60, 2)
-    trink       = round(hotel_naechte * 3.60, 2)
-    gesamt      = round(fahr + reinig + trink + vma_in + vma_aus, 2)
-    ag_z17      = r(200, 450)
-    spesen_g    = r(4000, 7000)
-    spesen_s    = r(800, 2000)
-    z77         = round(spesen_g - spesen_s, 2)
-    netto       = round(gesamt - ag_z17 - z77, 2)
-
+    # Check if client sent fixed data
+    req = request.get_json(silent=True) or {}
+    
+    if req.get('name') == 'Max Mustermann' and req.get('km'):
+        # Use the exact data sent by frontend
+        r_data = req
+        km = float(r_data.get('km', 22))
+        fahr_tage = int(r_data.get('fahr_tage', 62))
+        arbeitstage = int(r_data.get('arbeitstage', 140))
+        hotel_naechte = int(r_data.get('hotel_naechte', 72))
+        vma_72 = float(r_data.get('vma_72', 84))
+        vma_73 = float(r_data.get('vma_73', 196))
+        vma_74 = float(r_data.get('vma_74', 56))
+        vma_in = float(r_data.get('vma_in', 336))
+        vma_aus = float(r_data.get('vma_aus', 5180))
+        fahr = float(r_data.get('fahr', 598.40))
+        reinig = float(r_data.get('reinig', 224.00))
+        trink = float(r_data.get('trink', 259.20))
+        gesamt = float(r_data.get('gesamt', 6597.60))
+        ag_z17 = float(r_data.get('ag_z17', 280))
+        spesen_g = float(r_data.get('spesen_gesamt', 5920))
+        spesen_s = float(r_data.get('spesen_steuer', 1340))
+        z77 = float(r_data.get('z77', 4580))
+        netto = float(r_data.get('netto', 1737.60))
+        name = 'Max Mustermann'
+    else:
+        # Generate random values
+        r = lambda a, b: round(random.uniform(a, b), 2)
+        ri = lambda a, b: random.randint(a, b)
+        km = ri(15, 60); fahr_tage = ri(45, 70); arbeitstage = ri(110, 150)
+        hotel_naechte = ri(50, 80)
+        vma_72 = ri(3, 8) * 14; vma_73 = ri(8, 15) * 14; vma_74 = ri(0, 2) * 28
+        vma_in = vma_72 + vma_73 + vma_74; vma_aus = r(3500, 6000)
+        fahr = round(min(km,20)*fahr_tage*0.30 + max(0,km-20)*fahr_tage*0.38, 2)
+        reinig = round(arbeitstage * 1.60, 2); trink = round(hotel_naechte * 3.60, 2)
+        gesamt = round(fahr + reinig + trink + vma_in + vma_aus, 2)
+        ag_z17 = r(200, 450); spesen_g = r(4000, 7000); spesen_s = r(800, 2000)
+        z77 = round(spesen_g - spesen_s, 2); netto = round(gesamt - ag_z17 - z77, 2)
+        name = 'Max Mustermann'
+    r = r if 'r' in dir() else lambda a,b: round((a+b)/2, 2)
     result = {
-        'name': 'Max Mustermann',
+        'name': name,
         'year': 2025,
         'datum': datetime.now().strftime('%d.%m.%Y'),
         'km': km, 'fahr_tage': fahr_tage,
@@ -211,7 +231,7 @@ def demo():
         'gesamt': gesamt, 'ag_z17': ag_z17,
         'spesen_gesamt': spesen_g, 'spesen_steuer': spesen_s,
         'z77': z77, 'netto': netto,
-        'brutto': r(40000, 70000), 'lohnsteuer': r(5000, 12000),
+        'brutto': 54200.00, 'lohnsteuer': 7980.00,
         'arbeitgeber': 'Deutsche Lufthansa AG',
         'uploaded_summary': 'Demo-Modus — keine echten Dokumente',
         'not_uploaded': '',
@@ -228,7 +248,7 @@ def demo():
     token = str(uuid.uuid4())
     _store[token] = {
         'pdf_bytes': pdf,
-        'filename':  'AeroTax_Demo_Auswertung.pdf',
+        'filename':  'AeroTax_Auswertung_Demo_2025.pdf',
         'expires':   datetime.utcnow() + timedelta(hours=1),
     }
     safe = {k: v for k, v in result.items()
@@ -292,11 +312,13 @@ def process_real():
 
         # Return result (safe: only primitives)
         safe = {k: v for k, v in result.items()
-                if isinstance(v, (int, float, str)) and k != 'abrechnungen'}
+                if isinstance(v, (int, float, str))}
         return jsonify({
             'status':       'ready',
             'download_url': f'/api/download/{token}',
-            'data':         safe
+            'data':         safe,
+            'abrechnungen': result.get('abrechnungen', []),
+            'optionale_belege': result.get('optionale_belege', []),
         })
 
     except Exception as e:
@@ -503,6 +525,139 @@ Antworte NUR mit JSON:
 #  3. Netto-Betrag = in WISO unter Reisenebenkosten eintragen
 # ══════════════════════════════════════════════════════════════════
 
+
+def parse_optionale_belege(files):
+    """
+    Liest optionale Belege mit Claude Vision KI.
+    Unterstützt PDFs und Bilder (JPG, PNG, WEBP).
+    """
+    if not ANTHROPIC_KEY:
+        return []
+
+    WISO_PFADE = {
+        'tel':  {'name':'Telefon & Internet', 'wiso':'Werbungskosten → Arbeitsmittel → Telefon & Internet', 'hint':'20% der Jahreskosten ansetzbar', 'icon':'📱'},
+        'gew':  {'name':'Gewerkschaft / UFO', 'wiso':'Werbungskosten → Gewerkschaftsbeiträge', 'hint':'Voller Jahresbeitrag absetzbar', 'icon':'✊'},
+        'stb':  {'name':'Steuerberatung', 'wiso':'Sonderausgaben → Steuerberatungskosten', 'hint':'Voller Betrag absetzbar', 'icon':'📋'},
+        'bu':   {'name':'BU-Versicherung', 'wiso':'Vorsorgeaufwendungen → Sonstige Vorsorgeaufwendungen', 'hint':'Bis zum Höchstbetrag', 'icon':'🛡️'},
+        'arzt': {'name':'Arztkosten', 'wiso':'Außergewöhnliche Belastungen → Krankheitskosten', 'hint':'Zumutbarkeitsgrenze beachten', 'icon':'🏥'},
+        'zahn': {'name':'Zahnarzt', 'wiso':'Außergewöhnliche Belastungen → Krankheitskosten', 'hint':'Zumutbarkeitsgrenze beachten', 'icon':'🦷'},
+        'fort': {'name':'Weiterbildung', 'wiso':'Werbungskosten → Fortbildungskosten', 'hint':'Voller Betrag absetzbar', 'icon':'🎓'},
+        'arb':  {'name':'Arbeitsmittel', 'wiso':'Werbungskosten → Arbeitsmittel', 'hint':'Ab 952€ AfA beachten', 'icon':'🧳'},
+        'hand': {'name':'Handwerkerleistungen', 'wiso':'Haushaltsnahe Dienstleistungen → Handwerkerleistungen', 'hint':'20% der Lohnkosten, max. 1.200€', 'icon':'🔧'},
+        'haed': {'name':'Haushaltshilfe', 'wiso':'Haushaltsnahe Dienstleistungen', 'hint':'20% der Kosten, max. 4.000€', 'icon':'🧹'},
+        'spen': {'name':'Spenden', 'wiso':'Sonderausgaben → Spenden und Mitgliedsbeiträge', 'hint':'Bis 20% der Einkünfte', 'icon':'💝'},
+        'kind': {'name':'Kinderbetreuung', 'wiso':'Sonderausgaben → Kinderbetreuungskosten', 'hint':'2/3 der Kosten, max. 4.000€', 'icon':'👶'},
+        'rv':   {'name':'Altersvorsorge', 'wiso':'Vorsorgeaufwendungen → Beiträge zur Altersvorsorge', 'hint':'Riester/Rürup Grenzen beachten', 'icon':'💰'},
+        'haft': {'name':'Haftpflicht', 'wiso':'Vorsorgeaufwendungen → Sonstige', 'hint':'Anteilig absetzbar', 'icon':'⚖️'},
+        'kiru': {'name':'Kirchensteuer', 'wiso':'Sonderausgaben → Kirchensteuer', 'hint':'Voller Betrag', 'icon':'⛪'},
+        'medi': {'name':'Medikamente', 'wiso':'Außergewöhnliche Belastungen → Krankheitskosten', 'hint':'Mit ärztlicher Verordnung', 'icon':'💊'},
+        'konz': {'name':'Kontoführung', 'wiso':'Werbungskosten → Sonstige Werbungskosten', 'hint':'Pauschal 16€ oder Nachweis', 'icon':'🏦'},
+        'kv':   {'name':'Krankenzusatz', 'wiso':'Vorsorgeaufwendungen → Sonstige', 'hint':'Anteilig', 'icon':'🦷'},
+        'leb':  {'name':'Lebensversicherung', 'wiso':'Vorsorgeaufwendungen → Sonstige', 'hint':'Falls vor 2005', 'icon':'💚'},
+        'haus': {'name':'Hausrat & Rechtsschutz', 'wiso':'Vorsorgeaufwendungen → Sonstige', 'hint':'Anteilig', 'icon':'🏠'},
+        'pfle': {'name':'Pflege & Behinderung', 'wiso':'Außergewöhnliche Belastungen → Pflegekosten', 'hint':'Je nach Pflegegrad', 'icon':'🤝'},
+        'under':{'name':'Unterhalt', 'wiso':'Außergewöhnliche Belastungen → Unterhalt', 'hint':'Max. 11.604€', 'icon':'👨‍👧'},
+        'kata': {'name':'Außergewöhnl. Belastungen', 'wiso':'Außergewöhnliche Belastungen → Sonstige', 'hint':'Zumutbarkeitsgrenze', 'icon':'⛈️'},
+        'part': {'name':'Partei-/Verbandsbeiträge', 'wiso':'Sonderausgaben → Parteibeiträge', 'hint':'Max. 1.650€', 'icon':'🏛️'},
+    }
+
+    results = []
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+    def file_to_claude_content(file_bytes, filename=''):
+        """Converts file bytes to Claude message content (text or image)."""
+        # Detect file type
+        ext = filename.lower().split('.')[-1] if '.' in filename else ''
+        
+        # Try as image first (JPG, PNG, WEBP, GIF)
+        img_types = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 
+                     'png': 'image/png', 'webp': 'image/webp', 'gif': 'image/gif'}
+        if ext in img_types:
+            b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+            return {
+                'type': 'image',
+                'source': {'type': 'base64', 'media_type': img_types[ext], 'data': b64}
+            }
+        
+        # Check magic bytes for image
+        if file_bytes[:3] == b'\xff\xd8\xff':  # JPEG
+            b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+            return {'type':'image','source':{'type':'base64','media_type':'image/jpeg','data':b64}}
+        if file_bytes[:8] == b'\x89PNG\r\n\x1a\n':  # PNG
+            b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+            return {'type':'image','source':{'type':'base64','media_type':'image/png','data':b64}}
+        
+        # Try as PDF
+        try:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                text = ' '.join(p.extract_text() or '' for p in pdf.pages)
+                return {'type': 'text', 'text': text[:3000]}
+        except:
+            pass
+        
+        # Fallback: try as plain text
+        try:
+            return {'type': 'text', 'text': file_bytes.decode('utf-8', errors='ignore')[:3000]}
+        except:
+            return {'type': 'text', 'text': '[Datei konnte nicht gelesen werden]'}
+
+    for key, info in WISO_PFADE.items():
+        if not files.get(key):
+            continue
+
+        content_blocks = []
+        for i, file_bytes in enumerate(files[key]):
+            block = file_to_claude_content(file_bytes)
+            content_blocks.append(block)
+
+        if not content_blocks:
+            continue
+
+        content_blocks.append({
+            'type': 'text',
+            'text': f"""Analysiere diesen Beleg für: {info['name']}
+WISO-Eintrag: {info['wiso']}
+
+Extrahiere:
+1. Den relevanten Jahresbetrag (Gesamtsumme)
+2. Zeitraum (z.B. "2025" oder "Jan-Dez 2025")
+3. Kurze Beschreibung (max. 8 Wörter)
+
+Antworte NUR mit JSON (keine Backticks):
+{{"betrag": 245.80, "zeitraum": "2025", "beschreibung": "Monatliche Beiträge 2025"}}"""
+        })
+
+        try:
+            response = client.messages.create(
+                model='claude-sonnet-4-20250514',
+                max_tokens=200,
+                messages=[{'role': 'user', 'content': content_blocks}]
+            )
+            raw = response.content[0].text.strip()
+            raw = re.sub(r'```json|```', '', raw).strip()
+            parsed = json.loads(raw)
+            results.append({
+                'key': key,
+                'icon': info['icon'],
+                'name': info['name'],
+                'wiso': info['wiso'],
+                'hint': info['hint'],
+                'betrag': float(parsed.get('betrag', 0)),
+                'zeitraum': parsed.get('zeitraum', '2025'),
+                'beschreibung': parsed.get('beschreibung', ''),
+            })
+        except Exception as e:
+            print(f'Optional doc {key} error: {e}')
+            results.append({
+                'key': key, 'icon': info['icon'], 'name': info['name'],
+                'wiso': info['wiso'], 'hint': info['hint'],
+                'betrag': 0, 'zeitraum': '2025',
+                'beschreibung': 'Betrag konnte nicht extrahiert werden',
+            })
+
+    return results
+
+
 def berechne(form, files):
     """
     Berechnet alle Werbungskosten.
@@ -606,6 +761,13 @@ def berechne(form, files):
     if not files.get('dp'):  not_uploaded.append("Flugstunden-Uebersichten (alle 12 Monate?)")
     if not files.get('se'):  not_uploaded.append("Streckeneinsatz-Abrechnungen (alle 12 Monate?)")
 
+    # ── OPTIONALE BELEGE ──────────────────────────────────────
+    opt_keys = ['stb','gew','arb','fort','tel','konz','bu','haft','kv',
+                'rv','leb','haus','arzt','zahn','medi','pfle','under',
+                'kata','spen','part','kind','hand','haed','kiru']
+    opt_files = {k: files[k] for k in opt_keys if files.get(k)}
+    optionale_belege = parse_optionale_belege(opt_files) if opt_files else []
+
     return {
         'name':           form.get('name', 'Flugbegleiter'),
         'year':           form.get('year', 2025),
@@ -637,6 +799,7 @@ def berechne(form, files):
         'brutto':         lst['brutto'],
         'lohnsteuer':     lst['lohnsteuer'],
         'arbeitgeber':    lst.get('arbeitgeber','Deutsche Lufthansa AG'),
+        'optionale_belege': optionale_belege,
     }
 
 
@@ -900,6 +1063,36 @@ def erstelle_pdf(d):
         S.append(Spacer(1, 0.18*cm))
 
     S.append(Spacer(1, 0.4*cm))
+    # ── SEKTION 4: BELEGE ─────────────────────────────
+    opt_belege = d.get('optionale_belege', [])
+    if opt_belege:
+        S.append(PageBreak())
+        S.append(Paragraph("4. Belege — WISO-Einträge", H2))
+        bel_rows = [
+            [Paragraph("Beleg", TH), Paragraph("WISO-Pfad", TH), Paragraph("Betrag", THR)]
+        ]
+        for b in opt_belege:
+            if b.get('betrag', 0) > 0:
+                bel_rows.append([
+                    Paragraph(b['icon'] + ' ' + b['name'], TD),
+                    Paragraph(b['wiso'], ps("bwiso", fontSize=8, textColor=BLUE, fontName="Helvetica", leading=11)),
+                    Paragraph(eur(b['betrag']), TDRB),
+                ])
+                if b.get('hint'):
+                    bel_rows.append([
+                        Paragraph('', SM),
+                        Paragraph('💡 ' + b['hint'], ps("bhint", fontSize=7.5, textColor=HexColor("#94a3b8"), fontName="Helvetica", leading=11)),
+                        Paragraph('', SM),
+                    ])
+        if len(bel_rows) > 1:
+            S.append(tbl(bel_rows, [5.5*cm, 8.5*cm, 3.2*cm]))
+            S.append(Spacer(1, 0.3*cm))
+            S.append(Paragraph(
+                "Hinweis: Die obigen Beträge wurden von der KI aus deinen hochgeladenen Belegen extrahiert. "
+                "Bitte prüfe die Angaben vor dem Einreichen beim Finanzamt.",
+                ps("belhinweis", fontSize=7.5, textColor=TEXT2, fontName="Helvetica", leading=11)
+            ))
+
     S.append(HRFlowable(width="100%", thickness=0.5, color=GREYB, spaceAfter=8))
     S.append(Paragraph(
         f"Erstellt mit AeroTax · aerotax.de · {d['datum']}",
