@@ -334,6 +334,8 @@ def process_real():
 
         # ── BERECHNUNG MIT ECHTER KI ──
         result = berechne(form, files)
+        if isinstance(result, tuple):
+            result = result[0]
 
         # ── PDF ERSTELLEN ──
         pdf_bytes = erstelle_pdf(result)
@@ -1152,7 +1154,7 @@ def berechne(form, files):
         try:
             dp = parse_dienstplan_mit_ki(files['dp'], se_bytes_list=files.get('se'))
         except RuntimeError as e:
-            return jsonify({'error': str(e), 'notes': [str(e)]}), 422
+            raise
         if not dp or not dp.get('arbeitstage'):
             missing.append('Flugstunden-Übersichten (Analyse fehlgeschlagen — bitte nochmal versuchen)')
             dp = None
