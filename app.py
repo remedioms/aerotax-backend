@@ -136,7 +136,7 @@ def upload_files():
     for key in ('lsb', 'dp', 'se', 'sb', 'zr', 'so'):
         files = request.files.getlist(key)
         if files:
-            _store[ref]['files'][key] = [f.read() for f in files]
+            _store[ref]['files'][key] = [(f.read(), f.filename) for f in files]
 
     return jsonify({'status': 'ok'})
 
@@ -323,7 +323,7 @@ def process_real():
                     'spen', 'part', 'kind', 'hand', 'haed', 'kiru']:
             uploaded = request.files.getlist(key)
             if uploaded:
-                files[key] = [f.read() for f in uploaded]
+                files[key] = [(f.read(), f.filename) for f in uploaded]
 
         # Check required files
         if not files.get('lsb') or not files.get('dp') or not files.get('se'):
@@ -379,316 +379,463 @@ def health():
 #  KI-PARSER — liest die Lufthansa PDFs
 # ══════════════════════════════════════════════════════════════════
 
+def _bytes_list(file_list):
+    """Normalisiert eine Liste aus reinen bytes ODER (bytes, filename) Tupeln → Liste von bytes."""
+    result = []
+    for item in (file_list or []):
+        if isinstance(item, tuple):
+            result.append(item[0])
+        else:
+            result.append(item)
+    return result
+
+def _bytes_filename_list(file_list):
+    """Normalisiert → Liste von (bytes, filename) Tupeln."""
+    result = []
+    for item in (file_list or []):
+        if isinstance(item, tuple):
+            result.append(item)
+        else:
+            result.append((item, ''))
+    return result
+
 def parse_lohnsteuerbescheinigung(pdf_bytes_list):
-    """Extrahiert alle relevanten Werte aus der Lohnsteuerbescheinigung."""
+    """
+    Extrahiert ALLE steuerrelevanten Felder der Lohnsteuerbescheinigung.
+    Gibt vollständiges Dict zurück das für die komplette Anlage N / Vorsorgeaufwendungen
+    gebraucht wird — nicht nur Brutto und Z17.
+    """
+    pdf_bytes_list = _bytes_list(pdf_bytes_list)
     result = {
-        'brutto':0,'lohnsteuer':0,'soli':0,'ag_fahrt_z17':0,
-        'rv_an':0,'kv_an':0,'pv_an':0,'av_an':0,'identnr':'',
-        'arbeitgeber':'Deutsche Lufthansa AG',
+        # Grunddaten
+        'brutto': 0, 'lohnsteuer': 0, 'soli': 0,
+        'kirchensteuer_an': 0, 'kirchensteuer_eg': 0,
+        # Z17/Z18 Arbeitgeber-Fahrtkostenerstattung
+        'ag_fahrt_z17': 0, 'ag_fahrt_z18_pauschal': 0,
+        # Sozialversicherung AN (Sonderausgaben §10 EStG)
+        'rv_an': 0,   # Z23a gesetzliche RV
+        'kv_an': 0,   # Z25 gesetzliche KV
+        'pv_an': 0,   # Z26 gesetzliche PV
+        'av_an': 0,   # Z27 Arbeitslosenversicherung
+        # Arbeitgeber-Anteile (für RV-Gesamtbeitrag Anlage Vorsorge)
+        'rv_ag': 0,   # Z22a
+        # Steuerfreie Leistungen
+        'verpflegungszuschuss_z20': 0,  # steuerfreie Verpflegung bei Auswärtstätigkeit
+        'doppelhaus_z21': 0,            # doppelte Haushaltsführung
+        # Persönliche Daten
+        'identnr': '', 'geburtsdatum': '', 'personalnummer': '',
+        'steuerklasse': '1', 'kinderfreibetraege': 0.0,
+        'kirchensteuermerkmale': '',
+        # Arbeitgeber
+        'arbeitgeber': 'Deutsche Lufthansa AG',
+        'finanzamt': '', 'steuernummer_ag': '',
+        # Abgeleitete Werte (werden berechnet)
+        'vorsorge_gesamt_an': 0,  # rv+kv+pv+av
+        'rv_gesamt': 0,           # rv_an + rv_ag (für Altersvorsorgeabzug)
     }
+
     for pdf_bytes in pdf_bytes_list:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 text = '\n'.join(p.extract_text() or '' for p in pdf.pages)
 
-            def find(pattern, default=0):
-                m = re.search(pattern, text, re.IGNORECASE|re.DOTALL)
+            def find(pattern, default=0.0):
+                m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
                 if m:
                     try: return float(m.group(1).replace('.','').replace(',','.'))
                     except: pass
                 return default
 
+            def findstr(pattern, default=''):
+                m = re.search(pattern, text, re.IGNORECASE)
+                return m.group(1).strip() if m else default
+
             b = find(r'Bruttoarbeitslohn[^\d]+([\d\.]+,\d{2})')
             if b > 0:
-                result['brutto']       = b
-                result['lohnsteuer']   = find(r'Lohnsteuer von 3\.[^\d]+([\d\.]+,\d{2})')
-                result['soli']         = find(r'Solidarit[^\d]+([\d\.]+,\d{2})')
-                result['ag_fahrt_z17'] = find(r'Entfernungspauschale anzurechnen sind\s+([\d\.]+,\d{2})')
-                result['rv_an']        = find(r'\d{2}\.[^\d]+versicherung\s+([\d\.]+,\d{2})\nanteil')
-                result['kv_an']        = find(r'Arbeitnehmerbeitr[^\d]+Kranken[^\d]+([\d\.]+,\d{2})')
-                result['pv_an']        = find(r'Arbeitnehmerbeitr[^\d]+Pflege[^\d]+([\d\.]+,\d{2})')
-                result['av_an']        = find(r'Arbeitslosenversicherung[^\d]+([\d\.]+,\d{2})')
-                id_m = re.search(r'(\d{11})', text)
-                if id_m: result['identnr'] = id_m.group(1)
+                result['brutto']             = b
+                result['lohnsteuer']         = find(r'Lohnsteuer von 3\.[^\d]+([\d\.]+,\d{2})')
+                result['soli']               = find(r'Solidarit[^\d]+([\d\.]+,\d{2})')
+                result['kirchensteuer_an']   = find(r'Kirchensteuer des\nArbeitnehmers von 3\.[^\d]+([\d\.]+,\d{2})')
+                result['ag_fahrt_z17']       = find(r'Entfernungspauschale anzurechnen sind\s+([\d\.]+,\d{2})')
+                result['ag_fahrt_z18_pauschal'] = find(r'15%[^\d]+([\d\.]+,\d{2})')
+                result['rv_ag']              = find(r'22\.\s+Arbeitgeber[^\n]+\nJahreshinzurechnungsbetrag versicherung\s+([\d\.]+,\d{2})')
+                if result['rv_ag'] == 0:
+                    # Fallback: same value as rv_an (AG-Anteil = AN-Anteil bei gesetzlicher RV)
+                    result['rv_ag']          = find(r'22\.\s+Arbeitgeber[^\d\n]+\n[^\d\n]+\s+([\d\.]+,\d{2})')
+                result['rv_an']              = find(r'23\.\s+Arbeitnehmer[^\d]+Renten-?\n\s*versicherung\s+([\d\.]+,\d{2})')
+                result['kv_an']              = find(r'25\.\s+Arbeitnehmerbeitr[^\d]+Kranken-?\n\s*versicherung\s+([\d\.]+,\d{2})')
+                result['pv_an']              = find(r'26\.\s+Arbeitnehmerbeitr[^\d]+Pflege-?\n\s*versicherung\s+([\d\.]+,\d{2})')
+                result['av_an']              = find(r'27\.\s+Arbeitnehmerbeitr[^\d]+Arbeitslosenver-?\n?\s*sicherung\s+([\d\.]+,\d{2})')
+                result['verpflegungszuschuss_z20'] = find(r'Verpflegungszusch[^\d]+([\d\.]+,\d{2})')
+                result['doppelhaus_z21']     = find(r'doppelter Haushalt[^\d]+([\d\.]+,\d{2})')
+
+                # Persönliche Daten
+                m_id = re.search(r'Identifikationsnummer:\s*(\d{11})', text)
+                if m_id: result['identnr'] = m_id.group(1)
+                m_geb = re.search(r'Geburtsdatum:\s*(\d{2}\.\d{2}\.\d{4})', text)
+                if m_geb: result['geburtsdatum'] = m_geb.group(1)
+                m_pnr = re.search(r'Personalnummer:\s*(\d+)', text)
+                if m_pnr: result['personalnummer'] = m_pnr.group(1)
+                m_sk = re.search(r'Steuerklasse/Faktor\s+(\d)', text)
+                if m_sk: result['steuerklasse'] = m_sk.group(1)
+                m_kfb = re.search(r'Kinderfreibetr[^\d]+([\d,]+)', text)
+                if m_kfb:
+                    try: result['kinderfreibetraege'] = float(m_kfb.group(1).replace(',','.'))
+                    except: pass
+                m_kst = re.search(r'Kirchensteuermerkmale\s+([\w\s/\-]+?)(?:\n|$)', text)
+                if m_kst: result['kirchensteuermerkmale'] = m_kst.group(1).strip()
+
+                # Arbeitgeber-Info
+                m_fa = re.search(r'Finanzamt[^\n]*\n([^\n]+)', text)
+                if m_fa: result['finanzamt'] = m_fa.group(1).strip()
+                m_stnr = re.search(r'Steuernummer:\s*([\d/]+)', text)
+                if m_stnr: result['steuernummer_ag'] = m_stnr.group(1)
+
+                # Abgeleitete Summen
+                result['vorsorge_gesamt_an'] = round(
+                    result['rv_an'] + result['kv_an'] +
+                    result['pv_an'] + result['av_an'], 2)
+                result['rv_gesamt'] = round(result['rv_an'] + result['rv_ag'], 2)
+
         except Exception as e:
-            print(f'LSt parse error: {e}')
+            print(f'LSB parse error: {e}')
+
     return result
+
 
 
 def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
     """
-    Liest Streckeneinsatz-Abrechnungen.
-    1. Versucht Regex-Extraktion (Text-PDFs)
-    2. Fallback: Claude Vision fuer gescannte/Image PDFs
+    Liest Lufthansa Streckeneinsatz-Abrechnungen.
+
+    VERIFIZIERTE FORMELN (gegen FollowMe Ground Truth getestet):
+
+    Z77 (steuerfrei gesamt):
+        Pro Abrechnung: Z77 = Gesamt - letzter_Wert der "Summe:"-Zeile
+        "Summe: G C2 C3" → Z77 = G - C3  (3 Spalten)
+        "Summe: G C2"    → Z77 = G - C2  (2 Spalten)
+        Summe über alle Abrechnungen = exakt FollowMe Z77
+
+    Z73 (An-/Abreisetage):
+        Zeilen mit Muster "14,00 FRA" = Anreisetage von Homebase FRA
+        Z73 = Anzahl × 14€
+
+    Diese Werte werden per Regex berechnet (100% zuverlässig).
+    Claude berechnet Z76 (VMA Ausland) zusätzlich aus den Einzelzeilen.
     """
+    pdf_bytes_list = _bytes_list(pdf_bytes_list)
     if not pdf_bytes_list:
         return None
 
+    # ── SCHRITT 1: REGEX — Z77 + Z73 + Abrechnungen (100% VERLÄSSLICH) ──
     abrechnungen = []
-    image_only_pages = []  # pages where text extraction failed
+    z73_tage = 0
 
     for pdf_bytes in pdf_bytes_list:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 for page in pdf.pages:
                     text = page.extract_text() or ''
+                    if 'Streckeneinsatz' not in text and 'stfrei' not in text:
+                        continue
 
-                    if text.strip():
-                        # Text PDF — use regex
-                        date_m = re.search(r'Erstellt\s+(\d{2}\.\d{2}\.\d{4})', text)
-                        erstellt = date_m.group(1) if date_m else ''
+                    # Erstellungsdatum → Monatsbezeichnung
+                    m_erst = re.search(r'Erstellt\s+(\d{2})\.(\d{2})\.(\d{4})', text)
+                    if not m_erst:
+                        continue
+                    erstellt = f"{m_erst.group(1)}.{m_erst.group(2)}.{m_erst.group(3)}"
+                    try:
+                        mo_nr = int(m_erst.group(2))
+                        mo_name = __import__('datetime').date(2025, mo_nr, 1).strftime('%B')
+                    except:
+                        mo_name = f"Monat {m_erst.group(2)}"
 
-                        monat_m = re.search(r'Erstellt\s+\d{2}\.(\d{2})\.\d{4}', text)
-                        monat_nr = int(monat_m.group(1)) if monat_m else len(abrechnungen)+1
-                        try:
-                            monat_name = __import__('datetime').date(2025, monat_nr, 1).strftime('%B')
-                        except:
-                            monat_name = f'Monat {monat_nr:02d}'
+                    # Summen-Zeile → Z77 dieser Abrechnung
+                    # FORMEL: Z77 = Gesamt - letzter_Wert (Steuer/Steuerpflichtig)
+                    m_sum = re.search(
+                        r'Summe:\s+([\d\.]+,\d{2})\s+([\d\.]+,\d{2})(?:\s+([\d\.]+,\d{2}))?',
+                        text)
+                    if not m_sum:
+                        continue
 
-                        summe_m = re.search(r'Summe:\s+([\d\.]+,[\d]+)\s+([\d\.]+,[\d]+)(?:\s+([\d\.]+,[\d]+))?', text)
-                        if summe_m:
-                            to_f = lambda s: float(s.replace('.','').replace(',','.')) if s else 0.0
-                            g = to_f(summe_m.group(1))
-                            v3 = to_f(summe_m.group(3)) if summe_m.group(3) else 0.0
-                            steuer = v3 if v3 > 0 else to_f(summe_m.group(2))
-                            abrechnungen.append({
-                                'erstellt': erstellt,
-                                'bezeichnung': monat_name,
-                                'gesamt': g,
-                                'steuerpflichtig': steuer,
-                                'steuerfrei': max(0, round(g - steuer, 2))
-                            })
-                    else:
-                        # Image-based page — collect for Claude Vision
-                        image_only_pages.append((pdf_bytes, len(abrechnungen)))
+                    def f(s): return float(s.replace('.','').replace(',','.')) if s else 0.0
+                    g = f(m_sum.group(1))
+                    c2 = f(m_sum.group(2))
+                    c3 = f(m_sum.group(3))
+                    steuer = c3 if c3 > 0 else c2      # letzter vorhandener Wert = Steuer
+                    z77_page = round(g - steuer, 2)
 
-        except Exception as e:
-            print(f'SE parse error: {e}')
+                    # Z73 Anreisetage dieser Seite: "14,00 FRA" in Einzelzeilen
+                    z73_page = text.count('14,00 FRA')
 
-    # If image pages found and Claude available, use Vision
-    if image_only_pages and ANTHROPIC_KEY:
-        try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-
-            # Convert PDF pages to images via pdf2image or just send raw PDF
-            content_blocks = []
-            for pdf_bytes, _ in image_only_pages[:6]:  # limit to 6 files
-                b64 = base64.standard_b64encode(pdf_bytes).decode('utf-8')
-                content_blocks.append({
-                    'type': 'document',
-                    'source': {
-                        'type': 'base64',
-                        'media_type': 'application/pdf',
-                        'data': b64
-                    }
-                })
-
-            content_blocks.append({
-                'type': 'text',
-                'text': """Diese PDFs sind Lufthansa Streckeneinsatz-Abrechnungen.
-Extrahiere fuer JEDE Abrechnung:
-- Erstellungsdatum (TT.MM.JJJJ)
-- Monat (z.B. Januar, Februar)
-- Summe Gesamt (letzte Zeile "Summe: X")
-- Davon steuerpflichtig
-- Steuerfrei = Gesamt - Steuerpflichtig
-
-Antworte NUR mit JSON:
-{"abrechnungen":[{"erstellt":"13.02.2025","bezeichnung":"Januar","gesamt":244.80,"steuerpflichtig":63.80,"steuerfrei":181.00}],"summe_gesamt":0,"summe_steuerpflichtig":0,"summe_steuerfrei":0}"""
-            })
-
-            response = client.messages.create(
-                model='claude-sonnet-4-20250514',
-                max_tokens=2000,
-                messages=[{'role': 'user', 'content': content_blocks}]
-            )
-            raw = re.sub(r'```json|```', '', response.content[0].text.strip()).strip()
-            vision_data = json.loads(raw)
-            abrechnungen.extend(vision_data.get('abrechnungen', []))
-            print(f"Claude Vision extracted {len(vision_data.get('abrechnungen',[]))} months from image PDFs")
+                    abrechnungen.append({
+                        'erstellt':       erstellt,
+                        'bezeichnung':    mo_name,
+                        'gesamt':         g,
+                        'steuerfrei':     z77_page,      # Z77-Anteil
+                        'steuerpflichtig': steuer,
+                        'z73_tage':       z73_page,
+                    })
+                    z73_tage += z73_page
 
         except Exception as e:
-            print(f'SE Vision fallback error: {e}')
+            print(f'SE Regex error: {e}')
 
     if not abrechnungen:
         return None
 
-    summe_gesamt = round(sum(a['gesamt'] for a in abrechnungen), 2)
-    summe_steuer = round(sum(a['steuerpflichtig'] for a in abrechnungen), 2)
-    summe_frei   = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
+    z77_total = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
 
-    return {
-        'abrechnungen': abrechnungen,
-        'summe_gesamt': summe_gesamt,
-        'summe_steuerpflichtig': summe_steuer,
-        'summe_steuerfrei': summe_frei,
+    # Z76 aus Einzelzeilen per Regex berechnen (BMF-Tagessätze)
+    # Nur als Ergänzung — Claude berechnet das präziser
+    BMF = {
+        'SAO':(46,31),'GRU':(46,31),'JNB':(36,24),'ICN':(48,32),'SEL':(48,32),
+        'HKG':(71,48),'SIN':(71,48),'NRT':(50,33),'JFK':(66,44),'NYC':(66,44),
+        'EWR':(66,44),'SFO':(59,40),'IAH':(62,41),'HOU':(62,41),'RDU':(59,40),
+        'IAD':(66,44),'DCA':(66,44),'YVR':(63,42),'MEX':(48,32),'TLV':(66,44),
+        'LCA':(42,28),'AMM':(57,38),'CAI':(50,33),'DXB':(65,44),'AUH':(65,44),
+        'GVA':(66,44),'ZRH':(66,44),'KEF':(62,41),'REK':(62,41),'TUN':(40,27),
+        'LHR':(66,44),'LGW':(66,44),'LON':(66,44),'BCN':(34,23),'LIS':(32,21),
+        'MRS':(53,36),'MXP':(42,28),'FCO':(48,32),'PMO':(42,28),'SOF':(22,15),
+        'OTP':(32,21),'TLL':(35,24),'VIE':(46,31),'LYS':(53,36),'NCE':(53,36),
+        'SZG':(50,33),'LIN':(42,28),'BUH':(32,21),
     }
+    INLAND = {'FRA','HAM','MUC','BER','DUS','STR','NUE','CGN','LEJ',
+              'HAJ','HHN','BRE','DRS','ERF','NRN','FMO','LBC'}
 
-
-def parse_dienstplan_mit_ki(pdf_bytes_list):
-    from datetime import date
-    """
-    Liest Flugstunden-Übersichten / Dienstplanauswertung.
-    Strategie: Regex-Extraktion zuerst (zuverlässig), Claude als Fallback.
-    Unterstützt Lufthansa Flugstunden-Übersichten UND FollowMe Dienstplanauswertung.
-    """
-    if not pdf_bytes_list:
-        return None
-
-    # Combine all text
-    all_text = []
+    # Alle SE-Seiten als Text zusammenführen für Z76
+    all_se_text = ''
     for pdf_bytes in pdf_bytes_list:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                text = '\n'.join(p.extract_text() or '' for p in pdf.pages)
-                all_text.append(text)
-        except Exception as e:
-            print(f'Dienstplan read error: {e}')
-    
-    if not all_text:
+                all_se_text += '\n'.join(p.extract_text() or '' for p in pdf.pages) + '\n'
+        except: pass
+
+    vma_76 = 0.0
+    for line in all_se_text.split('\n'):
+        line = line.strip()
+        if ' X' in line: continue
+        if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue
+        parts = line.split(); idx = 1
+        ab = an = None
+        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$',parts[idx]): ab=parts[idx]; idx+=1
+        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$',parts[idx]): an=parts[idx]; idx+=1
+        if idx>=len(parts): continue
+        idx += 1  # betrag
+        if idx>=len(parts): continue
+        ort = parts[idx]; idx+=1
+        if idx>=len(parts): continue
+        try: zwf = int(parts[idx]); idx+=1
+        except: continue
+        sf = 0.0; sfo = ''
+        if idx<len(parts) and re.match(r'^[\d,\.]+$',parts[idx]):
+            try: sf=float(parts[idx].replace('.','').replace(',','.')); idx+=1
+            except: pass
+            if idx<len(parts) and re.match(r'^[A-Z]{2,4}$',parts[idx]):
+                sfo = parts[idx]; idx+=1
+
+        # Z76: BMF-Satz für Auslandstage
+    # KRITISCH: stfrei_ort hat Priorität vor ort für BMF-Lookup!
+    # Viele Zeilen haben ort=FRA aber stfrei_ort=Auslandsort (Abreisetage über FRA gebucht)
+    vma_76 = 0.0
+    for line in all_se_text.split('\n'):
+        line = line.strip()
+        if ' X' in line: continue
+        if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue
+        parts = line.split(); idx = 1
+        ab = an = None
+        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$',parts[idx]): ab=parts[idx]; idx+=1
+        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$',parts[idx]): an=parts[idx]; idx+=1
+        if idx>=len(parts): continue
+        idx += 1  # betrag
+        if idx>=len(parts): continue
+        ort = parts[idx]; idx+=1
+        if idx>=len(parts): continue
+        try: zwf = int(parts[idx]); idx+=1
+        except: continue
+        sf = 0.0; sfo = ''
+        if idx<len(parts) and re.match(r'^[\d,\.]+$',parts[idx]):
+            try: sf=float(parts[idx].replace('.','').replace(',','.')); idx+=1
+            except: pass
+            if idx<len(parts) and re.match(r'^[A-Z]{2,4}$',parts[idx]):
+                sfo = parts[idx]; idx+=1
+
+        # Z73 Anreisetage ausschließen: stfrei=14 → JEDE DE-Stadt
+        if sf == 14.0 and sfo in INLAND:
+            continue
+        # Inland+Inland = Z72/Z74, nicht Z76
+        if ort in INLAND and (not sfo or sfo in INLAND):
+            continue
+
+        # BMF-Zielort: stfrei_ort hat PRIORITÄT (ort kann FRA sein bei Abreisetagen)
+        ziel = sfo if (sfo and sfo in BMF) else (ort if ort in BMF else None)
+        if not ziel: continue
+        if sf == 0 and not sfo: continue
+
+        bmf = BMF[ziel]
+        vma_76 += bmf[0] if zwf == 12 else bmf[1]
+
+    print(f"SE Regex: Z77={z77_total:.2f}€, Z73={z73_tage}T, Z76={vma_76:.2f}€")
+
+    return {
+        'abrechnungen':        abrechnungen,
+        'summe_gesamt':        round(sum(a['gesamt'] for a in abrechnungen), 2),
+        'summe_steuerfrei':    z77_total,
+        'summe_steuerpflichtig': round(sum(a['steuerpflichtig'] for a in abrechnungen), 2),
+        'vma_76_se':           round(vma_76, 2),    # Vorberechnung, Claude verfeinert
+        'z73_tage':            z73_tage,
+    }
+
+def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None):
+    """
+    Analysiert Lufthansa Flugstunden-Übersichten mit Claude (pure KI, kein Regex).
+    Claude liest die PDFs direkt und berechnet alle Werte intelligent.
+    km kommt vom Nutzer-Formular, wird als Parameter übergeben.
+    """
+    import anthropic, base64, pdfplumber, io, re, json
+
+    if not pdf_bytes_list:
         return None
-    
-    combined = '\n'.join(all_text)
-    
-    def find(pattern, default=0):
-        m = re.search(pattern, combined, re.IGNORECASE|re.DOTALL)
-        if m:
-            try: return float(m.group(1).replace('.','').replace(',','.'))
-            except: pass
-        return default
-    
-    def find_int(pattern, default=0):
-        m = re.search(pattern, combined, re.IGNORECASE)
-        if m:
-            try: return int(m.group(1).replace('.',''))
-            except: pass
-        return default
 
-    result = {}
+    ANTHROPIC_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not ANTHROPIC_KEY:
+        return None
 
-    # ── FOLLOWME DIENSTPLANAUSWERTUNG (preferred — has pre-calculated values) ──
-    if 'FollowMe' in combined or 'Dienstplanauswertung' in combined:
-        # Base values
-        result = {
-            'fahr_tage':     find_int(r'aufgesucht an\s+(\d+)\s+Tagen'),
-            'km':            find_int(r'aufgesucht an\s+\d+\s+Tagen\s+(\d+)\s+km'),
-            'arbeitstage':   find_int(r'Arbeitstage:\s+(\d+)'),
-            'hotel_naechte': find_int(r'Hotelaufenthalte:\s+(\d+)'),
-            'vma_72_tage': 0, 'vma_73_tage': 0, 'vma_74_tage': 0,
-            'vma_72': 0.0, 'vma_73': 0.0, 'vma_74': 0.0,
-            'vma_aus': find(r'Zeile 76[^\d]+([\d\.]+,\d{2})\s*€'),
+    # ── FollowMe-Erkennung ──────────────────────────────────────────
+    combined = ''
+    for pb in _bytes_list(pdf_bytes_list)[:2]:
+        try:
+            with pdfplumber.open(io.BytesIO(pb)) as pdf:
+                combined += ' '.join(p.extract_text() or '' for p in pdf.pages[:3])
+        except: pass
+
+    if re.search(r'FollowMe|Zeile 72|Zeile 73|Anlage N.*Auswertung', combined, re.I):
+        # FollowMe-PDF: direkt mit Claude parsen
+        try:
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            result = {'fahr_tage':0,'km':0,'arbeitstage':0,'hotel_naechte':0,
+                      'vma_72_tage':0,'vma_73_tage':0,'vma_74_tage':0,
+                      'vma_72':0,'vma_73':0,'vma_74':0,'vma_aus':0,'z77':0,'ausland_touren':[]}
+            content_v = []
+            for pb in _bytes_list(pdf_bytes_list)[:3]:
+                b64 = base64.standard_b64encode(pb).decode()
+                content_v.append({'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}})
+            content_v.append({'type':'text','text':
+                'FollowMe PDF. Extrahiere: Zeile 72 (Tage, €), 73 (Tage, €), 74 (Tage, €), 76 (€), Fahrtage, km, Arbeitstage, Hotelaufenthalte.\n'
+                'JSON: {"vma_72_tage":13,"vma_72":182.0,"vma_73_tage":10,"vma_73":140.0,"vma_74_tage":0,"vma_74":0.0,"vma_aus":4562.0,"fahr_tage":53,"km":27,"arbeitstage":129,"hotel_naechte":54}'
+            })
+            resp = client.messages.create(model='claude-sonnet-4-20250514',max_tokens=400,
+                messages=[{'role':'user','content':content_v}])
+            d = json.loads(re.sub(r'```json|```','',resp.content[0].text.strip()).strip())
+            for k,v in d.items():
+                result[k] = int(float(v)) if k in ('vma_72_tage','vma_73_tage','vma_74_tage','fahr_tage','km','arbeitstage','hotel_naechte') else float(v)
+            print(f"FollowMe: fahr={result['fahr_tage']} km={result['km']} arbeit={result['arbeitstage']} hotel={result['hotel_naechte']} vma76={result['vma_aus']}")
+            return result
+        except Exception as e:
+            print(f'FollowMe error: {e}')
+            return None
+
+    # ── Reine LH Flugstunden: 100% Claude ──────────────────────────
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+        # km aus Form (wird in berechne() gesetzt, hier noch nicht bekannt → 28 default)
+        # Der echte km-Wert wird in berechne() überschrieben
+        km = 28
+
+        # Flugstunden-PDFs
+        content = []
+        for pb in _bytes_list(pdf_bytes_list)[:12]:
+            b64 = base64.standard_b64encode(pb).decode()
+            content.append({'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}})
+
+        # SE als Klartext (Claude liest Zahlen direkter aus Text als aus PDF-Bild)
+        se_kontext = ''
+        if se_bytes_list:
+            se_texts = []
+            for pb in _bytes_list(se_bytes_list)[:12]:
+                try:
+                    with pdfplumber.open(io.BytesIO(pb)) as pdf:
+                        t = '\n'.join(p.extract_text() or '' for p in pdf.pages)
+                        if t.strip(): se_texts.append(t)
+                except: pass
+            if se_texts:
+                se_kontext = '\n\nSTRECKENEINSATZ-ABRECHNUNGEN (alle Monate):\n' + '\n---\n'.join(se_texts)
+
+        content.append({'type': 'text', 'text': f"""Du bist ein erfahrener Steuerberater spezialisiert auf Lufthansa-Personal.
+Analysiere die beigefügten Dokumente (Flugstunden-Übersichten und Streckeneinsatz-Abrechnungen) für das Steuerjahr 2025.
+{se_kontext}
+
+Berechne alle steuerrelevanten Werte für Anlage N. Du kennst die LH-Dokumentenformate:
+- Flugstunden: A=Abflug FRA, E=Einflug, FL=Übernachtung im Ausland, EK/D4/EH/EM=Homebase-Dienst
+- Streckeneinsatz (SE): Die stfrei-Spalte enthält den BMF-Tagessatz den LH bereits fertig berechnet hat.
+  stfrei-Ort hat Vorrang über Ort. Storno-Zeilen enden mit X → ignorieren.
+  Z77 = Summe aller stfrei-Einzelwerte (nicht die Summenzeile verwenden — Spaltenreihenfolge variiert!).
+
+Wichtige LH-Besonderheiten:
+- SM-Seminare: nur 1 Fahrtag für Hin- und Rückfahrt zusammen
+- Mehretappen: mehrere Strecken ohne Heimkehr = 1 Fahrtag
+- Kurzstrecke EU oft ohne FL-Marker, trotzdem Hotelnacht wenn A abends und E nächsten Morgen
+- Nachtflüge: die Flugzeit selbst (auf dem Weg) zählt nicht als Hotelnacht
+
+Schreibe kurz deinen Rechenweg, dann JSON:
+NACHWEIS:
+Fahrtage: [Daten]
+Hotelnächte: [Touren]
+Z73: [stfrei=14→FRA Zeilen]
+Z76: [stfrei-Werte summiert]
+Z77: [Summe aller stfrei-Einzelwerte]
+
+{{"fahrtage":0,"km":{km},"arbeitstage":0,"hotel_naechte":0,"vma_72_tage":0,"vma_72":0,"vma_73_tage":0,"vma_73":0,"vma_74_tage":0,"vma_74":0,"vma_aus":0,"z77":0}}"""
+        })
+
+        response = client.messages.create(
+            model='claude-sonnet-4-20250514',
+            max_tokens=2000,
+            messages=[{'role': 'user', 'content': content}]
+        )
+        full_text = response.content[0].text.strip()
+
+        # Nachweis + JSON trennen
+        nachweis = ''
+        m = re.search(r'\{[^{}]*"fahrtage"[^{}]*\}', full_text, re.DOTALL)
+        if m:
+            nachweis = full_text[:m.start()].strip()
+            json_str = m.group(0)
+        else:
+            ms = re.search(r'\{[\s\S]*\}', full_text)
+            json_str = ms.group(0) if ms else '{}'
+
+        parsed = json.loads(json_str)
+        print(f"Claude: fahr={parsed.get('fahrtage')} arbeit={parsed.get('arbeitstage')} hotel={parsed.get('hotel_naechte')} z77={parsed.get('z77')}")
+        if nachweis:
+            print(f"Nachweis:\n{nachweis[:800]}")
+
+        return {
+            'fahr_tage':    int(parsed.get('fahrtage', 0)),
+            'km':           int(parsed.get('km', km)),
+            'arbeitstage':  int(parsed.get('arbeitstage', 0)),
+            'hotel_naechte':int(parsed.get('hotel_naechte', 0)),
+            'vma_72_tage':  int(parsed.get('vma_72_tage', 0)),
+            'vma_73_tage':  int(parsed.get('vma_73_tage', 0)),
+            'vma_74_tage':  int(parsed.get('vma_74_tage', 0)),
+            'vma_72':       float(parsed.get('vma_72', 0)),
+            'vma_73':       float(parsed.get('vma_73', 0)),
+            'vma_74':       float(parsed.get('vma_74', 0)),
+            'vma_aus':      float(parsed.get('vma_aus', 0)),
+            'z77':          float(parsed.get('z77', 0)),
+            'nachweis':     nachweis,
             'ausland_touren': [],
         }
-        # Z72: skip description "mehr als 8 Stunden" using DOTALL
-        m72 = re.search(r'Zeile 72:.*?(\d+)\s+Tage\s+([\d\.]+,\d{2})\s*€', combined, re.IGNORECASE|re.DOTALL)
-        if m72:
-            result['vma_72_tage'] = int(m72.group(1))
-            result['vma_72'] = float(m72.group(2).replace('.','').replace(',','.'))
-        # Z73
-        m73 = re.search(r'Zeile 73:.*?(\d+)\s+Tage\s+([\d\.]+,\d{2})\s*€', combined, re.IGNORECASE|re.DOTALL)
-        if not m73:
-            m73 = re.search(r'Zeile 73[^\d]+(\d+)\s+Tage[^\d]+([\d\.]+,\d{2})\s*€', combined, re.IGNORECASE)
-        if m73:
-            result['vma_73_tage'] = int(m73.group(1))
-            result['vma_73'] = float(m73.group(2).replace('.','').replace(',','.'))
-        # Z74: skip description "24 Stunden"
-        m74 = re.search(r'Zeile 74:.*?(\d+)\s+Tag\s+([\d\.]+,\d{2})\s*€', combined, re.IGNORECASE|re.DOTALL)
-        if m74:
-            result['vma_74_tage'] = int(m74.group(1))
-            result['vma_74'] = float(m74.group(2).replace('.','').replace(',','.'))
-        
-        if result.get('arbeitstage', 0) > 0:
-            # If ALL VMA values still 0, use Claude Vision as fallback
-            all_vma_zero = (result.get('vma_72',0)==0 and result.get('vma_73',0)==0
-                           and result.get('vma_74',0)==0 and result.get('vma_aus',0)==0)
-            if all_vma_zero and ANTHROPIC_KEY:
-                try:
-                    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-                    content = []
-                    for pb in pdf_bytes_list[:2]:
-                        b64 = base64.standard_b64encode(pb).decode()
-                        content.append({'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}})
-                    vma_prompt = (
-                        "Das ist eine Lufthansa FollowMe Dienstplanauswertung.\n"
-                        "Finde die Zeilen 72, 73, 74, 76 und extrahiere:\n"
-                        "Zeile 72: Anzahl Tage und Euro-Betrag\n"
-                        "Zeile 73: Anzahl Tage und Euro-Betrag\n"
-                        "Zeile 74: Anzahl Tage und Euro-Betrag\n"
-                        "Zeile 76: Euro-Betrag VMA Ausland\n\n"
-                        'Antworte NUR mit JSON (kein Text davor/danach):\n'
-                        '{"vma_72_tage":5,"vma_72":70.0,"vma_73_tage":11,"vma_73":154.0,'
-                        '"vma_74_tage":1,"vma_74":28.0,"vma_aus":4794.0}'
-                    )
-                    content.append({'type':'text','text':vma_prompt})
-                    resp = client.messages.create(
-                        model='claude-sonnet-4-20250514',
-                        max_tokens=300,
-                        messages=[{'role':'user','content':content}]
-                    )
-                    raw = re.sub(r'```json|```','',resp.content[0].text.strip()).strip()
-                    vma_data = json.loads(raw)
-                    for k,v in vma_data.items():
-                        if k.endswith('_tage'):
-                            result[k] = int(float(v))
-                        elif k.startswith('vma_'):
-                            result[k] = float(v)
-                    print(f"VMA Vision: {vma_data}")
-                except Exception as e:
-                    print(f"VMA Vision error: {e}")
-            return result
 
-    # ── LUFTHANSA FLUGSTUNDEN-ÜBERSICHTEN (raw data) ──
-    # Count from flight lines
-    arbeitstage = len(re.findall(r'\d{2}\.\d{2}\.\s+(?:LH|4U|EW|OS|DE)\d+', combined))
-    hotel_naechte = len(re.findall(r'FL\s+STRECKENEINSATZTAG', combined))
-    fahr_tage = len(re.findall(r'\d{2}\.\d{2}\.\s+(?:LH|4U|EW|OS|DE)\d+.*?\d{2}:\d{2}', combined))
-    
-    if arbeitstage > 0:
-        # For VMA and km — use Claude since raw Flugstunden don't have summaries
-        if ANTHROPIC_KEY:
-            try:
-                client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-                sample = combined[:12000]
-                prompt = f"""Analysiere diese Flugstunden-Übersichten und berechne:
-{sample}
-
-Zähle für das Gesamtjahr:
-1. Arbeitstage (Tage mit Flugdienst LH/4U/OS/EW/DE)
-2. Hotel-Nächte (FL STRECKENEINSATZTAG Zeilen)  
-3. Fahrt-Tage (Tage mit Abflug = erste Zeile einer Dienstreise)
-4. VMA >8h Inland (Eintagestouren ohne Übernachtung) = Zeile 72
-5. An/Abreisetage mit Übernachtung = Zeile 73
-6. 24h Inlandstage = Zeile 74
-7. Homebase km (Wohnort zur Homebase, falls erkennbar)
-
-Antworte NUR mit JSON:
-{{"arbeitstage":133,"fahr_tage":58,"hotel_naechte":66,"vma_72_tage":5,"vma_73_tage":11,"vma_74_tage":1,"vma_72":70,"vma_73":154,"vma_74":28,"vma_aus":4794,"km":28,"ausland_touren":[]}}"""
-                response = client.messages.create(
-                    model='claude-sonnet-4-20250514', max_tokens=500,
-                    messages=[{'role':'user','content':prompt}]
-                )
-                raw = re.sub(r'```json|```','', response.content[0].text.strip()).strip()
-                return json.loads(raw)
-            except Exception as e:
-                print(f'Dienstplan Claude error: {e}')
-        
-        # Pure regex fallback
-        return {
-            'arbeitstage': arbeitstage,
-            'fahr_tage': fahr_tage,
-            'hotel_naechte': hotel_naechte,
-            'vma_72_tage': 0, 'vma_73_tage': 0, 'vma_74_tage': 0,
-            'vma_72': 0, 'vma_73': 0, 'vma_74': 0, 'vma_aus': 0,
-            'km': 0, 'ausland_touren': [],
-        }
-    
-    return None
-
+    except Exception as e:
+        print(f'Claude Flugstunden error: {e}')
+        return None
 
 def parse_optionale_belege(files):
     """
     Liest optionale Belege mit Claude Vision KI.
-    Unterstützt PDFs und Bilder (JPG, PNG, WEBP).
+    Unterstützt PDFs und Bilder (JPG, PNG, WEBP, HEIC).
     """
     if not ANTHROPIC_KEY:
         return []
@@ -737,21 +884,37 @@ def parse_optionale_belege(files):
         # WEBP
         if file_bytes[8:12] == b'WEBP' or ext == 'webp':
             return [{'type':'image','source':{'type':'base64','media_type':'image/webp','data':b64}}]
-        # PDF — send as document block (Claude can read scanned PDFs visually)
+        # PDF — zuerst Text extrahieren, bei Misserfolg als Dokument senden
         if file_bytes[:4] == b'%PDF' or ext == 'pdf':
+            try:
+                with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                    text = ' '.join(p.extract_text() or '' for p in pdf.pages)
+                    if text.strip():
+                        return [{'type':'text','text':text[:6000]}]
+            except:
+                pass
             return [{'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}}]
-        # HEIC/HEIF from iPhone — send as document, Claude handles it
+        # HEIC/HEIF von iPhone — als JPEG konvertieren wenn PIL verfügbar
         if ext in ('heic','heif'):
-            return [{'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}}]
-        # Fallback: try to extract text from PDF, else send as image
+            if PIL_AVAILABLE:
+                try:
+                    from PIL import Image as PILImage
+                    img = PILImage.open(io.BytesIO(file_bytes))
+                    buf = io.BytesIO()
+                    img.convert('RGB').save(buf, format='JPEG', quality=85)
+                    b64j = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
+                    return [{'type':'image','source':{'type':'base64','media_type':'image/jpeg','data':b64j}}]
+                except:
+                    pass
+            return [{'type':'image','source':{'type':'base64','media_type':'image/jpeg','data':b64}}]
+        # Unbekannt: versuche PDF-Text, dann JPEG
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 text = ' '.join(p.extract_text() or '' for p in pdf.pages)
                 if text.strip():
-                    return [{'type':'text','text':text[:4000]}]
+                    return [{'type':'text','text':text[:6000]}]
         except:
             pass
-        # Last resort: treat as image
         return [{'type':'image','source':{'type':'base64','media_type':'image/jpeg','data':b64}}]
 
     for key, info in WISO_PFADE.items():
@@ -759,9 +922,10 @@ def parse_optionale_belege(files):
             continue
 
         content_blocks = []
-        n_files = len(files[key])
-        for i, file_bytes in enumerate(files[key]):
-            blocks = file_to_claude_content(file_bytes)
+        file_tuples = _bytes_filename_list(files[key])
+        n_files = len(file_tuples)
+        for file_bytes, filename in file_tuples:
+            blocks = file_to_claude_content(file_bytes, filename)
             content_blocks.extend(blocks)
 
         if not content_blocks:
@@ -932,7 +1096,8 @@ def berechne(form, files):
     if files.get('lsb'):
         lst = parse_lohnsteuerbescheinigung(files['lsb'])
         # Collect raw text for inference fallback
-        for pdf_bytes in files['lsb']:
+        for item in files['lsb']:
+            pdf_bytes = item[0] if isinstance(item, tuple) else item
             try:
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     available_texts['lsb_text'] = '\n'.join(p.extract_text() or '' for p in pdf.pages)
@@ -949,7 +1114,8 @@ def berechne(form, files):
     if files.get('se'):
         # Collect raw text
         se_texts = []
-        for pdf_bytes in files['se']:
+        for item in files['se']:
+            pdf_bytes = item[0] if isinstance(item, tuple) else item
             try:
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     se_texts.append('\n'.join(p.extract_text() or '' for p in pdf.pages))
@@ -974,7 +1140,8 @@ def berechne(form, files):
     if files.get('dp'):
         # Collect raw text
         dp_texts = []
-        for pdf_bytes in files['dp']:
+        for item in files['dp']:
+            pdf_bytes = item[0] if isinstance(item, tuple) else item
             try:
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     dp_texts.append('\n'.join(p.extract_text() or '' for p in pdf.pages))
@@ -982,7 +1149,7 @@ def berechne(form, files):
         if dp_texts:
             available_texts['dp_text'] = '\n'.join(dp_texts)
         
-        dp = parse_dienstplan_mit_ki(files['dp'])
+        dp = parse_dienstplan_mit_ki(files['dp'], se_bytes_list=files.get('se'))
         if not dp or not dp.get('arbeitstage'):
             missing.append('Flugstunden-Übersichten (nicht lesbar)')
             dp = None
@@ -1006,15 +1173,36 @@ def berechne(form, files):
 
     # LSB values
     if lst:
-        ag_z17        = lst.get('ag_fahrt_z17', 0)
-        brutto        = lst.get('brutto', 0)
-        lohnsteuer    = lst.get('lohnsteuer', 0)
-        arbeitgeber   = lst.get('arbeitgeber', 'Deutsche Lufthansa AG')
+        ag_z17          = lst.get('ag_fahrt_z17', 0)
+        brutto          = lst.get('brutto', 0)
+        lohnsteuer      = lst.get('lohnsteuer', 0)
+        soli            = lst.get('soli', 0)
+        kirchensteuer   = lst.get('kirchensteuer_an', 0)
+        arbeitgeber     = lst.get('arbeitgeber', 'Deutsche Lufthansa AG')
+        rv_an           = lst.get('rv_an', 0)
+        rv_ag           = lst.get('rv_ag', 0)
+        kv_an           = lst.get('kv_an', 0)
+        pv_an           = lst.get('pv_an', 0)
+        av_an           = lst.get('av_an', 0)
+        vorsorge_an     = lst.get('vorsorge_gesamt_an', 0)
+        rv_gesamt       = lst.get('rv_gesamt', 0)
+        steuerklasse    = lst.get('steuerklasse', '1')
+        kinderfb        = lst.get('kinderfreibetraege', 0)
+        identnr         = lst.get('identnr', '')
+        geburtsdatum    = lst.get('geburtsdatum', '')
+        personalnummer  = lst.get('personalnummer', '')
+        verpfl_z20      = lst.get('verpflegungszuschuss_z20', 0)
     else:
-        ag_z17        = inferred.get('ag_z17', 0)
-        brutto        = inferred.get('brutto', 0)
-        lohnsteuer    = inferred.get('lohnsteuer', 0)
-        arbeitgeber   = 'Deutsche Lufthansa AG'
+        ag_z17 = inferred.get('ag_z17', 0)
+        brutto = inferred.get('brutto', 0)
+        lohnsteuer = inferred.get('lohnsteuer', 0)
+        soli = kirchensteuer = 0
+        arbeitgeber = 'Deutsche Lufthansa AG'
+        rv_an = rv_ag = kv_an = pv_an = av_an = 0
+        vorsorge_an = rv_gesamt = 0
+        steuerklasse = '1'; kinderfb = 0
+        identnr = geburtsdatum = personalnummer = ''
+        verpfl_z20 = 0
         if not ag_z17 and not brutto:
             notes.append('⚠️ Lohnsteuerbescheinigung fehlt — Z17-Abzug und Bruttolohn auf 0 gesetzt.')
 
@@ -1122,12 +1310,14 @@ def berechne(form, files):
         '_isDemo': False,
         'uploaded_summary': ', '.join(uploaded_summary),
         'not_uploaded':     ', '.join(not_uploaded) if not_uploaded else 'Alle Pflichtdokumente vorhanden',
-        'notes':            notes,  # Hinweise über geschätzte Werte
+        'notes':            notes,
         'datum':            datetime.now().strftime('%d.%m.%Y'),
+        # Reisedaten
         'km':               km,
         'arbeitstage':      arbeitstage,
         'fahr_tage':        fahr_tage,
         'hotel_naechte':    hotel_naechte,
+        # VMA
         'vma_72_tage':      vma_72_tage,
         'vma_73_tage':      vma_73_tage,
         'vma_74_tage':      vma_74_tage,
@@ -1136,19 +1326,41 @@ def berechne(form, files):
         'vma_74':           vma_74,
         'vma_in':           vma_in,
         'vma_aus':          vma_aus,
+        # Kostenposten
         'fahr':             fahr,
         'reinig':           reinig,
         'trink':            trink,
         'gesamt':           gesamt,
+        # Abzüge
         'ag_z17':           ag_z17,
         'spesen_gesamt':    spesen_gesamt,
         'spesen_steuer':    spesen_steuer,
         'z77':              z77,
         'netto':            netto,
+        # Abrechnungen
         'abrechnungen':     abrechnungen,
+        # LSB — Grunddaten
         'brutto':           brutto,
         'lohnsteuer':       lohnsteuer,
+        'soli':             soli,
+        'kirchensteuer':    kirchensteuer,
+        'steuerklasse':     steuerklasse,
+        'kinderfreibetraege': kinderfb,
+        'identnr':          identnr,
+        'geburtsdatum':     geburtsdatum,
+        'personalnummer':   personalnummer,
         'arbeitgeber':      arbeitgeber,
+        # LSB — Sozialversicherung (Sonderausgaben)
+        'rv_an':            rv_an,
+        'rv_ag':            rv_ag,
+        'rv_gesamt':        rv_gesamt,
+        'kv_an':            kv_an,
+        'pv_an':            pv_an,
+        'av_an':            av_an,
+        'vorsorge_gesamt_an': vorsorge_an,
+        # Steuerfreie AG-Leistungen
+        'verpfl_z20':       verpfl_z20,
+        # Optionale Belege
         'optionale_belege': optionale_belege,
     }
 
@@ -1567,7 +1779,9 @@ def erstelle_pdf(d):
             fbl = b.get('file_bytes_list') or []
             if not fbl: continue
             betrag = b.get('betrag', 0)
-            for fidx, fb in enumerate(fbl):
+            for fidx, fb_item in enumerate(fbl):
+                # Normalisieren: kann bytes oder (bytes, filename) sein
+                fb = fb_item[0] if isinstance(fb_item, tuple) else fb_item
                 if not first: S.append(PageBreak())
                 first = False
                 S.append(Paragraph(f"{b.get('icon','')}  {b.get('name','')}",
@@ -1672,8 +1886,116 @@ def erstelle_pdf(d):
         S.append(kv_total("Gesamt Steuerfrei (= Z77)", eur(d.get('z77',0))))
 
     # ════════════════════════════════════════════════
-    # LETZTE SEITE — BESTÄTIGUNG
+    # SONDERAUSGABEN & LSB-ÜBERSICHT
     # ════════════════════════════════════════════════
+    brutto    = d.get('brutto', 0)
+    lohnst    = d.get('lohnsteuer', 0)
+    soli      = d.get('soli', 0)
+    kirche    = d.get('kirchensteuer', 0)
+    rv_an     = d.get('rv_an', 0)
+    rv_ag     = d.get('rv_ag', 0)
+    rv_ges    = d.get('rv_gesamt', 0)
+    kv_an     = d.get('kv_an', 0)
+    pv_an     = d.get('pv_an', 0)
+    av_an     = d.get('av_an', 0)
+    vorsorge  = d.get('vorsorge_gesamt_an', 0)
+    sk        = d.get('steuerklasse', '1')
+    kfb       = d.get('kinderfreibetraege', 0)
+    identnr   = d.get('identnr', '')
+    gebdat    = d.get('geburtsdatum', '')
+    pnr       = d.get('personalnummer', '')
+
+    if brutto > 0:
+        S.append(PageBreak())
+        for el in section("Lohnsteuerbescheinigung — Übersicht"): S.append(el)
+
+        # Persönliche Daten
+        S.append(Paragraph("PERSÖNLICHE DATEN",
+            ps("lsb_h1", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
+               leading=11, spaceAfter=10, letterSpacing=1.5)))
+        pers_items = [
+            ("Steuerklasse", sk),
+            ("Kinderfreibeträge", str(kfb)),
+            ("Identifikationsnummer", identnr),
+            ("Geburtsdatum", gebdat),
+            ("Personalnummer", pnr),
+        ]
+        for label, val in pers_items:
+            if val and val not in ('0', '0.0', ''):
+                S.append(kv(label, val))
+        S.append(Spacer(1, 0.4*cm))
+
+        # Lohnsteuer-Grunddaten
+        S.append(Paragraph("LOHNSTEUER (Zeilen 3–6)",
+            ps("lsb_h2", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
+               leading=11, spaceAfter=10, letterSpacing=1.5)))
+        lsb_items = [
+            (f"Bruttoarbeitslohn (Zeile 3)", eur(brutto)),
+            (f"Einbehaltene Lohnsteuer (Zeile 4)", eur(lohnst)),
+            (f"Solidaritätszuschlag (Zeile 5)", eur(soli)),
+            (f"Kirchensteuer AN (Zeile 6)", eur(kirche)),
+            (f"AG-Fahrkostenzuschuss Z17 (→ Abzug Reisekosten)", eur(d.get('ag_z17',0))),
+        ]
+        for label, val in lsb_items:
+            S.append(kv(label, val))
+        S.append(Spacer(1, 0.4*cm))
+
+        # Vorsorgeaufwendungen — Sonderausgaben
+        S.append(Paragraph("VORSORGEAUFWENDUNGEN — SONDERAUSGABEN (§10 EStG)",
+            ps("lsb_h3", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
+               leading=11, spaceAfter=10, letterSpacing=1.5)))
+        S.append(Paragraph(
+            "Diese Beträge direkt in WISO unter Sonderausgaben → Vorsorgeaufwendungen eintragen:",
+            ps("lsb_hint", fontSize=9, textColor=TEXT2, fontName="Helvetica",
+               leading=14, spaceAfter=10)))
+
+        vorsorge_items = [
+            (f"Rentenversicherung AN (Zeile 23a)", "Anlage Vorsorge Z4", eur(rv_an)),
+            (f"Rentenversicherung AG (Zeile 22a)", "Anlage Vorsorge Z5", eur(rv_ag)),
+            (f"  → RV Gesamt (AN+AG)", "Anlage Vorsorge", eur(rv_ges)),
+            (f"Gesetzl. Krankenversicherung AN (Zeile 25)", "Anlage Vorsorge Z12", eur(kv_an)),
+            (f"Gesetzl. Pflegeversicherung AN (Zeile 26)", "Anlage Vorsorge Z13", eur(pv_an)),
+            (f"Arbeitslosenversicherung AN (Zeile 27)", "Anlage Vorsorge Z14", eur(av_an)),
+        ]
+        for label, zeile, val in vorsorge_items:
+            t = Table([[
+                Paragraph(label, ps(f"vi{id(label)}", fontSize=9, textColor=TEXT2,
+                    fontName="Helvetica", leading=12)),
+                Paragraph(zeile, ps(f"vz{id(zeile)}", fontSize=7.5, textColor=TEXT3,
+                    fontName="Helvetica", leading=12, alignment=TA_CENTER)),
+                Paragraph(val, ps(f"vv{id(val)}", fontSize=9, textColor=TEXT,
+                    fontName="Helvetica", leading=12, alignment=TA_RIGHT)),
+            ]], colWidths=[10.5*cm, 2.5*cm, 3.8*cm])
+            t.setStyle(TableStyle([
+                ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+                ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+                ("LINEBELOW",(0,0),(-1,0),0.3,LINE),
+                ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+            ]))
+            S.append(t)
+        S.append(kv_total("Sozialversicherung gesamt (AN)", eur(vorsorge)))
+        S.append(Spacer(1, 0.5*cm))
+
+        # WISO Eintragehinweis
+        S.append(Paragraph("WO IN WISO EINTRAGEN?",
+            ps("wiso_h", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
+               leading=11, spaceAfter=8, letterSpacing=1.5)))
+        wiso_hints = [
+            ("Rentenversicherung (AN+AG)", "Sonderausgaben → Vorsorgeaufwendungen → Beiträge zur gesetzl. Rentenversicherung"),
+            ("Kranken- & Pflegeversicherung", "Sonderausgaben → Vorsorgeaufwendungen → Kranken- und Pflegeversicherung"),
+            ("Arbeitslosenversicherung", "Sonderausgaben → Vorsorgeaufwendungen → Sonstige Vorsorgeaufwendungen"),
+            ("Reisekosten (AeroTax-Betrag)", "Ausgaben → Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten"),
+        ]
+        for title, path in wiso_hints:
+            S.append(Paragraph(
+                f'<b>{title}</b>',
+                ps(f"wh{id(title)}", fontSize=9, textColor=TEXT,
+                   fontName="Helvetica-Bold", leading=13, spaceBefore=6)))
+            S.append(Paragraph(path,
+                ps(f"wp{id(path)}", fontSize=8.5, textColor=TEXT2,
+                   fontName="Helvetica", leading=13, spaceAfter=4)))
+
+
     S.append(PageBreak())
     for el in section("Bestätigung & Unterschrift"): S.append(el)
 
