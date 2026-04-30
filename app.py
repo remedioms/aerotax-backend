@@ -726,7 +726,7 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None):
                 'FollowMe PDF. Extrahiere: Zeile 72 (Tage, €), 73 (Tage, €), 74 (Tage, €), 76 (€), Fahrtage, km, Arbeitstage, Hotelaufenthalte.\n'
                 'JSON: {"vma_72_tage":13,"vma_72":182.0,"vma_73_tage":10,"vma_73":140.0,"vma_74_tage":0,"vma_74":0.0,"vma_aus":4562.0,"fahr_tage":53,"km":27,"arbeitstage":129,"hotel_naechte":54}'
             })
-            resp = client.messages.create(model='claude-sonnet-4-20250514',max_tokens=400,
+            resp = client.messages.create(model='claude-sonnet-4-5',max_tokens=400,
                 messages=[{'role':'user','content':content_v}])
             d = json.loads(re.sub(r'```json|```','',resp.content[0].text.strip()).strip())
             for k,v in d.items():
@@ -792,7 +792,7 @@ Z77: [Summe aller stfrei-Einzelwerte]
         })
 
         response = client.messages.create(
-            model='claude-sonnet-4-20250514',
+            model='claude-sonnet-4-5',
             max_tokens=2000,
             messages=[{'role': 'user', 'content': content}]
         )
@@ -963,7 +963,7 @@ Wenn absolut kein Betrag erkennbar: {{"betrag": 0}}"""
 
         try:
             response = client.messages.create(
-                model='claude-sonnet-4-20250514',
+                model='claude-sonnet-4-5',
                 max_tokens=200,
                 messages=[{'role': 'user', 'content': content_blocks}]
             )
@@ -1066,7 +1066,7 @@ Antworte NUR mit JSON (keine Backticks):
 
     try:
         response = client.messages.create(
-            model='claude-sonnet-4-20250514',
+            model='claude-sonnet-4-5',
             max_tokens=1000,
             messages=[{'role': 'user', 'content': prompt}]
         )
