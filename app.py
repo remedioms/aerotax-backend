@@ -830,7 +830,7 @@ Z77: [Summe aller stfrei-Einzelwerte]
 
     except Exception as e:
         print(f'Claude Flugstunden error: {e}')
-        return None
+        raise RuntimeError(f'Steuerberechnung fehlgeschlagen: {e}')
 
 def parse_optionale_belege(files):
     """
@@ -1149,9 +1149,12 @@ def berechne(form, files):
         if dp_texts:
             available_texts['dp_text'] = '\n'.join(dp_texts)
         
-        dp = parse_dienstplan_mit_ki(files['dp'], se_bytes_list=files.get('se'))
+        try:
+            dp = parse_dienstplan_mit_ki(files['dp'], se_bytes_list=files.get('se'))
+        except RuntimeError as e:
+            return jsonify({'error': str(e), 'notes': [str(e)]}), 422
         if not dp or not dp.get('arbeitstage'):
-            missing.append('Flugstunden-Übersichten (nicht lesbar)')
+            missing.append('Flugstunden-Übersichten (Analyse fehlgeschlagen — bitte nochmal versuchen)')
             dp = None
     else:
         missing.append('Flugstunden-Übersichten (nicht hochgeladen)')
