@@ -777,19 +777,21 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0):
 
         # Flugstunden: alle Seiten aller PDFs als ein Textblock
         content = []
-        alle_monate = []
+        alle_seiten = []
+        pdf_count = len(_bytes_list(pdf_bytes_list)[:12])
         for pb in _bytes_list(pdf_bytes_list)[:12]:
             try:
                 with pdfplumber.open(io.BytesIO(pb)) as pdf:
                     for page in pdf.pages:
                         text = page.extract_text() or ''
                         if text.strip():
-                            alle_monate.append(text)
+                            alle_seiten.append(text)
             except:
                 pass
-        if alle_monate:
-            flug_gesamt = '\n\n---\n\n'.join(alle_monate)
-            content.append({'type':'text','text':f'FLUGSTUNDEN ALLE {len(alle_monate)} MONATE:\n\n{flug_gesamt}'})
+        print(f"Flugstunden: {len(alle_seiten)} Seiten extrahiert aus {pdf_count} PDF(s)")
+        if alle_seiten:
+            flug_gesamt = '\n\n---\n\n'.join(alle_seiten)
+            content.append({'type':'text','text':f'FLUGSTUNDEN-ÜBERSICHTEN ({len(alle_seiten)} Seiten, komplettes Steuerjahr):\n\n{flug_gesamt}'})
         else:
             for pb in _bytes_list(pdf_bytes_list)[:5]:
                 b64 = base64.standard_b64encode(pb).decode()
