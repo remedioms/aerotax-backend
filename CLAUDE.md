@@ -17,7 +17,8 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
 - Neue Endpoints / neue Routen / neue Features
 - Refactors die >3 Dateien oder >100 Zeilen anfassen
 - `requirements.txt` Versions-Bumps oder neue Dependencies
-- Frontend-Code ändern oder Cloudflare Pages deployen (touched ~/Desktop/site)
+- Frontend-Code spontan ändern oder von dir nicht angefragte Edits an `~/Desktop/site/`
+  (wenn der Nutzer aber explizit eine Frontend-Änderung anfragt: ohne Rückfrage ändern + `wrangler pages deploy ~/Desktop/site --project-name aerosteuer --commit-dirty=true` ausführen)
 - Render-Env-Vars *löschen* oder existierende Werte *überschreiben*
 - Stripe-Webhook / Payment-Logik
 - Datenbankschema (falls hinzukommt)
