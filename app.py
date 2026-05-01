@@ -681,111 +681,15 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
 
     z77_total = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
 
-    # Z76 aus Einzelzeilen per Regex berechnen (BMF-Tagessätze)
-    # Nur als Ergänzung — Claude berechnet das präziser
-    BMF = {
-        'SAO':(46,31),'GRU':(46,31),'JNB':(36,24),'ICN':(48,32),'SEL':(48,32),
-        'HKG':(71,48),'SIN':(71,48),'NRT':(50,33),'JFK':(66,44),'NYC':(66,44),
-        'EWR':(66,44),'SFO':(59,40),'IAH':(62,41),'HOU':(62,41),'RDU':(59,40),
-        'IAD':(66,44),'DCA':(66,44),'YVR':(63,42),'MEX':(48,32),'TLV':(66,44),
-        'LCA':(42,28),'AMM':(57,38),'CAI':(50,33),'DXB':(65,44),'AUH':(65,44),
-        'GVA':(66,44),'ZRH':(66,44),'KEF':(62,41),'REK':(62,41),'TUN':(40,27),
-        'LHR':(66,44),'LGW':(66,44),'LON':(66,44),'BCN':(34,23),'LIS':(32,21),
-        'MRS':(53,36),'MXP':(42,28),'FCO':(48,32),'PMO':(42,28),'SOF':(22,15),
-        'OTP':(32,21),'TLL':(35,24),'VIE':(46,31),'LYS':(53,36),'NCE':(53,36),
-        'SZG':(50,33),'LIN':(42,28),'BUH':(32,21),
-    }
-    INLAND = {'FRA','HAM','MUC','BER','DUS','STR','NUE','CGN','LEJ',
-              'HAJ','HHN','BRE','DRS','ERF','NRN','FMO','LBC'}
+    print(f"SE: Z77={z77_total:.2f}€ aus {len(abrechnungen)} Abrechnungen")
 
-    # Alle SE-Seiten als Text zusammenführen für Z76
-    all_se_text = ''
-    for pdf_bytes in pdf_bytes_list:
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                all_se_text += '\n'.join(p.extract_text() or '' for p in pdf.pages) + '\n'
-        except: pass
-
-    # ── KORREKTE ZUORDNUNG je SE-Zeile ──────────────────────────────
-    # SE-Format:   DATUM [AB] [AN] BETRAG ORT ZWF [STFREI] [STFREI-ORT]
-    # Lufthansa hat den BMF-Wert je Tag bereits in der stfrei-Spalte stehen.
-    # Wir müssen nur korrekt einsortieren in Z72/Z73/Z74/Z76.
-    z72_tage = z73_tage_real = z74_tage = 0  # z73 alt überschreiben
-    vma_72 = vma_73 = vma_74 = vma_76 = 0.0
-
-    for line in all_se_text.split('\n'):
-        line = line.strip()
-        if ' X' in line: continue                                  # Storno
-        if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue   # nur Datums-Zeilen
-
-        parts = line.split(); idx = 1
-        ab = an = None
-        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$', parts[idx]): ab = parts[idx]; idx += 1
-        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$', parts[idx]): an = parts[idx]; idx += 1
-        if idx>=len(parts): continue
-        # Spesenanspruch (überspringen, brauchen wir nicht — wir nehmen stfrei direkt)
-        if not re.match(r'^[\d,\.]+$', parts[idx]): continue
-        idx += 1
-        if idx>=len(parts): continue
-        ort = parts[idx]; idx += 1
-        if idx>=len(parts): continue
-        try: zwf = int(parts[idx]); idx += 1
-        except: continue
-
-        sf = 0.0; sfo = ''
-        if idx<len(parts) and re.match(r'^[\d,\.]+$', parts[idx]):
-            try: sf = float(parts[idx].replace('.','').replace(',','.')); idx += 1
-            except: pass
-            if idx<len(parts) and re.match(r'^[A-Z]{2,4}$', parts[idx]):
-                sfo = parts[idx]; idx += 1
-
-        # KEIN steuerfreier Tagessatz erkennbar → Zeile überspringen (z.B. Storno-Reste)
-        if sf == 0 and not sfo: continue
-
-        # stfrei-Ort entscheidet die Kategorie. Wenn nicht da, fallback auf ort.
-        kategorie_ort = sfo if sfo else ort
-        is_inland = kategorie_ort in INLAND
-        has_ab = ab is not None
-        has_an = an is not None
-
-        if is_inland:
-            # Inland-Tagessatz (14€ od. 28€)
-            if has_ab and has_an:
-                # Tagestrip Inland (Abflug + Ankunft am gleichen Tag, kein Hotel) → Z72
-                z72_tage += 1
-                vma_72 += sf if sf > 0 else 14.0
-            elif zwf == 12 and not has_ab and not has_an:
-                # 24h Inland-Tag (sehr selten) → Z74 (28€)
-                z74_tage += 1
-                vma_74 += sf if sf > 0 else 28.0
-            else:
-                # An-Tag oder Abreise-Tag mit Hotel — meist Verbindung zu Auslands-Tour → Z73
-                z73_tage_real += 1
-                vma_73 += sf if sf > 0 else 14.0
-        else:
-            # Ausland → Z76, stfrei-Wert direkt von LH übernehmen (BMF-konform)
-            if sf > 0:
-                vma_76 += sf
-            elif kategorie_ort in BMF:
-                # Fallback wenn LH den Wert nicht ausgewiesen hat (selten)
-                bmf = BMF[kategorie_ort]
-                vma_76 += bmf[0] if zwf == 12 else bmf[1]
-
-    print(f"SE: Z77={z77_total:.2f}€  Z72={z72_tage}T/{vma_72:.2f}€  Z73={z73_tage_real}T/{vma_73:.2f}€  Z74={z74_tage}T/{vma_74:.2f}€  Z76={vma_76:.2f}€")
-
+    # Nur Z77 (steuerfrei-Summe) und die Monatsabrechnungen sind deterministisch zuverlässig.
+    # Z72/Z73/Z74/Z76 + Fahrtage/Arbeitstage/Hotelnächte → macht Claude aus den vollen Texten.
     return {
-        'abrechnungen':        abrechnungen,
-        'summe_gesamt':        round(sum(a['gesamt'] for a in abrechnungen), 2),
-        'summe_steuerfrei':    z77_total,
+        'abrechnungen':          abrechnungen,
+        'summe_gesamt':          round(sum(a['gesamt'] for a in abrechnungen), 2),
+        'summe_steuerfrei':      z77_total,
         'summe_steuerpflichtig': round(sum(a['steuerpflichtig'] for a in abrechnungen), 2),
-        'vma_72_tage':         z72_tage,
-        'vma_72':              round(vma_72, 2),
-        'vma_73_tage':         z73_tage_real,
-        'vma_73':              round(vma_73, 2),
-        'vma_74_tage':         z74_tage,
-        'vma_74':              round(vma_74, 2),
-        'vma_76_se':           round(vma_76, 2),
-        'z73_tage':            z73_tage_real,
     }
 
 def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0):
@@ -905,109 +809,51 @@ REFERENZFALL (bereits verifiziert — zum Lernen wie LH-Dokumente zu lesen sind)
 - Z77: Alle stfrei-Einzelwerte summieren — NICHT die Summenzeile (Format variiert!)
 Verifiziertes Ergebnis eines LH-Mitarbeiters: Fahrtage=53, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€
 
-═══ WIE DU DIE FLUGSTUNDEN LIEST ═══
+═══ DEINE AUFGABE ═══
+Lies Flugstunden + Streckeneinsatz Tag für Tag und ermittle die Jahressummen für:
+- arbeitstage / fahrtage / hotel_naechte
+- vma_72_tage / vma_73_tage / vma_74_tage / vma_aus  (aus den stfrei-Werten der SE — LH hat schon korrekt nach BMF berechnet, du übernimmst die Beträge)
+z77 lass auf 0, das Backend setzt's deterministisch.
 
-Jede Zeile hat: Datum, Code/Marker, evtl. Flugnummer, evtl. Uhrzeiten (von-bis), Strecke (FRA→XXX), Spesenwert. **Diese Daten erzählen dir was passiert ist** — du musst sie nur lesen.
+═══ INFO (zum Verstehen — keine starren Regeln) ═══
 
-Drei einfache Fragen pro Tag:
+**LH-Marker die typischerweise vorkommen** (du erkennst Kontext aus Datum, Uhrzeit, Strecke):
+- `/- FREIER TAG`, `U` (Urlaub), `K` (Krank), unbezahlte Freistellung → kein Arbeitstag
+- `LH#### A FRA` = Abflug von FRA → Tour-Start, Arbeitstag, Fahrtag
+- `LH#### E ... FRA` = Einflug nach FRA → Tour-Ende, Arbeitstag
+- `FL STRECKENEINSATZTAG` = Auslands-Übernachtung → Arbeitstag + Hotel-Nacht
+- `SBY` (Standby zuhause), `RES` (Reserve zuhause), Online-Schulung/e-Learning → Arbeitstag, **kein Fahrtag** (du warst daheim)
+- Vor-Ort-Dienst in FRA mit Uhrzeit (Briefing, Sprachtest, Schulung in Präsenz, EM, EK, D4, EH) → Arbeitstag + Fahrtag (du musstest hin)
+- `LM NACHGEWAEHRUNG` = Lohnnachzahlung (Buchungspost) → **kein Arbeitstag**
 
-1. **Ist der Tag ein Arbeitstag?**
-   - Steht "FREIER TAG", "U" (Urlaub), "K" (Krank) oder ähnlich Frei-Indikator → NEIN
-   - Sonst → JA (Arbeitstag)
+**EASA-FTL Layover-Regel (EU 965/2012, ORO.FTL.235):**
+Hotel-Nacht setzt min. ~10h Bodenzeit am Zielort voraus. Crew Rest im Flieger zählt nicht. Nachtflug-Heimkehr (z.B. 22:00 raus, 05-06h FRA) ist Turnaround, kein Hotel. FL-Marker bei LH = echter Layover ≥10h.
 
-2. **Ist es ein Fahrtag (du bist physisch zur Homebase FRA gefahren)?**
-   ═══ EASA-Konzept: "Reporting at Home Base" ═══
-   Ein Fahrtag entsteht wenn du dich am Heimatflughafen melden musst (Reporting). Das ist gesetzlich relevant für die FDP (Flight Duty Period) — und für die Steuer der "Ich bin zur Arbeit gefahren"-Tag.
+**Tour-Logik:**
+- Eine Tour = 1 Fahrtag (egal ob 1- oder 10-tägig — du fährst einmal hin und einmal zurück)
+- Mehretappen ohne Heimkehr (FRA→GVA→OTP→FRA) = 1 Fahrtag
+- Folge-Tage einer Tour = Arbeitstag, kein Fahrtag (du bist nicht zuhause gewesen)
 
-   - Tour-Start (du fliegst raus von FRA, Tag 1 einer Tour) → JA
-   - Vor-Ort-Dienst in FRA mit Uhrzeit (Briefing, Schulung in Präsenz, EM, EK, D4, EH, Sprachtest, Airport-Standby) → JA, du musstest hinfahren ("Reporting at Home Base")
-   - **Home-Standby** (SBY zuhause, RES Reserve zuhause, Online-Schulung, e-Learning) → NEIN, kein Reporting, du warst daheim
-   - Folge-Tage einer Tour (FL Auslands-Übernachtung, oder Rückflug-Tag wenn der Vortag schon Auslandstag war) → NEIN, du bist nicht zuhause gewesen
-   - Mehretappen-Tour ohne Heimkehr (FRA→GVA→OTP→FRA) = nur 1 Fahrtag (1× Reporting beim Tour-Start)
+**SE für VMA:**
+- stfrei-Spalte = vorberechneter BMF-Tagessatz, stfrei-Ort entscheidet die Kategorie
+- stfrei-Ort Inland (FRA, MUC, HAM…) → Z72/Z73/Z74 (14€ Tagestrip / 14€ An-/Abreise / 28€ 24h-Inland)
+- stfrei-Ort Ausland (SAO, JNB, ICN…) → Z76 (Betrag direkt aus stfrei-Spalte addieren)
+- Storno-Zeilen enden mit `X` → ignorieren
 
-3. **Hat dieser Tag eine Hotel-Nacht?**
-   Hotel-Nacht heißt: du **schläfst in einem Hotel** weil du den Tag nicht heimkommst. Es heißt NICHT: jede Nacht in der du nicht zuhause bist.
+**Verifizierter Referenzfall (FollowMe):** Fahrtage=53, Arbeitstage=129, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€. Wenn deine Werte deutlich abweichen, prüf nochmal.
 
-   ═══ EASA-FTL Ruhezeit-Regel (EU 965/2012, ORO.FTL.235) ═══
-   Eine Hotel-Nacht setzt einen **Layover** voraus — das ist gesetzlich definiert als Aufenthalt am Zielort mit min. **10 Stunden Bodenzeit** (inkl. Hotel-Schlafzeit). Darunter ist es ein Turnaround/Wendeflug, kein Layover. Crew Rest im Flieger (auch >8h auf Langstrecken) zählt NICHT als Hotel.
+Plausi-Anker: 110-150 Arbeitstage/Jahr, 40-60 Fahrtage, 40-65 Hotelnächte bei Vollzeit-Kabinenpersonal.
 
-   Konkret:
-   - Bodenzeit am Zielort ≥ 10h mit Nachtanteil → **Hotel-Nacht JA**
-   - Bodenzeit < 10h (z.B. 5h Quick-Turn) → **NEIN**, das ist Turnaround
-   - Nachtflug zurück nach FRA (Abflug 22:00, Landung 05-06h FRA) → **NEIN**, du sitzt im Flieger
-   - Single-Day-Trip (Ab und An gleicher Tag) → **NEIN**
-   - FL-Marker im Dienstplan → fast immer **JA** (LH setzt FL nur bei echtem Layover ≥10h)
+═══ ANTWORT-FORMAT ═══
+ZUERST die JSON-Zeile (erste Zeichen `{{`), DANN Nachweis. Keine Backticks.
 
-Wenn ein Code unklar ist (z.B. exotischer LH-Buchungscode), schau auf die **anderen Felder**:
-- Steht eine Uhrzeit + FRA dabei → Vor-Ort-Dienst → Fahrtag
-- Steht keine Uhrzeit oder explizit "zuhause"/"home" → kein Fahrtag
-Notier den unklaren Code im Nachweis-Output, damit wir's mitbekommen.
+{{"fahrtage":53,"km":{km},"arbeitstage":129,"hotel_naechte":54,"vma_72_tage":13,"vma_72":182,"vma_73_tage":10,"vma_73":140,"vma_74_tage":0,"vma_74":0,"vma_aus":4562,"z77":0}}
 
-═══ AUS DIESEN MARKERN LEITEST DU AB ═══
-
-**Tour-Erkennung:**
-- Eine Tour beginnt mit `A FRA` und endet mit `E ... FRA`
-- Wenn A und E am selben Tag sind = 1-tägige Tour (kein Hotel)
-- Wenn A heute, E morgen oder später = mehrtägige Tour mit Hotel
-
-**Fahrtage zählen:**
-- Jede Tour = 1 Fahrtag (egal ob 1 Tag oder 10 Tage Tour — du fährst EINMAL hin und EINMAL zurück, das ist zusammen 1 Fahrtag)
-- Mehretappen-Touren ohne Heimkehr = 1 Fahrtag (FRA→GVA→OTP zurück = nur 1)
-- Vor-Ort-Dienst in FRA (EM, EK, D4, EH, BRIEFING, Sprachtest, Schulung in FRA) = **+1 Fahrtag** (du fährst hin)
-- KEIN Fahrtag NUR bei: SBY (Standby zuhause), RES (Reserve zuhause), Online-Schulung/e-Learning
-- Default für unbekannte Codes: Fahrtag JA (lieber zählen als verlieren — User kann manuell korrigieren)
-
-**Arbeitstage zählen:**
-- ALLE Tage mit Dienst-Eintrag (A, E, FL, EK, D4, EH, EM, Schulung)
-- Frei-Tage (`/-`), Urlaub (U), Krank (K) zählen NICHT
-- Bei mehrtägiger Tour zählt jeder Tag einzeln (Hin-Tag + alle FL-Tage + Rück-Tag)
-
-**Hotel-Nächte zählen:**
-- Jeder `FL STRECKENEINSATZTAG`-Eintrag = 1 Hotel-Nacht
-- Plus: Kurzstrecke EU/Inland ohne FL-Marker — aber A spätabends und E nächsten Morgen = 1 Nacht (z.B. "23.05. A FRA→TUN 20:10 / 24.05. E TUN→FRA 03:00")
-- Nachtflug-Übergang (z.B. ICN-Rückflug 18:00→05:00 nächster Tag) zählt NICHT als Hotel — du bist auf dem Heimweg
-
-═══ STRECKENEINSATZ (SE) ═══
-- stfrei-Spalte = von LH vorberechneter BMF-Tagessatz (offiziell, immer korrekt)
-- stfrei-Ort hat Vorrang über Ort
-- Storno-Zeilen enden mit X → ignorieren
-- Z77 = Summe aller stfrei-Einzelwerte (NICHT die Summenzeile, Format variiert)
-- Z72/Z73/Z74/Z76 werden vom Backend automatisch aus SE berechnet — du brauchst sie nicht zu zählen, fokussier dich auf die Flugstunden-Auswertung
-
-═══ DEINE HAUPTAUFGABE ═══
-Du sortierst die Flugstunden Tag für Tag mit den Markern oben ein und zählst:
-- arbeitstage (jeden Tag mit Dienst)
-- fahrtage (Anzahl Touren)
-- hotel_naechte (alle FL-Tage + Übernachtungen ohne FL-Marker)
-
-Plausi-Anker für LH-Personal: 110-150 Arbeitstage/Jahr, 40-60 Fahrtage, 40-65 Hotelnächte. Wenn deine Werte massiv abweichen, prüf nochmal.
-
-VMA (Z72/Z73/Z74/Z76) und Z77 ignorierst du — die kommen deterministisch aus dem SE. Trag in der JSON für vma_*_tage/vma_*/vma_aus/z77 einfach 0 ein, das Backend ersetzt sie.
-
-═══ ANTWORT-FORMAT — UNBEDINGT EINHALTEN ═══
-
-Schreibe ZUERST die JSON-Zeile, DANN den Nachweis. Die JSON MUSS in der ersten Zeile deiner Antwort stehen — sonst geht sie verloren.
-
-Format:
-
-{{"fahrtage":53,"km":{km},"arbeitstage":129,"hotel_naechte":54,"vma_72_tage":13,"vma_72":182,"vma_73_tage":10,"vma_73":140,"vma_74_tage":0,"vma_74":0,"vma_aus":4562,"z77":4742.80}}
-
-NACHWEIS Monat für Monat:
-Januar: Arbeitstage=…, Fahrtage=…, Hotel=…
-Februar: …
+Nachweis (kurz, Monat für Monat):
+Januar: Arbeitstage=…, Fahrtage=…, Hotel=…  (kurze Tour-Zusammenfassung)
 …
 Dezember: …
-
-UNBEKANNTE MARKER:
-Liste am Ende JEDEN Code auf den du gesehen hast und der NICHT in der Marker-Tabelle stand. Format:
-"Unbekannte Marker: <Code> (X Tage), <Code2> (Y Tage), …"
-Wenn alle Codes bekannt waren: "Unbekannte Marker: keine"
-
-REGELN:
-- arbeitstage darf NIEMALS 0 sein wenn Dienstplan-Einträge vorhanden sind. Lieber konservativ schätzen als 0.
-- Werte in der JSON-Zeile sind die SUMMEN über alle 12 Monate.
-- Keine Backticks, kein "json"-Tag — die JSON-Zeile muss als allererste Zeichen direkt mit `{{` beginnen.
-- Keine Zeile vor der JSON. Nicht "Hier ist...", direkt JSON."""
+Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
         })
 
         full_text = ''
@@ -1512,27 +1358,20 @@ def berechne(form, files):
         if not arbeitstage:
             notes.append('⚠️ Flugstunden-Übersichten fehlen — Arbeitstage und VMA konnten nicht berechnet werden.')
 
-    # ── VMA-KATEGORISIERUNG: SE-Daten haben PRIORITÄT ─────────
-    # Lufthansa hat den BMF-Tagessatz je Tag in der SE bereits exakt berechnet.
-    # Wir übernehmen die Werte direkt — präziser als jede KI-Interpretation.
-    if se_data and (se_data.get('vma_72_tage', 0) or se_data.get('vma_73_tage', 0) or se_data.get('vma_74_tage', 0) or se_data.get('vma_76_se', 0) > 0):
-        vma_72_tage = se_data.get('vma_72_tage', 0)
-        vma_73_tage = se_data.get('vma_73_tage', 0)
-        vma_74_tage = se_data.get('vma_74_tage', 0)
-        vma_72      = se_data.get('vma_72', vma_72_tage * 14)
-        vma_73      = se_data.get('vma_73', vma_73_tage * 14)
-        vma_74      = se_data.get('vma_74', vma_74_tage * 28)
-        vma_aus_se  = se_data.get('vma_76_se', 0)
-        print(f"VMA aus SE übernommen: Z72={vma_72_tage}T/{vma_72}€  Z73={vma_73_tage}T/{vma_73}€  Z74={vma_74_tage}T/{vma_74}€  Z76={vma_aus_se}€")
+    # ── VMA-KATEGORISIERUNG: aus Claudes DP-Auswertung ────────
+    # Claude liest die Streckeneinsatz- + Flugstunden-Texte und sortiert ein.
+    # Z77 (gesamt-steuerfrei) kommt deterministisch aus dem SE-Parser, alles andere von Claude.
+    if dp:
+        vma_72_tage = dp.get('vma_72_tage', 0)
+        vma_73_tage = dp.get('vma_73_tage', 0)
+        vma_74_tage = dp.get('vma_74_tage', 0)
     else:
-        # Fallback: aus DP/inferred
-        vma_72_tage = (dp or {}).get('vma_72_tage', 0) if dp else inferred.get('vma_72_tage', 0)
-        vma_73_tage = (dp or {}).get('vma_73_tage', 0) if dp else inferred.get('vma_73_tage', 0)
-        vma_74_tage = (dp or {}).get('vma_74_tage', 0) if dp else inferred.get('vma_74_tage', 0)
-        vma_72 = vma_72_tage * 14
-        vma_73 = vma_73_tage * 14
-        vma_74 = vma_74_tage * 28
-        vma_aus_se = 0
+        vma_72_tage = inferred.get('vma_72_tage', 0)
+        vma_73_tage = inferred.get('vma_73_tage', 0)
+        vma_74_tage = inferred.get('vma_74_tage', 0)
+    vma_72 = vma_72_tage * 14
+    vma_73 = vma_73_tage * 14
+    vma_74 = vma_74_tage * 28
 
     # ── KM: form > dienstplan > inferred ──────────────────────
     anreise = form.get('anreise', 'auto')
@@ -1551,9 +1390,6 @@ def berechne(form, files):
             if ort in BMF_2025:
                 s24, sab = BMF_2025[ort]
                 vma_aus += t.get('an',0)*sab + t.get('voll',0)*s24 + t.get('ab',0)*sab
-    elif vma_aus_se > 0:
-        # SE-Wert hat Priorität — Lufthansa hat BMF-Tagessätze bereits korrekt verrechnet
-        vma_aus = vma_aus_se
     elif dp and dp.get('vma_aus', 0) > 0:
         vma_aus = dp.get('vma_aus', 0)
     else:
