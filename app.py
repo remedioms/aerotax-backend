@@ -377,6 +377,37 @@ def health():
     return jsonify({'status': 'AeroTax Backend läuft', 'version': '2.0'})
 
 
+@app.route('/api/progress', methods=['GET'])
+def progress_stream():
+    """Server-Sent Events — live Fortschritt während Claude rechnet."""
+    year = request.args.get('year', 'Steuerjahr')
+    def generate():
+        monate = ['Januar','Februar','März','April','Mai','Juni',
+                  'Juli','August','September','Oktober','November','Dezember']
+        steps = [
+            (5,  f'Dokumente werden geöffnet…'),
+            (12, f'Lohnsteuerbescheinigung wird gelesen…'),
+            (20, f'Streckeneinsatz {year} wird analysiert…'),
+            (30, f'KI liest Flugstunden Monat für Monat…'),
+            (40, f'Fahrtage werden gezählt…'),
+            (52, f'Hotelnächte werden ausgewertet…'),
+            (62, f'Auslandsrouten werden erkannt…'),
+            (72, f'BMF-Pauschalen {year} werden angewendet…'),
+            (80, f'Steuerfreie Spesen werden berechnet…'),
+            (88, f'Fahrtkosten werden ermittelt…'),
+            (94, f'Netto-Betrag wird berechnet…'),
+            (97, f'PDF wird erstellt…'),
+        ]
+        import time
+        for pct, text in steps:
+            yield f"data: {json.dumps({'pct': pct, 'text': text})}\n\n"
+            time.sleep(12)
+        yield f"data: {json.dumps({'pct': 100, 'text': 'Fertig!'})}\n\n"
+    return app.response_class(generate(), mimetype='text/event-stream',
+        headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+
+
+
 # ══════════════════════════════════════════════════════════════════
 #  KI-PARSER — liest die Lufthansa PDFs
 # ══════════════════════════════════════════════════════════════════
@@ -688,7 +719,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
         'z73_tage':            z73_tage,
     }
 
-def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None):
+def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0):
     """
     Analysiert Lufthansa Flugstunden-Übersichten mit Claude (pure KI, kein Regex).
     Claude liest die PDFs direkt und berechnet alle Werte intelligent.
@@ -741,9 +772,8 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None):
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-        # km aus Form (wird in berechne() gesetzt, hier noch nicht bekannt → 28 default)
-        # Der echte km-Wert wird in berechne() überschrieben
-        km = 28
+        # km aus Nutzer-Formular — Fallback 28 wenn nicht angegeben
+        km = km_form if km_form and km_form > 0 else 28
 
         # Flugstunden: alle Seiten aller PDFs als ein Textblock
         content = []
@@ -815,22 +845,27 @@ Wichtige LH-Besonderheiten:
 - Kurzstrecke EU oft ohne FL-Marker, trotzdem Hotelnacht wenn A abends und E nächsten Morgen
 - Nachtflüge: die Flugzeit selbst (auf dem Weg) zählt nicht als Hotelnacht
 
+DEFINITION Arbeitstage: ALLE Tage mit Dienst im Jahr — Flüge (FRA-Abflug oder Einflug), Standby/Reserve (EK/D4/EH/EM), Briefings, Schulungen, SM-Seminare. NICHT zählen: Frei-Tage, Urlaub (U), Krank (K), unbezahlte Freistellung. Mehrtägige Touren = jeder Einsatztag zählt einzeln (auch Auslands-Übernachtungen sind Arbeitstage). Typische LH-Werte: 110-150 Arbeitstage/Jahr.
+
 Geh Monat für Monat durch — Januar bis Dezember. Schreibe für jeden Monat:
-"Januar: Fahrtage=[...], Hotel=[...], Z73=[...], Z76=[...]"
+"Januar: Arbeitstage=[...], Fahrtage=[...], Hotel=[...], Z73=[...], Z76=[...]"
 "Februar: ..."
 usw. bis Dezember.
-Dann summiere alles und schreibe das JSON.
+Dann summiere alles (auch Arbeitstage!) und schreibe das JSON. WICHTIG: arbeitstage darf NIEMALS 0 sein wenn Dienstplan-Einträge vorhanden sind.
 Überspringe keinen Monat. Nimm dir Zeit — Gründlichkeit ist wichtiger als Geschwindigkeit.
 
 {{"fahrtage":0,"km":{km},"arbeitstage":0,"hotel_naechte":0,"vma_72_tage":0,"vma_72":0,"vma_73_tage":0,"vma_73":0,"vma_74_tage":0,"vma_74":0,"vma_aus":0,"z77":0}}"""
         })
 
-        response = client.messages.create(
+        full_text = ''
+        with client.messages.stream(
             model='claude-sonnet-4-5',
             max_tokens=8000,
             messages=[{'role': 'user', 'content': content}]
-        )
-        full_text = response.content[0].text.strip()
+        ) as stream:
+            for text in stream.text_stream:
+                full_text += text
+        full_text = full_text.strip()
 
         # Nachweis + JSON trennen
         nachweis = ''
@@ -1186,7 +1221,9 @@ def berechne(form, files):
             available_texts['dp_text'] = '\n'.join(dp_texts)
         
         try:
-            dp = parse_dienstplan_mit_ki(files['dp'], se_bytes_list=files.get('se'))
+            anreise_form = form.get('anreise', 'auto')
+            km_form_val = float(form.get('km', 0) or 0) if anreise_form in ('auto', 'fahrrad') else 0
+            dp = parse_dienstplan_mit_ki(files['dp'], se_bytes_list=files.get('se'), km_form=km_form_val)
         except RuntimeError as e:
             raise
         if not dp or not dp.get('arbeitstage'):
