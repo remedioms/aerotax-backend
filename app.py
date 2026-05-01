@@ -681,42 +681,15 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
 
     z77_total = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
 
-    # ── Z76 (VMA Ausland) = Σ stfrei-Werte je Tag wo stfrei-Ort Ausland ist ──
-    # Reine Addition der von LH bereits berechneten BMF-Tagessätze.
-    # Keine eigene BMF-Tabelle, keine Lookups, keine Kategorisierungs-Regeln.
-    INLAND = {'FRA','HAM','MUC','BER','DUS','STR','NUE','CGN','LEJ','HAJ',
-              'HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN'}
-    all_se_text = ''
-    for pdf_bytes in pdf_bytes_list:
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                all_se_text += '\n'.join(p.extract_text() or '' for p in pdf.pages) + '\n'
-        except: pass
+    print(f"SE: Z77={z77_total:.2f}€ aus {len(abrechnungen)} Abrechnungen")
 
-    vma_76_se = 0.0
-    for line in all_se_text.split('\n'):
-        line = line.strip()
-        if ' X' in line: continue                                  # Storno
-        if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue
-        # Letzten 3-4-Letter-IATA-Code finden = stfrei-Ort
-        # Davor steht der stfrei-Wert (Zahl mit Komma)
-        m = re.search(r'([\d\.]+,\d{2})\s+([A-Z]{2,4})\s*$', line)
-        if not m: continue
-        sf_val_str, sf_ort = m.group(1), m.group(2)
-        if sf_ort in INLAND: continue                              # Inland → Z72/Z73/Z74, nicht Z76
-        try:
-            sf_val = float(sf_val_str.replace('.','').replace(',','.'))
-            vma_76_se += sf_val
-        except: pass
-
-    print(f"SE: Z77={z77_total:.2f}€ aus {len(abrechnungen)} Abrechnungen, Z76={vma_76_se:.2f}€ (Σ stfrei Ausland)")
-
+    # Z76 macht Claude — er liest die stfrei-Werte direkt aus den SE-Zeilen
+    # und summiert wie ein Steuerberater. Kein Backend-Regex, kein Schätzen.
     return {
         'abrechnungen':          abrechnungen,
         'summe_gesamt':          round(sum(a['gesamt'] for a in abrechnungen), 2),
         'summe_steuerfrei':      z77_total,
         'summe_steuerpflichtig': round(sum(a['steuerpflichtig'] for a in abrechnungen), 2),
-        'vma_76_se':             round(vma_76_se, 2),
     }
 
 def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0):
@@ -836,11 +809,23 @@ REFERENZFALL (bereits verifiziert — zum Lernen wie LH-Dokumente zu lesen sind)
 - Z77: Alle stfrei-Einzelwerte summieren — NICHT die Summenzeile (Format variiert!)
 Verifiziertes Ergebnis eines LH-Mitarbeiters: Fahrtage=53, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€
 
-═══ DEINE AUFGABE ═══
-Lies Flugstunden + Streckeneinsatz Tag für Tag und ermittle die Jahressummen für:
-- arbeitstage / fahrtage / hotel_naechte
-- vma_72_tage / vma_73_tage / vma_74_tage / vma_aus  (aus den stfrei-Werten der SE — LH hat schon korrekt nach BMF berechnet, du übernimmst die Beträge)
-z77 lass auf 0, das Backend setzt's deterministisch.
+═══ DEINE AUFGABE — Steuerberater-Mentalität ═══
+Du bist Steuerberater. Ein Steuerberater **erfindet keine Zahlen, schätzt nicht, nutzt keine eigene BMF-Tabelle**. Er liest exakt was im Dokument steht und addiert/subtrahiert was relevant ist.
+
+Lies Flugstunden + Streckeneinsatz Tag für Tag und ermittle:
+
+**Aus reinem Lesen + Addieren (keine Interpretation):**
+- vma_aus  = Σ aller stfrei-Werte aus SE-Zeilen wo stfrei-Ort Ausland ist (NICHT aus deinem Wissen über BMF-Sätze rechnen — nur die literal Zahlen die LH ins Dokument geschrieben hat)
+- vma_72 = Σ stfrei wo stfrei-Ort Inland UND Tagestrip (AB+AN gleicher Tag)
+- vma_73 = Σ stfrei wo stfrei-Ort Inland UND An-/Abreisetag (zur Auslandsdestination)
+- vma_74 = Σ stfrei wo Inland 24h-Tag (sehr selten)
+
+**Mit Interpretation (Tag-Klassifikation, brauchst Domain-Wissen):**
+- arbeitstage / fahrtage / hotel_naechte (siehe Info-Buch unten)
+
+z77 lass auf 0, das Backend setzt's deterministisch aus der Summe-Zeile.
+
+WICHTIG: Wenn du eine SE-Zeile siehst wie `04.02.2025  28,80 JNB 12 36,00 JNB`, ist 36,00 der stfrei-Wert den du addierst. NICHT 36 aus einer BMF-Tabelle in deinem Kopf, sondern die literal `36,00` aus dem Dokument. Selbst wenn LH einen BMF-untypischen Wert hingeschrieben hat — der ist gültig, du addierst ihn so wie er da steht.
 
 ═══ INFO (zum Verstehen — keine starren Regeln) ═══
 
@@ -1409,11 +1394,8 @@ def berechne(form, files):
     # ── VMA BERECHNEN ─────────────────────────────────────────
     vma_in = vma_72 + vma_73 + vma_74
 
-    # VMA Ausland — Priorität: SE-Summe (LH-genau) > DP > inferred
-    vma_76_se = (se_data or {}).get('vma_76_se', 0)
-    if vma_76_se > 0:
-        vma_aus = vma_76_se
-    elif dp and ausland_touren:
+    # VMA Ausland — Claude liest die stfrei-Werte direkt aus der SE
+    if dp and ausland_touren:
         vma_aus = 0
         for t in ausland_touren:
             ort = t.get('ort', '').upper()
