@@ -419,30 +419,52 @@ def health():
 
 @app.route('/api/progress', methods=['GET'])
 def progress_stream():
-    """Server-Sent Events — live Fortschritt während Claude rechnet."""
+    """Server-Sent Events — live Fortschritt während Claude rechnet.
+    Hauptsteps für die ersten ~2 Min, danach Heartbeats alle 10s ('noch dabei…')
+    bis maximal 8 Minuten — der Frontend-Timeout schließt vorher.
+    """
     year = request.args.get('year', 'Steuerjahr')
     def generate():
-        monate = ['Januar','Februar','März','April','Mai','Juni',
-                  'Juli','August','September','Oktober','November','Dezember']
         steps = [
-            (5,  f'Dokumente werden geöffnet…'),
-            (12, f'Lohnsteuerbescheinigung wird gelesen…'),
-            (20, f'Streckeneinsatz {year} wird analysiert…'),
-            (30, f'KI liest Flugstunden Monat für Monat…'),
-            (40, f'Fahrtage werden gezählt…'),
-            (52, f'Hotelnächte werden ausgewertet…'),
-            (62, f'Auslandsrouten werden erkannt…'),
-            (72, f'BMF-Pauschalen {year} werden angewendet…'),
-            (80, f'Steuerfreie Spesen werden berechnet…'),
-            (88, f'Fahrtkosten werden ermittelt…'),
-            (94, f'Netto-Betrag wird berechnet…'),
-            (97, f'PDF wird erstellt…'),
+            (5,  'Dokumente werden geöffnet…'),
+            (10, 'Lohnsteuerbescheinigung wird gelesen…'),
+            (16, f'Streckeneinsatz {year} wird analysiert…'),
+            (22, 'KI liest Flugstunden Monat für Monat…'),
+            (28, 'Fahrtage werden gezählt…'),
+            (34, 'Hotelnächte nach EASA-FTL geprüft…'),
+            (40, 'Auslandsrouten + BMF-Pauschalen…'),
+            (46, 'Steuerfreie Spesen werden berechnet…'),
+            (52, 'Fahrtkosten werden ermittelt…'),
+            (58, 'Belege werden ausgewertet…'),
+            (64, 'Netto-Betrag wird berechnet…'),
+            (70, 'PDF wird erstellt…'),
         ]
-        import time
+        # Heartbeat-Texte für die längere Wartezeit (rotieren alle 10s)
+        wait_msgs = [
+            'KI prüft Tag für Tag — bitte einen Moment…',
+            'Bin noch dabei, deine Auswertung wird gerade fertig…',
+            'Daten werden verifiziert (FollowMe-Vergleich)…',
+            'Letzte Plausi-Checks laufen…',
+            'Gleich fertig — Ergebnis wird formatiert…',
+        ]
+        import time, json as _j
+
+        # Phase 1: Hauptsteps (12s Abstand → ~2:24 Min)
         for pct, text in steps:
-            yield f"data: {json.dumps({'pct': pct, 'text': text})}\n\n"
+            yield f"data: {_j.dumps({'pct': pct, 'text': text})}\n\n"
             time.sleep(12)
-        yield f"data: {json.dumps({'pct': 100, 'text': 'Fertig!'})}\n\n"
+
+        # Phase 2: Heartbeat (alle 10s, langsam steigend bis 95%)
+        # Maximum 30 Heartbeats → 5 Min zusätzlich → Gesamt ~7:30 Min
+        pct = 72
+        for i in range(30):
+            msg = wait_msgs[i % len(wait_msgs)]
+            yield f"data: {_j.dumps({'pct': pct, 'text': msg})}\n\n"
+            time.sleep(10)
+            if pct < 95:
+                pct += 1
+
+        yield f"data: {_j.dumps({'pct': 100, 'text': 'Fertig!'})}\n\n"
     return app.response_class(generate(), mimetype='text/event-stream',
         headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
 
