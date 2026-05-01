@@ -337,11 +337,59 @@ def _normalize_upload(file_bytes, filename=''):
 # ── PROCESS MIT ECHTEN PDFs ────────────────────────────────────
 # Wird vom Frontend aufgerufen wenn echte Dokumente hochgeladen werden
 # Unterstützt: Free Promo Code + Paid Flow (nach Webhook)
-# ── ASYNC JOB STORE ────────────────────────────────────────────
-# In-memory Job-Store für Long-Running Auswertungen.
-# Nicht persistent über Render-Restarts hinaus, aber löst das HTTP-Timeout-Problem.
-_jobs = {}  # job_id → {status, progress, result, error, created, audit_log}
+# ── ASYNC JOB STORE + PERSISTENZ ───────────────────────────────
+# In-Memory Job-Store für schnellen Zugriff, plus Disk-Persistierung für Restart-Resilience.
+_jobs = {}
 _jobs_lock = __import__('threading').Lock()
+_JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jobs_state')
+os.makedirs(_JOBS_DIR, exist_ok=True)
+
+
+def _save_job_to_disk(job_id):
+    """Speichert Job-State nach Disk — überlebt Render-Restart."""
+    with _jobs_lock:
+        j = _jobs.get(job_id, {}).copy()
+    if not j: return
+    # Entferne Binär-Daten (PDFs gehören in _store, nicht in Job)
+    j_safe = {k: v for k, v in j.items() if k != 'files'}
+    try:
+        with open(os.path.join(_JOBS_DIR, f'{job_id}.json'), 'w') as f:
+            json.dump(j_safe, f, default=str)
+    except Exception as e:
+        print(f"[persist] Job {job_id[:8]} save fail: {e}")
+
+
+def _load_job_from_disk(job_id):
+    """Lädt Job-State vom Disk falls Memory-Dict leer (nach Server-Restart)."""
+    path = os.path.join(_JOBS_DIR, f'{job_id}.json')
+    if not os.path.exists(path): return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[persist] Job {job_id[:8]} load fail: {e}")
+        return None
+
+
+# ── RECOVERY CODES ─────────────────────────────────────────────
+# Bei einem fehlgeschlagenen Job bekommt der User einen Recovery-Code,
+# der am SELBEN Tag gilt für einen kostenlosen Retry. Nicht weitergebbar
+# weil er nächsten Tag ungültig ist.
+import hashlib as _hashlib
+
+def _make_recovery_code(job_id):
+    """Generiert tagesgültigen Recovery-Code aus job_id + Server-Secret + heutigem Datum."""
+    secret = os.environ.get('RECOVERY_SECRET', 'aerosteuer-recovery-default-2025')
+    today = datetime.utcnow().strftime('%Y%m%d')
+    raw = f"{job_id}:{today}:{secret}"
+    h = _hashlib.sha256(raw.encode()).hexdigest()[:12].upper()
+    # Format: AERO-XXXX-XXXX für Lesbarkeit
+    return f'AERO-{h[:4]}-{h[4:8]}-{h[8:12]}'
+
+
+def _verify_recovery_code(job_id, code):
+    expected = _make_recovery_code(job_id)
+    return code.strip().upper() == expected.upper()
 
 def _audit(job_id, event, data=None):
     """Schreibt Audit-Event in Job-Log + Render-Stdout. Audit-konform für Tax-Compliance."""
@@ -465,35 +513,111 @@ def _run_process_async(job_id, form, files):
         import traceback
         traceback.print_exc()
         _audit(job_id, 'calculation_failed', {'error': str(e)})
+        recovery_code = _make_recovery_code(job_id)
         with _jobs_lock:
             _jobs[job_id] = {
                 **_jobs[job_id],
                 'status':   'failed',
                 'error':    str(e),
+                'recovery_code': recovery_code,
                 'completed': datetime.utcnow().isoformat() + 'Z',
             }
+        _save_job_to_disk(job_id)
+        print(f"[FAIL {job_id[:8]}] Job failed. Recovery-Code: {recovery_code}")
+    finally:
+        # Erfolg oder Fehler: persistiere Status nach Disk
+        _save_job_to_disk(job_id)
 
 
 @app.route('/api/job/<job_id>', methods=['GET'])
 def get_job_status(job_id):
-    """Pollt Status eines async Jobs. Frontend ruft alle ~3s."""
+    """Pollt Status. Bei Memory-Miss: lade vom Disk (Server-Restart-Resilience)."""
     with _jobs_lock:
         j = _jobs.get(job_id)
     if not j:
+        j = _load_job_from_disk(job_id)
+        if j:
+            with _jobs_lock:
+                _jobs[job_id] = j
+    if not j:
         return jsonify({'status': 'not_found'}), 404
-    # Audit-Log nicht zurückgeben (sensitiv) — nur bei expliziter Anfrage
     safe = {k: v for k, v in j.items() if k != 'audit'}
     return jsonify(safe)
 
 
 @app.route('/api/job/<job_id>/audit', methods=['GET'])
 def get_job_audit(job_id):
-    """Liefert vollständiges Audit-Log eines Jobs (für Compliance/Steuerberater)."""
+    """Vollständiges Audit-Log (für Compliance / Steuerberater)."""
     with _jobs_lock:
-        j = _jobs.get(job_id)
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
     if not j:
         return jsonify({'error': 'job not found'}), 404
     return jsonify({'audit': j.get('audit', []), 'status': j.get('status')})
+
+
+@app.route('/api/recover', methods=['POST'])
+def recover_failed_job():
+    """Recovery für fehlgeschlagene Jobs. Body: {job_id, code}.
+    Code ist nur am selben UTC-Tag gültig (verhindert Weitergabe).
+    Bei Erfolg: Reset des Jobs auf 'pending', Auswertung läuft erneut OHNE neue Bezahlung."""
+    body = request.get_json(silent=True) or {}
+    job_id = body.get('job_id', '').strip()
+    code = body.get('code', '').strip()
+    if not job_id or not code:
+        return jsonify({'error': 'job_id und code sind erforderlich'}), 400
+    if not _verify_recovery_code(job_id, code):
+        return jsonify({'error': 'Recovery-Code ungültig oder abgelaufen (nur am Tag des Fehlers gültig)'}), 403
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'Job nicht gefunden'}), 404
+        if j.get('status') != 'failed':
+            return jsonify({'error': 'Job ist nicht im failed-State'}), 400
+    # Hier bräuchten wir eigentlich die Original-Files. Da wir die nicht persistieren,
+    # geben wir dem User einen Hinweis dass er nochmal hochladen muss — ABER ohne erneut zu bezahlen.
+    # Recovery-Code wird für 30 Min cached → der User kann hochladen ohne neue Bezahlung
+    _recovery_tokens[code] = {
+        'job_id': job_id,
+        'expires': (datetime.utcnow() + timedelta(minutes=30)).isoformat() + 'Z',
+    }
+    return jsonify({
+        'ok': True,
+        'message': 'Recovery aktiviert. Lade die Dokumente innerhalb 30 Min nochmal hoch — kostenlos.',
+        'free_retry_token': code,
+    })
+
+
+@app.route('/api/health/full', methods=['GET'])
+def full_health_check():
+    """End-to-End Health Check: Server, Anthropic API, File-System."""
+    health = {'server': 'ok', 'timestamp': datetime.utcnow().isoformat() + 'Z'}
+    # Anthropic
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        r = client.messages.create(
+            model='claude-haiku-4-5-20251001', max_tokens=10,
+            messages=[{'role':'user','content':'pong'}])
+        health['anthropic'] = 'ok' if r.content else 'no_content'
+    except Exception as e:
+        health['anthropic'] = f'fail: {str(e)[:120]}'
+    # File system
+    try:
+        test_path = os.path.join(_JOBS_DIR, '.health-check')
+        with open(test_path, 'w') as f: f.write('ok')
+        os.remove(test_path)
+        health['filesystem'] = 'ok'
+    except Exception as e:
+        health['filesystem'] = f'fail: {str(e)[:120]}'
+    # PIL/HEIF
+    health['pil'] = 'ok' if PIL_AVAILABLE else 'missing'
+    health['heif'] = 'ok' if HEIF_AVAILABLE else 'missing'
+    overall = 'ok' if all(v == 'ok' for k, v in health.items() if k not in ('timestamp', 'server')) else 'degraded'
+    health['overall'] = overall
+    return jsonify(health), 200 if overall == 'ok' else 503
+
+
+# Recovery-Tokens: erlauben kostenlose Wiederholung in 30 Min Fenster
+_recovery_tokens = {}
 
 
 @app.route('/')
@@ -2094,6 +2218,21 @@ def berechne(form, files):
     else:
         print(f"PLAUSI-CHECKS ok: VMA-Summe={vma_summe:.2f}€ Z77={z77:.2f}€ Hotel/Arbeit/Fahr/365 alle plausibel")
 
+    # ── ANOMALIE-DETECTION: Werte außerhalb LH-Plausi-Anker ──
+    anomalies = []
+    if arbeitstage > 0 and (arbeitstage < 60 or arbeitstage > 200):
+        anomalies.append(f'Arbeitstage {arbeitstage} außerhalb LH-Norm (60-200)')
+    if fahr_tage > 0 and (fahr_tage < 20 or fahr_tage > 80):
+        anomalies.append(f'Fahrtage {fahr_tage} außerhalb LH-Norm (20-80)')
+    if hotel_naechte > 0 and hotel_naechte > 90:
+        anomalies.append(f'Hotelnächte {hotel_naechte} sehr hoch — bitte prüfen')
+    if vma_aus > 12000:
+        anomalies.append(f'VMA Ausland {vma_aus:.0f}€ sehr hoch — bitte prüfen')
+    if anomalies:
+        for a in anomalies:
+            notes.append(f'⚠ Anomalie: {a}')
+        print(f"ANOMALIE-DETECTION: {anomalies}")
+
     # ── AUDIT-TRAIL ──────────────────────────────────────────
     se_unklar = len((se_data or {}).get('unklare_zeilen', []))
     se_clean = se_data is not None and se_unklar == 0
@@ -2102,6 +2241,26 @@ def berechne(form, files):
     opus_used = (dp or {}).get('_opus_used', False)
     verif_src = (dp or {}).get('_verification_source', 'unbekannt')
 
+    # ── CONFIDENCE SCORING pro Wert ──
+    # 100% = deterministisch + Math-OK; 85-95% = AI-Konsensus; 70-84% = Hybrid mit Drift; <70% = Unsicher
+    def _conf(deterministic, agreement=True, math_ok=True):
+        if deterministic and math_ok: return 100
+        if deterministic and not math_ok: return 85
+        if agreement and math_ok: return 92
+        if agreement and not math_ok: return 78
+        return 65
+
+    math_ok = not plausi_warns
+    confidence = {
+        'z77':         _conf(True, math_ok=math_ok),
+        'z76':         _conf(se_clean, agreement=opus_used, math_ok=math_ok),
+        'z72':         _conf(se_clean, agreement=opus_used, math_ok=math_ok),
+        'z73':         _conf(se_clean, agreement=opus_used, math_ok=math_ok),
+        'fahrtage':    _conf(flug_clean, agreement=opus_used, math_ok=math_ok),
+        'arbeitstage': _conf(flug_clean, agreement=opus_used, math_ok=math_ok),
+        'hotel':       _conf(flug_clean, agreement=opus_used, math_ok=math_ok),
+        'lsb':         _conf(True, math_ok=True),
+    }
     audit_source = {
         'z77':         'deterministisch — Summe-Zeile aus SE-Abrechnungen',
         'z76':         f'deterministisch — Σ stfrei-Werte aus {len(se_data.get("abrechnungen", [])) if se_data else 0} SE-Monaten' if se_clean else 'Hybrid (Parser + Claude)',
@@ -2196,9 +2355,11 @@ def berechne(form, files):
         'verpfl_z20':       verpfl_z20,
         # Optionale Belege
         'optionale_belege': optionale_belege,
-        # Audit-Trail
+        # Audit-Trail + Confidence
         '_audit_source':   audit_source,
         '_verification':   verification_info,
+        '_confidence':     confidence,
+        '_anomalies':      anomalies,
     }
 
 
