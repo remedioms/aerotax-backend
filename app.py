@@ -620,6 +620,215 @@ def full_health_check():
 _recovery_tokens = {}
 
 
+# ══════════════════════════════════════════════════════════════════
+#  Q&A COMMUNITY — anonyme Fragen, Code-Namen, AeroTAX Auto-Antworten
+# ══════════════════════════════════════════════════════════════════
+import threading as _qa_thread
+
+_QA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qa_data')
+os.makedirs(_QA_DIR, exist_ok=True)
+_QA_FILE = os.path.join(_QA_DIR, 'questions.json')
+_qa_lock = _qa_thread.Lock()
+_qa_rate = {}  # IP → [(timestamp, action), ...]
+
+
+def _qa_load():
+    if not os.path.exists(_QA_FILE): return []
+    try:
+        with open(_QA_FILE) as f: return json.load(f)
+    except: return []
+
+
+def _qa_save(questions):
+    try:
+        with open(_QA_FILE, 'w') as f: json.dump(questions, f, ensure_ascii=False, indent=1)
+    except Exception as e: print(f"[qa] save failed: {e}")
+
+
+def _qa_random_codename():
+    """Generiert anonymen Code-Namen wenn User keinen angibt."""
+    import random as _r
+    adj = ['Flying','Sky','Cloud','Jet','Aero','Cruising','Mach','Vector','Heading','Turning','Climbing','Descending','Boarding','Cabin','Wing']
+    noun = ['Falcon','Eagle','Hawk','Phoenix','Comet','Star','Pilot','Wanderer','Drifter','Voyager','Captain','Crew','Skywalker','Nomad','Dreamer']
+    return f"{_r.choice(adj)}{_r.choice(noun)}{_r.randint(10,99)}"
+
+
+def _qa_rate_check(ip, action, max_per_hour):
+    """Rate-Limit pro IP. Returnt True wenn erlaubt."""
+    now = datetime.utcnow()
+    key = f'{ip}:{action}'
+    with _qa_lock:
+        history = _qa_rate.get(key, [])
+        # filter on last hour
+        history = [t for t in history if (now - t).total_seconds() < 3600]
+        if len(history) >= max_per_hour:
+            return False
+        history.append(now)
+        _qa_rate[key] = history
+        return True
+
+
+def _qa_aerotax_answer(question_title, question_body):
+    """Generiert AeroTAX-Bot-Antwort via Claude. Wird automatisch zu jeder Frage gerufen."""
+    if not ANTHROPIC_KEY: return None
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        # EASA-Referenz mitschicken für fundierte Antworten
+        easa_kontext = ''
+        try:
+            ref = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'referenz_easa.txt')
+            if os.path.exists(ref):
+                with open(ref, encoding='utf-8') as f:
+                    easa_kontext = f.read()
+        except: pass
+
+        prompt = f"""Du bist AeroTAX — der Tax-Advisor-Bot von aerosteuer.de für Lufthansa-Kabinenpersonal und Cockpit-Crew.
+Beantworte die folgende Community-Frage kurz, präzise, fundiert. Nutze §9 EStG, EASA-FTL, BMF-Schreiben als Wissensbasis.
+
+═══ FACHWISSEN (zur Referenz, nicht zitieren) ═══
+{easa_kontext[:8000]}
+
+═══ COMMUNITY-FRAGE ═══
+Titel: {question_title}
+Frage: {question_body}
+
+═══ ANTWORT-RICHTLINIEN ═══
+- 3-6 Absätze, klar strukturiert
+- Konkrete Werte/Pauschalen nennen wenn relevant (mit Jahr-Hinweis)
+- KEINE individuelle Steuerberatung — disclaimer am Ende
+- Keine "Hier ist die Antwort"-Floskeln, direkt einsteigen
+- Wenn Frage außerhalb Steuerrecht: höflich auf Steuer-Fokus hinweisen
+- Tonalität: kollegial, hilfreich, fachlich. Nicht von oben herab.
+- Wenn unklar oder mehrdeutig: explizit darauf hinweisen
+- Quellen verweisen wenn möglich (§ EStG-Paragraph, BMF-Schreiben Datum)
+
+Antworte direkt mit dem Antworttext (kein Header, kein "Hallo X")."""
+        resp = _claude_with_retry(client, 'claude-sonnet-4-6', 1200, prompt,
+                                   max_retries=2, label='AeroTAX-QA')
+        return resp.content[0].text.strip()
+    except Exception as e:
+        print(f"[qa] AeroTAX answer failed: {e}")
+        return None
+
+
+def _qa_async_aerotax(qid, title, body):
+    """Background-Thread: AeroTAX antwortet, schreibt in question."""
+    answer = _qa_aerotax_answer(title, body)
+    if not answer: return
+    with _qa_lock:
+        questions = _qa_load()
+        for q in questions:
+            if q['id'] == qid:
+                q['aerotax_answer'] = answer
+                q['aerotax_answered_at'] = datetime.utcnow().isoformat() + 'Z'
+                _qa_save(questions)
+                break
+
+
+@app.route('/api/qa', methods=['GET'])
+def qa_list():
+    """Liste aller Fragen mit Antworten. Newest first."""
+    with _qa_lock:
+        questions = _qa_load()
+    # Sort by created desc
+    questions.sort(key=lambda q: q.get('created', ''), reverse=True)
+    return jsonify({'questions': questions[:100]})
+
+
+@app.route('/api/qa/ask', methods=['POST'])
+def qa_ask():
+    """Neue Frage stellen. Body: {title, body, codename?, tags?}."""
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
+    if not _qa_rate_check(ip, 'ask', max_per_hour=5):
+        return jsonify({'error': 'Zu viele Fragen — bitte warte eine Stunde'}), 429
+    body = request.get_json(silent=True) or {}
+    title = (body.get('title') or '').strip()[:200]
+    text = (body.get('body') or '').strip()[:5000]
+    if len(title) < 5 or len(text) < 10:
+        return jsonify({'error': 'Titel min. 5 Zeichen, Frage min. 10 Zeichen'}), 400
+    codename = (body.get('codename') or '').strip()[:30] or _qa_random_codename()
+    tags = body.get('tags') or []
+    if not isinstance(tags, list): tags = []
+    tags = [str(t).strip()[:20] for t in tags[:5] if t]
+
+    qid = str(uuid.uuid4())
+    question = {
+        'id': qid,
+        'codename': codename,
+        'title': title,
+        'body': text,
+        'tags': tags,
+        'created': datetime.utcnow().isoformat() + 'Z',
+        'upvotes': 0,
+        'answers': [],
+        'aerotax_answer': None,
+        'aerotax_answered_at': None,
+    }
+    with _qa_lock:
+        questions = _qa_load()
+        questions.append(question)
+        _qa_save(questions)
+
+    # AeroTAX antwortet im Hintergrund
+    _qa_thread.Thread(target=_qa_async_aerotax, args=(qid, title, text), daemon=True).start()
+
+    return jsonify({'ok': True, 'question': question})
+
+
+@app.route('/api/qa/<qid>/answer', methods=['POST'])
+def qa_answer(qid):
+    """Community-Antwort zu einer Frage."""
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
+    if not _qa_rate_check(ip, 'answer', max_per_hour=20):
+        return jsonify({'error': 'Zu viele Antworten — bitte warte eine Stunde'}), 429
+    body = request.get_json(silent=True) or {}
+    text = (body.get('body') or '').strip()[:3000]
+    if len(text) < 10:
+        return jsonify({'error': 'Antwort min. 10 Zeichen'}), 400
+    codename = (body.get('codename') or '').strip()[:30] or _qa_random_codename()
+
+    answer = {
+        'id': str(uuid.uuid4()),
+        'codename': codename,
+        'body': text,
+        'created': datetime.utcnow().isoformat() + 'Z',
+        'upvotes': 0,
+    }
+    with _qa_lock:
+        questions = _qa_load()
+        for q in questions:
+            if q['id'] == qid:
+                q['answers'].append(answer)
+                _qa_save(questions)
+                return jsonify({'ok': True, 'answer': answer})
+    return jsonify({'error': 'Frage nicht gefunden'}), 404
+
+
+@app.route('/api/qa/<qid>/upvote', methods=['POST'])
+def qa_upvote(qid):
+    """Upvote für Frage oder Antwort. Body: {answer_id?}."""
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
+    if not _qa_rate_check(ip, 'upvote', max_per_hour=60):
+        return jsonify({'error': 'Zu viele Upvotes — bitte warte'}), 429
+    body = request.get_json(silent=True) or {}
+    answer_id = body.get('answer_id')
+    with _qa_lock:
+        questions = _qa_load()
+        for q in questions:
+            if q['id'] == qid:
+                if answer_id:
+                    for a in q.get('answers', []):
+                        if a['id'] == answer_id:
+                            a['upvotes'] = a.get('upvotes', 0) + 1
+                            _qa_save(questions)
+                            return jsonify({'ok': True, 'upvotes': a['upvotes']})
+                else:
+                    q['upvotes'] = q.get('upvotes', 0) + 1
+                    _qa_save(questions)
+                    return jsonify({'ok': True, 'upvotes': q['upvotes']})
+    return jsonify({'error': 'Nicht gefunden'}), 404
+
+
 @app.route('/')
 def health():
     return jsonify({'status': 'AeroTax Backend läuft', 'version': '2.0'})
