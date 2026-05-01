@@ -893,8 +893,12 @@ Jeder Tag in der Flugstunden-Übersicht hat einen Marker direkt nach dem Datum:
 | `LH#### A FRA xx:xx-xx:xx XXX` | **Abflug** von FRA | Arbeitstag + Tour-Start (Fahrtag wenn Tag 1 der Tour) |
 | `LH#### E XXX xx:xx-xx:xx FRA` | **Einflug** nach FRA | Arbeitstag + Tour-Ende |
 | `FL STRECKENEINSATZTAG` | **Auslands-Übernachtung** (du schläfst im Hotel im Ausland) | Arbeitstag + 1 Hotel-Nacht |
-| `EK STANDBY` / `D4` / `EH` / `EM` | Homebase-Dienst (Standby/Reserve) | Arbeitstag, KEIN Fahrtag |
-| `SM` / `SCHULUNG` / `BRIEFING` | Schulung/Briefing in FRA | Arbeitstag, evtl. 1 Fahrtag |
+| `SBY` | Standby von zuhause | Arbeitstag, **KEIN Fahrtag** |
+| `RES` (RESERVE) | Reserve von zuhause | Arbeitstag, **KEIN Fahrtag** |
+| `Online-Schulung` / `e-Learning` | Online-Training daheim | Arbeitstag, **KEIN Fahrtag** |
+| **Alle anderen Dienst-Codes** (EM, EK, D4, EH, SM, BRIEFING, Schulung in FRA, Sprachtest, …) | Vor-Ort-Dienst in FRA | Arbeitstag **+ 1 Fahrtag** (du musst zur Homebase fahren) |
+
+**Default-Regel bei unbekannten Markern:** Wenn ein Code nicht in der Liste steht UND nicht explizit "Online" oder "Standby/Reserve" enthält → behandle als Vor-Ort-Dienst → Arbeitstag + Fahrtag. Notier den unbekannten Marker im Nachweis damit ich's später ergänzen kann.
 
 ═══ AUS DIESEN MARKERN LEITEST DU AB ═══
 
@@ -906,8 +910,9 @@ Jeder Tag in der Flugstunden-Übersicht hat einen Marker direkt nach dem Datum:
 **Fahrtage zählen:**
 - Jede Tour = 1 Fahrtag (egal ob 1 Tag oder 10 Tage Tour — du fährst EINMAL hin und EINMAL zurück, das ist zusammen 1 Fahrtag)
 - Mehretappen-Touren ohne Heimkehr = 1 Fahrtag (FRA→GVA→OTP zurück = nur 1)
-- Nur Standby (EK/D4/EH/EM) ohne Flug = KEIN Fahrtag (du wartest zuhause)
-- Schulungen mit physischer Anwesenheit in FRA = 1 Fahrtag
+- Vor-Ort-Dienst in FRA (EM, EK, D4, EH, BRIEFING, Sprachtest, Schulung in FRA) = **+1 Fahrtag** (du fährst hin)
+- KEIN Fahrtag NUR bei: SBY (Standby zuhause), RES (Reserve zuhause), Online-Schulung/e-Learning
+- Default für unbekannte Codes: Fahrtag JA (lieber zählen als verlieren — User kann manuell korrigieren)
 
 **Arbeitstage zählen:**
 - ALLE Tage mit Dienst-Eintrag (A, E, FL, EK, D4, EH, EM, Schulung)
@@ -945,10 +950,15 @@ Format:
 {{"fahrtage":53,"km":{km},"arbeitstage":129,"hotel_naechte":54,"vma_72_tage":13,"vma_72":182,"vma_73_tage":10,"vma_73":140,"vma_74_tage":0,"vma_74":0,"vma_aus":4562,"z77":4742.80}}
 
 NACHWEIS Monat für Monat:
-Januar: Arbeitstage=…, Fahrtage=…, Hotel=…, Z73=…, Z76=…
+Januar: Arbeitstage=…, Fahrtage=…, Hotel=…
 Februar: …
 …
 Dezember: …
+
+UNBEKANNTE MARKER:
+Liste am Ende JEDEN Code auf den du gesehen hast und der NICHT in der Marker-Tabelle stand. Format:
+"Unbekannte Marker: <Code> (X Tage), <Code2> (Y Tage), …"
+Wenn alle Codes bekannt waren: "Unbekannte Marker: keine"
 
 REGELN:
 - arbeitstage darf NIEMALS 0 sein wenn Dienstplan-Einträge vorhanden sind. Lieber konservativ schätzen als 0.
