@@ -17,7 +17,7 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
 - Neue Endpoints / neue Routen / neue Features
 - Refactors die >3 Dateien oder >100 Zeilen anfassen
 - `requirements.txt` Versions-Bumps oder neue Dependencies
-- Frontend-Code ändern (Cloudflare Pages Repo)
+- Frontend-Code ändern oder Cloudflare Pages deployen (touched ~/Desktop/site)
 - Render-Env-Vars *löschen* oder existierende Werte *überschreiben*
 - Stripe-Webhook / Payment-Logik
 - Datenbankschema (falls hinzukommt)
@@ -36,7 +36,13 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
   - Service: `srv-d7o6qbe8bjmc7398acdg`, Owner: `tea-d7np5om8bjmc73909ea0`
   - URL: `https://aerotax-backend.onrender.com`
   - Auto-Deploy bei `git push origin main` aktiv
-- **Frontend:** Cloudflare Pages (Repo separat — Wrangler-CLI noch nicht eingerichtet)
+- **Frontend:** statisches `index.html` in `~/Desktop/site/` (kein Build-Step, kein Repo)
+  - Cloudflare Pages Projekt: `aerosteuer`
+  - Account-ID: `28a9e1f1409d83cc94ef2c12db769985`
+  - Domains: `aerosteuer.pages.dev`, `aerosteuer.de`
+  - Deploy-Methode: direct upload (ad_hoc, kein Git-Connect)
+  - Wrangler v4.86 installiert; Token + Account-ID in `~/.zshrc` als `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`
+  - Deploy-Befehl: `wrangler pages deploy ~/Desktop/site --project-name aerosteuer --commit-dirty=true`
 - **PDF-Verarbeitung:** pdfplumber für Text, ReportLab für Output, PIL+pillow-heif für Bilder
 - **KI:** Claude Sonnet 4.5 via `anthropic` SDK — vier Stellen:
   - `parse_lohnsteuerbescheinigung` (LSB)
