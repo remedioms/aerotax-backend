@@ -599,6 +599,88 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
 
 
 
+def _parse_flugstunden_deterministic(flug_text):
+    """Liest Flugstunden Tag für Tag, klassifiziert Marker, trackt Tour-State.
+    Liefert (fahrtage, arbeitstage, hotel_naechte, frei_tage, unklare_tage).
+    Keine Interpretation — nur literal-Markers + Tour-State-Maschine.
+    """
+    fahrtage = arbeitstage = hotel_naechte = frei_tage = 0
+    unklare = []
+    in_tour = False  # ob auf Tour (außerhalb FRA)
+
+    # Extrem konservative Frei-Indikatoren — alles was nach "Frei/Urlaub/Krank/Lohnpost" aussieht
+    FREI_PATTERNS = re.compile(
+        r'(/-\s*FREIER\s*TAG|^/-\s|^U\b|^K\b|URLAUB|KRANK|FREIER TAG'
+        r'|UNBEZAHLTE FREISTELLUNG|KEIN DIENST'
+        r'|NACHGEWAEHRUNG|^LM\b|MUTTERSCHUTZ|ELTERNZEIT)',
+        re.I)
+    # Standby/Reserve zuhause — Arbeitstag aber kein Fahrtag
+    HOME_DUTY = re.compile(r'\b(SBY|RES|RESERVE|STANDBY|ONLINE|E-LEARNING|ELEARNING|HOME)\b', re.I)
+    # Vor-Ort-Dienst — Arbeitstag UND Fahrtag wenn nicht in Tour
+    OFFICE_DUTY = re.compile(r'\b(EM|EK|D4|EH|BRIEFING|SCHULUNG|SM|MEDICAL|SPRACHTEST)\b')
+
+    for raw in flug_text.split('\n'):
+        line = raw.strip()
+        m_dat = re.match(r'^(\d{2})\.(\d{2})\.\s+(.+)$', line)
+        if not m_dat: continue
+        rest = m_dat.group(3)
+
+        # 1. Frei-Tag (höchste Priorität — überschreibt alles)
+        if FREI_PATTERNS.search(rest):
+            frei_tage += 1
+            in_tour = False
+            continue
+
+        # 2. FL Strecken-Einsatz — Auslands-Übernachtung
+        if re.search(r'\bFL\b.*STRECKENEINSATZTAG|\bFL\b\s+STRECKEN', rest, re.I) or rest.startswith('FL '):
+            arbeitstage += 1
+            hotel_naechte += 1
+            in_tour = True
+            continue
+
+        # 3. Tour-Start: A FRA gefolgt von Auslands-Ziel
+        m_a = re.search(r'LH\d+\s+A\s+FRA\b.*?\b([A-Z]{3})\b', rest)
+        if m_a:
+            ziel = m_a.group(1)
+            arbeitstage += 1
+            if not in_tour:
+                fahrtage += 1
+                in_tour = True
+            # Same-day Rückkehr (1-Tages-Tour): falls auch E ... FRA in derselben Zeile
+            if re.search(r'\bE\b.*FRA\s*$', rest):
+                in_tour = False
+            continue
+
+        # 4. Tour-Ende: E ZIEL FRA
+        if re.search(r'LH\d+\s+E\s+[A-Z]{3}.*FRA\b', rest):
+            arbeitstage += 1
+            in_tour = False
+            continue
+
+        # 5. Home-Duty (Standby/Reserve/Online): Arbeitstag, kein Fahrtag
+        if HOME_DUTY.search(rest):
+            arbeitstage += 1
+            continue
+
+        # 6. Vor-Ort-Dienst (EM/EK/D4/EH/Briefing/Schulung): Arbeitstag + Fahrtag (wenn nicht schon auf Tour)
+        if OFFICE_DUTY.search(rest):
+            arbeitstage += 1
+            if not in_tour:
+                fahrtage += 1
+            continue
+
+        # 7. Unbekannter Marker — Claude muss interpretieren
+        unklare.append(f"{m_dat.group(1)}.{m_dat.group(2)}: {rest[:80]}")
+
+    return {
+        'fahrtage':       fahrtage,
+        'arbeitstage':    arbeitstage,
+        'hotel_naechte':  hotel_naechte,
+        'frei_tage':      frei_tage,
+        'unklare_tage':   unklare,
+    }
+
+
 def _parse_se_lines_deterministic(all_se_text):
     """Liest SE Zeile für Zeile, kategorisiert nach stfrei-Ort + AB/AN-Pattern.
     Liefert literal-Werte aus dem Dokument — keine BMF-Tabellen, keine Schätzungen.
@@ -857,8 +939,13 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
             except:
                 pass
         print(f"Flugstunden: {len(alle_seiten)} Seiten extrahiert aus {pdf_count} PDF(s)")
+
+        # ── DETERMINISTISCHES LESEN der Flugstunden ──
+        flug_det = None
         if alle_seiten:
             flug_gesamt = '\n\n---\n\n'.join(alle_seiten)
+            flug_det = _parse_flugstunden_deterministic(flug_gesamt)
+            print(f"Flugstunden deterministisch: fahrtage={flug_det['fahrtage']}  arbeitstage={flug_det['arbeitstage']}  hotel={flug_det['hotel_naechte']}  frei={flug_det['frei_tage']}  unklar={len(flug_det['unklare_tage'])} Tage")
             content.append({'type':'text','text':f'FLUGSTUNDEN-ÜBERSICHTEN ({len(alle_seiten)} Seiten, komplettes Steuerjahr):\n\n{flug_gesamt}'})
         else:
             for pb in _bytes_list(pdf_bytes_list)[:5]:
@@ -878,29 +965,45 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
             if se_texts:
                 se_kontext = '\n\nSTRECKENEINSATZ-ABRECHNUNGEN (alle Monate):\n' + '\n---\n'.join(se_texts)
 
-        # ── DETERMINISTISCHE SE-AUSWERTUNG vom Backend (literal aus Doku) ──
+        # ── DETERMINISTISCHE BACKEND-AUSWERTUNG (literal aus Doku) ──
         rechner_kontext = ''
-        if se_hints:
-            z77_t  = se_hints.get('summe_steuerfrei', 0)
-            z72_t  = se_hints.get('z72_tage', 0); z72_e = se_hints.get('z72_eur', 0)
-            z73_t  = se_hints.get('z73_tage', 0); z73_e = se_hints.get('z73_eur', 0)
-            z74_t  = se_hints.get('z74_tage', 0); z74_e = se_hints.get('z74_eur', 0)
-            z76_e  = se_hints.get('z76_eur', 0)
-            unklar = len(se_hints.get('unklare_zeilen', []))
-            mt     = len(se_hints.get('abrechnungen', []))
-            rechner_kontext = (
-                f'\n\nSE-DETERMINISTISCH GELESEN (Backend hat literal aus dem Dokument extrahiert — das sind keine Schätzungen):\n'
-                f'- Z77 (steuerfrei gesamt): {z77_t:.2f} €\n'
-                f'- Z72 (Inland Tagestrip): {z72_t} Tage / {z72_e:.2f} €\n'
-                f'- Z73 (An-/Abreisetag): {z73_t} Tage / {z73_e:.2f} €\n'
-                f'- Z74 (Inland 24h): {z74_t} Tage / {z74_e:.2f} €\n'
-                f'- Z76 (Ausland-VMA, Σ stfrei-Werte wo Ausland): {z76_e:.2f} €\n'
-                f'- SE-Monate hochgeladen: {mt} von 12\n'
-                f'- Nicht eindeutig lesbare Zeilen (brauchen deine Interpretation): {unklar}\n'
-                f'\nDas Backend hat die eindeutigen Zeilen literal eingelesen. Übernimm die Werte als gegeben.\n'
-                f'Falls oben "unklare Zeilen > 0" steht, prüf bitte gezielt diese Zeilen in der SE und ergänze die VMA-Werte.\n'
-                f'Falls 0 unklare Zeilen → übernimm die Backend-Werte 1:1, du musst die VMA nicht selbst nochmal addieren.\n'
+        if se_hints or flug_det:
+            parts_kontext = ['\n\nDETERMINISTISCHES LESEN VOM BACKEND (Backend hat Zeile für Zeile literal aus den Dokumenten extrahiert — keine Schätzungen):\n']
+            if se_hints:
+                z77_t  = se_hints.get('summe_steuerfrei', 0)
+                z72_t  = se_hints.get('z72_tage', 0); z72_e = se_hints.get('z72_eur', 0)
+                z73_t  = se_hints.get('z73_tage', 0); z73_e = se_hints.get('z73_eur', 0)
+                z74_t  = se_hints.get('z74_tage', 0); z74_e = se_hints.get('z74_eur', 0)
+                z76_e  = se_hints.get('z76_eur', 0)
+                se_unklar = len(se_hints.get('unklare_zeilen', []))
+                mt     = len(se_hints.get('abrechnungen', []))
+                parts_kontext.append(
+                    f'\n[SE-Auswertung]\n'
+                    f'- Z77 (steuerfrei gesamt): {z77_t:.2f} €\n'
+                    f'- Z72 (Inland Tagestrip): {z72_t} Tage / {z72_e:.2f} €\n'
+                    f'- Z73 (An-/Abreisetag): {z73_t} Tage / {z73_e:.2f} €\n'
+                    f'- Z74 (Inland 24h): {z74_t} Tage / {z74_e:.2f} €\n'
+                    f'- Z76 (Ausland-VMA, Σ stfrei-Werte): {z76_e:.2f} €\n'
+                    f'- SE-Monate hochgeladen: {mt} von 12\n'
+                    f'- Unklare SE-Zeilen: {se_unklar}\n'
+                )
+            if flug_det:
+                parts_kontext.append(
+                    f'\n[Flugstunden-Auswertung]\n'
+                    f'- Fahrtage: {flug_det["fahrtage"]}\n'
+                    f'- Arbeitstage: {flug_det["arbeitstage"]}\n'
+                    f'- Hotelnächte: {flug_det["hotel_naechte"]}\n'
+                    f'- Frei-Tage: {flug_det["frei_tage"]}\n'
+                    f'- Unklare Tage: {len(flug_det["unklare_tage"])}\n'
+                )
+                if flug_det['unklare_tage']:
+                    parts_kontext.append('Unklare Tage (interpretier diese):\n  ' + '\n  '.join(flug_det['unklare_tage'][:30]) + '\n')
+            parts_kontext.append(
+                '\nWICHTIG: Wenn 0 unklare Zeilen/Tage → übernimm die Backend-Werte 1:1, du musst nichts neu zählen.\n'
+                'Wenn unklar > 0 → prüf nur diese spezifischen Zeilen/Tage und sag wie sie zu klassifizieren sind.\n'
+                'Mathematischer Plausi-Check: Z72_eur + Z73_eur + Z74_eur + Z76 sollte ≈ Z77 sein.\n'
             )
+            rechner_kontext = ''.join(parts_kontext)
 
         # FollowMe als letztes Content-Element (Lernbeispiel, kein Regelwerk)
         fm_kontext = ''
@@ -1029,11 +1132,28 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
         if nachweis:
             print(f"Nachweis:\n{nachweis[:800]}")
 
+        # ── HYBRID: Deterministisch wo möglich, Claude wo nötig ──
+        # Wenn Backend deterministisch sauber gelesen hat (0 unklare), Backend-Werte sind authoritativ.
+        # Claude's Werte werden nur genommen wenn Backend keine deterministische Antwort hat.
+        flug_clean = flug_det and len(flug_det.get('unklare_tage', [])) == 0
+        if flug_clean:
+            fahrtage_final   = flug_det['fahrtage']
+            arbeitstage_fin  = flug_det['arbeitstage']
+            hotel_final      = flug_det['hotel_naechte']
+            print(f"Flugstunden-Werte: aus deterministischem Parser (0 unklare Tage) übernommen")
+        else:
+            # Claude hat interpretiert, deterministischer Parser ist Fallback-Anker
+            fahrtage_final  = int(parsed.get('fahrtage') or (flug_det['fahrtage'] if flug_det else 0))
+            arbeitstage_fin = int(parsed.get('arbeitstage') or (flug_det['arbeitstage'] if flug_det else 0))
+            hotel_final     = int(parsed.get('hotel_naechte') or (flug_det['hotel_naechte'] if flug_det else 0))
+            if flug_det:
+                print(f"Flugstunden-Werte: Hybrid (Parser={flug_det['fahrtage']}/{flug_det['arbeitstage']}/{flug_det['hotel_naechte']}, Claude={parsed.get('fahrtage')}/{parsed.get('arbeitstage')}/{parsed.get('hotel_naechte')}) → final={fahrtage_final}/{arbeitstage_fin}/{hotel_final}")
+
         return {
-            'fahr_tage':    int(parsed.get('fahrtage', 0)),
+            'fahr_tage':    fahrtage_final,
             'km':           int(parsed.get('km', km)),
-            'arbeitstage':  int(parsed.get('arbeitstage', 0)),
-            'hotel_naechte':int(parsed.get('hotel_naechte', 0)),
+            'arbeitstage':  arbeitstage_fin,
+            'hotel_naechte':hotel_final,
             'vma_72_tage':  int(parsed.get('vma_72_tage', 0)),
             'vma_73_tage':  int(parsed.get('vma_73_tage', 0)),
             'vma_74_tage':  int(parsed.get('vma_74_tage', 0)),
@@ -1044,6 +1164,10 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
             'z77':          float(parsed.get('z77', 0)),
             'nachweis':     nachweis,
             'ausland_touren': [],
+            # Audit-Trail für PDF
+            '_flug_parser':   flug_det,
+            '_flug_claude':   {'fahrtage': parsed.get('fahrtage'), 'arbeitstage': parsed.get('arbeitstage'), 'hotel_naechte': parsed.get('hotel_naechte')},
+            '_flug_clean':    flug_clean,
         }
 
     except Exception as e:
@@ -1568,6 +1692,28 @@ def berechne(form, files):
     # ── GESAMTBERECHNUNG ─────────────────────────────────────
     gesamt = round(fahr + reinig + trink + vma_in + vma_aus, 2)
     netto  = round(gesamt - ag_z17 - z77, 2)
+
+    # ── MATHEMATISCHE PLAUSI-CHECKS ──────────────────────────
+    # Wenn Inkonsistenzen, User über Note informieren — keine stille Fehler.
+    plausi_warns = []
+    # Z72+Z73+Z74+Z76 ≈ Z77 (alle steuerfreien Werte sollten Z77 ergeben)
+    vma_summe = vma_72 + vma_73 + vma_74 + vma_aus
+    if z77 > 0 and abs(vma_summe - z77) > max(50, z77 * 0.05):
+        plausi_warns.append(f'VMA-Summe ({vma_summe:.2f}€) weicht von Z77 ({z77:.2f}€) um {abs(vma_summe-z77):.2f}€ ab — bitte prüfen.')
+    # Hotel ≤ Arbeitstage (logisch: jede Hotelnacht ist auch ein Arbeitstag)
+    if hotel_naechte > arbeitstage:
+        plausi_warns.append(f'Hotelnächte ({hotel_naechte}) > Arbeitstage ({arbeitstage}) — unmöglich, bitte prüfen.')
+    # Fahrtage ≤ Arbeitstage
+    if fahr_tage > arbeitstage:
+        plausi_warns.append(f'Fahrtage ({fahr_tage}) > Arbeitstage ({arbeitstage}) — unmöglich, bitte prüfen.')
+    # Arbeitstage ≤ 365
+    if arbeitstage > 365:
+        plausi_warns.append(f'Arbeitstage ({arbeitstage}) > 365 — bitte prüfen.')
+    if plausi_warns:
+        notes.extend(['⚠ ' + w for w in plausi_warns])
+        print(f"PLAUSI-CHECKS fehlgeschlagen: {plausi_warns}")
+    else:
+        print(f"PLAUSI-CHECKS ok: VMA-Summe={vma_summe:.2f}€ Z77={z77:.2f}€ Hotel/Arbeit/Fahr/365 alle plausibel")
 
     # ── UPLOADED DOCS SUMMARY ────────────────────────────────
     uploaded_summary = []
