@@ -1132,22 +1132,79 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
         if nachweis:
             print(f"Nachweis:\n{nachweis[:800]}")
 
-        # ── HYBRID: Deterministisch wo möglich, Claude wo nötig ──
-        # Wenn Backend deterministisch sauber gelesen hat (0 unklare), Backend-Werte sind authoritativ.
-        # Claude's Werte werden nur genommen wenn Backend keine deterministische Antwort hat.
+        # ── HYBRID: Deterministisch + Claude + (bei Konflikt) Opus-Verifikation ──
         flug_clean = flug_det and len(flug_det.get('unklare_tage', [])) == 0
+        opus_result = None
+        verification_source = 'parser-only'
+
         if flug_clean:
             fahrtage_final   = flug_det['fahrtage']
             arbeitstage_fin  = flug_det['arbeitstage']
             hotel_final      = flug_det['hotel_naechte']
+            verification_source = 'parser-deterministisch'
             print(f"Flugstunden-Werte: aus deterministischem Parser (0 unklare Tage) übernommen")
         else:
-            # Claude hat interpretiert, deterministischer Parser ist Fallback-Anker
-            fahrtage_final  = int(parsed.get('fahrtage') or (flug_det['fahrtage'] if flug_det else 0))
-            arbeitstage_fin = int(parsed.get('arbeitstage') or (flug_det['arbeitstage'] if flug_det else 0))
-            hotel_final     = int(parsed.get('hotel_naechte') or (flug_det['hotel_naechte'] if flug_det else 0))
-            if flug_det:
-                print(f"Flugstunden-Werte: Hybrid (Parser={flug_det['fahrtage']}/{flug_det['arbeitstage']}/{flug_det['hotel_naechte']}, Claude={parsed.get('fahrtage')}/{parsed.get('arbeitstage')}/{parsed.get('hotel_naechte')}) → final={fahrtage_final}/{arbeitstage_fin}/{hotel_final}")
+            p_f = flug_det['fahrtage'] if flug_det else 0
+            p_a = flug_det['arbeitstage'] if flug_det else 0
+            p_h = flug_det['hotel_naechte'] if flug_det else 0
+            c_f = int(parsed.get('fahrtage') or 0)
+            c_a = int(parsed.get('arbeitstage') or 0)
+            c_h = int(parsed.get('hotel_naechte') or 0)
+
+            # Konflikt-Check: wenn Parser und Claude >5% / >3 Tage abweichen → Opus zur Schlichtung
+            f_diff = abs(p_f - c_f) > 3
+            a_diff = abs(p_a - c_a) > 5
+            h_diff = abs(p_h - c_h) > 3
+            many_unklar = flug_det and len(flug_det['unklare_tage']) > 5
+            many_se_unklar = se_hints and len(se_hints.get('unklare_zeilen', [])) > 5
+
+            if f_diff or a_diff or h_diff or many_unklar or many_se_unklar:
+                # Opus 4.7 zur Verifikation triggern
+                print(f"Konflikt erkannt — triggere Opus-Verifikation: parser=({p_f}/{p_a}/{p_h}) vs claude=({c_f}/{c_a}/{c_h})  unklar_flug={len(flug_det['unklare_tage']) if flug_det else '-'}  unklar_se={len(se_hints.get('unklare_zeilen', [])) if se_hints else '-'}")
+                parser_sum = (
+                    f"Parser-Werte: fahrtage={p_f}, arbeitstage={p_a}, hotel={p_h}\n"
+                    f"Unklare Flugstunden-Tage ({len(flug_det['unklare_tage']) if flug_det else 0}): "
+                    + ('; '.join(flug_det['unklare_tage'][:15]) if flug_det else 'keine')
+                )
+                if se_hints:
+                    parser_sum += f"\nSE-Werte: Z72={se_hints.get('z72_tage',0)}T/{se_hints.get('z72_eur',0)}€, Z73={se_hints.get('z73_tage',0)}T/{se_hints.get('z73_eur',0)}€, Z76={se_hints.get('z76_eur',0)}€, unklar={len(se_hints.get('unklare_zeilen', []))} Zeilen"
+                sonnet_sum = (
+                    f"Sonnet-Werte: fahrtage={c_f}, arbeitstage={c_a}, hotel={c_h}, "
+                    f"vma_72={parsed.get('vma_72_tage')}T/{parsed.get('vma_72')}€, vma_73={parsed.get('vma_73_tage')}T/{parsed.get('vma_73')}€, vma_aus={parsed.get('vma_aus')}€"
+                )
+                full_se_text = ''
+                if se_bytes_list:
+                    for pb in _bytes_list(se_bytes_list)[:12]:
+                        try:
+                            with pdfplumber.open(io.BytesIO(pb)) as pdf:
+                                full_se_text += '\n'.join(p.extract_text() or '' for p in pdf.pages) + '\n'
+                        except: pass
+                opus_result = _opus_verifizierung(parser_sum, sonnet_sum, full_se_text, flug_gesamt if alle_seiten else '')
+
+            if opus_result:
+                fahrtage_final  = int(opus_result.get('fahrtage') or c_f)
+                arbeitstage_fin = int(opus_result.get('arbeitstage') or c_a)
+                hotel_final     = int(opus_result.get('hotel_naechte') or c_h)
+                # Opus überschreibt VMA-Werte ggf. auch
+                if opus_result.get('vma_aus'):
+                    parsed['vma_aus'] = float(opus_result['vma_aus'])
+                if opus_result.get('vma_72_tage') is not None:
+                    parsed['vma_72_tage'] = int(opus_result['vma_72_tage'])
+                    parsed['vma_72'] = float(opus_result.get('vma_72', 0))
+                if opus_result.get('vma_73_tage') is not None:
+                    parsed['vma_73_tage'] = int(opus_result['vma_73_tage'])
+                    parsed['vma_73'] = float(opus_result.get('vma_73', 0))
+                if opus_result.get('vma_74_tage') is not None:
+                    parsed['vma_74_tage'] = int(opus_result['vma_74_tage'])
+                    parsed['vma_74'] = float(opus_result.get('vma_74', 0))
+                verification_source = 'opus-verifiziert'
+            else:
+                # Kein Opus oder kein Konflikt — Hybrid: bevorzuge Parser außer wenn Claude höher (Parser kann Tage übersehen)
+                fahrtage_final  = max(p_f, c_f)
+                arbeitstage_fin = max(p_a, c_a)
+                hotel_final     = max(p_h, c_h)
+                verification_source = 'sonnet-hybrid'
+            print(f"Flugstunden final via {verification_source}: fahrtage={fahrtage_final}, arbeitstage={arbeitstage_fin}, hotel={hotel_final}")
 
         return {
             'fahr_tage':    fahrtage_final,
@@ -1168,11 +1225,73 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
             '_flug_parser':   flug_det,
             '_flug_claude':   {'fahrtage': parsed.get('fahrtage'), 'arbeitstage': parsed.get('arbeitstage'), 'hotel_naechte': parsed.get('hotel_naechte')},
             '_flug_clean':    flug_clean,
+            '_opus_used':     opus_result is not None,
+            '_opus_nachweis': (opus_result or {}).get('_opus_nachweis', ''),
+            '_verification_source': verification_source,
         }
 
     except Exception as e:
         print(f'Claude Flugstunden error: {e}')
         raise RuntimeError(f'Steuerberechnung fehlgeschlagen: {e}')
+
+
+def _opus_verifizierung(parser_summary, sonnet_summary, full_se_text, full_flug_text):
+    """Opus 4.7 als Senior-Steuerberater. Wird nur gerufen wenn Parser+Sonnet uneinig sind.
+    Bekommt beide Vorschläge + Originaldokumente, entscheidet final.
+    Liefert verifizierte Werte + Begründung.
+    """
+    ANTHROPIC_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not ANTHROPIC_KEY:
+        return None
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        prompt = f"""Du bist ein Senior-Steuerberater für Lufthansa-Kabinenpersonal mit jahrzehntelanger Erfahrung.
+Zwei Junior-Berater haben unabhängig dieselben Dokumente ausgewertet und kommen zu unterschiedlichen Werten.
+Deine Aufgabe: Streit schlichten — den korrekten Wert ermitteln, nicht den Mittelwert.
+
+JUNIOR 1 (Deterministischer Parser, liest literal aus Dokument):
+{parser_summary}
+
+JUNIOR 2 (KI-Steuerberater Sonnet, interpretiert Edge-Cases):
+{sonnet_summary}
+
+ORIGINAL-DOKUMENTE:
+
+[STRECKENEINSATZ]
+{full_se_text[:30000]}
+
+[FLUGSTUNDEN]
+{full_flug_text[:30000]}
+
+Schlichte den Konflikt indem du die Originaldokumente selbst liest. §9 EStG + EU 965/2012 EASA-FTL gelten.
+Antwort ZUERST als JSON (erste Zeile), dann Begründung:
+
+{{"fahrtage":N,"arbeitstage":N,"hotel_naechte":N,"vma_72_tage":N,"vma_72":F,"vma_73_tage":N,"vma_73":F,"vma_74_tage":N,"vma_74":F,"vma_aus":F}}
+
+Kurze Begründung wo Junior 1 vs 2 falsch lagen.
+"""
+        resp = client.messages.create(
+            model='claude-opus-4-7',
+            max_tokens=4000,
+            messages=[{'role':'user','content':prompt}]
+        )
+        full_text = resp.content[0].text.strip()
+        first_line = full_text.split('\n', 1)[0].strip()
+        if first_line.startswith('{') and '"fahrtage"' in first_line:
+            json_str = first_line
+        else:
+            m = re.search(r'\{[^{}]*"fahrtage"[^{}]*\}', full_text, re.DOTALL)
+            json_str = m.group(0) if m else '{}'
+        verifiziert = json.loads(json_str)
+        nachweis = full_text[len(first_line):].strip()
+        print(f"Opus-Verifikation: fahr={verifiziert.get('fahrtage')} arbeit={verifiziert.get('arbeitstage')} hotel={verifiziert.get('hotel_naechte')} z76={verifiziert.get('vma_aus')}")
+        if nachweis:
+            print(f"Opus-Begründung:\n{nachweis[:600]}")
+        return {**verifiziert, '_opus_nachweis': nachweis[:800]}
+    except Exception as e:
+        print(f"Opus-Verifikation fehlgeschlagen: {e}")
+        return None
+
 
 def parse_optionale_belege(files):
     """
