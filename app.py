@@ -599,8 +599,30 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
 
 
 
-def _parse_flugstunden_deterministic(flug_text):
+def _extract_homebase(base_str):
+    """Extrahiert IATA-Code aus dem Form-Feld 'base' (z.B. 'Frankfurt (FRA)' → 'FRA').
+    Fallback: FRA wenn nichts erkennbar."""
+    if not base_str: return 'FRA'
+    m = re.search(r'\(([A-Z]{3})\)', base_str)
+    if m: return m.group(1)
+    # Direkt 3-Letter-Code?
+    m2 = re.match(r'^([A-Z]{3})$', base_str.strip().upper())
+    if m2: return m2.group(1)
+    # Stadtname → IATA-Mapping
+    city_map = {
+        'frankfurt':'FRA', 'münchen':'MUC', 'munich':'MUC',
+        'hamburg':'HAM', 'düsseldorf':'DUS', 'duesseldorf':'DUS',
+        'berlin':'BER', 'stuttgart':'STR', 'köln':'CGN', 'koeln':'CGN',
+    }
+    low = base_str.lower()
+    for city, iata in city_map.items():
+        if city in low: return iata
+    return 'FRA'
+
+
+def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
     """Liest Flugstunden Tag für Tag, klassifiziert Marker, trackt Tour-State.
+    homebase: IATA-Code des Heimatflughafens (FRA, MUC, HAM, DUS, BER, ...)
     Liefert (fahrtage, arbeitstage, hotel_naechte, frei_tage, unklare_tage).
     Keine Interpretation — nur literal-Markers + Tour-State-Maschine.
     """
@@ -638,21 +660,20 @@ def _parse_flugstunden_deterministic(flug_text):
             in_tour = True
             continue
 
-        # 3. Tour-Start: A FRA gefolgt von Auslands-Ziel
-        m_a = re.search(r'LH\d+\s+A\s+FRA\b.*?\b([A-Z]{3})\b', rest)
+        # 3. Tour-Start: A {homebase} gefolgt von Ziel
+        m_a = re.search(rf'LH\d+\s+A\s+{homebase}\b.*?\b([A-Z]{{3}})\b', rest)
         if m_a:
-            ziel = m_a.group(1)
             arbeitstage += 1
             if not in_tour:
                 fahrtage += 1
                 in_tour = True
-            # Same-day Rückkehr (1-Tages-Tour): falls auch E ... FRA in derselben Zeile
-            if re.search(r'\bE\b.*FRA\s*$', rest):
+            # Same-day Rückkehr (1-Tages-Tour): falls auch E ... {homebase} in derselben Zeile
+            if re.search(rf'\bE\b.*{homebase}\s*$', rest):
                 in_tour = False
             continue
 
-        # 4. Tour-Ende: E ZIEL FRA
-        if re.search(r'LH\d+\s+E\s+[A-Z]{3}.*FRA\b', rest):
+        # 4. Tour-Ende: E ZIEL {homebase}
+        if re.search(rf'LH\d+\s+E\s+[A-Z]{{3}}.*{homebase}\b', rest):
             arbeitstage += 1
             in_tour = False
             continue
@@ -869,7 +890,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
         'unklare_zeilen': se_det['unklare_zeilen'],
     }
 
-def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hints=None):
+def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hints=None, homebase='FRA'):
     """
     Analysiert Lufthansa Flugstunden-Übersichten mit Claude (pure KI, kein Regex).
     Claude liest die PDFs direkt und berechnet alle Werte intelligent.
@@ -944,7 +965,7 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
         flug_det = None
         if alle_seiten:
             flug_gesamt = '\n\n---\n\n'.join(alle_seiten)
-            flug_det = _parse_flugstunden_deterministic(flug_gesamt)
+            flug_det = _parse_flugstunden_deterministic(flug_gesamt, homebase=homebase)
             print(f"Flugstunden deterministisch: fahrtage={flug_det['fahrtage']}  arbeitstage={flug_det['arbeitstage']}  hotel={flug_det['hotel_naechte']}  frei={flug_det['frei_tage']}  unklar={len(flug_det['unklare_tage'])} Tage")
             content.append({'type':'text','text':f'FLUGSTUNDEN-ÜBERSICHTEN ({len(alle_seiten)} Seiten, komplettes Steuerjahr):\n\n{flug_gesamt}'})
         else:
@@ -1030,12 +1051,14 @@ Geh wie ein gründlicher Steuerberater vor — lies JEDEN Monat, JEDE Seite, JED
 Ein Steuerberater der nur 2 von 12 Monaten auswertet macht seinen Job nicht — sei gründlich.
 {se_kontext}{rechner_kontext}{fm_kontext}{easa_kontext}
 
-REFERENZFALL (bereits verifiziert — zum Lernen wie LH-Dokumente zu lesen sind):
-- Fahrtag: "03.01. LH400 A FRA 14:36" → A=Abflug FRA → Fahrtag ✓
-- Kein Fahrtag: Vortag endete mit A FRA→MUC → heute noch unterwegs → kein Fahrtag
-- KEINE Hotelnacht: "23.05. A FRA→TUN 20:10 / 24.05. E TUN→FRA 03:00" — nur ~5h Bodenzeit, du landest morgens in FRA → keine Übernachtung
-- Hotelnacht: "20.04. A FRA→JNB 21:00 / 21.04. FL ... / 22.04. E JNB→FRA 17:55" — du übernachtest in JNB, das ist eine Hotel-Nacht
-- Z73: SE "14,00  FRA" → stfrei=14, stfrei-Ort=FRA → Anreisetag Z73 ✓
+HOMEBASE des Mandanten: **{homebase}** — alle Tour-Marker beziehen sich auf {homebase} als Heimatflughafen.
+
+REFERENZFALL (zum Lernen wie LH-Dokumente zu lesen sind):
+- Fahrtag: "03.01. LH400 A {homebase} 14:36" → A=Abflug {homebase} → Fahrtag ✓
+- Kein Fahrtag: Vortag endete mit A {homebase}→XXX → heute noch unterwegs → kein Fahrtag
+- KEINE Hotelnacht: kurzer Wendeflug mit ~5h Bodenzeit → du landest morgens wieder in {homebase} → keine Übernachtung
+- Hotelnacht: "20.04. A {homebase}→JNB 21:00 / 21.04. FL ... / 22.04. E JNB→{homebase} 17:55" → du übernachtest in JNB, das ist eine Hotel-Nacht
+- Z73: SE "14,00  {homebase}" → stfrei=14, stfrei-Ort={homebase} → Anreisetag Z73 ✓
 - Z76: SE "48,00  SEL" → stfrei=48, stfrei-Ort=SEL(Ausland) → VMA Ausland Z76 ✓
 - Z77: Alle stfrei-Einzelwerte summieren — NICHT die Summenzeile (Format variiert!)
 Verifiziertes Ergebnis eines LH-Mitarbeiters: Fahrtage=53, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€
@@ -1062,8 +1085,8 @@ WICHTIG: Wenn du eine SE-Zeile siehst wie `04.02.2025  28,80 JNB 12 36,00 JNB`, 
 
 **LH-Marker die typischerweise vorkommen** (du erkennst Kontext aus Datum, Uhrzeit, Strecke):
 - `/- FREIER TAG`, `U` (Urlaub), `K` (Krank), unbezahlte Freistellung → kein Arbeitstag
-- `LH#### A FRA` = Abflug von FRA → Tour-Start, Arbeitstag, Fahrtag
-- `LH#### E ... FRA` = Einflug nach FRA → Tour-Ende, Arbeitstag
+- `LH#### A {homebase}` = Abflug von Heimatflughafen → Tour-Start, Arbeitstag, Fahrtag
+- `LH#### E ... {homebase}` = Einflug nach {homebase} → Tour-Ende, Arbeitstag
 - `FL STRECKENEINSATZTAG` = Auslands-Übernachtung → Arbeitstag + Hotel-Nacht
 - `SBY` (Standby zuhause), `RES` (Reserve zuhause), Online-Schulung/e-Learning → Arbeitstag, **kein Fahrtag** (du warst daheim)
 - Vor-Ort-Dienst in FRA mit Uhrzeit (Briefing, Sprachtest, Schulung in Präsenz, EM, EK, D4, EH) → Arbeitstag + Fahrtag (du musstest hin)
@@ -1634,8 +1657,10 @@ def berechne(form, files):
         try:
             anreise_form = form.get('anreise', 'auto')
             km_form_val = float(form.get('km', 0) or 0) if anreise_form in ('auto', 'fahrrad') else 0
+            homebase_iata = _extract_homebase(form.get('base', 'Frankfurt (FRA)'))
+            print(f"Homebase erkannt: {homebase_iata} (aus Form: '{form.get('base','')}')")
             dp = parse_dienstplan_mit_ki(files['dp'], se_bytes_list=files.get('se'), km_form=km_form_val,
-                                          se_hints=se_data if se_data else None)
+                                          se_hints=se_data if se_data else None, homebase=homebase_iata)
         except RuntimeError as e:
             raise
         if not dp or not dp.get('arbeitstage'):
