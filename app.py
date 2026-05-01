@@ -22,8 +22,15 @@ import base64
 try:
     from PIL import Image
     PIL_AVAILABLE = True
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+        HEIF_AVAILABLE = True
+    except ImportError:
+        HEIF_AVAILABLE = False
 except ImportError:
     PIL_AVAILABLE = False
+    HEIF_AVAILABLE = False
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib.colors import HexColor, white
@@ -294,6 +301,38 @@ def demo():
                     'data': safe})
 
 
+# ── BILD-NORMALISIERUNG (HEIC/WEBP/etc → JPEG) ─────────────────
+def _normalize_upload(file_bytes, filename=''):
+    """Konvertiert exotische Bildformate (HEIC/HEIF/WEBP/…) zu JPEG.
+    PDFs, JPEG, PNG bleiben unverändert. Garantiert dass Claude UND
+    der PDF-Generator die Bytes lesen können.
+    Returns (bytes, filename) — Endung wird auf .jpg gesetzt wenn konvertiert.
+    """
+    if not file_bytes:
+        return file_bytes, filename
+    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+    # Bereits in einem unterstützten Format → unverändert
+    if file_bytes[:4] == b'%PDF' or ext == 'pdf':
+        return file_bytes, filename
+    if file_bytes[:3] == b'\xff\xd8\xff':  # JPEG
+        return file_bytes, filename
+    if file_bytes[:8] == b'\x89PNG\r\n\x1a\n':  # PNG
+        return file_bytes, filename
+    # Konvertierung versuchen
+    if PIL_AVAILABLE:
+        try:
+            img = Image.open(io.BytesIO(file_bytes))
+            buf = io.BytesIO()
+            img.convert('RGB').save(buf, format='JPEG', quality=88)
+            new_bytes = buf.getvalue()
+            new_name = (filename.rsplit('.', 1)[0] + '.jpg') if '.' in filename else (filename or 'image') + '.jpg'
+            print(f"Bild normalisiert ({ext or 'unbekannt'} → JPEG): {filename} {len(file_bytes)//1024}KB → {len(new_bytes)//1024}KB")
+            return new_bytes, new_name
+        except Exception as e:
+            print(f"Bild-Normalisierung fehlgeschlagen für {filename}: {e}")
+    return file_bytes, filename
+
+
 # ── PROCESS MIT ECHTEN PDFs ────────────────────────────────────
 # Wird vom Frontend aufgerufen wenn echte Dokumente hochgeladen werden
 # Unterstützt: Free Promo Code + Paid Flow (nach Webhook)
@@ -323,7 +362,7 @@ def process_real():
                     'spen', 'part', 'kind', 'hand', 'haed', 'kiru']:
             uploaded = request.files.getlist(key)
             if uploaded:
-                files[key] = [(f.read(), f.filename) for f in uploaded]
+                files[key] = [_normalize_upload(f.read(), f.filename) for f in uploaded]
 
         # Check required files
         if not files.get('lsb') or not files.get('dp') or not files.get('se'):
