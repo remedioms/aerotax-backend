@@ -337,12 +337,29 @@ def _normalize_upload(file_bytes, filename=''):
 # ── PROCESS MIT ECHTEN PDFs ────────────────────────────────────
 # Wird vom Frontend aufgerufen wenn echte Dokumente hochgeladen werden
 # Unterstützt: Free Promo Code + Paid Flow (nach Webhook)
+# ── ASYNC JOB STORE ────────────────────────────────────────────
+# In-memory Job-Store für Long-Running Auswertungen.
+# Nicht persistent über Render-Restarts hinaus, aber löst das HTTP-Timeout-Problem.
+_jobs = {}  # job_id → {status, progress, result, error, created, audit_log}
+_jobs_lock = __import__('threading').Lock()
+
+def _audit(job_id, event, data=None):
+    """Schreibt Audit-Event in Job-Log + Render-Stdout. Audit-konform für Tax-Compliance."""
+    entry = {
+        'ts': datetime.utcnow().isoformat() + 'Z',
+        'event': event,
+        'data': data,
+    }
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id].setdefault('audit', []).append(entry)
+    print(f"[AUDIT {job_id[:8]}] {event}: {json.dumps(data, default=str)[:200] if data else ''}")
+
+
 @app.route('/api/process', methods=['POST'])
 def process_real():
-    """Empfängt echte PDF-Dateien, ruft Claude KI auf, berechnet Werbungskosten."""
+    """Startet asynchrone Auswertung. Liefert sofort job_id, Frontend pollt /api/job/<id>."""
     try:
-        # Form data
-        # Nur die Felder die wirklich für die Berechnung gebraucht werden
         anreise = request.form.get('anreise', 'auto')
         form = {
             'name':    request.form.get('name', 'Flugbegleiter'),
@@ -355,7 +372,6 @@ def process_real():
             'jobticket':  request.form.get('jobticket', 'nein'),
         }
 
-        # Read uploaded files into memory
         files = {}
         for key in ['lsb', 'dp', 'se', 'stb', 'gew', 'arb', 'fort', 'tel',
                     'konz', 'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
@@ -365,51 +381,119 @@ def process_real():
             if uploaded:
                 files[key] = [_normalize_upload(f.read(), f.filename) for f in uploaded]
 
-        # Check required files
         if not files.get('lsb') or not files.get('dp') or not files.get('se'):
             return jsonify({
                 'error': 'Pflicht-Dokumente fehlen. Bitte lade Lohnsteuerbescheinigung, '
                          'Flugstunden-Übersichten und Streckeneinsatz-Abrechnungen hoch.'
             }), 400
 
-        # ── BERECHNUNG MIT ECHTER KI ──
-        result = berechne(form, files)
-        if isinstance(result, tuple):
-            result = result[0]
+        # ── ASYNC: Job anlegen und im Hintergrund starten ──
+        job_id = str(uuid.uuid4())
+        with _jobs_lock:
+            _jobs[job_id] = {
+                'status':   'pending',
+                'progress': 0,
+                'created':  datetime.utcnow().isoformat() + 'Z',
+            }
+        _audit(job_id, 'job_created', {'year': form['year'], 'base': form['base'], 'files': {k: len(v) for k, v in files.items()}})
 
-        # ── PDF ERSTELLEN ──
-        pdf_bytes = erstelle_pdf(result)
-        token = str(uuid.uuid4())
-        name  = result['name'].replace(' ', '_')
-        year  = form.get('year', 2025)
-        _store[token] = {
-            'pdf_bytes': pdf_bytes,
-            'filename':  f'AeroTax_Auswertung_{year}_{name}.pdf',
-            'expires':   datetime.utcnow() + timedelta(hours=24),
-        }
-
-        # Return result (safe: only primitives)
-        safe = {k: v for k, v in result.items()
-                if isinstance(v, (int, float, str))}
-        # Strip file_bytes_list before JSON serialization
-        opt_belege_safe = []
-        for b in result.get('optionale_belege', []):
-            b_safe = {k: v for k, v in b.items() if k != 'file_bytes_list'}
-            opt_belege_safe.append(b_safe)
+        Thread = __import__('threading').Thread
+        Thread(target=_run_process_async, args=(job_id, form, files), daemon=True).start()
 
         return jsonify({
-            'status':       'ready',
-            'download_url': f'/api/download/{token}',
-            'data':         safe,
-            'abrechnungen': result.get('abrechnungen', []),
-            'optionale_belege': opt_belege_safe,
-            'notes':        result.get('notes', []),
+            'job_id': job_id,
+            'status': 'pending',
+            'poll_url': f'/api/job/{job_id}',
         })
 
     except Exception as e:
         print(f'Process error: {e}')
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+
+def _run_process_async(job_id, form, files):
+    """Background-Worker — führt die echte Auswertung durch, schreibt Ergebnis in _jobs."""
+    try:
+        with _jobs_lock:
+            _jobs[job_id]['status'] = 'running'
+            _jobs[job_id]['progress'] = 5
+        _audit(job_id, 'calculation_started')
+
+        result = berechne(form, files)
+        if isinstance(result, tuple):
+            result = result[0]
+        _audit(job_id, 'calculation_done', {
+            'gesamt': result.get('gesamt'), 'netto': result.get('netto'),
+            'verification': result.get('_verification'),
+        })
+
+        with _jobs_lock:
+            _jobs[job_id]['progress'] = 90
+
+        pdf_bytes = erstelle_pdf(result)
+        token = str(uuid.uuid4())
+        name = result['name'].replace(' ', '_')
+        year = form.get('year', 2025)
+        _store[token] = {
+            'pdf_bytes': pdf_bytes,
+            'filename':  f'AeroTax_Auswertung_{year}_{name}.pdf',
+            'expires':   datetime.utcnow() + timedelta(hours=24),
+        }
+        _audit(job_id, 'pdf_created', {'token': token, 'size_kb': len(pdf_bytes)//1024})
+
+        safe = {k: v for k, v in result.items() if isinstance(v, (int, float, str))}
+        opt_belege_safe = []
+        for b in result.get('optionale_belege', []):
+            b_safe = {k: v for k, v in b.items() if k != 'file_bytes_list'}
+            opt_belege_safe.append(b_safe)
+
+        with _jobs_lock:
+            _jobs[job_id] = {
+                **_jobs[job_id],
+                'status':       'done',
+                'progress':     100,
+                'completed':    datetime.utcnow().isoformat() + 'Z',
+                'download_url': f'/api/download/{token}',
+                'data':         safe,
+                'abrechnungen': result.get('abrechnungen', []),
+                'optionale_belege': opt_belege_safe,
+                'notes':        result.get('notes', []),
+            }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _audit(job_id, 'calculation_failed', {'error': str(e)})
+        with _jobs_lock:
+            _jobs[job_id] = {
+                **_jobs[job_id],
+                'status':   'failed',
+                'error':    str(e),
+                'completed': datetime.utcnow().isoformat() + 'Z',
+            }
+
+
+@app.route('/api/job/<job_id>', methods=['GET'])
+def get_job_status(job_id):
+    """Pollt Status eines async Jobs. Frontend ruft alle ~3s."""
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+    if not j:
+        return jsonify({'status': 'not_found'}), 404
+    # Audit-Log nicht zurückgeben (sensitiv) — nur bei expliziter Anfrage
+    safe = {k: v for k, v in j.items() if k != 'audit'}
+    return jsonify(safe)
+
+
+@app.route('/api/job/<job_id>/audit', methods=['GET'])
+def get_job_audit(job_id):
+    """Liefert vollständiges Audit-Log eines Jobs (für Compliance/Steuerberater)."""
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+    if not j:
+        return jsonify({'error': 'job not found'}), 404
+    return jsonify({'audit': j.get('audit', []), 'status': j.get('status')})
 
 
 @app.route('/')
@@ -597,6 +681,80 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
 
     return result
 
+
+
+def _claude_with_retry(client, model, max_tokens, content, max_retries=3, label='claude'):
+    """Anthropic API mit exponential backoff. Schützt vor transienten Fehlern (429, 5xx, network).
+    Liefert Response-Objekt zurück oder wirft nach max_retries die letzte Exception."""
+    import time as _t
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return client.messages.create(model=model, max_tokens=max_tokens,
+                                          messages=[{'role': 'user', 'content': content}])
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            # Retry bei: rate limit, 5xx, connection, timeout
+            should_retry = any(s in err_str.lower() for s in ['429', '500', '502', '503', '504', 'timeout', 'connection', 'rate'])
+            if not should_retry or attempt == max_retries - 1:
+                print(f"[{label}] failed (attempt {attempt+1}/{max_retries}): {err_str[:200]}")
+                raise
+            wait = 2 ** attempt + 1
+            print(f"[{label}] retry attempt {attempt+1}/{max_retries} in {wait}s — {err_str[:120]}")
+            _t.sleep(wait)
+    if last_err: raise last_err
+
+
+def _claude_stream_with_retry(client, model, max_tokens, content, max_retries=3, label='claude-stream'):
+    """Wie _claude_with_retry, aber für Streaming-Calls. Liefert kompletten Text zurück."""
+    import time as _t
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            full_text = ''
+            with client.messages.stream(model=model, max_tokens=max_tokens,
+                                        messages=[{'role': 'user', 'content': content}]) as stream:
+                for text in stream.text_stream:
+                    full_text += text
+            return full_text.strip()
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            should_retry = any(s in err_str.lower() for s in ['429', '500', '502', '503', '504', 'timeout', 'connection', 'rate'])
+            if not should_retry or attempt == max_retries - 1:
+                print(f"[{label}] failed (attempt {attempt+1}/{max_retries}): {err_str[:200]}")
+                raise
+            wait = 2 ** attempt + 1
+            print(f"[{label}] retry attempt {attempt+1}/{max_retries} in {wait}s — {err_str[:120]}")
+            _t.sleep(wait)
+    if last_err: raise last_err
+
+
+# ── BMF-PAUSCHALEN PRO JAHR ────────────────────────────────────
+# Quelle: BMF-Schreiben "Steuerliche Behandlung von Reisekosten"
+# Aktualisierungen jährlich — wenn neues Jahr, hier ergänzen.
+BMF_INLAND_BY_YEAR = {
+    2023: {'tagestrip_8h': 14.0, 'an_abreise': 14.0, 'voll_24h': 28.0},
+    2024: {'tagestrip_8h': 14.0, 'an_abreise': 14.0, 'voll_24h': 28.0},
+    2025: {'tagestrip_8h': 14.0, 'an_abreise': 14.0, 'voll_24h': 28.0},
+    2026: {'tagestrip_8h': 14.0, 'an_abreise': 14.0, 'voll_24h': 28.0},  # noch keine Änderung bekannt
+}
+
+PENDLER_BY_YEAR = {
+    2023: {'lt_20km': 0.30, 'gt_21km': 0.38},
+    2024: {'lt_20km': 0.30, 'gt_21km': 0.38},
+    2025: {'lt_20km': 0.30, 'gt_21km': 0.38},
+    2026: {'lt_20km': 0.30, 'gt_21km': 0.38},
+}
+
+REINIGUNG_PRO_TAG_BY_YEAR = {
+    2023: 1.60, 2024: 1.60, 2025: 1.60, 2026: 1.60,  # Verwaltungspraxis
+}
+
+TRINKGELD_PRO_NACHT_BY_YEAR = {
+    2023: 3.60, 2024: 3.60, 2025: 3.60, 2026: 3.60,  # Verwaltungspraxis
+}
 
 
 def _extract_homebase(base_str):
@@ -1142,15 +1300,8 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
 
         import time as _time_mod
         sonnet_start_time = _time_mod.time()
-        full_text = ''
-        with client.messages.stream(
-            model='claude-sonnet-4-6',
-            max_tokens=24000,
-            messages=[{'role': 'user', 'content': content}]
-        ) as stream:
-            for text in stream.text_stream:
-                full_text += text
-        full_text = full_text.strip()
+        full_text = _claude_stream_with_retry(client, 'claude-sonnet-4-6', 24000, content,
+                                              max_retries=3, label='Sonnet-DP')
         print(f"Sonnet-Antwort: {len(full_text)} Zeichen, {_time_mod.time()-sonnet_start_time:.1f}s")
 
         # ── JSON robust extrahieren via brace-counter ──
@@ -1344,11 +1495,8 @@ Antwort ZUERST als JSON (erste Zeile), dann Begründung:
 
 Kurze Begründung wo Junior 1 vs 2 falsch lagen.
 """
-        resp = client.messages.create(
-            model='claude-opus-4-7',
-            max_tokens=8000,
-            messages=[{'role':'user','content':prompt}]
-        )
+        resp = _claude_with_retry(client, 'claude-opus-4-7', 8000, prompt,
+                                   max_retries=3, label='Opus-Verify')
         full_text = resp.content[0].text.strip()
 
         # Brace-counter JSON-Extraktion (gleiche Logik wie bei Sonnet)
@@ -1895,7 +2043,7 @@ def berechne(form, files):
     fahrzeug  = form.get('fahrzeug', 'verbrenner')
     jobticket = form.get('jobticket', 'nein')
     if anreise in ('auto', 'fahrrad'):
-        fahr = min(km,20)*fahr_tage*0.30 + max(0,km-20)*fahr_tage*0.38
+        fahr = min(km,20)*fahr_tage*pendler['lt_20km'] + max(0,km-20)*fahr_tage*pendler['gt_21km']
     elif anreise == 'oepnv':
         oepnv_kosten = float(form.get('oepnv_kosten', 0))
         fahr = 0 if jobticket == 'ja_frei' else float(oepnv_kosten)
@@ -1903,9 +2051,22 @@ def berechne(form, files):
         fahr = 0
     fahr = round(fahr, 2)
 
-    # ── REINIGUNG & TRINKGELD ────────────────────────────────
-    reinig = round(arbeitstage * 1.60, 2)
-    trink  = round(hotel_naechte * 3.60, 2)
+    # ── JAHR-SPEZIFISCHE PAUSCHALEN ──────────────────────────
+    year_int = int(form.get('year', 2025))
+    bmf_inland = BMF_INLAND_BY_YEAR.get(year_int, BMF_INLAND_BY_YEAR[2025])
+    pendler = PENDLER_BY_YEAR.get(year_int, PENDLER_BY_YEAR[2025])
+    reinig_satz = REINIGUNG_PRO_TAG_BY_YEAR.get(year_int, 1.60)
+    trink_satz  = TRINKGELD_PRO_NACHT_BY_YEAR.get(year_int, 3.60)
+
+    # VMA-Werte mit jahr-korrekten Sätzen neu berechnen falls Tage da
+    vma_72 = vma_72_tage * bmf_inland['tagestrip_8h']
+    vma_73 = vma_73_tage * bmf_inland['an_abreise']
+    vma_74 = vma_74_tage * bmf_inland['voll_24h']
+    vma_in = vma_72 + vma_73 + vma_74
+
+    # ── REINIGUNG & TRINKGELD (jahr-konform) ─────────────────
+    reinig = round(arbeitstage * reinig_satz, 2)
+    trink  = round(hotel_naechte * trink_satz, 2)
 
     # ── GESAMTBERECHNUNG ─────────────────────────────────────
     gesamt = round(fahr + reinig + trink + vma_in + vma_aus, 2)
