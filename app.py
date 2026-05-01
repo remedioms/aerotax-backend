@@ -599,6 +599,88 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
 
 
 
+def _parse_se_lines_deterministic(all_se_text):
+    """Liest SE Zeile für Zeile, kategorisiert nach stfrei-Ort + AB/AN-Pattern.
+    Liefert literal-Werte aus dem Dokument — keine BMF-Tabellen, keine Schätzungen.
+    Edge-Cases (z.B. Ausland ohne stfrei-Wert) werden als 'unklare_zeilen' für Claude markiert.
+    """
+    INLAND = {'FRA','HAM','MUC','BER','DUS','STR','NUE','CGN','LEJ','HAJ',
+              'HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN','XFW','RLG'}
+    z72_count = z73_count = z74_count = 0
+    z72_eur = z73_eur = z74_eur = z76_eur = 0.0
+    unklare = []
+
+    for line in all_se_text.split('\n'):
+        line = line.strip()
+        if not line: continue
+        if ' X' in line: continue                                  # Storno
+        if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue   # nur Datums-Zeilen
+
+        parts = line.split()
+        idx = 1
+        ab = an = None
+        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$', parts[idx]): ab = parts[idx]; idx += 1
+        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$', parts[idx]): an = parts[idx]; idx += 1
+        if idx >= len(parts): continue
+        # Spesenanspruch (überspringen — wir interessieren uns für stfrei)
+        if not re.match(r'^[\d\.]+,\d{2}$', parts[idx]):
+            unklare.append(line); continue
+        idx += 1
+        if idx >= len(parts): continue
+        ort = parts[idx]; idx += 1
+        if idx >= len(parts): continue
+        try: zwf = int(parts[idx]); idx += 1
+        except:
+            unklare.append(line); continue
+
+        # stfrei optional, stfrei-Ort optional
+        sf_val = None
+        sf_ort = None
+        if idx<len(parts) and re.match(r'^[\d\.]+,\d{2}$', parts[idx]):
+            try: sf_val = float(parts[idx].replace('.','').replace(',','.'))
+            except: pass
+            idx += 1
+        if idx<len(parts) and re.match(r'^[A-Z]{2,4}$', parts[idx]):
+            sf_ort = parts[idx]; idx += 1
+
+        # Wenn weder stfrei-Wert noch stfrei-Ort, Zeile nicht eindeutig
+        if sf_val is None and sf_ort is None:
+            unklare.append(line); continue
+
+        # Kategorie aus stfrei-Ort (Priorität) oder ort
+        kategorie_ort = sf_ort if sf_ort else ort
+        is_inland = kategorie_ort in INLAND
+        has_ab = ab is not None
+        has_an = an is not None
+
+        if is_inland:
+            # Inland — gesetzlicher Tagessatz (§9 EStG): 14€ Tagestrip/An-Reise, 28€ 24h
+            if has_ab and has_an:
+                z72_count += 1
+                z72_eur += sf_val if sf_val else 14.0
+            elif zwf == 12 and not has_ab and not has_an:
+                z74_count += 1
+                z74_eur += sf_val if sf_val else 28.0
+            else:
+                z73_count += 1
+                z73_eur += sf_val if sf_val else 14.0
+        else:
+            # Ausland — literal stfrei-Wert addieren
+            if sf_val is not None:
+                z76_eur += sf_val
+            else:
+                # Ausland ohne stfrei-Wert → BMF-Lookup nötig → Claude
+                unklare.append(line)
+
+    return {
+        'z72_tage': z72_count, 'z72_eur': round(z72_eur, 2),
+        'z73_tage': z73_count, 'z73_eur': round(z73_eur, 2),
+        'z74_tage': z74_count, 'z74_eur': round(z74_eur, 2),
+        'z76_eur':  round(z76_eur, 2),
+        'unklare_zeilen': unklare,
+    }
+
+
 def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
     """
     Liest Lufthansa Streckeneinsatz-Abrechnungen.
@@ -681,11 +763,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
 
     z77_total = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
 
-    # ── HILFS-REGEX: Z76-Schätzung als REFERENZ für Claude (nicht als Wert!) ──
-    # Die regex-Summe ist nur ein Anhaltspunkt zum Plausi-Check. Claude liest selbst
-    # und entscheidet — der Regex ist sein "Taschenrechner-Vorabwert", nicht Befehl.
-    INLAND = {'FRA','HAM','MUC','BER','DUS','STR','NUE','CGN','LEJ','HAJ',
-              'HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN'}
+    # ── DETERMINISTISCHES LESEN aller SE-Zeilen ──
     all_se_text = ''
     for pdf_bytes in pdf_bytes_list:
         try:
@@ -693,30 +771,20 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
                 all_se_text += '\n'.join(p.extract_text() or '' for p in pdf.pages) + '\n'
         except: pass
 
-    z76_regex_hint = 0.0
-    z76_regex_lines = 0
-    for line in all_se_text.split('\n'):
-        line = line.strip()
-        if ' X' in line: continue
-        if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue
-        m = re.search(r'([\d\.]+,\d{2})\s+([A-Z]{2,4})\s*$', line)
-        if not m: continue
-        sf_val_str, sf_ort = m.group(1), m.group(2)
-        if sf_ort in INLAND: continue
-        try:
-            z76_regex_hint += float(sf_val_str.replace('.','').replace(',','.'))
-            z76_regex_lines += 1
-        except: pass
-
-    print(f"SE: Z77={z77_total:.2f}€ aus {len(abrechnungen)} Abrechnungen, Z76-Hint(Regex)={z76_regex_hint:.2f}€ aus {z76_regex_lines} Auslands-Zeilen")
+    se_det = _parse_se_lines_deterministic(all_se_text)
+    print(f"SE deterministisch: Z77={z77_total:.2f}€  Z72={se_det['z72_tage']}T/{se_det['z72_eur']}€  Z73={se_det['z73_tage']}T/{se_det['z73_eur']}€  Z74={se_det['z74_tage']}T/{se_det['z74_eur']}€  Z76={se_det['z76_eur']}€  unklar={len(se_det['unklare_zeilen'])} Zeilen")
 
     return {
         'abrechnungen':          abrechnungen,
         'summe_gesamt':          round(sum(a['gesamt'] for a in abrechnungen), 2),
         'summe_steuerfrei':      z77_total,
         'summe_steuerpflichtig': round(sum(a['steuerpflichtig'] for a in abrechnungen), 2),
-        'z76_regex_hint':        round(z76_regex_hint, 2),
-        'z76_regex_lines':       z76_regex_lines,
+        # Deterministisch ermittelt (literal aus SE) — primärer Wert
+        'z72_tage': se_det['z72_tage'], 'z72_eur': se_det['z72_eur'],
+        'z73_tage': se_det['z73_tage'], 'z73_eur': se_det['z73_eur'],
+        'z74_tage': se_det['z74_tage'], 'z74_eur': se_det['z74_eur'],
+        'z76_eur':  se_det['z76_eur'],
+        'unklare_zeilen': se_det['unklare_zeilen'],
     }
 
 def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hints=None):
@@ -810,19 +878,28 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
             if se_texts:
                 se_kontext = '\n\nSTRECKENEINSATZ-ABRECHNUNGEN (alle Monate):\n' + '\n---\n'.join(se_texts)
 
-        # ── HILFS-RECHNER-VORSCHAU vom Backend (Info, nicht Befehl) ──
+        # ── DETERMINISTISCHE SE-AUSWERTUNG vom Backend (literal aus Doku) ──
         rechner_kontext = ''
         if se_hints:
-            z77_t = se_hints.get('summe_steuerfrei', 0)
-            z76_h = se_hints.get('z76_regex_hint', 0)
-            z76_l = se_hints.get('z76_regex_lines', 0)
-            mt = len(se_hints.get('abrechnungen', []))
+            z77_t  = se_hints.get('summe_steuerfrei', 0)
+            z72_t  = se_hints.get('z72_tage', 0); z72_e = se_hints.get('z72_eur', 0)
+            z73_t  = se_hints.get('z73_tage', 0); z73_e = se_hints.get('z73_eur', 0)
+            z74_t  = se_hints.get('z74_tage', 0); z74_e = se_hints.get('z74_eur', 0)
+            z76_e  = se_hints.get('z76_eur', 0)
+            unklar = len(se_hints.get('unklare_zeilen', []))
+            mt     = len(se_hints.get('abrechnungen', []))
             rechner_kontext = (
-                f'\n\nHILFS-RECHNER-VORSCHAU (deterministisch berechnet, nur als Anker für deinen Plausi-Check — du entscheidest selbst):\n'
-                f'- Z77 (steuerfrei gesamt aus Summe-Zeilen): {z77_t:.2f} €\n'
-                f'- Z76 (Σ stfrei-Werte wo stfrei-Ort Ausland, Regex-Schätzung): {z76_h:.2f} € aus {z76_l} Zeilen\n'
-                f'- Anzahl SE-Monate vorhanden: {mt} von 12\n'
-                f'Wenn deine eigene Lese-Summe stark abweicht (>5%), prüf nochmal. Wenn der Regex Zeilen verpasst hat (Format-Variante), vertrau deiner Lese-Summe — du siehst das Dokument als Steuerberater.\n'
+                f'\n\nSE-DETERMINISTISCH GELESEN (Backend hat literal aus dem Dokument extrahiert — das sind keine Schätzungen):\n'
+                f'- Z77 (steuerfrei gesamt): {z77_t:.2f} €\n'
+                f'- Z72 (Inland Tagestrip): {z72_t} Tage / {z72_e:.2f} €\n'
+                f'- Z73 (An-/Abreisetag): {z73_t} Tage / {z73_e:.2f} €\n'
+                f'- Z74 (Inland 24h): {z74_t} Tage / {z74_e:.2f} €\n'
+                f'- Z76 (Ausland-VMA, Σ stfrei-Werte wo Ausland): {z76_e:.2f} €\n'
+                f'- SE-Monate hochgeladen: {mt} von 12\n'
+                f'- Nicht eindeutig lesbare Zeilen (brauchen deine Interpretation): {unklar}\n'
+                f'\nDas Backend hat die eindeutigen Zeilen literal eingelesen. Übernimm die Werte als gegeben.\n'
+                f'Falls oben "unklare Zeilen > 0" steht, prüf bitte gezielt diese Zeilen in der SE und ergänze die VMA-Werte.\n'
+                f'Falls 0 unklare Zeilen → übernimm die Backend-Werte 1:1, du musst die VMA nicht selbst nochmal addieren.\n'
             )
 
         # FollowMe als letztes Content-Element (Lernbeispiel, kein Regelwerk)
@@ -1413,20 +1490,40 @@ def berechne(form, files):
         if not arbeitstage:
             notes.append('⚠️ Flugstunden-Übersichten fehlen — Arbeitstage und VMA konnten nicht berechnet werden.')
 
-    # ── VMA-KATEGORISIERUNG: aus Claudes DP-Auswertung ────────
-    # Claude liest die Streckeneinsatz- + Flugstunden-Texte und sortiert ein.
-    # Z77 (gesamt-steuerfrei) kommt deterministisch aus dem SE-Parser, alles andere von Claude.
-    if dp:
-        vma_72_tage = dp.get('vma_72_tage', 0)
-        vma_73_tage = dp.get('vma_73_tage', 0)
-        vma_74_tage = dp.get('vma_74_tage', 0)
+    # ── VMA-KATEGORISIERUNG ─────────────────────────────────────
+    # SE-Parser liest deterministisch (literal-Werte aus dem Dokument). Claude greift nur bei
+    # unklaren Zeilen ein. Wenn SE komplett sauber gelesen wurde → SE-Werte sind authoritativ.
+    se_unklar = len((se_data or {}).get('unklare_zeilen', []))
+    if se_data and se_unklar == 0:
+        # 100% deterministisch gelesen, keine Edge-Cases
+        vma_72_tage = se_data.get('z72_tage', 0)
+        vma_73_tage = se_data.get('z73_tage', 0)
+        vma_74_tage = se_data.get('z74_tage', 0)
+        vma_72 = se_data.get('z72_eur', vma_72_tage * 14)
+        vma_73 = se_data.get('z73_eur', vma_73_tage * 14)
+        vma_74 = se_data.get('z74_eur', vma_74_tage * 28)
+        vma_aus_se_det = se_data.get('z76_eur', 0)
+        print(f"VMA aus SE deterministisch (sauber): Z72={vma_72_tage}T/{vma_72}€  Z73={vma_73_tage}T/{vma_73}€  Z74={vma_74_tage}T/{vma_74}€  Z76={vma_aus_se_det}€")
+    elif se_data:
+        # Teilweise deterministisch — Claude soll für unklare Zeilen nachhelfen
+        vma_72_tage = max(se_data.get('z72_tage', 0), (dp or {}).get('vma_72_tage', 0))
+        vma_73_tage = max(se_data.get('z73_tage', 0), (dp or {}).get('vma_73_tage', 0))
+        vma_74_tage = max(se_data.get('z74_tage', 0), (dp or {}).get('vma_74_tage', 0))
+        vma_72 = se_data.get('z72_eur', vma_72_tage * 14) or vma_72_tage * 14
+        vma_73 = se_data.get('z73_eur', vma_73_tage * 14) or vma_73_tage * 14
+        vma_74 = se_data.get('z74_eur', vma_74_tage * 28) or vma_74_tage * 28
+        vma_aus_se_det = se_data.get('z76_eur', 0)
+        notes.append(f'Hinweis: {se_unklar} SE-Zeilen waren nicht eindeutig lesbar — Claude hat sie zusätzlich interpretiert.')
+        print(f"VMA hybrid (SE-Parser + Claude für {se_unklar} unklare): Z72={vma_72_tage}T  Z73={vma_73_tage}T  Z76={vma_aus_se_det}€")
     else:
-        vma_72_tage = inferred.get('vma_72_tage', 0)
-        vma_73_tage = inferred.get('vma_73_tage', 0)
-        vma_74_tage = inferred.get('vma_74_tage', 0)
-    vma_72 = vma_72_tage * 14
-    vma_73 = vma_73_tage * 14
-    vma_74 = vma_74_tage * 28
+        # Kein SE-Parser-Output → komplett auf DP/Claude angewiesen
+        vma_72_tage = (dp or inferred).get('vma_72_tage', 0)
+        vma_73_tage = (dp or inferred).get('vma_73_tage', 0)
+        vma_74_tage = (dp or inferred).get('vma_74_tage', 0)
+        vma_72 = vma_72_tage * 14
+        vma_73 = vma_73_tage * 14
+        vma_74 = vma_74_tage * 28
+        vma_aus_se_det = 0
 
     # ── KM: form > dienstplan > inferred ──────────────────────
     anreise = form.get('anreise', 'auto')
@@ -1437,8 +1534,10 @@ def berechne(form, files):
     # ── VMA BERECHNEN ─────────────────────────────────────────
     vma_in = vma_72 + vma_73 + vma_74
 
-    # VMA Ausland — Claude liest die stfrei-Werte direkt aus der SE
-    if dp and ausland_touren:
+    # VMA Ausland — Priorität: SE deterministisch > DP/Claude > inferred
+    if vma_aus_se_det > 0:
+        vma_aus = vma_aus_se_det
+    elif dp and ausland_touren:
         vma_aus = 0
         for t in ausland_touren:
             ort = t.get('ort', '').upper()
