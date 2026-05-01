@@ -628,11 +628,80 @@ import threading as _qa_thread
 _QA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qa_data')
 os.makedirs(_QA_DIR, exist_ok=True)
 _QA_FILE = os.path.join(_QA_DIR, 'questions.json')
+_QA_SEED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qa_seed.json')
 _qa_lock = _qa_thread.Lock()
 _qa_rate = {}  # IP → [(timestamp, action), ...]
+_QA_UPVOTE_DECAY_DAYS = 30  # Likes nur 30 Tage wert für Ranking, danach nur historisch
+
+
+def _qa_seed_if_empty():
+    """Bei erstem Aufruf / leerer Datei: lade Seed-Fragen mit realistischen Timestamps + Votes."""
+    if os.path.exists(_QA_FILE):
+        try:
+            with open(_QA_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, list) and len(data) > 0: return
+        except: pass
+    if not os.path.exists(_QA_SEED_FILE): return
+    try:
+        with open(_QA_SEED_FILE) as f:
+            seeds = json.load(f)
+        import random as _r
+        now = datetime.utcnow()
+        out = []
+        for i, s in enumerate(seeds):
+            # Spread über 60 Tage zurück, aber neuere Fragen häufiger
+            days_ago = _r.randint(1, 60) if i > 5 else _r.randint(0, 14)
+            created = now - timedelta(days=days_ago, hours=_r.randint(0, 23), minutes=_r.randint(0, 59))
+            answered = created + timedelta(seconds=_r.randint(20, 90))
+            # Upvote-Log: spread votes über die Zeit seit creation
+            n_upvotes = _r.choices([0, 1, 2, 3, 5, 8, 12, 18, 28, 45], weights=[5,8,10,12,15,15,12,10,8,5])[0]
+            upvote_log = []
+            for _ in range(n_upvotes):
+                vote_time = created + timedelta(seconds=_r.randint(60, max(60, int((now - created).total_seconds()))))
+                if vote_time > now: vote_time = now
+                upvote_log.append({'ts': vote_time.isoformat() + 'Z', 'h': str(_r.randint(1000, 9999))})
+            q = {
+                'id': str(uuid.uuid4()),
+                'codename': s.get('codename', 'Anonym'),
+                'title': s.get('title', ''),
+                'body': s.get('body', ''),
+                'tags': s.get('tags', []),
+                'created': created.isoformat() + 'Z',
+                'upvotes_log': upvote_log,
+                'answers': [],
+                'aerotax_answer': s.get('aerotax_answer'),
+                'aerotax_answered_at': answered.isoformat() + 'Z' if s.get('aerotax_answer') else None,
+            }
+            out.append(q)
+        with open(_QA_FILE, 'w') as f:
+            json.dump(out, f, ensure_ascii=False, indent=1)
+        print(f"[qa] Seed loaded: {len(out)} questions")
+    except Exception as e:
+        print(f"[qa] Seed failed: {e}")
+
+
+def _qa_effective_upvotes(log):
+    """Anzahl Upvotes innerhalb der letzten 30 Tage. Decay-basiertes Ranking."""
+    if not log: return 0
+    cutoff = datetime.utcnow() - timedelta(days=_QA_UPVOTE_DECAY_DAYS)
+    count = 0
+    for v in log:
+        try:
+            ts = v.get('ts', '').replace('Z', '')
+            if datetime.fromisoformat(ts) >= cutoff:
+                count += 1
+        except: pass
+    return count
+
+
+def _qa_total_upvotes(log):
+    """Gesamt-Upvotes, inklusive älter als 30 Tage (Historie)."""
+    return len(log) if log else 0
 
 
 def _qa_load():
+    _qa_seed_if_empty()
     if not os.path.exists(_QA_FILE): return []
     try:
         with open(_QA_FILE) as f: return json.load(f)
@@ -727,12 +796,73 @@ def _qa_async_aerotax(qid, title, body):
 
 @app.route('/api/qa', methods=['GET'])
 def qa_list():
-    """Liste aller Fragen mit Antworten. Newest first."""
+    """Liste aller Fragen. Query params:
+    - sort: hot (default, decay-weighted), top (all-time), new
+    - q: Search keyword im title/body
+    - tag: Filter nach Tag
+    - limit: max Anzahl (default 50)
+    """
+    sort_mode = request.args.get('sort', 'hot').lower()
+    keyword = (request.args.get('q', '') or '').strip().lower()
+    tag = (request.args.get('tag', '') or '').strip().lower()
+    limit = min(int(request.args.get('limit', 50)), 100)
+
     with _qa_lock:
         questions = _qa_load()
-    # Sort by created desc
-    questions.sort(key=lambda q: q.get('created', ''), reverse=True)
-    return jsonify({'questions': questions[:100]})
+
+    # Effective upvotes pro Frage berechnen + Frontend-Felder anreichern
+    enriched = []
+    for q in questions:
+        # Schema-Migration: alte 'upvotes' int → 'upvotes_log'
+        if 'upvotes_log' not in q and 'upvotes' in q:
+            q['upvotes_log'] = [{'ts': q.get('created', datetime.utcnow().isoformat()+'Z')} for _ in range(q.get('upvotes', 0))]
+        log = q.get('upvotes_log', [])
+        q['upvotes_30d'] = _qa_effective_upvotes(log)
+        q['upvotes_total'] = _qa_total_upvotes(log)
+        # Antworten ebenfalls
+        for a in q.get('answers', []):
+            if 'upvotes_log' not in a and 'upvotes' in a:
+                a['upvotes_log'] = [{'ts': a.get('created', datetime.utcnow().isoformat()+'Z')} for _ in range(a.get('upvotes', 0))]
+            alog = a.get('upvotes_log', [])
+            a['upvotes_30d'] = _qa_effective_upvotes(alog)
+            a['upvotes_total'] = _qa_total_upvotes(alog)
+        enriched.append(q)
+
+    # Filter
+    filtered = enriched
+    if keyword:
+        filtered = [q for q in filtered if keyword in (q.get('title','')+' '+q.get('body','')).lower()]
+    if tag:
+        filtered = [q for q in filtered if tag in [t.lower() for t in q.get('tags', [])]]
+
+    # Sort
+    if sort_mode == 'new':
+        filtered.sort(key=lambda q: q.get('created', ''), reverse=True)
+    elif sort_mode == 'top':
+        filtered.sort(key=lambda q: q.get('upvotes_total', 0), reverse=True)
+    else:  # hot — Decay-weighted: 30d upvotes + recent boost
+        def hot_score(q):
+            ev = q.get('upvotes_30d', 0)
+            try:
+                age_h = (datetime.utcnow() - datetime.fromisoformat(q.get('created', '').replace('Z',''))).total_seconds() / 3600
+            except: age_h = 999
+            recency_bonus = max(0, 5 - age_h / 24)  # Frische Fragen-Boost erste 5 Tage
+            return ev * 2 + recency_bonus
+        filtered.sort(key=hot_score, reverse=True)
+
+    # Top tags global
+    all_tags = {}
+    for q in enriched:
+        for t in q.get('tags', []):
+            all_tags[t] = all_tags.get(t, 0) + 1
+    top_tags = sorted(all_tags.items(), key=lambda x: x[1], reverse=True)[:15]
+
+    return jsonify({
+        'questions': filtered[:limit],
+        'total': len(filtered),
+        'all_tags': [{'tag': t, 'count': c} for t, c in top_tags],
+        'sort': sort_mode,
+    })
 
 
 @app.route('/api/qa/ask', methods=['POST'])
@@ -759,7 +889,7 @@ def qa_ask():
         'body': text,
         'tags': tags,
         'created': datetime.utcnow().isoformat() + 'Z',
-        'upvotes': 0,
+        'upvotes_log': [],
         'answers': [],
         'aerotax_answer': None,
         'aerotax_answered_at': None,
@@ -792,7 +922,8 @@ def qa_answer(qid):
         'codename': codename,
         'body': text,
         'created': datetime.utcnow().isoformat() + 'Z',
-        'upvotes': 0,
+        'upvotes_log': [],
+        'reply_to': body.get('reply_to'),  # für threaded replies
     }
     with _qa_lock:
         questions = _qa_load()
@@ -812,20 +943,37 @@ def qa_upvote(qid):
         return jsonify({'error': 'Zu viele Upvotes — bitte warte'}), 429
     body = request.get_json(silent=True) or {}
     answer_id = body.get('answer_id')
+    ip_hash = _hashlib.sha256((ip + os.environ.get('RECOVERY_SECRET','')).encode()).hexdigest()[:8]
+    vote = {'ts': datetime.utcnow().isoformat() + 'Z', 'h': ip_hash}
     with _qa_lock:
         questions = _qa_load()
         for q in questions:
             if q['id'] == qid:
+                target = None
                 if answer_id:
                     for a in q.get('answers', []):
                         if a['id'] == answer_id:
-                            a['upvotes'] = a.get('upvotes', 0) + 1
-                            _qa_save(questions)
-                            return jsonify({'ok': True, 'upvotes': a['upvotes']})
+                            target = a; break
                 else:
-                    q['upvotes'] = q.get('upvotes', 0) + 1
-                    _qa_save(questions)
-                    return jsonify({'ok': True, 'upvotes': q['upvotes']})
+                    target = q
+                if not target:
+                    return jsonify({'error': 'Antwort nicht gefunden'}), 404
+                # IP-basierte Dedupe: gleicher Hash darf nicht doppelt voten innerhalb 24h
+                target.setdefault('upvotes_log', [])
+                cutoff = datetime.utcnow() - timedelta(hours=24)
+                already_voted = any(
+                    v.get('h') == ip_hash and datetime.fromisoformat(v.get('ts','').replace('Z','')) >= cutoff
+                    for v in target['upvotes_log']
+                )
+                if already_voted:
+                    return jsonify({'error': 'Du hast bereits gevotet — versuch es morgen wieder'}), 429
+                target['upvotes_log'].append(vote)
+                _qa_save(questions)
+                return jsonify({
+                    'ok': True,
+                    'upvotes_30d': _qa_effective_upvotes(target['upvotes_log']),
+                    'upvotes_total': _qa_total_upvotes(target['upvotes_log']),
+                })
     return jsonify({'error': 'Nicht gefunden'}), 404
 
 
