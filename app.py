@@ -745,11 +745,25 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None):
         # Der echte km-Wert wird in berechne() überschrieben
         km = 28
 
-        # Flugstunden-PDFs
+        # Flugstunden: alle Seiten aller PDFs als ein Textblock
         content = []
+        alle_monate = []
         for pb in _bytes_list(pdf_bytes_list)[:12]:
-            b64 = base64.standard_b64encode(pb).decode()
-            content.append({'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}})
+            try:
+                with pdfplumber.open(io.BytesIO(pb)) as pdf:
+                    for page in pdf.pages:
+                        text = page.extract_text() or ''
+                        if text.strip():
+                            alle_monate.append(text)
+            except:
+                pass
+        if alle_monate:
+            flug_gesamt = '\n\n---\n\n'.join(alle_monate)
+            content.append({'type':'text','text':f'FLUGSTUNDEN ALLE {len(alle_monate)} MONATE:\n\n{flug_gesamt}'})
+        else:
+            for pb in _bytes_list(pdf_bytes_list)[:5]:
+                b64 = base64.standard_b64encode(pb).decode()
+                content.append({'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}})
 
         # SE als Klartext (Claude liest Zahlen direkter aus Text als aus PDF-Bild)
         se_kontext = ''
@@ -764,12 +778,31 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None):
             if se_texts:
                 se_kontext = '\n\nSTRECKENEINSATZ-ABRECHNUNGEN (alle Monate):\n' + '\n---\n'.join(se_texts)
 
+        # FollowMe als letztes Content-Element (Lernbeispiel, kein Regelwerk)
+        fm_kontext = ''
+        try:
+            fm_ref = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'referenz_faelle.txt')
+            if os.path.exists(fm_ref):
+                with open(fm_ref, encoding='utf-8') as fmf:
+                    fm_kontext = '\n\nHIER SIND ZWEI BEREITS BERECHNETE FÄLLE ZUM VERGLEICH (von FollowMe verifiziert — nicht als Regeln, sondern als Beispiele zum Lernen):\n' + fmf.read()
+        except: pass
+
         content.append({'type': 'text', 'text': f"""Du bist ein gewissenhafter Steuerberater spezialisiert auf Lufthansa-Kabinenpersonal.
 Dein Mandant hat dir seine Unterlagen für 2025 gegeben. Deine Aufgabe: alle Werbungskosten für Anlage N berechnen.
 
 Geh wie ein gründlicher Steuerberater vor — lies JEDEN Monat, JEDE Seite, JEDE Zeile der Dokumente.
 Ein Steuerberater der nur 2 von 12 Monaten auswertet macht seinen Job nicht — sei gründlich.
-{se_kontext}
+{se_kontext}{fm_kontext}
+
+REFERENZFALL (bereits verifiziert — zum Lernen wie LH-Dokumente zu lesen sind):
+- Fahrtag: "03.01. LH400 A FRA 14:36" → A=Abflug FRA → Fahrtag ✓
+- Kein Fahrtag: Vortag endete mit A FRA→MUC → heute noch unterwegs → kein Fahrtag
+- Hotelnacht ohne FL-Marker: "23.05. A FRA→TUN 20:10 / 24.05. E TUN→FRA 03:00" → 1 Nacht ✓
+- Z73: SE "14,00  FRA" → stfrei=14, stfrei-Ort=FRA → Anreisetag Z73 ✓
+- Z76: SE "48,00  SEL" → stfrei=48, stfrei-Ort=SEL(Ausland) → VMA Ausland Z76 ✓
+- Z77: Alle stfrei-Einzelwerte summieren — NICHT die Summenzeile (Format variiert!)
+Verifiziertes Ergebnis eines LH-Mitarbeiters: Fahrtage=53, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€
+
 Du kennst die LH-Dokumentenformate:
 - Flugstunden: A=Abflug FRA, E=Einflug, FL=Übernachtung im Ausland, EK/D4/EH/EM=Homebase-Dienst
 - Streckeneinsatz (SE): Die stfrei-Spalte enthält den BMF-Tagessatz den LH bereits fertig berechnet hat.
@@ -782,20 +815,19 @@ Wichtige LH-Besonderheiten:
 - Kurzstrecke EU oft ohne FL-Marker, trotzdem Hotelnacht wenn A abends und E nächsten Morgen
 - Nachtflüge: die Flugzeit selbst (auf dem Weg) zählt nicht als Hotelnacht
 
-Schreibe kurz deinen Rechenweg, dann JSON:
-NACHWEIS:
-Fahrtage: [Daten]
-Hotelnächte: [Touren]
-Z73: [stfrei=14→FRA Zeilen]
-Z76: [stfrei-Werte summiert]
-Z77: [Summe aller stfrei-Einzelwerte]
+Geh Monat für Monat durch — Januar bis Dezember. Schreibe für jeden Monat:
+"Januar: Fahrtage=[...], Hotel=[...], Z73=[...], Z76=[...]"
+"Februar: ..."
+usw. bis Dezember.
+Dann summiere alles und schreibe das JSON.
+Überspringe keinen Monat. Nimm dir Zeit — Gründlichkeit ist wichtiger als Geschwindigkeit.
 
 {{"fahrtage":0,"km":{km},"arbeitstage":0,"hotel_naechte":0,"vma_72_tage":0,"vma_72":0,"vma_73_tage":0,"vma_73":0,"vma_74_tage":0,"vma_74":0,"vma_aus":0,"z77":0}}"""
         })
 
         response = client.messages.create(
             model='claude-sonnet-4-5',
-            max_tokens=2000,
+            max_tokens=8000,
             messages=[{'role': 'user', 'content': content}]
         )
         full_text = response.content[0].text.strip()
