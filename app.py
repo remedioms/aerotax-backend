@@ -888,37 +888,65 @@ Wichtige LH-Besonderheiten:
 
 DEFINITION Arbeitstage: ALLE Tage mit Dienst im Jahr — Flüge (FRA-Abflug oder Einflug), Standby/Reserve (EK/D4/EH/EM), Briefings, Schulungen, SM-Seminare. NICHT zählen: Frei-Tage, Urlaub (U), Krank (K), unbezahlte Freistellung. Mehrtägige Touren = jeder Einsatztag zählt einzeln (auch Auslands-Übernachtungen sind Arbeitstage). Typische LH-Werte: 110-150 Arbeitstage/Jahr.
 
-Geh Monat für Monat durch — Januar bis Dezember. Schreibe für jeden Monat:
-"Januar: Arbeitstage=[...], Fahrtage=[...], Hotel=[...], Z73=[...], Z76=[...]"
-"Februar: ..."
-usw. bis Dezember.
-Dann summiere alles (auch Arbeitstage!) und schreibe das JSON. WICHTIG: arbeitstage darf NIEMALS 0 sein wenn Dienstplan-Einträge vorhanden sind.
-Überspringe keinen Monat. Nimm dir Zeit — Gründlichkeit ist wichtiger als Geschwindigkeit.
+═══ ANTWORT-FORMAT — UNBEDINGT EINHALTEN ═══
 
-{{"fahrtage":0,"km":{km},"arbeitstage":0,"hotel_naechte":0,"vma_72_tage":0,"vma_72":0,"vma_73_tage":0,"vma_73":0,"vma_74_tage":0,"vma_74":0,"vma_aus":0,"z77":0}}"""
+Schreibe ZUERST die JSON-Zeile, DANN den Nachweis. Die JSON MUSS in der ersten Zeile deiner Antwort stehen — sonst geht sie verloren.
+
+Format:
+
+{{"fahrtage":53,"km":{km},"arbeitstage":129,"hotel_naechte":54,"vma_72_tage":13,"vma_72":182,"vma_73_tage":10,"vma_73":140,"vma_74_tage":0,"vma_74":0,"vma_aus":4562,"z77":4742.80}}
+
+NACHWEIS Monat für Monat:
+Januar: Arbeitstage=…, Fahrtage=…, Hotel=…, Z73=…, Z76=…
+Februar: …
+…
+Dezember: …
+
+REGELN:
+- arbeitstage darf NIEMALS 0 sein wenn Dienstplan-Einträge vorhanden sind. Lieber konservativ schätzen als 0.
+- Werte in der JSON-Zeile sind die SUMMEN über alle 12 Monate.
+- Keine Backticks, kein "json"-Tag — die JSON-Zeile muss als allererste Zeichen direkt mit `{{` beginnen.
+- Keine Zeile vor der JSON. Nicht "Hier ist...", direkt JSON."""
         })
 
         full_text = ''
         with client.messages.stream(
             model='claude-sonnet-4-5',
-            max_tokens=8000,
+            max_tokens=16000,
             messages=[{'role': 'user', 'content': content}]
         ) as stream:
             for text in stream.text_stream:
                 full_text += text
         full_text = full_text.strip()
 
-        # Nachweis + JSON trennen
+        # JSON-Zeile finden — Claude soll sie an den Anfang setzen, fallback: irgendwo im Text
         nachweis = ''
-        m = re.search(r'\{[^{}]*"fahrtage"[^{}]*\}', full_text, re.DOTALL)
-        if m:
-            nachweis = full_text[:m.start()].strip()
-            json_str = m.group(0)
+        json_str = ''
+        # Versuch 1: Erste Zeile direkt JSON?
+        first_line = full_text.split('\n', 1)[0].strip()
+        if first_line.startswith('{') and '"fahrtage"' in first_line:
+            json_str = first_line
+            nachweis = full_text[len(first_line):].strip()
         else:
-            ms = re.search(r'\{[\s\S]*\}', full_text)
-            json_str = ms.group(0) if ms else '{}'
+            # Versuch 2: Flache JSON mit fahrtage finden (no nested braces)
+            m = re.search(r'\{[^{}]*"fahrtage"[^{}]*\}', full_text, re.DOTALL)
+            if m:
+                json_str = m.group(0)
+                nachweis = (full_text[:m.start()] + full_text[m.end():]).strip()
+            else:
+                # Versuch 3: Greedy
+                ms = re.search(r'\{[\s\S]*\}', full_text)
+                json_str = ms.group(0) if ms else '{}'
 
-        parsed = json.loads(json_str)
+        try:
+            parsed = json.loads(json_str)
+        except json.JSONDecodeError as je:
+            print(f"Claude JSON parse failed: {je}")
+            print(f"Full response (first 1500 chars):\n{full_text[:1500]}")
+            parsed = {}
+
+        if not parsed.get('arbeitstage'):
+            print(f"⚠️ Claude lieferte kein arbeitstage. Volle Antwort (erste 2000 Zeichen):\n{full_text[:2000]}")
         print(f"Claude: fahr={parsed.get('fahrtage')} arbeit={parsed.get('arbeitstage')} hotel={parsed.get('hotel_naechte')} z77={parsed.get('z77')}")
         if nachweis:
             print(f"Nachweis:\n{nachweis[:800]}")
