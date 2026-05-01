@@ -684,79 +684,86 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
                 all_se_text += '\n'.join(p.extract_text() or '' for p in pdf.pages) + '\n'
         except: pass
 
-    vma_76 = 0.0
+    # ── KORREKTE ZUORDNUNG je SE-Zeile ──────────────────────────────
+    # SE-Format:   DATUM [AB] [AN] BETRAG ORT ZWF [STFREI] [STFREI-ORT]
+    # Lufthansa hat den BMF-Wert je Tag bereits in der stfrei-Spalte stehen.
+    # Wir müssen nur korrekt einsortieren in Z72/Z73/Z74/Z76.
+    z72_tage = z73_tage_real = z74_tage = 0  # z73 alt überschreiben
+    vma_72 = vma_73 = vma_74 = vma_76 = 0.0
+
     for line in all_se_text.split('\n'):
         line = line.strip()
-        if ' X' in line: continue
-        if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue
+        if ' X' in line: continue                                  # Storno
+        if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue   # nur Datums-Zeilen
+
         parts = line.split(); idx = 1
         ab = an = None
-        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$',parts[idx]): ab=parts[idx]; idx+=1
-        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$',parts[idx]): an=parts[idx]; idx+=1
+        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$', parts[idx]): ab = parts[idx]; idx += 1
+        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$', parts[idx]): an = parts[idx]; idx += 1
         if idx>=len(parts): continue
-        idx += 1  # betrag
+        # Spesenanspruch (überspringen, brauchen wir nicht — wir nehmen stfrei direkt)
+        if not re.match(r'^[\d,\.]+$', parts[idx]): continue
+        idx += 1
         if idx>=len(parts): continue
-        ort = parts[idx]; idx+=1
+        ort = parts[idx]; idx += 1
         if idx>=len(parts): continue
-        try: zwf = int(parts[idx]); idx+=1
+        try: zwf = int(parts[idx]); idx += 1
         except: continue
+
         sf = 0.0; sfo = ''
-        if idx<len(parts) and re.match(r'^[\d,\.]+$',parts[idx]):
-            try: sf=float(parts[idx].replace('.','').replace(',','.')); idx+=1
+        if idx<len(parts) and re.match(r'^[\d,\.]+$', parts[idx]):
+            try: sf = float(parts[idx].replace('.','').replace(',','.')); idx += 1
             except: pass
-            if idx<len(parts) and re.match(r'^[A-Z]{2,4}$',parts[idx]):
-                sfo = parts[idx]; idx+=1
+            if idx<len(parts) and re.match(r'^[A-Z]{2,4}$', parts[idx]):
+                sfo = parts[idx]; idx += 1
 
-        # Z76: BMF-Satz für Auslandstage
-    # KRITISCH: stfrei_ort hat Priorität vor ort für BMF-Lookup!
-    # Viele Zeilen haben ort=FRA aber stfrei_ort=Auslandsort (Abreisetage über FRA gebucht)
-    vma_76 = 0.0
-    for line in all_se_text.split('\n'):
-        line = line.strip()
-        if ' X' in line: continue
-        if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue
-        parts = line.split(); idx = 1
-        ab = an = None
-        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$',parts[idx]): ab=parts[idx]; idx+=1
-        if idx<len(parts) and re.match(r'^\d{2}:\d{2}$',parts[idx]): an=parts[idx]; idx+=1
-        if idx>=len(parts): continue
-        idx += 1  # betrag
-        if idx>=len(parts): continue
-        ort = parts[idx]; idx+=1
-        if idx>=len(parts): continue
-        try: zwf = int(parts[idx]); idx+=1
-        except: continue
-        sf = 0.0; sfo = ''
-        if idx<len(parts) and re.match(r'^[\d,\.]+$',parts[idx]):
-            try: sf=float(parts[idx].replace('.','').replace(',','.')); idx+=1
-            except: pass
-            if idx<len(parts) and re.match(r'^[A-Z]{2,4}$',parts[idx]):
-                sfo = parts[idx]; idx+=1
-
-        # Z73 Anreisetage ausschließen: stfrei=14 → JEDE DE-Stadt
-        if sf == 14.0 and sfo in INLAND:
-            continue
-        # Inland+Inland = Z72/Z74, nicht Z76
-        if ort in INLAND and (not sfo or sfo in INLAND):
-            continue
-
-        # BMF-Zielort: stfrei_ort hat PRIORITÄT (ort kann FRA sein bei Abreisetagen)
-        ziel = sfo if (sfo and sfo in BMF) else (ort if ort in BMF else None)
-        if not ziel: continue
+        # KEIN steuerfreier Tagessatz erkennbar → Zeile überspringen (z.B. Storno-Reste)
         if sf == 0 and not sfo: continue
 
-        bmf = BMF[ziel]
-        vma_76 += bmf[0] if zwf == 12 else bmf[1]
+        # stfrei-Ort entscheidet die Kategorie. Wenn nicht da, fallback auf ort.
+        kategorie_ort = sfo if sfo else ort
+        is_inland = kategorie_ort in INLAND
+        has_ab = ab is not None
+        has_an = an is not None
 
-    print(f"SE Regex: Z77={z77_total:.2f}€, Z73={z73_tage}T, Z76={vma_76:.2f}€")
+        if is_inland:
+            # Inland-Tagessatz (14€ od. 28€)
+            if has_ab and has_an:
+                # Tagestrip Inland (Abflug + Ankunft am gleichen Tag, kein Hotel) → Z72
+                z72_tage += 1
+                vma_72 += sf if sf > 0 else 14.0
+            elif zwf == 12 and not has_ab and not has_an:
+                # 24h Inland-Tag (sehr selten) → Z74 (28€)
+                z74_tage += 1
+                vma_74 += sf if sf > 0 else 28.0
+            else:
+                # An-Tag oder Abreise-Tag mit Hotel — meist Verbindung zu Auslands-Tour → Z73
+                z73_tage_real += 1
+                vma_73 += sf if sf > 0 else 14.0
+        else:
+            # Ausland → Z76, stfrei-Wert direkt von LH übernehmen (BMF-konform)
+            if sf > 0:
+                vma_76 += sf
+            elif kategorie_ort in BMF:
+                # Fallback wenn LH den Wert nicht ausgewiesen hat (selten)
+                bmf = BMF[kategorie_ort]
+                vma_76 += bmf[0] if zwf == 12 else bmf[1]
+
+    print(f"SE: Z77={z77_total:.2f}€  Z72={z72_tage}T/{vma_72:.2f}€  Z73={z73_tage_real}T/{vma_73:.2f}€  Z74={z74_tage}T/{vma_74:.2f}€  Z76={vma_76:.2f}€")
 
     return {
         'abrechnungen':        abrechnungen,
         'summe_gesamt':        round(sum(a['gesamt'] for a in abrechnungen), 2),
         'summe_steuerfrei':    z77_total,
         'summe_steuerpflichtig': round(sum(a['steuerpflichtig'] for a in abrechnungen), 2),
-        'vma_76_se':           round(vma_76, 2),    # Vorberechnung, Claude verfeinert
-        'z73_tage':            z73_tage,
+        'vma_72_tage':         z72_tage,
+        'vma_72':              round(vma_72, 2),
+        'vma_73_tage':         z73_tage_real,
+        'vma_73':              round(vma_73, 2),
+        'vma_74_tage':         z74_tage,
+        'vma_74':              round(vma_74, 2),
+        'vma_76_se':           round(vma_76, 2),
+        'z73_tage':            z73_tage_real,
     }
 
 def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0):
@@ -1410,27 +1417,43 @@ def berechne(form, files):
         if not spesen_gesamt:
             notes.append('⚠️ Streckeneinsatz-Abrechnungen fehlen — Z77-Abzug konnte nicht berechnet werden.')
 
-    # Dienstplan values
+    # Dienstplan values (Arbeitstage/Hotel/Fahrtage kommen aus DP/Claude)
     if dp:
         arbeitstage    = dp.get('arbeitstage', 0)
         fahr_tage      = dp.get('fahr_tage', 0)
         hotel_naechte  = dp.get('hotel_naechte', 0)
-        vma_72_tage    = dp.get('vma_72_tage', 0)
-        vma_73_tage    = dp.get('vma_73_tage', 0)
-        vma_74_tage    = dp.get('vma_74_tage', 0)
         ausland_touren = dp.get('ausland_touren', [])
         km_dp          = dp.get('km', 0)
     else:
         arbeitstage    = inferred.get('arbeitstage', 0)
         fahr_tage      = inferred.get('fahr_tage', 0)
         hotel_naechte  = inferred.get('hotel_naechte', 0)
-        vma_72_tage    = inferred.get('vma_72_tage', 0)
-        vma_73_tage    = inferred.get('vma_73_tage', 0)
-        vma_74_tage    = inferred.get('vma_74_tage', 0)
         ausland_touren = []
         km_dp          = inferred.get('km', 0)
         if not arbeitstage:
             notes.append('⚠️ Flugstunden-Übersichten fehlen — Arbeitstage und VMA konnten nicht berechnet werden.')
+
+    # ── VMA-KATEGORISIERUNG: SE-Daten haben PRIORITÄT ─────────
+    # Lufthansa hat den BMF-Tagessatz je Tag in der SE bereits exakt berechnet.
+    # Wir übernehmen die Werte direkt — präziser als jede KI-Interpretation.
+    if se_data and (se_data.get('vma_72_tage', 0) or se_data.get('vma_73_tage', 0) or se_data.get('vma_74_tage', 0) or se_data.get('vma_76_se', 0) > 0):
+        vma_72_tage = se_data.get('vma_72_tage', 0)
+        vma_73_tage = se_data.get('vma_73_tage', 0)
+        vma_74_tage = se_data.get('vma_74_tage', 0)
+        vma_72      = se_data.get('vma_72', vma_72_tage * 14)
+        vma_73      = se_data.get('vma_73', vma_73_tage * 14)
+        vma_74      = se_data.get('vma_74', vma_74_tage * 28)
+        vma_aus_se  = se_data.get('vma_76_se', 0)
+        print(f"VMA aus SE übernommen: Z72={vma_72_tage}T/{vma_72}€  Z73={vma_73_tage}T/{vma_73}€  Z74={vma_74_tage}T/{vma_74}€  Z76={vma_aus_se}€")
+    else:
+        # Fallback: aus DP/inferred
+        vma_72_tage = (dp or {}).get('vma_72_tage', 0) if dp else inferred.get('vma_72_tage', 0)
+        vma_73_tage = (dp or {}).get('vma_73_tage', 0) if dp else inferred.get('vma_73_tage', 0)
+        vma_74_tage = (dp or {}).get('vma_74_tage', 0) if dp else inferred.get('vma_74_tage', 0)
+        vma_72 = vma_72_tage * 14
+        vma_73 = vma_73_tage * 14
+        vma_74 = vma_74_tage * 28
+        vma_aus_se = 0
 
     # ── KM: form > dienstplan > inferred ──────────────────────
     anreise = form.get('anreise', 'auto')
@@ -1439,9 +1462,6 @@ def berechne(form, files):
         km = km_dp
 
     # ── VMA BERECHNEN ─────────────────────────────────────────
-    vma_72 = vma_72_tage * 14
-    vma_73 = vma_73_tage * 14
-    vma_74 = vma_74_tage * 28
     vma_in = vma_72 + vma_73 + vma_74
 
     # VMA Ausland
@@ -1452,6 +1472,9 @@ def berechne(form, files):
             if ort in BMF_2025:
                 s24, sab = BMF_2025[ort]
                 vma_aus += t.get('an',0)*sab + t.get('voll',0)*s24 + t.get('ab',0)*sab
+    elif vma_aus_se > 0:
+        # SE-Wert hat Priorität — Lufthansa hat BMF-Tagessätze bereits korrekt verrechnet
+        vma_aus = vma_aus_se
     elif dp and dp.get('vma_aus', 0) > 0:
         vma_aus = dp.get('vma_aus', 0)
     else:
