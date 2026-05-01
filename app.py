@@ -764,11 +764,13 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None):
             if se_texts:
                 se_kontext = '\n\nSTRECKENEINSATZ-ABRECHNUNGEN (alle Monate):\n' + '\n---\n'.join(se_texts)
 
-        content.append({'type': 'text', 'text': f"""Du bist ein erfahrener Steuerberater spezialisiert auf Lufthansa-Personal.
-Analysiere die beigefügten Dokumente (Flugstunden-Übersichten und Streckeneinsatz-Abrechnungen) für das Steuerjahr 2025.
-{se_kontext}
+        content.append({'type': 'text', 'text': f"""Du bist ein gewissenhafter Steuerberater spezialisiert auf Lufthansa-Kabinenpersonal.
+Dein Mandant hat dir seine Unterlagen für 2025 gegeben. Deine Aufgabe: alle Werbungskosten für Anlage N berechnen.
 
-Berechne alle steuerrelevanten Werte für Anlage N. Du kennst die LH-Dokumentenformate:
+Geh wie ein gründlicher Steuerberater vor — lies JEDEN Monat, JEDE Seite, JEDE Zeile der Dokumente.
+Ein Steuerberater der nur 2 von 12 Monaten auswertet macht seinen Job nicht — sei gründlich.
+{se_kontext}
+Du kennst die LH-Dokumentenformate:
 - Flugstunden: A=Abflug FRA, E=Einflug, FL=Übernachtung im Ausland, EK/D4/EH/EM=Homebase-Dienst
 - Streckeneinsatz (SE): Die stfrei-Spalte enthält den BMF-Tagessatz den LH bereits fertig berechnet hat.
   stfrei-Ort hat Vorrang über Ort. Storno-Zeilen enden mit X → ignorieren.
