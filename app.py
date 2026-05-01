@@ -907,7 +907,7 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
                 'FollowMe PDF. Extrahiere: Zeile 72 (Tage, €), 73 (Tage, €), 74 (Tage, €), 76 (€), Fahrtage, km, Arbeitstage, Hotelaufenthalte.\n'
                 'JSON: {"vma_72_tage":13,"vma_72":182.0,"vma_73_tage":10,"vma_73":140.0,"vma_74_tage":0,"vma_74":0.0,"vma_aus":4562.0,"fahr_tage":53,"km":27,"arbeitstage":129,"hotel_naechte":54}'
             })
-            resp = client.messages.create(model='claude-sonnet-4-5',max_tokens=400,
+            resp = client.messages.create(model='claude-sonnet-4-6',max_tokens=400,
                 messages=[{'role':'user','content':content_v}])
             d = json.loads(re.sub(r'```json|```','',resp.content[0].text.strip()).strip())
             for k,v in d.items():
@@ -1014,12 +1014,21 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
                     fm_kontext = '\n\nHIER SIND ZWEI BEREITS BERECHNETE FÄLLE ZUM VERGLEICH (von FollowMe verifiziert — nicht als Regeln, sondern als Beispiele zum Lernen):\n' + fmf.read()
         except: pass
 
+        # EASA + Steuerrecht-Referenz als Wissens-Buch
+        easa_kontext = ''
+        try:
+            easa_ref = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'referenz_easa.txt')
+            if os.path.exists(easa_ref):
+                with open(easa_ref, encoding='utf-8') as ef:
+                    easa_kontext = '\n\n═══ FACH-WISSEN: EASA-FTL + DEUTSCHES STEUERRECHT (zum Nachschlagen, nicht als Befehl) ═══\n' + ef.read()
+        except: pass
+
         content.append({'type': 'text', 'text': f"""Du bist ein gewissenhafter Steuerberater spezialisiert auf Lufthansa-Kabinenpersonal.
 Dein Mandant hat dir seine Unterlagen für 2025 gegeben. Deine Aufgabe: alle Werbungskosten für Anlage N berechnen.
 
 Geh wie ein gründlicher Steuerberater vor — lies JEDEN Monat, JEDE Seite, JEDE Zeile der Dokumente.
 Ein Steuerberater der nur 2 von 12 Monaten auswertet macht seinen Job nicht — sei gründlich.
-{se_kontext}{rechner_kontext}{fm_kontext}
+{se_kontext}{rechner_kontext}{fm_kontext}{easa_kontext}
 
 REFERENZFALL (bereits verifiziert — zum Lernen wie LH-Dokumente zu lesen sind):
 - Fahrtag: "03.01. LH400 A FRA 14:36" → A=Abflug FRA → Fahrtag ✓
@@ -1092,7 +1101,7 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
 
         full_text = ''
         with client.messages.stream(
-            model='claude-sonnet-4-5',
+            model='claude-sonnet-4-6',
             max_tokens=16000,
             messages=[{'role': 'user', 'content': content}]
         ) as stream:
@@ -1151,16 +1160,12 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
             c_a = int(parsed.get('arbeitstage') or 0)
             c_h = int(parsed.get('hotel_naechte') or 0)
 
-            # Konflikt-Check: wenn Parser und Claude >5% / >3 Tage abweichen → Opus zur Schlichtung
-            f_diff = abs(p_f - c_f) > 3
-            a_diff = abs(p_a - c_a) > 5
-            h_diff = abs(p_h - c_h) > 3
-            many_unklar = flug_det and len(flug_det['unklare_tage']) > 5
-            many_se_unklar = se_hints and len(se_hints.get('unklare_zeilen', [])) > 5
+            # Opus läuft IMMER als Senior-Verifikation (max Accuracy, Kosten egal)
+            run_opus = True
 
-            if f_diff or a_diff or h_diff or many_unklar or many_se_unklar:
-                # Opus 4.7 zur Verifikation triggern
-                print(f"Konflikt erkannt — triggere Opus-Verifikation: parser=({p_f}/{p_a}/{p_h}) vs claude=({c_f}/{c_a}/{c_h})  unklar_flug={len(flug_det['unklare_tage']) if flug_det else '-'}  unklar_se={len(se_hints.get('unklare_zeilen', [])) if se_hints else '-'}")
+            if run_opus:
+                # Opus 4.7 läuft immer für maximale Genauigkeit
+                print(f"Opus-Verifikation startet: parser=({p_f}/{p_a}/{p_h})  sonnet=({c_f}/{c_a}/{c_h})  unklar_flug={len(flug_det['unklare_tage']) if flug_det else '-'}  unklar_se={len(se_hints.get('unklare_zeilen', [])) if se_hints else '-'}")
                 parser_sum = (
                     f"Parser-Werte: fahrtage={p_f}, arbeitstage={p_a}, hotel={p_h}\n"
                     f"Unklare Flugstunden-Tage ({len(flug_det['unklare_tage']) if flug_det else 0}): "
@@ -1422,7 +1427,7 @@ Wenn absolut kein Betrag erkennbar: {{"betrag": 0}}"""
 
         try:
             response = client.messages.create(
-                model='claude-sonnet-4-5',
+                model='claude-sonnet-4-6',
                 max_tokens=200,
                 messages=[{'role': 'user', 'content': content_blocks}]
             )
@@ -1541,7 +1546,7 @@ Antworte NUR mit JSON (keine Backticks):
 
     try:
         response = client.messages.create(
-            model='claude-sonnet-4-5',
+            model='claude-sonnet-4-6',
             max_tokens=1000,
             messages=[{'role': 'user', 'content': prompt}]
         )
@@ -1834,6 +1839,33 @@ def berechne(form, files):
     else:
         print(f"PLAUSI-CHECKS ok: VMA-Summe={vma_summe:.2f}€ Z77={z77:.2f}€ Hotel/Arbeit/Fahr/365 alle plausibel")
 
+    # ── AUDIT-TRAIL ──────────────────────────────────────────
+    se_unklar = len((se_data or {}).get('unklare_zeilen', []))
+    se_clean = se_data is not None and se_unklar == 0
+    flug_clean = (dp or {}).get('_flug_clean', False)
+    flug_unklar = len(((dp or {}).get('_flug_parser') or {}).get('unklare_tage', []))
+    opus_used = (dp or {}).get('_opus_used', False)
+    verif_src = (dp or {}).get('_verification_source', 'unbekannt')
+
+    audit_source = {
+        'z77':         'deterministisch — Summe-Zeile aus SE-Abrechnungen',
+        'z76':         f'deterministisch — Σ stfrei-Werte aus {len(se_data.get("abrechnungen", [])) if se_data else 0} SE-Monaten' if se_clean else 'Hybrid (Parser + Claude)',
+        'z72':         'deterministisch — SE-Line-Parser' if se_clean else 'Hybrid (Parser + Claude)',
+        'z73':         'deterministisch — SE-Line-Parser' if se_clean else 'Hybrid (Parser + Claude)',
+        'fahrtage':    f'Parser + Sonnet 4.6 + {"Opus 4.7 verifiziert" if opus_used else "Übereinstimmung ohne Konflikt"}',
+        'arbeitstage': f'Parser + Sonnet 4.6 + {"Opus 4.7 verifiziert" if opus_used else "Übereinstimmung ohne Konflikt"}',
+        'hotel':       f'Parser + Sonnet 4.6 + {"Opus 4.7 verifiziert (EASA-FTL)" if opus_used else "Übereinstimmung ohne Konflikt"}',
+    }
+    verification_info = {
+        'parser_clean': se_clean,
+        'se_unklar':    se_unklar,
+        'flug_clean':   flug_clean,
+        'flug_unklar':  flug_unklar,
+        'opus_used':    opus_used,
+        'plausi_ok':    not plausi_warns,
+        'verif_source': verif_src,
+    }
+
     # ── UPLOADED DOCS SUMMARY ────────────────────────────────
     uploaded_summary = []
     not_uploaded = []
@@ -1909,6 +1941,9 @@ def berechne(form, files):
         'verpfl_z20':       verpfl_z20,
         # Optionale Belege
         'optionale_belege': optionale_belege,
+        # Audit-Trail
+        '_audit_source':   audit_source,
+        '_verification':   verification_info,
     }
 
 
@@ -2543,6 +2578,70 @@ def erstelle_pdf(d):
                 ps(f"wp{id(path)}", fontSize=8.5, textColor=TEXT2,
                    fontName="Helvetica", leading=13, spaceAfter=4)))
 
+
+    # ── AUDIT-TRAIL: Quellen & Confidence pro Wert ──
+    S.append(PageBreak())
+    for el in section("Audit-Trail — Wie diese Werte entstanden sind"): S.append(el)
+    S.append(Paragraph(
+        "Maximale Transparenz: für jede Zahl in der Berechnung dokumentieren wir hier wie sie zustande kam — "
+        "deterministisch aus dem Originaldokument, KI-interpretiert oder per Senior-Prüfung verifiziert.",
+        ps("at_intro", fontSize=10, textColor=TEXT2, fontName="Helvetica",
+           leading=15, spaceAfter=14)))
+
+    # Quellen-Tabelle
+    src = d.get('_audit_source', {})
+    audit_rows = [
+        ('Z77 (steuerfrei gesamt)',  src.get('z77', 'deterministisch — Summe-Zeile aus SE')),
+        ('Z76 (VMA Ausland)',        src.get('z76', 'deterministisch — Σ stfrei-Werte aus SE')),
+        ('Z72 (Inland Tagestrip)',   src.get('z72', 'deterministisch — SE-Pattern AB+AN+Inland')),
+        ('Z73 (An-/Abreisetage)',    src.get('z73', 'deterministisch — SE-Pattern Einseite-Zeit+Inland-stfrei')),
+        ('Fahrtage',                 src.get('fahrtage', 'Parser + Sonnet + Opus')),
+        ('Arbeitstage',              src.get('arbeitstage', 'Parser + Sonnet + Opus')),
+        ('Hotelnächte',              src.get('hotel', 'Parser + Sonnet + Opus, EASA-FTL Layover-Regel')),
+        ('LSB-Werte (Brutto/Lohnsteuer/Z17)', 'deterministisch — Regex auf gesetzlichem LSB-Format'),
+        ('Optionale Belege',          'Claude Vision — Beträge aus Bildern/PDFs gelesen'),
+    ]
+    for label, source in audit_rows:
+        t = Table([[
+            Paragraph(label, ps(f"al{id(label)}", fontSize=9, textColor=TEXT,
+                fontName="Helvetica-Bold", leading=12)),
+            Paragraph(source, ps(f"as{id(source)}", fontSize=8.5, textColor=TEXT2,
+                fontName="Helvetica", leading=12)),
+        ]], colWidths=[6.5*cm, 10.3*cm])
+        t.setStyle(TableStyle([
+            ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+            ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+            ("LINEBELOW",(0,0),(-1,0),0.3,LINE),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+        ]))
+        S.append(t)
+
+    S.append(Spacer(1, 0.6*cm))
+
+    # Verifikations-Status
+    verif = d.get('_verification', {})
+    if verif:
+        S.append(Paragraph("VERIFIKATIONS-STATUS",
+            ps("verif_h", fontSize=8, textColor=TEXT3, fontName="Helvetica-Bold",
+               leading=12, spaceAfter=8, letterSpacing=1.5)))
+        verif_lines = []
+        if verif.get('parser_clean'):
+            verif_lines.append('✓ Streckeneinsatz: Backend hat alle Zeilen deterministisch eingelesen')
+        else:
+            verif_lines.append(f'⚠ Streckeneinsatz: {verif.get("se_unklar",0)} Zeilen waren mehrdeutig — Claude hat zusätzlich interpretiert')
+        if verif.get('flug_clean'):
+            verif_lines.append('✓ Flugstunden: Backend hat alle Tage deterministisch klassifiziert')
+        else:
+            verif_lines.append(f'⚠ Flugstunden: {verif.get("flug_unklar",0)} Tage waren mehrdeutig — Claude + Opus haben verifiziert')
+        if verif.get('opus_used'):
+            verif_lines.append('✓ Senior-Verifikation durch Opus 4.7 (zweiter unabhängiger KI-Steuerberater)')
+        if verif.get('plausi_ok'):
+            verif_lines.append('✓ Mathematische Plausi-Checks bestanden (Z72+Z73+Z74+Z76 ≈ Z77, Hotel ≤ Arbeit, etc.)')
+        for vl in verif_lines:
+            color = HexColor('#34d399') if vl.startswith('✓') else HexColor('#fbbf24')
+            S.append(Paragraph(vl,
+                ps(f"vl{id(vl)}", fontSize=9, textColor=color, fontName="Helvetica",
+                   leading=14, spaceAfter=4)))
 
     S.append(PageBreak())
     for el in section("Bestätigung & Unterschrift"): S.append(el)

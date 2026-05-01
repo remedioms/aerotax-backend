@@ -1,0 +1,109 @@
+═══════════════════════════════════════════════════════════════════
+EASA + DEUTSCHES STEUERRECHT — REFERENZ FÜR KABINENPERSONAL
+═══════════════════════════════════════════════════════════════════
+
+§ 1  EU 965/2012 — Subpart FTL (Flight Time Limitations)
+─────────────────────────────────────────────────────────
+
+ORO.FTL.105 — Definitionen:
+- Home Base: Ort wo Crew Member üblicherweise für eine FDP einsteigt
+- Reporting Time: 60 min vor STD (Standard Time of Departure)
+- FDP (Flight Duty Period): vom Reporting bis 30 min nach Block On
+- Layover: Aufenthalt am Zielort mit Möglichkeit zur ortsfesten Ruhe (Hotel)
+- Turnaround: kein Layover, Crew bleibt im Flughafen-Bereich
+
+ORO.FTL.235 — Rest Periods:
+- Mindest-Ruhe AT HOME BASE: 12 Stunden
+- Mindest-Ruhe AWAY FROM HOME BASE: 10 Stunden inkl. Hotel-Schlafzeit
+- Crew Rest Compartment während Flug zählt NICHT als Rest-Period
+
+ORO.FTL.205 — Maximum FDP:
+- Abhängig von Reporting-Zeit und Anzahl Sectors
+- Standard 13 Stunden, gestreckt bis 14h bei limitierten Sectors
+
+═══════════════════════════════════════════════════════════════════
+
+§ 2  §9 EStG (DEUTSCHES STEUERRECHT) — Werbungskosten
+─────────────────────────────────────────────────────────
+
+Abs. 1 Nr. 4: Fahrten Wohnung ↔ erste Tätigkeitsstätte
+- Entfernungspauschale: 0,30 € pro km bis 20. km, 0,38 € ab 21. km
+- Einfache Strecke × Anzahl Fahrtage (NICHT × 2)
+
+Abs. 4a: Verpflegungsmehraufwand (BMF-Pauschalen)
+- Inland > 8h ohne Übernachtung (Z72): 14 €/Tag
+- Inland An-/Abreisetag mit Übernachtung (Z73): 14 €/Tag
+- Inland 24h-Tag mit Übernachtung (Z74): 28 €/Tag
+- Ausland: BMF-Tagessätze je Land (siehe BMF-Schreiben)
+
+§ 9 Abs. 1 Satz 3 Nr. 6 (Reinigungskosten Berufskleidung):
+- Pauschal 1,60 €/Arbeitstag bei einheitlicher Dienstkleidung (LH-Uniform)
+
+Reisenebenkosten (Trinkgelder bei Übernachtungen):
+- Pauschal 3,60 €/Hotelübernachtung (BMF-Verwaltungspraxis)
+
+═══════════════════════════════════════════════════════════════════
+
+§ 3  LUFTHANSA-DOKUMENTE — Format-Konventionen
+─────────────────────────────────────────────────────────
+
+A) STRECKENEINSATZ-ABRECHNUNG
+Spaltenstruktur: DATUM | AB | AN | SPESEN-€ | ORT | ZWÖLFTEL | STFREI-€ | STFREI-ORT | STEUER | WERBKO | DOPP | STORNO
+
+- stfrei-Spalte = vorberechneter BMF-Tagessatz (wirft LH bereits korrekt aus)
+- stfrei-Ort entscheidet Kategorie (Inland-IATA → Z72/Z73/Z74; Ausland → Z76)
+- Storno-Zeilen enden mit "X" → ignorieren
+- Z77 (Summe steuerfrei) steht in der Summe-Zeile pro Monat
+- Zwölftel: 12 = ganzer Tag, 1-11 = anteilig (Lufthansa hat den anteiligen Satz dann bereits in stfrei eingetragen)
+
+Pattern für VMA-Kategorisierung pro Zeile:
+- AB+AN beide Zeiten + Inland-stfrei-Ort → Z72 (Inland-Tagestrip)
+- Nur AB ODER nur AN + Inland-stfrei-Ort, Ausland-ort → Z73 (An-/Abreise zur Auslands-Tour)
+- 12 Zwölftel + Inland-stfrei-Ort, keine Zeiten → Z74 (24h Inland, sehr selten)
+- Ausland-stfrei-Ort → Z76 (Ausland-VMA, stfrei-Wert direkt addieren)
+
+B) FLUGSTUNDEN-ÜBERSICHT
+Format pro Tag: DATUM MARKER [Flugnummer A/E ORT-FRA Zeit-Zeit ZIEL Block-Stunden ...]
+
+Marker und ihre Bedeutung:
+- /- FREIER TAG       → kein Arbeitstag, kein Fahrtag, kein Hotel
+- U / Urlaub          → kein Arbeitstag
+- K / Krank           → kein Arbeitstag
+- LH#### A FRA ...    → Tour-Start (Flug AB FRA): Arbeitstag + Fahrtag
+- LH#### E ZIEL FRA   → Tour-Ende (Flug AN FRA): Arbeitstag, kein neuer Fahrtag
+- FL STRECKENEINSATZTAG → Auslands-Übernachtung: Arbeitstag + 1 Hotel-Nacht
+- SBY / RES / Reserve / Standby → Home-Standby: Arbeitstag, kein Fahrtag
+- Online-Schulung / e-Learning → Arbeitstag, kein Fahrtag
+- EM / EK / D4 / EH / Briefing / SM → Vor-Ort-Dienst: Arbeitstag + Fahrtag
+- LM NACHGEWAEHRUNG  → Lohnnachzahlung (Buchung): KEIN Arbeitstag
+
+Tour-Logik:
+- Eine Tour = 1 Fahrtag (egal ob 1 Tag oder 10 Tage — du fährst einmal hin und einmal zurück)
+- Mehretappen ohne Heimkehr (FRA→GVA→OTP→FRA) = 1 Fahrtag
+- Folge-Tage einer Tour (FL-Tage zwischen A FRA und E FRA) = Arbeitstag, kein Fahrtag
+
+Hotel-Nacht-Kriterien (EASA-FTL-konform):
+- FL-Marker im Dienstplan = ECHTER Layover (LH setzt FL nur bei ≥10h Bodenzeit)
+- Quick-Turnaround (z.B. FRA 22:00 → MAD → FRA 07:00, ~3-5h Bodenzeit) = KEIN Hotel
+- Nachtflug-Heimkehr (Abflug Ausland 22:00, Landung FRA 06:00) = KEIN Hotel
+- Crew Rest Compartment im Flieger zählt NICHT als Hotel
+
+═══════════════════════════════════════════════════════════════════
+
+§ 4  PLAUSIBILITÄTS-ANKER (Vollzeit-Kabinenpersonal Lufthansa)
+─────────────────────────────────────────────────────────
+
+Typische Jahres-Werte:
+- Arbeitstage: 110-150
+- Fahrtage: 40-60
+- Hotelnächte: 40-65
+- Z76 (Ausland-VMA): 3.000-7.000 €
+- Z77 (steuerfrei gesamt): 3.500-8.000 €
+
+Mathematische Identitäten (müssen erfüllt sein):
+- Z72_eur + Z73_eur + Z74_eur + Z76_eur ≈ Z77 (alle stfrei-Werte addieren zu Z77)
+- Hotelnächte ≤ Arbeitstage außerhalb FRA
+- Fahrtage ≤ Arbeitstage
+- Arbeitstage + Frei-Tage + Urlaub + Krank ≤ 366 (Schaltjahr 366)
+
+═══════════════════════════════════════════════════════════════════
