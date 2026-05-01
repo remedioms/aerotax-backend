@@ -882,23 +882,32 @@ REFERENZFALL (bereits verifiziert — zum Lernen wie LH-Dokumente zu lesen sind)
 - Z77: Alle stfrei-Einzelwerte summieren — NICHT die Summenzeile (Format variiert!)
 Verifiziertes Ergebnis eines LH-Mitarbeiters: Fahrtage=53, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€
 
-═══ FLUGSTUNDEN-MARKER (so liest du JEDEN Tag) ═══
-Jeder Tag in der Flugstunden-Übersicht hat einen Marker direkt nach dem Datum:
+═══ WIE DU DIE FLUGSTUNDEN LIEST ═══
 
-| Marker | Bedeutung | Was zählt |
-|---|---|---|
-| `/- FREIER TAG` | Frei  | KEIN Arbeitstag |
-| `U` (Urlaub)  | Urlaub | KEIN Arbeitstag |
-| `K` (Krank) | Krank | KEIN Arbeitstag |
-| `LH#### A FRA xx:xx-xx:xx XXX` | **Abflug** von FRA | Arbeitstag + Tour-Start (Fahrtag wenn Tag 1 der Tour) |
-| `LH#### E XXX xx:xx-xx:xx FRA` | **Einflug** nach FRA | Arbeitstag + Tour-Ende |
-| `FL STRECKENEINSATZTAG` | **Auslands-Übernachtung** (du schläfst im Hotel im Ausland) | Arbeitstag + 1 Hotel-Nacht |
-| `SBY` | Standby von zuhause | Arbeitstag, **KEIN Fahrtag** |
-| `RES` (RESERVE) | Reserve von zuhause | Arbeitstag, **KEIN Fahrtag** |
-| `Online-Schulung` / `e-Learning` | Online-Training daheim | Arbeitstag, **KEIN Fahrtag** |
-| **Alle anderen Dienst-Codes** (EM, EK, D4, EH, SM, BRIEFING, Schulung in FRA, Sprachtest, …) | Vor-Ort-Dienst in FRA | Arbeitstag **+ 1 Fahrtag** (du musst zur Homebase fahren) |
+Jede Zeile hat: Datum, Code/Marker, evtl. Flugnummer, evtl. Uhrzeiten (von-bis), Strecke (FRA→XXX), Spesenwert. **Diese Daten erzählen dir was passiert ist** — du musst sie nur lesen.
 
-**Default-Regel bei unbekannten Markern:** Wenn ein Code nicht in der Liste steht UND nicht explizit "Online" oder "Standby/Reserve" enthält → behandle als Vor-Ort-Dienst → Arbeitstag + Fahrtag. Notier den unbekannten Marker im Nachweis damit ich's später ergänzen kann.
+Drei einfache Fragen pro Tag:
+
+1. **Ist der Tag ein Arbeitstag?**
+   - Steht "FREIER TAG", "U" (Urlaub), "K" (Krank) oder ähnlich Frei-Indikator → NEIN
+   - Sonst → JA (Arbeitstag)
+
+2. **Ist es ein Fahrtag (du bist physisch zur Homebase FRA gefahren)?**
+   - Tour-Start (du fliegst raus von FRA, Tag 1 einer Tour) → JA
+   - Vor-Ort-Dienst in FRA mit Uhrzeit (Briefing, Schulung in Präsenz, EM, EK, D4, EH, Sprachtest, etc.) → JA, du musstest hinfahren
+   - "SBY"/"Standby" zuhause, "RES"/"Reserve" zuhause, "Online-Schulung", "e-Learning" → NEIN, du warst zuhause
+   - Folge-Tage einer Tour (FL Auslands-Übernachtung, oder Rückflug-Tag wenn der Vortag schon Auslandstag war) → NEIN, du bist nicht zuhause gewesen
+   - Mehretappen-Tour ohne Heimkehr (FRA→GVA→OTP→FRA) = nur 1 Fahrtag (Anreise + Rückreise zusammen)
+
+3. **Hat dieser Tag eine Hotel-Nacht?**
+   - Auslands-Übernachtung (FL-Marker oder du landest im Ausland und der nächste Eintrag ist auch auswärts) → JA
+   - Single-Day-Trip (Ab und An gleicher Tag, abends wieder zuhause) → NEIN
+   - Kurzstrecke EU spätabends raus, früh morgens zurück → JA (du warst über Nacht weg)
+
+Wenn ein Code unklar ist (z.B. exotischer LH-Buchungscode), schau auf die **anderen Felder**:
+- Steht eine Uhrzeit + FRA dabei → Vor-Ort-Dienst → Fahrtag
+- Steht keine Uhrzeit oder explizit "zuhause"/"home" → kein Fahrtag
+Notier den unklaren Code im Nachweis-Output, damit wir's mitbekommen.
 
 ═══ AUS DIESEN MARKERN LEITEST DU AB ═══
 
