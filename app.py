@@ -876,7 +876,8 @@ Ein Steuerberater der nur 2 von 12 Monaten auswertet macht seinen Job nicht — 
 REFERENZFALL (bereits verifiziert — zum Lernen wie LH-Dokumente zu lesen sind):
 - Fahrtag: "03.01. LH400 A FRA 14:36" → A=Abflug FRA → Fahrtag ✓
 - Kein Fahrtag: Vortag endete mit A FRA→MUC → heute noch unterwegs → kein Fahrtag
-- Hotelnacht ohne FL-Marker: "23.05. A FRA→TUN 20:10 / 24.05. E TUN→FRA 03:00" → 1 Nacht ✓
+- KEINE Hotelnacht: "23.05. A FRA→TUN 20:10 / 24.05. E TUN→FRA 03:00" — nur ~5h Bodenzeit, du landest morgens in FRA → keine Übernachtung
+- Hotelnacht: "20.04. A FRA→JNB 21:00 / 21.04. FL ... / 22.04. E JNB→FRA 17:55" — du übernachtest in JNB, das ist eine Hotel-Nacht
 - Z73: SE "14,00  FRA" → stfrei=14, stfrei-Ort=FRA → Anreisetag Z73 ✓
 - Z76: SE "48,00  SEL" → stfrei=48, stfrei-Ort=SEL(Ausland) → VMA Ausland Z76 ✓
 - Z77: Alle stfrei-Einzelwerte summieren — NICHT die Summenzeile (Format variiert!)
@@ -900,9 +901,13 @@ Drei einfache Fragen pro Tag:
    - Mehretappen-Tour ohne Heimkehr (FRA→GVA→OTP→FRA) = nur 1 Fahrtag (Anreise + Rückreise zusammen)
 
 3. **Hat dieser Tag eine Hotel-Nacht?**
-   - Auslands-Übernachtung (FL-Marker oder du landest im Ausland und der nächste Eintrag ist auch auswärts) → JA
-   - Single-Day-Trip (Ab und An gleicher Tag, abends wieder zuhause) → NEIN
-   - Kurzstrecke EU spätabends raus, früh morgens zurück → JA (du warst über Nacht weg)
+   Hotel-Nacht heißt: du **schläfst in einem Hotel** weil du den Tag nicht heimkommst. Es heißt NICHT: jede Nacht in der du nicht zuhause bist.
+
+   - Auslands-Übernachtung mit Bodenzeit am Zielort (FL-Marker, oder du landest abends im Ausland und der nächste Eintrag am Ziel-Ort ist >8h später) → **JA**
+   - Single-Day-Trip (Ab und An gleicher Tag, abends wieder zuhause in FRA) → **NEIN**
+   - **Nachtflug-Rückkehr nach FRA** (z.B. Abflug 22:00, Landung 05-06h FRA): du sitzt im Flieger durch die Nacht, kein Hotel → **NEIN**
+   - **Wendetour ohne Bodenzeit** (z.B. FRA 20:10 → TUN, dann TUN 03:00 → FRA, nur ~5h am Boden): Flugzeit-Pause, kein Hotel → **NEIN**
+   - Faustregel: nur dann Hotel-Nacht zählen, wenn klar erkennbar **>8h Bodenzeit am Zielort während Nachtstunden**. Crew Rest in der Luft zählt nicht.
 
 Wenn ein Code unklar ist (z.B. exotischer LH-Buchungscode), schau auf die **anderen Felder**:
 - Steht eine Uhrzeit + FRA dabei → Vor-Ort-Dienst → Fahrtag
