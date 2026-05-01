@@ -1,219 +1,205 @@
 [
   {
-    "codename": "JetSetterFlo",
-    "title": "Mehretappen-Tour FRA→GVA→OTP→FRA — wie viele Fahrtage?",
-    "body": "Hatte letzte Woche eine Tour mit drei Legs ohne Heimkehr in FRA. Zähle ich das als 1, 2 oder 3 Fahrtage? FollowMe sagt was anderes als ein Kollege.",
-    "aerotax_answer": "Eine Tour ohne Heimkehr zur Homebase = 1 Fahrtag, egal wie viele Etappen dazwischen liegen. Du fährst einmal hin und einmal zurück.\n\nKonkret: FRA→GVA→OTP→FRA sind drei Strecken aber nur EIN \"Reporting at Home Base\" und EINE Heimkehr. Das ist die Definition aus §9 EStG i.V.m. der EASA-FTL: ein Fahrtag entsteht durch Anreise/Abreise an die Homebase, nicht durch Streckenwechsel auf Tour.\n\nAnders wäre es nur, wenn du zwischendurch nach FRA zurückkehrst (z.B. FRA→GVA→FRA→OTP→FRA) — dann hast du zwei separate Touren = 2 Fahrtage. Schau im Dienstplan auf E FRA: jedes Mal wenn du wirklich in FRA landest und das Tour-Ende dokumentiert ist, beginnt eine neue Tour.\n\nDein Kollege hat vermutlich nach Strecken statt nach Touren gezählt — typischer Fehler.",
-    "tags": ["fahrtage", "mehretappen", "tour"]
+    "codename": "FraVagabund",
+    "title": "mehretappen tour - 1 fahrtag oder mehrere?",
+    "body": "moin leute kurze frage. hatte letzte woche fra-gva-otp-fra ohne in fra zwischenzulanden. trag ich das jetzt als 1 fahrtag oder als 2 oder 3? followme sagt 1 mein kollege meint 2. wer hat recht?",
+    "aerotax_answer": "Ein Fahrtag — dein Kollege liegt falsch. Die Pendler/Fahrtag-Logik knüpft an das \"Reporting at Home Base\" an: einmal hin, einmal zurück = 1 Fahrtag.\n\nFRA→GVA→OTP→FRA = du fährst genau einmal zur FRA (am Tour-Anfang) und kommst einmal heim (am Tour-Ende). Was zwischen drin passiert sind Strecken-Wechsel auf Tour, die zählen nicht extra.\n\nAnders wäre's wenn du z.B. mittendrin mal in FRA gelandet wärst (FRA→GVA→FRA→OTP→FRA): zwei separate Touren = 2 Fahrtage. Aber bei dir nicht der Fall.\n\nAlso vertrau FollowMe hier — 1 Fahrtag stimmt.",
+    "tags": ["fahrtag", "mehretappen", "tour"]
   },
   {
-    "codename": "CrewRester88",
-    "title": "Crew Rest Compartment — zählt das als Hotelnacht?",
-    "body": "Auf der LAX-Tour schlafen wir in der Crew-Bunk im Flugzeug zurück. Kann ich für die Nacht trotzdem die Trinkgeld-Pauschale (3,60€) und den Z76-Satz für Übernachtung nehmen?",
-    "aerotax_answer": "Nein. Crew Rest Compartment im Flieger zählt steuerlich NICHT als Hotelübernachtung. Die Trinkgeld-Pauschale 3,60€ entsteht nur durch echten Hotelaufenthalt (Verwaltungspraxis BMF, basiert auf der Annahme dass du im Hotel Concierge/Zimmer-Service Trinkgeld gibst).\n\nAuch EASA-FTL (EU 965/2012, ORO.FTL.235) unterscheidet klar: \"Layover\" = ortsfeste Ruhe ≥10h am Zielort, \"In-Flight Rest\" = Crew Rest Compartment. Nur Layover triggert Hotel-Anspruch und damit auch die steuerliche Hotelnacht.\n\nWas DU aber bekommst: Z76 Auslandspauschale für die Tage am Zielort vor dem Rückflug (LAX = 59€/Tag voll, 40€/Tag An-/Abreise — Lufthansa berechnet das in der stfrei-Spalte deiner SE-Abrechnung schon korrekt).\n\nDie reine Heimflug-Nacht durch die Zeitzone zählt als Arbeitszeit, nicht als Hotelübernachtung.",
-    "tags": ["hotel", "z76", "crew-rest", "ftl"]
+    "codename": "LongHaulLisa",
+    "title": "Crew Rest auf 12h flug = hotel?",
+    "body": "habe in der bunk auf SIN-FRA 4 std geschlafen. zähl ich diese nacht jetzt als hotelübernachtung mit 3,60 trinkgeld und so?",
+    "aerotax_answer": "Nein, leider nicht. Crew Rest Compartment im Flieger zählt steuerlich nicht als Hotelübernachtung — auch wenn du da gut geschlafen hast.\n\nDie 3,60€-Trinkgeldpauschale soll abgelten was du dem Concierge oder dem Hotel-Personal an Trinkgeld gibst. Auf 12h SIN-FRA gibst du der Crew aber kein Trinkgeld... daher kein Anspruch.\n\nEASA selbst trennt das auch klar: ORO.FTL.235 unterscheidet zwischen \"Layover\" (= ortsfeste Ruhe ≥10h Bodenzeit, also Hotel) und \"In-Flight Rest\" (= Crew Rest in der Luft). Nur Layover triggert die Hotelnacht.\n\nWas du KRIEGST: Z76 für deine Tage in Singapur (vor dem Rückflug) plus Hotel-Trinkgelder für die SIN-Nächte. Aber nicht für die letzte Nacht im Flieger.",
+    "tags": ["hotel", "crew-rest", "z76"]
   },
   {
-    "codename": "AlphaPilot42",
-    "title": "Sonnenbrille mit Sehstärke fürs Cockpit — komplett absetzbar?",
-    "body": "Brauche für Cockpit eine polarisierende Sonnenbrille mit Sehstärke. Habe 480€ bezahlt. Kann ich die voll absetzen oder nur anteilig?",
-    "aerotax_answer": "Schwierig — der Bundesfinanzhof ist bei Sonnenbrillen mit Sehstärke streng. Reine Korrekturbrillen sind außergewöhnliche Belastung (Krankheitskosten), keine Werbungskosten. Das gilt grundsätzlich auch für getönte Versionen.\n\nWerbungskosten kommen nur in Frage, wenn die Brille AUSSCHLIESSLICH beruflich genutzt wird (z.B. bei intensiver Cockpit-Sicht-Anforderung) und du eine Bescheinigung deines Arbeitgebers oder Fliegerarztes hast die das bestätigt. Selbst dann oft nur 50/50.\n\nMein Rat: Trage es als außergewöhnliche Belastung ein (volle 480€), oder versuche 50% als Werbungskosten + 50% als a.B. wenn du das Splitting belegen kannst. Bei Streit mit dem Finanzamt verweise auf BFH-Urteil VI R 50/03 (Pilotenbrille).\n\nBei Sehstärke + Polarisation ist der berufliche Anteil glaubhafter als bei reiner Mode-Sonnenbrille.",
-    "tags": ["arbeitsmittel", "brille", "cockpit"]
-  },
-  {
-    "codename": "FrequentFlier_DE",
-    "title": "Z76 bei Wet-Lease-Flügen für Eurowings — wie zählt das?",
-    "body": "Wir fliegen aktuell viel Wet-Lease für EW. Im SE steht aber LH als Vertragspartner. Bekomme ich die Auslandspauschale trotzdem oder gilt das als Inland weil EW-Konzern?",
-    "aerotax_answer": "Steuerlich zählt der ZIELORT, nicht der Vertragspartner. Wenn du im Wet-Lease nach Palma fliegst und dort übernachtest, ist das Z76 mit BMF-Tagessatz Spanien — egal ob LH-Code oder EW-Code im SE steht.\n\nKonzernzugehörigkeit ist nur arbeitsrechtlich/tariflich relevant. §9 Abs. 4a EStG knüpft an die TATSÄCHLICHE Auswärtstätigkeit (= wo bist du physisch).\n\nIn deiner SE-Abrechnung erkennst du es an der stfrei-Ortspalte: steht da PMI (Palma), MAD oder ein anderer Auslandsort, ist es Z76. Nur wenn stfrei-Ort eine deutsche Stadt (FRA, MUC, HAM, DUS, BER, etc.) ist, fällt es in Z72/Z73/Z74.\n\nLufthansa hat den BMF-Wert übrigens schon in der stfrei-Spalte drin — du musst keine Tabelle nachschlagen, einfach die Werte aus der SE übernehmen.",
-    "tags": ["z76", "wet-lease", "eurowings"]
-  },
-  {
-    "codename": "MileagePusher",
-    "title": "Doppelte Haushaltsführung FRA-MUC bei Familie in München",
-    "body": "Hauptwohnsitz München (Familie), Zweitwohnung Frankfurt wegen Homebase. Voll absetzbar? Habe 18.000€ Miete + Möbel.",
-    "aerotax_answer": "Doppelte Haushaltsführung ist möglich wenn drei Bedingungen erfüllt sind: (1) eigener Hausstand in München mit finanzieller Beteiligung an der Lebensführung dort, (2) Zweitwohnung Frankfurt aus beruflichen Gründen, (3) Lebensmittelpunkt nachweislich in München (Familie, Vereine, Hausarzt etc.).\n\nMaximalbeträge 2025:\n• Unterkunftskosten: bis 1.000€/Monat (= 12.000€/Jahr) absetzbar — auch wenn deine Miete höher ist\n• Möbel/Hausrat: gesondert absetzbar (separat von der 1.000€-Grenze), inkl. AfA über Nutzungsdauer\n• Heimfahrten: 1× pro Woche pauschal mit Entfernungspauschale (0,30/0,38 €/km)\n• Verpflegung: nur in den ersten 3 Monaten der DH (BMF-Pauschalen Inland)\n\nWICHTIG: Dein Lebensmittelpunkt muss überzeugend in MUC sein. Bei alleinstehenden Angestellten unterstellt das FA oft den Lebensmittelpunkt am Beschäftigungsort — das ist bei Familie aber unproblematisch.\n\nLege Mietvertrag, Familienmeldebestätigung und Heimfahrt-Belege bei.",
-    "tags": ["doppelte-haushaltsfuehrung", "familie", "muc"]
-  },
-  {
-    "codename": "CabinCloudia",
-    "title": "Englisch-Sprachtest Renewal — Werbungskosten?",
-    "body": "Habe für die Lizenz-Verlängerung (English Proficiency ICAO Level 6) 280€ bezahlt. Komplett absetzbar?",
-    "aerotax_answer": "Ja, klar Werbungskosten. ICAO English Proficiency ist Voraussetzung für deine Berufsausübung als Flugpersonal — das ist klassische Fortbildung im engeren Sinne nach §9 Abs. 1 Nr. 6 EStG.\n\nVoll absetzbar:\n• Prüfungsgebühr (deine 280€)\n• Anreise zum Prüfungsort (Pendlerpauschale falls einmaliger Termin, sonst 0,30€/km dienstlich)\n• Lehrmaterial (Bücher, Online-Kurse zur Vorbereitung)\n• Eventuell vorbereitende Sprachkurse (auch private Anbieter)\n\nEintragen in Anlage N: \"Fortbildungskosten\" (Werbungskosten). Kein Zumutbarkeitsabzug, keine 1.000€-Grenze.\n\nBeleg aufheben — bei Pflicht-Tests reicht oft der Hinweis auf das Lizenz-Erfordernis. Bei Diskussion mit FA verweise auf §9 Abs. 1 Nr. 6 EStG i.V.m. EASA Part-FCL Sprachanforderungen.",
-    "tags": ["fortbildung", "sprachtest", "lizenz"]
-  },
-  {
-    "codename": "TimeZonedTess",
-    "title": "Trinkgelder im Hotel — Pauschal 3,60€ oder Beleg?",
-    "body": "Lese überall die 3,60€/Nacht Pauschale. Aber wenn ich in Manhattan dem Doorman 5 Dollar gebe, ist das damit abgegolten oder kann ich's zusätzlich angeben?",
-    "aerotax_answer": "Die 3,60€/Nacht ist eine VEREINFACHUNGS-Pauschale aus der BMF-Verwaltungspraxis (R 9.7 LStR sinngemäß). Sie deckt das normale Trinkgeld an Concierge, Zimmer-Service, Doorman etc. pauschal ab — du brauchst keine Belege.\n\nWichtig: Die Pauschale gilt PRO Hotelübernachtung im Rahmen einer Auswärtstätigkeit. Bei deinen NYC-Tours ist das die korrekte Behandlung.\n\nEinzelbelege (z.B. 5$ Doorman-Tip) wären theoretisch alternativ ansetzbar, aber:\n(a) das Trinkgeld muss klar dienstlich veranlasst sein (also auf der Tour),\n(b) du musst es lückenlos belegen — bei Bargeld kaum machbar,\n(c) Aufwand vs Gewinn lohnt sich nicht.\n\nFazit: Bleib bei 3,60€/Nacht-Pauschale, das wirst du nirgends besser bekommen. Sie ist auch unproblematisch beim FA — Standard für Flugpersonal.",
-    "tags": ["trinkgeld", "hotel", "pauschale"]
-  },
-  {
-    "codename": "PolarRoute_LH",
-    "title": "Krankheit auf Tour — VMA für Heimflug noch absetzbar?",
-    "body": "Bin in HKG krank geworden, LH hat mich repatriiert. Bekomme ich die Z76-Pauschale für die Krankheits-Tage am Zielort + Heimflug-Tag noch?",
-    "aerotax_answer": "Ja. §9 Abs. 4a EStG verlangt nur \"Auswärtstätigkeit\" — eine Erkrankung am Zielort beendet die Auswärtstätigkeit nicht steuerlich. Du warst objektiv weiter dienstlich abwesend.\n\nKonkret:\n• Krankheits-Tage in HKG = volle Z76-Pauschale (Hong Kong: 71€/Tag voll, 48€/Tag An-/Abreise)\n• Heimflug-Tag = Z76 (Abreisetag-Satz, 48€)\n• Hotelnächte in HKG während Krankheit = je 3,60€ Trinkgelder\n\nWICHTIG: Lufthansa hat dir vermutlich für die Krankheits-Tage trotzdem die stfrei-Pauschalen ausgezahlt (in der SE-Abrechnung sichtbar). Diese werden als AG-Erstattung Z77 vom Total abgezogen — Netto-Werbungskosten reduzieren sich entsprechend.\n\nFalls die Krankheit so massiv war dass auch Z76 nicht voll gezahlt wurde: Sonderfall, bitte Beleg vom Fliegerarzt + LH-Bestätigung beifügen. Der \"normale\" Werbungskostenanspruch bleibt aber bestehen.",
-    "tags": ["krankheit", "z76", "repatriierung"]
-  },
-  {
-    "codename": "SkyMileMax",
-    "title": "Kann ich meinen Crew-Koffer absetzen?",
-    "body": "Habe einen Rimowa Cabin Plus für 850€ gekauft, ausschließlich für Tours. Komplett oder anteilig?",
-    "aerotax_answer": "Wenn der Koffer AUSSCHLIESSLICH beruflich genutzt wird, ist er Arbeitsmittel nach §9 Abs. 1 Nr. 6 EStG. Bei 850€ Anschaffungskosten: über der Geringwertige-Wirtschaftsgüter-Grenze (952€ inkl. MwSt.), darunter aber sofort absetzbar wenn netto unter 800€.\n\nDein Fall (850€ inkl. MwSt. = ~714€ netto): GWG-Grenze unterschritten → SOFORTABSCHREIBUNG, voll im Anschaffungsjahr absetzbar.\n\nFür den Rimowa konkret: Crew nutzt ihn fast 100% beruflich (genau dafür ist die Cabin Plus Größe). Aber Vorsicht: das FA prüft \"ausschließliche berufliche Nutzung\". Wenn du ihn auch privat im Urlaub nutzt, kürzt es 50% (oder mehr).\n\nTipp: Foto-Dokumentation des Koffers mit Crew-Tags, separater Privatkoffer für Urlaub. Dann ist die ausschließliche Nutzung glaubhaft.\n\nEintragen unter Werbungskosten → Arbeitsmittel.",
+    "codename": "RollingThunderJ",
+    "title": "kann man eigentlich die rimowa absetzen die nur für tours benutzt wird?",
+    "body": "850€ rimowa cabin plus, ausschließlich für tours. hab nen privaten samsonite. komplett absetzbar oder muss ich abschreiben über jahre?",
+    "aerotax_answer": "Bei 850€ inkl. MwSt. = ~714€ netto. Damit unter der Geringwertige-Wirtschaftsgüter-Grenze (800€ netto). → SOFORT-Abschreibung im Anschaffungsjahr, kein AfA über mehrere Jahre.\n\nWichtig ist aber dass das FA glaubt dass der Koffer wirklich nur dienstlich genutzt wird. Hilfreich:\n• Foto vom Koffer mit Crew-Tag\n• Aussage dass du einen separaten Privatkoffer hast (deinen Samsonite)\n• Beleg vom Kauf\n\nWenn das FA argwöhnisch wird, kürzen sie 50%. Mit deiner Argumentation (separater Privatkoffer) sind 100% aber meist drin.\n\nEintragen unter Werbungskosten → Arbeitsmittel.",
     "tags": ["arbeitsmittel", "koffer", "afa"]
   },
   {
-    "codename": "VectorVince",
-    "title": "Telefon-Rechnung 600€ — wie viel kann ich absetzen?",
-    "body": "iPhone-Vertrag 49,99€/Monat plus Auslands-Roaming oft 200-300€ extra. Wie viel davon ist Werbungskosten?",
-    "aerotax_answer": "Standard-Pauschale Flugpersonal: 20% der Jahres-Telefonkosten ohne Einzelnachweis (R 9.1 LStR analog).\n\nBei 600€/Jahr × 20% = 120€ Werbungskosten — sofort und unproblematisch.\n\nWenn du höhere berufliche Nutzung nachweisen kannst (was bei intensivem Crew-Center-Kontakt + Auslands-Roaming für Standby-Erreichbarkeit oft gut belegbar ist), kannst du auch 30-50% ansetzen — dann brauchst du aber:\n(a) repräsentative 3-Monats-Aufstellung mit dienstlich/privat-Markierung,\n(b) Einzelnachweis der Auslands-Roaming-Posten die durch Crew-Erreichbarkeit verursacht waren.\n\nMein Rat: bleib bei der 20%-Pauschale — das geht ohne Stress durch. Bei hohem Roaming wegen Standby/Reserve im Ausland: extra 10-15% möglich aber rechtfertigungspflichtig.\n\nEintragen: \"Werbungskosten → Arbeitsmittel → Telefon & Internet\".",
-    "tags": ["telefon", "internet", "pauschale"]
+    "codename": "_Skywriter_",
+    "title": "Doppelte Haushaltsführung wenn nur Freundin in MUC?",
+    "body": "habe haupt wohnsitz frankfurt (job homebase) aber meine freundin lebt in münchen wo ich oft bin. kann ich das absetzen oder muss ich verheiratet sein?",
+    "aerotax_answer": "Verheiratet sein muss man definitiv NICHT für doppelte Haushaltsführung. Aber dein Lebensmittelpunkt muss überzeugend in München liegen — und das ist bei reinem Freundin-Status schwerer als bei Familie.\n\nWichtig: Lebensmittelpunkt heißt soziale Bindung, Freizeit, Freunde, Hausarzt etc. Wenn du nur ab und zu am Wochenende in MUC bist und Freundin = einziger Anker, hat das FA gute Argumente das abzulehnen.\n\nWas hilft:\n• Eigener Mietvertrag oder Miet-Anteil in der MUC-Wohnung (nicht nur Freundin alleine)\n• Finanzielle Beteiligung an der Lebensführung in MUC (Lebensmittel, Nebenkosten anteilig)\n• Aktivitäten dort (Verein, Sport, Bekannte)\n• Belege für Heimfahrten (mind. 2x im Monat)\n\nWenn du das alles hast: 1.000€/Monat Unterkunft + Heimfahrten + Möbel als Werbungskosten möglich. Wenn nicht, lehnt das FA ab.\n\nMein Rat: erstmal versuchen, Belege sammeln. Bei Ablehnung: Einspruch mit Hinweis auf BFH VI R 22/14 (Lebensmittelpunkt nicht zwingend Familie).",
+    "tags": ["doppelte-haushaltsfuehrung", "lebensmittelpunkt"]
   },
   {
-    "codename": "NorthernLightsKim",
-    "title": "Internet zuhause für Online-Schulungen — anteilig absetzbar?",
-    "body": "Mache regelmäßig EASA-CRM und Safety Refresher online. Internet kostet 35€/Monat. Wieviel kann ich angeben?",
-    "aerotax_answer": "Auch beim Internet die 20%-Pauschale ohne Einzelnachweis (analog Telefon). Bei 35€/Monat = 420€/Jahr × 20% = 84€/Jahr.\n\nWenn du regelmäßig dienstlich von zuhause arbeitest (Online-Schulungen, e-Learning, Crew-Center-Erreichbarkeit auf Standby), kannst du auch 30-40% argumentieren — aber dann lückenlose Dokumentation der dienstlichen Nutzung.\n\nWichtig: Internet und Telefon werden IM SELBEN PUNKT zusammengefasst — beide unter \"Telefon & Internet\". Die 20%-Regel gilt für beide gemeinsam.\n\nWenn du Home-Office-Pauschale für Schulungstage nimmst: dann darfst du die Internet-Kosten NICHT zusätzlich anteilig ansetzen (Doppel-Verwertung).\n\nFalls du nur 84€ Telefon + Internet zusammen ansetzt, lohnt sich der Aufwand kaum. Lieber bleib bei der unkomplizierten Pauschale.",
-    "tags": ["internet", "schulung", "homeoffice"]
+    "codename": "QuickTurn88",
+    "title": "Wisst ihr ob man die Englisch-Test Verlängerung absetzen kann?",
+    "body": "muss alle 4 jahre meinen ICAO english level 5 verlängern, kostet 280€. werbungskosten oder bekomm ich nichts?",
+    "aerotax_answer": "Werbungskosten — easy zu argumentieren. Der ICAO English Test ist Voraussetzung für deine Lizenz und damit für deine Berufsausübung als Flugpersonal. Klassische Fortbildung nach §9 Abs. 1 Nr. 6 EStG.\n\nVoll absetzbar: 280€ Prüfungsgebühr + Anreise zum Prüfungsort (Pendler-Pauschale) + ggf. Vorbereitungs-Kurse oder Bücher.\n\nKein Zumutbarkeitsabzug, keine Höchstgrenze.\n\nEintragen unter Werbungskosten → Fortbildungskosten. Beleg aufheben — bei Pflicht-Tests reicht der Hinweis dass es Lizenz-Voraussetzung ist.",
+    "tags": ["fortbildung", "lizenz", "sprachtest"]
   },
   {
-    "codename": "RotationRobin",
-    "title": "Hotel-Upgrade aus eigener Tasche — abzugsfähig?",
-    "body": "In Singapur habe ich 80€ für ein besseres Zimmer dazu bezahlt. Kann ich das geltend machen?",
-    "aerotax_answer": "Nein, leider nicht. Das ist ein klassischer Fall \"Aufwendungen der privaten Lebensführung\" nach §12 Nr. 1 EStG.\n\nDie Z76-Auslandspauschale (Singapur: 71€/Tag voll, 48€/Tag An-/Abreise) deckt deine Verpflegungs-Mehraufwendungen pauschal ab. Hotelkosten selbst sind im Verhältnis zur Pauschale OHNE Einzelbeleg ansetzbar — und LH bezahlt das Standard-Crew-Hotel ja eh.\n\nDein freiwilliges Upgrade auf Komfort ist privat motiviert (= Lebensführung), nicht beruflich erforderlich. Würde nur funktionieren wenn:\n• du nachweisen kannst dass das Standard-Hotel nicht zumutbar war (Lärm, Sicherheit) — schwer\n• oder dein AG das ausnahmsweise anerkennt und erstattet (= dann steuerfrei, kein WK-Thema)\n\nMein Rat: lass das Upgrade weg. Es ist kein steuerlich relevanter Fall.",
-    "tags": ["hotel", "upgrade", "privatkosten"]
+    "codename": "Bxg_pilot",
+    "title": "Sonnenbrille fürs Cockpit absetzbar?",
+    "body": "Costa del Mar mit polarisation und sehstärke 480€. brauche ich für gegenlicht, aber aufm boden trag ich sie auch mal. komplett werbungskosten oder split?",
+    "aerotax_answer": "Heikles Thema bei dir — Sonnenbrillen mit Sehstärke sind beim FA grundsätzlich AUSSERGEWÖHNLICHE BELASTUNG (Krankheitskosten), nicht Werbungskosten.\n\nWerbungskosten gehen nur wenn die Brille AUSSCHLIESSLICH beruflich genutzt wird. Bei dir laut deiner eigenen Aussage \"trag ich sie auch mal aufm boden\" — das ist private Mitnutzung.\n\nMein Rat: Splitting 50/50.\n• 240€ als Werbungskosten (Arbeitsmittel) — für die Cockpit-Nutzung argumentieren\n• 240€ als außergewöhnliche Belastung (Krankheitskosten)\n\nDie 240€ a.B. werden um die Zumutbarkeitsgrenze (1-7% deines Einkommens) gekürzt — bei normalem Pilot-Einkommen ist die Grenze meist überschritten, also a.B. wirkt nicht. Aber die 240€ Werbungskosten sind unangefochten.\n\nFür 100% Werbungskosten brauchst du eine AME-Bestätigung (Fliegerarzt) dass die Brille spezifisch für den Cockpit-Sehbereich verschrieben wurde. Mit dem Schein gehen 480€ voll durch.",
+    "tags": ["arbeitsmittel", "brille", "cockpit"]
   },
   {
-    "codename": "PenguinPosse",
-    "title": "Coronavirus-/PCR-Tests bei Auslandstour — abzugsfähig?",
-    "body": "2023 und Anfang 2024 noch viel PCR-Tests gemacht für Tours nach China und Japan. Hatte ca. 600€ Eigenanteil. Werbungskosten oder a.B.?",
-    "aerotax_answer": "Berufliche PCR-Tests die als Voraussetzung für eine Tour erforderlich waren = Werbungskosten nach §9 Abs. 1 EStG. Klare Sache: ohne Test keine Tour, ohne Tour kein Lohn — beruflich veranlasst.\n\n600€ voll absetzbar, eintragen unter \"Werbungskosten → Sonstige Werbungskosten\" oder \"Arbeitsmittel\".\n\nWAS ABER ZÄHLT: Tests die DEIN Arbeitgeber erstattet hat sind RAUS. Nur dein Eigenanteil bleibt absetzbar. Schau in der Lohnabrechnung ob LH dir was rückerstattet hat (oft als steuerfreier AG-Zuschuss in Z20).\n\nPrivate Tests (z.B. weil du auf Privatreise wolltest) sind nicht beruflich → außergewöhnliche Belastung mit Zumutbarkeitsgrenze.\n\nBelege aufheben: Test-Quittungen + ggf. Mail/Brief von LH dass der Test für die Tour Pflicht war.",
+    "codename": "WetLeaseWendy",
+    "title": "wet lease eurowings - z76 oder inland?",
+    "body": "wir fliegen aktuell viel wet lease für EW (PMI, BCN, MAD). im streckeneinsatz steht aber LH als auftraggeber. hab ich z76 oder ist das jetzt inland weil konzern?",
+    "aerotax_answer": "Z76 — der Vertragspartner ist steuerlich egal. §9 Abs. 4a EStG knüpft an die TATSÄCHLICHE Auswärtstätigkeit, also wo du physisch warst.\n\nPMI, BCN, MAD = alle Spanien = Ausland = Z76 mit BMF-Tagessatz Spanien. Egal ob in deinem SE \"Lufthansa\" oder \"Eurowings\" steht.\n\nIn deiner SE-Abrechnung erkennst du es eindeutig an der stfrei-Ortspalte: PMI/BCN/MAD steht da → Z76. Wäre HAM oder MUC → Z73.\n\nGuter Trick: Lufthansa hat den BMF-Wert für jeden Tag schon in der stfrei-Spalte ausgewiesen. Du musst keine Tabelle nachschlagen — einfach die Werte aus deiner SE addieren wo der stfrei-Ort Ausland ist.",
+    "tags": ["z76", "wet-lease", "eurowings"]
+  },
+  {
+    "codename": "MileageMike747",
+    "title": "doppelte haushaltsführung - 1000€ grenze ist netto oder brutto?",
+    "body": "miete in fra ist 1200€ kalt. die 1000€ grenze für absetzbarkeit - ist das warmmiete inkl nebenkosten oder kaltmiete? und sind möbel da extra?",
+    "aerotax_answer": "Die 1.000€-Grenze ist BRUTTO (warm) — also inkl. Nebenkosten, Heizung, Strom. Bei deiner Kaltmiete von 1.200€ + Nebenkosten kommst du wahrscheinlich auf 1.500-1.700€ warm. Davon sind 1.000€ absetzbar, der Rest fällt durchs Raster.\n\nABER: Möbel und Hausrat sind SEPARAT zu betrachten — die fallen nicht unter die 1.000€-Grenze. Bett, Schrank, Sofa, Küche kannst du zusätzlich ansetzen:\n• Anschaffung 800€ netto pro Stück → sofort komplett\n• Drüber → AfA über die Nutzungsdauer (z.B. Möbel 13 Jahre, Bett 13 Jahre, Hausrat 10 Jahre)\n\nKaltmiete + Nebenkosten + Heizung + Strom + Möbel-AfA = was du ansetzen kannst. Nur die ersten beiden zusammen (= warm) sind auf 1.000€ gedeckelt.\n\nWichtig auch: Heimfahrten 1× pro Woche pauschal mit Pendler-Pauschale. Lohnt sich oft.",
+    "tags": ["doppelte-haushaltsfuehrung", "miete"]
+  },
+  {
+    "codename": "TZShiftKurt",
+    "title": "krank in BKK - werbungskosten trotzdem da?",
+    "body": "wurde in BKK krank, lh hat mich nach 4 tagen repatriiert. die 4 tage zähle ich trotzdem als z76 ja? oder ist das jetzt freistellungs-zeit ohne pauschale?",
+    "aerotax_answer": "Die 4 Tage zählen voll als Z76. Eine Erkrankung am Zielort beendet die Auswärtstätigkeit nicht — du warst objektiv weiter dienstlich abwesend.\n\nKonkret bei BKK (Bangkok):\n• Voller 24h-Tag: 32€/Tag\n• An-/Abreisetag: 21€/Tag\n• Plus 3,60€ Hotel-Trinkgeld pro Übernachtung\n\nAuch der Heimflug-Tag ist Z76 (Abreisesatz). Nur der Tag der eigentlichen Landung in FRA wird zum Z73 falls du auf der Rückreise nochmal in DE übernachten musstest (selten).\n\nHinweis: Lufthansa zahlt dir für die Krankheits-Tage normalerweise auch die stfrei-Pauschale (siehst du in der SE). Die wird dann als Z77 vom Total abgezogen — du bekommst also nur den Differenzbetrag als Werbungskosten netto. Aber: das ist trotzdem korrekt eingetragen.\n\nKein Sonderfall, wirklich Standard.",
+    "tags": ["krankheit", "z76", "repatriierung"]
+  },
+  {
+    "codename": "FuelPlanner",
+    "title": "Telefon 20% Pauschale - wirklich das maximum?",
+    "body": "lese überall die 20% telefon pauschale. ist das wirklich das max oder kann man auch 30 oder 40% argumentieren wenn man oft auslandsroaming für standby hat?",
+    "aerotax_answer": "20% ist die Pauschale OHNE Nachweis. Du kannst absolut höher gehen — aber dann musst du nachweisen.\n\nNachweis-Anforderungen für höheren Anteil:\n• Repräsentative 3-Monats-Aufstellung mit Markierung dienstlich/privat pro Anruf/Datenmenge\n• Bei Standby/Crew-Erreichbarkeit ist 30-40% glaubhaft argumentierbar\n• Bei intensivem Auslands-Roaming für Crew-Center-Kontakt: bis 50% möglich\n\nKonkret: Bei deinem Fall (Standby + Auslandsroaming) würde ich 30-35% versuchen. Das passt zur Realität bei Crew die viel Standby hat.\n\nAber: Aufwand vs Gewinn. Bei 600€/Jahr × 30% = 180€ statt 120€ (20%-Pauschale). Mehrwert ~60€ × Grenzsteuersatz 35% = 21€ Ersparnis. Dafür 3 Monate Telefon-Buchführung führen?\n\nLohnt sich nur wenn deine Telefonkosten richtig hoch sind oder du eh akribisch bist. Sonst bleib bei der 20%-Pauschale, geht ohne Diskussion durch.",
+    "tags": ["telefon", "pauschale", "internet"]
+  },
+  {
+    "codename": "RestlessRogerRR",
+    "title": "Hotel upgrade aus eigener tasche absetzbar?",
+    "body": "Singapur, hab 80€ aufpreis bezahlt für besseres zimmer mit aussicht auf marina bay. abzugsfähig oder nope?",
+    "aerotax_answer": "Nope. Klassisches Privatleben (§12 Nr. 1 EStG).\n\nDie Z76-Pauschale (SIN: 71€/Tag voll) deckt den \"Verpflegungsmehraufwand\" pauschal ab — du brauchst dafür keinen Beleg. Hotelkosten selbst zahlt LH. Was du oben drauflegst aus eigener Tasche ist privat motiviert (Komfort, Aussicht) und damit nicht beruflich veranlasst.\n\nDas FA würde nur Ausnahmen anerkennen wie:\n• Standard-Hotel war nachweislich nicht zumutbar (Lärm, Sicherheit, defekt) — schwer\n• Du musstest aus dienstlichen Gründen umziehen (z.B. wegen Crew-Rest-Anforderung)\n\nFür Marina-Bay-View bekommst du leider nichts.",
+    "tags": ["hotel", "upgrade", "privat"]
+  },
+  {
+    "codename": "Pylon_99",
+    "title": "Covid PCR Tests von 23/24 noch in welche kategorie?",
+    "body": "hab für meine asien tours 2023 und 2024 ne menge PCR tests gebraucht, eigenanteil ca 700€. wo trag ich das ein? werbungskosten oder krankenkasse?",
+    "aerotax_answer": "Werbungskosten — keine Frage. PCR-Tests die als Voraussetzung für eine Tour Pflicht waren = klassische beruflich veranlasste Aufwendung nach §9 Abs. 1 EStG. Ohne Test keine Tour, ohne Tour kein Lohn.\n\n700€ voll absetzbar.\n\nABER: Tests die LH dir erstattet hat sind RAUS. Schau in der Lohnabrechnung Z20 (\"Steuerfreie AG-Leistungen\") ob da was zu Tests erwähnt ist. Falls ja, der erstattete Anteil ist nicht nochmal absetzbar.\n\nEintragen unter Werbungskosten → Sonstige Werbungskosten oder Arbeitsmittel.\n\nBelege aufheben (Test-Quittungen + ggf. LH-Mail dass Test für die Tour Pflicht war). Bei Diskussion mit FA: §9 Abs. 1 EStG genügt als Rechtsgrundlage.",
     "tags": ["covid", "pcr-test", "ausland"]
   },
   {
-    "codename": "ContrailCarmen",
-    "title": "Notebook für Crew-Briefings — komplett oder anteilig?",
-    "body": "MacBook Air für 1.299€ gekauft, nutze es für CrewLink, Briefings, Roster-Check. Aber auch privat für Netflix.",
-    "aerotax_answer": "Bei 1.299€ liegst du über der GWG-Grenze (952€) → AfA über 3 Jahre Nutzungsdauer (BMF-Tabelle für PCs/Notebooks):\n• 2025: 433€\n• 2026: 433€\n• 2027: 433€ (Restbuchwert auf 0)\n\nABER: bei gemischter Nutzung (beruflich + privat) musst du den dienstlichen Anteil schätzen.\n\nFaustregel BFH-Praxis: 50/50 ohne Nachweis, 90% bei klar dienstlicher Hauptnutzung. Für ein Crew-Notebook (CrewLink, Roster, Briefings, Auslandstour-Streaming) sind 50% in der Regel akzeptabel ohne große Diskussion.\n\nKonkret: 50% × 433€ AfA-Jahresrate = 216,50€ pro Jahr für 3 Jahre.\n\nWENN du höher willst (z.B. 80%): musst du eine repräsentative 3-Monats-Nutzungsstatistik führen (App-Logs, Berufs-vs-Privat-Sessions). Aufwand vs Gewinn rechnet sich oft nicht.\n\nEintragen unter Werbungskosten → Arbeitsmittel → AfA. Beleg aufheben.",
+    "codename": "JFK_VOR_NDB",
+    "title": "MacBook anteilig absetzbar?",
+    "body": "macbook air 1299€, brauche es für crewlink, briefings, roster checks. aber auch privat (netflix, foto). wie viel davon krieg ich?",
+    "aerotax_answer": "Über der GWG-Grenze (952€) → AfA über 3 Jahre Nutzungsdauer. Pro Jahr: 433€ AfA-Rate.\n\nPrivat + dienstliche Nutzung gemischt → 50/50 Standard-Aufteilung beim FA. Heißt: 216,50€ pro Jahr × 3 Jahre = 649,50€ insgesamt absetzbar als Werbungskosten.\n\nWenn du 80% argumentieren willst (z.B. weil du intensiv Crewlink, Roster, Briefings nutzt), brauchst du eine 3-Monats-Nutzungsstatistik. Aufwand vs Gewinn rechnet sich oft nicht.\n\nMein Rat: 50/50 ohne Nachweis. Lohnt nicht zu kämpfen für mehr.\n\nEintragen: Werbungskosten → Arbeitsmittel → AfA. Beleg aufheben + Modellbezeichnung notieren (für Rückfragen 3 Jahre lang).",
     "tags": ["arbeitsmittel", "notebook", "afa"]
   },
   {
-    "codename": "AfterburnerAndi",
-    "title": "Pendlerpauschale bei Wohnsitzwechsel mitten im Jahr",
-    "body": "Bin im Juni von Mannheim nach Frankfurt gezogen. Kann ich für die ersten 5 Monate Mannheim→FRA absetzen und ab Juni nur die paar km in FRA?",
-    "aerotax_answer": "Ja, exakt so. Pendlerpauschale wird tageweise berechnet — nach jedem Anfahrtstag mit der dann aktuellen einfachen Entfernung.\n\nKonkret:\n• Jan-Mai: Mannheim → FRA = 84km einfach. Bei 22 Fahrtagen × (20km × 0,30€ + 64km × 0,38€) = 22 × (6,00 + 24,32) = 666,80€\n• Jun-Dez: FRA → FRA = 8km einfach (oder was deine neue Wohnung kostet). Bei 31 Fahrtagen × 8km × 0,30€ = 74,40€\n• Total: 741,20€\n\nWICHTIG: Du brauchst Nachweise für beide Wohnsitze (Meldebestätigung mit Datum). Pro Fahrtag ZÄHLT NUR DIE EINFACHE STRECKE — also nicht hin und zurück doppelt.\n\nUmzugskosten selbst sind ein eigener Werbungskosten-Topf (umzugsbedingte Werbungskosten). Wenn dein Umzug beruflich veranlasst war (z.B. näher zur Homebase), volle Umzugskostenpauschale + Maklergebühren für die NEUE Wohnung absetzbar.\n\nEintragen unter Werbungskosten → Wege Wohnung-Arbeit.",
-    "tags": ["pendler", "umzug", "wohnsitz"]
+    "codename": "Tarmac_Tom",
+    "title": "umzug mitten im jahr - wie pendler aufteilen?",
+    "body": "bin im juni von mannheim nach frankfurt gezogen. erste hälfte mannheim-fra (84km), 2. hälfte fra-fra (8km). wie eintragen? komplette pendler ist 1000€+ mit alter strecke.",
+    "aerotax_answer": "Wird tageweise berechnet — pro Fahrtag mit der dann aktuellen Entfernung. Dein Fall:\n\nJan-Mai: 84km × 22 Fahrtage × (20km × 0,30€ + 64km × 0,38€)\n= 22 × (6,00 + 24,32) = 22 × 30,32 = 666,80€\n\nJun-Dez: 8km × 31 Fahrtage × 0,30€ (komplett unter 20km)\n= 31 × 8 × 0,30 = 74,40€\n\nGesamt: 741,20€ Pendler-Pauschale\n\nWichtig: Du brauchst Meldebestätigungen für beide Wohnsitze mit Datum (zur Beleg-Sicherheit beim FA).\n\nUmzug selbst: wenn dein Umzug nach FRA beruflich war (= näher zur Homebase), kannst du Umzugskosten als zusätzliche Werbungskosten ansetzen. Inkl. Umzugskostenpauschale 1.058€ (Single), Maklergebühren neue Wohnung, Doppelmiete-Übergang etc.",
+    "tags": ["pendler", "umzug"]
   },
   {
-    "codename": "GlideSlope_GRU",
-    "title": "JFK-Tour über 8 Tage — wie zählen die Z76 Tage genau?",
-    "body": "8-Tage-Tour FRA→JFK→FRA mit Mid-Tour-Standby in NYC. Wie viele Z76-Tage und welcher Tagessatz?",
-    "aerotax_answer": "Bei einer durchgehenden Auslandstour zählst du jeden Kalendertag auf dem du im Ausland bist:\n\n• Tag 1 (Anreise FRA→JFK, abends in NYC): Z76 An-Reise-Satz NYC = 44€\n• Tag 2-7 (Volltage in NYC): Z76 Volltag-Satz NYC = 66€/Tag → 6 × 66€ = 396€\n• Tag 8 (Abreise JFK→FRA, morgens noch in NYC): Z76 Abreise-Satz NYC = 44€\n\nGesamt Z76: 44 + 396 + 44 = 484€\n\nLufthansa hat das aber schon in deiner SE-Abrechnung vorberechnet — du musst nur die Werte aus der stfrei-Spalte addieren. Der Vorteil: LH wendet die BMF-Tabelle 1:1 an, du sparst dir das Nachschlagen.\n\nMid-Tour-Standby in NYC: zählt steuerlich als Volltag im Ausland (Z76 voll), weil du physisch in NYC bist. Auch wenn du \"warten\" musst — die Auswärtstätigkeit läuft.\n\nHotelnächte in NYC: 7 Nächte × 3,60€ Trinkgeld-Pauschale = 25,20€ (separat zu Z76).\n\nEintragen: alle Z76-Werte in Anlage N Zeile 76; Trinkgelder in Zeile 68.",
+    "codename": "EastSide_Andy",
+    "title": "wie zähl ich die JFK volltage richtig?",
+    "body": "8 tage NYC tour mit standby in NY mittendrin. wieviel z76 tage und welcher satz? ich check das mit den teilung an-/abreise vs 24h nicht ganz",
+    "aerotax_answer": "Jeden Kalendertag den du im Ausland bist zählst du:\n\n• Tag 1 (anreise): An-Reise-Satz NYC = 44€\n• Tag 2-7 (du bist 6 volle 24h-Tage in NY, auch Standby zählt da als Volltag): 6 × 66€ = 396€\n• Tag 8 (abreise): An-/Abreise-Satz = 44€\n\nGesamt Z76: 484€\n\nLufthansa hat das aber alles schon in deiner SE in der stfrei-Spalte vorberechnet. Du nimmst einfach die Werte raus und addierst sie für jeden Tag wo der stfrei-Ort \"NYC\" oder \"JFK\" oder \"EWR\" ist.\n\nMid-Tour-Standby in NY zählt steuerlich als \"Du warst in NY\" → voller Z76-Satz für den Tag. Auch wenn du nicht aktiv geflogen bist.\n\nHotelnächte: 7 × 3,60€ = 25,20€ (separat zu Z76).",
     "tags": ["z76", "jfk", "auslandstour"]
   },
   {
-    "codename": "TaxiwayTina",
-    "title": "Schwangere Cabin Crew Tieferlegung — Lohnausfall absetzbar?",
-    "body": "Wegen Schwangerschaft im Boden-Dienst (LH-internal Tieferlegung), Lohn ist niedriger als auf Tour. Wie steuerlich?",
-    "aerotax_answer": "Der Lohnausfall selbst ist NICHT als Werbungskosten absetzbar — nur was du tatsächlich BEZAHLT hast (Gehalt geht vom Arbeitgeber an dich, nicht andersrum).\n\nABER: was sich für dich ändert:\n\n1. **Auswärtstätigkeit endet während Bodendienst** → keine VMA-Pauschalen Z72/73/74/76 für die Bodenmonate (du bist ja nicht mehr auswärts).\n\n2. **Trotzdem absetzbar während Bodendienst:**\n• Pendlerpauschale (du fährst nach FRA zum Boden-Dienst)\n• Reinigungskosten Uniform (1,60€/Tag, falls weiter getragen)\n• Fortbildungen, Telefon-Pauschale, Gewerkschaft\n\n3. **Mutterschaftsgeld** ist steuerfrei nach §3 Nr. 1d EStG, aber unterliegt dem Progressionsvorbehalt — d.h. dein restliches Einkommen wird höher besteuert.\n\n4. **Krankheits-/Schwangerschafts-bedingte Kosten** (Vitamine, Spezial-Schuhe etc.) gehören in außergewöhnliche Belastung, nicht Werbungskosten.\n\nMein Rat: Lass dir vom Steuerberater einmal das Mutterschutz-Jahr mit Progressionsvorbehalt durchrechnen — da gibt's oft 500-1500€ Erstattung.",
-    "tags": ["schwangerschaft", "bodendienst", "lohn"]
+    "codename": "GroundFlightG",
+    "title": "schwanger und tieferlegung - was geht steuerlich?",
+    "body": "bin im 4. monat, lh hat mich auf bodenstand gestellt. lohn ist niedriger. kann ich da was bei der steuer rausholen?",
+    "aerotax_answer": "Erstmal Glückwunsch. Steuerlich gibt's leider keine Werbungskosten für den Lohnunterschied selbst — du kannst nur ansetzen was du tatsächlich BEZAHLT hast.\n\nWas du ABER weiterhin absetzen kannst während Bodendienst:\n• Pendlerpauschale (du fährst weiterhin nach FRA)\n• Reinigungskosten Uniform (1,60€/Tag falls du sie weiter trägst)\n• Telefon/Internet-Pauschale\n• Gewerkschaft, Fortbildung, Arbeitsmittel — alles wie sonst\n\nWas WEGFÄLLT während Bodendienst:\n• VMA-Pauschalen Z72/Z73/Z74/Z76 — du bist ja nicht mehr auswärts\n• Hotel-Trinkgelder\n\nWichtig: Mutterschaftsgeld ist steuerfrei aber unterliegt dem Progressionsvorbehalt. Heißt: dein restliches Einkommen wird mit höherem Steuersatz berechnet. Lass das einmal vom Steuerberater durchrechnen — da sind oft 500-1500€ zu holen.\n\nUnd: Vorsorge-Vollmacht, Mutterschutz-Frist (6 Wochen vor + 8 Wochen nach), Elterngeld — separates Thema, aber wichtig zu kennen.",
+    "tags": ["schwangerschaft", "bodendienst"]
   },
   {
-    "codename": "FuelOnTopFred",
-    "title": "Fluggepäck-Verlust auf Auslandstour — Werbungskosten?",
-    "body": "Mein Crew-Bag ist auf der LAX-Tour verschwunden, 1.200€ Inhalt (Koffer, Uniform, Schuhe). LH hat 400€ ersetzt. Rest absetzbar?",
-    "aerotax_answer": "Ja, der nicht erstattete Eigenschaden ist Werbungskosten — sofern er auf einer dienstlichen Reise entstanden ist und der verlorene Inhalt beruflich genutzt wurde (Uniform, Crew-Schuhe, dienstliche Unterlagen).\n\nKonkret: 1.200€ (Schaden) − 400€ (AG-Erstattung) = 800€ absetzbar als Werbungskosten.\n\nABER eintragen mit Vorsicht:\n• Aufstellung schreiben: was war drin (Uniform 600€, Crew-Schuhe 180€, Koffer 200€, Standard-Toiletries — letzteres NICHT absetzbar, das ist Privatleben)\n• Schaden ist nur der dienstliche Anteil → realistischer Wert ist eher 600-700€\n• Original-Belege oder zumindest Nachkauf-Belege beifügen\n• Verlust-Bestätigung von LH mit Verweis auf die Tour\n\nWENN deine private Hausratversicherung den Rest erstattet, dann fällt das zusätzlich raus — nur den ECHT verbliebenen Eigenschaden ansetzen.\n\nKategorie: Werbungskosten → Sonstige Werbungskosten oder Arbeitsmittel-Verlust. Bei Zweifel mit FA: §9 Abs. 1 EStG genügt als Rechtsgrundlage.",
+    "codename": "BaggageHunterBH",
+    "title": "Crew-bag verloren in LAX - was geht?",
+    "body": "lh hat 400€ ersetzt, eigentlicher schaden war 1200€ (uniform, schuhe, persönlich). rest auf eigene rechnung. werbungskosten?",
+    "aerotax_answer": "Ja, der Eigenanteil ist Werbungskosten — sofern der verlorene Inhalt beruflich genutzt wurde.\n\n1200€ Schaden − 400€ AG-Erstattung = 800€ Eigenanteil.\n\nDavon ist aber nur der DIENSTLICHE Anteil absetzbar:\n• Uniform-Teile: ja\n• Crew-Schuhe: ja (wenn dienstlich)\n• Crew-Bag selbst: ja\n• Persönliche Toiletries, T-Shirts, Bücher: nein (Privatleben)\n\nRealistisch ansetzbar: 600-700€ als Werbungskosten — der dienstliche Anteil. Den Rest als verlorenes Privateigentum (steuerlich uninteressant).\n\nWAS du brauchst: Aufstellung was drin war + Verlustbestätigung von LH/Hotel + Bezugnahme auf die Tour. Nachkauf-Belege als Wert-Nachweis.\n\nABER: wenn deine private Hausratversicherung den Rest ersetzt, fällt auch das raus. Nur den ECHT verbliebenen Eigenschaden ansetzen.\n\nKategorie: Werbungskosten → Sonstige Werbungskosten oder Arbeitsmittel-Verlust.",
     "tags": ["gepaeck", "verlust", "ausland"]
   },
   {
-    "codename": "HappyHolderHasi",
-    "title": "Coffee/Snacks am Crew-Center vor Briefing — Pauschale oder Beleg?",
-    "body": "Stehe oft 1-2h vor Briefing in der Crew-Lounge, kaufe da Kaffee + Snack für 8-12€. Pauschal oder mit Bon?",
-    "aerotax_answer": "Schwierig — gegebenenfalls keiner von beidem.\n\nKaffee/Snack vor Briefing = grundsätzlich \"Verpflegungs-Mehraufwendung\" → wird durch Z72/Z73-Pauschale (14€/Tag bei >8h Abwesenheit Inland) bereits PAUSCHAL abgegolten.\n\nDas heißt: für jeden Briefing-Tag der über 8h dauert (was bei den meisten Tours der Fall ist) bekommst du sowieso 14€ Z72 — egal ob du Kaffee gekauft hast oder nicht. Doppelt geht nicht.\n\nFür reine Standby-Tage (in der Lounge ohne Tour) > 8h: ebenfalls Z72 Inland-Pauschale.\n\nAUSNAHMEN wo Belege helfen:\n• Bewirtung von externen Crew-Mitgliedern aus geschäftlichem Anlass (selten)\n• Kaffee bei reinem Bodendienst <8h: dann gar keine Pauschale → Belege auch nicht ansetzbar (Privatleben)\n\nMein Rat: lass die Belege liegen, die Z72-Pauschale deckt das ab. Beleg-Aufwand bringt nichts extra.",
+    "codename": "FlightAttendantA",
+    "title": "Coffee + Snacks vor briefing 12€ pro tag - absetzbar?",
+    "body": "stehe oft 1-2h vor briefing in der lounge, hol mir nen kaffee und snack. zusammen so 8-12€. kann ich da was machen?",
+    "aerotax_answer": "Nein, das ist schon abgedeckt. Bei einem Briefing-Tag der über 8h dauert (was bei den meisten Tours der Fall ist) bekommst du eh die 14€ Z72 Inland-Pauschale — die deckt deine Verpflegungs-Mehraufwendungen pauschal ab. Doppelt geht nicht.\n\nKonkret: für jeden Tag wo du auf Tour bist, gilt entweder Z72 (Inland >8h ohne Übernachtung), Z73 (An-/Abreise mit Übernachtung) oder Z76 (Ausland). Alle drei beinhalten den Verpflegungs-Mehraufwand.\n\nFür reine Standby-Tage in der Lounge ohne Tour, wenn die Abwesenheit > 8h ist: ebenfalls Z72.\n\nFür Bodendienst-Tage <8h: dann gar keine Pauschale → Coffee-Belege auch nicht (Privatleben).\n\nLass die Belege also liegen. Z72-Pauschale macht's pauschal.",
     "tags": ["verpflegung", "briefing", "z72"]
   },
   {
-    "codename": "NocturnalNomad",
-    "title": "Reinigung von Privatkleidung im Hotel — pauschal oder Beleg?",
-    "body": "Auf 6-Tage-Tour habe ich Wäsche im Hotel gemacht für 25€. Werbungskosten oder privat?",
-    "aerotax_answer": "Reine Privatkleidung-Reinigung im Hotel = privat (§12 Nr. 1 EStG). Auch wenn du auf Dienstreise bist: das Reinigen deiner T-Shirts und Unterwäsche ist Lebensführung.\n\nABER: deine UNIFORM ist getrennt zu betrachten — die Reinigungs-Pauschale 1,60€/Arbeitstag deckt ALLES ab (auch Hotel-Reinigung der Uniform). Du brauchst keine zusätzlichen Belege.\n\nEntscheidung pro Stück:\n• Uniform-Bluse/Hose Hotel-Reinigung → bereits durch 1,60€/Tag-Pauschale abgegolten, NICHT zusätzlich\n• Privat-T-Shirt → privat, nicht absetzbar\n• Crew-Krawatte/Schal → Uniform-Bestandteil, gleich wie Uniform\n\nDie 1,60€/Tag × Arbeitstage ist eine Verwaltungspraxis-Pauschale. Wenn du mehr ansetzen willst (z.B. 800€ Reinigungs-Belege), brauchst du lückenlose Einzel-Belege ABER nur für Uniform-Stücke.\n\nMein Rat: die 1,60€/Tag-Pauschale ist großzügig genug. Lass die 25€ Hotel-Wäsche aus.",
-    "tags": ["reinigung", "uniform", "pauschale"]
+    "codename": "VFR_oncTop",
+    "title": "Schuhe für crew - 6 paar zuviel?",
+    "body": "hab dieses jahr 6 paar schwarze pumps gekauft (laufen einfach so schnell durch bei tower briefings). 720€ gesamt. komplett absetzbar?",
+    "aerotax_answer": "Pumps sind beim FA grundsätzlich umstritten — schwarze Pumps tragen viele Frauen auch privat. Die Linie des BFH: nur wenn die Schuhe NICHT im normalen Leben tragbar sind, sind sie Arbeitsmittel.\n\nWenn deine Pumps:\n• Spezielle Anti-Rutsch-Sohle oder andere Crew-Spezifika haben\n• In der Tarifvereinbarung explizit als Uniform definiert sind\n• Du sie tatsächlich nur dienstlich trägst (separater Privatschuh)\n→ Voll absetzbar als Arbeitsmittel.\n\nWenn es \"normale\" schwarze Pumps sind: meistens 50% beim FA durchsetzbar, 100% nur mit guter Argumentation.\n\n6 Paar in einem Jahr ist VIEL — das FA wird argwöhnisch. Realistische Position für dich:\n• 4 Paar á 100€ = 400€ als Arbeitsmittel ansetzen (mit Nachweis dass es Crew-spezifisch ist)\n• Den Rest weglassen oder zu 50% ansetzen\n\nFotos der Schuhe + Tarif-Verweis sind hilfreich. Wenn du argumentieren kannst dass die Tarifvereinbarung die Schuhe als Uniform-Bestandteil definiert, hast du Wind im Rücken.",
+    "tags": ["uniform", "schuhe"]
   },
   {
-    "codename": "ApproachAdam",
-    "title": "Standby zu Hause — wirklich kein Fahrtag?",
-    "body": "Habe an einem SBY-Tag 7 Stunden in Crew-Uniform zuhause gewartet (Phone, Computer an). Bekomme ich da nicht trotzdem irgendeine Pauschale?",
-    "aerotax_answer": "Korrekt — Standby zuhause ist KEIN Fahrtag, weil du dich nicht zur Homebase begeben hast. EASA-FTL nennt das \"Home-Standby\" (vs. \"Airport-Standby\" der ein Fahrtag wäre).\n\nABER es ist ein ARBEITSTAG. Das hat Konsequenzen:\n• Reinigungspauschale Uniform 1,60€/Tag → JA (du trägst Crew-Kleidung in Bereitschaft)\n• Telefon-Pauschale (anteilig) → JA (Erreichbarkeit ist beruflich)\n• Internet anteilig → JA (CrewLink etc.)\n• Pendlerpauschale → NEIN (keine Anreise)\n• Z72/73/74/76 VMA → NEIN (du bist nicht auswärts)\n\nWENN dein SBY ZIELORT NICHT FRA war (z.B. Hotel-Standby in MUC oder im Ausland weil du auf Tour warst):\n→ DANN gilt das als Auswärtstätigkeit, du bekommst die normale VMA-Pauschale.\n\nMein Rat: Inland-Home-Standby gibt nichts extra. Trag die Tage als Arbeitstage in den Reinigungs-Pool ein, das war's.",
+    "codename": "MorningHotelMan",
+    "title": "Wäsche im Hotel auf Tour - extra absetzen?",
+    "body": "war 6 tage in YYZ, hab im hotel wäsche machen lassen für 25€. zähl ich das zur reinigungspauschale dazu oder ist das was extra?",
+    "aerotax_answer": "Reine Privatkleidung-Reinigung im Hotel = privat (§12 Nr. 1 EStG). Auch wenn du auf Dienstreise bist — deine T-Shirts und Unterwäsche zu waschen ist Lebensführung.\n\nWAS aber drin steckt:\n• Uniform-Teile (Bluse, Hose, Krawatte) im Hotel waschen lassen → bereits durch die 1,60€/Tag Reinigungspauschale abgedeckt. Brauchst keine zusätzlichen Belege.\n• Privat-Klamotten → privat, gar nicht absetzbar.\n\nDie 25€ Hotel-Wäsche kannst du entweder:\n(a) ignorieren (lohnt sich nicht für Klein-Beträge),\n(b) versuchen den Uniform-Anteil zu argumentieren (etwa 5-8€), aber die 1,60€-Pauschale ist schon drin\n\nMein Rat: 1,60€/Tag-Pauschale × Arbeitstage ist großzügig genug, deckt Hotel-Reinigung ab. 25€ separat einreichen lohnt nicht.",
+    "tags": ["reinigung", "uniform"]
+  },
+  {
+    "codename": "StandbyZach",
+    "title": "Home Standby = arbeitstag oder nicht?",
+    "body": "hab 7std SBY zuhause in uniform gewartet, telefon an. ist das jetzt arbeitstag bei der reinigungs pauschale oder nicht?",
+    "aerotax_answer": "Arbeitstag ja, aber kein Fahrtag. Heißt:\n\n• Reinigungspauschale 1,60€ → JA (du trägst Crew-Kleidung)\n• Telefon-Pauschale anteilig → JA (Erreichbarkeit ist beruflich)\n• Internet-Pauschale anteilig → JA\n• Pendlerpauschale → NEIN (du bist nicht zur Homebase gefahren)\n• VMA Z72/Z73/Z74 → NEIN (du bist nicht auswärts gewesen)\n\nDie Zeit zählt aber definitiv als Arbeitstag im Sinn der Reinigungspauschale.\n\nUnterschied zu \"Airport Standby\": wenn du am Flughafen wartest, IST es ein Fahrtag (du bist zur Homebase gefahren). Plus die selben anderen Kategorien wie oben.\n\nBei Home Standby = Arbeitstag-Counter +1 (für Reinigung), Fahrtag-Counter unverändert.",
     "tags": ["standby", "fahrtag", "home"]
   },
   {
-    "codename": "WindShiftWendy",
-    "title": "Sechs Pärchen Crew-Schuhe in einem Jahr — alle absetzbar?",
-    "body": "Dienstvorschrift verlangt schwarze Schuhe. Habe 6 Paar à 80-150€ gekauft (laufen kaputt). Alle 720€ absetzbar?",
-    "aerotax_answer": "Schuhe sind bei Crew oft umstritten. Steuerliche Sicht:\n\nKonkret schwarze Pumps/Schuhe sind UNIFORM-Bestandteil im weiteren Sinne — wenn die Dienstvorschrift sie zwingend vorgibt UND sie nicht im normalen Leben tragbar sind (z.B. Crew-Pumps mit 3cm Absatz, schmaler Sohle, Lufthansa-Code), sind sie Arbeitsmittel.\n\nABER: Schwarze Standard-Pumps die du auch auf der Hochzeit tragen könntest = grundsätzlich PRIVAT, nicht absetzbar (BFH-Linie).\n\nMein Rat:\n• Wenn die Schuhe ein klar abgrenzbares \"Crew-Modell\" sind (z.B. spezielle Anti-Rutsch-Sohle, LH-Logo, von der Tarifvereinbarung definiert): voll absetzbar als Arbeitsmittel\n• Wenn es Standard-Schuhe sind die zufällig schwarz sind: 50% akzeptiert das FA oft\n• 100% nur mit guter Argumentation (Anzahl, exklusive Crew-Nutzung dokumentiert)\n\n6 Paar in einem Jahr ist viel — das FA wird argwöhnisch. Realistische Position: 4 Paar + Anti-Rutsch-Detail nachweisen → 4 × 100€ = 400€ als Arbeitsmittel ansetzbar.\n\nBelege aufheben + Foto der Schuhe (mit Crew-Tag).",
-    "tags": ["uniform", "schuhe", "arbeitsmittel"]
+    "codename": "AirCrewAlex",
+    "title": "BU versicherung 65€/monat - wo eintragen?",
+    "body": "hab seit kurzem ne berufsunfähigkeitsversicherung speziell für flugpersonal. 65€/monat. werbungskosten oder vorsorge?",
+    "aerotax_answer": "Berufsunfähigkeitsversicherung = Sonderausgabe (Vorsorgeaufwendungen), nicht Werbungskosten. Auch wenn sie speziell für Flugpersonal ausgelegt ist.\n\nGrund: BU schützt dein Einkommen für die Zukunft, das ist kein direkter Aufwand zur Erzielung deiner aktuellen Einnahmen. § 10 EStG, nicht § 9 EStG.\n\n65€ × 12 = 780€/Jahr. Eintragen: Anlage Vorsorgeaufwand → Sonstige Vorsorgeaufwendungen.\n\nABER: Höchstbetrag bei Vorsorgeaufwendungen ist meistens schon durch deine Krankenversicherung + Pflegeversicherung ausgeschöpft. Heißt: in der Praxis bringt die BU oft NICHTS mehr Steuerersparnis weil der Höchstbetrag schon voll ist.\n\nLass das vom Steuerberater einmal prüfen — wenn dein vorgesehener Höchstbetrag für sonstige Vorsorgeaufwendungen schon durch KV/PV verbraucht ist, ist die BU für die Steuer egal.\n\nTipp: Eine reine Risikolebensversicherung wäre günstiger und ist im selben Topf.",
+    "tags": ["versicherung", "bu", "vorsorge"]
   },
   {
-    "codename": "StratosphereStef",
-    "title": "Englisch-Untertitel-Software für CRM-Schulungen?",
-    "body": "Habe Untertitel-Plugin für Browser-CRM-Videos gekauft (LingQ, 99€/Jahr). Werbungskosten?",
-    "aerotax_answer": "Grenzfall — kommt drauf an wie eindeutig dienstlich motiviert.\n\nWENN die Software primär für CRM/EASA-Schulungs-Videos genutzt wird (also dienstliche Fortbildung): klar Werbungskosten nach §9 Abs. 1 Nr. 6 EStG. Voll absetzbar 99€/Jahr.\n\nABER: LingQ und ähnliche Tools haben einen klaren PRIVATEN Mehrwert (Sprachverbesserung allgemein, Filme schauen, Hobby). Das FA wird argwöhnisch.\n\nUm 100% durchzubekommen, brauchst du:\n• Nachweis dass du die Software überwiegend für dienstliche Schulungs-Videos nutzt (Logs/Verlauf wenn möglich)\n• Argument: CRM-Videos sind oft englischsprachig, Untertitel beschleunigen Lerneffekt\n• Pauschal 50% wäre konsensfähig\n\nMein Rat: 50% ansetzen (49,50€) als Fortbildungs-Hilfsmittel — fällt unter den Radar. Bei voller 99€ rechnest du mit Diskussion.\n\nKategorie: Werbungskosten → Fortbildung → Lehrmittel.",
-    "tags": ["software", "fortbildung", "sprache"]
-  },
-  {
-    "codename": "BluestSky",
-    "title": "Notfall-Heimflug aus eigenen Mitteln — abzugsfähig?",
-    "body": "Vater plötzlich verstorben in BKK auf Privatreise, habe 1.800€ Rückflug zur Beerdigung selbst bezahlt. Werbungskosten oder a.B.?",
-    "aerotax_answer": "Tut mir leid für den Verlust deines Vaters.\n\nSteuerlich: das ist NICHT Werbungskosten — du warst auf Privatreise, nicht auf Dienst. Auch der Rückflug zur Beerdigung ist privat veranlasst.\n\nABER: Bestattungskosten + dazugehörige Anreise-Kosten können als außergewöhnliche Belastung nach §33 EStG angesetzt werden, soweit sie das Vermögen des Verstorbenen übersteigen (also dein Eigenanteil).\n\nKonkret:\n• Bestattung selbst: meist 5.000-10.000€\n• Wenn Erbschaft des Vaters die Kosten DECKT → keine außergewöhnliche Belastung mehr\n• Wenn dein Eigenanteil am Bestatten + Rückflug das Erbe übersteigt → der Eigenanteil ist a.B.\n• Plus deine 1.800€ Rückflug zur Beerdigung\n\nWICHTIG: Zumutbarkeitsgrenze §33 Abs. 3 EStG (1-7% deines Einkommens) wird zuerst abgezogen — bei einem 60.000€ Brutto sind das ~3.000€ Selbstbehalt.\n\nFAZIT: Wenn deine Gesamt-a.B. (Bestattung-Eigenanteil + Rückflug + andere Krankheitskosten 2025) über deine Zumutbarkeitsgrenze geht, wird's wirksam. Sonst leider nicht.\n\nLass dir das vom Steuerberater rechnen.",
-    "tags": ["beerdigung", "ausland", "ausserge-belastung"]
-  },
-  {
-    "codename": "GroundedGreta",
-    "title": "Gewerkschaftsbeitrag UFO 480€/Jahr — wo eintragen?",
-    "body": "Bin UFO-Mitglied, zahle 40€/Monat. Voll absetzbar?",
-    "aerotax_answer": "Ja, voll absetzbar. Gewerkschaftsbeiträge sind Werbungskosten nach §9 Abs. 1 Nr. 3 EStG — ohne Höchstgrenze, ohne Nachweis-Aufwand.\n\nKonkret: 40€/Monat × 12 = 480€/Jahr → komplett in Anlage N → \"Werbungskosten → Gewerkschaftsbeiträge\" eintragen.\n\nAuch absetzbar:\n• Vereinigung Cockpit (für Piloten)\n• Berufsverbände (Berufsverband der Bordbetreuer, falls Mitglied)\n• ver.di / DGB-Beiträge wenn statt UFO\n\nWENN UFO einen Anteil als Spende/Sondervermögen ausweist: nur der reine Mitgliedsbeitrag ist Werbungskosten, Spendenanteil als Sonderausgabe (Spenden).\n\nBeleg: Jahresbeitragsbescheinigung von UFO bekommst du automatisch im Januar — aufheben für die Steuererklärung.\n\nKein Zumutbarkeitsabzug. Schmaler Block, schnell erledigt.",
-    "tags": ["gewerkschaft", "ufo"]
-  },
-  {
-    "codename": "FlightlevelFra",
-    "title": "Pendlerpauschale bei Fahrgemeinschaft — voll oder anteilig?",
-    "body": "Fahre 4× Woche mit Kollegin im Auto. Wir wechseln uns ab. Bekomme ich die volle Pendlerpauschale?",
-    "aerotax_answer": "Ja, JEDER von euch bekommt die volle Pendlerpauschale für seine Fahrtage zur Arbeit (§9 Abs. 2 EStG) — egal ob du gefahren bist oder als Mitfahrerin.\n\nKonkret: bei 60 Fahrtagen × 27km × 0,30/0,38 € = volle Pauschale für jeden von euch separat.\n\nABER: Die Pendlerpauschale wird gekürzt wenn ihr die kürzeste verkehrsübliche Strecke nicht nehmt — egal wer fährt.\n\nWICHTIG bei Fahrgemeinschaft:\n• Höchstgrenze 4.500€/Jahr für Mitfahrer (gilt nicht beim Fahrer-Anteil)\n• Wenn du gemeinsam mit dem Auto fährst und sie tanken, ist das tarifrechtlich euer Privat-Arrangement, steuerlich irrelevant\n\nFalls du an manchen Tagen NUR mitgefahren bist (nicht selbst gefahren): bei DEINEM Fahrtag-Counter zählt es trotzdem voll, aber die 4.500€-Höchstgrenze für Nicht-Fahrer-Tage gilt.\n\nMein Rat: einfach die volle Pendlerpauschale ansetzen, das passt in 99% der Crew-Fälle. Bei sehr hohen km ggf. die 4.500€-Grenze prüfen.",
+    "codename": "FuelSpillFred",
+    "title": "fahrgemeinschaft wer bekommt was?",
+    "body": "fahre 4x woche mit nem kollege nach FRA. wir wechseln uns ab. bekommt jeder die volle pendler oder muss ich was teilen?",
+    "aerotax_answer": "Jeder bekommt die volle Pendler-Pauschale für seine Fahrtage zur Arbeit, unabhängig davon ob er gefahren ist oder mitgefahren. § 9 Abs. 2 EStG.\n\nKonkret: bei 4 Fahrtagen pro Woche × 50 Wochen × Entfernung × Pauschalsatz → für DICH allein. Dein Kollege rechnet sich seins separat. Niemand teilt was.\n\nABER: für Mitfahrer gibt's eine Höchstgrenze 4.500€/Jahr. Das gilt für die Tage wo DU nicht selbst gefahren bist. Bei normaler Crew-Strecke (8-30km) bleibst du da meilenweit drunter, kein Problem.\n\nAchtung: Pendler-Pauschale wird gekürzt wenn ihr nicht die kürzeste verkehrsübliche Strecke nehmt — also nicht über die Berge fahren sondern die Autobahn. Das wird selten geprüft, aber kann.\n\nMein Rat: einfach die volle Pendler-Pauschale ansetzen wie wenn du allein fährst. Passt in 99% der Crew-Fälle.",
     "tags": ["pendler", "fahrgemeinschaft"]
   },
   {
-    "codename": "TraffiCargo",
-    "title": "Brillenputztuch + Sehtest beim Fliegerarzt absetzbar?",
-    "body": "Pflicht-Sehtest beim Fliegerarzt 80€, neue Brille 320€. Cockpit-Pflicht-Brille. Alles Werbungskosten?",
-    "aerotax_answer": "Differenziert anschauen:\n\n**Sehtest beim Fliegerarzt 80€:**\nWenn er Pflicht-Voraussetzung für deine Lizenz ist (Class 1 für Cockpit) → klar Werbungskosten als Fortbildung/Lizenz-Erhalt. Voll absetzbar nach §9 EStG.\n\n**Brille 320€:**\nGrenzfall. Reine Sehkorrekturbrille = grundsätzlich AUSSERGEWÖHNLICHE BELASTUNG (Krankheitskosten), keine Werbungskosten. BFH-Linie.\n\nABER: wenn die Brille SPEZIELL für Cockpit-Anforderungen ist (z.B. Multi-Fokus für Cockpit-Instrumente, blendarme Beschichtung gegen Cockpit-Reflektion, vom AME-Arzt vorgeschrieben) und ausschließlich beruflich getragen wird:\n→ DANN Arbeitsmittel, voll Werbungskosten.\n\nIn deinem Fall: \"Cockpit-Pflicht-Brille\" suggeriert eine berufsspezifische Brille. Mit AME-Bescheinigung dass die Brille spezifisch fürs Fliegen verschrieben wurde → 100% Werbungskosten.\n\n**Mein Rat:**\n• 80€ Sehtest: Werbungskosten → Fortbildungskosten (sicher)\n• 320€ Brille: Werbungskosten → Arbeitsmittel WENN AME-Bescheinigung vorliegt; sonst 50% Werbungskosten + 50% a.B.\n\nFA-sicher: 80€ + 50% × 320€ = 240€ Werbungskosten + 160€ a.B. → unproblematisch.",
-    "tags": ["fliegerarzt", "brille", "lizenz"]
+    "codename": "FlyOpsFiona",
+    "title": "neue brille fürs cockpit + sehtest 400€ insgesamt",
+    "body": "fliegerarzt sehtest 80€ + neue gleitsichtbrille fürs cockpit 320€. werbungskosten?",
+    "aerotax_answer": "Die 80€ Sehtest beim Fliegerarzt sind klar Werbungskosten — Pflicht-Voraussetzung für deine Lizenz, also Fortbildung/Lizenzerhalt. Voll absetzbar.\n\nBei der 320€ Brille wird's strittig:\n• Reine Sehkorrekturbrille (auch privat tragbar) = AUSSERGEWÖHNLICHE BELASTUNG (Krankheitskosten), nicht Werbungskosten. BFH-Linie.\n• Wenn die Brille spezifisch fürs Cockpit verschrieben ist (vom AME mit Hinweis auf berufliche Notwendigkeit, z.B. Multifokus für Cockpit-Instrumente, blendarme Beschichtung): voll Werbungskosten.\n\nBei dir: \"Gleitsicht fürs Cockpit\" — wenn der AME-Brief das so sagt, hast du gute Argumente für 100% Werbungskosten. Gleitsicht-Erfordernis fürs Cockpit (Instrumente nah, Sicht weit) ist berufsspezifisch.\n\nMein Rat: 80€ + 320€ = 400€ als Werbungskosten ansetzen. Bei Streit mit dem FA AME-Brief beifügen.\n\nFalls der AME-Brief die Cockpit-Spezifität nicht erwähnt: 80€ als Werbungskosten + 320€ als a.B. (mit Zumutbarkeitsgrenze, oft wirkt es nicht).",
+    "tags": ["fliegerarzt", "brille"]
   },
   {
-    "codename": "SkidsOutSarah",
-    "title": "DOPPELTE Tour-Heimkehr durch Crew-Tausch — wieviele Fahrtage?",
-    "body": "Bin morgens 9:00 nach NICE geflogen, mittags zurück (abends in FRA), abends nochmal nach LON. Wieviele Fahrtage?",
-    "aerotax_answer": "Klassischer Doppel-Reise-Tag. Steuerlich: ZWEI separate Touren = 2 Fahrtage.\n\nWarum: Du bist abends in FRA gelandet (= Tour-Ende NICE). Dann später am gleichen Tag erneut nach LON gestartet (= neuer Tour-Start). Zwischen den beiden Touren warst du in der Homebase — das ist die Definition für separate Touren.\n\nKonkret:\n• Tour 1 (NICE): 1 Fahrtag, Z72 Inland-Tagestrip wenn morgens raus + abends zurück (sehr selten der Fall — meist Z76 NICE)\n• Tour 2 (LON): 1 Fahrtag, plus Hotelnacht falls Übernachtung\n\nBeide Touren werden separat in Anlage N gezählt.\n\nWICHTIG: Wenn das Briefing für Tour 2 in Crew-Center war BEVOR du nach NICE losgeflogen bist (= Briefing für die Schicht insgesamt), könnte ein Steuerberater argumentieren das ist EIN Schichttag = 1 Fahrtag. Aber LH dokumentiert das in der SE/Flugstunden meist als zwei separate Touren — folge dem Dokument.\n\nMein Rat: 2 Fahrtage zählen, wenn dein Dienstplan zwei separate Tour-Sessions zeigt.",
+    "codename": "EngineRunsT",
+    "title": "doppelreise an einem tag - wie zählen?",
+    "body": "morgens fra-NUE und mittags zurück, abends nochmal fra-LIS und übernachtet. wieviele fahrtage und welche pauschalen?",
+    "aerotax_answer": "Zwei separate Touren an dem Tag = 2 Fahrtage.\n\nWarum: Du bist mittags wieder in FRA gelandet (= Tour 1 zu Ende) und später am gleichen Tag erneut nach LIS gestartet (= neue Tour). Zwischen den beiden Touren warst du in der Homebase. Das ist die Definition für separate Touren.\n\nKonkret:\n• Tour 1 NUE: 1 Fahrtag, Z72 wenn morgens raus und abends zurück, oder Z73 falls Übernachtung war (war's nicht). Bei Inland-Tagestrip mit > 8h Abwesenheit: 14€ Z72.\n• Tour 2 LIS: 1 Fahrtag, plus Z76 für Lissabon (Portugal: 32€/Tag An-/Abreise, 21€ Volltage)\n• Hotelnacht in LIS: 3,60€\n\nGesamt: 2 Fahrtage, Z72 + Z76 + Hotel-Trinkgeld.\n\nEintragen: alle Werte einzeln in die Anlage N. Mein Rat: schau nochmal ob LH das in der SE als zwei separate Touren oder als eine Schicht dokumentiert. Folge dem Dokument.",
     "tags": ["fahrtage", "doppel", "tour"]
   },
   {
-    "codename": "PowerlineP",
-    "title": "Kann ich meine FlightRadar24 Premium absetzen?",
-    "body": "Habe FR24 Gold für 35€/Jahr. Nutze es um Crew-Pairings zu checken und vor Touren das Wetter/Verspätung. Werbungskosten?",
-    "aerotax_answer": "Theoretisch ja, praktisch klein.\n\nFlightRadar24 Premium ist berufsbezogen wenn du es für dienstliche Vorbereitungen nutzt (Pairing-Check, Anschluss-Verspätungen, Crew-Tracking auf Ferry-Flights). §9 Abs. 1 Nr. 6 EStG → Arbeitsmittel.\n\n35€/Jahr ist unter der GWG-Grenze, sofort voll absetzbar.\n\nABER: das FA wird sehen \"FlightRadar\" und sofort an Hobby denken. Realistische Position:\n• 50% beruflich (= 17,50€) → unproblematisch\n• 100% wenn du nachweisen kannst dass du es PRIMÄR dienstlich nutzt (Logs sind schwer)\n\nLohnt sich der Aufwand? Nicht wirklich. Bei 35€ → 17,50€ Steuerwirkung × Grenzsteuersatz 35% = ~6€ Ersparnis.\n\nMein Rat: lass es weg, oder pack es zusammen mit anderen kleineren Werbungskosten in einen \"Sonstige Werbungskosten\"-Posten ohne Einzelaufschlüsselung. Manchmal akzeptiert das FA bis 110€ ohne Rückfrage als Sonstige.\n\nNicht das Ding wo du Energie reinstecken solltest.",
-    "tags": ["software", "fr24", "klein"]
+    "codename": "VictorXrayKilo",
+    "title": "FlightRadar24 abonnement - Werbungskosten?",
+    "body": "zahle 35€/jahr für FR24 gold. nutze es um pairings zu prüfen und vor touren wetter zu checken. werbungskosten oder hobby?",
+    "aerotax_answer": "Theoretisch ja, praktisch klein. FR24 Premium ist berufsbezogen wenn du es für dienstliche Vorbereitungen nutzt. Bei 35€ ist es unter der GWG-Grenze, sofort voll absetzbar.\n\nABER: das FA wird sehen \"FlightRadar\" und sofort an Hobby denken. Realistische Position:\n• 50% beruflich (= 17,50€) → unproblematisch\n• 100% wenn du nachweisen kannst dass du es PRIMÄR dienstlich nutzt — Logs sind schwer\n\nLohnt sich der Aufwand? Bei 35€ → 17,50€ × Grenzsteuersatz 35% = ~6€ Ersparnis. Eher nicht.\n\nMein Rat: lass es weg, oder pack es zusammen mit anderen kleineren Werbungskosten in einen Sammel-Posten ohne Einzelaufschlüsselung. Manchmal akzeptiert das FA bis 110€ \"Sonstige\" ohne Rückfrage.",
+    "tags": ["software", "fr24"]
   },
   {
-    "codename": "VortexValentina",
-    "title": "Krankenversicherung für Crew-Auslandsdienst — extra absetzbar?",
-    "body": "Habe Auslands-Krankenversicherung 220€/Jahr extra abgeschlossen weil oft in Asien/USA. Sonderausgabe oder Werbungskosten?",
-    "aerotax_answer": "Spezielle Auslandsdienst-Krankenversicherung für Crew = Werbungskosten nach §9 EStG, NICHT Sonderausgabe.\n\nWarum: Sonderausgaben sind Lebensversicherungen für die normale Lebensführung (also auch Privatreisen). Eine Versicherung die SPEZIELL für berufliche Auslandsreisen abgeschlossen wurde, ist beruflich veranlasst.\n\nVoraussetzungen für Werbungskosten:\n• Versicherung deckt nur dienstliche Auslandsreisen (laut Police)\n• Nicht überschneidend mit deiner normalen Krankenversicherung\n• Beleg: Police mit Hinweis auf Auslandstour-Cover\n\n220€/Jahr → komplett Werbungskosten → Anlage N → \"Sonstige Werbungskosten\" oder \"Arbeitsmittel/Versicherung\".\n\nWENN die Versicherung auch private Auslandsreisen abdeckt (typisch bei Standard-Reisekrankenversicherungen): dann ist sie Sonderausgabe (Vorsorgeaufwendungen). Da gibt es Höchstbeträge.\n\nLies die Police: deckt sie EXPLIZIT \"berufliche Aufenthalte / Crew-Service\" ab? Dann Werbungskosten. Wenn unklar: 100% Werbungskosten ansetzen, FA fragt im Zweifel nach.",
-    "tags": ["versicherung", "ausland", "krankenversicherung"]
+    "codename": "_LavandulaJet_",
+    "title": "Auslands-krankenversicherung extra für Crew - wo eintragen?",
+    "body": "hab nen extra Vertrag bei der HanseMerkur für Crew-spezifischen Schutz im Ausland, 220€/Jahr. Sonderausgabe oder Werbungskosten?",
+    "aerotax_answer": "Wenn die Police EXPLIZIT sagt \"deckt nur dienstliche Auslandsreisen\" oder \"Crew-Service\" → Werbungskosten nach §9 EStG, nicht Sonderausgabe.\n\nWenn die Police auch Privatreisen abdeckt → Sonderausgabe (Vorsorgeaufwendungen), wo sie wahrscheinlich gar nichts bringt weil der Höchstbetrag schon durch KV/PV ausgeschöpft ist.\n\nLies den Vertrag: deckt sie \"berufliche Auslandseinsätze\" oder \"alle Auslandsreisen\"? Bei der HanseMerkur Crew-Tarife sind oft EXPLIZIT auf dienstlich beschränkt — dann kannst du 100% Werbungskosten ansetzen.\n\n220€ → Werbungskosten → \"Sonstige Werbungskosten\" oder \"Arbeitsmittel/Versicherung\".\n\nBei Zweifel: 100% ansetzen, FA fragt im Zweifel nach Police-Auszug. Wenn dich dort die Crew-Klausel rettet, gehst du voll durch.",
+    "tags": ["versicherung", "ausland"]
   },
   {
-    "codename": "RidgeRunnerR",
-    "title": "Welche Fortbildungen vom AG bezahlt sind absetzbar?",
-    "body": "LH bietet manchmal Refresher-Kurse an. Wenn LH den Kurs zahlt, kann ich ihn trotzdem absetzen?",
-    "aerotax_answer": "Nein. §9 EStG erlaubt nur Werbungskosten die DU SELBST gezahlt hast. Wenn der Arbeitgeber die Fortbildung zahlt (oder ein Wert-Lohn-Element ist), ist sie für DICH steuerlich nicht absetzbar.\n\nABER es gibt zwei Ausnahmen:\n\n1. **AG-Erstattung in der Lohnabrechnung:** Wenn LH dir den Kurs erstattet hat und das in deiner LSB Z20 (\"Steuerfreie Arbeitgeberleistungen\") auftaucht, ist es für dich neutral — aber du musst es nicht abziehen, weil es dich nichts gekostet hat.\n\n2. **Eigenanteil + AG-Anteil gemischt:** Wenn ein Kurs 1.000€ kostet, LH 700€ übernimmt und du 300€ Eigenanteil zahlst → die 300€ sind voll Werbungskosten.\n\n3. **Verdiens­tausfall während Fortbildung:** Wenn du unbezahlt freigestellt bist um den Kurs zu machen, ist der Verdienstausfall keine Werbungskosten — aber du hast ja eh weniger Lohn versteuert.\n\nMein Rat: Schau in die LSB Z20. Wenn Fortbildungs-Erstattung dort steht, ist das schon steuerfrei berücksichtigt. Nur Eigenanteile in Anlage N (Werbungskosten → Fortbildung) eintragen.",
+    "codename": "LineupLeader",
+    "title": "lh zahlt fortbildung selbst - kann ich trotzdem absetzen?",
+    "body": "lh hat mir nen language refresher in london finanziert, 1500€. krieg ich da noch was steuerlich?",
+    "aerotax_answer": "Nein. § 9 EStG erlaubt nur Werbungskosten die DU SELBST gezahlt hast. Wenn LH den Kurs zahlt, ist er für DICH steuerlich neutral — du hast nichts ausgegeben.\n\nABER: schau in deine LSB Z20. Wenn die 1500€ als steuerfreier AG-Zuschuss ausgewiesen sind, ist das schon korrekt verbucht. Du brauchst und kannst da nichts mehr drehen.\n\nWAS ginge:\n• Eigene Anreise nach London (falls nicht von LH übernommen): Pendler/Reisekosten als Werbungskosten\n• Eigener Hotel-Anteil falls du selbst gezahlt hast (Tagessatz Z76 London 66€/Tag voll)\n• Trinkgelder bei Hotelübernachtung (3,60€/Nacht)\n• Verbrauchsmaterial vor Ort (Bücher, Gebühren) wenn nicht erstattet\n\nWenn ALLES von LH erstattet ist: kein Werbungskosten-Eintrag. Aber prüf genau, oft gibt's nicht-erstattete Reisenebenkosten.",
     "tags": ["fortbildung", "ag-erstattung"]
+  },
+  {
+    "codename": "SpeedbrakeSophie",
+    "title": "Gewerkschaft 480€ - mit Beleg oder pauschal?",
+    "body": "UFO 40€/monat. brauche ich da nen Beleg oder ist das pauschal absetzbar?",
+    "aerotax_answer": "Voll absetzbar mit Beleg. Gewerkschaftsbeiträge sind Werbungskosten nach §9 Abs. 1 Nr. 3 EStG. Keine Höchstgrenze, keine Pauschale — voll der gezahlte Beitrag.\n\nUFO schickt dir Anfang des Jahres automatisch eine Jahresbeitragsbescheinigung — auf Nachfrage oder per Post. Die heftest du in deine Steuerunterlagen, brauchst sie aber nicht zwingend einzureichen (FA fragt im Zweifel nach).\n\n40€ × 12 = 480€/Jahr → komplett in Anlage N → \"Werbungskosten → Gewerkschaftsbeiträge\".\n\nFalls UFO einen Anteil als Spende ausweist: nur reiner Mitgliedsbeitrag = Werbungskosten, Spendenanteil = Sonderausgabe (Spenden).\n\nKein Stress, geht problemlos durch.",
+    "tags": ["gewerkschaft", "ufo"]
   }
 ]

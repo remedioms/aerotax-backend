@@ -496,6 +496,16 @@ def _run_process_async(job_id, form, files):
             b_safe = {k: v for k, v in b.items() if k != 'file_bytes_list'}
             opt_belege_safe.append(b_safe)
 
+        # Session-Token für Premium-Features (Chat + Recall) erzeugen
+        session_token = _make_session_token(job_id)
+        _save_session(session_token, {
+            'job_id': job_id,
+            'result_data': safe,
+            'notes': result.get('notes', []),
+            'download_url': f'/api/download/{token}',
+            'chat_history': [],
+        })
+
         with _jobs_lock:
             _jobs[job_id] = {
                 **_jobs[job_id],
@@ -503,6 +513,7 @@ def _run_process_async(job_id, form, files):
                 'progress':     100,
                 'completed':    datetime.utcnow().isoformat() + 'Z',
                 'download_url': f'/api/download/{token}',
+                'session_token': session_token,
                 'data':         safe,
                 'abrechnungen': result.get('abrechnungen', []),
                 'optionale_belege': opt_belege_safe,
@@ -618,6 +629,196 @@ def full_health_check():
 
 # Recovery-Tokens: erlauben kostenlose Wiederholung in 30 Min Fenster
 _recovery_tokens = {}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SESSION TOKENS — Premium-Chat & Result-Recall (7 Tage gültig)
+# ══════════════════════════════════════════════════════════════════
+# Nach erfolgreicher Auswertung bekommt der User einen Session-Token.
+# Damit kann er 7 Tage lang:
+#   • Sein Auswertungs-Ergebnis erneut abrufen
+#   • Mit AeroTAX über sein konkretes Ergebnis chatten
+# Token ist NICHT weitergebbar (auf Browser/Device-Hash gebunden, refresht alle 7 Tage)
+
+_SESSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sessions')
+os.makedirs(_SESSION_DIR, exist_ok=True)
+
+
+def _make_session_token(job_id):
+    """Generiert 7-Tage Session-Token nach erfolgreicher Auswertung."""
+    secret = os.environ.get('SESSION_SECRET', 'aerosteuer-session-default-2025')
+    today = datetime.utcnow().strftime('%Y%m%d')
+    raw = f"{job_id}:{today}:{secret}"
+    return 'AT-' + _hashlib.sha256(raw.encode()).hexdigest()[:16].upper()
+
+
+def _save_session(token, data):
+    """Speichert Session-Daten (Auswertungs-Ergebnis + Chat-Verlauf)."""
+    expires = datetime.utcnow() + timedelta(days=7)
+    payload = {**data, 'token': token, 'created': datetime.utcnow().isoformat() + 'Z',
+               'expires': expires.isoformat() + 'Z'}
+    try:
+        with open(os.path.join(_SESSION_DIR, f'{token}.json'), 'w') as f:
+            json.dump(payload, f, default=str)
+    except Exception as e:
+        print(f"[session] save fail: {e}")
+
+
+def _load_session(token):
+    if not token: return None
+    path = os.path.join(_SESSION_DIR, f'{token}.json')
+    if not os.path.exists(path): return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        # Expiry-Check
+        try:
+            exp = datetime.fromisoformat(data['expires'].replace('Z', ''))
+            if exp < datetime.utcnow():
+                return None  # abgelaufen
+        except: pass
+        return data
+    except: return None
+
+
+@app.route('/api/session/<token>', methods=['GET'])
+def session_recall(token):
+    """Holt Auswertungs-Ergebnis via Session-Token."""
+    s = _load_session(token)
+    if not s:
+        return jsonify({'error': 'Session-Token ungültig oder abgelaufen'}), 404
+    # Sensitiver Chat-Verlauf nicht standardmäßig zurückgeben
+    safe = {k: v for k, v in s.items() if k != 'chat_history'}
+    return jsonify(safe)
+
+
+@app.route('/api/chat', methods=['POST'])
+def chat_with_aerotax():
+    """Chat mit AeroTAX über deine Auswertung. Body: {token, message}."""
+    body = request.get_json(silent=True) or {}
+    token = body.get('token', '').strip()
+    message = (body.get('message') or '').strip()[:2000]
+    if not token or not message:
+        return jsonify({'error': 'token und message erforderlich'}), 400
+    if len(message) < 3:
+        return jsonify({'error': 'Frage zu kurz'}), 400
+
+    session = _load_session(token)
+    if not session:
+        return jsonify({'error': 'Session-Token ungültig oder abgelaufen — bitte neu auswerten'}), 401
+
+    # ── COST-CONTROL: Hard-Caps pro Session ──────────────────
+    # 25 Nachrichten total in 7 Tagen → bei 19,99€ Umsatz noch sehr profitabel
+    chat_history_existing = session.get('chat_history', [])
+    user_msg_count = sum(1 for m in chat_history_existing if m.get('role') == 'user')
+    HARD_CAP = 25
+    if user_msg_count >= HARD_CAP:
+        return jsonify({
+            'error': f'Maximum {HARD_CAP} Chat-Nachrichten pro Session erreicht. Du kannst weiterhin deine Auswertung als PDF runterladen und im Forum Fragen stellen.'
+        }), 429
+
+    # IP-Rate-Limit: 8 Chat-Messages/h (verhindert Brute-Force)
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
+    if not _qa_rate_check(ip, 'chat', max_per_hour=8):
+        return jsonify({'error': 'Zu viele Nachrichten — bitte warte 5-10 Minuten'}), 429
+
+    if not ANTHROPIC_KEY:
+        return jsonify({'error': 'KI nicht verfügbar'}), 503
+
+    # Auswertungs-Daten in den Prompt einbauen
+    result_data = session.get('result_data', {})
+    chat_history = session.get('chat_history', [])
+    notes = session.get('notes', [])
+
+    summary_lines = [
+        f"Mandant: {result_data.get('name','?')}",
+        f"Steuerjahr: {result_data.get('year','?')}",
+        f"Arbeitgeber: {result_data.get('arbeitgeber','Lufthansa')}",
+        f"Brutto: {result_data.get('brutto', 0):.2f} €",
+        f"Lohnsteuer: {result_data.get('lohnsteuer', 0):.2f} €",
+        f"Z17 (AG-Fahrkostenzuschuss): {result_data.get('ag_z17', 0):.2f} €",
+        f"Z77 (steuerfreie Spesen): {result_data.get('z77', 0):.2f} €",
+        f"Fahrtkosten: {result_data.get('fahr', 0):.2f} € ({result_data.get('km',0)}km × {result_data.get('fahr_tage',0)} Fahrtage)",
+        f"Reinigung: {result_data.get('reinig', 0):.2f} € ({result_data.get('arbeitstage',0)} Arbeitstage × 1,60 €)",
+        f"Trinkgelder: {result_data.get('trink', 0):.2f} € ({result_data.get('hotel_naechte',0)} Hotelnächte × 3,60 €)",
+        f"Z72 (Inland >8h): {result_data.get('vma_72_tage',0)} Tage / {result_data.get('vma_72',0):.2f} €",
+        f"Z73 (An-/Abreise): {result_data.get('vma_73_tage',0)} Tage / {result_data.get('vma_73',0):.2f} €",
+        f"Z74 (Inland 24h): {result_data.get('vma_74_tage',0)} Tage / {result_data.get('vma_74',0):.2f} €",
+        f"Z76 (Ausland-VMA): {result_data.get('vma_aus', 0):.2f} €",
+        f"Brutto-Aufwendungen gesamt: {result_data.get('gesamt', 0):.2f} €",
+        f"Netto in WISO einzutragen: {result_data.get('netto', 0):.2f} €",
+    ]
+
+    notes_block = ('\n'.join(f"- {n}" for n in notes)) if notes else 'keine'
+    history_block = '\n'.join(
+        f"{'User' if m['role']=='user' else 'AeroTAX'}: {m['content']}"
+        for m in chat_history[-10:]
+    )
+
+    prompt = f"""Du bist AeroTAX, der KI-Steuerberater von aerosteuer.de. Du beantwortest STRENG NUR Fragen zu zwei Themen:
+
+  1. DIESER konkreten Auswertung des Mandanten (Werte, Berechnung, Plausibilität)
+  2. WISO-Eingabe der Werte (welche Zeile, welcher Pfad)
+
+ALLES ANDERE wird höflich abgelehnt mit kurzem Hinweis: "Das ist außerhalb meines Scopes — ich helfe dir nur zur Auswertung und WISO-Eingabe. Allgemeine Steuerfragen kannst du im Community-Forum stellen."
+
+Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Investments, Politik, was-wäre-wenn-Spiele, hypothetische Beispiele.
+
+═══ MANDANTEN-AUSWERTUNG (Steuerjahr {result_data.get('year','?')}) ═══
+{chr(10).join(summary_lines)}
+
+═══ HINWEISE AUS DER AUSWERTUNG ═══
+{notes_block}
+
+═══ BISHERIGER CHAT-VERLAUF (max 10 letzte) ═══
+{history_block or '(erste Nachricht)'}
+
+═══ NEUE FRAGE ═══
+{message}
+
+═══ ANTWORT-REGELN ═══
+- Max 200 Wörter, präzise auf den Punkt
+- Bei On-Topic: konkret bezogen auf SEINE Werte aus der Liste oben
+- Bei Off-Topic: 1-Satz-Ablehnung mit Verweis auf Forum
+- Nutze §9 EStG / EASA-FTL nur wenn nötig zur Begründung
+- KEINE Disclaimer-Wiederholungen, KEINE Floskeln
+- Wenn Frage zu WISO-Eingabe: konkrete Zeilen-Nummer + Pfad nennen"""
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        # Output-Cap: 600 Tokens = ca. 200-250 Wörter, hält Kosten klein
+        resp = _claude_with_retry(client, 'claude-sonnet-4-6', 600, prompt,
+                                   max_retries=2, label='Chat-AeroTAX')
+        answer = resp.content[0].text.strip()
+
+        # Chat-Verlauf updaten + speichern
+        chat_history.append({'role': 'user', 'content': message, 'ts': datetime.utcnow().isoformat() + 'Z'})
+        chat_history.append({'role': 'assistant', 'content': answer, 'ts': datetime.utcnow().isoformat() + 'Z'})
+        session['chat_history'] = chat_history[-50:]  # max 50 Nachrichten
+        _save_session(token, session)
+
+        new_user_count = sum(1 for m in chat_history if m.get('role') == 'user')
+        remaining = max(0, HARD_CAP - new_user_count)
+        return jsonify({
+            'answer': answer,
+            'remaining': remaining,
+            'used': new_user_count,
+            'cap': HARD_CAP,
+        })
+    except Exception as e:
+        print(f"[chat] failed: {e}")
+        return jsonify({'error': f'Chat-Anfrage fehlgeschlagen: {str(e)[:200]}'}), 500
+
+
+@app.route('/api/chat/history', methods=['POST'])
+def chat_history_get():
+    """Gibt vollständigen Chat-Verlauf zurück."""
+    body = request.get_json(silent=True) or {}
+    token = body.get('token', '').strip()
+    s = _load_session(token)
+    if not s:
+        return jsonify({'error': 'Session ungültig'}), 401
+    return jsonify({'history': s.get('chat_history', [])})
 
 
 # ══════════════════════════════════════════════════════════════════
