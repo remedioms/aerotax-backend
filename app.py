@@ -882,33 +882,59 @@ REFERENZFALL (bereits verifiziert — zum Lernen wie LH-Dokumente zu lesen sind)
 - Z77: Alle stfrei-Einzelwerte summieren — NICHT die Summenzeile (Format variiert!)
 Verifiziertes Ergebnis eines LH-Mitarbeiters: Fahrtage=53, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€
 
-Du kennst die LH-Dokumentenformate:
-- Flugstunden: A=Abflug FRA, E=Einflug, FL=Übernachtung im Ausland, EK/D4/EH/EM=Homebase-Dienst
-- Streckeneinsatz (SE): Die stfrei-Spalte enthält den BMF-Tagessatz den LH bereits fertig berechnet hat.
-  stfrei-Ort hat Vorrang über Ort. Storno-Zeilen enden mit X → ignorieren.
-  Z77 = Summe aller stfrei-Einzelwerte (nicht die Summenzeile verwenden — Spaltenreihenfolge variiert!).
+═══ FLUGSTUNDEN-MARKER (so liest du JEDEN Tag) ═══
+Jeder Tag in der Flugstunden-Übersicht hat einen Marker direkt nach dem Datum:
 
-Wichtige LH-Besonderheiten:
-- SM-Seminare: nur 1 Fahrtag für Hin- und Rückfahrt zusammen
-- Mehretappen: mehrere Strecken ohne Heimkehr = 1 Fahrtag
-- Kurzstrecke EU oft ohne FL-Marker, trotzdem Hotelnacht wenn A abends und E nächsten Morgen
-- Nachtflüge: die Flugzeit selbst (auf dem Weg) zählt nicht als Hotelnacht
+| Marker | Bedeutung | Was zählt |
+|---|---|---|
+| `/- FREIER TAG` | Frei  | KEIN Arbeitstag |
+| `U` (Urlaub)  | Urlaub | KEIN Arbeitstag |
+| `K` (Krank) | Krank | KEIN Arbeitstag |
+| `LH#### A FRA xx:xx-xx:xx XXX` | **Abflug** von FRA | Arbeitstag + Tour-Start (Fahrtag wenn Tag 1 der Tour) |
+| `LH#### E XXX xx:xx-xx:xx FRA` | **Einflug** nach FRA | Arbeitstag + Tour-Ende |
+| `FL STRECKENEINSATZTAG` | **Auslands-Übernachtung** (du schläfst im Hotel im Ausland) | Arbeitstag + 1 Hotel-Nacht |
+| `EK STANDBY` / `D4` / `EH` / `EM` | Homebase-Dienst (Standby/Reserve) | Arbeitstag, KEIN Fahrtag |
+| `SM` / `SCHULUNG` / `BRIEFING` | Schulung/Briefing in FRA | Arbeitstag, evtl. 1 Fahrtag |
 
-VMA-KATEGORISIERUNG — KRITISCH (Claude verwechselt das oft):
-- Z72 (Inland >8h OHNE Übernachtung, 14€/Tag): Eintägige Inland-Tour, morgens raus/abends zurück, Abwesenheit >8h, KEINE Hotel-Nacht.
-  Beispiel: "31.01 Deutschland 14€" als EINZIGER Tag einer Tour → Z72.
-  Typische LH-Werte: 5-15 solche Tage/Jahr.
-- Z73 (An-/Abreisetag mit Übernachtung, 14€/Tag): ERSTER oder LETZTER Tag einer mehrtägigen Tour MIT Hotel.
-  Beispiel: "03.02 Deutschland 14€" wenn DANN folgen 04.02-07.02 in JNB → der 03.02 ist Z73.
-- Z74 (24h voll abwesend, 28€/Tag): Mittlere Tage einer mehrtägigen Tour, kompletter 24h-Tag im Inland (selten bei LH — meist Ausland → Z76).
-- Z76 (Ausland, BMF-Pauschalen je Land): jeder Tag mit Auslandsdestination.
+═══ AUS DIESEN MARKERN LEITEST DU AB ═══
 
-ENTSCHEIDUNGSBAUM für jeden 14€-Tag in Deutschland:
-1. Ist die Tour 1-tägig (kein Hotel)? → Z72
-2. Ist es der 1./letzte Tag einer mehrtägigen Tour mit Hotel? → Z73
-3. Sonst: Z72 ist der Default für Single-Day Inland-Tagestrips.
+**Tour-Erkennung:**
+- Eine Tour beginnt mit `A FRA` und endet mit `E ... FRA`
+- Wenn A und E am selben Tag sind = 1-tägige Tour (kein Hotel)
+- Wenn A heute, E morgen oder später = mehrtägige Tour mit Hotel
 
-DEFINITION Arbeitstage: ALLE Tage mit Dienst im Jahr — Flüge (FRA-Abflug oder Einflug), Standby/Reserve (EK/D4/EH/EM), Briefings, Schulungen, SM-Seminare. NICHT zählen: Frei-Tage, Urlaub (U), Krank (K), unbezahlte Freistellung. Mehrtägige Touren = jeder Einsatztag zählt einzeln (auch Auslands-Übernachtungen sind Arbeitstage). Typische LH-Werte: 110-150 Arbeitstage/Jahr.
+**Fahrtage zählen:**
+- Jede Tour = 1 Fahrtag (egal ob 1 Tag oder 10 Tage Tour — du fährst EINMAL hin und EINMAL zurück, das ist zusammen 1 Fahrtag)
+- Mehretappen-Touren ohne Heimkehr = 1 Fahrtag (FRA→GVA→OTP zurück = nur 1)
+- Nur Standby (EK/D4/EH/EM) ohne Flug = KEIN Fahrtag (du wartest zuhause)
+- Schulungen mit physischer Anwesenheit in FRA = 1 Fahrtag
+
+**Arbeitstage zählen:**
+- ALLE Tage mit Dienst-Eintrag (A, E, FL, EK, D4, EH, EM, Schulung)
+- Frei-Tage (`/-`), Urlaub (U), Krank (K) zählen NICHT
+- Bei mehrtägiger Tour zählt jeder Tag einzeln (Hin-Tag + alle FL-Tage + Rück-Tag)
+
+**Hotel-Nächte zählen:**
+- Jeder `FL STRECKENEINSATZTAG`-Eintrag = 1 Hotel-Nacht
+- Plus: Kurzstrecke EU/Inland ohne FL-Marker — aber A spätabends und E nächsten Morgen = 1 Nacht (z.B. "23.05. A FRA→TUN 20:10 / 24.05. E TUN→FRA 03:00")
+- Nachtflug-Übergang (z.B. ICN-Rückflug 18:00→05:00 nächster Tag) zählt NICHT als Hotel — du bist auf dem Heimweg
+
+═══ STRECKENEINSATZ (SE) ═══
+- stfrei-Spalte = von LH vorberechneter BMF-Tagessatz (offiziell, immer korrekt)
+- stfrei-Ort hat Vorrang über Ort
+- Storno-Zeilen enden mit X → ignorieren
+- Z77 = Summe aller stfrei-Einzelwerte (NICHT die Summenzeile, Format variiert)
+- Z72/Z73/Z74/Z76 werden vom Backend automatisch aus SE berechnet — du brauchst sie nicht zu zählen, fokussier dich auf die Flugstunden-Auswertung
+
+═══ DEINE HAUPTAUFGABE ═══
+Du sortierst die Flugstunden Tag für Tag mit den Markern oben ein und zählst:
+- arbeitstage (jeden Tag mit Dienst)
+- fahrtage (Anzahl Touren)
+- hotel_naechte (alle FL-Tage + Übernachtungen ohne FL-Marker)
+
+Plausi-Anker für LH-Personal: 110-150 Arbeitstage/Jahr, 40-60 Fahrtage, 40-65 Hotelnächte. Wenn deine Werte massiv abweichen, prüf nochmal.
+
+VMA (Z72/Z73/Z74/Z76) und Z77 ignorierst du — die kommen deterministisch aus dem SE. Trag in der JSON für vma_*_tage/vma_*/vma_aus/z77 einfach 0 ein, das Backend ersetzt sie.
 
 ═══ ANTWORT-FORMAT — UNBEDINGT EINHALTEN ═══
 
