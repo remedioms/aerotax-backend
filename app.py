@@ -36,7 +36,8 @@ from reportlab.lib.units import cm
 from reportlab.lib.colors import HexColor, white
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
-                                 Table, TableStyle, PageBreak, HRFlowable)
+                                 Table, TableStyle, PageBreak, HRFlowable,
+                                 Image as RLImage)
 from reportlab.lib.enums import TA_RIGHT, TA_CENTER
 
 # ── APP SETUP ─────────────────────────────────────────────────────
@@ -885,6 +886,20 @@ Wichtige LH-Besonderheiten:
 - Mehretappen: mehrere Strecken ohne Heimkehr = 1 Fahrtag
 - Kurzstrecke EU oft ohne FL-Marker, trotzdem Hotelnacht wenn A abends und E nächsten Morgen
 - Nachtflüge: die Flugzeit selbst (auf dem Weg) zählt nicht als Hotelnacht
+
+VMA-KATEGORISIERUNG — KRITISCH (Claude verwechselt das oft):
+- Z72 (Inland >8h OHNE Übernachtung, 14€/Tag): Eintägige Inland-Tour, morgens raus/abends zurück, Abwesenheit >8h, KEINE Hotel-Nacht.
+  Beispiel: "31.01 Deutschland 14€" als EINZIGER Tag einer Tour → Z72.
+  Typische LH-Werte: 5-15 solche Tage/Jahr.
+- Z73 (An-/Abreisetag mit Übernachtung, 14€/Tag): ERSTER oder LETZTER Tag einer mehrtägigen Tour MIT Hotel.
+  Beispiel: "03.02 Deutschland 14€" wenn DANN folgen 04.02-07.02 in JNB → der 03.02 ist Z73.
+- Z74 (24h voll abwesend, 28€/Tag): Mittlere Tage einer mehrtägigen Tour, kompletter 24h-Tag im Inland (selten bei LH — meist Ausland → Z76).
+- Z76 (Ausland, BMF-Pauschalen je Land): jeder Tag mit Auslandsdestination.
+
+ENTSCHEIDUNGSBAUM für jeden 14€-Tag in Deutschland:
+1. Ist die Tour 1-tägig (kein Hotel)? → Z72
+2. Ist es der 1./letzte Tag einer mehrtägigen Tour mit Hotel? → Z73
+3. Sonst: Z72 ist der Default für Single-Day Inland-Tagestrips.
 
 DEFINITION Arbeitstage: ALLE Tage mit Dienst im Jahr — Flüge (FRA-Abflug oder Einflug), Standby/Reserve (EK/D4/EH/EM), Briefings, Schulungen, SM-Seminare. NICHT zählen: Frei-Tage, Urlaub (U), Krank (K), unbezahlte Freistellung. Mehrtägige Touren = jeder Einsatztag zählt einzeln (auch Auslands-Übernachtungen sind Arbeitstage). Typische LH-Werte: 110-150 Arbeitstage/Jahr.
 
@@ -1969,7 +1984,7 @@ def erstelle_pdf(d):
                 S.append(hr(0, 12))
                 try:
                     if fb[:3]==b'\xff\xd8\xff' or fb[:4]==b'\x89PNG':
-                        img = Image(io.BytesIO(fb))
+                        img = RLImage(io.BytesIO(fb))
                         iw,ih = img.drawWidth,img.drawHeight
                         scale = min(W_c/iw, 22*cm/ih, 1.0)
                         img.drawWidth=iw*scale; img.drawHeight=ih*scale
@@ -1986,7 +2001,8 @@ def erstelle_pdf(d):
                                                textColor=TEXT, fontName="Courier", leading=12)))
                                     else:
                                         S.append(Spacer(1, 0.1*cm))
-                except:
+                except Exception as embed_err:
+                    print(f"PDF-Embed fail [{b.get('name','?')}/{fidx}, {len(fb)}B, magic={fb[:8].hex()}]: {type(embed_err).__name__}: {embed_err}")
                     S.append(Paragraph("Datei konnte nicht eingebettet werden.",
                         ps(f"fe{id(b)}{fidx}", fontSize=9, textColor=TEXT3,
                            fontName="Helvetica", leading=12)))
