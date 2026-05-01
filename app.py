@@ -894,20 +894,27 @@ Drei einfache Fragen pro Tag:
    - Sonst → JA (Arbeitstag)
 
 2. **Ist es ein Fahrtag (du bist physisch zur Homebase FRA gefahren)?**
+   ═══ EASA-Konzept: "Reporting at Home Base" ═══
+   Ein Fahrtag entsteht wenn du dich am Heimatflughafen melden musst (Reporting). Das ist gesetzlich relevant für die FDP (Flight Duty Period) — und für die Steuer der "Ich bin zur Arbeit gefahren"-Tag.
+
    - Tour-Start (du fliegst raus von FRA, Tag 1 einer Tour) → JA
-   - Vor-Ort-Dienst in FRA mit Uhrzeit (Briefing, Schulung in Präsenz, EM, EK, D4, EH, Sprachtest, etc.) → JA, du musstest hinfahren
-   - "SBY"/"Standby" zuhause, "RES"/"Reserve" zuhause, "Online-Schulung", "e-Learning" → NEIN, du warst zuhause
+   - Vor-Ort-Dienst in FRA mit Uhrzeit (Briefing, Schulung in Präsenz, EM, EK, D4, EH, Sprachtest, Airport-Standby) → JA, du musstest hinfahren ("Reporting at Home Base")
+   - **Home-Standby** (SBY zuhause, RES Reserve zuhause, Online-Schulung, e-Learning) → NEIN, kein Reporting, du warst daheim
    - Folge-Tage einer Tour (FL Auslands-Übernachtung, oder Rückflug-Tag wenn der Vortag schon Auslandstag war) → NEIN, du bist nicht zuhause gewesen
-   - Mehretappen-Tour ohne Heimkehr (FRA→GVA→OTP→FRA) = nur 1 Fahrtag (Anreise + Rückreise zusammen)
+   - Mehretappen-Tour ohne Heimkehr (FRA→GVA→OTP→FRA) = nur 1 Fahrtag (1× Reporting beim Tour-Start)
 
 3. **Hat dieser Tag eine Hotel-Nacht?**
    Hotel-Nacht heißt: du **schläfst in einem Hotel** weil du den Tag nicht heimkommst. Es heißt NICHT: jede Nacht in der du nicht zuhause bist.
 
-   - Auslands-Übernachtung mit Bodenzeit am Zielort (FL-Marker, oder du landest abends im Ausland und der nächste Eintrag am Ziel-Ort ist >8h später) → **JA**
-   - Single-Day-Trip (Ab und An gleicher Tag, abends wieder zuhause in FRA) → **NEIN**
-   - **Nachtflug-Rückkehr nach FRA** (z.B. Abflug 22:00, Landung 05-06h FRA): du sitzt im Flieger durch die Nacht, kein Hotel → **NEIN**
-   - **Wendetour ohne Bodenzeit** (z.B. FRA 20:10 → TUN, dann TUN 03:00 → FRA, nur ~5h am Boden): Flugzeit-Pause, kein Hotel → **NEIN**
-   - Faustregel: nur dann Hotel-Nacht zählen, wenn klar erkennbar **>8h Bodenzeit am Zielort während Nachtstunden**. Crew Rest in der Luft zählt nicht.
+   ═══ EASA-FTL Ruhezeit-Regel (EU 965/2012, ORO.FTL.235) ═══
+   Eine Hotel-Nacht setzt einen **Layover** voraus — das ist gesetzlich definiert als Aufenthalt am Zielort mit min. **10 Stunden Bodenzeit** (inkl. Hotel-Schlafzeit). Darunter ist es ein Turnaround/Wendeflug, kein Layover. Crew Rest im Flieger (auch >8h auf Langstrecken) zählt NICHT als Hotel.
+
+   Konkret:
+   - Bodenzeit am Zielort ≥ 10h mit Nachtanteil → **Hotel-Nacht JA**
+   - Bodenzeit < 10h (z.B. 5h Quick-Turn) → **NEIN**, das ist Turnaround
+   - Nachtflug zurück nach FRA (Abflug 22:00, Landung 05-06h FRA) → **NEIN**, du sitzt im Flieger
+   - Single-Day-Trip (Ab und An gleicher Tag) → **NEIN**
+   - FL-Marker im Dienstplan → fast immer **JA** (LH setzt FL nur bei echtem Layover ≥10h)
 
 Wenn ein Code unklar ist (z.B. exotischer LH-Buchungscode), schau auf die **anderen Felder**:
 - Steht eine Uhrzeit + FRA dabei → Vor-Ort-Dienst → Fahrtag
