@@ -1105,11 +1105,14 @@ Wenn absolut kein Betrag erkennbar: {{"betrag": 0}}"""
 
 
 
-def infer_missing_data_with_ki(files, available_data, missing):
+def infer_missing_data_with_ki(files, available_data, missing, parsed_summary=None):
     """
     When documents are missing or incomplete, Claude infers values
     from available documents. Always tries to be accurate using cross-references.
     Returns dict with inferred values and notes about what was estimated.
+
+    parsed_summary: dict mit bereits korrekt geparsten Werten (z.B. SE-Monate, summen)
+    damit Claude darüber NICHT editorialisiert.
     """
     if not ANTHROPIC_KEY:
         return {}, []
@@ -1118,29 +1121,42 @@ def infer_missing_data_with_ki(files, available_data, missing):
     notes = []  # Will be shown in PDF as warnings
     inferred = {}
 
-    # Build context from available data
+    # Build context from available data — größere Limits, Claude verkraftet das problemlos
     context_parts = []
-    
+
     if available_data.get('lsb_text'):
-        context_parts.append(f"LOHNSTEUERBESCHEINIGUNG:\n{available_data['lsb_text'][:2000]}")
+        context_parts.append(f"LOHNSTEUERBESCHEINIGUNG:\n{available_data['lsb_text'][:8000]}")
     if available_data.get('se_text'):
-        context_parts.append(f"STRECKENEINSATZ-ABRECHNUNGEN (vorhandene Monate):\n{available_data['se_text'][:4000]}")
+        context_parts.append(f"STRECKENEINSATZ-ABRECHNUNGEN — KOMPLETTER TEXT:\n{available_data['se_text'][:60000]}")
     if available_data.get('dp_text'):
-        context_parts.append(f"FLUGSTUNDEN-ÜBERSICHTEN (vorhandene Monate):\n{available_data['dp_text'][:4000]}")
-    
+        context_parts.append(f"FLUGSTUNDEN-ÜBERSICHTEN — KOMPLETTER TEXT:\n{available_data['dp_text'][:60000]}")
+
     if not context_parts:
         return {}, ['Zu wenige Dokumente für Schätzung vorhanden.']
 
     context = '\n\n'.join(context_parts)
-    
+
+    # Bereits korrekt geparste Werte — Claude soll DARÜBER nicht editorialisieren
+    parsed_block = ''
+    if parsed_summary:
+        parsed_lines = [f"- {k}: {v}" for k, v in parsed_summary.items() if v]
+        if parsed_lines:
+            parsed_block = '\n\nDIESE WERTE WURDEN BEREITS KORREKT GEPARST und sind verlässlich — übernimm sie unverändert, schätze sie NICHT neu, schreibe KEINE Notes darüber:\n' + '\n'.join(parsed_lines)
+
     missing_str = ', '.join(missing)
-    
+
     prompt = f"""Du bist ein Steuerexperte für Lufthansa-Flugbegleiter.
 
-Folgende Dokumente sind VORHANDEN:
-{context}
+Folgende Dokumente sind VORHANDEN (kompletter Text — nicht abgeschnitten, alle Monate die du siehst sind tatsächlich da):
+{context}{parsed_block}
 
 Folgendes FEHLT oder konnte nicht gelesen werden: {missing_str}
+
+WICHTIG zu Notes:
+- Schreibe Notes AUSSCHLIESSLICH über die Items in der FEHLT-Liste oben.
+- Keine Kommentare über bereits korrekt geparste Werte.
+- Keine Aussagen wie "X Monate fehlen" wenn X nicht aus deiner Schätzung resultiert.
+- Wenn ein Item NICHT in der FEHLT-Liste ist, ignoriere es bei den Notes komplett.
 
 Bitte schätze die fehlenden Werte SO GENAU WIE MÖGLICH aus den vorhandenen Daten:
 
@@ -1276,8 +1292,22 @@ def berechne(form, files):
     # ── SMART INFERENCE für fehlende Daten ────────────────────
     inferred = {}
     if missing and available_texts:
-        print(f"Running inference for missing: {missing}")
-        inferred, inf_notes = infer_missing_data_with_ki(files, available_texts, missing)
+        # Bereits geparste Werte zusammenfassen, damit Inferenz NICHT darüber editorialisiert
+        parsed_summary = {}
+        if lst:
+            parsed_summary['LSB_brutto'] = lst.get('brutto', 0)
+            parsed_summary['LSB_lohnsteuer'] = lst.get('lohnsteuer', 0)
+            parsed_summary['LSB_z17'] = lst.get('ag_fahrt_z17', 0)
+        if se_data:
+            parsed_summary['SE_monate_geparst'] = len(se_data.get('abrechnungen', []))
+            parsed_summary['SE_summe_gesamt'] = se_data.get('summe_gesamt', 0)
+            parsed_summary['SE_summe_steuerfrei_z77'] = se_data.get('summe_steuerfrei', 0)
+        if dp:
+            parsed_summary['DP_arbeitstage'] = dp.get('arbeitstage', 0)
+            parsed_summary['DP_fahr_tage'] = dp.get('fahr_tage', 0)
+            parsed_summary['DP_hotel_naechte'] = dp.get('hotel_naechte', 0)
+        print(f"Running inference for missing: {missing}; parsed_summary={parsed_summary}")
+        inferred, inf_notes = infer_missing_data_with_ki(files, available_texts, missing, parsed_summary=parsed_summary)
         notes.extend(inf_notes)
 
     # ── WERTE ZUSAMMENFÜHREN (real > inferred > default 0) ────
