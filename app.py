@@ -681,18 +681,45 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
 
     z77_total = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
 
-    print(f"SE: Z77={z77_total:.2f}€ aus {len(abrechnungen)} Abrechnungen")
+    # ── HILFS-REGEX: Z76-Schätzung als REFERENZ für Claude (nicht als Wert!) ──
+    # Die regex-Summe ist nur ein Anhaltspunkt zum Plausi-Check. Claude liest selbst
+    # und entscheidet — der Regex ist sein "Taschenrechner-Vorabwert", nicht Befehl.
+    INLAND = {'FRA','HAM','MUC','BER','DUS','STR','NUE','CGN','LEJ','HAJ',
+              'HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN'}
+    all_se_text = ''
+    for pdf_bytes in pdf_bytes_list:
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                all_se_text += '\n'.join(p.extract_text() or '' for p in pdf.pages) + '\n'
+        except: pass
 
-    # Z76 macht Claude — er liest die stfrei-Werte direkt aus den SE-Zeilen
-    # und summiert wie ein Steuerberater. Kein Backend-Regex, kein Schätzen.
+    z76_regex_hint = 0.0
+    z76_regex_lines = 0
+    for line in all_se_text.split('\n'):
+        line = line.strip()
+        if ' X' in line: continue
+        if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue
+        m = re.search(r'([\d\.]+,\d{2})\s+([A-Z]{2,4})\s*$', line)
+        if not m: continue
+        sf_val_str, sf_ort = m.group(1), m.group(2)
+        if sf_ort in INLAND: continue
+        try:
+            z76_regex_hint += float(sf_val_str.replace('.','').replace(',','.'))
+            z76_regex_lines += 1
+        except: pass
+
+    print(f"SE: Z77={z77_total:.2f}€ aus {len(abrechnungen)} Abrechnungen, Z76-Hint(Regex)={z76_regex_hint:.2f}€ aus {z76_regex_lines} Auslands-Zeilen")
+
     return {
         'abrechnungen':          abrechnungen,
         'summe_gesamt':          round(sum(a['gesamt'] for a in abrechnungen), 2),
         'summe_steuerfrei':      z77_total,
         'summe_steuerpflichtig': round(sum(a['steuerpflichtig'] for a in abrechnungen), 2),
+        'z76_regex_hint':        round(z76_regex_hint, 2),
+        'z76_regex_lines':       z76_regex_lines,
     }
 
-def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0):
+def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hints=None):
     """
     Analysiert Lufthansa Flugstunden-Übersichten mit Claude (pure KI, kein Regex).
     Claude liest die PDFs direkt und berechnet alle Werte intelligent.
@@ -783,6 +810,21 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0):
             if se_texts:
                 se_kontext = '\n\nSTRECKENEINSATZ-ABRECHNUNGEN (alle Monate):\n' + '\n---\n'.join(se_texts)
 
+        # ── HILFS-RECHNER-VORSCHAU vom Backend (Info, nicht Befehl) ──
+        rechner_kontext = ''
+        if se_hints:
+            z77_t = se_hints.get('summe_steuerfrei', 0)
+            z76_h = se_hints.get('z76_regex_hint', 0)
+            z76_l = se_hints.get('z76_regex_lines', 0)
+            mt = len(se_hints.get('abrechnungen', []))
+            rechner_kontext = (
+                f'\n\nHILFS-RECHNER-VORSCHAU (deterministisch berechnet, nur als Anker für deinen Plausi-Check — du entscheidest selbst):\n'
+                f'- Z77 (steuerfrei gesamt aus Summe-Zeilen): {z77_t:.2f} €\n'
+                f'- Z76 (Σ stfrei-Werte wo stfrei-Ort Ausland, Regex-Schätzung): {z76_h:.2f} € aus {z76_l} Zeilen\n'
+                f'- Anzahl SE-Monate vorhanden: {mt} von 12\n'
+                f'Wenn deine eigene Lese-Summe stark abweicht (>5%), prüf nochmal. Wenn der Regex Zeilen verpasst hat (Format-Variante), vertrau deiner Lese-Summe — du siehst das Dokument als Steuerberater.\n'
+            )
+
         # FollowMe als letztes Content-Element (Lernbeispiel, kein Regelwerk)
         fm_kontext = ''
         try:
@@ -797,7 +839,7 @@ Dein Mandant hat dir seine Unterlagen für 2025 gegeben. Deine Aufgabe: alle Wer
 
 Geh wie ein gründlicher Steuerberater vor — lies JEDEN Monat, JEDE Seite, JEDE Zeile der Dokumente.
 Ein Steuerberater der nur 2 von 12 Monaten auswertet macht seinen Job nicht — sei gründlich.
-{se_kontext}{fm_kontext}
+{se_kontext}{rechner_kontext}{fm_kontext}
 
 REFERENZFALL (bereits verifiziert — zum Lernen wie LH-Dokumente zu lesen sind):
 - Fahrtag: "03.01. LH400 A FRA 14:36" → A=Abflug FRA → Fahrtag ✓
@@ -1267,7 +1309,8 @@ def berechne(form, files):
         try:
             anreise_form = form.get('anreise', 'auto')
             km_form_val = float(form.get('km', 0) or 0) if anreise_form in ('auto', 'fahrrad') else 0
-            dp = parse_dienstplan_mit_ki(files['dp'], se_bytes_list=files.get('se'), km_form=km_form_val)
+            dp = parse_dienstplan_mit_ki(files['dp'], se_bytes_list=files.get('se'), km_form=km_form_val,
+                                          se_hints=se_data if se_data else None)
         except RuntimeError as e:
             raise
         if not dp or not dp.get('arbeitstage'):
