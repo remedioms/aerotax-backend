@@ -623,10 +623,13 @@ def _extract_homebase(base_str):
 def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
     """Liest Flugstunden Tag für Tag, klassifiziert Marker, trackt Tour-State.
     homebase: IATA-Code des Heimatflughafens (FRA, MUC, HAM, DUS, BER, ...)
-    Liefert (fahrtage, arbeitstage, hotel_naechte, frei_tage, unklare_tage).
-    Keine Interpretation — nur literal-Markers + Tour-State-Maschine.
+    Liefert (fahrtage, arbeitstage, hotel_naechte, z72_inland_days, frei_tage, unklare_tage).
     """
+    INLAND_IATA = {'FRA','MUC','HAM','DUS','BER','STR','CGN','NUE','LEJ',
+                   'HAJ','HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN',
+                   'XFW','RLG','SXF','TXF','MHG','FKB','SCN'}
     fahrtage = arbeitstage = hotel_naechte = frei_tage = 0
+    z72_inland_days = 0  # Inland-Tagestrips (1-day round-trip mit Auslandsabwesenheit >8h)
     unklare = []
     in_tour = False  # ob auf Tour (außerhalb FRA)
 
@@ -663,13 +666,17 @@ def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
         # 3. Tour-Start: A {homebase} gefolgt von Ziel
         m_a = re.search(rf'LH\d+\s+A\s+{homebase}\b.*?\b([A-Z]{{3}})\b', rest)
         if m_a:
+            ziel = m_a.group(1)
             arbeitstage += 1
             if not in_tour:
                 fahrtage += 1
                 in_tour = True
-            # Same-day Rückkehr (1-Tages-Tour): falls auch E ... {homebase} in derselben Zeile
+            # Same-day Rückkehr → 1-Tages-Tour (kein Hotel)
             if re.search(rf'\bE\b.*{homebase}\s*$', rest):
                 in_tour = False
+                # Wenn Ziel Inland: Z72 Inland-Tagestrip (Pauschale 14€)
+                if ziel in INLAND_IATA:
+                    z72_inland_days += 1
             continue
 
         # 4. Tour-Ende: E ZIEL {homebase}
@@ -694,11 +701,12 @@ def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
         unklare.append(f"{m_dat.group(1)}.{m_dat.group(2)}: {rest[:80]}")
 
     return {
-        'fahrtage':       fahrtage,
-        'arbeitstage':    arbeitstage,
-        'hotel_naechte':  hotel_naechte,
-        'frei_tage':      frei_tage,
-        'unklare_tage':   unklare,
+        'fahrtage':         fahrtage,
+        'arbeitstage':      arbeitstage,
+        'hotel_naechte':    hotel_naechte,
+        'z72_inland_days':  z72_inland_days,
+        'frei_tage':        frei_tage,
+        'unklare_tage':     unklare,
     }
 
 
@@ -713,10 +721,14 @@ def _parse_se_lines_deterministic(all_se_text):
     z72_eur = z73_eur = z74_eur = z76_eur = 0.0
     unklare = []
 
+    # Number-Pattern toleriert Thousands-Separator: "1.234,56" oder "234,56" oder "12,60"
+    NUM_PATTERN = re.compile(r'^[\d]{1,3}(?:\.\d{3})*,\d{2}$|^\d+,\d{2}$')
+
     for line in all_se_text.split('\n'):
         line = line.strip()
         if not line: continue
-        if ' X' in line: continue                                  # Storno
+        # Storno-Erkennung präziser: einzelnes "X" am Zeilenende oder " X " in Spalten-Position
+        if re.search(r'\s+X\s*$', line) or '  X  ' in line: continue
         if not re.match(r'^\d{2}\.\d{2}\.\d{4}', line): continue   # nur Datums-Zeilen
 
         parts = line.split()
@@ -726,7 +738,7 @@ def _parse_se_lines_deterministic(all_se_text):
         if idx<len(parts) and re.match(r'^\d{2}:\d{2}$', parts[idx]): an = parts[idx]; idx += 1
         if idx >= len(parts): continue
         # Spesenanspruch (überspringen — wir interessieren uns für stfrei)
-        if not re.match(r'^[\d\.]+,\d{2}$', parts[idx]):
+        if not NUM_PATTERN.match(parts[idx]):
             unklare.append(line); continue
         idx += 1
         if idx >= len(parts): continue
@@ -739,7 +751,7 @@ def _parse_se_lines_deterministic(all_se_text):
         # stfrei optional, stfrei-Ort optional
         sf_val = None
         sf_ort = None
-        if idx<len(parts) and re.match(r'^[\d\.]+,\d{2}$', parts[idx]):
+        if idx<len(parts) and NUM_PATTERN.match(parts[idx]):
             try: sf_val = float(parts[idx].replace('.','').replace(',','.'))
             except: pass
             idx += 1
@@ -1128,6 +1140,8 @@ Dezember: …
 Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
         })
 
+        import time as _time_mod
+        sonnet_start_time = _time_mod.time()
         full_text = ''
         with client.messages.stream(
             model='claude-sonnet-4-6',
@@ -1137,6 +1151,7 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
             for text in stream.text_stream:
                 full_text += text
         full_text = full_text.strip()
+        print(f"Sonnet-Antwort: {len(full_text)} Zeichen, {_time_mod.time()-sonnet_start_time:.1f}s")
 
         # ── JSON robust extrahieren via brace-counter ──
         # Sucht nach ALLEN balanced {...} Blöcken im Text und nimmt den der "fahrtage" enthält.
@@ -1180,7 +1195,8 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
         if nachweis:
             print(f"Nachweis:\n{nachweis[:800]}")
 
-        # ── HYBRID: Deterministisch + Claude + (bei Konflikt) Opus-Verifikation ──
+        # ── HYBRID: Deterministisch + Claude + Opus-Verifikation ──
+        sonnet_elapsed = _time_mod.time() - sonnet_start_time
         flug_clean = flug_det and len(flug_det.get('unklare_tage', [])) == 0
         opus_result = None
         verification_source = 'parser-only'
@@ -1199,8 +1215,17 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
             c_a = int(parsed.get('arbeitstage') or 0)
             c_h = int(parsed.get('hotel_naechte') or 0)
 
-            # Opus läuft IMMER als Senior-Verifikation (max Accuracy, Kosten egal)
-            run_opus = True
+            # Opus läuft als Senior-Verifikation, AUSSER:
+            # - Sonnet hat schon >180s gebraucht (Render-Timeout-Risiko)
+            # - Sonnet+Parser sind sehr nah dran (<2 Tage Diff aller Werte) — keine Verifikation nötig
+            f_diff = abs(p_f - c_f)
+            a_diff = abs(p_a - c_a)
+            h_diff = abs(p_h - c_h)
+            small_diff = f_diff <= 2 and a_diff <= 3 and h_diff <= 2
+            run_opus = not small_diff and sonnet_elapsed < 180
+
+            if not run_opus:
+                print(f"Opus übersprungen — Konsensus zwischen Parser und Sonnet (diff={f_diff}/{a_diff}/{h_diff}) oder Sonnet-Zeit ({sonnet_elapsed:.0f}s) zu lang")
 
             if run_opus:
                 # Opus 4.7 läuft immer für maximale Genauigkeit
@@ -1226,9 +1251,13 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
                 opus_result = _opus_verifizierung(parser_sum, sonnet_sum, full_se_text, flug_gesamt if alle_seiten else '')
 
             if opus_result:
-                fahrtage_final  = int(opus_result.get('fahrtage') or c_f)
-                arbeitstage_fin = int(opus_result.get('arbeitstage') or c_a)
-                hotel_final     = int(opus_result.get('hotel_naechte') or c_h)
+                # Defensive Merging: Opus-Wert nur nehmen wenn er nicht 0 ist UND Claude/Parser haben höhere Werte
+                _o_f = int(opus_result.get('fahrtage') or 0)
+                _o_a = int(opus_result.get('arbeitstage') or 0)
+                _o_h = int(opus_result.get('hotel_naechte') or 0)
+                fahrtage_final  = _o_f if _o_f > 0 else max(p_f, c_f)
+                arbeitstage_fin = _o_a if _o_a > 0 else max(p_a, c_a)
+                hotel_final     = _o_h if _o_h > 0 else max(p_h, c_h)
                 # Opus überschreibt VMA-Werte ggf. auch
                 if opus_result.get('vma_aus'):
                     parsed['vma_aus'] = float(opus_result['vma_aus'])
@@ -1255,10 +1284,11 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
             'km':           int(parsed.get('km', km)),
             'arbeitstage':  arbeitstage_fin,
             'hotel_naechte':hotel_final,
-            'vma_72_tage':  int(parsed.get('vma_72_tage', 0)),
+            # VMA-Werte: Claude ist primary; Parser-Z72 als Fallback wenn Claude 0 hat
+            'vma_72_tage':  int(parsed.get('vma_72_tage') or (flug_det.get('z72_inland_days', 0) if flug_det else 0)),
             'vma_73_tage':  int(parsed.get('vma_73_tage', 0)),
             'vma_74_tage':  int(parsed.get('vma_74_tage', 0)),
-            'vma_72':       float(parsed.get('vma_72', 0)),
+            'vma_72':       float(parsed.get('vma_72') or ((flug_det.get('z72_inland_days', 0) if flug_det else 0) * 14.0)),
             'vma_73':       float(parsed.get('vma_73', 0)),
             'vma_74':       float(parsed.get('vma_74', 0)),
             'vma_aus':      float(parsed.get('vma_aus', 0)),
@@ -1316,18 +1346,36 @@ Kurze Begründung wo Junior 1 vs 2 falsch lagen.
 """
         resp = client.messages.create(
             model='claude-opus-4-7',
-            max_tokens=4000,
+            max_tokens=8000,
             messages=[{'role':'user','content':prompt}]
         )
         full_text = resp.content[0].text.strip()
-        first_line = full_text.split('\n', 1)[0].strip()
-        if first_line.startswith('{') and '"fahrtage"' in first_line:
-            json_str = first_line
-        else:
-            m = re.search(r'\{[^{}]*"fahrtage"[^{}]*\}', full_text, re.DOTALL)
-            json_str = m.group(0) if m else '{}'
-        verifiziert = json.loads(json_str)
-        nachweis = full_text[len(first_line):].strip()
+
+        # Brace-counter JSON-Extraktion (gleiche Logik wie bei Sonnet)
+        json_str = '{}'
+        nachweis = full_text
+        candidates = []
+        depth = 0; start = -1
+        for i, ch in enumerate(full_text):
+            if ch == '{':
+                if depth == 0: start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidates.append((start, i+1, full_text[start:i+1]))
+                    start = -1
+        for cs, ce, cstr in candidates:
+            if '"fahrtage"' in cstr:
+                json_str = cstr
+                nachweis = (full_text[:cs] + full_text[ce:]).strip()
+                break
+
+        try:
+            verifiziert = json.loads(json_str)
+        except Exception as je:
+            print(f"Opus JSON parse failed: {je}; full text: {full_text[:1000]}")
+            return None
         print(f"Opus-Verifikation: fahr={verifiziert.get('fahrtage')} arbeit={verifiziert.get('arbeitstage')} hotel={verifiziert.get('hotel_naechte')} z76={verifiziert.get('vma_aus')}")
         if nachweis:
             print(f"Opus-Begründung:\n{nachweis[:600]}")
@@ -1467,12 +1515,17 @@ Wenn absolut kein Betrag erkennbar: {{"betrag": 0}}"""
         try:
             response = client.messages.create(
                 model='claude-sonnet-4-6',
-                max_tokens=200,
+                max_tokens=400,
                 messages=[{'role': 'user', 'content': content_blocks}]
             )
             raw = response.content[0].text.strip()
             raw = re.sub(r'```json|```', '', raw).strip()
-            parsed = json.loads(raw)
+            # Brace-counter JSON-Extraktion für Robustheit
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                m = re.search(r'\{[^{}]*"betrag"[^{}]*\}', raw, re.DOTALL)
+                parsed = json.loads(m.group(0)) if m else {}
             results.append({
                 'key': key,
                 'icon': info['icon'],
