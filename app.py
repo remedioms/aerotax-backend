@@ -757,14 +757,17 @@ def _parse_se_lines_deterministic(all_se_text):
         has_an = an is not None
 
         if is_inland:
-            # Inland — gesetzlicher Tagessatz (§9 EStG): 14€ Tagestrip/An-Reise, 28€ 24h
-            if has_ab and has_an:
-                z72_count += 1
-                z72_eur += sf_val if sf_val else 14.0
-            elif zwf == 12 and not has_ab and not has_an:
+            # Inland — Hinweis: SE zeigt nur was LH stfrei bezahlt hat. Tax-Law-Pauschalen
+            # (Z72: Inland-Tagestrip >8h, 14€) gehören eher aus Flugstunden — LH zahlt nicht
+            # immer aus für Inland-Tagestrips. Wir zählen hier NUR die SE-bezahlten Tage:
+            if zwf == 12 and not has_ab and not has_an:
+                # 24h-Inland-Tag, vom LH stfrei bezahlt
                 z74_count += 1
                 z74_eur += sf_val if sf_val else 28.0
             else:
+                # Alle anderen Inland-stfrei-Tage zählen wir als An-/Abreise (Z73)
+                # — das passt zur LH-Praxis: 14€/Tag für An- oder Abreise mit Übernachtung.
+                # Z72 (Tagestrip >8h, oft NICHT von LH bezahlt) wird vom Flugstunden-Parser ermittelt.
                 z73_count += 1
                 z73_eur += sf_val if sf_val else 14.0
         else:
@@ -999,14 +1002,17 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
                 se_unklar = len(se_hints.get('unklare_zeilen', []))
                 mt     = len(se_hints.get('abrechnungen', []))
                 parts_kontext.append(
-                    f'\n[SE-Auswertung]\n'
+                    f'\n[SE-Auswertung — was LH stfrei bezahlt hat]\n'
                     f'- Z77 (steuerfrei gesamt): {z77_t:.2f} €\n'
-                    f'- Z72 (Inland Tagestrip): {z72_t} Tage / {z72_e:.2f} €\n'
-                    f'- Z73 (An-/Abreisetag): {z73_t} Tage / {z73_e:.2f} €\n'
-                    f'- Z74 (Inland 24h): {z74_t} Tage / {z74_e:.2f} €\n'
+                    f'- Z73 (An-/Abreise mit Übernachtung): {z73_t} Tage / {z73_e:.2f} €\n'
+                    f'- Z74 (Inland 24h, selten): {z74_t} Tage / {z74_e:.2f} €\n'
                     f'- Z76 (Ausland-VMA, Σ stfrei-Werte): {z76_e:.2f} €\n'
                     f'- SE-Monate hochgeladen: {mt} von 12\n'
                     f'- Unklare SE-Zeilen: {se_unklar}\n'
+                    f'\nZ72 (Inland-Tagestrip >8h) ist NICHT in dieser SE-Auswertung — '
+                    f'LH zahlt diese oft nicht stfrei aus. Du musst Z72 selbst aus den '
+                    f'Flugstunden zählen: jeden Tag mit A {homebase}→XXX UND E XXX→{homebase} '
+                    f'am gleichen Tag, wo XXX ein deutscher Flughafen ist und Gesamtabwesenheit >8h.\n'
                 )
             if flug_det:
                 parts_kontext.append(
@@ -1125,31 +1131,41 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
         full_text = ''
         with client.messages.stream(
             model='claude-sonnet-4-6',
-            max_tokens=16000,
+            max_tokens=24000,
             messages=[{'role': 'user', 'content': content}]
         ) as stream:
             for text in stream.text_stream:
                 full_text += text
         full_text = full_text.strip()
 
-        # JSON-Zeile finden — Claude soll sie an den Anfang setzen, fallback: irgendwo im Text
+        # ── JSON robust extrahieren via brace-counter ──
+        # Sucht nach ALLEN balanced {...} Blöcken im Text und nimmt den der "fahrtage" enthält.
         nachweis = ''
-        json_str = ''
-        # Versuch 1: Erste Zeile direkt JSON?
-        first_line = full_text.split('\n', 1)[0].strip()
-        if first_line.startswith('{') and '"fahrtage"' in first_line:
-            json_str = first_line
-            nachweis = full_text[len(first_line):].strip()
+        json_str = '{}'
+        candidates = []
+        depth = 0
+        start = -1
+        for i, ch in enumerate(full_text):
+            if ch == '{':
+                if depth == 0: start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidates.append((start, i+1, full_text[start:i+1]))
+                    start = -1
+        # Kandidat mit "fahrtage" hat Vorrang
+        for cs, ce, cstr in candidates:
+            if '"fahrtage"' in cstr:
+                json_str = cstr
+                nachweis = (full_text[:cs] + full_text[ce:]).strip()
+                break
         else:
-            # Versuch 2: Flache JSON mit fahrtage finden (no nested braces)
-            m = re.search(r'\{[^{}]*"fahrtage"[^{}]*\}', full_text, re.DOTALL)
-            if m:
-                json_str = m.group(0)
-                nachweis = (full_text[:m.start()] + full_text[m.end():]).strip()
-            else:
-                # Versuch 3: Greedy
-                ms = re.search(r'\{[\s\S]*\}', full_text)
-                json_str = ms.group(0) if ms else '{}'
+            # kein "fahrtage"-JSON — nimm den größten Kandidaten als Best-Effort
+            if candidates:
+                cs, ce, cstr = max(candidates, key=lambda x: len(x[2]))
+                json_str = cstr
+                nachweis = (full_text[:cs] + full_text[ce:]).strip()
 
         try:
             parsed = json.loads(json_str)
