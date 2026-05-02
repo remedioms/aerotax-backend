@@ -31,6 +31,24 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
     HEIF_AVAILABLE = False
+
+# ── SUPABASE CLIENT (für persistente QA + Sessions) ──
+try:
+    from supabase import create_client as _create_sb_client
+    SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
+    SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
+    if SUPABASE_URL and SUPABASE_KEY:
+        sb = _create_sb_client(SUPABASE_URL, SUPABASE_KEY)
+        SB_AVAILABLE = True
+        print(f"[supabase] connected to {SUPABASE_URL}")
+    else:
+        sb = None
+        SB_AVAILABLE = False
+        print("[supabase] not configured (env vars missing) — fallback to file-based")
+except Exception as e:
+    sb = None
+    SB_AVAILABLE = False
+    print(f"[supabase] init failed: {e} — fallback to file-based")
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib.colors import HexColor, white
@@ -668,8 +686,23 @@ def _make_session_token(job_id):
 
 
 def _save_session(token, data):
-    """Speichert Session-Daten (NUR result-Numbers + Chat-Verlauf, KEINE Originaldokumente)."""
+    """Speichert Session-Daten in Supabase (persistent) ODER Disk-Fallback."""
     expires = datetime.utcnow() + timedelta(hours=SESSION_HOURS)
+    if SB_AVAILABLE:
+        try:
+            sb.table('sessions').upsert({
+                'token':         token,
+                'job_id':        data.get('job_id'),
+                'result_data':   data.get('result_data'),
+                'notes':         data.get('notes', []),
+                'download_url':  data.get('download_url'),
+                'chat_history':  data.get('chat_history', []),
+                'expires_at':    expires.isoformat(),
+            }).execute()
+            return
+        except Exception as e:
+            print(f"[supabase] session save fail: {e} — fallback to disk")
+    # Disk-Fallback
     payload = {**data, 'token': token, 'created': datetime.utcnow().isoformat() + 'Z',
                'expires': expires.isoformat() + 'Z'}
     try:
@@ -725,16 +758,39 @@ __import__('threading').Thread(target=_cleanup_loop, daemon=True).start()
 
 def _load_session(token):
     if not token: return None
+    if SB_AVAILABLE:
+        try:
+            r = sb.table('sessions').select('*').eq('token', token).limit(1).execute()
+            if r.data:
+                row = r.data[0]
+                # Expiry-Check
+                try:
+                    exp_str = (row.get('expires_at') or '').replace('Z', '').split('+')[0]
+                    if datetime.fromisoformat(exp_str) < datetime.utcnow():
+                        return None
+                except: pass
+                # Frontend-kompatible Form zurückgeben
+                return {
+                    'token': row.get('token'),
+                    'job_id': row.get('job_id'),
+                    'result_data': row.get('result_data') or {},
+                    'notes': row.get('notes') or [],
+                    'download_url': row.get('download_url'),
+                    'chat_history': row.get('chat_history') or [],
+                    'expires': row.get('expires_at'),
+                }
+        except Exception as e:
+            print(f"[supabase] session load fail: {e} — fallback to disk")
+    # Disk-Fallback
     path = os.path.join(_SESSION_DIR, f'{token}.json')
     if not os.path.exists(path): return None
     try:
         with open(path) as f:
             data = json.load(f)
-        # Expiry-Check
         try:
             exp = datetime.fromisoformat(data['expires'].replace('Z', ''))
             if exp < datetime.utcnow():
-                return None  # abgelaufen
+                return None
         except: pass
         return data
     except: return None
@@ -876,14 +932,21 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
 @app.route('/api/session/<token>/delete', methods=['POST'])
 def session_delete(token):
     """User kann seine Daten manuell sofort löschen — Datenschutz auf Anforderung."""
+    deleted = False
+    if SB_AVAILABLE:
+        try:
+            sb.table('sessions').delete().eq('token', token).execute()
+            deleted = True
+        except Exception as e:
+            print(f"[supabase] session delete fail: {e}")
+    # Auch Disk-Fallback löschen
     path = os.path.join(_SESSION_DIR, f'{token}.json')
     if os.path.exists(path):
         try:
             os.remove(path)
-            return jsonify({'ok': True, 'deleted': True})
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    return jsonify({'ok': True, 'deleted': False, 'note': 'Token war nicht mehr da'}), 200
+            deleted = True
+        except: pass
+    return jsonify({'ok': True, 'deleted': deleted}), 200
 
 
 @app.route('/api/chat/history', methods=['POST'])
@@ -912,14 +975,44 @@ _QA_UPVOTE_DECAY_DAYS = 30  # Likes nur 30 Tage wert für Ranking, danach nur hi
 
 
 def _qa_seed_if_empty():
-    """Bei erstem Aufruf / leerer Datei: lade Seed-Fragen mit realistischen Timestamps + Votes."""
+    """Bei leerer DB: Seed-Fragen einfügen (nur wenn Supabase leer ist)."""
+    if not os.path.exists(_QA_SEED_FILE): return
+
+    if SB_AVAILABLE:
+        try:
+            r = sb.table('questions').select('id').limit(1).execute()
+            if r.data and len(r.data) > 0:
+                return  # Schon gefüllt
+            # DB leer → Seeds einfügen
+            with open(_QA_SEED_FILE) as f:
+                seeds = json.load(f)
+            import random as _r
+            now = datetime.utcnow()
+            for i, s in enumerate(seeds):
+                days_ago = _r.randint(1, 30)
+                created = now - timedelta(days=days_ago, hours=_r.randint(0, 23), minutes=_r.randint(0, 59))
+                answered = created + timedelta(seconds=_r.randint(20, 90))
+                sb.table('questions').insert({
+                    'codename': s.get('codename', 'Anonym'),
+                    'title': s.get('title', ''),
+                    'body': s.get('body', ''),
+                    'tags': s.get('tags', []),
+                    'aerotax_answer': s.get('aerotax_answer'),
+                    'aerotax_answered_at': answered.isoformat() if s.get('aerotax_answer') else None,
+                    'created_at': created.isoformat(),
+                }).execute()
+            print(f"[qa] Supabase seed loaded: {len(seeds)} questions")
+            return
+        except Exception as e:
+            print(f"[qa] Supabase seed failed: {e} — fallback to file")
+
+    # Disk-Fallback
     if os.path.exists(_QA_FILE):
         try:
             with open(_QA_FILE) as f:
                 data = json.load(f)
             if isinstance(data, list) and len(data) > 0: return
         except: pass
-    if not os.path.exists(_QA_SEED_FILE): return
     try:
         with open(_QA_SEED_FILE) as f:
             seeds = json.load(f)
@@ -927,12 +1020,9 @@ def _qa_seed_if_empty():
         now = datetime.utcnow()
         out = []
         for i, s in enumerate(seeds):
-            # Seed-Fragen werden mit ehrlichen 0 Upvotes gestartet — echte Votes kommen von echten Usern.
-            # Spread Erstellungs-Datum über 30 Tage damit die Liste nicht alle gleichzeitig "neu" wirkt.
             days_ago = _r.randint(1, 30)
             created = now - timedelta(days=days_ago, hours=_r.randint(0, 23), minutes=_r.randint(0, 59))
             answered = created + timedelta(seconds=_r.randint(20, 90))
-            upvote_log = []  # Echte Upvotes werden hier akkumuliert
             q = {
                 'id': str(uuid.uuid4()),
                 'codename': s.get('codename', 'Anonym'),
@@ -940,7 +1030,7 @@ def _qa_seed_if_empty():
                 'body': s.get('body', ''),
                 'tags': s.get('tags', []),
                 'created': created.isoformat() + 'Z',
-                'upvotes_log': upvote_log,
+                'upvotes_log': [],
                 'answers': [],
                 'aerotax_answer': s.get('aerotax_answer'),
                 'aerotax_answered_at': answered.isoformat() + 'Z' if s.get('aerotax_answer') else None,
@@ -948,7 +1038,7 @@ def _qa_seed_if_empty():
             out.append(q)
         with open(_QA_FILE, 'w') as f:
             json.dump(out, f, ensure_ascii=False, indent=1)
-        print(f"[qa] Seed loaded: {len(out)} questions")
+        print(f"[qa] Disk-Fallback seed loaded: {len(out)} questions")
     except Exception as e:
         print(f"[qa] Seed failed: {e}")
 
@@ -1055,9 +1145,19 @@ Antworte direkt mit dem Antworttext (kein Header, kein "Hallo X")."""
 
 
 def _qa_async_aerotax(qid, title, body):
-    """Background-Thread: AeroTAX antwortet, schreibt in question."""
+    """Background-Thread: AeroTAX antwortet, schreibt zurück."""
     answer = _qa_aerotax_answer(title, body)
     if not answer: return
+    if SB_AVAILABLE:
+        try:
+            sb.table('questions').update({
+                'aerotax_answer': answer,
+                'aerotax_answered_at': datetime.utcnow().isoformat(),
+            }).eq('id', qid).execute()
+            return
+        except Exception as e:
+            print(f"[supabase] aerotax-answer save fail: {e}")
+    # Disk-Fallback
     with _qa_lock:
         questions = _qa_load()
         for q in questions:
@@ -1068,21 +1168,79 @@ def _qa_async_aerotax(qid, title, body):
                 break
 
 
+def _qa_load_from_sb():
+    """Lädt alle Fragen + Antworten + Upvotes aus Supabase, vereint sie zur Frontend-Form."""
+    try:
+        # Fragen
+        qr = sb.table('questions').select('*').order('created_at', desc=True).limit(200).execute()
+        questions = qr.data or []
+        if not questions: return []
+        qids = [q['id'] for q in questions]
+        # Antworten
+        ar = sb.table('answers').select('*').in_('question_id', qids).execute()
+        answers_by_qid = {}
+        for a in (ar.data or []):
+            answers_by_qid.setdefault(a['question_id'], []).append(a)
+        # Upvotes (alle, last 60 Tage als Cap für Performance)
+        cutoff = (datetime.utcnow() - timedelta(days=60)).isoformat()
+        ur = sb.table('upvotes').select('*').gte('created_at', cutoff).execute()
+        upvotes_by_target = {}
+        for v in (ur.data or []):
+            key = (v['target_type'], v['target_id'])
+            upvotes_by_target.setdefault(key, []).append({'ts': v['created_at'], 'h': v['ip_hash']})
+
+        # Frontend-kompatible Form bauen
+        out = []
+        for q in questions:
+            qkey = ('question', q['id'])
+            q_upvotes = upvotes_by_target.get(qkey, [])
+            ans_list = []
+            for a in sorted(answers_by_qid.get(q['id'], []), key=lambda x: x['created_at']):
+                akey = ('answer', a['id'])
+                a_upvotes = upvotes_by_target.get(akey, [])
+                ans_list.append({
+                    'id': a['id'],
+                    'codename': a['codename'],
+                    'body': a['body'],
+                    'reply_to': a.get('reply_to'),
+                    'created': a['created_at'],
+                    'upvotes_log': a_upvotes,
+                })
+            out.append({
+                'id': q['id'],
+                'codename': q['codename'],
+                'title': q['title'],
+                'body': q['body'],
+                'tags': q.get('tags') or [],
+                'created': q['created_at'],
+                'upvotes_log': q_upvotes,
+                'answers': ans_list,
+                'aerotax_answer': q.get('aerotax_answer'),
+                'aerotax_answered_at': q.get('aerotax_answered_at'),
+            })
+        return out
+    except Exception as e:
+        print(f"[supabase] qa load fail: {e}")
+        return None
+
+
 @app.route('/api/qa', methods=['GET'])
 def qa_list():
-    """Liste aller Fragen. Query params:
-    - sort: hot (default, decay-weighted), top (all-time), new
-    - q: Search keyword im title/body
-    - tag: Filter nach Tag
-    - limit: max Anzahl (default 50)
-    """
+    """Liste aller Fragen. Query params: sort (hot/top/new), q, tag, limit."""
     sort_mode = request.args.get('sort', 'hot').lower()
     keyword = (request.args.get('q', '') or '').strip().lower()
     tag = (request.args.get('tag', '') or '').strip().lower()
     limit = min(int(request.args.get('limit', 50)), 100)
 
-    with _qa_lock:
-        questions = _qa_load()
+    if SB_AVAILABLE:
+        # Sicherstellen dass Seeds drin sind (nur einmalig)
+        _qa_seed_if_empty()
+        questions = _qa_load_from_sb()
+        if questions is None:
+            questions = []
+    else:
+        with _qa_lock:
+            questions = _qa_load()
 
     # Effective upvotes pro Frage berechnen + Frontend-Felder anreichern
     enriched = []
@@ -1156,27 +1314,36 @@ def qa_ask():
     tags = [str(t).strip()[:20] for t in tags[:5] if t]
 
     qid = str(uuid.uuid4())
-    question = {
-        'id': qid,
-        'codename': codename,
-        'title': title,
-        'body': text,
-        'tags': tags,
-        'created': datetime.utcnow().isoformat() + 'Z',
-        'upvotes_log': [],
-        'answers': [],
-        'aerotax_answer': None,
-        'aerotax_answered_at': None,
-    }
-    with _qa_lock:
-        questions = _qa_load()
-        questions.append(question)
-        _qa_save(questions)
+    created_at_iso = datetime.utcnow().isoformat()
+
+    if SB_AVAILABLE:
+        try:
+            sb.table('questions').insert({
+                'id': qid,
+                'codename': codename,
+                'title': title,
+                'body': text,
+                'tags': tags,
+                'created_at': created_at_iso,
+            }).execute()
+        except Exception as e:
+            print(f"[supabase] qa_ask fail: {e}")
+            return jsonify({'error': 'Speichern fehlgeschlagen — bitte später nochmal'}), 500
+    else:
+        question_obj = {
+            'id': qid, 'codename': codename, 'title': title, 'body': text, 'tags': tags,
+            'created': created_at_iso + 'Z', 'upvotes_log': [], 'answers': [],
+            'aerotax_answer': None, 'aerotax_answered_at': None,
+        }
+        with _qa_lock:
+            questions = _qa_load()
+            questions.append(question_obj)
+            _qa_save(questions)
 
     # AeroTAX antwortet im Hintergrund
     _qa_thread.Thread(target=_qa_async_aerotax, args=(qid, title, text), daemon=True).start()
 
-    return jsonify({'ok': True, 'question': question})
+    return jsonify({'ok': True, 'question': {'id': qid, 'codename': codename, 'title': title, 'body': text, 'tags': tags, 'created': created_at_iso}})
 
 
 @app.route('/api/qa/<qid>/answer', methods=['POST'])
@@ -1191,14 +1358,34 @@ def qa_answer(qid):
         return jsonify({'error': 'Antwort min. 10 Zeichen'}), 400
     codename = (body.get('codename') or '').strip()[:30] or _qa_random_codename()
 
+    aid = str(uuid.uuid4())
+    created_iso = datetime.utcnow().isoformat()
     answer = {
-        'id': str(uuid.uuid4()),
-        'codename': codename,
-        'body': text,
-        'created': datetime.utcnow().isoformat() + 'Z',
-        'upvotes_log': [],
-        'reply_to': body.get('reply_to'),  # für threaded replies
+        'id': aid, 'codename': codename, 'body': text,
+        'created': created_iso, 'upvotes_log': [],
+        'reply_to': body.get('reply_to'),
     }
+
+    if SB_AVAILABLE:
+        try:
+            # Erst prüfen ob Frage existiert
+            qcheck = sb.table('questions').select('id').eq('id', qid).limit(1).execute()
+            if not qcheck.data:
+                return jsonify({'error': 'Frage nicht gefunden'}), 404
+            sb.table('answers').insert({
+                'id': aid,
+                'question_id': qid,
+                'codename': codename,
+                'body': text,
+                'reply_to': body.get('reply_to'),
+                'created_at': created_iso,
+            }).execute()
+            return jsonify({'ok': True, 'answer': answer})
+        except Exception as e:
+            print(f"[supabase] qa_answer fail: {e}")
+            return jsonify({'error': 'Speichern fehlgeschlagen'}), 500
+
+    # Disk-Fallback
     with _qa_lock:
         questions = _qa_load()
         for q in questions:
@@ -1218,6 +1405,38 @@ def qa_upvote(qid):
     body = request.get_json(silent=True) or {}
     answer_id = body.get('answer_id')
     ip_hash = _hashlib.sha256((ip + os.environ.get('RECOVERY_SECRET','')).encode()).hexdigest()[:8]
+    target_type = 'answer' if answer_id else 'question'
+    target_id = answer_id if answer_id else qid
+
+    if SB_AVAILABLE:
+        try:
+            # Dedupe: 24h-Window
+            cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+            check = sb.table('upvotes').select('id').eq('target_type', target_type).eq('target_id', target_id).eq('ip_hash', ip_hash).gte('created_at', cutoff).limit(1).execute()
+            if check.data:
+                return jsonify({'error': 'Du hast bereits gevotet — versuch es morgen wieder'}), 429
+            sb.table('upvotes').insert({
+                'target_type': target_type,
+                'target_id': target_id,
+                'ip_hash': ip_hash,
+            }).execute()
+            # Counts zurückgeben
+            cutoff_30d = (datetime.utcnow() - timedelta(days=30)).isoformat()
+            r30 = sb.table('upvotes').select('id', count='exact').eq('target_type', target_type).eq('target_id', target_id).gte('created_at', cutoff_30d).execute()
+            rtotal = sb.table('upvotes').select('id', count='exact').eq('target_type', target_type).eq('target_id', target_id).execute()
+            return jsonify({
+                'ok': True,
+                'upvotes_30d': r30.count or 0,
+                'upvotes_total': rtotal.count or 0,
+            })
+        except Exception as e:
+            err_str = str(e).lower()
+            if 'unique' in err_str or 'duplicate' in err_str:
+                return jsonify({'error': 'Bereits gevotet'}), 429
+            print(f"[supabase] upvote fail: {e}")
+            return jsonify({'error': 'Speichern fehlgeschlagen'}), 500
+
+    # Disk-Fallback
     vote = {'ts': datetime.utcnow().isoformat() + 'Z', 'h': ip_hash}
     with _qa_lock:
         questions = _qa_load()
@@ -1232,7 +1451,6 @@ def qa_upvote(qid):
                     target = q
                 if not target:
                     return jsonify({'error': 'Antwort nicht gefunden'}), 404
-                # IP-basierte Dedupe: gleicher Hash darf nicht doppelt voten innerhalb 24h
                 target.setdefault('upvotes_log', [])
                 cutoff = datetime.utcnow() - timedelta(hours=24)
                 already_voted = any(
@@ -1240,7 +1458,7 @@ def qa_upvote(qid):
                     for v in target['upvotes_log']
                 )
                 if already_voted:
-                    return jsonify({'error': 'Du hast bereits gevotet — versuch es morgen wieder'}), 429
+                    return jsonify({'error': 'Du hast bereits gevotet'}), 429
                 target['upvotes_log'].append(vote)
                 _qa_save(questions)
                 return jsonify({
