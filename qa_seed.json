@@ -1,23 +1,23 @@
 [
   {
-    "codename": "FrankfurterFlieger",
-    "title": "Mehretappen-Tour ohne Heimkehr — 1 Fahrtag oder mehrere?",
-    "body": "Hatte letzte Woche eine Tour FRA→GVA→OTP→FRA ohne in Frankfurt zu zwischenzulanden. Trag ich das jetzt als 1 Fahrtag oder als 3 (pro Strecke einer)? Kollege meint 3, ich meine 1.",
-    "aerotax_answer": "Ein Fahrtag — du liegst richtig.\n\nDie Pendler/Fahrtag-Logik knüpft an das \"Reporting at Home Base\" an: einmal hin zur FRA, einmal zurück = 1 Fahrtag, egal was zwischendrin passiert. FRA→GVA→OTP→FRA ist EINE Tour mit Strecken-Wechsel auf Tour. Strecken-Wechsel sind keine separaten Fahrtage.\n\nAnders wäre's nur wenn du zwischendrin in FRA gelandet wärst (z.B. FRA→GVA→FRA→OTP→FRA). Dann zwei separate Touren = 2 Fahrtage.\n\n⚠ Rechtshinweis: Diese Information dient zur Orientierung. AeroTAX ist kein Steuerberater nach §3 StBerG. Bei komplexen Einzelfällen ziehe einen Steuerberater oder Lohnsteuerhilfeverein zu Rate.",
-    "tags": ["fahrtag", "mehretappen", "tour"]
+    "codename": "MaxausFRA",
+    "title": "fra gva otp fra wieviel fahrtage",
+    "body": "moin. hatte letzte woche fra gva otp fra ohne zwischenzulanden in fra. wieviel fahrtage trag ich da ein? mein kollege sagt 3, ich dachte 1. wer hat recht?",
+    "aerotax_answer": "1 Fahrtag stimmt. Du fährst einmal hin (zu FRA für den Tour-Start) und einmal zurück nach Hause am Ende. Was zwischen drin passiert sind Strecken-Wechsel auf Tour, das zählt nicht extra.\n\nWäre nur anders wenn du irgendwann zwischendurch wirklich in FRA gelandet wärst. Aber wenn du durchläufst FRA→GVA→OTP→FRA = 1 Tour = 1 Fahrtag.\n\nDein Kollege liegt falsch. Vermutlich zählt er pro Strecke statt pro Tour, klassischer Fehler.\n\n⚠ Hinweis: Orientierungshilfe, kein Ersatz für Steuerberater (§3 StBerG).",
+    "tags": ["fahrtag", "tour"]
   },
   {
-    "codename": "LangstreckenLisa",
-    "title": "Crew Rest auf 12h-Flug = Hotelnacht steuerlich?",
-    "body": "Habe in der Crew-Bunk auf SIN-FRA 4h geschlafen. Zähl ich das jetzt als Hotelübernachtung mit 3,60€ Trinkgeld-Pauschale?",
-    "aerotax_answer": "Nein. Crew Rest Compartment im Flieger ist steuerlich keine Hotelübernachtung — auch wenn du dort gut geschlafen hast.\n\nDie 3,60€-Trinkgeldpauschale soll abgelten was du dem Concierge oder dem Hotel-Personal gibst. Auf SIN-FRA gibst du der Crew aber kein Trinkgeld. Daher kein Anspruch.\n\nEASA selbst trennt das klar: ORO.FTL.235 (EU 965/2012) unterscheidet \"Layover\" (ortsfeste Ruhe ≥10h Bodenzeit, also Hotel) von \"In-Flight Rest\" (Crew Rest in der Luft). Nur Layover triggert die Hotelnacht steuerlich.\n\nWas du KRIEGST: Z76 für deine Tage in Singapur am Boden + Hotel-Trinkgeld 3,60€ pro SIN-Übernachtung. Aber nicht für die Heimflug-Nacht.\n\n⚠ Rechtshinweis: Diese Information dient zur Orientierung. AeroTAX ist kein Steuerberater nach §3 StBerG. Bei komplexen Einzelfällen ziehe einen Steuerberater oder Lohnsteuerhilfeverein zu Rate.",
-    "tags": ["hotel", "crew-rest", "easa-ftl"]
+    "codename": "AnnaCabin",
+    "title": "crew rest auf langstrecke = hotelnacht?",
+    "body": "habe gestern auf SIN FRA 4h in der bunk gepennt. kann ich für die nacht jetzt die 3,60 hotel pauschale ansetzen oder nicht?",
+    "aerotax_answer": "Leider nein. Crew Rest Compartment im Flieger ist keine Hotelübernachtung steuerlich, auch wenn du da gut geschlafen hast.\n\nDie 3,60 Trinkgeld-Pauschale ist dafür gedacht dass du dem Hotel-Personal Trinkgeld gibst (Concierge, Zimmer-Service). Im Flieger gibt's das halt nicht.\n\nEASA selbst trennt das: nur Layover am Boden (mind. 10h Bodenzeit) zählt als richtige Hotelnacht. In-Flight Rest nicht.\n\nWas du aber kriegst: Z76 für deine Tage in Singapur am Boden plus 3,60 für jede SIN Hotelnacht. Nur die Heimflug Nacht zählt nicht.\n\n⚠ Hinweis: Orientierungshilfe, kein Ersatz für Steuerberater (§3 StBerG).",
+    "tags": ["hotel", "crew-rest"]
   },
   {
-    "codename": "AnnaAusMUC",
-    "title": "Telefon-Pauschale — 20% reicht oder mehr drin?",
-    "body": "Lese überall die 20% Telefon-Pauschale für Flugpersonal. Ist das wirklich das Maximum oder geht auch mehr wenn man oft Auslandsroaming für Standby-Erreichbarkeit hat?",
-    "aerotax_answer": "20% ist die Pauschale OHNE Nachweis (R 9.1 LStR analog). Mehr ist möglich — aber dann mit Nachweis.\n\nFür höheren Anteil brauchst du:\n• Repräsentative 3-Monats-Aufstellung mit Markierung dienstlich/privat pro Anruf/Datenmenge\n• Bei Standby/Crew-Erreichbarkeit ist 30-40% glaubhaft argumentierbar\n• Bei intensivem Auslands-Roaming: bis 50% möglich\n\nKonkret: Bei 600€/Jahr Telefon und 30% statt 20% bekommst du 60€ mehr × Grenzsteuersatz 35% = ~21€ Ersparnis. Dafür 3 Monate Telefon-Buchführung führen?\n\nMein praktischer Rat: 20%-Pauschale geht ohne Diskussion durch. Höher nur wenn du eh akribisch dokumentierst.\n\nEintragen: Werbungskosten → Arbeitsmittel → Telefon & Internet.\n\n⚠ Rechtshinweis: Diese Information dient zur Orientierung. AeroTAX ist kein Steuerberater nach §3 StBerG. Bei komplexen Einzelfällen ziehe einen Steuerberater oder Lohnsteuerhilfeverein zu Rate.",
-    "tags": ["telefon", "pauschale", "internet"]
+    "codename": "PilotPeter",
+    "title": "telefon 20% pauschale wirklich max?",
+    "body": "lese überall diese 20% telefon pauschale. ist das wirklich das limit oder kann man auch mehr ansetzen wenn man viel auslandsroaming für sby hat?",
+    "aerotax_answer": "20% sind die Pauschale ohne Nachweis. Mehr geht aber definitiv, brauchst halt Beleg.\n\nFür höher musst du eine 3-Monats-Aufstellung machen wo du dienstlich vs privat markierst. Mit Standby + Auslandsroaming sind 30 bis 40% gut argumentierbar.\n\nIst aber Aufwand. Bei 600€ Telefon im Jahr: 20% = 120€, 30% = 180€. Differenz × Steuersatz 35% sind so 21€ mehr. Dafür 3 Monate Buchhaltung führen lohnt sich oft nicht.\n\nMein praktischer Rat: bleib bei 20%, geht ohne Diskussion durch. Für mehr nur wenn du eh akribisch bist.\n\n⚠ Hinweis: Orientierungshilfe, kein Ersatz für Steuerberater (§3 StBerG).",
+    "tags": ["telefon", "pauschale"]
   }
 ]
