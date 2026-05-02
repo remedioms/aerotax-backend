@@ -927,17 +927,12 @@ def _qa_seed_if_empty():
         now = datetime.utcnow()
         out = []
         for i, s in enumerate(seeds):
-            # Spread über 60 Tage zurück, aber neuere Fragen häufiger
-            days_ago = _r.randint(1, 60) if i > 5 else _r.randint(0, 14)
+            # Seed-Fragen werden mit ehrlichen 0 Upvotes gestartet — echte Votes kommen von echten Usern.
+            # Spread Erstellungs-Datum über 30 Tage damit die Liste nicht alle gleichzeitig "neu" wirkt.
+            days_ago = _r.randint(1, 30)
             created = now - timedelta(days=days_ago, hours=_r.randint(0, 23), minutes=_r.randint(0, 59))
             answered = created + timedelta(seconds=_r.randint(20, 90))
-            # Upvote-Log: spread votes über die Zeit seit creation
-            n_upvotes = _r.choices([0, 1, 2, 3, 5, 8, 12, 18, 28, 45], weights=[5,8,10,12,15,15,12,10,8,5])[0]
-            upvote_log = []
-            for _ in range(n_upvotes):
-                vote_time = created + timedelta(seconds=_r.randint(60, max(60, int((now - created).total_seconds()))))
-                if vote_time > now: vote_time = now
-                upvote_log.append({'ts': vote_time.isoformat() + 'Z', 'h': str(_r.randint(1000, 9999))})
+            upvote_log = []  # Echte Upvotes werden hier akkumuliert
             q = {
                 'id': str(uuid.uuid4()),
                 'codename': s.get('codename', 'Anonym'),

@@ -1,0 +1,22 @@
+# Runtime data — wird auf Render eh wiped, gehört NICHT ins Repo
+qa_data/
+jobs_state/
+sessions/
+audit_logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local
+.DS_Store
+.env
+.env.local
+venv/
+.venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
