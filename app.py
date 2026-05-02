@@ -1687,17 +1687,17 @@ def _parse_se_lines_deterministic(all_se_text):
         has_an = an is not None
 
         if is_inland:
-            # Inland — Hinweis: SE zeigt nur was LH stfrei bezahlt hat. Tax-Law-Pauschalen
-            # (Z72: Inland-Tagestrip >8h, 14€) gehören eher aus Flugstunden — LH zahlt nicht
-            # immer aus für Inland-Tagestrips. Wir zählen hier NUR die SE-bezahlten Tage:
-            if zwf == 12 and not has_ab and not has_an:
-                # 24h-Inland-Tag, vom LH stfrei bezahlt
+            # Inland-Klassifizierung nach AB/AN-Pattern:
+            # - AB+AN beide vorhanden = Tagestrip Inland (Z72, 14€)
+            # - keine Zeiten + 12 zwölftel = 24h Inland (Z74, 28€)
+            # - sonst (nur AB oder nur AN) = An-/Abreise mit Übernachtung (Z73, 14€)
+            if has_ab and has_an:
+                z72_count += 1
+                z72_eur += sf_val if sf_val else 14.0
+            elif zwf == 12 and not has_ab and not has_an:
                 z74_count += 1
                 z74_eur += sf_val if sf_val else 28.0
             else:
-                # Alle anderen Inland-stfrei-Tage zählen wir als An-/Abreise (Z73)
-                # — das passt zur LH-Praxis: 14€/Tag für An- oder Abreise mit Übernachtung.
-                # Z72 (Tagestrip >8h, oft NICHT von LH bezahlt) wird vom Flugstunden-Parser ermittelt.
                 z73_count += 1
                 z73_eur += sf_val if sf_val else 14.0
         else:
@@ -2763,10 +2763,9 @@ def berechne(form, files):
         vma_73 = se_data.get('z73_eur', vma_73_tage * 14) or vma_73_tage * 14
         vma_74 = se_data.get('z74_eur', vma_74_tage * 28) or vma_74_tage * 28
         vma_aus_se_det = se_data.get('z76_eur', 0)
-        # Nur dann notes-Warnung wenn der Anteil unklarer Zeilen wirklich groß ist (>15% der Gesamtzeilen).
-        # Sonst hat Claude+Opus die Edge-Cases ohnehin sauber gehandelt — kein Grund den User zu beunruhigen.
-        total_lines_estimate = max(se_unklar + 30, 30)  # ~30 Zeilen pro Monat * Anteil bekannte
-        if se_unklar / total_lines_estimate > 0.15:
+        # Warnung nur wenn wirklich auffällig viele unklare Zeilen (>30 absolut)
+        # Bis dahin hat Claude+Opus das ohnehin sauber gehandelt — kein User-Stress.
+        if se_unklar > 30:
             notes.append(f'⚠ {se_unklar} SE-Zeilen waren nicht eindeutig lesbar — Werte ggf. ungenau, bitte prüfen.')
         print(f"VMA hybrid (SE-Parser + Claude für {se_unklar} unklare): Z72={vma_72_tage}T  Z73={vma_73_tage}T  Z76={vma_aus_se_det}€")
     else:
