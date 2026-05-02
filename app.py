@@ -389,26 +389,6 @@ def _load_job_from_disk(job_id):
         return None
 
 
-# ── RECOVERY CODES ─────────────────────────────────────────────
-# Bei einem fehlgeschlagenen Job bekommt der User einen Recovery-Code,
-# der am SELBEN Tag gilt für einen kostenlosen Retry. Nicht weitergebbar
-# weil er nächsten Tag ungültig ist.
-import hashlib as _hashlib
-
-def _make_recovery_code(job_id):
-    """Generiert tagesgültigen Recovery-Code aus job_id + Server-Secret + heutigem Datum."""
-    secret = os.environ.get('RECOVERY_SECRET', 'aerosteuer-recovery-default-2025')
-    today = datetime.utcnow().strftime('%Y%m%d')
-    raw = f"{job_id}:{today}:{secret}"
-    h = _hashlib.sha256(raw.encode()).hexdigest()[:12].upper()
-    # Format: AERO-XXXX-XXXX für Lesbarkeit
-    return f'AERO-{h[:4]}-{h[4:8]}-{h[8:12]}'
-
-
-def _verify_recovery_code(job_id, code):
-    expected = _make_recovery_code(job_id)
-    return code.strip().upper() == expected.upper()
-
 def _audit(job_id, event, data=None):
     """Schreibt Audit-Event in Job-Log + Render-Stdout. Audit-konform für Tax-Compliance."""
     entry = {
@@ -454,13 +434,24 @@ def process_real():
                          'Flugstunden-Übersichten und Streckeneinsatz-Abrechnungen hoch.'
             }), 400
 
-        # ── ASYNC: Job anlegen und im Hintergrund starten ──
+        # ── ASYNC: Job anlegen, Token sofort generieren, im Hintergrund starten ──
         job_id = str(uuid.uuid4())
+        # Token wird SOFORT erstellt (vor der Berechnung) — bleibt 24h gültig auch bei Fehler.
+        # Damit gibt's kein separates Recovery-Code-System mehr.
+        session_token = _make_session_token(job_id)
+        _save_session(session_token, {
+            'job_id': job_id,
+            'result_data': {},  # wird nach erfolgreicher Berechnung gefüllt
+            'notes': [],
+            'download_url': None,
+            'chat_history': [],
+        })
         with _jobs_lock:
             _jobs[job_id] = {
                 'status':   'pending',
                 'progress': 0,
                 'created':  datetime.utcnow().isoformat() + 'Z',
+                'session_token': session_token,
             }
         _audit(job_id, 'job_created', {'year': form['year'], 'base': form['base'], 'files': {k: len(v) for k, v in files.items()}})
 
@@ -470,6 +461,7 @@ def process_real():
         return jsonify({
             'job_id': job_id,
             'status': 'pending',
+            'session_token': session_token,
             'poll_url': f'/api/job/{job_id}',
         })
 
@@ -528,15 +520,17 @@ def _run_process_async(job_id, form, files):
             b_safe = {k: v for k, v in b.items() if k != 'file_bytes_list'}
             opt_belege_safe.append(b_safe)
 
-        # Session-Token für Premium-Features (Chat + Recall) erzeugen
-        session_token = _make_session_token(job_id)
-        _save_session(session_token, {
-            'job_id': job_id,
-            'result_data': safe,
-            'notes': result.get('notes', []),
-            'download_url': f'/api/download/{token}',
-            'chat_history': [],
-        })
+        # Session-Token wurde bereits beim job_created erstellt — jetzt nur Result reinpacken
+        with _jobs_lock:
+            session_token = _jobs[job_id].get('session_token')
+        if session_token:
+            _save_session(session_token, {
+                'job_id': job_id,
+                'result_data': safe,
+                'notes': result.get('notes', []),
+                'download_url': f'/api/download/{token}',
+                'chat_history': [],
+            })
 
         with _jobs_lock:
             _jobs[job_id] = {
@@ -545,7 +539,6 @@ def _run_process_async(job_id, form, files):
                 'progress':     100,
                 'completed':    datetime.utcnow().isoformat() + 'Z',
                 'download_url': f'/api/download/{token}',
-                'session_token': session_token,
                 'data':         safe,
                 'abrechnungen': result.get('abrechnungen', []),
                 'optionale_belege': opt_belege_safe,
@@ -556,17 +549,17 @@ def _run_process_async(job_id, form, files):
         import traceback
         traceback.print_exc()
         _audit(job_id, 'calculation_failed', {'error': str(e)})
-        recovery_code = _make_recovery_code(job_id)
+        # Session-Token bleibt gültig — User kann mit demselben Token einfach erneut auswerten
         with _jobs_lock:
+            session_token = _jobs[job_id].get('session_token', '')
             _jobs[job_id] = {
                 **_jobs[job_id],
                 'status':   'failed',
                 'error':    str(e),
-                'recovery_code': recovery_code,
                 'completed': datetime.utcnow().isoformat() + 'Z',
             }
         _save_job_to_disk(job_id)
-        print(f"[FAIL {job_id[:8]}] Job failed. Recovery-Code: {recovery_code}")
+        print(f"[FAIL {job_id[:8]}] Job failed. Session-Token bleibt gültig: {session_token}")
     finally:
         # Erfolg oder Fehler: persistiere Status nach Disk
         _save_job_to_disk(job_id)
@@ -600,33 +593,31 @@ def get_job_audit(job_id):
 
 @app.route('/api/recover', methods=['POST'])
 def recover_failed_job():
-    """Recovery für fehlgeschlagene Jobs. Body: {job_id, code}.
-    Code ist nur am selben UTC-Tag gültig (verhindert Weitergabe).
-    Bei Erfolg: Reset des Jobs auf 'pending', Auswertung läuft erneut OHNE neue Bezahlung."""
+    """Vereinfacht: Session-Token reicht für Retry. Max 1 kostenloser Retry — danach Support.
+    Body: {token}. Token muss noch gültig sein (24h ab Bezahlung)."""
     body = request.get_json(silent=True) or {}
-    job_id = body.get('job_id', '').strip()
-    code = body.get('code', '').strip()
-    if not job_id or not code:
-        return jsonify({'error': 'job_id und code sind erforderlich'}), 400
-    if not _verify_recovery_code(job_id, code):
-        return jsonify({'error': 'Recovery-Code ungültig oder abgelaufen (nur am Tag des Fehlers gültig)'}), 403
-    with _jobs_lock:
-        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
-        if not j:
-            return jsonify({'error': 'Job nicht gefunden'}), 404
-        if j.get('status') != 'failed':
-            return jsonify({'error': 'Job ist nicht im failed-State'}), 400
-    # Hier bräuchten wir eigentlich die Original-Files. Da wir die nicht persistieren,
-    # geben wir dem User einen Hinweis dass er nochmal hochladen muss — ABER ohne erneut zu bezahlen.
-    # Recovery-Code wird für 30 Min cached → der User kann hochladen ohne neue Bezahlung
-    _recovery_tokens[code] = {
-        'job_id': job_id,
-        'expires': (datetime.utcnow() + timedelta(minutes=30)).isoformat() + 'Z',
+    token = body.get('token', '').strip()
+    if not token:
+        return jsonify({'error': 'token erforderlich'}), 400
+    session = _load_session(token)
+    if not session:
+        return jsonify({'error': 'Token ungültig oder abgelaufen (24h ab Bezahlung)'}), 403
+    retry_count = int(session.get('retry_count') or 0)
+    if retry_count >= 1:
+        return jsonify({
+            'error': 'Du hast bereits einen kostenlosen Retry genutzt. Bitte kontaktiere Support — wir helfen dir persönlich.',
+            'support': True,
+        }), 403
+    session['retry_count'] = retry_count + 1
+    _save_session(token, session)
+    _recovery_tokens[token] = {
+        'token': token,
+        'expires': (datetime.utcnow() + timedelta(minutes=60)).isoformat() + 'Z',
     }
     return jsonify({
         'ok': True,
-        'message': 'Recovery aktiviert. Lade die Dokumente innerhalb 30 Min nochmal hoch — kostenlos.',
-        'free_retry_token': code,
+        'message': 'Du kannst innerhalb der nächsten 60 Min die Dokumente erneut hochladen — ohne erneute Bezahlung. Bei einem weiteren Fehler wende dich bitte an den Support.',
+        'free_retry_token': token,
     })
 
 
