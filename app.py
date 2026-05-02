@@ -781,8 +781,12 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
 - Bei On-Topic: konkret bezogen auf SEINE Werte aus der Liste oben
 - Bei Off-Topic: 1-Satz-Ablehnung mit Verweis auf Forum
 - Nutze §9 EStG / EASA-FTL nur wenn nötig zur Begründung
-- KEINE Disclaimer-Wiederholungen, KEINE Floskeln
-- Wenn Frage zu WISO-Eingabe: konkrete Zeilen-Nummer + Pfad nennen"""
+- Wenn Frage zu WISO-Eingabe: konkrete Zeilen-Nummer + Pfad nennen
+- Bei Off-Topic-Verweisen brauchst du KEINEN Disclaimer
+- Bei On-Topic Antworten: schließe mit dem Pflicht-Disclaimer (siehe unten)
+
+═══ PFLICHT-DISCLAIMER bei steuerlichen Antworten (am Ende, neue Zeile) ═══
+⚠ Hinweis: Orientierungshilfe — kein Ersatz für persönlichen Steuerberater (§3 StBerG)."""
 
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
@@ -965,12 +969,14 @@ Frage: {question_body}
 ═══ ANTWORT-RICHTLINIEN ═══
 - 3-6 Absätze, klar strukturiert
 - Konkrete Werte/Pauschalen nennen wenn relevant (mit Jahr-Hinweis)
-- KEINE individuelle Steuerberatung — disclaimer am Ende
 - Keine "Hier ist die Antwort"-Floskeln, direkt einsteigen
 - Wenn Frage außerhalb Steuerrecht: höflich auf Steuer-Fokus hinweisen
 - Tonalität: kollegial, hilfreich, fachlich. Nicht von oben herab.
 - Wenn unklar oder mehrdeutig: explizit darauf hinweisen
 - Quellen verweisen wenn möglich (§ EStG-Paragraph, BMF-Schreiben Datum)
+
+═══ PFLICHT-ABSCHLUSS (immer am Ende der Antwort wörtlich anhängen, mit Leerzeile davor) ═══
+⚠ Rechtshinweis: Diese Information dient zur Orientierung. AeroTAX ist kein Steuerberater nach §3 StBerG. Bei komplexen Einzelfällen ziehe einen Steuerberater oder Lohnsteuerhilfeverein zu Rate.
 
 Antworte direkt mit dem Antworttext (kein Header, kein "Hallo X")."""
         resp = _claude_with_retry(client, 'claude-sonnet-4-6', 1200, prompt,
