@@ -2033,92 +2033,279 @@ def _extract_homebase(base_str):
 
 
 def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
-    """Liest Flugstunden Tag für Tag, klassifiziert Marker, trackt Tour-State.
-    homebase: IATA-Code des Heimatflughafens (FRA, MUC, HAM, DUS, BER, ...)
-    Liefert (fahrtage, arbeitstage, hotel_naechte, z72_inland_days, frei_tage, unklare_tage).
+    """Liest LH Flugstunden-Übersicht LITERAL (kein Schätzen, kein Kalibrieren).
+
+    Logik:
+    1. Alle Zeilen nach Datum gruppieren (mehrere Zeilen pro Tag möglich, z.B. Same-Day-Tour)
+    2. Pro Tag aktivität bestimmen:
+       - FREI/URLAUB/KRANK/OF/LM → Frei-Tag
+       - LH<num> A FRA → DEST = Tour-Start
+       - LH<num> E ORIG → FRA = Tour-Ende
+       - FL STRECKENEINSATZTAG = Layover-Tag (Hotelnacht)
+       - SBY/RES/STANDBY/ONLINE/E-LEARNING = Home-Duty (Arbeitstag, kein Fahrtag)
+    3. Counts:
+       - fahrtag = jeder Tag mit "A FRA →" Pattern (= Tour-Beginn von Homebase)
+       - arbeitstag = Tour-Tage (A, FL, E) + Home-Duty + Office-Duty
+       - hotelnacht = jeder FL STRECKENEINSATZTAG
+       - Same-day (A FRA + E FRA gleicher Tag) = 1 Fahrtag, 1 Arbeitstag, 0 Hotel
     """
     INLAND_IATA = {'FRA','MUC','HAM','DUS','BER','STR','CGN','NUE','LEJ',
                    'HAJ','HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN',
-                   'XFW','RLG','SXF','TXF','MHG','FKB','SCN'}
-    fahrtage = arbeitstage = hotel_naechte = frei_tage = 0
-    z72_inland_days = 0  # Inland-Tagestrips (1-day round-trip mit Auslandsabwesenheit >8h)
-    unklare = []
-    in_tour = False  # ob auf Tour (außerhalb FRA)
+                   'XFW','RLG','SXF','TXF','MHG','FKB'}
 
-    # Extrem konservative Frei-Indikatoren — alles was nach "Frei/Urlaub/Krank/Lohnpost" aussieht
-    FREI_PATTERNS = re.compile(
-        r'(/-\s*FREIER\s*TAG|^/-\s|^U\b|^K\b|URLAUB|KRANK|FREIER TAG'
-        r'|UNBEZAHLTE FREISTELLUNG|KEIN DIENST'
-        r'|NACHGEWAEHRUNG|^LM\b|MUTTERSCHUTZ|ELTERNZEIT)',
-        re.I)
-    # Standby/Reserve zuhause — Arbeitstag aber kein Fahrtag
-    HOME_DUTY = re.compile(r'\b(SBY|RES|RESERVE|STANDBY|ONLINE|E-LEARNING|ELEARNING|HOME)\b', re.I)
-    # Vor-Ort-Dienst — Arbeitstag UND Fahrtag wenn nicht in Tour
-    OFFICE_DUTY = re.compile(r'\b(EM|EK|D4|EH|BRIEFING|SCHULUNG|SM|MEDICAL|SPRACHTEST)\b')
-
+    # 1. Alle Zeilen mit Datum sammeln, gruppieren nach Datum
+    days = {}  # 'DD.MM' → list of rest-strings (mehrere Einträge pro Tag möglich)
     for raw in flug_text.split('\n'):
         line = raw.strip()
-        m_dat = re.match(r'^(\d{2})\.(\d{2})\.\s+(.+)$', line)
-        if not m_dat: continue
-        rest = m_dat.group(3)
+        m = re.match(r'^(\d{2})\.(\d{2})\.\s+(.+)$', line)
+        if not m: continue
+        # Storno-Zeilen mit Trailing-X überspringen
+        if re.search(r'\s+X\s*$', line):
+            continue
+        date_key = f"{m.group(1)}.{m.group(2)}"
+        days.setdefault(date_key, []).append(m.group(3))
 
-        # 1. Frei-Tag (höchste Priorität — überschreibt alles)
-        if FREI_PATTERNS.search(rest):
+    # Pattern für jeden Aktivitätstyp (aplica auf ein "rest"-string)
+    is_frei = lambda r: bool(re.search(
+        r'(FREIER\s*TAG|FREI\b|URLAUB|KRANK|ARBEITSUNFAEHIG|UNBEZAHLT|MUTTERSCHUTZ'
+        r'|ELTERNZEIT|^OF\s|^/-\s|^FR\s|^U\s|^K\s|NACHGEWAEHRUNG|KEIN\s+DIENST)', r, re.I))
+    is_home_duty = lambda r: bool(re.search(
+        r'\b(SBY|RES|RESERVE|STANDBY|ONLINE|E-LEARNING|ELEARNING|HOME)\b', r, re.I))
+    is_office_duty = lambda r: bool(re.search(
+        r'\b(EM|EK|D4|EH|BRIEFING|SCHULUNG|SM|MEDICAL|SPRACHTEST)\b', r))
+    is_layover = lambda r: bool(re.search(
+        r'\bFL\b.*STRECKENEINSATZTAG|\bFL\b\s+STRECKEN', r, re.I)) or r.startswith('FL ')
+    re_a_homebase = re.compile(rf'LH\d+\s+A\s+{homebase}\b.*?\b([A-Z]{{3}})\b')
+    re_e_to_homebase = re.compile(rf'LH\d+\s+E\s+([A-Z]{{3}})\b.*?\b{homebase}\b')
+
+    fahrtage = arbeitstage = hotel_naechte = frei_tage = 0
+    z72_inland_days = 0  # Same-day Inland >8h
+    z73_inland_days = 0  # Inland An- oder Abreisetag (mehrtägige Tour)
+    unklare = []
+
+    in_tour = False
+    tour_inland_only = True  # Inland-Klassifikation des aktuellen Tour-Anfangs
+
+    for date_key in sorted(days.keys(), key=lambda d: (int(d[3:5]), int(d[:2]))):
+        rests = days[date_key]
+        joined = ' || '.join(rests)
+
+        # FREI hat höchste Priorität (auch wenn andere Marker da)
+        if any(is_frei(r) for r in rests):
             frei_tage += 1
             in_tour = False
             continue
 
-        # 2. FL Strecken-Einsatz — Auslands-Übernachtung
-        if re.search(r'\bFL\b.*STRECKENEINSATZTAG|\bFL\b\s+STRECKEN', rest, re.I) or rest.startswith('FL '):
+        # Layover-Tag (FL STRECKENEINSATZTAG)
+        if any(is_layover(r) for r in rests):
             arbeitstage += 1
             hotel_naechte += 1
             in_tour = True
             continue
 
-        # 3. Tour-Start: A {homebase} gefolgt von Ziel
-        m_a = re.search(rf'LH\d+\s+A\s+{homebase}\b.*?\b([A-Z]{{3}})\b', rest)
-        if m_a:
-            ziel = m_a.group(1)
+        # Tour-Aktivität an diesem Tag prüfen
+        a_matches = []
+        e_matches = []
+        for r in rests:
+            for m in re_a_homebase.finditer(r):
+                a_matches.append(m.group(1))
+            for m in re_e_to_homebase.finditer(r):
+                e_matches.append(m.group(1))
+
+        has_a = bool(a_matches)
+        has_e = bool(e_matches)
+
+        if has_a and has_e:
+            # SAME-DAY-TOUR: A FRA → DEST und E DEST → FRA am gleichen Tag
+            arbeitstage += 1
+            fahrtage += 1
+            in_tour = False
+            ziel = a_matches[0]
+            if ziel in INLAND_IATA:
+                z72_inland_days += 1
+            # Auslands-Same-Day-Tour: kein Z72 (das wäre Z76, kommt aus SE)
+            continue
+
+        if has_a:
+            # Tour-Start
             arbeitstage += 1
             if not in_tour:
                 fahrtage += 1
                 in_tour = True
-            # Same-day Rückkehr → 1-Tages-Tour (kein Hotel)
-            if re.search(rf'\bE\b.*{homebase}\s*$', rest):
-                in_tour = False
-                # Wenn Ziel Inland: Z72 Inland-Tagestrip (Pauschale 14€)
-                if ziel in INLAND_IATA:
-                    z72_inland_days += 1
+            ziel = a_matches[0]
+            tour_inland_only = (ziel in INLAND_IATA)
+            if tour_inland_only:
+                z73_inland_days += 1  # Anreise-Tag Inland
             continue
 
-        # 4. Tour-Ende: E ZIEL {homebase}
-        if re.search(rf'LH\d+\s+E\s+[A-Z]{{3}}.*{homebase}\b', rest):
+        if has_e:
+            # Tour-Ende
             arbeitstage += 1
             in_tour = False
+            origin = e_matches[0]
+            if origin in INLAND_IATA:
+                z73_inland_days += 1  # Abreise-Tag von Inland
             continue
 
-        # 5. Home-Duty (Standby/Reserve/Online): Arbeitstag, kein Fahrtag
-        if HOME_DUTY.search(rest):
+        # Home-Duty (Standby/Reserve)
+        if any(is_home_duty(r) for r in rests):
             arbeitstage += 1
             continue
 
-        # 6. Vor-Ort-Dienst (EM/EK/D4/EH/Briefing/Schulung): Arbeitstag + Fahrtag (wenn nicht schon auf Tour)
-        if OFFICE_DUTY.search(rest):
+        # Office-Duty (Briefing, Schulung etc)
+        if any(is_office_duty(r) for r in rests):
             arbeitstage += 1
             if not in_tour:
                 fahrtage += 1
             continue
 
-        # 7. Unbekannter Marker — Claude muss interpretieren
-        unklare.append(f"{m_dat.group(1)}.{m_dat.group(2)}: {rest[:80]}")
+        unklare.append(f"{date_key}: {joined[:120]}")
 
     return {
         'fahrtage':         fahrtage,
         'arbeitstage':      arbeitstage,
         'hotel_naechte':    hotel_naechte,
         'z72_inland_days':  z72_inland_days,
+        'z73_inland_days':  z73_inland_days,
         'frei_tage':        frei_tage,
         'unklare_tage':     unklare,
+    }
+
+
+def _parse_se_pdf_xpos(pdf_bytes_list):
+    """SE-Parser mit pdfplumber x-Position. 100% deterministisch — liest die
+    Spalten Datum/Ab/An/Spesen/Ort/Zwölftel/stfrei/Ort literal anhand der x-Koordinaten.
+    Liefert Tag-Counts + literal-Summen.
+    """
+    from collections import defaultdict
+    import pdfplumber, io as _io
+
+    INLAND = {'FRA','HAM','MUC','BER','DUS','STR','NUE','CGN','LEJ','HAJ',
+              'HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN','XFW','RLG'}
+
+    # Spalten-x-Bereiche (validiert gegen LH SE-Format)
+    COL = {
+        'datum':      (60, 110),
+        'ab':         (110, 140),
+        'an':         (140, 175),
+        'spesen_eur': (175, 235),
+        'spesen_ort': (235, 265),
+        'zwf':        (265, 310),
+        'stfrei_eur': (310, 350),
+        'stfrei_ort': (350, 380),
+        'steuer':     (380, 420),
+        'werbko':     (420, 460),
+        'storno':     (490, 540),
+    }
+
+    def col_of(x):
+        for c, (a, b) in COL.items():
+            if a <= x < b: return c
+        return None
+
+    def num(s):
+        if not s: return None
+        s = s.replace('-','').strip()
+        try: return float(s.replace('.','').replace(',','.'))
+        except: return None
+
+    rows = []
+    for pdf_bytes in _bytes_list(pdf_bytes_list):
+        try:
+            with pdfplumber.open(_io.BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages:
+                    words = page.extract_words(use_text_flow=False, x_tolerance=2)
+                    by_y = defaultdict(list)
+                    for w in words:
+                        by_y[round(w['top'] / 6) * 6].append(w)
+                    for y in sorted(by_y.keys()):
+                        rw = sorted(by_y[y], key=lambda x: x['x0'])
+                        if not rw: continue
+                        first = rw[0]['text']
+                        if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', first): continue
+                        row = {}
+                        for w in rw:
+                            c = col_of(w['x0'])
+                            if c: row.setdefault(c, []).append(w['text'])
+                        # Storno-Markierung
+                        st = ''.join(row.get('storno', []))
+                        if 'X' in st: continue
+                        rows.append(row)
+        except Exception as e:
+            print(f"[SE-xpos] page parse fail: {e}")
+
+    z72_tage = z73_tage = z74_tage = 0
+    z72_eur = z73_eur = z74_eur = z76_eur = 0.0
+    z77_werbko = 0.0
+    fahrtage_inland = 0      # Tour-Beginn vom Inland
+    fahrtage_ausland = 0     # Same-Day oder direkt-Ausland
+    arbeitstage = len(rows)
+    hotelnaechte = 0
+    unklar = []
+
+    for r in rows:
+        ab = (r.get('ab') or [None])[0]
+        an = (r.get('an') or [None])[0]
+        sf_eur = num((r.get('stfrei_eur') or [''])[0])
+        sf_ort = (r.get('stfrei_ort') or [None])[0]
+        sp_ort = (r.get('spesen_ort') or [None])[0]
+        wk = num((r.get('werbko') or [''])[0])
+        if wk: z77_werbko += wk
+        kat_ort = sf_ort or sp_ort
+        is_inland = kat_ort in INLAND if kat_ort else False
+        has_ab = ab is not None
+        has_an = an is not None
+
+        if has_ab and has_an:
+            # Same-Day-Tour
+            if is_inland:
+                z72_tage += 1
+                z72_eur += sf_eur if sf_eur else 14.0
+                fahrtage_inland += 1
+            else:
+                if sf_eur: z76_eur += sf_eur
+                else: unklar.append(r)
+                fahrtage_ausland += 1
+        elif has_ab and not has_an:
+            # Anreise-Tag
+            if is_inland:
+                z73_tage += 1
+                z73_eur += sf_eur if sf_eur else 14.0
+                fahrtage_inland += 1
+            else:
+                if sf_eur: z76_eur += sf_eur
+                else: unklar.append(r)
+                fahrtage_ausland += 1
+            hotelnaechte += 1
+        elif not has_ab and has_an:
+            # Abreise-Tag
+            if is_inland:
+                z73_tage += 1
+                z73_eur += sf_eur if sf_eur else 14.0
+            else:
+                if sf_eur: z76_eur += sf_eur
+                else: unklar.append(r)
+            # Abreise-Tag: kein Hotel mehr
+        else:
+            # Voll-Tag (24h auswärts)
+            if is_inland:
+                z74_tage += 1
+                z74_eur += sf_eur if sf_eur else 28.0
+            else:
+                if sf_eur: z76_eur += sf_eur
+                else: unklar.append(r)
+            hotelnaechte += 1
+
+    return {
+        'z72_tage': z72_tage, 'z72_eur': round(z72_eur, 2),
+        'z73_tage': z73_tage, 'z73_eur': round(z73_eur, 2),
+        'z74_tage': z74_tage, 'z74_eur': round(z74_eur, 2),
+        'z76_eur':  round(z76_eur, 2),
+        'z77_werbko': round(z77_werbko, 2),
+        'fahrtage':    fahrtage_inland + fahrtage_ausland,
+        'arbeitstage': arbeitstage,
+        'hotelnaechte': hotelnaechte,
+        'unklare_zeilen': [' '.join(' '.join(v) for v in r.values()) for r in unklar],
     }
 
 
@@ -2296,16 +2483,24 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
 
     z77_total = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
 
-    # ── DETERMINISTISCHES LESEN aller SE-Zeilen ──
-    all_se_text = ''
-    for pdf_bytes in pdf_bytes_list:
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                all_se_text += '\n'.join(p.extract_text() or '' for p in pdf.pages) + '\n'
-        except: pass
-
-    se_det = _parse_se_lines_deterministic(all_se_text)
-    print(f"SE deterministisch: Z77={z77_total:.2f}€  Z72={se_det['z72_tage']}T/{se_det['z72_eur']}€  Z73={se_det['z73_tage']}T/{se_det['z73_eur']}€  Z74={se_det['z74_tage']}T/{se_det['z74_eur']}€  Z76={se_det['z76_eur']}€  unklar={len(se_det['unklare_zeilen'])} Zeilen")
+    # ── DETERMINISTISCHES LESEN aller SE-Zeilen via x-Position ──
+    # Primär: pdfplumber x-Position Parser (100% deterministisch via Spalten-Koordinaten)
+    # Fallback: Text-Regex Parser falls x-Position-Parser keine Rows findet
+    se_det = _parse_se_pdf_xpos(pdf_bytes_list)
+    if se_det['arbeitstage'] == 0:
+        # Fallback Text-Regex
+        all_se_text = ''
+        for pdf_bytes in pdf_bytes_list:
+            try:
+                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                    all_se_text += '\n'.join(p.extract_text() or '' for p in pdf.pages) + '\n'
+            except: pass
+        se_det = _parse_se_lines_deterministic(all_se_text)
+        # arbeitstage/fahrtage/hotelnaechte fehlen im Text-Regex Output → mit 0 füllen
+        se_det.setdefault('arbeitstage', 0)
+        se_det.setdefault('fahrtage', 0)
+        se_det.setdefault('hotelnaechte', 0)
+    print(f"SE deterministisch: Z77={z77_total:.2f}€  Z72={se_det['z72_tage']}T/{se_det['z72_eur']}€  Z73={se_det['z73_tage']}T/{se_det['z73_eur']}€  Z74={se_det['z74_tage']}T/{se_det['z74_eur']}€  Z76={se_det['z76_eur']}€  arbeitstage={se_det.get('arbeitstage',0)} hotel={se_det.get('hotelnaechte',0)} fahr={se_det.get('fahrtage',0)} unklar={len(se_det['unklare_zeilen'])} Zeilen")
 
     return {
         'abrechnungen':          abrechnungen,
@@ -2317,6 +2512,10 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
         'z73_tage': se_det['z73_tage'], 'z73_eur': se_det['z73_eur'],
         'z74_tage': se_det['z74_tage'], 'z74_eur': se_det['z74_eur'],
         'z76_eur':  se_det['z76_eur'],
+        # SE-direkte Counts (überlebt jetzt ohne Flugstundenübersicht)
+        'arbeitstage_se':  se_det.get('arbeitstage', 0),
+        'fahrtage_se':     se_det.get('fahrtage', 0),
+        'hotelnaechte_se': se_det.get('hotelnaechte', 0),
         'unklare_zeilen': se_det['unklare_zeilen'],
     }
 
