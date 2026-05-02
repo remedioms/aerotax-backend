@@ -486,9 +486,22 @@ def _run_process_async(job_id, form, files):
         _store[token] = {
             'pdf_bytes': pdf_bytes,
             'filename':  f'AeroTax_Auswertung_{year}_{name}.pdf',
-            'expires':   datetime.utcnow() + timedelta(hours=24),
+            'expires':   datetime.utcnow() + timedelta(hours=SESSION_HOURS),
         }
         _audit(job_id, 'pdf_created', {'token': token, 'size_kb': len(pdf_bytes)//1024})
+
+        # ── DATENSCHUTZ: ALLE Originaldateien sofort aus dem Speicher entfernen ──
+        # Files-Dict (eingegangene PDFs/Bilder) ist lokal im Thread → wird nach Funktion GC.
+        # Aber wir setzen sie explizit auf None um sicher zu gehen.
+        try:
+            for k in list(files.keys()):
+                files[k] = None
+            files.clear()
+        except: pass
+        # File-bytes aus Result auch entfernen (Belege-Bilder waren da für PDF-Embedding)
+        for b in result.get('optionale_belege', []):
+            b.pop('file_bytes_list', None)
+        _audit(job_id, 'files_purged', {'note': 'Originaldokumente sofort nach PDF-Generierung gelöscht'})
 
         safe = {k: v for k, v in result.items() if isinstance(v, (int, float, str))}
         opt_belege_safe = []
@@ -644,17 +657,18 @@ _SESSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'session
 os.makedirs(_SESSION_DIR, exist_ok=True)
 
 
+SESSION_HOURS = 24  # Session-Token nur 24h gültig — Datenschutz-First
+
 def _make_session_token(job_id):
-    """Generiert 7-Tage Session-Token nach erfolgreicher Auswertung."""
+    """Generiert kurzlebigen Session-Token nach erfolgreicher Auswertung."""
     secret = os.environ.get('SESSION_SECRET', 'aerosteuer-session-default-2025')
-    today = datetime.utcnow().strftime('%Y%m%d')
-    raw = f"{job_id}:{today}:{secret}"
+    raw = f"{job_id}:{datetime.utcnow().isoformat()}:{secret}"
     return 'AT-' + _hashlib.sha256(raw.encode()).hexdigest()[:16].upper()
 
 
 def _save_session(token, data):
-    """Speichert Session-Daten (Auswertungs-Ergebnis + Chat-Verlauf)."""
-    expires = datetime.utcnow() + timedelta(days=7)
+    """Speichert Session-Daten (NUR result-Numbers + Chat-Verlauf, KEINE Originaldokumente)."""
+    expires = datetime.utcnow() + timedelta(hours=SESSION_HOURS)
     payload = {**data, 'token': token, 'created': datetime.utcnow().isoformat() + 'Z',
                'expires': expires.isoformat() + 'Z'}
     try:
@@ -662,6 +676,50 @@ def _save_session(token, data):
             json.dump(payload, f, default=str)
     except Exception as e:
         print(f"[session] save fail: {e}")
+
+
+def _cleanup_expired_sessions():
+    """Löscht abgelaufene Sessions vom Disk. Wird periodisch ausgeführt."""
+    try:
+        now = datetime.utcnow()
+        for fn in os.listdir(_SESSION_DIR):
+            if not fn.endswith('.json'): continue
+            path = os.path.join(_SESSION_DIR, fn)
+            try:
+                with open(path) as f: data = json.load(f)
+                exp = datetime.fromisoformat(data.get('expires', '').replace('Z', ''))
+                if exp < now:
+                    os.remove(path)
+                    print(f"[cleanup] expired session deleted: {fn[:24]}")
+            except Exception:
+                # Korrupte Datei → löschen
+                os.remove(path)
+    except Exception as e:
+        print(f"[cleanup] failed: {e}")
+
+
+def _cleanup_loop():
+    """Background-Loop für regelmäßiges Cleanup (alle 30 Min)."""
+    import time as _t
+    while True:
+        try:
+            _t.sleep(1800)  # 30 Min
+            _cleanup_expired_sessions()
+            # Auch alte Job-State-Files
+            cutoff = datetime.utcnow() - timedelta(hours=48)
+            for fn in os.listdir(_JOBS_DIR):
+                if not fn.endswith('.json'): continue
+                path = os.path.join(_JOBS_DIR, fn)
+                try:
+                    if datetime.utcfromtimestamp(os.path.getmtime(path)) < cutoff:
+                        os.remove(path)
+                        print(f"[cleanup] old job file deleted: {fn[:24]}")
+                except: pass
+        except: pass
+
+
+# Cleanup-Thread starten
+__import__('threading').Thread(target=_cleanup_loop, daemon=True).start()
 
 
 def _load_session(token):
@@ -812,6 +870,19 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
     except Exception as e:
         print(f"[chat] failed: {e}")
         return jsonify({'error': f'Chat-Anfrage fehlgeschlagen: {str(e)[:200]}'}), 500
+
+
+@app.route('/api/session/<token>/delete', methods=['POST'])
+def session_delete(token):
+    """User kann seine Daten manuell sofort löschen — Datenschutz auf Anforderung."""
+    path = os.path.join(_SESSION_DIR, f'{token}.json')
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+            return jsonify({'ok': True, 'deleted': True})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True, 'deleted': False, 'note': 'Token war nicht mehr da'}), 200
 
 
 @app.route('/api/chat/history', methods=['POST'])
