@@ -416,7 +416,8 @@ def process_real():
             'anreise': anreise,
             'km':      float(request.form.get('km', 0)) if anreise in ('auto','fahrrad') else 0,
             'fahrzeug':   request.form.get('fahrzeug', 'verbrenner'),
-            'oepnv_kosten': float(request.form.get('oepnv_kosten', 0)),
+            'oepnv_kosten': float(request.form.get('oepnv_kosten', 0) or 0),
+            'shuttle_kosten': float(request.form.get('shuttle_kosten', 0) or 0),
             'jobticket':  request.form.get('jobticket', 'nein'),
         }
 
@@ -2819,7 +2820,11 @@ def berechne(form, files):
     elif anreise == 'oepnv':
         oepnv_kosten = float(form.get('oepnv_kosten', 0))
         fahr = 0 if jobticket == 'ja_frei' else float(oepnv_kosten)
+    elif anreise == 'shuttle_kosten':
+        # Kostenpflichtiger Shuttle/Sammeltaxi → Jahreskosten direkt absetzbar (Reisekosten)
+        fahr = float(form.get('shuttle_kosten', 0) or 0)
     else:
+        # shuttle_frei, fuss, oder unbekannt → keine Fahrtkosten
         fahr = 0
     fahr = round(fahr, 2)
 
