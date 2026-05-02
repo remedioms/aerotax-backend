@@ -184,6 +184,7 @@ def upload_files():
 
 
 _processed_stripe_events = {}  # event_id → timestamp; Idempotenz für Webhooks
+_consumed_payment_intents = {}  # pi_id → consumed_at; verhindert Replay
 
 @app.route('/api/stripe-webhook', methods=['POST'])
 def stripe_webhook():
@@ -502,6 +503,11 @@ def process_real():
         promo_code = (request.form.get('promo_code') or '').strip().upper()
         is_free_retry = bool(free_retry_token and free_retry_token in _recovery_tokens)
         is_paid = bool(ref and _store.get(ref, {}).get('paid'))
+        # Replay-Schutz: PI darf nur 1x für /api/process genutzt werden
+        if pi_id and pi_id in _consumed_payment_intents:
+            return jsonify({
+                'error': 'Diese Zahlung wurde bereits für eine Auswertung verwendet. Pro Bezahlung gibt es eine Auswertung.'
+            }), 402
         # Wenn Webhook noch nicht durch ist: PaymentIntent direkt bei Stripe verifizieren
         if not is_paid and pi_id:
             try:
@@ -545,10 +551,17 @@ def process_real():
                 'download_url': None,
                 'chat_history': [],
             })
-            # Bezahlung verbrauchen — Ref kann nur 1x für /api/process genutzt werden
+            # Bezahlung verbrauchen — Ref + PI können nur 1x für /api/process genutzt werden
             if ref and ref in _store:
                 _store[ref]['paid'] = False
                 _store[ref]['used_at'] = datetime.utcnow().isoformat() + 'Z'
+            if pi_id:
+                _consumed_payment_intents[pi_id] = datetime.utcnow()
+                # Alte Einträge >25h aufräumen
+                cutoff_pi = datetime.utcnow() - timedelta(hours=25)
+                for k, ts in list(_consumed_payment_intents.items()):
+                    if ts < cutoff_pi:
+                        _consumed_payment_intents.pop(k, None)
         with _jobs_lock:
             _jobs[job_id] = {
                 'status':   'pending',
