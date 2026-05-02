@@ -169,18 +169,40 @@ def create_payment_intent():
         return jsonify({'error': str(e)}), 500
 
 
+_ALL_FILE_KEYS = (
+    'lsb', 'dp', 'se',
+    'stb', 'gew', 'arb', 'fort', 'tel',
+    'konz', 'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
+    'arzt', 'zahn', 'medi', 'pfle', 'under', 'kata',
+    'spen', 'part', 'kind', 'hand', 'haed', 'kiru',
+)
+
+
 @app.route('/api/upload-files', methods=['POST'])
 def upload_files():
-    ref = request.form.get('ref','')
-    if ref not in _store:
+    """Pre-Upload: Frontend lädt Dateien VOR der Bezahlung hoch, damit sie bei
+    3DS-Redirect oder Reload nicht verloren gehen. Files in _store[ref]['files'].
+    """
+    ref = request.form.get('ref', '').strip()
+    if not ref or ref not in _store:
         return jsonify({'error': 'ref not found'}), 404
 
-    for key in ('lsb', 'dp', 'se', 'sb', 'zr', 'so'):
+    saved_count = 0
+    for key in _ALL_FILE_KEYS:
         files = request.files.getlist(key)
         if files:
-            _store[ref]['files'][key] = [(f.read(), f.filename) for f in files]
+            normalized = []
+            for f in files:
+                try:
+                    normalized.append((_normalize_upload(f.read(), f.filename), f.filename))
+                    saved_count += 1
+                except Exception as e:
+                    print(f"[upload-files] {key}/{f.filename} failed: {e}")
+            if normalized:
+                _store[ref]['files'][key] = normalized
 
-    return jsonify({'status': 'ok'})
+    print(f"[upload-files] ref={ref[:8]} {saved_count} Dateien gespeichert")
+    return jsonify({'status': 'ok', 'count': saved_count})
 
 
 _processed_stripe_events = {}  # event_id → timestamp; Idempotenz für Webhooks
@@ -482,13 +504,22 @@ def process_real():
         }
 
         files = {}
-        for key in ['lsb', 'dp', 'se', 'stb', 'gew', 'arb', 'fort', 'tel',
-                    'konz', 'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
-                    'arzt', 'zahn', 'medi', 'pfle', 'under', 'kata',
-                    'spen', 'part', 'kind', 'hand', 'haed', 'kiru']:
+        for key in _ALL_FILE_KEYS:
             uploaded = request.files.getlist(key)
             if uploaded:
                 files[key] = [_normalize_upload(f.read(), f.filename) for f in uploaded]
+
+        # Fallback: Falls keine Files in Form aber ref hat pre-uploaded Files in _store
+        ref_for_fallback = (request.form.get('ref') or '').strip()
+        if (not files.get('lsb') or not files.get('dp') or not files.get('se')) \
+                and ref_for_fallback and _store.get(ref_for_fallback, {}).get('files'):
+            stored = _store[ref_for_fallback]['files']
+            for k, items in stored.items():
+                if k in files:
+                    continue  # form hat Vorrang
+                # items sind (bytes, filename)-Tupel oder bytes
+                files[k] = [it[0] if isinstance(it, tuple) else it for it in items]
+            print(f"[process] ref={ref_for_fallback[:8]} Files aus _store geladen ({sum(len(v) for v in files.values())} insgesamt)")
 
         if not files.get('lsb') or not files.get('dp') or not files.get('se'):
             return jsonify({
