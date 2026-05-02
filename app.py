@@ -12,6 +12,7 @@
 # ═══════════════════════════════════════════════════════════════
 
 import os, io, uuid, json, re, tempfile
+import hashlib as _hashlib
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file, abort
 from flask_cors import CORS
@@ -60,7 +61,13 @@ from reportlab.lib.enums import TA_RIGHT, TA_CENTER
 
 # ── APP SETUP ─────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, origins=[os.getenv('FRONTEND_URL','https://aerotax.de'), 'http://localhost:3000'])
+CORS(app, origins=[
+    os.getenv('FRONTEND_URL', 'https://aerosteuer.de'),
+    'https://aerosteuer.de',
+    'https://aerosteuer.pages.dev',
+    'http://localhost:3000',
+    'http://localhost:8080',
+])
 
 stripe.api_key        = os.getenv('STRIPE_SECRET_KEY')
 WEBHOOK_SECRET        = os.getenv('STRIPE_WEBHOOK_SECRET')
@@ -113,13 +120,22 @@ def create_checkout():
         payment_method_types=['card'],
         line_items=[{'price': PRICE_ID, 'quantity': 1}],
         mode='payment',
-        success_url=f'{FRONTEND_URL}/success?ref={ref}',
-        cancel_url=f'{FRONTEND_URL}/#tool',
+        success_url=f'{FRONTEND_URL}/?paid=1&ref={ref}#tool',
+        cancel_url=f'{FRONTEND_URL}/?paid=0#tool',
         metadata={'ref': ref},
         locale='de',
         invoice_creation={'enabled': True},
     )
     return jsonify({'checkout_url': session.url, 'ref': ref})
+
+
+@app.route('/api/payment-status/<ref>', methods=['GET'])
+def payment_status(ref):
+    """Frontend prüft nach Stripe-Redirect ob die Zahlung wirklich durch ist."""
+    entry = _store.get(ref)
+    if not entry:
+        return jsonify({'paid': False, 'error': 'ref not found'}), 404
+    return jsonify({'paid': bool(entry.get('paid')), 'ref': ref})
 
 
 @app.route('/api/create-payment-intent', methods=['POST'])
@@ -434,18 +450,47 @@ def process_real():
                          'Flugstunden-Übersichten und Streckeneinsatz-Abrechnungen hoch.'
             }), 400
 
+        # ── PAYMENT-GATE: ref (Stripe), free_retry_token, oder valider Promo-Code ──
+        free_retry_token = (request.form.get('free_retry_token') or '').strip()
+        ref = (request.form.get('ref') or '').strip()
+        promo_code = (request.form.get('promo_code') or '').strip().upper()
+        is_free_retry = bool(free_retry_token and free_retry_token in _recovery_tokens)
+        is_paid = bool(ref and _store.get(ref, {}).get('paid'))
+        valid_promos = set(c.strip().upper() for c in os.environ.get('PROMO_CODES', 'AEROTAXFREEPASS26').split(',') if c.strip())
+        is_promo = bool(promo_code and promo_code in valid_promos)
+        allow_unpaid = os.environ.get('ALLOW_UNPAID') == '1'
+        if not (is_paid or is_free_retry or is_promo or allow_unpaid):
+            return jsonify({
+                'error': 'Zahlung nicht verifiziert. Bitte schließe den Bezahlvorgang ab und versuche es dann erneut.'
+            }), 402
+
         # ── ASYNC: Job anlegen, Token sofort generieren, im Hintergrund starten ──
         job_id = str(uuid.uuid4())
-        # Token wird SOFORT erstellt (vor der Berechnung) — bleibt 24h gültig auch bei Fehler.
-        # Damit gibt's kein separates Recovery-Code-System mehr.
-        session_token = _make_session_token(job_id)
-        _save_session(session_token, {
-            'job_id': job_id,
-            'result_data': {},  # wird nach erfolgreicher Berechnung gefüllt
-            'notes': [],
-            'download_url': None,
-            'chat_history': [],
-        })
+        if is_free_retry:
+            session_token = free_retry_token
+            # Recovery-Token verbrauchen — nur 1x pro Token zulässig
+            _recovery_tokens.pop(free_retry_token, None)
+            _save_session(session_token, {
+                'job_id': job_id,
+                'result_data': {},
+                'notes': [],
+                'download_url': None,
+                'chat_history': [],
+            })
+        else:
+            # Normaler Pfad: Token sofort erstellen, 24h gültig auch bei Fehler.
+            session_token = _make_session_token(job_id)
+            _save_session(session_token, {
+                'job_id': job_id,
+                'result_data': {},
+                'notes': [],
+                'download_url': None,
+                'chat_history': [],
+            })
+            # Bezahlung verbrauchen — Ref kann nur 1x für /api/process genutzt werden
+            if ref and ref in _store:
+                _store[ref]['paid'] = False
+                _store[ref]['used_at'] = datetime.utcnow().isoformat() + 'Z'
         with _jobs_lock:
             _jobs[job_id] = {
                 'status':   'pending',
@@ -594,7 +639,9 @@ def get_job_audit(job_id):
 @app.route('/api/recover', methods=['POST'])
 def recover_failed_job():
     """Vereinfacht: Session-Token reicht für Retry. Max 1 kostenloser Retry — danach Support.
-    Body: {token}. Token muss noch gültig sein (24h ab Bezahlung)."""
+    Body: {token}. Token muss noch gültig sein (24h ab Bezahlung).
+    Retry-Counter im In-Memory _recovery_tokens (V1 acceptance).
+    """
     body = request.get_json(silent=True) or {}
     token = body.get('token', '').strip()
     if not token:
@@ -602,16 +649,15 @@ def recover_failed_job():
     session = _load_session(token)
     if not session:
         return jsonify({'error': 'Token ungültig oder abgelaufen (24h ab Bezahlung)'}), 403
-    retry_count = int(session.get('retry_count') or 0)
-    if retry_count >= 1:
+    info = _recovery_tokens.get(token, {})
+    if int(info.get('retries_used', 0)) >= 1:
         return jsonify({
             'error': 'Du hast bereits einen kostenlosen Retry genutzt. Bitte kontaktiere Support — wir helfen dir persönlich.',
             'support': True,
         }), 403
-    session['retry_count'] = retry_count + 1
-    _save_session(token, session)
     _recovery_tokens[token] = {
         'token': token,
+        'retries_used': int(info.get('retries_used', 0)) + 1,
         'expires': (datetime.utcnow() + timedelta(minutes=60)).isoformat() + 'Z',
     }
     return jsonify({
@@ -1084,10 +1130,22 @@ def _qa_rate_check(ip, action, max_per_hour):
         # filter on last hour
         history = [t for t in history if (now - t).total_seconds() < 3600]
         if len(history) >= max_per_hour:
+            _qa_rate[key] = history
             return False
         history.append(now)
         _qa_rate[key] = history
+        # Periodisches Aufräumen — leere Einträge entfernen, damit dict nicht unbounded wächst
+        if len(_qa_rate) > 5000:
+            _qa_rate_cleanup(now)
         return True
+
+
+def _qa_rate_cleanup(now):
+    """Entfernt abgelaufene Rate-Limit-Einträge (intern, ruft mit _qa_lock gehalten auf)."""
+    expired = [k for k, h in _qa_rate.items()
+               if not h or (now - h[-1]).total_seconds() >= 3600]
+    for k in expired:
+        _qa_rate.pop(k, None)
 
 
 def _qa_aerotax_answer(question_title, question_body):
@@ -3648,9 +3706,13 @@ def erstelle_pdf(d):
                     if fb[:3]==b'\xff\xd8\xff' or fb[:4]==b'\x89PNG':
                         img = RLImage(io.BytesIO(fb))
                         iw,ih = img.drawWidth,img.drawHeight
-                        scale = min(W_c/iw, 22*cm/ih, 1.0)
-                        img.drawWidth=iw*scale; img.drawHeight=ih*scale
-                        S.append(img)
+                        if iw and ih:
+                            scale = min(W_c/iw, 22*cm/ih, 1.0)
+                            img.drawWidth=iw*scale; img.drawHeight=ih*scale
+                            S.append(img)
+                        else:
+                            S.append(Paragraph("⚠ Bild konnte nicht eingebettet werden (unbekannte Dimensionen).",
+                                ps(f"bpe{id(b)}{fidx}", fontSize=9, textColor=TEXT3, fontName="Helvetica")))
                     else:
                         with pdfplumber.open(io.BytesIO(fb)) as pdoc:
                             for pgi,pg_ in enumerate(pdoc.pages):
