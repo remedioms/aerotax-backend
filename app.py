@@ -2798,6 +2798,19 @@ def berechne(form, files):
     else:
         vma_aus = inferred.get('vma_aus', 0)
 
+    # ── JAHR-SPEZIFISCHE PAUSCHALEN (zuerst — werden von Fahrtkosten + VMA gebraucht) ──
+    year_int = int(form.get('year', 2025))
+    bmf_inland = BMF_INLAND_BY_YEAR.get(year_int, BMF_INLAND_BY_YEAR[2025])
+    pendler = PENDLER_BY_YEAR.get(year_int, PENDLER_BY_YEAR[2025])
+    reinig_satz = REINIGUNG_PRO_TAG_BY_YEAR.get(year_int, 1.60)
+    trink_satz  = TRINKGELD_PRO_NACHT_BY_YEAR.get(year_int, 3.60)
+
+    # VMA-Werte mit jahr-korrekten Sätzen
+    vma_72 = vma_72_tage * bmf_inland['tagestrip_8h']
+    vma_73 = vma_73_tage * bmf_inland['an_abreise']
+    vma_74 = vma_74_tage * bmf_inland['voll_24h']
+    vma_in = vma_72 + vma_73 + vma_74
+
     # ── FAHRTKOSTEN ───────────────────────────────────────────
     fahrzeug  = form.get('fahrzeug', 'verbrenner')
     jobticket = form.get('jobticket', 'nein')
@@ -2809,19 +2822,6 @@ def berechne(form, files):
     else:
         fahr = 0
     fahr = round(fahr, 2)
-
-    # ── JAHR-SPEZIFISCHE PAUSCHALEN ──────────────────────────
-    year_int = int(form.get('year', 2025))
-    bmf_inland = BMF_INLAND_BY_YEAR.get(year_int, BMF_INLAND_BY_YEAR[2025])
-    pendler = PENDLER_BY_YEAR.get(year_int, PENDLER_BY_YEAR[2025])
-    reinig_satz = REINIGUNG_PRO_TAG_BY_YEAR.get(year_int, 1.60)
-    trink_satz  = TRINKGELD_PRO_NACHT_BY_YEAR.get(year_int, 3.60)
-
-    # VMA-Werte mit jahr-korrekten Sätzen neu berechnen falls Tage da
-    vma_72 = vma_72_tage * bmf_inland['tagestrip_8h']
-    vma_73 = vma_73_tage * bmf_inland['an_abreise']
-    vma_74 = vma_74_tage * bmf_inland['voll_24h']
-    vma_in = vma_72 + vma_73 + vma_74
 
     # ── REINIGUNG & TRINKGELD (jahr-konform) ─────────────────
     reinig = round(arbeitstage * reinig_satz, 2)
