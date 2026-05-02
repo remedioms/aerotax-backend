@@ -94,7 +94,7 @@ BMF_2025 = {
     "ATH":(40,27),"VNO":(26,17),"SNN":(58,39),"BUD":(32,21),
     "LIN":(42,28),"PRG":(32,21),"MLA":(46,31),"KRK":(34,23),
     "MXP":(42,28),"WAW":(34,23),"VIE":(46,31),"ZRH":(66,44),
-    "BRU":(66,44),"AMS":(62,41),"CDG":(53,36),"MAD":(42,28),
+    "BRU":(66,44),"AMS":(62,41),"CDG":(53,36),
     "PMI":(34,23),"ACE":(34,23),"TFS":(34,23),"LPA":(34,23),
     "FUE":(34,23),"IBZ":(34,23),"ALC":(34,23),"SVQ":(42,28),
 }
@@ -183,39 +183,39 @@ def upload_files():
     return jsonify({'status': 'ok'})
 
 
+_processed_stripe_events = {}  # event_id → timestamp; Idempotenz für Webhooks
+
 @app.route('/api/stripe-webhook', methods=['POST'])
 def stripe_webhook():
+    """Markiert _store[ref].paid=True. Auswertung selbst läuft NICHT hier — der
+    Frontend-Flow ruft /api/process direkt auf nach Payment-Element Erfolg.
+    Webhook bleibt als Backup / Confirmation bestehen."""
     payload = request.get_data()
-    sig     = request.headers.get('Stripe-Signature','')
+    sig     = request.headers.get('Stripe-Signature', '')
 
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
+    # Idempotenz: gleicher Webhook-Event nur 1x verarbeiten
+    eid = event.get('id', '')
+    if eid and eid in _processed_stripe_events:
+        return jsonify({'status': 'ok', 'idempotent': True})
+    if eid:
+        # Alte Einträge >1h aufräumen
+        cutoff = datetime.utcnow() - timedelta(hours=1)
+        for k, ts in list(_processed_stripe_events.items()):
+            if ts < cutoff:
+                _processed_stripe_events.pop(k, None)
+        _processed_stripe_events[eid] = datetime.utcnow()
+
     if event['type'] in ('checkout.session.completed', 'payment_intent.succeeded'):
-        session = event['data']['object']
-        ref     = session.get('metadata', {}).get('ref','')
-
-        if ref in _store:
-            entry = _store[ref]
-            entry['paid'] = True
-
-            try:
-                result = berechne(entry['form'], entry['files'])
-                pdf_bytes = erstelle_pdf(result)
-
-                dl_token = str(uuid.uuid4())
-                name = result['name'].replace(' ','_')
-                _store[dl_token] = {
-                    'pdf_bytes': pdf_bytes,
-                    'filename':  f'AeroTax_Auswertung_2025_{name}.pdf',
-                    'expires':   datetime.utcnow() + timedelta(hours=24),
-                }
-                entry['dl_token'] = dl_token
-
-            except Exception as e:
-                print(f'PDF generation error: {e}')
+        obj = event['data']['object']
+        ref = (obj.get('metadata') or {}).get('ref', '')
+        if ref and ref in _store:
+            _store[ref]['paid'] = True
+            print(f"[stripe-webhook] ref {ref[:8]} marked paid via {event['type']}")
 
     return jsonify({'status': 'ok'})
 
@@ -234,18 +234,67 @@ def check_status(ref):
         return jsonify({'status': 'pending'})
 
 
+PDF_TTL_HOURS = 24
+
+def _save_pdf(token, pdf_bytes, filename, hours=PDF_TTL_HOURS):
+    """Persist PDF in Supabase + In-Memory _store. Beide Wege werden versucht."""
+    expires = datetime.utcnow() + timedelta(hours=hours)
+    _store[token] = {
+        'pdf_bytes': pdf_bytes,
+        'filename':  filename,
+        'expires':   expires,
+    }
+    if SB_AVAILABLE:
+        try:
+            sb.table('pdfs').upsert({
+                'token':      token,
+                'filename':   filename,
+                'pdf_b64':    base64.b64encode(pdf_bytes).decode(),
+                'expires_at': expires.isoformat(),
+            }).execute()
+        except Exception as e:
+            print(f"[supabase] pdf save fail: {e}")
+
+
+def _load_pdf(token):
+    """In-Memory zuerst, dann Supabase. Returns (bytes, filename, expires) or None."""
+    entry = _store.get(token)
+    if entry and entry.get('pdf_bytes'):
+        return entry['pdf_bytes'], entry.get('filename') or 'AeroTax_Auswertung.pdf', entry.get('expires')
+    if SB_AVAILABLE:
+        try:
+            r = sb.table('pdfs').select('*').eq('token', token).limit(1).execute()
+            if r.data:
+                row = r.data[0]
+                exp = None
+                try:
+                    exp_str = (row.get('expires_at') or '').replace('Z', '').split('+')[0]
+                    exp = datetime.fromisoformat(exp_str)
+                    if exp < datetime.utcnow():
+                        return None
+                except: pass
+                pdf_bytes = base64.b64decode(row['pdf_b64'])
+                # In-Memory cachen
+                _store[token] = {'pdf_bytes': pdf_bytes, 'filename': row.get('filename'), 'expires': exp}
+                return pdf_bytes, row.get('filename') or 'AeroTax_Auswertung.pdf', exp
+        except Exception as e:
+            print(f"[supabase] pdf load fail: {e}")
+    return None
+
+
 @app.route('/api/download/<token>', methods=['GET'])
 def download_pdf(token):
-    entry = _store.get(token)
-    if not entry:
+    res = _load_pdf(token)
+    if not res:
         abort(404)
-    if datetime.utcnow() > entry.get('expires', datetime.utcnow()):
+    pdf_bytes, filename, expires = res
+    if expires and datetime.utcnow() > expires:
         abort(410)
     return send_file(
-        io.BytesIO(entry['pdf_bytes']),
+        io.BytesIO(pdf_bytes),
         mimetype='application/pdf',
         as_attachment=True,
-        download_name=entry.get('filename','AeroTax_Auswertung.pdf'),
+        download_name=filename,
     )
 
 
@@ -324,11 +373,7 @@ def demo():
 
     pdf   = erstelle_pdf(result)
     token = str(uuid.uuid4())
-    _store[token] = {
-        'pdf_bytes': pdf,
-        'filename':  'AeroTax_Auswertung_Demo_2025.pdf',
-        'expires':   datetime.utcnow() + timedelta(hours=1),
-    }
+    _save_pdf(token, pdf, 'AeroTax_Auswertung_Demo_2025.pdf', hours=1)
     safe = {k: v for k, v in result.items()
             if isinstance(v, (int, float, str))}
     return jsonify({'status':'ready',
@@ -453,9 +498,22 @@ def process_real():
         # ── PAYMENT-GATE: ref (Stripe), free_retry_token, oder valider Promo-Code ──
         free_retry_token = (request.form.get('free_retry_token') or '').strip()
         ref = (request.form.get('ref') or '').strip()
+        pi_id = (request.form.get('payment_intent_id') or '').strip()
         promo_code = (request.form.get('promo_code') or '').strip().upper()
         is_free_retry = bool(free_retry_token and free_retry_token in _recovery_tokens)
         is_paid = bool(ref and _store.get(ref, {}).get('paid'))
+        # Wenn Webhook noch nicht durch ist: PaymentIntent direkt bei Stripe verifizieren
+        if not is_paid and pi_id:
+            try:
+                pi = stripe.PaymentIntent.retrieve(pi_id)
+                if pi and pi.status == 'succeeded':
+                    is_paid = True
+                    if not ref:
+                        ref = (pi.metadata or {}).get('ref') or ''
+                    if ref and ref in _store:
+                        _store[ref]['paid'] = True
+            except Exception as _e:
+                print(f"[stripe] PI verify fail {pi_id[:12]}: {_e}")
         valid_promos = set(c.strip().upper() for c in os.environ.get('PROMO_CODES', 'AEROTAXFREEPASS26').split(',') if c.strip())
         is_promo = bool(promo_code and promo_code in valid_promos)
         allow_unpaid = os.environ.get('ALLOW_UNPAID') == '1'
@@ -539,11 +597,7 @@ def _run_process_async(job_id, form, files):
         token = str(uuid.uuid4())
         name = result['name'].replace(' ', '_')
         year = form.get('year', 2025)
-        _store[token] = {
-            'pdf_bytes': pdf_bytes,
-            'filename':  f'AeroTax_Auswertung_{year}_{name}.pdf',
-            'expires':   datetime.utcnow() + timedelta(hours=SESSION_HOURS),
-        }
+        _save_pdf(token, pdf_bytes, f'AeroTax_Auswertung_{year}_{name}.pdf')
         _audit(job_id, 'pdf_created', {'token': token, 'size_kb': len(pdf_bytes)//1024})
 
         # ── DATENSCHUTZ: ALLE Originaldateien sofort aus dem Speicher entfernen ──
@@ -2038,7 +2092,10 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
                     c2 = f(m_sum.group(2))
                     c3 = f(m_sum.group(3))
                     steuer = c3 if c3 > 0 else c2      # letzter vorhandener Wert = Steuer
-                    z77_page = round(g - steuer, 2)
+                    # Sanity-Check: Steuer kann nie größer als Gesamt sein → ggf. Spalten vertauscht
+                    if steuer > g and c2 > 0 and c2 < g:
+                        steuer = c2  # fallback: zweiter Wert ist Steuer, dritter wäre dann Steuerfrei
+                    z77_page = round(max(0, g - steuer), 2)
 
                     # Z73 Anreisetage dieser Seite: "14,00 FRA" in Einzelzeilen
                     z73_page = text.count('14,00 FRA')

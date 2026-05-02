@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions (expires_at);
 
+-- ─── PDF PERSISTENZ (überlebt Render-Restarts) ───
+CREATE TABLE IF NOT EXISTS pdfs (
+  token TEXT PRIMARY KEY,
+  filename TEXT NOT NULL,
+  pdf_b64 TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_pdfs_expires ON pdfs (expires_at);
+ALTER TABLE pdfs DISABLE ROW LEVEL SECURITY;
+
 -- ─── AUDIT LOG (optional Compliance) ───
 CREATE TABLE IF NOT EXISTS audit_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -66,6 +77,7 @@ ALTER TABLE answers DISABLE ROW LEVEL SECURITY;
 ALTER TABLE upvotes DISABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions DISABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs DISABLE ROW LEVEL SECURITY;
+ALTER TABLE pdfs DISABLE ROW LEVEL SECURITY;
 
 -- ─── Cleanup-Funktion: alte Sessions löschen ───
 CREATE OR REPLACE FUNCTION cleanup_expired_sessions()
