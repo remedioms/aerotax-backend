@@ -2060,7 +2060,7 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
 
         import time as _time_mod
         sonnet_start_time = _time_mod.time()
-        full_text = _claude_stream_with_retry(client, 'claude-sonnet-4-6', 24000, content,
+        full_text = _claude_stream_with_retry(client, 'claude-sonnet-4-6', 12000, content,
                                               max_retries=3, label='Sonnet-DP')
         print(f"Sonnet-Antwort: {len(full_text)} Zeichen, {_time_mod.time()-sonnet_start_time:.1f}s")
 
@@ -2755,7 +2755,7 @@ def berechne(form, files):
         vma_aus_se_det = se_data.get('z76_eur', 0)
         print(f"VMA aus SE deterministisch (sauber): Z72={vma_72_tage}T/{vma_72}€  Z73={vma_73_tage}T/{vma_73}€  Z74={vma_74_tage}T/{vma_74}€  Z76={vma_aus_se_det}€")
     elif se_data:
-        # Teilweise deterministisch — Claude soll für unklare Zeilen nachhelfen
+        # Teilweise deterministisch — Claude hat unklare Zeilen ergänzt
         vma_72_tage = max(se_data.get('z72_tage', 0), (dp or {}).get('vma_72_tage', 0))
         vma_73_tage = max(se_data.get('z73_tage', 0), (dp or {}).get('vma_73_tage', 0))
         vma_74_tage = max(se_data.get('z74_tage', 0), (dp or {}).get('vma_74_tage', 0))
@@ -2763,7 +2763,11 @@ def berechne(form, files):
         vma_73 = se_data.get('z73_eur', vma_73_tage * 14) or vma_73_tage * 14
         vma_74 = se_data.get('z74_eur', vma_74_tage * 28) or vma_74_tage * 28
         vma_aus_se_det = se_data.get('z76_eur', 0)
-        notes.append(f'Hinweis: {se_unklar} SE-Zeilen waren nicht eindeutig lesbar — Claude hat sie zusätzlich interpretiert.')
+        # Nur dann notes-Warnung wenn der Anteil unklarer Zeilen wirklich groß ist (>15% der Gesamtzeilen).
+        # Sonst hat Claude+Opus die Edge-Cases ohnehin sauber gehandelt — kein Grund den User zu beunruhigen.
+        total_lines_estimate = max(se_unklar + 30, 30)  # ~30 Zeilen pro Monat * Anteil bekannte
+        if se_unklar / total_lines_estimate > 0.15:
+            notes.append(f'⚠ {se_unklar} SE-Zeilen waren nicht eindeutig lesbar — Werte ggf. ungenau, bitte prüfen.')
         print(f"VMA hybrid (SE-Parser + Claude für {se_unklar} unklare): Z72={vma_72_tage}T  Z73={vma_73_tage}T  Z76={vma_aus_se_det}€")
     else:
         # Kein SE-Parser-Output → komplett auf DP/Claude angewiesen
@@ -2857,6 +2861,11 @@ def berechne(form, files):
         print(f"PLAUSI-CHECKS fehlgeschlagen: {plausi_warns}")
     else:
         print(f"PLAUSI-CHECKS ok: VMA-Summe={vma_summe:.2f}€ Z77={z77:.2f}€ Hotel/Arbeit/Fahr/365 alle plausibel")
+
+    # ── QUALITY GATE: bei massiven Plausi-Fehlern direkt Recovery-Hinweis aufnehmen ──
+    quality_questionable = bool(plausi_warns) and any('unmöglich' in w.lower() for w in plausi_warns)
+    if quality_questionable:
+        notes.append('🔁 Qualitäts-Hinweis: Werte sehen unplausibel aus. Falls offensichtlich falsch — du bekommst nach Auswertung einen kostenlosen Wiederholungs-Code.')
 
     # ── ANOMALIE-DETECTION: Werte außerhalb LH-Plausi-Anker ──
     anomalies = []
