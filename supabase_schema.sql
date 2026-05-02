@@ -61,6 +61,21 @@ CREATE TABLE IF NOT EXISTS pdfs (
 CREATE INDEX IF NOT EXISTS idx_pdfs_expires ON pdfs (expires_at);
 ALTER TABLE pdfs DISABLE ROW LEVEL SECURITY;
 
+-- ─── HOCHGELADENE DATEIEN (überlebt Render-Restarts während Bezahlung) ───
+CREATE TABLE IF NOT EXISTS uploaded_files (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ref TEXT NOT NULL,
+  key TEXT NOT NULL,
+  idx INT NOT NULL DEFAULT 0,
+  filename TEXT NOT NULL,
+  data_b64 TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_uploaded_files_ref ON uploaded_files (ref);
+CREATE INDEX IF NOT EXISTS idx_uploaded_files_expires ON uploaded_files (expires_at);
+ALTER TABLE uploaded_files DISABLE ROW LEVEL SECURITY;
+
 -- ─── AUDIT LOG (optional Compliance) ───
 CREATE TABLE IF NOT EXISTS audit_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

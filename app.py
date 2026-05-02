@@ -177,6 +177,83 @@ _ALL_FILE_KEYS = (
     'spen', 'part', 'kind', 'hand', 'haed', 'kiru',
 )
 
+UPLOAD_TTL_HOURS = 4   # Pre-Upload nur kurz aufbewahren — nach Auswertung gelöscht
+
+
+def _save_uploaded_files_supabase(ref, files_dict, hours=UPLOAD_TTL_HOURS):
+    """Persist uploaded files to Supabase 'uploaded_files' table.
+    files_dict: { key: [(bytes, filename), ...] } oder { key: [bytes, ...] }
+    """
+    if not SB_AVAILABLE or not files_dict:
+        return False
+    expires = (datetime.utcnow() + timedelta(hours=hours)).isoformat()
+    rows = []
+    for key, items in files_dict.items():
+        for idx, item in enumerate(items):
+            data = item[0] if isinstance(item, tuple) else item
+            fname = item[1] if isinstance(item, tuple) and len(item) > 1 else f'{key}_{idx}'
+            try:
+                rows.append({
+                    'ref':       ref,
+                    'key':       key,
+                    'idx':       idx,
+                    'filename':  fname or f'{key}_{idx}',
+                    'data_b64':  base64.b64encode(data).decode(),
+                    'expires_at': expires,
+                })
+            except Exception as e:
+                print(f"[supabase upload] encode fail {key}/{idx}: {e}")
+    if not rows:
+        return False
+    try:
+        # Erst alte Einträge für ref löschen, dann neu inserten
+        sb.table('uploaded_files').delete().eq('ref', ref).execute()
+        # In Batches von 5 inserten — JSONB-Rows können groß sein
+        for i in range(0, len(rows), 5):
+            sb.table('uploaded_files').insert(rows[i:i+5]).execute()
+        print(f"[supabase upload] ref={ref[:8]}: {len(rows)} Dateien persistiert")
+        return True
+    except Exception as e:
+        print(f"[supabase upload] save fail: {e}")
+        return False
+
+
+def _load_uploaded_files_supabase(ref):
+    """Return {key: [(bytes, filename), ...]} or {} if nothing/expired."""
+    if not SB_AVAILABLE or not ref:
+        return {}
+    try:
+        r = sb.table('uploaded_files').select('*').eq('ref', ref).execute()
+        if not r.data:
+            return {}
+        out = {}
+        now = datetime.utcnow()
+        for row in r.data:
+            try:
+                exp_str = (row.get('expires_at') or '').replace('Z', '').split('+')[0]
+                if datetime.fromisoformat(exp_str) < now:
+                    continue
+            except: pass
+            key = row['key']
+            data = base64.b64decode(row['data_b64'])
+            fname = row.get('filename') or f"{key}_{row.get('idx',0)}"
+            out.setdefault(key, []).append((row.get('idx', 0), data, fname))
+        # Sortieren nach idx, dann strip
+        return {k: [(d, f) for (_, d, f) in sorted(v)] for k, v in out.items()}
+    except Exception as e:
+        print(f"[supabase upload] load fail: {e}")
+        return {}
+
+
+def _delete_uploaded_files_supabase(ref):
+    """Cleanup nach erfolgreicher Auswertung — Datenschutz first."""
+    if not SB_AVAILABLE or not ref:
+        return
+    try:
+        sb.table('uploaded_files').delete().eq('ref', ref).execute()
+    except Exception as e:
+        print(f"[supabase upload] delete fail: {e}")
+
 
 @app.route('/api/upload-files', methods=['POST'])
 def upload_files():
@@ -200,6 +277,10 @@ def upload_files():
                     print(f"[upload-files] {key}/{f.filename} failed: {e}")
             if normalized:
                 _store[ref]['files'][key] = normalized
+
+    # Parallel auf Supabase persistieren — überlebt Render-Restart
+    if _store[ref].get('files'):
+        _save_uploaded_files_supabase(ref, _store[ref]['files'])
 
     print(f"[upload-files] ref={ref[:8]} {saved_count} Dateien gespeichert")
     return jsonify({'status': 'ok', 'count': saved_count})
@@ -509,17 +590,27 @@ def process_real():
             if uploaded:
                 files[key] = [_normalize_upload(f.read(), f.filename) for f in uploaded]
 
-        # Fallback: Falls keine Files in Form aber ref hat pre-uploaded Files in _store
+        # Fallback: Files aus _store (in-memory) — überlebt Stripe-Retry
         ref_for_fallback = (request.form.get('ref') or '').strip()
         if (not files.get('lsb') or not files.get('dp') or not files.get('se')) \
                 and ref_for_fallback and _store.get(ref_for_fallback, {}).get('files'):
             stored = _store[ref_for_fallback]['files']
             for k, items in stored.items():
                 if k in files:
-                    continue  # form hat Vorrang
-                # items sind (bytes, filename)-Tupel oder bytes
+                    continue
                 files[k] = [it[0] if isinstance(it, tuple) else it for it in items]
             print(f"[process] ref={ref_for_fallback[:8]} Files aus _store geladen ({sum(len(v) for v in files.values())} insgesamt)")
+
+        # Letzter Fallback: Supabase — überlebt Render-Restart
+        if (not files.get('lsb') or not files.get('dp') or not files.get('se')) \
+                and ref_for_fallback:
+            sb_files = _load_uploaded_files_supabase(ref_for_fallback)
+            if sb_files:
+                for k, items in sb_files.items():
+                    if k in files:
+                        continue
+                    files[k] = [d for (d, _) in items]
+                print(f"[process] ref={ref_for_fallback[:8]} Files aus Supabase geladen ({sum(len(v) for v in files.values())} insgesamt)")
 
         if not files.get('lsb') or not files.get('dp') or not files.get('se'):
             return jsonify({
@@ -600,6 +691,9 @@ def process_real():
                 'created':  datetime.utcnow().isoformat() + 'Z',
                 'session_token': session_token,
             }
+        # ref/pi_id ans form-dict heften — für späteren Cleanup nach erfolgreicher Auswertung
+        form['ref'] = ref or ''
+        form['pi_id'] = pi_id or ''
         _audit(job_id, 'job_created', {'year': form['year'], 'base': form['base'], 'files': {k: len(v) for k, v in files.items()}})
 
         Thread = __import__('threading').Thread
@@ -644,18 +738,26 @@ def _run_process_async(job_id, form, files):
         _save_pdf(token, pdf_bytes, f'AeroTax_Auswertung_{year}_{name}.pdf')
         _audit(job_id, 'pdf_created', {'token': token, 'size_kb': len(pdf_bytes)//1024})
 
-        # ── DATENSCHUTZ: ALLE Originaldateien sofort aus dem Speicher entfernen ──
-        # Files-Dict (eingegangene PDFs/Bilder) ist lokal im Thread → wird nach Funktion GC.
-        # Aber wir setzen sie explizit auf None um sicher zu gehen.
+        # ── DATENSCHUTZ: ALLE Originaldateien sofort aus dem Speicher + Supabase entfernen ──
         try:
             for k in list(files.keys()):
                 files[k] = None
             files.clear()
         except: pass
+        # In-Memory _store[ref].files auch leeren
+        try:
+            ref_used = (form.get('ref') if isinstance(form, dict) else '') or ''
+            if ref_used and ref_used in _store and _store[ref_used].get('files'):
+                _store[ref_used]['files'] = {}
+            # Supabase uploaded_files für ref löschen
+            if ref_used:
+                _delete_uploaded_files_supabase(ref_used)
+        except Exception as _de:
+            print(f"[cleanup] partial fail: {_de}")
         # File-bytes aus Result auch entfernen (Belege-Bilder waren da für PDF-Embedding)
         for b in result.get('optionale_belege', []):
             b.pop('file_bytes_list', None)
-        _audit(job_id, 'files_purged', {'note': 'Originaldokumente sofort nach PDF-Generierung gelöscht'})
+        _audit(job_id, 'files_purged', {'note': 'Originaldokumente sofort nach PDF-Generierung gelöscht (RAM + Supabase)'})
 
         safe = {k: v for k, v in result.items() if isinstance(v, (int, float, str))}
         opt_belege_safe = []
@@ -789,7 +891,27 @@ def full_health_check():
     # PIL/HEIF
     health['pil'] = 'ok' if PIL_AVAILABLE else 'missing'
     health['heif'] = 'ok' if HEIF_AVAILABLE else 'missing'
-    overall = 'ok' if all(v == 'ok' for k, v in health.items() if k not in ('timestamp', 'server')) else 'degraded'
+    # Stripe — verifiziert dass STRIPE_SECRET_KEY konfiguriert + valide ist
+    try:
+        if not stripe.api_key:
+            health['stripe'] = 'missing_key'
+        else:
+            stripe.Account.retrieve()
+            health['stripe'] = 'ok'
+    except Exception as e:
+        health['stripe'] = f'fail: {str(e)[:120]}'
+    # Supabase — DB read + uploaded_files / pdfs Tabellen erreichbar
+    if not SB_AVAILABLE:
+        health['supabase'] = 'not_configured'
+    else:
+        try:
+            sb.table('sessions').select('token').limit(1).execute()
+            sb.table('pdfs').select('token').limit(1).execute()
+            sb.table('uploaded_files').select('id').limit(1).execute()
+            health['supabase'] = 'ok'
+        except Exception as e:
+            health['supabase'] = f'fail: {str(e)[:120]}'
+    overall = 'ok' if all(v == 'ok' for k, v in health.items() if k not in ('timestamp', 'server', 'heif')) else 'degraded'
     health['overall'] = overall
     return jsonify(health), 200 if overall == 'ok' else 503
 
@@ -884,6 +1006,18 @@ def _cleanup_loop():
                         os.remove(path)
                         print(f"[cleanup] old job file deleted: {fn[:24]}")
                 except: pass
+            # Abgelaufene uploaded_files in Supabase löschen
+            if SB_AVAILABLE:
+                try:
+                    now = datetime.utcnow().isoformat()
+                    sb.table('uploaded_files').delete().lt('expires_at', now).execute()
+                except Exception as e:
+                    print(f"[cleanup] supabase uploaded_files: {e}")
+                # Abgelaufene PDFs ebenfalls
+                try:
+                    sb.table('pdfs').delete().lt('expires_at', now).execute()
+                except Exception as e:
+                    print(f"[cleanup] supabase pdfs: {e}")
         except: pass
 
 
