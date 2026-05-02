@@ -3,21 +3,14 @@
     "codename": "MaxausFRA",
     "title": "fra gva otp fra wieviel fahrtage",
     "body": "moin. hatte letzte woche fra gva otp fra ohne zwischenzulanden in fra. wieviel fahrtage trag ich da ein? mein kollege sagt 3, ich dachte 1. wer hat recht?",
-    "aerotax_answer": "1 Fahrtag stimmt. Du fährst einmal hin (zu FRA für den Tour-Start) und einmal zurück nach Hause am Ende. Was zwischen drin passiert sind Strecken-Wechsel auf Tour, das zählt nicht extra.\n\nWäre nur anders wenn du irgendwann zwischendurch wirklich in FRA gelandet wärst. Aber wenn du durchläufst FRA→GVA→OTP→FRA = 1 Tour = 1 Fahrtag.\n\nDein Kollege liegt falsch. Vermutlich zählt er pro Strecke statt pro Tour, klassischer Fehler.\n\n⚠ Hinweis: Orientierungshilfe, kein Ersatz für Steuerberater (§3 StBerG).",
-    "tags": ["fahrtag", "tour"]
+    "aerotax_answer": "1 Fahrtag stimmt. Du fährst einmal hin und einmal zurück, was zwischendrin passiert sind nur Strecken-Wechsel auf Tour. Das zählt nicht extra.\n\nWäre nur anders wenn du dazwischen wirklich in FRA gelandet wärst. Dein Kollege liegt falsch, vermutlich zählt er pro Strecke statt pro Tour.\n\nHinweis: Orientierungshilfe, kein Ersatz für Steuerberater (§3 StBerG).",
+    "tags": ["fahrtage"]
   },
   {
     "codename": "AnnaCabin",
-    "title": "crew rest auf langstrecke = hotelnacht?",
-    "body": "habe gestern auf SIN FRA 4h in der bunk gepennt. kann ich für die nacht jetzt die 3,60 hotel pauschale ansetzen oder nicht?",
-    "aerotax_answer": "Leider nein. Crew Rest Compartment im Flieger ist keine Hotelübernachtung steuerlich, auch wenn du da gut geschlafen hast.\n\nDie 3,60 Trinkgeld-Pauschale ist dafür gedacht dass du dem Hotel-Personal Trinkgeld gibst (Concierge, Zimmer-Service). Im Flieger gibt's das halt nicht.\n\nEASA selbst trennt das: nur Layover am Boden (mind. 10h Bodenzeit) zählt als richtige Hotelnacht. In-Flight Rest nicht.\n\nWas du aber kriegst: Z76 für deine Tage in Singapur am Boden plus 3,60 für jede SIN Hotelnacht. Nur die Heimflug Nacht zählt nicht.\n\n⚠ Hinweis: Orientierungshilfe, kein Ersatz für Steuerberater (§3 StBerG).",
-    "tags": ["hotel", "crew-rest"]
-  },
-  {
-    "codename": "PilotPeter",
-    "title": "telefon 20% pauschale wirklich max?",
-    "body": "lese überall diese 20% telefon pauschale. ist das wirklich das limit oder kann man auch mehr ansetzen wenn man viel auslandsroaming für sby hat?",
-    "aerotax_answer": "20% sind die Pauschale ohne Nachweis. Mehr geht aber definitiv, brauchst halt Beleg.\n\nFür höher musst du eine 3-Monats-Aufstellung machen wo du dienstlich vs privat markierst. Mit Standby + Auslandsroaming sind 30 bis 40% gut argumentierbar.\n\nIst aber Aufwand. Bei 600€ Telefon im Jahr: 20% = 120€, 30% = 180€. Differenz × Steuersatz 35% sind so 21€ mehr. Dafür 3 Monate Buchhaltung führen lohnt sich oft nicht.\n\nMein praktischer Rat: bleib bei 20%, geht ohne Diskussion durch. Für mehr nur wenn du eh akribisch bist.\n\n⚠ Hinweis: Orientierungshilfe, kein Ersatz für Steuerberater (§3 StBerG).",
-    "tags": ["telefon", "pauschale"]
+    "title": "frage zu Z76 auf der LSB",
+    "body": "kapier das nicht. auf meiner LSB steht Z17 mit 360 und auf der streckeneinsatz Z77 mit 4742. mein vater sagt das ist alles steuerfrei, aber dann kann ich doch gar nichts mehr absetzen oder?",
+    "aerotax_answer": "Nicht ganz. Z77 ist tatsächlich was LH dir steuerfrei ausgezahlt hat (Spesen, Tagessätze). Aber die ZIEHST du am Ende von deinen Werbungskosten ab, du bekommst sie nicht doppelt.\n\nKonkret: deine Brutto-Werbungskosten (Fahrtkosten, Z76 Ausland, Reinigung, Trinkgelder, alles addiert) sind meistens 5000-6000 Euro. Davon ziehst du Z17 (360) und Z77 (4742) ab = was übrig bleibt ist dein Netto-Werbungskosten-Anspruch. Das trägst du in WISO ein.\n\nBei dir wären das geschätzt 200-1000 Euro die du noch geltend machen kannst, je nach Fahrtagen und Touren. Klingt wenig, aber bei deinem Steuersatz oft 70-300 Euro Erstattung.\n\nHinweis: Orientierungshilfe, kein Ersatz für Steuerberater (§3 StBerG).",
+    "tags": ["lsb", "z77", "grundlagen"]
   }
 ]
