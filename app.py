@@ -2866,15 +2866,17 @@ def berechne(form, files):
     if quality_questionable:
         notes.append('🔁 Qualitäts-Hinweis: Werte sehen unplausibel aus. Falls offensichtlich falsch — du bekommst nach Auswertung einen kostenlosen Wiederholungs-Code.')
 
-    # ── ANOMALIE-DETECTION: Werte außerhalb LH-Plausi-Anker ──
+    # ── ANOMALIE-DETECTION: Werte außerhalb realistischer Bandbreite ──
+    # Bandbreiten sind großzügig — nur extreme Ausreißer werden geflaggt.
+    # Teilzeit-Mitarbeiter, Mutterschutz-Phasen etc. sollen NICHT geflaggt werden.
     anomalies = []
-    if arbeitstage > 0 and (arbeitstage < 60 or arbeitstage > 200):
-        anomalies.append(f'Arbeitstage {arbeitstage} außerhalb LH-Norm (60-200)')
-    if fahr_tage > 0 and (fahr_tage < 20 or fahr_tage > 80):
-        anomalies.append(f'Fahrtage {fahr_tage} außerhalb LH-Norm (20-80)')
-    if hotel_naechte > 0 and hotel_naechte > 90:
-        anomalies.append(f'Hotelnächte {hotel_naechte} sehr hoch — bitte prüfen')
-    if vma_aus > 12000:
+    if arbeitstage > 250:
+        anomalies.append(f'Arbeitstage {arbeitstage} sehr hoch (>250) — bitte prüfen')
+    if fahr_tage > arbeitstage and arbeitstage > 0:
+        anomalies.append(f'Fahrtage {fahr_tage} > Arbeitstage {arbeitstage} — unmöglich')
+    if hotel_naechte > 120:
+        anomalies.append(f'Hotelnächte {hotel_naechte} sehr hoch (>120) — bitte prüfen')
+    if vma_aus > 15000:
         anomalies.append(f'VMA Ausland {vma_aus:.0f}€ sehr hoch — bitte prüfen')
     if anomalies:
         for a in anomalies:
