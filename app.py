@@ -2087,7 +2087,7 @@ def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
         r'(FREIER\s*TAG|FREI\b|URLAUB|KRANK|ARBEITSUNFAEHIG|UNBEZAHLT|MUTTERSCHUTZ'
         r'|ELTERNZEIT|^OF\s|^/-\s|^FR\s|^U\s|^K\s|NACHGEWAEHRUNG|KEIN\s+DIENST)', r, re.I))
     is_home_duty = lambda r: bool(re.search(
-        r'\b(SBY|RES|RESERVE|STANDBY|ONLINE|E-LEARNING|ELEARNING|HOME)\b', r, re.I))
+        r'\b(SBY|RES|RESERVE|STANDBY|ONLINE|E-LEARNING|ELEARNING|HOME|RB|RUFBEREITSCHAFT)\b', r, re.I))
     is_office_duty = lambda r: bool(re.search(
         r'\b(EM|EK|D4|EH|BRIEFING|SCHULUNG|SM|MEDICAL|SPRACHTEST)\b', r))
     is_layover = lambda r: bool(re.search(
@@ -3188,24 +3188,46 @@ Wenn absolut kein Betrag erkennbar: {{"betrag": 0}}"""
             except json.JSONDecodeError:
                 m = re.search(r'\{[^{}]*"betrag"[^{}]*\}', raw, re.DOTALL)
                 parsed = json.loads(m.group(0)) if m else {}
+            betrag_raw = float(parsed.get('betrag', 0) or 0)
+            # ── Pauschale-Fallback wenn Claude keinen Betrag rauskriegt ──
+            # (User hat einen Beleg hochgeladen, aber Bild/PDF unleserlich)
+            beschreibung = parsed.get('beschreibung', '')
+            if betrag_raw == 0:
+                if key == 'tel':
+                    betrag_raw = 240.0  # Telefon-Pauschale 20€/Monat (R 9.1 Abs. 5 LStR)
+                    beschreibung = 'Pauschale 20€/Monat — Beleg unleserlich, Pauschale angesetzt (BFH 11.10.2007)'
+                elif key == 'konz':
+                    betrag_raw = 16.0   # Kontoführungs-Pauschale
+                    beschreibung = 'Pauschale 16€/Jahr (BFH 09.05.1984)'
+                else:
+                    beschreibung = 'Betrag konnte nicht extrahiert werden — bitte Beleg manuell prüfen'
             results.append({
                 'key': key,
                 'icon': info['icon'],
                 'name': info['name'],
                 'wiso': info['wiso'],
                 'hint': info['hint'],
-                'betrag': float(parsed.get('betrag', 0)),
+                'betrag': betrag_raw,
                 'zeitraum': parsed.get('zeitraum', '2025'),
-                'beschreibung': parsed.get('beschreibung', ''),
-                'file_bytes_list': files[key],  # Store raw files for PDF embedding
+                'beschreibung': beschreibung,
+                'file_bytes_list': files[key],
             })
         except Exception as e:
             print(f'Optional doc {key} error: {e}')
+            # Bei kompletten Parser-Fehlern: Pauschale-Fallback wo legitim
+            fallback_betrag = 0.0
+            fallback_desc = 'Betrag konnte nicht extrahiert werden'
+            if key == 'tel':
+                fallback_betrag = 240.0
+                fallback_desc = 'Pauschale 20€/Monat (BFH 11.10.2007) — Beleg unleserlich'
+            elif key == 'konz':
+                fallback_betrag = 16.0
+                fallback_desc = 'Pauschale (BFH 09.05.1984)'
             results.append({
                 'key': key, 'icon': info['icon'], 'name': info['name'],
                 'wiso': info['wiso'], 'hint': info['hint'],
-                'betrag': 0, 'zeitraum': '2025',
-                'beschreibung': 'Betrag konnte nicht extrahiert werden',
+                'betrag': fallback_betrag, 'zeitraum': '2025',
+                'beschreibung': fallback_desc,
                 'file_bytes_list': files[key],
             })
 
@@ -3590,17 +3612,8 @@ def berechne(form, files):
     reinig = round(arbeitstage * reinig_satz, 2)
     trink  = round(hotel_naechte * trink_satz, 2)
 
-    # ── AUTO-PAUSCHALEN (rechtlich anerkannt für Cabin/Cockpit Crew, ohne Beleg) ──
-    # Telefon-Pauschale: 20€/Monat = 240€/Jahr (BFH 11.10.2007 / R 9.1 Abs. 5 LStR)
-    # Cabin Crew nutzt Smartphone für Roster-App, eAZE, Crew-Portal, Briefings
-    telefon_pauschale = 240.0
-    # Kontoführungs-Pauschale: 16€/Jahr (BFH 09.05.1984 / OFD-Verfügung)
-    kontofuehrung_pauschale = 16.0
-    # Werbungskosten-Pauschalen, die ohne Beleg vom Finanzamt anerkannt werden
-    auto_pauschalen = telefon_pauschale + kontofuehrung_pauschale
-
     # ── GESAMTBERECHNUNG ─────────────────────────────────────
-    gesamt = round(fahr + reinig + trink + vma_in + vma_aus + auto_pauschalen, 2)
+    gesamt = round(fahr + reinig + trink + vma_in + vma_aus, 2)
     netto  = round(gesamt - ag_z17 - z77, 2)
 
     # ── MATHEMATISCHE PLAUSI-CHECKS ──────────────────────────
@@ -3737,8 +3750,6 @@ def berechne(form, files):
         'fahr':             fahr,
         'reinig':           reinig,
         'trink':            trink,
-        'telefon':          telefon_pauschale,
-        'kontofuehrung':    kontofuehrung_pauschale,
         'gesamt':           gesamt,
         # Abzüge
         'ag_z17':           ag_z17,
