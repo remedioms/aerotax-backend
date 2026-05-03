@@ -180,7 +180,7 @@ _ALL_FILE_KEYS = (
     'lapt', 'fach', 'reini', 'bewer',
     'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
     'arzt', 'zahn', 'medi', 'pfle', 'under', 'kata',
-    'spen', 'part', 'kind', 'hand', 'haed', 'kiru',
+    'spen', 'part', 'kind', 'hand', 'haed',
 )
 
 UPLOAD_TTL_HOURS = 4   # Pre-Upload nur kurz aufbewahren — nach Auswertung gelöscht
@@ -3065,7 +3065,7 @@ def parse_optionale_belege(files):
         'reini':{'name':'Reinigung extra', 'wiso':'Werbungskosten → Sonstiges → Reinigung Berufskleidung', 'hint':'Mit Beleg über Pauschale hinaus', 'icon':'🧴'},
         'bewer':{'name':'Bewerbungskosten', 'wiso':'Werbungskosten → Sonstiges → Bewerbungskosten', 'hint':'Fahrtkosten, Bewerbungsmappen, Porto', 'icon':'💼'},
         'gew':  {'name':'Gewerkschaft / UFO', 'wiso':'Werbungskosten → Gewerkschaftsbeiträge', 'hint':'Voller Jahresbeitrag absetzbar', 'icon':'✊'},
-        'stb':  {'name':'Steuerberatung', 'wiso':'Sonderausgaben → Steuerberatungskosten', 'hint':'Voller Betrag absetzbar', 'icon':'📋'},
+        'stb':  {'name':'Steuerberatung', 'wiso':'Werbungskosten → Sonstiges → Steuerberatungskosten', 'hint':'Nur Werbungskosten-Anteil (BFH X R 10/08)', 'icon':'📋'},
         'bu':   {'name':'BU-Versicherung', 'wiso':'Vorsorgeaufwendungen → Sonstige Vorsorgeaufwendungen', 'hint':'Bis zum Höchstbetrag', 'icon':'🛡️'},
         'arzt': {'name':'Arztkosten', 'wiso':'Außergewöhnliche Belastungen → Krankheitskosten', 'hint':'Zumutbarkeitsgrenze beachten', 'icon':'🏥'},
         'zahn': {'name':'Zahnarzt', 'wiso':'Außergewöhnliche Belastungen → Krankheitskosten', 'hint':'Zumutbarkeitsgrenze beachten', 'icon':'🦷'},
@@ -3077,12 +3077,11 @@ def parse_optionale_belege(files):
         'kind': {'name':'Kinderbetreuung', 'wiso':'Sonderausgaben → Kinderbetreuungskosten', 'hint':'2/3 der Kosten, max. 4.000€', 'icon':'👶'},
         'rv':   {'name':'Altersvorsorge', 'wiso':'Vorsorgeaufwendungen → Beiträge zur Altersvorsorge', 'hint':'Riester/Rürup Grenzen beachten', 'icon':'💰'},
         'haft': {'name':'Haftpflicht', 'wiso':'Vorsorgeaufwendungen → Sonstige', 'hint':'Anteilig absetzbar', 'icon':'⚖️'},
-        'kiru': {'name':'Kirchensteuer', 'wiso':'Sonderausgaben → Kirchensteuer', 'hint':'Voller Betrag', 'icon':'⛪'},
         'medi': {'name':'Medikamente', 'wiso':'Außergewöhnliche Belastungen → Krankheitskosten', 'hint':'Mit ärztlicher Verordnung', 'icon':'💊'},
         'konz': {'name':'Kontoführung', 'wiso':'Werbungskosten → Sonstige Werbungskosten', 'hint':'Pauschal 16€ oder Nachweis', 'icon':'🏦'},
         'kv':   {'name':'Krankenzusatz', 'wiso':'Vorsorgeaufwendungen → Sonstige', 'hint':'Anteilig', 'icon':'🦷'},
         'leb':  {'name':'Lebensversicherung', 'wiso':'Vorsorgeaufwendungen → Sonstige', 'hint':'Falls vor 2005', 'icon':'💚'},
-        'haus': {'name':'Hausrat & Rechtsschutz', 'wiso':'Vorsorgeaufwendungen → Sonstige', 'hint':'Anteilig', 'icon':'🏠'},
+        'haus': {'name':'Hausrat & Rechtsschutz', 'wiso':'Vorsorgeaufwendungen → Sonstige (nur beruflich)', 'hint':'Nur beruflicher Anteil (z.B. Berufsrechtsschutz)', 'icon':'🏠'},
         'pfle': {'name':'Pflege & Behinderung', 'wiso':'Außergewöhnliche Belastungen → Pflegekosten', 'hint':'Je nach Pflegegrad', 'icon':'🤝'},
         'under':{'name':'Unterhalt', 'wiso':'Außergewöhnliche Belastungen → Unterhalt', 'hint':'Max. 11.604€', 'icon':'👨‍👧'},
         'kata': {'name':'Außergewöhnl. Belastungen', 'wiso':'Außergewöhnliche Belastungen → Sonstige', 'hint':'Zumutbarkeitsgrenze', 'icon':'⛈️'},
@@ -3680,7 +3679,7 @@ def berechne(form, files):
     opt_keys = ['stb','gew','arb','fort','tel','konz',
                 'lapt','fach','reini','bewer',
                 'bu','haft','kv','rv','leb','haus','arzt','zahn','medi','pfle','under',
-                'kata','spen','part','kind','hand','haed','kiru']
+                'kata','spen','part','kind','hand','haed']
     opt_files = {k: files[k] for k in opt_keys if files.get(k)}
     optionale_belege = parse_optionale_belege(opt_files) if opt_files else []
 
