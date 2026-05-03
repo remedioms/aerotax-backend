@@ -3685,28 +3685,29 @@ def berechne(form, files):
 
     # ── Z72-BOOST: pro-Tag Block-Time-aware mit AUTO-Briefing-Detection ──
     # LH Standard Operating Procedure für Cabin Crew:
-    #   - Continental (Block ≤4h):  60 Min Briefing + 30 Min Debrief
-    #   - Mid-haul    (Block 4-7h): 75 Min Briefing + 45 Min Debrief
-    #   - Long-haul   (Block >7h):  90 Min Briefing + 60 Min Debrief
-    # Inland-Tagestrips (Z72 relevant) sind ~immer Continental → 60+30.
+    #   - Continental (Block ≤4h):  60 Min Briefing + 30 Min Sign-Off
+    #   - Mid-haul    (Block 4-7h): 75 Min Briefing + 30 Min Sign-Off
+    #   - Long-haul   (Block >7h):  90 Min Briefing + 30 Min Sign-Off
+    # Sign-Off (Nacharbeitung) ist bei LH einheitlich ~30 Min für alle Tour-Typen.
     # Anfahrt: aus km × 1,5 min/km, oder 30 min Default.
+    NACHARB_MIN = 30  # einheitlich für alle Tour-Typen
     anfahrt_min = max(0, int(km * 1.5)) if km > 0 else 30
     if dp:
         candidates = (dp or {}).get('z72_candidates') or []
         qualifying = []
         for cand in candidates:
             block_m = cand.get('block_min', 0)
-            # Auto-Briefing/Debrief nach LH SOP basierend auf Block-Time
+            # Auto-Briefing nach LH SOP basierend auf Block-Time
             if block_m <= 240:
-                briefing_min, nacharb_min = 60, 30   # Continental
+                briefing_min = 60   # Continental
             elif block_m <= 420:
-                briefing_min, nacharb_min = 75, 45   # Mid-haul
+                briefing_min = 75   # Mid-haul
             else:
-                briefing_min, nacharb_min = 90, 60   # Long-haul
-            abw = anfahrt_min + briefing_min + block_m + nacharb_min + anfahrt_min
+                briefing_min = 90   # Long-haul
+            abw = anfahrt_min + briefing_min + block_m + NACHARB_MIN + anfahrt_min
             if abw >= 480:
                 qualifying.append({**cand, 'abwesenheit_min': abw,
-                                   'briefing_used': briefing_min, 'debrief_used': nacharb_min})
+                                   'briefing_used': briefing_min})
         if len(qualifying) > vma_72_tage:
             added = len(qualifying) - vma_72_tage
             vma_72_tage = len(qualifying)
@@ -3714,7 +3715,7 @@ def berechne(form, files):
             vma_in = vma_72 + vma_73 + vma_74
             notes.append(
                 f'ℹ Pro-Tag-Berechnung: {added} Inland-Tagestrips erreichen §9-EStG 8h-Schwelle '
-                f'(LH SOP Briefing/Debrief auto + Anfahrt 2×{anfahrt_min}min) → +{added*int(bmf_inland["tagestrip_8h"])}€.'
+                f'(LH SOP Briefing + 30 min Sign-Off + Anfahrt 2×{anfahrt_min}min) → +{added*int(bmf_inland["tagestrip_8h"])}€.'
             )
 
     # ── REINIGUNG & TRINKGELD (jahr-konform) ─────────────────
