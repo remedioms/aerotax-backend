@@ -177,7 +177,7 @@ def create_payment_intent():
 _ALL_FILE_KEYS = (
     'lsb', 'dp', 'se',
     'stb', 'gew', 'arb', 'fort', 'tel', 'konz',
-    'lapt', 'fach', 'reini', 'bewer', 'doha',
+    'lapt', 'fach', 'reini', 'bewer',
     'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
     'arzt', 'zahn', 'medi', 'pfle', 'under', 'kata',
     'spen', 'part', 'kind', 'hand', 'haed', 'kiru',
@@ -3064,7 +3064,6 @@ def parse_optionale_belege(files):
         'fach': {'name':'Fachliteratur', 'wiso':'Werbungskosten → Sonstiges → Fachbücher', 'hint':'Bücher und Zeitschriften zum Beruf', 'icon':'📚'},
         'reini':{'name':'Reinigung extra', 'wiso':'Werbungskosten → Sonstiges → Reinigung Berufskleidung', 'hint':'Mit Beleg über Pauschale hinaus', 'icon':'🧴'},
         'bewer':{'name':'Bewerbungskosten', 'wiso':'Werbungskosten → Sonstiges → Bewerbungskosten', 'hint':'Fahrtkosten, Bewerbungsmappen, Porto', 'icon':'💼'},
-        'doha': {'name':'Doppelter Haushalt', 'wiso':'Werbungskosten → Doppelter Haushalt', 'hint':'2. Wohnung am Arbeitsort', 'icon':'🏘️'},
         'gew':  {'name':'Gewerkschaft / UFO', 'wiso':'Werbungskosten → Gewerkschaftsbeiträge', 'hint':'Voller Jahresbeitrag absetzbar', 'icon':'✊'},
         'stb':  {'name':'Steuerberatung', 'wiso':'Sonderausgaben → Steuerberatungskosten', 'hint':'Voller Betrag absetzbar', 'icon':'📋'},
         'bu':   {'name':'BU-Versicherung', 'wiso':'Vorsorgeaufwendungen → Sonstige Vorsorgeaufwendungen', 'hint':'Bis zum Höchstbetrag', 'icon':'🛡️'},
@@ -3679,7 +3678,7 @@ def berechne(form, files):
 
     # ── OPTIONALE BELEGE (User-Upload — Telefon, Gewerkschaft, etc) ──
     opt_keys = ['stb','gew','arb','fort','tel','konz',
-                'lapt','fach','reini','bewer','doha',
+                'lapt','fach','reini','bewer',
                 'bu','haft','kv','rv','leb','haus','arzt','zahn','medi','pfle','under',
                 'kata','spen','part','kind','hand','haed','kiru']
     opt_files = {k: files[k] for k in opt_keys if files.get(k)}
