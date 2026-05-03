@@ -401,12 +401,69 @@ def download_pdf(token):
     pdf_bytes, filename, expires = res
     if expires and datetime.utcnow() > expires:
         abort(410)
+    # PDF-Download = finaler Bescheid → Edit-Token verbrauchen
+    try:
+        sess_tok = (_store.get(token) or {}).get('session_token')
+        if sess_tok:
+            _mark_session_consumed(sess_tok)
+    except Exception as e:
+        print(f"[download] consume-mark fail: {e}")
     return send_file(
         io.BytesIO(pdf_bytes),
         mimetype='application/pdf',
         as_attachment=True,
         download_name=filename,
     )
+
+
+def _mark_session_consumed(token):
+    """Markiert Session als final (nach PDF-Download). Restore wird damit blockiert."""
+    s = _load_session(token)
+    if not s: return
+    rd = s.get('result_data') or {}
+    if rd.get('_consumed_at'): return  # bereits consumed
+    rd['_consumed_at'] = datetime.utcnow().isoformat() + 'Z'
+    s['result_data'] = rd
+    _save_session(token, s)
+    print(f"[session] {token[:8]}... consumed (PDF downloaded)")
+
+
+@app.route('/api/restore-session/<token>', methods=['POST'])
+def restore_session(token):
+    """User gibt AT-Code ein → bekommt Form-Werte zurück + Free-Retry-Token, kann
+    Files erneut hochladen ohne erneut zu zahlen. PDF-Download invalidiert das.
+    """
+    token = (token or '').strip().upper()
+    if not token.startswith('AT-'):
+        return jsonify({'error': 'Ungültiges Code-Format'}), 400
+    s = _load_session(token)
+    if not s:
+        return jsonify({'error': 'Code abgelaufen oder ungültig (24h-Frist)'}), 404
+    rd = s.get('result_data') or {}
+    if rd.get('_consumed_at'):
+        return jsonify({
+            'error': 'Code bereits verbraucht — du hast die Auswertung als PDF heruntergeladen. '
+                     'Eine neue Berechnung erfordert Neukauf.',
+            'consumed': True,
+        }), 410
+    form_inputs = rd.get('_form_inputs') or {}
+    if not form_inputs:
+        return jsonify({'error': 'Keine speicherbaren Form-Werte gefunden — Session zu alt.'}), 422
+
+    # Free-Retry-Token vergeben (60 Min Fenster für Neuberechnung)
+    info = _recovery_tokens.get(token, {})
+    _recovery_tokens[token] = {
+        'token': token,
+        'retries_used': int(info.get('retries_used', 0)),  # nicht hochzählen — Edit ≠ Recovery
+        'expires': (datetime.utcnow() + timedelta(minutes=60)).isoformat() + 'Z',
+        'kind': 'edit',
+    }
+    return jsonify({
+        'ok': True,
+        'form_inputs':      form_inputs,
+        'free_retry_token': token,
+        'message': 'Du kannst jetzt deine Dateien erneut hochladen und neu berechnen — kostenlos.',
+    })
 
 
 # Demo ohne Zahlung (gibt Fallback-Werte zurück)
@@ -602,6 +659,8 @@ def process_real():
 
         form = {
             'name':    request.form.get('name', 'Flugbegleiter'),
+            'vorname': request.form.get('vorname', ''),
+            'nachname':request.form.get('nachname', ''),
             'year':    year_input,
             'base':    request.form.get('base', 'Frankfurt (FRA)'),
             'anreise': anreise,
@@ -794,6 +853,23 @@ def _run_process_async(job_id, form, files):
             b_safe = {k: v for k, v in b.items() if k != 'file_bytes_list'}
             opt_belege_safe.append(b_safe)
 
+        # Form-Inputs für Edit-Restore mit-speichern (alle User-Eingaben)
+        safe['_form_inputs'] = {
+            'name':           form.get('name', ''),
+            'vorname':        form.get('vorname', ''),
+            'nachname':       form.get('nachname', ''),
+            'year':           form.get('year', 2025),
+            'base':           form.get('base', 'Frankfurt (FRA)'),
+            'anreise':        form.get('anreise', 'auto'),
+            'km':             form.get('km', 0),
+            'fahrzeug':       form.get('fahrzeug', 'verbrenner'),
+            'oepnv_kosten':   form.get('oepnv_kosten', 0),
+            'shuttle_kosten': form.get('shuttle_kosten', 0),
+            'jobticket':      form.get('jobticket', 'nein'),
+            'anfahrt_min':    form.get('anfahrt_min', 0),
+        }
+        safe['_consumed_at'] = None  # wird beim PDF-Download gesetzt
+
         # Session-Token wurde bereits beim job_created erstellt — jetzt nur Result reinpacken
         with _jobs_lock:
             session_token = _jobs[job_id].get('session_token')
@@ -805,6 +881,8 @@ def _run_process_async(job_id, form, files):
                 'download_url': f'/api/download/{token}',
                 'chat_history': [],
             })
+            # Verknüpfung dl_token → session_token, damit Download den Token consumen kann
+            _store.setdefault(token, {})['session_token'] = session_token
 
         with _jobs_lock:
             _jobs[job_id] = {
@@ -2169,22 +2247,37 @@ def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
         has_e = bool(e_matches)
 
         if has_a and has_e:
-            # SAME-DAY-TOUR: A FRA → DEST und E DEST → FRA am gleichen Tag
+            # Zwei Sub-Cases:
+            # A) Turnaround: in_tour war True → User landet morgens UND startet neue Tour abends
+            #    → 1 Arbeitstag, KEIN zusätzlicher Fahrtag (User war am FRA, kein Heim-Pendel),
+            #      2× Z73 bei Inland-Routen, in_tour bleibt True (neue Tour aktiv).
+            # B) Same-Day-Tour: in_tour war False → A FRA → DEST → E DEST → FRA am gleichen Tag
+            #    → 1 Arbeitstag, 1 Fahrtag, ggf. Z72.
             arbeitstage += 1
-            fahrtage += 1
-            in_tour = False
-            ziel = a_matches[0]
-            if ziel in INLAND_IATA:
-                z72_inland_days += 1
-                # Block-Time für Z72-Boost-Berechnung mitgeben
-                block_min = _block_span_minutes(rests)
-                if block_min is not None:
-                    z72_candidates.append({
-                        'date': date_key,
-                        'block_min': block_min,
-                        'dest': ziel,
-                    })
-            # Auslands-Same-Day-Tour: kein Z72 (das wäre Z76, kommt aus SE)
+            origin = e_matches[0]
+            ziel   = a_matches[0]
+            if in_tour:
+                # Turnaround
+                if origin in INLAND_IATA:
+                    z73_inland_days += 1  # alte Tour Abreise
+                if ziel in INLAND_IATA:
+                    z73_inland_days += 1  # neue Tour Anreise
+                tour_inland_only = (ziel in INLAND_IATA)
+                # in_tour bleibt True
+            else:
+                # Echte Same-Day-Tour
+                fahrtage += 1
+                in_tour = False
+                if ziel in INLAND_IATA:
+                    z72_inland_days += 1
+                    block_min = _block_span_minutes(rests)
+                    if block_min is not None:
+                        z72_candidates.append({
+                            'date': date_key,
+                            'block_min': block_min,
+                            'dest': ziel,
+                        })
+                # Auslands-Same-Day-Tour: kein Z72 (das wäre Z76, kommt aus SE)
             continue
 
         if has_a:
@@ -3421,6 +3514,48 @@ Antworte NUR mit JSON (keine Backticks):
         notes = data.pop('notes', [f'Fehlende Daten ({missing_str}) wurden aus vorhandenen Dokumenten geschätzt.'])
         inferred = data
         print(f"Inference successful: {list(inferred.keys())}")
+
+        # ── OPUS-VERIFY bei hohem Z76 (>4000€) ────────────────────
+        # Bei großen Auslandsspesen-Beträgen schickt ein zweiter Pass das Sonnet-Ergebnis
+        # samt Originaltext zu Opus zur Plausibilitäts-Prüfung. Korrekturen werden übernommen.
+        try:
+            vma_aus_val = float(inferred.get('vma_aus', 0) or 0)
+        except: vma_aus_val = 0.0
+        if vma_aus_val > 4000:
+            print(f"[opus-verify] Z76={vma_aus_val:.2f}€ > 4000 — Opus-Pass startet")
+            verify_prompt = (
+                "Du bist Senior-Steuerberater. Sonnet hat aus den unten stehenden LH-Dokumenten "
+                "diese Werte geschätzt. Bei großen Z76-Werten (>4000€) ist eine Zweit-Verifikation Pflicht.\n\n"
+                f"SONNET-ERGEBNIS:\n{json.dumps(data, ensure_ascii=False, indent=2)}\n\n"
+                f"DOKUMENTE (gleicher Kontext wie Sonnet):\n{context[:80000]}\n\n"
+                "Prüfe Z76 (vma_aus) auf Plausibilität — passt der Wert zur Anzahl/Distanz der "
+                "Auslandsdestinationen aus den Dokumenten? Sind 24h-Tage, An-/Abreise-Tage korrekt "
+                "klassifiziert? BMF-Sätze realistisch?\n\n"
+                "Antworte NUR mit JSON:\n"
+                '{"vma_aus_correct": true/false, "vma_aus_corrected": <Zahl|null>, '
+                '"reason": "kurze Begründung", "vma_72_corrected": <Zahl|null>, '
+                '"vma_73_corrected": <Zahl|null>, "vma_74_corrected": <Zahl|null>}'
+            )
+            try:
+                vresp = client.messages.create(
+                    model='claude-opus-4-7', max_tokens=600,
+                    messages=[{'role':'user','content': verify_prompt}]
+                )
+                vraw = re.sub(r'```json|```', '', vresp.content[0].text.strip()).strip()
+                vdata = json.loads(vraw)
+                if vdata.get('vma_aus_correct') is False:
+                    corrected = vdata.get('vma_aus_corrected')
+                    if isinstance(corrected, (int, float)) and corrected > 0:
+                        inferred['vma_aus'] = float(corrected)
+                        notes.append(f"Opus-Verify hat Z76 korrigiert ({vma_aus_val:.0f}€ → {corrected:.0f}€): {vdata.get('reason','')[:160]}")
+                    for fld in ('vma_72', 'vma_73', 'vma_74'):
+                        cor = vdata.get(f'{fld}_corrected')
+                        if isinstance(cor, (int, float)) and cor >= 0:
+                            inferred[fld] = float(cor)
+                else:
+                    print(f"[opus-verify] Z76 bestätigt: {vdata.get('reason','')[:120]}")
+            except Exception as ve:
+                print(f"[opus-verify] failed: {ve} — Sonnet-Werte bleiben")
     except Exception as e:
         print(f'Inference error: {e}')
         notes = [f'Schätzung fehlgeschlagen für: {missing_str}']
@@ -3477,9 +3612,23 @@ def berechne(form, files):
             se_data = None
         else:
             # Check if all 12 months present
-            months_found = len(se_data.get('abrechnungen', []))
+            abr_list = se_data.get('abrechnungen', [])
+            months_found = len(abr_list)
             if months_found < 12:
-                notes.append(f'Streckeneinsatz: {months_found} von 12 Monaten hochgeladen — fehlende Monate wurden nicht berücksichtigt')
+                # Welche Monate wurden erfasst?
+                detected_months = sorted({int(a.get('monat', 0) or 0) for a in abr_list if a.get('monat')})
+                month_names = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez']
+                detected_str = ', '.join(month_names[m-1] for m in detected_months if 1 <= m <= 12) or '?'
+                missing_months = [month_names[i] for i in range(12) if (i+1) not in detected_months]
+                # Geschätzter Spesen-Schnitt der erfassten Monate
+                avg_steuerfrei = sum(a.get('steuerfrei', 0) for a in abr_list) / max(1, months_found)
+                est_missing = round(avg_steuerfrei * (12 - months_found), 2)
+                notes.append(
+                    f'⚠️ ACHTUNG: Nur {months_found}/12 Streckeneinsatz-Abrechnungen erfasst '
+                    f'(erfasst: {detected_str}; fehlend: {", ".join(missing_months)}). '
+                    f'Geschätzter Verlust durch fehlende Monate: ~{est_missing:.0f}€ steuerfreie Spesen. '
+                    f'Tipp: lade die fehlenden Monate nach via "Mit Code anpassen" auf der Startseite.'
+                )
     else:
         missing.append('Streckeneinsatz-Abrechnungen (nicht hochgeladen)')
 
