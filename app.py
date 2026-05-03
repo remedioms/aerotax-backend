@@ -176,8 +176,9 @@ def create_payment_intent():
 
 _ALL_FILE_KEYS = (
     'lsb', 'dp', 'se',
-    'stb', 'gew', 'arb', 'fort', 'tel',
-    'konz', 'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
+    'stb', 'gew', 'arb', 'fort', 'tel', 'konz',
+    'lapt', 'koff', 'uni', 'fitn',
+    'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
     'arzt', 'zahn', 'medi', 'pfle', 'under', 'kata',
     'spen', 'part', 'kind', 'hand', 'haed', 'kiru',
 )
@@ -3057,6 +3058,10 @@ def parse_optionale_belege(files):
 
     WISO_PFADE = {
         'tel':  {'name':'Telefon & Internet', 'wiso':'Werbungskosten → Arbeitsmittel → Telefon & Internet', 'hint':'20% der Jahreskosten ansetzbar', 'icon':'📱'},
+        'lapt': {'name':'Laptop / Tablet', 'wiso':'Werbungskosten → Arbeitsmittel → Computer', 'hint':'Anteilig oder voll bei Berufsnutzung; ab 952€ AfA', 'icon':'💻'},
+        'koff': {'name':'Crew-Bag / Trolley', 'wiso':'Werbungskosten → Arbeitsmittel', 'hint':'Voll absetzbar wenn beruflich', 'icon':'🛄'},
+        'uni':  {'name':'Uniform-Teile', 'wiso':'Werbungskosten → Berufskleidung', 'hint':'Schuhe, Strümpfe, Hemden', 'icon':'👔'},
+        'fitn': {'name':'Fitness / Sport', 'wiso':'Werbungskosten → Sonstiges (falls dienstlich nötig)', 'hint':'Nur wenn beruflich erforderlich (Fluggesundheit)', 'icon':'💪'},
         'gew':  {'name':'Gewerkschaft / UFO', 'wiso':'Werbungskosten → Gewerkschaftsbeiträge', 'hint':'Voller Jahresbeitrag absetzbar', 'icon':'✊'},
         'stb':  {'name':'Steuerberatung', 'wiso':'Sonderausgaben → Steuerberatungskosten', 'hint':'Voller Betrag absetzbar', 'icon':'📋'},
         'bu':   {'name':'BU-Versicherung', 'wiso':'Vorsorgeaufwendungen → Sonstige Vorsorgeaufwendungen', 'hint':'Bis zum Höchstbetrag', 'icon':'🛡️'},
@@ -3653,8 +3658,9 @@ def berechne(form, files):
     trink  = round(hotel_naechte * trink_satz, 2)
 
     # ── OPTIONALE BELEGE (User-Upload — Telefon, Gewerkschaft, etc) ──
-    opt_keys = ['stb','gew','arb','fort','tel','konz','bu','haft','kv',
-                'rv','leb','haus','arzt','zahn','medi','pfle','under',
+    opt_keys = ['stb','gew','arb','fort','tel','konz',
+                'lapt','koff','uni','fitn',
+                'bu','haft','kv','rv','leb','haus','arzt','zahn','medi','pfle','under',
                 'kata','spen','part','kind','hand','haed','kiru']
     opt_files = {k: files[k] for k in opt_keys if files.get(k)}
     optionale_belege = parse_optionale_belege(opt_files) if opt_files else []
@@ -4468,70 +4474,8 @@ def erstelle_pdf(d):
                    fontName="Helvetica", leading=13, spaceAfter=4)))
 
 
-    # ── AUDIT-TRAIL: Quellen & Confidence pro Wert ──
-    S.append(PageBreak())
-    for el in section("Audit-Trail — Wie diese Werte entstanden sind"): S.append(el)
-    S.append(Paragraph(
-        "Maximale Transparenz: für jede Zahl in der Berechnung dokumentieren wir hier wie sie zustande kam — "
-        "deterministisch aus dem Originaldokument, KI-interpretiert oder per Senior-Prüfung verifiziert.",
-        ps("at_intro", fontSize=10, textColor=TEXT2, fontName="Helvetica",
-           leading=15, spaceAfter=14)))
-
-    # Quellen-Tabelle
-    src = d.get('_audit_source', {})
-    audit_rows = [
-        ('Z77 (steuerfrei gesamt)',  src.get('z77', 'deterministisch — Summe-Zeile aus SE')),
-        ('Z76 (VMA Ausland)',        src.get('z76', 'deterministisch — Σ stfrei-Werte aus SE')),
-        ('Z72 (Inland Tagestrip)',   src.get('z72', 'deterministisch — SE-Pattern AB+AN+Inland')),
-        ('Z73 (An-/Abreisetage)',    src.get('z73', 'deterministisch — SE-Pattern Einseite-Zeit+Inland-stfrei')),
-        ('Fahrtage',                 src.get('fahrtage', 'Parser + Sonnet + Opus')),
-        ('Arbeitstage',              src.get('arbeitstage', 'Parser + Sonnet + Opus')),
-        ('Hotelnächte',              src.get('hotel', 'Parser + Sonnet + Opus, EASA-FTL Layover-Regel')),
-        ('LSB-Werte (Brutto/Lohnsteuer/Z17)', 'deterministisch — Regex auf gesetzlichem LSB-Format'),
-        ('Optionale Belege',          'Claude Vision — Beträge aus Bildern/PDFs gelesen'),
-    ]
-    for label, source in audit_rows:
-        t = Table([[
-            Paragraph(label, ps(f"al{id(label)}", fontSize=9, textColor=TEXT,
-                fontName="Helvetica-Bold", leading=12)),
-            Paragraph(source, ps(f"as{id(source)}", fontSize=8.5, textColor=TEXT2,
-                fontName="Helvetica", leading=12)),
-        ]], colWidths=[6.5*cm, 10.3*cm])
-        t.setStyle(TableStyle([
-            ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
-            ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
-            ("LINEBELOW",(0,0),(-1,0),0.3,LINE),
-            ("VALIGN",(0,0),(-1,-1),"TOP"),
-        ]))
-        S.append(t)
-
-    S.append(Spacer(1, 0.6*cm))
-
-    # Verifikations-Status
-    verif = d.get('_verification', {})
-    if verif:
-        S.append(Paragraph("VERIFIKATIONS-STATUS",
-            ps("verif_h", fontSize=8, textColor=TEXT3, fontName="Helvetica-Bold",
-               leading=12, spaceAfter=8, letterSpacing=1.5)))
-        verif_lines = []
-        if verif.get('parser_clean'):
-            verif_lines.append('✓ Streckeneinsatz: Backend hat alle Zeilen deterministisch eingelesen')
-        else:
-            verif_lines.append(f'⚠ Streckeneinsatz: {verif.get("se_unklar",0)} Zeilen waren mehrdeutig — Claude hat zusätzlich interpretiert')
-        if verif.get('flug_clean'):
-            verif_lines.append('✓ Flugstunden: Backend hat alle Tage deterministisch klassifiziert')
-        else:
-            verif_lines.append(f'⚠ Flugstunden: {verif.get("flug_unklar",0)} Tage waren mehrdeutig — Claude + Opus haben verifiziert')
-        if verif.get('opus_used'):
-            verif_lines.append('✓ Senior-Verifikation durch Opus 4.7 (zweiter unabhängiger KI-Steuerberater)')
-        if verif.get('plausi_ok'):
-            verif_lines.append('✓ Mathematische Plausi-Checks bestanden (Z72+Z73+Z74+Z76 ≈ Z77, Hotel ≤ Arbeit, etc.)')
-        for vl in verif_lines:
-            color = HexColor('#34d399') if vl.startswith('✓') else HexColor('#fbbf24')
-            S.append(Paragraph(vl,
-                ps(f"vl{id(vl)}", fontSize=9, textColor=color, fontName="Helvetica",
-                   leading=14, spaceAfter=4)))
-
+    # Audit-Trail / Verifikations-Status komplett raus —
+    # User will nur die AeroTAX-Auswertung, keine KI-/Methodik-Hinweise im PDF.
     S.append(PageBreak())
     for el in section("Bestätigung & Unterschrift"): S.append(el)
 
