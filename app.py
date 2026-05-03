@@ -177,7 +177,7 @@ def create_payment_intent():
 _ALL_FILE_KEYS = (
     'lsb', 'dp', 'se',
     'stb', 'gew', 'arb', 'fort', 'tel', 'konz',
-    'lapt', 'koff', 'uni', 'fitn',
+    'lapt', 'fach', 'reini', 'bewer', 'doha',
     'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
     'arzt', 'zahn', 'medi', 'pfle', 'under', 'kata',
     'spen', 'part', 'kind', 'hand', 'haed', 'kiru',
@@ -600,6 +600,8 @@ def process_real():
             'oepnv_kosten': _safe_float(request.form.get('oepnv_kosten', 0)),
             'shuttle_kosten': _safe_float(request.form.get('shuttle_kosten', 0)),
             'jobticket':  request.form.get('jobticket', 'nein'),
+            'briefing_min': _safe_int(request.form.get('briefing_min', 60), 60),
+            'nacharb_min':  _safe_int(request.form.get('nacharb_min', 30), 30),
         }
 
         files = {}
@@ -3058,10 +3060,11 @@ def parse_optionale_belege(files):
 
     WISO_PFADE = {
         'tel':  {'name':'Telefon & Internet', 'wiso':'Werbungskosten → Arbeitsmittel → Telefon & Internet', 'hint':'20% der Jahreskosten ansetzbar', 'icon':'📱'},
-        'lapt': {'name':'Laptop / Tablet', 'wiso':'Werbungskosten → Arbeitsmittel → Computer', 'hint':'Anteilig oder voll bei Berufsnutzung; ab 952€ AfA', 'icon':'💻'},
-        'koff': {'name':'Crew-Bag / Trolley', 'wiso':'Werbungskosten → Arbeitsmittel', 'hint':'Voll absetzbar wenn beruflich', 'icon':'🛄'},
-        'uni':  {'name':'Uniform-Teile', 'wiso':'Werbungskosten → Berufskleidung', 'hint':'Schuhe, Strümpfe, Hemden', 'icon':'👔'},
-        'fitn': {'name':'Fitness / Sport', 'wiso':'Werbungskosten → Sonstiges (falls dienstlich nötig)', 'hint':'Nur wenn beruflich erforderlich (Fluggesundheit)', 'icon':'💪'},
+        'lapt': {'name':'Laptop / Tablet', 'wiso':'Werbungskosten → Arbeitsmittel → Computer', 'hint':'Anteilig wenn privat mitgenutzt; ab 952€ AfA', 'icon':'💻'},
+        'fach': {'name':'Fachliteratur', 'wiso':'Werbungskosten → Sonstiges → Fachbücher', 'hint':'Bücher und Zeitschriften zum Beruf', 'icon':'📚'},
+        'reini':{'name':'Reinigung extra', 'wiso':'Werbungskosten → Sonstiges → Reinigung Berufskleidung', 'hint':'Mit Beleg über Pauschale hinaus', 'icon':'🧴'},
+        'bewer':{'name':'Bewerbungskosten', 'wiso':'Werbungskosten → Sonstiges → Bewerbungskosten', 'hint':'Fahrtkosten, Bewerbungsmappen, Porto', 'icon':'💼'},
+        'doha': {'name':'Doppelter Haushalt', 'wiso':'Werbungskosten → Doppelter Haushalt', 'hint':'2. Wohnung am Arbeitsort', 'icon':'🏘️'},
         'gew':  {'name':'Gewerkschaft / UFO', 'wiso':'Werbungskosten → Gewerkschaftsbeiträge', 'hint':'Voller Jahresbeitrag absetzbar', 'icon':'✊'},
         'stb':  {'name':'Steuerberatung', 'wiso':'Sonderausgaben → Steuerberatungskosten', 'hint':'Voller Betrag absetzbar', 'icon':'📋'},
         'bu':   {'name':'BU-Versicherung', 'wiso':'Vorsorgeaufwendungen → Sonstige Vorsorgeaufwendungen', 'hint':'Bis zum Höchstbetrag', 'icon':'🛡️'},
@@ -3653,13 +3656,30 @@ def berechne(form, files):
         fahr = 0
     fahr = round(fahr, 2)
 
+    # ── Z72-BOOST über Briefing+Nacharb-Form-Werte (audit-fest, User-bestätigt) ──
+    briefing_min = int(form.get('briefing_min', 60) or 60)
+    nacharb_min = int(form.get('nacharb_min', 30) or 30)
+    anfahrt_min = max(0, int(km * 1.5)) if km > 0 else 30  # ~1.5min/km, default 30min
+    typical_block_min = 180  # ~3h für Inland-Tagestrip
+    typical_abwesenheit = anfahrt_min + briefing_min + typical_block_min + nacharb_min + anfahrt_min
+    if typical_abwesenheit >= 480 and dp:
+        # User-Eingaben + Block-Time ergeben rechnerisch ≥ 8h Abwesenheit
+        # → alle Inland-Tagestrips aus Flugstundenübersicht qualifizieren für Z72
+        inland_tagestrips_dp = (dp or {}).get('z72_inland_days', 0)
+        if inland_tagestrips_dp > vma_72_tage:
+            added = inland_tagestrips_dp - vma_72_tage
+            vma_72_tage = inland_tagestrips_dp
+            vma_72 = vma_72_tage * bmf_inland['tagestrip_8h']
+            vma_in = vma_72 + vma_73 + vma_74
+            notes.append(f'ℹ Bei deiner Briefing-Zeit ({briefing_min}min) + Nacharbeitung ({nacharb_min}min) erreichen {added} weitere Inland-Tagestrips die §9-EStG 8h-Schwelle → +{added*14}€.')
+
     # ── REINIGUNG & TRINKGELD (jahr-konform) ─────────────────
     reinig = round(arbeitstage * reinig_satz, 2)
     trink  = round(hotel_naechte * trink_satz, 2)
 
     # ── OPTIONALE BELEGE (User-Upload — Telefon, Gewerkschaft, etc) ──
     opt_keys = ['stb','gew','arb','fort','tel','konz',
-                'lapt','koff','uni','fitn',
+                'lapt','fach','reini','bewer','doha',
                 'bu','haft','kv','rv','leb','haus','arzt','zahn','medi','pfle','under',
                 'kata','spen','part','kind','hand','haed','kiru']
     opt_files = {k: files[k] for k in opt_keys if files.get(k)}
