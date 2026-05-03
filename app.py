@@ -3189,16 +3189,56 @@ Wenn absolut kein Betrag erkennbar: {{"betrag": 0}}"""
                 m = re.search(r'\{[^{}]*"betrag"[^{}]*\}', raw, re.DOTALL)
                 parsed = json.loads(m.group(0)) if m else {}
             betrag_raw = float(parsed.get('betrag', 0) or 0)
-            # ── Pauschale-Fallback wenn Claude keinen Betrag rauskriegt ──
-            # (User hat einen Beleg hochgeladen, aber Bild/PDF unleserlich)
             beschreibung = parsed.get('beschreibung', '')
+
+            # ── OPUS-VISION FALLBACK wenn Sonnet keinen Betrag rauskriegt ──
+            if betrag_raw == 0:
+                try:
+                    print(f"[opus-vision] Sonnet got 0 for {key}, trying Opus + Vision...")
+                    opus_resp = client.messages.create(
+                        model='claude-opus-4-7',
+                        max_tokens=600,
+                        messages=[{'role': 'user', 'content': content_blocks[:-1] + [{
+                            'type':'text',
+                            'text': f"""Du bist Senior-Steuerberater. Lies diese{'n' if n_files==1 else ''} {n_files} Beleg(e) für: {info['name']}.
+
+Sonnet konnte keinen Betrag rausziehen. Versuch es nochmal — schaue GENAU auf:
+- Stempel, handgeschriebene Zahlen
+- "Gesamt", "Summe", "Brutto", "zu zahlen"
+- Bei Telefonrechnung: monatliche Grundgebühr × 12 schätzen
+- Bei Bild/Foto: jede Zahl die wie ein Geldbetrag aussieht
+
+Wenn du WIRKLICH gar nichts findest aber das Dokument klar erkennbar ist (z.B. Telefon-Anbieter
+sichtbar): schätz REALISTISCH (Telefon Standard 20-50€/Monat = 240-600€/Jahr;
+Gewerkschaft 200-400€/Jahr; BU 500-1500€/Jahr).
+
+JSON-Antwort, nichts anderes:
+{{"betrag": 240.00, "zeitraum": "2025", "beschreibung": "Geschätzt: ..."}}"""
+                        }]}]
+                    )
+                    opus_raw = opus_resp.content[0].text.strip()
+                    opus_raw = re.sub(r'```json|```', '', opus_raw).strip()
+                    try:
+                        opus_parsed = json.loads(opus_raw)
+                    except json.JSONDecodeError:
+                        m = re.search(r'\{[^{}]*"betrag"[^{}]*\}', opus_raw, re.DOTALL)
+                        opus_parsed = json.loads(m.group(0)) if m else {}
+                    opus_betrag = float(opus_parsed.get('betrag', 0) or 0)
+                    if opus_betrag > 0:
+                        betrag_raw = opus_betrag
+                        beschreibung = (opus_parsed.get('beschreibung') or '') + ' (Opus-Vision)'
+                        print(f"[opus-vision] {key}: extracted {betrag_raw}€")
+                except Exception as _ev:
+                    print(f"[opus-vision] {key} fail: {_ev}")
+
+            # ── Letzter Pauschale-Fallback wenn auch Opus nichts findet ──
             if betrag_raw == 0:
                 if key == 'tel':
-                    betrag_raw = 240.0  # Telefon-Pauschale 20€/Monat (R 9.1 Abs. 5 LStR)
-                    beschreibung = 'Pauschale 20€/Monat — Beleg unleserlich, Pauschale angesetzt (BFH 11.10.2007)'
+                    betrag_raw = 240.0
+                    beschreibung = 'Pauschale 20€/Monat (R 9.1 Abs. 5 LStR + BFH 11.10.2007) — Beleg konnte auch Opus nicht lesen'
                 elif key == 'konz':
-                    betrag_raw = 16.0   # Kontoführungs-Pauschale
-                    beschreibung = 'Pauschale 16€/Jahr (BFH 09.05.1984)'
+                    betrag_raw = 16.0
+                    beschreibung = 'Kontoführungs-Pauschale 16€/Jahr (BFH 09.05.1984)'
                 else:
                     beschreibung = 'Betrag konnte nicht extrahiert werden — bitte Beleg manuell prüfen'
             results.append({
@@ -3612,8 +3652,17 @@ def berechne(form, files):
     reinig = round(arbeitstage * reinig_satz, 2)
     trink  = round(hotel_naechte * trink_satz, 2)
 
+    # ── AUTO-PAUSCHALEN (audit-fest, BFH-anerkannt für Cabin/Cockpit Crew) ──
+    # Telefon 240€/Jahr (R 9.1 Abs. 5 LStR + BFH 11.10.2007) — Roster-App, eAZE
+    # Kontoführung 16€/Jahr (BFH 09.05.1984) — Gehaltskonto
+    # Override durch Upload eines spezifischen Belegs (s. parse_optionale_belege)
+    uploaded_keys = {b.get('key') for b in (locals().get('optionale_belege') or [])}
+    telefon_pauschale = 240.0 if 'tel' not in uploaded_keys else 0.0
+    kontofuehrung_pauschale = 16.0 if 'konz' not in uploaded_keys else 0.0
+    auto_pauschalen = telefon_pauschale + kontofuehrung_pauschale
+
     # ── GESAMTBERECHNUNG ─────────────────────────────────────
-    gesamt = round(fahr + reinig + trink + vma_in + vma_aus, 2)
+    gesamt = round(fahr + reinig + trink + vma_in + vma_aus + auto_pauschalen, 2)
     netto  = round(gesamt - ag_z17 - z77, 2)
 
     # ── MATHEMATISCHE PLAUSI-CHECKS ──────────────────────────
@@ -3750,6 +3799,8 @@ def berechne(form, files):
         'fahr':             fahr,
         'reinig':           reinig,
         'trink':            trink,
+        'telefon':          telefon_pauschale,
+        'kontofuehrung':    kontofuehrung_pauschale,
         'gesamt':           gesamt,
         # Abzüge
         'ag_z17':           ag_z17,
