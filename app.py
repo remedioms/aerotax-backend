@@ -65,6 +65,7 @@ CORS(app, origins=[
     os.getenv('FRONTEND_URL', 'https://aerosteuer.de'),
     'https://aerosteuer.de',
     'https://aerosteuer.pages.dev',
+    re.compile(r'^https://[a-z0-9]+\.aerosteuer\.pages\.dev$'),  # Cloudflare Preview-Deploys
     'http://localhost:3000',
     'http://localhost:8080',
 ])
