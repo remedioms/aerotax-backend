@@ -276,7 +276,8 @@ def upload_files():
             normalized = []
             for f in files:
                 try:
-                    normalized.append((_normalize_upload(f.read(), f.filename), f.filename))
+                    # _normalize_upload liefert bereits (bytes, filename) als Tupel
+                    normalized.append(_normalize_upload(f.read(), f.filename))
                     saved_count += 1
                 except Exception as e:
                     print(f"[upload-files] {key}/{f.filename} failed: {e}")
@@ -577,15 +578,25 @@ def process_real():
     """Startet asynchrone Auswertung. Liefert sofort job_id, Frontend pollt /api/job/<id>."""
     try:
         anreise = request.form.get('anreise', 'auto')
+        # Robuste Number-Casts mit Fallback bei fehlerhaftem Input
+        def _safe_int(v, default):
+            try: return int(float(v))
+            except: return default
+        def _safe_float(v, default=0.0):
+            try: return float(v)
+            except: return default
+        year_input = _safe_int(request.form.get('year', 2025), 2025)
+        # Year auf supportete Range klemmen (2023-2026)
+        year_input = max(2023, min(2026, year_input))
         form = {
             'name':    request.form.get('name', 'Flugbegleiter'),
-            'year':    int(request.form.get('year', 2025)),
+            'year':    year_input,
             'base':    request.form.get('base', 'Frankfurt (FRA)'),
             'anreise': anreise,
-            'km':      float(request.form.get('km', 0)) if anreise in ('auto','fahrrad') else 0,
+            'km':      _safe_float(request.form.get('km', 0)) if anreise in ('auto','fahrrad') else 0,
             'fahrzeug':   request.form.get('fahrzeug', 'verbrenner'),
-            'oepnv_kosten': float(request.form.get('oepnv_kosten', 0) or 0),
-            'shuttle_kosten': float(request.form.get('shuttle_kosten', 0) or 0),
+            'oepnv_kosten': _safe_float(request.form.get('oepnv_kosten', 0)),
+            'shuttle_kosten': _safe_float(request.form.get('shuttle_kosten', 0)),
             'jobticket':  request.form.get('jobticket', 'nein'),
         }
 
@@ -926,13 +937,13 @@ _recovery_tokens = {}
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SESSION TOKENS — Premium-Chat & Result-Recall (7 Tage gültig)
+#  SESSION TOKENS — Premium-Chat & Result-Recall (24h gültig, Datenschutz-First)
 # ══════════════════════════════════════════════════════════════════
 # Nach erfolgreicher Auswertung bekommt der User einen Session-Token.
-# Damit kann er 7 Tage lang:
+# Damit kann er 24h lang:
 #   • Sein Auswertungs-Ergebnis erneut abrufen
 #   • Mit AeroTAX über sein konkretes Ergebnis chatten
-# Token ist NICHT weitergebbar (auf Browser/Device-Hash gebunden, refresht alle 7 Tage)
+# Token läuft nach 24h ab — Datenschutz-First, keine Langzeit-Speicherung.
 
 _SESSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sessions')
 os.makedirs(_SESSION_DIR, exist_ok=True)
@@ -1097,7 +1108,7 @@ def chat_with_aerotax():
         return jsonify({'error': 'Session-Token ungültig oder abgelaufen — bitte neu auswerten'}), 401
 
     # ── COST-CONTROL: Hard-Caps pro Session ──────────────────
-    # 25 Nachrichten total in 7 Tagen → bei 19,99€ Umsatz noch sehr profitabel
+    # 25 Nachrichten total in 24h → bei 19,99€ Umsatz noch sehr profitabel
     chat_history_existing = session.get('chat_history', [])
     user_msg_count = sum(1 for m in chat_history_existing if m.get('role') == 'user')
     HARD_CAP = 25
