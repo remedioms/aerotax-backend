@@ -3652,24 +3652,15 @@ def berechne(form, files):
     reinig = round(arbeitstage * reinig_satz, 2)
     trink  = round(hotel_naechte * trink_satz, 2)
 
-    # ── OPTIONALE BELEGE (vor Pauschalen-Logik, damit Override greift) ──
+    # ── OPTIONALE BELEGE (User-Upload — Telefon, Gewerkschaft, etc) ──
     opt_keys = ['stb','gew','arb','fort','tel','konz','bu','haft','kv',
                 'rv','leb','haus','arzt','zahn','medi','pfle','under',
                 'kata','spen','part','kind','hand','haed','kiru']
     opt_files = {k: files[k] for k in opt_keys if files.get(k)}
     optionale_belege = parse_optionale_belege(opt_files) if opt_files else []
 
-    # ── AUTO-PAUSCHALEN (audit-fest, BFH-anerkannt für Cabin/Cockpit Crew) ──
-    # Telefon 240€/Jahr (R 9.1 Abs. 5 LStR + BFH 11.10.2007) — Roster-App, eAZE
-    # Kontoführung 16€/Jahr (BFH 09.05.1984) — Gehaltskonto
-    # Override durch eigenen Beleg-Upload (höherer realer Betrag möglich)
-    uploaded_keys = {b.get('key') for b in optionale_belege if b.get('betrag', 0) > 0}
-    telefon_pauschale = 240.0 if 'tel' not in uploaded_keys else 0.0
-    kontofuehrung_pauschale = 16.0 if 'konz' not in uploaded_keys else 0.0
-    auto_pauschalen = telefon_pauschale + kontofuehrung_pauschale
-
     # ── GESAMTBERECHNUNG ─────────────────────────────────────
-    gesamt = round(fahr + reinig + trink + vma_in + vma_aus + auto_pauschalen, 2)
+    gesamt = round(fahr + reinig + trink + vma_in + vma_aus, 2)
     netto  = round(gesamt - ag_z17 - z77, 2)
 
     # ── MATHEMATISCHE PLAUSI-CHECKS ──────────────────────────
@@ -3801,8 +3792,6 @@ def berechne(form, files):
         'fahr':             fahr,
         'reinig':           reinig,
         'trink':            trink,
-        'telefon':          telefon_pauschale,
-        'kontofuehrung':    kontofuehrung_pauschale,
         'gesamt':           gesamt,
         # Abzüge
         'ag_z17':           ag_z17,
