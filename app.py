@@ -600,8 +600,6 @@ def process_real():
             'oepnv_kosten': _safe_float(request.form.get('oepnv_kosten', 0)),
             'shuttle_kosten': _safe_float(request.form.get('shuttle_kosten', 0)),
             'jobticket':  request.form.get('jobticket', 'nein'),
-            'briefing_min': _safe_int(request.form.get('briefing_min', 60), 60),
-            'nacharb_min':  _safe_int(request.form.get('nacharb_min', 30), 30),
         }
 
         files = {}
@@ -2102,6 +2100,28 @@ def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
     z72_inland_days = 0  # Same-day Inland >8h
     z73_inland_days = 0  # Inland An- oder Abreisetag (mehrtägige Tour)
     unklare = []
+    z72_candidates = []  # [{'date': '31.01', 'block_min': 180, 'dest': 'HAM'}]
+
+    # Pattern für Block-Out-Block-In Zeiten in einer Zeile: "05:45-07:01"
+    re_time_range = re.compile(r'(\d{2}):(\d{2})-(\d{2}):(\d{2})')
+
+    def _block_span_minutes(rests_for_day):
+        """Ermittelt Block-Out → Block-In Span in Minuten für alle Flüge eines Tages."""
+        starts = []
+        ends = []
+        for r in rests_for_day:
+            for m in re_time_range.finditer(r):
+                sh, sm, eh, em = map(int, m.groups())
+                start_min = sh*60 + sm
+                end_min = eh*60 + em
+                # Wenn Endzeit < Startzeit (Mitternacht-Crossing), 24h drauf
+                if end_min < start_min:
+                    end_min += 24*60
+                starts.append(start_min)
+                ends.append(end_min)
+        if not starts:
+            return None
+        return max(ends) - min(starts)
 
     in_tour = False
     tour_inland_only = True  # Inland-Klassifikation des aktuellen Tour-Anfangs
@@ -2143,6 +2163,14 @@ def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
             ziel = a_matches[0]
             if ziel in INLAND_IATA:
                 z72_inland_days += 1
+                # Block-Time für Z72-Boost-Berechnung mitgeben
+                block_min = _block_span_minutes(rests)
+                if block_min is not None:
+                    z72_candidates.append({
+                        'date': date_key,
+                        'block_min': block_min,
+                        'dest': ziel,
+                    })
             # Auslands-Same-Day-Tour: kein Z72 (das wäre Z76, kommt aus SE)
             continue
 
@@ -2187,6 +2215,7 @@ def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
         'hotel_naechte':    hotel_naechte,
         'z72_inland_days':  z72_inland_days,
         'z73_inland_days':  z73_inland_days,
+        'z72_candidates':   z72_candidates,    # pro-Tag Block-Time für Z72-Berechnung
         'frei_tage':        frei_tage,
         'unklare_tage':     unklare,
     }
@@ -3654,22 +3683,39 @@ def berechne(form, files):
         fahr = 0
     fahr = round(fahr, 2)
 
-    # ── Z72-BOOST über Briefing+Nacharb-Form-Werte (audit-fest, User-bestätigt) ──
-    briefing_min = int(form.get('briefing_min', 60) or 60)
-    nacharb_min = int(form.get('nacharb_min', 30) or 30)
-    anfahrt_min = max(0, int(km * 1.5)) if km > 0 else 30  # ~1.5min/km, default 30min
-    typical_block_min = 180  # ~3h für Inland-Tagestrip
-    typical_abwesenheit = anfahrt_min + briefing_min + typical_block_min + nacharb_min + anfahrt_min
-    if typical_abwesenheit >= 480 and dp:
-        # User-Eingaben + Block-Time ergeben rechnerisch ≥ 8h Abwesenheit
-        # → alle Inland-Tagestrips aus Flugstundenübersicht qualifizieren für Z72
-        inland_tagestrips_dp = (dp or {}).get('z72_inland_days', 0)
-        if inland_tagestrips_dp > vma_72_tage:
-            added = inland_tagestrips_dp - vma_72_tage
-            vma_72_tage = inland_tagestrips_dp
+    # ── Z72-BOOST: pro-Tag Block-Time-aware mit AUTO-Briefing-Detection ──
+    # LH Standard Operating Procedure für Cabin Crew:
+    #   - Continental (Block ≤4h):  60 Min Briefing + 30 Min Debrief
+    #   - Mid-haul    (Block 4-7h): 75 Min Briefing + 45 Min Debrief
+    #   - Long-haul   (Block >7h):  90 Min Briefing + 60 Min Debrief
+    # Inland-Tagestrips (Z72 relevant) sind ~immer Continental → 60+30.
+    # Anfahrt: aus km × 1,5 min/km, oder 30 min Default.
+    anfahrt_min = max(0, int(km * 1.5)) if km > 0 else 30
+    if dp:
+        candidates = (dp or {}).get('z72_candidates') or []
+        qualifying = []
+        for cand in candidates:
+            block_m = cand.get('block_min', 0)
+            # Auto-Briefing/Debrief nach LH SOP basierend auf Block-Time
+            if block_m <= 240:
+                briefing_min, nacharb_min = 60, 30   # Continental
+            elif block_m <= 420:
+                briefing_min, nacharb_min = 75, 45   # Mid-haul
+            else:
+                briefing_min, nacharb_min = 90, 60   # Long-haul
+            abw = anfahrt_min + briefing_min + block_m + nacharb_min + anfahrt_min
+            if abw >= 480:
+                qualifying.append({**cand, 'abwesenheit_min': abw,
+                                   'briefing_used': briefing_min, 'debrief_used': nacharb_min})
+        if len(qualifying) > vma_72_tage:
+            added = len(qualifying) - vma_72_tage
+            vma_72_tage = len(qualifying)
             vma_72 = vma_72_tage * bmf_inland['tagestrip_8h']
             vma_in = vma_72 + vma_73 + vma_74
-            notes.append(f'ℹ Bei deiner Briefing-Zeit ({briefing_min}min) + Nacharbeitung ({nacharb_min}min) erreichen {added} weitere Inland-Tagestrips die §9-EStG 8h-Schwelle → +{added*14}€.')
+            notes.append(
+                f'ℹ Pro-Tag-Berechnung: {added} Inland-Tagestrips erreichen §9-EStG 8h-Schwelle '
+                f'(LH SOP Briefing/Debrief auto + Anfahrt 2×{anfahrt_min}min) → +{added*int(bmf_inland["tagestrip_8h"])}€.'
+            )
 
     # ── REINIGUNG & TRINKGELD (jahr-konform) ─────────────────
     reinig = round(arbeitstage * reinig_satz, 2)
