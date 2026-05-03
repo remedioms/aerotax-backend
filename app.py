@@ -145,20 +145,27 @@ def payment_status(ref):
 
 @app.route('/api/create-payment-intent', methods=['POST'])
 def create_payment_intent():
-    """Creates a Stripe PaymentIntent for Stripe Elements (no redirect)."""
+    """Creates a Stripe PaymentIntent for Stripe Elements (no redirect).
+    Reused ein Pre-Upload-ref wenn vom Frontend mitgegeben (so überleben Files den Reload)."""
     try:
         data = request.get_json() or {}
         amount = int(data.get('amount', 1999))
         currency = data.get('currency', 'eur')
-        ref = str(uuid.uuid4())
-
-        # Save ref for later file processing
-        _store[ref] = {
-            'form': data,
-            'files': {},
-            'paid': False,
-            'expires': datetime.utcnow() + timedelta(hours=2),
-        }
+        existing_ref = (data.get('ref') or '').strip()
+        # Reuse pre-upload ref wenn vorhanden + im Store
+        if existing_ref and existing_ref in _store:
+            ref = existing_ref
+            # Form-Daten + paid-Status nicht überschreiben — nur erweitern
+            _store[ref]['kind'] = 'payment'
+            _store[ref]['expires'] = datetime.utcnow() + timedelta(hours=26)
+        else:
+            ref = str(uuid.uuid4())
+            _store[ref] = {
+                'form':    data,
+                'files':   {},
+                'paid':    False,
+                'expires': datetime.utcnow() + timedelta(hours=2),
+            }
 
         intent = stripe.PaymentIntent.create(
             amount=amount,
@@ -259,6 +266,21 @@ def _delete_uploaded_files_supabase(ref):
         sb.table('uploaded_files').delete().eq('ref', ref).execute()
     except Exception as e:
         print(f"[supabase upload] delete fail: {e}")
+
+
+@app.route('/api/init-upload-session', methods=['POST'])
+def init_upload_session():
+    """Erzeugt einen ref-Slot OHNE Stripe — Frontend kann sofort beim Upload Files persistieren.
+    Beim späteren /api/create-payment-intent kann derselbe ref reused werden."""
+    ref = str(uuid.uuid4())
+    _store[ref] = {
+        'form':     {},
+        'files':    {},
+        'paid':     False,
+        'expires':  datetime.utcnow() + timedelta(hours=26),  # 24h + Puffer
+        'kind':     'preupload',
+    }
+    return jsonify({'ref': ref})
 
 
 @app.route('/api/upload-files', methods=['POST'])
