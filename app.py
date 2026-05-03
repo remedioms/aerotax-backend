@@ -78,26 +78,31 @@ FRONTEND_URL          = os.getenv('FRONTEND_URL','https://aerotax.de')
 # In-memory store (in Produktion: Redis oder S3)
 _store = {}
 
-# ── BMF AUSLANDSPAUSCHALEN 2025 ───────────────────────────────────
-# Format: "IATA": (Tagessatz_24h, Tagessatz_An_Abreise)
-BMF_2025 = {
-    "BLR":(42,28),"HKG":(71,48),"HND":(50,33),"NRT":(50,33),
-    "CPH":(75,50),"SVG":(75,50),"OSL":(75,50),"GVA":(66,44),
-    "BOS":(63,42),"BOM":(53,36),"ICN":(48,32),"IKA":(33,22),
-    "ORD":(65,44),"KEF":(62,41),"SEA":(59,40),"SIN":(71,48),
-    "ZAG":(46,31),"ARN":(66,44),"GOT":(66,44),"TLL":(35,24),
-    "MAD":(42,28),"LIS":(32,21),"EDI":(52,35),"SKP":(27,18),
-    "SOF":(22,15),"VCE":(42,28),"FCO":(48,32),"MIA":(65,44),
-    "LHR":(66,44),"NAP":(42,28),"OTP":(32,21),"BCN":(34,23),
-    "RIX":(35,24),"CAI":(33,22),"TLV":(66,44),"LCA":(42,28),
-    "DUB":(58,39),"TUN":(40,27),"MRS":(53,36),"AGP":(34,23),
-    "ATH":(40,27),"VNO":(26,17),"SNN":(58,39),"BUD":(32,21),
-    "LIN":(42,28),"PRG":(32,21),"MLA":(46,31),"KRK":(34,23),
-    "MXP":(42,28),"WAW":(34,23),"VIE":(46,31),"ZRH":(66,44),
-    "BRU":(66,44),"AMS":(62,41),"CDG":(53,36),
-    "PMI":(34,23),"ACE":(34,23),"TFS":(34,23),"LPA":(34,23),
-    "FUE":(34,23),"IBZ":(34,23),"ALC":(34,23),"SVQ":(42,28),
-}
+# ── BMF AUSLANDSPAUSCHALEN ────────────────────────────────────────
+# Quelle: bundesfinanzministerium.de offizielle BMF-Schreiben 2023-2026
+# Auto-generated via /tmp/parse_bmf_v5.py (Spalten: 24h, An-/Abreise+8h)
+from bmf_data import BMF_AUSLAND_BY_YEAR, IATA_TO_BMF
+
+
+def bmf_lookup(iata, year):
+    """Resolves IATA → BMF (24h, an_abreise) für ein Jahr.
+    Fallback-Kette: City → 'im Übrigen' → Country → None.
+    """
+    bmf = BMF_AUSLAND_BY_YEAR.get(year) or BMF_AUSLAND_BY_YEAR.get(2025)
+    if not bmf: return None
+    key = IATA_TO_BMF.get(iata)
+    if not key: return None
+    if key in bmf: return bmf[key]
+    if ' – ' in key:
+        parent = key.split(' – ')[0]
+        alt = f"{parent} – im Übrigen"
+        if alt in bmf: return bmf[alt]
+        if parent in bmf: return bmf[parent]
+    return None
+
+
+# Backward-Compat-Alias für alten Code
+BMF_2025 = {iata: bmf_lookup(iata, 2025) for iata in IATA_TO_BMF if bmf_lookup(iata, 2025)}
 
 # ══════════════════════════════════════════════════════════════════
 #  STRIPE ROUTEN
@@ -2172,10 +2177,14 @@ def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
     }
 
 
-def _parse_se_pdf_xpos(pdf_bytes_list):
+def _parse_se_pdf_xpos(pdf_bytes_list, year=2025):
     """SE-Parser mit pdfplumber x-Position. 100% deterministisch — liest die
     Spalten Datum/Ab/An/Spesen/Ort/Zwölftel/stfrei/Ort literal anhand der x-Koordinaten.
     Liefert Tag-Counts + literal-Summen.
+
+    Wenn LH keinen stfrei-Wert ausweist (kürzere Touren ohne LH-Spesen-Anspruch):
+    BMF-Pauschale für das Land aus offizieller Tabelle anwenden (rechtlich legitim
+    nach §9 EStG).
     """
     from collections import defaultdict
     import pdfplumber, io as _io
@@ -2236,12 +2245,21 @@ def _parse_se_pdf_xpos(pdf_bytes_list):
 
     z72_tage = z73_tage = z74_tage = 0
     z72_eur = z73_eur = z74_eur = z76_eur = 0.0
+    z76_eur_bmf_fallback = 0.0   # Anteil aus BMF-Pauschalen (LH zahlt nichts)
+    bmf_fallback_count = 0
     z77_werbko = 0.0
-    fahrtage_inland = 0      # Tour-Beginn vom Inland
-    fahrtage_ausland = 0     # Same-Day oder direkt-Ausland
+    fahrtage_inland = 0
+    fahrtage_ausland = 0
     arbeitstage = len(rows)
     hotelnaechte = 0
     unklar = []
+
+    def bmf_24h(ort):
+        v = bmf_lookup(ort, year)
+        return v[0] if v else None
+    def bmf_an(ort):
+        v = bmf_lookup(ort, year)
+        return v[1] if v else None
 
     for r in rows:
         ab = (r.get('ab') or [None])[0]
@@ -2263,8 +2281,11 @@ def _parse_se_pdf_xpos(pdf_bytes_list):
                 z72_eur += sf_eur if sf_eur else 14.0
                 fahrtage_inland += 1
             else:
-                if sf_eur: z76_eur += sf_eur
-                else: unklar.append(r)
+                # Auslands-Tagestrip: NUR Pauschale wenn LH stfrei zahlt.
+                # Wenn LH nichts zahlt, war Abwesenheit i.d.R. unter 8h
+                # (kein §9 EStG-Anspruch). Kein BMF-Fallback hier.
+                if sf_eur:
+                    z76_eur += sf_eur
                 fahrtage_ausland += 1
         elif has_ab and not has_an:
             # Anreise-Tag
@@ -2273,8 +2294,16 @@ def _parse_se_pdf_xpos(pdf_bytes_list):
                 z73_eur += sf_eur if sf_eur else 14.0
                 fahrtage_inland += 1
             else:
-                if sf_eur: z76_eur += sf_eur
-                else: unklar.append(r)
+                if sf_eur:
+                    z76_eur += sf_eur
+                else:
+                    fb = bmf_an(kat_ort)
+                    if fb:
+                        z76_eur += fb
+                        z76_eur_bmf_fallback += fb
+                        bmf_fallback_count += 1
+                    else:
+                        unklar.append(r)
                 fahrtage_ausland += 1
             hotelnaechte += 1
         elif not has_ab and has_an:
@@ -2283,17 +2312,32 @@ def _parse_se_pdf_xpos(pdf_bytes_list):
                 z73_tage += 1
                 z73_eur += sf_eur if sf_eur else 14.0
             else:
-                if sf_eur: z76_eur += sf_eur
-                else: unklar.append(r)
-            # Abreise-Tag: kein Hotel mehr
+                if sf_eur:
+                    z76_eur += sf_eur
+                else:
+                    fb = bmf_an(kat_ort)
+                    if fb:
+                        z76_eur += fb
+                        z76_eur_bmf_fallback += fb
+                        bmf_fallback_count += 1
+                    else:
+                        unklar.append(r)
         else:
             # Voll-Tag (24h auswärts)
             if is_inland:
                 z74_tage += 1
                 z74_eur += sf_eur if sf_eur else 28.0
             else:
-                if sf_eur: z76_eur += sf_eur
-                else: unklar.append(r)
+                if sf_eur:
+                    z76_eur += sf_eur
+                else:
+                    fb = bmf_24h(kat_ort)
+                    if fb:
+                        z76_eur += fb
+                        z76_eur_bmf_fallback += fb
+                        bmf_fallback_count += 1
+                    else:
+                        unklar.append(r)
             hotelnaechte += 1
 
     return {
@@ -2301,6 +2345,8 @@ def _parse_se_pdf_xpos(pdf_bytes_list):
         'z73_tage': z73_tage, 'z73_eur': round(z73_eur, 2),
         'z74_tage': z74_tage, 'z74_eur': round(z74_eur, 2),
         'z76_eur':  round(z76_eur, 2),
+        'z76_eur_bmf_fallback': round(z76_eur_bmf_fallback, 2),
+        'bmf_fallback_count': bmf_fallback_count,
         'z77_werbko': round(z77_werbko, 2),
         'fahrtage':    fahrtage_inland + fahrtage_ausland,
         'arbeitstage': arbeitstage,
@@ -2398,7 +2444,7 @@ def _parse_se_lines_deterministic(all_se_text):
     }
 
 
-def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
+def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
     """
     Liest Lufthansa Streckeneinsatz-Abrechnungen.
 
@@ -2486,7 +2532,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list):
     # ── DETERMINISTISCHES LESEN aller SE-Zeilen via x-Position ──
     # Primär: pdfplumber x-Position Parser (100% deterministisch via Spalten-Koordinaten)
     # Fallback: Text-Regex Parser falls x-Position-Parser keine Rows findet
-    se_det = _parse_se_pdf_xpos(pdf_bytes_list)
+    se_det = _parse_se_pdf_xpos(pdf_bytes_list, year=year)
     if se_det['arbeitstage'] == 0:
         # Fallback Text-Regex
         all_se_text = ''
@@ -3301,7 +3347,7 @@ def berechne(form, files):
         if se_texts:
             available_texts['se_text'] = '\n'.join(se_texts)
         
-        se_data = parse_streckeneinsatz_mit_ki(files['se'])
+        se_data = parse_streckeneinsatz_mit_ki(files['se'], year=int(form.get('year', 2025)))
         if not se_data or not se_data.get('summe_gesamt', 0) > 0:
             missing.append('Streckeneinsatz-Abrechnungen (nicht vollständig lesbar)')
             se_data = None
@@ -3490,8 +3536,9 @@ def berechne(form, files):
         vma_aus = 0
         for t in ausland_touren:
             ort = t.get('ort', '').upper()
-            if ort in BMF_2025:
-                s24, sab = BMF_2025[ort]
+            v = bmf_lookup(ort, year_int)
+            if v:
+                s24, sab = v
                 vma_aus += t.get('an',0)*sab + t.get('voll',0)*s24 + t.get('ab',0)*sab
     elif dp and dp.get('vma_aus', 0) > 0:
         vma_aus = dp.get('vma_aus', 0)
