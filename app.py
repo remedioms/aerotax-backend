@@ -588,6 +588,14 @@ def process_real():
         year_input = _safe_int(request.form.get('year', 2025), 2025)
         # Year auf supportete Range klemmen (2023-2026)
         year_input = max(2023, min(2026, year_input))
+
+        # Klärungs-Chat-Antworten (User hat im Klärungs-Popup gewählt)
+        clarify = {}
+        for k in ('briefing_min', 'standby_after_block', 'standby_days', 'jobticket', 'phone_business'):
+            v = request.form.get('clarify_' + k)
+            if v is not None and v != '':
+                clarify[k] = v
+
         form = {
             'name':    request.form.get('name', 'Flugbegleiter'),
             'year':    year_input,
@@ -597,7 +605,8 @@ def process_real():
             'fahrzeug':   request.form.get('fahrzeug', 'verbrenner'),
             'oepnv_kosten': _safe_float(request.form.get('oepnv_kosten', 0)),
             'shuttle_kosten': _safe_float(request.form.get('shuttle_kosten', 0)),
-            'jobticket':  request.form.get('jobticket', 'nein'),
+            'jobticket':  clarify.get('jobticket') or request.form.get('jobticket', 'nein'),
+            'clarify':    clarify,
         }
 
         files = {}
@@ -3585,8 +3594,40 @@ def berechne(form, files):
         fahr = 0
     fahr = round(fahr, 2)
 
+    # ── KLÄRUNGS-CHAT BOOSTS ────────────────────────────────
+    clarify = form.get('clarify') or {}
+    def _clar_int(key, default=0):
+        try: return int(float(clarify.get(key, default)))
+        except: return default
+
+    # Z72-Boost: wenn User briefing+standby angibt das Block+Padding > 8h ergibt
+    if clarify and (dp or se_data):
+        briefing_min = _clar_int('briefing_min', 60)
+        standby_after = _clar_int('standby_after_block', 0)
+        debrief_min = 30
+        anfahrt_min = max(0, int(km * 1.5)) if km > 0 else 0
+        typical_block_min = 180   # ~3h block für Inland-Tagestrip (typisch FRA-X-FRA)
+        typical_abwesenheit_min = (
+            anfahrt_min + briefing_min + typical_block_min + debrief_min + standby_after + anfahrt_min
+        )
+        # >8h Schwelle für Z72-Pauschale
+        if typical_abwesenheit_min >= 480:
+            inland_tagestrips_dp = (dp or {}).get('z72_inland_days', 0) if dp else 0
+            # Wir nehmen MAX aus SE (literal) und DP (Flugstundenübersicht-Erkennung)
+            extra_z72 = max(vma_72_tage, inland_tagestrips_dp)
+            if extra_z72 > vma_72_tage:
+                added = extra_z72 - vma_72_tage
+                vma_72_tage = extra_z72
+                vma_72 = vma_72_tage * bmf_inland['tagestrip_8h']
+                vma_in = vma_72 + vma_73 + vma_74
+                notes.append(f'ℹ Klärung: Bei deinem Briefing/Standby-Profil sind {added} weitere Inland-Tagestrips Z72-fähig (Abwesenheit ≥8h).')
+
+    # Standby/Reserve-Tage als zusätzliche Arbeitstage (für Reinigung)
+    standby_days = _clar_int('standby_days', 0) if clarify else 0
+    arbeitstage_total = arbeitstage + standby_days
+
     # ── REINIGUNG & TRINKGELD (jahr-konform) ─────────────────
-    reinig = round(arbeitstage * reinig_satz, 2)
+    reinig = round(arbeitstage_total * reinig_satz, 2)
     trink  = round(hotel_naechte * trink_satz, 2)
 
     # ── GESAMTBERECHNUNG ─────────────────────────────────────
