@@ -590,17 +590,27 @@ def process_real():
         # Year auf supportete Range klemmen (2023-2026)
         year_input = max(2023, min(2026, year_input))
 
+        # Sanity-Caps für User-Eingaben (verhindert absurde Werte)
+        km_raw = _safe_float(request.form.get('km', 0))
+        km_capped = max(0.0, min(500.0, km_raw))  # 0-500 km plausible
+        anfahrt_raw = _safe_int(request.form.get('anfahrt_min', 0), 0)
+        anfahrt_capped = max(0, min(180, anfahrt_raw))  # 0-180 min plausible
+        oepnv_raw = _safe_float(request.form.get('oepnv_kosten', 0))
+        oepnv_capped = max(0.0, min(10000.0, oepnv_raw))
+        shuttle_raw = _safe_float(request.form.get('shuttle_kosten', 0))
+        shuttle_capped = max(0.0, min(10000.0, shuttle_raw))
+
         form = {
             'name':    request.form.get('name', 'Flugbegleiter'),
             'year':    year_input,
             'base':    request.form.get('base', 'Frankfurt (FRA)'),
             'anreise': anreise,
-            'km':      _safe_float(request.form.get('km', 0)) if anreise in ('auto','fahrrad') else 0,
+            'km':      km_capped if anreise in ('auto','fahrrad') else 0,
             'fahrzeug':   request.form.get('fahrzeug', 'verbrenner'),
-            'oepnv_kosten': _safe_float(request.form.get('oepnv_kosten', 0)),
-            'shuttle_kosten': _safe_float(request.form.get('shuttle_kosten', 0)),
+            'oepnv_kosten': oepnv_capped,
+            'shuttle_kosten': shuttle_capped,
             'jobticket':  request.form.get('jobticket', 'nein'),
-            'anfahrt_min': _safe_int(request.form.get('anfahrt_min', 0), 0),
+            'anfahrt_min': anfahrt_capped,
         }
 
         files = {}
@@ -2070,7 +2080,9 @@ def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
     """
     INLAND_IATA = {'FRA','MUC','HAM','DUS','BER','STR','CGN','NUE','LEJ',
                    'HAJ','HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN',
-                   'XFW','RLG','SXF','TXF','MHG','FKB'}
+                   'XFW','RLG','SXF','TXF','MHG','FKB','FDH','DTM','FRO','HEI','KEL',
+                   'BYU','EUM','OBF','BMK','RBM','EDLN','EDDF','EDDM','EDDH','EDDT',
+                   'AOC','GWW','LHA','BFE'}
 
     # 1. Alle Zeilen mit Datum sammeln, gruppieren nach Datum
     days = {}  # 'DD.MM' → list of rest-strings (mehrere Einträge pro Tag möglich)
@@ -2235,7 +2247,8 @@ def _parse_se_pdf_xpos(pdf_bytes_list, year=2025):
     import pdfplumber, io as _io
 
     INLAND = {'FRA','HAM','MUC','BER','DUS','STR','NUE','CGN','LEJ','HAJ',
-              'HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN','XFW','RLG'}
+              'HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN','XFW','RLG',
+              'FDH','DTM','SXF','TXF','MHG','FKB'}
 
     # Spalten-x-Bereiche (validiert gegen LH SE-Format)
     COL = {
@@ -2406,7 +2419,8 @@ def _parse_se_lines_deterministic(all_se_text):
     Edge-Cases (z.B. Ausland ohne stfrei-Wert) werden als 'unklare_zeilen' für Claude markiert.
     """
     INLAND = {'FRA','HAM','MUC','BER','DUS','STR','NUE','CGN','LEJ','HAJ',
-              'HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN','XFW','RLG'}
+              'HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN','XFW','RLG',
+              'FDH','DTM','SXF','TXF','MHG','FKB'}
     z72_count = z73_count = z74_count = 0
     z72_eur = z73_eur = z74_eur = z76_eur = 0.0
     unklare = []
@@ -3636,6 +3650,10 @@ def berechne(form, files):
     if km == 0 and km_dp > 0:
         km = km_dp
 
+    # ── JAHR-SPEZIFISCHE PAUSCHALEN (zuerst, weil VMA-Lookup year_int braucht) ──
+    year_int = int(form.get('year', 2025))
+    bmf_inland = BMF_INLAND_BY_YEAR.get(year_int, BMF_INLAND_BY_YEAR[2025])
+
     # ── VMA BERECHNEN ─────────────────────────────────────────
     vma_in = vma_72 + vma_73 + vma_74
 
@@ -3655,9 +3673,6 @@ def berechne(form, files):
     else:
         vma_aus = inferred.get('vma_aus', 0)
 
-    # ── JAHR-SPEZIFISCHE PAUSCHALEN (zuerst — werden von Fahrtkosten + VMA gebraucht) ──
-    year_int = int(form.get('year', 2025))
-    bmf_inland = BMF_INLAND_BY_YEAR.get(year_int, BMF_INLAND_BY_YEAR[2025])
     pendler = PENDLER_BY_YEAR.get(year_int, PENDLER_BY_YEAR[2025])
     reinig_satz = REINIGUNG_PRO_TAG_BY_YEAR.get(year_int, 1.60)
     trink_satz  = TRINKGELD_PRO_NACHT_BY_YEAR.get(year_int, 3.60)
@@ -3744,8 +3759,12 @@ def berechne(form, files):
     # Wenn Inkonsistenzen, User über Note informieren — keine stille Fehler.
     plausi_warns = []
     # Z72+Z73+Z74+Z76 ≈ Z77 (alle steuerfreien Werte sollten Z77 ergeben)
+    # Bei sauber geparstem SE (keine unklare_zeilen) sollten sie nahezu identisch sein.
     vma_summe = vma_72 + vma_73 + vma_74 + vma_aus
-    if z77 > 0 and abs(vma_summe - z77) > max(50, z77 * 0.05):
+    se_unklar_count = len((se_data or {}).get('unklare_zeilen', []) or [])
+    # Tolerance: 1% wenn SE clean, 5% wenn unklare Zeilen, min 30€
+    tolerance = max(30, z77 * (0.05 if se_unklar_count > 5 else 0.01))
+    if z77 > 0 and abs(vma_summe - z77) > tolerance:
         plausi_warns.append(f'VMA-Summe ({vma_summe:.2f}€) weicht von Z77 ({z77:.2f}€) um {abs(vma_summe-z77):.2f}€ ab — bitte prüfen.')
     # Hotel ≤ Arbeitstage (logisch: jede Hotelnacht ist auch ein Arbeitstag)
     if hotel_naechte > arbeitstage:
@@ -4211,7 +4230,7 @@ def erstelle_pdf(d):
         ("1", "WISO / Elster öffnen",
          "Ausgaben → Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten → Neuer Eintrag"),
         ("2", "Beschreibung eingeben",
-         "Weitere Werbungskosten — Dienstplanauswertung AeroTax 2025"),
+         f"Weitere Werbungskosten — Dienstplanauswertung AeroTax {d.get('year', 2025)}"),
         ("3", f"Reisenebenkosten:  {eur(d['netto'])}",
          "Nur diesen Betrag eintragen — alle anderen Felder leer lassen."),
         ("4", "PDF hochladen",
@@ -4313,7 +4332,7 @@ def erstelle_pdf(d):
                fontName="Helvetica", leading=16, alignment=TA_CENTER,
                spaceAfter=8)))
         S.append(Paragraph(
-            "Es wurden keine Belege hochgeladen. Lade beim naechsten Mal deine Rechnungen unter Schritt 2 hoch — dann muss du sie nicht manuell in WISO suchen.",
+            "Es wurden keine Belege hochgeladen. Lade beim nächsten Mal deine Rechnungen unter Schritt 2 hoch — dann musst du sie nicht manuell in WISO suchen.",
             ps("no_belege_sub", fontSize=9, textColor=TEXT3,
                fontName="Helvetica", leading=14, alignment=TA_CENTER)))
     if has_fotos:
@@ -4337,11 +4356,22 @@ def erstelle_pdf(d):
                        fontName="Helvetica", leading=12, spaceAfter=10)))
                 S.append(hr(0, 12))
                 try:
-                    if fb[:3]==b'\xff\xd8\xff' or fb[:4]==b'\x89PNG':
+                    # HEIC (iPhone) → erst zu JPEG konvertieren falls möglich
+                    is_heic = b'ftypheic' in fb[:32] or b'ftypheix' in fb[:32] or b'ftypmif1' in fb[:32]
+                    if is_heic and PIL_AVAILABLE and HEIF_AVAILABLE:
+                        try:
+                            from PIL import Image as PILImage
+                            heic_img = PILImage.open(io.BytesIO(fb))
+                            buf_jpg = io.BytesIO()
+                            heic_img.convert('RGB').save(buf_jpg, format='JPEG', quality=88)
+                            fb = buf_jpg.getvalue()
+                        except Exception as _hc:
+                            print(f"[heic] convert fail: {_hc}")
+                    if fb[:3]==b'\xff\xd8\xff' or fb[:4]==b'\x89PNG' or fb[:6]==b'GIF87a' or fb[:6]==b'GIF89a' or fb[8:12]==b'WEBP':
                         img = RLImage(io.BytesIO(fb))
                         iw,ih = img.drawWidth,img.drawHeight
                         if iw and ih:
-                            scale = min(W_c/iw, 22*cm/ih, 1.0)
+                            scale = min(W_c/iw, 20*cm/ih, 1.0)  # 20cm cap (war 22cm) wegen Header/Footer
                             img.drawWidth=iw*scale; img.drawHeight=ih*scale
                             S.append(img)
                         else:
