@@ -600,6 +600,7 @@ def process_real():
             'oepnv_kosten': _safe_float(request.form.get('oepnv_kosten', 0)),
             'shuttle_kosten': _safe_float(request.form.get('shuttle_kosten', 0)),
             'jobticket':  request.form.get('jobticket', 'nein'),
+            'anfahrt_min': _safe_int(request.form.get('anfahrt_min', 0), 0),
         }
 
         files = {}
@@ -3691,7 +3692,12 @@ def berechne(form, files):
     # Sign-Off (Nacharbeitung) ist bei LH einheitlich ~30 Min für alle Tour-Typen.
     # Anfahrt: aus km × 1,5 min/km, oder 30 min Default.
     NACHARB_MIN = 30  # einheitlich für alle Tour-Typen
-    anfahrt_min = max(0, int(km * 1.5)) if km > 0 else 30
+    # Anfahrt: User-Input bevorzugt, sonst aus km × 1,5 min/km abgeleitet
+    user_anfahrt = int(form.get('anfahrt_min', 0) or 0)
+    if user_anfahrt > 0:
+        anfahrt_min = user_anfahrt
+    else:
+        anfahrt_min = max(0, int(km * 1.5)) if km > 0 else 30
     if dp:
         candidates = (dp or {}).get('z72_candidates') or []
         qualifying = []
