@@ -802,6 +802,9 @@ def process_real():
                 'created':  datetime.utcnow().isoformat() + 'Z',
                 'session_token': session_token,
             }
+        # SOFORT auf Disk persistieren — falls Worker zwischen create und ersten Poll restartet
+        # (gunicorn --max-requests recycled Worker, Polling-Calls würden sonst 404 sehen)
+        _save_job_to_disk(job_id)
         # ref/pi_id ans form-dict heften — für späteren Cleanup nach erfolgreicher Auswertung
         form['ref'] = ref or ''
         form['pi_id'] = pi_id or ''
