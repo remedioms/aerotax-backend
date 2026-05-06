@@ -4590,7 +4590,7 @@ def erstelle_pdf(d):
             # Card pro Beleg: Icon+Name links, Betrag mittig, WISO-Pfad rechts darunter
             head_row = Table([[
                 Paragraph(
-                    f"{b.get('icon','📄')}  <b>{b.get('name','')}</b>",
+                    f"<b>{b.get('name','')}</b>",
                     ps(f"bn{id(b)}", fontSize=11,
                        textColor=TEXT if has_doc else TEXT3,
                        fontName="Helvetica", leading=15)),
@@ -4612,7 +4612,7 @@ def erstelle_pdf(d):
                 ps(f"bw{id(b)}", fontSize=9, textColor=TEXT,
                    fontName="Helvetica", leading=13, spaceAfter=4)))
             if b.get('hint') and has_doc:
-                S.append(Paragraph(f"💡  {b['hint']}",
+                S.append(Paragraph(f"{b['hint']}",
                     ps(f"bh{id(b)}", fontSize=8.5, textColor=TEXT3,
                        fontName="Helvetica", leading=12, spaceAfter=2)))
             S.append(HRFlowable(width="100%", thickness=0.3, color=LINE,
@@ -4682,11 +4682,11 @@ def erstelle_pdf(d):
                 fb = fb_item[0] if isinstance(fb_item, tuple) else fb_item
                 if not first: S.append(PageBreak())
                 first = False
-                S.append(Paragraph(f"{b.get('icon','')}  {b.get('name','')}",
+                S.append(Paragraph(f"{b.get('name','')}",
                     ps(f"bpn{id(b)}{fidx}", fontSize=11, textColor=TEXT,
                        fontName="Helvetica-Bold", leading=15, spaceAfter=4)))
                 S.append(Paragraph(
-                    f"Betrag: {eur(betrag)}" if betrag>0 else "⚠  Betrag nicht erkannt",
+                    f"Betrag: {eur(betrag)}" if betrag>0 else "— Betrag nicht erkannt —",
                     ps(f"bpp{id(b)}{fidx}", fontSize=8.5, textColor=TEXT2,
                        fontName="Helvetica", leading=12, spaceAfter=10)))
                 S.append(hr(0, 12))
