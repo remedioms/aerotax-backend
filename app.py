@@ -4335,15 +4335,35 @@ def erstelle_pdf(d):
         ex,ey = Lpt(120, 30.5)
         canv.rect(ex, ey, 13*scale, 4.5*scale, fill=1, stroke=0)
 
-        # AeroTAX wordmark rechts vom Logo — TAX im Gradient (orange→purple→blue)
+        # AeroTAX wordmark rechts vom Logo — TAX als smoother Gradient
+        # Website-Gradient: linear-gradient(135deg, #f97316, #ec4899, #8b5cf6, #2563eb)
+        # Bei 3 Buchstaben (T=0%, A=50%, X=100%) interpolieren wir die 4 Stops:
         canv.setFillColor(WHITE); canv.setFont("Helvetica-Bold", 13)
         text_x = lx + lw + 0.25*cm
         canv.drawString(text_x, H-1.0*cm, "Aero")
         aw = canv.stringWidth("Aero","Helvetica-Bold",13)
-        # TAX-Gradient: T=Orange, A=Purple, X=Blue
+
+        def _grad(t):
+            """Interpoliert zwischen den 4 Website-Gradient-Stops (t in 0..1)."""
+            stops = [
+                (0.0,  (0xf9, 0x73, 0x16)),   # G1 orange
+                (0.33, (0xec, 0x48, 0x99)),   # G2 pink
+                (0.66, (0x8b, 0x5c, 0xf6)),   # G3 purple
+                (1.0,  (0x25, 0x63, 0xeb)),   # G4 blue
+            ]
+            for i in range(len(stops)-1):
+                if t <= stops[i+1][0]:
+                    p0,c0 = stops[i]; p1,c1 = stops[i+1]
+                    f = (t-p0)/(p1-p0) if p1>p0 else 0
+                    rgb = tuple(int(c0[j] + (c1[j]-c0[j])*f) for j in range(3))
+                    return HexColor("#%02x%02x%02x" % rgb)
+            return HexColor("#%02x%02x%02x" % stops[-1][1])
+
         tx = text_x + aw
-        for letter, color in [("T", G1), ("A", G3), ("X", G4)]:
-            canv.setFillColor(color)
+        letters = "TAX"
+        for i, letter in enumerate(letters):
+            t_pos = i / (len(letters)-1) if len(letters)>1 else 0
+            canv.setFillColor(_grad(t_pos))
             canv.drawString(tx, H-1.0*cm, letter)
             tx += canv.stringWidth(letter, "Helvetica-Bold", 13)
         tw = tx - (text_x + aw)
@@ -4560,39 +4580,38 @@ def erstelle_pdf(d):
             S.append(hr(8, 12))
 
     # ════════════════════════════════════════════════
-    # TRENNSEITE — elegant, narrativer Übergang
+    # TRENNSEITE — elegant, jahres- und beleg-agnostisch
     # ════════════════════════════════════════════════
     S.append(PageBreak())
-    S.append(Spacer(1, 4.0*cm))
+    S.append(Spacer(1, 5*cm))
     S.append(Paragraph("ALL DOORS IN PARK",
         ps("sep0", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
-           leading=12, alignment=TA_CENTER, spaceAfter=18, letterSpacing=2.5)))
-    S.append(Paragraph("Du bist fertig.",
+           leading=12, alignment=TA_CENTER, spaceAfter=20, letterSpacing=2.5)))
+    S.append(Paragraph("Auswertung abgeschlossen.",
         ps("sep1", fontSize=22, textColor=TEXT, fontName="Helvetica",
-           leading=28, alignment=TA_CENTER, spaceAfter=22, letterSpacing=-0.2)))
-    S.append(HRFlowable(width="10%", thickness=0.5, color=LINE2,
-        hAlign='CENTER', spaceAfter=22))
+           leading=28, alignment=TA_CENTER, spaceAfter=24, letterSpacing=-0.2)))
+    S.append(HRFlowable(width="8%", thickness=0.5, color=LINE2,
+        hAlign='CENTER', spaceAfter=24))
     S.append(Paragraph(
-        "Reise abgeschlossen. Deine Werbungskosten sind ausgewertet, "
-        "der einzutragende Betrag steht fest, und die Schritt-für-Schritt-Anleitung "
-        "liegt zwei Seiten zurück. Mehr brauchst du nicht.",
+        "Deine Werbungskosten sind ausgewertet, der einzutragende Betrag steht fest. "
+        "Was zu tun bleibt, ist Eintragen — die Anleitung dafür liegt im vorderen Teil dieses Dokuments.",
         ps("sepbody", fontSize=10.5, textColor=TEXT2, fontName="Helvetica",
-           leading=18, alignment=TA_CENTER, spaceAfter=36)))
+           leading=18, alignment=TA_CENTER, spaceAfter=44)))
 
-    S.append(HRFlowable(width="30%", thickness=0.4, color=LINE,
+    S.append(HRFlowable(width="24%", thickness=0.4, color=LINE,
         hAlign='CENTER', spaceAfter=18))
     S.append(Paragraph("Ab hier nur zur Information",
         ps("sep2", fontSize=9, textColor=TEXT3, fontName="Helvetica-Bold",
            leading=13, alignment=TA_CENTER, spaceAfter=14, letterSpacing=1.8)))
     S.append(Paragraph(
-        "Die folgenden Seiten dienen als Nachweis und Begleit-Dokumentation: "
-        "hochgeladene Belege, die detaillierte Berechnung nach BMF-Pauschalen 2025 "
-        "sowie die Bestätigungsseite mit Unterschrift.",
+        "Die folgenden Seiten dienen als Nachweis und Begleit-Dokumentation deiner Auswertung: "
+        "die detaillierte Berechnung nach den jeweils gültigen BMF-Pauschalen, "
+        "alle hochgeladenen Belege als Anlagen sowie die Bestätigungsseite zur Unterschrift.",
         ps("sep3", fontSize=9.5, textColor=TEXT2, fontName="Helvetica",
            leading=16, alignment=TA_CENTER, spaceAfter=12)))
     S.append(Paragraph(
         "Sollte das Finanzamt Rückfragen haben, findest du hier alles "
-        "<i>sortiert, beschriftet und unterschriftsreif</i>.",
+        "<i>geordnet, beschriftet und nachvollziehbar</i> — Seite für Seite.",
         ps("sep4", fontSize=9.5, textColor=TEXT3, fontName="Helvetica",
            leading=15, alignment=TA_CENTER)))
 
