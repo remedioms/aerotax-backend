@@ -4135,19 +4135,25 @@ def _fallback_streck():
 
 
 def erstelle_pdf(d):
-    # ── PALETTE: minimal, elegant ────────────────────────────
-    BG     = HexColor("#060a16")
-    TEXT   = HexColor("#f1f5f9")   # primary
-    TEXT2  = HexColor("#94a3b8")   # secondary
-    TEXT3  = HexColor("#4a5a72")   # muted
-    LINE   = HexColor("#1e3050")   # dividers
-    LINE2  = HexColor("#2a3f5e")   # slightly brighter
-    WHITE  = HexColor("#ffffff")
+    # ── PALETTE: matching aerosteuer.de Glassmorphism ────────────
+    BG       = HexColor("#02060f")   # matching website html bg
+    BG_GLASS = HexColor("#0d1830")   # "translucent" glass card
+    BG_GLASS2= HexColor("#101e3d")   # slightly brighter (hover state)
+    TEXT     = HexColor("#f1f5f9")   # primary text
+    TEXT2    = HexColor("#94a3b8")   # secondary
+    TEXT3    = HexColor("#4a5a72")   # muted
+    LINE     = HexColor("#1e3050")   # dividers
+    LINE2    = HexColor("#2a3f5e")   # brighter borders
+    LINE3    = HexColor("#3b5278")   # bright border (highlights)
+    WHITE    = HexColor("#ffffff")
     G1=HexColor("#f97316"); G2=HexColor("#ec4899")
     G3=HexColor("#8b5cf6"); G4=HexColor("#2563eb")
-    BLUE2  = HexColor("#60a5fa")
-    NAVY   = HexColor("#071120")
-    OFF    = HexColor("#e2e8f0")
+    BLUE2    = HexColor("#60a5fa")
+    BLUE3    = HexColor("#93c5fd")
+    NAVY     = HexColor("#071120")
+    OFF      = HexColor("#e2e8f0")
+    GOLD     = HexColor("#fbbf24")   # cockpit accent
+    GOLD2    = HexColor("#fde047")
 
     base = getSampleStyleSheet()
     def ps(n, **kw): return ParagraphStyle(n, parent=base["Normal"], **kw)
@@ -4233,40 +4239,89 @@ def erstelle_pdf(d):
     def on_page(canv, doc):
         canv.saveState()
         W, H = A4
+        # Hauptbackground — matching website
         canv.setFillColor(BG); canv.rect(0,0,W,H,fill=1,stroke=0)
 
-        # Header — thick navy
+        # Subtile Mesh-Orb-Andeutung — diffuses Highlight oben links/unten rechts
+        # (ReportLab kann keinen echten blur — wir machen "Layered Tint")
+        for radius, alpha_hex, dx, dy in [(8*cm,"#0d1f3a",-2*cm,H-3*cm),(7*cm,"#0a1530",W-2*cm,1*cm)]:
+            canv.setFillColor(HexColor(alpha_hex))
+            canv.circle(dx, dy, radius, fill=1, stroke=0)
+
+        # Header-Glass-Strip — "translucent" navy band
         canv.setFillColor(NAVY)
-        canv.rect(0, H-1.6*cm, W, 1.6*cm, fill=1,stroke=0)
-        # Rainbow strip
+        canv.rect(0, H-1.7*cm, W, 1.7*cm, fill=1,stroke=0)
+        # Gradient stripe (orange→pink→purple→blue)
         sw = W/4
         for i,col in enumerate([G1,G2,G3,G4]):
             canv.setFillColor(col)
-            canv.rect(i*sw, H-0.12*cm, sw, 0.12*cm, fill=1,stroke=0)
-        canv.setFillColor(LINE)
-        canv.rect(0, H-1.6*cm, W, 0.04*cm, fill=1,stroke=0)
+            canv.rect(i*sw, H-0.1*cm, sw, 0.1*cm, fill=1,stroke=0)
+        # Subtile Glass-Border unten
+        canv.setStrokeColor(LINE2); canv.setLineWidth(0.4)
+        canv.line(0, H-1.7*cm, W, H-1.7*cm)
 
-        # AeroTAX — Aero white, TAX blue, together
+        # AeroTAX-Logo — kompakte Pyramid-A mit Cross-Bar (das Glas-Logo der Website)
+        # Position: x=1.5cm, y_baseline=H-1.15cm, height=0.9cm
+        lx = 1.5*cm; ly = H-1.45*cm; lh = 0.85*cm; lw = lh  # square logo box
+        canv.saveState()
+        # Glass-Background-Square unter Logo (rounded corners imitiert)
+        canv.setFillColor(HexColor("#0a1530"))
+        canv.setStrokeColor(HexColor("#1e3050")); canv.setLineWidth(0.4)
+        canv.roundRect(lx-0.05*cm, ly-0.05*cm, lw+0.1*cm, lh+0.1*cm, 0.12*cm, fill=1,stroke=1)
+        # Linker A-Schenkel (Polygon: 18,192 → 76,22 → 94,22 → 100,42 → 46,192)
+        # ViewBox 200x210, mappen auf lh (0.85cm)
+        scale = lh/210.0
+        def Lpt(x,y): return (lx + x*scale, ly + lh - y*scale)
+        canv.setFillColor(WHITE)
+        p = canv.beginPath()
+        for i,(x,y) in enumerate([(18,192),(76,22),(94,22),(100,42),(46,192)]):
+            if i==0: p.moveTo(*Lpt(x,y))
+            else: p.lineTo(*Lpt(x,y))
+        p.close(); canv.drawPath(p, fill=1, stroke=0)
+        # Rechter A-Schenkel
+        p = canv.beginPath()
+        for i,(x,y) in enumerate([(182,192),(124,22),(106,22),(100,42),(154,192)]):
+            if i==0: p.moveTo(*Lpt(x,y))
+            else: p.lineTo(*Lpt(x,y))
+        p.close(); canv.drawPath(p, fill=1, stroke=0)
+        # Cross-Bar
+        canv.rect(*Lpt(52,144), 96*scale, 16*scale, fill=1, stroke=0)
+        # Blue accent unter Cross-Bar
+        canv.setFillColor(BLUE2)
+        canv.rect(*Lpt(52,130.5), 96*scale, 2.5*scale, fill=1, stroke=0)
+        # Cockpit-Mast
+        canv.setFillColor(WHITE)
+        canv.rect(*Lpt(96.5,30), 7*scale, 38*scale, fill=1, stroke=0)
+        canv.circle(lx+100*scale, ly+lh-(-8)*scale, 5*scale, fill=1, stroke=0)
+        # Triebwerke (gold)
+        canv.setFillColor(GOLD)
+        canv.rect(*Lpt(67,30.5), 13*scale, 4.5*scale, fill=1, stroke=0)
+        canv.rect(*Lpt(120,30.5), 13*scale, 4.5*scale, fill=1, stroke=0)
+        canv.restoreState()
+
+        # AeroTAX wordmark rechts vom Logo
         canv.setFillColor(WHITE); canv.setFont("Helvetica-Bold", 14)
-        canv.drawString(1.5*cm, H-1.08*cm, "Aero")
+        text_x = lx + lw + 0.3*cm
+        canv.drawString(text_x, H-1.08*cm, "Aero")
         aw = canv.stringWidth("Aero","Helvetica-Bold",14)
         canv.setFillColor(BLUE2)
-        canv.drawString(1.5*cm+aw, H-1.08*cm, "TAX")
+        canv.drawString(text_x+aw, H-1.08*cm, "TAX")
         tw = canv.stringWidth("TAX","Helvetica-Bold",14)
+        # Trenner + Name
         canv.setFillColor(TEXT3); canv.setFont("Helvetica",9)
-        canv.drawString(1.5*cm+aw+tw+0.25*cm, H-1.1*cm, "·")
+        canv.drawString(text_x+aw+tw+0.25*cm, H-1.1*cm, "·")
         canv.setFillColor(OFF); canv.setFont("Helvetica",9)
-        canv.drawString(1.5*cm+aw+tw+0.6*cm, H-1.08*cm,
+        canv.drawString(text_x+aw+tw+0.6*cm, H-1.08*cm,
             f"{d.get('name','')}  ·  Steuerjahr {d.get('year',2025)}")
         canv.setFillColor(TEXT3); canv.setFont("Helvetica",8)
         canv.drawRightString(W-1.5*cm, H-0.95*cm, f"Seite {doc.page}")
         canv.drawRightString(W-1.5*cm, H-1.38*cm, d.get('datum',''))
 
-        # Footer — thick navy, minimal
+        # Footer — Glass-Strip
         canv.setFillColor(NAVY)
         canv.rect(0, 0, W, 0.75*cm, fill=1,stroke=0)
-        canv.setFillColor(LINE)
-        canv.rect(0, 0.75*cm, W, 0.04*cm, fill=1,stroke=0)
+        canv.setStrokeColor(LINE2); canv.setLineWidth(0.4)
+        canv.line(0, 0.75*cm, W, 0.75*cm)
         canv.setFillColor(WHITE); canv.setFont("Helvetica-Bold",7)
         canv.drawString(1.5*cm,0.48*cm,"Aero")
         aw2 = canv.stringWidth("Aero","Helvetica-Bold",7)
@@ -4291,18 +4346,63 @@ def erstelle_pdf(d):
     S = []
 
     # ════════════════════════════════════════════════
-    # SEITE 1 — DECKBLATT
+    # SEITE 1 — DECKBLATT (Glassmorphism)
     # ════════════════════════════════════════════════
-    S.append(Spacer(1, 1.8*cm))
+    S.append(Spacer(1, 1.4*cm))
 
-    # AeroTAX logo — large, gradient colored via font coloring
+    # Großes AeroTAX-Logo als Drawing — A-Form mit Cross-Bar + Cockpit + Triebwerke
+    from reportlab.graphics.shapes import Drawing, Polygon, Rect, Circle, Ellipse
+    from reportlab.platypus import Image as RLImage
+    def big_logo(size_cm=4.5):
+        sz = size_cm*cm
+        scale = sz/210.0
+        d2 = Drawing(sz, sz, hAlign='CENTER')
+        # Glass-BG-Square
+        d2.add(Rect(0, 0, sz, sz, rx=0.2*cm, ry=0.2*cm,
+                    fillColor=BG_GLASS, strokeColor=LINE2, strokeWidth=0.5))
+        # Linker A-Schenkel — Polygon points (xy in viewBox-Koords, dann mappen)
+        def to_xy(pts):
+            out = []
+            for x,y in pts:
+                out.extend([x*scale, sz - y*scale])
+            return out
+        d2.add(Polygon(points=to_xy([(18,192),(76,22),(94,22),(100,42),(46,192)]),
+                       fillColor=WHITE, strokeColor=None))
+        d2.add(Polygon(points=to_xy([(182,192),(124,22),(106,22),(100,42),(154,192)]),
+                       fillColor=WHITE, strokeColor=None))
+        # Cross-Bar
+        d2.add(Rect(52*scale, sz - 144*scale, 96*scale, 16*scale,
+                    fillColor=WHITE, strokeColor=None))
+        # Blue-Accent-Linie unter Cross-Bar
+        d2.add(Rect(52*scale, sz - 130.5*scale, 96*scale, 2.5*scale,
+                    fillColor=BLUE2, strokeColor=None))
+        # Cockpit-Mast oben
+        d2.add(Rect(96.5*scale, sz - 30*scale, 7*scale, 38*scale,
+                    fillColor=WHITE, strokeColor=None))
+        d2.add(Ellipse(100*scale, sz + 8*scale, 5*scale, 7*scale,
+                       fillColor=WHITE, strokeColor=None))
+        # Tragflächen — leichte Polygon-Andeutung
+        d2.add(Polygon(points=to_xy([(100,14),(100,25),(56,36),(60,25)]),
+                       fillColor=WHITE, strokeColor=None))
+        d2.add(Polygon(points=to_xy([(100,14),(100,25),(144,36),(140,25)]),
+                       fillColor=WHITE, strokeColor=None))
+        # Triebwerke (gold)
+        d2.add(Rect(67*scale, sz - 30.5*scale, 13*scale, 4.5*scale,
+                    fillColor=GOLD, strokeColor=None))
+        d2.add(Rect(120*scale, sz - 30.5*scale, 13*scale, 4.5*scale,
+                    fillColor=GOLD, strokeColor=None))
+        return d2
+    S.append(big_logo(4.5))
+    S.append(Spacer(1, 0.5*cm))
+
+    # AeroTAX wordmark mit Gradient-Andeutung (Helvetica)
     S.append(Paragraph(
-        'Aero<font color="#60a5fa">TAX</font>',
-        ps("logo", fontSize=34, textColor=WHITE, fontName="Helvetica-Bold",
-           leading=38, alignment=TA_CENTER, spaceAfter=8)))
+        '<font color="#ffffff">Aero</font><font color="#60a5fa">TAX</font>',
+        ps("logo", fontSize=38, textColor=WHITE, fontName="Helvetica-Bold",
+           leading=42, alignment=TA_CENTER, spaceAfter=4)))
     S.append(Paragraph("Die einfache Steuerauswertung für Flugpersonal",
-        ps("tag", fontSize=9.5, textColor=TEXT3, fontName="Helvetica",
-           leading=13, alignment=TA_CENTER, spaceAfter=30)))
+        ps("tag", fontSize=10, textColor=TEXT2, fontName="Helvetica",
+           leading=13, alignment=TA_CENTER, spaceAfter=28)))
 
     S.append(HRFlowable(width="40%", thickness=0.8, color=LINE2,
         hAlign='CENTER', spaceAfter=30))
