@@ -4240,6 +4240,45 @@ def erstelle_pdf(d):
         ]))
         return t
 
+    # ── WHITE BROCHURE CARD HELPERS (für Berechnung/Bestätigung) ──
+    def white_card(inner_flowables, pad=18, width_cm=16.8):
+        """Wrappt Flowables in eine weiße Brochure-Card auf blauem BG."""
+        t = Table([[inner_flowables]], colWidths=[width_cm*cm])
+        t.setStyle(TableStyle([
+            ('BACKGROUND',(0,0),(-1,-1),BG_CARD),
+            ('LEFTPADDING',(0,0),(-1,-1),pad),
+            ('RIGHTPADDING',(0,0),(-1,-1),pad),
+            ('TOPPADDING',(0,0),(-1,-1),pad),
+            ('BOTTOMPADDING',(0,0),(-1,-1),pad),
+            ('VALIGN',(0,0),(-1,-1),'TOP'),
+        ]))
+        try:
+            t.cornerRadii = [10, 10, 10, 10]
+        except Exception:
+            pass
+        return t
+
+    def kv_dark(label, value, bold=False, big=False):
+        """KV row für white card — dunkler Text auf weiß."""
+        vsize = 14 if big else 10
+        t = Table([[
+            Paragraph(label,
+                ps(f"kld{id(label)}", fontSize=10, textColor=TEXT_D2,
+                   fontName="Helvetica", leading=14)),
+            Paragraph(value,
+                ps(f"kvd{id(value)}", fontSize=vsize,
+                   textColor=TEXT_D,
+                   fontName="Helvetica-Bold" if (bold or big) else "Helvetica",
+                   leading=vsize+4, alignment=TA_RIGHT)),
+        ]], colWidths=[10.6*cm, 4.6*cm])
+        t.setStyle(TableStyle([
+            ("TOPPADDING",(0,0),(-1,-1),7), ("BOTTOMPADDING",(0,0),(-1,-1),7),
+            ("LEFTPADDING",(0,0),(-1,-1),0), ("RIGHTPADDING",(0,0),(-1,-1),0),
+            ("LINEBELOW",(0,0),(-1,0),0.3,LINE_W),
+            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ]))
+        return t
+
     # ── PAGE HEADER / FOOTER ─────────────────────────────────
     def on_page(canv, doc):
         canv.saveState()
@@ -4503,45 +4542,87 @@ def erstelle_pdf(d):
             S.append(hr(8, 12))
 
     # ════════════════════════════════════════════════
-    # TRENNSEITE — minimalistisch, elegant
+    # TRENNSEITE — Brochure-Hero-Card (weiß auf blau)
     # ════════════════════════════════════════════════
     S.append(PageBreak())
-    S.append(Spacer(1, 5*cm))
-    S.append(HRFlowable(width="30%", thickness=0.5, color=LINE2,
-        hAlign='CENTER', spaceAfter=28))
-    S.append(Paragraph("All Doors in Park.",
-        ps("sep0", fontSize=14, textColor=TEXT3, fontName="Helvetica",
-           leading=19, alignment=TA_CENTER, spaceAfter=18)))
-    S.append(Paragraph("Du bist fertig.",
-        ps("sep1", fontSize=28, textColor=TEXT, fontName="Helvetica-Bold",
-           leading=32, alignment=TA_CENTER, spaceAfter=22)))
-    S.append(HRFlowable(width="30%", thickness=0.5, color=LINE2,
-        hAlign='CENTER', spaceAfter=22))
-    S.append(Paragraph("Ab hier nur zur Information",
-        ps("sep2", fontSize=13, textColor=TEXT2, fontName="Helvetica",
-           leading=18, alignment=TA_CENTER, spaceAfter=16)))
-    S.append(Paragraph(
-        "Die folgenden Seiten zeigen die Berechnung im Detail "
-        "und dienen als Nachweis für das Finanzamt.",
-        ps("sep3", fontSize=9.5, textColor=TEXT3, fontName="Helvetica",
-           leading=16, alignment=TA_CENTER)))
+    S.append(Spacer(1, 4*cm))
+
+    # Inhalt der weißen Hero-Card
+    inner = []
+    inner.append(Paragraph("ALL DOORS IN PARK",
+        ps("hpe", fontSize=9, textColor=TEXT_D2, fontName="Helvetica-Bold",
+           leading=13, alignment=TA_CENTER, spaceAfter=10)))
+    inner.append(Paragraph("Du bist fertig.",
+        ps("hph", fontSize=32, textColor=TEXT_D, fontName="Helvetica-Bold",
+           leading=36, alignment=TA_CENTER, spaceAfter=14)))
+    inner.append(HRFlowable(width="20%", thickness=1, color=BLUE_HL,
+        hAlign='CENTER', spaceAfter=18))
+    inner.append(Paragraph(
+        "Trag die <b>3.940,10 €</b> in WISO ein, hänge dieses PDF an — "
+        "und schick deine Steuererklärung ab. Der Rest kommt vom Finanzamt.".replace(
+            "3.940,10 €", eur(d.get('netto', 0))),
+        ps("hpt", fontSize=11, textColor=TEXT_D2, fontName="Helvetica",
+           leading=17, alignment=TA_CENTER, spaceAfter=22)))
+    # Checkliste
+    checks = [
+        "Reisekosten korrekt berechnet (BMF-Pauschalen 2025)",
+        "Arbeitgeber-Erstattungen (Z17/Z77) bereits abgezogen",
+        "WISO-Eingabepfad steht auf Seite 2",
+        "Belege als Anhang fürs Finanzamt enthalten",
+    ]
+    for c in checks:
+        inner.append(Table([[
+            Paragraph("&#10003;",
+                ps(f"chk{id(c)}", fontSize=12, textColor=BLUE_HL,
+                   fontName="Helvetica-Bold", leading=14, alignment=TA_CENTER)),
+            Paragraph(c,
+                ps(f"cht{id(c)}", fontSize=10, textColor=TEXT_D,
+                   fontName="Helvetica", leading=14)),
+        ]], colWidths=[0.7*cm, 12.5*cm], style=TableStyle([
+            ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+            ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+        ])))
+    inner.append(Spacer(1, 0.3*cm))
+    inner.append(HRFlowable(width="100%", thickness=0.4, color=LINE_W,
+        spaceAfter=12, spaceBefore=4))
+    inner.append(Paragraph(
+        "AB HIER NUR ZUR INFORMATION",
+        ps("hpf", fontSize=8, textColor=TEXT_D3, fontName="Helvetica-Bold",
+           leading=11, alignment=TA_CENTER, spaceAfter=4)))
+    inner.append(Paragraph(
+        "Die folgenden Seiten zeigen die Berechnung im Detail und dienen als Nachweis für das Finanzamt.",
+        ps("hpf2", fontSize=9, textColor=TEXT_D3, fontName="Helvetica",
+           leading=14, alignment=TA_CENTER)))
+
+    S.append(white_card(inner, pad=22))
 
     # ════════════════════════════════════════════════
     # BELEGE — nur wenn Fotos vorhanden
     # ════════════════════════════════════════════════
     # Belege page — always shown
     S.append(PageBreak())
-    for el in section("Belege — Hochgeladene Dokumente"): S.append(el)
+    S.append(Paragraph("ANLAGEN",
+        ps("bel_eye", fontSize=10, textColor=TEXT2, fontName="Helvetica-Bold",
+           leading=14, spaceAfter=4)))
+    S.append(Paragraph("Belege & hochgeladene Dokumente",
+        ps("bel_h", fontSize=22, textColor=WHITE, fontName="Helvetica-Bold",
+           leading=26, spaceAfter=18)))
+
     if not has_fotos:
-        S.append(Spacer(1, 1.5*cm))
-        S.append(Paragraph("Keine Belege hochgeladen.",
-            ps("no_belege", fontSize=11, textColor=TEXT2,
-               fontName="Helvetica", leading=16, alignment=TA_CENTER,
+        nb_inner = []
+        nb_inner.append(Paragraph("Keine Belege hochgeladen",
+            ps("no_belege", fontSize=15, textColor=TEXT_D,
+               fontName="Helvetica-Bold", leading=20, alignment=TA_CENTER,
                spaceAfter=8)))
-        S.append(Paragraph(
-            "Es wurden keine Belege hochgeladen. Lade beim nächsten Mal deine Rechnungen unter Schritt 2 hoch — dann musst du sie nicht manuell in WISO suchen.",
-            ps("no_belege_sub", fontSize=9, textColor=TEXT3,
-               fontName="Helvetica", leading=14, alignment=TA_CENTER)))
+        nb_inner.append(Paragraph(
+            "Bei dieser Auswertung wurden keine optionalen Belege beigefügt. "
+            "Beim nächsten Mal kannst du Telefonrechnungen, Versicherungs-Bescheinigungen, "
+            "Gewerkschaftsbeiträge etc. unter <b>Schritt 2 — Optionale Dokumente</b> hochladen — "
+            "AeroTAX schreibt den WISO-Pfad direkt drauf, dann musst du nichts mehr suchen.",
+            ps("no_belege_sub", fontSize=10, textColor=TEXT_D2,
+               fontName="Helvetica", leading=16, alignment=TA_CENTER)))
+        S.append(white_card(nb_inner, pad=22))
     if has_fotos:
       W_c = A4[0] - 3.2*cm
       first = True
@@ -4603,10 +4684,17 @@ def erstelle_pdf(d):
                            fontName="Helvetica", leading=12)))
 
     # ════════════════════════════════════════════════
-    # BERECHNUNG
+    # BERECHNUNG — White Brochure Card auf Royal Blue
     # ════════════════════════════════════════════════
     S.append(PageBreak())
-    for el in section("Berechnung — Zur Information"): S.append(el)
+
+    # Section-Title in Brochure-Style (weiß auf blau, dann Card)
+    S.append(Paragraph("BERECHNUNG",
+        ps("calc_eye", fontSize=10, textColor=TEXT2, fontName="Helvetica-Bold",
+           leading=14, spaceAfter=4)))
+    S.append(Paragraph("Wie sich der Betrag zusammensetzt",
+        ps("calc_h", fontSize=22, textColor=WHITE, fontName="Helvetica-Bold",
+           leading=26, spaceAfter=18)))
 
     calc_items = [
         (f"Fahrtkosten Homebase  ({d.get('km',0)} km × {d.get('fahr_tage',0)} Tage)", "Zeilen 27–30", eur(d.get('fahr',0))),
@@ -4617,30 +4705,52 @@ def erstelle_pdf(d):
         (f"VMA 24h  ({d.get('vma_74_tage',0)} Tage × 28 €)", "Zeile 74", eur(d.get('vma_74',0))),
         ("VMA Ausland nach BMF-Pauschalen 2025", "Zeile 76", eur(d.get('vma_aus',0))),
     ]
+
+    calc_inner = []
     for label, zeile, val in calc_items:
         t = Table([[
-            Paragraph(label, ps(f"cl{id(label)}", fontSize=9, textColor=TEXT2,
-                fontName="Helvetica", leading=12)),
-            Paragraph(zeile, ps(f"cz{id(zeile)}", fontSize=8, textColor=TEXT3,
+            Paragraph(label, ps(f"cl{id(label)}", fontSize=9.5, textColor=TEXT_D,
+                fontName="Helvetica", leading=13)),
+            Paragraph(zeile, ps(f"cz{id(zeile)}", fontSize=8, textColor=TEXT_D3,
                 fontName="Helvetica", leading=12, alignment=TA_CENTER)),
-            Paragraph(val, ps(f"cv{id(val)}", fontSize=9, textColor=TEXT,
-                fontName="Helvetica", leading=12, alignment=TA_RIGHT)),
-        ]], colWidths=[10.5*cm, 2*cm, 4.3*cm])
+            Paragraph(val, ps(f"cv{id(val)}", fontSize=9.5, textColor=TEXT_D,
+                fontName="Helvetica", leading=13, alignment=TA_RIGHT)),
+        ]], colWidths=[9.0*cm, 2*cm, 4.0*cm])
         t.setStyle(TableStyle([
-            ("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6),
+            ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7),
             ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
-            ("LINEBELOW",(0,0),(-1,0),0.3,LINE),
+            ("LINEBELOW",(0,0),(-1,0),0.3,LINE_W),
             ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
         ]))
-        S.append(t)
+        calc_inner.append(t)
 
-    # Summe
-    S.append(kv_total("Summe aller Aufwendungen", eur(d.get('gesamt',0))))
-    S.append(kv(f"Abzug: AG-Fahrkostenzuschuss (Z17)",
-        eur(-d.get('ag_z17',0)), vc=TEXT2))
-    S.append(kv(f"Abzug: Steuerfreie Spesen Lufthansa (Z77)",
-        eur(-d.get('z77',0)), vc=TEXT2))
-    S.append(kv_total("Einzutragender Betrag", eur(d.get('netto',0))))
+    # Summe (bold, mit Top-Line)
+    def kv_total_dark(label, value, accent=False):
+        t = Table([[
+            Paragraph(label, ps(f"ktd{id(label)}", fontSize=11,
+                textColor=BLUE_HL if accent else TEXT_D,
+                fontName="Helvetica-Bold", leading=15)),
+            Paragraph(value, ps(f"kvtd{id(value)}", fontSize=14,
+                textColor=BLUE_HL if accent else TEXT_D, fontName="Helvetica-Bold",
+                leading=18, alignment=TA_RIGHT)),
+        ]], colWidths=[11.0*cm, 4.0*cm])
+        t.setStyle(TableStyle([
+            ("TOPPADDING",(0,0),(-1,-1),10),("BOTTOMPADDING",(0,0),(-1,-1),10),
+            ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+            ("LINEABOVE",(0,0),(-1,0),1.0,BLUE_HL if accent else TEXT_D2),
+            ("LINEBELOW",(0,0),(-1,0),1.0,BLUE_HL if accent else TEXT_D2),
+            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ]))
+        return t
+
+    calc_inner.append(kv_total_dark("Summe aller Aufwendungen", eur(d.get('gesamt',0))))
+    calc_inner.append(kv_dark(f"Abzug: AG-Fahrkostenzuschuss (Z17)",
+        eur(-d.get('ag_z17',0))))
+    calc_inner.append(kv_dark(f"Abzug: Steuerfreie Spesen Lufthansa (Z77)",
+        eur(-d.get('z77',0))))
+    calc_inner.append(kv_total_dark("Einzutragender Betrag", eur(d.get('netto',0)), accent=True))
+
+    S.append(white_card(calc_inner, pad=20))
     S.append(Spacer(1, 0.5*cm))
 
     # Monate
@@ -4785,41 +4895,51 @@ def erstelle_pdf(d):
     # Audit-Trail / Verifikations-Status komplett raus —
     # User will nur die AeroTAX-Auswertung, keine KI-/Methodik-Hinweise im PDF.
     S.append(PageBreak())
-    for el in section("Bestätigung & Unterschrift"): S.append(el)
 
-    S.append(Paragraph(
+    # Brochure-Style Section-Header (weiß auf blau)
+    S.append(Paragraph("BESTÄTIGUNG",
+        ps("conf_eye", fontSize=10, textColor=TEXT2, fontName="Helvetica-Bold",
+           leading=14, spaceAfter=4)))
+    S.append(Paragraph("Bestätigung & Unterschrift",
+        ps("conf_h", fontSize=22, textColor=WHITE, fontName="Helvetica-Bold",
+           leading=26, spaceAfter=18)))
+
+    # White Card mit Confirmation + Form
+    sig_inner = []
+    sig_inner.append(Paragraph(
         "Ich bestätige, dass ich alle Angaben in diesem Dokument "
         "persönlich geprüft habe und diese nach meiner Kenntnis "
         "vollständig und korrekt sind. Mir ist bewusst, dass ich "
         "als Steuerpflichtiger für die Richtigkeit meiner "
         "Steuererklärung gegenüber dem Finanzamt verantwortlich bin.",
-        ps("conf", fontSize=9.5, textColor=TEXT, fontName="Helvetica",
-           leading=17, spaceAfter=36)))
+        ps("conf", fontSize=10, textColor=TEXT_D2, fontName="Helvetica",
+           leading=16, spaceAfter=24)))
 
     for label, value in [("Name", d.get('name','')), ("Datum", d.get('datum',''))]:
-        S.append(Paragraph(label,
-            ps(f"sl{label}", fontSize=7.5, textColor=TEXT3,
+        sig_inner.append(Paragraph(label,
+            ps(f"sl{label}", fontSize=7.5, textColor=TEXT_D3,
                fontName="Helvetica-Bold", leading=11,
-               spaceAfter=4, letterSpacing=1.5)))
-        S.append(Paragraph(value,
-            ps(f"sv{label}", fontSize=11, textColor=TEXT,
-               fontName="Helvetica", leading=14, spaceAfter=22)))
+               spaceAfter=3, letterSpacing=1.5)))
+        sig_inner.append(Paragraph(value,
+            ps(f"sv{label}", fontSize=12, textColor=TEXT_D,
+               fontName="Helvetica-Bold", leading=15, spaceAfter=18)))
 
-    S.append(Paragraph("Unterschrift",
-        ps("sig_l", fontSize=7.5, textColor=TEXT3,
+    sig_inner.append(Paragraph("Unterschrift",
+        ps("sig_l", fontSize=7.5, textColor=TEXT_D3,
            fontName="Helvetica-Bold", leading=11,
            spaceAfter=10, letterSpacing=1.5)))
-    sig = Table([[""]], colWidths=[16.8*cm], rowHeights=[4.2*cm])
+    sig = Table([[""]], colWidths=[15.4*cm], rowHeights=[3.8*cm])
     sig.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,-1), WHITE),
-        ("BOX",(0,0),(-1,-1), 0.5, HexColor("#2a3f5e")),
+        ("BACKGROUND",(0,0),(-1,-1), HexColor("#f8fafc")),
+        ("BOX",(0,0),(-1,-1), 0.6, LINE_W),
     ]))
-    S.append(sig)
-    S.append(Spacer(1, 0.8*cm))
-    S.append(hr(0, 10))
+    sig_inner.append(sig)
+
+    S.append(white_card(sig_inner, pad=22))
+    S.append(Spacer(1, 0.5*cm))
     S.append(Paragraph(
         f"AeroTAX  ·  aerosteuer.de  ·  Erstellt am {d.get('datum','')}",
-        ps("ff", fontSize=7.5, textColor=TEXT3, fontName="Helvetica",
+        ps("ff", fontSize=8, textColor=TEXT2, fontName="Helvetica",
            leading=11, alignment=TA_CENTER)))
 
     doc.build(S, onFirstPage=on_page, onLaterPages=on_page)
