@@ -4493,45 +4493,74 @@ def erstelle_pdf(d):
             f'Fehlende Dokumente: {_not_upl}',
             ps('warn_miss', fontSize=8, textColor=TEXT3,
                fontName='Helvetica', leading=12, alignment=TA_CENTER)))
-    # SEITE 2 — REISEKOSTEN & WEITERE KOSTEN
+    # SEITE 2 — DAS HIER MUSS DER USER MACHEN (klar für Anfänger)
     # ════════════════════════════════════════════════
     S.append(PageBreak())
-    for el in section("Reisekosten & weitere absetzbare Kosten"): S.append(el)
 
-    # Betrag — large, clean
-    S.append(Paragraph("Einzutragender Betrag",
-        ps("nb_lbl", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
-           leading=11, spaceAfter=8, letterSpacing=1.5)))
-    S.append(kv_total("Reisenebenkosten", eur(d['netto'])))
-    S.append(Spacer(1, 0.3*cm))
+    # ── HERO: Der Betrag, prominent ──
+    S.append(Spacer(1, 0.4*cm))
+    S.append(Paragraph("DEIN WISO-BETRAG",
+        ps("hero_eye", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
+           leading=12, alignment=TA_CENTER, spaceAfter=14, letterSpacing=2.5)))
+    S.append(Paragraph(eur(d['netto']),
+        ps("hero_num", fontSize=46, textColor=TEXT, fontName="Helvetica",
+           leading=52, alignment=TA_CENTER, spaceAfter=12, letterSpacing=-1.0)))
 
-    # Steps — pure text, elegant
-    S.append(Paragraph("Schritt für Schritt",
-        ps("steps_h", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
-           leading=11, spaceAfter=14, letterSpacing=1.5)))
+    # Pill-Hinweis: WO einzutragen
+    pill = Table([[Paragraph(
+        '<font color="#94a3b8">eintragen als</font>  <b>Reisenebenkosten</b>',
+        ps("pill_t", fontSize=10, textColor=TEXT, fontName="Helvetica",
+           leading=14, alignment=TA_CENTER))]], colWidths=[7.0*cm])
+    pill.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1), HexColor("#0f1830")),
+        ("BOX",(0,0),(-1,-1), 0.5, LINE2),
+        ("ROUNDEDCORNERS",[12,12,12,12]),
+        ("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8),
+        ("LEFTPADDING",(0,0),(-1,-1),18),("RIGHTPADDING",(0,0),(-1,-1),18),
+    ]))
+    pwrap = Table([[pill]], colWidths=[16.8*cm])
+    pwrap.setStyle(TableStyle([
+        ("ALIGN",(0,0),(-1,-1),"CENTER"),
+        ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+        ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),0),
+    ]))
+    S.append(pwrap)
+    S.append(Spacer(1, 0.7*cm))
+
+    # ── Subtle Trenner ──
+    S.append(HRFlowable(width="100%", thickness=0.4, color=LINE,
+        spaceBefore=4, spaceAfter=22))
+
+    # ── ANLEITUNG: So trägst du den Betrag ein ──
+    S.append(Paragraph("SO TRÄGST DU IHN EIN",
+        ps("steps_eye", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
+           leading=12, spaceAfter=4, letterSpacing=2.5)))
+    S.append(Paragraph("Vier Schritte in WISO oder ELSTER",
+        ps("steps_h", fontSize=15, textColor=TEXT, fontName="Helvetica",
+           leading=20, spaceAfter=18, letterSpacing=-0.2)))
 
     steps = [
-        ("1", "WISO / Elster öffnen",
-         "Ausgaben → Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten → Neuer Eintrag"),
+        ("1", "Auswertungs-Software öffnen",
+         "WISO Steuer · ELSTER · oder das Programm deiner Wahl. Lege einen neuen Eintrag unter <b>Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten</b> an."),
         ("2", "Beschreibung eingeben",
-         f"Weitere Werbungskosten — Dienstplanauswertung AeroTax {d.get('year', 2025)}"),
-        ("3", f"Reisenebenkosten:  {eur(d['netto'])}",
-         "Nur diesen Betrag eintragen — alle anderen Felder leer lassen."),
-        ("4", "PDF hochladen",
-         "Als Anhang beifügen oder auf Anfrage beim Finanzamt nachreichen."),
+         f"Beim Beschreibungs-Feld eintragen: <b>Dienstplan-Auswertung AeroTAX {d.get('year', 2025)}</b>. Damit ist klar, woher der Betrag stammt."),
+        ("3", f"Betrag eintragen:  <b>{eur(d['netto'])}</b>",
+         f"Nur dieser eine Wert kommt ins Feld <b>Reisenebenkosten</b>. Alle anderen Felder bleiben leer — der Betrag enthält bereits Verpflegung, Fahrtkosten und Trinkgelder."),
+        ("4", "Dieses PDF anhängen",
+         "Lade das komplette PDF als Anlage zur Steuererklärung mit hoch. Es enthält Berechnung und Belege als Nachweis — falls das Finanzamt Rückfragen hat, ist alles drin."),
     ]
     for n, title, desc in steps:
         t = Table([[
-            Paragraph(n, ps(f"sn{n}", fontSize=14, textColor=BLUE3,
-                fontName="Helvetica-Bold", leading=18, alignment=TA_CENTER)),
+            Paragraph(n, ps(f"sn{n}", fontSize=18, textColor=BLUE3,
+                fontName="Helvetica", leading=22, alignment=TA_CENTER)),
             Paragraph(
                 f"<b>{title}</b><br/>"
-                f'<font color="#bfdbfe" size="8.5">{desc}</font>',
-                ps(f"sd{n}", fontSize=10, textColor=TEXT,
+                f'<font color="#94a3b8" size="9">{desc}</font>',
+                ps(f"sd{n}", fontSize=10.5, textColor=TEXT,
                    fontName="Helvetica", leading=15)),
-        ]], colWidths=[0.9*cm, 15.9*cm])
+        ]], colWidths=[1.1*cm, 15.7*cm])
         t.setStyle(TableStyle([
-            ("TOPPADDING",(0,0),(-1,-1),12),("BOTTOMPADDING",(0,0),(-1,-1),12),
+            ("TOPPADDING",(0,0),(-1,-1),14),("BOTTOMPADDING",(0,0),(-1,-1),14),
             ("LEFTPADDING",(0,0),(-1,-1),10),("RIGHTPADDING",(0,0),(-1,-1),0),
             ("LINEBELOW",(0,0),(-1,0),0.4,LINE),
             ("VALIGN",(0,0),(-1,-1),"TOP"),
@@ -4899,8 +4928,8 @@ def erstelle_pdf(d):
            spaceAfter=10, letterSpacing=1.5)))
     sig = Table([[""]], colWidths=[16.8*cm], rowHeights=[4.2*cm])
     sig.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,-1), BG_DARK),
-        ("BOX",(0,0),(-1,-1), 0.5, LINE2),
+        ("BACKGROUND",(0,0),(-1,-1), WHITE),
+        ("BOX",(0,0),(-1,-1), 0.6, LINE2),
     ]))
     S.append(sig)
     S.append(Spacer(1, 0.8*cm))
