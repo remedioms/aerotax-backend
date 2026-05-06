@@ -4360,13 +4360,13 @@ def erstelle_pdf(d):
         ps("eye", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
            leading=12, alignment=TA_CENTER, spaceAfter=24, letterSpacing=2.5)))
 
-    # Title — dünn & elegant (Helvetica non-bold, mit letter-spacing wie das Aerosteuer Wordmark)
-    S.append(Paragraph(f"{d.get('name','')}<font size=\"26\">'s</font> Steuerauswertung",
-        ps("h1", fontSize=30, textColor=TEXT, fontName="Helvetica",
-           leading=38, alignment=TA_CENTER, spaceAfter=8, letterSpacing=-0.5)))
+    # Title — dünn & elegant, kleiner & runder
+    S.append(Paragraph(f"{d.get('name','')}<font size=\"18\">'s</font> Steuerauswertung",
+        ps("h1", fontSize=20, textColor=TEXT, fontName="Helvetica",
+           leading=26, alignment=TA_CENTER, spaceAfter=6, letterSpacing=0)))
     S.append(Paragraph(f"Steuerjahr {d.get('year',2025)}",
-        ps("h1y", fontSize=13, textColor=TEXT2, fontName="Helvetica",
-           leading=17, alignment=TA_CENTER, spaceAfter=44, letterSpacing=0.8)))
+        ps("h1y", fontSize=11, textColor=TEXT2, fontName="Helvetica",
+           leading=15, alignment=TA_CENTER, spaceAfter=40, letterSpacing=0.6)))
 
     # Subtle Trenner
     S.append(HRFlowable(width="10%", thickness=0.5, color=LINE2,
