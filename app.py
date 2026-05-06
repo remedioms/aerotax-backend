@@ -4335,38 +4335,12 @@ def erstelle_pdf(d):
         ex,ey = Lpt(120, 30.5)
         canv.rect(ex, ey, 13*scale, 4.5*scale, fill=1, stroke=0)
 
-        # AeroTAX wordmark rechts vom Logo — TAX als smoother Gradient
-        # Website-Gradient: linear-gradient(135deg, #f97316, #ec4899, #8b5cf6, #2563eb)
-        # Bei 3 Buchstaben (T=0%, A=50%, X=100%) interpolieren wir die 4 Stops:
-        canv.setFillColor(WHITE); canv.setFont("Helvetica-Bold", 13)
+        # AeroTAX wordmark rechts vom Logo — komplett weiß, dünn (Helvetica regular)
+        canv.setFillColor(WHITE); canv.setFont("Helvetica", 14)
         text_x = lx + lw + 0.25*cm
-        canv.drawString(text_x, H-1.0*cm, "Aero")
-        aw = canv.stringWidth("Aero","Helvetica-Bold",13)
-
-        def _grad(t):
-            """Interpoliert zwischen den 4 Website-Gradient-Stops (t in 0..1)."""
-            stops = [
-                (0.0,  (0xf9, 0x73, 0x16)),   # G1 orange
-                (0.33, (0xec, 0x48, 0x99)),   # G2 pink
-                (0.66, (0x8b, 0x5c, 0xf6)),   # G3 purple
-                (1.0,  (0x25, 0x63, 0xeb)),   # G4 blue
-            ]
-            for i in range(len(stops)-1):
-                if t <= stops[i+1][0]:
-                    p0,c0 = stops[i]; p1,c1 = stops[i+1]
-                    f = (t-p0)/(p1-p0) if p1>p0 else 0
-                    rgb = tuple(int(c0[j] + (c1[j]-c0[j])*f) for j in range(3))
-                    return HexColor("#%02x%02x%02x" % rgb)
-            return HexColor("#%02x%02x%02x" % stops[-1][1])
-
-        tx = text_x + aw
-        letters = "TAX"
-        for i, letter in enumerate(letters):
-            t_pos = i / (len(letters)-1) if len(letters)>1 else 0
-            canv.setFillColor(_grad(t_pos))
-            canv.drawString(tx, H-1.0*cm, letter)
-            tx += canv.stringWidth(letter, "Helvetica-Bold", 13)
-        tw = tx - (text_x + aw)
+        canv.drawString(text_x, H-1.0*cm, "AeroTAX")
+        aw = canv.stringWidth("AeroTAX","Helvetica",14)
+        tw = 0  # combined into aw
         # Trenner + Name
         canv.setFillColor(TEXT3); canv.setFont("Helvetica",9)
         canv.drawString(text_x+aw+tw+0.22*cm, H-1.02*cm, "·")
@@ -4611,8 +4585,9 @@ def erstelle_pdf(d):
                 f'<font color="#94a3b8">eintragen unter:</font>  <b>{wiso_path}</b>',
                 ps(f"bw{id(b)}", fontSize=9, textColor=TEXT,
                    fontName="Helvetica", leading=13, spaceAfter=4)))
-            if b.get('hint') and has_doc:
-                S.append(Paragraph(f"{b['hint']}",
+            if has_doc:
+                S.append(Paragraph(
+                    'Vollen Beleg-Betrag eintragen — WISO berechnet den absetzbaren Anteil automatisch.',
                     ps(f"bh{id(b)}", fontSize=8.5, textColor=TEXT3,
                        fontName="Helvetica", leading=12, spaceAfter=2)))
             S.append(HRFlowable(width="100%", thickness=0.3, color=LINE,
