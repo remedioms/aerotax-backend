@@ -4335,14 +4335,18 @@ def erstelle_pdf(d):
         ex,ey = Lpt(120, 30.5)
         canv.rect(ex, ey, 13*scale, 4.5*scale, fill=1, stroke=0)
 
-        # AeroTAX wordmark rechts vom Logo
+        # AeroTAX wordmark rechts vom Logo — TAX im Gradient (orange→purple→blue)
         canv.setFillColor(WHITE); canv.setFont("Helvetica-Bold", 13)
         text_x = lx + lw + 0.25*cm
         canv.drawString(text_x, H-1.0*cm, "Aero")
         aw = canv.stringWidth("Aero","Helvetica-Bold",13)
-        canv.setFillColor(BLUE3)
-        canv.drawString(text_x+aw, H-1.0*cm, "TAX")
-        tw = canv.stringWidth("TAX","Helvetica-Bold",13)
+        # TAX-Gradient: T=Orange, A=Purple, X=Blue
+        tx = text_x + aw
+        for letter, color in [("T", G1), ("A", G3), ("X", G4)]:
+            canv.setFillColor(color)
+            canv.drawString(tx, H-1.0*cm, letter)
+            tx += canv.stringWidth(letter, "Helvetica-Bold", 13)
+        tw = tx - (text_x + aw)
         # Trenner + Name
         canv.setFillColor(TEXT3); canv.setFont("Helvetica",9)
         canv.drawString(text_x+aw+tw+0.22*cm, H-1.02*cm, "·")
@@ -4556,28 +4560,41 @@ def erstelle_pdf(d):
             S.append(hr(8, 12))
 
     # ════════════════════════════════════════════════
-    # TRENNSEITE — minimalistisch & elegant
+    # TRENNSEITE — elegant, narrativer Übergang
     # ════════════════════════════════════════════════
     S.append(PageBreak())
-    S.append(Spacer(1, 5.5*cm))
-    S.append(HRFlowable(width="14%", thickness=0.5, color=LINE2,
-        hAlign='CENTER', spaceAfter=24))
-    S.append(Paragraph("All Doors in Park.",
-        ps("sep0", fontSize=11, textColor=TEXT3, fontName="Helvetica",
-           leading=15, alignment=TA_CENTER, spaceAfter=14, letterSpacing=0.5)))
+    S.append(Spacer(1, 4.0*cm))
+    S.append(Paragraph("ALL DOORS IN PARK",
+        ps("sep0", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
+           leading=12, alignment=TA_CENTER, spaceAfter=18, letterSpacing=2.5)))
     S.append(Paragraph("Du bist fertig.",
-        ps("sep1", fontSize=22, textColor=TEXT, fontName="Helvetica-Bold",
-           leading=28, alignment=TA_CENTER, spaceAfter=24)))
-    S.append(HRFlowable(width="14%", thickness=0.5, color=LINE2,
+        ps("sep1", fontSize=22, textColor=TEXT, fontName="Helvetica",
+           leading=28, alignment=TA_CENTER, spaceAfter=22, letterSpacing=-0.2)))
+    S.append(HRFlowable(width="10%", thickness=0.5, color=LINE2,
+        hAlign='CENTER', spaceAfter=22))
+    S.append(Paragraph(
+        "Reise abgeschlossen. Deine Werbungskosten sind ausgewertet, "
+        "der einzutragende Betrag steht fest, und die Schritt-für-Schritt-Anleitung "
+        "liegt zwei Seiten zurück. Mehr brauchst du nicht.",
+        ps("sepbody", fontSize=10.5, textColor=TEXT2, fontName="Helvetica",
+           leading=18, alignment=TA_CENTER, spaceAfter=36)))
+
+    S.append(HRFlowable(width="30%", thickness=0.4, color=LINE,
         hAlign='CENTER', spaceAfter=18))
     S.append(Paragraph("Ab hier nur zur Information",
-        ps("sep2", fontSize=9.5, textColor=TEXT2, fontName="Helvetica",
-           leading=14, alignment=TA_CENTER, spaceAfter=8)))
+        ps("sep2", fontSize=9, textColor=TEXT3, fontName="Helvetica-Bold",
+           leading=13, alignment=TA_CENTER, spaceAfter=14, letterSpacing=1.8)))
     S.append(Paragraph(
-        "Die folgenden Seiten zeigen die Berechnung im Detail "
-        "und dienen als Nachweis für das Finanzamt.",
-        ps("sep3", fontSize=8.5, textColor=TEXT3, fontName="Helvetica",
-           leading=13, alignment=TA_CENTER)))
+        "Die folgenden Seiten dienen als Nachweis und Begleit-Dokumentation: "
+        "hochgeladene Belege, die detaillierte Berechnung nach BMF-Pauschalen 2025 "
+        "sowie die Bestätigungsseite mit Unterschrift.",
+        ps("sep3", fontSize=9.5, textColor=TEXT2, fontName="Helvetica",
+           leading=16, alignment=TA_CENTER, spaceAfter=12)))
+    S.append(Paragraph(
+        "Sollte das Finanzamt Rückfragen haben, findest du hier alles "
+        "<i>sortiert, beschriftet und unterschriftsreif</i>.",
+        ps("sep4", fontSize=9.5, textColor=TEXT3, fontName="Helvetica",
+           leading=15, alignment=TA_CENTER)))
 
     # ════════════════════════════════════════════════
     # BELEGE — nur wenn Fotos vorhanden
