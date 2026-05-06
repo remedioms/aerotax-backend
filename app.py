@@ -1919,7 +1919,7 @@ def progress_stream():
         wait_msgs = [
             'KI prüft Tag für Tag — bitte einen Moment…',
             'Bin noch dabei, deine Auswertung wird gerade fertig…',
-            'Daten werden verifiziert (FollowMe-Vergleich)…',
+            'Konsistenz-Check der Werte…',
             'Letzte Plausi-Checks laufen…',
             'Gleich fertig — Ergebnis wird formatiert…',
         ]
@@ -2631,13 +2631,13 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
     """
     Liest Lufthansa Streckeneinsatz-Abrechnungen.
 
-    VERIFIZIERTE FORMELN (gegen FollowMe Ground Truth getestet):
+    VERIFIZIERTE FORMELN (gegen Referenz-Auswertung getestet):
 
     Z77 (steuerfrei gesamt):
         Pro Abrechnung: Z77 = Gesamt - letzter_Wert der "Summe:"-Zeile
         "Summe: G C2 C3" → Z77 = G - C3  (3 Spalten)
         "Summe: G C2"    → Z77 = G - C2  (2 Spalten)
-        Summe über alle Abrechnungen = exakt FollowMe Z77
+        Summe über alle Abrechnungen = exakt Z77
 
     Z73 (An-/Abreisetage):
         Zeilen mit Muster "14,00 FRA" = Anreisetage von Homebase FRA
@@ -2763,7 +2763,7 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
     if not ANTHROPIC_KEY:
         return None
 
-    # ── FollowMe-Erkennung ──────────────────────────────────────────
+    # ── Auswertungs-PDF-Erkennung ──────────────────────────────────────────
     combined = ''
     for pb in _bytes_list(pdf_bytes_list)[:2]:
         try:
@@ -2771,8 +2771,8 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
                 combined += ' '.join(p.extract_text() or '' for p in pdf.pages[:3])
         except: pass
 
-    if re.search(r'FollowMe|Zeile 72|Zeile 73|Anlage N.*Auswertung', combined, re.I):
-        # FollowMe-PDF: direkt mit Claude parsen
+    if re.search(r'Steuer-Auswertung|Zeile 72|Zeile 73|Anlage N.*Auswertung', combined, re.I):
+        # Auswertungs-PDF: direkt mit Claude parsen
         try:
             client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
             result = {'fahr_tage':0,'km':0,'arbeitstage':0,'hotel_naechte':0,
@@ -2783,7 +2783,7 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
                 b64 = base64.standard_b64encode(pb).decode()
                 content_v.append({'type':'document','source':{'type':'base64','media_type':'application/pdf','data':b64}})
             content_v.append({'type':'text','text':
-                'FollowMe PDF. Extrahiere: Zeile 72 (Tage, €), 73 (Tage, €), 74 (Tage, €), 76 (€), Fahrtage, km, Arbeitstage, Hotelaufenthalte.\n'
+                'Auswertungs-PDF. Extrahiere: Zeile 72 (Tage, €), 73 (Tage, €), 74 (Tage, €), 76 (€), Fahrtage, km, Arbeitstage, Hotelaufenthalte.\n'
                 'JSON: {"vma_72_tage":13,"vma_72":182.0,"vma_73_tage":10,"vma_73":140.0,"vma_74_tage":0,"vma_74":0.0,"vma_aus":4562.0,"fahr_tage":53,"km":27,"arbeitstage":129,"hotel_naechte":54}'
             })
             resp = client.messages.create(model='claude-sonnet-4-6',max_tokens=400,
@@ -2791,10 +2791,10 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
             d = json.loads(re.sub(r'```json|```','',resp.content[0].text.strip()).strip())
             for k,v in d.items():
                 result[k] = int(float(v)) if k in ('vma_72_tage','vma_73_tage','vma_74_tage','fahr_tage','km','arbeitstage','hotel_naechte') else float(v)
-            print(f"FollowMe: fahr={result['fahr_tage']} km={result['km']} arbeit={result['arbeitstage']} hotel={result['hotel_naechte']} vma76={result['vma_aus']}")
+            print(f"Parser: fahr={result['fahr_tage']} km={result['km']} arbeit={result['arbeitstage']} hotel={result['hotel_naechte']} vma76={result['vma_aus']}")
             return result
         except Exception as e:
-            print(f'FollowMe error: {e}')
+            print(f'Parser error: {e}')
             return None
 
     # ── Reine LH Flugstunden: 100% Claude ──────────────────────────
@@ -2887,13 +2887,13 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
             )
             rechner_kontext = ''.join(parts_kontext)
 
-        # FollowMe als letztes Content-Element (Lernbeispiel, kein Regelwerk)
-        fm_kontext = ''
+        # Referenz-Auswertung als letztes Content-Element (Lernbeispiel, kein Regelwerk)
+        ref_kontext = ''
         try:
             fm_ref = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'referenz_faelle.txt')
             if os.path.exists(fm_ref):
                 with open(fm_ref, encoding='utf-8') as fmf:
-                    fm_kontext = '\n\nHIER SIND ZWEI BEREITS BERECHNETE FÄLLE ZUM VERGLEICH (von FollowMe verifiziert — nicht als Regeln, sondern als Beispiele zum Lernen):\n' + fmf.read()
+                    ref_kontext = '\n\nHIER SIND ZWEI BEREITS BERECHNETE FÄLLE ZUM VERGLEICH (intern verifiziert intern — nicht als Regeln, sondern als Beispiele zum Lernen):\n' + fmf.read()
         except: pass
 
         # EASA + Steuerrecht-Referenz als Wissens-Buch
@@ -2910,7 +2910,7 @@ Dein Mandant hat dir seine Unterlagen für 2025 gegeben. Deine Aufgabe: alle Wer
 
 Geh wie ein gründlicher Steuerberater vor — lies JEDEN Monat, JEDE Seite, JEDE Zeile der Dokumente.
 Ein Steuerberater der nur 2 von 12 Monaten auswertet macht seinen Job nicht — sei gründlich.
-{se_kontext}{rechner_kontext}{fm_kontext}{easa_kontext}
+{se_kontext}{rechner_kontext}{ref_kontext}{easa_kontext}
 
 HOMEBASE des Mandanten: **{homebase}** — alle Tour-Marker beziehen sich auf {homebase} als Heimatflughafen.
 
@@ -2967,7 +2967,7 @@ Hotel-Nacht setzt min. ~10h Bodenzeit am Zielort voraus. Crew Rest im Flieger z�
 - stfrei-Ort Ausland (SAO, JNB, ICN…) → Z76 (Betrag direkt aus stfrei-Spalte addieren)
 - Storno-Zeilen enden mit `X` → ignorieren
 
-**Verifizierter Referenzfall (FollowMe):** Fahrtage=53, Arbeitstage=129, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€. Wenn deine Werte deutlich abweichen, prüf nochmal.
+**Verifizierter Referenzfall:** Fahrtage=53, Arbeitstage=129, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€. Wenn deine Werte deutlich abweichen, prüf nochmal.
 
 Plausi-Anker: 110-150 Arbeitstage/Jahr, 40-60 Fahrtage, 40-65 Hotelnächte bei Vollzeit-Kabinenpersonal.
 
@@ -4118,8 +4118,8 @@ def _fallback_streck():
 
 # ══════════════════════════════════════════════════════════════════
 #  PDF GENERIERUNG
-#  Helles Design wie EK Kanzlei / FollowMe
-#  Korrekter Aufbau nach FollowMe-Methode
+#  Helles Design — Steuerauswertung
+#  Korrekter Aufbau nach Standard-Methode
 # ══════════════════════════════════════════════════════════════════
 
 
