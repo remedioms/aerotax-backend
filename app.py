@@ -4567,45 +4567,56 @@ def erstelle_pdf(d):
         S.append(t)
     S.append(Spacer(1, 0.6*cm))
 
-    # Weitere absetzbare Kosten — directly below
+    # ── Optionale Belege — eigene klare Anleitung ──
     if belege:
-        S.append(hr(0, 16))
-        S.append(Paragraph("Weitere absetzbare Kosten",
-            ps("wak", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
-               leading=11, spaceAfter=8, letterSpacing=1.5)))
+        S.append(Spacer(1, 0.6*cm))
+        S.append(HRFlowable(width="100%", thickness=0.4, color=LINE,
+            spaceBefore=4, spaceAfter=22))
+        S.append(Paragraph("ZUSÄTZLICH — DEINE OPTIONALEN BELEGE",
+            ps("wak_eye", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
+               leading=12, spaceAfter=4, letterSpacing=2.5)))
+        S.append(Paragraph("Diese Posten einzeln in WISO eintragen",
+            ps("wak_h", fontSize=15, textColor=TEXT, fontName="Helvetica",
+               leading=20, spaceAfter=6, letterSpacing=-0.2)))
         S.append(Paragraph(
-            "Diese Kosten kannst du zusätzlich eintragen:",
-            ps("wak_s", fontSize=8.5, textColor=TEXT2, fontName="Helvetica",
-               leading=13, spaceAfter=16)))
+            "Jeder Beleg gehört in einen eigenen WISO-Bereich. "
+            "Lege pro Position einen neuen Eintrag an — Betrag und Pfad stehen jeweils dabei.",
+            ps("wak_sub", fontSize=10, textColor=TEXT2, fontName="Helvetica",
+               leading=15, spaceAfter=20)))
+
         for b in belege:
             has_doc = b.get('betrag', 0) > 0
-            S.append(Paragraph(
-                f"{b.get('icon','')}  <b>{b.get('name','')}</b>",
-                ps(f"bn{id(b)}", fontSize=10,
-                   textColor=TEXT if has_doc else TEXT3,
-                   fontName="Helvetica-Bold" if has_doc else "Helvetica",
-                   leading=14, spaceAfter=3)))
-            t = Table([[
+            wiso_path = b.get('wiso', '') or 'Werbungskosten'
+            # Card pro Beleg: Icon+Name links, Betrag mittig, WISO-Pfad rechts darunter
+            head_row = Table([[
                 Paragraph(
-                    eur(b['betrag']) if has_doc else "⚠  Beleg fehlt",
-                    ps(f"ba{id(b)}", fontSize=10,
+                    f"{b.get('icon','📄')}  <b>{b.get('name','')}</b>",
+                    ps(f"bn{id(b)}", fontSize=11,
                        textColor=TEXT if has_doc else TEXT3,
-                       fontName="Helvetica-Bold", leading=13)),
-                Paragraph(b.get('wiso', ''),
-                    ps(f"bw{id(b)}", fontSize=8, textColor=TEXT3,
-                       fontName="Helvetica", leading=11, alignment=TA_RIGHT)),
-            ]], colWidths=[4*cm, 12.8*cm])
-            t.setStyle(TableStyle([
-                ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),0),
+                       fontName="Helvetica", leading=15)),
+                Paragraph(
+                    f"<b>{eur(b['betrag'])}</b>" if has_doc else '<font color="#94a3b8">⚠ Beleg fehlt</font>',
+                    ps(f"ba{id(b)}", fontSize=11,
+                       textColor=TEXT if has_doc else TEXT3,
+                       fontName="Helvetica", leading=15, alignment=TA_RIGHT)),
+            ]], colWidths=[12.0*cm, 4.8*cm])
+            head_row.setStyle(TableStyle([
+                ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3),
                 ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
                 ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
             ]))
-            S.append(t)
+            S.append(head_row)
+            # WISO-Pfad als Sub-Zeile (klar als „eintragen unter:")
+            S.append(Paragraph(
+                f'<font color="#94a3b8">eintragen unter:</font>  <b>{wiso_path}</b>',
+                ps(f"bw{id(b)}", fontSize=9, textColor=TEXT,
+                   fontName="Helvetica", leading=13, spaceAfter=4)))
             if b.get('hint') and has_doc:
                 S.append(Paragraph(f"💡  {b['hint']}",
-                    ps(f"bh{id(b)}", fontSize=7.5, textColor=TEXT3,
-                       fontName="Helvetica", leading=11, spaceAfter=2)))
-            S.append(hr(8, 12))
+                    ps(f"bh{id(b)}", fontSize=8.5, textColor=TEXT3,
+                       fontName="Helvetica", leading=12, spaceAfter=2)))
+            S.append(HRFlowable(width="100%", thickness=0.3, color=LINE,
+                spaceBefore=8, spaceAfter=10))
 
     # ════════════════════════════════════════════════
     # TRENNSEITE — elegant, jahres- und beleg-agnostisch
