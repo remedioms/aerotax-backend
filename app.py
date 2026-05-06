@@ -4308,6 +4308,32 @@ def erstelle_pdf(d):
         p.close(); canv.drawPath(p, fill=1, stroke=0)
         # Cross-Bar
         canv.rect(*Lpt(52,144), 96*scale, 16*scale, fill=1, stroke=0)
+        # Flugzeug-Symbol über dem A — Cockpit + Tragflächen
+        canv.setFillColor(WHITE)
+        # Cockpit-Mast (rect)
+        cx,cy = Lpt(96.5, 30)
+        canv.rect(cx, cy, 7*scale, 38*scale, fill=1, stroke=0)
+        # Cockpit-Spitze (ellipse oben)
+        canv.ellipse(lx+95*scale, ly+lh-(-15)*scale,
+                     lx+105*scale, ly+lh-(-1)*scale, fill=1, stroke=0)
+        # Linke Tragfläche
+        p = canv.beginPath()
+        for i,(x,y) in enumerate([(100,14),(100,25),(56,36),(60,25)]):
+            if i==0: p.moveTo(*Lpt(x,y))
+            else: p.lineTo(*Lpt(x,y))
+        p.close(); canv.drawPath(p, fill=1, stroke=0)
+        # Rechte Tragfläche
+        p = canv.beginPath()
+        for i,(x,y) in enumerate([(100,14),(100,25),(144,36),(140,25)]):
+            if i==0: p.moveTo(*Lpt(x,y))
+            else: p.lineTo(*Lpt(x,y))
+        p.close(); canv.drawPath(p, fill=1, stroke=0)
+        # Triebwerke (gold) — kleine Akzente
+        canv.setFillColor(GOLD)
+        ex,ey = Lpt(67, 30.5)
+        canv.rect(ex, ey, 13*scale, 4.5*scale, fill=1, stroke=0)
+        ex,ey = Lpt(120, 30.5)
+        canv.rect(ex, ey, 13*scale, 4.5*scale, fill=1, stroke=0)
 
         # AeroTAX wordmark rechts vom Logo
         canv.setFillColor(WHITE); canv.setFont("Helvetica-Bold", 13)
