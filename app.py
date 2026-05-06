@@ -1829,6 +1829,11 @@ def qa_upvote(qid):
             check = sb.table('upvotes').select('id').eq('target_type', target_type).eq('target_id', target_id).eq('ip_hash', ip_hash).gte('created_at', cutoff).limit(1).execute()
             if check.data:
                 return jsonify({'error': 'Schon gevotet — bitte 1 Stunde warten'}), 429
+            # Alte Votes derselben IP fürs selbe Target löschen (>1h alt) — sonst greift der UNIQUE-Constraint
+            try:
+                sb.table('upvotes').delete().eq('target_type', target_type).eq('target_id', target_id).eq('ip_hash', ip_hash).lt('created_at', cutoff).execute()
+            except Exception as _de:
+                print(f"[supabase] cleanup old votes fail: {_de}")
             sb.table('upvotes').insert({
                 'target_type': target_type,
                 'target_id': target_id,
@@ -1846,7 +1851,7 @@ def qa_upvote(qid):
         except Exception as e:
             err_str = str(e).lower()
             if 'unique' in err_str or 'duplicate' in err_str:
-                return jsonify({'error': 'Bereits gevotet'}), 429
+                return jsonify({'error': 'Schon gevotet — bitte 1 Stunde warten'}), 429
             print(f"[supabase] upvote fail: {e}")
             return jsonify({'error': 'Speichern fehlgeschlagen'}), 500
 
