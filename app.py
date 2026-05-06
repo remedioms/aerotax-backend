@@ -4135,25 +4135,30 @@ def _fallback_streck():
 
 
 def erstelle_pdf(d):
-    # ── PALETTE: matching aerosteuer.de Glassmorphism ────────────
-    BG       = HexColor("#02060f")   # matching website html bg
-    BG_GLASS = HexColor("#0d1830")   # "translucent" glass card
-    BG_GLASS2= HexColor("#101e3d")   # slightly brighter (hover state)
-    TEXT     = HexColor("#f1f5f9")   # primary text
-    TEXT2    = HexColor("#94a3b8")   # secondary
-    TEXT3    = HexColor("#4a5a72")   # muted
-    LINE     = HexColor("#1e3050")   # dividers
-    LINE2    = HexColor("#2a3f5e")   # brighter borders
-    LINE3    = HexColor("#3b5278")   # bright border (highlights)
+    # ── PALETTE: Corporate Brochure Style — Royal Blue + Weiß ──
+    BG       = HexColor("#1d4ed8")   # Royal Blue dominant
+    BG_DARK  = HexColor("#1e3a8a")   # tieferes Navy für Header
+    BG_DEEP  = HexColor("#172554")   # tiefster Navy für Footer
+    BG_LIGHT = HexColor("#eff6ff")   # heller Page-BG (Cards/Sections)
+    BG_CARD  = HexColor("#ffffff")   # weiße Card auf blau
+    TEXT     = HexColor("#ffffff")   # Weiß auf Blau
+    TEXT2    = HexColor("#bfdbfe")   # hellblau (sub auf blau)
+    TEXT3    = HexColor("#93c5fd")   # gedämpft (auf blau)
+    TEXT_D   = HexColor("#1e3a8a")   # Dunkelblau auf weiß
+    TEXT_D2  = HexColor("#3b5cae")   # mid-blau auf weiß
+    TEXT_D3  = HexColor("#64748b")   # grau auf weiß
+    LINE     = HexColor("#3b5cae")   # divider auf blau
+    LINE2    = HexColor("#60a5fa")   # bright border
+    LINE_W   = HexColor("#dbeafe")   # divider auf weiß
     WHITE    = HexColor("#ffffff")
-    G1=HexColor("#f97316"); G2=HexColor("#ec4899")
-    G3=HexColor("#8b5cf6"); G4=HexColor("#2563eb")
     BLUE2    = HexColor("#60a5fa")
     BLUE3    = HexColor("#93c5fd")
-    NAVY     = HexColor("#071120")
+    BLUE_HL  = HexColor("#3b82f6")   # accent
+    NAVY     = HexColor("#1e3a8a")
     OFF      = HexColor("#e2e8f0")
-    GOLD     = HexColor("#fbbf24")   # cockpit accent
-    GOLD2    = HexColor("#fde047")
+    GOLD     = HexColor("#fbbf24")
+    G1=HexColor("#f97316"); G2=HexColor("#ec4899")
+    G3=HexColor("#8b5cf6"); G4=HexColor("#2563eb")
 
     base = getSampleStyleSheet()
     def ps(n, **kw): return ParagraphStyle(n, parent=base["Normal"], **kw)
@@ -4239,40 +4244,19 @@ def erstelle_pdf(d):
     def on_page(canv, doc):
         canv.saveState()
         W, H = A4
-        # Hauptbackground — matching website
+        # Hauptbackground — Royal Blue dominant
         canv.setFillColor(BG); canv.rect(0,0,W,H,fill=1,stroke=0)
 
-        # Subtile Mesh-Orb-Andeutung — diffuses Highlight oben links/unten rechts
-        # (ReportLab kann keinen echten blur — wir machen "Layered Tint")
-        for radius, alpha_hex, dx, dy in [(8*cm,"#0d1f3a",-2*cm,H-3*cm),(7*cm,"#0a1530",W-2*cm,1*cm)]:
-            canv.setFillColor(HexColor(alpha_hex))
-            canv.circle(dx, dy, radius, fill=1, stroke=0)
+        # Header-Bar — dunklere Navy strip mit Logo
+        canv.setFillColor(BG_DARK)
+        canv.rect(0, H-1.5*cm, W, 1.5*cm, fill=1,stroke=0)
 
-        # Header-Glass-Strip — "translucent" navy band
-        canv.setFillColor(NAVY)
-        canv.rect(0, H-1.7*cm, W, 1.7*cm, fill=1,stroke=0)
-        # Gradient stripe (orange→pink→purple→blue)
-        sw = W/4
-        for i,col in enumerate([G1,G2,G3,G4]):
-            canv.setFillColor(col)
-            canv.rect(i*sw, H-0.1*cm, sw, 0.1*cm, fill=1,stroke=0)
-        # Subtile Glass-Border unten
-        canv.setStrokeColor(LINE2); canv.setLineWidth(0.4)
-        canv.line(0, H-1.7*cm, W, H-1.7*cm)
-
-        # AeroTAX-Logo — kompakte Pyramid-A mit Cross-Bar (das Glas-Logo der Website)
-        # Position: x=1.5cm, y_baseline=H-1.15cm, height=0.9cm
-        lx = 1.5*cm; ly = H-1.45*cm; lh = 0.85*cm; lw = lh  # square logo box
-        canv.saveState()
-        # Glass-Background-Square unter Logo (rounded corners imitiert)
-        canv.setFillColor(HexColor("#0a1530"))
-        canv.setStrokeColor(HexColor("#1e3050")); canv.setLineWidth(0.4)
-        canv.roundRect(lx-0.05*cm, ly-0.05*cm, lw+0.1*cm, lh+0.1*cm, 0.12*cm, fill=1,stroke=1)
-        # Linker A-Schenkel (Polygon: 18,192 → 76,22 → 94,22 → 100,42 → 46,192)
-        # ViewBox 200x210, mappen auf lh (0.85cm)
+        # Mini AeroTAX-Logo (klein, dezent oben links)
+        lx = 1.5*cm; ly = H-1.25*cm; lh = 0.7*cm; lw = lh
         scale = lh/210.0
         def Lpt(x,y): return (lx + x*scale, ly + lh - y*scale)
         canv.setFillColor(WHITE)
+        # Linker A-Schenkel
         p = canv.beginPath()
         for i,(x,y) in enumerate([(18,192),(76,22),(94,22),(100,42),(46,192)]):
             if i==0: p.moveTo(*Lpt(x,y))
@@ -4286,50 +4270,33 @@ def erstelle_pdf(d):
         p.close(); canv.drawPath(p, fill=1, stroke=0)
         # Cross-Bar
         canv.rect(*Lpt(52,144), 96*scale, 16*scale, fill=1, stroke=0)
-        # Blue accent unter Cross-Bar
-        canv.setFillColor(BLUE2)
-        canv.rect(*Lpt(52,130.5), 96*scale, 2.5*scale, fill=1, stroke=0)
-        # Cockpit-Mast
-        canv.setFillColor(WHITE)
-        canv.rect(*Lpt(96.5,30), 7*scale, 38*scale, fill=1, stroke=0)
-        canv.circle(lx+100*scale, ly+lh-(-8)*scale, 5*scale, fill=1, stroke=0)
-        # Triebwerke (gold)
-        canv.setFillColor(GOLD)
-        canv.rect(*Lpt(67,30.5), 13*scale, 4.5*scale, fill=1, stroke=0)
-        canv.rect(*Lpt(120,30.5), 13*scale, 4.5*scale, fill=1, stroke=0)
-        canv.restoreState()
 
         # AeroTAX wordmark rechts vom Logo
-        canv.setFillColor(WHITE); canv.setFont("Helvetica-Bold", 14)
-        text_x = lx + lw + 0.3*cm
-        canv.drawString(text_x, H-1.08*cm, "Aero")
-        aw = canv.stringWidth("Aero","Helvetica-Bold",14)
-        canv.setFillColor(BLUE2)
-        canv.drawString(text_x+aw, H-1.08*cm, "TAX")
-        tw = canv.stringWidth("TAX","Helvetica-Bold",14)
+        canv.setFillColor(WHITE); canv.setFont("Helvetica-Bold", 13)
+        text_x = lx + lw + 0.25*cm
+        canv.drawString(text_x, H-1.0*cm, "Aero")
+        aw = canv.stringWidth("Aero","Helvetica-Bold",13)
+        canv.setFillColor(BLUE3)
+        canv.drawString(text_x+aw, H-1.0*cm, "TAX")
+        tw = canv.stringWidth("TAX","Helvetica-Bold",13)
         # Trenner + Name
         canv.setFillColor(TEXT3); canv.setFont("Helvetica",9)
-        canv.drawString(text_x+aw+tw+0.25*cm, H-1.1*cm, "·")
-        canv.setFillColor(OFF); canv.setFont("Helvetica",9)
-        canv.drawString(text_x+aw+tw+0.6*cm, H-1.08*cm,
+        canv.drawString(text_x+aw+tw+0.22*cm, H-1.02*cm, "·")
+        canv.setFillColor(TEXT2); canv.setFont("Helvetica",9)
+        canv.drawString(text_x+aw+tw+0.55*cm, H-1.0*cm,
             f"{d.get('name','')}  ·  Steuerjahr {d.get('year',2025)}")
+        # Page-Number rechts (im Brochure-Stil: "PAGE — 03")
         canv.setFillColor(TEXT3); canv.setFont("Helvetica",8)
-        canv.drawRightString(W-1.5*cm, H-0.95*cm, f"Seite {doc.page}")
-        canv.drawRightString(W-1.5*cm, H-1.38*cm, d.get('datum',''))
+        canv.drawRightString(W-1.5*cm, H-1.0*cm,
+            f"PAGE — {str(doc.page).zfill(2)}")
 
-        # Footer — Glass-Strip
-        canv.setFillColor(NAVY)
-        canv.rect(0, 0, W, 0.75*cm, fill=1,stroke=0)
-        canv.setStrokeColor(LINE2); canv.setLineWidth(0.4)
-        canv.line(0, 0.75*cm, W, 0.75*cm)
-        canv.setFillColor(WHITE); canv.setFont("Helvetica-Bold",7)
-        canv.drawString(1.5*cm,0.48*cm,"Aero")
-        aw2 = canv.stringWidth("Aero","Helvetica-Bold",7)
-        canv.setFillColor(BLUE2)
-        canv.drawString(1.5*cm+aw2,0.48*cm,"TAX")
-        tw2 = canv.stringWidth("TAX","Helvetica-Bold",7)
-        canv.setFillColor(TEXT3); canv.setFont("Helvetica",7)
-        canv.drawString(1.5*cm+aw2+tw2+0.12*cm,0.48*cm,"·  aerosteuer.de")
+        # Footer — schmaler Strip mit URL
+        canv.setFillColor(BG_DEEP)
+        canv.rect(0, 0, W, 0.65*cm, fill=1,stroke=0)
+        canv.setFillColor(TEXT2); canv.setFont("Helvetica",7.5)
+        canv.drawString(1.5*cm, 0.42*cm,"aerosteuer.de")
+        canv.setFillColor(TEXT3); canv.setFont("Helvetica",7.5)
+        canv.drawRightString(W-1.5*cm, 0.42*cm, d.get('datum',''))
         canv.restoreState()
 
     buf = io.BytesIO()
@@ -4346,122 +4313,82 @@ def erstelle_pdf(d):
     S = []
 
     # ════════════════════════════════════════════════
-    # SEITE 1 — DECKBLATT (Glassmorphism)
+    # SEITE 1 — DECKBLATT (Brochure-Style: Big-Number Hero)
     # ════════════════════════════════════════════════
-    S.append(Spacer(1, 1.4*cm))
+    S.append(Spacer(1, 2.5*cm))
 
-    # Großes AeroTAX-Logo als Drawing — A-Form mit Cross-Bar + Cockpit + Triebwerke
-    from reportlab.graphics.shapes import Drawing, Polygon, Rect, Circle, Ellipse
-    from reportlab.platypus import Image as RLImage
-    def big_logo(size_cm=4.5):
-        sz = size_cm*cm
-        scale = sz/210.0
-        d2 = Drawing(sz, sz, hAlign='CENTER')
-        # Glass-BG-Square
-        d2.add(Rect(0, 0, sz, sz, rx=0.2*cm, ry=0.2*cm,
-                    fillColor=BG_GLASS, strokeColor=LINE2, strokeWidth=0.5))
-        # Linker A-Schenkel — Polygon points (xy in viewBox-Koords, dann mappen)
-        def to_xy(pts):
-            out = []
-            for x,y in pts:
-                out.extend([x*scale, sz - y*scale])
-            return out
-        d2.add(Polygon(points=to_xy([(18,192),(76,22),(94,22),(100,42),(46,192)]),
-                       fillColor=WHITE, strokeColor=None))
-        d2.add(Polygon(points=to_xy([(182,192),(124,22),(106,22),(100,42),(154,192)]),
-                       fillColor=WHITE, strokeColor=None))
-        # Cross-Bar
-        d2.add(Rect(52*scale, sz - 144*scale, 96*scale, 16*scale,
-                    fillColor=WHITE, strokeColor=None))
-        # Blue-Accent-Linie unter Cross-Bar
-        d2.add(Rect(52*scale, sz - 130.5*scale, 96*scale, 2.5*scale,
-                    fillColor=BLUE2, strokeColor=None))
-        # Cockpit-Mast oben
-        d2.add(Rect(96.5*scale, sz - 30*scale, 7*scale, 38*scale,
-                    fillColor=WHITE, strokeColor=None))
-        d2.add(Ellipse(100*scale, sz + 8*scale, 5*scale, 7*scale,
-                       fillColor=WHITE, strokeColor=None))
-        # Tragflächen — leichte Polygon-Andeutung
-        d2.add(Polygon(points=to_xy([(100,14),(100,25),(56,36),(60,25)]),
-                       fillColor=WHITE, strokeColor=None))
-        d2.add(Polygon(points=to_xy([(100,14),(100,25),(144,36),(140,25)]),
-                       fillColor=WHITE, strokeColor=None))
-        # Triebwerke (gold)
-        d2.add(Rect(67*scale, sz - 30.5*scale, 13*scale, 4.5*scale,
-                    fillColor=GOLD, strokeColor=None))
-        d2.add(Rect(120*scale, sz - 30.5*scale, 13*scale, 4.5*scale,
-                    fillColor=GOLD, strokeColor=None))
-        return d2
-    S.append(big_logo(4.5))
-    S.append(Spacer(1, 0.5*cm))
+    # Eyebrow-Tag
+    S.append(Paragraph("WERBUNGSKOSTEN-AUSWERTUNG",
+        ps("eye", fontSize=10, textColor=TEXT2, fontName="Helvetica-Bold",
+           leading=14, alignment=TA_CENTER, spaceAfter=14)))
 
-    # AeroTAX wordmark mit Gradient-Andeutung (Helvetica)
-    S.append(Paragraph(
-        '<font color="#ffffff">Aero</font><font color="#60a5fa">TAX</font>',
-        ps("logo", fontSize=38, textColor=WHITE, fontName="Helvetica-Bold",
-           leading=42, alignment=TA_CENTER, spaceAfter=4)))
-    S.append(Paragraph("Die einfache Steuerauswertung für Flugpersonal",
-        ps("tag", fontSize=10, textColor=TEXT2, fontName="Helvetica",
-           leading=13, alignment=TA_CENTER, spaceAfter=28)))
-
-    S.append(HRFlowable(width="40%", thickness=0.8, color=LINE2,
-        hAlign='CENTER', spaceAfter=30))
-
-    S.append(Paragraph(d['name'],
-        ps("cname", fontSize=22, textColor=TEXT, fontName="Helvetica-Bold",
-           leading=26, alignment=TA_CENTER, spaceAfter=5)))
+    # Massive Headline — Brochure-Style "OUR ADVANTAGES"
+    S.append(Paragraph("Deine Steuerauswertung",
+        ps("h1", fontSize=42, textColor=WHITE, fontName="Helvetica-Bold",
+           leading=46, alignment=TA_CENTER, spaceAfter=4)))
     S.append(Paragraph(f"Steuerjahr {d.get('year',2025)}",
-        ps("cyear", fontSize=11, textColor=TEXT2, fontName="Helvetica",
-           leading=15, alignment=TA_CENTER, spaceAfter=5)))
+        ps("h1y", fontSize=22, textColor=BLUE3, fontName="Helvetica",
+           leading=26, alignment=TA_CENTER, spaceAfter=20)))
+
+    # Trenner
+    S.append(HRFlowable(width="20%", thickness=1.5, color=BLUE2,
+        hAlign='CENTER', spaceAfter=32))
+
+    # Big Number Hero — der WISO-Betrag als 80pt Statement
+    netto_eur = eur(d.get('netto', 0))
+    S.append(Paragraph(netto_eur,
+        ps("big", fontSize=72, textColor=WHITE, fontName="Helvetica-Bold",
+           leading=76, alignment=TA_CENTER, spaceAfter=8)))
+    S.append(Paragraph("einzutragen als Reisenebenkosten in WISO",
+        ps("biglbl", fontSize=11, textColor=TEXT2, fontName="Helvetica",
+           leading=15, alignment=TA_CENTER, spaceAfter=40)))
+
+    # Name + LH
+    S.append(HRFlowable(width="20%", thickness=0.6, color=LINE,
+        hAlign='CENTER', spaceAfter=22))
+    S.append(Paragraph(d['name'],
+        ps("cname", fontSize=18, textColor=WHITE, fontName="Helvetica-Bold",
+           leading=22, alignment=TA_CENTER, spaceAfter=4)))
     S.append(Paragraph("Deutsche Lufthansa AG",
-        ps("cag", fontSize=9, textColor=TEXT3, fontName="Helvetica",
-           leading=13, alignment=TA_CENTER, spaceAfter=36)))
+        ps("cag", fontSize=10, textColor=TEXT3, fontName="Helvetica",
+           leading=14, alignment=TA_CENTER, spaceAfter=28)))
 
-    S.append(HRFlowable(width="40%", thickness=0.4, color=LINE,
-        hAlign='CENTER', spaceAfter=30))
-
-    # TOC — centered, elegant
-    S.append(Paragraph("Inhalt",
-        ps("toch", fontSize=11, textColor=TEXT2, fontName="Helvetica-Bold",
-           leading=15, alignment=TA_CENTER, spaceAfter=22)))
+    # Brochure-Style: kompakte "Inhalt"-Liste am unteren Rand des Covers
+    S.append(Spacer(1, 0.4*cm))
+    S.append(HRFlowable(width="60%", thickness=0.4, color=LINE,
+        hAlign='CENTER', spaceAfter=18))
+    S.append(Paragraph("In dieser Auswertung",
+        ps("toch", fontSize=9, textColor=TEXT3, fontName="Helvetica-Bold",
+           leading=13, alignment=TA_CENTER, spaceAfter=14)))
 
     pg = 2
-    toc = []
-    toc.append(("Reisekosten & weitere absetzbare Kosten", str(pg))); pg+=1
-    toc.append(("· · ·  Ab hier nur zur Information  · · ·", ""))
-    toc.append(("Belege", str(pg))); pg+=1
-    toc.append(("Berechnung", str(pg))); pg+=1
-    toc.append(("Bestätigung & Unterschrift", str(pg)))
+    toc = [
+        ("01", "Reisekosten & weitere absetzbare Kosten", str(pg)),
+    ]; pg+=1
+    toc += [
+        ("02", "Belege & Anlagen", str(pg)),
+    ]; pg+=1
+    toc += [
+        ("03", "Berechnung im Detail", str(pg)),
+    ]; pg+=1
+    toc += [
+        ("04", "Bestätigung & Unterschrift", str(pg)),
+    ]
 
-    for i, (title, page) in enumerate(toc):
-        is_sep = title.startswith("·")
-        if is_sep:
-            S.append(Spacer(1, 0.1*cm))
-            wrap = Table([[Paragraph(title,
-                ps(f"tsep{i}", fontSize=8, textColor=TEXT3,
-                   fontName="Helvetica", leading=12, alignment=TA_CENTER))]],
-                colWidths=[13.2*cm])
-            wrap.setStyle(TableStyle([
-                ("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6),
-                ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
-                ("ALIGN",(0,0),(-1,-1),"CENTER"),
-            ]))
-            S.append(wrap)
-            continue
-
+    for i, (num, title, page) in enumerate(toc):
         row = Table([[
-            Paragraph(str(i+1) if not is_sep else "",
-                ps(f"tn{i}", fontSize=9, textColor=TEXT3,
-                   fontName="Helvetica-Bold", leading=13, alignment=TA_CENTER)),
+            Paragraph(num,
+                ps(f"tn{i}", fontSize=11, textColor=BLUE3,
+                   fontName="Helvetica-Bold", leading=15, alignment=TA_CENTER)),
             Paragraph(title,
-                ps(f"tt{i}", fontSize=9.5, textColor=TEXT,
-                   fontName="Helvetica", leading=13)),
-            Paragraph(f"—  {page}" if page else "",
-                ps(f"tp{i}", fontSize=9, textColor=TEXT3,
-                   fontName="Helvetica", leading=13, alignment=TA_RIGHT)),
-        ]], colWidths=[0.6*cm, 11.2*cm, 1.4*cm])
+                ps(f"tt{i}", fontSize=10, textColor=TEXT,
+                   fontName="Helvetica", leading=14)),
+            Paragraph(f"PAGE — {page.zfill(2)}",
+                ps(f"tp{i}", fontSize=8, textColor=TEXT3,
+                   fontName="Helvetica", leading=12, alignment=TA_RIGHT)),
+        ]], colWidths=[0.9*cm, 10.8*cm, 1.5*cm])
         row.setStyle(TableStyle([
-            ("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6),
+            ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7),
             ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
             ("LINEBELOW",(0,0),(-1,0),0.3,LINE),
             ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
@@ -4518,18 +4445,18 @@ def erstelle_pdf(d):
     ]
     for n, title, desc in steps:
         t = Table([[
-            Paragraph(n, ps(f"sn{n}", fontSize=11, textColor=TEXT3,
-                fontName="Helvetica-Bold", leading=15, alignment=TA_CENTER)),
+            Paragraph(n, ps(f"sn{n}", fontSize=14, textColor=BLUE3,
+                fontName="Helvetica-Bold", leading=18, alignment=TA_CENTER)),
             Paragraph(
                 f"<b>{title}</b><br/>"
-                f'<font color="#4a5a72" size="8">{desc}</font>',
-                ps(f"sd{n}", fontSize=9, textColor=TEXT,
-                   fontName="Helvetica", leading=14)),
+                f'<font color="#bfdbfe" size="8.5">{desc}</font>',
+                ps(f"sd{n}", fontSize=10, textColor=TEXT,
+                   fontName="Helvetica", leading=15)),
         ]], colWidths=[0.9*cm, 15.9*cm])
         t.setStyle(TableStyle([
-            ("TOPPADDING",(0,0),(-1,-1),10),("BOTTOMPADDING",(0,0),(-1,-1),10),
-            ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),0),
-            ("LINEBELOW",(0,0),(-1,0),0.3,LINE),
+            ("TOPPADDING",(0,0),(-1,-1),12),("BOTTOMPADDING",(0,0),(-1,-1),12),
+            ("LEFTPADDING",(0,0),(-1,-1),10),("RIGHTPADDING",(0,0),(-1,-1),0),
+            ("LINEBELOW",(0,0),(-1,0),0.4,LINE),
             ("VALIGN",(0,0),(-1,-1),"TOP"),
         ]))
         S.append(t)
