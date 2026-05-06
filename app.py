@@ -4493,66 +4493,65 @@ def erstelle_pdf(d):
             f'Fehlende Dokumente: {_not_upl}',
             ps('warn_miss', fontSize=8, textColor=TEXT3,
                fontName='Helvetica', leading=12, alignment=TA_CENTER)))
-    # SEITE 2 — DAS HIER MUSS DER USER MACHEN (klar für Anfänger)
+    # SEITE 2 — Anleitung: was der User in WISO tut
     # ════════════════════════════════════════════════
     S.append(PageBreak())
-
-    # ── HERO: Der Betrag, prominent ──
     S.append(Spacer(1, 0.4*cm))
-    S.append(Paragraph("DEIN WISO-BETRAG",
+
+    # ── Eyebrow + Erklärender Titel ──
+    S.append(Paragraph("DEINE NÄCHSTEN SCHRITTE",
         ps("hero_eye", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
-           leading=12, alignment=TA_CENTER, spaceAfter=14, letterSpacing=2.5)))
-    S.append(Paragraph(eur(d['netto']),
-        ps("hero_num", fontSize=46, textColor=TEXT, fontName="Helvetica",
-           leading=52, alignment=TA_CENTER, spaceAfter=12, letterSpacing=-1.0)))
+           leading=12, spaceAfter=8, letterSpacing=2.5)))
+    S.append(Paragraph("So trägst du das Ergebnis in WISO ein",
+        ps("hero_h", fontSize=18, textColor=TEXT, fontName="Helvetica",
+           leading=24, spaceAfter=6, letterSpacing=-0.2)))
+    S.append(Paragraph(
+        "Eine Eingabe, ein Wert — alles weitere ist Anhang. "
+        "Folge den vier Schritten unten, dann ist deine Werbungskosten-Auswertung "
+        "in deiner Steuererklärung verbucht.",
+        ps("hero_sub", fontSize=10, textColor=TEXT2, fontName="Helvetica",
+           leading=15, spaceAfter=24)))
 
-    # Pill-Hinweis: WO einzutragen
-    pill = Table([[Paragraph(
-        '<font color="#94a3b8">eintragen als</font>  <b>Reisenebenkosten</b>',
-        ps("pill_t", fontSize=10, textColor=TEXT, fontName="Helvetica",
-           leading=14, alignment=TA_CENTER))]], colWidths=[7.0*cm])
-    pill.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,-1), HexColor("#0f1830")),
-        ("BOX",(0,0),(-1,-1), 0.5, LINE2),
-        ("ROUNDEDCORNERS",[12,12,12,12]),
-        ("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8),
-        ("LEFTPADDING",(0,0),(-1,-1),18),("RIGHTPADDING",(0,0),(-1,-1),18),
+    # ── Dezenter Betrag-Block (klein, elegant) ──
+    betrag_box = Table([[
+        Paragraph("EINZUTRAGENDER BETRAG",
+            ps("bb_l", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
+               leading=11, letterSpacing=1.8)),
+        Paragraph(eur(d['netto']),
+            ps("bb_v", fontSize=20, textColor=TEXT, fontName="Helvetica",
+               leading=24, alignment=TA_RIGHT, letterSpacing=-0.3)),
+    ]], colWidths=[10.0*cm, 6.8*cm])
+    betrag_box.setStyle(TableStyle([
+        ("TOPPADDING",(0,0),(-1,-1),14),("BOTTOMPADDING",(0,0),(-1,-1),14),
+        ("LEFTPADDING",(0,0),(-1,-1),16),("RIGHTPADDING",(0,0),(-1,-1),16),
+        ("BACKGROUND",(0,0),(-1,-1), HexColor("#0a1224")),
+        ("BOX",(0,0),(-1,-1), 0.6, LINE2),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
     ]))
-    pwrap = Table([[pill]], colWidths=[16.8*cm])
-    pwrap.setStyle(TableStyle([
-        ("ALIGN",(0,0),(-1,-1),"CENTER"),
-        ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
-        ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),0),
-    ]))
-    S.append(pwrap)
-    S.append(Spacer(1, 0.7*cm))
+    try: betrag_box.cornerRadii = [10,10,10,10]
+    except Exception: pass
+    S.append(betrag_box)
+    S.append(Spacer(1, 0.8*cm))
 
-    # ── Subtle Trenner ──
-    S.append(HRFlowable(width="100%", thickness=0.4, color=LINE,
-        spaceBefore=4, spaceAfter=22))
-
-    # ── ANLEITUNG: So trägst du den Betrag ein ──
-    S.append(Paragraph("SO TRÄGST DU IHN EIN",
-        ps("steps_eye", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
-           leading=12, spaceAfter=4, letterSpacing=2.5)))
-    S.append(Paragraph("Vier Schritte in WISO oder ELSTER",
-        ps("steps_h", fontSize=15, textColor=TEXT, fontName="Helvetica",
-           leading=20, spaceAfter=18, letterSpacing=-0.2)))
+    # ── Anleitung-Section ──
+    S.append(Paragraph("Schritt für Schritt in WISO",
+        ps("steps_h", fontSize=12, textColor=TEXT2, fontName="Helvetica",
+           leading=16, spaceAfter=14, letterSpacing=0.3)))
 
     steps = [
-        ("1", "Auswertungs-Software öffnen",
-         "WISO Steuer · ELSTER · oder das Programm deiner Wahl. Lege einen neuen Eintrag unter <b>Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten</b> an."),
-        ("2", "Beschreibung eingeben",
-         f"Beim Beschreibungs-Feld eintragen: <b>Dienstplan-Auswertung AeroTAX {d.get('year', 2025)}</b>. Damit ist klar, woher der Betrag stammt."),
+        ("1", "WISO Steuer öffnen",
+         "Lege einen neuen Eintrag unter <b>Ausgaben → Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten</b> an."),
+        ("2", "Beschreibung eintragen",
+         f"Bei <i>Beschreibung der Auswärtstätigkeit</i> eintragen: <b>Dienstplan-Auswertung AeroTAX {d.get('year', 2025)}</b>."),
         ("3", f"Betrag eintragen:  <b>{eur(d['netto'])}</b>",
-         f"Nur dieser eine Wert kommt ins Feld <b>Reisenebenkosten</b>. Alle anderen Felder bleiben leer — der Betrag enthält bereits Verpflegung, Fahrtkosten und Trinkgelder."),
-        ("4", "Dieses PDF anhängen",
-         "Lade das komplette PDF als Anlage zur Steuererklärung mit hoch. Es enthält Berechnung und Belege als Nachweis — falls das Finanzamt Rückfragen hat, ist alles drin."),
+         "Genau dieser Wert kommt ins Feld <b>Reisenebenkosten</b>. Alle anderen Felder bleiben leer — Verpflegung, Fahrtkosten und Trinkgelder sind bereits enthalten."),
+        ("4", "Dieses PDF als Anlage anhängen",
+         "WISO erlaubt PDF-Anhänge an die Steuererklärung. Berechnung und Belege sind hier vollständig — falls das Finanzamt Rückfragen hat, liegt alles bei."),
     ]
     for n, title, desc in steps:
         t = Table([[
-            Paragraph(n, ps(f"sn{n}", fontSize=18, textColor=BLUE3,
-                fontName="Helvetica", leading=22, alignment=TA_CENTER)),
+            Paragraph(n, ps(f"sn{n}", fontSize=16, textColor=BLUE3,
+                fontName="Helvetica", leading=20, alignment=TA_CENTER)),
             Paragraph(
                 f"<b>{title}</b><br/>"
                 f'<font color="#94a3b8" size="9">{desc}</font>',
@@ -4560,7 +4559,7 @@ def erstelle_pdf(d):
                    fontName="Helvetica", leading=15)),
         ]], colWidths=[1.1*cm, 15.7*cm])
         t.setStyle(TableStyle([
-            ("TOPPADDING",(0,0),(-1,-1),14),("BOTTOMPADDING",(0,0),(-1,-1),14),
+            ("TOPPADDING",(0,0),(-1,-1),12),("BOTTOMPADDING",(0,0),(-1,-1),12),
             ("LEFTPADDING",(0,0),(-1,-1),10),("RIGHTPADDING",(0,0),(-1,-1),0),
             ("LINEBELOW",(0,0),(-1,0),0.4,LINE),
             ("VALIGN",(0,0),(-1,-1),"TOP"),
