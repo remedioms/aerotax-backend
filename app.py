@@ -4351,36 +4351,33 @@ def erstelle_pdf(d):
     S = []
 
     # ════════════════════════════════════════════════
-    # SEITE 1 — DECKBLATT (minimalistisch & elegant)
+    # SEITE 1 — DECKBLATT (dünn, elegant — Montserrat-Vibe)
     # ════════════════════════════════════════════════
-    S.append(Spacer(1, 4*cm))
+    S.append(Spacer(1, 5.5*cm))
 
     # Eyebrow
     S.append(Paragraph("WERBUNGSKOSTEN-AUSWERTUNG",
         ps("eye", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
-           leading=12, alignment=TA_CENTER, spaceAfter=18, letterSpacing=2.0)))
+           leading=12, alignment=TA_CENTER, spaceAfter=24, letterSpacing=2.5)))
 
-    # Title — elegant, nicht schreiend
-    S.append(Paragraph("Deine Steuerauswertung",
-        ps("h1", fontSize=24, textColor=TEXT, fontName="Helvetica-Bold",
-           leading=30, alignment=TA_CENTER, spaceAfter=4)))
+    # Title — dünn & elegant (Helvetica non-bold, mit letter-spacing wie das Aerosteuer Wordmark)
+    S.append(Paragraph(f"{d.get('name','')}<font size=\"26\">'s</font> Steuerauswertung",
+        ps("h1", fontSize=30, textColor=TEXT, fontName="Helvetica",
+           leading=38, alignment=TA_CENTER, spaceAfter=8, letterSpacing=-0.5)))
     S.append(Paragraph(f"Steuerjahr {d.get('year',2025)}",
-        ps("h1y", fontSize=12, textColor=TEXT2, fontName="Helvetica",
-           leading=16, alignment=TA_CENTER, spaceAfter=44)))
+        ps("h1y", fontSize=13, textColor=TEXT2, fontName="Helvetica",
+           leading=17, alignment=TA_CENTER, spaceAfter=44, letterSpacing=0.8)))
 
     # Subtle Trenner
-    S.append(HRFlowable(width="14%", thickness=0.5, color=LINE2,
-        hAlign='CENTER', spaceAfter=28))
+    S.append(HRFlowable(width="10%", thickness=0.5, color=LINE2,
+        hAlign='CENTER', spaceAfter=24))
 
-    # Name + LH (zentriert, dezent)
-    S.append(Paragraph(d['name'],
-        ps("cname", fontSize=18, textColor=TEXT, fontName="Helvetica-Bold",
-           leading=22, alignment=TA_CENTER, spaceAfter=4)))
+    # Lufthansa als kleine Sub-Info (Name ist ja im Title)
     S.append(Paragraph("Deutsche Lufthansa AG",
         ps("cag", fontSize=9.5, textColor=TEXT3, fontName="Helvetica",
-           leading=14, alignment=TA_CENTER, spaceAfter=42)))
+           leading=14, alignment=TA_CENTER, spaceAfter=42, letterSpacing=1.2)))
 
-    S.append(HRFlowable(width="14%", thickness=0.5, color=LINE2,
+    S.append(HRFlowable(width="10%", thickness=0.5, color=LINE2,
         hAlign='CENTER', spaceAfter=28))
 
     # Brochure-Style: kompakte "Inhalt"-Liste am unteren Rand des Covers
