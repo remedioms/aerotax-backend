@@ -4463,12 +4463,12 @@ def erstelle_pdf(d):
         canv.rect(*Lpt(52,144), 96*scale, 16*scale, fill=1, stroke=0)
         # Flugzeug-Symbol über dem A — Cockpit + Tragflächen
         canv.setFillColor(WHITE)
-        # Cockpit-Mast (rect)
+        # Cockpit-Mast (rect) — kürzer damit Antenne im Header bleibt
         cx,cy = Lpt(96.5, 30)
-        canv.rect(cx, cy, 7*scale, 38*scale, fill=1, stroke=0)
-        # Cockpit-Spitze (ellipse oben)
-        canv.ellipse(lx+95*scale, ly+lh-(-15)*scale,
-                     lx+105*scale, ly+lh-(-1)*scale, fill=1, stroke=0)
+        canv.rect(cx, cy, 7*scale, 30*scale, fill=1, stroke=0)
+        # Cockpit-Spitze (ellipse oben) — Y im positiven Bereich, kein Overflow
+        canv.ellipse(lx+95*scale, ly+lh-2*scale,
+                     lx+105*scale, ly+lh-12*scale, fill=1, stroke=0)
         # Linke Tragfläche
         p = canv.beginPath()
         for i,(x,y) in enumerate([(100,14),(100,25),(56,36),(60,25)]):
@@ -4498,8 +4498,11 @@ def erstelle_pdf(d):
         canv.setFillColor(TEXT3); canv.setFont("Helvetica",9)
         canv.drawString(text_x+aw+tw+0.22*cm, H-1.02*cm, "·")
         canv.setFillColor(TEXT2); canv.setFont("Helvetica",9)
+        # Lange Namen truncen damit kein Overflow
+        _name_full = d.get('name','') or ''
+        _name_short = _name_full if len(_name_full) <= 24 else (_name_full[:23] + '…')
         canv.drawString(text_x+aw+tw+0.55*cm, H-1.0*cm,
-            f"{d.get('name','')}  ·  Steuerjahr {d.get('year',2025)}")
+            f"{_name_short}  ·  Steuerjahr {d.get('year',2025)}")
         # Page-Number rechts (im Brochure-Stil: "PAGE — 03")
         canv.setFillColor(TEXT3); canv.setFont("Helvetica",8)
         canv.drawRightString(W-1.5*cm, H-1.0*cm,
