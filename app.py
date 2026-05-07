@@ -184,6 +184,7 @@ def create_payment_intent():
 
 _ALL_FILE_KEYS = (
     'lsb', 'dp', 'se',
+    'einsatz',  # Optional: Einsatzplan (CAS) — Cross-Check + Z72-Boost
     'stb', 'gew', 'arb', 'fort', 'tel', 'konz',
     'lapt', 'fach', 'reini', 'bewer',
     'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
