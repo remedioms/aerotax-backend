@@ -1861,7 +1861,59 @@ def support_message():
             print(f"[support] disk save fail: {e}")
             return jsonify({'error': 'Speichern fehlgeschlagen'}), 500
 
+    # ── Email-Notification an Admin via Resend (best-effort, blockt nicht) ──
+    _send_support_email_notification(record)
+
     return jsonify({'ok': True, 'message': 'Nachricht erhalten — wir melden uns'})
+
+
+def _send_support_email_notification(record):
+    """Schickt eine Notification-Mail an Admin via Resend API.
+    Failures werden nur geloggt — User-Submit gilt als erfolgreich auch ohne Mail.
+    """
+    api_key = os.environ.get('RESEND_API_KEY', '').strip()
+    to_email = os.environ.get('SUPPORT_NOTIFY_EMAIL', 'miguel.schumann@icloud.com').strip()
+    if not api_key:
+        print("[support-mail] RESEND_API_KEY nicht gesetzt — überspringe Email-Notification")
+        return
+    try:
+        import urllib.request, urllib.error
+        subject = f"[AeroTAX Support] {record.get('reason','—')} · {record.get('email','')}"
+        html_body = (
+            f"<h2 style='font-family:sans-serif'>Neue Support-Anfrage</h2>"
+            f"<p style='font-family:sans-serif;color:#444'>"
+            f"<b>Grund:</b> {record.get('reason','')}<br>"
+            f"<b>Email:</b> <a href='mailto:{record.get('email','')}'>{record.get('email','')}</a><br>"
+            f"<b>Telefon:</b> {record.get('phone','') or '—'}<br>"
+            f"<b>Eingegangen:</b> {record.get('created_at','')}<br>"
+            f"<b>IP-Hash:</b> {record.get('ip_hash','')}"
+            f"</p>"
+            f"<div style='background:#f5f5f7;border-radius:8px;padding:16px;font-family:sans-serif;white-space:pre-wrap;color:#222;border-left:3px solid #2563eb'>"
+            f"{(record.get('message','') or '').replace('<','&lt;').replace('>','&gt;')}"
+            f"</div>"
+            f"<p style='font-family:sans-serif;font-size:12px;color:#888;margin-top:20px'>"
+            f"Antworte direkt auf diese Mail — sie geht an <b>{record.get('email','')}</b> raus."
+            f"</p>"
+        )
+        payload = json.dumps({
+            'from': 'AeroTAX Support <support@aerosteuer.de>',
+            'to': [to_email],
+            'reply_to': record.get('email',''),
+            'subject': subject,
+            'html': html_body,
+        }).encode()
+        req = urllib.request.Request(
+            'https://api.resend.com/emails',
+            data=payload,
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                print(f"[support-mail] sent to {to_email}")
+            else:
+                print(f"[support-mail] unexpected status {resp.status}")
+    except Exception as e:
+        print(f"[support-mail] send fail: {e}")
 
 
 @app.route('/api/admin/support-list', methods=['GET'])
