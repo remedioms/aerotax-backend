@@ -1864,6 +1864,38 @@ def support_message():
     return jsonify({'ok': True, 'message': 'Nachricht erhalten — wir melden uns'})
 
 
+@app.route('/api/admin/support-list', methods=['GET'])
+def admin_support_list():
+    """Liest gespeicherte Support-Anfragen — geschützt durch Token-Header."""
+    auth = request.headers.get('X-Admin-Token', '')
+    expected = os.environ.get('RECOVERY_SECRET', '')
+    if not expected or auth != expected:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    items = []
+    if SB_AVAILABLE:
+        try:
+            r = sb.table('support_requests').select('*').order('created_at', desc=True).limit(200).execute()
+            items.extend(r.data or [])
+        except Exception as e:
+            print(f"[admin] supabase support-list fail: {e}")
+
+    # Disk-Fallback dazu
+    try:
+        sup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'support_inbox')
+        if os.path.isdir(sup_dir):
+            for fname in sorted(os.listdir(sup_dir), reverse=True)[:200]:
+                if not fname.endswith('.json'): continue
+                try:
+                    with open(os.path.join(sup_dir, fname)) as f:
+                        items.append(json.load(f))
+                except: pass
+    except Exception as e:
+        print(f"[admin] disk support-list fail: {e}")
+
+    return jsonify({'count': len(items), 'items': items})
+
+
 @app.route('/api/qa/<qid>/upvote', methods=['POST'])
 def qa_upvote(qid):
     """Upvote für Frage oder Antwort. Body: {answer_id?}."""
