@@ -1825,12 +1825,12 @@ def qa_upvote(qid):
 
     if SB_AVAILABLE:
         try:
-            # Dedupe: 1h-Window — Spam-Schutz, aber nicht zu restriktiv
-            cutoff = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+            # Dedupe: 1-Min-Window — minimaler Spam-Schutz, sonst freie Likes
+            cutoff = (datetime.utcnow() - timedelta(seconds=60)).isoformat()
             check = sb.table('upvotes').select('id').eq('target_type', target_type).eq('target_id', target_id).eq('ip_hash', ip_hash).gte('created_at', cutoff).limit(1).execute()
             if check.data:
-                return jsonify({'error': 'Schon gevotet — bitte 1 Stunde warten'}), 429
-            # Alte Votes derselben IP fürs selbe Target löschen (>1h alt) — sonst greift der UNIQUE-Constraint
+                return jsonify({'error': 'Bitte kurz warten — nur ein Like pro Minute'}), 429
+            # Alte Votes derselben IP fürs selbe Target löschen (>1min alt) — sonst greift der UNIQUE-Constraint
             try:
                 sb.table('upvotes').delete().eq('target_type', target_type).eq('target_id', target_id).eq('ip_hash', ip_hash).lt('created_at', cutoff).execute()
             except Exception as _de:
@@ -1872,13 +1872,13 @@ def qa_upvote(qid):
                 if not target:
                     return jsonify({'error': 'Antwort nicht gefunden'}), 404
                 target.setdefault('upvotes_log', [])
-                cutoff = datetime.utcnow() - timedelta(hours=1)
+                cutoff = datetime.utcnow() - timedelta(seconds=60)
                 already_voted = any(
                     v.get('h') == ip_hash and datetime.fromisoformat(v.get('ts','').replace('Z','')) >= cutoff
                     for v in target['upvotes_log']
                 )
                 if already_voted:
-                    return jsonify({'error': 'Schon gevotet — bitte 1 Stunde warten'}), 429
+                    return jsonify({'error': 'Bitte kurz warten — nur ein Like pro Minute'}), 429
                 target['upvotes_log'].append(vote)
                 _qa_save(questions)
                 return jsonify({
