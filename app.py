@@ -1811,6 +1811,59 @@ def qa_answer(qid):
     return jsonify({'error': 'Frage nicht gefunden'}), 404
 
 
+@app.route('/api/support-message', methods=['POST'])
+def support_message():
+    """Speichert eine Support-Anfrage in Supabase (oder Disk-Fallback)."""
+    body = request.get_json(silent=True) or {}
+    reason  = (body.get('reason') or '').strip()[:120]
+    email   = (body.get('email')  or '').strip()[:200]
+    phone   = (body.get('phone')  or '').strip()[:80]
+    message = (body.get('message') or '').strip()[:5000]
+
+    if not reason or not email or not message:
+        return jsonify({'error': 'Pflichtfelder fehlen'}), 400
+    # Simple email check
+    if '@' not in email or '.' not in email.split('@')[-1]:
+        return jsonify({'error': 'E-Mail-Format ungültig'}), 400
+
+    record = {
+        'reason': reason,
+        'email': email,
+        'phone': phone,
+        'message': message,
+        'created_at': datetime.utcnow().isoformat() + 'Z',
+        'ip_hash': _hashlib.sha256(
+            (request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
+             + os.environ.get('RECOVERY_SECRET','')).encode()
+        ).hexdigest()[:12],
+    }
+
+    saved = False
+    if SB_AVAILABLE:
+        try:
+            sb.table('support_requests').insert(record).execute()
+            saved = True
+            print(f"[support] saved to Supabase: {reason} from {email}")
+        except Exception as e:
+            print(f"[support] Supabase insert fail: {e}")
+
+    if not saved:
+        # Disk-Fallback
+        try:
+            sup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'support_inbox')
+            os.makedirs(sup_dir, exist_ok=True)
+            fname = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{record['ip_hash']}.json"
+            with open(os.path.join(sup_dir, fname), 'w') as f:
+                json.dump(record, f, indent=2, ensure_ascii=False)
+            saved = True
+            print(f"[support] saved to disk: {fname}")
+        except Exception as e:
+            print(f"[support] disk save fail: {e}")
+            return jsonify({'error': 'Speichern fehlgeschlagen'}), 500
+
+    return jsonify({'ok': True, 'message': 'Nachricht erhalten — wir melden uns'})
+
+
 @app.route('/api/qa/<qid>/upvote', methods=['POST'])
 def qa_upvote(qid):
     """Upvote für Frage oder Antwort. Body: {answer_id?}."""
@@ -1825,12 +1878,12 @@ def qa_upvote(qid):
 
     if SB_AVAILABLE:
         try:
-            # Dedupe: 1-Min-Window — minimaler Spam-Schutz, sonst freie Likes
-            cutoff = (datetime.utcnow() - timedelta(seconds=60)).isoformat()
+            # Minimaler Spam-Schutz: 1-Sekunden-Window — User kann frei mehrfach liken
+            cutoff = (datetime.utcnow() - timedelta(seconds=1)).isoformat()
             check = sb.table('upvotes').select('id').eq('target_type', target_type).eq('target_id', target_id).eq('ip_hash', ip_hash).gte('created_at', cutoff).limit(1).execute()
             if check.data:
-                return jsonify({'error': 'Bitte kurz warten — nur ein Like pro Minute'}), 429
-            # Alte Votes derselben IP fürs selbe Target löschen (>1min alt) — sonst greift der UNIQUE-Constraint
+                return jsonify({'error': 'Bitte langsamer klicken'}), 429
+            # Alte Votes derselben IP fürs selbe Target löschen (>1s alt) — UNIQUE-Constraint Workaround
             try:
                 sb.table('upvotes').delete().eq('target_type', target_type).eq('target_id', target_id).eq('ip_hash', ip_hash).lt('created_at', cutoff).execute()
             except Exception as _de:
@@ -1872,13 +1925,13 @@ def qa_upvote(qid):
                 if not target:
                     return jsonify({'error': 'Antwort nicht gefunden'}), 404
                 target.setdefault('upvotes_log', [])
-                cutoff = datetime.utcnow() - timedelta(seconds=60)
+                cutoff = datetime.utcnow() - timedelta(seconds=1)
                 already_voted = any(
                     v.get('h') == ip_hash and datetime.fromisoformat(v.get('ts','').replace('Z','')) >= cutoff
                     for v in target['upvotes_log']
                 )
                 if already_voted:
-                    return jsonify({'error': 'Bitte kurz warten — nur ein Like pro Minute'}), 429
+                    return jsonify({'error': 'Bitte langsamer klicken'}), 429
                 target['upvotes_log'].append(vote)
                 _qa_save(questions)
                 return jsonify({
