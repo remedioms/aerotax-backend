@@ -3219,6 +3219,100 @@ Kurze Begründung wo Junior 1 vs 2 falsch lagen.
         return None
 
 
+def parse_einsatzplan_mit_ki(pdf_bytes_list, year=2025):
+    """
+    Parsed den CAS-Einsatzplan (PUB-Liste) — pro Monat eine PDF.
+    Liefert: Umläufe + Spesen-Beträge + Tagestrips für Cross-Check & Z72-Boost.
+
+    Format-Erkennung: Header "Crew Assignment System ... Persönlicher Einsatzplan"
+    Pro Tag: Datum, Umlauf-Nr, Spesen (z.B. "4Tg 206 EURO"), Briefingzeit,
+    Flug-Routing, Block-Time.
+    """
+    if not pdf_bytes_list:
+        return None
+
+    import re as _re
+    monate_geparst = 0
+    umlaeufe = []          # Liste aller Umläufe: {umlauf_nr, monat, tage, spesen_eur, ist_tagestrip}
+    tagestrips = []        # Tage mit ≥8h Abwesenheit aus Tagestrips
+    spesen_total = 0.0
+    monatslisten = []
+
+    for item in pdf_bytes_list:
+        pdf_bytes = item[0] if isinstance(item, tuple) else item
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                full_text = '\n'.join((p.extract_text() or '') for p in pdf.pages)
+        except Exception as e:
+            print(f"Einsatzplan: PDF-Read fail: {e}")
+            continue
+
+        # Format-Check: ist das wirklich ein CAS-Einsatzplan?
+        if 'Persönlicher Einsatzplan' not in full_text and 'Crew Assignment System' not in full_text:
+            print("Einsatzplan: Format nicht erkannt (kein CAS-Header)")
+            continue
+
+        monate_geparst += 1
+
+        # Monat extrahieren — erstes Vorkommen "(JAN|FEB|...)\s+JAHR" im Header-Bereich
+        m_monat = _re.search(r'\b(JAN|FEB|M[ÄA]R|APR|MAI|JUN|JUL|AUG|SEP|OKT|NOV|DEZ)\s+(\d{4})', full_text[:600])
+        monat_str = f"{m_monat.group(1)} {m_monat.group(2)}" if m_monat else "?"
+
+        # Umläufe finden — flexibles Pattern: zuerst Tg-Format, sonst letzte Zahl vor EURO
+        # Beispiele:
+        #   "Mo 03 60039 FB 25 25 4Tg 206 EURO"   → 4 Tage, 206€
+        #   "Mi 12 60379 FB 19 19 87 148 EURO"    → ?Tage, 148€ (Tage aus Routing-Folgetagen)
+        umlauf_pattern = _re.compile(
+            r'^(?:Mo|Di|Mi|Do|Fr|Sa|So)\s+(\d{1,2})\s+(\d{4,6})\s+FB[^\n]*?(\d+(?:[.,]\d+)?)\s+EURO',
+            _re.M
+        )
+        # Tg-Detector (zusätzlich) — wenn es ein "<n>Tg" gibt, lese die Tage explizit
+        tg_pattern = _re.compile(r'(\d+)\s*Tg\s+\d+(?:[.,]\d+)?\s+EURO')
+
+        for match in umlauf_pattern.finditer(full_text):
+            tag_nr, umlauf_nr, spesen_str = match.groups()
+            line = match.group(0)
+            try:
+                spesen = float(spesen_str.replace(',', '.'))
+            except Exception:
+                continue
+            tg_match = tg_pattern.search(line)
+            tage = int(tg_match.group(1)) if tg_match else 0
+            ist_tagestrip = (tage == 1)
+            umlaeufe.append({
+                'umlauf_nr': umlauf_nr,
+                'monat': monat_str,
+                'tage': tage,
+                'spesen_eur': spesen,
+                'ist_tagestrip': ist_tagestrip,
+            })
+            spesen_total += spesen
+
+        # Briefingzeit + Block-Time pro Tag (für Z72-Boost-Detection)
+        # Pattern: "Briefingzeit(LT FRA): 03/02/25 20:10"
+        # Pattern: "FRA 21:00- ... -07:30 JNB 10:30" (Block-Time = 10:30)
+        # Tagestrips erkennen: Wenn 1Tg im Umlauf + Block-Time + Briefing → Abwesenheit-Berechnung
+        # Pro Tagestrip-Day: vereinfachte Annahme — wenn 1Tg-Umlauf, ist es ein Tagestrip-Kandidat
+        for u in umlaeufe:
+            if u['ist_tagestrip'] and u['monat'] == monat_str:
+                tagestrips.append(u)
+
+        monatslisten.append(monat_str)
+
+    if monate_geparst == 0:
+        return None
+
+    spesen_total = round(spesen_total, 2)
+    return {
+        'monate_geparst': monate_geparst,
+        'monatslisten': monatslisten,
+        'umlaeufe': umlaeufe,
+        'spesen_total': spesen_total,
+        'tagestrips_count': len(tagestrips),
+        'tagestrips': tagestrips,
+    }
+
+
 def parse_optionale_belege(files):
     """
     Liest optionale Belege mit Claude Vision KI.
@@ -3693,6 +3787,20 @@ def berechne(form, files):
     else:
         missing.append('Flugstunden-Übersichten (nicht hochgeladen)')
 
+    # ── EINSATZPLAN (CAS) — optional, für Cross-Check & Z72-Boost ──
+    einsatz_data = None
+    if files.get('einsatz'):
+        try:
+            einsatz_data = parse_einsatzplan_mit_ki(files['einsatz'], year=int(form.get('year', 2025)))
+            if einsatz_data:
+                print(f"Einsatzplan: {einsatz_data.get('monate_geparst',0)}/12 Monate, "
+                      f"{len(einsatz_data.get('umlaeufe',[]))} Umläufe, "
+                      f"Spesen-Total={einsatz_data.get('spesen_total',0):.2f} EUR, "
+                      f"Tagestrips={einsatz_data.get('tagestrips_count',0)}")
+        except Exception as e:
+            print(f"Einsatzplan-Parse fail: {e}")
+            einsatz_data = None
+
     # ── SMART INFERENCE für fehlende Daten ────────────────────
     inferred = {}
     if missing and available_texts:
@@ -3961,6 +4069,50 @@ def berechne(form, files):
         print(f"PLAUSI-CHECKS fehlgeschlagen: {plausi_warns}")
     else:
         print(f"PLAUSI-CHECKS ok: VMA-Summe={vma_summe:.2f}€ Z77={z77:.2f}€ Hotel/Arbeit/Fahr/365 alle plausibel")
+
+    # ── EINSATZPLAN-CROSS-CHECK (wenn vorhanden) ─────────────
+    if einsatz_data and einsatz_data.get('monate_geparst', 0) > 0:
+        ein_monate = einsatz_data['monate_geparst']
+        ein_spesen = einsatz_data['spesen_total']
+        ein_umlaeufe_count = len(einsatz_data.get('umlaeufe', []))
+        cross_notes = []
+
+        # Cross-Check 1: Spesen-Total Einsatzplan vs SE-Spesen-Summe
+        if se_data and se_data.get('summe_gesamt', 0) > 0:
+            se_spesen = float(se_data.get('summe_gesamt', 0))
+            spesen_diff = abs(ein_spesen - se_spesen)
+            spesen_tolerance = max(50, se_spesen * 0.03)  # 3% oder mind. 50€
+            if spesen_diff > spesen_tolerance and ein_monate >= 6:
+                cross_notes.append(
+                    f'Spesen-Differenz: Einsatzplan zeigt {ein_spesen:.2f}€ — '
+                    f'Streckeneinsatz {se_spesen:.2f}€ (Δ {spesen_diff:.2f}€). '
+                    f'Möglicherweise fehlt eine Streckeneinsatz-Abrechnung oder ein Einsatzplan-Monat.'
+                )
+
+        # Cross-Check 2: Anzahl Umläufe vs Streckeneinsatz-Abrechnungen
+        if se_data and se_data.get('abrechnungen'):
+            se_count = len(se_data['abrechnungen'])
+            if ein_umlaeufe_count > 0 and abs(ein_umlaeufe_count - se_count) > 2 and ein_monate >= 6:
+                cross_notes.append(
+                    f'Umlauf-Anzahl: Einsatzplan zeigt {ein_umlaeufe_count} Umläufe — '
+                    f'Streckeneinsatz hat {se_count} Abrechnungen. Bitte Vollständigkeit prüfen.'
+                )
+
+        # Cross-Check 3: Vollständigkeit Einsatzplan-Monate
+        if 1 <= ein_monate < 12:
+            cross_notes.append(
+                f'Einsatzplan: nur {ein_monate}/12 Monate hochgeladen — '
+                f'der Cross-Check läuft nur über die hochgeladenen Monate.'
+            )
+
+        if cross_notes:
+            notes.extend(['↻ Einsatzplan-Abgleich: ' + n for n in cross_notes])
+            print(f"EINSATZPLAN-CROSS-CHECK Hinweise: {cross_notes}")
+        else:
+            ok_msg = (f'Einsatzplan-Abgleich: {ein_monate}/12 Monate, '
+                      f'{ein_umlaeufe_count} Umläufe, Spesen {ein_spesen:.2f}€ — alle Werte konsistent.')
+            notes.append('✓ ' + ok_msg)
+            print(f"EINSATZPLAN-CROSS-CHECK ok: {ok_msg}")
 
     # ── QUALITY GATE: bei massiven Plausi-Fehlern direkt Recovery-Hinweis aufnehmen ──
     quality_questionable = bool(plausi_warns) and any('unmöglich' in w.lower() for w in plausi_warns)
