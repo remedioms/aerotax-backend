@@ -2240,8 +2240,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '3.4',
-        'build':   'briefing-zeiten-zurueck-im-prompt-2026-05-09',
+        'version': '3.5',
+        'build':   'tour-aware-zurueckgenommen-konservativ-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -3054,67 +3054,14 @@ def _parse_se_pdf_xpos(pdf_bytes_list, year=2025):
                 'kat_ort': kat_ort,
             })
 
-    # ── TOUR-AWARE RE-KLASSIFIZIERUNG ──────────────────────────
-    # Bei Auslandstouren schreibt LH oft den Anreise-/Abreise-Tag mit FRA als
-    # stfrei-Ort (Inland-Anteil 14€). Steuerlich gehört dieser Tag aber zur
-    # Auslandstour → Z76 mit Auslandsanreise-Pauschale (BMF-Tagessatz "anreise").
-    # Wir reklassifizieren: jede Z73-Inland-Zeile, die direkter Nachbar
-    # (±1 Tag im selben Monat) einer Z76-Auslands-Zeile ist → wird Z76.
-    def _parse_dt(s):
-        try:
-            from datetime import datetime as _dt
-            return _dt.strptime(s, '%d.%m.%Y')
-        except: return None
-
-    sorted_classifications = sorted(row_classifications, key=lambda c: _parse_dt(c['datum']) or 0)
-    z76_dates = set()
-    for c in sorted_classifications:
-        if c['kat'] == 'z76':
-            d = _parse_dt(c['datum'])
-            if d: z76_dates.add(d.date())
-
-    reklass_count = 0
-    reklass_eur_z73_zu_z76 = 0.0
-    reklass_z76_pauschale_eur = 0.0
-    from datetime import timedelta as _td
-    for c in sorted_classifications:
-        if not c.get('reklass'): continue
-        d = _parse_dt(c['datum'])
-        if not d: continue
-        d = d.date()
-        # Ist Vortag oder Folgetag eine Z76-Auslandszeile?
-        is_neighbor_to_ausland = (d - _td(days=1)) in z76_dates or (d + _td(days=1)) in z76_dates
-        if not is_neighbor_to_ausland: continue
-
-        # Reklassifizieren: Z73 (14€ Inland-Anreise) → Z76 (Auslandstour-Anteil)
-        # Dem User schlagen wir den Auslandsanreise-Satz an, da der Tag steuerlich
-        # zur Auslandstour gehört. Suche das Auslands-Ziel beim Nachbarn.
-        ausland_neighbor = next(
-            (cc for cc in sorted_classifications if cc['kat'] == 'z76' and
-             _parse_dt(cc['datum']) and abs((_parse_dt(cc['datum']).date() - d).days) <= 1),
-            None
-        )
-        bmf_satz = None
-        if ausland_neighbor and ausland_neighbor.get('kat_ort'):
-            bmf_satz = bmf_an(ausland_neighbor['kat_ort'])
-        # Inland-Anteil aus Z73 abziehen
-        z73_tage -= 1
-        z73_eur -= c['eur']
-        reklass_eur_z73_zu_z76 += c['eur']
-        # Auslands-Anreise-Pauschale zu Z76 addieren (oder mind. den Inland-Anteil wenn keine BMF-Daten)
-        z76_add = bmf_satz if bmf_satz and bmf_satz > c['eur'] else c['eur']
-        z76_eur += z76_add
-        reklass_z76_pauschale_eur += z76_add
-        reklass_count += 1
-
-    if reklass_count > 0:
-        print(f"[SE-tour-aware] {reklass_count} Z73-Inlandstage → Z76 reklassifiziert "
-              f"(Inland-Anteil {reklass_eur_z73_zu_z76:.2f}€ → Ausland {reklass_z76_pauschale_eur:.2f}€, "
-              f"+{reklass_z76_pauschale_eur - reklass_eur_z73_zu_z76:.2f}€)")
-
-    z73_tage = max(0, z73_tage)
-    z73_eur  = round(max(0, z73_eur), 2)
-    z76_eur  = round(z76_eur, 2)
+    # ── TOUR-AWARE RE-KLASSIFIZIERUNG DEAKTIVIERT ──────────────
+    # Mein vorheriger Fix war zu aggressiv: hat ALLE Z73-Tage in Auslandstour-
+    # Nachbarschaft zu Z76 reklassifiziert UND mit Auslands-Pauschalen aufgewertet.
+    # Steuerberater-Praxis (FollowMe-Methode) ist konservativer:
+    # Inland-Anteile (FRA stfrei) bleiben Z73 mit 14€ — Z76 ist nur was LH
+    # explizit als Auslandsspesen markiert. Sicherer beim Finanzamt.
+    # Nur die deterministische Klassifikation aus der Loop bleibt.
+    pass
 
     return {
         'z72_tage': z72_tage, 'z72_eur': round(z72_eur, 2),
@@ -3353,14 +3300,12 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                     "Du klassifizierst die Tage steuerlich richtig nach §9 EStG.\n\n"
                     "Pro Seite gibt es eine 'Summe:'-Zeile (Gesamt/Steuer/Stfrei). "
                     "Z77 = stfrei-Anteil = Gesamt - letzter_Wert.\n\n"
-                    "WICHTIG — TOUR-AWARE-KLASSIFIKATION DER EINZELNEN TAGE:\n"
-                    "Bei einer Auslandstour schreibt LH den Anreise-Tag oft mit FRA als stfrei-Ort\n"
-                    "(z.B. 14,00 € FRA für die Stunden bis Boarding). Steuerlich gehört dieser Tag\n"
-                    "aber zur AUSLANDSREISE → wird Z76 (mit BMF-Auslands-Anreise-Pauschale für das Ziel),\n"
-                    "NICHT Z73 (Inland-Anreise).\n\n"
-                    "Regel: ein Tag mit stfrei-Ort=Inland (FRA/MUC/HAM/...) ist nur dann Z73 wenn\n"
-                    "- am Vor-/Folgetag KEIN Auslands-Eintrag steht (also echte Inland-Tour mit Inland-Hotel)\n"
-                    "Ist der Vor-/Folgetag Ausland → der Inlandstag gehört zur Auslandstour → Z76.\n\n"
+                    "KLASSIFIKATION DER EINZELNEN TAGE — KONSERVATIV (FollowMe-Methode):\n"
+                    "- stfrei-Ort = Inland (FRA/MUC/HAM/...): zähle als Z72/Z73/Z74 mit dem stfrei-Wert\n"
+                    "  (auch wenn der Tag teil einer Auslandstour ist — bleibt Z73 mit 14€)\n"
+                    "- stfrei-Ort = Ausland (GRU/JFK/SEL/...): zähle als Z76 mit dem stfrei-Wert\n"
+                    "- Inland-Anteile von Auslandstouren NICHT künstlich auf Auslandspauschale aufwerten\n"
+                    "- Konservativ ist sicherer beim Finanzamt\n\n"
                     "Extrahiere ALLE Abrechnungen + EINE TAGES-ZUSAMMENFASSUNG. Gib NUR JSON zurück, kein Erklärtext.\n\n"
                     "Format:\n"
                     '{\n'
@@ -3807,8 +3752,11 @@ vma_aus = Σ aller stfrei-Werte wo stfrei-Ort AUSLAND ist
 vma_72/73/74 = Σ stfrei-Werte wo stfrei-Ort INLAND, klassifiziert per Tag
 z77 = lass auf 0 (Backend rechnet)
 
-WICHTIG bei Auslandstour-Anreise: wenn LH am Anreise-Tag einer Auslandstour 14€ FRA-stfrei schreibt,
-zählt der Tag steuerlich zur AUSLANDSTOUR (Z76), NICHT zu Z73 (Inland).
+WICHTIG: Klassifiziere konservativ wie ein klassischer Steuerberater (FollowMe-Methode):
+- Wenn LH am Anreise-Tag mit FRA stfrei-Ort 14€ schreibt → Z73 (Inland-An-/Abreise) bleibt 14€
+- Wenn LH am gleichen Tag eine ZUSÄTZLICHE Zeile mit Auslands-Stempel schreibt → das ist Z76
+- Z76 = NUR was LH explizit mit Ausland-Stempel auszeichnet
+- Inland-Anteile von Auslandstouren NICHT künstlich aufwerten
 
 ═══ LIEFERFORMAT ═══
 
