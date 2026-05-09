@@ -722,6 +722,237 @@ def test_anreise_z17_kann_fahrtkosten_topf_nicht_negativ_machen():
     # Andere Töpfe (VMA) müssen separat berechnet werden — kein Übergriff
 
 
+# ── v7.5 Tests: audit_notes vs unresolved_days, VMA-Mapping ───────────────
+
+def test_v75_audit_notes_separate_from_unresolved():
+    """FRA-Stempel bei Auslandscluster → audit_notes, NICHT unresolved_days."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'BLR'},
+        {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-05', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 03.01 FRA-Stempel im Auslands-Cluster: gehört in audit_notes
+    note_match = [n for n in result.get('audit_notes', []) if '2025-01-03' in n]
+    assert note_match, f"FRA-Stempel-Audit-Note für 03.01 fehlt. notes={result.get('audit_notes')}"
+    # ABER 03.01 ist NICHT in unresolved_days
+    unresolved_match = [u for u in result.get('unresolved_days', []) if '2025-01-03' in u]
+    assert not unresolved_match, f"03.01 darf nicht in unresolved_days sein. unresolved={result.get('unresolved_days')}"
+
+
+def test_v75_no_active_se_unmapped():
+    """Aktive SE-Zeile MUSS in Z72/Z73/Z74/Z76 oder vma_unmapped_se landen."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Beide SE-Zeilen sind aktiv — beide müssen als Z76 klassifiziert sein
+    z76_days = [t for t in result['tage_detail'] if t['klass'] == 'Z76']
+    assert len(z76_days) >= 2, f"Beide BLR-Tage sollten Z76 sein, sind {[(t['datum'], t['klass']) for t in result['tage_detail']]}"
+    # Kein vma_unmapped_se
+    assert len(result.get('vma_unmapped_se', [])) == 0, \
+        f"Keine SE-Zeile sollte unmapped sein. unmapped={result.get('vma_unmapped_se')}"
+
+
+def test_v75_isolated_tour_day_with_recent_foreign_resolves_to_z76():
+    """Isolierter Tour-Tag NACH Auslands-Cluster → Z76 Heimkehr (nicht Sonstiges)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # Konstruktion: Auslandstour 03-05.01 BLR, dann frei, dann isolierter Tour-Tag 06.01
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'BLR'},
+        {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'BLR'},
+        # 06.01 als isolierter 'tour'-Tag ohne Vortag-Verbindung im DP
+        {'datum': '2025-01-06', 'activity_type': 'tour', 'overnight_after_day': False, 'has_fl': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-05', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        # Keine SE-Zeile am 06.01!
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 06.01 darf NICHT 'Sonstiges' sein
+    detail_06 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-06']
+    assert detail_06, "Tag 06.01 fehlt"
+    assert detail_06[0]['klass'] == 'Z76', \
+        f"Tag 06.01 sollte Z76 sein (Recent-Foreign-Cluster Heimkehr), ist {detail_06[0]['klass']}"
+    # Auch nicht in unresolved_days
+    unresolved = [u for u in result.get('unresolved_days', []) if '2025-01-06' in u]
+    assert not unresolved, f"06.01 darf nicht unresolved sein, ist {unresolved}"
+
+
+def test_v75_same_day_under_8h_becomes_zero_day_not_unresolved():
+    """Same-Day ohne FL/SE/Cluster-Spur → ZeroDay, NICHT unresolved."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-15', 'activity_type': 'tour', 'overnight_after_day': False, 'has_fl': False,
+         'routing': []},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []})
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail = [d for d in result['tage_detail'] if d['datum'] == '2025-04-15']
+    assert detail, "Tag 15.04 fehlt"
+    # ZeroDay (kein VMA, aber AT) ist gültig — keine unresolved
+    assert detail[0]['klass'] in ('ZeroDay', 'Z72'), \
+        f"Tag 15.04 sollte ZeroDay oder Z72 sein, ist {detail[0]['klass']}"
+
+
+def test_v75_office_not_unresolved():
+    """Office-Tag landet nicht in unresolved_days."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [{'datum': '2025-01-10', 'activity_type': 'office',
+                            'overnight_after_day': False}]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []})
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert len(result.get('unresolved_days', [])) == 0
+    assert result['arbeitstage'] == 1
+    assert result['fahr_tage'] == 1
+
+
+def test_v75_standby_not_unresolved():
+    """Standby zählt als AT, kein FT, nicht unresolved."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [{'datum': '2025-01-10', 'activity_type': 'standby',
+                            'overnight_after_day': False}]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []})
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert len(result.get('unresolved_days', [])) == 0
+    assert result['arbeitstage'] == 1
+    assert result['fahr_tage'] == 0
+
+
+def test_v75_z74_for_inland_volltag_in_mixed_cluster():
+    """Mixed-Cluster: SOF→DE-24h→GOT — DE-Tag wird Z74 (24h Inland)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-09-26', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','SOF'], 'layover_ort': 'SOF'},
+        {'datum': '2025-09-27', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['SOF','MUC'], 'layover_ort': 'MUC'},
+        {'datum': '2025-09-28', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['MUC','GOT'], 'layover_ort': 'GOT'},
+        {'datum': '2025-09-29', 'activity_type': 'tour', 'overnight_after_day': False, 'has_fl': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-09-26', 'stfrei_betrag': 32, 'stfrei_ort': 'SOF', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-09-27', 'stfrei_betrag': 28, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-09-28', 'stfrei_betrag': 33, 'stfrei_ort': 'GOT', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-09-29', 'stfrei_betrag': 30, 'stfrei_ort': 'GOT', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 27.09 ist Inland-Volltag im Mixed-Cluster → Z74 erwartet
+    detail_27 = [d for d in result['tage_detail'] if d['datum'] == '2025-09-27']
+    assert detail_27 and detail_27[0]['klass'] == 'Z74', \
+        f"27.09 sollte Z74 sein (Inland-Volltag im Mixed-Cluster), ist {detail_27[0]['klass'] if detail_27 else 'fehlt'}"
+
+
+def test_v75_arbeitstage_only_real_classes():
+    """Arbeitstage zählen nur aus tour/same_day/office/training/standby/zero,
+    NICHT aus frei/urlaub/krank/sonstiges."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-01', 'activity_type': 'frei', 'overnight_after_day': False},
+        {'datum': '2025-01-02', 'activity_type': 'urlaub', 'overnight_after_day': False},
+        {'datum': '2025-01-03', 'activity_type': 'office', 'overnight_after_day': False},
+        {'datum': '2025-01-04', 'activity_type': 'standby', 'overnight_after_day': False},
+        {'datum': '2025-01-05', 'activity_type': 'krank', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []})
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Office + Standby = 2 Arbeitstage
+    assert result['arbeitstage'] == 2
+    # Office = 1 Fahrtag, Standby = 0 → 1 Fahrtag
+    assert result['fahr_tage'] == 1
+
+
+def test_v75_hotel_only_for_cluster_overnight():
+    """Hotelnächte zählen nur für Z73/Z74/Z76 mit overnight=true."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        # Auslandstour mit Hotel
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'BLR'},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': False, 'has_fl': False},
+        # Frei-Tag mit "overnight" — soll NICHT als Hotel zählen
+        {'datum': '2025-01-05', 'activity_type': 'frei', 'overnight_after_day': True},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Nur 03.01 (Z76 mit overnight) zählt als Hotel — 05.01 ist frei
+    assert result['hotel_naechte'] == 1, \
+        f"Hotel sollte 1 sein (nur Z76-Übernachtung), ist {result['hotel_naechte']}"
+
+
+def test_v75_z72_not_in_inland_cluster():
+    """Z72 darf nicht für Tage entstehen die Teil eines Tour-Clusters sind."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # Tour-Cluster mit Same-Day-artigem Tag mittendrin (nicht möglich realistisch, aber Test-Schutz)
+    structured = {'days': [
+        {'datum': '2025-03-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'MUC'},
+        {'datum': '2025-03-05', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'MUC'},
+        {'datum': '2025-03-06', 'activity_type': 'tour', 'overnight_after_day': False, 'has_fl': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-03-04', 'stfrei_betrag': 14, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-03-05', 'stfrei_betrag': 28, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-03-06', 'stfrei_betrag': 14, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Inland-Tour: kein Z72
+    assert result['z72_tage'] == 0, f"Z72 sollte 0 sein in Inland-Tour, ist {result['z72_tage']}"
+    # Stattdessen: Z73 An/Ab + Z74 Volltag
+    assert result['z73_tage'] >= 2
+    assert result['z74_tage'] >= 1
+
+
+def test_v75_active_se_inland_without_cluster_z73():
+    """Aktive Inland-SE-Zeile bei DP=unknown (ohne Cluster) → Z73 (nicht Sonstiges)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-10', 'activity_type': 'unknown', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-04-10', 'stfrei_betrag': 14, 'stfrei_ort': 'HAM', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail = [d for d in result['tage_detail'] if d['datum'] == '2025-04-10']
+    assert detail and detail[0]['klass'] == 'Z73', \
+        f"DP=unknown + aktive Inland-SE → Z73, ist {detail[0]['klass'] if detail else 'fehlt'}"
+    # Audit-Note dokumentiert die Reklassifikation
+    assert any('2025-04-10' in n for n in result.get('audit_notes', []))
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

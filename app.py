@@ -1190,7 +1190,10 @@ def _run_process_async(job_id, form, files):
             _audit(job_id, 'classification_detail', {
                 'summary':  result.get('_klass_summary'),
                 'nachweis': (result.get('_nachweis') or '')[:2000],
-                'unklare_tage': result.get('_unklare_tage'),
+                'unklare_tage':     result.get('_unklare_tage'),
+                'audit_notes':      result.get('_audit_notes') or [],
+                'unresolved_days':  result.get('_unresolved_days') or [],
+                'vma_unmapped_se':  result.get('_vma_unmapped_se') or [],
                 'tage_detail': _tage_detail,
             })
 
@@ -2416,8 +2419,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '7.4',
-        'build':   'simplified-form-no-tax-class-no-zweitwohnung-2026-05-09',
+        'version': '7.5',
+        'build':   'vma-mapping-audit-notes-vs-unresolved-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -6108,6 +6111,10 @@ def _match_dp_se_per_day(structured_days, se_structured):
 def _belongs_to_previous_tour(day_match, prev_match, prev_cluster):
     """True wenn day_match ein nachklingender Abreise/Stop-Over-Tag der vorherigen
     Tour ist. Wird nach _build_tour_clusters aufgerufen um Cluster zu erweitern.
+
+    v7.5: Erweitert um Heimkehr-Tag-Erkennung ohne aktive SE — wenn der Cluster
+    Auslands-Layover hatte und heute ein 'tour'/'unknown'-Tag OHNE neue Übernachtung
+    kommt, ist das fast sicher der Heimkehrtag (BLR/HKG/BOS-Pattern).
     """
     if not prev_match or not prev_cluster:
         return False
@@ -6120,11 +6127,11 @@ def _belongs_to_previous_tour(day_match, prev_match, prev_cluster):
     # Vortag muss aktive Tour-Übernachtung gewesen sein
     if not prev_d.get('overnight_after_day'):
         return False
-    # Heutiger Tag darf keinen NEUEN Tour-Start haben (kein neuer Cluster)
     today_at = d.get('activity_type', '')
-    if today_at in ('frei', 'urlaub', 'krank'):
+    today_overnight = bool(d.get('overnight_after_day'))
+    # Heutiger Tag mit eigener Klassifikation (nicht-tour Aktivität): nicht anhängen
+    if today_at in ('frei', 'urlaub', 'krank', 'standby', 'office', 'training', 'same_day'):
         return False
-    # Heutiger Tag mit aktiver SE-Zeile?
     has_active_se = se.get('count', 0) > 0 and se.get('stfrei_total', 0) > 0
     if has_active_se:
         # Heutige SE-Ort = Vortag-Layover-Ort? (Abreisetag aus Layover)
@@ -6136,15 +6143,19 @@ def _belongs_to_previous_tour(day_match, prev_match, prev_cluster):
         if se.get('stfrei_inland') is False and prev_cluster.get('has_foreign'):
             return True
         # Heutige SE Inland-Ort + prev Auslands-Layover + heute kein overnight → Heimkehr-Tag
-        if se.get('stfrei_inland') is True and prev_cluster.get('has_foreign') and not d.get('overnight_after_day'):
+        if se.get('stfrei_inland') is True and prev_cluster.get('has_foreign') and not today_overnight:
             return True
-    # DP-Routing: beginnt am vorherigen Layover, endet am Homebase?
+    # DP-Routing: beginnt am vorherigen Layover?
     today_routing = d.get('routing') or []
     prev_layover = prev_se.get('stfrei_ort') or prev_d.get('layover_ort', '')
     if today_routing and prev_layover:
         first = (today_routing[0] or '').upper() if today_routing else ''
         if first == prev_layover.upper():
             return True
+    # NEU v7.5: Heimkehr-Pattern ohne aktive SE — tour/unknown nach Auslands-Layover
+    # ohne neue Übernachtung. Cabin-Crew-Heimkehr von Langstrecken (BLR/HKG/BOS etc.)
+    if (not today_overnight) and prev_cluster.get('has_foreign') and today_at in ('tour', 'unknown', 'none', ''):
+        return True
     return False
 
 
@@ -6197,92 +6208,151 @@ def _build_tour_clusters(sorted_days):
         clusters.append(current)
 
     # PHASE 2: Cluster nach hinten erweitern — bei nachklingenden Abreise-/Heimkehr-Tagen
+    # v7.5: erlaube bis zu 2 frei/urlaub/krank Tage zwischen Cluster-Ende und Heimkehr
+    # (DP-Reader liest Layover-Tage manchmal als 'frei' — Heimkehr darf trotzdem anhängen).
     cluster_by_idx = {}
     for c in clusters:
         for i in c['indices']:
             cluster_by_idx[i] = c
     for c in clusters:
-        # Schau auf den Tag NACH dem letzten Index
-        last_idx = c['indices'][-1] if c['indices'] else None
-        if last_idx is None:
+        last_idx_in_cluster = c['indices'][-1] if c['indices'] else None
+        if last_idx_in_cluster is None:
             continue
-        next_idx = last_idx + 1
-        # Bis zu 2 Folgetage prüfen
-        for offset in range(1, 3):
-            check_idx = last_idx + offset
+        # bis zu 4 Folgetage scannen, frei/urlaub/krank überspringen
+        cur_anchor = last_idx_in_cluster
+        for offset in range(1, 5):
+            check_idx = last_idx_in_cluster + offset
             if check_idx >= len(sorted_days):
                 break
             if check_idx in cluster_by_idx:
-                break  # gehört bereits zu einem (anderen) Cluster
+                break
             day_match = sorted_days[check_idx]
-            prev_match = sorted_days[last_idx]
+            today_at = day_match['dp'].get('activity_type', '')
+            if today_at in ('frei', 'urlaub', 'krank'):
+                # Lücke — überspringen, aber nicht abbrechen
+                continue
+            prev_match = sorted_days[cur_anchor]
             if _belongs_to_previous_tour(day_match, prev_match, c):
-                # Anhängen
                 c['indices'].append(check_idx)
                 c['abreise_idx'] = check_idx
                 cluster_by_idx[check_idx] = c
                 _absorb_layover_info(c, day_match)
-                last_idx = check_idx
+                cur_anchor = check_idx
                 datum = day_match.get('datum', '')
                 print(f"[v7-cluster-extend] datum={datum} cluster={c.get('_id', '?')} "
-                      f"reason='SE/DP belongs to previous layover'")
+                      f"at={today_at} reason='nachklingender Abreise-/Heimkehr-Tag'")
             else:
                 break
     return clusters
 
 
 def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
-    """v7.0 Backend-Klassifikator: deterministisch aus DP+SE pro Tag.
-    Liefert dict mit z72_tage/z73_tage/z74_tage/z76_eur + tage_detail + unklare_tage.
+    """v7.5 Backend-Klassifikator: deterministisch aus DP+SE pro Tag.
 
-    KORRIGIERTE Tour-Logik (v7.0.2):
-    SE.stfrei_inland=true bedeutet NICHT automatisch Z73. Ein FRA-Stempel auf
-    einem Auslandstour-Anreisetag ist normal. Tour wird daher als CLUSTER
-    klassifiziert: dominante Übernachtung im Cluster bestimmt Inland-vs-Ausland.
+    Architektur (v7.5):
+    1. Tour-Cluster bilden (Phase 1: tour-Tage; Phase 2: Heimkehr-Anhang)
+    2. Pro Tag → klass + eur + reason setzen, audit_note (informativ) ODER
+       unresolved_reason (echter Issue) optional
+    3. Counter aus klass am Ende aggregieren — kein arbeitstage += 1 im Loop
+    4. VMA-Unmapped-SE-Liste: aktive SE-Zeile ohne Z72/73/74/76 → echter Issue
 
-    Regel-Priorität:
-    1. frei/urlaub/krank → kein VMA, nicht zählen
-    2. standby → AT, kein FT, kein VMA
-    3. office → AT, FT, kein VMA
-    4. training Inland mit Hotel → Z73 An/Abreise; Volltag → Office
-       training Homebase ohne Hotel → Office
-    5. same_day → Z72 (Hard-Gate)
-    6. tour:
-       Tour-Cluster mit Auslands-Layover irgendwo → Z76 für ALLE Tour-Tage
-         (mit BMF-Pauschale; An/Abreise vs Volltag-Satz)
-       Tour-Cluster nur Inland-Layover → Z73 An/Abreise, Volltage Office
-       Tour-Cluster ohne erkennbaren Layover → Audit-Issue
-    7. Audit-Issues: Mismatch SE↔DP, ungewöhnliche Konstellationen
+    Klassen-Set: Z72, Z73, Z74, Z76, Office, Standby, ZeroDay, Sonstiges
+    Counter-Mapping:
+      arbeitstage = klass in {Z72,Z73,Z74,Z76,Office,Standby,ZeroDay}
+      fahr_tage   = klass in {Z72,Office,training-anreise,training-abreise,Z73-anreise,Z73-abreise,Z76-anreise}
+      hotel       = klass in {Z73,Z74,Z76,Office-Inland-Volltag} UND overnight=True
     """
     bmf_inland = BMF_INLAND_BY_YEAR.get(year, BMF_INLAND_BY_YEAR[2025])
-    NICHT_AT = {'frei', 'urlaub', 'krank', 'unknown', 'none'}
+    INLAND_TAGESTRIP_8H = bmf_inland['tagestrip_8h']
+    INLAND_AN_ABREISE = bmf_inland['an_abreise']
+    INLAND_VOLL_24H = bmf_inland['voll_24h']
 
-    # Sortiert nach Datum für Vortag/Folgetag-Lookups
     sorted_days = sorted(matched_days, key=lambda m: m.get('datum', ''))
-    by_date = {m['datum']: i for i, m in enumerate(sorted_days)}
-
-    # Tour-Cluster bilden (zusammenhängende Tour-Sequenzen)
     tour_clusters = _build_tour_clusters(sorted_days)
-    cluster_for_idx = {}  # index → cluster
+    cluster_for_idx = {}
     for c_id, c in enumerate(tour_clusters):
         c['_id'] = c_id
         for i in c['indices']:
             cluster_for_idx[i] = c
-        # Logging pro Cluster
         mixed = c.get('has_foreign') and c.get('has_inland')
         print(f"[v7-cluster] id={c_id} days={len(c['indices'])} "
               f"has_foreign={c.get('has_foreign')} has_inland={c.get('has_inland')} "
               f"mixed={mixed}")
 
-    z72_tage = 0
-    z73_tage = 0
-    z74_tage = 0
-    z76_eur = 0.0
-    arbeitstage = 0
-    fahr_tage = 0
-    hotel_naechte = 0
-    unklare = []
+    audit_notes = []        # informativ (z.B. FRA-Stempel bei Auslandstour)
+    unresolved_days = []    # echte Issues (klass=Sonstiges mit Grund)
+    vma_unmapped_se = []    # aktive SE-Zeile ohne VMA-Klassifikation
     tage_detail = []
+    z76_eur = 0.0
+
+    def _recent_foreign_cluster(idx, max_back=4):
+        """Schaut bis max_back Tage zurück nach geschlossenem has_foreign Cluster."""
+        for back in range(1, max_back + 1):
+            bi = idx - back
+            if bi < 0:
+                return None
+            bc = cluster_for_idx.get(bi)
+            if bc and bc.get('has_foreign'):
+                return bc
+        return None
+
+    def _resolve_isolated_tour_day(i, m, d, se):
+        """Same-Day/Heimkehr-Auflösung für isolierte Tour-Tage (kein Cluster, kein
+        prev_overnight). Liefert (klass, eur, reason, audit_note_or_None,
+        unresolved_reason_or_None)."""
+        datum = m['datum']
+        has_fl = bool(d.get('has_fl'))
+        routing = d.get('routing') or []
+        has_active_se = se.get('count', 0) > 0 and float(se.get('stfrei_total', 0) or 0) > 0
+        se_ort = se.get('stfrei_ort', '')
+        se_inland = se.get('stfrei_inland')
+
+        # 1. Recent-Foreign-Cluster Lookback (Heimkehr aus Langstrecke)
+        rec = _recent_foreign_cluster(i, max_back=4)
+        if rec:
+            target_iata = ''
+            for ci in rec.get('indices', []):
+                cm = sorted_days[ci]
+                if cm['dp'].get('overnight_after_day'):
+                    cand = cm['se'].get('stfrei_ort') or cm['dp'].get('layover_ort', '')
+                    if cand and not _is_inland_code(cand):
+                        target_iata = cand
+                        break
+            bmf_aus = _get_bmf_for_iata(target_iata, year)
+            satz = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+            return ('Z76', satz,
+                    f'Heimkehr aus Auslands-Cluster (Layover {target_iata or "?"}) Z76 An/Ab',
+                    f'{datum}: tour-Tag isoliert, Heimkehr aus Auslands-Cluster {target_iata or "?"} → Z76',
+                    None)
+
+        # 2. Aktive SE-Zeile vorhanden
+        if has_active_se and se_ort:
+            if se_inland is False:
+                bmf_aus = _get_bmf_for_iata(se_ort, year)
+                satz = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+                return ('Z76', satz,
+                        f'Aktive Auslands-SE {se_ort} (Same-Day) Z76',
+                        f'{datum}: aktive Auslands-SE {se_ort} ohne Cluster → Z76 Same-Day',
+                        None)
+            elif se_inland is True:
+                # Inland-Same-Day mit aktiver SE > 8h plausibel
+                return ('Z72', INLAND_TAGESTRIP_8H,
+                        f'Aktive Inland-SE {se_ort} Same-Day (>8h) Z72',
+                        None,
+                        None)
+
+        # 3. DP-Indizien: FL-Marker oder Multi-Stop-Routing → >8h plausibel
+        if has_fl or len(routing) >= 2:
+            return ('Z72', INLAND_TAGESTRIP_8H,
+                    f'Tour-Tag isoliert mit FL/Routing — Same-Day Z72',
+                    None,
+                    None)
+
+        # 4. Sonst: 0€-Day (Arbeitstag aber keine VMA-Pauschale, keine echte Auswärts-Tätigkeit)
+        return ('ZeroDay', 0.0,
+                'Tour-Tag isoliert, keine FL/SE/Cluster-Spur — kein VMA',
+                None,
+                None)
 
     for i, m in enumerate(sorted_days):
         d = m['dp']
@@ -6291,108 +6361,98 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
         at = d.get('activity_type', 'unknown')
         overnight = bool(d.get('overnight_after_day'))
         has_fl = bool(d.get('has_fl'))
-
-        # Vortag/Folgetag holen
         prev = sorted_days[i-1] if i > 0 else None
         next_ = sorted_days[i+1] if i+1 < len(sorted_days) else None
         prev_overnight = bool(prev and prev['dp'].get('overnight_after_day'))
         prev_at = prev['dp'].get('activity_type', '') if prev else ''
+        next_overnight = bool(next_ and next_['dp'].get('overnight_after_day'))
 
-        # Cluster-Extend: wenn dieser Tag durch _belongs_to_previous_tour zu einer
-        # Tour gehört (z.B. Heimkehr-Tag den Sonnet als 'unknown' klassifiziert hat),
-        # behandele ihn als 'tour' für die Klassifikation.
-        in_extended_cluster = (i in cluster_for_idx) and at in NICHT_AT
-
-        # Hotel-Nacht zählen
-        if overnight:
-            hotel_naechte += 1
-
-        # Frei/Urlaub/Krank: nichts (außer Cluster-Extend greift)
-        if at in NICHT_AT and not in_extended_cluster:
-            continue
-
-        arbeitstage += 1
-        klass = 'Sonstiges'
-        begruendung = ''
-        eur_added = 0.0
-
-        # Wenn Cluster-Extend: as ob 'tour'
+        # Cluster-Extend: Tag durch _belongs_to_previous_tour angehängt → behandeln als 'tour'
+        in_extended_cluster = (i in cluster_for_idx) and at not in ('tour', 'same_day', 'office', 'training', 'standby')
         if in_extended_cluster:
             at = 'tour'
 
-        # Klassifikation
+        klass = 'Sonstiges'
+        eur_added = 0.0
+        reason = ''
+        audit_note = None
+        unresolved_reason = None
+
+        if at in ('frei', 'urlaub', 'krank'):
+            klass = 'Frei'
+            reason = at
+            tage_detail.append({
+                'datum': datum, 'klass': klass, 'begruendung': reason,
+                'marker': d.get('raw_marker', '') or at,
+                'routing': '-'.join(d.get('routing') or []),
+                'tour_dauer': 1, 'eur': 0.0,
+            })
+            continue
+
         if at == 'standby':
             klass = 'Standby'
-            begruendung = 'Standby zuhause — AT, kein FT, kein VMA'
+            reason = 'Standby zuhause — AT, kein FT, kein VMA'
 
         elif at == 'office':
             klass = 'Office'
-            begruendung = 'Office am Homebase — täglich Anfahrt'
-            fahr_tage += 1
+            reason = 'Office am Homebase — AT + FT'
 
         elif at == 'training':
             if overnight and prev_at != 'training':
-                # Anreise zur Schulung
                 klass = 'Z73'
-                begruendung = 'Schulung mit Hotel — Anreisetag'
-                z73_tage += 1
-                eur_added = bmf_inland['an_abreise']
-                fahr_tage += 1
+                reason = 'Schulung mit Hotel — Anreise'
+                eur_added = INLAND_AN_ABREISE
             elif (not overnight) and prev_at == 'training' and prev_overnight:
-                # Abreise von der Schulung
                 klass = 'Z73'
-                begruendung = 'Schulung mit Hotel — Abreisetag'
-                z73_tage += 1
-                eur_added = bmf_inland['an_abreise']
+                reason = 'Schulung mit Hotel — Abreise'
+                eur_added = INLAND_AN_ABREISE
             elif overnight and prev_at == 'training':
-                # Volltag mitten in Schulung — kein VMA, nur AT
-                klass = 'Office'
-                begruendung = 'Schulung mit Hotel — Volltag (kein VMA)'
+                klass = 'Z74' if True else 'Office'  # Volltag in Inland-Schulung mit Hotel = 24h Inland
+                reason = 'Schulung mit Hotel — Volltag (Z74 24h)'
+                eur_added = INLAND_VOLL_24H
             else:
-                # Eintägige Schulung am Homebase oder eindeutig keine Übernachtung
                 klass = 'Office'
-                begruendung = 'Schulung am Homebase'
-                fahr_tage += 1
+                reason = 'Schulung am Homebase'
 
         elif at == 'same_day':
-            # Z72-Hard-Gate
+            # Z72-Hard-Gate: kein FL, kein overnight, kein prev_overnight, nicht in Cluster
+            in_cluster = i in cluster_for_idx
+            cluster_today = cluster_for_idx.get(i)
             if has_fl or overnight:
                 klass = 'Sonstiges'
-                begruendung = 'Same-Day verletzt Hard-Gate (FL oder overnight)'
-                unklare.append(f'{datum}: same_day mit has_fl={has_fl} overnight={overnight}')
+                reason = 'Same-Day verletzt Hard-Gate (FL oder overnight)'
+                unresolved_reason = f'same_day mit has_fl={has_fl} overnight={overnight}'
             elif prev_overnight:
-                # Heimkehr aus Vortag-Tour — kein zusätzliches Z72
                 klass = 'Sonstiges'
-                begruendung = 'Heimkehr aus mehrtägiger Tour (Mischfall) — separater Tour-Abschluss'
+                reason = 'Heimkehr aus Vortag-Tour — separater Tour-Abschluss'
+                unresolved_reason = 'same_day nach prev_overnight (Mischfall)'
+            elif in_cluster and cluster_today and cluster_today.get('has_foreign'):
+                # Same-Day in Auslands-Cluster: Anreise-Tag der Auslandstour
+                klass = 'Z76'
+                eur_added = 28.0
+                reason = 'Same-Day im Auslands-Cluster (Z76 An/Ab)'
+                audit_note = f'{datum}: same_day im Auslands-Cluster — als Z76 klassifiziert'
+            elif in_cluster and cluster_today and cluster_today.get('has_inland'):
+                klass = 'Z73'
+                eur_added = INLAND_AN_ABREISE
+                reason = 'Same-Day im Inland-Cluster (Z73 An/Ab)'
             else:
                 klass = 'Z72'
-                begruendung = 'Same-Day-Tagestrip — A+E selber Tag, kein FL'
-                z72_tage += 1
-                eur_added = bmf_inland['tagestrip_8h']
-                fahr_tage += 1
+                eur_added = INLAND_TAGESTRIP_8H
+                reason = 'Same-Day-Tagestrip — A+E selber Tag, kein FL'
 
         elif at == 'tour':
-            # v7.0.3: Tagweise Klassifikation. Cluster nur Kontext für Anreise-Tage
-            # ohne eindeutigen heutigen Layover-Ort. Mixed-Cluster werden Tag-für-Tag
-            # zerlegt — Inland-Tag mitten in Auslandstour bleibt Inland.
             cluster = cluster_for_idx.get(i)
             cluster_foreign = bool(cluster and cluster.get('has_foreign'))
             cluster_inland = bool(cluster and cluster.get('has_inland'))
             cluster_mixed = cluster_foreign and cluster_inland
-
-            # Cluster-Position (Anreise = erster, Abreise = letzter Tag im Cluster)
             is_anreise = bool(cluster and cluster.get('indices') and i == cluster['indices'][0])
             is_abreise = bool(cluster and cluster.get('indices') and i == cluster['indices'][-1])
-            if is_anreise:
-                fahr_tage += 1
 
-            # Heutiger Layover-Ort/Land (wo User HEUTE Nacht schläft)
             today_layover_ort = se.get('stfrei_ort') or d.get('layover_ort', '') or ''
             today_layover_inland = None
             if overnight and today_layover_ort:
                 today_layover_inland = _is_inland_code(today_layover_ort)
-
-            # Vortag-Layover (wo User letzte Nacht schlief)
             yesterday_layover_ort = ''
             yesterday_layover_inland = None
             if prev and prev_overnight:
@@ -6400,35 +6460,22 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
                 if yesterday_layover_ort:
                     yesterday_layover_inland = _is_inland_code(yesterday_layover_ort)
 
-            # Folgetag-Layover (für Z74-Erkennung: 24h Inland)
-            next_layover_inland = None
-            if next_ and next_['dp'].get('overnight_after_day'):
-                n_ort = next_['se'].get('stfrei_ort') or next_['dp'].get('layover_ort', '') or ''
-                if n_ort:
-                    next_layover_inland = _is_inland_code(n_ort)
-
             classified = False
 
-            # ─── Fall A: Heute Übernachtung mit eindeutigem Layover-Ort ───
+            # ─── Fall A: Heute Übernachtung ───
             if overnight and today_layover_inland is False:
-                # Auslands-Layover heute → Z76
                 klass = 'Z76'
                 bmf_aus = _get_bmf_for_iata(today_layover_ort, year)
-                # An/Ab: aus Cluster-Position; Volltag sonst
                 if is_anreise or is_abreise:
                     satz = (bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0)
                 else:
                     satz = (bmf_aus.get('voll_24h', 0) if bmf_aus else 28.0)
                 eur_added = float(satz or 0)
-                z76_eur += eur_added
-                begruendung = f'Auslands-Layover {today_layover_ort} (Z76 {"An/Ab" if (is_anreise or is_abreise) else "Volltag"})'
+                reason = f'Auslands-Layover {today_layover_ort} (Z76 {"An/Ab" if (is_anreise or is_abreise) else "Volltag"})'
                 classified = True
 
             elif overnight and today_layover_inland is True:
                 is_volltag = not (is_anreise or is_abreise)
-
-                # Spezialfall: Cluster hat Auslands-Layover (Mixed oder Foreign)
-                # UND heute Inland — Anreise-Tag ist hier Auslandstour-Anreise mit FRA-Stempel
                 if cluster_foreign and is_anreise:
                     # Auslandstour-Anreise mit Inland-Stempel — Z76 mit Ziel-Land
                     target_iata = ''
@@ -6442,184 +6489,227 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
                     klass = 'Z76'
                     bmf_aus = _get_bmf_for_iata(target_iata, year)
                     eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
-                    z76_eur += eur_added
-                    begruendung = f'Auslandstour-Anreise (Stempel {today_layover_ort}, Ziel {target_iata or "?"}) Z76'
-                    unklare.append(f'{datum}: Inland-SE-Stempel {today_layover_ort} bei Auslands-Cluster — als Auslandstour-Anreise (Z76)')
-                # Inland-Volltag (Mittel-Tag in Tour) → Office (nur AT, kein VMA)
-                # Z74 nur bei echtem 24h-Inland: Volltag UND prev+next auch Inland
-                elif is_volltag and yesterday_layover_inland is True and next_layover_inland is True:
+                    reason = f'Auslandstour-Anreise (Stempel {today_layover_ort}, Ziel {target_iata or "?"}) Z76'
+                    audit_note = f'{datum}: Inland-SE-Stempel {today_layover_ort} bei Auslands-Cluster — als Z76 An/Ab'
+                elif is_volltag:
+                    # v7.5: Z74 für jeden Inland-Volltag im Cluster (egal Mixed oder reiner Inland)
                     klass = 'Z74'
-                    z74_tage += 1
-                    eur_added = bmf_inland['voll_24h']
-                    begruendung = f'Inland-24h {today_layover_ort} (Z74) zwischen Inland-Layovern'
-                elif is_volltag and not cluster_foreign:
-                    # Reiner Inland-Cluster Volltag → Office (kein VMA)
-                    klass = 'Office'
-                    begruendung = f'Inland-Mittel-Tag {today_layover_ort} (kein VMA)'
+                    eur_added = INLAND_VOLL_24H
+                    reason = f'Inland-Mittel-Tag {today_layover_ort} (Z74 24h)'
                 else:
-                    # Inland-An/Abreise (Z73) — auch Mixed-Cluster: echte Inland-Übernachtung
                     klass = 'Z73'
-                    z73_tage += 1
-                    eur_added = bmf_inland['an_abreise']
-                    if cluster_mixed:
-                        begruendung = f'Inland-Layover {today_layover_ort} im Mixed-Cluster (Z73)'
-                    else:
-                        begruendung = f'Inland-Layover {today_layover_ort} (Z73)'
+                    eur_added = INLAND_AN_ABREISE
+                    reason = f'Inland-Layover {today_layover_ort} (Z73 An/Ab{"" if not cluster_mixed else " im Mixed"})'
                 classified = True
 
             elif overnight and today_layover_inland is None:
-                # Heute Übernachtung aber Ort unbekannt — Cluster-Kontext für Schätzung
                 if cluster_foreign and not cluster_inland:
                     klass = 'Z76'
                     eur_added = 28.0
-                    z76_eur += eur_added
-                    begruendung = 'Tour-Übernachtung ohne Ort (Cluster=Ausland)'
-                    unklare.append(f'{datum}: overnight=true, kein Layover-Ort, Cluster Ausland → Z76 28€')
+                    reason = 'Tour-Übernachtung ohne Ort (Cluster=Ausland)'
+                    audit_note = f'{datum}: overnight ohne Layover-Ort, Cluster Ausland → Z76 28€'
                 elif cluster_inland and not cluster_foreign:
-                    klass = 'Z73' if (is_anreise or is_abreise) else 'Office'
-                    if klass == 'Z73':
-                        z73_tage += 1
-                        eur_added = bmf_inland['an_abreise']
-                    begruendung = 'Tour-Übernachtung ohne Ort (Cluster=Inland)'
-                    unklare.append(f'{datum}: overnight=true, kein Layover-Ort, Cluster Inland → konservativ')
+                    if is_anreise or is_abreise:
+                        klass = 'Z73'
+                        eur_added = INLAND_AN_ABREISE
+                    else:
+                        klass = 'Z74'
+                        eur_added = INLAND_VOLL_24H
+                    reason = 'Tour-Übernachtung ohne Ort (Cluster=Inland)'
+                    audit_note = f'{datum}: overnight ohne Ort, Cluster Inland → konservativ'
                 else:
                     klass = 'Sonstiges'
-                    begruendung = 'Tour-Übernachtung ohne Ort, kein Cluster-Kontext'
-                    unklare.append(f'{datum}: overnight=true, kein Layover-Ort, kein Cluster-Kontext')
+                    reason = 'Tour-Übernachtung ohne Ort, kein Cluster-Kontext'
+                    unresolved_reason = 'overnight=true, kein Layover-Ort, kein Cluster-Kontext'
                 classified = True
 
-            # ─── Fall B: Heute KEINE Übernachtung — Heimkehr-Tag oder Same-Day ───
+            # ─── Fall B: Heute KEINE Übernachtung — Heimkehr ───
             elif (not overnight) and prev_overnight:
-                # User kommt aus mehrtägiger Tour heim — Klassifikation aus Vortag-Layover
                 if yesterday_layover_inland is False:
                     klass = 'Z76'
                     bmf_aus = _get_bmf_for_iata(yesterday_layover_ort, year)
                     eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
-                    z76_eur += eur_added
-                    begruendung = f'Auslandstour Abreise (Vortag in {yesterday_layover_ort}) (Z76)'
+                    reason = f'Auslands-Heimkehr (Vortag {yesterday_layover_ort}) Z76'
                 elif yesterday_layover_inland is True:
                     klass = 'Z73'
-                    z73_tage += 1
-                    eur_added = bmf_inland['an_abreise']
-                    begruendung = f'Inland-Abreise (Vortag in {yesterday_layover_ort}) (Z73)'
+                    eur_added = INLAND_AN_ABREISE
+                    reason = f'Inland-Heimkehr (Vortag {yesterday_layover_ort}) Z73'
                 else:
-                    klass = 'Sonstiges'
-                    begruendung = 'Heimkehr aus Tour, Vortag-Layover unklar'
-                    unklare.append(f'{datum}: Heimkehr aus Tour aber kein Vortag-Layover-Ort')
+                    # Vortag-Layover-Ort unbekannt — Cluster-Kontext nutzen
+                    cluster_prev = cluster_for_idx.get(i - 1) if i > 0 else None
+                    if cluster_prev and cluster_prev.get('has_foreign'):
+                        klass = 'Z76'
+                        eur_added = 28.0
+                        reason = 'Heimkehr aus Auslands-Cluster (Vortag-Ort unklar)'
+                        audit_note = f'{datum}: Heimkehr ohne Vortag-Ort, Cluster Ausland → Z76 28€'
+                    else:
+                        klass = 'Sonstiges'
+                        reason = 'Heimkehr — Vortag-Layover unklar'
+                        unresolved_reason = 'Heimkehr ohne Vortag-Layover-Ort und ohne Cluster-Kontext'
                 classified = True
 
+            # ─── Fall C: kein overnight, kein prev_overnight ───
             elif (not overnight) and (not prev_overnight):
-                # Tour-Tag ohne overnight UND ohne Vortag-overnight = Anreise eines
-                # 1-Tage-Trips ODER eines Mixed-Cluster-Anreise. Cluster-Kontext nutzen.
                 if cluster_foreign:
                     klass = 'Z76'
                     eur_added = 28.0
-                    z76_eur += eur_added
-                    begruendung = 'Tour-Tag im Auslands-Cluster (Anreise oder Stop-Over)'
-                    unklare.append(f'{datum}: tour ohne overnight, Cluster=Ausland → konservativ Z76')
+                    reason = 'Tour-Tag im Auslands-Cluster (An/Stop)'
+                    audit_note = f'{datum}: tour ohne overnight im Auslands-Cluster → Z76 28€'
                 elif cluster_inland:
-                    # Same-Day-Inland-Trip (z.B. innerhalb Multi-Stop-Cluster)
-                    klass = 'Z72'
-                    z72_tage += 1
-                    eur_added = bmf_inland['tagestrip_8h']
-                    begruendung = 'Inland-Same-Day im Tour-Cluster (Z72)'
+                    klass = 'Z73'
+                    eur_added = INLAND_AN_ABREISE
+                    reason = 'Tour-Tag im Inland-Cluster (An/Stop)'
                 else:
-                    klass = 'Sonstiges'
-                    begruendung = 'Tour ohne Übernachtung und ohne Cluster-Kontext'
-                    unklare.append(f'{datum}: tour ohne overnight, kein Cluster-Kontext')
+                    # ECHT isoliert — Same-Day-Heuristik
+                    k, e, r, a, u = _resolve_isolated_tour_day(i, m, d, se)
+                    klass, eur_added, reason = k, e, r
+                    if a:
+                        audit_note = a
+                    if u:
+                        unresolved_reason = u
+                    print(f"[v7-daytrip-resolved] datum={datum} klass={klass} eur={eur_added:.2f} reason='{reason[:80]}'")
                 classified = True
 
             if not classified:
                 klass = 'Sonstiges'
-                begruendung = 'tour-Tag konnte nicht klassifiziert werden'
-                unklare.append(f'{datum}: tour ohne klare Klassifikations-Spur')
+                reason = 'tour-Tag konnte nicht klassifiziert werden'
+                unresolved_reason = 'tour ohne klare Klassifikations-Spur'
 
-            # Logging pro Tour-Tag (auf Anfrage)
-            cluster_id = cluster['indices'][0] if cluster else -1
-            print(f"[v7-classify-day] datum={datum} cluster={cluster_id} ort={today_layover_ort or '-'} klass={klass} reason='{begruendung[:80]}'")
+            cluster_id = cluster['_id'] if cluster else -1
+            print(f"[v7-classify-day] datum={datum} cluster={cluster_id} ort={today_layover_ort or '-'} klass={klass} reason='{reason[:80]}'")
 
         else:
-            # unknown / Sonstiges — aber wenn aktive SE-Zeile vorhanden ist,
-            # erzwinge Klassifikation aus SE+Cluster-Kontext
+            # at='unknown'/'none' und nicht in Cluster — aktive SE → Re-Klassifikation
             has_active_se = se.get('count', 0) > 0 and float(se.get('stfrei_total', 0) or 0) > 0
-            cluster_for_today = cluster_for_idx.get(i)
-
             if has_active_se:
-                # Reklassifikation aus SE-Kontext
                 se_ort = se.get('stfrei_ort', '')
                 se_inland = se.get('stfrei_inland')
-                cluster_foreign = bool(cluster_for_today and cluster_for_today.get('has_foreign'))
-
                 if se_inland is False:
-                    # Auslands-SE → Z76
-                    klass = 'Z76'
                     bmf_aus = _get_bmf_for_iata(se_ort, year)
-                    eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
-                    z76_eur += eur_added
-                    begruendung = f'Aktive SE-Zeile {se_ort} (Auslands-Reklassifikation aus {at})'
-                    unklare.append(f'{datum}: activity_type={at} mit aktiver Auslands-SE → Z76 ({se_ort})')
-                elif se_inland is True and cluster_foreign:
-                    # FRA-Stempel im Auslands-Cluster → Auslandstour-Abreise
-                    target_iata = ''
-                    for ci in cluster_for_today.get('indices', []):
-                        cm = sorted_days[ci]
-                        if cm['dp'].get('overnight_after_day'):
-                            cand = cm['se'].get('stfrei_ort') or cm['dp'].get('layover_ort', '')
-                            if cand and not _is_inland_code(cand):
-                                target_iata = cand
-                                break
+                    satz = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
                     klass = 'Z76'
-                    bmf_aus = _get_bmf_for_iata(target_iata, year)
-                    eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
-                    z76_eur += eur_added
-                    begruendung = f'Aktive SE-Zeile {se_ort} im Auslands-Cluster (Abreise nach {target_iata or "?"}) Z76'
-                    unklare.append(f'{datum}: SE-Stempel {se_ort} bei Auslands-Cluster (Abreisetag) → Z76')
+                    eur_added = satz
+                    reason = f'Aktive Auslands-SE {se_ort} (DP={at}) Z76'
+                    audit_note = f'{datum}: DP={at} mit aktiver Auslands-SE {se_ort} → Z76'
                 elif se_inland is True:
-                    # Inland-SE ohne Auslands-Cluster → Z73
                     klass = 'Z73'
-                    z73_tage += 1
-                    eur_added = bmf_inland['an_abreise']
-                    begruendung = f'Aktive Inland-SE-Zeile {se_ort} (Reklassifikation aus {at}) Z73'
-                    unklare.append(f'{datum}: activity_type={at} mit aktiver Inland-SE → Z73 ({se_ort})')
+                    eur_added = INLAND_AN_ABREISE
+                    reason = f'Aktive Inland-SE {se_ort} (DP={at}) Z73'
+                    audit_note = f'{datum}: DP={at} mit aktiver Inland-SE {se_ort} → Z73'
                 else:
                     klass = 'Sonstiges'
-                    begruendung = f'Aktive SE-Zeile {se_ort}, aber Kontext unklar (activity_type={at})'
-                    unklare.append(f'{datum}: aktive SE-Zeile, aber Klassifikation unklar — manuell prüfen')
-                # Arbeitstag/Fahrtag korrigieren wenn fälschlich nicht gezählt
-                # (aber wir haben schon arbeitstage += 1 oben gemacht, weil at NICHT in NICHT_AT)
+                    reason = f'Aktive SE {se_ort} aber Inland/Ausland unklar'
+                    unresolved_reason = f'aktive SE-Zeile ohne stfrei_inland-Klarheit (DP={at})'
             else:
-                klass = 'Sonstiges'
-                begruendung = f'Activity-Type {at} — unklar'
-                unklare.append(f'{datum}: activity_type={at} unklar')
+                klass = 'ZeroDay' if at in ('unknown', 'none', '') else 'Sonstiges'
+                reason = f'Activity-Type {at} ohne SE/Cluster-Spur'
+                if klass == 'Sonstiges':
+                    unresolved_reason = f'activity_type={at} unklar'
+
+        # VMA-Unmapped-SE-Check: aktive SE ohne Z72/73/74/76?
+        has_active_se_final = se.get('count', 0) > 0 and float(se.get('stfrei_total', 0) or 0) > 0
+        if has_active_se_final and klass not in ('Z72', 'Z73', 'Z74', 'Z76'):
+            vma_unmapped_se.append({
+                'datum': datum,
+                'stfrei_ort': se.get('stfrei_ort', ''),
+                'stfrei_total': se.get('stfrei_total', 0),
+                'zwoelftel': se.get('zwoelftel', 0),
+                'klass': klass,
+                'reason': reason,
+                'lines_count': se.get('count', 0),
+            })
+            print(f"[v7-vma-unmapped-se] datum={datum} ort={se.get('stfrei_ort','')} "
+                  f"betrag={se.get('stfrei_total',0):.2f} klass={klass} reason='{reason[:60]}'")
+            unresolved_reason = unresolved_reason or f'aktive SE-Zeile ohne VMA-Klassifikation (klass={klass})'
+
+        if audit_note:
+            audit_notes.append(audit_note)
+        if unresolved_reason:
+            unresolved_days.append(f'{datum}: {unresolved_reason}')
+            print(f"[v7-unresolved-day] datum={datum} marker={d.get('raw_marker','') or at} "
+                  f"routing={'-'.join(d.get('routing') or [])} se_count={se.get('count',0)} "
+                  f"se_ort={se.get('stfrei_ort','')} reason='{unresolved_reason}'")
 
         tage_detail.append({
             'datum': datum,
             'klass': klass,
-            'begruendung': begruendung,
+            'begruendung': reason,
             'marker': d.get('raw_marker', '') or at,
             'routing': '-'.join(d.get('routing') or []),
             'tour_dauer': 1,
             'eur': round(eur_added, 2),
         })
 
-    # EUR-Berechnung
-    z72_eur = round(z72_tage * bmf_inland['tagestrip_8h'], 2)
-    z73_eur = round(z73_tage * bmf_inland['an_abreise'], 2)
-    z74_eur = round(z74_tage * bmf_inland['voll_24h'], 2)
-    z76_eur = round(z76_eur, 2)
+    # ── Counter aus klass aggregieren ──
+    z72_tage = sum(1 for t in tage_detail if t['klass'] == 'Z72')
+    z73_tage = sum(1 for t in tage_detail if t['klass'] == 'Z73')
+    z74_tage = sum(1 for t in tage_detail if t['klass'] == 'Z74')
+    z76_tage = sum(1 for t in tage_detail if t['klass'] == 'Z76')
+    office_tage = sum(1 for t in tage_detail if t['klass'] == 'Office')
+    standby_tage = sum(1 for t in tage_detail if t['klass'] == 'Standby')
+    zero_tage = sum(1 for t in tage_detail if t['klass'] == 'ZeroDay')
+    sonstige_tage = sum(1 for t in tage_detail if t['klass'] == 'Sonstiges')
 
-    # Plausi-Audit-Issues nach Klassifikation
-    audit_issues = list(unklare)  # Start mit Tag-Level-unklaren
-    if z72_tage == 0 and arbeitstage > 100:
-        audit_issues.append(f'Audit: Z72=0 bei {arbeitstage} Arbeitstagen — Same-Day-Trips evtl. übersehen')
-    if z73_tage == 0 and hotel_naechte > 40:
-        audit_issues.append(f'Audit: Z73=0 bei {hotel_naechte} Hotelnächten — Inland-Übernachtungen evtl. übersehen')
+    z72_eur = round(sum(t['eur'] for t in tage_detail if t['klass'] == 'Z72'), 2)
+    z73_eur = round(sum(t['eur'] for t in tage_detail if t['klass'] == 'Z73'), 2)
+    z74_eur = round(sum(t['eur'] for t in tage_detail if t['klass'] == 'Z74'), 2)
+    z76_eur = round(sum(t['eur'] for t in tage_detail if t['klass'] == 'Z76'), 2)
 
+    ARBEITS_KLASSEN = {'Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby', 'ZeroDay'}
+    arbeitstage = sum(1 for t in tage_detail if t['klass'] in ARBEITS_KLASSEN)
+
+    # Fahrtage: Same-Day-Z72/Office/Office-after-training/Z73-An-Abreise/Z76-An-Abreise
+    # Heuristik: Tag mit Klassifikation, der Anreise/Abreise impliziert ODER Office
+    FAHR_KLASSEN = {'Z72', 'Office'}
+    fahr_tage = sum(1 for t in tage_detail if t['klass'] in FAHR_KLASSEN)
+    # Plus: Z73/Z76 An-/Abreise-Tage (1 pro Cluster-Beginn + 1 pro Cluster-Ende)
+    for c in tour_clusters:
+        if not c.get('indices'):
+            continue
+        first = c['indices'][0]
+        last = c['indices'][-1]
+        # Anreise zählt als Fahrtag
+        if 0 <= first < len(tage_detail) and tage_detail[first]['klass'] in ('Z73', 'Z74', 'Z76'):
+            fahr_tage += 1
+        # Abreise zählt als Fahrtag (wenn unterschiedlich vom Anreise-Tag)
+        if last != first and 0 <= last < len(tage_detail) and tage_detail[last]['klass'] in ('Z73', 'Z74', 'Z76'):
+            fahr_tage += 1
+
+    # Hotel-Nächte: nur Tage mit overnight=true UND klass in Cluster-Hotel-Klassen
+    HOTEL_KLASSEN = {'Z73', 'Z74', 'Z76'}
+    hotel_naechte = 0
+    hotel_skipped = []
+    for i, m in enumerate(sorted_days):
+        d = m['dp']
+        if not d.get('overnight_after_day'):
+            continue
+        if i >= len(tage_detail):
+            continue
+        t = tage_detail[i]
+        if t['klass'] in HOTEL_KLASSEN:
+            hotel_naechte += 1
+        else:
+            hotel_skipped.append(f'{t["datum"]}:{t["klass"]}')
+            print(f"[v7-hotel-extra] datum={t['datum']} klass={t['klass']} reason='overnight=true aber klass nicht Hotel-relevant'")
+
+    print(f"[v7-counts-detail] arbeitstage_sources Z72={z72_tage} Z73={z73_tage} Z74={z74_tage} "
+          f"Z76={z76_tage} Office={office_tage} Standby={standby_tage} ZeroDay={zero_tage} "
+          f"Sonstiges={sonstige_tage}")
+    print(f"[v7-hotel-detail] counted={hotel_naechte} skipped={len(hotel_skipped)}")
     print(f"[v7-classify] arbeit={arbeitstage}T fahr={fahr_tage}T hotel={hotel_naechte}T  "
           f"Z72={z72_tage}T/{z72_eur:.2f}€  Z73={z73_tage}T/{z73_eur:.2f}€  "
-          f"Z74={z74_tage}T/{z74_eur:.2f}€  Z76={z76_eur:.2f}€  "
-          f"unklar={len(unklare)} issues={len(audit_issues)}")
-    unklare = audit_issues
+          f"Z74={z74_tage}T/{z74_eur:.2f}€  Z76={z76_tage}T/{z76_eur:.2f}€  "
+          f"audit_notes={len(audit_notes)} unresolved={len(unresolved_days)} "
+          f"vma_unmapped={len(vma_unmapped_se)}")
+
+    # Plausi-Issues
+    plausi_issues = []
+    if z72_tage == 0 and arbeitstage > 100:
+        plausi_issues.append(f'Plausi: Z72=0 bei {arbeitstage} Arbeitstagen — Same-Day-Trips evtl. übersehen')
+    if z73_tage == 0 and hotel_naechte > 40:
+        plausi_issues.append(f'Plausi: Z73=0 bei {hotel_naechte} Hotelnächten — Inland-Übernachtungen evtl. übersehen')
+    if vma_unmapped_se:
+        plausi_issues.append(f'VMA-Unmapped-SE: {len(vma_unmapped_se)} aktive SE-Zeilen ohne Klassifikation')
 
     return {
         'arbeitstage': arbeitstage,
@@ -6628,13 +6718,19 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
         'z72_tage': z72_tage,
         'z73_tage': z73_tage,
         'z74_tage': z74_tage,
+        'z76_tage': z76_tage,
         'z72_eur': z72_eur,
         'z73_eur': z73_eur,
         'z74_eur': z74_eur,
         'z76_eur': z76_eur,
         'tage_detail': tage_detail,
-        'unklare_tage': unklare,
-        'nachweis': '',  # wird ggf. von Opus für unklare Tage gefüllt
+        # Backward-Compat: 'unklare_tage' bleibt — enthält nur ECHTE Issues
+        'unklare_tage': unresolved_days + plausi_issues,
+        'audit_notes': audit_notes,
+        'unresolved_days': unresolved_days,
+        'vma_unmapped_se': vma_unmapped_se,
+        'plausi_issues': plausi_issues,
+        'nachweis': '',
         '_v7_used': True,
     }
 
@@ -7708,6 +7804,9 @@ def _berechne_via_hybrid(form, files):
         '_verification':    verification_info,
         '_nachweis':        nachweis_text,
         '_unklare_tage':    unklare_tage,
+        '_audit_notes':     list(cls.get('audit_notes', []) or []),
+        '_unresolved_days': list(cls.get('unresolved_days', []) or []),
+        '_vma_unmapped_se': list(cls.get('vma_unmapped_se', []) or []),
         '_tage_detail':     list(cls.get('tage_detail', []) or []),
         '_klass_summary':   {
             'arbeitstage': arbeitstage, 'fahr_tage': fahr_tage, 'hotel_naechte': hotel_naechte,
