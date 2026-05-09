@@ -107,6 +107,54 @@ def test_classification_issues_fahr_too_high():
     assert any('Fahr' in i and 'Arbeitstage' in i for i in issues)
 
 
+# ── Anti-Muster: Z72 hoch + Z73=0 + viele Hotelnächte (v5.5 Tour-Guardrails) ──
+
+def test_classification_issues_z72_high_z73_zero_with_hotels():
+    """Klassisches Anti-Muster: viele Z72, 0 Z73, viele Hotelnächte → Inland-ÜN
+    fehlklassifiziert. Beispiel aus realem Test v5.4 (Z72=38, Z73=0, Hotel=52)."""
+    from app import _detect_classification_issues
+    cls = {'z76_eur': 3856, 'arbeitstage': 144, 'fahr_tage': 71,
+           'hotel_naechte': 52, 'z72_tage': 38, 'z73_tage': 0}
+    se = {'z77_total': 4655, 'auslandsspesen_total': 4000}
+    issues = _detect_classification_issues(cls, se)
+    assert any('Anti-Muster' in i and 'Z72=38' in i and 'Z73=0' in i for i in issues), \
+        f"Erwartetes Anti-Muster nicht gefunden in: {issues}"
+
+
+def test_classification_issues_z72_low_z73_zero_no_antimuster():
+    """Wenig Z72 + Z73=0 + wenig Hotels: kein Anti-Muster (z.B. Standby-Crew
+    ohne Touren)."""
+    from app import _detect_classification_issues
+    cls = {'z76_eur': 100, 'arbeitstage': 60, 'fahr_tage': 30,
+           'hotel_naechte': 5, 'z72_tage': 3, 'z73_tage': 0}
+    se = {'z77_total': 200, 'auslandsspesen_total': 80}
+    issues = _detect_classification_issues(cls, se)
+    assert not any('Anti-Muster' in i for i in issues)
+
+
+def test_classification_issues_z76_eur_implies_more_tage_than_hotels():
+    """Z76 in EUR (geschätzt /50€) deutet auf mehr Auslandstage als Hotelnächte.
+    Schwelle: Z76-Tage > 2× Hotelnächte → starker Mismatch."""
+    from app import _detect_classification_issues
+    # 5000€ ≈ 100 Auslandstage, aber nur 20 Hotelnächte → Verhältnis 5.0 → Issue
+    cls = {'z76_eur': 5000, 'arbeitstage': 150, 'fahr_tage': 60,
+           'hotel_naechte': 20, 'z72_tage': 5, 'z73_tage': 5}
+    se = {'z77_total': 6000, 'auslandsspesen_total': 4500}
+    issues = _detect_classification_issues(cls, se)
+    assert any('Hotelnächte' in i and 'Auslandstage' in i for i in issues)
+
+
+def test_classification_issues_z76_hotel_ratio_normal_no_warning():
+    """Verhältnis Z76-Tage/Hotelnächte ~1.3 (normal): kein Warning."""
+    from app import _detect_classification_issues
+    # 4500€ ≈ 90 Auslandstage, 50 Hotelnächte → Verhältnis 1.8 (unter 2.0) → kein Issue
+    cls = {'z76_eur': 4500, 'arbeitstage': 150, 'fahr_tage': 60,
+           'hotel_naechte': 50, 'z72_tage': 5, 'z73_tage': 5}
+    se = {'z77_total': 5000, 'auslandsspesen_total': 4000}
+    issues = _detect_classification_issues(cls, se)
+    assert not any('Auslandstage' in i and 'Hotelnächte' in i for i in issues)
+
+
 # ── PII-Redaktion ──────────────────────────────────────────────────────────
 
 def test_redact_pii_dict():

@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '5.4',
-        'build':   'recheck-memory-fix-se-consistency-2026-05-09',
+        'version': '5.5',
+        'build':   'tour-classification-guardrails-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5519,12 +5519,15 @@ Bei unklaren Tagen: in 'unklare_tage' mit Begründung listen. NIE raten.
 LIEFERE jetzt via Tool die strukturierten Werte + monatlichen Nachweis."""
 
     # Self-Reflection-Pass: wenn vorheriger Klass-Output Math-Invarianten verletzt,
-    # bekommt Opus die konkreten Issues als Korrektur-Auftrag mit.
+    # bekommt Opus die konkreten Issues als RE-KLASSIFIKATIONS-Auftrag mit.
+    # WICHTIG: Recheck darf NICHT auf "Z76 runter" optimieren — sondern auf KORREKTE
+    # Tour-Klassifikation. Z76 zu hoch heißt: zu viele Tage als Auslandstour ODER
+    # zu wenige als Inland-Übernachtung, NICHT "alle in Z72 schieben".
     if feedback and feedback.get('issues'):
         prev = feedback.get('prev_classification', {}) or {}
         issues_list = feedback.get('issues', [])
         prompt += "\n\n═══════════════════════════════════════════════════════════════════════════"
-        prompt += "\n█ KORREKTUR-AUFTRAG: deine vorherige Klassifikation hatte Probleme"
+        prompt += "\n█ RE-KLASSIFIKATIONS-AUFTRAG: deine vorherige Klassifikation hatte Probleme"
         prompt += "\n═══════════════════════════════════════════════════════════════════════════\n"
         prompt += f"\nDeine erste Klassifikation lieferte:"
         prompt += f"\n  arbeitstage={prev.get('arbeitstage')}, fahr_tage={prev.get('fahr_tage')}, "
@@ -5534,11 +5537,40 @@ LIEFERE jetzt via Tool die strukturierten Werte + monatlichen Nachweis."""
         prompt += "\n\nProbleme die das Backend identifiziert hat:\n"
         for i, iss in enumerate(issues_list, 1):
             prompt += f"  {i}. {iss}\n"
-        prompt += "\nGEH JETZT TAG-FÜR-TAG NOCHMAL DURCH und korrigiere diese spezifischen "
-        prompt += "Probleme. Schau besonders die Tage an die zur Inkonsistenz führen — falsch "
-        prompt += "klassifizierte Inland-/Ausland-Touren oder übersehene Schulungen mit Hotel. "
-        prompt += "Im 'tage_detail' dokumentiere KLAR die Begründung für jeden Tag der zu den "
-        prompt += "Problem-Posten beiträgt. Liefere das KORRIGIERTE Ergebnis via Tool."
+        prompt += "\n█ RECHECK-PRINZIP (KRITISCH — vermeide häufigen Reflex-Fehler!) ███████████\n"
+        prompt += "\nZiel ist NICHT 'Z76 reduzieren um jeden Preis'. Ziel ist KORREKTE Tour-\n"
+        prompt += "Klassifikation. Wenn dein erster Pass z.B. Z76>Z77 ergeben hat, ist die\n"
+        prompt += "Lösung NICHT 'mehr Tage als Z72 markieren', sondern systematisch prüfen:\n\n"
+        prompt += "  1. Sind ALLE als Z72 klassifizierten Tage echte Same-Day-Tagestrips?\n"
+        prompt += "     Z72 IST NUR ZULÄSSIG wenn ALLE Bedingungen erfüllt:\n"
+        prompt += "     • A-Marker UND E-Marker am SELBEN Kalendertag\n"
+        prompt += "     • KEIN FL-Marker (Layover) am Tag oder Folgetag\n"
+        prompt += "     • KEINE Fortsetzung der Tour am nächsten Tag (kein A am Folgetag)\n"
+        prompt += "     • KEIN Hotel-/Layover-Indiz im Einsatzplan\n"
+        prompt += "     • Gesamtabwesenheit >8h\n"
+        prompt += "     Wenn EINE Bedingung fehlt → NICHT Z72 → prüfe Z73 oder Z76.\n\n"
+        prompt += "  2. Wurden Inland-Übernachtungen (Z73) fälschlich als Z72 oder Office\n"
+        prompt += "     klassifiziert? Prüfe besonders Mehrtages-Schulungen (D4/DD/EM) und\n"
+        prompt += "     Inland-Layovers in MUC/HAM/BER/DUS/STR/CGN/HAJ/NUE/LEJ/BRE.\n"
+        prompt += "     Indiz: 2+ aufeinanderfolgende Diensttage OHNE FREI dazwischen +\n"
+        prompt += "     Layover-Ort Inland → fast immer Z73 (An/Abreise je 14€).\n\n"
+        prompt += "  3. Wurden Auslandstouren fälschlich als Inland klassifiziert?\n"
+        prompt += "     Prüfe Routing-Codes im Einsatzplan gegen Inland-IATA-Liste.\n\n"
+        prompt += "  4. PASSEN die Hotelnächte zur Touren-Anzahl?\n"
+        prompt += "     Hotelnächte sollten ungefähr Σ(Auslandstour-Layovers + Inland-Schulungs-Hotels) sein.\n"
+        prompt += "     Wenn Hotelnächte deutlich niedriger als FL-Marker im DP → Inland-Übernachtungen übersehen.\n\n"
+        prompt += "  5. Z76 ≤ Z77 ist KEIN Selbstzweck — wenn Z76 nach korrekter Re-Klassifikation\n"
+        prompt += "     immer noch leicht über Z77 liegt, ist das OK (Audit-Hinweis im Backend).\n"
+        prompt += "     LIEBER fachlich richtig + Hinweis als pauschal Z76 zerschnitten.\n\n"
+        prompt += "█ REFLEX-FEHLER DEN DU NICHT MACHEN DARFST ████████████████████████████████\n"
+        prompt += "\n❌ Z76 war zu hoch → 'verschiebe Auslandstour-Tage einfach nach Z72' = FALSCH\n"
+        prompt += "❌ Hotelnächte reduzieren um Z76 zu senken = FALSCH (verstößt gegen FL-Marker)\n"
+        prompt += "❌ Z73 = 0 lassen 'weil sicherer' = FALSCH bei vorhandenen Inland-Layovers\n\n"
+        prompt += "Im 'tage_detail' dokumentiere für JEDEN als Z72 markierten Tag explizit:\n"
+        prompt += "'Same-Day-Heimkehr nachgewiesen durch A+E am Tag X, kein FL'.\n"
+        prompt += "Im 'tage_detail' für Z73-Tage: 'Inland-Layover XYZ am Tag X mit Hotel'.\n"
+        prompt += "Im 'tage_detail' für Z76-Tage: 'Auslandstour LAND, Hotel im Ausland'.\n\n"
+        prompt += "Liefere das fachlich KORREKT re-klassifizierte Ergebnis via Tool."
 
     content.append({'type': 'text', 'text': prompt})
 
@@ -5615,6 +5647,8 @@ def _detect_classification_issues(cls, se_summary):
     arbeitstage = int(cls.get('arbeitstage', 0) or 0)
     fahr_tage = int(cls.get('fahr_tage', 0) or 0)
     hotel = int(cls.get('hotel_naechte', 0) or 0)
+    z72_tage = int(cls.get('z72_tage', 0) or 0)
+    z73_tage = int(cls.get('z73_tage', 0) or 0)
 
     # 1) Audit-Plausibilität: Z76 > Z77 ist kein harter Rechts-/Rechenfehler,
     # aber ein starkes Warnsignal für fehlende SE-Dateien, falsche Tourklassifikation
@@ -5648,6 +5682,29 @@ def _detect_classification_issues(cls, se_summary):
             f"Fahr-Tage ({fahr_tage}) > Arbeitstage ({arbeitstage}) — logisch unmöglich. "
             f"Eine Tour = 1 Fahrtag, kein eigener Fahrtag pro Etappe."
         )
+    # 5) Z72 viel + Z73=0 + viele Hotelnächte → Klassisches Anti-Muster: Inland-
+    # Übernachtungen werden als Same-Day fehlklassifiziert. Häufiger Bug bei
+    # Recheck-Pass der nur Z76 reduziert ohne Z73 zu erhöhen.
+    if z72_tage > 20 and z73_tage == 0 and hotel > 30:
+        issues.append(
+            f"Anti-Muster: Z72={z72_tage} Tage + Z73=0 + Hotel={hotel} Nächte. "
+            f"Bei {hotel} Hotelnächten und {z72_tage} 'Same-Day-Trips' fehlt Z73 wahrscheinlich. "
+            f"Mehrtages-Inland-Touren oder Schulungen mit Hotel werden vermutlich als Z72 oder "
+            f"Office klassifiziert. Prüfe alle EM/EH/D4-Blöcke und Inland-Layovers neu — "
+            f"jede Tour mit Folgetag-Aktivität ohne FREI ist KEIN Z72."
+        )
+    # 6) Hotelnächte stark unter Z76-Tagen impliziert: zu viele Auslandstage erkannt OHNE Hotel-Nachweis.
+    # Erwartung: Bei 4-Tages-Auslandstour sind 4 Z76-Tage und 3 Hotelnächte → Verhältnis ~1.33.
+    # Verhältnis > 2.0 ist deutlich verdächtig (z.B. 90 Z76-Tage bei nur 30 Hotelnächten).
+    if z76 > 0 and hotel > 0:
+        z76_tage_geschaetzt = z76 / 50  # grobe Schätzung: Z76 in EUR / 50€ ø-Tagessatz
+        if z76_tage_geschaetzt > hotel * 2.0:
+            issues.append(
+                f"Z76 = {z76:.0f}€ entspricht ~{z76_tage_geschaetzt:.0f} Auslandstagen, aber nur "
+                f"{hotel} Hotelnächte erfasst (Verhältnis {z76_tage_geschaetzt/max(hotel,1):.1f}, "
+                f"normal ~1.3). Auslandstour braucht Hotelnächte als Nachweis — FL-Marker "
+                f"im Dienstplan vollständig erfasst?"
+            )
     return issues
 
 

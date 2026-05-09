@@ -94,16 +94,42 @@ DREI HAUPT-KATEGORIEN:
              FollowMe-Konvention: lieber Z73 als Office annehmen wenn unsicher.
 
   Schritt 2: Bei Tour (A/E/FL): Wo ist die Übernachtung?
-             a) Same-Day-Heimkehr (A + E gleicher Tag, kein FL/Hotel)? → Z72 (14€)
-                Egal ob Ziel CPH/AMS/VIE oder MUC/HAM/STR — beides Z72.
+             a) Z72 — Same-Day-Tagestrip — STRENGES HARD-GATE!
+                Z72 darf NUR vergeben werden wenn ALLE Bedingungen ERFÜLLT sind:
+                  ✓ A-Marker UND E-Marker am SELBEN Kalendertag
+                  ✓ KEIN FL-Marker am Tag oder am Folgetag
+                  ✓ KEINE Tour-Fortsetzung am Folgetag (kein A am nächsten Tag,
+                    kein RES/SBY direkt anschließend)
+                  ✓ KEIN Hotel- oder Layover-Indiz im Einsatzplan
+                  ✓ Gesamtabwesenheit > 8h (Briefing+Block+Sign-Off+Anfahrt)
+                Wenn EINE Bedingung fehlt → NICHT Z72 → prüfe Z73 oder Z76!
+                Egal ob Ziel CPH/AMS/VIE oder MUC/HAM/STR — gleiche Hard-Gate-Regel.
              b) Hotel-Marker (FL) am Folgetag UND Routing/Layover-Ort = INLAND?
-                → Z73 für Anreise+Abreise (14€ pro Tag).
+                → Z73 für Anreise+Abreise (14€ pro Tag), Volltage = Arbeitstage.
                 Inland-Routing erkennst du an Layover-Code aus der Inland-Liste:
                 FRA, MUC, HAM, DUS, STR, CGN, HAJ, BER (TXL/SXF), LEJ, NUE,
                 BRE, FMO, PAD, NRN, FKB, HHN, SCN, DRS, ERF, FDH, RLG, KSF.
              c) Hotel-Marker (FL) am Folgetag UND Routing-Layover = AUSLAND?
                 → Z76 für ALLE Tour-Tage (BMF-Land-Pauschale für An/Ab + 24h
                   für Volltage).
+
+  ═══ Z72-HARD-GATE BEISPIELE ═══
+
+  ZULÄSSIG Z72:
+    • 11.01: A LH882 FRA→CPH 06:30 + E LH883 CPH→FRA 18:45 + 12.01 FREI
+      → Same-Day, kein FL, kein Folgetag-Dienst → Z72 ✓
+
+  NICHT Z72 (= Z73 oder Z76):
+    • 11.01: A LH900 FRA→MUC 16:00 + E LH901 MUC→FRA 21:00 + 12.01 EM Schulung
+      → Auch wenn 11.01 Same-Day wirkt: Folgetag Schulung ohne FREI dazwischen
+        deutet auf zusammenhängenden Dienst → KEIN Z72.
+        Wenn Schulung in MUC: ganze Sequenz Z73. Wenn Schulung FRA: Office.
+    • 04.03: A LH950 FRA→MUC 08:00 + E LH951 MUC→FRA 22:00 + 05.03 D4 SCHULUNG MUC
+      → 05.03 zeigt User ist STILL in MUC → 04.03 war Anreisetag → Z73, nicht Z72.
+
+  REFLEX-FEHLER VERMEIDEN:
+    Wenn Pass 1 zu viel Z76 ergeben hat: NICHT pauschal Tage in Z72 verschieben.
+    Sondern: Schau jede einzelne Tour an, prüfe Z72-Hard-Gate, sortiere richtig.
 
   Schritt 3: Bei Z76: BMF-Auslands-Pauschale für das Land aufschlagen
              (Anreise-Satz für Tag 1 + letzten Tag,
