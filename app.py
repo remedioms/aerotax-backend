@@ -2361,17 +2361,25 @@ def _claude_with_retry(client, model, max_tokens, content, max_retries=3, label=
     if last_err: raise last_err
 
 
-def _claude_stream_with_retry(client, model, max_tokens, content, max_retries=3, label='claude-stream'):
-    """Wie _claude_with_retry, aber für Streaming-Calls. Liefert kompletten Text zurück."""
+def _claude_stream_with_retry(client, model, max_tokens, content, max_retries=3, label='claude-stream', prefill=None):
+    """Wie _claude_with_retry, aber für Streaming-Calls. Liefert kompletten Text zurück.
+    prefill (optional): String der als Anfang der Assistant-Antwort vorgegeben wird.
+    Damit zwingt man Claude zu strukturierter Ausgabe (z.B. JSON) ohne Vorgeplänkel."""
     import time as _t
     last_err = None
     for attempt in range(max_retries):
         try:
             full_text = ''
+            messages = [{'role': 'user', 'content': content}]
+            if prefill:
+                messages.append({'role': 'assistant', 'content': prefill})
             with client.messages.stream(model=model, max_tokens=max_tokens,
-                                        messages=[{'role': 'user', 'content': content}]) as stream:
+                                        messages=messages) as stream:
                 for text in stream.text_stream:
                     full_text += text
+            # Bei prefill: Antwort beginnt OHNE den prefill-String, also vorhängen
+            if prefill:
+                full_text = prefill + full_text
             return full_text.strip()
         except Exception as e:
             last_err = e
@@ -3368,8 +3376,11 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
 
         import time as _time_mod
         sonnet_start_time = _time_mod.time()
+        # Prefill mit `{"fahrtage":` zwingt Sonnet, mit JSON zu starten —
+        # ohne Vorgeplänkel/Erklärung. Spart 2-3 Min Output-Zeit.
         full_text = _claude_stream_with_retry(client, 'claude-sonnet-4-6', 12000, content,
-                                              max_retries=3, label='Sonnet-DP')
+                                              max_retries=3, label='Sonnet-DP',
+                                              prefill='{"fahrtage":')
         print(f"Sonnet-Antwort: {len(full_text)} Zeichen, {_time_mod.time()-sonnet_start_time:.1f}s")
 
         # ── JSON robust extrahieren via brace-counter ──
