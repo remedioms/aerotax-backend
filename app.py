@@ -2226,8 +2226,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '2.7',
-        'build':   'final-audit-fixes-2026-05-09',
+        'version': '2.8',
+        'build':   'topf-getrennte-netto-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5074,7 +5074,29 @@ def berechne(form, files):
 
     # ── GESAMTBERECHNUNG ─────────────────────────────────────
     gesamt = round(fahr + reinig + trink + vma_in + vma_aus + opt_zu_gesamt, 2)
-    netto  = round(gesamt - ag_z17 - z77, 2)
+
+    # ── NETTO-BERECHNUNG nach §9 EStG + §3 Nr. 16 EStG ──
+    # WICHTIG: stfrei-Erstattungen vom AG dürfen NUR den eigenen Topf reduzieren,
+    # nicht den Gesamt-Topf. Wenn LH mehr stfrei zahlt als BMF-Pauschale erlaubt
+    # (z.B. großzügiges LH-Niveau), ist der Überschuss steuerpflichtig (im Brutto)
+    # — User darf nicht zusätzlich noch Werbungskosten geltend machen, aber auch
+    # nicht NEGATIVE Werbungskosten.
+    vma_total = round(vma_in + vma_aus, 2)
+    vma_netto = round(max(0, vma_total - z77), 2)        # Z77 deckelt nur Reisekosten
+    fahr_netto = round(max(0, fahr - ag_z17), 2)         # Z17 deckelt nur Fahrtkosten
+    netto = round(fahr_netto + reinig + trink + vma_netto + opt_zu_gesamt, 2)
+    # Hinweis-Notes wenn AG mehr stfrei gezahlt hat als Pauschale erlaubt
+    if z77 > vma_total + 5:
+        notes.append(
+            f'ℹ Hinweis: Lufthansa hat {z77:.2f}€ stfrei (Z77) gezahlt — das übersteigt die '
+            f'BMF-Pauschalen ({vma_total:.2f}€) um {z77-vma_total:.2f}€. Reisekosten-Topf bleibt 0, '
+            f'der Überschuss ist bereits im Brutto enthalten und wurde regulär versteuert.'
+        )
+    if ag_z17 > fahr + 5:
+        notes.append(
+            f'ℹ Hinweis: AG-Fahrkostenzuschuss (Z17 {ag_z17:.2f}€) übersteigt deine Fahrtkosten '
+            f'({fahr:.2f}€) — Fahrtkosten-Topf bleibt 0.'
+        )
 
     # ── MATHEMATISCHE PLAUSI-CHECKS ──────────────────────────
     # Wenn Inkonsistenzen, User über Note informieren — keine stille Fehler.
@@ -5346,10 +5368,15 @@ def berechne(form, files):
         if any(c.startswith('z77:') for c in auto_corrections):
             spesen_gesamt = round(z77 + spesen_steuer, 2)
         gesamt = round(fahr + reinig + trink + vma_in + vma_aus + opt_zu_gesamt, 2)
-        netto = round(gesamt - ag_z17 - z77, 2)
+        # Netto wieder mit getrennter Topf-Logik (Z77 nur gegen VMA, Z17 nur gegen Fahrt)
+        vma_total = round(vma_in + vma_aus, 2)
+        vma_netto = round(max(0, vma_total - z77), 2)
+        fahr_netto = round(max(0, fahr - ag_z17), 2)
+        netto = round(fahr_netto + reinig + trink + vma_netto + opt_zu_gesamt, 2)
         print(f"[Opus-Audit] Auto-Korrekturen: {auto_corrections}; "
               f"recalc: reinig={reinig:.2f} trink={trink:.2f} fahr={fahr:.2f} "
-              f"vma_in={vma_in:.2f} gesamt={gesamt:.2f} netto={netto:.2f}")
+              f"vma_in={vma_in:.2f} gesamt={gesamt:.2f} netto={netto:.2f} "
+              f"(vma_netto={vma_netto:.2f}, fahr_netto={fahr_netto:.2f})")
 
     # Notes-Deduplikation: identische Strings entfernen, Reihenfolge erhalten
     if notes:
