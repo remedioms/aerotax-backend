@@ -131,6 +131,74 @@ DREI HAUPT-KATEGORIEN:
     Wenn Pass 1 zu viel Z76 ergeben hat: NICHT pauschal Tage in Z72 verschieben.
     Sondern: Schau jede einzelne Tour an, prüfe Z72-Hard-Gate, sortiere richtig.
 
+  ═══ MULTI-STOP-TOUREN MIT GEMISCHTEN LAYOVERN — TAG-FÜR-TAG ═══
+
+  Eine Tour darf NICHT pauschal komplett als Z76 klassifiziert werden, nur weil
+  irgendwo im Verlauf ein Auslands-Layover vorkommt. Bei Multi-Stop-Touren mit
+  gemischten Inland- und Auslands-Layovern muss PRO KALENDERTAG entschieden werden.
+
+  Entscheidend pro Kalendertag:
+    1. Wo endet der dienstliche Tag?
+    2. Wo schläft der User?
+    3. Ist der Übernachtungsort Inland oder Ausland?
+    4. Gibt es am selben Tag eine Heimkehr aus einer vorherigen Tour plus
+       neuen Same-Day?
+
+  REGEL:
+    • Übernachtung im Inland → Z73 für An-/Abreisetag der Inland-Übernachtung.
+    • Übernachtung im Ausland → Z76 nach BMF-Auslandspauschale.
+    • Same-Day-Turnaround OHNE Übernachtung → Z72, NUR wenn eindeutig A+E am
+      selben Tag und keine Tourfortsetzung.
+    • Ein Kalendertag kann fachlich eine Mischsituation enthalten — z.B.
+      Rückkehr aus mehrtägiger Tour + neue Same-Day-Tätigkeit. Dann NICHT
+      pauschal nur Z72 setzen, sondern die vorherige Tour korrekt abschließen
+      und die neue Aktivität separat dokumentieren.
+
+  BEISPIEL-SCHEMA (gemischte Multi-Stop-Tour):
+    Tag 1: FRA→<Inland-Stadt>, Übernachtung Inland       → Z73 Anreise
+    Tag 2: <Inland>→<Ausland>, Übergang aus Inland-Layover → Z73 Abreise (von
+           Inland) bzw. neuer Tour-Start ins Ausland prüfen
+    Tag 3: <Ausland>→<anderes Ausland>, Übernachtung      → Z76 Volltag
+    Tag 4: Auslands-Layover                              → Z76 24h
+    Tag 5: Rückkehr Homebase                             → Z76 Abreise
+
+  ANTI-PATTERN (häufiger Bug):
+    Multi-Stop FRA→<Inland>→<Ausland>→<Ausland>→FRA pauschal als komplett
+    Z76 abrechnen, obwohl Tag 1 eine Inland-Übernachtung ist. Das verschiebt
+    Z73-Tage in Z76 und führt zu Inkonsistenz mit den AG-Auslandsspesen.
+
+  ═══ Z72-HARD-GATE — VOLLSTÄNDIGE BEDINGUNGSLISTE ═══
+
+  Z72 darf NUR vergeben werden, wenn ALLE folgenden Bedingungen erfüllt sind:
+    ✓ A-Marker UND E-Marker am selben Kalendertag
+    ✓ Keine FL-/Hotel-/Layover-Fortsetzung am Tag oder Folgetag
+    ✓ Keine Heimkehr aus einer mehrtägigen Tour am selben Tag
+    ✓ Kein vorheriger oder folgender Tag gehört zur gleichen Tour
+    ✓ Abwesenheit > 8h plausibel
+
+  Wenn der Tag MIT Heimkehr aus mehrtägiger Tour beginnt oder endet:
+    → NICHT pauschal Z72.
+    → Tourabschluss separat klassifizieren (Z76- oder Z73-Abreisetag),
+      neue Same-Day-Aktivität separat dokumentieren wenn vorhanden.
+    → Im tage_detail beide Komponenten getrennt aufführen.
+
+  ═══ MEHRTÄGIGE SCHULUNGEN — Z73 STATT OFFICE ═══
+
+  Wenn 2+ aufeinanderfolgende Schulungs-/Office-Tage (EH/EM/EK/D4/DD) vorliegen
+  UND der Ort nicht eindeutig tägliche Homebase-Anfahrt ist, MUSS aktiv auf
+  Inland-Übernachtung geprüft werden.
+
+  Bei Hotel-/Layover-/auswärtigem Schulungsort im Inland:
+    • erster Tag → Z73 Anreise (14 €)
+    • letzter Tag → Z73 Abreise (14 €)
+    • Zwischentage → Arbeitstag (kein zusätzliches VMA), ggf. Z74 nur bei
+      nachgewiesener 24h-Inland-Abwesenheit ohne An-/Abreise-Charakter
+
+  NICHT automatisch als Office klassifizieren wenn:
+    • Schulung mehrtägig
+    • Schulungs-Ort in Einsatzplan ≠ Homebase
+    • Hotel-Indikator vorhanden ODER keine tägliche Heimfahrt-Indikation
+
   Schritt 3: Bei Z76: BMF-Auslands-Pauschale für das Land aufschlagen
              (Anreise-Satz für Tag 1 + letzten Tag,
               24h-Satz für Volltage)
