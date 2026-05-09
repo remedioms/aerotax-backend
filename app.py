@@ -5201,10 +5201,10 @@ Liefere via Tool das strukturierte Ergebnis."""
 
 
 def hybrid_analyze(form, files):
-    """Hauptanalyse: Sonnet (LSB+SE-Summen) + Opus (Tag-Klassifikation) parallel.
-    Liefert ein dict mit allen für berechne() relevanten Feldern.
+    """Hauptanalyse: Sonnet (LSB+SE-Summen) + Opus (Tag-Klassifikation) SEQUENZIELL.
+    Sequenziell statt parallel — schont Memory auf Render Free 512 MB.
+    Nach jedem Call: gc.collect() + malloc_trim → maximaler Spike <500 MB.
     Rückgabe: {'lsb': {...}, 'se_summary': {...}, 'classification': {...}, 'errors': [...]}"""
-    import concurrent.futures as _cf
     year = int(form.get('year', 2025))
     homebase = _extract_homebase(form.get('base', 'Frankfurt (FRA)'))
 
@@ -5221,19 +5221,44 @@ def hybrid_analyze(form, files):
     for item in (files.get('einsatz') or []):
         einsatz_bytes.append(item[0] if isinstance(item, tuple) else item)
 
-    print(f"[hybrid] Start: LSB={len(lsb_bytes)} SE={len(se_bytes)} DP={len(dp_bytes)} Einsatzplan={len(einsatz_bytes)}")
+    print(f"[hybrid] Start sequenziell: LSB={len(lsb_bytes)} SE={len(se_bytes)} "
+          f"DP={len(dp_bytes)} Einsatzplan={len(einsatz_bytes)}")
 
     errors = []
-    with _cf.ThreadPoolExecutor(max_workers=3) as ex:
-        f_lsb  = ex.submit(_sonnet_read_lsb_v2, lsb_bytes) if lsb_bytes else None
-        f_se   = ex.submit(_sonnet_read_se_summary_v2, se_bytes, year) if se_bytes else None
-        f_cls  = ex.submit(_opus_classify_days_v2, dp_bytes, einsatz_bytes, se_bytes, year, homebase) if dp_bytes else None
-        try:    lsb_data = f_lsb.result() if f_lsb else None
-        except Exception as e: errors.append(f'LSB: {e}'); lsb_data = None
-        try:    se_summary = f_se.result() if f_se else None
-        except Exception as e: errors.append(f'SE: {e}'); se_summary = None
-        try:    classification = f_cls.result() if f_cls else None
-        except Exception as e: errors.append(f'DP-Klassifikation: {e}'); classification = None
+
+    # Schritt 1: Sonnet-LSB (kleinster Memory-Footprint, läuft zuerst)
+    lsb_data = None
+    if lsb_bytes:
+        try:
+            lsb_data = _sonnet_read_lsb_v2(lsb_bytes)
+        except Exception as e:
+            errors.append(f'LSB: {e}')
+            print(f"[hybrid] Sonnet-LSB crash: {e}")
+    gc.collect()
+    _release_memory_to_os()
+
+    # Schritt 2: Sonnet-SE-Summen (mittlerer Footprint)
+    se_summary = None
+    if se_bytes:
+        try:
+            se_summary = _sonnet_read_se_summary_v2(se_bytes, year)
+        except Exception as e:
+            errors.append(f'SE: {e}')
+            print(f"[hybrid] Sonnet-SE crash: {e}")
+    gc.collect()
+    _release_memory_to_os()
+
+    # Schritt 3: Opus-Klassifikation (großer Footprint — als letztes, danach Cleanup)
+    classification = None
+    if dp_bytes:
+        try:
+            classification = _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year, homebase)
+        except Exception as e:
+            errors.append(f'DP-Klassifikation: {e}')
+            print(f"[hybrid] Opus-Klassifikation crash: {e}")
+    gc.collect()
+    _release_memory_to_os()
+
     return {
         'lsb': lsb_data,
         'se_summary': se_summary,
