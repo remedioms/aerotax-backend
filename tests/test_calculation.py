@@ -70,12 +70,13 @@ def test_bmf_jeder_jahr_komplett():
 # ── Math-Konsistenz-Check ──────────────────────────────────────────────────
 
 def test_classification_issues_z76_higher_than_z77():
-    """Z76 > Z77 muss als Issue erkannt werden."""
+    """Z76 > Z77 muss als Audit-Warnsignal erkannt werden, aber nicht gedeckelt werden."""
     from app import _detect_classification_issues
     cls = {'z76_eur': 5000, 'arbeitstage': 150, 'fahr_tage': 60, 'hotel_naechte': 50}
     se = {'z77_total': 3000, 'auslandsspesen_total': 2500}
     issues = _detect_classification_issues(cls, se)
-    assert any('Z76' in i and 'HÖHER' in i for i in issues)
+    assert any('Z76' in i and 'Z77' in i and 'Audit-Warnung' in i for i in issues)
+    assert any('nicht automatisch' in i or 'nicht pauschal' in i for i in issues)
 
 
 def test_classification_issues_no_issue_when_consistent():

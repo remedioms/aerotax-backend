@@ -1,4 +1,3 @@
-═══════════════════════════════════════════════════════════════════════════
   AEROTAX — KOMPLETTES WISSENS-BUCH FÜR LH-CABIN-CREW-AUSWERTUNG
   Single Source of Truth (Stand: Mai 2026)
   Enthält: Steuerrecht §9 + §3 EStG, EASA-FTL EU 965/2012, BMF-Pauschalen,
@@ -411,10 +410,12 @@ TEILZEIT/MUTTERSCHUTZ/KRANKHEIT-Anteil:
     Bandbreiten). NIEMALS aus Bandbreite zurückrechnen — IMMER aus
     Dienstplan zählen.
 
-INVARIANTEN (mathematisch zwingend, NIE verletzen):
-  • Z76 ≤ Z77 (BMF-Auslandspauschale ≤ LH-stfrei-Auszahlung)
-  • Hotelnächte ≤ Arbeitstage
-  • Fahrtage ≤ Arbeitstage
+HARTE INVARIANTEN + AUDIT-PLAUSIBILITÄT:
+  • Z76 > Z77 ist KEINE harte mathematische Unmöglichkeit, aber ein
+    starkes Audit-Warnsignal: SE-Vollständigkeit, Auslands-/Inland-
+    Klassifikation, Storno-Zeilen, Zwölftel/Kürzungen und Mahlzeiten prüfen.
+  • Hotelnächte ≤ Arbeitstage (harte logische Invariante)
+  • Fahrtage ≤ Arbeitstage (harte logische Invariante)
   • Z76-Tage entsprechen ungefähr Σ(Auslands-Hotelnächte + 1 Anreise/Tour)
   • Auslandsspesen-Summe (SE) ≈ Z76 (BMF) ±30% — sonst Klassifikations-Bug
 
@@ -425,7 +426,7 @@ BEOBACHTUNGEN AUS DER PRAXIS (statistisch, nicht zwingend):
     mit Auslandsanteil), weil Langstreckenflüge die Pauschalen hochtreiben
   • Hotelnächte und Fahrtage liegen meist im Verhältnis 1:1 bis 1.5:1
 
-→ Wenn deine Klassifikation diese Bandbreiten/Invarianten verletzt:
+→ Wenn deine Klassifikation diese Bandbreiten/Checks verletzt:
   STOP, geh zurück zu den Files, lies und zähl nochmal.
 → Wenn deine Klassifikation in den Bandbreiten liegt: das ist KEIN Beweis
   dass es stimmt — nur dass es plausibel groß ist.
@@ -447,9 +448,12 @@ BEOBACHTUNGEN AUS DER PRAXIS (statistisch, nicht zwingend):
 ❌ FEHLER 4: DD SEMINAR (15 Tage) nur als 1 Block zählen
 ✓ RICHTIG: Jeder DD-Tag = Arbeitstag + Fahrtag (täglich Anfahrt zur Schulung)
 
-❌ FEHLER 5: Z76 EUR-Wert größer als Z77 errechnen
-✓ RICHTIG: Z76 ist Teilmenge von Z77 — niemals Z76 > Z77
-   Wenn LH 1.146€ Z77 stfrei zahlt, KANN Z76 nicht 2.025€ sein
+❌ FEHLER 5: Z76 > Z77 ungeprüft akzeptieren ODER automatisch deckeln
+✓ RICHTIG: Z76 ist der berechnete BMF-WK-Anspruch, Z77 ist die tatsächlich
+   steuerfrei erstattete AG-Summe. Z76 > Z77 ist ein starkes Audit-Warnsignal,
+   aber kein automatischer mathematischer Beweisfehler. Prüfe SE-Vollständigkeit,
+   Auslands-/Inland-Klassifikation, Storno-Zeilen, Zwölftel/Kürzungen und
+   gestellte Mahlzeiten. Z76 NICHT pauschal auf Z77 deckeln.
 
 ❌ FEHLER 6: Nachtflug-Heimkehr als Hotelnacht zählen
 ✓ RICHTIG: Nur ≥10h Bodenzeit am Zielort (FL-Marker = echte Hotelnacht)
@@ -539,8 +543,10 @@ OPTIONALE BELEGE (Werden separat per Vision-API gelesen, nicht in deiner Klassif
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
 Bevor du das Tool aufrufst, prüfe selbst:
-  ✓ Z76 ≤ Z77 (mathematisch zwingend, sonst falsch klassifiziert!)
-  ✓ Z76 ≈ Auslandsspesen-Summe der SE ±30% (wenn weit auseinander → Bug!)
+  ✓ Z76 > Z77? → starkes Audit-Warnsignal, NICHT automatisch harter Fehler.
+    Prüfe SE-Vollständigkeit, Auslands-/Inland-Klassifikation, Storno-Zeilen,
+    Zwölftel/Kürzungen und Mahlzeiten. Nicht pauschal auf Z77 deckeln.
+  ✓ Z76 ≈ Auslandsspesen-Summe der SE ±30% (wenn weit auseinander → Recheck!)
   ✓ Hotel ≤ Arbeitstage (logisch unmöglich anders)
   ✓ Fahrtage ≤ Arbeitstage (logisch)
   ✓ Z73 = 0 → DOPPELT prüfen ob mehrtägige EM/EH/D4-Schulungen oder
@@ -570,4 +576,3 @@ für Audit-Trail und Validierung gegen FollowMe.
 
 ═══════════════════════════════════════════════════════════════════════════
 ENDE DES WISSENS-BUCHS
-═══════════════════════════════════════════════════════════════════════════

@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '5.1',
-        'build':   'security-fixes-pi-auth-cors-recovery-2026-05-09',
+        'version': '5.2',
+        'build':   'audit-language-unified-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5465,10 +5465,10 @@ Zähle:
 
 PFLICHT vor dem Tool-Aufruf — gehe diese Checks durch:
 
-✓ Z76_EUR ≤ Z77 (Z77 ist was LH literal stfrei gezahlt hat — kannst du im SE
-  durch Σ aller stfrei-Werte verifizieren). Wenn Z76 > Z77: deine BMF-Pauschalen
-  überschreiten was LH gezahlt hat → das ist OK steuerlich, aber prüfe
-  mathematisch: ist deine Tag-Klassifikation realistisch?
+✓ Z76_EUR > Z77? Das ist ein starkes Audit-Warnsignal, aber kein automatischer
+  Rechts-/Rechenfehler. Prüfe dann SE-Vollständigkeit, Auslands-/Inland-
+  Klassifikation, Storno-Zeilen, Zwölftel/Kürzungen und gestellte Mahlzeiten.
+  Z76 NICHT pauschal auf Z77 deckeln.
 
 ✓ hotel_naechte ≤ arbeitstage (logisch zwingend)
 
@@ -5583,10 +5583,13 @@ LIEFERE jetzt via Tool die strukturierten Werte + monatlichen Nachweis."""
 
 
 def _detect_classification_issues(cls, se_summary):
-    """Prüft Math-Invarianten zwischen Opus-Klassifikation und Sonnet-SE-Summen.
-    Liefert Liste konkreter Issue-Strings für den Self-Reflection-Pass.
-    Nur HARTE Verletzungen — nicht jede statistische Auffälligkeit.
-    Bei Verletzungen: Opus bekommt diese Issues als Korrektur-Auftrag mit."""
+    """Prüft harte logische Invarianten und Audit-Plausibilitätschecks.
+    Liefert konkrete Issue-Strings für den Self-Reflection-Pass.
+
+    Harte Invarianten: Hotelnächte/Fahrtage dürfen Arbeitstage nicht übersteigen.
+    Audit-Plausibilität: Z76 > Z77 oder starke Abweichung zu Auslandsspesen
+    ist ein Recheck-Signal, aber kein automatischer mathematischer Beweisfehler.
+    """
     if not cls or not se_summary:
         return []
     issues = []
@@ -5597,13 +5600,15 @@ def _detect_classification_issues(cls, se_summary):
     fahr_tage = int(cls.get('fahr_tage', 0) or 0)
     hotel = int(cls.get('hotel_naechte', 0) or 0)
 
-    # 1) Mathematisch: Z76 darf nicht > Z77 sein (BMF ist Teilmenge der LH-stfrei-Auszahlung)
-    if z77 > 0 and z76 > z77:  # harte Invariante laut Wissens-Buch: Z76 darf nicht höher als Z77 sein
+    # 1) Audit-Plausibilität: Z76 > Z77 ist kein harter Rechts-/Rechenfehler,
+    # aber ein starkes Warnsignal für fehlende SE-Dateien, falsche Tourklassifikation
+    # oder AG-Kürzungen/Mahlzeiten/Zwölftel-Logik. Nicht pauschal auf Z77 deckeln.
+    if z77 > 0 and z76 > z77:
         issues.append(
-            f"Z76 = {z76:.2f}€ ist HÖHER als Z77 = {z77:.2f}€. Das ist mathematisch "
-            f"problematisch (BMF-Pauschale > LH-stfrei-Auszahlung). Du hast vermutlich "
-            f"zu viele Tage als Auslandstour klassifiziert. Prüfe ob einige Tage Inland "
-            f"(Z73) oder Same-Day (Z72) sein müssten."
+            f"Audit-Warnung: Z76 = {z76:.2f}€ liegt über Z77 = {z77:.2f}€. "
+            f"Bitte SE-Vollständigkeit, Auslands-/Inland-Klassifikation, Storno-Zeilen, "
+            f"Zwölftel/Kürzungen und gestellte Mahlzeiten prüfen. Z76 nicht automatisch "
+            f"auf Z77 deckeln."
         )
     # 2) Z76 vs Auslandsspesen-Summe ±30% — sollten ähnlich sein (BMF ≈ AG-Auszahlung pro Auslands-Tag)
     if auslandsspesen_se > 100 and z76 > 0:
@@ -5820,11 +5825,12 @@ def _berechne_via_hybrid(form, files):
                 f'aber LH hat nur {auslandsspesen_se:.2f}€ Auslands-stfrei gezahlt '
                 f'(Diff {abs(vma_aus-auslandsspesen_se):.2f}€). Bitte Auswertung prüfen.'
             )
-    # Harte Invariante laut Wissens-Buch: Z76 darf nicht höher als Z77 sein.
+    # Audit-Plausibilität: Z76 > Z77 ist ein Recheck-Hinweis, keine automatische Deckelung.
     if vma_aus > z77 and z77 > 0:
         notes.append(
-            f'⚠ Z76 ({vma_aus:.2f}€) ist höher als Z77 ({z77:.2f}€) — bitte Klassifikation prüfen. '
-            f'Wahrscheinlich wurden zu viele Tage als Auslandstour klassifiziert.'
+            f'⚠ Audit-Hinweis: Z76 ({vma_aus:.2f}€) liegt über Z77 ({z77:.2f}€). '
+            f'Bitte SE-Vollständigkeit, Klassifikation, Zwölftel/Kürzungen und Mahlzeiten prüfen; '
+            f'Z76 wird nicht pauschal auf Z77 gedeckelt.'
         )
 
     # ── Fahrtkosten ──

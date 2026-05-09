@@ -82,7 +82,7 @@ Auslandsspesen-Tabelle pro Land (BMF-Schreiben jährlich). `BMF_AUSLAND_BY_YEAR`
 17 Pure-Python-Unit-Tests (kein Netzwerk, keine KI):
 - Pendlerpauschale-Staffelung
 - BMF-Tabellen-Vollständigkeit
-- Math-Konsistenz-Check (`_detect_classification_issues`)
+- Invarianten-/Audit-Checks (`_detect_classification_issues`)
 - PII-Redaktion (`_redact_pii`)
 - Pauschalen-Konstanten
 
@@ -156,7 +156,7 @@ Cloudflare Pages: Account `28a9e1f1409d83cc94ef2c12db769985`, Domains `aerosteue
 3. **Opus klassifiziert Tag-für-Tag** mit dem Wissens-Buch im Prompt
 
 Nach Schritt 3 läuft **Self-Reflection-Loop** (`_detect_classification_issues`):
-- Wenn Z76 > Z77 (mathematisch unmöglich) → Opus-Recheck
+- Wenn Z76 deutlich > Z77 oder deutlich von Auslandsspesen abweicht → Audit-Warnung + Opus-Recheck
 - Wenn Z76 vs Auslandsspesen ±40% abweichend → Opus-Recheck
 - Wenn Hotel > Arbeitstage → Opus-Recheck
 - Recheck-Pass bekommt konkreten Korrektur-Auftrag-Prompt
