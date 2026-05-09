@@ -8,34 +8,87 @@
 
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ 1. KERNSATZ — Tour-Aware-Klassifikation (FollowMe-Standard)              ┃
+┃ 1. KERNSATZ — Klassifikation nach FollowMe-Standard                      ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
-Lufthansa schreibt bei einer AUSLANDSTOUR oft den Anreise- und Abreise-Tag
-mit FRA als stfrei-Ort und 14€ stfrei (= Inland-Anteil bis Boarding).
-Steuerlich gehört dieser Tag aber zur AUSLANDSTOUR.
+Die ENTSCHEIDENDE Frage pro Tag/Tour ist nicht "Inland oder Ausland?",
+sondern: "GIBT ES EINE ÜBERNACHTUNG IM AUSLAND?"
 
-→ Klassifiziere TOUR-AWARE, nicht zeilenweise:
+DREI HAUPT-KATEGORIEN:
 
-  • Wenn die TOUR ins Ausland geht (irgendein Tag der Tour hat
-    Ausland-stfrei-Ort oder LH-Routing nach Ausland):
-    → ALLE Tage dieser Tour = Z76 (mit BMF-Auslands-Pauschalen)
-    → Anreise-Tag mit FRA-Stempel = Z76 mit BMF-Auslands-Anreise-Pauschale
-      (typisch 30-50€, NICHT 14€)
-    → 24h-Tage im Ausland = Z76 mit BMF-Auslands-24h-Pauschale (typ. 40-60€)
-    → Abreise-Tag mit FRA-Stempel = Z76 mit BMF-Auslands-Anreise-Pauschale
+┌─────────────────────────────────────────────────────────────────────────┐
+│ A) SAME-DAY-TAGESTRIP (= Z72) — Heimkehr am gleichen Tag                │
+│                                                                          │
+│ User fliegt morgens raus, kehrt abends zurück nach Homebase.            │
+│ Egal ob Ziel Inland (HAM/MUC/STR) ODER EU-Ausland (CPH/BER/AMS/VIE):   │
+│ → Z72 mit 14€ Inland-Tagestrip-Pauschale (LH-/FollowMe-Konvention)     │
+│ → 1 Fahrtag, 1 Arbeitstag, 0 Hotelnächte                                │
+│ → Voraussetzung: Gesamtabwesenheit ≥ 8h (mit Briefingzeiten prüfen)    │
+│                                                                          │
+│ BEISPIEL: 11.01 LH882 A FRA→CPH 06:30 + LH883 E CPH→FRA 18:45          │
+│         → Same-Day → Z72 mit 14€ (NICHT Z76 weil keine Übernachtung)   │
+└─────────────────────────────────────────────────────────────────────────┘
 
-  • Z73 (Inland An-/Abreise mit Übernachtung) = NUR echte Inland-Touren:
-    → Schulung in München mit Hotel-Übernachtung (1× An + 1× Ab = 2 Z73-Tage)
-    → DD-Seminar an einem Inland-Standort mit Hotel
-    → KEINE Auslandstour-Tage hier zählen
+┌─────────────────────────────────────────────────────────────────────────┐
+│ B) INLAND-MEHRTAGES-TOUR (= Z73 + Arbeitstage) — Hotel im Inland        │
+│                                                                          │
+│ User fliegt zu Inland-Ziel, übernachtet dort, kehrt zurück.             │
+│ Z.B. Schulung in München mit Hotel-Übernachtung.                        │
+│ → Anreise-Tag = Z73 (14€)                                               │
+│ → Volltage zwischen An/Ab = nur Arbeitstage (kein zusätzliches VMA)    │
+│ → Abreise-Tag = Z73 (14€)                                                │
+│ → 1 Fahrtag (Tour-Start), n Hotelnächte                                  │
+│                                                                          │
+│ BEISPIEL: 04-08.03 D4 SCHULUNG in MUC mit Hotel                         │
+│         → 04.03 Z73 (Anreise), 05+06+07.03 Arbeitstage,                │
+│           08.03 Z73 (Abreise) = 2× Z73 = 28€                            │
+└─────────────────────────────────────────────────────────────────────────┘
 
-  • Z72 (Inland Tagestrip >8h, ohne Übernachtung) = NUR Inland-Same-Day-Touren:
-    → CPH-Tagestrip mit Heimkehr am gleichen Tag (mit 8h-Schwelle prüfen)
-    → DUS-Tagestrip
-    → KEINE Auslandstour-Tage hier zählen
+┌─────────────────────────────────────────────────────────────────────────┐
+│ C) AUSLANDSTOUR (= Z76) — Übernachtung im AUSLAND                       │
+│                                                                          │
+│ User fliegt zu Auslands-Ziel, übernachtet dort, kehrt zurück.           │
+│ → ALLE Tage der Tour = Z76 (auch An-/Abreise mit FRA-Stempel)           │
+│ → BMF-Auslands-Anreise-Pauschale für Tag 1 + letzten Tag                │
+│ → BMF-Auslands-24h-Pauschale für Volltage zwischen An/Ab                │
+│ → 1 Fahrtag pro Tour, n Hotelnächte (FL-Marker)                          │
+│                                                                          │
+│ BEISPIEL: 03-06.05 BLR-Tour (Indien)                                    │
+│         → 03.05 BMF Indien-Anreise 30€                                  │
+│         → 04.05 BMF Indien-24h 39€                                      │
+│         → 05.05 BMF Indien-24h 39€                                      │
+│         → 06.05 BMF Indien-Anreise 30€                                  │
+│         → Z76 = 30+39+39+30 = 138€ für diese Tour                       │
+│         → 3 Hotelnächte (03-05.), 1 Fahrtag, 4 Arbeitstage              │
+└─────────────────────────────────────────────────────────────────────────┘
 
-  • Z74 (Inland 24h ohne An-/Abreise) = sehr selten, NUR wenn ZW=12 + keine Zeiten
+┌─────────────────────────────────────────────────────────────────────────┐
+│ D) Z74 (24h Inland) — sehr selten                                        │
+│                                                                          │
+│ Inland-Tag mit ZW=12 ohne Ab/An-Zeiten — User war ganzen Tag dienstlich │
+│ in Inland aber NICHT Tagestrip-/Anreise-Pattern.                        │
+│ → 1 Tag × 28€                                                            │
+│                                                                          │
+│ Beispiel: D4 SCHULUNG mit ganztägiger Anwesenheit ohne Übernachtung,    │
+│ aber zu lange für Tagestrip-Klassifikation. SELTEN — typisch 0-2/Jahr. │
+└─────────────────────────────────────────────────────────────────────────┘
+
+═══ DENK-SCHEMA PRO TAG ═══
+
+  Schritt 1: Welche Aktivität laut Marker?
+             FREI/U/K → kein Arbeitstag, fertig.
+             SBY/RES → Arbeitstag, kein Fahrtag, fertig.
+             EK/EM/D4/DD → Arbeitstag + Fahrtag (täglich Anfahrt!), fertig.
+             Tour (A/E/FL) → weiter Schritt 2.
+
+  Schritt 2: Bei Tour: Übernachtung im Ausland?
+             Same-Day-Heimkehr (A + E gleicher Tag)? → Z72 (Tagestrip 14€)
+             Mehrtages mit Hotel im INLAND? → Z73 (An-/Abreise je 14€)
+             Mehrtages mit Hotel im AUSLAND? → Z76 (BMF-Ausland)
+
+  Schritt 3: Bei Z76: BMF-Auslands-Pauschale für das Land aufschlagen
+             (Anreise-Satz für Tag 1 + letzten Tag,
+              24h-Satz für Volltage)
 
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -290,17 +343,22 @@ VMA Ausland (BMF-Tagessätze pro Land × Anzahl Tag-Typen):
 ┃ 9. REFERENCE-CASES (reale, FollowMe-validierte Auswertungen)             ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
-REFERENZ-CASE A — Vollzeit FRA-Cabin, Steuerjahr 2024:
+REFERENZ-CASE A — Vollzeit FRA-Cabin, Steuerjahr 2024 (vom realen User mit FollowMe-PDF):
   Brutto:        ~46.000 €
   Z17:           0 €
   Arbeitstage:   159  ← Vollzeit mit Schulungen
   Fahrtage:      71
   Hotelnächte:   76
-  Z72:           30 Tage × 14€ = 420 €     ← viele Tagestrips Inland
+  Z72:           30 Tage × 14€ = 420 €     ← VIELE Same-Day-Tagestrips
+                                              (CPH/BER/HAM/MUC/AMS — egal ob
+                                               Inland oder EU-Ausland → 14€ pauschal)
   Z73:           11 Tage × 14€ = 154 €     ← echte Inland-Touren mit Hotel
-  Z74:           1 Tag × 28€ = 28 €
-  Z76:           5.073 €                    ← inklusive Auslandstour-An-/Abreisen
-  Pattern:       sehr aktive Crew mit ~17 Auslandstouren + viel Inland-Service
+                                              (Schulungen MUC/HAM mit Übernachtung)
+  Z74:           1 Tag × 28€ = 28 €         ← seltener Inland-24h-Sondertag
+  Z76:           5.073 €                    ← Auslandstouren mit Übernachtung
+                                              (BMF-Auslands-Pauschalen)
+  Pattern:       ~17 Auslandstouren + 30 Same-Day-Tagestrips
+                 + 5-6 Inland-Schulungen mit Hotel + restliche Standby/Office
 
 REFERENZ-CASE B — Vollzeit FRA-Cabin, Steuerjahr 2025:
   Brutto:        ~52.000 €
@@ -363,6 +421,24 @@ WICHTIGE BEOBACHTUNGEN:
 
 ❌ FEHLER 12: Bei Auslandstour 24h-Tag mit Inland-Pauschale (28€) rechnen
 ✓ RICHTIG: BMF-Auslands-24h-Pauschale für das Zielland (z.B. JNB 57€)
+
+❌ FEHLER 13: Same-Day-Tagestrip nach EU-Ausland (CPH/AMS/VIE/BER) als Z76 zählen
+✓ RICHTIG: Wenn User am gleichen Tag heimkehrt = Z72 mit 14€ Inland-Tagestrip-
+   Pauschale, EGAL ob Ziel CPH (Dänemark) oder MUC (Inland).
+   Z76 nur bei Ausland-ÜBERNACHTUNG.
+
+❌ FEHLER 14: Inland-Schulungen mit Hotel als Auslandstour klassifizieren
+✓ RICHTIG: D4-/DD-Schulung in MUC/HAM mit Hotel = Z73 (Anreise + Abreise je 14€).
+   Volltage zwischen An/Ab = nur Arbeitstage, keine zusätzliche VMA.
+
+❌ FEHLER 15: Bei Schulungen auf Hotel-Übernachtung schließen ohne FL-Marker
+✓ RICHTIG: Hotel nur wenn FL-Marker (≥10h Bodenzeit) ODER explizit
+   Hotel-Tag/Übernachtungs-Marker. Im Zweifelsfall NICHT als Hotel zählen.
+
+❌ FEHLER 16: Bei Office-Day (EK/EM/D4) keinen Fahrtag rechnen
+✓ RICHTIG: Office-Day in Homebase = TÄGLICH Anfahrt = Fahrtag pro Tag.
+   Auch wenn der User nicht fliegt — er muss zur Homebase fahren für die
+   Schulung/Bürodienst.
 
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
