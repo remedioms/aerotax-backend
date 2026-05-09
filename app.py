@@ -980,8 +980,14 @@ def process_real():
                 files[key] = [_normalize_upload(f.read(), f.filename) for f in uploaded]
 
         # Audit: Wieviele Files kamen direkt im Request an?
-        direct_summary = ', '.join(f"{k}={len(v)}" for k, v in files.items() if v) or 'KEINE'
-        print(f"[process] Direct-Upload: {direct_summary}")
+        # Pflicht-Kategorien (lsb/dp=flugstunden/se) explizit, Rest nur wenn vorhanden
+        direct_parts = []
+        for k, v in files.items():
+            if not v:
+                continue
+            label = {'dp': 'flugstunden', 'se': 'streckeneinsatz', 'lsb': 'lsb'}.get(k, k)
+            direct_parts.append(f"{label}={len(v)}")
+        print(f"[process] Direct-Upload: {', '.join(direct_parts) or 'KEINE'}")
 
         # Fallback: Files aus _store (in-memory) — überlebt Stripe-Retry
         ref_for_fallback = (request.form.get('ref') or '').strip()
@@ -1007,8 +1013,8 @@ def process_real():
 
         if not files.get('lsb') or not files.get('dp') or not files.get('se'):
             return jsonify({
-                'error': 'Pflicht-Dokumente fehlen. Bitte lade Lohnsteuerbescheinigung, '
-                         'Flugstunden-Übersichten und Streckeneinsatz-Abrechnungen hoch.'
+                'error': 'Für die Auswertung brauchst du Lohnsteuerbescheinigung, '
+                         'Flugstundenübersicht und Streckeneinsatzabrechnung.'
             }), 400
 
         # ── PAYMENT-GATE: ref (Stripe), free_retry_token, oder valider Promo-Code ──
@@ -1092,7 +1098,13 @@ def process_real():
         # ref/pi_id ans form-dict heften
         form['ref'] = ref or ''
         form['pi_id'] = pi_id or ''
-        _audit(job_id, 'job_created', {'year': form['year'], 'base': form['base'], 'files': {k: len(v) for k, v in files.items()}})
+        # Audit: nur die 3 Pflicht-Kategorien zählen + optionale Belege
+        _v7_files = {
+            'lsb': len(files.get('lsb') or []),
+            'flugstunden': len(files.get('dp') or []),
+            'streckeneinsatz': len(files.get('se') or []),
+        }
+        _audit(job_id, 'job_created', {'year': form['year'], 'base': form['base'], 'files': _v7_files})
 
         # WICHTIG: ZUERST auf Disk persistieren, DANN in Queue einreihen.
         # Sonst: Crash zwischen put und save → Job in Queue (geht bei Restart verloren)
@@ -2404,8 +2416,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '7.0.4',
-        'build':   'cluster-extend-se-anchored-z77-unify-2026-05-09',
+        'version': '7.1',
+        'build':   'three-document-flow-einsatzplan-removed-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5230,9 +5242,12 @@ def _is_inland_code(code):
     return code.upper().strip() in INLAND_IATA_CODES
 
 
-def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year=2025, homebase='FRA'):
-    """v6.0 Pre-Reader: Sonnet liest DP+Einsatzplan strukturiert pro Tag aus.
+def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes=None, year=2025, homebase='FRA'):
+    """v7.0 Pre-Reader: Sonnet liest Flugstundenübersichten strukturiert pro Tag aus.
     Liefert NUR Lese-Fakten — keine steuerliche Klassifikation!
+
+    Kein Einsatzplan mehr. Der einsatz_bytes-Parameter bleibt aus Kompatibilität,
+    wird aber ignoriert.
 
     Output-Format:
     {
@@ -5262,7 +5277,7 @@ def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year=2025, homebase='FRA
     if not ANTHROPIC_KEY:
         return None
     dp_bytes = _bytes_list(dp_bytes) if dp_bytes else []
-    einsatz_bytes = _bytes_list(einsatz_bytes) if einsatz_bytes else []
+    # einsatz_bytes-Parameter wird ignoriert (v7: nur 3 Pflichtdokumente)
     if not dp_bytes:
         return None
 
@@ -5299,48 +5314,31 @@ def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year=2025, homebase='FRA
                 'warnings': {
                     'type': 'array',
                     'items': {'type': 'string'},
-                    'description': 'Lese-Warnungen z.B. fehlender Einsatzplan, unklares Routing, mehrdeutige Marker'
+                    'description': 'Lese-Warnungen z.B. unklares Routing, mehrdeutige Marker'
                 }
             }
         }
     }
 
-    # PDF-Cap: insgesamt max 24 Documents an Sonnet (Anthropic-Limit ist 100, aber
-    # mehr als ~25 macht den Output zu groß für strukturierte Tagesdaten).
-    # DP wichtiger als Einsatzplan — DP first.
+    # PDF-Cap: insgesamt max 24 Documents an Sonnet (Anthropic-Limit ist 100,
+    # aber mehr als ~25 macht den Output zu groß für strukturierte Tagesdaten).
     content = []
     pdf_count = 0
-    max_total = 24
-    for label, blist in [('Dienstplan', dp_bytes), ('Einsatzplan', einsatz_bytes)]:
-        remaining = max_total - pdf_count
-        if remaining <= 0:
-            break
-        for pdf_bytes in blist[:remaining]:
-            try:
-                content.append({
-                    'type': 'document',
-                    'source': {'type': 'base64', 'media_type': 'application/pdf',
-                               'data': base64.b64encode(pdf_bytes).decode()}
-                })
-                pdf_count += 1
-            except: pass
+    for pdf_bytes in dp_bytes[:24]:
+        try:
+            content.append({
+                'type': 'document',
+                'source': {'type': 'base64', 'media_type': 'application/pdf',
+                           'data': base64.b64encode(pdf_bytes).decode()}
+            })
+            pdf_count += 1
+        except: pass
     if pdf_count == 0:
         return None
 
-    has_einsatz = len(einsatz_bytes) > 0
     einsatz_hinweis = ""
-    if not has_einsatz:
-        einsatz_hinweis = """
-═════ HINWEIS: KEIN EINSATZPLAN VORHANDEN ══════════════════════════════════
 
-Es wurde nur ein Dienstplan hochgeladen, kein Einsatzplan. Das ist OK.
-Extrahiere Marker und Routing soweit aus dem Dienstplan möglich. Setze
-confidence niedriger (0.5-0.7) bei unklaren Routings. Gib trotzdem days[]
-zurück. Vermerke im warnings-Array: "Kein Einsatzplan vorhanden — Routing
-nur aus Dienstplan abgeleitet".
-"""
-
-    prompt = f"""Du bist ein DOKUMENTEN-PARSER für Lufthansa-Crew-Dienstpläne (Steuerjahr {year}, Homebase {homebase}).
+    prompt = f"""Du bist ein DOKUMENTEN-PARSER für Lufthansa-Flugstundenübersichten (Steuerjahr {year}, Homebase {homebase}).
 
 ═════ ZWINGEND: TOOL VERWENDEN ══════════════════════════════════════════════
 
@@ -7267,12 +7265,11 @@ def hybrid_analyze(form, files):
     dp_bytes = []
     for item in (files.get('dp') or []):
         dp_bytes.append(item[0] if isinstance(item, tuple) else item)
+    # Einsatzplan ist seit v7 nicht mehr Pflicht und wird nicht aktiv genutzt.
+    # Falls der Frontend-Upload-Flow legacy noch Bytes mitschickt: hier ignoriert.
     einsatz_bytes = []
-    for item in (files.get('einsatz') or []):
-        einsatz_bytes.append(item[0] if isinstance(item, tuple) else item)
 
-    print(f"[hybrid] Start sequenziell: LSB={len(lsb_bytes)} SE={len(se_bytes)} "
-          f"DP={len(dp_bytes)} Einsatzplan={len(einsatz_bytes)}")
+    print(f"[v7] Start: LSB={len(lsb_bytes)} SE={len(se_bytes)} Flugstunden={len(dp_bytes)}")
 
     errors = []
 

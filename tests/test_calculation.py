@@ -650,6 +650,36 @@ def test_as_dict_item_normalizer():
     assert _as_dict_item('string') == {}
 
 
+# ── v7 Einsatzplan-frei Tests ──────────────────────────────────────────────
+
+def test_v7_dp_reader_signature_einsatz_optional():
+    """_sonnet_read_dp_structured akzeptiert Aufruf ohne einsatz_bytes."""
+    from app import _sonnet_read_dp_structured
+    import inspect
+    sig = inspect.signature(_sonnet_read_dp_structured)
+    params = list(sig.parameters.values())
+    # einsatz_bytes hat default-Value (optional)
+    p_einsatz = next((p for p in params if p.name == 'einsatz_bytes'), None)
+    if p_einsatz is not None:
+        assert p_einsatz.default is None or p_einsatz.default == [], \
+            f"einsatz_bytes muss optional sein, default ist {p_einsatz.default}"
+
+
+def test_v7_required_documents_lsb_dp_se():
+    """Required-Documents sind nur lsb + dp + se. Einsatzplan nicht."""
+    # Test schaut nicht auf HTTP-Layer, sondern dass kein 'einsatz' in der
+    # Required-Validation oder Audit-Job-Created-Files erscheint.
+    import inspect
+    from app import process_real
+    src = inspect.getsource(process_real)
+    # lsb, dp, se müssen erwähnt sein
+    assert "files.get('lsb')" in src
+    assert "files.get('dp')" in src
+    assert "files.get('se')" in src
+    # einsatzplan_files darf nicht als Pflicht geprüft werden
+    assert "files.get('einsatz')" not in src or "not files.get('einsatz')" not in src
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

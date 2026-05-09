@@ -1,10 +1,18 @@
 # AeroTax Backend — Arbeitsweise
 
-## Architektur-Grundsatz (v6.0)
+## Architektur-Grundsatz (v7.0)
 
-> **Sonnet liest Dienstplan/Einsatzplan strukturiert pro Tag aus. Das Backend zählt harte Fakten wie Arbeitstage, Fahrtage und Hotelnächte deterministisch. Opus darf diese Fakten nicht ändern, sondern nur steuerlich klassifizieren.**
+> **Sonnet liest Lohnsteuerbescheinigung, Flugstundenübersicht und Streckeneinsatzabrechnung strukturiert. Backend matcht DP+SE pro Datum und klassifiziert deterministisch. Opus ist NICHT mehr Hauptklassifikator.**
 
-Konkret: `_sonnet_read_dp_structured()` → `_count_deterministic()` → `_opus_classify_structured_days_v6()` → `_validate_opus_against_structure()`. Bei Crash der v6.0-Pipeline: Fallback auf v5.7-Pfad (`_opus_classify_days_v2`). Disable-Flag: `AEROTAX_DISABLE_V6=1`.
+Pflichtbasis (3 Dokumente + Formularangaben):
+1. Lohnsteuerbescheinigung
+2. Flugstundenübersicht
+3. Streckeneinsatzabrechnung
+4. Formular: Steuerjahr, Homebase, Entfernung km, ggf. Zusatzfahrten
+
+**Einsatzplan ist aus dem Produkt entfernt — nicht wieder als Pflichtdokument einführen.**
+
+Pipeline: `_sonnet_read_lsb_v2` → `_sonnet_read_se_structured` → `_sonnet_read_dp_structured` → `_match_dp_se_per_day` → `_build_tour_clusters` → `_deterministic_classify_v7`. Kein Opus-Hauptklassifikator. Kein produktiver Fallback.
 
 ## Autonomie-Modus
 

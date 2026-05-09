@@ -1,8 +1,10 @@
 # AeroTax — Files & Architecture Guide
 
-**Stand:** 2026-05-09 · Version 6.0 · Build `structured-day-pipeline-deterministic-counts`
+**Stand:** 2026-05-09 · Version 7.x · Build `three-document-deterministic-flow`
 
-> **DESIGN-PRINZIP ab v6.0:** Sonnet liest Dienstplan/Einsatzplan strukturiert pro Tag aus. Das Backend zählt harte Fakten wie Arbeitstage, Fahrtage und Hotelnächte deterministisch. Opus darf diese Fakten nicht ändern, sondern nur steuerlich klassifizieren.
+> **DESIGN-PRINZIP ab v7.0:** Sonnet liest Lohnsteuerbescheinigung, Flugstundenübersicht und Streckeneinsatzabrechnung strukturiert. Backend matcht DP+SE pro Datum und klassifiziert deterministisch. Opus ist NICHT mehr Hauptklassifikator. Einsatzplan ist nicht mehr Teil des Produkts.
+
+**Pflicht-Dokumente:** LSB + Flugstundenübersicht + Streckeneinsatzabrechnung + Formular (Steuerjahr/Homebase/km/Zusatzfahrten).
 
 Briefing für Mit-Entwickler (Mensch oder KI). Dieses Dokument erklärt was wo liegt und warum, damit ihr ohne wochenlanges Reverse-Engineering einsteigen könnt.
 
