@@ -77,8 +77,8 @@ PRICE_ID              = os.getenv('AEROTAX_PRICE_ID')
 FRONTEND_URL          = os.getenv('FRONTEND_URL','https://aerosteuer.de')
 
 # ── v8: Reader-/Engine-Versionierung ──
-APP_VERSION = '8.0'
-APP_BUILD   = 'audit-safe-deterministic-2026-05-09'
+APP_VERSION = '8.3'
+APP_BUILD   = 'strict-fahrtage-arbeitstage-pdf-cleanup-2026-05-10'
 READER_VERSIONS = {
     'lsb': 'sonnet_lsb_v8_0',
     'se':  'sonnet_se_structured_v8_0',
@@ -6924,8 +6924,14 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     reason = f'Aktive SE {se_ort} aber Inland/Ausland unklar'
                     unresolved_reason = f'aktive SE-Zeile ohne stfrei_inland-Klarheit (DP={at})'
             else:
+                # v8.3: at='unknown'/'none' ohne SE-Spur → KEIN Arbeitstag.
+                # Diese Tage sind weder Frei (nicht eindeutig) noch Dienst.
+                # Wir markieren sie als ZeroDay aber NICHT-dienstlich, sodass
+                # arbeitstage sie nicht zählt.
                 klass = 'ZeroDay' if at in ('unknown', 'none', '') else 'Issue'
-                reason = f'Activity-Type {at} ohne SE/Cluster-Spur'
+                reason = f'Activity-Type {at} ohne SE/Cluster-Spur — nicht als Arbeitstag gewertet'
+                # zero_day_dienstlich = False: standalone unknown ist kein Dienst
+                zero_day_dienstlich = False  # noqa: F841 (später ausgewertet)
                 if klass == 'Issue':
                     unresolved_reason = f'activity_type={at} unklar'
 
@@ -6953,6 +6959,18 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                   f"routing={'-'.join(d.get('routing') or [])} se_count={se.get('count',0)} "
                   f"se_ort={se.get('stfrei_ort','')} reason='{unresolved_reason}'")
 
+        # v8.3: dienstlich-Flag bestimmen — entscheidet ob ZeroDay/Issue als
+        # Arbeitstag zählt. Z72/Z73/Z74/Z76/Office/Standby/Training sind immer
+        # dienstlich. ZeroDay ist nur dienstlich wenn aus echtem Tour/Same-Day
+        # (= DP hatte echten Dienst-Marker). Unknown/none ohne Spur → False.
+        if klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby'):
+            dienstlich = True
+        elif klass == 'ZeroDay':
+            # Original-AT vor in_extended_cluster-Patch: aus DP holen
+            orig_at = d.get('activity_type', 'unknown')
+            dienstlich = orig_at in ('tour', 'same_day', 'office', 'training', 'standby')
+        else:
+            dienstlich = False  # Frei/Issue
         tage_detail.append({
             'datum': datum,
             'klass': klass,
@@ -6961,6 +6979,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'routing': '-'.join(d.get('routing') or []),
             'tour_dauer': 1,
             'eur': round(eur_added, 2),
+            'dienstlich': dienstlich,
         })
 
     # ── Counter aus klass aggregieren ──
@@ -6979,42 +6998,83 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     z74_eur = round(sum(t['eur'] for t in tage_detail if t['klass'] == 'Z74'), 2)
     z76_eur = round(sum(t['eur'] for t in tage_detail if t['klass'] == 'Z76'), 2)
 
-    ARBEITS_KLASSEN = {'Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby', 'ZeroDay'}
-    arbeitstage = sum(1 for t in tage_detail if t['klass'] in ARBEITS_KLASSEN)
+    # v8.3: Arbeitstage strenger — Z72/Z73/Z74/Z76/Office/Standby zählen immer.
+    # ZeroDay nur wenn dienstlich=True (Same-Day < 8h, isolierter Tour-Tag).
+    # Standalone unknown ohne SE-Spur (ZeroDay mit dienstlich=False) zählt NICHT.
+    HARD_AT_KLASSEN = {'Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby'}
+    arbeitstage = sum(
+        1 for t in tage_detail
+        if t['klass'] in HARD_AT_KLASSEN
+        or (t['klass'] == 'ZeroDay' and t.get('dienstlich'))
+    )
+    zero_dienstlich_tage = sum(1 for t in tage_detail if t['klass'] == 'ZeroDay' and t.get('dienstlich'))
+    zero_skipped_tage    = sum(1 for t in tage_detail if t['klass'] == 'ZeroDay' and not t.get('dienstlich'))
+    print(f"[v8-counts-detail] arbeitstage_sources Z72={z72_tage} Z73={z73_tage} Z74={z74_tage} "
+          f"Z76={z76_tage} Office={office_tage} Standby={standby_tage} "
+          f"ZeroDay_dienstlich={zero_dienstlich_tage} skipped_unknown={zero_skipped_tage} "
+          f"Issue={issue_tage}")
 
-    # Fahrtage v8.1: aus dp.requires_commute aggregieren (nicht aus klass-Map).
-    # requires_commute=true nur bei: Tourstart ab Homebase, Same-Day, Office/Training
-    # an Homebase. Layover-Tage, Tourfortsetzung, Heimkehr, Standby zählen nicht.
-    # ZUSÄTZLICH: Heimkehr-Tage (ends_at_homebase=true UND prev_overnight) zählen
-    # als Fahrtag — der User fährt vom Flughafen heim.
+    # Fahrtage v8.3: ausschließlich dp.requires_commute (Sonnet oder Heuristik).
+    # Kein automatischer Heimkehr-Fahrtag mehr — der Heimkehrtag zählt nur wenn
+    # Sonnet/Heuristik explizit eine NEUE Anfahrt zur Homebase erkennt
+    # (= requires_commute=true, was nur bei Tour-Anreise/Same-Day/Office/Training
+    # gesetzt wird). Mehrtagestour = max 1 Fahrtag (Tourstart).
     fahr_tage = 0
-    fahr_skipped = []
+    fahr_skipped_heimkehr = 0
+    fahr_skipped_layover = 0
+    fahr_skipped_tourfortsetzung = 0
+    fahr_skipped_unknown = 0
+    fahr_skipped_standby = 0
+    fahr_skipped_other = 0
     for i, m in enumerate(sorted_days):
         d = m['dp']
         datum = m['datum']
-        # Heimkehr-Erkennung: ends_at_homebase + Vortag-overnight + heute kein overnight
         prev_d = sorted_days[i-1]['dp'] if i > 0 else None
-        is_heimkehr_fahrt = (
-            d.get('ends_at_homebase') and
-            prev_d and prev_d.get('overnight_after_day') and
-            not d.get('overnight_after_day')
-        )
         klass_today = tage_detail[i]['klass'] if i < len(tage_detail) else 'Issue'
-        # Frei/Urlaub/Krank/Issue zählen nie als Fahrtag
+        at = d.get('activity_type', '')
+        overnight = bool(d.get('overnight_after_day'))
+        prev_overnight = bool(prev_d and prev_d.get('overnight_after_day'))
+
         if klass_today in ('Frei', 'Issue'):
-            fahr_skipped.append(f'{datum}:{klass_today}')
+            fahr_skipped_other += 1
             continue
+        if at == 'standby':
+            fahr_skipped_standby += 1
+            print(f"[v8-fahrtage-detail] datum={datum} counted=False reason='Standby zuhause'")
+            continue
+
         if d.get('requires_commute'):
             fahr_tage += 1
-            print(f"[v8-fahrtage-detail] datum={datum} counted=True reason='requires_commute=true ({d.get('activity_type','')})'")
-        elif is_heimkehr_fahrt:
-            fahr_tage += 1
-            print(f"[v8-fahrtage-detail] datum={datum} counted=True reason='Heimkehr-Fahrt nach Layover'")
+            print(f"[v8-fahrtage-detail] datum={datum} counted=True reason='requires_commute=true ({at})'")
         else:
-            fahr_skipped.append(f'{datum}:no_commute')
+            if not overnight and prev_overnight:
+                fahr_skipped_heimkehr += 1
+                reason = 'Heimkehrtag — keine neue Anfahrt'
+            elif overnight and prev_overnight:
+                fahr_skipped_layover += 1
+                reason = 'Layover-Tag (Tourfortsetzung)'
+            elif overnight and at == 'tour':
+                fahr_skipped_tourfortsetzung += 1
+                reason = 'Tour-Layover ohne Homebase-Start'
+            elif at in ('unknown', 'none', ''):
+                fahr_skipped_unknown += 1
+                reason = f'unknown/{at or "leer"}'
+            else:
+                fahr_skipped_other += 1
+                reason = f'no_commute ({at})'
+            print(f"[v8-fahrtage-detail] datum={datum} counted=False reason='{reason}'")
 
-    # Hotel-Nächte: nur Tage mit overnight=true UND klass in Cluster-Hotel-Klassen
+    print(f"[v8-fahrtage-summary] counted={fahr_tage} skipped_heimkehr={fahr_skipped_heimkehr} "
+          f"skipped_layover={fahr_skipped_layover} skipped_tourfortsetzung={fahr_skipped_tourfortsetzung} "
+          f"skipped_unknown={fahr_skipped_unknown} skipped_standby={fahr_skipped_standby} "
+          f"skipped_other={fahr_skipped_other}")
+
+    # Hotel-Nächte v8.3: nur Tage mit overnight_after_day=true UND
+    # echtem Layover-Ort außerhalb Homebase UND VMA-Klasse Z73/Z74/Z76.
+    # Z76-Heimkehrtag (overnight=false) zählt automatisch nicht. Frei/Issue
+    # mit overnight=true (DP-Reader-Fehler) wird explizit ausgeschlossen.
     HOTEL_KLASSEN = {'Z73', 'Z74', 'Z76'}
+    NON_HOTEL_KLASSEN = {'Frei', 'Issue', 'Standby', 'Office', 'ZeroDay'}
     hotel_naechte = 0
     hotel_skipped = []
     for i, m in enumerate(sorted_days):
@@ -7024,15 +7084,23 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         if i >= len(tage_detail):
             continue
         t = tage_detail[i]
-        if t['klass'] in HOTEL_KLASSEN:
+        klass = t['klass']
+        # Layover-Ort prüfen — Homebase/leer = keine Hotelnacht
+        layover_ort = (d.get('layover_ort') or m['se'].get('stfrei_ort') or '').upper()
+        is_homebase = layover_ort in ('FRA', (homebase or 'FRA').upper(), '')
+        if klass in HOTEL_KLASSEN and not is_homebase:
             hotel_naechte += 1
+        elif klass in HOTEL_KLASSEN and is_homebase:
+            hotel_skipped.append(f'{t["datum"]}:homebase')
+            ort_disp = layover_ort or 'leer'
+            print(f"[v8-hotel-skipped] datum={t['datum']} reason='Layover-Ort={ort_disp} = Homebase'")
+        elif klass in NON_HOTEL_KLASSEN:
+            hotel_skipped.append(f'{t["datum"]}:{klass}')
+            print(f"[v8-hotel-skipped] datum={t['datum']} reason='overnight=true aber klass={klass} (kein Hotel)'")
         else:
-            hotel_skipped.append(f'{t["datum"]}:{t["klass"]}')
-            print(f"[v8-hotel-extra] datum={t['datum']} klass={t['klass']} reason='overnight=true aber klass nicht Hotel-relevant'")
+            hotel_skipped.append(f'{t["datum"]}:{klass}')
+            print(f"[v8-hotel-extra] datum={t['datum']} klass={klass} reason='overnight=true aber klass={klass}'")
 
-    print(f"[v8-counts-detail] arbeitstage_sources Z72={z72_tage} Z73={z73_tage} Z74={z74_tage} "
-          f"Z76={z76_tage} Office={office_tage} Standby={standby_tage} ZeroDay={zero_tage} "
-          f"Issue={issue_tage}")
     print(f"[v8-hotel-detail] counted={hotel_naechte} skipped={len(hotel_skipped)}")
     print(f"[v8-classify] arbeit={arbeitstage}T fahr={fahr_tage}T hotel={hotel_naechte}T  "
           f"Z72={z72_tage}T/{z72_eur:.2f}€  Z73={z73_tage}T/{z73_eur:.2f}€  "
@@ -9321,8 +9389,10 @@ def erstelle_pdf(d):
         ps("eye", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
            leading=12, alignment=TA_CENTER, spaceAfter=24, letterSpacing=2.5)))
 
-    # Title — dünn & elegant, kleiner & runder
-    S.append(Paragraph(f"{d.get('name','')}<font size=\"18\">'s</font> Steuerauswertung",
+    # Title — v8.3: kein englisches Possessiv mehr ("'s Steuerauswertung").
+    _name = d.get('name', '') or ''
+    _title = f"Werbungskosten-Auswertung für {_name}" if _name else "Werbungskosten-Auswertung"
+    S.append(Paragraph(_title,
         ps("h1", fontSize=20, textColor=TEXT, fontName="Helvetica",
            leading=26, alignment=TA_CENTER, spaceAfter=6, letterSpacing=0)))
     S.append(Paragraph(f"Steuerjahr {d.get('year',2025)}",
@@ -9417,7 +9487,7 @@ def erstelle_pdf(d):
         ps("hero_h", fontSize=18, textColor=TEXT, fontName="Helvetica",
            leading=24, spaceAfter=6, letterSpacing=-0.2)))
     S.append(Paragraph(
-        "Eine Eingabe, ein Wert — alles weitere ist Anhang. "
+        "Eine Eingabe, ein Wert — die Aufteilung liegt als Anlage bei. "
         "Folge den vier Schritten unten, dann ist deine Werbungskosten-Auswertung "
         "in deiner Steuererklärung verbucht.",
         ps("hero_sub", fontSize=10, textColor=TEXT2, fontName="Helvetica",
@@ -9425,7 +9495,7 @@ def erstelle_pdf(d):
 
     # ── Dezenter Betrag-Block (klein, elegant) ──
     betrag_box = Table([[
-        Paragraph("EINZUTRAGENDER BETRAG",
+        Paragraph("EINZUTRAGENDER GESAMTBETRAG",
             ps("bb_l", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
                leading=11, letterSpacing=1.8)),
         Paragraph(eur(d['netto']),
@@ -9449,15 +9519,23 @@ def erstelle_pdf(d):
         ps("steps_h", fontSize=12, textColor=TEXT2, fontName="Helvetica",
            leading=16, spaceAfter=14, letterSpacing=0.3)))
 
+    # v8.3: Sachlicher WISO-Text — kein "Reisenebenkosten"/"alle anderen Felder
+    # bleiben leer". Der Wert ist eine zusammengefasste Werbungskosten-Auswertung.
     steps = [
         ("1", "WISO Steuer öffnen",
          "Lege einen neuen Eintrag unter <b>Ausgaben → Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten</b> an."),
         ("2", "Beschreibung eintragen",
          f"Bei <i>Beschreibung der Auswärtstätigkeit</i> eintragen: <b>Dienstplan-Auswertung AeroTAX {d.get('year', 2025)}</b>."),
-        ("3", f"Betrag eintragen:  <b>{eur(d['netto'])}</b>",
-         "Genau dieser Wert kommt ins Feld <b>Reisenebenkosten</b>. Alle anderen Felder bleiben leer — Verpflegung, Fahrtkosten und Trinkgelder sind bereits enthalten."),
+        ("3", f"Gesamtbetrag eintragen:  <b>{eur(d['netto'])}</b>",
+         "Trage den ausgewiesenen Gesamtbetrag ein. Der Wert ist eine "
+         "<b>zusammengefasste Werbungskosten-Auswertung</b> aus Fahrtkosten, "
+         "Reinigung, Reisenebenkosten und verbleibenden VMA nach Arbeitgeber-"
+         "Erstattungen. Die genaue Aufteilung findest du im Abschnitt "
+         "<i>Berechnung im Detail</i>."),
         ("4", "Dieses PDF als Anlage anhängen",
-         "WISO erlaubt PDF-Anhänge an die Steuererklärung. Berechnung und Belege sind hier vollständig — falls das Finanzamt Rückfragen hat, liegt alles bei."),
+         "Füge dieses PDF deiner Steuererklärung bei. Es enthält Rechenweg, "
+         "verwendete Werte und Nachweise. Bitte prüfe die Werte vor "
+         "Übernahme in deine Steuersoftware."),
     ]
     for n, title, desc in steps:
         t = Table([[
@@ -9574,13 +9652,12 @@ def erstelle_pdf(d):
         ps("disc_t", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
            leading=12, alignment=TA_CENTER, spaceAfter=8, letterSpacing=1.5)))
     S.append(Paragraph(
-        "Diese Auswertung wurde automatisiert auf Basis deiner hochgeladenen Dokumente erstellt. "
-        "AeroTAX erbringt <b>keine geschäftsmäßige Hilfeleistung in Steuersachen</b> iSv § 1 StBerG "
-        "und ersetzt keine individuelle Beratung durch eine Steuerberaterin oder einen Steuerberater. "
-        "Wir übernehmen keine Gewähr für die Richtigkeit, Vollständigkeit oder steuerliche "
-        "Anerkennung der berechneten Werte durch das Finanzamt. Prüfe vor Eintragung in deine "
-        "Steuererklärung selbst, ob alle Werte plausibel sind, und ziehe im Zweifelsfall fachlichen "
-        "Rat hinzu. Die rechtliche Verantwortung für deine Steuererklärung liegt bei dir.",
+        "Diese Auswertung wurde automatisiert auf Basis deiner hochgeladenen "
+        "Dokumente erstellt. AeroTAX ist ein Berechnungs- und Dokumentations-"
+        "werkzeug und ersetzt keine individuelle steuerliche Beratung. Bitte "
+        "prüfe die Werte vor Übernahme in deine Steuersoftware. Bei steuerlichen "
+        "Fragen wende dich an eine zugelassene Steuerberaterin, einen "
+        "Steuerberater oder deine Steuersoftware.",
         ps("disc_b", fontSize=8.5, textColor=TEXT3, fontName="Helvetica",
            leading=13, alignment=TA_CENTER, spaceAfter=8)))
 
@@ -9826,21 +9903,11 @@ def erstelle_pdf(d):
         S.append(PageBreak())
         for el in section("Lohnsteuerbescheinigung — Übersicht"): S.append(el)
 
-        # Persönliche Daten
-        S.append(Paragraph("PERSÖNLICHE DATEN",
-            ps("lsb_h1", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
-               leading=11, spaceAfter=10, letterSpacing=1.5)))
-        pers_items = [
-            ("Steuerklasse", sk),
-            ("Kinderfreibeträge", str(kfb)),
-            ("Identifikationsnummer", identnr),
-            ("Geburtsdatum", gebdat),
-            ("Personalnummer", pnr),
-        ]
-        for label, val in pers_items:
-            if val and val not in ('0', '0.0', ''):
-                S.append(kv(label, val))
-        S.append(Spacer(1, 0.4*cm))
+        # v8.3: Persönliche Daten/PII werden NICHT mehr im PDF gezeigt.
+        # Identifikationsnummer/Geburtsdatum/Personalnummer/Steuerklasse/Kinderfreibeträge
+        # sind für die Werbungskosten-Auswertung nicht erforderlich und werden aus
+        # Datenschutz-Gründen aus dem PDF entfernt. Die Daten bleiben in der
+        # Lohnsteuerbescheinigung selbst — die User schon hat — vorhanden.
 
         # Lohnsteuer-Grunddaten
         S.append(Paragraph("LOHNSTEUER (Zeilen 3–6)",
@@ -9851,7 +9918,7 @@ def erstelle_pdf(d):
             (f"Einbehaltene Lohnsteuer (Zeile 4)", eur(lohnst)),
             (f"Solidaritätszuschlag (Zeile 5)", eur(soli)),
             (f"Kirchensteuer AN (Zeile 6)", eur(kirche)),
-            (f"AG-Fahrkostenzuschuss Z17 (→ Abzug Reisekosten)", eur(d.get('ag_z17',0))),
+            (f"AG-Fahrkostenzuschuss Z17 (→ Abzug Fahrtkosten-/Anreisekosten-Topf)", eur(d.get('ag_z17',0))),
         ]
         for label, val in lsb_items:
             S.append(kv(label, val))

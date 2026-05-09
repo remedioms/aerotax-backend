@@ -1258,9 +1258,9 @@ def test_v81_dp_schema_has_commute_fields():
         assert field in src, f"Feld '{field}' fehlt im DP-Reader-Schema/Prompt"
 
 
-def test_v81_layover_does_not_count_as_fahrtag():
-    """Layover-Tag (3-Tages-Auslandstour) erzeugt 1 Anreise + 1 Heimkehr-Fahrtag,
-    nicht 3 Fahrtage."""
+def test_v83_layover_does_not_count_as_fahrtag():
+    """v8.3: 3-Tages-Auslandstour = 1 Fahrtag (Tourstart). Layover und Heimkehr
+    zählen NICHT mehr automatisch — sonst wären Fahrtage zu hoch."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': '2025-01-13', 'activity_type': 'tour', 'overnight_after_day': True,
@@ -1277,10 +1277,9 @@ def test_v81_layover_does_not_count_as_fahrtag():
     ]}
     matched = _match_dp_se_per_day(structured, se, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=0)
-    # 1 Anreise (commute=true) + 1 Heimkehr (ends_at_homebase + prev_overnight)
-    # = 2 Fahrtage. NICHT 3.
-    assert result['fahr_tage'] == 2, \
-        f"3-Tages-Tour sollte 2 Fahrtage haben (An + Heimkehr), ist {result['fahr_tage']}"
+    # v8.3: nur 1 Fahrtag (Tourstart), Heimkehr/Layover zählen nicht
+    assert result['fahr_tage'] == 1, \
+        f"3-Tages-Tour sollte 1 Fahrtag (Tourstart) haben, ist {result['fahr_tage']}"
 
 
 def test_v81_isolated_heimkehrtag_no_double_fahrtag():
@@ -1383,6 +1382,141 @@ def test_v812_no_lines_months_in_user_notes():
             if 'notes.append' in line:
                 assert 'lines=' not in line, f"User-Note enthält 'lines=': {line.strip()[:120]}"
                 assert 'months=' not in line, f"User-Note enthält 'months=': {line.strip()[:120]}"
+
+
+# ── v8.3 Tests: strenge Fahrtage / Arbeitstage / Hotel / PDF-Wording ──
+
+def test_v83_heimkehr_no_fahrtag():
+    """Heimkehrtag nach Layover zählt NICHT mehr automatisch als Fahrtag."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-02-10', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'JFK'], 'layover_ort': 'JFK'},
+        {'datum': '2025-02-11', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['JFK', 'FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-02-10', 'stfrei_betrag': 40, 'stfrei_ort': 'JFK', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-02-11', 'stfrei_betrag': 40, 'stfrei_ort': 'JFK', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 1, \
+        f"2-Tages-Tour: nur Tourstart-Fahrtag (1), nicht 2. Ist {result['fahr_tage']}"
+
+
+def test_v83_standby_not_fahrtag():
+    """Standby zuhause: Arbeitstag ja, Fahrtag nein."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-03-01', 'activity_type': 'standby', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['arbeitstage'] == 1
+    assert result['fahr_tage'] == 0
+
+
+def test_v83_zeroday_unknown_not_arbeitstag():
+    """ZeroDay aus at='unknown' ohne SE/Cluster zählt NICHT als Arbeitstag."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-15', 'activity_type': 'unknown', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # ZeroDay ja, aber dienstlich=False → nicht als AT gezählt
+    assert result['arbeitstage'] == 0, \
+        f"unknown ohne Spur darf nicht AT zählen, arbeitstage={result['arbeitstage']}"
+
+
+def test_v83_zeroday_same_day_under_8h_counts_as_arbeitstag():
+    """Same-Day < 8h → ZeroDay, aber dienstlich=True → AT zählt."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-15', 'activity_type': 'same_day', 'overnight_after_day': False,
+         'has_fl': False, 'start_time': '08:00', 'end_time': '14:00'},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=0)
+    # ZeroDay weil <8h, aber war same_day-Dienst → dienstlich=True → AT zählt
+    assert result['arbeitstage'] == 1
+
+
+def test_v83_hotel_homebase_does_not_count():
+    """Tag mit overnight=True UND Layover-Ort=Homebase (FRA) zählt nicht als Hotel."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-01', 'activity_type': 'tour', 'overnight_after_day': True,
+         'layover_ort': 'FRA', 'has_fl': True},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-01', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['hotel_naechte'] == 0, \
+        f"FRA als Layover-Ort = kein Hotel, hotel={result['hotel_naechte']}"
+
+
+def test_v83_pdf_no_pii_rendered():
+    """PDF-Renderer rendert KEINE Identifikationsnummer/Personalnummer/Geburtsdatum mehr."""
+    import inspect
+    from app import erstelle_pdf
+    src = inspect.getsource(erstelle_pdf)
+    # Es darf keinen aktiven render-Block für die PII-Felder geben
+    assert '("Identifikationsnummer", identnr)' not in src
+    assert '("Geburtsdatum", gebdat)' not in src
+    assert '("Personalnummer", pnr)' not in src
+
+
+def test_v83_pdf_no_english_possessive():
+    """PDF-Header hat kein '<font>'s</font>'-Possessiv mehr."""
+    import inspect
+    from app import erstelle_pdf
+    src = inspect.getsource(erstelle_pdf)
+    assert '\'s</font> Steuerauswertung' not in src
+
+
+def test_v83_pdf_wiso_text_softer():
+    """WISO-Anleitung hat kein 'Reisenebenkosten' / 'Alle anderen Felder bleiben leer' mehr."""
+    import inspect
+    from app import erstelle_pdf
+    src = inspect.getsource(erstelle_pdf)
+    assert 'Genau dieser Wert kommt ins Feld <b>Reisenebenkosten</b>' not in src
+    assert 'Alle anderen Felder bleiben leer' not in src
+    assert 'zusammengefasste Werbungskosten-Auswertung' in src
+
+
+def test_v83_pdf_z17_text_correct():
+    """Z17-Text → 'Fahrtkosten-/Anreisekosten-Topf' statt 'Abzug Reisekosten'."""
+    import inspect
+    from app import erstelle_pdf
+    src = inspect.getsource(erstelle_pdf)
+    assert 'Abzug Fahrtkosten-/Anreisekosten-Topf' in src
+    assert '→ Abzug Reisekosten)' not in src
+
+
+def test_v83_pdf_disclaimer_softened():
+    """Disclaimer hat kein 'keine geschäftsmäßige Hilfeleistung' mehr (PDF entschärft)."""
+    import inspect
+    from app import erstelle_pdf
+    src = inspect.getsource(erstelle_pdf)
+    assert 'keine geschäftsmäßige Hilfeleistung in Steuersachen' not in src
+    assert 'Berechnungs- und Dokumentations-' in src or 'Berechnungs- und Dokumentationswerkzeug' in src
+
+
+def test_v83_dienstlich_flag_in_tage_detail():
+    """tage_detail enthält dienstlich-Flag pro Tag."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-01', 'activity_type': 'office', 'overnight_after_day': False},
+        {'datum': '2025-06-02', 'activity_type': 'unknown', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    for t in result['tage_detail']:
+        assert 'dienstlich' in t, f"tage_detail-Eintrag ohne dienstlich-Flag: {t['datum']}"
 
 
 if __name__ == '__main__':
