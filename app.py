@@ -717,22 +717,20 @@ def _calc_worker():
             _release_memory_to_os()
 
 
-def _start_calc_worker():
-    global _calc_worker_started
-    if _calc_worker_started:
-        return
-    _calc_worker_started = True
-    _t = __import__('threading').Thread(target=_calc_worker, daemon=True, name='calc-worker')
-    _t.start()
-    print("[queue] Worker-Thread gestartet")
-    # Bei Restart: laufende/queued Jobs auf Disk → als 'failed' markieren
-    # (Files sind nach Restart eh weg aus _store, kann also nicht weiter rechnen)
-    # User kriegt Token-Fail-Pfad und kann mit Code neu starten.
+def _restart_recovery_async():
+    """Läuft im Background-Thread, blockiert nicht den App-Start (sonst Render Port-Timeout)."""
     try:
-        for fn in os.listdir(_JOBS_DIR):
+        if not os.path.exists(_JOBS_DIR):
+            return
+        files_list = os.listdir(_JOBS_DIR)
+        if not files_list:
+            return
+        recovered = 0
+        for fn in files_list:
             if not fn.endswith('.json'): continue
             try:
-                with open(os.path.join(_JOBS_DIR, fn)) as _f:
+                path = os.path.join(_JOBS_DIR, fn)
+                with open(path) as _f:
                     j = json.load(_f)
                 if j.get('status') in ('queued', 'pending', 'running'):
                     j['status'] = 'failed'
@@ -741,13 +739,29 @@ def _start_calc_worker():
                     job_id = fn[:-5]
                     with _jobs_lock:
                         _jobs[job_id] = j
-                    with open(os.path.join(_JOBS_DIR, fn), 'w') as _wf:
+                    with open(path, 'w') as _wf:
                         json.dump(j, _wf, default=str)
-                    print(f"[queue] Restart-Recovery: Job {job_id[:8]} auf 'failed' gesetzt")
+                    recovered += 1
             except Exception as _re:
                 print(f"[queue] Restart-Recovery fail für {fn}: {_re}")
+        if recovered > 0:
+            print(f"[queue] Restart-Recovery: {recovered} Job(s) auf 'failed' gesetzt")
     except Exception as _e:
         print(f"[queue] Restart-Recovery konnte JOBS_DIR nicht lesen: {_e}")
+
+
+def _start_calc_worker():
+    global _calc_worker_started
+    if _calc_worker_started:
+        return
+    _calc_worker_started = True
+    _T = __import__('threading').Thread
+    # Worker-Thread (verarbeitet Queue) sofort starten
+    _T(target=_calc_worker, daemon=True, name='calc-worker').start()
+    # Restart-Recovery in eigenem Thread (kann lange dauern bei vielen alten Jobs)
+    # → blockiert nicht den App-Start, Port wird sofort geöffnet
+    _T(target=_restart_recovery_async, daemon=True, name='restart-recovery').start()
+    print("[queue] Worker-Thread + Restart-Recovery gestartet (async)")
 
 
 # Worker beim App-Init starten (bei Render-Worker-Start)
@@ -2226,8 +2240,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '3.2',
-        'build':   'einsatzplan-an-dp-strict-reading-2026-05-09',
+        'version': '3.3',
+        'build':   'restart-recovery-async-port-fix-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
