@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '7.0.3',
-        'build':   'mixed-cluster-per-day-classification-2026-05-09',
+        'version': '7.0.4',
+        'build':   'cluster-extend-se-anchored-z77-unify-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -6107,16 +6107,73 @@ def _match_dp_se_per_day(structured_days, se_structured):
     return matched
 
 
+def _belongs_to_previous_tour(day_match, prev_match, prev_cluster):
+    """True wenn day_match ein nachklingender Abreise/Stop-Over-Tag der vorherigen
+    Tour ist. Wird nach _build_tour_clusters aufgerufen um Cluster zu erweitern.
+    """
+    if not prev_match or not prev_cluster:
+        return False
+    if not day_match:
+        return False
+    d = day_match['dp']
+    se = day_match['se']
+    prev_d = prev_match['dp']
+    prev_se = prev_match['se']
+    # Vortag muss aktive Tour-Übernachtung gewesen sein
+    if not prev_d.get('overnight_after_day'):
+        return False
+    # Heutiger Tag darf keinen NEUEN Tour-Start haben (kein neuer Cluster)
+    today_at = d.get('activity_type', '')
+    if today_at in ('frei', 'urlaub', 'krank'):
+        return False
+    # Heutiger Tag mit aktiver SE-Zeile?
+    has_active_se = se.get('count', 0) > 0 and se.get('stfrei_total', 0) > 0
+    if has_active_se:
+        # Heutige SE-Ort = Vortag-Layover-Ort? (Abreisetag aus Layover)
+        prev_layover = prev_se.get('stfrei_ort') or prev_d.get('layover_ort', '')
+        today_se_ort = se.get('stfrei_ort', '')
+        if today_se_ort and prev_layover and today_se_ort.upper() == prev_layover.upper():
+            return True
+        # Heutige SE Auslands-Ort + prev_cluster Auslands-Tour → Abreisetag
+        if se.get('stfrei_inland') is False and prev_cluster.get('has_foreign'):
+            return True
+        # Heutige SE Inland-Ort + prev Auslands-Layover + heute kein overnight → Heimkehr-Tag
+        if se.get('stfrei_inland') is True and prev_cluster.get('has_foreign') and not d.get('overnight_after_day'):
+            return True
+    # DP-Routing: beginnt am vorherigen Layover, endet am Homebase?
+    today_routing = d.get('routing') or []
+    prev_layover = prev_se.get('stfrei_ort') or prev_d.get('layover_ort', '')
+    if today_routing and prev_layover:
+        first = (today_routing[0] or '').upper() if today_routing else ''
+        if first == prev_layover.upper():
+            return True
+    return False
+
+
 def _build_tour_clusters(sorted_days):
     """Identifiziert zusammenhängende Tour-Sequenzen (Tour-Cluster).
-    Eine Tour beginnt am Tag mit activity_type='tour' nach einer Heimkehr/Frei-Phase
-    und endet am ersten Tag mit overnight_after_day=false innerhalb der Tour-Kette.
-    Liefert Liste von Cluster-Daten:
-      [{indices: [i1,i2,...], has_foreign: bool, has_inland: bool,
-        anreise_idx: i1, abreise_idx: iN, all_tour_indices: [...]}, ...]
-    """
+    PHASE 1: Cluster aus tour-Tagen bilden.
+    PHASE 2: Cluster nach hinten erweitern wenn Folgetage Abreise-Charakter haben."""
     clusters = []
     current = None
+
+    def _absorb_layover_info(c, m):
+        d = m['dp']
+        if not d.get('overnight_after_day'):
+            return
+        se = m['se']
+        se_inland = se.get('stfrei_inland')
+        layover_ort = d.get('layover_ort', '')
+        if se_inland is False:
+            c['has_foreign'] = True
+        elif layover_ort and not _is_inland_code(layover_ort):
+            c['has_foreign'] = True
+        elif se_inland is True:
+            c['has_inland'] = True
+        elif layover_ort and _is_inland_code(layover_ort):
+            c['has_inland'] = True
+
+    # PHASE 1: Cluster aus tour-Tagen
     for i, m in enumerate(sorted_days):
         d = m['dp']
         at = d.get('activity_type', '')
@@ -6130,36 +6187,49 @@ def _build_tour_clusters(sorted_days):
             else:
                 current['indices'].append(i)
                 current['abreise_idx'] = i
-
-            # Layover-Charakter aus DP+SE bestimmen — aber nur für Tage mit overnight
-            # (Heimkehr-Tag selbst hat keine Übernachtung mehr)
-            if overnight:
-                se = m['se']
-                se_inland = se.get('stfrei_inland')
-                layover_ort = d.get('layover_ort', '')
-                # Auslands-Indizien priorisieren — Auslands-Layover dominiert die Tour
-                if se_inland is False:
-                    current['has_foreign'] = True
-                elif layover_ort and not _is_inland_code(layover_ort):
-                    current['has_foreign'] = True
-                elif se_inland is True:
-                    current['has_inland'] = True
-                elif layover_ort and _is_inland_code(layover_ort):
-                    current['has_inland'] = True
-                # Wenn weder DP noch SE Layover-Info: keep flags
-
-            # Tour endet wenn overnight=false (Heimkehr-Tag)
+            _absorb_layover_info(current, m)
             if not overnight:
                 clusters.append(current)
                 current = None
         else:
-            # Nicht-Tour-Tag → laufende Tour beenden
             if current is not None:
                 clusters.append(current)
                 current = None
-    # Falls Tour bis Jahresende offen
     if current is not None:
         clusters.append(current)
+
+    # PHASE 2: Cluster nach hinten erweitern — bei nachklingenden Abreise-/Heimkehr-Tagen
+    cluster_by_idx = {}
+    for c in clusters:
+        for i in c['indices']:
+            cluster_by_idx[i] = c
+    for c in clusters:
+        # Schau auf den Tag NACH dem letzten Index
+        last_idx = c['indices'][-1] if c['indices'] else None
+        if last_idx is None:
+            continue
+        next_idx = last_idx + 1
+        # Bis zu 2 Folgetage prüfen
+        for offset in range(1, 3):
+            check_idx = last_idx + offset
+            if check_idx >= len(sorted_days):
+                break
+            if check_idx in cluster_by_idx:
+                break  # gehört bereits zu einem (anderen) Cluster
+            day_match = sorted_days[check_idx]
+            prev_match = sorted_days[last_idx]
+            if _belongs_to_previous_tour(day_match, prev_match, c):
+                # Anhängen
+                c['indices'].append(check_idx)
+                c['abreise_idx'] = check_idx
+                cluster_by_idx[check_idx] = c
+                _absorb_layover_info(c, day_match)
+                last_idx = check_idx
+                datum = day_match.get('datum', '')
+                print(f"[v7-cluster-extend] datum={datum} cluster={c.get('_id', '?')} "
+                      f"reason='SE/DP belongs to previous layover'")
+            else:
+                break
     return clusters
 
 
@@ -6230,18 +6300,27 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
         prev_overnight = bool(prev and prev['dp'].get('overnight_after_day'))
         prev_at = prev['dp'].get('activity_type', '') if prev else ''
 
+        # Cluster-Extend: wenn dieser Tag durch _belongs_to_previous_tour zu einer
+        # Tour gehört (z.B. Heimkehr-Tag den Sonnet als 'unknown' klassifiziert hat),
+        # behandele ihn als 'tour' für die Klassifikation.
+        in_extended_cluster = (i in cluster_for_idx) and at in NICHT_AT
+
         # Hotel-Nacht zählen
         if overnight:
             hotel_naechte += 1
 
-        # Frei/Urlaub/Krank: nichts
-        if at in NICHT_AT:
+        # Frei/Urlaub/Krank: nichts (außer Cluster-Extend greift)
+        if at in NICHT_AT and not in_extended_cluster:
             continue
 
         arbeitstage += 1
         klass = 'Sonstiges'
         begruendung = ''
         eur_added = 0.0
+
+        # Wenn Cluster-Extend: as ob 'tour'
+        if in_extended_cluster:
+            at = 'tour'
 
         # Klassifikation
         if at == 'standby':
@@ -6462,10 +6541,58 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
             print(f"[v7-classify-day] datum={datum} cluster={cluster_id} ort={today_layover_ort or '-'} klass={klass} reason='{begruendung[:80]}'")
 
         else:
-            # unknown / Sonstiges
-            klass = 'Sonstiges'
-            begruendung = f'Activity-Type {at} — unklar'
-            unklare.append(f'{datum}: activity_type={at} unklar')
+            # unknown / Sonstiges — aber wenn aktive SE-Zeile vorhanden ist,
+            # erzwinge Klassifikation aus SE+Cluster-Kontext
+            has_active_se = se.get('count', 0) > 0 and float(se.get('stfrei_total', 0) or 0) > 0
+            cluster_for_today = cluster_for_idx.get(i)
+
+            if has_active_se:
+                # Reklassifikation aus SE-Kontext
+                se_ort = se.get('stfrei_ort', '')
+                se_inland = se.get('stfrei_inland')
+                cluster_foreign = bool(cluster_for_today and cluster_for_today.get('has_foreign'))
+
+                if se_inland is False:
+                    # Auslands-SE → Z76
+                    klass = 'Z76'
+                    bmf_aus = _get_bmf_for_iata(se_ort, year)
+                    eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+                    z76_eur += eur_added
+                    begruendung = f'Aktive SE-Zeile {se_ort} (Auslands-Reklassifikation aus {at})'
+                    unklare.append(f'{datum}: activity_type={at} mit aktiver Auslands-SE → Z76 ({se_ort})')
+                elif se_inland is True and cluster_foreign:
+                    # FRA-Stempel im Auslands-Cluster → Auslandstour-Abreise
+                    target_iata = ''
+                    for ci in cluster_for_today.get('indices', []):
+                        cm = sorted_days[ci]
+                        if cm['dp'].get('overnight_after_day'):
+                            cand = cm['se'].get('stfrei_ort') or cm['dp'].get('layover_ort', '')
+                            if cand and not _is_inland_code(cand):
+                                target_iata = cand
+                                break
+                    klass = 'Z76'
+                    bmf_aus = _get_bmf_for_iata(target_iata, year)
+                    eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+                    z76_eur += eur_added
+                    begruendung = f'Aktive SE-Zeile {se_ort} im Auslands-Cluster (Abreise nach {target_iata or "?"}) Z76'
+                    unklare.append(f'{datum}: SE-Stempel {se_ort} bei Auslands-Cluster (Abreisetag) → Z76')
+                elif se_inland is True:
+                    # Inland-SE ohne Auslands-Cluster → Z73
+                    klass = 'Z73'
+                    z73_tage += 1
+                    eur_added = bmf_inland['an_abreise']
+                    begruendung = f'Aktive Inland-SE-Zeile {se_ort} (Reklassifikation aus {at}) Z73'
+                    unklare.append(f'{datum}: activity_type={at} mit aktiver Inland-SE → Z73 ({se_ort})')
+                else:
+                    klass = 'Sonstiges'
+                    begruendung = f'Aktive SE-Zeile {se_ort}, aber Kontext unklar (activity_type={at})'
+                    unklare.append(f'{datum}: aktive SE-Zeile, aber Klassifikation unklar — manuell prüfen')
+                # Arbeitstag/Fahrtag korrigieren wenn fälschlich nicht gezählt
+                # (aber wir haben schon arbeitstage += 1 oben gemacht, weil at NICHT in NICHT_AT)
+            else:
+                klass = 'Sonstiges'
+                begruendung = f'Activity-Type {at} — unklar'
+                unklare.append(f'{datum}: activity_type={at} unklar')
 
         tage_detail.append({
             'datum': datum,
@@ -7182,43 +7309,52 @@ def hybrid_analyze(form, files):
     gc.collect()
     _release_memory_to_os()
 
-    # Schritt 2b: Sonnet-SE-Summary (Z77-Total für Topf-Trennung; bleibt nötig
-    # weil _berechne_via_hybrid Z77 für Reisekosten-Topf braucht)
+    # Schritt 2b: Sonnet-SE-Summary (für Cross-Check)
     se_summary = None
     if se_bytes:
         try:
             se_summary = _sonnet_read_se_summary_v2(se_bytes, year)
-            # Wenn Structured durchgelaufen ist: Z77 daraus übernehmen (deterministisch)
-            if se_structured and se_structured.get('z77_total'):
-                if se_summary:
-                    se_summary['z77_total'] = max(
-                        float(se_summary.get('z77_total', 0) or 0),
-                        float(se_structured.get('z77_total', 0) or 0)
-                    )
-                else:
-                    se_summary = {
-                        'z77_total': se_structured['z77_total'],
-                        'auslandsspesen_total': sum(
-                            float(s.get('stfrei_betrag', 0) or 0)
-                            for s in se_structured.get('se_lines', [])
-                            if not s.get('storno') and s.get('stfrei_inland') is False
-                        ),
-                        'inlandsspesen_total': sum(
-                            float(s.get('stfrei_betrag', 0) or 0)
-                            for s in se_structured.get('se_lines', [])
-                            if not s.get('storno') and s.get('stfrei_inland') is True
-                        ),
-                        'flugmonate': sorted(set(
-                            int(s.get('datum', '0000-00-00')[5:7])
-                            for s in se_structured.get('se_lines', [])
-                            if s.get('datum') and not s.get('storno')
-                        )),
-                    }
         except Exception as e:
             errors.append(f'SE-Summary: {e}')
             print(f"[hybrid] Sonnet-SE-Summary crash: {e}")
     gc.collect()
     _release_memory_to_os()
+
+    # Z77 vereinheitlichen — eine Quelle für die Backend-Berechnung
+    if se_structured:
+        z77_from_lines = sum(
+            float(s.get('stfrei_betrag', 0) or 0)
+            for s in se_structured.get('se_lines', [])
+            if not s.get('storno')
+        )
+        z77_from_months = float((se_summary or {}).get('z77_total', 0) or 0)
+        z77_used = max(z77_from_lines, z77_from_months)
+        diff = abs(z77_from_lines - z77_from_months)
+        print(f"[v7-se] z77_from_lines={z77_from_lines:.2f} z77_from_months={z77_from_months:.2f} "
+              f"z77_used={z77_used:.2f} diff={diff:.2f}")
+        if diff > 50:
+            errors.append(f'Z77-Diff: lines={z77_from_lines:.2f} vs months={z77_from_months:.2f} (diff {diff:.2f}€)')
+        # se_summary auf einheitliche Z77-Quelle bringen
+        if se_summary is None:
+            se_summary = {}
+        se_summary['z77_total'] = z77_used
+        se_summary['z77_from_lines'] = z77_from_lines
+        se_summary['z77_from_months'] = z77_from_months
+        se_summary.setdefault('auslandsspesen_total', sum(
+            float(s.get('stfrei_betrag', 0) or 0)
+            for s in se_structured.get('se_lines', [])
+            if not s.get('storno') and s.get('stfrei_inland') is False
+        ))
+        se_summary.setdefault('inlandsspesen_total', sum(
+            float(s.get('stfrei_betrag', 0) or 0)
+            for s in se_structured.get('se_lines', [])
+            if not s.get('storno') and s.get('stfrei_inland') is True
+        ))
+        se_summary.setdefault('flugmonate', sorted(set(
+            int(s.get('datum', '0000-00-00')[5:7])
+            for s in se_structured.get('se_lines', [])
+            if s.get('datum') and not s.get('storno')
+        )))
 
     # Schritt 3: Sonnet liest DP strukturiert
     classification = None
@@ -7508,6 +7644,7 @@ def _berechne_via_hybrid(form, files):
     print(f"[berechne-hybrid] FERTIG: brutto={brutto:.2f} arbeit={arbeitstage} fahr={fahr_tage} "
           f"hotel={hotel_naechte} VMA-In={vma_in:.2f} VMA-Aus={vma_aus:.2f} Z77={z77:.2f} "
           f"gesamt={gesamt:.2f} netto={netto:.2f}")
+    print(f"[v7] brutto={gesamt:.2f} netto={netto:.2f} issues={len(notes)}")
 
     return {
         'name':             form.get('name', 'Flugbegleiter'),

@@ -479,6 +479,37 @@ def test_v7_classify_blr_tour_with_fra_stempel_anreise():
     assert result['z76_eur'] >= 100, f"Z76 EUR sollte > 100€ sein, ist {result['z76_eur']}"
 
 
+def test_v7_cluster_extends_to_abreisetag_with_active_se():
+    """Reference-Contract: BLR-Tour 03.-06.01 — Tag 06.01 (Abreise) hat aktive SE-Zeile
+    aber nicht als 'tour' im DP klassifiziert. Cluster-Extend muss greifen."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'BLR'},
+        {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'BLR'},
+        # Tag 06.01: Sonnet hat es NICHT als 'tour' erkannt (z.B. 'unknown')
+        # aber SE-Zeile zeigt BLR-Heimkehr-Routing
+        {'datum': '2025-01-06', 'activity_type': 'unknown', 'overnight_after_day': False,
+         'has_fl': False, 'routing': ['BLR', 'FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-05', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-06', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Tag 06.01 muss als Z76 klassifiziert sein (Cluster-Extend), nicht als Sonstiges
+    detail_06 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-06']
+    assert detail_06, "Tag 06.01 fehlt in tage_detail"
+    assert detail_06[0]['klass'] == 'Z76', \
+        f"Tag 06.01 sollte Z76 sein (Cluster-Extend), ist {detail_06[0]['klass']}"
+
+
 def test_v7_classify_mixed_tour_inland_day_keeps_inland():
     """Mixed-Cluster: Bulgarien → Deutschland 24h → Schweden.
     Erwartung: Tag 1+3 Z76 (Ausland), Tag 2 Z74 (Inland 24h zwischen 2 Inland-Layovern wäre Z74)
