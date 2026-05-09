@@ -2240,8 +2240,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '3.5',
-        'build':   'tour-aware-zurueckgenommen-konservativ-2026-05-09',
+        'version': '4.0',
+        'build':   'hybrid-sonnet-opus-singlesource-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -4783,13 +4783,751 @@ Antworte NUR mit JSON (keine Backticks):
     return inferred, notes
 
 
+# ════════════════════════════════════════════════════════════════════════
+# HYBRID-ANALYSE: Sonnet (LSB+SE-Summen) + Opus (Tag-Klassifikation)
+# Drei parallele KI-Calls, dann Merge. Single-Source-of-Truth pro Bereich.
+# ════════════════════════════════════════════════════════════════════════
+
+def _sonnet_read_lsb_v2(pdf_bytes_list):
+    """Sonnet liest LSB-PDF(s) direkt via Tool-Use. Standardisiertes Format
+    der elektronischen LSB → Sonnet kann das deterministisch abklopfen.
+    Bei Multi-LSB: numerische Werte werden addiert, Personalien von 1. PDF."""
+    if not pdf_bytes_list or not ANTHROPIC_KEY:
+        return None
+    pdf_bytes_list = _bytes_list(pdf_bytes_list)
+
+    accumulated = {
+        'brutto': 0.0, 'lohnsteuer': 0.0, 'soli': 0.0,
+        'kirchensteuer_an': 0.0, 'ag_fahrt_z17': 0.0, 'ag_fahrt_z18_pauschal': 0.0,
+        'rv_an': 0.0, 'kv_an': 0.0, 'pv_an': 0.0, 'av_an': 0.0, 'rv_ag': 0.0,
+        'verpflegungszuschuss_z20': 0.0, 'doppelhaus_z21': 0.0,
+        'identnr': '', 'geburtsdatum': '', 'personalnummer': '',
+        'steuerklasse': '1', 'kinderfreibetraege': 0.0,
+        'kirchensteuermerkmale': '', 'arbeitgeber': 'Deutsche Lufthansa AG',
+        'finanzamt': '', 'steuernummer_ag': '',
+        'vorsorge_gesamt_an': 0.0, 'rv_gesamt': 0.0,
+    }
+
+    lsb_tool = {
+        'name': 'submit_lsb_extraktion',
+        'description': 'Extrahiere alle Felder aus der Lohnsteuerbescheinigung',
+        'input_schema': {
+            'type': 'object',
+            'required': ['brutto'],
+            'properties': {
+                'brutto':           {'type': 'number', 'description': 'Bruttoarbeitslohn (Zeile 3)'},
+                'lohnsteuer':       {'type': 'number', 'description': 'einbehaltene Lohnsteuer (Zeile 4)'},
+                'soli':             {'type': 'number', 'description': 'Solidaritätszuschlag (Zeile 5)'},
+                'kirchensteuer_an': {'type': 'number', 'description': 'Kirchensteuer (Zeile 6/7)'},
+                'ag_fahrt_z17':     {'type': 'number', 'description': 'AG-Fahrkostenzuschuss Entfernungspauschale (Zeile 17)'},
+                'ag_fahrt_z18_pauschal': {'type': 'number', 'description': 'Pauschalversteuert 15% (Zeile 18) — Jobticket-Indikator'},
+                'verpflegungszuschuss_z20': {'type': 'number', 'description': 'stfrei Verpflegung (Zeile 20)'},
+                'doppelhaus_z21':   {'type': 'number', 'description': 'Doppelter Haushalt (Zeile 21)'},
+                'rv_ag':            {'type': 'number', 'description': 'AG-Rentenversicherung (Zeile 22a)'},
+                'rv_an':            {'type': 'number', 'description': 'AN-Rentenversicherung (Zeile 23a)'},
+                'kv_an':            {'type': 'number', 'description': 'AN-Krankenversicherung (Zeile 25)'},
+                'pv_an':            {'type': 'number', 'description': 'AN-Pflegeversicherung (Zeile 26)'},
+                'av_an':            {'type': 'number', 'description': 'AN-Arbeitslosenversicherung (Zeile 27)'},
+                'identnr':          {'type': 'string', 'description': 'Steuerliche Identifikationsnummer (11 Ziffern)'},
+                'geburtsdatum':     {'type': 'string', 'description': 'DD.MM.YYYY'},
+                'personalnummer':   {'type': 'string'},
+                'steuerklasse':     {'type': 'string', 'description': '1-6'},
+                'kinderfreibetraege': {'type': 'number'},
+                'kirchensteuermerkmale': {'type': 'string'},
+                'arbeitgeber':      {'type': 'string'},
+                'finanzamt':        {'type': 'string'},
+                'steuernummer_ag':  {'type': 'string'},
+            }
+        }
+    }
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
+    is_first = True
+    for pdf_bytes in pdf_bytes_list:
+        try:
+            content = [
+                {
+                    'type': 'document',
+                    'source': {'type': 'base64', 'media_type': 'application/pdf',
+                               'data': base64.b64encode(pdf_bytes).decode()}
+                },
+                {
+                    'type': 'text',
+                    'text': ('Du bekommst eine deutsche elektronische Lohnsteuerbescheinigung. '
+                             'Lies alle Felder ab und liefere sie über das Tool. '
+                             'Deutsche Zahlen (1.234,56 € → 1234.56). '
+                             'Wenn ein Feld leer/0 ist, gib 0 zurück. '
+                             'Bei Personalien: nur was im Dokument steht, sonst leerer String.')
+                }
+            ]
+            resp = None
+            for attempt in range(3):
+                try:
+                    resp = client.messages.create(
+                        model='claude-sonnet-4-6', max_tokens=2000,
+                        tools=[lsb_tool],
+                        tool_choice={'type': 'tool', 'name': 'submit_lsb_extraktion'},
+                        messages=[{'role': 'user', 'content': content}]
+                    )
+                    break
+                except Exception as e:
+                    if attempt == 2: raise
+                    print(f"[Sonnet-LSB] retry {attempt+1}/3: {str(e)[:100]}")
+                    import time as _t; _t.sleep(2 ** attempt + 1)
+            tool_input = None
+            for block in resp.content:
+                if getattr(block, 'type', None) == 'tool_use':
+                    tool_input = block.input
+                    break
+            if not tool_input:
+                print(f"[Sonnet-LSB] kein tool_input erhalten")
+                continue
+
+            # Numerische Werte addieren (Multi-LSB)
+            for k in ['brutto','lohnsteuer','soli','kirchensteuer_an',
+                      'ag_fahrt_z17','ag_fahrt_z18_pauschal',
+                      'rv_an','kv_an','pv_an','av_an','rv_ag',
+                      'verpflegungszuschuss_z20','doppelhaus_z21','kinderfreibetraege']:
+                v = tool_input.get(k)
+                try: accumulated[k] = round((accumulated[k] or 0) + float(v or 0), 2)
+                except: pass
+            # Personalien nur von 1. LSB
+            if is_first:
+                for k in ['identnr','geburtsdatum','personalnummer','steuerklasse',
+                          'kirchensteuermerkmale','arbeitgeber','finanzamt','steuernummer_ag']:
+                    v = tool_input.get(k)
+                    if v: accumulated[k] = str(v)
+                is_first = False
+            print(f"[Sonnet-LSB] gelesen: brutto={accumulated['brutto']:.2f} z17={accumulated['ag_fahrt_z17']:.2f} z20={accumulated['verpflegungszuschuss_z20']:.2f}")
+        except Exception as e:
+            print(f"[Sonnet-LSB] PDF fail: {e}")
+
+    accumulated['vorsorge_gesamt_an'] = round(
+        accumulated['rv_an'] + accumulated['kv_an'] +
+        accumulated['pv_an'] + accumulated['av_an'], 2)
+    accumulated['rv_gesamt'] = round(accumulated['rv_an'] + accumulated['rv_ag'], 2)
+    return accumulated
+
+
+def _sonnet_read_se_summary_v2(pdf_bytes_list, year=2025):
+    """Sonnet liest SE-PDFs nur für SUMMEN (Z77, Z76, Anzahl Abrechnungen, Flugmonate).
+    Tag-für-Tag-Klassifikation macht Opus separat. Hier nur einfache Aggregation."""
+    if not pdf_bytes_list or not ANTHROPIC_KEY:
+        return None
+    pdf_bytes_list = _bytes_list(pdf_bytes_list)
+    if not pdf_bytes_list:
+        return None
+
+    se_tool = {
+        'name': 'submit_se_summen',
+        'description': 'Liefere die Summen aus allen Streckeneinsatz-Abrechnungen',
+        'input_schema': {
+            'type': 'object',
+            'required': ['z77_total', 'flugmonate'],
+            'properties': {
+                'z77_total': {
+                    'type': 'number',
+                    'description': 'Σ aller stfrei-Werte über alle Tage und alle Abrechnungen — '
+                                   'das ist Z77 (steuerfreie Auszahlung vom Arbeitgeber)'
+                },
+                'summe_gesamt': {
+                    'type': 'number',
+                    'description': 'Σ aller Gesamt-Beträge (steuerpflichtig + steuerfrei)'
+                },
+                'summe_steuerpflichtig': {
+                    'type': 'number',
+                    'description': 'Σ aller steuerpflichtigen Anteile'
+                },
+                'flugmonate': {
+                    'type': 'array',
+                    'items': {'type': 'integer'},
+                    'description': 'Liste der Monate (1-12) in denen Flüge stattfanden'
+                },
+                'anzahl_abrechnungen': {
+                    'type': 'integer',
+                    'description': 'Anzahl der erkannten Monatsabrechnungen'
+                }
+            }
+        }
+    }
+
+    # Alle PDFs in einen Call (Sonnet kann viele Documents auf einmal)
+    content = []
+    for pdf_bytes in pdf_bytes_list[:14]:  # safety limit
+        try:
+            content.append({
+                'type': 'document',
+                'source': {'type': 'base64', 'media_type': 'application/pdf',
+                           'data': base64.b64encode(pdf_bytes).decode()}
+            })
+        except: pass
+    if not content:
+        return None
+    content.append({
+        'type': 'text',
+        'text': (f'Du bekommst Lufthansa Streckeneinsatz-Abrechnungen für {year}. '
+                 f'Pro Abrechnung gibt es eine Summe-Zeile mit drei Werten: Gesamt, Steuerpflichtig, Steuerfrei. '
+                 f'Z77 (steuerfrei gesamt) ist die Σ aller "Steuerfrei"-Werte. '
+                 f'Berechne über ALLE Abrechnungen die Summen. '
+                 f'Liste auch die Flugmonate (1-12) in denen Flüge stattfanden — erkennbar an den Datums-Zeilen DD.MM.YYYY.'
+                 f'Liefere via Tool.')
+    })
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
+    try:
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = client.messages.create(
+                    model='claude-sonnet-4-6', max_tokens=2000,
+                    tools=[se_tool],
+                    tool_choice={'type': 'tool', 'name': 'submit_se_summen'},
+                    messages=[{'role': 'user', 'content': content}]
+                )
+                break
+            except Exception as e:
+                if attempt == 2: raise
+                print(f"[Sonnet-SE] retry {attempt+1}/3: {str(e)[:100]}")
+                import time as _t; _t.sleep(2 ** attempt + 1)
+        tool_input = None
+        for block in resp.content:
+            if getattr(block, 'type', None) == 'tool_use':
+                tool_input = block.input
+                break
+        if not tool_input:
+            print(f"[Sonnet-SE] kein tool_input")
+            return None
+        result = {
+            'z77_total': float(tool_input.get('z77_total', 0) or 0),
+            'summe_gesamt': float(tool_input.get('summe_gesamt', 0) or 0),
+            'summe_steuerpflichtig': float(tool_input.get('summe_steuerpflichtig', 0) or 0),
+            'flugmonate': sorted(set(int(m) for m in tool_input.get('flugmonate', []) if 1 <= int(m) <= 12)),
+            'anzahl_abrechnungen': int(tool_input.get('anzahl_abrechnungen', 0) or 0),
+        }
+        print(f"[Sonnet-SE] Z77={result['z77_total']:.2f}€  Abrechnungen={result['anzahl_abrechnungen']}  "
+              f"Flugmonate={result['flugmonate']}")
+        return result
+    except Exception as e:
+        print(f"[Sonnet-SE] fail: {e}")
+        return None
+
+
+def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebase='FRA'):
+    """Opus 4.7: liest Dienstplan + Einsatzplan + SE parallel, klassifiziert Tag für Tag.
+    Liefert: arbeitstage, fahrtage, hotel_naechte, z72/73/74_tage und EUR, z76_eur,
+    plus monatlichen Nachweis. Konservative FollowMe-Methode."""
+    if not ANTHROPIC_KEY:
+        return None
+    dp_bytes = _bytes_list(dp_bytes) if dp_bytes else []
+    einsatz_bytes = _bytes_list(einsatz_bytes) if einsatz_bytes else []
+    se_bytes = _bytes_list(se_bytes) if se_bytes else []
+    if not dp_bytes:
+        return None  # ohne Dienstplan nicht möglich
+
+    # Alle PDFs als Document-Content
+    content = []
+    pdf_count = 0
+    for label, blist in [('Dienstplan', dp_bytes), ('Einsatzplan', einsatz_bytes), ('Streckeneinsatz', se_bytes)]:
+        for pdf_bytes in blist[:14]:
+            try:
+                content.append({
+                    'type': 'document',
+                    'source': {'type': 'base64', 'media_type': 'application/pdf',
+                               'data': base64.b64encode(pdf_bytes).decode()}
+                })
+                pdf_count += 1
+            except: pass
+    print(f"[Opus-Klassifikation] {pdf_count} PDFs an Opus übergeben")
+
+    # Tool für strukturierte Antwort
+    classify_tool = {
+        'name': 'submit_tag_klassifikation',
+        'description': 'Liefere die Tag-für-Tag-Auswertung der LH-Dokumente',
+        'input_schema': {
+            'type': 'object',
+            'required': ['arbeitstage', 'fahr_tage', 'hotel_naechte',
+                         'z72_tage', 'z73_tage', 'z74_tage', 'z76_eur', 'nachweis'],
+            'properties': {
+                'arbeitstage':   {'type': 'integer', 'description': 'Alle Tage mit Dienst (Tour/Office/Standby/Schulung), ohne Frei/Urlaub/Krank'},
+                'fahr_tage':     {'type': 'integer', 'description': 'Tage an denen User zum Flughafen fahren musste (Tour-Start + Office-Day). Eine Tour = 1 Fahrtag total, egal wie lang.'},
+                'hotel_naechte': {'type': 'integer', 'description': 'Auslands-Übernachtungen (FL-Marker, ≥10h Bodenzeit nach EASA-FTL)'},
+                'z72_tage':      {'type': 'integer', 'description': 'Tagestrips Inland >8h (mit Briefingzeit-Berechnung) ohne Übernachtung'},
+                'z72_eur':       {'type': 'number',  'description': 'z72_tage × 14€ (BMF Inland Tagestrip)'},
+                'z73_tage':      {'type': 'integer', 'description': 'An-/Abreisetage Inland (mit Inland-Übernachtung). Auch Auslandstour-Anreise mit FRA-stfrei zählt hier (FollowMe-Methode konservativ).'},
+                'z73_eur':       {'type': 'number',  'description': 'z73_tage × 14€'},
+                'z74_tage':      {'type': 'integer', 'description': 'Inland 24h ohne Ab/An-Zeiten (selten)'},
+                'z74_eur':       {'type': 'number',  'description': 'z74_tage × 28€'},
+                'z76_eur':       {'type': 'number',  'description': 'Σ aller stfrei-Werte aus SE wo stfrei-Ort Ausland ist (Z76 VMA Ausland)'},
+                'nachweis':      {'type': 'string',  'description': 'Monatlicher Nachweis. Pro Monat 1-3 Sätze: was waren die Touren, wie viele Arbeitstage/Fahrtage/Hotel.'},
+                'unklare_tage':  {'type': 'array', 'items': {'type': 'string'}, 'description': 'Tage die nicht eindeutig klassifizierbar waren (mit Begründung)'},
+            }
+        }
+    }
+
+    prompt = f"""Du bist Senior-Steuerberater spezialisiert auf Lufthansa-Kabinenpersonal — und du arbeitest streng nach FollowMe-Standard (= konservativ, FA-akzeptiert).
+
+Dein Auftrag: Lies die {pdf_count} hochgeladenen PDFs (Dienstplan/Flugstunden, Einsatzplan/CAS, Streckeneinsatz-Abrechnungen) für Steuerjahr {year} und klassifiziere jeden Tag des Jahres.
+
+═══ HOMEBASE: {homebase} ═══
+
+═══ LH-MARKER-KATALOG (lies, klassifiziere, zähle) ═══
+
+Frei-Tage (KEIN Arbeitstag, KEIN Fahrtag, KEIN Hotel):
+- FREI / FREIER TAG / "/-"
+- U / URLAUB
+- K / KRANK
+- LM NACHGEWAEHRUNG (Lohnnachzahlung ohne Dienst)
+- unbezahlte Freistellung
+
+Tour-Tage (Auslands-Tour mit Übernachtung):
+- LH#### A {homebase} → ZIEL = Tour-Start: Arbeitstag UND 1 Fahrtag (pro Tour, nicht pro Tag!)
+- LH#### E ZIEL → {homebase} = Tour-Ende: Arbeitstag (KEIN neuer Fahrtag)
+- FL STRECKENEINSATZTAG = Layover im Ausland: Arbeitstag UND 1 Hotelnacht
+- Mehretappen ohne Heimkehr (z.B. FRA→GVA→OTP→FRA) = 1 Fahrtag total
+- Folge-Tage einer Tour = jeweils Arbeitstag (kein Fahrtag, kein neues Hotel ausser FL-Marker)
+
+Home-Duty (Arbeitstag, KEIN Fahrtag — User war zuhause):
+- SBY / RES / Standby / Reserve / Bereitschaft zuhause
+- Online-Schulung, e-Learning, Webinar von zuhause
+
+Office/Vor-Ort-Dienst in {homebase} (Arbeitstag UND Fahrtag täglich):
+- EK / EK BÜRODIENST
+- EM (Erste-Hilfe / Briefing)
+- D4 (Schulung Präsenz — JEDER Tag = Arbeitstag + Fahrtag)
+- DD SEMINAR / DD ABORDNUNG (mehrtägig — JEDER Tag = Arbeitstag + Fahrtag, da täglich Anreise)
+- EH (Erste Hilfe), Sprachtest, Medical
+- BRIEFING mit Uhrzeit am {homebase}
+
+═══ EASA-FTL Layover-Regel ═══
+FL-Marker bei LH = echter Layover ≥10h Bodenzeit am Zielort = 1 Hotelnacht.
+Nachtflug-Heimkehr (z.B. raus 22:00, zurück 06:00 nächsten Tag) = Turnaround, KEIN Hotel.
+Bei mehrtägiger Auslandstour: jeder Zwischen-Tag = 1 Hotelnacht.
+
+═══ BRIEFINGZEITEN LH-Kabine (für Z72-Tagestrip-8h-Schwelle) ═══
+- Wenn explizit im Einsatzplan/Dienstplan: diese benutzen (z.B. "Briefingzeit(LT FRA): 03/02/25 20:10")
+- Sonst Faustregel:
+  → Kurzstrecke (Block ≤ 4h):  85 Min vor STD (1:25 h)
+  → Langstrecke (Block > 4h): 110 Min vor STD (1:50 h)
+- Plus 30 Min Sign-Off nach Block-In, einheitlich
+- Inland-Tagestrip qualifiziert für Z72 wenn Gesamtabwesenheit ≥ 480 min (8h)
+  (= 2× Anfahrt + Briefing + Block + 30 min Sign-Off)
+
+═══ VMA-KLASSIFIKATION nach SE-stfrei-Ort (FollowMe-Methode KONSERVATIV) ═══
+
+Pro SE-Tageszeile:
+- stfrei-Ort = INLAND (FRA/MUC/HAM/...): klassifiziere nach Tag-Typ
+  → AB+AN gleicher Tag = Z72 (Tagestrip, mit Briefingzeit-Check 8h-Schwelle)
+  → nur AB ODER nur AN (mit Übernachtung) = Z73 (An-/Abreise)
+  → keine Zeiten + Zwölftel=12 = Z74 (24h Inland, selten)
+- stfrei-Ort = AUSLAND (GRU/JFK/SEL/...): Z76 mit literal stfrei-Wert
+
+WICHTIG (FollowMe-Methode): Wenn LH am Anreise-Tag einer Auslandstour 14€ FRA-stfrei schreibt,
+zählt das als Z73 (NICHT als Z76 mit Auslandspauschale aufwerten). Konservativ ist sicherer
+beim Finanzamt.
+
+═══ VORGEHEN ═══
+
+1. Gehe Tag für Tag durch (1.1.{year} bis 31.12.{year}).
+2. Pro Tag: schaue Dienstplan + Einsatzplan + SE.
+3. Identifiziere Marker → klassifiziere → zähle.
+4. Aggregiere am Ende:
+   - arbeitstage, fahr_tage, hotel_naechte
+   - z72_tage, z73_tage, z74_tage (mit BMF-Pauschale × Tage = EUR)
+   - z76_eur = Σ stfrei-Werte mit Auslands-Stempel aus SE
+5. Schreibe einen Nachweis-Text Monat für Monat (1-3 Sätze pro Monat).
+
+═══ NICHT ═══
+- KEINE "Plausi-Bandbreiten" anwenden ("normal sind 110-150 Arbeitstage" → ignorieren!)
+- KEINE Werte erfinden — wenn Marker unklar, in `unklare_tage` listen
+- KEINE Auslands-Pauschalen für Inland-Anreise von Auslandstouren (FollowMe-konservativ!)
+- KEINE Tagestrips ohne 8h-Schwellen-Check als Z72 (mit Briefingzeit prüfen)
+
+Liefere via Tool das strukturierte Ergebnis."""
+
+    content.append({'type': 'text', 'text': prompt})
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=300.0)
+    import time as _t
+    start = _t.time()
+    try:
+        resp = None
+        for attempt in range(2):
+            try:
+                resp = client.messages.create(
+                    model='claude-opus-4-7', max_tokens=12000,
+                    tools=[classify_tool],
+                    tool_choice={'type': 'tool', 'name': 'submit_tag_klassifikation'},
+                    messages=[{'role': 'user', 'content': content}]
+                )
+                break
+            except Exception as e:
+                if attempt == 1: raise
+                print(f"[Opus-Klassifikation] retry: {str(e)[:100]}")
+                _t.sleep(5)
+        elapsed = _t.time() - start
+        tool_input = None
+        for block in resp.content:
+            if getattr(block, 'type', None) == 'tool_use':
+                tool_input = block.input
+                break
+        if not tool_input:
+            print(f"[Opus-Klassifikation] kein tool_input — content blocks: {[getattr(b,'type',None) for b in resp.content]}")
+            return None
+        result = {
+            'arbeitstage':   int(tool_input.get('arbeitstage', 0) or 0),
+            'fahr_tage':     int(tool_input.get('fahr_tage', 0) or 0),
+            'hotel_naechte': int(tool_input.get('hotel_naechte', 0) or 0),
+            'z72_tage':      int(tool_input.get('z72_tage', 0) or 0),
+            'z73_tage':      int(tool_input.get('z73_tage', 0) or 0),
+            'z74_tage':      int(tool_input.get('z74_tage', 0) or 0),
+            'z76_eur':       float(tool_input.get('z76_eur', 0) or 0),
+            'nachweis':      str(tool_input.get('nachweis', '') or ''),
+            'unklare_tage':  list(tool_input.get('unklare_tage', []) or []),
+        }
+        # EUR aus Tagen × BMF-Pauschale (vereinheitlicht)
+        bmf = BMF_INLAND_BY_YEAR.get(year, BMF_INLAND_BY_YEAR[2025])
+        result['z72_eur'] = round(result['z72_tage'] * bmf['tagestrip_8h'], 2)
+        result['z73_eur'] = round(result['z73_tage'] * bmf['an_abreise'], 2)
+        result['z74_eur'] = round(result['z74_tage'] * bmf['voll_24h'], 2)
+        result['z76_eur'] = round(result['z76_eur'], 2)
+        print(f"[Opus-Klassifikation] {elapsed:.1f}s: arbeit={result['arbeitstage']}T fahr={result['fahr_tage']}T "
+              f"hotel={result['hotel_naechte']}T  Z72={result['z72_tage']}T/{result['z72_eur']:.2f}€  "
+              f"Z73={result['z73_tage']}T/{result['z73_eur']:.2f}€  Z74={result['z74_tage']}T/{result['z74_eur']:.2f}€  "
+              f"Z76={result['z76_eur']:.2f}€  unklar={len(result['unklare_tage'])}")
+        return result
+    except Exception as e:
+        print(f"[Opus-Klassifikation] fail: {e}")
+        return None
+
+
+def hybrid_analyze(form, files):
+    """Hauptanalyse: Sonnet (LSB+SE-Summen) + Opus (Tag-Klassifikation) parallel.
+    Liefert ein dict mit allen für berechne() relevanten Feldern.
+    Rückgabe: {'lsb': {...}, 'se_summary': {...}, 'classification': {...}, 'errors': [...]}"""
+    import concurrent.futures as _cf
+    year = int(form.get('year', 2025))
+    homebase = _extract_homebase(form.get('base', 'Frankfurt (FRA)'))
+
+    lsb_bytes = []
+    for item in (files.get('lsb') or []):
+        lsb_bytes.append(item[0] if isinstance(item, tuple) else item)
+    se_bytes = []
+    for item in (files.get('se') or []):
+        se_bytes.append(item[0] if isinstance(item, tuple) else item)
+    dp_bytes = []
+    for item in (files.get('dp') or []):
+        dp_bytes.append(item[0] if isinstance(item, tuple) else item)
+    einsatz_bytes = []
+    for item in (files.get('einsatz') or []):
+        einsatz_bytes.append(item[0] if isinstance(item, tuple) else item)
+
+    print(f"[hybrid] Start: LSB={len(lsb_bytes)} SE={len(se_bytes)} DP={len(dp_bytes)} Einsatzplan={len(einsatz_bytes)}")
+
+    errors = []
+    with _cf.ThreadPoolExecutor(max_workers=3) as ex:
+        f_lsb  = ex.submit(_sonnet_read_lsb_v2, lsb_bytes) if lsb_bytes else None
+        f_se   = ex.submit(_sonnet_read_se_summary_v2, se_bytes, year) if se_bytes else None
+        f_cls  = ex.submit(_opus_classify_days_v2, dp_bytes, einsatz_bytes, se_bytes, year, homebase) if dp_bytes else None
+        try:    lsb_data = f_lsb.result() if f_lsb else None
+        except Exception as e: errors.append(f'LSB: {e}'); lsb_data = None
+        try:    se_summary = f_se.result() if f_se else None
+        except Exception as e: errors.append(f'SE: {e}'); se_summary = None
+        try:    classification = f_cls.result() if f_cls else None
+        except Exception as e: errors.append(f'DP-Klassifikation: {e}'); classification = None
+    return {
+        'lsb': lsb_data,
+        'se_summary': se_summary,
+        'classification': classification,
+        'errors': errors,
+    }
+
+
+def _berechne_via_hybrid(form, files):
+    """Hauptpfad: nutzt hybrid_analyze (Sonnet+Opus parallel) und baut komplettes
+    Result-Dict. Liefert None wenn nicht möglich (dann fallback auf alter Code)."""
+    try:
+        hr = hybrid_analyze(form, files)
+    except Exception as e:
+        print(f"[berechne-hybrid] hybrid_analyze crash: {e}")
+        return None
+
+    lst = (hr or {}).get('lsb') or {}
+    cls = (hr or {}).get('classification') or {}
+    se_sum = (hr or {}).get('se_summary') or {}
+    errors = (hr or {}).get('errors') or []
+
+    # Mindestanforderung: Klassifikation muss da sein (sonst keine Werbungskosten möglich)
+    if not cls or cls.get('arbeitstage', 0) == 0:
+        print(f"[berechne-hybrid] keine Klassifikation — fallback auf alten Code")
+        return None
+
+    notes = []
+    for e in errors:
+        notes.append(f'⚠ {e}')
+
+    # ── Werte aus Hybrid-Output ──
+    year_int = int(form.get('year', 2025))
+    bmf_inland = BMF_INLAND_BY_YEAR.get(year_int, BMF_INLAND_BY_YEAR[2025])
+    pendler = PENDLER_BY_YEAR.get(year_int, PENDLER_BY_YEAR[2025])
+    reinig_satz = REINIGUNG_PRO_TAG_BY_YEAR.get(year_int, 1.60)
+    trink_satz = TRINKGELD_PRO_NACHT_BY_YEAR.get(year_int, 3.60)
+
+    # LSB-Werte
+    brutto       = float(lst.get('brutto', 0) or 0)
+    lohnsteuer   = float(lst.get('lohnsteuer', 0) or 0)
+    soli         = float(lst.get('soli', 0) or 0)
+    kirchensteuer = float(lst.get('kirchensteuer_an', 0) or 0)
+    ag_z17       = float(lst.get('ag_fahrt_z17', 0) or 0)
+    z18_pauschal = float(lst.get('ag_fahrt_z18_pauschal', 0) or 0)
+    verpfl_z20   = float(lst.get('verpflegungszuschuss_z20', 0) or 0)
+    rv_an        = float(lst.get('rv_an', 0) or 0)
+    rv_ag        = float(lst.get('rv_ag', 0) or 0)
+    kv_an        = float(lst.get('kv_an', 0) or 0)
+    pv_an        = float(lst.get('pv_an', 0) or 0)
+    av_an        = float(lst.get('av_an', 0) or 0)
+    vorsorge_an  = float(lst.get('vorsorge_gesamt_an', 0) or 0)
+    rv_gesamt    = float(lst.get('rv_gesamt', 0) or 0)
+    identnr      = lst.get('identnr', '') or ''
+    geburtsdatum = lst.get('geburtsdatum', '') or ''
+    personalnummer = lst.get('personalnummer', '') or ''
+    arbeitgeber  = lst.get('arbeitgeber', 'Deutsche Lufthansa AG') or 'Deutsche Lufthansa AG'
+    steuerklasse = lst.get('steuerklasse', '1') or '1'
+    kinderfb     = float(lst.get('kinderfreibetraege', 0) or 0)
+
+    if not brutto:
+        notes.append('⚠️ Lohnsteuerbescheinigung nicht lesbar — Brutto auf 0 gesetzt')
+
+    # SE-Summen
+    z77 = float(se_sum.get('z77_total', 0) or 0)
+    spesen_gesamt = float(se_sum.get('summe_gesamt', 0) or 0)
+    spesen_steuer = float(se_sum.get('summe_steuerpflichtig', 0) or 0)
+    flugmonate    = list(se_sum.get('flugmonate', []) or [])
+
+    if not z77 and files.get('se'):
+        notes.append('⚠️ Streckeneinsatz konnte Z77-Summe nicht ermitteln — bitte prüfen')
+
+    # Klassifikations-Werte
+    arbeitstage   = int(cls.get('arbeitstage', 0) or 0)
+    fahr_tage     = int(cls.get('fahr_tage', 0) or 0)
+    hotel_naechte = int(cls.get('hotel_naechte', 0) or 0)
+    vma_72_tage   = int(cls.get('z72_tage', 0) or 0)
+    vma_73_tage   = int(cls.get('z73_tage', 0) or 0)
+    vma_74_tage   = int(cls.get('z74_tage', 0) or 0)
+    vma_aus       = float(cls.get('z76_eur', 0) or 0)
+    nachweis_text = str(cls.get('nachweis', '') or '')
+    unklare_tage  = list(cls.get('unklare_tage', []) or [])
+
+    # ── BMF-Pauschalen × Tage ──
+    vma_72 = round(vma_72_tage * bmf_inland['tagestrip_8h'], 2)
+    vma_73 = round(vma_73_tage * bmf_inland['an_abreise'], 2)
+    vma_74 = round(vma_74_tage * bmf_inland['voll_24h'], 2)
+    vma_in = round(vma_72 + vma_73 + vma_74, 2)
+
+    # ── Fahrtkosten ──
+    anreise = form.get('anreise', 'auto')
+    anreise_modes = set(m.strip() for m in str(anreise).split(',') if m.strip()) or {'auto'}
+    has_km = bool(anreise_modes & {'auto', 'fahrrad'})
+    km = float(form.get('km', 0) or 0) if has_km else 0
+    if km == 0 and cls.get('km'):
+        try: km = float(cls.get('km', 0) or 0)
+        except: pass
+
+    # Jobticket-Auto-Detection aus Z18
+    jobticket = 'ja_frei' if z18_pauschal > 0 else form.get('jobticket', 'nein')
+
+    fahr = 0.0
+    fahr_breakdown = []
+    if 'auto' in anreise_modes or 'fahrrad' in anreise_modes:
+        f_auto = round(min(km, 20) * fahr_tage * pendler['lt_20km'] +
+                       max(0, km - 20) * fahr_tage * pendler['gt_21km'], 2)
+        if f_auto > 0:
+            fahr += f_auto
+            fahr_breakdown.append(f'Auto/Fahrrad ({km}km × {fahr_tage}T): {f_auto:.2f}€')
+    if 'oepnv' in anreise_modes:
+        oepnv_k = float(form.get('oepnv_kosten', 0) or 0)
+        f_oepnv = 0 if jobticket == 'ja_frei' else oepnv_k
+        if f_oepnv > 0:
+            fahr += f_oepnv
+            fahr_breakdown.append(f'ÖPNV: {f_oepnv:.2f}€')
+    if 'shuttle' in anreise_modes:
+        f_shuttle = float(form.get('shuttle_kosten', 0) or 0)
+        if f_shuttle > 0:
+            fahr += f_shuttle
+            fahr_breakdown.append(f'Shuttle: {f_shuttle:.2f}€')
+    fahr = round(fahr, 2)
+    if fahr_breakdown:
+        print(f'[fahrtkosten] {fahr:.2f}€ aus: {", ".join(fahr_breakdown)}')
+
+    # ── Reinigung & Trinkgeld ──
+    reinig = round(arbeitstage * reinig_satz, 2)
+    trink  = round(hotel_naechte * trink_satz, 2)
+
+    # ── Optionale Belege ──
+    opt_keys = ['stb','gew','arb','fort','tel','konz',
+                'lapt','fach','reini','bewer',
+                'bu','haft','kv','rv','leb','haus','arzt','zahn','medi','pfle','under',
+                'kata','spen','part','kind','hand','haed']
+    opt_files = {k: files[k] for k in opt_keys if files.get(k)}
+    optionale_belege = parse_optionale_belege(opt_files) if opt_files else []
+
+    # Werbungskosten-Belege summieren (zum gesamt-Topf)
+    opt_zu_gesamt = 0.0
+    opt_wk_summary = []
+    for b in (optionale_belege or []):
+        wiso = b.get('wiso', '') or ''
+        if not wiso.startswith('Werbungskosten'): continue
+        betrag = float(b.get('betrag', 0) or 0)
+        if b.get('key') == 'tel':
+            betrag = round(betrag * 0.20, 2)
+        if betrag > 0:
+            opt_zu_gesamt += betrag
+            opt_wk_summary.append(f"{b.get('name','?')}={betrag:.2f}€")
+    opt_zu_gesamt = round(opt_zu_gesamt, 2)
+    if opt_zu_gesamt > 0:
+        notes.append(f'+ Werbungskosten-Belege ({", ".join(opt_wk_summary)}) +{opt_zu_gesamt:.2f}€')
+
+    # ── Gesamt + Topf-getrennte Netto-Berechnung ──
+    gesamt = round(fahr + reinig + trink + vma_in + vma_aus + opt_zu_gesamt, 2)
+    vma_total = round(vma_in + vma_aus, 2)
+    vma_netto = round(max(0, vma_total - z77), 2)
+    fahr_netto = round(max(0, fahr - ag_z17), 2)
+    netto = round(fahr_netto + reinig + trink + vma_netto + opt_zu_gesamt, 2)
+
+    if z77 > vma_total + 5:
+        notes.append(
+            f'ℹ Hinweis: LH hat {z77:.2f}€ stfrei (Z77) gezahlt — übersteigt BMF-Pauschalen '
+            f'({vma_total:.2f}€) um {z77-vma_total:.2f}€. Reisekosten-Topf bleibt 0.'
+        )
+    if ag_z17 > fahr + 5:
+        notes.append(
+            f'ℹ Hinweis: Z17 ({ag_z17:.2f}€) > Fahrtkosten ({fahr:.2f}€) — Fahrtkosten-Topf bleibt 0.'
+        )
+
+    # ── Plausi-Soft-Warnungen (NUR hinweisen, nichts korrigieren) ──
+    if hotel_naechte > arbeitstage and arbeitstage > 0:
+        notes.append(f'⚠ Plausi: Hotelnächte {hotel_naechte} > Arbeitstage {arbeitstage} — bitte prüfen')
+    if fahr_tage > arbeitstage and arbeitstage > 0:
+        notes.append(f'⚠ Plausi: Fahrtage {fahr_tage} > Arbeitstage {arbeitstage} — unmöglich, bitte prüfen')
+    if unklare_tage:
+        notes.append(f'ℹ {len(unklare_tage)} unklare Tag(e) — siehe Audit-Trail')
+
+    # ── Nachweis-Text (Audit-Trail) ──
+    if nachweis_text:
+        notes.append(f'✓ Auswertung: {nachweis_text[:500]}{"…" if len(nachweis_text) > 500 else ""}')
+
+    # ── Notes-Deduplikation ──
+    if notes:
+        _seen = set()
+        notes = [n for n in notes if not (n in _seen or _seen.add(n))]
+
+    # Uploaded-Summary
+    uploaded_summary = []
+    not_uploaded = []
+    if files.get('lsb'):  uploaded_summary.append(f"LSB ({len(files['lsb'])} Datei(en))")
+    else: not_uploaded.append("Lohnsteuerbescheinigung")
+    if files.get('dp'):   uploaded_summary.append(f"Flugstunden ({len(files['dp'])} Datei(en))")
+    else: not_uploaded.append("Flugstunden-Übersichten")
+    if files.get('se'):   uploaded_summary.append(f"Streckeneinsatz ({len(files['se'])} Datei(en))")
+    else: not_uploaded.append("Streckeneinsatz-Abrechnungen")
+    if files.get('einsatz'): uploaded_summary.append(f"Einsatzplan ({len(files['einsatz'])} Datei(en))")
+
+    # ── Confidence (vereinheitlicht: KI-Hauptpfad → 90 als sane default) ──
+    confidence = {
+        'z77': 92, 'z76': 90, 'z72': 90, 'z73': 90,
+        'fahrtage': 90, 'arbeitstage': 90, 'hotel': 90,
+        'lsb': 95,
+    }
+    audit_source = {
+        'z77':         'Sonnet liest SE-Summen',
+        'z76':         'Opus klassifiziert Auslandstage aus SE',
+        'z72':         'Opus klassifiziert Inland-Tagestrips (Briefingzeiten + 8h-Schwelle)',
+        'z73':         'Opus klassifiziert Inland-An-/Abreise (FollowMe-konservativ)',
+        'fahrtage':    'Opus liest Dienstplan + Einsatzplan',
+        'arbeitstage': 'Opus zählt Marker Tag-für-Tag',
+        'hotel':       'Opus EASA-FTL Layover-Regel ≥10h Bodenzeit',
+    }
+    verification_info = {
+        'method': 'hybrid (Sonnet LSB+SE, Opus Klassifikation)',
+        'unklare_tage_count': len(unklare_tage),
+        'errors': errors,
+    }
+
+    print(f"[berechne-hybrid] FERTIG: brutto={brutto:.2f} arbeit={arbeitstage} fahr={fahr_tage} "
+          f"hotel={hotel_naechte} VMA-In={vma_in:.2f} VMA-Aus={vma_aus:.2f} Z77={z77:.2f} "
+          f"gesamt={gesamt:.2f} netto={netto:.2f}")
+
+    return {
+        'name':             form.get('name', 'Flugbegleiter'),
+        'year':             form.get('year', 2025),
+        '_isDemo': False,
+        'uploaded_summary': ', '.join(uploaded_summary),
+        'not_uploaded':     ', '.join(not_uploaded) if not_uploaded else 'Alle Pflichtdokumente vorhanden',
+        'notes':            notes,
+        'datum':            datetime.now().strftime('%d.%m.%Y'),
+        'km':               km,
+        'arbeitstage':      arbeitstage,
+        'fahr_tage':        fahr_tage,
+        'hotel_naechte':    hotel_naechte,
+        'vma_72_tage':      vma_72_tage,
+        'vma_73_tage':      vma_73_tage,
+        'vma_74_tage':      vma_74_tage,
+        'vma_72':           vma_72,
+        'vma_73':           vma_73,
+        'vma_74':           vma_74,
+        'vma_in':           vma_in,
+        'vma_aus':          vma_aus,
+        'fahr':             fahr,
+        'reinig':           reinig,
+        'trink':            trink,
+        'gesamt':           gesamt,
+        'ag_z17':           ag_z17,
+        'spesen_gesamt':    spesen_gesamt,
+        'spesen_steuer':    spesen_steuer,
+        'z77':              z77,
+        'netto':            netto,
+        'abrechnungen':     [],
+        'brutto':           brutto,
+        'lohnsteuer':       lohnsteuer,
+        'soli':             soli,
+        'kirchensteuer':    kirchensteuer,
+        'steuerklasse':     steuerklasse,
+        'kinderfreibetraege': kinderfb,
+        'identnr':          identnr,
+        'geburtsdatum':     geburtsdatum,
+        'personalnummer':   personalnummer,
+        'arbeitgeber':      arbeitgeber,
+        'rv_an':            rv_an,
+        'rv_ag':            rv_ag,
+        'rv_gesamt':        rv_gesamt,
+        'kv_an':            kv_an,
+        'pv_an':            pv_an,
+        'av_an':            av_an,
+        'vorsorge_gesamt_an': vorsorge_an,
+        'verpfl_z20':       verpfl_z20,
+        'optionale_belege': optionale_belege,
+        '_confidence':      confidence,
+        '_audit_source':    audit_source,
+        '_verification':    verification_info,
+        '_nachweis':        nachweis_text,
+        '_unklare_tage':    unklare_tage,
+    }
+
+
 def berechne(form, files):
     """
-    Berechnet alle Werbungskosten.
-    Strategie: Erst aus allen Dokumenten extrahieren.
-    Bei fehlenden/unvollständigen Dokumenten: KI schätzt aus vorhandenen.
-    Immer eine Auswertung liefern, fehlende Werte klar markieren.
+    Berechnet alle Werbungskosten — Hauptpfad: hybrid_analyze (Sonnet+Opus).
+    Falls Hybrid fehlschlägt: Fallback auf alten Multi-Parser-Code.
     """
+    # ── Hauptpfad: Hybrid-Analyse (Sonnet+Opus parallel) ──
+    try:
+        hybrid_result = _berechne_via_hybrid(form, files)
+        if hybrid_result is not None:
+            return hybrid_result
+    except Exception as e:
+        print(f"[berechne] hybrid path crash: {e} — fallback auf alten Code")
+
+    # ── Fallback: alter Multi-Parser-Code ──
+    print(f"[berechne] FALLBACK: alter Multi-Parser-Code wird verwendet")
     notes = []  # Hinweise über geschätzte Werte
     available_texts = {}  # Raw texts for inference
     missing = []  # Was fehlt oder fehlschlug
