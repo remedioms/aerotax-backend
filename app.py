@@ -76,6 +76,17 @@ ANTHROPIC_KEY = os.getenv('ANTHROPIC_API_KEY')
 PRICE_ID              = os.getenv('AEROTAX_PRICE_ID')
 FRONTEND_URL          = os.getenv('FRONTEND_URL','https://aerosteuer.de')
 
+# ── v8: Reader-/Engine-Versionierung ──
+APP_VERSION = '8.0'
+APP_BUILD   = 'audit-safe-deterministic-2026-05-09'
+READER_VERSIONS = {
+    'lsb': 'sonnet_lsb_v8_0',
+    'se':  'sonnet_se_structured_v8_0',
+    'dp':  'sonnet_dp_structured_v8_0',
+}
+ENGINE_VERSION = 'deterministic_v8_0'
+PROMPT_VERSION = 'v8_0'
+
 # In-memory store (in Produktion: Redis oder S3)
 _store = {}
 
@@ -1194,6 +1205,14 @@ def _run_process_async(job_id, form, files):
                 'audit_notes':      result.get('_audit_notes') or [],
                 'unresolved_days':  result.get('_unresolved_days') or [],
                 'vma_unmapped_se':  result.get('_vma_unmapped_se') or [],
+                'document_health':  result.get('_document_health') or {},
+                'versions': {
+                    'app': APP_VERSION,
+                    'engine': ENGINE_VERSION,
+                    'readers': READER_VERSIONS,
+                    'prompt': PROMPT_VERSION,
+                    'bmf_data_year': int(form.get('year', 2025)),
+                },
                 'tage_detail': _tage_detail,
             })
 
@@ -2419,10 +2438,12 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '7.5',
-        'build':   'vma-mapping-audit-notes-vs-unresolved-2026-05-09',
-        'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
-                     'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
+        'version': APP_VERSION,
+        'build':   APP_BUILD,
+        'reader_versions': READER_VERSIONS,
+        'engine':  ENGINE_VERSION,
+        'prompt_version': PROMPT_VERSION,
+        'bmf_data_year': 2025,
     })
 
 
@@ -6239,11 +6260,108 @@ def _build_tour_clusters(sorted_days):
                 _absorb_layover_info(c, day_match)
                 cur_anchor = check_idx
                 datum = day_match.get('datum', '')
-                print(f"[v7-cluster-extend] datum={datum} cluster={c.get('_id', '?')} "
+                print(f"[v8-cluster-extend] datum={datum} cluster={c.get('_id', '?')} "
                       f"at={today_at} reason='nachklingender Abreise-/Heimkehr-Tag'")
             else:
                 break
     return clusters
+
+
+def _document_health_check(lsb_data, se_structured, structured_days, year):
+    """v8 Document Health Check.
+    Liefert {'status': 'green'|'yellow'|'red', 'issues': [...], 'sources': {...}}.
+    Wird VOR _deterministic_classify_v7 aufgerufen. red → keine Berechnung,
+    klare Fehlermeldung an User.
+    """
+    issues = []
+    sources = {'lsb': 'green', 'se': 'green', 'dp': 'green'}
+
+    # ── LSB-Check ──
+    if not lsb_data:
+        issues.append({'source': 'LSB', 'severity': 'red', 'reason': 'Lohnsteuerbescheinigung konnte nicht gelesen werden'})
+        sources['lsb'] = 'red'
+    else:
+        brutto = float(lsb_data.get('brutto', 0) or 0)
+        z17    = float(lsb_data.get('z17', 0) or 0)
+        if brutto <= 0:
+            issues.append({'source': 'LSB', 'severity': 'red', 'reason': 'Brutto-Wert (Zeile 3) nicht erkannt'})
+            sources['lsb'] = 'red'
+        # Z17 fehlt ist OK (manche LSBs haben kein Jobticket)
+        if z17 == 0:
+            issues.append({'source': 'LSB', 'severity': 'info', 'reason': 'Zeile 17 (Jobticket) ist 0 oder nicht erkannt — falls Jobticket vorhanden, bitte prüfen'})
+
+    # ── SE-Check ──
+    if not se_structured or not se_structured.get('se_lines'):
+        issues.append({'source': 'SE', 'severity': 'red', 'reason': 'Streckeneinsatz konnte nicht gelesen werden — keine Zeilen erkannt'})
+        sources['se'] = 'red'
+    else:
+        se_lines = se_structured.get('se_lines', [])
+        active = [s for s in se_lines if not s.get('storno')]
+        storno = [s for s in se_lines if s.get('storno')]
+        if not active:
+            issues.append({'source': 'SE', 'severity': 'red', 'reason': 'Keine aktiven SE-Zeilen erkannt (alle storniert?)'})
+            sources['se'] = 'red'
+        else:
+            z77_lines = sum(float(s.get('stfrei_betrag', 0) or 0) for s in active)
+            # Monate prüfen
+            monate = sorted(set(int(s.get('datum', '0000-00-00')[5:7]) for s in active if s.get('datum')))
+            if len(monate) < 6:
+                issues.append({'source': 'SE', 'severity': 'warning',
+                               'reason': f'Nur {len(monate)} Flugmonate erkannt — bei Vollzeit ungewöhnlich (Teilzeit/Mutterschutz/Krank ist OK)'})
+                sources['se'] = 'yellow'
+            if z77_lines < 500:
+                issues.append({'source': 'SE', 'severity': 'warning',
+                               'reason': f'Z77-Summe nur {z77_lines:.2f}€ — bei Vollzeit ungewöhnlich'})
+                if sources['se'] == 'green':
+                    sources['se'] = 'yellow'
+
+    # ── DP-Check ──
+    if not structured_days or not structured_days.get('days'):
+        issues.append({'source': 'DP', 'severity': 'red', 'reason': 'Flugstundenübersicht konnte nicht gelesen werden — keine Tage erkannt'})
+        sources['dp'] = 'red'
+    else:
+        days = structured_days.get('days', [])
+        # Touren erkannt?
+        tour_count = sum(1 for d in days if d.get('activity_type') == 'tour')
+        # SE-Zeilen ohne DP-Match?
+        if se_structured and se_structured.get('se_lines'):
+            dp_dates = set(d.get('datum') for d in days)
+            se_active_dates = set(s.get('datum') for s in se_structured['se_lines']
+                                  if not s.get('storno') and s.get('datum'))
+            unmatched = se_active_dates - dp_dates
+            if len(unmatched) > 5:
+                issues.append({'source': 'DP', 'severity': 'warning',
+                               'reason': f'{len(unmatched)} aktive SE-Tage ohne DP-Match — DP unvollständig?'})
+                sources['dp'] = 'yellow'
+        if len(days) < 30:
+            issues.append({'source': 'DP', 'severity': 'warning',
+                           'reason': f'Nur {len(days)} Tage erkannt — DP unvollständig?'})
+            if sources['dp'] == 'green':
+                sources['dp'] = 'yellow'
+        if len(days) > 230:
+            issues.append({'source': 'DP', 'severity': 'warning',
+                           'reason': f'{len(days)} Tage erkannt — bei normalem Crew-Jahr ungewöhnlich hoch'})
+            if sources['dp'] == 'green':
+                sources['dp'] = 'yellow'
+        if tour_count == 0 and se_structured and se_structured.get('se_lines'):
+            issues.append({'source': 'DP', 'severity': 'warning',
+                           'reason': 'Keine Touren erkannt im DP, aber SE hat Zeilen — DP-Reader-Problem?'})
+            sources['dp'] = 'yellow'
+
+    # Gesamt-Status
+    if any(s == 'red' for s in sources.values()):
+        status = 'red'
+    elif any(s == 'yellow' for s in sources.values()):
+        status = 'yellow'
+    else:
+        status = 'green'
+
+    print(f"[v8-health] lsb={sources['lsb']} se={sources['se']} dp={sources['dp']} "
+          f"status={status} issues={len(issues)}")
+    for issue in issues:
+        print(f"[v8-health-issue] source={issue['source']} severity={issue['severity']} reason='{issue['reason'][:120]}'")
+
+    return {'status': status, 'issues': issues, 'sources': sources}
 
 
 def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
@@ -6275,7 +6393,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
         for i in c['indices']:
             cluster_for_idx[i] = c
         mixed = c.get('has_foreign') and c.get('has_inland')
-        print(f"[v7-cluster] id={c_id} days={len(c['indices'])} "
+        print(f"[v8-cluster] id={c_id} days={len(c['indices'])} "
               f"has_foreign={c.get('has_foreign')} has_inland={c.get('has_inland')} "
               f"mixed={mixed}")
 
@@ -6372,7 +6490,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
         if in_extended_cluster:
             at = 'tour'
 
-        klass = 'Sonstiges'
+        klass = 'Issue'
         eur_added = 0.0
         reason = ''
         audit_note = None
@@ -6419,11 +6537,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
             in_cluster = i in cluster_for_idx
             cluster_today = cluster_for_idx.get(i)
             if has_fl or overnight:
-                klass = 'Sonstiges'
+                klass = 'Issue'
                 reason = 'Same-Day verletzt Hard-Gate (FL oder overnight)'
                 unresolved_reason = f'same_day mit has_fl={has_fl} overnight={overnight}'
             elif prev_overnight:
-                klass = 'Sonstiges'
+                klass = 'Issue'
                 reason = 'Heimkehr aus Vortag-Tour — separater Tour-Abschluss'
                 unresolved_reason = 'same_day nach prev_overnight (Mischfall)'
             elif in_cluster and cluster_today and cluster_today.get('has_foreign'):
@@ -6518,7 +6636,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
                     reason = 'Tour-Übernachtung ohne Ort (Cluster=Inland)'
                     audit_note = f'{datum}: overnight ohne Ort, Cluster Inland → konservativ'
                 else:
-                    klass = 'Sonstiges'
+                    klass = 'Issue'
                     reason = 'Tour-Übernachtung ohne Ort, kein Cluster-Kontext'
                     unresolved_reason = 'overnight=true, kein Layover-Ort, kein Cluster-Kontext'
                 classified = True
@@ -6543,7 +6661,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
                         reason = 'Heimkehr aus Auslands-Cluster (Vortag-Ort unklar)'
                         audit_note = f'{datum}: Heimkehr ohne Vortag-Ort, Cluster Ausland → Z76 28€'
                     else:
-                        klass = 'Sonstiges'
+                        klass = 'Issue'
                         reason = 'Heimkehr — Vortag-Layover unklar'
                         unresolved_reason = 'Heimkehr ohne Vortag-Layover-Ort und ohne Cluster-Kontext'
                 classified = True
@@ -6567,16 +6685,16 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
                         audit_note = a
                     if u:
                         unresolved_reason = u
-                    print(f"[v7-daytrip-resolved] datum={datum} klass={klass} eur={eur_added:.2f} reason='{reason[:80]}'")
+                    print(f"[v8-daytrip-resolved] datum={datum} klass={klass} eur={eur_added:.2f} reason='{reason[:80]}'")
                 classified = True
 
             if not classified:
-                klass = 'Sonstiges'
+                klass = 'Issue'
                 reason = 'tour-Tag konnte nicht klassifiziert werden'
                 unresolved_reason = 'tour ohne klare Klassifikations-Spur'
 
             cluster_id = cluster['_id'] if cluster else -1
-            print(f"[v7-classify-day] datum={datum} cluster={cluster_id} ort={today_layover_ort or '-'} klass={klass} reason='{reason[:80]}'")
+            print(f"[v8-classify-day] datum={datum} cluster={cluster_id} ort={today_layover_ort or '-'} klass={klass} reason='{reason[:80]}'")
 
         else:
             # at='unknown'/'none' und nicht in Cluster — aktive SE → Re-Klassifikation
@@ -6597,13 +6715,13 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
                     reason = f'Aktive Inland-SE {se_ort} (DP={at}) Z73'
                     audit_note = f'{datum}: DP={at} mit aktiver Inland-SE {se_ort} → Z73'
                 else:
-                    klass = 'Sonstiges'
+                    klass = 'Issue'
                     reason = f'Aktive SE {se_ort} aber Inland/Ausland unklar'
                     unresolved_reason = f'aktive SE-Zeile ohne stfrei_inland-Klarheit (DP={at})'
             else:
-                klass = 'ZeroDay' if at in ('unknown', 'none', '') else 'Sonstiges'
+                klass = 'ZeroDay' if at in ('unknown', 'none', '') else 'Issue'
                 reason = f'Activity-Type {at} ohne SE/Cluster-Spur'
-                if klass == 'Sonstiges':
+                if klass == 'Issue':
                     unresolved_reason = f'activity_type={at} unklar'
 
         # VMA-Unmapped-SE-Check: aktive SE ohne Z72/73/74/76?
@@ -6618,7 +6736,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
                 'reason': reason,
                 'lines_count': se.get('count', 0),
             })
-            print(f"[v7-vma-unmapped-se] datum={datum} ort={se.get('stfrei_ort','')} "
+            print(f"[v8-vma-unmapped-se] datum={datum} ort={se.get('stfrei_ort','')} "
                   f"betrag={se.get('stfrei_total',0):.2f} klass={klass} reason='{reason[:60]}'")
             unresolved_reason = unresolved_reason or f'aktive SE-Zeile ohne VMA-Klassifikation (klass={klass})'
 
@@ -6626,7 +6744,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
             audit_notes.append(audit_note)
         if unresolved_reason:
             unresolved_days.append(f'{datum}: {unresolved_reason}')
-            print(f"[v7-unresolved-day] datum={datum} marker={d.get('raw_marker','') or at} "
+            print(f"[v8-unresolved-day] datum={datum} marker={d.get('raw_marker','') or at} "
                   f"routing={'-'.join(d.get('routing') or [])} se_count={se.get('count',0)} "
                   f"se_ort={se.get('stfrei_ort','')} reason='{unresolved_reason}'")
 
@@ -6648,7 +6766,8 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
     office_tage = sum(1 for t in tage_detail if t['klass'] == 'Office')
     standby_tage = sum(1 for t in tage_detail if t['klass'] == 'Standby')
     zero_tage = sum(1 for t in tage_detail if t['klass'] == 'ZeroDay')
-    sonstige_tage = sum(1 for t in tage_detail if t['klass'] == 'Sonstiges')
+    sonstige_tage = sum(1 for t in tage_detail if t['klass'] in ('Issue', 'Sonstiges'))
+    issue_tage = sum(1 for t in tage_detail if t['klass'] == 'Issue')
 
     z72_eur = round(sum(t['eur'] for t in tage_detail if t['klass'] == 'Z72'), 2)
     z73_eur = round(sum(t['eur'] for t in tage_detail if t['klass'] == 'Z73'), 2)
@@ -6690,26 +6809,41 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
             hotel_naechte += 1
         else:
             hotel_skipped.append(f'{t["datum"]}:{t["klass"]}')
-            print(f"[v7-hotel-extra] datum={t['datum']} klass={t['klass']} reason='overnight=true aber klass nicht Hotel-relevant'")
+            print(f"[v8-hotel-extra] datum={t['datum']} klass={t['klass']} reason='overnight=true aber klass nicht Hotel-relevant'")
 
-    print(f"[v7-counts-detail] arbeitstage_sources Z72={z72_tage} Z73={z73_tage} Z74={z74_tage} "
+    print(f"[v8-counts-detail] arbeitstage_sources Z72={z72_tage} Z73={z73_tage} Z74={z74_tage} "
           f"Z76={z76_tage} Office={office_tage} Standby={standby_tage} ZeroDay={zero_tage} "
-          f"Sonstiges={sonstige_tage}")
-    print(f"[v7-hotel-detail] counted={hotel_naechte} skipped={len(hotel_skipped)}")
-    print(f"[v7-classify] arbeit={arbeitstage}T fahr={fahr_tage}T hotel={hotel_naechte}T  "
+          f"Issue={issue_tage}")
+    print(f"[v8-hotel-detail] counted={hotel_naechte} skipped={len(hotel_skipped)}")
+    print(f"[v8-classify] arbeit={arbeitstage}T fahr={fahr_tage}T hotel={hotel_naechte}T  "
           f"Z72={z72_tage}T/{z72_eur:.2f}€  Z73={z73_tage}T/{z73_eur:.2f}€  "
           f"Z74={z74_tage}T/{z74_eur:.2f}€  Z76={z76_tage}T/{z76_eur:.2f}€  "
           f"audit_notes={len(audit_notes)} unresolved={len(unresolved_days)} "
-          f"vma_unmapped={len(vma_unmapped_se)}")
+          f"vma_unmapped={len(vma_unmapped_se)} issues={issue_tage}")
 
-    # Plausi-Issues
+    # Plausi-Issues (v8: Hard-Fails + Soft-Warnings)
     plausi_issues = []
+    plausi_hard_fails = []
+
+    # Hard-Fails (red): unmögliche Konstellationen
+    if hotel_naechte > arbeitstage:
+        plausi_hard_fails.append(f'Hotelnächte ({hotel_naechte}) > Arbeitstage ({arbeitstage}) — unplausibel')
+    if arbeitstage > 230:
+        plausi_hard_fails.append(f'Arbeitstage={arbeitstage} unplausibel hoch (>230)')
+
+    # Soft-Warnings (yellow)
     if z72_tage == 0 and arbeitstage > 100:
         plausi_issues.append(f'Plausi: Z72=0 bei {arbeitstage} Arbeitstagen — Same-Day-Trips evtl. übersehen')
     if z73_tage == 0 and hotel_naechte > 40:
         plausi_issues.append(f'Plausi: Z73=0 bei {hotel_naechte} Hotelnächten — Inland-Übernachtungen evtl. übersehen')
     if vma_unmapped_se:
         plausi_issues.append(f'VMA-Unmapped-SE: {len(vma_unmapped_se)} aktive SE-Zeilen ohne Klassifikation')
+    if z76_tage == 0 and arbeitstage > 50:
+        plausi_issues.append(f'Plausi: Z76=0 bei {arbeitstage} Arbeitstagen — Auslandstage evtl. übersehen')
+    if issue_tage > 5:
+        plausi_issues.append(f'Plausi: {issue_tage} Issue-Tage — viele Tage konnten nicht eindeutig klassifiziert werden')
+    if arbeitstage < 50 and len([s for s in (audit_notes or []) if 'aktive' in str(s).lower()]) > 30:
+        plausi_issues.append(f'Plausi: Nur {arbeitstage} Arbeitstage bei vielen aktiven SE-Zeilen — DP unvollständig?')
 
     return {
         'arbeitstage': arbeitstage,
@@ -6723,13 +6857,15 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
         'z73_eur': z73_eur,
         'z74_eur': z74_eur,
         'z76_eur': z76_eur,
+        'issue_tage': issue_tage,
         'tage_detail': tage_detail,
         # Backward-Compat: 'unklare_tage' bleibt — enthält nur ECHTE Issues
-        'unklare_tage': unresolved_days + plausi_issues,
+        'unklare_tage': unresolved_days + plausi_issues + plausi_hard_fails,
         'audit_notes': audit_notes,
         'unresolved_days': unresolved_days,
         'vma_unmapped_se': vma_unmapped_se,
         'plausi_issues': plausi_issues,
+        'plausi_hard_fails': plausi_hard_fails,
         'nachweis': '',
         '_v7_used': True,
     }
@@ -7365,7 +7501,7 @@ def hybrid_analyze(form, files):
     # Falls der Frontend-Upload-Flow legacy noch Bytes mitschickt: hier ignoriert.
     einsatz_bytes = []
 
-    print(f"[v7] Start: LSB={len(lsb_bytes)} SE={len(se_bytes)} Flugstunden={len(dp_bytes)}")
+    print(f"[v8] Start: LSB={len(lsb_bytes)} SE={len(se_bytes)} Flugstunden={len(dp_bytes)}")
 
     errors = []
 
@@ -7423,7 +7559,7 @@ def hybrid_analyze(form, files):
         z77_from_months = float((se_summary or {}).get('z77_total', 0) or 0)
         z77_used = max(z77_from_lines, z77_from_months)
         diff = abs(z77_from_lines - z77_from_months)
-        print(f"[v7-se] z77_from_lines={z77_from_lines:.2f} z77_from_months={z77_from_months:.2f} "
+        print(f"[v8-se] z77_from_lines={z77_from_lines:.2f} z77_from_months={z77_from_months:.2f} "
               f"z77_used={z77_used:.2f} diff={diff:.2f}")
         if diff > 50:
             errors.append(f'Z77-Diff: lines={z77_from_lines:.2f} vs months={z77_from_months:.2f} (diff {diff:.2f}€)')
@@ -7452,27 +7588,36 @@ def hybrid_analyze(form, files):
     # Schritt 3: Sonnet liest DP strukturiert
     classification = None
     structured_days = None
+    document_health = None
     if dp_bytes:
         try:
             structured_days = _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year, homebase)
             if structured_days and structured_days.get('days'):
-                # Schritt 4: Backend matcht DP+SE pro Datum
-                matched = _match_dp_se_per_day(structured_days, se_structured)
-                print(f"[v7] Matched {len(matched)} Tage (DP+SE pro Datum)")
-                gc.collect()
-                _release_memory_to_os()
-                # Schritt 5: Deterministische Klassifikation
-                classification = _deterministic_classify_v7(matched, year, homebase)
-                classification['_v7_used'] = True
+                # Schritt 3b (v8): Document Health Check vor der Berechnung
+                document_health = _document_health_check(lsb_data, se_structured, structured_days, year)
+                if document_health['status'] == 'red':
+                    red_reasons = '; '.join(i['reason'] for i in document_health['issues'] if i['severity'] == 'red')
+                    errors.append(f'Dokumenten-Probleme: {red_reasons}')
+                    print(f"[v8-health] Status RED — Berechnung gestoppt: {red_reasons}")
+                else:
+                    # Schritt 4: Backend matcht DP+SE pro Datum
+                    matched = _match_dp_se_per_day(structured_days, se_structured)
+                    print(f"[v8] Matched {len(matched)} Tage (DP+SE pro Datum)")
+                    gc.collect()
+                    _release_memory_to_os()
+                    # Schritt 5: Deterministische Klassifikation
+                    classification = _deterministic_classify_v7(matched, year, homebase)
+                    classification['_v7_used'] = True
+                    classification['_document_health'] = document_health
             else:
-                print(f"[v7] Sonnet-DP lieferte keine Tagesdaten — Job-Error")
+                print(f"[v8] Sonnet-DP lieferte keine Tagesdaten — Job-Error")
         except Exception as e:
             etype = type(e).__name__
             import traceback as _tb
             tb_str = _tb.format_exc()
-            print(f"[v7] Pipeline crash: {etype}: {str(e)[:200]} — KEIN Fallback (Job-Error)")
-            print(f"[v7] Traceback (letzte 1000 Zeichen):\n{tb_str[-1000:]}")
-            errors.append(f'v7-Pipeline ({etype}): {str(e)[:200]}')
+            print(f"[v8] Pipeline crash: {etype}: {str(e)[:200]} — Job-Error")
+            print(f"[v8] Traceback (letzte 1000 Zeichen):\n{tb_str[-1000:]}")
+            errors.append(f'Pipeline ({etype}): {str(e)[:200]}')
             classification = None
     gc.collect()
     _release_memory_to_os()
@@ -7484,7 +7629,7 @@ def hybrid_analyze(form, files):
     if classification and se_summary:
         issues = _detect_classification_issues(classification, se_summary)
         if issues:
-            print(f"[v7] Audit-Issues (informativ, kein Recheck): {'; '.join(issues)[:300]}")
+            print(f"[v8] Audit-Issues (informativ, kein Recheck): {'; '.join(issues)[:300]}")
             classification['_audit_issues'] = issues
     for _ in range(3):
         gc.collect()
@@ -7745,7 +7890,7 @@ def _berechne_via_hybrid(form, files):
     print(f"[berechne-hybrid] FERTIG: brutto={brutto:.2f} arbeit={arbeitstage} fahr={fahr_tage} "
           f"hotel={hotel_naechte} VMA-In={vma_in:.2f} VMA-Aus={vma_aus:.2f} Z77={z77:.2f} "
           f"gesamt={gesamt:.2f} netto={netto:.2f}")
-    print(f"[v7] brutto={gesamt:.2f} netto={netto:.2f} issues={len(notes)}")
+    print(f"[v8] brutto={gesamt:.2f} netto={netto:.2f} issues={len(notes)}")
 
     return {
         'name':             form.get('name', 'Flugbegleiter'),
@@ -7807,6 +7952,7 @@ def _berechne_via_hybrid(form, files):
         '_audit_notes':     list(cls.get('audit_notes', []) or []),
         '_unresolved_days': list(cls.get('unresolved_days', []) or []),
         '_vma_unmapped_se': list(cls.get('vma_unmapped_se', []) or []),
+        '_document_health': cls.get('_document_health', {}),
         '_tage_detail':     list(cls.get('tage_detail', []) or []),
         '_klass_summary':   {
             'arbeitstage': arbeitstage, 'fahr_tage': fahr_tage, 'hotel_naechte': hotel_naechte,
@@ -7818,23 +7964,18 @@ def _berechne_via_hybrid(form, files):
 
 
 def berechne(form, files):
-    """
-    Berechnet alle Werbungskosten via Hybrid-Pipeline (v6.0:
-    Sonnet-Pre-Reader + Backend-Counts + Opus-Klassifikator).
+    """v8 Berechnungs-Einstieg: Sonnet-Reader → Backend-Klassifikator.
 
-    KEIN FALLBACK MEHR. Bei Pipeline-Fehler wirft Exception. Spart
-    Token-Kosten bei Code-Bugs/API-Schluckauf — Job-Error ist
-    günstiger als zweiter teurer API-Versuch.
+    Bei Pipeline-Fehler: Exception mit nutzerfreundlicher Meldung.
+    Kein automatischer Wiederholungs-Versuch — der User entscheidet.
     """
-    # ── Hybrid-Analyse (Sonnet+Opus) ──
     hybrid_result = _berechne_via_hybrid(form, files)
     if hybrid_result is not None:
         return hybrid_result
 
-    # Hybrid lieferte None — Job-Error mit nutzerfreundlicher Meldung
     raise RuntimeError(
         "Die Auswertung konnte nicht abgeschlossen werden. Deine Sitzung bleibt gültig — "
-        "bitte versuche es erneut oder kontaktiere den Support, wenn der Fehler weiter auftritt."
+        "bitte versuche es erneut oder kontaktiere den Support."
     )
 
     # ── DEAD CODE BELOW (alter Multi-Parser-Pfad bleibt im File für historische

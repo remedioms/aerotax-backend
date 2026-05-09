@@ -1,18 +1,27 @@
 # AeroTax Backend — Arbeitsweise
 
-## Architektur-Grundsatz (v7.0)
+## Architektur-Grundsatz (v8.0)
 
-> **Sonnet liest Lohnsteuerbescheinigung, Flugstundenübersicht und Streckeneinsatzabrechnung strukturiert. Backend matcht DP+SE pro Datum und klassifiziert deterministisch. Opus ist NICHT mehr Hauptklassifikator.**
+> **Sonnet liest 3 Dokumente strukturiert. Backend matcht DP+SE pro Datum, klassifiziert deterministisch, prüft Plausi und Health.**
 
 Pflichtbasis (3 Dokumente + Formularangaben):
 1. Lohnsteuerbescheinigung
 2. Flugstundenübersicht
 3. Streckeneinsatzabrechnung
-4. Formular: Steuerjahr, Homebase, Entfernung km, ggf. Zusatzfahrten
+4. Formular: Steuerjahr, Homebase, Entfernung km, optional Fahrzeit, optional Zusatzkosten
 
 **Einsatzplan ist aus dem Produkt entfernt — nicht wieder als Pflichtdokument einführen.**
 
-Pipeline: `_sonnet_read_lsb_v2` → `_sonnet_read_se_structured` → `_sonnet_read_dp_structured` → `_match_dp_se_per_day` → `_build_tour_clusters` → `_deterministic_classify_v7`. Kein Opus-Hauptklassifikator. Kein produktiver Fallback.
+Pipeline: `_sonnet_read_lsb_v2` → `_sonnet_read_se_structured` → `_sonnet_read_dp_structured` → `_document_health_check` → `_match_dp_se_per_day` → `_build_tour_clusters` → `_deterministic_classify_v7`. Kein Opus-Hauptklassifikator. Kein produktiver Fallback.
+
+### v8-Garantien
+- Jede aktive SE-Zeile landet in Z72/Z73/Z74/Z76 oder `vma_unmapped_se` (sichtbarer Issue, kein stilles Sonstiges).
+- Klass `Issue` statt stillen Sonstiges für nicht klassifizierbare Tage.
+- `audit_notes` (informativ, Ergebnis berechnet) ↔ `unresolved_days` (echte offene Probleme) getrennt.
+- Document Health Check vor Berechnung: red → keine Auswertung mit klarem User-Text.
+- Hard-Fails: hotel_naechte > arbeitstage; arbeitstage > 230.
+- Reader-/Engine-Versionen im Audit (`READER_VERSIONS`, `ENGINE_VERSION`, `PROMPT_VERSION`).
+- Counter aus `tage_detail.klass` aggregiert — kein inkrementelles Hochzählen im Loop.
 
 ## Autonomie-Modus
 
