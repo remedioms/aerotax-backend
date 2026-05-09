@@ -22,17 +22,48 @@ OUT = os.path.expanduser('~/Desktop/AeroTax_Bundle.txt')
 
 # (label, abs_path, language_hint)
 FILES = [
+    # ── BRIEFINGS (zuerst lesen) ──
     ('FILES.md',                 f'{REPO}/FILES.md',                  'markdown'),
     ('RECHENWEG.md',             f'{REPO}/RECHENWEG.md',              'markdown'),
     ('CLAUDE.md',                f'{REPO}/CLAUDE.md',                 'markdown'),
+
+    # ── DOMAIN-WISSEN (in den Opus-Prompt geladen) ──
     ('referenz_faelle.txt',      f'{REPO}/referenz_faelle.txt',       'text'),
+    ('referenz_easa.txt (HISTORISCH — wird NICHT mehr geladen)',
+                                  f'{REPO}/referenz_easa.txt',         'text'),
+
+    # ── SETUP / CONFIG ──
     ('requirements.txt',         f'{REPO}/requirements.txt',          'text'),
-    ('Procfile',                 f'{REPO}/Procfile',                  'text'),
-    ('tests/test_calculation.py',f'{REPO}/tests/test_calculation.py', 'python'),
-    ('bmf_data.py',              f'{REPO}/bmf_data.py',               'python'),
-    ('app.py',                   f'{REPO}/app.py',                    'python'),
-    ('frontend/index.html',      f'{SITE}/index.html',                'html'),
+    ('Procfile (Render Deploy)', f'{REPO}/Procfile',                  'text'),
+    ('Dockerfile (HISTORISCH — Fly.io-Migration, nicht aktiv)',
+                                  f'{REPO}/Dockerfile',                'dockerfile'),
+    ('fly.toml (HISTORISCH — Fly.io-Migration, nicht aktiv)',
+                                  f'{REPO}/fly.toml',                  'toml'),
+    ('.gitignore',               f'{REPO}/.gitignore',                'text'),
+
+    # ── DATEN ──
+    ('bmf_data.py (BMF-Auslandsspesen-Tabelle)',
+                                  f'{REPO}/bmf_data.py',               'python'),
+    ('qa_seed.json (Forum-Seed, inaktives Feature)',
+                                  f'{REPO}/qa_seed.json',              'json'),
     ('supabase_schema.sql',      f'{REPO}/supabase_schema.sql',       'sql'),
+
+    # ── TESTS ──
+    ('tests/test_calculation.py',f'{REPO}/tests/test_calculation.py', 'python'),
+
+    # ── HAUPTCODE BACKEND ──
+    ('app.py (HAUPT-BACKEND, ~7700 Zeilen)',
+                                  f'{REPO}/app.py',                    'python'),
+
+    # ── FRONTEND ──
+    ('frontend/index.html (statisches Single-Page, kein Build)',
+                                  f'{SITE}/index.html',                'html'),
+
+    # ── HELPER-SKRIPTE ──
+    ('scripts/generate_action_guide.py (Action-Guide-PDF-Generator)',
+                                  f'{REPO}/scripts/generate_action_guide.py', 'python'),
+    ('scripts/bundle_for_kis.py (DIESES Skript — Selbstreferenz)',
+                                  f'{REPO}/scripts/bundle_for_kis.py', 'python'),
 ]
 
 
