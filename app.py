@@ -55,9 +55,9 @@ from reportlab.lib.units import cm
 from reportlab.lib.colors import HexColor, white
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
-                                 Table, TableStyle, PageBreak, HRFlowable,
+                                 Table, TableStyle, PageBreak, HRFlowable, LongTable,
                                  Image as RLImage)
-from reportlab.lib.enums import TA_RIGHT, TA_CENTER
+from reportlab.lib.enums import TA_RIGHT, TA_CENTER, TA_LEFT
 
 # ── APP SETUP ─────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -319,6 +319,36 @@ def upload_files():
 
 _processed_stripe_events = {}  # event_id → timestamp; Idempotenz für Webhooks
 _consumed_payment_intents = {}  # pi_id → consumed_at; verhindert Replay
+_ip_rate_buckets = {}  # ip → list[ts]; rolling window 1h für /api/process Anti-Abuse
+
+
+def _ip_rate_limited(ip, endpoint='process', limit=20, window_sec=3600):
+    """Sliding-Window Rate-Limit pro IP. Liefert True wenn limit überschritten.
+    Default: 20 Versuche pro Stunde pro IP für /api/process. Stripe-Payment ist
+    der primäre Anti-Abuse-Layer (kostet Geld); IP-Limit fängt nur Brute-Force
+    auf das Endpoint selbst (z.B. Promo-Code-Raten) ab."""
+    if not ip: return False
+    now = datetime.utcnow().timestamp()
+    cutoff = now - window_sec
+    key = f'{ip}:{endpoint}'
+    bucket = _ip_rate_buckets.setdefault(key, [])
+    # Alte Entries räumen + Cleanup wenn dict zu groß (>10000 keys)
+    bucket[:] = [t for t in bucket if t > cutoff]
+    if len(_ip_rate_buckets) > 10000:
+        for k in list(_ip_rate_buckets.keys())[:5000]:
+            _ip_rate_buckets.pop(k, None)
+    if len(bucket) >= limit:
+        return True
+    bucket.append(now)
+    return False
+
+
+def _client_ip():
+    """Extrahiert Client-IP, respektiert X-Forwarded-For (Cloudflare/Render-Proxies)."""
+    xff = request.headers.get('X-Forwarded-For', '')
+    if xff:
+        return xff.split(',')[0].strip()
+    return request.remote_addr or ''
 
 @app.route('/api/stripe-webhook', methods=['POST'])
 def stripe_webhook():
@@ -768,13 +798,43 @@ def _start_calc_worker():
 _start_calc_worker()
 
 
+_PII_KEYS = {
+    # Direkte Identifier (DSGVO Art. 4)
+    'identnr', 'geburtsdatum', 'personalnummer',
+    'name', 'vorname', 'nachname',
+    'finanzamt', 'steuernummer_ag',
+    'adresse', 'plz', 'ort', 'strasse',
+    'iban', 'bic',
+    'email', 'telefon', 'phone',
+}
+
+
+def _redact_pii(obj):
+    """Rekursiv: ersetzt PII-Felder durch '[redacted]'. Nicht in-place — neue Struktur.
+    Wird vor Disk-Persist genutzt damit job-state files keine personenbezogenen
+    Daten enthalten (DSGVO-Compliance)."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(k, str) and k.lower().lstrip('_') in _PII_KEYS:
+                out[k] = '[redacted]' if v else v
+            else:
+                out[k] = _redact_pii(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_pii(x) for x in obj]
+    return obj
+
+
 def _save_job_to_disk(job_id):
-    """Speichert Job-State nach Disk — überlebt Render-Restart."""
+    """Speichert Job-State nach Disk — überlebt Render-Restart.
+    PII wird vor Persistierung redacted (DSGVO Art. 5: Datenminimierung)."""
     with _jobs_lock:
         j = _jobs.get(job_id, {}).copy()
     if not j: return
-    # Entferne Binär-Daten (PDFs gehören in _store, nicht in Job)
+    # Entferne Binär-Daten (PDFs gehören in _store, nicht in Job) + PII
     j_safe = {k: v for k, v in j.items() if k != 'files'}
+    j_safe = _redact_pii(j_safe)
     try:
         with open(os.path.join(_JOBS_DIR, f'{job_id}.json'), 'w') as f:
             json.dump(j_safe, f, default=str)
@@ -807,10 +867,55 @@ def _audit(job_id, event, data=None):
     print(f"[AUDIT {job_id[:8]}] {event}: {json.dumps(data, default=str)[:200] if data else ''}")
 
 
+def _validate_file_categories(files):
+    """Quick sanity check: peek in PDF-text und prüfe ob Files typisch zur Kategorie passen.
+    Liefert Liste warnings (leer = alles ok). Verhindert teure KI-Calls bei
+    offensichtlich falschen Uploads (z.B. User lädt Reisepass statt LSB hoch)."""
+    warnings = []
+    # Marker-Strings die typisch in der Kategorie vorkommen (case-insensitive)
+    markers = {
+        'lsb':     ['lohnsteuerbescheinigung', 'bruttoarbeitslohn', 'arbeitslohn',
+                    'bescheinigungsnummer', 'einbehaltene lohnsteuer'],
+        'se':      ['streckeneinsatz', 'spesen', 'stfrei', 'steuerfrei',
+                    'abrechnung', 'verpflegung'],
+        'dp':      ['dienstplan', 'duty', 'roster', 'flug', 'frei'],
+        'einsatz': ['einsatzplan', 'briefing', 'cas-pub', 'rotation', 'duty'],
+    }
+    label_de = {'lsb': 'Lohnsteuerbescheinigung', 'se': 'Streckeneinsatz',
+                'dp': 'Dienstplan', 'einsatz': 'Einsatzplan'}
+    for cat, kw_list in markers.items():
+        items = files.get(cat) or []
+        for idx, item in enumerate(items):
+            pdf_bytes = item[0] if isinstance(item, tuple) else item
+            if not pdf_bytes or not isinstance(pdf_bytes, (bytes, bytearray)):
+                continue
+            try:
+                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                    # Erste Seite reicht für Sanity — sparsam mit Memory
+                    page1_text = (pdf.pages[0].extract_text() or '') if pdf.pages else ''
+            except Exception:
+                continue  # nicht lesbar — Plausi überspringen, KI versucht's
+            ptext = page1_text.lower()
+            if not any(kw in ptext for kw in kw_list):
+                warnings.append(
+                    f'⚠ Datei {idx+1} in Kategorie "{label_de[cat]}" enthält keine '
+                    f'typischen Begriffe (z.B. "{kw_list[0]}"). Bitte prüfen ob du das '
+                    f'richtige Dokument hochgeladen hast.'
+                )
+    return warnings
+
+
 @app.route('/api/process', methods=['POST'])
 def process_real():
     """Startet asynchrone Auswertung. Liefert sofort job_id, Frontend pollt /api/job/<id>."""
     try:
+        # Rate-Limit pro IP: max 20 Process-Calls/h. Stripe ist primärer Anti-Abuse-Layer,
+        # IP-Limit fängt nur Versuche das Endpoint zu spammen (z.B. Promo-Code-Brute-Force).
+        ip = _client_ip()
+        if _ip_rate_limited(ip, 'process', limit=20, window_sec=3600):
+            return jsonify({
+                'error': 'Zu viele Versuche von dieser Verbindung. Bitte warte ca. 1 Stunde und versuche es dann erneut.'
+            }), 429
         anreise = request.form.get('anreise', 'auto')
         # Robuste Number-Casts mit Fallback bei fehlerhaftem Input
         def _safe_int(v, default):
@@ -1027,9 +1132,26 @@ def _run_process_async(job_id, form, files):
             _jobs[job_id]['progress'] = 5
         _audit(job_id, 'calculation_started')
 
+        # Plausi-Check: sind die Files typisch zur Kategorie?
+        try:
+            file_warnings = _validate_file_categories(files)
+            if file_warnings:
+                _audit(job_id, 'file_validation_warnings', {'warnings': file_warnings})
+                print(f"[file-validation] {len(file_warnings)} Warnung(en): {file_warnings[0][:120]}")
+        except Exception as e:
+            file_warnings = []
+            print(f"[file-validation] Skip wegen Fehler: {e}")
+
         result = berechne(form, files)
         if isinstance(result, tuple):
             result = result[0]
+        # File-Validation-Warnings vorne in Notes einfügen — User soll sie sehen
+        if file_warnings:
+            existing_notes = result.get('hinweise') or result.get('notes') or []
+            if isinstance(existing_notes, list):
+                # vorne anhängen damit prominent
+                key = 'hinweise' if 'hinweise' in result else 'notes'
+                result[key] = list(file_warnings) + existing_notes
         _audit(job_id, 'calculation_done', {
             'gesamt': result.get('gesamt'), 'netto': result.get('netto'),
             'verification': result.get('_verification'),
@@ -2250,8 +2372,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '4.4',
-        'build':   'patterns-statt-overfit-cases-2026-05-09',
+        'version': '5.0',
+        'build':   'self-reflection-audit-pdf-dsgvo-tests-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -2631,16 +2753,34 @@ def _claude_stream_with_retry(client, model, max_tokens, content, max_retries=3,
     if last_err: raise last_err
 
 
-# ── BMF-PAUSCHALEN PRO JAHR ────────────────────────────────────
-# Quelle: BMF-Schreiben "Steuerliche Behandlung von Reisekosten"
-# Aktualisierungen jährlich — wenn neues Jahr, hier ergänzen.
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║ BMF-PAUSCHALEN — JÄHRLICHES REVIEW PFLICHT                       ║
+# ║                                                                   ║
+# ║ LAST-REVIEWED: 2026-05-09  (gültig für Steuerjahr 2025)         ║
+# ║ NEXT-REVIEW:   2026-12-01  (für Steuerjahr 2026 finalisieren)   ║
+# ║                                                                   ║
+# ║ Quelle: BMF-Schreiben "Steuerliche Behandlung von Reisekosten"  ║
+# ║   - Inland-Pauschalen: § 9 Abs. 4a EStG                         ║
+# ║   - Auslands-Pauschalen: jährliches BMF-Schreiben (siehe        ║
+# ║     bmf_data.py + IATA_TO_BMF)                                   ║
+# ║   - Pendlerpauschale: § 9 Abs. 1 Nr. 4 EStG                     ║
+# ║                                                                   ║
+# ║ BEI NEUEM STEUERJAHR (Jan/Feb des Folgejahres):                 ║
+# ║   1. BMF-Schreiben Reisekosten suchen (Bundesfinanzministerium)║
+# ║   2. Inland: tagestrip_8h, an_abreise, voll_24h aktualisieren   ║
+# ║   3. Auslandsspesen-Tabelle in bmf_data.py aktualisieren        ║
+# ║   4. LAST-REVIEWED-Datum oben aktualisieren                      ║
+# ║   5. Diesen Codeblock prüfen: Tests laufen lassen               ║
+# ╚══════════════════════════════════════════════════════════════════╝
 BMF_INLAND_BY_YEAR = {
     2023: {'tagestrip_8h': 14.0, 'an_abreise': 14.0, 'voll_24h': 28.0},
     2024: {'tagestrip_8h': 14.0, 'an_abreise': 14.0, 'voll_24h': 28.0},
     2025: {'tagestrip_8h': 14.0, 'an_abreise': 14.0, 'voll_24h': 28.0},
-    2026: {'tagestrip_8h': 14.0, 'an_abreise': 14.0, 'voll_24h': 28.0},  # noch keine Änderung bekannt
+    2026: {'tagestrip_8h': 14.0, 'an_abreise': 14.0, 'voll_24h': 28.0},  # PROVISORISCH — Review Dez 2026
 }
 
+# Pendlerpauschale: 0,30€ km 1-20, 0,38€ ab km 21
+# Stand 2025: gilt seit 2022, soll bis 2026 verlängert werden (Klimaschutz-Anhebung)
 PENDLER_BY_YEAR = {
     2023: {'lt_20km': 0.30, 'gt_21km': 0.38},
     2024: {'lt_20km': 0.30, 'gt_21km': 0.38},
@@ -2648,12 +2788,16 @@ PENDLER_BY_YEAR = {
     2026: {'lt_20km': 0.30, 'gt_21km': 0.38},
 }
 
+# Reinigungskosten-Pauschale (BFH-Verwaltungspraxis, ohne Beleg):
+# 1,60€/Arbeitstag für Berufskleidung-Reinigung. Quelle: BFH VI R 56/91, Urteilspraxis.
 REINIGUNG_PRO_TAG_BY_YEAR = {
-    2023: 1.60, 2024: 1.60, 2025: 1.60, 2026: 1.60,  # Verwaltungspraxis
+    2023: 1.60, 2024: 1.60, 2025: 1.60, 2026: 1.60,
 }
 
+# Trinkgeld-Pauschale für Hotelnächte (Reisenebenkosten, § 9 Abs. 1 Nr. 5a EStG):
+# 3,60€/Hotelnacht. Verwaltungspraxis, BFH-konform.
 TRINKGELD_PRO_NACHT_BY_YEAR = {
-    2023: 3.60, 2024: 3.60, 2025: 3.60, 2026: 3.60,  # Verwaltungspraxis
+    2023: 3.60, 2024: 3.60, 2025: 3.60, 2026: 3.60,
 }
 
 
@@ -5141,10 +5285,13 @@ Liefere via Tool das strukturierte Ergebnis."""
         return None
 
 
-def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebase='FRA'):
+def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebase='FRA', feedback=None):
     """Opus 4.7: liest Dienstplan + Einsatzplan + SE parallel, klassifiziert Tag für Tag.
     Liefert: arbeitstage, fahrtage, hotel_naechte, z72/73/74_tage und EUR, z76_eur,
-    plus monatlichen Nachweis. Konservative FollowMe-Methode."""
+    plus monatlichen Nachweis. Konservative FollowMe-Methode.
+
+    feedback: Optional dict {'prev_classification': cls, 'issues': [str]} — bei
+    Self-Reflection-Pass wird Opus mit konkreten Hinweisen zur Korrektur erneut aufgerufen."""
     if not ANTHROPIC_KEY:
         return None
     dp_bytes = _bytes_list(dp_bytes) if dp_bytes else []
@@ -5323,6 +5470,28 @@ Bei unklaren Tagen: in 'unklare_tage' mit Begründung listen. NIE raten.
 
 LIEFERE jetzt via Tool die strukturierten Werte + monatlichen Nachweis."""
 
+    # Self-Reflection-Pass: wenn vorheriger Klass-Output Math-Invarianten verletzt,
+    # bekommt Opus die konkreten Issues als Korrektur-Auftrag mit.
+    if feedback and feedback.get('issues'):
+        prev = feedback.get('prev_classification', {}) or {}
+        issues_list = feedback.get('issues', [])
+        prompt += "\n\n═══════════════════════════════════════════════════════════════════════════"
+        prompt += "\n█ KORREKTUR-AUFTRAG: deine vorherige Klassifikation hatte Probleme"
+        prompt += "\n═══════════════════════════════════════════════════════════════════════════\n"
+        prompt += f"\nDeine erste Klassifikation lieferte:"
+        prompt += f"\n  arbeitstage={prev.get('arbeitstage')}, fahr_tage={prev.get('fahr_tage')}, "
+        prompt += f"hotel={prev.get('hotel_naechte')}"
+        prompt += f"\n  Z72={prev.get('z72_tage')}T, Z73={prev.get('z73_tage')}T, "
+        prompt += f"Z74={prev.get('z74_tage')}T, Z76={prev.get('z76_eur'):.2f}€" if prev.get('z76_eur') is not None else ""
+        prompt += "\n\nProbleme die das Backend identifiziert hat:\n"
+        for i, iss in enumerate(issues_list, 1):
+            prompt += f"  {i}. {iss}\n"
+        prompt += "\nGEH JETZT TAG-FÜR-TAG NOCHMAL DURCH und korrigiere diese spezifischen "
+        prompt += "Probleme. Schau besonders die Tage an die zur Inkonsistenz führen — falsch "
+        prompt += "klassifizierte Inland-/Ausland-Touren oder übersehene Schulungen mit Hotel. "
+        prompt += "Im 'tage_detail' dokumentiere KLAR die Begründung für jeden Tag der zu den "
+        prompt += "Problem-Posten beiträgt. Liefere das KORRIGIERTE Ergebnis via Tool."
+
     content.append({'type': 'text', 'text': prompt})
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=300.0)
@@ -5362,6 +5531,7 @@ LIEFERE jetzt via Tool die strukturierten Werte + monatlichen Nachweis."""
             'z76_eur':       float(tool_input.get('z76_eur', 0) or 0),
             'nachweis':      str(tool_input.get('nachweis', '') or ''),
             'unklare_tage':  list(tool_input.get('unklare_tage', []) or []),
+            'tage_detail':   list(tool_input.get('tage_detail', []) or []),
         }
         # EUR aus Tagen × BMF-Pauschale (vereinheitlicht)
         bmf = BMF_INLAND_BY_YEAR.get(year, BMF_INLAND_BY_YEAR[2025])
@@ -5369,7 +5539,8 @@ LIEFERE jetzt via Tool die strukturierten Werte + monatlichen Nachweis."""
         result['z73_eur'] = round(result['z73_tage'] * bmf['an_abreise'], 2)
         result['z74_eur'] = round(result['z74_tage'] * bmf['voll_24h'], 2)
         result['z76_eur'] = round(result['z76_eur'], 2)
-        print(f"[Opus-Klassifikation] {elapsed:.1f}s: arbeit={result['arbeitstage']}T fahr={result['fahr_tage']}T "
+        pass_label = '[Opus-Klassifikation-RECHECK]' if feedback else '[Opus-Klassifikation]'
+        print(f"{pass_label} {elapsed:.1f}s: arbeit={result['arbeitstage']}T fahr={result['fahr_tage']}T "
               f"hotel={result['hotel_naechte']}T  Z72={result['z72_tage']}T/{result['z72_eur']:.2f}€  "
               f"Z73={result['z73_tage']}T/{result['z73_eur']:.2f}€  Z74={result['z74_tage']}T/{result['z74_eur']:.2f}€  "
               f"Z76={result['z76_eur']:.2f}€  unklar={len(result['unklare_tage'])}")
@@ -5377,6 +5548,54 @@ LIEFERE jetzt via Tool die strukturierten Werte + monatlichen Nachweis."""
     except Exception as e:
         print(f"[Opus-Klassifikation] fail: {e}")
         return None
+
+
+def _detect_classification_issues(cls, se_summary):
+    """Prüft Math-Invarianten zwischen Opus-Klassifikation und Sonnet-SE-Summen.
+    Liefert Liste konkreter Issue-Strings für den Self-Reflection-Pass.
+    Nur HARTE Verletzungen — nicht jede statistische Auffälligkeit.
+    Bei Verletzungen: Opus bekommt diese Issues als Korrektur-Auftrag mit."""
+    if not cls or not se_summary:
+        return []
+    issues = []
+    z76 = float(cls.get('z76_eur', 0) or 0)
+    z77 = float(se_summary.get('z77_total', 0) or 0)
+    auslandsspesen_se = float(se_summary.get('auslandsspesen_total', 0) or 0)
+    arbeitstage = int(cls.get('arbeitstage', 0) or 0)
+    fahr_tage = int(cls.get('fahr_tage', 0) or 0)
+    hotel = int(cls.get('hotel_naechte', 0) or 0)
+
+    # 1) Mathematisch: Z76 darf nicht > Z77 sein (BMF ist Teilmenge der LH-stfrei-Auszahlung)
+    if z77 > 0 and z76 > z77 * 1.05:  # 5% Toleranz für BMF-Aufschlag
+        issues.append(
+            f"Z76 = {z76:.2f}€ ist HÖHER als Z77 = {z77:.2f}€. Das ist mathematisch "
+            f"problematisch (BMF-Pauschale > LH-stfrei-Auszahlung). Du hast vermutlich "
+            f"zu viele Tage als Auslandstour klassifiziert. Prüfe ob einige Tage Inland "
+            f"(Z73) oder Same-Day (Z72) sein müssten."
+        )
+    # 2) Z76 vs Auslandsspesen-Summe ±30% — sollten ähnlich sein (BMF ≈ AG-Auszahlung pro Auslands-Tag)
+    if auslandsspesen_se > 100 and z76 > 0:
+        diff_pct = abs(z76 - auslandsspesen_se) / max(auslandsspesen_se, 1)
+        if diff_pct > 0.40:  # >40% Diff = sehr suspekt
+            direction = "ZU HOCH" if z76 > auslandsspesen_se else "ZU NIEDRIG"
+            issues.append(
+                f"Z76 = {z76:.2f}€ ist {direction} im Vergleich zu Auslandsspesen-SE = "
+                f"{auslandsspesen_se:.2f}€ (Diff {diff_pct*100:.0f}%). "
+                f"{'Du hast vermutlich Tage falsch als Auslandstour klassifiziert die eigentlich Inland sind.' if z76 > auslandsspesen_se else 'Du hast vermutlich Auslandstage übersehen oder als Inland klassifiziert.'}"
+            )
+    # 3) Hotel ≤ Arbeitstage (logisch zwingend)
+    if hotel > arbeitstage:
+        issues.append(
+            f"Hotel-Nächte ({hotel}) > Arbeitstage ({arbeitstage}) — logisch unmöglich. "
+            f"Eine Nacht-Übernachtung setzt einen Arbeitstag voraus."
+        )
+    # 4) Fahr-Tage ≤ Arbeitstage
+    if fahr_tage > arbeitstage:
+        issues.append(
+            f"Fahr-Tage ({fahr_tage}) > Arbeitstage ({arbeitstage}) — logisch unmöglich. "
+            f"Eine Tour = 1 Fahrtag, kein eigener Fahrtag pro Etappe."
+        )
+    return issues
 
 
 def hybrid_analyze(form, files):
@@ -5435,6 +5654,30 @@ def hybrid_analyze(form, files):
         except Exception as e:
             errors.append(f'DP-Klassifikation: {e}')
             print(f"[hybrid] Opus-Klassifikation crash: {e}")
+    gc.collect()
+    _release_memory_to_os()
+
+    # Schritt 3b: Self-Reflection — wenn Klassifikation Math-Invarianten verletzt,
+    # Opus mit konkreten Issues nochmal aufrufen (max 1 Recheck-Pass).
+    if classification and se_summary:
+        issues = _detect_classification_issues(classification, se_summary)
+        if issues:
+            print(f"[hybrid] Self-Reflection-Trigger: {len(issues)} Issue(s) — {'; '.join(issues)[:200]}")
+            try:
+                rechecked = _opus_classify_days_v2(
+                    dp_bytes, einsatz_bytes, se_bytes, year, homebase,
+                    feedback={'prev_classification': classification, 'issues': issues}
+                )
+                if rechecked and rechecked.get('arbeitstage', 0) > 0:
+                    # Re-Issues check: hat Recheck die Probleme behoben?
+                    new_issues = _detect_classification_issues(rechecked, se_summary)
+                    if len(new_issues) < len(issues):
+                        print(f"[hybrid] Recheck behebt {len(issues)-len(new_issues)} von {len(issues)} Issues — übernehme.")
+                        classification = rechecked
+                    else:
+                        print(f"[hybrid] Recheck löst keine Issues — behalte Original ({len(new_issues)} Issues bleiben).")
+            except Exception as e:
+                print(f"[hybrid] Self-Reflection-Pass crash: {e}")
     gc.collect()
     _release_memory_to_os()
 
@@ -7109,6 +7352,76 @@ def erstelle_pdf(d):
         "<i>geordnet, beschriftet und nachvollziehbar</i> — Seite für Seite.",
         ps("sep4", fontSize=9.5, textColor=TEXT3, fontName="Helvetica",
            leading=15, alignment=TA_CENTER)))
+
+    # Rechtlicher Disclaimer
+    S.append(Spacer(1, 1.2*cm))
+    S.append(HRFlowable(width="40%", thickness=0.3, color=LINE,
+        hAlign='CENTER', spaceAfter=10))
+    S.append(Paragraph("Rechtlicher Hinweis",
+        ps("disc_t", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
+           leading=12, alignment=TA_CENTER, spaceAfter=8, letterSpacing=1.5)))
+    S.append(Paragraph(
+        "Diese Auswertung wurde automatisiert auf Basis deiner hochgeladenen Dokumente erstellt. "
+        "Sie ersetzt <b>keine</b> Beratung durch eine Steuerberaterin oder einen Steuerberater. "
+        "Wir übernehmen keine Gewähr für die Richtigkeit, Vollständigkeit oder steuerliche "
+        "Anerkennung der berechneten Werte. Prüfe vor Eintragung in deine Steuererklärung "
+        "selbst, ob alle Werte plausibel sind, und ziehe im Zweifelsfall fachlichen Rat hinzu. "
+        "Die rechtliche Verantwortung für deine Steuererklärung liegt bei dir.",
+        ps("disc_b", fontSize=8.5, textColor=TEXT3, fontName="Helvetica",
+           leading=13, alignment=TA_CENTER, spaceAfter=8)))
+
+    # ════════════════════════════════════════════════
+    # TAG-FÜR-TAG-NACHWEIS (Audit) — nur wenn tage_detail vorhanden
+    # ════════════════════════════════════════════════
+    tage_detail = d.get('_tage_detail') or []
+    if tage_detail and isinstance(tage_detail, list):
+        S.append(PageBreak())
+        for el in section("Tag-für-Tag-Nachweis"): S.append(el)
+        S.append(Paragraph(
+            "Diese Tabelle dokumentiert wie jeder dienstliche Tag klassifiziert wurde. "
+            "Sie dient als Nachweis gegenüber dem Finanzamt und Steuerberater.",
+            ps("td_intro", fontSize=9, textColor=TEXT2, fontName="Helvetica",
+               leading=13, alignment=TA_LEFT, spaceAfter=12)))
+        # Tabelle aufbauen
+        tdata = [['Datum', 'Marker', 'Routing', 'Klass.', 'Begründung']]
+        for entry in tage_detail[:200]:  # safety cap
+            if not isinstance(entry, dict):
+                continue
+            datum = str(entry.get('datum', ''))[:10]
+            marker = str(entry.get('marker', ''))[:14]
+            routing = str(entry.get('routing', ''))[:18]
+            klass = str(entry.get('klass', ''))[:8]
+            begr = str(entry.get('begruendung', ''))[:90]
+            tdata.append([datum, marker, routing, klass, begr])
+        if len(tdata) > 1:
+            ttab = LongTable(tdata, colWidths=[1.8*cm, 1.6*cm, 2.2*cm, 1.4*cm, 9.3*cm], repeatRows=1)
+            ttab.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), BG_CARD),
+                ('TEXTCOLOR', (0,0), (-1,0), TEXT),
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0,0), (-1,-1), 7.5),
+                ('TEXTCOLOR', (0,1), (-1,-1), TEXT2),
+                ('FONTNAME', (0,1), (-1,-1), 'Helvetica'),
+                ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                ('LINEBELOW', (0,0), (-1,0), 0.4, LINE2),
+                ('LINEBELOW', (0,1), (-1,-1), 0.2, LINE),
+                ('LEFTPADDING', (0,0), (-1,-1), 4),
+                ('RIGHTPADDING', (0,0), (-1,-1), 4),
+                ('TOPPADDING', (0,0), (-1,-1), 3),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+            ]))
+            S.append(ttab)
+            S.append(Spacer(1, 0.4*cm))
+            unklare = d.get('_unklare_tage') or []
+            if unklare:
+                S.append(Paragraph(
+                    f"<b>Unklare Tage ({len(unklare)}):</b> Diese Tage konnten nicht eindeutig klassifiziert werden — bitte selbst prüfen.",
+                    ps("td_unklar", fontSize=8.5, textColor=GOLD, fontName="Helvetica",
+                       leading=12, alignment=TA_LEFT, spaceAfter=6)))
+                for u in unklare[:15]:
+                    S.append(Paragraph(f"• {str(u)[:200]}",
+                        ps(f"td_u{id(u)}", fontSize=8, textColor=TEXT3,
+                           fontName="Helvetica", leading=11, leftIndent=10, spaceAfter=2)))
 
     # ════════════════════════════════════════════════
     # BELEGE — nur wenn Fotos vorhanden
