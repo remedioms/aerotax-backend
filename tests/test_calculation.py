@@ -1972,6 +1972,51 @@ def test_v87_counted_flags_consistent_with_counters():
     assert sum_hotel == result['hotel_naechte']
 
 
+def test_v88_same_day_with_foreign_se_becomes_z76():
+    """Same-Day mit Auslands-SE-Stempel (TLV/CAI/REK) → Z76, NICHT Z72.
+    Live-Bug aus job f20175f0: Tel Aviv-Same-Day landete als Z72 statt Z76."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-22', 'activity_type': 'same_day', 'overnight_after_day': False,
+         'has_fl': False, 'start_time': '08:22', 'end_time': '18:35'},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-04-22', 'stfrei_betrag': 32, 'stfrei_ort': 'TLV', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=30)
+    detail = [d for d in result['tage_detail'] if d['datum'] == '2025-04-22']
+    assert detail and detail[0]['klass'] == 'Z76', \
+        f"Same-Day TLV mit Auslands-SE sollte Z76, ist {detail[0]['klass'] if detail else 'fehlt'}"
+    # eur_added sollte BMF-Pauschale für Israel sein (nicht 14€ Z72-Pauschale)
+    assert detail[0]['eur'] > 14, \
+        f"Z76 sollte BMF-Auslands-Satz haben, ist {detail[0]['eur']}"
+
+
+def test_v88_diag_missing_z73_uses_se_ort_priority():
+    """Diagnose-Heuristik nutzt SE-Ort vor DP-layover_ort (konsistent mit Classifier).
+    Sonst false-positive bei Tagen mit Auslands-SE und DP-Inland-Layover-Lesefehler."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # Sonnet hat Inland-DP-layover gelesen aber SE-Ort ist Ausland (= echte Auslands-Anreise)
+    structured = {'days': [
+        {'datum': '2025-03-16', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'GVA', 'FRA', 'MUC'],
+         'layover_ort': 'MUC'},  # DP las MUC
+        {'datum': '2025-03-17', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-03-16', 'stfrei_betrag': 33, 'stfrei_ort': 'GVA', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Klassifikator nimmt SE-Ort GVA (foreign) → Z76
+    detail = [d for d in result['tage_detail'] if d['datum'] == '2025-03-16']
+    assert detail and detail[0]['klass'] == 'Z76'
+    # Diagnose darf KEINE missing_z73 für 16.03 erzeugen (false-positive Bug)
+    candidates = [c for c in result['missing_z73_candidates'] if c['datum'] == '2025-03-16']
+    assert not candidates, f"16.03 mit Auslands-SE GVA darf kein missing_z73 sein, ist {candidates}"
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

@@ -6859,6 +6859,18 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 klass = 'Z73'
                 eur_added = INLAND_AN_ABREISE
                 reason = 'Same-Day im Inland-Cluster (Z73 An/Ab)'
+            elif (se.get('count', 0) > 0 and se.get('stfrei_inland') is False
+                  and se.get('stfrei_ort')):
+                # v8.8: Same-Day mit AUSLANDS-SE-Stempel (z.B. TLV/CAI/REK) — das ist
+                # ein Same-Day-Auslandstrip → Z76 mit BMF-Pauschale für >8h
+                # (an_abreise-Satz, weil keine Übernachtung).
+                se_ort_fix = se.get('stfrei_ort', '')
+                bmf_aus = _bmf(se_ort_fix)
+                eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+                klass = 'Z76'
+                reason = f'Same-Day Auslandstrip {se_ort_fix} (Z76 >8h)'
+                audit_note = f'{datum}: Same-Day mit Auslands-SE {se_ort_fix} → Z76'
+                print(f"[v8-z76-detail] datum={datum} ort={se_ort_fix} bmf_land={(bmf_aus or {}).get('land','?')} tagtyp=an_abreise amount={eur_added:.2f} reason='Same-Day Auslandstrip'")
             else:
                 # v8.1: Dauer-Plausibilisierung. Z72 nur wenn Dienst+Fahrzeit ≥ 8h.
                 # Wenn duty_duration_minutes vorhanden: + 2× commute (Hin+Zurück)
@@ -7395,12 +7407,15 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'reason': 'Z72-Hard-Gate möglicherweise verletzt'
                 })
 
-        # missing_z73_candidates: echter Inland-Layover (≠ Homebase) ohne Z73/Z74
-        if (overnight and layover_ort and layover_ort != hb_upper
-                and _is_inland_code(layover_ort) and klass not in ('Z73', 'Z74')):
+        # missing_z73_candidates: echter Inland-Layover (≠ Homebase) ohne Z73/Z74.
+        # v8.8: Konsistent mit Classifier — SE-Ort hat Vorrang vor DP-layover_ort.
+        # Sonst false-positive bei Tagen mit Auslands-SE-Stempel + DP-Inland-layover.
+        effective_ort = (se_ort or layover_ort).upper()
+        if (overnight and effective_ort and effective_ort != hb_upper
+                and _is_inland_code(effective_ort) and klass not in ('Z73', 'Z74')):
             missing_z73_candidates.append({
-                'datum': datum, 'klass': klass, 'layover_ort': layover_ort,
-                'reason': f'Inland-Layover {layover_ort} (≠ Homebase) ohne Z73/Z74'
+                'datum': datum, 'klass': klass, 'layover_ort': effective_ort,
+                'reason': f'Inland-Layover {effective_ort} (≠ Homebase) ohne Z73/Z74'
             })
 
         # missing_z76_candidates: Auslands-SE-Zeile oder Foreign-Cluster aber kein Z76
