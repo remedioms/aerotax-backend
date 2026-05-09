@@ -3855,6 +3855,38 @@ def berechne(form, files):
     else:
         missing.append('Lohnsteuerbescheinigung (nicht hochgeladen)')
 
+    # ── EINSATZPLAN (CAS) — zuerst parsen, damit SE-Warnings ihn berücksichtigen ──
+    einsatz_data = None
+    if files.get('einsatz'):
+        try:
+            einsatz_data = parse_einsatzplan_mit_ki(files['einsatz'], year=int(form.get('year', 2025)))
+            if einsatz_data:
+                print(f"Einsatzplan: {einsatz_data.get('monate_geparst',0)}/12 Monate, "
+                      f"{len(einsatz_data.get('umlaeufe',[]))} Umläufe, "
+                      f"Spesen-Total={einsatz_data.get('spesen_total',0):.2f} EUR, "
+                      f"Tagestrips={einsatz_data.get('tagestrips_count',0)}")
+        except Exception as e:
+            print(f"Einsatzplan-Parse fail: {e}")
+            einsatz_data = None
+
+    # Helper: Einsatzplan-Monate auswerten (welche Monate flugfrei?)
+    _MONAT_MAP = {'JAN':1,'FEB':2,'MAR':3,'MÄR':3,'APR':4,'MAI':5,'JUN':6,
+                  'JUL':7,'AUG':8,'SEP':9,'OKT':10,'NOV':11,'DEZ':12}
+    einsatz_flugmonate = set()       # Monate mit ≥1 Umlauf
+    einsatz_abgedeckte_monate = set() # alle Monate die im Einsatzplan auftauchen
+    if einsatz_data:
+        for ml in einsatz_data.get('monatslisten', []):
+            mn_part = (ml or '').split()[0].upper() if ml else ''
+            mn = _MONAT_MAP.get(mn_part)
+            if mn:
+                einsatz_abgedeckte_monate.add(mn)
+        for u in einsatz_data.get('umlaeufe', []):
+            mn_part = (u.get('monat', '') or '').split()[0].upper()
+            mn = _MONAT_MAP.get(mn_part)
+            if mn:
+                einsatz_flugmonate.add(mn)
+    einsatz_flugfreie_monate = einsatz_abgedeckte_monate - einsatz_flugmonate
+
     # ── STRECKENEINSATZ-ABRECHNUNGEN ──────────────────────────
     se_data = None
     if files.get('se'):
@@ -3882,16 +3914,32 @@ def berechne(form, files):
                 detected_months = sorted({int(a.get('monat', 0) or 0) for a in abr_list if a.get('monat')})
                 month_names = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez']
                 detected_str = ', '.join(month_names[m-1] for m in detected_months if 1 <= m <= 12) or '?'
-                missing_months = [month_names[i] for i in range(12) if (i+1) not in detected_months]
+                # Wirklich fehlende Monate = nicht in SE UND laut Einsatzplan NICHT flugfrei
+                # (Teilzeit/Urlaub/Krankheit = keine SE = kein Fehler)
+                truly_missing = [i+1 for i in range(12)
+                                 if (i+1) not in detected_months
+                                 and (i+1) not in einsatz_flugfreie_monate]
                 # Geschätzter Spesen-Schnitt der erfassten Monate
                 avg_steuerfrei = sum(a.get('steuerfrei', 0) for a in abr_list) / max(1, months_found)
-                est_missing = round(avg_steuerfrei * (12 - months_found), 2)
-                notes.append(
-                    f'⚠️ ACHTUNG: Nur {months_found}/12 Streckeneinsatz-Abrechnungen erfasst '
-                    f'(erfasst: {detected_str}; fehlend: {", ".join(missing_months)}). '
-                    f'Geschätzter Verlust durch fehlende Monate: ~{est_missing:.0f}€ steuerfreie Spesen. '
-                    f'Tipp: lade die fehlenden Monate nach via "Mit Code anpassen" auf der Startseite.'
-                )
+                if truly_missing:
+                    missing_strs = [month_names[m-1] for m in truly_missing]
+                    est_missing = round(avg_steuerfrei * len(truly_missing), 2)
+                    notes.append(
+                        f'⚠️ ACHTUNG: Nur {months_found}/12 Streckeneinsatz-Abrechnungen erfasst '
+                        f'(erfasst: {detected_str}; fehlend: {", ".join(missing_strs)}). '
+                        f'Geschätzter Verlust durch fehlende Monate: ~{est_missing:.0f}€ steuerfreie Spesen. '
+                        f'Tipp: lade die fehlenden Monate nach via "Mit Code anpassen" auf der Startseite.'
+                    )
+                elif einsatz_flugfreie_monate:
+                    # Alle "fehlenden" SE-Monate waren laut Einsatzplan flugfrei → kein Warning, nur Info
+                    flugfrei_strs = [month_names[m-1] for m in sorted(einsatz_flugfreie_monate)
+                                     if m not in detected_months]
+                    if flugfrei_strs:
+                        notes.append(
+                            f'ℹ Streckeneinsatz: {months_found}/12 Monate erfasst — fehlende Monate '
+                            f'({", ".join(flugfrei_strs)}) waren laut Einsatzplan flugfrei '
+                            f'(Teilzeit/Urlaub/Frei) und benötigen keine Abrechnung.'
+                        )
     else:
         missing.append('Streckeneinsatz-Abrechnungen (nicht hochgeladen)')
 
@@ -3923,20 +3971,6 @@ def berechne(form, files):
             dp = None
     else:
         missing.append('Flugstunden-Übersichten (nicht hochgeladen)')
-
-    # ── EINSATZPLAN (CAS) — optional, für Cross-Check & Z72-Boost ──
-    einsatz_data = None
-    if files.get('einsatz'):
-        try:
-            einsatz_data = parse_einsatzplan_mit_ki(files['einsatz'], year=int(form.get('year', 2025)))
-            if einsatz_data:
-                print(f"Einsatzplan: {einsatz_data.get('monate_geparst',0)}/12 Monate, "
-                      f"{len(einsatz_data.get('umlaeufe',[]))} Umläufe, "
-                      f"Spesen-Total={einsatz_data.get('spesen_total',0):.2f} EUR, "
-                      f"Tagestrips={einsatz_data.get('tagestrips_count',0)}")
-        except Exception as e:
-            print(f"Einsatzplan-Parse fail: {e}")
-            einsatz_data = None
 
     # ── SMART INFERENCE für fehlende Daten ────────────────────
     inferred = {}
@@ -4214,25 +4248,35 @@ def berechne(form, files):
         ein_umlaeufe_count = len(einsatz_data.get('umlaeufe', []))
         cross_notes = []
 
-        # Cross-Check 1: Spesen-Total Einsatzplan vs SE-Spesen-Summe
+        # Cross-Check 1: Spesen-Total nur vergleichen, wenn beide Quellen die gleichen Monate abdecken
+        # (sonst vergleichen wir Äpfel mit Birnen — z.B. Einsatzplan 12 Mon vs SE 8 Mon Teilzeit)
         if se_data and se_data.get('summe_gesamt', 0) > 0:
-            se_spesen = float(se_data.get('summe_gesamt', 0))
-            spesen_diff = abs(ein_spesen - se_spesen)
-            spesen_tolerance = max(50, se_spesen * 0.03)  # 3% oder mind. 50€
-            if spesen_diff > spesen_tolerance and ein_monate >= 6:
-                cross_notes.append(
-                    f'Spesen-Differenz: Einsatzplan zeigt {ein_spesen:.2f}€ — '
-                    f'Streckeneinsatz {se_spesen:.2f}€ (Δ {spesen_diff:.2f}€). '
-                    f'Möglicherweise fehlt eine Streckeneinsatz-Abrechnung oder ein Einsatzplan-Monat.'
-                )
+            se_monate = {int(a.get('monat', 0) or 0) for a in se_data.get('abrechnungen', []) if a.get('monat')}
+            # Nur vergleichen wenn Einsatzplan-Monate ⊆ SE-Monate (oder umgekehrt vollständig)
+            gemeinsame_monate = einsatz_abgedeckte_monate & se_monate if se_monate else set()
+            if gemeinsame_monate and gemeinsame_monate == einsatz_abgedeckte_monate and ein_monate >= 6:
+                se_spesen = float(se_data.get('summe_gesamt', 0))
+                spesen_diff = abs(ein_spesen - se_spesen)
+                spesen_tolerance = max(50, se_spesen * 0.03)
+                # Nur wenn ALLE 12 Monate von beiden abgedeckt sind, sonst Vergleich nicht sinnvoll
+                if spesen_diff > spesen_tolerance and len(einsatz_abgedeckte_monate) == 12 and len(se_monate) == 12:
+                    cross_notes.append(
+                        f'Spesen-Differenz: Einsatzplan zeigt {ein_spesen:.2f}€ — '
+                        f'Streckeneinsatz {se_spesen:.2f}€ (Δ {spesen_diff:.2f}€). '
+                        f'Möglicherweise wurde ein Wert nicht richtig ausgelesen — bitte prüfen.'
+                    )
 
-        # Cross-Check 2: Anzahl Umläufe vs Streckeneinsatz-Abrechnungen
+        # Cross-Check 2: Welche Flugmonate fehlen in SE? (nur Monate mit Umläufen vergleichen)
         if se_data and se_data.get('abrechnungen'):
-            se_count = len(se_data['abrechnungen'])
-            if ein_umlaeufe_count > 0 and abs(ein_umlaeufe_count - se_count) > 2 and ein_monate >= 6:
+            se_monate = {int(a.get('monat', 0) or 0) for a in se_data['abrechnungen'] if a.get('monat')}
+            # Flugmonate aus Einsatzplan = Monate mit ≥1 Umlauf
+            flugmonate_fehlen_in_se = einsatz_flugmonate - se_monate
+            if flugmonate_fehlen_in_se:
+                _mn = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez']
+                fehlend_str = ', '.join(_mn[m-1] for m in sorted(flugmonate_fehlen_in_se))
                 cross_notes.append(
-                    f'Umlauf-Anzahl: Einsatzplan zeigt {ein_umlaeufe_count} Umläufe — '
-                    f'Streckeneinsatz hat {se_count} Abrechnungen. Bitte Vollständigkeit prüfen.'
+                    f'Flugmonate ohne SE: laut Einsatzplan wurde in {fehlend_str} geflogen, '
+                    f'aber für diese Monate fehlt eine Streckeneinsatz-Abrechnung.'
                 )
 
         # Cross-Check 3: Vollständigkeit Einsatzplan-Monate
