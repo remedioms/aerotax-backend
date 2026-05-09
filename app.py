@@ -2226,8 +2226,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '2.9',
-        'build':   'vma-bmf-pauschale-revert-2026-05-09',
+        'version': '3.0',
+        'build':   'tour-aware-se-classification-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -2919,6 +2919,10 @@ def _parse_se_pdf_xpos(pdf_bytes_list, year=2025):
     arbeitstage = len(rows)
     hotelnaechte = 0
     unklar = []
+    # Tour-Tracking: pro Row protokollieren wir (datum, kategorie, eur, ist_inland_anreise).
+    # Nach dem Loop machen wir einen 2. Pass: Inland-An-/Abreise-Tage, die direkter Nachbar
+    # einer Auslands-Zeile sind, werden zu Z76 reklassifiziert (= Auslandstour-Anreise/Abreise).
+    row_classifications = []  # list of dicts: {'datum': date, 'kat': 'z72'|'z73'|'z74'|'z76', 'eur': float, 'reklassifizierbar': bool}
 
     def bmf_24h(ort):
         v = bmf_lookup(ort, year)
@@ -2926,6 +2930,13 @@ def _parse_se_pdf_xpos(pdf_bytes_list, year=2025):
     def bmf_an(ort):
         v = bmf_lookup(ort, year)
         return v[1] if v else None
+
+    def _datum(r):
+        try:
+            d = r.get('datum', [''])
+            ds = d[0] if isinstance(d, list) else d
+            return ds  # 'DD.MM.YYYY' string is good enough for sorting
+        except: return ''
 
     for r in rows:
         ab = (r.get('ab') or [None])[0]
@@ -2940,25 +2951,33 @@ def _parse_se_pdf_xpos(pdf_bytes_list, year=2025):
         has_ab = ab is not None
         has_an = an is not None
 
+        datum = _datum(r)
+        eur_used = sf_eur if sf_eur else (14.0 if is_inland else 0.0)
+        kat = None  # 'z72', 'z73', 'z74', 'z76'
+        # Reklassifizierbar = Inland-An-/Abreise (kein Tagestrip, kein 24h)
+        # → kann später zu Z76 werden wenn Nachbar einer Auslandszeile
+        reklass = False
+
         if has_ab and has_an:
             # Same-Day-Tour
             if is_inland:
                 z72_tage += 1
                 z72_eur += sf_eur if sf_eur else 14.0
                 fahrtage_inland += 1
+                kat = 'z72'
             else:
-                # Auslands-Tagestrip: NUR Pauschale wenn LH stfrei zahlt.
-                # Wenn LH nichts zahlt, war Abwesenheit i.d.R. unter 8h
-                # (kein §9 EStG-Anspruch). Kein BMF-Fallback hier.
                 if sf_eur:
                     z76_eur += sf_eur
                 fahrtage_ausland += 1
+                kat = 'z76'
         elif has_ab and not has_an:
             # Anreise-Tag
             if is_inland:
                 z73_tage += 1
                 z73_eur += sf_eur if sf_eur else 14.0
                 fahrtage_inland += 1
+                kat = 'z73'
+                reklass = True
             else:
                 if sf_eur:
                     z76_eur += sf_eur
@@ -2971,12 +2990,15 @@ def _parse_se_pdf_xpos(pdf_bytes_list, year=2025):
                     else:
                         unklar.append(r)
                 fahrtage_ausland += 1
+                kat = 'z76'
             hotelnaechte += 1
         elif not has_ab and has_an:
             # Abreise-Tag
             if is_inland:
                 z73_tage += 1
                 z73_eur += sf_eur if sf_eur else 14.0
+                kat = 'z73'
+                reklass = True
             else:
                 if sf_eur:
                     z76_eur += sf_eur
@@ -2988,11 +3010,13 @@ def _parse_se_pdf_xpos(pdf_bytes_list, year=2025):
                         bmf_fallback_count += 1
                     else:
                         unklar.append(r)
+                kat = 'z76'
         else:
             # Voll-Tag (24h auswärts)
             if is_inland:
                 z74_tage += 1
                 z74_eur += sf_eur if sf_eur else 28.0
+                kat = 'z74'
             else:
                 if sf_eur:
                     z76_eur += sf_eur
@@ -3004,7 +3028,79 @@ def _parse_se_pdf_xpos(pdf_bytes_list, year=2025):
                         bmf_fallback_count += 1
                     else:
                         unklar.append(r)
+                kat = 'z76'
             hotelnaechte += 1
+
+        if kat:
+            row_classifications.append({
+                'datum': datum,
+                'kat':   kat,
+                'eur':   sf_eur if sf_eur else (14.0 if kat in ('z72','z73') else 28.0 if kat == 'z74' else 0.0),
+                'reklass': reklass,
+                'kat_ort': kat_ort,
+            })
+
+    # ── TOUR-AWARE RE-KLASSIFIZIERUNG ──────────────────────────
+    # Bei Auslandstouren schreibt LH oft den Anreise-/Abreise-Tag mit FRA als
+    # stfrei-Ort (Inland-Anteil 14€). Steuerlich gehört dieser Tag aber zur
+    # Auslandstour → Z76 mit Auslandsanreise-Pauschale (BMF-Tagessatz "anreise").
+    # Wir reklassifizieren: jede Z73-Inland-Zeile, die direkter Nachbar
+    # (±1 Tag im selben Monat) einer Z76-Auslands-Zeile ist → wird Z76.
+    def _parse_dt(s):
+        try:
+            from datetime import datetime as _dt
+            return _dt.strptime(s, '%d.%m.%Y')
+        except: return None
+
+    sorted_classifications = sorted(row_classifications, key=lambda c: _parse_dt(c['datum']) or 0)
+    z76_dates = set()
+    for c in sorted_classifications:
+        if c['kat'] == 'z76':
+            d = _parse_dt(c['datum'])
+            if d: z76_dates.add(d.date())
+
+    reklass_count = 0
+    reklass_eur_z73_zu_z76 = 0.0
+    reklass_z76_pauschale_eur = 0.0
+    from datetime import timedelta as _td
+    for c in sorted_classifications:
+        if not c.get('reklass'): continue
+        d = _parse_dt(c['datum'])
+        if not d: continue
+        d = d.date()
+        # Ist Vortag oder Folgetag eine Z76-Auslandszeile?
+        is_neighbor_to_ausland = (d - _td(days=1)) in z76_dates or (d + _td(days=1)) in z76_dates
+        if not is_neighbor_to_ausland: continue
+
+        # Reklassifizieren: Z73 (14€ Inland-Anreise) → Z76 (Auslandstour-Anteil)
+        # Dem User schlagen wir den Auslandsanreise-Satz an, da der Tag steuerlich
+        # zur Auslandstour gehört. Suche das Auslands-Ziel beim Nachbarn.
+        ausland_neighbor = next(
+            (cc for cc in sorted_classifications if cc['kat'] == 'z76' and
+             _parse_dt(cc['datum']) and abs((_parse_dt(cc['datum']).date() - d).days) <= 1),
+            None
+        )
+        bmf_satz = None
+        if ausland_neighbor and ausland_neighbor.get('kat_ort'):
+            bmf_satz = bmf_an(ausland_neighbor['kat_ort'])
+        # Inland-Anteil aus Z73 abziehen
+        z73_tage -= 1
+        z73_eur -= c['eur']
+        reklass_eur_z73_zu_z76 += c['eur']
+        # Auslands-Anreise-Pauschale zu Z76 addieren (oder mind. den Inland-Anteil wenn keine BMF-Daten)
+        z76_add = bmf_satz if bmf_satz and bmf_satz > c['eur'] else c['eur']
+        z76_eur += z76_add
+        reklass_z76_pauschale_eur += z76_add
+        reklass_count += 1
+
+    if reklass_count > 0:
+        print(f"[SE-tour-aware] {reklass_count} Z73-Inlandstage → Z76 reklassifiziert "
+              f"(Inland-Anteil {reklass_eur_z73_zu_z76:.2f}€ → Ausland {reklass_z76_pauschale_eur:.2f}€, "
+              f"+{reklass_z76_pauschale_eur - reklass_eur_z73_zu_z76:.2f}€)")
+
+    z73_tage = max(0, z73_tage)
+    z73_eur  = round(max(0, z73_eur), 2)
+    z76_eur  = round(z76_eur, 2)
 
     return {
         'z72_tage': z72_tage, 'z72_eur': round(z72_eur, 2),
