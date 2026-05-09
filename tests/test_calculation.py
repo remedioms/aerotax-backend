@@ -258,14 +258,15 @@ def test_v6_inland_iata_codes():
 
 
 def test_v6_count_deterministic_basic():
-    """Backend zählt Hotelnächte/Arbeitstage/Fahrtage deterministisch."""
+    """Backend zählt Hotelnächte/Arbeitstage/Fahrtage deterministisch (v6.0.2 Schema)."""
     from app import _count_deterministic
     structured = {
         'days': [
-            {'datum': '2025-01-03', 'activity_type': 'tour_start', 'overnight_after_day': True},
-            {'datum': '2025-01-04', 'activity_type': 'tour_continuation', 'overnight_after_day': True},
-            {'datum': '2025-01-05', 'activity_type': 'tour_continuation', 'overnight_after_day': True},
-            {'datum': '2025-01-06', 'activity_type': 'tour_end', 'overnight_after_day': False},
+            # 4-Tages-Tour: Anreise + 2 Volltage + Heimkehr
+            {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True},
+            {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True},
+            {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': True},
+            {'datum': '2025-01-06', 'activity_type': 'tour', 'overnight_after_day': False},
             {'datum': '2025-01-10', 'activity_type': 'office', 'overnight_after_day': False},
             {'datum': '2025-01-11', 'activity_type': 'same_day', 'overnight_after_day': False},
             {'datum': '2025-01-12', 'activity_type': 'frei', 'overnight_after_day': False},
@@ -273,12 +274,11 @@ def test_v6_count_deterministic_basic():
         ]
     }
     counts = _count_deterministic(structured)
-    # 4-Tages-Tour = 3 Hotelnächte (an Tag 1,2,3), Tag 4 kommt heim
+    # 3 Hotelnächte (Tag 1,2,3), Tag 4 kommt heim
     assert counts['hotel_naechte'] == 3
-    # Arbeitstage: Tour (4) + Office (1) + Same-Day (1) + Standby (1) = 7
+    # Arbeitstage: 4 tour + 1 office + 1 same_day + 1 standby = 7
     assert counts['arbeitstage'] == 7
-    # Fahrtage: Tour-Start (1) + Office (1) + Same-Day (1) = 3
-    # (Tour-Continuation und Tour-End zählen nicht; Standby zuhause auch nicht)
+    # Fahrtage: nur Tag 1 der Tour (Tag 2-4 kommen aus Übernachtung) + Office + Same-Day = 3
     assert counts['fahr_tage'] == 3
 
 
@@ -288,13 +288,13 @@ def test_v6_count_deterministic_multi_stop_inland():
     structured = {
         'days': [
             # FRA → BER (Inland-Übernachtung) → ZAG (Ausland) → ARN (Ausland) → Heimkehr
-            {'datum': '2025-06-17', 'activity_type': 'tour_start', 'overnight_after_day': True,
+            {'datum': '2025-06-17', 'activity_type': 'tour', 'overnight_after_day': True,
              'layover_ort': 'BER', 'layover_inland': True},
-            {'datum': '2025-06-18', 'activity_type': 'tour_continuation', 'overnight_after_day': True,
+            {'datum': '2025-06-18', 'activity_type': 'tour', 'overnight_after_day': True,
              'layover_ort': 'ZAG', 'layover_inland': False},
-            {'datum': '2025-06-19', 'activity_type': 'tour_continuation', 'overnight_after_day': True,
+            {'datum': '2025-06-19', 'activity_type': 'tour', 'overnight_after_day': True,
              'layover_ort': 'ARN', 'layover_inland': False},
-            {'datum': '2025-06-20', 'activity_type': 'tour_end', 'overnight_after_day': False},
+            {'datum': '2025-06-20', 'activity_type': 'tour', 'overnight_after_day': False},
         ]
     }
     counts = _count_deterministic(structured)

@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '6.0.1',
-        'build':   'structured-prereader-32k-tokens-pdf-cap-2026-05-09',
+        'version': '6.0.2',
+        'build':   'force-tool-use-robust-parsing-minimal-schema-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5194,46 +5194,38 @@ def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year=2025, homebase='FRA
 
     structured_tool = {
         'name': 'submit_structured_days',
-        'description': 'Liefere strukturierte Tagesdaten — NUR Fakten, keine steuerliche Klassifikation',
+        'description': 'Liefere strukturierte Tagesdaten als reine Lese-Fakten. KEINE steuerliche Klassifikation.',
         'input_schema': {
             'type': 'object',
             'required': ['days'],
             'properties': {
                 'days': {
                     'type': 'array',
-                    'description': f'Liste aller Kalendertage {year}-01-01 bis {year}-12-31 mit dienstlicher Aktivität (FREI/Urlaub/Krank optional weglassen wenn klar). Pflicht: alle Tour-, Office-, Standby-, Schulungs-Tage.',
+                    'description': f'Liste aller Kalendertage {year} mit dienstlicher Aktivität. FREI/Urlaub/Krank weglassen wenn klar erkennbar.',
                     'items': {
                         'type': 'object',
-                        'required': ['datum', 'activity_type', 'overnight_after_day'],
+                        'required': ['datum', 'activity_type'],
                         'properties': {
                             'datum': {'type': 'string', 'description': 'YYYY-MM-DD'},
-                            'raw_marker': {'type': 'string', 'description': 'Marker-Roh-Text aus dem Dienstplan'},
-                            'markers': {'type': 'array', 'items': {'type': 'string'},
-                                        'description': 'Strukturiert: Liste von Markern (A, E, FL, SBY, RES, EM, EH, D4, DD, OFF, U, K, FREI)'},
-                            'routing': {'type': 'array', 'items': {'type': 'string'},
-                                        'description': 'IATA-Codes der Stationen (z.B. ["FRA", "BLR"])'},
                             'activity_type': {
                                 'type': 'string',
-                                'enum': ['frei', 'urlaub', 'krank', 'standby', 'office', 'schulung_inland_hotel', 'tour_start', 'tour_continuation', 'tour_end', 'same_day', 'mixed_handover_sameday', 'none'],
-                                'description': 'Welcher Aktivitäts-Typ. mixed_handover_sameday = Heimkehr aus Tour UND neuer Same-Day am selben Tag.'
+                                'enum': ['frei', 'urlaub', 'krank', 'standby', 'office', 'training', 'tour', 'same_day', 'unknown'],
+                                'description': 'tour=mehrtägige Tour-Tag (Anreise/Mittel/Heimkehr), same_day=Tagestrip, training=Schulung, office=Bürotag Homebase, standby=SBY/RES zuhause'
                             },
-                            'has_flight': {'type': 'boolean', 'description': 'Findet an diesem Tag ein Flug statt?'},
-                            'has_fl': {'type': 'boolean', 'description': 'FL-Marker im Dienstplan vorhanden? (Layover-Indikator)'},
-                            'layover_ort': {'type': 'string', 'description': 'IATA-Code wo der User heute Nacht schläft (leer wenn zuhause)'},
-                            'layover_inland': {'type': 'boolean', 'description': 'Layover-Ort in Inland-Liste (FRA/MUC/HAM/DUS/STR/CGN/BER/...)? Null wenn keine Übernachtung.'},
-                            'homebase_heimkehr': {'type': 'boolean', 'description': 'Endet der dienstliche Tag mit Heimkehr nach Homebase?'},
-                            'overnight_after_day': {'type': 'boolean', 'description': 'KRITISCH: schläft User nach diesem Tag AUSWÄRTS (Hotel)? True wenn am Folgetag noch nicht zuhause. False bei Same-Day, FREI, Standby zuhause.'},
-                            'tour_id': {'type': 'string', 'description': 'ID der zugehörigen Tour (z.B. "2025-03-06_BLR"). Mehrere Tage einer Tour teilen die ID.'},
-                            'tour_open': {'type': 'boolean', 'description': 'Ist die Tour an diesem Tag noch offen (User ist nicht zuhause)?'},
-                            'confidence': {'type': 'number', 'description': '0.0 bis 1.0 — wie sicher ist diese Klassifikation der Lese-Fakten?'},
-                            'notes': {'type': 'string', 'description': 'Optional: Hinweis bei Unsicherheit'},
+                            'routing': {'type': 'array', 'items': {'type': 'string'}, 'description': 'IATA-Codes z.B. ["FRA","BLR"]'},
+                            'has_fl': {'type': 'boolean', 'description': 'FL-Marker im Dienstplan'},
+                            'overnight_after_day': {'type': 'boolean', 'description': 'KRITISCH: User schläft NACH diesem Tag auswärts (Hotel)? True bei FL/Tour-Layover. False bei Same-Day/FREI/Standby/Heimkehr.'},
+                            'layover_ort': {'type': 'string', 'description': 'IATA wo User heute Nacht schläft, leer wenn zuhause'},
+                            'layover_inland': {'type': 'boolean', 'description': 'true=Inland (FRA/MUC/HAM/DUS/STR/CGN/HAJ/BER/LEJ/NUE/BRE), false=Ausland, weglassen wenn keine Übernachtung'},
+                            'confidence': {'type': 'number', 'description': '0-1 wie sicher'},
+                            'notes': {'type': 'string', 'description': 'Optionaler Kurzhinweis bei Unsicherheit (max 60 Zeichen)'},
                         }
                     }
                 },
                 'warnings': {
                     'type': 'array',
                     'items': {'type': 'string'},
-                    'description': 'Lese-Warnungen die das Backend kennen sollte (z.B. unklares Routing, mehrdeutige Marker)'
+                    'description': 'Lese-Warnungen z.B. fehlender Einsatzplan, unklares Routing, mehrdeutige Marker'
                 }
             }
         }
@@ -5261,66 +5253,69 @@ def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year=2025, homebase='FRA
     if pdf_count == 0:
         return None
 
+    has_einsatz = len(einsatz_bytes) > 0
+    einsatz_hinweis = ""
+    if not has_einsatz:
+        einsatz_hinweis = """
+═════ HINWEIS: KEIN EINSATZPLAN VORHANDEN ══════════════════════════════════
+
+Es wurde nur ein Dienstplan hochgeladen, kein Einsatzplan. Das ist OK.
+Extrahiere Marker und Routing soweit aus dem Dienstplan möglich. Setze
+confidence niedriger (0.5-0.7) bei unklaren Routings. Gib trotzdem days[]
+zurück. Vermerke im warnings-Array: "Kein Einsatzplan vorhanden — Routing
+nur aus Dienstplan abgeleitet".
+"""
+
     prompt = f"""Du bist ein DOKUMENTEN-PARSER für Lufthansa-Crew-Dienstpläne (Steuerjahr {year}, Homebase {homebase}).
 
+═════ ZWINGEND: TOOL VERWENDEN ══════════════════════════════════════════════
+
+Du MUSST das Tool 'submit_structured_days' aufrufen. Antworte NICHT mit
+Freitext, NICHT mit JSON im Text, NICHT mit Erklärungen außerhalb des Tools.
+Auch wenn du unsicher bist: Gib trotzdem strukturierte Tagesdaten mit
+confidence < 0.6 + warnings zurück. Lieber unsichere Daten als kein Tool-Aufruf.
+{einsatz_hinweis}
 ═════ DEINE AUFGABE ═════════════════════════════════════════════════════════
 
-Lies Dienstplan + Einsatzplan strukturiert. Liefere für JEDEN dienstlichen
-Kalendertag (alle Tage MIT Aktivität — FREI/Urlaub/Krank kannst du weglassen
-oder mitliefern, beides OK) ein strukturiertes Dict.
+Lies den Dienstplan strukturiert. Liefere für jeden Kalendertag MIT
+dienstlicher Aktivität ein Dict mit datum + activity_type +
+overnight_after_day. Andere Felder optional aber empfohlen wo bekannt.
 
 DU LIEST NUR FAKTEN AUS — DU KLASSIFIZIERST NICHT STEUERLICH (Z72/Z73/Z76)!
 Das macht ein anderer Schritt mit deinen Daten als Input.
 
-═════ FELDER PRO TAG ═════════════════════════════════════════════════════════
+═════ FELDER PRO TAG (KOMPAKT) ══════════════════════════════════════════════
 
-datum (YYYY-MM-DD), raw_marker (was im DP steht), markers (strukturiert),
-routing (IATA-Codes), activity_type (siehe enum), has_flight, has_fl,
-layover_ort, layover_inland, homebase_heimkehr, overnight_after_day,
-tour_id, tour_open, confidence, notes.
+PFLICHT: datum, activity_type
+EMPFOHLEN: routing, has_fl, overnight_after_day, layover_ort, layover_inland
 
-═════ KRITISCHE FELDER — RICHTIG INTERPRETIEREN ═════════════════════════════
+▸ activity_type — wähle einen Wert:
+  • frei (F-Marker), urlaub (U), krank (K)
+  • standby (SBY/RES, zuhause)
+  • office (EM/EH/Office am Homebase mit täglicher Heimkehr)
+  • training (Schulung — D4/DD/EM/EH mehrtägig oder einzeln; bei mehrtägiger
+    Schulung mit auswärtigem Ort: overnight_after_day=true setzen)
+  • tour (mehrtägige Tour-Tag — Anreise/Mittel/Heimkehr alle "tour")
+  • same_day (Tagestrip, A+E am gleichen Tag, kein FL)
+  • unknown (wenn Marker unklar)
 
-▸ has_fl: TRUE wenn FL-Marker im Dienstplan steht. Das ist ein
-  HARTER LESE-FAKT — wenn FL da steht, ist es FL.
-
-▸ layover_ort: 3-Letter-IATA-Code wo der User heute NACHTS schläft.
-  Leer wenn User zuhause schläft (Standby, FREI, Same-Day-Heimkehr).
-
-▸ layover_inland: TRUE wenn layover_ort einer der deutschen
-  Flughäfen ist (FRA, MUC, HAM, DUS, STR, CGN, HAJ, BER, TXL, SXF,
-  LEJ, NUE, BRE, FMO, PAD, NRN, FKB, HHN, SCN, DRS, ERF, FDH, RLG, KSF).
-  FALSE bei Auslands-Codes. NULL wenn keine Übernachtung (overnight_after_day=false).
+▸ has_fl: TRUE wenn FL-Marker im Dienstplan. HARTER LESE-FAKT.
 
 ▸ overnight_after_day: KRITISCHSTES Feld!
-  TRUE = User schläft NACH diesem Tag AUSWÄRTS (irgendein Hotel, egal wo)
-  FALSE = User schläft NACH diesem Tag ZUHAUSE (Homebase erreicht)
-  Bei Same-Day-Tagestrip: FALSE
-  Bei Tour-Tag mit FL/Layover: TRUE
-  Bei FREI/Standby/Office am Homebase: FALSE
+  TRUE = User schläft NACH diesem Tag AUSWÄRTS
+  FALSE = User schläft NACH diesem Tag ZUHAUSE
+  • Same-Day → FALSE
+  • Tour-Tag mit FL/Layover → TRUE
+  • Tour-Heimkehr-Tag (letzter Tag) → FALSE
+  • FREI/Standby/Office → FALSE
+  • Mehrtägige Schulung auswärts (alle Tage außer letzter) → TRUE
 
-▸ activity_type: Wähle EINEN aus dem enum:
-  • frei: F-Marker, kein Dienst
-  • urlaub: U-Marker
-  • krank: K-Marker
-  • standby: SBY/RES, User zuhause
-  • office: EM/EH am Homebase mit täglicher Heimkehr (kein Hotel)
-  • schulung_inland_hotel: D4/DD/EM mehrtägig mit auswärtigem Hotel (Indiz: 2+
-    aufeinanderfolgende Schulungstage OHNE FREI dazwischen + Schulungs-Ort
-    NICHT Homebase). overnight_after_day=true.
-  • tour_start: Erster Tag einer mehrtägigen Tour (Anreise)
-  • tour_continuation: Mittlerer Tag einer Tour (User noch unterwegs)
-  • tour_end: Letzter Tag einer Tour (Heimkehr Homebase)
-  • same_day: A+E am gleichen Tag, Heimkehr noch heute, kein FL
-  • mixed_handover_sameday: SELBER Tag enthält Heimkehr aus mehrtägiger Tour
-    UND neue Same-Day-Aktivität — beides dokumentieren in notes!
+▸ layover_ort: 3-Letter-IATA wo User HEUTE NACHTS schläft.
+  Leer wenn zuhause. Bei overnight_after_day=true: setze layover_ort.
 
-▸ tour_id: Wenn mehrere Tage zur gleichen Tour gehören, teilen sie eine
-  tour_id (z.B. "2025-03-06_BLR" für eine 4-Tages-BLR-Tour). Same-Day-Trips
-  haben jeweils eine eigene tour_id.
-
-▸ tour_open: TRUE wenn User an diesem Tag NICHT zuhause schläft (Tour offen).
-  Bei tour_end FALSE (User kommt heute zurück).
+▸ layover_inland: TRUE wenn layover_ort ∈ {FRA,MUC,HAM,DUS,STR,CGN,HAJ,
+  BER,TXL,SXF,LEJ,NUE,BRE,FMO,PAD,NRN,FKB,HHN,SCN,DRS,ERF,FDH,RLG,KSF}.
+  FALSE bei Auslandscodes. Weglassen wenn keine Übernachtung.
 
 ═════ MULTI-STOP-TOUREN — JEDEN TAG EINZELN ═══════════════════════════════════
 
@@ -5375,23 +5370,44 @@ LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
                 _t.sleep(5)
         elapsed = _t.time() - start
         # Detailliertes Logging zum Debuggen — content blocks + stop_reason
-        stop_reason = getattr(resp, 'stop_reason', 'unknown') if resp else 'no_response'
+        stop_reason = getattr(resp, 'stop_reason', None) if resp else 'no_response'
         usage = getattr(resp, 'usage', None) if resp else None
         if usage:
             in_tok = getattr(usage, 'input_tokens', '?')
             out_tok = getattr(usage, 'output_tokens', '?')
             print(f"[Sonnet-DP-Structured] resp stop={stop_reason} in_tok={in_tok} out_tok={out_tok}")
+        # Robustes Tool-Parsing: object UND dict, plus expliziter Tool-Name-Check
         tool_input = None
-        for block in resp.content if resp else []:
-            if getattr(block, 'type', None) == 'tool_use':
-                tool_input = block.input
-                break
+        block_summary = []
+        for block in (resp.content if resp else []):
+            btype = getattr(block, 'type', None) if not isinstance(block, dict) else block.get('type')
+            bname = getattr(block, 'name', None) if not isinstance(block, dict) else block.get('name')
+            block_summary.append(f"{btype}:{bname or '_'}")
+            if btype == 'tool_use' and (bname == 'submit_structured_days' or bname is None):
+                # Input kann object oder dict sein
+                if isinstance(block, dict):
+                    tool_input = block.get('input')
+                else:
+                    tool_input = getattr(block, 'input', None)
+                if tool_input:
+                    break
         if not tool_input:
-            block_types = [getattr(b, 'type', None) for b in (resp.content if resp else [])]
-            print(f"[Sonnet-DP-Structured] kein tool_input — stop={stop_reason} blocks={block_types}")
+            # Falls Sonnet als Text geantwortet hat: ersten 500 Zeichen loggen
+            text_snippet = ''
+            for block in (resp.content if resp else []):
+                if (getattr(block, 'type', None) == 'text') or (isinstance(block, dict) and block.get('type') == 'text'):
+                    txt = getattr(block, 'text', None) or (block.get('text', '') if isinstance(block, dict) else '')
+                    text_snippet = (txt or '')[:500]
+                    break
+            print(f"[Sonnet-DP-Structured] kein tool_input — stop={stop_reason} blocks={block_summary}")
+            if text_snippet:
+                print(f"[Sonnet-DP-Structured] text-fallback Sonnet sagte: {text_snippet[:300]}")
             return None
-        days = list(tool_input.get('days', []) or [])
-        warnings = list(tool_input.get('warnings', []) or [])
+        # tool_input kann auch dict sein wenn SDK serialisiert
+        days_raw = tool_input.get('days', []) if isinstance(tool_input, dict) else []
+        warnings_raw = tool_input.get('warnings', []) if isinstance(tool_input, dict) else []
+        days = list(days_raw or [])
+        warnings = list(warnings_raw or [])
         # Normalisiere: stelle sicher dass alle Felder existieren
         for d in days:
             d.setdefault('markers', [])
@@ -5435,52 +5451,42 @@ def _count_deterministic(structured_days):
 
     hotel_naechte = sum(1 for d in days if d.get('overnight_after_day'))
 
-    NICHT_AT = {'frei', 'urlaub', 'krank', 'none'}
+    NICHT_AT = {'frei', 'urlaub', 'krank', 'unknown', 'none'}
     arbeitstage = sum(1 for d in days if d.get('activity_type') not in NICHT_AT)
 
-    # Fahrtage: deterministische Regeln
+    # Fahrtage: deterministische Regeln (für reduziertes Schema v6.0.2)
+    # Ein Fahrtag entsteht wenn der User HEUTE von ZUHAUSE zur Homebase fährt:
+    #   - Same-Day-Trip       → 1 Fahrtag (zur Homebase + zurück abends)
+    #   - Office/Training-Tag → 1 Fahrtag
+    #   - Tour-Tag wo Vortag KEINE Übernachtung war → 1 Fahrtag (Anreise zur Homebase)
+    #   - Tour-Tag wo Vortag Übernachtung war       → 0 (User ist noch unterwegs/kommt heim)
+    #   - Standby zuhause → 0 (User ist zuhause)
     fahrtage_detail = []
-    for d in days:
+    days_sorted = sorted(days, key=lambda x: x.get('datum', ''))
+    for i, d in enumerate(days_sorted):
         at = d.get('activity_type', '')
         datum = d.get('datum', '')
-        # Standby zuhause = kein Fahrtag
-        if at == 'standby':
+        if at in NICHT_AT or at == 'standby':
             continue
-        # Frei/Urlaub/Krank/none = kein Fahrtag
-        if at in NICHT_AT:
-            continue
-        # Tour-Continuation (Mittlerer Tag einer Tour) = kein neuer Fahrtag
-        if at == 'tour_continuation':
-            continue
-        # Tour-End (Heimkehr) = kein neuer Fahrtag (User fährt nach Hause, nicht hin)
-        if at == 'tour_end':
-            continue
-        # Office, Schulung am Homebase = täglich Fahrtag
         if at == 'office':
             fahrtage_detail.append({'datum': datum, 'grund': 'Office am Homebase', 'counted': True})
             continue
-        # Schulung Inland mit Hotel: NUR der Anreisetag = Fahrtag (Tag 1).
-        # Folgetage sind Continuation/End → kein Fahrtag.
-        if at == 'schulung_inland_hotel':
-            # Prüfen: ist es der erste Tag (Vortag war NICHT auch Schulung)?
-            # Vereinfacht: nur Tage mit homebase_heimkehr=False UND nicht continuation/end
-            # Wir erkennen Anreise an: Vortag Aktivität ≠ Schulung
-            fahrtage_detail.append({'datum': datum, 'grund': 'Schulung Inland Anreise', 'counted': True})
+        if at == 'training':
+            # Training: 1 Fahrtag wenn Vortag NICHT auch training mit Übernachtung
+            prev = days_sorted[i-1] if i > 0 else None
+            if prev and prev.get('activity_type') == 'training' and prev.get('overnight_after_day'):
+                continue  # mehrtägige Schulung, gestern schon angefahren
+            fahrtage_detail.append({'datum': datum, 'grund': 'Training Anreise', 'counted': True})
             continue
-        # Tour-Start = Fahrtag (User fährt zur Homebase)
-        if at == 'tour_start':
-            fahrtage_detail.append({'datum': datum, 'grund': 'Tourstart ab Homebase', 'counted': True})
-            continue
-        # Same-Day-Tagestrip = Fahrtag (1 Anfahrt)
         if at == 'same_day':
             fahrtage_detail.append({'datum': datum, 'grund': 'Same-Day Tagestrip', 'counted': True})
             continue
-        # Mischfall (Heimkehr + neue Same-Day): User ist heute schon zuhause
-        # (von Tour-Heimkehr), neue Same-Day → typisch KEIN zusätzlicher Fahrtag
-        # weil keine Heimfahrt zwischen Tour-End und neuer Same-Day plausibel ist.
-        # Konservativ: 1 Fahrtag.
-        if at == 'mixed_handover_sameday':
-            fahrtage_detail.append({'datum': datum, 'grund': 'Mischfall — 1 Fahrtag konservativ', 'counted': True})
+        if at == 'tour':
+            # Tour-Anreise nur wenn Vortag KEINE Übernachtung
+            prev = days_sorted[i-1] if i > 0 else None
+            if prev and prev.get('overnight_after_day'):
+                continue  # User ist gestern auswärts geblieben → kein neuer Fahrtag heute
+            fahrtage_detail.append({'datum': datum, 'grund': 'Tourstart ab Homebase', 'counted': True})
             continue
     fahr_tage = len(fahrtage_detail)
 
@@ -5677,6 +5683,8 @@ def _aggregate_v6_classification(classifications, structured_days, year=2025):
 
     # Z76 aus BMF-Auslandspauschalen: pro Z76-Tag das Land bestimmen via layover_ort
     by_date = {d.get('datum'): d for d in (structured_days or {}).get('days', [])}
+    days_sorted = sorted((structured_days or {}).get('days', []), key=lambda x: x.get('datum', ''))
+    idx_by_date = {d.get('datum'): i for i, d in enumerate(days_sorted)}
     z76_eur = 0.0
     for c in classifications:
         if c.get('klass') != 'Z76':
@@ -5684,15 +5692,19 @@ def _aggregate_v6_classification(classifications, structured_days, year=2025):
         d = by_date.get(c.get('datum'))
         if not d:
             continue
-        # An- oder Abreise vs Volltag
-        is_an_ab = d.get('activity_type') in ('tour_start', 'tour_end')
-        layover_code = d.get('layover_ort', '') or (d.get('routing') or [''])[-1]
+        # An-/Abreise erkennen: tour-Tag mit overnight=false ODER Vortag overnight=false
+        i = idx_by_date.get(c.get('datum'))
+        prev = days_sorted[i-1] if i and i > 0 else None
+        is_anreise = (not prev) or (not prev.get('overnight_after_day'))
+        is_abreise = not d.get('overnight_after_day')
+        is_an_ab = is_anreise or is_abreise
+        layover_code = d.get('layover_ort', '') or (d.get('routing') or [''])[-1] if d.get('routing') else ''
         bmf_aus = _get_bmf_for_iata(layover_code, year)
         if bmf_aus:
             satz = bmf_aus.get('an_abreise', 0) if is_an_ab else bmf_aus.get('voll_24h', 0)
             z76_eur += float(satz or 0)
         else:
-            # Fallback: 28€ Inland-Volltag-Satz wenn Land nicht erkannt
+            # Fallback: 28€ Volltag-Satz wenn Land nicht erkannt
             z76_eur += 28.0
 
     return {
