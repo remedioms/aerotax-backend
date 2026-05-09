@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '6.0.2',
-        'build':   'force-tool-use-robust-parsing-minimal-schema-2026-05-09',
+        'version': '6.0.3',
+        'build':   'defensive-tour-only-an-abreise-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5681,7 +5681,10 @@ def _aggregate_v6_classification(classifications, structured_days, year=2025):
     z73_tage = sum(1 for c in classifications if c.get('klass') == 'Z73')
     z74_tage = sum(1 for c in classifications if c.get('klass') == 'Z74')
 
-    # Z76 aus BMF-Auslandspauschalen: pro Z76-Tag das Land bestimmen via layover_ort
+    # Z76 aus BMF-Auslandspauschalen: pro Z76-Tag das Land bestimmen via layover_ort.
+    # Defensive: An-/Abreise-Logik via overnight_after_day NUR auf TOUR-Tage anwenden.
+    # Office/Training/Standby haben auch overnight=false, sind aber keine "Heimkehr-Tage"
+    # — würde sonst falsche An/Abreise-Pauschalen geben.
     by_date = {d.get('datum'): d for d in (structured_days or {}).get('days', [])}
     days_sorted = sorted((structured_days or {}).get('days', []), key=lambda x: x.get('datum', ''))
     idx_by_date = {d.get('datum'): i for i, d in enumerate(days_sorted)}
@@ -5692,14 +5695,27 @@ def _aggregate_v6_classification(classifications, structured_days, year=2025):
         d = by_date.get(c.get('datum'))
         if not d:
             continue
-        # An-/Abreise erkennen: tour-Tag mit overnight=false ODER Vortag overnight=false
-        i = idx_by_date.get(c.get('datum'))
-        prev = days_sorted[i-1] if i and i > 0 else None
-        is_anreise = (not prev) or (not prev.get('overnight_after_day'))
-        is_abreise = not d.get('overnight_after_day')
-        is_an_ab = is_anreise or is_abreise
-        layover_code = d.get('layover_ort', '') or (d.get('routing') or [''])[-1] if d.get('routing') else ''
+        at = d.get('activity_type', '')
+        layover_code = d.get('layover_ort', '') or ((d.get('routing') or [''])[-1] if d.get('routing') else '')
         bmf_aus = _get_bmf_for_iata(layover_code, year)
+
+        # An-/Abreise-Erkennung NUR bei activity_type='tour' — sonst Volltag-Satz konservativ
+        if at == 'tour':
+            i = idx_by_date.get(c.get('datum'))
+            prev = days_sorted[i-1] if i and i > 0 else None
+            # Anreise-Tag: Vortag war NICHT auf Tour (Vortag overnight=false oder kein Vortag-Tour)
+            prev_is_tour_overnight = (
+                prev and prev.get('activity_type') == 'tour' and prev.get('overnight_after_day')
+            )
+            is_anreise = not prev_is_tour_overnight
+            # Abreise-Tag: heute overnight=false (User kommt heute heim)
+            is_abreise = not d.get('overnight_after_day')
+            is_an_ab = is_anreise or is_abreise
+        else:
+            # Defensive: Z76 bei Nicht-Tour-Tag (z.B. Opus klassifiziert Schulung als Z76)
+            # → konservativer Volltag-Satz, keine An/Abreise-Pauschale
+            is_an_ab = False
+
         if bmf_aus:
             satz = bmf_aus.get('an_abreise', 0) if is_an_ab else bmf_aus.get('voll_24h', 0)
             z76_eur += float(satz or 0)
