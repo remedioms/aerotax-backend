@@ -408,9 +408,21 @@ def _load_pdf(token):
                     if exp < datetime.utcnow():
                         return None
                 except: pass
+                # downloaded_at aus Supabase mit übernehmen — sonst Replay-Schutz nach Worker-Restart wirkungslos
+                downloaded_at = None
+                try:
+                    da_str = (row.get('downloaded_at') or '').replace('Z', '').split('+')[0]
+                    if da_str:
+                        downloaded_at = datetime.fromisoformat(da_str)
+                except: pass
                 pdf_bytes = base64.b64decode(row['pdf_b64'])
-                # In-Memory cachen
-                _store[token] = {'pdf_bytes': pdf_bytes, 'filename': row.get('filename'), 'expires': exp}
+                # In-Memory cachen inklusive downloaded_at
+                _store[token] = {
+                    'pdf_bytes':     pdf_bytes,
+                    'filename':      row.get('filename'),
+                    'expires':       exp,
+                    'downloaded_at': downloaded_at,
+                }
                 return pdf_bytes, row.get('filename') or 'AeroTax_Auswertung.pdf', exp
         except Exception as e:
             print(f"[supabase] pdf load fail: {e}")
@@ -2356,26 +2368,36 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
                     else:
                         result[k] = v
 
-            # ── 4) Persönliche Daten via Regex (selten Format-kritisch) ──
+            # ── 4) Persönliche Daten via Regex — nur setzen wenn noch nicht gesetzt
+            # (bei Multi-LSB AG-Wechsel: erste LSB liefert die Stammdaten,
+            #  zweite würde sonst überschreiben mit AG2-Werten)
             if result['brutto'] > 0:
-                m_id = re.search(r'Identifikationsnummer:\s*(\d{11})', text)
-                if m_id: result['identnr'] = m_id.group(1)
-                m_geb = re.search(r'Geburtsdatum:\s*(\d{2}\.\d{2}\.\d{4})', text)
-                if m_geb: result['geburtsdatum'] = m_geb.group(1)
-                m_pnr = re.search(r'Personalnummer:\s*(\d+)', text)
-                if m_pnr: result['personalnummer'] = m_pnr.group(1)
-                m_sk = re.search(r'Steuerklasse/Faktor\s+(\d)', text)
-                if m_sk: result['steuerklasse'] = m_sk.group(1)
-                m_kfb = re.search(r'Kinderfreibetr[^\d]+([\d,]+)', text)
-                if m_kfb:
-                    try: result['kinderfreibetraege'] = float(m_kfb.group(1).replace(',','.'))
-                    except: pass
-                m_kst = re.search(r'Kirchensteuermerkmale\s+([\w\s/\-]+?)(?:\n|$)', text)
-                if m_kst: result['kirchensteuermerkmale'] = m_kst.group(1).strip()
-                m_fa = re.search(r'Finanzamt[^\n]*\n([^\n]+)', text)
-                if m_fa: result['finanzamt'] = m_fa.group(1).strip()
-                m_stnr = re.search(r'Steuernummer:\s*([\d/]+)', text)
-                if m_stnr: result['steuernummer_ag'] = m_stnr.group(1)
+                if not result.get('identnr'):
+                    m_id = re.search(r'Identifikationsnummer:\s*(\d{11})', text)
+                    if m_id: result['identnr'] = m_id.group(1)
+                if not result.get('geburtsdatum'):
+                    m_geb = re.search(r'Geburtsdatum:\s*(\d{2}\.\d{2}\.\d{4})', text)
+                    if m_geb: result['geburtsdatum'] = m_geb.group(1)
+                if not result.get('personalnummer'):
+                    m_pnr = re.search(r'Personalnummer:\s*(\d+)', text)
+                    if m_pnr: result['personalnummer'] = m_pnr.group(1)
+                if result.get('steuerklasse') in (None, '', '1'):  # default ist '1'
+                    m_sk = re.search(r'Steuerklasse/Faktor\s+(\d)', text)
+                    if m_sk: result['steuerklasse'] = m_sk.group(1)
+                if not result.get('kinderfreibetraege'):
+                    m_kfb = re.search(r'Kinderfreibetr[^\d]+([\d,]+)', text)
+                    if m_kfb:
+                        try: result['kinderfreibetraege'] = float(m_kfb.group(1).replace(',','.'))
+                        except: pass
+                if not result.get('kirchensteuermerkmale'):
+                    m_kst = re.search(r'Kirchensteuermerkmale\s+([\w\s/\-]+?)(?:\n|$)', text)
+                    if m_kst: result['kirchensteuermerkmale'] = m_kst.group(1).strip()
+                if not result.get('finanzamt'):
+                    m_fa = re.search(r'Finanzamt[^\n]*\n([^\n]+)', text)
+                    if m_fa: result['finanzamt'] = m_fa.group(1).strip()
+                if not result.get('steuernummer_ag'):
+                    m_stnr = re.search(r'Steuernummer:\s*([\d/]+)', text)
+                    if m_stnr: result['steuernummer_ag'] = m_stnr.group(1)
 
                 result['vorsorge_gesamt_an'] = round(
                     result['rv_an'] + result['kv_an'] +
@@ -3807,7 +3829,9 @@ def parse_einsatzplan_mit_ki(pdf_bytes_list, year=2025):
         )
         # Wenn CAS-Header fehlt: zusätzlich nach Einsatzplan-typischen Markern suchen
         # (Briefingzeit, "Tg" + EURO, Monat im Header) UND NICHT nach SE/DP-Markern
-        is_se = 'Streckeneinsatz' in full_text or 'Erstellt' in full_text[:500]
+        # 'Erstellt' ohne Streckeneinsatz-Kontext könnte auch im Einsatzplan vorkommen — daher enger
+        is_se = ('Streckeneinsatz' in full_text or
+                 ('Erstellt' in full_text[:500] and ('stfrei' in full_text or 'Summe:' in full_text)))
         is_dp = 'Flugstunden' in full_text or 'Steuer-Auswertung' in full_text
         has_einsatzplan_marker = (
             re.search(r'\bBriefingzeit\b', full_text) or
@@ -3948,11 +3972,25 @@ def _opus_final_audit(values, texts, year):
                                   [{'type': 'text', 'text': prompt}],
                                   max_retries=2, label='opus-final-audit')
         ai_text = resp.content[0].text.strip()
-        # Robuster JSON-Array-Extraktor: balanced bracket counter (statt greedy regex)
+        # Robuster JSON-Array-Extraktor: balanced bracket counter MIT String-Awareness
+        # (sonst würde ']' in einem JSON-String wie "grund": "Wert]: zu hoch" den Counter falsch dekrementieren)
         import json as _json
         issues = None
         depth = 0; start = -1
+        in_str = False; escape_next = False
         for i, ch in enumerate(ai_text):
+            if escape_next:
+                escape_next = False
+                continue
+            if in_str:
+                if ch == '\\':
+                    escape_next = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
             if ch == '[':
                 if depth == 0: start = i
                 depth += 1
@@ -4651,7 +4689,9 @@ def berechne(form, files):
 
     # ── KM: form > dienstplan > inferred ──────────────────────
     anreise = form.get('anreise', 'auto')
-    km = float(form.get('km', 0)) if anreise in ('auto', 'fahrrad') else 0
+    # anreise kann CSV sein (z.B. "auto,shuttle"). km nur relevant wenn auto/fahrrad in den Modi.
+    _anreise_modes_for_km = set(m.strip() for m in str(anreise).split(',') if m.strip())
+    km = float(form.get('km', 0)) if (_anreise_modes_for_km & {'auto', 'fahrrad'}) else 0
     if km == 0 and km_dp > 0:
         km = km_dp
 
@@ -5054,6 +5094,13 @@ def berechne(form, files):
             f_auto_old = next((float(p.split(': ')[1].rstrip('€'))
                                for p in fahr_breakdown if p.startswith('Auto')), 0)
             fahr = round(fahr - f_auto_old + f_auto_new, 2)
+        # VMA-Tage rückrechnen falls Opus EUR-Werte korrigiert hat (sonst Inkonsistenz EUR/Tage)
+        if any(c.startswith('vma_72:') for c in auto_corrections):
+            vma_72_tage = round(vma_72 / max(bmf_inland['tagestrip_8h'], 0.01))
+        if any(c.startswith('vma_73:') for c in auto_corrections):
+            vma_73_tage = round(vma_73 / max(bmf_inland['an_abreise'], 0.01))
+        if any(c.startswith('vma_74:') for c in auto_corrections):
+            vma_74_tage = round(vma_74 / max(bmf_inland['voll_24h'], 0.01))
         # vma_in neu (Inland-Anteile könnten korrigiert sein)
         vma_in = round(vma_72 + vma_73 + vma_74, 2)
         # Wenn z77 korrigiert wurde: spesen_gesamt/spesen_steuer angleichen damit PDF-Math stimmt
