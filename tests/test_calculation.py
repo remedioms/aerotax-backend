@@ -432,9 +432,9 @@ def test_v7_classify_foreign_tour_z76():
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True,
-         'routing': ['FRA', 'BLR']},
+         'routing': ['FRA', 'BLR'], 'layover_ort': 'BLR'},
         {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True,
-         'routing': ['BLR']},
+         'routing': ['BLR'], 'layover_ort': 'BLR'},
         {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': False, 'has_fl': False,
          'routing': ['BLR', 'FRA']},
     ]}
@@ -448,6 +448,62 @@ def test_v7_classify_foreign_tour_z76():
     assert result['z76_eur'] > 0
     assert result['z73_tage'] == 0
     assert result['z72_tage'] == 0
+
+
+def test_v7_classify_blr_tour_with_fra_stempel_anreise():
+    """Klassische BLR 4-Tage-Tour mit FRA-Stempel auf Anreisetag.
+    Erwartung: 4× Z76, KEIN Z73 trotz FRA-Stempel im SE."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True,
+         'routing': ['FRA', 'BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True,
+         'routing': ['BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True,
+         'routing': ['BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-06', 'activity_type': 'tour', 'overnight_after_day': False, 'has_fl': False,
+         'routing': ['BLR', 'FRA']},
+    ]}
+    se = {'se_lines': [
+        # FRA-STEMPEL am Anreisetag (häufig bei LH-Auslandstouren)
+        {'datum': '2025-01-03', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-05', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-06', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 4 Tour-Tage, kein Z73, alles Z76
+    assert result['z73_tage'] == 0, f"Z73 sollte 0 sein, ist {result['z73_tage']}"
+    # Z76 EUR sollte > 100€ sein (4 Tage Indien)
+    assert result['z76_eur'] >= 100, f"Z76 EUR sollte > 100€ sein, ist {result['z76_eur']}"
+
+
+def test_v7_classify_mixed_tour_inland_day_keeps_inland():
+    """Mixed-Cluster: Bulgarien → Deutschland 24h → Schweden.
+    Erwartung: Tag 1+3 Z76 (Ausland), Tag 2 Z74 (Inland 24h zwischen 2 Inland-Layovern wäre Z74)
+    Eigentlich: Tag 2 ist Inland-Layover zwischen Auslands-Layovern → Z73 (Übergang)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-09-26', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True,
+         'routing': ['FRA', 'SOF'], 'layover_ort': 'SOF'},  # Bulgarien
+        {'datum': '2025-09-27', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True,
+         'routing': ['SOF', 'MUC'], 'layover_ort': 'MUC'},  # Deutschland Inland-Stop
+        {'datum': '2025-09-28', 'activity_type': 'tour', 'overnight_after_day': False, 'has_fl': False,
+         'routing': ['MUC', 'GOT', 'FRA'], 'layover_ort': 'GOT'},  # Schweden
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-09-26', 'stfrei_betrag': 32, 'stfrei_ort': 'SOF', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-09-27', 'stfrei_betrag': 28, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-09-28', 'stfrei_betrag': 33, 'stfrei_ort': 'GOT', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Mixed-Cluster: muss Inland-Tag erkennen
+    # Tag 1 (SOF) = Z76, Tag 2 (MUC Inland) = Z73 oder Z74, Tag 3 (Heimkehr nach GOT-overnight=false) = Z76 Abreise
+    # Wichtig: Mixed-Tour darf nicht alles Z76 sein
+    assert result['z73_tage'] >= 1 or result['z74_tage'] >= 1, \
+        f"Mixed-Tour mit Inland-Layover muss Z73/Z74 erzeugen, ist Z73={result['z73_tage']} Z74={result['z74_tage']}"
 
 
 def test_v7_classify_frei_no_count():
