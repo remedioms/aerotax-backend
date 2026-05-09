@@ -2032,7 +2032,12 @@ def qa_upvote(qid):
 
 @app.route('/')
 def health():
-    return jsonify({'status': 'AeroTax Backend läuft', 'version': '2.0'})
+    return jsonify({
+        'status':  'AeroTax Backend läuft',
+        'version': '2.1',
+        'build':   'ki-always-2026-05-09',
+        'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always', 'opus-final-audit'],
+    })
 
 
 @app.route('/api/progress', methods=['GET'])
