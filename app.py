@@ -2416,8 +2416,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '7.1',
-        'build':   'three-document-flow-einsatzplan-removed-2026-05-09',
+        'version': '7.2',
+        'build':   'anreisekosten-oepnv-shuttle-getrennt-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -7521,25 +7521,33 @@ def _berechne_via_hybrid(form, files):
     # Jobticket-Auto-Detection aus Z18
     jobticket = 'ja_frei' if z18_pauschal > 0 else form.get('jobticket', 'nein')
 
+    # Entfernungspauschale (verkehrsmittel-unabhängig nach § 9 EStG)
     fahr = 0.0
     fahr_breakdown = []
-    if 'auto' in anreise_modes or 'fahrrad' in anreise_modes:
-        f_auto = round(min(km, 20) * fahr_tage * pendler['lt_20km'] +
-                       max(0, km - 20) * fahr_tage * pendler['gt_21km'], 2)
-        if f_auto > 0:
-            fahr += f_auto
-            fahr_breakdown.append(f'Auto/Fahrrad ({km}km × {fahr_tage}T): {f_auto:.2f}€')
-    if 'oepnv' in anreise_modes:
-        oepnv_k = float(form.get('oepnv_kosten', 0) or 0)
-        f_oepnv = 0 if jobticket == 'ja_frei' else oepnv_k
+    f_entfernungspauschale = 0.0
+    if km > 0 and fahr_tage > 0:
+        f_entfernungspauschale = round(min(km, 20) * fahr_tage * pendler['lt_20km'] +
+                                        max(0, km - 20) * fahr_tage * pendler['gt_21km'], 2)
+        if f_entfernungspauschale > 0:
+            fahr += f_entfernungspauschale
+            fahr_breakdown.append(f'Entfernungspauschale ({km}km × {fahr_tage}T): {f_entfernungspauschale:.2f}€')
+
+    # Zusätzliche selbst gezahlte Anreisekosten (separat dokumentiert für PDF)
+    f_oepnv = 0.0
+    oepnv_k = float(form.get('oepnv_kosten', 0) or 0)
+    if oepnv_k > 0:
+        f_oepnv = oepnv_k if jobticket != 'ja_frei' else 0.0
         if f_oepnv > 0:
             fahr += f_oepnv
-            fahr_breakdown.append(f'ÖPNV: {f_oepnv:.2f}€')
-    if 'shuttle' in anreise_modes:
-        f_shuttle = float(form.get('shuttle_kosten', 0) or 0)
-        if f_shuttle > 0:
-            fahr += f_shuttle
-            fahr_breakdown.append(f'Shuttle: {f_shuttle:.2f}€')
+            fahr_breakdown.append(f'ÖPNV/Bahn: {f_oepnv:.2f}€')
+
+    f_shuttle = 0.0
+    shuttle_k = float(form.get('shuttle_kosten', 0) or 0)
+    if shuttle_k > 0:
+        f_shuttle = shuttle_k
+        fahr += f_shuttle
+        fahr_breakdown.append(f'Crew-Shuttle/Zubringer: {f_shuttle:.2f}€')
+
     fahr = round(fahr, 2)
     if fahr_breakdown:
         print(f'[fahrtkosten] {fahr:.2f}€ aus: {", ".join(fahr_breakdown)}')
@@ -7664,6 +7672,9 @@ def _berechne_via_hybrid(form, files):
         'vma_in':           vma_in,
         'vma_aus':          vma_aus,
         'fahr':             fahr,
+        'fahr_entfernungspauschale': f_entfernungspauschale,
+        'fahr_oepnv':       f_oepnv,
+        'fahr_shuttle':     f_shuttle,
         'reinig':           reinig,
         'trink':            trink,
         'gesamt':           gesamt,

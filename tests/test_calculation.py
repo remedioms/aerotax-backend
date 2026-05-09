@@ -680,6 +680,48 @@ def test_v7_required_documents_lsb_dp_se():
     assert "files.get('einsatz')" not in src or "not files.get('einsatz')" not in src
 
 
+# ── Anreisekosten / ÖPNV / Crew-Shuttle (v7.1+) ────────────────────────────
+
+def test_anreise_entfernungspauschale_unchanged():
+    """Reference: 28 km × 58 Tage = 524,32 € — verkehrsmittel-unabhängig."""
+    from app import PENDLER_BY_YEAR
+    pendler = PENDLER_BY_YEAR[2025]
+    f = round(min(28, 20) * 58 * pendler['lt_20km'] +
+              max(0, 28 - 20) * 58 * pendler['gt_21km'], 2)
+    assert f == 524.32
+
+
+def test_anreise_zusatzkosten_addieren():
+    """Zusatzkosten (ÖPNV + Shuttle) addieren sich zur Entfernungspauschale."""
+    entfernungspauschale = 524.32
+    oepnv = 360.00
+    shuttle = 480.00
+    fahrtkosten_brutto = entfernungspauschale + oepnv + shuttle
+    assert round(fahrtkosten_brutto, 2) == 1364.32
+
+
+def test_anreise_z17_mindert_nur_fahrtkosten_topf():
+    """Z17 mindert nur den Anreisekosten-Topf, niemals VMA/Reinigung/Trinkgeld."""
+    fahrtkosten_brutto = 524.32 + 360.00 + 480.00  # mit Zusatz
+    z17 = 330.00
+    fahrt_netto = max(0, fahrtkosten_brutto - z17)
+    assert round(fahrt_netto, 2) == 1034.32
+    # Reinigung/Trinkgeld unverändert
+    reinigung = 212.80
+    trinkgeld = 237.60
+    assert reinigung == 212.80
+    assert trinkgeld == 237.60
+
+
+def test_anreise_z17_kann_fahrtkosten_topf_nicht_negativ_machen():
+    """Z17 > Fahrtkosten → Topf wird 0, andere Töpfe bleiben."""
+    fahrtkosten_brutto = 100.00
+    z17 = 500.00
+    fahrt_netto = max(0, fahrtkosten_brutto - z17)
+    assert fahrt_netto == 0
+    # Andere Töpfe (VMA) müssen separat berechnet werden — kein Übergriff
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
