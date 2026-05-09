@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '5.3',
-        'build':   'legal-stberg-tom-loeschfristen-2026-05-09',
+        'version': '5.4',
+        'build':   'recheck-memory-fix-se-consistency-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5182,11 +5182,15 @@ def _sonnet_read_se_summary_v2(pdf_bytes_list, year=2025):
                 },
                 'auslandsspesen_total': {
                     'type': 'number',
-                    'description': 'Σ aller stfrei-Werte wo stfrei-Ort AUSLAND ist (≠ FRA/MUC/HAM/etc.)'
+                    'description': 'Σ aller stfrei-Werte wo stfrei-Ort AUSLAND ist (≠ FRA/MUC/HAM/STR/CGN/HAJ/BER/LEJ/NUE/BRE/DUS/etc.). '
+                                   'WICHTIG: Inlandsspesen NIEMALS hier mitzählen. '
+                                   'Mathematische Invariante: auslandsspesen_total + inlandsspesen_total ≈ z77_total (±5€ Rundung).'
                 },
                 'inlandsspesen_total': {
                     'type': 'number',
-                    'description': 'Σ aller stfrei-Werte wo stfrei-Ort INLAND ist (FRA/MUC/HAM/etc.)'
+                    'description': 'Σ aller stfrei-Werte wo stfrei-Ort INLAND ist (FRA/MUC/HAM/STR/CGN/HAJ/BER/LEJ/NUE/BRE/DUS). '
+                                   'WICHTIG: Auslandsspesen NIEMALS hier mitzählen. '
+                                   'Mathematische Invariante: auslandsspesen_total + inlandsspesen_total ≈ z77_total (±5€ Rundung).'
                 }
             }
         }
@@ -5291,12 +5295,24 @@ Liefere via Tool das strukturierte Ergebnis."""
                   f"— Diff {abs(monat_sum - z77_main):.2f}€. Nehme den höheren Wert (vermutlich vollständiger).")
             z77_main = max(z77_main, monat_sum)
 
+        ausland_se = float(tool_input.get('auslandsspesen_total', 0) or 0)
+        inland_se  = float(tool_input.get('inlandsspesen_total', 0) or 0)
+        # Konsistenz-Check: Inland + Ausland sollte ≈ Z77 sein
+        ai_sum = ausland_se + inland_se
+        if ai_sum > 0 and abs(ai_sum - z77_main) > 50:
+            print(f"[Sonnet-SE] ⚠ Inkonsistenz: Inland({inland_se:.2f}) + Ausland({ausland_se:.2f}) = {ai_sum:.2f}€ "
+                  f"≠ Z77 ({z77_main:.2f}€). Skaliere Anteile auf Z77.")
+            # Sonnet hat Inland/Ausland unsauber summiert. Skaliere proportional auf z77_main
+            if ai_sum > 0:
+                scale = z77_main / ai_sum
+                ausland_se = round(ausland_se * scale, 2)
+                inland_se  = round(inland_se  * scale, 2)
         result = {
             'z77_total': z77_main,
             'summe_gesamt': float(tool_input.get('summe_gesamt', 0) or 0),
             'summe_steuerpflichtig': float(tool_input.get('summe_steuerpflichtig', 0) or 0),
-            'auslandsspesen_total': float(tool_input.get('auslandsspesen_total', 0) or 0),
-            'inlandsspesen_total': float(tool_input.get('inlandsspesen_total', 0) or 0),
+            'auslandsspesen_total': ausland_se,
+            'inlandsspesen_total': inland_se,
             'flugmonate': sorted(set(int(m) for m in tool_input.get('flugmonate', []) if 1 <= int(m) <= 12)),
             'anzahl_abrechnungen': int(tool_input.get('anzahl_abrechnungen', 0) or 0),
             'monatliche_z77': monatliche,
@@ -5696,13 +5712,21 @@ def hybrid_analyze(form, files):
 
     # Schritt 3b: Self-Reflection — wenn Klassifikation Math-Invarianten verletzt,
     # Opus mit konkreten Issues nochmal aufrufen (max 1 Recheck-Pass).
+    # WICHTIG: Render Free 512 MB → vor Recheck aggressiv Memory freigeben + nur DP+Einsatzplan
+    # nochmal an Opus schicken (SE-PDFs nicht erneut, Issues sind eh aus SE-Summen abgeleitet).
     if classification and se_summary:
         issues = _detect_classification_issues(classification, se_summary)
         if issues:
             print(f"[hybrid] Self-Reflection-Trigger: {len(issues)} Issue(s) — {'; '.join(issues)[:200]}")
+            # AGGRESSIVES Memory-Cleanup vor Recheck-Pass (sonst OOM auf Render Free 512MB)
+            for _ in range(3):
+                gc.collect()
+            _release_memory_to_os()
             try:
+                # Recheck-Pass: nur DP+Einsatzplan PDFs, KEINE SE-PDFs mehr (Issues sind text-basiert)
+                # Spart ~30-40% Memory beim 2. Pass.
                 rechecked = _opus_classify_days_v2(
-                    dp_bytes, einsatz_bytes, se_bytes, year, homebase,
+                    dp_bytes, einsatz_bytes, [], year, homebase,
                     feedback={'prev_classification': classification, 'issues': issues}
                 )
                 if rechecked and rechecked.get('arbeitstage', 0) > 0:
@@ -5713,9 +5737,16 @@ def hybrid_analyze(form, files):
                         classification = rechecked
                     else:
                         print(f"[hybrid] Recheck löst keine Issues — behalte Original ({len(new_issues)} Issues bleiben).")
+                else:
+                    print(f"[hybrid] Recheck lieferte kein gültiges Ergebnis — behalte Original.")
+            except MemoryError as me:
+                print(f"[hybrid] Self-Reflection-Pass MemoryError: {me} — behalte Original-Klassifikation")
             except Exception as e:
-                print(f"[hybrid] Self-Reflection-Pass crash: {e}")
-    gc.collect()
+                # JEDE Exception abfangen — Original-Klassifikation muss erhalten bleiben,
+                # damit der Job nicht hängen bleibt und User wenigstens das 1.-Pass-Ergebnis bekommt.
+                print(f"[hybrid] Self-Reflection-Pass crash: {type(e).__name__}: {str(e)[:200]} — behalte Original")
+    for _ in range(3):
+        gc.collect()
     _release_memory_to_os()
 
     return {
