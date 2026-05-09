@@ -3469,11 +3469,10 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
 
         import time as _time_mod
         sonnet_start_time = _time_mod.time()
-        # Prefill mit `{"fahrtage":` zwingt Sonnet, mit JSON zu starten —
-        # ohne Vorgeplänkel/Erklärung. Spart 2-3 Min Output-Zeit.
+        # WICHTIG: Sonnet-4-6 unterstützt KEIN assistant-prefill via streaming.
+        # Stattdessen: Prompt-Instruction stark machen + Stop-Sequence wenn JSON fertig.
         full_text = _claude_stream_with_retry(client, 'claude-sonnet-4-6', 12000, content,
-                                              max_retries=3, label='Sonnet-DP',
-                                              prefill='{"fahrtage":')
+                                              max_retries=3, label='Sonnet-DP')
         print(f"Sonnet-Antwort: {len(full_text)} Zeichen, {_time_mod.time()-sonnet_start_time:.1f}s")
 
         # ── JSON robust extrahieren via brace-counter ──
@@ -4730,9 +4729,13 @@ def berechne(form, files):
 
     # ── FAHRTKOSTEN ───────────────────────────────────────────
     # Multi-Mode: User kann Anreise mischen (Auto + Shuttle + ÖPNV gleichzeitig)
-    # Frontend sendet anreise als CSV (z.B. "auto,shuttle,oepnv") oder Single-Wert
+    # Frontend sendet anreise als CSV (z.B. "auto,shuttle,oepnv") oder Single-Wert.
+    # Jobticket-Erkennung automatisch aus LSB:
+    #   Z18 (15% pauschal) > 0 → AG hat Jobticket pauschal versteuert → User darf kein ÖPNV mehr ansetzen
+    #   sonst Z17 > 0 → AG-Zuschuss anteilig (wird später vom Netto abgezogen, ÖPNV-Eingabe legitim)
     fahrzeug  = form.get('fahrzeug', 'verbrenner')
-    jobticket = form.get('jobticket', 'nein')
+    z18_pauschal = float((lst or {}).get('ag_fahrt_z18_pauschal', 0) or 0) if lst else 0
+    jobticket = 'ja_frei' if z18_pauschal > 0 else form.get('jobticket', 'nein')
     fahr = 0.0
     fahr_breakdown = []
     anreise_modes = set(m.strip() for m in str(anreise).split(',') if m.strip())
