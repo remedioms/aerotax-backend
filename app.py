@@ -2416,8 +2416,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '7.2',
-        'build':   'anreisekosten-oepnv-shuttle-getrennt-2026-05-09',
+        'version': '7.3',
+        'build':   'final-copy-optionale-belege-doppelhaushaltsfuehrung-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
