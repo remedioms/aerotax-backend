@@ -702,6 +702,10 @@ def process_real():
             if uploaded:
                 files[key] = [_normalize_upload(f.read(), f.filename) for f in uploaded]
 
+        # Audit: Wieviele Files kamen direkt im Request an?
+        direct_summary = ', '.join(f"{k}={len(v)}" for k, v in files.items() if v) or 'KEINE'
+        print(f"[process] Direct-Upload: {direct_summary}")
+
         # Fallback: Files aus _store (in-memory) — überlebt Stripe-Retry
         ref_for_fallback = (request.form.get('ref') or '').strip()
         if (not files.get('lsb') or not files.get('dp') or not files.get('se')) \
@@ -2148,6 +2152,8 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 text = '\n'.join(p.extract_text() or '' for p in pdf.pages)
 
+            print(f"[LSB-parser] PDF text len={len(text)}, head={text[:200].replace(chr(10),' | ')!r}")
+
             def find(pattern, default=0.0):
                 m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
                 if m:
@@ -2159,7 +2165,59 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
                 m = re.search(pattern, text, re.IGNORECASE)
                 return m.group(1).strip() if m else default
 
+            # Brutto: mehrere Pattern-Varianten probieren (Format wechselt zwischen Jahren/Versionen)
             b = find(r'Bruttoarbeitslohn[^\d]+([\d\.]+,\d{2})')
+            if b == 0:
+                # Fallback 1: ohne ":", direkt Whitespace
+                b = find(r'3\.\s*Bruttoarbeitslohn\s+([\d\.]+,\d{2})')
+            if b == 0:
+                # Fallback 2: mit Zeilenumbruch zwischen Label und Wert
+                b = find(r'Bruttoarbeitslohn[\s\S]{0,200}?(\d{2,6}[\.,]\d{2})')
+            if b == 0:
+                # Fallback 3: deutsche-fr LH-Variante "Lohn (Arbeitslohn)"
+                b = find(r'Arbeitslohn[^\d]+(\d{2,6}[\.,]\d{2})')
+            if b == 0:
+                print(f"[LSB-parser] Brutto-Regex FAILED — versuche Claude-Fallback")
+                # Claude-Fallback: extract Brutto + Z17 via KI
+                if ANTHROPIC_KEY and text:
+                    try:
+                        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+                        prompt = (
+                            "Du bekommst den Text einer deutschen Lohnsteuerbescheinigung. "
+                            "Extrahiere folgende Werte und gib NUR ein JSON-Objekt zurück, kein Erklärtext:\n"
+                            "{\n"
+                            '  "brutto": <Bruttoarbeitslohn in EUR als Zahl>,\n'
+                            '  "lohnsteuer": <einbehaltene Lohnsteuer EUR>,\n'
+                            '  "soli": <Solidaritätszuschlag EUR>,\n'
+                            '  "kirchensteuer_an": <Kirchensteuer EUR>,\n'
+                            '  "ag_fahrt_z17": <AG-Fahrkostenzuschuss Zeile 17 EUR>,\n'
+                            '  "rv_an": <RV-AN-Anteil Z23a EUR>,\n'
+                            '  "kv_an": <KV-AN-Anteil Z25 EUR>,\n'
+                            '  "pv_an": <PV-AN-Anteil Z26 EUR>,\n'
+                            '  "av_an": <AV-AN-Anteil Z27 EUR>,\n'
+                            '  "verpflegungszuschuss_z20": <Verpflegung-Zuschuss Z20 EUR>\n'
+                            "}\n\n"
+                            "Wenn ein Wert nicht zu finden ist, setze 0. Niemals Felder weglassen.\n\n"
+                            "PDF-Text:\n" + text[:8000]
+                        )
+                        resp = _claude_with_retry(client, 'claude-sonnet-4-5', 1500,
+                                                  [{'type': 'text', 'text': prompt}],
+                                                  label='lsb-fallback')
+                        ai_text = resp.content[0].text.strip()
+                        # JSON aus Antwort extrahieren
+                        m = re.search(r'\{.*\}', ai_text, re.DOTALL)
+                        if m:
+                            import json as _json
+                            ai_data = _json.loads(m.group(0))
+                            for k in ['brutto','lohnsteuer','soli','kirchensteuer_an','ag_fahrt_z17',
+                                      'rv_an','kv_an','pv_an','av_an','verpflegungszuschuss_z20']:
+                                v = ai_data.get(k, 0)
+                                try: result[k] = float(v) if v else 0
+                                except: pass
+                            print(f"[LSB-parser] Claude-Fallback OK: brutto={result['brutto']:.2f} z17={result['ag_fahrt_z17']:.2f}")
+                            b = result['brutto']
+                    except Exception as e:
+                        print(f"[LSB-parser] Claude-Fallback fail: {e}")
             if b > 0:
                 result['brutto']             = b
                 result['lohnsteuer']         = find(r'Lohnsteuer von 3\.[^\d]+([\d\.]+,\d{2})')
@@ -2793,12 +2851,16 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
     z73_tage = 0
     flugmonate = set()  # echte Flugmonate aus den Flug-Zeilen (eine SE kann 2 Monate enthalten)
 
-    for pdf_bytes in pdf_bytes_list:
+    for pdf_idx, pdf_bytes in enumerate(pdf_bytes_list):
+        pdf_label = f"SE#{pdf_idx+1}"
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                for page in pdf.pages:
+                page_count = len(pdf.pages)
+                print(f"[SE-parser] {pdf_label}: {page_count} Seiten")
+                for page_idx, page in enumerate(pdf.pages):
                     text = page.extract_text() or ''
                     if 'Streckeneinsatz' not in text and 'stfrei' not in text:
+                        print(f"[SE-parser] {pdf_label} p{page_idx+1}: SKIP (kein 'Streckeneinsatz'/'stfrei' im Text, len={len(text)})")
                         continue
 
                     # Echte Flugmonate aus DD.MM.YYYY-Zeilenanfängen extrahieren
@@ -2812,6 +2874,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                     # Erstellungsdatum → Monatsbezeichnung
                     m_erst = re.search(r'Erstellt\s+(\d{2})\.(\d{2})\.(\d{4})', text)
                     if not m_erst:
+                        print(f"[SE-parser] {pdf_label} p{page_idx+1}: SKIP (kein 'Erstellt'-Datum)")
                         continue
                     erstellt = f"{m_erst.group(1)}.{m_erst.group(2)}.{m_erst.group(3)}"
                     try:
@@ -2827,6 +2890,17 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                         r'Summe:\s+([\d\.]+,\d{2})\s+([\d\.]+,\d{2})(?:\s+([\d\.]+,\d{2}))?',
                         text)
                     if not m_sum:
+                        # Fallback-Patterns: Summe ohne Doppelpunkt, oder mit Tab/multi-space
+                        m_sum = re.search(
+                            r'Summe[:\s]+([\d\.]+,\d{2})\s+([\d\.]+,\d{2})(?:\s+([\d\.]+,\d{2}))?',
+                            text)
+                    if not m_sum:
+                        # Allerletzter Fallback: irgendwo am Seitenende stehen drei EUR-Beträge
+                        m_sum = re.search(
+                            r'(\d{2,5}[\.,]\d{2})\s+(\d{1,5}[\.,]\d{2})\s+(\d{1,5}[\.,]\d{2})\s*$',
+                            text.strip(), re.M)
+                    if not m_sum:
+                        print(f"[SE-parser] {pdf_label} p{page_idx+1}: SKIP (keine 'Summe:'-Zeile gefunden — text-len={len(text)}, last200={text[-200:].replace(chr(10),' | ')!r})")
                         continue
 
                     def f(s): return float(s.replace('.','').replace(',','.')) if s else 0.0
