@@ -2112,39 +2112,122 @@ def _bytes_filename_list(file_list):
             result.append((item, ''))
     return result
 
+def _lsb_extract_via_regex(text):
+    """Liefert numerische Werte direkt aus dem PDF-Text via Regex.
+    Nullwerte = nicht gefunden / Format unbekannt."""
+    def find(pattern, default=0.0):
+        m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if m:
+            try: return float(m.group(1).replace('.','').replace(',','.'))
+            except: pass
+        return default
+
+    out = {}
+    # Brutto: mehrere Patterns für Format-Robustheit
+    b = find(r'Bruttoarbeitslohn[^\d]+([\d\.]+,\d{2})')
+    if b == 0: b = find(r'3\.\s*Bruttoarbeitslohn\s+([\d\.]+,\d{2})')
+    if b == 0: b = find(r'Bruttoarbeitslohn[\s\S]{0,200}?(\d{2,6}[\.,]\d{2})')
+    if b == 0: b = find(r'Arbeitslohn[^\d]+(\d{2,6}[\.,]\d{2})')
+    out['brutto'] = b
+    out['lohnsteuer'] = find(r'Lohnsteuer von 3\.[^\d]+([\d\.]+,\d{2})')
+    out['soli']       = find(r'Solidarit[^\d]+([\d\.]+,\d{2})')
+    out['kirchensteuer_an'] = find(r'Kirchensteuer des\nArbeitnehmers von 3\.[^\d]+([\d\.]+,\d{2})')
+    out['ag_fahrt_z17']     = find(r'Entfernungspauschale anzurechnen sind\s+([\d\.]+,\d{2})')
+    out['ag_fahrt_z18_pauschal'] = find(r'15%[^\d]+([\d\.]+,\d{2})')
+    rv_ag = find(r'22\.\s+Arbeitgeber[^\n]+\nJahreshinzurechnungsbetrag versicherung\s+([\d\.]+,\d{2})')
+    if rv_ag == 0:
+        rv_ag = find(r'22\.\s+Arbeitgeber[^\d\n]+\n[^\d\n]+\s+([\d\.]+,\d{2})')
+    out['rv_ag'] = rv_ag
+    out['rv_an'] = find(r'23\.\s+Arbeitnehmer[^\d]+Renten-?\n\s*versicherung\s+([\d\.]+,\d{2})')
+    out['kv_an'] = find(r'25\.\s+Arbeitnehmerbeitr[^\d]+Kranken-?\n\s*versicherung\s+([\d\.]+,\d{2})')
+    out['pv_an'] = find(r'26\.\s+Arbeitnehmerbeitr[^\d]+Pflege-?\n\s*versicherung\s+([\d\.]+,\d{2})')
+    out['av_an'] = find(r'27\.\s+Arbeitnehmerbeitr[^\d]+Arbeitslosenver-?\n?\s*sicherung\s+([\d\.]+,\d{2})')
+    out['verpflegungszuschuss_z20'] = find(r'Verpflegungszusch[^\d]+([\d\.]+,\d{2})')
+    out['doppelhaus_z21']           = find(r'doppelter Haushalt[^\d]+([\d\.]+,\d{2})')
+    return out
+
+
+def _lsb_extract_via_claude(text, regex_hints=None, label='lsb-extract'):
+    """Liefert die numerischen Felder via Claude. Wird IMMER aufgerufen
+    (KI ist Source of Truth, Regex nur Cross-Check). Bei Diskrepanz mit
+    regex_hints wird ein Re-Check ausgelöst."""
+    if not ANTHROPIC_KEY or not text:
+        return {}
+    fields = ['brutto','lohnsteuer','soli','kirchensteuer_an','ag_fahrt_z17',
+              'ag_fahrt_z18_pauschal','rv_ag','rv_an','kv_an','pv_an','av_an',
+              'verpflegungszuschuss_z20','doppelhaus_z21']
+    hint_block = ''
+    if regex_hints:
+        hint_lines = '\n'.join(f'  {k}: {v}' for k, v in regex_hints.items() if v)
+        if hint_lines:
+            hint_block = ('\nRegex-Vorschläge (zur Plausi-Prüfung — können falsch sein):\n'
+                          + hint_lines + '\n')
+    prompt = (
+        "Du bekommst den Text einer deutschen Lohnsteuerbescheinigung. "
+        "Lies sorgfältig und extrahiere die Beträge — gib NUR ein JSON-Objekt zurück, kein Erklärtext.\n\n"
+        "Felder (alle in EUR als Zahl, 0 wenn nicht vorhanden):\n"
+        '{\n'
+        '  "brutto": <Bruttoarbeitslohn Zeile 3>,\n'
+        '  "lohnsteuer": <einbehaltene Lohnsteuer Zeile 4>,\n'
+        '  "soli": <Solidaritätszuschlag Zeile 5>,\n'
+        '  "kirchensteuer_an": <Kirchensteuer AN Zeile 6/7>,\n'
+        '  "ag_fahrt_z17": <Entfernungspauschale anzurechnen Zeile 17>,\n'
+        '  "ag_fahrt_z18_pauschal": <15% pauschal Zeile 18>,\n'
+        '  "rv_ag": <Arbeitgeber-RV Zeile 22a>,\n'
+        '  "rv_an": <Arbeitnehmer-RV Zeile 23a>,\n'
+        '  "kv_an": <KV-Arbeitnehmer Zeile 25>,\n'
+        '  "pv_an": <PV-Arbeitnehmer Zeile 26>,\n'
+        '  "av_an": <AV-Arbeitnehmer Zeile 27>,\n'
+        '  "verpflegungszuschuss_z20": <stfrei Verpflegung Zeile 20>,\n'
+        '  "doppelhaus_z21": <doppelter Haushalt Zeile 21>\n'
+        '}\n'
+        + hint_block +
+        "\nWichtig: deutsche Zahlen (1.234,56 = 1234.56 in JSON). Niemals Felder weglassen.\n\n"
+        "PDF-Text:\n" + text[:10000]
+    )
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        resp = _claude_with_retry(client, 'claude-sonnet-4-5', 1500,
+                                  [{'type': 'text', 'text': prompt}], label=label)
+        ai_text = resp.content[0].text.strip()
+        m = re.search(r'\{[\s\S]*\}', ai_text)
+        if not m:
+            print(f"[LSB-parser/{label}] kein JSON in Claude-Antwort: {ai_text[:200]}")
+            return {}
+        import json as _json
+        data = _json.loads(m.group(0))
+        out = {}
+        for k in fields:
+            v = data.get(k, 0)
+            try: out[k] = float(v) if v else 0
+            except: out[k] = 0
+        return out
+    except Exception as e:
+        print(f"[LSB-parser/{label}] Claude fail: {e}")
+        return {}
+
+
 def parse_lohnsteuerbescheinigung(pdf_bytes_list):
     """
-    Extrahiert ALLE steuerrelevanten Felder der Lohnsteuerbescheinigung.
-    Gibt vollständiges Dict zurück das für die komplette Anlage N / Vorsorgeaufwendungen
-    gebraucht wird — nicht nur Brutto und Z17.
+    Extrahiert ALLE steuerrelevanten Felder.
+    Strategie: Regex (schnell) + Claude (immer) + Diskrepanz-Re-Check.
+    KI ist Source of Truth — Regex nur Cross-Check + Notnagel bei API-Ausfall.
     """
     pdf_bytes_list = _bytes_list(pdf_bytes_list)
     result = {
-        # Grunddaten
         'brutto': 0, 'lohnsteuer': 0, 'soli': 0,
         'kirchensteuer_an': 0, 'kirchensteuer_eg': 0,
-        # Z17/Z18 Arbeitgeber-Fahrtkostenerstattung
         'ag_fahrt_z17': 0, 'ag_fahrt_z18_pauschal': 0,
-        # Sozialversicherung AN (Sonderausgaben §10 EStG)
-        'rv_an': 0,   # Z23a gesetzliche RV
-        'kv_an': 0,   # Z25 gesetzliche KV
-        'pv_an': 0,   # Z26 gesetzliche PV
-        'av_an': 0,   # Z27 Arbeitslosenversicherung
-        # Arbeitgeber-Anteile (für RV-Gesamtbeitrag Anlage Vorsorge)
-        'rv_ag': 0,   # Z22a
-        # Steuerfreie Leistungen
-        'verpflegungszuschuss_z20': 0,  # steuerfreie Verpflegung bei Auswärtstätigkeit
-        'doppelhaus_z21': 0,            # doppelte Haushaltsführung
-        # Persönliche Daten
+        'rv_an': 0, 'kv_an': 0, 'pv_an': 0, 'av_an': 0,
+        'rv_ag': 0,
+        'verpflegungszuschuss_z20': 0, 'doppelhaus_z21': 0,
         'identnr': '', 'geburtsdatum': '', 'personalnummer': '',
         'steuerklasse': '1', 'kinderfreibetraege': 0.0,
         'kirchensteuermerkmale': '',
-        # Arbeitgeber
         'arbeitgeber': 'Deutsche Lufthansa AG',
         'finanzamt': '', 'steuernummer_ag': '',
-        # Abgeleitete Werte (werden berechnet)
-        'vorsorge_gesamt_an': 0,  # rv+kv+pv+av
-        'rv_gesamt': 0,           # rv_an + rv_ag (für Altersvorsorgeabzug)
+        'vorsorge_gesamt_an': 0,
+        'rv_gesamt': 0,
     }
 
     for pdf_bytes in pdf_bytes_list:
@@ -2154,89 +2237,69 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
 
             print(f"[LSB-parser] PDF text len={len(text)}, head={text[:200].replace(chr(10),' | ')!r}")
 
-            def find(pattern, default=0.0):
-                m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-                if m:
-                    try: return float(m.group(1).replace('.','').replace(',','.'))
-                    except: pass
-                return default
+            # ── 1) Regex-Extraktion (schnell, deterministisch) ──
+            regex_vals = _lsb_extract_via_regex(text)
+            print(f"[LSB-parser] Regex: brutto={regex_vals.get('brutto',0):.2f} "
+                  f"z17={regex_vals.get('ag_fahrt_z17',0):.2f} "
+                  f"lohnsteuer={regex_vals.get('lohnsteuer',0):.2f}")
 
-            def findstr(pattern, default=''):
-                m = re.search(pattern, text, re.IGNORECASE)
-                return m.group(1).strip() if m else default
+            # ── 2) Claude-Extraktion (immer — Source of Truth) ──
+            ai_vals = _lsb_extract_via_claude(text, regex_hints=regex_vals, label='lsb-primary')
+            print(f"[LSB-parser] Claude: brutto={ai_vals.get('brutto',0):.2f} "
+                  f"z17={ai_vals.get('ag_fahrt_z17',0):.2f} "
+                  f"lohnsteuer={ai_vals.get('lohnsteuer',0):.2f}")
 
-            # Brutto: mehrere Pattern-Varianten probieren (Format wechselt zwischen Jahren/Versionen)
-            b = find(r'Bruttoarbeitslohn[^\d]+([\d\.]+,\d{2})')
-            if b == 0:
-                # Fallback 1: ohne ":", direkt Whitespace
-                b = find(r'3\.\s*Bruttoarbeitslohn\s+([\d\.]+,\d{2})')
-            if b == 0:
-                # Fallback 2: mit Zeilenumbruch zwischen Label und Wert
-                b = find(r'Bruttoarbeitslohn[\s\S]{0,200}?(\d{2,6}[\.,]\d{2})')
-            if b == 0:
-                # Fallback 3: deutsche-fr LH-Variante "Lohn (Arbeitslohn)"
-                b = find(r'Arbeitslohn[^\d]+(\d{2,6}[\.,]\d{2})')
-            if b == 0:
-                print(f"[LSB-parser] Brutto-Regex FAILED — versuche Claude-Fallback")
-                # Claude-Fallback: extract Brutto + Z17 via KI
-                if ANTHROPIC_KEY and text:
-                    try:
-                        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-                        prompt = (
-                            "Du bekommst den Text einer deutschen Lohnsteuerbescheinigung. "
-                            "Extrahiere folgende Werte und gib NUR ein JSON-Objekt zurück, kein Erklärtext:\n"
-                            "{\n"
-                            '  "brutto": <Bruttoarbeitslohn in EUR als Zahl>,\n'
-                            '  "lohnsteuer": <einbehaltene Lohnsteuer EUR>,\n'
-                            '  "soli": <Solidaritätszuschlag EUR>,\n'
-                            '  "kirchensteuer_an": <Kirchensteuer EUR>,\n'
-                            '  "ag_fahrt_z17": <AG-Fahrkostenzuschuss Zeile 17 EUR>,\n'
-                            '  "rv_an": <RV-AN-Anteil Z23a EUR>,\n'
-                            '  "kv_an": <KV-AN-Anteil Z25 EUR>,\n'
-                            '  "pv_an": <PV-AN-Anteil Z26 EUR>,\n'
-                            '  "av_an": <AV-AN-Anteil Z27 EUR>,\n'
-                            '  "verpflegungszuschuss_z20": <Verpflegung-Zuschuss Z20 EUR>\n'
-                            "}\n\n"
-                            "Wenn ein Wert nicht zu finden ist, setze 0. Niemals Felder weglassen.\n\n"
-                            "PDF-Text:\n" + text[:8000]
-                        )
-                        resp = _claude_with_retry(client, 'claude-sonnet-4-5', 1500,
-                                                  [{'type': 'text', 'text': prompt}],
-                                                  label='lsb-fallback')
-                        ai_text = resp.content[0].text.strip()
-                        # JSON aus Antwort extrahieren
-                        m = re.search(r'\{.*\}', ai_text, re.DOTALL)
-                        if m:
-                            import json as _json
-                            ai_data = _json.loads(m.group(0))
-                            for k in ['brutto','lohnsteuer','soli','kirchensteuer_an','ag_fahrt_z17',
-                                      'rv_an','kv_an','pv_an','av_an','verpflegungszuschuss_z20']:
-                                v = ai_data.get(k, 0)
-                                try: result[k] = float(v) if v else 0
-                                except: pass
-                            print(f"[LSB-parser] Claude-Fallback OK: brutto={result['brutto']:.2f} z17={result['ag_fahrt_z17']:.2f}")
-                            b = result['brutto']
-                    except Exception as e:
-                        print(f"[LSB-parser] Claude-Fallback fail: {e}")
-            if b > 0:
-                result['brutto']             = b
-                result['lohnsteuer']         = find(r'Lohnsteuer von 3\.[^\d]+([\d\.]+,\d{2})')
-                result['soli']               = find(r'Solidarit[^\d]+([\d\.]+,\d{2})')
-                result['kirchensteuer_an']   = find(r'Kirchensteuer des\nArbeitnehmers von 3\.[^\d]+([\d\.]+,\d{2})')
-                result['ag_fahrt_z17']       = find(r'Entfernungspauschale anzurechnen sind\s+([\d\.]+,\d{2})')
-                result['ag_fahrt_z18_pauschal'] = find(r'15%[^\d]+([\d\.]+,\d{2})')
-                result['rv_ag']              = find(r'22\.\s+Arbeitgeber[^\n]+\nJahreshinzurechnungsbetrag versicherung\s+([\d\.]+,\d{2})')
-                if result['rv_ag'] == 0:
-                    # Fallback: same value as rv_an (AG-Anteil = AN-Anteil bei gesetzlicher RV)
-                    result['rv_ag']          = find(r'22\.\s+Arbeitgeber[^\d\n]+\n[^\d\n]+\s+([\d\.]+,\d{2})')
-                result['rv_an']              = find(r'23\.\s+Arbeitnehmer[^\d]+Renten-?\n\s*versicherung\s+([\d\.]+,\d{2})')
-                result['kv_an']              = find(r'25\.\s+Arbeitnehmerbeitr[^\d]+Kranken-?\n\s*versicherung\s+([\d\.]+,\d{2})')
-                result['pv_an']              = find(r'26\.\s+Arbeitnehmerbeitr[^\d]+Pflege-?\n\s*versicherung\s+([\d\.]+,\d{2})')
-                result['av_an']              = find(r'27\.\s+Arbeitnehmerbeitr[^\d]+Arbeitslosenver-?\n?\s*sicherung\s+([\d\.]+,\d{2})')
-                result['verpflegungszuschuss_z20'] = find(r'Verpflegungszusch[^\d]+([\d\.]+,\d{2})')
-                result['doppelhaus_z21']     = find(r'doppelter Haushalt[^\d]+([\d\.]+,\d{2})')
+            # ── 3) Cross-Check + Diskrepanz-Resolution ──
+            chosen = {}
+            critical_fields = ['brutto', 'lohnsteuer', 'ag_fahrt_z17']
+            disagreement = False
+            for k in regex_vals.keys():
+                rv = regex_vals.get(k, 0) or 0
+                av = ai_vals.get(k, 0) or 0
+                # Diskrepanz: beide Werte nicht 0 und differieren um >1 EUR oder >1%
+                if rv > 0 and av > 0:
+                    diff = abs(rv - av)
+                    if diff > max(1.0, rv * 0.01):
+                        if k in critical_fields:
+                            disagreement = True
+                            print(f"[LSB-parser] DISKREPANZ {k}: regex={rv:.2f} vs claude={av:.2f}")
+                        chosen[k] = av  # KI gewinnt
+                    else:
+                        chosen[k] = av  # praktisch identisch, KI nehmen
+                elif av > 0:
+                    chosen[k] = av  # nur KI hat Wert
+                elif rv > 0:
+                    chosen[k] = rv  # nur Regex hat Wert (KI vermutlich offline)
+                else:
+                    chosen[k] = 0   # beide leer
 
-                # Persönliche Daten
+            # Bei kritischer Diskrepanz: zweiter Claude-Call mit beiden Werten zur finalen Entscheidung
+            if disagreement and ANTHROPIC_KEY:
+                print(f"[LSB-parser] kritische Diskrepanz → Re-Check mit beiden Werten")
+                resolution_prompt = (
+                    "Diese Lohnsteuerbescheinigung wurde sowohl per Regex als auch von dir gelesen. "
+                    "Es gibt unterschiedliche Werte. Schau JEDEN dieser Werte nochmal sorgfältig im Text nach "
+                    "und gib das KORREKTE Ergebnis zurück. Achte auf Tausenderpunkte, Kommas, Zeilennummern.\n\n"
+                    "Vergleich:\n" +
+                    '\n'.join(f"  {k}: regex={regex_vals.get(k,0):.2f} EUR, claude={ai_vals.get(k,0):.2f} EUR"
+                              for k in critical_fields) +
+                    "\n\nGib NUR das JSON mit den korrigierten Werten zurück (gleiches Schema wie vorher)."
+                )
+                final_vals = _lsb_extract_via_claude(text + '\n\n' + resolution_prompt,
+                                                     regex_hints=None, label='lsb-recheck')
+                if final_vals.get('brutto', 0) > 0:
+                    print(f"[LSB-parser] Re-Check OK: brutto={final_vals.get('brutto',0):.2f}")
+                    for k, v in final_vals.items():
+                        if v > 0:
+                            chosen[k] = v
+
+            # Werte ins result-Dict übernehmen
+            for k in regex_vals.keys():
+                if chosen.get(k, 0) > 0:
+                    result[k] = chosen[k]
+
+            # ── 4) Persönliche Daten via Regex (selten Format-kritisch) ──
+            if result['brutto'] > 0:
                 m_id = re.search(r'Identifikationsnummer:\s*(\d{11})', text)
                 if m_id: result['identnr'] = m_id.group(1)
                 m_geb = re.search(r'Geburtsdatum:\s*(\d{2}\.\d{2}\.\d{4})', text)
@@ -2251,21 +2314,20 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
                     except: pass
                 m_kst = re.search(r'Kirchensteuermerkmale\s+([\w\s/\-]+?)(?:\n|$)', text)
                 if m_kst: result['kirchensteuermerkmale'] = m_kst.group(1).strip()
-
-                # Arbeitgeber-Info
                 m_fa = re.search(r'Finanzamt[^\n]*\n([^\n]+)', text)
                 if m_fa: result['finanzamt'] = m_fa.group(1).strip()
                 m_stnr = re.search(r'Steuernummer:\s*([\d/]+)', text)
                 if m_stnr: result['steuernummer_ag'] = m_stnr.group(1)
 
-                # Abgeleitete Summen
                 result['vorsorge_gesamt_an'] = round(
                     result['rv_an'] + result['kv_an'] +
                     result['pv_an'] + result['av_an'], 2)
                 result['rv_gesamt'] = round(result['rv_an'] + result['rv_ag'], 2)
+                print(f"[LSB-parser] FINAL brutto={result['brutto']:.2f} "
+                      f"z17={result['ag_fahrt_z17']:.2f} disagreement={disagreement}")
 
         except Exception as e:
-            print(f'LSB parse error: {e}')
+            print(f'[LSB-parser] PDF-Read fail: {e}')
 
     return result
 
