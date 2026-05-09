@@ -2240,8 +2240,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '4.1',
-        'build':   'wissensbuch-konsolidiert-2026-05-09',
+        'version': '4.2',
+        'build':   'prompts-verschaerft-z77-monatlich-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -4853,11 +4853,44 @@ def _sonnet_read_lsb_v2(pdf_bytes_list):
                 },
                 {
                     'type': 'text',
-                    'text': ('Du bekommst eine deutsche elektronische Lohnsteuerbescheinigung. '
-                             'Lies alle Felder ab und liefere sie über das Tool. '
-                             'Deutsche Zahlen (1.234,56 € → 1234.56). '
-                             'Wenn ein Feld leer/0 ist, gib 0 zurück. '
-                             'Bei Personalien: nur was im Dokument steht, sonst leerer String.')
+                    'text': """Du bekommst eine deutsche elektronische Lohnsteuerbescheinigung (eLSTB).
+
+═══ FORMAT EINER eLSTB ═══
+
+Standard-Aufbau, jede Zeile hat eine Nummer:
+  Zeile 3:  Bruttoarbeitslohn — Jahresbruttolohn
+  Zeile 4:  Einbehaltene Lohnsteuer
+  Zeile 5:  Solidaritätszuschlag
+  Zeile 6:  Kirchensteuer Arbeitnehmer
+  Zeile 7:  Kirchensteuer Ehegatte (selten relevant)
+  Zeile 17: Steuerpflichtiger AG-Fahrkostenzuschuss (NICHT Z18!)
+  Zeile 18: Pauschal versteuerter (15%) Fahrkostenzuschuss / Jobticket-Indikator
+  Zeile 20: Steuerfreie Verpflegungszuschüsse
+  Zeile 21: Steuerfreie Erstattung doppelter Haushalt
+  Zeile 22a: Arbeitgeber-Anteil Rentenversicherung
+  Zeile 23a: Arbeitnehmer-Anteil Rentenversicherung
+  Zeile 25: Arbeitnehmer-Anteil Krankenversicherung
+  Zeile 26: Arbeitnehmer-Anteil Pflegeversicherung
+  Zeile 27: Arbeitnehmer-Anteil Arbeitslosenversicherung
+
+═══ REGELN ═══
+
+✓ Lies LITERAL — keine Schätzungen.
+✓ Deutsche Zahlen umwandeln: '1.234,56 €' → 1234.56 (Punkt = Tausender, Komma = Dezimal)
+✓ Wenn Feld leer / nicht vorhanden / 0,00 → liefere 0 (NICHT null/None)
+✓ Personalien: nur was wirklich da steht, sonst leerer String
+✓ Wenn unklar welche Spalte: Z17 (steuerpflichtig) ist normalerweise GRÖßER als Z18 (pauschal),
+  und Z17 wird in der Regel direkt unter "Werbungskosten" gerechnet
+✓ Identifikationsnummer: 11 Ziffern, formatiert wie 12345678901
+✓ Geburtsdatum: DD.MM.YYYY
+
+═══ MULTI-SEITEN ═══
+
+Wenn die LSB mehrere Seiten hat: Werte stehen typisch auf Seite 1.
+Manche Felder können auf Folgeseiten weitergehen — lies ALLE Seiten.
+
+Liefere via Tool. Bei UNSICHER welcher Wert zu welcher Zeile gehört: lieber 0 als
+falscher Wert."""
                 }
             ]
             resp = None
@@ -4920,23 +4953,37 @@ def _sonnet_read_se_summary_v2(pdf_bytes_list, year=2025):
 
     se_tool = {
         'name': 'submit_se_summen',
-        'description': 'Liefere die Summen aus allen Streckeneinsatz-Abrechnungen',
+        'description': 'Liefere die Summen aus allen Streckeneinsatz-Abrechnungen + monatliche Aufschlüsselung zur Verifikation',
         'input_schema': {
             'type': 'object',
-            'required': ['z77_total', 'flugmonate'],
+            'required': ['z77_total', 'flugmonate', 'monatliche_z77'],
             'properties': {
                 'z77_total': {
                     'type': 'number',
-                    'description': 'Σ aller stfrei-Werte über alle Tage und alle Abrechnungen — '
-                                   'das ist Z77 (steuerfreie Auszahlung vom Arbeitgeber)'
+                    'description': 'Z77 = Σ aller Werte in der "Steuerfrei"-Spalte über alle Tage und alle Monate. '
+                                   'Das ist was Lufthansa STEUERFREI ausgezahlt hat. Niemals Steuerpflichtig dazurechnen!'
+                },
+                'monatliche_z77': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'monat': {'type': 'integer', 'description': '1-12'},
+                            'z77_monat': {'type': 'number', 'description': 'Σ stfrei-Werte für diesen Monat'},
+                            'anzahl_zeilen': {'type': 'integer', 'description': 'Anzahl Tageszeilen für diesen Monat'}
+                        },
+                        'required': ['monat', 'z77_monat']
+                    },
+                    'description': 'Pro Monat: Z77-Anteil zur Cross-Verifikation. '
+                                   'Σ(monatliche_z77) MUSS = z77_total ergeben.'
                 },
                 'summe_gesamt': {
                     'type': 'number',
-                    'description': 'Σ aller Gesamt-Beträge (steuerpflichtig + steuerfrei)'
+                    'description': 'Σ aller GESAMT-Spalte (steuerpflichtig + steuerfrei zusammen)'
                 },
                 'summe_steuerpflichtig': {
                     'type': 'number',
-                    'description': 'Σ aller steuerpflichtigen Anteile'
+                    'description': 'Σ aller "Steuerpflichtig"-Werte'
                 },
                 'flugmonate': {
                     'type': 'array',
@@ -4945,7 +4992,15 @@ def _sonnet_read_se_summary_v2(pdf_bytes_list, year=2025):
                 },
                 'anzahl_abrechnungen': {
                     'type': 'integer',
-                    'description': 'Anzahl der erkannten Monatsabrechnungen'
+                    'description': 'Anzahl der erkannten Monatsabrechnungen (typisch 12 für volles Jahr)'
+                },
+                'auslandsspesen_total': {
+                    'type': 'number',
+                    'description': 'Σ aller stfrei-Werte wo stfrei-Ort AUSLAND ist (≠ FRA/MUC/HAM/etc.)'
+                },
+                'inlandsspesen_total': {
+                    'type': 'number',
+                    'description': 'Σ aller stfrei-Werte wo stfrei-Ort INLAND ist (FRA/MUC/HAM/etc.)'
                 }
             }
         }
@@ -4953,7 +5008,7 @@ def _sonnet_read_se_summary_v2(pdf_bytes_list, year=2025):
 
     # Alle PDFs in einen Call (Sonnet kann viele Documents auf einmal)
     content = []
-    for pdf_bytes in pdf_bytes_list[:14]:  # safety limit
+    for pdf_bytes in pdf_bytes_list[:14]:
         try:
             content.append({
                 'type': 'document',
@@ -4965,12 +5020,56 @@ def _sonnet_read_se_summary_v2(pdf_bytes_list, year=2025):
         return None
     content.append({
         'type': 'text',
-        'text': (f'Du bekommst Lufthansa Streckeneinsatz-Abrechnungen für {year}. '
-                 f'Pro Abrechnung gibt es eine Summe-Zeile mit drei Werten: Gesamt, Steuerpflichtig, Steuerfrei. '
-                 f'Z77 (steuerfrei gesamt) ist die Σ aller "Steuerfrei"-Werte. '
-                 f'Berechne über ALLE Abrechnungen die Summen. '
-                 f'Liste auch die Flugmonate (1-12) in denen Flüge stattfanden — erkennbar an den Datums-Zeilen DD.MM.YYYY.'
-                 f'Liefere via Tool.')
+        'text': f"""Du bekommst Lufthansa Streckeneinsatz-Abrechnungen für Steuerjahr {year}.
+
+═══ FORMAT EINER STRECKENEINSATZ-ABRECHNUNG ═══
+
+Pro Monat eine Abrechnung mit:
+- Header: "Erstellt DD.MM.YYYY" + Mandanten-Daten
+- Tabelle mit Spalten:
+  DATUM | AB | AN | SPESEN-€ | ORT | ZWÖLFTEL | STFREI-€ | STFREI-ORT | STEUER | WERBKO | DOPP | STORNO
+  Eine Zeile pro Tag/Tour-Aktivität (typisch 5-30 Zeilen pro Monat)
+- SUMME-Zeile am Ende mit drei Beträgen:
+  "Summe: GESAMT_€  STEUERPFLICHTIG_€  STEUERFREI_€"
+  → STEUERFREI_€ in dieser Summe-Zeile = Z77 für diesen Monat
+
+═══ WAS DU LIEFERN MUSST ═══
+
+1. Z77_TOTAL: Σ aller "Steuerfrei"-Werte über ALLE Monate + ALLE Tage.
+   → Methode A: Σ aller Tageszeilen-stfrei-Werte
+   → Methode B: Σ aller Monats-Summe-Zeilen-stfrei-Werte
+   → Beide Methoden müssen gleichen Wert ergeben — wenn nicht, prüfe Storno-Zeilen!
+
+2. MONATLICHE_Z77: Pro Monat (1-12) den Z77-Anteil + Anzahl Zeilen.
+   Σ(monatliche_z77) MUSS = z77_total sein. Das ist deine Selbst-Prüfung.
+
+3. AUSLANDSSPESEN_TOTAL: Σ stfrei-Werte wo stfrei-Ort = AUSLAND
+   (z.B. JFK, GRU, BLR, ICN, JNB — nicht FRA/MUC/HAM).
+   Das wird später als Z76-Anteil von Z77 verwendet.
+
+4. INLANDSSPESEN_TOTAL: Σ stfrei-Werte wo stfrei-Ort = INLAND
+   (FRA, MUC, HAM, BER, DUS, STR, CGN, HAJ, BRE, NUE, LEJ, etc.)
+   Cross-Check: AUSLANDSSPESEN + INLANDSSPESEN = Z77_TOTAL.
+
+5. FLUGMONATE: Liste 1-12 in denen Flüge stattfanden (DD.MM.YYYY-Zeilen).
+
+═══ WICHTIGE REGELN ═══
+
+❌ Storno-Zeilen (Spalte STORNO enthält "X") IGNORIEREN — nicht summieren.
+❌ Steuerpflichtig-Spalte NICHT zu Z77 dazurechnen — Z77 ist NUR Steuerfrei.
+❌ Bei Multi-Page-PDFs: ALLE Seiten lesen, nicht nur die erste.
+✓ Bei Tageszeile mit nur einem Wert in Steuerfrei-Spalte: addiere diesen.
+✓ Bei Tageszeile mit "0,00" oder leer in Steuerfrei: addiere 0 (zähle aber Zeile).
+✓ Verifiziere durch zwei Methoden (Σ Zeilen vs Σ Summe-Zeilen) — bei Diskrepanz
+   nimm den höheren Wert und prüfe nochmal Storno.
+
+═══ REALISTIC-CHECK ═══
+
+Z77 für Vollzeit-LH-Cabin-Crew typisch 3.000-7.000€/Jahr.
+Wenn dein Z77 < 1.500€ oder > 10.000€: prüfe nochmal — wahrscheinlich
+hast du Monate übersehen oder Storno-Zeilen mitgezählt.
+
+Liefere via Tool das strukturierte Ergebnis."""
     })
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
@@ -4997,15 +5096,35 @@ def _sonnet_read_se_summary_v2(pdf_bytes_list, year=2025):
         if not tool_input:
             print(f"[Sonnet-SE] kein tool_input")
             return None
+        # Cross-Check: Σ(monatliche_z77) muss = z77_total sein
+        monatliche = tool_input.get('monatliche_z77', []) or []
+        monat_sum = sum(float(m.get('z77_monat', 0) or 0) for m in monatliche)
+        z77_main = float(tool_input.get('z77_total', 0) or 0)
+        if monatliche and abs(monat_sum - z77_main) > 5:
+            print(f"[Sonnet-SE] WARNUNG: monatliche_z77-Summe ({monat_sum:.2f}€) ≠ z77_total ({z77_main:.2f}€) "
+                  f"— Diff {abs(monat_sum - z77_main):.2f}€. Nehme den höheren Wert (vermutlich vollständiger).")
+            z77_main = max(z77_main, monat_sum)
+
         result = {
-            'z77_total': float(tool_input.get('z77_total', 0) or 0),
+            'z77_total': z77_main,
             'summe_gesamt': float(tool_input.get('summe_gesamt', 0) or 0),
             'summe_steuerpflichtig': float(tool_input.get('summe_steuerpflichtig', 0) or 0),
+            'auslandsspesen_total': float(tool_input.get('auslandsspesen_total', 0) or 0),
+            'inlandsspesen_total': float(tool_input.get('inlandsspesen_total', 0) or 0),
             'flugmonate': sorted(set(int(m) for m in tool_input.get('flugmonate', []) if 1 <= int(m) <= 12)),
             'anzahl_abrechnungen': int(tool_input.get('anzahl_abrechnungen', 0) or 0),
+            'monatliche_z77': monatliche,
         }
-        print(f"[Sonnet-SE] Z77={result['z77_total']:.2f}€  Abrechnungen={result['anzahl_abrechnungen']}  "
-              f"Flugmonate={result['flugmonate']}")
+        # Plus Plausi-Warning bei verdächtig niedrigem/hohem Z77
+        if 0 < result['z77_total'] < 1500:
+            print(f"[Sonnet-SE] ⚠ VERDÄCHTIG NIEDRIG: Z77={result['z77_total']:.2f}€ — typisch 3000-7000€ für Vollzeit-Crew. "
+                  f"Sonnet hat möglicherweise Monate übersehen.")
+        elif result['z77_total'] > 10000:
+            print(f"[Sonnet-SE] ⚠ VERDÄCHTIG HOCH: Z77={result['z77_total']:.2f}€ — typisch 3000-7000€. "
+                  f"Sonnet hat möglicherweise Werte doppelt summiert.")
+        print(f"[Sonnet-SE] Z77={result['z77_total']:.2f}€  "
+              f"(Inland {result['inlandsspesen_total']:.2f}€ + Ausland {result['auslandsspesen_total']:.2f}€)  "
+              f"Abrechnungen={result['anzahl_abrechnungen']}  Flugmonate={result['flugmonate']}")
         return result
     except Exception as e:
         print(f"[Sonnet-SE] fail: {e}")
@@ -5079,40 +5198,104 @@ def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebas
         print(f"[Opus-Klassifikation] Wissens-Buch laden fail: {e}")
 
     prompt = f"""Du bist Senior-Steuerberater spezialisiert auf Lufthansa-Kabinenpersonal.
+Mandant: LH-Cabin-Crew, Homebase {homebase}, Steuerjahr {year}.
 
 ═══════════════════════════════════════════════════════════════════════════
-INSTITUTIONELLES WISSEN — VERPFLICHTEND ZU LESEN UND ANZUWENDEN
+█ TEIL 1: VERPFLICHTENDES WISSEN — LIES UND VERINNERLICHE
 ═══════════════════════════════════════════════════════════════════════════
 
 {wissensbuch}
 
 ═══════════════════════════════════════════════════════════════════════════
-DEIN AUFTRAG JETZT
+█ TEIL 2: DEIN ANALYSE-AUFTRAG
 ═══════════════════════════════════════════════════════════════════════════
 
-Mandant: Lufthansa-Kabinenbesatzung mit Homebase {homebase}, Steuerjahr {year}.
-Du bekommst {pdf_count} PDFs: Dienstplan/Flugstunden, Einsatzplan (CAS), Streckeneinsatz.
+Du bekommst {pdf_count} PDFs in dieser Reihenfolge:
+- Dienstplan / Flugstunden-Übersichten (Tag-für-Tag-Marker)
+- Einsatzplan / CAS-PUB-Liste (detaillierter mit Briefingzeiten, Routings)
+- Streckeneinsatz-Abrechnungen (was LH stfrei gezahlt hat)
 
-VORGEHEN:
-1. Gehe Tag für Tag durch (1.1.{year} bis 31.12.{year})
-2. Pro Tag: identifiziere Marker (Dienstplan + Einsatzplan)
-3. Cross-Reference mit SE für stfrei-Werte
-4. Klassifiziere nach Marker-Katalog im Wissens-Buch
-5. Wende TOUR-AWARENESS an (Wissens-Buch Regel #1)
-6. Aggregiere am Ende
+═══ STEP 1 — Datenbasis aufbauen ═══
 
-KRITISCH: Beachte besonders die "Häufigen Fehler" aus dem Wissens-Buch.
-Vor dem Liefern: prüfe die Muss-Checks (Z76 ≤ Z77, Hotel ≤ Arbeitstage, etc.)
+Lies ALLE PDFs durch. Erstelle innerlich einen Tag-Kalender 1.1.{year}-31.12.{year}.
+Pro Tag erfasse:
+- Welcher Marker im Dienstplan? (FREI/U/K/A/E/FL/SBY/RES/EK/EM/D4/DD/BRIEFING/...)
+- Welche Routing-Info im Einsatzplan? (Tour-Code, Briefingzeit, Block-Time)
+- Welche stfrei-Werte in der SE? (mit stfrei-Ort: FRA/MUC/HAM = Inland, sonst Ausland)
 
-NACHWEIS: Liefere im 'nachweis'-Feld eine Monat-für-Monat-Zusammenfassung.
-Pro Monat 1-3 Sätze: was waren die Touren, wie viele Arbeitstage/Fahrtage/Hotel.
-Bei kontroversen Klassifizierungen: kurze Begründung im Nachweis (z.B.
-"08.03 BLR-Tour-Anreise: zähle als Z76 mit Indien-Anreise-Pauschale 30€").
+═══ STEP 2 — Tag-Klassifikation ═══
 
-UNKLARE TAGE: wenn Marker nicht eindeutig zuzuordnen, in 'unklare_tage' listen
-mit Begründung. NIE raten, lieber als unklar markieren.
+Wende das DENK-SCHEMA aus Teil 1, Abschnitt 1 an:
 
-Liefere via Tool das strukturierte Ergebnis."""
+Pro Tag:
+1. FREI/U/K → kein Arbeitstag, fertig.
+2. SBY/RES/Online-Schulung → Arbeitstag, kein Fahrtag, kein Hotel, fertig.
+3. EK/EM/D4/DD/BRIEFING (Office-Day in {homebase}) → Arbeitstag + Fahrtag (täglich!).
+4. Tour (A/E/FL):
+   a. Same-Day-Heimkehr (A + E gleicher Tag, egal ob Inland oder EU-Ausland):
+      → Z72 mit 14€ Inland-Tagestrip-Pauschale (LH/FollowMe-Konvention)
+      → 1 Fahrtag, 0 Hotelnacht
+   b. Mehrtägig mit Hotel im INLAND (z.B. Schulung MUC mit Übernachtung):
+      → Anreise-Tag = Z73 (14€), Volltage = nur Arbeitstag, Abreise-Tag = Z73 (14€)
+      → 1 Fahrtag pro Tour, n Hotelnächte
+   c. Mehrtägig mit Hotel im AUSLAND:
+      → ALLE Tage = Z76, BMF-Auslands-Anreise-Pauschale für Tag 1 + letzten Tag,
+        BMF-Auslands-24h-Pauschale für Volltage zwischen
+      → 1 Fahrtag pro Tour, n Hotelnächte (FL-Marker)
+
+═══ STEP 3 — Aggregation ═══
+
+Zähle:
+- arbeitstage = Σ aller Tage außer Frei/Urlaub/Krank
+- fahr_tage = Σ Tour-Starts + Σ Office-Days
+  (Eine Tour = 1 Fahrtag insgesamt, AUCH bei mehreren Etappen!)
+- hotel_naechte = Σ FL-Marker (≥10h Bodenzeit)
+- z72_tage = Σ Same-Day-Tagestrips mit ≥8h Abwesenheit
+- z73_tage = Σ Inland-Mehrtages-Tour Anreise- + Abreise-Tage (NUR echte Inland-Touren!)
+- z74_tage = Σ Inland 24h-Tage (sehr selten, typisch 0-2/Jahr)
+- z76_eur = Σ BMF-Auslands-Pauschalen pro Auslandstour-Tag
+  (Anreise-Satz für Tag 1+letzten, 24h-Satz für Volltage)
+
+═══ STEP 4 — Self-Check VOR Liefern ═══
+
+PFLICHT vor dem Tool-Aufruf — gehe diese Checks durch:
+
+✓ Z76_EUR ≤ Z77 (Z77 ist was LH literal stfrei gezahlt hat — kannst du im SE
+  durch Σ aller stfrei-Werte verifizieren). Wenn Z76 > Z77: deine BMF-Pauschalen
+  überschreiten was LH gezahlt hat → das ist OK steuerlich, aber prüfe
+  mathematisch: ist deine Tag-Klassifikation realistisch?
+
+✓ hotel_naechte ≤ arbeitstage (logisch zwingend)
+
+✓ fahr_tage ≤ arbeitstage (logisch zwingend)
+
+✓ z73_tage typisch 5-15 (NUR echte Inland-Touren mit Hotel — z.B. Schulungen).
+  Wenn dein Z73 > 20: hast du Auslandstouren als Z73 reklassifiziert? FALSCH!
+
+✓ Plausi-Bandbreite Vollzeit: arbeitstage 120-160, fahrtage 50-80, hotel 50-80.
+  Wenn deutlich darüber/unter: prüfe ob du SBY/RES korrekt gezählt hast oder
+  Office-Days als Fahrtag erkannt hast.
+
+Wenn ein Check fehlschlägt: zurück zu STEP 2 und nachschärfen.
+
+═══ STEP 5 — Nachweis schreiben ═══
+
+Im 'nachweis'-Feld: Monat für Monat 2-3 Sätze. Format-Beispiel:
+"JAN: 5 Touren — BLR-Tour 03-06.01 (Z76 Indien), 2× CPH-Tagestrip (Z72), HKG-Tour
+17-21.01 (Z76 China), 1× DD-Schulung Tag 28 (Office). 12 AT, 6 FT, 5 Hotel."
+
+Bei unklaren Tagen: in 'unklare_tage' mit Begründung listen. NIE raten.
+
+═══ ANTI-MUSTER (NICHT MACHEN) ═══
+
+❌ Auslandstour-Anreise-Tag mit FRA-Stempel als Z73 zählen (= FollowMe-FEHLER #13)
+❌ Same-Day-Tagestrip nach CPH als Z76 zählen (= FollowMe-FEHLER #13)
+❌ Inland-Schulung mit Hotel als Auslandstour klassifizieren (= FEHLER #14)
+❌ DD/EK/EM nur 1 Fahrtag zählen statt täglich (= FEHLER #4 + #16)
+❌ Plausi-Bandbreiten als Schätzung verwenden — IMMER zählen aus Dienstplan
+❌ Werte ohne Tag-Beleg im Nachweis erfinden — bei Unsicherheit unklar markieren
+
+LIEFERE jetzt via Tool die strukturierten Werte + monatlichen Nachweis."""
 
     content.append({'type': 'text', 'text': prompt})
 
@@ -5296,10 +5479,14 @@ def _berechne_via_hybrid(form, files):
     z77 = float(se_sum.get('z77_total', 0) or 0)
     spesen_gesamt = float(se_sum.get('summe_gesamt', 0) or 0)
     spesen_steuer = float(se_sum.get('summe_steuerpflichtig', 0) or 0)
+    auslandsspesen_se = float(se_sum.get('auslandsspesen_total', 0) or 0)  # Z76-Anteil von Z77
+    inlandsspesen_se  = float(se_sum.get('inlandsspesen_total', 0) or 0)
     flugmonate    = list(se_sum.get('flugmonate', []) or [])
 
     if not z77 and files.get('se'):
         notes.append('⚠️ Streckeneinsatz konnte Z77-Summe nicht ermitteln — bitte prüfen')
+    elif 0 < z77 < 1500:
+        notes.append(f'⚠ Z77 mit {z77:.2f}€ verdächtig niedrig — typisch sind 3.000-7.000€/Jahr für Vollzeit-Crew. Bitte prüfen ob alle SE-Files vollständig hochgeladen wurden.')
 
     # Klassifikations-Werte
     arbeitstage   = int(cls.get('arbeitstage', 0) or 0)
@@ -5312,11 +5499,31 @@ def _berechne_via_hybrid(form, files):
     nachweis_text = str(cls.get('nachweis', '') or '')
     unklare_tage  = list(cls.get('unklare_tage', []) or [])
 
-    # ── BMF-Pauschalen × Tage ──
+    # ── BMF-Pauschalen × Tage (Inland) ──
     vma_72 = round(vma_72_tage * bmf_inland['tagestrip_8h'], 2)
     vma_73 = round(vma_73_tage * bmf_inland['an_abreise'], 2)
     vma_74 = round(vma_74_tage * bmf_inland['voll_24h'], 2)
     vma_in = round(vma_72 + vma_73 + vma_74, 2)
+
+    # ── MATH-KONSISTENZ-CHECK (Z76 vs Z77 + Auslandsspesen) ──
+    # Z76 (BMF-Pauschalen × Auslandstage) sollte ähnlich auslandsspesen_se sein.
+    # Wenn Z76 viel höher: Opus hat zu viele Tage als Auslandstour klassifiziert.
+    # Wenn Z76 viel niedriger: Opus hat Auslandstage übersehen.
+    if auslandsspesen_se > 0 and vma_aus > 0:
+        ausland_diff_pct = abs(vma_aus - auslandsspesen_se) / max(auslandsspesen_se, 1)
+        if ausland_diff_pct > 0.30:  # >30% Diff
+            notes.append(
+                f'⚠ Z76-Inkonsistenz: Opus klassifiziert {vma_aus:.2f}€ Auslands-WK, '
+                f'aber LH hat nur {auslandsspesen_se:.2f}€ Auslands-stfrei gezahlt '
+                f'(Diff {abs(vma_aus-auslandsspesen_se):.2f}€). Bitte Auswertung prüfen.'
+            )
+    # Z76 darf grundsätzlich höher sein als auslandsspesen_se (Pauschale > AG-Auszahlung erlaubt),
+    # aber NIE höher als Z77 + großer Toleranz (sonst wird Netto absurd hoch)
+    if vma_aus > z77 * 2 and z77 > 0:
+        notes.append(
+            f'⚠ Z76 ({vma_aus:.2f}€) ist > 2× Z77 ({z77:.2f}€) — sehr ungewöhnlich. '
+            f'Möglicherweise hat Opus Tage falsch als Auslandstour klassifiziert.'
+        )
 
     # ── Fahrtkosten ──
     anreise = form.get('anreise', 'auto')
