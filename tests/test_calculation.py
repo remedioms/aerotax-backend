@@ -1825,6 +1825,153 @@ def test_v86_wrong_z72_candidate_when_overnight():
     assert 'Z72-Hard-Gate' in src
 
 
+# ── v8.7 Tests: Architektur-Trennung Reader ↔ Classifier ──
+
+def test_v87_dp_reader_schema_no_z_codes():
+    """DP-Reader-Tool darf KEINE Z-Codes (Z72/Z73/Z74/Z76) als Aktivitäts-Enum
+    zulassen. Sonnet liest Fakten, kein Klassifikator."""
+    import inspect
+    from app import _sonnet_read_dp_structured
+    src = inspect.getsource(_sonnet_read_dp_structured)
+    # activity_type-Enum enthält KEINE Z-Codes
+    # Pattern suchen: 'enum': [...frei, urlaub, krank, standby, office, training, tour, same_day, unknown...]
+    # Z72/Z73/Z74/Z76 dürfen nicht im enum auftauchen
+    assert "'Z72'" not in src, "DP-Reader-Schema darf kein 'Z72' enthalten — Sonnet klassifiziert nicht steuerlich"
+    assert "'Z73'" not in src
+    assert "'Z74'" not in src
+    assert "'Z76'" not in src
+
+
+def test_v87_se_reader_schema_no_z_codes():
+    """SE-Reader-Tool darf KEINE Z-Codes (Z72-Z76) zulassen — nur Z77 als
+    Lese-Fakt aus der Streckeneinsatzabrechnung."""
+    import inspect
+    from app import _sonnet_read_se_structured
+    src = inspect.getsource(_sonnet_read_se_structured)
+    # Z72/Z73/Z74/Z76 sind Klassifikations-Codes — die soll Sonnet nicht setzen
+    assert "'klass': {'type': 'string', 'enum': ['Z72'" not in src
+    assert "'classify': True" not in src
+
+
+def test_v87_lsb_reader_schema_no_z_codes():
+    """LSB-Reader-Tool liest nur Lohnsteuer-Felder (brutto/Z17/Z18/Z20/etc.)
+    — kein Z72/Z73/Z74/Z76."""
+    import inspect
+    from app import _sonnet_read_lsb_v2
+    src = inspect.getsource(_sonnet_read_lsb_v2)
+    # Z72-76 sind reine Werbungskosten-Klassen → KEIN LSB-Feld
+    for zcode in ('Z72', 'Z73', 'Z74', 'Z76'):
+        # erlaubt sind nur Z17/Z18/Z20 (LSB-Zeilen) — Z72-Z76 nicht
+        assert f"'{zcode}'" not in src or 'description' in src.split(zcode)[0][-200:], \
+            f"LSB-Reader hat {zcode} im Schema — sollte Sonnet nicht setzen"
+
+
+def test_v87_tage_detail_has_reader_facts_and_classifier_result():
+    """Jeder tage_detail-Eintrag enthält reader_facts UND classifier_result
+    UND sources UND diagnostics als nested Audit-Struktur."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-01', 'activity_type': 'office', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['tage_detail'], "tage_detail leer"
+    t = result['tage_detail'][0]
+    # Nested Sections sind da
+    for key in ('reader_facts', 'classifier_result', 'sources', 'diagnostics'):
+        assert key in t, f"tage_detail-Eintrag ohne '{key}'"
+    # Reader-Facts haben die Pflichtfelder
+    rf = t['reader_facts']
+    for key in ('datum', 'activity_type', 'overnight_after_day',
+                'starts_at_homebase', 'ends_at_homebase', 'requires_commute',
+                'is_workday', 'duty_duration_minutes'):
+        assert key in rf, f"reader_facts ohne '{key}'"
+    # Classifier-Result hat die Entscheidungs-Felder
+    cr = t['classifier_result']
+    for key in ('klass', 'amount', 'reason', 'bmf_land', 'bmf_tagtyp',
+                'counted_as_workday', 'counted_as_fahrtag', 'counted_as_hotel_nacht'):
+        assert key in cr, f"classifier_result ohne '{key}'"
+    # Diagnostics enthält die Issue-Felder
+    di = t['diagnostics']
+    for key in ('reader_warning', 'classifier_warning',
+                'bmf_mapping_issue', 'unresolved_reason'):
+        assert key in di, f"diagnostics ohne '{key}'"
+
+
+def test_v87_tage_detail_z76_has_bmf_land():
+    """Z76-Tag enthält bmf_land im classifier_result + 'BMF2025' in sources."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'BLR'], 'layover_ort': 'BLR'},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['classifier_result']['klass'] == 'Z76'
+    assert t['classifier_result']['bmf_land'], f"bmf_land fehlt für Z76: {t['classifier_result']}"
+    assert 'BMF2025' in t['sources']
+
+
+def test_v87_tage_detail_office_no_bmf():
+    """Office-Tag hat KEIN bmf_land (kein Auslandsbezug)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-01', 'activity_type': 'office', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['classifier_result']['klass'] == 'Office'
+    assert not t['classifier_result']['bmf_land']
+    assert 'BMF2025' not in t['sources']
+
+
+def test_v87_claude_md_documents_principle():
+    """CLAUDE.md enthält das Architektur-Prinzip explizit."""
+    import os
+    p = os.path.join(os.path.dirname(__file__), '..', 'CLAUDE.md')
+    with open(p, 'r') as f:
+        txt = f.read()
+    assert 'Sonnet reads facts' in txt
+    assert 'Python classifies and calculates' in txt
+    assert 'ReportLab renders' in txt
+    assert 'No AI-generated tax decision is accepted as final' in txt
+
+
+def test_v87_counted_flags_consistent_with_counters():
+    """classifier_result.counted_as_*-Flags summieren sich zu den
+    aggregate Countern arbeitstage/fahr_tage/hotel_naechte."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # Einfache Konstellation: 1 Office, 1 Frei, 1 Tour mit Layover
+    structured = {'days': [
+        {'datum': '2025-07-01', 'activity_type': 'office', 'overnight_after_day': False},
+        {'datum': '2025-07-02', 'activity_type': 'frei', 'overnight_after_day': False},
+        {'datum': '2025-07-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'JFK'], 'layover_ort': 'JFK'},
+        {'datum': '2025-07-04', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-07-03', 'stfrei_betrag': 40, 'stfrei_ort': 'JFK', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-07-04', 'stfrei_betrag': 40, 'stfrei_ort': 'JFK', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Summen aus tage_detail.classifier_result-Flags
+    sum_workday = sum(1 for t in result['tage_detail']
+                      if t['classifier_result']['counted_as_workday'])
+    sum_fahrtag = sum(1 for t in result['tage_detail']
+                      if t['classifier_result']['counted_as_fahrtag'])
+    sum_hotel = sum(1 for t in result['tage_detail']
+                    if t['classifier_result']['counted_as_hotel_nacht'])
+    assert sum_workday == result['arbeitstage']
+    assert sum_fahrtag == result['fahr_tage']
+    assert sum_hotel == result['hotel_naechte']
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

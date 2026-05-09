@@ -1,5 +1,23 @@
 # AeroTax Backend — Arbeitsweise
 
+## Architecture principle
+
+> **Sonnet reads facts. Python classifies and calculates. ReportLab renders. No AI-generated tax decision is accepted as final.**
+
+Strikte Verantwortungs-Trennung — keine Vermischung:
+
+| Schicht | Verantwortung | Was sie NICHT macht |
+|---|---|---|
+| **KI/Sonnet (Reader)** | Strukturierte Lese-Fakten extrahieren: `activity_type`, `routing`, `overnight_after_day`, `layover_ort`, `start_time`, `end_time`, `stfrei_betrag`, `stfrei_ort`, `storno`, `brutto`, `Z17`, etc. | KEINE steuerliche Klassifikation. KEIN Z72/Z73/Z74/Z76. KEINE finale Beträge. Reader-Tools enthalten keinen Z-Code im enum. |
+| **Python (Classifier)** | Tag-Klassifikation, Tour-Cluster, Fahrtage, Arbeitstage, Hotelnächte, BMF-Landmapping, VMA-Beträge, Z17/Z77-Topftrennung, finaler WISO-Gesamtbetrag. Deterministisch — gleiche Input-Fakten → gleicher Output. | Keine Lese-Heuristik auf rohen Dokumenten — Python rechnet nur mit Reader-Fakten. |
+| **ReportLab (Renderer)** | PDF-Layout aus Result-Dict | Keine Berechnung. Keine Klassifikation. |
+
+**Konsequenz:** Wenn ein Wert falsch ist, ist sofort sichtbar wer Schuld hat:
+- Reader-Fakt falsch → `tage_detail[i].reader_facts` zeigt was Sonnet gelesen hat
+- Classifier falsch → `tage_detail[i].classifier_result.reason` zeigt Code-Pfad
+- BMF-Mapping fehlt → `tage_detail[i].diagnostics.bmf_mapping_issue` listet Lücke
+- PDF zeigt falsch → result-Dict war richtig, ReportLab-Bug
+
 ## Architektur-Grundsatz (v8.0)
 
 > **Sonnet liest 3 Dokumente strukturiert. Backend matcht DP+SE pro Datum, klassifiziert deterministisch, prüft Plausi und Health.**

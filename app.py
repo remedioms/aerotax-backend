@@ -6771,6 +6771,44 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 'marker': d.get('raw_marker', '') or at,
                 'routing': '-'.join(d.get('routing') or []),
                 'tour_dauer': 1, 'eur': 0.0,
+                'dienstlich': False,
+                # v8.7: minimale nested Sections auch für Frei-Tage
+                'reader_facts': {
+                    'datum': datum,
+                    'activity_type': at,
+                    'marker_raw': d.get('raw_marker', ''),
+                    'routing': list(d.get('routing') or []),
+                    'has_fl': bool(d.get('has_fl')),
+                    'overnight_after_day': bool(d.get('overnight_after_day')),
+                    'layover_ort': d.get('layover_ort', '') or '',
+                    'layover_inland': d.get('layover_inland'),
+                    'starts_at_homebase': bool(d.get('starts_at_homebase')),
+                    'ends_at_homebase': bool(d.get('ends_at_homebase')),
+                    'requires_commute': bool(d.get('requires_commute')),
+                    'is_workday': bool(d.get('is_workday')),
+                    'start_time': d.get('start_time', '') or '',
+                    'end_time': d.get('end_time', '') or '',
+                    'duty_duration_minutes': int(d.get('duty_duration_minutes') or 0),
+                    'confidence': float(d.get('confidence') or 0),
+                    'raw_lines': list(d.get('raw_lines') or []),
+                },
+                'classifier_result': {
+                    'klass': 'Frei',
+                    'amount': 0.0,
+                    'reason': at,
+                    'bmf_land': '',
+                    'bmf_tagtyp': '',
+                    'counted_as_workday': False,
+                    'counted_as_fahrtag': False,
+                    'counted_as_hotel_nacht': False,
+                },
+                'sources': ['DP'],
+                'diagnostics': {
+                    'reader_warning': '',
+                    'classifier_warning': '',
+                    'bmf_mapping_issue': '',
+                    'unresolved_reason': '',
+                },
             })
             continue
 
@@ -7087,7 +7125,71 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             dienstlich = orig_at in ('tour', 'same_day', 'office', 'training', 'standby')
         else:
             dienstlich = False  # Frei/Issue
+
+        # v8.7: BMF-Land/Tagtyp für Z76 ableiten
+        bmf_land = ''
+        bmf_tagtyp = ''
+        if klass == 'Z76':
+            try:
+                from bmf_data import IATA_TO_BMF
+                ort_for_bmf = (d.get('layover_ort') or se.get('stfrei_ort') or '').upper()
+                if ort_for_bmf and not _is_inland_code(ort_for_bmf):
+                    bmf_land = IATA_TO_BMF.get(ort_for_bmf, '') or ''
+            except Exception:
+                pass
+            # tagtyp aus Reason ableiten (an_abreise / 24h)
+            if 'An/Ab' in reason or 'Anreise' in reason or 'Heimkehr' in reason or 'Abreise' in reason:
+                bmf_tagtyp = 'an_abreise'
+            elif 'Volltag' in reason or '24h' in reason:
+                bmf_tagtyp = 'voll_24h'
+
+        # v8.7: Architektur-saubere nested Audit-Struktur — getrennt nach
+        # Reader-Fakt vs Classifier-Entscheidung vs Diagnostics. Backward-
+        # Compat: flache Felder (klass, begruendung, marker, routing, eur,
+        # dienstlich) bleiben für PDF und alte Konsumenten.
+        reader_facts = {
+            'datum': datum,
+            'activity_type': d.get('activity_type', ''),
+            'marker_raw': d.get('raw_marker', ''),
+            'routing': list(d.get('routing') or []),
+            'has_fl': bool(d.get('has_fl')),
+            'overnight_after_day': bool(d.get('overnight_after_day')),
+            'layover_ort': d.get('layover_ort', '') or '',
+            'layover_inland': d.get('layover_inland'),
+            'starts_at_homebase': bool(d.get('starts_at_homebase')),
+            'ends_at_homebase': bool(d.get('ends_at_homebase')),
+            'requires_commute': bool(d.get('requires_commute')),
+            'is_workday': bool(d.get('is_workday')),
+            'start_time': d.get('start_time', '') or '',
+            'end_time': d.get('end_time', '') or '',
+            'duty_duration_minutes': int(d.get('duty_duration_minutes') or 0),
+            'confidence': float(d.get('confidence') or 0),
+            'raw_lines': list(d.get('raw_lines') or []),
+        }
+        classifier_result = {
+            'klass': klass,
+            'amount': round(eur_added, 2),
+            'reason': reason,
+            'bmf_land': bmf_land,
+            'bmf_tagtyp': bmf_tagtyp,
+            'counted_as_workday': klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby') or (klass == 'ZeroDay' and dienstlich),
+            'counted_as_fahrtag': bool(d.get('requires_commute')) and klass not in ('Frei', 'Issue', 'Standby'),
+            'counted_as_hotel_nacht': bool(d.get('overnight_after_day')) and klass in ('Z73', 'Z74', 'Z76'),
+        }
+        sources = []
+        if d.get('activity_type'): sources.append('DP')
+        if se.get('count', 0) > 0: sources.append('SE')
+        if klass == 'Z76' and bmf_land: sources.append('BMF2025')
+        diagnostics = {
+            'reader_warning': d.get('notes', '') or '',
+            'classifier_warning': audit_note or '',
+            'bmf_mapping_issue': '' if (klass != 'Z76' or bmf_land)
+                                  else f'BMF-Mapping fehlt für {d.get("layover_ort","")}',
+            'unresolved_reason': unresolved_reason or '',
+        }
+
         tage_detail.append({
+            # Backward-Compat (PDF + alte Konsumenten):
             'datum': datum,
             'klass': klass,
             'begruendung': reason,
@@ -7096,6 +7198,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'tour_dauer': 1,
             'eur': round(eur_added, 2),
             'dienstlich': dienstlich,
+            # v8.7: Nested Audit-Struktur (Architektur-Trennung sichtbar):
+            'reader_facts':      reader_facts,
+            'classifier_result': classifier_result,
+            'sources':           sources,
+            'diagnostics':       diagnostics,
         })
 
     # ── Counter aus klass aggregieren ──
