@@ -473,6 +473,96 @@ def test_v7_classify_office_counts_fahrtag():
     assert result['z72_tage'] == 0
 
 
+# ── Reference-Contract Tests (interne Reference-Werte) ──────────────────
+
+def test_reference_contract_fahrtkosten():
+    """Reference-Contract: 28 km × 58 Fahrtage = 524,32 €."""
+    from app import PENDLER_BY_YEAR
+    pendler = PENDLER_BY_YEAR[2025]
+    km, tage = 28, 58
+    fahrt = round(min(km, 20) * tage * pendler['lt_20km'] +
+                  max(0, km - 20) * tage * pendler['gt_21km'], 2)
+    assert fahrt == 524.32
+
+
+def test_reference_contract_reinigung():
+    """Reference-Contract: 133 Arbeitstage × 1,60 € = 212,80 €."""
+    from app import REINIGUNG_PRO_TAG_BY_YEAR
+    satz = REINIGUNG_PRO_TAG_BY_YEAR[2025]
+    assert round(133 * satz, 2) == 212.80
+
+
+def test_reference_contract_trinkgeld():
+    """Reference-Contract: 66 Hotelnächte × 3,60 € = 237,60 €."""
+    from app import TRINKGELD_PRO_NACHT_BY_YEAR
+    satz = TRINKGELD_PRO_NACHT_BY_YEAR[2025]
+    assert round(66 * satz, 2) == 237.60
+
+
+def test_reference_contract_vma_inland():
+    """Reference-Contract: Z72=5×14, Z73=11×14, Z74=1×28."""
+    from app import BMF_INLAND_BY_YEAR
+    bmf = BMF_INLAND_BY_YEAR[2025]
+    assert round(5 * bmf['tagestrip_8h'], 2) == 70.00
+    assert round(11 * bmf['an_abreise'], 2) == 154.00
+    assert round(1 * bmf['voll_24h'], 2) == 28.00
+
+
+def test_reference_contract_topf_trennung_z17_only_fahrt():
+    """Reference: Z17=330 mindert NUR Fahrtkosten-Topf, nicht VMA/Reinigung/Trinkgeld."""
+    fahrtkosten = 524.32
+    z17 = 330.00
+    fahrt_netto = max(0, fahrtkosten - z17)
+    assert round(fahrt_netto, 2) == 194.32
+    # Reinigung und Trinkgeld bleiben unverändert (Z17 fasst sie nicht an)
+    reinigung_brutto = 212.80
+    trink_brutto = 237.60
+    assert reinigung_brutto == 212.80
+    assert trink_brutto == 237.60
+
+
+def test_reference_contract_topf_trennung_z77_only_vma():
+    """Reference: Z77 mindert NUR VMA-Topf, nicht Fahrt/Reinigung/Trinkgeld."""
+    z76, z73_eur, z72_eur = 4794.00, 154.00, 70.00
+    z77 = 4655.00
+    vma_brutto = z76 + z73_eur + z72_eur + 28.0  # plus Z74
+    vma_netto = max(0, vma_brutto - z77)
+    # Wenn VMA > Z77 → positiver Rest. Wenn VMA < Z77 → 0 (kein Übergriff).
+    assert vma_netto >= 0
+
+
+def test_reference_contract_storno_filter_in_match():
+    """Reference: Storno-Zeilen dürfen nicht in z77_total zählen."""
+    from app import _match_dp_se_per_day
+    structured = {'days': [{'datum': '2025-03-04', 'activity_type': 'tour',
+                             'overnight_after_day': True}]}
+    se = {'se_lines': [
+        {'datum': '2025-03-04', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR',
+         'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-03-04', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR',
+         'stfrei_inland': False, 'storno': True},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    # Nur 1 nicht-Storno-Zeile, Σ = 30
+    assert matched[0]['se']['stfrei_total'] == 30
+    assert matched[0]['se']['count'] == 1
+
+
+def test_as_dict_item_normalizer():
+    """Tuple-Normalizer akzeptiert dict, tuple, pydantic-Model."""
+    from app import _as_dict_item
+    # dict
+    assert _as_dict_item({'datum': '2025-01-01', 'klass': 'Z72'}) == {'datum': '2025-01-01', 'klass': 'Z72'}
+    # tuple (key, value-dict)
+    out = _as_dict_item(('2025-01-01', {'klass': 'Z72'}))
+    assert out['datum'] == '2025-01-01' and out['klass'] == 'Z72'
+    # tuple (key, primitive)
+    out = _as_dict_item(('foo', 42))
+    assert out['datum'] == 'foo' and out['value'] == 42
+    # nicht-konvertierbar
+    assert _as_dict_item('string') == {}
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

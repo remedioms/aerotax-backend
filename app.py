@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '7.0',
-        'build':   'deterministic-dp-se-matching-no-opus-classify-2026-05-09',
+        'version': '7.0.1',
+        'build':   'as-dict-item-cleanup-reference-contract-tests-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -3243,7 +3243,7 @@ def _parse_se_pdf_xpos(pdf_bytes_list, year=2025):
     # ── TOUR-AWARE RE-KLASSIFIZIERUNG DEAKTIVIERT ──────────────
     # Mein vorheriger Fix war zu aggressiv: hat ALLE Z73-Tage in Auslandstour-
     # Nachbarschaft zu Z76 reklassifiziert UND mit Auslands-Pauschalen aufgewertet.
-    # Steuerberater-Praxis (FollowMe-Methode) ist konservativer:
+    # Steuerberater-Praxis (branchenüblicher Steuerberater-Methode) ist konservativer:
     # Inland-Anteile (FRA stfrei) bleiben Z73 mit 14€ — Z76 ist nur was LH
     # explizit als Auslandsspesen markiert. Sicherer beim Finanzamt.
     # Nur die deterministische Klassifikation aus der Loop bleibt.
@@ -3486,7 +3486,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                     "Du klassifizierst die Tage steuerlich richtig nach §9 EStG.\n\n"
                     "Pro Seite gibt es eine 'Summe:'-Zeile (Gesamt/Steuer/Stfrei). "
                     "Z77 = stfrei-Anteil = Gesamt - letzter_Wert.\n\n"
-                    "KLASSIFIKATION DER EINZELNEN TAGE — KONSERVATIV (FollowMe-Methode):\n"
+                    "KLASSIFIKATION DER EINZELNEN TAGE — KONSERVATIV (branchenüblicher Steuerberater-Methode):\n"
                     "- stfrei-Ort = Inland (FRA/MUC/HAM/...): zähle als Z72/Z73/Z74 mit dem stfrei-Wert\n"
                     "  (auch wenn der Tag teil einer Auslandstour ist — bleibt Z73 mit 14€)\n"
                     "- stfrei-Ort = Ausland (GRU/JFK/SEL/...): zähle als Z76 mit dem stfrei-Wert\n"
@@ -3938,7 +3938,7 @@ vma_aus = Σ aller stfrei-Werte wo stfrei-Ort AUSLAND ist
 vma_72/73/74 = Σ stfrei-Werte wo stfrei-Ort INLAND, klassifiziert per Tag
 z77 = lass auf 0 (Backend rechnet)
 
-WICHTIG: Klassifiziere konservativ wie ein klassischer Steuerberater (FollowMe-Methode):
+WICHTIG: Klassifiziere konservativ wie ein klassischer Steuerberater (branchenüblicher Steuerberater-Methode):
 - Wenn LH am Anreise-Tag mit FRA stfrei-Ort 14€ schreibt → Z73 (Inland-An-/Abreise) bleibt 14€
 - Wenn LH am gleichen Tag eine ZUSÄTZLICHE Zeile mit Auslands-Stempel schreibt → das ist Z76
 - Z76 = NUR was LH explizit mit Ausland-Stempel auszeichnet
@@ -5142,11 +5142,17 @@ falscher Wert."""
 #   4. _validate_opus_against_structure() prüft Opus gegen harte Fakten
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _ensure_dict(item):
-    """Konvertiert Anthropic-SDK-Tool-Input-Items robust zu dict.
-    Anthropic kann pydantic-Models, dicts oder bei Edge-Cases tuples liefern."""
+def _as_dict_item(item):
+    """Zentrale Normalisierung für LLM-Output-Items.
+    Akzeptiert: dict, tuple(key,value), pydantic-Model, Object mit __dict__.
+    Liefert immer dict (leeres dict bei nicht konvertierbar)."""
     if isinstance(item, dict):
         return item
+    if isinstance(item, tuple) and len(item) == 2:
+        k, v = item
+        if isinstance(v, dict):
+            return {'datum': k, **v}
+        return {'datum': k, 'value': v}
     if hasattr(item, 'model_dump'):
         try:
             return item.model_dump()
@@ -5158,6 +5164,10 @@ def _ensure_dict(item):
         except Exception:
             pass
     return {}
+
+
+# Alias für Rückwärts-Kompatibilität (v6.0.x verwendete _ensure_dict)
+_ensure_dict = _as_dict_item
 
 
 def _normalize_v6_classifications(raw):
@@ -6542,7 +6552,7 @@ Liefere via Tool das strukturierte Ergebnis."""
 def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebase='FRA', feedback=None):
     """Opus 4.7: liest Dienstplan + Einsatzplan + SE parallel, klassifiziert Tag für Tag.
     Liefert: arbeitstage, fahrtage, hotel_naechte, z72/73/74_tage und EUR, z76_eur,
-    plus monatlichen Nachweis. Konservative FollowMe-Methode.
+    plus monatlichen Nachweis. Konservative branchenüblicher Steuerberater-Methode.
 
     feedback: Optional dict {'prev_classification': cls, 'issues': [str]} — bei
     Self-Reflection-Pass wird Opus mit konkreten Hinweisen zur Korrektur erneut aufgerufen."""
@@ -6583,7 +6593,7 @@ def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebas
                 'hotel_naechte': {'type': 'integer', 'description': 'Σ ALLER Übernachtungen außerhalb Homebase (FL-Marker oder anderer Hotel-Indikator) — INLAND UND AUSLAND. Auch Inland-Schulungs-Hotels und Inland-Tour-Layovers zählen. NICHT nur Auslands-Übernachtungen!'},
                 'z72_tage':      {'type': 'integer', 'description': 'Tagestrips Inland >8h (mit Briefingzeit-Berechnung) ohne Übernachtung'},
                 'z72_eur':       {'type': 'number',  'description': 'z72_tage × 14€ (BMF Inland Tagestrip)'},
-                'z73_tage':      {'type': 'integer', 'description': 'An-/Abreisetage Inland (mit Inland-Übernachtung). Auch Auslandstour-Anreise mit FRA-stfrei zählt hier (FollowMe-Methode konservativ).'},
+                'z73_tage':      {'type': 'integer', 'description': 'An-/Abreisetage Inland (mit Inland-Übernachtung). Auch Auslandstour-Anreise mit FRA-stfrei zählt hier (branchenüblicher Steuerberater-Methode konservativ).'},
                 'z73_eur':       {'type': 'number',  'description': 'z73_tage × 14€'},
                 'z74_tage':      {'type': 'integer', 'description': 'Inland 24h ohne Ab/An-Zeiten (selten)'},
                 'z74_eur':       {'type': 'number',  'description': 'z74_tage × 28€'},
@@ -6612,7 +6622,7 @@ def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebas
 
     # Wissens-Buch laden — Single Source of Truth.
     # NUR referenz_faelle.txt laden (konsolidiert: §9 EStG, §3 Nr. 16, EASA-FTL,
-    # BMF-Pauschalen, LH-Marker-Katalog, FollowMe-Standard, Reference-Cases,
+    # BMF-Pauschalen, LH-Marker-Katalog, branchenüblicher Standard, Reference-Cases,
     # Häufige Fehler). Die alte referenz_easa.txt wird NICHT mehr geladen weil sie
     # widersprüchliche VMA-Klassifikations-Logik enthält.
     wissensbuch = ''
@@ -6660,7 +6670,7 @@ Pro Tag:
 3. EK/EM/D4/DD/BRIEFING (Office-Day in {homebase}) → Arbeitstag + Fahrtag (täglich!).
 4. Tour (A/E/FL):
    a. Same-Day-Heimkehr (A + E gleicher Tag, egal ob Inland oder EU-Ausland):
-      → Z72 mit 14€ Inland-Tagestrip-Pauschale (LH/FollowMe-Konvention)
+      → Z72 mit 14€ Inland-Tagestrip-Pauschale (LH/branchenüblicher Konvention)
       → 1 Fahrtag, 0 Hotelnacht
    b. Mehrtägig mit Hotel im INLAND (z.B. Schulung MUC mit Übernachtung):
       → Anreise-Tag = Z73 (14€), Volltage = nur Arbeitstag, Abreise-Tag = Z73 (14€)
@@ -6715,8 +6725,8 @@ Bei unklaren Tagen: in 'unklare_tage' mit Begründung listen. NIE raten.
 
 ═══ ANTI-MUSTER (NICHT MACHEN) ═══
 
-❌ Auslandstour-Anreise-Tag mit FRA-Stempel als Z73 zählen (= FollowMe-FEHLER #13)
-❌ Same-Day-Tagestrip nach CPH als Z76 zählen (= FollowMe-FEHLER #13)
+❌ Auslandstour-Anreise-Tag mit FRA-Stempel als Z73 zählen (= Klassifikations-FEHLER #13)
+❌ Same-Day-Tagestrip nach CPH als Z76 zählen (= Klassifikations-FEHLER #13)
 ❌ Inland-Schulung mit Hotel als Auslandstour klassifizieren (= FEHLER #14)
 ❌ DD/EK/EM nur 1 Fahrtag zählen statt täglich (= FEHLER #4 + #16)
 ❌ Plausi-Bandbreiten als Schätzung verwenden — IMMER zählen aus Dienstplan
@@ -7314,7 +7324,7 @@ def _berechne_via_hybrid(form, files):
         'z77':         'Sonnet liest SE-Summen',
         'z76':         'Opus klassifiziert Auslandstage aus SE',
         'z72':         'Opus klassifiziert Inland-Tagestrips (Briefingzeiten + 8h-Schwelle)',
-        'z73':         'Opus klassifiziert Inland-An-/Abreise (FollowMe-konservativ)',
+        'z73':         'Opus klassifiziert Inland-An-/Abreise (konservativ)',
         'fahrtage':    'Opus liest Dienstplan + Einsatzplan',
         'arbeitstage': 'Opus zählt Marker Tag-für-Tag',
         'hotel':       'Opus EASA-FTL Layover-Regel ≥10h Bodenzeit',

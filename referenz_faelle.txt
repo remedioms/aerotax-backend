@@ -1,13 +1,13 @@
   AEROTAX — KOMPLETTES WISSENS-BUCH FÜR LH-CABIN-CREW-AUSWERTUNG
   Single Source of Truth (Stand: Mai 2026)
   Enthält: Steuerrecht §9 + §3 EStG, EASA-FTL EU 965/2012, BMF-Pauschalen,
-           LH-Dokumentenformate, FollowMe-Standard, Reference-Cases,
+           LH-Dokumentenformate, branchenüblicher Standard, Reference-Cases,
            Häufige Fehler. ALLES was du als Steuerberater wissen MUSST.
 ═══════════════════════════════════════════════════════════════════════════
 
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ 1. KERNSATZ — Klassifikation nach FollowMe-Standard                      ┃
+┃ 1. KERNSATZ — Klassifikation nach branchenüblicher Standard                      ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
 Die ENTSCHEIDENDE Frage pro Tag/Tour ist nicht "Inland oder Ausland?",
@@ -20,7 +20,7 @@ DREI HAUPT-KATEGORIEN:
 │                                                                          │
 │ User fliegt morgens raus, kehrt abends zurück nach Homebase.            │
 │ Egal ob Ziel Inland (HAM/MUC/STR) ODER EU-Ausland (CPH/BER/AMS/VIE):   │
-│ → Z72 mit 14€ Inland-Tagestrip-Pauschale (LH-/FollowMe-Konvention)     │
+│ → Z72 mit 14€ Inland-Tagestrip-Pauschale (LH-/branchenüblicher Konvention)     │
 │ → 1 Fahrtag, 1 Arbeitstag, 0 Hotelnächte                                │
 │ → Voraussetzung: Gesamtabwesenheit ≥ 8h (mit Briefingzeiten prüfen)    │
 │                                                                          │
@@ -91,7 +91,7 @@ DREI HAUPT-KATEGORIEN:
 
              FAUSTREGEL: Wenn 3+ aufeinanderfolgende EM/EH/D4-Tage OHNE FREI
              dazwischen, ist es FAST IMMER eine Schulung mit Hotel (Z73-Tour).
-             FollowMe-Konvention: lieber Z73 als Office annehmen wenn unsicher.
+             branchenüblicher Konvention: lieber Z73 als Office annehmen wenn unsicher.
 
   Schritt 2: Bei Tour (A/E/FL): Wo ist die Übernachtung?
              a) Z72 — Same-Day-Tagestrip — STRENGES HARD-GATE!
@@ -706,7 +706,7 @@ oder Office-Block (NICHT für FREI/Urlaub-Tage). Pro Eintrag:
   - begruendung: Kurz warum, z.B. "Same-Day → Z72" / "BLR Indien 4T → Z76"
 
 Bei ~150 AT/Jahr ergibt das ~50-80 Einträge. Pflicht. Wir nutzen das
-für Audit-Trail und Validierung gegen FollowMe.
+für Audit-Trail und interne Reference-Validierung.
 
 ═══════════════════════════════════════════════════════════════════════════
 ENDE DES WISSENS-BUCHS
