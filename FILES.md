@@ -1,6 +1,8 @@
 # AeroTax — Files & Architecture Guide
 
-**Stand:** 2026-05-09 · Version 5.0 · Build `self-reflection-audit-pdf-dsgvo-tests`
+**Stand:** 2026-05-09 · Version 6.0 · Build `structured-day-pipeline-deterministic-counts`
+
+> **DESIGN-PRINZIP ab v6.0:** Sonnet liest Dienstplan/Einsatzplan strukturiert pro Tag aus. Das Backend zählt harte Fakten wie Arbeitstage, Fahrtage und Hotelnächte deterministisch. Opus darf diese Fakten nicht ändern, sondern nur steuerlich klassifizieren.
 
 Briefing für Mit-Entwickler (Mensch oder KI). Dieses Dokument erklärt was wo liegt und warum, damit ihr ohne wochenlanges Reverse-Engineering einsteigen könnt.
 

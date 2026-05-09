@@ -236,6 +236,123 @@ def test_validate_file_categories_empty():
     assert _validate_file_categories({}) == []
 
 
+# ── v6.0 Structured-Day-Pipeline Tests ────────────────────────────────────
+
+def test_v6_inland_iata_codes():
+    """Inland-IATA-Erkennung: deutsche Flughafen-Codes."""
+    from app import _is_inland_code
+    assert _is_inland_code('FRA')
+    assert _is_inland_code('MUC')
+    assert _is_inland_code('HAM')
+    assert _is_inland_code('BER')
+    assert _is_inland_code('DUS')
+    assert _is_inland_code('CGN')
+    # Auslandscodes
+    assert not _is_inland_code('BLR')  # Indien
+    assert not _is_inland_code('JFK')  # USA
+    assert not _is_inland_code('CPH')  # Dänemark
+    assert not _is_inland_code('VIE')  # Österreich
+    # Edge: leer / None
+    assert not _is_inland_code('')
+    assert not _is_inland_code(None)
+
+
+def test_v6_count_deterministic_basic():
+    """Backend zählt Hotelnächte/Arbeitstage/Fahrtage deterministisch."""
+    from app import _count_deterministic
+    structured = {
+        'days': [
+            {'datum': '2025-01-03', 'activity_type': 'tour_start', 'overnight_after_day': True},
+            {'datum': '2025-01-04', 'activity_type': 'tour_continuation', 'overnight_after_day': True},
+            {'datum': '2025-01-05', 'activity_type': 'tour_continuation', 'overnight_after_day': True},
+            {'datum': '2025-01-06', 'activity_type': 'tour_end', 'overnight_after_day': False},
+            {'datum': '2025-01-10', 'activity_type': 'office', 'overnight_after_day': False},
+            {'datum': '2025-01-11', 'activity_type': 'same_day', 'overnight_after_day': False},
+            {'datum': '2025-01-12', 'activity_type': 'frei', 'overnight_after_day': False},
+            {'datum': '2025-01-15', 'activity_type': 'standby', 'overnight_after_day': False},
+        ]
+    }
+    counts = _count_deterministic(structured)
+    # 4-Tages-Tour = 3 Hotelnächte (an Tag 1,2,3), Tag 4 kommt heim
+    assert counts['hotel_naechte'] == 3
+    # Arbeitstage: Tour (4) + Office (1) + Same-Day (1) + Standby (1) = 7
+    assert counts['arbeitstage'] == 7
+    # Fahrtage: Tour-Start (1) + Office (1) + Same-Day (1) = 3
+    # (Tour-Continuation und Tour-End zählen nicht; Standby zuhause auch nicht)
+    assert counts['fahr_tage'] == 3
+
+
+def test_v6_count_deterministic_multi_stop_inland():
+    """Multi-Stop-Tour mit Inland- und Ausland-Layover: Hotelnächte korrekt."""
+    from app import _count_deterministic
+    structured = {
+        'days': [
+            # FRA → BER (Inland-Übernachtung) → ZAG (Ausland) → ARN (Ausland) → Heimkehr
+            {'datum': '2025-06-17', 'activity_type': 'tour_start', 'overnight_after_day': True,
+             'layover_ort': 'BER', 'layover_inland': True},
+            {'datum': '2025-06-18', 'activity_type': 'tour_continuation', 'overnight_after_day': True,
+             'layover_ort': 'ZAG', 'layover_inland': False},
+            {'datum': '2025-06-19', 'activity_type': 'tour_continuation', 'overnight_after_day': True,
+             'layover_ort': 'ARN', 'layover_inland': False},
+            {'datum': '2025-06-20', 'activity_type': 'tour_end', 'overnight_after_day': False},
+        ]
+    }
+    counts = _count_deterministic(structured)
+    # 3 Hotelnächte (BER, ZAG, ARN) — egal Inland oder Ausland, ALLE zählen
+    assert counts['hotel_naechte'] == 3
+
+
+def test_v6_validate_z72_with_overnight_impossible():
+    """Z72 darf nicht klassifiziert werden wenn overnight_after_day=true."""
+    from app import _validate_opus_against_structure
+    classifications = [{'datum': '2025-01-03', 'klass': 'Z72', 'begruendung': '...'}]
+    structured = {'days': [{'datum': '2025-01-03', 'overnight_after_day': True, 'has_fl': True,
+                             'layover_ort': 'BLR', 'layover_inland': False}]}
+    issues = _validate_opus_against_structure(classifications, structured)
+    assert any('Z72' in i and 'unmöglich' in i for i in issues)
+
+
+def test_v6_validate_z73_at_inland_layover():
+    """Z73 ist konsistent wenn layover_inland=true."""
+    from app import _validate_opus_against_structure
+    classifications = [{'datum': '2025-03-05', 'klass': 'Z73', 'begruendung': 'MUC Schulung'}]
+    structured = {'days': [{'datum': '2025-03-05', 'overnight_after_day': True, 'has_fl': True,
+                             'layover_ort': 'MUC', 'layover_inland': True}]}
+    issues = _validate_opus_against_structure(classifications, structured)
+    # Sollte keine Z73-bezogenen Issues geben (konsistent)
+    assert not any('Z73' in i for i in issues)
+
+
+def test_v6_validate_z73_at_foreign_layover_warns():
+    """Z73 bei Ausland-Layover → Warnung."""
+    from app import _validate_opus_against_structure
+    classifications = [{'datum': '2025-01-03', 'klass': 'Z73', 'begruendung': 'falsch'}]
+    structured = {'days': [{'datum': '2025-01-03', 'overnight_after_day': True, 'has_fl': True,
+                             'layover_ort': 'BLR', 'layover_inland': False}]}
+    issues = _validate_opus_against_structure(classifications, structured)
+    assert any('Z73' in i and 'prüfen' in i for i in issues)
+
+
+def test_v6_validate_z76_at_inland_layover_warns():
+    """Z76 bei Inland-Layover → Warnung."""
+    from app import _validate_opus_against_structure
+    classifications = [{'datum': '2025-03-05', 'klass': 'Z76', 'begruendung': 'falsch'}]
+    structured = {'days': [{'datum': '2025-03-05', 'overnight_after_day': True, 'has_fl': True,
+                             'layover_ort': 'MUC', 'layover_inland': True}]}
+    issues = _validate_opus_against_structure(classifications, structured)
+    assert any('Z76' in i and 'prüfen' in i for i in issues)
+
+
+def test_v6_validate_z73_without_overnight_warns():
+    """Z73/Z76 ohne Übernachtung → Issue."""
+    from app import _validate_opus_against_structure
+    classifications = [{'datum': '2025-01-11', 'klass': 'Z73', 'begruendung': 'falsch'}]
+    structured = {'days': [{'datum': '2025-01-11', 'overnight_after_day': False, 'has_fl': False,
+                             'layover_ort': '', 'layover_inland': None}]}
+    issues = _validate_opus_against_structure(classifications, structured)
+    assert any('ohne Übernachtung' in i for i in issues)
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

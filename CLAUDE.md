@@ -1,5 +1,11 @@
 # AeroTax Backend — Arbeitsweise
 
+## Architektur-Grundsatz (v6.0)
+
+> **Sonnet liest Dienstplan/Einsatzplan strukturiert pro Tag aus. Das Backend zählt harte Fakten wie Arbeitstage, Fahrtage und Hotelnächte deterministisch. Opus darf diese Fakten nicht ändern, sondern nur steuerlich klassifizieren.**
+
+Konkret: `_sonnet_read_dp_structured()` → `_count_deterministic()` → `_opus_classify_structured_days_v6()` → `_validate_opus_against_structure()`. Bei Crash der v6.0-Pipeline: Fallback auf v5.7-Pfad (`_opus_classify_days_v2`). Disable-Flag: `AEROTAX_DISABLE_V6=1`.
+
 ## Autonomie-Modus
 
 Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
