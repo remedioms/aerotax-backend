@@ -1091,6 +1091,198 @@ def test_v8_health_endpoint_format():
     assert data['version'].startswith('8.')
 
 
+# ── v8.1 Tests: DP-Schema-Erweiterung, requires_commute, Z72-Dauer ──
+
+def test_v81_dp_enrichment_requires_commute_for_office():
+    """Office am Homebase ohne Übernachtung → requires_commute=true."""
+    from app import _enrich_dp_with_v8_fields
+    dp = {'datum': '2025-01-15', 'activity_type': 'office', 'overnight_after_day': False}
+    _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA')
+    assert dp['requires_commute'] is True
+    assert dp['is_workday'] is True
+    assert dp['starts_at_homebase'] is True
+    assert dp['ends_at_homebase'] is True
+
+
+def test_v81_dp_enrichment_no_commute_for_layover():
+    """Tour-Layover-Tag → requires_commute=false (kein Weg zur Homebase)."""
+    from app import _enrich_dp_with_v8_fields
+    prev_dp = {'datum': '2025-01-14', 'activity_type': 'tour', 'overnight_after_day': True}
+    dp = {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': True,
+          'routing': ['BLR']}
+    _enrich_dp_with_v8_fields(dp, prev_dp=prev_dp, next_dp=None, homebase='FRA')
+    assert dp['requires_commute'] is False
+    assert dp['is_workday'] is True
+    assert dp['starts_at_homebase'] is False
+    assert dp['ends_at_homebase'] is False
+
+
+def test_v81_dp_enrichment_no_commute_for_standby():
+    """Standby zuhause → requires_commute=false."""
+    from app import _enrich_dp_with_v8_fields
+    dp = {'datum': '2025-01-15', 'activity_type': 'standby', 'overnight_after_day': False}
+    _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA')
+    assert dp['requires_commute'] is False
+    assert dp['is_workday'] is True
+
+
+def test_v81_dp_enrichment_no_commute_for_frei():
+    """Frei → requires_commute=false, is_workday=false."""
+    from app import _enrich_dp_with_v8_fields
+    dp = {'datum': '2025-01-15', 'activity_type': 'frei', 'overnight_after_day': False}
+    _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA')
+    assert dp['requires_commute'] is False
+    assert dp['is_workday'] is False
+
+
+def test_v81_dp_enrichment_tour_anreise_commute():
+    """Tour-Anreise ab Homebase → requires_commute=true."""
+    from app import _enrich_dp_with_v8_fields
+    dp = {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': True,
+          'routing': ['FRA', 'BLR'], 'has_fl': True}
+    _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA')
+    assert dp['starts_at_homebase'] is True
+    assert dp['requires_commute'] is True
+    # Layover heute → ends_at_homebase=false
+    assert dp['ends_at_homebase'] is False
+
+
+def test_v81_dp_enrichment_heimkehrtag_no_commute():
+    """Heimkehrtag (BLR→FRA) → starts_at_homebase=false (Dienst beginnt auswärts),
+    ends_at_homebase=true, requires_commute=false."""
+    from app import _enrich_dp_with_v8_fields
+    prev_dp = {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': True,
+               'layover_ort': 'BLR'}
+    dp = {'datum': '2025-01-16', 'activity_type': 'tour', 'overnight_after_day': False,
+          'routing': ['BLR', 'FRA']}
+    _enrich_dp_with_v8_fields(dp, prev_dp=prev_dp, next_dp=None, homebase='FRA')
+    assert dp['starts_at_homebase'] is False
+    assert dp['ends_at_homebase'] is True
+    assert dp['requires_commute'] is False  # keine NEUE Anfahrt
+
+
+def test_v81_dp_enrichment_does_not_overwrite_sonnet_values():
+    """Wenn Sonnet die Felder bereits gesetzt hat, NICHT überschreiben."""
+    from app import _enrich_dp_with_v8_fields
+    dp = {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': True,
+          'requires_commute': False, 'starts_at_homebase': False, 'is_workday': True}
+    _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA')
+    # Heuristik würde requires_commute=True für Tour-Anreise schätzen — aber Sonnet hat False gesetzt.
+    assert dp['requires_commute'] is False
+    assert dp['starts_at_homebase'] is False
+
+
+def test_v81_duty_duration_calculated_from_times():
+    """duty_duration_minutes wird aus start_time/end_time berechnet wenn fehlt."""
+    from app import _enrich_dp_with_v8_fields
+    dp = {'datum': '2025-01-15', 'activity_type': 'same_day',
+          'overnight_after_day': False, 'start_time': '06:30', 'end_time': '15:00'}
+    _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA')
+    # 6:30 → 15:00 = 8h 30min = 510min
+    assert dp['duty_duration_minutes'] == 510
+
+
+def test_v81_duty_duration_handles_overnight_times():
+    """Bei Tour über Mitternacht: 22:00 → 02:00 = 4h."""
+    from app import _enrich_dp_with_v8_fields
+    dp = {'datum': '2025-01-15', 'activity_type': 'tour',
+          'overnight_after_day': True, 'start_time': '22:00', 'end_time': '02:00'}
+    _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA')
+    assert dp['duty_duration_minutes'] == 240
+
+
+def test_v81_z72_duration_zero_day_when_under_8h():
+    """Same-Day < 8h ohne Fahrzeit-Plus → ZeroDay."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-15', 'activity_type': 'same_day', 'overnight_after_day': False,
+         'has_fl': False, 'start_time': '08:00', 'end_time': '14:00'},  # 6h
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=0)
+    detail = [d for d in result['tage_detail'] if d['datum'] == '2025-01-15']
+    assert detail and detail[0]['klass'] == 'ZeroDay', \
+        f"6h Dienst ohne Fahrzeit → ZeroDay, ist {detail[0]['klass'] if detail else 'fehlt'}"
+    assert result['z72_tage'] == 0
+
+
+def test_v81_z72_duration_with_commute_above_8h():
+    """Same-Day 7h Dienst + 2× 35min Fahrzeit = 8h 10min → Z72."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-15', 'activity_type': 'same_day', 'overnight_after_day': False,
+         'has_fl': False, 'start_time': '08:00', 'end_time': '15:00'},  # 7h
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=35)
+    detail = [d for d in result['tage_detail'] if d['datum'] == '2025-01-15']
+    # 7h Dienst + 70min Fahrzeit = 8h 10min ≥ 8h → Z72
+    assert detail and detail[0]['klass'] == 'Z72', \
+        f"7h+70min Fahrzeit sollte Z72 sein, ist {detail[0]['klass'] if detail else 'fehlt'}"
+
+
+def test_v81_z72_no_duration_falls_back_to_z72():
+    """Same-Day ohne Zeitinfo → konservativ Z72 (alte Heuristik)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-15', 'activity_type': 'same_day', 'overnight_after_day': False,
+         'has_fl': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=0)
+    assert result['z72_tage'] == 1
+
+
+def test_v81_fahrtage_from_requires_commute():
+    """Fahrtage werden aus dp.requires_commute aggregiert.
+    Office (commute=true) + Standby (commute=false) → 1 Fahrtag."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-10', 'activity_type': 'office', 'overnight_after_day': False},
+        {'datum': '2025-01-11', 'activity_type': 'standby', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=0)
+    assert result['arbeitstage'] == 2  # Office + Standby
+    assert result['fahr_tage'] == 1    # nur Office
+
+
+def test_v81_dp_schema_has_commute_fields():
+    """DP-Schema enthält die neuen v8-Felder."""
+    import inspect
+    from app import _sonnet_read_dp_structured
+    src = inspect.getsource(_sonnet_read_dp_structured)
+    for field in ('starts_at_homebase', 'ends_at_homebase', 'is_workday',
+                  'requires_commute', 'start_time', 'end_time',
+                  'duty_duration_minutes', 'raw_marker', 'raw_lines'):
+        assert field in src, f"Feld '{field}' fehlt im DP-Reader-Schema/Prompt"
+
+
+def test_v81_layover_does_not_count_as_fahrtag():
+    """Layover-Tag (3-Tages-Auslandstour) erzeugt 1 Anreise + 1 Heimkehr-Fahrtag,
+    nicht 3 Fahrtage."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-13', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-14', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'BLR'},
+        {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['BLR', 'FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-13', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-14', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-15', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=0)
+    # 1 Anreise (commute=true) + 1 Heimkehr (ends_at_homebase + prev_overnight)
+    # = 2 Fahrtage. NICHT 3.
+    assert result['fahr_tage'] == 2, \
+        f"3-Tages-Tour sollte 2 Fahrtage haben (An + Heimkehr), ist {result['fahr_tage']}"
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

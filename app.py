@@ -5330,6 +5330,16 @@ def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes=None, year=2025, homebase
                             'overnight_after_day': {'type': 'boolean', 'description': 'KRITISCH: User schläft NACH diesem Tag auswärts (Hotel)? True bei FL/Tour-Layover. False bei Same-Day/FREI/Standby/Heimkehr.'},
                             'layover_ort': {'type': 'string', 'description': 'IATA wo User heute Nacht schläft, leer wenn zuhause'},
                             'layover_inland': {'type': 'boolean', 'description': 'true=Inland (FRA/MUC/HAM/DUS/STR/CGN/HAJ/BER/LEJ/NUE/BRE), false=Ausland, weglassen wenn keine Übernachtung'},
+                            # ── v8.1: Commute-/Workday-/Dauer-Felder ──
+                            'starts_at_homebase': {'type': 'boolean', 'description': 'true wenn Dienst/Routing am Homebase BEGINNT (Tour-Anreise, Same-Day-Start, Office, Training-Anreise). false bei Tourfortsetzung/Layover-Tag.'},
+                            'ends_at_homebase': {'type': 'boolean', 'description': 'true wenn Dienst/Routing am Homebase ENDET (Heimkehr, Same-Day-Ende, Office). false bei Layover-Tag/auswärtiger Übernachtung.'},
+                            'is_workday': {'type': 'boolean', 'description': 'true bei tour/same_day/office/training/standby. false bei frei/urlaub/krank/LM-Nachgewährung/unknown ohne Dienstkontext.'},
+                            'requires_commute': {'type': 'boolean', 'description': 'true NUR wenn der User HEUTE neu von zuhause zur Homebase fährt: Tourstart ab Homebase, Same-Day ab Homebase, Office/Training an Homebase. false bei Layover-Tag, Tourfortsetzung, Heimkehrtag ohne neue Anfahrt, Standby zuhause, frei/urlaub/krank.'},
+                            'start_time': {'type': 'string', 'description': 'HH:MM Dienstbeginn (z.B. "06:30"), leer wenn nicht im DP'},
+                            'end_time': {'type': 'string', 'description': 'HH:MM Dienstende (z.B. "18:45"), leer wenn nicht im DP'},
+                            'duty_duration_minutes': {'type': 'integer', 'description': 'Dienstdauer in Minuten (start→end), nur setzen wenn beide Zeiten erkennbar sind. Bei Tour über Mitternacht: bis Mitternacht.'},
+                            'raw_marker': {'type': 'string', 'description': 'Roher Marker-String wie im DP (max 30 Zeichen), z.B. "FL738 FRA-DUB"'},
+                            'raw_lines': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Rohe Zeilen aus dem DP für diesen Tag (max 3 Zeilen, jeweils max 80 Zeichen) — nur bei Unsicherheit oder Same-Day befüllen.'},
                             'confidence': {'type': 'number', 'description': '0-1 wie sicher'},
                             'notes': {'type': 'string', 'description': 'Optionaler Kurzhinweis bei Unsicherheit (max 60 Zeichen)'},
                         }
@@ -5413,6 +5423,56 @@ EMPFOHLEN: routing, has_fl, overnight_after_day, layover_ort, layover_inland
   FRA, MUC, HAM, DUS, STR, CGN, HAJ, BER, TXL, SXF, LEJ, NUE, BRE,
   FMO, PAD, NRN, FKB, HHN, SCN, DRS, ERF, FDH, RLG, KSF.
   FALSE bei Auslandscodes. Weglassen wenn keine Übernachtung.
+
+═════ COMMUTE-/WORKDAY-FELDER (v8) ═════════════════════════════════════════
+
+▸ starts_at_homebase: TRUE wenn der DIENST HEUTE am Homebase ({homebase}) beginnt.
+  • Tour-Anreise (FRA→BLR): true
+  • Same-Day (FRA→TXL→FRA): true
+  • Office/Training am Homebase: true
+  • Layover-Tag (BLR→BLR oder BLR→TYO): false
+  • Tourfortsetzung von Vortag-Layover: false
+  • Heimkehrtag (BLR→FRA aus Layover): false (Dienst beginnt auswärts)
+
+▸ ends_at_homebase: TRUE wenn der DIENST HEUTE am Homebase ({homebase}) endet.
+  • Same-Day: true
+  • Heimkehrtag (BLR→FRA): true
+  • Office/Training ohne Übernachtung: true
+  • Layover-Tag mit auswärtiger Übernachtung: false
+  • Tour-Anreise ohne Heimkehr: false
+
+▸ is_workday: TRUE bei echtem Dienst:
+  tour, same_day, office, training, standby = TRUE
+  frei, urlaub, krank, LM-Nachgewährung = FALSE
+  unknown ohne Dienstkontext = FALSE
+
+▸ requires_commute: TRUE wenn User HEUTE neu von zuhause zur Homebase fährt.
+  Das ist eine STRENGERE Bedingung als is_workday — viele Workdays haben
+  KEIN requires_commute (Layover-Tag, Tourfortsetzung, Standby zuhause).
+  • Tour-Anreise ab Homebase: TRUE (Heimfahrt → Homebase)
+  • Same-Day ab Homebase: TRUE
+  • Office/Training an Homebase: TRUE
+  • Layover-Tag (auswärts schlafen): FALSE
+  • Tourfortsetzung mitten in Tour: FALSE
+  • Heimkehrtag ohne neue Anfahrt: FALSE
+  • Standby zuhause (kein Weg zur Homebase): FALSE
+  • Frei/Urlaub/Krank: FALSE
+  Faustregel: requires_commute = starts_at_homebase = "Tag beginnt mit
+  Anfahrt von zuhause".
+
+▸ start_time / end_time: Dienstbeginn/-ende im DP, falls erkennbar (HH:MM).
+  Bei Mehrtagestour: pro Tag die heutige Briefing-/Off-Duty-Zeit.
+
+▸ duty_duration_minutes: Minuten zwischen start_time und end_time. Nur setzen
+  wenn beide Zeiten klar im DP stehen. Bei Tagen über Mitternacht: bis 23:59.
+  Wichtig für Z72-Plausibilisierung: Dienst >480min (8h) ohne Übernachtung.
+
+▸ raw_marker: Originaler Marker-String aus dem DP (max 30 Zeichen).
+  Beispiele: "FL738 FRA-DUB", "EH FRA", "SBY", "F".
+
+▸ raw_lines: 1-3 rohe Zeilen aus dem DP für diesen Tag (max 80 Zeichen je
+  Zeile). NUR befüllen bei: Same-Day-Tag, unklarer Klassifikation,
+  ungewöhnlichem Marker. Nicht für offensichtliche Tour-/FL-/Frei-Tage.
 
 ═════ MULTI-STOP-TOUREN — JEDEN TAG EINZELN ═══════════════════════════════════
 
@@ -6077,14 +6137,30 @@ LIEFERE jetzt via Tool die strukturierten SE-Zeilen."""
 # deterministisch. Opus nur für unklare Edge-Cases.
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _match_dp_se_per_day(structured_days, se_structured):
+def _match_dp_se_per_day(structured_days, se_structured, homebase='FRA'):
     """Matcht DP-Tagesdaten + SE-Zeilen pro Kalendertag.
     Liefert Liste von matched_days mit dp + se + initial_klass + needs_opus.
     Storno-SE-Zeilen werden gefiltert.
+
+    v8.1: DP-Tage werden mit Heuristik-Felder (requires_commute,
+    is_workday, starts_at_homebase, ends_at_homebase) angereichert,
+    falls Sonnet sie nicht geliefert hat.
     """
     if not structured_days or not structured_days.get('days'):
         return []
-    dp_days = structured_days['days']
+    dp_days = list(structured_days['days'])
+    # Sortiert nach Datum für prev/next-Lookups bei Heuristik
+    dp_days_sorted = sorted(dp_days, key=lambda d: d.get('datum', ''))
+    # v8.1: Anreicherung mit prev/next-Kontext
+    for i, d in enumerate(dp_days_sorted):
+        prev_d = dp_days_sorted[i-1] if i > 0 else None
+        next_d = dp_days_sorted[i+1] if i+1 < len(dp_days_sorted) else None
+        _enrich_dp_with_v8_fields(d, prev_d, next_d, homebase)
+        print(f"[v8-dp-detail] datum={d.get('datum','')} activity={d.get('activity_type','')} "
+              f"start_homebase={d.get('starts_at_homebase')} end_homebase={d.get('ends_at_homebase')} "
+              f"requires_commute={d.get('requires_commute')} is_workday={d.get('is_workday')} "
+              f"start={d.get('start_time') or '-'} end={d.get('end_time') or '-'}")
+
     # SE: Datum → liste aktive Zeilen (Storno gefiltert)
     se_by_date = {}
     if se_structured and se_structured.get('se_lines'):
@@ -6097,14 +6173,12 @@ def _match_dp_se_per_day(structured_days, se_structured):
             se_by_date.setdefault(datum, []).append(s)
 
     matched = []
-    for d in dp_days:
+    for d in dp_days_sorted:
         datum = d.get('datum')
         if not datum:
             continue
         se_for_day = se_by_date.get(datum, [])
-        # Aggregate SE-Daten für diesen Tag (mehrere Zeilen pro Tag möglich)
         stfrei_total = sum(float(s.get('stfrei_betrag', 0) or 0) for s in se_for_day)
-        # Dominanten stfrei_ort: höchster Betrag
         if se_for_day:
             best = max(se_for_day, key=lambda s: float(s.get('stfrei_betrag', 0) or 0))
             stfrei_ort = best.get('stfrei_ort', '')
@@ -6364,8 +6438,102 @@ def _document_health_check(lsb_data, se_structured, structured_days, year):
     return {'status': status, 'issues': issues, 'sources': sources}
 
 
-def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
-    """v7.5 Backend-Klassifikator: deterministisch aus DP+SE pro Tag.
+def _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA'):
+    """v8.1: Heuristik-Fallback für DP-Felder, falls Sonnet sie nicht liefert.
+    Setzt requires_commute, is_workday, starts_at_homebase, ends_at_homebase
+    aus activity_type + routing + has_fl + overnight_after_day.
+
+    NICHT überschreiben wenn Sonnet das Feld bereits gesetzt hat.
+    """
+    at = dp.get('activity_type', 'unknown')
+    overnight = bool(dp.get('overnight_after_day'))
+    prev_overnight = bool(prev_dp and prev_dp.get('overnight_after_day'))
+    has_fl = bool(dp.get('has_fl'))
+    routing = dp.get('routing') or []
+    routing_upper = [r.upper() for r in routing if r]
+    homebase_upper = (homebase or 'FRA').upper()
+
+    # is_workday
+    if 'is_workday' not in dp:
+        if at in ('tour', 'same_day', 'office', 'training', 'standby'):
+            dp['is_workday'] = True
+        elif at in ('frei', 'urlaub', 'krank'):
+            dp['is_workday'] = False
+        else:
+            dp['is_workday'] = False  # unknown ohne Dienstkontext
+
+    # starts_at_homebase
+    if 'starts_at_homebase' not in dp:
+        if at in ('frei', 'urlaub', 'krank', 'standby'):
+            dp['starts_at_homebase'] = False  # kein Routing
+        elif at in ('office', 'training') and not prev_overnight:
+            dp['starts_at_homebase'] = True
+        elif at == 'same_day':
+            dp['starts_at_homebase'] = True  # Same-Day startet immer ab Homebase
+        elif at == 'tour':
+            # Tour-Anreise: prev nicht overnight + Routing beginnt am Homebase
+            if not prev_overnight:
+                if not routing_upper or routing_upper[0] == homebase_upper:
+                    dp['starts_at_homebase'] = True
+                else:
+                    dp['starts_at_homebase'] = False
+            else:
+                dp['starts_at_homebase'] = False  # Tourfortsetzung
+        else:
+            dp['starts_at_homebase'] = False
+
+    # ends_at_homebase
+    if 'ends_at_homebase' not in dp:
+        if at in ('frei', 'urlaub', 'krank', 'standby'):
+            dp['ends_at_homebase'] = False
+        elif at in ('office', 'training') and not overnight:
+            dp['ends_at_homebase'] = True
+        elif at == 'same_day':
+            dp['ends_at_homebase'] = True
+        elif at == 'tour':
+            if not overnight:
+                # Heimkehrtag oder Same-Day-Tour-Bein
+                if not routing_upper or routing_upper[-1] == homebase_upper:
+                    dp['ends_at_homebase'] = True
+                else:
+                    dp['ends_at_homebase'] = False
+            else:
+                dp['ends_at_homebase'] = False  # Layover
+        else:
+            dp['ends_at_homebase'] = False
+
+    # requires_commute (strenger als is_workday)
+    if 'requires_commute' not in dp:
+        # NUR wenn der Dienst HEUTE NEU von zuhause zur Homebase startet
+        if dp.get('is_workday') and dp.get('starts_at_homebase'):
+            # Standby zuhause = KEIN commute (kein Weg zur Homebase)
+            if at == 'standby':
+                dp['requires_commute'] = False
+            else:
+                dp['requires_commute'] = True
+        else:
+            dp['requires_commute'] = False
+
+    # duty_duration_minutes (ableiten aus start_time/end_time wenn nicht da)
+    if 'duty_duration_minutes' not in dp or not dp.get('duty_duration_minutes'):
+        st = dp.get('start_time', '')
+        et = dp.get('end_time', '')
+        if st and et and ':' in st and ':' in et:
+            try:
+                sh, sm = int(st.split(':')[0]), int(st.split(':')[1])
+                eh, em = int(et.split(':')[0]), int(et.split(':')[1])
+                duration = (eh * 60 + em) - (sh * 60 + sm)
+                if duration < 0:
+                    duration += 24 * 60  # über Mitternacht
+                dp['duty_duration_minutes'] = duration
+            except (ValueError, IndexError):
+                pass
+
+    return dp
+
+
+def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_minutes=0):
+    """v8.1 Backend-Klassifikator: deterministisch aus DP+SE pro Tag.
 
     Architektur (v7.5):
     1. Tour-Cluster bilden (Phase 1: tour-Tage; Phase 2: Heimkehr-Anhang)
@@ -6555,9 +6723,28 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
                 eur_added = INLAND_AN_ABREISE
                 reason = 'Same-Day im Inland-Cluster (Z73 An/Ab)'
             else:
-                klass = 'Z72'
-                eur_added = INLAND_TAGESTRIP_8H
-                reason = 'Same-Day-Tagestrip — A+E selber Tag, kein FL'
+                # v8.1: Dauer-Plausibilisierung. Z72 nur wenn Dienst+Fahrzeit ≥ 8h.
+                # Wenn duty_duration_minutes vorhanden: + 2× commute (Hin+Zurück)
+                # = total_minutes. Wenn ≥ 480 → Z72. Sonst → ZeroDay (kein VMA).
+                duty_min = int(d.get('duty_duration_minutes') or 0)
+                # Fahrzeit hin + zurück
+                commute_total = (commute_minutes * 2) if commute_minutes > 0 else 0
+                total_min = duty_min + commute_total
+                if duty_min == 0:
+                    # Keine Zeitinfo im DP — konservativ Z72 annehmen (alte Logik)
+                    klass = 'Z72'
+                    eur_added = INLAND_TAGESTRIP_8H
+                    reason = 'Same-Day-Tagestrip (Dauer unbekannt, konservativ Z72)'
+                    print(f"[v8-z72-duration] datum={datum} duty_minutes=0 commute_minutes={commute_total} total=? counted=Z72-konservativ")
+                elif total_min >= 480:
+                    klass = 'Z72'
+                    eur_added = INLAND_TAGESTRIP_8H
+                    reason = f'Same-Day Z72 — Dienst {duty_min}min + Fahrzeit {commute_total}min = {total_min}min ≥ 480min'
+                    print(f"[v8-z72-duration] datum={datum} duty_minutes={duty_min} commute_minutes={commute_total} total={total_min} counted=Z72")
+                else:
+                    klass = 'ZeroDay'
+                    reason = f'Same-Day < 8h (Dienst {duty_min}min + Fahrzeit {commute_total}min = {total_min}min) — kein VMA'
+                    print(f"[v8-z72-duration] datum={datum} duty_minutes={duty_min} commute_minutes={commute_total} total={total_min} counted=ZeroDay")
 
         elif at == 'tour':
             cluster = cluster_for_idx.get(i)
@@ -6777,22 +6964,36 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
     ARBEITS_KLASSEN = {'Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby', 'ZeroDay'}
     arbeitstage = sum(1 for t in tage_detail if t['klass'] in ARBEITS_KLASSEN)
 
-    # Fahrtage: Same-Day-Z72/Office/Office-after-training/Z73-An-Abreise/Z76-An-Abreise
-    # Heuristik: Tag mit Klassifikation, der Anreise/Abreise impliziert ODER Office
-    FAHR_KLASSEN = {'Z72', 'Office'}
-    fahr_tage = sum(1 for t in tage_detail if t['klass'] in FAHR_KLASSEN)
-    # Plus: Z73/Z76 An-/Abreise-Tage (1 pro Cluster-Beginn + 1 pro Cluster-Ende)
-    for c in tour_clusters:
-        if not c.get('indices'):
+    # Fahrtage v8.1: aus dp.requires_commute aggregieren (nicht aus klass-Map).
+    # requires_commute=true nur bei: Tourstart ab Homebase, Same-Day, Office/Training
+    # an Homebase. Layover-Tage, Tourfortsetzung, Heimkehr, Standby zählen nicht.
+    # ZUSÄTZLICH: Heimkehr-Tage (ends_at_homebase=true UND prev_overnight) zählen
+    # als Fahrtag — der User fährt vom Flughafen heim.
+    fahr_tage = 0
+    fahr_skipped = []
+    for i, m in enumerate(sorted_days):
+        d = m['dp']
+        datum = m['datum']
+        # Heimkehr-Erkennung: ends_at_homebase + Vortag-overnight + heute kein overnight
+        prev_d = sorted_days[i-1]['dp'] if i > 0 else None
+        is_heimkehr_fahrt = (
+            d.get('ends_at_homebase') and
+            prev_d and prev_d.get('overnight_after_day') and
+            not d.get('overnight_after_day')
+        )
+        klass_today = tage_detail[i]['klass'] if i < len(tage_detail) else 'Issue'
+        # Frei/Urlaub/Krank/Issue zählen nie als Fahrtag
+        if klass_today in ('Frei', 'Issue'):
+            fahr_skipped.append(f'{datum}:{klass_today}')
             continue
-        first = c['indices'][0]
-        last = c['indices'][-1]
-        # Anreise zählt als Fahrtag
-        if 0 <= first < len(tage_detail) and tage_detail[first]['klass'] in ('Z73', 'Z74', 'Z76'):
+        if d.get('requires_commute'):
             fahr_tage += 1
-        # Abreise zählt als Fahrtag (wenn unterschiedlich vom Anreise-Tag)
-        if last != first and 0 <= last < len(tage_detail) and tage_detail[last]['klass'] in ('Z73', 'Z74', 'Z76'):
+            print(f"[v8-fahrtage-detail] datum={datum} counted=True reason='requires_commute=true ({d.get('activity_type','')})'")
+        elif is_heimkehr_fahrt:
             fahr_tage += 1
+            print(f"[v8-fahrtage-detail] datum={datum} counted=True reason='Heimkehr-Fahrt nach Layover'")
+        else:
+            fahr_skipped.append(f'{datum}:no_commute')
 
     # Hotel-Nächte: nur Tage mit overnight=true UND klass in Cluster-Hotel-Klassen
     HOTEL_KLASSEN = {'Z73', 'Z74', 'Z76'}
@@ -7601,12 +7802,14 @@ def hybrid_analyze(form, files):
                     print(f"[v8-health] Status RED — Berechnung gestoppt: {red_reasons}")
                 else:
                     # Schritt 4: Backend matcht DP+SE pro Datum
-                    matched = _match_dp_se_per_day(structured_days, se_structured)
+                    matched = _match_dp_se_per_day(structured_days, se_structured, homebase)
                     print(f"[v8] Matched {len(matched)} Tage (DP+SE pro Datum)")
                     gc.collect()
                     _release_memory_to_os()
                     # Schritt 5: Deterministische Klassifikation
-                    classification = _deterministic_classify_v7(matched, year, homebase)
+                    commute_min = int(form.get('anfahrt_min', 0) or 0)
+                    classification = _deterministic_classify_v7(matched, year, homebase,
+                                                                 commute_minutes=commute_min)
                     classification['_v7_used'] = True
                     classification['_document_health'] = document_health
             else:
