@@ -664,12 +664,14 @@ _AVG_JOB_SECONDS = 150
 def _get_queue_position(job_id):
     """Gibt die 1-basierte Queue-Position zurück. 1 = wird gerade gerechnet bzw als Nächstes.
     None wenn nicht in Queue (vermutlich schon fertig oder läuft gerade).
+    Atomar gegen race conditions: wir snapshoten beide Werte unter Lock.
     """
-    global _calc_running_id
-    snap = list(_calc_queue.queue)
-    if _calc_running_id == job_id:
-        return 1  # läuft gerade
-    pos = 1 if _calc_running_id else 0
+    with _jobs_lock:
+        running = _calc_running_id
+        snap = list(_calc_queue.queue)
+    if running == job_id:
+        return 1
+    pos = 1 if running else 0
     for entry in snap:
         if entry[0] == job_id:
             return pos + 1
@@ -710,6 +712,29 @@ def _start_calc_worker():
     _t = __import__('threading').Thread(target=_calc_worker, daemon=True, name='calc-worker')
     _t.start()
     print("[queue] Worker-Thread gestartet")
+    # Bei Restart: laufende/queued Jobs auf Disk → als 'failed' markieren
+    # (Files sind nach Restart eh weg aus _store, kann also nicht weiter rechnen)
+    # User kriegt Token-Fail-Pfad und kann mit Code neu starten.
+    try:
+        for fn in os.listdir(_JOBS_DIR):
+            if not fn.endswith('.json'): continue
+            try:
+                with open(os.path.join(_JOBS_DIR, fn)) as _f:
+                    j = json.load(_f)
+                if j.get('status') in ('queued', 'pending', 'running'):
+                    j['status'] = 'failed'
+                    j['error']  = 'Server wurde neugestartet während die Auswertung lief. Bitte mit deinem Code (AT-...) erneut starten — keine erneute Zahlung nötig.'
+                    j['restart_recovered'] = True
+                    job_id = fn[:-5]
+                    with _jobs_lock:
+                        _jobs[job_id] = j
+                    with open(os.path.join(_JOBS_DIR, fn), 'w') as _wf:
+                        json.dump(j, _wf, default=str)
+                    print(f"[queue] Restart-Recovery: Job {job_id[:8]} auf 'failed' gesetzt")
+            except Exception as _re:
+                print(f"[queue] Restart-Recovery fail für {fn}: {_re}")
+    except Exception as _e:
+        print(f"[queue] Restart-Recovery konnte JOBS_DIR nicht lesen: {_e}")
 
 
 # Worker beim App-Init starten (bei Render-Worker-Start)
@@ -909,25 +934,27 @@ def process_real():
                 for k, ts in list(_consumed_payment_intents.items()):
                     if ts < cutoff_pi:
                         _consumed_payment_intents.pop(k, None)
-        # Status: 'queued' wenn aktuell schon eine Auswertung läuft, sonst 'pending'
-        initial_status = 'queued' if _calc_running_id else 'pending'
+        # Tentative Status — wird nach Put auf Basis echter Position korrigiert
         with _jobs_lock:
             _jobs[job_id] = {
-                'status':   initial_status,
+                'status':   'pending',  # vorläufig, wird gleich aktualisiert
                 'progress': 0,
                 'created':  datetime.utcnow().isoformat() + 'Z',
                 'session_token': session_token,
             }
-        # SOFORT auf Disk persistieren — falls Worker zwischen create und ersten Poll restartet
-        _save_job_to_disk(job_id)
-        # ref/pi_id ans form-dict heften — für späteren Cleanup
+        # ref/pi_id ans form-dict heften
         form['ref'] = ref or ''
         form['pi_id'] = pi_id or ''
         _audit(job_id, 'job_created', {'year': form['year'], 'base': form['base'], 'files': {k: len(v) for k, v in files.items()}})
 
-        # In Warteschlange einreihen statt direktem Thread-Spawn — verhindert OOM bei parallelen Usern
+        # In Warteschlange einreihen statt direktem Thread-Spawn
         _calc_queue.put((job_id, form, files))
         queue_pos = _get_queue_position(job_id) or 1
+        # Echten Status anhand Position setzen
+        initial_status = 'queued' if queue_pos > 1 else 'pending'
+        with _jobs_lock:
+            _jobs[job_id]['status'] = initial_status
+        _save_job_to_disk(job_id)
 
         return jsonify({
             'job_id': job_id,
@@ -2165,8 +2192,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '2.4',
-        'build':   'queue-and-mem-opt-2026-05-09',
+        'version': '2.5',
+        'build':   'queue-fixes-restart-recovery-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -3609,9 +3636,10 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
         if not tool_input:
             raise RuntimeError('Sonnet-DP tool_use lieferte keine input')
         print(f"Sonnet-DP tool_use OK: {elapsed:.1f}s, fields={list(tool_input.keys())}")
-        # Bauen wir full_text zusammen damit nachgelagerte JSON-Extraktion (brace-counter) funktioniert
+        # full_text für nachgelagerte JSON-Extraktion (brace-counter) — nachweis nur einmal
         import json as _json
-        full_text = _json.dumps(tool_input, ensure_ascii=False) + '\n\n' + (tool_input.get('nachweis') or nachweis_text or '')
+        tool_input_for_text = {k: v for k, v in tool_input.items() if k != 'nachweis'}
+        full_text = _json.dumps(tool_input_for_text, ensure_ascii=False) + '\n\n' + (tool_input.get('nachweis') or nachweis_text or '')
 
         # ── JSON robust extrahieren via brace-counter ──
         # Sucht nach ALLEN balanced {...} Blöcken im Text und nimmt den der "fahrtage" enthält.
@@ -5897,23 +5925,26 @@ def erstelle_pdf(d):
                     is_image = (is_heic or fb[:3]==b'\xff\xd8\xff' or fb[:4]==b'\x89PNG' or
                                 fb[:6]==b'GIF87a' or fb[:6]==b'GIF89a' or fb[8:12]==b'WEBP')
                     if is_image and PIL_AVAILABLE:
+                        src_img = None
                         try:
                             from PIL import Image as PILImage
                             src_img = PILImage.open(io.BytesIO(fb))
-                            # Auf max 1500px Längste-Kante runterskalieren (PDF-Output bleibt scharf)
                             max_dim = 1500
                             if max(src_img.size) > max_dim:
                                 ratio = max_dim / max(src_img.size)
                                 new_size = (int(src_img.size[0]*ratio), int(src_img.size[1]*ratio))
                                 src_img = src_img.resize(new_size, PILImage.LANCZOS)
-                                print(f"[img-scale] {b.get('name','?')}: {fb_item[1] if isinstance(fb_item,tuple) else 'img'} → {new_size[0]}×{new_size[1]}")
+                                print(f"[img-scale] {b.get('name','?')}: → {new_size[0]}×{new_size[1]}")
                             buf_jpg = io.BytesIO()
                             src_img.convert('RGB').save(buf_jpg, format='JPEG', quality=82, optimize=True)
                             fb = buf_jpg.getvalue()
-                            # Source-Image freigeben
-                            src_img.close()
                         except Exception as _hc:
                             print(f"[img-scale] fail: {_hc}")
+                        finally:
+                            try:
+                                if src_img is not None:
+                                    src_img.close()
+                            except: pass
                     if fb[:3]==b'\xff\xd8\xff' or fb[:4]==b'\x89PNG' or fb[:6]==b'GIF87a' or fb[:6]==b'GIF89a' or fb[8:12]==b'WEBP':
                         img = RLImage(io.BytesIO(fb))
                         iw,ih = img.drawWidth,img.drawHeight
