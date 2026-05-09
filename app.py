@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '6.0.7',
-        'build':   'tuple-defensive-normalize-traceback-2026-05-09',
+        'version': '6.0.8',
+        'build':   'normalize-classifications-rescue-aggregation-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5144,8 +5144,7 @@ falscher Wert."""
 
 def _ensure_dict(item):
     """Konvertiert Anthropic-SDK-Tool-Input-Items robust zu dict.
-    Anthropic kann pydantic-Models, dicts oder bei Edge-Cases tuples liefern.
-    Ein tuple kommt z.B. wenn ein verschachteltes Schema-Item durchschlägt."""
+    Anthropic kann pydantic-Models, dicts oder bei Edge-Cases tuples liefern."""
     if isinstance(item, dict):
         return item
     if hasattr(item, 'model_dump'):
@@ -5158,8 +5157,53 @@ def _ensure_dict(item):
             return dict(item.__dict__)
         except Exception:
             pass
-    # tuple, list oder andere — nicht konvertierbar, leeres dict zurück
     return {}
+
+
+def _normalize_v6_classifications(raw):
+    """Akzeptiert beliebige Eingabe-Strukturen und liefert immer list[dict] zurück.
+    Edge-Cases die Anthropic-SDK manchmal liefert:
+    - list[dict] (normal)
+    - dict[datum → dict] (auch möglich)
+    - dict mit key 'classifications'/'days' der Liste enthält
+    - list[tuple(datum, dict)] (durch dict.items() irgendwo)
+    - pydantic-Models statt dicts
+    """
+    if raw is None:
+        return []
+
+    # Wenn dict: prüfe gängige Wrapper-Keys
+    if isinstance(raw, dict):
+        if isinstance(raw.get('classifications'), list):
+            raw = raw['classifications']
+        elif isinstance(raw.get('days'), list):
+            raw = raw['days']
+        else:
+            # dict[datum → dict] — keys sind die Daten
+            raw = [
+                {'datum': k, **v} if isinstance(v, dict) else {'datum': k, 'value': v}
+                for k, v in raw.items()
+            ]
+
+    if not isinstance(raw, (list, tuple)):
+        return []
+
+    out = []
+    for item in raw:
+        if isinstance(item, tuple) and len(item) == 2:
+            k, v = item
+            if isinstance(v, dict):
+                out.append({'datum': k, **v})
+            else:
+                out.append({'datum': k, 'value': v})
+        elif isinstance(item, dict):
+            out.append(item)
+        else:
+            # pydantic-Model oder anderes Object
+            d = _ensure_dict(item)
+            if d:
+                out.append(d)
+    return out
 
 
 INLAND_IATA_CODES = {
@@ -5427,11 +5471,14 @@ LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
         # tool_input kann auch dict sein wenn SDK serialisiert
         days_raw = tool_input.get('days', []) if isinstance(tool_input, dict) else []
         warnings_raw = tool_input.get('warnings', []) if isinstance(tool_input, dict) else []
-        # Normalisiere alle items zu echten dicts (Anthropic-SDK kann pydantic
-        # Models oder im Edge-Case tuples liefern). Nicht-konvertierbare Items
-        # werden zu {} und beim setdefault-Loop unten gefiltert/ergänzt.
-        days = [_ensure_dict(d) for d in (days_raw or [])]
-        days = [d for d in days if d.get('datum')]  # leere Items raus
+        # Diagnostic-Log vor Normalisierung
+        if isinstance(days_raw, list) and days_raw:
+            print(f"[Sonnet-DP-Structured] raw days type=list[{type(days_raw[0]).__name__}] len={len(days_raw)}")
+        elif isinstance(days_raw, dict):
+            print(f"[Sonnet-DP-Structured] raw days is DICT not list — keys[:5]={list(days_raw.keys())[:5]}")
+        # Robuste Normalisierung — auch dict-input/tuple-items werden zu list[dict]
+        days = _normalize_v6_classifications(days_raw)
+        days = [d for d in days if d.get('datum')]
         warnings = [str(w) if not isinstance(w, str) else w for w in (warnings_raw or [])]
         # Normalisiere: stelle sicher dass alle Felder existieren
         for d in days:
@@ -5666,9 +5713,21 @@ WICHTIG:
             return None
         # Robust: tool_input könnte pydantic-Model sein
         tool_input = _ensure_dict(tool_input) if not isinstance(tool_input, dict) else tool_input
-        classifications_raw = tool_input.get('classifications', []) or []
-        # Jeden classification-Eintrag normalisieren (pydantic/tuple/dict)
-        classifications = [_ensure_dict(c) for c in classifications_raw]
+
+        # Diagnostic-Logging vor Normalisierung — hilft beim nächsten Bug
+        classifications_raw = tool_input.get('classifications', []) if isinstance(tool_input, dict) else []
+        raw_type = type(classifications_raw).__name__
+        if isinstance(classifications_raw, list) and classifications_raw:
+            first_type = type(classifications_raw[0]).__name__
+            print(f"[Opus-v6] raw classifications type=list[{first_type}] len={len(classifications_raw)}")
+        elif isinstance(classifications_raw, dict):
+            print(f"[Opus-v6] raw classifications type=dict keys[:5]={list(classifications_raw.keys())[:5]}")
+        else:
+            print(f"[Opus-v6] raw classifications type={raw_type} preview={str(classifications_raw)[:100]}")
+
+        # Robuste Normalisierung — handelt list[dict], dict[datum→dict],
+        # list[tuple], pydantic-Models, etc.
+        classifications = _normalize_v6_classifications(classifications_raw)
         classifications = [c for c in classifications if c.get('datum')]
         nachweis = str(tool_input.get('nachweis', '') or '')
         unklare_raw = tool_input.get('unklare_tage', []) or []
@@ -6467,15 +6526,55 @@ def hybrid_analyze(form, files):
                     structured_days, se_summary, year, homebase
                 )
                 if v6_class and v6_class.get('classifications'):
-                    # Aggregiere und validiere
-                    aggregated = _aggregate_v6_classification(v6_class['classifications'], structured_days, year)
-                    consistency_issues = _validate_opus_against_structure(
-                        v6_class['classifications'], structured_days
-                    )
-                    if consistency_issues:
-                        print(f"[v6] Konsistenz-Issues: {len(consistency_issues)} — {'; '.join(consistency_issues)[:300]}")
-                    # Baue klassisches classification-Dict zusammen für Kompatibilität mit
-                    # _berechne_via_hybrid und Self-Reflection-Loop
+                    # Klassifikationen sicher haben — Aggregation/Validation defensiv
+                    # umschließen, damit ein Crash hier nicht die geretteten Daten verliert.
+                    classifs_safe = [_ensure_dict(c) for c in v6_class['classifications']]
+                    classifs_safe = [c for c in classifs_safe if c.get('datum')]
+
+                    aggregated = None
+                    consistency_issues = []
+                    try:
+                        aggregated = _aggregate_v6_classification(classifs_safe, structured_days, year)
+                    except Exception as agg_err:
+                        import traceback as _tb
+                        print(f"[v6] Aggregation-Crash: {type(agg_err).__name__}: {str(agg_err)[:200]}")
+                        print(f"[v6] Aggregation-Traceback:\n{_tb.format_exc()[-800:]}")
+                        # Fallback-Aggregation: zähle einfach ohne BMF-EUR-Berechnung
+                        bmf = BMF_INLAND_BY_YEAR.get(year, BMF_INLAND_BY_YEAR[2025])
+                        aggregated = {
+                            'z72_tage': sum(1 for c in classifs_safe if c.get('klass') == 'Z72'),
+                            'z73_tage': sum(1 for c in classifs_safe if c.get('klass') == 'Z73'),
+                            'z74_tage': sum(1 for c in classifs_safe if c.get('klass') == 'Z74'),
+                            'z76_eur': 0.0,  # konnte nicht aggregiert werden
+                            'z72_eur': 0.0, 'z73_eur': 0.0, 'z74_eur': 0.0,
+                        }
+                        aggregated['z72_eur'] = round(aggregated['z72_tage'] * bmf['tagestrip_8h'], 2)
+                        aggregated['z73_eur'] = round(aggregated['z73_tage'] * bmf['an_abreise'], 2)
+                        aggregated['z74_eur'] = round(aggregated['z74_tage'] * bmf['voll_24h'], 2)
+                        errors.append(f'v6-Aggregation-Fallback ({type(agg_err).__name__})')
+
+                    try:
+                        consistency_issues = _validate_opus_against_structure(classifs_safe, structured_days)
+                        if consistency_issues:
+                            print(f"[v6] Konsistenz-Issues: {len(consistency_issues)} — {'; '.join(consistency_issues)[:300]}")
+                    except Exception as val_err:
+                        print(f"[v6] Validation-Crash: {type(val_err).__name__}: {str(val_err)[:200]}")
+                        consistency_issues = []
+
+                    # tage_detail defensiv bauen — auch wenn ein einzelnes c kaputt ist,
+                    # nicht die ganze Liste verlieren
+                    tage_detail_safe = []
+                    for c in classifs_safe:
+                        try:
+                            tage_detail_safe.append({
+                                'datum': c.get('datum'),
+                                'klass': c.get('klass'),
+                                'begruendung': c.get('begruendung', ''),
+                                'marker': '', 'routing': '', 'tour_dauer': 1,
+                            })
+                        except Exception:
+                            continue
+
                     classification = {
                         'arbeitstage':   deterministic_counts['arbeitstage'],
                         'fahr_tage':     deterministic_counts['fahr_tage'],
@@ -6489,12 +6588,7 @@ def hybrid_analyze(form, files):
                         'z74_eur':       aggregated['z74_eur'],
                         'nachweis':      v6_class.get('nachweis', ''),
                         'unklare_tage':  v6_class.get('unklare_tage', []),
-                        'tage_detail':   [
-                            {'datum': c.get('datum'), 'klass': c.get('klass'),
-                             'begruendung': c.get('begruendung', ''),
-                             'marker': '', 'routing': '', 'tour_dauer': 1}
-                            for c in v6_class['classifications']
-                        ],
+                        'tage_detail':   tage_detail_safe,
                         '_v6_used': True,
                         '_consistency_issues': consistency_issues,
                     }
@@ -6503,9 +6597,9 @@ def hybrid_analyze(form, files):
                           f"Z72={classification['z72_tage']}T Z73={classification['z73_tage']}T "
                           f"Z76={classification['z76_eur']:.2f}€")
                 else:
-                    print(f"[v6] Opus-v6 lieferte keine Klassifikationen — Fallback auf v5.7")
+                    print(f"[v6] Opus-v6 lieferte keine Klassifikationen")
             else:
-                print(f"[v6] Sonnet-Pre-Reader lieferte keine Tagesdaten — Fallback auf v5.7")
+                print(f"[v6] Sonnet-Pre-Reader lieferte keine Tagesdaten")
         except Exception as e:
             etype = type(e).__name__
             import traceback as _tb
@@ -6889,11 +6983,10 @@ def berechne(form, files):
     if hybrid_result is not None:
         return hybrid_result
 
-    # Hybrid lieferte None — Job-Error
+    # Hybrid lieferte None — Job-Error mit nutzerfreundlicher Meldung
     raise RuntimeError(
-        "Hybrid-Pipeline lieferte kein Ergebnis. Fallback ist deaktiviert "
-        "(spart Token-Kosten bei Pipeline-Fehlern). Render-Logs prüfen für "
-        "Ursache, Code fixen oder Files erneut hochladen."
+        "Die Auswertung konnte nicht abgeschlossen werden. Deine Sitzung bleibt gültig — "
+        "bitte versuche es erneut oder kontaktiere den Support, wenn der Fehler weiter auftritt."
     )
 
     # ── DEAD CODE BELOW (alter Multi-Parser-Pfad bleibt im File für historische
