@@ -3947,16 +3947,20 @@ def berechne(form, files):
                         f'flugfreie Monate ({", ".join(flugfrei_strs)}) laut Einsatzplan benötigen keine Abrechnung.'
                     )
             else:
-                # Kein Einsatzplan → wir können nur grob prüfen ob ALLE 12 Monate Flüge haben
-                # (annehmend Vollzeit). Wenn weniger, einfach Info ohne Schätzung.
-                if len(se_flugmonate) < 12 and len(se_flugmonate) > 0:
+                # Kein Einsatzplan → trotzdem die echten Flugmonate aus SE-Daten ablesen
+                if 0 < len(se_flugmonate) < 12:
+                    abr_list = se_data.get('abrechnungen', [])
+                    avg_steuerfrei = sum(a.get('steuerfrei', 0) for a in abr_list) / max(1, len(abr_list))
                     erfasst_str = ', '.join(month_names[m-1] for m in sorted(se_flugmonate))
                     fehlend = [m for m in range(1,13) if m not in se_flugmonate]
                     fehlend_str = ', '.join(month_names[m-1] for m in fehlend)
+                    est_missing = round(avg_steuerfrei * len(fehlend), 2)
                     notes.append(
-                        f'ℹ Streckeneinsatz: Flüge in {len(se_flugmonate)}/12 Monaten erfasst '
-                        f'(erfasst: {erfasst_str}; ohne Flüge: {fehlend_str}). '
-                        f'Falls Teilzeit/Urlaub: ok. Sonst lade fehlende Monate nach via "Mit Code anpassen".'
+                        f'⚠️ Streckeneinsatz: nur {len(se_flugmonate)}/12 Monate mit Flügen erfasst '
+                        f'(erfasst: {erfasst_str}; fehlend: {fehlend_str}). '
+                        f'Falls Teilzeit/Urlaub: ok — sonst geschätzter Verlust ~{est_missing:.0f}€ steuerfreie Spesen. '
+                        f'Tipp: lade fehlende Monate nach via "Mit Code anpassen" oder lade den Einsatzplan hoch '
+                        f'damit wir flugfreie Monate automatisch erkennen.'
                     )
     else:
         missing.append('Streckeneinsatz-Abrechnungen (nicht hochgeladen)')
