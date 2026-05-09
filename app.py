@@ -679,6 +679,17 @@ def _get_queue_position(job_id):
     return None
 
 
+def _release_memory_to_os():
+    """Forciert Python-Allocator Speicher tatsächlich an OS zurückzugeben (Linux/glibc).
+    Standardmäßig hält Python freigegebenen RAM intern für Reuse — auf Render Free
+    wirkt das dann nach OUTSIDE wie Memory-Leak. malloc_trim(0) räumt das auf."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass  # Mac/Windows oder kein libc — egal
+
+
 def _calc_worker():
     """Background-Worker: pickt Jobs aus _calc_queue, führt sequenziell aus."""
     global _calc_running_id
@@ -701,7 +712,9 @@ def _calc_worker():
                 _calc_running_id = None
             try: _calc_queue.task_done()
             except: pass
-            gc.collect()  # nach jedem Job RAM freigeben
+            # Aggressive Memory-Freigabe nach jedem Job
+            gc.collect()
+            _release_memory_to_os()
 
 
 def _start_calc_worker():
@@ -2192,8 +2205,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '2.5',
-        'build':   'queue-fixes-restart-recovery-2026-05-09',
+        'version': '2.6',
+        'build':   'prep-ux-and-malloc-trim-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
