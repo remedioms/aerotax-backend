@@ -6919,14 +6919,36 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
 
             # ─── Fall A: Heute Übernachtung ───
             if overnight and today_layover_inland is False:
-                klass = 'Z76'
-                bmf_aus = _bmf(today_layover_ort)
-                if is_anreise or is_abreise:
-                    satz = (bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0)
+                # v8.10: Auslandstour-Anreise mit Abend-Briefing (start_time >= 18:00)
+                # ist hauptsächlich in Deutschland verbracht (User in DE bis Briefing,
+                # dann lange Flugnacht). Steuerlich Z73 Inland-Anreise 14€, nicht
+                # Z76 BMF-An/Ab des Ziellands.
+                # Die Mittel-Tage und der Heimkehrtag bleiben Z76 wie gewohnt.
+                start_time_str = d.get('start_time', '') or ''
+                evening_anreise = False
+                if is_anreise and start_time_str and ':' in start_time_str:
+                    try:
+                        start_h = int(start_time_str.split(':')[0])
+                        if start_h >= 18:
+                            evening_anreise = True
+                    except (ValueError, IndexError):
+                        pass
+
+                if evening_anreise:
+                    klass = 'Z73'
+                    eur_added = INLAND_AN_ABREISE
+                    reason = f'Auslandstour-Anreise mit Abend-Briefing {start_time_str} (>= 18:00) → Inland-Anreise 14€'
+                    audit_note = f'{datum}: Auslandstour-Anreise nach {today_layover_ort}, Briefing {start_time_str} → Z73 Inland (Tag dominant in DE)'
+                    print(f"[v8-z73-detail] datum={datum} ort={today_layover_ort} start={start_time_str} reason='Abend-Anreise → Z73 Inland'")
                 else:
-                    satz = (bmf_aus.get('voll_24h', 0) if bmf_aus else 28.0)
-                eur_added = float(satz or 0)
-                reason = f'Auslands-Layover {today_layover_ort} (Z76 {"An/Ab" if (is_anreise or is_abreise) else "Volltag"})'
+                    klass = 'Z76'
+                    bmf_aus = _bmf(today_layover_ort)
+                    if is_anreise or is_abreise:
+                        satz = (bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0)
+                    else:
+                        satz = (bmf_aus.get('voll_24h', 0) if bmf_aus else 28.0)
+                    eur_added = float(satz or 0)
+                    reason = f'Auslands-Layover {today_layover_ort} (Z76 {"An/Ab" if (is_anreise or is_abreise) else "Volltag"})'
                 classified = True
 
             elif overnight and today_layover_inland is True:

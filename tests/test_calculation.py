@@ -2178,6 +2178,81 @@ def test_v89_reference_diff_helper_works():
     assert diff['z74']['within_tolerance'] is True
 
 
+def test_v810_evening_foreign_anreise_becomes_z73():
+    """LH0506 FRA-GRU mit Briefing 21:25: Auslandstour-Anreise mit
+    Abend-Start → Z73 Inland 14€ (nicht Z76 An/Ab Brasilien).
+
+    Live-Bug aus job f20175f0: 9 LH-Auslandsanreisen mit start_time 19:54-21:25
+    landeten als Z76 An/Ab statt Z73 Inland-Anreise."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-19', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'GRU'], 'layover_ort': 'GRU',
+         'start_time': '21:25'},
+        {'datum': '2025-01-20', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'GRU'},
+        {'datum': '2025-01-21', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'GRU'},
+        {'datum': '2025-01-22', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['GRU', 'FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-19', 'stfrei_betrag': 31, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-20', 'stfrei_betrag': 47, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-21', 'stfrei_betrag': 47, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-22', 'stfrei_betrag': 31, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail_19 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-19']
+    assert detail_19 and detail_19[0]['klass'] == 'Z73', \
+        f"Auslandstour-Anreise 21:25 sollte Z73 sein, ist {detail_19[0]['klass']}"
+    assert detail_19[0]['eur'] == 14.00, \
+        f"Z73 sollte 14€ sein, ist {detail_19[0]['eur']}"
+    # Mittel-Tage 20.+21. bleiben Z76 voll_24h
+    detail_20 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-20']
+    assert detail_20 and detail_20[0]['klass'] == 'Z76'
+    # Heimkehrtag 22. bleibt Z76 An/Ab
+    detail_22 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-22']
+    assert detail_22 and detail_22[0]['klass'] == 'Z76'
+
+
+def test_v810_morning_foreign_anreise_stays_z76():
+    """LH-BLR-Anreise mit Briefing 11:00 → bleibt Z76 An/Ab (Tag dominant im Flug)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'BLR'], 'layover_ort': 'BLR',
+         'start_time': '11:00'},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail_03 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-03']
+    assert detail_03 and detail_03[0]['klass'] == 'Z76', \
+        f"BLR-Anreise mit 11:00-Briefing sollte Z76 bleiben, ist {detail_03[0]['klass']}"
+
+
+def test_v810_no_start_time_stays_z76():
+    """Auslandstour-Anreise ohne start_time-Info → konservativ Z76 wie bisher."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-19', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'GRU'], 'layover_ort': 'GRU'},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-19', 'stfrei_betrag': 31, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail = [d for d in result['tage_detail'] if d['datum'] == '2025-01-19']
+    # Ohne start_time → nicht eindeutig "abend" → Z76 bleibt
+    assert detail and detail[0]['klass'] == 'Z76'
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
