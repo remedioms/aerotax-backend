@@ -1034,6 +1034,16 @@ def _run_process_async(job_id, form, files):
             'gesamt': result.get('gesamt'), 'netto': result.get('netto'),
             'verification': result.get('_verification'),
         })
+        # Tag-für-Tag-Klassifikation getrennt loggen (für Debug/Validation,
+        # nicht im /api/job-Status weil zu groß). Über /api/job/<id>/audit abrufbar.
+        _tage_detail = result.get('_tage_detail') or []
+        if _tage_detail or result.get('_klass_summary'):
+            _audit(job_id, 'classification_detail', {
+                'summary':  result.get('_klass_summary'),
+                'nachweis': (result.get('_nachweis') or '')[:2000],
+                'unklare_tage': result.get('_unklare_tage'),
+                'tage_detail': _tage_detail,
+            })
 
         with _jobs_lock:
             _jobs[job_id]['progress'] = 90
@@ -2240,8 +2250,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '4.2',
-        'build':   'prompts-verschaerft-z77-monatlich-2026-05-09',
+        'version': '4.3',
+        'build':   'audit-tagdetail-z73-decision-tree-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5179,6 +5189,22 @@ def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebas
                 'z76_eur':       {'type': 'number',  'description': 'Σ aller stfrei-Werte aus SE wo stfrei-Ort Ausland ist (Z76 VMA Ausland)'},
                 'nachweis':      {'type': 'string',  'description': 'Monatlicher Nachweis. Pro Monat 1-3 Sätze: was waren die Touren, wie viele Arbeitstage/Fahrtage/Hotel.'},
                 'unklare_tage':  {'type': 'array', 'items': {'type': 'string'}, 'description': 'Tage die nicht eindeutig klassifizierbar waren (mit Begründung)'},
+                'tage_detail':   {
+                    'type': 'array',
+                    'description': 'Tag-für-Tag-Klassifikation NUR für Tour-/Office-/Standby-Tage (NICHT für FREI/Urlaub/Krank). Pro Tour: nur den ANREISE-Tag eintragen (mit dauer-Hinweis). Bei Same-Day: 1 Eintrag. So bleibt die Liste kompakt (~50-80 Einträge/Jahr).',
+                    'items': {
+                        'type': 'object',
+                        'required': ['datum', 'marker', 'klass', 'begruendung'],
+                        'properties': {
+                            'datum':       {'type': 'string', 'description': 'YYYY-MM-DD'},
+                            'marker':      {'type': 'string', 'description': 'DP-Marker am Tag (FL/SBY/RES/EM/EH/D4/...)'},
+                            'routing':     {'type': 'string', 'description': 'Routing-Codes z.B. "FRA-CPH-FRA" oder "FRA-BLR" (bei Übernachtung) — wenn unklar leer'},
+                            'klass':       {'type': 'string', 'enum': ['Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby', 'Sonstiges'], 'description': 'Klassifikation für VMA-Berechnung'},
+                            'tour_dauer':  {'type': 'integer', 'description': 'Anzahl Tage der Tour (1=Same-Day, 2-5=mehrtägig). Bei Office/Standby = 1.'},
+                            'begruendung': {'type': 'string', 'description': 'Kurz: warum diese Klassifikation? z.B. "Same-Day CPH+Rückflug → Z72" oder "BLR Indien 3 Tage → Z76 Auslandstour" oder "DUS Übernachtung → Z73 Inland-ÜN"'},
+                        }
+                    }
+                },
             }
         }
     }
@@ -5712,6 +5738,13 @@ def _berechne_via_hybrid(form, files):
         '_verification':    verification_info,
         '_nachweis':        nachweis_text,
         '_unklare_tage':    unklare_tage,
+        '_tage_detail':     list(cls.get('tage_detail', []) or []),
+        '_klass_summary':   {
+            'arbeitstage': arbeitstage, 'fahr_tage': fahr_tage, 'hotel_naechte': hotel_naechte,
+            'z72_tage': vma_72_tage, 'z73_tage': vma_73_tage, 'z74_tage': vma_74_tage,
+            'z76_eur': vma_aus, 'z77_total': z77,
+            'auslandsspesen_se': auslandsspesen_se, 'inlandsspesen_se': inlandsspesen_se,
+        },
     }
 
 

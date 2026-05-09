@@ -78,17 +78,62 @@ DREI HAUPT-KATEGORIEN:
   Schritt 1: Welche Aktivität laut Marker?
              FREI/U/K → kein Arbeitstag, fertig.
              SBY/RES → Arbeitstag, kein Fahrtag, fertig.
-             EK/EM/D4/DD → Arbeitstag + Fahrtag (täglich Anfahrt!), fertig.
+             EK/EM/EH (Recurrent/Schulung) → AT + FT, ABER: prüfe Schritt 1b.
+             D4/DD (mehrtägige Schulung) → IMMER Schritt 1b prüfen.
              Tour (A/E/FL) → weiter Schritt 2.
 
-  Schritt 2: Bei Tour: Übernachtung im Ausland?
-             Same-Day-Heimkehr (A + E gleicher Tag)? → Z72 (Tagestrip 14€)
-             Mehrtages mit Hotel im INLAND? → Z73 (An-/Abreise je 14€)
-             Mehrtages mit Hotel im AUSLAND? → Z76 (BMF-Ausland)
+  Schritt 1b (NEU — KRITISCH für Z73): Schulung mit Hotel-Übernachtung?
+             Folgt direkt am nächsten Tag wieder Schulung+ohne FREI dazwischen?
+             ODER: ist Schulungs-Ort NICHT FRA/MUC/HAM/Homebase (z.B. D4 in
+             externem Center)? ODER: gibt es Hotel-Anweisung/Layover-Ortswechsel?
+             → JA → Mehrtages-Inland-Tour → Z73 für Anreise + Abreise!
+                    Volltage dazwischen = AT ohne zusätzliches VMA.
+             → NEIN → reine Office-Schulung am Homebase, kein VMA.
+
+             FAUSTREGEL: Wenn 3+ aufeinanderfolgende EM/EH/D4-Tage OHNE FREI
+             dazwischen, ist es FAST IMMER eine Schulung mit Hotel (Z73-Tour).
+             FollowMe-Konvention: lieber Z73 als Office annehmen wenn unsicher.
+
+  Schritt 2: Bei Tour (A/E/FL): Wo ist die Übernachtung?
+             a) Same-Day-Heimkehr (A + E gleicher Tag, kein FL/Hotel)? → Z72 (14€)
+                Egal ob Ziel CPH/AMS/VIE oder MUC/HAM/STR — beides Z72.
+             b) Hotel-Marker (FL) am Folgetag UND Routing/Layover-Ort = INLAND?
+                → Z73 für Anreise+Abreise (14€ pro Tag).
+                Inland-Routing erkennst du an Layover-Code aus der Inland-Liste:
+                FRA, MUC, HAM, DUS, STR, CGN, HAJ, BER (TXL/SXF), LEJ, NUE,
+                BRE, FMO, PAD, NRN, FKB, HHN, SCN, DRS, ERF, FDH, RLG, KSF.
+             c) Hotel-Marker (FL) am Folgetag UND Routing-Layover = AUSLAND?
+                → Z76 für ALLE Tour-Tage (BMF-Land-Pauschale für An/Ab + 24h
+                  für Volltage).
 
   Schritt 3: Bei Z76: BMF-Auslands-Pauschale für das Land aufschlagen
              (Anreise-Satz für Tag 1 + letzten Tag,
               24h-Satz für Volltage)
+
+═══ DECISION-TREE Z72 vs Z73 vs Z76 (KRITISCH) ═══
+
+  Frage 1: Hotel-Marker (FL) im Dienstplan an diesem Tag?
+    NEIN → Wenn Marker A+E am gleichen Tag → Z72. Sonst kein VMA.
+    JA → Frage 2.
+
+  Frage 2: Was ist der Layover-Ort (3-Letter-Code im Einsatzplan)?
+    Code in Inland-Liste oben → Z73 für An/Abreise.
+    Code NICHT in Inland-Liste → Z76 für gesamte Tour.
+    Code nicht eindeutig → konservativ Z73 (Inland) annehmen, in unklare_tage
+    eintragen.
+
+  Frage 3 (Sanity-Check): Z77 in der SE für diesen Tag stfrei-Inland oder Ausland?
+    stfrei-Inland (FRA/Homebase) + Auslands-Layover → trotzdem Z76 (LH zahlt
+                                                       FRA-stempel aber Tour
+                                                       war Ausland → Wissens-
+                                                       Fehler #1)
+    stfrei-Ausland → Z76 zwingend (LH bestätigt Auslandstour)
+
+  Z73 = 0 IST FAST IMMER FALSCH bei Vollzeit-Crew!
+  Typisch Vollzeit: 5-15 Z73-Tage/Jahr aus Schulungen + Inland-Layovers.
+  Wenn deine Klassifikation auf Z73=0 endet, gehe alle EM/EH/D4-Blöcke
+  nochmal durch — du hast vermutlich mehrtägige Schulungen als "Office daily"
+  fehlklassifiziert.
 
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -440,6 +485,29 @@ WICHTIGE BEOBACHTUNGEN:
    Auch wenn der User nicht fliegt — er muss zur Homebase fahren für die
    Schulung/Bürodienst.
 
+❌ FEHLER 17 (★HÄUFIGSTER★): Z73 = 0 in der Auswertung
+✓ RICHTIG: Z73 = 0 ist FAST IMMER FALSCH bei Vollzeit-Crew (typisch 5-15/Jahr).
+   Wenn deine Klassifikation auf Z73=0 endet, hast du wahrscheinlich:
+     a) Mehrtägige EM/EH/D4-Schulungen mit Hotel als "Office daily" verbucht
+        statt als Z73-Inland-Tour
+     b) Inland-Übernachtungen in MUC/HAM/STR/CGN aus Standby-Stationierungen
+        oder Tour-Layovers übersehen
+   GEH ALLE EM/EH/D4-Blöcke nochmal durch: 3+ aufeinanderfolgende Tage
+   ohne FREI dazwischen → fast immer Schulung mit Hotel → 2× Z73 (An+Ab).
+
+❌ FEHLER 18 (Spiegelbild zu Fehler 17): Z76 deutlich höher als
+   Auslandsspesen-Summe in der SE
+✓ RICHTIG: Z76 (BMF×Tage) sollte ungefähr ±30% der LH-stfrei-Auslandszahlung
+   sein. Wenn Z76 deutlich höher: zu viele Tage als Auslandstour klassifiziert,
+   manche müssen Inland (Z73) sein. Wenn Z76 deutlich niedriger: Auslands-
+   tage übersehen.
+
+❌ FEHLER 19: Same-Day-Tagestrip-Konvention zu aggressiv anwenden
+✓ RICHTIG: Z72 NUR wenn EINDEUTIG Heimkehr am gleichen Tag (A+E gleicher Tag,
+   kein FL-Marker). Wenn der nächste Tag wieder Tour-Tätigkeit ist OHNE FREI,
+   prüfe ob es eine zusammenhängende Mehrtages-Tour ist (= Z73 oder Z76).
+   Bei Unsicherheit: lieber Z73 als Z72 annehmen (konservativer für User).
+
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃ 11. MULTI-LSB & EDGE-CASES                                               ┃
@@ -466,14 +534,32 @@ OPTIONALE BELEGE (Werden separat per Vision-API gelesen, nicht in deiner Klassif
 
 Bevor du das Tool aufrufst, prüfe selbst:
   ✓ Z76 ≤ Z77 (mathematisch zwingend, sonst falsch klassifiziert!)
+  ✓ Z76 ≈ Auslandsspesen-Summe der SE ±30% (wenn weit auseinander → Bug!)
   ✓ Hotel ≤ Arbeitstage (logisch unmöglich anders)
   ✓ Fahrtage ≤ Arbeitstage (logisch)
-  ✓ Z73 typisch 5-15 Tage (nur echte Inland-Touren)
+  ✓ Z73 ≥ 1 für Vollzeit-Crew (typisch 5-15 Tage). Z73 = 0 → STOP, prüfe
+    EM/EH/D4-Blöcke und Inland-Layover-Touren nochmal!
+  ✓ Z72 + Z73 + (Z76-Tage)/Tour ≈ Anzahl Touren (jede Tour produziert 1
+    Klassifikation: Same-Day → Z72, Inland-Übernacht → Z73, Ausland-Übernacht → Z76)
   ✓ Z76 typisch der GRÖSSTE Posten bei aktiver Crew
   ✓ Arbeitstage ~120-160 für Vollzeit (90-120 für Teilzeit)
 
 Wenn dein Ergebnis stark abweicht: NOCHMAL das Wissens-Buch lesen und Tag-für-Tag
 durchgehen. Lieber langsam und richtig als schnell und falsch.
+
+═══ TAG-FÜR-TAG-DOKUMENTATION (PFLICHT für Audit) ═══
+
+Du sollst im Tool-Output das Feld `tage_detail` füllen — eine Liste pro Tour
+oder Office-Block (NICHT für FREI/Urlaub-Tage). Pro Eintrag:
+  - datum: YYYY-MM-DD (Anreise/Tour-Start-Tag)
+  - marker: was steht im DP (z.B. "A FRA→BLR" / "EM" / "FL" / "SBY")
+  - routing: Routing-Codes wenn ablesbar (z.B. "FRA-BLR" / "MUC-HAM-MUC")
+  - klass: Z72 / Z73 / Z74 / Z76 / Office / Standby / Sonstiges
+  - tour_dauer: Anzahl Tage der Tour (1=Same-Day, 2-5=mehrtägig)
+  - begruendung: Kurz warum, z.B. "Same-Day → Z72" / "BLR Indien 4T → Z76"
+
+Bei ~150 AT/Jahr ergibt das ~50-80 Einträge. Pflicht. Wir nutzen das
+für Audit-Trail und Validierung gegen FollowMe.
 
 ═══════════════════════════════════════════════════════════════════════════
 ENDE DES WISSENS-BUCHS
