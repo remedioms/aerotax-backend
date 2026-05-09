@@ -2791,6 +2791,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
     # ── SCHRITT 1: REGEX — Z77 + Z73 + Abrechnungen (100% VERLÄSSLICH) ──
     abrechnungen = []
     z73_tage = 0
+    flugmonate = set()  # echte Flugmonate aus den Flug-Zeilen (eine SE kann 2 Monate enthalten)
 
     for pdf_bytes in pdf_bytes_list:
         try:
@@ -2799,6 +2800,14 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                     text = page.extract_text() or ''
                     if 'Streckeneinsatz' not in text and 'stfrei' not in text:
                         continue
+
+                    # Echte Flugmonate aus DD.MM.YYYY-Zeilenanfängen extrahieren
+                    for fm in re.finditer(r'(?m)^(\d{2})\.(\d{2})\.(\d{4})\b', text):
+                        try:
+                            mn = int(fm.group(2))
+                            if 1 <= mn <= 12:
+                                flugmonate.add(mn)
+                        except: pass
 
                     # Erstellungsdatum → Monatsbezeichnung
                     m_erst = re.search(r'Erstellt\s+(\d{2})\.(\d{2})\.(\d{4})', text)
@@ -2809,6 +2818,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                         mo_nr = int(m_erst.group(2))
                         mo_name = __import__('datetime').date(2025, mo_nr, 1).strftime('%B')
                     except:
+                        mo_nr = 0
                         mo_name = f"Monat {m_erst.group(2)}"
 
                     # Summen-Zeile → Z77 dieser Abrechnung
@@ -2835,8 +2845,9 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                     abrechnungen.append({
                         'erstellt':       erstellt,
                         'bezeichnung':    mo_name,
+                        'monat':          mo_nr,           # Erstellt-Monat (zur Info, nicht zuverlässig)
                         'gesamt':         g,
-                        'steuerfrei':     z77_page,      # Z77-Anteil
+                        'steuerfrei':     z77_page,        # Z77-Anteil
                         'steuerpflichtig': steuer,
                         'z73_tage':       z73_page,
                     })
@@ -2871,6 +2882,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
 
     return {
         'abrechnungen':          abrechnungen,
+        'flugmonate':            sorted(flugmonate),  # echte Monate mit Flügen (1-12)
         'summe_gesamt':          round(sum(a['gesamt'] for a in abrechnungen), 2),
         'summe_steuerfrei':      z77_total,
         'summe_steuerpflichtig': round(sum(a['steuerpflichtig'] for a in abrechnungen), 2),
@@ -3906,40 +3918,46 @@ def berechne(form, files):
             missing.append('Streckeneinsatz-Abrechnungen (nicht vollständig lesbar)')
             se_data = None
         else:
-            # Check if all 12 months present
-            abr_list = se_data.get('abrechnungen', [])
-            months_found = len(abr_list)
-            if months_found < 12:
-                # Welche Monate wurden erfasst?
-                detected_months = sorted({int(a.get('monat', 0) or 0) for a in abr_list if a.get('monat')})
-                month_names = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez']
-                detected_str = ', '.join(month_names[m-1] for m in detected_months if 1 <= m <= 12) or '?'
-                # Wirklich fehlende Monate = nicht in SE UND laut Einsatzplan NICHT flugfrei
-                # (Teilzeit/Urlaub/Krankheit = keine SE = kein Fehler)
-                truly_missing = [i+1 for i in range(12)
-                                 if (i+1) not in detected_months
-                                 and (i+1) not in einsatz_flugfreie_monate]
-                # Geschätzter Spesen-Schnitt der erfassten Monate
-                avg_steuerfrei = sum(a.get('steuerfrei', 0) for a in abr_list) / max(1, months_found)
-                if truly_missing:
-                    missing_strs = [month_names[m-1] for m in truly_missing]
-                    est_missing = round(avg_steuerfrei * len(truly_missing), 2)
+            # Welche Monate sind tatsächlich durch Flugzeilen abgedeckt?
+            # (Eine SE kann Flüge aus 2 Monaten enthalten, daher Flugdaten-basiert prüfen)
+            se_flugmonate = set(se_data.get('flugmonate', []))
+            month_names = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez']
+
+            # Welche Monate sollten Flüge haben? Primär: laut Einsatzplan.
+            # Ohne Einsatzplan: alle 12 Monate annehmen (Vollzeit) — sonst keine Warnung möglich.
+            if einsatz_data:
+                # Flugmonate laut Einsatzplan = die Soll-Vorgabe
+                expected_flugmonate = set(einsatz_flugmonate)
+                fehlende_flugmonate = expected_flugmonate - se_flugmonate
+                if fehlende_flugmonate:
+                    abr_list = se_data.get('abrechnungen', [])
+                    avg_steuerfrei = sum(a.get('steuerfrei', 0) for a in abr_list) / max(1, len(abr_list))
+                    fehlend_str = ', '.join(month_names[m-1] for m in sorted(fehlende_flugmonate))
+                    est_missing = round(avg_steuerfrei * len(fehlende_flugmonate), 2)
                     notes.append(
-                        f'⚠️ ACHTUNG: Nur {months_found}/12 Streckeneinsatz-Abrechnungen erfasst '
-                        f'(erfasst: {detected_str}; fehlend: {", ".join(missing_strs)}). '
-                        f'Geschätzter Verlust durch fehlende Monate: ~{est_missing:.0f}€ steuerfreie Spesen. '
-                        f'Tipp: lade die fehlenden Monate nach via "Mit Code anpassen" auf der Startseite.'
+                        f'⚠️ Streckeneinsatz unvollständig: laut Einsatzplan wurde in {fehlend_str} geflogen, '
+                        f'die SE-Abrechnungen decken diese Monate aber nicht ab. '
+                        f'Geschätzter Verlust: ~{est_missing:.0f}€ steuerfreie Spesen. '
+                        f'Tipp: lade die fehlenden Abrechnungen nach via "Mit Code anpassen".'
                     )
                 elif einsatz_flugfreie_monate:
-                    # Alle "fehlenden" SE-Monate waren laut Einsatzplan flugfrei → kein Warning, nur Info
-                    flugfrei_strs = [month_names[m-1] for m in sorted(einsatz_flugfreie_monate)
-                                     if m not in detected_months]
-                    if flugfrei_strs:
-                        notes.append(
-                            f'ℹ Streckeneinsatz: {months_found}/12 Monate erfasst — fehlende Monate '
-                            f'({", ".join(flugfrei_strs)}) waren laut Einsatzplan flugfrei '
-                            f'(Teilzeit/Urlaub/Frei) und benötigen keine Abrechnung.'
-                        )
+                    flugfrei_strs = [month_names[m-1] for m in sorted(einsatz_flugfreie_monate)]
+                    notes.append(
+                        f'ℹ {len(se_flugmonate)} Flugmonate aus SE erfasst — '
+                        f'flugfreie Monate ({", ".join(flugfrei_strs)}) laut Einsatzplan benötigen keine Abrechnung.'
+                    )
+            else:
+                # Kein Einsatzplan → wir können nur grob prüfen ob ALLE 12 Monate Flüge haben
+                # (annehmend Vollzeit). Wenn weniger, einfach Info ohne Schätzung.
+                if len(se_flugmonate) < 12 and len(se_flugmonate) > 0:
+                    erfasst_str = ', '.join(month_names[m-1] for m in sorted(se_flugmonate))
+                    fehlend = [m for m in range(1,13) if m not in se_flugmonate]
+                    fehlend_str = ', '.join(month_names[m-1] for m in fehlend)
+                    notes.append(
+                        f'ℹ Streckeneinsatz: Flüge in {len(se_flugmonate)}/12 Monaten erfasst '
+                        f'(erfasst: {erfasst_str}; ohne Flüge: {fehlend_str}). '
+                        f'Falls Teilzeit/Urlaub: ok. Sonst lade fehlende Monate nach via "Mit Code anpassen".'
+                    )
     else:
         missing.append('Streckeneinsatz-Abrechnungen (nicht hochgeladen)')
 
@@ -4159,15 +4177,13 @@ def berechne(form, files):
         fahr = 0
     fahr = round(fahr, 2)
 
-    # ── Z72-BOOST: pro-Tag Block-Time-aware mit AUTO-Briefing-Detection ──
-    # LH Standard Operating Procedure für Cabin Crew:
-    #   - Continental (Block ≤4h):  60 Min Briefing + 30 Min Sign-Off
-    #   - Mid-haul    (Block 4-7h): 75 Min Briefing + 30 Min Sign-Off
-    #   - Long-haul   (Block >7h):  90 Min Briefing + 30 Min Sign-Off
-    # Sign-Off (Nacharbeitung) ist bei LH einheitlich ~30 Min für alle Tour-Typen.
+    # ── Z72-BOOST: pro-Tag Block-Time-aware mit LH-Faustregel-Briefing ──
+    # LH Cabin-Crew Faustregel (wenn nicht aus Dienstplan ablesbar):
+    #   - Kurzstrecke (Block ≤4h):  85 Min Briefing  (1:25 h vor STD)
+    #   - Langstrecke (Block >4h): 110 Min Briefing  (1:50 h vor STD)
+    # Sign-Off (Nacharbeitung) ist bei LH einheitlich ~30 Min.
     # Anfahrt: aus km × 1,5 min/km, oder 30 min Default.
-    NACHARB_MIN = 30  # einheitlich für alle Tour-Typen
-    # Anfahrt: User-Input bevorzugt, sonst aus km × 1,5 min/km abgeleitet
+    NACHARB_MIN = 30
     user_anfahrt = int(form.get('anfahrt_min', 0) or 0)
     if user_anfahrt > 0:
         anfahrt_min = user_anfahrt
@@ -4178,13 +4194,11 @@ def berechne(form, files):
         qualifying = []
         for cand in candidates:
             block_m = cand.get('block_min', 0)
-            # Auto-Briefing nach LH SOP basierend auf Block-Time
-            if block_m <= 240:
-                briefing_min = 60   # Continental
-            elif block_m <= 420:
-                briefing_min = 75   # Mid-haul
-            else:
-                briefing_min = 90   # Long-haul
+            # 1) Echte Briefingzeit aus Dienstplan, falls verfügbar
+            briefing_min = cand.get('briefing_min')
+            # 2) Sonst LH-Faustregel: Kurz/Lang anhand Block-Time
+            if not briefing_min:
+                briefing_min = 85 if block_m <= 240 else 110
             abw = anfahrt_min + briefing_min + block_m + NACHARB_MIN + anfahrt_min
             if abw >= 480:
                 qualifying.append({**cand, 'abwesenheit_min': abw,
@@ -4196,7 +4210,8 @@ def berechne(form, files):
             vma_in = vma_72 + vma_73 + vma_74
             notes.append(
                 f'ℹ Pro-Tag-Berechnung: {added} Inland-Tagestrips erreichen §9-EStG 8h-Schwelle '
-                f'(LH SOP Briefing + 30 min Sign-Off + Anfahrt 2×{anfahrt_min}min) → +{added*int(bmf_inland["tagestrip_8h"])}€.'
+                f'(LH-Faustregel Briefing 85/110 min + 30 min Sign-Off + Anfahrt 2×{anfahrt_min}min) → '
+                f'+{added*int(bmf_inland["tagestrip_8h"])}€.'
             )
 
     # ── REINIGUNG & TRINKGELD (jahr-konform) ─────────────────
@@ -4266,18 +4281,9 @@ def berechne(form, files):
                         f'Möglicherweise wurde ein Wert nicht richtig ausgelesen — bitte prüfen.'
                     )
 
-        # Cross-Check 2: Welche Flugmonate fehlen in SE? (nur Monate mit Umläufen vergleichen)
-        if se_data and se_data.get('abrechnungen'):
-            se_monate = {int(a.get('monat', 0) or 0) for a in se_data['abrechnungen'] if a.get('monat')}
-            # Flugmonate aus Einsatzplan = Monate mit ≥1 Umlauf
-            flugmonate_fehlen_in_se = einsatz_flugmonate - se_monate
-            if flugmonate_fehlen_in_se:
-                _mn = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez']
-                fehlend_str = ', '.join(_mn[m-1] for m in sorted(flugmonate_fehlen_in_se))
-                cross_notes.append(
-                    f'Flugmonate ohne SE: laut Einsatzplan wurde in {fehlend_str} geflogen, '
-                    f'aber für diese Monate fehlt eine Streckeneinsatz-Abrechnung.'
-                )
+        # Cross-Check 2: ist bereits oben in der SE-Warning-Logik abgedeckt
+        # (Vergleich SE-Flugmonate vs Einsatzplan-Flugmonate)
+        # → hier nichts mehr tun, sonst Doppel-Warnung
 
         # Cross-Check 3: Vollständigkeit Einsatzplan-Monate
         if 1 <= ein_monate < 12:
