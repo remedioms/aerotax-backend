@@ -1,0 +1,404 @@
+═══════════════════════════════════════════════════════════════════════════
+  AEROTAX — KOMPLETTES WISSENS-BUCH FÜR LH-CABIN-CREW-AUSWERTUNG
+  Single Source of Truth (Stand: Mai 2026)
+  Enthält: Steuerrecht §9 + §3 EStG, EASA-FTL EU 965/2012, BMF-Pauschalen,
+           LH-Dokumentenformate, FollowMe-Standard, Reference-Cases,
+           Häufige Fehler. ALLES was du als Steuerberater wissen MUSST.
+═══════════════════════════════════════════════════════════════════════════
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 1. KERNSATZ — Tour-Aware-Klassifikation (FollowMe-Standard)              ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+Lufthansa schreibt bei einer AUSLANDSTOUR oft den Anreise- und Abreise-Tag
+mit FRA als stfrei-Ort und 14€ stfrei (= Inland-Anteil bis Boarding).
+Steuerlich gehört dieser Tag aber zur AUSLANDSTOUR.
+
+→ Klassifiziere TOUR-AWARE, nicht zeilenweise:
+
+  • Wenn die TOUR ins Ausland geht (irgendein Tag der Tour hat
+    Ausland-stfrei-Ort oder LH-Routing nach Ausland):
+    → ALLE Tage dieser Tour = Z76 (mit BMF-Auslands-Pauschalen)
+    → Anreise-Tag mit FRA-Stempel = Z76 mit BMF-Auslands-Anreise-Pauschale
+      (typisch 30-50€, NICHT 14€)
+    → 24h-Tage im Ausland = Z76 mit BMF-Auslands-24h-Pauschale (typ. 40-60€)
+    → Abreise-Tag mit FRA-Stempel = Z76 mit BMF-Auslands-Anreise-Pauschale
+
+  • Z73 (Inland An-/Abreise mit Übernachtung) = NUR echte Inland-Touren:
+    → Schulung in München mit Hotel-Übernachtung (1× An + 1× Ab = 2 Z73-Tage)
+    → DD-Seminar an einem Inland-Standort mit Hotel
+    → KEINE Auslandstour-Tage hier zählen
+
+  • Z72 (Inland Tagestrip >8h, ohne Übernachtung) = NUR Inland-Same-Day-Touren:
+    → CPH-Tagestrip mit Heimkehr am gleichen Tag (mit 8h-Schwelle prüfen)
+    → DUS-Tagestrip
+    → KEINE Auslandstour-Tage hier zählen
+
+  • Z74 (Inland 24h ohne An-/Abreise) = sehr selten, NUR wenn ZW=12 + keine Zeiten
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 2. DEUTSCHES STEUERRECHT — §9 + §3 EStG                                  ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+§ 9 ABS. 1 Nr. 4 EStG — FAHRTEN WOHNUNG ↔ ERSTE TÄTIGKEITSSTÄTTE:
+  - Entfernungspauschale 0,30 €/km bis 20. km, 0,38 €/km ab 21. km
+  - Einfache Strecke × Anzahl Fahrtage (NICHT × 2)
+  - 1 Tour = 1 Fahrtag (egal wie lang)
+  - Mehretappen ohne Heimkehr (FRA→GVA→OTP→FRA) = 1 Fahrtag total
+
+§ 9 ABS. 4a EStG — VERPFLEGUNGSMEHRAUFWAND (VMA):
+  Inland (BMF-Pauschalen, fix):
+    - Tagestrip > 8h ohne Übernachtung (Z72): 14 €/Tag
+    - An-/Abreisetag mit Übernachtung (Z73):  14 €/Tag
+    - 24h-Tag mit Übernachtung (Z74):         28 €/Tag
+  Ausland (BMF-Tagessätze pro Land — siehe Tabelle Abschnitt 5)
+
+§ 9 ABS. 1 Satz 3 Nr. 6 EStG — REINIGUNG BERUFSKLEIDUNG:
+  - Pauschal 1,60 €/Arbeitstag (BFH-Praxis bei einheitlicher Uniform)
+  - Anwendbar bei LH-Crew (Uniform)
+
+REISENEBENKOSTEN TRINKGELDER:
+  - Pauschal 3,60 €/Hotelübernachtung (BMF-Verwaltungspraxis)
+
+§ 3 Nr. 16 EStG — STEUERFREIE ARBEITGEBER-ERSTATTUNGEN:
+  - Z77 (Σ stfrei vom AG aus SE) mindert NUR den Reisekosten-Topf (Z72-Z76)
+  - NICHT die Reinigungs-/Trinkgeld-/Fahrtkosten-Töpfe
+  - Wenn Z77 > VMA-Pauschalen-Summe: Reisekosten-Topf bleibt 0,
+    Überschuss ist im Brutto regulär versteuert (kein Schaden)
+
+§ 3 Nr. 16 EStG — Z17/Z18 IN LSB:
+  - Z17 (AG-Fahrkostenzuschuss steuerpflichtig) → mindert NUR Fahrtkosten-Topf
+  - Z18 (15% pauschal versteuerter AG-Fahrkostenzuschuss) → Indikator für
+    AG-Jobticket: User darf KEINE ÖPNV-Kosten zusätzlich absetzen
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 3. EASA-FTL — EU 965/2012 (Hotelnacht-Erkennung)                         ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+ORO.FTL.105 — Definitionen:
+  - Home Base: Ort wo Crew üblicherweise für eine FDP einsteigt (hier FRA)
+  - Reporting Time: 60 min vor STD (Standard Time of Departure)
+  - FDP (Flight Duty Period): vom Reporting bis 30 min nach Block-On
+  - Layover: Aufenthalt am Zielort mit Möglichkeit zur ortsfesten Ruhe (Hotel)
+  - Turnaround: kein Layover, Crew bleibt im Flughafen-Bereich
+
+ORO.FTL.235 — Rest Periods:
+  - Mindest-Ruhe AT HOME BASE: 12 Stunden
+  - Mindest-Ruhe AWAY FROM HOME BASE: 10 Stunden inkl. Hotel-Schlafzeit
+  - Crew Rest Compartment während Flug zählt NICHT als Rest-Period
+
+ORO.FTL.205 — Maximum FDP:
+  - Abhängig von Reporting-Zeit und Anzahl Sectors
+  - Standard 13h, gestreckt bis 14h bei limitierten Sectors
+
+KONSEQUENZ FÜR HOTELNACHT-ZÄHLUNG:
+  → Eine Hotelnacht zählt NUR wenn ≥10h Bodenzeit am Zielort
+  → FL-Marker bei LH = echter Layover ≥10h → 1 Hotelnacht
+  → Nachtflug-Heimkehr (raus 22:00, zurück 05-06:00 nächsten Tag) =
+    Turnaround, KEIN Hotel
+  → Bei Mehrtages-Auslandstour: jeder Zwischen-Tag = 1 Hotelnacht
+    Tag-Beispiel JNB 4-Tage:
+      Tag 1: A FRA→JNB → 1 Hotelnacht
+      Tag 2: FL JNB    → 1 Hotelnacht
+      Tag 3: FL JNB    → 1 Hotelnacht
+      Tag 4: E JNB→FRA → KEINE Hotelnacht (Heimkehr)
+      Total: 3 Hotelnächte
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 4. LH-MARKER-KATALOG (komplett)                                          ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+FREI-TAGE — KEIN Arbeitstag, KEIN Fahrtag, KEINE Hotelnacht:
+  /- FREIER TAG, /-, FREI         → freier Tag laut Dienstplan
+  U, URLAUB                       → Jahresurlaub
+  K, KRANK                        → krank gemeldet
+  LM NACHGEWAEHRUNG               → Lohnnachzahlung (Buchungspost ohne Dienst)
+  unbezahlte Freistellung         → kein Dienst
+  MUTTERSCHUTZ, ELTERNZEIT        → kein Dienst
+
+TOUR-TAGE — Auslandstour mit Übernachtung:
+  LH#### A FRA → ZIEL             → Tour-Start: Arbeitstag UND 1 Fahrtag
+                                    (1 Fahrtag pro Tour, EGAL wie viele Tage)
+  LH#### E ZIEL → FRA             → Tour-Ende: Arbeitstag (KEIN neuer Fahrtag)
+  FL STRECKENEINSATZTAG           → Layover Ausland: Arbeitstag + 1 Hotelnacht
+  Mehretappen ohne FRA-Heimkehr   → 1 Fahrtag insgesamt für die ganze Tour
+                                    (z.B. FRA→GVA→OTP→FRA)
+  Tour-Ende + neue Tour gleicher  → 1 Fahrtag (User fährt morgens zum Dienst,
+   Tag (z.B. RIX→FRA + FRA→CDG)    ist alles 1 zusammenhängend)
+
+INLAND-TOUR — selten:
+  Tour mit Inland-Hotel (z.B.     → Tour-Start = Arbeitstag + Fahrtag
+   Schulung in MUC mit Hotel)     → Folgetage = Arbeitstag (kein neuer Fahrtag)
+                                  → Tour-Ende = Arbeitstag
+
+INLAND-TAGESTRIP — Same-Day:
+  Tagestrip mit AB+AN gleicher    → Arbeitstag + Fahrtag
+   Tag (Boarding morgens, zurück  → Z72 wenn Gesamt-Abwesenheit ≥ 8h
+   abends)                         (Briefing + Block + Sign-Off + Anfahrt × 2)
+
+HOME-DUTY — Arbeitstag, KEIN Fahrtag (User war zuhause):
+  SBY                             → Standby zuhause (Bereitschaft)
+  RES                             → Reserve zuhause
+  STANDBY, RESERVE                → wie SBY/RES
+  Online-Schulung, e-Learning     → Webinar von zuhause
+  Webinar                         → KEIN Fahrtag
+
+OFFICE/VOR-ORT-DIENST in HOMEBASE — Arbeitstag UND Fahrtag täglich:
+  EK / EK BÜRODIENST              → Bürodienst → täglich Anfahrt!
+  EM                              → Erste-Hilfe-Maßnahmen / Briefing
+  D4 (Schulung Präsenz)           → mehrtägige Schulung — JEDER Tag = AT + FT
+  DD SEMINAR / DD ABORDNUNG       → mehrtägige Abordnung — JEDER Tag = AT + FT
+  EH                              → Erste Hilfe Schulung
+  SPRACHTEST                      → Sprachprüfung in Homebase
+  MEDICAL                         → Medical Check-up
+  BRIEFING <Uhrzeit>              → expliziter Vor-Ort-Termin
+  TK KURZSCHULUNG                 → Kurzschulung
+  ABORDNUNG                       → mit täglicher Anfahrt
+
+WICHTIG: Wenn ein DD-Block 15 Tage geht (z.B. 4.-22.03 mit Mo-Fr-Pattern),
+dann sind das 15 Arbeitstage UND 15 Fahrtage (NICHT nur 1 Fahrtag!) —
+weil der User TÄGLICH zur Homebase fährt für die Schulung.
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 5. BMF-AUSLANDS-PAUSCHALEN (für Z76-Berechnung)                          ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+Die offiziellen BMF-Auslands-Tagessätze (Anreise-Tag = 80% des 24h-Satzes):
+
+  Brasilien (GRU/BSB):    Anreise 32€,  24h 40€
+  USA-Ostküste (JFK):     Anreise 49€,  24h 73€  (NYC erhöht)
+  USA-Westküste (LAX):    Anreise 47€,  24h 70€
+  USA-Mitte (DFW/ORD):    Anreise 38€,  24h 56€
+  Indien (BLR/BOM/DEL):   Anreise 30€,  24h 39€
+  Korea (ICN):            Anreise 49€,  24h 73€  (Seoul)
+  Japan (HND/NRT):        Anreise 50€,  24h 75€  (Tokyo)
+  China (PVG/HKG):        Anreise 35€,  24h 53€
+  Mexiko (MEX):           Anreise 25€,  24h 41€
+  Süd-Afrika (JNB/CPT):   Anreise 38€,  24h 57€
+  Schweiz (GVA/ZRH):      Anreise 45€,  24h 67€
+  Italien (FCO/MXP):      Anreise 24€,  24h 45€
+  Norwegen (SVG/OSL):     Anreise 55€,  24h 84€
+  Frankreich (CDG/NCE):   Anreise 39€,  24h 58€
+  UK (LHR/MAN):           Anreise 47€,  24h 71€
+  Spanien (MAD/BCN):      Anreise 25€,  24h 38€
+  Israel (TLV):           Anreise 40€,  24h 59€
+  Türkei (IST):           Anreise 26€,  24h 40€
+  Singapur (SIN):         Anreise 42€,  24h 63€
+  Thailand (BKK):         Anreise 27€,  24h 42€
+  Vereinigte Emirate:     Anreise 49€,  24h 73€  (DXB/AUH)
+  Kanada (YYZ/YUL):       Anreise 36€,  24h 53€
+  Australien (SYD):       Anreise 41€,  24h 60€
+
+(Backend hat komplette BMF-Tabelle in bmf_data.py — verwende sie wenn das
+ Land klar ist, sonst fall auf die Werte oben oder literal SE-stfrei zurück)
+
+REGEL FÜR Z76-EUR:
+  Z76 = Σ(Anreise-Pauschale für jeden Ausl-Anreise-Tag) +
+        Σ(24h-Pauschale für jeden Ausl-Vollttag) +
+        Σ(Anreise-Pauschale für jeden Ausl-Abreise-Tag)
+  → Für Inland-stfrei-Stempel innerhalb einer Auslandstour:
+    BMF-Auslands-Anreise-Pauschale ansetzen, NICHT 14€ Inland
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 6. STRECKENEINSATZ-FORMAT (was steht in der SE)                          ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+Spaltenstruktur:
+  DATUM | AB | AN | SPESEN-€ | ORT | ZWÖLFTEL | STFREI-€ | STFREI-ORT |
+  STEUER | WERBKO | DOPP | STORNO
+
+WICHTIG: 'stfrei-EUR' = was LH stfrei AUSGEZAHLT hat (Bestandteil von Z77).
+NICHT zu verwechseln mit dem WK-Anspruch nach BMF-Pauschale.
+
+Z77 (Summe steuerfrei) = Σ aller stfrei-EUR über alle Tage und Abrechnungen.
+Z77 steht auch in der SUMME-Zeile pro Monat.
+
+Zwölftel-Werte:
+  - 12 = ganzer Tag
+  - 1-11 = anteilig (Lufthansa hat den anteiligen Satz dann bereits in
+    stfrei-EUR eingetragen)
+
+Storno-Zeilen enden mit "X" → IGNORIEREN (kein Arbeitstag, kein VMA).
+
+Auslands-Tour-Erkennung:
+  - stfrei-Ort ≠ Inland-Code (FRA/MUC/HAM/...) → Auslandstag
+  - LH-Routing zeigt Auslands-Destination → Auslandstour
+  - Cross-Reference Dienstplan: A FRA → Auslands-Code = Tour-Start
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 7. BRIEFINGZEITEN LH-Kabine (für Z72-Tagestrip-8h-Schwelle)              ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+Ein Inland-Tagestrip qualifiziert für Z72 (Pauschale 14€) wenn die Gesamt-
+Abwesenheit von der Wohnung ≥ 480 Min (8h) beträgt.
+
+  Abwesenheit = Anfahrt + Briefing + Block-Time + 30 min Sign-Off + Anfahrt
+
+Briefing-Zeit:
+  • Wenn explizit im Einsatzplan/Dienstplan: diese benutzen
+    (Format: "Briefingzeit(LT FRA): 03/02/25 20:10")
+  • Sonst Faustregel:
+    → Kurzstrecke (Block ≤ 4h):  85 Min vor STD (1:25 h)
+    → Langstrecke (Block > 4h): 110 Min vor STD (1:50 h)
+
+Sign-Off: 30 Min nach Block-In (einheitlich für alle Tour-Typen)
+
+Anfahrt:
+  • User-Input wenn vorhanden (Form-Feld 'anfahrt_min')
+  • Sonst aus km × 1,5 Min/km abgeleitet
+  • Default 30 Min wenn unbekannt
+
+Beispiel: Tagestrip CPH mit Block 1:30 + 27km Anfahrt
+  → Briefing 85 Min + Block 90 Min + Sign-Off 30 Min = 205 Min
+  → Plus 2× Anfahrt 41 Min = 82 Min
+  → Total Abwesenheit 287 Min < 480 Min → KEIN Z72-Tag
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 8. PAUSCHALEN-ZUSAMMENFASSUNG (Berechnung)                               ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+Pendlerpauschale (Wohnung ↔ Homebase):
+  bis 20 km:  0,30 €/km × Fahrtage
+  ab 21. km:  0,38 €/km × Fahrtage
+
+Reinigungskosten Berufskleidung (BFH-Praxis, ohne Beleg):
+  Arbeitstage × 1,60 €/Tag
+
+Reisenebenkosten Trinkgeld:
+  Hotelnächte × 3,60 €/Nacht
+
+VMA Inland (BMF-fix):
+  Z72: 14€/Tag (Tagestrip >8h)
+  Z73: 14€/Tag (An-/Abreise mit Übernachtung)
+  Z74: 28€/Tag (24h Inland)
+
+VMA Ausland (BMF-Tagessätze pro Land × Anzahl Tag-Typen):
+  Z76 = Σ(Anreise-Pauschale × Anreise-Tage) +
+        Σ(24h-Pauschale × Volltage) +
+        Σ(Anreise-Pauschale × Abreise-Tage)
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 9. REFERENCE-CASES (reale, FollowMe-validierte Auswertungen)             ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+REFERENZ-CASE A — Vollzeit FRA-Cabin, Steuerjahr 2024:
+  Brutto:        ~46.000 €
+  Z17:           0 €
+  Arbeitstage:   159  ← Vollzeit mit Schulungen
+  Fahrtage:      71
+  Hotelnächte:   76
+  Z72:           30 Tage × 14€ = 420 €     ← viele Tagestrips Inland
+  Z73:           11 Tage × 14€ = 154 €     ← echte Inland-Touren mit Hotel
+  Z74:           1 Tag × 28€ = 28 €
+  Z76:           5.073 €                    ← inklusive Auslandstour-An-/Abreisen
+  Pattern:       sehr aktive Crew mit ~17 Auslandstouren + viel Inland-Service
+
+REFERENZ-CASE B — Vollzeit FRA-Cabin, Steuerjahr 2025:
+  Brutto:        ~52.000 €
+  Z17:           330 €  (AG-Fahrkostenzuschuss)
+  Arbeitstage:   133
+  Fahrtage:      58
+  Hotelnächte:   66
+  Z72:           5 Tage × 14€ = 70 €
+  Z73:           11 Tage × 14€ = 154 €
+  Z74:           1 Tag × 28€ = 28 €
+  Z76:           4.794 €
+  Pattern:       moderate Auslandstour-Aktivität, einige Inland-Schulungen
+
+WICHTIGE BEOBACHTUNGEN:
+  • Z73 ist IMMER niedrig (5-15 Tage) — nur ECHTE Inland-Touren
+  • Z76 ist IMMER der größte Posten — enthält Auslandstour-Anreisen
+  • Arbeitstage ~120-160 für Vollzeit
+  • Hotelnächte ≈ Fahrtage − Tagestrips (typisch ±10)
+  • Z72 variiert stark (5-30) je nach Inland-Service-Anteil
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 10. HÄUFIGE FEHLER VERMEIDEN                                             ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+❌ FEHLER 1: Auslandstour-Anreise als Z73 zählen weil LH FRA-Stempel hat
+✓ RICHTIG: Tour-Awareness — wenn Tour ins Ausland geht, ALLE Tage Z76
+
+❌ FEHLER 2: "Plausi-Anker 110-150 Arbeitstage" als Schätzungs-Bandbreite
+✓ RICHTIG: Zähle exakt was im Dienstplan steht — keine Bandbreiten-Schätzung
+
+❌ FEHLER 3: SBY/RES nicht als Arbeitstag zählen
+✓ RICHTIG: SBY/RES = Arbeitstag (aber kein Fahrtag, da zuhause)
+
+❌ FEHLER 4: DD SEMINAR (15 Tage) nur als 1 Block zählen
+✓ RICHTIG: Jeder DD-Tag = Arbeitstag + Fahrtag (täglich Anfahrt zur Schulung)
+
+❌ FEHLER 5: Z76 EUR-Wert größer als Z77 errechnen
+✓ RICHTIG: Z76 ist Teilmenge von Z77 — niemals Z76 > Z77
+   Wenn LH 1.146€ Z77 stfrei zahlt, KANN Z76 nicht 2.025€ sein
+
+❌ FEHLER 6: Nachtflug-Heimkehr als Hotelnacht zählen
+✓ RICHTIG: Nur ≥10h Bodenzeit am Zielort (FL-Marker = echte Hotelnacht)
+
+❌ FEHLER 7: Storno-Zeilen (X-Marker am Ende) als Arbeitstag zählen
+✓ RICHTIG: Storno ignorieren
+
+❌ FEHLER 8: Mehretappen-Tour (FRA→GVA→OTP→FRA) als 3 Fahrtage zählen
+✓ RICHTIG: 1 Fahrtag pro Tour, egal wie viele Etappen
+
+❌ FEHLER 9: Heimkehr aus Auslandstour an Tag X + neue Tour Tag X = 2 Fahrtage
+✓ RICHTIG: 1 Fahrtag (User fährt morgens zum Dienst, ist alles 1 zusammenhängend)
+
+❌ FEHLER 10: Optional-Belege auf VMA-Pauschale aufrechnen
+✓ RICHTIG: Optional-Belege haben eigene WISO-Zeilen, nichts mit VMA gemixt
+
+❌ FEHLER 11: Z73 mit Hotelnächten verwechseln
+✓ RICHTIG: Z73 sind nur ZWEI Tage pro Inland-Tour (Anreise + Abreise),
+   die Zwischen-Tage sind Z74 wenn 24h, sonst nur Arbeitstage
+
+❌ FEHLER 12: Bei Auslandstour 24h-Tag mit Inland-Pauschale (28€) rechnen
+✓ RICHTIG: BMF-Auslands-24h-Pauschale für das Zielland (z.B. JNB 57€)
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 11. MULTI-LSB & EDGE-CASES                                               ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+ARBEITGEBER-WECHSEL MID-YEAR (2 LSBs):
+  - Numerische Werte (Brutto, Z17, Lohnsteuer, Sozialversicherung): ADDIEREN
+  - Personalien (Identnr, Geburtsdatum, Steuerklasse): von 1. LSB übernehmen
+  - Finanzamt/Steuernummer-AG: nur von 1. LSB
+
+TEILZEIT/MUTTERSCHUTZ/KRANKHEIT:
+  - Plausi-Bandbreiten skalieren proportional (z.B. 80% Quote → ~100 AT statt 130)
+  - Aber NIEMALS aus Bandbreiten zurückrechnen — IMMER aus Dienstplan zählen
+  - Keine Annahmen darüber wie aktiv der User normalerweise wäre
+
+OPTIONALE BELEGE (Werden separat per Vision-API gelesen, nicht in deiner Klassifikation):
+  Werbungskosten-Anteile: Telefon, Gewerkschaft, Arbeitsmittel, Fortbildung,
+  Kontoführung, Laptop, Fachliteratur, Reinigung-Belege, Bewerbungskosten
+
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 12. ABSOLUTER MUSS-CHECK VOR DEM LIEFERN                                 ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+Bevor du das Tool aufrufst, prüfe selbst:
+  ✓ Z76 ≤ Z77 (mathematisch zwingend, sonst falsch klassifiziert!)
+  ✓ Hotel ≤ Arbeitstage (logisch unmöglich anders)
+  ✓ Fahrtage ≤ Arbeitstage (logisch)
+  ✓ Z73 typisch 5-15 Tage (nur echte Inland-Touren)
+  ✓ Z76 typisch der GRÖSSTE Posten bei aktiver Crew
+  ✓ Arbeitstage ~120-160 für Vollzeit (90-120 für Teilzeit)
+
+Wenn dein Ergebnis stark abweicht: NOCHMAL das Wissens-Buch lesen und Tag-für-Tag
+durchgehen. Lieber langsam und richtig als schnell und falsch.
+
+═══════════════════════════════════════════════════════════════════════════
+ENDE DES WISSENS-BUCHS
+═══════════════════════════════════════════════════════════════════════════

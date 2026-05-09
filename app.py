@@ -2240,8 +2240,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '4.0',
-        'build':   'hybrid-sonnet-opus-singlesource-2026-05-09',
+        'version': '4.1',
+        'build':   'wissensbuch-konsolidiert-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5064,83 +5064,53 @@ def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebas
         }
     }
 
-    prompt = f"""Du bist Senior-Steuerberater spezialisiert auf Lufthansa-Kabinenpersonal — und du arbeitest streng nach FollowMe-Standard (= konservativ, FA-akzeptiert).
+    # Wissens-Buch laden — Single Source of Truth.
+    # NUR referenz_faelle.txt laden (konsolidiert: §9 EStG, §3 Nr. 16, EASA-FTL,
+    # BMF-Pauschalen, LH-Marker-Katalog, FollowMe-Standard, Reference-Cases,
+    # Häufige Fehler). Die alte referenz_easa.txt wird NICHT mehr geladen weil sie
+    # widersprüchliche VMA-Klassifikations-Logik enthält.
+    wissensbuch = ''
+    try:
+        ref_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'referenz_faelle.txt')
+        if os.path.exists(ref_path):
+            with open(ref_path, encoding='utf-8') as f:
+                wissensbuch = f.read()
+    except Exception as e:
+        print(f"[Opus-Klassifikation] Wissens-Buch laden fail: {e}")
 
-Dein Auftrag: Lies die {pdf_count} hochgeladenen PDFs (Dienstplan/Flugstunden, Einsatzplan/CAS, Streckeneinsatz-Abrechnungen) für Steuerjahr {year} und klassifiziere jeden Tag des Jahres.
+    prompt = f"""Du bist Senior-Steuerberater spezialisiert auf Lufthansa-Kabinenpersonal.
 
-═══ HOMEBASE: {homebase} ═══
+═══════════════════════════════════════════════════════════════════════════
+INSTITUTIONELLES WISSEN — VERPFLICHTEND ZU LESEN UND ANZUWENDEN
+═══════════════════════════════════════════════════════════════════════════
 
-═══ LH-MARKER-KATALOG (lies, klassifiziere, zähle) ═══
+{wissensbuch}
 
-Frei-Tage (KEIN Arbeitstag, KEIN Fahrtag, KEIN Hotel):
-- FREI / FREIER TAG / "/-"
-- U / URLAUB
-- K / KRANK
-- LM NACHGEWAEHRUNG (Lohnnachzahlung ohne Dienst)
-- unbezahlte Freistellung
+═══════════════════════════════════════════════════════════════════════════
+DEIN AUFTRAG JETZT
+═══════════════════════════════════════════════════════════════════════════
 
-Tour-Tage (Auslands-Tour mit Übernachtung):
-- LH#### A {homebase} → ZIEL = Tour-Start: Arbeitstag UND 1 Fahrtag (pro Tour, nicht pro Tag!)
-- LH#### E ZIEL → {homebase} = Tour-Ende: Arbeitstag (KEIN neuer Fahrtag)
-- FL STRECKENEINSATZTAG = Layover im Ausland: Arbeitstag UND 1 Hotelnacht
-- Mehretappen ohne Heimkehr (z.B. FRA→GVA→OTP→FRA) = 1 Fahrtag total
-- Folge-Tage einer Tour = jeweils Arbeitstag (kein Fahrtag, kein neues Hotel ausser FL-Marker)
+Mandant: Lufthansa-Kabinenbesatzung mit Homebase {homebase}, Steuerjahr {year}.
+Du bekommst {pdf_count} PDFs: Dienstplan/Flugstunden, Einsatzplan (CAS), Streckeneinsatz.
 
-Home-Duty (Arbeitstag, KEIN Fahrtag — User war zuhause):
-- SBY / RES / Standby / Reserve / Bereitschaft zuhause
-- Online-Schulung, e-Learning, Webinar von zuhause
+VORGEHEN:
+1. Gehe Tag für Tag durch (1.1.{year} bis 31.12.{year})
+2. Pro Tag: identifiziere Marker (Dienstplan + Einsatzplan)
+3. Cross-Reference mit SE für stfrei-Werte
+4. Klassifiziere nach Marker-Katalog im Wissens-Buch
+5. Wende TOUR-AWARENESS an (Wissens-Buch Regel #1)
+6. Aggregiere am Ende
 
-Office/Vor-Ort-Dienst in {homebase} (Arbeitstag UND Fahrtag täglich):
-- EK / EK BÜRODIENST
-- EM (Erste-Hilfe / Briefing)
-- D4 (Schulung Präsenz — JEDER Tag = Arbeitstag + Fahrtag)
-- DD SEMINAR / DD ABORDNUNG (mehrtägig — JEDER Tag = Arbeitstag + Fahrtag, da täglich Anreise)
-- EH (Erste Hilfe), Sprachtest, Medical
-- BRIEFING mit Uhrzeit am {homebase}
+KRITISCH: Beachte besonders die "Häufigen Fehler" aus dem Wissens-Buch.
+Vor dem Liefern: prüfe die Muss-Checks (Z76 ≤ Z77, Hotel ≤ Arbeitstage, etc.)
 
-═══ EASA-FTL Layover-Regel ═══
-FL-Marker bei LH = echter Layover ≥10h Bodenzeit am Zielort = 1 Hotelnacht.
-Nachtflug-Heimkehr (z.B. raus 22:00, zurück 06:00 nächsten Tag) = Turnaround, KEIN Hotel.
-Bei mehrtägiger Auslandstour: jeder Zwischen-Tag = 1 Hotelnacht.
+NACHWEIS: Liefere im 'nachweis'-Feld eine Monat-für-Monat-Zusammenfassung.
+Pro Monat 1-3 Sätze: was waren die Touren, wie viele Arbeitstage/Fahrtage/Hotel.
+Bei kontroversen Klassifizierungen: kurze Begründung im Nachweis (z.B.
+"08.03 BLR-Tour-Anreise: zähle als Z76 mit Indien-Anreise-Pauschale 30€").
 
-═══ BRIEFINGZEITEN LH-Kabine (für Z72-Tagestrip-8h-Schwelle) ═══
-- Wenn explizit im Einsatzplan/Dienstplan: diese benutzen (z.B. "Briefingzeit(LT FRA): 03/02/25 20:10")
-- Sonst Faustregel:
-  → Kurzstrecke (Block ≤ 4h):  85 Min vor STD (1:25 h)
-  → Langstrecke (Block > 4h): 110 Min vor STD (1:50 h)
-- Plus 30 Min Sign-Off nach Block-In, einheitlich
-- Inland-Tagestrip qualifiziert für Z72 wenn Gesamtabwesenheit ≥ 480 min (8h)
-  (= 2× Anfahrt + Briefing + Block + 30 min Sign-Off)
-
-═══ VMA-KLASSIFIKATION nach SE-stfrei-Ort (FollowMe-Methode KONSERVATIV) ═══
-
-Pro SE-Tageszeile:
-- stfrei-Ort = INLAND (FRA/MUC/HAM/...): klassifiziere nach Tag-Typ
-  → AB+AN gleicher Tag = Z72 (Tagestrip, mit Briefingzeit-Check 8h-Schwelle)
-  → nur AB ODER nur AN (mit Übernachtung) = Z73 (An-/Abreise)
-  → keine Zeiten + Zwölftel=12 = Z74 (24h Inland, selten)
-- stfrei-Ort = AUSLAND (GRU/JFK/SEL/...): Z76 mit literal stfrei-Wert
-
-WICHTIG (FollowMe-Methode): Wenn LH am Anreise-Tag einer Auslandstour 14€ FRA-stfrei schreibt,
-zählt das als Z73 (NICHT als Z76 mit Auslandspauschale aufwerten). Konservativ ist sicherer
-beim Finanzamt.
-
-═══ VORGEHEN ═══
-
-1. Gehe Tag für Tag durch (1.1.{year} bis 31.12.{year}).
-2. Pro Tag: schaue Dienstplan + Einsatzplan + SE.
-3. Identifiziere Marker → klassifiziere → zähle.
-4. Aggregiere am Ende:
-   - arbeitstage, fahr_tage, hotel_naechte
-   - z72_tage, z73_tage, z74_tage (mit BMF-Pauschale × Tage = EUR)
-   - z76_eur = Σ stfrei-Werte mit Auslands-Stempel aus SE
-5. Schreibe einen Nachweis-Text Monat für Monat (1-3 Sätze pro Monat).
-
-═══ NICHT ═══
-- KEINE "Plausi-Bandbreiten" anwenden ("normal sind 110-150 Arbeitstage" → ignorieren!)
-- KEINE Werte erfinden — wenn Marker unklar, in `unklare_tage` listen
-- KEINE Auslands-Pauschalen für Inland-Anreise von Auslandstouren (FollowMe-konservativ!)
-- KEINE Tagestrips ohne 8h-Schwellen-Check als Z72 (mit Briefingzeit prüfen)
+UNKLARE TAGE: wenn Marker nicht eindeutig zuzuordnen, in 'unklare_tage' listen
+mit Begründung. NIE raten, lieber als unklar markieren.
 
 Liefere via Tool das strukturierte Ergebnis."""
 
