@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '6.0.8',
-        'build':   'normalize-classifications-rescue-aggregation-2026-05-09',
+        'version': '7.0',
+        'build':   'deterministic-dp-se-matching-no-opus-classify-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5830,7 +5830,9 @@ def _aggregate_v6_classification(classifications, structured_days, year=2025):
 
 
 def _get_bmf_for_iata(iata, year):
-    """Hilfsfunktion: BMF-Auslandspauschale für einen IATA-Code via BMF_AUSLAND_BY_YEAR + IATA_TO_BMF."""
+    """Hilfsfunktion: BMF-Auslandspauschale für einen IATA-Code.
+    Liefert dict {voll_24h, an_abreise} oder None.
+    bmf_data.py speichert tuple (voll_24h, an_abreise) — wird hier konvertiert."""
     if not iata:
         return None
     iata_upper = iata.upper().strip()
@@ -5842,9 +5844,494 @@ def _get_bmf_for_iata(iata, year):
         if not land:
             return None
         bmf_year = BMF_AUSLAND_BY_YEAR.get(year) or BMF_AUSLAND_BY_YEAR.get(2025)
-        return bmf_year.get(land)
+        raw = bmf_year.get(land)
+        if not raw:
+            return None
+        # tuple (voll_24h, an_abreise) → dict
+        if isinstance(raw, tuple) and len(raw) >= 2:
+            return {'voll_24h': float(raw[0]), 'an_abreise': float(raw[1])}
+        if isinstance(raw, dict):
+            return raw
+        return None
     except Exception:
         return None
+
+
+def _sonnet_read_se_structured(pdf_bytes_list, year=2025):
+    """v7.0: Sonnet liest SE-PDFs strukturiert PRO ZEILE (jede Tour-/Tag-Zeile).
+    Liefert Liste von SE-Zeilen mit datum, stfrei-Betrag, stfrei-Ort, Zwölftel,
+    Storno-Flag. Backend nutzt das als steuerlichen Anker für Z72/Z73/Z76.
+
+    SE-Format pro Zeile (typische Lufthansa-Streckeneinsatz-Abrechnung):
+      DATUM | AB | AN | SPESEN-€ | ORT | ZWÖLFTEL | STFREI-€ | STFREI-ORT |
+      STEUER | WERBKO | DOPP | STORNO
+
+    Output:
+    {
+      "se_lines": [
+        {
+          "datum": "2025-03-04",
+          "stfrei_betrag": 30.00,
+          "stfrei_ort": "BLR",
+          "stfrei_inland": false,
+          "zwoelftel": 12,         # 12 = ganzer Tag, 1-11 = anteilig
+          "storno": false,
+          "gesamt": 60.00,
+          "steuerpflichtig": 30.00,
+          "ort_routing": "FRA-BLR"  # Optional: wenn ablesbar
+        },
+        ...
+      ],
+      "z77_total": 4655.00,
+      "warnings": [...]
+    }
+    """
+    if not pdf_bytes_list or not ANTHROPIC_KEY:
+        return None
+    pdf_bytes_list = _bytes_list(pdf_bytes_list)
+    if not pdf_bytes_list:
+        return None
+
+    se_struct_tool = {
+        'name': 'submit_se_lines',
+        'description': 'Liefere alle SE-Zeilen strukturiert pro Datum — keine steuerliche Klassifikation.',
+        'input_schema': {
+            'type': 'object',
+            'required': ['se_lines'],
+            'properties': {
+                'se_lines': {
+                    'type': 'array',
+                    'description': f'Eine Zeile pro Datum mit dienstlicher Aktivität in {year}. Storno-Zeilen MIT storno=true mitliefern (NICHT weglassen — Backend filtert).',
+                    'items': {
+                        'type': 'object',
+                        'required': ['datum'],
+                        'properties': {
+                            'datum': {'type': 'string', 'description': 'YYYY-MM-DD'},
+                            'stfrei_betrag': {'type': 'number', 'description': 'Steuerfrei-Betrag aus Spalte STFREI-€ (0 wenn keiner)'},
+                            'stfrei_ort': {'type': 'string', 'description': '3-Letter-IATA-Code aus Spalte STFREI-ORT (z.B. FRA, BLR, MUC) oder leer'},
+                            'stfrei_inland': {'type': 'boolean', 'description': 'true wenn stfrei_ort einer von FRA/MUC/HAM/DUS/STR/CGN/HAJ/BER/LEJ/NUE/BRE'},
+                            'zwoelftel': {'type': 'integer', 'description': 'Spalte ZWÖLFTEL: 12 = ganzer Tag, 1-11 = anteilig'},
+                            'storno': {'type': 'boolean', 'description': 'true wenn STORNO-Spalte X enthält oder Zeile durchgestrichen ist'},
+                            'gesamt': {'type': 'number', 'description': 'Spalte GESAMT/SPESEN-€ (gesamter Spesen-Betrag)'},
+                            'steuerpflichtig': {'type': 'number', 'description': 'Spalte STEUER (steuerpflichtiger Anteil)'},
+                            'ort_routing': {'type': 'string', 'description': 'Optional: Routing wenn aus AB/AN ablesbar, z.B. FRA-BLR'},
+                        }
+                    }
+                },
+                'z77_total': {'type': 'number', 'description': 'Σ aller stfrei_betrag wo storno=false. Sollte mit SUMME-Zeile in PDF matchen.'},
+                'warnings': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Lese-Warnungen z.B. unklare Spalten, fehlende Werte'},
+            }
+        }
+    }
+
+    content = []
+    for pdf_bytes in pdf_bytes_list[:14]:
+        try:
+            content.append({
+                'type': 'document',
+                'source': {'type': 'base64', 'media_type': 'application/pdf',
+                           'data': base64.b64encode(pdf_bytes).decode()}
+            })
+        except: pass
+    if not content:
+        return None
+
+    prompt = f"""Du bist ein DOKUMENTEN-PARSER für Lufthansa-Streckeneinsatz-Abrechnungen ({year}).
+
+═════ ZWINGEND: TOOL VERWENDEN ══════════════════════════════════════════════
+
+Du MUSST das Tool 'submit_se_lines' aufrufen. Antworte NICHT mit Freitext.
+
+═════ AUFGABE ════════════════════════════════════════════════════════════════
+
+Lies ALLE Zeilen aus den SE-Abrechnungen Tag-für-Tag. Liefere pro Zeile:
+  • datum (YYYY-MM-DD)
+  • stfrei_betrag (Spalte STFREI-€)
+  • stfrei_ort (Spalte STFREI-ORT, z.B. FRA, BLR, MUC)
+  • stfrei_inland (true wenn FRA/MUC/HAM/DUS/STR/CGN/HAJ/BER/LEJ/NUE/BRE)
+  • zwoelftel (Spalte ZWÖLFTEL, typisch 12 = ganzer Tag)
+  • storno (true wenn X-Marker oder durchgestrichen)
+  • gesamt (gesamter Spesen-Betrag)
+  • steuerpflichtig (steuerpflichtiger Anteil)
+  • ort_routing (z.B. "FRA-BLR" wenn AB/AN-Spalten ablesbar)
+
+═════ STORNO ══════════════════════════════════════════════════════════════════
+
+Storno-Zeilen MIT storno=true mitliefern. Backend filtert sie selbst.
+Storno-Indizien: X-Marker in STORNO-Spalte, durchgestrichene Zeile,
+mehrere Zeilen pro selben Datum (eine echte + eine Storno).
+
+═════ Z77-VERIFIKATION ════════════════════════════════════════════════════════
+
+Berechne z77_total = Σ stfrei_betrag wo storno=false.
+Sollte mit der SUMME-Zeile am Ende jeder Monats-Abrechnung übereinstimmen.
+
+═════ KOMPAKTHEIT ═════════════════════════════════════════════════════════════
+
+Halte ort_routing kurz (max 30 Zeichen). Bei ~150-250 Zeilen über 12 Monate
+sollte der Output in 32k Tokens passen.
+
+LIEFERE jetzt via Tool die strukturierten SE-Zeilen."""
+
+    content.append({'type': 'text', 'text': prompt})
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=300.0)
+    import time as _t
+    start = _t.time()
+    try:
+        resp = None
+        for attempt in range(2):
+            try:
+                resp = client.messages.create(
+                    model='claude-sonnet-4-6', max_tokens=32000,
+                    tools=[se_struct_tool],
+                    tool_choice={'type': 'tool', 'name': 'submit_se_lines'},
+                    messages=[{'role': 'user', 'content': content}]
+                )
+                break
+            except Exception as e:
+                if attempt == 1: raise
+                print(f"[Sonnet-SE-Structured] retry: {str(e)[:100]}")
+                _t.sleep(5)
+        elapsed = _t.time() - start
+        stop_reason = getattr(resp, 'stop_reason', None) if resp else 'no_response'
+        usage = getattr(resp, 'usage', None) if resp else None
+        if usage:
+            in_tok = getattr(usage, 'input_tokens', '?')
+            out_tok = getattr(usage, 'output_tokens', '?')
+            print(f"[Sonnet-SE-Structured] resp stop={stop_reason} in_tok={in_tok} out_tok={out_tok}")
+        tool_input = None
+        for block in (resp.content if resp else []):
+            btype = getattr(block, 'type', None) if not isinstance(block, dict) else block.get('type')
+            bname = getattr(block, 'name', None) if not isinstance(block, dict) else block.get('name')
+            if btype == 'tool_use' and (bname == 'submit_se_lines' or bname is None):
+                tool_input = block.get('input') if isinstance(block, dict) else getattr(block, 'input', None)
+                if tool_input:
+                    break
+        if not tool_input:
+            print(f"[Sonnet-SE-Structured] kein tool_input — stop={stop_reason}")
+            return None
+        tool_input = _ensure_dict(tool_input) if not isinstance(tool_input, dict) else tool_input
+        se_lines_raw = tool_input.get('se_lines', []) or []
+        se_lines = _normalize_v6_classifications(se_lines_raw)
+        se_lines = [s for s in se_lines if s.get('datum')]
+        # layover_inland aus stfrei_ort ableiten falls nicht gesetzt
+        for s in se_lines:
+            if 'stfrei_inland' not in s or s.get('stfrei_inland') is None:
+                ort = s.get('stfrei_ort', '')
+                s['stfrei_inland'] = _is_inland_code(ort) if ort else None
+            s.setdefault('storno', False)
+            s.setdefault('zwoelftel', 12)
+            s.setdefault('stfrei_betrag', 0)
+            s.setdefault('stfrei_ort', '')
+        z77_total = float(tool_input.get('z77_total', 0) or 0)
+        warnings = [str(w) for w in (tool_input.get('warnings', []) or [])]
+        non_storno = [s for s in se_lines if not s.get('storno')]
+        z77_calc = sum(float(s.get('stfrei_betrag', 0) or 0) for s in non_storno)
+        print(f"[Sonnet-SE-Structured] {elapsed:.1f}s: {len(se_lines)} Zeilen ({len(non_storno)} aktiv, {len(se_lines)-len(non_storno)} Storno) — z77_total={z77_total:.2f}€ z77_calc={z77_calc:.2f}€")
+        return {
+            'se_lines': se_lines,
+            'z77_total': max(z77_total, z77_calc),
+            'warnings': warnings,
+        }
+    except Exception as e:
+        print(f"[Sonnet-SE-Structured] fail: {type(e).__name__}: {str(e)[:200]}")
+        return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v7.0 DETERMINISTIC CLASSIFICATION
+# Sonnet liest DP+SE strukturiert. Backend matcht pro Datum + klassifiziert
+# deterministisch. Opus nur für unklare Edge-Cases.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _match_dp_se_per_day(structured_days, se_structured):
+    """Matcht DP-Tagesdaten + SE-Zeilen pro Kalendertag.
+    Liefert Liste von matched_days mit dp + se + initial_klass + needs_opus.
+    Storno-SE-Zeilen werden gefiltert.
+    """
+    if not structured_days or not structured_days.get('days'):
+        return []
+    dp_days = structured_days['days']
+    # SE: Datum → liste aktive Zeilen (Storno gefiltert)
+    se_by_date = {}
+    if se_structured and se_structured.get('se_lines'):
+        for s in se_structured['se_lines']:
+            if s.get('storno'):
+                continue
+            datum = s.get('datum')
+            if not datum:
+                continue
+            se_by_date.setdefault(datum, []).append(s)
+
+    matched = []
+    for d in dp_days:
+        datum = d.get('datum')
+        if not datum:
+            continue
+        se_for_day = se_by_date.get(datum, [])
+        # Aggregate SE-Daten für diesen Tag (mehrere Zeilen pro Tag möglich)
+        stfrei_total = sum(float(s.get('stfrei_betrag', 0) or 0) for s in se_for_day)
+        # Dominanten stfrei_ort: höchster Betrag
+        if se_for_day:
+            best = max(se_for_day, key=lambda s: float(s.get('stfrei_betrag', 0) or 0))
+            stfrei_ort = best.get('stfrei_ort', '')
+            stfrei_inland = best.get('stfrei_inland')
+            zwoelftel = best.get('zwoelftel', 12)
+        else:
+            stfrei_ort = ''
+            stfrei_inland = None
+            zwoelftel = 0
+        matched.append({
+            'datum': datum,
+            'dp': d,
+            'se': {
+                'stfrei_total': stfrei_total,
+                'stfrei_ort': stfrei_ort,
+                'stfrei_inland': stfrei_inland,
+                'zwoelftel': zwoelftel,
+                'lines': se_for_day,
+                'count': len(se_for_day),
+            },
+        })
+    return matched
+
+
+def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA'):
+    """v7.0 Backend-Klassifikator: deterministisch aus DP+SE pro Tag.
+    Liefert dict mit z72_tage/z73_tage/z74_tage/z76_eur + tage_detail + unklare_tage.
+
+    Regel-Priorität:
+    1. activity_type == 'frei'/'urlaub'/'krank' → kein VMA, nicht zählen
+    2. activity_type == 'standby' → AT (kein VMA)
+    3. activity_type == 'office' → Office, kein VMA
+    4. activity_type == 'training':
+       a. overnight_after_day=true UND (Vortag training+overnight ODER nicht eindeutig Heimkehr) → Z73 Anreise
+       b. overnight=false UND Vortag training+overnight=true → Z73 Abreise
+       c. mehrtägige Schulung Mitte → Office (kein VMA)
+       d. Eintägig Office am Homebase → Office
+    5. activity_type == 'same_day' → Z72 (Hard-Gate: keine overnight, kein FL)
+    6. activity_type == 'tour':
+       a. SE-Zeile mit stfrei_inland=true → Z73 Anreise/Abreise (an/abreisetag), Volltag = kein VMA
+       b. SE-Zeile mit stfrei_inland=false → Z76 mit BMF-Pauschale aus stfrei_ort
+       c. Keine SE-Zeile aber DP.routing zeigt Inland → Z73 (konservativ)
+       d. Keine SE-Zeile + Auslands-Routing → Z76 mit BMF aus Routing-Code
+    7. Edge-Cases (mehrere Aktivitäten am Tag, Mismatch DP↔SE) → unklar (für Opus)
+    """
+    bmf_inland = BMF_INLAND_BY_YEAR.get(year, BMF_INLAND_BY_YEAR[2025])
+    NICHT_AT = {'frei', 'urlaub', 'krank', 'unknown', 'none'}
+
+    # Sortiert nach Datum für Vortag/Folgetag-Lookups
+    sorted_days = sorted(matched_days, key=lambda m: m.get('datum', ''))
+    by_date = {m['datum']: i for i, m in enumerate(sorted_days)}
+
+    z72_tage = 0
+    z73_tage = 0
+    z74_tage = 0
+    z76_eur = 0.0
+    arbeitstage = 0
+    fahr_tage = 0
+    hotel_naechte = 0
+    unklare = []
+    tage_detail = []
+
+    for i, m in enumerate(sorted_days):
+        d = m['dp']
+        se = m['se']
+        datum = m['datum']
+        at = d.get('activity_type', 'unknown')
+        overnight = bool(d.get('overnight_after_day'))
+        has_fl = bool(d.get('has_fl'))
+
+        # Vortag/Folgetag holen
+        prev = sorted_days[i-1] if i > 0 else None
+        next_ = sorted_days[i+1] if i+1 < len(sorted_days) else None
+        prev_overnight = bool(prev and prev['dp'].get('overnight_after_day'))
+        prev_at = prev['dp'].get('activity_type', '') if prev else ''
+
+        # Hotel-Nacht zählen
+        if overnight:
+            hotel_naechte += 1
+
+        # Frei/Urlaub/Krank: nichts
+        if at in NICHT_AT:
+            continue
+
+        arbeitstage += 1
+        klass = 'Sonstiges'
+        begruendung = ''
+        eur_added = 0.0
+
+        # Klassifikation
+        if at == 'standby':
+            klass = 'Standby'
+            begruendung = 'Standby zuhause — AT, kein FT, kein VMA'
+
+        elif at == 'office':
+            klass = 'Office'
+            begruendung = 'Office am Homebase — täglich Anfahrt'
+            fahr_tage += 1
+
+        elif at == 'training':
+            if overnight and prev_at != 'training':
+                # Anreise zur Schulung
+                klass = 'Z73'
+                begruendung = 'Schulung mit Hotel — Anreisetag'
+                z73_tage += 1
+                eur_added = bmf_inland['an_abreise']
+                fahr_tage += 1
+            elif (not overnight) and prev_at == 'training' and prev_overnight:
+                # Abreise von der Schulung
+                klass = 'Z73'
+                begruendung = 'Schulung mit Hotel — Abreisetag'
+                z73_tage += 1
+                eur_added = bmf_inland['an_abreise']
+            elif overnight and prev_at == 'training':
+                # Volltag mitten in Schulung — kein VMA, nur AT
+                klass = 'Office'
+                begruendung = 'Schulung mit Hotel — Volltag (kein VMA)'
+            else:
+                # Eintägige Schulung am Homebase oder eindeutig keine Übernachtung
+                klass = 'Office'
+                begruendung = 'Schulung am Homebase'
+                fahr_tage += 1
+
+        elif at == 'same_day':
+            # Z72-Hard-Gate
+            if has_fl or overnight:
+                klass = 'Sonstiges'
+                begruendung = 'Same-Day verletzt Hard-Gate (FL oder overnight)'
+                unklare.append(f'{datum}: same_day mit has_fl={has_fl} overnight={overnight}')
+            elif prev_overnight:
+                # Heimkehr aus Vortag-Tour — kein zusätzliches Z72
+                klass = 'Sonstiges'
+                begruendung = 'Heimkehr aus mehrtägiger Tour (Mischfall) — separater Tour-Abschluss'
+            else:
+                klass = 'Z72'
+                begruendung = 'Same-Day-Tagestrip — A+E selber Tag, kein FL'
+                z72_tage += 1
+                eur_added = bmf_inland['tagestrip_8h']
+                fahr_tage += 1
+
+        elif at == 'tour':
+            # Tour-Anreise vs Volltag vs Abreise erkennen
+            is_anreise = not prev_overnight
+            is_abreise = not overnight
+            # Fahrtag nur bei Anreise (User fährt von Homebase los)
+            if is_anreise:
+                fahr_tage += 1
+
+            if se.get('count', 0) > 0:
+                # SE-Zeile vorhanden — primärer Anker
+                if se.get('stfrei_inland') is True:
+                    # Inland-Tour
+                    if is_anreise or is_abreise:
+                        klass = 'Z73'
+                        begruendung = f'Inland-Tour {se.get("stfrei_ort","")} (SE) — An/Abreise'
+                        z73_tage += 1
+                        eur_added = bmf_inland['an_abreise']
+                    else:
+                        klass = 'Office'
+                        begruendung = f'Inland-Tour {se.get("stfrei_ort","")} — Volltag (kein VMA)'
+                elif se.get('stfrei_inland') is False:
+                    # Auslands-Tour
+                    klass = 'Z76'
+                    bmf_aus = _get_bmf_for_iata(se.get('stfrei_ort', ''), year)
+                    if bmf_aus:
+                        satz = bmf_aus.get('an_abreise', 0) if (is_anreise or is_abreise) else bmf_aus.get('voll_24h', 0)
+                        eur_added = float(satz or 0)
+                    else:
+                        eur_added = 28.0  # Fallback
+                    z76_eur += eur_added
+                    begruendung = f'Auslandstour {se.get("stfrei_ort","")} ({"An/Ab" if (is_anreise or is_abreise) else "Volltag"})'
+                else:
+                    # SE vorhanden aber stfrei_inland unklar → Routing prüfen
+                    routing_code = (d.get('routing') or [''])[-1] if d.get('routing') else se.get('stfrei_ort', '')
+                    if routing_code and _is_inland_code(routing_code):
+                        klass = 'Z73' if (is_anreise or is_abreise) else 'Office'
+                        if klass == 'Z73':
+                            z73_tage += 1
+                            eur_added = bmf_inland['an_abreise']
+                        begruendung = f'Tour mit unklarem stfrei_ort, Routing→Inland {routing_code}'
+                        unklare.append(f'{datum}: stfrei_inland unklar, Routing={routing_code} → konservativ Inland')
+                    else:
+                        klass = 'Z76'
+                        bmf_aus = _get_bmf_for_iata(routing_code, year)
+                        if bmf_aus:
+                            eur_added = float(bmf_aus.get('an_abreise' if (is_anreise or is_abreise) else 'voll_24h', 0) or 0)
+                        else:
+                            eur_added = 28.0
+                        z76_eur += eur_added
+                        begruendung = f'Tour {routing_code} → Auslandstour (Routing)'
+                        unklare.append(f'{datum}: stfrei_inland unklar, Routing={routing_code} → Z76')
+            else:
+                # KEINE SE-Zeile, nur DP — Routing als Anker
+                routing_code = (d.get('routing') or [''])[-1] if d.get('routing') else ''
+                layover_ort = d.get('layover_ort', '') or routing_code
+                if layover_ort and _is_inland_code(layover_ort):
+                    if is_anreise or is_abreise:
+                        klass = 'Z73'
+                        z73_tage += 1
+                        eur_added = bmf_inland['an_abreise']
+                    else:
+                        klass = 'Office'
+                    begruendung = f'Tour ohne SE — Inland-Layover {layover_ort}'
+                elif layover_ort:
+                    klass = 'Z76'
+                    bmf_aus = _get_bmf_for_iata(layover_ort, year)
+                    if bmf_aus:
+                        eur_added = float(bmf_aus.get('an_abreise' if (is_anreise or is_abreise) else 'voll_24h', 0) or 0)
+                    else:
+                        eur_added = 28.0
+                    z76_eur += eur_added
+                    begruendung = f'Tour ohne SE — Auslands-Layover {layover_ort}'
+                else:
+                    klass = 'Sonstiges'
+                    begruendung = 'Tour ohne SE und ohne Routing — unklar'
+                    unklare.append(f'{datum}: Tour ohne SE-Zeile, kein Routing erkennbar')
+
+        else:
+            # unknown / Sonstiges
+            klass = 'Sonstiges'
+            begruendung = f'Activity-Type {at} — unklar'
+            unklare.append(f'{datum}: activity_type={at} unklar')
+
+        tage_detail.append({
+            'datum': datum,
+            'klass': klass,
+            'begruendung': begruendung,
+            'marker': d.get('raw_marker', '') or at,
+            'routing': '-'.join(d.get('routing') or []),
+            'tour_dauer': 1,
+            'eur': round(eur_added, 2),
+        })
+
+    # EUR-Berechnung
+    z72_eur = round(z72_tage * bmf_inland['tagestrip_8h'], 2)
+    z73_eur = round(z73_tage * bmf_inland['an_abreise'], 2)
+    z74_eur = round(z74_tage * bmf_inland['voll_24h'], 2)
+    z76_eur = round(z76_eur, 2)
+
+    print(f"[v7-classify] arbeit={arbeitstage}T fahr={fahr_tage}T hotel={hotel_naechte}T  "
+          f"Z72={z72_tage}T/{z72_eur:.2f}€  Z73={z73_tage}T/{z73_eur:.2f}€  "
+          f"Z74={z74_tage}T/{z74_eur:.2f}€  Z76={z76_eur:.2f}€  unklar={len(unklare)}")
+
+    return {
+        'arbeitstage': arbeitstage,
+        'fahr_tage': fahr_tage,
+        'hotel_naechte': hotel_naechte,
+        'z72_tage': z72_tage,
+        'z73_tage': z73_tage,
+        'z74_tage': z74_tage,
+        'z72_eur': z72_eur,
+        'z73_eur': z73_eur,
+        'z74_eur': z74_eur,
+        'z76_eur': z76_eur,
+        'tage_detail': tage_detail,
+        'unklare_tage': unklare,
+        'nachweis': '',  # wird ggf. von Opus für unklare Tage gefüllt
+        '_v7_used': True,
+    }
 
 
 def _sonnet_read_se_summary_v2(pdf_bytes_list, year=2025):
@@ -6493,166 +6980,103 @@ def hybrid_analyze(form, files):
     gc.collect()
     _release_memory_to_os()
 
-    # Schritt 2: Sonnet-SE-Summen (mittlerer Footprint)
+    # ════════════════════════════════════════════════════════════════════
+    # v7.0 PIPELINE — DETERMINISTISCH
+    # ════════════════════════════════════════════════════════════════════
+    # 1. Sonnet liest SE strukturiert (pro Datum: stfrei/Ort/Storno)
+    # 2. Sonnet liest DP strukturiert (pro Datum: marker/has_fl/overnight)
+    # 3. Backend matcht beides pro Datum
+    # 4. Backend klassifiziert deterministisch (SE als Anker für Z72/Z73/Z76)
+    # 5. Z77 aus SE-Summen separat (für Topf-Trennung & Audit)
+    # KEIN Fallback. Bei Crash → Job-Error.
+    # ════════════════════════════════════════════════════════════════════
+
+    # Schritt 2a: Sonnet-SE strukturiert (pro Zeile/Datum)
+    se_structured = None
+    if se_bytes:
+        try:
+            se_structured = _sonnet_read_se_structured(se_bytes, year)
+        except Exception as e:
+            errors.append(f'SE-Structured: {type(e).__name__}: {str(e)[:200]}')
+            print(f"[hybrid] Sonnet-SE-Structured crash: {type(e).__name__}: {str(e)[:200]}")
+    gc.collect()
+    _release_memory_to_os()
+
+    # Schritt 2b: Sonnet-SE-Summary (Z77-Total für Topf-Trennung; bleibt nötig
+    # weil _berechne_via_hybrid Z77 für Reisekosten-Topf braucht)
     se_summary = None
     if se_bytes:
         try:
             se_summary = _sonnet_read_se_summary_v2(se_bytes, year)
+            # Wenn Structured durchgelaufen ist: Z77 daraus übernehmen (deterministisch)
+            if se_structured and se_structured.get('z77_total'):
+                if se_summary:
+                    se_summary['z77_total'] = max(
+                        float(se_summary.get('z77_total', 0) or 0),
+                        float(se_structured.get('z77_total', 0) or 0)
+                    )
+                else:
+                    se_summary = {
+                        'z77_total': se_structured['z77_total'],
+                        'auslandsspesen_total': sum(
+                            float(s.get('stfrei_betrag', 0) or 0)
+                            for s in se_structured.get('se_lines', [])
+                            if not s.get('storno') and s.get('stfrei_inland') is False
+                        ),
+                        'inlandsspesen_total': sum(
+                            float(s.get('stfrei_betrag', 0) or 0)
+                            for s in se_structured.get('se_lines', [])
+                            if not s.get('storno') and s.get('stfrei_inland') is True
+                        ),
+                        'flugmonate': sorted(set(
+                            int(s.get('datum', '0000-00-00')[5:7])
+                            for s in se_structured.get('se_lines', [])
+                            if s.get('datum') and not s.get('storno')
+                        )),
+                    }
         except Exception as e:
-            errors.append(f'SE: {e}')
-            print(f"[hybrid] Sonnet-SE crash: {e}")
+            errors.append(f'SE-Summary: {e}')
+            print(f"[hybrid] Sonnet-SE-Summary crash: {e}")
     gc.collect()
     _release_memory_to_os()
 
-    # Schritt 3 (v6.0): Sonnet-Pre-Reader → strukturierte Tagesdaten
-    # Schritt 4 (v6.0): Backend zählt Hotelnächte/Arbeitstage/Fahrtage deterministisch
-    # Schritt 5 (v6.0): Opus klassifiziert nur noch steuerlich (keine PDFs mehr)
-    #
-    # KEIN FALLBACK MEHR. Bei v6-Crash → Job-Error. Spart Tokens während Debugging.
-    # Wenn v6 stabil läuft, ist Fallback eh selten nötig. v5.7-Code bleibt im File
-    # und kann via _opus_classify_days_v2() weiter manuell aufgerufen werden, ist
-    # aber NICHT mehr automatisch eingebunden.
+    # Schritt 3: Sonnet liest DP strukturiert
     classification = None
     structured_days = None
-    deterministic_counts = None
     if dp_bytes:
         try:
             structured_days = _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year, homebase)
             if structured_days and structured_days.get('days'):
-                deterministic_counts = _count_deterministic(structured_days)
+                # Schritt 4: Backend matcht DP+SE pro Datum
+                matched = _match_dp_se_per_day(structured_days, se_structured)
+                print(f"[v7] Matched {len(matched)} Tage (DP+SE pro Datum)")
                 gc.collect()
                 _release_memory_to_os()
-                v6_class = _opus_classify_structured_days_v6(
-                    structured_days, se_summary, year, homebase
-                )
-                if v6_class and v6_class.get('classifications'):
-                    # Klassifikationen sicher haben — Aggregation/Validation defensiv
-                    # umschließen, damit ein Crash hier nicht die geretteten Daten verliert.
-                    classifs_safe = [_ensure_dict(c) for c in v6_class['classifications']]
-                    classifs_safe = [c for c in classifs_safe if c.get('datum')]
-
-                    aggregated = None
-                    consistency_issues = []
-                    try:
-                        aggregated = _aggregate_v6_classification(classifs_safe, structured_days, year)
-                    except Exception as agg_err:
-                        import traceback as _tb
-                        print(f"[v6] Aggregation-Crash: {type(agg_err).__name__}: {str(agg_err)[:200]}")
-                        print(f"[v6] Aggregation-Traceback:\n{_tb.format_exc()[-800:]}")
-                        # Fallback-Aggregation: zähle einfach ohne BMF-EUR-Berechnung
-                        bmf = BMF_INLAND_BY_YEAR.get(year, BMF_INLAND_BY_YEAR[2025])
-                        aggregated = {
-                            'z72_tage': sum(1 for c in classifs_safe if c.get('klass') == 'Z72'),
-                            'z73_tage': sum(1 for c in classifs_safe if c.get('klass') == 'Z73'),
-                            'z74_tage': sum(1 for c in classifs_safe if c.get('klass') == 'Z74'),
-                            'z76_eur': 0.0,  # konnte nicht aggregiert werden
-                            'z72_eur': 0.0, 'z73_eur': 0.0, 'z74_eur': 0.0,
-                        }
-                        aggregated['z72_eur'] = round(aggregated['z72_tage'] * bmf['tagestrip_8h'], 2)
-                        aggregated['z73_eur'] = round(aggregated['z73_tage'] * bmf['an_abreise'], 2)
-                        aggregated['z74_eur'] = round(aggregated['z74_tage'] * bmf['voll_24h'], 2)
-                        errors.append(f'v6-Aggregation-Fallback ({type(agg_err).__name__})')
-
-                    try:
-                        consistency_issues = _validate_opus_against_structure(classifs_safe, structured_days)
-                        if consistency_issues:
-                            print(f"[v6] Konsistenz-Issues: {len(consistency_issues)} — {'; '.join(consistency_issues)[:300]}")
-                    except Exception as val_err:
-                        print(f"[v6] Validation-Crash: {type(val_err).__name__}: {str(val_err)[:200]}")
-                        consistency_issues = []
-
-                    # tage_detail defensiv bauen — auch wenn ein einzelnes c kaputt ist,
-                    # nicht die ganze Liste verlieren
-                    tage_detail_safe = []
-                    for c in classifs_safe:
-                        try:
-                            tage_detail_safe.append({
-                                'datum': c.get('datum'),
-                                'klass': c.get('klass'),
-                                'begruendung': c.get('begruendung', ''),
-                                'marker': '', 'routing': '', 'tour_dauer': 1,
-                            })
-                        except Exception:
-                            continue
-
-                    classification = {
-                        'arbeitstage':   deterministic_counts['arbeitstage'],
-                        'fahr_tage':     deterministic_counts['fahr_tage'],
-                        'hotel_naechte': deterministic_counts['hotel_naechte'],
-                        'z72_tage':      aggregated['z72_tage'],
-                        'z73_tage':      aggregated['z73_tage'],
-                        'z74_tage':      aggregated['z74_tage'],
-                        'z76_eur':       aggregated['z76_eur'],
-                        'z72_eur':       aggregated['z72_eur'],
-                        'z73_eur':       aggregated['z73_eur'],
-                        'z74_eur':       aggregated['z74_eur'],
-                        'nachweis':      v6_class.get('nachweis', ''),
-                        'unklare_tage':  v6_class.get('unklare_tage', []),
-                        'tage_detail':   tage_detail_safe,
-                        '_v6_used': True,
-                        '_consistency_issues': consistency_issues,
-                    }
-                    print(f"[v6] Klassifikation fertig: arbeit={classification['arbeitstage']}T "
-                          f"fahr={classification['fahr_tage']}T hotel={classification['hotel_naechte']}T "
-                          f"Z72={classification['z72_tage']}T Z73={classification['z73_tage']}T "
-                          f"Z76={classification['z76_eur']:.2f}€")
-                else:
-                    print(f"[v6] Opus-v6 lieferte keine Klassifikationen")
+                # Schritt 5: Deterministische Klassifikation
+                classification = _deterministic_classify_v7(matched, year, homebase)
+                classification['_v7_used'] = True
             else:
-                print(f"[v6] Sonnet-Pre-Reader lieferte keine Tagesdaten")
+                print(f"[v7] Sonnet-DP lieferte keine Tagesdaten — Job-Error")
         except Exception as e:
             etype = type(e).__name__
             import traceback as _tb
             tb_str = _tb.format_exc()
-            print(f"[v6] Pipeline crash: {etype}: {str(e)[:200]} — KEIN Fallback (Job-Error)")
-            print(f"[v6] Traceback (letzte 1000 Zeichen):\n{tb_str[-1000:]}")
-            errors.append(f'v6-Pipeline ({etype}): {str(e)[:200]}')
+            print(f"[v7] Pipeline crash: {etype}: {str(e)[:200]} — KEIN Fallback (Job-Error)")
+            print(f"[v7] Traceback (letzte 1000 Zeichen):\n{tb_str[-1000:]}")
+            errors.append(f'v7-Pipeline ({etype}): {str(e)[:200]}')
             classification = None
     gc.collect()
     _release_memory_to_os()
 
-    # Schritt 3b: Self-Reflection für v6.0 — wenn Klassifikation Issues hat,
-    # Opus-v6 mit Korrektur-Auftrag erneut aufrufen (1 Recheck-Pass).
-    # Recheck nutzt dieselben strukturierten Tagesdaten (kein erneutes PDF-Lesen).
-    if classification and se_summary and structured_days:
+    # v7.0: KEIN Self-Reflection-Loop mehr — Klassifikation ist bereits
+    # deterministisch aus DP+SE. Pendel-Risiko entfällt. Wenn Math-Inkonsistenz
+    # erkannt wird (z.B. Z76 > Z77), wird das nur als Audit-Note ausgegeben,
+    # nicht durch erneuten Opus-Call versucht zu beheben.
+    if classification and se_summary:
         issues = _detect_classification_issues(classification, se_summary)
         if issues:
-            print(f"[hybrid] Self-Reflection-Trigger: {len(issues)} Issue(s) — {'; '.join(issues)[:200]}")
-            for _ in range(3):
-                gc.collect()
-            _release_memory_to_os()
-            try:
-                v6_recheck = _opus_classify_structured_days_v6(
-                    structured_days, se_summary, year, homebase,
-                    feedback={'issues': issues, 'prev': classification}
-                )
-                if v6_recheck and v6_recheck.get('classifications'):
-                    rechecked_agg = _aggregate_v6_classification(
-                        v6_recheck['classifications'], structured_days, year
-                    )
-                    rechecked = {
-                        **classification,
-                        'z72_tage':  rechecked_agg['z72_tage'],
-                        'z73_tage':  rechecked_agg['z73_tage'],
-                        'z74_tage':  rechecked_agg['z74_tage'],
-                        'z76_eur':   rechecked_agg['z76_eur'],
-                        'z72_eur':   rechecked_agg['z72_eur'],
-                        'z73_eur':   rechecked_agg['z73_eur'],
-                        'z74_eur':   rechecked_agg['z74_eur'],
-                        'nachweis':  v6_recheck.get('nachweis', classification.get('nachweis', '')),
-                        'unklare_tage': v6_recheck.get('unklare_tage', classification.get('unklare_tage', [])),
-                    }
-                    new_issues = _detect_classification_issues(rechecked, se_summary)
-                    if len(new_issues) < len(issues):
-                        print(f"[hybrid] v6-Recheck behebt {len(issues)-len(new_issues)} von {len(issues)} — übernehme.")
-                        classification = rechecked
-                    else:
-                        print(f"[hybrid] v6-Recheck löst keine Issues — behalte Original ({len(new_issues)} bleiben).")
-                else:
-                    print(f"[hybrid] v6-Recheck lieferte nichts — behalte Original.")
-            except Exception as e:
-                # Recheck-Crash: Original-Klassifikation behalten (Job nicht killen)
-                print(f"[hybrid] v6-Recheck crash: {type(e).__name__}: {str(e)[:200]} — behalte Original")
+            print(f"[v7] Audit-Issues (informativ, kein Recheck): {'; '.join(issues)[:300]}")
+            classification['_audit_issues'] = issues
     for _ in range(3):
         gc.collect()
     _release_memory_to_os()

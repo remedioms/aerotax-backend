@@ -376,6 +376,103 @@ def test_v6_aggregate_office_with_z76_misclass_uses_volltag_satz():
     assert agg['z76_eur'] >= 0, f"z76_eur sollte ≥ 0 sein, ist {agg['z76_eur']}"
 
 
+# ── v7.0 Deterministic Classification Tests ──────────────────────────────
+
+def test_v7_match_dp_se_filters_storno():
+    """Storno-Zeilen werden aus SE rausgefiltert."""
+    from app import _match_dp_se_per_day
+    structured = {'days': [{'datum': '2025-03-04', 'activity_type': 'tour', 'overnight_after_day': True}]}
+    se = {'se_lines': [
+        {'datum': '2025-03-04', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'storno': False, 'stfrei_inland': False},
+        {'datum': '2025-03-04', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'storno': True},  # Storno
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    assert len(matched) == 1
+    assert matched[0]['se']['count'] == 1  # Storno ausgefiltert
+    assert matched[0]['se']['stfrei_total'] == 30
+
+
+def test_v7_classify_same_day_z72():
+    """Same-Day → Z72 wenn alle Hard-Gate-Bedingungen erfüllt."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [{'datum': '2025-01-11', 'activity_type': 'same_day',
+                             'overnight_after_day': False, 'has_fl': False}]}
+    se = {'se_lines': []}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['z72_tage'] == 1
+    assert result['z73_tage'] == 0
+    assert result['z76_eur'] == 0
+
+
+def test_v7_classify_inland_tour_z73():
+    """Tour mit SE-Inland-Layover → Z73 An/Abreise."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # 3-Tages-Tour MUC: Anreise + 1 Volltag + Abreise
+    structured = {'days': [
+        {'datum': '2025-03-04', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True},
+        {'datum': '2025-03-05', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True},
+        {'datum': '2025-03-06', 'activity_type': 'tour', 'overnight_after_day': False, 'has_fl': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-03-04', 'stfrei_betrag': 14, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-03-05', 'stfrei_betrag': 28, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-03-06', 'stfrei_betrag': 14, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # An- + Abreise = 2× Z73, Volltag = Office
+    assert result['z73_tage'] == 2
+    assert result['z73_eur'] == 28.0  # 2 × 14€
+    assert result['z76_eur'] == 0
+
+
+def test_v7_classify_foreign_tour_z76():
+    """Tour mit SE-Auslands-Layover → Z76 mit BMF-Pauschale."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True,
+         'routing': ['FRA', 'BLR']},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True, 'has_fl': True,
+         'routing': ['BLR']},
+        {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': False, 'has_fl': False,
+         'routing': ['BLR', 'FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-05', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se)
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['z76_eur'] > 0
+    assert result['z73_tage'] == 0
+    assert result['z72_tage'] == 0
+
+
+def test_v7_classify_frei_no_count():
+    """FREI-Tage zählen weder als AT noch produzieren VMA."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [{'datum': '2025-01-01', 'activity_type': 'frei',
+                             'overnight_after_day': False, 'has_fl': False}]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []})
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['arbeitstage'] == 0
+    assert result['z72_tage'] == 0
+
+
+def test_v7_classify_office_counts_fahrtag():
+    """Office-Tag: AT + Fahrtag, kein VMA."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [{'datum': '2025-01-10', 'activity_type': 'office',
+                             'overnight_after_day': False, 'has_fl': False}]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []})
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['arbeitstage'] == 1
+    assert result['fahr_tage'] == 1
+    assert result['z72_tage'] == 0
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
