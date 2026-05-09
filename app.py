@@ -2992,6 +2992,98 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
         except Exception as e:
             print(f'SE Regex error: {e}')
 
+    # ── KI-VALIDIERUNG: Claude verifiziert die Abrechnungen + Z77-Summen ──
+    # Auch wenn keine Abrechnungen via Regex gefunden wurden, fragt Claude
+    # (Format-Änderungen werden so abgefangen).
+    claude_abrechnungen = []
+    if ANTHROPIC_KEY:
+        try:
+            all_text = ''
+            for pdf_bytes in pdf_bytes_list:
+                try:
+                    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                        all_text += '\n=== PDF ===\n' + '\n'.join(p.extract_text() or '' for p in pdf.pages)
+                except: pass
+            if all_text and len(all_text) > 100:
+                hint_block = ''
+                if abrechnungen:
+                    hint_lines = '\n'.join(
+                        f"  - Erstellt {a['erstellt']}: gesamt={a['gesamt']:.2f} steuerfrei(Z77)={a['steuerfrei']:.2f} steuer={a['steuerpflichtig']:.2f}"
+                        for a in abrechnungen)
+                    hint_block = f"\nRegex hat folgende Abrechnungen gefunden (kann unvollständig/falsch sein):\n{hint_lines}\n"
+                prompt = (
+                    "Du liest Lufthansa Streckeneinsatz-Abrechnungen. Pro Seite gibt es eine 'Summe:'-Zeile "
+                    "mit drei Beträgen: 'Gesamt steuerpflichtig steuerfrei' oder 'Gesamt steuer' (2-spaltig). "
+                    "Z77 = stfrei-Anteil = Gesamt - letzter_Wert.\n\n"
+                    "Extrahiere ALLE Abrechnungen aus dem Text als JSON. Gib NUR JSON zurück, kein Erklärtext.\n\n"
+                    "Format:\n"
+                    '{\n'
+                    '  "abrechnungen": [\n'
+                    '    {"erstellt": "DD.MM.YYYY", "monat": <1-12>, "gesamt": <EUR>, "steuerfrei": <EUR>, "steuerpflichtig": <EUR>}\n'
+                    '  ],\n'
+                    '  "flugmonate": [<int>, ...]\n'
+                    '}\n\n'
+                    "Regeln:\n"
+                    "- 'erstellt' = Erstellt-Datum der Abrechnung (DD.MM.YYYY)\n"
+                    "- 'monat' = Monat der Erstellung (1-12)\n"
+                    "- 'gesamt' = erste Zahl in der Summe-Zeile\n"
+                    "- 'steuerpflichtig' = mittlere oder letzte Zahl\n"
+                    "- 'steuerfrei' = letzter Spaltenwert (Z77-Anteil)\n"
+                    "- 'flugmonate' = alle Monate (1-12) in denen Flüge stattfanden (DD.MM.YYYY-Zeilen prüfen)\n"
+                    "- Deutsche Zahlen (1.234,56 → 1234.56 in JSON)\n"
+                    + hint_block +
+                    "\nSE-Text:\n" + all_text[:50000]
+                )
+                client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+                resp = _claude_with_retry(client, 'claude-sonnet-4-5', 6000,
+                                          [{'type': 'text', 'text': prompt}], label='se-verify')
+                ai_text = resp.content[0].text.strip()
+                m = re.search(r'\{[\s\S]*\}', ai_text)
+                if m:
+                    import json as _json
+                    data = _json.loads(m.group(0))
+                    for a in data.get('abrechnungen', []):
+                        try:
+                            claude_abrechnungen.append({
+                                'erstellt':       str(a.get('erstellt', '')),
+                                'bezeichnung':    str(a.get('erstellt', '')),
+                                'monat':          int(a.get('monat', 0) or 0),
+                                'gesamt':         float(a.get('gesamt', 0) or 0),
+                                'steuerfrei':     float(a.get('steuerfrei', 0) or 0),
+                                'steuerpflichtig': float(a.get('steuerpflichtig', 0) or 0),
+                                'z73_tage':       0,
+                            })
+                        except Exception as ie:
+                            print(f"[SE-claude] entry parse fail: {ie}")
+                    # Flugmonate aus Claude addieren
+                    for mn in data.get('flugmonate', []):
+                        try:
+                            mi = int(mn)
+                            if 1 <= mi <= 12:
+                                flugmonate.add(mi)
+                        except: pass
+                    print(f"[SE-claude] {len(claude_abrechnungen)} Abrechnungen, "
+                          f"Z77-Total={sum(a['steuerfrei'] for a in claude_abrechnungen):.2f}€")
+        except Exception as e:
+            print(f"[SE-claude] verification fail: {e}")
+
+    # ── Reconciliation: KI gewinnt wenn sie mehr/andere Werte hat ──
+    regex_z77 = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
+    claude_z77 = round(sum(a['steuerfrei'] for a in claude_abrechnungen), 2)
+    if claude_abrechnungen and (
+        len(claude_abrechnungen) > len(abrechnungen) or
+        abs(claude_z77 - regex_z77) > 5.0  # mehr als 5€ Diff
+    ):
+        # Z73-Tage von Regex erhalten falls vorhanden (KI weiß das nicht)
+        regex_z73_by_month = {a.get('monat', 0): a.get('z73_tage', 0) for a in abrechnungen}
+        for ca in claude_abrechnungen:
+            ca['z73_tage'] = regex_z73_by_month.get(ca.get('monat', 0), 0)
+        print(f"[SE] KI gewinnt: regex={len(abrechnungen)} abr / Z77={regex_z77:.2f}€ "
+              f"vs claude={len(claude_abrechnungen)} abr / Z77={claude_z77:.2f}€")
+        abrechnungen = claude_abrechnungen
+    elif claude_abrechnungen:
+        print(f"[SE] regex+claude einig: {len(abrechnungen)} Abrechnungen, Z77={regex_z77:.2f}€")
+
     if not abrechnungen:
         return None
 
@@ -3504,22 +3596,108 @@ Kurze Begründung wo Junior 1 vs 2 falsch lagen.
         return None
 
 
+def _einsatzplan_extract_via_regex(full_text):
+    """Regex-Extraktion eines Monats. Liefert dict mit monat_str, umlaeufe."""
+    import re as _re
+    m_monat = _re.search(
+        r'\b(JAN|FEB|M[ÄA]R|APR|MAI|JUN|JUL|AUG|SEP|OKT|NOV|DEZ)\s+(\d{4})',
+        full_text[:600])
+    monat_str = f"{m_monat.group(1)} {m_monat.group(2)}" if m_monat else "?"
+
+    umlaeufe = []
+    umlauf_pattern = _re.compile(
+        r'^(?:Mo|Di|Mi|Do|Fr|Sa|So)\s+(\d{1,2})\s+(\d{4,6})\s+FB[^\n]*?(\d+(?:[.,]\d+)?)\s+EURO',
+        _re.M)
+    tg_pattern = _re.compile(r'(\d+)\s*Tg\s+\d+(?:[.,]\d+)?\s+EURO')
+
+    for match in umlauf_pattern.finditer(full_text):
+        tag_nr, umlauf_nr, spesen_str = match.groups()
+        line = match.group(0)
+        try:
+            spesen = float(spesen_str.replace(',', '.'))
+        except Exception:
+            continue
+        tg_match = tg_pattern.search(line)
+        tage = int(tg_match.group(1)) if tg_match else 0
+        umlaeufe.append({
+            'umlauf_nr': umlauf_nr,
+            'monat': monat_str,
+            'tage': tage,
+            'spesen_eur': spesen,
+            'ist_tagestrip': (tage == 1),
+        })
+    return {'monat_str': monat_str, 'umlaeufe': umlaeufe}
+
+
+def _einsatzplan_extract_via_claude(full_text, regex_hint=None, label='einsatzplan'):
+    """Claude liest den Einsatzplan-Text strukturiert. Source of Truth."""
+    if not ANTHROPIC_KEY or not full_text:
+        return {}
+    hint_block = ''
+    if regex_hint and regex_hint.get('umlaeufe'):
+        hint_block = (
+            f"\nRegex-Vorschlag (kann falsch sein, prüfe selbst):\n"
+            f"  Monat: {regex_hint.get('monat_str','?')}\n"
+            f"  Umläufe: {len(regex_hint['umlaeufe'])} (Spesen-Total {sum(u['spesen_eur'] for u in regex_hint['umlaeufe']):.2f}€)\n")
+    prompt = (
+        "Du liest einen CAS-Einsatzplan (PUB-Liste) der Lufthansa für einen Monat. "
+        "Extrahiere alle Umläufe (=Touren) als JSON-Array. Gib NUR JSON zurück, kein Erklärtext.\n\n"
+        "Format:\n"
+        '{\n'
+        '  "monat": "MAR 2025",\n'
+        '  "umlaeufe": [\n'
+        '    {"umlauf_nr": "60039", "tag_nr": 3, "tage": 4, "spesen_eur": 206.00},\n'
+        '    {"umlauf_nr": "60379", "tag_nr": 12, "tage": 1, "spesen_eur": 148.00}\n'
+        '  ]\n'
+        '}\n\n'
+        "Regeln:\n"
+        "- Pro Tour = 1 Eintrag, auch wenn Tour mehrere Tage geht\n"
+        "- 'tage' = Anzahl Tage der Tour (Tagestrip = 1, Mehrtagestour = 2-5)\n"
+        "- 'spesen_eur' = der Gesamt-Spesen-Betrag der Tour in EUR (Wert vor 'EURO')\n"
+        "- 'tag_nr' = Tag im Monat (1-31) an dem Tour startet\n"
+        "- Storno-Touren NICHT mitzählen\n"
+        "- Office-Days, Standby, Frei-Tage NICHT als Umlauf zählen\n"
+        + hint_block +
+        "\nPDF-Text:\n" + full_text[:15000]
+    )
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        resp = _claude_with_retry(client, 'claude-sonnet-4-5', 4000,
+                                  [{'type': 'text', 'text': prompt}], label=label)
+        ai_text = resp.content[0].text.strip()
+        m = re.search(r'\{[\s\S]*\}', ai_text)
+        if not m:
+            print(f"[Einsatzplan/{label}] kein JSON: {ai_text[:200]}")
+            return {}
+        import json as _json
+        data = _json.loads(m.group(0))
+        return {
+            'monat_str': data.get('monat', '?'),
+            'umlaeufe': [{
+                'umlauf_nr': str(u.get('umlauf_nr', '')),
+                'monat': data.get('monat', '?'),
+                'tage': int(u.get('tage', 0) or 0),
+                'spesen_eur': float(u.get('spesen_eur', 0) or 0),
+                'ist_tagestrip': int(u.get('tage', 0) or 0) == 1,
+            } for u in data.get('umlaeufe', [])],
+        }
+    except Exception as e:
+        print(f"[Einsatzplan/{label}] Claude fail: {e}")
+        return {}
+
+
 def parse_einsatzplan_mit_ki(pdf_bytes_list, year=2025):
     """
     Parsed den CAS-Einsatzplan (PUB-Liste) — pro Monat eine PDF.
-    Liefert: Umläufe + Spesen-Beträge + Tagestrips für Cross-Check & Z72-Boost.
-
-    Format-Erkennung: Header "Crew Assignment System ... Persönlicher Einsatzplan"
-    Pro Tag: Datum, Umlauf-Nr, Spesen (z.B. "4Tg 206 EURO"), Briefingzeit,
-    Flug-Routing, Block-Time.
+    Strategie: Regex + Claude parallel pro Monat. Claude ist Source of Truth.
+    Bei Diskrepanz nimmt Claude. Fallback Regex bei API-Ausfall.
     """
     if not pdf_bytes_list:
         return None
 
-    import re as _re
     monate_geparst = 0
-    umlaeufe = []          # Liste aller Umläufe: {umlauf_nr, monat, tage, spesen_eur, ist_tagestrip}
-    tagestrips = []        # Tage mit ≥8h Abwesenheit aus Tagestrips
+    umlaeufe = []
+    tagestrips = []
     spesen_total = 0.0
     monatslisten = []
 
@@ -3529,72 +3707,61 @@ def parse_einsatzplan_mit_ki(pdf_bytes_list, year=2025):
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 full_text = '\n'.join((p.extract_text() or '') for p in pdf.pages)
         except Exception as e:
-            print(f"Einsatzplan: PDF-Read fail: {e}")
+            print(f"[Einsatzplan] PDF-Read fail: {e}")
             continue
 
-        # Format-Check: ist das wirklich ein CAS-Einsatzplan?
-        if 'Persönlicher Einsatzplan' not in full_text and 'Crew Assignment System' not in full_text:
-            print("Einsatzplan: Format nicht erkannt (kein CAS-Header)")
+        # Format-Check (lockerer — Header kann variieren)
+        is_einsatzplan = (
+            'Persönlicher Einsatzplan' in full_text or
+            'Crew Assignment System' in full_text or
+            'PUB-Liste' in full_text or
+            re.search(r'\b(JAN|FEB|MAR|MÄR|APR|MAI|JUN|JUL|AUG|SEP|OKT|NOV|DEZ)\s+\d{4}', full_text[:1000])
+        )
+        if not is_einsatzplan:
+            print("[Einsatzplan] Format nicht erkannt (kein Header/Monat-Marker)")
             continue
 
         monate_geparst += 1
 
-        # Monat extrahieren — erstes Vorkommen "(JAN|FEB|...)\s+JAHR" im Header-Bereich
-        m_monat = _re.search(r'\b(JAN|FEB|M[ÄA]R|APR|MAI|JUN|JUL|AUG|SEP|OKT|NOV|DEZ)\s+(\d{4})', full_text[:600])
-        monat_str = f"{m_monat.group(1)} {m_monat.group(2)}" if m_monat else "?"
+        # Regex (schnell, deterministisch)
+        regex_data = _einsatzplan_extract_via_regex(full_text)
+        # Claude (Source of Truth)
+        ai_data = _einsatzplan_extract_via_claude(full_text, regex_hint=regex_data,
+                                                   label=f'einsatzplan-{monate_geparst}')
 
-        # Umläufe finden — flexibles Pattern: zuerst Tg-Format, sonst letzte Zahl vor EURO
-        # Beispiele:
-        #   "Mo 03 60039 FB 25 25 4Tg 206 EURO"   → 4 Tage, 206€
-        #   "Mi 12 60379 FB 19 19 87 148 EURO"    → ?Tage, 148€ (Tage aus Routing-Folgetagen)
-        umlauf_pattern = _re.compile(
-            r'^(?:Mo|Di|Mi|Do|Fr|Sa|So)\s+(\d{1,2})\s+(\d{4,6})\s+FB[^\n]*?(\d+(?:[.,]\d+)?)\s+EURO',
-            _re.M
-        )
-        # Tg-Detector (zusätzlich) — wenn es ein "<n>Tg" gibt, lese die Tage explizit
-        tg_pattern = _re.compile(r'(\d+)\s*Tg\s+\d+(?:[.,]\d+)?\s+EURO')
+        # Wer gewinnt? Claude wenn er Werte hat, sonst Regex
+        if ai_data.get('umlaeufe'):
+            chosen_data = ai_data
+            source = 'claude'
+        else:
+            chosen_data = regex_data
+            source = 'regex'
 
-        for match in umlauf_pattern.finditer(full_text):
-            tag_nr, umlauf_nr, spesen_str = match.groups()
-            line = match.group(0)
-            try:
-                spesen = float(spesen_str.replace(',', '.'))
-            except Exception:
-                continue
-            tg_match = tg_pattern.search(line)
-            tage = int(tg_match.group(1)) if tg_match else 0
-            ist_tagestrip = (tage == 1)
-            umlaeufe.append({
-                'umlauf_nr': umlauf_nr,
-                'monat': monat_str,
-                'tage': tage,
-                'spesen_eur': spesen,
-                'ist_tagestrip': ist_tagestrip,
-            })
-            spesen_total += spesen
+        monat_str = chosen_data['monat_str']
+        ai_count = len(ai_data.get('umlaeufe', []))
+        rg_count = len(regex_data.get('umlaeufe', []))
+        if ai_count != rg_count:
+            print(f"[Einsatzplan/{monat_str}] Umlauf-Diskrepanz: regex={rg_count} claude={ai_count} → {source}")
+        else:
+            print(f"[Einsatzplan/{monat_str}] {ai_count} Umläufe, regex+claude einig")
 
-        # Briefingzeit + Block-Time pro Tag (für Z72-Boost-Detection)
-        # Pattern: "Briefingzeit(LT FRA): 03/02/25 20:10"
-        # Pattern: "FRA 21:00- ... -07:30 JNB 10:30" (Block-Time = 10:30)
-        # Tagestrips erkennen: Wenn 1Tg im Umlauf + Block-Time + Briefing → Abwesenheit-Berechnung
-        # Pro Tagestrip-Day: vereinfachte Annahme — wenn 1Tg-Umlauf, ist es ein Tagestrip-Kandidat
-        for u in umlaeufe:
-            if u['ist_tagestrip'] and u['monat'] == monat_str:
+        for u in chosen_data['umlaeufe']:
+            umlaeufe.append(u)
+            spesen_total += u['spesen_eur']
+            if u['ist_tagestrip']:
                 tagestrips.append(u)
-
         monatslisten.append(monat_str)
 
     if monate_geparst == 0:
         return None
 
-    spesen_total = round(spesen_total, 2)
     return {
-        'monate_geparst': monate_geparst,
-        'monatslisten': monatslisten,
-        'umlaeufe': umlaeufe,
-        'spesen_total': spesen_total,
+        'monate_geparst':  monate_geparst,
+        'monatslisten':    monatslisten,
+        'umlaeufe':        umlaeufe,
+        'spesen_total':    round(spesen_total, 2),
         'tagestrips_count': len(tagestrips),
-        'tagestrips': tagestrips,
+        'tagestrips':      tagestrips,
     }
 
 
