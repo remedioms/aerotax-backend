@@ -6857,8 +6857,15 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
 
             elif overnight and today_layover_inland is True:
                 is_volltag = not (is_anreise or is_abreise)
-                if cluster_foreign and is_anreise:
-                    # Auslandstour-Anreise mit Inland-Stempel — Z76 mit Ziel-Land
+                hb_upper = (homebase or 'FRA').upper()
+                # v8.5: Wenn der Inland-Layover-Ort die Homebase ist UND der
+                # Cluster Auslandscluster ist → das ist ein Homebase-Stempel
+                # auf einem Auslandstour-Tag, kein echter Inland-Layover.
+                # → Z76 (mit Cluster-Ziel-Land), nicht Z73/Z74.
+                # Inland-Layover-Ort ≠ Homebase (z.B. MUC bei FRA-Crew, Mixed-Tour)
+                # = echter Inland-Layover → Z73/Z74 wie gewohnt.
+                inland_is_homebase = today_layover_ort.upper() == hb_upper
+                if cluster_foreign and inland_is_homebase:
                     target_iata = ''
                     for ci in cluster['indices']:
                         cm = sorted_days[ci]
@@ -6869,11 +6876,17 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                                 break
                     klass = 'Z76'
                     bmf_aus = _get_bmf_for_iata(target_iata, year)
-                    eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
-                    reason = f'Auslandstour-Anreise (Stempel {today_layover_ort}, Ziel {target_iata or "?"}) Z76'
-                    audit_note = f'{datum}: Inland-SE-Stempel {today_layover_ort} bei Auslands-Cluster — als Z76 An/Ab'
+                    if is_anreise or is_abreise:
+                        eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+                        position = 'An/Ab'
+                    else:
+                        eur_added = float((bmf_aus.get('voll_24h', 0) if bmf_aus else 28.0) or 0)
+                        position = 'Volltag'
+                    reason = f'Auslandstour-{position} (Homebase-Stempel {today_layover_ort}, Ziel {target_iata or "?"}) Z76'
+                    audit_note = f'{datum}: Homebase-SE-Stempel {today_layover_ort} bei Auslands-Cluster — als Z76 {position}'
+                    print(f"[v8-inland-blocked-foreign-cluster] datum={datum} stempel={today_layover_ort} reason='Homebase-Stempel auf Auslandstour — kein Z73/Z74'")
                 elif is_volltag:
-                    # v7.5: Z74 für jeden Inland-Volltag im Cluster (egal Mixed oder reiner Inland)
+                    # Echter Inland-Volltag (Inland-Layover ≠ Homebase, oder reiner Inland-Cluster)
                     klass = 'Z74'
                     eur_added = INLAND_VOLL_24H
                     reason = f'Inland-Mittel-Tag {today_layover_ort} (Z74 24h)'
@@ -6906,11 +6919,33 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
 
             # ─── Fall B: Heute KEINE Übernachtung — Heimkehr ───
             elif (not overnight) and prev_overnight:
+                # v8.5: prev_cluster prüfen — Homebase-Stempel im Vortag bei
+                # Auslandscluster ist Auslands-Heimkehr (kein Z73 Inland).
+                cluster_prev = cluster_for_idx.get(i - 1) if i > 0 else None
+                prev_cluster_foreign = bool(cluster_prev and cluster_prev.get('has_foreign'))
+                hb_upper = (homebase or 'FRA').upper()
+                yesterday_is_homebase = yesterday_layover_ort.upper() == hb_upper
                 if yesterday_layover_inland is False:
                     klass = 'Z76'
                     bmf_aus = _get_bmf_for_iata(yesterday_layover_ort, year)
                     eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
                     reason = f'Auslands-Heimkehr (Vortag {yesterday_layover_ort}) Z76'
+                elif yesterday_layover_inland is True and prev_cluster_foreign and yesterday_is_homebase:
+                    # Homebase-Stempel im Vortag bei Auslandscluster = Heimkehr aus Auslandstour
+                    target_iata = ''
+                    for ci in cluster_prev.get('indices', []):
+                        cm = sorted_days[ci]
+                        if cm['dp'].get('overnight_after_day'):
+                            cand = cm['se'].get('stfrei_ort') or cm['dp'].get('layover_ort', '')
+                            if cand and not _is_inland_code(cand):
+                                target_iata = cand
+                                break
+                    klass = 'Z76'
+                    bmf_aus = _get_bmf_for_iata(target_iata, year)
+                    eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+                    reason = f'Auslands-Heimkehr (Homebase-Stempel {yesterday_layover_ort}, Ziel {target_iata or "?"}) Z76'
+                    audit_note = f'{datum}: Heimkehr aus Auslandscluster mit Homebase-Stempel — als Z76'
+                    print(f"[v8-inland-blocked-foreign-cluster] datum={datum} stempel={yesterday_layover_ort} reason='Heimkehr aus Auslandscluster — kein Z73'")
                 elif yesterday_layover_inland is True:
                     klass = 'Z73'
                     eur_added = INLAND_AN_ABREISE
@@ -9656,11 +9691,12 @@ def erstelle_pdf(d):
                 ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
             ]))
             S.append(head_row)
-            # WISO-Pfad als Sub-Zeile (klar als „eintragen unter:")
+            # v8.5: WISO-Pfad mit auto-wrap (leading 15, kein Quetschen)
             S.append(Paragraph(
                 f'<font color="#94a3b8">eintragen unter:</font>  <b>{wiso_path}</b>',
                 ps(f"bw{id(b)}", fontSize=9, textColor=TEXT,
-                   fontName="Helvetica", leading=13, spaceAfter=4)))
+                   fontName="Helvetica", leading=15, spaceAfter=6,
+                   wordWrap='CJK')))
             if has_doc:
                 S.append(Paragraph(
                     'Vollen Beleg-Betrag eintragen — WISO berechnet den absetzbaren Anteil automatisch.',
@@ -9714,11 +9750,11 @@ def erstelle_pdf(d):
            leading=12, alignment=TA_CENTER, spaceAfter=8, letterSpacing=1.5)))
     S.append(Paragraph(
         "Diese Auswertung wurde automatisiert auf Basis deiner hochgeladenen "
-        "Dokumente erstellt. AeroTAX ist ein Berechnungs- und Dokumentations-"
-        "werkzeug und ersetzt keine individuelle steuerliche Beratung. Bitte "
-        "prüfe die Werte vor Übernahme in deine Steuersoftware. Bei steuerlichen "
-        "Fragen wende dich an eine zugelassene Steuerberaterin, einen "
-        "Steuerberater oder deine Steuersoftware.",
+        "Dokumente erstellt. AeroTAX ist ein Berechnungs- und "
+        "Dokumentationswerkzeug und ersetzt keine individuelle steuerliche "
+        "Beratung. Bitte prüfe die Werte vor Übernahme in deine Steuersoftware. "
+        "Bei steuerlichen Fragen wende dich an eine zugelassene Steuerberaterin, "
+        "einen Steuerberater oder deine Steuersoftware.",
         ps("disc_b", fontSize=8.5, textColor=TEXT3, fontName="Helvetica",
            leading=13, alignment=TA_CENTER, spaceAfter=8)))
 
@@ -9964,81 +10000,47 @@ def erstelle_pdf(d):
         S.append(PageBreak())
         for el in section("Lohnsteuerbescheinigung — Übersicht"): S.append(el)
 
-        # v8.3: Persönliche Daten/PII werden NICHT mehr im PDF gezeigt.
-        # Identifikationsnummer/Geburtsdatum/Personalnummer/Steuerklasse/Kinderfreibeträge
-        # sind für die Werbungskosten-Auswertung nicht erforderlich und werden aus
-        # Datenschutz-Gründen aus dem PDF entfernt. Die Daten bleiben in der
-        # Lohnsteuerbescheinigung selbst — die User schon hat — vorhanden.
+        # v8.5: LSB-Seite radikal vereinfacht. Nur AeroTAX-relevante Werte
+        # (Brutto, Lohnsteuer, Soli, KSt, Z17). Vorsorgeaufwendungen,
+        # Sozialversicherungs-Details, WO-IN-WISO-Block und PII raus —
+        # die übernimmt WISO automatisch oder der User selbst aus seiner LSB.
+        S.append(Paragraph(
+            "Für die AeroTAX-Berechnung verwendete Werte:",
+            ps("lsb_intro", fontSize=9.5, textColor=TEXT2, fontName="Helvetica",
+               leading=14, spaceAfter=14)))
 
-        # Lohnsteuer-Grunddaten
-        S.append(Paragraph("LOHNSTEUER (Zeilen 3–6)",
-            ps("lsb_h2", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
-               leading=11, spaceAfter=10, letterSpacing=1.5)))
+        z17_label_long = "AG-Fahrkostenzuschuss Z17 (→ Abzug Fahrtkosten-/Anreisekosten-Topf)"
         lsb_items = [
-            (f"Bruttoarbeitslohn (Zeile 3)", eur(brutto)),
-            (f"Einbehaltene Lohnsteuer (Zeile 4)", eur(lohnst)),
-            (f"Solidaritätszuschlag (Zeile 5)", eur(soli)),
-            (f"Kirchensteuer AN (Zeile 6)", eur(kirche)),
-            (f"AG-Fahrkostenzuschuss Z17 (→ Abzug Fahrtkosten-/Anreisekosten-Topf)", eur(d.get('ag_z17',0))),
+            ("Bruttoarbeitslohn (Zeile 3)", eur(brutto)),
+            ("Einbehaltene Lohnsteuer (Zeile 4)", eur(lohnst)),
+            ("Solidaritätszuschlag (Zeile 5)", eur(soli)),
+            ("Kirchensteuer AN (Zeile 6)", eur(kirche)),
+            (z17_label_long, eur(d.get('ag_z17', 0))),
         ]
         for label, val in lsb_items:
             S.append(kv(label, val))
         S.append(Spacer(1, 0.4*cm))
 
-        # Vorsorgeaufwendungen — Sonderausgaben
-        S.append(Paragraph("VORSORGEAUFWENDUNGEN — SONDERAUSGABEN (§10 EStG)",
-            ps("lsb_h3", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
-               leading=11, spaceAfter=10, letterSpacing=1.5)))
-        S.append(Paragraph(
-            "Diese Beträge direkt in WISO unter Sonderausgaben → Vorsorgeaufwendungen eintragen:",
-            ps("lsb_hint", fontSize=9, textColor=TEXT2, fontName="Helvetica",
+        # Z17-Hinweis sachlich
+        z17_hint = "Hinweis: Z17 wird ausschließlich mit dem Fahrtkosten-/Anreisekosten-Topf verrechnet."
+        S.append(Paragraph(z17_hint,
+            ps("lsb_z17_note", fontSize=9, textColor=TEXT2, fontName="Helvetica",
                leading=14, spaceAfter=10)))
 
-        vorsorge_items = [
-            (f"Rentenversicherung AN (Zeile 23a)", "Anlage Vorsorge Z4", eur(rv_an)),
-            (f"Rentenversicherung AG (Zeile 22a)", "Anlage Vorsorge Z5", eur(rv_ag)),
-            (f"  → RV Gesamt (AN+AG)", "Anlage Vorsorge", eur(rv_ges)),
-            (f"Gesetzl. Krankenversicherung AN (Zeile 25)", "Anlage Vorsorge Z12", eur(kv_an)),
-            (f"Gesetzl. Pflegeversicherung AN (Zeile 26)", "Anlage Vorsorge Z13", eur(pv_an)),
-            (f"Arbeitslosenversicherung AN (Zeile 27)", "Anlage Vorsorge Z14", eur(av_an)),
-        ]
-        for label, zeile, val in vorsorge_items:
-            t = Table([[
-                Paragraph(label, ps(f"vi{id(label)}", fontSize=9, textColor=TEXT2,
-                    fontName="Helvetica", leading=12)),
-                Paragraph(zeile, ps(f"vz{id(zeile)}", fontSize=7.5, textColor=TEXT3,
-                    fontName="Helvetica", leading=12, alignment=TA_CENTER)),
-                Paragraph(val, ps(f"vv{id(val)}", fontSize=9, textColor=TEXT,
-                    fontName="Helvetica", leading=12, alignment=TA_RIGHT)),
-            ]], colWidths=[10.5*cm, 2.5*cm, 3.8*cm])
-            t.setStyle(TableStyle([
-                ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
-                ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
-                ("LINEBELOW",(0,0),(-1,0),0.3,LINE),
-                ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-            ]))
-            S.append(t)
-        S.append(kv_total("Sozialversicherung gesamt (AN)", eur(vorsorge)))
-        S.append(Spacer(1, 0.5*cm))
-
-        # WISO Eintragehinweis
-        S.append(Paragraph("WO IN WISO EINTRAGEN?",
-            ps("wiso_h", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
-               leading=11, spaceAfter=8, letterSpacing=1.5)))
-        wiso_hints = [
-            ("Rentenversicherung (AN+AG)", "Sonderausgaben → Vorsorgeaufwendungen → Beiträge zur gesetzl. Rentenversicherung"),
-            ("Kranken- & Pflegeversicherung", "Sonderausgaben → Vorsorgeaufwendungen → Kranken- und Pflegeversicherung"),
-            ("Arbeitslosenversicherung", "Sonderausgaben → Vorsorgeaufwendungen → Sonstige Vorsorgeaufwendungen"),
-            ("Reisekosten (AeroTax-Betrag)", "Ausgaben → Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten"),
-        ]
-        for title, path in wiso_hints:
+        # Optional: Z20-Hinweis falls erkannt
+        z20 = d.get('verpfl_z20', 0) or 0
+        if z20 and float(z20) > 0:
             S.append(Paragraph(
-                f'<b>{title}</b>',
-                ps(f"wh{id(title)}", fontSize=9, textColor=TEXT,
-                   fontName="Helvetica-Bold", leading=13, spaceBefore=6)))
-            S.append(Paragraph(path,
-                ps(f"wp{id(path)}", fontSize=8.5, textColor=TEXT2,
-                   fontName="Helvetica", leading=13, spaceAfter=4)))
+                f"Steuerfreie Verpflegungs-/Reisekosten laut Lohnsteuer­"
+                f"bescheinigung (Z20): <b>{eur(z20)}</b>",
+                ps("lsb_z20", fontSize=9.5, textColor=TEXT, fontName="Helvetica",
+                   leading=14, spaceBefore=6)))
+            S.append(Paragraph(
+                "Hinweis: AeroTAX verwendet für die VMA-Verrechnung "
+                "vorrangig die Streckeneinsatzabrechnung, damit keine "
+                "Doppelzählung entsteht.",
+                ps("lsb_z20_note", fontSize=9, textColor=TEXT2,
+                   fontName="Helvetica", leading=14, spaceAfter=4)))
 
 
     # Audit-Trail / Verifikations-Status komplett raus —

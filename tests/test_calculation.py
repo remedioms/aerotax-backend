@@ -1503,7 +1503,9 @@ def test_v83_pdf_disclaimer_softened():
     from app import erstelle_pdf
     src = inspect.getsource(erstelle_pdf)
     assert 'keine geschäftsmäßige Hilfeleistung in Steuersachen' not in src
-    assert 'Berechnungs- und Dokumentations-' in src or 'Berechnungs- und Dokumentationswerkzeug' in src
+    # String kann über Zeilen verteilt sein — prüfen auf "Dokumentationswerkzeug" (kein Bindestrich-Bruch)
+    assert 'Dokumentationswerkzeug' in src
+    assert 'Dokumentations-"' not in src  # kein Bindestrich-Zeilenbruch
 
 
 def test_v83_dienstlich_flag_in_tage_detail():
@@ -1620,6 +1622,123 @@ def test_v84_homebase_logging_present():
     src = inspect.getsource(_match_dp_se_per_day)
     assert '[v8-homebase]' in src
     assert 'selected=' in src
+
+
+# ── v8.5 Tests: Foreign-Cluster blockt Inland + WISO-Layout ──
+
+def test_v85_blr_tour_volltag_with_homebase_stamp_stays_z76():
+    """BLR-Tour: Volltag mit FRA-Stempel (Homebase) im Auslandscluster → Z76,
+    NICHT Z74. Kernbug aus Live-PDF."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'BLR'},
+        {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['BLR', 'FRA'], 'layover_ort': 'FRA'},  # FRA-Stempel
+        {'datum': '2025-01-06', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-05', 'stfrei_betrag': 30, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-01-06', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail_05 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-05']
+    detail_06 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-06']
+    assert detail_05 and detail_05[0]['klass'] == 'Z76', \
+        f"BLR-Tour 05.01 mit FRA-Stempel sollte Z76 sein, ist {detail_05[0]['klass'] if detail_05 else 'fehlt'}"
+    assert detail_06 and detail_06[0]['klass'] == 'Z76', \
+        f"BLR-Tour 06.01 Heimkehr mit FRA-Stempel sollte Z76 sein, ist {detail_06[0]['klass'] if detail_06 else 'fehlt'}"
+    # Z74 bleibt 0 (kein echter Inland-Volltag)
+    assert result['z74_tage'] == 0
+
+
+def test_v85_real_inland_layover_in_mixed_cluster_still_z74():
+    """Echter Inland-Layover (≠ Homebase) in Mixed-Cluster → Z74 (nicht Z76)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-09-26', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'SOF'], 'layover_ort': 'SOF'},
+        {'datum': '2025-09-27', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['SOF', 'MUC'], 'layover_ort': 'MUC'},  # MUC ≠ Homebase
+        {'datum': '2025-09-28', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['MUC', 'GOT'], 'layover_ort': 'GOT'},
+        {'datum': '2025-09-29', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-09-26', 'stfrei_betrag': 32, 'stfrei_ort': 'SOF', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-09-27', 'stfrei_betrag': 28, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-09-28', 'stfrei_betrag': 33, 'stfrei_ort': 'GOT', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 27.09 MUC ist echter Inland-Layover (≠ Homebase FRA) → Z74 bleibt
+    detail_27 = [d for d in result['tage_detail'] if d['datum'] == '2025-09-27']
+    assert detail_27 and detail_27[0]['klass'] == 'Z74', \
+        f"MUC-Layover (≠ FRA-Homebase) im Mixed-Cluster sollte Z74 bleiben, ist {detail_27[0]['klass'] if detail_27 else 'fehlt'}"
+
+
+def test_v85_homebase_stamp_on_heimkehrtag_is_z76():
+    """Heimkehrtag mit Vortag-FRA-Stempel bei Auslandscluster → Z76, nicht Z73."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-02-10', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'JFK'], 'layover_ort': 'JFK'},
+        {'datum': '2025-02-11', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['JFK', 'FRA'], 'layover_ort': 'FRA'},  # FRA-Stempel
+        {'datum': '2025-02-12', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-02-10', 'stfrei_betrag': 40, 'stfrei_ort': 'JFK', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-02-11', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-02-12', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 11.02 (Volltag mit FRA-Stempel) → Z76
+    detail_11 = [d for d in result['tage_detail'] if d['datum'] == '2025-02-11']
+    assert detail_11 and detail_11[0]['klass'] == 'Z76', \
+        f"Volltag mit FRA-Stempel im JFK-Cluster sollte Z76, ist {detail_11[0]['klass'] if detail_11 else 'fehlt'}"
+    # Heimkehrtag 12.02 → Z76
+    detail_12 = [d for d in result['tage_detail'] if d['datum'] == '2025-02-12']
+    assert detail_12 and detail_12[0]['klass'] == 'Z76', \
+        f"Heimkehrtag aus JFK sollte Z76, ist {detail_12[0]['klass'] if detail_12 else 'fehlt'}"
+    assert result['z73_tage'] == 0
+    assert result['z74_tage'] == 0
+
+
+def test_v85_pdf_lsb_radically_simplified():
+    """LSB-Seite enthält keine Vorsorgeaufwendungen, kein WO-IN-WISO-Block,
+    keine SV-Details mehr."""
+    import inspect
+    from app import erstelle_pdf
+    src = inspect.getsource(erstelle_pdf)
+    # Vorsorge-/SV-Detail-Strings sind raus
+    assert 'VORSORGEAUFWENDUNGEN' not in src
+    assert '"Rentenversicherung AN' not in src
+    assert '"Gesetzl. Krankenversicherung AN' not in src
+    assert '"Gesetzl. Pflegeversicherung AN' not in src
+    assert '"Arbeitslosenversicherung AN' not in src
+    assert 'Sozialversicherung gesamt (AN)' not in src
+    assert 'WO IN WISO EINTRAGEN?' not in src
+    # Die Kern-AeroTAX-Werte bleiben
+    assert 'Bruttoarbeitslohn (Zeile 3)' in src
+    assert 'AG-Fahrkostenzuschuss Z17' in src
+    # Z17-Hinweis ist da
+    assert 'Fahrtkosten-/Anreisekosten-Topf' in src
+
+
+def test_v85_pdf_wiso_path_uses_wrap():
+    """Optionale-Belege WISO-Pfad nutzt wordWrap und höheres leading."""
+    import inspect
+    from app import erstelle_pdf
+    src = inspect.getsource(erstelle_pdf)
+    # Mindestens ein Paragraph mit wordWrap='CJK' für lange Pfade
+    assert "wordWrap='CJK'" in src or 'wordWrap="CJK"' in src
 
 
 if __name__ == '__main__':
