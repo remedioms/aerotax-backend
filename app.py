@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '6.0.3',
-        'build':   'defensive-tour-only-an-abreise-2026-05-09',
+        'version': '6.0.4',
+        'build':   'fstring-fra-nameerror-fix-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5313,8 +5313,9 @@ EMPFOHLEN: routing, has_fl, overnight_after_day, layover_ort, layover_inland
 ▸ layover_ort: 3-Letter-IATA wo User HEUTE NACHTS schläft.
   Leer wenn zuhause. Bei overnight_after_day=true: setze layover_ort.
 
-▸ layover_inland: TRUE wenn layover_ort ∈ {FRA,MUC,HAM,DUS,STR,CGN,HAJ,
-  BER,TXL,SXF,LEJ,NUE,BRE,FMO,PAD,NRN,FKB,HHN,SCN,DRS,ERF,FDH,RLG,KSF}.
+▸ layover_inland: TRUE wenn layover_ort einer dieser Codes ist:
+  FRA, MUC, HAM, DUS, STR, CGN, HAJ, BER, TXL, SXF, LEJ, NUE, BRE,
+  FMO, PAD, NRN, FKB, HHN, SCN, DRS, ERF, FDH, RLG, KSF.
   FALSE bei Auslandscodes. Weglassen wenn keine Übernachtung.
 
 ═════ MULTI-STOP-TOUREN — JEDEN TAG EINZELN ═══════════════════════════════════
