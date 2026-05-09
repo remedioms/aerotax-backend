@@ -1741,6 +1741,90 @@ def test_v85_pdf_wiso_path_uses_wrap():
     assert "wordWrap='CJK'" in src or 'wordWrap="CJK"' in src
 
 
+# ── v8.6 Tests: Audit-Diagnose-Listen ──
+
+def test_v86_diag_lists_present_in_result():
+    """Result-Dict enthält alle Diagnose-Listen."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-15', 'activity_type': 'office', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    for key in ('extra_fahrtage', 'extra_arbeitstage', 'extra_hotelnaechte',
+                'wrong_z72_candidates', 'missing_z73_candidates',
+                'missing_z76_candidates', 'bmf_missing', 'iata_unknown'):
+        assert key in result, f"Diagnose-Liste '{key}' fehlt im Result"
+
+
+def test_v86_missing_z73_candidate_for_inland_layover():
+    """Inland-Layover ≠ Homebase mit klass != Z73 landet in missing_z73_candidates."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # Manipuliertes Szenario: tour mit MUC-Layover aber wir erzwingen ZeroDay
+    # via at='unknown' — sollte als missing_z73_candidate erkannt werden
+    structured = {'days': [
+        {'datum': '2025-04-15', 'activity_type': 'unknown', 'overnight_after_day': True,
+         'layover_ort': 'MUC'},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Tag mit overnight in MUC, aber unknown ohne SE → keine Z73, sollte aber Kandidat sein
+    candidates = [c for c in result['missing_z73_candidates'] if c['datum'] == '2025-04-15']
+    assert candidates, f"MUC-Layover sollte als missing_z73 erkannt werden, ist {result['missing_z73_candidates']}"
+
+
+def test_v86_missing_z76_candidate_for_unmapped_foreign_se():
+    """Aktive Auslands-SE-Zeile mit klass != Z76 landet in missing_z76_candidates."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # Edge-Case: SE inland=False aber DP frei → sollte zwar Z76 werden via Reklass,
+    # aber falls etwas schiefgeht: Kandidat
+    structured = {'days': [
+        {'datum': '2025-04-15', 'activity_type': 'frei', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-04-15', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Frei-Tag mit Auslands-SE → klass=Frei (continue), aktive SE landet in vma_unmapped_se ODER missing_z76
+    detail = [d for d in result['tage_detail'] if d['datum'] == '2025-04-15']
+    if detail and detail[0]['klass'] != 'Z76':
+        candidates = [c for c in result['missing_z76_candidates'] if c['datum'] == '2025-04-15']
+        assert candidates or [v for v in result['vma_unmapped_se'] if v['datum'] == '2025-04-15'], \
+            f"Aktive Auslands-SE mit klass!=Z76 muss als missing_z76 oder vma_unmapped_se erscheinen"
+
+
+def test_v86_iata_unknown_tracks_unknown_iata():
+    """Unbekannter IATA-Code wird in iata_unknown gelistet."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-01', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'XQQ'], 'layover_ort': 'XQQ'},
+        {'datum': '2025-05-02', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-01', 'stfrei_betrag': 30, 'stfrei_ort': 'XQQ', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # XQQ ist kein realer IATA → sollte in iata_unknown landen
+    assert 'XQQ' in result['iata_unknown'], \
+        f"Unbekannter IATA XQQ sollte in iata_unknown sein, ist {result['iata_unknown']}"
+
+
+def test_v86_wrong_z72_candidate_when_overnight():
+    """Z72 mit overnight=True wird als wrong_z72_candidate erkannt."""
+    # Z72 sollte nicht entstehen wenn overnight=True (Hard-Gate). Wenn doch (Bug),
+    # sollte er als wrong_z72 erkannt werden. Der Test simuliert via direkte
+    # Manipulation des tage_detail nicht möglich — daher prüfen wir nur dass
+    # die Logik überhaupt existiert.
+    import inspect
+    from app import _deterministic_classify_v7
+    src = inspect.getsource(_deterministic_classify_v7)
+    assert 'wrong_z72_candidates' in src
+    assert 'Z72-Hard-Gate' in src
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

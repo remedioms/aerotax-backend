@@ -1207,6 +1207,15 @@ def _run_process_async(job_id, form, files):
                 'vma_unmapped_se':  result.get('_vma_unmapped_se') or [],
                 'document_health':  result.get('_document_health') or {},
                 'z77_audit':        result.get('_z77_audit') or {},
+                # v8.6: Diagnose-Listen für Live-Audit
+                'extra_fahrtage':         result.get('_extra_fahrtage') or [],
+                'extra_arbeitstage':      result.get('_extra_arbeitstage') or [],
+                'extra_hotelnaechte':     result.get('_extra_hotelnaechte') or [],
+                'wrong_z72_candidates':   result.get('_wrong_z72_candidates') or [],
+                'missing_z73_candidates': result.get('_missing_z73_candidates') or [],
+                'missing_z76_candidates': result.get('_missing_z76_candidates') or [],
+                'bmf_missing':            result.get('_bmf_missing') or [],
+                'iata_unknown':           result.get('_iata_unknown') or [],
                 'versions': {
                     'app': APP_VERSION,
                     'engine': ENGINE_VERSION,
@@ -5971,10 +5980,14 @@ def _aggregate_v6_classification(classifications, structured_days, year=2025):
     }
 
 
-def _get_bmf_for_iata(iata, year):
+def _get_bmf_for_iata(iata, year, _diag=None):
     """Hilfsfunktion: BMF-Auslandspauschale für einen IATA-Code.
     Liefert dict {voll_24h, an_abreise} oder None.
-    bmf_data.py speichert tuple (voll_24h, an_abreise) — wird hier konvertiert."""
+
+    v8.6: optional `_diag`-dict mit Listen 'bmf_missing'/'iata_unknown' —
+    wird befüllt wenn Mapping fehlt, damit der Caller die Diagnose
+    bekommt (statt still 0 zu liefern).
+    """
     if not iata:
         return None
     iata_upper = iata.upper().strip()
@@ -5984,12 +5997,15 @@ def _get_bmf_for_iata(iata, year):
         from bmf_data import IATA_TO_BMF, BMF_AUSLAND_BY_YEAR
         land = IATA_TO_BMF.get(iata_upper)
         if not land:
+            if _diag is not None:
+                _diag.setdefault('iata_unknown', []).append(iata_upper)
             return None
         bmf_year = BMF_AUSLAND_BY_YEAR.get(year) or BMF_AUSLAND_BY_YEAR.get(2025)
         raw = bmf_year.get(land)
         if not raw:
+            if _diag is not None:
+                _diag.setdefault('bmf_missing', []).append({'iata': iata_upper, 'land': land, 'year': year})
             return None
-        # tuple (voll_24h, an_abreise) → dict
         if isinstance(raw, tuple) and len(raw) >= 2:
             return {'voll_24h': float(raw[0]), 'an_abreise': float(raw[1])}
         if isinstance(raw, dict):
@@ -6647,6 +6663,13 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     tage_detail = []
     z76_eur = 0.0
 
+    # v8.6: Diagnose-Listen für Audit-Output
+    _diag_bmf = {'bmf_missing': [], 'iata_unknown': []}
+
+    def _bmf(iata):
+        """Lokaler Wrapper — sammelt BMF-Mapping-Lücken in _diag_bmf."""
+        return _get_bmf_for_iata(iata, year, _diag=_diag_bmf)
+
     def _recent_foreign_cluster(idx, max_back=4):
         """Schaut bis max_back Tage zurück nach geschlossenem has_foreign Cluster."""
         for back in range(1, max_back + 1):
@@ -6680,7 +6703,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     if cand and not _is_inland_code(cand):
                         target_iata = cand
                         break
-            bmf_aus = _get_bmf_for_iata(target_iata, year)
+            bmf_aus = _bmf(target_iata)
             satz = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
             return ('Z76', satz,
                     f'Heimkehr aus Auslands-Cluster (Layover {target_iata or "?"}) Z76 An/Ab',
@@ -6690,7 +6713,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         # 2. Aktive SE-Zeile vorhanden
         if has_active_se and se_ort:
             if se_inland is False:
-                bmf_aus = _get_bmf_for_iata(se_ort, year)
+                bmf_aus = _bmf(se_ort)
                 satz = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
                 return ('Z76', satz,
                         f'Aktive Auslands-SE {se_ort} (Same-Day) Z76',
@@ -6846,7 +6869,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             # ─── Fall A: Heute Übernachtung ───
             if overnight and today_layover_inland is False:
                 klass = 'Z76'
-                bmf_aus = _get_bmf_for_iata(today_layover_ort, year)
+                bmf_aus = _bmf(today_layover_ort)
                 if is_anreise or is_abreise:
                     satz = (bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0)
                 else:
@@ -6875,7 +6898,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                                 target_iata = cand
                                 break
                     klass = 'Z76'
-                    bmf_aus = _get_bmf_for_iata(target_iata, year)
+                    bmf_aus = _bmf(target_iata)
                     if is_anreise or is_abreise:
                         eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
                         position = 'An/Ab'
@@ -6927,7 +6950,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 yesterday_is_homebase = yesterday_layover_ort.upper() == hb_upper
                 if yesterday_layover_inland is False:
                     klass = 'Z76'
-                    bmf_aus = _get_bmf_for_iata(yesterday_layover_ort, year)
+                    bmf_aus = _bmf(yesterday_layover_ort)
                     eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
                     reason = f'Auslands-Heimkehr (Vortag {yesterday_layover_ort}) Z76'
                 elif yesterday_layover_inland is True and prev_cluster_foreign and yesterday_is_homebase:
@@ -6941,7 +6964,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                                 target_iata = cand
                                 break
                     klass = 'Z76'
-                    bmf_aus = _get_bmf_for_iata(target_iata, year)
+                    bmf_aus = _bmf(target_iata)
                     eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
                     reason = f'Auslands-Heimkehr (Homebase-Stempel {yesterday_layover_ort}, Ziel {target_iata or "?"}) Z76'
                     audit_note = f'{datum}: Heimkehr aus Auslandscluster mit Homebase-Stempel — als Z76'
@@ -7001,7 +7024,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 se_ort = se.get('stfrei_ort', '')
                 se_inland = se.get('stfrei_inland')
                 if se_inland is False:
-                    bmf_aus = _get_bmf_for_iata(se_ort, year)
+                    bmf_aus = _bmf(se_ort)
                     satz = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
                     klass = 'Z76'
                     eur_added = satz
@@ -7204,6 +7227,101 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
           f"audit_notes={len(audit_notes)} unresolved={len(unresolved_days)} "
           f"vma_unmapped={len(vma_unmapped_se)} issues={issue_tage}")
 
+    # ── v8.6: Diagnose-Listen pro Tag ───────────────────────────────
+    # Heuristik-basierte "verdächtige" Tag-Listen für Live-Diff-Diagnose.
+    # Nicht hard, sondern als Audit-Hilfe für gezielte Verbesserung.
+    extra_fahrtage = []          # Tage die Fahrtag sind, aber verdächtig
+    extra_arbeitstage = []        # Arbeitstage, deren klass nicht eindeutig Dienst
+    extra_hotelnaechte = []       # Hotelnächte mit verdächtigem Kontext
+    wrong_z72_candidates = []     # Z72 verdächtig (overnight, FL, prev_overnight)
+    missing_z73_candidates = []   # Tag könnte Z73 sein (Inland-Layover ≠ Homebase, aber andere klass)
+    missing_z76_candidates = []   # Tag könnte Z76 sein (Auslands-SE ohne Z76, oder cluster_foreign + falsche klass)
+
+    hb_upper = (homebase or 'FRA').upper()
+    for i, m in enumerate(sorted_days):
+        if i >= len(tage_detail):
+            continue
+        t = tage_detail[i]
+        klass = t['klass']
+        d = m['dp']
+        se = m['se']
+        datum = t['datum']
+        at = d.get('activity_type', '')
+        overnight = bool(d.get('overnight_after_day'))
+        prev_d = sorted_days[i-1]['dp'] if i > 0 else None
+        prev_overnight = bool(prev_d and prev_d.get('overnight_after_day'))
+        cluster = cluster_for_idx.get(i)
+        cluster_foreign = bool(cluster and cluster.get('has_foreign'))
+        se_ort = se.get('stfrei_ort', '').upper()
+        se_inland = se.get('stfrei_inland')
+        has_active_se = se.get('count', 0) > 0 and float(se.get('stfrei_total', 0) or 0) > 0
+        layover_ort = (d.get('layover_ort') or se_ort).upper()
+
+        # extra_fahrtage: Fahrtag bei verdächtigen Konstellationen
+        if d.get('requires_commute') and at not in ('tour', 'same_day', 'office', 'training'):
+            extra_fahrtage.append({'datum': datum, 'activity_type': at,
+                                   'reason': 'requires_commute=true bei nicht-Dienst-Aktivität'})
+
+        # extra_arbeitstage: AT mit unklarem Klass-Hintergrund
+        if klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby') and at in ('unknown', 'none', 'frei', 'urlaub', 'krank'):
+            extra_arbeitstage.append({'datum': datum, 'klass': klass, 'activity_type': at,
+                                       'reason': 'AT-Klass auf nicht-dienstlichem DP-Marker'})
+        if klass == 'ZeroDay' and t.get('dienstlich') and not has_active_se and at in ('unknown', 'none'):
+            extra_arbeitstage.append({'datum': datum, 'klass': klass, 'activity_type': at,
+                                       'reason': 'ZeroDay als dienstlich markiert ohne SE-Spur'})
+
+        # extra_hotelnaechte: gezählte Hotelnacht aber verdächtig
+        if overnight and klass in ('Z73', 'Z74', 'Z76') and layover_ort in (hb_upper, ''):
+            extra_hotelnaechte.append({'datum': datum, 'klass': klass,
+                                        'layover_ort': layover_ort,
+                                        'reason': 'Hotel an Homebase/leerem Ort'})
+
+        # wrong_z72_candidates: Z72 das verletzt sein könnte
+        if klass == 'Z72':
+            if overnight or d.get('has_fl') or prev_overnight or i in cluster_for_idx:
+                wrong_z72_candidates.append({
+                    'datum': datum,
+                    'overnight': overnight,
+                    'has_fl': bool(d.get('has_fl')),
+                    'prev_overnight': prev_overnight,
+                    'in_cluster': i in cluster_for_idx,
+                    'reason': 'Z72-Hard-Gate möglicherweise verletzt'
+                })
+
+        # missing_z73_candidates: echter Inland-Layover (≠ Homebase) ohne Z73/Z74
+        if (overnight and layover_ort and layover_ort != hb_upper
+                and _is_inland_code(layover_ort) and klass not in ('Z73', 'Z74')):
+            missing_z73_candidates.append({
+                'datum': datum, 'klass': klass, 'layover_ort': layover_ort,
+                'reason': f'Inland-Layover {layover_ort} (≠ Homebase) ohne Z73/Z74'
+            })
+
+        # missing_z76_candidates: Auslands-SE-Zeile oder Foreign-Cluster aber kein Z76
+        if klass not in ('Z76',):
+            if has_active_se and se_inland is False:
+                missing_z76_candidates.append({
+                    'datum': datum, 'klass': klass, 'se_ort': se_ort,
+                    'reason': 'Aktive Auslands-SE-Zeile aber klass != Z76'
+                })
+            elif overnight and layover_ort and not _is_inland_code(layover_ort):
+                missing_z76_candidates.append({
+                    'datum': datum, 'klass': klass, 'layover_ort': layover_ort,
+                    'reason': f'Auslands-Layover {layover_ort} aber klass != Z76'
+                })
+
+    # Logging (kompakt, top-5 pro Liste)
+    print(f"[v8-diag] extra_fahrtage={len(extra_fahrtage)} extra_arbeitstage={len(extra_arbeitstage)} "
+          f"extra_hotelnaechte={len(extra_hotelnaechte)} wrong_z72={len(wrong_z72_candidates)} "
+          f"missing_z73={len(missing_z73_candidates)} missing_z76={len(missing_z76_candidates)} "
+          f"bmf_missing={len(_diag_bmf['bmf_missing'])} iata_unknown={len(set(_diag_bmf['iata_unknown']))}")
+    for item in (extra_fahrtage + extra_arbeitstage + extra_hotelnaechte
+                 + wrong_z72_candidates + missing_z73_candidates + missing_z76_candidates)[:30]:
+        print(f"[v8-diag-item] {item}")
+    for iata in sorted(set(_diag_bmf['iata_unknown'])):
+        print(f"[v8-iata-unknown] {iata}")
+    for entry in _diag_bmf['bmf_missing']:
+        print(f"[v8-bmf-missing] {entry}")
+
     # Plausi-Issues (v8: Hard-Fails + Soft-Warnings)
     plausi_issues = []
     plausi_hard_fails = []
@@ -7249,6 +7367,15 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         'vma_unmapped_se': vma_unmapped_se,
         'plausi_issues': plausi_issues,
         'plausi_hard_fails': plausi_hard_fails,
+        # v8.6: Diagnose-Listen für Live-Audit
+        'extra_fahrtage':         extra_fahrtage,
+        'extra_arbeitstage':      extra_arbeitstage,
+        'extra_hotelnaechte':     extra_hotelnaechte,
+        'wrong_z72_candidates':   wrong_z72_candidates,
+        'missing_z73_candidates': missing_z73_candidates,
+        'missing_z76_candidates': missing_z76_candidates,
+        'bmf_missing':            list(_diag_bmf['bmf_missing']),
+        'iata_unknown':           sorted(set(_diag_bmf['iata_unknown'])),
         'nachweis': '',
         '_v7_used': True,
     }
@@ -8342,6 +8469,14 @@ def _berechne_via_hybrid(form, files):
         '_unresolved_days': list(cls.get('unresolved_days', []) or []),
         '_vma_unmapped_se': list(cls.get('vma_unmapped_se', []) or []),
         '_document_health': cls.get('_document_health', {}),
+        '_extra_fahrtage':         list(cls.get('extra_fahrtage', []) or []),
+        '_extra_arbeitstage':      list(cls.get('extra_arbeitstage', []) or []),
+        '_extra_hotelnaechte':     list(cls.get('extra_hotelnaechte', []) or []),
+        '_wrong_z72_candidates':   list(cls.get('wrong_z72_candidates', []) or []),
+        '_missing_z73_candidates': list(cls.get('missing_z73_candidates', []) or []),
+        '_missing_z76_candidates': list(cls.get('missing_z76_candidates', []) or []),
+        '_bmf_missing':            list(cls.get('bmf_missing', []) or []),
+        '_iata_unknown':           list(cls.get('iata_unknown', []) or []),
         '_tage_detail':     list(cls.get('tage_detail', []) or []),
         '_klass_summary':   {
             'arbeitstage': arbeitstage, 'fahr_tage': fahr_tage, 'hotel_naechte': hotel_naechte,
