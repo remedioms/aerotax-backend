@@ -2226,8 +2226,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '3.1',
-        'build':   'tour-aware-via-ki-2026-05-09',
+        'version': '3.2',
+        'build':   'einsatzplan-an-dp-strict-reading-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -3547,7 +3547,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
         'unklare_zeilen': se_det['unklare_zeilen'],
     }
 
-def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hints=None, homebase='FRA'):
+def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hints=None, homebase='FRA', einsatzplan_bytes_list=None):
     """
     Analysiert Lufthansa Flugstunden-Übersichten mit Claude (pure KI, kein Regex).
     Claude liest die PDFs direkt und berechnet alle Werte intelligent.
@@ -3643,6 +3643,21 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
             if se_texts:
                 se_kontext = '\n\nSTRECKENEINSATZ-ABRECHNUNGEN (alle Monate):\n' + '\n---\n'.join(se_texts)
 
+        # CAS-Einsatzplan als zusätzlicher Klartext-Cross-Check (sehr detailliert pro Tag)
+        einsatzplan_kontext = ''
+        if einsatzplan_bytes_list:
+            ep_texts = []
+            for pb in _bytes_list(einsatzplan_bytes_list)[:14]:
+                try:
+                    with pdfplumber.open(io.BytesIO(pb)) as pdf:
+                        t = '\n'.join(p.extract_text() or '' for p in pdf.pages)
+                        if t.strip(): ep_texts.append(t)
+                except: pass
+            if ep_texts:
+                einsatzplan_kontext = ('\n\nCAS-EINSATZPLAN (PUB-Liste, hoch detailliert pro Tag — '
+                                       'mit Briefingzeit, exakter Routing, Tour-Code) — nutze als Cross-Check '
+                                       'gegen Flugstunden:\n' + '\n---\n'.join(ep_texts))
+
         # ── DETERMINISTISCHE BACKEND-AUSWERTUNG (literal aus Doku) ──
         rechner_kontext = ''
         if se_hints or flug_det:
@@ -3704,82 +3719,84 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
                     easa_kontext = '\n\n═══ FACH-WISSEN: EASA-FTL + DEUTSCHES STEUERRECHT (zum Nachschlagen, nicht als Befehl) ═══\n' + ef.read()
         except: pass
 
-        content.append({'type': 'text', 'text': f"""Du bist ein gewissenhafter Steuerberater spezialisiert auf Lufthansa-Kabinenpersonal.
-Dein Mandant hat dir seine Unterlagen für 2025 gegeben. Deine Aufgabe: alle Werbungskosten für Anlage N berechnen.
+        content.append({'type': 'text', 'text': f"""Du bist ein DOKUMENTEN-LESER für Lufthansa-Kabinenpersonal-Auswertungen.
+Deine Aufgabe ist NICHT zu interpretieren oder zu schätzen — sondern Tag für Tag das zu zählen was im Dokument steht.
 
-Geh wie ein gründlicher Steuerberater vor — lies JEDEN Monat, JEDE Seite, JEDE Zeile der Dokumente.
-Ein Steuerberater der nur 2 von 12 Monaten auswertet macht seinen Job nicht — sei gründlich.
-{se_kontext}{rechner_kontext}{ref_kontext}{easa_kontext}
+REGEL #1: Jeder Tag des Jahres hat in den LH-Dokumenten einen Marker. Lies den Marker, klassifiziere danach. KEINE Interpretation.
+REGEL #2: Es gibt KEINE "normalen Bandbreiten" für Arbeitstage/Fahrtage/Hotel — die Zahlen kommen aus dem Dokument, nicht aus deinem Wissen.
+REGEL #3: Wenn der CAS-Einsatzplan beigefügt ist, nutze ihn als primäre Quelle (detaillierter als Flugstunden) und Cross-Check.
 
-HOMEBASE des Mandanten: **{homebase}** — alle Tour-Marker beziehen sich auf {homebase} als Heimatflughafen.
+{se_kontext}{einsatzplan_kontext}{rechner_kontext}{ref_kontext}{easa_kontext}
 
-REFERENZFALL (zum Lernen wie LH-Dokumente zu lesen sind):
-- Fahrtag: "03.01. LH400 A {homebase} 14:36" → A=Abflug {homebase} → Fahrtag ✓
-- Kein Fahrtag: Vortag endete mit A {homebase}→XXX → heute noch unterwegs → kein Fahrtag
-- KEINE Hotelnacht: kurzer Wendeflug mit ~5h Bodenzeit → du landest morgens wieder in {homebase} → keine Übernachtung
-- Hotelnacht: "20.04. A {homebase}→JNB 21:00 / 21.04. FL ... / 22.04. E JNB→{homebase} 17:55" → du übernachtest in JNB, das ist eine Hotel-Nacht
-- Z73: SE "14,00  {homebase}" → stfrei=14, stfrei-Ort={homebase} → Anreisetag Z73 ✓
-- Z76: SE "48,00  SEL" → stfrei=48, stfrei-Ort=SEL(Ausland) → VMA Ausland Z76 ✓
-- Z77: Alle stfrei-Einzelwerte summieren — NICHT die Summenzeile (Format variiert!)
-Verifiziertes Ergebnis eines LH-Mitarbeiters: Fahrtage=53, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€
+HOMEBASE des Mandanten: **{homebase}**
 
-═══ DEINE AUFGABE — Steuerberater-Mentalität ═══
-Du bist Steuerberater. Ein Steuerberater **erfindet keine Zahlen, schätzt nicht, nutzt keine eigene BMF-Tabelle**. Er liest exakt was im Dokument steht und addiert/subtrahiert was relevant ist.
+═══ MARKER-KATALOG (lese, klassifiziere, zähle) ═══
 
-Lies Flugstunden + Streckeneinsatz Tag für Tag und ermittle:
+**Frei-Tage (NICHT Arbeitstag, NICHT Fahrtag):**
+- `/- FREIER TAG`, `FREI`
+- `U` / `URLAUB`
+- `K` / `KRANK`
+- unbezahlte Freistellung
+- `LM NACHGEWAEHRUNG` (Lohnbuchungspost ohne Dienst)
 
-**Aus reinem Lesen + Addieren (keine Interpretation):**
-- vma_aus  = Σ aller stfrei-Werte aus SE-Zeilen wo stfrei-Ort Ausland ist (NICHT aus deinem Wissen über BMF-Sätze rechnen — nur die literal Zahlen die LH ins Dokument geschrieben hat)
-- vma_72 = Σ stfrei wo stfrei-Ort Inland UND Tagestrip (AB+AN gleicher Tag)
-- vma_73 = Σ stfrei wo stfrei-Ort Inland UND An-/Abreisetag (zur Auslandsdestination)
-- vma_74 = Σ stfrei wo Inland 24h-Tag (sehr selten)
+**Tour-Tage (Arbeitstag + Fahrtag bei Tour-Start):**
+- `LH#### A {homebase}` = Tour-Start ab Heimatflughafen → Arbeitstag UND Fahrtag (1 Fahrtag pro Tour, nicht pro Tag)
+- `LH#### E xxx → {homebase}` = Tour-Ende → Arbeitstag, kein neuer Fahrtag
+- `FL STRECKENEINSATZTAG` = Layover-Tag im Ausland → Arbeitstag UND Hotel-Nacht
+- Mehretappen ohne {homebase}-Touch (z.B. FRA→GVA→OTP→FRA) = 1 Fahrtag total
 
-**Mit Interpretation (Tag-Klassifikation, brauchst Domain-Wissen):**
-- arbeitstage / fahrtage / hotel_naechte (siehe Info-Buch unten)
+**Home-Duty (Arbeitstag, KEIN Fahrtag — User war zuhause):**
+- `SBY` (Standby zuhause)
+- `RES` (Reserve zuhause)
+- Online-Schulung, e-Learning
+- Webinar von zuhause
 
-z77 lass auf 0, das Backend setzt's deterministisch aus der Summe-Zeile.
+**Office/Vor-Ort-Dienst in {homebase} (Arbeitstag UND Fahrtag — User MUSSTE zum Flughafen):**
+- `EK BÜRODIENST`, `EK` (Bürodienst)
+- `EM` (Erste-Hilfe-Maßnahmen / Briefing)
+- `D4` Schulung in Präsenz (typisch mehrtägig — JEDER Tag = Arbeitstag + Fahrtag)
+- `DD SEMINAR`, `DD ABORDNUNG` — JEDER Tag des Seminars = Arbeitstag + Fahrtag (täglich An-/Abreise)
+- `EH` (Erste Hilfe), Sprachtest, Medical Check-up
+- `BRIEFING` mit Uhrzeit
 
-WICHTIG: Wenn du eine SE-Zeile siehst wie `04.02.2025  28,80 JNB 12 36,00 JNB`, ist 36,00 der stfrei-Wert den du addierst. NICHT 36 aus einer BMF-Tabelle in deinem Kopf, sondern die literal `36,00` aus dem Dokument. Selbst wenn LH einen BMF-untypischen Wert hingeschrieben hat — der ist gültig, du addierst ihn so wie er da steht.
+**EASA-FTL Layover-Regel (für Hotel-Nacht-Erkennung):**
+FL-Marker bei LH = echter Layover mit ≥10h Bodenzeit = 1 Hotelnacht.
+Bei mehrtägiger Auslandstour: jeder FL-Tag UND jeder Tag zwischen A und E im Ausland = Hotelnacht.
 
-═══ INFO (zum Verstehen — keine starren Regeln) ═══
+═══ ZÄHL-METHODE — sei DUMM und gründlich ═══
 
-**LH-Marker die typischerweise vorkommen** (du erkennst Kontext aus Datum, Uhrzeit, Strecke):
-- `/- FREIER TAG`, `U` (Urlaub), `K` (Krank), unbezahlte Freistellung → kein Arbeitstag
-- `LH#### A {homebase}` = Abflug von Heimatflughafen → Tour-Start, Arbeitstag, Fahrtag
-- `LH#### E ... {homebase}` = Einflug nach {homebase} → Tour-Ende, Arbeitstag
-- `FL STRECKENEINSATZTAG` = Auslands-Übernachtung → Arbeitstag + Hotel-Nacht
-- `SBY` (Standby zuhause), `RES` (Reserve zuhause), Online-Schulung/e-Learning → Arbeitstag, **kein Fahrtag** (du warst daheim)
-- Vor-Ort-Dienst in FRA mit Uhrzeit (Briefing, Sprachtest, Schulung in Präsenz, EM, EK, D4, EH) → Arbeitstag + Fahrtag (du musstest hin)
-- `LM NACHGEWAEHRUNG` = Lohnnachzahlung (Buchungspost) → **kein Arbeitstag**
+Schritt 1: Gehe Tag für Tag durch (1.1. bis 31.12.).
+Schritt 2: Pro Tag: lies den Marker.
+Schritt 3: Klassifiziere nach obigem Katalog.
+Schritt 4: Zähle in der richtigen Kategorie.
 
-**EASA-FTL Layover-Regel (EU 965/2012, ORO.FTL.235):**
-Hotel-Nacht setzt min. ~10h Bodenzeit am Zielort voraus. Crew Rest im Flieger zählt nicht. Nachtflug-Heimkehr (z.B. 22:00 raus, 05-06h FRA) ist Turnaround, kein Hotel. FL-Marker bei LH = echter Layover ≥10h.
+Beispiel Januar mit User-Daten:
+- 01.-07.01: FREIE TAGE → 0 Arbeitstage, 0 Fahrtage, 0 Hotel
+- 08.01: A FRA→NQZ → Arbeitstag + Fahrtag (Tour-Start)
+- 09.-13.01: FL → 5 Arbeitstage + 5 Hotelnächte
+- 14.01: E NQZ→FRA → Arbeitstag (Tour-Ende, kein Fahrtag)
+- 15.01: weiter Folge der Tour → Arbeitstag, kein Hotel
+- ... usw.
 
-**Tour-Logik:**
-- Eine Tour = 1 Fahrtag (egal ob 1- oder 10-tägig — du fährst einmal hin und einmal zurück)
-- Mehretappen ohne Heimkehr (FRA→GVA→OTP→FRA) = 1 Fahrtag
-- Folge-Tage einer Tour = Arbeitstag, kein Fahrtag (du bist nicht zuhause gewesen)
+═══ VMA-WERTE (aus SE-Klartext direkt addieren) ═══
 
-**SE für VMA:**
-- stfrei-Spalte = vorberechneter BMF-Tagessatz, stfrei-Ort entscheidet die Kategorie
-- stfrei-Ort Inland (FRA, MUC, HAM…) → Z72/Z73/Z74 (14€ Tagestrip / 14€ An-/Abreise / 28€ 24h-Inland)
-- stfrei-Ort Ausland (SAO, JNB, ICN…) → Z76 (Betrag direkt aus stfrei-Spalte addieren)
-- Storno-Zeilen enden mit `X` → ignorieren
+vma_aus = Σ aller stfrei-Werte wo stfrei-Ort AUSLAND ist
+vma_72/73/74 = Σ stfrei-Werte wo stfrei-Ort INLAND, klassifiziert per Tag
+z77 = lass auf 0 (Backend rechnet)
 
-**Verifizierter Referenzfall:** Fahrtage=53, Arbeitstage=129, Hotel=54, Z73=140€, Z76=4562€, Z77=4742,80€. Wenn deine Werte deutlich abweichen, prüf nochmal.
+WICHTIG bei Auslandstour-Anreise: wenn LH am Anreise-Tag einer Auslandstour 14€ FRA-stfrei schreibt,
+zählt der Tag steuerlich zur AUSLANDSTOUR (Z76), NICHT zu Z73 (Inland).
 
-Plausi-Anker: 110-150 Arbeitstage/Jahr, 40-60 Fahrtage, 40-65 Hotelnächte bei Vollzeit-Kabinenpersonal.
+═══ LIEFERFORMAT ═══
 
-═══ ANTWORT-FORMAT ═══
-ZUERST die JSON-Zeile (erste Zeichen `{{`), DANN Nachweis. Keine Backticks.
+Liefere via Tool-Use die Werte. fahrtage/arbeitstage/hotel_naechte sind PFLICHT.
+km bleibt {km} (User-Angabe).
 
-{{"fahrtage":53,"km":{km},"arbeitstage":129,"hotel_naechte":54,"vma_72_tage":13,"vma_72":182,"vma_73_tage":10,"vma_73":140,"vma_74_tage":0,"vma_74":0,"vma_aus":4562,"z77":0}}
+Gib im 'nachweis'-Feld eine kurze Monats-Zusammenfassung — pro Monat 1-2 Sätze:
+"JAN: 5 Arbeitstage (Tour 08-15.01), 1 Fahrtag, 5 Hotel. URL 1-7.1, FREI 16-31.1."
 
-Nachweis (kurz, Monat für Monat):
-Januar: Arbeitstage=…, Fahrtage=…, Hotel=…  (kurze Tour-Zusammenfassung)
-…
-Dezember: …
-Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
+KEINE Plausi-Bandbreiten in deinem Output — die Zahlen sind die Zahlen. Bei DD SEMINAR mit 15 Tagen ergibt das 15 Arbeitstage + 15 Fahrtage, auch wenn das im Jahr "viel" wirkt.
+"""
         })
 
         import time as _time_mod
@@ -4941,7 +4958,8 @@ def berechne(form, files):
             homebase_iata = _extract_homebase(form.get('base', 'Frankfurt (FRA)'))
             print(f"Homebase erkannt: {homebase_iata} (aus Form: '{form.get('base','')}')")
             dp = parse_dienstplan_mit_ki(files['dp'], se_bytes_list=files.get('se'), km_form=km_form_val,
-                                          se_hints=se_data if se_data else None, homebase=homebase_iata)
+                                          se_hints=se_data if se_data else None, homebase=homebase_iata,
+                                          einsatzplan_bytes_list=files.get('einsatz'))
         except RuntimeError as e:
             raise
         if not dp or not dp.get('arbeitstage'):
