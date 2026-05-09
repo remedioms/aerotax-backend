@@ -2250,8 +2250,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '4.3',
-        'build':   'audit-tagdetail-z73-decision-tree-2026-05-09',
+        'version': '4.4',
+        'build':   'patterns-statt-overfit-cases-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5511,8 +5511,10 @@ def _berechne_via_hybrid(form, files):
 
     if not z77 and files.get('se'):
         notes.append('⚠️ Streckeneinsatz konnte Z77-Summe nicht ermitteln — bitte prüfen')
-    elif 0 < z77 < 1500:
-        notes.append(f'⚠ Z77 mit {z77:.2f}€ verdächtig niedrig — typisch sind 3.000-7.000€/Jahr für Vollzeit-Crew. Bitte prüfen ob alle SE-Files vollständig hochgeladen wurden.')
+    elif 0 < z77 < 500:
+        # Sehr niedriger Z77 — meist ein Read-Fehler bei Vollzeit-Crew, aber
+        # bei Teilzeit/Mutterschutz/Wiedereinstieg auch legitim. Nicht prescriptive.
+        notes.append(f'ℹ Z77 = {z77:.2f}€ ist niedrig. Bei Vollzeit ungewöhnlich, bei Teilzeit/Mutterschutz/Krankheit normal. Bitte prüfen ob alle SE-Abrechnungen hochgeladen wurden.')
 
     # Klassifikations-Werte
     arbeitstage   = int(cls.get('arbeitstage', 0) or 0)

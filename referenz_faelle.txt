@@ -129,11 +129,11 @@ DREI HAUPT-KATEGORIEN:
                                                        Fehler #1)
     stfrei-Ausland → Z76 zwingend (LH bestätigt Auslandstour)
 
-  Z73 = 0 IST FAST IMMER FALSCH bei Vollzeit-Crew!
-  Typisch Vollzeit: 5-15 Z73-Tage/Jahr aus Schulungen + Inland-Layovers.
-  Wenn deine Klassifikation auf Z73=0 endet, gehe alle EM/EH/D4-Blöcke
-  nochmal durch — du hast vermutlich mehrtägige Schulungen als "Office daily"
-  fehlklassifiziert.
+  Z73 = 0 ist UNWAHRSCHEINLICH bei Vollzeit-Crew (aber theoretisch möglich).
+  Wenn deine Klassifikation auf Z73=0 endet, prüfe nochmal alle EM/EH/D4-Blöcke
+  und potenzielle Inland-Layovers — häufiger Bug ist mehrtägige Schulung mit
+  Hotel als "Office daily" zu verbuchen. Wenn nach erneuter Prüfung wirklich
+  keine Inland-Übernachtung im Dienstplan steht: dann eben Z73=0, das ist OK.
 
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -385,44 +385,50 @@ VMA Ausland (BMF-Tagessätze pro Land × Anzahl Tag-Typen):
 
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ 9. REFERENCE-CASES (reale, FollowMe-validierte Auswertungen)             ┃
+┃ 9. PATTERNS — wie eine plausible LH-Crew-Auswertung AUSSEHEN KANN        ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
-REFERENZ-CASE A — Vollzeit FRA-Cabin, Steuerjahr 2024 (vom realen User mit FollowMe-PDF):
-  Brutto:        ~46.000 €
-  Z17:           0 €
-  Arbeitstage:   159  ← Vollzeit mit Schulungen
-  Fahrtage:      71
-  Hotelnächte:   76
-  Z72:           30 Tage × 14€ = 420 €     ← VIELE Same-Day-Tagestrips
-                                              (CPH/BER/HAM/MUC/AMS — egal ob
-                                               Inland oder EU-Ausland → 14€ pauschal)
-  Z73:           11 Tage × 14€ = 154 €     ← echte Inland-Touren mit Hotel
-                                              (Schulungen MUC/HAM mit Übernachtung)
-  Z74:           1 Tag × 28€ = 28 €         ← seltener Inland-24h-Sondertag
-  Z76:           5.073 €                    ← Auslandstouren mit Übernachtung
-                                              (BMF-Auslands-Pauschalen)
-  Pattern:       ~17 Auslandstouren + 30 Same-Day-Tagestrips
-                 + 5-6 Inland-Schulungen mit Hotel + restliche Standby/Office
+ACHTUNG: Diese Patterns sind NUR Größenordnungs-Sanity-Checks, KEINE
+Zielwerte. Du sollst NIE auf eine bestimmte Zahl hinrechnen — du sollst
+das ZÄHLEN was im Dienstplan steht und das KLASSIFIZIEREN was im Einsatzplan
+und in der SE bestätigt wird. Wenn dein User-Dienstplan andere Größenordnungen
+ergibt, ist das KORREKT — die Zahlen unten sind nur Notbremse für Tippfehler
+oder ungelesene Files.
 
-REFERENZ-CASE B — Vollzeit FRA-Cabin, Steuerjahr 2025:
-  Brutto:        ~52.000 €
-  Z17:           330 €  (AG-Fahrkostenzuschuss)
-  Arbeitstage:   133
-  Fahrtage:      58
-  Hotelnächte:   66
-  Z72:           5 Tage × 14€ = 70 €
-  Z73:           11 Tage × 14€ = 154 €
-  Z74:           1 Tag × 28€ = 28 €
-  Z76:           4.794 €
-  Pattern:       moderate Auslandstour-Aktivität, einige Inland-Schulungen
+VOLLZEIT-CREW (Quote ~100%, ganzes Jahr aktiv):
+  Arbeitstage:    grob 110-170 (Tour + Office + Standby + Schulung)
+  Fahrtage:       grob 50-100 (1 pro Tour-Start + tägliche Office-Anfahrt)
+  Hotelnächte:    grob 40-100 (alle FL-Marker = Auslands-Layovers)
+  Z72-Tage:       0-50 (Same-Day-Trips, stark crew-/airline-abhängig)
+  Z73-Tage:       1-20 (Inland-Schulungen mit Hotel + Inland-Layover)
+  Z74-Tage:       0-3 (sehr selten — 24h Inland ohne Tagestrip-Pattern)
+  Z76 (€):        meist der GRÖSSTE WK-Posten bei aktiver Crew
+                  (Auslandstouren × BMF-Pauschalen)
+  Z77 (€):        typisch 3.000-7.000 (LH stfrei gezahlte Spesen)
 
-WICHTIGE BEOBACHTUNGEN:
-  • Z73 ist IMMER niedrig (5-15 Tage) — nur ECHTE Inland-Touren
-  • Z76 ist IMMER der größte Posten — enthält Auslandstour-Anreisen
-  • Arbeitstage ~120-160 für Vollzeit
-  • Hotelnächte ≈ Fahrtage − Tagestrips (typisch ±10)
-  • Z72 variiert stark (5-30) je nach Inland-Service-Anteil
+TEILZEIT/MUTTERSCHUTZ/KRANKHEIT-Anteil:
+  → Alle Werte oben proportional skalieren (z.B. 60%-Quote → ~60% der
+    Bandbreiten). NIEMALS aus Bandbreite zurückrechnen — IMMER aus
+    Dienstplan zählen.
+
+INVARIANTEN (mathematisch zwingend, NIE verletzen):
+  • Z76 ≤ Z77 (BMF-Auslandspauschale ≤ LH-stfrei-Auszahlung)
+  • Hotelnächte ≤ Arbeitstage
+  • Fahrtage ≤ Arbeitstage
+  • Z76-Tage entsprechen ungefähr Σ(Auslands-Hotelnächte + 1 Anreise/Tour)
+  • Auslandsspesen-Summe (SE) ≈ Z76 (BMF) ±30% — sonst Klassifikations-Bug
+
+BEOBACHTUNGEN AUS DER PRAXIS (statistisch, nicht zwingend):
+  • Z73 = 0 ist unwahrscheinlich bei Vollzeit — meistens hat Crew
+    mind. 1 Inland-Schulung mit Hotel pro Jahr (Recurrent in MUC/HAM)
+  • Z76 in € ist normalerweise der größte WK-Posten (>1.000€ bei Vollzeit
+    mit Auslandsanteil), weil Langstreckenflüge die Pauschalen hochtreiben
+  • Hotelnächte und Fahrtage liegen meist im Verhältnis 1:1 bis 1.5:1
+
+→ Wenn deine Klassifikation diese Bandbreiten/Invarianten verletzt:
+  STOP, geh zurück zu den Files, lies und zähl nochmal.
+→ Wenn deine Klassifikation in den Bandbreiten liegt: das ist KEIN Beweis
+  dass es stimmt — nur dass es plausibel groß ist.
 
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -485,15 +491,15 @@ WICHTIGE BEOBACHTUNGEN:
    Auch wenn der User nicht fliegt — er muss zur Homebase fahren für die
    Schulung/Bürodienst.
 
-❌ FEHLER 17 (★HÄUFIGSTER★): Z73 = 0 in der Auswertung
-✓ RICHTIG: Z73 = 0 ist FAST IMMER FALSCH bei Vollzeit-Crew (typisch 5-15/Jahr).
-   Wenn deine Klassifikation auf Z73=0 endet, hast du wahrscheinlich:
-     a) Mehrtägige EM/EH/D4-Schulungen mit Hotel als "Office daily" verbucht
-        statt als Z73-Inland-Tour
-     b) Inland-Übernachtungen in MUC/HAM/STR/CGN aus Standby-Stationierungen
-        oder Tour-Layovers übersehen
-   GEH ALLE EM/EH/D4-Blöcke nochmal durch: 3+ aufeinanderfolgende Tage
-   ohne FREI dazwischen → fast immer Schulung mit Hotel → 2× Z73 (An+Ab).
+❌ FEHLER 17 (Häufiger Bug): Z73 = 0, weil mehrtägige Inland-Schulungen
+   als "Office daily" statt als Z73-Tour klassifiziert wurden
+✓ RICHTIG: 3+ aufeinanderfolgende EM/EH/D4-Tage ohne FREI dazwischen sind
+   ein STARKES Indiz für Inland-Schulung MIT Hotel = Z73 für An+Abreise-Tag.
+   Auch Inland-Tour-Layovers (z.B. RES/SBY in HAM/MUC mit Übernachtung) sind
+   Z73-Kandidaten.
+   Gegenbeispiel: Wenn alle EM/EH wirklich am Homebase sind und der User
+   pendelt → Office (kein Z73). Entscheidend: wo schläft der User?
+   Im Hotel = Z73, zuhause = Office.
 
 ❌ FEHLER 18 (Spiegelbild zu Fehler 17): Z76 deutlich höher als
    Auslandsspesen-Summe in der SE
@@ -537,8 +543,9 @@ Bevor du das Tool aufrufst, prüfe selbst:
   ✓ Z76 ≈ Auslandsspesen-Summe der SE ±30% (wenn weit auseinander → Bug!)
   ✓ Hotel ≤ Arbeitstage (logisch unmöglich anders)
   ✓ Fahrtage ≤ Arbeitstage (logisch)
-  ✓ Z73 ≥ 1 für Vollzeit-Crew (typisch 5-15 Tage). Z73 = 0 → STOP, prüfe
-    EM/EH/D4-Blöcke und Inland-Layover-Touren nochmal!
+  ✓ Z73 = 0 → DOPPELT prüfen ob mehrtägige EM/EH/D4-Schulungen oder
+    Inland-Layovers übersehen wurden. Wenn nach erneuter Prüfung keine
+    da sind: OK. Wenn doch da: nachklassifizieren.
   ✓ Z72 + Z73 + (Z76-Tage)/Tour ≈ Anzahl Touren (jede Tour produziert 1
     Klassifikation: Same-Day → Z72, Inland-Übernacht → Z73, Ausland-Übernacht → Z76)
   ✓ Z76 typisch der GRÖSSTE Posten bei aktiver Crew
