@@ -878,7 +878,18 @@ def _run_process_async(job_id, form, files):
             b.pop('file_bytes_list', None)
         _audit(job_id, 'files_purged', {'note': 'Originaldokumente sofort nach PDF-Generierung gelöscht (RAM + Supabase)'})
 
-        safe = {k: v for k, v in result.items() if isinstance(v, (int, float, str))}
+        # Filter: Felder die zum Frontend gehen — Dicts/Listen behalten
+        # (außer file_bytes_list die explizit ausgeschlossen wird, da Bytes nicht JSON-serializable)
+        def _is_jsonable(v):
+            if isinstance(v, (int, float, str, bool)) or v is None:
+                return True
+            if isinstance(v, (list, tuple)):
+                return all(_is_jsonable(x) for x in v)
+            if isinstance(v, dict):
+                return all(isinstance(k, str) and _is_jsonable(x) for k, x in v.items())
+            return False
+        safe = {k: v for k, v in result.items()
+                if k != 'optionale_belege' and _is_jsonable(v)}
         opt_belege_safe = []
         for b in result.get('optionale_belege', []):
             b_safe = {k: v for k, v in b.items() if k != 'file_bytes_list'}
@@ -2298,10 +2309,15 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
                         if v > 0:
                             chosen[k] = v
 
-            # Werte ins result-Dict übernehmen
+            # Werte ins result-Dict übernehmen — bei mehreren LSB-PDFs (z.B. AG-Wechsel)
+            # werden numerische Werte AKKUMULIERT, nicht überschrieben.
             for k in regex_vals.keys():
-                if chosen.get(k, 0) > 0:
-                    result[k] = chosen[k]
+                v = chosen.get(k, 0) or 0
+                if v > 0:
+                    if isinstance(result.get(k), (int, float)):
+                        result[k] = round((result[k] or 0) + v, 2)
+                    else:
+                        result[k] = v
 
             # ── 4) Persönliche Daten via Regex (selten Format-kritisch) ──
             if result['brutto'] > 0:
@@ -3726,15 +3742,28 @@ def parse_einsatzplan_mit_ki(pdf_bytes_list, year=2025):
             print(f"[Einsatzplan] PDF-Read fail: {e}")
             continue
 
-        # Format-Check (lockerer — Header kann variieren)
-        is_einsatzplan = (
+        # Format-Check: stabile CAS-Header bevorzugt — sonst muss zusätzlich
+        # ein einsatzplan-spezifischer Marker da sein (verhindert dass SE/DP-PDFs
+        # fälschlich als Einsatzplan geparst werden, nur weil "MAR 2025" im Text steht)
+        has_cas_header = (
             'Persönlicher Einsatzplan' in full_text or
             'Crew Assignment System' in full_text or
-            'PUB-Liste' in full_text or
+            'PUB-Liste' in full_text
+        )
+        # Wenn CAS-Header fehlt: zusätzlich nach Einsatzplan-typischen Markern suchen
+        # (Briefingzeit, "Tg" + EURO, Monat im Header) UND NICHT nach SE/DP-Markern
+        is_se = 'Streckeneinsatz' in full_text or 'Erstellt' in full_text[:500]
+        is_dp = 'Flugstunden' in full_text or 'Steuer-Auswertung' in full_text
+        has_einsatzplan_marker = (
+            re.search(r'\bBriefingzeit\b', full_text) or
+            re.search(r'\d+\s*Tg\s+\d+', full_text)
+        )
+        is_einsatzplan = has_cas_header or (
+            has_einsatzplan_marker and not is_se and not is_dp and
             re.search(r'\b(JAN|FEB|MAR|MÄR|APR|MAI|JUN|JUL|AUG|SEP|OKT|NOV|DEZ)\s+\d{4}', full_text[:1000])
         )
         if not is_einsatzplan:
-            print("[Einsatzplan] Format nicht erkannt (kein Header/Monat-Marker)")
+            print(f"[Einsatzplan] Format nicht erkannt (CAS-Header fehlt und keine Einsatzplan-Marker; SE={is_se}, DP={is_dp})")
             continue
 
         monate_geparst += 1
@@ -4639,8 +4668,29 @@ def berechne(form, files):
     opt_files = {k: files[k] for k in opt_keys if files.get(k)}
     optionale_belege = parse_optionale_belege(opt_files) if opt_files else []
 
+    # ── WERBUNGSKOSTEN-BELEGE zu gesamt addieren ────────────
+    # Belege mit wiso='Werbungskosten...' fließen in den WK-Topf (Anlage N).
+    # Belege für Sonderausgaben/außergew. Belastungen/Vorsorge gehen separat → nicht hier addieren.
+    opt_zu_gesamt = 0.0
+    opt_wk_summary = []
+    for b in (optionale_belege or []):
+        wiso = b.get('wiso', '') or ''
+        if not wiso.startswith('Werbungskosten'):
+            continue
+        betrag = float(b.get('betrag', 0) or 0)
+        # Sonderfall Telefon: nur 20% berufl. Anteil (BFH 11.10.2007)
+        if b.get('key') == 'tel':
+            betrag = round(betrag * 0.20, 2)
+        if betrag > 0:
+            opt_zu_gesamt += betrag
+            opt_wk_summary.append(f"{b.get('name','?')}={betrag:.2f}€")
+    opt_zu_gesamt = round(opt_zu_gesamt, 2)
+    if opt_zu_gesamt > 0:
+        notes.append(f'+ Werbungskosten-Belege ({", ".join(opt_wk_summary)}) +{opt_zu_gesamt:.2f}€')
+        print(f"[opt-belege] WK-Beträge: {opt_wk_summary}, total +{opt_zu_gesamt:.2f}€")
+
     # ── GESAMTBERECHNUNG ─────────────────────────────────────
-    gesamt = round(fahr + reinig + trink + vma_in + vma_aus, 2)
+    gesamt = round(fahr + reinig + trink + vma_in + vma_aus + opt_zu_gesamt, 2)
     netto  = round(gesamt - ag_z17 - z77, 2)
 
     # ── MATHEMATISCHE PLAUSI-CHECKS ──────────────────────────
@@ -4829,39 +4879,67 @@ def berechne(form, files):
             notes.append(f'⚠ Senior-Audit ({feld}): {grund}')
             continue
 
-        # Auto-Korrektur nur wenn Diff < 15% oder beide Werte ähnlicher Größenordnung
+        # Auto-Korrektur konservativ: nur kleine Diffs (<15%) und ≥1€/1 Tag.
+        # Geld-Diff niemals stillschweigend > 100€ anwenden — sonst nur Warnung.
         try:
             cur_v = float(aktuell or 0)
             new_v = float(korrekt)
             diff_pct = abs(new_v - cur_v) / max(abs(cur_v), 1.0)
-            if sev == 'critical' and diff_pct < 0.15 and abs(new_v - cur_v) >= 1.0:
-                # Korrektur anwenden
+            money_fields = {'z77', 'vma_aus', 'vma_72', 'vma_73', 'vma_74', 'brutto', 'lohnsteuer', 'ag_fahrt_z17', 'ag_z17'}
+            big_money_diff = feld in money_fields and abs(new_v - cur_v) > 100
+            if sev == 'critical' and diff_pct < 0.15 and abs(new_v - cur_v) >= 1.0 and not big_money_diff:
+                # Korrektur anwenden — alle Felder die Opus vorschlagen kann
+                applied = False
                 if feld == 'z77' and abs(new_v - z77) > 1:
-                    z77 = new_v
+                    z77 = new_v; applied = True
                 elif feld == 'vma_aus' and abs(new_v - vma_aus) > 1:
-                    vma_aus = new_v
+                    vma_aus = new_v; applied = True
+                elif feld == 'vma_72' and abs(new_v - vma_72) > 1:
+                    vma_72 = new_v; applied = True
+                elif feld == 'vma_73' and abs(new_v - vma_73) > 1:
+                    vma_73 = new_v; applied = True
+                elif feld == 'vma_74' and abs(new_v - vma_74) > 1:
+                    vma_74 = new_v; applied = True
                 elif feld == 'arbeitstage' and abs(new_v - arbeitstage) >= 1:
-                    arbeitstage = int(new_v)
+                    arbeitstage = int(new_v); applied = True
                 elif feld == 'fahr_tage' and abs(new_v - fahr_tage) >= 1:
-                    fahr_tage = int(new_v)
+                    fahr_tage = int(new_v); applied = True
                 elif feld == 'hotel_naechte' and abs(new_v - hotel_naechte) >= 1:
-                    hotel_naechte = int(new_v)
+                    hotel_naechte = int(new_v); applied = True
                 elif feld == 'brutto' and abs(new_v - brutto) > 1:
-                    brutto = new_v
+                    brutto = new_v; applied = True
+                elif feld in ('ag_fahrt_z17', 'ag_z17') and abs(new_v - ag_z17) > 1:
+                    ag_z17 = new_v; applied = True
+                if applied:
+                    auto_corrections.append(f'{feld}: {cur_v:.2f} → {new_v:.2f}')
+                    notes.append(f'↻ Senior-Korrektur ({feld}): {cur_v:.2f} → {new_v:.2f} — {grund}')
                 else:
                     notes.append(f'⚠ Senior-Audit ({feld}): {aktuell} → {korrekt}? Grund: {grund}')
-                    continue
-                auto_corrections.append(f'{feld}: {cur_v:.2f} → {new_v:.2f}')
-                notes.append(f'↻ Senior-Korrektur ({feld}): {cur_v:.2f} → {new_v:.2f} — {grund}')
             else:
+                # Keine Auto-Anwendung — nur Hinweis (zu großer Geld-Diff oder zu unsicher)
                 notes.append(f'⚠ Senior-Audit ({feld}): aktuell {aktuell}, möglicherweise korrekt {korrekt} — {grund}')
         except Exception:
             notes.append(f'⚠ Senior-Audit ({feld}): {grund}')
 
-    # Bei Auto-Korrekturen Netto neu berechnen
+    # Bei Auto-Korrekturen ALLE abgeleiteten Werte neu berechnen, sonst Math-Inkonsistenz
     if auto_corrections:
+        reinig = round(arbeitstage * reinig_satz, 2)
+        trink  = round(hotel_naechte * trink_satz, 2)
+        # Fahrtkosten neu (km/fahr_tage könnten sich geändert haben)
+        if anreise == 'auto':
+            fahr = round(min(km, 20) * fahr_tage * 0.30 + max(0, km - 20) * fahr_tage * 0.38, 2)
+        # vma_in neu (Inland-Anteile könnten korrigiert sein)
+        vma_in = round(vma_72 + vma_73 + vma_74, 2)
+        gesamt = round(fahr + reinig + trink + vma_in + vma_aus + opt_zu_gesamt, 2)
         netto = round(gesamt - ag_z17 - z77, 2)
-        print(f"[Opus-Audit] Auto-Korrekturen: {auto_corrections}; netto neu={netto:.2f}")
+        print(f"[Opus-Audit] Auto-Korrekturen: {auto_corrections}; "
+              f"recalc: reinig={reinig:.2f} trink={trink:.2f} fahr={fahr:.2f} "
+              f"vma_in={vma_in:.2f} gesamt={gesamt:.2f} netto={netto:.2f}")
+
+    # Notes-Deduplikation: identische Strings entfernen, Reihenfolge erhalten
+    if notes:
+        _seen = set()
+        notes = [n for n in notes if not (n in _seen or _seen.add(n))]
 
     return {
         'name':             form.get('name', 'Flugbegleiter'),
@@ -5535,14 +5613,20 @@ def erstelle_pdf(d):
     S.append(PageBreak())
     for el in section("Berechnung — Zur Information"): S.append(el)
 
+    # Jahres-spezifische Pauschalen für PDF-Anzeige
+    _yr = int(d.get('year', 2025) or 2025)
+    _bmf = BMF_INLAND_BY_YEAR.get(_yr, BMF_INLAND_BY_YEAR[2025])
+    _rsatz = REINIGUNG_PRO_TAG_BY_YEAR.get(_yr, 1.60)
+    _tsatz = TRINKGELD_PRO_NACHT_BY_YEAR.get(_yr, 3.60)
+    _de_dec = lambda f: f"{f:.2f}".replace('.', ',')
     calc_items = [
         (f"Fahrtkosten Homebase  ({d.get('km',0)} km × {d.get('fahr_tage',0)} Tage)", "Zeilen 27–30", eur(d.get('fahr',0))),
-        (f"Reinigungskosten  ({d.get('arbeitstage',0)} Tage × 1,60 €)", "Zeile 62", eur(d.get('reinig',0))),
-        (f"Trinkgelder  ({d.get('hotel_naechte',0)} Nächte × 3,60 €)", "Zeile 68", eur(d.get('trink',0))),
-        (f"VMA Inland >8h  ({d.get('vma_72_tage',0)} Tage × 14 €)", "Zeile 72", eur(d.get('vma_72',0))),
-        (f"VMA An-/Abreisetage  ({d.get('vma_73_tage',0)} Tage × 14 €)", "Zeile 73", eur(d.get('vma_73',0))),
-        (f"VMA 24h  ({d.get('vma_74_tage',0)} Tage × 28 €)", "Zeile 74", eur(d.get('vma_74',0))),
-        ("VMA Ausland nach BMF-Pauschalen 2025", "Zeile 76", eur(d.get('vma_aus',0))),
+        (f"Reinigungskosten  ({d.get('arbeitstage',0)} Tage × {_de_dec(_rsatz)} €)", "Zeile 62", eur(d.get('reinig',0))),
+        (f"Trinkgelder  ({d.get('hotel_naechte',0)} Nächte × {_de_dec(_tsatz)} €)", "Zeile 68", eur(d.get('trink',0))),
+        (f"VMA Inland >8h  ({d.get('vma_72_tage',0)} Tage × {_de_dec(_bmf['tagestrip_8h'])} €)", "Zeile 72", eur(d.get('vma_72',0))),
+        (f"VMA An-/Abreisetage  ({d.get('vma_73_tage',0)} Tage × {_de_dec(_bmf['an_abreise'])} €)", "Zeile 73", eur(d.get('vma_73',0))),
+        (f"VMA 24h  ({d.get('vma_74_tage',0)} Tage × {_de_dec(_bmf['voll_24h'])} €)", "Zeile 74", eur(d.get('vma_74',0))),
+        (f"VMA Ausland nach BMF-Pauschalen {_yr}", "Zeile 76", eur(d.get('vma_aus',0))),
     ]
     for label, zeile, val in calc_items:
         t = Table([[
