@@ -2253,6 +2253,82 @@ def test_v810_no_start_time_stays_z76():
     assert detail and detail[0]['klass'] == 'Z76'
 
 
+def test_v811_diagnostic_lists_present():
+    """v8.11 Diagnose-Listen sind im Result-Dict."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-01', 'activity_type': 'office', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    for key in ('aerotax_z76_dates_amounts', 'training_commute_candidates',
+                'office_z72_candidates', 'missing_reader_days'):
+        assert key in result, f"v8.11-Liste '{key}' fehlt"
+
+
+def test_v811_z76_dates_amounts_collected():
+    """Z76-Tage werden mit Datum/Betrag/Land/Tagtyp gelistet."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'BLR'], 'layover_ort': 'BLR',
+         'start_time': '11:00'},  # früh → bleibt Z76
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert len(result['aerotax_z76_dates_amounts']) >= 1
+    z76_03 = result['aerotax_z76_dates_amounts'][0]
+    assert z76_03['datum'] == '2025-01-03'
+    assert z76_03['layover_ort'] == 'BLR'
+    assert z76_03['amount'] > 0
+
+
+def test_v811_training_sequence_detected():
+    """Mehrtägige Training-Sequenz (≥4 Tage) wird als training_commute_candidate."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'training', 'overnight_after_day': False}
+        for d in (4, 5, 8, 9, 10, 11, 12)
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Erwartet: 1 Sequenz (04-12.09 mit Lücke 06-07.09 zählt als 2 Sequenzen <4)
+    # Also entweder 2 separate Sequenzen ODER eine wenn die Lücke übersprungen wird.
+    # Bei meinem Code wird seq nur durch != training abgebrochen — Lücke (Wochenende) nicht im days-Array
+    # = wird nicht als Lücke gesehen. Also 1 zusammenhängende Sequenz von 7.
+    assert len(result['training_commute_candidates']) >= 1
+
+
+def test_v811_office_over_8h_listed_as_z72_candidate():
+    """Office mit duty>=480 → office_z72_candidate."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-07', 'activity_type': 'office', 'overnight_after_day': False,
+         'start_time': '08:00', 'end_time': '17:30', 'duty_duration_minutes': 570},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    candidates = [c for c in result['office_z72_candidates'] if c['datum'] == '2025-04-07']
+    assert candidates, f"Office mit duty=570min sollte Z72-Kandidat sein, ist {result['office_z72_candidates']}"
+
+
+def test_v811_missing_reader_days_detected():
+    """Tage in der Datum-Range die der DP-Reader weggelassen hat → missing_reader_days."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-01', 'activity_type': 'office', 'overnight_after_day': False},
+        # 02.06 fehlt
+        {'datum': '2025-06-03', 'activity_type': 'office', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert any(m['datum'] == '2025-06-02' for m in result['missing_reader_days']), \
+        f"02.06 sollte als missing_reader_day erkannt werden, ist {result['missing_reader_days']}"
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

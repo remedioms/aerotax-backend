@@ -1215,6 +1215,10 @@ def _run_process_async(job_id, form, files):
                 'missing_z73_candidates': result.get('_missing_z73_candidates') or [],
                 'missing_z76_candidates': result.get('_missing_z76_candidates') or [],
                 'missing_deutschland_14_candidates': result.get('_missing_deutschland_14_candidates') or [],
+                'aerotax_z76_dates_amounts':   result.get('_aerotax_z76_dates_amounts') or [],
+                'training_commute_candidates': result.get('_training_commute_candidates') or [],
+                'office_z72_candidates':       result.get('_office_z72_candidates') or [],
+                'missing_reader_days':         result.get('_missing_reader_days') or [],
                 'bmf_missing':            result.get('_bmf_missing') or [],
                 'iata_unknown':           result.get('_iata_unknown') or [],
                 'versions': {
@@ -7389,6 +7393,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     missing_z73_candidates = []   # Tag könnte Z73 sein (Inland-Layover ≠ Homebase, aber andere klass)
     missing_z76_candidates = []   # Tag könnte Z76 sein (Auslands-SE ohne Z76, oder cluster_foreign + falsche klass)
     missing_deutschland_14_candidates = []  # Z72/Z73-Inland-Tage die Heuristik vermutet
+    # v8.11: Diagnose-Listen für Z76-Diff vs Reference
+    aerotax_z76_dates_amounts = []   # alle AeroTAX-Z76-Tage mit Betrag/Land/Tagtyp
+    training_commute_candidates = [] # mehrtägige Training-Sequenz (evtl. nicht jeder Tag Fahrtag)
+    office_z72_candidates = []       # Office mit duty>=480 ohne klaren Homebase-Bezug
+    missing_reader_days = []         # Tage in Datum-Range die der DP-Reader weggelassen hat
 
     hb_upper = (homebase or 'FRA').upper()
     for i, m in enumerate(sorted_days):
@@ -7492,6 +7501,78 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'reason': f'Inland-Layover {effective_ort} im Inland-Cluster → Z73-Kandidat (aktuell {klass})'
                 })
 
+        # v8.11: aerotax_z76_dates_amounts — alle Z76-Tage mit Detail für Reference-Diff
+        if klass == 'Z76':
+            t_detail = tage_detail[i] if i < len(tage_detail) else {}
+            cr = t_detail.get('classifier_result') or {}
+            aerotax_z76_dates_amounts.append({
+                'datum':       datum,
+                'amount':      round(eur_added, 2),
+                'layover_ort': effective_ort,
+                'bmf_land':    cr.get('bmf_land', '') or '',
+                'tagtyp':      cr.get('bmf_tagtyp', '') or '',
+                'is_anreise':  i in cluster_for_idx and cluster_for_idx[i].get('indices', [None])[0] == i,
+                'is_abreise':  i in cluster_for_idx and cluster_for_idx[i].get('indices', [None])[-1] == i,
+            })
+
+        # v8.11: office_z72_candidates — Office mit duty>=480 (>8h) ohne klaren Homebase-Bezug
+        if klass == 'Office':
+            duty_min_office = int(d.get('duty_duration_minutes') or 0)
+            if duty_min_office >= 480:
+                office_z72_candidates.append({
+                    'datum': datum, 'klass': klass,
+                    'marker': d.get('raw_marker', '') or at,
+                    'duty_minutes': duty_min_office,
+                    'reason': 'Office >8h — auswärtige Schulung/Training? Z72-Kandidat'
+                })
+
+    # v8.11: training_commute_candidates — mehrtägige Training-Sequenz (≥ 4 zusammen)
+    # Wenn 4+ Tage hintereinander activity_type=training mit requires_commute=true,
+    # ist es vermutlich EINE auswärtige Schulung/Seminar mit nur 1 Anfahrt nötig,
+    # nicht jeden Tag eigene Fahrt.
+    seq_start = None
+    for i, m in enumerate(sorted_days):
+        d = m['dp']
+        if d.get('activity_type') == 'training' and d.get('requires_commute'):
+            if seq_start is None:
+                seq_start = i
+        else:
+            if seq_start is not None and (i - seq_start) >= 4:
+                training_commute_candidates.append({
+                    'start_datum': sorted_days[seq_start]['datum'],
+                    'end_datum':   sorted_days[i-1]['datum'],
+                    'days_count':  i - seq_start,
+                    'reason': f'Mehrtägige Training-Sequenz {sorted_days[seq_start]["datum"]} bis {sorted_days[i-1]["datum"]} — evtl. nur 1-2 Fahrtage statt jeden Tag'
+                })
+            seq_start = None
+    if seq_start is not None and (len(sorted_days) - seq_start) >= 4:
+        training_commute_candidates.append({
+            'start_datum': sorted_days[seq_start]['datum'],
+            'end_datum':   sorted_days[-1]['datum'],
+            'days_count':  len(sorted_days) - seq_start,
+            'reason': 'Mehrtägige Training-Sequenz am Jahresende — evtl. nur 1-2 Fahrtage'
+        })
+
+    # v8.11: missing_reader_days — Tage in Datum-Range die der DP-Reader weggelassen hat.
+    # Häufig sind das Frei/Urlaub/Krank-Tage die Sonnet weglassen sollte. Aber wenn ein
+    # Tag mitten in einer aktiven Tour fehlt, ist das ein Reader-Bug.
+    if sorted_days:
+        try:
+            from datetime import date as _date
+            start_d = _date.fromisoformat(sorted_days[0]['datum'])
+            end_d   = _date.fromisoformat(sorted_days[-1]['datum'])
+            present = set(m['datum'] for m in sorted_days)
+            cur = start_d
+            while cur <= end_d:
+                iso = cur.isoformat()
+                if iso not in present:
+                    missing_reader_days.append({'datum': iso, 'reason': 'Nicht im DP-Reader-Output'})
+                cur = cur.replace(day=cur.day) if False else cur
+                # Erhöhung: pythonisch
+                cur = cur.fromordinal(cur.toordinal() + 1)
+        except Exception:
+            pass
+
     # Logging (kompakt, top-5 pro Liste)
     print(f"[v8-diag] extra_fahrtage={len(extra_fahrtage)} extra_arbeitstage={len(extra_arbeitstage)} "
           f"extra_hotelnaechte={len(extra_hotelnaechte)} wrong_z72={len(wrong_z72_candidates)} "
@@ -7558,6 +7639,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         'missing_z73_candidates': missing_z73_candidates,
         'missing_z76_candidates': missing_z76_candidates,
         'missing_deutschland_14_candidates': missing_deutschland_14_candidates,
+        'aerotax_z76_dates_amounts':   aerotax_z76_dates_amounts,
+        'training_commute_candidates': training_commute_candidates,
+        'office_z72_candidates':       office_z72_candidates,
+        'missing_reader_days':         missing_reader_days,
         'bmf_missing':            list(_diag_bmf['bmf_missing']),
         'iata_unknown':           sorted(set(_diag_bmf['iata_unknown'])),
         'nachweis': '',
@@ -8660,6 +8745,10 @@ def _berechne_via_hybrid(form, files):
         '_missing_z73_candidates': list(cls.get('missing_z73_candidates', []) or []),
         '_missing_z76_candidates': list(cls.get('missing_z76_candidates', []) or []),
         '_missing_deutschland_14_candidates': list(cls.get('missing_deutschland_14_candidates', []) or []),
+        '_aerotax_z76_dates_amounts':   list(cls.get('aerotax_z76_dates_amounts', []) or []),
+        '_training_commute_candidates': list(cls.get('training_commute_candidates', []) or []),
+        '_office_z72_candidates':       list(cls.get('office_z72_candidates', []) or []),
+        '_missing_reader_days':         list(cls.get('missing_reader_days', []) or []),
         '_bmf_missing':            list(cls.get('bmf_missing', []) or []),
         '_iata_unknown':           list(cls.get('iata_unknown', []) or []),
         '_tage_detail':     list(cls.get('tage_detail', []) or []),
