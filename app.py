@@ -11,7 +11,7 @@
 #    PORT                   = 5000
 # ═══════════════════════════════════════════════════════════════
 
-import os, io, uuid, json, re, tempfile
+import os, io, uuid, json, re, tempfile, gc
 import hashlib as _hashlib
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file, abort
@@ -650,6 +650,71 @@ _jobs_lock = __import__('threading').Lock()
 _JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jobs_state')
 os.makedirs(_JOBS_DIR, exist_ok=True)
 
+# ── WARTESCHLANGE ──────────────────────────────────────────────
+# Verhindert dass mehrere Auswertungen parallel laufen → schützt vor OOM auf Free-Tier.
+# 1 Worker-Thread zieht Jobs sequenziell aus der Queue. Andere User warten in Position 2,3,...
+import queue as _stdqueue
+_calc_queue = _stdqueue.Queue()
+_calc_running_id = None
+_calc_worker_started = False
+# Geschätzte Zeit pro Job in Sekunden (für ETA-Berechnung im Frontend)
+_AVG_JOB_SECONDS = 150
+
+
+def _get_queue_position(job_id):
+    """Gibt die 1-basierte Queue-Position zurück. 1 = wird gerade gerechnet bzw als Nächstes.
+    None wenn nicht in Queue (vermutlich schon fertig oder läuft gerade).
+    """
+    global _calc_running_id
+    snap = list(_calc_queue.queue)
+    if _calc_running_id == job_id:
+        return 1  # läuft gerade
+    pos = 1 if _calc_running_id else 0
+    for entry in snap:
+        if entry[0] == job_id:
+            return pos + 1
+        pos += 1
+    return None
+
+
+def _calc_worker():
+    """Background-Worker: pickt Jobs aus _calc_queue, führt sequenziell aus."""
+    global _calc_running_id
+    while True:
+        try:
+            job_id, form, files = _calc_queue.get()
+        except Exception as e:
+            print(f"[queue-worker] queue.get fail: {e}")
+            continue
+        try:
+            with _jobs_lock:
+                _calc_running_id = job_id
+                if job_id in _jobs and _jobs[job_id].get('status') == 'queued':
+                    _jobs[job_id]['status'] = 'pending'
+            _run_process_async(job_id, form, files)
+        except Exception as e:
+            print(f"[queue-worker] job {job_id[:8]} crash: {e}")
+        finally:
+            with _jobs_lock:
+                _calc_running_id = None
+            try: _calc_queue.task_done()
+            except: pass
+            gc.collect()  # nach jedem Job RAM freigeben
+
+
+def _start_calc_worker():
+    global _calc_worker_started
+    if _calc_worker_started:
+        return
+    _calc_worker_started = True
+    _t = __import__('threading').Thread(target=_calc_worker, daemon=True, name='calc-worker')
+    _t.start()
+    print("[queue] Worker-Thread gestartet")
+
+
+# Worker beim App-Init starten (bei Render-Worker-Start)
+_start_calc_worker()
+
 
 def _save_job_to_disk(job_id):
     """Speichert Job-State nach Disk — überlebt Render-Restart."""
@@ -844,27 +909,31 @@ def process_real():
                 for k, ts in list(_consumed_payment_intents.items()):
                     if ts < cutoff_pi:
                         _consumed_payment_intents.pop(k, None)
+        # Status: 'queued' wenn aktuell schon eine Auswertung läuft, sonst 'pending'
+        initial_status = 'queued' if _calc_running_id else 'pending'
         with _jobs_lock:
             _jobs[job_id] = {
-                'status':   'pending',
+                'status':   initial_status,
                 'progress': 0,
                 'created':  datetime.utcnow().isoformat() + 'Z',
                 'session_token': session_token,
             }
         # SOFORT auf Disk persistieren — falls Worker zwischen create und ersten Poll restartet
-        # (gunicorn --max-requests recycled Worker, Polling-Calls würden sonst 404 sehen)
         _save_job_to_disk(job_id)
-        # ref/pi_id ans form-dict heften — für späteren Cleanup nach erfolgreicher Auswertung
+        # ref/pi_id ans form-dict heften — für späteren Cleanup
         form['ref'] = ref or ''
         form['pi_id'] = pi_id or ''
         _audit(job_id, 'job_created', {'year': form['year'], 'base': form['base'], 'files': {k: len(v) for k, v in files.items()}})
 
-        Thread = __import__('threading').Thread
-        Thread(target=_run_process_async, args=(job_id, form, files), daemon=True).start()
+        # In Warteschlange einreihen statt direktem Thread-Spawn — verhindert OOM bei parallelen Usern
+        _calc_queue.put((job_id, form, files))
+        queue_pos = _get_queue_position(job_id) or 1
 
         return jsonify({
             'job_id': job_id,
-            'status': 'pending',
+            'status': initial_status,
+            'queue_position': queue_pos,
+            'eta_seconds':    max(0, (queue_pos - 1) * _AVG_JOB_SECONDS),
             'session_token': session_token,
             'poll_url': f'/api/job/{job_id}',
         })
@@ -1016,6 +1085,13 @@ def get_job_status(job_id):
     if not j:
         return jsonify({'status': 'not_found'}), 404
     safe = {k: v for k, v in j.items() if k != 'audit'}
+    # Wenn Job noch in Queue: aktuelle Position + ETA mitschicken
+    status = safe.get('status')
+    if status in ('queued', 'pending'):
+        pos = _get_queue_position(job_id)
+        if pos is not None:
+            safe['queue_position'] = pos
+            safe['eta_seconds']    = max(0, (pos - 1) * _AVG_JOB_SECONDS)
     return jsonify(safe)
 
 
@@ -2089,9 +2165,10 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '2.3',
-        'build':   'sonnet-dp-tool-use-2026-05-09',
-        'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always', 'opus-final-audit', 'sonnet-dp-tool-use'],
+        'version': '2.4',
+        'build':   'queue-and-mem-opt-2026-05-09',
+        'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
+                     'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
 
 
@@ -4481,6 +4558,7 @@ def berechne(form, files):
         if not lst or not lst.get('brutto'):
             missing.append('Lohnsteuerbescheinigung (nicht lesbar)')
             lst = None
+        gc.collect()  # LSB-PDF-Buffer freigeben
     else:
         missing.append('Lohnsteuerbescheinigung (nicht hochgeladen)')
 
@@ -4497,6 +4575,7 @@ def berechne(form, files):
         except Exception as e:
             print(f"Einsatzplan-Parse fail: {e}")
             einsatz_data = None
+        gc.collect()  # Einsatzplan-PDFs Buffer freigeben
 
     # Helper: Einsatzplan-Monate auswerten (welche Monate flugfrei?)
     _MONAT_MAP = {'JAN':1,'FEB':2,'MAR':3,'MÄR':3,'APR':4,'MAI':5,'JUN':6,
@@ -4577,6 +4656,7 @@ def berechne(form, files):
                     )
     else:
         missing.append('Streckeneinsatz-Abrechnungen (nicht hochgeladen)')
+    gc.collect()  # SE-PDFs + Claude-Validation-Buffer freigeben
 
     # ── FLUGSTUNDEN-ÜBERSICHTEN ───────────────────────────────
     dp = None
@@ -4604,6 +4684,7 @@ def berechne(form, files):
         if not dp or not dp.get('arbeitstage'):
             missing.append('Flugstunden-Übersichten (Analyse fehlgeschlagen — bitte nochmal versuchen)')
             dp = None
+        gc.collect()  # DP-PDFs Buffer + Sonnet-Response freigeben
     else:
         missing.append('Flugstunden-Übersichten (nicht hochgeladen)')
 
@@ -5088,6 +5169,7 @@ def berechne(form, files):
     except Exception as _ae:
         print(f"[Opus-Audit] crash: {_ae}")
         opus_issues = []
+    gc.collect()  # Opus-Response + Audit-Texte freigeben
 
     # Critical Issues mit konkreter Korrektur → automatisch übernehmen + Note
     # Minor Issues / unsichere Korrekturen → nur als Warnung anzeigen
@@ -5809,17 +5891,29 @@ def erstelle_pdf(d):
                        fontName="Helvetica", leading=12, spaceAfter=10)))
                 S.append(hr(0, 12))
                 try:
-                    # HEIC (iPhone) → erst zu JPEG konvertieren falls möglich
+                    # HEIC (iPhone) ODER große Bilder → erst auf max 1500px skalieren
+                    # spart massiv RAM (12MP-iPhone-Foto: 100MB → 5MB) ohne PDF-Qualitätsverlust
                     is_heic = b'ftypheic' in fb[:32] or b'ftypheix' in fb[:32] or b'ftypmif1' in fb[:32]
-                    if is_heic and PIL_AVAILABLE and HEIF_AVAILABLE:
+                    is_image = (is_heic or fb[:3]==b'\xff\xd8\xff' or fb[:4]==b'\x89PNG' or
+                                fb[:6]==b'GIF87a' or fb[:6]==b'GIF89a' or fb[8:12]==b'WEBP')
+                    if is_image and PIL_AVAILABLE:
                         try:
                             from PIL import Image as PILImage
-                            heic_img = PILImage.open(io.BytesIO(fb))
+                            src_img = PILImage.open(io.BytesIO(fb))
+                            # Auf max 1500px Längste-Kante runterskalieren (PDF-Output bleibt scharf)
+                            max_dim = 1500
+                            if max(src_img.size) > max_dim:
+                                ratio = max_dim / max(src_img.size)
+                                new_size = (int(src_img.size[0]*ratio), int(src_img.size[1]*ratio))
+                                src_img = src_img.resize(new_size, PILImage.LANCZOS)
+                                print(f"[img-scale] {b.get('name','?')}: {fb_item[1] if isinstance(fb_item,tuple) else 'img'} → {new_size[0]}×{new_size[1]}")
                             buf_jpg = io.BytesIO()
-                            heic_img.convert('RGB').save(buf_jpg, format='JPEG', quality=88)
+                            src_img.convert('RGB').save(buf_jpg, format='JPEG', quality=82, optimize=True)
                             fb = buf_jpg.getvalue()
+                            # Source-Image freigeben
+                            src_img.close()
                         except Exception as _hc:
-                            print(f"[heic] convert fail: {_hc}")
+                            print(f"[img-scale] fail: {_hc}")
                     if fb[:3]==b'\xff\xd8\xff' or fb[:4]==b'\x89PNG' or fb[:6]==b'GIF87a' or fb[:6]==b'GIF89a' or fb[8:12]==b'WEBP':
                         img = RLImage(io.BytesIO(fb))
                         iw,ih = img.drawWidth,img.drawHeight
