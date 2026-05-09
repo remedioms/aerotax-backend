@@ -7,6 +7,9 @@ Lokal ausführen:
 import os
 import sys
 
+# Unit-Tests dürfen beim Import von app.py keine Worker-/Cleanup-Threads starten.
+os.environ.setdefault('AEROTAX_DISABLE_BG_THREADS', '1')
+
 # app.py liegt im Parent-Dir
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

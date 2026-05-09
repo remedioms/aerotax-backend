@@ -1,13 +1,13 @@
 # ═══════════════════════════════════════════════════════════════
 #  AEROTAX BACKEND — app.py
-#  Deploy auf Railway.app
+#  Deploy auf Render
 #
-#  Umgebungsvariablen (in Railway Dashboard setzen):
+#  Umgebungsvariablen (in Render Dashboard setzen):
 #    ANTHROPIC_API_KEY      = sk-ant-...
 #    STRIPE_SECRET_KEY      = sk_live_...
 #    STRIPE_WEBHOOK_SECRET  = whsec_...
 #    AEROTAX_PRICE_ID       = price_... (15 EUR Produkt in Stripe)
-#    FRONTEND_URL           = https://aerotax.de
+#    FRONTEND_URL           = https://aerosteuer.de
 #    PORT                   = 5000
 # ═══════════════════════════════════════════════════════════════
 
@@ -65,7 +65,7 @@ CORS(app, origins=[
     os.getenv('FRONTEND_URL', 'https://aerosteuer.de'),
     'https://aerosteuer.de',
     'https://aerosteuer.pages.dev',
-    re.compile(r'^https://[a-z0-9]+\.aerosteuer\.pages\.dev$'),  # Cloudflare Preview-Deploys
+    re.compile(r'^https://[a-z0-9-]+\.aerosteuer\.pages\.dev$'),  # Cloudflare Preview-Deploys
     'http://localhost:3000',
     'http://localhost:8080',
 ])
@@ -74,7 +74,7 @@ stripe.api_key        = os.getenv('STRIPE_SECRET_KEY')
 WEBHOOK_SECRET        = os.getenv('STRIPE_WEBHOOK_SECRET')
 ANTHROPIC_KEY = os.getenv('ANTHROPIC_API_KEY')
 PRICE_ID              = os.getenv('AEROTAX_PRICE_ID')
-FRONTEND_URL          = os.getenv('FRONTEND_URL','https://aerotax.de')
+FRONTEND_URL          = os.getenv('FRONTEND_URL','https://aerosteuer.de')
 
 # In-memory store (in Produktion: Redis oder S3)
 _store = {}
@@ -122,6 +122,9 @@ def create_checkout():
         'expires': datetime.utcnow() + timedelta(hours=2),
     }
 
+    if not stripe.api_key or not PRICE_ID:
+        return jsonify({'error': 'Stripe ist nicht korrekt konfiguriert.'}), 500
+
     session = stripe.checkout.Session.create(
         payment_method_types=['card'],
         line_items=[{'price': PRICE_ID, 'quantity': 1}],
@@ -167,6 +170,9 @@ def create_payment_intent():
                 'paid':    False,
                 'expires': datetime.utcnow() + timedelta(hours=2),
             }
+
+        if not stripe.api_key:
+            return jsonify({'error': 'Stripe ist nicht korrekt konfiguriert.'}), 500
 
         intent = stripe.PaymentIntent.create(
             amount=amount,
@@ -357,6 +363,9 @@ def stripe_webhook():
     Webhook bleibt als Backup / Confirmation bestehen."""
     payload = request.get_data()
     sig     = request.headers.get('Stripe-Signature', '')
+
+    if not WEBHOOK_SECRET:
+        return jsonify({'error': 'Stripe Webhook Secret fehlt.'}), 500
 
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
@@ -794,8 +803,10 @@ def _start_calc_worker():
     print("[queue] Worker-Thread + Restart-Recovery gestartet (async)")
 
 
-# Worker beim App-Init starten (bei Render-Worker-Start)
-_start_calc_worker()
+# Worker beim App-Init starten (bei Render-Worker-Start).
+# Tests/Imports können die Threads deaktivieren, damit Unit-Tests wirklich isoliert bleiben.
+if os.environ.get('AEROTAX_DISABLE_BG_THREADS') != '1':
+    _start_calc_worker()
 
 
 _PII_KEYS = {
@@ -1005,7 +1016,7 @@ def process_real():
         ref = (request.form.get('ref') or '').strip()
         pi_id = (request.form.get('payment_intent_id') or '').strip()
         promo_code = (request.form.get('promo_code') or '').strip().upper()
-        is_free_retry = bool(free_retry_token and free_retry_token in _recovery_tokens)
+        is_free_retry = _is_valid_recovery_token(free_retry_token)
         is_paid = bool(ref and _store.get(ref, {}).get('paid'))
         # Replay-Schutz: PI darf nur 1x für /api/process genutzt werden
         if pi_id and pi_id in _consumed_payment_intents:
@@ -1016,10 +1027,14 @@ def process_real():
         if not is_paid and pi_id:
             try:
                 pi = stripe.PaymentIntent.retrieve(pi_id)
-                if pi and pi.status == 'succeeded':
+                pi_ref = ((pi.metadata or {}).get('ref') or '').strip() if pi else ''
+                if pi and pi.status == 'succeeded' and pi_ref:
+                    # WICHTIG: PaymentIntent darf nur die eigene Upload-ref freischalten.
+                    # Sonst könnte ein bezahlter PI versehentlich/absichtlich für fremde refs genutzt werden.
+                    if ref and ref != pi_ref:
+                        return jsonify({'error': 'Zahlung passt nicht zu dieser Upload-Session.'}), 402
+                    ref = ref or pi_ref
                     is_paid = True
-                    if not ref:
-                        ref = (pi.metadata or {}).get('ref') or ''
                     if ref and ref in _store:
                         _store[ref]['paid'] = True
             except Exception as _e:
@@ -1392,8 +1407,24 @@ def full_health_check():
     return jsonify(health), 200 if overall == 'ok' else 503
 
 
-# Recovery-Tokens: erlauben kostenlose Wiederholung in 30 Min Fenster
+# Recovery-Tokens: erlauben kostenlose Wiederholung in 60-Min-Fenster
 _recovery_tokens = {}
+
+
+def _is_valid_recovery_token(token):
+    """True, wenn Recovery/Edit-Token existiert und noch nicht abgelaufen ist."""
+    info = _recovery_tokens.get(token or '')
+    if not info:
+        return False
+    try:
+        exp = datetime.fromisoformat(str(info.get('expires', '')).replace('Z', ''))
+        if exp < datetime.utcnow():
+            _recovery_tokens.pop(token, None)
+            return False
+    except Exception:
+        _recovery_tokens.pop(token, None)
+        return False
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1497,8 +1528,9 @@ def _cleanup_loop():
         except: pass
 
 
-# Cleanup-Thread starten
-__import__('threading').Thread(target=_cleanup_loop, daemon=True).start()
+# Cleanup-Thread starten (in Tests deaktivierbar)
+if os.environ.get('AEROTAX_DISABLE_BG_THREADS') != '1':
+    __import__('threading').Thread(target=_cleanup_loop, daemon=True, name='cleanup-loop').start()
 
 
 def _load_session(token):
@@ -2372,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '5.0',
-        'build':   'self-reflection-audit-pdf-dsgvo-tests-2026-05-09',
+        'version': '5.1',
+        'build':   'security-fixes-pi-auth-cors-recovery-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5566,7 +5598,7 @@ def _detect_classification_issues(cls, se_summary):
     hotel = int(cls.get('hotel_naechte', 0) or 0)
 
     # 1) Mathematisch: Z76 darf nicht > Z77 sein (BMF ist Teilmenge der LH-stfrei-Auszahlung)
-    if z77 > 0 and z76 > z77 * 1.05:  # 5% Toleranz für BMF-Aufschlag
+    if z77 > 0 and z76 > z77:  # harte Invariante laut Wissens-Buch: Z76 darf nicht höher als Z77 sein
         issues.append(
             f"Z76 = {z76:.2f}€ ist HÖHER als Z77 = {z77:.2f}€. Das ist mathematisch "
             f"problematisch (BMF-Pauschale > LH-stfrei-Auszahlung). Du hast vermutlich "
@@ -5788,12 +5820,11 @@ def _berechne_via_hybrid(form, files):
                 f'aber LH hat nur {auslandsspesen_se:.2f}€ Auslands-stfrei gezahlt '
                 f'(Diff {abs(vma_aus-auslandsspesen_se):.2f}€). Bitte Auswertung prüfen.'
             )
-    # Z76 darf grundsätzlich höher sein als auslandsspesen_se (Pauschale > AG-Auszahlung erlaubt),
-    # aber NIE höher als Z77 + großer Toleranz (sonst wird Netto absurd hoch)
-    if vma_aus > z77 * 2 and z77 > 0:
+    # Harte Invariante laut Wissens-Buch: Z76 darf nicht höher als Z77 sein.
+    if vma_aus > z77 and z77 > 0:
         notes.append(
-            f'⚠ Z76 ({vma_aus:.2f}€) ist > 2× Z77 ({z77:.2f}€) — sehr ungewöhnlich. '
-            f'Möglicherweise hat Opus Tage falsch als Auslandstour klassifiziert.'
+            f'⚠ Z76 ({vma_aus:.2f}€) ist höher als Z77 ({z77:.2f}€) — bitte Klassifikation prüfen. '
+            f'Wahrscheinlich wurden zu viele Tage als Auslandstour klassifiziert.'
         )
 
     # ── Fahrtkosten ──

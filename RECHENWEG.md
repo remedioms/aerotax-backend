@@ -1,271 +1,280 @@
 # RECHENWEG — wie AeroTax die Werbungskosten berechnet
 
-Dieses Dokument ist die **kompakte Referenz für Steuerberater oder Steuerberater-KIs**, die den Berechnungsweg fachlich prüfen wollen. Es zeigt jede Formel, jede Pauschale und jede gesetzliche Grundlage auf 2 Seiten — ohne im 7.700-Zeilen `app.py` wühlen zu müssen.
+Dieses Dokument ist die **kompakte Referenz für Steuerberater oder Steuerberater-KIs**, die den Berechnungsweg fachlich prüfen wollen. Es zeigt Formel, Pauschalen und fachliche Prüfregeln, ohne im 7.700-Zeilen-Backend suchen zu müssen.
+
+**Wichtig:** AeroTax ist ein Berechnungs- und Dokumentationswerkzeug. Es ersetzt keine Steuerberatung. Alle Ergebnisse müssen vom User bzw. Steuerberater geprüft werden.
 
 ---
 
-## Die Hauptformel (1 Blick)
+## Die Hauptformel
 
+```text
+BRUTTO-WERBUNGSKOSTEN = Fahrtkosten
+                      + Reinigung Berufskleidung
+                      + Trinkgeld / Reisenebenkosten
+                      + VMA Inland (Z72 + Z73 + Z74)
+                      + VMA Ausland (Z76)
+                      + optionale Werbungskosten-Belege
+
+NETTO-WERBUNGSKOSTEN = max(0, Fahrtkosten − Z17)
+                     + Reinigung Berufskleidung
+                     + Trinkgeld / Reisenebenkosten
+                     + optionale Werbungskosten-Belege
+                     + max(0, (Z72 + Z73 + Z74 + Z76) − Z77)
 ```
-                             ┌─ Fahrtkosten      = km-Pauschale × Fahrtage
-                             ├─ Reinigung        = 1,60€ × Arbeitstage
-BRUTTO-WERBUNGSKOSTEN  =     ├─ Trinkgeld        = 3,60€ × Hotelnächte
-                             ├─ VMA Inland       = Z72 + Z73 + Z74
-                             ├─ VMA Ausland      = Z76 (BMF-Auslandspauschalen)
-                             └─ Optional-Belege  = Σ aller WK-Belege
 
-NETTO-WERBUNGSKOSTEN   = (Fahrt − Z17)        ← Fahrtkosten-Topf
-                       + Reinigung + Trinkgeld + Optional-Belege
-                       + max(0, (VMA-Brutto − Z77))   ← Reisekosten-Topf
-```
+**Topf-Trennung:**
 
-**Code-Stelle:** `app.py` Zeilen 5862-5867 (`_berechne_via_hybrid`).
-
-**Topf-Trennung erklärt:** Z17 (AG-Fahrkostenzuschuss) wird NUR von Fahrtkosten abgezogen, Z77 (LH-stfrei-Spesen) NUR von VMA. So wird vermieden, dass eine Über-Erstattung in einem Topf den anderen Topf negativ macht (das wäre unzulässig).
+- **Z17** aus der Lohnsteuerbescheinigung mindert nur den Fahrtkosten-Topf.
+- **Z77** aus dem Streckeneinsatz mindert nur den VMA-/Reisekosten-Topf.
+- Eine Übererstattung in einem Topf darf den anderen Topf nicht negativ machen.
 
 ---
 
-## Die einzelnen Posten
+## 1. Fahrtkosten Wohnung ↔ Homebase
 
-### 1. Fahrtkosten (Wohnung ↔ Homebase)
+**Grundlage:** Entfernungspauschale nach § 9 Abs. 1 Nr. 4 EStG.
 
-**Rechtsgrundlage:** § 9 Abs. 1 Nr. 4 EStG (Entfernungspauschale)
-
-**Formel:**
-```
+```text
 Fahrtkosten = min(km, 20) × Fahrtage × 0,30 €
             + max(0, km − 20) × Fahrtage × 0,38 €
 ```
 
-**Beispiel:** 27 km × 71 Fahrtage = 20×71×0,30 + 7×71×0,38 = 426 + 188,86 = **614,86 €**
+**Beispiel:** 27 km × 71 Fahrtage
 
-**Code-Stelle:** `app.py:5571-5572` und `PENDLER_BY_YEAR` Z. 2747.
+```text
+20 × 71 × 0,30 € = 426,00 €
+ 7 × 71 × 0,38 € = 188,86 €
+Summe             = 614,86 €
+```
 
-**Wichtig:** Pauschale gilt unabhängig vom Verkehrsmittel (Auto, Fahrrad, ÖV — aber Bahn/Flug haben Sonderregeln, hier nicht implementiert weil bei Crew untypisch).
+**Wichtig:** Es zählt grundsätzlich die einfache Entfernung, nicht Hin- und Rückweg. Ein mehrtägiger Umlauf erzeugt in der AeroTax-Logik nur einen Fahrtag am Tour-Start, nicht jeden Layover-Tag erneut.
 
 ---
 
-### 2. Reinigungskosten Berufskleidung
+## 2. Reinigungskosten Berufskleidung
 
-**Rechtsgrundlage:** Verwaltungspraxis nach BFH VI R 56/91
-
-**Formel:**
-```
+```text
 Reinigung = Arbeitstage × 1,60 €
 ```
 
-**Code-Stelle:** `app.py:5835` und `REINIGUNG_PRO_TAG_BY_YEAR` Z. 2762.
-
-**Hintergrund:** Pauschale ohne Beleg, weil Crew-Uniform (Hemd/Bluse mit Logo) zwingend zu reinigen ist. Bei höheren Beleg-Kosten ist optional auch der Einzelnachweis möglich (in WISO separat).
+Die Pauschale ist eine interne AeroTax-Arbeitshilfe für typische Crew-Uniformreinigung. Höhere tatsächlich nachgewiesene Kosten können separat über Belege angesetzt werden.
 
 ---
 
-### 3. Trinkgelder / Reisenebenkosten
+## 3. Trinkgeld / Reisenebenkosten
 
-**Rechtsgrundlage:** § 9 Abs. 1 Nr. 5a EStG
-
-**Formel:**
-```
+```text
 Trinkgeld = Hotelnächte × 3,60 €
 ```
 
-**Code-Stelle:** `app.py:5836` und `TRINKGELD_PRO_NACHT_BY_YEAR` Z. 2767.
-
-**Definition Hotelnacht:** Nur **echte** Übernachtungen außerhalb Homebase (FL-Marker im Dienstplan, ≥10h Bodenzeit nach EASA-FTL). Tagestrips zählen nicht.
+**Hotelnacht zählt nur bei echter Übernachtung außerhalb der Homebase**, typischerweise durch FL-Marker bzw. erkennbaren Layover. Tagestrips, Nachtflug-Heimkehr und reine Turnarounds zählen nicht.
 
 ---
 
-### 4. VMA Inland — Z72 / Z73 / Z74
+## 4. VMA Inland — Z72 / Z73 / Z74
 
-**Rechtsgrundlage:** § 9 Abs. 4a EStG + jährliches BMF-Schreiben "Reisekosten"
+**Grundlage:** § 9 Abs. 4a EStG und BMF-/Lohnsteuer-Regeln zu Verpflegungsmehraufwand.
 
-**Pauschalen 2025/2026 (Inland):**
-```
-Z72  Tagestrip > 8h ohne Übernachtung    14,00 €/Tag
-Z73  An- oder Abreisetag mit Übernachtung 14,00 €/Tag
-Z74  Inland 24h ohne Tagestrip-Pattern   28,00 €/Tag
-```
-
-**Formel:**
-```
-VMA Inland = Z72_Tage × 14 + Z73_Tage × 14 + Z74_Tage × 28
+```text
+Z72 = Tagestrip > 8h ohne Übernachtung       = 14 € pro Tag
+Z73 = An-/Abreisetag mit Übernachtung Inland = 14 € pro Tag
+Z74 = voller Inland-Zwischentag / 24h        = 28 € pro Tag
 ```
 
-**Code-Stelle:** `app.py:5773-5776` und `BMF_INLAND_BY_YEAR` Z. 2742.
+```text
+VMA Inland = Z72_Tage × 14 €
+           + Z73_Tage × 14 €
+           + Z74_Tage × 28 €
+```
 
-**Wann Z72/Z73/Z74?** Siehe Decision-Tree in `referenz_faelle.txt` Section 1 + 2. Kurz:
-- **Z72:** User fliegt morgens raus, kommt abends zurück (Same-Day, egal ob Inland-Ziel oder EU-Ausland-Ziel — die "FollowMe-Konvention").
-- **Z73:** User fliegt zu Inland-Ziel (FRA/MUC/HAM/...), übernachtet, kommt zurück. Nur Anreise- + Abreisetag = Z73; Volltage dazwischen sind nur Arbeitstage ohne extra VMA.
-- **Z74:** Selten — Inland-Tag mit ≥24h Anwesenheit ohne Tagestrip-Charakter.
+**AeroTax-/FollowMe-Klassifikation:**
+
+- **Z72:** Same-Day-Tagestrip mit Rückkehr am selben Tag. In der Projektlogik wird auch ein EU-Auslandsziel als Z72 behandelt, wenn keine Auslandsübernachtung vorliegt.
+- **Z73:** Inland-Tour mit Übernachtung, z. B. Schulung oder Layover in MUC/HAM/BER. Nur An- und Abreisetag bekommen Z73.
+- **Z74:** Seltener voller Inland-Zwischentag mit 24h-Abwesenheit.
+
+**Hinweis:** Die Inlandspauschalen 14 €/28 € gelten auch 2026 weiter; die Aussage „unverändert seit 2014“ sollte nicht verwendet werden, weil die heutige 14/28-Systematik erst seit der Reform 2020 gilt.
 
 ---
 
-### 5. VMA Ausland — Z76 (BMF-Auslandspauschalen pro Land)
+## 5. VMA Ausland — Z76
 
-**Rechtsgrundlage:** § 9 Abs. 4a EStG + BMF-Schreiben "Auslandstagegelder" (jährlich)
+**Grundlage:** § 9 Abs. 4a EStG und jährliches BMF-Schreiben zu Auslandsreisekosten.
 
-**Formel (vereinfacht):**
+```text
+Z76 = Summe über alle Auslandstouren:
+      BMF-Anreisesatz für Anreise- und Abreisetage
+    + BMF-24h-Satz für volle Zwischentage
 ```
-Z76 = Σ (über alle Auslandstouren):
-        BMF-Anreisesatz × (Anreise- + Abreisetage der Tour)
-      + BMF-24h-Satz × Volltage zwischen An- und Abreise
+
+**Beispiel BLR / Indien, 4-Tages-Tour:**
+
+```text
+Tag 1 Anreise:   30 €
+Tag 2 Volltag:   39 €
+Tag 3 Volltag:   39 €
+Tag 4 Abreise:   30 €
+Summe Z76:      138 €
 ```
 
-**Beispiel:** 4-Tages-Tour BLR (Indien):
-- Anreise-Satz Indien 2025 = 30 €, 24h-Satz = 39 €
-- Tag 1 (Anreise): 30 €
-- Tag 2-3 (Volltage): 2 × 39 = 78 €
-- Tag 4 (Abreise): 30 €
-- **Z76 für diese Tour: 138 €**
+**Wann Z76?** Eine Tour bekommt Z76, wenn eine Übernachtung außerhalb Deutschlands vorliegt. Entscheidend ist die Tour-/Layover-Logik, nicht nur der einzelne Streckeneinsatz-Stempel.
 
-**Code-Stelle:** Berechnung in `_opus_classify_days_v2()` (`app.py:5144 ff.`); Land-Tabelle in `bmf_data.py` (`BMF_AUSLAND_BY_YEAR`).
-
-**Wann Z76?** Tour mit Übernachtung (FL-Marker am Folgetag) UND Layover-Ort liegt außerhalb Inland-IATA-Liste (FRA/MUC/HAM/DUS/STR/CGN/HAJ/BER/LEJ/NUE/BRE/FMO/PAD).
+**Prüfregel statt harter Wahrheit:** Z76 sollte zur Summe der steuerfrei gezahlten Auslandsspesen plausibel passen. Eine starke Abweichung ist ein Audit-Signal und soll eine erneute Klassifikation auslösen.
 
 ---
 
-### 6. Abzüge: Z17 und Z77
+## 6. Abzüge: Z17 und Z77
 
-**Z17 — AG-Fahrkostenzuschuss (Lohnsteuerbescheinigung Zeile 17):**
-```
+### Z17 — AG-Fahrkostenzuschuss
+
+```text
 Fahrt-netto = max(0, Fahrtkosten − Z17)
 ```
-Wird NUR von Fahrtkosten abgezogen, nicht von VMA.
 
-**Z77 — LH-steuerfrei-Spesen (Streckeneinsatz-Abrechnung):**
-```
-VMA-netto = max(0, (Z72+Z73+Z74+Z76) − Z77)
-```
-Wird NUR von VMA abgezogen, nicht von Fahrtkosten.
+Z17 mindert nur die Fahrten Wohnung ↔ erste Tätigkeitsstätte.
 
-**Mathematische Invariante:** Z76 ≤ Z77 (BMF-Pauschale immer ≤ AG-Auszahlung). Der Backend-Code prüft das und triggert ein Self-Reflection-Pass wenn die Klassifikation diese Regel verletzt — siehe `_detect_classification_issues()` `app.py:5410`.
+### Z77 — steuerfrei erstattete Spesen
+
+```text
+VMA-netto = max(0, (Z72 + Z73 + Z74 + Z76) − Z77)
+```
+
+Z77 mindert nur den Reisekosten-/VMA-Topf.
+
+### Wichtige Korrektur zu Z76 ≤ Z77
+
+Nicht sauber ist die Formulierung: **„Z76 ≤ Z77 ist mathematisch immer zwingend.“**
+
+Besser:
+
+```text
+Z76 > Z77 ist ein starkes Warnsignal, aber nicht automatisch ein mathematischer Beweisfehler.
+```
+
+Warum: Z76 ist der berechnete Werbungskostenanspruch nach BMF-Pauschalen. Z77 ist die tatsächlich steuerfrei erstattete Summe des Arbeitgebers. In der Praxis sollten beide bei korrekt gelesenen Lufthansa-SE-Daten oft nah beieinander liegen, aber sie sind nicht dieselbe Größe. Für AeroTax ist deshalb sinnvoll:
+
+- **Z76 deutlich über Z77** → Audit-Warnung / Self-Reflection auslösen.
+- **Z76 grob im Bereich der Auslandsspesen** → plausibel.
+- **Z77 > VMA-Brutto** → Netto-VMA wird 0 €, aber andere Töpfe bleiben erhalten.
 
 ---
 
-### 7. Optionale Werbungskosten-Belege
+## 7. Optionale Werbungskosten-Belege
 
-User kann zusätzlich Belege hochladen (Telefon, Gewerkschaft, Steuerberatung etc.). Diese werden via Vision-API gelesen und einzeln in WISO eingetragen — separate Zeilen, nicht mit VMA verrechnet.
+Optionale Belege werden separat behandelt und nicht mit VMA vermischt.
 
-| Beleg-Typ | Absetzbar | Default-Anteil |
-|---|---|---|
-| Telefon & Internet | 20% Jahreskosten (BFH-Praxis) | 20% |
-| Gewerkschaft (UFO, ver.di) | 100% | 100% |
-| Berufsbedingt-Fortbildung | 100% | 100% |
-| Steuerberatung | 100% | 100% |
-| Kontoführung | 100% (max 16€ Pauschale) | min(real, 16) |
-| Fachliteratur | 100% | 100% |
-
-**Code-Stelle:** `app.py:5840-5860`. Logik dynamisch je nach Beleg-Typ.
+| Beleg-Typ | Ansatz in AeroTax | Bemerkung |
+|---|---:|---|
+| Telefon & Internet | typischer beruflicher Anteil, z. B. 20 % | bei Nachweis ggf. höher |
+| Gewerkschaft | 100 % | z. B. UFO/ver.di |
+| Fortbildung | 100 % | beruflich veranlasst |
+| Steuerberatung | Werbungskosten-Anteil | nicht immer komplett Werbungskosten |
+| Kontoführung | Pauschale bis 16 € | typische Vereinfachung |
+| Fachliteratur | 100 % | beruflich veranlasst |
 
 ---
 
-## Komplette Beispiel-Rechnung
+## Korrigierte Beispiel-Rechnung
 
 **Annahme:** Vollzeit-Crew FRA, Steuerjahr 2025
-- Brutto: 52.884,81 € (aus LSB)
-- Z17 (AG-Fahrkosten): 330 €
-- Z77 (LH-stfrei): 4.655 € (davon 3.896 € Auslandsspesen, 759 € Inlandsspesen)
-- 27 km Anfahrt zur Homebase
-- 71 Fahrtage (Tour-Starts + Office-Days)
-- 170 Arbeitstage
-- 53 Hotelnächte (alle FL-Marker = Auslands-Layovers)
-- 25 × Z72-Tage (Same-Day-Tagestrips)
-- 0 × Z73-Tage
-- 0 × Z74-Tage
-- Z76 = 5.980 € (Σ über alle Auslandstouren mit BMF-Tabelle)
 
-**Berechnung:**
+- Brutto: 52.884,81 €
+- Z17: 330,00 €
+- Z77: 4.655,00 €
+- davon Auslandsspesen: 3.896,00 €
+- davon Inlandsspesen: 759,00 €
+- Entfernung: 27 km
+- Fahrtage: 71
+- Arbeitstage: 170
+- Hotelnächte: 53
+- Z72: 25 Tage
+- Z73: 0 Tage
+- Z74: 0 Tage
+- **Z76 korrigiert: 3.896,00 €**
+
+Die alte Beispielzahl **Z76 = 5.980 €** war im Dokument widersprüchlich, weil im selben Beispiel Z77 nur 4.655 € betrug und der Text gleichzeitig Z76 ≤ Z77 als harte Invariante formulierte.
+
+```text
+Fahrtkosten = 20×71×0,30 + 7×71×0,38    =   614,86 €
+Reinigung   = 170 × 1,60                 =   272,00 €
+Trinkgeld   = 53 × 3,60                  =   190,80 €
+Z72         = 25 × 14                    =   350,00 €
+Z73         = 0 × 14                     =     0,00 €
+Z74         = 0 × 28                     =     0,00 €
+Z76         = Auslandstouren/BMF          = 3.896,00 €
+                                             ──────────
+BRUTTO-WERBUNGSKOSTEN                     = 5.323,66 €
+
+Fahrt-netto = max(0, 614,86 − 330)        =   284,86 €
+VMA-Brutto  = 350 + 0 + 0 + 3.896         = 4.246,00 €
+VMA-netto   = max(0, 4.246 − 4.655)       =     0,00 €
+                                             ──────────
+NETTO-WERBUNGSKOSTEN                      =   747,66 €
+                                             (= 284,86 + 272,00 + 190,80)
 ```
-Fahrtkosten = 20×71×0,30 + 7×71×0,38             = 614,86 €
-Reinigung   = 170 × 1,60                          = 272,00 €
-Trinkgeld   = 53 × 3,60                           = 190,80 €
-Z72         = 25 × 14                             = 350,00 €
-Z73         = 0                                   = 0,00 €
-Z74         = 0                                   = 0,00 €
-Z76         = (Σ BMF-Auslandstouren)              = 5.980,00 €
-                                                ──────────
-BRUTTO-WERBUNGSKOSTEN                            = 7.407,66 €
 
-Fahrt-netto    = max(0, 614,86 − 330)            = 284,86 €
-VMA-Brutto     = 350 + 0 + 0 + 5.980             = 6.330,00 €
-VMA-netto      = max(0, 6.330 − 4.655)           = 1.675,00 €
-                                                ──────────
-NETTO-WERBUNGSKOSTEN für WISO                    = 2.422,66 €
-                                                  (= 284,86 + 272 + 190,80 + 1.675)
+**Alternative, falls Z76 = 5.980 € fachlich wirklich aus den Touren kommt:** Dann darf das Beispiel nicht gleichzeitig behaupten, Z76 ≤ Z77 sei zwingend. In diesem Fall wäre die Rechnung mathematisch:
+
+```text
+VMA-Brutto = 350 + 5.980 = 6.330,00 €
+VMA-netto  = max(0, 6.330 − 4.655) = 1.675,00 €
+Netto-WK   = 284,86 + 272,00 + 190,80 + 1.675,00 = 2.422,66 €
 ```
 
----
-
-## Eintragung in die Steuererklärung (Anlage N)
-
-| Anlage-N-Zeile | Posten | Wert | Kommentar |
-|---|---|---|---|
-| Z. 27-30 | Fahrten Wohnung ↔ erste Tätigkeitsstätte | 614,86 € (brutto) | WISO zieht Z17 automatisch ab |
-| Z. 62 | Reinigung Arbeitskleidung | 272,00 € | — |
-| Z. 68 | Reisenebenkosten | 190,80 € | — |
-| Z. 72 | VMA Inland >8h | 350,00 € (25 Tage) | — |
-| Z. 73 | VMA An-/Abreisetage Inland | 0,00 € (0 Tage) | — |
-| Z. 74 | VMA Inland 24h | 0,00 € (0 Tage) | — |
-| Z. 76 | VMA Ausland | 5.980,00 € | — |
-| Z. 77 | LH-stfrei-Erstattung Spesen | 4.655,00 € | wird von Z76 abgezogen |
-
-**WISO-Vereinfachung:** Manche User tragen direkt `Netto-Werbungskosten = 2.422,66 €` unter "Reisenebenkosten" ein. Das ist mathematisch äquivalent (Finanzamt rechnet eh auf den Netto), aber der konkrete Tax-Compliance-Pfad ist die saubere Eintragung Zeile-für-Zeile.
+Dann müsste aber der Audit-Text lauten: „Z76 > Z77 → Warnung prüfen“, nicht „mathematisch unmöglich“.
 
 ---
 
-## Edge-Cases die der Code abfängt
+## Eintragung in Anlage N / WISO
 
-1. **Z76 > Z77 (mathematisch unmöglich)** → Self-Reflection-Loop ruft Opus erneut auf mit Korrektur-Auftrag.
-2. **Hotel > Arbeitstage (logisch unmöglich)** → wie 1.
-3. **Fahr-Tage > Arbeitstage (logisch unmöglich)** → wie 1.
-4. **Z76 vs Auslandsspesen-Summe ±40% Diff** → wie 1.
-5. **Multi-LSB (Arbeitgeber-Wechsel)** → Brutto/Lohnsteuer/SozVers ADDIEREN, Personalien von 1. LSB. Code: `_sonnet_read_lsb_v2` Z. 4929-4942.
-6. **Storno-Zeilen in SE (X-Marker)** → ignoriert. Wissens-Buch-Anweisung im Sonnet-Prompt.
-7. **Z77 < 500 € bei Vollzeit** → Hinweis-Note für User (möglicherweise nicht alle SE-Files hochgeladen).
-8. **Teilzeit / Mutterschutz / Krankheit** → Werte skalieren proportional, keine Plausi-Bandbreiten-Hochrechnung.
+| Bereich | Posten | Wert aus Beispiel | Hinweis |
+|---|---:|---:|---|
+| Fahrten Wohnung ↔ erste Tätigkeitsstätte | Entfernungspauschale brutto | 614,86 € | Z17 separat berücksichtigen bzw. durch Software abziehen lassen |
+| Arbeitsmittel / Berufskleidung | Reinigung Uniform | 272,00 € | als Werbungskosten-Posten |
+| Reisekosten / Reisenebenkosten | Trinkgeld | 190,80 € | Hotelnächte × 3,60 € |
+| VMA Inland >8h | Z72 | 350,00 € | 25 Tage |
+| VMA An-/Abreise Inland | Z73 | 0,00 € | 0 Tage |
+| VMA Inland 24h | Z74 | 0,00 € | 0 Tage |
+| VMA Ausland | Z76 | 3.896,00 € | nach BMF-/Tour-Auswertung |
+| steuerfrei ersetzt | Z77 | 4.655,00 € | mindert nur den VMA-Topf |
 
----
-
-## Was AeroTax NICHT abdeckt (User-Verantwortung)
-
-- Doppelte Haushaltsführung (Anlage N Zeile 81+)
-- Kinderbetreuungskosten (Anlage Kind)
-- Außergewöhnliche Belastungen (Anlage AVOR)
-- Sonderausgaben außerhalb Werbungskosten (Vorsorge etc.)
-- Kapitaleinkünfte (Anlage KAP)
-
-Dafür empfehlen wir Steuerberater oder VLH (Lohnsteuerhilfeverein).
+**WISO-Hinweis:** Die saubere Variante ist die zeilenweise Eintragung. Eine direkte Netto-Summe unter einem Sammelposten kann rechnerisch funktionieren, ist aber weniger transparent und sollte nicht als Standardempfehlung im Tool stehen.
 
 ---
 
-## Wo ist welche Logik im Code?
+## Edge-Cases / Audit-Regeln
 
-| Was | Datei | Zeilen |
-|---|---|---|
-| Sonnet liest LSB | `app.py` | 4801-4954 |
-| Sonnet liest SE-Summen | `app.py` | 4955-5143 |
-| Opus klassifiziert Tage | `app.py` | 5144-5409 |
-| Self-Reflection-Loop (Math-Check) | `app.py` | 5410-5462 |
-| Hauptformel (Brutto+Netto) | `app.py` | 5862-5867 |
-| Topf-Trennung Z17/Z77 | `app.py` | 5865-5867 |
-| BMF Inland-Pauschalen | `app.py` | 2742-2747 (`BMF_INLAND_BY_YEAR`) |
-| BMF Ausland-Pauschalen | `bmf_data.py` | komplett (`BMF_AUSLAND_BY_YEAR`) |
-| Pendlerpauschale | `app.py` | 2747-2754 (`PENDLER_BY_YEAR`) |
-| Reinigung + Trinkgeld | `app.py` | 2762-2772 |
-| Klassifikations-Wissensbuch | `referenz_faelle.txt` | gesamt (573 Zeilen) |
-| Tag-für-Tag-Audit-Output | `app.py` | 5193-5210 (`tage_detail` schema) |
-| PDF-Aufbau | `app.py` | 6800-7700 |
+1. **Z76 deutlich > Z77 oder deutlich abweichend von Auslandsspesen** → Audit-Warnung, erneute Klassifikation.
+2. **Hotelnächte > Arbeitstage** → logisch falsch, erneute Klassifikation.
+3. **Fahrtage > Arbeitstage** → logisch falsch, erneute Klassifikation.
+4. **Z76 vs. Auslandsspesen-Summe stark abweichend** → vermutlich falsch klassifizierte Ausland-/Inland-Touren oder fehlende SE-Dateien.
+5. **Multi-LSB** → numerische Werte addieren; Personalien aus erster LSB übernehmen.
+6. **Storno-Zeilen in SE** → ignorieren.
+7. **Z77 ungewöhnlich niedrig bei Vollzeit** → Hinweis: möglicherweise fehlen Streckeneinsatz-Dateien.
+8. **Teilzeit / Mutterschutz / Krankheit** → keine Hochrechnung; nur tatsächlich vorhandene Dienst-/SE-Daten zählen.
 
 ---
 
-## Wenn ihr das Tool prüft, achtet auf:
+## Was AeroTax nicht abdeckt
 
-1. **Stimmt die Hauptformel?** (siehe oben Block 1) — § 9 EStG-konform?
-2. **Topf-Trennung Z17/Z77** — wird das richtig gemacht?
-3. **BMF-Pauschalen aktuell** — sind die 14€/28€-Sätze für 2025 korrekt? (Ja, unverändert seit 2014.)
-4. **Z76-Klassifikation** — wird ein 4-Tages-BLR-Tour wirklich mit BMF-Indien-Pauschalen × 4 Tage gerechnet?
-5. **Z73 vs Z76** — Inland vs. Ausland-Übernachtung sauber unterschieden?
-6. **Self-Check Math-Invariants** — funktioniert das Math-Konsistenz-System?
-7. **Edge-Cases Multi-LSB / Teilzeit** — sind die abgedeckt?
+- Doppelte Haushaltsführung
+- Kinderbetreuungskosten
+- Außergewöhnliche Belastungen
+- Sonderausgaben außerhalb Werbungskosten
+- Kapitaleinkünfte
+- individuelle Steuerberatung / verbindliche Rechtsauskunft
 
-Bei Fragen: schaut in `referenz_faelle.txt` Section 12 ("Self-Check vor Tool-Aufruf") — das ist die Liste die Opus selbst durchgeht bevor er klassifiziert.
+---
+
+## Prüfpunkte für Steuerberater / Review
+
+1. Ist die Topf-Trennung Z17/Z77 korrekt?
+2. Stimmen die Inlandspauschalen 14 €/28 € für das geprüfte Steuerjahr?
+3. Stimmen die Auslandspauschalen im jeweiligen Jahr gemäß BMF-Tabelle?
+4. Ist Z76 aus echten Auslandstouren mit Übernachtung abgeleitet?
+5. Wird Z72 nicht fälschlich für mehrtägige Touren genutzt?
+6. Werden Inland-Schulungen mit Hotel als Z73 behandelt?
+7. Sind Storno-Zeilen und Nicht-Dienst-Tage sauber ausgeschlossen?
+8. Werden PII und Belege DSGVO-konform verarbeitet?
+
