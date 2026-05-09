@@ -1311,6 +1311,80 @@ def test_v81_tour_anreise_with_overnight_still_counts():
     assert dp['requires_commute'] is True
 
 
+# ── v8.1.2 Tests: Z77-Wording entschärft ──
+
+def test_v812_z77_diff_not_in_user_errors():
+    """Z77-Diff zwischen lines/months erscheint NICHT mehr in den user-facing
+    errors-Liste der Hybrid-Pipeline."""
+    import inspect
+    from app import hybrid_analyze
+    src = inspect.getsource(hybrid_analyze)
+    # Die wörtliche User-facing-Formulierung darf nicht mehr in den errors landen
+    assert "errors.append(f'Z77-Diff:" not in src, \
+        "Z77-Diff darf nicht in user-facing errors-Liste"
+    assert "Z77-Diff: lines=" not in src or "errors.append" not in src.split("Z77-Diff: lines=")[0][-200:], \
+        "Z77-Diff darf nicht zu user-facing notes werden"
+
+
+def test_v812_z77_audit_kept_in_se_summary():
+    """z77_from_lines und z77_from_months bleiben im se_summary für Detailbereich."""
+    import inspect
+    from app import hybrid_analyze
+    src = inspect.getsource(hybrid_analyze)
+    # Die Felder müssen weiterhin gesetzt werden (nur eben intern, nicht user-facing)
+    assert "z77_from_lines" in src
+    assert "z77_from_months" in src
+    assert "z77_diff" in src
+
+
+def test_v812_z77_user_note_uses_friendly_wording():
+    """Wenn Z77 > VMA, ist die User-Note sachlich formuliert (kein 'übersteigt BMF')."""
+    import inspect
+    from app import _berechne_via_hybrid
+    src = inspect.getsource(_berechne_via_hybrid)
+    # Sachliches Wording sollte vorkommen
+    assert 'Steuerfreie Spesen wurden berücksichtigt' in src
+    # Hartes Wording aus alter Version raus
+    assert 'übersteigt BMF-Pauschalen' not in src
+    assert 'LH hat ' not in src  # "LH hat 4705€ stfrei gezahlt" — raus
+    assert 'Lufthansa hat ' not in src  # auch in dead-code raus
+
+
+def test_v812_z76_inkonsistenz_uses_pruefhinweis():
+    """Z76-Plausi-Check ist 'Prüfhinweis', keine 'Inkonsistenz' / 'Audit-Hinweis'."""
+    import inspect
+    from app import _berechne_via_hybrid
+    src = inspect.getsource(_berechne_via_hybrid)
+    # Altes Wording raus
+    assert 'Z76-Inkonsistenz' not in src
+    assert 'Audit-Hinweis: Z76' not in src
+    # Neue Formulierung
+    assert 'Prüfhinweis' in src
+
+
+def test_v812_steuerfreie_spesen_positive_note():
+    """Bei normalem Z77 > 0 erscheint eine sachlich-positive Info-Note."""
+    import inspect
+    from app import _berechne_via_hybrid
+    src = inspect.getsource(_berechne_via_hybrid)
+    assert 'Steuerfreie Spesen laut Streckeneinsatzabrechnung' in src
+    assert 'Dieser Betrag wurde bei der Verrechnung berücksichtigt' in src
+
+
+def test_v812_no_lines_months_in_user_notes():
+    """Technische Labels 'lines=' / 'months=' tauchen nicht in user-facing Notes auf."""
+    import inspect
+    from app import _berechne_via_hybrid, hybrid_analyze
+    for fn in (_berechne_via_hybrid, hybrid_analyze):
+        src = inspect.getsource(fn)
+        # In notes.append-Strings darf weder 'lines=' noch 'months=' stehen
+        # (Print-Logs für [v8-se] sind okay, da intern)
+        for line in src.split('\n'):
+            if 'notes.append' in line:
+                assert 'lines=' not in line, f"User-Note enthält 'lines=': {line.strip()[:120]}"
+                assert 'months=' not in line, f"User-Note enthält 'months=': {line.strip()[:120]}"
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

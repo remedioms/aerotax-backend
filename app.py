@@ -1206,6 +1206,7 @@ def _run_process_async(job_id, form, files):
                 'unresolved_days':  result.get('_unresolved_days') or [],
                 'vma_unmapped_se':  result.get('_vma_unmapped_se') or [],
                 'document_health':  result.get('_document_health') or {},
+                'z77_audit':        result.get('_z77_audit') or {},
                 'versions': {
                     'app': APP_VERSION,
                     'engine': ENGINE_VERSION,
@@ -7779,14 +7780,17 @@ def hybrid_analyze(form, files):
         diff = abs(z77_from_lines - z77_from_months)
         print(f"[v8-se] z77_from_lines={z77_from_lines:.2f} z77_from_months={z77_from_months:.2f} "
               f"z77_used={z77_used:.2f} diff={diff:.2f}")
-        if diff > 50:
-            errors.append(f'Z77-Diff: lines={z77_from_lines:.2f} vs months={z77_from_months:.2f} (diff {diff:.2f}€)')
+        # v8.1.2: Diff zwischen Einzelzeilen und Summenzeilen ist ein interner Audit-
+        # Datenpunkt, KEIN user-facing Fehler. Wir nehmen den höheren Wert (konservativ
+        # für den User), behalten beide im se_summary für den Detailbereich.
         # se_summary auf einheitliche Z77-Quelle bringen
         if se_summary is None:
             se_summary = {}
         se_summary['z77_total'] = z77_used
         se_summary['z77_from_lines'] = z77_from_lines
         se_summary['z77_from_months'] = z77_from_months
+        se_summary['z77_diff'] = round(diff, 2)
+        se_summary['z77_source'] = 'einzelzeilen' if z77_from_lines >= z77_from_months else 'summenzeilen'
         se_summary.setdefault('auslandsspesen_total', sum(
             float(s.get('stfrei_betrag', 0) or 0)
             for s in se_structured.get('se_lines', [])
@@ -7929,9 +7933,13 @@ def _berechne_via_hybrid(form, files):
     if not z77 and files.get('se'):
         notes.append('⚠️ Streckeneinsatz konnte Z77-Summe nicht ermitteln — bitte prüfen')
     elif 0 < z77 < 500:
-        # Sehr niedriger Z77 — meist ein Read-Fehler bei Vollzeit-Crew, aber
-        # bei Teilzeit/Mutterschutz/Wiedereinstieg auch legitim. Nicht prescriptive.
-        notes.append(f'ℹ Z77 = {z77:.2f}€ ist niedrig. Bei Vollzeit ungewöhnlich, bei Teilzeit/Mutterschutz/Krankheit normal. Bitte prüfen ob alle SE-Abrechnungen hochgeladen wurden.')
+        notes.append(f'ℹ Steuerfreie Spesen laut Streckeneinsatzabrechnung: {z77:.2f} €. '
+                     f'Bei Vollzeit ungewöhnlich niedrig — bitte prüfen, ob alle Streckeneinsatz-'
+                     f'Abrechnungen hochgeladen wurden.')
+    elif z77 > 0:
+        # v8.1.2: Positive Info-Note — der Wert wurde berücksichtigt.
+        notes.append(f'ℹ Steuerfreie Spesen laut Streckeneinsatzabrechnung: {z77:.2f} €. '
+                     f'Dieser Betrag wurde bei der Verrechnung berücksichtigt.')
 
     # Klassifikations-Werte
     arbeitstage   = int(cls.get('arbeitstage', 0) or 0)
@@ -7950,25 +7958,17 @@ def _berechne_via_hybrid(form, files):
     vma_74 = round(vma_74_tage * bmf_inland['voll_24h'], 2)
     vma_in = round(vma_72 + vma_73 + vma_74, 2)
 
-    # ── MATH-KONSISTENZ-CHECK (Z76 vs Z77 + Auslandsspesen) ──
-    # Z76 (BMF-Pauschalen × Auslandstage) sollte ähnlich auslandsspesen_se sein.
-    # Wenn Z76 viel höher: Opus hat zu viele Tage als Auslandstour klassifiziert.
-    # Wenn Z76 viel niedriger: Opus hat Auslandstage übersehen.
+    # ── Plausi-Check (Z76 vs Auslandsspesen aus SE) ──
+    # Wenn die berechneten Auslandstage stark von den steuerfrei gezahlten
+    # Auslandsspesen abweichen, ist das ein Prüfhinweis — keine Fehlfunktion.
     if auslandsspesen_se > 0 and vma_aus > 0:
         ausland_diff_pct = abs(vma_aus - auslandsspesen_se) / max(auslandsspesen_se, 1)
-        if ausland_diff_pct > 0.30:  # >30% Diff
+        if ausland_diff_pct > 0.30:
             notes.append(
-                f'⚠ Z76-Inkonsistenz: Opus klassifiziert {vma_aus:.2f}€ Auslands-WK, '
-                f'aber LH hat nur {auslandsspesen_se:.2f}€ Auslands-stfrei gezahlt '
-                f'(Diff {abs(vma_aus-auslandsspesen_se):.2f}€). Bitte Auswertung prüfen.'
+                f'ℹ Prüfhinweis: Berechnete VMA Ausland ({vma_aus:.2f} €) weicht spürbar '
+                f'von den steuerfrei gezahlten Auslandsspesen ({auslandsspesen_se:.2f} €) ab. '
+                f'Bitte vor Übernahme die VMA-Tabelle prüfen.'
             )
-    # Audit-Plausibilität: Z76 > Z77 ist ein Recheck-Hinweis, keine automatische Deckelung.
-    if vma_aus > z77 and z77 > 0:
-        notes.append(
-            f'⚠ Audit-Hinweis: Z76 ({vma_aus:.2f}€) liegt über Z77 ({z77:.2f}€). '
-            f'Bitte SE-Vollständigkeit, Klassifikation, Zwölftel/Kürzungen und Mahlzeiten prüfen; '
-            f'Z76 wird nicht pauschal auf Z77 gedeckelt.'
-        )
 
     # ── Fahrtkosten ──
     anreise = form.get('anreise', 'auto')
@@ -8050,12 +8050,17 @@ def _berechne_via_hybrid(form, files):
 
     if z77 > vma_total + 5:
         notes.append(
-            f'ℹ Hinweis: LH hat {z77:.2f}€ stfrei (Z77) gezahlt — übersteigt BMF-Pauschalen '
-            f'({vma_total:.2f}€) um {z77-vma_total:.2f}€. Reisekosten-Topf bleibt 0.'
+            f'ℹ Steuerfreie Spesen wurden berücksichtigt: {z77:.2f} €. '
+            f'Berechnete VMA-Pauschalen: {vma_total:.2f} €. '
+            f'Da die steuerfreien Spesen die berechneten VMA-Pauschalen übersteigen, '
+            f'ergibt sich für den Reisekosten-Topf kein zusätzlicher Betrag.'
         )
     if ag_z17 > fahr + 5:
         notes.append(
-            f'ℹ Hinweis: Z17 ({ag_z17:.2f}€) > Fahrtkosten ({fahr:.2f}€) — Fahrtkosten-Topf bleibt 0.'
+            f'ℹ Arbeitgeber-Fahrkostenzuschuss (Zeile 17): {ag_z17:.2f} €. '
+            f'Berechnete Fahrtkosten: {fahr:.2f} €. '
+            f'Da der Zuschuss die Fahrtkosten übersteigt, ergibt sich für den '
+            f'Fahrtkosten-Topf kein zusätzlicher Betrag.'
         )
 
     # ── Plausi-Soft-Warnungen (NUR hinweisen, nichts korrigieren) ──
@@ -8179,6 +8184,17 @@ def _berechne_via_hybrid(form, files):
             'z72_tage': vma_72_tage, 'z73_tage': vma_73_tage, 'z74_tage': vma_74_tage,
             'z76_eur': vma_aus, 'z77_total': z77,
             'auslandsspesen_se': auslandsspesen_se, 'inlandsspesen_se': inlandsspesen_se,
+        },
+        # v8.1.2: Z77-Audit-Detail für aufklappbaren Detail-Bereich (intern,
+        # NICHT als Top-Level-Note. Zeigt Einzelzeilen vs Summenzeilen.)
+        '_z77_audit': {
+            'verwendeter_wert': float(se_sum.get('z77_total', 0) or 0),
+            'einzelzeilen':     float(se_sum.get('z77_from_lines', 0) or 0),
+            'summenzeilen':     float(se_sum.get('z77_from_months', 0) or 0),
+            'differenz':        float(se_sum.get('z77_diff', 0) or 0),
+            'quelle':           se_sum.get('z77_source', '') or '',
+            'auslandsspesen':   auslandsspesen_se,
+            'inlandsspesen':    inlandsspesen_se,
         },
     }
 
@@ -8662,14 +8678,17 @@ def berechne(form, files):
     # Hinweis-Notes wenn AG mehr stfrei gezahlt hat als Pauschale erlaubt
     if z77 > vma_total + 5:
         notes.append(
-            f'ℹ Hinweis: Lufthansa hat {z77:.2f}€ stfrei (Z77) gezahlt — das übersteigt die '
-            f'BMF-Pauschalen ({vma_total:.2f}€) um {z77-vma_total:.2f}€. Reisekosten-Topf bleibt 0, '
-            f'der Überschuss ist bereits im Brutto enthalten und wurde regulär versteuert.'
+            f'ℹ Steuerfreie Spesen wurden berücksichtigt: {z77:.2f} €. '
+            f'Berechnete VMA-Pauschalen: {vma_total:.2f} €. '
+            f'Da die steuerfreien Spesen die berechneten VMA-Pauschalen übersteigen, '
+            f'ergibt sich für den Reisekosten-Topf kein zusätzlicher Betrag.'
         )
     if ag_z17 > fahr + 5:
         notes.append(
-            f'ℹ Hinweis: AG-Fahrkostenzuschuss (Z17 {ag_z17:.2f}€) übersteigt deine Fahrtkosten '
-            f'({fahr:.2f}€) — Fahrtkosten-Topf bleibt 0.'
+            f'ℹ Arbeitgeber-Fahrkostenzuschuss (Zeile 17): {ag_z17:.2f} €. '
+            f'Berechnete Fahrtkosten: {fahr:.2f} €. '
+            f'Da der Zuschuss die Fahrtkosten übersteigt, ergibt sich für den '
+            f'Fahrtkosten-Topf kein zusätzlicher Betrag.'
         )
 
     # ── MATHEMATISCHE PLAUSI-CHECKS ──────────────────────────
