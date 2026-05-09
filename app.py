@@ -2089,9 +2089,9 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '2.1',
-        'build':   'ki-always-2026-05-09',
-        'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always', 'opus-final-audit'],
+        'version': '2.2',
+        'build':   'hotfix-prefill-removed-2026-05-09',
+        'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always', 'opus-final-audit', 'no-prefill'],
     })
 
 
