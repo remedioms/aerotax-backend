@@ -1214,6 +1214,7 @@ def _run_process_async(job_id, form, files):
                 'wrong_z72_candidates':   result.get('_wrong_z72_candidates') or [],
                 'missing_z73_candidates': result.get('_missing_z73_candidates') or [],
                 'missing_z76_candidates': result.get('_missing_z76_candidates') or [],
+                'missing_deutschland_14_candidates': result.get('_missing_deutschland_14_candidates') or [],
                 'bmf_missing':            result.get('_bmf_missing') or [],
                 'iata_unknown':           result.get('_iata_unknown') or [],
                 'versions': {
@@ -7178,6 +7179,12 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'confidence': float(d.get('confidence') or 0),
             'raw_lines': list(d.get('raw_lines') or []),
         }
+        # v8.9: effective_ort-Tracking für Diagnose vs Classifier-Konsistenz
+        dp_layover_ort_v = (d.get('layover_ort') or '').upper()
+        se_effective_ort = (se.get('stfrei_ort') or '').upper()
+        # Classifier-Priorität: SE-Ort vor DP-layover_ort
+        classifier_effective_ort = se_effective_ort or dp_layover_ort_v
+
         classifier_result = {
             'klass': klass,
             'amount': round(eur_added, 2),
@@ -7187,6 +7194,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'counted_as_workday': klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby') or (klass == 'ZeroDay' and dienstlich),
             'counted_as_fahrtag': bool(d.get('requires_commute')) and klass not in ('Frei', 'Issue', 'Standby'),
             'counted_as_hotel_nacht': bool(d.get('overnight_after_day')) and klass in ('Z73', 'Z74', 'Z76'),
+            # v8.9: effective_ort sichtbar machen — bei Bug sofort sehen welche Quelle Classifier nutzt
+            'dp_layover_ort':           dp_layover_ort_v,
+            'se_effective_ort':         se_effective_ort,
+            'classifier_effective_ort': classifier_effective_ort,
         }
         sources = []
         if d.get('activity_type'): sources.append('DP')
@@ -7355,6 +7366,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     wrong_z72_candidates = []     # Z72 verdächtig (overnight, FL, prev_overnight)
     missing_z73_candidates = []   # Tag könnte Z73 sein (Inland-Layover ≠ Homebase, aber andere klass)
     missing_z76_candidates = []   # Tag könnte Z76 sein (Auslands-SE ohne Z76, oder cluster_foreign + falsche klass)
+    missing_deutschland_14_candidates = []  # Z72/Z73-Inland-Tage die Heuristik vermutet
 
     hb_upper = (homebase or 'FRA').upper()
     for i, m in enumerate(sorted_days):
@@ -7431,6 +7443,33 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'reason': f'Auslands-Layover {layover_ort} aber klass != Z76'
                 })
 
+        # v8.9: missing_deutschland_14_candidates — Tage die EVTL. Z72/Z73-Inland
+        # sein müssten (Deutschland 14€). Heuristik:
+        # - Same-Day mit Inland-SE-Stempel + Dauer ≥ 8h → Z72-Kandidat (wenn nicht Z72)
+        # - Tour-Anreise mit Inland-Layover (≠ Homebase) → Z73-Kandidat (wenn nicht Z73)
+        # Aktuelle Klass darf NICHT bereits Z72/Z73/Z74 sein.
+        if klass not in ('Z72', 'Z73', 'Z74'):
+            duty_min_local = int(d.get('duty_duration_minutes') or 0)
+            # Same-Day Inland >8h → Z72-Kandidat
+            if (at == 'same_day' and not overnight and not prev_overnight
+                    and (se_inland is True or (effective_ort and _is_inland_code(effective_ort)))
+                    and (duty_min_local + commute_minutes * 2) >= 480):
+                missing_deutschland_14_candidates.append({
+                    'datum': datum, 'klass': klass, 'expected': 'Z72',
+                    'effective_ort': effective_ort,
+                    'duty_minutes': duty_min_local,
+                    'reason': f'Same-Day Deutschland >8h → Z72-Kandidat (aktuell {klass})'
+                })
+            # Tour-Anreise mit Inland-Layover (≠ Homebase) → Z73-Kandidat
+            elif (overnight and effective_ort and effective_ort != hb_upper
+                  and _is_inland_code(effective_ort)
+                  and not cluster_foreign):  # nur reiner Inland-Cluster
+                missing_deutschland_14_candidates.append({
+                    'datum': datum, 'klass': klass, 'expected': 'Z73',
+                    'effective_ort': effective_ort,
+                    'reason': f'Inland-Layover {effective_ort} im Inland-Cluster → Z73-Kandidat (aktuell {klass})'
+                })
+
     # Logging (kompakt, top-5 pro Liste)
     print(f"[v8-diag] extra_fahrtage={len(extra_fahrtage)} extra_arbeitstage={len(extra_arbeitstage)} "
           f"extra_hotelnaechte={len(extra_hotelnaechte)} wrong_z72={len(wrong_z72_candidates)} "
@@ -7496,6 +7535,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         'wrong_z72_candidates':   wrong_z72_candidates,
         'missing_z73_candidates': missing_z73_candidates,
         'missing_z76_candidates': missing_z76_candidates,
+        'missing_deutschland_14_candidates': missing_deutschland_14_candidates,
         'bmf_missing':            list(_diag_bmf['bmf_missing']),
         'iata_unknown':           sorted(set(_diag_bmf['iata_unknown'])),
         'nachweis': '',
@@ -8597,6 +8637,7 @@ def _berechne_via_hybrid(form, files):
         '_wrong_z72_candidates':   list(cls.get('wrong_z72_candidates', []) or []),
         '_missing_z73_candidates': list(cls.get('missing_z73_candidates', []) or []),
         '_missing_z76_candidates': list(cls.get('missing_z76_candidates', []) or []),
+        '_missing_deutschland_14_candidates': list(cls.get('missing_deutschland_14_candidates', []) or []),
         '_bmf_missing':            list(cls.get('bmf_missing', []) or []),
         '_iata_unknown':           list(cls.get('iata_unknown', []) or []),
         '_tage_detail':     list(cls.get('tage_detail', []) or []),

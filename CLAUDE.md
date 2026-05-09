@@ -50,6 +50,9 @@ AeroTAX verwendet EASA-/FTL-Begriffe nur als Lesehilfe für Dienstplan-Marker. A
 ### Homebase-Logik
 Homebase = der Flughafen, dem das Crewmitglied dienstlich zugeordnet ist. **Nicht** der nächstgelegene oder Wohnort-Flughafen. FRA wird **nicht** hardcoded — alle `starts_at_homebase`/`ends_at_homebase`/Hotel-Vergleiche prüfen gegen die im Formular gewählte Homebase. FRA bei MUC/BER/DUS-Base ist ein normaler Routing-Flughafen, kein Homebase-Indikator.
 
+### Reference-Contract (anonymisiert)
+`tests/test_calculation.py` enthält `REFERENCE_CONTRACT_2025_MIGUEL` als Test-Constant für gezielten Diff-Vergleich. Werte werden **nicht** im Produktions-Code hardcoded — nur als Soll-Werte für Live-Job-Vergleich (`reference_diff`-Helper). Plus Tag-Listen `REFERENCE_FAHRTAGE_2025_MIGUEL` und `REFERENCE_DEUTSCHLAND_14_2025_MIGUEL` für Tag-für-Tag-Diff.
+
 ## Autonomie-Modus
 
 Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
