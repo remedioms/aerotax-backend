@@ -425,19 +425,42 @@ def download_pdf(token):
     pdf_bytes, filename, expires = res
     if expires and datetime.utcnow() > expires:
         abort(410)
-    # PDF-Download = finaler Bescheid → Edit-Token verbrauchen
+    # Replay-Schutz: nach 1. erfolgreichem Download Token markieren
+    # Cache-Header: kein Caching durch Browser/CDN damit zweiter Klick wirklich Backend trifft
+    entry = _store.get(token) or {}
+    if entry.get('downloaded_at'):
+        # Innerhalb von 60s den Re-Click erlauben (User klickt manchmal 2x), danach blocken
+        try:
+            dl_at = entry['downloaded_at']
+            if isinstance(dl_at, str):
+                dl_at = datetime.fromisoformat(dl_at.replace('Z',''))
+            if (datetime.utcnow() - dl_at).total_seconds() > 60:
+                print(f"[download] token {token[:8]}: blocked re-download (>60s nach 1. Download)")
+                abort(410)
+        except: pass
+    # PDF-Download = finaler Bescheid → Edit-Token verbrauchen + Download-Marker setzen
     try:
-        sess_tok = (_store.get(token) or {}).get('session_token')
+        sess_tok = entry.get('session_token')
         if sess_tok:
             _mark_session_consumed(sess_tok)
+        _store.setdefault(token, {})['downloaded_at'] = datetime.utcnow()
+        # Auch in Supabase persistieren falls möglich
+        if SB_AVAILABLE:
+            try:
+                sb.table('pdfs').update({'downloaded_at': datetime.utcnow().isoformat()}).eq('token', token).execute()
+            except Exception as _se:
+                pass  # downloaded_at-Spalte könnte fehlen, in-memory reicht für 60s-Fenster
     except Exception as e:
         print(f"[download] consume-mark fail: {e}")
-    return send_file(
+    response = send_file(
         io.BytesIO(pdf_bytes),
         mimetype='application/pdf',
         as_attachment=True,
         download_name=filename,
     )
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    return response
 
 
 def _mark_session_consumed(token):
@@ -680,6 +703,14 @@ def process_real():
         oepnv_capped = max(0.0, min(10000.0, oepnv_raw))
         shuttle_raw = _safe_float(request.form.get('shuttle_kosten', 0))
         shuttle_capped = max(0.0, min(10000.0, shuttle_raw))
+        # Ausfallzeit (Mutterschutz/Krankheit/Teilzeit) — Monate die nicht gearbeitet wurde
+        ausfall_raw = _safe_int(request.form.get('ausfallzeit_monate', 0), 0)
+        ausfall_capped = max(0, min(12, ausfall_raw))
+
+        # Anreise: kann Multi-Mode sein (CSV: "auto,shuttle"), bleibt für Single-Mode kompatibel
+        # km nur relevant wenn auto/fahrrad in den Modes
+        anreise_modes_raw = set(m.strip() for m in str(anreise).split(',') if m.strip())
+        has_km = bool(anreise_modes_raw & {'auto', 'fahrrad'})
 
         form = {
             'name':    request.form.get('name', 'Flugbegleiter'),
@@ -688,12 +719,13 @@ def process_real():
             'year':    year_input,
             'base':    request.form.get('base', 'Frankfurt (FRA)'),
             'anreise': anreise,
-            'km':      km_capped if anreise in ('auto','fahrrad') else 0,
+            'km':      km_capped if has_km else 0,
             'fahrzeug':   request.form.get('fahrzeug', 'verbrenner'),
             'oepnv_kosten': oepnv_capped,
             'shuttle_kosten': shuttle_capped,
             'jobticket':  request.form.get('jobticket', 'nein'),
             'anfahrt_min': anfahrt_capped,
+            'ausfallzeit_monate': ausfall_capped,
         }
 
         files = {}
@@ -4494,6 +4526,14 @@ def berechne(form, files):
             parsed_summary['DP_arbeitstage'] = dp.get('arbeitstage', 0)
             parsed_summary['DP_fahr_tage'] = dp.get('fahr_tage', 0)
             parsed_summary['DP_hotel_naechte'] = dp.get('hotel_naechte', 0)
+        # Ausfallzeit-Hint für Inferenz (sonst wird Vollzeit angenommen)
+        ausfall_for_inf = int(form.get('ausfallzeit_monate', 0) or 0)
+        if ausfall_for_inf > 0:
+            parsed_summary['ausfallzeit_monate'] = ausfall_for_inf
+            parsed_summary['_hint'] = (
+                f"User hat {ausfall_for_inf} Monat(e) Ausfallzeit (Mutterschutz/Krank/Teilzeit) angegeben. "
+                f"Werte entsprechend skalieren — nicht von Vollzeit ausgehen."
+            )
         print(f"Running inference for missing: {missing}; parsed_summary={parsed_summary}")
         inferred, inf_notes = infer_missing_data_with_ki(files, available_texts, missing, parsed_summary=parsed_summary)
         notes.extend(inf_notes)
@@ -4649,20 +4689,41 @@ def berechne(form, files):
     vma_in = vma_72 + vma_73 + vma_74
 
     # ── FAHRTKOSTEN ───────────────────────────────────────────
+    # Multi-Mode: User kann Anreise mischen (Auto + Shuttle + ÖPNV gleichzeitig)
+    # Frontend sendet anreise als CSV (z.B. "auto,shuttle,oepnv") oder Single-Wert
     fahrzeug  = form.get('fahrzeug', 'verbrenner')
     jobticket = form.get('jobticket', 'nein')
-    if anreise in ('auto', 'fahrrad'):
-        fahr = min(km,20)*fahr_tage*pendler['lt_20km'] + max(0,km-20)*fahr_tage*pendler['gt_21km']
-    elif anreise == 'oepnv':
-        oepnv_kosten = float(form.get('oepnv_kosten', 0))
-        fahr = 0 if jobticket == 'ja_frei' else float(oepnv_kosten)
-    elif anreise == 'shuttle_kosten':
-        # Kostenpflichtiger Shuttle/Sammeltaxi → Jahreskosten direkt absetzbar (Reisekosten)
-        fahr = float(form.get('shuttle_kosten', 0) or 0)
-    else:
-        # shuttle_frei, fuss, oder unbekannt → keine Fahrtkosten
-        fahr = 0
+    fahr = 0.0
+    fahr_breakdown = []
+    anreise_modes = set(m.strip() for m in str(anreise).split(',') if m.strip())
+    if not anreise_modes:
+        anreise_modes = {'auto'}
+
+    # Auto/Fahrrad: km × Tage × Pendlerpauschale
+    if 'auto' in anreise_modes or 'fahrrad' in anreise_modes:
+        f_auto = round(min(km,20)*fahr_tage*pendler['lt_20km'] + max(0,km-20)*fahr_tage*pendler['gt_21km'], 2)
+        if f_auto > 0:
+            fahr += f_auto
+            fahr_breakdown.append(f"Auto/Fahrrad ({km}km × {fahr_tage}T): {f_auto:.2f}€")
+
+    # ÖPNV: Jahreskosten direkt (außer wenn Jobticket frei → 0)
+    if 'oepnv' in anreise_modes:
+        oepnv_k = float(form.get('oepnv_kosten', 0) or 0)
+        f_oepnv = 0 if jobticket == 'ja_frei' else oepnv_k
+        if f_oepnv > 0:
+            fahr += f_oepnv
+            fahr_breakdown.append(f"ÖPNV: {f_oepnv:.2f}€")
+
+    # Shuttle: Jahreskosten direkt (Sammeltaxi/kostenpflichtiger Shuttle)
+    if 'shuttle' in anreise_modes or 'shuttle_kosten' in anreise_modes:
+        f_shuttle = float(form.get('shuttle_kosten', 0) or 0)
+        if f_shuttle > 0:
+            fahr += f_shuttle
+            fahr_breakdown.append(f"Shuttle: {f_shuttle:.2f}€")
+
     fahr = round(fahr, 2)
+    if fahr_breakdown:
+        print(f"[fahrtkosten] {fahr:.2f}€ aus: {', '.join(fahr_breakdown)}")
 
     # ── Z72-BOOST: pro-Tag Block-Time-aware mit LH-Faustregel-Briefing ──
     # LH Cabin-Crew Faustregel (wenn nicht aus Dienstplan ablesbar):
@@ -4827,21 +4888,24 @@ def berechne(form, files):
         notes.append('🔁 Qualitäts-Hinweis: Werte sehen unplausibel aus. Falls offensichtlich falsch — du bekommst nach Auswertung einen kostenlosen Wiederholungs-Code.')
 
     # ── ANOMALIE-DETECTION: Werte außerhalb realistischer Bandbreite ──
-    # Bandbreiten sind großzügig — nur extreme Ausreißer werden geflaggt.
-    # Teilzeit-Mitarbeiter, Mutterschutz-Phasen etc. sollen NICHT geflaggt werden.
+    # Ausfallzeit (Mutterschutz/Krank/Teilzeit) berücksichtigen — Bandbreiten skalieren proportional
+    ausfall_monate = int(form.get('ausfallzeit_monate', 0) or 0)
+    arbeits_quote = max(0.1, (12 - ausfall_monate) / 12)  # min 10% damit nicht /0
     anomalies = []
-    if arbeitstage > 250:
-        anomalies.append(f'Arbeitstage {arbeitstage} sehr hoch (>250) — bitte prüfen')
+    if arbeitstage > round(250 * arbeits_quote):
+        anomalies.append(f'Arbeitstage {arbeitstage} sehr hoch — bitte prüfen')
     if fahr_tage > arbeitstage and arbeitstage > 0:
         anomalies.append(f'Fahrtage {fahr_tage} > Arbeitstage {arbeitstage} — unmöglich')
-    if hotel_naechte > 120:
-        anomalies.append(f'Hotelnächte {hotel_naechte} sehr hoch (>120) — bitte prüfen')
-    if vma_aus > 15000:
+    if hotel_naechte > round(120 * arbeits_quote):
+        anomalies.append(f'Hotelnächte {hotel_naechte} sehr hoch — bitte prüfen')
+    if vma_aus > round(15000 * arbeits_quote):
         anomalies.append(f'VMA Ausland {vma_aus:.0f}€ sehr hoch — bitte prüfen')
+    if ausfall_monate > 0:
+        notes.append(f'ℹ Ausfallzeit angegeben: {ausfall_monate} Monat(e) — Plausi-Bandbreiten entsprechend angepasst.')
     if anomalies:
         for a in anomalies:
             notes.append(f'⚠ Anomalie: {a}')
-        print(f"ANOMALIE-DETECTION: {anomalies}")
+        print(f"ANOMALIE-DETECTION (Quote {arbeits_quote:.2f}): {anomalies}")
 
     # ── AUDIT-TRAIL ──────────────────────────────────────────
     se_unklar = len((se_data or {}).get('unklare_zeilen', []))
@@ -4982,9 +5046,14 @@ def berechne(form, files):
     if auto_corrections:
         reinig = round(arbeitstage * reinig_satz, 2)
         trink  = round(hotel_naechte * trink_satz, 2)
-        # Fahrtkosten neu (km/fahr_tage könnten sich geändert haben)
-        if anreise == 'auto':
-            fahr = round(min(km, 20) * fahr_tage * 0.30 + max(0, km - 20) * fahr_tage * 0.38, 2)
+        # Fahrtkosten neu (Auto-Komponente: km/fahr_tage könnten sich geändert haben)
+        if 'auto' in anreise_modes or 'fahrrad' in anreise_modes:
+            f_auto_new = round(min(km, 20) * fahr_tage * pendler['lt_20km'] +
+                               max(0, km - 20) * fahr_tage * pendler['gt_21km'], 2)
+            # Anteilig: alte Auto-Komponente abziehen, neue rauf
+            f_auto_old = next((float(p.split(': ')[1].rstrip('€'))
+                               for p in fahr_breakdown if p.startswith('Auto')), 0)
+            fahr = round(fahr - f_auto_old + f_auto_new, 2)
         # vma_in neu (Inland-Anteile könnten korrigiert sein)
         vma_in = round(vma_72 + vma_73 + vma_74, 2)
         # Wenn z77 korrigiert wurde: spesen_gesamt/spesen_steuer angleichen damit PDF-Math stimmt
