@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '5.6',
-        'build':   'multi-stop-tag-fuer-tag-classification-2026-05-09',
+        'version': '5.7',
+        'build':   'pendel-fix-z72-balanced-z73-multistop-hotel-all-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5374,7 +5374,7 @@ def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebas
             'properties': {
                 'arbeitstage':   {'type': 'integer', 'description': 'Alle Tage mit Dienst (Tour/Office/Standby/Schulung), ohne Frei/Urlaub/Krank'},
                 'fahr_tage':     {'type': 'integer', 'description': 'Tage an denen User zum Flughafen fahren musste (Tour-Start + Office-Day). Eine Tour = 1 Fahrtag total, egal wie lang.'},
-                'hotel_naechte': {'type': 'integer', 'description': 'Auslands-Übernachtungen (FL-Marker, ≥10h Bodenzeit nach EASA-FTL)'},
+                'hotel_naechte': {'type': 'integer', 'description': 'Σ ALLER Übernachtungen außerhalb Homebase (FL-Marker oder anderer Hotel-Indikator) — INLAND UND AUSLAND. Auch Inland-Schulungs-Hotels und Inland-Tour-Layovers zählen. NICHT nur Auslands-Übernachtungen!'},
                 'z72_tage':      {'type': 'integer', 'description': 'Tagestrips Inland >8h (mit Briefingzeit-Berechnung) ohne Übernachtung'},
                 'z72_eur':       {'type': 'number',  'description': 'z72_tage × 14€ (BMF Inland Tagestrip)'},
                 'z73_tage':      {'type': 'integer', 'description': 'An-/Abreisetage Inland (mit Inland-Übernachtung). Auch Auslandstour-Anreise mit FRA-stfrei zählt hier (FollowMe-Methode konservativ).'},
@@ -5722,6 +5722,18 @@ def _detect_classification_issues(cls, se_summary):
                 f"normal ~1.3). Auslandstour braucht Hotelnächte als Nachweis — FL-Marker "
                 f"im Dienstplan vollständig erfasst?"
             )
+
+    # 7) Pendel-Anti-Pattern: Z72 = 0 trotz Arbeitstagen → Hard-Gate zu strikt interpretiert.
+    # Vollzeit-Crew hat fast immer mind. 1-2 Same-Day-Trips/Jahr. Z72=0 ist sehr unwahrscheinlich
+    # bei Tour-aktiver Crew.
+    if z72_tage == 0 and arbeitstage > 100 and z76 > 1000:
+        issues.append(
+            f"Anti-Muster: Z72 = 0 bei {arbeitstage} Arbeitstagen und Z76 = {z76:.0f}€. "
+            f"Eine Tour-aktive Crew hat typisch mind. ein paar Same-Day-Tagestrips. Z72 = 0 deutet "
+            f"darauf hin dass das Hard-Gate zu strikt interpretiert wurde — Tagestrips wurden "
+            f"vermutlich fälschlich als Office oder gar nicht klassifiziert. Prüfe alle Tage mit "
+            f"A+E-Markern am selben Kalendertag ohne FL erneut."
+        )
     return issues
 
 

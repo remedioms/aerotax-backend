@@ -82,11 +82,13 @@ def test_classification_issues_z76_higher_than_z77():
 def test_classification_issues_no_issue_when_consistent():
     """Konsistente Werte → keine Issues."""
     from app import _detect_classification_issues
-    cls = {'z76_eur': 4500, 'arbeitstage': 150, 'fahr_tage': 60, 'hotel_naechte': 50}
+    cls = {'z76_eur': 4500, 'arbeitstage': 150, 'fahr_tage': 60,
+           'hotel_naechte': 50, 'z72_tage': 5, 'z73_tage': 8}
     se = {'z77_total': 5000, 'auslandsspesen_total': 4000}
     issues = _detect_classification_issues(cls, se)
     # Z76 (4500) <= Z77 (5000) ✓; Z76 vs Auslandsspesen 4500 vs 4000 → diff 12.5%, < 40%
-    assert len(issues) == 0
+    # Z72=5 + Z73=8 + Hotel=50 → kein Anti-Muster
+    assert len(issues) == 0, f"Erwartet 0 Issues, bekommen: {issues}"
 
 
 def test_classification_issues_hotel_too_high():
@@ -153,6 +155,29 @@ def test_classification_issues_z76_hotel_ratio_normal_no_warning():
     se = {'z77_total': 5000, 'auslandsspesen_total': 4000}
     issues = _detect_classification_issues(cls, se)
     assert not any('Auslandstage' in i and 'Hotelnächte' in i for i in issues)
+
+
+def test_classification_issues_z72_zero_pendel_antipattern():
+    """Pendel-Anti-Pattern v5.7: Z72 = 0 trotz vieler Arbeitstage und aktiver Auslandstouren.
+    Aufgetreten bei v5.6 nach zu strikter Z72-Hard-Gate Interpretation."""
+    from app import _detect_classification_issues
+    cls = {'z76_eur': 4655, 'arbeitstage': 144, 'fahr_tage': 26,
+           'hotel_naechte': 52, 'z72_tage': 0, 'z73_tage': 0}
+    se = {'z77_total': 4655, 'auslandsspesen_total': 4441}
+    issues = _detect_classification_issues(cls, se)
+    assert any('Anti-Muster' in i and 'Z72 = 0' in i for i in issues), \
+        f"Pendel-Anti-Pattern nicht gefunden in: {issues}"
+
+
+def test_classification_issues_z72_zero_no_pendel_when_inactive():
+    """Z72 = 0 ist OK bei wenig Arbeitstagen oder ohne Z76 (Standby-only Crew)."""
+    from app import _detect_classification_issues
+    cls = {'z76_eur': 200, 'arbeitstage': 80, 'fahr_tage': 20,
+           'hotel_naechte': 5, 'z72_tage': 0, 'z73_tage': 0}
+    se = {'z77_total': 250, 'auslandsspesen_total': 200}
+    issues = _detect_classification_issues(cls, se)
+    # Bei wenig AT (<100) oder Z76 < 1000€ kein Pendel-Trigger
+    assert not any('Anti-Muster' in i and 'Z72 = 0' in i for i in issues)
 
 
 # ── PII-Redaktion ──────────────────────────────────────────────────────────

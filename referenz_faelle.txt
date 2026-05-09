@@ -167,20 +167,60 @@ DREI HAUPT-KATEGORIEN:
     Z76 abrechnen, obwohl Tag 1 eine Inland-Übernachtung ist. Das verschiebt
     Z73-Tage in Z76 und führt zu Inkonsistenz mit den AG-Auslandsspesen.
 
+  Z73 ist NICHT auf reine Inlandstouren beschränkt!
+    Z73 entsteht IMMER wenn an einem Kalendertag eine INLAND-Übernachtung
+    stattfindet — egal ob:
+    • Reine Inland-Tour (FRA→MUC mit Hotel zurück nach FRA)
+    • Reine Inland-Schulung (D4 in MUC mit Hotel mehrtägig)
+    • Multi-Stop-Tour mit Inland-Layover (FRA→BER→ZAG→FRA: Tag 1 = Z73 BER)
+    • Tour-Mix: User kehrt aus Auslandstour zurück + neue Tour beginnt am
+      gleichen Tag mit Inland-Layover
+
+    Wenn dein Klassifikations-Output Z73 = 0 ergibt UND es im Dienstplan
+    Indizien für Inland-Übernachtungen gibt (z.B. mehrtägige EM/D4 außerhalb
+    Homebase, Inland-Layover-Codes in Multi-Stop-Touren), hast du Z73 übersehen.
+
+  HOTELNÄCHTE — DETERMINISTISCH AUS FL-MARKERN:
+    hotel_naechte = Σ aller FL-Marker im Dienstplan, EGAL ob Inland oder Ausland.
+    Eine FL-Markierung im Dienstplan IST eine Hotelnacht — die Land-Frage ist
+    erst für die Z73-vs-Z76-Klassifikation relevant, nicht für die Hotelnacht-
+    Zählung an sich.
+
+    Häufiger Bug: hotel_naechte zählt nur Auslands-Hotels. Das ist falsch.
+    Inland-Hotels (Schulungs-Hotels MUC/HAM/BER, Inland-Tour-Layover) zählen
+    GLEICHWERTIG. Trinkgeld-Pauschale 3,60€/Nacht gilt für jede Hotelnacht.
+
   ═══ Z72-HARD-GATE — VOLLSTÄNDIGE BEDINGUNGSLISTE ═══
 
-  Z72 darf NUR vergeben werden, wenn ALLE folgenden Bedingungen erfüllt sind:
+  Z72 darf vergeben werden, wenn:
     ✓ A-Marker UND E-Marker am selben Kalendertag
-    ✓ Keine FL-/Hotel-/Layover-Fortsetzung am Tag oder Folgetag
-    ✓ Keine Heimkehr aus einer mehrtägigen Tour am selben Tag
-    ✓ Kein vorheriger oder folgender Tag gehört zur gleichen Tour
+    ✓ KEINE FL-/Hotel-/Layover-Übernachtung an diesem Tag
+    ✓ Der Tag gehört nicht zu einer am Vortag begonnenen mehrtägigen Tour
+      (kein offener Layover aus der vorherigen Nacht — User schlief zuhause)
+    ✓ Der Tag startet keine mehrtägige Tour (kein Übernachtung-am-Folgetag)
     ✓ Abwesenheit > 8h plausibel
 
-  Wenn der Tag MIT Heimkehr aus mehrtägiger Tour beginnt oder endet:
-    → NICHT pauschal Z72.
-    → Tourabschluss separat klassifizieren (Z76- oder Z73-Abreisetag),
-      neue Same-Day-Aktivität separat dokumentieren wenn vorhanden.
-    → Im tage_detail beide Komponenten getrennt aufführen.
+  WICHTIG — Z72 ist NICHT verboten nur weil Vortag dienstlich war:
+    ✗ FALSCHE Auslegung: "Kein vorheriger oder folgender Tag darf Dienst sein"
+    ✓ KORREKT: User kommt aus mehrtägiger Tour zurück (Tag X = Heimkehr) und
+      macht am Tag X+1 einen sauberen Same-Day-Trip (A+E am Tag X+1, keine
+      Übernachtung Tag X+1) → Tag X+1 IST Z72.
+
+  Mischfall-Regelung (Heimkehr + Same-Day am selben Tag):
+    Wenn am SELBEN Kalendertag Heimkehr aus mehrtägiger Tour UND ein
+    Same-Day-Trip stattfindet:
+    → NICHT pauschal nur Z72.
+    → Im tage_detail beide Komponenten getrennt aufführen:
+      • Tour-Abschluss: Z76- oder Z73-Abreisetag (je nach letzter Übernachtung)
+      • Same-Day-Aktivität separat dokumentieren (zählt aber typisch nicht als
+        zusätzliches Z72, weil der Tag bereits VMA aus der Tour-Abreise hat)
+
+  REFLEX-FEHLER VERMEIDEN (beide Richtungen):
+    ❌ "Pendel" Pass-1: zu viele Z72 → Pass-2 reduziert auf 0 = FALSCH
+    Z72 ist eine REGULÄRE Klasse für Same-Day-Tagestrips. Eine Vollzeit-Crew
+    hat typisch mehrere echte Same-Day-Trips pro Jahr. Wenn dein Output
+    Z72 = 0 ergibt UND es klare A+E-am-selben-Tag-Sequenzen ohne FL gibt,
+    hast du das Hard-Gate zu strikt interpretiert. Korrigiere zurück.
 
   ═══ MEHRTÄGIGE SCHULUNGEN — Z73 STATT OFFICE ═══
 
