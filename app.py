@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '6.0.4',
-        'build':   'fstring-fra-nameerror-fix-2026-05-09',
+        'version': '6.0.5',
+        'build':   'no-fallback-flag-code-bug-detection-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -6414,10 +6414,19 @@ def hybrid_analyze(form, files):
     # Schritt 4 (v6.0): Backend zählt Hotelnächte/Arbeitstage/Fahrtage deterministisch
     # Schritt 5 (v6.0): Opus klassifiziert nur noch steuerlich (keine PDFs mehr)
     # Bei Crash → Fallback auf v5.7-Pfad (_opus_classify_days_v2 mit PDF-Input)
+    #
+    # Kosten-Schutz: Code-Bugs (NameError/AttributeError/TypeError/etc.) lösen
+    # KEINEN Fallback aus — das wäre teuer ohne Nutzen, weil's ein Code-Fix
+    # ist und keine transiente API-Störung. Stattdessen Job-Fehler → User
+    # bekommt klare Fehlermeldung, Entwickler fixt den Code.
+    # ENV: AEROTAX_DISABLE_V6=1 → kein v6-Versuch (nur v5.7)
+    # ENV: AEROTAX_NO_FALLBACK=1 → bei v6-Crash KEIN Fallback (Test-Modus)
     classification = None
     structured_days = None
     deterministic_counts = None
-    use_v6 = os.environ.get('AEROTAX_DISABLE_V6') != '1'  # Notbremse via env-flag
+    use_v6 = os.environ.get('AEROTAX_DISABLE_V6') != '1'
+    no_fallback = os.environ.get('AEROTAX_NO_FALLBACK') == '1'
+    v6_code_bug = False  # wenn Python-Bug erkannt: kein Fallback (Code muss gefixt werden)
     if dp_bytes and use_v6:
         try:
             structured_days = _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year, homebase)
@@ -6469,12 +6478,27 @@ def hybrid_analyze(form, files):
             else:
                 print(f"[v6] Sonnet-Pre-Reader lieferte keine Tagesdaten — Fallback auf v5.7")
         except Exception as e:
-            print(f"[v6] Pipeline crash: {type(e).__name__}: {str(e)[:200]} — Fallback auf v5.7")
-            errors.append(f'v6-Pipeline: {e}')
+            etype = type(e).__name__
+            # Code-Bugs: NameError, AttributeError, TypeError, SyntaxError, ImportError, KeyError
+            # → kein Fallback weil es ein Code-Bug ist, kein API-Problem.
+            # Sonst läuft Fallback durch und kostet zusätzliche Tokens (Sonnet+Opus auf 24 PDFs)
+            # ohne dass der Code-Bug gefixt wird.
+            CODE_BUG_TYPES = {'NameError', 'AttributeError', 'TypeError', 'SyntaxError',
+                              'ImportError', 'IndentationError', 'KeyError', 'IndexError'}
+            if etype in CODE_BUG_TYPES:
+                v6_code_bug = True
+                print(f"[v6] Pipeline CODE-BUG: {etype}: {str(e)[:200]} — KEIN Fallback (Code-Fix nötig)")
+                errors.append(f'v6-Code-Bug ({etype}): {str(e)[:200]}')
+            else:
+                print(f"[v6] Pipeline crash: {etype}: {str(e)[:200]} — Fallback auf v5.7")
+                errors.append(f'v6-Pipeline ({etype}): {str(e)[:200]}')
             classification = None
 
     # Fallback: v5.7-Pfad (Opus liest PDFs direkt)
-    if classification is None and dp_bytes:
+    # Wird unterdrückt wenn:
+    # 1. ENV AEROTAX_NO_FALLBACK=1 (Dev/Test-Modus, spart Kosten)
+    # 2. v6_code_bug=True (Python-Code-Bug erkannt → muss Entwickler fixen, nicht API)
+    if classification is None and dp_bytes and not no_fallback and not v6_code_bug:
         try:
             classification = _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year, homebase)
             if classification:
@@ -6482,6 +6506,9 @@ def hybrid_analyze(form, files):
         except Exception as e:
             errors.append(f'DP-Klassifikation: {e}')
             print(f"[hybrid] Opus-Klassifikation crash: {e}")
+    elif classification is None and (no_fallback or v6_code_bug):
+        reason = 'AEROTAX_NO_FALLBACK=1' if no_fallback else f'Code-Bug erkannt ({errors[-1] if errors else "?"})'
+        print(f"[hybrid] Fallback unterdrückt — {reason}. Job liefert keine Klassifikation.")
     gc.collect()
     _release_memory_to_os()
 
@@ -6840,14 +6867,25 @@ def berechne(form, files):
     """
     Berechnet alle Werbungskosten — Hauptpfad: hybrid_analyze (Sonnet+Opus).
     Falls Hybrid fehlschlägt: Fallback auf alten Multi-Parser-Code.
+
+    Test-Modus: ENV AEROTAX_NO_FALLBACK=1 → bei Hybrid-Crash KEIN
+    Multi-Parser-Fallback. Spart Token-Kosten bei iterativem Debugging.
     """
+    no_fallback = os.environ.get('AEROTAX_NO_FALLBACK') == '1'
+
     # ── Hauptpfad: Hybrid-Analyse (Sonnet+Opus parallel) ──
     try:
         hybrid_result = _berechne_via_hybrid(form, files)
         if hybrid_result is not None:
             return hybrid_result
     except Exception as e:
-        print(f"[berechne] hybrid path crash: {e} — fallback auf alten Code")
+        print(f"[berechne] hybrid path crash: {e} — {'KEIN Fallback (NO_FALLBACK=1)' if no_fallback else 'fallback auf alten Code'}")
+        if no_fallback:
+            raise
+
+    if no_fallback:
+        print(f"[berechne] hybrid lieferte None — KEIN Multi-Parser-Fallback (AEROTAX_NO_FALLBACK=1). Job fehlt.")
+        raise RuntimeError("Hybrid-Pipeline ohne Ergebnis und Fallback deaktiviert (AEROTAX_NO_FALLBACK=1)")
 
     # ── Fallback: alter Multi-Parser-Code ──
     print(f"[berechne] FALLBACK: alter Multi-Parser-Code wird verwendet")
