@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '6.0',
-        'build':   'structured-day-pipeline-deterministic-counts-2026-05-09',
+        'version': '6.0.1',
+        'build':   'structured-prereader-32k-tokens-pdf-cap-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5239,10 +5239,17 @@ def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year=2025, homebase='FRA
         }
     }
 
+    # PDF-Cap: insgesamt max 24 Documents an Sonnet (Anthropic-Limit ist 100, aber
+    # mehr als ~25 macht den Output zu groß für strukturierte Tagesdaten).
+    # DP wichtiger als Einsatzplan — DP first.
     content = []
     pdf_count = 0
+    max_total = 24
     for label, blist in [('Dienstplan', dp_bytes), ('Einsatzplan', einsatz_bytes)]:
-        for pdf_bytes in blist[:14]:
+        remaining = max_total - pdf_count
+        if remaining <= 0:
+            break
+        for pdf_bytes in blist[:remaining]:
             try:
                 content.append({
                     'type': 'document',
@@ -5332,6 +5339,18 @@ eigenen Felder. Beispiel:
 ❌ NICHT steuerlich klassifizieren (kein "Z72/Z73/Z76" in den notes — das
    macht ein anderer Schritt)
 
+═════ KOMPAKTHEIT — WICHTIG für Token-Limit ════════════════════════════════
+
+- raw_marker max 30 Zeichen
+- notes max 60 Zeichen, NUR wenn echter Hinweis
+- Lass FREI/Urlaub/Krank-Tage einfach WEG (oder min. so kompakt wie möglich)
+- Tour-Continuation-Tage nur wenn nötig — wenn ein Tag eindeutig Mittel-Tag
+  einer mehrtägigen Tour ist, kannst du ihn weglassen wenn der Tour-Start
+  klar markiert ist und du activity_type=tour_continuation auf den Tour-End
+  Tag setzt. ABER: lieber zu viele als zu wenige Tage.
+
+Ziel: Output passt in 32k Tokens auch bei 365 Tagen. Halte dich kompakt.
+
 LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
 
     content.append({'type': 'text', 'text': prompt})
@@ -5344,7 +5363,7 @@ LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
         for attempt in range(2):
             try:
                 resp = client.messages.create(
-                    model='claude-sonnet-4-6', max_tokens=16000,
+                    model='claude-sonnet-4-6', max_tokens=32000,
                     tools=[structured_tool],
                     tool_choice={'type': 'tool', 'name': 'submit_structured_days'},
                     messages=[{'role': 'user', 'content': content}]
@@ -5355,13 +5374,21 @@ LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
                 print(f"[Sonnet-DP-Structured] retry: {str(e)[:100]}")
                 _t.sleep(5)
         elapsed = _t.time() - start
+        # Detailliertes Logging zum Debuggen — content blocks + stop_reason
+        stop_reason = getattr(resp, 'stop_reason', 'unknown') if resp else 'no_response'
+        usage = getattr(resp, 'usage', None) if resp else None
+        if usage:
+            in_tok = getattr(usage, 'input_tokens', '?')
+            out_tok = getattr(usage, 'output_tokens', '?')
+            print(f"[Sonnet-DP-Structured] resp stop={stop_reason} in_tok={in_tok} out_tok={out_tok}")
         tool_input = None
-        for block in resp.content:
+        for block in resp.content if resp else []:
             if getattr(block, 'type', None) == 'tool_use':
                 tool_input = block.input
                 break
         if not tool_input:
-            print(f"[Sonnet-DP-Structured] kein tool_input")
+            block_types = [getattr(b, 'type', None) for b in (resp.content if resp else [])]
+            print(f"[Sonnet-DP-Structured] kein tool_input — stop={stop_reason} blocks={block_types}")
             return None
         days = list(tool_input.get('days', []) or [])
         warnings = list(tool_input.get('warnings', []) or [])
