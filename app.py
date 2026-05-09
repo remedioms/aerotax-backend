@@ -2089,9 +2089,9 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '2.2',
-        'build':   'hotfix-prefill-removed-2026-05-09',
-        'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always', 'opus-final-audit', 'no-prefill'],
+        'version': '2.3',
+        'build':   'sonnet-dp-tool-use-2026-05-09',
+        'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always', 'opus-final-audit', 'sonnet-dp-tool-use'],
     })
 
 
@@ -3469,11 +3469,72 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
 
         import time as _time_mod
         sonnet_start_time = _time_mod.time()
-        # WICHTIG: Sonnet-4-6 unterstützt KEIN assistant-prefill via streaming.
-        # Stattdessen: Prompt-Instruction stark machen + Stop-Sequence wenn JSON fertig.
-        full_text = _claude_stream_with_retry(client, 'claude-sonnet-4-6', 12000, content,
-                                              max_retries=3, label='Sonnet-DP')
-        print(f"Sonnet-Antwort: {len(full_text)} Zeichen, {_time_mod.time()-sonnet_start_time:.1f}s")
+        # ── TOOL-USE statt Prompt-JSON ──
+        # Tool-Use ist offizielle Anthropic-Feature für strukturierte Outputs.
+        # Zwingt Sonnet zu sofortigem JSON ohne 20k-Zeichen-Reasoning-Vorgeplänkel.
+        # Erwartete Zeit: 30-60s statt 180s.
+        dp_tool = {
+            'name': 'submit_dienstplan_analysis',
+            'description': 'Submit the analyzed Lufthansa Dienstplan values',
+            'input_schema': {
+                'type': 'object',
+                'properties': {
+                    'fahrtage':       {'type': 'integer', 'description': 'Anzahl Fahrtage zum Flughafen (eine Tour = 1 Fahrtag)'},
+                    'arbeitstage':    {'type': 'integer', 'description': 'Alle Dienst-Tage (Flug, Standby, Schulung, Office) ohne Frei/Urlaub/Krank'},
+                    'hotel_naechte':  {'type': 'integer', 'description': 'Auslands-Übernachtungen mit ≥10h Bodenzeit (EASA-FTL)'},
+                    'vma_72_tage':    {'type': 'integer', 'description': 'Inland-Tagestrips >8h (Z72)'},
+                    'vma_72':         {'type': 'number',  'description': 'Z72 EUR-Summe'},
+                    'vma_73_tage':    {'type': 'integer', 'description': 'An-/Abreisetage Inland (Z73)'},
+                    'vma_73':         {'type': 'number',  'description': 'Z73 EUR-Summe'},
+                    'vma_74_tage':    {'type': 'integer', 'description': 'Inland 24h-Tage (Z74, selten)'},
+                    'vma_74':         {'type': 'number',  'description': 'Z74 EUR-Summe'},
+                    'vma_aus':        {'type': 'number',  'description': 'VMA Ausland Z76 (Σ stfrei-Werte aus SE für Auslandsdestinationen)'},
+                    'z77':            {'type': 'number',  'description': 'Z77 stfrei gesamt — auf 0 lassen, Backend rechnet'},
+                    'km':             {'type': 'integer', 'description': 'km Homebase einfache Strecke'},
+                    'nachweis':       {'type': 'string',  'description': 'Knappe Begründung Monat für Monat (1-2 Sätze pro Monat)'},
+                },
+                'required': ['fahrtage', 'arbeitstage', 'hotel_naechte'],
+            }
+        }
+        # Tool-Use Call mit Retry-Logik (transient errors)
+        tool_resp = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                tool_resp = client.messages.create(
+                    model='claude-sonnet-4-6',
+                    max_tokens=8000,
+                    tools=[dp_tool],
+                    tool_choice={'type': 'tool', 'name': 'submit_dienstplan_analysis'},
+                    messages=[{'role': 'user', 'content': content}],
+                )
+                break
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                should_retry = any(s in err_str.lower() for s in ['429','500','502','503','504','timeout','connection','rate'])
+                if not should_retry or attempt == 2:
+                    raise
+                wait = 2 ** attempt + 1
+                print(f"[Sonnet-DP-tool] retry {attempt+1}/3 in {wait}s — {err_str[:120]}")
+                _time_mod.sleep(wait)
+        if tool_resp is None:
+            raise (last_err or RuntimeError('Sonnet-DP tool call fehlgeschlagen'))
+        elapsed = _time_mod.time() - sonnet_start_time
+        # Tool-Use-Response: content ist Liste, einer der Blöcke ist tool_use mit input-Dict
+        tool_input = None
+        nachweis_text = ''
+        for block in tool_resp.content:
+            if getattr(block, 'type', None) == 'tool_use':
+                tool_input = block.input
+            elif getattr(block, 'type', None) == 'text':
+                nachweis_text = (nachweis_text + ' ' + (block.text or '')).strip()
+        if not tool_input:
+            raise RuntimeError('Sonnet-DP tool_use lieferte keine input')
+        print(f"Sonnet-DP tool_use OK: {elapsed:.1f}s, fields={list(tool_input.keys())}")
+        # Bauen wir full_text zusammen damit nachgelagerte JSON-Extraktion (brace-counter) funktioniert
+        import json as _json
+        full_text = _json.dumps(tool_input, ensure_ascii=False) + '\n\n' + (tool_input.get('nachweis') or nachweis_text or '')
 
         # ── JSON robust extrahieren via brace-counter ──
         # Sucht nach ALLEN balanced {...} Blöcken im Text und nimmt den der "fahrtage" enthält.
