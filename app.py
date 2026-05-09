@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '5.2',
-        'build':   'audit-language-unified-2026-05-09',
+        'version': '5.3',
+        'build':   'legal-stberg-tom-loeschfristen-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -7399,11 +7399,12 @@ def erstelle_pdf(d):
            leading=12, alignment=TA_CENTER, spaceAfter=8, letterSpacing=1.5)))
     S.append(Paragraph(
         "Diese Auswertung wurde automatisiert auf Basis deiner hochgeladenen Dokumente erstellt. "
-        "Sie ersetzt <b>keine</b> Beratung durch eine Steuerberaterin oder einen Steuerberater. "
+        "AeroTAX erbringt <b>keine geschäftsmäßige Hilfeleistung in Steuersachen</b> iSv § 1 StBerG "
+        "und ersetzt keine individuelle Beratung durch eine Steuerberaterin oder einen Steuerberater. "
         "Wir übernehmen keine Gewähr für die Richtigkeit, Vollständigkeit oder steuerliche "
-        "Anerkennung der berechneten Werte. Prüfe vor Eintragung in deine Steuererklärung "
-        "selbst, ob alle Werte plausibel sind, und ziehe im Zweifelsfall fachlichen Rat hinzu. "
-        "Die rechtliche Verantwortung für deine Steuererklärung liegt bei dir.",
+        "Anerkennung der berechneten Werte durch das Finanzamt. Prüfe vor Eintragung in deine "
+        "Steuererklärung selbst, ob alle Werte plausibel sind, und ziehe im Zweifelsfall fachlichen "
+        "Rat hinzu. Die rechtliche Verantwortung für deine Steuererklärung liegt bei dir.",
         ps("disc_b", fontSize=8.5, textColor=TEXT3, fontName="Helvetica",
            leading=13, alignment=TA_CENTER, spaceAfter=8)))
 
