@@ -6471,14 +6471,29 @@ def _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA'):
         elif at == 'same_day':
             dp['starts_at_homebase'] = True  # Same-Day startet immer ab Homebase
         elif at == 'tour':
-            # Tour-Anreise: prev nicht overnight + Routing beginnt am Homebase
-            if not prev_overnight:
-                if not routing_upper or routing_upper[0] == homebase_upper:
-                    dp['starts_at_homebase'] = True
-                else:
-                    dp['starts_at_homebase'] = False
-            else:
+            # Tour-Anreise (= neue Fahrt von zuhause zur Homebase):
+            # - prev_overnight=False (Vortag zuhause)
+            # - heute overnight=true (Layover-Hotel) ODER Routing zeigt Homebase→Auswärts
+            # WICHTIG: Tour-Tag ohne overnight + ohne klares Routing ist mehrdeutig
+            # (kann Heimkehrtag sein, der Sonnet als isolierten 'tour'-Tag gelesen hat).
+            # In dem Fall KEIN Anreise-Fahrtag — der Heimkehr-Fahrtag wird separat
+            # gezählt (ends_at_homebase + prev_overnight oder Recent-Foreign-Cluster).
+            if prev_overnight:
                 dp['starts_at_homebase'] = False  # Tourfortsetzung
+            elif overnight:
+                # heute Hotel → klassische Anreise. Routing=Homebase prüfen falls vorhanden,
+                # sonst optimistisch True (Cabin-Crew startet meist ab Homebase).
+                if routing_upper and routing_upper[0] != homebase_upper:
+                    dp['starts_at_homebase'] = False
+                else:
+                    dp['starts_at_homebase'] = True
+            else:
+                # Tour ohne overnight + Vortag zuhause: nur dann Anreise wenn Routing
+                # klar Homebase→Ausland→Homebase (Same-Day-Tour-Bein) zeigt.
+                if routing_upper and routing_upper[0] == homebase_upper and routing_upper[-1] == homebase_upper:
+                    dp['starts_at_homebase'] = True  # Same-Day-Tour
+                else:
+                    dp['starts_at_homebase'] = False  # vermutlich isolierter Heimkehr-Tag
         else:
             dp['starts_at_homebase'] = False
 
@@ -6491,14 +6506,16 @@ def _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA'):
         elif at == 'same_day':
             dp['ends_at_homebase'] = True
         elif at == 'tour':
-            if not overnight:
-                # Heimkehrtag oder Same-Day-Tour-Bein
-                if not routing_upper or routing_upper[-1] == homebase_upper:
-                    dp['ends_at_homebase'] = True
-                else:
-                    dp['ends_at_homebase'] = False
+            if overnight:
+                dp['ends_at_homebase'] = False  # Layover heute
             else:
-                dp['ends_at_homebase'] = False  # Layover
+                # Kein overnight: Heimkehrtag oder Same-Day. Bei klarem Routing prüfen.
+                if routing_upper:
+                    dp['ends_at_homebase'] = (routing_upper[-1] == homebase_upper)
+                else:
+                    # Ohne Routing: wenn Vortag overnight war → vermutlich Heimkehr → True
+                    # sonst (Vortag auch zuhause) → konservativ False
+                    dp['ends_at_homebase'] = bool(prev_overnight)
         else:
             dp['ends_at_homebase'] = False
 

@@ -1283,6 +1283,34 @@ def test_v81_layover_does_not_count_as_fahrtag():
         f"3-Tages-Tour sollte 2 Fahrtage haben (An + Heimkehr), ist {result['fahr_tage']}"
 
 
+def test_v81_isolated_heimkehrtag_no_double_fahrtag():
+    """Bugfix v8.1.1: Isolierter Heimkehrtag (Vortag im DP als 'frei' gelesen)
+    darf NICHT als requires_commute=true gewertet werden.
+    Sonst: doppelte Fahrtag-Zählung (commute + Heimkehr-Erkennung)."""
+    from app import _enrich_dp_with_v8_fields
+    # 03.01 BLR-Anreise (overnight=true) — Sonnet hat 04+05 NICHT erkannt (z.B. als frei),
+    # 06.01 als isolierter 'tour' ohne overnight, ohne routing → Heimkehrtag.
+    prev_dp = {'datum': '2025-01-05', 'activity_type': 'frei', 'overnight_after_day': False}
+    dp = {'datum': '2025-01-06', 'activity_type': 'tour', 'overnight_after_day': False}  # kein routing!
+    _enrich_dp_with_v8_fields(dp, prev_dp=prev_dp, next_dp=None, homebase='FRA')
+    # KEIN Anreise (nicht starts_at_homebase) — Tag ist eher Heimkehr
+    assert dp['starts_at_homebase'] is False, \
+        'Tour ohne overnight + Vortag-frei + ohne Routing darf KEIN Anreise-Fahrtag sein'
+    assert dp['requires_commute'] is False
+
+
+def test_v81_tour_anreise_with_overnight_still_counts():
+    """Tour-Anreise mit overnight=true (Hotel auswärts) bleibt commute=true,
+    auch ohne explizites Routing."""
+    from app import _enrich_dp_with_v8_fields
+    prev_dp = {'datum': '2025-01-02', 'activity_type': 'frei', 'overnight_after_day': False}
+    dp = {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+          'has_fl': True, 'layover_ort': 'BLR'}
+    _enrich_dp_with_v8_fields(dp, prev_dp=prev_dp, next_dp=None, homebase='FRA')
+    assert dp['starts_at_homebase'] is True
+    assert dp['requires_commute'] is True
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
