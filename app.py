@@ -2163,11 +2163,14 @@ def _lsb_extract_via_regex(text):
     return out
 
 
-def _lsb_extract_via_claude(text, regex_hints=None, label='lsb-extract'):
+def _lsb_extract_via_claude(text, regex_hints=None, label='lsb-extract', extra_instruction=None):
     """Liefert die numerischen Felder via Claude. Wird IMMER aufgerufen
     (KI ist Source of Truth, Regex nur Cross-Check). Bei Diskrepanz mit
-    regex_hints wird ein Re-Check ausgelöst."""
+    regex_hints wird ein Re-Check ausgelöst.
+    extra_instruction: optionaler zusätzlicher Anweisungsblock (z.B. Diskrepanz-Resolution)."""
     if not ANTHROPIC_KEY or not text:
+        if not ANTHROPIC_KEY:
+            print(f"[LSB-parser/{label}] ANTHROPIC_KEY fehlt → fallback auf Regex-only")
         return {}
     fields = ['brutto','lohnsteuer','soli','kirchensteuer_an','ag_fahrt_z17',
               'ag_fahrt_z18_pauschal','rv_ag','rv_an','kv_an','pv_an','av_an',
@@ -2178,6 +2181,7 @@ def _lsb_extract_via_claude(text, regex_hints=None, label='lsb-extract'):
         if hint_lines:
             hint_block = ('\nRegex-Vorschläge (zur Plausi-Prüfung — können falsch sein):\n'
                           + hint_lines + '\n')
+    extra_block = f'\n{extra_instruction}\n' if extra_instruction else ''
     prompt = (
         "Du bekommst den Text einer deutschen Lohnsteuerbescheinigung. "
         "Lies sorgfältig und extrahiere die Beträge — gib NUR ein JSON-Objekt zurück, kein Erklärtext.\n\n"
@@ -2197,7 +2201,7 @@ def _lsb_extract_via_claude(text, regex_hints=None, label='lsb-extract'):
         '  "verpflegungszuschuss_z20": <stfrei Verpflegung Zeile 20>,\n'
         '  "doppelhaus_z21": <doppelter Haushalt Zeile 21>\n'
         '}\n'
-        + hint_block +
+        + hint_block + extra_block +
         "\nWichtig: deutsche Zahlen (1.234,56 = 1234.56 in JSON). Niemals Felder weglassen.\n\n"
         "PDF-Text:\n" + text[:10000]
     )
@@ -2292,17 +2296,18 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
             # Bei kritischer Diskrepanz: zweiter Claude-Call mit beiden Werten zur finalen Entscheidung
             if disagreement and ANTHROPIC_KEY:
                 print(f"[LSB-parser] kritische Diskrepanz → Re-Check mit beiden Werten")
-                resolution_prompt = (
-                    "Diese Lohnsteuerbescheinigung wurde sowohl per Regex als auch von dir gelesen. "
-                    "Es gibt unterschiedliche Werte. Schau JEDEN dieser Werte nochmal sorgfältig im Text nach "
-                    "und gib das KORREKTE Ergebnis zurück. Achte auf Tausenderpunkte, Kommas, Zeilennummern.\n\n"
-                    "Vergleich:\n" +
-                    '\n'.join(f"  {k}: regex={regex_vals.get(k,0):.2f} EUR, claude={ai_vals.get(k,0):.2f} EUR"
-                              for k in critical_fields) +
-                    "\n\nGib NUR das JSON mit den korrigierten Werten zurück (gleiches Schema wie vorher)."
+                resolution_text = (
+                    "DISKREPANZ-RE-CHECK: Diese LSB wurde 2× gelesen mit unterschiedlichen Ergebnissen. "
+                    "Lies JEDEN dieser Werte nochmal sorgfältig im PDF-Text nach. Achte auf Tausenderpunkte, "
+                    "Kommas, korrekte Zeilen-Zuordnung. Gib das korrekte JSON zurück.\n"
+                    "Vergleich der Quellen:\n" +
+                    '\n'.join(f"  {k}: regex={regex_vals.get(k,0):.2f} vs claude={ai_vals.get(k,0):.2f}"
+                              for k in critical_fields)
                 )
-                final_vals = _lsb_extract_via_claude(text + '\n\n' + resolution_prompt,
-                                                     regex_hints=None, label='lsb-recheck')
+                # Resolution als extra_instruction übergeben (nicht in text einbetten — wäre nach text[:10000] abgeschnitten)
+                final_vals = _lsb_extract_via_claude(text, regex_hints=None,
+                                                     label='lsb-recheck',
+                                                     extra_instruction=resolution_text)
                 if final_vals.get('brutto', 0) > 0:
                     print(f"[LSB-parser] Re-Check OK: brutto={final_vals.get('brutto',0):.2f}")
                     for k, v in final_vals.items():
@@ -3099,14 +3104,32 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
     # ── Reconciliation: KI gewinnt wenn sie mehr/andere Werte hat ──
     regex_z77 = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
     claude_z77 = round(sum(a['steuerfrei'] for a in claude_abrechnungen), 2)
+    # Z73 robust mappen: per Erstellt-Datum (eindeutig), nicht per monat (kann kollidieren)
+    regex_z73_by_erstellt = {a.get('erstellt', ''): a.get('z73_tage', 0) for a in abrechnungen}
     if claude_abrechnungen and (
         len(claude_abrechnungen) > len(abrechnungen) or
         abs(claude_z77 - regex_z77) > 5.0  # mehr als 5€ Diff
     ):
-        # Z73-Tage von Regex erhalten falls vorhanden (KI weiß das nicht)
+        # Z73-Tage von Regex erhalten — primär per Erstellt-Datum (eindeutig),
+        # fallback per Monat (für Claude-Einträge ohne erstellt-Match)
         regex_z73_by_month = {a.get('monat', 0): a.get('z73_tage', 0) for a in abrechnungen}
         for ca in claude_abrechnungen:
-            ca['z73_tage'] = regex_z73_by_month.get(ca.get('monat', 0), 0)
+            erstellt = ca.get('erstellt', '')
+            if erstellt and erstellt in regex_z73_by_erstellt:
+                ca['z73_tage'] = regex_z73_by_erstellt[erstellt]
+            else:
+                ca['z73_tage'] = regex_z73_by_month.get(ca.get('monat', 0), 0)
+        # Fehlende Z73 (kein Match) per Regex auf Gesamt-Text rekonstruieren
+        # (stellt sicher dass Z73 nicht verloren geht wenn Claude komplett neue Abrechnungen findet)
+        if all(ca.get('z73_tage', 0) == 0 for ca in claude_abrechnungen) and abrechnungen:
+            total_z73 = sum(a.get('z73_tage', 0) for a in abrechnungen)
+            if total_z73 > 0 and claude_abrechnungen:
+                # Verteile gleichmäßig auf Claude-Abrechnungen die was haben
+                per_abr = total_z73 // len(claude_abrechnungen)
+                rest = total_z73 % len(claude_abrechnungen)
+                for i, ca in enumerate(claude_abrechnungen):
+                    ca['z73_tage'] = per_abr + (1 if i < rest else 0)
+                print(f"[SE] Z73-Tage ({total_z73}T) auf {len(claude_abrechnungen)} Claude-Abrechnungen verteilt")
         print(f"[SE] KI gewinnt: regex={len(abrechnungen)} abr / Z77={regex_z77:.2f}€ "
               f"vs claude={len(claude_abrechnungen)} abr / Z77={claude_z77:.2f}€")
         abrechnungen = claude_abrechnungen
@@ -3766,13 +3789,11 @@ def parse_einsatzplan_mit_ki(pdf_bytes_list, year=2025):
             print(f"[Einsatzplan] Format nicht erkannt (CAS-Header fehlt und keine Einsatzplan-Marker; SE={is_se}, DP={is_dp})")
             continue
 
-        monate_geparst += 1
-
         # Regex (schnell, deterministisch)
         regex_data = _einsatzplan_extract_via_regex(full_text)
         # Claude (Source of Truth)
         ai_data = _einsatzplan_extract_via_claude(full_text, regex_hint=regex_data,
-                                                   label=f'einsatzplan-{monate_geparst}')
+                                                   label=f'einsatzplan-{monate_geparst+1}')
 
         # Wer gewinnt? Claude wenn er Werte hat, sonst Regex
         if ai_data.get('umlaeufe'):
@@ -3785,6 +3806,14 @@ def parse_einsatzplan_mit_ki(pdf_bytes_list, year=2025):
         monat_str = chosen_data['monat_str']
         ai_count = len(ai_data.get('umlaeufe', []))
         rg_count = len(regex_data.get('umlaeufe', []))
+        umlauf_count = len(chosen_data.get('umlaeufe', []))
+
+        # Nur als geparst zählen wenn wir tatsächlich Daten haben (Umläufe ODER eindeutiger Monat)
+        if umlauf_count == 0 and monat_str == '?':
+            print(f"[Einsatzplan] PDF erkannt aber 0 Umläufe + kein Monat → übersprungen")
+            continue
+        monate_geparst += 1
+
         if ai_count != rg_count:
             print(f"[Einsatzplan/{monat_str}] Umlauf-Diskrepanz: regex={rg_count} claude={ai_count} → {source}")
         else:
@@ -3887,12 +3916,28 @@ def _opus_final_audit(values, texts, year):
                                   [{'type': 'text', 'text': prompt}],
                                   max_retries=2, label='opus-final-audit')
         ai_text = resp.content[0].text.strip()
-        m = re.search(r'\[[\s\S]*\]', ai_text)
-        if not m:
-            print(f"[Opus-Audit] kein JSON-Array gefunden: {ai_text[:300]}")
-            return []
+        # Robuster JSON-Array-Extraktor: balanced bracket counter (statt greedy regex)
         import json as _json
-        issues = _json.loads(m.group(0))
+        issues = None
+        depth = 0; start = -1
+        for i, ch in enumerate(ai_text):
+            if ch == '[':
+                if depth == 0: start = i
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidate = ai_text[start:i+1]
+                    try:
+                        parsed = _json.loads(candidate)
+                        if isinstance(parsed, list):
+                            issues = parsed
+                            break  # erstes valides Top-Level-Array nehmen
+                    except: pass
+                    start = -1
+        if issues is None:
+            print(f"[Opus-Audit] kein parsebares JSON-Array gefunden: {ai_text[:300]}")
+            return []
         print(f"[Opus-Audit] {len(issues)} Issue(s) gefunden")
         for issue in issues:
             print(f"  [{issue.get('severity','?')}] {issue.get('feld','?')}: "
@@ -4701,7 +4746,19 @@ def berechne(form, files):
     vma_summe = vma_72 + vma_73 + vma_74 + vma_aus
     se_unklar_count = len((se_data or {}).get('unklare_zeilen', []) or [])
     # Tolerance: 1% wenn SE clean, 5% wenn unklare Zeilen, min 30€
-    tolerance = max(30, z77 * (0.05 if se_unklar_count > 5 else 0.01))
+    # Tolerance erhöht bei Auslandstouren (Z76 > 0): bei vielen Auslandsdestinationen
+    # können BMF-Pauschalen und LH-stfrei systematisch differieren (nicht-1:1-Mapping).
+    # Defaults: 1% wenn SE clean ohne Ausland, 5% wenn unklare Zeilen, 10% bei Auslandstouren.
+    has_ausland = vma_aus > 0
+    if has_ausland and se_unklar_count > 5:
+        tol_pct = 0.10
+    elif has_ausland:
+        tol_pct = 0.05  # statt 0.01 — Ausland erlaubt mehr Drift
+    elif se_unklar_count > 5:
+        tol_pct = 0.05
+    else:
+        tol_pct = 0.01
+    tolerance = max(30, z77 * tol_pct)
     if z77 > 0 and abs(vma_summe - z77) > tolerance:
         plausi_warns.append(f'VMA-Summe ({vma_summe:.2f}€) weicht von Z77 ({z77:.2f}€) um {abs(vma_summe-z77):.2f}€ ab — bitte prüfen.')
     # Hotel ≤ Arbeitstage (logisch: jede Hotelnacht ist auch ein Arbeitstag)
@@ -4930,6 +4987,10 @@ def berechne(form, files):
             fahr = round(min(km, 20) * fahr_tage * 0.30 + max(0, km - 20) * fahr_tage * 0.38, 2)
         # vma_in neu (Inland-Anteile könnten korrigiert sein)
         vma_in = round(vma_72 + vma_73 + vma_74, 2)
+        # Wenn z77 korrigiert wurde: spesen_gesamt/spesen_steuer angleichen damit PDF-Math stimmt
+        # (spesen_gesamt = z77 + spesen_steuer; bei z77-Korrektur halten wir spesen_steuer fix)
+        if any(c.startswith('z77:') for c in auto_corrections):
+            spesen_gesamt = round(z77 + spesen_steuer, 2)
         gesamt = round(fahr + reinig + trink + vma_in + vma_aus + opt_zu_gesamt, 2)
         netto = round(gesamt - ag_z17 - z77, 2)
         print(f"[Opus-Audit] Auto-Korrekturen: {auto_corrections}; "
