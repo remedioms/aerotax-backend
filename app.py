@@ -2226,8 +2226,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '3.0',
-        'build':   'tour-aware-se-classification-2026-05-09',
+        'version': '3.1',
+        'build':   'tour-aware-via-ki-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -3318,6 +3318,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
     # Auch wenn keine Abrechnungen via Regex gefunden wurden, fragt Claude
     # (Format-Änderungen werden so abgefangen).
     claude_abrechnungen = []
+    claude_tage_klass = None  # Tour-aware Tag-Klassifikation von Claude (Source of Truth)
     if ANTHROPIC_KEY:
         try:
             all_text = ''
@@ -3334,24 +3335,49 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                         for a in abrechnungen)
                     hint_block = f"\nRegex hat folgende Abrechnungen gefunden (kann unvollständig/falsch sein):\n{hint_lines}\n"
                 prompt = (
-                    "Du liest Lufthansa Streckeneinsatz-Abrechnungen. Pro Seite gibt es eine 'Summe:'-Zeile "
-                    "mit drei Beträgen: 'Gesamt steuerpflichtig steuerfrei' oder 'Gesamt steuer' (2-spaltig). "
+                    "Du liest Lufthansa Streckeneinsatz-Abrechnungen — als Steuerberater. "
+                    "Du klassifizierst die Tage steuerlich richtig nach §9 EStG.\n\n"
+                    "Pro Seite gibt es eine 'Summe:'-Zeile (Gesamt/Steuer/Stfrei). "
                     "Z77 = stfrei-Anteil = Gesamt - letzter_Wert.\n\n"
-                    "Extrahiere ALLE Abrechnungen aus dem Text als JSON. Gib NUR JSON zurück, kein Erklärtext.\n\n"
+                    "WICHTIG — TOUR-AWARE-KLASSIFIKATION DER EINZELNEN TAGE:\n"
+                    "Bei einer Auslandstour schreibt LH den Anreise-Tag oft mit FRA als stfrei-Ort\n"
+                    "(z.B. 14,00 € FRA für die Stunden bis Boarding). Steuerlich gehört dieser Tag\n"
+                    "aber zur AUSLANDSREISE → wird Z76 (mit BMF-Auslands-Anreise-Pauschale für das Ziel),\n"
+                    "NICHT Z73 (Inland-Anreise).\n\n"
+                    "Regel: ein Tag mit stfrei-Ort=Inland (FRA/MUC/HAM/...) ist nur dann Z73 wenn\n"
+                    "- am Vor-/Folgetag KEIN Auslands-Eintrag steht (also echte Inland-Tour mit Inland-Hotel)\n"
+                    "Ist der Vor-/Folgetag Ausland → der Inlandstag gehört zur Auslandstour → Z76.\n\n"
+                    "Extrahiere ALLE Abrechnungen + EINE TAGES-ZUSAMMENFASSUNG. Gib NUR JSON zurück, kein Erklärtext.\n\n"
                     "Format:\n"
                     '{\n'
                     '  "abrechnungen": [\n'
                     '    {"erstellt": "DD.MM.YYYY", "monat": <1-12>, "gesamt": <EUR>, "steuerfrei": <EUR>, "steuerpflichtig": <EUR>}\n'
                     '  ],\n'
-                    '  "flugmonate": [<int>, ...]\n'
+                    '  "flugmonate": [<int>, ...],\n'
+                    '  "tage_klassifiziert": {\n'
+                    '    "z72_tage": <Anzahl Tagestrips Inland >8h>,\n'
+                    '    "z72_eur":  <Σ Pauschalen für Z72>,\n'
+                    '    "z73_tage": <Anzahl ECHTE Inland-An-/Abreisetage (Inland-Tour mit Inland-Hotel)>,\n'
+                    '    "z73_eur":  <Σ Pauschalen für Z73>,\n'
+                    '    "z74_tage": <Anzahl 24h Inland>,\n'
+                    '    "z74_eur":  <Σ Pauschalen für Z74>,\n'
+                    '    "z76_eur":  <Σ Auslands-Pauschalen INKL. der Auslandstour-Anreise/Abreise-Tage mit Inland-stfrei-Ort>\n'
+                    '  }\n'
                     '}\n\n'
                     "Regeln:\n"
-                    "- 'erstellt' = Erstellt-Datum der Abrechnung (DD.MM.YYYY)\n"
-                    "- 'monat' = Monat der Erstellung (1-12)\n"
-                    "- 'gesamt' = erste Zahl in der Summe-Zeile\n"
-                    "- 'steuerpflichtig' = mittlere oder letzte Zahl\n"
-                    "- 'steuerfrei' = letzter Spaltenwert (Z77-Anteil)\n"
-                    "- 'flugmonate' = alle Monate (1-12) in denen Flüge stattfanden (DD.MM.YYYY-Zeilen prüfen)\n"
+                    "- 'erstellt' = Erstellt-Datum (DD.MM.YYYY)\n"
+                    "- 'monat' = Monat der Erstellung\n"
+                    "- 'gesamt' = erste Zahl der Summe-Zeile\n"
+                    "- 'steuerfrei' = letzte Zahl der Summe-Zeile (Z77)\n"
+                    "- 'flugmonate' = alle Monate mit Flügen (1-12)\n"
+                    "- 'tage_klassifiziert' = TOUR-AWARE Klassifikation aller Tage:\n"
+                    "  → Z72: Tag mit AB+AN gleicher Tag, stfrei-Ort=Inland, KEIN Übernachtungs-Kontext\n"
+                    "  → Z73: Inland-Anreise/Abreise NUR wenn Tour insgesamt im Inland (z.B. Schulung in MUC mit Hotel)\n"
+                    "  → Z74: Inland 24h ohne Ab/An-Zeiten, zwf=12 (selten)\n"
+                    "  → Z76: ALLE Auslandstage INKL. Inland-Anreise/Abreise-Tage einer Auslandstour\n"
+                    "        (use BMF-Anreise-Pauschale des Ausland-Ziels für die Inland-Anteile)\n"
+                    "- BMF-Auslands-Anreise-Pauschalen: 80% des 24h-Satzes für das Land. "
+                    "  Bei stfrei-Wert in der Zeile: nimm den, sonst BMF-Tabelle.\n"
                     "- Deutsche Zahlen (1.234,56 → 1234.56 in JSON)\n"
                     + hint_block +
                     "\nSE-Text:\n" + all_text[:50000]
@@ -3384,10 +3410,35 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                             if 1 <= mi <= 12:
                                 flugmonate.add(mi)
                         except: pass
+                    # Tour-aware Tag-Klassifikation von Claude (KI-Source-of-Truth)
+                    tk = data.get('tage_klassifiziert') or {}
+                    if tk:
+                        try:
+                            claude_tage_klass = {
+                                'z72_tage': int(tk.get('z72_tage', 0) or 0),
+                                'z72_eur':  float(tk.get('z72_eur', 0) or 0),
+                                'z73_tage': int(tk.get('z73_tage', 0) or 0),
+                                'z73_eur':  float(tk.get('z73_eur', 0) or 0),
+                                'z74_tage': int(tk.get('z74_tage', 0) or 0),
+                                'z74_eur':  float(tk.get('z74_eur', 0) or 0),
+                                'z76_eur':  float(tk.get('z76_eur', 0) or 0),
+                            }
+                            print(f"[SE-claude] Tour-aware: Z72={claude_tage_klass['z72_tage']}T/{claude_tage_klass['z72_eur']:.2f}€  "
+                                  f"Z73={claude_tage_klass['z73_tage']}T/{claude_tage_klass['z73_eur']:.2f}€  "
+                                  f"Z74={claude_tage_klass['z74_tage']}T/{claude_tage_klass['z74_eur']:.2f}€  "
+                                  f"Z76={claude_tage_klass['z76_eur']:.2f}€")
+                        except Exception as _te:
+                            print(f"[SE-claude] tage_klassifiziert parse fail: {_te}")
+                            claude_tage_klass = None
+                    else:
+                        claude_tage_klass = None
                     print(f"[SE-claude] {len(claude_abrechnungen)} Abrechnungen, "
                           f"Z77-Total={sum(a['steuerfrei'] for a in claude_abrechnungen):.2f}€")
         except Exception as e:
             print(f"[SE-claude] verification fail: {e}")
+            claude_tage_klass = None
+    else:
+        claude_tage_klass = None
 
     # ── Reconciliation: KI gewinnt wenn sie mehr/andere Werte hat ──
     regex_z77 = round(sum(a['steuerfrei'] for a in abrechnungen), 2)
@@ -3448,17 +3499,47 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
         se_det.setdefault('hotelnaechte', 0)
     print(f"SE deterministisch: Z77={z77_total:.2f}€  Z72={se_det['z72_tage']}T/{se_det['z72_eur']}€  Z73={se_det['z73_tage']}T/{se_det['z73_eur']}€  Z74={se_det['z74_tage']}T/{se_det['z74_eur']}€  Z76={se_det['z76_eur']}€  arbeitstage={se_det.get('arbeitstage',0)} hotel={se_det.get('hotelnaechte',0)} fahr={se_det.get('fahrtage',0)} unklar={len(se_det['unklare_zeilen'])} Zeilen")
 
+    # ── KI-vs-Code-Reconciliation für Tag-Klassifikation ──
+    # Wenn Claude tour-aware Klassifikation geliefert hat: vergleiche mit Code-Werten
+    # und nehme die KI-Werte wenn sie deutlich höher sind in Z76 (= Tour-Awareness wirkt).
+    # KI ist Source of Truth bei Format-Änderungen die Code-Path nicht versteht.
+    final_z72_tage = se_det['z72_tage']
+    final_z72_eur  = se_det['z72_eur']
+    final_z73_tage = se_det['z73_tage']
+    final_z73_eur  = se_det['z73_eur']
+    final_z74_tage = se_det['z74_tage']
+    final_z74_eur  = se_det['z74_eur']
+    final_z76_eur  = se_det['z76_eur']
+    if claude_tage_klass:
+        ck = claude_tage_klass
+        # Plausi: Σ aller Z* sollte ≈ Z77 sein (LH-stfrei-Total)
+        ki_sum = ck.get('z72_eur',0) + ck.get('z73_eur',0) + ck.get('z74_eur',0) + ck.get('z76_eur',0)
+        code_sum = se_det['z72_eur'] + se_det['z73_eur'] + se_det['z74_eur'] + se_det['z76_eur']
+        # KI gewinnt wenn: KI's Z76 deutlich höher (Tour-Awareness wirkt) UND KI-Total plausibel
+        z76_diff = ck.get('z76_eur', 0) - se_det['z76_eur']
+        if z76_diff > 100 and ki_sum >= z77_total * 0.85:
+            final_z72_tage = ck.get('z72_tage', se_det['z72_tage'])
+            final_z72_eur  = round(ck.get('z72_eur',  se_det['z72_eur']), 2)
+            final_z73_tage = ck.get('z73_tage', se_det['z73_tage'])
+            final_z73_eur  = round(ck.get('z73_eur',  se_det['z73_eur']), 2)
+            final_z74_tage = ck.get('z74_tage', se_det['z74_tage'])
+            final_z74_eur  = round(ck.get('z74_eur',  se_det['z74_eur']), 2)
+            final_z76_eur  = round(ck.get('z76_eur',  se_det['z76_eur']), 2)
+            print(f"[SE-reconcile] KI gewinnt (Tour-Aware): Code-Z76={se_det['z76_eur']:.2f}€ → KI-Z76={final_z76_eur:.2f}€ (+{z76_diff:.2f}€)")
+        else:
+            print(f"[SE-reconcile] Code gewinnt (KI keine deutliche Verbesserung: Z76 +{z76_diff:.2f}€)")
+
     return {
         'abrechnungen':          abrechnungen,
         'flugmonate':            sorted(flugmonate),  # echte Monate mit Flügen (1-12)
         'summe_gesamt':          round(sum(a['gesamt'] for a in abrechnungen), 2),
         'summe_steuerfrei':      z77_total,
         'summe_steuerpflichtig': round(sum(a['steuerpflichtig'] for a in abrechnungen), 2),
-        # Deterministisch ermittelt (literal aus SE) — primärer Wert
-        'z72_tage': se_det['z72_tage'], 'z72_eur': se_det['z72_eur'],
-        'z73_tage': se_det['z73_tage'], 'z73_eur': se_det['z73_eur'],
-        'z74_tage': se_det['z74_tage'], 'z74_eur': se_det['z74_eur'],
-        'z76_eur':  se_det['z76_eur'],
+        # Final-Werte: Code-deterministisch ODER KI-Override bei Tour-Awareness
+        'z72_tage': final_z72_tage, 'z72_eur': final_z72_eur,
+        'z73_tage': final_z73_tage, 'z73_eur': final_z73_eur,
+        'z74_tage': final_z74_tage, 'z74_eur': final_z74_eur,
+        'z76_eur':  final_z76_eur,
         # SE-direkte Counts (überlebt jetzt ohne Flugstundenübersicht)
         'arbeitstage_se':  se_det.get('arbeitstage', 0),
         'fahrtage_se':     se_det.get('fahrtage', 0),
