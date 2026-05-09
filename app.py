@@ -3947,20 +3947,16 @@ def berechne(form, files):
                         f'flugfreie Monate ({", ".join(flugfrei_strs)}) laut Einsatzplan benötigen keine Abrechnung.'
                     )
             else:
-                # Kein Einsatzplan → trotzdem die echten Flugmonate aus SE-Daten ablesen
+                # Kein Einsatzplan → einfach neutral hinweisen welche Monate keine Flüge zeigen
+                # (kann Teilzeit/Urlaub sein oder fehlende Abrechnung — nicht entscheidbar)
                 if 0 < len(se_flugmonate) < 12:
-                    abr_list = se_data.get('abrechnungen', [])
-                    avg_steuerfrei = sum(a.get('steuerfrei', 0) for a in abr_list) / max(1, len(abr_list))
-                    erfasst_str = ', '.join(month_names[m-1] for m in sorted(se_flugmonate))
                     fehlend = [m for m in range(1,13) if m not in se_flugmonate]
                     fehlend_str = ', '.join(month_names[m-1] for m in fehlend)
-                    est_missing = round(avg_steuerfrei * len(fehlend), 2)
                     notes.append(
-                        f'⚠️ Streckeneinsatz: nur {len(se_flugmonate)}/12 Monate mit Flügen erfasst '
-                        f'(erfasst: {erfasst_str}; fehlend: {fehlend_str}). '
-                        f'Falls Teilzeit/Urlaub: ok — sonst geschätzter Verlust ~{est_missing:.0f}€ steuerfreie Spesen. '
-                        f'Tipp: lade fehlende Monate nach via "Mit Code anpassen" oder lade den Einsatzplan hoch '
-                        f'damit wir flugfreie Monate automatisch erkennen.'
+                        f'ℹ Streckeneinsatz: in {fehlend_str} wurde kein Flug erkannt. '
+                        f'Falls Teilzeit/Urlaub/Frei: alles gut. Falls eine Abrechnung fehlt: '
+                        f'lade sie nach via "Mit Code anpassen" oder lade den Einsatzplan hoch — '
+                        f'dann erkennen wir flugfreie Monate automatisch.'
                     )
     else:
         missing.append('Streckeneinsatz-Abrechnungen (nicht hochgeladen)')
