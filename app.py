@@ -3765,6 +3765,100 @@ def parse_einsatzplan_mit_ki(pdf_bytes_list, year=2025):
     }
 
 
+def _opus_final_audit(values, texts, year):
+    """
+    Opus 4.7 Senior-Steuerberater-Review aller berechneten Werte.
+    Bekommt: alle Schlüsselwerte + die Original-PDF-Texte.
+    Liefert: Liste von Korrektur-Vorschlägen oder leere Liste wenn alles plausibel.
+
+    Format der Korrekturen: [{'feld': 'z77', 'aktuell': 1234.56, 'korrekt': 1300.00,
+                              'grund': '...', 'severity': 'critical|minor'}]
+    """
+    if not ANTHROPIC_KEY:
+        return []
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        # Werte-Zusammenfassung
+        v = values
+        summary = (
+            f"=== AKTUELLE BERECHNUNG (Steuerjahr {year}) ===\n"
+            f"Lohnsteuerbescheinigung:\n"
+            f"  Brutto:               {v.get('brutto', 0):.2f} €\n"
+            f"  Lohnsteuer:           {v.get('lohnsteuer', 0):.2f} €\n"
+            f"  Z17 AG-Fahrt:         {v.get('ag_fahrt_z17', 0):.2f} €\n"
+            f"  Z20 Verpflegung:      {v.get('verpflegungszuschuss_z20', 0):.2f} €\n"
+            f"\nStreckeneinsatz:\n"
+            f"  Z77 stfrei gesamt:    {v.get('z77', 0):.2f} €\n"
+            f"  Z76 VMA Ausland:      {v.get('vma_aus', 0):.2f} €\n"
+            f"  Z72 Tagestrips:       {v.get('vma_72_tage', 0)} Tage / {v.get('vma_72', 0):.2f} €\n"
+            f"  Z73 An-/Abreise:      {v.get('vma_73_tage', 0)} Tage / {v.get('vma_73', 0):.2f} €\n"
+            f"  Z74 24h Inland:       {v.get('vma_74_tage', 0)} Tage / {v.get('vma_74', 0):.2f} €\n"
+            f"\nFlugstunden:\n"
+            f"  Arbeitstage:          {v.get('arbeitstage', 0)}\n"
+            f"  Fahrtage:             {v.get('fahr_tage', 0)}\n"
+            f"  Hotelnächte:          {v.get('hotel_naechte', 0)}\n"
+            f"  Fahrtkosten:          {v.get('fahr', 0):.2f} €\n"
+            f"\nResultat:\n"
+            f"  Reinigung+Trinkgeld:  {v.get('reinig', 0):.2f} + {v.get('trink', 0):.2f} €\n"
+            f"  Werbungskosten gesamt:{v.get('gesamt', 0):.2f} €\n"
+            f"  ./. Z17 AG-Fahrt:     {v.get('ag_fahrt_z17', 0):.2f} €\n"
+            f"  ./. Z77 stfrei:       {v.get('z77', 0):.2f} €\n"
+            f"  = Netto-Werbungskosten:{v.get('netto', 0):.2f} €\n"
+        )
+        # Original-Texte (gekürzt)
+        lsb_text = (texts.get('lsb_text') or '')[:5000]
+        se_text  = (texts.get('se_text')  or '')[:15000]
+        dp_text  = (texts.get('dp_text')  or '')[:8000]
+
+        prompt = (
+            "Du bist Senior-Steuerberater für Lufthansa-Kabinenpersonal mit jahrzehntelanger Erfahrung. "
+            "Ein Junior-Berater hat die Auswertung gemacht. Deine Aufgabe: Plausi-Check über ALLE Werte zusammen — "
+            "Math-Check + interne Konsistenz + Cross-Document-Validation.\n\n"
+            "Prüfe insbesondere:\n"
+            "1. Math: Brutto - Z17 - Z77 - andere Abzüge → ergibt das den Netto-Wert?\n"
+            "2. Konsistenz Z77 (LSB nicht direkt gelistet, kommt aus SE) — passt zur Summe der SE-stfrei-Werte?\n"
+            "3. Konsistenz Z20 (Verpflegung LSB) ≈ Z77 (stfrei aus SE)? Beide repräsentieren steuerfreie Verpflegung.\n"
+            "4. Realistisch: Vollzeit-Kabine ~120-150 Arbeitstage, ~50-65 Fahrtage, ~40-65 Hotelnächte. "
+            "   Werte deutlich außerhalb → entweder Teilzeit (OK) oder Fehler.\n"
+            "5. VMA-Anteile: Z72+Z73+Z74 sollten ≈ Z77 ergeben (alle stfrei Inland).\n"
+            "6. Hotelnächte ≤ Arbeitstage (logisch).\n"
+            "7. Fahrtage ≤ Arbeitstage.\n\n"
+            f"{summary}\n\n"
+            "=== ORIGINAL-DOKUMENTE (gekürzt) ===\n"
+            f"[LSB]\n{lsb_text}\n\n[SE]\n{se_text}\n\n[FLUGSTUNDEN]\n{dp_text}\n\n"
+            "Antworte als JSON-Array. Wenn alles plausibel: []. Wenn Issues:\n"
+            '[\n'
+            '  {"feld": "z77", "aktuell": 1234.56, "korrekt": 1300.00, "grund": "...", "severity": "critical"},\n'
+            '  {"feld": "arbeitstage", "aktuell": 200, "korrekt": null, "grund": "Sehr hoch — Teilzeit oder zwei Jobs?", "severity": "minor"}\n'
+            ']\n\n'
+            "Regeln:\n"
+            "- 'feld': z77, z76, vma_72, vma_73, vma_74, brutto, lohnsteuer, ag_fahrt_z17, "
+            "         arbeitstage, fahr_tage, hotel_naechte, gesamt, netto\n"
+            "- 'korrekt': der NEUE Wert wenn du sicher bist; null wenn du nur warnen willst\n"
+            "- 'severity': 'critical' = klar falsch, 'minor' = ungewöhnlich aber möglich\n"
+            "- KEINE Erklärungstexte außerhalb des JSON-Arrays.\n"
+        )
+        resp = _claude_with_retry(client, 'claude-opus-4-7', 4000,
+                                  [{'type': 'text', 'text': prompt}],
+                                  max_retries=2, label='opus-final-audit')
+        ai_text = resp.content[0].text.strip()
+        m = re.search(r'\[[\s\S]*\]', ai_text)
+        if not m:
+            print(f"[Opus-Audit] kein JSON-Array gefunden: {ai_text[:300]}")
+            return []
+        import json as _json
+        issues = _json.loads(m.group(0))
+        print(f"[Opus-Audit] {len(issues)} Issue(s) gefunden")
+        for issue in issues:
+            print(f"  [{issue.get('severity','?')}] {issue.get('feld','?')}: "
+                  f"{issue.get('aktuell','?')} → {issue.get('korrekt','-')} "
+                  f"({issue.get('grund','')[:120]})")
+        return issues
+    except Exception as e:
+        print(f"[Opus-Audit] fail: {e}")
+        return []
+
+
 def parse_optionale_belege(files):
     """
     Liest optionale Belege mit Claude Vision KI.
@@ -4684,6 +4778,74 @@ def berechne(form, files):
     else: not_uploaded.append("Streckeneinsatz-Abrechnungen")
 
     # optionale_belege bereits vor Pauschalen-Logik geparst
+
+    # ── OPUS-FINAL-AUDIT: Senior-Steuerberater Cross-Check aller Werte ──
+    audit_input = {
+        'brutto': brutto, 'lohnsteuer': lohnsteuer, 'ag_fahrt_z17': ag_z17,
+        'verpflegungszuschuss_z20': verpfl_z20,
+        'z77': z77, 'vma_aus': vma_aus,
+        'vma_72_tage': vma_72_tage, 'vma_72': vma_72,
+        'vma_73_tage': vma_73_tage, 'vma_73': vma_73,
+        'vma_74_tage': vma_74_tage, 'vma_74': vma_74,
+        'arbeitstage': arbeitstage, 'fahr_tage': fahr_tage,
+        'hotel_naechte': hotel_naechte, 'fahr': fahr,
+        'reinig': reinig, 'trink': trink,
+        'gesamt': gesamt, 'netto': netto,
+    }
+    try:
+        opus_issues = _opus_final_audit(audit_input, available_texts, int(form.get('year', 2025)))
+    except Exception as _ae:
+        print(f"[Opus-Audit] crash: {_ae}")
+        opus_issues = []
+
+    # Critical Issues mit konkreter Korrektur → automatisch übernehmen + Note
+    # Minor Issues / unsichere Korrekturen → nur als Warnung anzeigen
+    auto_corrections = []
+    for issue in opus_issues:
+        feld = issue.get('feld', '')
+        aktuell = issue.get('aktuell')
+        korrekt = issue.get('korrekt')
+        grund = issue.get('grund', '')
+        sev = issue.get('severity', 'minor')
+
+        if korrekt is None:
+            # Nur Warnung
+            notes.append(f'⚠ Senior-Audit ({feld}): {grund}')
+            continue
+
+        # Auto-Korrektur nur wenn Diff < 15% oder beide Werte ähnlicher Größenordnung
+        try:
+            cur_v = float(aktuell or 0)
+            new_v = float(korrekt)
+            diff_pct = abs(new_v - cur_v) / max(abs(cur_v), 1.0)
+            if sev == 'critical' and diff_pct < 0.15 and abs(new_v - cur_v) >= 1.0:
+                # Korrektur anwenden
+                if feld == 'z77' and abs(new_v - z77) > 1:
+                    z77 = new_v
+                elif feld == 'vma_aus' and abs(new_v - vma_aus) > 1:
+                    vma_aus = new_v
+                elif feld == 'arbeitstage' and abs(new_v - arbeitstage) >= 1:
+                    arbeitstage = int(new_v)
+                elif feld == 'fahr_tage' and abs(new_v - fahr_tage) >= 1:
+                    fahr_tage = int(new_v)
+                elif feld == 'hotel_naechte' and abs(new_v - hotel_naechte) >= 1:
+                    hotel_naechte = int(new_v)
+                elif feld == 'brutto' and abs(new_v - brutto) > 1:
+                    brutto = new_v
+                else:
+                    notes.append(f'⚠ Senior-Audit ({feld}): {aktuell} → {korrekt}? Grund: {grund}')
+                    continue
+                auto_corrections.append(f'{feld}: {cur_v:.2f} → {new_v:.2f}')
+                notes.append(f'↻ Senior-Korrektur ({feld}): {cur_v:.2f} → {new_v:.2f} — {grund}')
+            else:
+                notes.append(f'⚠ Senior-Audit ({feld}): aktuell {aktuell}, möglicherweise korrekt {korrekt} — {grund}')
+        except Exception:
+            notes.append(f'⚠ Senior-Audit ({feld}): {grund}')
+
+    # Bei Auto-Korrekturen Netto neu berechnen
+    if auto_corrections:
+        netto = round(gesamt - ag_z17 - z77, 2)
+        print(f"[Opus-Audit] Auto-Korrekturen: {auto_corrections}; netto neu={netto:.2f}")
 
     return {
         'name':             form.get('name', 'Flugbegleiter'),
