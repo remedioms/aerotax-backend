@@ -2226,8 +2226,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '2.8',
-        'build':   'topf-getrennte-netto-2026-05-09',
+        'version': '2.9',
+        'build':   'vma-bmf-pauschale-revert-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -4949,16 +4949,12 @@ def berechne(form, files):
     reinig_satz = REINIGUNG_PRO_TAG_BY_YEAR.get(year_int, 1.60)
     trink_satz  = TRINKGELD_PRO_NACHT_BY_YEAR.get(year_int, 3.60)
 
-    # VMA-Werte mit jahr-korrekten Sätzen — NUR wenn keine SE-deterministischen Werte vorhanden.
-    # Bei sauberer SE-Auswertung wurden vma_72/73/74 oben (Z. ~4843-4846) bereits aus den
-    # literal-stfrei-Werten der LH-Abrechnung gesetzt. Diese sind authoritativ und dürfen
-    # NICHT mit der BMF-Pauschale × Tage überschrieben werden — LH zahlt manchmal abweichend.
-    if not (se_data and se_unklar == 0 and vma_72 > 0):
-        vma_72 = vma_72_tage * bmf_inland['tagestrip_8h']
-    if not (se_data and se_unklar == 0 and vma_73 > 0):
-        vma_73 = vma_73_tage * bmf_inland['an_abreise']
-    if not (se_data and se_unklar == 0 and vma_74 > 0):
-        vma_74 = vma_74_tage * bmf_inland['voll_24h']
+    # VMA = Werbungskosten-Anspruch nach §9 EStG = BMF-Pauschale × Tage.
+    # IMMER mit jahr-konformen BMF-Sätzen rechnen — egal was LH stfrei gezahlt hat.
+    # Die LH-stfrei-Auszahlung ist Z77, wird separat als Abzug behandelt (§3 Nr. 16 EStG).
+    vma_72 = vma_72_tage * bmf_inland['tagestrip_8h']
+    vma_73 = vma_73_tage * bmf_inland['an_abreise']
+    vma_74 = vma_74_tage * bmf_inland['voll_24h']
     vma_in = vma_72 + vma_73 + vma_74
 
     # ── FAHRTKOSTEN ───────────────────────────────────────────
