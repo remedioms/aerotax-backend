@@ -23,6 +23,7 @@ OUT = os.path.expanduser('~/Desktop/AeroTax_Bundle.txt')
 # (label, abs_path, language_hint)
 FILES = [
     ('FILES.md',                 f'{REPO}/FILES.md',                  'markdown'),
+    ('RECHENWEG.md',             f'{REPO}/RECHENWEG.md',              'markdown'),
     ('CLAUDE.md',                f'{REPO}/CLAUDE.md',                 'markdown'),
     ('referenz_faelle.txt',      f'{REPO}/referenz_faelle.txt',       'text'),
     ('requirements.txt',         f'{REPO}/requirements.txt',          'text'),
