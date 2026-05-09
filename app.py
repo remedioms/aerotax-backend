@@ -2240,8 +2240,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '3.3',
-        'build':   'restart-recovery-async-port-fix-2026-05-09',
+        'version': '3.4',
+        'build':   'briefing-zeiten-zurueck-im-prompt-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -3776,6 +3776,15 @@ HOMEBASE des Mandanten: **{homebase}**
 **EASA-FTL Layover-Regel (für Hotel-Nacht-Erkennung):**
 FL-Marker bei LH = echter Layover mit ≥10h Bodenzeit = 1 Hotelnacht.
 Bei mehrtägiger Auslandstour: jeder FL-Tag UND jeder Tag zwischen A und E im Ausland = Hotelnacht.
+
+**Briefingzeiten LH-Kabine (für Abwesenheits-Berechnung Z72-Tagestrip 8h-Schwelle):**
+- Wenn die Briefingzeit explizit im Dienstplan/Einsatzplan steht → diese benutzen (z.B. "Briefingzeit(LT FRA): 03/02/25 20:10")
+- Wenn nicht ablesbar, dann Faustregel:
+  → Kurzstrecke (Block ≤ 4h):  **85 Min** Briefing vor STD (= 1:25 h)
+  → Langstrecke (Block > 4h):  **110 Min** Briefing vor STD (= 1:50 h)
+- Plus 30 Min Sign-Off (Nacharbeitung) nach Block-In, einheitlich für alle Tour-Typen
+- Plus Anfahrt (User-spezifisch, ggf. aus km abgeleitet: km × 1,5 min)
+- Tagestrip qualifiziert für Z72 wenn: anfahrt + briefing + block + 30 + anfahrt ≥ 480 min (8h)
 
 ═══ ZÄHL-METHODE — sei DUMM und gründlich ═══
 
