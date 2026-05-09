@@ -22,6 +22,15 @@ Pipeline: `_sonnet_read_lsb_v2` → `_sonnet_read_se_structured` → `_sonnet_re
 - Hard-Fails: hotel_naechte > arbeitstage; arbeitstage > 230.
 - Reader-/Engine-Versionen im Audit (`READER_VERSIONS`, `ENGINE_VERSION`, `PROMPT_VERSION`).
 - Counter aus `tage_detail.klass` aggregiert — kein inkrementelles Hochzählen im Loop.
+- Fahrtage = `Σ dp.requires_commute`. Heimkehr/Layover/Tourfortsetzung zählen NICHT.
+- ZeroDay zählt nur als Arbeitstag wenn `dienstlich=True` (Same-Day < 8h, isolierter Tour-Tag).
+- Hotel-Nächte: nur Z73/Z74/Z76 mit overnight=True UND Layover-Ort ≠ Homebase.
+
+### EASA/FTL — nur Lesehilfe
+AeroTAX verwendet EASA-/FTL-Begriffe nur als Lesehilfe für Dienstplan-Marker. AeroTAX prüft keine Flugdienstzeit-Compliance.
+
+### Homebase-Logik
+Homebase = der Flughafen, dem das Crewmitglied dienstlich zugeordnet ist. **Nicht** der nächstgelegene oder Wohnort-Flughafen. FRA wird **nicht** hardcoded — alle `starts_at_homebase`/`ends_at_homebase`/Hotel-Vergleiche prüfen gegen die im Formular gewählte Homebase. FRA bei MUC/BER/DUS-Base ist ein normaler Routing-Flughafen, kein Homebase-Indikator.
 
 ## Autonomie-Modus
 

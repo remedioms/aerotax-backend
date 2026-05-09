@@ -1519,6 +1519,109 @@ def test_v83_dienstlich_flag_in_tage_detail():
         assert 'dienstlich' in t, f"tage_detail-Eintrag ohne dienstlich-Flag: {t['datum']}"
 
 
+# ── v8.4 Tests: Marker-Lexikon + Homebase entriegelt ──
+
+def test_v84_dp_prompt_has_marker_lexikon():
+    """DP-Reader-Prompt enthält Marker-Lexikon mit SB/RB/RE/EM/EH/TK/D4/FL/LM."""
+    import inspect
+    from app import _sonnet_read_dp_structured
+    src = inspect.getsource(_sonnet_read_dp_structured)
+    # Lexikon-Marker sind im Prompt verlinkt
+    for marker in ('SB', 'RB', 'RE', 'EM', 'EH', 'TK', 'D4', 'FL',
+                   'LM NACHGEWAEHRUNG', 'Proceeding', 'Positioning', 'Deadhead'):
+        assert marker in src, f"Marker '{marker}' fehlt im DP-Reader-Prompt"
+
+
+def test_v84_dp_prompt_says_no_easa_legality():
+    """DP-Reader-Prompt sagt explizit: keine EASA-Legalitätsprüfung."""
+    import inspect
+    from app import _sonnet_read_dp_structured
+    src = inspect.getsource(_sonnet_read_dp_structured)
+    assert 'EASA' in src and 'KEINE' in src
+
+
+def test_v84_homebase_muc_not_fra():
+    """Homebase MUC: starts_at_homebase prüft MUC, nicht FRA."""
+    from app import _enrich_dp_with_v8_fields
+    # MUC-Crew, Tour-Anreise FRA→XYZ — FRA ist Routing-Stop, NICHT Homebase
+    dp = {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': True,
+          'has_fl': True, 'routing': ['FRA', 'JFK'], 'layover_ort': 'JFK'}
+    _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='MUC')
+    # Routing[0]=FRA != MUC → starts_at_homebase=False (kein Fahrtag von zuhause)
+    assert dp['starts_at_homebase'] is False, \
+        f"MUC-Crew: FRA als Routing-Start ist NICHT Homebase, aber starts_at_homebase={dp['starts_at_homebase']}"
+    assert dp['requires_commute'] is False
+
+
+def test_v84_homebase_muc_muc_routing_counts():
+    """Homebase MUC: Tour MUC→JFK zählt als Anreise (starts_at_homebase=true)."""
+    from app import _enrich_dp_with_v8_fields
+    dp = {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': True,
+          'has_fl': True, 'routing': ['MUC', 'JFK'], 'layover_ort': 'JFK'}
+    _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='MUC')
+    assert dp['starts_at_homebase'] is True
+    assert dp['requires_commute'] is True
+
+
+def test_v84_homebase_ber_routing_check():
+    """Homebase BER: BER→XYZ ist Anreise; FRA→XYZ ist nicht."""
+    from app import _enrich_dp_with_v8_fields
+    dp_ber = {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': True,
+              'routing': ['BER', 'JFK'], 'layover_ort': 'JFK'}
+    _enrich_dp_with_v8_fields(dp_ber, prev_dp=None, next_dp=None, homebase='BER')
+    assert dp_ber['starts_at_homebase'] is True
+
+    dp_fra = {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': True,
+              'routing': ['FRA', 'JFK'], 'layover_ort': 'JFK'}
+    _enrich_dp_with_v8_fields(dp_fra, prev_dp=None, next_dp=None, homebase='BER')
+    # FRA bei BER-Crew = nicht starts_at_homebase
+    assert dp_fra['starts_at_homebase'] is False
+
+
+def test_v84_hotel_layover_at_fra_when_muc_homebase():
+    """Homebase MUC: FRA-Layover IST eine Hotelnacht (FRA != MUC)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-01', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['MUC', 'FRA'], 'layover_ort': 'FRA'},
+        {'datum': '2025-05-02', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['FRA', 'MUC']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-01', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-05-02', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'MUC')
+    result = _deterministic_classify_v7(matched, 2025, 'MUC')
+    # Bei MUC-Crew ist FRA ein normaler Inland-Layover-Ort → Hotel zählt
+    assert result['hotel_naechte'] == 1, \
+        f"MUC-Crew mit FRA-Layover sollte 1 Hotel zählen, ist {result['hotel_naechte']}"
+
+
+def test_v84_hotel_layover_at_fra_when_fra_homebase_does_not_count():
+    """Homebase FRA: FRA-Layover ist KEINE Hotelnacht (= Homebase)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-01', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'FRA'},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-01', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['hotel_naechte'] == 0
+
+
+def test_v84_homebase_logging_present():
+    """Homebase wird zu Beginn des Match-Schritts geloggt — Audit-Trail."""
+    import inspect
+    from app import _match_dp_se_per_day
+    src = inspect.getsource(_match_dp_se_per_day)
+    assert '[v8-homebase]' in src
+    assert 'selected=' in src
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

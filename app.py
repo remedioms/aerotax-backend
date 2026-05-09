@@ -5475,6 +5475,55 @@ EMPFOHLEN: routing, has_fl, overnight_after_day, layover_ort, layover_inland
   Zeile). NUR befüllen bei: Same-Day-Tag, unklarer Klassifikation,
   ungewöhnlichem Marker. Nicht für offensichtliche Tour-/FL-/Frei-Tage.
 
+═════ CREW-MARKER-LEXIKON (LH-Dienstpläne) ════════════════════════════════════
+
+Erkenne diese Crew-typischen Marker. Bewerte KEINE EASA-/FTL-Legalität —
+nutze die Begriffe nur als Lesehilfe für Tagesart, Routing, Overnight und
+Homebase-Kontext.
+
+▸ Flug-/Tour-Dienste:
+  • LH#### (LH-Flugnummer) ODER mehrere LH-Segmente an einem Tag
+  • Routing mit IATA-Codes, z. B. "{homebase}-BLR", "BLR-{homebase}",
+    "{homebase}-CPH-{homebase}"
+  → activity_type=tour bei Layover/Overnight, =same_day bei A+E selber Tag
+
+▸ FL = Layover-/Freizeit-/Hotel-Tag innerhalb einer Tour
+  • FL ist KEIN neuer Tourstart, sondern Tour-Mittel-Tag
+  • FL kann Hotelnacht anzeigen → overnight_after_day=true
+  • FL nach Heimkehr: kein neuer Tourstart, kein automatisches Hotel
+  • activity_type bleibt "tour", auch bei FL-Marker
+
+▸ Standby / Bereitschaft:
+  • SB, RB, RE, "Bereitschaft", "Rufbereitschaft"
+  → activity_type=standby
+  → is_workday=true, requires_commute=false (zuhause), kein VMA, kein Hotel
+
+▸ Office / Schulung an Homebase:
+  • EM, EH, TK, D4, "Erste Hilfe", "Emergency Training", "Office"
+  → activity_type=office (täglich Heimkehr) ODER training (mehrtägig)
+  → is_workday=true, requires_commute=true (Anfahrt zur Homebase)
+
+▸ Frei / Urlaub / Krank / nicht-dienstlich:
+  • frei, OF, FR, /-, U, U1, "Urlaub", K, "krank"
+  → activity_type=frei/urlaub/krank
+  → is_workday=false, requires_commute=false, kein VMA, keine Hotelnacht
+
+▸ LM Nachgewährung:
+  • "LM NACHGEWAEHRUNG", "LM Nachgewähr"
+  → activity_type=frei
+  → is_workday=false, KEIN Arbeitstag, kein Fahrtag, kein VMA
+
+▸ Proceeding / Positioning / Deadhead / DH:
+  • Dienstlich relevant. Kann Same-Day/Z72 sein, wenn >8h und keine Übernachtung
+  • Kann Teil eines Tourclusters sein
+  • activity_type=tour oder same_day je nach Overnight
+  • NICHT automatisch Hotel/Fahrtag
+
+▸ Unknown:
+  • Nur verwenden wenn Marker WIRKLICH unklar ist
+  • activity_type=unknown wird NICHT als Arbeitstag gezählt
+  • Bei aktiver SE-Zeile + Cluster-Kontext kann Backend reklassifizieren
+
 ═════ MULTI-STOP-TOUREN — JEDEN TAG EINZELN ═══════════════════════════════════
 
 Bei FRA→BER→ZAG→ARN→FRA Multi-Stop-Tour: jeder Kalendertag bekommt seine
@@ -6152,6 +6201,9 @@ def _match_dp_se_per_day(structured_days, se_structured, homebase='FRA'):
     dp_days = list(structured_days['days'])
     # Sortiert nach Datum für prev/next-Lookups bei Heuristik
     dp_days_sorted = sorted(dp_days, key=lambda d: d.get('datum', ''))
+    # v8.4: Homebase-Logging zu Beginn (Audit-Trail kann Homebase-Wahl belegen)
+    homebase_upper = (homebase or 'FRA').upper()
+    print(f"[v8-homebase] selected={homebase_upper}")
     # v8.1: Anreicherung mit prev/next-Kontext
     for i, d in enumerate(dp_days_sorted):
         prev_d = dp_days_sorted[i-1] if i > 0 else None
@@ -6161,6 +6213,12 @@ def _match_dp_se_per_day(structured_days, se_structured, homebase='FRA'):
               f"start_homebase={d.get('starts_at_homebase')} end_homebase={d.get('ends_at_homebase')} "
               f"requires_commute={d.get('requires_commute')} is_workday={d.get('is_workday')} "
               f"start={d.get('start_time') or '-'} end={d.get('end_time') or '-'}")
+        # v8.4: zusätzliches Detail-Logging gegen Homebase-Vergleich
+        routing_str = '-'.join(d.get('routing') or []) or '-'
+        print(f"[v8-homebase-check] datum={d.get('datum','')} routing={routing_str} "
+              f"starts_at_homebase={d.get('starts_at_homebase')} "
+              f"ends_at_homebase={d.get('ends_at_homebase')} "
+              f"homebase={homebase_upper}")
 
     # SE: Datum → liste aktive Zeilen (Storno gefiltert)
     se_by_date = {}
@@ -7085,9 +7143,12 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             continue
         t = tage_detail[i]
         klass = t['klass']
-        # Layover-Ort prüfen — Homebase/leer = keine Hotelnacht
+        # v8.4: Layover-Ort gegen GEWÄHLTE Homebase prüfen, nicht gegen FRA hardcoded.
+        # Nur die ausgewählte Homebase ausschließen — FRA bleibt als Layover-Ort
+        # für nicht-FRA-Bases (z.B. MUC-Crew) ein normaler Übernachtungsort.
         layover_ort = (d.get('layover_ort') or m['se'].get('stfrei_ort') or '').upper()
-        is_homebase = layover_ort in ('FRA', (homebase or 'FRA').upper(), '')
+        homebase_upper = (homebase or 'FRA').upper()
+        is_homebase = layover_ort in (homebase_upper, '')
         if klass in HOTEL_KLASSEN and not is_homebase:
             hotel_naechte += 1
         elif klass in HOTEL_KLASSEN and is_homebase:
