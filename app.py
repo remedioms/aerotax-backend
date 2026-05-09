@@ -960,7 +960,28 @@ def process_real():
         form['pi_id'] = pi_id or ''
         _audit(job_id, 'job_created', {'year': form['year'], 'base': form['base'], 'files': {k: len(v) for k, v in files.items()}})
 
-        # In Warteschlange einreihen statt direktem Thread-Spawn
+        # WICHTIG: ZUERST auf Disk persistieren, DANN in Queue einreihen.
+        # Sonst: Crash zwischen put und save → Job in Queue (geht bei Restart verloren)
+        # aber NICHT in JOBS_DIR → Frontend pollt 404. Mit save-first: Job überlebt
+        # Restart, Restart-Recovery markiert ihn als 'failed' mit klarem Hinweis.
+        _save_job_to_disk(job_id)
+
+        # Queue-Tiefe-Limit: bei zu vielen Jobs in der Queue sofort 503 zurück
+        # (verhindert OOM bei Spike + lange Wartezeiten)
+        MAX_QUEUE_DEPTH = 8  # ~20 Min Wartezeit max
+        current_queue_size = _calc_queue.qsize() + (1 if _calc_running_id else 0)
+        if current_queue_size >= MAX_QUEUE_DEPTH:
+            with _jobs_lock:
+                _jobs[job_id]['status'] = 'rejected'
+                _jobs[job_id]['error']  = f'Server gerade überlastet ({current_queue_size} Auswertungen in Wartezeit). Bitte in 5-10 Min mit deinem Code (AT-...) erneut versuchen — keine erneute Zahlung nötig.'
+            _save_job_to_disk(job_id)
+            return jsonify({
+                'job_id': job_id,
+                'status': 'rejected',
+                'error':  _jobs[job_id]['error'],
+                'session_token': session_token,
+            }), 503
+
         _calc_queue.put((job_id, form, files))
         queue_pos = _get_queue_position(job_id) or 1
         # Echten Status anhand Position setzen
@@ -1182,7 +1203,7 @@ def full_health_check():
     health = {'server': 'ok', 'timestamp': datetime.utcnow().isoformat() + 'Z'}
     # Anthropic
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
         r = client.messages.create(
             model='claude-haiku-4-5-20251001', max_tokens=10,
             messages=[{'role':'user','content':'pong'}])
@@ -1482,7 +1503,7 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
 ⚠ Hinweis: Orientierungshilfe — kein Ersatz für persönlichen Steuerberater (§3 StBerG)."""
 
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
         # Output-Cap: 600 Tokens = ca. 200-250 Wörter, hält Kosten klein
         resp = _claude_with_retry(client, 'claude-sonnet-4-6', 600, prompt,
                                    max_retries=2, label='Chat-AeroTAX')
@@ -1693,7 +1714,7 @@ def _qa_aerotax_answer(question_title, question_body):
     """Generiert AeroTAX-Bot-Antwort via Claude. Wird automatisch zu jeder Frage gerufen."""
     if not ANTHROPIC_KEY: return None
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
         # EASA-Referenz mitschicken für fundierte Antworten
         easa_kontext = ''
         try:
@@ -2205,8 +2226,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '2.6',
-        'build':   'prep-ux-and-malloc-trim-2026-05-09',
+        'version': '2.7',
+        'build':   'final-audit-fixes-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -2367,7 +2388,7 @@ def _lsb_extract_via_claude(text, regex_hints=None, label='lsb-extract', extra_i
         "PDF-Text:\n" + text[:10000]
     )
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
         resp = _claude_with_retry(client, 'claude-sonnet-4-5', 1500,
                                   [{'type': 'text', 'text': prompt}], label=label)
         ai_text = resp.content[0].text.strip()
@@ -3239,7 +3260,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                     + hint_block +
                     "\nSE-Text:\n" + all_text[:50000]
                 )
-                client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+                client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
                 resp = _claude_with_retry(client, 'claude-sonnet-4-5', 6000,
                                           [{'type': 'text', 'text': prompt}], label='se-verify')
                 ai_text = resp.content[0].text.strip()
@@ -3375,7 +3396,7 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
     if re.search(r'Steuer-Auswertung|Zeile 72|Zeile 73|Anlage N.*Auswertung', combined, re.I):
         # Auswertungs-PDF: direkt mit Claude parsen
         try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
             result = {'fahr_tage':0,'km':0,'arbeitstage':0,'hotel_naechte':0,
                       'vma_72_tage':0,'vma_73_tage':0,'vma_74_tage':0,
                       'vma_72':0,'vma_73':0,'vma_74':0,'vma_aus':0,'z77':0,'ausland_touren':[]}
@@ -3400,7 +3421,7 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
 
     # ── Reine LH Flugstunden: 100% Claude ──────────────────────────
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
 
         # km aus Nutzer-Formular — Fallback 28 wenn nicht angegeben
         km = km_form if km_form and km_form > 0 else 28
@@ -3638,6 +3659,9 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
         if tool_resp is None:
             raise (last_err or RuntimeError('Sonnet-DP tool call fehlgeschlagen'))
         elapsed = _time_mod.time() - sonnet_start_time
+        # max_tokens-Truncation erkennen — kann unvollständige tool_input liefern
+        if getattr(tool_resp, 'stop_reason', None) == 'max_tokens':
+            print(f"[Sonnet-DP] WARNUNG: stop_reason='max_tokens' nach {elapsed:.1f}s — tool_input ggf. unvollständig")
         # Tool-Use-Response: content ist Liste, einer der Blöcke ist tool_use mit input-Dict
         tool_input = None
         nachweis_text = ''
@@ -3654,14 +3678,24 @@ Unklare Codes (falls): <Code> = <was du daraus geschlossen hast>"""
         tool_input_for_text = {k: v for k, v in tool_input.items() if k != 'nachweis'}
         full_text = _json.dumps(tool_input_for_text, ensure_ascii=False) + '\n\n' + (tool_input.get('nachweis') or nachweis_text or '')
 
-        # ── JSON robust extrahieren via brace-counter ──
-        # Sucht nach ALLEN balanced {...} Blöcken im Text und nimmt den der "fahrtage" enthält.
+        # ── JSON robust extrahieren via brace-counter (String-aware) ──
         nachweis = ''
         json_str = '{}'
         candidates = []
         depth = 0
         start = -1
+        in_str = False; escape_next = False
         for i, ch in enumerate(full_text):
+            if escape_next:
+                escape_next = False
+                continue
+            if in_str:
+                if ch == '\\': escape_next = True
+                elif ch == '"': in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
             if ch == '{':
                 if depth == 0: start = i
                 depth += 1
@@ -3819,7 +3853,7 @@ def _opus_verifizierung(parser_summary, sonnet_summary, full_se_text, full_flug_
     if not ANTHROPIC_KEY:
         return None
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
         prompt = f"""Du bist ein Senior-Steuerberater für Lufthansa-Kabinenpersonal mit jahrzehntelanger Erfahrung.
 Zwei Junior-Berater haben unabhängig dieselben Dokumente ausgewertet und kommen zu unterschiedlichen Werten.
 Deine Aufgabe: Streit schlichten — den korrekten Wert ermitteln, nicht den Mittelwert.
@@ -3854,7 +3888,18 @@ Kurze Begründung wo Junior 1 vs 2 falsch lagen.
         nachweis = full_text
         candidates = []
         depth = 0; start = -1
+        in_str = False; escape_next = False
         for i, ch in enumerate(full_text):
+            if escape_next:
+                escape_next = False
+                continue
+            if in_str:
+                if ch == '\\': escape_next = True
+                elif ch == '"': in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
             if ch == '{':
                 if depth == 0: start = i
                 depth += 1
@@ -3948,7 +3993,7 @@ def _einsatzplan_extract_via_claude(full_text, regex_hint=None, label='einsatzpl
         "\nPDF-Text:\n" + full_text[:15000]
     )
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
         resp = _claude_with_retry(client, 'claude-sonnet-4-5', 4000,
                                   [{'type': 'text', 'text': prompt}], label=label)
         ai_text = resp.content[0].text.strip()
@@ -4085,7 +4130,7 @@ def _opus_final_audit(values, texts, year):
     if not ANTHROPIC_KEY:
         return []
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
         # Werte-Zusammenfassung
         v = values
         summary = (
@@ -4236,7 +4281,7 @@ def parse_optionale_belege(files):
     }
 
     results = []
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
 
     def file_to_claude_content(file_bytes, filename=''):
         """Converts file bytes to Claude message content block(s)."""
@@ -4440,7 +4485,7 @@ def infer_missing_data_with_ki(files, available_data, missing, parsed_summary=No
     if not ANTHROPIC_KEY:
         return {}, []
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
     notes = []  # Will be shown in PDF as warnings
     inferred = {}
 
@@ -4904,10 +4949,16 @@ def berechne(form, files):
     reinig_satz = REINIGUNG_PRO_TAG_BY_YEAR.get(year_int, 1.60)
     trink_satz  = TRINKGELD_PRO_NACHT_BY_YEAR.get(year_int, 3.60)
 
-    # VMA-Werte mit jahr-korrekten Sätzen
-    vma_72 = vma_72_tage * bmf_inland['tagestrip_8h']
-    vma_73 = vma_73_tage * bmf_inland['an_abreise']
-    vma_74 = vma_74_tage * bmf_inland['voll_24h']
+    # VMA-Werte mit jahr-korrekten Sätzen — NUR wenn keine SE-deterministischen Werte vorhanden.
+    # Bei sauberer SE-Auswertung wurden vma_72/73/74 oben (Z. ~4843-4846) bereits aus den
+    # literal-stfrei-Werten der LH-Abrechnung gesetzt. Diese sind authoritativ und dürfen
+    # NICHT mit der BMF-Pauschale × Tage überschrieben werden — LH zahlt manchmal abweichend.
+    if not (se_data and se_unklar == 0 and vma_72 > 0):
+        vma_72 = vma_72_tage * bmf_inland['tagestrip_8h']
+    if not (se_data and se_unklar == 0 and vma_73 > 0):
+        vma_73 = vma_73_tage * bmf_inland['an_abreise']
+    if not (se_data and se_unklar == 0 and vma_74 > 0):
+        vma_74 = vma_74_tage * bmf_inland['voll_24h']
     vma_in = vma_72 + vma_73 + vma_74
 
     # ── FAHRTKOSTEN ───────────────────────────────────────────
