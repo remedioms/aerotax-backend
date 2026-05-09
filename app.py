@@ -2404,8 +2404,8 @@ def qa_upvote(qid):
 def health():
     return jsonify({
         'status':  'AeroTax Backend läuft',
-        'version': '6.0.6',
-        'build':   'no-fallback-hardcoded-2026-05-09',
+        'version': '6.0.7',
+        'build':   'tuple-defensive-normalize-traceback-2026-05-09',
         'features': ['lsb-ki-always', 'se-ki-validate', 'einsatzplan-ki-always',
                      'opus-final-audit', 'sonnet-dp-tool-use', 'serial-queue', 'image-scaling'],
     })
@@ -5142,6 +5142,26 @@ falscher Wert."""
 #   4. _validate_opus_against_structure() prüft Opus gegen harte Fakten
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _ensure_dict(item):
+    """Konvertiert Anthropic-SDK-Tool-Input-Items robust zu dict.
+    Anthropic kann pydantic-Models, dicts oder bei Edge-Cases tuples liefern.
+    Ein tuple kommt z.B. wenn ein verschachteltes Schema-Item durchschlägt."""
+    if isinstance(item, dict):
+        return item
+    if hasattr(item, 'model_dump'):
+        try:
+            return item.model_dump()
+        except Exception:
+            pass
+    if hasattr(item, '__dict__'):
+        try:
+            return dict(item.__dict__)
+        except Exception:
+            pass
+    # tuple, list oder andere — nicht konvertierbar, leeres dict zurück
+    return {}
+
+
 INLAND_IATA_CODES = {
     'FRA', 'MUC', 'HAM', 'DUS', 'STR', 'CGN', 'HAJ', 'BER', 'TXL', 'SXF',
     'LEJ', 'NUE', 'BRE', 'FMO', 'PAD', 'NRN', 'FKB', 'HHN', 'SCN', 'DRS',
@@ -5407,8 +5427,12 @@ LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
         # tool_input kann auch dict sein wenn SDK serialisiert
         days_raw = tool_input.get('days', []) if isinstance(tool_input, dict) else []
         warnings_raw = tool_input.get('warnings', []) if isinstance(tool_input, dict) else []
-        days = list(days_raw or [])
-        warnings = list(warnings_raw or [])
+        # Normalisiere alle items zu echten dicts (Anthropic-SDK kann pydantic
+        # Models oder im Edge-Case tuples liefern). Nicht-konvertierbare Items
+        # werden zu {} und beim setdefault-Loop unten gefiltert/ergänzt.
+        days = [_ensure_dict(d) for d in (days_raw or [])]
+        days = [d for d in days if d.get('datum')]  # leere Items raus
+        warnings = [str(w) if not isinstance(w, str) else w for w in (warnings_raw or [])]
         # Normalisiere: stelle sicher dass alle Felder existieren
         for d in days:
             d.setdefault('markers', [])
@@ -5630,14 +5654,25 @@ WICHTIG:
         elapsed = _t.time() - start
         tool_input = None
         for block in resp.content:
-            if getattr(block, 'type', None) == 'tool_use':
-                tool_input = block.input
+            btype = getattr(block, 'type', None) if not isinstance(block, dict) else block.get('type')
+            bname = getattr(block, 'name', None) if not isinstance(block, dict) else block.get('name')
+            if btype == 'tool_use' and (bname == 'submit_v6_classifications' or bname is None):
+                if isinstance(block, dict):
+                    tool_input = block.get('input')
+                else:
+                    tool_input = getattr(block, 'input', None)
                 break
         if not tool_input:
             return None
-        classifications = list(tool_input.get('classifications', []) or [])
+        # Robust: tool_input könnte pydantic-Model sein
+        tool_input = _ensure_dict(tool_input) if not isinstance(tool_input, dict) else tool_input
+        classifications_raw = tool_input.get('classifications', []) or []
+        # Jeden classification-Eintrag normalisieren (pydantic/tuple/dict)
+        classifications = [_ensure_dict(c) for c in classifications_raw]
+        classifications = [c for c in classifications if c.get('datum')]
         nachweis = str(tool_input.get('nachweis', '') or '')
-        unklare = list(tool_input.get('unklare_tage', []) or [])
+        unklare_raw = tool_input.get('unklare_tage', []) or []
+        unklare = [str(u) if not isinstance(u, str) else u for u in unklare_raw]
         pass_label = '[Opus-v6-RECHECK]' if feedback else '[Opus-v6]'
         print(f"{pass_label} {elapsed:.1f}s: {len(classifications)} Klassifikationen, "
               f"{len(unklare)} unklar")
@@ -6473,7 +6508,10 @@ def hybrid_analyze(form, files):
                 print(f"[v6] Sonnet-Pre-Reader lieferte keine Tagesdaten — Fallback auf v5.7")
         except Exception as e:
             etype = type(e).__name__
+            import traceback as _tb
+            tb_str = _tb.format_exc()
             print(f"[v6] Pipeline crash: {etype}: {str(e)[:200]} — KEIN Fallback (Job-Error)")
+            print(f"[v6] Traceback (letzte 1000 Zeichen):\n{tb_str[-1000:]}")
             errors.append(f'v6-Pipeline ({etype}): {str(e)[:200]}')
             classification = None
     gc.collect()
