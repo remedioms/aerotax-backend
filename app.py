@@ -1379,6 +1379,105 @@ def get_job_audit(job_id):
     return jsonify({'audit': j.get('audit', []), 'status': j.get('status')})
 
 
+@app.route('/api/job/<job_id>/review-answer', methods=['POST'])
+def post_review_answer(job_id):
+    """v8.21: Speichert eine Nutzer-Antwort auf ein Review-Item.
+
+    Body: {review_item_id, answer: 'yes'|'no'|'time'|'unsure',
+           start_time?, end_time?, source?}
+
+    Speichert das Override im Job-State (manual_day_overrides). Liefert
+    eine deterministische Delta-Schätzung zurück (kein Sonnet-Call).
+    Echte Re-Berechnung erfolgt bei /finalize-pdf (Phase 3b).
+    """
+    body = request.get_json(silent=True) or {}
+    review_item_id = (body.get('review_item_id') or '').strip()
+    answer = (body.get('answer') or '').strip()
+    start_time = (body.get('start_time') or '').strip()
+    end_time = (body.get('end_time') or '').strip()
+    source = body.get('source') or 'user_review_chatbot'
+
+    if not review_item_id or ':' not in review_item_id:
+        return jsonify({'error': 'invalid review_item_id'}), 400
+    typ, datum = review_item_id.split(':', 1)
+    if not datum:
+        return jsonify({'error': 'invalid datum in review_item_id'}), 400
+
+    # Override aus Antwort bauen
+    delta_eur = 0.0
+    delta_label = 'Keine Änderung am Betrag'
+    if answer == 'yes':
+        ov = {'over_8h': True, 'source': source}
+        delta_eur = 14.0
+        delta_label = '+14,00 € berücksichtigt'
+    elif answer == 'no':
+        ov = {'over_8h': False, 'source': source}
+        delta_label = 'Okay, kein zusätzlicher Betrag für diesen Tag.'
+    elif answer == 'time':
+        if not start_time or not end_time:
+            return jsonify({'error': 'start_time and end_time required for time answer'}), 400
+        # Validate + compute
+        try:
+            sh, sm = int(start_time.split(':')[0]), int(start_time.split(':')[1])
+            eh, em = int(end_time.split(':')[0]), int(end_time.split(':')[1])
+            duration = (eh * 60 + em) - (sh * 60 + sm)
+            if duration < 0:
+                duration += 24 * 60
+        except (ValueError, IndexError):
+            return jsonify({'error': 'invalid time format (HH:MM)'}), 400
+        ov = {
+            'start_time': start_time, 'end_time': end_time,
+            'time_is_absence': True,
+            'source': 'user_review_chatbot_time_entry',
+        }
+        if duration >= SAME_DAY_Z72_TOTAL_MINUTES:
+            delta_eur = 14.0
+            delta_label = f'Erkannte Abwesenheit: {duration//60}:{duration%60:02d} h → +14,00 € berücksichtigt'
+        else:
+            delta_label = f'Erkannte Abwesenheit: {duration//60}:{duration%60:02d} h → kein zusätzlicher Betrag'
+    elif answer == 'unsure':
+        ov = {'unsure': True, 'source': 'user_unsure'}
+        delta_label = 'Okay, ich lasse den Tag unverändert.'
+    else:
+        return jsonify({'error': 'invalid answer (yes|no|time|unsure)'}), 400
+
+    # Job laden + Override speichern
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'job not found'}), 404
+        overrides = dict(j.get('manual_day_overrides') or {})
+        overrides[datum] = ov
+        j['manual_day_overrides'] = overrides
+        # Audit-Log-Eintrag
+        if 'audit' in j and isinstance(j['audit'], list):
+            j['audit'].append({
+                'event': 'review_answer',
+                'data': {'review_item_id': review_item_id, 'answer': answer,
+                         'datum': datum, 'override': ov, 'delta_eur': delta_eur},
+                'timestamp': datetime.now().isoformat(),
+            })
+        # Persist
+        try:
+            _save_job_to_disk(job_id)
+        except Exception as _e:
+            print(f'[review-answer] save warning: {_e}')
+
+    # Delta auf data anwenden für sofortige UI-Aktualisierung
+    # (Echte Re-Klassifikation erfolgt erst bei finalize-pdf)
+    answered = sum(1 for v in overrides.values()
+                   if isinstance(v, dict) and not v.get('unsure'))
+    return jsonify({
+        'review_item_id': review_item_id,
+        'answer': answer,
+        'delta_eur': delta_eur,
+        'delta_label': delta_label,
+        'override_saved': True,
+        'answered_count': len(overrides),
+        'answered_with_impact': answered,
+    })
+
+
 @app.route('/api/recover', methods=['POST'])
 def recover_failed_job():
     """Vereinfacht: Session-Token reicht für Retry. Max 1 kostenloser Retry — danach Support.
@@ -1699,16 +1798,18 @@ def chat_with_aerotax():
         for m in chat_history[-10:]
     )
 
-    prompt = f"""Du bist AeroTAX, der KI-Steuerberater von aerosteuer.de. Du beantwortest STRENG NUR Fragen zu zwei Themen:
+    prompt = f"""Du bist AeroTAX, der Werbungskosten-Auswertungs-Assistent von aerosteuer.de.
+AeroTAX ist eine Berechnungs- und Dokumentationshilfe — KEINE Steuerberatung.
+Du beantwortest STRENG NUR Fragen zu zwei Themen:
 
-  1. DIESER konkreten Auswertung des Mandanten (Werte, Berechnung, Plausibilität)
+  1. DIESER konkreten Auswertung des Nutzers (Werte, Berechnung, Plausibilität)
   2. WISO-Eingabe der Werte (welche Zeile, welcher Pfad)
 
-ALLES ANDERE wird höflich abgelehnt mit kurzem Hinweis: "Das ist außerhalb meines Scopes — ich helfe dir nur zur Auswertung und WISO-Eingabe. Allgemeine Steuerfragen kannst du im Community-Forum stellen."
+ALLES ANDERE wird höflich abgelehnt mit kurzem Hinweis: "Das ist außerhalb meines Scopes — ich helfe dir nur zur Auswertung und WISO-Eingabe. Allgemeine Steuerfragen gehören zu einem Steuerberater oder Lohnsteuerhilfeverein."
 
 Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Investments, Politik, was-wäre-wenn-Spiele, hypothetische Beispiele.
 
-═══ MANDANTEN-AUSWERTUNG (Steuerjahr {result_data.get('year','?')}) ═══
+═══ NUTZER-AUSWERTUNG (Steuerjahr {result_data.get('year','?')}) ═══
 {chr(10).join(summary_lines)}
 
 ═══ HINWEISE AUS DER AUSWERTUNG ═══
@@ -1730,7 +1831,7 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
 - Bei On-Topic Antworten: schließe mit dem Pflicht-Disclaimer (siehe unten)
 
 ═══ PFLICHT-DISCLAIMER bei steuerlichen Antworten (am Ende, neue Zeile) ═══
-⚠ Hinweis: Orientierungshilfe — kein Ersatz für persönlichen Steuerberater (§3 StBerG)."""
+ℹ Hinweis: AeroTAX ist eine Berechnungs- und Dokumentationshilfe und ersetzt keine individuelle steuerliche Beratung."""
 
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
@@ -1974,7 +2075,7 @@ Frage: {question_body}
 - Quellen verweisen wenn möglich (§ EStG-Paragraph, BMF-Schreiben Datum)
 
 ═══ PFLICHT-ABSCHLUSS (immer am Ende der Antwort wörtlich anhängen, mit Leerzeile davor) ═══
-⚠ Rechtshinweis: Diese Information dient zur Orientierung. AeroTAX ist kein Steuerberater nach §3 StBerG. Bei komplexen Einzelfällen ziehe einen Steuerberater oder Lohnsteuerhilfeverein zu Rate.
+ℹ Hinweis: AeroTAX ist eine Berechnungs- und Dokumentationshilfe und ersetzt keine individuelle steuerliche Beratung. Bei komplexen Einzelfällen ziehe einen Steuerberater oder Lohnsteuerhilfeverein zu Rate.
 
 Antworte direkt mit dem Antworttext (kein Header, kein "Hallo X")."""
         resp = _claude_with_retry(client, 'claude-sonnet-4-6', 1200, prompt,
@@ -3536,7 +3637,7 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
                         for a in abrechnungen)
                     hint_block = f"\nRegex hat folgende Abrechnungen gefunden (kann unvollständig/falsch sein):\n{hint_lines}\n"
                 prompt = (
-                    "Du liest Lufthansa Streckeneinsatz-Abrechnungen — als Steuerberater. "
+                    "Du liest Lufthansa Streckeneinsatz-Abrechnungen im Werbungskosten-Kontext. "
                     "Du klassifizierst die Tage steuerlich richtig nach §9 EStG.\n\n"
                     "Pro Seite gibt es eine 'Summe:'-Zeile (Gesamt/Steuer/Stfrei). "
                     "Z77 = stfrei-Anteil = Gesamt - letzter_Wert.\n\n"
@@ -4250,7 +4351,7 @@ KEINE Plausi-Bandbreiten in deinem Output — die Zahlen sind die Zahlen. Bei DD
 
 
 def _opus_verifizierung(parser_summary, sonnet_summary, full_se_text, full_flug_text):
-    """Opus 4.7 als Senior-Steuerberater. Wird nur gerufen wenn Parser+Sonnet uneinig sind.
+    """Opus 4.7 als Senior-Werbungskosten-Klassifikator (branchenübliche Steuer-Praxis). Wird nur gerufen wenn Parser+Sonnet uneinig sind.
     Bekommt beide Vorschläge + Originaldokumente, entscheidet final.
     Liefert verifizierte Werte + Begründung.
     """
@@ -4259,14 +4360,14 @@ def _opus_verifizierung(parser_summary, sonnet_summary, full_se_text, full_flug_
         return None
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
-        prompt = f"""Du bist ein Senior-Steuerberater für Lufthansa-Kabinenpersonal mit jahrzehntelanger Erfahrung.
+        prompt = f"""Du bist ein erfahrener Werbungskosten-Klassifikator für Lufthansa-Kabinenpersonal mit jahrzehntelanger Erfahrung in branchenüblicher Steuer-Praxis.
 Zwei Junior-Berater haben unabhängig dieselben Dokumente ausgewertet und kommen zu unterschiedlichen Werten.
 Deine Aufgabe: Streit schlichten — den korrekten Wert ermitteln, nicht den Mittelwert.
 
 JUNIOR 1 (Deterministischer Parser, liest literal aus Dokument):
 {parser_summary}
 
-JUNIOR 2 (KI-Steuerberater Sonnet, interpretiert Edge-Cases):
+JUNIOR 2 (KI-Werbungskosten-Klassifikator Sonnet, interpretiert Edge-Cases):
 {sonnet_summary}
 
 ORIGINAL-DOKUMENTE:
@@ -4525,7 +4626,7 @@ def parse_einsatzplan_mit_ki(pdf_bytes_list, year=2025):
 
 def _opus_final_audit(values, texts, year):
     """
-    Opus 4.7 Senior-Steuerberater-Review aller berechneten Werte.
+    Opus 4.7 Senior-Werbungskosten-Review aller berechneten Werte (branchenübliche Steuer-Praxis).
     Bekommt: alle Schlüsselwerte + die Original-PDF-Texte.
     Liefert: Liste von Korrektur-Vorschlägen oder leere Liste wenn alles plausibel.
 
@@ -4569,7 +4670,7 @@ def _opus_final_audit(values, texts, year):
         dp_text  = (texts.get('dp_text')  or '')[:8000]
 
         prompt = (
-            "Du bist Senior-Steuerberater für Lufthansa-Kabinenpersonal mit jahrzehntelanger Erfahrung. "
+            "Du bist erfahrener Werbungskosten-Klassifikator für Lufthansa-Kabinenpersonal (branchenübliche Steuer-Praxis). "
             "Ein Junior-Berater hat die Auswertung gemacht. Deine Aufgabe: Plausi-Check über ALLE Werte zusammen — "
             "Math-Check + interne Konsistenz + Cross-Document-Validation.\n\n"
             "Prüfe insbesondere:\n"
@@ -4803,7 +4904,7 @@ Wenn absolut kein Betrag erkennbar: {{"betrag": 0}}"""
                         max_tokens=600,
                         messages=[{'role': 'user', 'content': content_blocks[:-1] + [{
                             'type':'text',
-                            'text': f"""Du bist Senior-Steuerberater. Lies diese{'n' if n_files==1 else ''} {n_files} Beleg(e) für: {info['name']}.
+                            'text': f"""Du bist erfahrener Werbungskosten-Klassifikator (branchenübliche Steuer-Praxis). Lies diese{'n' if n_files==1 else ''} {n_files} Beleg(e) für: {info['name']}.
 
 Sonnet konnte keinen Betrag rausziehen. Versuch es nochmal — schaue GENAU auf:
 - Stempel, handgeschriebene Zahlen
@@ -4984,7 +5085,7 @@ Antworte NUR mit JSON (keine Backticks):
         if vma_aus_val > 4000:
             print(f"[opus-verify] Z76={vma_aus_val:.2f}€ > 4000 — Opus-Pass startet")
             verify_prompt = (
-                "Du bist Senior-Steuerberater. Sonnet hat aus den unten stehenden LH-Dokumenten "
+                "Du bist erfahrener Werbungskosten-Klassifikator (branchenübliche Steuer-Praxis). Sonnet hat aus den unten stehenden LH-Dokumenten "
                 "diese Werte geschätzt. Bei großen Z76-Werten (>4000€) ist eine Zweit-Verifikation Pflicht.\n\n"
                 f"SONNET-ERGEBNIS:\n{json.dumps(data, ensure_ascii=False, indent=2)}\n\n"
                 f"DOKUMENTE (gleicher Kontext wie Sonnet):\n{context[:80000]}\n\n"
@@ -5813,7 +5914,7 @@ def _opus_classify_structured_days_v6(structured_days, se_summary, year=2025, ho
 
     days_json = json.dumps(days, ensure_ascii=False, default=str)
 
-    prompt = f"""Du bist Senior-Steuerberater für Lufthansa-Kabinenpersonal (Homebase {homebase}, {year}).
+    prompt = f"""Du bist erfahrener Werbungskosten-Klassifikator für Lufthansa-Kabinenpersonal (Homebase {homebase}, {year}).
 
 ═════ DU BEKOMMST STRUKTURIERTE TAGESDATEN — KEINE PDFs! ═══════════════════
 
@@ -8016,6 +8117,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     aerotax_z76_dates_amounts = []   # alle AeroTAX-Z76-Tage mit Betrag/Land/Tagtyp
     training_commute_candidates = [] # mehrtägige Training-Sequenz (evtl. nicht jeder Tag Fahrtag)
     office_z72_candidates = []       # Office mit duty>=480 ohne klaren Homebase-Bezug
+    office_training_time_missing_candidates = []  # v8.21: Office/Schulung ohne Zeitinfo
     missing_reader_days = []         # Tage in Datum-Range die der DP-Reader weggelassen hat
 
     hb_upper = (homebase or 'FRA').upper()
@@ -8186,6 +8288,32 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'reason': 'Office >8h — auswärtige Schulung/Training? Z72-Kandidat'
                 })
 
+        # v8.21: office_training_time_missing_candidates — Office/Training-Tag der
+        # potenziell Z72 wäre, aber Reader hat keine Zeitinfo geliefert. Wird
+        # später im review_items-Flow dem Nutzer zur Klärung angeboten.
+        if klass == 'Office' and at in ('office', 'training'):
+            raw_duty_rev = d.get('duty_duration_minutes')
+            duty_known_rev = isinstance(raw_duty_rev, (int, float)) and raw_duty_rev > 0
+            in_cluster_rev = i in cluster_for_idx
+            has_active_foreign_se_rev = (
+                se.get('count', 0) > 0
+                and se.get('stfrei_inland') is False
+                and bool(se.get('stfrei_ort'))
+            )
+            # Kandidat nur wenn: Tag ist Office an Homebase, kein Hotel, nicht
+            # in Auslands-Cluster, keine aktive Auslands-SE, und Zeitinfo fehlt.
+            if (not duty_known_rev
+                and not overnight and not prev_overnight
+                and not in_cluster_rev
+                and not has_active_foreign_se_rev):
+                office_training_time_missing_candidates.append({
+                    'datum': datum,
+                    'activity_type': at,
+                    'marker': d.get('raw_marker', '') or at,
+                    'reason': 'Office/Schulung an Homebase ohne Zeitinfo — Z72-Plausi unklar',
+                    'money_impact_estimate': 14.0,  # potenzielle Z72-Pauschale
+                })
+
     # v8.11: training_commute_candidates — mehrtägige Training-Sequenz
     # (≥TRAINING_SEQ_MIN_DAYS zusammen). Wenn so viele Tage hintereinander
     # activity_type=training mit requires_commute=true, ist es vermutlich EINE
@@ -8307,6 +8435,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         'training_sequences':          training_seq_audit,
         'training_commute_candidates': training_commute_candidates,
         'office_z72_candidates':       office_z72_candidates,
+        'office_training_time_missing_candidates': office_training_time_missing_candidates,
         'missing_reader_days':         missing_reader_days,
         'hotel_candidate_issues':      hotel_candidate_issues,
         'bmf_missing':            list(_diag_bmf['bmf_missing']),
@@ -8606,7 +8735,7 @@ def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebas
     except Exception as e:
         print(f"[Opus-Klassifikation] Wissens-Buch laden fail: {e}")
 
-    prompt = f"""Du bist Senior-Steuerberater spezialisiert auf Lufthansa-Kabinenpersonal.
+    prompt = f"""Du bist erfahrener Werbungskosten-Klassifikator spezialisiert auf Lufthansa-Kabinenpersonal (branchenübliche Steuer-Praxis).
 Mandant: LH-Cabin-Crew, Homebase {homebase}, Steuerjahr {year}.
 
 ═══════════════════════════════════════════════════════════════════════════
@@ -9461,6 +9590,7 @@ def _berechne_via_hybrid(form, files):
         '_nachweis':        nachweis_text,
         '_unklare_tage':    unklare_tage,
         '_audit_notes':     list(cls.get('audit_notes', []) or []),
+        '_review_items':    _build_review_items(cls, manual_day_overrides=None),
         '_unresolved_days': list(cls.get('unresolved_days', []) or []),
         '_vma_unmapped_se': list(cls.get('vma_unmapped_se', []) or []),
         '_plausi_issues':   list(cls.get('plausi_issues', []) or []),
@@ -9478,6 +9608,7 @@ def _berechne_via_hybrid(form, files):
         '_training_sequences':          list(cls.get('training_sequences', []) or []),
         '_training_commute_candidates': list(cls.get('training_commute_candidates', []) or []),
         '_office_z72_candidates':       list(cls.get('office_z72_candidates', []) or []),
+        '_office_training_time_missing_candidates': list(cls.get('office_training_time_missing_candidates', []) or []),
         '_missing_reader_days':         list(cls.get('missing_reader_days', []) or []),
         '_hotel_candidate_issues':      list(cls.get('hotel_candidate_issues', []) or []),
         '_bmf_missing':            list(cls.get('bmf_missing', []) or []),
@@ -9502,6 +9633,98 @@ def _berechne_via_hybrid(form, files):
             'inlandsspesen':    inlandsspesen_se,
         },
     }
+
+
+def _apply_manual_day_overrides(structured_days, overrides):
+    """v8.21: User-Review-Antworten als Patches auf structured_days anwenden.
+    structured_days: list of day-dicts (Sonnet-Output).
+    overrides: {datum: {over_8h: bool} | {start_time, end_time} | {unsure: True}}.
+    Returns new list (immutable input)."""
+    if not overrides:
+        return structured_days
+    out = []
+    for d in structured_days:
+        ov = overrides.get(d.get('datum')) if isinstance(d, dict) else None
+        if not ov:
+            out.append(d)
+            continue
+        d = dict(d)  # shallow copy
+        if 'start_time' in ov and 'end_time' in ov:
+            st, et = ov['start_time'], ov['end_time']
+            try:
+                sh, sm = int(st.split(':')[0]), int(st.split(':')[1])
+                eh, em = int(et.split(':')[0]), int(et.split(':')[1])
+                duration = (eh * 60 + em) - (sh * 60 + sm)
+                if duration < 0:
+                    duration += 24 * 60
+                d['start_time'] = st
+                d['end_time'] = et
+                d['duty_duration_minutes'] = duration
+                # User-Eingabe ist Tour-Abwesenheits-Zeit (Tür-zu-Tür)
+                d['time_is_absence'] = True
+                d['_user_review_source'] = ov.get('source', 'user_review_chatbot_time_entry')
+            except (ValueError, IndexError):
+                pass
+        elif 'over_8h' in ov:
+            if ov['over_8h']:
+                d['duty_duration_minutes'] = SAME_DAY_Z72_TOTAL_MINUTES  # genau 480
+                d['time_is_absence'] = True
+            else:
+                d['duty_duration_minutes'] = SAME_DAY_Z72_TOTAL_MINUTES - 1  # 479 = sicher unter
+                d['time_is_absence'] = True
+            d['_user_review_source'] = ov.get('source', 'user_review_chatbot')
+        elif ov.get('unsure'):
+            # User unsicher — Tag bleibt unverändert (kein Override) aber Source vermerkt
+            d['_user_review_source'] = 'user_unsure'
+        out.append(d)
+    return out
+
+
+def _build_review_items(cls, manual_day_overrides=None):
+    """v8.21: Erzeugt die User-facing review_items Liste.
+
+    Aus Klassifikator-Diagnose-Listen werden Fragen für den Chatbot abgeleitet.
+    Bereits beantwortete Items werden mit status='answered' markiert.
+    """
+    overrides = manual_day_overrides or {}
+    items = []
+
+    # office_training_time_missing: Office/Schulung an Homebase ohne Zeitinfo
+    for c in (cls.get('office_training_time_missing_candidates', []) or []):
+        datum = c.get('datum', '')
+        ov = overrides.get(datum)
+        status = 'answered' if ov else 'pending'
+        marker = c.get('marker', '') or 'Schulung/Office'
+        items.append({
+            'id': f'office_training_time_missing:{datum}',
+            'type': 'office_training_time_missing',
+            'severity': 'yellow',
+            'datum': datum,
+            'marker': marker,
+            'activity_type': c.get('activity_type', ''),
+            'question': (
+                f'Am {datum} war ein Office-/Schulungstag ({marker}) eingetragen — '
+                f'wir konnten keine Uhrzeit erkennen. '
+                f'Warst du inklusive Hin- und Rückweg länger als 8 Stunden unterwegs?'
+            ),
+            'options': [
+                {'value': 'yes',    'label': 'Ja, über 8h'},
+                {'value': 'no',     'label': 'Nein, unter 8h'},
+                {'value': 'time',   'label': 'Uhrzeit eingeben'},
+                {'value': 'unsure', 'label': 'Ich weiß es nicht'},
+            ],
+            'money_impact_estimate': float(c.get('money_impact_estimate', 14.0)),
+            'status': status,
+            'user_answer': ov,
+        })
+
+    # Sortierung: pending zuerst, dann nach money_impact (absteigend), dann Datum
+    items.sort(key=lambda x: (
+        0 if x['status'] == 'pending' else 1,
+        -float(x.get('money_impact_estimate', 0)),
+        x['datum'],
+    ))
+    return items
 
 
 def berechne(form, files):
@@ -10163,7 +10386,7 @@ def berechne(form, files):
 
     # optionale_belege bereits vor Pauschalen-Logik geparst
 
-    # ── OPUS-FINAL-AUDIT: Senior-Steuerberater Cross-Check aller Werte ──
+    # ── OPUS-FINAL-AUDIT: Senior-Werbungskosten-Cross-Check aller Werte ──
     audit_input = {
         'brutto': brutto, 'lohnsteuer': lohnsteuer, 'ag_fahrt_z17': ag_z17,
         'verpflegungszuschuss_z20': verpfl_z20,
@@ -10762,7 +10985,7 @@ def erstelle_pdf(d):
         ("1", "WISO Steuer öffnen",
          "Lege einen neuen Eintrag unter <b>Ausgaben → Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten</b> an."),
         ("2", "Beschreibung eintragen",
-         f"Bei <i>Beschreibung der Auswärtstätigkeit</i> eintragen: <b>Dienstplan-Auswertung AeroTAX {d.get('year', 2025)}</b>."),
+         f"Bei <i>Beschreibung der Auswärtstätigkeit</i> eintragen: <b>Werbungskosten-Auswertung AeroTAX {d.get('year', 2025)}</b>."),
         ("3", f"Gesamtbetrag eintragen:  <b>{eur(d['netto'])}</b>",
          "Trage den ausgewiesenen Gesamtbetrag ein. Der Wert ist eine "
          "<b>zusammengefasste Werbungskosten-Auswertung</b> aus Fahrtkosten, "

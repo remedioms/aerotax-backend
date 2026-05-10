@@ -4487,6 +4487,142 @@ def test_v8201_helper_returns_correct_total():
     assert total == 600 and known is True
 
 
+# ── v8.21 Review-Items + manual_day_overrides ──
+
+def test_v821_apply_manual_overrides_yes():
+    """User-Antwort 'yes' (über 8h) patcht den Tag mit duty=480, time_is_absence=True."""
+    from app import _apply_manual_day_overrides
+    days = [{'datum': '2025-04-09', 'activity_type': 'training'}]
+    overrides = {'2025-04-09': {'over_8h': True, 'source': 'user_review_chatbot'}}
+    out = _apply_manual_day_overrides(days, overrides)
+    assert out[0]['duty_duration_minutes'] == 480
+    assert out[0]['time_is_absence'] is True
+    assert out[0]['_user_review_source'] == 'user_review_chatbot'
+
+
+def test_v821_apply_manual_overrides_no():
+    """User-Antwort 'no' (unter 8h) patcht den Tag mit duty<480."""
+    from app import _apply_manual_day_overrides
+    days = [{'datum': '2025-04-08', 'activity_type': 'training'}]
+    overrides = {'2025-04-08': {'over_8h': False, 'source': 'user_review_chatbot'}}
+    out = _apply_manual_day_overrides(days, overrides)
+    assert out[0]['duty_duration_minutes'] < 480
+    assert out[0]['_user_review_source'] == 'user_review_chatbot'
+
+
+def test_v821_apply_manual_overrides_time():
+    """User-Antwort 'time' (08:30-18:45) berechnet duty=615, time_is_absence=True."""
+    from app import _apply_manual_day_overrides
+    days = [{'datum': '2025-04-07', 'activity_type': 'office'}]
+    overrides = {'2025-04-07': {'start_time': '08:30', 'end_time': '18:45',
+                                  'time_is_absence': True,
+                                  'source': 'user_review_chatbot_time_entry'}}
+    out = _apply_manual_day_overrides(days, overrides)
+    assert out[0]['duty_duration_minutes'] == 615
+    assert out[0]['time_is_absence'] is True
+    assert out[0]['start_time'] == '08:30'
+
+
+def test_v821_apply_manual_overrides_unsure():
+    """User-Antwort 'unsure' lässt Tag unverändert, nur source vermerkt."""
+    from app import _apply_manual_day_overrides
+    days = [{'datum': '2025-09-19', 'activity_type': 'training'}]
+    overrides = {'2025-09-19': {'unsure': True, 'source': 'user_unsure'}}
+    out = _apply_manual_day_overrides(days, overrides)
+    # duty bleibt unverändert
+    assert 'duty_duration_minutes' not in out[0] or out[0].get('duty_duration_minutes') is None
+    assert out[0]['_user_review_source'] == 'user_unsure'
+
+
+def test_v821_apply_overrides_then_classify_yes_yields_z72():
+    """End-to-End: User sagt 'yes' → Klassifikator macht Z72 daraus."""
+    from app import _apply_manual_day_overrides, _deterministic_classify_v7, _match_dp_se_per_day
+    days = [{'datum': '2025-04-09', 'activity_type': 'training',
+             'overnight_after_day': False, 'starts_at_homebase': True,
+             'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'}]
+    overrides = {'2025-04-09': {'over_8h': True, 'source': 'user_review_chatbot'}}
+    patched = _apply_manual_day_overrides(days, overrides)
+    matched = _match_dp_se_per_day({'days': patched}, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Z72'
+    assert t['eur'] == 14.0
+
+
+def test_v821_apply_overrides_then_classify_no_yields_office():
+    """End-to-End: User sagt 'no' → Klassifikator bleibt Office (kein Z72)."""
+    from app import _apply_manual_day_overrides, _deterministic_classify_v7, _match_dp_se_per_day
+    days = [{'datum': '2025-04-08', 'activity_type': 'training',
+             'overnight_after_day': False, 'starts_at_homebase': True,
+             'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'}]
+    overrides = {'2025-04-08': {'over_8h': False, 'source': 'user_review_chatbot'}}
+    patched = _apply_manual_day_overrides(days, overrides)
+    matched = _match_dp_se_per_day({'days': patched}, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Office'
+
+
+def test_v821_build_review_items_office_training_missing():
+    """_build_review_items erzeugt Items aus office_training_time_missing_candidates."""
+    from app import _build_review_items
+    cls_stub = {
+        'office_training_time_missing_candidates': [
+            {'datum': '2025-04-09', 'marker': 'D4 SCHULUNG',
+             'activity_type': 'training', 'money_impact_estimate': 14.0},
+            {'datum': '2025-04-07', 'marker': 'EK BUERODIENST',
+             'activity_type': 'office', 'money_impact_estimate': 14.0},
+        ]
+    }
+    items = _build_review_items(cls_stub)
+    assert len(items) == 2
+    # Sortierung: bei gleichem money_impact nach Datum aufsteigend
+    assert items[0]['datum'] == '2025-04-07'
+    assert items[1]['datum'] == '2025-04-09'
+    # Alle pending
+    assert all(i['status'] == 'pending' for i in items)
+    # Struktur
+    sample = items[0]
+    for k in ('id', 'type', 'severity', 'question', 'options', 'money_impact_estimate'):
+        assert k in sample
+    assert sample['severity'] == 'yellow'
+
+
+def test_v821_build_review_items_with_overrides_marks_answered():
+    """Bereits beantwortete Items werden als status='answered' markiert."""
+    from app import _build_review_items
+    cls_stub = {
+        'office_training_time_missing_candidates': [
+            {'datum': '2025-04-09', 'marker': 'D4 SCHULUNG', 'activity_type': 'training'},
+            {'datum': '2025-04-07', 'marker': 'EK BUERODIENST', 'activity_type': 'office'},
+        ]
+    }
+    overrides = {'2025-04-09': {'over_8h': True, 'source': 'user_review_chatbot'}}
+    items = _build_review_items(cls_stub, manual_day_overrides=overrides)
+    by_date = {i['datum']: i for i in items}
+    assert by_date['2025-04-09']['status'] == 'answered'
+    assert by_date['2025-04-09']['user_answer']['over_8h'] is True
+    assert by_date['2025-04-07']['status'] == 'pending'
+
+
+def test_v821_review_items_in_result_dict():
+    """Berechnetes result-dict enthält _review_items Liste."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-07', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EK BUERODIENST'},
+        {'datum': '2025-04-09', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    cands = result.get('office_training_time_missing_candidates', [])
+    # Beide Tage sollten Kandidaten sein (Office/Training, keine Zeit, keine SE)
+    assert len(cands) == 2
+    dates = sorted([c['datum'] for c in cands])
+    assert dates == ['2025-04-07', '2025-04-09']
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
