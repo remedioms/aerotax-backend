@@ -4,6 +4,19 @@
 
 > **Sonnet reads facts. Python classifies and calculates. ReportLab renders. No AI-generated tax decision is accepted as final.**
 
+> **Die Berechnung ist deterministisch und auditierbar. Die Genauigkeit hängt von der Lesbarkeit und Vollständigkeit der hochgeladenen Dokumente ab. Unklare Stellen werden im Audit sichtbar gemacht — sie werden nicht still als "richtig" angenommen.**
+
+**Was AeroTAX NICHT verspricht:**
+- "100% sicher" / "Steuerberater-sicher" / "Finanzamt-sicher" — solche Aussagen erscheinen NIE in UI/PDF/Marketing
+- "Garantiert korrekt" — die Genauigkeit hängt am Sonnet-Lesergebnis und an der Vollständigkeit der hochgeladenen Dokumente
+- Konkrete Prozent-Zahlen (z.B. "95%") — die kann niemand seriös prüfen
+
+**Was AeroTAX kann:**
+- Deterministische Klassifikation (gleicher Reader-Input → gleicher Output)
+- Vollständiger Audit-Trail (jeder Tag mit reader_facts + classifier_result + diagnostics)
+- Sichtbare Unklarheiten (vma_unmapped_se, unresolved_days, hotel_candidate_issues, iata_unknown, bmf_missing)
+- Health-Status (green/yellow/red) der dem User sagt: "Hier solltest du prüfen"
+
 Strikte Verantwortungs-Trennung — keine Vermischung:
 
 | Schicht | Verantwortung | Was sie NICHT macht |

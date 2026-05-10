@@ -5330,7 +5330,7 @@ def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes=None, year=2025, homebase
             'properties': {
                 'days': {
                     'type': 'array',
-                    'description': f'Liste aller Kalendertage {year} mit dienstlicher Aktivität. FREI/Urlaub/Krank weglassen wenn klar erkennbar.',
+                    'description': f'Liste ALLER sichtbaren Tage in {year}. Tage NIEMALS still auslassen — wenn unklar: activity_type="unknown" + raw_lines + notes. Frei/Urlaub/Krank werden mit activity_type="frei"/"urlaub"/"krank" geliefert (NICHT weggelassen). Nur lange Frei-Sequenzen (z.B. mehrwöchiger Urlaub) können auf einen activity-Tag reduziert werden.',
                     'items': {
                         'type': 'object',
                         'required': ['datum', 'activity_type'],
@@ -5557,17 +5557,35 @@ eigenen Felder. Beispiel:
 ❌ NICHT steuerlich klassifizieren (kein "Z72/Z73/Z76" in den notes — das
    macht ein anderer Schritt)
 
-═════ KOMPAKTHEIT — WICHTIG für Token-Limit ════════════════════════════════
+═════ VOLLSTÄNDIGKEIT — WICHTIGER ALS KOMPAKTHEIT (v8.18) ═══════════════════
 
-- raw_marker max 30 Zeichen
-- notes max 60 Zeichen, NUR wenn echter Hinweis
-- Lass FREI/Urlaub/Krank-Tage einfach WEG (oder min. so kompakt wie möglich)
-- Tour-Continuation-Tage nur wenn nötig — wenn ein Tag eindeutig Mittel-Tag
-  einer mehrtägigen Tour ist, kannst du ihn weglassen wenn der Tour-Start
-  klar markiert ist und du activity_type=tour_continuation auf den Tour-End
-  Tag setzt. ABER: lieber zu viele als zu wenige Tage.
+KRITISCH: Liefere JEDEN sichtbaren Tag aus dem Dienstplan-PDF als eigenes
+day-object. Niemals einen sichtbaren Tag still auslassen.
 
-Ziel: Output passt in 32k Tokens auch bei 365 Tagen. Halte dich kompakt.
+Wenn der Marker für einen Tag UNKLAR ist:
+  • activity_type="unknown"
+  • confidence < 0.5
+  • raw_lines: 1-2 rohe Zeilen aus dem PDF
+  • notes: kurze Erklärung warum unklar
+
+Frei/Urlaub/Krank-Tage:
+  • Liefere als activity_type="frei"/"urlaub"/"krank"
+  • NICHT weglassen — der Backend-Klassifikator braucht die Info dass
+    "an diesem Tag war FREI markiert" (nicht "kein Tag im PDF")
+  • Ausnahme: Mehrwöchiger Urlaub-Block kann auf 1-2 Tage reduziert werden
+    (z.B. "01.07-31.07 Urlaub" → 1 Eintrag)
+
+Tour-Mittel-Tage:
+  • Liefere alle Layover-/FL-Tage einer Tour als eigene day-objects
+  • Keine Auslassung weil "war ja eh nur Layover"
+
+Kompaktheit-Regeln:
+  • raw_marker max 30 Zeichen
+  • notes max 60 Zeichen
+  • raw_lines nur bei Unsicherheit oder Same-Day
+
+Ziel: Output passt in 32k Tokens. Bei 365 Tagen mit kurzen Einträgen
+machbar. Vollständigkeit > Kompaktheit.
 
 LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
 
@@ -7210,8 +7228,24 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 if klass == 'Issue':
                     unresolved_reason = f'activity_type={at} unklar'
 
-        # VMA-Unmapped-SE-Check: aktive SE ohne Z72/73/74/76?
+        # v8.18: Anti-Stochastik-Final-Check für aktive SE-Zeilen
+        # Wenn klass=Issue (ANY Issue-Pfad) und aktive Auslands-SE existiert,
+        # reklassifiziere deterministisch zu Z76. Sonnet-Stochastik darf nicht
+        # entscheiden ob Tag stochastisch Z76 oder Issue wird.
         has_active_se_final = se.get('count', 0) > 0 and float(se.get('stfrei_total', 0) or 0) > 0
+        if (klass == 'Issue' and has_active_se_final
+                and se.get('stfrei_inland') is False and se.get('stfrei_ort')):
+            se_ort_rescue = se.get('stfrei_ort', '')
+            bmf_aus_rescue = _bmf(se_ort_rescue)
+            eur_added = float((bmf_aus_rescue.get('an_abreise', 0) if bmf_aus_rescue else 28.0) or 0)
+            old_reason = reason
+            klass = 'Z76'
+            reason = f'Aktive Auslands-SE {se_ort_rescue} — Anti-Stochastik-Z76 (war: {old_reason[:50]})'
+            audit_note = f'{datum}: aktive Auslands-SE {se_ort_rescue} → Z76 (Issue→Z76-Rescue)'
+            unresolved_reason = None
+            print(f"[v8-anti-stochastik] datum={datum} ort={se_ort_rescue} reason='Issue→Z76 (active foreign SE)'")
+
+        # VMA-Unmapped-SE-Check: aktive SE ohne Z72/73/74/76?
         if has_active_se_final and klass not in ('Z72', 'Z73', 'Z74', 'Z76'):
             vma_unmapped_se.append({
                 'datum': datum,
@@ -7247,22 +7281,35 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         else:
             dienstlich = False  # Frei/Issue
 
-        # v8.7: BMF-Land/Tagtyp für Z76 ableiten
+        # v8.7/v8.18: BMF-Land/Tagtyp für Z76 ableiten.
+        # v8.18: Z76 MUSS einen tagtyp haben — leerer tagtyp = fallback_issue
+        # mit Audit-Hinweis (statt still leer zu bleiben).
         bmf_land = ''
+        bmf_key = ''
         bmf_tagtyp = ''
         if klass == 'Z76':
             try:
                 from bmf_data import IATA_TO_BMF
-                ort_for_bmf = (d.get('layover_ort') or se.get('stfrei_ort') or '').upper()
+                ort_for_bmf = (se.get('stfrei_ort') or d.get('layover_ort') or '').upper()
                 if ort_for_bmf and not _is_inland_code(ort_for_bmf):
                     bmf_land = IATA_TO_BMF.get(ort_for_bmf, '') or ''
+                    bmf_key = bmf_land
             except Exception:
                 pass
-            # tagtyp aus Reason ableiten (an_abreise / 24h)
-            if 'An/Ab' in reason or 'Anreise' in reason or 'Heimkehr' in reason or 'Abreise' in reason:
-                bmf_tagtyp = 'an_abreise'
-            elif 'Volltag' in reason or '24h' in reason:
+            # tagtyp aus Reason ableiten (Bestpraxis — wir setzen reason-Strings konsistent)
+            r_low = (reason or '').lower()
+            if 'same-day' in r_low or 'same_day' in r_low or '>8h' in r_low:
+                bmf_tagtyp = 'same_day_8h'
+            elif 'volltag' in r_low or '24h' in r_low:
                 bmf_tagtyp = 'voll_24h'
+            elif 'heimkehr' in r_low or 'abreise' in r_low or 'an/ab' in r_low:
+                bmf_tagtyp = 'an_abreise'
+            elif 'anreise' in r_low:
+                bmf_tagtyp = 'anreise'
+            else:
+                # v8.18: Fallback — Z76 ohne ableitbaren Tagtyp ist suspect
+                bmf_tagtyp = 'fallback_issue'
+                audit_note = audit_note or f'{datum}: Z76 ohne ableitbaren bmf_tagtyp (Pauschal-Fallback)'
 
         # v8.7: Architektur-saubere nested Audit-Struktur — getrennt nach
         # Reader-Fakt vs Classifier-Entscheidung vs Diagnostics. Backward-
@@ -7330,6 +7377,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'amount': round(eur_added, 2),
             'reason': reason,
             'bmf_land': bmf_land,
+            'bmf_key': bmf_key,
             'bmf_tagtyp': bmf_tagtyp,
             'z73_type': z73_type,           # v8.14: explizites Subtyp-Flag
             'counted_as_workday': klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby') or (klass == 'ZeroDay' and dienstlich),
@@ -8616,7 +8664,55 @@ def hybrid_analyze(form, files):
                     classification = _deterministic_classify_v7(matched, year, homebase,
                                                                  commute_minutes=commute_min)
                     classification['_v7_used'] = True
+
+                    # v8.18: Post-Classification-Health-Update — Probleme aus
+                    # Klassifikation reflektieren (vma_unmapped/iata_unknown/etc.)
+                    vma_unmapped_n = len(classification.get('vma_unmapped_se', []) or [])
+                    iata_unknown_n = len(classification.get('iata_unknown', []) or [])
+                    bmf_missing_n  = len(classification.get('bmf_missing', []) or [])
+                    hotel_issues_n = len(classification.get('hotel_candidate_issues', []) or [])
+                    unresolved_n   = len(classification.get('unresolved_days', []) or [])
+
+                    if vma_unmapped_n > 0:
+                        document_health.setdefault('issues', []).append({
+                            'source': 'CLASSIFIER', 'severity': 'yellow',
+                            'reason': f'{vma_unmapped_n} aktive SE-Zeilen ohne VMA-Klassifikation'
+                        })
+                        if document_health.get('status') == 'green':
+                            document_health['status'] = 'yellow'
+                    if iata_unknown_n > 0:
+                        document_health.setdefault('issues', []).append({
+                            'source': 'BMF', 'severity': 'yellow',
+                            'reason': f'{iata_unknown_n} unbekannte IATA-Codes (Auslandstage könnten falsch berechnet sein)'
+                        })
+                        if document_health.get('status') == 'green':
+                            document_health['status'] = 'yellow'
+                    if bmf_missing_n > 0:
+                        document_health.setdefault('issues', []).append({
+                            'source': 'BMF', 'severity': 'red',
+                            'reason': f'{bmf_missing_n} fehlende BMF-Mappings (aktive Auslands-SE ohne Pauschalen-Wert)'
+                        })
+                        document_health['status'] = 'red'
+                    if hotel_issues_n > 0:
+                        document_health.setdefault('issues', []).append({
+                            'source': 'CLASSIFIER', 'severity': 'yellow',
+                            'reason': f'{hotel_issues_n} Hotel-Candidate-Issues (overnight ohne Layover-Ort)'
+                        })
+                        if document_health.get('status') == 'green':
+                            document_health['status'] = 'yellow'
+                    if unresolved_n > 3:
+                        document_health.setdefault('issues', []).append({
+                            'source': 'CLASSIFIER', 'severity': 'yellow',
+                            'reason': f'{unresolved_n} unresolved_days (>3) — Klassifikation unklar'
+                        })
+                        if document_health.get('status') == 'green':
+                            document_health['status'] = 'yellow'
+
                     classification['_document_health'] = document_health
+                    print(f"[v8-health-final] status={document_health['status']} "
+                          f"vma_unmapped={vma_unmapped_n} iata_unknown={iata_unknown_n} "
+                          f"bmf_missing={bmf_missing_n} hotel_issues={hotel_issues_n} "
+                          f"unresolved={unresolved_n}")
             else:
                 print(f"[v8] Sonnet-DP lieferte keine Tagesdaten — Job-Error")
         except Exception as e:

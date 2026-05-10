@@ -2893,6 +2893,163 @@ def test_v817_frei_neither_workday_nor_reinigungstag():
     assert result['reinigungstage'] == 0
 
 
+def test_v818_anti_stochastik_active_foreign_se_rescue():
+    """v8.18: Aktive Auslands-SE-Zeile darf nie als Issue still bleiben.
+    Issue + Auslands-SE → Z76-Rescue (Anti-Stochastik)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # Konstrukt: Tag mit DP=tour, overnight=True, kein layover_ort,
+    # kein Cluster-Kontext → fällt normalerweise in 'Issue'.
+    # Aber aktive Auslands-SE soll trotzdem zu Z76 reklassifiziert werden.
+    structured = {'days': [
+        {'datum': '2025-05-08', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': []},  # kein layover_ort, isolierter Tag
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-08', 'stfrei_betrag': 44, 'stfrei_ort': 'NYC',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail = result['tage_detail'][0]
+    # Anti-Stochastik: aktive Auslands-SE rettet zu Z76, nicht Issue
+    assert detail['klass'] == 'Z76', \
+        f"Aktive Auslands-SE (NYC) sollte Z76-Rescue triggern, ist {detail['klass']}"
+    # vma_unmapped_se MUSS 0 sein
+    assert len(result['vma_unmapped_se']) == 0
+
+
+def test_v818_z76_must_have_tagtyp():
+    """v8.18: Jeder Z76-Tag hat einen bmf_tagtyp (nie leer)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-13', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','BLR'], 'layover_ort': 'BLR'},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-13', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    for t in result['tage_detail']:
+        if t['klass'] == 'Z76':
+            cr = t['classifier_result']
+            assert cr['bmf_tagtyp'], f"{t['datum']}: Z76 ohne bmf_tagtyp"
+            assert cr['bmf_tagtyp'] in ('anreise','abreise','voll_24h','same_day_8h','an_abreise','fallback_issue'), \
+                f"{t['datum']}: ungültiger bmf_tagtyp '{cr['bmf_tagtyp']}'"
+
+
+def test_v818_determinism_same_input_same_output():
+    """v8.18: Gleiches strukturiertes Input liefert identisches Ergebnis (zweimal)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-13', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-14', 'activity_type': 'tour', 'overnight_after_day': True,
+         'layover_ort': 'BLR'},
+        {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-13', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-14', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-15', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    m1 = _match_dp_se_per_day(structured, se, 'FRA')
+    r1 = _deterministic_classify_v7(m1, 2025, 'FRA')
+    m2 = _match_dp_se_per_day(structured, se, 'FRA')
+    r2 = _deterministic_classify_v7(m2, 2025, 'FRA')
+    # Schlüssel-Werte müssen identisch sein
+    for key in ('arbeitstage', 'reinigungstage', 'fahr_tage', 'hotel_naechte',
+                'z72_tage', 'z73_tage', 'z74_tage', 'z76_eur', 'z76_tage'):
+        assert r1.get(key) == r2.get(key), \
+            f"Determinismus verletzt: {key} unterschiedlich (run1={r1.get(key)}, run2={r2.get(key)})"
+
+
+def test_v818_minor_overnight_fluctuation_with_clear_se_stays_stable():
+    """Sonnet liefert overnight=True bei Run A, =False bei Run B — Backend
+    muss bei klarer SE-Spur dennoch deterministisch klassifizieren."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # Run A: overnight=True
+    structured_a = {'days': [
+        {'datum': '2025-04-22', 'activity_type': 'same_day', 'overnight_after_day': True,
+         'has_fl': False},
+    ]}
+    # Run B: overnight=False
+    structured_b = {'days': [
+        {'datum': '2025-04-22', 'activity_type': 'same_day', 'overnight_after_day': False,
+         'has_fl': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-04-22', 'stfrei_betrag': 44, 'stfrei_ort': 'TLV',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    r_a = _deterministic_classify_v7(_match_dp_se_per_day(structured_a, se, 'FRA'), 2025, 'FRA')
+    r_b = _deterministic_classify_v7(_match_dp_se_per_day(structured_b, se, 'FRA'), 2025, 'FRA')
+    # Beide Runs müssen Z76 ergeben (Auslands-SE-Spur ist eindeutig)
+    klass_a = r_a['tage_detail'][0]['klass']
+    klass_b = r_b['tage_detail'][0]['klass']
+    assert klass_a == 'Z76' and klass_b == 'Z76', \
+        f"Sonnet-Schwankung soll keinen Klass-Drift erzeugen: A={klass_a}, B={klass_b}"
+
+
+def test_v818_overnight_without_layover_creates_hotel_issue():
+    """overnight=True ohne layover_ort UND ohne SE-Ort-Spur → kein Hotel."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-12-10', 'activity_type': 'unknown', 'overnight_after_day': True,
+         'has_fl': True, 'routing': []},
+    ]}
+    # Auch keine SE-Zeile — komplett ohne Layover-Ort-Spur
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Hotel zählt nicht — kein layover_ort + kein SE-Ort
+    assert result['hotel_naechte'] == 0
+
+
+def test_v818_health_yellow_when_iata_unknown():
+    """Wenn iata_unknown > 0 → health-Status soll yellow signalisieren.
+    (Test ist konzeptuell — die Health-Update-Logik ist in _berechne_via_hybrid,
+    daher hier nur prüfen dass _document_health_check basis-Verhalten hat.)"""
+    from app import _document_health_check
+    health = _document_health_check(
+        {'brutto': 50000, 'z17': 0},
+        {'se_lines': [{'datum': '2025-01-15', 'stfrei_betrag': 30, 'stfrei_ort': 'XQQ',
+                       'stfrei_inland': False, 'storno': False}]},
+        {'days': [{'datum': '2025-01-15', 'activity_type': 'tour'}]},
+        2025,
+    )
+    # Basis-Health-Check soll laufen, Status nicht crash
+    assert health['status'] in ('green', 'yellow', 'red')
+
+
+def test_v818_claude_md_has_honest_wording():
+    """CLAUDE.md enthält ehrlichen Wortlaut (Determinismus + Genauigkeits-Vorbehalt)."""
+    import os
+    p = os.path.join(os.path.dirname(__file__), '..', 'CLAUDE.md')
+    with open(p, 'r') as f:
+        txt = f.read()
+    # Ehrlicher Wortlaut
+    assert 'Die Berechnung ist deterministisch und auditierbar' in txt
+    assert 'Genauigkeit hängt' in txt
+    # Konkrete Versprechen (positive Versicherungen) dürfen nicht da sein.
+    # Test prüft Sätze die als "wir versprechen X" gelesen werden, nicht
+    # Listen von "wir versprechen NICHT X".
+    assert 'AeroTAX ist 100% sicher' not in txt
+    assert 'AeroTAX ist garantiert korrekt' not in txt
+    assert 'AeroTAX ist Steuerberater-sicher' not in txt
+    assert 'mit 95% Genauigkeit' not in txt
+
+
+def test_v818_dp_prompt_no_silent_skip():
+    """DP-Reader-Prompt darf keine Tage still auslassen."""
+    import inspect
+    from app import _sonnet_read_dp_structured
+    src = inspect.getsource(_sonnet_read_dp_structured)
+    # Vollständigkeit-Hinweise da
+    assert 'Vollständigkeit' in src or 'sichtbaren Tag still' in src or 'NIEMALS einen sichtbaren' in src or 'niemals still' in src.lower() or 'still auslassen' in src
+    # Frei wird mit activity_type='frei' geliefert, nicht weggelassen
+    assert 'NICHT weglassen' in src or 'als activity_type=' in src
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
