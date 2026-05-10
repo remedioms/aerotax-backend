@@ -3756,6 +3756,197 @@ def test_v8184_explicit_daily_commute_overrides_sm():
     assert seqs[0]['why_collapsed'] is False
 
 
+# ── v8.18.5 Heimkehr-Anti-Drift-Tests ──
+# Sonnet liest manchmal overnight=True auch für den Heimkehr-Tag (Reader-Drift).
+# v8.18.5 muss Hotel trotzdem korrekt verweigern wenn Routing/Cluster auf
+# Heimkehr deuten.
+
+def test_v8185_icn_homecoming_with_buggy_overnight_no_hotel():
+    """3-Tages-ICN-Tour: An, Volltag, Heimkehr. Sonnet markiert fälschlich
+    auch Heimkehrtag mit overnight=True. Hotel darf trotzdem nicht zählen
+    am Heimkehrtag. Erwartet: 2 Hotelnächte (An+Voll), nicht 3."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','ICN'], 'layover_ort': 'ICN',
+         'starts_at_homebase': True, 'requires_commute': True},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'ICN'},
+        {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['ICN','FRA'], 'ends_at_homebase': True},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 30, 'stfrei_ort': 'ICN', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 39, 'stfrei_ort': 'ICN', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-05', 'stfrei_betrag': 30, 'stfrei_ort': 'ICN', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['hotel_naechte'] == 2, \
+        f"ICN-Heimkehr darf trotz overnight=True nicht zählen: {result['hotel_naechte']}"
+
+
+def test_v8185_gru_homecoming_via_routing_no_hotel():
+    """GRU-Heimkehr: ends_at_homebase=False (Sonnet-Bug) ABER routing endet FRA."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-29', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','GRU'], 'layover_ort': 'GRU',
+         'starts_at_homebase': True, 'requires_commute': True},
+        {'datum': '2025-05-30', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'GRU'},
+        # Heimkehr: routing endet FRA, aber Sonnet hat ends_at_homebase nicht gesetzt
+        # und overnight_after_day=True (Reader-Bug)
+        {'datum': '2025-05-31', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['GRU','FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-29', 'stfrei_betrag': 30, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-05-30', 'stfrei_betrag': 47, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-05-31', 'stfrei_betrag': 30, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['hotel_naechte'] == 2, \
+        f"GRU-Heimkehr (routing→FRA, ends_at_homebase=false) darf nicht zählen: {result['hotel_naechte']}"
+
+
+def test_v8185_sfo_homecoming_routing_endsat_fra_no_hotel():
+    """SFO-Heimkehr: routing[-1]=FRA → kein Hotel am Heimkehrtag."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-03-31', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','SFO'], 'layover_ort': 'SFO',
+         'starts_at_homebase': True, 'requires_commute': True},
+        {'datum': '2025-04-01', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'SFO'},
+        {'datum': '2025-04-02', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'SFO'},
+        {'datum': '2025-04-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['SFO','FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-03-31', 'stfrei_betrag': 30, 'stfrei_ort': 'SFO', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-04-01', 'stfrei_betrag': 30, 'stfrei_ort': 'SFO', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-04-02', 'stfrei_betrag': 30, 'stfrei_ort': 'SFO', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-04-03', 'stfrei_betrag': 30, 'stfrei_ort': 'SFO', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['hotel_naechte'] == 3, \
+        f"SFO 4-Tage-Tour: 3 Hotelnächte (An+Voll+Voll), nicht 4: {result['hotel_naechte']}"
+
+
+def test_v8185_inland_ham_homecoming_no_hotel():
+    """Inland-Tour HAM-FRA-Heimkehr darf nicht zählen."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-03-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','HAM'], 'layover_ort': 'HAM',
+         'starts_at_homebase': True, 'requires_commute': True},
+        {'datum': '2025-03-05', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['HAM','FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-03-04', 'stfrei_betrag': 14, 'stfrei_ort': 'HAM', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-03-05', 'stfrei_betrag': 14, 'stfrei_ort': 'HAM', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['hotel_naechte'] == 1, \
+        f"HAM-Heimkehr darf nicht zählen, nur HAM-Layover-Nacht: {result['hotel_naechte']}"
+
+
+def test_v8185_real_layover_outside_homebase_still_counts():
+    """Echter Layover-Tag (overnight=True, layover_ort=AUS) zählt weiterhin."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-08', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','SIN'], 'layover_ort': 'SIN',
+         'starts_at_homebase': True, 'requires_commute': True},
+        {'datum': '2025-06-09', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'SIN'},
+        {'datum': '2025-06-10', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'SIN'},
+        {'datum': '2025-06-11', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['SIN','FRA'], 'ends_at_homebase': True},
+    ]}
+    se = {'se_lines': [
+        {'datum': d, 'stfrei_betrag': 35, 'stfrei_ort': 'SIN', 'stfrei_inland': False, 'storno': False}
+        for d in ('2025-06-08','2025-06-09','2025-06-10','2025-06-11')
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 3 Hotelnächte (An, Voll, Voll) — Heimkehr 11.06 zählt nicht (overnight=False sowieso)
+    assert result['hotel_naechte'] == 3, \
+        f"Echte SIN-Layover-Tour: 3 Hotelnächte, ist {result['hotel_naechte']}"
+
+
+def test_v8185_evening_foreign_tour_start_no_hotel():
+    """Z73 evening_foreign_tour_start zählt nicht als Hotel (User schläft im Flugzeug)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-19', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': False, 'routing': ['FRA','GRU'], 'layover_ort': 'GRU',
+         'start_time': '21:25', 'starts_at_homebase': True, 'requires_commute': True},
+        {'datum': '2025-01-20', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'GRU'},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-19', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-01-20', 'stfrei_betrag': 47, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 1 Hotelnacht (20.01 GRU). 19.01 ist evening_foreign → kein Hotel.
+    assert result['hotel_naechte'] == 1, \
+        f"evening_foreign_tour_start darf nicht zählen: {result['hotel_naechte']}"
+
+
+def test_v8185_homebase_layover_ort_no_hotel():
+    """layover_ort = Homebase (Sonnet-Stempel auf Auslandstag) zählt nicht als Hotel."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-08-12', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','YVR'], 'layover_ort': 'FRA',
+         'starts_at_homebase': True, 'requires_commute': True},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-08-12', 'stfrei_betrag': 30, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['hotel_naechte'] == 0, \
+        f"layover_ort=FRA darf nicht als Hotel zählen: {result['hotel_naechte']}"
+
+
+def test_v8185_extra_hotelnaechte_audit_fields():
+    """v8.18.5: extra_hotelnaechte enthält ends_at_homebase / cluster_id-Felder."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','ICN'], 'layover_ort': 'ICN',
+         'starts_at_homebase': True, 'requires_commute': True},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'ICN'},
+        {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['ICN','FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': d, 'stfrei_betrag': 30, 'stfrei_ort': 'ICN', 'stfrei_inland': False, 'storno': False}
+        for d in ('2025-01-03','2025-01-04','2025-01-05')
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    eh = result.get('extra_hotelnaechte') or []
+    assert len(eh) >= 1
+    sample = eh[0]
+    for key in ('datum','klass','routing','layover_ort','overnight_after_day',
+                'ends_at_homebase','ends_at_homebase_robust','cluster_id',
+                'counted_as_hotel_nacht','reason_counted'):
+        assert key in sample, f"extra_hotelnaechte ohne Feld '{key}'"
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

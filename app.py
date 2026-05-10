@@ -7760,44 +7760,94 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     hotel_skipped = []
     hotel_candidate_issues = []  # v8.16: overnight=true ohne layover_ort etc.
 
-    def _hotel_check(i, t, m, prev_m):
-        """v8.16: Harter Check für Hotelnacht. Liefert (counted, reason).
+    # v8.18.5: Anti-Drift-Helper gegen Sonnet-overnight-Stochastik.
+    # Heimkehr zur Homebase schlägt ein eventuell falsch gelesenes overnight=True.
 
+    def _routing_ends_at_homebase(d):
+        """Routing-Liste endet an Homebase (letzter IATA)."""
+        routing = d.get('routing') or []
+        if not routing:
+            return False
+        last = (routing[-1] or '').upper().strip()
+        return last == homebase_upper
+
+    def _ends_at_homebase_robust(d):
+        """ends_at_homebase ODER Routing endet an Homebase."""
+        return bool(d.get('ends_at_homebase')) or _routing_ends_at_homebase(d)
+
+    def _has_prior_foreign_layover(idx):
+        """Hatte der vorhergehende Tag ODER der laufende Tour-Cluster einen
+        Layover außerhalb Homebase?"""
+        if idx <= 0:
+            return False
+        prev_d = sorted_days[idx-1]['dp']
+        prev_layover = (prev_d.get('layover_ort')
+                        or sorted_days[idx-1]['se'].get('stfrei_ort') or '').upper()
+        if prev_d.get('overnight_after_day') and prev_layover and prev_layover != homebase_upper:
+            return True
+        # Cluster-Lookup: gehört Tag zu Cluster, der einen has_foreign-Tag enthält?
+        c = cluster_for_idx.get(idx)
+        if c and c.get('has_foreign'):
+            return True
+        return False
+
+    def _has_subsequent_foreign_layover(idx):
+        """Gibt es nach idx noch einen Tag mit Layover außerhalb Homebase, BEVOR
+        eine neue Homebase-Phase (Frei/Standby/Office) eintritt?"""
+        for j in range(idx + 1, len(sorted_days)):
+            m_n = sorted_days[j]
+            d_n = m_n['dp']
+            if not d_n.get('overnight_after_day'):
+                # Tag ohne overnight bricht Auslandsphase
+                if d_n.get('activity_type') in ('frei', 'urlaub', 'krank',
+                                                  'standby', 'office', 'unknown', 'none', ''):
+                    return False
+                continue
+            layover_n = (d_n.get('layover_ort')
+                         or m_n['se'].get('stfrei_ort') or '').upper()
+            if layover_n and layover_n != homebase_upper:
+                return True
+            # Layover an Homebase oder leer → weiter schauen
+        return False
+
+    def _hotel_check(i, t, m, prev_m):
+        """v8.18.5: Harter Check für Hotelnacht.
         counted=True nur wenn:
         - overnight_after_day=true
         - klass in Z73/Z74/Z76
         - z73_type != evening_foreign_tour_start
-        - layover_ort vorhanden
-        - layover_ort != Homebase
+        - layover_ort vorhanden + ≠ Homebase
         - kein SE-only/unknown-Nachlauf
-        - kein Heimkehr-Pattern (Vortag overnight + heute ends_at_homebase)
+        - KEIN Heimkehr-Pattern (robust):
+            ends_at_homebase ODER Routing endet an Homebase
+            UND prior_foreign_layover (Vortag/Cluster)
+            UND KEIN nachfolgender Foreign-Layover
+
+        Returns (counted, reason).
         """
         d = m['dp']
         cr = t.get('classifier_result') or {}
         klass = t['klass']
-        # 1. overnight=true ist Voraussetzung (außerhalb dieser Funktion gefiltert)
         if not d.get('overnight_after_day'):
             return False, 'no_overnight'
-        # 2. Klass muss Hotel-relevant sein
         if klass not in HOTEL_KLASSEN:
             return False, f'klass={klass}_not_hotel'
-        # 3. evening_foreign_tour_start zählt nicht (User schläft im Flugzeug)
         if cr.get('z73_type') == 'evening_foreign_tour_start':
             return False, 'evening_foreign_tour_start'
-        # 4. layover_ort muss vorhanden sein
         layover_ort_local = (d.get('layover_ort') or m['se'].get('stfrei_ort') or '').upper()
         if not layover_ort_local:
-            return False, 'no_layover_ort'  # Hotel-Candidate-Issue (siehe Audit)
-        # 5. layover_ort darf nicht Homebase sein
+            return False, 'no_layover_ort'
         if layover_ort_local == homebase_upper:
             return False, f'layover={layover_ort_local}=Homebase'
-        # 6. SE-only/unknown ohne SE-Spur ist Nachlauf, nicht Hotel
         at_local = d.get('activity_type', '')
         has_active_se_local = m['se'].get('count', 0) > 0 and float(m['se'].get('stfrei_total', 0) or 0) > 0
         if at_local in ('unknown', 'none', '') and not has_active_se_local:
             return False, 'unknown_without_se_spur'
-        # 7. Heimkehr-Pattern: Vortag overnight + heute ends_at_homebase = Heimkehr,
-        # auch wenn Sonnet overnight=True markiert hat (Reader-Lesefehler)
+        # v8.18.5: Robuste Heimkehr-Erkennung — schlägt falsch gelesenes overnight=True
+        if _ends_at_homebase_robust(d) and _has_prior_foreign_layover(i):
+            if not _has_subsequent_foreign_layover(i):
+                return False, 'heimkehr_homebase_kein_neuer_foreign_layover'
+        # Legacy-Heimkehr (Vortag overnight + ends_at_homebase) als Fallback
         if prev_m and prev_m['dp'].get('overnight_after_day') and d.get('ends_at_homebase'):
             return False, 'heimkehr_pattern_despite_overnight'
         return True, 'ok'
@@ -7915,6 +7965,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     why_susp = f'overnight + Layover {layover_ort} ≠ Homebase, aber klass={klass}'
 
             if counted_h or why_susp:
+                # v8.18.5: erweiterter Audit für Heimkehr-Erkennung
+                ends_homebase_robust = bool(d.get('ends_at_homebase')) or (
+                    (d.get('routing') or [''])[-1] or ''
+                ).upper().strip() == hb_upper if d.get('routing') else False
                 extra_hotelnaechte.append({
                     'datum':                       datum,
                     'klass':                       klass,
@@ -7922,6 +7976,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'routing':                     t_diag.get('routing', ''),
                     'layover_ort':                 layover_ort,
                     'overnight_after_day':         overnight,
+                    'ends_at_homebase':            bool(d.get('ends_at_homebase')),
+                    'ends_at_homebase_robust':     ends_homebase_robust,
+                    'cluster_id':                  cluster.get('_id') if cluster else None,
+                    'cluster_foreign':             cluster_foreign,
                     'z73_type':                    z73_type_diag,
                     'is_evening_foreign_tour_start': z73_type_diag == 'evening_foreign_tour_start',
                     'counted_as_hotel_nacht':      counted_h,
