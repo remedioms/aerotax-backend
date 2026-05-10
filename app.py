@@ -6966,25 +6966,46 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 # = echter Inland-Layover → Z73/Z74 wie gewohnt.
                 inland_is_homebase = today_layover_ort.upper() == hb_upper
                 if cluster_foreign and inland_is_homebase:
-                    target_iata = ''
-                    for ci in cluster['indices']:
-                        cm = sorted_days[ci]
-                        if cm['dp'].get('overnight_after_day'):
-                            cand = cm['se'].get('stfrei_ort') or cm['dp'].get('layover_ort', '')
-                            if cand and not _is_inland_code(cand):
-                                target_iata = cand
-                                break
-                    klass = 'Z76'
-                    bmf_aus = _bmf(target_iata)
-                    if is_anreise or is_abreise:
-                        eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
-                        position = 'An/Ab'
+                    # v8.12: Vor der Z76-Standard-Logik: Abend-Anreise-Regel auch hier.
+                    # Bei FRA-SE-Stempel + cluster_foreign + is_anreise + start_time>=18
+                    # → Z73 Inland-Anreise 14€ (statt Z76 An/Ab des Ziellands).
+                    # Tag dominant in DE verbracht (User boardet abends in FRA).
+                    start_time_str_v12 = d.get('start_time', '') or ''
+                    evening_anreise_v12 = False
+                    if is_anreise and start_time_str_v12 and ':' in start_time_str_v12:
+                        try:
+                            sh = int(start_time_str_v12.split(':')[0])
+                            if sh >= 18:
+                                evening_anreise_v12 = True
+                        except (ValueError, IndexError):
+                            pass
+
+                    if evening_anreise_v12:
+                        klass = 'Z73'
+                        eur_added = INLAND_AN_ABREISE
+                        reason = f'Auslandstour-Anreise mit FRA-Stempel + Abend-Briefing {start_time_str_v12} → Inland 14€'
+                        audit_note = f'{datum}: Homebase-SE-Stempel {today_layover_ort}, Briefing {start_time_str_v12} → Z73 Inland (Tag dominant in DE)'
+                        print(f"[v8-z73-detail] datum={datum} stempel={today_layover_ort} start={start_time_str_v12} reason='FRA-Stempel + Abend-Anreise → Z73'")
                     else:
-                        eur_added = float((bmf_aus.get('voll_24h', 0) if bmf_aus else 28.0) or 0)
-                        position = 'Volltag'
-                    reason = f'Auslandstour-{position} (Homebase-Stempel {today_layover_ort}, Ziel {target_iata or "?"}) Z76'
-                    audit_note = f'{datum}: Homebase-SE-Stempel {today_layover_ort} bei Auslands-Cluster — als Z76 {position}'
-                    print(f"[v8-inland-blocked-foreign-cluster] datum={datum} stempel={today_layover_ort} reason='Homebase-Stempel auf Auslandstour — kein Z73/Z74'")
+                        target_iata = ''
+                        for ci in cluster['indices']:
+                            cm = sorted_days[ci]
+                            if cm['dp'].get('overnight_after_day'):
+                                cand = cm['se'].get('stfrei_ort') or cm['dp'].get('layover_ort', '')
+                                if cand and not _is_inland_code(cand):
+                                    target_iata = cand
+                                    break
+                        klass = 'Z76'
+                        bmf_aus = _bmf(target_iata)
+                        if is_anreise or is_abreise:
+                            eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+                            position = 'An/Ab'
+                        else:
+                            eur_added = float((bmf_aus.get('voll_24h', 0) if bmf_aus else 28.0) or 0)
+                            position = 'Volltag'
+                        reason = f'Auslandstour-{position} (Homebase-Stempel {today_layover_ort}, Ziel {target_iata or "?"}) Z76'
+                        audit_note = f'{datum}: Homebase-SE-Stempel {today_layover_ort} bei Auslands-Cluster — als Z76 {position}'
+                        print(f"[v8-inland-blocked-foreign-cluster] datum={datum} stempel={today_layover_ort} reason='Homebase-Stempel auf Auslandstour — kein Z73/Z74'")
                 elif is_volltag:
                     # Echter Inland-Volltag (Inland-Layover ≠ Homebase, oder reiner Inland-Cluster)
                     klass = 'Z74'
@@ -7462,7 +7483,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             })
 
         # missing_z76_candidates: Auslands-SE-Zeile oder Foreign-Cluster aber kein Z76
-        if klass not in ('Z76',):
+        # v8.12: Z73 mit Abend-Anreise-Reason ist legitim (nicht missing_z76).
+        is_legitimate_z73_evening = klass == 'Z73' and 'Abend-Briefing' in (
+            tage_detail[i].get('begruendung','') if i < len(tage_detail) else '')
+        if klass not in ('Z76',) and not is_legitimate_z73_evening:
             if has_active_se and se_inland is False:
                 missing_z76_candidates.append({
                     'datum': datum, 'klass': klass, 'se_ort': se_ort,
@@ -7501,13 +7525,14 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'reason': f'Inland-Layover {effective_ort} im Inland-Cluster → Z73-Kandidat (aktuell {klass})'
                 })
 
-        # v8.11: aerotax_z76_dates_amounts — alle Z76-Tage mit Detail für Reference-Diff
+        # v8.12: aerotax_z76_dates_amounts — Bug-Fix: amount aus tage_detail.eur
+        # statt aus eur_added (das ist im Diagnose-Loop am Ende nicht mehr aktuell).
         if klass == 'Z76':
             t_detail = tage_detail[i] if i < len(tage_detail) else {}
             cr = t_detail.get('classifier_result') or {}
             aerotax_z76_dates_amounts.append({
                 'datum':       datum,
-                'amount':      round(eur_added, 2),
+                'amount':      round(t_detail.get('eur', 0), 2),
                 'layover_ort': effective_ort,
                 'bmf_land':    cr.get('bmf_land', '') or '',
                 'tagtyp':      cr.get('bmf_tagtyp', '') or '',

@@ -1124,6 +1124,7 @@ IATA_TO_BMF = {
     "KBV": "Thailand",
     "KCH": "Malaysia",
     "KEF": "Island",
+    "REK": "Island",  # alternativer City-Code für Reykjavik
     "KGL": "Ruanda",
     "KHH": "Taiwan",
     "KHI": "Pakistan",

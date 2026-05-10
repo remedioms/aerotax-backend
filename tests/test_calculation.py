@@ -2329,6 +2329,77 @@ def test_v811_missing_reader_days_detected():
         f"02.06 sollte als missing_reader_day erkannt werden, ist {result['missing_reader_days']}"
 
 
+def test_v812_fra_se_stempel_evening_anreise_z73():
+    """FRA-SE-Stempel + cluster_foreign + is_anreise + start_time>=18 → Z73 14€.
+    Live-Bug aus job a9222a3c: 19.01 LH0506 FRA-GRU mit start=21:25 + SE-Ort=FRA
+    landete im v8.5-Branch als Z76, statt v8.10-Z73."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-19', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': False, 'routing': ['FRA', 'GRU'], 'layover_ort': 'GRU',
+         'start_time': '21:25', 'starts_at_homebase': True},
+        {'datum': '2025-01-20', 'activity_type': 'tour', 'overnight_after_day': True,
+         'layover_ort': 'GRU'},
+        {'datum': '2025-01-21', 'activity_type': 'tour', 'overnight_after_day': True,
+         'layover_ort': 'GRU'},
+        {'datum': '2025-01-22', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        # FRA-SE-Stempel auf Anreisetag (häufig bei LH-Auslandsflügen)
+        {'datum': '2025-01-19', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-01-20', 'stfrei_betrag': 47, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-21', 'stfrei_betrag': 47, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-22', 'stfrei_betrag': 31, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail_19 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-19']
+    assert detail_19 and detail_19[0]['klass'] == 'Z73', \
+        f"FRA-SE-Stempel + Abend-Anreise sollte Z73 sein, ist {detail_19[0]['klass']}"
+    assert detail_19[0]['eur'] == 14.0
+
+
+def test_v812_aerotax_z76_amounts_match_tage_detail():
+    """aerotax_z76_dates_amounts.amount muss mit tage_detail.eur übereinstimmen
+    (Bug-Fix für v8.11: vorher wurde eur_added genutzt, das war im Diag-Loop nicht aktuell)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-13', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'BLR'], 'layover_ort': 'BLR',
+         'start_time': '11:00'},
+        {'datum': '2025-01-14', 'activity_type': 'tour', 'overnight_after_day': True,
+         'layover_ort': 'BLR'},
+        {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-13', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-14', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-15', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    z76_list = result['aerotax_z76_dates_amounts']
+    td_z76 = {t['datum']: t['eur'] for t in result['tage_detail'] if t['klass'] == 'Z76'}
+    list_by_date = {z['datum']: z['amount'] for z in z76_list}
+    for date, td_eur in td_z76.items():
+        assert list_by_date.get(date) == td_eur, \
+            f"{date}: tage_detail.eur={td_eur}, list.amount={list_by_date.get(date)} — Diff!"
+
+
+def test_v812_rek_iata_mapped_to_island():
+    """REK (Reykjavik alternativ-Code) wird zu Island gemappt."""
+    from bmf_data import IATA_TO_BMF
+    assert IATA_TO_BMF.get('REK') == 'Island'
+
+
+def test_v812_rek_bmf_lookup_works():
+    """_get_bmf_for_iata liefert für REK Island-Pauschalen."""
+    from app import _get_bmf_for_iata
+    bmf = _get_bmf_for_iata('REK', 2025)
+    assert bmf is not None
+    assert bmf.get('voll_24h', 0) > 0
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
