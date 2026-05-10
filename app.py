@@ -13017,13 +13017,14 @@ def erstelle_pdf(d):
         ps("eye", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
            leading=12, alignment=TA_CENTER, spaceAfter=24, letterSpacing=2.5)))
 
-    # Title — v8.3: kein englisches Possessiv mehr ("'s Steuerauswertung").
+    # v9.9: Title generisch, Name nur im Subtitle (User-Direktive: keine Person im Titel).
     _name = d.get('name', '') or ''
-    _title = f"Werbungskosten-Auswertung für {_name}" if _name else "Werbungskosten-Auswertung"
-    S.append(Paragraph(_title,
+    _year = d.get('year', '') or ''
+    S.append(Paragraph("Werbungskosten-Auswertung",
         ps("h1", fontSize=20, textColor=TEXT, fontName="Helvetica",
            leading=26, alignment=TA_CENTER, spaceAfter=6, letterSpacing=0)))
-    S.append(Paragraph(f"Steuerjahr {d.get('year',2025)}",
+    _subtitle = f"{_name} · Steuerjahr {_year}" if _name else f"Steuerjahr {_year}"
+    S.append(Paragraph(_subtitle,
         ps("h1y", fontSize=11, textColor=TEXT2, fontName="Helvetica",
            leading=15, alignment=TA_CENTER, spaceAfter=40, letterSpacing=0.6)))
 

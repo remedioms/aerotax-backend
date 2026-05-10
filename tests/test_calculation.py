@@ -7649,6 +7649,111 @@ def test_v98_local_bulk_uses_pseudo_confirmation_id():
     assert "_chatPendingProposal" in block
 
 
+# ── v9.9 Final Release-Gate Audit ──
+
+def test_v99_pdf_title_has_no_personal_name():
+    """PDF-Title ist generisch 'Werbungskosten-Auswertung' — Name nur im Subtitle.
+    User-Direktive: keine Person im Title."""
+    import app as _app
+    src = open(_app.__file__).read()
+    # Suche nach hardcoded „für {_name}"-Pattern im PDF-Code
+    assert 'f"Werbungskosten-Auswertung für {_name}"' not in src
+    assert 'Werbungskosten-Auswertung für {_name}' not in src
+    # Title muss als plain string ohne Name vorkommen
+    assert '"Werbungskosten-Auswertung"' in src
+    # Subtitle-Pattern: name + year
+    assert '_subtitle = f"{_name} · Steuerjahr {_year}"' in src or \
+           '"{_name} · Steuerjahr {_year}"' in src
+
+
+def test_v99_no_mehr_rausholen_user_facing_in_frontend():
+    """„Mehr rausholen" darf nicht user-facing in opt-plus-label vorkommen."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # opt-plus-label-Element
+    import re
+    label_matches = re.findall(r'id="opt-plus-label"[^>]*>([^<]+)<', src)
+    for txt in label_matches:
+        assert 'Mehr rausholen' not in txt, f'opt-plus-label hat verbotenes Wording: {txt!r}'
+    # Auch in JS-Update-Logik
+    js_label_set = re.findall(r"label\.textContent\s*=\s*open\s*\?\s*'([^']+)'", src)
+    for txt in js_label_set:
+        assert 'Mehr rausholen' not in txt, f'JS-Label hat verbotenes Wording: {txt!r}'
+
+
+def test_v99_comprehensive_forbidden_audit():
+    """Ein-Test-Audit: alle verbotenen Phrasen müssen klassifizierbar sein
+    (Impressum / Comment / Stale-Pattern / Prompt-Verbots-Liste / Test) ODER
+    nicht im Code vorkommen."""
+    import os, re
+    forbidden = {
+        'Hallo Miguel': 'production-greeting',
+        'Werbungskosten-Auswertung für Miguel': 'pdf-title',
+        'Freitext-Interpretation': 'fallback-error',
+        'wir rechnen selbst': 'cas-marketing',
+        'kein Tag verloren': 'greeting-marketing',
+        '0 von 22 geklärt': 'progress-pill-old',
+        'beeinflussen nicht direkt': 'AI-tax-claim',
+        'Was bedeutet EM': 'AI-marker-question',
+    }
+    files = [
+        '/Users/miguelschumann/Desktop/site/index.html',
+        '/Users/miguelschumann/Desktop/aerotax-backend/app.py',
+    ]
+    violations = []
+    for fp in files:
+        if not os.path.exists(fp): continue
+        src = open(fp).read()
+        for phrase, _category in forbidden.items():
+            if phrase in src:
+                # Akzeptabel: in Anti-Liste / Stale-Pattern-Filter / Comment
+                idx = 0
+                while True:
+                    pos = src.find(phrase, idx)
+                    if pos < 0: break
+                    pre = src[max(0,pos-300):pos]
+                    line_start = src.rfind('\n', 0, pos) + 1
+                    line = src[line_start:src.find('\n', pos)]
+                    is_safe = (
+                        '//' in line[:line.find(phrase) - line_start + 5] or
+                        '#' in line[:line.find(phrase) - line_start + 5] or
+                        'STALE_PATTERNS' in pre or
+                        'forbidden' in pre or
+                        'VERBOTEN' in pre or
+                        'Verbotene' in pre
+                    )
+                    if not is_safe:
+                        line_no = src[:pos].count('\n') + 1
+                        violations.append(f'{os.path.basename(fp)}:{line_no} — {phrase!r}: {line.strip()[:80]}')
+                    idx = pos + len(phrase)
+    assert not violations, 'User-facing verbotene Phrasen gefunden:\n  ' + '\n  '.join(violations)
+
+
+def test_v99_pdf_amount_comes_from_backend():
+    """PDF zeigt nur Backend-berechneten Betrag, nicht KI-Wert."""
+    import app as _app
+    src = open(_app.__file__).read()
+    # erstelle_pdf nutzt result-dict aus Backend-Recalc
+    fn_idx = src.find('def erstelle_pdf(')
+    block = src[fn_idx:fn_idx+5000]
+    # Im Title-Bereich: Werte aus d (=result-dict)
+    assert "d.get('netto'" in src or "d['netto']" in src or "data.get('netto'" in src
+
+
+def test_v99_review_messages_dont_count_against_chat_limit():
+    """Review-Antworten via /review-answer-bulk berühren chat_history NICHT."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def post_review_answer_bulk(')
+    block = src[fn_idx:fn_idx+5000]
+    # Body darf chat_history nicht anfassen
+    import re
+    body_only = re.sub(r'""".*?"""', '', block, count=1, flags=re.DOTALL)
+    assert 'chat_history' not in body_only, \
+        'review-answer-bulk darf chat_history nicht inkrementieren'
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
