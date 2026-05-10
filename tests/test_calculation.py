@@ -4623,6 +4623,284 @@ def test_v821_review_items_in_result_dict():
     assert dates == ['2025-04-07', '2025-04-09']
 
 
+# ── v8.21 Test-Hammer: Review-Validator Edge-Cases (Pure-Helper) ──
+# Diese Tests rufen den Pure-Helper _validate_and_compute_review_answer direkt auf,
+# umgehen Flask test_client (das wegen Worker-Threads im Test-Env hängt).
+
+
+def _validate(rid, ans, start='', end=''):
+    from app import _validate_and_compute_review_answer
+    return _validate_and_compute_review_answer(rid, ans, start, end)
+
+
+def test_v821_validator_yes_returns_delta_14():
+    status, p = _validate('office_training_time_missing:2025-04-09', 'yes')
+    assert status == 200
+    assert p['delta_eur'] == 14.0
+    assert p['override']['over_8h'] is True
+    assert p['datum'] == '2025-04-09'
+
+
+def test_v821_validator_no_returns_delta_0():
+    status, p = _validate('office_training_time_missing:2025-04-08', 'no')
+    assert status == 200
+    assert p['delta_eur'] == 0.0
+    assert p['override']['over_8h'] is False
+
+
+def test_v821_validator_unsure_returns_delta_0():
+    status, p = _validate('office_training_time_missing:2025-09-19', 'unsure')
+    assert status == 200
+    assert p['delta_eur'] == 0.0
+    assert p['override']['unsure'] is True
+
+
+def test_v821_validator_time_valid_above_8h():
+    status, p = _validate('office_training_time_missing:2025-04-07', 'time', '08:30', '18:45')
+    assert status == 200
+    assert p['delta_eur'] == 14.0
+
+
+def test_v821_validator_time_valid_below_8h():
+    status, p = _validate('office_training_time_missing:2025-04-08', 'time', '08:30', '15:00')
+    assert status == 200
+    assert p['delta_eur'] == 0.0
+
+
+def test_v821_validator_time_invalid_morgen():
+    status, p = _validate('office_training_time_missing:2025-04-09', 'time', 'morgen', '18:00')
+    assert status == 400
+    assert 'HH:MM' in p['error']
+
+
+def test_v821_validator_time_invalid_short():
+    status, p = _validate('office_training_time_missing:2025-04-09', 'time', '8', '18')
+    assert status == 400
+
+
+def test_v821_validator_time_invalid_dash():
+    status, p = _validate('office_training_time_missing:2025-04-09', 'time', '8-18', '18:00')
+    assert status == 400
+
+
+def test_v821_validator_time_end_before_start():
+    status, p = _validate('office_training_time_missing:2025-04-09', 'time', '18:00', '08:00')
+    assert status == 400
+    assert 'Endzeit' in p['error']
+
+
+def test_v821_validator_time_implausibly_long():
+    """20h Abwesenheit → unplausibel."""
+    status, p = _validate('office_training_time_missing:2025-04-09', 'time', '04:00', '23:59')
+    assert status == 400
+    assert 'unplausibel' in p['error']
+
+
+def test_v821_validator_time_invalid_hh_mm_ranges():
+    """Stunden >23 oder Minuten >59 abgelehnt."""
+    status, p = _validate('office_training_time_missing:2025-04-09', 'time', '25:00', '18:00')
+    assert status == 400
+    status, p = _validate('office_training_time_missing:2025-04-09', 'time', '08:00', '08:60')
+    assert status == 400
+
+
+def test_v821_validator_invalid_answer():
+    status, _ = _validate('office_training_time_missing:2025-04-09', 'maybe')
+    assert status == 400
+
+
+def test_v821_validator_invalid_review_item_id():
+    status, _ = _validate('no-colon-here', 'yes')
+    assert status == 400
+
+
+def test_v821_validator_unknown_review_type():
+    status, p = _validate('foo_bar_unknown:2025-04-09', 'yes')
+    assert status == 400
+    assert 'unbekannter review-type' in p['error']
+
+
+def test_v821_validator_invalid_datum():
+    status, _ = _validate('office_training_time_missing:not-a-date', 'yes')
+    assert status == 400
+
+
+def test_v821_validator_time_required_for_time_answer():
+    """time-answer ohne start/end → 400."""
+    status, _ = _validate('office_training_time_missing:2025-04-09', 'time', '', '')
+    assert status == 400
+
+
+# ── v8.21 Miguel-Integration: 12 Office-Days mit Review-Antworten ──
+
+def _build_miguel_review_case_12_days():
+    """Synthetischer Case: 12 Office/Schulung-Tage ohne Zeitinfo + Standby-Tage."""
+    days = [
+        {'datum': '2025-04-07', 'activity_type': 'office',   'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EK BUERODIENST'},
+        {'datum': '2025-04-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-04-09', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-04-10', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-04-11', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-04-24', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EH ERSTE HILFE'},
+        {'datum': '2025-04-25', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EH ERSTE HILFE'},
+        {'datum': '2025-05-13', 'activity_type': 'office',   'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EK BUERODIENST'},
+        {'datum': '2025-07-23', 'activity_type': 'office',   'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EK BUERODIENST'},
+        {'datum': '2025-08-11', 'activity_type': 'office',   'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EK BUERODIENST'},
+        {'datum': '2025-09-19', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EM EMERGENCY'},
+        {'datum': '2025-11-24', 'activity_type': 'office',   'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EK BUERODIENST'},
+    ]
+    return {'days': days}
+
+
+def test_v821_miguel_initial_no_z72_all_review_pending():
+    """Initial sind alle 12 Tage Office (kein Z72), 12 Review-Items pending."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day, _build_review_items
+    structured = _build_miguel_review_case_12_days()
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    cls = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert cls['z72_tage'] == 0
+    items = _build_review_items(cls)
+    assert len(items) == 12
+    assert all(i['status'] == 'pending' for i in items)
+
+
+def test_v821_miguel_all_yes_yields_12_z72():
+    """Alle 12× Ja → 12 Z72-Tage (delta 12×14 = 168€)."""
+    from app import _apply_manual_day_overrides, _deterministic_classify_v7, _match_dp_se_per_day
+    structured = _build_miguel_review_case_12_days()
+    overrides = {d['datum']: {'over_8h': True, 'source': 'user_review_chatbot'}
+                 for d in structured['days']}
+    patched = _apply_manual_day_overrides(structured['days'], overrides)
+    matched = _match_dp_se_per_day({'days': patched}, {'se_lines': []}, 'FRA')
+    cls = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert cls['z72_tage'] == 12
+    assert cls['z72_eur'] == 168.0
+
+
+def test_v821_miguel_10_yes_2_no_yields_10_z72():
+    """10× Ja, 2× Nein → 10 Z72-Tage (140€)."""
+    from app import _apply_manual_day_overrides, _deterministic_classify_v7, _match_dp_se_per_day
+    structured = _build_miguel_review_case_12_days()
+    no_dates = {'2025-04-08', '2025-09-19'}
+    overrides = {}
+    for d in structured['days']:
+        if d['datum'] in no_dates:
+            overrides[d['datum']] = {'over_8h': False, 'source': 'user_review_chatbot'}
+        else:
+            overrides[d['datum']] = {'over_8h': True, 'source': 'user_review_chatbot'}
+    patched = _apply_manual_day_overrides(structured['days'], overrides)
+    matched = _match_dp_se_per_day({'days': patched}, {'se_lines': []}, 'FRA')
+    cls = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert cls['z72_tage'] == 10
+    assert cls['z72_eur'] == 140.0
+
+
+def test_v821_miguel_6_yes_6_unsure_yields_6_z72():
+    """6× Ja, 6× Unsicher → 6 Z72-Tage (84€)."""
+    from app import _apply_manual_day_overrides, _deterministic_classify_v7, _match_dp_se_per_day
+    structured = _build_miguel_review_case_12_days()
+    yes_dates = {'2025-04-07', '2025-04-09', '2025-04-10', '2025-04-11', '2025-04-24', '2025-04-25'}
+    overrides = {}
+    for d in structured['days']:
+        if d['datum'] in yes_dates:
+            overrides[d['datum']] = {'over_8h': True, 'source': 'user_review_chatbot'}
+        else:
+            overrides[d['datum']] = {'unsure': True, 'source': 'user_unsure'}
+    patched = _apply_manual_day_overrides(structured['days'], overrides)
+    matched = _match_dp_se_per_day({'days': patched}, {'se_lines': []}, 'FRA')
+    cls = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert cls['z72_tage'] == 6
+    assert cls['z72_eur'] == 84.0
+
+
+def test_v821_miguel_time_input_mixed():
+    """Time-Input für 3 Tage: über/unter Schwelle gemischt."""
+    from app import _apply_manual_day_overrides, _deterministic_classify_v7, _match_dp_se_per_day
+    structured = _build_miguel_review_case_12_days()
+    overrides = {
+        '2025-04-07': {'start_time': '08:30', 'end_time': '18:45',
+                        'time_is_absence': True, 'source': 'user_review_chatbot_time_entry'},  # 615 → Z72
+        '2025-04-08': {'start_time': '08:30', 'end_time': '15:00',
+                        'time_is_absence': True, 'source': 'user_review_chatbot_time_entry'},  # 390 → kein Z72
+        '2025-04-09': {'start_time': '07:00', 'end_time': '16:30',
+                        'time_is_absence': True, 'source': 'user_review_chatbot_time_entry'},  # 570 → Z72
+    }
+    patched = _apply_manual_day_overrides(structured['days'], overrides)
+    matched = _match_dp_se_per_day({'days': patched}, {'se_lines': []}, 'FRA')
+    cls = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 2 von 3 mit Zeit → Z72 (07.04, 09.04). 08.04 < 8h. Rest 9 Tage bleiben Office.
+    assert cls['z72_tage'] == 2
+
+
+def test_v821_miguel_review_items_with_overrides_status_flips():
+    """Nach Override sind betroffene Items 'answered'."""
+    from app import _apply_manual_day_overrides, _deterministic_classify_v7, _match_dp_se_per_day, _build_review_items
+    structured = _build_miguel_review_case_12_days()
+    overrides = {
+        '2025-04-07': {'over_8h': True, 'source': 'user_review_chatbot'},
+        '2025-04-09': {'over_8h': False, 'source': 'user_review_chatbot'},
+    }
+    # Build review_items aus ORIGINAL classification (vor Override) mit overrides als known answered
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    cls = _deterministic_classify_v7(matched, 2025, 'FRA')
+    items = _build_review_items(cls, manual_day_overrides=overrides)
+    by_d = {i['datum']: i for i in items}
+    assert by_d['2025-04-07']['status'] == 'answered'
+    assert by_d['2025-04-09']['status'] == 'answered'
+    assert by_d['2025-04-08']['status'] == 'pending'  # nicht beantwortet
+    answered = [i for i in items if i['status'] == 'answered']
+    pending = [i for i in items if i['status'] == 'pending']
+    assert len(answered) == 2
+    assert len(pending) == 10
+
+
+# ── v8.21 Wording-Härtung: User-facing Texte ──
+
+def test_v821_review_item_question_no_technical_terms():
+    """review_items.question darf keine internen Begriffe enthalten."""
+    from app import _build_review_items
+    cls_stub = {'office_training_time_missing_candidates': [
+        {'datum': '2025-04-09', 'marker': 'D4 SCHULUNG', 'activity_type': 'training'},
+    ]}
+    items = _build_review_items(cls_stub)
+    forbidden = ['Z72', 'Z73', 'Z76', 'document_health', 'review_item',
+                 'unresolved_days', 'vma_unmapped_se', 'bmf_missing',
+                 'classifier', 'Sonnet', 'Verpflegungsmehraufwand',
+                 'Mehrfach geprüft', 'garantiert absetzbar', 'Hol mehr raus']
+    for item in items:
+        for term in forbidden:
+            assert term not in item['question'], \
+                f"Frage enthält internen/verbotenen Begriff '{term}': {item['question']}"
+        for opt in item.get('options', []):
+            for term in forbidden:
+                assert term not in opt['label'], \
+                    f"Option enthält '{term}': {opt['label']}"
+
+
+def test_v821_review_item_question_uses_friendly_language():
+    """Frage muss freundlich/einfach formuliert sein (mind. eins der Schlüsselworte)."""
+    from app import _build_review_items
+    cls_stub = {'office_training_time_missing_candidates': [
+        {'datum': '2025-04-09', 'marker': 'D4 SCHULUNG', 'activity_type': 'training'},
+    ]}
+    items = _build_review_items(cls_stub)
+    friendly = ['8 Stunden', 'unterwegs', 'Hin- und Rückweg', 'inklusive']
+    q = items[0]['question']
+    assert any(f in q for f in friendly), f"Frage zu technisch: {q}"
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

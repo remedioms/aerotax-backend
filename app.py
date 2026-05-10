@@ -1379,52 +1379,62 @@ def get_job_audit(job_id):
     return jsonify({'audit': j.get('audit', []), 'status': j.get('status')})
 
 
-@app.route('/api/job/<job_id>/review-answer', methods=['POST'])
-def post_review_answer(job_id):
-    """v8.21: Speichert eine Nutzer-Antwort auf ein Review-Item.
+def _validate_and_compute_review_answer(review_item_id, answer, start_time, end_time):
+    """v8.21 Pure-Helper: Validiert Review-Antwort und berechnet Override + Delta.
 
-    Body: {review_item_id, answer: 'yes'|'no'|'time'|'unsure',
-           start_time?, end_time?, source?}
-
-    Speichert das Override im Job-State (manual_day_overrides). Liefert
-    eine deterministische Delta-Schätzung zurück (kein Sonnet-Call).
-    Echte Re-Berechnung erfolgt bei /finalize-pdf (Phase 3b).
+    Returns:
+        (200, {ov, delta_eur, delta_label, datum, type}) bei Erfolg
+        (status_code, {error: ...}) bei Validierungsfehler
     """
-    body = request.get_json(silent=True) or {}
-    review_item_id = (body.get('review_item_id') or '').strip()
-    answer = (body.get('answer') or '').strip()
-    start_time = (body.get('start_time') or '').strip()
-    end_time = (body.get('end_time') or '').strip()
-    source = body.get('source') or 'user_review_chatbot'
+    import re as _re_v
+    review_item_id = (review_item_id or '').strip()
+    answer = (answer or '').strip()
+    start_time = (start_time or '').strip()
+    end_time = (end_time or '').strip()
 
     if not review_item_id or ':' not in review_item_id:
-        return jsonify({'error': 'invalid review_item_id'}), 400
+        return 400, {'error': 'invalid review_item_id'}
     typ, datum = review_item_id.split(':', 1)
     if not datum:
-        return jsonify({'error': 'invalid datum in review_item_id'}), 400
+        return 400, {'error': 'invalid datum in review_item_id'}
+    if not _re_v.fullmatch(r'\d{4}-\d{2}-\d{2}', datum):
+        return 400, {'error': 'datum muss ISO-Format YYYY-MM-DD haben'}
+    if typ not in ('office_training_time_missing',):
+        return 400, {'error': f'unbekannter review-type: {typ}'}
 
-    # Override aus Antwort bauen
     delta_eur = 0.0
     delta_label = 'Keine Änderung am Betrag'
     if answer == 'yes':
-        ov = {'over_8h': True, 'source': source}
+        ov = {'over_8h': True, 'source': 'user_review_chatbot'}
         delta_eur = 14.0
         delta_label = '+14,00 € berücksichtigt'
     elif answer == 'no':
-        ov = {'over_8h': False, 'source': source}
+        ov = {'over_8h': False, 'source': 'user_review_chatbot'}
         delta_label = 'Okay, kein zusätzlicher Betrag für diesen Tag.'
     elif answer == 'time':
         if not start_time or not end_time:
-            return jsonify({'error': 'start_time and end_time required for time answer'}), 400
-        # Validate + compute
+            return 400, {'error': 'start_time and end_time required for time answer'}
+        if not _re_v.fullmatch(r'([01]?\d|2[0-3]):[0-5]\d', start_time):
+            return 400, {'error': 'start_time muss HH:MM sein (z.B. 08:30)'}
+        if not _re_v.fullmatch(r'([01]?\d|2[0-3]):[0-5]\d', end_time):
+            return 400, {'error': 'end_time muss HH:MM sein (z.B. 18:45)'}
         try:
             sh, sm = int(start_time.split(':')[0]), int(start_time.split(':')[1])
             eh, em = int(end_time.split(':')[0]), int(end_time.split(':')[1])
             duration = (eh * 60 + em) - (sh * 60 + sm)
-            if duration < 0:
-                duration += 24 * 60
         except (ValueError, IndexError):
-            return jsonify({'error': 'invalid time format (HH:MM)'}), 400
+            return 400, {'error': 'invalid time format (HH:MM)'}
+        if duration <= 0:
+            return 400, {
+                'error': 'Endzeit muss nach Startzeit liegen. '
+                         'Falls du wirklich über Mitternacht arbeitest, bitte separat prüfen.',
+                'start_time': start_time, 'end_time': end_time,
+            }
+        if duration > 18 * 60:
+            return 400, {
+                'error': 'Abwesenheitsdauer >18h erscheint unplausibel — bitte prüfen.',
+                'duration_minutes': duration,
+            }
         ov = {
             'start_time': start_time, 'end_time': end_time,
             'time_is_absence': True,
@@ -1439,7 +1449,41 @@ def post_review_answer(job_id):
         ov = {'unsure': True, 'source': 'user_unsure'}
         delta_label = 'Okay, ich lasse den Tag unverändert.'
     else:
-        return jsonify({'error': 'invalid answer (yes|no|time|unsure)'}), 400
+        return 400, {'error': 'invalid answer (yes|no|time|unsure)'}
+
+    return 200, {
+        'datum': datum, 'type': typ,
+        'override': ov, 'delta_eur': delta_eur, 'delta_label': delta_label,
+    }
+
+
+@app.route('/api/job/<job_id>/review-answer', methods=['POST'])
+def post_review_answer(job_id):
+    """v8.21: Speichert eine Nutzer-Antwort auf ein Review-Item.
+
+    Body: {review_item_id, answer: 'yes'|'no'|'time'|'unsure',
+           start_time?, end_time?, source?}
+
+    Speichert das Override im Job-State (manual_day_overrides). Liefert
+    eine deterministische Delta-Schätzung zurück (kein Sonnet-Call).
+    Echte Re-Berechnung erfolgt bei /finalize-pdf (Phase 3b).
+    """
+    body = request.get_json(silent=True) or {}
+    status, payload = _validate_and_compute_review_answer(
+        review_item_id=body.get('review_item_id'),
+        answer=body.get('answer'),
+        start_time=body.get('start_time'),
+        end_time=body.get('end_time'),
+    )
+    if status != 200:
+        return jsonify(payload), status
+
+    review_item_id = payload['type'] + ':' + payload['datum']
+    datum = payload['datum']
+    ov = payload['override']
+    delta_eur = payload['delta_eur']
+    delta_label = payload['delta_label']
+    answer = body.get('answer', '').strip()
 
     # Job laden + Override speichern
     with _jobs_lock:
