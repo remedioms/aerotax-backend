@@ -7580,12 +7580,13 @@ Tour-Mittel-Tage:
   • Keine Auslassung weil "war ja eh nur Layover"
 
 Kompaktheit-Regeln:
-  • raw_marker max 30 Zeichen
-  • notes max 60 Zeichen
-  • raw_lines nur bei Unsicherheit oder Same-Day
+  • raw_marker max 24 Zeichen
+  • notes nur wenn nötig (max 50 Zeichen, sonst weglassen)
+  • raw_lines nur bei Unsicherheit oder Same-Day (sonst weglassen)
+  • duplicate-Felder vermeiden — ID-Verkürzung wo möglich
 
-Ziel: Output passt in 32k Tokens. Bei 365 Tagen mit kurzen Einträgen
-machbar. Vollständigkeit > Kompaktheit.
+Ziel: Output passt in 60k Tokens. Bei 365 Tagen mit kompakten Einträgen
+gut machbar. Vollständigkeit > Kompaktheit, aber unnötige Felder weg.
 
 LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
 
@@ -7598,8 +7599,11 @@ LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
         resp = None
         for attempt in range(2):
             try:
+                # v10.2: max_tokens 32k → 60k. 32k war zu eng für volle 12 Monate
+                # mit detaillierten Marker-Notes — Sonnet stoppte mit stop=max_tokens
+                # OHNE tool_input → Job-Fail. 60k ist innerhalb des sonnet-4-6 Limits.
                 resp = client.messages.create(
-                    model='claude-sonnet-4-6', max_tokens=32000,
+                    model='claude-sonnet-4-6', max_tokens=60000,
                     tools=[structured_tool],
                     tool_choice={'type': 'tool', 'name': 'submit_structured_days'},
                     messages=[{'role': 'user', 'content': content}]
