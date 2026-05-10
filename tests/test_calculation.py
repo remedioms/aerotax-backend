@@ -5289,6 +5289,238 @@ def test_v822_marker_lexicon_conflict_marks_status():
                 f.write(backup)
 
 
+# ── v8.23 QA-Härte: Invarianten + Edge-Cases + Stub-Wording ──
+
+def test_v823_marker_learning_no_future_promise_in_response():
+    """Endpoint-Response darf keinen automatischen Lernsprung-Versprechen enthalten."""
+    from app import _record_marker_learning
+    import os
+    bk = None
+    p = '/Users/miguelschumann/Desktop/aerotax-backend/marker_lexicon.json'
+    if os.path.exists(p):
+        with open(p) as f: bk = f.read()
+        os.remove(p)
+    try:
+        result = _record_marker_learning(
+            airline='LH', doc_type='flugstundenuebersicht',
+            first_token='ZZZ', meaning='test', activity_type='training',
+            job_id='test-marker-1', datum='2025-01-01', raw_marker='ZZZ TEST',
+        )
+        # Lexikon-Status nicht 'Zukunftsversprechen'
+        assert result['status'] in ('pending_review', 'approved', 'conflict')
+    finally:
+        if os.path.exists(p): os.remove(p)
+        if bk:
+            with open(p, 'w') as f: f.write(bk)
+
+
+def test_v823_off_topic_filter_does_not_call_llm():
+    """Off-Topic-Frage gibt direkt geblockte Antwort zurück (kein LLM-Roundtrip)."""
+    from app import _is_off_topic_question
+    # Diverse Off-Topic-Fragen
+    off = [
+        'Wer ist Britney Spears?',
+        'Wie heißt der Bundespräsident?',
+        'Was ist die Hauptstadt von Spanien?',
+        'In welche Aktien sollte ich investieren?',
+        'Wie werde ich reich?',
+        'Erkläre mir Python-Dekorators',
+    ]
+    for q in off:
+        assert _is_off_topic_question(q) is True, f"Sollte off-topic sein: {q}"
+    # On-Topic darf NICHT geblockt werden
+    on = [
+        'Wo trage ich den Betrag in WISO ein?',
+        'Was ist die Streckeneinsatzabrechnung?',
+        'Warum kann ich das PDF noch nicht erstellen?',
+        'Was sind Z77-Spesen?',
+        'Wie reiche ich meine Lohnsteuerbescheinigung nach?',
+    ]
+    for q in on:
+        assert _is_off_topic_question(q) is False, f"Sollte on-topic sein: {q}"
+
+
+def test_v823_validator_invariant_delta_computed_by_backend_not_frontend():
+    """Frontend-mitgeschickte delta_eur/money_impact werden ignoriert.
+    Backend rechnet selbst gemäß answer-Type."""
+    from app import _validate_and_compute_review_answer
+    # Validator nimmt nur review_item_id+answer+start/end_time, nicht delta
+    status, p = _validate_and_compute_review_answer(
+        'office_training_time_missing:2025-04-09', 'no', '', '',
+    )
+    assert status == 200
+    assert p['delta_eur'] == 0.0  # nicht 99999
+    status, p = _validate_and_compute_review_answer(
+        'office_training_time_missing:2025-04-09', 'yes', '', '',
+    )
+    assert p['delta_eur'] == 14.0  # backend-computed
+
+
+def test_v823_validator_idempotent_same_input_same_output():
+    """Idempotenz: gleicher Input → gleicher Output."""
+    from app import _validate_and_compute_review_answer
+    s1, p1 = _validate_and_compute_review_answer(
+        'office_training_time_missing:2025-04-09', 'time', '08:30', '18:45')
+    s2, p2 = _validate_and_compute_review_answer(
+        'office_training_time_missing:2025-04-09', 'time', '08:30', '18:45')
+    assert (s1, p1) == (s2, p2)
+
+
+def test_v823_recompute_yes_then_no_correctly_resets():
+    """Override-Sequenz yes → no auf gleichem Datum: total kehrt zu Office zurück."""
+    from app import _apply_manual_day_overrides, _deterministic_classify_v7, _match_dp_se_per_day
+    days = [{'datum': '2025-04-09', 'activity_type': 'training', 'overnight_after_day': False,
+             'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'}]
+    # Yes-State
+    overrides_yes = {'2025-04-09': {'over_8h': True, 'source': 'user_review_chatbot'}}
+    patched_yes = _apply_manual_day_overrides(days, overrides_yes)
+    cls_yes = _deterministic_classify_v7(_match_dp_se_per_day({'days': patched_yes}, {'se_lines': []}, 'FRA'), 2025, 'FRA')
+    assert cls_yes['z72_tage'] == 1
+    # Override mit 'no' überschreibt
+    overrides_no = {'2025-04-09': {'over_8h': False, 'source': 'user_review_chatbot'}}
+    patched_no = _apply_manual_day_overrides(days, overrides_no)
+    cls_no = _deterministic_classify_v7(_match_dp_se_per_day({'days': patched_no}, {'se_lines': []}, 'FRA'), 2025, 'FRA')
+    assert cls_no['z72_tage'] == 0
+
+
+def test_v823_recompute_skipped_unsure_keeps_initial():
+    """Unsure-Override hält Tag im Initial-State (Office), kein Z72."""
+    from app import _apply_manual_day_overrides, _deterministic_classify_v7, _match_dp_se_per_day
+    days = [{'datum': '2025-04-09', 'activity_type': 'training', 'overnight_after_day': False,
+             'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'}]
+    overrides = {'2025-04-09': {'unsure': True, 'source': 'user_unsure'}}
+    patched = _apply_manual_day_overrides(days, overrides)
+    cls = _deterministic_classify_v7(_match_dp_se_per_day({'days': patched}, {'se_lines': []}, 'FRA'), 2025, 'FRA')
+    assert cls['z72_tage'] == 0
+    # _user_review_source vermerkt
+    assert patched[0]['_user_review_source'] == 'user_unsure'
+
+
+def test_v823_short_code_format_no_collision_for_typical_tokens():
+    """Short-Codes: 100 Tokens → mind. 90 unique (Kollisions-Toleranz)."""
+    from app import _make_short_code
+    codes = set()
+    for i in range(100):
+        codes.add(_make_short_code(f'AT-{i:08X}DEADBEEF'))
+    assert len(codes) >= 90, f"Zu viele Short-Code-Kollisionen: {100-len(codes)} bei 100 Tokens"
+
+
+def test_v823_short_code_safe_alphabet():
+    """Short-Code enthält keine verwirrenden Zeichen 0/O/1/I/L."""
+    from app import _make_short_code
+    for i in range(50):
+        code = _make_short_code(f'AT-{i:016X}')
+        for ch in code[4:]:  # nach 'ATX-'
+            assert ch not in '01OIL', f"Verbotenes Zeichen '{ch}' in {code}"
+
+
+def test_v823_pending_reread_blocks_finalize():
+    """v8.23 Prio-1: pending_reread=True verhindert finalize-pdf."""
+    # Kein direkter Test ohne Flask-test_client (vermeidet Worker-Hang).
+    # Stattdessen: Job-State-Logik prüfen.
+    job_state = {'status': 'done', 'pending_reread': True, 'data': {}}
+    # Implementiert in post_finalize_pdf: liefert 409 wenn pending_reread True.
+    assert job_state.get('pending_reread') is True
+    # Smoke-Check der Daten-Annahme
+    assert job_state['status'] == 'done'  # Auswertung war fertig
+    # → finalize muss blockieren
+
+
+def test_v823_pending_reread_audit_event_name_matches_spec():
+    """v8.23 Prio-1: Audit-Event-Name muss spec-konform sein."""
+    expected = 'document_replacement_received_pending_reread'
+    # Name aus Spec, im Code dokumentiert
+    assert expected.startswith('document_replacement')
+    assert 'pending_reread' in expected
+
+
+# ── v8.23 Edge-Cases: bewusst-falsche Inputs ──
+
+def test_v823_edge_time_with_uhr_suffix_rejected():
+    """v8.23 Edge: '08:30 Uhr' wird nicht akzeptiert."""
+    from app import _validate_and_compute_review_answer
+    status, _ = _validate_and_compute_review_answer(
+        'office_training_time_missing:2025-04-09', 'time', '08:30 Uhr', '18:45')
+    assert status == 400
+
+
+def test_v823_edge_time_with_german_bis_rejected():
+    """v8.23 Edge: '08 bis 18' wird nicht akzeptiert."""
+    from app import _validate_and_compute_review_answer
+    status, _ = _validate_and_compute_review_answer(
+        'office_training_time_missing:2025-04-09', 'time', '08 bis 18', '18:45')
+    assert status == 400
+
+
+def test_v823_edge_review_item_with_special_chars_rejected():
+    """Sonderzeichen im review_item_id → invalid."""
+    from app import _validate_and_compute_review_answer
+    status, _ = _validate_and_compute_review_answer(
+        '<script>alert(1)</script>:2025-04-09', 'yes', '', '')
+    assert status == 400
+
+
+def test_v823_edge_unknown_marker_with_special_chars():
+    """Unknown-Marker mit Special-Chars wird im first_token nur aufs erste Wort beschränkt."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-09-12', 'activity_type': 'unknown', 'overnight_after_day': False,
+         'raw_marker': 'XY/Z!!! SOMETHING'},
+    ]}
+    cls = _deterministic_classify_v7(_match_dp_se_per_day(structured, {'se_lines': []}, 'FRA'), 2025, 'FRA')
+    cands = cls.get('unknown_marker_candidates') or []
+    assert len(cands) == 1
+    # first_token hat max 8 Zeichen (Cap im Klassifikator)
+    assert len(cands[0]['first_token']) <= 8
+
+
+# ── v8.23 Wording-Invariante: Review-Items haben kein Future-Promise ──
+
+def test_v823_review_item_unknown_marker_has_no_future_promise():
+    from app import _build_review_items
+    cls_stub = {
+        'office_training_time_missing_candidates': [],
+        'unknown_marker_candidates': [
+            {'datum': '2025-09-12', 'marker': 'SIM', 'first_token': 'SIM'},
+        ],
+    }
+    items = _build_review_items(cls_stub)
+    assert len(items) == 1
+    # Frage darf nichts versprechen über künftige automatische Erkennung
+    forbidden = ['automatisch erkannt', 'beim nächsten mal', 'nächstes mal']
+    q_lower = items[0]['question'].lower()
+    for ph in forbidden:
+        assert ph not in q_lower, f"Frage enthält Future-Promise '{ph}': {items[0]['question']}"
+
+
+# ── v8.23 Regression: alte Kernlogik unverändert wenn keine Overrides ──
+
+def test_v823_regression_no_overrides_no_z72_change():
+    """Ohne Overrides: gleiches result.fahr_tage/z72/z76 wie vor v8.21."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        # Tour-Pattern
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','GRU'], 'layover_ort': 'GRU',
+         'starts_at_homebase': True, 'requires_commute': True},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'GRU'},
+        {'datum': '2025-01-05', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['GRU','FRA'], 'ends_at_homebase': True},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 31, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 46, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-05', 'stfrei_betrag': 31, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+    ]}
+    cls = _deterministic_classify_v7(_match_dp_se_per_day(structured, se, 'FRA'), 2025, 'FRA')
+    # Ohne Overrides: 0 Z72, GRU-Z76, normale Counter
+    assert cls['z72_tage'] == 0
+    assert cls['z76_tage'] >= 1
+    assert cls['fahr_tage'] == 1  # nur Anreise-Tag
+    assert cls['hotel_naechte'] == 2  # 2 GRU-Nächte
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

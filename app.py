@@ -1784,8 +1784,12 @@ def post_marker_answer(job_id):
     """v8.22 Rest-5: Nutzer erklärt eine unbekannte Kennung.
 
     Body: {first_token, meaning, activity_type, datum, raw_marker, airline?, doc_type?}
-    Speichert User-Antwort als learning_candidate; bei 3+ konsistenten
-    Bestätigungen → status=approved (automatisch nutzbar bei nächsten Jobs).
+
+    Speichert User-Antwort als learning_candidate (file-based marker_lexicon.json).
+    Bei 3+ konsistenten Bestätigungen → status='approved'.
+    HINWEIS: Das Lexikon wird gepflegt, der Klassifikator nutzt approved-Marker
+    aktuell noch NICHT automatisch beim nächsten Job — Integration folgt in
+    einer späteren Version. User-facing keine Zukunftsversprechen.
     """
     body = request.get_json(silent=True) or {}
     first_token = (body.get('first_token') or '').strip().upper()
@@ -1835,6 +1839,8 @@ def post_marker_answer(job_id):
         'activity_type': activity_type,
         'lexicon_status': result.get('status') if result else 'unknown',
         'confirmed_count': result.get('confirmed_count', 0) if result else 0,
+        # v8.23: ehrliches User-Wording — kein Zukunftsversprechen
+        'user_message': 'Für diese Auswertung berücksichtigt. Als Lernkandidat gespeichert.',
     })
 
 
@@ -1861,19 +1867,35 @@ def post_upload_replacement(job_id):
     if fext not in ('pdf', 'jpg', 'jpeg', 'png', 'heic', 'heif'):
         return jsonify({'error': f'Format nicht unterstützt: .{fext}'}), 400
 
+    file_size = 0
+    try:
+        file.seek(0, 2)
+        file_size = file.tell()
+        file.seek(0)
+    except Exception:
+        pass
+
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
             return jsonify({'error': 'job not found'}), 404
-        # Audit-Log: Replacement angekündigt
+        # v8.23: pending_reread-Flag blockiert finalize-pdf bis volle Re-Verarbeitung
+        # implementiert ist. Ehrlich begrenzt — keine UI-Behauptung "aktualisiert".
+        j['pending_reread'] = True
+        j['pending_reread_doc_types'] = list(set(
+            (j.get('pending_reread_doc_types') or []) + [doc_type]
+        ))
+        j['pending_reread_at'] = datetime.now().isoformat()
         if 'audit' in j and isinstance(j['audit'], list):
             j['audit'].append({
-                'event': 'document_replacement_uploaded',
+                'event': 'document_replacement_received_pending_reread',
                 'data': {
                     'doc_type': doc_type, 'filename': fname,
-                    'size_bytes': len(file.read()) if file else 0,
+                    'size_bytes': file_size,
                     'status': 'received_pending_reread',
                     'source': 'user_uploaded_replacement',
+                    'note': 'Selektives Re-Read pro Doc-Typ noch nicht implementiert. '
+                            'Datei vorgemerkt, finalize-pdf blockiert bis Re-Verarbeitung.',
                 },
                 'timestamp': datetime.now().isoformat(),
             })
@@ -1882,14 +1904,17 @@ def post_upload_replacement(job_id):
         except Exception:
             pass
 
-    # v8.23 TODO: selektives Re-Read pro doc_type (Sonnet pro Slot statt voller Pipeline).
     return jsonify({
         'status': 'received_pending_reread',
+        'pending_reread': True,
         'doc_type': doc_type,
         'filename': fname,
-        'message': 'Datei erhalten. Vollständige Re-Verarbeitung folgt in v8.23 — '
-                   'aktuell wird das Dokument für eine erneute Auswertung vorgemerkt.',
-    })
+        'message': 'Datei erhalten. Die erneute Auswertung ist noch nicht abgeschlossen. '
+                   'Du brauchst eine vollständige Neu-Auswertung, damit der ersetzte Beleg '
+                   'in deine Werte einfließt.',
+        'next_action': 'restart_evaluation',
+        'pdf_blocked': True,
+    }), 202
 
 
 @app.route('/api/job/<job_id>/finalize-pdf', methods=['POST'])
@@ -1912,6 +1937,13 @@ def post_finalize_pdf(job_id):
         # Job-Status muss done sein (Berechnung abgeschlossen)
         if j.get('status') != 'done':
             return jsonify({'error': 'Auswertung noch nicht abgeschlossen'}), 400
+        # v8.23: PDF blockiert wenn ein Dokument zur Re-Verarbeitung vorgemerkt ist
+        if j.get('pending_reread'):
+            return jsonify({
+                'error': 'Eine Datei wartet auf erneute Auswertung — bitte erst Auswertung neu starten.',
+                'pending_reread': True,
+                'pending_reread_doc_types': j.get('pending_reread_doc_types', []),
+            }), 409
         data = dict(j.get('data') or {})
         cached = data.get('_cached_recalc_state') or {}
         overrides = j.get('manual_day_overrides') or {}
@@ -2428,7 +2460,8 @@ _OFF_TOPIC_PATTERNS = [
     # Promis allgemein
     r'\b(prominen|promi|stars?|filmstar|popstar|sänger|schauspieler)\b',
     # Investments
-    r'\b(aktien?|krypto|bitcoin|ethereum|investiere|investment|vermögen|reich werden|geld anlegen)\b',
+    r'\b(aktien?|krypto|bitcoin|ethereum|investiere|investment|vermögen|reich werden|reich\b|geld anlegen)\b',
+    r'\bwie werde ich (reich|millionär|wohlhabend)\b',
     # Beziehungen / Lebensberatung
     r'\b(beziehung|freundin|freund|liebe|trennung|ehe|scheidung)\b',
     r'\b(was soll ich|wie werde ich|sollte ich)\b.{0,40}\b(machen|tun|werden|kaufen|kaufen)\b',

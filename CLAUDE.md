@@ -1,5 +1,15 @@
 # AeroTax Backend — Arbeitsweise
 
+## v8.23 Release-Stubs (offene Lücken — nicht produktionsreif)
+
+Diese Stubs sind absichtlich **nicht voll implementiert**. User-facing wird das ehrlich kommuniziert; release-blocking entscheidet der Produkt-Eigentümer:
+
+1. **Document-Replacement selektiver Re-Read** — `/api/job/<id>/upload-replacement` nimmt Datei entgegen, setzt `pending_reread=True` im Job-State. **`/finalize-pdf` blockiert**, solange `pending_reread=True`. UI zeigt "Datei erhalten. Die erneute Auswertung ist noch nicht abgeschlossen." — KEINE Behauptung "Auswertung aktualisiert". Selektives Sonnet-Re-Read pro Doc-Typ (statt voller Pipeline) folgt in einer späteren Version.
+
+2. **Marker-Lexikon Klassifikator-Integration** — `marker_lexicon.json` wird gepflegt (`_record_marker_learning`), `status='approved'` nach 3 Bestätigungen. **ABER:** Der Klassifikator nutzt approved-Marker beim NÄCHSTEN Job aktuell **nicht aktiv** (würde Reader/Klassifikator-Refactor erfordern). User-facing wird das ehrlich kommuniziert: "Für diese Auswertung berücksichtigt. Als Lernkandidat gespeichert." — KEIN Versprechen "Beim nächsten Mal automatisch erkannt".
+
+3. **Side-Drawer mit live-sichtbarer Result-Card** — Chat öffnet als rechts-fixierter Glassmorphism-Drawer auf Desktop (>900px), Modal auf Mobile. Die darunterliegende Result-Card ist **nicht parallel sichtbar**. Stattdessen: **Live-Betrag im Chat-Header** während Drawer offen (Polish-Workaround).
+
 ## Architecture principle
 
 > **Sonnet reads facts. Python classifies and calculates. ReportLab renders. No AI-generated tax decision is accepted as final.**
