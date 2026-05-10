@@ -8985,7 +8985,8 @@ def _berechne_via_hybrid(form, files):
         '_iata_unknown':           list(cls.get('iata_unknown', []) or []),
         '_tage_detail':     list(cls.get('tage_detail', []) or []),
         '_klass_summary':   {
-            'arbeitstage': arbeitstage, 'fahr_tage': fahr_tage, 'hotel_naechte': hotel_naechte,
+            'arbeitstage': arbeitstage, 'reinigungstage': reinigungstage,
+            'fahr_tage': fahr_tage, 'hotel_naechte': hotel_naechte,
             'z72_tage': vma_72_tage, 'z73_tage': vma_73_tage, 'z74_tage': vma_74_tage,
             'z76_eur': vma_aus, 'z77_total': z77,
             'auslandsspesen_se': auslandsspesen_se, 'inlandsspesen_se': inlandsspesen_se,
