@@ -1379,7 +1379,7 @@ def get_job_audit(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
     if not j:
-        return jsonify({'error': 'job not found'}), 404
+        return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
     return jsonify({'audit': j.get('audit', []), 'status': j.get('status')})
 
 
@@ -1626,7 +1626,7 @@ def post_review_answer(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
-            return jsonify({'error': 'job not found'}), 404
+            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
         overrides = dict(j.get('manual_day_overrides') or {})
         overrides[datum] = ov
         j['manual_day_overrides'] = overrides
@@ -1719,7 +1719,7 @@ def post_review_bulk_answer(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
-            return jsonify({'error': 'job not found'}), 404
+            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
         data = j.get('data') or {}
         review_items = list(data.get('_review_items') or [])
         existing_overrides = dict(j.get('manual_day_overrides') or {})
@@ -1799,7 +1799,7 @@ def get_review_groups(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
-            return jsonify({'error': 'job not found'}), 404
+            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
         review_items = (j.get('data') or {}).get('_review_items') or []
     groups = _build_review_groups(review_items)
     return jsonify({'groups': groups, 'total_pending': sum(g['count'] for g in groups)})
@@ -1925,6 +1925,26 @@ REGELN:
 - Bei off-topic („wer ist Britney"): intent='off_topic', message_to_user=Standard-Block-Antwort.
 - Bei Upload-Wunsch („ich lade plan hoch"): intent='document_upload', next_action='show_upload'.
 - Bei Unklarheit: intent='clarification', clarification_question gesetzt, proposed_changes=[].
+
+MULTI-TURN-REGEL (KRITISCH):
+- Wenn dein vorheriger Bot-Turn eine konkrete Klärungsfrage gestellt hat (z.B.
+  „Welche 2 Tage waren nicht über 8 Stunden?" oder „Welche Startzeit?")
+  UND die neue Nutzer-Nachricht eine direkte Antwort darauf ist (Datum, Uhrzeit, Anzahl)
+  → JETZT generierst du proposed_changes mit der vollständigen Bulk-Logik.
+  Du fragst NICHT erneut. Du sammelst die Antwort + den vorherigen Bulk-Kontext zusammen
+  und lieferst proposed_changes für den vollständigen Apply.
+
+BEISPIEL Multi-Turn:
+  User Turn 1: „alle über 8 außer 2"
+  Bot Turn 1: „Welche 2 Tage waren nicht über 8h?" (clarification)
+  User Turn 2: „29.04 und 13.05"
+  Bot Turn 2 (DU JETZT): proposed_changes mit ALLEN pending außer 29.04+13.05 als 'yes',
+                         29.04+13.05 als 'no'. needs_confirmation=true.
+
+REGEL „Betrag-Auskunft":
+- Du darfst NIEMALS eigenständig sagen, dass sich der Betrag ändert oder nicht ändert.
+- Backend rechnet. Wenn der User „was ändert sich" fragt: setze intent='question_answer',
+  message_to_user='Ich übernehme das gleich und das Backend berechnet den genauen Betrag.'
 """
 
 
@@ -1969,9 +1989,10 @@ def post_ai_chat(job_id):
         initial_total = float((j.get('data') or {}).get('netto') or 0)
         ctx = _build_ai_chat_context(j)
 
-    chat_history = (body.get('chat_history') or [])[-8:]  # last 8 turns max
-    history_block = '\n'.join(
-        f"{('User' if m.get('role')=='user' else 'AeroTAX')}: {(m.get('content') or '')[:300]}"
+    # v9.2: Volle Chat-History (last 6 turns), nicht 300-char-truncated — sonst geht Kontext verloren
+    chat_history = (body.get('chat_history') or [])[-6:]
+    history_block = '\n\n'.join(
+        f"{('USER' if m.get('role')=='user' else 'BOT')}:\n{(m.get('content') or '')[:1500]}"
         for m in chat_history if isinstance(m, dict)
     )
 
@@ -2128,7 +2149,7 @@ def post_review_interpret(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
-            return jsonify({'error': 'job not found'}), 404
+            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
         review_items = (j.get('data') or {}).get('_review_items') or []
         existing_overrides = dict(j.get('manual_day_overrides') or {})
         cached = (j.get('data') or {}).get('_cached_recalc_state') or {}
@@ -2197,7 +2218,7 @@ def post_review_answer_bulk(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
-            return jsonify({'error': 'job not found'}), 404
+            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
         review_items = (j.get('data') or {}).get('_review_items') or []
         items_by_id = {it['id']: it for it in review_items}
         existing_overrides = dict(j.get('manual_day_overrides') or {})
@@ -2306,7 +2327,7 @@ def post_marker_answer(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
-            return jsonify({'error': 'job not found'}), 404
+            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
 
     result = _record_marker_learning(
         airline=airline, doc_type=doc_type,
@@ -2375,7 +2396,7 @@ def post_upload_replacement(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
-            return jsonify({'error': 'job not found'}), 404
+            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
         # v8.23: pending_reread-Flag blockiert finalize-pdf bis volle Re-Verarbeitung
         # implementiert ist. Ehrlich begrenzt — keine UI-Behauptung "aktualisiert".
         j['pending_reread'] = True
@@ -2443,7 +2464,7 @@ def post_upload_roster_screenshot(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
-            return jsonify({'error': 'job not found'}), 404
+            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
         review_items = (j.get('data') or {}).get('_review_items') or []
         existing_overrides = dict(j.get('manual_day_overrides') or {})
         cached = (j.get('data') or {}).get('_cached_recalc_state') or {}
@@ -2584,7 +2605,7 @@ def post_finalize_pdf(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
-            return jsonify({'error': 'job not found'}), 404
+            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
         # Job-Status muss done sein (Berechnung abgeschlossen)
         if j.get('status') != 'done':
             return jsonify({'error': 'Auswertung noch nicht abgeschlossen'}), 400
@@ -2598,6 +2619,17 @@ def post_finalize_pdf(job_id):
         data = dict(j.get('data') or {})
         cached = data.get('_cached_recalc_state') or {}
         overrides = j.get('manual_day_overrides') or {}
+        # v9.2 Hard-Gate: offene Review-Items + nicht skip → 409
+        if not skip_unanswered:
+            review_items = data.get('_review_items') or []
+            still_pending = [it for it in review_items if it.get('status') == 'pending']
+            if still_pending:
+                return jsonify({
+                    'error': f'Es sind noch {len(still_pending)} Tage ungeklärt. '
+                              f'Beantworte sie im Chat — oder rufe den Endpoint mit '
+                              f'skip_unanswered=true auf, dann werden sie als nicht bestätigt notiert.',
+                    'pending_review_count': len(still_pending),
+                }), 409
 
     if not cached or not cached.get('matched_days'):
         return jsonify({

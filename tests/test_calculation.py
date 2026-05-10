@@ -5640,11 +5640,13 @@ def test_v825_chat_greeting_never_empty():
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    # Mindestens 2 Greeting-Pfade (review pending vs ready)
     greetings = [
+        'Hallo 👋\\n\\nAlles ist geklärt',
         'Hallo 👋\\n\\nDeine Auswertung ist bereit',
         'Hallo 👋\\n\\nDeine Auswertung ist vorbereitet',
         'Ich habe ein Problem mit deinen Unterlagen',
+        'Schauen wir gemeinsam',
+        'Lass uns die noch kurz klären',
     ]
     found = sum(1 for g in greetings if g in src)
     assert found >= 2, f'Mindestens 2 Greeting-Varianten erwartet, {found} gefunden'
@@ -7287,6 +7289,123 @@ def test_v91_no_freitext_interpretation_nicht_verfügbar():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     assert 'Freitext-Interpretation ist gerade nicht verfügbar' not in src
+
+
+# ── v9.2 Audit-Tests ──
+
+def test_v92_audit_no_fahrtag_review_questions():
+    """AUDIT A: Es gibt KEINE Fahrtag-Review-Fragen — Fahrtage sind backend-deterministisch.
+    Wenn das je geändert wird, muss es einen Test geben dafür."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def _build_review_items(')
+    block = src[fn_idx:fn_idx+3500]
+    # Aktueller Stand: nur 2 Item-Types
+    assert "office_training_time_missing_candidates" in block
+    assert "unknown_marker_candidates" in block
+    # Keine fahrtag-review-Question implementiert (intentional)
+    assert "fahrtag_question_candidates" not in block
+    assert "_fahrtag_review_items" not in block
+
+
+def test_v92_audit_no_raw_job_not_found_user_facing():
+    """AUDIT B: kein raw 'job not found' mehr in user-facing JSON-Errors."""
+    import app as _app
+    src = open(_app.__file__).read()
+    # In return-jsonify-Statements darf 'job not found' nicht mehr auftauchen
+    import re
+    raw_returns = re.findall(r"return jsonify\(\{'error':\s*'job not found'", src)
+    assert len(raw_returns) == 0, f'Es gibt noch {len(raw_returns)} raw "job not found"-Returns'
+    # Stattdessen: friendly Text
+    assert "'Diese Auswertung ist nicht mehr verfügbar" in src
+
+
+def test_v92_audit_finalize_pdf_hard_gate_open_reviews():
+    """AUDIT E: /finalize-pdf blockt wenn offene Review-Items + nicht skip_unanswered."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def post_finalize_pdf(')
+    block = src[fn_idx:fn_idx+3500]
+    assert 'still_pending' in block
+    assert "if not skip_unanswered" in block
+    assert "pending_review_count" in block
+    assert ', 409' in block, 'Block muss HTTP 409 returnen'
+
+
+def test_v92_audit_ai_chat_passes_full_history():
+    """AUDIT D: /ai-chat bekommt 1500-char-Turns (nicht 300), last 6 Turns."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def post_ai_chat(')
+    block = src[fn_idx:fn_idx+5000]
+    # Keine 300-char-Begrenzung mehr
+    assert ":300]" not in block.split('history_block')[1][:500] if 'history_block' in block else True
+    # Stattdessen 1500
+    assert "[:1500]" in block
+    # Last 6 Turns
+    assert "[-6:]" in block
+
+
+def test_v92_audit_ai_system_prompt_multi_turn_rule():
+    """AUDIT D: System-Prompt enthält explizite Multi-Turn-Regel."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('_AI_SYSTEM_PROMPT = """')
+    block = src[fn_idx:fn_idx+8000]
+    assert 'MULTI-TURN-REGEL' in block
+    assert 'Welche 2 Tage' in block, 'Beispiel-Multi-Turn fehlt'
+    # Regel: Bot darf Betrag nicht selbst behaupten
+    assert 'Backend rechnet' in block or 'Backend macht das' in block
+
+
+def test_v92_audit_friendly_job_not_found_in_frontend():
+    """AUDIT B: Frontend mappt „job not found" auf freundliche User-Message."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Im Roster-Upload-Path muss „job not found"-Detection sein
+    fn_idx = src.find('upload-roster-screenshot')
+    block = src[fn_idx:fn_idx+3000]
+    assert '/job\\s*not\\s*found/i' in block, 'Frontend muss „job not found" detecten'
+    assert 'Diese Auswertung ist gerade nicht mehr verfügbar' in block
+
+
+def test_v92_audit_pdf_cta_bubble_after_review_complete():
+    """AUDIT D+E: nach Apply mit remaining=0 erscheint PDF-CTA-Bubble im Chat."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'chat-pdf-cta' in src
+    assert 'Finales PDF erstellen' in src
+    fn_idx = src.find('async function _applyPendingProposal')
+    block = src[fn_idx:fn_idx+8000]
+    assert "stillPending === 0" in block
+    assert 'chat-pdf-cta' in block
+
+
+def test_v92_audit_header_pill_says_offen_not_geklaert():
+    """AUDIT D: Header-Pill zeigt „X offen" oder „Alles geklärt", nicht „X von Y geklärt"."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window.updateChatHeaderProgress = function')
+    block = src[fn_idx:fn_idx+2000]
+    # Nicht mehr „done + ' von ' + total + ' geklärt'"
+    assert "' von ' + total + ' geklärt'" not in block
+    # Stattdessen: „X offen" oder „Alles geklärt"
+    assert "Alles geklärt" in block
+    assert "offen" in block
+
+
+def test_v92_audit_multi_cas_works_via_status_filter():
+    """AUDIT C: Multi-CAS ist sequenziell sicher via status='answered'-Filter
+    (zweiter Upload kann nicht über bereits-answered Items doppel-applyen)."""
+    import app as _app
+    src = open(_app.__file__).read()
+    # /review-answer-bulk filtert bereits answered
+    fn_idx = src.find('def post_review_answer_bulk(')
+    block = src[fn_idx:fn_idx+3500]
+    assert "if it.get('status') == 'answered': continue" in block
 
 
 if __name__ == '__main__':
