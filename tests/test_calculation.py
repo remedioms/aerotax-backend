@@ -8772,16 +8772,18 @@ def test_v104_migration_creates_job_chunks_table():
 
 
 def test_v104_migration_unique_constraint_on_chunk():
-    """Unique-Index (job_id, document_type, chunk_index)."""
+    """Unique-Index (job_id, document_type, chunk_index) auf CREATE-TABLE-Migration."""
     import os, glob
     mig_dir = os.path.join(os.path.dirname(__file__), '..', 'supabase_migrations')
     for f in glob.glob(os.path.join(mig_dir, '*chunk*.sql')):
         content = open(f).read()
-        if 'job_chunks' in content:
-            assert 'unique' in content.lower()
+        # Nur Migrations die job_chunks Table erstellen (nicht ALTER-only)
+        if 'create table' in content.lower() and 'job_chunks' in content:
+            assert 'unique' in content.lower(), f'{os.path.basename(f)}: unique-Constraint fehlt'
             assert 'job_id, document_type, chunk_index' in content or \
                    'job_id,document_type,chunk_index' in content
             return
+    raise AssertionError('Keine job_chunks-CREATE-Migration mit unique-Constraint')
 
 
 def test_v104_migration_cleanup_extended_with_chunks():
@@ -9212,6 +9214,266 @@ def test_v104_existing_supabase_cleanup_unchanged():
     assert "sb.table('sessions').delete()" in block
     assert "sb.table('jobs').delete()" in block
     assert 'cleanup_old_job_chunks()' in block  # NEW: v10.4
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v10.4.1 — LSB local-first + File-Hash-Cache + Friendly Phase-Labels
+# „So wenig KI wie möglich. So viel KI wie nötig."
+# ════════════════════════════════════════════════════════════════════════════
+
+
+# ─── LSB Local-First Reader ───────────────────────────────────────────────
+
+def test_v1041_lsb_local_fast_function_exists():
+    """_parse_lsb_local_fast + _read_lsb_with_local_fallback existieren."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_parse_lsb_local_fast')
+    assert hasattr(_app, '_read_lsb_with_local_fallback')
+
+
+def test_v1041_lsb_local_fast_returns_none_for_empty():
+    """Leere PDF-Bytes → None (kein Crash)."""
+    _app = _load_app_fresh()
+    assert _app._parse_lsb_local_fast(None) is None
+    assert _app._parse_lsb_local_fast(b'') is None
+
+
+def test_v1041_lsb_local_fast_returns_none_for_non_lsb():
+    """PDF ohne eLSTB-Signatur → None → Sonnet-Fallback."""
+    _app = _load_app_fresh()
+    # Minimal-PDF mit „random text" — keine eLSTB-Signaturen
+    # Wir können kein echtes PDF konstruieren, aber pdfplumber wirft auf garbage
+    # → die Funktion sollte robust None liefern
+    result = _app._parse_lsb_local_fast(b'%PDF-1.4 garbage')
+    assert result is None
+
+
+def test_v1041_lsb_caller_uses_local_first():
+    """v8 Calc-Pfad ruft _read_lsb_with_local_fallback (nicht direkt Sonnet)."""
+    src = _read_backend()
+    idx = src.find('# Schritt 1:')
+    block = src[idx:idx + 1500]
+    assert '_read_lsb_with_local_fallback' in block, \
+        'LSB-Pfad muss local-fallback nutzen statt direkt Sonnet'
+
+
+def test_v1041_parser_version_constants_exist():
+    """_LSB_PARSER_VERSION + _DP_PARSER_VERSION existieren."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_LSB_PARSER_VERSION')
+    assert hasattr(_app, '_DP_PARSER_VERSION')
+    assert _app._LSB_PARSER_VERSION
+    assert _app._DP_PARSER_VERSION
+
+
+def test_v1041_lsb_local_fast_sanity_check():
+    """Funktion macht Plausi-Check (lohnsteuer < brutto * 0.5).
+    Bei impossiblen Werten → None (Sonnet-Fallback)."""
+    src = _read_backend()
+    fn_idx = src.find('def _parse_lsb_local_fast')
+    block = src[fn_idx:fn_idx + 5000]
+    assert 'brutto * 0.5' in block or 'Sanity' in block, \
+        'Plausi-Check fehlt in LSB-Local-Reader'
+
+
+def test_v1041_lsb_local_fast_no_sonnet_when_complete():
+    """Wenn local-fast erfolgreich → kein Sonnet-Call.
+    _read_lsb_with_local_fallback returnt direkt bei Erfolg."""
+    src = _read_backend()
+    fn_idx = src.find('def _read_lsb_with_local_fallback')
+    block = src[fn_idx:fn_idx + 1500]
+    assert 'return local' in block, \
+        'Bei local-Erfolg muss früh-Return ohne Sonnet erfolgen'
+
+
+# ─── File-Hash Cache ──────────────────────────────────────────────────────
+
+def test_v1041_find_cached_chunk_function_exists():
+    """find_cached_chunk(file_hash, doc_type, idx, parser_version) existiert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, 'find_cached_chunk')
+
+
+def test_v1041_find_cached_chunk_returns_none_without_hash():
+    """Ohne file_hash oder parser_version → None (kein Lookup)."""
+    _app = _load_app_fresh()
+    assert _app.find_cached_chunk(None, 'dp', 0, 'v10') is None
+    assert _app.find_cached_chunk('abc', 'dp', 0, None) is None
+
+
+def test_v1041_create_job_chunk_accepts_file_hash():
+    """create_job_chunk akzeptiert file_hash + parser_version."""
+    _app = _load_app_fresh()
+    cid = _app.create_job_chunk('test-job-hash-001', 'dp', 0, 1, 3,
+                                  file_hash='abc123', parser_version='v10.4.1')
+    assert cid is not None
+    chunks = _app.load_job_chunks('test-job-hash-001')
+    if chunks:
+        c = chunks[0]
+        assert c.get('file_hash') == 'abc123'
+        assert c.get('parser_version') == 'v10.4.1'
+
+
+def test_v1041_dp_chunked_computes_file_hash():
+    """Chunked DP-Reader berechnet SHA-256 von dp_bytes für Cache-Lookup."""
+    src = _read_backend()
+    idx = src.find('def _sonnet_read_dp_structured_chunked_v104')
+    block = src[idx:idx + 8000]
+    assert 'file_hash' in block, 'file_hash muss berechnet werden'
+    assert 'sha256' in block.lower() or 'hashlib' in block, \
+        'SHA-256-Hash für file_hash'
+
+
+def test_v1041_dp_chunked_uses_cache_lookup():
+    """Chunked DP-Reader ruft find_cached_chunk vor Sonnet-Call innerhalb des Chunk-Loops."""
+    src = _read_backend()
+    idx = src.find('def _sonnet_read_dp_structured_chunked_v104')
+    block = src[idx:idx + 8000]
+    assert 'find_cached_chunk(' in block, \
+        'Cache-Lookup fehlt im Chunked-Reader'
+    # Innerhalb des Chunk-Loops: Cache-Check kommt vor Sonnet-Call-für-diesen-Chunk
+    loop_idx = block.find('for idx, (pf, pt) in enumerate(boundaries)')
+    assert loop_idx > 0, 'Chunk-Loop nicht gefunden'
+    loop_block = block[loop_idx:]
+    cache_pos = loop_block.find('find_cached_chunk(')
+    # Sonnet-Call IM LOOP — entspricht dem Pattern „chunk_result = _sonnet_read_dp_structured("
+    sonnet_pos = loop_block.find('chunk_result = _sonnet_read_dp_structured(')
+    assert cache_pos > 0
+    assert sonnet_pos > 0
+    assert cache_pos < sonnet_pos, \
+        f'Cache-Lookup ({cache_pos}) muss VOR Sonnet-Call im Loop ({sonnet_pos}) sein'
+
+
+def test_v1041_dp_chunked_skips_sonnet_on_cache_hit():
+    """Bei cache hit: weiter zum nächsten Chunk ohne Sonnet."""
+    src = _read_backend()
+    idx = src.find('def _sonnet_read_dp_structured_chunked_v104')
+    block = src[idx:idx + 8000]
+    # Look for cache-hit handling with 'continue' to skip Sonnet
+    cache_idx = block.find('cached = find_cached_chunk(')
+    if cache_idx > 0:
+        post = block[cache_idx:cache_idx + 2000]
+        assert 'continue' in post, 'Cache-Hit muss zum nächsten Chunk continue'
+
+
+def test_v1041_dp_parser_version_in_chunk():
+    """create_job_chunk wird mit parser_version=_DP_PARSER_VERSION gerufen."""
+    src = _read_backend()
+    idx = src.find('def _sonnet_read_dp_structured_chunked_v104')
+    block = src[idx:idx + 8000]
+    assert 'parser_version' in block
+    assert '_DP_PARSER_VERSION' in block, 'parser_version-Konstante muss verwendet werden'
+
+
+# ─── Migration v10.4.1 ────────────────────────────────────────────────────
+
+def test_v1041_migration_chunk_cache_columns():
+    """SQL-Migration fügt file_hash + parser_version Spalten hinzu."""
+    import os, glob
+    mig_dir = os.path.join(os.path.dirname(__file__), '..', 'supabase_migrations')
+    found_alter = False
+    for f in glob.glob(os.path.join(mig_dir, '*.sql')):
+        content = open(f).read()
+        if 'job_chunks' in content and 'file_hash' in content and 'parser_version' in content:
+            if 'alter table' in content.lower() or 'add column' in content.lower():
+                found_alter = True
+                break
+    assert found_alter, 'Migration mit ALTER TABLE für file_hash + parser_version fehlt'
+
+
+def test_v1041_migration_has_cache_lookup_index():
+    """Index idx_job_chunks_cache_lookup auf (file_hash, document_type, chunk_index, parser_version)."""
+    import os, glob
+    mig_dir = os.path.join(os.path.dirname(__file__), '..', 'supabase_migrations')
+    found = False
+    for f in glob.glob(os.path.join(mig_dir, '*.sql')):
+        content = open(f).read()
+        if 'cache_lookup' in content.lower() or (
+            'file_hash' in content and 'document_type' in content and 'parser_version' in content
+            and 'index' in content.lower()):
+            found = True
+            break
+    assert found, 'Cache-Lookup-Index fehlt'
+
+
+# ─── Friendly Phase-Labels ────────────────────────────────────────────────
+
+def test_v1041_phase_label_lsb():
+    """LSB-Phase setzt friendly label."""
+    src = _read_backend()
+    idx = src.find('# Schritt 1:')
+    block = src[idx:idx + 1000]
+    assert '_heartbeat_phase' in block
+    assert 'Lohnsteuer' in block, 'Friendly LSB-Label fehlt'
+
+
+def test_v1041_phase_label_se():
+    """SE-Phase setzt friendly label."""
+    src = _read_backend()
+    idx = src.find("# Schritt 2a: Sonnet-SE")
+    block = src[idx:idx + 800]
+    assert '_heartbeat_phase' in block
+    assert 'Streckeneinsatz' in block, 'Friendly SE-Label fehlt'
+
+
+def test_v1041_phase_label_dp_chunks():
+    """DP-Chunks setzen friendly label mit Abschnittsnummer."""
+    src = _read_backend()
+    idx = src.find('def _sonnet_read_dp_structured_chunked_v104')
+    block = src[idx:idx + 8000]
+    assert 'Flugstundenübersicht' in block
+    assert 'Abschnitt' in block, 'Friendly Chunk-Label „Abschnitt X von Y" fehlt'
+
+
+def test_v1041_no_technical_phase_words_in_labels():
+    """Friendly Labels enthalten KEINE technischen Wörter."""
+    src = _read_backend()
+    # Suche alle ' 'label': "..." Vorkommen
+    import re as _re
+    forbidden_in_labels = ['chunk', 'sonnet', 'parser', 'token', 'OOM', 'tool_input',
+                            'max_tokens', 'base64', 'worker']
+    for m in _re.finditer(r"'label':\s*'([^']*)'", src):
+        label = m.group(1)
+        for f in forbidden_in_labels:
+            assert f.lower() not in label.lower(), \
+                f'Technisches Wort „{f}" in Phase-Label: „{label}"'
+
+
+# ─── Regression Guards ────────────────────────────────────────────────────
+
+def test_v1041_existing_v104_chunked_still_works():
+    """v10.4 Chunked-Reader Infrastructure bleibt intakt."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_sonnet_read_dp_structured_chunked_v104')
+    assert hasattr(_app, '_count_dp_pdf_pages')
+    assert hasattr(_app, '_dp_chunk_boundaries')
+    assert hasattr(_app, '_heartbeat_phase')
+    assert hasattr(_app, '_detect_and_fail_stale_jobs')
+
+
+def test_v1041_existing_v103_z77_still_works():
+    """v10.3 Z77-Source-Selection unverändert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, 'choose_z77_source')
+
+
+def test_v1041_no_chunk_word_user_facing_in_frontend():
+    """Frontend-Wording: kein „chunk" als User-Text."""
+    site = open(_FRONTEND_HTML).read()
+    # Phase-label aus Backend wird im Frontend gezeigt — kein „chunk" dort
+    import re as _re
+    # Suche nach „chunk" außerhalb von JS-Code
+    for m in _re.finditer(r'\bchunk', site, _re.IGNORECASE):
+        pos = m.start()
+        line_start = site.rfind('\n', 0, pos) + 1
+        line = site[line_start:site.find('\n', pos)]
+        rel = pos - line_start
+        is_safe = ('//' in line[:rel] or 'console.' in line[:rel]
+                   or '<!--' in site[max(0,pos-100):pos][-100:]
+                   or '.includes(' in line or '.test(' in line)
+        if not is_safe:
+            ln = site[:pos].count('\n') + 1
+            raise AssertionError(f'„chunk" user-facing line {ln}: {line[:80]}')
 
 
 if __name__ == '__main__':

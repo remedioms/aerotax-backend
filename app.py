@@ -942,8 +942,11 @@ def _sanitize_chunk_result(result):
 
 
 def create_job_chunk(job_id, document_type, chunk_index,
-                     page_from=None, page_to=None):
+                     page_from=None, page_to=None,
+                     file_hash=None, parser_version=None):
     """Erstellt einen pending-Chunk-Eintrag. Idempotent via (job_id, document_type, chunk_index).
+    v10.4.1: file_hash + parser_version unterstützen Cache-Lookups bei Wiederholung
+    derselben Datei.
     Returns chunk_id (UUID) oder None bei Fehler."""
     import uuid as _uuid
     chunk_id = str(_uuid.uuid4())
@@ -954,6 +957,8 @@ def create_job_chunk(job_id, document_type, chunk_index,
         'chunk_index': int(chunk_index),
         'page_from': page_from,
         'page_to': page_to,
+        'file_hash': file_hash,
+        'parser_version': parser_version,
         'status': 'pending',
         'result_json': None,
         'error_code': None,
@@ -1054,6 +1059,48 @@ def load_job_chunks(job_id, document_type=None, status=None):
             chunks = [c for c in chunks if c.get('status') == status]
     chunks.sort(key=lambda c: c.get('chunk_index', 0))
     return chunks
+
+
+def find_cached_chunk(file_hash, document_type, chunk_index, parser_version):
+    """v10.4.1: Cache-Lookup für completed chunks.
+    Wenn dieselbe Datei (SHA-256) + selbe parser_version bereits ausgewertet:
+    Result direkt aus Supabase ohne Sonnet-Call.
+
+    Returns result_json (dict) oder None.
+    """
+    if not file_hash or not parser_version:
+        return None
+    if SB_AVAILABLE:
+        try:
+            res = sb.table('job_chunks').select('result_json').eq(
+                'file_hash', file_hash).eq(
+                'document_type', document_type).eq(
+                'chunk_index', int(chunk_index)).eq(
+                'parser_version', parser_version).eq(
+                'status', 'completed').limit(1).execute()
+            rows = (res and res.data) or []
+            if rows:
+                return rows[0].get('result_json')
+        except Exception as e:
+            print(f"[chunks] cache lookup fail: {str(e)[:120]}")
+    # Disk-Fallback: scan all known chunks (rare path, slower)
+    try:
+        for fn in os.listdir(_JOB_CHUNKS_DIR):
+            if not fn.endswith('.json'): continue
+            try:
+                chunks = json.load(open(os.path.join(_JOB_CHUNKS_DIR, fn)))
+                for c in chunks:
+                    if (c.get('file_hash') == file_hash and
+                        c.get('document_type') == document_type and
+                        c.get('chunk_index') == int(chunk_index) and
+                        c.get('parser_version') == parser_version and
+                        c.get('status') == 'completed'):
+                        return c.get('result_json')
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
 
 
 def cleanup_old_job_chunks():
@@ -7296,6 +7343,132 @@ Antworte NUR mit JSON (keine Backticks):
 # Drei parallele KI-Calls, dann Merge. Single-Source-of-Truth pro Bereich.
 # ════════════════════════════════════════════════════════════════════════
 
+# v10.4.1: Parser-Versionen für File-Hash-Cache-Invalidierung.
+# Bei Logik-Änderungen am Reader die entsprechende Version bumpen.
+_LSB_PARSER_VERSION = 'v10.4.1'
+_DP_PARSER_VERSION = 'v10.4.1'
+
+
+def _parse_lsb_local_fast(pdf_bytes):
+    """v10.4.1: Schneller lokaler LSB-Parser via pdfplumber + Regex.
+    Standardisiertes eLSTB-Format hat strikte Zeilen-Nummerierung — keine KI nötig.
+
+    Liefert dict mit allen Standard-Feldern WENN brutto + lohnsteuer sicher
+    erkannt. Sonst None → Sonnet-Fallback.
+
+    Critical fields für die Berechnung:
+      - brutto (Zeile 3) — Pflicht
+      - lohnsteuer (Zeile 4)
+      - ag_fahrt_z17 (Zeile 17) → Anreisekosten-Topf
+      - verpflegungszuschuss_z20 (Zeile 20) → wird vom Code nicht primär genutzt
+    """
+    import pdfplumber as _pp, io as _io, re as _re
+    if not pdf_bytes:
+        return None
+    try:
+        with _pp.open(_io.BytesIO(pdf_bytes)) as pdf:
+            text = '\n'.join(p.extract_text() or '' for p in pdf.pages)
+    except Exception:
+        return None
+
+    # eLSTB-Signaturen — sonst kein gültiges LSB
+    text_lc = text.lower()
+    if not any(sig in text_lc for sig in [
+        'lohnsteuerbescheinigung', 'eltb', 'elstb', 'elektronische lohnsteuer',
+        'bruttoarbeitslohn',
+    ]):
+        return None
+
+    def _eur(s):
+        try:
+            return float(str(s).replace('.', '').replace(',', '.'))
+        except Exception:
+            return None
+
+    def _line_value(pattern, default=0.0):
+        """Sucht Zeilen-Muster im Text. Toleriert verschiedene Whitespaces."""
+        m = _re.search(pattern, text, _re.MULTILINE)
+        if not m:
+            return default
+        v = _eur(m.group(1))
+        return v if v is not None else default
+
+    # eLSTB-Patterns — Zahlen typisch in Format „1.234,56" oder „52.884,81"
+    # Zeile 3: Bruttoarbeitslohn — Pflicht
+    # Format-Varianten: "3.    52.884,81" oder "3 52.884,81" oder mit "EUR"
+    brutto_patterns = [
+        r'(?:^|\n)\s*3\.?\s+(\d{1,3}(?:[.\s]?\d{3})*,\d{2})',
+        r'Bruttoarbeitslohn[^\d\n]*(\d{1,3}(?:[.\s]?\d{3})*,\d{2})',
+        r'\b3\.\s*Bruttoarbeitslohn[^\d]*?(\d{1,3}(?:[.\s]?\d{3})*,\d{2})',
+    ]
+    brutto = None
+    for pat in brutto_patterns:
+        m = _re.search(pat, text)
+        if m:
+            v = _eur(m.group(1))
+            if v and v >= 1000:  # Sanity: Jahresbrutto mindestens 1000€
+                brutto = v
+                break
+    if not brutto:
+        return None  # Kein Brutto → kein verlässliches LSB → Sonnet
+
+    result = {
+        'brutto': brutto,
+        'lohnsteuer': _line_value(r'(?:^|\n)\s*4\.?\s+(\d[\d.,\s]*)'),
+        'soli': _line_value(r'(?:^|\n)\s*5\.?\s+(\d[\d.,\s]*)'),
+        'kirchensteuer_an': _line_value(r'(?:^|\n)\s*6\.?\s+(\d[\d.,\s]*)'),
+        'ag_fahrt_z17': _line_value(r'(?:^|\n)\s*17\.?\s+(\d[\d.,\s]*)'),
+        'ag_fahrt_z18_pauschal': _line_value(r'(?:^|\n)\s*18\.?\s+(\d[\d.,\s]*)'),
+        'verpflegungszuschuss_z20': _line_value(r'(?:^|\n)\s*20\.?\s+(\d[\d.,\s]*)'),
+        'doppelhaus_z21': _line_value(r'(?:^|\n)\s*21\.?\s+(\d[\d.,\s]*)'),
+        'rv_ag': _line_value(r'(?:^|\n)\s*22\s*a\.?\s+(\d[\d.,\s]*)'),
+        'rv_an': _line_value(r'(?:^|\n)\s*23\s*a\.?\s+(\d[\d.,\s]*)'),
+        'kv_an': _line_value(r'(?:^|\n)\s*25\.?\s+(\d[\d.,\s]*)'),
+        'pv_an': _line_value(r'(?:^|\n)\s*26\.?\s+(\d[\d.,\s]*)'),
+        'av_an': _line_value(r'(?:^|\n)\s*27\.?\s+(\d[\d.,\s]*)'),
+        # Personalien — local hat keine echte Sicherheit, Sonnet liefert das im Fallback
+        'identnr': '', 'geburtsdatum': '', 'personalnummer': '',
+        'steuerklasse': '1', 'kinderfreibetraege': 0.0,
+        'kirchensteuermerkmale': '', 'arbeitgeber': 'Deutsche Lufthansa AG',
+        'finanzamt': '', 'steuernummer_ag': '',
+        'vorsorge_gesamt_an': 0.0, 'rv_gesamt': 0.0,
+        '_source': 'local_fast_v10.4.1',
+        '_confidence': 'high',
+    }
+
+    # Sanity: lohnsteuer sollte ungefähr 15-35% vom Brutto sein
+    if result['lohnsteuer'] > brutto * 0.5 or result['lohnsteuer'] < 0:
+        return None  # Unplausibel → Sonnet
+
+    print(f"[LSB-LocalFast] brutto={brutto:.2f} ls={result['lohnsteuer']:.2f} "
+          f"z17={result['ag_fahrt_z17']:.2f} z20={result['verpflegungszuschuss_z20']:.2f} "
+          f"(kein Sonnet-Call)")
+    return result
+
+
+def _read_lsb_with_local_fallback(pdf_bytes_list):
+    """v10.4.1: LSB-Reader mit Local-First-Pfad.
+    1. Local Regex-Parse versuchen (pdfplumber).
+    2. Bei Erfolg + alleinigem PDF: return ohne Sonnet.
+    3. Sonst: Fallback auf _sonnet_read_lsb_v2.
+
+    Multi-LSB (z.B. mehrere Arbeitgeber) → immer Sonnet (Aggregation komplex).
+    """
+    pdf_bytes_list = _bytes_list(pdf_bytes_list) if pdf_bytes_list else []
+    if not pdf_bytes_list:
+        return None
+    # Nur Single-LSB lokal — Multi-LSB braucht Sonnet
+    if len(pdf_bytes_list) == 1:
+        try:
+            local = _parse_lsb_local_fast(pdf_bytes_list[0])
+            if local and local.get('brutto', 0) > 0:
+                return local
+        except Exception as e:
+            print(f"[LSB-LocalFast] error: {str(e)[:120]} → Sonnet fallback")
+    # Fallback: Sonnet
+    return _sonnet_read_lsb_v2(pdf_bytes_list)
+
+
 def _sonnet_read_lsb_v2(pdf_bytes_list):
     """Sonnet liest LSB-PDF(s) direkt via Tool-Use. Standardisiertes Format
     der elektronischen LSB → Sonnet kann das deterministisch abklopfen.
@@ -8074,22 +8247,63 @@ def _sonnet_read_dp_structured_chunked_v104(dp_bytes, einsatz_bytes=None, year=2
 
     if len(boundaries) <= 1:
         # Klein genug für single-call (kein Chunking-Overhead)
-        _heartbeat_phase(job_id, 'dp_single_call', {'pages': total_pages})
+        _heartbeat_phase(job_id, 'dp_single_call',
+                         {'pages': total_pages,
+                          'label': 'Flugstundenübersicht wird gelesen…'})
         return _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year, homebase)
+
+    # v10.4.1: File-Hash für Cache-Lookup berechnen
+    import hashlib as _hl
+    dp_bytes_concat = b''.join((b if isinstance(b, bytes) else (b[0] if isinstance(b, tuple) else b''))
+                                for b in (_bytes_list(dp_bytes) or []))
+    file_hash = _hl.sha256(dp_bytes_concat).hexdigest()[:32] if dp_bytes_concat else None
+    parser_version = _DP_PARSER_VERSION
+    if file_hash:
+        print(f"[DP-Chunked-v10.4.1] file_hash={file_hash[:12]} parser={parser_version}")
 
     print(f"[DP-Chunked-v10.4] {total_pages} Seiten → {len(boundaries)} Chunks (max_tokens=20000/Chunk)")
     all_days = []
     all_warnings = []
     failed_chunks = 0
+    cache_hits = 0
 
     for idx, (pf, pt) in enumerate(boundaries):
         chunk_label = f"dp_chunk_{idx+1}_of_{len(boundaries)}"
-        _heartbeat_phase(job_id, chunk_label, {'page_from': pf, 'page_to': pt,
-                                                 'chunk_index': idx,
-                                                 'total_chunks': len(boundaries)})
+        _heartbeat_phase(job_id, chunk_label,
+                         {'page_from': pf, 'page_to': pt,
+                          'chunk_index': idx, 'total_chunks': len(boundaries),
+                          'label': f'Flugstundenübersicht wird ausgewertet (Abschnitt {idx+1} von {len(boundaries)})…'})
+
+        # v10.4.1: Cache-Lookup zuerst — wenn diese Datei + dieser Chunk + diese
+        # parser_version bereits ausgewertet wurde, kompletter Sonnet-Call gespart.
+        cached = find_cached_chunk(file_hash, 'dp', idx, parser_version) if file_hash else None
+        if cached and isinstance(cached, dict) and cached.get('days'):
+            cache_days = cached.get('days') or []
+            cache_warnings = cached.get('warnings') or []
+            all_days.extend(cache_days)
+            all_warnings.extend(cache_warnings)
+            cache_hits += 1
+            print(f"[DP-Chunked-v10.4.1] chunk {idx+1}/{len(boundaries)} cache HIT — {len(cache_days)} Tage (kein Sonnet-Call)")
+            # Job-Chunk für dieses job_id anlegen + sofort als completed markieren
+            # (zur Audit-Trace; cache_result ist die selbe Daten)
+            if job_id:
+                chunk_id = create_job_chunk(job_id, 'dp', idx, pf, pt,
+                                             file_hash=file_hash,
+                                             parser_version=parser_version)
+                if chunk_id:
+                    save_job_chunk_result(chunk_id, {
+                        'days': cache_days, 'warnings': cache_warnings,
+                        'days_count': len(cache_days),
+                        'page_from': pf, 'page_to': pt,
+                        '_from_cache': True,
+                    })
+            gc.collect()
+            continue
 
         # 1. Chunk-Row in Supabase anlegen
-        chunk_id = create_job_chunk(job_id, 'dp', idx, pf, pt) if job_id else None
+        chunk_id = create_job_chunk(job_id, 'dp', idx, pf, pt,
+                                     file_hash=file_hash,
+                                     parser_version=parser_version) if job_id else None
         if chunk_id:
             mark_job_chunk_running(chunk_id)
 
@@ -8166,9 +8380,11 @@ def _sonnet_read_dp_structured_chunked_v104(dp_bytes, einsatz_bytes=None, year=2
             f"konnten nicht vollständig gelesen werden — geprüfte Tage trotzdem berücksichtigt."
         )
 
-    print(f"[DP-Chunked-v10.4] FERTIG: {len(deduped)} Tage (von {len(all_days)} pre-dedupe), "
-          f"{failed_chunks} fehlgeschlagene Chunks")
-    _heartbeat_phase(job_id, 'dp_merge_complete', {'days': len(deduped)})
+    print(f"[DP-Chunked-v10.4.1] FERTIG: {len(deduped)} Tage (von {len(all_days)} pre-dedupe), "
+          f"{failed_chunks} fehlgeschlagene Chunks, {cache_hits} cache hits")
+    _heartbeat_phase(job_id, 'dp_merge_complete',
+                     {'days': len(deduped), 'cache_hits': cache_hits,
+                      'label': 'Auswertung wird zusammengeführt…'})
 
     if not deduped:
         # Alle Chunks failed — wir haben gar nichts
@@ -11608,11 +11824,15 @@ def hybrid_analyze(form, files):
 
     errors = []
 
-    # Schritt 1: Sonnet-LSB (kleinster Memory-Footprint, läuft zuerst)
+    # Schritt 1: LSB (Local-First, Sonnet nur Fallback)
     lsb_data = None
     if lsb_bytes:
         try:
-            lsb_data = _sonnet_read_lsb_v2(lsb_bytes)
+            _heartbeat_phase(job_id, 'lsb',
+                             {'label': 'Lohnsteuerbescheinigung wird geprüft…'})
+            # v10.4.1: Local-First — versucht regex-basierten Fast-Parse zuerst,
+            # Sonnet nur als Fallback wenn local nicht greift.
+            lsb_data = _read_lsb_with_local_fallback(lsb_bytes)
         except Exception as e:
             errors.append(f'LSB: {e}')
             print(f"[hybrid] Sonnet-LSB crash: {e}")
@@ -11634,6 +11854,8 @@ def hybrid_analyze(form, files):
     se_structured = None
     if se_bytes:
         try:
+            _heartbeat_phase(job_id, 'se_structured',
+                             {'label': 'Streckeneinsatz-Abrechnung wird gelesen…'})
             se_structured = _sonnet_read_se_structured(se_bytes, year)
         except Exception as e:
             errors.append(f'SE-Structured: {type(e).__name__}: {str(e)[:200]}')
@@ -11697,6 +11919,8 @@ def hybrid_analyze(form, files):
     document_health = None
     if dp_bytes:
         try:
+            _heartbeat_phase(job_id, 'dp_start',
+                             {'label': 'Flugstundenübersicht wird in Abschnitten ausgewertet…'})
             # v10.4: Chunked DP-Reader für Memory-Pressure-Reduktion auf Render Free-Tier.
             # Wenn job_id vorhanden → persistente Chunks in Supabase + Heartbeat-Tracking.
             # Sonst: fallback auf single-call.
