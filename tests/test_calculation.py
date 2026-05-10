@@ -2790,6 +2790,109 @@ def test_v816_hotel_candidate_issues_list_present():
     assert 'hotel_candidate_issues' in result
 
 
+def test_v817_reinigungstage_field_present():
+    """Result-Dict enthält reinigungstage als getrennten Counter."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-15', 'activity_type': 'office', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert 'reinigungstage' in result
+    # Office an Homebase = 1 reinigungstag
+    assert result['reinigungstage'] == 1
+
+
+def test_v817_standby_not_reinigungstag():
+    """Standby zuhause zählt als Arbeitstag, NICHT als Reinigungstag."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-03-15', 'activity_type': 'standby', 'overnight_after_day': False},
+        {'datum': '2025-03-16', 'activity_type': 'standby', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 2 Arbeitstage (Standby), 0 Reinigungstage
+    assert result['arbeitstage'] == 2
+    assert result['reinigungstage'] == 0
+    # classifier_result-Flag pro Tag prüfen
+    for t in result['tage_detail']:
+        cr = t.get('classifier_result') or {}
+        assert cr.get('counted_as_workday') is True
+        assert cr.get('counted_as_reinigungstag') is False
+
+
+def test_v817_tour_day_is_reinigungstag():
+    """Z76-Tour-Tag ist Reinigungstag (Uniform-Bezug klar)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-13', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-14', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-13', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-14', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 2 Z76-Tage = 2 Arbeitstage = 2 Reinigungstage
+    assert result['arbeitstage'] == 2
+    assert result['reinigungstage'] == 2
+
+
+def test_v817_multi_day_seminar_only_first_reinigungstag():
+    """Mehrtages-Seminar-Block (≥5 Tage): nur Tag 1 ist Reinigungstag.
+    Folgetage werden auch für Reinigung übersprungen (analog Fahrtage)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True}
+        for d in range(4, 13)  # 9 Tage
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 9 Office-Arbeitstage, aber nur 1 Reinigungstag (Tag 1)
+    assert result['arbeitstage'] == 9
+    assert result['reinigungstage'] == 1
+
+
+def test_v817_evening_foreign_tour_start_no_reinigungstag():
+    """Z73-Abend-Auslandsanreise zählt nicht als Reinigungstag (User in DE,
+    abends Briefing, Flugnacht — kein Uniform-Tag im Sinne der Reinigung)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-19', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': False, 'routing': ['FRA', 'GRU'], 'layover_ort': 'GRU',
+         'start_time': '21:25'},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-19', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail = result['tage_detail'][0]
+    cr = detail['classifier_result']
+    assert cr['z73_type'] == 'evening_foreign_tour_start'
+    assert cr['counted_as_reinigungstag'] is False
+    assert result['reinigungstage'] == 0
+    # Aber als AT zählt es:
+    assert cr['counted_as_workday'] is True
+
+
+def test_v817_frei_neither_workday_nor_reinigungstag():
+    """Frei zählt weder Arbeits- noch Reinigungstag."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-01', 'activity_type': 'frei', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['arbeitstage'] == 0
+    assert result['reinigungstage'] == 0
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

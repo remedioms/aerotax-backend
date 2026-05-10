@@ -1681,7 +1681,7 @@ def chat_with_aerotax():
         f"Z17 (AG-Fahrkostenzuschuss): {result_data.get('ag_z17', 0):.2f} €",
         f"Z77 (steuerfreie Spesen): {result_data.get('z77', 0):.2f} €",
         f"Fahrtkosten: {result_data.get('fahr', 0):.2f} € ({result_data.get('km',0)}km × {result_data.get('fahr_tage',0)} Fahrtage)",
-        f"Reinigung: {result_data.get('reinig', 0):.2f} € ({result_data.get('arbeitstage',0)} Arbeitstage × 1,60 €)",
+        f"Reinigung: {result_data.get('reinig', 0):.2f} € ({result_data.get('reinigungstage', result_data.get('arbeitstage',0))} Reinigungstage × 1,60 €)",
         f"Trinkgelder: {result_data.get('trink', 0):.2f} € ({result_data.get('hotel_naechte',0)} Hotelnächte × 3,60 €)",
         f"Z72 (Inland >8h): {result_data.get('vma_72_tage',0)} Tage / {result_data.get('vma_72',0):.2f} €",
         f"Z73 (An-/Abreise): {result_data.get('vma_73_tage',0)} Tage / {result_data.get('vma_73',0):.2f} €",
@@ -6746,6 +6746,42 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 None,
                 None)
 
+    # v8.17: Mehrtages-Training-Sequenz vorm Klassifikations-Loop berechnen.
+    # Das training_seq_skip-Set ist auch für counted_as_reinigungstag relevant
+    # (Folgetage zählen weder Fahrtag NOCH Reinigungstag).
+    training_seq_skip = set()
+    training_seq_audit = []
+    seq_start_pre = None
+    for idx_pre, m_pre in enumerate(sorted_days):
+        d_pre = m_pre['dp']
+        if d_pre.get('activity_type') == 'training' and d_pre.get('requires_commute'):
+            if seq_start_pre is None:
+                seq_start_pre = idx_pre
+        else:
+            if seq_start_pre is not None and (idx_pre - seq_start_pre) >= 5:
+                seq_days_pre = sorted_days[seq_start_pre:idx_pre]
+                any_daily_pre = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days_pre)
+                if not any_daily_pre:
+                    for skip_i in range(seq_start_pre + 1, idx_pre):
+                        training_seq_skip.add(skip_i)
+                    training_seq_audit.append({
+                        'start': sorted_days[seq_start_pre]['datum'],
+                        'end':   sorted_days[idx_pre-1]['datum'],
+                        'days':  idx_pre - seq_start_pre,
+                    })
+            seq_start_pre = None
+    if seq_start_pre is not None and (len(sorted_days) - seq_start_pre) >= 5:
+        seq_days_pre = sorted_days[seq_start_pre:]
+        any_daily_pre = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days_pre)
+        if not any_daily_pre:
+            for skip_i in range(seq_start_pre + 1, len(sorted_days)):
+                training_seq_skip.add(skip_i)
+            training_seq_audit.append({
+                'start': sorted_days[seq_start_pre]['datum'],
+                'end':   sorted_days[-1]['datum'],
+                'days':  len(sorted_days) - seq_start_pre,
+            })
+
     for i, m in enumerate(sorted_days):
         d = m['dp']
         se = m['se']
@@ -7273,6 +7309,22 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             and not (at in ('unknown', 'none', '') and not has_active_se_for_hotel)
         )
 
+        # v8.17: counted_as_reinigungstag — getrennt vom counted_as_workday.
+        # Reinigungskosten zählen nur Tage mit Uniform-/Dienstkleidungs-Bezug.
+        # Standby/Rufbereitschaft zuhause zählen NICHT (kein Uniform-Tag).
+        # Mehrtages-Training-Block-Folgetage zählen NICHT (gleiche Logik wie Fahrtage).
+        # Frei/Issue/SE-only zählen NICHT.
+        REINIGUNG_KLASSEN = ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Training')
+        in_training_skip = i in training_seq_skip
+        counted_reinigung = (
+            klass in REINIGUNG_KLASSEN
+            and not in_training_skip
+            and not is_evening_anreise_z73  # Tag in DE im Flugzeug — kein Uniform-Tag
+        ) or (
+            # ZeroDay nur wenn explizit dienstlich UND Same-Day-Pattern (echter Tour-Tag)
+            klass == 'ZeroDay' and dienstlich
+        )
+
         classifier_result = {
             'klass': klass,
             'amount': round(eur_added, 2),
@@ -7283,6 +7335,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'counted_as_workday': klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby') or (klass == 'ZeroDay' and dienstlich),
             'counted_as_fahrtag': bool(d.get('requires_commute')) and klass not in ('Frei', 'Issue', 'Standby'),
             'counted_as_hotel_nacht': counted_hotel,
+            'counted_as_reinigungstag': counted_reinigung,
             'is_vma_correction_only': is_evening_anreise_z73,
             # v8.9: effective_ort sichtbar machen — bei Bug sofort sehen welche Quelle Classifier nutzt
             'dp_layover_ort':           dp_layover_ort_v,
@@ -7343,53 +7396,24 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         if t['klass'] in HARD_AT_KLASSEN
         or (t['klass'] == 'ZeroDay' and t.get('dienstlich'))
     )
+    # v8.17: reinigungstage = nur Tage mit Uniform-/Dienstkleidungs-Bezug.
+    # Aus classifier_result.counted_as_reinigungstag aggregiert.
+    reinigungstage = sum(
+        1 for t in tage_detail
+        if (t.get('classifier_result') or {}).get('counted_as_reinigungstag')
+    )
     zero_dienstlich_tage = sum(1 for t in tage_detail if t['klass'] == 'ZeroDay' and t.get('dienstlich'))
     zero_skipped_tage    = sum(1 for t in tage_detail if t['klass'] == 'ZeroDay' and not t.get('dienstlich'))
-    print(f"[v8-counts-detail] arbeitstage_sources Z72={z72_tage} Z73={z73_tage} Z74={z74_tage} "
+    print(f"[v8-counts-detail] arbeitstage={arbeitstage} reinigungstage={reinigungstage} "
+          f"Z72={z72_tage} Z73={z73_tage} Z74={z74_tage} "
           f"Z76={z76_tage} Office={office_tage} Standby={standby_tage} "
           f"ZeroDay_dienstlich={zero_dienstlich_tage} skipped_unknown={zero_skipped_tage} "
           f"Issue={issue_tage}")
 
     # Fahrtage v8.3: ausschließlich dp.requires_commute (Sonnet oder Heuristik).
     # Kein automatischer Heimkehr-Fahrtag mehr.
-    # v8.13/v8.14: Mehrtages-Training-Sequenz (≥4 Tage activity=training mit
-    # requires_commute) zählt nur den ERSTEN Tag als Fahrtag, sofern nicht
-    # explicit_daily_commute=true gesetzt ist (User fährt täglich hin).
-    # Allgemeine Heuristik — KEINE datums-/tour-spezifischen Hardcodes.
-    training_seq_skip = set()
-    training_seq_audit = []  # für audit_notes
-    seq_start = None
-    for idx, m in enumerate(sorted_days):
-        d = m['dp']
-        if d.get('activity_type') == 'training' and d.get('requires_commute'):
-            if seq_start is None:
-                seq_start = idx
-        else:
-            if seq_start is not None and (idx - seq_start) >= 5:
-                # Prüfe explicit_daily_commute innerhalb der Sequenz
-                seq_days = sorted_days[seq_start:idx]
-                any_daily = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days)
-                if not any_daily:
-                    # Keine tägliche Heimfahrt-Indizien → nur Tag 1 als Fahrtag
-                    for skip_i in range(seq_start + 1, idx):
-                        training_seq_skip.add(skip_i)
-                    training_seq_audit.append({
-                        'start': sorted_days[seq_start]['datum'],
-                        'end':   sorted_days[idx-1]['datum'],
-                        'days':  idx - seq_start,
-                    })
-            seq_start = None
-    if seq_start is not None and (len(sorted_days) - seq_start) >= 5:
-        seq_days = sorted_days[seq_start:]
-        any_daily = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days)
-        if not any_daily:
-            for skip_i in range(seq_start + 1, len(sorted_days)):
-                training_seq_skip.add(skip_i)
-            training_seq_audit.append({
-                'start': sorted_days[seq_start]['datum'],
-                'end':   sorted_days[-1]['datum'],
-                'days':  len(sorted_days) - seq_start,
-            })
+    # v8.17: training_seq_skip wird oben (vorm Klassifikations-Loop) berechnet,
+    # damit auch counted_as_reinigungstag im classifier_result darauf reagieren kann.
 
     # v8.14: Audit-Notes für jede erkannte Mehrtages-Sequenz
     for seq in training_seq_audit:
@@ -7808,6 +7832,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
 
     return {
         'arbeitstage': arbeitstage,
+        'reinigungstage': reinigungstage,
         'fahr_tage': fahr_tage,
         'hotel_naechte': hotel_naechte,
         'z72_tage': z72_tage,
@@ -8381,6 +8406,8 @@ def _detect_classification_issues(cls, se_summary):
     z77 = float(se_summary.get('z77_total', 0) or 0)
     auslandsspesen_se = float(se_summary.get('auslandsspesen_total', 0) or 0)
     arbeitstage = int(cls.get('arbeitstage', 0) or 0)
+    # v8.17: reinigungstage als getrennter Counter (Uniform-/Dienstkleidungstage)
+    reinigungstage = int(cls.get('reinigungstage', arbeitstage) or arbeitstage)
     fahr_tage = int(cls.get('fahr_tage', 0) or 0)
     hotel = int(cls.get('hotel_naechte', 0) or 0)
     z72_tage = int(cls.get('z72_tage', 0) or 0)
@@ -8771,7 +8798,10 @@ def _berechne_via_hybrid(form, files):
         print(f'[fahrtkosten] {fahr:.2f}€ aus: {", ".join(fahr_breakdown)}')
 
     # ── Reinigung & Trinkgeld ──
-    reinig = round(arbeitstage * reinig_satz, 2)
+    # v8.17: Reinigung nutzt reinigungstage (Uniform-/Dienstkleidungstage),
+    # nicht arbeitstage. Standby zuhause/SE-only/Mehrtages-Seminar-Folgetage
+    # zählen für Reinigung NICHT (kein Uniform-Bezug an dem Tag).
+    reinig = round(reinigungstage * reinig_satz, 2)
     trink  = round(hotel_naechte * trink_satz, 2)
 
     # ── Optionale Belege ──
@@ -8884,6 +8914,7 @@ def _berechne_via_hybrid(form, files):
         'datum':            datetime.now().strftime('%d.%m.%Y'),
         'km':               km,
         'arbeitstage':      arbeitstage,
+        'reinigungstage':   reinigungstage,
         'fahr_tage':        fahr_tage,
         'hotel_naechte':    hotel_naechte,
         'vma_72_tage':      vma_72_tage,
@@ -10523,7 +10554,7 @@ def erstelle_pdf(d):
     _de_dec = lambda f: f"{f:.2f}".replace('.', ',')
     calc_items = [
         (f"Fahrtkosten Homebase  ({d.get('km',0)} km × {d.get('fahr_tage',0)} Tage)", "Zeilen 27–30", eur(d.get('fahr',0))),
-        (f"Reinigungskosten  ({d.get('arbeitstage',0)} Tage × {_de_dec(_rsatz)} €)", "Zeile 62", eur(d.get('reinig',0))),
+        (f"Reinigungskosten  ({d.get('reinigungstage', d.get('arbeitstage',0))} Reinigungstage × {_de_dec(_rsatz)} €)", "Zeile 62", eur(d.get('reinig',0))),
         (f"Trinkgelder  ({d.get('hotel_naechte',0)} Nächte × {_de_dec(_tsatz)} €)", "Zeile 68", eur(d.get('trink',0))),
         (f"VMA Inland >8h  ({d.get('vma_72_tage',0)} Tage × {_de_dec(_bmf['tagestrip_8h'])} €)", "Zeile 72", eur(d.get('vma_72',0))),
         (f"VMA An-/Abreisetage  ({d.get('vma_73_tage',0)} Tage × {_de_dec(_bmf['an_abreise'])} €)", "Zeile 73", eur(d.get('vma_73',0))),
