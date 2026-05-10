@@ -9277,12 +9277,13 @@ def test_v1041_lsb_local_fast_sanity_check():
 
 
 def test_v1041_lsb_local_fast_no_sonnet_when_complete():
-    """Wenn local-fast erfolgreich → kein Sonnet-Call.
-    _read_lsb_with_local_fallback returnt direkt bei Erfolg."""
+    """Wenn local-fast/gated erfolgreich → kein Sonnet-Call.
+    _read_lsb_with_local_fallback returnt direkt bei Erfolg (über result dict)."""
     src = _read_backend()
     fn_idx = src.find('def _read_lsb_with_local_fallback')
-    block = src[fn_idx:fn_idx + 1500]
-    assert 'return local' in block, \
+    block = src[fn_idx:fn_idx + 3500]
+    # Im gated/on-Pfad: return result (= flattened local dict)
+    assert 'return result' in block, \
         'Bei local-Erfolg muss früh-Return ohne Sonnet erfolgen'
 
 
@@ -9491,13 +9492,13 @@ def test_taskA_lsb_flag_constant_exists():
 
 
 def test_taskA_lsb_flag_default_off():
-    """Default-Verhalten: Flag AUS — Sonnet wird genutzt wie vor v10.4.1.
-    Test prüft dass Constant in der Fallback-Funktion gecheckt wird."""
+    """Default-Verhalten (Task A2): mode 'gated' — Sonnet als Fallback bei
+    fehlender Confidence. Fallback-Funktion nutzt Mode-Check (statt binärem Flag)."""
     src = _read_backend()
     fn_idx = src.find('def _read_lsb_with_local_fallback')
-    block = src[fn_idx:fn_idx + 2000]
-    assert '_AEROTAX_LSB_LOCAL_FIRST' in block, \
-        'Fallback-Funktion muss ENV-Flag prüfen'
+    block = src[fn_idx:fn_idx + 3000]
+    assert '_aerotax_lsb_mode()' in block, \
+        'Fallback-Funktion muss Mode-Check (Task A2) nutzen'
 
 
 def test_taskA_lsb_flag_default_value():
@@ -9527,13 +9528,13 @@ def test_taskA_lsb_flag_true_when_enabled():
 
 
 def test_taskA_lsb_fallback_uses_flag_check():
-    """Local-fast-Pfad ist hinter ENV-Flag-Bedingung gated."""
+    """Local-Pfad ist hinter ENV-Mode-Check gated (Task A2: 3-mode)."""
     src = _read_backend()
     fn_idx = src.find('def _read_lsb_with_local_fallback')
-    block = src[fn_idx:fn_idx + 2000]
-    # Suche if-statement mit Flag + local-fast call
-    assert 'if _AEROTAX_LSB_LOCAL_FIRST' in block, \
-        'Local-First Pfad muss explizit hinter Flag stehen'
+    block = src[fn_idx:fn_idx + 3000]
+    # Task A2: nutzt _aerotax_lsb_mode() für 3-Mode-Logic statt binäres Flag
+    assert '_aerotax_lsb_mode()' in block or '_AEROTAX_LSB_LOCAL_FIRST' in block, \
+        'Reader muss Mode/Flag-Check haben'
 
 
 def test_taskA_sonnet_remains_default_path():
@@ -9604,6 +9605,294 @@ def test_taskA_local_fast_function_still_present():
     _app = _load_app_fresh()
     assert hasattr(_app, '_parse_lsb_local_fast'), \
         'Local-Fast-Funktion darf nicht entfernt werden'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Task A2 — AI-gated LSB Fast-Reader (off/gated/on)
+# Default: gated. Lokales Lesen NUR bei high-confidence Standard-Layout +
+# eindeutigem Z17. Sonst Sonnet.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_taskA2_mode_function_exists():
+    """_aerotax_lsb_mode() existiert und liefert default 'gated'."""
+    import os as _os
+    _os.environ.pop('AEROTAX_LSB_FAST_READER_MODE', None)
+    _app = _load_app_fresh()
+    assert _app._aerotax_lsb_mode() == 'gated', \
+        'Default-Modus muss gated sein'
+
+
+def test_taskA2_mode_off():
+    """ENV-Var off → mode=off."""
+    import os as _os
+    _os.environ['AEROTAX_LSB_FAST_READER_MODE'] = 'off'
+    try:
+        _app = _load_app_fresh()
+        assert _app._aerotax_lsb_mode() == 'off'
+    finally:
+        _os.environ.pop('AEROTAX_LSB_FAST_READER_MODE', None)
+
+
+def test_taskA2_mode_on():
+    """ENV-Var on → mode=on."""
+    import os as _os
+    _os.environ['AEROTAX_LSB_FAST_READER_MODE'] = 'on'
+    try:
+        _app = _load_app_fresh()
+        assert _app._aerotax_lsb_mode() == 'on'
+    finally:
+        _os.environ.pop('AEROTAX_LSB_FAST_READER_MODE', None)
+
+
+def test_taskA2_mode_invalid_falls_back_to_gated():
+    """Ungültige Werte → gated."""
+    import os as _os
+    _os.environ['AEROTAX_LSB_FAST_READER_MODE'] = 'banana'
+    try:
+        _app = _load_app_fresh()
+        assert _app._aerotax_lsb_mode() == 'gated'
+    finally:
+        _os.environ.pop('AEROTAX_LSB_FAST_READER_MODE', None)
+
+
+def test_taskA2_layout_check_function_exists():
+    """_check_lsb_standard_layout existiert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_check_lsb_standard_layout')
+
+
+def test_taskA2_layout_check_empty_text_low():
+    """Leerer Text → confidence=low."""
+    _app = _load_app_fresh()
+    r = _app._check_lsb_standard_layout('')
+    assert r['confidence'] == 'low'
+    assert 'no_text_layer' in r['red_flags']
+
+
+def test_taskA2_layout_check_random_text_low():
+    """Text ohne LSB-Signaturen → low."""
+    _app = _load_app_fresh()
+    r = _app._check_lsb_standard_layout('Das ist nur ein Test ohne LSB-Signatur')
+    assert r['confidence'] == 'low'
+
+
+def test_taskA2_layout_check_full_lsb_high():
+    """Vollständiges LSB-Layout → high."""
+    _app = _load_app_fresh()
+    fake_lsb = """
+    Lohnsteuerbescheinigung 2025
+    3. Bruttoarbeitslohn                       52.884,81
+    4. Einbehaltene Lohnsteuer                  8.123,45
+    5. Solidaritätszuschlag                       250,00
+    6. Kirchensteuer                              350,00
+    17. Steuerpflichtiger Fahrkostenzuschuss   1.200,00
+    22a. AG-Rentenversicherung                  4.500,00
+    23a. AN-Rentenversicherung                  4.500,00
+    25. AN-Krankenversicherung                  3.200,00
+    26. AN-Pflegeversicherung                     500,00
+    27. AN-Arbeitslosenversicherung               600,00
+    """
+    r = _app._check_lsb_standard_layout(fake_lsb)
+    assert r['confidence'] == 'high', f'Layout-Check sollte high sein. Got: {r}'
+
+
+def test_taskA2_z17_eindeutig_high():
+    """Eindeutige Zeile 17 → confidence=high mit Wert."""
+    _app = _load_app_fresh()
+    text = """
+    16. Beitrag                       0,00
+    17. Steuerpflichtiger Fahrkostenzuschuss   1.234,56
+    18. Pauschal versteuert                     0,00
+    """
+    r = _app._extract_lsb_field_with_evidence(text, 17, allow_absent=True)
+    assert r['confidence'] == 'high'
+    assert abs(r['value'] - 1234.56) < 0.01
+
+
+def test_taskA2_z17_absent_allowed_returns_zero_high():
+    """Wenn Zeile 17 NICHT da aber Layout-Standard ist: 0 mit confidence=high und
+    definitely_absent=True. Das ist kein stilles 0 — es ist evidence-based 0."""
+    _app = _load_app_fresh()
+    text = """
+    3. Bruttoarbeitslohn         50.000,00
+    4. Lohnsteuer                 8.000,00
+    16. Etwas anderes            0,00
+    18. Pauschal                 100,00
+    """
+    r = _app._extract_lsb_field_with_evidence(text, 17, allow_absent=True)
+    assert r['value'] == 0.0
+    assert r['confidence'] == 'high'
+    assert r['definitely_absent'] is True
+    assert 'reason' in r['evidence']
+
+
+def test_taskA2_z17_multiple_candidates_conflict():
+    """Mehrere unterschiedliche Z17-Werte → confidence=conflict, value=None."""
+    _app = _load_app_fresh()
+    text = """
+    17. Fahrtkosten              1.234,56
+    17. Fahrtkosten anders       2.500,00
+    """
+    r = _app._extract_lsb_field_with_evidence(text, 17, allow_absent=True)
+    assert r['confidence'] == 'conflict'
+    assert r['value'] is None
+    assert 'candidates' in r['evidence']
+
+
+def test_taskA2_z17_multiple_identical_high():
+    """Mehrere IDENTISCHE Z17-Werte → high (Duplikat-Tolerant)."""
+    _app = _load_app_fresh()
+    text = """
+    17. Fahrtkosten              1.234,56
+    17. Fahrtkosten              1.234,56
+    """
+    r = _app._extract_lsb_field_with_evidence(text, 17, allow_absent=True)
+    assert r['confidence'] == 'high'
+    assert abs(r['value'] - 1234.56) < 0.01
+
+
+def test_taskA2_z17_unreadable_no_absent_low():
+    """Zeile 17 unleserlich und allow_absent=False → confidence=low."""
+    _app = _load_app_fresh()
+    text = ""
+    r = _app._extract_lsb_field_with_evidence(text, 17, allow_absent=False)
+    assert r['confidence'] == 'low'
+    assert r['value'] is None
+
+
+def test_taskA2_parse_with_confidence_function_exists():
+    """_parse_lsb_local_with_confidence existiert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_parse_lsb_local_with_confidence')
+
+
+def test_taskA2_parse_with_confidence_returns_low_for_non_lsb():
+    """Bytes ohne LSB-Layer → overall_confidence=low oder None."""
+    _app = _load_app_fresh()
+    r = _app._parse_lsb_local_with_confidence(None)
+    assert r is None
+
+
+def test_taskA2_flatten_function_exists():
+    """_flatten_local_to_lsb_dict existiert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_flatten_local_to_lsb_dict')
+
+
+def test_taskA2_flatten_preserves_z17():
+    """flatten setzt ag_fahrt_z17 aus Confidence-Dict."""
+    _app = _load_app_fresh()
+    fake = {
+        'overall_confidence': 'high',
+        'layout_check': {'confidence': 'high'},
+        'brutto':     {'value': 50000.0, 'confidence': 'high'},
+        'lohnsteuer': {'value': 8000.0, 'confidence': 'high'},
+        'ag_fahrt_z17': {'value': 1234.56, 'confidence': 'high'},
+    }
+    out = _app._flatten_local_to_lsb_dict(fake)
+    assert out['brutto'] == 50000.0
+    assert out['ag_fahrt_z17'] == 1234.56
+    assert out['_source'] == 'local_gated_v10.4.2'
+    assert out.get('_audit')
+
+
+def test_taskA2_no_silent_zero_for_z17():
+    """Wenn Z17 unklar lesbar → NICHT silent 0. Result behält None/conflict."""
+    _app = _load_app_fresh()
+    # In confidence-Dict: z17.value=None mit confidence=conflict
+    fake_low = {
+        'overall_confidence': 'low',
+        'layout_check': {'confidence': 'high'},
+        'brutto': {'value': 50000.0, 'confidence': 'high'},
+        'lohnsteuer': {'value': 8000.0, 'confidence': 'high'},
+        'ag_fahrt_z17': {'value': None, 'confidence': 'conflict',
+                          'evidence': {'candidates': [1234, 2500]}},
+    }
+    # flatten konvertiert None → 0, ABER der Reader-Pfad selbst sollte NICHT in den
+    # flatten gehen wenn z17.confidence != 'high'. Wir prüfen das auf Reader-Ebene:
+    src = _read_backend()
+    fn_idx = src.find('def _read_lsb_with_local_fallback')
+    block = src[fn_idx:fn_idx + 3000]
+    # Im gated-Modus: explizite Prüfung dass z17.confidence='high'
+    assert 'z17_ok' in block or "z17.get('confidence') == 'high'" in block, \
+        'Reader muss z17.confidence=high prüfen vor flatten'
+
+
+def test_taskA2_multi_lsb_always_uses_sonnet():
+    """Mehrere LSB-PDFs → immer Sonnet, egal welcher Modus."""
+    src = _read_backend()
+    fn_idx = src.find('def _read_lsb_with_local_fallback')
+    block = src[fn_idx:fn_idx + 3000]
+    assert 'len(pdf_bytes_list) > 1' in block, \
+        'Multi-LSB-Check muss vorhanden sein'
+    # Direkt-Return Sonnet bei Multi
+    multi_idx = block.find('len(pdf_bytes_list) > 1')
+    after_multi = block[multi_idx:multi_idx + 500]
+    assert '_sonnet_read_lsb_v2' in after_multi, \
+        'Bei Multi-LSB muss Sonnet folgen'
+
+
+def test_taskA2_gated_strict_checks():
+    """Gated-Modus prüft overall_confidence, layout, z17 — alle high."""
+    src = _read_backend()
+    fn_idx = src.find('def _read_lsb_with_local_fallback')
+    block = src[fn_idx:fn_idx + 3000]
+    # Gated-Block hat alle 3 Checks
+    gated_idx = block.find("if mode == 'gated':")
+    assert gated_idx > 0
+    gated_block = block[gated_idx:gated_idx + 2000]
+    assert 'overall' in gated_block
+    assert 'layout_conf' in gated_block
+    assert 'z17' in gated_block.lower()
+
+
+def test_taskA2_off_mode_only_sonnet():
+    """Mode=off → direkt Sonnet, kein local-Versuch."""
+    src = _read_backend()
+    fn_idx = src.find('def _read_lsb_with_local_fallback')
+    block = src[fn_idx:fn_idx + 3000]
+    off_idx = block.find("if mode == 'off':")
+    assert off_idx > 0
+    off_block = block[off_idx:off_idx + 200]
+    assert '_sonnet_read_lsb_v2' in off_block, 'Off-Mode → Sonnet direkt'
+
+
+def test_taskA2_layout_low_falls_back_to_sonnet():
+    """Wenn layout_check.confidence=low → confidence-Dict signalisiert das,
+    Reader fällt auf Sonnet zurück."""
+    src = _read_backend()
+    fn_idx = src.find('def _parse_lsb_local_with_confidence')
+    block = src[fn_idx:fn_idx + 3000]
+    assert "layout['confidence'] == 'low'" in block, \
+        'Low-Layout-Check muss zu overall_confidence=low führen'
+
+
+def test_taskA2_audit_field_in_local_result():
+    """Lokales Result hat _audit-Feld für Debug/Transparenz."""
+    _app = _load_app_fresh()
+    fake = {
+        'overall_confidence': 'high',
+        'layout_check': {'confidence': 'high', 'red_flags': []},
+        'brutto': {'value': 50000.0, 'confidence': 'high', 'evidence': {'reason': 'line_3_match'}},
+        'lohnsteuer': {'value': 8000.0, 'confidence': 'high'},
+        'ag_fahrt_z17': {'value': 1234.56, 'confidence': 'high', 'evidence': {'reason': 'line_17_match'}},
+    }
+    out = _app._flatten_local_to_lsb_dict(fake)
+    assert '_audit' in out
+    audit = out['_audit']
+    assert 'layout' in audit
+    assert 'z17_evidence' in audit
+    assert 'brutto_evidence' in audit
+
+
+def test_taskA2_lsb_implausible_lohnsteuer_falls_to_sonnet():
+    """Wenn lohnsteuer > brutto*0.5 (implausibel) → low confidence → Sonnet."""
+    src = _read_backend()
+    fn_idx = src.find('def _parse_lsb_local_with_confidence')
+    block = src[fn_idx:fn_idx + 5000]
+    assert 'lohnsteuer_implausible' in block or 'brutto[' in block, \
+        'Plausi-Check für Lohnsteuer fehlt'
 
 
 if __name__ == '__main__':

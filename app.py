@@ -7446,34 +7446,336 @@ def _parse_lsb_local_fast(pdf_bytes):
     return result
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Task A2 — AI-gated LSB Fast-Reader (default: gated)
+#
+# Modus über AEROTAX_LSB_FAST_READER_MODE konfigurierbar:
+#   off    → immer Sonnet (Pre-v10.4.1 Verhalten)
+#   gated  → local nur wenn ALLE Confidence-Checks high (DEFAULT)
+#   on     → local-first, Sonnet nur bei explizitem Low-Confidence
+#
+# Kernprinzip: Kein stilles Zero für Z17. Sicher 0 (Layout-Standard + kein
+# Pattern-Match) ist OK; unsicher (Layout-Issue oder Multi-Match) → Sonnet.
+# ────────────────────────────────────────────────────────────────────────────
+
+def _aerotax_lsb_mode():
+    """Liest aktuellen Modus zur Laufzeit (ENV kann sich ändern, nicht cachen)."""
+    v = (os.environ.get('AEROTAX_LSB_FAST_READER_MODE', 'gated') or '').lower().strip()
+    if v in ('off', 'gated', 'on'):
+        return v
+    return 'gated'  # Default bei ungültigem Wert
+
+
+def _check_lsb_standard_layout(text):
+    """Prüft ob ein Text-Layer einer Standard-eLSTB entspricht.
+    Returns dict mit confidence + red_flags."""
+    if not text:
+        return {'confidence': 'low', 'red_flags': ['no_text_layer']}
+    text_lc = text.lower()
+
+    # Pflicht-Signaturen
+    has_lsb_title = any(s in text_lc for s in [
+        'lohnsteuerbescheinigung', 'elektronische lohnsteuer', 'elstb', 'eltb',
+    ])
+    has_brutto_keyword = 'bruttoarbeitslohn' in text_lc
+    # Mindestens 5 der Standard-Zeilennummern (3-27 typisch) muss erkennbar sein
+    import re as _re
+    visible_lines = set()
+    for m in _re.finditer(r'(?:^|\n)\s*(\d{1,2})\.?\s+', text):
+        try:
+            n = int(m.group(1))
+            if 1 <= n <= 35:
+                visible_lines.add(n)
+        except Exception:
+            pass
+    line_coverage = len(visible_lines & {3, 4, 5, 17, 22, 23, 25, 26, 27})
+
+    red_flags = []
+    if not has_lsb_title:
+        red_flags.append('no_lsb_title')
+    if not has_brutto_keyword:
+        red_flags.append('no_bruttoarbeitslohn')
+    if line_coverage < 4:
+        red_flags.append(f'few_standard_lines_visible({line_coverage}/9)')
+    # Indikatoren für gescanntes/rotiertes Dokument
+    if len(text.strip()) < 200:
+        red_flags.append('very_little_text')
+
+    if not red_flags and has_lsb_title and has_brutto_keyword and line_coverage >= 6:
+        conf = 'high'
+    elif len(red_flags) == 1 and line_coverage >= 5:
+        conf = 'medium'
+    else:
+        conf = 'low'
+
+    return {
+        'confidence': conf,
+        'red_flags': red_flags,
+        'has_lsb_title': has_lsb_title,
+        'has_brutto_keyword': has_brutto_keyword,
+        'visible_lines_count': line_coverage,
+    }
+
+
+def _extract_lsb_field_with_evidence(text, line_num, allow_absent=True):
+    """Extrahiert eine Zeile (z.B. Z17) mit Confidence + Evidence.
+
+    eLSTB-Format ist tabellarisch: „17. <Bezeichnung>            <Wert>".
+    Strategie: Zeilen finden die mit Zeilennummer beginnen, dann LAST EUR-Wert
+    in der Zeile. Mehrere Zeilen → conflict (außer identische Werte).
+
+    Returns dict:
+      - value: float oder None
+      - confidence: 'high' / 'medium' / 'low' / 'conflict'
+      - evidence: dict mit raw_line/candidates/reason
+      - definitely_absent: True wenn Layout-Standard aber kein Match (= sicher 0)
+    """
+    import re as _re
+
+    def _eur(s):
+        try:
+            return float(str(s).replace('.', '').replace(',', '.'))
+        except Exception:
+            return None
+
+    # Zeilen finden die mit Zeilennummer beginnen (z.B. "17." oder "17 ")
+    line_start_pat = rf'^\s*{line_num}\.?\s+.+$'
+    matching_lines = _re.findall(line_start_pat, text, _re.MULTILINE)
+
+    # EUR-Werte (deutsches Format mit Komma) — pro Zeile suchen
+    num_pat = r'(\d{1,3}(?:[.\s]?\d{3})*,\d{2})'
+
+    candidates = []  # list of (value, raw_line) tuples
+    for line in matching_lines:
+        nums_in_line = _re.findall(num_pat, line)
+        if not nums_in_line:
+            continue
+        # eLSTB-Konvention: letzte Zahl pro Zeile = Wert (Text dazwischen ist Bezeichnung)
+        val = _eur(nums_in_line[-1])
+        if val is not None:
+            candidates.append((val, line.strip()))
+
+    if not candidates:
+        if allow_absent:
+            return {
+                'value': 0.0, 'confidence': 'high',
+                'definitely_absent': True,
+                'evidence': {'reason': f'line_{line_num}_not_found_in_standard_layout'},
+            }
+        return {
+            'value': None, 'confidence': 'low',
+            'definitely_absent': False,
+            'evidence': {'reason': f'line_{line_num}_unreadable'},
+        }
+
+    values = [c[0] for c in candidates]
+    if len(set(values)) > 1:
+        # Mehrere Zeilen mit DIFFERENTEN Werten → conflict
+        return {
+            'value': None, 'confidence': 'conflict',
+            'definitely_absent': False,
+            'evidence': {'reason': f'line_{line_num}_multiple_candidates',
+                          'candidates': values},
+        }
+
+    # Single value (oder mehrere identische) → high
+    return {
+        'value': values[0], 'confidence': 'high',
+        'definitely_absent': False,
+        'evidence': {'reason': f'line_{line_num}_match',
+                      'raw': candidates[0][1][:80],
+                      'match_count': len(candidates)},
+    }
+
+
+def _parse_lsb_local_with_confidence(pdf_bytes):
+    """Confidence-aware LSB-Reader. Ergänzt _parse_lsb_local_fast um pro-Feld
+    Confidence + Evidence. Wird im 'gated' Modus genutzt — strikte Checks
+    bevor das lokale Ergebnis vertraut wird.
+
+    Returns dict oder None (bei Crash/leerer Input).
+    """
+    import pdfplumber as _pp, io as _io
+    if not pdf_bytes:
+        return None
+    try:
+        with _pp.open(_io.BytesIO(pdf_bytes)) as pdf:
+            text = '\n'.join(p.extract_text() or '' for p in pdf.pages)
+    except Exception:
+        return None
+
+    layout = _check_lsb_standard_layout(text)
+    if layout['confidence'] == 'low':
+        # Layout nicht erkennbar → lokal nicht sinnvoll
+        return {
+            'overall_confidence': 'low',
+            'layout_check': layout,
+            'reason': 'non_standard_layout',
+        }
+
+    # Felder mit Evidence
+    brutto = _extract_lsb_field_with_evidence(text, 3, allow_absent=False)
+    if brutto['value'] is None or brutto['value'] < 1000:
+        return {
+            'overall_confidence': 'low',
+            'layout_check': layout,
+            'brutto': brutto,
+            'reason': 'brutto_missing_or_implausible',
+        }
+
+    lohnsteuer = _extract_lsb_field_with_evidence(text, 4, allow_absent=True)
+    soli = _extract_lsb_field_with_evidence(text, 5, allow_absent=True)
+    kirche = _extract_lsb_field_with_evidence(text, 6, allow_absent=True)
+    z17 = _extract_lsb_field_with_evidence(text, 17, allow_absent=True)
+    z18 = _extract_lsb_field_with_evidence(text, 18, allow_absent=True)
+    z20 = _extract_lsb_field_with_evidence(text, 20, allow_absent=True)
+    z21 = _extract_lsb_field_with_evidence(text, 21, allow_absent=True)
+
+    # Sanity: lohnsteuer plausibel?
+    ls_val = lohnsteuer.get('value') or 0
+    if ls_val > brutto['value'] * 0.5:
+        return {
+            'overall_confidence': 'low',
+            'layout_check': layout,
+            'reason': 'lohnsteuer_implausible',
+            'brutto': brutto, 'lohnsteuer': lohnsteuer,
+        }
+
+    # Overall-Confidence: nur high wenn ALLES high
+    critical_fields = [brutto, lohnsteuer, z17]
+    if all(f['confidence'] == 'high' for f in critical_fields):
+        overall = 'high'
+    elif any(f['confidence'] == 'conflict' for f in [brutto, lohnsteuer, z17, z18, z20, z21]):
+        overall = 'conflict'
+    elif any(f['confidence'] == 'low' for f in critical_fields):
+        overall = 'low'
+    else:
+        overall = 'medium'
+
+    return {
+        'overall_confidence': overall,
+        'layout_check': layout,
+        'brutto': brutto,
+        'lohnsteuer': lohnsteuer,
+        'soli': soli,
+        'kirchensteuer_an': kirche,
+        'ag_fahrt_z17': z17,
+        'ag_fahrt_z18_pauschal': z18,
+        'verpflegungszuschuss_z20': z20,
+        'doppelhaus_z21': z21,
+    }
+
+
+def _flatten_local_to_lsb_dict(local_result):
+    """Konvertiert confidence-aware Result zu flachem LSB-Dict (Format wie _sonnet_read_lsb_v2)."""
+    def _v(field):
+        if not isinstance(field, dict): return 0.0
+        return float(field.get('value') or 0.0)
+    out = {
+        'brutto': _v(local_result.get('brutto')),
+        'lohnsteuer': _v(local_result.get('lohnsteuer')),
+        'soli': _v(local_result.get('soli')),
+        'kirchensteuer_an': _v(local_result.get('kirchensteuer_an')),
+        'ag_fahrt_z17': _v(local_result.get('ag_fahrt_z17')),
+        'ag_fahrt_z18_pauschal': _v(local_result.get('ag_fahrt_z18_pauschal')),
+        'verpflegungszuschuss_z20': _v(local_result.get('verpflegungszuschuss_z20')),
+        'doppelhaus_z21': _v(local_result.get('doppelhaus_z21')),
+        'rv_ag': 0.0, 'rv_an': 0.0, 'kv_an': 0.0, 'pv_an': 0.0, 'av_an': 0.0,
+        'identnr': '', 'geburtsdatum': '', 'personalnummer': '',
+        'steuerklasse': '1', 'kinderfreibetraege': 0.0,
+        'kirchensteuermerkmale': '', 'arbeitgeber': 'Deutsche Lufthansa AG',
+        'finanzamt': '', 'steuernummer_ag': '',
+        'vorsorge_gesamt_an': 0.0, 'rv_gesamt': 0.0,
+        '_source': 'local_gated_v10.4.2',
+        '_confidence': local_result.get('overall_confidence', 'medium'),
+        '_audit': {
+            'layout': local_result.get('layout_check', {}),
+            'z17_evidence': local_result.get('ag_fahrt_z17', {}).get('evidence'),
+            'brutto_evidence': local_result.get('brutto', {}).get('evidence'),
+        },
+    }
+    return out
+
+
+# Backwards-Compat: alte Konstante bleibt erhalten für bestehende Tests
 _AEROTAX_LSB_LOCAL_FIRST = (os.environ.get('AEROTAX_LSB_LOCAL_FIRST', '') == '1')
 
 
 def _read_lsb_with_local_fallback(pdf_bytes_list):
-    """v10.4.1: LSB-Reader mit Local-First-Pfad — opt-in via ENV-Flag.
+    """Task A2: LSB-Reader mit AI-gated Fast-Reader.
 
-    Default: AEROTAX_LSB_LOCAL_FIRST nicht gesetzt → Sonnet wie vor v10.4.1.
-    Aktivierbar: AEROTAX_LSB_LOCAL_FIRST=1 → regex-basierter Fast-Parse vor Sonnet.
+    AEROTAX_LSB_FAST_READER_MODE:
+      off    → immer Sonnet
+      gated  → local nur bei high-confidence Standard-Layout + eindeutigem Z17 (DEFAULT)
+      on     → local mit Fallback bei Low-Confidence
 
-    Begründung: Regex-Parser ist neuer Code-Pfad. ENV-Flag ermöglicht
-    risikofreies Live-Testing ohne Production-User zu beeinträchtigen.
-    Wenn Flag AUS: nur Sonnet (identisches Verhalten wie v10.4).
-
-    Multi-LSB (mehrere Arbeitgeber): immer Sonnet, auch wenn Flag AN.
+    Schutz-Regeln:
+      - Multi-LSB → immer Sonnet (Aggregation komplex)
+      - Layout non-standard → Sonnet
+      - Z17 mehrdeutig → Sonnet
+      - Z17 unklar lesbar (kein definitely_absent) → Sonnet
+      - Lohnsteuer implausibel → Sonnet
     """
     pdf_bytes_list = _bytes_list(pdf_bytes_list) if pdf_bytes_list else []
     if not pdf_bytes_list:
         return None
-    # v10.4.1+: Default-Pfad ist Sonnet — Local-First nur bei explizitem ENV-Flag
-    if _AEROTAX_LSB_LOCAL_FIRST and len(pdf_bytes_list) == 1:
-        try:
-            local = _parse_lsb_local_fast(pdf_bytes_list[0])
-            if local and local.get('brutto', 0) > 0:
-                print(f"[LSB] local-fast erfolgreich (ENV-Flag) — kein Sonnet-Call")
-                return local
-        except Exception as e:
-            print(f"[LSB] local-fast error: {str(e)[:120]} → Sonnet fallback")
-    # Default-Pfad: Sonnet
+
+    mode = _aerotax_lsb_mode()
+
+    # Multi-LSB: immer Sonnet
+    if len(pdf_bytes_list) > 1:
+        print(f"[LSB] Multi-LSB (n={len(pdf_bytes_list)}) → Sonnet")
+        return _sonnet_read_lsb_v2(pdf_bytes_list)
+
+    # Mode 'off' → direkt Sonnet
+    if mode == 'off':
+        return _sonnet_read_lsb_v2(pdf_bytes_list)
+
+    # Mode 'gated' / 'on' → confidence-aware Reader probieren
+    try:
+        local = _parse_lsb_local_with_confidence(pdf_bytes_list[0])
+    except Exception as e:
+        print(f"[LSB] gated reader error: {str(e)[:120]} → Sonnet")
+        return _sonnet_read_lsb_v2(pdf_bytes_list)
+
+    if not local:
+        print(f"[LSB] gated reader: kein Text-Layer → Sonnet")
+        return _sonnet_read_lsb_v2(pdf_bytes_list)
+
+    overall = local.get('overall_confidence')
+    layout_conf = (local.get('layout_check') or {}).get('confidence')
+
+    if mode == 'gated':
+        # Strikte Checks
+        z17 = local.get('ag_fahrt_z17', {}) or {}
+        z17_ok = z17.get('confidence') == 'high'  # high inkl. definitely_absent
+
+        if overall != 'high':
+            print(f"[LSB] gated: overall_confidence={overall} ≠ high → Sonnet")
+            return _sonnet_read_lsb_v2(pdf_bytes_list)
+        if layout_conf != 'high':
+            print(f"[LSB] gated: layout_confidence={layout_conf} ≠ high → Sonnet")
+            return _sonnet_read_lsb_v2(pdf_bytes_list)
+        if not z17_ok:
+            print(f"[LSB] gated: z17.confidence={z17.get('confidence')} → Sonnet")
+            return _sonnet_read_lsb_v2(pdf_bytes_list)
+
+        result = _flatten_local_to_lsb_dict(local)
+        result['_local_used_reason'] = 'gated_all_checks_high'
+        print(f"[LSB] gated: alle Checks high — local used (brutto={result['brutto']:.2f}, z17={result['ag_fahrt_z17']:.2f})")
+        return result
+
+    if mode == 'on':
+        # Lockerer — accept high und medium
+        if overall == 'low':
+            print(f"[LSB] mode=on: overall=low → Sonnet")
+            return _sonnet_read_lsb_v2(pdf_bytes_list)
+        result = _flatten_local_to_lsb_dict(local)
+        result['_local_used_reason'] = f'mode_on_overall_{overall}'
+        print(f"[LSB] mode=on: confidence={overall} — local used")
+        return result
+
+    # Unreachable defensive
     return _sonnet_read_lsb_v2(pdf_bytes_list)
 
 
