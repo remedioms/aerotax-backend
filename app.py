@@ -3363,7 +3363,44 @@ def _cleanup_loop():
                     sb.table('pdfs').delete().lt('expires_at', now).execute()
                 except Exception as e:
                     print(f"[cleanup] supabase pdfs: {e}")
+            # v10.3: Auch jobs (>7 Tage) + sessions (expired) cleanen
+            cleanup_old_supabase_state()
         except: pass
+
+
+def cleanup_old_supabase_state():
+    """v10.3: Backend-Cleanup für Supabase-Tabellen jobs + sessions.
+    Verhindert unbegrenztes Wachstum unabhängig von pg_cron.
+
+    - sessions: löscht expires_at < now (24h Code-Validity).
+    - jobs: löscht updated_at < now() - 7 Tage (Debug/Pilot-Window).
+      Access-Code wird über sessions.expires_at geprüft, NICHT über jobs-Existenz —
+      so kann Job intern 7 Tage liegen während Code nach 24h ungültig wird.
+
+    Exception-safe — Cleanup-Loop läuft weiter selbst wenn ein Delete fehlschlägt.
+    """
+    if not SB_AVAILABLE:
+        return
+    sess_deleted = 0
+    jobs_deleted = 0
+    try:
+        now_iso = datetime.utcnow().isoformat()
+        try:
+            res = sb.table('sessions').delete().lt('expires_at', now_iso).execute()
+            sess_deleted = len((res and getattr(res, 'data', None)) or [])
+        except Exception as e:
+            print(f"[cleanup] supabase sessions delete fail: {str(e)[:120]}")
+        try:
+            cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+            res = sb.table('jobs').delete().lt('updated_at', cutoff).execute()
+            jobs_deleted = len((res and getattr(res, 'data', None)) or [])
+        except Exception as e:
+            print(f"[cleanup] supabase jobs delete fail: {str(e)[:120]}")
+        if sess_deleted or jobs_deleted:
+            print(f"[cleanup] supabase state: {sess_deleted} sessions, {jobs_deleted} jobs (>7d) deleted")
+    except Exception as e:
+        # Outer catch — Cleanup-Loop niemals crashen lassen
+        print(f"[cleanup] supabase state error: {str(e)[:120]}")
 
 
 # Cleanup-Thread starten (in Tests deaktivierbar)
@@ -8022,6 +8059,108 @@ def _aggregate_v6_classification(classifications, structured_days, year=2025):
     }
 
 
+def choose_z77_source(daily_lines=0.0, monthly_z77_list=None, declared_total=0.0):
+    """v10.3: Konsolidiert die drei Z77-Quellen aus dem SE-PDF zu einer Wahrheit.
+
+    Priorität:
+      A) daily_lines  = Σ aller Tageszeilen-stfrei-Werte. Bevorzugt — ignoriert
+         SUMME-Zeilen, ist die mathematisch sauberste Quelle.
+      B) monthly_sum  = Σ monatliche_z77[].z77_monat. Nutzen wenn daily fehlt.
+      C) declared_total = Sonnet's z77_total-Pick aus einer SUMME-Zeile. Nur
+         Fallback und nie blind vertrauen — Sonnet greift gerne die FALSCHE
+         SUMME-Zeile (Monats-statt Jahresdaten).
+
+    Liefert: dict mit
+      - z77_used:       finaler Z77-Wert
+      - z77_source:     'daily_lines' | 'monthly_sum' | 'declared_total' | 'none'
+      - z77_audit:      vollständiger Cross-Check (used, source, alle 3 Quellen,
+                        diff_daily_monthly, notes-Liste)
+      - warnings:       nur echte Warnings (large mismatch, suspicious low/high,
+                        keine Quelle). KEIN Lärm bei kleinen, erklärbaren Diffs.
+
+    Toleranz: max(50€, 2%) zwischen daily und monthly = INFO-Note, keine Warning.
+    """
+    monthly_list = monthly_z77_list or []
+    monthly_sum = round(sum(float(m.get('z77_monat', 0) or 0) for m in monthly_list), 2)
+    daily = round(float(daily_lines or 0), 2)
+    declared = round(float(declared_total or 0), 2)
+
+    notes = []
+    warnings = []
+
+    # ── Priorität A: daily_lines (bevorzugt) ──
+    if daily > 0:
+        used = daily
+        source = 'daily_lines'
+        if monthly_sum > 0:
+            diff = abs(daily - monthly_sum)
+            tol = max(50.0, daily * 0.02)
+            if diff <= tol:
+                notes.append(
+                    f"daily_lines={daily:.2f} ✓ monthly_sum={monthly_sum:.2f} "
+                    f"(diff {diff:.2f} ≤ tolerance {tol:.2f})"
+                )
+            else:
+                warnings.append(
+                    f"Z77 daily/monthly mismatch: daily={daily:.2f} "
+                    f"monthly={monthly_sum:.2f} diff={diff:.2f}"
+                )
+        if declared > 0 and abs(declared - used) > max(100.0, used * 0.05):
+            notes.append(
+                f"declared_total={declared:.2f} ignored — daily_lines={daily:.2f} "
+                f"is the trusted source"
+            )
+    # ── Priorität B: monthly_sum (wenn daily fehlt) ──
+    elif monthly_sum > 0:
+        used = monthly_sum
+        source = 'monthly_sum'
+        if declared > 0 and abs(declared - monthly_sum) > max(100.0, monthly_sum * 0.05):
+            notes.append(
+                f"declared_total={declared:.2f} ignored; monthly_sum={monthly_sum:.2f} "
+                f"appears more complete"
+            )
+    # ── Priorität C: declared_total (nur Fallback) ──
+    elif declared > 0:
+        used = declared
+        source = 'declared_total'
+        warnings.append(
+            f"Z77 only declared_total available ({declared:.2f}) — "
+            f"keine Tageszeilen- oder Monats-Aufschlüsselung verfügbar"
+        )
+    # ── Keine Quelle ──
+    else:
+        used = 0.0
+        source = 'none'
+        warnings.append("Keine Z77-Quelle verfügbar — Steuerfrei-Spesen = 0")
+
+    # Plausi-Checks (typisches Vollzeit-Crew-Z77: 3000–7000€)
+    if 0 < used < 1500:
+        warnings.append(
+            f"Z77 verdächtig niedrig ({used:.2f}) — typisch 3000-7000€ "
+            f"für Vollzeit-Crew. Möglicherweise wurden Monate nicht erfasst."
+        )
+    elif used > 10000:
+        warnings.append(
+            f"Z77 verdächtig hoch ({used:.2f}) — typisch 3000-7000€. "
+            f"Möglicherweise doppelt summiert."
+        )
+
+    return {
+        'z77_used': used,
+        'z77_source': source,
+        'z77_audit': {
+            'used': used,
+            'source': source,
+            'daily_lines': daily,
+            'monthly_sum': monthly_sum,
+            'declared_total': declared,
+            'diff_daily_monthly': round(abs(daily - monthly_sum), 2) if (daily > 0 and monthly_sum > 0) else None,
+            'notes': notes,
+        },
+        'warnings': warnings,
+    }
+
+
 def _get_bmf_for_iata(iata, year, _diag=None):
     """Hilfsfunktion: BMF-Auslandspauschale für einen IATA-Code.
     Liefert dict {voll_24h, an_abreise} oder None.
@@ -8118,7 +8257,7 @@ def _sonnet_read_se_structured(pdf_bytes_list, year=2025):
                         }
                     }
                 },
-                'z77_total': {'type': 'number', 'description': 'Σ aller stfrei_betrag wo storno=false. Sollte mit SUMME-Zeile in PDF matchen.'},
+                'z77_total': {'type': 'number', 'description': 'Σ aller stfrei_betrag der Tageszeilen wo storno=false. WICHTIG: IGNORIERE die SUMME-Zeilen im PDF — das sind oft mehrere (Monats- und/oder Jahres-Summen). Summiere immer die Tageszeilen-stfrei-Werte SELBST. Niemals eine beliebige SUMME-Zeile als z77_total verwenden.'},
                 'warnings': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Lese-Warnungen z.B. unklare Spalten, fehlende Werte'},
             }
         }
@@ -8163,8 +8302,10 @@ mehrere Zeilen pro selben Datum (eine echte + eine Storno).
 
 ═════ Z77-VERIFIKATION ════════════════════════════════════════════════════════
 
-Berechne z77_total = Σ stfrei_betrag wo storno=false.
-Sollte mit der SUMME-Zeile am Ende jeder Monats-Abrechnung übereinstimmen.
+Berechne z77_total = Σ stfrei_betrag wo storno=false (Tageszeilen-Summe).
+WICHTIG: Es gibt mehrere SUMME-Zeilen im PDF (Monats-Summe, manchmal Jahres-Summe).
+IGNORIERE diese SUMME-Zeilen. Summiere immer die Tageszeilen selbst.
+Die Tageszeilen-Summe ist die einzige zuverlässige Quelle für z77_total.
 
 ═════ KOMPAKTHEIT ═════════════════════════════════════════════════════════════
 
@@ -8228,11 +8369,24 @@ LIEFERE jetzt via Tool die strukturierten SE-Zeilen."""
         warnings = [str(w) for w in (tool_input.get('warnings', []) or [])]
         non_storno = [s for s in se_lines if not s.get('storno')]
         z77_calc = sum(float(s.get('stfrei_betrag', 0) or 0) for s in non_storno)
-        print(f"[Sonnet-SE-Structured] {elapsed:.1f}s: {len(se_lines)} Zeilen ({len(non_storno)} aktiv, {len(se_lines)-len(non_storno)} Storno) — z77_total={z77_total:.2f}€ z77_calc={z77_calc:.2f}€")
+        # v10.3: choose_z77_source — daily_lines (z77_calc) ist hier die bevorzugte
+        # Quelle. declared_total (z77_total von Sonnet) nur als Cross-Check.
+        z77_choice = choose_z77_source(daily_lines=z77_calc,
+                                       monthly_z77_list=None,
+                                       declared_total=z77_total)
+        # Info-Level Log statt WARNUNG, wenn alles im Toleranz-Bereich
+        for w in z77_choice['warnings']:
+            print(f"[Sonnet-SE-Structured] ⚠ {w}")
+        for n in z77_choice['z77_audit']['notes']:
+            print(f"[Sonnet-SE-Structured] info: {n}")
+        print(f"[Sonnet-SE-Structured] {elapsed:.1f}s: {len(se_lines)} Zeilen "
+              f"({len(non_storno)} aktiv, {len(se_lines)-len(non_storno)} Storno) — "
+              f"z77={z77_choice['z77_used']:.2f}€ src={z77_choice['z77_source']}")
         return {
             'se_lines': se_lines,
-            'z77_total': max(z77_total, z77_calc),
-            'warnings': warnings,
+            'z77_total': z77_choice['z77_used'],
+            'z77_audit': z77_choice['z77_audit'],
+            'warnings': warnings + z77_choice['warnings'],
         }
     except Exception as e:
         print(f"[Sonnet-SE-Structured] fail: {type(e).__name__}: {str(e)[:200]}")
@@ -10381,8 +10535,13 @@ def _sonnet_read_se_summary_v2(pdf_bytes_list, year=2025):
             'properties': {
                 'z77_total': {
                     'type': 'number',
-                    'description': 'Z77 = Σ aller Werte in der "Steuerfrei"-Spalte über alle Tage und alle Monate. '
-                                   'Das ist was Lufthansa STEUERFREI ausgezahlt hat. Niemals Steuerpflichtig dazurechnen!'
+                    'description': 'Z77 = Σ aller Werte in der "Steuerfrei"-Spalte über alle Tageszeilen. '
+                                   'WICHTIG: Es gibt mehrere SUMME-Zeilen pro Monat im PDF. IGNORIERE diese SUMME-Zeilen '
+                                   'für die Berechnung von z77_total. Summiere stattdessen alle Tageszeilen-stfrei-Werte selbst. '
+                                   'Methode A (Tageszeilen-Summe) ist die einzige Wahrheit. '
+                                   'Falls du eine Jahres-SUMME-Zeile siehst — gib sie NICHT als z77_total zurück, sondern '
+                                   'gib sie nur als zusätzlichen Hinweis in monatliche_z77 (falls erkennbar pro Monat). '
+                                   'Niemals Steuerpflichtig-Werte dazurechnen.'
                 },
                 'monatliche_z77': {
                     'type': 'array',
@@ -10521,29 +10680,46 @@ Liefere via Tool das strukturierte Ergebnis."""
         if not tool_input:
             print(f"[Sonnet-SE] kein tool_input")
             return None
-        # Cross-Check: Σ(monatliche_z77) muss = z77_total sein
+        # v10.3: choose_z77_source — drei Quellen, klare Priorität.
+        # Hier verfügbar: monatliche_z77 (B) + declared (C). daily_lines hat dieser
+        # Reader nicht; structured-Reader liefert die separat.
         monatliche = tool_input.get('monatliche_z77', []) or []
-        monat_sum = sum(float(m.get('z77_monat', 0) or 0) for m in monatliche)
-        z77_main = float(tool_input.get('z77_total', 0) or 0)
-        if monatliche and abs(monat_sum - z77_main) > 5:
-            print(f"[Sonnet-SE] WARNUNG: monatliche_z77-Summe ({monat_sum:.2f}€) ≠ z77_total ({z77_main:.2f}€) "
-                  f"— Diff {abs(monat_sum - z77_main):.2f}€. Nehme den höheren Wert (vermutlich vollständiger).")
-            z77_main = max(z77_main, monat_sum)
+        z77_declared = float(tool_input.get('z77_total', 0) or 0)
+        z77_choice = choose_z77_source(daily_lines=0,
+                                       monthly_z77_list=monatliche,
+                                       declared_total=z77_declared)
+        z77_main = z77_choice['z77_used']
+        # Logging: notes als INFO, nur echte warnings als ⚠
+        for n in z77_choice['z77_audit']['notes']:
+            print(f"[Sonnet-SE] info: {n}")
+        for w in z77_choice['warnings']:
+            print(f"[Sonnet-SE] ⚠ {w}")
 
         ausland_se = float(tool_input.get('auslandsspesen_total', 0) or 0)
         inland_se  = float(tool_input.get('inlandsspesen_total', 0) or 0)
-        # Konsistenz-Check: Inland + Ausland sollte ≈ Z77 sein
+        # Konsistenz-Check: Inland + Ausland sollte ≈ Z77 sein.
+        # v10.3: kleine Diff → INFO/audit-note. Große Diff → echte Skalierung mit Note.
         ai_sum = ausland_se + inland_se
+        ia_audit_note = None
         if ai_sum > 0 and abs(ai_sum - z77_main) > 50:
-            print(f"[Sonnet-SE] ⚠ Inkonsistenz: Inland({inland_se:.2f}) + Ausland({ausland_se:.2f}) = {ai_sum:.2f}€ "
-                  f"≠ Z77 ({z77_main:.2f}€). Skaliere Anteile auf Z77.")
-            # Sonnet hat Inland/Ausland unsauber summiert. Skaliere proportional auf z77_main
+            ia_audit_note = (
+                f"Inland({inland_se:.2f}) + Ausland({ausland_se:.2f}) = {ai_sum:.2f}€ "
+                f"≠ Z77 ({z77_main:.2f}€). Skaliert proportional auf Z77."
+            )
+            if abs(ai_sum - z77_main) > max(200.0, z77_main * 0.10):
+                # Große Diff: echte Warning
+                print(f"[Sonnet-SE] ⚠ Inland/Ausland-Inkonsistenz: {ia_audit_note}")
+            else:
+                # Kleine bis mittlere Diff: nur info
+                print(f"[Sonnet-SE] info: {ia_audit_note}")
             if ai_sum > 0:
                 scale = z77_main / ai_sum
                 ausland_se = round(ausland_se * scale, 2)
                 inland_se  = round(inland_se  * scale, 2)
         result = {
             'z77_total': z77_main,
+            'z77_audit': dict(z77_choice['z77_audit'],
+                              inland_ausland_note=ia_audit_note),
             'summe_gesamt': float(tool_input.get('summe_gesamt', 0) or 0),
             'summe_steuerpflichtig': float(tool_input.get('summe_steuerpflichtig', 0) or 0),
             'auslandsspesen_total': ausland_se,
@@ -10552,16 +10728,9 @@ Liefere via Tool das strukturierte Ergebnis."""
             'anzahl_abrechnungen': int(tool_input.get('anzahl_abrechnungen', 0) or 0),
             'monatliche_z77': monatliche,
         }
-        # Plus Plausi-Warning bei verdächtig niedrigem/hohem Z77
-        if 0 < result['z77_total'] < 1500:
-            print(f"[Sonnet-SE] ⚠ VERDÄCHTIG NIEDRIG: Z77={result['z77_total']:.2f}€ — typisch 3000-7000€ für Vollzeit-Crew. "
-                  f"Sonnet hat möglicherweise Monate übersehen.")
-        elif result['z77_total'] > 10000:
-            print(f"[Sonnet-SE] ⚠ VERDÄCHTIG HOCH: Z77={result['z77_total']:.2f}€ — typisch 3000-7000€. "
-                  f"Sonnet hat möglicherweise Werte doppelt summiert.")
-        print(f"[Sonnet-SE] Z77={result['z77_total']:.2f}€  "
-              f"(Inland {result['inlandsspesen_total']:.2f}€ + Ausland {result['auslandsspesen_total']:.2f}€)  "
-              f"Abrechnungen={result['anzahl_abrechnungen']}  Flugmonate={result['flugmonate']}")
+        print(f"[Sonnet-SE] Z77={result['z77_total']:.2f}€ src={z77_choice['z77_source']} "
+              f"(Inland {result['inlandsspesen_total']:.2f}€ + Ausland {result['auslandsspesen_total']:.2f}€) "
+              f"Abrechnungen={result['anzahl_abrechnungen']} Flugmonate={result['flugmonate']}")
         return result
     except Exception as e:
         print(f"[Sonnet-SE] fail: {e}")

@@ -8384,6 +8384,349 @@ def test_v10_pdf_title_still_no_personal_name():
     assert 'für {_name}' not in src, 'PDF-Title soll generisch sein'
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# v10.3 — Supabase-Cleanup für jobs/sessions + Z77 Source-Selection-Consolidation
+# ════════════════════════════════════════════════════════════════════════════
+
+# ─── FALL 1: Supabase Cleanup ────────────────────────────────────────────
+
+def test_v103_cleanup_old_supabase_state_function_exists():
+    """Backend-Funktion cleanup_old_supabase_state() existiert."""
+    src = _read_backend()
+    assert 'def cleanup_old_supabase_state' in src, \
+        'cleanup_old_supabase_state() Funktion fehlt'
+
+
+def test_v103_cleanup_called_from_cleanup_loop():
+    """cleanup_old_supabase_state wird im _cleanup_loop aufgerufen."""
+    src = _read_backend()
+    fn_idx = src.find('def _cleanup_loop')
+    assert fn_idx > 0
+    loop_block = src[fn_idx:fn_idx + 3000]
+    assert 'cleanup_old_supabase_state' in loop_block, \
+        '_cleanup_loop muss cleanup_old_supabase_state aufrufen'
+
+
+def test_v103_cleanup_deletes_expired_sessions_in_supabase():
+    """cleanup löscht sessions wo expires_at < now()."""
+    src = _read_backend()
+    fn_idx = src.find('def cleanup_old_supabase_state')
+    block = src[fn_idx:fn_idx + 3000]
+    assert "table('sessions')" in block and 'delete' in block
+    assert 'expires_at' in block
+    assert "lt('expires_at'" in block, 'sessions-delete muss lt(expires_at, now) sein'
+
+
+def test_v103_cleanup_deletes_old_jobs_7_days():
+    """cleanup löscht jobs wo updated_at < now() - 7 days."""
+    src = _read_backend()
+    fn_idx = src.find('def cleanup_old_supabase_state')
+    block = src[fn_idx:fn_idx + 3000]
+    assert "table('jobs')" in block and 'delete' in block
+    assert 'updated_at' in block
+    assert ('days=7' in block or "interval '7 days'" in block or '7' in block), \
+        'jobs-delete muss 7-Tage-Cutoff haben'
+
+
+def test_v103_cleanup_noop_without_supabase():
+    """Wenn SB_AVAILABLE=False → early return, kein Crash."""
+    src = _read_backend()
+    fn_idx = src.find('def cleanup_old_supabase_state')
+    block = src[fn_idx:fn_idx + 1000]
+    assert 'if not SB_AVAILABLE' in block or 'if not sb' in block.lower() or 'SB_AVAILABLE' in block, \
+        'cleanup muss SB_AVAILABLE-Guard haben'
+    # return ohne Action wenn nicht verfügbar
+    assert 'return' in block
+
+
+def test_v103_cleanup_errors_do_not_crash():
+    """Delete-Calls in try/except eingewickelt — Cleanup-Loop läuft weiter."""
+    src = _read_backend()
+    fn_idx = src.find('def cleanup_old_supabase_state')
+    block = src[fn_idx:fn_idx + 3000]
+    assert 'try:' in block and 'except' in block, \
+        'cleanup muss exception-safe sein'
+
+
+def test_v103_uploaded_files_pdf_cleanup_still_works():
+    """Bestehende Cleanups (uploaded_files + pdfs) bleiben erhalten."""
+    src = _read_backend()
+    loop_idx = src.find('def _cleanup_loop')
+    block = src[loop_idx:loop_idx + 3000]
+    assert "table('uploaded_files').delete()" in block, \
+        'uploaded_files-Cleanup darf nicht entfernt sein'
+    assert "table('pdfs').delete()" in block, \
+        'pdfs-Cleanup darf nicht entfernt sein'
+
+
+def test_v103_supabase_migration_sql_file_exists():
+    """SQL-Migration für indexes + cleanup-function liegt unter supabase_migrations/."""
+    import os
+    mig_dir = os.path.join(os.path.dirname(_APP_PY), 'supabase_migrations')
+    assert os.path.isdir(mig_dir), 'supabase_migrations/ Verzeichnis fehlt'
+    files = [f for f in os.listdir(mig_dir) if f.endswith('.sql')]
+    assert files, 'Mindestens eine .sql Migration nötig'
+    # Prüfe Inhalt
+    target = [f for f in files if 'cleanup' in f.lower() or 'jobs' in f.lower()]
+    assert target, 'cleanup/jobs migration fehlt'
+    content = open(os.path.join(mig_dir, target[0])).read()
+    assert 'aerotax_cleanup_old_state' in content
+    assert 'idx_jobs_updated_at' in content
+    assert 'idx_sessions_expires_at' in content
+
+
+def test_v103_no_raw_job_not_found_user_facing():
+    """„job not found" darf nicht user-facing erscheinen — nur als interne ID-Phrase."""
+    site = open(_FRONTEND_HTML).read()
+    # Nur in Comments/Tests OK
+    import re as _re
+    for m in _re.finditer(r'job not found', site, _re.IGNORECASE):
+        pos = m.start()
+        ctx_pre = site[max(0, pos-300):pos]
+        line_start = site.rfind('\n', 0, pos) + 1
+        rel = pos - line_start
+        line = site[line_start:site.find('\n', pos)]
+        is_safe = ('//' in line[:rel] or '<!--' in ctx_pre[-200:]
+                   or 'STALE_PATTERNS' in ctx_pre or 'forbidden' in ctx_pre.lower()
+                   or 'console.' in line[:rel] or 'log' in line[:rel].lower())
+        if not is_safe:
+            ln = site[:pos].count('\n') + 1
+            raise AssertionError(f'„job not found" user-facing line {ln}')
+
+
+# ─── FALL 2: Z77 Source-Selection ────────────────────────────────────────
+
+def test_v103_choose_z77_source_function_exists():
+    """Backend-Helper choose_z77_source() existiert."""
+    src = _read_backend()
+    assert 'def choose_z77_source' in src, 'choose_z77_source() Funktion fehlt'
+
+
+def test_v103_choose_z77_prefers_daily_lines():
+    """Priorität A: wenn daily_lines plausibel — nutze sie."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    r = _app.choose_z77_source(daily_lines=4705.0, monthly_z77_list=[{'z77_monat': 4923.0}],
+                                declared_total=1393.0)
+    assert r['z77_used'] == 4705.0
+    assert r['z77_source'] == 'daily_lines'
+
+
+def test_v103_choose_z77_uses_monthly_when_daily_missing():
+    """Priorität B: monthly_sum wenn daily_lines fehlt."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    r = _app.choose_z77_source(daily_lines=0, monthly_z77_list=[
+        {'z77_monat': 400.0}, {'z77_monat': 350.0}, {'z77_monat': 500.0},
+    ], declared_total=1393.0)
+    assert r['z77_used'] == 1250.0  # 400+350+500
+    assert r['z77_source'] == 'monthly_sum'
+
+
+def test_v103_choose_z77_declared_only_fallback():
+    """Priorität C: declared nur wenn alles andere fehlt."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    r = _app.choose_z77_source(daily_lines=0, monthly_z77_list=[], declared_total=4500.0)
+    assert r['z77_used'] == 4500.0
+    assert r['z77_source'] == 'declared_total'
+
+
+def test_v103_choose_z77_no_source_at_all():
+    """Kein Source verfügbar → z77_used=0 + warning."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    r = _app.choose_z77_source(daily_lines=0, monthly_z77_list=[], declared_total=0)
+    assert r['z77_used'] == 0
+    assert r['z77_source'] == 'none'
+    assert r['warnings']
+
+
+def test_v103_choose_z77_small_diff_info_not_warning():
+    """daily/monthly diff ≤ max(50€, 2%) → INFO, keine Warning."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    # 4705 vs 4752 → diff 47 ≤ tolerance (max(50, 4705*0.02=94)=94)
+    r = _app.choose_z77_source(daily_lines=4705.0, monthly_z77_list=[
+        {'z77_monat': 4752.0},
+    ], declared_total=1000.0)
+    # Keine Warning — Source ist klar daily_lines
+    assert not any('mismatch' in w.lower() for w in r['warnings']), \
+        f'Small diff darf keine mismatch-Warning erzeugen. warnings={r["warnings"]}'
+
+
+def test_v103_choose_z77_large_diff_warning():
+    """daily/monthly diff > max(50€, 2%) → echte Warning."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    # 4705 vs 2000 → diff 2705, > tolerance
+    r = _app.choose_z77_source(daily_lines=4705.0, monthly_z77_list=[
+        {'z77_monat': 2000.0},
+    ], declared_total=1000.0)
+    assert any('mismatch' in w.lower() or 'diff' in w.lower() for w in r['warnings']), \
+        f'Large diff muss Warning sein. warnings={r["warnings"]}'
+
+
+def test_v103_choose_z77_no_blind_max():
+    """choose_z77_source nimmt NICHT blind max() aller drei."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    # daily=4000, monthly=4923, declared=10000 (declared ist Müll/zu hoch)
+    # max() würde 10000 wählen — falsch. Wir wollen daily=4000.
+    r = _app.choose_z77_source(daily_lines=4000.0, monthly_z77_list=[
+        {'z77_monat': 4923.0},
+    ], declared_total=10000.0)
+    assert r['z77_used'] == 4000.0, \
+        f'Daily wins; nicht max(). Got {r["z77_used"]}'
+    assert r['z77_source'] == 'daily_lines'
+
+
+def test_v103_choose_z77_audit_contains_source_and_crosschecks():
+    """z77_audit-Feld enthält used, source, daily_lines, monthly_sum, declared_total, notes."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    r = _app.choose_z77_source(daily_lines=4705.0, monthly_z77_list=[
+        {'z77_monat': 4923.0},
+    ], declared_total=1393.0)
+    audit = r['z77_audit']
+    assert audit['used'] == 4705.0
+    assert audit['source'] == 'daily_lines'
+    assert audit['daily_lines'] == 4705.0
+    assert audit['monthly_sum'] == 4923.0
+    assert audit['declared_total'] == 1393.0
+    assert 'notes' in audit
+    assert isinstance(audit['notes'], list)
+
+
+def test_v103_choose_z77_suspicious_low_high_warnings():
+    """Ungewöhnlich niedrig (<1500) oder hoch (>10000) → Plausi-Warning."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    # Zu niedrig
+    r_low = _app.choose_z77_source(daily_lines=800.0, monthly_z77_list=[], declared_total=0)
+    assert any('niedrig' in w.lower() or 'low' in w.lower() for w in r_low['warnings'])
+    # Zu hoch
+    r_high = _app.choose_z77_source(daily_lines=15000.0, monthly_z77_list=[], declared_total=0)
+    assert any('hoch' in w.lower() or 'high' in w.lower() for w in r_high['warnings'])
+
+
+def test_v103_se_prompt_says_ignore_summe_lines():
+    """Sonnet-SE-Prompt sagt explizit: SUMME-Zeilen ignorieren für z77_total."""
+    src = _read_backend()
+    src_lc = src.lower()
+    # Mindestens eines dieser Hinweise muss irgendwo im SE-Reader-Code stehen
+    found = ('ignoriere die summe-zeilen' in src_lc or
+             'ignoriere diese summe-zeilen' in src_lc or
+             'mehrere summe-zeilen' in src_lc or
+             'nicht eine beliebige summe' in src_lc or
+             'ignore the summe lines' in src_lc)
+    assert found, 'SE-Prompt muss explizit auf mehrere SUMME-Zeilen hinweisen'
+
+
+def test_v103_no_blind_max_in_legacy_se_reader():
+    """Legacy SE-Reader nutzt nicht mehr `max(z77_main, monat_sum)` — sondern choose_z77_source."""
+    src = _read_backend()
+    # Suche die alte zeile
+    legacy_idx = src.find("# Cross-Check: Σ(monatliche_z77) muss = z77_total sein")
+    if legacy_idx > 0:
+        block = src[legacy_idx:legacy_idx + 2000]
+        # Alte direkte Zuweisung darf nicht mehr da sein
+        assert 'z77_main = max(z77_main, monat_sum)' not in block, \
+            'Legacy max()-Logik muss durch choose_z77_source ersetzt sein'
+
+
+def test_v103_z77_audit_in_se_result():
+    """Sonnet-SE Result-Dict enthält z77_audit-Feld."""
+    src = _read_backend()
+    # In _sonnet_read_se
+    fn_idx = src.find('def _sonnet_read_se(')
+    if fn_idx < 0:
+        # Fallback: prüfe direkt nach choose_z77_source
+        fn_idx = src.find('choose_z77_source')
+    block = src[fn_idx:fn_idx + 8000]
+    assert 'z77_audit' in block, \
+        'SE-Reader Result muss z77_audit enthalten'
+
+
+def test_v103_no_user_facing_technical_z77_warning():
+    """Frontend zeigt KEINE technischen Z77-Strings."""
+    site = open(_FRONTEND_HTML).read()
+    forbidden = ['monatliche_z77', 'z77_total', 'declared_total', 'daily_lines',
+                 'tool_input', 'max_tokens', 'Sonnet']
+    for needle in forbidden:
+        idx = 0
+        while True:
+            pos = site.find(needle, idx)
+            if pos < 0: break
+            ctx_pre = site[max(0, pos-300):pos]
+            line_start = site.rfind('\n', 0, pos) + 1
+            rel = pos - line_start
+            line = site[line_start:site.find('\n', pos)]
+            is_safe = ('//' in line[:rel] or '<!--' in ctx_pre[-200:]
+                       or 'STALE_PATTERNS' in ctx_pre or 'forbidden' in ctx_pre.lower()
+                       or 'console.' in line[:rel])
+            if not is_safe:
+                ln = site[:pos].count('\n') + 1
+                raise AssertionError(f'„{needle}" user-facing line {ln}')
+            idx = pos + len(needle)
+
+
+# ─── Regression-Guards ───────────────────────────────────────────────────
+
+def test_v103_deterministic_se_z77_unchanged():
+    """Deterministischer SE-Parse-Pfad (app.py ~5662) bleibt unverändert.
+    z77_total = sum(a['steuerfrei'] for a in abrechnungen) — Quelle der Wahrheit
+    für die Produktions-Berechnung."""
+    src = _read_backend()
+    # Die zentrale deterministische Linie
+    assert "z77_total = round(sum(a['steuerfrei'] for a in abrechnungen), 2)" in src, \
+        'Deterministischer Z77-Pfad darf nicht geändert werden'
+
+
+def test_v103_choose_z77_with_real_world_log_case():
+    """Konkretes Beispiel aus Render-Logs:
+    declared=1393, monthly=4923, daily=4705 → wir nehmen daily=4705.
+    Das ist 218€ niedriger als der alte max(monthly,declared)=4923 vom legacy-Reader.
+    Aber der STRUCTURED-Reader nutzte schon vorher max(declared,daily)=4705 → match."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    monthly_list = [{'z77_monat': 4923.0 / 12}] * 12  # ~4923 gesamt
+    r = _app.choose_z77_source(daily_lines=4705.0, monthly_z77_list=monthly_list,
+                                declared_total=1393.0)
+    assert r['z77_source'] == 'daily_lines'
+    assert r['z77_used'] == 4705.0
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
