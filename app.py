@@ -2029,7 +2029,7 @@ def post_upload_replacement(job_id):
         return jsonify({'error': 'Keine Datei im Upload-Body'}), 400
     file = request.files['file']
     doc_type = (request.form.get('doc_type') or '').strip().lower()
-    if doc_type not in ('lsb', 'se', 'dp', 'einsatz'):
+    if doc_type not in ('lsb', 'se', 'dp', 'einsatz', 'other'):
         return jsonify({'error': f'unbekannter doc_type: {doc_type}'}), 400
     if not file or not file.filename:
         return jsonify({'error': 'leere Datei'}), 400

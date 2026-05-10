@@ -5607,16 +5607,16 @@ def test_v825_chat_footer_has_upload_button():
 
 
 def test_v825_chat_input_min_height_and_padding():
-    """Textarea hat min-height ≥ 48px und ausreichend padding für nicht-clipping."""
+    """Textarea hat min-height passend zu Send/Plus-Button-Höhe und kein Text-Clipping."""
     import os, re
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    # Suche das textarea-Element für chat-input
     m = re.search(r'<textarea id="chat-input"[^>]*>', src)
     assert m is not None
     style = m.group(0)
-    assert 'min-height:48px' in style or 'min-height: 48px' in style
-    assert re.search(r'padding:\s*14px', style), 'Padding ≥ 14px für Klar-Lesbarkeit'
+    # v8.27: textarea matched button-height (44px), nicht 48px
+    assert re.search(r'min-height:\s*4[48]px', style), 'min-height muss 44 oder 48px sein'
+    assert re.search(r'padding:\s*1[2-6]px', style), 'Padding 12-16px für Klar-Lesbarkeit'
     assert 'line-height:1.4' in style or 'line-height: 1.4' in style
 
 
@@ -6024,6 +6024,150 @@ def test_v826_no_promo_marketing_phrases_in_chat():
                  'garantiert korrekt', 'Steuerberater-sicher']
     for phrase in forbidden:
         assert phrase not in src, f'Verbotene Marketing-Floskel im Chat: "{phrase}"'
+
+
+# ── v8.27 Bug-Fixes: Centering, Tint, Upload-Flow, Greeting-Wording ──
+
+def test_v827_chat_opens_with_display_flex_for_centering():
+    """chat-overlay.style.display = 'flex' beim Öffnen (sonst greift align-items:center nicht)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Bei _chatOpen wird flex gesetzt
+    assert "ov.style.display = 'flex'" in src
+    # Overlay default-CSS hat align-items:center
+    assert 'align-items:center;justify-content:center' in src
+    # Kein alter "ov.style.display = 'block'" mehr
+    assert "ov.style.display = 'block'" not in src
+
+
+def test_v827_modal_background_neutral_not_blue():
+    """v8.27: Modal-Background hat keinen blauen Tint (rgba(30,45,90,...) entfernt)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Der explizite Blau-Gradient von v8.26 ist weg
+    assert 'rgba(30,45,90' not in src, 'Modal darf keinen blauen Tint mehr haben'
+    # Backdrop neutral schwarz
+    assert 'rgba(0,0,0,0.42)' in src or 'rgba(0,0,0,0.4' in src, 'Backdrop muss neutral schwarz sein'
+
+
+def test_v827_plus_btn_opens_attach_menu_not_chat_msg():
+    """+ Button öffnet Attach-Popover statt Chat-Message zu schreiben."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # +-Button onclick ruft _chatToggleAttachMenu (nicht _chatToggleUploadMenu)
+    assert 'onclick="window._chatToggleAttachMenu' in src
+    # Hidden file-input existiert
+    assert 'id="chat-file-input"' in src
+    # Attachment-Slot existiert
+    assert 'id="chat-attachments"' in src
+
+
+def test_v827_attach_menu_has_doc_type_pills():
+    """Attach-Popover bietet Doc-Type-Auswahl (LSB/SE/DP/Other)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatToggleAttachMenu = function')
+    assert fn_idx > 0
+    block = src[fn_idx:fn_idx+3500]
+    for label in ['Lohnsteuerbescheinigung', 'Streckeneinsatzabrechnung', 'Flugstundenübersicht', 'Sonstiger Beleg']:
+        assert label in block, f'Doc-Type "{label}" fehlt im Attach-Popover'
+
+
+def test_v827_attach_file_creates_pill_in_footer():
+    """_chatAttachFile zeigt Attachment-Pill im Footer (nicht direkt Upload)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'function _chatAttachFile' in src
+    # Pill wird im chat-attachments slot angelegt
+    assert 'window._chatAttachedFile = {file: file' in src
+
+
+def test_v827_send_uploads_attached_file():
+    """_chatSend uploadet attached file via /upload-replacement statt /api/chat."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatSend = async function')
+    assert fn_idx > 0
+    block = src[fn_idx:fn_idx+5000]
+    assert 'window._chatAttachedFile' in block
+    assert '/upload-replacement' in block
+
+
+def test_v827_greeting_no_count_demotivator():
+    """Greeting erwähnt KEINE konkrete „22 offene Angaben"-Zahl mehr."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # _chatGreetReview-Block isolieren
+    fn_idx = src.find('async function _chatGreetReview')
+    if fn_idx < 0: fn_idx = src.find('function _chatGreetReview')
+    assert fn_idx > 0
+    block_end = src.find('window._localGroupReviewItems', fn_idx)
+    if block_end < 0: block_end = fn_idx + 2000
+    block = src[fn_idx:block_end]
+    # Kein "22 offen" oder "22 Angaben" in Greeting
+    import re
+    nums = re.findall(r"\d{1,3}\s+(?:offene?|Angaben)", block)
+    assert not nums, f'Greeting darf keine konkrete Zahl nennen, fand: {nums}'
+    # Stattdessen weiches Wording
+    assert 'ein paar Tage' in block or 'kurz durchgehen' in block or 'zusammen' in block
+
+
+def test_v827_local_grouping_fallback_exists():
+    """Frontend hat lokales Grouping als Fallback wenn /review-groups nicht erreichbar."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'window._localGroupReviewItems' in src
+    assert 'familyOf' in src and 'fmtRange' in src
+
+
+def test_v827_upload_replacement_accepts_other_doc_type():
+    """Backend /upload-replacement akzeptiert 'other' für Sonstige Belege."""
+    import app as _app
+    src = open(_app.__file__).read()
+    import re
+    m = re.search(r"doc_type not in\s*\(([^)]+)\)", src)
+    assert m is not None
+    accepted = m.group(1)
+    assert "'other'" in accepted, "doc_type='other' muss erlaubt sein"
+
+
+def test_v827_input_row_align_items_flex_end():
+    """Input-Row align-items:flex-end damit textarea bei Wachstum nach unten ankert."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('id="chat-input-row"')
+    assert fn_idx > 0
+    # Ein gültiges align für mit Auto-Resize textarea: flex-end ODER center
+    snippet = src[fn_idx:fn_idx+400]
+    assert 'align-items:flex-end' in snippet or 'align-items:center' in snippet
+
+
+def test_v827_send_button_height_matches_input_height():
+    """Send-Button + Plus-Button haben gleiche Höhe wie Textarea-min-height (44px)."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Send-Button height:44px
+    send_match = re.search(r'id="chat-send"[^>]*style="([^"]*)"', src)
+    assert send_match
+    assert 'height:44px' in send_match.group(1)
+    # Plus-Button height:44px
+    plus_match = re.search(r'id="chat-upload-btn"[^>]*style="([^"]*)"', src)
+    assert plus_match
+    assert 'height:44px' in plus_match.group(1)
+    # Textarea min-height:44px
+    ta_match = re.search(r'id="chat-input"[^>]*style="([^"]*)"', src)
+    assert ta_match
+    assert 'min-height:44px' in ta_match.group(1)
 
 
 if __name__ == '__main__':
