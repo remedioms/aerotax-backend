@@ -4901,6 +4901,165 @@ def test_v821_review_item_question_uses_friendly_language():
     assert any(f in q for f in friendly), f"Frage zu technisch: {q}"
 
 
+# ── v8.22 Step A-C: Server-side Recalc Tests ──
+
+def test_v822_recompute_totals_simple_no_overrides():
+    """Recompute mit cls=Office-only, keine Overrides → keine Z72."""
+    from app import _recompute_totals_from_cls
+    cls_stub = {
+        'arbeitstage': 5, 'reinigungstage': 5, 'fahr_tage': 5,
+        'hotel_naechte': 0, 'z72_tage': 0, 'z73_tage': 0, 'z74_tage': 0,
+        'z76_eur': 0,
+    }
+    cached = {'km': 27, 'fahr_oepnv': 0, 'fahr_shuttle': 0,
+              'ag_z17': 100, 'z77': 0, 'opt_zu_gesamt': 0}
+    totals = _recompute_totals_from_cls(cls_stub, cached, 2025)
+    assert totals['vma_72'] == 0
+    assert totals['vma_in'] == 0
+    assert totals['reinig'] == 5 * 1.60
+    # fahr = 27km × 5T → 20×5×0.30 + 7×5×0.38 = 30 + 13.30 = 43.30
+    assert totals['fahr'] == round(20 * 5 * 0.30 + 7 * 5 * 0.38, 2)
+    # netto = max(0, fahr-z17) + reinig + ... = max(0, 43.30-100)=0 + 8 + 0 + 0 + 0 = 8
+    assert totals['netto'] == 8.0
+
+
+def test_v822_recompute_totals_with_z72_days():
+    """Recompute mit 13 Z72-Tagen → vma_72 = 182, ändert netto."""
+    from app import _recompute_totals_from_cls
+    cls_stub = {
+        'arbeitstage': 13, 'reinigungstage': 13, 'fahr_tage': 13,
+        'hotel_naechte': 0, 'z72_tage': 13, 'z73_tage': 0, 'z74_tage': 0,
+        'z76_eur': 0,
+    }
+    cached = {'km': 27, 'fahr_oepnv': 0, 'fahr_shuttle': 0,
+              'ag_z17': 0, 'z77': 0, 'opt_zu_gesamt': 0}
+    totals = _recompute_totals_from_cls(cls_stub, cached, 2025)
+    assert totals['vma_72_tage'] == 13
+    assert totals['vma_72'] == 13 * 14.0  # 182
+    assert totals['vma_in'] == 182.0
+    assert totals['gesamt'] >= 182.0
+
+
+def test_v822_recompute_with_overrides_yes_all_changes_total():
+    """End-to-End: cached_state mit 3 Office-Tagen, Overrides yes/yes/yes → Z72=3, +42€."""
+    from app import _recompute_with_overrides, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-07', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EK BUERODIENST'},
+        {'datum': '2025-04-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-04-09', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    cached = {
+        'matched_days': matched, 'year': 2025, 'homebase': 'FRA', 'commute_minutes': 0,
+        'km': 27, 'fahr_oepnv': 0, 'fahr_shuttle': 0,
+        'ag_z17': 0, 'z77': 0, 'opt_zu_gesamt': 0,
+    }
+    overrides = {
+        '2025-04-07': {'over_8h': True, 'source': 'user_review_chatbot'},
+        '2025-04-08': {'over_8h': True, 'source': 'user_review_chatbot'},
+        '2025-04-09': {'over_8h': True, 'source': 'user_review_chatbot'},
+    }
+    rec = _recompute_with_overrides(cached, overrides)
+    assert rec is not None
+    assert rec['cls']['z72_tage'] == 3
+    assert rec['totals']['vma_72'] == 42.0
+
+
+def test_v822_recompute_with_overrides_mixed():
+    """Mixed: yes/no/time → 2 Z72-Tage."""
+    from app import _recompute_with_overrides, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-07', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EK BUERODIENST'},
+        {'datum': '2025-04-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-04-09', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'D4 SCHULUNG'},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    cached = {
+        'matched_days': matched, 'year': 2025, 'homebase': 'FRA', 'commute_minutes': 0,
+        'km': 27, 'fahr_oepnv': 0, 'fahr_shuttle': 0,
+        'ag_z17': 0, 'z77': 0, 'opt_zu_gesamt': 0,
+    }
+    overrides = {
+        '2025-04-07': {'over_8h': True, 'source': 'user_review_chatbot'},
+        '2025-04-08': {'over_8h': False, 'source': 'user_review_chatbot'},
+        '2025-04-09': {'start_time': '08:30', 'end_time': '18:45',
+                        'time_is_absence': True,
+                        'source': 'user_review_chatbot_time_entry'},  # 615min → Z72
+    }
+    rec = _recompute_with_overrides(cached, overrides)
+    assert rec['cls']['z72_tage'] == 2  # 07.04 + 09.04
+    assert rec['totals']['vma_72'] == 28.0
+
+
+def test_v822_recompute_unsure_keeps_office():
+    """Unsure → Tag bleibt Office, kein Z72."""
+    from app import _recompute_with_overrides, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-07', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EK BUERODIENST'},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    cached = {
+        'matched_days': matched, 'year': 2025, 'homebase': 'FRA', 'commute_minutes': 0,
+        'km': 27, 'fahr_oepnv': 0, 'fahr_shuttle': 0,
+        'ag_z17': 0, 'z77': 0, 'opt_zu_gesamt': 0,
+    }
+    overrides = {'2025-04-07': {'unsure': True, 'source': 'user_unsure'}}
+    rec = _recompute_with_overrides(cached, overrides)
+    assert rec['cls']['z72_tage'] == 0
+    assert rec['totals']['vma_72'] == 0
+
+
+def test_v822_recompute_topf_trennung_z77_caps_vma():
+    """Wenn z77 (steuerfreie Spesen) > vma_total: vma_netto=0."""
+    from app import _recompute_totals_from_cls
+    cls_stub = {
+        'arbeitstage': 13, 'reinigungstage': 13, 'fahr_tage': 13,
+        'hotel_naechte': 0, 'z72_tage': 13, 'z73_tage': 0, 'z74_tage': 0,
+        'z76_eur': 1000,
+    }
+    cached = {'km': 27, 'fahr_oepnv': 0, 'fahr_shuttle': 0,
+              'ag_z17': 0, 'z77': 5000, 'opt_zu_gesamt': 0}  # z77 > vma_total
+    totals = _recompute_totals_from_cls(cls_stub, cached, 2025)
+    # vma_total = 182 + 1000 = 1182, z77 = 5000 → vma_netto = max(0, 1182-5000) = 0
+    assert totals['vma_in'] == 182.0
+    assert totals['vma_aus'] == 1000.0
+    # netto = fahr_netto + reinig + trink + 0 + 0 = (43.30 - 0) + 20.80 + 0 = 64.10
+    assert totals['netto'] == round(totals['fahr'] + totals['reinig'] + 0 + 0, 2)
+
+
+def test_v822_recompute_topf_trennung_z17_caps_fahr():
+    """Wenn ag_z17 > fahr: fahr_netto=0."""
+    from app import _recompute_totals_from_cls
+    cls_stub = {
+        'arbeitstage': 5, 'reinigungstage': 5, 'fahr_tage': 5,
+        'hotel_naechte': 0, 'z72_tage': 0, 'z73_tage': 0, 'z74_tage': 0,
+        'z76_eur': 0,
+    }
+    cached = {'km': 5, 'fahr_oepnv': 0, 'fahr_shuttle': 0,
+              'ag_z17': 1000, 'z77': 0, 'opt_zu_gesamt': 0}  # z17 viel größer
+    totals = _recompute_totals_from_cls(cls_stub, cached, 2025)
+    # fahr = 5km × 5T × 0.30 = 7.50
+    assert totals['fahr'] == 7.50
+    # fahr_netto = max(0, 7.50 - 1000) = 0
+    # netto = 0 + reinig + 0 + 0 + 0 = 8.0
+    assert totals['netto'] == 8.0
+
+
+def test_v822_recompute_with_empty_cache_returns_none():
+    """Leerer cache (matched_days fehlt) → kein recompute."""
+    from app import _recompute_with_overrides
+    rec = _recompute_with_overrides({}, {'2025-04-07': {'over_8h': True}})
+    # cached.matched_days fehlt → returns None oder leeres cls
+    assert rec is None or rec['cls']['z72_tage'] == 0
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

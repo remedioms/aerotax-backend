@@ -1379,6 +1379,139 @@ def get_job_audit(job_id):
     return jsonify({'audit': j.get('audit', []), 'status': j.get('status')})
 
 
+def _recompute_totals_from_cls(cls_new, cached_state, year):
+    """v8.22 Pure-Helper: berechnet Topf-Trennung + Brutto/Netto aus neuer Klassifikation
+    + gecachten Inputs (LSB, SE-Summe, Form). Identisch zur Logik in _berechne_via_hybrid.
+    Liefert Dict mit allen relevanten Feldern für den Result-Dict-Update.
+    """
+    bmf_inland = BMF_INLAND_BY_YEAR.get(year, BMF_INLAND_BY_YEAR.get(2025, {
+        'tagestrip_8h': 14, 'an_abreise': 14, 'voll_24h': 28
+    }))
+    reinig_satz = REINIGUNG_PRO_TAG_BY_YEAR.get(year, 1.60)
+    trink_satz = TRINKGELD_PRO_NACHT_BY_YEAR.get(year, 3.60)
+    pendler = PENDLER_BY_YEAR.get(year, PENDLER_BY_YEAR.get(2025, {'lt_20km': 0.30, 'gt_21km': 0.38}))
+
+    fahr_tage_n     = int(cls_new.get('fahr_tage', 0) or 0)
+    reinigungstage_n = int(cls_new.get('reinigungstage', cls_new.get('arbeitstage', 0)) or 0)
+    hotel_n         = int(cls_new.get('hotel_naechte', 0) or 0)
+    arbeitstage_n   = int(cls_new.get('arbeitstage', 0) or 0)
+    vma_72_tage     = int(cls_new.get('z72_tage', 0) or 0)
+    vma_73_tage     = int(cls_new.get('z73_tage', 0) or 0)
+    vma_74_tage     = int(cls_new.get('z74_tage', 0) or 0)
+    vma_aus         = float(cls_new.get('z76_eur', 0) or 0)
+
+    vma_72 = round(vma_72_tage * bmf_inland['tagestrip_8h'], 2)
+    vma_73 = round(vma_73_tage * bmf_inland['an_abreise'], 2)
+    vma_74 = round(vma_74_tage * bmf_inland['voll_24h'], 2)
+    vma_in = round(vma_72 + vma_73 + vma_74, 2)
+
+    km = float(cached_state.get('km', 0) or 0)
+    fahr = 0.0
+    f_entfernungspauschale = 0.0
+    if km > 0 and fahr_tage_n > 0:
+        f_entfernungspauschale = round(
+            min(km, 20) * fahr_tage_n * pendler['lt_20km']
+            + max(0, km - 20) * fahr_tage_n * pendler['gt_21km'], 2)
+        fahr += f_entfernungspauschale
+    f_oepnv = float(cached_state.get('fahr_oepnv', 0) or 0)
+    f_shuttle = float(cached_state.get('fahr_shuttle', 0) or 0)
+    fahr += f_oepnv + f_shuttle
+    fahr = round(fahr, 2)
+
+    reinig = round(reinigungstage_n * reinig_satz, 2)
+    trink  = round(hotel_n * trink_satz, 2)
+
+    opt_zu_gesamt = float(cached_state.get('opt_zu_gesamt', 0) or 0)
+    ag_z17        = float(cached_state.get('ag_z17', 0) or 0)
+    z77           = float(cached_state.get('z77', 0) or 0)
+
+    gesamt    = round(fahr + reinig + trink + vma_in + vma_aus + opt_zu_gesamt, 2)
+    vma_total = round(vma_in + vma_aus, 2)
+    vma_netto = round(max(0, vma_total - z77), 2)
+    fahr_netto = round(max(0, fahr - ag_z17), 2)
+    netto      = round(fahr_netto + reinig + trink + vma_netto + opt_zu_gesamt, 2)
+
+    return {
+        'arbeitstage':    arbeitstage_n,
+        'reinigungstage': reinigungstage_n,
+        'fahr_tage':      fahr_tage_n,
+        'hotel_naechte':  hotel_n,
+        'vma_72_tage':    vma_72_tage,
+        'vma_73_tage':    vma_73_tage,
+        'vma_74_tage':    vma_74_tage,
+        'vma_72':         vma_72,
+        'vma_73':         vma_73,
+        'vma_74':         vma_74,
+        'vma_in':         vma_in,
+        'vma_aus':        vma_aus,
+        'fahr':           fahr,
+        'fahr_entfernungspauschale': f_entfernungspauschale,
+        'fahr_oepnv':     f_oepnv,
+        'fahr_shuttle':   f_shuttle,
+        'reinig':         reinig,
+        'trink':          trink,
+        'gesamt':         gesamt,
+        'netto':          netto,
+        'ag_z17':         ag_z17,
+        'z77':            z77,
+    }
+
+
+def _recompute_with_overrides(cached_state, manual_day_overrides):
+    """v8.22: Wendet User-Review-Overrides auf gecachte matched_days an,
+    klassifiziert neu, rechnet Topf-Totals neu. KEIN Sonnet-Call.
+
+    cached_state braucht: matched_days, year, homebase, commute_minutes,
+                          km, fahr_oepnv, fahr_shuttle, ag_z17, z77, opt_zu_gesamt
+    """
+    if not cached_state or not isinstance(cached_state, dict):
+        return None
+    matched = cached_state.get('matched_days') or []
+    overrides = manual_day_overrides or {}
+    # Patche DP-Felder pro Tag gemäß Override
+    patched = []
+    for m in matched:
+        if not isinstance(m, dict):
+            continue
+        m_new = dict(m)
+        dp = dict(m_new.get('dp') or {})
+        ov = overrides.get(m_new.get('datum'))
+        if ov:
+            if 'start_time' in ov and 'end_time' in ov:
+                st, et = ov['start_time'], ov['end_time']
+                try:
+                    sh, sm = int(st.split(':')[0]), int(st.split(':')[1])
+                    eh, em = int(et.split(':')[0]), int(et.split(':')[1])
+                    duration = (eh * 60 + em) - (sh * 60 + sm)
+                    if duration > 0:
+                        dp['start_time'] = st
+                        dp['end_time'] = et
+                        dp['duty_duration_minutes'] = duration
+                        dp['time_is_absence'] = True
+                        dp['_user_review_source'] = ov.get('source', 'user_review_chatbot_time_entry')
+                except (ValueError, IndexError):
+                    pass
+            elif 'over_8h' in ov:
+                if ov['over_8h']:
+                    dp['duty_duration_minutes'] = SAME_DAY_Z72_TOTAL_MINUTES
+                    dp['time_is_absence'] = True
+                else:
+                    dp['duty_duration_minutes'] = SAME_DAY_Z72_TOTAL_MINUTES - 1
+                    dp['time_is_absence'] = True
+                dp['_user_review_source'] = ov.get('source', 'user_review_chatbot')
+            elif ov.get('unsure'):
+                dp['_user_review_source'] = 'user_unsure'
+        m_new['dp'] = dp
+        patched.append(m_new)
+
+    year = int(cached_state.get('year', 2025) or 2025)
+    homebase = str(cached_state.get('homebase', 'FRA') or 'FRA').upper()
+    commute_minutes = int(cached_state.get('commute_minutes', 0) or 0)
+    cls_new = _deterministic_classify_v7(patched, year, homebase, commute_minutes=commute_minutes)
+    totals = _recompute_totals_from_cls(cls_new, cached_state, year)
+    return {'cls': cls_new, 'totals': totals}
+
+
 def _validate_and_compute_review_answer(review_item_id, answer, start_time, end_time):
     """v8.21 Pure-Helper: Validiert Review-Antwort und berechnet Override + Delta.
 
@@ -1501,14 +1634,44 @@ def post_review_answer(job_id):
                          'datum': datum, 'override': ov, 'delta_eur': delta_eur},
                 'timestamp': datetime.now().isoformat(),
             })
-        # Persist
+
+        # v8.22 Step C: Deterministische Re-Berechnung mit gecachtem State
+        # (KEIN Sonnet-Call). Liefert authoritativen updated_preview_total.
+        cached = (j.get('data') or {}).get('_cached_recalc_state') or {}
+        updated_preview_total = None
+        total_delta = None
+        recalc_breakdown = None
+        if cached and cached.get('matched_days'):
+            try:
+                rec = _recompute_with_overrides(cached, overrides)
+                if rec and rec.get('totals'):
+                    updated_preview_total = rec['totals'].get('netto')
+                    initial_total = float(((j.get('data') or {}).get('netto')) or 0)
+                    if isinstance(updated_preview_total, (int, float)):
+                        total_delta = round(float(updated_preview_total) - initial_total, 2)
+                    recalc_breakdown = {
+                        'arbeitstage':    rec['totals'].get('arbeitstage'),
+                        'reinigungstage': rec['totals'].get('reinigungstage'),
+                        'fahr_tage':      rec['totals'].get('fahr_tage'),
+                        'hotel_naechte':  rec['totals'].get('hotel_naechte'),
+                        'vma_72_tage':    rec['totals'].get('vma_72_tage'),
+                        'vma_73_tage':    rec['totals'].get('vma_73_tage'),
+                        'vma_72':         rec['totals'].get('vma_72'),
+                        'vma_73':         rec['totals'].get('vma_73'),
+                        'vma_aus':        rec['totals'].get('vma_aus'),
+                        'gesamt':         rec['totals'].get('gesamt'),
+                        'netto':          rec['totals'].get('netto'),
+                    }
+                    # Persist updated preview totals in job data so UI/Refresh sehen es
+                    j.setdefault('data', {})['_preview_totals'] = recalc_breakdown
+            except Exception as _re:
+                print(f'[review-answer] recalc fail: {_re}')
+
         try:
             _save_job_to_disk(job_id)
         except Exception as _e:
             print(f'[review-answer] save warning: {_e}')
 
-    # Delta auf data anwenden für sofortige UI-Aktualisierung
-    # (Echte Re-Klassifikation erfolgt erst bei finalize-pdf)
     answered = sum(1 for v in overrides.values()
                    if isinstance(v, dict) and not v.get('unsure'))
     return jsonify({
@@ -1519,6 +1682,128 @@ def post_review_answer(job_id):
         'override_saved': True,
         'answered_count': len(overrides),
         'answered_with_impact': answered,
+        # v8.22 Step C: authoritative serverseitige Berechnung
+        'updated_preview_total': updated_preview_total,
+        'total_delta': total_delta,
+        'preview_breakdown': recalc_breakdown,
+    })
+
+
+@app.route('/api/job/<job_id>/finalize-pdf', methods=['POST'])
+def post_finalize_pdf(job_id):
+    """v8.22 Step E: Erstellt finales PDF unter Berücksichtigung aller User-Review-
+    Antworten (manual_day_overrides). Re-klassifiziert deterministisch, ruft
+    erstelle_pdf mit aktualisiertem Result-Dict, persistiert das neue PDF und
+    liefert finale Werte zurück.
+
+    Body (optional): {skip_unanswered: bool}  — bei True werden offene Items
+    als "nicht bestätigt" im Audit markiert und das PDF trotzdem erstellt.
+    """
+    body = request.get_json(silent=True) or {}
+    skip_unanswered = bool(body.get('skip_unanswered', False))
+
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'job not found'}), 404
+        # Job-Status muss done sein (Berechnung abgeschlossen)
+        if j.get('status') != 'done':
+            return jsonify({'error': 'Auswertung noch nicht abgeschlossen'}), 400
+        data = dict(j.get('data') or {})
+        cached = data.get('_cached_recalc_state') or {}
+        overrides = j.get('manual_day_overrides') or {}
+
+    if not cached or not cached.get('matched_days'):
+        return jsonify({
+            'error': 'Recalc-State nicht verfügbar — bitte Auswertung erneut starten.',
+        }), 409
+
+    # Re-Compute mit aktuellen Overrides (deterministisch, kein Sonnet-Call)
+    try:
+        rec = _recompute_with_overrides(cached, overrides)
+        if not rec:
+            return jsonify({'error': 'Re-Berechnung fehlgeschlagen.'}), 500
+    except Exception as e:
+        print(f'[finalize-pdf] recalc fail: {e}')
+        return jsonify({'error': 'Re-Berechnung fehlgeschlagen.', 'detail': str(e)[:120]}), 500
+
+    # Result-Dict mit neuen Totals patchen (PDF-Generator nutzt die Felder direkt)
+    final_data = dict(data)
+    final_data.update(rec['totals'])
+    # Audit-Notes für skipped/answered ergänzen
+    notes_existing = list(final_data.get('notes') or [])
+    answered = sum(1 for v in overrides.values()
+                   if isinstance(v, dict) and not v.get('unsure'))
+    unsure_n = sum(1 for v in overrides.values()
+                   if isinstance(v, dict) and v.get('unsure'))
+    if answered > 0:
+        notes_existing.append(
+            f'ℹ {answered} Schulungs-/Office-Tag(e) durch deine Antworten ergänzt.'
+        )
+    if unsure_n > 0:
+        notes_existing.append(
+            f'ℹ {unsure_n} Tag(e) nicht bestätigt (User unsicher) — im Nachweis vermerkt.'
+        )
+    final_data['notes'] = notes_existing
+
+    # PDF generieren
+    try:
+        pdf_bytes = erstelle_pdf(final_data).getvalue()
+    except Exception as e:
+        print(f'[finalize-pdf] erstelle_pdf fail: {e}')
+        return jsonify({'error': 'PDF-Erstellung fehlgeschlagen.', 'detail': str(e)[:120]}), 500
+
+    # PDF unter Token speichern (überschreibt das alte)
+    download_url = data.get('download_url') or ''
+    token = ''
+    if download_url and '/api/download/' in download_url:
+        token = download_url.rsplit('/', 1)[-1]
+    if not token:
+        # Neues Token wenn nicht vorhanden
+        import secrets as _s
+        token = _s.token_urlsafe(16)
+        download_url = f'/api/download/{token}'
+
+    name_safe = (final_data.get('name') or 'Auswertung').replace(' ', '_')
+    year_safe = final_data.get('year', 2025)
+    filename = f'AeroTAX_Auswertung_{year_safe}_{name_safe}.pdf'
+    try:
+        _save_pdf(token, pdf_bytes, filename)
+    except Exception as e:
+        print(f'[finalize-pdf] save_pdf fail: {e}')
+        return jsonify({'error': 'PDF-Speicherung fehlgeschlagen.'}), 500
+
+    # Job-State aktualisieren
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if j:
+            j['data'] = final_data
+            j['data']['download_url'] = download_url
+            j['download_url'] = download_url
+            j['pdf_status'] = 'ready'
+            j['pdf_finalized_at'] = datetime.now().isoformat()
+            if 'audit' in j and isinstance(j['audit'], list):
+                j['audit'].append({
+                    'event': 'pdf_finalized',
+                    'data': {
+                        'overrides_applied': len(overrides),
+                        'answered': answered, 'unsure': unsure_n,
+                        'final_total': final_data.get('netto'),
+                    },
+                    'timestamp': datetime.now().isoformat(),
+                })
+            try:
+                _save_job_to_disk(job_id)
+            except Exception as _e:
+                print(f'[finalize-pdf] save warning: {_e}')
+
+    return jsonify({
+        'final_total':  final_data.get('netto'),
+        'pdf_status':   'ready',
+        'download_url': download_url,
+        'overrides_applied': len(overrides),
+        'answered':     answered,
+        'unsure':       unsure_n,
     })
 
 
@@ -1844,12 +2129,31 @@ def chat_with_aerotax():
 
     prompt = f"""Du bist AeroTAX, der Werbungskosten-Auswertungs-Assistent von aerosteuer.de.
 AeroTAX ist eine Berechnungs- und Dokumentationshilfe — KEINE Steuerberatung.
-Du beantwortest STRENG NUR Fragen zu zwei Themen:
+
+Du beantwortest STRENG NUR Fragen aus diesen erlaubten Themen:
 
   1. DIESER konkreten Auswertung des Nutzers (Werte, Berechnung, Plausibilität)
-  2. WISO-Eingabe der Werte (welche Zeile, welcher Pfad)
+  2. WISO-Übernahme der Werte (welche Zeile, welcher Pfad)
+  3. Hochgeladenen Dokumenten (Flugstundenübersicht, Streckeneinsatzabrechnung,
+     Lohnsteuerbescheinigung) — was sie sind, warum sie gebraucht werden, was AeroTAX daraus liest
+  4. Offene Punkte / Rückfragen (warum kann das PDF noch nicht erstellt werden,
+     welches Dokument fehlt, Schulungs-/Office-Tag-Zeit)
+  5. Wie der Nutzer mit seinem Zugangscode später zurückkommt
 
-ALLES ANDERE wird höflich abgelehnt mit kurzem Hinweis: "Das ist außerhalb meines Scopes — ich helfe dir nur zur Auswertung und WISO-Eingabe. Allgemeine Steuerfragen gehören zu einem Steuerberater oder Lohnsteuerhilfeverein."
+EXPLIZIT VERBOTEN:
+  - Allgemeines Weltwissen (z.B. "Wie heißt Britney Spears?", "Hauptstadt von Frankreich")
+  - Politik, Medizin, Beziehungen, Programmierung, Reiseplanung, Promis
+  - Karriere-Beratung, Investments, Lebensberatung, was-wäre-wenn-Spiele
+  - Hypothetische Steuer-Szenarien außerhalb dieser Auswertung
+  - Andere Steuerjahre als das vorliegende
+  - Steuerberatung im engeren Sinn (z.B. "ist das absetzbar?", "garantiert das Finanzamt akzeptiert?")
+
+Bei Off-Topic-Fragen IMMER mit dieser Antwort ablehnen (höflich, einmal, dann Stopp):
+"Ich kann dir hier nur bei deiner AeroTAX-Auswertung helfen — also bei deinen Unterlagen, offenen Punkten, dem PDF und der Übernahme in deine Steuersoftware. Wenn du dazu eine Frage hast, bin ich da."
+
+KEINE allgemeinen Antworten geben.
+KEINE Vermutungen aufstellen.
+Bei Steuer-Zweifelsfragen außerhalb der Auswertung: auf Steuerberater oder Lohnsteuerhilfeverein verweisen.
 
 Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Investments, Politik, was-wäre-wenn-Spiele, hypothetische Beispiele.
 
@@ -9575,10 +9879,25 @@ def _berechne_via_hybrid(form, files):
           f"gesamt={gesamt:.2f} netto={netto:.2f}")
     print(f"[v8] brutto={gesamt:.2f} netto={netto:.2f} issues={len(notes)}")
 
+    # v8.22 Step A: Recalc-State cachen für deterministische Re-Berechnung nach Review-Antworten.
+    # Enthält genau die Inputs die _recompute_with_overrides braucht — KEIN Sonnet/LSB-Prompt nötig.
+    _cached_recalc_state = {
+        'matched_days':     locals().get('matched', []) or [],
+        'year':             int(form.get('year', 2025) or 2025),
+        'homebase':         str(form.get('homebase', 'FRA') or 'FRA').upper(),
+        'commute_minutes':  int(form.get('anfahrt_min', 0) or 0),
+        'km':               float(km),
+        'fahr_oepnv':       float(f_oepnv),
+        'fahr_shuttle':     float(f_shuttle),
+        'ag_z17':           float(ag_z17),
+        'z77':              float(z77),
+        'opt_zu_gesamt':    float(opt_zu_gesamt),
+    }
     return {
         'name':             form.get('name', 'Flugbegleiter'),
         'year':             form.get('year', 2025),
         '_isDemo': False,
+        '_cached_recalc_state': _cached_recalc_state,
         'uploaded_summary': ', '.join(uploaded_summary),
         'not_uploaded':     ', '.join(not_uploaded) if not_uploaded else 'Alle Pflichtdokumente vorhanden',
         'notes':            notes,
