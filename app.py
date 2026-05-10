@@ -8178,8 +8178,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         'z76_eur': z76_eur,
         'issue_tage': issue_tage,
         'tage_detail': tage_detail,
-        # Backward-Compat: 'unklare_tage' bleibt — enthält nur ECHTE Issues
-        'unklare_tage': unresolved_days + plausi_issues + plausi_hard_fails,
+        # v8.18.6: 'unklare_tage' enthält NUR echte unresolved_days + Hard-Fails.
+        # Plausi-Soft-Warnings (Z72=0, Z76=0 etc.) werden separat in plausi_issues
+        # geführt und nicht als "unklare Tage" angezeigt — sind Hinweise, keine Issues.
+        'unklare_tage': unresolved_days + plausi_hard_fails,
         'audit_notes': audit_notes,
         'unresolved_days': unresolved_days,
         'vma_unmapped_se': vma_unmapped_se,
@@ -9241,8 +9243,11 @@ def _berechne_via_hybrid(form, files):
         notes.append(f'⚠ Plausi: Hotelnächte {hotel_naechte} > Arbeitstage {arbeitstage} — bitte prüfen')
     if fahr_tage > arbeitstage and arbeitstage > 0:
         notes.append(f'⚠ Plausi: Fahrtage {fahr_tage} > Arbeitstage {arbeitstage} — unmöglich, bitte prüfen')
-    if unklare_tage:
-        notes.append(f'ℹ {len(unklare_tage)} unklare Tag(e) — siehe Audit-Trail')
+    # v8.18.6: Echte unresolved_days separat von Plausi-Soft-Warnings melden
+    _unresolved_count = len(cls.get('unresolved_days', []) or [])
+    _plausi_count = len(cls.get('plausi_issues', []) or [])
+    if _unresolved_count > 0:
+        notes.append(f'ℹ {_unresolved_count} unklare Tag(e) — bitte im PDF prüfen')
 
     # ── Nachweis-Text (Audit-Trail) ──
     if nachweis_text:
@@ -9351,6 +9356,8 @@ def _berechne_via_hybrid(form, files):
         '_audit_notes':     list(cls.get('audit_notes', []) or []),
         '_unresolved_days': list(cls.get('unresolved_days', []) or []),
         '_vma_unmapped_se': list(cls.get('vma_unmapped_se', []) or []),
+        '_plausi_issues':   list(cls.get('plausi_issues', []) or []),
+        '_plausi_hard_fails': list(cls.get('plausi_hard_fails', []) or []),
         '_document_health': cls.get('_document_health', {}),
         '_extra_fahrtage':         list(cls.get('extra_fahrtage', []) or []),
         '_extra_arbeitstage':      list(cls.get('extra_arbeitstage', []) or []),
@@ -10799,7 +10806,8 @@ def erstelle_pdf(d):
                leading=13, alignment=TA_LEFT, spaceAfter=12)))
         # Tabelle aufbauen
         tdata = [['Datum', 'Marker', 'Routing', 'Klass.', 'Begründung']]
-        for entry in tage_detail[:200]:  # safety cap
+        # v8.18.6: Cap auf 366 (volles Jahr inkl. Schaltjahr) — vorher 200 → Cut-off Mitte Juli
+        for entry in tage_detail[:366]:
             if not isinstance(entry, dict):
                 continue
             datum = str(entry.get('datum', ''))[:10]
