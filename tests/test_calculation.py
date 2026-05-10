@@ -5575,7 +5575,7 @@ def test_v825_chat_drawer_has_glassmorphism_styles():
     src = open(site).read()
     fn_idx = src.find('function buildChatOverlay')
     assert fn_idx > 0
-    block = src[fn_idx:fn_idx+5000]
+    block = src[fn_idx:fn_idx+10000]
     assert 'backdrop-filter:blur' in block, 'Drawer muss backdrop-filter haben'
     assert 'saturate' in block, 'Drawer muss saturate haben (Premium-Glass)'
     assert 'rgba(' in block, 'Drawer muss rgba-Hintergrund haben (translucent)'
@@ -6094,7 +6094,7 @@ def test_v827_send_uploads_attached_file():
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
     assert fn_idx > 0
-    block = src[fn_idx:fn_idx+5000]
+    block = src[fn_idx:fn_idx+10000]
     assert 'window._chatAttachedFile' in block
     assert '/upload-replacement' in block
 
@@ -6179,7 +6179,7 @@ def test_v828_BUG_glass_alpha_must_be_low_for_translucency():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('function buildChatOverlay')
-    block = src[fn_idx:fn_idx+5000]
+    block = src[fn_idx:fn_idx+10000]
     # glassBg ist mehrzeilig konkateniert — Block bis nächstem ; nehmen
     glass_idx = block.find('var glassBg')
     assert glass_idx > 0, 'glassBg-Variable nicht gefunden'
@@ -6419,6 +6419,155 @@ def test_v830_input_field_missing_shows_warning():
     block = src[fn_idx:fn_idx+600]
     assert 'if(!ta)' in block
     assert 'Eingabefeld nicht gefunden' in block
+
+
+# ── v8.33 Review-Bypass + Marker-Kontext + Disclaimer-Strict ──
+
+def test_v833_chat_endpoint_accepts_kind_field():
+    """Backend /api/chat accepts kind='review' in body."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_with_aerotax')
+    block = src[fn_idx:fn_idx+3000]
+    assert "body.get('kind')" in block, 'Backend muss kind-Field aus Body lesen'
+    assert "is_review_context" in block
+
+
+def test_v833_review_kind_bypasses_hard_cap():
+    """kind='review' überspringt HARD_CAP-Block."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_with_aerotax')
+    block = src[fn_idx:fn_idx+3000]
+    # Suche HARD_CAP-Check — muss is_review_context-Bedingung haben
+    cap_idx = block.find('user_msg_count >= HARD_CAP')
+    assert cap_idx > 0
+    pre = block[max(0, cap_idx-200):cap_idx]
+    assert 'is_review_context' in pre, 'HARD_CAP-Check muss is_review_context bypassen'
+
+
+def test_v833_review_kind_bypasses_ip_rate_limit():
+    """kind='review' überspringt IP-Rate-Limit."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_with_aerotax')
+    block = src[fn_idx:fn_idx+3000]
+    # IP-Rate-Limit muss in if(not is_review_context)-Branch sein
+    ip_idx = block.find("_qa_rate_check(ip, 'chat'")
+    assert ip_idx > 0
+    pre = block[max(0, ip_idx-300):ip_idx]
+    assert 'is_review_context' in pre, 'IP-Rate-Limit muss is_review_context bypassen'
+
+
+def test_v833_review_kind_short_messages_allowed():
+    """Kurze Messages (<3 chars) sind im Review-Kontext erlaubt (z.B. „08:30", „ja")."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_with_aerotax')
+    block = src[fn_idx:fn_idx+1500]
+    # len(message) < 3-Check muss is_review_context-Bedingung haben
+    short_idx = block.find('len(message) < 3')
+    assert short_idx > 0
+    pre = block[max(0, short_idx-200):short_idx]
+    assert 'is_review_context' in pre, 'Min-Length-Check muss Review-Kontext bypassen'
+
+
+def test_v833_marker_glossary_in_prompt():
+    """Sonnet-Prompt enthält Marker-Glossar (D4=Schulung, EM=Emergency...)."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_with_aerotax')
+    block = src[fn_idx:fn_idx+10000]
+    assert 'MARKER-GLOSSAR' in block, 'Prompt muss Marker-Glossar haben'
+    assert 'EM = Emergency' in block
+    assert 'D4 = Schulung' in block
+    assert 'SM = Seminar' in block
+    assert 'EH = Erste-Hilfe' in block
+    assert 'EK = Bürodienst' in block
+
+
+def test_v833_active_groups_block_in_prompt():
+    """Aktive Review-Groups werden im Prompt übergeben."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_with_aerotax')
+    block = src[fn_idx:fn_idx+10000]
+    assert 'AKTIVE OFFENE GRUPPEN' in block
+    assert '_build_review_groups' in block
+
+
+def test_v833_prompt_max_4_sentences_rule():
+    """Prompt-Regel: MAX 4 Sätze (vorher 100 Wörter, zu lange erfahrungsgemäß)."""
+    import app as _app
+    src = open(_app.__file__).read()
+    assert 'MAX 4 Sätze' in src or 'max 4 sätze' in src.lower()
+
+
+def test_v833_prompt_forbids_netto_colon_prefix():
+    """Prompt verbietet „Netto:" mit Doppelpunkt vor einem Betrag."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_with_aerotax')
+    block = src[fn_idx:fn_idx+10000]
+    assert 'Netto:' in block, 'Prompt-Regel muss "Netto:" mit Doppelpunkt verbieten'
+
+
+def test_v833_prompt_disclaimer_only_for_tax_statements():
+    """Disclaimer NUR bei steuerlichen Aussagen, NICHT bei Bedienfragen."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_with_aerotax')
+    block = src[fn_idx:fn_idx+10000]
+    assert 'NIEMALS in derselben Konversation erneut' in block, \
+        'Prompt muss verbieten, Disclaimer mehrfach zu zeigen'
+
+
+def test_v833_chat_history_marks_review_messages():
+    """chat_history speichert is_review-Flag, Counter zählt nur freie Fragen."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_with_aerotax')
+    block = src[fn_idx:fn_idx+10000]
+    assert "'is_review': is_review_context" in block, \
+        'chat_history muss is_review-Flag pro Nachricht speichern'
+    # Counter-Filter
+    assert "not m.get('is_review')" in block, \
+        'Counter darf nur Nicht-Review-Messages zählen'
+
+
+def test_v833_frontend_chat_send_passes_kind():
+    """Frontend _chatSend übergibt kind='review' wenn _chatReviewMode=true."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatSend = async function')
+    block = src[fn_idx:fn_idx+10000]
+    assert 'isReviewCtx' in block
+    assert "kind: isReviewCtx ? 'review' : 'free'" in block, \
+        'Frontend muss kind-Feld an /api/chat senden'
+
+
+def test_v833_frontend_short_msgs_allowed_in_review():
+    """Frontend zeigt KEIN „Magst du ausführlicher" mehr im Review-Kontext."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatSend = async function')
+    block = src[fn_idx:fn_idx+10000]
+    # Block muss isReviewCtx vor Length-Check haben
+    short_idx = block.find('Magst du das etwas ausführlicher fragen?')
+    assert short_idx > 0
+    pre = block[max(0, short_idx-300):short_idx]
+    assert '!isReviewCtx' in pre or 'isReviewCtx' in pre, \
+        'Frontend muss „Magst du ausführlicher" nur außerhalb Review-Kontext zeigen'
+
+
+def test_v833_blocked_message_says_review_continues():
+    """Wenn Free-Limit erreicht, Backend sagt klar: Review geht weiter."""
+    import app as _app
+    src = open(_app.__file__).read()
+    assert 'Review-Antworten und PDF-Erstellung gehen weiter' in src \
+       or 'Review-Antworten gehen weiter' in src
 
 
 if __name__ == '__main__':

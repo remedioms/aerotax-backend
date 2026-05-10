@@ -2679,13 +2679,18 @@ def _is_off_topic_question(message):
 
 @app.route('/api/chat', methods=['POST'])
 def chat_with_aerotax():
-    """Chat mit AeroTAX über deine Auswertung. Body: {token, message}."""
+    """Chat mit AeroTAX über deine Auswertung. Body: {token, message, kind?}."""
     body = request.get_json(silent=True) or {}
     token = body.get('token', '').strip()
     message = (body.get('message') or '').strip()[:2000]
+    # v8.33: kind='review' → User ist im Review-Flow → keine Rate-Limits
+    kind = (body.get('kind') or 'free').strip().lower()
+    is_review_context = (kind == 'review')
+
     if not token or not message:
         return jsonify({'error': 'token und message erforderlich'}), 400
-    if len(message) < 3:
+    # v8.33: kurze Antworten (z.B. „08:30", „?", „ja") sind im Review-Kontext valide
+    if not is_review_context and len(message) < 3:
         return jsonify({'error': 'Frage zu kurz'}), 400
 
     # v8.22 Rest-4: Server-Pre-Filter — Off-Topic ohne LLM-Call ablehnen
@@ -2703,20 +2708,21 @@ def chat_with_aerotax():
         return jsonify({'error': 'Session-Token ungültig oder abgelaufen — bitte neu auswerten'}), 401
 
     # ── COST-CONTROL: Hard-Caps pro Session ──────────────────
-    # v8.25: 50 freie Fragen total in 24h. Review-Antworten zählen NICHT (separater Endpoint).
-    # Off-Topic zählt nicht (return BEFORE session load).
+    # v8.33: Review-Kontext bypassed Caps & IP-Rate-Limit komplett
     chat_history_existing = session.get('chat_history', [])
-    user_msg_count = sum(1 for m in chat_history_existing if m.get('role') == 'user')
+    user_msg_count = sum(1 for m in chat_history_existing if m.get('role') == 'user' and not m.get('is_review'))
     HARD_CAP = 50
-    if user_msg_count >= HARD_CAP:
+    if not is_review_context and user_msg_count >= HARD_CAP:
         return jsonify({
-            'error': f'Maximum {HARD_CAP} Chat-Nachrichten pro Session erreicht. Du kannst weiterhin deine Auswertung als PDF runterladen und im Forum Fragen stellen.'
+            'error': f'Maximum {HARD_CAP} freie Chat-Nachrichten pro Session erreicht. Review-Antworten und PDF-Erstellung gehen weiter.'
         }), 429
 
-    # IP-Rate-Limit: 8 Chat-Messages/h (verhindert Brute-Force)
-    ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
-    if not _qa_rate_check(ip, 'chat', max_per_hour=8):
-        return jsonify({'error': 'Zu viele Nachrichten — bitte warte 5-10 Minuten'}), 429
+    # IP-Rate-Limit: 30 Chat-Messages/h für freie Fragen (vorher 8 — zu strikt)
+    # Review-Antworten bypassed komplett.
+    if not is_review_context:
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
+        if not _qa_rate_check(ip, 'chat', max_per_hour=30):
+            return jsonify({'error': 'Zu viele freie Fragen — bitte ein paar Minuten warten. Review-Antworten gehen weiter.'}), 429
 
     if not ANTHROPIC_KEY:
         return jsonify({'error': 'KI nicht verfügbar'}), 503
@@ -2751,6 +2757,30 @@ def chat_with_aerotax():
         for m in chat_history[-10:]
     )
 
+    # v8.33: Marker-Glossar + aktive Review-Gruppen — damit Sonnet nicht „Was bedeutet em?" fragt
+    marker_glossary = (
+        '- D4 = Schulung (z.B. Crew-Training, Recurrent)\n'
+        '- EK = Bürodienst (z.B. ground duty, office)\n'
+        '- SM = Seminar (mehrtägig)\n'
+        '- EH = Erste-Hilfe-Schulung\n'
+        '- EM = Emergency-Training\n'
+        '- SIM = Simulator-Session\n'
+        'Wenn der User „em", „eh", „d4" usw. schreibt, beziehe es auf diese Marker — frag NICHT nach.'
+    )
+    active_groups_block = ''
+    try:
+        review_items = result_data.get('_review_items') or []
+        groups = _build_review_groups(review_items) if review_items else []
+        if groups:
+            lines = []
+            for g in groups:
+                lines.append(f"  - {g.get('group_id','?')}: {g.get('date_range','?')} "
+                             f"— {g.get('label','?')} ({g.get('count',0)} Tage, "
+                             f"Marker: {g.get('marker_summary','?')})")
+            active_groups_block = '\n'.join(lines)
+    except Exception:
+        active_groups_block = ''
+
     prompt = f"""Du bist AeroTAX, der Werbungskosten-Auswertungs-Assistent von aerosteuer.de.
 AeroTAX ist eine Berechnungs- und Dokumentationshilfe — KEINE Steuerberatung.
 
@@ -2784,6 +2814,12 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
 ═══ NUTZER-AUSWERTUNG (Steuerjahr {result_data.get('year','?')}) ═══
 {chr(10).join(summary_lines)}
 
+═══ MARKER-GLOSSAR (Lufthansa Crew-Marker) ═══
+{marker_glossary}
+
+═══ AKTIVE OFFENE GRUPPEN (für Review-Kontext) ═══
+{active_groups_block or '(keine offenen Gruppen)'}
+
 ═══ HINWEISE AUS DER AUSWERTUNG ═══
 {notes_block}
 
@@ -2793,21 +2829,20 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
 ═══ NEUE FRAGE ═══
 {message}
 
-═══ ANTWORT-REGELN (STRENG) ═══
-- Max 100 Wörter, präzise.
-- ABSOLUT VERBOTEN: Markdown-Tabellen (also keine "| Spalte | …"-Strukturen, keine "---"-Trennlinien).
-- ABSOLUT VERBOTEN: Berechnungstabelle, Aufzählung der einzelnen Posten ("27 km × 59 Tage = …").
-  Wenn der User eine Berechnung sehen will, verweise auf "Berechnung im Detail" und das PDF — KEINE Re-Auflistung.
-- ABSOLUT VERBOTEN: Trennlinien (---, ===), Emoji-Bullet-Listen am Anfang ("✅", "📋"), Pseudo-Headlines mit ** **.
-- Antworte als Fließtext mit MAX 1 kurzer Bullet-Liste (max 4 Bullets) wenn nötig.
-- Bei On-Topic: konkret bezogen auf SEINE Werte (kurze Aussagen).
-- Bei Off-Topic: 1-Satz-Ablehnung mit Verweis auf Steuerberater/Lohnsteuerhilfeverein.
-- Nutze §9 EStG nur wenn nötig zur Begründung — keine FTL/EASA Erklärungen.
-- Wenn WISO-Frage: KURZ den Pfad nennen (Ausgaben → Werbungskosten → Reisekosten →
-  Zusammengefasste Auswärtstätigkeiten). KEIN Versprechen wie "Netto in WISO eintragen".
-- Verbotene Wörter: "garantiert", "Mehr absetzen", "Steuerersparnis", "AeroTAX kennt deine Zahlen".
-- Disclaimer NUR wenn deine Antwort konkrete steuerliche Aussage trifft (Beträge interpretieren, "absetzbar", §9 zitieren).
-  Bei reinen Bedienfragen ("wo finde ich…", "wie öffnet man…", "warum fehlt mir…") KEIN Disclaimer.
+═══ ANTWORT-REGELN (STRENG, ZWINGEND) ═══
+- MAX 4 Sätze. Kurz, freundlich, direkt.
+- ABSOLUT VERBOTEN: Markdown-Tabellen (kein "| Spalte | ...", keine "---" Trennlinien)
+- ABSOLUT VERBOTEN: Berechnungstabellen, Posten-Aufzählung ("27 km × 59 Tage = ...")
+- ABSOLUT VERBOTEN: Pseudo-Headlines mit ** **, Trennlinien (---, ===), Emoji-Bullet-Headers ("✅", "📋", "**📋")
+- ABSOLUT VERBOTEN das Wort "Netto:" mit Doppelpunkt direkt vor einem Betrag.
+  Verwende "Einzutragender Gesamtbetrag" oder "vorläufiger Betrag".
+- ABSOLUT VERBOTEN: "Netto in WISO", "einfach eintragen", "AeroTAX kennt deine Zahlen", "garantiert", "Mehr absetzen", "Steuerersparnis"
+- ABSOLUT VERBOTEN: bei "wo finde ich..."-Fragen lange Erklärungen zu Hotelnächten/Reinigungstagen/Berechnung — User fragt nur nach EINEM Punkt
+- Wenn der User „em", „eh", „d4", „ek", „sm" schreibt: NUTZE das MARKER-GLOSSAR oben. NICHT zurückfragen.
+- Bei WISO-Frage: 1-Satz-Pfad (Ausgaben → Werbungskosten → Reisekosten → Zusammengefasste Auswärtstätigkeiten). Fertig.
+- Disclaimer NUR wenn deine Antwort eine konkrete steuerliche Aussage trifft („§9", „absetzbar", Werteinterpretation).
+  Bei Bedienfragen, „wo finde ich...", „wie übergebe ich...", „was bedeutet der Marker..." → KEIN Disclaimer.
+- Wenn der vorherige Bot-Turn schon einen Disclaimer hatte, NIEMALS in derselben Konversation erneut.
 
 ═══ PFLICHT-DISCLAIMER bei steuerlichen Antworten (am Ende, neue Zeile) ═══
 ℹ Hinweis: AeroTAX ist eine Berechnungs- und Dokumentationshilfe und ersetzt keine individuelle steuerliche Beratung."""
@@ -2819,19 +2854,29 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
                                    max_retries=2, label='Chat-AeroTAX')
         answer = resp.content[0].text.strip()
 
-        # Chat-Verlauf updaten + speichern
-        chat_history.append({'role': 'user', 'content': message, 'ts': datetime.utcnow().isoformat() + 'Z'})
-        chat_history.append({'role': 'assistant', 'content': answer, 'ts': datetime.utcnow().isoformat() + 'Z'})
-        session['chat_history'] = chat_history[-50:]  # max 50 Nachrichten
+        # Chat-Verlauf updaten + speichern (v8.33: is_review-Flag mitschreiben)
+        chat_history.append({
+            'role': 'user', 'content': message,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+            'is_review': is_review_context,
+        })
+        chat_history.append({
+            'role': 'assistant', 'content': answer,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+            'is_review': is_review_context,
+        })
+        session['chat_history'] = chat_history[-100:]  # max 100 Nachrichten (Review erhöht Volumen)
         _save_session(token, session)
 
-        new_user_count = sum(1 for m in chat_history if m.get('role') == 'user')
+        # Counter zählt nur freie Fragen (is_review=False)
+        new_user_count = sum(1 for m in chat_history if m.get('role') == 'user' and not m.get('is_review'))
         remaining = max(0, HARD_CAP - new_user_count)
         return jsonify({
             'answer': answer,
             'remaining': remaining,
             'used': new_user_count,
             'cap': HARD_CAP,
+            'is_review': is_review_context,
         })
     except Exception as e:
         print(f"[chat] failed: {e}")
