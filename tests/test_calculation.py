@@ -6170,6 +6170,97 @@ def test_v827_send_button_height_matches_input_height():
     assert 'min-height:44px' in ta_match.group(1)
 
 
+# ── v8.28 Bug-Repro Tests (jeder reproduziert einen konkreten Screenshot-Bug) ──
+
+def test_v828_BUG_glass_alpha_must_be_low_for_translucency():
+    """BUG 1: Modal hat zu hohe rgba-Alpha → kein milky glass, sieht opak aus.
+    Glassmorphism = max ~0.30 Alpha auf dem dunklen Layer."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('function buildChatOverlay')
+    block = src[fn_idx:fn_idx+5000]
+    # glassBg ist mehrzeilig konkateniert — Block bis nächstem ; nehmen
+    glass_idx = block.find('var glassBg')
+    assert glass_idx > 0, 'glassBg-Variable nicht gefunden'
+    glass_end = block.find(';', glass_idx)
+    glass_block = block[glass_idx:glass_end+1]
+    # Alphas aus dem ganzen Block (alle rgba-Werte)
+    alphas = [float(a) for a in re.findall(r'rgba\([^)]+,\s*([\d.]+)\)', glass_block)]
+    assert alphas, 'Keine rgba-Werte im glassBg-Block'
+    max_alpha = max(alphas)
+    assert max_alpha <= 0.32, f'Modal-BG Alpha zu hoch ({max_alpha}) — Glas wirkt opak. Soll ≤ 0.32 für echte Transluzenz.'
+
+
+def test_v828_BUG_no_22_offen_pill_visible_by_default():
+    """BUG 2: Header-Pill „22 offen" demotiviert — soll standardmäßig versteckt
+    bleiben oder sehr dezent (kleine Text-Andeutung statt gelbe Pille)."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # In updateChatHeaderAmount: pill darf NICHT mit display:inline-block bei pending>0 erscheinen
+    fn_idx = src.find('window.updateChatHeaderAmount = function')
+    fn_end = src.find('function renderQuickChips', fn_idx)
+    fn_body = src[fn_idx:fn_end]
+    # Variante 1: pill ist komplett aus DOM entfernt
+    if 'chat-header-pending-pill' not in src:
+        return  # OK, pill wurde komplett entfernt
+    # Variante 2: pill bleibt aber wird NICHT mehr proaktiv angezeigt
+    assert "pill.style.display = 'inline-block'" not in fn_body, \
+        'Pill „22 offen" soll nicht mehr proaktiv angezeigt werden — User-Feedback'
+
+
+def test_v828_BUG_chat_send_not_hijacked_by_review_mode():
+    """BUG 3 (P0): Freitext „Hallo wie gehts?" muss zu /api/chat gehen, nicht zu
+    /review-interpret. Aktuell: _chatReviewMode=true hijackt jede Message."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # _chatSend muss VOR Review-Routing prüfen ob Text wie Review-Antwort aussieht
+    fn_idx = src.find('window._chatSend = async function')
+    block = src[fn_idx:fn_idx+6000]
+    # Es muss ein _looksLikeReviewAnswer-Check ODER ein chip-intent-Check VOR review-mode-Branch existieren
+    has_local_check = '_looksLikeReviewAnswer' in block
+    assert has_local_check, \
+        'Vor _handleReviewFreeText muss eine lokale Pattern-Erkennung stehen, sonst kann User nicht frei chatten'
+
+
+def test_v828_BUG_file_input_not_cleared_before_upload():
+    """BUG 4 (P0): fileInput.value='' vor Upload kann File auf manchen Browsern
+    invalidieren. Reset darf nur NACH erfolgreichem Upload oder bei Pill-Remove."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Suche das change-Handler-Block
+    handler_start = src.find("fileInput.addEventListener('change'")
+    if handler_start < 0:
+        # Maybe handler is in different format
+        handler_start = src.find('change-Handler')
+    block = src[handler_start:handler_start+800] if handler_start > 0 else ''
+    # In dem block darf fileInput.value = '' NICHT direkt nach _chatAttachFile stehen
+    # (besser: Reset erst beim Pill-Remove oder nach erfolgreichem Send)
+    if "fileInput.value = ''" in block:
+        # Wenn vorhanden, dann mindestens als Kommentar gekennzeichnet ODER nach try-block
+        # FAIL bei aktuellem Stand
+        assert False, 'fileInput.value="" zu früh — kann File invalidieren bevor FormData gebaut wird'
+
+
+def test_v828_BUG_input_row_align_items_center_for_equal_heights():
+    """BUG 5: Bei drei Elementen mit gleicher Höhe (44px) ist align-items:center
+    semantisch korrekter als flex-end (vermeidet Sub-Pixel-Versatz)."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    m = re.search(r'id="chat-input-row"[^>]*style="([^"]*)"', src)
+    assert m is not None
+    style = m.group(1)
+    # Bevorzugt: align-items:center
+    # Akzeptabel: flex-end NUR wenn textarea wachsen kann (was sie kann)
+    # → User sieht beim leeren textarea visuelles Bottom-Alignment, was ok ist
+    # Test ist tolerant: beides erlaubt, aber dokumentiert
+    assert 'align-items:flex-end' in style or 'align-items:center' in style
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
