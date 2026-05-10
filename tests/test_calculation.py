@@ -5129,6 +5129,166 @@ def test_v822_bulk_apply_yes_to_all_pending():
         assert ds.get('_user_review_source') == 'user_bulk_review_chatbot'
 
 
+# ── v8.22 Rest-1 Short-Code-Tests ──
+
+def test_v822_short_code_format():
+    """ATX-XXXXX Format mit safe-alphabet (kein 0/O/1/I/L)."""
+    from app import _make_short_code
+    code = _make_short_code('AT-AABBCCDDEEFF1122')
+    assert code.startswith('ATX-')
+    assert len(code) == 9
+    suffix = code[4:]
+    forbidden = set('01OIL')
+    for ch in suffix:
+        assert ch not in forbidden, f"Verbotenes Zeichen '{ch}' im Short-Code: {code}"
+
+
+def test_v822_short_code_deterministic():
+    """Gleicher Token → gleicher Short-Code (für Recovery)."""
+    from app import _make_short_code
+    tok = 'AT-DEADBEEF12345678'
+    assert _make_short_code(tok) == _make_short_code(tok)
+
+
+def test_v822_short_code_different_tokens_different_codes():
+    """Verschiedene Tokens → verschiedene Codes (Kollisions-Wahrscheinlichkeit minimal)."""
+    from app import _make_short_code
+    codes = set(_make_short_code(f'AT-{i:016X}') for i in range(50))
+    assert len(codes) >= 45, f"Zu viele Kollisionen in 50 Codes: {len(codes)} unique"
+
+
+# ── v8.22 Rest-4 Off-Topic-Filter-Tests ──
+
+def test_v822_off_topic_britney_blocked():
+    from app import _is_off_topic_question
+    assert _is_off_topic_question('Wie heißt Britney Spears?') is True
+
+
+def test_v822_off_topic_hauptstadt_blocked():
+    from app import _is_off_topic_question
+    assert _is_off_topic_question('Was ist die Hauptstadt von Frankreich?') is True
+
+
+def test_v822_off_topic_politics_blocked():
+    from app import _is_off_topic_question
+    assert _is_off_topic_question('Welche Partei sollte ich wählen?') is True
+
+
+def test_v822_off_topic_investment_blocked():
+    from app import _is_off_topic_question
+    assert _is_off_topic_question('In welche Aktien investieren?') is True
+
+
+def test_v822_on_topic_wiso_allowed():
+    from app import _is_off_topic_question
+    assert _is_off_topic_question('Wo trage ich den Betrag in WISO ein?') is False
+
+
+def test_v822_on_topic_streckeneinsatz_allowed():
+    from app import _is_off_topic_question
+    assert _is_off_topic_question('Was ist die Streckeneinsatzabrechnung?') is False
+
+
+def test_v822_on_topic_pdf_allowed():
+    from app import _is_off_topic_question
+    assert _is_off_topic_question('Warum kann ich das PDF noch nicht erstellen?') is False
+
+
+def test_v822_on_topic_z77_allowed():
+    """Z77-Frage hat 'spesen' → erlaubt."""
+    from app import _is_off_topic_question
+    assert _is_off_topic_question('Was bedeutet Z77 bei meinen Spesen?') is False
+
+
+# ── v8.22 Rest-5 Marker-Lexikon-Tests ──
+
+def test_v822_marker_lexicon_first_record_pending():
+    """Neuer Marker wird als pending_review aufgenommen."""
+    import os, tempfile
+    from app import _record_marker_learning, _MARKER_LEXICON_PATH
+    # Backup existing lexicon
+    backup = None
+    if os.path.exists(_MARKER_LEXICON_PATH):
+        with open(_MARKER_LEXICON_PATH) as f:
+            backup = f.read()
+        os.remove(_MARKER_LEXICON_PATH)
+    try:
+        result = _record_marker_learning(
+            airline='LH', doc_type='flugstundenuebersicht',
+            first_token='SIM', meaning='Simulator-Schulung',
+            activity_type='training', job_id='test1',
+            datum='2025-09-12', raw_marker='SIM SIMULATOR',
+        )
+        assert result is not None
+        assert result['status'] == 'pending_review'
+        assert result['confirmed_count'] == 1
+    finally:
+        if os.path.exists(_MARKER_LEXICON_PATH):
+            os.remove(_MARKER_LEXICON_PATH)
+        if backup:
+            with open(_MARKER_LEXICON_PATH, 'w') as f:
+                f.write(backup)
+
+
+def test_v822_marker_lexicon_three_confirmations_approve():
+    """3 konsistente Bestätigungen → status=approved."""
+    import os
+    from app import _record_marker_learning, _MARKER_LEXICON_PATH
+    backup = None
+    if os.path.exists(_MARKER_LEXICON_PATH):
+        with open(_MARKER_LEXICON_PATH) as f:
+            backup = f.read()
+        os.remove(_MARKER_LEXICON_PATH)
+    try:
+        for i in range(3):
+            r = _record_marker_learning(
+                airline='LH', doc_type='flugstundenuebersicht',
+                first_token='SIM', meaning='Simulator-Schulung',
+                activity_type='training', job_id=f'test{i}',
+                datum=f'2025-09-{12+i:02d}', raw_marker='SIM SIMULATOR',
+            )
+        assert r['status'] == 'approved'
+        assert r['confirmed_count'] == 3
+    finally:
+        if os.path.exists(_MARKER_LEXICON_PATH):
+            os.remove(_MARKER_LEXICON_PATH)
+        if backup:
+            with open(_MARKER_LEXICON_PATH, 'w') as f:
+                f.write(backup)
+
+
+def test_v822_marker_lexicon_conflict_marks_status():
+    """Widersprüchliche Erklärungen → status=conflict."""
+    import os
+    from app import _record_marker_learning, _MARKER_LEXICON_PATH
+    backup = None
+    if os.path.exists(_MARKER_LEXICON_PATH):
+        with open(_MARKER_LEXICON_PATH) as f:
+            backup = f.read()
+        os.remove(_MARKER_LEXICON_PATH)
+    try:
+        _record_marker_learning(
+            airline='LH', doc_type='flugstundenuebersicht',
+            first_token='XTR', meaning='Extratraining',
+            activity_type='training', job_id='t1',
+            datum='2025-01-01', raw_marker='XTR EXTRA',
+        )
+        r = _record_marker_learning(
+            airline='LH', doc_type='flugstundenuebersicht',
+            first_token='XTR', meaning='Sondereinsatz',
+            activity_type='tour', job_id='t2',
+            datum='2025-01-02', raw_marker='XTR SONDER',
+        )
+        assert r['status'] == 'conflict'
+        assert r['conflicting_count'] >= 1
+    finally:
+        if os.path.exists(_MARKER_LEXICON_PATH):
+            os.remove(_MARKER_LEXICON_PATH)
+        if backup:
+            with open(_MARKER_LEXICON_PATH, 'w') as f:
+                f.write(backup)
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

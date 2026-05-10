@@ -1302,12 +1302,16 @@ def _run_process_async(job_id, form, files):
         # Session-Token wurde bereits beim job_created erstellt — jetzt nur Result reinpacken
         with _jobs_lock:
             session_token = _jobs[job_id].get('session_token')
+        # v8.22 Rest-1: kurzer ATX-Code zusätzlich zum Token
+        short_code = _make_short_code(session_token) if session_token else ''
+        safe['short_code'] = short_code
         if session_token:
             _save_session(session_token, {
                 'job_id': job_id,
                 'result_data': safe,
                 'notes': result.get('notes', []),
                 'download_url': f'/api/download/{token}',
+                'short_code': short_code,
                 'chat_history': [],
             })
             # Verknüpfung dl_token → session_token, damit Download den Token consumen kann
@@ -1775,6 +1779,65 @@ def post_review_bulk_answer(job_id):
     })
 
 
+@app.route('/api/job/<job_id>/marker-answer', methods=['POST'])
+def post_marker_answer(job_id):
+    """v8.22 Rest-5: Nutzer erklärt eine unbekannte Kennung.
+
+    Body: {first_token, meaning, activity_type, datum, raw_marker, airline?, doc_type?}
+    Speichert User-Antwort als learning_candidate; bei 3+ konsistenten
+    Bestätigungen → status=approved (automatisch nutzbar bei nächsten Jobs).
+    """
+    body = request.get_json(silent=True) or {}
+    first_token = (body.get('first_token') or '').strip().upper()
+    meaning = (body.get('meaning') or '').strip()
+    activity_type = (body.get('activity_type') or '').strip().lower()
+    datum = (body.get('datum') or '').strip()
+    raw_marker = (body.get('raw_marker') or '').strip()
+    airline = (body.get('airline') or 'LH').strip().upper()
+    doc_type = (body.get('doc_type') or 'flugstundenuebersicht').strip().lower()
+
+    if not first_token or not meaning:
+        return jsonify({'error': 'first_token und meaning erforderlich'}), 400
+    if activity_type not in ('flight', 'training', 'sim', 'office', 'standby',
+                              'free', 'other', '', 'tour', 'same_day', 'unknown'):
+        return jsonify({'error': f'unbekannter activity_type: {activity_type}'}), 400
+
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'job not found'}), 404
+
+    result = _record_marker_learning(
+        airline=airline, doc_type=doc_type,
+        first_token=first_token, meaning=meaning,
+        activity_type=activity_type, job_id=job_id,
+        datum=datum, raw_marker=raw_marker,
+    )
+
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if j and 'audit' in j and isinstance(j['audit'], list):
+            j['audit'].append({
+                'event': 'marker_answer',
+                'data': {'first_token': first_token, 'meaning': meaning,
+                         'activity_type': activity_type, 'datum': datum,
+                         'lexicon_status': result.get('status') if result else 'unknown'},
+                'timestamp': datetime.now().isoformat(),
+            })
+            try:
+                _save_job_to_disk(job_id)
+            except Exception:
+                pass
+
+    return jsonify({
+        'first_token': first_token,
+        'meaning': meaning,
+        'activity_type': activity_type,
+        'lexicon_status': result.get('status') if result else 'unknown',
+        'confirmed_count': result.get('confirmed_count', 0) if result else 0,
+    })
+
+
 @app.route('/api/job/<job_id>/upload-replacement', methods=['POST'])
 def post_upload_replacement(job_id):
     """v8.22 Now-5 (Stub): Endpoint für Document-Replacement im Chat.
@@ -2069,6 +2132,111 @@ def _make_session_token(job_id):
     return 'AT-' + _hashlib.sha256(raw.encode()).hexdigest()[:16].upper()
 
 
+_MARKER_LEXICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'marker_lexicon.json')
+
+
+def _load_marker_lexicon():
+    """v8.22 Rest-5: Lädt das persistente Marker-Lexikon (file-based).
+
+    Format: {<airline>: {<doc_type>: {<first_token>: {meaning, activity_type,
+    confirmed_count, conflicting_count, status, examples}}}}.
+    """
+    try:
+        if os.path.isfile(_MARKER_LEXICON_PATH):
+            with open(_MARKER_LEXICON_PATH, 'r') as f:
+                return json.load(f) or {}
+    except Exception as e:
+        print(f'[marker_lexicon] load fail: {e}')
+    return {}
+
+
+def _save_marker_lexicon(lex):
+    try:
+        with open(_MARKER_LEXICON_PATH, 'w') as f:
+            json.dump(lex, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f'[marker_lexicon] save fail: {e}')
+        return False
+
+
+def _record_marker_learning(airline, doc_type, first_token, meaning, activity_type,
+                              job_id, datum, raw_marker):
+    """v8.22 Rest-5: Speichert User-Antwort als learning_candidate. Bei
+    wiederholter Bestätigung mit gleicher meaning → status=approved. Bei
+    Konflikt (andere Erklärung) → status=conflict.
+
+    Returns dict mit aktuellem Status für Audit.
+    """
+    if not first_token or not meaning:
+        return None
+    lex = _load_marker_lexicon()
+    airline = (airline or 'LH').upper()
+    doc_type = (doc_type or 'flugstundenuebersicht').lower()
+    first_token = first_token.upper().strip()
+    meaning = meaning.strip()[:80]
+    activity_type = (activity_type or '').lower().strip()
+
+    by_airline = lex.setdefault(airline, {})
+    by_doc = by_airline.setdefault(doc_type, {})
+    entry = by_doc.get(first_token)
+    if entry is None:
+        entry = {
+            'meaning':           meaning,
+            'activity_type':     activity_type,
+            'confirmed_count':   1,
+            'conflicting_count': 0,
+            'status':            'pending_review',
+            'first_seen_job_id': job_id,
+            'examples':          [],
+            'created_at':        datetime.utcnow().isoformat() + 'Z',
+        }
+        by_doc[first_token] = entry
+    else:
+        # Vergleich der bestehenden meaning vs neuer
+        if entry.get('meaning', '').lower() == meaning.lower() \
+                and entry.get('activity_type', '') == activity_type:
+            entry['confirmed_count'] = int(entry.get('confirmed_count', 0) or 0) + 1
+            # Auto-Approve bei 3+ konsistenten Bestätigungen
+            if entry['confirmed_count'] >= 3 and entry.get('status') != 'approved':
+                entry['status'] = 'approved'
+                entry['approved_at'] = datetime.utcnow().isoformat() + 'Z'
+        else:
+            entry['conflicting_count'] = int(entry.get('conflicting_count', 0) or 0) + 1
+            entry['status'] = 'conflict'
+
+    examples = entry.setdefault('examples', [])
+    examples.append({
+        'job_id':       job_id, 'datum': datum,
+        'raw_marker':   raw_marker, 'user_meaning': meaning,
+        'user_activity_type': activity_type,
+        'recorded_at':  datetime.utcnow().isoformat() + 'Z',
+    })
+    # Cap auf 20 Beispiele pro Eintrag
+    if len(examples) > 20:
+        entry['examples'] = examples[-20:]
+
+    _save_marker_lexicon(lex)
+    return {
+        'first_token': first_token, 'status': entry['status'],
+        'confirmed_count': entry['confirmed_count'],
+        'conflicting_count': entry['conflicting_count'],
+    }
+
+
+def _make_short_code(token):
+    """v8.22 Rest-1: kurzer ATX-XXXXX-Code (5 Zeichen ohne 0/O/1/I/L) abgeleitet
+    aus Session-Token. Für User-Anzeige + Recovery via Code-Input.
+    Kollisionsfrei pro Session weil deterministische Ableitung aus Token."""
+    import hashlib as _hl
+    alphabet = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'  # ohne 0,O,1,I,L
+    h = _hl.sha256(token.encode()).digest()
+    code = ''
+    for i in range(5):
+        code += alphabet[h[i] % len(alphabet)]
+    return f'ATX-{code}'
+
+
 def _save_session(token, data):
     """Speichert Session-Daten in Supabase (persistent) ODER Disk-Fallback."""
     expires = datetime.utcnow() + timedelta(hours=SESSION_HOURS)
@@ -2193,6 +2361,51 @@ def _load_session(token):
     except: return None
 
 
+@app.route('/api/session-by-code/<code>', methods=['GET'])
+def session_by_short_code(code):
+    """v8.22 Rest-1: Recovery via kurzem ATX-Code. Sucht alle aktiven Sessions
+    deren _make_short_code(token) == code matched. Rate-limited per IP.
+    """
+    code = (code or '').strip().upper()
+    if not code or not code.startswith('ATX-') or len(code) != 9:
+        return jsonify({'error': 'Code muss Format ATX-XXXXX haben'}), 400
+    # Rate-Limit pro IP (Brute-Force-Schutz)
+    ip = (request.remote_addr or 'unknown')
+    if not _qa_rate_check(ip, 'short-code', max_per_hour=20):
+        return jsonify({'error': 'Zu viele Versuche — bitte später erneut.'}), 429
+
+    # Iteriere über aktive sessions im store + supabase
+    matched_token = None
+    if SB_AVAILABLE:
+        try:
+            res = sb.table('sessions').select('token').execute()
+            for row in (res.data or []):
+                tok = row.get('token', '')
+                if tok and _make_short_code(tok) == code:
+                    matched_token = tok
+                    break
+        except Exception:
+            pass
+    if not matched_token:
+        # Fallback: Disk-basierte Sessions durchsuchen
+        try:
+            import os as _o
+            sessions_dir = _SESSION_DIR
+            if _o.path.isdir(sessions_dir):
+                for fn in _o.listdir(sessions_dir):
+                    if not fn.endswith('.json'):
+                        continue
+                    tok = fn[:-5]
+                    if _make_short_code(tok) == code:
+                        matched_token = tok
+                        break
+        except Exception:
+            pass
+    if not matched_token:
+        return jsonify({'error': 'Code unbekannt oder abgelaufen'}), 404
+    return jsonify({'token': matched_token, 'short_code': code})
+
+
 @app.route('/api/session/<token>', methods=['GET'])
 def session_recall(token):
     """Holt Auswertungs-Ergebnis via Session-Token."""
@@ -2202,6 +2415,62 @@ def session_recall(token):
     # Sensitiver Chat-Verlauf nicht standardmäßig zurückgeben
     safe = {k: v for k, v in s.items() if k != 'chat_history'}
     return jsonify(safe)
+
+
+_OFF_TOPIC_PATTERNS = [
+    # Promis / Personen
+    r'\b(britney|spears|trump|biden|merkel|musk|bezos|messi|ronaldo|swift|beyon)',
+    r'\bwer ist\b', r'\bwie heisst\b', r'\bwie heißt\b',
+    # Geographie / Allgemeinwissen
+    r'\bhauptstadt\b', r'\bbevölkerung\b', r'\beinwohner\b', r'\bgrößte stadt\b',
+    # Politik
+    r'\b(politik|wahl|partei|kanzler|präsident|bundestag|grüne|spd|cdu|csu|fdp|afd|linke)\b',
+    # Promis allgemein
+    r'\b(prominen|promi|stars?|filmstar|popstar|sänger|schauspieler)\b',
+    # Investments
+    r'\b(aktien?|krypto|bitcoin|ethereum|investiere|investment|vermögen|reich werden|geld anlegen)\b',
+    # Beziehungen / Lebensberatung
+    r'\b(beziehung|freundin|freund|liebe|trennung|ehe|scheidung)\b',
+    r'\b(was soll ich|wie werde ich|sollte ich)\b.{0,40}\b(machen|tun|werden|kaufen|kaufen)\b',
+    # Programmierung / Tech
+    r'\b(python|javascript|html|css|programmier|code\b|debug)\b',
+    # Reise/Urlaub allgemein (NICHT dienstlich)
+    r'\bbest(es)?\s+(restaurant|hotel|reise(ziel)?|urlaubsziel|sehenswürdigkeit)\b',
+    # Medizin / Gesundheit Allgemein
+    r'\b(krankheit|symptom|medikament|arzt empfehlen|diagnose)\b',
+    # Generelle Wissensfragen
+    r'\bwas ist (der|die|das)\s+(unterschied|sinn|grund)\b.{0,30}',
+]
+
+
+def _is_off_topic_question(message):
+    """v8.22 Rest-4: Hard-Server-Pre-Filter für Off-Topic-Fragen.
+    Greift VOR dem LLM-Call → kostenfrei + deterministisch.
+    Returns True wenn die Frage offensichtlich off-topic ist.
+    """
+    import re as _re
+    msg = (message or '').lower()
+    # Erlaubte Crew/Steuer-Whitelist überschreibt Off-Topic-Match
+    allowed_keywords = (
+        'aerotax', 'wiso', 'auswertung', 'pdf', 'beleg', 'streckeneinsatz',
+        'flugstunden', 'lohnsteuer', 'spesen', 'pauschale', 'fahrtkost',
+        'reinigung', 'hotel', 'übernachtung', 'schulung', 'bürodienst',
+        'office', 'training', 'tour', 'layover', 'ausland', 'inland',
+        'werbungs', 'reisekost', 'verpfleg', 'gewerkschaft', 'crew',
+        'flugbegleiter', 'pilot', 'kapit', 'einsatz', 'frei',
+        'urlaub', 'krank', 'standby', 'simulator', 'sim ',
+        'zugangscode', 'kurzcode', 'datei', 'dokument', 'unterlage',
+        'briefing', 'off-duty', 'duty', 'lh ', 'lufthansa',
+        'bmf', 'pauschale', 'tagessatz', 'antragsfrist',
+    )
+    for kw in allowed_keywords:
+        if kw in msg:
+            return False  # Crew/Steuer-Bezug → erlaubt
+    # Kein Crew-Bezug → prüfe Off-Topic-Patterns
+    for pat in _OFF_TOPIC_PATTERNS:
+        if _re.search(pat, msg, _re.IGNORECASE):
+            return True
+    return False
 
 
 @app.route('/api/chat', methods=['POST'])
@@ -2214,6 +2483,16 @@ def chat_with_aerotax():
         return jsonify({'error': 'token und message erforderlich'}), 400
     if len(message) < 3:
         return jsonify({'error': 'Frage zu kurz'}), 400
+
+    # v8.22 Rest-4: Server-Pre-Filter — Off-Topic ohne LLM-Call ablehnen
+    if _is_off_topic_question(message):
+        off_topic_reply = (
+            'Ich kann dir hier nur bei deiner AeroTAX-Auswertung helfen — '
+            'also bei deinen Unterlagen, offenen Punkten, dem PDF und der '
+            'Übernahme in deine Steuersoftware. Wenn du dazu eine Frage hast, '
+            'bin ich da.'
+        )
+        return jsonify({'reply': off_topic_reply, 'filtered': 'off_topic'}), 200
 
     session = _load_session(token)
     if not session:
