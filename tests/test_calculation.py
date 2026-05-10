@@ -9476,6 +9476,136 @@ def test_v1041_no_chunk_word_user_facing_in_frontend():
             raise AssertionError(f'„chunk" user-facing line {ln}: {line[:80]}')
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Task A — Backend Safety
+# 1) LSB local-first hinter AEROTAX_LSB_LOCAL_FIRST=1 ENV-Flag (default AUS)
+# 2) Post-Read Memory Release (lsb/se/dp Bytes nach Phase freigeben)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_taskA_lsb_flag_constant_exists():
+    """_AEROTAX_LSB_LOCAL_FIRST Konstante existiert im app.py."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_AEROTAX_LSB_LOCAL_FIRST'), \
+        'ENV-Flag-Konstante muss existieren'
+
+
+def test_taskA_lsb_flag_default_off():
+    """Default-Verhalten: Flag AUS — Sonnet wird genutzt wie vor v10.4.1.
+    Test prüft dass Constant in der Fallback-Funktion gecheckt wird."""
+    src = _read_backend()
+    fn_idx = src.find('def _read_lsb_with_local_fallback')
+    block = src[fn_idx:fn_idx + 2000]
+    assert '_AEROTAX_LSB_LOCAL_FIRST' in block, \
+        'Fallback-Funktion muss ENV-Flag prüfen'
+
+
+def test_taskA_lsb_flag_default_value():
+    """Wenn ENV-Var nicht gesetzt → False (Default Sonnet)."""
+    # Saubere Umgebung: Flag nicht setzen
+    import os as _os
+    prev = _os.environ.pop('AEROTAX_LSB_LOCAL_FIRST', None)
+    try:
+        _app = _load_app_fresh()
+        assert _app._AEROTAX_LSB_LOCAL_FIRST is False, \
+            'Default ohne ENV-Var muss False sein'
+    finally:
+        if prev is not None:
+            _os.environ['AEROTAX_LSB_LOCAL_FIRST'] = prev
+
+
+def test_taskA_lsb_flag_true_when_enabled():
+    """Wenn AEROTAX_LSB_LOCAL_FIRST=1 gesetzt → True."""
+    import os as _os
+    _os.environ['AEROTAX_LSB_LOCAL_FIRST'] = '1'
+    try:
+        _app = _load_app_fresh()
+        assert _app._AEROTAX_LSB_LOCAL_FIRST is True, \
+            'Flag=1 muss True sein'
+    finally:
+        _os.environ.pop('AEROTAX_LSB_LOCAL_FIRST', None)
+
+
+def test_taskA_lsb_fallback_uses_flag_check():
+    """Local-fast-Pfad ist hinter ENV-Flag-Bedingung gated."""
+    src = _read_backend()
+    fn_idx = src.find('def _read_lsb_with_local_fallback')
+    block = src[fn_idx:fn_idx + 2000]
+    # Suche if-statement mit Flag + local-fast call
+    assert 'if _AEROTAX_LSB_LOCAL_FIRST' in block, \
+        'Local-First Pfad muss explizit hinter Flag stehen'
+
+
+def test_taskA_sonnet_remains_default_path():
+    """Default-Pfad in _read_lsb_with_local_fallback ist Sonnet-Call."""
+    src = _read_backend()
+    fn_idx = src.find('def _read_lsb_with_local_fallback')
+    block = src[fn_idx:fn_idx + 2000]
+    # Funktion endet mit Sonnet-Aufruf (Default-Pfad)
+    assert 'return _sonnet_read_lsb_v2(pdf_bytes_list)' in block, \
+        'Sonnet muss der finale Default-Return sein'
+
+
+def test_taskA_memory_release_after_lsb():
+    """Nach LSB-Read: lsb_bytes wird freigegeben (None gesetzt)."""
+    src = _read_backend()
+    idx = src.find('# Schritt 1: LSB')
+    block = src[idx:idx + 1500]
+    assert 'lsb_bytes = None' in block, 'lsb_bytes muss nach Read None gesetzt werden'
+    assert "files['lsb']" in block, 'files[lsb] muss freigegeben werden'
+    assert 'gc.collect()' in block
+
+
+def test_taskA_memory_release_after_se():
+    """Nach SE-Readers (structured + summary): se_bytes freigegeben."""
+    src = _read_backend()
+    idx = src.find('# Schritt 2b: Sonnet-SE-Summary')
+    assert idx > 0
+    block = src[idx:idx + 1500]
+    assert 'se_bytes = None' in block, 'se_bytes muss nach SE-Phase None'
+    assert "files['se']" in block
+
+
+def test_taskA_memory_release_after_dp():
+    """Nach DP-Read in berechne(): dp_bytes + einsatz_bytes freigegeben."""
+    src = _read_backend()
+    # Suche in berechne() — der DP-Aufruf MIT job_id-Argument
+    idx = src.find('structured_days = _sonnet_read_dp_structured_chunked_v104(')
+    assert idx > 0
+    block = src[idx:idx + 2500]
+    assert 'dp_bytes = None' in block, 'dp_bytes muss nach DP-Phase None'
+    assert 'einsatz_bytes = None' in block, 'einsatz_bytes muss freigegeben werden'
+    assert "files['dp']" in block
+
+
+def test_taskA_memory_release_calls_gc():
+    """Jede Memory-Release-Stelle hat gc.collect() + _release_memory_to_os()."""
+    src = _read_backend()
+    for phase_marker in ['# Schritt 1: LSB', '# Schritt 2b: Sonnet-SE-Summary']:
+        idx = src.find(phase_marker)
+        block = src[idx:idx + 1500]
+        assert 'gc.collect()' in block, f'gc.collect() fehlt nach {phase_marker}'
+        assert '_release_memory_to_os()' in block, f'_release_memory_to_os fehlt nach {phase_marker}'
+
+
+def test_taskA_no_regression_in_lsb_func_signature():
+    """_read_lsb_with_local_fallback Signatur bleibt: pdf_bytes_list."""
+    src = _read_backend()
+    sig_idx = src.find('def _read_lsb_with_local_fallback(')
+    line_end = src.find(':', sig_idx)
+    sig = src[sig_idx:line_end]
+    assert 'pdf_bytes_list' in sig
+    # Keine neuen Pflicht-Parameter
+    assert sig.count(',') <= 1
+
+
+def test_taskA_local_fast_function_still_present():
+    """_parse_lsb_local_fast bleibt verfügbar (auch wenn flag-default AUS)."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_parse_lsb_local_fast'), \
+        'Local-Fast-Funktion darf nicht entfernt werden'
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

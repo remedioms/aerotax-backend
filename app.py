@@ -7446,26 +7446,34 @@ def _parse_lsb_local_fast(pdf_bytes):
     return result
 
 
-def _read_lsb_with_local_fallback(pdf_bytes_list):
-    """v10.4.1: LSB-Reader mit Local-First-Pfad.
-    1. Local Regex-Parse versuchen (pdfplumber).
-    2. Bei Erfolg + alleinigem PDF: return ohne Sonnet.
-    3. Sonst: Fallback auf _sonnet_read_lsb_v2.
+_AEROTAX_LSB_LOCAL_FIRST = (os.environ.get('AEROTAX_LSB_LOCAL_FIRST', '') == '1')
 
-    Multi-LSB (z.B. mehrere Arbeitgeber) → immer Sonnet (Aggregation komplex).
+
+def _read_lsb_with_local_fallback(pdf_bytes_list):
+    """v10.4.1: LSB-Reader mit Local-First-Pfad — opt-in via ENV-Flag.
+
+    Default: AEROTAX_LSB_LOCAL_FIRST nicht gesetzt → Sonnet wie vor v10.4.1.
+    Aktivierbar: AEROTAX_LSB_LOCAL_FIRST=1 → regex-basierter Fast-Parse vor Sonnet.
+
+    Begründung: Regex-Parser ist neuer Code-Pfad. ENV-Flag ermöglicht
+    risikofreies Live-Testing ohne Production-User zu beeinträchtigen.
+    Wenn Flag AUS: nur Sonnet (identisches Verhalten wie v10.4).
+
+    Multi-LSB (mehrere Arbeitgeber): immer Sonnet, auch wenn Flag AN.
     """
     pdf_bytes_list = _bytes_list(pdf_bytes_list) if pdf_bytes_list else []
     if not pdf_bytes_list:
         return None
-    # Nur Single-LSB lokal — Multi-LSB braucht Sonnet
-    if len(pdf_bytes_list) == 1:
+    # v10.4.1+: Default-Pfad ist Sonnet — Local-First nur bei explizitem ENV-Flag
+    if _AEROTAX_LSB_LOCAL_FIRST and len(pdf_bytes_list) == 1:
         try:
             local = _parse_lsb_local_fast(pdf_bytes_list[0])
             if local and local.get('brutto', 0) > 0:
+                print(f"[LSB] local-fast erfolgreich (ENV-Flag) — kein Sonnet-Call")
                 return local
         except Exception as e:
-            print(f"[LSB-LocalFast] error: {str(e)[:120]} → Sonnet fallback")
-    # Fallback: Sonnet
+            print(f"[LSB] local-fast error: {str(e)[:120]} → Sonnet fallback")
+    # Default-Pfad: Sonnet
     return _sonnet_read_lsb_v2(pdf_bytes_list)
 
 
@@ -11824,18 +11832,24 @@ def hybrid_analyze(form, files):
 
     errors = []
 
-    # Schritt 1: LSB (Local-First, Sonnet nur Fallback)
+    # Schritt 1: LSB (Default Sonnet, Local-First nur per ENV-Flag)
     lsb_data = None
     if lsb_bytes:
         try:
             _heartbeat_phase(job_id, 'lsb',
                              {'label': 'Lohnsteuerbescheinigung wird geprüft…'})
-            # v10.4.1: Local-First — versucht regex-basierten Fast-Parse zuerst,
-            # Sonnet nur als Fallback wenn local nicht greift.
+            # v10.4.1: Default Sonnet; local-first via AEROTAX_LSB_LOCAL_FIRST=1.
             lsb_data = _read_lsb_with_local_fallback(lsb_bytes)
         except Exception as e:
             errors.append(f'LSB: {e}')
             print(f"[hybrid] Sonnet-LSB crash: {e}")
+    # v10.4.2 Memory-Release: LSB-Bytes nicht mehr gebraucht
+    try:
+        lsb_bytes = None
+        if 'lsb' in files:
+            files['lsb'] = None
+    except Exception:
+        pass
     gc.collect()
     _release_memory_to_os()
 
@@ -11871,6 +11885,13 @@ def hybrid_analyze(form, files):
         except Exception as e:
             errors.append(f'SE-Summary: {e}')
             print(f"[hybrid] Sonnet-SE-Summary crash: {e}")
+    # v10.4.2 Memory-Release: SE-Bytes nach beiden Readern nicht mehr gebraucht
+    try:
+        se_bytes = None
+        if 'se' in files:
+            files['se'] = None
+    except Exception:
+        pass
     gc.collect()
     _release_memory_to_os()
 
@@ -11930,6 +11951,20 @@ def hybrid_analyze(form, files):
             else:
                 structured_days = _sonnet_read_dp_structured(
                     dp_bytes, einsatz_bytes, year, homebase)
+            # v10.4.2 Memory-Release: DP-Bytes nach Read nicht mehr gebraucht.
+            # Strukturierte Tagesdaten sind extrahiert, originale PDF-Bytes
+            # können freigegeben werden bevor die Klassifikation läuft.
+            try:
+                dp_bytes = None
+                einsatz_bytes = None
+                if 'dp' in files:
+                    files['dp'] = None
+                if 'einsatz' in files:
+                    files['einsatz'] = None
+            except Exception:
+                pass
+            gc.collect()
+            _release_memory_to_os()
             if structured_days and structured_days.get('days'):
                 # Schritt 3b (v8): Document Health Check vor der Berechnung
                 document_health = _document_health_check(lsb_data, se_structured, structured_days, year)
