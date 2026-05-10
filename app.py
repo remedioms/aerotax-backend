@@ -1216,6 +1216,7 @@ def _run_process_async(job_id, form, files):
                 'missing_z76_candidates': result.get('_missing_z76_candidates') or [],
                 'missing_deutschland_14_candidates': result.get('_missing_deutschland_14_candidates') or [],
                 'aerotax_z76_dates_amounts':   result.get('_aerotax_z76_dates_amounts') or [],
+                'rescues':                     result.get('_rescues') or [],
                 'training_commute_candidates': result.get('_training_commute_candidates') or [],
                 'office_z72_candidates':       result.get('_office_z72_candidates') or [],
                 'missing_reader_days':         result.get('_missing_reader_days') or [],
@@ -6685,6 +6686,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     audit_notes = []        # informativ (z.B. FRA-Stempel bei Auslandstour)
     unresolved_days = []    # echte Issues (klass=Sonstiges mit Grund)
     vma_unmapped_se = []    # aktive SE-Zeile ohne VMA-Klassifikation
+    rescues = []            # v8.18.1: Audit-Trail für Issue→Z76-Rescue
     tage_detail = []
     z76_eur = 0.0
 
@@ -7228,22 +7230,48 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 if klass == 'Issue':
                     unresolved_reason = f'activity_type={at} unklar'
 
-        # v8.18: Anti-Stochastik-Final-Check für aktive SE-Zeilen
-        # Wenn klass=Issue (ANY Issue-Pfad) und aktive Auslands-SE existiert,
-        # reklassifiziere deterministisch zu Z76. Sonnet-Stochastik darf nicht
-        # entscheiden ob Tag stochastisch Z76 oder Issue wird.
+        # v8.18.1: Anti-Stochastik-Rescue mit verschärften Bedingungen.
+        # Issue → Z76 NUR wenn ALLE Bedingungen erfüllt:
+        # 1. klass='Issue' (Klassifikator hat keine eindeutige Klasse gefunden)
+        # 2. Aktive (nicht-storno) SE-Zeile mit stfrei_total > 0
+        # 3. SE-Ort ist Auslands-IATA (stfrei_inland=False)
+        # 4. BMF-Mapping existiert für SE-Ort (kein 28€-Pauschal-Fallback)
+        # 5. Tag ist nicht aus Frei/Urlaub/Krank-Pfad gekommen (würde mit
+        #    'continue' den Loop verlassen — Issue-klass kommt nur aus echten
+        #    Klassifikations-Pfaden, nie aus Frei-Pfad)
+        # Wenn BMF-Mapping fehlt: Issue bleibt + iata_unknown wird sichtbar.
         has_active_se_final = se.get('count', 0) > 0 and float(se.get('stfrei_total', 0) or 0) > 0
         if (klass == 'Issue' and has_active_se_final
                 and se.get('stfrei_inland') is False and se.get('stfrei_ort')):
             se_ort_rescue = se.get('stfrei_ort', '')
-            bmf_aus_rescue = _bmf(se_ort_rescue)
-            eur_added = float((bmf_aus_rescue.get('an_abreise', 0) if bmf_aus_rescue else 28.0) or 0)
-            old_reason = reason
-            klass = 'Z76'
-            reason = f'Aktive Auslands-SE {se_ort_rescue} — Anti-Stochastik-Z76 (war: {old_reason[:50]})'
-            audit_note = f'{datum}: aktive Auslands-SE {se_ort_rescue} → Z76 (Issue→Z76-Rescue)'
-            unresolved_reason = None
-            print(f"[v8-anti-stochastik] datum={datum} ort={se_ort_rescue} reason='Issue→Z76 (active foreign SE)'")
+            se_betrag_rescue = float(se.get('stfrei_total', 0) or 0)
+            bmf_aus_rescue = _bmf(se_ort_rescue)  # tracked iata_unknown / bmf_missing
+            if bmf_aus_rescue and bmf_aus_rescue.get('an_abreise'):
+                # Rescue legitim: BMF-Mapping vorhanden
+                eur_added = float(bmf_aus_rescue.get('an_abreise', 0) or 0)
+                old_reason_rescue = reason
+                klass = 'Z76'
+                reason = f'Aktive Auslands-SE {se_ort_rescue} → Z76-Rescue (war: {old_reason_rescue[:60]})'
+                audit_note = f'{datum}: aktive Auslands-SE {se_ort_rescue} → Z76 (Issue→Z76-Rescue)'
+                unresolved_reason = None
+                # v8.18.1: strukturierter Rescue-Audit-Eintrag
+                from bmf_data import IATA_TO_BMF
+                rescues.append({
+                    'datum':         datum,
+                    'rescue_type':   'active_foreign_se_issue_to_z76',
+                    'rescue_reason': old_reason_rescue,
+                    'se_ort':        se_ort_rescue,
+                    'se_betrag':     se_betrag_rescue,
+                    'bmf_land':      IATA_TO_BMF.get(se_ort_rescue.upper(), '') or '',
+                    'bmf_tagtyp':    'an_abreise',
+                    'amount':        eur_added,
+                    'original_klass':'Issue',
+                })
+                print(f"[v8-anti-stochastik] datum={datum} ort={se_ort_rescue} betrag={se_betrag_rescue:.2f} reason='Issue→Z76 (BMF-Mapping vorhanden)'")
+            else:
+                # Kein BMF-Mapping → Rescue NICHT durchführen, Issue bleibt
+                # Plus _bmf() hat schon iata_unknown/bmf_missing geloggt
+                print(f"[v8-anti-stochastik-skip] datum={datum} ort={se_ort_rescue} reason='Issue bleibt — BMF-Mapping fehlt'")
 
         # VMA-Unmapped-SE-Check: aktive SE ohne Z72/73/74/76?
         if has_active_se_final and klass not in ('Z72', 'Z73', 'Z74', 'Z76'):
@@ -7909,6 +7937,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         'missing_z76_candidates': missing_z76_candidates,
         'missing_deutschland_14_candidates': missing_deutschland_14_candidates,
         'aerotax_z76_dates_amounts':   aerotax_z76_dates_amounts,
+        'rescues':                     rescues,
         'training_commute_candidates': training_commute_candidates,
         'office_z72_candidates':       office_z72_candidates,
         'missing_reader_days':         missing_reader_days,
@@ -9073,6 +9102,7 @@ def _berechne_via_hybrid(form, files):
         '_missing_z76_candidates': list(cls.get('missing_z76_candidates', []) or []),
         '_missing_deutschland_14_candidates': list(cls.get('missing_deutschland_14_candidates', []) or []),
         '_aerotax_z76_dates_amounts':   list(cls.get('aerotax_z76_dates_amounts', []) or []),
+        '_rescues':                     list(cls.get('rescues', []) or []),
         '_training_commute_candidates': list(cls.get('training_commute_candidates', []) or []),
         '_office_z72_candidates':       list(cls.get('office_z72_candidates', []) or []),
         '_missing_reader_days':         list(cls.get('missing_reader_days', []) or []),

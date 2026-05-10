@@ -3050,6 +3050,128 @@ def test_v818_dp_prompt_no_silent_skip():
     assert 'NICHT weglassen' in src or 'als activity_type=' in src
 
 
+def test_v8181_rescue_only_with_bmf_mapping():
+    """v8.18.1: Rescue greift NUR wenn BMF-Mapping vorhanden.
+    Unbekannter IATA bleibt Issue (kein 28€-Pauschal-Rescue).
+
+    Konstrukt: Same-Day mit overnight=True verletzt Hard-Gate → Issue.
+    Plus Auslands-SE mit unbekanntem IATA."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-08-15', 'activity_type': 'same_day', 'overnight_after_day': True,
+         'has_fl': False},  # overnight=True bei same_day = Hard-Gate-Verletzung → Issue
+    ]}
+    se = {'se_lines': [
+        # XQQ ist kein realer IATA-Code → kein BMF-Mapping
+        {'datum': '2025-08-15', 'stfrei_betrag': 50, 'stfrei_ort': 'XQQ',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail = result['tage_detail'][0]
+    # Kein BMF-Mapping → kein Rescue → bleibt Issue
+    assert detail['klass'] == 'Issue', \
+        f"Unbekannter IATA sollte Issue bleiben (kein Pauschal-Rescue), ist {detail['klass']}"
+    # Kein Rescue-Eintrag
+    assert len(result.get('rescues', [])) == 0
+
+
+def test_v8181_rescue_with_bmf_mapping_creates_audit_entry():
+    """v8.18.1: Rescue mit BMF-Mapping erzeugt strukturierten Audit-Eintrag.
+
+    Konstrukt: Same-Day mit overnight=True (Hard-Gate-Verletzung) → Issue.
+    Plus Auslands-SE NYC (BMF-Mapping vorhanden) → Rescue greift."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-08', 'activity_type': 'same_day', 'overnight_after_day': True,
+         'has_fl': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-08', 'stfrei_betrag': 44, 'stfrei_ort': 'NYC',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail = result['tage_detail'][0]
+    assert detail['klass'] == 'Z76', \
+        f"Same-Day-Issue mit Auslands-SE NYC sollte Z76 sein (Rescue), ist {detail['klass']}"
+    rescues = result.get('rescues', [])
+    assert len(rescues) == 1, f"Erwartet 1 rescue, ist {len(rescues)}"
+    r = rescues[0]
+    for key in ('datum', 'rescue_type', 'rescue_reason', 'se_ort', 'se_betrag',
+                'bmf_land', 'bmf_tagtyp', 'amount', 'original_klass'):
+        assert key in r, f"rescue ohne Feld '{key}'"
+    assert r['rescue_type'] == 'active_foreign_se_issue_to_z76'
+    assert r['original_klass'] == 'Issue'
+    assert r['se_ort'] == 'NYC'
+    assert r['se_betrag'] == 44.0
+    assert r['bmf_tagtyp'] == 'an_abreise'
+
+
+def test_v8181_storno_se_does_not_trigger_rescue():
+    """Storno-SE-Zeile löst KEINEN Rescue aus (Storno wird im Match gefiltert)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-08', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': []},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-08', 'stfrei_betrag': 44, 'stfrei_ort': 'NYC',
+         'stfrei_inland': False, 'storno': True},  # STORNO
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail = result['tage_detail'][0]
+    # Storno gefiltert → keine aktive SE → kein Rescue
+    assert detail['klass'] != 'Z76' or len(result.get('rescues', [])) == 0
+
+
+def test_v8181_zero_betrag_se_does_not_trigger_rescue():
+    """SE-Zeile mit stfrei_betrag=0 löst KEINEN Rescue aus."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-08', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': []},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-08', 'stfrei_betrag': 0, 'stfrei_ort': 'NYC',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # has_active_se_final ist False → kein Rescue
+    assert len(result.get('rescues', [])) == 0
+
+
+def test_v8181_inland_se_does_not_trigger_rescue():
+    """Inland-SE löst KEINEN Z76-Rescue aus (kein foreign-Kontext)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-08', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': []},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-08', 'stfrei_betrag': 14, 'stfrei_ort': 'MUC',
+         'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # stfrei_inland=True → kein Foreign-Rescue
+    assert len(result.get('rescues', [])) == 0
+
+
+def test_v8181_rescues_field_present_in_result():
+    """Result-dict enthält rescues-Liste (auch wenn leer)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-01', 'activity_type': 'office', 'overnight_after_day': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert 'rescues' in result
+    assert result['rescues'] == []
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
