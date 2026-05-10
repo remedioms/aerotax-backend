@@ -1676,6 +1676,12 @@ def post_review_answer(job_id):
         except Exception as _e:
             print(f'[review-answer] save warning: {_e}')
 
+    # v8.37: Session.result_data sync (Recall sieht post-review-Stand)
+    try:
+        _sync_session_result_with_job(job_id, j)
+    except Exception as _e:
+        print(f'[review-answer] session sync warn: {_e}')
+
     answered = sum(1 for v in overrides.values()
                    if isinstance(v, dict) and not v.get('unsure'))
     return jsonify({
@@ -1768,6 +1774,12 @@ def post_review_bulk_answer(job_id):
             _save_job_to_disk(job_id)
         except Exception as _e:
             print(f'[review-bulk] save warning: {_e}')
+
+    # v8.37: Session-Sync für Recall-Persistenz
+    try:
+        _sync_session_result_with_job(job_id, j)
+    except Exception as _e:
+        print(f'[review-bulk] session sync warn: {_e}')
 
     return jsonify({
         'applied_count': len(applied_dates),
@@ -1939,6 +1951,13 @@ def post_review_answer_bulk(job_id):
             _save_job_to_disk(job_id)
         except Exception as _e:
             print(f'[review-bulk-text] save warning: {_e}')
+
+    # v8.37: Session.result_data._review_items mit-updaten, damit Recall den
+    # post-review-Stand sieht (nicht stale 22 pending). Suche Session(s) mit gleichem job_id.
+    try:
+        _sync_session_result_with_job(job_id, j)
+    except Exception as _e:
+        print(f'[review-bulk-text] session sync warn: {_e}')
 
     return jsonify({
         'applied_count':         len(applied),
@@ -2619,6 +2638,68 @@ def _save_session(token, data):
             json.dump(payload, f, default=str)
     except Exception as e:
         print(f"[session] save fail: {e}")
+
+
+def _sync_session_result_with_job(job_id, job_state):
+    """v8.37: Spiegelt manual_day_overrides + aktualisierte review_items + preview_totals
+    aus dem Job-State zurück in alle Sessions, die diesen job_id referenzieren.
+
+    Damit überlebt der post-Review-Stand einen Browser-Reload / Recall.
+    """
+    if not job_id or not job_state: return
+    job_data = job_state.get('data') or {}
+    job_review_items = job_data.get('_review_items') or []
+    overrides = job_state.get('manual_day_overrides') or {}
+    preview = job_data.get('_preview_totals') or {}
+
+    # Sessions finden, die job_id referenzieren
+    if SB_AVAILABLE:
+        try:
+            res = sb.table('sessions').select('token,result_data').eq('job_id', job_id).execute()
+            rows = (res and res.data) or []
+            for row in rows:
+                token = row.get('token')
+                rd = dict(row.get('result_data') or {})
+                rd['_review_items'] = job_review_items
+                if preview:
+                    # Live-Werte aktualisieren, damit Recall den neuen Betrag zeigt
+                    if 'netto' in preview:    rd['netto']    = preview.get('netto')
+                    if 'gesamt' in preview:   rd['gesamt']   = preview.get('gesamt')
+                    if 'arbeitstage' in preview:    rd['arbeitstage']    = preview.get('arbeitstage')
+                    if 'fahr_tage' in preview:      rd['fahr_tage']      = preview.get('fahr_tage')
+                    if 'hotel_naechte' in preview:  rd['hotel_naechte']  = preview.get('hotel_naechte')
+                    if 'vma_72_tage' in preview:    rd['vma_72_tage']    = preview.get('vma_72_tage')
+                    if 'vma_73_tage' in preview:    rd['vma_73_tage']    = preview.get('vma_73_tage')
+                    if 'vma_72' in preview:         rd['vma_72']         = preview.get('vma_72')
+                    if 'vma_73' in preview:         rd['vma_73']         = preview.get('vma_73')
+                    if 'vma_aus' in preview:        rd['vma_aus']        = preview.get('vma_aus')
+                rd['_manual_day_overrides_count'] = len(overrides)
+                sb.table('sessions').update({'result_data': rd}).eq('token', token).execute()
+        except Exception as e:
+            print(f'[session-sync] supabase fail: {e}')
+            return
+    # Disk-Fallback
+    try:
+        for fname in os.listdir(_SESSION_DIR):
+            if not fname.endswith('.json'): continue
+            fpath = os.path.join(_SESSION_DIR, fname)
+            try:
+                with open(fpath) as f: s = json.load(f)
+            except Exception: continue
+            if s.get('job_id') != job_id: continue
+            rd = dict(s.get('result_data') or {})
+            rd['_review_items'] = job_review_items
+            if preview:
+                for k in ('netto','gesamt','arbeitstage','fahr_tage','hotel_naechte',
+                         'vma_72_tage','vma_73_tage','vma_72','vma_73','vma_aus'):
+                    if k in preview: rd[k] = preview.get(k)
+            rd['_manual_day_overrides_count'] = len(overrides)
+            s['result_data'] = rd
+            try:
+                with open(fpath, 'w') as f: json.dump(s, f, default=str)
+            except Exception: pass
+    except Exception as e:
+        print(f'[session-sync] disk fail: {e}')
 
 
 def _cleanup_expired_sessions():
