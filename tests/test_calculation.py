@@ -6216,10 +6216,8 @@ def test_v828_BUG_chat_send_not_hijacked_by_review_mode():
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    # _chatSend muss VOR Review-Routing prüfen ob Text wie Review-Antwort aussieht
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+6000]
-    # Es muss ein _looksLikeReviewAnswer-Check ODER ein chip-intent-Check VOR review-mode-Branch existieren
+    block = src[fn_idx:fn_idx+12000]
     has_local_check = '_looksLikeReviewAnswer' in block
     assert has_local_check, \
         'Vor _handleReviewFreeText muss eine lokale Pattern-Erkennung stehen, sonst kann User nicht frei chatten'
@@ -6279,7 +6277,7 @@ def test_v829_chat_send_uses_fetch_with_timeout():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+8000]
+    block = src[fn_idx:fn_idx+15000]
     # Suche nach API+'/api/chat' Aufruf
     api_chat_idx = block.find("API+'/api/chat'")
     assert api_chat_idx > 0, '/api/chat-Call nicht gefunden'
@@ -6296,7 +6294,7 @@ def test_v829_upload_replacement_uses_fetch_with_timeout():
     src = open(site).read()
     # Suche im _chatSend-Block (nicht in legacy uploads außerhalb)
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+8000]
+    block = src[fn_idx:fn_idx+15000]
     upload_idx = block.find("/upload-replacement'")
     assert upload_idx > 0, 'upload-replacement-Call im Chat-Send fehlt'
     pre = block[max(0, upload_idx-200):upload_idx]
@@ -6325,7 +6323,7 @@ def test_v829_chat_error_messages_are_assistant_bubbles_not_system():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+8000]
+    block = src[fn_idx:fn_idx+15000]
     # Block soll keine renderMsg('system', '⚠ ...') mehr enthalten
     import re
     sys_warns = re.findall(r"renderMsg\('system',\s*'⚠", block)
@@ -6447,16 +6445,13 @@ def test_v833_review_kind_bypasses_hard_cap():
 
 
 def test_v833_review_kind_bypasses_ip_rate_limit():
-    """kind='review' überspringt IP-Rate-Limit."""
+    """v8.34 Update: IP-Rate-Limit auf /api/chat ist komplett entfernt — User soll
+    NIE wieder „Zu viele Nachrichten" sehen."""
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def chat_with_aerotax')
-    block = src[fn_idx:fn_idx+3000]
-    # IP-Rate-Limit muss in if(not is_review_context)-Branch sein
-    ip_idx = block.find("_qa_rate_check(ip, 'chat'")
-    assert ip_idx > 0
-    pre = block[max(0, ip_idx-300):ip_idx]
-    assert 'is_review_context' in pre, 'IP-Rate-Limit muss is_review_context bypassen'
+    block = src[fn_idx:fn_idx+3500]
+    assert '_qa_rate_check' not in block, 'IP-Rate-Limit muss aus /api/chat raus'
 
 
 def test_v833_review_kind_short_messages_allowed():
@@ -6541,7 +6536,7 @@ def test_v833_frontend_chat_send_passes_kind():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+10000]
+    block = src[fn_idx:fn_idx+18000]
     assert 'isReviewCtx' in block
     assert "kind: isReviewCtx ? 'review' : 'free'" in block, \
         'Frontend muss kind-Feld an /api/chat senden'
@@ -6568,6 +6563,127 @@ def test_v833_blocked_message_says_review_continues():
     src = open(_app.__file__).read()
     assert 'Review-Antworten und PDF-Erstellung gehen weiter' in src \
        or 'Review-Antworten gehen weiter' in src
+
+
+# ── v8.34 Verbotene Wörter Grep-Test ──
+
+def test_v834_forbidden_phrases_not_in_codebase():
+    """Catch-all: keine verbotenen Marketing-/Heilspruch-/Debug-Phrasen
+    in user-facing Code.
+
+    Ausnahmen:
+    - Backend-Sonnet-Prompts (enthalten die Phrasen als Negativliste für die KI)
+    - Frontend-IIFE-Variablen-Listen (forbidden-arrays)
+
+    Strategie: Phrase erlaubt wenn in 1000-char-Fenster davor ein Whitelist-Marker
+    steht (VERBOTEN / forbidden / Negativliste / etc.).
+    """
+    import os
+    forbidden = [
+        'Hol mehr raus',
+        'Mehr absetzen',
+        'Maximiere',
+        'maximale Rückerstattung',
+        'garantiert absetzbar',
+        'steuerberater-sicher',
+        'finanzamtssicher',
+        'Steuerersparnis sichern',
+        'Netto in WISO eintragen',
+        'einfach eintragen',
+        'genau so eintragen',
+        'AeroTAX kennt deine Zahlen',
+    ]
+    files = [
+        '/Users/miguelschumann/Desktop/aerotax-backend/app.py',
+        '/Users/miguelschumann/Desktop/site/index.html',
+    ]
+    whitelist_markers = [
+        'VERBOTEN', 'verboten:', 'Verbotene Wörter', 'forbidden', 'Forbidden',
+        'ABSOLUT VERBOTEN', 'NICHT erscheinen', 'Verbotene Pattern',
+        'Negativliste', 'Negative-List', 'Verbotene Floskeln',
+    ]
+    violations = []
+    for fp in files:
+        if not os.path.exists(fp): continue
+        src = open(fp, encoding='utf-8').read()
+        for phrase in forbidden:
+            idx = 0
+            while True:
+                pos = src.find(phrase, idx)
+                if pos < 0: break
+                window = src[max(0, pos-1000):pos]
+                if any(marker in window for marker in whitelist_markers):
+                    idx = pos + len(phrase); continue
+                violations.append(f'{os.path.basename(fp)}:{src[:pos].count(chr(10))+1} — "{phrase}"')
+                idx = pos + len(phrase)
+    assert not violations, 'Verbotene Phrasen außerhalb von Verbots-Listen gefunden:\n  ' + '\n  '.join(violations)
+
+
+def test_v834_chat_endpoint_no_ip_rate_limit():
+    """v8.34: IP-Rate-Limit auf /api/chat ist komplett entfernt — User soll nie wieder
+    „Zu viele Nachrichten"-Block sehen, weder im Review noch im Free-Chat."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_with_aerotax')
+    block = src[fn_idx:fn_idx+3500]
+    # Im chat_with_aerotax-Body darf KEIN _qa_rate_check mehr sein
+    assert '_qa_rate_check' not in block, \
+        'IP-Rate-Limit muss aus /api/chat raus — User-Frust-Trigger'
+
+
+# ── v8.34 Idempotenz-Hinweise ──
+
+def test_v834_apply_pending_proposal_clears_state_after_apply():
+    """Nach _applyPendingProposal wird _chatPendingProposal genullt
+    (verhindert Doppel-Apply)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _applyPendingProposal')
+    block = src[fn_idx:fn_idx+800]
+    # Innerhalb von _applyPendingProposal muss window._chatPendingProposal = null gesetzt werden
+    assert 'window._chatPendingProposal = null' in block, \
+        '_applyPendingProposal muss State zurücksetzen für Idempotenz'
+
+
+# ── v8.34 Screenshot-Upload: Endpoint registriert ──
+
+def test_v834_screenshot_upload_endpoint_registered():
+    """Endpoint /api/job/<id>/upload-roster-screenshot ist registriert."""
+    import app as _app
+    rules = [r.rule for r in _app.app.url_map.iter_rules()]
+    assert any('upload-roster-screenshot' in r for r in rules), \
+        'Screenshot-OCR-Endpoint /upload-roster-screenshot fehlt'
+
+
+def test_v834_screenshot_endpoint_uses_sonnet_vision():
+    """Screenshot-Endpoint nutzt Sonnet Vision API."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def post_upload_roster_screenshot')
+    if fn_idx < 0:
+        # Endpoint noch nicht implementiert → skip mit klarer Message
+        import pytest
+        pytest.skip('Screenshot-Endpoint noch nicht implementiert')
+    block = src[fn_idx:fn_idx+3000]
+    assert "type': 'image'" in block or 'media_type' in block, \
+        'Screenshot-Endpoint muss Sonnet-Vision-Format verwenden'
+
+
+def test_v834_screenshot_response_requires_confirmation():
+    """Screenshot-Endpoint liefert proposed_changes mit applied=False
+    und confirmation_id (wie /review-interpret)."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def post_upload_roster_screenshot')
+    if fn_idx < 0:
+        import pytest
+        pytest.skip('Screenshot-Endpoint noch nicht implementiert')
+    block = src[fn_idx:fn_idx+12000]
+    assert 'confirmation_id' in block
+    # Tolerant: irgendwo im Endpoint-Body taucht applied: False auf
+    import re
+    assert re.search(r"'applied':\s*False", block), "Screenshot-Response muss 'applied': False zurückgeben"
 
 
 if __name__ == '__main__':

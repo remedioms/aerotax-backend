@@ -2088,6 +2088,160 @@ def post_upload_replacement(job_id):
     }), 202
 
 
+@app.route('/api/job/<job_id>/upload-roster-screenshot', methods=['POST'])
+def post_upload_roster_screenshot(job_id):
+    """v8.34: Sonnet Vision liest Daten + Zeiten aus einem Dienstplan-/Roster-
+    Screenshot oder -Foto. KEIN Auto-Apply: User muss im Chat bestätigen.
+
+    Body multipart/form-data: file (PDF/JPG/PNG/HEIC)
+    Returns: {recognized_count, matched_count, proposed_changes, detected_days,
+              confirmation_id, applied: False}
+    """
+    import base64, json, re, hashlib
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'Keine Datei im Upload-Body'}), 400
+    file = request.files['file']
+    fname = file.filename or 'screenshot'
+    fext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
+    if fext not in ('pdf', 'jpg', 'jpeg', 'png', 'heic', 'heif'):
+        return jsonify({'error': f'Format nicht unterstützt: .{fext}'}), 400
+    if not ANTHROPIC_KEY:
+        return jsonify({'error': 'KI nicht verfügbar — Screenshot-Auswertung temporär aus'}), 503
+
+    file_bytes = file.read()
+    if not file_bytes or len(file_bytes) > 8 * 1024 * 1024:
+        return jsonify({'error': 'Datei leer oder zu groß (max 8 MB)'}), 400
+
+    # Job laden
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'job not found'}), 404
+        review_items = (j.get('data') or {}).get('_review_items') or []
+        existing_overrides = dict(j.get('manual_day_overrides') or {})
+        cached = (j.get('data') or {}).get('_cached_recalc_state') or {}
+        initial_total = float((j.get('data') or {}).get('netto') or 0)
+
+    pending = [it for it in review_items if it.get('status') == 'pending']
+    if not pending:
+        return jsonify({'error': 'Keine offenen Tage — Screenshot wird nicht benötigt'}), 400
+    pending_dates = [it.get('datum', '') for it in pending if it.get('datum')]
+
+    # Sonnet Vision Call
+    media_type_map = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+                      'png': 'image/png', 'heic': 'image/heic',
+                      'heif': 'image/heif', 'pdf': 'application/pdf'}
+    media_type = media_type_map.get(fext, 'image/jpeg')
+    b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+
+    prompt = (
+        f"Lies aus diesem Dienstplan-/Roster-Bild die Tagesdaten und Uhrzeiten ab.\n\n"
+        f"Wir suchen Zeiten für diese offenen Tage (YYYY-MM-DD): {', '.join(pending_dates)}\n\n"
+        f"Antworte ausschließlich als JSON in dieser Form (keine Erklärungen):\n"
+        f'{{"days": [{{"datum": "YYYY-MM-DD", "start_time": "HH:MM", "end_time": "HH:MM"}}, ...]}}\n\n'
+        f"- Wenn ein Tag oder eine Uhrzeit nicht eindeutig erkennbar ist, lass ihn weg.\n"
+        f"- Nimm nur Tage, die in der oben genannten Liste vorkommen.\n"
+        f"- Datum-Format YYYY-MM-DD strikt.\n"
+        f"- Uhrzeit 24h-Format HH:MM.\n"
+    )
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=60.0)
+        if fext == 'pdf':
+            content = [
+                {'type': 'document', 'source': {'type': 'base64', 'media_type': 'application/pdf', 'data': b64}},
+                {'type': 'text', 'text': prompt},
+            ]
+        else:
+            content = [
+                {'type': 'image', 'source': {'type': 'base64', 'media_type': media_type, 'data': b64}},
+                {'type': 'text', 'text': prompt},
+            ]
+        resp = client.messages.create(
+            model='claude-sonnet-4-6',
+            max_tokens=2000,
+            messages=[{'role': 'user', 'content': content}],
+        )
+        text_out = resp.content[0].text
+    except Exception as e:
+        print(f'[upload-roster-screenshot] Sonnet fail: {e}')
+        return jsonify({'error': 'Konnte das Bild nicht auswerten — bitte mit klarerem Screenshot erneut versuchen.'}), 502
+
+    # JSON parsen
+    m = re.search(r'\{[\s\S]*\}', text_out or '')
+    detected_days = []
+    if m:
+        try:
+            parsed = json.loads(m.group(0))
+            detected_days = [d for d in (parsed.get('days') or [])
+                             if isinstance(d, dict) and d.get('datum')]
+        except Exception as e:
+            print(f'[upload-roster-screenshot] JSON parse fail: {e}')
+
+    # Mapping zu proposed_changes
+    proposed_changes = []
+    matched_dates = set()
+    items_by_id = {it['id']: it for it in review_items}
+    pending_by_date = {it['datum']: it for it in pending}
+    for d in detected_days:
+        datum = d.get('datum', '')
+        st = d.get('start_time', '')
+        et = d.get('end_time', '')
+        it = pending_by_date.get(datum)
+        if not it: continue
+        try:
+            sh, sm = map(int, st.split(':')[:2])
+            eh, em = map(int, et.split(':')[:2])
+            minutes = (eh * 60 + em) - (sh * 60 + sm)
+            if minutes < 0:
+                minutes += 24 * 60
+        except Exception:
+            continue
+        over_8h = minutes > 480
+        proposed_changes.append({
+            'review_item_id': it['id'],
+            'answer': 'yes' if over_8h else 'no',
+            'detected_start': st,
+            'detected_end': et,
+            'detected_minutes': minutes,
+        })
+        matched_dates.add(datum)
+
+    # Confirmation-ID
+    cid_src = job_id + '|screenshot|' + json.dumps(detected_days, sort_keys=True)
+    confirmation_id = hashlib.sha256(cid_src.encode('utf-8')).hexdigest()[:16]
+
+    # Audit-Eintrag (optional — nur Logging, kein Apply)
+    with _jobs_lock:
+        j2 = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if j2 and 'audit' in j2 and isinstance(j2['audit'], list):
+            j2['audit'].append({
+                'event': 'roster_screenshot_uploaded',
+                'data': {
+                    'filename': fname, 'recognized_count': len(detected_days),
+                    'matched_count': len(proposed_changes),
+                    'pending_total': len(pending_dates),
+                    'confirmation_id': confirmation_id,
+                },
+                'timestamp': datetime.now().isoformat(),
+            })
+            try: _save_job_to_disk(job_id)
+            except Exception: pass
+
+    return jsonify({
+        'recognized_count':  len(detected_days),
+        'matched_count':     len(proposed_changes),
+        'pending_total':     len(pending_dates),
+        'detected_days':     detected_days,
+        'proposed_changes':  proposed_changes,
+        'unmatched_dates':   [d for d in pending_dates if d not in matched_dates],
+        'confirmation_id':   confirmation_id,
+        'applied':           False,
+        'source_hint':       'user_uploaded_roster_screenshot',
+    })
+
+
 @app.route('/api/job/<job_id>/finalize-pdf', methods=['POST'])
 def post_finalize_pdf(job_id):
     """v8.22 Step E: Erstellt finales PDF unter Berücksichtigung aller User-Review-
@@ -2717,12 +2871,8 @@ def chat_with_aerotax():
             'error': f'Maximum {HARD_CAP} freie Chat-Nachrichten pro Session erreicht. Review-Antworten und PDF-Erstellung gehen weiter.'
         }), 429
 
-    # IP-Rate-Limit: 30 Chat-Messages/h für freie Fragen (vorher 8 — zu strikt)
-    # Review-Antworten bypassed komplett.
-    if not is_review_context:
-        ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
-        if not _qa_rate_check(ip, 'chat', max_per_hour=30):
-            return jsonify({'error': 'Zu viele freie Fragen — bitte ein paar Minuten warten. Review-Antworten gehen weiter.'}), 429
+    # v8.34: IP-Rate-Limit komplett entfernt. Per-Session HARD_CAP=50 + Review-Bypass reicht.
+    # Hauptauslöser für „Zu viele Nachrichten"-Frust war hier — User kriegt nie wieder diesen Block.
 
     if not ANTHROPIC_KEY:
         return jsonify({'error': 'KI nicht verfügbar'}), 503
