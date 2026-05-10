@@ -849,30 +849,57 @@ def _redact_pii(obj):
 
 
 def _save_job_to_disk(job_id):
-    """Speichert Job-State nach Disk — überlebt Render-Restart.
-    PII wird vor Persistierung redacted (DSGVO Art. 5: Datenminimierung)."""
+    """v9.7: Speichert Job-State in Supabase (persistent über Render-Deploys/Restarts)
+    + Disk-Fallback. PII wird redacted."""
     with _jobs_lock:
         j = _jobs.get(job_id, {}).copy()
     if not j: return
-    # Entferne Binär-Daten (PDFs gehören in _store, nicht in Job) + PII
     j_safe = {k: v for k, v in j.items() if k != 'files'}
     j_safe = _redact_pii(j_safe)
+    # Supabase-Persistenz (überlebt Render-Container-Wipes)
+    if SB_AVAILABLE:
+        try:
+            sb.table('jobs').upsert({
+                'job_id':     job_id,
+                'data':       j_safe,
+                'updated_at': datetime.utcnow().isoformat() + 'Z',
+            }).execute()
+        except Exception as e:
+            print(f"[persist] Job {job_id[:8]} supabase save fail: {e} — fallback to disk")
+    # Disk-Fallback (auch zusätzlich für lokale Dev)
     try:
         with open(os.path.join(_JOBS_DIR, f'{job_id}.json'), 'w') as f:
             json.dump(j_safe, f, default=str)
     except Exception as e:
-        print(f"[persist] Job {job_id[:8]} save fail: {e}")
+        print(f"[persist] Job {job_id[:8]} disk save fail: {e}")
 
 
 def _load_job_from_disk(job_id):
-    """Lädt Job-State vom Disk falls Memory-Dict leer (nach Server-Restart)."""
+    """v9.7: Lädt Job-State zuerst aus Supabase (überlebt Restart),
+    dann Disk-Fallback. Bei Erfolg auch ins _jobs-Memory-Dict spiegeln."""
+    # 1. Supabase
+    if SB_AVAILABLE:
+        try:
+            res = sb.table('jobs').select('data').eq('job_id', job_id).limit(1).execute()
+            rows = (res and res.data) or []
+            if rows and rows[0].get('data'):
+                data = rows[0]['data']
+                with _jobs_lock:
+                    _jobs[job_id] = data
+                return data
+        except Exception as e:
+            print(f"[persist] Job {job_id[:8]} supabase load fail: {e} — try disk")
+    # 2. Disk-Fallback
     path = os.path.join(_JOBS_DIR, f'{job_id}.json')
     if not os.path.exists(path): return None
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
+            with _jobs_lock:
+                _jobs[job_id] = data
+            return data
     except Exception as e:
-        print(f"[persist] Job {job_id[:8]} load fail: {e}")
+        print(f"[persist] Job {job_id[:8]} disk load fail: {e}")
         return None
 
 

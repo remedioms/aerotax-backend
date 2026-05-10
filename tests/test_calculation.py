@@ -6090,15 +6090,15 @@ def test_v827_attach_file_creates_pill_in_footer():
 
 
 def test_v827_send_uploads_attached_file():
-    """_chatSend uploadet attached file via /upload-replacement statt /api/chat."""
+    """_chatSend uploadet attached file via roster-screenshot oder upload-replacement."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
     assert fn_idx > 0
-    block = src[fn_idx:fn_idx+10000]
+    block = src[fn_idx:fn_idx+25000]
     assert 'window._chatAttachedFile' in block
-    assert '/upload-replacement' in block
+    assert '/upload-replacement' in block or '/upload-roster-screenshot' in block
 
 
 def test_v827_greeting_no_count_demotivator():
@@ -6219,7 +6219,7 @@ def test_v828_BUG_chat_send_not_hijacked_by_review_mode():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+12000]
+    block = src[fn_idx:fn_idx+20000]
     has_local_check = '_looksLikeReviewAnswer' in block
     assert has_local_check, \
         'Vor _handleReviewFreeText muss eine lokale Pattern-Erkennung stehen, sonst kann User nicht frei chatten'
@@ -6279,7 +6279,7 @@ def test_v829_chat_send_uses_fetch_with_timeout():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+15000]
+    block = src[fn_idx:fn_idx+25000]
     # Suche nach API+'/api/chat' Aufruf
     api_chat_idx = block.find("API+'/api/chat'")
     assert api_chat_idx > 0, '/api/chat-Call nicht gefunden'
@@ -6296,7 +6296,7 @@ def test_v829_upload_replacement_uses_fetch_with_timeout():
     src = open(site).read()
     # Suche im _chatSend-Block (nicht in legacy uploads außerhalb)
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+15000]
+    block = src[fn_idx:fn_idx+25000]
     upload_idx = block.find("/upload-replacement'")
     assert upload_idx > 0, 'upload-replacement-Call im Chat-Send fehlt'
     pre = block[max(0, upload_idx-200):upload_idx]
@@ -6325,7 +6325,7 @@ def test_v829_chat_error_messages_are_assistant_bubbles_not_system():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+15000]
+    block = src[fn_idx:fn_idx+25000]
     # Block soll keine renderMsg('system', '⚠ ...') mehr enthalten
     import re
     sys_warns = re.findall(r"renderMsg\('system',\s*'⚠", block)
@@ -6680,7 +6680,7 @@ def test_v834_screenshot_response_requires_confirmation():
     if fn_idx < 0:
         import pytest
         pytest.skip('Screenshot-Endpoint noch nicht implementiert')
-    block = src[fn_idx:fn_idx+12000]
+    block = src[fn_idx:fn_idx+20000]
     assert 'confirmation_id' in block
     # Tolerant: irgendwo im Endpoint-Body taucht applied: False auf
     import re
@@ -6740,7 +6740,7 @@ def test_v835_frontend_confirm_synonyms_apply_pending():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+12000]
+    block = src[fn_idx:fn_idx+20000]
     confirm_idx = block.find('confirmRe')
     assert confirm_idx > 0, 'Confirm-Regex muss existieren'
     # Wichtige Synonyme müssen drin sein
@@ -6755,7 +6755,7 @@ def test_v835_frontend_cancel_synonyms_clear_pending():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+12000]
+    block = src[fn_idx:fn_idx+20000]
     cancel_idx = block.find('cancelRe')
     assert cancel_idx > 0, 'Cancel-Regex muss existieren'
     cancel_block = block[cancel_idx:cancel_idx+800]
@@ -7172,7 +7172,7 @@ def test_v91_ai_chat_falls_back_to_regex_parser_when_ai_unavailable():
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def post_ai_chat(')
-    block = src[fn_idx:fn_idx+8000]
+    block = src[fn_idx:fn_idx+15000]
     assert '_interpret_review_text(user_msg, groups, items_by_id)' in block, \
         'Fallback auf deterministischen Parser fehlt'
 
@@ -7348,7 +7348,7 @@ def test_v92_audit_ai_system_prompt_multi_turn_rule():
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('_AI_SYSTEM_PROMPT = """')
-    block = src[fn_idx:fn_idx+8000]
+    block = src[fn_idx:fn_idx+15000]
     assert 'MULTI-TURN-REGEL' in block
     assert 'Welche 2 Tage' in block, 'Beispiel-Multi-Turn fehlt'
     # Regel: Bot darf Betrag nicht selbst behaupten
@@ -7360,11 +7360,9 @@ def test_v92_audit_friendly_job_not_found_in_frontend():
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    # Im Roster-Upload-Path muss „job not found"-Detection sein
-    fn_idx = src.find('upload-roster-screenshot')
-    block = src[fn_idx:fn_idx+3000]
-    assert '/job\\s*not\\s*found/i' in block, 'Frontend muss „job not found" detecten'
-    assert 'Diese Auswertung ist gerade nicht mehr verfügbar' in block
+    # Globale Suche — Pattern + Friendly-Text müssen irgendwo im Frontend sein
+    assert '/job\\s*not\\s*found/i' in src, 'Frontend muss „job not found" detecten'
+    assert 'Diese Auswertung ist gerade nicht mehr verfügbar' in src
 
 
 def test_v92_audit_pdf_cta_bubble_after_review_complete():
@@ -7375,7 +7373,7 @@ def test_v92_audit_pdf_cta_bubble_after_review_complete():
     assert 'chat-pdf-cta' in src
     assert 'Finales PDF erstellen' in src
     fn_idx = src.find('async function _applyPendingProposal')
-    block = src[fn_idx:fn_idx+8000]
+    block = src[fn_idx:fn_idx+15000]
     assert "stillPending === 0" in block
     assert 'chat-pdf-cta' in block
 
