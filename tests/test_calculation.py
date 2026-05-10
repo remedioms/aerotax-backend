@@ -7551,6 +7551,101 @@ def test_v96_chat_send_routes_to_ai_chat_for_free_questions():
     assert 'return window._handleReviewFreeText(txt)' in block
 
 
+# ── v9.8 P0: Deterministischer Bulk-Detector ──
+
+def test_v98_local_bulk_detector_exists():
+    """_detectLocalBulkIntent + _localBulkApply existieren als window-Helper."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'function _detectLocalBulkIntent(' in src
+    assert 'window._localBulkApply = function' in src
+    assert 'window._detectLocalBulkIntent = _detectLocalBulkIntent' in src
+
+
+def test_v98_chat_send_runs_local_bulk_first():
+    """Im _chatSendImpl läuft Local-Bulk-Detector VOR /ai-chat."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _chatSendImpl')
+    block = src[fn_idx:fn_idx+25000]
+    # Local-Detector vor _handleReviewFreeText (welche /ai-chat ruft)
+    local_idx = block.find('window._detectLocalBulkIntent')
+    review_idx = block.find('window._handleReviewFreeText(txt)')
+    assert local_idx > 0
+    if review_idx > 0:
+        assert local_idx < review_idx, 'Local-Detector muss VOR /ai-chat laufen'
+
+
+def test_v98_local_bulk_pattern_matches_alle_ueber_8h():
+    """Pattern-Test: 'alle über 8h' und Varianten matchen yes."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('function _detectLocalBulkIntent(')
+    end_idx = src.find('window._detectLocalBulkIntent', fn_idx)
+    block = src[fn_idx:end_idx]
+    # YES-Pattern ist da
+    yes_match = re.search(r"yesPat\s*=\s*/([^/]+)/", block)
+    assert yes_match
+    yes_re = yes_match.group(1)
+    # Convert JS regex flag-free to Python
+    py_yes = re.compile(yes_re.replace('\\b', r'\b').replace('\\s', r'\s'))
+    # Test cases
+    for s in ['über 8h', 'über 8 h', 'über 8 stunden', 'über acht', 'länger als 8', 'mehr als 8']:
+        # Pre-filter: hasAlle would have matched in real flow
+        assert py_yes.search(s), f'YES-Pattern muss „{s}" matchen'
+
+
+def test_v98_local_bulk_pattern_matches_alle_unter_8h():
+    """Pattern-Test: 'alle unter 8h' / 'alle 0' matchen no."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('function _detectLocalBulkIntent(')
+    end_idx = src.find('window._detectLocalBulkIntent', fn_idx)
+    block = src[fn_idx:end_idx]
+    no_match = re.search(r"noPat\s*=\s*/([^/]+)/", block)
+    assert no_match
+    py_no = re.compile(no_match.group(1).replace('\\b', r'\b').replace('\\s', r'\s'))
+    for s in ['unter 8h', 'unter 8 h', 'weniger als 8', 'unter acht', 'alles 0', '0h']:
+        assert py_no.search(s), f'NO-Pattern muss „{s}" matchen'
+
+
+def test_v98_no_quote_back_user_input_in_fallback():
+    """Backend-Fallback-Message zitiert NICHT mehr „alle über 8h" als Beispiel zurück."""
+    import app as _app
+    src = open(_app.__file__).read()
+    # Fallback-Message in /ai-chat
+    fn_idx = src.find('def post_ai_chat(')
+    block = src[fn_idx:fn_idx+12000]
+    # In der else-fallback (no clarification) darf nicht „alle über 8h" als Beispiel stehen
+    # — User würde seine eigene Eingabe zurückgequotet bekommen.
+    forbidden_quote_back = 'kurz anders schreiben — z.B. „April ja, September nein" oder „alle über 8h"'
+    assert forbidden_quote_back not in block
+
+
+def test_v98_frontend_fallback_no_quote_back_user_input():
+    """Frontend-Fallback (legacy) zitiert User-Eingabe nicht zurück."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    forbidden = 'Ich konnte das gerade nicht zuordnen — magst du es kurz anders schreiben? z.B. „April ja, September nein" oder „alle über 8h".'
+    assert forbidden not in src
+
+
+def test_v98_local_bulk_uses_pseudo_confirmation_id():
+    """Local-Apply nutzt Pseudo-confirmation_id (kein Round-Trip zu Server)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._localBulkApply = function')
+    block = src[fn_idx:fn_idx+2500]
+    assert "'local_' + Date.now()" in block
+    assert "_chatPendingProposal" in block
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

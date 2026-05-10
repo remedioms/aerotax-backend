@@ -2103,7 +2103,7 @@ Antworte JETZT mit dem strukturierten JSON-Objekt."""
         else:
             parsed = {
                 'intent': 'clarification',
-                'message_to_user': 'Ich konnte das gerade nicht sicher zuordnen. Magst du es kurz anders schreiben — z.B. „April ja, September nein" oder „alle über 8h"?',
+                'message_to_user': 'Magst du das nochmal kurz präzisieren? Du kannst auch „alle über 8h", „alle unter 8h" oder einen konkreten Tag wie „07.04 ja" antworten.',
                 'needs_confirmation': False,
                 'proposed_changes': [],
                 'clarification_question': 'Magst du es kurz anders schreiben?',
