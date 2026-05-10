@@ -7408,6 +7408,31 @@ def test_v92_audit_multi_cas_works_via_status_filter():
     assert "if it.get('status') == 'answered': continue" in block
 
 
+# ── v9.3 Chat als primäres Interface ──
+
+def test_v93_chat_auto_opens_on_pending_reviews():
+    """Chat öffnet sich automatisch nach Render wenn pending Reviews."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # _chatAutoOpenedThisRender flag + _chatOpen('__review__')-Trigger im hero_actions-Block
+    assert '_chatAutoOpenedThisRender' in src
+    assert "items.length && !window._chatAutoOpenedThisRender" in src
+    assert "window._chatOpen('__review__')" in src
+
+
+def test_v93_user_close_disables_auto_reopen():
+    """Wenn User Chat schließt, wird _chatUserClosedManually=true → kein erneutes Auto-Open."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatClose = function')
+    block = src[fn_idx:fn_idx+500]
+    assert '_chatUserClosedManually = true' in block
+    # Auto-Open-Check berücksichtigt das Flag
+    assert "!window._chatUserClosedManually" in src
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
