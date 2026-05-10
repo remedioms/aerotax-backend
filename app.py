@@ -6666,6 +6666,21 @@ def _enrich_dp_with_v8_fields(dp, prev_dp=None, next_dp=None, homebase='FRA'):
     return dp
 
 
+# v8.18.3 Klassifikator-Konstanten (Magic Numbers benannt)
+EVENING_FOREIGN_TOUR_START_HOUR = 18      # Briefing-Start ab 18:00 → Abend-Anreise
+TRAINING_SEQ_MIN_DAYS = 5                  # ≥5 Tage = Mehrtages-Schulungsblock
+SAME_DAY_Z72_TOTAL_MINUTES = 480           # 8h (duty + 2× commute) → Same-Day Z72
+RECENT_FOREIGN_CLUSTER_MAX_BACK = 4        # Lookback-Tage für Heimkehr-Erkennung
+
+# v8.18.3 Feature-Flags (vorerst nicht runtime-toggelbar — nur Benennung der
+# Sub-Logiken; spätere Toggles können hier eingehängt werden ohne tiefere Patches)
+FEATURE_EVENING_FOREIGN_TOUR_START_TO_Z73 = True
+FEATURE_ACTIVE_FOREIGN_SE_ISSUE_RESCUE_TO_Z76 = True
+FEATURE_TRAINING_SEQUENCE_COMMUTE_COLLAPSE = True
+FEATURE_HOTEL_COUNTER_STRICT_MODE = True
+FEATURE_DYNAMIC_HOMEBASE_MODE = True
+
+
 def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_minutes=0):
     """v8.1 Backend-Klassifikator: deterministisch aus DP+SE pro Tag.
 
@@ -6677,10 +6692,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     4. VMA-Unmapped-SE-Liste: aktive SE-Zeile ohne Z72/73/74/76 → echter Issue
 
     Klassen-Set: Z72, Z73, Z74, Z76, Office, Standby, ZeroDay, Sonstiges
-    Counter-Mapping:
-      arbeitstage = klass in {Z72,Z73,Z74,Z76,Office,Standby,ZeroDay}
-      fahr_tage   = klass in {Z72,Office,training-anreise,training-abreise,Z73-anreise,Z73-abreise,Z76-anreise}
-      hotel       = klass in {Z73,Z74,Z76,Office-Inland-Volltag} UND overnight=True
+    Counter-Mapping (v8.18.3 — alle aus tage_detail-Flags):
+      arbeitstage    = sum(counted_as_workday)
+      fahr_tage      = sum(counted_as_fahrtag)
+      reinigungstage = sum(counted_as_reinigungstag)
+      hotel_naechte  = sum(counted_as_hotel_nacht)
     """
     bmf_inland = BMF_INLAND_BY_YEAR.get(year, BMF_INLAND_BY_YEAR[2025])
     INLAND_TAGESTRIP_8H = bmf_inland['tagestrip_8h']
@@ -6713,7 +6729,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         """Lokaler Wrapper — sammelt BMF-Mapping-Lücken in _diag_bmf."""
         return _get_bmf_for_iata(iata, year, _diag=_diag_bmf)
 
-    def _recent_foreign_cluster(idx, max_back=4):
+    def _recent_foreign_cluster(idx, max_back=RECENT_FOREIGN_CLUSTER_MAX_BACK):
         """Schaut bis max_back Tage zurück nach geschlossenem has_foreign Cluster."""
         for back in range(1, max_back + 1):
             bi = idx - back
@@ -6736,7 +6752,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         se_inland = se.get('stfrei_inland')
 
         # 1. Recent-Foreign-Cluster Lookback (Heimkehr aus Langstrecke)
-        rec = _recent_foreign_cluster(i, max_back=4)
+        rec = _recent_foreign_cluster(i, max_back=RECENT_FOREIGN_CLUSTER_MAX_BACK)
         if rec:
             target_iata = ''
             for ci in rec.get('indices', []):
@@ -6839,7 +6855,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             i_pre += 1
         else:
             # Sequenz endet hier
-            if seq_start_pre is not None and len(seq_indices) >= 5:
+            if seq_start_pre is not None and len(seq_indices) >= TRAINING_SEQ_MIN_DAYS:
                 seq_days_pre = [sorted_days[idx] for idx in seq_indices]
                 any_daily_pre = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days_pre)
                 marker_types = sorted(set(
@@ -6877,7 +6893,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             # kein Marker, aber jetzt einfach weiter)
             i_pre += 1
     # Sequenz am Jahresende
-    if seq_start_pre is not None and len(seq_indices) >= 5:
+    if seq_start_pre is not None and len(seq_indices) >= TRAINING_SEQ_MIN_DAYS:
         seq_days_pre = [sorted_days[idx] for idx in seq_indices]
         any_daily_pre = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days_pre)
         marker_types = sorted(set(
@@ -7064,10 +7080,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     eur_added = INLAND_TAGESTRIP_8H
                     reason = 'Same-Day-Tagestrip (Dauer unbekannt, konservativ Z72)'
                     print(f"[v8-z72-duration] datum={datum} duty_minutes=0 commute_minutes={commute_total} total=? counted=Z72-konservativ")
-                elif total_min >= 480:
+                elif total_min >= SAME_DAY_Z72_TOTAL_MINUTES:
                     klass = 'Z72'
                     eur_added = INLAND_TAGESTRIP_8H
-                    reason = f'Same-Day Z72 — Dienst {duty_min}min + Fahrzeit {commute_total}min = {total_min}min ≥ 480min'
+                    reason = f'Same-Day Z72 — Dienst {duty_min}min + Fahrzeit {commute_total}min = {total_min}min ≥ {SAME_DAY_Z72_TOTAL_MINUTES}min'
                     print(f"[v8-z72-duration] datum={datum} duty_minutes={duty_min} commute_minutes={commute_total} total={total_min} counted=Z72")
                 else:
                     klass = 'ZeroDay'
@@ -7107,7 +7123,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 if is_anreise and start_time_str and ':' in start_time_str:
                     try:
                         start_h = int(start_time_str.split(':')[0])
-                        if start_h >= 18:
+                        if start_h >= EVENING_FOREIGN_TOUR_START_HOUR:
                             evening_anreise = True
                     except (ValueError, IndexError):
                         pass
@@ -7116,7 +7132,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     klass = 'Z73'
                     z73_type = 'evening_foreign_tour_start'
                     eur_added = INLAND_AN_ABREISE
-                    reason = f'Auslandstour-Anreise mit Abend-Briefing {start_time_str} (>= 18:00) → Inland-Anreise 14€'
+                    reason = f'Auslandstour-Anreise mit Abend-Briefing {start_time_str} (>= {EVENING_FOREIGN_TOUR_START_HOUR}:00) → Inland-Anreise 14€'
                     audit_note = f'{datum}: Auslandstour-Anreise nach {today_layover_ort}, Briefing {start_time_str} → Z73 Inland (Tag dominant in DE)'
                     print(f"[v8-z73-detail] datum={datum} ort={today_layover_ort} start={start_time_str} reason='Abend-Anreise → Z73 Inland'")
                 else:
@@ -7150,7 +7166,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     if is_anreise and start_time_str_v12 and ':' in start_time_str_v12:
                         try:
                             sh = int(start_time_str_v12.split(':')[0])
-                            if sh >= 18:
+                            if sh >= EVENING_FOREIGN_TOUR_START_HOUR:
                                 evening_anreise_v12 = True
                         except (ValueError, IndexError):
                             pass
@@ -7893,7 +7909,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             # Same-Day Inland >8h → Z72-Kandidat
             if (at == 'same_day' and not overnight and not prev_overnight
                     and (se_inland is True or (effective_ort and _is_inland_code(effective_ort)))
-                    and (duty_min_local + commute_minutes * 2) >= 480):
+                    and (duty_min_local + commute_minutes * 2) >= SAME_DAY_Z72_TOTAL_MINUTES):
                 missing_deutschland_14_candidates.append({
                     'datum': datum, 'klass': klass, 'expected': 'Z72',
                     'effective_ort': effective_ort,
@@ -7925,10 +7941,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 'is_abreise':  i in cluster_for_idx and cluster_for_idx[i].get('indices', [None])[-1] == i,
             })
 
-        # v8.11: office_z72_candidates — Office mit duty>=480 (>8h) ohne klaren Homebase-Bezug
+        # v8.11: office_z72_candidates — Office mit duty>=8h ohne klaren Homebase-Bezug
         if klass == 'Office':
             duty_min_office = int(d.get('duty_duration_minutes') or 0)
-            if duty_min_office >= 480:
+            if duty_min_office >= SAME_DAY_Z72_TOTAL_MINUTES:
                 office_z72_candidates.append({
                     'datum': datum, 'klass': klass,
                     'marker': d.get('raw_marker', '') or at,
@@ -7936,10 +7952,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'reason': 'Office >8h — auswärtige Schulung/Training? Z72-Kandidat'
                 })
 
-    # v8.11: training_commute_candidates — mehrtägige Training-Sequenz (≥ 4 zusammen)
-    # Wenn 4+ Tage hintereinander activity_type=training mit requires_commute=true,
-    # ist es vermutlich EINE auswärtige Schulung/Seminar mit nur 1 Anfahrt nötig,
-    # nicht jeden Tag eigene Fahrt.
+    # v8.11: training_commute_candidates — mehrtägige Training-Sequenz
+    # (≥TRAINING_SEQ_MIN_DAYS zusammen). Wenn so viele Tage hintereinander
+    # activity_type=training mit requires_commute=true, ist es vermutlich EINE
+    # auswärtige Schulung/Seminar mit nur 1 Anfahrt, nicht täglich eigene Fahrt.
     seq_start = None
     for i, m in enumerate(sorted_days):
         d = m['dp']
@@ -7947,7 +7963,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             if seq_start is None:
                 seq_start = i
         else:
-            if seq_start is not None and (i - seq_start) >= 5:
+            if seq_start is not None and (i - seq_start) >= TRAINING_SEQ_MIN_DAYS:
                 training_commute_candidates.append({
                     'start_datum': sorted_days[seq_start]['datum'],
                     'end_datum':   sorted_days[i-1]['datum'],
@@ -7955,7 +7971,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'reason': f'Mehrtägige Training-Sequenz {sorted_days[seq_start]["datum"]} bis {sorted_days[i-1]["datum"]} — evtl. nur 1-2 Fahrtage statt jeden Tag'
                 })
             seq_start = None
-    if seq_start is not None and (len(sorted_days) - seq_start) >= 5:
+    if seq_start is not None and (len(sorted_days) - seq_start) >= TRAINING_SEQ_MIN_DAYS:
         training_commute_candidates.append({
             'start_datum': sorted_days[seq_start]['datum'],
             'end_datum':   sorted_days[-1]['datum'],
