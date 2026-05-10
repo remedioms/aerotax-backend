@@ -2462,14 +2462,80 @@ def post_upload_replacement(job_id):
     }), 202
 
 
+def _validate_cas_reader_output(parsed):
+    """v10: Validiert Sonnet-Output gegen das Targeted-Reader-Schema.
+
+    Erwartet entweder das v2-Format mit 'matches' ODER das alte 'days'-Format
+    (Backwards-Compat während Migration). Returns (matches_list, errors_list).
+    """
+    matches = []
+    errors = []
+    if not isinstance(parsed, dict):
+        return matches, ['root_not_dict']
+    # v2-Format
+    if 'matches' in parsed and isinstance(parsed['matches'], list):
+        for entry in parsed['matches']:
+            if not isinstance(entry, dict):
+                errors.append('match_not_dict')
+                continue
+            rid = entry.get('review_item_id')
+            datum = entry.get('date') or entry.get('datum')
+            status = entry.get('status', '').lower()
+            if status not in ('found', 'not_found'):
+                errors.append(f'invalid_status:{status}')
+                continue
+            if status == 'found':
+                st = entry.get('start_time', '')
+                et = entry.get('end_time', '')
+                if not (st and et):
+                    # status=found ohne Zeit → downgrade auf not_found
+                    matches.append({'review_item_id': rid, 'date': datum, 'status': 'not_found',
+                                    'confidence': 'low'})
+                    continue
+            matches.append({
+                'review_item_id': rid,
+                'date': datum,
+                'status': status,
+                'marker': entry.get('marker', ''),
+                'start_time': entry.get('start_time', '') if status == 'found' else '',
+                'end_time': entry.get('end_time', '') if status == 'found' else '',
+                'confidence': (entry.get('confidence', 'medium') or 'medium').lower(),
+                'raw_excerpt': str(entry.get('raw_excerpt', ''))[:200],
+            })
+        return matches, errors
+    # Legacy v1: 'days'-Liste — als found-matches behandeln (review_item_id wird später gemapped)
+    if 'days' in parsed and isinstance(parsed['days'], list):
+        for d in parsed['days']:
+            if not isinstance(d, dict): continue
+            datum = d.get('datum') or d.get('date')
+            if not datum: continue
+            matches.append({
+                'review_item_id': None,
+                'date': datum,
+                'status': 'found' if (d.get('start_time') and d.get('end_time')) else 'not_found',
+                'marker': d.get('marker', ''),
+                'start_time': d.get('start_time', ''),
+                'end_time': d.get('end_time', ''),
+                'confidence': 'medium',
+                'raw_excerpt': '',
+            })
+        return matches, errors
+    return matches, ['no_matches_or_days_field']
+
+
 @app.route('/api/job/<job_id>/upload-roster-screenshot', methods=['POST'])
 def post_upload_roster_screenshot(job_id):
-    """v8.34: Sonnet Vision liest Daten + Zeiten aus einem Dienstplan-/Roster-
-    Screenshot oder -Foto. KEIN Auto-Apply: User muss im Chat bestätigen.
+    """v10 Targeted CAS Reader: Sonnet Vision sucht ausschließlich nach Ziel-Tagen
+    aus den pending review_items und liefert striktes Schema mit Status, Confidence
+    und Roh-Auszug. KEIN Auto-Apply: User bestätigt im Chat.
 
-    Body multipart/form-data: file (PDF/JPG/PNG/HEIC)
-    Returns: {recognized_count, matched_count, proposed_changes, detected_days,
-              confirmation_id, applied: False}
+    Cross-File-Conflicts werden über job-state tracking detektiert. Duplikate (gleiche
+    Datei doppelt) via SHA-256 deduped.
+
+    Body multipart/form-data: file (PDF/JPG/PNG/HEIC ≤8MB)
+    Returns: {matches[], conflicts[], recognized_count, matched_count, proposed_changes,
+              detected_days, unmatched_dates, confirmation_id, applied: False,
+              source_file_id, source_filename, source_hint}
     """
     import base64, json, re, hashlib
 
@@ -2481,11 +2547,14 @@ def post_upload_roster_screenshot(job_id):
     if fext not in ('pdf', 'jpg', 'jpeg', 'png', 'heic', 'heif'):
         return jsonify({'error': f'Format nicht unterstützt: .{fext}'}), 400
     if not ANTHROPIC_KEY:
-        return jsonify({'error': 'KI nicht verfügbar — Screenshot-Auswertung temporär aus'}), 503
+        return jsonify({'error': 'Auswertung gerade nicht verfügbar — bitte später erneut.'}), 503
 
     file_bytes = file.read()
     if not file_bytes or len(file_bytes) > 8 * 1024 * 1024:
         return jsonify({'error': 'Datei leer oder zu groß (max 8 MB)'}), 400
+
+    # v10: SHA-256 als file_id für Dedupe (gleiche Datei doppelt = ignorieren)
+    file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
 
     # Job laden
     with _jobs_lock:
@@ -2496,11 +2565,44 @@ def post_upload_roster_screenshot(job_id):
         existing_overrides = dict(j.get('manual_day_overrides') or {})
         cached = (j.get('data') or {}).get('_cached_recalc_state') or {}
         initial_total = float((j.get('data') or {}).get('netto') or 0)
+        # v10: Cross-File-State für Conflict-Detection
+        cas_detected_per_date = dict(j.get('_cas_detected_per_date') or {})
+        seen_file_hashes = set(j.get('_cas_seen_file_hashes') or [])
+
+    # v10: Dedupe — gleiche Datei doppelt → freundlich melden
+    if file_hash in seen_file_hashes:
+        return jsonify({
+            'matches': [],
+            'conflicts': [],
+            'recognized_count': 0,
+            'matched_count': 0,
+            'pending_total': len([it for it in review_items if it.get('status') == 'pending']),
+            'detected_days': [],
+            'proposed_changes': [],
+            'unmatched_dates': [],
+            'confirmation_id': '',
+            'applied': False,
+            'source_file_id': file_hash,
+            'source_filename': fname,
+            'source_hint': 'user_uploaded_roster_cas_detected',
+            'duplicate_file_skipped': True,
+            'message': 'Diese Datei wurde bereits ausgewertet — überspringe sie.',
+        })
 
     pending = [it for it in review_items if it.get('status') == 'pending']
     if not pending:
-        return jsonify({'error': 'Keine offenen Tage — Screenshot wird nicht benötigt'}), 400
-    pending_dates = [it.get('datum', '') for it in pending if it.get('datum')]
+        return jsonify({'error': 'Keine offenen Tage — Datei wird nicht benötigt'}), 400
+
+    # v10: Target-Liste mit review_item_id + Marker-Hint für stärkere Sonnet-Lenkung
+    targets = []
+    for it in pending:
+        targets.append({
+            'review_item_id': it.get('id', ''),
+            'date': it.get('datum', ''),
+            'marker_hint': it.get('marker', ''),
+            'activity': it.get('activity_type', ''),
+        })
+    pending_dates = [t['date'] for t in targets if t['date']]
 
     # Sonnet Vision Call
     media_type_map = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
@@ -2509,15 +2611,31 @@ def post_upload_roster_screenshot(job_id):
     media_type = media_type_map.get(fext, 'image/jpeg')
     b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
 
+    # v10: Strikter Target-Reader-Prompt. Sucht ausschließlich Ziel-Tage,
+    # erfindet keine Zeiten, gibt status='not_found' bei Unsicherheit.
+    target_lines = []
+    for t in targets[:60]:  # cap auf 60 Targets pro Call (Token-Budget)
+        target_lines.append(f"  - {t['date']}  (review_item_id={t['review_item_id']}, marker={t['marker_hint'] or 'n/a'})")
     prompt = (
-        f"Lies aus diesem Dienstplan-/Roster-Bild die Tagesdaten und Uhrzeiten ab.\n\n"
-        f"Wir suchen Zeiten für diese offenen Tage (YYYY-MM-DD): {', '.join(pending_dates)}\n\n"
-        f"Antworte ausschließlich als JSON in dieser Form (keine Erklärungen):\n"
-        f'{{"days": [{{"datum": "YYYY-MM-DD", "start_time": "HH:MM", "end_time": "HH:MM"}}, ...]}}\n\n'
-        f"- Wenn ein Tag oder eine Uhrzeit nicht eindeutig erkennbar ist, lass ihn weg.\n"
-        f"- Nimm nur Tage, die in der oben genannten Liste vorkommen.\n"
-        f"- Datum-Format YYYY-MM-DD strikt.\n"
-        f"- Uhrzeit 24h-Format HH:MM.\n"
+        "Du liest einen Dienstplan/CAS/Roster für eine Lufthansa-Crewmember.\n\n"
+        "Wichtig:\n"
+        "- Suche ausschließlich nach den unten genannten Ziel-Tagen.\n"
+        "- Ignoriere alle anderen Tage im Dienstplan.\n"
+        "- Erfinde keine Zeiten. Wenn ein Ziel-Tag nicht sicher erkennbar ist, gib status='not_found' zurück.\n"
+        "- Gib keine steuerliche Bewertung ab.\n\n"
+        "Ziel-Tage:\n"
+        + '\n'.join(target_lines) + '\n\n'
+        "Extrahiere pro Ziel-Tag ein Match-Objekt mit diesen Feldern:\n"
+        "  - review_item_id: exakt der Ziel-ID aus der Liste\n"
+        "  - date: YYYY-MM-DD\n"
+        "  - status: 'found' wenn Datum+Zeiten sicher erkennbar, sonst 'not_found'\n"
+        "  - marker: Terminname/Kürzel aus dem Plan (z.B. 'EK BUERODIENST', 'D4 SCHULUNG')\n"
+        "  - start_time: HH:MM (24h), nur bei status='found'\n"
+        "  - end_time: HH:MM (24h), nur bei status='found'\n"
+        "  - confidence: 'high' wenn klar lesbar, 'medium' wenn etwas unsicher, 'low' wenn sehr unsicher\n"
+        "  - raw_excerpt: kurzer sichtbarer Zeilenausschnitt (max 100 Zeichen)\n\n"
+        "Antwort ausschließlich als JSON in diesem Schema:\n"
+        '{"matches": [{"review_item_id": "...", "date": "YYYY-MM-DD", "status": "found", "marker": "...", "start_time": "HH:MM", "end_time": "HH:MM", "confidence": "high", "raw_excerpt": "..."}, ...]}\n'
     )
 
     try:
@@ -2534,77 +2652,173 @@ def post_upload_roster_screenshot(job_id):
             ]
         resp = client.messages.create(
             model='claude-sonnet-4-6',
-            max_tokens=2000,
+            max_tokens=3000,
             messages=[{'role': 'user', 'content': content}],
         )
         text_out = resp.content[0].text
     except Exception as e:
         print(f'[upload-roster-screenshot] Sonnet fail: {e}')
-        return jsonify({'error': 'Konnte das Bild nicht auswerten — bitte mit klarerem Screenshot erneut versuchen.'}), 502
+        return jsonify({'error': 'Konnte die Datei gerade nicht auswerten — bitte mit klarerem Screenshot erneut versuchen.'}), 502
 
-    # JSON parsen
+    # v10: JSON parsen + gegen Schema validieren
     m = re.search(r'\{[\s\S]*\}', text_out or '')
-    detected_days = []
+    matches_raw = []
+    schema_errors = []
     if m:
         try:
             parsed = json.loads(m.group(0))
-            detected_days = [d for d in (parsed.get('days') or [])
-                             if isinstance(d, dict) and d.get('datum')]
+            matches_raw, schema_errors = _validate_cas_reader_output(parsed)
         except Exception as e:
             print(f'[upload-roster-screenshot] JSON parse fail: {e}')
+            schema_errors.append('json_parse_fail')
 
-    # Mapping zu proposed_changes
+    # v10: Map auf review_items (Review-IDs in Target-Liste sind Wahrheit, Datum als Fallback)
+    items_by_id = {it.get('id'): it for it in review_items}
+    pending_by_date = {it.get('datum'): it for it in pending}
+    valid_target_ids = {t['review_item_id'] for t in targets}
+
+    matches = []
     proposed_changes = []
+    detected_days = []  # backwards-compat
     matched_dates = set()
-    items_by_id = {it['id']: it for it in review_items}
-    pending_by_date = {it['datum']: it for it in pending}
-    for d in detected_days:
-        datum = d.get('datum', '')
-        st = d.get('start_time', '')
-        et = d.get('end_time', '')
-        it = pending_by_date.get(datum)
-        if not it: continue
-        try:
-            sh, sm = map(int, st.split(':')[:2])
-            eh, em = map(int, et.split(':')[:2])
-            minutes = (eh * 60 + em) - (sh * 60 + sm)
-            if minutes < 0:
-                minutes += 24 * 60
-        except Exception:
-            continue
-        over_8h = minutes > 480
-        proposed_changes.append({
-            'review_item_id': it['id'],
-            'answer': 'yes' if over_8h else 'no',
-            'detected_start': st,
-            'detected_end': et,
-            'detected_minutes': minutes,
-        })
-        matched_dates.add(datum)
+    conflicts = []
 
-    # Confirmation-ID
-    cid_src = job_id + '|screenshot|' + json.dumps(detected_days, sort_keys=True)
+    for m_entry in matches_raw:
+        rid = m_entry.get('review_item_id')
+        datum = m_entry.get('date')
+        # Sicherheit: review_item_id MUSS in Target-Liste sein (kein fremder Tag)
+        target_item = None
+        if rid and rid in valid_target_ids:
+            target_item = items_by_id.get(rid)
+        elif datum and datum in pending_by_date:
+            target_item = pending_by_date[datum]
+            rid = target_item.get('id')
+        if not target_item:
+            # Fremder Tag oder ungültige ID → silently skip (Reader hat Anweisung übertreten)
+            continue
+        # Datum-Konsistenz prüfen
+        if datum and datum != target_item.get('datum'):
+            continue  # Reader hat ID falsch zugeordnet → skip
+        datum = target_item.get('datum')
+
+        status = m_entry.get('status', 'not_found')
+        st = m_entry.get('start_time', '') or ''
+        et = m_entry.get('end_time', '') or ''
+
+        match_obj = {
+            'review_item_id': rid,
+            'date': datum,
+            'status': status,
+            'marker': m_entry.get('marker', ''),
+            'start_time': st,
+            'end_time': et,
+            'duration_minutes': None,
+            'confidence': m_entry.get('confidence', 'medium'),
+            'source_file_id': file_hash,
+            'source_filename': fname,
+            'raw_excerpt': m_entry.get('raw_excerpt', ''),
+        }
+
+        if status == 'found' and st and et:
+            try:
+                sh, sm = map(int, st.split(':')[:2])
+                eh, em = map(int, et.split(':')[:2])
+                minutes = (eh * 60 + em) - (sh * 60 + sm)
+                if minutes < 0:
+                    minutes += 24 * 60
+                match_obj['duration_minutes'] = minutes
+            except Exception:
+                # Ungültige Zeit → downgrade auf not_found
+                match_obj['status'] = 'not_found'
+                match_obj['start_time'] = ''
+                match_obj['end_time'] = ''
+                matches.append(match_obj)
+                continue
+
+            # v10: Cross-File-Conflict-Detection
+            prior = cas_detected_per_date.get(datum) or []
+            time_sig = f"{st}-{et}"
+            existing_sigs = [(p.get('start_time', '') + '-' + p.get('end_time', '')) for p in prior]
+            if existing_sigs and time_sig not in existing_sigs:
+                # Conflict — andere Zeit für selben Tag aus früherer Datei
+                conflicts.append({
+                    'review_item_id': rid,
+                    'date': datum,
+                    'candidates': prior + [{'start_time': st, 'end_time': et,
+                                             'source_filename': fname,
+                                             'source_file_id': file_hash}],
+                })
+                matches.append(match_obj)
+                # Conflict → KEIN proposed_change (User muss wählen)
+                continue
+            if time_sig in existing_sigs:
+                # Dedupe — selbe Zeit, neuer File → bestätigt vorhanden, kein neuer change
+                matches.append(match_obj)
+                matched_dates.add(datum)
+                continue
+
+            # Neue Erkennung → Track + proposed_change
+            cas_detected_per_date.setdefault(datum, []).append({
+                'start_time': st, 'end_time': et,
+                'source_filename': fname, 'source_file_id': file_hash,
+            })
+            over_8h = minutes > 480
+            proposed_changes.append({
+                'review_item_id': rid,
+                'answer': 'yes' if over_8h else 'no',
+                'detected_start': st,
+                'detected_end': et,
+                'detected_minutes': minutes,
+                'source_file_id': file_hash,
+                'source_filename': fname,
+                'confidence': match_obj['confidence'],
+            })
+            detected_days.append({'datum': datum, 'start_time': st, 'end_time': et})
+            matched_dates.add(datum)
+
+        matches.append(match_obj)
+
+    # Confirmation-ID (deterministisch über sortierte review_item_ids + Zeiten)
+    cid_payload = sorted([(c.get('review_item_id', ''), c.get('detected_start', ''),
+                           c.get('detected_end', '')) for c in proposed_changes])
+    cid_src = job_id + '|cas_v10|' + json.dumps(cid_payload)
     confirmation_id = hashlib.sha256(cid_src.encode('utf-8')).hexdigest()[:16]
 
-    # Audit-Eintrag (optional — nur Logging, kein Apply)
+    # Audit-Eintrag + Cross-File-State persistieren
     with _jobs_lock:
         j2 = _jobs.get(job_id) or _load_job_from_disk(job_id)
-        if j2 and 'audit' in j2 and isinstance(j2['audit'], list):
-            j2['audit'].append({
-                'event': 'roster_screenshot_uploaded',
-                'data': {
-                    'filename': fname, 'recognized_count': len(detected_days),
-                    'matched_count': len(proposed_changes),
-                    'pending_total': len(pending_dates),
-                    'confirmation_id': confirmation_id,
-                },
-                'timestamp': datetime.now().isoformat(),
-            })
+        if j2:
+            j2['_cas_detected_per_date'] = cas_detected_per_date
+            seen = set(j2.get('_cas_seen_file_hashes') or [])
+            seen.add(file_hash)
+            j2['_cas_seen_file_hashes'] = sorted(seen)
+            if 'audit' in j2 and isinstance(j2['audit'], list):
+                j2['audit'].append({
+                    'event': 'roster_cas_uploaded',
+                    'data': {
+                        'filename': fname,
+                        'source_file_id': file_hash,
+                        'recognized_count': sum(1 for m in matches if m.get('status') == 'found'),
+                        'matched_count': len(proposed_changes),
+                        'conflicts_count': len(conflicts),
+                        'pending_total': len(pending_dates),
+                        'confirmation_id': confirmation_id,
+                        'schema_errors': schema_errors,
+                        'source': 'user_uploaded_roster_cas_detected',
+                    },
+                    'timestamp': datetime.now().isoformat(),
+                })
             try: _save_job_to_disk(job_id)
             except Exception: pass
 
     return jsonify({
-        'recognized_count':  len(detected_days),
+        # v10 neue Felder
+        'matches':           matches,
+        'conflicts':         conflicts,
+        'source_file_id':    file_hash,
+        'source_filename':   fname,
+        # Backwards-compat Felder (Frontend nutzt diese im Multi-CAS-Flow)
+        'recognized_count':  sum(1 for m in matches if m.get('status') == 'found'),
         'matched_count':     len(proposed_changes),
         'pending_total':     len(pending_dates),
         'detected_days':     detected_days,
@@ -2612,7 +2826,7 @@ def post_upload_roster_screenshot(job_id):
         'unmatched_dates':   [d for d in pending_dates if d not in matched_dates],
         'confirmation_id':   confirmation_id,
         'applied':           False,
-        'source_hint':       'user_uploaded_roster_screenshot',
+        'source_hint':       'user_uploaded_roster_cas_detected',
     })
 
 
@@ -2681,6 +2895,23 @@ def post_finalize_pdf(job_id):
                    if isinstance(v, dict) and not v.get('unsure'))
     unsure_n = sum(1 for v in overrides.values()
                    if isinstance(v, dict) and v.get('unsure'))
+    # v10: CAS-Quelle und Skip-Hinweis transparent im Audit dokumentieren.
+    cas_detected_dates = j.get('_cas_detected_per_date') or {}
+    cas_used_count = 0
+    if cas_detected_dates:
+        # Wie viele der angewendeten Antworten kamen aus CAS-Quelle?
+        for k, v in overrides.items():
+            if isinstance(v, dict) and v.get('source') in (
+                'user_uploaded_roster_cas_detected',
+                'user_uploaded_roster_screenshot',
+                'user_uploaded_roster_multi_confirmed',
+            ):
+                cas_used_count += 1
+    if cas_used_count > 0:
+        notes_existing.append(
+            f'ℹ Für {cas_used_count} Tag(e) wurden Zeiten aus einem optional '
+            f'hochgeladenen Dienstplan/CAS erkannt und vom Nutzer bestätigt.'
+        )
     if answered > 0:
         notes_existing.append(
             f'ℹ {answered} Schulungs-/Office-Tag(e) durch deine Antworten ergänzt.'
@@ -2688,6 +2919,10 @@ def post_finalize_pdf(job_id):
     if unsure_n > 0:
         notes_existing.append(
             f'ℹ {unsure_n} Tag(e) nicht bestätigt (User unsicher) — im Nachweis vermerkt.'
+        )
+    if skip_unanswered:
+        notes_existing.append(
+            'ℹ Nicht bestätigte Punkte wurden nicht zusätzlich berücksichtigt.'
         )
     final_data['notes'] = notes_existing
 
@@ -13303,27 +13538,52 @@ def erstelle_pdf(d):
             "Sie dient als Nachweis gegenüber dem Finanzamt und Steuerberater.",
             ps("td_intro", fontSize=9, textColor=TEXT2, fontName="Helvetica",
                leading=13, alignment=TA_LEFT, spaceAfter=12)))
-        # Tabelle aufbauen
-        tdata = [['Datum', 'Marker', 'Routing', 'Klass.', 'Begründung']]
+        # v10: Cells als Paragraph mit wordWrap='CJK' — lange Routing-/Begründung-Strings
+        # wickeln in die nächste Zeile statt rechts aus der Spalte zu fließen.
+        # ReportLab's ps() ist `ParagraphStyle(name, parent=Normal, **kw)` — wordWrap durchgereicht.
+        def _safe_cell(s):
+            # Escape für Paragraph (HTML-Parser von ReportLab interpretiert <, >, &).
+            return (str(s or '')
+                    .replace('&', '&amp;')
+                    .replace('<', '&lt;')
+                    .replace('>', '&gt;'))
+        cell_head_style = ps('td_head', fontSize=7.5, leading=9.5, fontName='Helvetica-Bold',
+                             textColor=TEXT, wordWrap='CJK', alignment=TA_LEFT)
+        cell_body_style = ps('td_body', fontSize=6.8, leading=8.6, fontName='Helvetica',
+                             textColor=TEXT2, wordWrap='CJK', alignment=TA_LEFT)
+        tdata = [[
+            Paragraph('Datum', cell_head_style),
+            Paragraph('Marker', cell_head_style),
+            Paragraph('Routing', cell_head_style),
+            Paragraph('Klass.', cell_head_style),
+            Paragraph('Begründung', cell_head_style),
+        ]]
         # v8.18.6: Cap auf 366 (volles Jahr inkl. Schaltjahr) — vorher 200 → Cut-off Mitte Juli
         for entry in tage_detail[:366]:
             if not isinstance(entry, dict):
                 continue
-            datum = str(entry.get('datum', ''))[:10]
-            marker = str(entry.get('marker', ''))[:14]
-            routing = str(entry.get('routing', ''))[:18]
-            klass = str(entry.get('klass', ''))[:8]
-            begr = str(entry.get('begruendung', ''))[:90]
-            tdata.append([datum, marker, routing, klass, begr])
+            datum = _safe_cell(entry.get('datum', ''))[:10]
+            # v10: Marker/Routing/Klass/Begründung NICHT mehr hart truncaten —
+            # wordWrap='CJK' fließt in die nächste Zeile innerhalb der Zelle.
+            marker = _safe_cell(entry.get('marker', ''))[:40]
+            routing = _safe_cell(entry.get('routing', ''))[:80]
+            klass = _safe_cell(entry.get('klass', ''))[:12]
+            begr = _safe_cell(entry.get('begruendung', ''))[:240]
+            tdata.append([
+                Paragraph(datum, cell_body_style),
+                Paragraph(marker, cell_body_style),
+                Paragraph(routing, cell_body_style),
+                Paragraph(klass, cell_body_style),
+                Paragraph(begr, cell_body_style),
+            ])
         if len(tdata) > 1:
-            ttab = LongTable(tdata, colWidths=[1.8*cm, 1.6*cm, 2.2*cm, 1.4*cm, 9.3*cm], repeatRows=1)
+            # v10: Routing-Spalte etwas breiter (lange Flugnummer+Routing wie 'LH0400 A FRA 0 FRA-JFK')
+            ttab = LongTable(tdata, colWidths=[1.7*cm, 1.7*cm, 2.6*cm, 1.4*cm, 8.9*cm], repeatRows=1)
             ttab.setStyle(TableStyle([
                 ('BACKGROUND', (0,0), (-1,0), BG_CARD),
-                ('TEXTCOLOR', (0,0), (-1,0), TEXT),
-                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0,0), (-1,-1), 7.5),
-                ('TEXTCOLOR', (0,1), (-1,-1), TEXT2),
-                ('FONTNAME', (0,1), (-1,-1), 'Helvetica'),
+                # FONTNAME/FONTSIZE/TEXTCOLOR werden von Paragraph-Style getragen,
+                # bleiben hier als Defensiv-Fallback falls eine Zelle als String durchschlüpft.
+                ('FONTSIZE', (0,0), (-1,-1), 7.0),
                 ('VALIGN', (0,0), (-1,-1), 'TOP'),
                 ('LINEBELOW', (0,0), (-1,0), 0.4, LINE2),
                 ('LINEBELOW', (0,1), (-1,-1), 0.2, LINE),

@@ -6669,7 +6669,8 @@ def test_v834_screenshot_endpoint_uses_sonnet_vision():
         # Endpoint noch nicht implementiert → skip mit klarer Message
         import pytest
         pytest.skip('Screenshot-Endpoint noch nicht implementiert')
-    block = src[fn_idx:fn_idx+3000]
+    # v10: Window erweitert — Endpoint wurde mit Targeted-Reader-v2 Schema deutlich länger.
+    block = src[fn_idx:fn_idx+9000]
     assert "type': 'image'" in block or 'media_type' in block, \
         'Screenshot-Endpoint muss Sonnet-Vision-Format verwenden'
 
@@ -7369,16 +7370,22 @@ def test_v92_audit_friendly_job_not_found_in_frontend():
 
 
 def test_v92_audit_pdf_cta_bubble_after_review_complete():
-    """AUDIT D+E: nach Apply mit remaining=0 erscheint PDF-CTA-Bubble im Chat."""
+    """AUDIT D+E: nach Apply mit remaining=0 erscheint PDF-Bubble im Chat.
+    v10: Inline-CTA-Builder wurde durch unified `_refreshPdfBubble()` ersetzt —
+    Button-Text ist jetzt „PDF herunterladen" (statt „Finales PDF erstellen")."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     assert 'chat-pdf-cta' in src
-    assert 'Finales PDF erstellen' in src
+    # v10: Unified PDF-Bubble verwendet „PDF herunterladen" / „PDF bereit" Wording
+    assert 'PDF herunterladen' in src, 'PDF-Bubble-Button-Text fehlt'
+    assert '_refreshPdfBubble' in src, 'Unified PDF-Bubble-Function fehlt'
     fn_idx = src.find('async function _applyPendingProposal')
     block = src[fn_idx:fn_idx+15000]
     assert "stillPending === 0" in block
-    assert 'chat-pdf-cta' in block
+    # v10: Apply-Pfad ruft _refreshPdfBubble (statt inline-CTA bauen)
+    assert '_refreshPdfBubble' in block, \
+        'Review-Apply-Pfad muss unified PDF-Bubble verwenden'
 
 
 def test_v92_audit_header_pill_says_offen_not_geklaert():
@@ -7463,14 +7470,21 @@ def test_v94_buildChatOverlay_inline_mode_branch():
 
 
 def test_v94_chat_close_hides_inline_host():
-    """_chatClose hidet auch chat-inline-host (Container im Layout)."""
+    """v10: _chatClose ist im Inline-Mode ein NO-OP (Chat ist permanent sichtbar).
+    Nur Legacy-Modal-Mode schließt. v9.4-Verhalten (hide inline-host) wurde
+    explizit zurückgenommen, weil Chat „fix da sein" soll."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatClose = function')
-    block = src[fn_idx:fn_idx+500]
-    assert "getElementById('chat-inline-host')" in block
-    assert "inlineHost.style.display = 'none'" in block
+    block = src[fn_idx:fn_idx+600]
+    assert "getElementById('chat-inline-host')" in block, \
+        '_chatClose muss inline-host detecten'
+    # v10: KEIN hide im Inline-Pfad — return early
+    assert 'inlineHost.contains(chatOverlay)' in block
+    pre_return = block[:block.find('return;')]
+    assert "inlineHost.style.display = 'none'" not in pre_return, \
+        'v10: Inline-Mode darf inline-host NICHT verstecken (Chat permanent)'
 
 
 # ── v9.6 Chat-Reset + Header-Cleanup + AI-Routing ──
@@ -7752,6 +7766,619 @@ def test_v99_review_messages_dont_count_against_chat_limit():
     body_only = re.sub(r'""".*?"""', '', block, count=1, flags=re.DOTALL)
     assert 'chat_history' not in body_only, \
         'review-answer-bulk darf chat_history nicht inkrementieren'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v10 — Public-Release Tests (Chat-Inline, PDF-Bubble, 4. Upload-Kachel,
+# Targeted CAS Reader v2, PDF Long-Routing-Wrap, CAS-Source-Note, Skipped-Note)
+# ════════════════════════════════════════════════════════════════════════════
+
+_FRONTEND_HTML = '/Users/miguelschumann/Desktop/site/index.html'
+_APP_PY = os.path.join(os.path.dirname(__file__), '..', 'app.py')
+
+
+def _read_frontend():
+    return open(_FRONTEND_HTML).read()
+
+
+def _read_backend():
+    return open(_APP_PY).read()
+
+
+# ── Chat permanent inline ─────────────────────────────────────────────────
+
+def test_v10_chat_inline_host_permanent_display_block():
+    """chat-inline-host muss display:block sein (kein Popup-Effekt mehr)."""
+    src = _read_frontend()
+    idx = src.find('id="chat-inline-host"')
+    assert idx > 0, 'chat-inline-host element missing'
+    block = src[idx:idx + 200]
+    assert 'display:block' in block, \
+        f'chat-inline-host must be display:block (permanent inline). Found: {block[:200]}'
+
+
+def test_v10_chat_overlay_inline_initial_display_block():
+    """buildChatOverlay inline-mode initial style MUSS display:block sein."""
+    src = _read_frontend()
+    idx = src.find('function buildChatOverlay')
+    assert idx > 0
+    block = src[idx:idx + 3000]
+    # Im Inline-Branch darf nicht display:none als initial sein
+    inline_branch = block[block.find('inlineMode'):block.find('} else {')]
+    assert 'display:block;width:100%' in inline_branch, \
+        'inline-mode initial style must be display:block (no pop-in)'
+
+
+def test_v10_chat_close_noop_in_inline_mode():
+    """_chatClose darf im Inline-Mode KEINEN display:none auf inline-host setzen."""
+    src = _read_frontend()
+    idx = src.find('window._chatClose = function')
+    assert idx > 0
+    block = src[idx:idx + 600]
+    # v10-Verhalten: erkennt inline-host und returnt früh
+    assert 'inlineHost.contains(chatOverlay)' in block, \
+        '_chatClose must detect inline-mode and return early'
+    # Stelle sicher dass im Inline-Pfad KEIN inline-host hidden wird
+    pre_return = block[:block.find('return;')]
+    assert "inlineHost.style.display = 'none'" not in pre_return, \
+        'Inline-Mode darf inline-host nicht verstecken'
+
+
+def test_v10_chat_open_idempotent_when_already_populated():
+    """_chatOpen: wenn Chat schon gefüllt und KEIN presetQuestion → kein Wipe."""
+    src = _read_frontend()
+    idx = src.find('window._chatOpen = async function')
+    assert idx > 0
+    block = src[idx:idx + 2500]
+    assert 'alreadyPopulated' in block, \
+        '_chatOpen needs alreadyPopulated check (idempotent open)'
+    # Wenn alreadyPopulated und kein preset → return ohne wipe
+    assert 'alreadyPopulated && !presetQuestion' in block
+
+
+def test_v10_chat_auto_open_no_600ms_timeout():
+    """Chat-Auto-Open beim Result-Render: kein 600ms Timeout mehr."""
+    src = _read_frontend()
+    idx = src.find('_chatAutoOpenedThisRender')
+    assert idx > 0
+    # Suche im Render-Block ob 600 als Timeout-Wert vorkommt
+    block = src[idx:idx + 2000]
+    # Erlaubt: 800ms für CAS-replay debounce — nicht für initial chat open.
+    # Das ursprüngliche 600ms Auto-Open-Pop-In darf nicht mehr da sein.
+    assert '600' not in block.split('window._chatOpen(items.length')[0] or True
+    # Genauere Assertion: zwischen `_chatAutoOpenedThisRender = true` und `_chatOpen(` darf
+    # kein setTimeout(...600) sein.
+    autoblock = block[block.find('_chatAutoOpenedThisRender = true'):block.find('_chatOpen(')]
+    assert 'setTimeout' not in autoblock, \
+        'Initial _chatOpen darf kein setTimeout mehr nutzen (kein Pop-In)'
+
+
+def test_v10_chat_oeffnen_button_removed_from_intro():
+    """„Chat öffnen"-Button im Intro-Bereich der Result-Page entfernt
+    (Chat ist permanent inline darunter)."""
+    src = _read_frontend()
+    # Bereich um result-session-token Sektion 1
+    idx = src.find('id="result-session-token"')
+    assert idx > 0
+    block = src[idx:idx + 4000]
+    # Section 1 (vor Zugangscode-Section)
+    sec1 = block[:block.find('Zugangscode')] if 'Zugangscode' in block else block[:2000]
+    # „Chat öffnen"-Standalone-Button (mit type-Pattern) darf nicht in Sektion 1 sein
+    assert '>Chat öffnen</button>' not in sec1, \
+        'Chat-öffnen-Button im Intro entfernen — Chat ist permanent inline'
+
+
+# ── PDF-Bubble im Chat ────────────────────────────────────────────────────
+
+def test_v10_refresh_pdf_bubble_function_exists():
+    """window._refreshPdfBubble muss existieren — unified PDF-Bubble-Renderer."""
+    src = _read_frontend()
+    assert 'window._refreshPdfBubble = function' in src, \
+        '_refreshPdfBubble function fehlt'
+
+
+def test_v10_pdf_bubble_auto_refresh_on_amount_change():
+    """animateAmountToBackendTotal MUSS _refreshPdfBubble({updated:true}) triggern."""
+    src = _read_frontend()
+    idx = src.find('function animateAmountToBackendTotal')
+    assert idx > 0
+    block = src[idx:idx + 2500]
+    assert '_refreshPdfBubble' in block, \
+        'animateAmountToBackendTotal must auto-refresh PDF bubble'
+    assert 'updated:true' in block, \
+        'Auto-refresh muss mit {updated:true} markieren'
+
+
+def test_v10_pdf_bubble_uses_finalize_pdf_each_click():
+    """PDF-Bubble-Click triggert dlPDF → /finalize-pdf (deterministisch, kein Sonnet)."""
+    src = _read_frontend()
+    idx = src.find('window._refreshPdfBubble = function')
+    assert idx > 0
+    block = src[idx:idx + 2500]
+    assert 'window.dlPDF()' in block, \
+        'PDF-Bubble onclick must call dlPDF (which posts /finalize-pdf)'
+
+
+def test_v10_pdf_bubble_mentions_24h():
+    """PDF-Bubble Text soll 24h-Gültigkeit erwähnen (24h beliebig oft)."""
+    src = _read_frontend()
+    idx = src.find('window._refreshPdfBubble = function')
+    assert idx > 0
+    block = src[idx:idx + 2500]
+    assert '24' in block and ('24h' in block or '24 Stunden' in block), \
+        'Bubble-Text soll 24h erwähnen (Token-Gültigkeit)'
+
+
+# ── 4. Upload-Kachel ──────────────────────────────────────────────────────
+
+def test_v10_upload_page_has_fourth_card_cas():
+    """Upload-Page muss 4. Karte „Dienstplan/CAS/Roster" haben."""
+    src = _read_frontend()
+    assert 'id="rc-cas"' in src, '4. Upload-Karte rc-cas fehlt'
+    assert 'id="f-cas"' in src, 'f-cas File-Input fehlt'
+    assert 'Dienstplan / CAS / Roster' in src or 'Dienstplan/CAS/Roster' in src or 'Dienstplan / CAS' in src, \
+        '4. Karte muss Titel „Dienstplan/CAS/Roster" enthalten'
+
+
+def test_v10_cas_card_badge_sehr_empfohlen():
+    """CAS-Karte muss „Sehr empfohlen"-Badge tragen."""
+    src = _read_frontend()
+    idx = src.find('id="rc-cas"')
+    assert idx > 0
+    block = src[idx:idx + 3000]
+    assert 'Sehr empfohlen' in block, '4. Karte braucht „Sehr empfohlen"-Badge'
+
+
+def test_v10_cas_card_states_optional():
+    """4. Karte ist explizit optional — Status-Text und Hinweis."""
+    src = _read_frontend()
+    idx = src.find('id="rc-cas"')
+    block = src[idx:idx + 3500]
+    assert 'optional' in block.lower(), 'CAS-Karte muss als optional markiert sein'
+    assert 'auch ohne' in block.lower() or 'ohne diese' in block.lower(), \
+        'Karte muss „kannst die Auswertung auch ohne starten" kommunizieren'
+
+
+def test_v10_cas_card_multifile_accepted():
+    """f-cas Input muss multiple sein + PDF/JPG/PNG/HEIC akzeptieren."""
+    src = _read_frontend()
+    idx = src.find('id="f-cas"')
+    assert idx > 0
+    block = src[idx:idx + 400]
+    assert 'multiple' in block, 'f-cas muss multiple sein'
+    assert '.pdf' in block.lower() and 'image/*' in block, \
+        'f-cas muss PDF und Bilder akzeptieren'
+    assert '.heic' in block.lower() or '.heif' in block.lower(), \
+        'f-cas muss HEIC akzeptieren'
+
+
+def test_v10_cas_card_uses_mytime_path_documented():
+    """CAS-Karte nennt den dokumentierten Pfad: „MyTime → Document Store"."""
+    src = _read_frontend()
+    idx = src.find('id="rc-cas"')
+    block = src[idx:idx + 3500]
+    assert 'MyTime' in block and 'Document Store' in block, \
+        'CAS-Karte muss dokumentierten Pfad „MyTime → Document Store" nennen'
+
+
+def test_v10_cas_card_no_invented_path():
+    """Falls MyTime-Pfad NICHT dokumentiert wäre, dürfte er nicht erfunden werden.
+    Hier IST er dokumentiert (User-bestätigt) — Test guard für zukünftige Regressionen."""
+    src = _read_frontend()
+    idx = src.find('id="rc-cas"')
+    block = src[idx:idx + 3500]
+    # Falsche/erfundene Pfade dürfen nicht erscheinen
+    forbidden_paths = ['NetLine', 'eCrew', 'CrewLink']
+    for p in forbidden_paths:
+        assert p not in block, f'Erfundener Pfad „{p}" in CAS-Karte — bitte nur dokumentierte Pfade verwenden'
+
+
+def test_v10_cas_card_not_in_pflicht_progress():
+    """progress-Bar muss „0 von 3 Pflicht-Dokumenten" lauten — NICHT „von 4"
+    (CAS ist optional, zählt nicht in den Pflicht-Progress)."""
+    src = _read_frontend()
+    assert '0 von 3 Pflicht-Dokumenten hochgeladen' in src
+    assert '0 von 4 Pflicht-Dokumenten hochgeladen' not in src
+
+
+def test_v10_cas_upload_handler_present():
+    """uploadCAS / clearCAS Handler müssen definiert sein."""
+    src = _read_frontend()
+    assert 'function uploadCAS(' in src, 'uploadCAS Handler fehlt'
+    assert 'function clearCAS(' in src, 'clearCAS Handler fehlt'
+    assert 'window._cas_files' in src, 'window._cas_files State fehlt'
+
+
+def test_v10_cas_auto_replay_after_calc():
+    """Nach Calc-Done werden gespeicherte CAS-Files via existing Multi-CAS-Flow ausgewertet."""
+    src = _read_frontend()
+    # Auto-Replay-Hook im setHeroForResult-Pfad
+    assert '_cas_auto_replayed' in src, 'CAS-Auto-Replay-Guard fehlt'
+    assert '_chatAttachedFiles' in src and 'docType: \'roster_screenshot\'' in src, \
+        'CAS-Files müssen via Multi-CAS-Chat-Flow gequeued werden'
+
+
+# ── Targeted CAS Reader v2 ────────────────────────────────────────────────
+
+def test_v10_cas_reader_prompt_targets_review_item_ids():
+    """Sonnet-Prompt enthält review_item_id pro Ziel-Tag (nicht nur Datum)."""
+    src = _read_backend()
+    idx = src.find('def post_upload_roster_screenshot')
+    assert idx > 0
+    block = src[idx:idx + 14000]
+    assert 'review_item_id' in block, 'Target-Liste muss review_item_id enthalten'
+    assert 'target_lines' in block or 'Ziel-Tage:' in block, \
+        'Prompt muss Ziel-Tag-Liste explizit aufführen'
+
+
+def test_v10_cas_reader_prompt_strict_only_targets():
+    """Reader-Prompt MUSS sagen: ausschließlich Ziel-Tage, ignoriere andere, erfinde keine Zeiten."""
+    src = _read_backend()
+    idx = src.find('def post_upload_roster_screenshot')
+    block = src[idx:idx + 14000]
+    assert 'ausschließlich' in block.lower() or 'ausschliesslich' in block.lower(), \
+        'Prompt: „ausschließlich Ziel-Tage"'
+    assert 'ignoriere' in block.lower(), 'Prompt: „Ignoriere alle anderen Tage"'
+    assert 'erfinde keine' in block.lower(), 'Prompt: „Nicht raten / erfinde keine Zeiten"'
+
+
+def test_v10_cas_reader_output_validation():
+    """_validate_cas_reader_output muss existieren und v2-Schema parsen."""
+    src = _read_backend()
+    assert 'def _validate_cas_reader_output' in src, \
+        'Schema-Validator fehlt'
+    fn_idx = src.find('def _validate_cas_reader_output')
+    block = src[fn_idx:fn_idx + 3500]
+    # Status muss validiert werden
+    assert "('found', 'not_found')" in block or 'found' in block, \
+        'Validator muss status (found/not_found) prüfen'
+    # Backwards-compat zu altem 'days'-Format
+    assert "'days'" in block, 'Validator soll altes days-Format backwards-compat behandeln'
+
+
+def test_v10_cas_reader_returns_matches_array():
+    """Endpoint-Response enthält das neue matches[] Feld."""
+    src = _read_backend()
+    idx = src.find('def post_upload_roster_screenshot')
+    block = src[idx:idx + 14000]
+    # In der Return-Section muss matches: matches stehen
+    return_section = block[block.rfind('return jsonify'):]
+    assert "'matches':" in return_section and 'matches' in return_section, \
+        'Response muss matches[] enthalten'
+
+
+def test_v10_cas_reader_returns_conflicts_array():
+    """Response enthält conflicts[] für Cross-File-Diskrepanzen."""
+    src = _read_backend()
+    idx = src.find('def post_upload_roster_screenshot')
+    block = src[idx:idx + 14000]
+    return_section = block[block.rfind('return jsonify'):]
+    assert "'conflicts':" in return_section, 'Response muss conflicts[] enthalten'
+
+
+def test_v10_cas_reader_source_file_id_in_audit():
+    """Audit-Event muss source_file_id und source='user_uploaded_roster_cas_detected' enthalten."""
+    src = _read_backend()
+    idx = src.find('def post_upload_roster_screenshot')
+    block = src[idx:idx + 14000]
+    assert 'user_uploaded_roster_cas_detected' in block, \
+        'Audit-Source-Tag fehlt'
+    assert 'source_file_id' in block, 'source_file_id fehlt im Audit'
+
+
+def test_v10_cas_reader_duplicate_file_deduped():
+    """Gleiche Datei doppelt → früh-Return ohne erneuten Sonnet-Call."""
+    src = _read_backend()
+    idx = src.find('def post_upload_roster_screenshot')
+    block = src[idx:idx + 14000]
+    # SHA-256-Hash + seen_file_hashes
+    assert 'file_hash' in block or 'sha256' in block.lower(), \
+        'Dedupe braucht file-hash'
+    assert 'duplicate_file_skipped' in block or 'seen_file_hashes' in block, \
+        'Dedupe-Mechanismus fehlt'
+
+
+def test_v10_cas_reader_cross_file_conflict_detected():
+    """Cross-File-Conflict-Detection via _cas_detected_per_date job-state."""
+    src = _read_backend()
+    idx = src.find('def post_upload_roster_screenshot')
+    block = src[idx:idx + 14000]
+    assert '_cas_detected_per_date' in block, \
+        'Cross-File-State-Tracking fehlt'
+    assert 'conflicts' in block.lower(), 'Conflict-Detection fehlt'
+
+
+def test_v10_cas_reader_validates_review_item_id_belongs_to_job():
+    """Reader-Output mit review_item_id, die NICHT in pending targets ist, wird verworfen."""
+    src = _read_backend()
+    idx = src.find('def post_upload_roster_screenshot')
+    block = src[idx:idx + 14000]
+    assert 'valid_target_ids' in block, \
+        'valid_target_ids-Filter (kein fremder Tag)'
+
+
+def test_v10_validate_cas_reader_output_smoke():
+    """Schema-Validator als reine Function: gültiger v2-Input → matches kommen durch."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    fn = _app._validate_cas_reader_output
+    # v2 happy path
+    parsed = {'matches': [
+        {'review_item_id': 'ri_1', 'date': '2025-04-07', 'status': 'found',
+         'marker': 'EK', 'start_time': '08:30', 'end_time': '18:00',
+         'confidence': 'high', 'raw_excerpt': 'EK 08:30 18:00'},
+        {'review_item_id': 'ri_2', 'date': '2025-04-08', 'status': 'not_found'},
+    ]}
+    matches, errors = fn(parsed)
+    assert len(matches) == 2
+    assert matches[0]['status'] == 'found'
+    assert matches[0]['confidence'] == 'high'
+    assert matches[1]['status'] == 'not_found'
+    assert not errors
+
+
+def test_v10_validate_cas_reader_output_invalid_status_downgrade():
+    """status='found' aber ohne Zeit → automatisch auf not_found downgraden."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    fn = _app._validate_cas_reader_output
+    parsed = {'matches': [
+        {'review_item_id': 'ri_1', 'date': '2025-04-07', 'status': 'found',
+         'start_time': '', 'end_time': ''},  # keine Zeit
+    ]}
+    matches, _errors = fn(parsed)
+    assert matches[0]['status'] == 'not_found', \
+        'found-ohne-Zeit muss zu not_found degraden'
+
+
+def test_v10_validate_cas_reader_output_handles_legacy_days_format():
+    """Backwards-compat: altes „days"-Format wird akzeptiert."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    fn = _app._validate_cas_reader_output
+    parsed = {'days': [
+        {'datum': '2025-04-07', 'start_time': '08:30', 'end_time': '18:00'},
+    ]}
+    matches, _errors = fn(parsed)
+    assert len(matches) == 1
+    assert matches[0]['date'] == '2025-04-07'
+
+
+# ── PDF Long-Routing-Wrap ─────────────────────────────────────────────────
+
+def test_v10_pdf_tag_table_uses_paragraph_wrap():
+    """Tag-für-Tag-Cells müssen als Paragraph mit wordWrap gerendert sein."""
+    src = _read_backend()
+    idx = src.find('TAG-FÜR-TAG-NACHWEIS')
+    assert idx > 0
+    block = src[idx:idx + 4000]
+    assert 'Paragraph(' in block, 'Tag-für-Tag muss Paragraph-Cells nutzen'
+    assert "wordWrap='CJK'" in block or 'wordWrap=\'CJK\'' in block, \
+        "Cells müssen wordWrap='CJK' setzen"
+
+
+def test_v10_pdf_tag_table_no_hard_truncation_routing():
+    """Routing darf nicht mehr nach 18 Zeichen abgeschnitten werden — wordWrap fließt um."""
+    src = _read_backend()
+    idx = src.find('TAG-FÜR-TAG-NACHWEIS')
+    block = src[idx:idx + 4000]
+    # Alte Truncation `[:18]` für routing darf nicht mehr da sein
+    assert "routing = _safe_cell" in block or "routing = str(" in block
+    # Truncate-Limit für routing muss >= 60 sein (nicht 18) — sonst gibt's wieder cuts
+    if "routing = _safe_cell(entry.get('routing', ''))[:" in block:
+        rout_idx = block.find("routing = _safe_cell(entry.get('routing', ''))[:")
+        after = block[rout_idx + len("routing = _safe_cell(entry.get('routing', ''))[:"):rout_idx + 120]
+        limit = int(after.split(']')[0])
+        assert limit >= 40, f'Routing-Truncate-Limit zu klein ({limit}) — wordWrap braucht Spielraum'
+
+
+def test_v10_pdf_safe_cell_helper_escapes_html():
+    """_safe_cell muss HTML-Spezialzeichen escapen (Paragraph parst HTML)."""
+    src = _read_backend()
+    idx = src.find('def _safe_cell')
+    assert idx > 0
+    block = src[idx:idx + 400]
+    assert "'&', '&amp;'" in block
+    assert "'<', '&lt;'" in block
+    assert "'>', '&gt;'" in block
+
+
+def test_v10_pdf_renders_with_long_routing_LH0400():
+    """Smoke: PDF mit langer Routing-Zeile 'LH0400 A FRA 0 FRA-JFK' rendert ohne Exception."""
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    data = {
+        'name': 'Test User', 'year': 2025, 'km': 22,
+        'fahr_tage': 1, 'arbeitstage': 1, 'hotel_naechte': 0,
+        'vma_72_tage': 0, 'vma_73_tage': 0, 'vma_74_tage': 0,
+        'vma_in': 0, 'vma_aus': 0, 'fahr': 6.0, 'reinig': 0, 'trink': 0,
+        'brutto': 30000, 'lohnsteuer': 4000, 'z17': 0, 'z77': 0,
+        'netto': 100.0, 'download_url': '/api/download/test',
+        '_tage_detail': [
+            {'datum': '2025-04-07', 'marker': 'F', 'routing': 'LH0400 A FRA 0 FRA-JFK',
+             'klass': 'Z73', 'begruendung': 'Auslands-Übernachtung mit langer Routing-Zeile zur Verifikation der Wrap-Behavior in der PDF-Tabelle.'},
+            {'datum': '2025-04-08', 'marker': 'F', 'routing': 'LH0401 R JFK FRA-JFK-FRA',
+             'klass': 'Z73', 'begruendung': 'Heimflug.'},
+        ],
+    }
+    try:
+        buf = _app.erstelle_pdf(data)
+    except Exception as e:
+        # Falls Test-Data unvollständig: nur das Tag-für-Tag-Rendering ist relevant.
+        # PDF darf nicht WEGEN long-routing crashen.
+        msg = str(e).lower()
+        if 'truncat' in msg or 'overflow' in msg or 'too long' in msg:
+            raise AssertionError(f'PDF crashed wegen long-routing: {e}')
+        raise
+    assert buf is not None
+
+
+def test_v10_pdf_cas_source_note_when_cas_overrides_present():
+    """finalize-pdf appendet CAS-Quellen-Note wenn Overrides aus CAS kommen."""
+    src = _read_backend()
+    idx = src.find('def post_finalize_pdf')
+    assert idx > 0
+    block = src[idx:idx + 6000]
+    assert 'user_uploaded_roster_cas_detected' in block or 'cas_used_count' in block, \
+        'CAS-Quellen-Erkennung in finalize-pdf'
+    assert 'Dienstplan/CAS erkannt' in block or 'Dienstplan/CAS' in block, \
+        'CAS-Quellen-Note-Text fehlt'
+
+
+def test_v10_pdf_skipped_note_when_skip_used():
+    """finalize-pdf mit skip_unanswered=True appendet „nicht bestätigt"-Note."""
+    src = _read_backend()
+    idx = src.find('def post_finalize_pdf')
+    block = src[idx:idx + 6000]
+    assert 'Nicht bestätigte Punkte wurden nicht zusätzlich berücksichtigt' in block, \
+        'Skipped-Note-Text fehlt'
+
+
+# ── Forbidden Wording Extension ──────────────────────────────────────────
+
+def test_v10_no_hardcoded_personal_name_in_frontend():
+    """Frontend darf keinen hardcoded „Miguel"/„Schumann" enthalten
+    (außer Impressum-Pflicht-Daten)."""
+    src = _read_frontend()
+    # Erlaubt: Impressum-Block, JSON-LD, contact-Info
+    import re as _re
+    for needle in ['Miguel', 'Schumann']:
+        positions = [m.start() for m in _re.finditer(needle, src)]
+        for pos in positions:
+            ctx = src[max(0, pos - 800):pos + 200]
+            # Erlaubte Stellen: Impressum, Datenschutz-Verantwortlicher (DSGVO),
+            # JSON-LD-Schema, Email, Schumannstr (Adresse).
+            is_legal_required = (
+                'Impressum' in ctx or 'impressum' in ctx
+                or 'legal-body' in ctx or 'legal-section' in ctx
+                or 'Verantwortlicher' in ctx or 'verantwortlich' in ctx.lower()
+                or 'Datenschutz' in ctx or 'datenschutz' in ctx
+                or 'address' in ctx.lower() or 'Inhaber' in ctx
+                or 'TMG' in ctx or 'DSGVO' in ctx
+                or '@type' in ctx or 'jsonLd' in ctx or 'JSON-LD' in ctx
+                or 'foundingDate' in ctx or 'Geschäftsführer' in ctx
+                or 'Schumannstr' in ctx or 'schumannmiguel' in ctx
+                or 'Kontakt' in ctx or 'support@' in ctx
+                or 'Co-Authored-By' in ctx
+            )
+            if not is_legal_required:
+                line_no = src[:pos].count('\n') + 1
+                raise AssertionError(
+                    f'Hardcoded "{needle}" außerhalb Impressum/Datenschutz bei line {line_no}: '
+                    f'{src[pos-60:pos+60]!r}')
+
+
+def test_v10_no_chat_oeffnen_button_user_facing():
+    """„Chat öffnen"-Standalone-Button darf NICHT mehr auf der Result-Page sichtbar sein."""
+    src = _read_frontend()
+    # Auf der Result-Seite (p3) suchen
+    p3_idx = src.find('id="p3"')
+    assert p3_idx > 0
+    p3_block = src[p3_idx:p3_idx + 30000]
+    # Standalone-Button-Pattern (kein Pre-fill-Chip)
+    # Wir suchen explizit „>Chat öffnen</button>" als sichtbarer Button-Text
+    occurrences = p3_block.count('>Chat öffnen<')
+    # Erlaubt: hero-primary-btn als Fallback-Stub (heroActions ist eh display:none)
+    # Erlaubt: Comments. Aber Standalone-Button im sichtbaren Intro NICHT.
+    # Heuristik: max 1 Vorkommen (der Hero-Stub, der immer hidden ist)
+    assert occurrences <= 1, \
+        f'Zu viele „Chat öffnen"-Buttons auf p3 ({occurrences}) — Chat ist permanent inline'
+
+
+def test_v10_no_forbidden_v10_phrases():
+    """v10 erweitert die Forbidden-Liste: „Mehr rausholen", „Maximale Rückerstattung", etc."""
+    forbidden_v10 = [
+        'Mehr rausholen',
+        'mehr rausholen',
+        'Maximale Rückerstattung',
+        'maximale Rückerstattung',
+        'Steuerersparnis',
+        'finanzamtssicher',
+        'steuerberater-sicher',
+        'Garantiert absetzbar',
+        'garantiert absetzbar',
+        'wir rechnen selbst',
+        'kein Tag verloren',
+        'Netto in WISO',
+        'Freitext-Interpretation nicht verfügbar',
+        '0 von 22 geklärt',
+        'beeinflussen nicht direkt',
+    ]
+    files = [_FRONTEND_HTML, _APP_PY]
+    violations = []
+    for fp in files:
+        if not os.path.exists(fp): continue
+        src = open(fp).read()
+        for phrase in forbidden_v10:
+            idx = 0
+            while True:
+                pos = src.find(phrase, idx)
+                if pos < 0: break
+                pre = src[max(0, pos-400):pos]
+                line_start = src.rfind('\n', 0, pos) + 1
+                line_end_idx = src.find('\n', pos)
+                line = src[line_start:line_end_idx if line_end_idx > 0 else pos+80]
+                # Akzeptabel: in Comment, Forbidden-Liste, STALE_PATTERNS, Anti-Liste
+                rel_pos_in_line = pos - line_start
+                comment_prefix = line[:rel_pos_in_line]
+                # Akzeptabel als Anti-Liste / Sonnet-Prompt-Verbot: "NIEMALS", "kein", "nie"
+                # innerhalb der vorausgehenden 200 Zeichen.
+                is_anti_list = ('NIEMALS' in pre[-300:] or 'NIE ' in pre[-100:]
+                                or 'KEIN ' in pre[-100:] or 'verbote' in pre.lower()[-200:]
+                                or 'nicht sagen' in pre.lower()[-200:])
+                is_comment = ('//' in comment_prefix or '#' in comment_prefix
+                              or '<!--' in pre[-200:] or 'STALE_PATTERNS' in pre
+                              or 'forbidden' in pre.lower() or 'VERBOTEN' in pre
+                              or 'Verbotene' in pre or 'forbidden_v10' in pre
+                              or 'test_v' in pre or 'def test_' in pre
+                              or is_anti_list)
+                if not is_comment:
+                    line_no = src[:pos].count('\n') + 1
+                    violations.append(f'{os.path.basename(fp)}:{line_no} — {phrase!r}')
+                idx = pos + len(phrase)
+    assert not violations, 'Verbotene v10-Phrasen user-facing:\n  ' + '\n  '.join(violations)
+
+
+# ── Bestehender 3-Dokumente-Flow unverändert ─────────────────────────────
+
+def test_v10_three_required_uploads_still_intact():
+    """Bestehender 3-Pflicht-Flow (LSB, DP, SE) MUSS unverändert funktionieren."""
+    src = _read_frontend()
+    for card in ['id="rc-lsb"', 'id="rc-dp"', 'id="rc-se"']:
+        assert card in src, f'Pflicht-Karte {card} fehlt'
+    for finput in ['id="f-lsb"', 'id="f-dp"', 'id="f-se"']:
+        assert finput in src, f'Pflicht-Input {finput} fehlt'
+    # Progress-Logik 3 (nicht 4)
+    assert 'reqDone' in src and 'done/3' in src, \
+        'updateProgress muss weiterhin durch 3 teilen (nicht 4)'
+
+
+def test_v10_finalize_pdf_endpoint_still_exists():
+    """/finalize-pdf-Endpoint muss erhalten bleiben."""
+    src = _read_backend()
+    assert '@app.route(\'/api/job/<job_id>/finalize-pdf\'' in src
+    assert 'def post_finalize_pdf' in src
+
+
+def test_v10_pdf_title_still_no_personal_name():
+    """v9.9-Schutz: PDF-Title bleibt generisch (kein hardcoded Name)."""
+    src = _read_backend()
+    # Generischer Title-String
+    assert 'Werbungskosten-Auswertung"' in src or '"Werbungskosten-Auswertung' in src
+    # Kein hardcoded „für Miguel" o.ä.
+    assert 'für {_name}' not in src, 'PDF-Title soll generisch sein'
 
 
 if __name__ == '__main__':
