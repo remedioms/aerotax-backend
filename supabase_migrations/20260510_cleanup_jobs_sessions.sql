@@ -24,48 +24,36 @@ create index if not exists idx_uploaded_files_expires_at
 
 -- Cleanup-Function: löscht abgelaufene Sessions + alte Jobs.
 -- Wird vom Backend im _cleanup_loop und optional via pg_cron aufgerufen.
+-- Nutzt GET DIAGNOSTICS statt CTE-with-RETURNING (robuster über Postgres-Versionen).
 create or replace function public.aerotax_cleanup_old_state()
 returns json
 language plpgsql
 as $$
 declare
-  v_sessions_deleted int;
-  v_jobs_deleted int;
-  v_pdfs_deleted int;
-  v_uploads_deleted int;
+  v_sessions_deleted int := 0;
+  v_jobs_deleted int := 0;
+  v_pdfs_deleted int := 0;
+  v_uploads_deleted int := 0;
 begin
   -- Sessions: expires_at < now (24h TTL)
-  with deleted as (
-    delete from public.sessions
-    where expires_at is not null and expires_at < now()
-    returning 1
-  )
-  select count(*) into v_sessions_deleted from deleted;
+  delete from public.sessions
+  where expires_at is not null and expires_at < now();
+  get diagnostics v_sessions_deleted = row_count;
 
-  -- Jobs: 7-Tage Cutoff (Debug-Window für Pilot-User; access-code ist 24h)
-  -- jobs hat kein expires_at, nur updated_at — das reicht für die Cleanup-Regel.
-  with deleted as (
-    delete from public.jobs
-    where updated_at is not null and updated_at < now() - interval '7 days'
-    returning 1
-  )
-  select count(*) into v_jobs_deleted from deleted;
+  -- Jobs: 7-Tage Cutoff via updated_at (access-code ist 24h separat in sessions)
+  delete from public.jobs
+  where updated_at is not null and updated_at < now() - interval '7 days';
+  get diagnostics v_jobs_deleted = row_count;
 
   -- PDFs: 24h TTL
-  with deleted as (
-    delete from public.pdfs
-    where expires_at is not null and expires_at < now()
-    returning 1
-  )
-  select count(*) into v_pdfs_deleted from deleted;
+  delete from public.pdfs
+  where expires_at is not null and expires_at < now();
+  get diagnostics v_pdfs_deleted = row_count;
 
   -- Uploaded-Files: 4h TTL
-  with deleted as (
-    delete from public.uploaded_files
-    where expires_at is not null and expires_at < now()
-    returning 1
-  )
-  select count(*) into v_uploads_deleted from deleted;
+  delete from public.uploaded_files
+  where expires_at is not null and expires_at < now();
+  get diagnostics v_uploads_deleted = row_count;
 
   return json_build_object(
     'sessions_deleted', v_sessions_deleted,
