@@ -3458,17 +3458,54 @@ def test_v8183_snapshot_training_seq_5_days_one_fahrtag():
     """Snapshot: 5-Tage-Schulung 08-12.04 → genau 1 Fahrtag (Block-Pattern).
     Aggregat-Snapshot: gesamt fahr_tage=5 (Schulung-Tag-1 + GRU + BLR + Same-Day + Office).
 
-    NB: classifier_result.counted_as_fahrtag ist aktuell auf allen 5 Schulungstagen True
-    (Drift zwischen Flag und Counter) — wird in v8.18.3 Task #76 ausgeglichen.
-    Der Snapshot prüft daher das verbindliche Aggregat result['fahr_tage'], nicht das Flag."""
+    Seit v8.18.3 Task #76: counted_as_fahrtag-Flag matcht das fahr_tage-Aggregat
+    (Single source of truth)."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured, se = _build_realistic_year()
     matched = _match_dp_se_per_day(structured, se, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
     assert result['fahr_tage'] == 5, \
         f"Snapshot: fahr_tage erwartet 5, ist {result['fahr_tage']}"
+    # v8.18.3: Flag muss nun mit Aggregat übereinstimmen
+    flag_sum = sum(
+        1 for t in result['tage_detail']
+        if (t.get('classifier_result') or {}).get('counted_as_fahrtag')
+    )
+    assert flag_sum == result['fahr_tage'], \
+        f"v8.18.3: counted_as_fahrtag-Flag-Sum ({flag_sum}) ≠ fahr_tage ({result['fahr_tage']})"
+    # Schulungs-Block: nur Tag 1 als Fahrtag, 4 Folgetage False
+    schulung_dates = [f'2025-04-{d:02d}' for d in (8, 9, 10, 11, 12)]
+    schulung_fahrtage = sum(
+        1 for t in result['tage_detail']
+        if t['datum'] in schulung_dates
+        and (t.get('classifier_result') or {}).get('counted_as_fahrtag')
+    )
+    assert schulung_fahrtage == 1, \
+        f"5-Tage-Schulung: Flag-Sum 1 erwartet, ist {schulung_fahrtage}"
     seqs = result.get('training_sequences') or []
     assert len(seqs) >= 1, f"training_sequences: ≥1 erwartet, ist {len(seqs)}"
+
+
+def test_v8183_flag_aggregate_consistency():
+    """v8.18.3 Härte-Test: alle Counter-Aggregate stimmen mit Flag-Summen überein.
+    Bricht sobald irgendeine Klassifikations-Logik divergiert."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured, se = _build_realistic_year()
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    flag_sums = {
+        'fahr_tage': sum(1 for t in result['tage_detail']
+                         if (t.get('classifier_result') or {}).get('counted_as_fahrtag')),
+        'arbeitstage': sum(1 for t in result['tage_detail']
+                           if (t.get('classifier_result') or {}).get('counted_as_workday')),
+        'reinigungstage': sum(1 for t in result['tage_detail']
+                              if (t.get('classifier_result') or {}).get('counted_as_reinigungstag')),
+        'hotel_naechte': sum(1 for t in result['tage_detail']
+                             if (t.get('classifier_result') or {}).get('counted_as_hotel_nacht')),
+    }
+    for key, flag_sum in flag_sums.items():
+        assert result[key] == flag_sum, \
+            f"v8.18.3 Drift: result[{key}]={result[key]} ≠ flag-sum={flag_sum}"
 
 
 def test_v8183_snapshot_standby_no_fahrtag_no_reinigung():

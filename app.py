@@ -7558,14 +7558,15 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     z74_eur = round(sum(t['eur'] for t in tage_detail if t['klass'] == 'Z74'), 2)
     z76_eur = round(sum(t['eur'] for t in tage_detail if t['klass'] == 'Z76'), 2)
 
-    # v8.3: Arbeitstage strenger — Z72/Z73/Z74/Z76/Office/Standby zählen immer.
-    # ZeroDay nur wenn dienstlich=True (Same-Day < 8h, isolierter Tour-Tag).
-    # Standalone unknown ohne SE-Spur (ZeroDay mit dienstlich=False) zählt NICHT.
+    # v8.18.3: Single source of truth ist counted_as_workday-Flag in
+    # classifier_result (gesetzt in der Klassifikations-Schleife oben).
+    # Logik dort: klass in {Z72,Z73,Z74,Z76,Office,Standby} oder
+    # (klass==ZeroDay und dienstlich). HARD_AT_KLASSEN nur noch
+    # für Counter-Print unten benötigt.
     HARD_AT_KLASSEN = {'Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby'}
     arbeitstage = sum(
         1 for t in tage_detail
-        if t['klass'] in HARD_AT_KLASSEN
-        or (t['klass'] == 'ZeroDay' and t.get('dienstlich'))
+        if (t.get('classifier_result') or {}).get('counted_as_workday')
     )
     # v8.17: reinigungstage = nur Tage mit Uniform-/Dienstkleidungs-Bezug.
     # Aus classifier_result.counted_as_reinigungstag aggregiert.
@@ -7597,7 +7598,9 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             f"sofern keine tägliche Homebase-Anfahrt eindeutig erkennbar ist."
         )
 
-    fahr_tage = 0
+    # v8.18.3: Fahrtage-Bestimmung schreibt counted_as_fahrtag-Flag
+    # zurück in tage_detail[i].classifier_result. Aggregation am Ende
+    # liest ausschließlich das Flag.
     fahr_skipped_heimkehr = 0
     fahr_skipped_layover = 0
     fahr_skipped_tourfortsetzung = 0
@@ -7614,21 +7617,20 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         overnight = bool(d.get('overnight_after_day'))
         prev_overnight = bool(prev_d and prev_d.get('overnight_after_day'))
 
+        # Default-Flag-Zustand für diesen Tag: nicht gezählt
+        counted_fahrtag = False
+
         if klass_today in ('Frei', 'Issue'):
             fahr_skipped_other += 1
-            continue
-        if at == 'standby':
+        elif at == 'standby':
             fahr_skipped_standby += 1
             print(f"[v8-fahrtage-detail] datum={datum} counted=False reason='Standby zuhause'")
-            continue
-        # v8.14: Mehrtages-Training-Sequenz Folgetage skippen (kein eigener Fahrtag)
-        if i in training_seq_skip:
+        elif i in training_seq_skip:
+            # v8.14: Mehrtages-Training-Sequenz Folgetage — kein eigener Fahrtag
             fahr_skipped_training_seq += 1
             print(f"[v8-fahrtage-detail] datum={datum} counted=False reason='Mehrtägige Trainingssequenz — keine eindeutige tägliche Anfahrt'")
-            continue
-
-        if d.get('requires_commute'):
-            fahr_tage += 1
+        elif d.get('requires_commute'):
+            counted_fahrtag = True
             print(f"[v8-fahrtage-detail] datum={datum} counted=True reason='requires_commute=true ({at})'")
         else:
             if not overnight and prev_overnight:
@@ -7648,6 +7650,15 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 reason = f'no_commute ({at})'
             print(f"[v8-fahrtage-detail] datum={datum} counted=False reason='{reason}'")
 
+        # Flag write-back: Single source of truth ist ab v8.18.3 das Flag
+        if i < len(tage_detail):
+            cr_writeback = tage_detail[i].setdefault('classifier_result', {})
+            cr_writeback['counted_as_fahrtag'] = counted_fahrtag
+
+    fahr_tage = sum(
+        1 for t in tage_detail
+        if (t.get('classifier_result') or {}).get('counted_as_fahrtag')
+    )
     print(f"[v8-fahrtage-summary] counted={fahr_tage} skipped_heimkehr={fahr_skipped_heimkehr} "
           f"skipped_layover={fahr_skipped_layover} skipped_tourfortsetzung={fahr_skipped_tourfortsetzung} "
           f"skipped_unknown={fahr_skipped_unknown} skipped_standby={fahr_skipped_standby} "
@@ -7661,7 +7672,6 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     HOTEL_KLASSEN = {'Z73', 'Z74', 'Z76'}
     NON_HOTEL_KLASSEN = {'Frei', 'Issue', 'Standby', 'Office', 'ZeroDay'}
     homebase_upper = (homebase or 'FRA').upper()
-    hotel_naechte = 0
     hotel_skipped = []
     hotel_candidate_issues = []  # v8.16: overnight=true ohne layover_ort etc.
 
@@ -7707,19 +7717,23 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             return False, 'heimkehr_pattern_despite_overnight'
         return True, 'ok'
 
+    # v8.18.3: Hotel-Nächte schreibt counted_as_hotel_nacht-Flag zurück;
+    # Aggregat liest ausschließlich das Flag.
     for i, m in enumerate(sorted_days):
         d = m['dp']
-        if not d.get('overnight_after_day'):
-            continue
         if i >= len(tage_detail):
             continue
         t = tage_detail[i]
+        cr_writeback = t.setdefault('classifier_result', {})
+        # Default: kein Hotel
+        if not d.get('overnight_after_day'):
+            cr_writeback['counted_as_hotel_nacht'] = False
+            continue
         prev_m = sorted_days[i-1] if i > 0 else None
-        layover_ort = (d.get('layover_ort') or m['se'].get('stfrei_ort') or '').upper()
-        cr_t = t.get('classifier_result') or {}
         klass = t['klass']
 
         counted, why = _hotel_check(i, t, m, prev_m)
+        cr_writeback['counted_as_hotel_nacht'] = bool(counted)
 
         # extra_hotelnaechte: detaillierte Diagnose (v8.16)
         # Liste enthält JEDEN Tag mit overnight=True PLUS counted/why-Felder,
@@ -7734,9 +7748,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'klass': klass,
                     'reason': 'overnight=true aber layover_ort fehlt — Hotel nicht eindeutig'
                 })
-        else:
-            hotel_naechte += 1
 
+    hotel_naechte = sum(
+        1 for t in tage_detail
+        if (t.get('classifier_result') or {}).get('counted_as_hotel_nacht')
+    )
     print(f"[v8-hotel-detail] counted={hotel_naechte} skipped={len(hotel_skipped)}")
     print(f"[v8-classify] arbeit={arbeitstage}T fahr={fahr_tage}T hotel={hotel_naechte}T  "
           f"Z72={z72_tage}T/{z72_eur:.2f}€  Z73={z73_tage}T/{z73_eur:.2f}€  "
