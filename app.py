@@ -2532,10 +2532,11 @@ def chat_with_aerotax():
         return jsonify({'error': 'Session-Token ungültig oder abgelaufen — bitte neu auswerten'}), 401
 
     # ── COST-CONTROL: Hard-Caps pro Session ──────────────────
-    # 25 Nachrichten total in 24h → bei 19,99€ Umsatz noch sehr profitabel
+    # v8.25: 50 freie Fragen total in 24h. Review-Antworten zählen NICHT (separater Endpoint).
+    # Off-Topic zählt nicht (return BEFORE session load).
     chat_history_existing = session.get('chat_history', [])
     user_msg_count = sum(1 for m in chat_history_existing if m.get('role') == 'user')
-    HARD_CAP = 25
+    HARD_CAP = 50
     if user_msg_count >= HARD_CAP:
         return jsonify({
             'error': f'Maximum {HARD_CAP} Chat-Nachrichten pro Session erreicht. Du kannst weiterhin deine Auswertung als PDF runterladen und im Forum Fragen stellen.'
@@ -2570,7 +2571,7 @@ def chat_with_aerotax():
         f"Z74 (Inland 24h): {result_data.get('vma_74_tage',0)} Tage / {result_data.get('vma_74',0):.2f} €",
         f"Z76 (Ausland-VMA): {result_data.get('vma_aus', 0):.2f} €",
         f"Brutto-Aufwendungen gesamt: {result_data.get('gesamt', 0):.2f} €",
-        f"Netto in WISO einzutragen: {result_data.get('netto', 0):.2f} €",
+        f"Einzutragender Gesamtbetrag: {result_data.get('netto', 0):.2f} €",
     ]
 
     notes_block = ('\n'.join(f"- {n}" for n in notes)) if notes else 'keine'

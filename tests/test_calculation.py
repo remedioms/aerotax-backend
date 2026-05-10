@@ -5521,6 +5521,214 @@ def test_v823_regression_no_overrides_no_z72_change():
     assert cls['hotel_naechte'] == 2  # 2 GRU-Nächte
 
 
+# ── v8.25 Chat-Limits + Trennung Review-vs-Chat ──
+
+def test_v825_chat_hard_cap_is_50():
+    """Freie Chat-Fragen gehen bis 50 (vorher 25)."""
+    import app as _app, re
+    src = open(_app.__file__).read()
+    m = re.search(r'HARD_CAP\s*=\s*(\d+)', src)
+    assert m is not None, 'HARD_CAP not defined'
+    assert int(m.group(1)) == 50, f'HARD_CAP must be 50 in v8.25, got {m.group(1)}'
+
+
+def test_v825_off_topic_returns_before_session_load():
+    """Off-Topic-Path returned BEVOR session geladen wird → kein chat_history-Increment."""
+    import app as _app, re
+    src = open(_app.__file__).read()
+    # Suche im chat_with_aerotax-Body
+    m = re.search(r'def chat_with_aerotax.*?(?=\n@app\.route|\Z)', src, re.DOTALL)
+    assert m is not None
+    body = m.group(0)
+    off_idx = body.find('_is_off_topic_question')
+    sess_idx = body.find('_load_session(token)')
+    assert off_idx > 0 and sess_idx > 0
+    assert off_idx < sess_idx, 'Off-Topic-Filter muss VOR Session-Load greifen'
+
+
+def test_v825_review_answer_does_not_touch_chat_history():
+    """post_review_answer schreibt NICHT in session.chat_history."""
+    import app as _app, re
+    src = open(_app.__file__).read()
+    m = re.search(r'def post_review_answer.*?(?=\n@app\.route|\Z)', src, re.DOTALL)
+    assert m is not None
+    body = m.group(0)
+    assert 'chat_history' not in body, 'review-answer darf chat_history nicht anfassen'
+
+
+def test_v825_chat_response_includes_remaining_and_cap():
+    """Chat-Endpoint liefert remaining + cap zurück (für dezenten Counter)."""
+    import app as _app, re
+    src = open(_app.__file__).read()
+    m = re.search(r"'cap':\s*HARD_CAP", src)
+    assert m is not None, "Chat-Response muss 'cap' liefern"
+    m2 = re.search(r"'remaining':\s*remaining", src)
+    assert m2 is not None, "Chat-Response muss 'remaining' liefern"
+
+
+# ── v8.25 Frontend-DOM-Invarianten via grep ──
+
+def test_v825_chat_drawer_has_glassmorphism_styles():
+    """Chat-Drawer hat backdrop-filter UND rgba-alpha-Background (kein solid #111)."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    drawer_match = re.search(r'id="chat-drawer".*?</div>', src[:src.find('chat-messages')], re.DOTALL)
+    # Nicht das ganze Drawer-Block, sondern die Style-Attribute prüfen
+    # Suche nach drawerGlass-Definition
+    assert 'drawerGlass' in src, 'drawerGlass-Variable nicht gefunden'
+    glass_def = re.search(r"drawerGlass\s*=\s*'([^']+)'", src)
+    assert glass_def is not None
+    g = glass_def.group(1)
+    assert 'backdrop-filter:blur' in g, 'Drawer muss backdrop-filter haben'
+    assert 'rgba(' in g, 'Drawer muss rgba-Hintergrund haben (translucent)'
+    # Sicherstellen, dass Drawer NICHT vollständig opak ist (Alpha < 0.8)
+    alpha_matches = re.findall(r'rgba\([^)]+,\s*([\d.]+)\)', g)
+    if alpha_matches:
+        max_alpha = max(float(a) for a in alpha_matches)
+        assert max_alpha < 0.75, f'Drawer-Alpha zu hoch ({max_alpha}) — kein milky glass mehr'
+
+
+def test_v825_chat_footer_has_upload_button():
+    """Chat-Footer enthält Upload-Button neben Textarea + Send."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'id="chat-upload-btn"' in src, 'Upload-Button im Footer fehlt'
+    assert 'id="chat-input"' in src
+    assert 'id="chat-send"' in src
+    # Reihenfolge: upload-btn vor chat-input
+    upload_idx = src.find('id="chat-upload-btn"')
+    input_idx = src.find('id="chat-input"')
+    assert upload_idx < input_idx, 'Upload-Btn muss VOR Textarea kommen'
+
+
+def test_v825_chat_input_min_height_and_padding():
+    """Textarea hat min-height ≥ 48px und ausreichend padding für nicht-clipping."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Suche das textarea-Element für chat-input
+    m = re.search(r'<textarea id="chat-input"[^>]*>', src)
+    assert m is not None
+    style = m.group(0)
+    assert 'min-height:48px' in style or 'min-height: 48px' in style
+    assert re.search(r'padding:\s*14px', style), 'Padding ≥ 14px für Klar-Lesbarkeit'
+    assert 'line-height:1.4' in style or 'line-height: 1.4' in style
+
+
+def test_v825_chat_counter_not_prominent_visible_default():
+    """Chat-Counter ist standardmäßig display:none — nur sichtbar wenn ≤5 übrig."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    m = re.search(r'id="chat-counter"[^>]*>', src)
+    assert m is not None
+    style = m.group(0)
+    assert 'display:none' in style or 'display: none' in style, \
+        'Counter muss standardmäßig versteckt sein'
+    # Kein "25 Nachrichten verfügbar" mehr im DOM
+    assert '25 Nachrichten verfügbar' not in src
+    assert '25 von 25 Nachrichten' not in src
+
+
+def test_v825_chat_greeting_never_empty():
+    """Chat-Open ruft IMMER renderMsg('assistant', ...) → kein leerer Body."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Mindestens 2 Greeting-Pfade (review pending vs ready)
+    greetings = [
+        'Hallo 👋\\n\\nDeine Auswertung ist bereit',
+        'Hallo 👋\\n\\nDeine Auswertung ist vorbereitet',
+        'Ich habe ein Problem mit deinen Unterlagen',
+    ]
+    found = sum(1 for g in greetings if g in src)
+    assert found >= 2, f'Mindestens 2 Greeting-Varianten erwartet, {found} gefunden'
+
+
+def test_v825_quick_chips_function_present():
+    """Quick-Chips werden gerendert (renderQuickChips vorhanden)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'function renderQuickChips' in src
+    for chip_label in ['WISO-Eingabe', 'PDF & Nachweis', 'Offene Angaben', 'Dokumente', 'Zugangscode']:
+        assert chip_label in src, f'Quick-Chip "{chip_label}" fehlt'
+
+
+def test_v825_chip_intent_handler_routes_locally():
+    """Chip-Click ruft lokal Funktionen — keine Sonnet-Calls für Standard-Intents."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'window._chatChipClick' in src
+    # WISO-Antwort lokal generiert (kein /api/chat-Call drinhin)
+    wiso_block_start = src.find("if(intent === 'wiso')")
+    assert wiso_block_start > 0
+    # Snippet bis next return
+    wiso_block = src[wiso_block_start:wiso_block_start+800]
+    assert 'Ausgaben → Werbungskosten' in wiso_block
+    assert '/api/chat' not in wiso_block, 'WISO-Chip darf keinen /api/chat-Call triggern'
+
+
+def test_v825_freitext_review_parser_present():
+    """Freitext-Parser für 'ja'/'nein'/'8 bis 18' im Chat-Send."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert '_parseReviewIntent' in src
+    assert '_hasActiveReviewQuestion' in src
+    # Pattern für Zeitspanne 8 bis 18
+    assert 'bis|-|–' in src or '(?:bis|-' in src
+
+
+def test_v825_no_review_cards_on_main_page():
+    """Hauptseite zeigt KEINE 22 Review-Karten — Review läuft im Chat."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # review-section-wrap muss display:none default haben
+    import re
+    m = re.search(r'id="review-section-wrap"[^>]*>', src)
+    assert m is not None
+    assert 'display:none' in m.group(0), 'Review-Section muss versteckt sein'
+    # Legacy review-card-Builder ist deaktiviert (if(false))
+    assert 'if(false){\n    (function legacy_review_dead_code' in src
+
+
+def test_v825_data_global_set_on_render():
+    """render(d) setzt _data + window._data global — auch bei Recall."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Defensive _data-Sync am Anfang von render()
+    assert "_data = d; window._data = d" in src or "window._data = d" in src
+
+
+def test_v825_recall_sets_job_id_for_chat():
+    """Recall-Flow setzt window._lastJobId, damit Review-Flow im Chat funktioniert."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'window._lastJobId = j.job_id' in src, \
+        'Recall muss _lastJobId setzen für Review-Endpoint im Chat'
+
+
+def test_v825_header_amount_no_dash_fallback():
+    """Header-Amount darf nicht '—' anzeigen wenn Daten verfügbar — 'wird geladen…' als Fallback."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Funktionsblock zwischen 'updateChatHeaderAmount = function' und nächstem 'function renderQuickChips'
+    fn_start = src.find('updateChatHeaderAmount = function')
+    fn_end = src.find('function renderQuickChips', fn_start)
+    assert fn_start > 0 and fn_end > 0, 'updateChatHeaderAmount-Block nicht gefunden'
+    fn_body = src[fn_start:fn_end]
+    assert "el.textContent = '—'" not in fn_body, "updateChatHeaderAmount darf nicht '—' setzen"
+    assert 'wird geladen' in fn_body
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
