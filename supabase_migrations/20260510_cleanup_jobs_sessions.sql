@@ -8,11 +8,9 @@
 -- ════════════════════════════════════════════════════════════════════════════
 
 -- Indexes auf den TTL-Spalten — Cleanup-DELETE-Queries werden Index-Scan statt Full-Scan
+-- HINWEIS: jobs hat nur updated_at, kein expires_at (Cutoff = 7 Tage seit Update).
 create index if not exists idx_jobs_updated_at
   on public.jobs (updated_at);
-
-create index if not exists idx_jobs_expires_at
-  on public.jobs (expires_at);
 
 create index if not exists idx_sessions_expires_at
   on public.sessions (expires_at);
@@ -45,10 +43,10 @@ begin
   select count(*) into v_sessions_deleted from deleted;
 
   -- Jobs: 7-Tage Cutoff (Debug-Window für Pilot-User; access-code ist 24h)
+  -- jobs hat kein expires_at, nur updated_at — das reicht für die Cleanup-Regel.
   with deleted as (
     delete from public.jobs
-    where (updated_at is not null and updated_at < now() - interval '7 days')
-       or (expires_at is not null and expires_at < now() - interval '7 days')
+    where updated_at is not null and updated_at < now() - interval '7 days'
     returning 1
   )
   select count(*) into v_jobs_deleted from deleted;
