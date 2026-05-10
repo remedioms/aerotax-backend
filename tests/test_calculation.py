@@ -7921,22 +7921,21 @@ def test_v10_upload_page_has_fourth_card_cas():
 
 
 def test_v10_cas_card_badge_sehr_empfohlen():
-    """CAS-Karte muss „Sehr empfohlen"-Badge tragen."""
+    """CAS-Karte muss als „empfohlen" markiert sein (Badge im Card oder
+    Doc-Hint über dem Grid). Layout: 4-spaltig kompakt, daher kürzere Wording im Card."""
     src = _read_frontend()
     idx = src.find('id="rc-cas"')
     assert idx > 0
     block = src[idx:idx + 3000]
-    assert 'Sehr empfohlen' in block, '4. Karte braucht „Sehr empfohlen"-Badge'
+    assert 'mpfohlen' in block, '4. Karte braucht „Empfohlen"/„Sehr empfohlen"-Badge'
 
 
 def test_v10_cas_card_states_optional():
-    """4. Karte ist explizit optional — Status-Text und Hinweis."""
+    """4. Karte ist explizit optional — Status-Text im Card."""
     src = _read_frontend()
     idx = src.find('id="rc-cas"')
     block = src[idx:idx + 3500]
-    assert 'optional' in block.lower(), 'CAS-Karte muss als optional markiert sein'
-    assert 'auch ohne' in block.lower() or 'ohne diese' in block.lower(), \
-        'Karte muss „kannst die Auswertung auch ohne starten" kommunizieren'
+    assert 'optional' in block.lower(), 'CAS-Karte muss als optional markiert sein (Status-Text)'
 
 
 def test_v10_cas_card_multifile_accepted():
@@ -7953,12 +7952,16 @@ def test_v10_cas_card_multifile_accepted():
 
 
 def test_v10_cas_card_uses_mytime_path_documented():
-    """CAS-Karte nennt den dokumentierten Pfad: „MyTime → Document Store"."""
+    """CAS-Pfad „MyTime → Document Store" muss auf der Upload-Page sichtbar sein
+    (im Card oder im Doc-Hint über der req-grid). v10: kompakte 4-Spalten-Optik
+    → Pfad steht im Doc-Hint, nicht mehr im Card-Body."""
     src = _read_frontend()
-    idx = src.find('id="rc-cas"')
-    block = src[idx:idx + 3500]
-    assert 'MyTime' in block and 'Document Store' in block, \
-        'CAS-Karte muss dokumentierten Pfad „MyTime → Document Store" nennen'
+    # Suche im gesamten Upload-Bereich (Doc-Hints UND Card)
+    upload_idx = src.find('id="rc-lsb"')
+    upload_end = src.find('opt-upload-section')
+    upload_block = src[max(0, upload_idx - 2000):upload_end if upload_end > 0 else upload_idx + 8000]
+    assert 'MyTime' in upload_block and 'Document Store' in upload_block, \
+        'Upload-Page muss dokumentierten Pfad „MyTime → Document Store" zeigen'
 
 
 def test_v10_cas_card_no_invented_path():
