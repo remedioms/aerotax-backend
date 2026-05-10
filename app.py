@@ -11232,6 +11232,79 @@ def _interpret_review_text(message, groups, items_by_id):
             if it and it.get('status') == 'pending':
                 all_pending_ids.append(iid)
 
+    # ── v8.38: „alle X AUSSER Y" Pattern zuerst (sonst hijackt es bulk_yes)
+    aua_match = _re.search(r'\balle\b.*?\baußer\b\s*(?P<exc>.+)', msg)
+    if aua_match:
+        head = msg[:aua_match.start('exc')]  # alles vor exc, inkl. „außer"
+        if _re.search(r'(über\s*8|über\s*acht|>\s*8|länger|mehr\s*als\s*8|\bja\b)', head):
+            main_ans = 'yes'
+        elif _re.search(r'(unter\s*8|unter\s*acht|<\s*8|kürzer|weniger\s*als\s*8|\b0\s*h?\b|\bnull\b|\bnein\b)', head):
+            main_ans = 'no'
+        else:
+            main_ans = 'yes'
+        exc = aua_match.group('exc').lower()
+        # Exception identifizieren: Datum-Liste, Family-Keyword, Gruppen-Label
+        exc_ids = set()
+        # Datum-Pattern in der Exception
+        for dm in _re.finditer(r'\b(\d{1,2})\.\s*(\d{1,2})?\.?', exc):
+            d, mo = int(dm.group(1)), (int(dm.group(2)) if dm.group(2) else None)
+            for iid in all_pending_ids:
+                it = items_by_id.get(iid)
+                if not it: continue
+                try:
+                    _, mm, dd = (it.get('datum') or '').split('-')
+                    mm, dd = int(mm), int(dd)
+                except Exception: continue
+                if mo and mm != mo: continue
+                if dd == d: exc_ids.add(iid)
+        # Family- / Gruppen-Keyword in Exception
+        ex_kw_map = {
+            'einzeltag': 'single_days', 'einzelne': 'single_days',
+            'seminar': 'seminar', 'sm': 'seminar',
+            'schulung': 'training', 'd4': 'training',
+            'bürodienst': 'office', 'buerodienst': 'office', 'büro': 'office', 'buero': 'office', 'ek': 'office',
+            'emergency': 'emergency', 'erste hilfe': 'emergency', 'erste-hilfe': 'emergency', 'eh': 'emergency', 'em': 'emergency',
+        }
+        for kw, target in ex_kw_map.items():
+            if kw in exc:
+                # Items deren Family/group_type matched
+                for g in groups:
+                    gtype = g.get('group_type', '')
+                    glab  = (g.get('label') or '').lower()
+                    if (target == 'single_days' and gtype == 'single_days') or \
+                       (target in gtype) or \
+                       (target in glab):
+                        for iid in g.get('item_ids', []):
+                            if iid in items_by_id and items_by_id[iid].get('status') == 'pending':
+                                exc_ids.add(iid)
+        # Monatsname in Exception
+        month_map_x = {'januar':1,'februar':2,'märz':3,'maerz':3,'april':4,'mai':5,'juni':6,'juli':7,
+                       'august':8,'september':9,'oktober':10,'november':11,'dezember':12}
+        for mn, mnum in month_map_x.items():
+            if mn in exc:
+                for iid in all_pending_ids:
+                    it = items_by_id.get(iid)
+                    if not it: continue
+                    try:
+                        _, mm, _ = (it.get('datum') or '').split('-')
+                        if int(mm) == mnum: exc_ids.add(iid)
+                    except Exception: continue
+        # proposed: alle pending außer exc_ids
+        changes = [{'review_item_id': iid, 'answer': main_ans}
+                   for iid in all_pending_ids if iid not in exc_ids]
+        if not changes:
+            return {
+                'intent': 'clarify',
+                'proposed_changes': [],
+                'confirmation_required': True,
+                'summary_lines': [],
+                'clarification': 'Ich habe „alle außer …" verstanden, aber keine passenden Tage gefunden. Magst du es anders formulieren?',
+            }
+        excl_count = len(exc_ids)
+        excl_hint = (' (' + str(excl_count) + ' Tag' + ('' if excl_count==1 else 'e') + ' bleiben offen)') if excl_count else ''
+        summary_label = ('Alle über 8h' if main_ans=='yes' else 'Alle unter 8h' if main_ans=='no' else 'Alle unsicher') + ' — außer den Ausnahmen' + excl_hint
+        return _build_proposed('bulk_all_except', changes, items_by_id, summary=summary_label)
+
     # ── Bulk: "alle ja" / "alle über 8h" / "alle nein" / "weiß nicht"
     # v8.35: 0/0h/null = no-Äquivalent
     bulk_yes = bool(_re.search(r'\balle\b[^.,]*(ja|über\s*8|>\s*8|länger|mehr\s*als\s*8)', msg))

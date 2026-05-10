@@ -6853,6 +6853,86 @@ def test_v836_progress_pill_called_after_apply():
     assert 'updateChatHeaderProgress' in block
 
 
+# ── v8.38 „alle X außer Y" Pattern + Main-UI-Cleanup ──
+
+def test_v838_parser_alle_ueber_8h_ausser_einzeltage():
+    """„alle über 8h außer die einzeltage" → yes für non-Einzeltage,
+    Einzeltage bleiben unangetastet."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [
+        _make_pending_item('2025-04-07', 'EK'),
+        _make_pending_item('2025-04-08', 'D4'),
+        _make_pending_item('2025-04-09', 'D4'),
+        _make_pending_item('2025-05-13', 'EK'),  # → wird Einzeltag (zu Mai keine andere)
+    ]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('alle über 8h außer die einzeltage',
+                                 groups, {it['id']: it for it in items})
+    assert res['intent'] == 'bulk_all_except', f'expected bulk_all_except, got {res["intent"]}'
+    # Block-Items (April) → yes
+    by_id = {c['review_item_id']: c['answer'] for c in res['proposed_changes']}
+    apr_items = [v for k, v in by_id.items() if '2025-04' in k]
+    assert apr_items and all(v == 'yes' for v in apr_items), 'April-Block muss yes sein'
+    # Einzeltag (Mai) → NICHT in proposed_changes
+    may_in_proposed = [k for k in by_id.keys() if '2025-05' in k]
+    assert not may_in_proposed, 'Einzeltag soll außen vor bleiben'
+
+
+def test_v838_parser_alle_unter_8h_ausser_april():
+    """„alle unter 8h außer april" → no außer April."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [
+        _make_pending_item('2025-04-07', 'EK'),
+        _make_pending_item('2025-04-08', 'D4'),
+        _make_pending_item('2025-09-04', 'SM'),
+    ]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('alle unter 8h außer april',
+                                 groups, {it['id']: it for it in items})
+    by_id = {c['review_item_id']: c['answer'] for c in res['proposed_changes']}
+    sep_items = [v for k, v in by_id.items() if '2025-09' in k]
+    assert sep_items and all(v == 'no' for v in sep_items)
+    apr_proposed = [k for k in by_id.keys() if '2025-04' in k]
+    assert not apr_proposed, 'April darf nicht in proposed_changes sein'
+
+
+def test_v838_parser_alle_ja_ausser_datum():
+    """„alle ja außer 08.04" → yes außer 08.04."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [
+        _make_pending_item('2025-04-07', 'EK'),
+        _make_pending_item('2025-04-08', 'D4'),
+        _make_pending_item('2025-04-09', 'D4'),
+    ]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('alle ja außer 08.04',
+                                 groups, {it['id']: it for it in items})
+    by_id = {c['review_item_id']: c['answer'] for c in res['proposed_changes']}
+    excluded = [k for k in by_id.keys() if '2025-04-08' in k]
+    assert not excluded, '08.04 soll ausgeschlossen sein'
+    others_yes = [v for v in by_id.values()]
+    assert all(v == 'yes' for v in others_yes)
+
+
+def test_v838_floating_badge_hidden_on_main():
+    """Floating Chat-Badge auf Hauptseite ist hidden (User-Feedback '22 raus')."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    m = re.search(r'id="floating-chat-badge"[^>]*style="([^"]*)"', src)
+    assert m is not None
+    style = m.group(1)
+    assert 'display:none' in style and 'left:-9999px' in style, \
+        'Floating-Badge muss komplett ausgeblendet sein (left:-9999px sicherstellen)'
+    # updateFloatingBadge ist no-op — setzt Badge immer auf display:none
+    fn_idx = src.find('function updateFloatingBadge')
+    block = src[fn_idx:fn_idx+500]
+    assert "b.style.display = 'none'" in block
+    # KEINE „X offene Punkte"-Text-Update mehr
+    assert "'1 offener Punkt'" not in block
+    assert "'offene Punkte'" not in block
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
