@@ -6933,6 +6933,137 @@ def test_v838_floating_badge_hidden_on_main():
     assert "'offene Punkte'" not in block
 
 
+# ── v8.40 P0: Friendly-Error / Retry / Health ──
+
+def test_v840_health_endpoint_registered():
+    """GET /api/health liefert {ok:true}."""
+    import app as _app
+    rules = [r.rule for r in _app.app.url_map.iter_rules()]
+    assert '/api/health' in rules, 'Health-Endpoint /api/health fehlt'
+
+
+def test_v840_health_endpoint_returns_ok():
+    """Health-Endpoint funktioniert ohne externe Calls (kein Anthropic, kein FS)."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def quick_health')
+    assert fn_idx > 0
+    block = src[fn_idx:fn_idx+800]
+    assert "'ok': True" in block
+    assert "'service': 'aerotax-backend'" in block
+
+
+def test_v840_friendly_error_helper_exists():
+    """_renderFriendlyChatError ist im Code definiert + auf window exposed."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'function _renderFriendlyChatError(' in src
+    assert 'window._renderFriendlyChatError = _renderFriendlyChatError' in src
+    assert 'function _classifyFetchError(' in src
+    assert 'window._classifyFetchError = _classifyFetchError' in src
+
+
+def test_v840_no_raw_load_failed_in_user_facing_strings():
+    """User-facing renderMsg/Bubble-Texte enthalten kein rohes „Load failed" /
+    „TypeError" / „Failed to fetch" / „NetworkError"."""
+    import os, re
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Suche renderMsg-Aufrufe die rohe Fehler-Strings enthalten
+    forbidden_in_user = ['Load failed', 'Failed to fetch', 'TypeError', 'NetworkError']
+    # Patterns die User wirklich SEHEN (renderMsg / textContent / innerHTML / alert)
+    user_render_patterns = [
+        r"renderMsg\(['\"](?:assistant|user|system)['\"],\s*['\"](.*?)['\"]",
+        r"\.textContent\s*=\s*['\"](.*?)['\"]",
+        r"alert\(['\"](.*?)['\"]",
+    ]
+    for pat in user_render_patterns:
+        for m in re.finditer(pat, src):
+            text = m.group(1)
+            for fb in forbidden_in_user:
+                assert fb not in text, f'User-facing String enthält „{fb}": {text[:80]}'
+
+
+def test_v840_friendly_error_classified_into_categories():
+    """_classifyFetchError unterscheidet network / timeout / server / 404 / auth."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('function _classifyFetchError(')
+    block = src[fn_idx:fn_idx+1500]
+    for cat in ['not_found', 'auth', 'server', 'timeout', 'network']:
+        assert "type:'" + cat + "'" in block or 'type: \'' + cat + '\'' in block, \
+            f'Klassifizierung „{cat}" fehlt'
+
+
+def test_v840_friendly_error_has_retry_button():
+    """Friendly-Error-Card bietet „Erneut versuchen" und „Seite neu laden"."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('function _renderFriendlyChatError(')
+    block = src[fn_idx:fn_idx+3500]
+    assert 'Erneut versuchen' in block
+    assert 'Seite neu laden' in block
+    assert 'window.location.reload' in block
+
+
+def test_v840_chat_send_uses_friendly_error_in_catch():
+    """_chatSend / _chatSendImpl /api/chat-Catch nutzt _renderFriendlyChatError."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _chatSendImpl(')
+    block = src[fn_idx:fn_idx+18000]
+    # Im Block finden wir mehrere try-catch-Blöcke. Wichtig: kein renderMsg('system'/'assistant', '⚠ Netzwerkfehler')
+    # mehr OHNE friendly-Helper vorher
+    assert '_renderFriendlyChatError' in block, '_chatSend muss Friendly-Helper im Catch nutzen'
+
+
+def test_v840_handle_review_free_text_uses_friendly_error():
+    """_handleReviewFreeText catch-Block nutzt friendly Helper."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _handleReviewFreeText(')
+    block = src[fn_idx:fn_idx+3500]
+    assert '_renderFriendlyChatError' in block or '_classifyFetchError' in block
+
+
+def test_v840_apply_pending_proposal_uses_friendly_error():
+    """_applyPendingProposal catch-Block nutzt friendly Helper."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _applyPendingProposal(')
+    block = src[fn_idx:fn_idx+9000]
+    assert '_renderFriendlyChatError' in block or '_classifyFetchError' in block
+
+
+def test_v840_stale_chat_history_filtered_on_load():
+    """Beim chat-history-Load werden alte Error-Bubbles gefiltert (Stale-Patterns)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'STALE_PATTERNS' in src
+    # Wichtige Patterns
+    for pat in ['Zu viele Nachrichten', '5-10', 'Verbindungsfehler', 'Magst du', 'Was bedeutet em', 'Server hat zu lange']:
+        assert pat in src, f'Stale-Pattern „{pat}" fehlt in Filter-Liste'
+
+
+def test_v840_fetch_with_timeout_has_retry():
+    """_fetchWithTimeout retried 1x bei Network-Errors."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _fetchWithTimeout(')
+    block = src[fn_idx:fn_idx+1800]
+    assert 'maxAttempts' in block, 'Retry-Counter muss existieren'
+    assert 'while(attempt < maxAttempts)' in block
+    assert 'isNetworkErr' in block
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

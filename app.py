@@ -2417,6 +2417,17 @@ def recover_failed_job():
     })
 
 
+@app.route('/api/health', methods=['GET'])
+def quick_health():
+    """v8.40: Schneller Health-Check ohne externe Calls. Frontend nutzt das bei
+    Verbindungsfehlern um zu unterscheiden: Server down vs. Endpoint-spezifisch."""
+    return jsonify({
+        'ok': True,
+        'service': 'aerotax-backend',
+        'version': 'v8.40',
+    })
+
+
 @app.route('/api/health/full', methods=['GET'])
 def full_health_check():
     """End-to-End Health Check: Server, Anthropic API, File-System."""
