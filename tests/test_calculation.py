@@ -4039,7 +4039,9 @@ def test_v8191_duty_600_ham_z72_via_duty():
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
     t = result['tage_detail'][0]
     assert t['klass'] == 'Z72'
-    assert 'Dienst 600min' in (t['classifier_result'].get('reason') or '')
+    # v8.20.1: Reason zeigt jetzt 'total=NNNmin (duty_plus_commute)'
+    reason = t['classifier_result'].get('reason') or ''
+    assert 'total=600min' in reason or 'duty_plus_commute' in reason
 
 
 def test_v8191_duty_240_ham_zeroday_no_routing_override():
@@ -4373,6 +4375,116 @@ def test_v8200_followme_fixture_counts():
     """Reference-Contract: Datums-Listen-Längen stimmen mit Aggregaten."""
     assert len(FOLLOWME_Z72_DATES_2025) == FOLLOWME_REFERENCE_2025['z72_tage']
     assert len(FOLLOWME_FAHRTAGE_2025) == FOLLOWME_REFERENCE_2025['fahrtage']
+
+
+# ── v8.20.1 Tour-Abwesenheits-Zeit vs Dienst-Zeit ──
+
+def test_v8201_duty_plus_commute_above_480_z72():
+    """Dienstzeit 7:30h (450min) + 2×30min Fahrt = 8:30h (510min) → Z72.
+    time_is_absence=False (default) — Backend addiert commute."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-15', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'EK BUERODIENST',
+         'duty_duration_minutes': 450},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=30)
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Z72', f"450min duty + 60min commute = 510min → Z72, ist {t['klass']}"
+
+
+def test_v8201_duty_plus_commute_below_480_zeroday():
+    """Dienstzeit 7:00h (420min) + 2×20min Fahrt = 7:40h (460min) → kein Z72."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-15', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'EK BUERODIENST',
+         'duty_duration_minutes': 420},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=20)
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Office', \
+        f"420min duty + 40min commute = 460min < 480 → kein Z72, ist {t['klass']}"
+
+
+def test_v8201_followme_absence_time_long_z72():
+    """FollowMe-artige Tour-Abwesenheits-Zeit 10:14h (614min) direkt → Z72.
+    time_is_absence=True — Backend addiert KEINE Fahrzeit."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-07', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'EK BUERODIENST',
+         'duty_duration_minutes': 614,
+         'time_is_absence': True},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    # commute=30 absichtlich gesetzt — DARF NICHT addiert werden
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=30)
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Z72'
+    reason = t['classifier_result'].get('reason') or ''
+    assert 'absence_time' in reason, f"Reason muss 'absence_time' zeigen, ist '{reason}'"
+
+
+def test_v8201_followme_absence_time_short_no_z72():
+    """FollowMe-artige Tour-Abwesenheits-Zeit 5:14h (314min) → kein Z72."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'D4 SCHULUNG',
+         'duty_duration_minutes': 314,
+         'time_is_absence': True},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=30)
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Office', \
+        f"5:14h Abwesenheit < 8h → kein Z72, ist {t['klass']}"
+
+
+def test_v8201_no_double_commute_when_absence():
+    """Kritisch: bei time_is_absence=True wird Fahrzeit NICHT addiert.
+    Sonst würde 470min + 60min = 530min fälschlich Z72 sein."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # 470min Abwesenheit (knapp unter 8h) + commute_minutes=30 (würde addiert sein +60)
+    structured = {'days': [
+        {'datum': '2025-05-15', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'EK BUERODIENST',
+         'duty_duration_minutes': 470,
+         'time_is_absence': True},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=30)
+    t = result['tage_detail'][0]
+    # 470min direkt → unter 480 → kein Z72
+    # Wenn Fahrzeit fälschlich addiert wäre: 470+60=530 → Z72 (FALSCH)
+    assert t['klass'] == 'Office', \
+        f"time_is_absence=True darf KEINE Fahrzeit doppelt addieren — erwartet Office, ist {t['klass']}"
+
+
+def test_v8201_helper_returns_correct_total():
+    """Direkter Helper-Test: _total_minutes_for_z72 verhält sich korrekt."""
+    from app import _total_minutes_for_z72
+    # Dienst-Zeit + commute
+    total, known, src = _total_minutes_for_z72({'duty_duration_minutes': 450}, 30)
+    assert (total, known, src) == (510, True, 'duty_plus_commute')
+    # Tour-Abwesenheits-Zeit (kein commute-Add)
+    total, known, src = _total_minutes_for_z72(
+        {'duty_duration_minutes': 614, 'time_is_absence': True}, 30)
+    assert (total, known, src) == (614, True, 'absence_time')
+    # Duty unknown
+    total, known, src = _total_minutes_for_z72({}, 30)
+    assert (total, known, src) == (0, False, 'no_duty')
+    # commute=0
+    total, known, src = _total_minutes_for_z72({'duty_duration_minutes': 600}, 0)
+    assert total == 600 and known is True
 
 
 if __name__ == '__main__':

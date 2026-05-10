@@ -5357,6 +5357,7 @@ def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes=None, year=2025, homebase
                             'start_time': {'type': 'string', 'description': 'HH:MM Dienstbeginn (z.B. "06:30"), leer wenn nicht im DP'},
                             'end_time': {'type': 'string', 'description': 'HH:MM Dienstende (z.B. "18:45"), leer wenn nicht im DP'},
                             'duty_duration_minutes': {'type': 'integer', 'description': 'Dienstdauer in Minuten (start→end), nur setzen wenn beide Zeiten erkennbar sind. Bei Tour über Mitternacht: bis Mitternacht.'},
+                            'time_is_absence': {'type': 'boolean', 'description': 'true wenn start_time/end_time die TOUR-ABWESENHEIT (Tür-zu-Tür inkl. Anfahrt) repräsentieren, false wenn nur Dienstbeginn/-ende. Sonnet/AeroTAX-Reader liefert idR. Dienstzeit (false). FollowMe-Style-Daten wären absence-time (true). Default false.'},
                             'raw_marker': {'type': 'string', 'description': 'Roher Marker-String wie im DP (max 30 Zeichen), z.B. "FL738 FRA-DUB"'},
                             'raw_lines': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Rohe Zeilen aus dem DP für diesen Tag (max 3 Zeilen, jeweils max 80 Zeichen) — nur bei Unsicherheit oder Same-Day befüllen.'},
                             'confidence': {'type': 'number', 'description': '0-1 wie sicher'},
@@ -5493,6 +5494,13 @@ EMPFOHLEN: routing, has_fl, overnight_after_day, layover_ort, layover_inland
   Wichtig für Z72-Plausibilisierung: Dienst >480min (8h) ohne Übernachtung.
   Office/Schulung mit duty>=480min an Homebase = Inland-Tagestrip Z72 (14€).
   Office/Schulung mit duty<480min = kein Z72.
+
+▸ time_is_absence: false (Default) wenn start/end nur Dienst-Slot sind
+  (Briefing→Off-Duty). Backend addiert dann +2×commute für Z72-Plausi.
+  true wenn start/end die TOUR-ABWESENHEIT sind (Tür-zu-Tür inkl. Anfahrt) —
+  Backend nutzt duty_duration_minutes direkt, KEIN doppelter commute.
+  AeroTAX-DP-Reader liefert idR Dienst-Zeit → false. Externer Import
+  (FollowMe-Style) liefert Abwesenheits-Zeit → true.
 
 ▸ raw_marker: Originaler Marker-String aus dem DP (max 30 Zeichen).
   Beispiele: "FL738 FRA-DUB", "EH FRA", "SBY", "F".
@@ -6680,6 +6688,28 @@ TRAINING_SEQ_MIN_DAYS = 5                  # ≥5 Tage = Mehrtages-Schulungsbloc
 SAME_DAY_Z72_TOTAL_MINUTES = 480           # 8h (duty + 2× commute) → Same-Day Z72
 RECENT_FOREIGN_CLUSTER_MAX_BACK = 4        # Lookback-Tage für Heimkehr-Erkennung
 
+# v8.20.1: Helper für Z72-Plausibilisierung. Unterscheidet Dienst-Zeit
+# (braucht +2×commute) von Tour-Abwesenheits-Zeit (bereits inkl. Anfahrt).
+def _total_minutes_for_z72(d, commute_minutes):
+    """Gibt (total_min, duty_known, source_label) zurück.
+
+    Wenn d['time_is_absence']=True: total_min = duty_duration_minutes (bereits
+        Tour-Start→Tour-Ende, KEINE doppelte Fahrzeit).
+    Sonst: total_min = duty_duration_minutes + 2 × commute_minutes (Hin+Zurück).
+
+    Wenn duty_duration_minutes None/missing → duty_known=False, total_min=0.
+    """
+    raw_duty = d.get('duty_duration_minutes')
+    duty_known = isinstance(raw_duty, (int, float))
+    if not duty_known:
+        return 0, False, 'no_duty'
+    duty_min = int(raw_duty)
+    if d.get('time_is_absence'):
+        return duty_min, True, 'absence_time'
+    commute_total = (commute_minutes * 2) if commute_minutes > 0 else 0
+    return duty_min + commute_total, True, 'duty_plus_commute'
+
+
 # v8.18.4: Training-Sequenz-Marker-Klassen.
 # CLOSED_SEMINAR = zusammenhängender Block ohne tägliche Homebase-Präsenz
 #   (klassisches Seminar, Sprachkurs, externer Lehrgang)
@@ -7067,12 +7097,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             reason = 'Standby zuhause — AT, kein FT, kein VMA'
 
         elif at == 'office':
-            # v8.20.0: Office mit duty>=480min + kein Hotel + nicht in Cluster
-            # + keine aktive Auslands-SE → Z72 (Inland-Tagestrip >8h).
-            # Office ohne Zeitinfo bleibt Office (kein blind Z72).
-            raw_duty_o = d.get('duty_duration_minutes')
-            duty_known_o = isinstance(raw_duty_o, (int, float))
-            duty_min_o = int(raw_duty_o) if duty_known_o else 0
+            # v8.20.0/v8.20.1: Office mit total>=480min + kein Hotel + nicht in
+            # Cluster + keine aktive Auslands-SE → Z72 (Inland-Tagestrip >8h).
+            # total nutzt _total_minutes_for_z72 (Dienst-Zeit + 2×commute ODER
+            # Tour-Abwesenheits-Zeit direkt).
+            total_min_o, duty_known_o, time_src_o = _total_minutes_for_z72(d, commute_minutes)
             in_cluster_o = i in cluster_for_idx
             has_active_foreign_se_o = (
                 se.get('count', 0) > 0
@@ -7081,11 +7110,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             )
             if (not overnight and not prev_overnight and not in_cluster_o
                 and not has_active_foreign_se_o
-                and duty_known_o and duty_min_o >= SAME_DAY_Z72_TOTAL_MINUTES):
+                and duty_known_o and total_min_o >= SAME_DAY_Z72_TOTAL_MINUTES):
                 klass = 'Z72'
                 eur_added = INLAND_TAGESTRIP_8H
-                reason = f'Office Inland >8h (duty {duty_min_o}min) → Z72 14€'
-                print(f"[v8-z72-office] datum={datum} duty={duty_min_o}min → Z72 (Office Inland >8h)")
+                reason = f'Office Inland >8h (total {total_min_o}min, {time_src_o}) → Z72 14€'
+                print(f"[v8-z72-office] datum={datum} total={total_min_o}min src={time_src_o} → Z72")
             else:
                 klass = 'Office'
                 reason = 'Office am Homebase — AT + FT'
@@ -7104,11 +7133,9 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 reason = 'Schulung mit Hotel — Volltag (Z74 24h)'
                 eur_added = INLAND_VOLL_24H
             else:
-                # v8.20.0: Schulung ohne Übernachtung mit duty>=480min → Z72.
+                # v8.20.0/v8.20.1: Schulung ohne Übernachtung mit total>=480min → Z72.
                 # Schulung ohne Zeitinfo oder <8h bleibt Office (kein blind Z72).
-                raw_duty_t = d.get('duty_duration_minutes')
-                duty_known_t = isinstance(raw_duty_t, (int, float))
-                duty_min_t = int(raw_duty_t) if duty_known_t else 0
+                total_min_t, duty_known_t, time_src_t = _total_minutes_for_z72(d, commute_minutes)
                 in_cluster_t = i in cluster_for_idx
                 has_active_foreign_se_t = (
                     se.get('count', 0) > 0
@@ -7116,11 +7143,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     and bool(se.get('stfrei_ort'))
                 )
                 if (not in_cluster_t and not has_active_foreign_se_t
-                    and duty_known_t and duty_min_t >= SAME_DAY_Z72_TOTAL_MINUTES):
+                    and duty_known_t and total_min_t >= SAME_DAY_Z72_TOTAL_MINUTES):
                     klass = 'Z72'
                     eur_added = INLAND_TAGESTRIP_8H
-                    reason = f'Schulung Inland >8h (duty {duty_min_t}min) → Z72 14€'
-                    print(f"[v8-z72-training] datum={datum} duty={duty_min_t}min → Z72 (Schulung Inland >8h)")
+                    reason = f'Schulung Inland >8h (total {total_min_t}min, {time_src_t}) → Z72 14€'
+                    print(f"[v8-z72-training] datum={datum} total={total_min_t}min src={time_src_t} → Z72")
                 else:
                     klass = 'Office'
                     reason = 'Schulung am Homebase'
@@ -7174,21 +7201,18 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 audit_note = f'{datum}: Same-Day mit Auslands-SE {se_ort_fix} → Z76'
                 print(f"[v8-z76-detail] datum={datum} ort={se_ort_fix} bmf_land={(bmf_aus or {}).get('land','?')} tagtyp=an_abreise amount={eur_added:.2f} reason='Same-Day Auslandstrip'")
             else:
-                # v8.19.1 — strikte Trennung "duty bekannt" vs "duty fehlt":
+                # v8.19.1 / v8.20.1 — strikte Trennung "duty bekannt" vs "duty fehlt":
                 #
-                # 1. duty bekannt (>=0) UND total >= 480       → Z72 via duty-Pfad
-                # 2. duty bekannt (>=0) UND total <  480       → ZeroDay (Sonnet-Read
+                # 1. duty bekannt UND total_for_z72 >= 480     → Z72 via duty-Pfad
+                # 2. duty bekannt UND total_for_z72 <  480     → ZeroDay (Sonnet-Read
                 #    glaubwürdig, KEIN Routing-Override)
                 # 3. duty fehlt/None UND Inland-Roundtrip      → Z72 via Routing-Override
-                #    (Sonnet hat nicht gelesen, Routing ist deterministisches Indiz)
                 # 4. duty fehlt/None UND kein Inland-Routing   → ZeroDay (kein Indiz)
                 #
-                # Kein automatisches Z72 mehr für duty=0 explicit.
-                raw_duty = d.get('duty_duration_minutes')
-                duty_known = isinstance(raw_duty, (int, float))
-                duty_min = int(raw_duty) if duty_known else 0
-                commute_total = (commute_minutes * 2) if commute_minutes > 0 else 0
-                total_min = duty_min + commute_total
+                # total_for_z72 berücksichtigt time_is_absence-Flag (v8.20.1):
+                # - false: duty + 2×commute (Dienst-Zeit, Fahrzeit hinzu)
+                # - true:  duty (bereits Tour-Abwesenheits-Zeit, kein doppelter commute)
+                total_min, duty_known, time_src = _total_minutes_for_z72(d, commute_minutes)
                 routing = d.get('routing') or []
                 _hb_up = (homebase or 'FRA').upper()
                 is_routing_inland_sameday = (
@@ -7200,23 +7224,19 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 if duty_known and total_min >= SAME_DAY_Z72_TOTAL_MINUTES:
                     klass = 'Z72'
                     eur_added = INLAND_TAGESTRIP_8H
-                    reason = f'Same-Day Z72 — Dienst {duty_min}min + Fahrzeit {commute_total}min = {total_min}min ≥ {SAME_DAY_Z72_TOTAL_MINUTES}min'
-                    print(f"[v8-z72-duration] datum={datum} duty_minutes={duty_min} commute_minutes={commute_total} total={total_min} counted=Z72")
+                    reason = f'Same-Day Z72 — total={total_min}min ({time_src}) ≥ {SAME_DAY_Z72_TOTAL_MINUTES}min'
+                    print(f"[v8-z72-duration] datum={datum} total={total_min}min src={time_src} counted=Z72")
                 elif duty_known:
-                    # duty wurde gelesen UND ist sicher unter 8h → ZeroDay,
-                    # KEIN Routing-Override (Sonnet-Read wird respektiert).
                     klass = 'ZeroDay'
-                    reason = f'Same-Day < 8h (Dienst {duty_min}min + Fahrzeit {commute_total}min = {total_min}min) — kein VMA'
-                    print(f"[v8-z72-duration] datum={datum} duty_minutes={duty_min} commute_minutes={commute_total} total={total_min} counted=ZeroDay")
+                    reason = f'Same-Day < 8h (total={total_min}min, {time_src}) — kein VMA'
+                    print(f"[v8-z72-duration] datum={datum} total={total_min}min src={time_src} counted=ZeroDay")
                 elif is_routing_inland_sameday:
-                    # duty fehlt/None UND Inland-Roundtrip → konservativ Z72 via Routing
                     klass = 'Z72'
                     eur_added = INLAND_TAGESTRIP_8H
                     routing_str = '-'.join(routing)
                     reason = f'Same-Day Inland-Tagestrip Routing {routing_str} (duty fehlt — Routing als Plausi-Quelle) → Z72 14€'
                     print(f"[v8-z72-routing] datum={datum} routing={routing_str} duty=None → Z72 (Routing-Override)")
                 else:
-                    # duty fehlt UND kein Inland-Routing → kein Indiz, ZeroDay
                     klass = 'ZeroDay'
                     reason = 'Same-Day ohne duty-Info und ohne Inland-Routing — kein VMA-Indiz'
                     print(f"[v8-z72-duration] datum={datum} duty=None routing={routing} counted=ZeroDay")
