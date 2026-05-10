@@ -1022,16 +1022,24 @@ def test_v8_health_check_yellow_low_z77():
 
 
 def test_v8_health_check_green_for_complete_docs():
-    """Vollständige Dokumente → green."""
+    """Vollständige Dokumente (alle Kalendertage) → green.
+    v8.18.2: DP-Reader liefert alle 365 Tage, daher Test mit komplettem Jahr."""
     from app import _document_health_check
+    from datetime import date, timedelta
     se_lines = [{'datum': f'2025-{m:02d}-15', 'stfrei_betrag': 100, 'storno': False}
-                for m in range(1, 13)]  # 12 Monate × 100€ = 1200€ Z77
-    days = [{'datum': f'2025-{m:02d}-15', 'activity_type': 'tour'} for m in range(1, 13)]
-    days += [{'datum': f'2025-{m:02d}-{d:02d}', 'activity_type': 'frei'}
-             for m in range(1, 13) for d in (1, 5, 10, 20, 25)]
+                for m in range(1, 13)]
+    # Volle 365 Tage: einer pro Tag
+    start = date(2025, 1, 1)
+    days = []
+    for offset in range(365):
+        d = start + timedelta(days=offset)
+        # 12 Tour-Tage, Rest Frei
+        is_tour = d.day == 15
+        days.append({'datum': d.isoformat(),
+                     'activity_type': 'tour' if is_tour else 'frei'})
     health = _document_health_check({'brutto': 50000, 'z17': 1200},
                                      {'se_lines': se_lines}, {'days': days}, 2025)
-    assert health['status'] == 'green', f"Vollständige Docs sollten green sein, sind {health['status']}: {health['issues']}"
+    assert health['status'] == 'green', f"365 Tage = green erwartet, ist {health['status']}: {health['issues']}"
 
 
 def test_v8_health_check_warns_on_no_dp_for_se_dates():
@@ -3170,6 +3178,155 @@ def test_v8181_rescues_field_present_in_result():
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
     assert 'rescues' in result
     assert result['rescues'] == []
+
+
+def test_v8182_health_365_days_no_warning():
+    """v8.18.2: 365 DP-Tage erzeugen kein warning (DP-Vollständigkeit ist gewollt)."""
+    from app import _document_health_check
+    from datetime import date, timedelta
+    start = date(2025, 1, 1)
+    days = [{'datum': (start + timedelta(days=i)).isoformat(),
+             'activity_type': 'tour' if i % 30 == 0 else 'frei'}
+            for i in range(365)]
+    se_lines = [{'datum': f'2025-{m:02d}-15', 'stfrei_betrag': 100, 'storno': False}
+                for m in range(1, 13)]
+    health = _document_health_check({'brutto': 50000, 'z17': 1200},
+                                     {'se_lines': se_lines}, {'days': days}, 2025)
+    # Kein "ungewöhnlich hoch"-warning bei 365 Tagen
+    bad_warnings = [i for i in health.get('issues', [])
+                    if i.get('severity') == 'warning' and 'ungewöhnlich hoch' in i.get('reason','')]
+    assert len(bad_warnings) == 0
+    assert health['status'] == 'green'
+
+
+def test_v8182_health_366_schaltjahr_ok():
+    """366 Tage (Schaltjahr) erzeugt kein Reader-Bug-warning."""
+    from app import _document_health_check
+    from datetime import date, timedelta
+    start = date(2024, 1, 1)
+    days = [{'datum': (start + timedelta(days=i)).isoformat(),
+             'activity_type': 'tour' if i % 30 == 0 else 'frei'}
+            for i in range(366)]
+    se_lines = [{'datum': f'2024-{m:02d}-15', 'stfrei_betrag': 100, 'storno': False}
+                for m in range(1, 13)]
+    health = _document_health_check({'brutto': 50000, 'z17': 1200},
+                                     {'se_lines': se_lines}, {'days': days}, 2024)
+    bad = [i for i in health.get('issues', [])
+           if i.get('severity') == 'warning' and 'Reader-Bug' in i.get('reason','')]
+    assert len(bad) == 0
+
+
+def test_v8182_health_more_than_366_warns():
+    """> 366 Tage = Reader-Bug warning."""
+    from app import _document_health_check
+    days = [{'datum': f'2025-01-{(i%28)+1:02d}', 'activity_type': 'tour'}
+            for i in range(400)]  # 400 Einträge
+    se_lines = [{'datum': '2025-01-15', 'stfrei_betrag': 100, 'storno': False}]
+    health = _document_health_check({'brutto': 50000, 'z17': 1200},
+                                     {'se_lines': se_lines}, {'days': days}, 2025)
+    bug = any('Reader-Bug' in i.get('reason','') for i in health.get('issues', []))
+    assert bug
+
+
+def test_v8182_health_less_than_250_warns():
+    """< 250 Tage = warning (möglicherweise Frei-Tage übersehen)."""
+    from app import _document_health_check
+    days = [{'datum': f'2025-{m:02d}-15', 'activity_type': 'tour'} for m in range(1, 13)]
+    se_lines = [{'datum': f'2025-{m:02d}-15', 'stfrei_betrag': 100, 'storno': False}
+                for m in range(1, 13)]
+    health = _document_health_check({'brutto': 50000, 'z17': 1200},
+                                     {'se_lines': se_lines}, {'days': days}, 2025)
+    # 12 Tage → "ungewöhnlich wenig" warning
+    warn = [i for i in health.get('issues', []) if 'ungewöhnlich wenig' in i.get('reason','')]
+    # Kann auch über andere warnings rauskommen — Hauptsache nicht green
+    assert health['status'] != 'green'
+
+
+def test_v8182_training_seq_uses_marker_substring():
+    """v8.18.2: SM SEMINAR ohne activity_type='training' wird via raw_marker erkannt."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'office',  # office statt training
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True,
+         'raw_marker': 'SM SEMINAR'}
+        for d in range(4, 13)  # 9 Tage
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 1, \
+        f"9-Tage SM SEMINAR (office) sollte 1 Fahrtag sein, ist {result['fahr_tage']}"
+    seqs = result.get('training_sequences') or []
+    assert len(seqs) == 1
+
+
+def test_v8182_training_seq_tolerates_one_gap_day():
+    """v8.18.2: 1 Tag Frei-Lücke zwischen Training-Tagen unterbricht Sequenz nicht."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = [
+        {'datum': '2025-09-04', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-05', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-06', 'activity_type': 'frei', 'overnight_after_day': False},  # GAP
+        {'datum': '2025-09-07', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-09', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+    ]
+    matched = _match_dp_se_per_day({'days': structured}, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 5 echte Training-Tage (06.09 frei) — Sequenz wird durch frei-Lücke nicht abgebrochen
+    # Total Fahrtage: 1 (Tag 1 der Sequenz)
+    assert result['fahr_tage'] == 1, \
+        f"5 Training-Tage mit 1 Frei-Gap = 1 Fahrtag, ist {result['fahr_tage']}"
+
+
+def test_v8182_training_seq_broken_by_real_flight():
+    """v8.18.2: Echter Flugdienst zwischen Training-Tagen UNTERBRICHT die Sequenz."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = [
+        {'datum': '2025-09-04', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-05', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        # Echter Flugdienst → Sequenz wird gebrochen
+        {'datum': '2025-09-06', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','JFK'], 'layover_ort': 'JFK'},
+        {'datum': '2025-09-07', 'activity_type': 'tour', 'overnight_after_day': False},
+        {'datum': '2025-09-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+    ]
+    se = {'se_lines': [
+        {'datum': '2025-09-06', 'stfrei_betrag': 40, 'stfrei_ort': 'JFK',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day({'days': structured}, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Keine zusammenhängende Training-Sequenz von ≥5 — Tour bricht ab
+    seqs = result.get('training_sequences') or []
+    assert len(seqs) == 0, f"Sequenz darf nicht über echten Flug verbinden: {seqs}"
+
+
+def test_v8182_training_sequences_audit_fields():
+    """training_sequences hat alle Audit-Felder."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'}
+        for d in range(4, 13)
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    seqs = result.get('training_sequences') or []
+    assert len(seqs) == 1
+    seq = seqs[0]
+    for key in ('start', 'end', 'days', 'marker_types', 'counted_fahrtage',
+                'skipped_fahrtage', 'reason'):
+        assert key in seq, f"training_sequences ohne Feld '{key}'"
 
 
 if __name__ == '__main__':

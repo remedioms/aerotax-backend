@@ -1217,6 +1217,7 @@ def _run_process_async(job_id, form, files):
                 'missing_deutschland_14_candidates': result.get('_missing_deutschland_14_candidates') or [],
                 'aerotax_z76_dates_amounts':   result.get('_aerotax_z76_dates_amounts') or [],
                 'rescues':                     result.get('_rescues') or [],
+                'training_sequences':          result.get('_training_sequences') or [],
                 'training_commute_candidates': result.get('_training_commute_candidates') or [],
                 'office_z72_candidates':       result.get('_office_z72_candidates') or [],
                 'missing_reader_days':         result.get('_missing_reader_days') or [],
@@ -6508,14 +6509,29 @@ def _document_health_check(lsb_data, se_structured, structured_days, year):
                 issues.append({'source': 'DP', 'severity': 'warning',
                                'reason': f'{len(unmatched)} aktive SE-Tage ohne DP-Match — DP unvollständig?'})
                 sources['dp'] = 'yellow'
+        # v8.18.2: Health-Threshold an DP-Vollständigkeit angepasst.
+        # Sonnet liefert seit v8.18 ALLE Kalendertage inkl. Frei — daher ist
+        # 360-366 Tage normal (kein warning).
+        # < 250 Tage bei vollem Jahr = unvollständig
+        # > 366 = Reader-Bug
         if len(days) < 30:
             issues.append({'source': 'DP', 'severity': 'warning',
                            'reason': f'Nur {len(days)} Tage erkannt — DP unvollständig?'})
             if sources['dp'] == 'green':
                 sources['dp'] = 'yellow'
-        if len(days) > 230:
+        elif 30 <= len(days) < 250:
             issues.append({'source': 'DP', 'severity': 'warning',
-                           'reason': f'{len(days)} Tage erkannt — bei normalem Crew-Jahr ungewöhnlich hoch'})
+                           'reason': f'{len(days)} Tage erkannt — bei Ganzjahresdatei ungewöhnlich wenig (möglicherweise Frei-Tage übersehen)'})
+            if sources['dp'] == 'green':
+                sources['dp'] = 'yellow'
+        elif 250 <= len(days) <= 366:
+            # Normal: 360-366 = vollständiges Jahr, 250-359 möglich (Teiljahr)
+            # Info-Eintrag, kein warning
+            issues.append({'source': 'DP', 'severity': 'info',
+                           'reason': f'{len(days)} Kalendertage gelesen inkl. Frei-/Urlaub-/Krank-Tage'})
+        elif len(days) > 366:
+            issues.append({'source': 'DP', 'severity': 'warning',
+                           'reason': f'{len(days)} Tage erkannt — Reader-Bug (Schaltjahr max 366)'})
             if sources['dp'] == 'green':
                 sources['dp'] = 'yellow'
         if tour_count == 0 and se_structured and se_structured.get('se_lines'):
@@ -6766,40 +6782,119 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 None,
                 None)
 
-    # v8.17: Mehrtages-Training-Sequenz vorm Klassifikations-Loop berechnen.
-    # Das training_seq_skip-Set ist auch für counted_as_reinigungstag relevant
-    # (Folgetage zählen weder Fahrtag NOCH Reinigungstag).
+    # v8.18.2: Training-Seminar-Sequenz robuster erkennen.
+    # Erweiterte Regeln:
+    # - activity_type='training' ODER raw_marker enthält Seminar-Token
+    #   (SEMINAR/SCHULUNG/SM/D4/EM/EH/TK)
+    # - 1 Tag Lücke (frei/urlaub/krank/unknown OHNE Flug) wird toleriert
+    # - Echter Flugdienst (has_fl/tour/same_day) bricht die Sequenz IMMER
+    # - Min 5 Tage zusammenhängend (mit Lücke)
+    # - explicit_daily_commute=true → keine Sequenz-Skip
+    SEMINAR_MARKER_TOKENS = ('SEMINAR', 'SCHULUNG', 'SM ', 'D4 ', 'EM ', 'EH ', 'TK ',
+                              'TRAINING', 'EMERGENCY', 'ERSTE-HILFE', 'BUERODIENST')
+
+    def _is_seminar_day(m_):
+        d_ = m_['dp']
+        at_ = d_.get('activity_type', '')
+        marker_ = (d_.get('raw_marker', '') or '').upper()
+        # Echter Flug bricht Sequenz IMMER
+        if d_.get('has_fl') or at_ in ('tour', 'same_day'):
+            return False
+        # activity_type=training/office-Office mit Seminar-Marker
+        if at_ in ('training', 'office'):
+            if any(tok in marker_ for tok in SEMINAR_MARKER_TOKENS):
+                return True
+            # Ohne Marker: nur 'training' zählt (office ohne Seminar-Marker = Homebase-Office, eigene Logik)
+            if at_ == 'training':
+                return True
+        return False
+
+    def _is_seminar_gap(m_):
+        """Tolerable Lücke: Frei/Urlaub/Krank/unknown OHNE echten Flug."""
+        d_ = m_['dp']
+        at_ = d_.get('activity_type', '')
+        if d_.get('has_fl') or at_ in ('tour', 'same_day'):
+            return False
+        return at_ in ('frei', 'urlaub', 'krank', 'unknown', 'none', '')
+
     training_seq_skip = set()
     training_seq_audit = []
     seq_start_pre = None
-    for idx_pre, m_pre in enumerate(sorted_days):
-        d_pre = m_pre['dp']
-        if d_pre.get('activity_type') == 'training' and d_pre.get('requires_commute'):
+    seq_indices = []  # alle Indices in der aktuellen Sequenz (ohne Lücken)
+    pending_gap = None  # potenzielle Lücke (max 1 Tag)
+    i_pre = 0
+    while i_pre < len(sorted_days):
+        m_pre = sorted_days[i_pre]
+        if _is_seminar_day(m_pre):
             if seq_start_pre is None:
-                seq_start_pre = idx_pre
+                seq_start_pre = i_pre
+                seq_indices = [i_pre]
+            else:
+                seq_indices.append(i_pre)
+            pending_gap = None
+            i_pre += 1
+        elif seq_start_pre is not None and _is_seminar_gap(m_pre) and pending_gap is None:
+            # 1-Tag-Lücke tolerieren — schauen ob Folgetag wieder Seminar ist
+            pending_gap = i_pre
+            i_pre += 1
         else:
-            if seq_start_pre is not None and (idx_pre - seq_start_pre) >= 5:
-                seq_days_pre = sorted_days[seq_start_pre:idx_pre]
+            # Sequenz endet hier
+            if seq_start_pre is not None and len(seq_indices) >= 5:
+                seq_days_pre = [sorted_days[idx] for idx in seq_indices]
                 any_daily_pre = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days_pre)
+                marker_types = sorted(set(
+                    dd['dp'].get('raw_marker', '').split()[0] if dd['dp'].get('raw_marker') else dd['dp'].get('activity_type','')
+                    for dd in seq_days_pre
+                ))
                 if not any_daily_pre:
-                    for skip_i in range(seq_start_pre + 1, idx_pre):
+                    # Skip alle außer dem ersten
+                    for skip_i in seq_indices[1:]:
                         training_seq_skip.add(skip_i)
                     training_seq_audit.append({
-                        'start': sorted_days[seq_start_pre]['datum'],
-                        'end':   sorted_days[idx_pre-1]['datum'],
-                        'days':  idx_pre - seq_start_pre,
+                        'start':            sorted_days[seq_indices[0]]['datum'],
+                        'end':              sorted_days[seq_indices[-1]]['datum'],
+                        'days':             len(seq_indices),
+                        'marker_types':     marker_types,
+                        'counted_fahrtage': 1,
+                        'skipped_fahrtage': len(seq_indices) - 1,
+                        'reason':           'Mehrtägige Schulungs-/Seminarsequenz — keine eindeutige tägliche Anfahrt',
+                    })
+                else:
+                    training_seq_audit.append({
+                        'start':            sorted_days[seq_indices[0]]['datum'],
+                        'end':              sorted_days[seq_indices[-1]]['datum'],
+                        'days':             len(seq_indices),
+                        'marker_types':     marker_types,
+                        'counted_fahrtage': len(seq_indices),
+                        'skipped_fahrtage': 0,
+                        'reason':           'Sequenz mit explicit_daily_commute=true — alle Tage zählen',
                     })
             seq_start_pre = None
-    if seq_start_pre is not None and (len(sorted_days) - seq_start_pre) >= 5:
-        seq_days_pre = sorted_days[seq_start_pre:]
+            seq_indices = []
+            pending_gap = None
+            # i_pre nicht erhöhen — aktueller Tag muss neu evaluiert werden
+            # (könnte selbst Seminar-Tag sein, wenn _is_seminar_day=False weil
+            # kein Marker, aber jetzt einfach weiter)
+            i_pre += 1
+    # Sequenz am Jahresende
+    if seq_start_pre is not None and len(seq_indices) >= 5:
+        seq_days_pre = [sorted_days[idx] for idx in seq_indices]
         any_daily_pre = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days_pre)
+        marker_types = sorted(set(
+            dd['dp'].get('raw_marker', '').split()[0] if dd['dp'].get('raw_marker') else dd['dp'].get('activity_type','')
+            for dd in seq_days_pre
+        ))
         if not any_daily_pre:
-            for skip_i in range(seq_start_pre + 1, len(sorted_days)):
+            for skip_i in seq_indices[1:]:
                 training_seq_skip.add(skip_i)
             training_seq_audit.append({
-                'start': sorted_days[seq_start_pre]['datum'],
-                'end':   sorted_days[-1]['datum'],
-                'days':  len(sorted_days) - seq_start_pre,
+                'start':            sorted_days[seq_indices[0]]['datum'],
+                'end':              sorted_days[seq_indices[-1]]['datum'],
+                'days':             len(seq_indices),
+                'marker_types':     marker_types,
+                'counted_fahrtage': 1,
+                'skipped_fahrtage': len(seq_indices) - 1,
+                'reason':           'Mehrtägige Schulungs-/Seminarsequenz — keine eindeutige tägliche Anfahrt',
             })
 
     for i, m in enumerate(sorted_days):
@@ -7491,11 +7586,14 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     # v8.17: training_seq_skip wird oben (vorm Klassifikations-Loop) berechnet,
     # damit auch counted_as_reinigungstag im classifier_result darauf reagieren kann.
 
-    # v8.14: Audit-Notes für jede erkannte Mehrtages-Sequenz
+    # v8.14/v8.18.2: Audit-Notes für jede erkannte Mehrtages-Sequenz
     for seq in training_seq_audit:
+        marker_str = ('/' + '/'.join(seq.get('marker_types', []))) if seq.get('marker_types') else ''
         audit_notes.append(
             f"Mehrtägige Schulungs-/Seminarsequenz erkannt ({seq['start']} bis "
-            f"{seq['end']}, {seq['days']} Tage); Fahrtag nur am ersten Tag gezählt, "
+            f"{seq['end']}, {seq['days']} Tage{marker_str}); "
+            f"Fahrtag nur am ersten Tag gezählt ({seq.get('counted_fahrtage', 1)}), "
+            f"{seq.get('skipped_fahrtage', 0)} Folgetage übersprungen — "
             f"sofern keine tägliche Homebase-Anfahrt eindeutig erkennbar ist."
         )
 
@@ -7938,6 +8036,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         'missing_deutschland_14_candidates': missing_deutschland_14_candidates,
         'aerotax_z76_dates_amounts':   aerotax_z76_dates_amounts,
         'rescues':                     rescues,
+        'training_sequences':          training_seq_audit,
         'training_commute_candidates': training_commute_candidates,
         'office_z72_candidates':       office_z72_candidates,
         'missing_reader_days':         missing_reader_days,
@@ -9103,6 +9202,7 @@ def _berechne_via_hybrid(form, files):
         '_missing_deutschland_14_candidates': list(cls.get('missing_deutschland_14_candidates', []) or []),
         '_aerotax_z76_dates_amounts':   list(cls.get('aerotax_z76_dates_amounts', []) or []),
         '_rescues':                     list(cls.get('rescues', []) or []),
+        '_training_sequences':          list(cls.get('training_sequences', []) or []),
         '_training_commute_candidates': list(cls.get('training_commute_candidates', []) or []),
         '_office_z72_candidates':       list(cls.get('office_z72_candidates', []) or []),
         '_missing_reader_days':         list(cls.get('missing_reader_days', []) or []),
