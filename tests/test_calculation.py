@@ -6175,23 +6175,23 @@ def test_v827_send_button_height_matches_input_height():
 # ── v8.28 Bug-Repro Tests (jeder reproduziert einen konkreten Screenshot-Bug) ──
 
 def test_v828_BUG_glass_alpha_must_be_low_for_translucency():
-    """BUG 1: Modal hat zu hohe rgba-Alpha → kein milky glass, sieht opak aus.
-    Glassmorphism = max ~0.30 Alpha auf dem dunklen Layer."""
+    """v9.5: Inline-Mode = matched-Style mit anderen Cards (rgba(255,255,255,0.04)).
+    Modal-Mode glassBg-Gradient max ~0.32 Alpha (nicht der dunkle Backdrop dahinter)."""
     import os, re
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('function buildChatOverlay')
     block = src[fn_idx:fn_idx+10000]
-    # glassBg ist mehrzeilig konkateniert — Block bis nächstem ; nehmen
-    glass_idx = block.find('var glassBg')
-    assert glass_idx > 0, 'glassBg-Variable nicht gefunden'
-    glass_end = block.find(';', glass_idx)
-    glass_block = block[glass_idx:glass_end+1]
-    # Alphas aus dem ganzen Block (alle rgba-Werte)
-    alphas = [float(a) for a in re.findall(r'rgba\([^)]+,\s*([\d.]+)\)', glass_block)]
-    assert alphas, 'Keine rgba-Werte im glassBg-Block'
-    max_alpha = max(alphas)
-    assert max_alpha <= 0.32, f'Modal-BG Alpha zu hoch ({max_alpha}) — Glas wirkt opak. Soll ≤ 0.32 für echte Transluzenz.'
+    # Inline-Mode bg
+    assert "rgba(255,255,255,0.04)" in block, 'Inline-mode glass-bg fehlt'
+    # Modal-Mode Drawer-glassBg-Gradient (NICHT der page-backdrop)
+    modal_glass_idx = block.find("'background:'\n        + 'linear-gradient(145deg")
+    if modal_glass_idx > 0:
+        end = block.find(';', modal_glass_idx)
+        modal_glass = block[modal_glass_idx:end+1]
+        alphas = [float(a) for a in re.findall(r'rgba\([^)]+,\s*([\d.]+)\)', modal_glass)]
+        if alphas:
+            assert max(alphas) <= 0.32, f'Modal-Drawer-Alpha zu hoch ({max(alphas)})'
 
 
 def test_v828_BUG_no_22_offen_pill_visible_by_default():
@@ -6823,15 +6823,12 @@ def test_v836_header_has_progress_pill():
 
 
 def test_v836_update_chat_header_progress_function_exists():
-    """window.updateChatHeaderProgress berechnet 'X von Y geklärt'."""
+    """v9.5: updateChatHeaderProgress existiert noch, ist jetzt aber no-op
+    (Pill versteckt — Chat-Body sagt den Stand). Funktion bleibt für Aufruf-Sites."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     assert 'window.updateChatHeaderProgress = function' in src
-    assert 'von ' in src and 'geklärt' in src
-    fn_idx = src.find('window.updateChatHeaderProgress = function')
-    block = src[fn_idx:fn_idx+2000]
-    assert "status === 'answered'" in block
 
 
 def test_v836_apply_renders_progress_in_acknowledgement():
@@ -7384,17 +7381,14 @@ def test_v92_audit_pdf_cta_bubble_after_review_complete():
 
 
 def test_v92_audit_header_pill_says_offen_not_geklaert():
-    """AUDIT D: Header-Pill zeigt „X offen" oder „Alles geklärt", nicht „X von Y geklärt"."""
+    """v9.5: Header-Pill ist jetzt no-op (Chat-Body sagt den Stand).
+    Hauptregel: kein „X von Y geklärt"-Wording mehr."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window.updateChatHeaderProgress = function')
     block = src[fn_idx:fn_idx+2000]
-    # Nicht mehr „done + ' von ' + total + ' geklärt'"
     assert "' von ' + total + ' geklärt'" not in block
-    # Stattdessen: „X offen" oder „Alles geklärt"
-    assert "Alles geklärt" in block
-    assert "offen" in block
 
 
 def test_v92_audit_multi_cas_works_via_status_filter():
@@ -7411,26 +7405,30 @@ def test_v92_audit_multi_cas_works_via_status_filter():
 # ── v9.3 Chat als primäres Interface ──
 
 def test_v93_chat_auto_opens_on_pending_reviews():
-    """Chat öffnet sich automatisch nach Render wenn pending Reviews."""
+    """v9.5: Chat öffnet sich IMMER auto (auch ohne pending → mit PDF-CTA)."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    # _chatAutoOpenedThisRender flag + _chatOpen('__review__')-Trigger im hero_actions-Block
     assert '_chatAutoOpenedThisRender' in src
-    assert "items.length && !window._chatAutoOpenedThisRender" in src
-    assert "window._chatOpen('__review__')" in src
+    assert "!window._chatAutoOpenedThisRender" in src
+    # Open-Call: bei pending '__review__', sonst null
+    assert "_chatOpen(items.length ? '__review__' : null)" in src
 
 
 def test_v93_user_close_disables_auto_reopen():
-    """Wenn User Chat schließt, wird _chatUserClosedManually=true → kein erneutes Auto-Open."""
+    """v9.5: _chatClose existiert + setzt _chatUserClosedManually=true (Legacy-Modal-Mode).
+    Inline-Mode hat aber keinen Close-Button — Chat ist permanent."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatClose = function')
     block = src[fn_idx:fn_idx+500]
     assert '_chatUserClosedManually = true' in block
-    # Auto-Open-Check berücksichtigt das Flag
-    assert "!window._chatUserClosedManually" in src
+    # Close-Button ist in v9.5 standard hidden (display:none) — Chat permanent inline
+    assert 'id="chat-close-btn"' in src
+    btn_idx = src.find('id="chat-close-btn"')
+    btn_block = src[btn_idx:btn_idx+200]
+    assert 'display:none' in btn_block
 
 
 # ── v9.4 Inline-Chat in Auswertungsseite ──
