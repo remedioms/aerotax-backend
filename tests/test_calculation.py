@@ -2400,6 +2400,94 @@ def test_v812_rek_bmf_lookup_works():
     assert bmf.get('voll_24h', 0) > 0
 
 
+def test_v813_z73_evening_anreise_no_hotel():
+    """Z73 Abend-Auslandsanreise zählt NICHT als Hotelnacht.
+    User boardet abends in DE, schläft im Flugzeug — kein Hotel-Tag heute.
+    Reference: Hotelnächte einer 5-Tage-Tour = 3 (Mittel-Tage), nicht 4 (mit Anreise)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-19', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': False, 'routing': ['FRA', 'GRU'], 'layover_ort': 'GRU',
+         'start_time': '21:25'},
+        {'datum': '2025-01-20', 'activity_type': 'tour', 'overnight_after_day': True,
+         'layover_ort': 'GRU'},
+        {'datum': '2025-01-21', 'activity_type': 'tour', 'overnight_after_day': True,
+         'layover_ort': 'GRU'},
+        {'datum': '2025-01-22', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-19', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-01-20', 'stfrei_betrag': 47, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-21', 'stfrei_betrag': 47, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-22', 'stfrei_betrag': 31, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail_19 = next(t for t in result['tage_detail'] if t['datum']=='2025-01-19')
+    assert detail_19['klass'] == 'Z73'
+    # Hotelnacht-Flag muss False sein für Abend-Anreise
+    assert detail_19['classifier_result']['counted_as_hotel_nacht'] is False
+    # Total Hotel = 2 (20.+21.) — NICHT 3 (also nicht 19. mitgezählt)
+    assert result['hotel_naechte'] == 2, \
+        f"3-Hotel-Nächte-Tour mit Z73-Anreise sollte 2 Hotels haben, ist {result['hotel_naechte']}"
+
+
+def test_v813_multi_day_training_sequence_only_first_fahrtag():
+    """Mehrtägiges Seminar (≥4 Tage activity=training): nur Tag 1 ist Fahrtag,
+    Folgetage zählen nicht (User fährt einmal hin, Veranstaltung läuft mehrere Tage)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True}
+        for d in range(4, 13)  # 04.09 - 12.09 = 9 Tage
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 9 Office-Tage, aber nur 1 Fahrtag (Tag 1)
+    assert result['fahr_tage'] == 1, \
+        f"9-Tage-Seminar sollte 1 Fahrtag haben, ist {result['fahr_tage']}"
+
+
+def test_v813_two_day_training_still_counts_each():
+    """Kurze Training-Sequenz (<4 Tage) zählt jeden Tag als Fahrtag (kein
+    Mehrtages-Seminar-Pattern)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-09', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True},
+        {'datum': '2025-04-10', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 2-Tages-Training: jeden Tag als Fahrtag
+    assert result['fahr_tage'] == 2
+
+
+def test_v813_inland_z73_still_counts_as_hotel():
+    """Echte Inland-Z73 (z.B. Inland-Layover ≠ Homebase) zählt weiterhin Hotel.
+    Nur Z73-Abend-Auslandsanreise wird ausgeschlossen."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-03-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'MUC'], 'layover_ort': 'MUC'},
+        {'datum': '2025-03-05', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['MUC', 'FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-03-04', 'stfrei_betrag': 14, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-03-05', 'stfrei_betrag': 14, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail_04 = next(t for t in result['tage_detail'] if t['datum']=='2025-03-04')
+    assert detail_04['klass'] == 'Z73'
+    # Echte Inland-Anreise mit Hotel — counted_as_hotel_nacht=True
+    assert detail_04['classifier_result']['counted_as_hotel_nacht'] is True
+    assert result['hotel_naechte'] == 1
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

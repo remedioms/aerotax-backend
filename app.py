@@ -7232,6 +7232,17 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         # Classifier-Priorität: SE-Ort vor DP-layover_ort
         classifier_effective_ort = se_effective_ort or dp_layover_ort_v
 
+        # v8.13: Z73-Abend-Anreise (cluster_foreign + Briefing >=18) zählt NICHT
+        # als Hotelnacht — User boardet abends in DE, schläft im Flugzeug, nicht im
+        # Hotel. Die "echten" Hotelnächte beginnen erst mit dem Layover am Folgetag.
+        # Generalisierte Erkennung über reason-Substring "Abend-Briefing" (vom v8.10/v8.12-Code gesetzt).
+        is_evening_anreise_z73 = klass == 'Z73' and 'Abend-Briefing' in reason
+        counted_hotel = (
+            bool(d.get('overnight_after_day'))
+            and klass in ('Z73', 'Z74', 'Z76')
+            and not is_evening_anreise_z73
+        )
+
         classifier_result = {
             'klass': klass,
             'amount': round(eur_added, 2),
@@ -7240,7 +7251,8 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'bmf_tagtyp': bmf_tagtyp,
             'counted_as_workday': klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby') or (klass == 'ZeroDay' and dienstlich),
             'counted_as_fahrtag': bool(d.get('requires_commute')) and klass not in ('Frei', 'Issue', 'Standby'),
-            'counted_as_hotel_nacht': bool(d.get('overnight_after_day')) and klass in ('Z73', 'Z74', 'Z76'),
+            'counted_as_hotel_nacht': counted_hotel,
+            'is_vma_correction_only': is_evening_anreise_z73,
             # v8.9: effective_ort sichtbar machen — bei Bug sofort sehen welche Quelle Classifier nutzt
             'dp_layover_ort':           dp_layover_ort_v,
             'se_effective_ort':         se_effective_ort,
@@ -7308,16 +7320,35 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
           f"Issue={issue_tage}")
 
     # Fahrtage v8.3: ausschließlich dp.requires_commute (Sonnet oder Heuristik).
-    # Kein automatischer Heimkehr-Fahrtag mehr — der Heimkehrtag zählt nur wenn
-    # Sonnet/Heuristik explizit eine NEUE Anfahrt zur Homebase erkennt
-    # (= requires_commute=true, was nur bei Tour-Anreise/Same-Day/Office/Training
-    # gesetzt wird). Mehrtagestour = max 1 Fahrtag (Tourstart).
+    # Kein automatischer Heimkehr-Fahrtag mehr.
+    # v8.13: Mehrtages-Training-Sequenz (≥4 Tage activity=training mit
+    # requires_commute) zählt nur den ERSTEN Tag als Fahrtag — User fährt
+    # einmal hin, das mehrtägige Seminar ist eine Veranstaltung, nicht
+    # täglich Hin-und-Zurück. Sequenz-Set wird vorm Loop berechnet.
+    training_seq_skip = set()  # Indices die nicht als Fahrtag zählen
+    seq_start = None
+    for idx, m in enumerate(sorted_days):
+        d = m['dp']
+        if d.get('activity_type') == 'training' and d.get('requires_commute'):
+            if seq_start is None:
+                seq_start = idx
+        else:
+            if seq_start is not None and (idx - seq_start) >= 4:
+                # Skippe alle außer dem ersten Tag der Sequenz
+                for skip_i in range(seq_start + 1, idx):
+                    training_seq_skip.add(skip_i)
+            seq_start = None
+    if seq_start is not None and (len(sorted_days) - seq_start) >= 4:
+        for skip_i in range(seq_start + 1, len(sorted_days)):
+            training_seq_skip.add(skip_i)
+
     fahr_tage = 0
     fahr_skipped_heimkehr = 0
     fahr_skipped_layover = 0
     fahr_skipped_tourfortsetzung = 0
     fahr_skipped_unknown = 0
     fahr_skipped_standby = 0
+    fahr_skipped_training_seq = 0
     fahr_skipped_other = 0
     for i, m in enumerate(sorted_days):
         d = m['dp']
@@ -7334,6 +7365,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         if at == 'standby':
             fahr_skipped_standby += 1
             print(f"[v8-fahrtage-detail] datum={datum} counted=False reason='Standby zuhause'")
+            continue
+        # v8.13: Mehrtages-Training-Sequenz Folgetage skippen
+        if i in training_seq_skip:
+            fahr_skipped_training_seq += 1
+            print(f"[v8-fahrtage-detail] datum={datum} counted=False reason='Mehrtages-Training-Sequenz Folgetag (kein eigener Fahrtag)'")
             continue
 
         if d.get('requires_commute'):
@@ -7360,6 +7396,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     print(f"[v8-fahrtage-summary] counted={fahr_tage} skipped_heimkehr={fahr_skipped_heimkehr} "
           f"skipped_layover={fahr_skipped_layover} skipped_tourfortsetzung={fahr_skipped_tourfortsetzung} "
           f"skipped_unknown={fahr_skipped_unknown} skipped_standby={fahr_skipped_standby} "
+          f"skipped_training_seq={fahr_skipped_training_seq} "
           f"skipped_other={fahr_skipped_other}")
 
     # Hotel-Nächte v8.3: nur Tage mit overnight_after_day=true UND
@@ -7384,8 +7421,15 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         layover_ort = (d.get('layover_ort') or m['se'].get('stfrei_ort') or '').upper()
         homebase_upper = (homebase or 'FRA').upper()
         is_homebase = layover_ort in (homebase_upper, '')
-        if klass in HOTEL_KLASSEN and not is_homebase:
+        # v8.13: Z73-Abend-Anreise zählt NICHT als Hotelnacht (User schläft im Flugzeug,
+        # nicht im Hotel). Die "echte" Hotelnacht beginnt am Folgetag im Ausland.
+        cr_t = t.get('classifier_result') or {}
+        is_evening_anreise_z73 = klass == 'Z73' and 'Abend-Briefing' in (t.get('begruendung','') or '')
+        if klass in HOTEL_KLASSEN and not is_homebase and not is_evening_anreise_z73:
             hotel_naechte += 1
+        elif is_evening_anreise_z73:
+            hotel_skipped.append(f'{t["datum"]}:abend-anreise-z73')
+            print(f"[v8-hotel-skipped] datum={t['datum']} reason='Z73 Abend-Anreise (Tag in DE, Flug nachts) — keine Hotelnacht'")
         elif klass in HOTEL_KLASSEN and is_homebase:
             hotel_skipped.append(f'{t["datum"]}:homebase')
             ort_disp = layover_ort or 'leer'
