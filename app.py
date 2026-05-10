@@ -9103,9 +9103,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                         'reason': 'Unbekannte Kennung — bitte erklären',
                     })
 
-        # v8.21: office_training_time_missing_candidates — Office/Training-Tag der
-        # potenziell Z72 wäre, aber Reader hat keine Zeitinfo geliefert. Wird
-        # später im review_items-Flow dem Nutzer zur Klärung angeboten.
+        # v8.21/v8.24: office_training_time_missing_candidates — Office/Training-Tag
+        # der potenziell Z72 wäre, aber Reader hat keine Zeitinfo geliefert.
+        # v8.24: Mehrtagige training_seq-Tage werden NICHT als Einzel-Kandidaten
+        # rausgekippt — die Sequenz hat eigene Audit-Logik. Nur isolierte
+        # Office/Training-Tage außerhalb erkannter Sequenzen werden zu Items.
         if klass == 'Office' and at in ('office', 'training'):
             raw_duty_rev = d.get('duty_duration_minutes')
             duty_known_rev = isinstance(raw_duty_rev, (int, float)) and raw_duty_rev > 0
@@ -9115,12 +9117,14 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 and se.get('stfrei_inland') is False
                 and bool(se.get('stfrei_ort'))
             )
-            # Kandidat nur wenn: Tag ist Office an Homebase, kein Hotel, nicht
-            # in Auslands-Cluster, keine aktive Auslands-SE, und Zeitinfo fehlt.
+            # v8.24: Tag ist Teil einer Mehrtages-Schulungssequenz (training_seq_skip)?
+            # Wenn ja, NICHT einzeln fragen — nur Tag 1 der Sequenz wird zur Frage.
+            in_training_seq_followup = i in training_seq_skip
             if (not duty_known_rev
                 and not overnight and not prev_overnight
                 and not in_cluster_rev
-                and not has_active_foreign_se_rev):
+                and not has_active_foreign_se_rev
+                and not in_training_seq_followup):
                 office_training_time_missing_candidates.append({
                     'datum': datum,
                     'activity_type': at,
