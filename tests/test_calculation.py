@@ -393,10 +393,12 @@ def test_v7_match_dp_se_filters_storno():
 
 
 def test_v7_classify_same_day_z72():
-    """Same-Day → Z72 wenn alle Hard-Gate-Bedingungen erfüllt."""
+    """Same-Day mit Inland-Roundtrip → Z72 (via Routing-Override, duty=None).
+    v8.19.1: Routing nötig damit Z72 entstehen kann ohne duty-Info."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [{'datum': '2025-01-11', 'activity_type': 'same_day',
-                             'overnight_after_day': False, 'has_fl': False}]}
+                             'overnight_after_day': False, 'has_fl': False,
+                             'routing': ['FRA','HAM','FRA']}]}
     se = {'se_lines': []}
     matched = _match_dp_se_per_day(structured, se)
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
@@ -1229,8 +1231,9 @@ def test_v81_z72_duration_with_commute_above_8h():
         f"7h+70min Fahrzeit sollte Z72 sein, ist {detail[0]['klass'] if detail else 'fehlt'}"
 
 
-def test_v81_z72_no_duration_falls_back_to_z72():
-    """Same-Day ohne Zeitinfo → konservativ Z72 (alte Heuristik)."""
+def test_v81_z72_no_duration_no_routing_zeroday():
+    """v8.19.1: Same-Day ohne Zeitinfo UND ohne Inland-Routing → ZeroDay
+    (kein konservativer Z72-Fallback mehr — Z72 nur mit Indiz)."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': '2025-01-15', 'activity_type': 'same_day', 'overnight_after_day': False,
@@ -1238,7 +1241,9 @@ def test_v81_z72_no_duration_falls_back_to_z72():
     ]}
     matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA', commute_minutes=0)
-    assert result['z72_tage'] == 1
+    assert result['z72_tage'] == 0
+    # Tag ist als ZeroDay markiert
+    assert result['tage_detail'][0]['klass'] == 'ZeroDay'
 
 
 def test_v81_fahrtage_from_requires_commute():
@@ -3949,26 +3954,28 @@ def test_v8185_extra_hotelnaechte_audit_fields():
 
 # ── v8.19.0 Fix 1: Same-Day Inland Routing → Z72 ──
 
-def test_v8190_sameday_fra_ham_fra_z72_routing():
-    """v8.19.0 Fix 1: FRA-HAM-FRA Same-Day → Z72, auch wenn duty=180min (Briefing only)."""
+def test_v8190_sameday_fra_ham_fra_z72_routing_duty_unknown():
+    """v8.19.1: duty=None (Sonnet hat nicht gelesen) + FRA-HAM-FRA → Z72 via Routing.
+    Routing-Override darf nur greifen wenn duty MISSING ist, nicht wenn duty als
+    sicherer Wert gelesen wurde."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # duty_duration_minutes nicht im dict → Sonnet hat nicht gelesen
     structured = {'days': [
         {'datum': '2025-01-31', 'activity_type': 'same_day',
          'overnight_after_day': False, 'has_fl': False,
          'routing': ['FRA','HAM','FRA'],
-         'starts_at_homebase': True, 'requires_commute': True,
-         'start_time': '05:45', 'end_time': '08:45',
-         'duty_duration_minutes': 180},
+         'starts_at_homebase': True, 'requires_commute': True},
     ]}
     matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
     t = result['tage_detail'][0]
-    assert t['klass'] == 'Z72', f"Same-Day FRA-HAM-FRA muss Z72 sein, ist {t['klass']}"
+    assert t['klass'] == 'Z72', f"duty=None + Routing → Z72 erwartet, ist {t['klass']}"
     assert t['eur'] == 14.0
+    assert 'Routing' in (t['classifier_result'].get('reason') or '')
 
 
-def test_v8190_sameday_fra_muc_fra_z72_routing():
-    """FRA-MUC-FRA Same-Day → Z72."""
+def test_v8190_sameday_fra_muc_fra_z72_routing_duty_unknown():
+    """duty=None + FRA-MUC-FRA → Z72 via Routing-Override."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': '2025-03-15', 'activity_type': 'same_day',
@@ -4015,54 +4022,71 @@ def test_v8190_sameday_overnight_no_z72_hard_gate():
     assert result['tage_detail'][0]['klass'] == 'Issue'
 
 
-def test_v8190_sameday_real_under_8h_NOT_z72():
-    """v8.19.0: Wenn duty wirklich belastbar UND < 8h, soll Routing-Override
-    NICHT greifen — ZeroDay, kein Z72. Sicherheit gegen Aggressiv-Override."""
+def test_v8191_duty_600_ham_z72_via_duty():
+    """v8.19.1: duty=600 + FRA-HAM-FRA → Z72 via duty-Pfad (nicht Routing).
+    Reason muss Dienst-Minuten zeigen."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': '2025-04-15', 'activity_type': 'same_day',
          'overnight_after_day': False, 'has_fl': False,
-         'routing': ['FRA','HAM','FRA'],  # Inland-Roundtrip
+         'routing': ['FRA','HAM','FRA'],
          'starts_at_homebase': True, 'requires_commute': True,
-         'duty_duration_minutes': 600},  # 10h — klar belastbar, aber wir nehmen <8h-Test
+         'duty_duration_minutes': 600},
     ]}
     matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
-    # 600min ≥ 480 → Z72 via duty-Pfad (nicht via Routing-Override)
     t = result['tage_detail'][0]
     assert t['klass'] == 'Z72'
-    # Reason zeigt duty-Pfad, nicht Routing-Pfad
     assert 'Dienst 600min' in (t['classifier_result'].get('reason') or '')
 
 
-def test_v8190_sameday_belastbar_under_8h_zeroday():
-    """Wenn duty belastbar (z.B. Sonnet liest 450min sauber inkl. commute=0)
-    UND total < 480 UND KEIN Inland-Routing (z.B. routing fehlt) → ZeroDay."""
+def test_v8191_duty_240_ham_zeroday_no_routing_override():
+    """v8.19.1: duty=240 (zuverlässig gelesen, <8h) + FRA-HAM-FRA → ZeroDay.
+    Routing-Override darf NICHT greifen wenn duty als sicherer Wert vorliegt."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': '2025-06-15', 'activity_type': 'same_day',
          'overnight_after_day': False, 'has_fl': False,
+         'routing': ['FRA','HAM','FRA'],
          'starts_at_homebase': True, 'requires_commute': True,
-         'duty_duration_minutes': 240},  # 4h, klar unter 8h, kein routing
+         'duty_duration_minutes': 240},
     ]}
     matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
-    # Ohne routing UND duty<480 → ZeroDay
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'ZeroDay', f"duty=240 + Routing → ZeroDay, KEIN Routing-Override"
+
+
+def test_v8191_duty_0_explicit_ham_zeroday():
+    """v8.19.1: duty=0 als expliziter gelesener Wert → ZeroDay (kein auto-Z72).
+    Sonnet hat 0 gelesen — wir respektieren das, KEIN konservativer Z72-Fallback."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-15', 'activity_type': 'same_day',
+         'overnight_after_day': False, 'has_fl': False,
+         'routing': ['FRA','HAM','FRA'],
+         'starts_at_homebase': True, 'requires_commute': True,
+         'duty_duration_minutes': 0},  # explizit 0 (keine None)
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'ZeroDay', \
+        f"duty=0 explicit darf NICHT automatisch Z72 sein, ist {t['klass']}"
+
+
+def test_v8191_duty_unknown_no_routing_zeroday():
+    """v8.19.1: duty=None UND kein Inland-Routing → ZeroDay (kein Indiz)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-15', 'activity_type': 'same_day',
+         'overnight_after_day': False, 'has_fl': False,
+         'starts_at_homebase': True, 'requires_commute': True},
+        # kein routing, kein duty_duration_minutes
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
     assert result['tage_detail'][0]['klass'] == 'ZeroDay'
-
-
-def test_v8190_sameday_no_routing_falls_to_duty_check():
-    """Same-Day ohne routing nutzt weiterhin duty-Check (Backward-Compat)."""
-    from app import _deterministic_classify_v7, _match_dp_se_per_day
-    structured = {'days': [
-        {'datum': '2025-06-15', 'activity_type': 'same_day',
-         'overnight_after_day': False, 'has_fl': False,
-         'starts_at_homebase': True, 'requires_commute': True,
-         'duty_duration_minutes': 0},  # ohne routing, duty=0 → konservativ Z72
-    ]}
-    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
-    result = _deterministic_classify_v7(matched, 2025, 'FRA')
-    assert result['tage_detail'][0]['klass'] == 'Z72'
 
 
 # ── v8.19.0 Fix 2: bmf_land-Fallback ──
