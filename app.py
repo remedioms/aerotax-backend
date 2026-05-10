@@ -12161,7 +12161,7 @@ def _detect_classification_issues(cls, se_summary):
     return issues
 
 
-def hybrid_analyze(form, files):
+def hybrid_analyze(form, files, job_id=None):
     """Hauptanalyse: Sonnet (LSB+SE-Summen) + Opus (Tag-Klassifikation) SEQUENZIELL.
     Sequenziell statt parallel — schont Memory auf Render Free 512 MB.
     Nach jedem Call: gc.collect() + malloc_trim → maximaler Spike <500 MB.
@@ -12420,11 +12420,12 @@ def hybrid_analyze(form, files):
     }
 
 
-def _berechne_via_hybrid(form, files):
+def _berechne_via_hybrid(form, files, job_id=None):
     """Hauptpfad: nutzt hybrid_analyze (Sonnet+Opus parallel) und baut komplettes
-    Result-Dict. Liefert None wenn nicht möglich (dann fallback auf alter Code)."""
+    Result-Dict. Liefert None wenn nicht möglich (dann fallback auf alter Code).
+    job_id wird für Heartbeat-Tracking + chunked DP-Reader durchgereicht."""
     try:
-        hr = hybrid_analyze(form, files)
+        hr = hybrid_analyze(form, files, job_id=job_id)
     except Exception as e:
         print(f"[berechne-hybrid] hybrid_analyze crash: {e}")
         return None
@@ -13383,7 +13384,7 @@ def berechne(form, files, job_id=None):
     Bei Pipeline-Fehler: Exception mit nutzerfreundlicher Meldung.
     Kein automatischer Wiederholungs-Versuch — der User entscheidet.
     """
-    hybrid_result = _berechne_via_hybrid(form, files)
+    hybrid_result = _berechne_via_hybrid(form, files, job_id=job_id)
     if hybrid_result is not None:
         return hybrid_result
 

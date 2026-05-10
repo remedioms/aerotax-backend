@@ -10095,6 +10095,66 @@ def test_taskB_normalize_idempotent_after_resize():
     assert out1 == out2, 'Zweiter Normalize muss idempotent sein'
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Hotfix: job_id Threading durch _berechne_via_hybrid → hybrid_analyze
+# Live-Run zeigte NameError: 'job_id' is not defined in hybrid_analyze.
+# Heartbeat-Calls in hybrid_analyze brauchten job_id durchgereicht.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_hotfix_hybrid_analyze_accepts_job_id():
+    """hybrid_analyze nimmt job_id-Parameter (default=None)."""
+    src = _read_backend()
+    sig_idx = src.find('def hybrid_analyze(')
+    line_end = src.find(':', sig_idx)
+    sig = src[sig_idx:line_end]
+    assert 'job_id' in sig, 'hybrid_analyze muss job_id-Parameter haben'
+
+
+def test_hotfix_berechne_via_hybrid_accepts_job_id():
+    """_berechne_via_hybrid nimmt job_id-Parameter (default=None)."""
+    src = _read_backend()
+    sig_idx = src.find('def _berechne_via_hybrid(')
+    line_end = src.find(':', sig_idx)
+    sig = src[sig_idx:line_end]
+    assert 'job_id' in sig, '_berechne_via_hybrid muss job_id-Parameter haben'
+
+
+def test_hotfix_berechne_via_hybrid_passes_job_id_to_hybrid_analyze():
+    """_berechne_via_hybrid übergibt job_id an hybrid_analyze."""
+    src = _read_backend()
+    fn_idx = src.find('def _berechne_via_hybrid(')
+    block = src[fn_idx:fn_idx + 1000]
+    assert 'hybrid_analyze(form, files, job_id=job_id)' in block, \
+        'job_id muss an hybrid_analyze durchgereicht werden'
+
+
+def test_hotfix_berechne_passes_job_id_to_via_hybrid():
+    """berechne ruft _berechne_via_hybrid mit job_id=job_id."""
+    src = _read_backend()
+    fn_idx = src.find('def berechne(form, files, job_id=None)')
+    block = src[fn_idx:fn_idx + 1000]
+    assert '_berechne_via_hybrid(form, files, job_id=job_id)' in block, \
+        'berechne muss job_id an _berechne_via_hybrid durchreichen'
+
+
+def test_hotfix_all_heartbeat_calls_have_defined_job_id():
+    """Alle _heartbeat_phase(job_id, ...) Aufrufe stehen in Funktionen die job_id im Scope haben.
+    Multi-line Signaturen werden korrekt erkannt (bis schließendes ')')."""
+    import re as _re
+    src = _read_backend()
+    funcs = _re.split(r'^def ', src, flags=_re.MULTILINE)
+    for fn_block in funcs:
+        if '_heartbeat_phase(job_id' in fn_block:
+            # Multi-line Signatur: alles bis zum ersten ')' nach 'def'
+            paren_close = fn_block.find('):')
+            if paren_close < 0:
+                continue
+            sig_block = fn_block[:paren_close + 1]
+            assert 'job_id' in sig_block, \
+                f'Funktion mit _heartbeat_phase(job_id) muss job_id in Signatur haben: {sig_block[:200]}'
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
