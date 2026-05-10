@@ -1779,6 +1779,177 @@ def post_review_bulk_answer(job_id):
     })
 
 
+# ── v8.26: Konversations-Endpoints für gruppierten Review-Flow ──
+
+@app.route('/api/job/<job_id>/review-groups', methods=['GET'])
+def get_review_groups(job_id):
+    """v8.26: Liefert gruppierte review_items für Konversations-UX im Chat."""
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'job not found'}), 404
+        review_items = (j.get('data') or {}).get('_review_items') or []
+    groups = _build_review_groups(review_items)
+    return jsonify({'groups': groups, 'total_pending': sum(g['count'] for g in groups)})
+
+
+@app.route('/api/job/<job_id>/review-interpret', methods=['POST'])
+def post_review_interpret(job_id):
+    """v8.26: Interpretiert Freitext-Antwort und liefert proposed_changes — OHNE anzuwenden.
+
+    Body: {message: str}
+    Returns: {intent, proposed_changes, confirmation_required, summary_lines, summary_header,
+              confirmation_id, estimated_delta, clarification?}
+    """
+    body = request.get_json(silent=True) or {}
+    message = (body.get('message') or '').strip()
+    if not message:
+        return jsonify({'error': 'message erforderlich'}), 400
+
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'job not found'}), 404
+        review_items = (j.get('data') or {}).get('_review_items') or []
+        existing_overrides = dict(j.get('manual_day_overrides') or {})
+        cached = (j.get('data') or {}).get('_cached_recalc_state') or {}
+        initial_total = float((j.get('data') or {}).get('netto') or 0)
+
+    items_by_id = {it['id']: it for it in review_items}
+    groups = _build_review_groups(review_items)
+    interp = _interpret_review_text(message, groups, items_by_id)
+
+    estimated_delta = None
+    if interp['proposed_changes'] and cached.get('matched_days'):
+        try:
+            preview_overrides = dict(existing_overrides)
+            for ch in interp['proposed_changes']:
+                it = items_by_id.get(ch['review_item_id'])
+                if not it: continue
+                d = it.get('datum')
+                if not d: continue
+                if ch['answer'] == 'yes':
+                    preview_overrides[d] = {'over_8h': True, 'source': 'user_bulk_review_chatbot_text'}
+                elif ch['answer'] == 'no':
+                    preview_overrides[d] = {'over_8h': False, 'source': 'user_bulk_review_chatbot_text'}
+                else:
+                    preview_overrides[d] = {'unsure': True, 'source': 'user_bulk_review_chatbot_text'}
+            rec = _recompute_with_overrides(cached, preview_overrides)
+            if rec and rec.get('totals'):
+                new_total = float(rec['totals'].get('netto') or 0)
+                estimated_delta = round(new_total - initial_total, 2)
+        except Exception as _e:
+            print(f'[review-interpret] preview fail: {_e}')
+
+    # Confirmation-ID: deterministisch aus Inhalt + jobid
+    import hashlib
+    cid_src = job_id + '|' + message + '|' + str(sorted([(c['review_item_id'], c['answer']) for c in interp['proposed_changes']]))
+    confirmation_id = hashlib.sha256(cid_src.encode('utf-8')).hexdigest()[:16]
+
+    return jsonify({
+        'intent':                interp['intent'],
+        'proposed_changes':      interp['proposed_changes'],
+        'confirmation_required': interp['confirmation_required'],
+        'summary_lines':         interp.get('summary_lines') or [],
+        'summary_header':        interp.get('summary_header') or 'Ich habe verstanden:',
+        'clarification':         interp.get('clarification'),
+        'confirmation_id':       confirmation_id,
+        'estimated_delta':       estimated_delta,
+        'applied':               False,
+    })
+
+
+@app.route('/api/job/<job_id>/review-answer-bulk', methods=['POST'])
+def post_review_answer_bulk(job_id):
+    """v8.26: Wendet bestätigte Bulk-Antworten an. Verlangt confirmation_id.
+
+    Body: {confirmation_id, proposed_changes: [{review_item_id, answer}], source?}
+    """
+    body = request.get_json(silent=True) or {}
+    confirmation_id = (body.get('confirmation_id') or '').strip()
+    proposed = body.get('proposed_changes') or []
+    source = (body.get('source') or 'user_bulk_review_chatbot_text').strip()
+
+    if not confirmation_id:
+        return jsonify({'error': 'confirmation_id erforderlich — bitte über review-interpret bestätigen'}), 400
+    if not proposed or not isinstance(proposed, list):
+        return jsonify({'error': 'proposed_changes erforderlich'}), 400
+
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'job not found'}), 404
+        review_items = (j.get('data') or {}).get('_review_items') or []
+        items_by_id = {it['id']: it for it in review_items}
+        existing_overrides = dict(j.get('manual_day_overrides') or {})
+
+        # Confirmation-ID neu berechnen + abgleichen (Anti-Replay/Tampering)
+        import hashlib
+        # Wir können die ursprüngliche message hier nicht reproduzieren — vertrauen auf Client
+        # CID ist primär Marker dafür, dass User explizit bestätigt hat.
+
+        applied = []
+        for ch in proposed:
+            iid = ch.get('review_item_id')
+            ans = ch.get('answer')
+            if not iid or ans not in ('yes', 'no', 'unsure'): continue
+            it = items_by_id.get(iid)
+            if not it: continue
+            d = it.get('datum')
+            if not d: continue
+            if it.get('status') == 'answered': continue
+            if ans == 'yes':
+                existing_overrides[d] = {'over_8h': True, 'source': source}
+            elif ans == 'no':
+                existing_overrides[d] = {'over_8h': False, 'source': source}
+            else:
+                existing_overrides[d] = {'unsure': True, 'source': source}
+            applied.append({'datum': d, 'answer': ans, 'review_item_id': iid})
+            it['status'] = 'answered'
+            it['user_answer'] = existing_overrides[d]
+
+        j['manual_day_overrides'] = existing_overrides
+        if 'audit' in j and isinstance(j['audit'], list):
+            j['audit'].append({
+                'event': 'review_answer_bulk',
+                'data': {'confirmation_id': confirmation_id, 'applied_count': len(applied),
+                         'source': source, 'applied': applied},
+                'timestamp': datetime.now().isoformat(),
+            })
+
+        # Recompute
+        cached = (j.get('data') or {}).get('_cached_recalc_state') or {}
+        updated_preview_total = None
+        total_delta = None
+        recalc_breakdown = None
+        if cached.get('matched_days'):
+            try:
+                rec = _recompute_with_overrides(cached, existing_overrides)
+                if rec and rec.get('totals'):
+                    updated_preview_total = rec['totals'].get('netto')
+                    initial_total = float((j.get('data') or {}).get('netto') or 0)
+                    if isinstance(updated_preview_total, (int, float)):
+                        total_delta = round(float(updated_preview_total) - initial_total, 2)
+                    recalc_breakdown = rec['totals']
+                    j.setdefault('data', {})['_preview_totals'] = recalc_breakdown
+            except Exception as _e:
+                print(f'[review-bulk-text] recalc fail: {_e}')
+
+        try:
+            _save_job_to_disk(job_id)
+        except Exception as _e:
+            print(f'[review-bulk-text] save warning: {_e}')
+
+    return jsonify({
+        'applied_count':         len(applied),
+        'applied':               applied,
+        'updated_preview_total': updated_preview_total,
+        'total_delta':           total_delta,
+        'preview_breakdown':     recalc_breakdown,
+        'source':                source,
+    })
+
+
 @app.route('/api/job/<job_id>/marker-answer', methods=['POST'])
 def post_marker_answer(job_id):
     """v8.22 Rest-5: Nutzer erklärt eine unbekannte Kennung.
@@ -10598,6 +10769,343 @@ def _build_review_items(cls, manual_day_overrides=None):
         x['datum'],
     ))
     return items
+
+
+# ── v8.26: Review-Gruppierung — zusammenhängende Tage clustern ──
+
+_MARKER_FAMILY = {
+    'D4':  'training',     # Schulung
+    'EK':  'office',       # Bürodienst
+    'SM':  'seminar',      # Seminar
+    'EH':  'emergency',    # Erste-Hilfe
+    'EM':  'emergency',    # Emergency Training
+    'SIM': 'simulator',
+}
+
+_FAMILY_LABEL = {
+    'training':  'Schulung',
+    'office':    'Bürodienst',
+    'seminar':   'Seminarblock',
+    'emergency': 'Erste-Hilfe / Emergency',
+    'simulator': 'Simulator',
+    'mixed':     'Bürodienst/Schulung',
+    'other':     'Schulung/Office',
+}
+
+
+def _marker_family(marker):
+    if not marker: return 'other'
+    m = str(marker).strip().upper()
+    # Erste 2-3 Zeichen nehmen für Family-Match
+    for key, fam in _MARKER_FAMILY.items():
+        if m.startswith(key):
+            return fam
+    return 'other'
+
+
+def _build_review_groups(review_items):
+    """v8.26: Clustert review_items zu sinnvollen Gruppen für Konversation.
+
+    Regeln:
+    - office_training_time_missing-Items werden gruppiert (unknown_marker einzeln)
+    - Aufeinanderfolgende Tage (≤2 Tage Abstand) mit derselben Family → Gruppe
+    - Verschiedene Family in dichtem Block (z.B. D4+EK) → mixed-Gruppe
+    - Übrigbleibende Einzeltage → "single_days"-Gruppe
+    """
+    from datetime import datetime as _dt, timedelta as _td
+
+    pending = [it for it in (review_items or [])
+               if it.get('status') == 'pending'
+               and it.get('type') == 'office_training_time_missing']
+    pending = sorted(pending, key=lambda x: x.get('datum', ''))
+
+    # Datum-Parser (defensiv)
+    def _parse(d):
+        try: return _dt.strptime(d, '%Y-%m-%d').date()
+        except Exception: return None
+
+    # Cluster: greedy linke nach rechts, ≤2 Tage Abstand + Family-kompatibel
+    groups = []
+    current = None
+    for it in pending:
+        dt = _parse(it.get('datum'))
+        fam = _marker_family(it.get('marker'))
+        if current is None:
+            current = {'items': [it], 'fam_set': {fam}, 'last_date': dt}
+            continue
+        gap = (dt - current['last_date']).days if (dt and current['last_date']) else 99
+        # Family-kompatibel: gleich, oder beide ∈ {training, office} (mixed)
+        fams = current['fam_set'] | {fam}
+        compatible = (
+            fam in current['fam_set'] or
+            fams.issubset({'training', 'office'})  # D4+EK kann zu "Bürodienst/Schulung" gemixt werden
+        )
+        if dt and gap <= 2 and compatible:
+            current['items'].append(it)
+            current['fam_set'].add(fam)
+            current['last_date'] = dt
+        else:
+            groups.append(current)
+            current = {'items': [it], 'fam_set': {fam}, 'last_date': dt}
+    if current is not None:
+        groups.append(current)
+
+    # Singles (Gruppen mit nur 1 Item) zusammenfassen
+    multi_groups = [g for g in groups if len(g['items']) >= 2]
+    singletons   = [g['items'][0] for g in groups if len(g['items']) == 1]
+
+    out = []
+    for idx, g in enumerate(multi_groups):
+        items = g['items']
+        first_d = items[0]['datum']
+        last_d  = items[-1]['datum']
+        fam_set = g['fam_set']
+        if len(fam_set) == 1:
+            fam = next(iter(fam_set))
+            label = _FAMILY_LABEL.get(fam, _FAMILY_LABEL['other'])
+            group_type = fam + '_block' if fam in ('training','seminar','emergency','office') else 'block'
+        else:
+            label = _FAMILY_LABEL['mixed']
+            group_type = 'mixed_block'
+        marker_summary = ', '.join(sorted({(it.get('marker') or '').strip() for it in items if it.get('marker')}))
+        out.append({
+            'group_id':       f'g{idx+1}',
+            'label':          label,
+            'date_range':     _format_date_range(first_d, last_d),
+            'date_range_iso': [first_d, last_d],
+            'marker_summary': marker_summary,
+            'item_ids':       [it['id'] for it in items],
+            'datums':         [it['datum'] for it in items],
+            'count':          len(items),
+            'group_type':     group_type,
+            'suggested_question': (
+                f'Für den Zeitraum {_format_date_range(first_d, last_d)} habe ich '
+                f'{label}-Tage ohne Uhrzeit gefunden. Waren diese Tage jeweils '
+                f'inklusive Hin- und Rückweg länger als 8 Stunden?'
+            ),
+        })
+    if singletons:
+        out.append({
+            'group_id':   f'g{len(multi_groups)+1}',
+            'label':      'Einzeltage',
+            'date_range': _format_singletons_range(singletons),
+            'date_range_iso': [singletons[0]['datum'], singletons[-1]['datum']],
+            'marker_summary': ', '.join(sorted({(it.get('marker') or '').strip() for it in singletons if it.get('marker')})),
+            'item_ids':   [it['id'] for it in singletons],
+            'datums':     [it['datum'] for it in singletons],
+            'count':      len(singletons),
+            'group_type': 'single_days',
+            'suggested_question': (
+                f'Es gibt noch {len(singletons)} Einzeltage. Möchtest du sie zusammen '
+                f'als „alle über 8h" bestätigen oder einzeln durchgehen?'
+            ),
+        })
+    return out
+
+
+def _format_date_range(first_iso, last_iso):
+    """'2025-04-07' + '2025-04-11' → '07.–11.04.'."""
+    try:
+        a = first_iso.split('-')
+        b = last_iso.split('-')
+        if a == b: return f'{a[2]}.{a[1]}.'
+        if a[1] == b[1] and a[0] == b[0]:
+            return f'{a[2]}.–{b[2]}.{a[1]}.'
+        return f'{a[2]}.{a[1]}.–{b[2]}.{b[1]}.'
+    except Exception:
+        return f'{first_iso} – {last_iso}'
+
+
+def _format_singletons_range(items):
+    if not items: return ''
+    try:
+        days = [it['datum'].split('-')[2]+'.'+it['datum'].split('-')[1]+'.' for it in items[:3]]
+        suffix = '' if len(items) <= 3 else f' u.a.'
+        return ', '.join(days) + suffix
+    except Exception:
+        return ''
+
+
+# ── v8.26: Natural-Language-Parser für Review-Antworten ──
+
+def _interpret_review_text(message, groups, items_by_id):
+    """Interpretiert Freitext-Antworten in proposed_changes ohne sie anzuwenden.
+
+    Returns:
+        {
+          'intent': 'bulk_all'|'group_answer'|'date_specific'|'mixed'|'clarify'|'out_of_scope',
+          'proposed_changes': [{'review_item_id': str, 'answer': 'yes'|'no'|'unsure'}],
+          'confirmation_required': True,
+          'summary_lines': [str],
+          'clarification': str|None,
+        }
+    """
+    import re as _re
+    msg = (message or '').strip().lower()
+    if not msg:
+        return {'intent':'clarify', 'proposed_changes':[], 'confirmation_required':True,
+                'summary_lines':[], 'clarification':'Bitte schreib mir kurz, wie du antworten möchtest.'}
+
+    all_pending_ids = []
+    for g in groups:
+        for iid in g.get('item_ids', []):
+            it = items_by_id.get(iid)
+            if it and it.get('status') == 'pending':
+                all_pending_ids.append(iid)
+
+    # ── Bulk: "alle ja" / "alle über 8h" / "alle nein" / "weiß nicht"
+    bulk_yes = bool(_re.search(r'\balle\b[^.,]*(ja|über\s*8|>\s*8|länger|mehr\s*als\s*8)', msg))
+    bulk_no  = bool(_re.search(r'\balle\b[^.,]*(nein|unter\s*8|<\s*8|kürzer|weniger\s*als\s*8)', msg))
+    bulk_unsure = bool(_re.search(r'\b(weiß|weiss).*nicht\b|\bunsicher\b|\bkeine\s*ahnung\b', msg))
+    if bulk_yes and not bulk_no:
+        changes = [{'review_item_id': iid, 'answer': 'yes'} for iid in all_pending_ids]
+        return _build_proposed('bulk_all', changes, items_by_id, summary='Alle als über 8h bestätigen')
+    if bulk_no and not bulk_yes:
+        changes = [{'review_item_id': iid, 'answer': 'no'} for iid in all_pending_ids]
+        return _build_proposed('bulk_all', changes, items_by_id, summary='Alle als unter 8h markieren')
+    if bulk_unsure and not bulk_yes and not bulk_no:
+        changes = [{'review_item_id': iid, 'answer': 'unsure'} for iid in all_pending_ids]
+        return _build_proposed('bulk_all', changes, items_by_id, summary='Alle als unsicher markieren')
+
+    # ── Datum-spezifisch: "08.04 nein, 09-11 ja" / "07.04 ja, 08.04 nein, 09-11 ja"
+    changes = []
+    summary_lines = []
+    matched_any = False
+    # Pattern: Datum oder Datumsbereich + ja/nein
+    # 08.04, 8.4., 24.-29.04, 24-29.04, 09–11.04
+    date_pat = r'(\d{1,2})\s*(?:[\.\-–]\s*(\d{1,2}))?\s*\.?\s*(?:(\d{1,2})\.?)?'
+    seg_pat  = _re.compile(
+        r'(?P<d1>\d{1,2})\s*\.\s*(?P<m1>\d{1,2})?\.?'                            # 08.04 / 08.
+        r'(?:\s*[\-–]\s*(?P<d2>\d{1,2})\s*(?:\.\s*(?P<m2>\d{1,2})?\.?)?)?'      # –11.04 optional
+        r'\s*(?P<ans>ja|nein|über\s*8|unter\s*8|>\s*8|<\s*8|unsicher|weiß\s*nicht)',
+        _re.IGNORECASE
+    )
+    for m in seg_pat.finditer(msg):
+        d1 = int(m.group('d1'))
+        d2 = int(m.group('d2')) if m.group('d2') else d1
+        mo1 = int(m.group('m1')) if m.group('m1') else None
+        mo2 = int(m.group('m2')) if m.group('m2') else mo1
+        ans_raw = m.group('ans').lower()
+        if 'unsicher' in ans_raw or 'weiß' in ans_raw or 'weiss' in ans_raw:
+            ans = 'unsure'
+        elif 'nein' in ans_raw or 'unter' in ans_raw or '<' in ans_raw:
+            ans = 'no'
+        else:
+            ans = 'yes'
+        # Datums in Range matchen mit pending Items
+        for iid in all_pending_ids:
+            it = items_by_id.get(iid)
+            if not it: continue
+            try:
+                _, mm, dd = (it.get('datum') or '').split('-')
+                mm, dd = int(mm), int(dd)
+            except Exception:
+                continue
+            if mo1 and mm != mo1: continue
+            if dd < d1 or dd > d2: continue
+            if any(c['review_item_id']==iid for c in changes): continue
+            changes.append({'review_item_id': iid, 'answer': ans})
+            matched_any = True
+
+    # ── "Rest ja" / "andere ja" / "übrige ja"
+    rest_match = _re.search(r'(?:rest|andere|übrige|sonst|sonstigen)\s*(ja|nein|unsicher|über\s*8|unter\s*8)', msg)
+    if rest_match:
+        ans_raw = rest_match.group(1).lower()
+        ans = 'yes' if ('ja' in ans_raw or 'über' in ans_raw) else ('no' if ('nein' in ans_raw or 'unter' in ans_raw) else 'unsure')
+        already = {c['review_item_id'] for c in changes}
+        for iid in all_pending_ids:
+            if iid in already: continue
+            changes.append({'review_item_id': iid, 'answer': ans})
+        matched_any = True
+
+    # ── Group-Label-spezifisch: "April ja", "September nein", "Seminar ja"
+    month_map = {'januar':1,'februar':2,'märz':3,'maerz':3,'april':4,'mai':5,'juni':6,'juli':7,
+                 'august':8,'september':9,'oktober':10,'november':11,'dezember':12}
+    fam_keywords = {
+        'training': ['schulung','training','d4'],
+        'office':   ['bürodienst','buerodienst','büro','buero','office','ek'],
+        'seminar':  ['seminar','sm'],
+        'emergency':['emergency','erste hilfe','erste-hilfe','eh','em'],
+    }
+    label_segs = _re.findall(
+        r'(januar|februar|m[aä]rz|april|mai|juni|juli|august|september|oktober|november|dezember|'
+        r'schulung|training|d4|bürodienst|buerodienst|büro|buero|office|ek|seminar|sm|'
+        r'emergency|erste\s*hilfe|erste-hilfe|eh|em)\s*(?:waren|war|wurde|sind|ist)?\s*'
+        r'(ja|nein|unsicher|weiß\s*nicht|über\s*8|unter\s*8)',
+        msg
+    )
+    for kw, ans_raw in label_segs:
+        kw = kw.lower().strip()
+        if 'unsicher' in ans_raw or 'weiß' in ans_raw or 'weiss' in ans_raw:
+            ans = 'unsure'
+        elif 'nein' in ans_raw or 'unter' in ans_raw:
+            ans = 'no'
+        else:
+            ans = 'yes'
+        # Monat?
+        target_month = month_map.get(kw)
+        target_fam = None
+        if not target_month:
+            for fam, kws in fam_keywords.items():
+                if any(k in kw for k in kws):
+                    target_fam = fam
+                    break
+        already = {c['review_item_id'] for c in changes}
+        for iid in all_pending_ids:
+            if iid in already: continue
+            it = items_by_id.get(iid)
+            if not it: continue
+            try:
+                _, mm, _ = (it.get('datum') or '').split('-')
+                mm = int(mm)
+            except Exception: continue
+            fam = _marker_family(it.get('marker'))
+            if target_month and mm != target_month: continue
+            if target_fam and fam != target_fam: continue
+            changes.append({'review_item_id': iid, 'answer': ans})
+            matched_any = True
+
+    if matched_any and changes:
+        return _build_proposed('mixed' if len(label_segs)+len(seg_pat.findall(msg)) > 1 else 'group_answer',
+                               changes, items_by_id)
+
+    # Nichts erkannt
+    return {
+        'intent': 'clarify',
+        'proposed_changes': [],
+        'confirmation_required': True,
+        'summary_lines': [],
+        'clarification': (
+            'Ich bin mir nicht sicher, was du meinst. Du kannst z.B. schreiben:\n'
+            '• "alle über 8h"\n'
+            '• "April ja, September nein"\n'
+            '• "07.04 ja, 08.04 nein, 09–11 ja"\n'
+            '• "weiß ich nicht"'
+        ),
+    }
+
+
+def _build_proposed(intent, changes, items_by_id, summary=None):
+    """Helper: baut proposed-changes-Response mit Summary-Lines."""
+    lines = []
+    # Gruppieren der Changes nach Datum für saubere Summary
+    yes_dates = sorted([items_by_id[c['review_item_id']]['datum']
+                        for c in changes if c['answer']=='yes' and c['review_item_id'] in items_by_id])
+    no_dates  = sorted([items_by_id[c['review_item_id']]['datum']
+                        for c in changes if c['answer']=='no' and c['review_item_id'] in items_by_id])
+    uns_dates = sorted([items_by_id[c['review_item_id']]['datum']
+                        for c in changes if c['answer']=='unsure' and c['review_item_id'] in items_by_id])
+    if yes_dates: lines.append(f'• {len(yes_dates)} Tag(e) als ÜBER 8h: ' + ', '.join(yes_dates[:6]) + ('…' if len(yes_dates)>6 else ''))
+    if no_dates:  lines.append(f'• {len(no_dates)} Tag(e) als UNTER 8h: ' + ', '.join(no_dates[:6]) + ('…' if len(no_dates)>6 else ''))
+    if uns_dates: lines.append(f'• {len(uns_dates)} Tag(e) als UNSICHER: ' + ', '.join(uns_dates[:6]) + ('…' if len(uns_dates)>6 else ''))
+    return {
+        'intent': intent,
+        'proposed_changes': changes,
+        'confirmation_required': True,
+        'summary_lines': lines,
+        'summary_header': summary or 'Ich habe verstanden:',
+        'clarification': None,
+    }
 
 
 def berechne(form, files):

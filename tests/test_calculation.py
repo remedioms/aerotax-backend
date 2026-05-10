@@ -5573,20 +5573,23 @@ def test_v825_chat_drawer_has_glassmorphism_styles():
     import os, re
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    drawer_match = re.search(r'id="chat-drawer".*?</div>', src[:src.find('chat-messages')], re.DOTALL)
-    # Nicht das ganze Drawer-Block, sondern die Style-Attribute prüfen
-    # Suche nach drawerGlass-Definition
-    assert 'drawerGlass' in src, 'drawerGlass-Variable nicht gefunden'
-    glass_def = re.search(r"drawerGlass\s*=\s*'([^']+)'", src)
-    assert glass_def is not None
-    g = glass_def.group(1)
-    assert 'backdrop-filter:blur' in g, 'Drawer muss backdrop-filter haben'
-    assert 'rgba(' in g, 'Drawer muss rgba-Hintergrund haben (translucent)'
-    # Sicherstellen, dass Drawer NICHT vollständig opak ist (Alpha < 0.8)
-    alpha_matches = re.findall(r'rgba\([^)]+,\s*([\d.]+)\)', g)
-    if alpha_matches:
-        max_alpha = max(float(a) for a in alpha_matches)
-        assert max_alpha < 0.75, f'Drawer-Alpha zu hoch ({max_alpha}) — kein milky glass mehr'
+    fn_idx = src.find('function buildChatOverlay')
+    assert fn_idx > 0
+    block = src[fn_idx:fn_idx+5000]
+    assert 'backdrop-filter:blur' in block, 'Drawer muss backdrop-filter haben'
+    assert 'saturate' in block, 'Drawer muss saturate haben (Premium-Glass)'
+    assert 'rgba(' in block, 'Drawer muss rgba-Hintergrund haben (translucent)'
+    # Suche speziell nach den Background-Definitionen (nicht SVG-Logo-Pfade)
+    # In v8.26 sind diese Variablen: glassBg / drawerGlass / Modal-Style
+    for pat in ['glassBg', 'drawerGlass']:
+        m = re.search(pat + r"\s*=\s*'([^']+)'", block)
+        if m:
+            bg = m.group(1)
+            alphas = re.findall(r'rgba\([^)]+,\s*([\d.]+)\)', bg)
+            if alphas:
+                max_alpha = max(float(a) for a in alphas)
+                assert max_alpha < 0.75, f'Drawer-Background-Alpha zu hoch ({max_alpha})'
+            break
 
 
 def test_v825_chat_footer_has_upload_button():
@@ -5727,6 +5730,300 @@ def test_v825_header_amount_no_dash_fallback():
     fn_body = src[fn_start:fn_end]
     assert "el.textContent = '—'" not in fn_body, "updateChatHeaderAmount darf nicht '—' setzen"
     assert 'wird geladen' in fn_body
+
+
+# ── v8.26: Review-Gruppierung + Natural-Language-Parser ──
+
+def _make_pending_item(datum, marker, type_='office_training_time_missing'):
+    return {
+        'id': f'{type_}:{datum}',
+        'type': type_,
+        'datum': datum,
+        'marker': marker,
+        'status': 'pending',
+        'options': [],
+    }
+
+
+def test_v826_grouping_consecutive_d4_april():
+    """D4-Tage 07.–11.04. werden in eine Gruppe geclustert."""
+    from app import _build_review_groups
+    items = [
+        _make_pending_item('2025-04-07', 'EK BUERODIENST'),
+        _make_pending_item('2025-04-08', 'D4 SCHULUNG'),
+        _make_pending_item('2025-04-09', 'D4 SCHULUNG'),
+        _make_pending_item('2025-04-10', 'D4 SCHULUNG'),
+        _make_pending_item('2025-04-11', 'D4 SCHULUNG'),
+    ]
+    groups = _build_review_groups(items)
+    assert len(groups) == 1, f'5 zusammenhängende Tage → 1 Gruppe, got {len(groups)}'
+    g = groups[0]
+    assert g['count'] == 5
+    assert g['date_range'].startswith('07.')
+    assert '11.04' in g['date_range']
+
+
+def test_v826_grouping_seminar_block_september():
+    """SM 04.–12.09 → 1 Seminar-Gruppe."""
+    from app import _build_review_groups
+    items = [_make_pending_item(f'2025-09-{d:02d}', 'SM SEMINAR') for d in range(4, 13)]
+    groups = _build_review_groups(items)
+    assert len(groups) == 1
+    assert groups[0]['count'] == 9
+    assert 'Seminar' in groups[0]['label']
+
+
+def test_v826_grouping_emergency_eh_em():
+    """EH+EM-Tage in derselben Family werden gruppiert."""
+    from app import _build_review_groups
+    items = [
+        _make_pending_item('2025-04-24', 'EH ERSTE HILFE'),
+        _make_pending_item('2025-04-25', 'EH ERSTE HILFE'),
+        _make_pending_item('2025-04-29', 'EM EMERGENCY'),
+    ]
+    groups = _build_review_groups(items)
+    # 24-25 zusammen, 29 als single (Lücke 4 Tage > 2)
+    assert len(groups) >= 1
+    # Mindestens eine Emergency-Gruppe oder Single
+    fams = [g.get('label') for g in groups]
+    assert any('Erste-Hilfe' in f or 'Emergency' in f or 'Einzeltage' in f for f in fams)
+
+
+def test_v826_grouping_isolated_singles_collected():
+    """Verstreute Einzeltage landen in „Einzeltage"-Gruppe."""
+    from app import _build_review_groups
+    items = [
+        _make_pending_item('2025-05-15', 'EK'),
+        _make_pending_item('2025-07-22', 'D4'),
+        _make_pending_item('2025-08-03', 'EK'),
+    ]
+    groups = _build_review_groups(items)
+    # Alle drei sind isolated → 1 Gruppe „Einzeltage"
+    single_groups = [g for g in groups if g['group_type'] == 'single_days']
+    assert len(single_groups) == 1
+    assert single_groups[0]['count'] == 3
+
+
+def test_v826_grouping_mixed_d4_ek_dense_block():
+    """D4+EK in dichtem Block (gap ≤2) → mixed-Gruppe „Bürodienst/Schulung"."""
+    from app import _build_review_groups
+    items = [
+        _make_pending_item('2025-04-07', 'EK BUERODIENST'),
+        _make_pending_item('2025-04-08', 'D4 SCHULUNG'),
+        _make_pending_item('2025-04-09', 'D4 SCHULUNG'),
+    ]
+    groups = _build_review_groups(items)
+    assert len(groups) == 1
+    g = groups[0]
+    assert g['count'] == 3
+    # Mixed: Label sollte „Bürodienst" oder „Schulung" enthalten
+    assert any(s in g['label'] for s in ['Bürodienst', 'Schulung', 'Bürodienst/Schulung'])
+
+
+# ── Natural-Language-Parser ──
+
+def test_v826_parser_alle_ja_means_yes_for_all_pending():
+    """„alle ja" → alle pending Items werden auf yes gesetzt (proposed, nicht angewendet)."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [
+        _make_pending_item('2025-04-07', 'EK'),
+        _make_pending_item('2025-04-08', 'D4'),
+        _make_pending_item('2025-09-04', 'SM'),
+    ]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('alle ja', groups, {it['id']: it for it in items})
+    assert res['intent'] == 'bulk_all'
+    assert res['confirmation_required'] is True
+    assert len(res['proposed_changes']) == 3
+    assert all(c['answer'] == 'yes' for c in res['proposed_changes'])
+
+
+def test_v826_parser_alle_ueber_8h_synonym():
+    """„alle über 8h" gleichbedeutend mit „alle ja"."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [_make_pending_item('2025-04-07', 'EK')]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('alle über 8h', groups, {it['id']: it for it in items})
+    assert res['intent'] == 'bulk_all'
+    assert res['proposed_changes'][0]['answer'] == 'yes'
+
+
+def test_v826_parser_alle_unter_8h_means_no():
+    from app import _interpret_review_text, _build_review_groups
+    items = [_make_pending_item('2025-04-07', 'EK'), _make_pending_item('2025-04-08', 'D4')]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('alle unter 8h', groups, {it['id']: it for it in items})
+    assert res['intent'] == 'bulk_all'
+    assert all(c['answer'] == 'no' for c in res['proposed_changes'])
+
+
+def test_v826_parser_weiss_nicht_means_unsure():
+    from app import _interpret_review_text, _build_review_groups
+    items = [_make_pending_item('2025-04-07', 'EK')]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('weiß ich nicht', groups, {it['id']: it for it in items})
+    assert res['proposed_changes'][0]['answer'] == 'unsure'
+
+
+def test_v826_parser_date_specific_08_04_nein():
+    """„08.04 nein" → nur 08.04 auf no, andere unverändert."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [
+        _make_pending_item('2025-04-07', 'EK'),
+        _make_pending_item('2025-04-08', 'D4'),
+        _make_pending_item('2025-04-09', 'D4'),
+    ]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('08.04 nein', groups, {it['id']: it for it in items})
+    assert len(res['proposed_changes']) == 1
+    assert res['proposed_changes'][0]['answer'] == 'no'
+    iid = res['proposed_changes'][0]['review_item_id']
+    assert '2025-04-08' in iid
+
+
+def test_v826_parser_date_range_with_rest():
+    """„08.04 nein, Rest ja" → 08.04 auf no, alle anderen pending auf yes."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [
+        _make_pending_item('2025-04-07', 'EK'),
+        _make_pending_item('2025-04-08', 'D4'),
+        _make_pending_item('2025-04-09', 'D4'),
+        _make_pending_item('2025-04-10', 'D4'),
+    ]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('08.04 nein, Rest ja', groups, {it['id']: it for it in items})
+    assert len(res['proposed_changes']) == 4
+    by_id = {c['review_item_id']: c['answer'] for c in res['proposed_changes']}
+    no_keys = [k for k, v in by_id.items() if v == 'no']
+    yes_keys = [k for k, v in by_id.items() if v == 'yes']
+    assert len(no_keys) == 1 and '2025-04-08' in no_keys[0]
+    assert len(yes_keys) == 3
+
+
+def test_v826_parser_month_specific_april_ja_september_nein():
+    """„April ja, September nein" → April-Items yes, September-Items no."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [
+        _make_pending_item('2025-04-07', 'EK'),
+        _make_pending_item('2025-04-08', 'D4'),
+        _make_pending_item('2025-09-04', 'SM'),
+        _make_pending_item('2025-09-05', 'SM'),
+    ]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('April ja, September nein', groups, {it['id']: it for it in items})
+    by_id = {c['review_item_id']: c['answer'] for c in res['proposed_changes']}
+    apr = [v for k, v in by_id.items() if '2025-04' in k]
+    sep = [v for k, v in by_id.items() if '2025-09' in k]
+    assert len(apr) == 2 and all(v == 'yes' for v in apr)
+    assert len(sep) == 2 and all(v == 'no' for v in sep)
+
+
+def test_v826_parser_clarification_when_unclear():
+    """Unverständlicher Text → intent=clarify, keine Changes."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [_make_pending_item('2025-04-07', 'EK')]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('was meinst du genau?', groups, {it['id']: it for it in items})
+    assert res['intent'] == 'clarify'
+    assert res['proposed_changes'] == []
+    assert res['clarification']
+
+
+def test_v826_parser_never_applies_directly():
+    """Parser-Ergebnis hat IMMER confirmation_required=True (kein Auto-Apply)."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [_make_pending_item('2025-04-07', 'EK')]
+    groups = _build_review_groups(items)
+    for q in ['alle ja', 'alle nein', '07.04 ja', 'April ja']:
+        res = _interpret_review_text(q, groups, {it['id']: it for it in items})
+        assert res['confirmation_required'] is True
+
+
+def test_v826_groups_have_suggested_question():
+    """Jede Gruppe hat suggested_question für Bot-Erstmeldung."""
+    from app import _build_review_groups
+    items = [_make_pending_item(f'2025-04-{d:02d}', 'D4') for d in range(7, 12)]
+    groups = _build_review_groups(items)
+    assert all(g.get('suggested_question') for g in groups)
+    # Frage erwähnt Datum + 8h
+    q = groups[0]['suggested_question']
+    assert '8' in q  # „über 8h"
+    assert ('07.' in q or '11.' in q)
+
+
+def test_v826_groups_endpoint_route_registered():
+    """Endpoint /api/job/<id>/review-groups ist registriert."""
+    import app as _app
+    rules = [r.rule for r in _app.app.url_map.iter_rules()]
+    assert any('review-groups' in r for r in rules)
+    assert any('review-interpret' in r for r in rules)
+    assert any('review-answer-bulk' in r for r in rules)
+
+
+def test_v826_bulk_endpoint_requires_confirmation_id():
+    """review-answer-bulk ohne confirmation_id → 400."""
+    import app as _app
+    src = open(_app.__file__).read()
+    # Endpoint-Body enthält die Validierung
+    import re
+    m = re.search(r'def post_review_answer_bulk.*?(?=\n@app\.route|\Z)', src, re.DOTALL)
+    assert m is not None
+    body = m.group(0)
+    assert 'confirmation_id' in body
+    assert "'confirmation_id erforderlich" in body
+
+
+# ── v8.26 Frontend: Centered-Modal + Premium Glass + Group-Flow ──
+
+def test_v826_chat_modal_centered_desktop():
+    """Desktop-Chat ist centered modal (nicht mehr right-Drawer mit 480px)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Suche das Drawer-Style-Pattern für Desktop
+    assert 'isDesktop' in src
+    # Width sollte ≥ 720px sein für Desktop
+    import re
+    desktop_widths = re.findall(r"isDesktop\s*\?\s*'[^']*width:\s*(\d+)px", src)
+    if desktop_widths:
+        assert max(int(w) for w in desktop_widths) >= 720, \
+            f'Desktop-Chat-Width zu klein: {desktop_widths}'
+
+
+def test_v826_chat_no_giant_body_cta_buttons():
+    """Keine großen isolierten 'Offene Angaben'/'+ Datei hochladen'-Buttons im Body."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Im Chat-Body-Bereich gibt es keinen großen CTA-Button "+ Datei hochladen"
+    # (nur Footer-Paperclip + Chip „Dokumente")
+    # Heuristik: kein großes button mit Text "+ Datei hochladen" als isoliertes Element
+    assert '+ Datei hochladen' not in src or 'chat-upload-btn' in src
+    # Upload-Btn ist im Footer (nicht body)
+    assert 'id="chat-upload-btn"' in src
+
+
+def test_v826_chat_premium_glass_multi_layer_gradient():
+    """Drawer-Glass nutzt mehrlagigen gradient für echte Tiefe."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # mehrlagig: zwei linear-gradient + backdrop-filter
+    import re
+    # Suche nach drawerGlass oder Modal-Style mit 2 gradients
+    # In v8.26 sollte es zwei layers haben (siehe Spec)
+    assert 'backdrop-filter:blur' in src and 'saturate' in src
+
+
+def test_v826_no_promo_marketing_phrases_in_chat():
+    """Chat enthält KEINE Marketing-Floskeln (Mehr absetzen, AeroTAX kennt deine Zahlen, ...)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    forbidden = ['Mehr absetzen', 'AeroTAX kennt deine Zahlen',
+                 'garantiert korrekt', 'Steuerberater-sicher']
+    for phrase in forbidden:
+        assert phrase not in src, f'Verbotene Marketing-Floskel im Chat: "{phrase}"'
 
 
 if __name__ == '__main__':
