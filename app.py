@@ -658,36 +658,88 @@ def demo():
                     'data': safe})
 
 
-# ── BILD-NORMALISIERUNG (HEIC/WEBP/etc → JPEG) ─────────────────
+# ── BILD-NORMALISIERUNG (HEIC/WEBP/etc → JPEG) + DOWNSCALE ─────
+# Task B (v10.4.2): iPhone-Fotos sind oft 4032×3024 (~30 MB decoded RAM).
+# Wir scalen auf max 1500px max-Dim runter — Sonnet braucht die Auflösung
+# nicht und der RAM-Druck auf Render Free-Tier sinkt deutlich. PDFs bleiben
+# unangetastet. EXIF-Rotation wird angewandt (iPhone speichert oft sideways).
+_IMAGE_MAX_DIM = 1500
+_IMAGE_JPEG_QUALITY = 88
+
+
 def _normalize_upload(file_bytes, filename=''):
-    """Konvertiert exotische Bildformate (HEIC/HEIF/WEBP/…) zu JPEG.
-    PDFs, JPEG, PNG bleiben unverändert. Garantiert dass Claude UND
-    der PDF-Generator die Bytes lesen können.
-    Returns (bytes, filename) — Endung wird auf .jpg gesetzt wenn konvertiert.
+    """Konvertiert exotische Bildformate zu JPEG + downscaled große Bilder.
+
+    Regeln:
+      - PDF: immer unverändert
+      - HEIC/HEIF/WEBP/TIFF: → JPEG (mit Downscale wenn nötig)
+      - JPEG/PNG:
+         · wenn max(width,height) > 1500 → Downscale + JPEG-Re-Save
+         · wenn EXIF-Orientation ≠ 1 → orientation-fix + JPEG-Re-Save
+         · sonst unverändert (kein Quality-Loss)
+      - Returns (bytes, filename)
     """
     if not file_bytes:
         return file_bytes, filename
     ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
-    # Bereits in einem unterstützten Format → unverändert
+
+    # PDF: NIEMALS anfassen
     if file_bytes[:4] == b'%PDF' or ext == 'pdf':
         return file_bytes, filename
-    if file_bytes[:3] == b'\xff\xd8\xff':  # JPEG
+
+    if not PIL_AVAILABLE:
         return file_bytes, filename
-    if file_bytes[:8] == b'\x89PNG\r\n\x1a\n':  # PNG
-        return file_bytes, filename
-    # Konvertierung versuchen
-    if PIL_AVAILABLE:
+
+    try:
+        from PIL import ImageOps as _IOps
+        img = Image.open(io.BytesIO(file_bytes))
+        original_size = img.size
+
+        # EXIF-Orientation anwenden (iPhone-Photos sind oft EXIF-rotated)
         try:
-            img = Image.open(io.BytesIO(file_bytes))
-            buf = io.BytesIO()
-            img.convert('RGB').save(buf, format='JPEG', quality=88)
-            new_bytes = buf.getvalue()
+            exif = img.getexif() if hasattr(img, 'getexif') else None
+            had_exif_rotation = bool(exif and exif.get(0x0112, 1) != 1)
+        except Exception:
+            had_exif_rotation = False
+        img = _IOps.exif_transpose(img)
+
+        # Downscale wenn zu groß
+        needs_resize = max(img.size) > _IMAGE_MAX_DIM
+        if needs_resize:
+            img.thumbnail((_IMAGE_MAX_DIM, _IMAGE_MAX_DIM), Image.Resampling.LANCZOS)
+
+        # Format-Konvertierung nötig?
+        is_jpeg = file_bytes[:3] == b'\xff\xd8\xff'
+        is_png = file_bytes[:8] == b'\x89PNG\r\n\x1a\n'
+        needs_convert = not (is_jpeg or is_png)  # HEIC/WEBP/TIFF etc.
+
+        # Wenn weder Resize noch Convert noch EXIF-Rotation: original lassen
+        # (vermeidet unnötige JPEG-Re-Compression)
+        if not (needs_resize or needs_convert or had_exif_rotation):
+            return file_bytes, filename
+
+        buf = io.BytesIO()
+        img.convert('RGB').save(buf, format='JPEG',
+                                  quality=_IMAGE_JPEG_QUALITY, optimize=True)
+        new_bytes = buf.getvalue()
+
+        # Neuer Filename
+        if needs_convert:
             new_name = (filename.rsplit('.', 1)[0] + '.jpg') if '.' in filename else (filename or 'image') + '.jpg'
-            print(f"Bild normalisiert ({ext or 'unbekannt'} → JPEG): {filename} {len(file_bytes)//1024}KB → {len(new_bytes)//1024}KB")
-            return new_bytes, new_name
-        except Exception as e:
-            print(f"Bild-Normalisierung fehlgeschlagen für {filename}: {e}")
-    return file_bytes, filename
+        else:
+            new_name = filename or 'image.jpg'
+
+        action = []
+        if needs_resize: action.append(f'resize {original_size}→{img.size}')
+        if needs_convert: action.append(f'convert {ext or "?"}→jpg')
+        if had_exif_rotation: action.append('exif-rotate')
+        print(f"[image-normalize] {filename}: {', '.join(action)} | "
+              f"{len(file_bytes)//1024}KB → {len(new_bytes)//1024}KB")
+        return new_bytes, new_name
+
+    except Exception as e:
+        print(f"[image-normalize] fehlgeschlagen für {filename}: {e}")
+        return file_bytes, filename
 
 
 # ── PROCESS MIT ECHTEN PDFs ────────────────────────────────────

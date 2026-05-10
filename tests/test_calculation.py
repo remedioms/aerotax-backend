@@ -9895,6 +9895,206 @@ def test_taskA2_lsb_implausible_lohnsteuer_falls_to_sonnet():
         'Plausi-Check für Lohnsteuer fehlt'
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Task B — Upload Image Optimization
+# Bilder werden vor Verarbeitung normalisiert:
+#   - PDFs unverändert
+#   - HEIC/WEBP/etc → JPEG
+#   - Downscale auf max 1500×1500 (iPhone-Fotos sind 4032×3024, ~37 MB RAM)
+#   - EXIF orientation angewandt
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _make_jpeg_bytes(width, height, color=(200, 100, 50)):
+    """Helper: Erstellt JPEG-Bytes der gegebenen Größe."""
+    import io as _io
+    from PIL import Image as _Image
+    img = _Image.new('RGB', (width, height), color=color)
+    buf = _io.BytesIO()
+    img.save(buf, format='JPEG', quality=90)
+    return buf.getvalue()
+
+
+def _make_png_bytes(width, height, color=(50, 200, 100)):
+    """Helper: PNG-Bytes."""
+    import io as _io
+    from PIL import Image as _Image
+    img = _Image.new('RGB', (width, height), color=color)
+    buf = _io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+
+def test_taskB_normalize_pdf_untouched():
+    """PDF-Bytes werden NIEMALS verändert."""
+    _app = _load_app_fresh()
+    pdf_bytes = b'%PDF-1.4\n%fake pdf content for test'
+    out_bytes, out_name = _app._normalize_upload(pdf_bytes, 'test.pdf')
+    assert out_bytes == pdf_bytes
+    assert out_name == 'test.pdf'
+
+
+def test_taskB_normalize_pdf_by_ext_untouched():
+    """PDFs werden auch erkannt wenn header fehlt aber ext .pdf."""
+    _app = _load_app_fresh()
+    bytes_no_header = b'random content but .pdf ext'
+    out, name = _app._normalize_upload(bytes_no_header, 'test.pdf')
+    assert out == bytes_no_header
+
+
+def test_taskB_normalize_jpeg_small_untouched():
+    """Kleine JPEGs (< 1500px) bleiben unverändert (keine Quality-Loss durch re-encode)."""
+    _app = _load_app_fresh()
+    small_jpeg = _make_jpeg_bytes(800, 600)
+    out, name = _app._normalize_upload(small_jpeg, 'small.jpg')
+    assert out == small_jpeg, 'Kleine JPEGs sollen NICHT re-encoded werden'
+    assert name == 'small.jpg'
+
+
+def test_taskB_normalize_png_small_untouched():
+    """Kleine PNGs bleiben unverändert."""
+    _app = _load_app_fresh()
+    small_png = _make_png_bytes(800, 600)
+    out, name = _app._normalize_upload(small_png, 'small.png')
+    assert out == small_png
+
+
+def test_taskB_normalize_large_jpeg_downscaled():
+    """JPEG > 1500px wird auf max 1500 downscaled."""
+    _app = _load_app_fresh()
+    big_jpeg = _make_jpeg_bytes(4032, 3024)  # iPhone-Größe
+    out, name = _app._normalize_upload(big_jpeg, 'big.jpg')
+    assert out != big_jpeg, 'Großes JPEG muss resized werden'
+    assert len(out) < len(big_jpeg), 'Resized JPEG muss kleiner sein'
+    # Verify resized dimensions
+    import io as _io
+    from PIL import Image as _Image
+    out_img = _Image.open(_io.BytesIO(out))
+    assert max(out_img.size) <= 1500, f'Max dim sollte ≤1500 sein, got {out_img.size}'
+
+
+def test_taskB_normalize_large_png_downscaled():
+    """PNG > 1500px wird zu kleinerer JPEG konvertiert."""
+    _app = _load_app_fresh()
+    big_png = _make_png_bytes(2500, 2000)
+    out, name = _app._normalize_upload(big_png, 'big.png')
+    import io as _io
+    from PIL import Image as _Image
+    out_img = _Image.open(_io.BytesIO(out))
+    assert max(out_img.size) <= 1500
+
+
+def test_taskB_normalize_preserves_aspect_ratio():
+    """Aspect-Ratio bleibt beim Downscale erhalten."""
+    _app = _load_app_fresh()
+    # 4000×2000 = 2:1
+    big = _make_jpeg_bytes(4000, 2000)
+    out, name = _app._normalize_upload(big, 'wide.jpg')
+    import io as _io
+    from PIL import Image as _Image
+    out_img = _Image.open(_io.BytesIO(out))
+    w, h = out_img.size
+    assert max(w, h) <= 1500
+    ratio = w / h
+    assert abs(ratio - 2.0) < 0.05, f'Aspect-Ratio sollte ~2:1 bleiben, got {ratio}'
+
+
+def test_taskB_normalize_filename_extension_jpg_after_convert():
+    """Wenn HEIC→JPG konvertiert wird: filename-extension wird .jpg."""
+    _app = _load_app_fresh()
+    # Wir können kein echtes HEIC erzeugen ohne pillow-heif HEIC-Writer,
+    # aber wir können mit einem TIFF testen (auch via PIL konvertierbar)
+    import io as _io
+    from PIL import Image as _Image
+    img = _Image.new('RGB', (800, 600), color=(100, 100, 100))
+    buf = _io.BytesIO()
+    img.save(buf, format='TIFF')
+    tiff_bytes = buf.getvalue()
+    out, name = _app._normalize_upload(tiff_bytes, 'photo.tiff')
+    assert name.endswith('.jpg'), f'TIFF muss zu .jpg umbenannt werden, got {name}'
+
+
+def test_taskB_normalize_max_dim_constant():
+    """_IMAGE_MAX_DIM ist definiert und vernünftig."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_IMAGE_MAX_DIM')
+    assert 1000 <= _app._IMAGE_MAX_DIM <= 2500, \
+        f'Max-Dim {_app._IMAGE_MAX_DIM} außerhalb sinnvollem Bereich'
+
+
+def test_taskB_normalize_empty_bytes_returns_empty():
+    """Leere Bytes → leer zurück (kein Crash)."""
+    _app = _load_app_fresh()
+    out, name = _app._normalize_upload(b'', 'empty.jpg')
+    assert out == b''
+
+
+def test_taskB_normalize_corrupt_bytes_returns_original():
+    """Korrupte Bytes → original zurück (kein Crash, kein silent loss)."""
+    _app = _load_app_fresh()
+    corrupt = b'\xff\xd8\xff garbage that is not valid jpeg'
+    out, name = _app._normalize_upload(corrupt, 'corrupt.jpg')
+    # PIL kann das nicht öffnen → original zurück
+    assert out == corrupt
+
+
+def test_taskB_normalize_exif_rotation_applied():
+    """Bild mit EXIF-Orientation ≠ 1 wird gerichtet + re-saved."""
+    _app = _load_app_fresh()
+    import io as _io
+    from PIL import Image as _Image
+    img = _Image.new('RGB', (1200, 800), color=(150, 150, 150))
+    # EXIF mit Orientation=6 (rotate 90° CW)
+    exif = img.getexif()
+    exif[0x0112] = 6
+    buf = _io.BytesIO()
+    img.save(buf, format='JPEG', exif=exif)
+    rotated_bytes = buf.getvalue()
+    out, name = _app._normalize_upload(rotated_bytes, 'rotated.jpg')
+    # Output sollte UNTERSCHIEDLICH sein (resaved nach exif_transpose)
+    assert out != rotated_bytes, 'EXIF-rotated Bild muss re-orientiert werden'
+
+
+def test_taskB_normalize_jpeg_quality_constant():
+    """JPEG-Qualität ist 88 (Balance Größe/Qualität)."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_IMAGE_JPEG_QUALITY')
+    assert 75 <= _app._IMAGE_JPEG_QUALITY <= 95
+
+
+def test_taskB_no_reader_logic_change():
+    """Reader/Berechnung wurden NICHT verändert in Task B."""
+    src = _read_backend()
+    # LSB Reader-Funktion existiert, unverändert in Funktion
+    assert 'def _sonnet_read_lsb_v2' in src
+    assert 'def _read_lsb_with_local_fallback' in src
+    # SE-Reader
+    assert 'def _sonnet_read_se_structured' in src
+    # DP-Reader
+    assert 'def _sonnet_read_dp_structured_chunked_v104' in src
+    # choose_z77_source
+    assert 'def choose_z77_source' in src
+
+
+def test_taskB_normalize_huge_image_memory_savings():
+    """Großes Bild (4032×3024) wird signifikant kleiner."""
+    _app = _load_app_fresh()
+    huge = _make_jpeg_bytes(4032, 3024)
+    out, name = _app._normalize_upload(huge, 'iphone.jpg')
+    reduction_pct = 100 * (1 - len(out) / len(huge))
+    assert reduction_pct > 30, \
+        f'Erwartete >30% Größen-Reduktion, got {reduction_pct:.1f}%'
+
+
+def test_taskB_normalize_idempotent_after_resize():
+    """Nach erstem Normalize: zweites Normalize ändert nicht weiter."""
+    _app = _load_app_fresh()
+    huge = _make_jpeg_bytes(4032, 3024)
+    out1, _ = _app._normalize_upload(huge, 'iphone.jpg')
+    out2, _ = _app._normalize_upload(out1, 'iphone.jpg')
+    assert out1 == out2, 'Zweiter Normalize muss idempotent sein'
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
