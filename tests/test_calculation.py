@@ -6548,11 +6548,10 @@ def test_v833_frontend_short_msgs_allowed_in_review():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+10000]
-    # Block muss isReviewCtx vor Length-Check haben
+    block = src[fn_idx:fn_idx+18000]
     short_idx = block.find('Magst du das etwas ausführlicher fragen?')
     assert short_idx > 0
-    pre = block[max(0, short_idx-300):short_idx]
+    pre = block[max(0, short_idx-400):short_idx]
     assert '!isReviewCtx' in pre or 'isReviewCtx' in pre, \
         'Frontend muss „Magst du ausführlicher" nur außerhalb Review-Kontext zeigen'
 
@@ -6684,6 +6683,95 @@ def test_v834_screenshot_response_requires_confirmation():
     # Tolerant: irgendwo im Endpoint-Body taucht applied: False auf
     import re
     assert re.search(r"'applied':\s*False", block), "Screenshot-Response muss 'applied': False zurückgeben"
+
+
+# ── v8.35 Conversation-Memory + Confirm/Cancel-Synonyme ──
+
+def test_v835_parser_beim_rest_0_means_no_for_remainder():
+    """„beim rest 0" → restliche pending Items auf no."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [
+        _make_pending_item('2025-04-07', 'EK'),
+        _make_pending_item('2025-04-08', 'D4'),
+        _make_pending_item('2025-09-04', 'SM'),
+    ]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('beim rest 0', groups, {it['id']: it for it in items})
+    assert len(res['proposed_changes']) == 3
+    assert all(c['answer'] == 'no' for c in res['proposed_changes'])
+
+
+def test_v835_parser_alle_0h_means_bulk_no():
+    """„alle 0h" → bulk_no."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [_make_pending_item('2025-04-07', 'EK')]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('alle 0h', groups, {it['id']: it for it in items})
+    assert res['intent'] == 'bulk_all'
+    assert res['proposed_changes'][0]['answer'] == 'no'
+
+
+def test_v835_parser_alle_null():
+    """„alle null" → bulk_no."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [_make_pending_item('2025-04-07', 'EK')]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('alle null', groups, {it['id']: it for it in items})
+    assert res['proposed_changes'][0]['answer'] == 'no'
+
+
+def test_v835_parser_rest_0h():
+    """„rest 0h" → restliche no."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [_make_pending_item('2025-04-07', 'EK'),
+             _make_pending_item('2025-04-08', 'D4')]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('rest 0h', groups, {it['id']: it for it in items})
+    assert all(c['answer'] == 'no' for c in res['proposed_changes'])
+
+
+# ── Frontend: Confirm/Cancel-Synonyme ──
+
+def test_v835_frontend_confirm_synonyms_apply_pending():
+    """„richtig"/„passt"/„stimmt"/„genau"/„korrekt" → Apply Pending."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatSend = async function')
+    block = src[fn_idx:fn_idx+12000]
+    confirm_idx = block.find('confirmRe')
+    assert confirm_idx > 0, 'Confirm-Regex muss existieren'
+    # Wichtige Synonyme müssen drin sein
+    confirm_block = block[confirm_idx:confirm_idx+800]
+    for syn in ['ja', 'übernehm', 'passt', 'stimmt', 'richtig', 'genau', 'korrekt']:
+        assert syn in confirm_block, f'Confirm-Synonym fehlt: {syn}'
+
+
+def test_v835_frontend_cancel_synonyms_clear_pending():
+    """„war ausversehen"/„stop"/„abbrechen"/„nochmal" → Cancel Pending."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatSend = async function')
+    block = src[fn_idx:fn_idx+12000]
+    cancel_idx = block.find('cancelRe')
+    assert cancel_idx > 0, 'Cancel-Regex muss existieren'
+    cancel_block = block[cancel_idx:cancel_idx+800]
+    for syn in ['nein', 'korrig', 'stop', 'abbrech', 'falsch', 'versehen', 'nochmal']:
+        assert syn in cancel_block, f'Cancel-Synonym fehlt: {syn}'
+
+
+def test_v835_frontend_looks_like_review_matches_beim_rest_0():
+    """Frontend _looksLikeReviewAnswer matched „beim rest 0" + „alle 0h"."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('function _looksLikeReviewAnswer')
+    block = src[fn_idx:fn_idx+2500]
+    # Pattern: (beim )?rest|andere|...
+    assert '(beim\\s+)?(rest|andere|übrige|sonst)' in block or 'beim\\s+)?(rest' in block
+    # Pattern: alle ... 0|null
+    assert '0|0h|null' in block or '0|null' in block
 
 
 if __name__ == '__main__':

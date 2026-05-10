@@ -11152,8 +11152,9 @@ def _interpret_review_text(message, groups, items_by_id):
                 all_pending_ids.append(iid)
 
     # ── Bulk: "alle ja" / "alle über 8h" / "alle nein" / "weiß nicht"
+    # v8.35: 0/0h/null = no-Äquivalent
     bulk_yes = bool(_re.search(r'\balle\b[^.,]*(ja|über\s*8|>\s*8|länger|mehr\s*als\s*8)', msg))
-    bulk_no  = bool(_re.search(r'\balle\b[^.,]*(nein|unter\s*8|<\s*8|kürzer|weniger\s*als\s*8)', msg))
+    bulk_no  = bool(_re.search(r'\balle\b[^.,]*(nein|unter\s*8|<\s*8|kürzer|weniger\s*als\s*8|\b0\b|\bnull\b|\b0\s*h\b|\b0\s*stunden\b)', msg))
     bulk_unsure = bool(_re.search(r'\b(weiß|weiss).*nicht\b|\bunsicher\b|\bkeine\s*ahnung\b', msg))
     if bulk_yes and not bulk_no:
         changes = [{'review_item_id': iid, 'answer': 'yes'} for iid in all_pending_ids]
@@ -11205,11 +11206,22 @@ def _interpret_review_text(message, groups, items_by_id):
             changes.append({'review_item_id': iid, 'answer': ans})
             matched_any = True
 
-    # ── "Rest ja" / "andere ja" / "übrige ja"
-    rest_match = _re.search(r'(?:rest|andere|übrige|sonst|sonstigen)\s*(ja|nein|unsicher|über\s*8|unter\s*8)', msg)
+    # ── "Rest ja" / "beim Rest 0" / "andere nein" / "übrige unsicher"
+    # v8.35: 0/0h/null als no-Äquivalent erkennen
+    rest_match = _re.search(
+        r'(?:rest|andere|übrige|sonst|sonstigen)\s*(ja|nein|unsicher|über\s*8|unter\s*8|0\b|null\b|0\s*h\b|0\s*stunden)',
+        msg
+    )
     if rest_match:
         ans_raw = rest_match.group(1).lower()
-        ans = 'yes' if ('ja' in ans_raw or 'über' in ans_raw) else ('no' if ('nein' in ans_raw or 'unter' in ans_raw) else 'unsure')
+        if 'unsicher' in ans_raw:
+            ans = 'unsure'
+        elif ('ja' in ans_raw) or ('über' in ans_raw):
+            ans = 'yes'
+        elif ('nein' in ans_raw) or ('unter' in ans_raw) or ('0' in ans_raw) or ('null' in ans_raw):
+            ans = 'no'
+        else:
+            ans = 'unsure'
         already = {c['review_item_id'] for c in changes}
         for iid in all_pending_ids:
             if iid in already: continue
