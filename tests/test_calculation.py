@@ -6774,6 +6774,85 @@ def test_v835_frontend_looks_like_review_matches_beim_rest_0():
     assert '0|0h|null' in block or '0|null' in block
 
 
+# ── v8.36 Conversation-State + Progress ──
+
+def test_v836_chat_conv_state_object_initialized_on_open():
+    """_chatOpen initialisiert window._chatConv mit appliedItems/applyHistory/lastBotQuestion."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatOpen = async function')
+    block = src[fn_idx:fn_idx+3500]
+    assert 'window._chatConv' in block
+    assert 'appliedItems' in block
+    assert 'applyHistory' in block
+    assert 'lastBotQuestion' in block
+
+
+def test_v836_apply_pending_tracks_in_chat_conv():
+    """Nach Apply werden applied review_item_ids in window._chatConv.appliedItems gespeichert."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _applyPendingProposal')
+    block = src[fn_idx:fn_idx+3500]
+    assert 'window._chatConv.appliedItems[a.review_item_id]' in block, \
+        'Applied items müssen in conv.appliedItems getrackt werden'
+    assert 'applyHistory.push' in block, 'apply-History muss erweitert werden'
+
+
+def test_v836_idempotency_check_prevents_double_apply():
+    """Wenn proposed_changes alle schon in appliedItems sind, freundliche Hinweismeldung."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _applyPendingProposal')
+    block = src[fn_idx:fn_idx+1500]
+    assert 'alreadyAppliedCount' in block
+    assert 'kein Doppel-Eintrag' in block or 'schon übernommen' in block.lower()
+
+
+def test_v836_header_has_progress_pill():
+    """Header hat progress-pill DOM-Element."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'id="chat-header-progress-pill"' in src
+
+
+def test_v836_update_chat_header_progress_function_exists():
+    """window.updateChatHeaderProgress berechnet 'X von Y geklärt'."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'window.updateChatHeaderProgress = function' in src
+    assert 'von ' in src and 'geklärt' in src
+    fn_idx = src.find('window.updateChatHeaderProgress = function')
+    block = src[fn_idx:fn_idx+2000]
+    assert "status === 'answered'" in block
+
+
+def test_v836_apply_renders_progress_in_acknowledgement():
+    """Apply-Acknowledgement enthält progress-Hinweis (X von Y geklärt)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _applyPendingProposal')
+    block = src[fn_idx:fn_idx+5000]
+    assert 'doneItems' in block, 'Apply-Path muss done/total tracken'
+    assert 'progressLine' in block or 'geklärt' in block
+
+
+def test_v836_progress_pill_called_after_apply():
+    """Nach Apply wird updateChatHeaderProgress aufgerufen."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _applyPendingProposal')
+    block = src[fn_idx:fn_idx+5000]
+    assert 'updateChatHeaderProgress' in block
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
