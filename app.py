@@ -1219,6 +1219,7 @@ def _run_process_async(job_id, form, files):
                 'training_commute_candidates': result.get('_training_commute_candidates') or [],
                 'office_z72_candidates':       result.get('_office_z72_candidates') or [],
                 'missing_reader_days':         result.get('_missing_reader_days') or [],
+                'hotel_candidate_issues':      result.get('_hotel_candidate_issues') or [],
                 'bmf_missing':            result.get('_bmf_missing') or [],
                 'iata_unknown':           result.get('_iata_unknown') or [],
                 'versions': {
@@ -7256,13 +7257,20 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         # Classifier-Priorität: SE-Ort vor DP-layover_ort
         classifier_effective_ort = se_effective_ort or dp_layover_ort_v
 
-        # v8.14: Hotel-Counter nutzt z73_type-Flag, nicht reason-Substring.
-        # Robust gegen wording-Änderung im reason.
+        # v8.16: Hotel-Counter mit harten Bedingungen — synchron zum
+        # zentralen _hotel_check (oben). Hier nur die statische Logik
+        # ohne prev_m-Zugriff (das macht der Counter selbst).
         is_evening_anreise_z73 = (klass == 'Z73' and z73_type == 'evening_foreign_tour_start')
+        hotel_layover_ort = ((d.get('layover_ort') or se.get('stfrei_ort') or '').upper())
+        hotel_homebase = (homebase or 'FRA').upper()
+        has_active_se_for_hotel = se.get('count', 0) > 0 and float(se.get('stfrei_total', 0) or 0) > 0
         counted_hotel = (
             bool(d.get('overnight_after_day'))
             and klass in ('Z73', 'Z74', 'Z76')
             and not is_evening_anreise_z73
+            and bool(hotel_layover_ort)
+            and hotel_layover_ort != hotel_homebase
+            and not (at in ('unknown', 'none', '') and not has_active_se_for_hotel)
         )
 
         classifier_result = {
@@ -7454,8 +7462,53 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     # mit overnight=true (DP-Reader-Fehler) wird explizit ausgeschlossen.
     HOTEL_KLASSEN = {'Z73', 'Z74', 'Z76'}
     NON_HOTEL_KLASSEN = {'Frei', 'Issue', 'Standby', 'Office', 'ZeroDay'}
+    homebase_upper = (homebase or 'FRA').upper()
     hotel_naechte = 0
     hotel_skipped = []
+    hotel_candidate_issues = []  # v8.16: overnight=true ohne layover_ort etc.
+
+    def _hotel_check(i, t, m, prev_m):
+        """v8.16: Harter Check für Hotelnacht. Liefert (counted, reason).
+
+        counted=True nur wenn:
+        - overnight_after_day=true
+        - klass in Z73/Z74/Z76
+        - z73_type != evening_foreign_tour_start
+        - layover_ort vorhanden
+        - layover_ort != Homebase
+        - kein SE-only/unknown-Nachlauf
+        - kein Heimkehr-Pattern (Vortag overnight + heute ends_at_homebase)
+        """
+        d = m['dp']
+        cr = t.get('classifier_result') or {}
+        klass = t['klass']
+        # 1. overnight=true ist Voraussetzung (außerhalb dieser Funktion gefiltert)
+        if not d.get('overnight_after_day'):
+            return False, 'no_overnight'
+        # 2. Klass muss Hotel-relevant sein
+        if klass not in HOTEL_KLASSEN:
+            return False, f'klass={klass}_not_hotel'
+        # 3. evening_foreign_tour_start zählt nicht (User schläft im Flugzeug)
+        if cr.get('z73_type') == 'evening_foreign_tour_start':
+            return False, 'evening_foreign_tour_start'
+        # 4. layover_ort muss vorhanden sein
+        layover_ort_local = (d.get('layover_ort') or m['se'].get('stfrei_ort') or '').upper()
+        if not layover_ort_local:
+            return False, 'no_layover_ort'  # Hotel-Candidate-Issue (siehe Audit)
+        # 5. layover_ort darf nicht Homebase sein
+        if layover_ort_local == homebase_upper:
+            return False, f'layover={layover_ort_local}=Homebase'
+        # 6. SE-only/unknown ohne SE-Spur ist Nachlauf, nicht Hotel
+        at_local = d.get('activity_type', '')
+        has_active_se_local = m['se'].get('count', 0) > 0 and float(m['se'].get('stfrei_total', 0) or 0) > 0
+        if at_local in ('unknown', 'none', '') and not has_active_se_local:
+            return False, 'unknown_without_se_spur'
+        # 7. Heimkehr-Pattern: Vortag overnight + heute ends_at_homebase = Heimkehr,
+        # auch wenn Sonnet overnight=True markiert hat (Reader-Lesefehler)
+        if prev_m and prev_m['dp'].get('overnight_after_day') and d.get('ends_at_homebase'):
+            return False, 'heimkehr_pattern_despite_overnight'
+        return True, 'ok'
+
     for i, m in enumerate(sorted_days):
         d = m['dp']
         if not d.get('overnight_after_day'):
@@ -7463,32 +7516,28 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         if i >= len(tage_detail):
             continue
         t = tage_detail[i]
-        klass = t['klass']
-        # v8.4: Layover-Ort gegen GEWÄHLTE Homebase prüfen, nicht gegen FRA hardcoded.
-        # Nur die ausgewählte Homebase ausschließen — FRA bleibt als Layover-Ort
-        # für nicht-FRA-Bases (z.B. MUC-Crew) ein normaler Übernachtungsort.
+        prev_m = sorted_days[i-1] if i > 0 else None
         layover_ort = (d.get('layover_ort') or m['se'].get('stfrei_ort') or '').upper()
-        homebase_upper = (homebase or 'FRA').upper()
-        is_homebase = layover_ort in (homebase_upper, '')
-        # v8.14: Z73-Abend-Anreise zählt NICHT als Hotelnacht — robust über
-        # z73_type-Flag (statt reason-Substring). Wording-resistent.
         cr_t = t.get('classifier_result') or {}
-        is_evening_anreise_z73 = cr_t.get('z73_type') == 'evening_foreign_tour_start'
-        if klass in HOTEL_KLASSEN and not is_homebase and not is_evening_anreise_z73:
-            hotel_naechte += 1
-        elif is_evening_anreise_z73:
-            hotel_skipped.append(f'{t["datum"]}:evening_foreign_tour_start')
-            print(f"[v8-hotel-skipped] datum={t['datum']} reason='Z73 evening_foreign_tour_start — Tag in DE, Flug nachts'")
-        elif klass in HOTEL_KLASSEN and is_homebase:
-            hotel_skipped.append(f'{t["datum"]}:homebase')
-            ort_disp = layover_ort or 'leer'
-            print(f"[v8-hotel-skipped] datum={t['datum']} reason='Layover-Ort={ort_disp} = Homebase'")
-        elif klass in NON_HOTEL_KLASSEN:
-            hotel_skipped.append(f'{t["datum"]}:{klass}')
-            print(f"[v8-hotel-skipped] datum={t['datum']} reason='overnight=true aber klass={klass} (kein Hotel)'")
+        klass = t['klass']
+
+        counted, why = _hotel_check(i, t, m, prev_m)
+
+        # extra_hotelnaechte: detaillierte Diagnose (v8.16)
+        # Liste enthält JEDEN Tag mit overnight=True PLUS counted/why-Felder,
+        # damit der User pro Tag sehen kann warum gezählt/nicht gezählt wurde.
+        if not counted:
+            hotel_skipped.append(f"{t['datum']}:{why}")
+            print(f"[v8-hotel-skipped] datum={t['datum']} reason='{why}'")
+            # Bei "no_layover_ort" und klass in Hotel-Klassen → expliziter Audit-Issue
+            if why == 'no_layover_ort' and klass in HOTEL_KLASSEN:
+                hotel_candidate_issues.append({
+                    'datum': t['datum'],
+                    'klass': klass,
+                    'reason': 'overnight=true aber layover_ort fehlt — Hotel nicht eindeutig'
+                })
         else:
-            hotel_skipped.append(f'{t["datum"]}:{klass}')
-            print(f"[v8-hotel-extra] datum={t['datum']} klass={klass} reason='overnight=true aber klass={klass}'")
+            hotel_naechte += 1
 
     print(f"[v8-hotel-detail] counted={hotel_naechte} skipped={len(hotel_skipped)}")
     print(f"[v8-classify] arbeit={arbeitstage}T fahr={fahr_tage}T hotel={hotel_naechte}T  "
@@ -7546,11 +7595,40 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             extra_arbeitstage.append({'datum': datum, 'klass': klass, 'activity_type': at,
                                        'reason': 'ZeroDay als dienstlich markiert ohne SE-Spur'})
 
-        # extra_hotelnaechte: gezählte Hotelnacht aber verdächtig
-        if overnight and klass in ('Z73', 'Z74', 'Z76') and layover_ort in (hb_upper, ''):
-            extra_hotelnaechte.append({'datum': datum, 'klass': klass,
-                                        'layover_ort': layover_ort,
-                                        'reason': 'Hotel an Homebase/leerem Ort'})
+        # v8.16: extra_hotelnaechte erweitert — pro Tag mit overnight=True alle
+        # relevanten Felder + counted_as_hotel-Flag + reason. Damit ist der
+        # User-Diff-Check direkt möglich.
+        if overnight:
+            t_diag = tage_detail[i] if i < len(tage_detail) else {}
+            cr_diag = t_diag.get('classifier_result') or {}
+            counted_h = bool(cr_diag.get('counted_as_hotel_nacht'))
+            z73_type_diag = cr_diag.get('z73_type', '') or ''
+            why_susp = ''
+            if counted_h:
+                # Verdächtig wenn gezählt
+                if layover_ort in (hb_upper, ''):
+                    why_susp = 'Hotel an Homebase oder leerem Ort'
+                elif z73_type_diag == 'evening_foreign_tour_start':
+                    why_susp = 'evening_foreign_tour_start sollte nicht zählen'
+            else:
+                # Verdächtig wenn nicht gezählt — z.B. echter Layover-Ort aber klass falsch
+                if klass not in ('Z73','Z74','Z76') and layover_ort and layover_ort != hb_upper:
+                    why_susp = f'overnight + Layover {layover_ort} ≠ Homebase, aber klass={klass}'
+
+            if counted_h or why_susp:
+                extra_hotelnaechte.append({
+                    'datum':                       datum,
+                    'klass':                       klass,
+                    'marker':                      t_diag.get('marker', ''),
+                    'routing':                     t_diag.get('routing', ''),
+                    'layover_ort':                 layover_ort,
+                    'overnight_after_day':         overnight,
+                    'z73_type':                    z73_type_diag,
+                    'is_evening_foreign_tour_start': z73_type_diag == 'evening_foreign_tour_start',
+                    'counted_as_hotel_nacht':      counted_h,
+                    'reason_counted':              cr_diag.get('reason', '')[:120],
+                    'why_suspicious':              why_susp,
+                })
 
         # wrong_z72_candidates: Z72 das verletzt sein könnte
         if klass == 'Z72':
@@ -7761,6 +7839,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         'training_commute_candidates': training_commute_candidates,
         'office_z72_candidates':       office_z72_candidates,
         'missing_reader_days':         missing_reader_days,
+        'hotel_candidate_issues':      hotel_candidate_issues,
         'bmf_missing':            list(_diag_bmf['bmf_missing']),
         'iata_unknown':           sorted(set(_diag_bmf['iata_unknown'])),
         'nachweis': '',
@@ -8867,6 +8946,7 @@ def _berechne_via_hybrid(form, files):
         '_training_commute_candidates': list(cls.get('training_commute_candidates', []) or []),
         '_office_z72_candidates':       list(cls.get('office_z72_candidates', []) or []),
         '_missing_reader_days':         list(cls.get('missing_reader_days', []) or []),
+        '_hotel_candidate_issues':      list(cls.get('hotel_candidate_issues', []) or []),
         '_bmf_missing':            list(cls.get('bmf_missing', []) or []),
         '_iata_unknown':           list(cls.get('iata_unknown', []) or []),
         '_tage_detail':     list(cls.get('tage_detail', []) or []),

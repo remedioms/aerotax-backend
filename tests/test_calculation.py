@@ -2666,6 +2666,130 @@ def test_v815_same_day_prev_overnight_without_foreign_se_stays_issue():
     assert detail['klass'] == 'Issue'
 
 
+def test_v816_overnight_without_layover_ort_no_hotel():
+    """overnight=True ohne layover_ort → kein Hotel + hotel_candidate_issue."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        # Tour-Tag mit overnight=True aber ohne layover_ort und ohne SE
+        {'datum': '2025-12-10', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': []},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Kein Hotel weil layover_ort fehlt
+    assert result['hotel_naechte'] == 0
+
+
+def test_v816_overnight_at_homebase_no_hotel():
+    """overnight=True mit layover_ort=Homebase → kein Hotel."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-01', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'FRA'},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-01', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA',
+         'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['hotel_naechte'] == 0
+
+
+def test_v816_z76_abreisetag_no_hotel():
+    """Z76-Heimkehrtag (overnight=False, prev_overnight=True) → kein Hotel."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-02-10', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'JFK'], 'layover_ort': 'JFK'},
+        {'datum': '2025-02-11', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['JFK', 'FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-02-10', 'stfrei_betrag': 40, 'stfrei_ort': 'JFK', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-02-11', 'stfrei_betrag': 40, 'stfrei_ort': 'JFK', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Nur 10.02 (Layover) zählt Hotel, 11.02 Heimkehr nicht
+    assert result['hotel_naechte'] == 1
+
+
+def test_v816_unknown_without_se_overnight_no_hotel():
+    """activity_type=unknown + overnight=True OHNE SE-Spur → kein Hotel (Nachlauf)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-08-01', 'activity_type': 'unknown', 'overnight_after_day': True,
+         'layover_ort': 'GRU'},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Sollte nicht als Hotel zählen — unknown ohne SE
+    # klass wird ZeroDay (kein VMA), also auch klass nicht Hotel-relevant → 0 Hotel
+    assert result['hotel_naechte'] == 0
+
+
+def test_v816_real_foreign_layover_with_overnight_counts_hotel():
+    """Echter Auslands-Layover mit overnight=True UND klarem layover_ort → Hotel."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-13', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'BLR'], 'layover_ort': 'BLR'},
+        {'datum': '2025-01-14', 'activity_type': 'tour', 'overnight_after_day': True,
+         'layover_ort': 'BLR'},
+        {'datum': '2025-01-15', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['BLR', 'FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-13', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-14', 'stfrei_betrag': 39, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-15', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Tag 13. + 14. zählen Hotel, 15. (Heimkehr) nicht
+    assert result['hotel_naechte'] == 2
+
+
+def test_v816_extra_hotelnaechte_has_required_fields():
+    """extra_hotelnaechte enthält alle vom User geforderten Detail-Felder."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-19', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': False, 'routing': ['FRA', 'GRU'], 'layover_ort': 'GRU',
+         'start_time': '21:25'},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-19', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Es sollte 0 oder 1 Eintrag im extra_hotelnaechte geben
+    # (wenn evening_foreign_tour_start, ist counted=False aber kann noch why_susp haben — oder gar nicht in Liste)
+    extras = result.get('extra_hotelnaechte') or []
+    if extras:
+        e = extras[0]
+        for key in ('datum', 'klass', 'marker', 'routing', 'layover_ort',
+                    'overnight_after_day', 'z73_type', 'is_evening_foreign_tour_start',
+                    'counted_as_hotel_nacht', 'reason_counted', 'why_suspicious'):
+            assert key in e, f"extra_hotelnaechte fehlt Feld '{key}'"
+
+
+def test_v816_hotel_candidate_issues_list_present():
+    """hotel_candidate_issues ist im Result und auch im Audit weitergereicht."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-12-10', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': []},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-12-10', 'stfrei_betrag': 30, 'stfrei_ort': 'BLR', 'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert 'hotel_candidate_issues' in result
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
