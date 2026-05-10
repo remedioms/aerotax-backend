@@ -7145,6 +7145,150 @@ def test_v90_apply_persists_state():
     assert 'window._persistChatConv()' in block
 
 
+# ── v9.1 AI-Chat mit Sonnet + Validierung + Fallback ──
+
+def test_v91_ai_chat_endpoint_registered():
+    """/api/job/<id>/ai-chat ist als POST-Route registriert."""
+    import app as _app
+    rules = [(r.rule, sorted(r.methods or [])) for r in _app.app.url_map.iter_rules()]
+    matches = [m for r, m in rules if 'ai-chat' in r]
+    assert matches, '/ai-chat-Endpoint nicht gefunden'
+
+
+def test_v91_ai_chat_uses_off_topic_filter_first():
+    """Off-topic wird vor KI-Call abgefangen (kostenlos)."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def post_ai_chat(')
+    block = src[fn_idx:fn_idx+5000]
+    assert '_is_off_topic_question(user_msg)' in block
+    # Off-Topic-Branch muss BEFORE Sonnet-Call sein
+    off_idx = block.find('_is_off_topic_question(user_msg)')
+    sonnet_idx = block.find('client.messages.create')
+    assert 0 < off_idx < sonnet_idx
+
+
+def test_v91_ai_chat_falls_back_to_regex_parser_when_ai_unavailable():
+    """Wenn ANTHROPIC_KEY fehlt oder Sonnet failt → deterministischer Fallback."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def post_ai_chat(')
+    block = src[fn_idx:fn_idx+8000]
+    assert '_interpret_review_text(user_msg, groups, items_by_id)' in block, \
+        'Fallback auf deterministischen Parser fehlt'
+
+
+def test_v91_ai_chat_validates_proposed_changes_against_pending():
+    """KI-proposed review_item_ids müssen aus pending_items kommen."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def post_ai_chat(')
+    block = src[fn_idx:fn_idx+10000]
+    assert 'iid not in items_by_id' in block, 'fremde IDs müssen abgelehnt werden'
+    assert "items_by_id[iid].get('status') != 'pending'" in block, \
+        'nicht-pending Items müssen gefiltert werden'
+    assert "ans not in ('yes', 'no', 'unsure')" in block, \
+        'Ungültige Antworten müssen abgelehnt werden'
+
+
+def test_v91_ai_chat_bulk_forces_confirmation():
+    """Bei ≥2 proposed_changes wird needs_confirmation auf True gezwungen."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def post_ai_chat(')
+    block = src[fn_idx:fn_idx+10000]
+    assert 'len(sanitized_changes) >= 2' in block
+    assert "parsed['needs_confirmation'] = True" in block
+
+
+def test_v91_ai_chat_returns_confirmation_id_and_estimated_delta():
+    """Response enthält confirmation_id + estimated_delta + applied=False."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def post_ai_chat(')
+    block = src[fn_idx:fn_idx+10000]
+    assert "parsed['confirmation_id']" in block
+    assert "parsed['estimated_delta']" in block
+    assert "parsed['applied'] = False" in block
+
+
+def test_v91_build_chat_context_no_pii():
+    """_build_ai_chat_context-Body (ohne Docstring) enthält keine PII-Felder."""
+    import app as _app, re
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def _build_ai_chat_context(')
+    block = src[fn_idx:fn_idx+3500]
+    # Docstring entfernen für reinen Code-Check
+    code_only = re.sub(r'""".*?"""', '', block, count=1, flags=re.DOTALL)
+    # Defensiv: PII-Felder dürfen nicht IM CODE als Field-Key oder Variable stehen
+    assert "'steuer_id'" not in code_only.lower()
+    assert "'personalnummer'" not in code_only.lower()
+    assert "'sozialversicherung'" not in code_only.lower()
+    assert "'name'" not in code_only.lower(), 'name-Field sollte nicht in Context exposed werden'
+
+
+def test_v91_build_chat_context_has_required_fields():
+    """Context enthält tax_year, current_total, review_groups, allowed_actions."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def _build_ai_chat_context(')
+    block = src[fn_idx:fn_idx+3500]
+    for f in ['tax_year', 'current_total', 'review_groups', 'pending_review_items',
+              'allowed_actions', 'pdf_status']:
+        assert "'" + f + "'" in block, f'Context-Field fehlt: {f}'
+
+
+def test_v91_system_prompt_forbids_marketing_and_tabellen():
+    """System-Prompt verbietet Marketing-Floskeln + Markdown-Tabellen."""
+    import app as _app
+    src = open(_app.__file__).read()
+    assert '_AI_SYSTEM_PROMPT' in src
+    fn_idx = src.find('_AI_SYSTEM_PROMPT = """')
+    block = src[fn_idx:fn_idx+5000]
+    for phrase in ['mehr rausholen', 'Netto in WISO', 'Finanzamt akzeptiert', 'Markdown-Tabellen']:
+        assert phrase in block, f'Verbots-Hinweis im Prompt fehlt: {phrase}'
+
+
+def test_v91_system_prompt_has_marker_glossary():
+    """System-Prompt enthält Marker-Glossar (D4/EK/SM/EH/EM)."""
+    import app as _app
+    src = open(_app.__file__).read()
+    fn_idx = src.find('_AI_SYSTEM_PROMPT = """')
+    block = src[fn_idx:fn_idx+5000]
+    for m in ['D4 = Schulung', 'EK = Bürodienst', 'EM = Emergency', 'EH = Erste-Hilfe', 'SM = Seminar']:
+        assert m in block, f'Marker-Glossar fehlt: {m}'
+
+
+def test_v91_frontend_uses_ai_chat_endpoint():
+    """_handleReviewFreeText ruft /ai-chat statt /review-interpret."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _handleReviewFreeText(txt)')
+    block = src[fn_idx:fn_idx+5000]
+    assert "/ai-chat" in block, 'Frontend muss /ai-chat aufrufen'
+    # Legacy-Fallback existiert
+    assert '_handleReviewFreeText_legacy' in src
+
+
+def test_v91_frontend_renders_message_to_user():
+    """Frontend zeigt message_to_user aus AI-Response."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _handleReviewFreeText(txt)')
+    block = src[fn_idx:fn_idx+5000]
+    assert 'j.message_to_user' in block
+
+
+def test_v91_no_freitext_interpretation_nicht_verfügbar():
+    """User darf NIE „Freitext-Interpretation ist gerade nicht verfügbar" sehen."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'Freitext-Interpretation ist gerade nicht verfügbar' not in src
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

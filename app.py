@@ -1805,6 +1805,313 @@ def get_review_groups(job_id):
     return jsonify({'groups': groups, 'total_pending': sum(g['count'] for g in groups)})
 
 
+def _build_ai_chat_context(job, session_data=None):
+    """v9.1: Sicheren, vollständigen Job-Kontext für KI-Interpreter.
+    Keine PII, keine Steuer-ID, kein Personalnummer.
+    """
+    data = (job.get('data') or {}) if job else {}
+    review_items = data.get('_review_items') or []
+    pending = [it for it in review_items if it.get('status') == 'pending']
+    answered = [it for it in review_items if it.get('status') == 'answered']
+    groups = _build_review_groups(review_items) if review_items else []
+
+    # Compact group summary for AI
+    group_summary = []
+    for g in groups:
+        group_summary.append({
+            'group_id':       g.get('group_id'),
+            'label':          g.get('label'),
+            'date_range':     g.get('date_range'),
+            'count':          g.get('count'),
+            'item_ids':       g.get('item_ids', []),
+            'datums':         g.get('datums', []),
+            'marker_summary': g.get('marker_summary'),
+            'group_type':     g.get('group_type'),
+        })
+
+    return {
+        'tax_year':        data.get('year'),
+        'airline':         data.get('arbeitgeber', 'Lufthansa'),
+        'current_total':   float(data.get('netto') or 0),
+        'brutto':          float(data.get('brutto') or 0),
+        'lohnsteuer':      float(data.get('lohnsteuer') or 0),
+        'fahr':            float(data.get('fahr') or 0),
+        'fahr_tage':       int(data.get('fahr_tage') or 0),
+        'reinig':          float(data.get('reinig') or 0),
+        'reinigungstage':  int(data.get('reinigungstage') or data.get('arbeitstage') or 0),
+        'trink':           float(data.get('trink') or 0),
+        'hotel_naechte':   int(data.get('hotel_naechte') or 0),
+        'z17':             float(data.get('ag_z17') or 0),
+        'z77':             float(data.get('z77') or 0),
+        'vma_72_tage':     int(data.get('vma_72_tage') or 0),
+        'vma_73_tage':     int(data.get('vma_73_tage') or 0),
+        'vma_74_tage':     int(data.get('vma_74_tage') or 0),
+        'vma_aus':         float(data.get('vma_aus') or 0),
+        'open_review_count':     len(pending),
+        'answered_review_count': len(answered),
+        'review_groups':         group_summary,
+        'pending_review_items':  [{
+            'id': it['id'],
+            'datum': it.get('datum'),
+            'marker': it.get('marker', ''),
+            'type': it.get('type'),
+        } for it in pending[:50]],  # cap at 50 to keep prompt small
+        'pdf_status':            'pending_reread' if job.get('pending_reread') else (
+                                  'ready' if data.get('pdf_finalized') else 'open'),
+        'has_review_items':      bool(pending),
+        'allowed_actions': [
+            'review_answer', 'bulk_review', 'clarification',
+            'document_upload', 'wiso_help', 'pdf_help',
+            'rechenweg_help', 'zugangscode_help',
+        ],
+    }
+
+
+_AI_SYSTEM_PROMPT = """Du bist der AeroTAX-Auswertungs-Assistent.
+
+Du hilfst Lufthansa-Crew-Mitgliedern bei ihrer Werbungskosten-Auswertung — nur in diesem
+Kontext. Du bist KEINE Steuerberatung.
+
+Du bekommst:
+- den vollständigen Job-Kontext (Beträge, offene Tage, Gruppen, Marker)
+- die bisherigen letzten Chat-Turns
+- die neue Nutzer-Nachricht
+
+Marker-Glossar (Lufthansa Crew):
+- D4 = Schulung
+- EK = Bürodienst
+- SM = Seminar
+- EH = Erste-Hilfe-Schulung
+- EM = Emergency-Training
+- SIM = Simulator
+Wenn der User „em", „eh", „d4" usw. schreibt → das sind die Marker, NICHT nachfragen.
+
+Deine Aufgaben:
+1. Nutzer-Absicht verstehen (auch chaotische Eingaben).
+2. Antworten auf offene Tage interpretieren — Bulk, Datum, Gruppe, Marker, Monat.
+3. Nur Tatsachen-Fragen stellen: „Warst du inkl. Hin- und Rückweg länger als 8 Stunden weg?"
+4. Bei Bulk/komplexen Eingaben Zusammenfassung zeigen + Bestätigung anfordern.
+5. WISO-/PDF-/Rechenweg-/Zugangscode-Fragen kurz beantworten.
+6. Off-topic höflich blockieren.
+7. NIEMALS Beträge selbst berechnen. Backend macht das.
+8. NIEMALS steuerliche Garantien, Marketing, „mehr rausholen", „Netto in WISO", „Finanzamt akzeptiert".
+9. Keine Markdown-Tabellen, keine Trennlinien (---), keine `**Header**`, keine emoji-bullet-lists.
+
+ANTWORT-FORMAT (ZWINGEND):
+Antworte AUSSCHLIESSLICH mit einem JSON-Objekt — kein Text davor oder danach.
+Schema:
+{
+  "intent": "review_answer" | "bulk_review" | "clarification" | "question_answer" | "document_upload" | "pdf_action" | "off_topic",
+  "message_to_user": "max 4 kurze Sätze, freundlich, deutsch",
+  "needs_confirmation": true | false,
+  "proposed_changes": [
+    { "review_item_id": "<exakter id-string aus pending_review_items>",
+      "answer": "yes" | "no" | "unsure",
+      "reason": "kurz" }
+  ],
+  "clarification_question": null | "wenn intent=clarification: konkrete Frage",
+  "next_action": "ask_confirmation" | "ask_clarification" | "answer_only" | "show_upload" | "block",
+  "referenced_groups": ["g1", "g2"]  // Group-IDs auf die sich der User bezieht
+}
+
+REGELN:
+- intent='bulk_review' → needs_confirmation MUSS true sein.
+- proposed_changes nur mit review_item_ids aus pending_review_items.
+- answer nur 'yes' | 'no' | 'unsure'.
+- Bei klarer Bulk-Absicht („alle über 8h"): proposed_changes für ALLE pending_review_items.
+- Bei „alle außer X" / „rest 0": proposed_changes für ALLE OUTSIDE der Exception.
+- Bei „April ja, September nein": jedes Pending im April → yes, jedes Pending im September → no.
+- Bei reiner Frage („wo finde ich..."): intent='question_answer', proposed_changes=[], next_action='answer_only'.
+- Bei off-topic („wer ist Britney"): intent='off_topic', message_to_user=Standard-Block-Antwort.
+- Bei Upload-Wunsch („ich lade plan hoch"): intent='document_upload', next_action='show_upload'.
+- Bei Unklarheit: intent='clarification', clarification_question gesetzt, proposed_changes=[].
+"""
+
+
+@app.route('/api/job/<job_id>/ai-chat', methods=['POST'])
+def post_ai_chat(job_id):
+    """v9.1: KI-Interpreter mit vollem Job-Kontext + strukturiertes JSON.
+
+    Body: {message, chat_history?: [{role, content}, ...]}
+    Returns: AI-Response-JSON (siehe Schema im System-Prompt) +
+             confirmation_id + estimated_delta wenn proposed_changes.
+    Fallback bei Sonnet-Fehler: deterministischer Regex-Parser (v8.26).
+    """
+    import json as _json
+    import re as _re
+    import hashlib
+
+    body = request.get_json(silent=True) or {}
+    user_msg = (body.get('message') or '').strip()[:2000]
+    if not user_msg:
+        return jsonify({'error': 'message erforderlich'}), 400
+
+    # Off-Topic-Schnell-Filter (kein KI-Call nötig)
+    if _is_off_topic_question(user_msg):
+        return jsonify({
+            'intent': 'off_topic',
+            'message_to_user': 'Ich kann dir hier nur bei deiner AeroTAX-Auswertung helfen — '
+                                'also bei Unterlagen, offenen Punkten, PDF und der Übernahme in WISO.',
+            'needs_confirmation': False,
+            'proposed_changes': [],
+            'next_action': 'block',
+            'referenced_groups': [],
+        })
+
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'Auswertung nicht gefunden — bitte Seite neu laden.'}), 404
+        review_items = (j.get('data') or {}).get('_review_items') or []
+        items_by_id = {it['id']: it for it in review_items}
+        cached = (j.get('data') or {}).get('_cached_recalc_state') or {}
+        existing_overrides = dict(j.get('manual_day_overrides') or {})
+        initial_total = float((j.get('data') or {}).get('netto') or 0)
+        ctx = _build_ai_chat_context(j)
+
+    chat_history = (body.get('chat_history') or [])[-8:]  # last 8 turns max
+    history_block = '\n'.join(
+        f"{('User' if m.get('role')=='user' else 'AeroTAX')}: {(m.get('content') or '')[:300]}"
+        for m in chat_history if isinstance(m, dict)
+    )
+
+    # Build user-prompt with context
+    pending_list_text = '\n'.join(
+        f"  - id={it['id']} | datum={it['datum']} | marker={it['marker']}"
+        for it in (ctx.get('pending_review_items') or [])
+    )
+    groups_text = '\n'.join(
+        f"  - {g['group_id']}: {g['date_range']} ({g['label']}, {g['count']} Tage)"
+        for g in (ctx.get('review_groups') or [])
+    )
+
+    user_prompt = f"""=== JOB-KONTEXT ===
+Steuerjahr: {ctx.get('tax_year')}
+Aktueller vorläufiger Betrag: {ctx.get('current_total'):.2f} €
+Offene Review-Tage: {ctx.get('open_review_count')}
+Bereits beantwortet: {ctx.get('answered_review_count')}
+PDF-Status: {ctx.get('pdf_status')}
+
+=== AKTIVE GRUPPEN ===
+{groups_text or '(keine)'}
+
+=== PENDING REVIEW-ITEMS (id, datum, marker) ===
+{pending_list_text or '(keine)'}
+
+=== BISHERIGER CHAT (max 8 letzte) ===
+{history_block or '(erste Nachricht)'}
+
+=== NEUE NUTZER-NACHRICHT ===
+{user_msg}
+
+Antworte JETZT mit dem strukturierten JSON-Objekt."""
+
+    parsed = None
+    ai_used = True
+    if ANTHROPIC_KEY:
+        try:
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=60.0)
+            resp = client.messages.create(
+                model='claude-sonnet-4-6', max_tokens=1500,
+                system=_AI_SYSTEM_PROMPT,
+                messages=[{'role': 'user', 'content': user_prompt}],
+            )
+            text_out = resp.content[0].text.strip()
+            # JSON extrahieren
+            m = _re.search(r'\{[\s\S]*\}', text_out)
+            if m:
+                parsed = _json.loads(m.group(0))
+        except Exception as e:
+            print(f'[ai-chat] Sonnet fail: {e}')
+            ai_used = False
+    else:
+        ai_used = False
+
+    if parsed is None:
+        # Fallback: deterministischer Parser
+        groups = _build_review_groups(review_items)
+        fallback = _interpret_review_text(user_msg, groups, items_by_id)
+        if fallback.get('proposed_changes'):
+            parsed = {
+                'intent': fallback.get('intent', 'review_answer'),
+                'message_to_user': (fallback.get('summary_header') or 'Ich habe verstanden:')
+                    + ('\n' + '\n'.join(fallback.get('summary_lines') or []) if fallback.get('summary_lines') else ''),
+                'needs_confirmation': True,
+                'proposed_changes': fallback['proposed_changes'],
+                'clarification_question': None,
+                'next_action': 'ask_confirmation',
+                'referenced_groups': [],
+            }
+        elif fallback.get('clarification'):
+            parsed = {
+                'intent': 'clarification',
+                'message_to_user': fallback['clarification'],
+                'needs_confirmation': False,
+                'proposed_changes': [],
+                'clarification_question': fallback['clarification'],
+                'next_action': 'ask_clarification',
+                'referenced_groups': [],
+            }
+        else:
+            parsed = {
+                'intent': 'clarification',
+                'message_to_user': 'Ich konnte das gerade nicht sicher zuordnen. Magst du es kurz anders schreiben — z.B. „April ja, September nein" oder „alle über 8h"?',
+                'needs_confirmation': False,
+                'proposed_changes': [],
+                'clarification_question': 'Magst du es kurz anders schreiben?',
+                'next_action': 'ask_clarification',
+                'referenced_groups': [],
+            }
+
+    # Validate
+    sanitized_changes = []
+    for ch in (parsed.get('proposed_changes') or []):
+        if not isinstance(ch, dict): continue
+        iid = ch.get('review_item_id')
+        ans = ch.get('answer')
+        if iid not in items_by_id: continue  # AI darf keine fremden IDs
+        if items_by_id[iid].get('status') != 'pending': continue
+        if ans not in ('yes', 'no', 'unsure'): continue
+        if any(c['review_item_id'] == iid for c in sanitized_changes): continue
+        sanitized_changes.append({'review_item_id': iid, 'answer': ans})
+    parsed['proposed_changes'] = sanitized_changes
+
+    # Bulk MUSS confirmation_required
+    if len(sanitized_changes) >= 2:
+        parsed['needs_confirmation'] = True
+
+    # estimated_delta + confirmation_id
+    estimated_delta = None
+    if sanitized_changes and cached.get('matched_days'):
+        try:
+            preview_overrides = dict(existing_overrides)
+            for ch in sanitized_changes:
+                it = items_by_id.get(ch['review_item_id'])
+                if not it: continue
+                d = it.get('datum')
+                if not d: continue
+                if ch['answer'] == 'yes':
+                    preview_overrides[d] = {'over_8h': True, 'source': 'user_ai_interpreted_text'}
+                elif ch['answer'] == 'no':
+                    preview_overrides[d] = {'over_8h': False, 'source': 'user_ai_interpreted_text'}
+                else:
+                    preview_overrides[d] = {'unsure': True, 'source': 'user_ai_interpreted_text'}
+            rec = _recompute_with_overrides(cached, preview_overrides)
+            if rec and rec.get('totals'):
+                new_total = float(rec['totals'].get('netto') or 0)
+                estimated_delta = round(new_total - initial_total, 2)
+        except Exception as e:
+            print(f'[ai-chat] preview fail: {e}')
+
+    cid_src = f"{job_id}|{user_msg}|{sorted([(c['review_item_id'], c['answer']) for c in sanitized_changes])}"
+    parsed['confirmation_id'] = hashlib.sha256(cid_src.encode('utf-8')).hexdigest()[:16]
+    parsed['estimated_delta'] = estimated_delta
+    parsed['ai_used'] = ai_used
+    parsed['applied'] = False
+
+    return jsonify(parsed)
+
+
 @app.route('/api/job/<job_id>/review-interpret', methods=['POST'])
 def post_review_interpret(job_id):
     """v8.26: Interpretiert Freitext-Antwort und liefert proposed_changes — OHNE anzuwenden.
