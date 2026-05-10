@@ -6545,17 +6545,20 @@ def test_v833_frontend_chat_send_passes_kind():
 
 
 def test_v833_frontend_short_msgs_allowed_in_review():
-    """Frontend zeigt KEIN „Magst du ausführlicher" mehr im Review-Kontext."""
+    """v9.8.1: Frontend hat KEIN „Magst du ausführlicher fragen?"-Wording mehr.
+    Stattdessen: „Schreib mir gern in einem Satz mehr"."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+18000]
-    short_idx = block.find('Magst du das etwas ausführlicher fragen?')
-    assert short_idx > 0
-    pre = block[max(0, short_idx-400):short_idx]
-    assert '!isReviewCtx' in pre or 'isReviewCtx' in pre, \
-        'Frontend muss „Magst du ausführlicher" nur außerhalb Review-Kontext zeigen'
+    # User-facing renderMsg darf das alte Wording nicht enthalten
+    import re
+    user_facing = re.findall(
+        r"renderMsg\(['\"]assistant['\"],\s*['\"]([^'\"]*Magst du das etwas ausführlicher[^'\"]*)['\"]",
+        src
+    )
+    assert not user_facing, f'„Magst du ausführlicher" noch user-facing: {user_facing}'
+    # Stattdessen sollte „Schreib mir" oder ähnliche kurze Hilfe-Nachricht da sein
+    assert 'Schreib mir gern' in src or 'Du kannst auch' in src
 
 
 def test_v833_blocked_message_says_review_continues():
