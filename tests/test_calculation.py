@@ -2596,6 +2596,76 @@ def test_v814_short_training_seq_counts_each():
     assert result['fahr_tage'] == 3
 
 
+def test_v815_4_day_training_still_counts_each():
+    """v8.15: 4-Tages-Training-Sequenz (zwischen 'kurz' und 'Block') zählt jeden Tag.
+    Schwelle für Block-Erkennung ist jetzt ≥5 Tage."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-04-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True}
+        for d in (8, 9, 10, 11)  # 4 Tage
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 4, \
+        f"4-Tages-Training (zwischen kurz und Block) sollte 4 Fahrtage haben, ist {result['fahr_tage']}"
+
+
+def test_v815_5_day_training_block_pattern():
+    """5-Tages-Training-Sequenz ohne explicit_daily_commute → nur Tag 1."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True}
+        for d in range(4, 9)  # 5 Tage
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 1
+
+
+def test_v815_same_day_prev_overnight_with_foreign_se_z76():
+    """Same-Day mit prev_overnight=True + aktive Auslands-SE → Z76 (Sonnet-Lesefehler).
+    Live-Bug aus job 02a91984: 22.04 TLV und 21.06 REK landeten als Issue."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-21', 'activity_type': 'frei', 'overnight_after_day': True},
+        # Sonnet hat overnight=True am Vortag falsch gesetzt
+        {'datum': '2025-04-22', 'activity_type': 'same_day', 'overnight_after_day': False,
+         'has_fl': False, 'start_time': '08:22', 'end_time': '18:35'},
+    ]}
+    se = {'se_lines': [
+        # Auslands-SE-Stempel TLV
+        {'datum': '2025-04-22', 'stfrei_betrag': 44, 'stfrei_ort': 'TLV',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail = next(t for t in result['tage_detail'] if t['datum'] == '2025-04-22')
+    assert detail['klass'] == 'Z76', \
+        f"Same-Day TLV mit prev_overnight + Auslands-SE sollte Z76, ist {detail['klass']}"
+    # vma_unmapped_se sollte 0 sein (TLV ist jetzt klassifiziert)
+    assert not any(v['datum'] == '2025-04-22' for v in result['vma_unmapped_se'])
+
+
+def test_v815_same_day_prev_overnight_without_foreign_se_stays_issue():
+    """Same-Day mit prev_overnight ohne Auslands-SE → bleibt Issue (Mischfall).
+    Nur das Auslands-SE-Pattern wird zu Z76 reklassifiziert."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-21', 'activity_type': 'tour', 'overnight_after_day': True,
+         'layover_ort': 'MUC'},
+        {'datum': '2025-04-22', 'activity_type': 'same_day', 'overnight_after_day': False,
+         'has_fl': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail = next(t for t in result['tage_detail'] if t['datum'] == '2025-04-22')
+    assert detail['klass'] == 'Issue'
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

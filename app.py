@@ -6859,9 +6859,23 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 reason = 'Same-Day verletzt Hard-Gate (FL oder overnight)'
                 unresolved_reason = f'same_day mit has_fl={has_fl} overnight={overnight}'
             elif prev_overnight:
-                klass = 'Issue'
-                reason = 'Heimkehr aus Vortag-Tour — separater Tour-Abschluss'
-                unresolved_reason = 'same_day nach prev_overnight (Mischfall)'
+                # v8.15: Same-Day mit prev_overnight + aktive Auslands-SE → Z76
+                # (Sonnet-Stochastik: Vortag wird mal als overnight=True, mal als
+                # False gelesen. Aktive Auslands-SE-Zeile am Same-Day-Tag ist
+                # eindeutig Auslandstrip → Z76 BMF-Pauschale).
+                if (se.get('count', 0) > 0 and se.get('stfrei_inland') is False
+                        and se.get('stfrei_ort')):
+                    se_ort_v15 = se.get('stfrei_ort', '')
+                    bmf_aus_v15 = _bmf(se_ort_v15)
+                    eur_added = float((bmf_aus_v15.get('an_abreise', 0) if bmf_aus_v15 else 28.0) or 0)
+                    klass = 'Z76'
+                    reason = f'Same-Day Auslandstrip {se_ort_v15} (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)'
+                    audit_note = f'{datum}: Same-Day mit Auslands-SE {se_ort_v15} trotz prev_overnight → Z76'
+                    print(f"[v8-z76-detail] datum={datum} ort={se_ort_v15} reason='Same-Day Auslandstrip prev_overnight'")
+                else:
+                    klass = 'Issue'
+                    reason = 'Heimkehr aus Vortag-Tour — separater Tour-Abschluss'
+                    unresolved_reason = 'same_day nach prev_overnight (Mischfall)'
             elif in_cluster and cluster_today and cluster_today.get('has_foreign'):
                 # Same-Day in Auslands-Cluster: Anreise-Tag der Auslandstour
                 klass = 'Z76'
@@ -7343,7 +7357,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             if seq_start is None:
                 seq_start = idx
         else:
-            if seq_start is not None and (idx - seq_start) >= 4:
+            if seq_start is not None and (idx - seq_start) >= 5:
                 # Prüfe explicit_daily_commute innerhalb der Sequenz
                 seq_days = sorted_days[seq_start:idx]
                 any_daily = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days)
@@ -7357,7 +7371,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                         'days':  idx - seq_start,
                     })
             seq_start = None
-    if seq_start is not None and (len(sorted_days) - seq_start) >= 4:
+    if seq_start is not None and (len(sorted_days) - seq_start) >= 5:
         seq_days = sorted_days[seq_start:]
         any_daily = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days)
         if not any_daily:
@@ -7641,7 +7655,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             if seq_start is None:
                 seq_start = i
         else:
-            if seq_start is not None and (i - seq_start) >= 4:
+            if seq_start is not None and (i - seq_start) >= 5:
                 training_commute_candidates.append({
                     'start_datum': sorted_days[seq_start]['datum'],
                     'end_datum':   sorted_days[i-1]['datum'],
@@ -7649,7 +7663,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'reason': f'Mehrtägige Training-Sequenz {sorted_days[seq_start]["datum"]} bis {sorted_days[i-1]["datum"]} — evtl. nur 1-2 Fahrtage statt jeden Tag'
                 })
             seq_start = None
-    if seq_start is not None and (len(sorted_days) - seq_start) >= 4:
+    if seq_start is not None and (len(sorted_days) - seq_start) >= 5:
         training_commute_candidates.append({
             'start_datum': sorted_days[seq_start]['datum'],
             'end_datum':   sorted_days[-1]['datum'],
