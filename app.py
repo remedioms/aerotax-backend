@@ -7580,13 +7580,17 @@ Tour-Mittel-Tage:
   • Keine Auslassung weil "war ja eh nur Layover"
 
 Kompaktheit-Regeln:
-  • raw_marker max 24 Zeichen
-  • notes nur wenn nötig (max 50 Zeichen, sonst weglassen)
-  • raw_lines nur bei Unsicherheit oder Same-Day (sonst weglassen)
-  • duplicate-Felder vermeiden — ID-Verkürzung wo möglich
+  • raw_marker max 30 Zeichen
+  • notes max 60 Zeichen
+  • raw_lines nur bei Unsicherheit oder Same-Day
 
-Ziel: Output passt in 60k Tokens. Bei 365 Tagen mit kompakten Einträgen
-gut machbar. Vollständigkeit > Kompaktheit, aber unnötige Felder weg.
+Ziel: Output passt in 60k Tokens. Bei 365 Tagen mit kurzen Einträgen
+machbar. Vollständigkeit > Kompaktheit.
+
+WICHTIG: Auch wenn das Dokument nur einzelne Monate enthält oder
+unvollständig ist — extrahiere jeden erkennbaren Tag. Liefere lieber
+20 Tage als 0. Wenn das Dokument nicht lesbar ist, schreibe das in
+warnings und gib so viele Tage zurück wie möglich.
 
 LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
 
@@ -7680,8 +7684,17 @@ LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
                 d['layover_inland'] = _is_inland_code(lo) if lo else None
         print(f"[Sonnet-DP-Structured] {elapsed:.1f}s: {len(days)} Tage strukturiert "
               f"({sum(1 for d in days if d.get('overnight_after_day'))} mit Übernachtung)")
+        # v10.3: Warnungen verbatim loggen, nicht nur Count. Bei 0 Tagen zusätzlich
+        # raw_input-Snippet ausgeben, damit man sehen kann was Sonnet gesehen hat.
         if warnings:
-            print(f"[Sonnet-DP-Structured] {len(warnings)} Warnung(en)")
+            for _wi, _w in enumerate(warnings[:5]):
+                print(f"[Sonnet-DP-Structured] warn[{_wi}]: {str(_w)[:300]}")
+        if not days:
+            try:
+                _ti_snip = json.dumps(tool_input, ensure_ascii=False)[:600] if isinstance(tool_input, dict) else str(tool_input)[:600]
+                print(f"[Sonnet-DP-Structured] 0-Tage-Diagnostic tool_input={_ti_snip}")
+            except Exception:
+                pass
         return {'days': days, 'warnings': warnings}
     except Exception as e:
         print(f"[Sonnet-DP-Structured] fail: {type(e).__name__}: {str(e)[:200]}")
