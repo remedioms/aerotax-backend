@@ -7065,6 +7065,86 @@ def test_v840_fetch_with_timeout_has_retry():
     assert 'isNetworkErr' in block
 
 
+# ── v9.0 Multi-Segment-Parser + Short-Month + localStorage ──
+
+def test_v90_parser_multi_segment_with_semicolon():
+    """„em ja; sep nein; büro über 8" → 3 Segmente einzeln verstanden."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [
+        _make_pending_item('2025-04-24', 'EM ERSTE HILFE'),    # emergency
+        _make_pending_item('2025-09-04', 'SM SEMINAR'),        # seminar
+        _make_pending_item('2025-09-05', 'SM SEMINAR'),        # seminar
+        _make_pending_item('2025-11-24', 'EK BUERODIENST'),    # office
+    ]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('em ja; sep nein; büro über 8',
+                                 groups, {it['id']: it for it in items})
+    assert res['proposed_changes'], 'Multi-Segment muss proposed_changes liefern'
+    by_id = {c['review_item_id']: c['answer'] for c in res['proposed_changes']}
+    # EM (April-24) → yes
+    em_items = [v for k, v in by_id.items() if '2025-04-24' in k]
+    assert em_items and all(v == 'yes' for v in em_items), 'EM April → yes'
+    # September → no
+    sep_items = [v for k, v in by_id.items() if '2025-09' in k]
+    assert sep_items and all(v == 'no' for v in sep_items), 'September → no'
+    # Büro (November-24) → yes
+    nov_items = [v for k, v in by_id.items() if '2025-11-24' in k]
+    assert nov_items and all(v == 'yes' for v in nov_items), 'Büro → yes'
+
+
+def test_v90_parser_short_month_sep():
+    """„Sep 0h" (kurzer Monatsname + 0h) → September no."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [
+        _make_pending_item('2025-09-04', 'SM'),
+        _make_pending_item('2025-04-08', 'EK'),
+    ]
+    groups = _build_review_groups(items)
+    res = _interpret_review_text('sep 0h', groups, {it['id']: it for it in items})
+    by_id = {c['review_item_id']: c['answer'] for c in res['proposed_changes']}
+    sep_items = [v for k, v in by_id.items() if '2025-09' in k]
+    assert sep_items and all(v == 'no' for v in sep_items)
+
+
+def test_v90_parser_kein_split_wenn_keine_keywords():
+    """Bei normalem Text ohne mehrere Family-Keywords NICHT splitten."""
+    from app import _interpret_review_text, _build_review_groups
+    items = [_make_pending_item('2025-04-08', 'D4')]
+    groups = _build_review_groups(items)
+    # „ja, das war so" sollte NICHT als 2 Segmente verstanden werden
+    res = _interpret_review_text('ja, das war so', groups, {it['id']: it for it in items})
+    # Kein Multi-Split: entweder bulk_all (wenn ja matched) oder clarify
+    assert res['intent'] != 'multi_segment'
+
+
+def test_v90_localstorage_persistenz_helper_exists():
+    """window._persistChatConv exists + speichert in localStorage."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'window._persistChatConv = function' in src
+    assert "localStorage.setItem(key, JSON.stringify" in src
+    assert 'aerotax_chatconv_' in src
+
+
+def test_v90_localstorage_24h_expiry():
+    """Beim Reload nur akzeptieren wenn _savedAt < 24h."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert "Date.now() - parsed._savedAt) < 24*3600*1000" in src
+
+
+def test_v90_apply_persists_state():
+    """Nach Apply wird _persistChatConv() aufgerufen."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _applyPendingProposal')
+    block = src[fn_idx:fn_idx+5000]
+    assert 'window._persistChatConv()' in block
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

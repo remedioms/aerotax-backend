@@ -11218,23 +11218,49 @@ def _format_singletons_range(items):
 
 # ── v8.26: Natural-Language-Parser für Review-Antworten ──
 
-def _interpret_review_text(message, groups, items_by_id):
+def _interpret_review_text(message, groups, items_by_id, _depth=0):
     """Interpretiert Freitext-Antworten in proposed_changes ohne sie anzuwenden.
+
+    v9.0: Multi-Segment-Parser. Wenn Message durch `;` oder klare „Family + Antwort"-
+    Segmente getrennt ist, splittet er und merged die Resultate.
 
     Returns:
         {
-          'intent': 'bulk_all'|'group_answer'|'date_specific'|'mixed'|'clarify'|'out_of_scope',
-          'proposed_changes': [{'review_item_id': str, 'answer': 'yes'|'no'|'unsure'}],
-          'confirmation_required': True,
-          'summary_lines': [str],
-          'clarification': str|None,
+          'intent': str, 'proposed_changes': [...], 'confirmation_required': True,
+          'summary_lines': [...], 'clarification': str|None,
+          'last_bot_question': {kind, context}|None,  # v9.0 für Frontend-State-Machine
         }
     """
     import re as _re
     msg = (message or '').strip().lower()
     if not msg:
         return {'intent':'clarify', 'proposed_changes':[], 'confirmation_required':True,
-                'summary_lines':[], 'clarification':'Bitte schreib mir kurz, wie du antworten möchtest.'}
+                'summary_lines':[], 'clarification':'Bitte schreib mir kurz, wie du antworten möchtest.',
+                'last_bot_question': None}
+
+    # v9.0: Multi-Segment-Splitter — Eingaben mit ; oder mehrere getrennte Familie-Antwort-Pairs
+    # „em ging 9-17:30; Sep 0h; Büro über 8" → 3 Segmente, jedes einzeln interpretieren
+    if _depth == 0 and (';' in msg or msg.count(',') >= 2):
+        segments = [s.strip() for s in _re.split(r';', msg) if s.strip()]
+        # Wenn nur 1 Segment, weiter zu kommas — aber NUR splitten wenn jedes Sub-Segment einen
+        # eindeutigen Family/Monats/Datums-Marker UND Antwort enthält
+        if len(segments) == 1:
+            cands = [s.strip() for s in _re.split(r',\s*(?=[a-zäöü]{3})', msg) if s.strip()]
+            # Nur splitten wenn ≥2 Sub-Segmente jeweils ein klares Family/Monats-Schlüsselwort haben
+            FAM_RE = _re.compile(r'\b(d4|ek|sm|eh|em|seminar|schulung|bürodienst|buerodienst|büro|buero|office|emergency|jan|feb|m[aä]r|apr|mai|jun|jul|aug|sep|okt|nov|dez|januar|februar|m[aä]rz|april|juni|juli|august|september|oktober|november|dezember)\b')
+            recognised = sum(1 for s in cands if FAM_RE.search(s))
+            if recognised >= 2:
+                segments = cands
+        if len(segments) >= 2:
+            all_changes = []
+            for seg in segments:
+                sub = _interpret_review_text(seg, groups, items_by_id, _depth=_depth+1)
+                for c in (sub.get('proposed_changes') or []):
+                    if not any(x['review_item_id']==c['review_item_id'] for x in all_changes):
+                        all_changes.append(c)
+            if all_changes:
+                return _build_proposed('multi_segment', all_changes, items_by_id,
+                                        summary='Mehrere Antworten zusammengeführt')
 
     all_pending_ids = []
     for g in groups:
@@ -11402,23 +11428,29 @@ def _interpret_review_text(message, groups, items_by_id):
         'seminar':  ['seminar','sm'],
         'emergency':['emergency','erste hilfe','erste-hilfe','eh','em'],
     }
+    # v9.0: Auch kurze Monatsnamen (Sep/Jan/...) + 0/0h/null als no-Äquivalent
     label_segs = _re.findall(
         r'(januar|februar|m[aä]rz|april|mai|juni|juli|august|september|oktober|november|dezember|'
+        r'\bjan|\bfeb|\bm[aä]r|\bapr|\bjun|\bjul|\baug|\bsep|\bokt|\bnov|\bdez|'
         r'schulung|training|d4|bürodienst|buerodienst|büro|buero|office|ek|seminar|sm|'
         r'emergency|erste\s*hilfe|erste-hilfe|eh|em)\s*(?:waren|war|wurde|sind|ist)?\s*'
-        r'(ja|nein|unsicher|weiß\s*nicht|über\s*8|unter\s*8)',
+        r'(ja|nein|unsicher|weiß\s*nicht|weiss\s*nicht|über\s*8|über\s*acht|unter\s*8|unter\s*acht|0\s*h?\b|null)',
         msg
     )
+    short_month_map = {
+        'jan':1, 'feb':2, 'mär':3, 'maer':3, 'mar':3, 'apr':4, 'mai':5, 'jun':6,
+        'jul':7, 'aug':8, 'sep':9, 'okt':10, 'nov':11, 'dez':12,
+    }
     for kw, ans_raw in label_segs:
         kw = kw.lower().strip()
         if 'unsicher' in ans_raw or 'weiß' in ans_raw or 'weiss' in ans_raw:
             ans = 'unsure'
-        elif 'nein' in ans_raw or 'unter' in ans_raw:
+        elif 'nein' in ans_raw or 'unter' in ans_raw or '0' in ans_raw or 'null' in ans_raw:
             ans = 'no'
         else:
             ans = 'yes'
-        # Monat?
-        target_month = month_map.get(kw)
+        # Monat? (lang oder kurz)
+        target_month = month_map.get(kw) or short_month_map.get(kw[:3])
         target_fam = None
         if not target_month:
             for fam, kws in fam_keywords.items():
