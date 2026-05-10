@@ -6363,6 +6363,64 @@ def test_v829_abort_error_message_human_readable():
     assert 'Server hat zu lange gebraucht' in src or 'Timeout' in src
 
 
+# ── v8.30: Defensive Wrapper + State-Reset ──
+
+def test_v830_chat_send_has_outer_try_catch_wrapper():
+    """_chatSend ist defensiv mit try/catch gewrappt — silent failures unmöglich."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatSend = async function')
+    block = src[fn_idx:fn_idx+1500]
+    assert 'try {' in block and 'catch(e)' in block, 'Outer wrapper fehlt'
+    assert '_chatSendImpl' in block, 'Inner Impl-Funktion fehlt'
+    assert 'console.error' in block, 'Error-Logging fehlt für Diagnostik'
+
+
+def test_v830_chat_send_impl_function_exists():
+    """_chatSendImpl ist als separate Funktion implementiert, kann gewrappt werden."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'async function _chatSendImpl(' in src
+
+
+def test_v830_chat_open_resets_state():
+    """_chatOpen resettet review-mode/pending-proposal/attached-file von voriger Session."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatOpen = async function')
+    block = src[fn_idx:fn_idx+2500]
+    assert 'window._chatReviewMode = false' in block, 'Review-Mode-Reset fehlt'
+    assert 'window._chatPendingProposal = null' in block, 'Pending-Proposal-Reset fehlt'
+    assert 'window._chatAttachedFile = null' in block, 'Attached-File-Reset fehlt'
+
+
+def test_v830_review_groups_uses_timeout():
+    """/review-groups call uses timeout — sonst hängt der Greeting-Flow."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    idx = src.find("/review-groups',")
+    if idx < 0:
+        idx = src.find("/review-groups'")
+    assert idx > 0
+    pre = src[max(0, idx-200):idx]
+    assert '_fetchWithTimeout' in pre, '/review-groups muss Timeout haben'
+
+
+def test_v830_input_field_missing_shows_warning():
+    """Wenn chat-input nicht im DOM, zeigt _chatSend sichtbare Warnung statt silent return."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _chatSendImpl')
+    block = src[fn_idx:fn_idx+600]
+    assert 'if(!ta)' in block
+    assert 'Eingabefeld nicht gefunden' in block
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
