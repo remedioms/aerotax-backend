@@ -2488,6 +2488,114 @@ def test_v813_inland_z73_still_counts_as_hotel():
     assert result['hotel_naechte'] == 1
 
 
+def test_v814_z73_flag_evening_foreign_tour_start():
+    """v8.14: classifier_result hat z73_type='evening_foreign_tour_start'
+    bei Z73-Abend-Anreise. Wording-resistent (nicht aus reason geparst)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-19', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': False, 'routing': ['FRA', 'GRU'], 'layover_ort': 'GRU',
+         'start_time': '21:25'},
+        {'datum': '2025-01-20', 'activity_type': 'tour', 'overnight_after_day': False},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-19', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail_19 = next(t for t in result['tage_detail'] if t['datum']=='2025-01-19')
+    cr = detail_19['classifier_result']
+    assert cr['klass'] == 'Z73'
+    assert cr['z73_type'] == 'evening_foreign_tour_start', \
+        f"z73_type-Flag fehlt oder falsch: {cr.get('z73_type')}"
+    assert cr['counted_as_hotel_nacht'] is False
+
+
+def test_v814_inland_z73_has_no_evening_flag():
+    """Echte Inland-Z73 (Inland-Layover ≠ Homebase) hat KEIN evening_foreign-
+    Flag — und zählt deshalb weiterhin als Hotel."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-03-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA', 'MUC'], 'layover_ort': 'MUC',
+         'start_time': '08:30'},
+        {'datum': '2025-03-05', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['MUC', 'FRA']},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-03-04', 'stfrei_betrag': 14, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+        {'datum': '2025-03-05', 'stfrei_betrag': 14, 'stfrei_ort': 'MUC', 'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    detail_04 = next(t for t in result['tage_detail'] if t['datum']=='2025-03-04')
+    cr = detail_04['classifier_result']
+    assert cr['klass'] == 'Z73'
+    assert cr['z73_type'] != 'evening_foreign_tour_start'
+    assert cr['counted_as_hotel_nacht'] is True
+
+
+def test_v814_training_explicit_daily_commute_counts_each_day():
+    """5-Tages-Training mit explicit_daily_commute=true an mind. einem Tag
+    → jeden Tag als Fahrtag zählen (User fährt täglich hin)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True,
+         'explicit_daily_commute': True}
+        for d in range(4, 9)  # 04-08.09 = 5 Tage
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 5, \
+        f"5-Tages-Training mit explicit_daily_commute=true sollte 5 Fahrtage haben, ist {result['fahr_tage']}"
+
+
+def test_v814_training_without_explicit_daily_only_first_fahrtag():
+    """5-Tages-Training ohne explicit_daily_commute → nur Tag 1 zählt (Block-Schulung)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True}
+        for d in range(4, 9)  # 04-08.09 = 5 Tage
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 1
+
+
+def test_v814_training_audit_note_present():
+    """Mehrtägige Schulungs-Sequenz erzeugt Audit-Note für Transparenz."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True}
+        for d in range(4, 13)  # 9 Tage
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    notes = result.get('audit_notes') or []
+    assert any('Mehrtägige Schulungs-/Seminarsequenz' in n for n in notes), \
+        f"Audit-Note für Mehrtages-Sequenz fehlt. notes={notes}"
+
+
+def test_v814_short_training_seq_counts_each():
+    """3-Tages-Training (<4) zählt jeden Tag (kein Block-Pattern)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-04-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True}
+        for d in (8, 9, 10)
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 3
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

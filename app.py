@@ -5350,6 +5350,7 @@ def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes=None, year=2025, homebase
                             'ends_at_homebase': {'type': 'boolean', 'description': 'true wenn Dienst/Routing am Homebase ENDET (Heimkehr, Same-Day-Ende, Office). false bei Layover-Tag/auswärtiger Übernachtung.'},
                             'is_workday': {'type': 'boolean', 'description': 'true bei tour/same_day/office/training/standby. false bei frei/urlaub/krank/LM-Nachgewährung/unknown ohne Dienstkontext.'},
                             'requires_commute': {'type': 'boolean', 'description': 'true NUR wenn der User HEUTE neu von zuhause zur Homebase fährt: Tourstart ab Homebase, Same-Day ab Homebase, Office/Training an Homebase. false bei Layover-Tag, Tourfortsetzung, Heimkehrtag ohne neue Anfahrt, Standby zuhause, frei/urlaub/krank.'},
+                            'explicit_daily_commute': {'type': 'boolean', 'description': 'NUR bei mehrtägigem Training/Seminar setzen: true wenn aus DP klar erkennbar ist dass User TÄGLICH von zuhause zur Schulung fährt (z.B. tägliche Briefingzeiten + Heimkehr). false oder weglassen bei Block-Schulung mit nur 1 Anfahrt.'},
                             'start_time': {'type': 'string', 'description': 'HH:MM Dienstbeginn (z.B. "06:30"), leer wenn nicht im DP'},
                             'end_time': {'type': 'string', 'description': 'HH:MM Dienstende (z.B. "18:45"), leer wenn nicht im DP'},
                             'duty_duration_minutes': {'type': 'integer', 'description': 'Dienstdauer in Minuten (start→end), nur setzen wenn beide Zeiten erkennbar sind. Bei Tour über Mitternacht: bis Mitternacht.'},
@@ -6767,6 +6768,13 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         reason = ''
         audit_note = None
         unresolved_reason = None
+        # v8.14: Z73-Untertyp explizit als Flag setzen (statt aus reason-String parsen).
+        # Mögliche Werte:
+        #   'evening_foreign_tour_start' — späte Auslandstour-Anreise, Tag in DE,
+        #                                   Flugnacht → keine Hotelnacht
+        #   'inland_layover'             — echter Inland-Layover/Hotel
+        #   ''                            — kein Z73 oder anderer Z73-Subtyp
+        z73_type = ''
 
         if at in ('frei', 'urlaub', 'krank'):
             klass = 'Frei'
@@ -6940,6 +6948,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
 
                 if evening_anreise:
                     klass = 'Z73'
+                    z73_type = 'evening_foreign_tour_start'
                     eur_added = INLAND_AN_ABREISE
                     reason = f'Auslandstour-Anreise mit Abend-Briefing {start_time_str} (>= 18:00) → Inland-Anreise 14€'
                     audit_note = f'{datum}: Auslandstour-Anreise nach {today_layover_ort}, Briefing {start_time_str} → Z73 Inland (Tag dominant in DE)'
@@ -6982,6 +6991,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
 
                     if evening_anreise_v12:
                         klass = 'Z73'
+                        z73_type = 'evening_foreign_tour_start'
                         eur_added = INLAND_AN_ABREISE
                         reason = f'Auslandstour-Anreise mit FRA-Stempel + Abend-Briefing {start_time_str_v12} → Inland 14€'
                         audit_note = f'{datum}: Homebase-SE-Stempel {today_layover_ort}, Briefing {start_time_str_v12} → Z73 Inland (Tag dominant in DE)'
@@ -7232,11 +7242,9 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         # Classifier-Priorität: SE-Ort vor DP-layover_ort
         classifier_effective_ort = se_effective_ort or dp_layover_ort_v
 
-        # v8.13: Z73-Abend-Anreise (cluster_foreign + Briefing >=18) zählt NICHT
-        # als Hotelnacht — User boardet abends in DE, schläft im Flugzeug, nicht im
-        # Hotel. Die "echten" Hotelnächte beginnen erst mit dem Layover am Folgetag.
-        # Generalisierte Erkennung über reason-Substring "Abend-Briefing" (vom v8.10/v8.12-Code gesetzt).
-        is_evening_anreise_z73 = klass == 'Z73' and 'Abend-Briefing' in reason
+        # v8.14: Hotel-Counter nutzt z73_type-Flag, nicht reason-Substring.
+        # Robust gegen wording-Änderung im reason.
+        is_evening_anreise_z73 = (klass == 'Z73' and z73_type == 'evening_foreign_tour_start')
         counted_hotel = (
             bool(d.get('overnight_after_day'))
             and klass in ('Z73', 'Z74', 'Z76')
@@ -7249,6 +7257,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'reason': reason,
             'bmf_land': bmf_land,
             'bmf_tagtyp': bmf_tagtyp,
+            'z73_type': z73_type,           # v8.14: explizites Subtyp-Flag
             'counted_as_workday': klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby') or (klass == 'ZeroDay' and dienstlich),
             'counted_as_fahrtag': bool(d.get('requires_commute')) and klass not in ('Frei', 'Issue', 'Standby'),
             'counted_as_hotel_nacht': counted_hotel,
@@ -7321,11 +7330,12 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
 
     # Fahrtage v8.3: ausschließlich dp.requires_commute (Sonnet oder Heuristik).
     # Kein automatischer Heimkehr-Fahrtag mehr.
-    # v8.13: Mehrtages-Training-Sequenz (≥4 Tage activity=training mit
-    # requires_commute) zählt nur den ERSTEN Tag als Fahrtag — User fährt
-    # einmal hin, das mehrtägige Seminar ist eine Veranstaltung, nicht
-    # täglich Hin-und-Zurück. Sequenz-Set wird vorm Loop berechnet.
-    training_seq_skip = set()  # Indices die nicht als Fahrtag zählen
+    # v8.13/v8.14: Mehrtages-Training-Sequenz (≥4 Tage activity=training mit
+    # requires_commute) zählt nur den ERSTEN Tag als Fahrtag, sofern nicht
+    # explicit_daily_commute=true gesetzt ist (User fährt täglich hin).
+    # Allgemeine Heuristik — KEINE datums-/tour-spezifischen Hardcodes.
+    training_seq_skip = set()
+    training_seq_audit = []  # für audit_notes
     seq_start = None
     for idx, m in enumerate(sorted_days):
         d = m['dp']
@@ -7334,13 +7344,38 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 seq_start = idx
         else:
             if seq_start is not None and (idx - seq_start) >= 4:
-                # Skippe alle außer dem ersten Tag der Sequenz
-                for skip_i in range(seq_start + 1, idx):
-                    training_seq_skip.add(skip_i)
+                # Prüfe explicit_daily_commute innerhalb der Sequenz
+                seq_days = sorted_days[seq_start:idx]
+                any_daily = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days)
+                if not any_daily:
+                    # Keine tägliche Heimfahrt-Indizien → nur Tag 1 als Fahrtag
+                    for skip_i in range(seq_start + 1, idx):
+                        training_seq_skip.add(skip_i)
+                    training_seq_audit.append({
+                        'start': sorted_days[seq_start]['datum'],
+                        'end':   sorted_days[idx-1]['datum'],
+                        'days':  idx - seq_start,
+                    })
             seq_start = None
     if seq_start is not None and (len(sorted_days) - seq_start) >= 4:
-        for skip_i in range(seq_start + 1, len(sorted_days)):
-            training_seq_skip.add(skip_i)
+        seq_days = sorted_days[seq_start:]
+        any_daily = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days)
+        if not any_daily:
+            for skip_i in range(seq_start + 1, len(sorted_days)):
+                training_seq_skip.add(skip_i)
+            training_seq_audit.append({
+                'start': sorted_days[seq_start]['datum'],
+                'end':   sorted_days[-1]['datum'],
+                'days':  len(sorted_days) - seq_start,
+            })
+
+    # v8.14: Audit-Notes für jede erkannte Mehrtages-Sequenz
+    for seq in training_seq_audit:
+        audit_notes.append(
+            f"Mehrtägige Schulungs-/Seminarsequenz erkannt ({seq['start']} bis "
+            f"{seq['end']}, {seq['days']} Tage); Fahrtag nur am ersten Tag gezählt, "
+            f"sofern keine tägliche Homebase-Anfahrt eindeutig erkennbar ist."
+        )
 
     fahr_tage = 0
     fahr_skipped_heimkehr = 0
@@ -7366,10 +7401,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             fahr_skipped_standby += 1
             print(f"[v8-fahrtage-detail] datum={datum} counted=False reason='Standby zuhause'")
             continue
-        # v8.13: Mehrtages-Training-Sequenz Folgetage skippen
+        # v8.14: Mehrtages-Training-Sequenz Folgetage skippen (kein eigener Fahrtag)
         if i in training_seq_skip:
             fahr_skipped_training_seq += 1
-            print(f"[v8-fahrtage-detail] datum={datum} counted=False reason='Mehrtages-Training-Sequenz Folgetag (kein eigener Fahrtag)'")
+            print(f"[v8-fahrtage-detail] datum={datum} counted=False reason='Mehrtägige Trainingssequenz — keine eindeutige tägliche Anfahrt'")
             continue
 
         if d.get('requires_commute'):
@@ -7421,15 +7456,15 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         layover_ort = (d.get('layover_ort') or m['se'].get('stfrei_ort') or '').upper()
         homebase_upper = (homebase or 'FRA').upper()
         is_homebase = layover_ort in (homebase_upper, '')
-        # v8.13: Z73-Abend-Anreise zählt NICHT als Hotelnacht (User schläft im Flugzeug,
-        # nicht im Hotel). Die "echte" Hotelnacht beginnt am Folgetag im Ausland.
+        # v8.14: Z73-Abend-Anreise zählt NICHT als Hotelnacht — robust über
+        # z73_type-Flag (statt reason-Substring). Wording-resistent.
         cr_t = t.get('classifier_result') or {}
-        is_evening_anreise_z73 = klass == 'Z73' and 'Abend-Briefing' in (t.get('begruendung','') or '')
+        is_evening_anreise_z73 = cr_t.get('z73_type') == 'evening_foreign_tour_start'
         if klass in HOTEL_KLASSEN and not is_homebase and not is_evening_anreise_z73:
             hotel_naechte += 1
         elif is_evening_anreise_z73:
-            hotel_skipped.append(f'{t["datum"]}:abend-anreise-z73')
-            print(f"[v8-hotel-skipped] datum={t['datum']} reason='Z73 Abend-Anreise (Tag in DE, Flug nachts) — keine Hotelnacht'")
+            hotel_skipped.append(f'{t["datum"]}:evening_foreign_tour_start')
+            print(f"[v8-hotel-skipped] datum={t['datum']} reason='Z73 evening_foreign_tour_start — Tag in DE, Flug nachts'")
         elif klass in HOTEL_KLASSEN and is_homebase:
             hotel_skipped.append(f'{t["datum"]}:homebase')
             ort_disp = layover_ort or 'leer'
