@@ -6998,15 +6998,16 @@ def test_v840_friendly_error_classified_into_categories():
 
 
 def test_v840_friendly_error_has_retry_button():
-    """Friendly-Error-Card bietet „Erneut versuchen" und „Seite neu laden"."""
+    """Friendly-Error-Card bietet „Erneut versuchen". „Seite neu laden" optional
+    via opts.showReload (Default off — würde Chat-Kontext zerstören)."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('function _renderFriendlyChatError(')
     block = src[fn_idx:fn_idx+3500]
     assert 'Erneut versuchen' in block
-    assert 'Seite neu laden' in block
-    assert 'window.location.reload' in block
+    # „Seite neu laden" darf nur unter opts.showReload erscheinen
+    assert 'opts.showReload' in block, 'Reload-Button muss opt-in sein'
 
 
 def test_v840_chat_send_uses_friendly_error_in_catch():
