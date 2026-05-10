@@ -6261,6 +6261,108 @@ def test_v828_BUG_input_row_align_items_center_for_equal_heights():
     assert 'align-items:flex-end' in style or 'align-items:center' in style
 
 
+# ── v8.29 Stabilization: fetch timeouts + visible errors ──
+
+def test_v829_fetchWithTimeout_helper_exists():
+    """_fetchWithTimeout helper muss in chat-IIFE existieren."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'function _fetchWithTimeout' in src
+    assert 'AbortController' in src
+    assert 'ctrl.abort()' in src
+
+
+def test_v829_chat_send_uses_fetch_with_timeout():
+    """/api/chat call uses _fetchWithTimeout statt naked fetch."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatSend = async function')
+    block = src[fn_idx:fn_idx+8000]
+    # Suche nach API+'/api/chat' Aufruf
+    api_chat_idx = block.find("API+'/api/chat'")
+    assert api_chat_idx > 0, '/api/chat-Call nicht gefunden'
+    # Im 200-Char-Fenster davor muss _fetchWithTimeout stehen
+    pre = block[max(0, api_chat_idx-200):api_chat_idx]
+    assert '_fetchWithTimeout' in pre, '/api/chat muss _fetchWithTimeout nutzen, nicht naked fetch'
+
+
+def test_v829_upload_replacement_uses_fetch_with_timeout():
+    """Im neuen Chat-Footer-Upload (_chatSend Attachment-Branch) muss
+    _fetchWithTimeout genutzt werden — verhindert unendlich ladende Loader."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    # Suche im _chatSend-Block (nicht in legacy uploads außerhalb)
+    fn_idx = src.find('window._chatSend = async function')
+    block = src[fn_idx:fn_idx+8000]
+    upload_idx = block.find("/upload-replacement'")
+    assert upload_idx > 0, 'upload-replacement-Call im Chat-Send fehlt'
+    pre = block[max(0, upload_idx-200):upload_idx]
+    assert '_fetchWithTimeout' in pre, 'Chat-Footer-Upload muss Timeout haben (sonst hängt Loader)'
+
+
+def test_v829_no_session_shows_visible_warning():
+    """Wenn getSession() null returns → renderMsg('assistant', ...) mit Warnung statt silent return."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatSend = async function')
+    block = src[fn_idx:fn_idx+1500]
+    # if(!session) muss renderMsg-Call enthalten, nicht nur "return;"
+    no_session_idx = block.find('if(!session)')
+    assert no_session_idx > 0
+    snippet = block[no_session_idx:no_session_idx+300]
+    assert 'renderMsg' in snippet, 'Wenn keine Session, muss sichtbare Warnung erscheinen'
+    assert 'Sitzung abgelaufen' in snippet or 'nicht vorhanden' in snippet or 'Seite neu laden' in snippet
+
+
+def test_v829_chat_error_messages_are_assistant_bubbles_not_system():
+    """Errors aus /api/chat sollen als assistant-bubbles erscheinen (sichtbar),
+    nicht als system-bubbles (11px gray, einfach übersehen)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatSend = async function')
+    block = src[fn_idx:fn_idx+8000]
+    # Block soll keine renderMsg('system', '⚠ ...') mehr enthalten
+    import re
+    sys_warns = re.findall(r"renderMsg\('system',\s*'⚠", block)
+    assert not sys_warns, f'_chatSend hat noch unsichtbare system-Errors: {sys_warns}'
+
+
+def test_v829_review_interpret_uses_timeout():
+    """/review-interpret call uses Timeout."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    idx = src.find("/review-interpret'")
+    assert idx > 0
+    pre = src[max(0, idx-200):idx]
+    assert '_fetchWithTimeout' in pre
+
+
+def test_v829_review_answer_bulk_uses_timeout():
+    """/review-answer-bulk call uses Timeout."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    idx = src.find("/review-answer-bulk'")
+    assert idx > 0
+    pre = src[max(0, idx-200):idx]
+    assert '_fetchWithTimeout' in pre
+
+
+def test_v829_abort_error_message_human_readable():
+    """AbortError (Timeout) bekommt verständliche User-Message."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'AbortError' in src
+    assert 'Server hat zu lange gebraucht' in src or 'Timeout' in src
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
