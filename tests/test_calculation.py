@@ -7472,6 +7472,87 @@ def test_v94_chat_close_hides_inline_host():
     assert "inlineHost.style.display = 'none'" in block
 
 
+# ── v9.6 Chat-Reset + Header-Cleanup + AI-Routing ──
+
+def test_v96_chat_clear_endpoint_registered():
+    """POST /api/chat/clear ist registriert."""
+    import app as _app
+    rules = [(r.rule, sorted(r.methods or [])) for r in _app.app.url_map.iter_rules()]
+    assert any('chat/clear' in r for r, _ in rules), '/api/chat/clear fehlt'
+
+
+def test_v96_chat_clear_resets_history_only():
+    """/api/chat/clear leert nur chat_history, NICHT manual_day_overrides."""
+    import app as _app, re
+    src = open(_app.__file__).read()
+    fn_idx = src.find('def chat_history_clear(')
+    block = src[fn_idx:fn_idx+800]
+    assert "s['chat_history'] = []" in block
+    # Body ohne Docstring prüfen
+    code_only = re.sub(r'""".*?"""', '', block, count=1, flags=re.DOTALL)
+    assert 'manual_day_overrides' not in code_only, \
+        'Funktions-Body darf manual_day_overrides nicht anfassen'
+
+
+def test_v96_chat_reset_button_in_dom():
+    """↻ Reset-Button im Chat-Header anstelle des X-Close-Buttons."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'id="chat-reset-btn"' in src
+    assert 'window._chatReset()' in src
+    # Reset-Function deklariert
+    assert 'window._chatReset = async function' in src
+
+
+def test_v96_chat_reset_clears_localStorage_and_state():
+    """_chatReset entfernt localStorage-Eintrag + setzt window._chatConv=null."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatReset = async function')
+    block = src[fn_idx:fn_idx+2000]
+    assert 'localStorage.removeItem(key)' in block
+    assert 'window._chatConv = null' in block
+    assert 'window._chatPendingProposal = null' in block
+
+
+def test_v96_text_command_clear_reset_routes_to_reset():
+    """„/clear" / „/reset" / „chat zurücksetzen" als Text triggert Reset."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _chatSendImpl')
+    block = src[fn_idx:fn_idx+2500]
+    assert '/^\\/(clear|reset)$/i' in block
+    assert 'chat\\s+(zur[üu]cksetzen|reset|neu' in block
+    assert 'window._chatReset()' in block
+
+
+def test_v96_chat_header_amount_row_hidden():
+    """Header-Amount-Row ist hidden (Hero ist Single-Source)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    import re
+    m = re.search(r'id="chat-header-amount-row"[^>]*style="([^"]*)"', src)
+    assert m is not None
+    assert 'display:none' in m.group(1)
+
+
+def test_v96_chat_send_routes_to_ai_chat_for_free_questions():
+    """Wenn jobId vorhanden: _chatSend ruft _handleReviewFreeText (nicht /api/chat)
+    auch für freie Fragen → strukturierte JSON-Response mit Job-Kontext."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('async function _chatSendImpl')
+    block = src[fn_idx:fn_idx+18000]
+    # Vor /api/chat-Fallback wird _handleReviewFreeText aufgerufen
+    assert "if(typeof window._handleReviewFreeText === 'function' && (window._lastJobId || '')){" in block
+    assert 'return window._handleReviewFreeText(txt)' in block
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

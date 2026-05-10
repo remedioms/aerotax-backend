@@ -3495,6 +3495,20 @@ def chat_history_get():
     return jsonify({'history': s.get('chat_history', [])})
 
 
+@app.route('/api/chat/clear', methods=['POST'])
+def chat_history_clear():
+    """v9.6: Backdoor-Reset — User kann Chat neu starten ohne neue Auswertung.
+    Body: {token}. Löscht chat_history (ABER nicht manual_day_overrides oder result_data)."""
+    body = request.get_json(silent=True) or {}
+    token = body.get('token', '').strip()
+    s = _load_session(token)
+    if not s:
+        return jsonify({'error': 'Session ungültig'}), 401
+    s['chat_history'] = []
+    _save_session(token, s)
+    return jsonify({'ok': True, 'cleared': True})
+
+
 # ══════════════════════════════════════════════════════════════════
 #  Q&A COMMUNITY — anonyme Fragen, Code-Namen, AeroTAX Auto-Antworten
 # ══════════════════════════════════════════════════════════════════
