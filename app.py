@@ -903,6 +903,186 @@ def _load_job_from_disk(job_id):
         return None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# v10.4 — job_chunks: persistente Chunk-Zwischenergebnisse für DP-Reader.
+# Reduziert Memory-Pressure auf Render Free-Tier (chunks werden sofort gespeichert,
+# große Sonnet-Responses sofort freigegeben).
+# Disk-Fallback wenn Supabase nicht verfügbar.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_job_chunks_memory = {}  # job_id → list of chunk dicts (in-memory fallback)
+_JOB_CHUNKS_DIR = os.path.join(os.path.dirname(__file__), '_job_chunks_state')
+try:
+    os.makedirs(_JOB_CHUNKS_DIR, exist_ok=True)
+except Exception:
+    pass
+
+
+def _sanitize_chunk_result(result):
+    """v10.4: Stellt sicher dass NIEMALS PDF-Bytes oder base64 in result_json landen.
+    Entfernt verdächtig große String-Felder und bekannte Binary-Keys."""
+    if not isinstance(result, dict):
+        return result
+    BLOCKED_KEYS = {'file_bytes', 'file_bytes_list', 'pdf_bytes', 'data_b64',
+                    'base64', 'b64', 'raw_pdf', 'pdf_content', 'image_bytes'}
+    out = {}
+    for k, v in result.items():
+        if k in BLOCKED_KEYS:
+            continue
+        # String-Feld > 50 KB ist verdächtig (PDFs sind groß, normaler Text klein)
+        if isinstance(v, str) and len(v) > 50_000:
+            out[k] = f'<truncated:{len(v)} chars>'
+        elif isinstance(v, dict):
+            out[k] = _sanitize_chunk_result(v)
+        elif isinstance(v, list):
+            out[k] = [_sanitize_chunk_result(x) if isinstance(x, dict) else x for x in v]
+        else:
+            out[k] = v
+    return out
+
+
+def create_job_chunk(job_id, document_type, chunk_index,
+                     page_from=None, page_to=None):
+    """Erstellt einen pending-Chunk-Eintrag. Idempotent via (job_id, document_type, chunk_index).
+    Returns chunk_id (UUID) oder None bei Fehler."""
+    import uuid as _uuid
+    chunk_id = str(_uuid.uuid4())
+    row = {
+        'id': chunk_id,
+        'job_id': str(job_id),
+        'document_type': document_type,
+        'chunk_index': int(chunk_index),
+        'page_from': page_from,
+        'page_to': page_to,
+        'status': 'pending',
+        'result_json': None,
+        'error_code': None,
+        'error_message': None,
+        'created_at': datetime.utcnow().isoformat() + 'Z',
+        'updated_at': datetime.utcnow().isoformat() + 'Z',
+    }
+    if SB_AVAILABLE:
+        try:
+            sb.table('job_chunks').upsert(
+                row, on_conflict='job_id,document_type,chunk_index'
+            ).execute()
+            return chunk_id
+        except Exception as e:
+            print(f"[chunks] create supabase fail {job_id[:8]}/{document_type}/{chunk_index}: {str(e)[:120]}")
+    # Disk-Fallback
+    _job_chunks_memory.setdefault(job_id, []).append(row)
+    try:
+        path = os.path.join(_JOB_CHUNKS_DIR, f'{job_id}.json')
+        with open(path, 'w') as f:
+            json.dump(_job_chunks_memory[job_id], f)
+    except Exception:
+        pass
+    return chunk_id
+
+
+def mark_job_chunk_running(chunk_id):
+    """Markiert chunk als 'running'."""
+    _update_chunk_fields(chunk_id, status='running')
+
+
+def save_job_chunk_result(chunk_id, result_json):
+    """Speichert Chunk-Result + setzt status='completed'.
+    result_json wird sanitized (kein base64/PDF-bytes)."""
+    sanitized = _sanitize_chunk_result(result_json)
+    _update_chunk_fields(chunk_id, status='completed', result_json=sanitized,
+                         error_code=None, error_message=None)
+
+
+def mark_job_chunk_failed(chunk_id, error_code, error_message):
+    """Markiert chunk als failed mit Code + Message."""
+    _update_chunk_fields(chunk_id, status='failed',
+                         error_code=str(error_code)[:50],
+                         error_message=str(error_message)[:500])
+
+
+def _update_chunk_fields(chunk_id, **fields):
+    """Internes Update — auf Supabase + Disk-Fallback."""
+    fields['updated_at'] = datetime.utcnow().isoformat() + 'Z'
+    if SB_AVAILABLE:
+        try:
+            sb.table('job_chunks').update(fields).eq('id', chunk_id).execute()
+            return
+        except Exception as e:
+            print(f"[chunks] update supabase fail {chunk_id[:8]}: {str(e)[:120]}")
+    # Disk-Fallback
+    for job_id, chunks in _job_chunks_memory.items():
+        for c in chunks:
+            if c.get('id') == chunk_id:
+                c.update(fields)
+                try:
+                    path = os.path.join(_JOB_CHUNKS_DIR, f'{job_id}.json')
+                    with open(path, 'w') as f:
+                        json.dump(chunks, f)
+                except Exception:
+                    pass
+                return
+
+
+def load_job_chunks(job_id, document_type=None, status=None):
+    """Lädt alle Chunks für einen Job. Optional gefiltert nach document_type/status.
+    Returns list of chunk dicts, sortiert nach chunk_index."""
+    chunks = []
+    if SB_AVAILABLE:
+        try:
+            q = sb.table('job_chunks').select('*').eq('job_id', str(job_id))
+            if document_type:
+                q = q.eq('document_type', document_type)
+            if status:
+                q = q.eq('status', status)
+            res = q.execute()
+            chunks = (res and res.data) or []
+        except Exception as e:
+            print(f"[chunks] load supabase fail {str(job_id)[:8]}: {str(e)[:120]}")
+    if not chunks:
+        # Disk-Fallback
+        path = os.path.join(_JOB_CHUNKS_DIR, f'{job_id}.json')
+        if os.path.exists(path):
+            try:
+                chunks = json.load(open(path))
+            except Exception:
+                chunks = []
+        if not chunks and job_id in _job_chunks_memory:
+            chunks = _job_chunks_memory[job_id]
+        if document_type:
+            chunks = [c for c in chunks if c.get('document_type') == document_type]
+        if status:
+            chunks = [c for c in chunks if c.get('status') == status]
+    chunks.sort(key=lambda c: c.get('chunk_index', 0))
+    return chunks
+
+
+def cleanup_old_job_chunks():
+    """Löscht job_chunks älter als 7 Tage. Wird im _cleanup_loop aufgerufen."""
+    if not SB_AVAILABLE:
+        # Disk-Fallback Cleanup
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=7)
+            for fn in os.listdir(_JOB_CHUNKS_DIR):
+                if not fn.endswith('.json'): continue
+                path = os.path.join(_JOB_CHUNKS_DIR, fn)
+                try:
+                    if datetime.utcfromtimestamp(os.path.getmtime(path)) < cutoff:
+                        os.remove(path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        res = sb.table('job_chunks').delete().lt('updated_at', cutoff).execute()
+        deleted = len((res and getattr(res, 'data', None)) or [])
+        if deleted:
+            print(f"[cleanup] supabase: {deleted} job_chunks (>7d) deleted")
+    except Exception as e:
+        print(f"[cleanup] job_chunks delete fail: {str(e)[:120]}")
+
+
 def _audit(job_id, event, data=None):
     """Schreibt Audit-Event in Job-Log + Render-Stdout. Audit-konform für Tax-Compliance."""
     entry = {
@@ -1207,7 +1387,8 @@ def _run_process_async(job_id, form, files):
             file_warnings = []
             print(f"[file-validation] Skip wegen Fehler: {e}")
 
-        result = berechne(form, files)
+        # v10.4: job_id durchreichen für chunked DP-Pipeline (Supabase-Persistenz + Heartbeat)
+        result = berechne(form, files, job_id=job_id)
         if isinstance(result, tuple):
             result = result[0]
         # File-Validation-Warnings vorne in Notes einfügen — User soll sie sehen
@@ -3335,11 +3516,18 @@ def _cleanup_expired_sessions():
 
 
 def _cleanup_loop():
-    """Background-Loop für regelmäßiges Cleanup (alle 30 Min)."""
+    """Background-Loop für regelmäßiges Cleanup (alle 30 Min) + Stale-Job-Detector (alle 2 Min)."""
     import time as _t
+    cycle = 0
     while True:
         try:
-            _t.sleep(1800)  # 30 Min
+            _t.sleep(120)  # 2 Min — häufig genug für Stale-Detection
+            cycle += 1
+            # v10.4: Stale-Job-Detector — bei jedem Cycle (alle 2 Min)
+            _detect_and_fail_stale_jobs()
+            # Vollständiger Cleanup nur alle 15 Cycles (≈ 30 Min)
+            if cycle % 15 != 0:
+                continue
             _cleanup_expired_sessions()
             # Auch alte Job-State-Files
             cutoff = datetime.utcnow() - timedelta(hours=48)
@@ -3366,6 +3554,62 @@ def _cleanup_loop():
             # v10.3: Auch jobs (>7 Tage) + sessions (expired) cleanen
             cleanup_old_supabase_state()
         except: pass
+
+
+# v10.4: Stale-Job-Detector — erkennt hängende Worker-Jobs und markiert sie als
+# failed_timeout, damit die Queue nicht endlos blockiert ist und der User eine
+# friendly-Fehlermeldung sieht.
+_STALE_JOB_TIMEOUT_MIN = 10  # Job ohne Heartbeat-Update für 10 Min → failed_timeout
+_STALE_JOB_GLOBAL_MAX_MIN = 15  # Job-Total-Runtime hart-Cap → failed_timeout
+
+
+def _detect_and_fail_stale_jobs():
+    """Iteriert über in-memory _jobs und failed Jobs deren Heartbeat zu alt ist.
+    Wird im _cleanup_loop alle 2 Min aufgerufen — keine externen Calls."""
+    try:
+        now = datetime.utcnow()
+        with _jobs_lock:
+            stuck_ids = []
+            for jid, j in _jobs.items():
+                if j.get('status') != 'running':
+                    continue
+                # Check 1: Heartbeat zu alt?
+                ph_ts = j.get('phase_updated_at') or j.get('created') or ''
+                try:
+                    ph_dt = datetime.fromisoformat(ph_ts.replace('Z', ''))
+                    if (now - ph_dt) > timedelta(minutes=_STALE_JOB_TIMEOUT_MIN):
+                        stuck_ids.append((jid, 'heartbeat_stale',
+                                          int((now - ph_dt).total_seconds() / 60)))
+                        continue
+                except Exception:
+                    pass
+                # Check 2: Total-Runtime-Cap
+                cr_ts = j.get('created') or ''
+                try:
+                    cr_dt = datetime.fromisoformat(cr_ts.replace('Z', ''))
+                    if (now - cr_dt) > timedelta(minutes=_STALE_JOB_GLOBAL_MAX_MIN):
+                        stuck_ids.append((jid, 'global_timeout',
+                                          int((now - cr_dt).total_seconds() / 60)))
+                except Exception:
+                    pass
+        # Failed setzen (außerhalb des Locks für minimale Lock-Zeit)
+        for jid, reason, mins_stale in stuck_ids:
+            with _jobs_lock:
+                if jid not in _jobs: continue
+                _jobs[jid]['status'] = 'failed_timeout'
+                _jobs[jid]['error'] = (
+                    'Die Auswertung wurde unterbrochen. '
+                    'Bitte starte sie erneut — deine Auswertung ist nicht verloren.'
+                )
+                _jobs[jid]['failed_reason'] = reason
+                _jobs[jid]['failed_at'] = now.isoformat() + 'Z'
+            print(f"[stale-detector] Job {jid[:8]} failed_timeout: {reason} ({mins_stale} min stale)")
+            try:
+                _save_job_to_disk(jid)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[stale-detector] error: {str(e)[:120]}")
 
 
 def cleanup_old_supabase_state():
@@ -3398,6 +3642,11 @@ def cleanup_old_supabase_state():
             print(f"[cleanup] supabase jobs delete fail: {str(e)[:120]}")
         if sess_deleted or jobs_deleted:
             print(f"[cleanup] supabase state: {sess_deleted} sessions, {jobs_deleted} jobs (>7d) deleted")
+        # v10.4: job_chunks ebenfalls cleanen (7-Tage Cutoff synchron zur jobs-TTL)
+        try:
+            cleanup_old_job_chunks()
+        except Exception as e:
+            print(f"[cleanup] job_chunks fail: {str(e)[:120]}")
     except Exception as e:
         # Outer catch — Cleanup-Loop niemals crashen lassen
         print(f"[cleanup] supabase state error: {str(e)[:120]}")
@@ -7303,7 +7552,8 @@ def _is_inland_code(code):
     return code.upper().strip() in INLAND_IATA_CODES
 
 
-def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes=None, year=2025, homebase='FRA'):
+def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes=None, year=2025, homebase='FRA',
+                                page_range_hint=None, max_tokens_override=None):
     """v7.0 Pre-Reader: Sonnet liest Flugstundenübersichten strukturiert pro Tag aus.
     Liefert NUR Lese-Fakten — keine steuerliche Klassifikation!
 
@@ -7631,6 +7881,18 @@ warnings und gib so viele Tage zurück wie möglich.
 
 LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
 
+    # v10.4: page_range_hint — chunked DP-Pipeline gibt Sonnet einen Seitenbereich
+    # vor. Spart Output-Tokens (jeder Chunk ist klein) → kleinerer Memory-Peak.
+    if page_range_hint and isinstance(page_range_hint, (tuple, list)) and len(page_range_hint) == 2:
+        _pf, _pt = page_range_hint
+        prompt += (
+            f"\n\n═════ CHUNK-FOKUS ════════════════════════════════════════════════════════════\n"
+            f"WICHTIG: Lies AUSSCHLIESSLICH die Seiten {_pf} bis {_pt} dieses Dokuments.\n"
+            f"Ignoriere alle anderen Seiten. Liefere NUR Tage die auf den Seiten {_pf}-{_pt}\n"
+            f"sichtbar sind. Wenn ein Tag teils auf einer früheren/späteren Seite war,\n"
+            f"liefere ihn trotzdem wenn du das Datum + die Aktivität klar erkennst.\n"
+        )
+
     content.append({'type': 'text', 'text': prompt})
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=300.0)
@@ -7640,11 +7902,12 @@ LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
         resp = None
         for attempt in range(2):
             try:
-                # v10.2: max_tokens 32k → 60k. 32k war zu eng für volle 12 Monate
-                # mit detaillierten Marker-Notes — Sonnet stoppte mit stop=max_tokens
-                # OHNE tool_input → Job-Fail. 60k ist innerhalb des sonnet-4-6 Limits.
+                # v10.2: max_tokens 32k → 60k. 32k war zu eng für volle 12 Monate.
+                # v10.4: max_tokens_override — chunked DP nutzt 20k pro Chunk
+                # (kleiner Memory-Peak, gc.collect zwischen Chunks).
+                _dp_max_tok = int(max_tokens_override) if max_tokens_override else 60000
                 resp = client.messages.create(
-                    model='claude-sonnet-4-6', max_tokens=60000,
+                    model='claude-sonnet-4-6', max_tokens=_dp_max_tok,
                     tools=[structured_tool],
                     tool_choice={'type': 'tool', 'name': 'submit_structured_days'},
                     messages=[{'role': 'user', 'content': content}]
@@ -7736,6 +7999,183 @@ LIEFERE jetzt via Tool die strukturierten Tagesdaten."""
     except Exception as e:
         print(f"[Sonnet-DP-Structured] fail: {type(e).__name__}: {str(e)[:200]}")
         return None
+
+
+def _count_dp_pdf_pages(dp_bytes_list):
+    """v10.4: Zählt Total-Seiten über alle DP-PDFs via pdfplumber."""
+    import pdfplumber as _pp, io as _io
+    total = 0
+    for pdf_bytes in (_bytes_list(dp_bytes_list) or []):
+        if not pdf_bytes: continue
+        try:
+            with _pp.open(_io.BytesIO(pdf_bytes)) as pdf:
+                total += len(pdf.pages)
+        except Exception as e:
+            print(f"[DP-Pages] count fail: {str(e)[:100]}")
+    return total
+
+
+def _dp_chunk_boundaries(total_pages, chunk_size_target=3):
+    """v10.4: Berechnet Chunk-Grenzen für DP-Pipeline.
+    Returns list of (page_from, page_to) tuples (1-indexed, inclusive).
+
+    Strategie:
+      - ≤4 Seiten: kein Chunking nötig → 1 Chunk
+      - 5-12 Seiten: chunks à ~3 Seiten
+      - >12 Seiten: chunks à ~4 Seiten
+    """
+    if total_pages <= 0:
+        return [(1, 1)]
+    if total_pages <= 4:
+        return [(1, total_pages)]
+    size = chunk_size_target if total_pages <= 12 else 4
+    boundaries = []
+    start = 1
+    while start <= total_pages:
+        end = min(start + size - 1, total_pages)
+        boundaries.append((start, end))
+        start = end + 1
+    return boundaries
+
+
+def _heartbeat_phase(job_id, phase_name, extra=None):
+    """v10.4: Worker-Heartbeat — setzt job.phase + phase_updated_at.
+    Stale-Job-Detector im Cleanup-Loop nutzt das um hängende Worker zu erkennen."""
+    if not job_id:
+        return
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]['phase'] = phase_name
+            _jobs[job_id]['phase_updated_at'] = datetime.utcnow().isoformat() + 'Z'
+            if extra and isinstance(extra, dict):
+                _jobs[job_id].update({f'phase_{k}': v for k, v in extra.items()})
+
+
+def _sonnet_read_dp_structured_chunked_v104(dp_bytes, einsatz_bytes=None, year=2025,
+                                             homebase='FRA', job_id=None):
+    """v10.4: Chunked DP-Reader für Memory-Pressure-Reduktion auf Render Free-Tier.
+
+    Strategie:
+      1. PDF-Seiten zählen via pdfplumber
+      2. Chunk-Grenzen berechnen (3-4 Seiten pro Chunk)
+      3. Pro Chunk: _sonnet_read_dp_structured mit page_range_hint + max_tokens=20000
+      4. Chunk-Result sofort in job_chunks persistieren
+      5. Lokale Objekte freigeben + gc.collect() zwischen Chunks
+      6. Am Ende: alle Chunks mergen, Tage deduplizieren
+
+    Wenn PDF klein genug (≤4 Seiten): single call ohne Chunking (kein Overhead).
+
+    Returns: dict {days, warnings} — gleiche Shape wie _sonnet_read_dp_structured.
+    """
+    if not dp_bytes:
+        return None
+    total_pages = _count_dp_pdf_pages(dp_bytes)
+    boundaries = _dp_chunk_boundaries(total_pages)
+
+    if len(boundaries) <= 1:
+        # Klein genug für single-call (kein Chunking-Overhead)
+        _heartbeat_phase(job_id, 'dp_single_call', {'pages': total_pages})
+        return _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year, homebase)
+
+    print(f"[DP-Chunked-v10.4] {total_pages} Seiten → {len(boundaries)} Chunks (max_tokens=20000/Chunk)")
+    all_days = []
+    all_warnings = []
+    failed_chunks = 0
+
+    for idx, (pf, pt) in enumerate(boundaries):
+        chunk_label = f"dp_chunk_{idx+1}_of_{len(boundaries)}"
+        _heartbeat_phase(job_id, chunk_label, {'page_from': pf, 'page_to': pt,
+                                                 'chunk_index': idx,
+                                                 'total_chunks': len(boundaries)})
+
+        # 1. Chunk-Row in Supabase anlegen
+        chunk_id = create_job_chunk(job_id, 'dp', idx, pf, pt) if job_id else None
+        if chunk_id:
+            mark_job_chunk_running(chunk_id)
+
+        # 2. Sonnet-Call mit kleinerem max_tokens + page-range hint
+        chunk_result = None
+        try:
+            chunk_result = _sonnet_read_dp_structured(
+                dp_bytes, einsatz_bytes, year, homebase,
+                page_range_hint=(pf, pt),
+                max_tokens_override=20000,
+            )
+        except Exception as e:
+            print(f"[DP-Chunked-v10.4] chunk {idx+1} crash: {type(e).__name__}: {str(e)[:200]}")
+            if chunk_id:
+                mark_job_chunk_failed(chunk_id, 'sonnet_exception', f'{type(e).__name__}: {str(e)[:200]}')
+            failed_chunks += 1
+            # MEMORY: lokale Refs freigeben
+            chunk_result = None
+            gc.collect()
+            continue
+
+        if not chunk_result or not isinstance(chunk_result, dict):
+            if chunk_id:
+                mark_job_chunk_failed(chunk_id, 'no_result', 'Sonnet returned None')
+            failed_chunks += 1
+            chunk_result = None
+            gc.collect()
+            continue
+
+        chunk_days = chunk_result.get('days') or []
+        chunk_warnings = chunk_result.get('warnings') or []
+
+        if not chunk_days:
+            if chunk_id:
+                mark_job_chunk_failed(chunk_id, 'zero_days', f'Sonnet returned 0 days for pages {pf}-{pt}')
+            failed_chunks += 1
+        else:
+            # 3. Result persistieren (sanitized, keine PDF-bytes)
+            if chunk_id:
+                save_job_chunk_result(chunk_id, {
+                    'days': chunk_days,
+                    'warnings': chunk_warnings,
+                    'days_count': len(chunk_days),
+                    'page_from': pf, 'page_to': pt,
+                })
+            all_days.extend(chunk_days)
+            all_warnings.extend(chunk_warnings)
+            print(f"[DP-Chunked-v10.4] chunk {idx+1}/{len(boundaries)} (Seiten {pf}-{pt}): {len(chunk_days)} Tage")
+
+        # 4. MEMORY-RELEASE — chunk-spezifische Refs freigeben + gc
+        chunk_result = None
+        chunk_days = None
+        chunk_warnings = None
+        gc.collect()
+        try:
+            _release_memory_to_os()
+        except Exception:
+            pass
+
+    # 5. Merge + Dedupe — gleiches Datum nur einmal
+    days_by_date = {}
+    for d in all_days:
+        if not isinstance(d, dict): continue
+        dt = d.get('datum')
+        if not dt: continue
+        if dt not in days_by_date:
+            days_by_date[dt] = d
+        # Bei Duplikat: behalte ersten Eintrag (chunk-Grenzen können Overlap haben)
+    deduped = sorted(days_by_date.values(), key=lambda d: d.get('datum', ''))
+
+    if failed_chunks:
+        all_warnings.append(
+            f"{failed_chunks} von {len(boundaries)} Abschnitten der Flugstundenübersicht "
+            f"konnten nicht vollständig gelesen werden — geprüfte Tage trotzdem berücksichtigt."
+        )
+
+    print(f"[DP-Chunked-v10.4] FERTIG: {len(deduped)} Tage (von {len(all_days)} pre-dedupe), "
+          f"{failed_chunks} fehlgeschlagene Chunks")
+    _heartbeat_phase(job_id, 'dp_merge_complete', {'days': len(deduped)})
+
+    if not deduped:
+        # Alle Chunks failed — wir haben gar nichts
+        return None
+
+    return {'days': deduped, 'warnings': all_warnings, '_chunked_v104': True,
+            '_chunks_total': len(boundaries), '_chunks_failed': failed_chunks}
 
 
 def _count_deterministic(structured_days):
@@ -11257,7 +11697,15 @@ def hybrid_analyze(form, files):
     document_health = None
     if dp_bytes:
         try:
-            structured_days = _sonnet_read_dp_structured(dp_bytes, einsatz_bytes, year, homebase)
+            # v10.4: Chunked DP-Reader für Memory-Pressure-Reduktion auf Render Free-Tier.
+            # Wenn job_id vorhanden → persistente Chunks in Supabase + Heartbeat-Tracking.
+            # Sonst: fallback auf single-call.
+            if job_id:
+                structured_days = _sonnet_read_dp_structured_chunked_v104(
+                    dp_bytes, einsatz_bytes, year, homebase, job_id=job_id)
+            else:
+                structured_days = _sonnet_read_dp_structured(
+                    dp_bytes, einsatz_bytes, year, homebase)
             if structured_days and structured_days.get('days'):
                 # Schritt 3b (v8): Document Health Check vor der Berechnung
                 document_health = _document_health_check(lsb_data, se_structured, structured_days, year)
@@ -12316,7 +12764,7 @@ def _build_proposed(intent, changes, items_by_id, summary=None):
     }
 
 
-def berechne(form, files):
+def berechne(form, files, job_id=None):
     """v8 Berechnungs-Einstieg: Sonnet-Reader → Backend-Klassifikator.
 
     Bei Pipeline-Fehler: Exception mit nutzerfreundlicher Meldung.

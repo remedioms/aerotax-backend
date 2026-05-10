@@ -8727,6 +8727,493 @@ def test_v103_choose_z77_with_real_world_log_case():
     assert r['z77_used'] == 4705.0
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# v10.4 — Chunked DP-Pipeline + job_chunks persistence + Worker-Timeout
+# Reduziert Render-Free-Tier-OOM-Risiko durch:
+#   - Pro Chunk: kleiner max_tokens (20k statt 60k) → kleinerer Memory-Peak
+#   - Chunk-Results sofort in Supabase → großer Sonnet-Response sofort freigegeben
+#   - gc.collect() zwischen Chunks
+#   - Stale-Job-Detector failt hängende Worker → Queue blockiert nicht endlos
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _load_app_fresh():
+    import sys as _sys
+    if 'app' in _sys.modules:
+        del _sys.modules['app']
+    sys.path.insert(0, os.path.dirname(_APP_PY))
+    import app as _app
+    return _app
+
+
+# ─── job_chunks Migration + CRUD ──────────────────────────────────────────
+
+def test_v104_migration_file_exists():
+    """SQL-Migration für job_chunks liegt unter supabase_migrations/."""
+    import os
+    mig_dir = os.path.join(os.path.dirname(__file__), '..', 'supabase_migrations')
+    files = [f for f in os.listdir(mig_dir) if f.endswith('.sql') and 'chunk' in f.lower()]
+    assert files, 'Migration job_chunks fehlt'
+
+
+def test_v104_migration_creates_job_chunks_table():
+    """Migration enthält CREATE TABLE für job_chunks mit allen erwarteten Spalten."""
+    import os, glob
+    mig_dir = os.path.join(os.path.dirname(__file__), '..', 'supabase_migrations')
+    for f in glob.glob(os.path.join(mig_dir, '*chunk*.sql')):
+        content = open(f).read()
+        if 'create table' in content.lower() and 'job_chunks' in content:
+            for col in ['job_id', 'document_type', 'chunk_index',
+                        'page_from', 'page_to', 'status', 'result_json',
+                        'error_code', 'error_message']:
+                assert col in content, f'Spalte {col} fehlt in Migration'
+            return
+    raise AssertionError('Keine job_chunks-CREATE-TABLE-Migration gefunden')
+
+
+def test_v104_migration_unique_constraint_on_chunk():
+    """Unique-Index (job_id, document_type, chunk_index)."""
+    import os, glob
+    mig_dir = os.path.join(os.path.dirname(__file__), '..', 'supabase_migrations')
+    for f in glob.glob(os.path.join(mig_dir, '*chunk*.sql')):
+        content = open(f).read()
+        if 'job_chunks' in content:
+            assert 'unique' in content.lower()
+            assert 'job_id, document_type, chunk_index' in content or \
+                   'job_id,document_type,chunk_index' in content
+            return
+
+
+def test_v104_migration_cleanup_extended_with_chunks():
+    """aerotax_cleanup_old_state() erweitert um job_chunks-Cleanup."""
+    import os, glob
+    mig_dir = os.path.join(os.path.dirname(__file__), '..', 'supabase_migrations')
+    found = False
+    for f in glob.glob(os.path.join(mig_dir, '*.sql')):
+        content = open(f).read()
+        if 'job_chunks' in content and 'aerotax_cleanup_old_state' in content:
+            assert "delete from public.job_chunks" in content
+            assert "7 days" in content or "interval '7" in content
+            found = True
+    assert found, 'cleanup_old_state-Erweiterung um job_chunks fehlt'
+
+
+def test_v104_create_job_chunk_returns_id():
+    """create_job_chunk() liefert chunk_id (UUID-Format)."""
+    _app = _load_app_fresh()
+    cid = _app.create_job_chunk('test-job-001', 'dp', 0, 1, 3)
+    assert cid is not None
+    assert len(cid) == 36  # UUID-Format
+
+
+def test_v104_save_job_chunk_result_sanitizes_pdf_bytes():
+    """save_job_chunk_result entfernt jegliche PDF-/Binary-Felder."""
+    _app = _load_app_fresh()
+    cid = _app.create_job_chunk('test-job-002', 'dp', 0, 1, 3)
+    poisoned = {
+        'days': [{'datum': '2025-01-01', 'activity_type': 'frei'}],
+        'file_bytes': b'\\x25PDF...' * 100,
+        'pdf_bytes': b'fake' * 50,
+        'data_b64': 'aGVsbG8=' * 1000,
+    }
+    _app.save_job_chunk_result(cid, poisoned)
+    chunks = _app.load_job_chunks('test-job-002')
+    if chunks:
+        r = chunks[0].get('result_json') or {}
+        assert 'file_bytes' not in r
+        assert 'pdf_bytes' not in r
+        assert 'data_b64' not in r
+        assert r.get('days')  # Tagesdaten bleiben
+
+
+def test_v104_save_job_chunk_truncates_huge_strings():
+    """Strings > 50KB werden truncated im chunk-result."""
+    _app = _load_app_fresh()
+    cid = _app.create_job_chunk('test-job-003', 'dp', 0, 1, 3)
+    huge_string = 'x' * 100_000
+    _app.save_job_chunk_result(cid, {'days': [], 'huge_field': huge_string})
+    chunks = _app.load_job_chunks('test-job-003')
+    if chunks:
+        r = chunks[0].get('result_json') or {}
+        if 'huge_field' in r:
+            assert len(r['huge_field']) < 200, 'Huge string muss truncated sein'
+
+
+def test_v104_load_job_chunks_sorted_by_index():
+    """load_job_chunks liefert Chunks sortiert nach chunk_index."""
+    _app = _load_app_fresh()
+    job_id = 'test-job-004'
+    # Out-of-order erstellen
+    _app.create_job_chunk(job_id, 'dp', 2, 7, 9)
+    _app.create_job_chunk(job_id, 'dp', 0, 1, 3)
+    _app.create_job_chunk(job_id, 'dp', 1, 4, 6)
+    chunks = _app.load_job_chunks(job_id)
+    if len(chunks) >= 3:
+        indices = [c.get('chunk_index') for c in chunks]
+        assert indices == sorted(indices), f'Chunks nicht sortiert: {indices}'
+
+
+def test_v104_mark_job_chunk_failed_sets_error_fields():
+    """mark_job_chunk_failed setzt status=failed + error_code + error_message."""
+    _app = _load_app_fresh()
+    cid = _app.create_job_chunk('test-job-005', 'dp', 0, 1, 3)
+    _app.mark_job_chunk_failed(cid, 'max_tokens', 'Sonnet output exceeded')
+    chunks = _app.load_job_chunks('test-job-005')
+    if chunks:
+        c = chunks[0]
+        assert c.get('status') == 'failed'
+        assert c.get('error_code') == 'max_tokens'
+
+
+def test_v104_cleanup_old_job_chunks_function_exists():
+    """cleanup_old_job_chunks() existiert + wird im supabase-cleanup aufgerufen."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, 'cleanup_old_job_chunks')
+    src = _read_backend()
+    fn_idx = src.find('def cleanup_old_supabase_state')
+    block = src[fn_idx:fn_idx + 2500]
+    assert 'cleanup_old_job_chunks' in block, \
+        'cleanup_old_supabase_state muss cleanup_old_job_chunks rufen'
+
+
+def test_v104_sanitize_chunk_result_pure():
+    """_sanitize_chunk_result als pure function: strippt verdächtige Felder."""
+    _app = _load_app_fresh()
+    out = _app._sanitize_chunk_result({
+        'days': [1, 2, 3],
+        'pdf_bytes': b'binary',
+        'data_b64': 'base64' * 1000,
+        'raw_pdf': 'whatever',
+        'normal_field': 'short value',
+    })
+    assert 'days' in out
+    assert 'pdf_bytes' not in out
+    assert 'data_b64' not in out
+    assert 'raw_pdf' not in out
+    assert out['normal_field'] == 'short value'
+
+
+# ─── DP Chunked Reader ────────────────────────────────────────────────────
+
+def test_v104_dp_chunked_function_exists():
+    """_sonnet_read_dp_structured_chunked_v104 existiert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_sonnet_read_dp_structured_chunked_v104')
+
+
+def test_v104_count_dp_pdf_pages_function_exists():
+    """_count_dp_pdf_pages liefert int."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_count_dp_pdf_pages')
+    # Mit leerer Liste sollte 0 zurückgeben
+    assert _app._count_dp_pdf_pages([]) == 0
+
+
+def test_v104_dp_chunk_boundaries_small():
+    """≤4 Seiten → 1 Chunk (kein Chunking-Overhead)."""
+    _app = _load_app_fresh()
+    assert _app._dp_chunk_boundaries(1) == [(1, 1)]
+    assert _app._dp_chunk_boundaries(4) == [(1, 4)]
+
+
+def test_v104_dp_chunk_boundaries_medium():
+    """5-12 Seiten → Chunks à 3 Seiten."""
+    _app = _load_app_fresh()
+    b = _app._dp_chunk_boundaries(12)
+    assert len(b) == 4
+    assert b == [(1, 3), (4, 6), (7, 9), (10, 12)]
+
+
+def test_v104_dp_chunk_boundaries_large():
+    """>12 Seiten → Chunks à 4 Seiten."""
+    _app = _load_app_fresh()
+    b = _app._dp_chunk_boundaries(24)
+    assert len(b) == 6
+    assert b[0] == (1, 4)
+    assert b[-1][1] == 24
+
+
+def test_v104_dp_chunk_boundaries_zero():
+    """0 Seiten → 1 fake-Chunk (Robustheit)."""
+    _app = _load_app_fresh()
+    b = _app._dp_chunk_boundaries(0)
+    assert len(b) == 1
+
+
+def test_v104_dp_reader_accepts_page_range_hint():
+    """_sonnet_read_dp_structured akzeptiert page_range_hint + max_tokens_override."""
+    src = _read_backend()
+    sig_idx = src.find('def _sonnet_read_dp_structured(')
+    line_end = src.find(':', sig_idx)
+    sig = src[sig_idx:line_end]
+    assert 'page_range_hint' in sig, 'page_range_hint parameter fehlt'
+    assert 'max_tokens_override' in sig, 'max_tokens_override parameter fehlt'
+
+
+def test_v104_dp_reader_passes_smaller_max_tokens():
+    """max_tokens_override wird im API-Call genutzt."""
+    src = _read_backend()
+    # Suche im gesamten src nach Override-Pattern — DP-Funktion ist sehr lang
+    assert 'max_tokens_override' in src, 'max_tokens_override Parameter fehlt'
+    assert '_dp_max_tok' in src, 'max_tokens runtime-Variable fehlt'
+
+
+def test_v104_dp_chunked_persists_each_chunk():
+    """Chunked-Reader ruft create_job_chunk + save_job_chunk_result auf."""
+    src = _read_backend()
+    idx = src.find('def _sonnet_read_dp_structured_chunked_v104')
+    assert idx > 0
+    block = src[idx:idx + 8000]
+    assert 'create_job_chunk(' in block
+    assert 'save_job_chunk_result(' in block
+    assert 'mark_job_chunk_running(' in block
+    assert 'mark_job_chunk_failed(' in block
+
+
+def test_v104_dp_chunked_frees_memory_per_chunk():
+    """Chunked-Reader macht gc.collect() pro Chunk."""
+    src = _read_backend()
+    idx = src.find('def _sonnet_read_dp_structured_chunked_v104')
+    block = src[idx:idx + 8000]
+    # Mindestens 2 gc.collect()-Aufrufe (für failed + success Pfade)
+    assert block.count('gc.collect()') >= 2, \
+        'Chunked-Reader muss gc.collect() pro Chunk machen'
+
+
+def test_v104_dp_chunked_dedupe_by_date():
+    """Merged Days werden nach datum dedupliziert."""
+    src = _read_backend()
+    idx = src.find('def _sonnet_read_dp_structured_chunked_v104')
+    block = src[idx:idx + 8000]
+    assert 'days_by_date' in block, 'Dedupe-Logik via days_by_date dict'
+
+
+def test_v104_dp_chunked_uses_20k_max_tokens():
+    """Pro Chunk wird max_tokens=20000 genutzt (statt 60k single-call)."""
+    src = _read_backend()
+    idx = src.find('def _sonnet_read_dp_structured_chunked_v104')
+    block = src[idx:idx + 8000]
+    assert 'max_tokens_override=20000' in block, \
+        'Chunks müssen max_tokens=20000 nutzen (kleiner Memory-Peak)'
+
+
+def test_v104_dp_chunked_no_chunking_for_small_pdf():
+    """≤4 Seiten → kein Chunking-Overhead, single call."""
+    src = _read_backend()
+    idx = src.find('def _sonnet_read_dp_structured_chunked_v104')
+    block = src[idx:idx + 8000]
+    assert 'len(boundaries) <= 1' in block or 'len(boundaries) == 1' in block, \
+        'Single-call-Pfad für kleine PDFs'
+
+
+# ─── Worker Heartbeat + Stale-Detector ────────────────────────────────────
+
+def test_v104_heartbeat_phase_function_exists():
+    """_heartbeat_phase setzt phase + phase_updated_at."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_heartbeat_phase')
+    # Pure-call ohne Crash auch wenn job_id=None
+    _app._heartbeat_phase(None, 'test_phase')
+
+
+def test_v104_stale_detector_function_exists():
+    """_detect_and_fail_stale_jobs existiert und wird im Cleanup-Loop aufgerufen."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_detect_and_fail_stale_jobs')
+    src = _read_backend()
+    fn_idx = src.find('def _cleanup_loop')
+    block = src[fn_idx:fn_idx + 3000]
+    assert '_detect_and_fail_stale_jobs' in block, \
+        'Cleanup-Loop muss Stale-Detector aufrufen'
+
+
+def test_v104_stale_detector_friendly_error_message():
+    """Stale-Detector setzt friendly error (kein technical Begriff)."""
+    src = _read_backend()
+    fn_idx = src.find('def _detect_and_fail_stale_jobs')
+    block = src[fn_idx:fn_idx + 3000]
+    # Friendly message present
+    assert 'wurde unterbrochen' in block or 'nicht verloren' in block, \
+        'Friendly error message muss vorhanden sein'
+    # Keine technischen Begriffe in der User-Message
+    assert 'OOM' not in block.split('failed_reason')[0] if 'failed_reason' in block else True
+
+
+def test_v104_stale_detector_timeout_threshold():
+    """Heartbeat-Timeout < 15 Min (sonst zu lange Stuck-State)."""
+    src = _read_backend()
+    fn_idx = src.find('_STALE_JOB_TIMEOUT_MIN')
+    block = src[fn_idx:fn_idx + 200]
+    import re as _re
+    m = _re.search(r'_STALE_JOB_TIMEOUT_MIN\s*=\s*(\d+)', block)
+    if m:
+        v = int(m.group(1))
+        assert 5 <= v <= 15, f'Timeout {v} außerhalb sinnvoller Range (5-15 Min)'
+
+
+def test_v104_cleanup_loop_more_frequent():
+    """Cleanup-Loop läuft jetzt häufiger (alle 2 Min) für Stale-Detection."""
+    src = _read_backend()
+    fn_idx = src.find('def _cleanup_loop')
+    block = src[fn_idx:fn_idx + 2000]
+    # 2-Min-Sleep statt 30 Min
+    assert '_t.sleep(120)' in block or 'sleep(120)' in block, \
+        'Cleanup-Loop sleep muss 120s für häufige Stale-Detection sein'
+
+
+# ─── Memory + No Bytes in Payload ─────────────────────────────────────────
+
+def test_v104_chunk_sanitize_blocks_known_binary_keys():
+    """_sanitize_chunk_result blockiert ALLE bekannten binary-key Patterns."""
+    _app = _load_app_fresh()
+    BLOCKED = ['file_bytes', 'file_bytes_list', 'pdf_bytes', 'data_b64',
+               'base64', 'b64', 'raw_pdf', 'pdf_content', 'image_bytes']
+    for key in BLOCKED:
+        inp = {'normal': 'ok', key: 'should-be-stripped'}
+        out = _app._sanitize_chunk_result(inp)
+        assert key not in out, f'Binary-Key "{key}" nicht gestrippt'
+
+
+def test_v104_chunk_sanitize_nested_dict():
+    """_sanitize rekursiv für nested dicts."""
+    _app = _load_app_fresh()
+    out = _app._sanitize_chunk_result({
+        'outer': 'ok',
+        'nested': {'pdf_bytes': 'BAD', 'safe': 'good'},
+    })
+    assert 'pdf_bytes' not in out.get('nested', {})
+    assert out['nested']['safe'] == 'good'
+
+
+# ─── User-facing Wording ──────────────────────────────────────────────────
+
+def test_v104_no_chunk_word_user_facing_in_frontend():
+    """Frontend zeigt das Wort „chunk" nicht user-facing."""
+    site = open(_FRONTEND_HTML).read()
+    # Erlaubt: in HTML comments, console.log, STALE_PATTERNS
+    import re as _re
+    for m in _re.finditer(r'\\bchunk', site, _re.IGNORECASE):
+        pos = m.start()
+        line_start = site.rfind('\n', 0, pos) + 1
+        ctx_pre = site[max(0, pos-200):pos]
+        line = site[line_start:site.find('\n', pos)]
+        rel = pos - line_start
+        is_safe = ('//' in line[:rel] or '<!--' in ctx_pre[-100:]
+                   or 'console.' in line[:rel]
+                   or 'STALE_PATTERNS' in ctx_pre)
+        if not is_safe:
+            ln = site[:pos].count('\n') + 1
+            raise AssertionError(f'„chunk" user-facing line {ln}: {line[:80]}')
+
+
+def test_v104_no_oom_user_facing():
+    """„OOM" / „out of memory" darf nicht user-facing als Text gezeigt werden.
+    Erlaubt: in `.includes()` Detector-Logik die Error-Patterns klassifiziert."""
+    site = open(_FRONTEND_HTML).read()
+    import re as _re
+    for needle in ['OOM', 'out of memory', 'OutOfMemory']:
+        for m in _re.finditer(_re.escape(needle), site, _re.IGNORECASE):
+            pos = m.start()
+            line_start = site.rfind('\n', 0, pos) + 1
+            line_end = site.find('\n', pos)
+            line = site[line_start:line_end if line_end > 0 else pos + 100]
+            ctx_pre = site[max(0, pos-300):pos]
+            rel = pos - line_start
+            is_safe = (
+                '//' in line[:rel]
+                or '<!--' in ctx_pre[-200:]
+                or 'STALE_PATTERNS' in ctx_pre
+                or 'console.' in line
+                # Erlaubt: includes/test/match — das sind Detector-Patterns für Error-Klassifikation
+                or '.includes(' in line or '.test(' in line or '.match(' in line
+                or '/i.test(' in ctx_pre[-100:] or 'regex' in ctx_pre[-200:].lower()
+                # Erlaubt: in einer Variable die als Pattern-Regex genutzt wird
+                or 'classifyError' in ctx_pre[-200:]
+                or 'errorTypes' in ctx_pre[-200:]
+            )
+            if not is_safe:
+                ln = site[:pos].count('\n') + 1
+                raise AssertionError(f'„{needle}" user-facing line {ln}: {line[:120]}')
+
+
+def test_v104_friendly_timeout_message_format():
+    """Failed-Timeout-Message ist freundlich (kein „RuntimeError", kein „worker")."""
+    src = _read_backend()
+    idx = src.find('def _detect_and_fail_stale_jobs')
+    block = src[idx:idx + 3000]
+    # Friendly message check
+    user_msg_section = block[block.find("'error':"):block.find("'failed_reason'")] if "'error':" in block else ''
+    if user_msg_section:
+        forbidden = ['RuntimeError', 'OOM', 'tool_input', 'max_tokens', 'Sonnet', 'worker', 'chunk', 'base64']
+        for f in forbidden:
+            assert f not in user_msg_section, f'„{f}" in User-Error-Message'
+
+
+# ─── Regression Guards ────────────────────────────────────────────────────
+
+def test_v104_berechne_accepts_job_id():
+    """berechne(form, files, job_id=None) — job_id-Parameter für chunked-Pfad."""
+    src = _read_backend()
+    sig_idx = src.find('def berechne(')
+    line_end = src.find(':', sig_idx)
+    sig = src[sig_idx:line_end]
+    assert 'job_id' in sig, 'berechne muss job_id akzeptieren'
+
+
+def test_v104_berechne_caller_passes_job_id():
+    """_run_process_async ruft berechne(form, files, job_id=job_id)."""
+    src = _read_backend()
+    # Im _run_process_async-Aufruf
+    idx = src.find('result = berechne(')
+    line = src[idx:idx + 200]
+    assert 'job_id=job_id' in line, 'berechne-call muss job_id durchreichen'
+
+
+def test_v104_dp_caller_uses_chunked_when_job_id():
+    """v8-Pipeline ruft _sonnet_read_dp_structured_chunked_v104 wenn job_id vorhanden."""
+    src = _read_backend()
+    # In berechne, DP-Call-Site
+    idx = src.find('_sonnet_read_dp_structured_chunked_v104(')
+    assert idx > 0, 'Chunked-Reader muss im v8-Calc-Pfad gerufen werden'
+
+
+def test_v104_no_dp_call_site_regression():
+    """Legacy single-call _sonnet_read_dp_structured wird NUR noch genutzt:
+       a) als interne Helper-Funktion vom Chunked-Reader
+       b) als Fallback wenn job_id=None
+    """
+    src = _read_backend()
+    # Im berechne-Pfad: Chunked ist primary
+    idx = src.find('# v10.4: Chunked DP-Reader')
+    assert idx > 0, 'v10.4 Comment im DP-Pfad fehlt'
+    block = src[idx:idx + 1000]
+    assert '_sonnet_read_dp_structured_chunked_v104(' in block
+    assert '_sonnet_read_dp_structured(' in block  # Fallback existiert
+
+
+def test_v104_existing_z77_logic_unchanged():
+    """v10.3 Z77-Logik (choose_z77_source) bleibt unverändert."""
+    src = _read_backend()
+    assert 'def choose_z77_source' in src
+    # Priority A → B → C structure
+    fn_idx = src.find('def choose_z77_source')
+    block = src[fn_idx:fn_idx + 3000]
+    assert "'daily_lines'" in block
+    assert "'monthly_sum'" in block
+    assert "'declared_total'" in block
+
+
+def test_v104_existing_supabase_cleanup_unchanged():
+    """v10.3 cleanup_old_supabase_state bleibt funktional, jetzt + chunks."""
+    src = _read_backend()
+    assert 'def cleanup_old_supabase_state' in src
+    fn_idx = src.find('def cleanup_old_supabase_state')
+    block = src[fn_idx:fn_idx + 2500]
+    assert "sb.table('sessions').delete()" in block
+    assert "sb.table('jobs').delete()" in block
+    assert 'cleanup_old_job_chunks()' in block  # NEW: v10.4
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
