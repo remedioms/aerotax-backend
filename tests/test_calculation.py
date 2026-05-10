@@ -6031,16 +6031,16 @@ def test_v826_no_promo_marketing_phrases_in_chat():
 # ── v8.27 Bug-Fixes: Centering, Tint, Upload-Flow, Greeting-Wording ──
 
 def test_v827_chat_opens_with_display_flex_for_centering():
-    """chat-overlay.style.display = 'flex' beim Öffnen (sonst greift align-items:center nicht)."""
+    """v9.4: Inline-Mode setzt 'block' (Container fließt im Layout),
+    Modal-Mode setzt 'flex' (zentriert via align-items:center)."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    # Bei _chatOpen wird flex gesetzt
-    assert "ov.style.display = 'flex'" in src
-    # Overlay default-CSS hat align-items:center
+    # Beide Modi müssen vertreten sein
+    assert "ov.style.display = 'flex'" in src, 'Modal-Mode-Display fehlt'
+    assert "ov.style.display = 'block'" in src, 'Inline-Mode-Display fehlt'
+    # Modal-Mode hat align-items:center für Centering
     assert 'align-items:center;justify-content:center' in src
-    # Kein alter "ov.style.display = 'block'" mehr
-    assert "ov.style.display = 'block'" not in src
 
 
 def test_v827_modal_background_neutral_not_blue():
@@ -7431,6 +7431,47 @@ def test_v93_user_close_disables_auto_reopen():
     assert '_chatUserClosedManually = true' in block
     # Auto-Open-Check berücksichtigt das Flag
     assert "!window._chatUserClosedManually" in src
+
+
+# ── v9.4 Inline-Chat in Auswertungsseite ──
+
+def test_v94_inline_chat_host_in_dom():
+    """chat-inline-host existiert in result-page DOM zwischen Hero und Berechnung."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    assert 'id="chat-inline-host"' in src
+    # Position: NACH dl-btn-row, VOR „Berechnung im Detail"
+    host_idx = src.find('id="chat-inline-host"')
+    dlrow_idx = src.find('id="dl-btn-row"')
+    berechn_idx = src.find('Berechnung im Detail')
+    assert dlrow_idx > 0 and berechn_idx > 0
+    # host ist im Result-Panel (zwischen review-section-wrap und dl-btn-row idealerweise)
+    review_wrap_idx = src.find('id="review-section-wrap"')
+    assert review_wrap_idx < host_idx < berechn_idx
+
+
+def test_v94_buildChatOverlay_inline_mode_branch():
+    """buildChatOverlay erkennt inline-mode wenn chat-inline-host existiert."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('function buildChatOverlay()')
+    block = src[fn_idx:fn_idx+30000]  # weit genug — Funktion ist groß wegen innerHTML-Template
+    assert 'inlineMode' in block
+    assert "getElementById('chat-inline-host')" in block
+    assert 'inlineHost.appendChild(chatOverlay)' in block
+
+
+def test_v94_chat_close_hides_inline_host():
+    """_chatClose hidet auch chat-inline-host (Container im Layout)."""
+    import os
+    site = os.path.expanduser('~/Desktop/site/index.html')
+    src = open(site).read()
+    fn_idx = src.find('window._chatClose = function')
+    block = src[fn_idx:fn_idx+500]
+    assert "getElementById('chat-inline-host')" in block
+    assert "inlineHost.style.display = 'none'" in block
 
 
 if __name__ == '__main__':
