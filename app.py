@@ -8727,6 +8727,9 @@ def _berechne_via_hybrid(form, files):
 
     # Klassifikations-Werte
     arbeitstage   = int(cls.get('arbeitstage', 0) or 0)
+    # v8.17 (hotfix): reinigungstage als getrennter Counter — Fallback auf
+    # arbeitstage bei alten v8.16-Result-Dicts ohne reinigungstage.
+    reinigungstage = int(cls.get('reinigungstage', arbeitstage) or arbeitstage)
     fahr_tage     = int(cls.get('fahr_tage', 0) or 0)
     hotel_naechte = int(cls.get('hotel_naechte', 0) or 0)
     vma_72_tage   = int(cls.get('z72_tage', 0) or 0)
