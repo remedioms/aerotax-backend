@@ -7128,28 +7128,45 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 audit_note = f'{datum}: Same-Day mit Auslands-SE {se_ort_fix} → Z76'
                 print(f"[v8-z76-detail] datum={datum} ort={se_ort_fix} bmf_land={(bmf_aus or {}).get('land','?')} tagtyp=an_abreise amount={eur_added:.2f} reason='Same-Day Auslandstrip'")
             else:
-                # v8.1: Dauer-Plausibilisierung. Z72 nur wenn Dienst+Fahrzeit ≥ 8h.
-                # Wenn duty_duration_minutes vorhanden: + 2× commute (Hin+Zurück)
-                # = total_minutes. Wenn ≥ 480 → Z72. Sonst → ZeroDay (kein VMA).
-                duty_min = int(d.get('duty_duration_minutes') or 0)
-                # Fahrzeit hin + zurück
-                commute_total = (commute_minutes * 2) if commute_minutes > 0 else 0
-                total_min = duty_min + commute_total
-                if duty_min == 0:
-                    # Keine Zeitinfo im DP — konservativ Z72 annehmen (alte Logik)
+                # v8.19.0 Fix 1: Same-Day mit Inland-Routing FRA-X-FRA (X = Inland-IATA)
+                # → Z72 unabhängig von duty_duration_minutes. Sonnet liest oft nur
+                # die Briefing-Dauer (z.B. 180min) und nicht den vollen Diensttag,
+                # was fälschlich ZeroDay produziert. Routing-Pattern ist eindeutiger.
+                routing = d.get('routing') or []
+                _hb_up = (homebase or 'FRA').upper()
+                is_routing_inland_sameday = (
+                    len(routing) >= 3
+                    and (routing[0] or '').upper() == _hb_up
+                    and (routing[-1] or '').upper() == _hb_up
+                    and any(_is_inland_code((r or '').upper()) for r in routing[1:-1])
+                )
+                if is_routing_inland_sameday:
                     klass = 'Z72'
                     eur_added = INLAND_TAGESTRIP_8H
-                    reason = 'Same-Day-Tagestrip (Dauer unbekannt, konservativ Z72)'
-                    print(f"[v8-z72-duration] datum={datum} duty_minutes=0 commute_minutes={commute_total} total=? counted=Z72-konservativ")
-                elif total_min >= SAME_DAY_Z72_TOTAL_MINUTES:
-                    klass = 'Z72'
-                    eur_added = INLAND_TAGESTRIP_8H
-                    reason = f'Same-Day Z72 — Dienst {duty_min}min + Fahrzeit {commute_total}min = {total_min}min ≥ {SAME_DAY_Z72_TOTAL_MINUTES}min'
-                    print(f"[v8-z72-duration] datum={datum} duty_minutes={duty_min} commute_minutes={commute_total} total={total_min} counted=Z72")
+                    routing_str = '-'.join(routing)
+                    reason = f'Same-Day Inland-Tagestrip Routing {routing_str} → Z72 14€'
+                    print(f"[v8-z72-routing] datum={datum} routing={routing_str} → Z72 (Inland-Tagestrip)")
                 else:
-                    klass = 'ZeroDay'
-                    reason = f'Same-Day < 8h (Dienst {duty_min}min + Fahrzeit {commute_total}min = {total_min}min) — kein VMA'
-                    print(f"[v8-z72-duration] datum={datum} duty_minutes={duty_min} commute_minutes={commute_total} total={total_min} counted=ZeroDay")
+                    # v8.1: Dauer-Plausibilisierung. Z72 nur wenn Dienst+Fahrzeit ≥ 8h.
+                    # Wenn duty_duration_minutes vorhanden: + 2× commute (Hin+Zurück)
+                    # = total_minutes. Wenn ≥ 480 → Z72. Sonst → ZeroDay (kein VMA).
+                    duty_min = int(d.get('duty_duration_minutes') or 0)
+                    commute_total = (commute_minutes * 2) if commute_minutes > 0 else 0
+                    total_min = duty_min + commute_total
+                    if duty_min == 0:
+                        klass = 'Z72'
+                        eur_added = INLAND_TAGESTRIP_8H
+                        reason = 'Same-Day-Tagestrip (Dauer unbekannt, konservativ Z72)'
+                        print(f"[v8-z72-duration] datum={datum} duty_minutes=0 commute_minutes={commute_total} total=? counted=Z72-konservativ")
+                    elif total_min >= SAME_DAY_Z72_TOTAL_MINUTES:
+                        klass = 'Z72'
+                        eur_added = INLAND_TAGESTRIP_8H
+                        reason = f'Same-Day Z72 — Dienst {duty_min}min + Fahrzeit {commute_total}min = {total_min}min ≥ {SAME_DAY_Z72_TOTAL_MINUTES}min'
+                        print(f"[v8-z72-duration] datum={datum} duty_minutes={duty_min} commute_minutes={commute_total} total={total_min} counted=Z72")
+                    else:
+                        klass = 'ZeroDay'
+                        reason = f'Same-Day < 8h (Dienst {duty_min}min + Fahrzeit {commute_total}min = {total_min}min) — kein VMA'
+                        print(f"[v8-z72-duration] datum={datum} duty_minutes={duty_min} commute_minutes={commute_total} total={total_min} counted=ZeroDay")
 
         elif at == 'tour':
             cluster = cluster_for_idx.get(i)
@@ -7490,7 +7507,24 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         if klass == 'Z76':
             try:
                 from bmf_data import IATA_TO_BMF
+                # Primary: heutiger SE-Ort oder DP-Layover
                 ort_for_bmf = (se.get('stfrei_ort') or d.get('layover_ort') or '').upper()
+                # v8.19.0 Fix 2a: Wenn ort Inland (z.B. FRA-Stempel auf Auslandstour-Anreise)
+                # → routing-tail probieren (Ziel-Flughafen)
+                if ort_for_bmf and _is_inland_code(ort_for_bmf):
+                    routing = d.get('routing') or []
+                    if routing:
+                        tail = (routing[-1] or '').upper()
+                        if tail and not _is_inland_code(tail):
+                            ort_for_bmf = tail
+                # v8.19.0 Fix 2b: Wenn ort leer oder Inland (z.B. Heimkehrtag)
+                # → Vortag-Layover-Ort verwenden
+                if not ort_for_bmf or _is_inland_code(ort_for_bmf):
+                    if prev:
+                        prev_layover = (prev['se'].get('stfrei_ort')
+                                        or prev['dp'].get('layover_ort','') or '').upper()
+                        if prev_layover and not _is_inland_code(prev_layover):
+                            ort_for_bmf = prev_layover
                 if ort_for_bmf and not _is_inland_code(ort_for_bmf):
                     bmf_land = IATA_TO_BMF.get(ort_for_bmf, '') or ''
                     bmf_key = bmf_land

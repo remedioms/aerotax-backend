@@ -3947,6 +3947,157 @@ def test_v8185_extra_hotelnaechte_audit_fields():
         assert key in sample, f"extra_hotelnaechte ohne Feld '{key}'"
 
 
+# ── v8.19.0 Fix 1: Same-Day Inland Routing → Z72 ──
+
+def test_v8190_sameday_fra_ham_fra_z72_routing():
+    """v8.19.0 Fix 1: FRA-HAM-FRA Same-Day → Z72, auch wenn duty=180min (Briefing only)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-31', 'activity_type': 'same_day',
+         'overnight_after_day': False, 'has_fl': False,
+         'routing': ['FRA','HAM','FRA'],
+         'starts_at_homebase': True, 'requires_commute': True,
+         'start_time': '05:45', 'end_time': '08:45',
+         'duty_duration_minutes': 180},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Z72', f"Same-Day FRA-HAM-FRA muss Z72 sein, ist {t['klass']}"
+    assert t['eur'] == 14.0
+
+
+def test_v8190_sameday_fra_muc_fra_z72_routing():
+    """FRA-MUC-FRA Same-Day → Z72."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-03-15', 'activity_type': 'same_day',
+         'overnight_after_day': False, 'has_fl': False,
+         'routing': ['FRA','MUC','FRA'],
+         'starts_at_homebase': True, 'requires_commute': True},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['tage_detail'][0]['klass'] == 'Z72'
+
+
+def test_v8190_sameday_fra_cai_fra_NOT_z72():
+    """FRA-CAI-FRA Same-Day mit Auslands-IATA → KEIN Z72-Routing-Trigger
+    (CAI ist Ausland, geht in Z76-Pfad über Auslands-SE)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-09-15', 'activity_type': 'same_day',
+         'overnight_after_day': False, 'has_fl': False,
+         'routing': ['FRA','CAI','FRA'],
+         'starts_at_homebase': True, 'requires_commute': True},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-09-15', 'stfrei_betrag': 32, 'stfrei_ort': 'CAI',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # CAI ist Ausland → Z76 via Auslands-SE-Stempel
+    assert result['tage_detail'][0]['klass'] == 'Z76'
+
+
+def test_v8190_sameday_overnight_no_z72_hard_gate():
+    """Same-Day Hard-Gate: overnight=True bricht Same-Day-Pfad → Issue."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-15', 'activity_type': 'same_day',
+         'overnight_after_day': True,  # Hard-Gate-Verletzung
+         'routing': ['FRA','HAM','FRA']},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Hard-Gate verletzt → Issue, NICHT Z72
+    assert result['tage_detail'][0]['klass'] == 'Issue'
+
+
+def test_v8190_sameday_no_routing_falls_to_duty_check():
+    """Same-Day ohne routing nutzt weiterhin duty-Check (Backward-Compat)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-15', 'activity_type': 'same_day',
+         'overnight_after_day': False, 'has_fl': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'duty_duration_minutes': 0},  # ohne routing, duty=0 → konservativ Z72
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['tage_detail'][0]['klass'] == 'Z72'
+
+
+# ── v8.19.0 Fix 2: bmf_land-Fallback ──
+
+def test_v8190_bmf_land_homecoming_uses_prev_layover():
+    """Heimkehrtag mit leerem layover_ort → bmf_land aus Vortag (z.B. GRU)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-12-08', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','GRU'], 'layover_ort': 'GRU',
+         'starts_at_homebase': True, 'requires_commute': True},
+        {'datum': '2025-12-09', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True, 'routing': ['GRU','FRA'], 'ends_at_homebase': True},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-12-08', 'stfrei_betrag': 47, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-12-09', 'stfrei_betrag': 31, 'stfrei_ort': '', 'stfrei_inland': None, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    homecoming = next(t for t in result['tage_detail'] if t['datum'] == '2025-12-09')
+    cr = homecoming['classifier_result']
+    assert homecoming['klass'] == 'Z76'
+    assert 'Brasilien' in (cr.get('bmf_land') or ''), \
+        f"Heimkehrtag bmf_land sollte Vortag-GRU=Brasilien sein, ist '{cr.get('bmf_land')}'"
+
+
+def test_v8190_bmf_land_fra_stempel_uses_routing_tail():
+    """FRA-Stempel-Anreisetag auf Auslandstour → bmf_land aus routing-tail."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','ICN'], 'layover_ort': 'ICN',
+         'starts_at_homebase': True, 'requires_commute': True},
+    ]}
+    se = {'se_lines': [
+        # FRA-Stempel (Sonnet liest oft Homebase als stfrei_ort bei Auslandstour-Anreise)
+        {'datum': '2025-01-03', 'stfrei_betrag': 14, 'stfrei_ort': 'FRA',
+         'stfrei_inland': True, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    cr = t['classifier_result']
+    # Korea via routing-tail
+    assert 'Korea' in (cr.get('bmf_land') or ''), \
+        f"FRA-Stempel + ICN-Routing → Korea expected, got '{cr.get('bmf_land')}'"
+
+
+def test_v8190_bmf_land_normal_layover_unchanged():
+    """Volltag-Layover mit klarem layover_ort=ICN → bmf_land=Korea (Regression)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','ICN'], 'layover_ort': 'ICN',
+         'starts_at_homebase': True, 'requires_commute': True},
+        {'datum': '2025-01-04', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'layover_ort': 'ICN'},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-01-03', 'stfrei_betrag': 32, 'stfrei_ort': 'ICN',
+         'stfrei_inland': False, 'storno': False},
+        {'datum': '2025-01-04', 'stfrei_betrag': 48, 'stfrei_ort': 'ICN',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    volltag = next(t for t in result['tage_detail'] if t['datum'] == '2025-01-04')
+    assert 'Korea' in (volltag['classifier_result'].get('bmf_land') or '')
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
