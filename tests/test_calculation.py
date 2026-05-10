@@ -5060,6 +5060,75 @@ def test_v822_recompute_with_empty_cache_returns_none():
     assert rec is None or rec['cls']['z72_tage'] == 0
 
 
+# ── v8.22 Now-4: Unknown-Marker-Learning ──
+
+def test_v822_unknown_marker_candidates_collected():
+    """activity_type='unknown' mit raw_marker → unknown_marker_candidate."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-09-12', 'activity_type': 'unknown', 'overnight_after_day': False,
+         'raw_marker': 'SIM SIMULATOR'},
+        {'datum': '2025-09-13', 'activity_type': 'unknown', 'overnight_after_day': False,
+         'raw_marker': 'SFT FLUGTRAINING'},
+        {'datum': '2025-09-14', 'activity_type': 'unknown', 'overnight_after_day': False,
+         'raw_marker': ''},  # leer → KEIN candidate
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    cls = _deterministic_classify_v7(matched, 2025, 'FRA')
+    cands = cls.get('unknown_marker_candidates') or []
+    assert len(cands) == 2
+    first_tokens = sorted(c['first_token'] for c in cands)
+    assert first_tokens == ['SFT', 'SIM']
+
+
+def test_v822_unknown_marker_creates_review_item():
+    """unknown_marker_candidate → review_item mit klassen-spez. Optionen."""
+    from app import _build_review_items
+    cls_stub = {
+        'office_training_time_missing_candidates': [],
+        'unknown_marker_candidates': [
+            {'datum': '2025-09-12', 'marker': 'SIM SIMULATOR', 'first_token': 'SIM'},
+        ],
+    }
+    items = _build_review_items(cls_stub)
+    assert len(items) == 1
+    it = items[0]
+    assert it['type'] == 'unknown_marker'
+    assert it['first_token'] == 'SIM'
+    assert any(opt['value'] == 'sim' for opt in it['options'])
+    assert any(opt['value'] == 'training' for opt in it['options'])
+    # Frage muss Marker enthalten
+    assert 'SIM' in it['question']
+
+
+# ── v8.22 Now-3: Bulk-Confirm-Helper (kein HTTP) ──
+# Validierungs-Logik des Bulk-Endpoints in synthetischer Form testen
+
+
+def test_v822_bulk_apply_yes_to_all_pending():
+    """Bulk-yes auf 5 pending office-Items → 5 Z72-Tage nach Recompute."""
+    from app import _apply_manual_day_overrides, _deterministic_classify_v7, _match_dp_se_per_day
+    days = [
+        {'datum': f'2025-04-{d:02d}', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True, 'raw_marker': 'EK BUERODIENST'}
+        for d in (7, 8, 9, 10, 11)
+    ]
+    # Bulk-Override = same template für alle 5
+    overrides = {d['datum']: {'over_8h': True, 'source': 'user_bulk_review_chatbot'}
+                 for d in days}
+    patched = _apply_manual_day_overrides(days, overrides)
+    matched = _match_dp_se_per_day({'days': patched}, {'se_lines': []}, 'FRA')
+    cls = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert cls['z72_tage'] == 5
+    # Source muss bei jedem Tag in classifier_result sein
+    for t in cls['tage_detail']:
+        rf = t.get('reader_facts') or {}
+        # _user_review_source ist auf dp gesetzt vor classify
+        # Es sollte in patched-days drinstehen
+        ds = next((d for d in patched if d['datum'] == t['datum']), None)
+        assert ds.get('_user_review_source') == 'user_bulk_review_chatbot'
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

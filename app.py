@@ -1689,6 +1689,146 @@ def post_review_answer(job_id):
     })
 
 
+@app.route('/api/job/<job_id>/review-bulk-answer', methods=['POST'])
+def post_review_bulk_answer(job_id):
+    """v8.22 Now-3: Bulk-Antwort auf mehrere pending Review-Items vom selben Typ.
+
+    Body: {answer: 'yes'|'no'|'unsure', type?: 'office_training_time_missing'}
+
+    Wendet die Antwort auf alle pending Items des Typs an, source=user_bulk_review_chatbot.
+    Liefert authoritative updated_preview_total via _recompute_with_overrides.
+    """
+    body = request.get_json(silent=True) or {}
+    answer = (body.get('answer') or '').strip()
+    typ = (body.get('type') or 'office_training_time_missing').strip()
+    if answer not in ('yes', 'no', 'unsure'):
+        return jsonify({'error': 'invalid bulk answer (yes|no|unsure)'}), 400
+    if typ not in ('office_training_time_missing',):
+        return jsonify({'error': f'unbekannter review-type: {typ}'}), 400
+
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'job not found'}), 404
+        data = j.get('data') or {}
+        review_items = list(data.get('_review_items') or [])
+        existing_overrides = dict(j.get('manual_day_overrides') or {})
+
+        # Override-Template
+        if answer == 'yes':
+            ov_template = {'over_8h': True, 'source': 'user_bulk_review_chatbot'}
+        elif answer == 'no':
+            ov_template = {'over_8h': False, 'source': 'user_bulk_review_chatbot'}
+        else:
+            ov_template = {'unsure': True, 'source': 'user_bulk_review_chatbot'}
+
+        # Auf alle pending Items vom Typ anwenden
+        applied_dates = []
+        for it in review_items:
+            if it.get('type') != typ:
+                continue
+            if it.get('status') == 'answered':
+                continue  # bereits beantwortet, überspringen
+            d_iso = it.get('datum')
+            if not d_iso:
+                continue
+            existing_overrides[d_iso] = dict(ov_template)
+            applied_dates.append(d_iso)
+
+        j['manual_day_overrides'] = existing_overrides
+        if 'audit' in j and isinstance(j['audit'], list):
+            j['audit'].append({
+                'event': 'review_bulk_answer',
+                'data': {'answer': answer, 'type': typ,
+                         'applied_count': len(applied_dates),
+                         'applied_dates': applied_dates},
+                'timestamp': datetime.now().isoformat(),
+            })
+
+        # Re-compute mit allen Overrides
+        cached = data.get('_cached_recalc_state') or {}
+        updated_preview_total = None
+        total_delta = None
+        if cached.get('matched_days'):
+            try:
+                rec = _recompute_with_overrides(cached, existing_overrides)
+                if rec and rec.get('totals'):
+                    updated_preview_total = rec['totals'].get('netto')
+                    initial_total = float((data.get('netto')) or 0)
+                    if isinstance(updated_preview_total, (int, float)):
+                        total_delta = round(float(updated_preview_total) - initial_total, 2)
+                    j.setdefault('data', {})['_preview_totals'] = rec['totals']
+            except Exception as e:
+                print(f'[review-bulk] recalc fail: {e}')
+        try:
+            _save_job_to_disk(job_id)
+        except Exception as _e:
+            print(f'[review-bulk] save warning: {_e}')
+
+    return jsonify({
+        'applied_count': len(applied_dates),
+        'applied_dates': applied_dates,
+        'answer': answer,
+        'updated_preview_total': updated_preview_total,
+        'total_delta': total_delta,
+        'override_count': len(existing_overrides),
+    })
+
+
+@app.route('/api/job/<job_id>/upload-replacement', methods=['POST'])
+def post_upload_replacement(job_id):
+    """v8.22 Now-5 (Stub): Endpoint für Document-Replacement im Chat.
+
+    Body multipart/form-data: file, doc_type ('lsb'|'se'|'dp'|'einsatz'|'opt')
+
+    Aktuell als Stub implementiert: nimmt Datei entgegen, validiert Format,
+    persistiert temp + bestätigt Upload. Vollständige selektive Re-Read-Pipeline
+    folgt in v8.23 (siehe TODO).
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'Keine Datei im Upload-Body'}), 400
+    file = request.files['file']
+    doc_type = (request.form.get('doc_type') or '').strip().lower()
+    if doc_type not in ('lsb', 'se', 'dp', 'einsatz'):
+        return jsonify({'error': f'unbekannter doc_type: {doc_type}'}), 400
+    if not file or not file.filename:
+        return jsonify({'error': 'leere Datei'}), 400
+    fname = file.filename
+    fext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
+    if fext not in ('pdf', 'jpg', 'jpeg', 'png', 'heic', 'heif'):
+        return jsonify({'error': f'Format nicht unterstützt: .{fext}'}), 400
+
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'job not found'}), 404
+        # Audit-Log: Replacement angekündigt
+        if 'audit' in j and isinstance(j['audit'], list):
+            j['audit'].append({
+                'event': 'document_replacement_uploaded',
+                'data': {
+                    'doc_type': doc_type, 'filename': fname,
+                    'size_bytes': len(file.read()) if file else 0,
+                    'status': 'received_pending_reread',
+                    'source': 'user_uploaded_replacement',
+                },
+                'timestamp': datetime.now().isoformat(),
+            })
+        try:
+            _save_job_to_disk(job_id)
+        except Exception:
+            pass
+
+    # v8.23 TODO: selektives Re-Read pro doc_type (Sonnet pro Slot statt voller Pipeline).
+    return jsonify({
+        'status': 'received_pending_reread',
+        'doc_type': doc_type,
+        'filename': fname,
+        'message': 'Datei erhalten. Vollständige Re-Verarbeitung folgt in v8.23 — '
+                   'aktuell wird das Dokument für eine erneute Auswertung vorgemerkt.',
+    })
+
+
 @app.route('/api/job/<job_id>/finalize-pdf', methods=['POST'])
 def post_finalize_pdf(job_id):
     """v8.22 Step E: Erstellt finales PDF unter Berücksichtigung aller User-Review-
@@ -8466,6 +8606,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     training_commute_candidates = [] # mehrtägige Training-Sequenz (evtl. nicht jeder Tag Fahrtag)
     office_z72_candidates = []       # Office mit duty>=480 ohne klaren Homebase-Bezug
     office_training_time_missing_candidates = []  # v8.21: Office/Schulung ohne Zeitinfo
+    unknown_marker_candidates = []  # v8.22 Now-4: unbekannte Kennungen mit raw_marker
     missing_reader_days = []         # Tage in Datum-Range die der DP-Reader weggelassen hat
 
     hb_upper = (homebase or 'FRA').upper()
@@ -8636,6 +8777,20 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     'reason': 'Office >8h — auswärtige Schulung/Training? Z72-Kandidat'
                 })
 
+        # v8.22 Now-4: Unknown-Marker-Kandidaten — Sonnet sieht raw_marker, kann
+        # die Aktivität aber nicht zuordnen (activity_type=unknown). Wird im
+        # review_items-Flow als "Was bedeutet diese Kennung?" präsentiert.
+        if at == 'unknown':
+            raw_mk = (d.get('raw_marker') or '').strip()
+            if raw_mk and len(raw_mk) <= 30:
+                # First-Token (das ist die Kennung, z.B. "SIM" aus "SIM SIMULATOR")
+                first = raw_mk.split()[0] if raw_mk else ''
+                if first and len(first) <= 8:
+                    unknown_marker_candidates.append({
+                        'datum': datum, 'marker': raw_mk, 'first_token': first,
+                        'reason': 'Unbekannte Kennung — bitte erklären',
+                    })
+
         # v8.21: office_training_time_missing_candidates — Office/Training-Tag der
         # potenziell Z72 wäre, aber Reader hat keine Zeitinfo geliefert. Wird
         # später im review_items-Flow dem Nutzer zur Klärung angeboten.
@@ -8784,6 +8939,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         'training_commute_candidates': training_commute_candidates,
         'office_z72_candidates':       office_z72_candidates,
         'office_training_time_missing_candidates': office_training_time_missing_candidates,
+        'unknown_marker_candidates':                unknown_marker_candidates,
         'missing_reader_days':         missing_reader_days,
         'hotel_candidate_issues':      hotel_candidate_issues,
         'bmf_missing':            list(_diag_bmf['bmf_missing']),
@@ -9972,6 +10128,7 @@ def _berechne_via_hybrid(form, files):
         '_training_commute_candidates': list(cls.get('training_commute_candidates', []) or []),
         '_office_z72_candidates':       list(cls.get('office_z72_candidates', []) or []),
         '_office_training_time_missing_candidates': list(cls.get('office_training_time_missing_candidates', []) or []),
+        '_unknown_marker_candidates':              list(cls.get('unknown_marker_candidates', []) or []),
         '_missing_reader_days':         list(cls.get('missing_reader_days', []) or []),
         '_hotel_candidate_issues':      list(cls.get('hotel_candidate_issues', []) or []),
         '_bmf_missing':            list(cls.get('bmf_missing', []) or []),
@@ -10077,6 +10234,38 @@ def _build_review_items(cls, manual_day_overrides=None):
                 {'value': 'unsure', 'label': 'Ich weiß es nicht'},
             ],
             'money_impact_estimate': float(c.get('money_impact_estimate', 14.0)),
+            'status': status,
+            'user_answer': ov,
+        })
+
+    # v8.22 Now-4: unknown_marker-Items (red/yellow je nach Frequenz)
+    for c in (cls.get('unknown_marker_candidates', []) or []):
+        datum = c.get('datum', '')
+        marker = c.get('marker', '')
+        ov = overrides.get(f'_marker:{c.get("first_token","")}')
+        status = 'answered' if ov else 'pending'
+        items.append({
+            'id': f'unknown_marker:{datum}',
+            'type': 'unknown_marker',
+            'severity': 'yellow',
+            'datum': datum,
+            'marker': marker,
+            'first_token': c.get('first_token', ''),
+            'question': (
+                f'Am {datum} habe ich die Kennung „{marker}" gefunden, kenne sie aber noch nicht. '
+                f'Was bedeutet diese Kennung?'
+            ),
+            'options': [
+                {'value': 'flight',   'label': 'Flugdienst'},
+                {'value': 'training', 'label': 'Schulung / Training'},
+                {'value': 'sim',      'label': 'Simulator'},
+                {'value': 'office',   'label': 'Bürodienst'},
+                {'value': 'standby',  'label': 'Standby / Bereitschaft'},
+                {'value': 'free',     'label': 'Frei / Urlaub / Krank'},
+                {'value': 'other',    'label': 'Sonstiges'},
+                {'value': 'unsure',   'label': 'Ich weiß es nicht'},
+            ],
+            'money_impact_estimate': 0.0,  # Marker-Klärung allein hat keinen direkten €-Impact
             'status': status,
             'user_answer': ov,
         })
