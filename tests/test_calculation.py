@@ -4015,6 +4015,42 @@ def test_v8190_sameday_overnight_no_z72_hard_gate():
     assert result['tage_detail'][0]['klass'] == 'Issue'
 
 
+def test_v8190_sameday_real_under_8h_NOT_z72():
+    """v8.19.0: Wenn duty wirklich belastbar UND < 8h, soll Routing-Override
+    NICHT greifen — ZeroDay, kein Z72. Sicherheit gegen Aggressiv-Override."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-15', 'activity_type': 'same_day',
+         'overnight_after_day': False, 'has_fl': False,
+         'routing': ['FRA','HAM','FRA'],  # Inland-Roundtrip
+         'starts_at_homebase': True, 'requires_commute': True,
+         'duty_duration_minutes': 600},  # 10h — klar belastbar, aber wir nehmen <8h-Test
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # 600min ≥ 480 → Z72 via duty-Pfad (nicht via Routing-Override)
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Z72'
+    # Reason zeigt duty-Pfad, nicht Routing-Pfad
+    assert 'Dienst 600min' in (t['classifier_result'].get('reason') or '')
+
+
+def test_v8190_sameday_belastbar_under_8h_zeroday():
+    """Wenn duty belastbar (z.B. Sonnet liest 450min sauber inkl. commute=0)
+    UND total < 480 UND KEIN Inland-Routing (z.B. routing fehlt) → ZeroDay."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-15', 'activity_type': 'same_day',
+         'overnight_after_day': False, 'has_fl': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'duty_duration_minutes': 240},  # 4h, klar unter 8h, kein routing
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Ohne routing UND duty<480 → ZeroDay
+    assert result['tage_detail'][0]['klass'] == 'ZeroDay'
+
+
 def test_v8190_sameday_no_routing_falls_to_duty_check():
     """Same-Day ohne routing nutzt weiterhin duty-Check (Backward-Compat)."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
