@@ -2441,20 +2441,19 @@ def test_v813_z73_evening_anreise_no_hotel():
 
 
 def test_v813_multi_day_training_sequence_only_first_fahrtag():
-    """Mehrtägiges Seminar (≥4 Tage activity=training): nur Tag 1 ist Fahrtag,
-    Folgetage zählen nicht (User fährt einmal hin, Veranstaltung läuft mehrere Tage)."""
+    """v8.18.4: 9-Tage-Training-Sequenz mit SM-SEMINAR-Marker (Closed-Seminar)
+    → 1 Fahrtag. Pure 'training' ohne klaren Marker kollabiert NICHT mehr."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
          'overnight_after_day': False, 'requires_commute': True,
-         'starts_at_homebase': True}
+         'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'}
         for d in range(4, 13)  # 04.09 - 12.09 = 9 Tage
     ]}
     matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
-    # 9 Office-Tage, aber nur 1 Fahrtag (Tag 1)
     assert result['fahr_tage'] == 1, \
-        f"9-Tage-Seminar sollte 1 Fahrtag haben, ist {result['fahr_tage']}"
+        f"9-Tage-SM-Seminar sollte 1 Fahrtag haben, ist {result['fahr_tage']}"
 
 
 def test_v813_two_day_training_still_counts_each():
@@ -2561,12 +2560,12 @@ def test_v814_training_explicit_daily_commute_counts_each_day():
 
 
 def test_v814_training_without_explicit_daily_only_first_fahrtag():
-    """5-Tages-Training ohne explicit_daily_commute → nur Tag 1 zählt (Block-Schulung)."""
+    """v8.18.4: 5-Tages-SM-SEMINAR ohne explicit_daily_commute → nur Tag 1."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
          'overnight_after_day': False, 'requires_commute': True,
-         'starts_at_homebase': True}
+         'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'}
         for d in range(4, 9)  # 04-08.09 = 5 Tage
     ]}
     matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
@@ -2575,19 +2574,19 @@ def test_v814_training_without_explicit_daily_only_first_fahrtag():
 
 
 def test_v814_training_audit_note_present():
-    """Mehrtägige Schulungs-Sequenz erzeugt Audit-Note für Transparenz."""
+    """v8.18.4: SM-SEMINAR-Block erzeugt Audit-Note 'Geschlossener Seminarblock'."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
          'overnight_after_day': False, 'requires_commute': True,
-         'starts_at_homebase': True}
+         'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'}
         for d in range(4, 13)  # 9 Tage
     ]}
     matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
     notes = result.get('audit_notes') or []
-    assert any('Mehrtägige Schulungs-/Seminarsequenz' in n for n in notes), \
-        f"Audit-Note für Mehrtages-Sequenz fehlt. notes={notes}"
+    assert any('Geschlossener Seminarblock' in n for n in notes), \
+        f"Audit-Note für SM-Seminarblock fehlt. notes={notes}"
 
 
 def test_v814_short_training_seq_counts_each():
@@ -2621,12 +2620,12 @@ def test_v815_4_day_training_still_counts_each():
 
 
 def test_v815_5_day_training_block_pattern():
-    """5-Tages-Training-Sequenz ohne explicit_daily_commute → nur Tag 1."""
+    """v8.18.4: 5-Tages-SM-SEMINAR-Sequenz → nur Tag 1 (Closed-Seminar)."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
          'overnight_after_day': False, 'requires_commute': True,
-         'starts_at_homebase': True}
+         'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'}
         for d in range(4, 9)  # 5 Tage
     ]}
     matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
@@ -2850,18 +2849,17 @@ def test_v817_tour_day_is_reinigungstag():
 
 
 def test_v817_multi_day_seminar_only_first_reinigungstag():
-    """Mehrtages-Seminar-Block (≥5 Tage): nur Tag 1 ist Reinigungstag.
-    Folgetage werden auch für Reinigung übersprungen (analog Fahrtage)."""
+    """v8.18.4: SM-SEMINAR-Block ≥5 Tage → nur Tag 1 ist Reinigungstag.
+    Pure 'training' ohne Marker → jeder Tag Reinigungstag (kein Kollaps)."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
          'overnight_after_day': False, 'requires_commute': True,
-         'starts_at_homebase': True}
+         'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'}
         for d in range(4, 13)  # 9 Tage
     ]}
     matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
-    # 9 Office-Arbeitstage, aber nur 1 Reinigungstag (Tag 1)
     assert result['arbeitstage'] == 9
     assert result['reinigungstage'] == 1
 
@@ -3261,27 +3259,25 @@ def test_v8182_training_seq_uses_marker_substring():
 
 
 def test_v8182_training_seq_tolerates_one_gap_day():
-    """v8.18.2: 1 Tag Frei-Lücke zwischen Training-Tagen unterbricht Sequenz nicht."""
+    """v8.18.4: 1 Tag Frei-Lücke wird nur bei reinem SM-SEMINAR-Block überbrückt."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = [
         {'datum': '2025-09-04', 'activity_type': 'training', 'overnight_after_day': False,
-         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
         {'datum': '2025-09-05', 'activity_type': 'training', 'overnight_after_day': False,
-         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
-        {'datum': '2025-09-06', 'activity_type': 'frei', 'overnight_after_day': False},  # GAP
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+        {'datum': '2025-09-06', 'activity_type': 'frei', 'overnight_after_day': False},
         {'datum': '2025-09-07', 'activity_type': 'training', 'overnight_after_day': False,
-         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
         {'datum': '2025-09-08', 'activity_type': 'training', 'overnight_after_day': False,
-         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
         {'datum': '2025-09-09', 'activity_type': 'training', 'overnight_after_day': False,
-         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
     ]
     matched = _match_dp_se_per_day({'days': structured}, {'se_lines': []}, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
-    # 5 echte Training-Tage (06.09 frei) — Sequenz wird durch frei-Lücke nicht abgebrochen
-    # Total Fahrtage: 1 (Tag 1 der Sequenz)
     assert result['fahr_tage'] == 1, \
-        f"5 Training-Tage mit 1 Frei-Gap = 1 Fahrtag, ist {result['fahr_tage']}"
+        f"5 SM-Tage mit 1 Frei-Gap = 1 Fahrtag, ist {result['fahr_tage']}"
 
 
 def test_v8182_training_seq_broken_by_real_flight():
@@ -3369,11 +3365,11 @@ def _build_realistic_year():
         {'datum': '2025-02-04', 'stfrei_betrag': 47, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
         {'datum': '2025-02-05', 'stfrei_betrag': 31, 'stfrei_ort': 'GRU', 'stfrei_inland': False, 'storno': False},
     ]
-    # April — Mehrtages-Schulung 08-12.04 (5 Tage, keine täglichen Indizien)
+    # April — Closed-Seminar SM 08-12.04 (5 Tage, kollabiert auf 1 Fahrtag)
     days += [
         {'datum': f'2025-04-{d:02d}', 'activity_type': 'training',
          'overnight_after_day': False, 'requires_commute': True,
-         'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'}
+         'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'}
         for d in (8, 9, 10, 11, 12)
     ]
     # Mai — Standby-Block 15.-17.05
@@ -3582,6 +3578,182 @@ def test_v8183_snapshot_total_counts_stable():
     assert result_2['z72_tage'] == snapshot_z72
     assert result_2['z73_tage'] == snapshot_z73
     assert result_2['z76_eur'] == snapshot_z76_eur
+
+
+# ── v8.18.4 Marker-Klassen-Tests: Closed-Seminar vs Daily-Presence ──
+
+def test_v8184_d4_5day_block_NOT_collapsed():
+    """v8.18.4: D4 SCHULUNG 5 Tage darf NICHT auf 1 Fahrtag kollabieren —
+    Daily-Presence-Marker, jeder Tag eigener Fahrtag/Reinigungstag."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-04-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'}
+        for d in (7, 8, 9, 10, 11)
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 5, \
+        f"D4-5-Tage darf NICHT kollabieren: erwartet 5 Fahrtage, ist {result['fahr_tage']}"
+    assert result['reinigungstage'] == 5, \
+        f"D4-5-Tage: erwartet 5 Reinigungstage, ist {result['reinigungstage']}"
+    seqs = result.get('training_sequences') or []
+    assert len(seqs) == 1
+    seq = seqs[0]
+    assert seq['sequence_type'] == 'daily_training_presence'
+    assert seq['why_collapsed'] is False
+    assert seq['counted_fahrtage'] == 5
+    assert seq['skipped_fahrtage'] == 0
+
+
+def test_v8184_ek_buerodienst_5day_NOT_collapsed():
+    """v8.18.4: EK BUERODIENST 5 Tage darf NICHT kollabieren — Bürodienst
+    an Homebase ist tägliche Präsenz."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-06-{d:02d}', 'activity_type': 'office',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True, 'raw_marker': 'EK BUERODIENST'}
+        for d in (2, 3, 4, 5, 6)
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 5
+    assert result['reinigungstage'] == 5
+    seqs = result.get('training_sequences') or []
+    assert len(seqs) == 1
+    assert seqs[0]['sequence_type'] == 'daily_training_presence'
+
+
+def test_v8184_sm_seminar_5day_collapses():
+    """v8.18.4: SM SEMINAR 5 Tage kollabiert weiterhin auf 1 Fahrtag."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'}
+        for d in (8, 9, 10, 11, 12)
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 1
+    seqs = result.get('training_sequences') or []
+    assert len(seqs) == 1
+    seq = seqs[0]
+    assert seq['sequence_type'] == 'closed_seminar_block'
+    assert seq['why_collapsed'] is True
+    assert seq['counted_fahrtage'] == 1
+    assert seq['skipped_fahrtage'] == 4
+
+
+def test_v8184_real_flight_breaks_sm_sequence():
+    """v8.18.4: echter Flug zwischen SM-Tagen unterbricht Sequenz definitiv."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-09-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+        {'datum': '2025-09-09', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+        # Echter Flug bricht Sequenz
+        {'datum': '2025-09-10', 'activity_type': 'tour', 'overnight_after_day': True,
+         'has_fl': True, 'routing': ['FRA','JFK'], 'layover_ort': 'JFK'},
+        {'datum': '2025-09-11', 'activity_type': 'tour', 'overnight_after_day': False,
+         'has_fl': True},
+        {'datum': '2025-09-12', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    seqs = result.get('training_sequences') or []
+    # Beide Teil-Sequenzen sind <5, also kein Audit-Eintrag
+    assert len(seqs) == 0, f"Tour darf SM-Sequenz brechen: {seqs}"
+
+
+def test_v8184_gap_only_bridges_sm_not_d4():
+    """v8.18.4: 1-Tag-Gap überbrückt SM-Sequenz, aber NICHT D4-Sequenz."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    # D4-Variante: Gap soll Sequenz brechen → 2 Sub-Sequenzen <5 → kein Kollaps
+    structured_d4 = {'days': [
+        {'datum': '2025-09-04', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-05', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-06', 'activity_type': 'frei', 'overnight_after_day': False},
+        {'datum': '2025-09-07', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-09', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+    ]}
+    matched_d4 = _match_dp_se_per_day(structured_d4, {'se_lines': []}, 'FRA')
+    result_d4 = _deterministic_classify_v7(matched_d4, 2025, 'FRA')
+    # Alle 5 D4-Tage zählen einzeln (kein Kollaps weder bei langer noch kurzer Sequenz)
+    assert result_d4['fahr_tage'] == 5
+
+    # SM-Variante: Gap soll Sequenz NICHT brechen → 5 SM-Tage = Closed-Seminar
+    structured_sm = {'days': [
+        {'datum': '2025-09-04', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+        {'datum': '2025-09-05', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+        {'datum': '2025-09-06', 'activity_type': 'frei', 'overnight_after_day': False},
+        {'datum': '2025-09-07', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+        {'datum': '2025-09-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+        {'datum': '2025-09-09', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+    ]}
+    matched_sm = _match_dp_se_per_day(structured_sm, {'se_lines': []}, 'FRA')
+    result_sm = _deterministic_classify_v7(matched_sm, 2025, 'FRA')
+    assert result_sm['fahr_tage'] == 1
+
+
+def test_v8184_mixed_d4_and_sm_no_collapse():
+    """v8.18.4: Mixed-Block (D4 + SM zusammen) ist KEIN Closed-Seminar →
+    konservativ kein Kollaps."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-09-04', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-05', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+        {'datum': '2025-09-06', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+        {'datum': '2025-09-07', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR'},
+        {'datum': '2025-09-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'requires_commute': True, 'starts_at_homebase': True, 'raw_marker': 'D4 SCHULUNG'},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    # Daily-presence (D4) gewinnt — sequence_type = daily_training_presence, 5 Fahrtage
+    assert result['fahr_tage'] == 5
+    seqs = result.get('training_sequences') or []
+    assert len(seqs) == 1
+    assert seqs[0]['sequence_type'] == 'daily_training_presence'
+    assert seqs[0]['why_collapsed'] is False
+
+
+def test_v8184_explicit_daily_commute_overrides_sm():
+    """v8.18.4: explicit_daily_commute=True bei SM-Block erzwingt Tag-für-Tag-Zählung."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': f'2025-09-{d:02d}', 'activity_type': 'training',
+         'overnight_after_day': False, 'requires_commute': True,
+         'starts_at_homebase': True, 'raw_marker': 'SM SEMINAR',
+         'explicit_daily_commute': True}
+        for d in (8, 9, 10, 11, 12)
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    assert result['fahr_tage'] == 5
+    seqs = result.get('training_sequences') or []
+    assert len(seqs) == 1
+    assert seqs[0]['sequence_type'] == 'daily_training_presence'
+    assert seqs[0]['why_collapsed'] is False
 
 
 if __name__ == '__main__':

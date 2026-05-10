@@ -6672,6 +6672,19 @@ TRAINING_SEQ_MIN_DAYS = 5                  # ≥5 Tage = Mehrtages-Schulungsbloc
 SAME_DAY_Z72_TOTAL_MINUTES = 480           # 8h (duty + 2× commute) → Same-Day Z72
 RECENT_FOREIGN_CLUSTER_MAX_BACK = 4        # Lookback-Tage für Heimkehr-Erkennung
 
+# v8.18.4: Training-Sequenz-Marker-Klassen.
+# CLOSED_SEMINAR = zusammenhängender Block ohne tägliche Homebase-Präsenz
+#   (klassisches Seminar, Sprachkurs, externer Lehrgang)
+#   → Kollaps auf 1 Fahrtag, Folgetage skip
+# DAILY_PRESENCE = Marker signalisiert tägliche Homebase-Präsenz
+#   (Schulung, Bürodienst, Emergency-Training, Erste Hilfe, technische
+#   Schulung, Medical/Sprachtest)
+#   → KEIN Kollaps, jeder Tag eigener Fahrtag/Reinigungstag
+TRAINING_CLOSED_SEMINAR_FIRST_TOKEN = ('SM',)
+TRAINING_CLOSED_SEMINAR_SUBSTRINGS = ('SEMINAR', 'LEHRGANG', 'SPRACHKURS')
+TRAINING_DAILY_PRESENCE_FIRST_TOKEN = ('D4', 'EK', 'EM', 'EH', 'TK',
+                                        'MEDICAL', 'SPRACHTEST', 'BRIEFING')
+
 # v8.18.3 Feature-Flags (vorerst nicht runtime-toggelbar — nur Benennung der
 # Sub-Logiken; spätere Toggles können hier eingehängt werden ohne tiefere Patches)
 FEATURE_EVENING_FOREIGN_TOUR_START_TO_Z73 = True
@@ -6798,32 +6811,54 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 None,
                 None)
 
-    # v8.18.2: Training-Seminar-Sequenz robuster erkennen.
-    # Erweiterte Regeln:
-    # - activity_type='training' ODER raw_marker enthält Seminar-Token
-    #   (SEMINAR/SCHULUNG/SM/D4/EM/EH/TK)
-    # - 1 Tag Lücke (frei/urlaub/krank/unknown OHNE Flug) wird toleriert
-    # - Echter Flugdienst (has_fl/tour/same_day) bricht die Sequenz IMMER
-    # - Min 5 Tage zusammenhängend (mit Lücke)
-    # - explicit_daily_commute=true → keine Sequenz-Skip
-    SEMINAR_MARKER_TOKENS = ('SEMINAR', 'SCHULUNG', 'SM ', 'D4 ', 'EM ', 'EH ', 'TK ',
-                              'TRAINING', 'EMERGENCY', 'ERSTE-HILFE', 'BUERODIENST')
+    # v8.18.4: Training-Seminar-Sequenz mit Marker-Klassen-Trennung.
+    # CLOSED_SEMINAR (SM/SEMINAR/LEHRGANG): kollabiert auf 1 Fahrtag, 1-Tag-Lücke
+    #   wird überbrückt.
+    # DAILY_PRESENCE (D4/EK/EM/EH/TK/...): jede Tag eigener Fahrtag, KEIN Kollaps,
+    #   keine Gap-Toleranz.
+    # Echter Flugdienst (has_fl/tour/same_day) bricht jede Sequenz.
+    # explicit_daily_commute=true erzwingt Tag-für-Tag-Zählung selbst bei SM.
 
-    def _is_seminar_day(m_):
+    def _marker_first_token(d_):
+        raw = (d_.get('raw_marker', '') or '').upper().strip()
+        return raw.split()[0] if raw else ''
+
+    def _is_closed_seminar_day(m_):
+        """SM/SEMINAR-Style: Kollaps-fähig."""
         d_ = m_['dp']
         at_ = d_.get('activity_type', '')
-        marker_ = (d_.get('raw_marker', '') or '').upper()
-        # Echter Flug bricht Sequenz IMMER
         if d_.get('has_fl') or at_ in ('tour', 'same_day'):
             return False
-        # activity_type=training/office-Office mit Seminar-Marker
-        if at_ in ('training', 'office'):
-            if any(tok in marker_ for tok in SEMINAR_MARKER_TOKENS):
-                return True
-            # Ohne Marker: nur 'training' zählt (office ohne Seminar-Marker = Homebase-Office, eigene Logik)
-            if at_ == 'training':
-                return True
+        if at_ not in ('training', 'office'):
+            return False
+        first = _marker_first_token(d_)
+        raw = (d_.get('raw_marker', '') or '').upper()
+        # Daily-Presence-Marker schließt Closed-Seminar aus, auch wenn Substring SEMINAR
+        if first in TRAINING_DAILY_PRESENCE_FIRST_TOKEN:
+            return False
+        if first in TRAINING_CLOSED_SEMINAR_FIRST_TOKEN:
+            return True
+        if any(tok in raw for tok in TRAINING_CLOSED_SEMINAR_SUBSTRINGS):
+            return True
         return False
+
+    def _is_daily_presence_day(m_):
+        """D4/EK/EM/EH/TK-Style: tägliche Präsenz, kein Kollaps."""
+        d_ = m_['dp']
+        at_ = d_.get('activity_type', '')
+        if d_.get('has_fl') or at_ in ('tour', 'same_day'):
+            return False
+        if at_ not in ('training', 'office'):
+            return False
+        first = _marker_first_token(d_)
+        return first in TRAINING_DAILY_PRESENCE_FIRST_TOKEN
+
+    def _is_seminar_day(m_):
+        """Sequenz-Mitglied: jede Training/Office-Tag (closed oder daily)."""
+        return _is_closed_seminar_day(m_) or _is_daily_presence_day(m_) or (
+            m_['dp'].get('activity_type') == 'training'
+            and not m_['dp'].get('has_fl')
+        )
 
     def _is_seminar_gap(m_):
         """Tolerable Lücke: Frei/Urlaub/Krank/unknown OHNE echten Flug."""
@@ -6833,11 +6868,77 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             return False
         return at_ in ('frei', 'urlaub', 'krank', 'unknown', 'none', '')
 
+    def _finalize_seq(seq_indices_):
+        """v8.18.4: schließt eine erkannte Sequenz ab. Setzt training_seq_skip
+        nur bei reinem closed_seminar-Block ohne daily_presence/explicit_commute,
+        sonst kein Kollaps. Gibt ein Audit-Dict zurück (oder None für unter-Min)."""
+        if len(seq_indices_) < TRAINING_SEQ_MIN_DAYS:
+            return None
+        seq_days_pre = [sorted_days[idx] for idx in seq_indices_]
+        any_daily_commute = any(dd['dp'].get('explicit_daily_commute') is True
+                                for dd in seq_days_pre)
+        all_closed_seminar = all(_is_closed_seminar_day(dd) for dd in seq_days_pre)
+        any_daily_presence = any(_is_daily_presence_day(dd) for dd in seq_days_pre)
+        marker_types = sorted(set(
+            (_marker_first_token(dd['dp']) or dd['dp'].get('activity_type', ''))
+            for dd in seq_days_pre
+        ))
+        start_d = sorted_days[seq_indices_[0]]['datum']
+        end_d = sorted_days[seq_indices_[-1]]['datum']
+        days_n = len(seq_indices_)
+
+        # Entscheidungsbaum (v8.18.4):
+        if any_daily_commute:
+            return {
+                'start':         start_d, 'end': end_d, 'days': days_n,
+                'marker_types':  marker_types,
+                'sequence_type': 'daily_training_presence',
+                'why_collapsed': False,
+                'counted_fahrtage': days_n,
+                'skipped_fahrtage': 0,
+                'reason':        'Sequenz mit explicit_daily_commute=true — alle Tage zählen',
+            }
+        if any_daily_presence:
+            # D4/EK/EM/EH/TK-Marker im Block → kein Kollaps
+            return {
+                'start':         start_d, 'end': end_d, 'days': days_n,
+                'marker_types':  marker_types,
+                'sequence_type': 'daily_training_presence',
+                'why_collapsed': False,
+                'counted_fahrtage': days_n,
+                'skipped_fahrtage': 0,
+                'reason':        'Daily-Presence-Marker (D4/EK/EM/EH/TK) im Block — Homebase-Schulung/Bürodienst, jeder Tag einzeln',
+            }
+        if all_closed_seminar:
+            # Reiner SM/SEMINAR-Block ohne Präsenz-Indizien → kollabieren
+            for skip_i in seq_indices_[1:]:
+                training_seq_skip.add(skip_i)
+            return {
+                'start':         start_d, 'end': end_d, 'days': days_n,
+                'marker_types':  marker_types,
+                'sequence_type': 'closed_seminar_block',
+                'why_collapsed': True,
+                'counted_fahrtage': 1,
+                'skipped_fahrtage': days_n - 1,
+                'reason':        'Geschlossener Seminarblock (SM/SEMINAR) ohne tägliche Anfahrts-Indizien',
+            }
+        # Mixed/unklarer Block → konservativ kein Kollaps
+        return {
+            'start':         start_d, 'end': end_d, 'days': days_n,
+            'marker_types':  marker_types,
+            'sequence_type': 'office_training_sequence_no_collapse',
+            'why_collapsed': False,
+            'counted_fahrtage': days_n,
+            'skipped_fahrtage': 0,
+            'reason':        'Office-/Training-Sequenz ohne klare Closed-Seminar-Marker — konservativ kein Kollaps',
+        }
+
     training_seq_skip = set()
     training_seq_audit = []
     seq_start_pre = None
-    seq_indices = []  # alle Indices in der aktuellen Sequenz (ohne Lücken)
-    pending_gap = None  # potenzielle Lücke (max 1 Tag)
+    seq_indices = []         # alle Indices in der aktuellen Sequenz (ohne Lücken)
+    seq_all_closed = True    # v8.18.4: sequence ist bisher pure closed_seminar
+    pending_gap = None       # potenzielle Lücke (max 1 Tag)
     i_pre = 0
     while i_pre < len(sorted_days):
         m_pre = sorted_days[i_pre]
@@ -6845,73 +6946,33 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             if seq_start_pre is None:
                 seq_start_pre = i_pre
                 seq_indices = [i_pre]
+                seq_all_closed = _is_closed_seminar_day(m_pre)
             else:
                 seq_indices.append(i_pre)
+                if not _is_closed_seminar_day(m_pre):
+                    seq_all_closed = False
             pending_gap = None
             i_pre += 1
-        elif seq_start_pre is not None and _is_seminar_gap(m_pre) and pending_gap is None:
-            # 1-Tag-Lücke tolerieren — schauen ob Folgetag wieder Seminar ist
+        elif (seq_start_pre is not None and seq_all_closed
+              and _is_seminar_gap(m_pre) and pending_gap is None):
+            # v8.18.4: 1-Tag-Lücke nur tolerieren wenn aktuelle Sequenz reines closed_seminar
             pending_gap = i_pre
             i_pre += 1
         else:
             # Sequenz endet hier
-            if seq_start_pre is not None and len(seq_indices) >= TRAINING_SEQ_MIN_DAYS:
-                seq_days_pre = [sorted_days[idx] for idx in seq_indices]
-                any_daily_pre = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days_pre)
-                marker_types = sorted(set(
-                    dd['dp'].get('raw_marker', '').split()[0] if dd['dp'].get('raw_marker') else dd['dp'].get('activity_type','')
-                    for dd in seq_days_pre
-                ))
-                if not any_daily_pre:
-                    # Skip alle außer dem ersten
-                    for skip_i in seq_indices[1:]:
-                        training_seq_skip.add(skip_i)
-                    training_seq_audit.append({
-                        'start':            sorted_days[seq_indices[0]]['datum'],
-                        'end':              sorted_days[seq_indices[-1]]['datum'],
-                        'days':             len(seq_indices),
-                        'marker_types':     marker_types,
-                        'counted_fahrtage': 1,
-                        'skipped_fahrtage': len(seq_indices) - 1,
-                        'reason':           'Mehrtägige Schulungs-/Seminarsequenz — keine eindeutige tägliche Anfahrt',
-                    })
-                else:
-                    training_seq_audit.append({
-                        'start':            sorted_days[seq_indices[0]]['datum'],
-                        'end':              sorted_days[seq_indices[-1]]['datum'],
-                        'days':             len(seq_indices),
-                        'marker_types':     marker_types,
-                        'counted_fahrtage': len(seq_indices),
-                        'skipped_fahrtage': 0,
-                        'reason':           'Sequenz mit explicit_daily_commute=true — alle Tage zählen',
-                    })
+            audit = _finalize_seq(seq_indices)
+            if audit is not None:
+                training_seq_audit.append(audit)
             seq_start_pre = None
             seq_indices = []
+            seq_all_closed = True
             pending_gap = None
-            # i_pre nicht erhöhen — aktueller Tag muss neu evaluiert werden
-            # (könnte selbst Seminar-Tag sein, wenn _is_seminar_day=False weil
-            # kein Marker, aber jetzt einfach weiter)
             i_pre += 1
     # Sequenz am Jahresende
-    if seq_start_pre is not None and len(seq_indices) >= TRAINING_SEQ_MIN_DAYS:
-        seq_days_pre = [sorted_days[idx] for idx in seq_indices]
-        any_daily_pre = any(dd['dp'].get('explicit_daily_commute') is True for dd in seq_days_pre)
-        marker_types = sorted(set(
-            dd['dp'].get('raw_marker', '').split()[0] if dd['dp'].get('raw_marker') else dd['dp'].get('activity_type','')
-            for dd in seq_days_pre
-        ))
-        if not any_daily_pre:
-            for skip_i in seq_indices[1:]:
-                training_seq_skip.add(skip_i)
-            training_seq_audit.append({
-                'start':            sorted_days[seq_indices[0]]['datum'],
-                'end':              sorted_days[seq_indices[-1]]['datum'],
-                'days':             len(seq_indices),
-                'marker_types':     marker_types,
-                'counted_fahrtage': 1,
-                'skipped_fahrtage': len(seq_indices) - 1,
-                'reason':           'Mehrtägige Schulungs-/Seminarsequenz — keine eindeutige tägliche Anfahrt',
-            })
+    if seq_start_pre is not None:
+        audit = _finalize_seq(seq_indices)
+        if audit is not None:
+            training_seq_audit.append(audit)
 
     for i, m in enumerate(sorted_days):
         d = m['dp']
@@ -7603,16 +7664,24 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     # v8.17: training_seq_skip wird oben (vorm Klassifikations-Loop) berechnet,
     # damit auch counted_as_reinigungstag im classifier_result darauf reagieren kann.
 
-    # v8.14/v8.18.2: Audit-Notes für jede erkannte Mehrtages-Sequenz
+    # v8.18.4: Audit-Notes pro Mehrtages-Sequenz, abhängig von sequence_type
     for seq in training_seq_audit:
         marker_str = ('/' + '/'.join(seq.get('marker_types', []))) if seq.get('marker_types') else ''
-        audit_notes.append(
-            f"Mehrtägige Schulungs-/Seminarsequenz erkannt ({seq['start']} bis "
-            f"{seq['end']}, {seq['days']} Tage{marker_str}); "
-            f"Fahrtag nur am ersten Tag gezählt ({seq.get('counted_fahrtage', 1)}), "
-            f"{seq.get('skipped_fahrtage', 0)} Folgetage übersprungen — "
-            f"sofern keine tägliche Homebase-Anfahrt eindeutig erkennbar ist."
-        )
+        seq_type = seq.get('sequence_type', '')
+        if seq.get('why_collapsed'):
+            audit_notes.append(
+                f"Geschlossener Seminarblock ({seq['start']} bis {seq['end']}, "
+                f"{seq['days']} Tage{marker_str}); "
+                f"Fahrtag nur am ersten Tag gezählt, "
+                f"{seq.get('skipped_fahrtage', 0)} Folgetage übersprungen — "
+                f"reiner SM/SEMINAR-Block ohne tägliche Anfahrts-Indizien."
+            )
+        else:
+            audit_notes.append(
+                f"Mehrtages-Schulungs-/Office-Sequenz ({seq['start']} bis {seq['end']}, "
+                f"{seq['days']} Tage{marker_str}); kein Kollaps, jeder Tag zählt einzeln "
+                f"als Fahrtag/Reinigungstag — Grund: {seq_type}."
+            )
 
     # v8.18.3: Fahrtage-Bestimmung schreibt counted_as_fahrtag-Flag
     # zurück in tage_detail[i].classifier_result. Aggregation am Ende
