@@ -5481,10 +5481,18 @@ EMPFOHLEN: routing, has_fl, overnight_after_day, layover_ort, layover_inland
 
 ▸ start_time / end_time: Dienstbeginn/-ende im DP, falls erkennbar (HH:MM).
   Bei Mehrtagestour: pro Tag die heutige Briefing-/Off-Duty-Zeit.
+  WICHTIG: Auch für Office/Schulung/Bürodienst-Marker explizit lesen!
+    - EK BUERODIENST z.B. 08:38–18:52
+    - D4 SCHULUNG    z.B. 08:08–17:22
+    - EH/EM/SM/TK    z.B. 08:38–18:22
+  Diese Zeiten sind essentiell für die Z72-Klassifikation (Inland >8h).
+  NIEMALS leer lassen wenn der DP klare Zeiten zeigt.
 
 ▸ duty_duration_minutes: Minuten zwischen start_time und end_time. Nur setzen
   wenn beide Zeiten klar im DP stehen. Bei Tagen über Mitternacht: bis 23:59.
   Wichtig für Z72-Plausibilisierung: Dienst >480min (8h) ohne Übernachtung.
+  Office/Schulung mit duty>=480min an Homebase = Inland-Tagestrip Z72 (14€).
+  Office/Schulung mit duty<480min = kein Z72.
 
 ▸ raw_marker: Originaler Marker-String aus dem DP (max 30 Zeichen).
   Beispiele: "FL738 FRA-DUB", "EH FRA", "SBY", "F".
@@ -7059,8 +7067,28 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             reason = 'Standby zuhause — AT, kein FT, kein VMA'
 
         elif at == 'office':
-            klass = 'Office'
-            reason = 'Office am Homebase — AT + FT'
+            # v8.20.0: Office mit duty>=480min + kein Hotel + nicht in Cluster
+            # + keine aktive Auslands-SE → Z72 (Inland-Tagestrip >8h).
+            # Office ohne Zeitinfo bleibt Office (kein blind Z72).
+            raw_duty_o = d.get('duty_duration_minutes')
+            duty_known_o = isinstance(raw_duty_o, (int, float))
+            duty_min_o = int(raw_duty_o) if duty_known_o else 0
+            in_cluster_o = i in cluster_for_idx
+            has_active_foreign_se_o = (
+                se.get('count', 0) > 0
+                and se.get('stfrei_inland') is False
+                and bool(se.get('stfrei_ort'))
+            )
+            if (not overnight and not prev_overnight and not in_cluster_o
+                and not has_active_foreign_se_o
+                and duty_known_o and duty_min_o >= SAME_DAY_Z72_TOTAL_MINUTES):
+                klass = 'Z72'
+                eur_added = INLAND_TAGESTRIP_8H
+                reason = f'Office Inland >8h (duty {duty_min_o}min) → Z72 14€'
+                print(f"[v8-z72-office] datum={datum} duty={duty_min_o}min → Z72 (Office Inland >8h)")
+            else:
+                klass = 'Office'
+                reason = 'Office am Homebase — AT + FT'
 
         elif at == 'training':
             if overnight and prev_at != 'training':
@@ -7076,8 +7104,26 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 reason = 'Schulung mit Hotel — Volltag (Z74 24h)'
                 eur_added = INLAND_VOLL_24H
             else:
-                klass = 'Office'
-                reason = 'Schulung am Homebase'
+                # v8.20.0: Schulung ohne Übernachtung mit duty>=480min → Z72.
+                # Schulung ohne Zeitinfo oder <8h bleibt Office (kein blind Z72).
+                raw_duty_t = d.get('duty_duration_minutes')
+                duty_known_t = isinstance(raw_duty_t, (int, float))
+                duty_min_t = int(raw_duty_t) if duty_known_t else 0
+                in_cluster_t = i in cluster_for_idx
+                has_active_foreign_se_t = (
+                    se.get('count', 0) > 0
+                    and se.get('stfrei_inland') is False
+                    and bool(se.get('stfrei_ort'))
+                )
+                if (not in_cluster_t and not has_active_foreign_se_t
+                    and duty_known_t and duty_min_t >= SAME_DAY_Z72_TOTAL_MINUTES):
+                    klass = 'Z72'
+                    eur_added = INLAND_TAGESTRIP_8H
+                    reason = f'Schulung Inland >8h (duty {duty_min_t}min) → Z72 14€'
+                    print(f"[v8-z72-training] datum={datum} duty={duty_min_t}min → Z72 (Schulung Inland >8h)")
+                else:
+                    klass = 'Office'
+                    reason = 'Schulung am Homebase'
 
         elif at == 'same_day':
             # Z72-Hard-Gate: kein FL, kein overnight, kein prev_overnight, nicht in Cluster

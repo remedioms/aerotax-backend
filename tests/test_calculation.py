@@ -2315,8 +2315,9 @@ def test_v811_training_sequence_detected():
     assert len(result['training_commute_candidates']) >= 1
 
 
-def test_v811_office_over_8h_listed_as_z72_candidate():
-    """Office mit duty>=480 → office_z72_candidate."""
+def test_v811_office_over_8h_now_z72():
+    """v8.20: Office mit duty>=480 wird direkt als Z72 klassifiziert
+    (vorher nur office_z72_candidate-Liste, jetzt echte Klassifikation)."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': '2025-04-07', 'activity_type': 'office', 'overnight_after_day': False,
@@ -2324,8 +2325,9 @@ def test_v811_office_over_8h_listed_as_z72_candidate():
     ]}
     matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
-    candidates = [c for c in result['office_z72_candidates'] if c['datum'] == '2025-04-07']
-    assert candidates, f"Office mit duty=570min sollte Z72-Kandidat sein, ist {result['office_z72_candidates']}"
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Z72', f"Office mit duty=570min muss Z72 sein, ist {t['klass']}"
+    assert t['eur'] == 14.0
 
 
 def test_v811_missing_reader_days_detected():
@@ -4156,6 +4158,221 @@ def test_v8190_bmf_land_normal_layover_unchanged():
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
     volltag = next(t for t in result['tage_detail'] if t['datum'] == '2025-01-04')
     assert 'Korea' in (volltag['classifier_result'].get('bmf_land') or '')
+
+
+# ── v8.20.0 Office/Schulung Z72-Regel (FollowMe-Reference-aligned) ──
+
+def test_v8200_office_ek_10h_z72():
+    """EK BUERODIENST 08:38–18:52 = 614min Inland → Z72 14€."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-07', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'EK BUERODIENST',
+         'start_time': '08:38', 'end_time': '18:52', 'duty_duration_minutes': 614},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Z72', f"EK 10:14h → Z72 erwartet, ist {t['klass']}"
+    assert t['eur'] == 14.0
+
+
+def test_v8200_d4_short_5h_no_z72():
+    """D4 SCHULUNG 5:14h = 314min → kein Z72, Office bleibt."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-08', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'D4 SCHULUNG',
+         'start_time': '08:08', 'end_time': '13:22', 'duty_duration_minutes': 314},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Office', f"D4 5:14h darf NICHT Z72 sein, ist {t['klass']}"
+
+
+def test_v8200_d4_long_9h_z72():
+    """D4 SCHULUNG 9:14h = 554min → Z72."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-09', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'D4 SCHULUNG',
+         'start_time': '08:08', 'end_time': '17:22', 'duty_duration_minutes': 554},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Z72', f"D4 9:14h → Z72 erwartet, ist {t['klass']}"
+    assert t['eur'] == 14.0
+
+
+def test_v8200_em_short_4h_no_z72():
+    """EM 4:44h = 284min → kein Z72."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-29', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'EM EMERGENCY',
+         'start_time': '12:38', 'end_time': '17:22', 'duty_duration_minutes': 284},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Office', f"EM 4:44h darf NICHT Z72 sein, ist {t['klass']}"
+
+
+def test_v8200_eh_em_long_944_z72():
+    """EH/EM 9:44h = 584min → Z72."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-24', 'activity_type': 'training', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'EH ERSTE HILFE',
+         'start_time': '08:38', 'end_time': '18:22', 'duty_duration_minutes': 584},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Z72', f"EH 9:44h → Z72 erwartet, ist {t['klass']}"
+    assert t['eur'] == 14.0
+
+
+def test_v8200_foreign_same_day_stays_z76():
+    """Auslands-Same-Day TLV bleibt Z76 (Foreign-SE überschreibt Z72)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-22', 'activity_type': 'same_day', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'routing': ['FRA','TLV','FRA'],
+         'duty_duration_minutes': 779},  # 12:59h
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-04-22', 'stfrei_betrag': 44, 'stfrei_ort': 'TLV',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Z76', f"TLV Same-Day muss Z76 bleiben, ist {t['klass']}"
+
+
+def test_v8200_office_in_foreign_cluster_no_z72():
+    """Office-Tag mit aktiver Auslands-SE → KEIN Z72 (Foreign-SE blockt)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-05-13', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'EK BUERODIENST',
+         'duty_duration_minutes': 600},
+    ]}
+    se = {'se_lines': [
+        {'datum': '2025-05-13', 'stfrei_betrag': 30, 'stfrei_ort': 'CDG',
+         'stfrei_inland': False, 'storno': False},
+    ]}
+    matched = _match_dp_se_per_day(structured, se, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    # Mit Auslands-SE darf Office nicht naiv Z72 werden — entweder Office bleibt
+    # oder anderer Pfad. Hier: Office (kein Z72-Pfad bei active foreign SE)
+    assert t['klass'] != 'Z72', \
+        f"Office mit Auslands-SE darf NICHT Z72 sein, ist {t['klass']}"
+
+
+def test_v8200_office_overnight_no_z72():
+    """Office mit overnight=True → KEIN Z72 (Hard-Gate)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-06-01', 'activity_type': 'office', 'overnight_after_day': True,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'duty_duration_minutes': 600},
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] != 'Z72', f"Office overnight=True darf NICHT Z72 sein, ist {t['klass']}"
+
+
+def test_v8200_office_no_time_info_stays_office():
+    """Office ohne duty_duration_minutes → bleibt Office (kein blind Z72)."""
+    from app import _deterministic_classify_v7, _match_dp_se_per_day
+    structured = {'days': [
+        {'datum': '2025-04-07', 'activity_type': 'office', 'overnight_after_day': False,
+         'starts_at_homebase': True, 'requires_commute': True,
+         'raw_marker': 'EK BUERODIENST'},
+        # KEIN start_time/end_time/duty_duration_minutes
+    ]}
+    matched = _match_dp_se_per_day(structured, {'se_lines': []}, 'FRA')
+    result = _deterministic_classify_v7(matched, 2025, 'FRA')
+    t = result['tage_detail'][0]
+    assert t['klass'] == 'Office', \
+        f"Office ohne Zeitinfo bleibt Office (nicht blind Z72), ist {t['klass']}"
+
+
+# ── v8.20.0 FollowMe Reference-Contract Fixture ──
+
+# Aus FollowMe-Auswertung 2025 (Lufthansa Cabin Crew, Pflichtdokumenten-Auswertung).
+# NUR als Test-Fixture, NICHT in Produktionslogik hardcoden.
+FOLLOWME_REFERENCE_2025 = {
+    'fahrtage':       53,
+    'arbeitstage':    129,
+    'reinigungstage': 129,
+    'hotel_naechte':  54,
+    'vma_total_eur':  4884.0,
+    'z72_tage':       13,
+    'z72_eur':        182.0,    # 13 × 14
+    'z73_tage':       10,
+    'z73_eur':        140.0,    # 10 × 14
+    'z74_tage':       0,
+    'z74_eur':        0.0,
+    'z76_eur':        4562.0,
+    'reinig_eur':     206.40,   # 129 × 1.60
+    'trink_eur':      194.40,   # 54 × 3.60
+    'fahr_km':        27,
+}
+
+FOLLOWME_Z72_DATES_2025 = [
+    '2025-01-31', '2025-04-07', '2025-04-09', '2025-04-10', '2025-04-11',
+    '2025-04-24', '2025-04-25', '2025-05-13', '2025-07-23', '2025-08-11',
+    '2025-09-19', '2025-11-24', '2025-11-25',
+]
+
+FOLLOWME_FAHRTAGE_2025 = [
+    '2025-01-14', '2025-01-19', '2025-01-30', '2025-01-31', '2025-02-03',
+    '2025-03-16', '2025-03-23', '2025-03-31', '2025-04-07', '2025-04-08',
+    '2025-04-09', '2025-04-10', '2025-04-11', '2025-04-13', '2025-04-22',
+    '2025-04-24', '2025-04-25', '2025-04-29', '2025-04-30', '2025-05-08',
+    '2025-05-13', '2025-05-23', '2025-05-28', '2025-06-07', '2025-06-21',
+    '2025-06-23', '2025-06-24', '2025-07-03', '2025-07-08', '2025-07-23',
+    '2025-07-28', '2025-08-08', '2025-08-11', '2025-08-12', '2025-08-20',
+    '2025-08-26', '2025-09-15', '2025-09-17', '2025-09-19', '2025-09-24',
+    '2025-09-25', '2025-09-28', '2025-10-05', '2025-11-07', '2025-11-14',
+    '2025-11-19', '2025-11-24', '2025-11-25', '2025-11-27', '2025-12-06',
+    '2025-12-16', '2025-12-26', '2025-12-27',
+]
+
+
+def test_v8200_followme_fixture_totals_consistent():
+    """Reference-Contract: FollowMe totale Beträge stimmen in sich."""
+    f = FOLLOWME_REFERENCE_2025
+    # Z72: 13 × 14 = 182
+    assert f['z72_eur'] == f['z72_tage'] * 14.0
+    # Z73: 10 × 14 = 140
+    assert f['z73_eur'] == f['z73_tage'] * 14.0
+    # VMA gesamt: Z72 + Z73 + Z76
+    assert abs(f['vma_total_eur'] - (f['z72_eur'] + f['z73_eur'] + f['z76_eur'])) < 0.01
+    # Reinigung: 129 × 1.60
+    assert abs(f['reinig_eur'] - (f['reinigungstage'] * 1.60)) < 0.01
+    # Trinkgeld: 54 × 3.60
+    assert abs(f['trink_eur'] - (f['hotel_naechte'] * 3.60)) < 0.01
+
+
+def test_v8200_followme_fixture_counts():
+    """Reference-Contract: Datums-Listen-Längen stimmen mit Aggregaten."""
+    assert len(FOLLOWME_Z72_DATES_2025) == FOLLOWME_REFERENCE_2025['z72_tage']
+    assert len(FOLLOWME_FAHRTAGE_2025) == FOLLOWME_REFERENCE_2025['fahrtage']
 
 
 if __name__ == '__main__':
