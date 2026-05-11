@@ -9,4 +9,6 @@ gunicorn==22.0.0
 Pillow==10.3.0
 pillow-heif>=0.16.0
 supabase>=2.7.0
+google-cloud-tasks>=2.16.0
+google-auth>=2.30.0
 pytest>=8.0.0

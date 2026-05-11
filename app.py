@@ -826,8 +826,126 @@ def _release_memory_to_os():
         pass  # Mac/Windows oder kein libc — egal
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# v13 Cloud Tasks Worker — saubere Architektur für Cloud Run
+# ════════════════════════════════════════════════════════════════════════════
+# Problem: Cloud Run zählt nur aktive HTTP-Requests. Background-Threads gehen
+# in SIGTERM nach dem Request-Return.
+#
+# Lösung: Worker läuft SYNCHRON im /api/internal/process-job HTTP-Request.
+# /api/process erstellt nur den Job + dispatcht einen Cloud Task. Der Cloud
+# Task ruft /api/internal/process-job auf, das hält die Connection offen
+# bis die Berechnung fertig ist.
+#
+# Mode-Switch via ENV AEROTAX_EXECUTION_MODE:
+#   - 'thread'      → Background-Thread (Default, lokal/dev/Render-Legacy)
+#   - 'cloud_tasks' → Cloud Tasks Enqueue → Worker-Endpoint (Cloud Run)
+# ════════════════════════════════════════════════════════════════════════════
+
+AEROTAX_EXECUTION_MODE = os.environ.get('AEROTAX_EXECUTION_MODE', 'thread').lower()
+AEROTAX_TASKS_QUEUE = os.environ.get('AEROTAX_TASKS_QUEUE', 'aerotax-jobs')
+AEROTAX_TASKS_LOCATION = os.environ.get('AEROTAX_TASKS_LOCATION', 'europe-west3')
+AEROTAX_GCP_PROJECT = os.environ.get('AEROTAX_GCP_PROJECT', 'aerotax-prod')
+AEROTAX_CLOUD_RUN_WORKER_URL = os.environ.get('AEROTAX_CLOUD_RUN_WORKER_URL', '').rstrip('/')
+AEROTAX_TASK_INVOKER_SA = os.environ.get(
+    'AEROTAX_TASK_INVOKER_SA',
+    'aerotax-task-invoker@aerotax-prod.iam.gserviceaccount.com'
+)
+
+
+def _enqueue_cloud_task(job_id, attempt=1, delay_seconds=0):
+    """Dispatcht einen Cloud Task auf die aerotax-jobs Queue.
+    Worker wird unter dem AEROTAX_CLOUD_RUN_WORKER_URL/api/internal/process-job aufgerufen.
+    Auth via OIDC ID-Token (service-account aerotax-task-invoker).
+
+    Returns task name (str) oder raised RuntimeError bei Konfig-Fehler.
+    """
+    if not AEROTAX_CLOUD_RUN_WORKER_URL:
+        raise RuntimeError('AEROTAX_CLOUD_RUN_WORKER_URL not configured (cloud_tasks mode)')
+
+    try:
+        from google.cloud import tasks_v2
+    except ImportError as e:
+        raise RuntimeError(f'google-cloud-tasks not installed: {e}')
+
+    full_url = f'{AEROTAX_CLOUD_RUN_WORKER_URL}/api/internal/process-job'
+
+    client = tasks_v2.CloudTasksClient()
+    parent = client.queue_path(AEROTAX_GCP_PROJECT, AEROTAX_TASKS_LOCATION, AEROTAX_TASKS_QUEUE)
+
+    payload = {'job_id': job_id, 'attempt': int(attempt)}
+    body_bytes = json.dumps(payload).encode('utf-8')
+
+    task = {
+        'http_request': {
+            'http_method': tasks_v2.HttpMethod.POST,
+            'url': full_url,
+            'headers': {'Content-Type': 'application/json'},
+            'body': body_bytes,
+            'oidc_token': {
+                'service_account_email': AEROTAX_TASK_INVOKER_SA,
+                'audience': full_url,
+            },
+        },
+    }
+
+    if delay_seconds and delay_seconds > 0:
+        from google.protobuf import timestamp_pb2
+        d = datetime.utcnow() + timedelta(seconds=int(delay_seconds))
+        ts = timestamp_pb2.Timestamp()
+        ts.FromDatetime(d)
+        task['schedule_time'] = ts
+
+    resp = client.create_task(parent=parent, task=task)
+    print(f"[cloud-tasks] enqueued job={job_id[:8]} attempt={attempt} task={resp.name.rsplit('/', 1)[-1][:16]}")
+    return resp.name
+
+
+def _verify_internal_task_auth(request):
+    """Verifiziert dass ein eingehender Request auf /api/internal/process-job
+    wirklich von Cloud Tasks kommt (via OIDC ID-Token vom service account).
+
+    Returns True wenn auth ok, sonst False.
+    """
+    # Local-Dev-Bypass: wenn nicht im cloud_tasks-Mode, akzeptiere ohne Auth
+    # (Tests rufen den Endpoint direkt; Worker läuft in Thread-Mode gar nicht)
+    if AEROTAX_EXECUTION_MODE != 'cloud_tasks':
+        if request.headers.get('X-Internal-Task-Mode') == 'test':
+            return True
+        # Cloud Tasks Mode aus → kein realer Worker erwartet
+        return False
+
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return False
+    token = auth[7:]
+
+    try:
+        from google.oauth2 import id_token
+        from google.auth.transport import requests as _g_req
+        info = id_token.verify_oauth2_token(token, _g_req.Request())
+        # Email muss unserem service-account entsprechen
+        if info.get('email') != AEROTAX_TASK_INVOKER_SA:
+            print(f"[task-auth] email mismatch: got={info.get('email')}")
+            return False
+        # Audience muss der Worker-URL entsprechen (verhindert token-reuse für andere services)
+        expected_aud = f'{AEROTAX_CLOUD_RUN_WORKER_URL}/api/internal/process-job'
+        if info.get('aud') != expected_aud:
+            print(f"[task-auth] audience mismatch: got={info.get('aud')[:80]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[task-auth] verify fail: {type(e).__name__}: {str(e)[:200]}")
+        return False
+
+
 def _calc_worker():
-    """Background-Worker: pickt Jobs aus _calc_queue, führt sequenziell aus."""
+    """Background-Worker: pickt Jobs aus _calc_queue, führt sequenziell aus.
+
+    NUR aktiv in thread-mode (default lokal/dev). In cloud_tasks-mode startet
+    diese Funktion zwar (kein harter Bypass), aber /api/process puttet
+    nicht mehr in die Queue — der Worker bleibt idle.
+    """
     global _calc_running_id
     while True:
         try:
@@ -1618,6 +1736,45 @@ def process_real():
                 'session_token': session_token,
             }), 503
 
+        # v13 Cloud Tasks: Verzweigung nach AEROTAX_EXECUTION_MODE.
+        # Thread-Mode (Default): wie bisher in _calc_queue putten — Background-Thread
+        # picks up. Funktioniert lokal/dev und auf Plattformen mit langen
+        # Background-Tasks (Render Starter, eigener VPS).
+        # Cloud-Tasks-Mode: Job + Form persistieren, Cloud Task dispatchen, der ruft
+        # /api/internal/process-job — Worker läuft SYNCHRON im HTTP-Request, Cloud Run
+        # killt nichts mehr wegen idle-Time.
+        if AEROTAX_EXECUTION_MODE == 'cloud_tasks':
+            # Form ans Job hängen — Worker im nächsten Request liest es aus Persistenz
+            with _jobs_lock:
+                _jobs[job_id]['form'] = form
+                _jobs[job_id]['attempt_id'] = 1
+                _jobs[job_id]['status'] = 'queued'
+            _save_job_to_disk(job_id)
+
+            try:
+                _enqueue_cloud_task(job_id, attempt=1)
+            except Exception as _e:
+                # Enqueue fail → Job als failed_retryable markieren
+                _set_job_failed(job_id, 'WORKER_RESTARTED',
+                                 f'Cloud Tasks enqueue failed: {str(_e)[:200]}')
+                print(f"[process] cloud_tasks enqueue fail: {_e}")
+                return jsonify({
+                    'job_id': job_id,
+                    'status': 'failed',
+                    'error': 'Auswertung konnte nicht gestartet werden. Bitte erneut versuchen.',
+                    'session_token': session_token,
+                }), 500
+
+            return jsonify({
+                'job_id': job_id,
+                'status': 'queued',
+                'canonical_state': 'queued',
+                'execution_mode': 'cloud_tasks',
+                'session_token': session_token,
+                'poll_url': f'/api/job/{job_id}',
+            })
+
+        # ── Thread-Mode (Default / Legacy) ──────────────────────────────
         _calc_queue.put((job_id, form, files))
         queue_pos = _get_queue_position(job_id) or 1
         # Echten Status anhand Position setzen
@@ -1639,6 +1796,131 @@ def process_real():
         print(f'Process error: {e}')
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/internal/process-job', methods=['POST'])
+def internal_process_job():
+    """v13 Cloud Tasks Worker — wird von Cloud Tasks aufgerufen, hält die HTTP-
+    Connection offen bis Berechnung fertig. Cloud Run sieht aktive Verbindung,
+    SIGTERM kommt erst nach Return.
+
+    Auth: OIDC ID-Token vom aerotax-task-invoker Service-Account.
+    Body: {"job_id": "...", "attempt": N}
+
+    Idempotenz:
+      - status=done → 200 idempotent, kein Re-Compute
+      - canonical_state=failed_support → 200 no-retry
+      - status=processing mit gleicher/höherer attempt → 200 duplicate
+      - sonst: lock auf attempt_id, run.
+    """
+    if not _verify_internal_task_auth(request):
+        return jsonify({'error': 'unauthorized'}), 401
+
+    body = request.get_json(silent=True) or {}
+    job_id = body.get('job_id', '').strip()
+    attempt = int(body.get('attempt', 1) or 1)
+    if not job_id:
+        return jsonify({'error': 'job_id required'}), 400
+
+    # Job laden — Memory zuerst, dann Disk
+    with _jobs_lock:
+        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if j:
+            _jobs[job_id] = j  # in Memory ziehen
+    if not j:
+        # Auch nicht auf Disk — vermutlich ephemeral verloren oder älterer Cleanup
+        print(f"[worker] job {job_id[:8]} not found — task is no-op")
+        return jsonify({'idempotent': True, 'no_op': True, 'reason': 'job not found'}), 200
+
+    status = j.get('status') or 'pending'
+    current_attempt = int(j.get('attempt_id', 0) or 0)
+
+    # ── Idempotenz-Branches ────────────────────────────────────────────
+    # done → return 200, kein Re-Compute
+    if status in ('done',):
+        return jsonify({'idempotent': True, 'status': 'done'}), 200
+
+    # failed_support oder cancelled → kein Retry
+    _state = _classify_job_state(j)
+    if _state['canonical_state'] == 'failed_support':
+        return jsonify({
+            'idempotent': True, 'no_retry': True,
+            'canonical_state': 'failed_support',
+            'reason_code': _state.get('reason_code'),
+        }), 200
+    if status == 'cancelled':
+        return jsonify({'idempotent': True, 'no_retry': True, 'status': 'cancelled'}), 200
+
+    # processing mit gleicher oder höherer attempt → ignore duplicate
+    if status == 'processing' and current_attempt >= attempt:
+        return jsonify({
+            'idempotent': True, 'duplicate': True,
+            'current_attempt': current_attempt, 'task_attempt': attempt,
+        }), 200
+
+    # ── Files + Form rekonstruieren ────────────────────────────────────
+    form = j.get('form') or {}
+    if not form:
+        _set_job_failed(job_id, 'WORKER_RESTARTED', 'Job form data missing — cannot run')
+        return jsonify({'error': 'job form missing', 'reason_code': 'WORKER_RESTARTED'}), 200
+
+    ref = form.get('ref') or ''
+    if not ref:
+        _set_job_failed(job_id, 'UPLOAD_EXPIRED', 'No upload ref in job — uploads expired')
+        return jsonify({'error': 'no upload ref', 'reason_code': 'UPLOAD_EXPIRED'}), 200
+
+    files_raw = _load_uploaded_files_supabase(ref)
+    if not files_raw:
+        _set_job_failed(job_id, 'UPLOAD_EXPIRED', 'Uploaded files no longer in storage')
+        return jsonify({'error': 'uploaded files not found', 'reason_code': 'UPLOAD_EXPIRED'}), 200
+
+    # Format-Anpassung: _load_uploaded_files_supabase returnt {key: [(bytes, fname), ...]}.
+    # Bestehender Code in process()/run_process_async erwartet die selbe Shape — passt.
+    files = files_raw
+
+    # ── Lock: attempt_id setzen, status=processing ─────────────────────
+    with _jobs_lock:
+        j['status'] = 'processing'
+        j['attempt_id'] = attempt
+        j['processing_started_at'] = datetime.utcnow().isoformat() + 'Z'
+        _jobs[job_id] = j
+    _save_job_to_disk(job_id)
+
+    # ── Synchron berechnen ────────────────────────────────────────────
+    print(f"[worker] job={job_id[:8]} attempt={attempt} start")
+    try:
+        _run_process_async(job_id, form, files)
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        # _run_process_async fängt schon die meisten Errors selbst und setzt status=failed.
+        # Falls hier doch was durchkommt: hart als failed markieren.
+        _set_job_failed(job_id, 'WORKER_RESTARTED', f'Worker exception: {str(e)[:200]}')
+
+    # Final state lesen
+    with _jobs_lock:
+        final_j = _jobs.get(job_id) or {}
+    final_status = final_j.get('status', 'unknown')
+    final_state = _classify_job_state(final_j)
+    print(f"[worker] job={job_id[:8]} done status={final_status} canonical={final_state['canonical_state']}")
+
+    # ── Response ───────────────────────────────────────────────────────
+    if final_status == 'done':
+        return jsonify({'ok': True, 'status': 'done'}), 200
+    # failed_retryable → 500 damit Cloud Tasks retried (bis max_attempts=2)
+    if final_state['canonical_state'] == 'failed_retryable' and attempt < AEROTAX_MAX_RETRY:
+        return jsonify({
+            'retryable': True,
+            'reason_code': final_state.get('reason_code'),
+            'attempt': attempt, 'max_attempts': AEROTAX_MAX_RETRY,
+        }), 500
+    # failed_support → 200 (kein Retry)
+    return jsonify({
+        'ok': False,
+        'status': final_status,
+        'canonical_state': final_state['canonical_state'],
+        'reason_code': final_state.get('reason_code'),
+    }), 200
 
 
 def _run_process_async(job_id, form, files):
