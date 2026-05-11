@@ -10271,15 +10271,20 @@ def _followme_align_counters(classification, matched_days, year=2025, homebase='
     # Reinigungstage = aktive Arbeitstage (gleiche Definition wie FollowMe-Seite 3)
     reinigungstage_followme = arbeitstage_followme
 
-    # Hotel-Nächte: Σ aktive Tage mit overnight_after_day=True.
-    # Definition FollowMe: jede Übernachtung im fremden Bett zählt.
-    # ORTSTAG/Frei-Tage ohne overnight sind ausgeschlossen.
-    hotel_naechte_followme = sum(
-        1 for tour in tours
-        for td in tour['days']
-        if (td.get('reader_facts') or {}).get('overnight_after_day')
-        and _followme_is_active_workday(td)
-    )
+    # Hotel-Nächte: FollowMe-Logik = Σ Tour-Tage mit klass='Z76' MINUS jeweils
+    # der letzte Z76-Tag pro Tour (= Heimkehr-/Abreisetag, Crew schläft danach
+    # zuhause). Reine Inland-Touren ohne Z76 → 0 Hotel.
+    # Verifiziert gegen Tibor's FollowMe-Soll: Tour 4 (HKG, 5d, 1d DE + 4d Z76)
+    # → 4 Z76-Tage minus 1 (letzter) = 3 Hotelnächte. Matcht FM Jan=5.
+    hotel_naechte_followme = 0
+    for tour in tours:
+        # Indizes aller Z76-Tage in der Tour
+        z76_idxs = [idx for idx, td in enumerate(tour['days'])
+                     if (td.get('klass') or '').lower() == 'z76']
+        if not z76_idxs:
+            continue  # Inland-Tour
+        # Alle Z76-Tage außer dem letzten zählen als Hotel
+        hotel_naechte_followme += len(z76_idxs) - 1
 
     # Update classification
     classification['_followme_aligned'] = True

@@ -11532,6 +11532,81 @@ def test_f3_f4_offline_against_tibor_golden_with_synth_f1():
     assert 60 <= hotel <= 95, f'Hotel soll 66 ±29, ist {hotel}'
 
 
+def test_followme_hotel_z76_minus_last_per_tour():
+    """Hotel-Algo: pro Tour len(Z76-Tage)-1, weil letzter Z76-Tag = Heimkehr."""
+    _app = _load_app_fresh()
+    # Synth-Tour: 1 DE Anreise + 3 HKG Z76 + Heimkehr Z76 → 4 Z76 - 1 = 3 Hotel
+    fake_tour_days = [
+        {'datum': '2025-01-18', 'klass': 'Z73', 'reader_facts': {}, 'marker': '49444'},
+        {'datum': '2025-01-19', 'klass': 'Z76', 'reader_facts': {'overnight_after_day': True}},
+        {'datum': '2025-01-20', 'klass': 'Z76', 'reader_facts': {'overnight_after_day': True}},
+        {'datum': '2025-01-21', 'klass': 'Z76', 'reader_facts': {'overnight_after_day': True}},
+        {'datum': '2025-01-22', 'klass': 'Z76', 'reader_facts': {'overnight_after_day': False},
+         'marker': '797 LH797-1'},  # Heimkehr
+    ]
+    cl = {'tage_detail': fake_tour_days, 'fahr_tage': 0, 'arbeitstage': 0,
+          'reinigungstage': 0, 'hotel_naechte': 0}
+    aligned = _app._followme_align_counters(cl, [], 2025, 'FRA')
+    assert aligned['hotel_naechte'] == 3, \
+        f'Sollte 3 Hotel (4 Z76-1), ist {aligned["hotel_naechte"]}'
+
+
+def test_followme_no_hotel_for_same_day_tour():
+    """1-Tag-Tour ohne Übernachtung → 0 Hotelnächte."""
+    _app = _load_app_fresh()
+    fake_tour = [
+        {'datum': '2025-03-16', 'klass': 'Z76', 'reader_facts': {},
+         'marker': '82907 PU'},
+    ]
+    cl = {'tage_detail': fake_tour, 'fahr_tage': 0, 'arbeitstage': 0,
+          'reinigungstage': 0, 'hotel_naechte': 0}
+    aligned = _app._followme_align_counters(cl, [], 2025, 'FRA')
+    assert aligned['hotel_naechte'] == 0
+
+
+def test_followme_no_hotel_for_inland_only_tour():
+    """Reine Inland-Tour (Z72/Z73 ohne Z76) → 0 Hotelnächte."""
+    _app = _load_app_fresh()
+    fake_tour = [
+        {'datum': '2025-03-18', 'klass': 'Z72', 'reader_facts': {}, 'marker': 'EH'},
+        {'datum': '2025-03-19', 'klass': 'Z72', 'reader_facts': {}, 'marker': 'EM'},
+    ]
+    cl = {'tage_detail': fake_tour, 'fahr_tage': 0, 'arbeitstage': 0,
+          'reinigungstage': 0, 'hotel_naechte': 0}
+    aligned = _app._followme_align_counters(cl, [], 2025, 'FRA')
+    assert aligned['hotel_naechte'] == 0
+
+
+def test_followme_hotel_offline_tibor_within_tolerance():
+    """Hotel-Counter Tibor (mit Synth-F1) im Δ±7 Toleranz-Bereich (Soll 66).
+    Plausibilität-Test — exakte Match braucht Live-F1-Daten."""
+    import os, json as _json
+    _app = _load_app_fresh()
+    fixture_path = os.path.join(os.path.dirname(__file__), 'fixtures',
+                                'tibor_aerotax_v11_raw_initial.json')
+    if not os.path.exists(fixture_path):
+        import pytest as _pt
+        _pt.skip()
+    raw_td = _json.load(open(fixture_path))
+    sorted_td = sorted([t for t in raw_td if isinstance(t, dict) and t.get('datum')],
+                       key=lambda t: t['datum'])
+    for i, t in enumerate(sorted_td):
+        if (t.get('klass') or '').lower() != 'frei': continue
+        m = (t.get('marker') or '').upper().strip()
+        if not (m in ('X','==') or m.startswith('X ') or 'OFF' in m.split()): continue
+        prev_in = (i > 0 and ((sorted_td[i-1].get('reader_facts') or {}).get('overnight_after_day')
+                   or (sorted_td[i-1].get('klass','').lower() in ('z73','z74','z76'))))
+        next_in = (i < len(sorted_td)-1
+                   and sorted_td[i+1].get('klass','').lower() in ('z73','z74','z76'))
+        if prev_in and next_in:
+            t['klass'] = 'Z76'
+    cl = {'tage_detail': sorted_td, 'fahr_tage': 0, 'arbeitstage': 0,
+          'reinigungstage': 0, 'hotel_naechte': 0}
+    aligned = _app._followme_align_counters(cl, [], 2025, 'FRA')
+    hotel = aligned['hotel_naechte']
+    assert 59 <= hotel <= 73, f'Hotel soll 66 ±7, ist {hotel}'
+
+
 def test_f3_passive_ortstag_excluded_from_workday():
     """ORTSTAG-only Tage (Office ohne start_time/duration) sind kein active_workday."""
     _app = _load_app_fresh()
