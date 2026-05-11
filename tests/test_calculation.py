@@ -8801,15 +8801,24 @@ def test_v104_migration_cleanup_extended_with_chunks():
 
 
 def test_v104_create_job_chunk_returns_id():
-    """create_job_chunk() liefert chunk_id (UUID-Format)."""
-    _app = _load_app_fresh()
-    cid = _app.create_job_chunk('test-job-001', 'dp', 0, 1, 3)
-    assert cid is not None
-    assert len(cid) == 36  # UUID-Format
+    """create_job_chunk() liefert chunk_id (UUID-Format) wenn Persistenz aktiv.
+    v11 B-015: Test setzt explizit AEROTAX_USE_CHUNK_PERSISTENCE=1."""
+    import os as _os
+    _os.environ['AEROTAX_USE_CHUNK_PERSISTENCE'] = '1'
+    try:
+        _app = _load_app_fresh()
+        cid = _app.create_job_chunk('test-job-001', 'dp', 0, 1, 3)
+        assert cid is not None
+        assert len(cid) == 36  # UUID-Format
+    finally:
+        _os.environ.pop('AEROTAX_USE_CHUNK_PERSISTENCE', None)
 
 
 def test_v104_save_job_chunk_result_sanitizes_pdf_bytes():
-    """save_job_chunk_result entfernt jegliche PDF-/Binary-Felder."""
+    """save_job_chunk_result entfernt jegliche PDF-/Binary-Felder.
+    v11 B-015: Test setzt explizit AEROTAX_USE_CHUNK_PERSISTENCE=1."""
+    import os as _os
+    _os.environ['AEROTAX_USE_CHUNK_PERSISTENCE'] = '1'
     _app = _load_app_fresh()
     cid = _app.create_job_chunk('test-job-002', 'dp', 0, 1, 3)
     poisoned = {
@@ -9303,16 +9312,22 @@ def test_v1041_find_cached_chunk_returns_none_without_hash():
 
 
 def test_v1041_create_job_chunk_accepts_file_hash():
-    """create_job_chunk akzeptiert file_hash + parser_version."""
-    _app = _load_app_fresh()
-    cid = _app.create_job_chunk('test-job-hash-001', 'dp', 0, 1, 3,
-                                  file_hash='abc123', parser_version='v10.4.1')
-    assert cid is not None
-    chunks = _app.load_job_chunks('test-job-hash-001')
-    if chunks:
-        c = chunks[0]
-        assert c.get('file_hash') == 'abc123'
-        assert c.get('parser_version') == 'v10.4.1'
+    """create_job_chunk akzeptiert file_hash + parser_version.
+    v11 B-015: Test setzt explizit AEROTAX_USE_CHUNK_PERSISTENCE=1."""
+    import os as _os
+    _os.environ['AEROTAX_USE_CHUNK_PERSISTENCE'] = '1'
+    try:
+        _app = _load_app_fresh()
+        cid = _app.create_job_chunk('test-job-hash-001', 'dp', 0, 1, 3,
+                                      file_hash='abc123', parser_version='v10.4.1')
+        assert cid is not None
+        chunks = _app.load_job_chunks('test-job-hash-001')
+        if chunks:
+            c = chunks[0]
+            assert c.get('file_hash') == 'abc123'
+            assert c.get('parser_version') == 'v10.4.1'
+    finally:
+        _os.environ.pop('AEROTAX_USE_CHUNK_PERSISTENCE', None)
 
 
 def test_v1041_dp_chunked_computes_file_hash():
@@ -11217,6 +11232,147 @@ def test_qa_b014_cors_localhost_only_in_dev():
     lh_idx = block.find('http://localhost')
     assert cond_idx > 0 and lh_idx > cond_idx, \
         'localhost-Origins müssen hinter Production-Env-Check stehen'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 B-015: Chunk-Persistence-Flag — Tests
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_v11_b015_default_no_job_chunks_written():
+    """Default-Flag=0: create_job_chunk liefert None, kein Supabase-Write."""
+    import os as _os
+    prev = _os.environ.pop('AEROTAX_USE_CHUNK_PERSISTENCE', None)
+    try:
+        _app = _load_app_fresh()
+        # Direct call: muss None liefern weil Flag off
+        result = _app.create_job_chunk('test-job-123', 'cas', 0,
+                                        file_hash='abc', parser_version='v11.0.0')
+        assert result is None, 'create_job_chunk darf bei Flag=0 nichts schreiben'
+    finally:
+        if prev is not None:
+            _os.environ['AEROTAX_USE_CHUNK_PERSISTENCE'] = prev
+
+
+def test_v11_b015_chunk_persistence_flag_enables_old_path():
+    """Flag=1: create_job_chunk schreibt wieder (oder versucht es — Supabase
+    kann offline sein, dann Disk-Fallback)."""
+    import os as _os
+    _os.environ['AEROTAX_USE_CHUNK_PERSISTENCE'] = '1'
+    try:
+        _app = _load_app_fresh()
+        # Bei Flag=1 sollte die Funktion NICHT None liefern (zumindest versuchen).
+        # Da wir hier keine Live-Supabase haben, Disk-Fallback greift → chunk_id wird zurückgegeben.
+        result = _app.create_job_chunk('test-job-flag-on', 'cas', 0,
+                                        file_hash='abc', parser_version='v11.0.0')
+        assert result is not None, 'Bei Flag=1 muss chunk_id zurückkommen'
+    finally:
+        _os.environ.pop('AEROTAX_USE_CHUNK_PERSISTENCE', None)
+
+
+def test_v11_b015_save_chunk_noop_without_id():
+    """save_job_chunk_result is no-op wenn chunk_id None (Flag=0 hat
+    bereits None geliefert) — kein Crash."""
+    _app = _load_app_fresh()
+    # Sollte nicht crashen, einfach return
+    result = _app.save_job_chunk_result(None, {'days': []})
+    assert result is None
+
+
+def test_v11_b015_find_cached_chunk_returns_none_when_off():
+    """find_cached_chunk returns None wenn Flag=0 (kein DB-Lookup)."""
+    import os as _os
+    prev = _os.environ.pop('AEROTAX_USE_CHUNK_PERSISTENCE', None)
+    try:
+        _app = _load_app_fresh()
+        result = _app.find_cached_chunk('hash123', 'cas', 0, 'v11.0.0')
+        assert result is None, 'Cache-Lookup muss bei Flag=0 immer None sein'
+    finally:
+        if prev is not None:
+            _os.environ['AEROTAX_USE_CHUNK_PERSISTENCE'] = prev
+
+
+def test_v11_b015_cas_reader_handles_missing_chunk_id():
+    """CAS-Reader-Code prüft `if chunk_id:` — bei None überspringt sauber."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured(')
+    block = src[fn_idx:fn_idx + 6000]
+    # CAS-Reader nutzt das `if chunk_id:` Pattern um None abzufangen
+    assert 'if chunk_id:' in block, \
+        'CAS-Reader muss chunk_id auf None prüfen vor save_job_chunk_result'
+
+
+def test_v11_b015_dp_chunked_handles_missing_chunk_id():
+    """DP-Chunked (Legacy) prüft chunk_id ebenso vor save."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_dp_structured_chunked_v104(')
+    block = src[fn_idx:fn_idx + 8000]
+    # DP-Chunked nutzt mehrere `if chunk_id:` Pattern
+    assert block.count('if chunk_id:') >= 2
+
+
+def test_v11_b015_job_state_persistence_still_active():
+    """Job-State-Persistenz (jobs Table) ist NICHT vom Flag betroffen.
+    _save_job_to_disk + Supabase-Upsert für jobs läuft weiter."""
+    src = _read_backend()
+    fn_idx = src.find('def _save_job_to_disk(job_id):')
+    block = src[fn_idx:fn_idx + 1500]
+    # Job-State-Save hat keinen AEROTAX_USE_CHUNK_PERSISTENCE-Check
+    assert 'AEROTAX_USE_CHUNK_PERSISTENCE' not in block, \
+        'Job-State-Persistenz darf nicht vom Chunk-Flag abhängen'
+    # Supabase-Upsert für jobs läuft weiter
+    assert "sb.table('jobs').upsert" in block
+
+
+def test_v11_b015_session_persistence_still_active():
+    """Session-Persistenz (sessions Table) NICHT vom Flag betroffen."""
+    src = _read_backend()
+    fn_idx = src.find('def _save_session(token, data):')
+    block = src[fn_idx:fn_idx + 1200]
+    assert 'AEROTAX_USE_CHUNK_PERSISTENCE' not in block
+
+
+def test_v11_b015_pdf_persistence_still_active():
+    """PDF-Persistenz (pdfs Table) NICHT vom Flag betroffen."""
+    src = _read_backend()
+    # Suche _save_pdf-Funktion
+    pdf_save_idx = src.find("sb.table('pdfs').upsert")
+    assert pdf_save_idx > 0
+
+
+def test_v11_b015_disk_fallback_unchanged():
+    """Disk-Fallback (_JOB_CHUNKS_DIR) ist NICHT vom Flag deaktiviert —
+    er greift nur wenn Persistence on UND Supabase offline. Cleanup
+    löscht trotzdem alte Files."""
+    src = _read_backend()
+    assert '_JOB_CHUNKS_DIR' in src
+    # Cleanup hat keinen Flag-Guard (löscht alte Rows immer)
+    cleanup_idx = src.find("sb.table('job_chunks').delete().lt")
+    assert cleanup_idx > 0
+
+
+def test_v11_b015_cleanup_still_handles_old_job_chunks():
+    """Cleanup-Loop löscht alte job_chunks-Rows unabhängig vom Flag."""
+    src = _read_backend()
+    # Cleanup-SQL-Call darf NICHT in einem `if AEROTAX_USE_CHUNK_PERSISTENCE:`-Block stehen
+    # — alte Rows müssen aufgeräumt werden auch wenn neue Writes off sind.
+    idx = src.find("sb.table('job_chunks').delete().lt")
+    pre_block = src[max(0, idx-500):idx]
+    # Muss Cleanup-Helper sein, nicht innerhalb einer Flag-Bedingung
+    assert 'if AEROTAX_USE_CHUNK_PERSISTENCE' not in pre_block
+
+
+def test_v11_b015_flag_default_is_off():
+    """Default-Wert: AEROTAX_USE_CHUNK_PERSISTENCE=0 (off)."""
+    import os as _os
+    prev = _os.environ.pop('AEROTAX_USE_CHUNK_PERSISTENCE', None)
+    try:
+        _app = _load_app_fresh()
+        assert _app.AEROTAX_USE_CHUNK_PERSISTENCE is False, \
+            'Default soll False sein (chunk-persistence ausgeschaltet)'
+    finally:
+        if prev is not None:
+            _os.environ['AEROTAX_USE_CHUNK_PERSISTENCE'] = prev
 
 
 if __name__ == '__main__':

@@ -223,6 +223,20 @@ _ALL_FILE_KEYS = (
 # Notfall-Rollback: AEROTAX_PIPELINE_VERSION=v10_legacy als Render-ENV setzen.
 AEROTAX_PIPELINE_VERSION = os.environ.get('AEROTAX_PIPELINE_VERSION', 'v11_cas_primary')
 
+# v11 B-015: Chunk-Persistence-Flag.
+# v10.4 hatte job_chunks-Persistierung eingeführt, um bei großem DP-Reader (~200
+# Seiten) RAM zu schonen + nach Restart resumen zu können. v11 CAS-Reader macht
+# nur 1 Sonnet-Call pro Datei — viel weniger Memory-Spike. Persistierung pro Chunk
+# ist nicht mehr nötig.
+#
+# AEROTAX_USE_CHUNK_PERSISTENCE:
+#   '0' (default): keine Writes in job_chunks-Tabelle, kein Cache-Lookup.
+#                   CAS-Reader läuft direkt + in-memory.
+#   '1':           Legacy-Verhalten — Chunks werden persistiert + gecached.
+#                   Notwendig wenn AEROTAX_PIPELINE_VERSION=v10_legacy oder
+#                   wenn wir wieder Resume-After-Restart brauchen.
+AEROTAX_USE_CHUNK_PERSISTENCE = os.environ.get('AEROTAX_USE_CHUNK_PERSISTENCE', '0') == '1'
+
 UPLOAD_TTL_HOURS = 4   # Pre-Upload nur kurz aufbewahren — nach Auswertung gelöscht
 
 
@@ -1077,7 +1091,10 @@ def create_job_chunk(job_id, document_type, chunk_index,
     """Erstellt einen pending-Chunk-Eintrag. Idempotent via (job_id, document_type, chunk_index).
     v10.4.1: file_hash + parser_version unterstützen Cache-Lookups bei Wiederholung
     derselben Datei.
-    Returns chunk_id (UUID) oder None bei Fehler."""
+    v11 B-015: NO-OP wenn AEROTAX_USE_CHUNK_PERSISTENCE=0 (default).
+    Returns chunk_id (UUID) oder None bei Fehler oder bei Flag=0."""
+    if not AEROTAX_USE_CHUNK_PERSISTENCE:
+        return None
     import uuid as _uuid
     chunk_id = str(_uuid.uuid4())
     row = {
@@ -1116,20 +1133,29 @@ def create_job_chunk(job_id, document_type, chunk_index,
 
 
 def mark_job_chunk_running(chunk_id):
-    """Markiert chunk als 'running'."""
+    """Markiert chunk als 'running'.
+    v11 B-015: NO-OP wenn chunk_id None (Flag=0)."""
+    if not AEROTAX_USE_CHUNK_PERSISTENCE or not chunk_id:
+        return
     _update_chunk_fields(chunk_id, status='running')
 
 
 def save_job_chunk_result(chunk_id, result_json):
     """Speichert Chunk-Result + setzt status='completed'.
-    result_json wird sanitized (kein base64/PDF-bytes)."""
+    result_json wird sanitized (kein base64/PDF-bytes).
+    v11 B-015: NO-OP wenn chunk_id None (Flag=0) oder Persistence ausgeschaltet."""
+    if not AEROTAX_USE_CHUNK_PERSISTENCE or not chunk_id:
+        return
     sanitized = _sanitize_chunk_result(result_json)
     _update_chunk_fields(chunk_id, status='completed', result_json=sanitized,
                          error_code=None, error_message=None)
 
 
 def mark_job_chunk_failed(chunk_id, error_code, error_message):
-    """Markiert chunk als failed mit Code + Message."""
+    """Markiert chunk als failed mit Code + Message.
+    v11 B-015: NO-OP wenn chunk_id None (Flag=0)."""
+    if not AEROTAX_USE_CHUNK_PERSISTENCE or not chunk_id:
+        return
     _update_chunk_fields(chunk_id, status='failed',
                          error_code=str(error_code)[:50],
                          error_message=str(error_message)[:500])
@@ -1196,8 +1222,13 @@ def find_cached_chunk(file_hash, document_type, chunk_index, parser_version):
     Wenn dieselbe Datei (SHA-256) + selbe parser_version bereits ausgewertet:
     Result direkt aus Supabase ohne Sonnet-Call.
 
+    v11 B-015: returns None wenn AEROTAX_USE_CHUNK_PERSISTENCE=0 (default).
+    Cache-Hit ist Optimierung, kein Korrektheits-Feature.
+
     Returns result_json (dict) oder None.
     """
+    if not AEROTAX_USE_CHUNK_PERSISTENCE:
+        return None
     if not file_hash or not parser_version:
         return None
     if SB_AVAILABLE:
