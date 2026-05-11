@@ -6068,15 +6068,18 @@ def test_v827_plus_btn_opens_attach_menu_not_chat_msg():
 
 
 def test_v827_attach_menu_has_doc_type_pills():
-    """Attach-Popover bietet Doc-Type-Auswahl (LSB/SE/DP/Other)."""
+    """v11: Attach-Popover bietet Doc-Type-Auswahl (CAS/LSB/SE/Other) — FU entfernt."""
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('window._chatToggleAttachMenu = function')
     assert fn_idx > 0
     block = src[fn_idx:fn_idx+3500]
-    for label in ['Lohnsteuerbescheinigung', 'Streckeneinsatzabrechnung', 'Flugstundenübersicht', 'Sonstiger Beleg']:
+    for label in ['Lohnsteuerbescheinigung', 'Streckeneinsatzabrechnung', 'CAS', 'Sonstiger Beleg']:
         assert label in block, f'Doc-Type "{label}" fehlt im Attach-Popover'
+    # v11: Flugstundenübersicht darf NICHT mehr im Picker erscheinen
+    assert 'Flugstundenübersicht' not in block, \
+        'v11: Flugstundenübersicht darf nicht mehr im Attach-Popover sein'
 
 
 def test_v827_attach_file_creates_pill_in_footer():
@@ -11011,6 +11014,209 @@ def test_v11p6_pipeline_branch_logs_version():
     fn_idx = src.find('def hybrid_analyze(')
     block = src[fn_idx:fn_idx + 1500]
     assert 'pipeline=' in block or 'AEROTAX_PIPELINE_VERSION' in block
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 Pre-Beta QA-Fixes — Tests B-001..B-014
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_qa_b001_chat_picker_no_flugstunden():
+    """Chat-Attach-Picker bietet keine Flugstundenübersicht-Option mehr."""
+    src = open(_FRONTEND_HTML).read()
+    fn_idx = src.find('window._chatToggleAttachMenu = function')
+    block = src[fn_idx:fn_idx + 3500]
+    assert "key:'dp'" not in block, 'dp-Eintrag muss aus Chat-Picker entfernt sein'
+    assert 'Flugstundenübersicht' not in block
+
+
+def test_qa_b001_doclabels_no_legacy_wording():
+    """docLabels enthalten kein „Flugstunden (Legacy)" mehr."""
+    src = open(_FRONTEND_HTML).read()
+    assert "Flugstunden (Legacy)" not in src, '„Legacy"-Wording user-facing entfernen'
+
+
+def test_qa_b007_chat_intent_regex_no_flugstunden():
+    """Chat-Intent-Detection-Regex matcht keine flugstunden-Keywords mehr."""
+    src = open(_FRONTEND_HTML).read()
+    # Suche die docs-Regex-Zeile
+    idx = src.find("return 'docs'")
+    block_before = src[max(0, idx-400):idx]
+    assert 'flugstunden' not in block_before.lower(), \
+        'Intent-Regex sollte dienstplan/roster/cas matchen, nicht flugstunden'
+
+
+def test_qa_b006_backend_rejects_dp_replacement_in_v11():
+    """upload-replacement lehnt doc_type=dp in v11_cas_primary ab."""
+    src = _read_backend()
+    fn_idx = src.find('def post_upload_replacement(')
+    block = src[fn_idx:fn_idx + 2500]
+    assert "doc_type == 'dp'" in block
+    assert 'v11_cas_primary' in block
+    assert 'Dienstplan/CAS/Roster' in block or 'CAS' in block
+
+
+def test_qa_b005_backend_preview_breakdown_full_fields():
+    """review-answer liefert vollständiges preview_breakdown (kein manueller Pick)."""
+    src = _read_backend()
+    fn_idx = src.find('def post_review_answer(')
+    block = src[fn_idx:fn_idx + 4000]
+    # Sollte rec['totals'] direkt durchreichen — keine manuelle Pick-Liste
+    assert "recalc_breakdown = dict(rec['totals'])" in block, \
+        'preview_breakdown soll alle Felder enthalten (dict(rec["totals"]))'
+
+
+def test_qa_b005_review_bulk_returns_preview_breakdown():
+    """review-bulk-answer liefert preview_breakdown in JSON-Response."""
+    src = _read_backend()
+    # Suche post_review_bulk_answer und prüfe ob preview_breakdown im jsonify()
+    fn_idx = src.find('def post_review_bulk_answer(')
+    block = src[fn_idx:fn_idx + 6000]
+    assert "'preview_breakdown'" in block
+
+
+def test_qa_b005_frontend_applies_preview_breakdown():
+    """Frontend ruft _applyPreviewBreakdown bei jeder Review-Response."""
+    src = open(_FRONTEND_HTML).read()
+    assert 'window._applyPreviewBreakdown = function' in src
+    # Mindestens 2 Call-Sites — Backend liefert es in 3 verschiedenen Routes
+    count = src.count('_applyPreviewBreakdown(j.preview_breakdown)')
+    assert count >= 2, f'Expected >=2 calls, found {count}'
+
+
+def test_qa_b005_render_detail_table_extracted():
+    """_renderDetailTable als standalone Funktion — wiederverwendbar."""
+    src = open(_FRONTEND_HTML).read()
+    assert 'function _renderDetailTable(d, _y)' in src
+
+
+def test_qa_b002_session_token_decorator_exists():
+    """requires_session_token Decorator definiert."""
+    src = _read_backend()
+    assert 'def requires_session_token(' in src
+    assert 'hmac.compare_digest' in src
+    assert 'X-Session-Token' in src
+
+
+def test_qa_b002_all_job_routes_decorated():
+    """Jede /api/job/<job_id>/* Route hat @requires_session_token."""
+    src = _read_backend()
+    import re as _re
+    pattern = _re.compile(
+        r"@app\.route\('/api/job/<job_id>[^']*', methods=\[[^\]]+\]\)\n(@[^\n]+\n)?def "
+    )
+    routes_with_deco = 0
+    routes_total = 0
+    for m in pattern.finditer(src):
+        routes_total += 1
+        deco_line = m.group(1) or ''
+        if 'requires_session_token' in deco_line:
+            routes_with_deco += 1
+    assert routes_total >= 10, f'Expected >=10 job routes, found {routes_total}'
+    assert routes_with_deco == routes_total, \
+        f'{routes_with_deco}/{routes_total} routes haben den Decorator'
+
+
+def test_qa_b002_frontend_injects_session_token_header():
+    """Frontend patcht fetch + _fetchWithTimeout für X-Session-Token-Header."""
+    src = open(_FRONTEND_HTML).read()
+    assert 'window._jobAuthHeaders = function' in src
+    assert "'X-Session-Token'" in src
+    assert '__aero_patched_v11' in src
+
+
+def test_qa_b003_rls_migration_exists():
+    """RLS-Migration ist vorhanden und enabled alle relevanten Tables."""
+    import os as _os
+    mig_dir = _os.path.join(_os.path.dirname(_FRONTEND_HTML), '..',
+                             'aerotax-backend', 'supabase_migrations')
+    if not _os.path.isdir(mig_dir):
+        mig_dir = '/Users/miguelschumann/Desktop/aerotax-backend/supabase_migrations'
+    files = _os.listdir(mig_dir)
+    rls_migs = [f for f in files if 'rls' in f.lower() or 'enable_rls' in f]
+    assert rls_migs, f'Keine RLS-Migration in {mig_dir}'
+    content = open(_os.path.join(mig_dir, rls_migs[0])).read()
+    for table in ['jobs', 'sessions', 'pdfs', 'uploaded_files', 'job_chunks']:
+        assert f'enable row level security' in content
+        assert table in content, f'Tabelle {table} fehlt in RLS-Migration'
+
+
+def test_qa_b003_no_disable_rls_in_current_migrations():
+    """In der RLS-Migration steht kein 'disable row level security' mehr.
+    (alte job_chunks-Migration hat es noch, das ist akzeptiert da später überschrieben)"""
+    import os as _os
+    mig_dir = '/Users/miguelschumann/Desktop/aerotax-backend/supabase_migrations'
+    rls_mig_path = _os.path.join(mig_dir, '20260511_enable_rls.sql')
+    content = open(rls_mig_path).read()
+    assert 'disable row level security' not in content
+
+
+def test_qa_b004_no_default_promo_code_in_backend():
+    """PROMO_CODES Default ist leer — keine hardcoded Promos."""
+    src = _read_backend()
+    assert "PROMO_CODES', 'AEROTAXFREEPASS26'" not in src
+    assert "'PROMO_CODES', ''" in src
+
+
+def test_qa_b004_no_default_promo_code_in_frontend():
+    """Frontend PROMOS-Dict ist leer."""
+    src = open(_FRONTEND_HTML).read()
+    assert "const PROMOS={};" in src
+    assert "AEROTAXFREEPASS26" not in src
+
+
+def test_qa_b008_no_brutto_in_berechne_logs():
+    """[berechne-hybrid] FERTIG loggt keine Brutto/Z77 mehr."""
+    src = _read_backend()
+    idx = src.find("[berechne-hybrid] FERTIG:")
+    block = src[idx:idx + 400]
+    assert 'brutto=' not in block, 'Brutto nicht in print/log loggen'
+    assert 'Z77=' not in block
+
+
+def test_qa_b010_xml_escape_helper_exists():
+    """_xml_escape_for_paragraph Helper für ReportLab Paragraph-Inputs."""
+    src = _read_backend()
+    assert 'def _xml_escape_for_paragraph(' in src
+    assert "&amp;" in src and "&lt;" in src and "&gt;" in src
+
+
+def test_qa_b010_pdf_name_escaped():
+    """PDF rendert _name nach _xml_escape_for_paragraph."""
+    src = _read_backend()
+    idx = src.find("_name = _xml_escape_for_paragraph(d.get('name'")
+    assert idx > 0, 'PDF-Name muss escaped sein'
+
+
+def test_qa_b011_pdf_sources_section_present():
+    """PDF nennt explizit Lohnsteuer/Streckeneinsatz/Dienstplan-CAS als Quellen."""
+    src = _read_backend()
+    # Suche im erstelle_pdf nach Quellen-Block (in der Deckblatt-Sektion, ~Z. 15240-15260)
+    idx = src.find("Grundlage der Auswertung")
+    assert idx > 0, 'Quellen-Sektion fehlt im PDF-Renderer'
+    block = src[idx:idx + 400]
+    assert 'Lohnsteuerbescheinigung' in block
+    assert 'Streckeneinsatzabrechnung' in block
+    assert 'Dienstplan/CAS' in block or 'CAS/Roster' in block
+
+
+def test_qa_b013_no_comment_drift_v10_legacy():
+    """Comment-Drift: kein „default v10_legacy bis Phase 6" mehr — wir sind in Phase 6+."""
+    src = _read_backend()
+    assert 'default v10_legacy bis Phase 6' not in src
+
+
+def test_qa_b014_cors_localhost_only_in_dev():
+    """localhost-CORS-Origins nur wenn nicht in Production-Env."""
+    src = _read_backend()
+    idx = src.find('_cors_origins = [')
+    block = src[idx:idx + 1500]
+    assert 'localhost' in block
+    # Muss hinter einer ENV-Bedingung stehen
+    cond_idx = block.find("os.getenv('RENDER')")
+    lh_idx = block.find('http://localhost')
+    assert cond_idx > 0 and lh_idx > cond_idx, \
+        'localhost-Origins müssen hinter Production-Env-Check stehen'
 
 
 if __name__ == '__main__':

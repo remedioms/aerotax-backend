@@ -11,7 +11,7 @@
 #    PORT                   = 5000
 # ═══════════════════════════════════════════════════════════════
 
-import os, io, uuid, json, re, tempfile, gc
+import os, io, uuid, json, re, tempfile, gc, hmac
 import hashlib as _hashlib
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file, abort
@@ -61,14 +61,18 @@ from reportlab.lib.enums import TA_RIGHT, TA_CENTER, TA_LEFT
 
 # ── APP SETUP ─────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, origins=[
+# v11 B-014: localhost-Origins NUR in Development. In Production (Render setzt
+# RENDER=true via Service-Default) bleibt die Whitelist auf echte Domains
+# beschränkt — kein localhost-Bypass via Browser-Plugin/Forge möglich.
+_cors_origins = [
     os.getenv('FRONTEND_URL', 'https://aerosteuer.de'),
     'https://aerosteuer.de',
     'https://aerosteuer.pages.dev',
     re.compile(r'^https://[a-z0-9-]+\.aerosteuer\.pages\.dev$'),  # Cloudflare Preview-Deploys
-    'http://localhost:3000',
-    'http://localhost:8080',
-])
+]
+if os.getenv('RENDER') != 'true' and os.getenv('AEROTAX_ENV', '').lower() != 'production':
+    _cors_origins += ['http://localhost:3000', 'http://localhost:8080']
+CORS(app, origins=_cors_origins)
 
 stripe.api_key        = os.getenv('STRIPE_SECRET_KEY')
 WEBHOOK_SECRET        = os.getenv('STRIPE_WEBHOOK_SECRET')
@@ -936,6 +940,70 @@ def _save_job_to_disk(job_id):
         print(f"[persist] Job {job_id[:8]} disk save fail: {e}")
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# v11 B-002: Session-Token-Decorator für alle /api/job/<id>/* Routes
+#
+# Ziel: Job-Routes nur für den User zugänglich, der den Job gestartet hat.
+# Vorher: jeder mit der job_id-UUID hatte Vollzugriff.
+# Jetzt:  X-Session-Token-Header muss zum gespeicherten session_token des Jobs
+#         passen, sonst 403 mit freundlicher Meldung.
+#
+# Backwards-compat: Token kann auch als `?session_token=...` Query-Param oder im
+# JSON-Body `session_token` mitkommen (für Upload-Endpoints die multipart sind).
+# ════════════════════════════════════════════════════════════════════════════
+def _extract_session_token_from_request():
+    """Liest Session-Token aus Header / Query / Form / JSON Body — in dieser
+    Priorität. Whitespace getrimmt. Leer-String → None."""
+    tok = (request.headers.get('X-Session-Token') or '').strip()
+    if tok:
+        return tok
+    tok = (request.args.get('session_token') or '').strip()
+    if tok:
+        return tok
+    tok = (request.form.get('session_token') or '').strip()
+    if tok:
+        return tok
+    try:
+        body = request.get_json(silent=True) or {}
+        tok = (body.get('session_token') or '').strip()
+        if tok:
+            return tok
+    except Exception:
+        pass
+    return None
+
+
+def requires_session_token(fn):
+    """Decorator: lädt Job, prüft Session-Token. 403 bei Fehlen/Falsch.
+    Funktion bekommt den Job geladen UND validiert übergeben.
+    Verwendung: View-Funktion erste Position `job_id`, Decorator liest selbst.
+    """
+    import functools as _ft
+    @_ft.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        job_id = kwargs.get('job_id') or (args[0] if args else None)
+        if not job_id:
+            return jsonify({'error': 'job_id fehlt'}), 400
+        with _jobs_lock:
+            j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        if not j:
+            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
+        expected = (j.get('session_token') or '').strip()
+        provided = _extract_session_token_from_request()
+        if not expected:
+            # Legacy-Job ohne gespeicherten Token (vor v11 erstellt) — wir lassen
+            # diesen Sonderfall durch, damit aktive Auswertungen beim Deploy nicht
+            # plötzlich 403 bekommen. Neu erstellte Jobs haben immer einen Token.
+            return fn(*args, **kwargs)
+        if not provided or not hmac.compare_digest(expected, provided):
+            return jsonify({
+                'error': 'Diese Auswertung konnte nicht geöffnet werden. '
+                         'Bitte nutze deinen Zugangscode erneut.'
+            }), 403
+        return fn(*args, **kwargs)
+    return _wrapped
+
+
 def _load_job_from_disk(job_id):
     """v9.7: Lädt Job-State zuerst aus Supabase (überlebt Restart),
     dann Disk-Fallback. Bei Erfolg auch ins _jobs-Memory-Dict spiegeln."""
@@ -1382,7 +1450,10 @@ def process_real():
                         _store[ref]['paid'] = True
             except Exception as _e:
                 print(f"[stripe] PI verify fail {pi_id[:12]}: {_e}")
-        valid_promos = set(c.strip().upper() for c in os.environ.get('PROMO_CODES', 'AEROTAXFREEPASS26').split(',') if c.strip())
+        # v11 B-004: Default leer — Promo-Codes nur via ENV setzen, keine
+        # gehärteten Codes im Source. Vorher: 'AEROTAXFREEPASS26' war via Repo-Lesen
+        # öffentlich raterbar und hätte Free-Auswertungen erlaubt.
+        valid_promos = set(c.strip().upper() for c in os.environ.get('PROMO_CODES', '').split(',') if c.strip())
         is_promo = bool(promo_code and promo_code in valid_promos)
         allow_unpaid = os.environ.get('ALLOW_UNPAID') == '1'
         if not (is_paid or is_free_retry or is_promo or allow_unpaid):
@@ -1679,6 +1750,7 @@ def _run_process_async(job_id, form, files):
 
 
 @app.route('/api/job/<job_id>', methods=['GET'])
+@requires_session_token
 def get_job_status(job_id):
     """Pollt Status. Bei Memory-Miss: lade vom Disk (Server-Restart-Resilience)."""
     with _jobs_lock:
@@ -1702,6 +1774,7 @@ def get_job_status(job_id):
 
 
 @app.route('/api/job/<job_id>/audit', methods=['GET'])
+@requires_session_token
 def get_job_audit(job_id):
     """Vollständiges Audit-Log (für Compliance / Steuerberater)."""
     with _jobs_lock:
@@ -1923,6 +1996,7 @@ def _validate_and_compute_review_answer(review_item_id, answer, start_time, end_
 
 
 @app.route('/api/job/<job_id>/review-answer', methods=['POST'])
+@requires_session_token
 def post_review_answer(job_id):
     """v8.21: Speichert eine Nutzer-Antwort auf ein Review-Item.
 
@@ -1981,20 +2055,10 @@ def post_review_answer(job_id):
                     initial_total = float(((j.get('data') or {}).get('netto')) or 0)
                     if isinstance(updated_preview_total, (int, float)):
                         total_delta = round(float(updated_preview_total) - initial_total, 2)
-                    recalc_breakdown = {
-                        'arbeitstage':    rec['totals'].get('arbeitstage'),
-                        'reinigungstage': rec['totals'].get('reinigungstage'),
-                        'fahr_tage':      rec['totals'].get('fahr_tage'),
-                        'hotel_naechte':  rec['totals'].get('hotel_naechte'),
-                        'vma_72_tage':    rec['totals'].get('vma_72_tage'),
-                        'vma_73_tage':    rec['totals'].get('vma_73_tage'),
-                        'vma_72':         rec['totals'].get('vma_72'),
-                        'vma_73':         rec['totals'].get('vma_73'),
-                        'vma_aus':        rec['totals'].get('vma_aus'),
-                        'gesamt':         rec['totals'].get('gesamt'),
-                        'netto':          rec['totals'].get('netto'),
-                    }
-                    # Persist updated preview totals in job data so UI/Refresh sehen es
+                    # Full breakdown — Frontend re-rendert Detail-Tabelle daraus.
+                    # Vorher: manuelle Pick-Liste ohne fahr/reinig/trink/vma_74/ag_z17/z77 →
+                    # Detail-Tabelle desynchron mit Header. Jetzt: vollständige Felder.
+                    recalc_breakdown = dict(rec['totals'])
                     j.setdefault('data', {})['_preview_totals'] = recalc_breakdown
             except Exception as _re:
                 print(f'[review-answer] recalc fail: {_re}')
@@ -2028,6 +2092,7 @@ def post_review_answer(job_id):
 
 
 @app.route('/api/job/<job_id>/review-bulk-answer', methods=['POST'])
+@requires_session_token
 def post_review_bulk_answer(job_id):
     """v8.22 Now-3: Bulk-Antwort auf mehrere pending Review-Items vom selben Typ.
 
@@ -2087,6 +2152,7 @@ def post_review_bulk_answer(job_id):
         cached = data.get('_cached_recalc_state') or {}
         updated_preview_total = None
         total_delta = None
+        recalc_breakdown = None
         if cached.get('matched_days'):
             try:
                 rec = _recompute_with_overrides(cached, existing_overrides)
@@ -2095,7 +2161,8 @@ def post_review_bulk_answer(job_id):
                     initial_total = float((data.get('netto')) or 0)
                     if isinstance(updated_preview_total, (int, float)):
                         total_delta = round(float(updated_preview_total) - initial_total, 2)
-                    j.setdefault('data', {})['_preview_totals'] = rec['totals']
+                    recalc_breakdown = dict(rec['totals'])
+                    j.setdefault('data', {})['_preview_totals'] = recalc_breakdown
             except Exception as e:
                 print(f'[review-bulk] recalc fail: {e}')
         try:
@@ -2115,6 +2182,7 @@ def post_review_bulk_answer(job_id):
         'answer': answer,
         'updated_preview_total': updated_preview_total,
         'total_delta': total_delta,
+        'preview_breakdown': recalc_breakdown,
         'override_count': len(existing_overrides),
     })
 
@@ -2122,6 +2190,7 @@ def post_review_bulk_answer(job_id):
 # ── v8.26: Konversations-Endpoints für gruppierten Review-Flow ──
 
 @app.route('/api/job/<job_id>/review-groups', methods=['GET'])
+@requires_session_token
 def get_review_groups(job_id):
     """v8.26: Liefert gruppierte review_items für Konversations-UX im Chat."""
     with _jobs_lock:
@@ -2277,6 +2346,7 @@ REGEL „Betrag-Auskunft":
 
 
 @app.route('/api/job/<job_id>/ai-chat', methods=['POST'])
+@requires_session_token
 def post_ai_chat(job_id):
     """v9.1: KI-Interpreter mit vollem Job-Kontext + strukturiertes JSON.
 
@@ -2462,6 +2532,7 @@ Antworte JETZT mit dem strukturierten JSON-Objekt."""
 
 
 @app.route('/api/job/<job_id>/review-interpret', methods=['POST'])
+@requires_session_token
 def post_review_interpret(job_id):
     """v8.26: Interpretiert Freitext-Antwort und liefert proposed_changes — OHNE anzuwenden.
 
@@ -2528,6 +2599,7 @@ def post_review_interpret(job_id):
 
 
 @app.route('/api/job/<job_id>/review-answer-bulk', methods=['POST'])
+@requires_session_token
 def post_review_answer_bulk(job_id):
     """v8.26: Wendet bestätigte Bulk-Antworten an. Verlangt confirmation_id.
 
@@ -2626,6 +2698,7 @@ def post_review_answer_bulk(job_id):
 
 
 @app.route('/api/job/<job_id>/marker-answer', methods=['POST'])
+@requires_session_token
 def post_marker_answer(job_id):
     """v8.22 Rest-5: Nutzer erklärt eine unbekannte Kennung.
 
@@ -2691,6 +2764,7 @@ def post_marker_answer(job_id):
 
 
 @app.route('/api/job/<job_id>/upload-replacement', methods=['POST'])
+@requires_session_token
 def post_upload_replacement(job_id):
     """v8.22 Now-5 (Stub): Endpoint für Document-Replacement im Chat.
 
@@ -2704,7 +2778,14 @@ def post_upload_replacement(job_id):
         return jsonify({'error': 'Keine Datei im Upload-Body'}), 400
     file = request.files['file']
     doc_type = (request.form.get('doc_type') or '').strip().lower()
-    if doc_type not in ('lsb', 'se', 'dp', 'einsatz', 'other'):
+    # v11: Flugstundenübersicht ('dp') ist im neuen Ablauf nicht mehr aktiv.
+    # CAS ist die primäre Quelle. Replacement-Upload als 'dp' freundlich ablehnen.
+    if doc_type == 'dp' and AEROTAX_PIPELINE_VERSION == 'v11_cas_primary':
+        return jsonify({
+            'error': 'Diese Datei wird im neuen Ablauf nicht benötigt. '
+                     'Bitte lade deinen CAS/Dienstplan/Roster hoch.'
+        }), 400
+    if doc_type not in ('lsb', 'se', 'dp', 'einsatz', 'cas', 'roster_screenshot', 'other'):
         return jsonify({'error': f'unbekannter doc_type: {doc_type}'}), 400
     if not file or not file.filename:
         return jsonify({'error': 'leere Datei'}), 400
@@ -2825,6 +2906,7 @@ def _validate_cas_reader_output(parsed):
 
 
 @app.route('/api/job/<job_id>/upload-roster-screenshot', methods=['POST'])
+@requires_session_token
 def post_upload_roster_screenshot(job_id):
     """v10 Targeted CAS Reader: Sonnet Vision sucht ausschließlich nach Ziel-Tagen
     aus den pending review_items und liefert striktes Schema mit Status, Confidence
@@ -3132,6 +3214,7 @@ def post_upload_roster_screenshot(job_id):
 
 
 @app.route('/api/job/<job_id>/finalize-pdf', methods=['POST'])
+@requires_session_token
 def post_finalize_pdf(job_id):
     """v8.22 Step E: Erstellt finales PDF unter Berücksichtigung aller User-Review-
     Antworten (manual_day_overrides). Re-klassifiziert deterministisch, ruft
@@ -12893,7 +12976,7 @@ def hybrid_analyze(form, files, job_id=None):
     # Schritt 3: Tag-Aktivität-Reader
     # v11_cas_primary: CAS-Reader (Phase 3+4)
     # v10_legacy:      DP-Reader (Flugstundenübersicht)
-    # Feature-Flag in AEROTAX_PIPELINE_VERSION (default v10_legacy bis Phase 6)
+    # Feature-Flag in AEROTAX_PIPELINE_VERSION (default v11_cas_primary seit Phase 6)
     classification = None
     structured_days = None
     document_health = None
@@ -13330,10 +13413,10 @@ def _berechne_via_hybrid(form, files, job_id=None):
         'errors': errors,
     }
 
-    print(f"[berechne-hybrid] FERTIG: brutto={brutto:.2f} arbeit={arbeitstage} fahr={fahr_tage} "
-          f"hotel={hotel_naechte} VMA-In={vma_in:.2f} VMA-Aus={vma_aus:.2f} Z77={z77:.2f} "
-          f"gesamt={gesamt:.2f} netto={netto:.2f}")
-    print(f"[v8] brutto={gesamt:.2f} netto={netto:.2f} issues={len(notes)}")
+    # v11 B-008: PII-arme Logs — Beträge ohne Brutto/Z77/Z17, nur strukturelle
+    # Counts. Detaillierte Werte stehen im Audit-Trail (Supabase, nur Owner).
+    print(f"[berechne-hybrid] FERTIG: arbeit={arbeitstage} fahr={fahr_tage} "
+          f"hotel={hotel_naechte} issues={len(notes)}")
 
     # v8.22 Step A: Recalc-State cachen für deterministische Re-Berechnung nach Review-Antworten.
     # Enthält genau die Inputs die _recompute_with_overrides braucht — KEIN Sonnet/LSB-Prompt nötig.
@@ -14902,6 +14985,18 @@ def _fallback_streck():
 
 
 
+def _xml_escape_for_paragraph(s):
+    """v11 B-010: minimaler XML-Escape für ReportLab-Paragraph-Inputs.
+    Verhindert Parse-Errors / Layout-Crashes bei Strings mit < > & in
+    user-derived Daten (Name, Adresse, Layover-Orte, Belege-Namen)."""
+    if s is None:
+        return ''
+    return (str(s)
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;'))
+
+
 def erstelle_pdf(d):
     # ── PALETTE: dezentes Dark Navy — minimalistisch & elegant ──
     BG       = HexColor("#060a16")   # dunkles Navy als Page-BG
@@ -15156,8 +15251,9 @@ def erstelle_pdf(d):
            leading=12, alignment=TA_CENTER, spaceAfter=24, letterSpacing=2.5)))
 
     # v9.9: Title generisch, Name nur im Subtitle (User-Direktive: keine Person im Titel).
-    _name = d.get('name', '') or ''
-    _year = d.get('year', '') or ''
+    # v11 B-010: Name XML-escaped — ReportLab-Paragraph parst minimales HTML.
+    _name = _xml_escape_for_paragraph(d.get('name', '') or '')
+    _year = _xml_escape_for_paragraph(d.get('year', '') or '')
     S.append(Paragraph("Werbungskosten-Auswertung",
         ps("h1", fontSize=20, textColor=TEXT, fontName="Helvetica",
            leading=26, alignment=TA_CENTER, spaceAfter=6, letterSpacing=0)))
@@ -15165,6 +15261,13 @@ def erstelle_pdf(d):
     S.append(Paragraph(_subtitle,
         ps("h1y", fontSize=11, textColor=TEXT2, fontName="Helvetica",
            leading=15, alignment=TA_CENTER, spaceAfter=40, letterSpacing=0.6)))
+
+    # v11 B-011: explizite Quellen-Sektion auf Deckblatt — User sieht klar,
+    # auf welcher Datenbasis die Auswertung beruht.
+    S.append(Paragraph("Grundlage der Auswertung: Lohnsteuerbescheinigung, "
+                       "Streckeneinsatzabrechnung, Dienstplan/CAS/Roster.",
+        ps("src", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Oblique",
+           leading=12, alignment=TA_CENTER, spaceAfter=24, letterSpacing=0.3)))
 
     # Subtle Trenner
     S.append(HRFlowable(width="10%", thickness=0.5, color=LINE2,
@@ -15504,7 +15607,7 @@ def erstelle_pdf(d):
                     ps("td_unklar", fontSize=8.5, textColor=GOLD, fontName="Helvetica",
                        leading=12, alignment=TA_LEFT, spaceAfter=6)))
                 for u in unklare[:15]:
-                    S.append(Paragraph(f"• {str(u)[:200]}",
+                    S.append(Paragraph(f"• {_xml_escape_for_paragraph(str(u)[:200])}",
                         ps(f"td_u{id(u)}", fontSize=8, textColor=TEXT3,
                            fontName="Helvetica", leading=11, leftIndent=10, spaceAfter=2)))
 
@@ -15536,7 +15639,7 @@ def erstelle_pdf(d):
                 fb = fb_item[0] if isinstance(fb_item, tuple) else fb_item
                 if not first: S.append(PageBreak())
                 first = False
-                S.append(Paragraph(f"{b.get('name','')}",
+                S.append(Paragraph(_xml_escape_for_paragraph(b.get('name','') or ''),
                     ps(f"bpn{id(b)}{fidx}", fontSize=11, textColor=TEXT,
                        fontName="Helvetica-Bold", leading=15, spaceAfter=4)))
                 S.append(Paragraph(
