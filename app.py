@@ -199,15 +199,24 @@ def create_payment_intent():
         return jsonify({'error': str(e)}), 500
 
 
+# v11: CAS (Dienstplan/Roster) ist ab v11 das 3. Pflicht-Dokument
+# anstelle der Flugstundenübersicht (dp). dp bleibt vorerst im File-Keys-Tupel
+# damit Legacy-Code in altem Hybrid-Pfad nicht crasht — wird in Phase 3-5
+# komplett entfernt zusammen mit dem DP-Reader.
 _ALL_FILE_KEYS = (
-    'lsb', 'dp', 'se',
-    'einsatz',  # Optional: Einsatzplan (CAS) — Cross-Check + Z72-Boost
+    'lsb', 'se', 'cas',  # v11 Pflicht
+    'dp',                 # Legacy v10 — wird in Phase 3-5 entfernt
+    'einsatz',           # Legacy (alter Einsatzplan-Slot, ungenutzt)
     'stb', 'gew', 'arb', 'fort', 'tel', 'konz',
     'lapt', 'fach', 'reini', 'bewer',
     'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
     'arzt', 'zahn', 'medi', 'pfle', 'under', 'kata',
     'spen', 'part', 'kind', 'hand', 'haed',
 )
+
+# v11 Pipeline-Version-Flag — bleibt 'v10_legacy' während Phase 2-5 Migration,
+# wird in Phase 6 final auf 'v11_cas_primary' geflippt sobald CAS-Reader fertig.
+AEROTAX_PIPELINE_VERSION = os.environ.get('AEROTAX_PIPELINE_VERSION', 'v10_legacy')
 
 UPLOAD_TTL_HOURS = 4   # Pre-Upload nur kurz aufbewahren — nach Auswertung gelöscht
 
@@ -1307,8 +1316,9 @@ def process_real():
         print(f"[process] Direct-Upload: {', '.join(direct_parts) or 'KEINE'}")
 
         # Fallback: Files aus _store (in-memory) — überlebt Stripe-Retry
+        # v11: Pflicht-Set = LSB + SE + CAS (kein DP mehr)
         ref_for_fallback = (request.form.get('ref') or '').strip()
-        if (not files.get('lsb') or not files.get('dp') or not files.get('se')) \
+        if (not files.get('lsb') or not files.get('se') or not files.get('cas')) \
                 and ref_for_fallback and _store.get(ref_for_fallback, {}).get('files'):
             stored = _store[ref_for_fallback]['files']
             for k, items in stored.items():
@@ -1318,7 +1328,7 @@ def process_real():
             print(f"[process] ref={ref_for_fallback[:8]} Files aus _store geladen ({sum(len(v) for v in files.values())} insgesamt)")
 
         # Letzter Fallback: Supabase — überlebt Render-Restart
-        if (not files.get('lsb') or not files.get('dp') or not files.get('se')) \
+        if (not files.get('lsb') or not files.get('se') or not files.get('cas')) \
                 and ref_for_fallback:
             sb_files = _load_uploaded_files_supabase(ref_for_fallback)
             if sb_files:
@@ -1328,10 +1338,19 @@ def process_real():
                     files[k] = [d for (d, _) in items]
                 print(f"[process] ref={ref_for_fallback[:8]} Files aus Supabase geladen ({sum(len(v) for v in files.values())} insgesamt)")
 
-        if not files.get('lsb') or not files.get('dp') or not files.get('se'):
+        # v11: CAS ist neues 3. Pflicht-Dokument. Wenn nur DP (Flugstundenübersicht) hochgeladen
+        # wurde, friendly weisen — User soll CAS hochladen.
+        if files.get('dp') and not files.get('cas'):
+            return jsonify({
+                'error': 'Die Flugstundenübersicht wird im neuen Ablauf nicht mehr benötigt. '
+                         'Bitte lade stattdessen deinen Dienstplan/CAS/Roster hoch — '
+                         'du findest ihn in MyTime → Document Store.'
+            }), 400
+
+        if not files.get('lsb') or not files.get('se') or not files.get('cas'):
             return jsonify({
                 'error': 'Für die Auswertung brauchst du Lohnsteuerbescheinigung, '
-                         'Flugstundenübersicht und Streckeneinsatzabrechnung.'
+                         'Streckeneinsatzabrechnung und Dienstplan/CAS/Roster.'
             }), 400
 
         # ── PAYMENT-GATE: ref (Stripe), free_retry_token, oder valider Promo-Code ──
@@ -1418,8 +1437,9 @@ def process_real():
         # Audit: nur die 3 Pflicht-Kategorien zählen + optionale Belege
         _v7_files = {
             'lsb': len(files.get('lsb') or []),
-            'flugstunden': len(files.get('dp') or []),
             'streckeneinsatz': len(files.get('se') or []),
+            'cas': len(files.get('cas') or []),
+            'dp_legacy': len(files.get('dp') or []),  # v11: dp ist nicht mehr Pflicht — Legacy-Tracking
         }
         _audit(job_id, 'job_created', {'year': form['year'], 'base': form['base'], 'files': _v7_files})
 

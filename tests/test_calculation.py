@@ -7921,13 +7921,10 @@ def test_v10_upload_page_has_fourth_card_cas():
 
 
 def test_v10_cas_card_badge_sehr_empfohlen():
-    """CAS-Karte muss als „empfohlen" markiert sein (Badge im Card oder
-    Doc-Hint über dem Grid). Layout: 4-spaltig kompakt, daher kürzere Wording im Card."""
+    """v10-Test obsolet — in v11 ist CAS Pflicht, nicht „empfohlen".
+    Test wurde umgewidmet zu Sanity-Check dass rc-cas Card existiert."""
     src = _read_frontend()
-    idx = src.find('id="rc-cas"')
-    assert idx > 0
-    block = src[idx:idx + 3000]
-    assert 'mpfohlen' in block, '4. Karte braucht „Empfohlen"/„Sehr empfohlen"-Badge'
+    assert 'id="rc-cas"' in src, 'rc-cas Kachel muss existieren (v11 Pflicht)'
 
 
 def test_v10_cas_card_states_optional():
@@ -8357,15 +8354,15 @@ def test_v10_no_forbidden_v10_phrases():
 # ── Bestehender 3-Dokumente-Flow unverändert ─────────────────────────────
 
 def test_v10_three_required_uploads_still_intact():
-    """Bestehender 3-Pflicht-Flow (LSB, DP, SE) MUSS unverändert funktionieren."""
+    """v11-Migration: 3-Pflicht-Flow ist jetzt LSB + SE + CAS (statt DP)."""
     src = _read_frontend()
-    for card in ['id="rc-lsb"', 'id="rc-dp"', 'id="rc-se"']:
+    for card in ['id="rc-lsb"', 'id="rc-se"', 'id="rc-cas"']:
         assert card in src, f'Pflicht-Karte {card} fehlt'
-    for finput in ['id="f-lsb"', 'id="f-dp"', 'id="f-se"']:
+    for finput in ['id="f-lsb"', 'id="f-se"', 'id="f-cas"']:
         assert finput in src, f'Pflicht-Input {finput} fehlt'
-    # Progress-Logik 3 (nicht 4)
+    # Progress-Logik 3
     assert 'reqDone' in src and 'done/3' in src, \
-        'updateProgress muss weiterhin durch 3 teilen (nicht 4)'
+        'updateProgress muss weiterhin durch 3 teilen'
 
 
 def test_v10_finalize_pdf_endpoint_still_exists():
@@ -10153,6 +10150,170 @@ def test_hotfix_all_heartbeat_calls_have_defined_job_id():
             sig_block = fn_block[:paren_close + 1]
             assert 'job_id' in sig_block, \
                 f'Funktion mit _heartbeat_phase(job_id) muss job_id in Signatur haben: {sig_block[:200]}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 Phase 2 — Upload-Contract: LSB + SE + CAS (Flugstundenübersicht raus)
+#
+# Phase 2 ändert NUR den Upload-Vertrag. Pipeline (Reader) bleibt v10 hinter
+# Feature-Flag AEROTAX_PIPELINE_VERSION (default v10_legacy). CAS-Pipeline
+# kommt in Phase 3-4.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_v11_pipeline_version_constant():
+    """AEROTAX_PIPELINE_VERSION existiert + default 'v10_legacy' (Phase 2-5 Migration)."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, 'AEROTAX_PIPELINE_VERSION')
+    # Default während Phase 2-5
+    import os as _os
+    prev = _os.environ.pop('AEROTAX_PIPELINE_VERSION', None)
+    try:
+        _app2 = _load_app_fresh()
+        assert _app2.AEROTAX_PIPELINE_VERSION == 'v10_legacy', \
+            'Default-Pipeline-Version sollte v10_legacy sein bis Phase 6'
+    finally:
+        if prev is not None:
+            _os.environ['AEROTAX_PIPELINE_VERSION'] = prev
+
+
+def test_v11_all_file_keys_contain_cas():
+    """_ALL_FILE_KEYS enthält 'cas' (v11 neue Pflicht)."""
+    _app = _load_app_fresh()
+    assert 'cas' in _app._ALL_FILE_KEYS
+    assert 'lsb' in _app._ALL_FILE_KEYS
+    assert 'se' in _app._ALL_FILE_KEYS
+
+
+def test_v11_all_file_keys_dp_still_present_for_legacy():
+    """'dp' bleibt vorerst im _ALL_FILE_KEYS-Tupel (Legacy-Code crasht sonst)."""
+    _app = _load_app_fresh()
+    assert 'dp' in _app._ALL_FILE_KEYS, \
+        "Phase 2: 'dp' bleibt für legacy hybrid_analyze — entfernt in Phase 5"
+
+
+def test_v11_pflicht_validation_requires_cas():
+    """/api/process Pflicht-Validation prüft jetzt LSB + SE + CAS (nicht DP)."""
+    src = _read_backend()
+    idx = src.find("@app.route('/api/process'")
+    block = src[idx:idx + 6000]
+    # Neue v11 Validation
+    assert "not files.get('lsb') or not files.get('se') or not files.get('cas')" in block, \
+        'v11 Pflicht-Check muss LSB+SE+CAS sein'
+
+
+def test_v11_friendly_reject_when_only_dp_uploaded():
+    """Wenn User Flugstundenübersicht hochlädt aber kein CAS → freundliche Reject-Message."""
+    src = _read_backend()
+    idx = src.find("@app.route('/api/process'")
+    block = src[idx:idx + 6000]
+    assert "files.get('dp') and not files.get('cas')" in block, \
+        'DP-only-Pfad muss erkannt werden'
+    assert 'Flugstundenübersicht wird im neuen Ablauf nicht mehr benötigt' in block, \
+        'Friendly-Reject-Message muss vorhanden sein'
+
+
+def test_v11_pflicht_error_message_mentions_cas():
+    """Error-Message bei fehlenden Pflicht-Docs nennt LSB + SE + Dienstplan/CAS."""
+    src = _read_backend()
+    # String-Konkatenation in Quelltext — beide Fragmente prüfen
+    assert 'Lohnsteuerbescheinigung' in src
+    assert 'Streckeneinsatzabrechnung und Dienstplan/CAS/Roster' in src, \
+        'v11 Error-Message muss SE + Dienstplan/CAS aufzählen'
+
+
+def test_v11_audit_tracks_cas_count():
+    """Job-Audit-Log trackt 'cas' (statt nur 'flugstunden')."""
+    src = _read_backend()
+    # Window genug groß für /api/process Audit-Section
+    idx = src.find("@app.route('/api/process'")
+    block = src[idx:idx + 12000]
+    assert "'cas': len(files.get('cas')" in block, \
+        'Audit muss cas-Count tracken'
+    # dp_legacy bleibt für Beobachtung wieviele alte FU-Uploads kommen
+    assert "'dp_legacy'" in block, \
+        'dp_legacy zur Beobachtung alter FU-Uploads'
+
+
+# ─── Frontend Tests ──────────────────────────────────────────────────────
+
+def test_v11_frontend_has_no_rc_dp_card():
+    """v11: rc-dp Kachel ist entfernt."""
+    site = open(_FRONTEND_HTML).read()
+    # In der req-grid Sektion zwischen <div class="req-grid"> und der nächsten </div>-Schließung
+    grid_start = site.find('<div class="req-grid">')
+    grid_end = site.find('<!-- Progress der Pflicht-Docs -->')
+    grid = site[grid_start:grid_end]
+    assert 'id="rc-dp"' not in grid, 'rc-dp Kachel muss aus req-grid entfernt sein'
+
+
+def test_v11_frontend_has_rc_cas_in_pflicht_grid():
+    """v11: rc-cas Kachel ist innerhalb req-grid (3. Pflicht)."""
+    site = open(_FRONTEND_HTML).read()
+    grid_start = site.find('<div class="req-grid">')
+    grid_end = site.find('<!-- Progress der Pflicht-Docs -->')
+    grid = site[grid_start:grid_end]
+    assert 'id="rc-cas"' in grid, 'rc-cas muss in req-grid sein'
+    assert 'id="rc-lsb"' in grid
+    assert 'id="rc-se"' in grid
+
+
+def test_v11_frontend_three_pflicht_cards():
+    """Genau 3 req-card-Kacheln in req-grid: LSB + SE + CAS."""
+    site = open(_FRONTEND_HTML).read()
+    grid_start = site.find('<div class="req-grid">')
+    grid_end = site.find('<!-- Progress der Pflicht-Docs -->')
+    grid = site[grid_start:grid_end]
+    # Zähle rc-card-IDs
+    count = grid.count('class="req-card"')
+    assert count == 3, f'Erwartet 3 Pflicht-Kacheln, gefunden {count}'
+
+
+def test_v11_frontend_cas_badge_not_empfohlen():
+    """v11: CAS-Kachel hat KEIN 'Empfohlen'-Badge mehr (ist jetzt Pflicht)."""
+    site = open(_FRONTEND_HTML).read()
+    # rc-cas Block
+    idx = site.find('id="rc-cas"')
+    block = site[idx:idx + 3000]
+    # 'Empfohlen' badge sollte raus sein
+    assert 'Empfohlen</span>' not in block, \
+        'CAS-Kachel sollte kein Empfohlen-Badge mehr haben'
+    assert 'Optional — klicken' not in block, \
+        'CAS-Status sollte nicht mehr Optional sein'
+
+
+def test_v11_frontend_toS2_requires_cas_not_dp():
+    """toS2() prüft CAS statt DP."""
+    site = open(_FRONTEND_HTML).read()
+    fn_idx = site.find('window.toS2 = function')
+    block = site[fn_idx:fn_idx + 1500]
+    assert "_hasReqFile('cas')" in block, \
+        'toS2 muss CAS prüfen'
+    assert "_hasReqFile('dp')" not in block, \
+        'toS2 darf NICHT mehr dp prüfen'
+
+
+def test_v11_grid_css_three_columns():
+    """req-grid CSS ist wieder 3-spaltig."""
+    site = open(_FRONTEND_HTML).read()
+    idx = site.find('.req-grid{')
+    block = site[idx:idx + 200]
+    assert 'repeat(3,1fr)' in block or 'repeat(3, 1fr)' in block, \
+        'req-grid muss 3-spaltig sein'
+
+
+def test_v11_no_flugstunden_in_upload_psub():
+    """Upload-Hilfetext erwähnt nicht mehr Flugstundenübersicht als Pflicht."""
+    site = open(_FRONTEND_HTML).read()
+    idx = site.find('class="psub" style="text-align:center;">Lohnsteuerbescheinigung')
+    if idx < 0:
+        # Suche im weiteren Kontext
+        idx = site.find('Auswertung dauert ~')
+    block = site[max(0, idx-200):idx+500]
+    # Im Upload-Hilfetext sollte CAS stehen, nicht Flugstunden
+    assert 'Flugstundenübersicht' not in block, \
+        'Upload-Hilfetext darf nicht mehr Flugstundenübersicht als Pflicht erwähnen'
+    assert 'Dienstplan' in block or 'CAS' in block
 
 
 if __name__ == '__main__':
