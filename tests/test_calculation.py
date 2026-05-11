@@ -9264,10 +9264,11 @@ def test_v1041_lsb_local_fast_returns_none_for_non_lsb():
 
 
 def test_v1041_lsb_caller_uses_local_first():
-    """v8 Calc-Pfad ruft _read_lsb_with_local_fallback (nicht direkt Sonnet)."""
+    """v8 Calc-Pfad ruft _read_lsb_with_local_fallback (nicht direkt Sonnet).
+    v12 Speed-1: jetzt im PARALLEL READER STAGE _task_lsb-Wrapper."""
     src = _read_backend()
-    idx = src.find('# Schritt 1:')
-    block = src[idx:idx + 1500]
+    idx = src.find('PARALLEL READER STAGE')
+    block = src[idx:idx + 5000]
     assert '_read_lsb_with_local_fallback' in block, \
         'LSB-Pfad muss local-fallback nutzen statt direkt Sonnet'
 
@@ -9421,18 +9422,22 @@ def test_v1041_migration_has_cache_lookup_index():
 # ─── Friendly Phase-Labels ────────────────────────────────────────────────
 
 def test_v1041_phase_label_lsb():
-    """LSB-Phase setzt friendly label."""
+    """LSB-Phase setzt friendly label.
+    v12 Speed-1: jetzt im PARALLEL _task_lsb."""
     src = _read_backend()
-    idx = src.find('# Schritt 1:')
-    block = src[idx:idx + 1000]
+    idx = src.find('def _task_lsb()')
+    assert idx > 0
+    block = src[idx:idx + 800]
     assert '_heartbeat_phase' in block
     assert 'Lohnsteuer' in block, 'Friendly LSB-Label fehlt'
 
 
 def test_v1041_phase_label_se():
-    """SE-Phase setzt friendly label."""
+    """SE-Phase setzt friendly label.
+    v12 Speed-1: jetzt im PARALLEL _task_se_structured."""
     src = _read_backend()
-    idx = src.find("# Schritt 2a: Sonnet-SE")
+    idx = src.find('def _task_se_structured()')
+    assert idx > 0
     block = src[idx:idx + 800]
     assert '_heartbeat_phase' in block
     assert 'Streckeneinsatz' in block, 'Friendly SE-Label fehlt'
@@ -9569,21 +9574,24 @@ def test_taskA_sonnet_remains_default_path():
 
 
 def test_taskA_memory_release_after_lsb():
-    """Nach LSB-Read: lsb_bytes wird freigegeben (None gesetzt)."""
+    """Nach LSB-Read: lsb_bytes wird freigegeben (None gesetzt).
+    v12 Speed-1: Release passiert nach PARALLEL stage (gemeinsam für LSB+SE)."""
     src = _read_backend()
-    idx = src.find('# Schritt 1: LSB')
-    block = src[idx:idx + 1500]
+    idx = src.find('PARALLEL READER STAGE done')
+    assert idx > 0
+    block = src[idx:idx + 3000]
     assert 'lsb_bytes = None' in block, 'lsb_bytes muss nach Read None gesetzt werden'
     assert "files['lsb']" in block, 'files[lsb] muss freigegeben werden'
     assert 'gc.collect()' in block
 
 
 def test_taskA_memory_release_after_se():
-    """Nach SE-Readers (structured + summary): se_bytes freigegeben."""
+    """Nach SE-Readers (structured + summary): se_bytes freigegeben.
+    v12 Speed-1: passiert gemeinsam mit LSB-Release nach PARALLEL stage."""
     src = _read_backend()
-    idx = src.find('# Schritt 2b: Sonnet-SE-Summary')
+    idx = src.find('PARALLEL READER STAGE done')
     assert idx > 0
-    block = src[idx:idx + 1500]
+    block = src[idx:idx + 3000]
     assert 'se_bytes = None' in block, 'se_bytes muss nach SE-Phase None'
     assert "files['se']" in block
 
@@ -9601,13 +9609,14 @@ def test_taskA_memory_release_after_dp():
 
 
 def test_taskA_memory_release_calls_gc():
-    """Jede Memory-Release-Stelle hat gc.collect() + _release_memory_to_os()."""
+    """Memory-Release-Stelle hat gc.collect() + _release_memory_to_os().
+    v12 Speed-1: gemeinsame Release-Stelle nach PARALLEL stage."""
     src = _read_backend()
-    for phase_marker in ['# Schritt 1: LSB', '# Schritt 2b: Sonnet-SE-Summary']:
-        idx = src.find(phase_marker)
-        block = src[idx:idx + 1500]
-        assert 'gc.collect()' in block, f'gc.collect() fehlt nach {phase_marker}'
-        assert '_release_memory_to_os()' in block, f'_release_memory_to_os fehlt nach {phase_marker}'
+    idx = src.find('PARALLEL READER STAGE done')
+    assert idx > 0
+    block = src[idx:idx + 3000]
+    assert 'gc.collect()' in block, 'gc.collect() fehlt nach PARALLEL stage'
+    assert '_release_memory_to_os()' in block, '_release_memory_to_os fehlt nach PARALLEL stage'
 
 
 def test_taskA_no_regression_in_lsb_func_signature():
@@ -10584,15 +10593,16 @@ def test_v11_cas_reader_result_contains_metadata():
         assert key in block, f'Result-Metadata „{key}" fehlt'
 
 
-def test_v11_cas_not_yet_wired_into_pipeline():
-    """Phase 3: Reader existiert, ist aber NOCH NICHT in berechne/hybrid_analyze gerufen.
-    Wird in Phase 4 verbunden."""
+def test_v11_cas_wired_into_pipeline_via_parallel_stage():
+    """v11 Phase 4+: CAS-Reader IST in hybrid_analyze gerufen.
+    v12 Speed-1: via PARALLEL _task_cas_read."""
     src = _read_backend()
-    # In hybrid_analyze sollte _sonnet_read_cas_structured noch nicht gerufen werden
     fn_idx = src.find('def hybrid_analyze(')
-    block = src[fn_idx:fn_idx + 10000]
-    assert '_sonnet_read_cas_structured(' not in block, \
-        'Phase 3: CAS-Reader noch nicht im hybrid_analyze-Pfad (kommt Phase 4)'
+    block = src[fn_idx:fn_idx + 18000]
+    assert '_sonnet_read_cas_structured(' in block, \
+        'CAS-Reader muss in hybrid_analyze gerufen werden (Phase 4+)'
+    # Speed-1: jetzt im _task_cas_read Wrapper
+    assert 'def _task_cas_read(' in block
 
 
 # ════════════════════════════════════════════════════════════════════════════

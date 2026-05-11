@@ -11613,19 +11613,28 @@ def _followme_align_counters(classification, matched_days, year=2025, homebase='
 
 
 def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=None,
-                                cas_source_filenames=None, commute_minutes=0):
+                                cas_source_filenames=None, commute_minutes=0,
+                                cas_result_pre_read=None):
     """v11 Komplett-Pipeline: CAS-Read → Match mit SE → Klassifikation.
 
     Wird in hybrid_analyze unter Feature-Flag AEROTAX_PIPELINE_VERSION=v11_cas_primary
     aufgerufen. Liefert dasselbe Output-Shape wie der v10-Pipeline (DP-basiert),
     plus zusätzliche CAS-Audit-Felder (_cas_conflicts, _cas_files_processed etc.).
 
+    v12 Speed-1: cas_result_pre_read — wenn der Caller den CAS-Sonnet-Read
+    schon parallel zu LSB/SE gemacht hat, wird das Result hier wiederverwendet
+    (kein zweiter Sonnet-Call). Output identisch.
+
     Returns: dict mit Klassifikations-Result + Metadaten, oder None bei Fehler.
     """
-    cas_result = _sonnet_read_cas_structured(
-        cas_bytes, year=year, homebase=homebase, job_id=job_id,
-        source_filenames=cas_source_filenames,
-    )
+    if cas_result_pre_read is not None:
+        cas_result = cas_result_pre_read
+        print("[v11-cas-pipeline] using pre-read CAS result (parallel reader mode)")
+    else:
+        cas_result = _sonnet_read_cas_structured(
+            cas_bytes, year=year, homebase=homebase, job_id=job_id,
+            source_filenames=cas_source_filenames,
+        )
     if not cas_result or not cas_result.get('days'):
         print("[v11-cas-pipeline] CAS-Reader lieferte keine Tage")
         return None
@@ -14543,64 +14552,116 @@ def hybrid_analyze(form, files, job_id=None):
 
     errors = []
 
-    # Schritt 1: LSB (Default Sonnet, Local-First nur per ENV-Flag)
-    lsb_data = None
-    if lsb_bytes:
+    # ════════════════════════════════════════════════════════════════════
+    # v12 Speed-1: PARALLEL READER STAGE
+    # ════════════════════════════════════════════════════════════════════
+    # Alle Reader (LSB + SE-structured + SE-summary + CAS) laufen GLEICHZEITIG
+    # via ThreadPoolExecutor. Jeder Reader liest seine eigene Datei — kein
+    # shared state, kein Race. Wallclock = max(t_lsb, t_se_s, t_se_sum, t_cas)
+    # statt Sum. Bei Tibor-Setup (12 CAS-Files): ~120s sequenziell → ~60-90s parallel.
+    #
+    # Qualität bleibt 100%: identische Reader, identische Prompts, identische
+    # Tool-Schemas. Nur die Reihenfolge ändert sich.
+    #
+    # Memory-Spike (4 Reader gleichzeitig) ist ~300-500 MB Peak — auf Cloud Run
+    # mit 2 GiB unkritisch. Auf Render Free wäre das gefährlich; wir setzen
+    # voraus dass die Infrastruktur >= 1 GiB liefert.
+    #
+    # Fehler-Isolation: wenn ein Reader crasht, laufen die anderen weiter.
+    # Errors werden gesammelt, der jeweilige Output ist None.
+    # ════════════════════════════════════════════════════════════════════
+
+    # Caller-Filter: welche Reader laufen wirklich?
+    commute_min_for_cas = int(form.get('anfahrt_min', 0) or 0)
+    cas_pipeline_active = (AEROTAX_PIPELINE_VERSION == 'v11_cas_primary' and bool(cas_bytes))
+
+    def _task_lsb():
+        if not lsb_bytes:
+            return ('lsb', None, None)
         try:
             _heartbeat_phase(job_id, 'lsb',
                              {'label': 'Lohnsteuerbescheinigung wird geprüft…'})
-            # v10.4.1: Default Sonnet; local-first via AEROTAX_LSB_LOCAL_FIRST=1.
-            lsb_data = _read_lsb_with_local_fallback(lsb_bytes)
+            return ('lsb', _read_lsb_with_local_fallback(lsb_bytes), None)
         except Exception as e:
-            errors.append(f'LSB: {e}')
-            print(f"[hybrid] Sonnet-LSB crash: {e}")
-    # v10.4.2 Memory-Release: LSB-Bytes nicht mehr gebraucht
-    try:
-        lsb_bytes = None
-        if 'lsb' in files:
-            files['lsb'] = None
-    except Exception:
-        pass
-    gc.collect()
-    _release_memory_to_os()
+            print(f"[hybrid] LSB crash: {e}")
+            return ('lsb', None, f'LSB: {e}')
 
-    # ════════════════════════════════════════════════════════════════════
-    # v7.0 PIPELINE — DETERMINISTISCH
-    # ════════════════════════════════════════════════════════════════════
-    # 1. Sonnet liest SE strukturiert (pro Datum: stfrei/Ort/Storno)
-    # 2. Sonnet liest DP strukturiert (pro Datum: marker/has_fl/overnight)
-    # 3. Backend matcht beides pro Datum
-    # 4. Backend klassifiziert deterministisch (SE als Anker für Z72/Z73/Z76)
-    # 5. Z77 aus SE-Summen separat (für Topf-Trennung & Audit)
-    # KEIN Fallback. Bei Crash → Job-Error.
-    # ════════════════════════════════════════════════════════════════════
-
-    # Schritt 2a: Sonnet-SE strukturiert (pro Zeile/Datum)
-    se_structured = None
-    if se_bytes:
+    def _task_se_structured():
+        if not se_bytes:
+            return ('se_structured', None, None)
         try:
             _heartbeat_phase(job_id, 'se_structured',
                              {'label': 'Streckeneinsatz-Abrechnung wird gelesen…'})
-            se_structured = _sonnet_read_se_structured(se_bytes, year)
+            return ('se_structured', _sonnet_read_se_structured(se_bytes, year), None)
         except Exception as e:
-            errors.append(f'SE-Structured: {type(e).__name__}: {str(e)[:200]}')
-            print(f"[hybrid] Sonnet-SE-Structured crash: {type(e).__name__}: {str(e)[:200]}")
-    gc.collect()
-    _release_memory_to_os()
+            print(f"[hybrid] SE-Structured crash: {type(e).__name__}: {str(e)[:200]}")
+            return ('se_structured', None, f'SE-Structured: {type(e).__name__}: {str(e)[:200]}')
 
-    # Schritt 2b: Sonnet-SE-Summary (für Cross-Check)
-    se_summary = None
-    if se_bytes:
+    def _task_se_summary():
+        if not se_bytes:
+            return ('se_summary', None, None)
         try:
-            se_summary = _sonnet_read_se_summary_v2(se_bytes, year)
+            return ('se_summary', _sonnet_read_se_summary_v2(se_bytes, year), None)
         except Exception as e:
-            errors.append(f'SE-Summary: {e}')
-            print(f"[hybrid] Sonnet-SE-Summary crash: {e}")
-    # v10.4.2 Memory-Release: SE-Bytes nach beiden Readern nicht mehr gebraucht
+            print(f"[hybrid] SE-Summary crash: {e}")
+            return ('se_summary', None, f'SE-Summary: {e}')
+
+    def _task_cas_read():
+        if not cas_pipeline_active:
+            return ('cas_result', None, None)
+        try:
+            _heartbeat_phase(job_id, 'cas_start',
+                             {'label': 'Dienstplan/CAS wird ausgewertet…'})
+            cr = _sonnet_read_cas_structured(
+                cas_bytes, year=year, homebase=homebase, job_id=job_id,
+                source_filenames=cas_filenames,
+            )
+            return ('cas_result', cr, None)
+        except Exception as e:
+            print(f"[hybrid] CAS-Read crash: {type(e).__name__}: {str(e)[:200]}")
+            return ('cas_result', None, f'CAS-Read: {type(e).__name__}: {str(e)[:200]}')
+
+    parallel_tasks = [_task_lsb, _task_se_structured, _task_se_summary, _task_cas_read]
+    parallel_results = {}
+
+    import time as _ptm
+    par_start = _ptm.time()
+    print(f"[hybrid] PARALLEL READER STAGE start "
+          f"(LSB={bool(lsb_bytes)}, SE={bool(se_bytes)}, CAS={cas_pipeline_active})")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=4) as _pool:
+        _futs = {_pool.submit(t): t.__name__ for t in parallel_tasks}
+        for fut in as_completed(_futs):
+            try:
+                key, val, err = fut.result()
+                parallel_results[key] = val
+                if err:
+                    errors.append(err)
+            except Exception as e:
+                # Sollte nicht passieren — tasks fangen ihre eigenen Errors
+                tname = _futs.get(fut, '?')
+                print(f"[hybrid] task {tname} unexpected crash: {type(e).__name__}: {str(e)[:200]}")
+                errors.append(f'{tname}: {type(e).__name__}: {str(e)[:200]}')
+    par_elapsed = _ptm.time() - par_start
+    print(f"[hybrid] PARALLEL READER STAGE done in {par_elapsed:.1f}s "
+          f"(lsb={parallel_results.get('lsb') is not None}, "
+          f"se_str={parallel_results.get('se_structured') is not None}, "
+          f"se_sum={parallel_results.get('se_summary') is not None}, "
+          f"cas={parallel_results.get('cas_result') is not None})")
+
+    lsb_data       = parallel_results.get('lsb')
+    se_structured  = parallel_results.get('se_structured')
+    se_summary     = parallel_results.get('se_summary')
+    cas_pre_read   = parallel_results.get('cas_result')
+
+    # Memory-Release nach allen Readern — Bytes sind extrahiert, Originale weg
     try:
+        lsb_bytes = None
         se_bytes = None
-        if 'se' in files:
-            files['se'] = None
+        if 'lsb' in files: files['lsb'] = None
+        if 'se' in files:  files['se']  = None
+        # cas_bytes erst nach _classify_v11_cas_pipeline freigeben, da fallback
+        # darauf zugreifen könnte falls cas_pre_read None ist.
     except Exception:
         pass
     gc.collect()
@@ -14658,13 +14719,21 @@ def hybrid_analyze(form, files, job_id=None):
     if use_v11_cas:
         # v11 PHASE 4 CAS-PIPELINE
         try:
-            _heartbeat_phase(job_id, 'cas_start',
-                             {'label': 'Dienstplan/CAS wird ausgewertet…'})
-            commute_min = int(form.get('anfahrt_min', 0) or 0)
+            # v12 Speed-1: CAS-Sonnet-Read passierte schon parallel zu LSB+SE
+            # (Reader-Stage oben). Wir reichen das pre-gelesene Result rein,
+            # die Pipeline überspringt den Sonnet-Call und macht direkt Match
+            # + Klassifikation. Wenn cas_pre_read None ist (z.B. Crash in
+            # Parallel-Stage), fällt _classify_v11_cas_pipeline auf
+            # _sonnet_read_cas_structured zurück (safety net).
+            if cas_pre_read is None:
+                _heartbeat_phase(job_id, 'cas_match',
+                                 {'label': 'Dienstplan-Tage werden zugeordnet…'})
+            commute_min = commute_min_for_cas
             classification = _classify_v11_cas_pipeline(
                 cas_bytes, se_structured, year, homebase,
                 job_id=job_id, cas_source_filenames=cas_filenames,
                 commute_minutes=commute_min,
+                cas_result_pre_read=cas_pre_read,
             )
             # Memory-Release nach CAS-Read
             try:

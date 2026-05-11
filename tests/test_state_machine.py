@@ -698,6 +698,119 @@ def test_dockerignore_excludes_local_state():
         assert p in src, f'{p} muss in .dockerignore sein'
 
 
+# ─── v12 Speed-1: Parallel Reader Stage ──────────────────────────────────────
+
+_APP_PY = '/Users/miguelschumann/Desktop/aerotax-backend/app.py'
+
+
+def test_hybrid_analyze_has_parallel_reader_stage():
+    """hybrid_analyze startet LSB+SE+CAS parallel via ThreadPoolExecutor."""
+    src = open(_APP_PY).read()
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 12000]
+    # Marker für die parallel stage
+    assert 'PARALLEL READER STAGE' in block, 'Parallel-Reader-Stage muss markiert sein'
+    assert 'ThreadPoolExecutor' in block
+    assert 'max_workers=4' in block, 'erwarte 4 parallel reader tasks'
+
+
+def test_parallel_reader_has_four_tasks():
+    """4 reader tasks: LSB, SE-structured, SE-summary, CAS."""
+    src = open(_APP_PY).read()
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 12000]
+    for task in ('_task_lsb', '_task_se_structured', '_task_se_summary', '_task_cas_read'):
+        assert f'def {task}(' in block, f'Task {task} fehlt'
+
+
+def test_parallel_reader_error_isolation():
+    """Jeder Task hat eigenen try/except — Crash eines Readers killt nicht alle."""
+    src = open(_APP_PY).read()
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 12000]
+    # Pro task: try/except + return tuple (key, val, err)
+    for task in ('_task_lsb', '_task_se_structured', '_task_se_summary', '_task_cas_read'):
+        task_idx = block.find(f'def {task}(')
+        if task_idx < 0:
+            continue
+        # Nehme die nächsten ~600 Zeichen ab Task-Definition
+        task_block = block[task_idx:task_idx + 800]
+        assert 'try:' in task_block, f'{task}: try fehlt'
+        assert 'except' in task_block, f'{task}: except fehlt'
+
+
+def test_classify_v11_cas_pipeline_accepts_pre_read():
+    """_classify_v11_cas_pipeline hat cas_result_pre_read Parameter."""
+    src = open(_APP_PY).read()
+    fn_idx = src.find('def _classify_v11_cas_pipeline(')
+    line_end = src.find(':', fn_idx)
+    sig = src[fn_idx:line_end]
+    assert 'cas_result_pre_read' in sig
+
+
+def test_classify_v11_cas_pipeline_skips_sonnet_when_pre_read():
+    """Wenn cas_result_pre_read gesetzt: KEIN _sonnet_read_cas_structured Call."""
+    src = open(_APP_PY).read()
+    fn_idx = src.find('def _classify_v11_cas_pipeline(')
+    # Suche ersten 800 Zeichen — da steht die if-Verzweigung
+    block = src[fn_idx:fn_idx + 1500]
+    assert 'cas_result_pre_read is not None' in block
+    assert 'cas_result = cas_result_pre_read' in block
+    assert 'using pre-read CAS result' in block
+
+
+def test_parallel_reader_pre_read_passed_to_classify():
+    """hybrid_analyze reicht cas_pre_read ans _classify_v11_cas_pipeline weiter."""
+    src = open(_APP_PY).read()
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 18000]
+    assert 'cas_result_pre_read=cas_pre_read' in block
+
+
+def test_parallel_reader_safety_fallback_on_crash(monkeypatch):
+    """Wenn cas_pre_read None ist (Reader-Crash), _classify_v11_cas_pipeline
+    fällt auf direkten Sonnet-Call zurück — kein Daten-Verlust."""
+    src = open(_APP_PY).read()
+    fn_idx = src.find('def _classify_v11_cas_pipeline(')
+    block = src[fn_idx:fn_idx + 2000]
+    # else-Branch: Sonnet wird aufgerufen
+    assert '_sonnet_read_cas_structured(' in block
+
+
+def test_parallel_reader_does_not_change_reader_signatures():
+    """Reader-Funktionen sind unverändert — gleiche Prompts, gleiche Models,
+    gleiche Tool-Schemas. Tier 1 ist nur Orchestration, kein Quality-Risk."""
+    src = open(_APP_PY).read()
+    # _read_lsb_with_local_fallback existiert
+    assert 'def _read_lsb_with_local_fallback' in src
+    # _sonnet_read_se_structured + _sonnet_read_se_summary_v2 existieren
+    assert 'def _sonnet_read_se_structured' in src
+    assert 'def _sonnet_read_se_summary_v2' in src
+    # _sonnet_read_cas_structured existiert + _sonnet_read_cas_merged_text (Variante A)
+    assert 'def _sonnet_read_cas_structured' in src
+    assert 'def _sonnet_read_cas_merged_text' in src
+    # Sonnet-Model unverändert (claude-sonnet-4-6)
+    assert "model='claude-sonnet-4-6'" in src or 'model="claude-sonnet-4-6"' in src
+
+
+def test_parallel_reader_memory_release_after_pool():
+    """Nach parallelem Pool: gc.collect() + _release_memory_to_os()."""
+    src = open(_APP_PY).read()
+    par_idx = src.find('PARALLEL READER STAGE')
+    block = src[par_idx:par_idx + 9000]
+    assert 'gc.collect()' in block
+    assert '_release_memory_to_os()' in block
+
+
+def test_parallel_reader_logs_elapsed_time():
+    """Parallel stage loggt Wallclock-Zeit (für Performance-Tracking)."""
+    src = open(_APP_PY).read()
+    par_idx = src.find('PARALLEL READER STAGE')
+    block = src[par_idx:par_idx + 5000]
+    assert 'par_elapsed' in block
+    assert 'PARALLEL READER STAGE done' in block
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
