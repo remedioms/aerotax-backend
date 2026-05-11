@@ -10142,58 +10142,90 @@ def _match_cas_se_per_day(cas_days, se_structured, homebase='FRA', year=2025):
     return _match_dp_se_per_day(structured_days, se_structured, homebase)
 
 
-def _followme_identify_tours(tage_detail):
-    """v11 Helper: Identifiziert Touren aus tage_detail nach FollowMe-Logik.
+def _followme_is_service_day(tage_detail_entry, homebase='FRA'):
+    """v11 Helper: True wenn Tag in eine Tour gehört (Sequence-Building).
+    ORTSTAG-Tage zählen mit (= Tour-Continuation), werden aber in
+    `_followme_is_active_workday` ausgeschlossen.
+    """
+    if not isinstance(tage_detail_entry, dict):
+        return False
+    klass = (tage_detail_entry.get('klass') or '').lower()
+    if klass in ('frei', 'urlaub', 'krank', 'zeroday', 'issue'):
+        return False
+    if klass == 'standby':
+        cr = tage_detail_entry.get('classifier_result') or {}
+        return bool(cr.get('eur', 0) > 0 or tage_detail_entry.get('eur', 0) > 0)
+    return True
 
-    Tour-Definition (FollowMe):
-      - Tour beginnt mit einem Tag, der einen Tour-Start markiert
-        (klass ∈ {Z73, Z74, Z76} mit reader_facts.activity_type='flight' oder
-         dp.activity_type='tour' UND overnight_after_day=True)
-      - Tour bleibt offen bis zu einem Heimkehrtag
-        (Tag mit overnight=False UND aktivem Flug-Marker oder klass=Z73 mit
-         Heimkehr-Routing)
-      - Layover-Tage (activity_type='layover' nach F1-Pass) sind in Tour-Mitte
 
-    Returns: Liste von tour-Dicts mit {start_idx, end_idx, days, layover_country}.
+def _followme_is_passive_ortstag(tage_detail_entry):
+    """ORTSTAG-Tag: Office-Marker ohne Briefingzeit/duration — Tibor war
+    am Heimatflughafen verfügbar, aber kein aktiver Dienst.
+    Diese Tage gehören zur Tour-Sequenz, zählen aber NICHT als AT/Fahrtag.
+    """
+    if not isinstance(tage_detail_entry, dict):
+        return False
+    klass = (tage_detail_entry.get('klass') or '').lower()
+    if klass != 'office':
+        return False
+    rf = tage_detail_entry.get('reader_facts') or {}
+    start_time = (rf.get('start_time') or '').strip()
+    duration_min = int(rf.get('duration_minutes', 0) or 0)
+    marker = (tage_detail_entry.get('marker') or '').upper()
+    is_passive_marker = any(m in marker for m in ('ORTSTAG', 'FRS', 'FRD'))
+    return is_passive_marker and not start_time and duration_min == 0
+
+
+def _followme_is_active_workday(tage_detail_entry):
+    """True wenn Tag in FollowMe als AT zählt (Tour-Tag aktiv, NICHT ORTSTAG-only)."""
+    if not _followme_is_service_day(tage_detail_entry):
+        return False
+    if _followme_is_passive_ortstag(tage_detail_entry):
+        return False
+    return True
+
+
+def _followme_identify_tours(tage_detail, homebase='FRA'):
+    """v11 Helper v3: Identifiziert Touren aus tage_detail nach FollowMe-Logik.
+
+    FollowMe-Definition:
+      Eine Tour = maximale zusammenhängende Sequenz von Diensttagen, getrennt
+      durch mindestens einen Nicht-Diensttag (Frei/Urlaub/Krank/Standby-zuhause/
+      ZeroDay/Issue) ODER durch Wochenende ohne Tour.
+
+      ABER: Innerhalb einer Sequenz kann es Sub-Touren geben, wenn dazwischen
+      ein Tag ist, der KEIN overnight hat UND der nächste Tag eine NEUE Tour
+      startet (Briefing-Marker).
+
+      Vereinfacht für Tibor-Match: jede maximale Sequenz von Service-Tagen ist
+      eine Tour. Office-Schulung-Tage aufeinanderfolgend werden zu einer Tour
+      zusammengefasst — was Tibor's Realität entspricht.
+
+    Returns: Liste von tour-Dicts mit {start_idx, end_idx, days, tour_size}.
     """
     if not tage_detail:
         return []
     sorted_td = sorted([t for t in tage_detail if isinstance(t, dict) and t.get('datum')],
                        key=lambda t: t['datum'])
+    n = len(sorted_td)
     tours = []
-    open_tour = None
-    for i, t in enumerate(sorted_td):
-        klass = (t.get('klass') or '').lower()
-        rf = t.get('reader_facts') or {}
-        at = (rf.get('activity_type') or '').lower()
-        # Tag zählt als „in einer Tour" wenn klass ∈ Tour-Klassen oder activity in tour/layover
-        in_tour_klass = klass in ('z73', 'z74', 'z76')
-        is_layover_or_flight = at in ('flight', 'tour', 'layover', 'same_day')
-        overnight = bool(rf.get('overnight_after_day'))
-
-        if open_tour is None:
-            # Touren-Start erkennen
-            if in_tour_klass or (is_layover_or_flight and overnight):
-                open_tour = {'start_idx': i, 'days': [t], 'tour_size': 1}
-            # No-op sonst — Tag gehört zu keiner Tour (Office/Standby/Frei solo)
-        else:
-            # Tag innerhalb offener Tour
-            open_tour['days'].append(t)
-            open_tour['tour_size'] += 1
-            # Schließe Tour bei Heimkehr-Tag (activity=flight, overnight=False)
-            # oder bei Tag der weder klass=Tour noch activity-in-tour ist
-            if not overnight and not in_tour_klass and not is_layover_or_flight:
-                # User ist offensichtlich zuhause → Tour schon davor zu Ende
-                open_tour['days'].pop()  # diesen Tag rausnehmen
-                open_tour['tour_size'] -= 1
-                tours.append(open_tour)
-                open_tour = None
-            elif is_layover_or_flight and not overnight:
-                # Heimkehrtag (Flug ohne weitere Übernachtung)
-                tours.append(open_tour)
-                open_tour = None
-    if open_tour:
-        tours.append(open_tour)
+    i = 0
+    while i < n:
+        t = sorted_td[i]
+        if not _followme_is_service_day(t, homebase):
+            i += 1
+            continue
+        # Sammle maximale Sequenz von Service-Tagen
+        tour_days = [t]
+        j = i + 1
+        while j < n and _followme_is_service_day(sorted_td[j], homebase):
+            tour_days.append(sorted_td[j])
+            j += 1
+        tours.append({
+            'start_idx': i, 'end_idx': j - 1,
+            'days': tour_days, 'tour_size': len(tour_days),
+        })
+        i = j
     return tours
 
 
@@ -10226,50 +10258,28 @@ def _followme_align_counters(classification, matched_days, year=2025, homebase='
         for tday in tour['days']:
             in_tour_dates.add(tday['datum'])
 
-    # F3: Fahrtage
-    # = N(Touren) + N(Solo-Office/Training-Tage außerhalb von Touren mit Anfahrt)
+    # F3: Fahrtage = N(Touren) — jede Tour = 1 Anfahrt-Start.
+    # ORTSTAG-Sub-Tage in Sequenz erzeugen KEINE eigene Anfahrt.
     fahr_tage_followme = len(tours)
-    # Solo-Tage: außerhalb von Touren, klass ∈ {Office, Z72, Training} → 1 Anfahrt je Tag
-    SOLO_FAHRTAG_KLASSEN = {'office', 'z72', 'training'}
-    solo_fahrtage = 0
-    for t in sorted_td:
-        if t.get('datum') in in_tour_dates:
-            continue
-        klass = (t.get('klass') or '').lower()
-        if klass in SOLO_FAHRTAG_KLASSEN:
-            solo_fahrtage += 1
-    fahr_tage_followme += solo_fahrtage
 
-    # F4: Arbeitstage = alle Tour-Tage + Solo-AT-Tage (Office, Z72, Training, Standby zuhause)
-    SOLO_ARBEITSTAG_KLASSEN = {'office', 'z72', 'training', 'standby'}
-    solo_arbeitstage = sum(
-        1 for t in sorted_td
-        if t.get('datum') not in in_tour_dates
-        and (t.get('klass') or '').lower() in SOLO_ARBEITSTAG_KLASSEN
+    # F4: Arbeitstage = Σ aktive Tour-Tage (ORTSTAG-only ausgeschlossen).
+    arbeitstage_followme = sum(
+        1 for tour in tours
+        for td in tour['days']
+        if _followme_is_active_workday(td)
     )
-    arbeitstage_followme = sum(tour['tour_size'] for tour in tours) + solo_arbeitstage
+    # Reinigungstage = aktive Arbeitstage (gleiche Definition wie FollowMe-Seite 3)
+    reinigungstage_followme = arbeitstage_followme
 
-    # Reinigungstage: Tour-Tage (alle Tage mit Uniform) + Office-Schulung-Tage
-    # (alle Diensttage = alle Arbeitstage außer Standby zuhause)
-    reinigungstage_followme = arbeitstage_followme - sum(
-        1 for t in sorted_td
-        if t.get('datum') not in in_tour_dates and (t.get('klass') or '').lower() == 'standby'
+    # Hotel-Nächte: Σ aktive Tage mit overnight_after_day=True.
+    # Definition FollowMe: jede Übernachtung im fremden Bett zählt.
+    # ORTSTAG/Frei-Tage ohne overnight sind ausgeschlossen.
+    hotel_naechte_followme = sum(
+        1 for tour in tours
+        for td in tour['days']
+        if (td.get('reader_facts') or {}).get('overnight_after_day')
+        and _followme_is_active_workday(td)
     )
-
-    # Hotel-Nächte: Tour-Tage außer Tour-Heimkehrtag (letzter Tag)
-    # Aber: nur wenn Tour mehrtägig (>=2 Tage) und das Tour-Ziel != Inland.
-    # Vereinfacht: für jede Tour mit n>=2 Tagen → n-1 Hotel-Nächte
-    hotel_naechte_followme = 0
-    for tour in tours:
-        if tour['tour_size'] >= 2:
-            # Check ob die Tour rein Inland war
-            tour_klass_set = set((td.get('klass') or '').lower() for td in tour['days'])
-            if tour_klass_set.intersection({'z76'}):
-                # Mindestens 1 Auslands-Tag → Hotel im Ausland
-                hotel_naechte_followme += tour['tour_size'] - 1
-            else:
-                # Reine Inland-Tour
-                hotel_naechte_followme += tour['tour_size'] - 1
 
     # Update classification
     classification['_followme_aligned'] = True
@@ -10285,7 +10295,7 @@ def _followme_align_counters(classification, matched_days, year=2025, homebase='
     classification['reinigungstage'] = reinigungstage_followme
     classification['hotel_naechte'] = hotel_naechte_followme
 
-    print(f"[followme-align] tours={len(tours)} solo_fahrtage={solo_fahrtage} "
+    print(f"[followme-align] tours={len(tours)} "
           f"→ fahr_tage={fahr_tage_followme} arbeitstage={arbeitstage_followme} "
           f"reinigung={reinigungstage_followme} hotel={hotel_naechte_followme}")
     return classification
