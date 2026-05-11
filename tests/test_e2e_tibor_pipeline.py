@@ -121,25 +121,39 @@ def test_align_failure_sets_red_health():
 
 
 def test_pdf_blocked_if_align_failed():
-    """post_finalize_pdf blockt bei _followme_align_failed mit 409."""
+    """v12 Phase A: post_finalize_pdf blockt failed_support via state-machine.
+    Statt direkter _followme_align_failed-Prüfung läuft die Logik über
+    _classify_job_state, das ALIGN_FAILED als reason_code setzt."""
     src_path = os.path.join(os.path.dirname(_HERE), 'app.py')
     src = open(src_path).read()
     idx = src.find('def post_finalize_pdf')
-    block = src[idx:idx + 4000]
-    assert '_followme_align_failed' in block
-    assert '409' in block
-    # Friendly user-message
-    assert 'Berechnung konnte nicht' in block or 'kontaktiere den Support' in block
+    block = src[idx:idx + 6000]
+    # State-Machine wird konsultiert
+    assert '_classify_job_state' in block
+    # failed_support blockiert PDF
+    assert 'failed_support' in block
+    # ALIGN_FAILED ist in der Error-Code-Tabelle
+    assert 'ALIGN_FAILED' in src
+    # Friendly user-message in error-codes-Tabelle
+    assert 'Berechnung konnte nicht vollständig geprüft werden' in src
+    assert 'kontaktiere den Support' in src
 
 
 def test_pdf_blocked_if_health_red():
-    """post_finalize_pdf blockt auch wenn _document_health.status='red'."""
+    """v12 Phase A: document_health=red führt via _classify_failure_reason
+    auf reason_code='DOCUMENT_HEALTH_RED' → canonical_state failed_support
+    → PDF blockiert mit strukturierter Response."""
     src_path = os.path.join(os.path.dirname(_HERE), 'app.py')
     src = open(src_path).read()
-    idx = src.find('def post_finalize_pdf')
-    block = src[idx:idx + 4000]
+    # Heuristik ist in _classify_failure_reason
+    assert "_document_health" in src
+    assert "'red'" in src
+    assert "DOCUMENT_HEALTH_RED" in src
+    # In _classify_failure_reason: red-status → DOCUMENT_HEALTH_RED
+    fn_idx = src.find('def _classify_failure_reason')
+    block = src[fn_idx:fn_idx + 3000]
     assert "_document_health" in block
-    assert "'red'" in block
+    assert "DOCUMENT_HEALTH_RED" in block
 
 
 # ════════════════════════════════════════════════════════════════════════════

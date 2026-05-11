@@ -1830,10 +1830,500 @@ def _run_process_async(job_id, form, files):
         _save_job_to_disk(job_id)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# v12 Phase A — Failure-Safe State-Machine
+# ════════════════════════════════════════════════════════════════════════════
+# Zentrale Wahrheit für „in welchem Zustand befindet sich diese Auswertung?".
+# Alle status-relevanten Endpoints lesen NUR über _classify_job_state() —
+# keine Ad-hoc-Heuristik mit '_followme_align_failed' / status / pending_reread
+# verstreut über den Code-Base.
+#
+# Vertrag mit Frontend: jede status-Response enthält canonical_state +
+# reason_code + user_title + user_message + next_actions[]. Frontend rendert
+# nach canonical_state — keine ad-hoc Frontend-Heuristik mehr.
+# ════════════════════════════════════════════════════════════════════════════
+
+AEROTAX_CANONICAL_STATES = (
+    'created',           # Job-Skelett, kein Upload
+    'uploaded',          # Dateien da, noch nicht im Queue
+    'queued',            # In Queue, wartet auf Worker
+    'processing',        # Worker rechnet (LSB → SE → CAS → Klassifikation → PDF)
+    'needs_review',      # Berechnet, aber offene Punkte (kritisch oder optional)
+    'done',              # PDF freigegeben
+    'failed_retryable',  # Transient — Retry sicher (Worker-Restart, Timeout, Rate-Limit)
+    'failed_support',    # Rechen-Integrität verletzt — Support empfehlen
+    'expired',           # Session-Token > 24h
+    'deleted',           # User hat explizit gelöscht
+)
+
+# Max-Retries pro Session. Bei Überschreitung → failed_support (kein weiterer Retry).
+AEROTAX_MAX_RETRY = 2
+
+# Error-Codes — strukturierter Vertrag mit Frontend.
+# Pro Code: user_title + user_message + retryable + support.
+# user_message ist immer freundlich, immer deutsch, nie technisch.
+AEROTAX_ERROR_CODES = {
+    # ── Upload-Probleme (retryable) ────────────────────────────────────────
+    'UPLOAD_MISSING_REQUIRED': {
+        'user_title':   'Fehlende Dokumente',
+        'user_message': 'Bitte lade alle drei Pflicht-Dokumente hoch.',
+        'retryable':    True,
+        'support':      False,
+    },
+    'UPLOAD_WRONG_TYPE': {
+        'user_title':   'Datei nicht erkannt',
+        'user_message': 'Diese Datei sieht nicht nach dem erwarteten Dokument aus. Bitte prüfe sie oder lade eine andere hoch.',
+        'retryable':    True,
+        'support':      False,
+    },
+    'UPLOAD_FILE_TOO_LARGE': {
+        'user_title':   'Datei zu groß',
+        'user_message': 'Die Datei überschreitet die maximale Größe. Bitte komprimiere sie oder splitte sie auf.',
+        'retryable':    True,
+        'support':      False,
+    },
+    'UPLOAD_EXPIRED': {
+        'user_title':   'Dokumente abgelaufen',
+        'user_message': 'Deine hochgeladenen Dateien sind aus Datenschutzgründen nicht mehr verfügbar. Bitte starte eine neue Auswertung.',
+        'retryable':    False,
+        'support':      False,
+    },
+    # ── Reader-Probleme (retryable) ────────────────────────────────────────
+    'LSB_READ_FAILED': {
+        'user_title':   'Lohnsteuerbescheinigung konnte nicht gelesen werden',
+        'user_message': 'Die Datei war nicht eindeutig lesbar. Bitte starte erneut oder ersetze die Datei.',
+        'retryable':    True,
+        'support':      False,
+    },
+    'SE_READ_FAILED': {
+        'user_title':   'Streckeneinsatz konnte nicht gelesen werden',
+        'user_message': 'Die Datei war nicht eindeutig lesbar. Bitte starte erneut oder ersetze die Datei.',
+        'retryable':    True,
+        'support':      False,
+    },
+    'CAS_READ_FAILED': {
+        'user_title':   'Dienstplan konnte nicht gelesen werden',
+        'user_message': 'Wir konnten den Dienstplan/CAS nicht lesen. Bitte prüfe die Datei oder lade eine andere Version hoch.',
+        'retryable':    True,
+        'support':      False,
+    },
+    # ── Server-Probleme (retryable) ────────────────────────────────────────
+    'WORKER_RESTARTED': {
+        'user_title':   'Auswertung unterbrochen',
+        'user_message': 'Der Server wurde während der Auswertung neu gestartet. Deine Dokumente sind noch da — du kannst die Auswertung erneut starten.',
+        'retryable':    True,
+        'support':      False,
+    },
+    'JOB_TIMEOUT': {
+        'user_title':   'Auswertung hat zu lange gedauert',
+        'user_message': 'Die Auswertung wurde abgebrochen, weil sie ungewöhnlich lange gedauert hat. Du kannst sie erneut starten.',
+        'retryable':    True,
+        'support':      False,
+    },
+    'SONNET_TIMEOUT': {
+        'user_title':   'Verbindung zur Auswertungs-KI verloren',
+        'user_message': 'Wir konnten die Auswertung nicht abschließen. Bitte starte sie erneut — kostenlos.',
+        'retryable':    True,
+        'support':      False,
+    },
+    'SONNET_RATE_LIMIT': {
+        'user_title':   'Hohe Auslastung',
+        'user_message': 'Aktuell hohe Auslastung. Bitte in 1-2 Minuten erneut starten — kostenlos.',
+        'retryable':    True,
+        'support':      False,
+    },
+    # ── Rechen-Integrität (failed_support — KEIN Retry) ────────────────────
+    'ALIGN_FAILED': {
+        'user_title':   'Berechnung konnte nicht vollständig geprüft werden',
+        'user_message': 'Damit kein unsicherer Betrag entsteht, wurde die Auswertung gestoppt. Bitte kontaktiere den Support — wir prüfen das persönlich.',
+        'retryable':    False,
+        'support':      True,
+    },
+    'ALIGN_SCHEMA_FAILED': {
+        'user_title':   'Berechnung konnte nicht vollständig geprüft werden',
+        'user_message': 'Die Auswertung wurde gestoppt, weil die interne Plausibilitäts-Prüfung Fehler gefunden hat. Bitte kontaktiere den Support.',
+        'retryable':    False,
+        'support':      True,
+    },
+    'DOCUMENT_HEALTH_RED': {
+        'user_title':   'Auswertung enthält ungelöste Probleme',
+        'user_message': 'Wir haben in deinen Dokumenten Punkte gefunden, die wir nicht eindeutig zuordnen können. Bitte kontaktiere den Support oder lade ggf. eine Datei neu hoch.',
+        'retryable':    False,
+        'support':      True,
+    },
+    'CALCULATION_INVARIANT_FAILED': {
+        'user_title':   'Plausibilitäts-Prüfung schlug fehl',
+        'user_message': 'Die Berechnung hat eine Plausibilitäts-Prüfung nicht bestanden. Damit kein falscher Betrag entsteht, wurde sie gestoppt. Bitte kontaktiere den Support.',
+        'retryable':    False,
+        'support':      True,
+    },
+    'PDF_RENDER_FAILED': {
+        'user_title':   'PDF-Erstellung fehlgeschlagen',
+        'user_message': 'Die PDF-Erstellung ist mehrfach fehlgeschlagen. Bitte kontaktiere den Support — wir senden dir das PDF persönlich zu.',
+        'retryable':    False,
+        'support':      True,
+    },
+    # ── Payment-Verifikation (failed_support, Safety-Issue) ────────────────
+    'PAYMENT_VERIFY_FAILED': {
+        'user_title':   'Zahlung konnte nicht bestätigt werden',
+        'user_message': 'Wir konnten deine Zahlung nicht überprüfen. Bitte kontaktiere den Support — wir vermeiden doppelte Belastungen.',
+        'retryable':    False,
+        'support':      True,
+    },
+    # ── Session/Access (nicht retryable) ───────────────────────────────────
+    'ACCESS_CODE_EXPIRED': {
+        'user_title':   'Code abgelaufen',
+        'user_message': 'Dein Zugangscode ist abgelaufen. Bitte starte eine neue Auswertung.',
+        'retryable':    False,
+        'support':      False,
+    },
+    'ACCESS_DENIED': {
+        'user_title':   'Zugriff nicht erlaubt',
+        'user_message': 'Diese Auswertung gehört zu einem anderen Zugangscode.',
+        'retryable':    False,
+        'support':      False,
+    },
+    'SESSION_DELETED': {
+        'user_title':   'Auswertung gelöscht',
+        'user_message': 'Diese Auswertung wurde gelöscht.',
+        'retryable':    False,
+        'support':      False,
+    },
+    'RETRY_LIMIT_REACHED': {
+        'user_title':   'Maximal mögliche Versuche erreicht',
+        'user_message': 'Du hast die maximal möglichen Versuche bereits genutzt. Bitte kontaktiere den Support.',
+        'retryable':    False,
+        'support':      True,
+    },
+    'OPEN_REVIEW': {
+        'user_title':   'Auswertung vorbereitet — kurze Klärung nötig',
+        'user_message': 'Ich habe deine Dokumente ausgewertet. Einige Punkte brauche ich noch zur Bestätigung.',
+        'retryable':    False,
+        'support':      False,
+    },
+}
+
+# Job-Status (Roh) → canonical_state. Mappings ohne Heuristik;
+# Heuristik (needs_review, failed_support) wird in _classify_job_state() ergänzt.
+_AEROTAX_STATUS_TO_CANONICAL = {
+    'pending':         'processing',
+    'queued':          'queued',
+    'running':         'processing',
+    'processing':      'processing',
+    'done':            'done',              # ggf. needs_review (Heuristik)
+    'completed':       'done',
+    'failed':          'failed_retryable',  # ggf. failed_support (Heuristik)
+    'failed_timeout':  'failed_retryable',
+    'rejected':        'failed_retryable',  # Queue-Overflow ist retryable
+    'cancelled':       'failed_retryable',
+}
+
+
+def _classify_failure_reason(job):
+    """Aus failed-Job-Daten den passenden reason_code ableiten.
+    Bevorzugt explizit gesetztes job['reason_code'], sonst Heuristik aus
+    job['data'] und job['error']-String.
+    """
+    if not job:
+        return 'WORKER_RESTARTED'
+    # Explizit gesetzt? (von neueren Code-Stellen die _set_job_failed nutzen)
+    explicit = job.get('reason_code')
+    if explicit and explicit in AEROTAX_ERROR_CODES:
+        return explicit
+
+    data = job.get('data') or {}
+    error_low = (job.get('error') or '').lower()
+    status = job.get('status') or ''
+
+    # Hard-Signals aus data (am verlässlichsten)
+    if data.get('_followme_align_failed'):
+        return 'ALIGN_FAILED'
+    dh = data.get('_document_health') or {}
+    if isinstance(dh, dict) and dh.get('status') == 'red':
+        return 'DOCUMENT_HEALTH_RED'
+
+    # Status-spezifische Heuristik
+    if status == 'failed_timeout':
+        return 'JOB_TIMEOUT'
+    if status == 'rejected':
+        return 'JOB_TIMEOUT' if 'überlastet' in error_low else 'WORKER_RESTARTED'
+
+    # Error-String-Heuristik (Last-Resort)
+    if 'schema' in error_low and 'valid' in error_low:
+        return 'ALIGN_SCHEMA_FAILED'
+    if 'invariant' in error_low:
+        return 'CALCULATION_INVARIANT_FAILED'
+    if 'pdf' in error_low and 'render' in error_low:
+        return 'PDF_RENDER_FAILED'
+    if 'payment' in error_low:
+        return 'PAYMENT_VERIFY_FAILED'
+    if 'rate' in error_low and 'limit' in error_low:
+        return 'SONNET_RATE_LIMIT'
+    if 'sonnet' in error_low or 'anthropic' in error_low:
+        return 'SONNET_TIMEOUT'
+    if 'timeout' in error_low:
+        return 'JOB_TIMEOUT'
+    if 'restart' in error_low or 'unterbroch' in error_low or 'neugestart' in error_low:
+        return 'WORKER_RESTARTED'
+
+    # Default
+    return 'WORKER_RESTARTED'
+
+
+def _classify_job_state(job, session=None):
+    """v12 Phase A: Zentrale State-Machine.
+
+    Mappt Raw-Job-Felder auf canonical_state + Aktionen.
+    Returns dict mit:
+      canonical_state, reason_code, user_title, user_message,
+      next_actions[], pdf_allowed, retry_allowed, support_recommended,
+      can_chat_explain_calculation, can_show_final_amount
+
+    Argumente:
+      job: Job-Dict aus _jobs[id] oder _load_job_from_disk; oder None
+      session: optional Session-Dict für expired/deleted-Erkennung
+
+    KEINE Heuristik in den Aufrufer auslagern — alles hier zentral.
+    """
+    # ─── job=None → entweder expired oder deleted (über session erkennen) ─
+    if not job:
+        if session and session.get('deleted'):
+            ec = AEROTAX_ERROR_CODES['SESSION_DELETED']
+            return {
+                'canonical_state':              'deleted',
+                'reason_code':                  'SESSION_DELETED',
+                'user_title':                   ec['user_title'],
+                'user_message':                 ec['user_message'],
+                'next_actions':                 [{'type': 'start_new', 'label': 'Neue Auswertung starten'}],
+                'pdf_allowed':                  False,
+                'retry_allowed':                False,
+                'support_recommended':          False,
+                'can_chat_explain_calculation': False,
+                'can_show_final_amount':        False,
+            }
+        ec = AEROTAX_ERROR_CODES['ACCESS_CODE_EXPIRED']
+        return {
+            'canonical_state':              'expired',
+            'reason_code':                  'ACCESS_CODE_EXPIRED',
+            'user_title':                   ec['user_title'],
+            'user_message':                 ec['user_message'],
+            'next_actions':                 [{'type': 'start_new', 'label': 'Neue Auswertung starten'}],
+            'pdf_allowed':                  False,
+            'retry_allowed':                False,
+            'support_recommended':          False,
+            'can_chat_explain_calculation': False,
+            'can_show_final_amount':        False,
+        }
+
+    status = job.get('status') or 'pending'
+    data = job.get('data') or {}
+
+    # Base canonical aus mapping
+    canonical = _AEROTAX_STATUS_TO_CANONICAL.get(status, 'processing')
+
+    # ─── failed_retryable → ggf. failed_support eskalieren ───
+    if canonical == 'failed_retryable':
+        reason_code = _classify_failure_reason(job)
+        ec = AEROTAX_ERROR_CODES.get(reason_code) or AEROTAX_ERROR_CODES['WORKER_RESTARTED']
+        if ec.get('support'):
+            canonical = 'failed_support'
+    else:
+        reason_code = None
+
+    # ─── done → ggf. needs_review wenn pending review items ───
+    if canonical == 'done':
+        review_items = data.get('_review_items') or []
+        pending = [it for it in review_items
+                   if isinstance(it, dict) and it.get('status') == 'pending']
+        if pending and not data.get('_skipped_unanswered'):
+            canonical = 'needs_review'
+
+    # ─── Retry-Limit prüfen: bei >= AEROTAX_MAX_RETRY zu failed_support ───
+    retry_count = int(job.get('retry_count', 0) or 0)
+    if canonical == 'failed_retryable' and retry_count >= AEROTAX_MAX_RETRY:
+        canonical = 'failed_support'
+        reason_code = 'RETRY_LIMIT_REACHED'
+
+    # ─── Per-State-Antwort ───
+    if canonical == 'created':
+        return {
+            'canonical_state':              'created',
+            'reason_code':                  None,
+            'user_title':                   'Auswertung vorbereitet',
+            'user_message':                 'Bitte lade die erforderlichen Dokumente hoch.',
+            'next_actions':                 [{'type': 'upload', 'label': 'Dokumente hochladen'}],
+            'pdf_allowed':                  False,
+            'retry_allowed':                False,
+            'support_recommended':          False,
+            'can_chat_explain_calculation': False,
+            'can_show_final_amount':        False,
+        }
+    if canonical == 'uploaded':
+        return {
+            'canonical_state':              'uploaded',
+            'reason_code':                  None,
+            'user_title':                   'Dokumente empfangen',
+            'user_message':                 'Deine Auswertung startet gleich.',
+            'next_actions':                 [{'type': 'refresh', 'label': 'Status aktualisieren'}],
+            'pdf_allowed':                  False,
+            'retry_allowed':                False,
+            'support_recommended':          False,
+            'can_chat_explain_calculation': False,
+            'can_show_final_amount':        False,
+        }
+    if canonical == 'queued':
+        return {
+            'canonical_state':              'queued',
+            'reason_code':                  None,
+            'user_title':                   'Auswertung in Warteschlange',
+            'user_message':                 'Deine Auswertung wird gleich gestartet.',
+            'next_actions':                 [{'type': 'refresh', 'label': 'Status aktualisieren'}],
+            'pdf_allowed':                  False,
+            'retry_allowed':                False,
+            'support_recommended':          False,
+            'can_chat_explain_calculation': False,
+            'can_show_final_amount':        False,
+        }
+    if canonical == 'processing':
+        return {
+            'canonical_state':              'processing',
+            'reason_code':                  None,
+            'user_title':                   'Auswertung läuft',
+            'user_message':                 'Deine Dokumente werden ausgewertet. Du kannst hier bleiben oder später mit deinem Zugangscode zurückkommen.',
+            'next_actions':                 [
+                {'type': 'refresh',          'label': 'Status aktualisieren'},
+                {'type': 'come_back_later',  'label': 'Später wiederkommen'},
+            ],
+            'pdf_allowed':                  False,
+            'retry_allowed':                False,
+            'support_recommended':          False,
+            'can_chat_explain_calculation': False,
+            'can_show_final_amount':        False,
+        }
+    if canonical == 'needs_review':
+        pending_count = len([it for it in (data.get('_review_items') or [])
+                              if isinstance(it, dict) and it.get('status') == 'pending'])
+        ec = AEROTAX_ERROR_CODES['OPEN_REVIEW']
+        return {
+            'canonical_state':              'needs_review',
+            'reason_code':                  'OPEN_REVIEW',
+            'user_title':                   ec['user_title'],
+            'user_message':                 f'Ich habe deine Dokumente ausgewertet. {pending_count} Punkt{"e" if pending_count != 1 else ""} brauche ich noch zur Bestätigung.',
+            'next_actions':                 [
+                {'type': 'open_review_chat',  'label': 'Im Chat klären'},
+                {'type': 'replace_file',      'label': 'Datei ersetzen'},
+                {'type': 'skip_noncritical',  'label': 'Bewusst überspringen'},
+                {'type': 'support',           'label': 'Support kontaktieren'},
+            ],
+            'pdf_allowed':                  False,  # gesperrt bis geklärt oder explizit skip
+            'retry_allowed':                False,
+            'support_recommended':          False,
+            'can_chat_explain_calculation': True,
+            'can_show_final_amount':        False,  # vorläufiger Wert — kein finaler Betrag
+        }
+    if canonical == 'done':
+        return {
+            'canonical_state':              'done',
+            'reason_code':                  None,
+            'user_title':                   'Auswertung fertig',
+            'user_message':                 'Dein Betrag ist berechnet. Du kannst das PDF herunterladen und den Wert in deiner Steuersoftware übernehmen.',
+            'next_actions':                 [
+                {'type': 'download_pdf',  'label': 'PDF herunterladen'},
+                {'type': 'open_chat',     'label': 'Frage im Chat stellen'},
+                {'type': 'start_new',     'label': 'Neue Auswertung starten'},
+            ],
+            'pdf_allowed':                  True,
+            'retry_allowed':                False,
+            'support_recommended':          False,
+            'can_chat_explain_calculation': True,
+            'can_show_final_amount':        True,
+        }
+    if canonical == 'failed_retryable':
+        if not reason_code:
+            reason_code = _classify_failure_reason(job)
+        ec = AEROTAX_ERROR_CODES.get(reason_code) or AEROTAX_ERROR_CODES['WORKER_RESTARTED']
+        return {
+            'canonical_state':              'failed_retryable',
+            'reason_code':                  reason_code,
+            'user_title':                   ec['user_title'],
+            'user_message':                 ec['user_message'],
+            'next_actions':                 [
+                {'type': 'retry',         'label': 'Auswertung erneut starten'},
+                {'type': 'replace_file',  'label': 'Dateien ersetzen'},
+                {'type': 'support',       'label': 'Support kontaktieren'},
+                {'type': 'start_new',     'label': 'Neue Auswertung starten'},
+            ],
+            'pdf_allowed':                  False,
+            'retry_allowed':                True,
+            'support_recommended':          False,
+            'can_chat_explain_calculation': False,
+            'can_show_final_amount':        False,
+        }
+    if canonical == 'failed_support':
+        if not reason_code:
+            reason_code = _classify_failure_reason(job)
+        ec = AEROTAX_ERROR_CODES.get(reason_code) or AEROTAX_ERROR_CODES['ALIGN_FAILED']
+        return {
+            'canonical_state':              'failed_support',
+            'reason_code':                  reason_code,
+            'user_title':                   ec['user_title'],
+            'user_message':                 ec['user_message'],
+            'next_actions':                 [
+                {'type': 'support',           'label': 'Support kontaktieren'},
+                {'type': 'send_debug_report', 'label': 'Technischen Bericht senden'},
+                {'type': 'replace_file',      'label': 'Dateien ersetzen'},
+                {'type': 'start_new',         'label': 'Neue Auswertung starten'},
+            ],
+            'pdf_allowed':                  False,
+            'retry_allowed':                False,  # kein Retry — wäre unsicher
+            'support_recommended':          True,
+            'can_chat_explain_calculation': False,
+            'can_show_final_amount':        False,
+        }
+    # Fallback (sollte nie hit werden — sicherheitshalber processing)
+    return {
+        'canonical_state':              'processing',
+        'reason_code':                  None,
+        'user_title':                   'Auswertung läuft',
+        'user_message':                 'Deine Auswertung wird gerade verarbeitet.',
+        'next_actions':                 [{'type': 'refresh', 'label': 'Status aktualisieren'}],
+        'pdf_allowed':                  False,
+        'retry_allowed':                False,
+        'support_recommended':          False,
+        'can_chat_explain_calculation': False,
+        'can_show_final_amount':        False,
+    }
+
+
+def _set_job_failed(job_id, reason_code, error_message=None):
+    """Helper: setzt Job auf failed mit explizitem reason_code.
+    Damit Future-Code (z.B. neue Error-Stellen) den State-Machine direkt
+    füttern statt sich auf Error-String-Heuristik verlassen zu müssen.
+    """
+    if reason_code not in AEROTAX_ERROR_CODES:
+        reason_code = 'WORKER_RESTARTED'
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        if j is not None:
+            j['status'] = 'failed'
+            j['reason_code'] = reason_code
+            j['error'] = error_message or AEROTAX_ERROR_CODES[reason_code]['user_message']
+            j['completed'] = datetime.utcnow().isoformat() + 'Z'
+    try:
+        _save_job_to_disk(job_id)
+    except Exception:
+        pass
+
+
 @app.route('/api/job/<job_id>', methods=['GET'])
 @requires_session_token
 def get_job_status(job_id):
-    """Pollt Status. Bei Memory-Miss: lade vom Disk (Server-Restart-Resilience)."""
+    """Pollt Status. Bei Memory-Miss: lade vom Disk (Server-Restart-Resilience).
+
+    v12 Phase A: liefert zusätzlich canonical_state + reason_code +
+    user_title + user_message + next_actions[]. Frontend rendert nach
+    canonical_state — keine Heuristik mehr im Frontend nötig.
+    """
     with _jobs_lock:
         j = _jobs.get(job_id)
     if not j:
@@ -1842,7 +2332,12 @@ def get_job_status(job_id):
             with _jobs_lock:
                 _jobs[job_id] = j
     if not j:
-        return jsonify({'status': 'not_found'}), 404
+        # Statt nacktem 404: friendly state-machine response.
+        state = _classify_job_state(None, None)
+        return jsonify({
+            'status': 'not_found',
+            **state,
+        }), 404
     safe = {k: v for k, v in j.items() if k != 'audit'}
     # Wenn Job noch in Queue: aktuelle Position + ETA mitschicken
     status = safe.get('status')
@@ -1851,6 +2346,8 @@ def get_job_status(job_id):
         if pos is not None:
             safe['queue_position'] = pos
             safe['eta_seconds']    = max(0, (pos - 1) * _AVG_JOB_SECONDS)
+    # v12 Phase A: canonical state ans Response heften (backward-compatible)
+    safe.update(_classify_job_state(j))
     return jsonify(safe)
 
 
@@ -3308,65 +3805,85 @@ def post_finalize_pdf(job_id):
     body = request.get_json(silent=True) or {}
     skip_unanswered = bool(body.get('skip_unanswered', False))
 
+    # v12 Phase A: strukturierte PDF-Lock-Response.
+    # Helper baut einheitliches Format aus state-machine + Extra-Felder.
+    def _pdf_lock_response(reason_code, http_status=409, extra=None):
+        ec = AEROTAX_ERROR_CODES.get(reason_code) or AEROTAX_ERROR_CODES['WORKER_RESTARTED']
+        resp = {
+            'ok':            False,
+            'pdf_allowed':   False,
+            'reason_code':   reason_code,
+            'user_title':    'PDF noch nicht verfügbar',
+            'user_message':  ec['user_message'],
+            'next_actions':  [],
+            # backward-compat: alte „error"-Stringkonsumenten weiter bedienen
+            'error':         ec['user_message'],
+        }
+        # next_actions je nach reason_code
+        if ec.get('retryable'):
+            resp['next_actions'].append({'type': 'retry', 'label': 'Auswertung erneut starten'})
+        if ec.get('support'):
+            resp['next_actions'].append({'type': 'support', 'label': 'Support kontaktieren'})
+        if reason_code == 'OPEN_REVIEW':
+            resp['next_actions'].insert(0, {'type': 'open_review_chat', 'label': 'Im Chat klären'})
+            resp['next_actions'].append({'type': 'skip_noncritical', 'label': 'Bewusst überspringen'})
+        resp['next_actions'].append({'type': 'start_new', 'label': 'Neue Auswertung starten'})
+        if extra:
+            resp.update(extra)
+        return jsonify(resp), http_status
+
     with _jobs_lock:
         j = _jobs.get(job_id) or _load_job_from_disk(job_id)
         if not j:
-            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
-        # Job-Status muss done sein (Berechnung abgeschlossen)
-        if j.get('status') != 'done':
-            return jsonify({'error': 'Auswertung noch nicht abgeschlossen'}), 400
+            return _pdf_lock_response('ACCESS_CODE_EXPIRED', http_status=404)
+        # canonical_state ermitteln — entscheidet ob PDF erlaubt
+        state = _classify_job_state(j)
         # v8.23: PDF blockiert wenn ein Dokument zur Re-Verarbeitung vorgemerkt ist
         if j.get('pending_reread'):
-            return jsonify({
-                'error': 'Eine Datei wartet auf erneute Auswertung — bitte erst Auswertung neu starten.',
+            return _pdf_lock_response('CAS_READ_FAILED', extra={
                 'pending_reread': True,
                 'pending_reread_doc_types': j.get('pending_reread_doc_types', []),
-            }), 409
-        # v11 P0 Safety: PDF blockiert wenn Align-Pflicht-Step crashed ist.
-        # Schutz davor dass User PDF mit potenziell falschen Werten downloadet.
-        _data_for_align_check = j.get('data') or {}
-        if _data_for_align_check.get('_followme_align_failed'):
-            return jsonify({
-                'error': 'Die Berechnung konnte nicht vollständig geprüft werden. '
-                         'Bitte starte die Auswertung erneut oder kontaktiere den Support.',
-                'followme_align_failed': True,
-            }), 409
-        # Plus: document_health=red blockiert ebenfalls
-        _dh = _data_for_align_check.get('_document_health') or {}
-        if isinstance(_dh, dict) and _dh.get('status') == 'red':
-            return jsonify({
-                'error': 'Die Auswertung enthält ungelöste Probleme. '
-                         'Bitte prüfe den Chat oder kontaktiere den Support.',
-                'document_health': 'red',
-            }), 409
+                'user_message': 'Eine Datei wartet auf erneute Auswertung — bitte erst Auswertung neu starten.',
+            })
+        # Strukturierte Blockade je canonical_state
+        if state['canonical_state'] == 'failed_support':
+            return _pdf_lock_response(state.get('reason_code') or 'ALIGN_FAILED')
+        if state['canonical_state'] == 'failed_retryable':
+            return _pdf_lock_response(state.get('reason_code') or 'WORKER_RESTARTED')
+        if state['canonical_state'] in ('processing', 'queued'):
+            return _pdf_lock_response('WORKER_RESTARTED', http_status=400, extra={
+                'user_message': 'Auswertung noch nicht abgeschlossen.',
+            })
+
+        # Ab hier: state ist done oder needs_review
         data = dict(j.get('data') or {})
         cached = data.get('_cached_recalc_state') or {}
         overrides = j.get('manual_day_overrides') or {}
-        # v9.2 Hard-Gate: offene Review-Items + nicht skip → 409
-        if not skip_unanswered:
+
+        # needs_review: nur erlauben wenn skip_unanswered=true
+        if state['canonical_state'] == 'needs_review' and not skip_unanswered:
             review_items = data.get('_review_items') or []
             still_pending = [it for it in review_items if it.get('status') == 'pending']
-            if still_pending:
-                return jsonify({
-                    'error': f'Es sind noch {len(still_pending)} Tage ungeklärt. '
-                              f'Beantworte sie im Chat — oder rufe den Endpoint mit '
-                              f'skip_unanswered=true auf, dann werden sie als nicht bestätigt notiert.',
-                    'pending_review_count': len(still_pending),
-                }), 409
+            return _pdf_lock_response('OPEN_REVIEW', extra={
+                'pending_review_count': len(still_pending),
+                'user_message': f'Es sind noch {len(still_pending)} Tage ungeklärt. Beantworte sie im Chat oder überspringe bewusst.',
+            })
 
     if not cached or not cached.get('matched_days'):
-        return jsonify({
-            'error': 'Recalc-State nicht verfügbar — bitte Auswertung erneut starten.',
-        }), 409
+        return _pdf_lock_response('WORKER_RESTARTED', extra={
+            'user_message': 'Berechnungsstand nicht verfügbar — bitte Auswertung erneut starten.',
+        })
 
     # Re-Compute mit aktuellen Overrides (deterministisch, kein Sonnet-Call)
     try:
         rec = _recompute_with_overrides(cached, overrides)
         if not rec:
-            return jsonify({'error': 'Re-Berechnung fehlgeschlagen.'}), 500
+            return _pdf_lock_response('CALCULATION_INVARIANT_FAILED', http_status=500)
     except Exception as e:
         print(f'[finalize-pdf] recalc fail: {e}')
-        return jsonify({'error': 'Re-Berechnung fehlgeschlagen.', 'detail': str(e)[:120]}), 500
+        return _pdf_lock_response('CALCULATION_INVARIANT_FAILED', http_status=500, extra={
+            'detail': str(e)[:120],
+        })
 
     # Result-Dict mit neuen Totals patchen (PDF-Generator nutzt die Felder direkt)
     final_data = dict(data)
@@ -3413,7 +3930,7 @@ def post_finalize_pdf(job_id):
         pdf_bytes = erstelle_pdf(final_data).getvalue()
     except Exception as e:
         print(f'[finalize-pdf] erstelle_pdf fail: {e}')
-        return jsonify({'error': 'PDF-Erstellung fehlgeschlagen.', 'detail': str(e)[:120]}), 500
+        return _pdf_lock_response('PDF_RENDER_FAILED', http_status=500, extra={'detail': str(e)[:120]})
 
     # PDF unter Token speichern (überschreibt das alte)
     download_url = data.get('download_url') or ''
@@ -3433,7 +3950,9 @@ def post_finalize_pdf(job_id):
         _save_pdf(token, pdf_bytes, filename)
     except Exception as e:
         print(f'[finalize-pdf] save_pdf fail: {e}')
-        return jsonify({'error': 'PDF-Speicherung fehlgeschlagen.'}), 500
+        return _pdf_lock_response('PDF_RENDER_FAILED', http_status=500, extra={
+            'user_message': 'PDF-Speicherung fehlgeschlagen.', 'detail': str(e)[:120],
+        })
 
     # Job-State aktualisieren
     with _jobs_lock:
@@ -3471,9 +3990,16 @@ def post_finalize_pdf(job_id):
 
 @app.route('/api/recover', methods=['POST'])
 def recover_failed_job():
-    """Vereinfacht: Session-Token reicht für Retry. Max 1 kostenloser Retry — danach Support.
+    """v12 Phase A: persistenter Retry-Counter, max AEROTAX_MAX_RETRY=2.
+
+    Counter-Quelle: session.result_data._retry_count (persistent via Supabase).
+    In-Memory _recovery_tokens als Cache, max(memory, session) gewinnt.
+    Render-Restart killt nur den Cache — Counter aus Supabase überlebt.
+
+    Bei retry_count >= AEROTAX_MAX_RETRY: failed_support response,
+    kein weiterer Retry. User muss Support kontaktieren oder neue Auswertung.
+
     Body: {token}. Token muss noch gültig sein (24h ab Bezahlung).
-    Retry-Counter im In-Memory _recovery_tokens (V1 acceptance).
     """
     body = request.get_json(silent=True) or {}
     token = body.get('token', '').strip()
@@ -3481,22 +4007,63 @@ def recover_failed_job():
         return jsonify({'error': 'token erforderlich'}), 400
     session = _load_session(token)
     if not session:
-        return jsonify({'error': 'Token ungültig oder abgelaufen (24h ab Bezahlung)'}), 403
-    info = _recovery_tokens.get(token, {})
-    if int(info.get('retries_used', 0)) >= 1:
+        ec = AEROTAX_ERROR_CODES['ACCESS_CODE_EXPIRED']
         return jsonify({
-            'error': 'Du hast bereits einen kostenlosen Retry genutzt. Bitte kontaktiere Support — wir helfen dir persönlich.',
-            'support': True,
+            'error':        ec['user_message'],
+            'reason_code':  'ACCESS_CODE_EXPIRED',
+            'user_title':   ec['user_title'],
+            'user_message': ec['user_message'],
         }), 403
+
+    # Counter aus beiden Quellen lesen, max nehmen (Supabase ist persistent)
+    rd_existing = session.get('result_data') or {}
+    sess_count = int(rd_existing.get('_retry_count', 0) or 0)
+    mem_count  = int((_recovery_tokens.get(token) or {}).get('retries_used', 0) or 0)
+    current_count = max(sess_count, mem_count)
+
+    if current_count >= AEROTAX_MAX_RETRY:
+        ec = AEROTAX_ERROR_CODES['RETRY_LIMIT_REACHED']
+        return jsonify({
+            'error':                 ec['user_message'],
+            'reason_code':           'RETRY_LIMIT_REACHED',
+            'user_title':            ec['user_title'],
+            'user_message':          ec['user_message'],
+            'support':               True,
+            'support_recommended':   True,
+            'retry_count':           current_count,
+            'retry_limit':           AEROTAX_MAX_RETRY,
+            'canonical_state':       'failed_support',
+            'next_actions':          [
+                {'type': 'support',   'label': 'Support kontaktieren'},
+                {'type': 'start_new', 'label': 'Neue Auswertung starten'},
+            ],
+        }), 403
+
+    new_count = current_count + 1
+
+    # 1) Supabase persistieren — überlebt Container-Restart
+    rd_new = dict(rd_existing)
+    rd_new['_retry_count'] = new_count
+    rd_new['_last_retry_at'] = datetime.utcnow().isoformat() + 'Z'
+    try:
+        _save_session(token, {**session, 'result_data': rd_new})
+    except Exception as _e:
+        print(f"[recover] session-persist warn: {_e}")
+
+    # 2) Memory-Cache aktualisieren — beschleunigt nächste Reads
     _recovery_tokens[token] = {
-        'token': token,
-        'retries_used': int(info.get('retries_used', 0)) + 1,
-        'expires': (datetime.utcnow() + timedelta(minutes=60)).isoformat() + 'Z',
+        'token':        token,
+        'retries_used': new_count,
+        'expires':      (datetime.utcnow() + timedelta(minutes=60)).isoformat() + 'Z',
     }
+
     return jsonify({
-        'ok': True,
-        'message': 'Du kannst innerhalb der nächsten 60 Min die Dokumente erneut hochladen — ohne erneute Bezahlung. Bei einem weiteren Fehler wende dich bitte an den Support.',
+        'ok':              True,
+        'message':         f'Du kannst innerhalb der nächsten 60 Min die Dokumente erneut hochladen — ohne erneute Bezahlung. Versuch {new_count} von {AEROTAX_MAX_RETRY}.',
         'free_retry_token': token,
+        'retry_count':     new_count,
+        'retry_limit':     AEROTAX_MAX_RETRY,
+        'retries_remaining': max(0, AEROTAX_MAX_RETRY - new_count),
     })
 
 
@@ -4052,12 +4619,28 @@ def session_by_short_code(code):
 
 @app.route('/api/session/<token>', methods=['GET'])
 def session_recall(token):
-    """Holt Auswertungs-Ergebnis via Session-Token."""
+    """Holt Auswertungs-Ergebnis via Session-Token.
+
+    v12 Phase A: liefert canonical_state + reason_code + user_title +
+    user_message + next_actions[] zusätzlich zu den bestehenden Feldern.
+    """
     s = _load_session(token)
     if not s:
-        return jsonify({'error': 'Session-Token ungültig oder abgelaufen'}), 404
+        # Token weder gefunden noch erkannt → expired (state-machine response).
+        state = _classify_job_state(None, None)
+        return jsonify({
+            'error': state['user_message'],  # backward-compat
+            **state,
+        }), 404
     # Sensitiver Chat-Verlauf nicht standardmäßig zurückgeben
     safe = {k: v for k, v in s.items() if k != 'chat_history'}
+    # v12 Phase A: state aus zugehörigem job ableiten, sonst aus session
+    job_id = s.get('job_id') or ''
+    job = None
+    if job_id:
+        with _jobs_lock:
+            job = _jobs.get(job_id) or _load_job_from_disk(job_id)
+    safe.update(_classify_job_state(job, s))
     return jsonify(safe)
 
 
@@ -4146,7 +4729,47 @@ def chat_with_aerotax():
 
     session = _load_session(token)
     if not session:
-        return jsonify({'error': 'Session-Token ungültig oder abgelaufen — bitte neu auswerten'}), 401
+        ec = AEROTAX_ERROR_CODES['ACCESS_CODE_EXPIRED']
+        return jsonify({
+            'error':        ec['user_message'],
+            'reason_code':  'ACCESS_CODE_EXPIRED',
+            'user_title':   ec['user_title'],
+        }), 401
+
+    # v12 Phase A: State-Gate — bei nicht-done Status, KEIN Sonnet-Call.
+    # Stattdessen state-spezifische fixe Antwort, damit Sonnet nicht aus
+    # unvollständigen result_data einen Final-Betrag halluziniert.
+    # Review-Kontext bypasst dieses Gate (User klärt offene Items im Chat).
+    if not is_review_context:
+        job_id = session.get('job_id') or ''
+        job_state = None
+        if job_id:
+            with _jobs_lock:
+                _j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+            job_state = _classify_job_state(_j, session)
+        if job_state and not job_state['can_chat_explain_calculation']:
+            # State-Gate aktiv: feste freundliche Antwort + Hinweis auf nächste Aktion.
+            gate_replies = {
+                'processing': 'Deine Auswertung läuft noch — sobald sie fertig ist, kann ich dir die Berechnung erklären. Du kannst hier bleiben oder später mit deinem Zugangscode zurückkommen.',
+                'queued':     'Deine Auswertung wartet auf den nächsten freien Worker. Ich melde mich, sobald sie fertig ist.',
+                'failed_retryable': 'Die Auswertung wurde technisch unterbrochen. Du kannst sie kostenlos erneut starten — bevor wir hier weiterreden, sollte sie erst durchlaufen.',
+                'failed_support':   'Ich habe die Auswertung gestoppt, damit kein unsicherer Betrag entsteht. Über den Chat kann ich keine Berechnung erklären — bitte kontaktiere den Support oder starte eine neue Auswertung.',
+                'expired':    'Dein Zugangscode ist abgelaufen. Bitte starte eine neue Auswertung.',
+                'deleted':    'Diese Auswertung wurde gelöscht.',
+                'created':    'Ich warte noch auf deine Dokumente.',
+                'uploaded':   'Deine Dokumente sind da — die Auswertung startet gleich.',
+            }
+            reply_text = gate_replies.get(
+                job_state['canonical_state'],
+                job_state.get('user_message') or 'Aktuell kann ich dir die Berechnung noch nicht erklären.',
+            )
+            return jsonify({
+                'reply':           reply_text,
+                'filtered':        'state_gate',
+                'canonical_state': job_state['canonical_state'],
+                'reason_code':     job_state.get('reason_code'),
+                'next_actions':    job_state.get('next_actions') or [],
+            }), 200
 
     # ── COST-CONTROL: Hard-Caps pro Session ──────────────────
     # v8.33: Review-Kontext bypassed Caps & IP-Rate-Limit komplett

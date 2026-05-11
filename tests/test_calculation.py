@@ -6441,7 +6441,7 @@ def test_v833_review_kind_bypasses_hard_cap():
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def chat_with_aerotax')
-    block = src[fn_idx:fn_idx+3000]
+    block = src[fn_idx:fn_idx+8000]
     # Suche HARD_CAP-Check — muss is_review_context-Bedingung haben
     cap_idx = block.find('user_msg_count >= HARD_CAP')
     assert cap_idx > 0
@@ -6508,7 +6508,7 @@ def test_v833_prompt_forbids_netto_colon_prefix():
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def chat_with_aerotax')
-    block = src[fn_idx:fn_idx+10000]
+    block = src[fn_idx:fn_idx+18000]
     assert 'Netto:' in block, 'Prompt-Regel muss "Netto:" mit Doppelpunkt verbieten'
 
 
@@ -6517,7 +6517,7 @@ def test_v833_prompt_disclaimer_only_for_tax_statements():
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def chat_with_aerotax')
-    block = src[fn_idx:fn_idx+10000]
+    block = src[fn_idx:fn_idx+18000]
     assert 'NIEMALS in derselben Konversation erneut' in block, \
         'Prompt muss verbieten, Disclaimer mehrfach zu zeigen'
 
@@ -6527,7 +6527,7 @@ def test_v833_chat_history_marks_review_messages():
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def chat_with_aerotax')
-    block = src[fn_idx:fn_idx+10000]
+    block = src[fn_idx:fn_idx+18000]
     assert "'is_review': is_review_context" in block, \
         'chat_history muss is_review-Flag pro Nachricht speichern'
     # Counter-Filter
@@ -7325,15 +7325,21 @@ def test_v92_audit_no_raw_job_not_found_user_facing():
 
 
 def test_v92_audit_finalize_pdf_hard_gate_open_reviews():
-    """AUDIT E: /finalize-pdf blockt wenn offene Review-Items + nicht skip_unanswered."""
+    """AUDIT E: /finalize-pdf blockt wenn offene Review-Items + nicht skip_unanswered.
+    v12 Phase A: läuft jetzt über state-machine (canonical_state='needs_review')
+    + strukturierte _pdf_lock_response mit reason_code='OPEN_REVIEW'."""
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def post_finalize_pdf(')
-    block = src[fn_idx:fn_idx+3500]
+    block = src[fn_idx:fn_idx+6000]
     assert 'still_pending' in block
-    assert "if not skip_unanswered" in block
+    # v12: condition kombiniert state + skip_unanswered
+    assert "not skip_unanswered" in block
+    assert "needs_review" in block
     assert "pending_review_count" in block
-    assert ', 409' in block, 'Block muss HTTP 409 returnen'
+    # v12: strukturierte response statt loose 409 — Helper enthält 409 default
+    assert "_pdf_lock_response" in block
+    assert "'OPEN_REVIEW'" in block
 
 
 def test_v92_audit_ai_chat_passes_full_history():
@@ -8244,7 +8250,7 @@ def test_v10_pdf_skipped_note_when_skip_used():
     """finalize-pdf mit skip_unanswered=True appendet „nicht bestätigt"-Note."""
     src = _read_backend()
     idx = src.find('def post_finalize_pdf')
-    block = src[idx:idx + 6000]
+    block = src[idx:idx + 10000]
     assert 'Nicht bestätigte Punkte wurden nicht zusätzlich berücksichtigt' in block, \
         'Skipped-Note-Text fehlt'
 
