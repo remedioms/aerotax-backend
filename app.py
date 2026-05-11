@@ -8479,59 +8479,35 @@ def _sonnet_read_cas_single_pdf(pdf_bytes, year, homebase, source_filename='cas.
         },
     }
 
-    prompt = f"""Du liest einen Lufthansa CAS / Dienstplan / Roster für Steuerjahr {year}.
+    # v11 Slim-Prompt (Commit 2): kürzer = schnellere Sonnet-Response.
+    # Behält alle kritischen Regeln (kein Tax-Bewertung, exakte Marker, kein
+    # Raten). Detail-Mappings raus — Sonnet weiß die Lufthansa-Marker schon.
+    prompt = f"""Du liest einen Lufthansa CAS/Dienstplan/Roster für {year} (Homebase {homebase}).
 
-═══ FORMAT ═══
-CAS ist eine tabellarische Aufstellung pro Tag mit:
-  • Wochentag-Kürzel + Tag-Nummer (z.B. „Mo 10", „Di 18", „Mi 06")
-  • Aktivitäts-Code:
-      - „LH<Nummer>" oder „FL" → flight (Linienflug)
-      - „EH", „EMCRM", „SECCRM", „TK", „D4", „EM" → training (Schulung)
-      - „SIM" → simulator
-      - „ORTSTAG", „FRS", „LMN_AS", „LMN_CR" → office (Bürodienst Homebase)
-      - „RES_SB", „RES", „SBY" → standby
-      - „U", „U1", „U2", „URLAUB" → vacation
-      - „K", „KRANK" → sick
-      - „OFF", „X", „FREI" → free
-      - alles andere → unknown
-  • Zeiten:
-      - Briefingzeit: oft „Briefingzeit(LT FRA): DD/MM/YY HH:MM"
-      - Flugzeit: „LH600 A340 FRA 12:20-17:15 IKA"
-      - Schulung: „EH 4 FRA 08:00-12:45"
-      - Standby-Fenster: „RES_SB FRA 04:00-20:00"
-  • Location: meist FRA Briefing oder remote (IKA, BLR, ORD etc.)
+Pro Kalendertag im Plan ein Eintrag (auch frei/OFF/Urlaub). Felder:
+- date: YYYY-MM-DD ({year})
+- activity_type: flight|training|simulator|office|standby|vacation|sick|free|unknown
+  Mapping: LH/FL→flight; EH/EM/EMCRM/SECCRM/TK/D4→training; SIM→simulator;
+  ORTSTAG/FRS/LMN_AS/LMN_CR→office; RES/RES_SB/SBY→standby; U/U1/U2/URLAUB→vacation;
+  K/KRANK→sick; OFF/X/FREI/==→free; sonst→unknown
+- marker: Roh-Code wie im CAS (NICHT interpretieren)
+- start_time / end_time: HH:MM (leer bei frei/Urlaub)
+- duration_minutes: end - start
+- location: Briefing-IATA (meist {homebase})
+- flights[]: nur bei activity_type='flight'
+- overnight_after_day: True wenn Tag endet in remote location
+- layover_ort: IATA wenn remote, leer wenn {homebase}
+- confidence: high|medium|low
+- raw_excerpt: max 80 chars
 
-═══ WAS DU LIEFERN MUSST ═══
-Pro Kalendertag im Plan ein Eintrag (auch frei/OFF/Urlaubs-Tage).
-Wenn der Plan einen Monat abdeckt: 28-31 Tage. Wenn 2 Monate: alle Tage beider Monate.
+REGELN:
+- KEINE Steuerbewertung, KEINE Beträge, KEINE Z72/Z73-Klassifizierung.
+- Marker EXAKT wiedergeben (X/OFF/== nicht interpretieren — Backend macht Tour-Logik).
+- Bei unklar: activity_type='unknown' + confidence='low'. NICHT raten.
+- Konflikte/Lücken in warnings[] notieren.
+- raw_excerpt MAX 80 Zeichen.
 
-Felder pro Tag:
-  - date: YYYY-MM-DD (das Jahr ist {year}, der Monat aus dem Plan-Header)
-  - activity_type: aus enum oben
-  - marker: Roh-Code wie er im CAS steht
-  - start_time: HH:MM (Briefing oder Aktivitäts-Start). Bei frei/Urlaub: leer.
-  - end_time: HH:MM (letzte Flug-Landung oder Aktivitäts-Ende). Bei Tour über Mitternacht: bis 23:59 dieses Tags.
-  - duration_minutes: end_time - start_time in Minuten
-  - location: Briefing-Location IATA (meist FRA)
-  - flights[]: nur bei activity_type='flight'
-  - overnight_after_day: True wenn Tag endet in remote Location (Layover)
-  - layover_ort: IATA-Code falls remote, leer wenn FRA
-  - confidence: high/medium/low
-  - raw_excerpt: kurzer Roh-Auszug (max 80 Zeichen)
-
-═══ WICHTIG ═══
-✓ KEINE STEUERLICHE BEWERTUNG. Liefere nur Lese-Fakten.
-✓ KEINE Berechnung von >8h / Z72 / Z73. Backend rechnet.
-✓ Wenn ein Tag unklar ist: activity_type='unknown' + confidence='low'.
-✓ Bei Konflikten oder Lücken: in warnings[] notieren.
-✓ Tage immer als YYYY-MM-DD im Steuerjahr {year}.
-
-═══ KOMPAKTHEIT ═══
-  • raw_excerpt max 80 Zeichen
-  • flights[] nur ausgefüllt bei flight-Tagen
-  • Output sollte in 25k Tokens passen
-
-LIEFERE jetzt via Tool 'submit_cas_days' die strukturierten Tagesdaten."""
+LIEFERE via Tool 'submit_cas_days'."""
 
     if use_text_path:
         # v11 Text-Pfad: pdfplumber-Text als plain text statt PDF-Bytes.
@@ -8547,17 +8523,22 @@ LIEFERE jetzt via Tool 'submit_cas_days' die strukturierten Tagesdaten."""
             {'type': 'text', 'text': prompt},
         ]
 
+    # v11 Commit 2: max_tokens=12000 default. Wenn Sonnet bei max_tokens
+    # truncated, einmal Retry mit 20000. Sonst friendly fail (kein silent loss).
     import time as _t
-    start = _t.time()
-    try:
+    def _call_sonnet(_max_tokens):
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
-        resp = client.messages.create(
+        return client.messages.create(
             model='claude-sonnet-4-6',
-            max_tokens=25000,
+            max_tokens=_max_tokens,
             tools=[cas_tool],
             tool_choice={'type': 'tool', 'name': 'submit_cas_days'},
             messages=[{'role': 'user', 'content': content}],
         )
+
+    start = _t.time()
+    try:
+        resp = _call_sonnet(12000)
     except Exception as e:
         print(f"[Sonnet-CAS] fail: {type(e).__name__}: {str(e)[:200]}")
         return None
@@ -8569,6 +8550,26 @@ LIEFERE jetzt via Tool 'submit_cas_days' die strukturierten Tagesdaten."""
         in_tok = getattr(usage, 'input_tokens', '?')
         out_tok = getattr(usage, 'output_tokens', '?')
         print(f"[Sonnet-CAS] {source_filename[:40]}: stop={stop_reason} in_tok={in_tok} out_tok={out_tok} {elapsed:.1f}s")
+
+    # v11 Retry bei max_tokens-Truncation
+    if stop_reason == 'max_tokens':
+        print(f"[Sonnet-CAS] {source_filename[:40]}: truncation @12k → retry @20k")
+        try:
+            resp = _call_sonnet(20000)
+            elapsed = _t.time() - start
+            stop_reason = getattr(resp, 'stop_reason', None) if resp else 'no_response'
+            usage = getattr(resp, 'usage', None) if resp else None
+            if usage:
+                in_tok = getattr(usage, 'input_tokens', '?')
+                out_tok = getattr(usage, 'output_tokens', '?')
+                print(f"[Sonnet-CAS] {source_filename[:40]} retry: stop={stop_reason} in_tok={in_tok} out_tok={out_tok} {elapsed:.1f}s")
+            if stop_reason == 'max_tokens':
+                # Auch bei 20k truncated — friendly fail
+                print(f"[Sonnet-CAS] {source_filename[:40]}: STILL truncated @20k — friendly fail, kein silent loss")
+                return None
+        except Exception as e:
+            print(f"[Sonnet-CAS] {source_filename[:40]} retry fail: {type(e).__name__}: {str(e)[:200]}")
+            return None
 
     # Tool-Output extrahieren
     tool_input = None

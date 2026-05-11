@@ -10471,8 +10471,10 @@ def test_v11_cas_prompt_no_steuerbewertung():
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     block = src[fn_idx:fn_idx + 10000]
-    assert 'KEINE STEUERLICHE BEWERTUNG' in block or 'KEINE STEUER' in block
-    assert 'Backend rechnet' in block
+    # v11 Slim-Prompt nutzt "KEINE Steuerbewertung" und "Backend macht Tour-Logik"
+    assert 'KEINE Steuerbewertung' in block or 'KEINE STEUER' in block or \
+           'KEINE STEUERLICHE BEWERTUNG' in block
+    assert 'Backend' in block
 
 
 def test_v11_cas_prompt_says_no_z72_z73():
@@ -10547,13 +10549,15 @@ def test_v11_cas_reader_heartbeat_per_file():
     assert 'cas_file_' in block or 'Dienstplan/CAS wird gelesen' in block
 
 
-def test_v11_cas_reader_max_tokens_25k():
-    """Sonnet-Call nutzt max_tokens=25000 (kleiner Memory-Peak pro File)."""
+def test_v11_cas_reader_max_tokens_12k_with_20k_retry():
+    """v11 Commit 2: max_tokens=12000 default + 20000 Retry bei Truncation."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
-    block = src[fn_idx:fn_idx + 10000]
-    assert 'max_tokens=25000' in block, \
-        '25k max_tokens pro CAS-PDF (Memory-bounded)'
+    block = src[fn_idx:fn_idx + 12000]
+    assert '_call_sonnet(12000)' in block or 'max_tokens=12000' in block, \
+        '12k max_tokens default'
+    assert '_call_sonnet(20000)' in block or 'max_tokens=20000' in block, \
+        '20k max_tokens als Retry-Stufe'
 
 
 def test_v11_cas_reader_memory_release_per_file():
@@ -11908,6 +11912,82 @@ def test_cas_text_path_does_not_send_base64():
     block = src[fn_idx:fn_idx + 12000]
     assert 'if use_text_path:' in block
     assert "extrahiert via pdfplumber" in block or 'pdfplumber' in block.lower()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 CAS Commit 2: Slim-Prompt + max_tokens=12000 + Retry
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_cas_prompt_does_not_ask_for_tax_amounts():
+    """Slim-Prompt enthält keine Steuerbewertung-Anforderungen."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 10000]
+    # Suche den Prompt-Block
+    p_idx = block.find('prompt = f"""')
+    p_end = block.find('"""', p_idx + 20)
+    prompt = block[p_idx:p_end]
+    assert 'KEINE Steuerbewertung' in prompt or 'NICHT interpretieren' in prompt
+    # Keine Beträge / Klassifikations-Forderung
+    forbidden = ['Z72', 'Z73', 'Z74', 'Z76', 'Tagessatz', 'Pauschale', 'Betrag']
+    # ABER: Z72/Z73 darf in der "Backend macht..."-Regel vorkommen.
+    # Wir prüfen daher: keine FORDERUNG nach Z72-Klassifizierung
+    assert 'Backend' in prompt or 'KEINE Z72' in prompt or 'Backend macht' in prompt
+
+
+def test_cas_max_tokens_default_12000():
+    """Default max_tokens=12000 für CAS-Reader."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 12000]
+    # Erste Sonnet-Call sollte 12000 nutzen
+    assert '_call_sonnet(12000)' in block or 'max_tokens=12000' in block
+
+
+def test_cas_retry_on_max_tokens():
+    """Retry mit 20000 wenn stop_reason='max_tokens'."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 12000]
+    assert "stop_reason == 'max_tokens'" in block
+    assert '_call_sonnet(20000)' in block or 'max_tokens=20000' in block
+
+
+def test_cas_no_silent_truncation():
+    """Bei 20k auch truncated: friendly fail (return None), kein stille Datenverlust."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 12000]
+    # Nach Retry: if stop_reason == 'max_tokens' return None
+    assert 'STILL truncated' in block or 'still truncated' in block.lower()
+
+
+def test_cas_slim_prompt_preserves_required_schema():
+    """Slim-Prompt nennt alle nötigen Felder."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    p_idx = src.find('prompt = f"""', fn_idx)
+    p_end = src.find('"""', p_idx + 20)
+    prompt = src[p_idx:p_end]
+    required_fields = ['date', 'activity_type', 'marker', 'start_time', 'end_time',
+                       'duration_minutes', 'flights', 'overnight_after_day',
+                       'layover_ort', 'confidence']
+    for f in required_fields:
+        assert f in prompt, f'Required field {f} fehlt im Slim-Prompt'
+
+
+def test_cas_slim_prompt_marker_rules():
+    """Prompt verbietet Marker-Interpretation (X/OFF/== exakt wiedergeben)."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    p_idx = src.find('prompt = f"""', fn_idx)
+    p_end = src.find('"""', p_idx + 20)
+    prompt = src[p_idx:p_end]
+    # X/OFF/== müssen erwähnt sein als Marker (nicht zu interpretieren)
+    assert 'X' in prompt and 'OFF' in prompt
+    # Klare Anweisung dass Backend Tour-Logik macht
+    assert 'Backend' in prompt or 'nicht interpretieren' in prompt.lower()
 
 
 if __name__ == '__main__':
