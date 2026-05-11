@@ -10564,7 +10564,7 @@ def test_v11_cas_reader_memory_release_per_file():
     """gc.collect() nach jeder File für Memory-Release."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 6000]
+    block = src[fn_idx:fn_idx + 12000]
     assert 'gc.collect()' in block, \
         'gc.collect() pro File nötig (Render Free-Tier RAM)'
 
@@ -12071,6 +12071,321 @@ def test_cas_parallel_no_duplicate_days_after_merge():
     # Konflikt-Detection bei Duplikaten
     assert 'conflicts' in block
     assert 'multiple_files_disagree' in block
+
+
+# ─── Variante A: CAS-Merge zu einem Sonnet-Call ───────────────────────────────
+
+def test_cas_merged_function_exists():
+    """_sonnet_read_cas_merged_text existiert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_sonnet_read_cas_merged_text')
+
+
+def test_cas_merged_signature():
+    """Funktion akzeptiert cas_list/year/homebase/source_filenames/job_id."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_merged_text(')
+    assert fn_idx > 0
+    line_end = src.find(':', fn_idx)
+    sig = src[fn_idx:line_end]
+    for arg in ['cas_list', 'year', 'homebase', 'source_filenames', 'job_id']:
+        assert arg in sig, f'arg „{arg}" fehlt in Signatur'
+
+
+def test_cas_merged_returns_none_on_empty_list():
+    """Leere cas_list → None (kein Crash)."""
+    _app = _load_app_fresh()
+    assert _app._sonnet_read_cas_merged_text([], 2025, 'FRA', [], None) is None
+    assert _app._sonnet_read_cas_merged_text(None, 2025, 'FRA', [], None) is None
+
+
+def test_cas_merged_aborts_when_text_not_sufficient(monkeypatch):
+    """Wenn eine Datei nicht text-fähig: return None (fallback parallel)."""
+    _app = _load_app_fresh()
+    # _is_cas_text_sufficient → simuliere fail bei file 2
+    calls = {'n': 0}
+    def fake_sufficient(text):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            return True, 'ok'
+        return False, 'too_few_day_lines'
+    monkeypatch.setattr(_app, '_is_cas_text_sufficient', fake_sufficient)
+    monkeypatch.setattr(_app, '_extract_cas_text', lambda b: 'dummy text')
+    result = _app._sonnet_read_cas_merged_text(
+        [b'pdf1', b'pdf2'], 2025, 'FRA', ['a.pdf', 'b.pdf'], None
+    )
+    assert result is None
+
+
+def test_cas_merged_single_sonnet_call_via_anthropic_mock(monkeypatch):
+    """Smoke: bei 2 text-fähigen Files macht die Funktion EINEN Sonnet-Call,
+    nicht 2. Output identisch geshapet wie _sonnet_read_cas_structured."""
+    _app = _load_app_fresh()
+    monkeypatch.setattr(_app, '_is_cas_text_sufficient', lambda t: (True, 'ok'))
+    monkeypatch.setattr(_app, '_extract_cas_text', lambda b: f'CAS-Text {len(b)}')
+    monkeypatch.setattr(_app, 'find_cached_chunk', lambda *a, **k: None)
+    monkeypatch.setattr(_app, 'create_job_chunk', lambda *a, **k: None)
+    monkeypatch.setattr(_app, 'save_job_chunk_result', lambda *a, **k: None)
+    monkeypatch.setattr(_app, '_heartbeat_phase', lambda *a, **k: None)
+    monkeypatch.setattr(_app, 'ANTHROPIC_KEY', 'sk-test')
+
+    # Track call count
+    call_count = {'n': 0}
+
+    class FakeBlock:
+        type = 'tool_use'
+        name = 'submit_cas_days'
+        input = {
+            'days': [
+                {'date': '2025-01-01', 'activity_type': 'free', 'marker': 'OFF',
+                 'confidence': 'high', 'source_file_idx': 1},
+                {'date': '2025-01-02', 'activity_type': 'flight', 'marker': 'LH600',
+                 'start_time': '08:00', 'end_time': '14:00', 'duration_minutes': 360,
+                 'location': 'FRA', 'flights': [{'flight_no': 'LH600', 'from_iata': 'FRA',
+                                                  'to_iata': 'JFK', 'start_time': '08:00',
+                                                  'end_time': '14:00'}],
+                 'overnight_after_day': True, 'layover_ort': 'JFK',
+                 'confidence': 'high', 'source_file_idx': 2},
+            ],
+            'warnings': [],
+        }
+
+    class FakeUsage:
+        input_tokens = 1000
+        output_tokens = 500
+
+    class FakeResp:
+        stop_reason = 'tool_use'
+        content = [FakeBlock()]
+        usage = FakeUsage()
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            call_count['n'] += 1
+            return FakeResp()
+
+    class FakeClient:
+        messages = FakeMessages()
+
+    monkeypatch.setattr(_app.anthropic, 'Anthropic', lambda **k: FakeClient())
+
+    result = _app._sonnet_read_cas_merged_text(
+        [b'pdf1-bytes', b'pdf2-bytes'], 2025, 'FRA',
+        ['jan.pdf', 'feb.pdf'], 'job-test-1'
+    )
+    assert result is not None
+    assert call_count['n'] == 1, f'erwarte 1 Sonnet-Call, war {call_count["n"]}'
+    assert result['_merged_mode'] is True
+    assert result['_files_processed'] == 2
+    assert len(result['days']) == 2
+    # source_file_idx → source_filename gemappt
+    day_jan = next(d for d in result['days'] if d['date'] == '2025-01-01')
+    assert day_jan.get('source_filename') == 'jan.pdf'
+    day_feb = next(d for d in result['days'] if d['date'] == '2025-01-02')
+    assert day_feb.get('source_filename') == 'feb.pdf'
+
+
+def test_cas_merged_fallback_when_max_tokens(monkeypatch):
+    """Wenn stop_reason=max_tokens → return None damit Caller auf parallel fallback."""
+    _app = _load_app_fresh()
+    monkeypatch.setattr(_app, '_is_cas_text_sufficient', lambda t: (True, 'ok'))
+    monkeypatch.setattr(_app, '_extract_cas_text', lambda b: 'text')
+    monkeypatch.setattr(_app, 'find_cached_chunk', lambda *a, **k: None)
+    monkeypatch.setattr(_app, '_heartbeat_phase', lambda *a, **k: None)
+    monkeypatch.setattr(_app, 'ANTHROPIC_KEY', 'sk-test')
+
+    class FakeResp:
+        stop_reason = 'max_tokens'
+        content = []
+        usage = None
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            return FakeResp()
+
+    class FakeClient:
+        messages = FakeMessages()
+
+    monkeypatch.setattr(_app.anthropic, 'Anthropic', lambda **k: FakeClient())
+
+    result = _app._sonnet_read_cas_merged_text(
+        [b'p1', b'p2'], 2025, 'FRA', ['a.pdf', 'b.pdf'], None
+    )
+    assert result is None  # → caller fällt auf parallel zurück
+
+
+def test_cas_structured_uses_merge_when_flag_set(monkeypatch):
+    """_sonnet_read_cas_structured: bei ≥2 Files + Flag=1 wird merged_text geprüft zuerst."""
+    _app = _load_app_fresh()
+    called = {'merged': 0, 'parallel': 0}
+
+    def fake_merged(cas_list, year, homebase, source_filenames, job_id):
+        called['merged'] += 1
+        return {
+            'days': [{'datum': '2025-01-01', 'activity_type': 'free', 'marker': 'OFF',
+                      'source_filename': 'a.pdf', 'source_file_id': 'abc'}],
+            'conflicts': [], 'warnings': [],
+            '_files_total': 2, '_files_processed': 2, '_cache_hits': 0,
+            '_parser_version': _app._CAS_PARSER_VERSION, '_merged_mode': True,
+        }
+
+    monkeypatch.setattr(_app, '_sonnet_read_cas_merged_text', fake_merged)
+    monkeypatch.setenv('AEROTAX_CAS_MERGE', '1')
+
+    result = _app._sonnet_read_cas_structured(
+        [b'pdf1', b'pdf2'], year=2025, homebase='FRA', job_id='j1',
+        source_filenames=['a.pdf', 'b.pdf']
+    )
+    assert called['merged'] == 1
+    assert result is not None
+    assert result.get('_merged_mode') is True
+
+
+def test_cas_structured_skips_merge_when_flag_zero(monkeypatch):
+    """AEROTAX_CAS_MERGE=0 → merge-path nicht versucht, direkt parallel."""
+    _app = _load_app_fresh()
+    called = {'merged': 0}
+
+    def fake_merged(*a, **k):
+        called['merged'] += 1
+        return {'days': [], '_merged_mode': True}
+
+    monkeypatch.setattr(_app, '_sonnet_read_cas_merged_text', fake_merged)
+    monkeypatch.setattr(_app, '_sonnet_read_cas_single_pdf',
+                         lambda *a, **k: None)  # Parallel-Path schlägt fehl → None
+    monkeypatch.setenv('AEROTAX_CAS_MERGE', '0')
+
+    _app._sonnet_read_cas_structured(
+        [b'pdf1', b'pdf2'], year=2025, homebase='FRA', job_id='j1',
+        source_filenames=['a.pdf', 'b.pdf']
+    )
+    assert called['merged'] == 0  # nicht aufgerufen wegen Flag
+
+
+def test_cas_structured_skips_merge_when_only_one_file(monkeypatch):
+    """Bei N=1 Datei wird merge-path nicht versucht (kein Gain)."""
+    _app = _load_app_fresh()
+    called = {'merged': 0}
+
+    def fake_merged(*a, **k):
+        called['merged'] += 1
+        return None
+
+    monkeypatch.setattr(_app, '_sonnet_read_cas_merged_text', fake_merged)
+    monkeypatch.setattr(_app, '_sonnet_read_cas_single_pdf',
+                         lambda *a, **k: None)
+    monkeypatch.setenv('AEROTAX_CAS_MERGE', '1')
+
+    _app._sonnet_read_cas_structured(
+        [b'only1'], year=2025, homebase='FRA', job_id='j1',
+        source_filenames=['only.pdf']
+    )
+    assert called['merged'] == 0
+
+
+def test_cas_merged_falls_back_to_parallel_on_none(monkeypatch):
+    """merged returnt None → _sonnet_read_cas_structured läuft parallel-path."""
+    _app = _load_app_fresh()
+    monkeypatch.setattr(_app, '_sonnet_read_cas_merged_text',
+                         lambda *a, **k: None)
+
+    parallel_calls = {'n': 0}
+
+    def fake_single(pdf_bytes, year, homebase, source_filename='cas.pdf'):
+        parallel_calls['n'] += 1
+        return {'days': [{'date': f'2025-0{parallel_calls["n"]}-01',
+                          'activity_type': 'free', 'marker': 'OFF',
+                          'confidence': 'high'}],
+                'warnings': [], 'month_covered': '', 'source_filename': source_filename}
+
+    monkeypatch.setattr(_app, '_sonnet_read_cas_single_pdf', fake_single)
+    monkeypatch.setattr(_app, 'find_cached_chunk', lambda *a, **k: None)
+    monkeypatch.setattr(_app, 'create_job_chunk', lambda *a, **k: None)
+    monkeypatch.setattr(_app, '_heartbeat_phase', lambda *a, **k: None)
+    monkeypatch.setenv('AEROTAX_CAS_MAX_PARALLEL', '1')  # Sequenz für deterministischen Test
+
+    result = _app._sonnet_read_cas_structured(
+        [b'p1', b'p2'], year=2025, homebase='FRA', job_id='j1',
+        source_filenames=['a.pdf', 'b.pdf']
+    )
+    assert parallel_calls['n'] == 2  # parallel-path lief
+    assert result is not None
+    assert result.get('_merged_mode') is None or result.get('_merged_mode') is False or '_merged_mode' not in result
+
+
+def test_cas_merge_prompt_explains_dedup_across_files():
+    """Sonnet-Prompt bei Merge erklärt: Dubletten zwischen Files dedup'pen."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_merged_text')
+    block = src[fn_idx:fn_idx + 14000]
+    assert 'mehreren Dateien' in block or 'mehrere Lufthansa CAS' in block
+    # Dedup-Anweisung
+    assert 'Dubletten' in block or 'dedupe' in block.lower() or 'EINEN Tag' in block
+
+
+def test_cas_merge_tool_schema_has_source_file_idx():
+    """Merged-Tool-Schema enthält source_file_idx damit Tage zur Quelldatei zurück-mappbar sind."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_merged_text')
+    block = src[fn_idx:fn_idx + 14000]
+    assert "'source_file_idx'" in block
+
+
+def test_cas_merge_max_tokens_high_enough_for_12_months():
+    """max_tokens=64000 — Kapazität für 12 Monate × 30 Tage × ~150 Tokens/Tag."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_merged_text')
+    block = src[fn_idx:fn_idx + 14000]
+    assert 'max_tokens=64000' in block or '_call_sonnet(64000)' in block
+
+
+def test_cas_merge_cache_key_combines_file_hashes():
+    """Cache-Key für merged-path nutzt combined Hash aller File-Hashes."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_merged_text')
+    block = src[fn_idx:fn_idx + 14000]
+    assert 'combined_hash' in block
+    assert "'cas_merged'" in block
+
+
+# ─── Auto-Resume Live-Text-Bugfix ────────────────────────────────────────────
+
+def test_auto_resume_starts_live_animation():
+    """Auto-Resume-Pfad (Job läuft noch) muss startStatusAnimation() aufrufen,
+    sonst sieht der User nur statischen Text."""
+    src = _read_frontend()
+    # Auto-resume IIFE Block enthalten
+    assert '_autoResume' in src
+    # Im Job-läuft-noch-Branch wird startStatusAnimation aufgerufen
+    resume_idx = src.find("Job läuft noch → Progress-Page")
+    assert resume_idx > 0, 'Auto-Resume-Branch (Job läuft noch) muss markiert sein'
+    block = src[resume_idx:resume_idx + 4000]
+    assert 'startStatusAnimation()' in block, \
+        'startStatusAnimation() muss im Auto-Resume-Branch aufgerufen werden'
+    assert 'window._procPaused = false' in block, \
+        '_procPaused muss false sein, sonst pausiert die Animation'
+
+
+def test_auto_resume_clears_procgen_on_done():
+    """Beim Polling-Done muss _procGen inkrementiert werden damit Heartbeat-Loop stoppt."""
+    src = _read_frontend()
+    resume_idx = src.find("Job läuft noch → Progress-Page")
+    assert resume_idx > 0
+    block = src[resume_idx:resume_idx + 4000]
+    assert '_procGen = (window._procGen || 0) + 1' in block, \
+        'Animation muss nach Done-Detection sauber beendet werden'
+
+
+def test_auto_resume_initial_text_friendly():
+    """Initial-Text bei Auto-Resume muss freundlich + verständlich sein,
+    kein „job is processing" Engineering-Sprech."""
+    src = _read_frontend()
+    resume_idx = src.find("Job läuft noch → Progress-Page")
+    assert resume_idx > 0
+    block = src[resume_idx:resume_idx + 4000]
+    # Friendly user-facing text (deutsch, nicht technisch)
+    assert 'Auswertung läuft' in block
+    assert 'Du musst nichts machen' in block or 'sobald sie fertig' in block
 
 
 if __name__ == '__main__':

@@ -22,11 +22,14 @@
 --   - anon-Client (z.B. via REST-API mit anon-Key) sollte 0 Rows zurückbekommen
 -- ════════════════════════════════════════════════════════════════════════════
 
+-- job_chunks ist NICHT mehr Teil der RLS-Migration:
+--   - Tabelle existiert nicht in allen Deployments (v10.4-Migration optional)
+--   - v11 default AEROTAX_USE_CHUNK_PERSISTENCE=0 → kein Write/Read
+--   - Falls später aktiviert: separat RLS via 20260510_job_chunks.sql + diesem Pattern.
 alter table public.jobs            enable row level security;
 alter table public.sessions        enable row level security;
 alter table public.pdfs            enable row level security;
 alter table public.uploaded_files  enable row level security;
-alter table public.job_chunks      enable row level security;
 
 -- Explizit FORCE RLS, damit auch table-owner (BYPASSRLS-Rollen ausgenommen)
 -- die Policies durchlaufen. service_role hat BYPASSRLS und ist nicht betroffen.
@@ -34,7 +37,17 @@ alter table public.jobs            force row level security;
 alter table public.sessions        force row level security;
 alter table public.pdfs            force row level security;
 alter table public.uploaded_files  force row level security;
-alter table public.job_chunks      force row level security;
+
+-- Optional: wenn job_chunks-Tabelle existiert, ebenfalls RLS-en (idempotent).
+do $$
+begin
+  if exists (
+    select from pg_tables where schemaname='public' and tablename='job_chunks'
+  ) then
+    execute 'alter table public.job_chunks enable row level security';
+    execute 'alter table public.job_chunks force row level security';
+  end if;
+end $$;
 
 -- Keine Policies — impliziter DENY für anon und authenticated.
 -- Falls in Zukunft direkter Client-Zugriff nötig wird: gezielt policies hinzufügen.

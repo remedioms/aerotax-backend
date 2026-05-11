@@ -8633,13 +8633,294 @@ LIEFERE via Tool 'submit_cas_days'."""
     }
 
 
+def _sonnet_read_cas_merged_text(cas_list, year, homebase, source_filenames, job_id):
+    """Variante A — alle CAS-PDFs als ein einziger Text-Call an Sonnet.
+
+    Spart vs. parallelem Pfad bei N=12 Files:
+      - 11 Sonnet-Calls (1 statt 12) → ~$0.30 weniger Kosten pro Run
+      - RAM-Peak signifikant: keine N gleichzeitig offenen base64-Bodies +
+        Response-Streams, kein ThreadPoolExecutor-Overhead
+      - kein PDF-Binary-Merge → keine neue Dependency
+
+    Bedingung: ALLE Files müssen text-extrahierbar sein (_is_cas_text_sufficient).
+    Wenn auch nur eine Datei Vision benötigt: return None → Caller fällt
+    zurück auf den alten Per-File-Pfad (sicherer für OCR/Scan-PDFs).
+
+    Returns: gleiche Shape wie _sonnet_read_cas_structured, oder None bei
+    Fallback/Fehler. Setzt '_merged_mode': True im Result.
+    """
+    if not cas_list:
+        return None
+    import hashlib as _hl, time as _t
+
+    # 1) Text aus allen PDFs ziehen — wenn EINE nicht text-fähig: kompletter Abort.
+    #    Lieber sicher per-file (Vision-Fallback existiert dort) als hier raten.
+    parts = []
+    for idx, pdf_bytes in enumerate(cas_list):
+        if not pdf_bytes:
+            continue
+        fname = source_filenames[idx] if idx < len(source_filenames) else f'cas_{idx+1}.pdf'
+        text = _extract_cas_text(pdf_bytes)
+        ok, reason = _is_cas_text_sufficient(text)
+        if not ok:
+            print(f"[CAS-Merged] file {idx+1} ({fname[:30]}) nicht text-fähig ({reason}) — Abort merge, fallback parallel")
+            return None
+        file_hash = _hl.sha256(pdf_bytes).hexdigest()[:32]
+        parts.append({'idx': idx, 'fname': fname, 'file_hash': file_hash,
+                      'text': text, 'pdf_bytes': pdf_bytes})
+
+    if not parts:
+        return None
+
+    # 2) Combined Cache-Check — Cache-Key aus combinierten Datei-Hashes
+    combined_hash = _hl.sha256(
+        b'|'.join(p['file_hash'].encode() for p in parts)
+    ).hexdigest()[:32]
+    cached = find_cached_chunk(combined_hash, 'cas_merged', 0, _CAS_PARSER_VERSION)
+    if cached and isinstance(cached, dict) and cached.get('days'):
+        print(f"[CAS-Merged] cache HIT — {len(cached['days'])} Tage aus {len(parts)} Files")
+        return {
+            'days': cached['days'],
+            'conflicts': [],
+            'warnings': cached.get('warnings') or [],
+            '_files_total': len(cas_list),
+            '_files_processed': len(parts),
+            '_cache_hits': len(parts),
+            '_parser_version': _CAS_PARSER_VERSION,
+            '_merged_mode': True,
+        }
+
+    # 3) Combined-Text mit klaren Trennern zwischen Files
+    combined_parts = []
+    for p in parts:
+        combined_parts.append(
+            f"=== CAS-Datei {p['idx']+1} von {len(parts)}: {p['fname']} ===\n\n{p['text']}"
+        )
+    combined_text = '\n\n'.join(combined_parts)
+    print(f"[CAS-Merged] start: {len(parts)} Files in 1 Call, "
+          f"{len(combined_text)} Zeichen kombiniert")
+
+    _heartbeat_phase(job_id, 'cas_merged_start', {
+        'files': len(parts),
+        'text_chars': len(combined_text),
+        'label': f'Dienstplan/CAS wird gelesen ({len(parts)} Dateien zusammen)…'
+    })
+
+    # 4) Tool-Schema — identisch zur Single-File-Variante damit Output austauschbar bleibt
+    cas_tool = {
+        'name': 'submit_cas_days',
+        'description': 'Liefere strukturierte Tagesdaten aus dem CAS/Dienstplan/Roster (alle gemerged).',
+        'input_schema': {
+            'type': 'object',
+            'required': ['days'],
+            'properties': {
+                'days': {
+                    'type': 'array',
+                    'description': f'Pro Kalendertag EIN Eintrag (auch frei/OFF). Jahr {year}, Homebase {homebase}. '
+                                   f'Wenn ein Tag in mehreren Dateien vorkommt: vollständigsten Eintrag wählen.',
+                    'items': {
+                        'type': 'object',
+                        'required': ['date', 'activity_type'],
+                        'properties': {
+                            'date': {'type': 'string', 'description': 'YYYY-MM-DD'},
+                            'activity_type': {
+                                'type': 'string',
+                                'enum': list(_CAS_ACTIVITY_TYPES),
+                                'description': 'flight=LH-Flugnummer, training=EH/EMCRM/SECCRM/TK/D4/EM, '
+                                                'office=ORTSTAG/FRS/LMN, simulator=SIM, '
+                                                'standby=RES_SB/RES/SBY, vacation=U/U1/U2, '
+                                                'sick=K, free=OFF/X, unknown=alles andere.',
+                            },
+                            'marker': {'type': 'string'},
+                            'start_time': {'type': 'string'},
+                            'end_time': {'type': 'string'},
+                            'duration_minutes': {'type': 'integer'},
+                            'location': {'type': 'string'},
+                            'flights': {
+                                'type': 'array',
+                                'items': {
+                                    'type': 'object',
+                                    'properties': {
+                                        'flight_no': {'type': 'string'},
+                                        'from_iata': {'type': 'string'},
+                                        'to_iata': {'type': 'string'},
+                                        'start_time': {'type': 'string'},
+                                        'end_time': {'type': 'string'},
+                                    },
+                                },
+                            },
+                            'overnight_after_day': {'type': 'boolean'},
+                            'layover_ort': {'type': 'string'},
+                            'confidence': {'type': 'string', 'enum': ['high', 'medium', 'low']},
+                            'raw_excerpt': {'type': 'string'},
+                            'source_file_idx': {
+                                'type': 'integer',
+                                'description': 'Index (1-N) der Quell-Datei aus der dieser Tag stammt.',
+                            },
+                        },
+                    },
+                },
+                'warnings': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                },
+            },
+        },
+    }
+
+    prompt = f"""Du liest mehrere Lufthansa CAS/Dienstplan/Roster-Dateien für {year} (Homebase {homebase}).
+
+Die Dateien sind oben aneinandergehängt mit Trennern '=== CAS-Datei X von N: ... ==='.
+Pro Kalendertag im gesamten Zeitraum ein Eintrag.
+Wenn ein Datum in mehreren Dateien vorkommt: vollständigsten/aktuellsten Eintrag wählen, source_file_idx der gewählten Quelle setzen.
+
+Felder pro Tag:
+- date: YYYY-MM-DD ({year})
+- activity_type: flight|training|simulator|office|standby|vacation|sick|free|unknown
+  Mapping: LH/FL→flight; EH/EM/EMCRM/SECCRM/TK/D4→training; SIM→simulator;
+  ORTSTAG/FRS/LMN_AS/LMN_CR→office; RES/RES_SB/SBY→standby; U/U1/U2/URLAUB→vacation;
+  K/KRANK→sick; OFF/X/FREI/==→free; sonst→unknown
+- marker: Roh-Code wie im CAS (NICHT interpretieren)
+- start_time / end_time: HH:MM (leer bei frei/Urlaub)
+- duration_minutes: end - start
+- location: Briefing-IATA (meist {homebase})
+- flights[]: nur bei activity_type='flight'
+- overnight_after_day: True wenn Tag endet in remote location
+- layover_ort: IATA wenn remote, leer wenn {homebase}
+- confidence: high|medium|low
+- raw_excerpt: max 80 chars
+- source_file_idx: 1..{len(parts)} — welche Datei dieser Tag stammt
+
+REGELN:
+- KEINE Steuerbewertung, KEINE Beträge, KEINE Z72/Z73-Klassifizierung.
+- Marker EXAKT wiedergeben (X/OFF/== nicht interpretieren — Backend macht Tour-Logik).
+- Bei unklar: activity_type='unknown' + confidence='low'. NICHT raten.
+- Lücken zwischen Dateien (z.B. Monatsübergang) in warnings[] notieren.
+- Bei Dubletten zwischen Files: nur EINEN Tag liefern (das vollständigere).
+
+LIEFERE via Tool 'submit_cas_days'."""
+
+    content = [{'type': 'text', 'text': f'{combined_text}\n\n---\n{prompt}'}]
+
+    # 5) Single Sonnet-Call mit großem max_tokens-Budget.
+    #    12 Monate × ~30 Tage × ~150 Tokens/Tag = ~54k Output → 64k mit Headroom.
+    #    Bei Truncation: fallback auf parallel (return None).
+    def _call_sonnet(_max_tokens):
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=300.0)
+        return client.messages.create(
+            model='claude-sonnet-4-6',
+            max_tokens=_max_tokens,
+            tools=[cas_tool],
+            tool_choice={'type': 'tool', 'name': 'submit_cas_days'},
+            messages=[{'role': 'user', 'content': content}],
+        )
+
+    start = _t.time()
+    try:
+        resp = _call_sonnet(64000)
+    except Exception as e:
+        print(f"[CAS-Merged] Sonnet-call fail: {type(e).__name__}: {str(e)[:200]} — fallback parallel")
+        return None
+
+    elapsed = _t.time() - start
+    stop_reason = getattr(resp, 'stop_reason', None) if resp else 'no_response'
+    usage = getattr(resp, 'usage', None) if resp else None
+    if usage:
+        in_tok = getattr(usage, 'input_tokens', '?')
+        out_tok = getattr(usage, 'output_tokens', '?')
+        print(f"[CAS-Merged] stop={stop_reason} in_tok={in_tok} out_tok={out_tok} {elapsed:.1f}s")
+
+    if stop_reason == 'max_tokens':
+        # 64k truncated wäre extrem ungewöhnlich — fallback statt riskieren
+        print(f"[CAS-Merged] truncated @64k — fallback parallel")
+        return None
+
+    # 6) Tool-Output extrahieren
+    tool_input = None
+    for block in (resp.content if resp else []):
+        btype = getattr(block, 'type', None) if not isinstance(block, dict) else block.get('type')
+        bname = getattr(block, 'name', None) if not isinstance(block, dict) else block.get('name')
+        if btype == 'tool_use' and (bname == 'submit_cas_days' or bname is None):
+            tool_input = block.get('input') if isinstance(block, dict) else getattr(block, 'input', None)
+            if tool_input:
+                break
+    if not tool_input:
+        print(f"[CAS-Merged] kein tool_input — fallback parallel")
+        return None
+
+    days_raw = tool_input.get('days', []) if isinstance(tool_input, dict) else []
+    warnings_raw = tool_input.get('warnings', []) if isinstance(tool_input, dict) else []
+
+    # 7) Per-Day-Validation + Sanity (identische Logik wie single-file path)
+    days_normalized = []
+    sanity_warnings = []
+    file_idx_to_meta = {p['idx']+1: (p['fname'], p['file_hash']) for p in parts}
+    for d in days_raw:
+        ok, normalized, warn = _validate_cas_day(d)
+        if ok and normalized:
+            # source_file_idx → konkrete fname/hash zuordnen (für Audit)
+            src_idx = d.get('source_file_idx') if isinstance(d, dict) else None
+            if src_idx and src_idx in file_idx_to_meta:
+                fname, fhash = file_idx_to_meta[src_idx]
+                normalized['source_filename'] = fname
+                normalized['source_file_id'] = fhash
+            else:
+                # Sonnet hat source_file_idx nicht gesetzt — markieren aber nicht raten
+                normalized['source_filename'] = 'cas_merged'
+                normalized['source_file_id'] = combined_hash
+            days_normalized.append(normalized)
+        if warn:
+            sanity_warnings.append(warn)
+
+    warnings_combined = [str(w) for w in warnings_raw] + sanity_warnings
+
+    if not days_normalized:
+        print(f"[CAS-Merged] keine validen Tage — fallback parallel")
+        return None
+
+    # 8) Cache schreiben (combined_hash als Key)
+    if job_id and combined_hash:
+        chunk_id = create_job_chunk(job_id, 'cas_merged', 0, page_from=None, page_to=None,
+                                     file_hash=combined_hash, parser_version=_CAS_PARSER_VERSION)
+        if chunk_id:
+            save_job_chunk_result(chunk_id, {
+                'days': days_normalized,
+                'warnings': warnings_combined,
+                'merged_files': [{'fname': p['fname'], 'file_hash': p['file_hash']} for p in parts],
+            })
+
+    print(f"[CAS-Merged] FERTIG: {len(parts)} Files → 1 Call, "
+          f"{len(days_normalized)} Tage, {elapsed:.1f}s, "
+          f"saved ~{len(parts)-1} Sonnet-Calls")
+    _heartbeat_phase(job_id, 'cas_merge_complete', {
+        'days': len(days_normalized),
+        'files': len(parts),
+        'merged': True,
+        'elapsed_s': round(elapsed, 1),
+        'label': 'Dienstplan zusammengeführt…',
+    })
+
+    return {
+        'days': days_normalized,
+        'conflicts': [],  # Sonnet macht Dedup im Tool-Output (Anweisung im Prompt)
+        'warnings': warnings_combined,
+        '_files_total': len(cas_list),
+        '_files_processed': len(parts),
+        '_cache_hits': 0,
+        '_parser_version': _CAS_PARSER_VERSION,
+        '_merged_mode': True,
+    }
+
+
 def _sonnet_read_cas_structured(cas_bytes, year=2025, homebase='FRA', job_id=None,
                                  source_filenames=None):
     """v11 CAS-Main-Reader: liest 1-N CAS-PDFs strukturiert pro Tag.
 
     Architektur:
-      - Eine Sonnet-Anfrage pro PDF (memory-bounded)
-      - Cache via SHA-256 file_hash + _CAS_PARSER_VERSION (reuse v10.4.1 chunk-cache)
+      - Variante A (merge-path): Wenn AEROTAX_CAS_MERGE=1 und alle Files
+        text-fähig → 1 Sonnet-Call für alle. Spart ~N-1 Calls + RAM.
+      - Fallback (per-file parallel): Wenn Merge-Path returnt None oder
+        AEROTAX_CAS_MERGE=0 → Eine Sonnet-Anfrage pro PDF mit Cache.
       - Multi-File-Merge: dedup gleiche Datei, conflict-detection bei
         unterschiedlichen Daten für selben Tag aus zwei Files
       - Heartbeat pro Datei (_heartbeat_phase)
@@ -8652,6 +8933,7 @@ def _sonnet_read_cas_structured(cas_bytes, year=2025, homebase='FRA', job_id=Non
         '_files_total': int,
         '_files_processed': int,
         '_cache_hits': int,
+        '_merged_mode': bool,  # True wenn Variante A genutzt wurde
       }
       oder None wenn kein PDF lesbar war.
     """
@@ -8664,6 +8946,18 @@ def _sonnet_read_cas_structured(cas_bytes, year=2025, homebase='FRA', job_id=Non
         source_filenames = [f'cas_{i+1}.pdf' for i in range(len(cas_list))]
 
     import hashlib as _hl
+
+    # Variante A — Merge-Path zuerst versuchen wenn ≥2 Files + Flag aktiv.
+    # Bei 1 File spart Merge nichts; bei Vision-Bedarf returnt es None.
+    try:
+        merge_enabled = os.environ.get('AEROTAX_CAS_MERGE', '1') == '1'
+    except Exception:
+        merge_enabled = True
+    if merge_enabled and len(cas_list) >= 2:
+        merged = _sonnet_read_cas_merged_text(cas_list, year, homebase, source_filenames, job_id)
+        if merged:
+            return merged
+        print(f"[CAS-Reader] merge-path nicht genutzt → fallback auf per-file ({len(cas_list)} files)")
 
     # v11 Commit 3: Parallel max=2 (env-flag steuerbar).
     # Pro Datei isolierter Task; bei Fehler nur dieses File betroffen.
