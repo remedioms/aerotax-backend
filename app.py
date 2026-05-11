@@ -10525,8 +10525,15 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
     # v11 F3/F4: FollowMe-Align (Touren-aggregierte Counter).
     # Hinter ENV-Flag bis Tour-Identifikation gegen Tibor-Golden verifiziert ist.
     # Aktivierung: AEROTAX_FOLLOWME_ALIGN=1
+    # Defensive: wenn Align crashed → pre-Align-Werte beibehalten, kein Pipeline-Kill.
     if os.environ.get('AEROTAX_FOLLOWME_ALIGN') == '1':
-        classification = _followme_align_counters(classification, matched, year, homebase)
+        try:
+            classification = _followme_align_counters(classification, matched, year, homebase)
+        except Exception as _ae:
+            import traceback as _tb
+            print(f"[followme-align] CRASH (ignoriert): {type(_ae).__name__}: {str(_ae)[:300]}")
+            print(f"[followme-align] trace:\n{_tb.format_exc()[:1000]}")
+            # classification bleibt unverändert (pre-Align-Werte aus v7-Klassifikator)
     classification['_v11_cas_used'] = True
     classification['_cas_conflicts'] = cas_result.get('conflicts', [])
     classification['_cas_warnings'] = cas_result.get('warnings', [])
