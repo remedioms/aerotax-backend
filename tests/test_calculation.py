@@ -10162,16 +10162,15 @@ def test_hotfix_all_heartbeat_calls_have_defined_job_id():
 
 
 def test_v11_pipeline_version_constant():
-    """AEROTAX_PIPELINE_VERSION existiert + default 'v10_legacy' (Phase 2-5 Migration)."""
+    """AEROTAX_PIPELINE_VERSION existiert. Phase 6: Default ist 'v11_cas_primary'."""
     _app = _load_app_fresh()
     assert hasattr(_app, 'AEROTAX_PIPELINE_VERSION')
-    # Default während Phase 2-5
     import os as _os
     prev = _os.environ.pop('AEROTAX_PIPELINE_VERSION', None)
     try:
         _app2 = _load_app_fresh()
-        assert _app2.AEROTAX_PIPELINE_VERSION == 'v10_legacy', \
-            'Default-Pipeline-Version sollte v10_legacy sein bis Phase 6'
+        assert _app2.AEROTAX_PIPELINE_VERSION == 'v11_cas_primary', \
+            'Phase 6: Default-Pipeline-Version ist v11_cas_primary'
     finally:
         if prev is not None:
             _os.environ['AEROTAX_PIPELINE_VERSION'] = prev
@@ -10835,13 +10834,13 @@ def test_v11p4_classification_includes_cas_metadata():
     assert '_cas_files_processed' in block
 
 
-def test_v11p4_default_feature_flag_runs_v10():
-    """Default-Flag v10_legacy → v10-Pfad. Sanity: keine Aktivierung ohne ENV."""
+def test_v11p4_default_feature_flag_runs_v11():
+    """Phase 6: Default-Flag ist 'v11_cas_primary'. Rollback via ENV-Override."""
     import os as _os
     prev = _os.environ.pop('AEROTAX_PIPELINE_VERSION', None)
     try:
         _app = _load_app_fresh()
-        assert _app.AEROTAX_PIPELINE_VERSION == 'v10_legacy'
+        assert _app.AEROTAX_PIPELINE_VERSION == 'v11_cas_primary'
     finally:
         if prev: _os.environ['AEROTAX_PIPELINE_VERSION'] = prev
 
@@ -10863,6 +10862,155 @@ def test_v11p4_invalid_cas_day_returns_none():
     _app = _load_app_fresh()
     assert _app._cas_day_to_dp_format(None) is None
     assert _app._cas_day_to_dp_format('not a dict') is None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 Phase 5 — Wording Cleanup (FU-Erwähnungen user-facing entfernt)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_v11p5_frontend_error_message_no_flugstunden():
+    """Frontend-Error-Message bei fehlenden Docs nennt CAS, nicht Flugstunden."""
+    site = open(_FRONTEND_HTML).read()
+    # Die showError-Message bei fehlenden Pflicht-Docs
+    idx = site.find('Pflicht-Dokumente fehlen')
+    assert idx > 0
+    block = site[idx:idx + 400]
+    assert 'Dienstplan/CAS' in block or 'CAS' in block
+    assert 'Flugstunden' not in block, \
+        'Error-Message darf nicht mehr Flugstunden erwähnen'
+
+
+def test_v11p5_progress_animation_no_flugstunden():
+    """Progress-Animation-Texte (messages) nennen Dienstplan/CAS, nicht Flugstundenübersicht."""
+    site = open(_FRONTEND_HTML).read()
+    msgs_idx = site.find('const messages=[')
+    msgs_block = site[msgs_idx:msgs_idx + 5000]
+    assert 'Flugstundenübersicht' not in msgs_block, \
+        'Progress-Animation darf nicht mehr Flugstundenübersicht enthalten'
+    # CAS muss explizit erwähnt sein
+    assert 'CAS' in msgs_block or 'Dienstplan' in msgs_block
+
+
+def test_v11p5_backend_chat_system_prompt_uses_cas():
+    """AI-Chat-System-Prompt verweist auf Dienstplan/CAS statt Flugstundenübersicht."""
+    src = _read_backend()
+    # Suche im AI-Chat-Prompt-Block bei „Du beantwortest STRENG NUR"
+    idx = src.find('Du beantwortest STRENG NUR')
+    assert idx > 0
+    block = src[idx:idx + 2000]
+    assert 'Dienstplan/CAS' in block or 'Dienstplan' in block
+    # FU darf nicht in der erlaubten-Themen-Liste sein (Comment kann erlaubt sein)
+    assert 'Flugstundenübersicht, Streckeneinsatz' not in block, \
+        'AI-Chat-Prompt darf nicht mehr Flugstundenübersicht als Pflicht-Doc auflisten'
+
+
+def test_v11p5_progress_endpoint_no_flugstunden():
+    """SSE-Progress-Endpoint nennt Dienstplan/CAS statt Flugstunden."""
+    src = _read_backend()
+    idx = src.find('Streckeneinsatz {year} wird analysiert')
+    if idx > 0:
+        block = src[idx:idx + 2000]
+        # In den steps_list: kein „KI liest Flugstunden Monat für Monat" mehr
+        assert 'KI liest Flugstunden' not in block, \
+            'Progress sollte „Dienstplan/CAS Monat für Monat" sagen, nicht Flugstunden'
+
+
+def test_v11p5_datenschutz_text_mentions_cas():
+    """Datenschutz-Text listet Pflicht-Dokumente inkl. CAS."""
+    site = open(_FRONTEND_HTML).read()
+    idx = site.find('Originaldokumente (Lohnsteuer')
+    if idx > 0:
+        block = site[idx:idx + 600]
+        assert 'Dienstplan' in block or 'CAS' in block, \
+            'Datenschutz-Text muss CAS/Dienstplan nennen'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 Phase 6 — Reference-Debug + Production-Cut
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_v11p6_default_pipeline_is_v11():
+    """Phase 6 Production-Cut: Default-Pipeline ist v11_cas_primary."""
+    _app = _load_app_fresh()
+    import os as _os
+    prev = _os.environ.pop('AEROTAX_PIPELINE_VERSION', None)
+    try:
+        _app2 = _load_app_fresh()
+        assert _app2.AEROTAX_PIPELINE_VERSION == 'v11_cas_primary', \
+            'Phase 6: Default muss v11_cas_primary sein (kein env-override)'
+    finally:
+        if prev is not None:
+            _os.environ['AEROTAX_PIPELINE_VERSION'] = prev
+
+
+def test_v11p6_env_override_v10_legacy_works():
+    """Notfall-Rollback: ENV-Override kann zurück auf v10_legacy."""
+    import os as _os
+    _os.environ['AEROTAX_PIPELINE_VERSION'] = 'v10_legacy'
+    try:
+        _app = _load_app_fresh()
+        assert _app.AEROTAX_PIPELINE_VERSION == 'v10_legacy'
+    finally:
+        _os.environ.pop('AEROTAX_PIPELINE_VERSION', None)
+
+
+def test_v11p6_cas_pipeline_default_active_in_hybrid():
+    """Bei Default-Flag fließt cas_bytes durch v11-Pfad, nicht DP."""
+    src = _read_backend()
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 16000]
+    # Branch-Reihenfolge: v11 zuerst, v10 elif
+    v11_branch = block.find("if use_v11_cas:")
+    v10_branch = block.find("elif dp_bytes:")
+    assert v11_branch > 0 and v10_branch > 0
+    assert v11_branch < v10_branch, \
+        'v11-Branch muss VOR v10-Branch evaluiert werden'
+
+
+def test_v11p6_reference_tibor_baseline_constants():
+    """Tibor's FollowMe-Baseline ist im Test als Reference-Constants verfügbar."""
+    # Diese Werte sind Tibor's externe FollowMe-Output (anonymisiert via Diff-Test)
+    TIBOR_FOLLOWME_2025 = {
+        'fahrtage':    53,
+        'arbeitstage': 133,
+        'hotel':       66,
+        'z72_tage':     5,
+        'z73_tage':    11,
+        'z74_tage':     1,
+        'z76_eur':   4794.00,
+        'gesamt_aufwand': 6020.72,
+    }
+    # Sanity: alle Werte plausibel
+    assert TIBOR_FOLLOWME_2025['z72_tage'] + TIBOR_FOLLOWME_2025['z73_tage'] \
+            + TIBOR_FOLLOWME_2025['z74_tage'] <= TIBOR_FOLLOWME_2025['arbeitstage']
+    assert TIBOR_FOLLOWME_2025['hotel'] <= TIBOR_FOLLOWME_2025['arbeitstage']
+    assert TIBOR_FOLLOWME_2025['z76_eur'] > 4000
+
+
+def test_v11p6_no_user_facing_flugstunden_anywhere_critical():
+    """Kritische user-facing Pfade enthalten kein „Flugstundenübersicht" mehr.
+    Erlaubt: in Legacy-DP-Reader-Code (intern), Comments, Test-Code, Anti-Listen."""
+    site = open(_FRONTEND_HTML).read()
+    backend = _read_backend()
+    # Frontend: Production-Sektionen müssen sauber sein
+    site_user_sections = [
+        site[site.find('<p class="psub"'):site.find('</p>', site.find('<p class="psub"'))],
+        site[site.find('Schritt 01'):site.find('Schritt 01') + 500] if 'Schritt 01' in site else '',
+    ]
+    for sec in site_user_sections:
+        if sec:
+            assert 'Flugstundenübersicht' not in sec, \
+                f'User-facing Sektion enthält noch Flugstundenübersicht: {sec[:200]}'
+
+
+def test_v11p6_pipeline_branch_logs_version():
+    """hybrid_analyze loggt pipeline-Version am Start (Audit-Trail)."""
+    src = _read_backend()
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 1500]
+    assert 'pipeline=' in block or 'AEROTAX_PIPELINE_VERSION' in block
 
 
 if __name__ == '__main__':

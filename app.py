@@ -214,9 +214,10 @@ _ALL_FILE_KEYS = (
     'spen', 'part', 'kind', 'hand', 'haed',
 )
 
-# v11 Pipeline-Version-Flag — bleibt 'v10_legacy' während Phase 2-5 Migration,
-# wird in Phase 6 final auf 'v11_cas_primary' geflippt sobald CAS-Reader fertig.
-AEROTAX_PIPELINE_VERSION = os.environ.get('AEROTAX_PIPELINE_VERSION', 'v10_legacy')
+# v11 Pipeline-Version-Flag — Phase 6: DEFAULT FLIPPED to v11_cas_primary.
+# CAS ist jetzt das 3. Pflicht-Dokument, DP-Reader läuft nur noch via ENV-Override.
+# Notfall-Rollback: AEROTAX_PIPELINE_VERSION=v10_legacy als Render-ENV setzen.
+AEROTAX_PIPELINE_VERSION = os.environ.get('AEROTAX_PIPELINE_VERSION', 'v11_cas_primary')
 
 UPLOAD_TTL_HOURS = 4   # Pre-Upload nur kurz aufbewahren — nach Auswertung gelöscht
 
@@ -4036,8 +4037,8 @@ Du beantwortest STRENG NUR Fragen aus diesen erlaubten Themen:
 
   1. DIESER konkreten Auswertung des Nutzers (Werte, Berechnung, Plausibilität)
   2. WISO-Übernahme der Werte (welche Zeile, welcher Pfad)
-  3. Hochgeladenen Dokumenten (Flugstundenübersicht, Streckeneinsatzabrechnung,
-     Lohnsteuerbescheinigung) — was sie sind, warum sie gebraucht werden, was AeroTAX daraus liest
+  3. Hochgeladenen Dokumenten (Lohnsteuerbescheinigung, Streckeneinsatzabrechnung,
+     Dienstplan/CAS) — was sie sind, warum sie gebraucht werden, was AeroTAX daraus liest
   4. Offene Punkte / Rückfragen (warum kann das PDF noch nicht erstellt werden,
      welches Dokument fehlt, Schulungs-/Office-Tag-Zeit)
   5. Wie der Nutzer mit seinem Zugangscode später zurückkommt
@@ -4864,7 +4865,7 @@ def progress_stream():
             (5,  'Dokumente werden geöffnet…'),
             (10, 'Lohnsteuerbescheinigung wird gelesen…'),
             (16, f'Streckeneinsatz {year} wird analysiert…'),
-            (22, 'KI liest Flugstunden Monat für Monat…'),
+            (22, 'KI liest Dienstplan/CAS Monat für Monat…'),
             (28, 'Fahrtage werden gezählt…'),
             (34, 'Hotelnächte nach EASA-FTL geprüft…'),
             (40, 'Auslandsrouten + BMF-Pauschalen…'),
@@ -12756,6 +12757,7 @@ def hybrid_analyze(form, files, job_id=None):
     Rückgabe: {'lsb': {...}, 'se_summary': {...}, 'classification': {...}, 'errors': [...]}"""
     year = int(form.get('year', 2025))
     homebase = _extract_homebase(form.get('base', 'Frankfurt (FRA)'))
+    print(f"[hybrid_analyze] start pipeline={AEROTAX_PIPELINE_VERSION} year={year} homebase={homebase} job_id={job_id}", flush=True)
 
     lsb_bytes = []
     for item in (files.get('lsb') or []):
