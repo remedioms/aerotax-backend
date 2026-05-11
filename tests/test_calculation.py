@@ -11756,6 +11756,61 @@ def test_followme_tibor_z73_count_with_synth_f6():
     assert _app._followme_is_active_workday(active_training) is True
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# v11 P0 — Auto-Retry-Bug + Stale-Job + Restart-Recovery-Hardening
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_frontend_no_auto_retry_with_new_process_call():
+    """finishProcess macht KEIN process() bei transient error — sonst doppelte
+    Jobs + doppelte Sonnet-Kosten."""
+    src = open(_FRONTEND_HTML).read()
+    fn_idx = src.find('function finishProcess')
+    assert fn_idx > 0
+    block = src[fn_idx:fn_idx + 2000]
+    # Auto-Retry-Timer + process()-Call darf NICHT mehr drin sein
+    assert 'window._autoRetryTimer = setTimeout' not in block, \
+        'Auto-Retry-Timer muss raus (verursachte doppelte Jobs ~$3.57)'
+    # Stattdessen sollte Hint auf Token sein
+    assert 'Mit deinem Code' in block or 'Auswertung läuft im Hintergrund' in block
+
+
+def test_stale_detector_catches_processing_and_pending():
+    """Stale-Detector erkennt auch 'processing'/'pending', nicht nur 'running'."""
+    src = _read_backend()
+    fn_idx = src.find('def _detect_and_fail_stale_jobs')
+    block = src[fn_idx:fn_idx + 2000]
+    # Non-Terminal-States müssen 'processing', 'pending', 'queued' enthalten
+    assert "'processing'" in block
+    assert "'pending'" in block
+    assert "'queued'" in block
+
+
+def test_restart_recovery_scans_supabase():
+    """Restart-Recovery prüft auch Supabase, nicht nur ephemeral Disk."""
+    src = _read_backend()
+    fn_idx = src.find('def _restart_recovery_async')
+    block = src[fn_idx:fn_idx + 3000]
+    assert 'sb.table' in block, 'Recovery muss Supabase scannen'
+    assert 'restart_recovered' in block
+
+
+def test_restart_recovery_marks_processing_as_failed():
+    """Recovery erkennt auch 'processing'-Status (mein Cancel-Revert setzte den)."""
+    src = _read_backend()
+    fn_idx = src.find('def _restart_recovery_async')
+    block = src[fn_idx:fn_idx + 3000]
+    assert "'processing'" in block
+
+
+def test_isTransientError_definition_unchanged_for_documentation():
+    """_isTransientError-Helper existiert noch — wird nicht mehr für Auto-Retry
+    genutzt, könnte aber für UI-Hint („Engpass — versuche es nochmal mit Code")
+    nützlich sein. Tests dokumentieren dass er noch da ist."""
+    src = open(_FRONTEND_HTML).read()
+    assert 'function _isTransientError' in src
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

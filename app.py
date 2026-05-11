@@ -848,36 +848,80 @@ def _calc_worker():
 
 
 def _restart_recovery_async():
-    """Läuft im Background-Thread, blockiert nicht den App-Start (sonst Render Port-Timeout)."""
+    """Läuft im Background-Thread, blockiert nicht den App-Start (sonst Render Port-Timeout).
+
+    v11 P0-Fix: scannt SOWOHL Disk-Files (ephemeral) ALS AUCH Supabase nach
+    Jobs die beim Restart in nicht-terminalen Status hängen. Markiert sie als
+    'failed' damit Stale-Detector nicht weiter wartet und User klar erfährt
+    dass sein Job nicht weiterläuft.
+
+    Bisher: nur Disk-Scan → bei ephemeral-Disk (Render Free) wurden orphan
+    Supabase-Jobs nicht erkannt → blieben endlos 'running'/'processing' →
+    Frontend pollte ewig.
+    """
+    recovered_total = 0
+    # 1. Disk-Scan (wie bisher)
     try:
-        if not os.path.exists(_JOBS_DIR):
-            return
-        files_list = os.listdir(_JOBS_DIR)
-        if not files_list:
-            return
-        recovered = 0
-        for fn in files_list:
-            if not fn.endswith('.json'): continue
-            try:
-                path = os.path.join(_JOBS_DIR, fn)
-                with open(path) as _f:
-                    j = json.load(_f)
-                if j.get('status') in ('queued', 'pending', 'running'):
-                    j['status'] = 'failed'
-                    j['error']  = 'Server wurde neugestartet während die Auswertung lief. Bitte mit deinem Code (AT-...) erneut starten — keine erneute Zahlung nötig.'
-                    j['restart_recovered'] = True
-                    job_id = fn[:-5]
-                    with _jobs_lock:
-                        _jobs[job_id] = j
-                    with open(path, 'w') as _wf:
-                        json.dump(j, _wf, default=str)
-                    recovered += 1
-            except Exception as _re:
-                print(f"[queue] Restart-Recovery fail für {fn}: {_re}")
-        if recovered > 0:
-            print(f"[queue] Restart-Recovery: {recovered} Job(s) auf 'failed' gesetzt")
+        if os.path.exists(_JOBS_DIR):
+            for fn in os.listdir(_JOBS_DIR):
+                if not fn.endswith('.json'): continue
+                try:
+                    path = os.path.join(_JOBS_DIR, fn)
+                    with open(path) as _f:
+                        j = json.load(_f)
+                    if j.get('status') in ('queued', 'pending', 'running', 'processing'):
+                        j['status'] = 'failed'
+                        j['error']  = 'Server wurde neugestartet während die Auswertung lief. Bitte mit deinem Code (AT-...) erneut starten — keine erneute Zahlung nötig.'
+                        j['restart_recovered'] = True
+                        job_id = fn[:-5]
+                        with _jobs_lock:
+                            _jobs[job_id] = j
+                        with open(path, 'w') as _wf:
+                            json.dump(j, _wf, default=str)
+                        recovered_total += 1
+                except Exception as _re:
+                    print(f"[queue] Restart-Recovery fail für {fn}: {_re}")
     except Exception as _e:
         print(f"[queue] Restart-Recovery konnte JOBS_DIR nicht lesen: {_e}")
+
+    # 2. Supabase-Scan: jeder Job mit non-terminal status seit dem Boot wird failed.
+    #    Wichtig: NICHT die jobs aus Disk-Scan überschreiben (die haben schon
+    #    den korrekten Recovery-State).
+    if SB_AVAILABLE:
+        try:
+            res = sb.table('jobs').select('job_id,data').execute()
+            rows = (res and res.data) or []
+            for row in rows:
+                jid = row.get('job_id')
+                if not jid: continue
+                d = row.get('data') or {}
+                status = (d.get('status') or '').lower()
+                if status not in ('queued', 'pending', 'running', 'processing'):
+                    continue
+                # Bereits durch Disk-Scan recovered? Skip.
+                with _jobs_lock:
+                    if jid in _jobs and _jobs[jid].get('status') == 'failed':
+                        continue
+                # Mark als failed
+                d['status'] = 'failed'
+                d['error'] = 'Server wurde neugestartet während die Auswertung lief. Bitte mit deinem Code (AT-...) erneut starten — keine erneute Zahlung nötig.'
+                d['restart_recovered'] = True
+                d['restart_recovered_at'] = datetime.utcnow().isoformat() + 'Z'
+                try:
+                    sb.table('jobs').update({
+                        'data': d,
+                        'updated_at': datetime.utcnow().isoformat() + 'Z',
+                    }).eq('job_id', jid).execute()
+                    with _jobs_lock:
+                        _jobs[jid] = d
+                    recovered_total += 1
+                except Exception as _se:
+                    print(f"[queue] Restart-Recovery Supabase-update fail {jid[:8]}: {_se}")
+        except Exception as _ssee:
+            print(f"[queue] Restart-Recovery Supabase-scan fail: {_ssee}")
+
+    if recovered_total > 0:
+        print(f"[queue] Restart-Recovery: {recovered_total} Job(s) auf 'failed' gesetzt (Disk+Supabase)")
 
 
 def _start_calc_worker():
@@ -3799,13 +3843,20 @@ _STALE_JOB_GLOBAL_MAX_MIN = 15  # Job-Total-Runtime hart-Cap → failed_timeout
 
 def _detect_and_fail_stale_jobs():
     """Iteriert über in-memory _jobs und failed Jobs deren Heartbeat zu alt ist.
-    Wird im _cleanup_loop alle 2 Min aufgerufen — keine externen Calls."""
+    Wird im _cleanup_loop alle 2 Min aufgerufen — keine externen Calls.
+
+    v11 P0-Fix: erkennt auch 'pending'/'processing'/'queued' als potentially-stuck.
+    Bisher: nur 'running' geprüft → wenn Worker hängte und Status bei 'pending'
+    blieb (oder mein manuelles Cancel-Revert setzte 'processing'), griff Stale-
+    Detector nicht.
+    """
+    NON_TERMINAL = ('running', 'processing', 'pending', 'queued')
     try:
         now = datetime.utcnow()
         with _jobs_lock:
             stuck_ids = []
             for jid, j in _jobs.items():
-                if j.get('status') != 'running':
+                if j.get('status') not in NON_TERMINAL:
                     continue
                 # Check 1: Heartbeat zu alt?
                 ph_ts = j.get('phase_updated_at') or j.get('created') or ''
