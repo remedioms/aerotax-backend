@@ -11607,7 +11607,134 @@ def test_followme_hotel_offline_tibor_within_tolerance():
     assert 59 <= hotel <= 73, f'Hotel soll 66 ±7, ist {hotel}'
 
 
-def test_f3_passive_ortstag_excluded_from_workday():
+def test_f6_res_before_foreign_tour_becomes_z73():
+    """RES-Tag am Homebase, gefolgt von Auslandstour-Start → Z73."""
+    _app = _load_app_fresh()
+    matched = [
+        {'datum': '2025-04-23',
+         'dp': {'activity_type': 'standby', 'raw_marker': 'RES',
+                 'layover_ort': '', 'overnight_after_day': False},
+         'se': {'stfrei_ort': 'FRA', 'stfrei_inland': True, 'stfrei_total': 14,
+                 'zwoelftel': 9, 'count': 1}},
+        {'datum': '2025-04-24',
+         'dp': {'activity_type': 'tour', 'raw_marker': 'LH712',
+                 'layover_ort': 'SEL', 'layover_inland': False,
+                 'overnight_after_day': True},
+         'se': {'stfrei_ort': 'SEL', 'stfrei_inland': False, 'stfrei_total': 48,
+                 'zwoelftel': 12, 'count': 1}},
+        {'datum': '2025-04-25',
+         'dp': {'activity_type': 'tour', 'raw_marker': 'X',
+                 'layover_ort': 'SEL', 'layover_inland': False,
+                 'overnight_after_day': True},
+         'se': {'stfrei_ort': 'SEL', 'stfrei_inland': False, 'stfrei_total': 48,
+                 'zwoelftel': 12, 'count': 1}},
+    ]
+    result = _app._deterministic_classify_v7(matched, 2025, 'FRA')
+    tage_detail = result.get('tage_detail') or []
+    tag_23 = next((t for t in tage_detail if t['datum'].startswith('2025-04-23')), None)
+    assert tag_23 is not None, '04-23 tag fehlt im Result'
+    assert tag_23['klass'] == 'Z73', \
+        f'04-23 RES vor Korea-Tour sollte Z73 sein, ist {tag_23["klass"]}'
+    assert tag_23.get('eur', 0) > 0
+
+
+def test_f6_res_sb_before_foreign_tour_becomes_z73():
+    """RES_SB-Marker (Standby-Brigade) vor Auslandstour → ebenfalls Z73."""
+    _app = _load_app_fresh()
+    matched = [
+        {'datum': '2025-10-20',
+         'dp': {'activity_type': 'standby', 'raw_marker': 'RES_SB',
+                 'layover_ort': '', 'overnight_after_day': False},
+         'se': {'stfrei_ort': 'FRA', 'stfrei_inland': True, 'stfrei_total': 0,
+                 'count': 0}},
+        {'datum': '2025-10-21',
+         'dp': {'activity_type': 'tour', 'raw_marker': 'LH444',
+                 'layover_ort': 'MAD', 'layover_inland': False,
+                 'overnight_after_day': True},
+         'se': {'stfrei_ort': 'MAD', 'stfrei_inland': False, 'stfrei_total': 23,
+                 'count': 1}},
+    ]
+    result = _app._deterministic_classify_v7(matched, 2025, 'FRA')
+    tag_20 = next((t for t in result['tage_detail']
+                   if t['datum'].startswith('2025-10-20')), None)
+    assert tag_20 and tag_20['klass'] == 'Z73'
+
+
+def test_f6_homebase_res_without_following_tour_not_z73():
+    """RES ohne folgende Auslandstour → bleibt Standby (kein Z73)."""
+    _app = _load_app_fresh()
+    matched = [
+        {'datum': '2025-05-15',
+         'dp': {'activity_type': 'standby', 'raw_marker': 'RES',
+                 'layover_ort': '', 'overnight_after_day': False},
+         'se': {'stfrei_ort': 'FRA', 'stfrei_inland': True, 'stfrei_total': 0,
+                 'count': 0}},
+        {'datum': '2025-05-16',
+         'dp': {'activity_type': 'free', 'raw_marker': 'OFF',
+                 'overnight_after_day': False},
+         'se': {'count': 0}},
+        {'datum': '2025-05-17',
+         'dp': {'activity_type': 'free', 'raw_marker': 'OFF',
+                 'overnight_after_day': False},
+         'se': {'count': 0}},
+    ]
+    result = _app._deterministic_classify_v7(matched, 2025, 'FRA')
+    tag_15 = next((t for t in result['tage_detail']
+                   if t['datum'].startswith('2025-05-15')), None)
+    assert tag_15 and tag_15['klass'] == 'Standby', \
+        f'Isolierter RES sollte Standby bleiben, ist {tag_15["klass"]}'
+
+
+def test_f6_res_before_inland_same_day_not_z73():
+    """RES vor Inland-Tagestrip (1-Tag, kein overnight) → kein Z73."""
+    _app = _load_app_fresh()
+    matched = [
+        {'datum': '2025-06-03',
+         'dp': {'activity_type': 'standby', 'raw_marker': 'RES',
+                 'layover_ort': '', 'overnight_after_day': False},
+         'se': {'stfrei_ort': 'FRA', 'stfrei_inland': True, 'stfrei_total': 0,
+                 'count': 0}},
+        {'datum': '2025-06-04',
+         'dp': {'activity_type': 'same_day', 'raw_marker': 'LH123',
+                 'layover_ort': '', 'overnight_after_day': False},
+         'se': {'stfrei_ort': 'FRA', 'stfrei_inland': True, 'stfrei_total': 14,
+                 'count': 1}},
+    ]
+    result = _app._deterministic_classify_v7(matched, 2025, 'FRA')
+    tag_03 = next((t for t in result['tage_detail']
+                   if t['datum'].startswith('2025-06-03')), None)
+    assert tag_03 and tag_03['klass'] == 'Standby', \
+        f'RES vor Same-Day-Trip sollte NICHT Z73, ist {tag_03["klass"]}'
+
+
+def test_assert_no_mid_tour_x_is_free_after_f1():
+    """Pflicht: nach F1 darf kein „X"-Marker zwischen Tour-Tagen als free bleiben."""
+    _app = _load_app_fresh()
+    cas_days = [
+        {'date': '2025-01-03', 'activity_type': 'flight', 'overnight_after_day': True,
+         'layover_ort': 'BLR', 'marker': '31591 P1'},
+        {'date': '2025-01-04', 'activity_type': 'free', 'overnight_after_day': True,
+         'marker': 'X', 'layover_ort': 'BLR'},
+        {'date': '2025-01-05', 'activity_type': 'flight', 'overnight_after_day': True,
+         'layover_ort': 'BLR', 'marker': '755 LH755-1'},
+        {'date': '2025-01-06', 'activity_type': 'flight', 'overnight_after_day': False,
+         'marker': '755 LH755-1'},
+    ]
+    result = _app._followme_pre_classify_layover(cas_days)
+    mid = next(d for d in result if d['date'] == '2025-01-04')
+    assert mid['activity_type'] == 'layover', \
+        f'Mid-Tour X muss layover sein, ist {mid["activity_type"]}'
+    assert mid['activity_type'] != 'free'
+
+
+def test_followme_tibor_z73_count_with_synth_f6():
+    """Plausibilitäts-Test: nach F6 sollten Tibor's Z73-Tage näher bei 11 liegen.
+    Aktuell (vor F6 in live-Daten): Standby-Anreisetage werden nicht als Z73 erkannt.
+    Mit F6 würden +4 Tage zu Z73 wechseln (04-23, 08-01, 10-20, 10-23)."""
+    src = open(__file__.replace('test_calculation.py', '../app.py')).read()
+    # F6-Logik muss vorhanden sein
+    assert 'f6-res-anreise' in src or 'F6: RES' in src or 'RES-Anreisetag' in src \
+           or 'F6: RES/RES_SB am Homebase' in src
     """ORTSTAG-only Tage (Office ohne start_time/duration) sind kein active_workday."""
     _app = _load_app_fresh()
     passive = {

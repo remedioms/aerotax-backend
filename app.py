@@ -11231,8 +11231,44 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     diagnostics_bmf_mapping_issue = f'iata={_sb_stfrei_ort}'
                 print(f"[v8-standby-foreign] datum={datum} stfrei_ort={_sb_stfrei_ort} → Z76 {eur_added}€")
             else:
-                klass = 'Standby'
-                reason = 'Standby zuhause — AT, kein FT, kein VMA'
+                # v11 F6: RES/RES_SB am Homebase als Tour-Anreisetag.
+                # Wenn der nächste Service-Tag (innerhalb 1-2 Tagen) Tour-Start
+                # zu einer mehrtägigen Auslandstour ist, klassifiziere als Z73
+                # (DE-Anreisetag, FollowMe-konform).
+                # d = sorted_days[i]['dp'] (siehe Loop-Init oben), also direkt
+                # raw_marker zugreifen statt via d.get('dp', {}).
+                f6_marker = (d.get('raw_marker', '') or '').upper().strip()
+                f6_is_res = any(m in f6_marker for m in ('RES', 'SBY', 'SB_M'))
+                f6_matched = False
+                if f6_is_res and i + 1 < len(sorted_days):
+                    # Suche nächsten Tour-Start innerhalb 2 Tagen
+                    for j in range(i + 1, min(i + 3, len(sorted_days))):
+                        nd = sorted_days[j]
+                        ndp = nd.get('dp') or {}
+                        n_at = (ndp.get('activity_type') or '').lower()
+                        n_overnight = bool(ndp.get('overnight_after_day'))
+                        n_layover = (ndp.get('layover_ort') or '').upper().strip()
+                        n_layover_inland = ndp.get('layover_inland')
+                        # Auslandstour-Start: tour-Activity + overnight + Auslands-Layover
+                        is_foreign_tour_start = (
+                            n_at in ('tour', 'flight') and n_overnight
+                            and n_layover and n_layover_inland is False
+                            and n_layover != _sb_homebase_iata
+                        )
+                        if is_foreign_tour_start:
+                            klass = 'Z73'
+                            # BMF-Z73-Pauschale Inland (2025: 14€)
+                            _z73_inland = BMF_INLAND_BY_YEAR.get(year,
+                                BMF_INLAND_BY_YEAR.get(2025, {})).get('an_abreise', 14)
+                            eur_added = float(_z73_inland)
+                            reason = (f'RES/Standby am Homebase vor Auslandstour '
+                                       f'({n_layover} am {nd.get("datum")}) → Z73 Anreise {eur_added}€')
+                            print(f"[v8-f6-res-anreise] datum={datum} → Z73 (nächste Tour: {n_layover} am {nd.get('datum')})")
+                            f6_matched = True
+                            break
+                if not f6_matched:
+                    klass = 'Standby'
+                    reason = 'Standby zuhause — AT, kein FT, kein VMA'
 
         elif at == 'office':
             # v8.20.0/v8.20.1: Office mit total>=480min + kein Hotel + nicht in
