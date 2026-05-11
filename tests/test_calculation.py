@@ -10316,6 +10316,258 @@ def test_v11_no_flugstunden_in_upload_psub():
     assert 'Dienstplan' in block or 'CAS' in block
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# v11 Phase 3 — CAS-Main-Reader
+# Sonnet-Reader für CAS/Dienstplan/Roster. Per-Tag-Schema + Hybrid-Checks
+# (Cross-File-Dedupe, Konflikt-Detection, Self-Consistency).
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_v11_cas_constants_exist():
+    """_CAS_PARSER_VERSION + _CAS_ACTIVITY_TYPES sind definiert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_CAS_PARSER_VERSION')
+    assert hasattr(_app, '_CAS_ACTIVITY_TYPES')
+    assert _app._CAS_PARSER_VERSION == 'v11.0.0'
+
+
+def test_v11_cas_activity_types_complete():
+    """Activity-Types deck alle CAS-Codes ab."""
+    _app = _load_app_fresh()
+    types = _app._CAS_ACTIVITY_TYPES
+    # Pflicht-Typen für die Steuer-Klassifikation
+    required = {'flight', 'office', 'training', 'simulator', 'standby',
+                'vacation', 'sick', 'free', 'unknown'}
+    assert set(types) == required
+
+
+def test_v11_validate_cas_day_function_exists():
+    """_validate_cas_day Helper für Sanity-Check pro Tag."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_validate_cas_day')
+
+
+def test_v11_validate_cas_day_accepts_valid_record():
+    """Valider Tag-Record wird akzeptiert und normalisiert."""
+    _app = _load_app_fresh()
+    ok, normalized, warn = _app._validate_cas_day({
+        'date': '2025-03-18',
+        'activity_type': 'training',
+        'marker': 'EH 4',
+        'start_time': '08:00',
+        'end_time': '16:30',
+        'duration_minutes': 510,
+        'location': 'FRA',
+        'confidence': 'high',
+    })
+    assert ok
+    assert normalized['date'] == '2025-03-18'
+    assert normalized['activity_type'] == 'training'
+    assert normalized['duration_minutes'] == 510
+
+
+def test_v11_validate_cas_day_rejects_invalid_date():
+    """Ungültiges Datum → reject."""
+    _app = _load_app_fresh()
+    ok, _, warn = _app._validate_cas_day({'date': '18.03.2025', 'activity_type': 'training'})
+    assert not ok
+    assert 'invalid_date' in warn
+
+
+def test_v11_validate_cas_day_normalizes_unknown_activity():
+    """Unbekannter Aktivitäts-Typ → 'unknown'."""
+    _app = _load_app_fresh()
+    ok, normalized, _ = _app._validate_cas_day({
+        'date': '2025-03-18',
+        'activity_type': 'banana',
+    })
+    assert ok
+    assert normalized['activity_type'] == 'unknown'
+
+
+def test_v11_validate_cas_day_warns_inconsistent_flight():
+    """activity=flight ohne flights[] → warning."""
+    _app = _load_app_fresh()
+    ok, normalized, warn = _app._validate_cas_day({
+        'date': '2025-03-18',
+        'activity_type': 'flight',
+        'start_time': '08:00',
+        'end_time': '16:00',
+    })
+    assert ok
+    assert warn is not None
+    assert 'flight' in warn.lower()
+
+
+def test_v11_validate_cas_day_warns_training_without_times():
+    """activity=training ohne Zeiten → warning + confidence downgrade."""
+    _app = _load_app_fresh()
+    ok, normalized, warn = _app._validate_cas_day({
+        'date': '2025-03-18',
+        'activity_type': 'training',
+        'confidence': 'high',  # wird auf medium gedowngraded
+    })
+    assert ok
+    assert warn is not None
+    assert normalized['confidence'] == 'medium'
+
+
+def test_v11_cas_reader_functions_exist():
+    """_sonnet_read_cas_structured + _sonnet_read_cas_single_pdf existieren."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_sonnet_read_cas_structured')
+    assert hasattr(_app, '_sonnet_read_cas_single_pdf')
+
+
+def test_v11_cas_reader_returns_none_for_empty_input():
+    """Leere Bytes → None (kein Crash)."""
+    _app = _load_app_fresh()
+    assert _app._sonnet_read_cas_structured(None) is None
+    assert _app._sonnet_read_cas_structured([]) is None
+
+
+def test_v11_cas_reader_signature():
+    """_sonnet_read_cas_structured Signatur."""
+    src = _read_backend()
+    sig_idx = src.find('def _sonnet_read_cas_structured(')
+    line_end = src.find(':', sig_idx)
+    sig = src[sig_idx:line_end]
+    assert 'year' in sig
+    assert 'homebase' in sig
+    assert 'job_id' in sig
+    assert 'source_filenames' in sig
+
+
+def test_v11_cas_single_pdf_prompt_contains_activity_codes():
+    """Sonnet-Prompt erklärt alle wichtigen CAS-Codes."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 10000]
+    # Pflicht-Codes
+    for code in ['LH', 'EH', 'EMCRM', 'SECCRM', 'TK', 'ORTSTAG', 'SIM',
+                 'RES_SB', 'U1', 'OFF']:
+        assert code in block, f'CAS-Code „{code}" fehlt im Sonnet-Prompt'
+
+
+def test_v11_cas_prompt_no_steuerbewertung():
+    """Reader-Prompt sagt explizit: keine Steuerbewertung."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 10000]
+    assert 'KEINE STEUERLICHE BEWERTUNG' in block or 'KEINE STEUER' in block
+    assert 'Backend rechnet' in block
+
+
+def test_v11_cas_prompt_says_no_z72_z73():
+    """Reader-Prompt sagt: keine Z72/Z73/>8h-Bewertung."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 10000]
+    assert 'Z72' in block or 'KEINE Berechnung' in block
+
+
+def test_v11_cas_tool_schema_has_required_fields():
+    """Sonnet-Tool-Schema enthält required Felder."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 10000]
+    # required fields im schema
+    for field in ['date', 'activity_type', 'marker', 'start_time',
+                   'end_time', 'duration_minutes', 'location',
+                   'flights', 'overnight_after_day', 'layover_ort',
+                   'confidence', 'raw_excerpt']:
+        assert f"'{field}'" in block, f'Schema-Feld „{field}" fehlt'
+
+
+def test_v11_cas_reader_uses_file_hash_cache():
+    """CAS-Reader nutzt find_cached_chunk + parser_version für Cache-Lookup."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 6000]
+    assert 'find_cached_chunk(' in block
+    assert '_CAS_PARSER_VERSION' in block
+    assert 'sha256' in block.lower() or 'hashlib' in block
+
+
+def test_v11_cas_reader_per_pdf_separate_call():
+    """Multi-File: eine Sonnet-Anfrage pro PDF (memory-bounded)."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 6000]
+    # Loop über cas_list mit _sonnet_read_cas_single_pdf
+    assert 'for idx, pdf_bytes in enumerate(cas_list)' in block, \
+        'Pro-PDF-Loop muss existieren'
+    assert '_sonnet_read_cas_single_pdf(' in block, \
+        'Pro PDF wird _sonnet_read_cas_single_pdf gerufen'
+
+
+def test_v11_cas_reader_conflict_detection():
+    """Mehrere Files für selben Tag mit unterschiedlichen Daten → conflict."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 6000]
+    assert 'conflicts' in block
+    assert 'multiple_files_disagree' in block or 'len(sigs) ==' in block
+    assert 'chosen_source' in block
+
+
+def test_v11_cas_reader_dedupe_identical_days():
+    """Mehrere Files mit identischem Tag-Eintrag → dedupe (1 Eintrag)."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 6000]
+    # Wenn alle Signaturen identisch → behalte 1
+    assert 'len(sigs) == 1' in block, \
+        'Identische Tag-Signaturen müssen dedupliziert werden'
+
+
+def test_v11_cas_reader_heartbeat_per_file():
+    """Heartbeat-Update pro Datei für Stale-Detector."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 6000]
+    assert '_heartbeat_phase(' in block
+    assert 'cas_file_' in block or 'Dienstplan/CAS wird gelesen' in block
+
+
+def test_v11_cas_reader_max_tokens_25k():
+    """Sonnet-Call nutzt max_tokens=25000 (kleiner Memory-Peak pro File)."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 10000]
+    assert 'max_tokens=25000' in block, \
+        '25k max_tokens pro CAS-PDF (Memory-bounded)'
+
+
+def test_v11_cas_reader_memory_release_per_file():
+    """gc.collect() nach jeder File für Memory-Release."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 6000]
+    assert 'gc.collect()' in block, \
+        'gc.collect() pro File nötig (Render Free-Tier RAM)'
+
+
+def test_v11_cas_reader_result_contains_metadata():
+    """Result-Dict enthält files_total/processed/cache_hits/parser_version."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 6000]
+    for key in ['_files_total', '_files_processed', '_cache_hits', '_parser_version']:
+        assert key in block, f'Result-Metadata „{key}" fehlt'
+
+
+def test_v11_cas_not_yet_wired_into_pipeline():
+    """Phase 3: Reader existiert, ist aber NOCH NICHT in berechne/hybrid_analyze gerufen.
+    Wird in Phase 4 verbunden."""
+    src = _read_backend()
+    # In hybrid_analyze sollte _sonnet_read_cas_structured noch nicht gerufen werden
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 10000]
+    assert '_sonnet_read_cas_structured(' not in block, \
+        'Phase 3: CAS-Reader noch nicht im hybrid_analyze-Pfad (kommt Phase 4)'
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

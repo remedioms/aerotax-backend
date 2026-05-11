@@ -7420,6 +7420,20 @@ Antworte NUR mit JSON (keine Backticks):
 _LSB_PARSER_VERSION = 'v10.4.1'
 _DP_PARSER_VERSION = 'v10.4.1'
 
+# v11 Phase 3 — CAS-Reader-Konstanten
+_CAS_PARSER_VERSION = 'v11.0.0'
+_CAS_ACTIVITY_TYPES = (
+    'flight',      # Tour mit LH-Flugnummer
+    'office',      # ORTSTAG, FRS, LMN_AS, LMN_CR, Bürodienst
+    'training',    # EH, EMCRM, SECCRM, TK, D4, EM (Schulungen)
+    'simulator',   # SIM
+    'standby',     # RES_SB, RES, SBY, Standby-zuhause oder am Airport
+    'vacation',    # U, U1, U2, URLAUB
+    'sick',        # K, KRANK
+    'free',        # OFF, X, FREI
+    'unknown',     # Fallback wenn nicht eindeutig erkennbar
+)
+
 
 def _parse_lsb_local_fast(pdf_bytes):
     """v10.4.1: Schneller lokaler LSB-Parser via pdfplumber + Regex.
@@ -8105,6 +8119,402 @@ def _is_inland_code(code):
     if not code:
         return False
     return code.upper().strip() in INLAND_IATA_CODES
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 Phase 3 — CAS / Dienstplan / Roster Main-Reader
+#
+# Liest CAS-PDFs strukturiert pro Tag. Ersetzt in v11 die Flugstundenübersicht
+# als Tag-Aktivitäts-Quelle. Eine Sonnet-Anfrage pro PDF (memory-bounded),
+# Cache via SHA-256 + parser_version. Multi-File-Merge mit Konflikt-Detection.
+#
+# Output-Schema pro Tag:
+#   {date, activity_type, marker, start_time, end_time, duration_minutes,
+#    location, flights[], overnight_after_day, layover_ort, confidence,
+#    raw_excerpt, source_file_id, source_filename}
+#
+# Hybrid-Checks (zusätzlich zum Per-Tag-Schema):
+#   - Cross-File-Dedupe: gleiche Datei zweimal → ignoriert
+#   - Cross-Month-Konflikt: gleicher Tag in 2 Files mit anderer Activity → conflict
+#   - Self-Consistency: activity_type passt zu Zeiten/Flügen
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _validate_cas_day(day):
+    """Sanity-Check pro CAS-Tag.
+    Returns (is_valid, normalized_day_dict, warning_or_None)."""
+    if not isinstance(day, dict):
+        return False, None, 'not_dict'
+    date = day.get('date') or day.get('datum') or ''
+    activity_type = (day.get('activity_type') or 'unknown').lower()
+    if activity_type not in _CAS_ACTIVITY_TYPES:
+        activity_type = 'unknown'
+    # Datum-Validierung
+    import re as _re
+    if not _re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+        return False, None, f'invalid_date:{date}'
+
+    out = {
+        'date': date,
+        'activity_type': activity_type,
+        'marker': str(day.get('marker') or '')[:60],
+        'start_time': str(day.get('start_time') or '')[:6],
+        'end_time': str(day.get('end_time') or '')[:6],
+        'duration_minutes': int(day.get('duration_minutes') or 0) if str(day.get('duration_minutes', '')).strip() else 0,
+        'location': str(day.get('location') or '')[:10],
+        'flights': day.get('flights') if isinstance(day.get('flights'), list) else [],
+        'overnight_after_day': bool(day.get('overnight_after_day')),
+        'layover_ort': str(day.get('layover_ort') or '')[:10],
+        'confidence': (day.get('confidence') or 'medium').lower(),
+        'raw_excerpt': str(day.get('raw_excerpt') or '')[:120],
+    }
+    if out['confidence'] not in ('high', 'medium', 'low'):
+        out['confidence'] = 'medium'
+
+    # Self-Consistency: activity_type passt zu Daten?
+    warning = None
+    if activity_type == 'flight' and not out['flights']:
+        warning = f'{date}: activity=flight aber keine Flüge'
+    elif activity_type in ('training', 'office', 'simulator') and not (out['start_time'] and out['end_time']):
+        warning = f'{date}: activity={activity_type} aber Zeiten fehlen'
+        # Downgrade confidence
+        if out['confidence'] == 'high':
+            out['confidence'] = 'medium'
+
+    return True, out, warning
+
+
+def _sonnet_read_cas_single_pdf(pdf_bytes, year, homebase, source_filename='cas.pdf'):
+    """Liest EINE CAS-PDF via Sonnet Vision. Returns dict mit days[]+warnings[].
+    Wird vom Multi-File-Wrapper _sonnet_read_cas_structured aufgerufen."""
+    if not pdf_bytes or not ANTHROPIC_KEY:
+        return None
+    import base64 as _b64, json as _j, re as _re
+
+    cas_tool = {
+        'name': 'submit_cas_days',
+        'description': 'Liefere strukturierte Tagesdaten aus dem CAS/Dienstplan/Roster.',
+        'input_schema': {
+            'type': 'object',
+            'required': ['days'],
+            'properties': {
+                'days': {
+                    'type': 'array',
+                    'description': f'Pro Kalendertag im Plan ein Eintrag (auch frei/OFF). '
+                                   f'Jahr {year}, Homebase {homebase}.',
+                    'items': {
+                        'type': 'object',
+                        'required': ['date', 'activity_type'],
+                        'properties': {
+                            'date': {'type': 'string', 'description': 'YYYY-MM-DD'},
+                            'activity_type': {
+                                'type': 'string',
+                                'enum': list(_CAS_ACTIVITY_TYPES),
+                                'description': 'Aktivitäts-Typ. flight=LH-Flugnummer, '
+                                                'training=EH/EMCRM/SECCRM/TK/D4/EM, '
+                                                'office=ORTSTAG/FRS/LMN, simulator=SIM, '
+                                                'standby=RES_SB/RES/SBY, vacation=U/U1/U2, '
+                                                'sick=K, free=OFF/X, unknown=alles andere.',
+                            },
+                            'marker': {'type': 'string', 'description': 'Roh-Code wie er im CAS steht (z.B. „EH 4", „LH600", „U1", „RES_SB").'},
+                            'start_time': {'type': 'string', 'description': 'HH:MM (24h) — Briefing/Aktivitäts-Start. Leer bei frei/Urlaub.'},
+                            'end_time': {'type': 'string', 'description': 'HH:MM — letzte Flug-Landung oder Aktivitäts-Ende. Bei Tour über Mitternacht: bis 23:59 dieses Tags.'},
+                            'duration_minutes': {'type': 'integer', 'description': 'Differenz end_time - start_time in Minuten.'},
+                            'location': {'type': 'string', 'description': 'Briefing-Location IATA (meist FRA) oder Layover-Ort.'},
+                            'flights': {
+                                'type': 'array',
+                                'description': 'Nur bei activity_type=flight. Liste der Flüge.',
+                                'items': {
+                                    'type': 'object',
+                                    'properties': {
+                                        'flight_no': {'type': 'string', 'description': 'z.B. „LH600"'},
+                                        'from_iata': {'type': 'string', 'description': '3-Letter IATA'},
+                                        'to_iata': {'type': 'string', 'description': '3-Letter IATA'},
+                                        'start_time': {'type': 'string', 'description': 'HH:MM'},
+                                        'end_time': {'type': 'string', 'description': 'HH:MM'},
+                                    },
+                                },
+                            },
+                            'overnight_after_day': {'type': 'boolean', 'description': 'Wahr wenn Tag in remote Location endet (Layover-Übernachtung).'},
+                            'layover_ort': {'type': 'string', 'description': 'IATA-Code falls remote, leer wenn FRA-Heimkehr.'},
+                            'confidence': {
+                                'type': 'string',
+                                'enum': ['high', 'medium', 'low'],
+                                'description': 'high=klar lesbar, medium=teils unklar, low=sehr unsicher.',
+                            },
+                            'raw_excerpt': {'type': 'string', 'description': 'Kurzer Roh-Auszug aus CAS (max 80 Zeichen).'},
+                        },
+                    },
+                },
+                'warnings': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'Lese-Warnungen (z.B. „Plan unvollständig für Sept 20").',
+                },
+                'month_covered': {'type': 'string', 'description': 'Haupt-Monat dieses Plans YYYY-MM (z.B. „2025-03").'},
+            },
+        },
+    }
+
+    prompt = f"""Du liest einen Lufthansa CAS / Dienstplan / Roster für Steuerjahr {year}.
+
+═══ FORMAT ═══
+CAS ist eine tabellarische Aufstellung pro Tag mit:
+  • Wochentag-Kürzel + Tag-Nummer (z.B. „Mo 10", „Di 18", „Mi 06")
+  • Aktivitäts-Code:
+      - „LH<Nummer>" oder „FL" → flight (Linienflug)
+      - „EH", „EMCRM", „SECCRM", „TK", „D4", „EM" → training (Schulung)
+      - „SIM" → simulator
+      - „ORTSTAG", „FRS", „LMN_AS", „LMN_CR" → office (Bürodienst Homebase)
+      - „RES_SB", „RES", „SBY" → standby
+      - „U", „U1", „U2", „URLAUB" → vacation
+      - „K", „KRANK" → sick
+      - „OFF", „X", „FREI" → free
+      - alles andere → unknown
+  • Zeiten:
+      - Briefingzeit: oft „Briefingzeit(LT FRA): DD/MM/YY HH:MM"
+      - Flugzeit: „LH600 A340 FRA 12:20-17:15 IKA"
+      - Schulung: „EH 4 FRA 08:00-12:45"
+      - Standby-Fenster: „RES_SB FRA 04:00-20:00"
+  • Location: meist FRA Briefing oder remote (IKA, BLR, ORD etc.)
+
+═══ WAS DU LIEFERN MUSST ═══
+Pro Kalendertag im Plan ein Eintrag (auch frei/OFF/Urlaubs-Tage).
+Wenn der Plan einen Monat abdeckt: 28-31 Tage. Wenn 2 Monate: alle Tage beider Monate.
+
+Felder pro Tag:
+  - date: YYYY-MM-DD (das Jahr ist {year}, der Monat aus dem Plan-Header)
+  - activity_type: aus enum oben
+  - marker: Roh-Code wie er im CAS steht
+  - start_time: HH:MM (Briefing oder Aktivitäts-Start). Bei frei/Urlaub: leer.
+  - end_time: HH:MM (letzte Flug-Landung oder Aktivitäts-Ende). Bei Tour über Mitternacht: bis 23:59 dieses Tags.
+  - duration_minutes: end_time - start_time in Minuten
+  - location: Briefing-Location IATA (meist FRA)
+  - flights[]: nur bei activity_type='flight'
+  - overnight_after_day: True wenn Tag endet in remote Location (Layover)
+  - layover_ort: IATA-Code falls remote, leer wenn FRA
+  - confidence: high/medium/low
+  - raw_excerpt: kurzer Roh-Auszug (max 80 Zeichen)
+
+═══ WICHTIG ═══
+✓ KEINE STEUERLICHE BEWERTUNG. Liefere nur Lese-Fakten.
+✓ KEINE Berechnung von >8h / Z72 / Z73. Backend rechnet.
+✓ Wenn ein Tag unklar ist: activity_type='unknown' + confidence='low'.
+✓ Bei Konflikten oder Lücken: in warnings[] notieren.
+✓ Tage immer als YYYY-MM-DD im Steuerjahr {year}.
+
+═══ KOMPAKTHEIT ═══
+  • raw_excerpt max 80 Zeichen
+  • flights[] nur ausgefüllt bei flight-Tagen
+  • Output sollte in 25k Tokens passen
+
+LIEFERE jetzt via Tool 'submit_cas_days' die strukturierten Tagesdaten."""
+
+    content = [
+        {'type': 'document', 'source': {'type': 'base64', 'media_type': 'application/pdf',
+                                          'data': _b64.b64encode(pdf_bytes).decode()}},
+        {'type': 'text', 'text': prompt},
+    ]
+
+    import time as _t
+    start = _t.time()
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
+        resp = client.messages.create(
+            model='claude-sonnet-4-6',
+            max_tokens=25000,
+            tools=[cas_tool],
+            tool_choice={'type': 'tool', 'name': 'submit_cas_days'},
+            messages=[{'role': 'user', 'content': content}],
+        )
+    except Exception as e:
+        print(f"[Sonnet-CAS] fail: {type(e).__name__}: {str(e)[:200]}")
+        return None
+
+    elapsed = _t.time() - start
+    stop_reason = getattr(resp, 'stop_reason', None) if resp else 'no_response'
+    usage = getattr(resp, 'usage', None) if resp else None
+    if usage:
+        in_tok = getattr(usage, 'input_tokens', '?')
+        out_tok = getattr(usage, 'output_tokens', '?')
+        print(f"[Sonnet-CAS] {source_filename[:40]}: stop={stop_reason} in_tok={in_tok} out_tok={out_tok} {elapsed:.1f}s")
+
+    # Tool-Output extrahieren
+    tool_input = None
+    for block in (resp.content if resp else []):
+        btype = getattr(block, 'type', None) if not isinstance(block, dict) else block.get('type')
+        bname = getattr(block, 'name', None) if not isinstance(block, dict) else block.get('name')
+        if btype == 'tool_use' and (bname == 'submit_cas_days' or bname is None):
+            tool_input = block.get('input') if isinstance(block, dict) else getattr(block, 'input', None)
+            if tool_input: break
+    if not tool_input:
+        print(f"[Sonnet-CAS] kein tool_input für {source_filename[:40]} (stop={stop_reason})")
+        return None
+
+    days_raw = tool_input.get('days', []) if isinstance(tool_input, dict) else []
+    warnings_raw = tool_input.get('warnings', []) if isinstance(tool_input, dict) else []
+    month_covered = tool_input.get('month_covered', '') if isinstance(tool_input, dict) else ''
+
+    # Per-Day-Validation + Sanity
+    days_normalized = []
+    sanity_warnings = []
+    for d in days_raw:
+        ok, normalized, warn = _validate_cas_day(d)
+        if ok and normalized:
+            days_normalized.append(normalized)
+        if warn:
+            sanity_warnings.append(warn)
+
+    warnings_combined = [str(w) for w in warnings_raw] + sanity_warnings
+
+    print(f"[Sonnet-CAS] {source_filename[:40]}: {len(days_normalized)} Tage normalisiert "
+          f"(Monat={month_covered}, {len(warnings_combined)} Warnungen)")
+
+    return {
+        'days': days_normalized,
+        'warnings': warnings_combined,
+        'month_covered': month_covered,
+        'source_filename': source_filename,
+    }
+
+
+def _sonnet_read_cas_structured(cas_bytes, year=2025, homebase='FRA', job_id=None,
+                                 source_filenames=None):
+    """v11 CAS-Main-Reader: liest 1-N CAS-PDFs strukturiert pro Tag.
+
+    Architektur:
+      - Eine Sonnet-Anfrage pro PDF (memory-bounded)
+      - Cache via SHA-256 file_hash + _CAS_PARSER_VERSION (reuse v10.4.1 chunk-cache)
+      - Multi-File-Merge: dedup gleiche Datei, conflict-detection bei
+        unterschiedlichen Daten für selben Tag aus zwei Files
+      - Heartbeat pro Datei (_heartbeat_phase)
+
+    Returns:
+      {
+        'days': [{date, activity_type, ..., source_file_id, ...}],  # alle Tage gemerged
+        'conflicts': [{date, sources: [...]}],
+        'warnings': [...],
+        '_files_total': int,
+        '_files_processed': int,
+        '_cache_hits': int,
+      }
+      oder None wenn kein PDF lesbar war.
+    """
+    if not cas_bytes:
+        return None
+    cas_list = _bytes_list(cas_bytes) if cas_bytes else []
+    if not cas_list:
+        return None
+    if source_filenames is None:
+        source_filenames = [f'cas_{i+1}.pdf' for i in range(len(cas_list))]
+
+    import hashlib as _hl
+
+    all_days_by_date = {}  # date → list of {day_dict, source_file_id, source_filename}
+    all_warnings = []
+    cache_hits = 0
+    files_processed = 0
+
+    for idx, pdf_bytes in enumerate(cas_list):
+        if not pdf_bytes:
+            continue
+        fname = source_filenames[idx] if idx < len(source_filenames) else f'cas_{idx+1}.pdf'
+        file_hash = _hl.sha256(pdf_bytes).hexdigest()[:32]
+        _heartbeat_phase(job_id, f'cas_file_{idx+1}_of_{len(cas_list)}',
+                         {'file': fname[:40], 'idx': idx,
+                          'label': f'Dienstplan/CAS wird gelesen (Datei {idx+1} von {len(cas_list)})…'})
+
+        # Cache-Lookup via file_hash + parser_version
+        cached = find_cached_chunk(file_hash, 'cas', 0, _CAS_PARSER_VERSION) if file_hash else None
+        if cached and isinstance(cached, dict) and cached.get('days'):
+            cas_days = cached.get('days') or []
+            cas_warnings = cached.get('warnings') or []
+            cache_hits += 1
+            print(f"[CAS-Reader] {fname[:40]} cache HIT — {len(cas_days)} Tage (kein Sonnet-Call)")
+        else:
+            # Sonnet-Call für diese PDF
+            result = _sonnet_read_cas_single_pdf(pdf_bytes, year, homebase, source_filename=fname)
+            if not result:
+                all_warnings.append(f'CAS-Datei {fname[:40]}: konnte nicht gelesen werden')
+                continue
+            cas_days = result.get('days') or []
+            cas_warnings = result.get('warnings') or []
+            # Cache speichern für Re-Runs
+            if job_id and file_hash:
+                chunk_id = create_job_chunk(job_id, 'cas', idx,
+                                             page_from=None, page_to=None,
+                                             file_hash=file_hash,
+                                             parser_version=_CAS_PARSER_VERSION)
+                if chunk_id:
+                    save_job_chunk_result(chunk_id, {
+                        'days': cas_days,
+                        'warnings': cas_warnings,
+                        'source_filename': fname,
+                    })
+
+        files_processed += 1
+        all_warnings.extend([f'{fname[:30]}: {w}' for w in cas_warnings])
+
+        # Merge: alle Tage indexieren mit source
+        for day in cas_days:
+            date = day.get('date')
+            if not date: continue
+            day_copy = dict(day)
+            day_copy['source_file_id'] = file_hash
+            day_copy['source_filename'] = fname
+            all_days_by_date.setdefault(date, []).append(day_copy)
+
+        # Memory-Release pro Datei (chunked design)
+        gc.collect()
+
+    # Hybrid-Check: Konflikt-Detection bei Duplikaten
+    merged_days = []
+    conflicts = []
+    for date in sorted(all_days_by_date):
+        candidates = all_days_by_date[date]
+        if len(candidates) == 1:
+            merged_days.append(candidates[0])
+            continue
+        # Mehrere Quellen für selben Tag → check ob inhaltlich identisch
+        sigs = set((c.get('activity_type'), c.get('start_time'), c.get('end_time'), c.get('marker'))
+                   for c in candidates)
+        if len(sigs) == 1:
+            # Identisch — dedupe, behalte ersten
+            merged_days.append(candidates[0])
+        else:
+            # Konflikt — neueste Datei gewinnt (vorletzte in der Liste = neuerer NTF)
+            # Heuristik: letzte ist die zuletzt geparste = oft die neuere
+            chosen = candidates[-1]
+            merged_days.append(chosen)
+            conflicts.append({
+                'date': date,
+                'reason': 'multiple_files_disagree',
+                'candidates': [{'activity_type': c.get('activity_type'),
+                                'start_time': c.get('start_time'),
+                                'end_time': c.get('end_time'),
+                                'marker': c.get('marker'),
+                                'source': c.get('source_filename')} for c in candidates],
+                'chosen_source': chosen.get('source_filename'),
+            })
+
+    print(f"[CAS-Reader] FERTIG: {files_processed}/{len(cas_list)} Files, "
+          f"{len(merged_days)} Tage, {len(conflicts)} Konflikte, {cache_hits} cache hits")
+    _heartbeat_phase(job_id, 'cas_merge_complete',
+                     {'days': len(merged_days), 'conflicts': len(conflicts), 'cache_hits': cache_hits,
+                      'label': 'Dienstplan zusammengeführt…'})
+
+    if not merged_days:
+        return None
+
+    return {
+        'days': merged_days,
+        'conflicts': conflicts,
+        'warnings': all_warnings,
+        '_files_total': len(cas_list),
+        '_files_processed': files_processed,
+        '_cache_hits': cache_hits,
+        '_parser_version': _CAS_PARSER_VERSION,
+    }
 
 
 def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes=None, year=2025, homebase='FRA',
