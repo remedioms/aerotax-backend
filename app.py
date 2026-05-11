@@ -8642,62 +8642,122 @@ def _sonnet_read_cas_structured(cas_bytes, year=2025, homebase='FRA', job_id=Non
 
     import hashlib as _hl
 
-    all_days_by_date = {}  # date → list of {day_dict, source_file_id, source_filename}
+    # v11 Commit 3: Parallel max=2 (env-flag steuerbar).
+    # Pro Datei isolierter Task; bei Fehler nur dieses File betroffen.
+    # Deterministischer Merge danach.
+    try:
+        cas_max_par = int(os.environ.get('AEROTAX_CAS_MAX_PARALLEL', '2'))
+    except Exception:
+        cas_max_par = 2
+    cas_max_par = max(1, min(4, cas_max_par))
+    print(f"[CAS-Reader] start: {len(cas_list)} Files, max_parallel={cas_max_par}")
+
+    def _process_one_cas(idx, pdf_bytes):
+        """Verarbeitet eine CAS-PDF: Cache → Sonnet. Returns dict mit
+        {idx, fname, file_hash, cas_days, cas_warnings, cache_hit, error}."""
+        if not pdf_bytes:
+            return None
+        fname = source_filenames[idx] if idx < len(source_filenames) else f'cas_{idx+1}.pdf'
+        file_hash = _hl.sha256(pdf_bytes).hexdigest()[:32]
+        try:
+            _heartbeat_phase(job_id, f'cas_file_{idx+1}_of_{len(cas_list)}',
+                             {'file': fname[:40], 'idx': idx,
+                              'label': f'Dienstplan/CAS wird gelesen (Datei {idx+1} von {len(cas_list)})…'})
+        except Exception:
+            pass
+        cached = find_cached_chunk(file_hash, 'cas', 0, _CAS_PARSER_VERSION) if file_hash else None
+        if cached and isinstance(cached, dict) and cached.get('days'):
+            return {'idx': idx, 'fname': fname, 'file_hash': file_hash,
+                    'cas_days': cached.get('days') or [],
+                    'cas_warnings': cached.get('warnings') or [],
+                    'cache_hit': True, 'error': None}
+        # Sonnet-Call für diese PDF (mit retry bei rate-limit)
+        last_err = None
+        for attempt in range(3):
+            try:
+                result = _sonnet_read_cas_single_pdf(pdf_bytes, year, homebase, source_filename=fname)
+                if not result:
+                    return {'idx': idx, 'fname': fname, 'file_hash': file_hash,
+                            'cas_days': [], 'cas_warnings': [],
+                            'cache_hit': False,
+                            'error': f'CAS-Datei {fname[:40]}: konnte nicht gelesen werden'}
+                cas_days = result.get('days') or []
+                cas_warnings = result.get('warnings') or []
+                if job_id and file_hash:
+                    chunk_id = create_job_chunk(job_id, 'cas', idx, page_from=None, page_to=None,
+                                                 file_hash=file_hash, parser_version=_CAS_PARSER_VERSION)
+                    if chunk_id:
+                        save_job_chunk_result(chunk_id, {
+                            'days': cas_days, 'warnings': cas_warnings,
+                            'source_filename': fname,
+                        })
+                return {'idx': idx, 'fname': fname, 'file_hash': file_hash,
+                        'cas_days': cas_days, 'cas_warnings': cas_warnings,
+                        'cache_hit': False, 'error': None}
+            except Exception as e:
+                last_err = e
+                err_str = str(e).lower()
+                is_rate_limit = ('rate limit' in err_str or '429' in err_str
+                                  or 'overloaded' in err_str)
+                if is_rate_limit and attempt < 2:
+                    import time as _t
+                    backoff = 2 ** attempt * 3  # 3, 6 Sekunden
+                    print(f"[CAS-Reader] {fname[:40]} rate-limit retry {attempt+1} in {backoff}s")
+                    _t.sleep(backoff)
+                    continue
+                break
+        return {'idx': idx, 'fname': fname, 'file_hash': file_hash,
+                'cas_days': [], 'cas_warnings': [], 'cache_hit': False,
+                'error': f'CAS-Datei {fname[:40]}: Exception {type(last_err).__name__ if last_err else "?"}'}
+
+    all_days_by_date = {}
     all_warnings = []
     cache_hits = 0
     files_processed = 0
+    results_by_idx = {}
 
-    for idx, pdf_bytes in enumerate(cas_list):
-        if not pdf_bytes:
+    if cas_max_par == 1:
+        # Safe-Mode: sequenziell wie früher (kein ThreadPool-Overhead)
+        for idx, pdf_bytes in enumerate(cas_list):
+            r = _process_one_cas(idx, pdf_bytes)
+            if r is not None:
+                results_by_idx[idx] = r
+            gc.collect()
+    else:
+        # Parallel mit ThreadPoolExecutor + Semaphore
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=cas_max_par) as executor:
+            futures = {executor.submit(_process_one_cas, idx, pdf): idx
+                       for idx, pdf in enumerate(cas_list) if pdf}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    r = fut.result()
+                    if r is not None:
+                        results_by_idx[idx] = r
+                except Exception as e:
+                    print(f"[CAS-Reader] task idx={idx} crash: {type(e).__name__}: {e}")
+                gc.collect()
+
+    # Deterministischer Merge — sortiert nach idx (Original-Reihenfolge der Files)
+    for idx in sorted(results_by_idx.keys()):
+        r = results_by_idx[idx]
+        fname = r['fname']
+        if r.get('error'):
+            all_warnings.append(r['error'])
             continue
-        fname = source_filenames[idx] if idx < len(source_filenames) else f'cas_{idx+1}.pdf'
-        file_hash = _hl.sha256(pdf_bytes).hexdigest()[:32]
-        _heartbeat_phase(job_id, f'cas_file_{idx+1}_of_{len(cas_list)}',
-                         {'file': fname[:40], 'idx': idx,
-                          'label': f'Dienstplan/CAS wird gelesen (Datei {idx+1} von {len(cas_list)})…'})
-
-        # Cache-Lookup via file_hash + parser_version
-        cached = find_cached_chunk(file_hash, 'cas', 0, _CAS_PARSER_VERSION) if file_hash else None
-        if cached and isinstance(cached, dict) and cached.get('days'):
-            cas_days = cached.get('days') or []
-            cas_warnings = cached.get('warnings') or []
+        if r.get('cache_hit'):
             cache_hits += 1
-            print(f"[CAS-Reader] {fname[:40]} cache HIT — {len(cas_days)} Tage (kein Sonnet-Call)")
-        else:
-            # Sonnet-Call für diese PDF
-            result = _sonnet_read_cas_single_pdf(pdf_bytes, year, homebase, source_filename=fname)
-            if not result:
-                all_warnings.append(f'CAS-Datei {fname[:40]}: konnte nicht gelesen werden')
-                continue
-            cas_days = result.get('days') or []
-            cas_warnings = result.get('warnings') or []
-            # Cache speichern für Re-Runs
-            if job_id and file_hash:
-                chunk_id = create_job_chunk(job_id, 'cas', idx,
-                                             page_from=None, page_to=None,
-                                             file_hash=file_hash,
-                                             parser_version=_CAS_PARSER_VERSION)
-                if chunk_id:
-                    save_job_chunk_result(chunk_id, {
-                        'days': cas_days,
-                        'warnings': cas_warnings,
-                        'source_filename': fname,
-                    })
-
+            print(f"[CAS-Reader] {fname[:40]} cache HIT — {len(r['cas_days'])} Tage")
         files_processed += 1
-        all_warnings.extend([f'{fname[:30]}: {w}' for w in cas_warnings])
-
-        # Merge: alle Tage indexieren mit source
-        for day in cas_days:
+        all_warnings.extend([f'{fname[:30]}: {w}' for w in r['cas_warnings']])
+        for day in r['cas_days']:
             date = day.get('date')
             if not date: continue
             day_copy = dict(day)
-            day_copy['source_file_id'] = file_hash
+            day_copy['source_file_id'] = r['file_hash']
             day_copy['source_filename'] = fname
             all_days_by_date.setdefault(date, []).append(day_copy)
-
-        # Memory-Release pro Datei (chunked design)
-        gc.collect()
 
     # Hybrid-Check: Konflikt-Detection bei Duplikaten
     merged_days = []

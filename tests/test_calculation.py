@@ -10524,7 +10524,7 @@ def test_v11_cas_reader_conflict_detection():
     """Mehrere Files für selben Tag mit unterschiedlichen Daten → conflict."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 6000]
+    block = src[fn_idx:fn_idx + 14000]
     assert 'conflicts' in block
     assert 'multiple_files_disagree' in block or 'len(sigs) ==' in block
     assert 'chosen_source' in block
@@ -10534,7 +10534,7 @@ def test_v11_cas_reader_dedupe_identical_days():
     """Mehrere Files mit identischem Tag-Eintrag → dedupe (1 Eintrag)."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 6000]
+    block = src[fn_idx:fn_idx + 14000]
     # Wenn alle Signaturen identisch → behalte 1
     assert 'len(sigs) == 1' in block, \
         'Identische Tag-Signaturen müssen dedupliziert werden'
@@ -10573,7 +10573,7 @@ def test_v11_cas_reader_result_contains_metadata():
     """Result-Dict enthält files_total/processed/cache_hits/parser_version."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 6000]
+    block = src[fn_idx:fn_idx + 14000]
     for key in ['_files_total', '_files_processed', '_cache_hits', '_parser_version']:
         assert key in block, f'Result-Metadata „{key}" fehlt'
 
@@ -11988,6 +11988,89 @@ def test_cas_slim_prompt_marker_rules():
     assert 'X' in prompt and 'OFF' in prompt
     # Klare Anweisung dass Backend Tour-Logik macht
     assert 'Backend' in prompt or 'nicht interpretieren' in prompt.lower()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 CAS Commit 3: Parallelisierung max=2
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_cas_parallel_env_default_2():
+    """AEROTAX_CAS_MAX_PARALLEL default 2."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 8000]
+    assert "os.environ.get('AEROTAX_CAS_MAX_PARALLEL'" in block
+    assert "'2'" in block, 'Default Wert 2 muss im environ.get fallback stehen'
+
+
+def test_cas_parallel_env_clamped_1_to_4():
+    """ENV-Wert wird auf 1..4 geclampt."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 8000]
+    assert 'max(1, min(4, cas_max_par))' in block or 'min(4' in block
+
+
+def test_cas_parallel_safe_mode_when_1():
+    """cas_max_par == 1 → sequenziell (kein ThreadPool-Overhead)."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 8000]
+    assert 'if cas_max_par == 1:' in block
+    assert 'Safe-Mode' in block or 'sequenziell' in block
+
+
+def test_cas_parallel_uses_threadpool():
+    """Bei max>1: ThreadPoolExecutor."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 8000]
+    assert 'ThreadPoolExecutor' in block
+    assert 'max_workers=cas_max_par' in block
+
+
+def test_cas_parallel_deterministic_merge():
+    """Merge nach idx sortiert für deterministische Reihenfolge."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 8000]
+    assert 'sorted(results_by_idx' in block
+    # Determinismus-Kommentar
+    assert 'Deterministischer Merge' in block or 'Original-Reihenfolge' in block
+
+
+def test_cas_parallel_one_file_error_isolated():
+    """Bei Fehler einer Datei: error in result, andere laufen weiter."""
+    src = _read_backend()
+    fn_idx = src.find('def _process_one_cas')
+    block = src[fn_idx:fn_idx + 4000]
+    # Result enthält 'error'-Field
+    assert "'error':" in block
+    # Bei Crash: as_completed läuft weiter (try/except in main loop)
+    main_idx = src.find('for fut in as_completed', fn_idx)
+    main_block = src[main_idx:main_idx + 1000]
+    assert 'try:' in main_block and 'except' in main_block
+
+
+def test_cas_parallel_rate_limit_retry():
+    """Bei rate-limit Error: Backoff-Retry mit exponentiellen Sekunden."""
+    src = _read_backend()
+    fn_idx = src.find('def _process_one_cas')
+    block = src[fn_idx:fn_idx + 4000]
+    assert "rate limit" in block.lower() or "'429'" in block
+    assert 'backoff' in block.lower()
+    assert 'range(3)' in block or 'attempt' in block
+
+
+def test_cas_parallel_no_duplicate_days_after_merge():
+    """Merge-Logic: gleicher date aus mehreren Files → dedupe/conflict-detection."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_structured')
+    block = src[fn_idx:fn_idx + 12000]
+    # Konflikt-Detection bei Duplikaten
+    assert 'conflicts' in block
+    assert 'multiple_files_disagree' in block
 
 
 if __name__ == '__main__':
