@@ -11811,6 +11811,105 @@ def test_isTransientError_definition_unchanged_for_documentation():
     assert 'function _isTransientError' in src
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# v11 CAS Text-first Reader (Commit 1)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_cas_text_layer_used_when_good():
+    """Text mit CAS-Markern + Tageszeilen → text-path."""
+    _app = _load_app_fresh()
+    txt = ('Crew Assignment System Lufthansa\n'
+           'Briefingzeit: 03/01/25 10:15\n'
+           'Mo 13 ORTSTAG\nDi 14 OFF\nMi 15 OFF\nDo 16 OFF\nFr 17 LH600 FRA 08:00-12:00 BLR\n'
+           'Sa 18 OFF\nSo 19 X BLR\n' + 'Zusatzinhalt ' * 200)
+    ok, reason = _app._is_cas_text_sufficient(txt)
+    assert ok, f'Erwarte sufficient, reason: {reason}'
+
+
+def test_cas_text_layer_falls_back_to_vision_when_empty():
+    """Leerer Text → vision-fallback."""
+    _app = _load_app_fresh()
+    ok, reason = _app._is_cas_text_sufficient('')
+    assert not ok
+    assert 'text_too_short' in reason
+
+
+def test_cas_text_layer_falls_back_when_missing_markers():
+    """Text ohne CAS-Marker → vision-fallback."""
+    _app = _load_app_fresh()
+    irrelevant = 'Some random text without any cas markers. ' * 50
+    ok, reason = _app._is_cas_text_sufficient(irrelevant)
+    assert not ok
+    assert 'markers' in reason or 'days' in reason
+
+
+def test_cas_text_layer_falls_back_when_no_day_lines():
+    """Text mit Markern aber ohne Tageszeilen (Mo/Di/...) → fallback."""
+    _app = _load_app_fresh()
+    no_days = ('Crew Assignment System Lufthansa Dienstplan Briefing\n'
+               + 'Lorem ipsum dolor sit amet ' * 80)
+    ok, reason = _app._is_cas_text_sufficient(no_days)
+    assert not ok
+    assert 'day' in reason
+
+
+def test_cas_extract_text_handles_invalid_pdf():
+    """Invalid PDF-Bytes → leerer String (kein Crash)."""
+    _app = _load_app_fresh()
+    result = _app._extract_cas_text(b'not a valid pdf')
+    assert result == ''
+
+
+def test_cas_extract_text_extracts_from_real_cas():
+    """Extrahiert echten Text aus Tibor-CAS-PDF."""
+    import os
+    pdf_path = '/Users/miguelschumann/Desktop/Tibor/2025/Dienstplan/NTF_2_1_1_2025-01-30.pdf'
+    if not os.path.exists(pdf_path):
+        import pytest as _pt
+        _pt.skip('Tibor-CAS-PDF nicht verfügbar')
+    _app = _load_app_fresh()
+    with open(pdf_path, 'rb') as f:
+        pdf_bytes = f.read()
+    text = _app._extract_cas_text(pdf_bytes)
+    assert len(text) > 1000, f'Erwarte >1000 Zeichen, ist {len(text)}'
+    # CAS-typische Inhalte
+    assert any(m in text.lower() for m in ('briefingzeit', 'lh', 'ortstag', 'off')), \
+        f'Erwarte CAS-Marker im Text, Anfang: {text[:200]}'
+
+
+def test_cas_text_sufficiency_real_cas():
+    """Echtes Tibor-CAS muss text-sufficient sein (sonst geht jeder Run via Vision)."""
+    import os
+    pdf_path = '/Users/miguelschumann/Desktop/Tibor/2025/Dienstplan/NTF_2_1_1_2025-01-30.pdf'
+    if not os.path.exists(pdf_path):
+        import pytest as _pt
+        _pt.skip()
+    _app = _load_app_fresh()
+    with open(pdf_path, 'rb') as f:
+        pdf_bytes = f.read()
+    text = _app._extract_cas_text(pdf_bytes)
+    ok, reason = _app._is_cas_text_sufficient(text)
+    assert ok, f'Tibor-CAS sollte text-pfad nutzen, reason: {reason}'
+
+
+def test_cas_reader_function_signatures_preserved():
+    """Sicherstellen dass öffentliche CAS-Reader-Signatur erhalten ist."""
+    src = _read_backend()
+    assert 'def _sonnet_read_cas_single_pdf(pdf_bytes, year, homebase, source_filename' in src
+    assert 'def _extract_cas_text(pdf_bytes)' in src
+    assert 'def _is_cas_text_sufficient(text)' in src
+
+
+def test_cas_text_path_does_not_send_base64():
+    """Wenn use_text_path=True, wird KEIN base64 PDF mehr im content geschickt."""
+    src = _read_backend()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 12000]
+    assert 'if use_text_path:' in block
+    assert "extrahiert via pdfplumber" in block or 'pdfplumber' in block.lower()
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

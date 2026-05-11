@@ -8350,12 +8350,69 @@ def _validate_cas_day(day):
     return True, out, warning
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# v11 CAS Text-first — pdfplumber-Text statt Vision-PDF, wenn Text gut genug.
+# Spart ~30-50% Sonnet-Latency (kein Vision-Processing) + reduziert Memory-Peak
+# (kein 50 KB base64 im RAM). Fallback auf Vision bei OCR-PDFs/leerem Text.
+# ════════════════════════════════════════════════════════════════════════════
+_CAS_TEXT_MIN_CHARS = 1000
+_CAS_TEXT_REQUIRED_MARKERS = (
+    'briefing', 'crew assignment', 'dienstplan', 'umlauf',
+    'lh', 'ortstag', 'res', 'off',
+)
+
+
+def _extract_cas_text(pdf_bytes):
+    """Extrahiert Text aus CAS-PDF via pdfplumber. Returns str (leer wenn nichts)."""
+    if not pdf_bytes:
+        return ''
+    try:
+        import io as _io
+        with pdfplumber.open(_io.BytesIO(pdf_bytes)) as pdf:
+            pages = []
+            for page in pdf.pages:
+                t = page.extract_text() or ''
+                if t.strip():
+                    pages.append(t)
+            return '\n\n'.join(pages)
+    except Exception as e:
+        print(f"[CAS-Text] extract fail: {type(e).__name__}: {str(e)[:120]}")
+        return ''
+
+
+def _is_cas_text_sufficient(text):
+    """Prüft ob extrahierter Text gut genug für Text-Pfad.
+    Returns (sufficient: bool, reason: str)."""
+    if not text or len(text.strip()) < _CAS_TEXT_MIN_CHARS:
+        return False, f'text_too_short ({len(text or "")} chars, min {_CAS_TEXT_MIN_CHARS})'
+    low = text.lower()
+    found_markers = [m for m in _CAS_TEXT_REQUIRED_MARKERS if m in low]
+    if len(found_markers) < 2:
+        return False, f'no_cas_markers (found: {found_markers})'
+    # Heuristik: enthält Datums-/Tageszeilen?
+    import re as _re
+    day_pattern_matches = len(_re.findall(r'\b(Mo|Di|Mi|Do|Fr|Sa|So)\s+\d{1,2}\b', text))
+    if day_pattern_matches < 5:
+        return False, f'too_few_day_lines ({day_pattern_matches})'
+    return True, f'ok (chars={len(text)}, markers={len(found_markers)}, days={day_pattern_matches})'
+
+
 def _sonnet_read_cas_single_pdf(pdf_bytes, year, homebase, source_filename='cas.pdf'):
-    """Liest EINE CAS-PDF via Sonnet Vision. Returns dict mit days[]+warnings[].
-    Wird vom Multi-File-Wrapper _sonnet_read_cas_structured aufgerufen."""
+    """Liest EINE CAS-PDF via Sonnet. v11: Text-first via pdfplumber,
+    Fallback auf Vision wenn Text nicht ausreicht.
+    Returns dict mit days[]+warnings[]."""
     if not pdf_bytes or not ANTHROPIC_KEY:
         return None
     import base64 as _b64, json as _j, re as _re
+
+    # v11 Text-first: erst Text-Extraktion versuchen
+    cas_text = _extract_cas_text(pdf_bytes)
+    text_ok, text_reason = _is_cas_text_sufficient(cas_text)
+    use_text_path = text_ok
+    if use_text_path:
+        print(f"[CAS-Reader] {source_filename[:40]}: text-path active ({text_reason})")
+    else:
+        print(f"[CAS-Reader] {source_filename[:40]}: vision-fallback ({text_reason})")
 
     cas_tool = {
         'name': 'submit_cas_days',
@@ -8476,11 +8533,19 @@ Felder pro Tag:
 
 LIEFERE jetzt via Tool 'submit_cas_days' die strukturierten Tagesdaten."""
 
-    content = [
-        {'type': 'document', 'source': {'type': 'base64', 'media_type': 'application/pdf',
-                                          'data': _b64.b64encode(pdf_bytes).decode()}},
-        {'type': 'text', 'text': prompt},
-    ]
+    if use_text_path:
+        # v11 Text-Pfad: pdfplumber-Text als plain text statt PDF-Bytes.
+        # Spart Vision-Latency + ~50 KB base64 im Memory.
+        content = [
+            {'type': 'text', 'text': f'CAS-Plan (extrahiert via pdfplumber):\n\n{cas_text}\n\n---\n{prompt}'},
+        ]
+    else:
+        # Vision-Fallback: PDF als base64 (OCR-PDFs, leere text-Layer, etc.)
+        content = [
+            {'type': 'document', 'source': {'type': 'base64', 'media_type': 'application/pdf',
+                                              'data': _b64.b64encode(pdf_bytes).decode()}},
+            {'type': 'text', 'text': prompt},
+        ]
 
     import time as _t
     start = _t.time()
