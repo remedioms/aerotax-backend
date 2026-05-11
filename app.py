@@ -9847,6 +9847,164 @@ LIEFERE jetzt via Tool die strukturierten SE-Zeilen."""
 # deterministisch. Opus nur für unklare Edge-Cases.
 # ═════════════════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════════════════
+# v11 Phase 4 — CAS → DP-Format-Konverter + CAS+SE-Merge
+#
+# Strategie: CAS-Reader-Output wird zu DP-kompatibler Tag-Struktur konvertiert.
+# Damit bleiben _match_dp_se_per_day + _deterministic_classify_v7 unverändert —
+# der bewährte Klassifikator wird wiederverwendet, nur die Input-Quelle ändert.
+# ════════════════════════════════════════════════════════════════════════════
+
+_CAS_TO_DP_ACTIVITY_MAP = {
+    'flight':    'tour',       # via overnight-Check ggf. zu 'same_day' überschrieben
+    'office':    'office',
+    'training':  'training',
+    'simulator': 'training',   # closest DP-Equivalent (kein 'simulator' im DP-Enum)
+    'standby':   'standby',
+    'vacation':  'urlaub',
+    'sick':      'krank',
+    'free':      'frei',
+    'unknown':   'unknown',
+}
+
+
+def _cas_day_to_dp_format(cas_day, year=2025, homebase='FRA'):
+    """v11: Konvertiert einen CAS-Tag-Eintrag zu DP-Format.
+
+    Damit kann der bestehende Klassifikator (_deterministic_classify_v7) ohne
+    Anpassung weiterverwendet werden. CAS-spezifische Felder (start_time,
+    end_time, duration_minutes) bleiben zusätzlich erhalten für künftige
+    v11-spezifische Logik (z.B. echtes Z72 via >480min statt nur Activity-Marker).
+    """
+    if not isinstance(cas_day, dict):
+        return None
+    cas_at = (cas_day.get('activity_type') or 'unknown').lower()
+    dp_at = _CAS_TO_DP_ACTIVITY_MAP.get(cas_at, 'unknown')
+
+    overnight = bool(cas_day.get('overnight_after_day'))
+    # Flight ohne Layover-Übernachtung → same_day-Trip (FRA-X-FRA gleicher Tag)
+    if dp_at == 'tour' and not overnight:
+        dp_at = 'same_day'
+
+    # Routing aus flights[] aufbauen
+    routing = []
+    flights = cas_day.get('flights') or []
+    for f in flights:
+        if not isinstance(f, dict): continue
+        fr = (f.get('from_iata') or '').upper().strip()
+        to = (f.get('to_iata') or '').upper().strip()
+        if fr and fr not in routing: routing.append(fr)
+        if to and to not in routing: routing.append(to)
+    # Fallback bei Office/Training: Location als Routing
+    if not routing and cas_day.get('location'):
+        routing = [(cas_day['location'] or '').upper()]
+
+    layover_ort = (cas_day.get('layover_ort') or '').upper()
+
+    # Confidence: CAS-string-enum → DP-float
+    cas_conf = (cas_day.get('confidence') or 'medium').lower()
+    confidence_float = {'high': 1.0, 'medium': 0.7, 'low': 0.4}.get(cas_conf, 0.7)
+
+    # has_fl ist für CAS heuristisch — nur ein FL-Marker nach Layover
+    # (echte Tour-Layover-Tage). Im DP-Reader war das ein explizites Feld.
+    # Setze hier konservativ False — _enrich_dp_with_v8_fields ergänzt prev/next-Kontext.
+    has_fl = False
+
+    return {
+        'datum':                 cas_day.get('date'),
+        'activity_type':         dp_at,
+        'raw_marker':            str(cas_day.get('marker', ''))[:30],
+        'markers':               [str(cas_day.get('marker', ''))[:14]] if cas_day.get('marker') else [],
+        'routing':               routing,
+        'has_flight':            dp_at in ('tour', 'same_day'),
+        'has_fl':                has_fl,
+        'layover_ort':           layover_ort,
+        'layover_inland':        _is_inland_code(layover_ort) if layover_ort else None,
+        'overnight_after_day':   overnight,
+        'homebase_heimkehr':     bool(flights) and not overnight,
+        'tour_id':               '',
+        'tour_open':             overnight,
+        'confidence':            confidence_float,
+        'notes':                 '',
+        # v11-spezifische CAS-Felder (zusätzlich, brechen DP-Enrichment nicht)
+        'start_time':            cas_day.get('start_time', ''),
+        'end_time':              cas_day.get('end_time', ''),
+        'duration_minutes':      int(cas_day.get('duration_minutes', 0) or 0),
+        '_cas_v11':              True,
+        '_cas_source_file_id':   cas_day.get('source_file_id', ''),
+        '_cas_source_filename':  cas_day.get('source_filename', ''),
+        '_cas_activity_orig':    cas_at,
+    }
+
+
+def _match_cas_se_per_day(cas_days, se_structured, homebase='FRA', year=2025):
+    """v11: Matcht CAS-Tage + SE-Zeilen pro Kalendertag.
+
+    Wandelt CAS-Output in DP-kompatibles structured_days-Format und ruft
+    _match_dp_se_per_day. Das bewährte Match+Klassifikations-Pipeline läuft
+    unverändert weiter — nur die primäre Daten-Quelle ist nun CAS.
+
+    Liefert: matched_days-Liste (gleiche Shape wie _match_dp_se_per_day).
+    """
+    if not cas_days:
+        return []
+    dp_format_days = []
+    skipped = 0
+    for cas_d in cas_days:
+        dp_d = _cas_day_to_dp_format(cas_d, year, homebase)
+        if dp_d and dp_d.get('datum'):
+            dp_format_days.append(dp_d)
+        else:
+            skipped += 1
+    if skipped:
+        print(f"[v11-cas-match] {skipped} CAS-Tage übersprungen (kein gültiges Datum)")
+    structured_days = {'days': dp_format_days}
+    return _match_dp_se_per_day(structured_days, se_structured, homebase)
+
+
+def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=None,
+                                cas_source_filenames=None, commute_minutes=0):
+    """v11 Komplett-Pipeline: CAS-Read → Match mit SE → Klassifikation.
+
+    Wird in hybrid_analyze unter Feature-Flag AEROTAX_PIPELINE_VERSION=v11_cas_primary
+    aufgerufen. Liefert dasselbe Output-Shape wie der v10-Pipeline (DP-basiert),
+    plus zusätzliche CAS-Audit-Felder (_cas_conflicts, _cas_files_processed etc.).
+
+    Returns: dict mit Klassifikations-Result + Metadaten, oder None bei Fehler.
+    """
+    cas_result = _sonnet_read_cas_structured(
+        cas_bytes, year=year, homebase=homebase, job_id=job_id,
+        source_filenames=cas_source_filenames,
+    )
+    if not cas_result or not cas_result.get('days'):
+        print("[v11-cas-pipeline] CAS-Reader lieferte keine Tage")
+        return None
+
+    cas_days = cas_result['days']
+    print(f"[v11-cas-pipeline] CAS-Reader: {len(cas_days)} Tage aus "
+          f"{cas_result.get('_files_processed', '?')} Dateien "
+          f"({cas_result.get('_cache_hits', 0)} Cache-Hits)")
+
+    # Match mit SE
+    matched = _match_cas_se_per_day(cas_days, se_structured, homebase, year)
+    if not matched:
+        print("[v11-cas-pipeline] _match_cas_se_per_day lieferte keine Matches")
+        return None
+    print(f"[v11-cas-pipeline] Matched {len(matched)} Tage CAS+SE")
+
+    # Klassifikation (bewährter v7-Klassifikator)
+    classification = _deterministic_classify_v7(matched, year, homebase,
+                                                 commute_minutes=commute_minutes)
+    if not classification:
+        return None
+    classification['_v11_cas_used'] = True
+    classification['_cas_conflicts'] = cas_result.get('conflicts', [])
+    classification['_cas_warnings'] = cas_result.get('warnings', [])
+    classification['_cas_files_processed'] = cas_result.get('_files_processed', 0)
+    classification['_cas_cache_hits'] = cas_result.get('_cache_hits', 0)
+    return classification
+
+
 def _match_dp_se_per_day(structured_days, se_structured, homebase='FRA'):
     """Matcht DP-Tagesdaten + SE-Zeilen pro Kalendertag.
     Liefert Liste von matched_days mit dp + se + initial_klass + needs_opus.
@@ -12608,11 +12766,23 @@ def hybrid_analyze(form, files, job_id=None):
     dp_bytes = []
     for item in (files.get('dp') or []):
         dp_bytes.append(item[0] if isinstance(item, tuple) else item)
+    # v11 Phase 4: CAS-Bytes extrahieren — Filenames mitführen für Audit
+    cas_bytes = []
+    cas_filenames = []
+    for item in (files.get('cas') or []):
+        if isinstance(item, tuple) and len(item) >= 2:
+            cas_bytes.append(item[0])
+            cas_filenames.append(item[1] or f'cas_{len(cas_filenames)+1}.pdf')
+        else:
+            cas_bytes.append(item)
+            cas_filenames.append(f'cas_{len(cas_filenames)+1}.pdf')
     # Einsatzplan ist seit v7 nicht mehr Pflicht und wird nicht aktiv genutzt.
     # Falls der Frontend-Upload-Flow legacy noch Bytes mitschickt: hier ignoriert.
     einsatz_bytes = []
 
-    print(f"[v8] Start: LSB={len(lsb_bytes)} SE={len(se_bytes)} Flugstunden={len(dp_bytes)}")
+    print(f"[v8] Start: LSB={len(lsb_bytes)} SE={len(se_bytes)} "
+          f"DP={len(dp_bytes)} CAS={len(cas_bytes)} "
+          f"pipeline={AEROTAX_PIPELINE_VERSION}")
 
     errors = []
 
@@ -12718,11 +12888,64 @@ def hybrid_analyze(form, files, job_id=None):
             if s.get('datum') and not s.get('storno')
         )))
 
-    # Schritt 3: Sonnet liest DP strukturiert
+    # Schritt 3: Tag-Aktivität-Reader
+    # v11_cas_primary: CAS-Reader (Phase 3+4)
+    # v10_legacy:      DP-Reader (Flugstundenübersicht)
+    # Feature-Flag in AEROTAX_PIPELINE_VERSION (default v10_legacy bis Phase 6)
     classification = None
     structured_days = None
     document_health = None
-    if dp_bytes:
+
+    use_v11_cas = (AEROTAX_PIPELINE_VERSION == 'v11_cas_primary' and cas_bytes)
+
+    if use_v11_cas:
+        # v11 PHASE 4 CAS-PIPELINE
+        try:
+            _heartbeat_phase(job_id, 'cas_start',
+                             {'label': 'Dienstplan/CAS wird ausgewertet…'})
+            commute_min = int(form.get('anfahrt_min', 0) or 0)
+            classification = _classify_v11_cas_pipeline(
+                cas_bytes, se_structured, year, homebase,
+                job_id=job_id, cas_source_filenames=cas_filenames,
+                commute_minutes=commute_min,
+            )
+            # Memory-Release nach CAS-Read
+            try:
+                cas_bytes = None
+                if 'cas' in files:
+                    files['cas'] = None
+            except Exception:
+                pass
+            gc.collect()
+            _release_memory_to_os()
+
+            if classification:
+                # Document-Health: minimal-Check für v11 (CAS-Tage vorhanden)
+                document_health = {
+                    'status': 'green',
+                    'issues': [],
+                    'pipeline': 'v11_cas_primary',
+                }
+                # Schritt 3b: Bei vielen CAS-Konflikten → yellow
+                cas_confl_n = len(classification.get('_cas_conflicts', []) or [])
+                if cas_confl_n > 5:
+                    document_health['status'] = 'yellow'
+                    document_health['issues'].append({
+                        'source': 'CAS', 'severity': 'yellow',
+                        'reason': f'{cas_confl_n} Konflikte zwischen CAS-Dateien'
+                    })
+                # structured_days-Shape für downstream-Compatibility
+                structured_days = {
+                    'days': [],  # Detailblätter sind in classification._tage_detail
+                    '_v11_cas': True,
+                }
+        except Exception as e:
+            errors.append(f'CAS-Pipeline: {type(e).__name__}: {str(e)[:200]}')
+            print(f"[v11-cas-pipeline] crash: {type(e).__name__}: {str(e)[:200]}")
+            classification = None
+
+    elif dp_bytes:
+        # v10 LEGACY DP-PIPELINE (Default bis Phase 6)
         try:
             _heartbeat_phase(job_id, 'dp_start',
                              {'label': 'Flugstundenübersicht wird in Abschnitten ausgewertet…'})

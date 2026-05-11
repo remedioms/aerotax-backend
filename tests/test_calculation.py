@@ -10568,6 +10568,303 @@ def test_v11_cas_not_yet_wired_into_pipeline():
         'Phase 3: CAS-Reader noch nicht im hybrid_analyze-Pfad (kommt Phase 4)'
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# v11 Phase 4 — CAS+SE Merge + Berechnung
+# CAS-Reader-Output → DP-kompatibles Format → bewährter Klassifikator-Reuse
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_v11p4_cas_to_dp_format_function_exists():
+    """_cas_day_to_dp_format Konverter existiert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_cas_day_to_dp_format')
+
+
+def test_v11p4_activity_type_mapping_exists():
+    """_CAS_TO_DP_ACTIVITY_MAP enthält alle CAS-Typen."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_CAS_TO_DP_ACTIVITY_MAP')
+    for cas_type in _app._CAS_ACTIVITY_TYPES:
+        assert cas_type in _app._CAS_TO_DP_ACTIVITY_MAP, f'Mapping fehlt für „{cas_type}"'
+
+
+def test_v11p4_cas_flight_overnight_becomes_tour():
+    """CAS flight + overnight → DP tour."""
+    _app = _load_app_fresh()
+    out = _app._cas_day_to_dp_format({
+        'date': '2025-03-18',
+        'activity_type': 'flight',
+        'overnight_after_day': True,
+        'flights': [{'from_iata': 'FRA', 'to_iata': 'IKA'}],
+        'layover_ort': 'IKA',
+    })
+    assert out['activity_type'] == 'tour'
+    assert out['has_flight'] is True
+    assert out['overnight_after_day'] is True
+
+
+def test_v11p4_cas_flight_no_overnight_becomes_same_day():
+    """CAS flight ohne overnight → DP same_day."""
+    _app = _load_app_fresh()
+    out = _app._cas_day_to_dp_format({
+        'date': '2025-02-10',
+        'activity_type': 'flight',
+        'overnight_after_day': False,
+        'flights': [{'from_iata': 'FRA', 'to_iata': 'DUS'},
+                     {'from_iata': 'DUS', 'to_iata': 'FRA'}],
+        'location': 'FRA',
+    })
+    assert out['activity_type'] == 'same_day'
+    assert out['has_flight'] is True
+
+
+def test_v11p4_cas_training_maps_to_training():
+    """CAS training → DP training (Z72-relevant wenn duration ≥ 480 min)."""
+    _app = _load_app_fresh()
+    out = _app._cas_day_to_dp_format({
+        'date': '2025-03-18',
+        'activity_type': 'training',
+        'marker': 'EH 4',
+        'start_time': '08:00',
+        'end_time': '16:30',
+        'duration_minutes': 510,
+        'location': 'FRA',
+    })
+    assert out['activity_type'] == 'training'
+    assert out['has_flight'] is False
+    assert out['start_time'] == '08:00'
+    assert out['duration_minutes'] == 510
+
+
+def test_v11p4_cas_office_maps_to_office():
+    """CAS office (ORTSTAG, FRS) → DP office."""
+    _app = _load_app_fresh()
+    out = _app._cas_day_to_dp_format({
+        'date': '2025-04-15',
+        'activity_type': 'office',
+        'marker': 'ORTSTAG',
+    })
+    assert out['activity_type'] == 'office'
+
+
+def test_v11p4_cas_simulator_maps_to_training():
+    """CAS simulator → DP training (engster DP-Match, kein 'simulator' im DP-Enum)."""
+    _app = _load_app_fresh()
+    out = _app._cas_day_to_dp_format({
+        'date': '2025-05-01',
+        'activity_type': 'simulator',
+        'marker': 'SIM',
+    })
+    assert out['activity_type'] == 'training'
+
+
+def test_v11p4_cas_vacation_maps_to_urlaub():
+    """CAS vacation (U/U1) → DP urlaub."""
+    _app = _load_app_fresh()
+    out = _app._cas_day_to_dp_format({
+        'date': '2025-08-15',
+        'activity_type': 'vacation',
+        'marker': 'U1',
+    })
+    assert out['activity_type'] == 'urlaub'
+
+
+def test_v11p4_cas_routing_from_flights():
+    """Routing wird aus flights[] aufgebaut (unique, IATA-uppercase)."""
+    _app = _load_app_fresh()
+    out = _app._cas_day_to_dp_format({
+        'date': '2025-03-29',
+        'activity_type': 'flight',
+        'overnight_after_day': True,
+        'flights': [
+            {'from_iata': 'fra', 'to_iata': 'bom'},  # lowercase → wird uppercased
+        ],
+        'layover_ort': 'BOM',
+    })
+    assert 'FRA' in out['routing']
+    assert 'BOM' in out['routing']
+
+
+def test_v11p4_cas_layover_inland_check():
+    """Layover-Inland-Flag wird aus Layover-Ort abgeleitet."""
+    _app = _load_app_fresh()
+    out_inland = _app._cas_day_to_dp_format({
+        'date': '2025-06-01',
+        'activity_type': 'flight',
+        'overnight_after_day': True,
+        'layover_ort': 'MUC',  # München = Inland
+    })
+    out_ausland = _app._cas_day_to_dp_format({
+        'date': '2025-06-02',
+        'activity_type': 'flight',
+        'overnight_after_day': True,
+        'layover_ort': 'ORD',  # Chicago = Ausland
+    })
+    assert out_inland['layover_inland'] is True
+    assert out_ausland['layover_inland'] is False
+
+
+def test_v11p4_cas_confidence_high_to_one():
+    """CAS confidence='high' → DP-confidence 1.0 (float)."""
+    _app = _load_app_fresh()
+    out = _app._cas_day_to_dp_format({
+        'date': '2025-03-18',
+        'activity_type': 'training',
+        'confidence': 'high',
+    })
+    assert out['confidence'] == 1.0
+
+
+def test_v11p4_cas_preserves_cas_v11_metadata():
+    """v11-spezifische CAS-Felder bleiben am DP-formatted Tag erhalten."""
+    _app = _load_app_fresh()
+    out = _app._cas_day_to_dp_format({
+        'date': '2025-03-18',
+        'activity_type': 'training',
+        'start_time': '08:00',
+        'end_time': '16:30',
+        'duration_minutes': 510,
+        'source_file_id': 'abc123',
+        'source_filename': 'PUB_3.pdf',
+    })
+    assert out['_cas_v11'] is True
+    assert out['start_time'] == '08:00'
+    assert out['end_time'] == '16:30'
+    assert out['duration_minutes'] == 510
+    assert out['_cas_source_file_id'] == 'abc123'
+    assert out['_cas_activity_orig'] == 'training'
+
+
+def test_v11p4_match_cas_se_per_day_exists():
+    """_match_cas_se_per_day Funktion existiert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_match_cas_se_per_day')
+
+
+def test_v11p4_match_cas_se_empty_input():
+    """Leerer CAS-Input → leere Liste, kein Crash."""
+    _app = _load_app_fresh()
+    assert _app._match_cas_se_per_day(None, None) == []
+    assert _app._match_cas_se_per_day([], None) == []
+
+
+def test_v11p4_match_cas_se_produces_matched_shape():
+    """Output ist matched_days-Liste mit {datum, dp, se}."""
+    _app = _load_app_fresh()
+    cas_days = [
+        {'date': '2025-03-18', 'activity_type': 'training',
+         'start_time': '08:00', 'end_time': '16:30',
+         'duration_minutes': 510, 'confidence': 'high'},
+        {'date': '2025-03-19', 'activity_type': 'free',
+         'confidence': 'high'},
+    ]
+    se = {'se_lines': []}
+    matched = _app._match_cas_se_per_day(cas_days, se, 'FRA', 2025)
+    assert isinstance(matched, list)
+    assert len(matched) == 2
+    for m in matched:
+        assert 'datum' in m
+        assert 'dp' in m
+        assert 'se' in m
+        assert isinstance(m['dp'], dict)
+
+
+def test_v11p4_classify_v11_cas_pipeline_exists():
+    """_classify_v11_cas_pipeline Komplett-Funktion existiert."""
+    _app = _load_app_fresh()
+    assert hasattr(_app, '_classify_v11_cas_pipeline')
+
+
+def test_v11p4_classify_v11_cas_pipeline_signature():
+    """Signatur enthält cas_bytes, se_structured, year, homebase, job_id, etc."""
+    src = _read_backend()
+    sig_idx = src.find('def _classify_v11_cas_pipeline(')
+    line_end = src.find(':', sig_idx)
+    sig = src[sig_idx:line_end]
+    assert 'cas_bytes' in sig
+    assert 'se_structured' in sig
+    assert 'job_id' in sig
+    assert 'commute_minutes' in sig
+
+
+def test_v11p4_hybrid_analyze_extracts_cas_bytes():
+    """hybrid_analyze extrahiert cas_bytes aus files dict."""
+    src = _read_backend()
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 3000]
+    assert "files.get('cas')" in block
+    assert 'cas_bytes' in block
+    assert 'cas_filenames' in block
+
+
+def test_v11p4_hybrid_analyze_feature_flag_branch():
+    """hybrid_analyze hat v11_cas_primary vs v10_legacy Branch."""
+    src = _read_backend()
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 15000]
+    assert "AEROTAX_PIPELINE_VERSION == 'v11_cas_primary'" in block
+    assert 'use_v11_cas' in block
+
+
+def test_v11p4_hybrid_analyze_calls_v11_pipeline_when_flag_set():
+    """v11-Branch ruft _classify_v11_cas_pipeline."""
+    src = _read_backend()
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 15000]
+    assert '_classify_v11_cas_pipeline(' in block
+
+
+def test_v11p4_hybrid_analyze_v10_fallback_intact():
+    """v10-Legacy-Branch (DP-Reader) noch da als Fallback."""
+    src = _read_backend()
+    fn_idx = src.find('def hybrid_analyze(')
+    block = src[fn_idx:fn_idx + 15000]
+    # elif dp_bytes wird genutzt wenn use_v11_cas=False
+    assert 'elif dp_bytes' in block
+    assert '_sonnet_read_dp_structured_chunked_v104(' in block
+
+
+def test_v11p4_classification_includes_cas_metadata():
+    """Classification-Dict enthält _v11_cas_used + _cas_conflicts."""
+    src = _read_backend()
+    fn_idx = src.find('def _classify_v11_cas_pipeline')
+    block = src[fn_idx:fn_idx + 3000]
+    assert '_v11_cas_used' in block
+    assert '_cas_conflicts' in block
+    assert '_cas_warnings' in block
+    assert '_cas_files_processed' in block
+
+
+def test_v11p4_default_feature_flag_runs_v10():
+    """Default-Flag v10_legacy → v10-Pfad. Sanity: keine Aktivierung ohne ENV."""
+    import os as _os
+    prev = _os.environ.pop('AEROTAX_PIPELINE_VERSION', None)
+    try:
+        _app = _load_app_fresh()
+        assert _app.AEROTAX_PIPELINE_VERSION == 'v10_legacy'
+    finally:
+        if prev: _os.environ['AEROTAX_PIPELINE_VERSION'] = prev
+
+
+def test_v11p4_no_silent_z72_zero_when_cas_low_confidence():
+    """v11p4 Soft-Constraint: confidence='low' wird zu DP-confidence 0.4 →
+    Klassifikator kann das als „nicht final" behandeln."""
+    _app = _load_app_fresh()
+    out = _app._cas_day_to_dp_format({
+        'date': '2025-03-18',
+        'activity_type': 'training',
+        'confidence': 'low',
+    })
+    assert out['confidence'] == 0.4
+
+
+def test_v11p4_invalid_cas_day_returns_none():
+    """Ungültiger CAS-Tag (kein dict) → None."""
+    _app = _load_app_fresh()
+    assert _app._cas_day_to_dp_format(None) is None
+    assert _app._cas_day_to_dp_format('not a dict') is None
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
