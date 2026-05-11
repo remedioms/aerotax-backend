@@ -578,6 +578,126 @@ def test_invariant_no_raw_errors_in_user_messages():
         assert '`' not in msg, f'{code}: backticks in message'
 
 
+# ─── Phase B: Frontend API_BASE_URL konfigurierbar ────────────────────────────
+
+_FRONTEND_PATH = '/Users/miguelschumann/Desktop/site/index.html'
+
+
+def test_frontend_has_central_api_config():
+    """index.html hat einen zentralen API-Config-Block."""
+    src = open(_FRONTEND_PATH).read()
+    assert 'v12 Phase B: zentrale API-Base-URL' in src
+    assert '_initApiBaseUrl' in src
+    assert 'window._API' in src
+    assert 'window._API_CONFIG' in src
+
+
+def test_frontend_no_hardcoded_render_url_outside_config():
+    """Keine hardcoded onrender.com URL außerhalb des Config-Blocks
+    (RENDER_FALLBACK-Konstante ist erlaubt)."""
+    src = open(_FRONTEND_PATH).read()
+    # Anzahl Vorkommen sollte genau 1 sein — die RENDER_FALLBACK-Constante
+    assert src.count('https://aerotax-backend.onrender.com') == 1, \
+        f'Erwarte genau 1 hardcoded URL (RENDER_FALLBACK), gefunden: {src.count("https://aerotax-backend.onrender.com")}'
+    # Diese eine Stelle ist die Constant-Definition
+    fallback_idx = src.find('https://aerotax-backend.onrender.com')
+    pre = src[max(0, fallback_idx - 100):fallback_idx]
+    assert 'RENDER_FALLBACK' in pre, 'Verbleibende onrender.com URL muss als RENDER_FALLBACK definiert sein'
+
+
+def test_frontend_supports_query_param_override():
+    """?api=... Query-Param kann window._API überschreiben (für QA/Staging)."""
+    src = open(_FRONTEND_PATH).read()
+    block_idx = src.find('_initApiBaseUrl')
+    block = src[block_idx:block_idx + 3000]
+    assert "p.get('api')" in block or 'p.get("api")' in block
+    # Validierung des Schemas (https?://)
+    assert 'https?:\\/\\/' in block or r"^https?:\/\/" in block
+
+
+def test_frontend_supports_localstorage_override():
+    """localStorage.aerotax_api kann window._API überschreiben (für Dev)."""
+    src = open(_FRONTEND_PATH).read()
+    block_idx = src.find('_initApiBaseUrl')
+    block = src[block_idx:block_idx + 3000]
+    assert "'aerotax_api'" in block or '"aerotax_api"' in block
+
+
+def test_frontend_hostname_routing_present():
+    """Hostname-basiertes Routing: localhost → LOCAL_DEV, aerosteuer → DEFAULT_PRIMARY."""
+    src = open(_FRONTEND_PATH).read()
+    block_idx = src.find('_initApiBaseUrl')
+    block = src[block_idx:block_idx + 3000]
+    assert 'localhost' in block
+    assert 'aerosteuer' in block
+    assert 'DEFAULT_PRIMARY' in block
+
+
+def test_frontend_api_config_exposes_active_url():
+    """window._API_CONFIG.active / is_cloud_run / is_render — UI kann anzeigen welcher Backend aktiv ist."""
+    src = open(_FRONTEND_PATH).read()
+    block_idx = src.find('_initApiBaseUrl')
+    block = src[block_idx:block_idx + 3000]
+    assert "'active'" in block or 'active:' in block
+    assert 'is_cloud_run' in block
+    assert 'is_render' in block
+
+
+# ─── Phase B: Dockerfile Cloud-Run-tauglich ──────────────────────────────────
+
+_DOCKERFILE = '/Users/miguelschumann/Desktop/aerotax-backend/Dockerfile'
+
+
+def test_dockerfile_uses_gunicorn_not_flask_dev_server():
+    """Production: gunicorn statt 'flask run' (Dev-Server)."""
+    src = open(_DOCKERFILE).read()
+    assert 'gunicorn' in src
+    assert 'flask run' not in src, 'Dev-Server raus — gunicorn ist Production'
+
+
+def test_dockerfile_binds_port_env():
+    """Cloud Run injiziert $PORT — Container muss auf $PORT binden."""
+    src = open(_DOCKERFILE).read()
+    assert '${PORT' in src or '$PORT' in src
+    # Default 8080 als Fallback
+    assert '8080' in src
+
+
+def test_dockerfile_timeout_sufficient_for_long_jobs():
+    """gunicorn timeout muss ≥ 1800s (30 Min) für lange CAS+Klassifikations-Jobs."""
+    src = open(_DOCKERFILE).read()
+    # Wir akzeptieren --timeout 1800 oder höher
+    import re as _re
+    m = _re.search(r'--timeout[\s=]+(\d+)', src)
+    assert m, 'gunicorn --timeout muss gesetzt sein'
+    assert int(m.group(1)) >= 1800, f'timeout muss ≥ 1800s sein, ist {m.group(1)}'
+
+
+def test_dockerfile_workers_count_one():
+    """Cloud Run mit concurrency=1: workers=1 pro Container (Spec)."""
+    src = open(_DOCKERFILE).read()
+    assert '--workers 1' in src or '--workers=1' in src
+
+
+def test_dockerfile_python_unbuffered():
+    """PYTHONUNBUFFERED=1 damit print() sofort in Cloud-Logging landet."""
+    src = open(_DOCKERFILE).read()
+    assert 'PYTHONUNBUFFERED=1' in src
+
+
+def test_dockerfile_libheif_for_pillow_heif():
+    """libheif1 Runtime-Dep für pillow-heif (iPhone-Bild-Belege)."""
+    src = open(_DOCKERFILE).read()
+    assert 'libheif' in src.lower()
+
+
+def test_dockerignore_excludes_local_state():
+    """jobs/, sessions/, pdfs/ nicht ins Image (Supabase ist primary)."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/.dockerignore').read()
+    for p in ('jobs/', 'sessions/', 'pdfs/', '_job_chunks_state/'):
+        assert p in src, f'{p} muss in .dockerignore sein'
+
+
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))

@@ -1,5 +1,37 @@
-fly.toml
+# Build-Hygiene — was nicht ins Container-Image gehört
 .git/
-__pycache__/
-.envrc
+.gitignore
+.github/
 .venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Test/Dev-Only
+tests/
+*.test
+.envrc
+.env
+.env.*
+
+# Lokale Job-/Session-State (nicht persistent über Container hinweg —
+# Supabase ist primary persistence; lokale Files nur Fallback)
+jobs/
+sessions/
+pdfs/
+_job_chunks_state/
+debug_snapshots/
+
+# Editor-Artefakte
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Andere Cloud-Configs (verwirrend für Cloud Run)
+fly.toml
+Procfile
+
+# Markdown-Docs (nicht relevant fürs Image)
+*.md
+!CLAUDE.md
