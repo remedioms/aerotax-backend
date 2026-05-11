@@ -9979,8 +9979,73 @@ _CAS_TO_DP_ACTIVITY_MAP = {
     'vacation':  'urlaub',
     'sick':      'krank',
     'free':      'frei',
+    'layover':   'tour',       # v11 FollowMe-Fix: Mid-Tour-Layover wird wie tour klassifiziert
     'unknown':   'unknown',
 }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 FollowMe-Align — Pre-Klassifikator-Pass für Tour-Aware-Klassifizierung
+# ════════════════════════════════════════════════════════════════════════════
+def _followme_pre_classify_layover(cas_days):
+    """v11 Fix F1: CAS-Tage mit Marker X/OFF/== zwischen Tour-Start und Tour-Ende
+    werden zu activity_type='layover' reklassifiziert.
+
+    Hintergrund:
+    Der Sonnet-CAS-Reader klassifiziert „X", „OFF", „==" pauschal als
+    `activity_type='free'`. Aber:
+    - Diese Marker ZWISCHEN einer offenen Tour (overnight=True) und einem
+      späteren Tour-Heimkehr-Tag bedeuten *Layover am Tour-Zielort*.
+    - Erst dadurch werden Auslands-Layover-Tage richtig als Z76 erkannt
+      und Hotel-Nächte gezählt.
+
+    Algorithmus:
+      1. Sortiere cas_days nach Datum
+      2. Tour-State-Machine:
+         - Tour-OPEN bei activity='flight' UND overnight_after_day=True
+         - Tour-CLOSE bei activity='flight' UND overnight_after_day=False
+           (Heimkehrtag)
+      3. Während Tour-OPEN: alle activity='free' Tage zu 'layover'
+         reklassifizieren, mit layover_ort vom vorigen Tag/Tour-Start
+
+    Mutates cas_days in-place (auch return für Chaining).
+    """
+    if not cas_days or not isinstance(cas_days, list):
+        return cas_days
+    sorted_days = sorted([d for d in cas_days if isinstance(d, dict) and d.get('date')],
+                         key=lambda d: d['date'])
+    tour_open = False
+    last_layover_ort = None
+    last_country_iata = None
+    reclass_count = 0
+    for d in sorted_days:
+        at = (d.get('activity_type') or '').lower()
+        overnight = bool(d.get('overnight_after_day'))
+        if at == 'flight':
+            if overnight:
+                # Tour bleibt/öffnet
+                tour_open = True
+                # Layover-Ort merken (vom Tag selber wenn vorhanden)
+                lo = (d.get('layover_ort') or '').upper().strip()
+                if lo:
+                    last_layover_ort = lo
+            else:
+                # Heimkehr — Tour schließt nach diesem Tag
+                tour_open = False
+                last_layover_ort = None
+        elif at == 'free' and tour_open and last_layover_ort:
+            # Mid-Tour-Free → Reklassifiziere zu Layover
+            d['activity_type'] = 'layover'
+            d['_followme_reclassified'] = True
+            d['_followme_reclassified_from'] = 'free'
+            if not d.get('layover_ort'):
+                d['layover_ort'] = last_layover_ort
+            # overnight_after_day setzen, falls letzter Layover-Tag ist nicht klar
+            # (wird vom nachfolgenden Heimkehr-Tag implizit gehandelt)
+            reclass_count += 1
+    if reclass_count:
+        print(f"[followme-pre-classify] {reclass_count} Mid-Tour-Frei-Tage zu Layover reklassifiziert")
+    return cas_days
 
 
 def _cas_day_to_dp_format(cas_day, year=2025, homebase='FRA'):
@@ -10077,6 +10142,155 @@ def _match_cas_se_per_day(cas_days, se_structured, homebase='FRA', year=2025):
     return _match_dp_se_per_day(structured_days, se_structured, homebase)
 
 
+def _followme_identify_tours(tage_detail):
+    """v11 Helper: Identifiziert Touren aus tage_detail nach FollowMe-Logik.
+
+    Tour-Definition (FollowMe):
+      - Tour beginnt mit einem Tag, der einen Tour-Start markiert
+        (klass ∈ {Z73, Z74, Z76} mit reader_facts.activity_type='flight' oder
+         dp.activity_type='tour' UND overnight_after_day=True)
+      - Tour bleibt offen bis zu einem Heimkehrtag
+        (Tag mit overnight=False UND aktivem Flug-Marker oder klass=Z73 mit
+         Heimkehr-Routing)
+      - Layover-Tage (activity_type='layover' nach F1-Pass) sind in Tour-Mitte
+
+    Returns: Liste von tour-Dicts mit {start_idx, end_idx, days, layover_country}.
+    """
+    if not tage_detail:
+        return []
+    sorted_td = sorted([t for t in tage_detail if isinstance(t, dict) and t.get('datum')],
+                       key=lambda t: t['datum'])
+    tours = []
+    open_tour = None
+    for i, t in enumerate(sorted_td):
+        klass = (t.get('klass') or '').lower()
+        rf = t.get('reader_facts') or {}
+        at = (rf.get('activity_type') or '').lower()
+        # Tag zählt als „in einer Tour" wenn klass ∈ Tour-Klassen oder activity in tour/layover
+        in_tour_klass = klass in ('z73', 'z74', 'z76')
+        is_layover_or_flight = at in ('flight', 'tour', 'layover', 'same_day')
+        overnight = bool(rf.get('overnight_after_day'))
+
+        if open_tour is None:
+            # Touren-Start erkennen
+            if in_tour_klass or (is_layover_or_flight and overnight):
+                open_tour = {'start_idx': i, 'days': [t], 'tour_size': 1}
+            # No-op sonst — Tag gehört zu keiner Tour (Office/Standby/Frei solo)
+        else:
+            # Tag innerhalb offener Tour
+            open_tour['days'].append(t)
+            open_tour['tour_size'] += 1
+            # Schließe Tour bei Heimkehr-Tag (activity=flight, overnight=False)
+            # oder bei Tag der weder klass=Tour noch activity-in-tour ist
+            if not overnight and not in_tour_klass and not is_layover_or_flight:
+                # User ist offensichtlich zuhause → Tour schon davor zu Ende
+                open_tour['days'].pop()  # diesen Tag rausnehmen
+                open_tour['tour_size'] -= 1
+                tours.append(open_tour)
+                open_tour = None
+            elif is_layover_or_flight and not overnight:
+                # Heimkehrtag (Flug ohne weitere Übernachtung)
+                tours.append(open_tour)
+                open_tour = None
+    if open_tour:
+        tours.append(open_tour)
+    return tours
+
+
+def _followme_align_counters(classification, matched_days, year=2025, homebase='FRA'):
+    """v11 F3/F4: Post-Klassifikator FollowMe-Align.
+
+    Korrigiert:
+    - fahr_tage = N(Touren) + N(Solo-Office/Schulung mit Anfahrt)
+      Statt: jeder requires_commute-Tag
+    - arbeitstage = Σ Tour-Tage + Σ Solo-Office/Schulung
+    - reinigungstage = Σ Tour-Tage mit Uniform (alle FlugTour-Tage) +
+                       Office/Schulung-Tage falls Dienstkleidung
+    - hotel_naechte = Σ Tour-Tage mit Land != Homebase-Land,
+                      ausgenommen letzter Tag (Heimkehr)
+
+    Mutates classification in-place + return.
+    """
+    if not classification:
+        return classification
+    tage_detail = classification.get('tage_detail') or []
+    if not tage_detail:
+        return classification
+
+    tours = _followme_identify_tours(tage_detail)
+    # Build sorted_td index Map zu Tag-Daten
+    sorted_td = sorted([t for t in tage_detail if isinstance(t, dict) and t.get('datum')],
+                       key=lambda t: t['datum'])
+    in_tour_dates = set()
+    for tour in tours:
+        for tday in tour['days']:
+            in_tour_dates.add(tday['datum'])
+
+    # F3: Fahrtage
+    # = N(Touren) + N(Solo-Office/Training-Tage außerhalb von Touren mit Anfahrt)
+    fahr_tage_followme = len(tours)
+    # Solo-Tage: außerhalb von Touren, klass ∈ {Office, Z72, Training} → 1 Anfahrt je Tag
+    SOLO_FAHRTAG_KLASSEN = {'office', 'z72', 'training'}
+    solo_fahrtage = 0
+    for t in sorted_td:
+        if t.get('datum') in in_tour_dates:
+            continue
+        klass = (t.get('klass') or '').lower()
+        if klass in SOLO_FAHRTAG_KLASSEN:
+            solo_fahrtage += 1
+    fahr_tage_followme += solo_fahrtage
+
+    # F4: Arbeitstage = alle Tour-Tage + Solo-AT-Tage (Office, Z72, Training, Standby zuhause)
+    SOLO_ARBEITSTAG_KLASSEN = {'office', 'z72', 'training', 'standby'}
+    solo_arbeitstage = sum(
+        1 for t in sorted_td
+        if t.get('datum') not in in_tour_dates
+        and (t.get('klass') or '').lower() in SOLO_ARBEITSTAG_KLASSEN
+    )
+    arbeitstage_followme = sum(tour['tour_size'] for tour in tours) + solo_arbeitstage
+
+    # Reinigungstage: Tour-Tage (alle Tage mit Uniform) + Office-Schulung-Tage
+    # (alle Diensttage = alle Arbeitstage außer Standby zuhause)
+    reinigungstage_followme = arbeitstage_followme - sum(
+        1 for t in sorted_td
+        if t.get('datum') not in in_tour_dates and (t.get('klass') or '').lower() == 'standby'
+    )
+
+    # Hotel-Nächte: Tour-Tage außer Tour-Heimkehrtag (letzter Tag)
+    # Aber: nur wenn Tour mehrtägig (>=2 Tage) und das Tour-Ziel != Inland.
+    # Vereinfacht: für jede Tour mit n>=2 Tagen → n-1 Hotel-Nächte
+    hotel_naechte_followme = 0
+    for tour in tours:
+        if tour['tour_size'] >= 2:
+            # Check ob die Tour rein Inland war
+            tour_klass_set = set((td.get('klass') or '').lower() for td in tour['days'])
+            if tour_klass_set.intersection({'z76'}):
+                # Mindestens 1 Auslands-Tag → Hotel im Ausland
+                hotel_naechte_followme += tour['tour_size'] - 1
+            else:
+                # Reine Inland-Tour
+                hotel_naechte_followme += tour['tour_size'] - 1
+
+    # Update classification
+    classification['_followme_aligned'] = True
+    classification['_followme_tours_identified'] = len(tours)
+    classification['_followme_pre_align'] = {
+        'fahr_tage': classification.get('fahr_tage'),
+        'arbeitstage': classification.get('arbeitstage'),
+        'reinigungstage': classification.get('reinigungstage'),
+        'hotel_naechte': classification.get('hotel_naechte'),
+    }
+    classification['fahr_tage'] = fahr_tage_followme
+    classification['arbeitstage'] = arbeitstage_followme
+    classification['reinigungstage'] = reinigungstage_followme
+    classification['hotel_naechte'] = hotel_naechte_followme
+
+    print(f"[followme-align] tours={len(tours)} solo_fahrtage={solo_fahrtage} "
+          f"→ fahr_tage={fahr_tage_followme} arbeitstage={arbeitstage_followme} "
+          f"reinigung={reinigungstage_followme} hotel={hotel_naechte_followme}")
+    return classification
+
+
 def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=None,
                                 cas_source_filenames=None, commute_minutes=0):
     """v11 Komplett-Pipeline: CAS-Read → Match mit SE → Klassifikation.
@@ -10100,6 +10314,10 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
           f"{cas_result.get('_files_processed', '?')} Dateien "
           f"({cas_result.get('_cache_hits', 0)} Cache-Hits)")
 
+    # v11 F1: Mid-Tour-Free → Layover (Cluster A der FollowMe-Diff)
+    cas_days = _followme_pre_classify_layover(cas_days)
+    cas_result['days'] = cas_days
+
     # Match mit SE
     matched = _match_cas_se_per_day(cas_days, se_structured, homebase, year)
     if not matched:
@@ -10112,6 +10330,11 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
                                                  commute_minutes=commute_minutes)
     if not classification:
         return None
+    # v11 F3/F4: FollowMe-Align (Touren-aggregierte Counter).
+    # Hinter ENV-Flag bis Tour-Identifikation gegen Tibor-Golden verifiziert ist.
+    # Aktivierung: AEROTAX_FOLLOWME_ALIGN=1
+    if os.environ.get('AEROTAX_FOLLOWME_ALIGN') == '1':
+        classification = _followme_align_counters(classification, matched, year, homebase)
     classification['_v11_cas_used'] = True
     classification['_cas_conflicts'] = cas_result.get('conflicts', [])
     classification['_cas_warnings'] = cas_result.get('warnings', [])
@@ -10967,8 +11190,34 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             continue
 
         if at == 'standby':
-            klass = 'Standby'
-            reason = 'Standby zuhause — AT, kein FT, kein VMA'
+            # v11 F2: Standby-Layover-Fix.
+            # Wenn SE für diesen Tag stfrei mit Ort ≠ Homebase zeigt, war der
+            # Crew-Member im Ausland (Layover-Standby). FollowMe rechnet diese
+            # Tage mit voller Land-Pauschale. AeroTAX vorher: pauschal 'kein VMA'.
+            _sb_stfrei_ort = (se.get('stfrei_ort') or '').upper().strip()
+            _sb_stfrei_inland = se.get('stfrei_inland')
+            _sb_homebase_iata = (homebase or 'FRA').upper().strip()
+            if (_sb_stfrei_ort and _sb_stfrei_ort != _sb_homebase_iata
+                    and _sb_stfrei_inland is False):
+                # Auslands-Layover-Standby
+                klass = 'Z76'
+                # Land aus IATA-Code ermitteln
+                bmf_land_sb = IATA_TO_BMF.get(_sb_stfrei_ort)
+                _bmf_y_sb = BMF_AUSLAND_BY_YEAR.get(year) or BMF_AUSLAND_BY_YEAR.get(2025) or {}
+                if bmf_land_sb and bmf_land_sb in _bmf_y_sb:
+                    sat = _bmf_y_sb[bmf_land_sb]
+                    # Voller 24h-Satz für Layover-Mid-Tour, An/Ab-Satz für Rand-Tage —
+                    # vereinfacht: 24h-Satz, weil FollowMe das auch so macht.
+                    eur_added = float(sat.get('voll_24h', 0) or 0)
+                    reason = f'Standby Layover {_sb_stfrei_ort} ({bmf_land_sb}) → Z76 {eur_added}€'
+                else:
+                    eur_added = 0
+                    reason = f'Standby Layover {_sb_stfrei_ort} — BMF-Mapping fehlt'
+                    diagnostics_bmf_mapping_issue = f'iata={_sb_stfrei_ort}'
+                print(f"[v8-standby-foreign] datum={datum} stfrei_ort={_sb_stfrei_ort} → Z76 {eur_added}€")
+            else:
+                klass = 'Standby'
+                reason = 'Standby zuhause — AT, kein FT, kein VMA'
 
         elif at == 'office':
             # v8.20.0/v8.20.1: Office mit total>=480min + kein Hotel + nicht in
