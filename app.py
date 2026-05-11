@@ -237,6 +237,12 @@ AEROTAX_PIPELINE_VERSION = os.environ.get('AEROTAX_PIPELINE_VERSION', 'v11_cas_p
 #                   wenn wir wieder Resume-After-Restart brauchen.
 AEROTAX_USE_CHUNK_PERSISTENCE = os.environ.get('AEROTAX_USE_CHUNK_PERSISTENCE', '0') == '1'
 
+# v11 P0 Safety: Snapshot-Capture für Debug nach Pipeline-Crashes.
+# Bei AEROTAX_CAPTURE_SNAPSHOTS=1 werden Zwischenergebnisse als jobs.data.debug_snapshots
+# persistiert. Spart Sonnet-Calls beim Re-Test (offline-Reproduktion möglich).
+# WICHTIG: KEINE PDF-Bytes, KEIN base64 — nur strukturierte JSON-Daten.
+AEROTAX_CAPTURE_SNAPSHOTS = os.environ.get('AEROTAX_CAPTURE_SNAPSHOTS', '0') == '1'
+
 UPLOAD_TTL_HOURS = 4   # Pre-Upload nur kurz aufbewahren — nach Auswertung gelöscht
 
 
@@ -3315,6 +3321,23 @@ def post_finalize_pdf(job_id):
                 'error': 'Eine Datei wartet auf erneute Auswertung — bitte erst Auswertung neu starten.',
                 'pending_reread': True,
                 'pending_reread_doc_types': j.get('pending_reread_doc_types', []),
+            }), 409
+        # v11 P0 Safety: PDF blockiert wenn Align-Pflicht-Step crashed ist.
+        # Schutz davor dass User PDF mit potenziell falschen Werten downloadet.
+        _data_for_align_check = j.get('data') or {}
+        if _data_for_align_check.get('_followme_align_failed'):
+            return jsonify({
+                'error': 'Die Berechnung konnte nicht vollständig geprüft werden. '
+                         'Bitte starte die Auswertung erneut oder kontaktiere den Support.',
+                'followme_align_failed': True,
+            }), 409
+        # Plus: document_health=red blockiert ebenfalls
+        _dh = _data_for_align_check.get('_document_health') or {}
+        if isinstance(_dh, dict) and _dh.get('status') == 'red':
+            return jsonify({
+                'error': 'Die Auswertung enthält ungelöste Probleme. '
+                         'Bitte prüfe den Chat oder kontaktiere den Support.',
+                'document_health': 'red',
             }), 409
         data = dict(j.get('data') or {})
         cached = data.get('_cached_recalc_state') or {}
@@ -10319,6 +10342,188 @@ def _match_cas_se_per_day(cas_days, se_structured, homebase='FRA', year=2025):
     return _match_dp_se_per_day(structured_days, se_structured, homebase)
 
 
+def _snapshot_strip_binaries(obj, depth=0):
+    """Entfernt rekursiv PDF-Bytes/base64/raw-File-Daten aus Snapshots.
+    Schutz gegen versehentliche PII-/Binary-Persistierung."""
+    if depth > 12:  # max recursion
+        return '<truncated:max_depth>'
+    if isinstance(obj, bytes):
+        return f'<bytes:{len(obj)}>'
+    if isinstance(obj, str):
+        # Heuristik: sehr langer String mit base64-Pattern
+        if len(obj) > 2000 and obj.count('/') + obj.count('+') > 50:
+            return f'<base64-like:{len(obj)} chars>'
+        return obj[:8000] if len(obj) > 8000 else obj
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            # Verbotene Keys gleich rausfiltern
+            if isinstance(k, str) and k.lower() in (
+                    'pdf_bytes', 'raw_pdf', 'pdf_b64', 'base64', 'b64',
+                    'pdf_content', 'image_bytes', 'file_bytes', 'data_uri'):
+                out[k] = '<stripped>'
+                continue
+            out[k] = _snapshot_strip_binaries(v, depth + 1)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_snapshot_strip_binaries(x, depth + 1) for x in obj[:500]]
+    return obj
+
+
+def _save_pipeline_snapshot(job_id, stage_name, data, error=None):
+    """v11 P0: speichert Pipeline-Zwischenstand für Offline-Debugging.
+    Aktiv nur wenn AEROTAX_CAPTURE_SNAPSHOTS=1.
+    Speichert in jobs.data.debug_snapshots — keine PDFs/base64.
+    Wird AUCH bei Exception aufgerufen damit Crash-Daten sichtbar sind.
+    """
+    if not AEROTAX_CAPTURE_SNAPSHOTS:
+        return
+    if not job_id:
+        return
+    try:
+        clean = _snapshot_strip_binaries(data)
+        entry = {
+            'stage': stage_name,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+            'data': clean,
+        }
+        if error:
+            import traceback as _tb
+            entry['error'] = {
+                'type': type(error).__name__,
+                'message': str(error)[:500],
+                'trace': _tb.format_exc()[:2000],
+            }
+        with _jobs_lock:
+            j = _jobs.get(job_id)
+            if j is None:
+                j = _load_job_from_disk(job_id) or {}
+                _jobs[job_id] = j
+            snaps = j.setdefault('debug_snapshots', [])
+            snaps.append(entry)
+            # Cap auf 20 Snapshots damit Job-Dict nicht explodiert
+            if len(snaps) > 20:
+                j['debug_snapshots'] = snaps[-20:]
+        try:
+            _save_job_to_disk(job_id)
+        except Exception as _e:
+            print(f"[snapshot] save fail {job_id[:8]}/{stage_name}: {_e}")
+        print(f"[snapshot] saved {stage_name} for {job_id[:8]} (error={bool(error)})")
+    except Exception as _outer:
+        print(f"[snapshot] capture failed {stage_name}: {_outer}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 P0 Safety — Schema-Validator für Pipeline-Datenfluss
+# Verhindert dass tuple/list/None/str unbemerkt in dict-erwartende Funktionen
+# einfließt (Bug a6e291f2: 'tuple' object has no attribute 'get').
+# ════════════════════════════════════════════════════════════════════════════
+class _PipelineSchemaError(ValueError):
+    """Schema-Validierungsfehler im Pipeline-Datenfluss."""
+    pass
+
+
+def _validate_pipeline_shape(obj, expected, path='root'):
+    """Rekursive Typ-Prüfung mit Pfad-Tracking. Kein silent-pass.
+
+    expected:
+      - 'dict' / 'list' / 'str' / 'int' / 'float' / 'bool' / 'number' / None
+      - {'type': 'list', 'item': <expected>}  → jeden Eintrag prüfen
+      - {'type': 'dict', 'fields': {key: <expected>, ...}, 'optional': [keys...]}
+      - {'type': 'one_of', 'any_of': [<expected>, ...]}
+      - None → kein Check (Wildcard)
+    """
+    if expected is None:
+        return
+    if isinstance(expected, str):
+        type_map = {
+            'dict': dict, 'list': list, 'str': str, 'int': int,
+            'float': float, 'bool': bool, 'number': (int, float),
+        }
+        py_type = type_map.get(expected)
+        if py_type is None:
+            raise _PipelineSchemaError(f'{path}: unbekannter expected-Type "{expected}"')
+        if not isinstance(obj, py_type):
+            raise _PipelineSchemaError(
+                f'{path}: erwarte {expected}, ist {type(obj).__name__} '
+                f'(value={repr(obj)[:120]})')
+        return
+    if not isinstance(expected, dict):
+        raise _PipelineSchemaError(f'{path}: malformed expected-Schema')
+    etype = expected.get('type')
+    if etype == 'one_of':
+        for option in expected.get('any_of', []):
+            try:
+                _validate_pipeline_shape(obj, option, path)
+                return
+            except _PipelineSchemaError:
+                continue
+        raise _PipelineSchemaError(f'{path}: keiner der erlaubten Typen passt')
+    if etype == 'list':
+        if not isinstance(obj, list):
+            raise _PipelineSchemaError(
+                f'{path}: erwarte list, ist {type(obj).__name__}')
+        item_schema = expected.get('item')
+        if item_schema is not None:
+            for i, x in enumerate(obj):
+                _validate_pipeline_shape(x, item_schema, f'{path}[{i}]')
+        return
+    if etype == 'dict':
+        if not isinstance(obj, dict):
+            raise _PipelineSchemaError(
+                f'{path}: erwarte dict, ist {type(obj).__name__} '
+                f'(value={repr(obj)[:120]})')
+        fields = expected.get('fields') or {}
+        optional = set(expected.get('optional') or [])
+        for fname, fschema in fields.items():
+            if fname in obj:
+                _validate_pipeline_shape(obj[fname], fschema, f'{path}.{fname}')
+            elif fname not in optional:
+                raise _PipelineSchemaError(
+                    f'{path}.{fname}: Pflichtfeld fehlt')
+        return
+    raise _PipelineSchemaError(f'{path}: unbekannter etype "{etype}"')
+
+
+# Schemas für die wichtigsten Pipeline-Stages
+_SCHEMA_TAGE_DETAIL_ENTRY = {
+    'type': 'dict',
+    'fields': {'datum': 'str', 'klass': 'str'},
+    'optional': ['begruendung', 'marker', 'routing', 'eur', 'classifier_result',
+                  'reader_facts', 'diagnostics', 'sources', 'tour_dauer', 'dienstlich'],
+}
+_SCHEMA_TAGE_DETAIL = {'type': 'list', 'item': _SCHEMA_TAGE_DETAIL_ENTRY}
+_SCHEMA_CLASSIFICATION = {
+    'type': 'dict',
+    'fields': {'tage_detail': _SCHEMA_TAGE_DETAIL},
+    'optional': ['arbeitstage', 'reinigungstage', 'fahr_tage', 'hotel_naechte',
+                  'vma_72', 'vma_73', 'vma_74', 'vma_aus', 'fahr', 'reinig',
+                  'trink', 'gesamt', 'netto', 'ag_z17', 'z77',
+                  'arbeitstage_total', 'audit', '_klass_summary',
+                  '_review_items', '_unresolved_days', '_vma_unmapped_se',
+                  '_document_health', '_plausi_issues', '_plausi_hard_fails',
+                  '_extra_arbeitstage', '_extra_fahrtage', '_extra_hotelnaechte',
+                  '_aerotax_z76_dates_amounts', '_iata_unknown', '_bmf_missing',
+                  '_audit_source', '_audit_notes', '_cached_recalc_state',
+                  '_confidence', '_isDemo', '_nachweis',
+                  '_office_training_time_missing_candidates',
+                  '_office_z72_candidates', '_rescues', '_training_sequences',
+                  '_training_commute_candidates', '_hotel_candidate_issues',
+                  '_missing_deutschland_14_candidates', '_missing_z73_candidates',
+                  '_missing_z76_candidates', '_missing_reader_days',
+                  '_v11_cas_used', '_cas_conflicts', '_cas_warnings',
+                  '_cas_files_processed', '_cas_cache_hits',
+                  '_followme_aligned', '_followme_tours_identified',
+                  '_followme_pre_align'],
+}
+_SCHEMA_MATCHED_DAY_ENTRY = {
+    'type': 'dict',
+    'fields': {'datum': 'str', 'dp': 'dict', 'se': 'dict'},
+    'optional': ['initial_klass', 'needs_opus'],
+}
+_SCHEMA_MATCHED_DAYS = {'type': 'list', 'item': _SCHEMA_MATCHED_DAY_ENTRY}
+
+
 def _followme_is_service_day(tage_detail_entry, homebase='FRA'):
     """v11 Helper: True wenn Tag in eine Tour gehört (Sequence-Building).
     ORTSTAG-Tage zählen mit (= Tour-Continuation), werden aber in
@@ -10409,6 +10614,10 @@ def _followme_identify_tours(tage_detail, homebase='FRA'):
 def _followme_align_counters(classification, matched_days, year=2025, homebase='FRA'):
     """v11 F3/F4: Post-Klassifikator FollowMe-Align.
 
+    Validiert SCHEMA als ersten Schritt. Wenn classification kein dict oder
+    tage_detail kein list[dict] ist → _PipelineSchemaError (fail-fast statt
+    silent .get-Crash wie in Job a6e291f2).
+
     Korrigiert:
     - fahr_tage = N(Touren) + N(Solo-Office/Schulung mit Anfahrt)
       Statt: jeder requires_commute-Tag
@@ -10422,9 +10631,12 @@ def _followme_align_counters(classification, matched_days, year=2025, homebase='
     """
     if not classification:
         return classification
+    # SCHEMA-VALIDIERUNG (fail-fast vor .get-Crashes)
+    _validate_pipeline_shape(classification, 'dict', 'classification')
     tage_detail = classification.get('tage_detail') or []
     if not tage_detail:
         return classification
+    _validate_pipeline_shape(tage_detail, _SCHEMA_TAGE_DETAIL, 'classification.tage_detail')
 
     tours = _followme_identify_tours(tage_detail)
     # Build sorted_td index Map zu Tag-Daten
@@ -10522,18 +10734,46 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
                                                  commute_minutes=commute_minutes)
     if not classification:
         return None
+    # Snapshot vor Align (auch wenn Align crashed, Daten sind sichtbar)
+    _save_pipeline_snapshot(job_id, 'pre_followme_align', {
+        'classification_keys': sorted(list(classification.keys())) if isinstance(classification, dict) else type(classification).__name__,
+        'classification_type': type(classification).__name__,
+        'tage_detail_count': (len(classification.get('tage_detail') or [])
+                              if isinstance(classification, dict) else None),
+        'tage_detail_sample': (classification.get('tage_detail', [])[:3]
+                                if isinstance(classification, dict) else None),
+        'matched_count': len(matched) if isinstance(matched, list) else type(matched).__name__,
+    })
     # v11 F3/F4: FollowMe-Align (Touren-aggregierte Counter).
     # Hinter ENV-Flag bis Tour-Identifikation gegen Tibor-Golden verifiziert ist.
     # Aktivierung: AEROTAX_FOLLOWME_ALIGN=1
-    # Defensive: wenn Align crashed → pre-Align-Werte beibehalten, kein Pipeline-Kill.
+    # v11 P0 Safety: Align-Failure ist NICHT silent. classification bekommt
+    # ein _followme_align_failed Flag — downstream sieht das (PDF-Block, Health).
     if os.environ.get('AEROTAX_FOLLOWME_ALIGN') == '1':
         try:
             classification = _followme_align_counters(classification, matched, year, homebase)
         except Exception as _ae:
             import traceback as _tb
-            print(f"[followme-align] CRASH (ignoriert): {type(_ae).__name__}: {str(_ae)[:300]}")
-            print(f"[followme-align] trace:\n{_tb.format_exc()[:1000]}")
-            # classification bleibt unverändert (pre-Align-Werte aus v7-Klassifikator)
+            print(f"[followme-align] CRASH: {type(_ae).__name__}: {str(_ae)[:300]}")
+            print(f"[followme-align] trace:\n{_tb.format_exc()[:1500]}")
+            _save_pipeline_snapshot(job_id, 'followme_align_crash', {
+                'matched_count': len(matched) if isinstance(matched, list) else None,
+            }, error=_ae)
+            # Mark als failed (statt silent)
+            if isinstance(classification, dict):
+                classification['_followme_align_failed'] = {
+                    'type': type(_ae).__name__,
+                    'message': str(_ae)[:300],
+                }
+                # document_health = red — downstream blockiert PDF
+                dh = classification.setdefault('_document_health', {})
+                if isinstance(dh, dict):
+                    dh['status'] = 'red'
+                    dh.setdefault('issues', []).append({
+                        'source': 'followme_align',
+                        'severity': 'red',
+                        'reason': f'Berechnung konnte nicht vollständig geprüft werden ({type(_ae).__name__})',
+                    })
     classification['_v11_cas_used'] = True
     classification['_cas_conflicts'] = cas_result.get('conflicts', [])
     classification['_cas_warnings'] = cas_result.get('warnings', [])
