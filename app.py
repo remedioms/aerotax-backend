@@ -2272,6 +2272,12 @@ AEROTAX_ERROR_CODES = {
         'retryable':    False,
         'support':      True,
     },
+    'CLASSIFICATION_SCHEMA_FAILED': {
+        'user_title':   'Berechnung konnte nicht vollständig geprüft werden',
+        'user_message': 'Die Klassifikation der Tage hat eine Strukturprüfung nicht bestanden. Damit kein falscher Betrag entsteht, wurde die Auswertung gestoppt. Bitte kontaktiere den Support.',
+        'retryable':    False,
+        'support':      True,
+    },
     'DOCUMENT_HEALTH_RED': {
         'user_title':   'Auswertung enthält ungelöste Probleme',
         'user_message': 'Wir haben in deinen Dokumenten Punkte gefunden, die wir nicht eindeutig zuordnen können. Bitte kontaktiere den Support oder lade ggf. eine Datei neu hoch.',
@@ -2382,6 +2388,13 @@ def _classify_failure_reason(job):
         return 'CALCULATION_INVARIANT_FAILED'
     if 'pdf' in error_low and 'render' in error_low:
         return 'PDF_RENDER_FAILED'
+    # v13 Bug-Hunt: tuple/list/None mit .get() → Klassifikations-Schema-Bug.
+    # Kein Retry möglich, weil deterministische Pipeline-Daten falsch typisiert sind.
+    # User soll Support kontaktieren — wiederholtes Auswerten würde gleich crashen.
+    if ('attributeerror' in error_low and
+        ('tuple' in error_low or 'list' in error_low or 'nonetype' in error_low) and
+        'get' in error_low):
+        return 'CLASSIFICATION_SCHEMA_FAILED'
     if 'payment' in error_low:
         return 'PAYMENT_VERIFY_FAILED'
     if 'rate' in error_low and 'limit' in error_low:
@@ -11984,7 +11997,7 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
 
     # v13 Bug-Hunt-Snapshot: matched-Liste VOR classify_v7 sichern.
     # Wenn classify_v7 crash (z.B. tuple-bug), haben wir die Input-Daten für Offline-Debug.
-    # Sample der ersten 5 + letzten 3 Einträge — keine binaries, keine PDFs.
+    # Sample erste 5 + letzte 3 + alle non-dict Einträge mit Index.
     try:
         _matched_sample = []
         for _idx in (list(range(min(5, len(matched)))) +
@@ -11999,15 +12012,26 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
                           else (f'tuple-len-{len(_m)}' if isinstance(_m, tuple)
                                 else str(_m)[:80])),
             })
-        # Type-Distribution
+        # Type-Distribution + alle non-dict Indices (genau das was wir suchen)
         _type_dist = {}
-        for _m in matched:
+        _non_dict_indices = []
+        for _i, _m in enumerate(matched):
             _t = type(_m).__name__
             _type_dist[_t] = _type_dist.get(_t, 0) + 1
+            if not isinstance(_m, dict):
+                _non_dict_indices.append({
+                    'idx': _i,
+                    'type': _t,
+                    'value_preview': (str(_m)[:200] if not isinstance(_m, (list, tuple, dict))
+                                       else (f'len={len(_m)}, first={str(_m[:2])[:120]}'
+                                             if hasattr(_m, '__getitem__') else str(_m)[:120])),
+                })
         _save_pipeline_snapshot(job_id, 'pre_classify_v7', {
             'matched_count': len(matched),
             'matched_type_distribution': _type_dist,
             'matched_sample': _matched_sample,
+            'non_dict_indices': _non_dict_indices,  # <— wenn nicht-leer: HIER ist der Bug
+            'non_dict_count': len(_non_dict_indices),
         })
     except Exception as _snap_e:
         print(f"[v11-cas-pipeline] snapshot pre_classify_v7 fail: {_snap_e}")
@@ -15133,6 +15157,18 @@ def hybrid_analyze(form, files, job_id=None):
                 'error_type': type(e).__name__,
                 'error_message': str(e)[:500],
             }, error=e)
+            # v13 Hard-Routing: Schema/Type-Crashes (tuple/list/None mit .get()) sind
+            # KEINE retryable Fehler. Retry würde dieselben Daten in dieselbe Logik
+            # füttern und exakt gleich crashen. → failed_support, kein Retry.
+            _err_low = (str(e).lower() + ' ' + type(e).__name__.lower())
+            _is_schema_crash = (
+                'attributeerror' in _err_low and
+                ('tuple' in _err_low or 'list' in _err_low or 'nonetype' in _err_low) and
+                'get' in _err_low
+            ) or ('pipelineschemaerror' in _err_low)
+            if _is_schema_crash:
+                _set_job_failed(job_id, 'CLASSIFICATION_SCHEMA_FAILED',
+                                 f'Pipeline schema crash in v11-cas: {type(e).__name__}: {str(e)[:200]}')
             classification = None
 
     elif dp_bytes:

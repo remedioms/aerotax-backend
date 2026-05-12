@@ -10865,7 +10865,8 @@ def test_v11p4_classification_includes_cas_metadata():
     """Classification-Dict enthält _v11_cas_used + _cas_conflicts."""
     src = _read_backend()
     fn_idx = src.find('def _classify_v11_cas_pipeline')
-    block = src[fn_idx:fn_idx + 6500]
+    # v13 Speed-1 + Bug-Hunt: function body ist gewachsen — größere window
+    block = src[fn_idx:fn_idx + 12000]
     assert '_v11_cas_used' in block
     assert '_cas_conflicts' in block
     assert '_cas_warnings' in block

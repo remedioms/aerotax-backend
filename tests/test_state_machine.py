@@ -567,6 +567,80 @@ def test_invariant_pdf_never_allowed_on_red_health():
     assert state['pdf_allowed'] is False
 
 
+# ─── v13 Bug-Hunt: CLASSIFICATION_SCHEMA_FAILED ───────────────────────────────
+
+def test_classification_schema_failed_error_code_exists():
+    """Neuer Error-Code CLASSIFICATION_SCHEMA_FAILED ist als support-Variante registriert."""
+    _app = _load_app_fresh()
+    assert 'CLASSIFICATION_SCHEMA_FAILED' in _app.AEROTAX_ERROR_CODES
+    ec = _app.AEROTAX_ERROR_CODES['CLASSIFICATION_SCHEMA_FAILED']
+    assert ec['retryable'] is False
+    assert ec['support'] is True
+
+
+def test_tuple_attributeerror_classified_as_schema_failed():
+    """error-string 'AttributeError tuple object has no attribute get' →
+    CLASSIFICATION_SCHEMA_FAILED (failed_support, kein Retry)."""
+    _app = _load_app_fresh()
+    job = {
+        'status': 'failed',
+        'error': "AttributeError: 'tuple' object has no attribute 'get'",
+    }
+    reason = _app._classify_failure_reason(job)
+    assert reason == 'CLASSIFICATION_SCHEMA_FAILED'
+
+    state = _app._classify_job_state(job)
+    assert state['canonical_state'] == 'failed_support'
+    assert state['reason_code'] == 'CLASSIFICATION_SCHEMA_FAILED'
+    assert state['retry_allowed'] is False
+    assert state['support_recommended'] is True
+    assert state['pdf_allowed'] is False
+
+
+def test_list_attributeerror_classified_as_schema_failed():
+    """error-string mit 'list' statt 'tuple' → ebenfalls CLASSIFICATION_SCHEMA_FAILED."""
+    _app = _load_app_fresh()
+    job = {
+        'status': 'failed',
+        'error': "AttributeError: 'list' object has no attribute 'get'",
+    }
+    assert _app._classify_failure_reason(job) == 'CLASSIFICATION_SCHEMA_FAILED'
+
+
+def test_nonetype_attributeerror_classified_as_schema_failed():
+    """error-string mit 'NoneType' → ebenfalls CLASSIFICATION_SCHEMA_FAILED."""
+    _app = _load_app_fresh()
+    job = {
+        'status': 'failed',
+        'error': "AttributeError: 'NoneType' object has no attribute 'get'",
+    }
+    assert _app._classify_failure_reason(job) == 'CLASSIFICATION_SCHEMA_FAILED'
+
+
+def test_v11_cas_pipeline_sets_explicit_reason_code_on_schema_crash():
+    """hybrid_analyze cas-pipeline-except-Block ruft _set_job_failed mit
+    'CLASSIFICATION_SCHEMA_FAILED' bei tuple/list/None-AttributeError.
+    Liegt nicht in _classify_v11_cas_pipeline selbst, sondern in der Caller-Stelle."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    # Marker für den catch-block ist [v11-cas-pipeline] TRACEBACK
+    idx = src.find("[v11-cas-pipeline] TRACEBACK")
+    assert idx > 0
+    block = src[idx:idx + 3000]
+    assert "_set_job_failed(job_id, 'CLASSIFICATION_SCHEMA_FAILED'" in block
+    assert '_is_schema_crash' in block
+    assert "'attributeerror'" in block.lower()
+
+
+def test_pre_classify_v7_snapshot_captures_non_dict_indices():
+    """Snapshot pre_classify_v7 enthält non_dict_indices (die wir suchen)."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    fn_idx = src.find("'pre_classify_v7'")
+    assert fn_idx > 0
+    block = src[fn_idx:fn_idx + 1500]
+    assert 'non_dict_indices' in block
+    assert 'non_dict_count' in block
+
+
 def test_invariant_no_raw_errors_in_user_messages():
     _app = _load_app_fresh()
     for code, ec in _app.AEROTAX_ERROR_CODES.items():
