@@ -735,6 +735,285 @@ def test_cas_merge_default_off():
     assert "Variante A default OFF" in src or "default OFF" in src
 
 
+# ─── v13 Phase 2B: CAS Output Slim ────────────────────────────────────────────
+
+def test_cas_slim_schema_no_duration_minutes():
+    """v13 Phase 2B: duration_minutes ist NICHT mehr im Sonnet-Schema
+    (wird deterministisch aus start/end in _validate_cas_day berechnet)."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 5000]
+    # Im Tool-Schema KEIN duration_minutes mehr
+    schema_block = block[block.find("cas_tool = {"):block.find("'warnings':")]
+    assert "'duration_minutes'" not in schema_block, \
+        'duration_minutes muss aus Schema raus (kosten Tokens)'
+
+
+def test_cas_slim_schema_no_month_covered():
+    """month_covered nicht mehr im Schema — aus dates ableitbar."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 5000]
+    schema_block = block[block.find("cas_tool = {"):block.find("LIEFERE via Tool")]
+    assert "'month_covered'" not in schema_block
+
+
+def test_cas_slim_schema_flights_as_strings():
+    """flights[] sind jetzt Strings (Flugnummer), nicht mehr Objects."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 5000]
+    schema_block = block[block.find("'flights':"):block.find("'overnight_after_day':", block.find("'flights':"))]
+    # 'items': {'type': 'string'} — keine nested object mehr
+    assert "'type': 'string'" in schema_block
+    # Keine start_time/end_time mehr pro Flight
+    assert "'flight_no'" not in schema_block or "'from_iata'" not in schema_block, \
+        'Flight-Objects mit flight_no/from_iata/etc raus — nur strings'
+
+
+def test_cas_slim_raw_excerpt_conditional():
+    """raw_excerpt nur bei confidence!=high oder unklarem Marker — slim prompt sagt das."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 8000]
+    # Prompt enthält die Regel
+    assert 'LASSE LEER bei confidence' in block or "leer bei confidence='high'" in block.lower()
+    assert 'max 120 Zeichen' in block or 'max 120 chars' in block.lower()
+
+
+def test_cas_slim_prompt_no_notes_no_explanations():
+    """Slim-Prompt verbietet explizit Notes/Erklärungen/Kommentare."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 8000]
+    # KEINE Notes, KEINE Erklärungen, KEINE Kommentare
+    assert 'KEINE Notes' in block
+    assert 'KEINE Erklärungen' in block or 'KEINE Kommentare' in block
+
+
+def test_cas_slim_prompt_preserves_marker_codes():
+    """Marker X / OFF / == / ORTSTAG / RES bleiben explizit im Prompt erwähnt."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 8000]
+    for code in ('OFF', 'X', '==', 'ORTSTAG', 'RES'):
+        assert code in block, f'Marker {code!r} muss im Prompt erwähnt sein'
+
+
+def test_cas_slim_prompt_forbids_tax_calculations():
+    """Prompt sagt explizit: KEINE Steuerbewertung, kein Z72/Z73/Z76, kein VMA."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    fn_idx = src.find('def _sonnet_read_cas_single_pdf')
+    block = src[fn_idx:fn_idx + 8000]
+    assert 'KEINE Steuerbewertung' in block
+    assert 'KEINE Z72' in block or 'KEINE Beträge' in block
+    assert 'VMA' in block  # erwähnt was nicht zu tun ist
+
+
+def test_validate_cas_day_computes_duration_from_times():
+    """_validate_cas_day berechnet duration_minutes aus start/end (deterministisch),
+    weil Sonnet das Feld nicht mehr liefert."""
+    _app = _load_app_fresh()
+    day = {
+        'date': '2025-04-01',
+        'activity_type': 'flight',
+        'start_time': '08:30',
+        'end_time': '14:15',
+        'flights': ['LH600'],
+        'confidence': 'high',
+    }
+    ok, normalized, _w = _app._validate_cas_day(day)
+    assert ok is True
+    # 14:15 - 08:30 = 5h 45m = 345 min
+    assert normalized['duration_minutes'] == 345
+
+
+def test_validate_cas_day_accepts_flight_strings():
+    """flights als list of strings (slim schema) → normalisiert auf [{flight_no}]."""
+    _app = _load_app_fresh()
+    day = {
+        'date': '2025-04-01',
+        'activity_type': 'flight',
+        'start_time': '08:00',
+        'end_time': '14:00',
+        'flights': ['LH600', 'LH601'],
+        'confidence': 'high',
+    }
+    ok, normalized, _w = _app._validate_cas_day(day)
+    assert ok is True
+    assert len(normalized['flights']) == 2
+    assert normalized['flights'][0] == {'flight_no': 'LH600'}
+    assert normalized['flights'][1] == {'flight_no': 'LH601'}
+
+
+def test_validate_cas_day_still_accepts_old_flight_objects():
+    """Backward compat: alte flights als list of dicts mit flight_no/from/to."""
+    _app = _load_app_fresh()
+    day = {
+        'date': '2025-04-01',
+        'activity_type': 'flight',
+        'start_time': '08:00',
+        'end_time': '14:00',
+        'flights': [{'flight_no': 'LH600', 'from_iata': 'FRA', 'to_iata': 'JFK',
+                     'start_time': '08:00', 'end_time': '14:00'}],
+        'confidence': 'high',
+    }
+    ok, normalized, _w = _app._validate_cas_day(day)
+    assert ok is True
+    assert normalized['flights'][0]['flight_no'] == 'LH600'
+
+
+def test_validate_cas_day_caps_raw_excerpt_120():
+    """raw_excerpt max 120 chars — auch wenn Sonnet mehr liefert."""
+    _app = _load_app_fresh()
+    long_text = 'X' * 500
+    day = {
+        'date': '2025-04-01',
+        'activity_type': 'free',
+        'marker': 'OFF',
+        'confidence': 'high',
+        'raw_excerpt': long_text,
+    }
+    ok, normalized, _w = _app._validate_cas_day(day)
+    assert ok is True
+    assert len(normalized['raw_excerpt']) == 120
+
+
+# ─── v13 Phase 2C: Granulare Phase-Übergangs-Snapshots ────────────────────────
+
+def test_snapshot_after_lsb_exists():
+    """after_lsb Snapshot wird nach Reader-Stage gespeichert."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    assert "_save_pipeline_snapshot(job_id, 'after_lsb'" in src
+
+
+def test_snapshot_after_se_exists():
+    """after_se Snapshot mit se_lines_count + z77_summary."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    assert "_save_pipeline_snapshot(job_id, 'after_se'" in src
+    after_se_idx = src.find("_save_pipeline_snapshot(job_id, 'after_se'")
+    block = src[after_se_idx:after_se_idx + 600]
+    assert 'se_lines_count' in block
+    assert 'z77' in block.lower()
+
+
+def test_snapshot_after_each_cas_file_exists():
+    """Pro CAS-Datei ein Snapshot mit non_dict_indices + type_distribution."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    assert "after_cas_file_" in src
+    # Pro-File-Snapshot enthält wichtige Felder
+    snap_idx = src.find("f'after_cas_file_")
+    block = src[snap_idx:snap_idx + 1500]
+    assert 'days_count' in block
+    assert 'type_distribution' in block
+    assert 'non_dict_indices' in block
+
+
+def test_snapshot_cas_file_failed_separate():
+    """Bei CAS-File-Fail wird separater Snapshot 'cas_file_NN_FAILED' gespeichert."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    assert "_FAILED" in src
+    assert "cas_file_" in src
+
+
+def test_snapshot_after_cas_merge_exists():
+    """after_cas_merge Snapshot mit type_distribution + non_dict_indices."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    assert "_save_pipeline_snapshot(job_id, 'after_cas_merge'" in src
+    idx = src.find("_save_pipeline_snapshot(job_id, 'after_cas_merge'")
+    block = src[idx:idx + 1000]
+    assert 'merged_days_count' in block
+    assert 'non_dict_indices' in block
+
+
+def test_snapshot_after_match_cas_se_exists():
+    """after_match_cas_se Snapshot mit matched_count + type_distribution."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    assert "_save_pipeline_snapshot(job_id, 'after_match_cas_se'" in src
+    idx = src.find("_save_pipeline_snapshot(job_id, 'after_match_cas_se'")
+    block = src[idx:idx + 1000]
+    assert 'matched_count' in block
+    assert 'non_dict_indices' in block
+
+
+def test_snapshot_post_classify_v7_exists():
+    """post_classify_v7 Snapshot mit Counter-Übersicht."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    assert "_save_pipeline_snapshot(job_id, 'post_classify_v7'" in src
+    idx = src.find("_save_pipeline_snapshot(job_id, 'post_classify_v7'")
+    block = src[idx:idx + 1500]
+    for field in ('tage_detail_count', 'arbeitstage', 'fahr_tage', 'hotel_naechte',
+                   'z72_tage', 'z73_tage', 'z74_tage', 'z76_eur'):
+        assert field in block, f'post_classify_v7 snapshot fehlt Feld {field}'
+
+
+def test_snapshot_followme_align_success_exists():
+    """followme_align_success Snapshot nach erfolgreichem Align."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    assert "_save_pipeline_snapshot(job_id, 'followme_align_success'" in src
+
+
+def test_snapshot_no_pdf_bytes_in_output():
+    """_snapshot_strip_binaries filtert pdf_bytes / base64 / raw_pdf raus."""
+    _app = _load_app_fresh()
+    payload = {
+        'normal_field': 'ok',
+        'pdf_bytes': b'%PDF-1.4 fake binary content',
+        'raw_pdf': b'binary',
+        'base64': 'SGVsbG8gV29ybGQ=' * 1000,
+    }
+    stripped = _app._snapshot_strip_binaries(payload)
+    assert stripped['normal_field'] == 'ok'
+    assert stripped['pdf_bytes'] == '<stripped>'
+    assert stripped['raw_pdf'] == '<stripped>'
+    assert stripped['base64'] == '<stripped>'
+
+
+def test_snapshot_caps_large_lists():
+    """_snapshot_strip_binaries cap lists auf 500 Einträge."""
+    _app = _load_app_fresh()
+    big_list = list(range(5000))
+    stripped = _app._snapshot_strip_binaries({'big': big_list})
+    assert len(stripped['big']) == 500
+
+
+def test_snapshot_disabled_when_env_off():
+    """Wenn AEROTAX_CAPTURE_SNAPSHOTS=0: _save_pipeline_snapshot ist no-op."""
+    import os as _os
+    _os.environ['AEROTAX_CAPTURE_SNAPSHOTS'] = '0'
+    _app = _load_app_fresh()
+    # AEROTAX_CAPTURE_SNAPSHOTS Module-level boolean
+    assert _app.AEROTAX_CAPTURE_SNAPSHOTS is False
+    # Aufruf ist no-op (Job-Dict bleibt leer)
+    with _app._jobs_lock:
+        _app._jobs['snap-disabled'] = {}
+    _app._save_pipeline_snapshot('snap-disabled', 'test_stage', {'x': 1})
+    with _app._jobs_lock:
+        snaps = _app._jobs['snap-disabled'].get('debug_snapshots', [])
+    assert len(snaps) == 0
+
+
+def test_snapshot_active_when_env_on():
+    """Wenn AEROTAX_CAPTURE_SNAPSHOTS=1: snapshot wird gespeichert."""
+    import os as _os
+    _os.environ['AEROTAX_CAPTURE_SNAPSHOTS'] = '1'
+    _app = _load_app_fresh()
+    try:
+        assert _app.AEROTAX_CAPTURE_SNAPSHOTS is True
+        # Stub disk save damit Test nicht auf Filesystem schreibt
+        _app._save_job_to_disk = lambda jid: None
+        with _app._jobs_lock:
+            _app._jobs['snap-on'] = {}
+        _app._save_pipeline_snapshot('snap-on', 'test_stage', {'x': 42})
+        with _app._jobs_lock:
+            snaps = _app._jobs['snap-on'].get('debug_snapshots', [])
+        assert len(snaps) == 1
+        assert snaps[0]['stage'] == 'test_stage'
+        assert snaps[0]['data']['x'] == 42
+    finally:
+        _os.environ['AEROTAX_CAPTURE_SNAPSHOTS'] = '0'
+
+
 def test_invariant_no_raw_errors_in_user_messages():
     _app = _load_app_fresh()
     for code, ec in _app.AEROTAX_ERROR_CODES.items():

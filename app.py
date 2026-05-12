@@ -9310,15 +9310,48 @@ def _validate_cas_day(day):
     if not _re.match(r'^\d{4}-\d{2}-\d{2}$', date):
         return False, None, f'invalid_date:{date}'
 
+    # v13 Phase 2B: flights[] kann jetzt entweder list of strings (neues slim
+    # schema) ODER list of dicts (alt mit flight_no/from/to) sein. Normalisiere
+    # auf strings damit downstream einheitlich ist.
+    flights_raw = day.get('flights') if isinstance(day.get('flights'), list) else []
+    flights_norm = []
+    for f in flights_raw:
+        if isinstance(f, str) and f.strip():
+            flights_norm.append({'flight_no': f.strip()[:12]})
+        elif isinstance(f, dict):
+            fno = (f.get('flight_no') or '').strip()[:12]
+            if fno:
+                flights_norm.append({
+                    'flight_no': fno,
+                    'from_iata': (f.get('from_iata') or '').strip()[:5],
+                    'to_iata':   (f.get('to_iata')   or '').strip()[:5],
+                })
+
+    # v13 Phase 2B: duration_minutes deterministisch aus start/end berechnen
+    # (Sonnet liefert es nicht mehr — slim schema). Bei Tour über Mitternacht
+    # kann das negativ werden — dann 0 (Backend handlet Mehrtages-Touren).
+    start_s = str(day.get('start_time') or '')[:6]
+    end_s   = str(day.get('end_time')   or '')[:6]
+    duration = 0
+    try:
+        if start_s and end_s and ':' in start_s and ':' in end_s:
+            sh, sm = start_s.split(':', 1)
+            eh, em = end_s.split(':', 1)
+            duration = (int(eh) * 60 + int(em)) - (int(sh) * 60 + int(sm))
+            if duration < 0:
+                duration = 0  # über Mitternacht — Backend handlet das
+    except Exception:
+        duration = 0
+
     out = {
         'date': date,
         'activity_type': activity_type,
         'marker': str(day.get('marker') or '')[:60],
-        'start_time': str(day.get('start_time') or '')[:6],
-        'end_time': str(day.get('end_time') or '')[:6],
-        'duration_minutes': int(day.get('duration_minutes') or 0) if str(day.get('duration_minutes', '')).strip() else 0,
+        'start_time': start_s,
+        'end_time': end_s,
+        'duration_minutes': duration,
         'location': str(day.get('location') or '')[:10],
-        'flights': day.get('flights') if isinstance(day.get('flights'), list) else [],
+        'flights': flights_norm,
         'overnight_after_day': bool(day.get('overnight_after_day')),
         'layover_ort': str(day.get('layover_ort') or '')[:10],
         'confidence': (day.get('confidence') or 'medium').lower(),
@@ -9404,17 +9437,23 @@ def _sonnet_read_cas_single_pdf(pdf_bytes, year, homebase, source_filename='cas.
     else:
         print(f"[CAS-Reader] {source_filename[:40]}: vision-fallback ({text_reason})")
 
+    # v13 Phase 2B Slim: minimales Schema. Entfernt:
+    #   - duration_minutes (Python kann es aus start/end berechnen)
+    #   - flights[].start_time/end_time (Day-level start/end reicht)
+    #   - month_covered (aus dates ableitbar)
+    #   - flights[] generell aus dem schema raus (nur flight_no als String)
+    # Sonnet liefert pro Tag ~50-80 Tokens statt 150-250. Ziel: 1500-3000
+    # Output-Tokens pro CAS-Monat (vorher 4600-7400).
     cas_tool = {
         'name': 'submit_cas_days',
-        'description': 'Liefere strukturierte Tagesdaten aus dem CAS/Dienstplan/Roster.',
+        'description': 'Strukturierte Tagesdaten aus CAS/Dienstplan/Roster — minimal.',
         'input_schema': {
             'type': 'object',
             'required': ['days'],
             'properties': {
                 'days': {
                     'type': 'array',
-                    'description': f'Pro Kalendertag im Plan ein Eintrag (auch frei/OFF). '
-                                   f'Jahr {year}, Homebase {homebase}.',
+                    'description': f'Ein Eintrag pro Kalendertag (auch frei/OFF). Jahr {year}, Homebase {homebase}.',
                     'items': {
                         'type': 'object',
                         'required': ['date', 'activity_type'],
@@ -9423,79 +9462,60 @@ def _sonnet_read_cas_single_pdf(pdf_bytes, year, homebase, source_filename='cas.
                             'activity_type': {
                                 'type': 'string',
                                 'enum': list(_CAS_ACTIVITY_TYPES),
-                                'description': 'Aktivitäts-Typ. flight=LH-Flugnummer, '
-                                                'training=EH/EMCRM/SECCRM/TK/D4/EM, '
-                                                'office=ORTSTAG/FRS/LMN, simulator=SIM, '
-                                                'standby=RES_SB/RES/SBY, vacation=U/U1/U2, '
-                                                'sick=K, free=OFF/X, unknown=alles andere.',
                             },
-                            'marker': {'type': 'string', 'description': 'Roh-Code wie er im CAS steht (z.B. „EH 4", „LH600", „U1", „RES_SB").'},
-                            'start_time': {'type': 'string', 'description': 'HH:MM (24h) — Briefing/Aktivitäts-Start. Leer bei frei/Urlaub.'},
-                            'end_time': {'type': 'string', 'description': 'HH:MM — letzte Flug-Landung oder Aktivitäts-Ende. Bei Tour über Mitternacht: bis 23:59 dieses Tags.'},
-                            'duration_minutes': {'type': 'integer', 'description': 'Differenz end_time - start_time in Minuten.'},
-                            'location': {'type': 'string', 'description': 'Briefing-Location IATA (meist FRA) oder Layover-Ort.'},
+                            'marker': {'type': 'string', 'description': 'Roh-Code (z.B. EH4, LH600, U1, RES_SB, OFF, X, ==).'},
+                            'start_time': {'type': 'string', 'description': 'HH:MM, leer bei frei/Urlaub.'},
+                            'end_time': {'type': 'string', 'description': 'HH:MM, leer bei frei/Urlaub.'},
+                            'location': {'type': 'string', 'description': f'IATA, meist {homebase}.'},
                             'flights': {
                                 'type': 'array',
-                                'description': 'Nur bei activity_type=flight. Liste der Flüge.',
-                                'items': {
-                                    'type': 'object',
-                                    'properties': {
-                                        'flight_no': {'type': 'string', 'description': 'z.B. „LH600"'},
-                                        'from_iata': {'type': 'string', 'description': '3-Letter IATA'},
-                                        'to_iata': {'type': 'string', 'description': '3-Letter IATA'},
-                                        'start_time': {'type': 'string', 'description': 'HH:MM'},
-                                        'end_time': {'type': 'string', 'description': 'HH:MM'},
-                                    },
-                                },
+                                'description': 'Nur activity_type=flight. Liste Flugnummern als Strings.',
+                                'items': {'type': 'string'},
                             },
-                            'overnight_after_day': {'type': 'boolean', 'description': 'Wahr wenn Tag in remote Location endet (Layover-Übernachtung).'},
-                            'layover_ort': {'type': 'string', 'description': 'IATA-Code falls remote, leer wenn FRA-Heimkehr.'},
+                            'overnight_after_day': {'type': 'boolean'},
+                            'layover_ort': {'type': 'string', 'description': f'IATA wenn remote, leer wenn {homebase}.'},
                             'confidence': {
                                 'type': 'string',
                                 'enum': ['high', 'medium', 'low'],
-                                'description': 'high=klar lesbar, medium=teils unklar, low=sehr unsicher.',
                             },
-                            'raw_excerpt': {'type': 'string', 'description': 'Kurzer Roh-Auszug aus CAS (max 80 Zeichen).'},
+                            'raw_excerpt': {
+                                'type': 'string',
+                                'description': 'NUR bei confidence!=high oder unklarem Marker. Max 120 Zeichen. Sonst leer.',
+                            },
                         },
                     },
                 },
                 'warnings': {
                     'type': 'array',
                     'items': {'type': 'string'},
-                    'description': 'Lese-Warnungen (z.B. „Plan unvollständig für Sept 20").',
+                    'description': 'NUR echte Lese-Lücken (z.B. fehlende Tage). Keine Erklärungen, keine Kommentare.',
                 },
-                'month_covered': {'type': 'string', 'description': 'Haupt-Monat dieses Plans YYYY-MM (z.B. „2025-03").'},
             },
         },
     }
 
-    # v11 Slim-Prompt (Commit 2): kürzer = schnellere Sonnet-Response.
-    # Behält alle kritischen Regeln (kein Tax-Bewertung, exakte Marker, kein
-    # Raten). Detail-Mappings raus — Sonnet weiß die Lufthansa-Marker schon.
-    prompt = f"""Du liest einen Lufthansa CAS/Dienstplan/Roster für {year} (Homebase {homebase}).
+    # v13 Slim-Prompt: minimal, klare Output-Disziplin
+    prompt = f"""Lies Lufthansa CAS/Dienstplan/Roster für {year} (Homebase {homebase}).
 
-Pro Kalendertag im Plan ein Eintrag (auch frei/OFF/Urlaub). Felder:
-- date: YYYY-MM-DD ({year})
-- activity_type: flight|training|simulator|office|standby|vacation|sick|free|unknown
-  Mapping: LH/FL→flight; EH/EM/EMCRM/SECCRM/TK/D4→training; SIM→simulator;
-  ORTSTAG/FRS/LMN_AS/LMN_CR→office; RES/RES_SB/SBY→standby; U/U1/U2/URLAUB→vacation;
-  K/KRANK→sick; OFF/X/FREI/==→free; sonst→unknown
-- marker: Roh-Code wie im CAS (NICHT interpretieren)
-- start_time / end_time: HH:MM (leer bei frei/Urlaub)
-- duration_minutes: end - start
-- location: Briefing-IATA (meist {homebase})
-- flights[]: nur bei activity_type='flight'
-- overnight_after_day: True wenn Tag endet in remote location
-- layover_ort: IATA wenn remote, leer wenn {homebase}
-- confidence: high|medium|low
-- raw_excerpt: max 80 chars
+Pro Kalendertag GENAU EIN Eintrag (auch frei/OFF/Urlaub). Mapping:
+LH/FL → flight | EH/EM/EMCRM/SECCRM/TK/D4 → training | SIM → simulator
+ORTSTAG/FRS/LMN_AS/LMN_CR → office | RES/RES_SB/SBY → standby
+U/U1/U2/URLAUB → vacation | K/KRANK → sick | OFF/X/FREI/== → free | sonst → unknown
 
-REGELN:
-- KEINE Steuerbewertung, KEINE Beträge, KEINE Z72/Z73-Klassifizierung.
-- Marker EXAKT wiedergeben (X/OFF/== nicht interpretieren — Backend macht Tour-Logik).
+marker: Roh-Code WIE IM CAS (NICHT interpretieren — Backend macht Tour-Logik).
+flights[]: nur Flugnummern als String (z.B. ["LH600","LH601"]), nur bei activity_type=flight.
+
+RAW_EXCERPT-Regel (strikt):
+- LASSE LEER bei confidence='high' und klarem Standard-Marker (OFF, X, ==, LH123, U1, etc.).
+- NUR bei confidence='medium'/'low' ODER unklarem Marker: max 120 Zeichen.
+- Niemals ganze Tabellenzeilen oder Erklärungen.
+
+REGELN (Hard):
+- KEINE Steuerbewertung. KEINE Beträge. KEINE Z72/Z73/Z76. KEINE VMA.
+- KEINE Notes über Tage, KEINE Erklärungen, KEINE Kommentare zur Berechnung.
+- warnings[] NUR bei echten Lese-Lücken (fehlender Tag, unklarer Plan).
 - Bei unklar: activity_type='unknown' + confidence='low'. NICHT raten.
-- Konflikte/Lücken in warnings[] notieren.
-- raw_excerpt MAX 80 Zeichen.
+- KEIN month_covered, KEINE Begründungen.
 
 LIEFERE via Tool 'submit_cas_days'."""
 
@@ -9978,6 +9998,30 @@ def _sonnet_read_cas_structured(cas_bytes, year=2025, homebase='FRA', job_id=Non
                             'days': cas_days, 'warnings': cas_warnings,
                             'source_filename': fname,
                         })
+                # v13 Phase 2C: Snapshot pro CAS-Datei (granular, kein 12-Monate-Verlust bei Fail)
+                try:
+                    _type_dist = {}
+                    _non_dict = []
+                    for _i, _d in enumerate(cas_days):
+                        _t = type(_d).__name__
+                        _type_dist[_t] = _type_dist.get(_t, 0) + 1
+                        if not isinstance(_d, dict):
+                            _non_dict.append({'idx': _i, 'type': _t})
+                    _save_pipeline_snapshot(job_id, f'after_cas_file_{idx+1:02d}', {
+                        'filename': fname[:60],
+                        'file_hash': file_hash,
+                        'days_count': len(cas_days),
+                        'warnings_count': len(cas_warnings),
+                        'type_distribution': _type_dist,
+                        'non_dict_indices': _non_dict[:20],
+                        'sample_first_3': [
+                            {'date': d.get('date'), 'activity_type': d.get('activity_type'),
+                             'marker': (d.get('marker') or '')[:20]}
+                            for d in cas_days[:3] if isinstance(d, dict)
+                        ],
+                    })
+                except Exception as _snap_e:
+                    print(f"[CAS-Reader] snapshot after_cas_file_{idx+1} fail: {_snap_e}")
                 return {'idx': idx, 'fname': fname, 'file_hash': file_hash,
                         'cas_days': cas_days, 'cas_warnings': cas_warnings,
                         'cache_hit': False, 'error': None}
@@ -9993,6 +10037,16 @@ def _sonnet_read_cas_structured(cas_bytes, year=2025, homebase='FRA', job_id=Non
                     _t.sleep(backoff)
                     continue
                 break
+        # v13 Phase 2C: Snapshot bei CAS-File-Fail (per-file Forensik)
+        try:
+            _save_pipeline_snapshot(job_id, f'cas_file_{idx+1:02d}_FAILED', {
+                'filename': fname[:60],
+                'file_hash': file_hash if file_hash else '',
+                'error_type': type(last_err).__name__ if last_err else 'unknown',
+                'error_message': str(last_err)[:300] if last_err else '',
+            }, error=last_err)
+        except Exception:
+            pass
         return {'idx': idx, 'fname': fname, 'file_hash': file_hash,
                 'cas_days': [], 'cas_warnings': [], 'cache_hit': False,
                 'error': f'CAS-Datei {fname[:40]}: Exception {type(last_err).__name__ if last_err else "?"}'}
@@ -10081,6 +10135,28 @@ def _sonnet_read_cas_structured(cas_bytes, year=2025, homebase='FRA', job_id=Non
     _heartbeat_phase(job_id, 'cas_merge_complete',
                      {'days': len(merged_days), 'conflicts': len(conflicts), 'cache_hits': cache_hits,
                       'label': 'Dienstplan zusammengeführt…'})
+
+    # v13 Phase 2C: Snapshot nach CAS-Merge (Gesamt-Sicht über alle Files)
+    try:
+        _type_dist_all = {}
+        _non_dict_all = []
+        for _i, _d in enumerate(merged_days):
+            _t = type(_d).__name__
+            _type_dist_all[_t] = _type_dist_all.get(_t, 0) + 1
+            if not isinstance(_d, dict):
+                _non_dict_all.append({'idx': _i, 'type': _t})
+        _save_pipeline_snapshot(job_id, 'after_cas_merge', {
+            'files_total': len(cas_list),
+            'files_processed': files_processed,
+            'cache_hits': cache_hits,
+            'merged_days_count': len(merged_days),
+            'conflicts_count': len(conflicts),
+            'warnings_count': len(all_warnings),
+            'type_distribution': _type_dist_all,
+            'non_dict_indices': _non_dict_all[:20],
+        })
+    except Exception as _snap_e:
+        print(f"[CAS-Reader] snapshot after_cas_merge fail: {_snap_e}")
 
     if not merged_days:
         return None
@@ -12002,6 +12078,23 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
         return None
     print(f"[v11-cas-pipeline] Matched {len(matched)} Tage CAS+SE")
 
+    # v13 Phase 2C: Snapshot nach Match (Tag-Liste mit dp+se per Datum)
+    try:
+        _match_type_dist = {}
+        _match_non_dict = []
+        for _i, _m in enumerate(matched):
+            _t = type(_m).__name__
+            _match_type_dist[_t] = _match_type_dist.get(_t, 0) + 1
+            if not isinstance(_m, dict):
+                _match_non_dict.append({'idx': _i, 'type': _t})
+        _save_pipeline_snapshot(job_id, 'after_match_cas_se', {
+            'matched_count': len(matched),
+            'type_distribution': _match_type_dist,
+            'non_dict_indices': _match_non_dict[:20],
+        })
+    except Exception as _snap_e:
+        print(f"[v11-cas-pipeline] snapshot after_match_cas_se fail: {_snap_e}")
+
     # v13 Phase 2D: Schema-Validator VOR classify_v7.
     # Wenn matched eine non-dict-Element enthält (tuple/list/None/str), fangen
     # wir das HIER mit klarem path-Tracking statt im classify-Loop mit
@@ -12066,6 +12159,22 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
                                                  commute_minutes=commute_minutes)
     if not classification:
         return None
+    # v13 Phase 2C: Snapshot nach erfolgreichem classify_v7
+    try:
+        _td_count = len(classification.get('tage_detail') or []) if isinstance(classification, dict) else 0
+        _save_pipeline_snapshot(job_id, 'post_classify_v7', {
+            'tage_detail_count': _td_count,
+            'arbeitstage': classification.get('arbeitstage') if isinstance(classification, dict) else None,
+            'fahr_tage': classification.get('fahr_tage') if isinstance(classification, dict) else None,
+            'hotel_naechte': classification.get('hotel_naechte') if isinstance(classification, dict) else None,
+            'z72_tage': classification.get('z72_tage') if isinstance(classification, dict) else None,
+            'z73_tage': classification.get('z73_tage') if isinstance(classification, dict) else None,
+            'z74_tage': classification.get('z74_tage') if isinstance(classification, dict) else None,
+            'z76_eur': classification.get('z76_eur') if isinstance(classification, dict) else None,
+            'unresolved_count': len(classification.get('unresolved_days') or []) if isinstance(classification, dict) else 0,
+        })
+    except Exception as _snap_e:
+        print(f"[v11-cas-pipeline] snapshot post_classify_v7 fail: {_snap_e}")
     # Snapshot vor Align (auch wenn Align crashed, Daten sind sichtbar)
     _save_pipeline_snapshot(job_id, 'pre_followme_align', {
         'classification_keys': sorted(list(classification.keys())) if isinstance(classification, dict) else type(classification).__name__,
@@ -12084,6 +12193,17 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
     if os.environ.get('AEROTAX_FOLLOWME_ALIGN') == '1':
         try:
             classification = _followme_align_counters(classification, matched, year, homebase)
+            # v13 Phase 2C: Snapshot nach erfolgreichem Align
+            try:
+                _save_pipeline_snapshot(job_id, 'followme_align_success', {
+                    'fahr_tage': classification.get('fahr_tage') if isinstance(classification, dict) else None,
+                    'arbeitstage': classification.get('arbeitstage') if isinstance(classification, dict) else None,
+                    'reinigungstage': classification.get('reinigungstage') if isinstance(classification, dict) else None,
+                    'hotel_naechte': classification.get('hotel_naechte') if isinstance(classification, dict) else None,
+                    'tours_identified': classification.get('_followme_tours_identified') if isinstance(classification, dict) else None,
+                })
+            except Exception:
+                pass
         except Exception as _ae:
             import traceback as _tb
             print(f"[followme-align] CRASH: {type(_ae).__name__}: {str(_ae)[:300]}")
@@ -15059,6 +15179,25 @@ def hybrid_analyze(form, files, job_id=None):
     se_structured  = parallel_results.get('se_structured')
     se_summary     = parallel_results.get('se_summary')
     cas_pre_read   = parallel_results.get('cas_result')
+
+    # v13 Phase 2C: Phase-Übergangs-Snapshots NACH allen Reader-Tasks
+    try:
+        _save_pipeline_snapshot(job_id, 'after_lsb', {
+            'has_data': lsb_data is not None,
+            'fields': sorted(list(lsb_data.keys()))[:30] if isinstance(lsb_data, dict) else None,
+            'brutto': lsb_data.get('brutto') if isinstance(lsb_data, dict) else None,
+            'z17':    lsb_data.get('ag_z17') if isinstance(lsb_data, dict) else None,
+        })
+        _save_pipeline_snapshot(job_id, 'after_se', {
+            'se_structured_has': se_structured is not None,
+            'se_lines_count': (len(se_structured.get('se_lines') or [])
+                               if isinstance(se_structured, dict) else 0),
+            'se_summary_has': se_summary is not None,
+            'z77_summary': (se_summary.get('z77_total')
+                            if isinstance(se_summary, dict) else None),
+        })
+    except Exception as _snap_e:
+        print(f"[hybrid] snapshot after_lsb/se fail: {_snap_e}")
 
     # Memory-Release nach allen Readern — Bytes sind extrahiert, Originale weg
     try:

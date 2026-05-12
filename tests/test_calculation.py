@@ -10501,13 +10501,14 @@ def test_v11_cas_prompt_says_no_z72_z73():
 
 
 def test_v11_cas_tool_schema_has_required_fields():
-    """Sonnet-Tool-Schema enthält required Felder."""
+    """Sonnet-Tool-Schema enthält required Felder.
+    v13 Phase 2B Slim: duration_minutes ist raus (deterministisch in Python)."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     block = src[fn_idx:fn_idx + 10000]
-    # required fields im schema
+    # required fields im schema — duration_minutes raus (Slim)
     for field in ['date', 'activity_type', 'marker', 'start_time',
-                   'end_time', 'duration_minutes', 'location',
+                   'end_time', 'location',
                    'flights', 'overnight_after_day', 'layover_ort',
                    'confidence', 'raw_excerpt']:
         assert f"'{field}'" in block, f'Schema-Feld „{field}" fehlt'
@@ -11982,15 +11983,16 @@ def test_cas_no_silent_truncation():
 
 
 def test_cas_slim_prompt_preserves_required_schema():
-    """Slim-Prompt nennt alle nötigen Felder."""
+    """Slim-Prompt nennt die nötigen Felder.
+    v13 Phase 2B noch slimmer: date+activity_type+marker+start/end+flights
+    sind im Prompt erwähnt. duration_minutes ist deterministisch."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     p_idx = src.find('prompt = f"""', fn_idx)
     p_end = src.find('"""', p_idx + 20)
     prompt = src[p_idx:p_end]
-    required_fields = ['date', 'activity_type', 'marker', 'start_time', 'end_time',
-                       'duration_minutes', 'flights', 'overnight_after_day',
-                       'layover_ort', 'confidence']
+    # Slim: nur Felder die im Prompt-Text erwähnt sein müssen (statt list aller Schema-Felder)
+    required_fields = ['marker', 'flights', 'activity_type']
     for f in required_fields:
         assert f in prompt, f'Required field {f} fehlt im Slim-Prompt'
 
@@ -12040,10 +12042,11 @@ def test_cas_parallel_safe_mode_when_1():
 
 
 def test_cas_parallel_uses_threadpool():
-    """Bei max>1: ThreadPoolExecutor."""
+    """Bei max>1: ThreadPoolExecutor.
+    v13 Phase 2C: window vergrößert weil after_cas_file Snapshots dazu kamen."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 8000]
+    block = src[fn_idx:fn_idx + 14000]
     assert 'ThreadPoolExecutor' in block
     assert 'max_workers=cas_max_par' in block
 
@@ -12052,7 +12055,7 @@ def test_cas_parallel_deterministic_merge():
     """Merge nach idx sortiert für deterministische Reihenfolge."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 8000]
+    block = src[fn_idx:fn_idx + 14000]
     assert 'sorted(results_by_idx' in block
     # Determinismus-Kommentar
     assert 'Deterministischer Merge' in block or 'Original-Reihenfolge' in block
@@ -12062,7 +12065,7 @@ def test_cas_parallel_one_file_error_isolated():
     """Bei Fehler einer Datei: error in result, andere laufen weiter."""
     src = _read_backend()
     fn_idx = src.find('def _process_one_cas')
-    block = src[fn_idx:fn_idx + 4000]
+    block = src[fn_idx:fn_idx + 6000]
     # Result enthält 'error'-Field
     assert "'error':" in block
     # Bei Crash: as_completed läuft weiter (try/except in main loop)
@@ -12075,7 +12078,7 @@ def test_cas_parallel_rate_limit_retry():
     """Bei rate-limit Error: Backoff-Retry mit exponentiellen Sekunden."""
     src = _read_backend()
     fn_idx = src.find('def _process_one_cas')
-    block = src[fn_idx:fn_idx + 4000]
+    block = src[fn_idx:fn_idx + 6000]
     assert "rate limit" in block.lower() or "'429'" in block
     assert 'backoff' in block.lower()
     assert 'range(3)' in block or 'attempt' in block
