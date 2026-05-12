@@ -74,6 +74,81 @@ if os.getenv('RENDER') != 'true' and os.getenv('AEROTAX_ENV', '').lower() != 'pr
     _cors_origins += ['http://localhost:3000', 'http://localhost:8080']
 CORS(app, origins=_cors_origins)
 
+
+# ── BUG-005 Instrumentation: Request-Lifecycle-Logs ───────────────────────────
+# Zweck: wir müssen sehen können, wo ein hängender Request klemmt:
+#   1. before_request log fehlt → Cloud-Run/Gunicorn-Queueing (Request kommt nie
+#      in Flask an)
+#   2. before_request da, after_request fehlt → App-Code hängt (Supabase, Sonnet,
+#      Disk-I/O)
+#   3. after_request mit hoher duration_ms → langsamer Endpoint
+# Logs sind 1 Zeile pro Event, JSON-kompatibles Format, kein I/O-overhead.
+import threading as _req_threading
+import time as _req_time
+import uuid as _req_uuid
+
+_REQ_LOG_PREFIX = '[req]'
+# Pfade die NICHT instrumentiert werden (zu noisy oder uninteressant):
+#   /api/progress (SSE-Endpoint, langer Open)
+#   statische Assets (gibts hier nicht aber als Safety)
+_REQ_LOG_SKIP = ('/api/progress',)
+
+
+@app.before_request
+def _bug005_before_request():
+    try:
+        path = request.path or ''
+        if any(path.startswith(p) for p in _REQ_LOG_SKIP):
+            return
+        # In Flask `g` thread-lokal kontext-speichern
+        from flask import g as _g
+        _g._req_start = _req_time.time()
+        _g._req_id = _req_uuid.uuid4().hex[:8]
+        tid = _req_threading.get_ident()
+        # PID muss bei jedem call frisch geholt werden (gthread teilt PID, threads variieren)
+        print(f"{_REQ_LOG_PREFIX} start id={_g._req_id} path={path} method={request.method} pid={os.getpid()} tid={tid}")
+    except Exception as _e:
+        # Instrumentation darf NIE die App stoppen
+        pass
+
+
+@app.after_request
+def _bug005_after_request(response):
+    try:
+        path = request.path or ''
+        if any(path.startswith(p) for p in _REQ_LOG_SKIP):
+            return response
+        from flask import g as _g
+        start = getattr(_g, '_req_start', None)
+        rid = getattr(_g, '_req_id', '?')
+        if start is None:
+            return response
+        dur_ms = int((_req_time.time() - start) * 1000)
+        tid = _req_threading.get_ident()
+        print(f"{_REQ_LOG_PREFIX} done  id={rid} path={path} status={response.status_code} duration_ms={dur_ms} pid={os.getpid()} tid={tid}")
+    except Exception:
+        pass
+    return response
+
+
+@app.teardown_request
+def _bug005_teardown(exc):
+    try:
+        from flask import g as _g
+        rid = getattr(_g, '_req_id', None)
+        if not rid:
+            return  # nicht instrumentiert
+        if exc is None:
+            return  # normaler request — schon im after_request geloggt
+        start = getattr(_g, '_req_start', None)
+        dur_ms = int((_req_time.time() - start) * 1000) if start else -1
+        path = (request.path if request else '?') or '?'
+        tid = _req_threading.get_ident()
+        print(f"{_REQ_LOG_PREFIX} error id={rid} path={path} exc={type(exc).__name__} duration_ms={dur_ms} pid={os.getpid()} tid={tid}")
+    except Exception:
+        pass
+
+
 stripe.api_key        = os.getenv('STRIPE_SECRET_KEY')
 WEBHOOK_SECRET        = os.getenv('STRIPE_WEBHOOK_SECRET')
 ANTHROPIC_KEY = os.getenv('ANTHROPIC_API_KEY')

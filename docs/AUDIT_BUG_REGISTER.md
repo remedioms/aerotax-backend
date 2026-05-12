@@ -143,6 +143,19 @@ Ready=True; ContainerHealthy=True; MinInstancesProvisioned=Unknown
 - `concurrency=10`, `min-instances=1`, `max-instances=5` **deployed (revision 00019-xwv) und unwirksam**.
 - Container restartet weiter, `starttransfer=0` persistiert.
 
+### Phase 1 Option A — Deploy 2026-05-12 18:25 UTC (revision 00020-2c8)
+**Status:** `fixed_unverified` (Restart-Loop-Symptom weg, aber neuer BUG-005 sichtbar)
+
+Boot-Logs zeigen alle 3 Disable-Messages:
+```
+[boot] cloud_tasks mode: legacy background worker disabled
+[boot] cloud_tasks mode: restart-recovery background thread disabled
+[boot] cloud_tasks mode: cleanup-loop background thread disabled
+```
+KEIN `Worker-Thread + Restart-Recovery gestartet (async)` mehr. KEINE `Handling signal: term`-Schleife in den letzten 20 min. KEINE ERROR-Events.
+
+**Phase 1 Fix wirkt** — der Restart-Loop ist gestoppt. Aber **BUG-005 (cpu-throttling)** ist die zweite Ursache der HTTP 000 Symptome. Beide brauchen Fix.
+
 ### Echter Fix (geplant, nicht gemacht) — drei Optionen
 
 **Option A — Worker-Thread in `app.py` deaktivieren wenn `AEROTAX_EXECUTION_MODE=cloud_tasks`**
@@ -222,6 +235,87 @@ Sobald BUG-001 gelöst: User soll mit `AT-89080734B3FDC191` recallen und screens
 
 ---
 
+## BUG-005 — Cloud Run cpu-throttling=true → Container schläft, Erste-Request-Latenz 15-30s
+
+| Feld | Inhalt |
+|---|---|
+| **ID** | BUG-005 |
+| **Titel** | Cloud Run Container kriegt nahezu 0% CPU wenn idle. Erste Request nach Pause → 15-30s Aufwach-Latenz. Curl mit 15s timeout → HTTP 000. |
+| **Area** | Cloud Run Infrastruktur-Konfiguration |
+| **Severity** | P0 — Backend faktisch unerreichbar aus User-Perspektive (Frontend-Timeouts) |
+| **Reporter** | Diagnostik nach Phase 1 BUG-002-Fix-Deploy (2026-05-12 18:30-18:45 UTC) |
+| **Status** | `open` — Fix-Plan klar, wartet auf User-Freigabe |
+
+### Repro Steps
+1. Cloud Run Service `aerotax-backend` 2+ min idle lassen
+2. `curl --max-time 15 https://aerotax-backend-...run.app/api/health`
+3. **Beobachtet:** HTTP 000 nach 15s, starttransfer=0
+4. **Cloud Run Logs:** `httpRequest.latency = 14.97s, status = 200`
+5. Bedeutet: Container hat 200 nach 14.97s zurückgegeben, curl-Timeout knapp vorher.
+
+### Evidence
+**Phase 1 Deploy (revision 00020-2c8) bestätigt:**
+- Boot-Logs zeigen alle 3 Disable-Messages ✓
+- KEIN Container-Restart-Loop mehr ✓
+- KEINE ERROR-Events mehr ✓
+- ABER: Latenz pro Request bleibt 15-30s (Cloud Run Frontend log)
+
+**Cloud Run Config (aktuell, revision 00020-2c8):**
+```
+cpu-throttling:      true       ← URSACHE
+startup-cpu-boost:   true
+min-instances:       1          ← greift faktisch nicht
+max-instances:       5
+concurrency:         10
+timeout:             1800s
+```
+
+**Latenz-Pattern (httpRequest.latency aus Cloud Run logs):**
+```
+18:43:32  /api/session/...  → 200 (29.948s)
+18:43:02  /api/session/...  → 200 (29.917s)
+18:36:51  /api/job/...      → 200 (14.913s)  ← warm
+18:36:36  /api/session/...  → 200 (14.995s)
+18:36:05  /api/health/full  → 200 (14.922s)
+```
+
+### Root Cause Status: **BEWIESEN (Hypothese mit hohem Konfidenz)**
+
+Mit `cpu-throttling=true` weist Cloud Run dem Container nur CPU zu wenn aktiv Requests bearbeitet werden. `min-instances=1` hält den Container "warm" im Sinne von "nicht beendet", aber bei Idle hat er fast keine CPU. Bei eingehender Request muss er:
+1. Wakeup (~5-10s)
+2. Python-GIL aktivieren, Import-Caches warm
+3. Erste DB-Connection (supabase) re-establishen
+→ 15-30s bis erste Bytes.
+
+Subsequent Requests in der Warm-Phase sind schnell (<200ms), aber nach ~1-2 min Idle wieder Cold-Path.
+
+### Fix Plan
+```bash
+gcloud run services update aerotax-backend \
+  --region=europe-west3 \
+  --no-cpu-throttling
+```
+
+- Effekt: Container kriegt durchgehend CPU
+- Erwartete Latenz: p95 <200ms für Health/Forum, <500ms für Session
+- Cost: +$15-30/Monat (CPU 24/7 statt request-only)
+- Reversibel: `--cpu-throttling`
+
+### Tests Required (Latenz-Messung NACH Fix)
+- [ ] `/api/health` 10× → 10/10 200, p95 <500ms
+- [ ] `/api/qa?sort=hot` 10× → 10/10 200, p95 <1s
+- [ ] `/api/session/<token>` 10× → 10/10 200, p95 <1s
+- [ ] `/api/job/<id>` 10× → 10/10 200, p95 <1s
+- [ ] 5min Idle danach erneut → noch immer <1s (kein Cold-Start)
+
+### Browser Proof Required
+- [ ] User klickt „Code prüfen" → Modal schließt + Result öffnet <3s
+
+### Workaround (User-side)
+- Mehrfach klicken: erste Request weckt Container, zweite Request schnell. Aber kein praktisches User-Verhalten.
+
+---
+
 ## BUG-004 — Doppelte Recall-Hinweise (Button-Text + Status-Banner identisch)
 
 | Feld | Inhalt |
@@ -255,6 +349,239 @@ Status-Banner-Loading-Aufruf entfernt. Nur noch Button-Text während Check. Bann
 
 ### Browser Proof Required
 - [ ] User klickt → nur Button-Loader, kein doppelter Hinweis
+
+---
+
+## BUG-006 — Race Condition: gleichzeitige `/api/process` mit gleichem PaymentIntent
+
+| Feld | Inhalt |
+|---|---|
+| **ID** | BUG-006 |
+| **Titel** | `_consumed_payment_intents` ist In-Memory dict + nicht thread-locked. Bei 2 parallelen Requests mit selbem PI gleichzeitig: beide passieren den Check, 2 Jobs entstehen. |
+| **Area** | Backend `/api/process` Payment-Idempotency |
+| **Severity** | P1 — niedrige Wahrscheinlichkeit (Race-Window <100ms), aber Doppelzahlung möglich |
+| **Reporter** | Code-Inspection im Rahmen Phase 2 Bug-Hunt (2026-05-12) |
+| **Status** | `open` |
+
+### Repro Steps (theoretisch)
+1. User auf Stripe-Form: Klick „Bezahlen"
+2. Stripe `confirmPayment` returnt `succeeded` → Frontend triggert `process()` (Z. 2663 in index.html)
+3. Parallel: Browser reload macht `?paid=1&ref=X` redirect-handling → triggert auch `process()` (Z. 6383)
+4. Beide `/api/process`-Requests senden gleichen `payment_intent_id`
+5. Beide passieren `if pi_id and pi_id in _consumed_payment_intents` (false bei beiden, weil noch nicht eingetragen)
+6. Beide setzen `_consumed_payment_intents[pi_id] = now()` → 2 Jobs erstellt
+
+### Evidence
+**Code-Inspektion app.py:1641-1644:**
+```python
+if pi_id and pi_id in _consumed_payment_intents:
+    return jsonify({'error': '...'}), 402
+# ... (nicht thread-locked)
+if pi_id:
+    _consumed_payment_intents[pi_id] = datetime.utcnow()
+```
+
+Plus: bei Multi-Container-Cloud-Run hat jeder Container sein eigenes `_consumed_payment_intents` dict → 2 Container können beide PI akzeptieren ohne Konflikt.
+
+### Mitigations (existent)
+- Stripe webhook setzt `_store[ref]['paid'] = True` — bei `is_paid` check ist das primärer Layer
+- `_store[ref]['paid'] = False` nach Verbrauch (Z. 1697)
+- Aber: bei race condition könnten beide den `is_paid` check passieren wenn `_store` race ebenfalls
+
+### Fix Plan (NICHT JETZT — nur dokumentiert)
+- Supabase atomic check-and-set für PI-Verbrauch (statt in-memory)
+- Plus: Frontend deduplizieren — `window._processStarted=true` flag mit timestamp
+
+### Tests Required
+- [ ] `test_concurrent_process_same_pi_only_one_succeeds` (synth)
+- [ ] `test_process_idempotent_per_pi_across_containers` (Supabase-Lock-Test)
+
+---
+
+## BUG-007 — Frontend `process()` kein Idempotenz-Lock
+
+| Feld | Inhalt |
+|---|---|
+| **ID** | BUG-007 |
+| **Titel** | `process()` (Z. 2976 in index.html) hat keinen Doppelklick-Schutz wie `pay()` (Z. 2619 `_payInFlight`). 2× klicken bei mode=paid → 2× /api/process. |
+| **Area** | Frontend `process()` |
+| **Severity** | P1 — User könnte versehentlich 2 Jobs starten |
+| **Reporter** | Code-Inspection 2026-05-12 |
+| **Status** | `open` |
+
+### Repro Steps
+1. Bezahlung abgeschlossen (Stripe success)
+2. `process()` wird aufgerufen + dauert mehrere Sekunden bis nächster Screen
+3. User klickt nochmal (Frust, langsame Verbindung)
+4. **Beobachtet:** zweite `process()` startet parallel → zwei `/api/process`-Requests
+
+### Evidence
+**Code-Inspection:**
+- `pay()` hat `if(window._payInFlight){ ...return; }` (Z. 2619)
+- `process()` hat KEINEN solchen Check
+
+### Mitigation (existent)
+- BUG-006 backend `_consumed_payment_intents` fängt das ab — wenn nicht race-condition
+- Plus: `process()` ruft `go('proc')` was zur Result-Page navigiert → User sieht nicht mehr den Button
+
+### Fix Plan
+```js
+async function process(){
+  if(window._processInFlight){ return; }
+  window._processInFlight = true;
+  // ... existing code ...
+  // finally: setTimeout(()=>{ window._processInFlight=false }, 5000);
+}
+```
+
+### Tests Required
+- [ ] `test_process_double_call_only_one_runs` (DOM)
+- [ ] `test_process_inflight_flag_resets_after_timeout` (DOM)
+
+---
+
+## BUG-008 — `_qa_async_aerotax` (per-request thread) bleibt unangetastet trotz cloud_tasks
+
+| Feld | Inhalt |
+|---|---|
+| **ID** | BUG-008 |
+| **Titel** | `app.py:5728` spawnt einen Background-Thread für Q&A-Antworten. Im cloud_tasks-mode läuft das immer noch im API-Container und kann lange Sonnet-Calls (10-30s) im Hintergrund halten. |
+| **Area** | Backend `/api/qa/ask` |
+| **Severity** | P2 — kein Restart-Loop (Threads sind per-request, kurzlebig), aber Cloud Run Container terminiert evtl. mit pending threads bei scale-down |
+| **Reporter** | Code-Inspection Phase 2 Bug-Hunt 2026-05-12 |
+| **Status** | `open` |
+
+### Evidence
+**Code-Inspection app.py:5728:**
+```python
+_qa_thread.Thread(target=_qa_async_aerotax, args=(qid, title, text), daemon=True).start()
+```
+Wird in `/api/qa/ask` per-Request gestartet. Cloud Run kann den Container beenden bevor der Thread Sonnet-Call fertig hat → Q&A-Antwort verloren.
+
+### Fix Plan (Option später)
+- Im cloud_tasks-mode: `_qa_async_aerotax` per Cloud Task statt Thread enqueueren
+- Oder: synchron im request, mit kürzerem Sonnet-Timeout
+
+### Tests Required
+- [ ] `test_qa_ask_returns_without_blocking_main_response`
+- [ ] `test_qa_async_completes_under_container_lifetime`
+
+---
+
+## BUG-009 — Auto-Resume bypasst v14 PDF/State-Gate
+
+| Feld | Inhalt |
+|---|---|
+| **ID** | BUG-009 |
+| **Titel** | `_autoResume` in index.html:6307 ruft `window.render({...rd, download_url, notes})` — gibt **canonical_state nicht weiter**. `deriveUiState` sieht `cs='unknown'`, kein State-Match, kein Banner. User landet auf Result-Panel ohne State-Kontext. |
+| **Area** | Frontend Auto-Resume bei Reload |
+| **Severity** | P0 — User mit needs_review-Token reloadet → keine „kurze Klärung nötig"-Banner-Info |
+| **Reporter** | Phase 2 Bug-Hunt Code-Inspection 2026-05-12 |
+| **Status** | `open` |
+
+### Repro Steps
+1. User mit `canonical_state=needs_review`-Token öffnet die Seite
+2. localStorage hat `aerotax_session.token` gespeichert (vorheriger Besuch)
+3. `_autoResume` fired (Z. 6277)
+4. `fetch /api/session/<token>` → response hat `canonical_state='needs_review'`, `result_data`, `download_url`
+5. `_autoResume` ruft `window.render({...rd, download_url, notes})`
+6. `deriveUiState(d)` sieht: `cs = d.canonical_state || 'unknown'` → `cs='unknown'` (canonical_state war nicht in `d`)
+7. **Beobachtet:** Kein „Auswertung vorbereitet — kurze Klärung nötig"-Banner, kein Review-Hint
+8. PDF-Buttons sind korrekt versteckt (canShowPdfDownload prüft canonical_state !== 'done' → false → KEIN PDF) — **dieser Teil ist safe**
+9. ABER: Detail-Tabelle mit netto-Betrag wird trotzdem gerendert (kein `show_final_amount`-Check im render-Pfad)
+
+### Evidence
+**Code-Inspection index.html:6307:**
+```js
+window.render({...rd, download_url: j.download_url, notes: j.notes || []});
+// MISSING: canonical_state, pdf_allowed, reason_code, _review_items
+```
+
+**deriveUiState index.html:1668:**
+```js
+var cs = s.canonical_state || 'unknown';
+// 'unknown' matched keinen Branch → default state, kein Banner
+```
+
+**show_final_amount wird nie gelesen** (nur gesetzt) — auch ein eigener Bug, aber bei korrektem state-Pass wäre Banner mindestens „Klärung nötig".
+
+### Root Cause Status: **BEWIESEN**
+
+### Fix Plan
+Edit `_autoResume` Z. 6307:
+```js
+window.render({
+  ...rd,
+  download_url: j.download_url,
+  notes: j.notes || [],
+  canonical_state: j.canonical_state,
+  reason_code: j.reason_code,
+  pdf_allowed: j.pdf_allowed,
+  result_stale: j.result_stale,
+  document_health: j.document_health,
+  _review_items: rd._review_items || j.review_items,
+  user_title: j.user_title,
+  user_message: j.user_message,
+  next_actions: j.next_actions,
+});
+```
+
+Plus: `hasResult`-Check verfeinern. Bei `canonical_state='needs_review'` mit `rd.netto>0` → NICHT als "fertig" behandeln, sondern erst route nach state.
+
+### Tests Required
+- [ ] `test_auto_resume_passes_canonical_state_to_render` (statisch+DOM)
+- [ ] `test_auto_resume_needs_review_shows_review_banner` (DOM)
+- [ ] `test_auto_resume_failed_support_shows_support_state` (DOM)
+
+### Browser Proof Required
+- [ ] Token `AT-89080734B3FDC191` (needs_review) → Reload → Banner „kurze Klärung nötig" sichtbar
+
+---
+
+## BUG-010 — `show_final_amount` wird gesetzt aber nirgendwo geprüft
+
+| Feld | Inhalt |
+|---|---|
+| **ID** | BUG-010 |
+| **Titel** | `deriveUiState.show_final_amount` ist die Single-Source-of-Truth ob ein finaler Betrag dem User gezeigt werden darf. Aber der render()-Pfad liest es NICHT — netto/brutto werden bedingungslos in DOM geschrieben. |
+| **Area** | Frontend Result-Render |
+| **Severity** | P1 — bei processing/needs_review/failed_* könnte ein Betrag groß sichtbar sein der nicht final ist |
+| **Reporter** | Phase 2 Bug-Hunt 2026-05-12 |
+| **Status** | `open` |
+
+### Evidence
+```bash
+grep -nE "show_final_amount|_uiState\.show_final" index.html
+1683:    show_final_amount:  false,
+1718:    out.show_final_amount = false; // NIE final bei needs_review
+1730:    out.show_final_amount = true;
+3581:    ... show_final_amount:false ...
+```
+
+4 Vorkommen — alle in Setter-Position. **Kein Reader.**
+
+### Fix Plan
+Im `render()` Pfad (index.html:3566+):
+```js
+var amountEl = document.getElementById('result-netto-big');
+if(amountEl){
+  if(_uiState.show_final_amount){
+    amountEl.textContent = formatEUR(d.netto);
+    amountEl.style.display = '';
+  } else {
+    // bei needs_review etc.: dimmen oder als „vorläufig" markieren
+    amountEl.textContent = formatEUR(d.netto) + ' (vorläufig)';
+    amountEl.style.opacity = '0.6';
+  }
+}
+```
+
+Plus: Detail-Tabelle nur bei `show_detail_table=true`.
+
+### Tests Required
+- [ ] `test_render_hides_final_amount_when_show_final_amount_false`
+- [ ] `test_render_shows_final_amount_when_done`
+- [ ] `test_render_marks_amount_as_provisional_in_needs_review`
 
 ---
 

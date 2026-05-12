@@ -134,6 +134,18 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
 2. Render auto-deployt (Build ~3-4 Min, Deploy ~30s)
 3. Bei Env-Var-Änderungen: manuell triggern via `POST /v1/services/.../deploys` (Render auto-redeployt nicht bei Env-Changes)
 
+## Cloud Run env-Vars — VORSICHT
+
+**WICHTIG (BUG-005 self-inflicted lessons-learned, 2026-05-12):**
+
+- `gcloud run services update --set-env-vars="K=V"` **ÜBERSCHREIBT ALLE env vars** (lässt nur das gegebene Set übrig). Niemals für inkrementelle Änderungen nutzen.
+- `gcloud run services update --update-env-vars="K=V"` **merged** in das existierende Set. Das ist der sichere Default für single-var updates.
+- `gcloud run services update --remove-env-vars="K"` löscht eine einzelne Variable, lässt alle anderen.
+
+Tat sich am 2026-05-12 ein P0-Incident weil ich `--set-env-vars="_BUG_002_REDEPLOY=…"` als Force-Restart-Trick nutzte — und dabei `AEROTAX_EXECUTION_MODE=cloud_tasks` plus alle anderen `AEROTAX_*`-Werte mitlöschte. Resultat: Backend fiel in thread-mode, der Worker-Thread lief wieder, Container-Restart-Loop kam zurück. Recovery brauchte ~10 Minuten + manuelle env-restoration aus alter revision.
+
+**Force-Restart ohne env-Risiko:** `gcloud run deploy aerotax-backend --source . --region europe-west3` triggert eine neue Source-Build-Revision, ohne env-Vars anzufassen.
+
 ## Logs-Zugriff
 
 Render API mit Token aus `RENDER_API_KEY` Env-Var (oder im Dashboard hinterlegt).

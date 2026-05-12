@@ -48,18 +48,23 @@ COPY --from=builder /app/.venv .venv/
 COPY . .
 
 # Cloud Run schickt SIGTERM bei scale-down → gunicorn graceful-shutdown.
-# workers=1 + threads=2 = 2 concurrent requests pro Container; bei Cloud-Run-
-# Service mit concurrency=1 sieht jeder Container nur 1 Request, threads=2
-# bleibt für intra-request I/O.
-# timeout=1800s (30 Min) reicht für lange Auswertungen.
-# max-requests=200 für graceful restart vor Memory-Leak-Akkumulation.
+# BUG-005 Fix (2026-05-12):
+#   worker-class=gthread + threads=8 → 8 concurrent requests pro Container.
+#   Vorher: workers=1 threads=2 mit default sync-worker → bei Cloud Run
+#   concurrency=10 staute sich die Gunicorn-Queue auf, ein hängender Supabase-
+#   Call (z.B. /api/session mit großem result_data) blockierte Health/Forum.
+#   Cloud-Run-Service muss `containerConcurrency=8` matchen (Tests:
+#   tests/test_concurrency_invariants.py).
+# timeout=1800s (30 Min) reicht für lange Worker-Jobs (process-job via Cloud Tasks).
+# max-requests=200/jitter=20 für graceful restart vor Memory-Leak-Akkumulation.
 CMD exec gunicorn app:app \
     --bind 0.0.0.0:${PORT:-8080} \
     --workers 1 \
-    --threads 2 \
+    --worker-class gthread \
+    --threads 8 \
     --timeout 1800 \
     --graceful-timeout 60 \
     --max-requests 200 \
-    --max-requests-jitter 30 \
+    --max-requests-jitter 20 \
     --access-logfile - \
     --error-logfile -
