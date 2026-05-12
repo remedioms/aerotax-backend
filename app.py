@@ -1052,6 +1052,15 @@ def _start_calc_worker():
     global _calc_worker_started
     if _calc_worker_started:
         return
+    # BUG-002 fix: In cloud_tasks-mode startet KEIN Legacy-Background-Thread.
+    # Cloud Tasks invokes /api/internal/process-job synchron pro Request — kein lokaler
+    # Queue-Worker, kein boot-time Supabase-Scan. Beides hatte den Gunicorn-Mainloop
+    # blockiert und Cloud Run zu Container-Kills geführt (Restart-Loop).
+    if AEROTAX_EXECUTION_MODE == 'cloud_tasks':
+        print("[boot] cloud_tasks mode: legacy background worker disabled")
+        print("[boot] cloud_tasks mode: restart-recovery background thread disabled")
+        _calc_worker_started = True  # idempotent
+        return
     _calc_worker_started = True
     _T = __import__('threading').Thread
     # Worker-Thread (verarbeitet Queue) sofort starten
@@ -4872,8 +4881,15 @@ def cleanup_old_supabase_state():
 
 
 # Cleanup-Thread starten (in Tests deaktivierbar)
+# BUG-002 fix: In cloud_tasks-mode kein Cleanup-Loop im API-Container.
+# Der Loop polls Supabase alle 2/30 Min — im API-Container nicht nötig (Stale-Detection
+# greift auf in-memory _jobs, das in cloud_tasks-mode leer bleibt). Cloud Tasks + Supabase-
+# TTLs übernehmen Cleanup. Ein expliziter Cleanup-Service folgt bei Bedarf separat.
 if os.environ.get('AEROTAX_DISABLE_BG_THREADS') != '1':
-    __import__('threading').Thread(target=_cleanup_loop, daemon=True, name='cleanup-loop').start()
+    if AEROTAX_EXECUTION_MODE == 'cloud_tasks':
+        print("[boot] cloud_tasks mode: cleanup-loop background thread disabled")
+    else:
+        __import__('threading').Thread(target=_cleanup_loop, daemon=True, name='cleanup-loop').start()
 
 
 def _load_session(token):

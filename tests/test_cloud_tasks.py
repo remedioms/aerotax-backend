@@ -15,6 +15,21 @@ import importlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _find_process_cloud_tasks_branch(src, span=4500):
+    """Liefert den Code-Block des `/api/process` cloud_tasks-Branches.
+
+    BUG-002-Fix hat einen früheren `cloud_tasks`-Branch in `_start_calc_worker`
+    eingeführt — der Boot-Disable-Branch. Die alten Tests suchen den *Routing*-
+    Branch in `/api/process`, daher verankern wir am Call-Site `_enqueue_cloud_task(
+    job_id, attempt=1)` und gehen rückwärts zum letzten cloud_tasks-Check davor.
+    """
+    enq_idx = src.find('_enqueue_cloud_task(job_id, attempt=1)')
+    assert enq_idx > 0, '_enqueue_cloud_task call-site fehlt in app.py'
+    cloud_check_idx = src.rfind("AEROTAX_EXECUTION_MODE == 'cloud_tasks'", 0, enq_idx)
+    assert cloud_check_idx > 0, 'cloud_tasks-Branch in /api/process fehlt'
+    return src[cloud_check_idx:cloud_check_idx + span]
+
+
 def _load_app_fresh(env=None):
     """Reload app mit optionalen ENV-Overrides.
     Wichtig: setzt AEROTAX_EXECUTION_MODE explizit auf 'thread' falls nicht
@@ -205,11 +220,22 @@ def test_internal_worker_failed_support_returns_200_no_retry(monkeypatch):
 
 def test_no_background_thread_in_cloud_tasks_mode():
     """In cloud_tasks-mode: /api/process puttet nicht in _calc_queue (aktiv).
-    Kommentare die '_calc_queue.put' erwähnen sind erlaubt."""
+    Kommentare die '_calc_queue.put' erwähnen sind erlaubt.
+
+    Wir suchen den `/api/process`-spezifischen Branch — nicht den Boot-Disable-
+    Branch in `_start_calc_worker` (BUG-002), der vorne im File steht.
+    """
     src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
-    idx = src.find("AEROTAX_EXECUTION_MODE == 'cloud_tasks'")
-    assert idx > 0
-    block = src[idx:idx + 6000]
+    # Suche den Branch in /api/process der `_enqueue_cloud_task(` aufruft (= Call-Site,
+    # nicht die Funktions-Definition). Wir verankern am Call-Pattern (Aufruf mit
+    # attempt=1) und gehen rückwärts zum cloud_tasks-Check davor.
+    enq_idx = src.find('_enqueue_cloud_task(job_id, attempt=1)')
+    assert enq_idx > 0, '_enqueue_cloud_task call-site fehlt in app.py'
+    cloud_check_idx = src.rfind("AEROTAX_EXECUTION_MODE == 'cloud_tasks'", 0, enq_idx)
+    assert cloud_check_idx > 0, (
+        'cloud_tasks-Branch vor _enqueue_cloud_task fehlt'
+    )
+    block = src[cloud_check_idx:cloud_check_idx + 6000]
     # _enqueue_cloud_task ist im Branch
     assert '_enqueue_cloud_task(' in block
     # cloud_tasks-Branch endet beim Thread-Mode-Marker
@@ -384,9 +410,7 @@ def test_cloud_tasks_process_persists_files_to_supabase():
     PARALLEL READER STAGE, weil Worker via _load_uploaded_files_supabase(ref) lädt."""
     src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
     # Im cloud_tasks-Branch muss _save_uploaded_files_supabase ausgeführt werden
-    idx = src.find("AEROTAX_EXECUTION_MODE == 'cloud_tasks'")
-    assert idx > 0
-    block = src[idx:idx + 4000]
+    block = _find_process_cloud_tasks_branch(src, span=4000)
     assert '_save_uploaded_files_supabase(' in block, \
         'cloud_tasks-Branch muss Files in Supabase persistieren vor enqueue'
     # Aufruf-Reihenfolge: persist VOR enqueue
@@ -401,8 +425,7 @@ def test_cloud_tasks_process_generates_fallback_ref_when_missing():
     """Falls /api/process ohne ref aufgerufen wird (Direct-Upload-Only): generiert
     einen fallback-ref aus job_id."""
     src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
-    idx = src.find("AEROTAX_EXECUTION_MODE == 'cloud_tasks'")
-    block = src[idx:idx + 4000]
+    block = _find_process_cloud_tasks_branch(src, span=4000)
     # Fallback-ref Generation: f'auto-{job_id[:12]}'
     assert "f'auto-" in block, 'Fallback-ref-Generation fehlt'
 
@@ -411,8 +434,7 @@ def test_cloud_tasks_process_hard_fails_on_persist_error():
     """Wenn _save_uploaded_files_supabase failed: Job sofort als failed mit
     WORKER_RESTARTED reason_code markieren — NICHT enqueue."""
     src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
-    idx = src.find("AEROTAX_EXECUTION_MODE == 'cloud_tasks'")
-    block = src[idx:idx + 4500]
+    block = _find_process_cloud_tasks_branch(src, span=4500)
     # _set_job_failed mit WORKER_RESTARTED bei persist-fail
     assert "_set_job_failed(job_id, 'WORKER_RESTARTED'" in block
     assert 'Failed to persist files' in block
@@ -421,8 +443,7 @@ def test_cloud_tasks_process_hard_fails_on_persist_error():
 def test_cloud_tasks_process_converts_files_to_supabase_format():
     """Files-Dict {key: [(bytes, fname)|bytes]} → Supabase-Format {key: [(bytes, fname)]}."""
     src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
-    idx = src.find("AEROTAX_EXECUTION_MODE == 'cloud_tasks'")
-    block = src[idx:idx + 4500]
+    block = _find_process_cloud_tasks_branch(src, span=4500)
     # Format-Konvertierung-Logik
     assert 'files_sb_format' in block
     # Behandelt sowohl tuple (bytes, fname) als auch bare bytes
