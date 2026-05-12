@@ -10524,10 +10524,11 @@ def test_v11_cas_reader_uses_file_hash_cache():
 
 
 def test_v11_cas_reader_per_pdf_separate_call():
-    """Multi-File: eine Sonnet-Anfrage pro PDF (memory-bounded)."""
+    """Multi-File: eine Sonnet-Anfrage pro PDF (memory-bounded).
+    v13 Phase 2A: window vergrößert weil Variante-A-Merge-Code davor liegt."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 6000]
+    block = src[fn_idx:fn_idx + 12000]
     # Loop über cas_list mit _sonnet_read_cas_single_pdf
     assert 'for idx, pdf_bytes in enumerate(cas_list)' in block, \
         'Pro-PDF-Loop muss existieren'

@@ -641,6 +641,100 @@ def test_pre_classify_v7_snapshot_captures_non_dict_indices():
     assert 'non_dict_count' in block
 
 
+# ─── v13 Phase 2D: Lokale Repro des tuple-Bugs ────────────────────────────────
+
+def test_schema_validator_catches_tuple_in_matched_days():
+    """Wenn matched-Liste eine tuple statt dict enthält: _PipelineSchemaError
+    mit klarem path. Genau der Bug-Fang den wir live brauchen."""
+    _app = _load_app_fresh()
+    import pytest as _pt
+    matched = [
+        {'datum': '2025-01-01', 'dp': {'activity_type': 'free'}, 'se': {'count': 0}},
+        ('garbage-tuple', 1, 2),  # <-- der bug
+        {'datum': '2025-01-03', 'dp': {'activity_type': 'tour'}, 'se': {'count': 1}},
+    ]
+    with _pt.raises(_app._PipelineSchemaError) as exc_info:
+        _app._validate_pipeline_shape(matched, _app._SCHEMA_MATCHED_DAYS, 'matched_days')
+    # Path muss den Index zeigen
+    assert 'matched_days[1]' in str(exc_info.value)
+
+
+def test_schema_validator_catches_missing_dp_key():
+    """matched[i] hat 'datum' aber dp ist tuple statt dict → schema error mit path."""
+    _app = _load_app_fresh()
+    import pytest as _pt
+    matched = [
+        {'datum': '2025-01-01', 'dp': ('not-a-dict',), 'se': {}},
+    ]
+    with _pt.raises(_app._PipelineSchemaError) as exc_info:
+        _app._validate_pipeline_shape(matched, _app._SCHEMA_MATCHED_DAYS, 'matched_days')
+    err = str(exc_info.value)
+    assert 'matched_days[0]' in err
+    assert 'dp' in err
+
+
+def test_schema_validator_passes_on_valid_matched():
+    """Valid matched-Liste (alle dicts mit datum/dp/se) → kein error."""
+    _app = _load_app_fresh()
+    matched = [
+        {'datum': '2025-01-01', 'dp': {'activity_type': 'free'}, 'se': {'count': 0}},
+        {'datum': '2025-01-02', 'dp': {'activity_type': 'tour'}, 'se': {'count': 1}},
+    ]
+    # Sollte nicht raisen
+    _app._validate_pipeline_shape(matched, _app._SCHEMA_MATCHED_DAYS, 'matched_days')
+
+
+def test_classify_v7_crashes_on_tuple_in_matched():
+    """Bestätigung: ohne schema-validator crashed classify_v7 mit AttributeError."""
+    _app = _load_app_fresh()
+    import pytest as _pt
+    matched = [
+        {'datum': '2025-01-01', 'dp': {'activity_type': 'free', 'raw_marker': 'OFF',
+                                         'routing': [], 'has_fl': False,
+                                         'overnight_after_day': False},
+         'se': {'stfrei_total': 0, 'stfrei_ort': '', 'stfrei_inland': None,
+                'zwoelftel': 0, 'lines': [], 'count': 0}},
+        ('garbage',),  # → classify_v7 crashed wenn unmaskiert
+    ]
+    with _pt.raises((AttributeError, TypeError)):
+        _app._deterministic_classify_v7(matched, 2025, 'FRA')
+
+
+def test_pipeline_schema_error_routed_to_classification_schema_failed():
+    """error-string mit 'pipelineschemaerror' oder 'expected dict, got tuple'
+    → reason_code=CLASSIFICATION_SCHEMA_FAILED."""
+    _app = _load_app_fresh()
+    job1 = {'status': 'failed',
+             'error': "_PipelineSchemaError: matched_days[7].dp: expected dict, got tuple"}
+    assert _app._classify_failure_reason(job1) == 'CLASSIFICATION_SCHEMA_FAILED'
+
+    job2 = {'status': 'failed',
+             'error': "expected dict, got tuple at matched_days[3]"}
+    assert _app._classify_failure_reason(job2) == 'CLASSIFICATION_SCHEMA_FAILED'
+
+
+def test_v11_cas_pipeline_validates_matched_before_classify():
+    """_classify_v11_cas_pipeline ruft _validate_pipeline_shape auf matched VOR classify_v7."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    # Reihenfolge: Validator vor classify-Aufruf
+    pipeline_idx = src.find('def _classify_v11_cas_pipeline')
+    block = src[pipeline_idx:pipeline_idx + 15000]
+    validate_pos = block.find("_validate_pipeline_shape(matched, _SCHEMA_MATCHED_DAYS")
+    classify_pos = block.find('_deterministic_classify_v7(matched')
+    assert validate_pos > 0, 'Schema-Validator fehlt vor classify_v7'
+    assert classify_pos > 0
+    assert validate_pos < classify_pos, 'Validator muss VOR classify_v7 aufgerufen werden'
+
+
+def test_cas_merge_default_off():
+    """v13 Phase 2A: AEROTAX_CAS_MERGE Default ist '0' (per-file parallel)."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    # Default in _sonnet_read_cas_structured
+    assert "os.environ.get('AEROTAX_CAS_MERGE', '0')" in src
+    # Begründung im Kommentar
+    assert "Variante A default OFF" in src or "default OFF" in src
+
+
 def test_invariant_no_raw_errors_in_user_messages():
     _app = _load_app_fresh()
     for code, ec in _app.AEROTAX_ERROR_CODES.items():

@@ -2395,6 +2395,10 @@ def _classify_failure_reason(job):
         ('tuple' in error_low or 'list' in error_low or 'nonetype' in error_low) and
         'get' in error_low):
         return 'CLASSIFICATION_SCHEMA_FAILED'
+    # _PipelineSchemaError (von _validate_pipeline_shape) → Schema-Verstoß explizit
+    if 'pipelineschemaerror' in error_low or 'expected dict, got tuple' in error_low \
+            or 'expected list, got' in error_low or 'expected dict, got' in error_low:
+        return 'CLASSIFICATION_SCHEMA_FAILED'
     if 'payment' in error_low:
         return 'PAYMENT_VERIFY_FAILED'
     if 'rate' in error_low and 'limit' in error_low:
@@ -9910,12 +9914,15 @@ def _sonnet_read_cas_structured(cas_bytes, year=2025, homebase='FRA', job_id=Non
 
     import hashlib as _hl
 
-    # Variante A — Merge-Path zuerst versuchen wenn ≥2 Files + Flag aktiv.
-    # Bei 1 File spart Merge nichts; bei Vision-Bedarf returnt es None.
+    # v13 Phase 2A: Variante A default OFF — per-file parallel ist Default.
+    # Begründung: Capture-Run #2 zeigte 580s Wallclock für Variante A bei 12 Files
+    # (Sonnet streamt 34075 Output-Tokens für 365 Tage). Per-file mit parallel=2:
+    # 12 Files × ~35-60s parallel ≈ 4-6 Min total, plus Fehler-Isolation pro Datei.
+    # Aktivieren via AEROTAX_CAS_MERGE=1 (Experiment-Flag, nicht Default).
     try:
-        merge_enabled = os.environ.get('AEROTAX_CAS_MERGE', '1') == '1'
+        merge_enabled = os.environ.get('AEROTAX_CAS_MERGE', '0') == '1'
     except Exception:
-        merge_enabled = True
+        merge_enabled = False
     if merge_enabled and len(cas_list) >= 2:
         merged = _sonnet_read_cas_merged_text(cas_list, year, homebase, source_filenames, job_id)
         if merged:
@@ -11994,6 +12001,24 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
         print("[v11-cas-pipeline] _match_cas_se_per_day lieferte keine Matches")
         return None
     print(f"[v11-cas-pipeline] Matched {len(matched)} Tage CAS+SE")
+
+    # v13 Phase 2D: Schema-Validator VOR classify_v7.
+    # Wenn matched eine non-dict-Element enthält (tuple/list/None/str), fangen
+    # wir das HIER mit klarem path-Tracking statt im classify-Loop mit
+    # generic AttributeError. Schema-Validator raised _PipelineSchemaError —
+    # die State-Machine routet das via Heuristik auf CLASSIFICATION_SCHEMA_FAILED
+    # (failed_support, kein Retry).
+    try:
+        _validate_pipeline_shape(matched, _SCHEMA_MATCHED_DAYS, 'matched_days')
+    except _PipelineSchemaError as _ve:
+        print(f"[v11-cas-pipeline] SCHEMA-CHECK FAIL pre-classify: {_ve}")
+        _save_pipeline_snapshot(job_id, 'matched_schema_invalid', {
+            'matched_count': len(matched),
+            'error_path': str(_ve)[:500],
+        }, error=_ve)
+        # Re-raise damit der außere except (in hybrid_analyze) das als
+        # CLASSIFICATION_SCHEMA_FAILED routet
+        raise
 
     # v13 Bug-Hunt-Snapshot: matched-Liste VOR classify_v7 sichern.
     # Wenn classify_v7 crash (z.B. tuple-bug), haben wir die Input-Daten für Offline-Debug.
