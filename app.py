@@ -11982,6 +11982,36 @@ def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=
         return None
     print(f"[v11-cas-pipeline] Matched {len(matched)} Tage CAS+SE")
 
+    # v13 Bug-Hunt-Snapshot: matched-Liste VOR classify_v7 sichern.
+    # Wenn classify_v7 crash (z.B. tuple-bug), haben wir die Input-Daten für Offline-Debug.
+    # Sample der ersten 5 + letzten 3 Einträge — keine binaries, keine PDFs.
+    try:
+        _matched_sample = []
+        for _idx in (list(range(min(5, len(matched)))) +
+                      list(range(max(0, len(matched) - 3), len(matched)))):
+            _m = matched[_idx] if _idx < len(matched) else None
+            if _m is None: continue
+            _matched_sample.append({
+                'idx': _idx,
+                'type': type(_m).__name__,
+                'is_dict': isinstance(_m, dict),
+                'shape': (sorted(_m.keys())[:10] if isinstance(_m, dict)
+                          else (f'tuple-len-{len(_m)}' if isinstance(_m, tuple)
+                                else str(_m)[:80])),
+            })
+        # Type-Distribution
+        _type_dist = {}
+        for _m in matched:
+            _t = type(_m).__name__
+            _type_dist[_t] = _type_dist.get(_t, 0) + 1
+        _save_pipeline_snapshot(job_id, 'pre_classify_v7', {
+            'matched_count': len(matched),
+            'matched_type_distribution': _type_dist,
+            'matched_sample': _matched_sample,
+        })
+    except Exception as _snap_e:
+        print(f"[v11-cas-pipeline] snapshot pre_classify_v7 fail: {_snap_e}")
+
     # Klassifikation (bewährter v7-Klassifikator)
     classification = _deterministic_classify_v7(matched, year, homebase,
                                                  commute_minutes=commute_minutes)
@@ -15095,6 +15125,14 @@ def hybrid_analyze(form, files, job_id=None):
         except Exception as e:
             errors.append(f'CAS-Pipeline: {type(e).__name__}: {str(e)[:200]}')
             print(f"[v11-cas-pipeline] crash: {type(e).__name__}: {str(e)[:200]}")
+            # v13 Bug-Hunt: voller Traceback statt nur Message — verrät Datei + Zeile.
+            import traceback as _ctb
+            _trace = _ctb.format_exc()[:3000]
+            print(f"[v11-cas-pipeline] TRACEBACK:\n{_trace}")
+            _save_pipeline_snapshot(job_id, 'v11_cas_pipeline_crash', {
+                'error_type': type(e).__name__,
+                'error_message': str(e)[:500],
+            }, error=e)
             classification = None
 
     elif dp_bytes:
