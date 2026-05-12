@@ -1744,6 +1744,51 @@ def process_real():
         # /api/internal/process-job — Worker läuft SYNCHRON im HTTP-Request, Cloud Run
         # killt nichts mehr wegen idle-Time.
         if AEROTAX_EXECUTION_MODE == 'cloud_tasks':
+            # v13 Cloud Tasks Bug-Fix (Capture-Run #1): /api/process empfängt
+            # Files direkt im POST body (request.files). Im Thread-Mode wurden
+            # sie an _calc_queue.put((id, form, files)) übergeben — die Bytes
+            # waren via Function-Arg verfügbar.
+            # Im cloud_tasks-Mode aber lädt der Worker Files via
+            # _load_uploaded_files_supabase(ref) — wenn /api/process die Files
+            # nicht in der uploaded_files-Tabelle persistiert, hat der Worker
+            # keinen Zugriff (CAS=False im PARALLEL READER → Pipeline fail).
+            #
+            # Fix: vor dem Cloud-Task-Dispatch alle Files in Supabase persistieren.
+            # Wenn kein ref aus /api/upload-files vorhanden: generiere fallback-ref.
+            sb_ref = (form.get('ref') or '').strip()
+            if not sb_ref:
+                sb_ref = f'auto-{job_id[:12]}'
+                form['ref'] = sb_ref
+            # Files zum Supabase-Format formen: {key: [(bytes, fname), ...]}
+            files_sb_format = {}
+            for k, items in files.items():
+                if not items:
+                    continue
+                files_sb_format[k] = []
+                for it in items:
+                    if isinstance(it, tuple) and len(it) >= 2:
+                        files_sb_format[k].append((it[0], it[1] or f'{k}.pdf'))
+                    elif isinstance(it, (bytes, bytearray)):
+                        files_sb_format[k].append((bytes(it), f'{k}.pdf'))
+                    else:
+                        # Skip unbekannte Shape (defensive)
+                        continue
+            try:
+                _save_uploaded_files_supabase(sb_ref, files_sb_format)
+                _file_count = sum(len(v) for v in files_sb_format.values())
+                print(f"[process] cloud_tasks: {_file_count} Files in Supabase persistiert (ref={sb_ref[:12]})")
+            except Exception as _se:
+                # Hart fail: ohne persistierte Files kann Worker nichts laden
+                _set_job_failed(job_id, 'WORKER_RESTARTED',
+                                 f'Failed to persist files: {str(_se)[:200]}')
+                print(f"[process] cloud_tasks file-persist FAIL: {_se}")
+                return jsonify({
+                    'job_id': job_id,
+                    'status': 'failed',
+                    'error': 'Auswertung konnte nicht gestartet werden — Datei-Persistenz fehlgeschlagen.',
+                    'session_token': session_token,
+                }), 500
+
             # Form ans Job hängen — Worker im nächsten Request liest es aus Persistenz
             with _jobs_lock:
                 _jobs[job_id]['form'] = form

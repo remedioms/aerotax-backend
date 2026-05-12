@@ -78,7 +78,7 @@ def test_process_enqueues_cloud_task(monkeypatch):
     src = open(_app.__file__).read()
     process_idx = src.find('# v13 Cloud Tasks: Verzweigung')
     assert process_idx > 0, 'cloud_tasks Verzweigung im /api/process fehlt'
-    block = src[process_idx:process_idx + 3000]
+    block = src[process_idx:process_idx + 6000]
     assert "AEROTAX_EXECUTION_MODE == 'cloud_tasks'" in block
     assert '_enqueue_cloud_task(' in block
 
@@ -88,7 +88,7 @@ def test_process_returns_queued_not_running(monkeypatch):
     _app = _load_app_fresh()
     src = open(_app.__file__).read()
     process_idx = src.find('# v13 Cloud Tasks: Verzweigung')
-    block = src[process_idx:process_idx + 3000]
+    block = src[process_idx:process_idx + 6000]
     assert "'status': 'queued'" in block
     assert "'canonical_state': 'queued'" in block
     assert "'execution_mode': 'cloud_tasks'" in block
@@ -204,17 +204,26 @@ def test_internal_worker_failed_support_returns_200_no_retry(monkeypatch):
 
 
 def test_no_background_thread_in_cloud_tasks_mode():
-    """In cloud_tasks-mode: /api/process puttet nicht in _calc_queue."""
+    """In cloud_tasks-mode: /api/process puttet nicht in _calc_queue (aktiv).
+    Kommentare die '_calc_queue.put' erwähnen sind erlaubt."""
     src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
-    # Branch: cloud_tasks-Pfad ruft _enqueue_cloud_task, NICHT _calc_queue.put
     idx = src.find("AEROTAX_EXECUTION_MODE == 'cloud_tasks'")
     assert idx > 0
-    block = src[idx:idx + 2000]
+    block = src[idx:idx + 6000]
     # _enqueue_cloud_task ist im Branch
     assert '_enqueue_cloud_task(' in block
-    # Aber _calc_queue.put NICHT — das ist im else/legacy-Branch
-    queue_put_in_branch = block.find('_calc_queue.put(') < block.find('# ── Thread-Mode')
-    # In cloud_tasks-Pfad sollte kein _calc_queue.put sein bevor der else-Branch beginnt
+    # cloud_tasks-Branch endet beim Thread-Mode-Marker
+    thread_marker = block.find('# ── Thread-Mode')
+    assert thread_marker > 0, 'Thread-Mode-Marker muss vorhanden sein'
+    cloud_tasks_branch = block[:thread_marker]
+    # Im cloud_tasks-Branch darf KEIN aktiver _calc_queue.put((job_id, form, files)) Call sein.
+    # Nur Kommentare die das erwähnen (mit # davor) sind OK.
+    for line in cloud_tasks_branch.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            continue  # Kommentar ignorieren
+        assert '_calc_queue.put(' not in stripped, \
+            f'aktiver _calc_queue.put im cloud_tasks-Branch gefunden: {stripped[:80]}'
 
 
 def test_thread_mode_still_works_local_dev():
@@ -294,7 +303,7 @@ def test_cloud_task_retry_count_persistent():
     assert '_save_job_to_disk(job_id)' in block  # persistiert
     # Plus initiales setzen in /api/process
     process_idx = src.find('# v13 Cloud Tasks: Verzweigung')
-    p_block = src[process_idx:process_idx + 2000]
+    p_block = src[process_idx:process_idx + 6000]
     assert "'attempt_id'" in p_block
 
 
@@ -363,6 +372,62 @@ def test_enqueue_raises_when_worker_url_missing(monkeypatch):
     import pytest as _pt
     with _pt.raises(RuntimeError, match='AEROTAX_CLOUD_RUN_WORKER_URL'):
         _app._enqueue_cloud_task('test-job-1', attempt=1)
+
+
+# ─── Bug-Fix: Files müssen vor Cloud-Task-Dispatch in Supabase persistiert sein ─
+
+def test_cloud_tasks_process_persists_files_to_supabase():
+    """v13 Bug-Fix: /api/process im cloud_tasks-Mode ruft _save_uploaded_files_supabase
+    BEVOR _enqueue_cloud_task. Sonst hat Worker keinen Zugriff auf Direct-Upload-Files.
+
+    Capture-Run #1 (2026-05-12) zeigte: ohne diesen Step kommt CAS=False im
+    PARALLEL READER STAGE, weil Worker via _load_uploaded_files_supabase(ref) lädt."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    # Im cloud_tasks-Branch muss _save_uploaded_files_supabase ausgeführt werden
+    idx = src.find("AEROTAX_EXECUTION_MODE == 'cloud_tasks'")
+    assert idx > 0
+    block = src[idx:idx + 4000]
+    assert '_save_uploaded_files_supabase(' in block, \
+        'cloud_tasks-Branch muss Files in Supabase persistieren vor enqueue'
+    # Aufruf-Reihenfolge: persist VOR enqueue
+    persist_pos = block.find('_save_uploaded_files_supabase(')
+    enqueue_pos = block.find('_enqueue_cloud_task(')
+    assert persist_pos > 0 and enqueue_pos > 0
+    assert persist_pos < enqueue_pos, \
+        'Files müssen VOR enqueue persistiert sein'
+
+
+def test_cloud_tasks_process_generates_fallback_ref_when_missing():
+    """Falls /api/process ohne ref aufgerufen wird (Direct-Upload-Only): generiert
+    einen fallback-ref aus job_id."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    idx = src.find("AEROTAX_EXECUTION_MODE == 'cloud_tasks'")
+    block = src[idx:idx + 4000]
+    # Fallback-ref Generation: f'auto-{job_id[:12]}'
+    assert "f'auto-" in block, 'Fallback-ref-Generation fehlt'
+
+
+def test_cloud_tasks_process_hard_fails_on_persist_error():
+    """Wenn _save_uploaded_files_supabase failed: Job sofort als failed mit
+    WORKER_RESTARTED reason_code markieren — NICHT enqueue."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    idx = src.find("AEROTAX_EXECUTION_MODE == 'cloud_tasks'")
+    block = src[idx:idx + 4500]
+    # _set_job_failed mit WORKER_RESTARTED bei persist-fail
+    assert "_set_job_failed(job_id, 'WORKER_RESTARTED'" in block
+    assert 'Failed to persist files' in block
+
+
+def test_cloud_tasks_process_converts_files_to_supabase_format():
+    """Files-Dict {key: [(bytes, fname)|bytes]} → Supabase-Format {key: [(bytes, fname)]}."""
+    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    idx = src.find("AEROTAX_EXECUTION_MODE == 'cloud_tasks'")
+    block = src[idx:idx + 4500]
+    # Format-Konvertierung-Logik
+    assert 'files_sb_format' in block
+    # Behandelt sowohl tuple (bytes, fname) als auch bare bytes
+    assert 'isinstance(it, tuple)' in block
+    assert 'isinstance(it, (bytes, bytearray))' in block
 
 
 if __name__ == '__main__':
