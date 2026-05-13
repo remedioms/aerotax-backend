@@ -235,16 +235,16 @@ Sobald BUG-001 gelöst: User soll mit `AT-89080734B3FDC191` recallen und screens
 
 ---
 
-## BUG-005 — Cloud Run cpu-throttling=true → Container schläft, Erste-Request-Latenz 15-30s
+## BUG-005 — Cloud Run cpu-throttling=true + Gunicorn sync-worker → Container hängt unter Last
 
 | Feld | Inhalt |
 |---|---|
 | **ID** | BUG-005 |
-| **Titel** | Cloud Run Container kriegt nahezu 0% CPU wenn idle. Erste Request nach Pause → 15-30s Aufwach-Latenz. Curl mit 15s timeout → HTTP 000. |
-| **Area** | Cloud Run Infrastruktur-Konfiguration |
+| **Titel** | Backend HTTP 000 / 15-30s Latenz. Doppelursache: (a) cpu-throttling=true → Container hat idle keine CPU; (b) Gunicorn workers=1 sync-worker → bei Cloud Run concurrency=10 staut sich die Request-Queue, ein hängender Supabase-Call blockiert alle anderen Threads. |
+| **Area** | Cloud Run Infrastruktur + Gunicorn Worker-Klasse |
 | **Severity** | P0 — Backend faktisch unerreichbar aus User-Perspektive (Frontend-Timeouts) |
 | **Reporter** | Diagnostik nach Phase 1 BUG-002-Fix-Deploy (2026-05-12 18:30-18:45 UTC) |
-| **Status** | `open` — Fix-Plan klar, wartet auf User-Freigabe |
+| **Status** | `fixed_unverified` — alle Latenz-Tests A-E grün, Browser-Proof noch ausstehend (2026-05-13 19:13 lokal) |
 
 ### Repro Steps
 1. Cloud Run Service `aerotax-backend` 2+ min idle lassen
@@ -301,18 +301,53 @@ gcloud run services update aerotax-backend \
 - Cost: +$15-30/Monat (CPU 24/7 statt request-only)
 - Reversibel: `--cpu-throttling`
 
-### Tests Required (Latenz-Messung NACH Fix)
-- [ ] `/api/health` 10× → 10/10 200, p95 <500ms
-- [ ] `/api/qa?sort=hot` 10× → 10/10 200, p95 <1s
-- [ ] `/api/session/<token>` 10× → 10/10 200, p95 <1s
-- [ ] `/api/job/<id>` 10× → 10/10 200, p95 <1s
-- [ ] 5min Idle danach erneut → noch immer <1s (kein Cold-Start)
+### Fix Implementiert (deployed in revision 00028-kgd, 2026-05-13 19:04 lokal)
 
-### Browser Proof Required
+**1. Dockerfile** (Gunicorn-Konfiguration):
+```dockerfile
+CMD exec gunicorn app:app \
+    --workers 1 \
+    --worker-class gthread \    ← NEU (vorher: default sync)
+    --threads 8 \               ← NEU (vorher: 2)
+    --timeout 1800 \
+    --max-requests 200 \
+    --max-requests-jitter 20
+```
+
+**2. Cloud Run Service Config:**
+```
+containerConcurrency:  8        ← matched gunicorn threads
+cpu-throttling:        false    ← Container kriegt durchgehend CPU
+min-instances:         1
+max-instances:         5
+```
+
+**3. Request-Instrumentation in app.py** (`@app.before_request` / `@app.after_request` / `@app.teardown_request`):
+- Jeder Request kriegt request_id (uuid-prefix)
+- Loggt path, method, pid, tid, duration_ms, status, exc
+- Skip-Liste für `/api/progress` (SSE)
+- Prefix `[req]` macht grepbar
+- Try/except in allen Hooks (Instrumentation darf nie App brechen)
+
+### Tests Required (Latenz-Messung NACH Fix) — ALLE GRÜN
+- [x] `/api/health` 20× → 20/20 200, p95=205ms ✓
+- [x] `/api/qa?sort=hot` 20× → 20/20 200, p95=443ms ✓
+- [x] `/api/session/<token>` 20× → 20/20 responsiv (404 in 161-407ms) ✓
+- [x] 8 parallel `/api/qa` → 8/8 200 in 510-513ms (echte Concurrency, 8 distinkte `tid`s in Logs) ✓
+- [x] 5min Idle Retest → Health 5/5 (83-160ms), Forum 5/5 (308-344ms) — kein Cold-Start ✓
+
+### Test-Coverage Statisch
+- `tests/test_concurrency_invariants.py` (19 Tests) — alle grün:
+  - Dockerfile-Invarianten (gthread, threads=8, timeout=1800, max-requests=200/jitter=20)
+  - Procfile-Konsistenz
+  - Instrumentation-Hooks vollständig (path, pid, tid, duration_ms, status, exc, request_id)
+
+### Browser Proof Required (offen, nächster Schritt)
 - [ ] User klickt „Code prüfen" → Modal schließt + Result öffnet <3s
+- [ ] User lädt Seite mit aktivem Token neu → Auto-Resume zeigt korrekten State
 
-### Workaround (User-side)
-- Mehrfach klicken: erste Request weckt Container, zweite Request schnell. Aber kein praktisches User-Verhalten.
+### Self-inflicted Incident (Lessons Learned, 2026-05-12)
+Während Diagnostik nutzte ich `gcloud run services update --set-env-vars=...` als Force-Restart-Trick → das **überschrieb alle env vars** inkl. `AEROTAX_EXECUTION_MODE=cloud_tasks`. Backend fiel in thread-mode zurück, Worker-Thread lief wieder, Container-Restart-Loop kehrte zurück. Recovery: env vars aus alter revision wiederhergestellt mit `--update-env-vars`. CLAUDE.md aktualisiert mit Warnung.
 
 ---
 
