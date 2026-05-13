@@ -794,6 +794,38 @@ Alle 3 verbleiben `fixed_unverified` bis BUG-012 gefixed + Browser-QA wiederholt
 
 ---
 
+## Audit-Cycle 2026-05-13 — „alles fixen" (Iteration nach Comprehensive-Audit)
+
+### Im aktuellen Cycle gefixt
+
+| Bug | Severity | Fix | Status |
+|---|---|---|---|
+| B-3 (state-bleed dl-btn-main innerHTML) | P1 | render() state-reset cleart innerHTML/disabled/opacity für dl-btn-main + header-pdf-btn | ✅ fixed |
+| B-4 (Chat-Greeting halluziniert „fertig" bei failed-states) | P1 | _chatOpen prüft canonical_state BEVOR Wording-Branch — separate Greetings für failed_*/expired/processing/fetch_error | ✅ fixed |
+| B-5 (Supabase ohne Timeout in 5 Endpoints) | P1 | _supabase_execute_with_timeout-Wrapper für /api/health/full, /api/session-by-code/<code>, _load_pdf (=/api/download) | ✅ fixed |
+| B-7 (PII in stdout-Audit-Logs) | P2 | _audit() redactet via _redact_pii vor stdout-print | ✅ fixed |
+| B-8 partial (aria-labels) | P2 | aria-label auf support-close, qa-close | ✅ partial |
+| B-9 (Touch-Targets <44px) | P2 | chat-reset/close/support-close/qa-close auf 44×44px | ✅ fixed |
+| Position PDF-Card | UX | dl-btn-row jetzt am Ende von p-result, Card-Style identisch chat-bubble | ✅ fixed |
+| 6 obsolete static tests | Tests | aktualisiert für BUG-012-Refactor (konsolidiertes Greeting + Pre-Filter + erweiterter Prompt) | ✅ fixed |
+
+### Verbleibende offene Befunde (nicht in diesem Cycle gefixt)
+
+| Bug | Sev | Status | Reason |
+|---|---|---|---|
+| B-1 (fetch_error nicht im canonical_state-Enum) | P1 | Design-Entscheidung | Trennung: state-machine = job-states, fetch_error = transport-error. Beide nutzen 10-field-shape. Doc-only |
+| B-2 (UI rendert nur Banner, keine Retry/Support-Buttons) | P1 | offen | next_actions-Renderer fehlt im DOM — separate task |
+| B-6 (Legacy-Job ohne session_token = Auth-Bypass) | P2 | offen | Migration-Cutoff-Datum braucht User-Entscheidung |
+| B-10 (Tote/Zombie-Elemente) | P3 | offen | Cleanup-Task, low-impact |
+| B-11 (5 Stellen Hardcoded „Lufthansa" im initial DOM) | P3 | offen | Multi-Carrier-Vorbereitung — kein aktueller Bug |
+| B-8 (94% Buttons ohne aria-label) | P2 | partial | Subset gefixt, vollständiger A11y-Sweep separate Task |
+
+### Tests
+- 1154/1154 grün (vorher 1147/1154)
+- 6 obsolete Tests aktualisiert für BUG-012-Refactor
+
+---
+
 ## Bug-Hygiene-Regeln (verbindlich)
 
 1. **Status nur 4 Werte**: `open` / `in_progress` / `fixed_unverified` / `verified_closed`

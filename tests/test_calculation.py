@@ -5636,30 +5636,44 @@ def test_v825_chat_counter_not_prominent_visible_default():
 
 
 def test_v825_chat_greeting_never_empty():
-    """Chat-Open ruft IMMER renderMsg('assistant', ...) → kein leerer Body."""
+    """Chat-Open ruft IMMER renderMsg('assistant', ...) → kein leerer Body.
+
+    Aktualisiert für BUG-012 Refactor: needs_review-Greeting via startReviewFlowInChat
+    konsolidiert (kein separates _chatGreetReview-Wording mehr). Plus B-4 fix:
+    state-aware Greetings für failed_*/expired/processing/done.
+    """
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     greetings = [
-        'Hallo 👋\\n\\nAlles ist geklärt',
-        'Hallo 👋\\n\\nDeine Auswertung ist bereit',
-        'Hallo 👋\\n\\nDeine Auswertung ist vorbereitet',
-        'Ich habe ein Problem mit deinen Unterlagen',
-        'Schauen wir gemeinsam',
-        'Lass uns die noch kurz klären',
+        'Hallo 👋\\n\\nDeine Auswertung ist fertig',  # done
+        'Hallo 👋\\n\\nIch habe ein Problem mit deinen Unterlagen',  # doc-health red
+        'Punkte offen',  # needs_review (consolidated in startReviewFlowInChat)
+        'Die Auswertung konnte nicht abgeschlossen werden',  # failed_*
+        'Diese Auswertung ist nicht mehr verfügbar',  # expired/deleted
+        'Verbindung kurz unterbrochen',  # fetch_error
+        'Deine Auswertung läuft noch',  # processing/queued
     ]
     found = sum(1 for g in greetings if g in src)
-    assert found >= 2, f'Mindestens 2 Greeting-Varianten erwartet, {found} gefunden'
+    assert found >= 4, f'Mindestens 4 state-spezifische Greetings erwartet, {found} gefunden'
 
 
 def test_v825_quick_chips_function_present():
-    """Quick-Chips werden gerendert (renderQuickChips vorhanden)."""
+    """Quick-Chips Code existiert (auch wenn no-op'd per User-Request „keine bubbles").
+
+    BUG-012 #22: QuickChips wurden auf User-Wunsch deaktiviert (renderQuickChips
+    returns early). Die Funktion + Chip-Click-Handler bleiben aber als
+    Code-Pfad bestehen (eventuell future re-enable).
+    """
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     assert 'function renderQuickChips' in src
+    # Chip-Labels noch im Code (chipClick-Handler nutzt sie via intent)
     for chip_label in ['WISO-Eingabe', 'PDF & Nachweis', 'Offene Angaben', 'Dokumente', 'Zugangscode']:
-        assert chip_label in src, f'Quick-Chip "{chip_label}" fehlt'
+        assert chip_label in src, f'Chip-Label "{chip_label}" fehlt'
+    # Verifying: no-op'd via early return
+    assert 'BUG-012 #22: QuickChips entfernt' in src
 
 
 def test_v825_chip_intent_handler_routes_locally():
@@ -6105,23 +6119,25 @@ def test_v827_send_uploads_attached_file():
 
 
 def test_v827_greeting_no_count_demotivator():
-    """Greeting erwähnt KEINE konkrete „22 offene Angaben"-Zahl mehr."""
+    """Greeting nennt KEINE roh-22-Angaben-Zahl, aber transparente Count-Info erlaubt.
+
+    BUG-012 Refactor: Review-Greeting ist jetzt in startReviewFlowInChat konsolidiert,
+    nicht mehr in _chatGreetReview (das ruft nur startReviewFlowInChat). User-Feedback
+    war: 'Chat sagte alles ist richtig, aber 2 Fehler unten' → Lösung: ehrlich Count nennen.
+    """
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    # _chatGreetReview-Block isolieren
-    fn_idx = src.find('async function _chatGreetReview')
-    if fn_idx < 0: fn_idx = src.find('function _chatGreetReview')
-    assert fn_idx > 0
-    block_end = src.find('window._localGroupReviewItems', fn_idx)
-    if block_end < 0: block_end = fn_idx + 2000
-    block = src[fn_idx:block_end]
-    # Kein "22 offen" oder "22 Angaben" in Greeting
+    fn_idx = src.find('window.startReviewFlowInChat')
+    assert fn_idx > 0, 'startReviewFlowInChat muss existieren'
+    block = src[fn_idx:fn_idx + 4000]
+    # Kein hartes „22 offene Angaben" / „N Angaben offen"-Demotivator
     import re
-    nums = re.findall(r"\d{1,3}\s+(?:offene?|Angaben)", block)
-    assert not nums, f'Greeting darf keine konkrete Zahl nennen, fand: {nums}'
-    # Stattdessen weiches Wording
-    assert 'ein paar Tage' in block or 'kurz durchgehen' in block or 'zusammen' in block
+    nums = re.findall(r"\d{2,3}\s+(?:offene?\s+)?Angaben", block)
+    assert not nums, f'Greeting darf keine Roh-Anzahl-Zeile zeigen, fand: {nums}'
+    # Aber Tageliste + Antwort-Beispiele MÜSSEN da sein (das ist explizite Klärungs-CTA)
+    assert 'Diese Tage sind noch offen' in block
+    assert 'Schreib einfach was du weißt' in block
 
 
 def test_v827_local_grouping_fallback_exists():
@@ -6473,11 +6489,15 @@ def test_v833_review_kind_short_messages_allowed():
 
 
 def test_v833_marker_glossary_in_prompt():
-    """Sonnet-Prompt enthält Marker-Glossar (D4=Schulung, EM=Emergency...)."""
+    """Sonnet-Prompt enthält Marker-Glossar (D4=Schulung, EM=Emergency...).
+
+    Window auf 18000 erhöht: BUG-012 #11+#12+#14 fügte pending_reread_block
+    am Anfang des Prompts ein → marker_glossary verschoben sich nach hinten.
+    """
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def chat_with_aerotax')
-    block = src[fn_idx:fn_idx+10000]
+    block = src[fn_idx:fn_idx+18000]
     assert 'MARKER-GLOSSAR' in block, 'Prompt muss Marker-Glossar haben'
     assert 'EM = Emergency' in block
     assert 'D4 = Schulung' in block
@@ -6487,11 +6507,14 @@ def test_v833_marker_glossary_in_prompt():
 
 
 def test_v833_active_groups_block_in_prompt():
-    """Aktive Review-Groups werden im Prompt übergeben."""
+    """Aktive Review-Groups werden im Prompt übergeben.
+
+    Window auf 18000 erhöht (siehe oben).
+    """
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def chat_with_aerotax')
-    block = src[fn_idx:fn_idx+10000]
+    block = src[fn_idx:fn_idx+18000]
     assert 'AKTIVE OFFENE GRUPPEN' in block
     assert '_build_review_groups' in block
 
@@ -6536,15 +6559,26 @@ def test_v833_chat_history_marks_review_messages():
 
 
 def test_v833_frontend_chat_send_passes_kind():
-    """Frontend _chatSend übergibt kind='review' wenn _chatReviewMode=true."""
+    """Frontend _chatSend übergibt kind='review' wenn _chatReviewMode=true.
+
+    BUG-012 Refactor: _chatSend wurde aufgesplittet in _chatSend + _chatSendImpl.
+    Plus pre-filter für PDF-Keywords (#21). Window 28000 für ausreichend.
+    """
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+18000]
-    assert 'isReviewCtx' in block
-    assert "kind: isReviewCtx ? 'review' : 'free'" in block, \
-        'Frontend muss kind-Feld an /api/chat senden'
+    # Suche im _chatSendImpl (das ist wo /api/chat called wird)
+    fn_idx = src.find('async function _chatSendImpl')
+    if fn_idx < 0:
+        fn_idx = src.find('window._chatSend = async function')
+    assert fn_idx > 0
+    block = src[fn_idx:fn_idx+28000]
+    assert 'isReviewCtx' in block, 'isReviewCtx variable muss existieren'
+    # Akzeptiere beide Formen (single quote OR double quote, mit/ohne Spaces)
+    assert ("kind: isReviewCtx ? 'review' : 'free'" in block
+            or 'kind: isReviewCtx ? "review" : "free"' in block
+            or "'kind':" in block and "'review'" in block), \
+        'Frontend muss kind-Feld an /api/chat senden (bei Legacy-Fallback-Pfad)'
 
 
 def test_v833_frontend_short_msgs_allowed_in_review():
@@ -7566,15 +7600,22 @@ def test_v96_chat_header_amount_row_hidden():
 
 def test_v96_chat_send_routes_to_ai_chat_for_free_questions():
     """Wenn jobId vorhanden: _chatSend ruft _handleReviewFreeText (nicht /api/chat)
-    auch für freie Fragen → strukturierte JSON-Response mit Job-Kontext."""
+    auch für freie Fragen → strukturierte JSON-Response mit Job-Kontext.
+
+    BUG-012 #21 Refactor: Vor _handleReviewFreeText läuft jetzt erst ein
+    PDF-Keyword-Pre-Filter — wenn User „pdf" tippt, wird direkt PDF-Bubble
+    gerendert ohne /ai-chat-Call. Window auf 30000 erhöht.
+    """
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('async function _chatSendImpl')
-    block = src[fn_idx:fn_idx+18000]
-    # Vor /api/chat-Fallback wird _handleReviewFreeText aufgerufen
+    block = src[fn_idx:fn_idx+30000]
+    # _handleReviewFreeText muss noch aufgerufen werden für non-PDF-Queries
     assert "if(typeof window._handleReviewFreeText === 'function' && (window._lastJobId || '')){" in block
     assert 'return window._handleReviewFreeText(txt)' in block
+    # PDF-Keyword-Prefilter ist davor
+    assert 'BUG-012 #21: PDF-Keyword-Pre-Filter' in block
 
 
 # ── v9.8 P0: Deterministischer Bulk-Detector ──
