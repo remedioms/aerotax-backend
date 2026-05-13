@@ -15,7 +15,7 @@
 | **Severity** | P0 |
 | **User impact** | Funktionaler Lock-out: User mit gültigem Zugangscode kommt nicht zur Auswertung zurück. |
 | **Reporter** | User (2026-05-12 17:30 UTC) |
-| **Status** | `open` |
+| **Status** | `fixed_unverified` — Browser-QA war erfolgreich solange QA-Seed-Jobs im in-memory `_jobs` lebten (Revision 00030). Nach Container-Restart (Revision 00031, leere `_jobs`-Dict) hängt `/api/session/<token>` weil `_load_job_from_disk` einen Supabase-`jobs`-Table-Query macht, der nie zurückkommt (siehe BUG-005). Browser-Symptom „Verbindung dauert länger als erwartet" zurück. Bei Recall-Flow weiterhin betroffen. |
 
 ### Repro Steps
 1. `https://aerosteuer.de/` öffnen
@@ -244,7 +244,7 @@ Sobald BUG-001 gelöst: User soll mit `AT-89080734B3FDC191` recallen und screens
 | **Area** | Cloud Run Infrastruktur + Gunicorn Worker-Klasse |
 | **Severity** | P0 — Backend faktisch unerreichbar aus User-Perspektive (Frontend-Timeouts) |
 | **Reporter** | Diagnostik nach Phase 1 BUG-002-Fix-Deploy (2026-05-12 18:30-18:45 UTC) |
-| **Status** | `fixed_unverified` — alle Latenz-Tests A-E grün, Browser-Proof noch ausstehend (2026-05-13 19:13 lokal) |
+| **Status** | `fixed_unverified` — **Gthread+Concurrency Teil-Fix wirkt** (Health/Forum/non-existent-tokens schnell, 8 echte concurrent threads). **ABER der Supabase-Load-Path hängt weiterhin**: `/api/job/<random-uuid>` hängt 30s+, `/api/session/<token>` mit valid job_id ebenfalls. Root-cause-Hypothese: `_load_job_from_disk` macht `sb.table('jobs').select(...).execute()` ohne Timeout, supabase-Query auf `jobs`-Table hängt. Browser-QA war "grün" weil QA-Seed-Jobs im in-memory `_jobs`-Dict lagen (von der gleichen Revision erstellt). Nach Container-Restart wäre BUG-005 sofort wieder sichtbar. **Verified_closed wäre falsch gewesen.** |
 
 ### Repro Steps
 1. Cloud Run Service `aerotax-backend` 2+ min idle lassen
@@ -512,7 +512,7 @@ Wird in `/api/qa/ask` per-Request gestartet. Cloud Run kann den Container beende
 | **Area** | Frontend Auto-Resume bei Reload |
 | **Severity** | P0 — User mit needs_review-Token reloadet → keine „kurze Klärung nötig"-Banner-Info |
 | **Reporter** | Phase 2 Bug-Hunt Code-Inspection 2026-05-12 |
-| **Status** | `open` |
+| **Status** | `fixed_unverified` — Frontend-Code-Fix in index.html:6316 ist deployed und statisch korrekt (11 Tests grün, alle 10 state-fields werden an render() durchgereicht). In Browser-QA hat Auto-Resume mit QA-Seed-needs_review-Token korrekt funktioniert. ABER: Verified-Closed setzt voraus dass `/api/session/<token>` zuverlässig respondiert. Aktuell blockiert durch BUG-005 (Supabase-jobs-Load hängt). BUG-009 Frontend-Fix isoliert betrachtet ist korrekt; End-to-End-Verifikation hängt an BUG-005-Fix. |
 
 ### Repro Steps
 1. User mit `canonical_state=needs_review`-Token öffnet die Seite

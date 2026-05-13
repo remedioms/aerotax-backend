@@ -87,6 +87,43 @@ import threading as _req_threading
 import time as _req_time
 import uuid as _req_uuid
 
+
+# ── BUG-005 P0-Fix Teil 2: Supabase-Timeout-Helper ────────────────────────────
+# Verhindert dass eine hängende Supabase-Query den ganzen Request-Handler blockiert.
+# Default 5s timeout. Module-level ThreadPool — timed-out futures laufen im Hintergrund
+# weiter und werden vom Pool recycled, kein Thread-Leak. cancel_futures=False ist OK,
+# weil die Pool-Größe begrenzt ist und Cloud Run die Container ohnehin recycled.
+#
+# Symptom vor Fix: `sb.table('jobs').select(...).execute()` hat 30+ Sekunden gehangen
+# wenn der supabase-py-Client in einem schlechten Verbindungszustand war. Da der Call
+# innerhalb von `with _jobs_lock:` lief, hingen ALLE anderen Lock-User auch.
+import concurrent.futures as _sb_cf
+_SB_TIMEOUT_EXECUTOR = _sb_cf.ThreadPoolExecutor(
+    max_workers=16,
+    thread_name_prefix='sb-timeout',
+)
+
+def _supabase_execute_with_timeout(label, fn, timeout_s=5):
+    """Run fn (typically a wrapped supabase .execute()) with a hard timeout.
+
+    Returns (result, timed_out_or_failed_flag).
+    On timeout or exception: returns (None, True) and logs reason.
+
+    Verwendung:
+        def _do(): return sb.table('jobs').select('data').eq('job_id', x).execute()
+        res, timed_out = _supabase_execute_with_timeout('load_job', _do, timeout_s=5)
+    """
+    try:
+        fut = _SB_TIMEOUT_EXECUTOR.submit(fn)
+        try:
+            return fut.result(timeout=timeout_s), False
+        except _sb_cf.TimeoutError:
+            print(f'[supabase-timeout] {label} exceeded {timeout_s}s — returning None')
+            return None, True
+    except Exception as e:
+        print(f'[supabase-timeout] {label} error: {type(e).__name__}: {e}')
+        return None, True
+
 _REQ_LOG_PREFIX = '[req]'
 # Pfade die NICHT instrumentiert werden (zu noisy oder uninteressant):
 #   /api/progress (SSE-Endpoint, langer Open)
@@ -1243,6 +1280,9 @@ def requires_session_token(fn):
     """Decorator: lädt Job, prüft Session-Token. 403 bei Fehlen/Falsch.
     Funktion bekommt den Job geladen UND validiert übergeben.
     Verwendung: View-Funktion erste Position `job_id`, Decorator liest selbst.
+
+    BUG-005 P0-Fix: nutzt `_get_or_load_job` — hält `_jobs_lock` NICHT während
+    Supabase-Load. Bei Supabase-Timeout: 503 fetch_error statt 30s-Hang.
     """
     import functools as _ft
     @_ft.wraps(fn)
@@ -1250,8 +1290,9 @@ def requires_session_token(fn):
         job_id = kwargs.get('job_id') or (args[0] if args else None)
         if not job_id:
             return jsonify({'error': 'job_id fehlt'}), 400
-        with _jobs_lock:
-            j = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        j, load_status = _get_or_load_job(job_id)
+        if load_status == 'timeout':
+            return jsonify(_fetch_error_response()), 503
         if not j:
             return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
         expected = (j.get('session_token') or '').strip()
@@ -1271,32 +1312,109 @@ def requires_session_token(fn):
 
 
 def _load_job_from_disk(job_id):
-    """v9.7: Lädt Job-State zuerst aus Supabase (überlebt Restart),
-    dann Disk-Fallback. Bei Erfolg auch ins _jobs-Memory-Dict spiegeln."""
-    # 1. Supabase
+    """v9.7 + BUG-005 P0-Fix: Lädt Job-State aus Supabase (überlebt Restart) mit
+    5s Timeout, dann Disk-Fallback.
+
+    Verwendet `_supabase_execute_with_timeout` → bei Hang return None statt
+    endlos hängen.
+
+    **Hält KEIN `_jobs_lock`** (auch nicht zum Memory-Mirror) — siehe
+    `_get_or_load_job()` für die Lock-Sequenz, die Caller verwenden sollen.
+
+    Returns: job_dict_or_None — gleiche Signatur wie vorher (backwards-compat).
+
+    Achtung: `None` heißt "nicht gefunden ODER timeout". Wer den Unterschied
+    braucht → `_get_or_load_job(job_id)` benutzen (gibt status-tuple zurück).
+    """
+    # 1. Supabase mit Timeout
     if SB_AVAILABLE:
-        try:
-            res = sb.table('jobs').select('data').eq('job_id', job_id).limit(1).execute()
-            rows = (res and res.data) or []
+        def _do_sb_query():
+            return sb.table('jobs').select('data').eq('job_id', job_id).limit(1).execute()
+        res, timed_out = _supabase_execute_with_timeout(
+            f'_load_job({job_id[:8]})', _do_sb_query, timeout_s=5
+        )
+        if timed_out:
+            # Nicht Disk fallback bei Timeout — vermutlich ist Supabase die
+            # vertrauenswürdigere Quelle, Disk könnte stale sein.
+            return None
+        if res is not None:
+            rows = (res.data) or []
             if rows and rows[0].get('data'):
-                data = rows[0]['data']
-                with _jobs_lock:
-                    _jobs[job_id] = data
-                return data
-        except Exception as e:
-            print(f"[persist] Job {job_id[:8]} supabase load fail: {e} — try disk")
-    # 2. Disk-Fallback
+                return rows[0]['data']
+    # 2. Disk-Fallback (nur wenn Supabase nicht-existierender oder beide leer)
     path = os.path.join(_JOBS_DIR, f'{job_id}.json')
-    if not os.path.exists(path): return None
+    if not os.path.exists(path):
+        return None
     try:
         with open(path) as f:
-            data = json.load(f)
-            with _jobs_lock:
-                _jobs[job_id] = data
-            return data
+            return json.load(f)
     except Exception as e:
         print(f"[persist] Job {job_id[:8]} disk load fail: {e}")
         return None
+
+
+def _load_job_from_persistence(job_id):
+    """Wie `_load_job_from_disk`, aber unterscheidet timeout vs not-found.
+
+    Returns (job_dict_or_None, timed_out_flag).
+      - (dict, False)  → erfolgreich geladen
+      - (None, False)  → nicht gefunden (weder Supabase noch Disk)
+      - (None, True)   → Supabase-Query timed out (caller: fetch_error-response)
+    """
+    if SB_AVAILABLE:
+        def _do_sb_query():
+            return sb.table('jobs').select('data').eq('job_id', job_id).limit(1).execute()
+        res, timed_out = _supabase_execute_with_timeout(
+            f'_load_job({job_id[:8]})', _do_sb_query, timeout_s=5
+        )
+        if timed_out:
+            return None, True
+        if res is not None:
+            rows = (res.data) or []
+            if rows and rows[0].get('data'):
+                return rows[0]['data'], False
+    path = os.path.join(_JOBS_DIR, f'{job_id}.json')
+    if not os.path.exists(path):
+        return None, False
+    try:
+        with open(path) as f:
+            return json.load(f), False
+    except Exception as e:
+        print(f"[persist] Job {job_id[:8]} disk load fail: {e}")
+        return None, False
+
+
+def _get_or_load_job(job_id):
+    """Memory-first Job-Lookup mit Lock-Disziplin.
+
+    KRITISCH: hält `_jobs_lock` NIEMALS während Supabase/Disk-I/O. Vorher hing
+    der Lock für 30s+ wenn `sb.table('jobs').execute()` blockierte → ALLE
+    anderen Lock-User waren blockiert → /api/session und /api/job hingen 30s.
+
+    Returns (job_dict_or_None, load_status).
+      load_status: 'memory'    → war schon in _jobs
+                   'persisted' → frisch aus Supabase/Disk geladen + ins _jobs gespiegelt
+                   'timeout'   → Supabase-Query hing → caller sollte fetch_error returnen
+                   'not_found' → nirgendwo zu finden → caller sollte expired returnen
+
+    Caller MUST handle 'timeout' separately from 'not_found' — sonst rendert User
+    eine „abgelaufen"-Meldung obwohl es nur ein transient DB-Hang ist.
+    """
+    if not job_id:
+        return None, 'not_found'
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+    if j is not None:
+        return j, 'memory'
+    # KEIN Lock während Persistenz-I/O
+    j, timed_out = _load_job_from_persistence(job_id)
+    if timed_out:
+        return None, 'timeout'
+    if j is None:
+        return None, 'not_found'
+    with _jobs_lock:
+        _jobs[job_id] = j
+    return j, 'persisted'
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2386,6 +2504,13 @@ AEROTAX_ERROR_CODES = {
         'user_message': 'Wir konnten deine Zahlung nicht überprüfen. Bitte kontaktiere den Support — wir vermeiden doppelte Belastungen.',
         'retryable':    False,
         'support':      True,
+    },
+    # ── Datenbank/Fetch-Fehler (retryable) ─────────────────────────────────
+    'SUPABASE_TIMEOUT': {
+        'user_title':   'Auswertung konnte gerade nicht geladen werden',
+        'user_message': 'Bitte versuche es gleich erneut.',
+        'retryable':    True,
+        'support':      False,
     },
     # ── Session/Access (nicht retryable) ───────────────────────────────────
     'ACCESS_CODE_EXPIRED': {
@@ -4968,43 +5093,87 @@ if os.environ.get('AEROTAX_DISABLE_BG_THREADS') != '1':
 
 
 def _load_session(token):
-    if not token: return None
+    """BUG-005 P0-Fix: ruft `_load_session_safe` und ignoriert den timeout-flag.
+    Für backward-compat. Wer den Unterschied zwischen timeout und not-found
+    braucht → `_load_session_safe(token)` benutzen.
+    """
+    s, _timed_out = _load_session_safe(token)
+    return s
+
+
+def _load_session_safe(token):
+    """Session-Load mit 5s Supabase-Timeout.
+
+    Returns (session_dict_or_None, timed_out_flag).
+      - (dict, False) → geladen (entweder Supabase oder Disk)
+      - (None, False) → nicht gefunden ODER abgelaufen
+      - (None, True)  → Supabase-Query timed out → caller: fetch_error-Response
+
+    KEINE Lock-Acquisition (Sessions sind kein _jobs_lock-protected state).
+    """
+    if not token:
+        return None, False
     if SB_AVAILABLE:
-        try:
-            r = sb.table('sessions').select('*').eq('token', token).limit(1).execute()
-            if r.data:
-                row = r.data[0]
-                # Expiry-Check
-                try:
-                    exp_str = (row.get('expires_at') or '').replace('Z', '').split('+')[0]
-                    if datetime.fromisoformat(exp_str) < datetime.utcnow():
-                        return None
-                except: pass
-                # Frontend-kompatible Form zurückgeben
-                return {
-                    'token': row.get('token'),
-                    'job_id': row.get('job_id'),
-                    'result_data': row.get('result_data') or {},
-                    'notes': row.get('notes') or [],
-                    'download_url': row.get('download_url'),
-                    'chat_history': row.get('chat_history') or [],
-                    'expires': row.get('expires_at'),
-                }
-        except Exception as e:
-            print(f"[supabase] session load fail: {e} — fallback to disk")
+        def _do_sb_query():
+            return sb.table('sessions').select('*').eq('token', token).limit(1).execute()
+        r, timed_out = _supabase_execute_with_timeout(
+            f'_load_session({token[:12]})', _do_sb_query, timeout_s=5
+        )
+        if timed_out:
+            return None, True
+        if r is not None and r.data:
+            row = r.data[0]
+            try:
+                exp_str = (row.get('expires_at') or '').replace('Z', '').split('+')[0]
+                if datetime.fromisoformat(exp_str) < datetime.utcnow():
+                    return None, False
+            except: pass
+            return {
+                'token':        row.get('token'),
+                'job_id':       row.get('job_id'),
+                'result_data':  row.get('result_data') or {},
+                'notes':        row.get('notes') or [],
+                'download_url': row.get('download_url'),
+                'chat_history': row.get('chat_history') or [],
+                'expires':      row.get('expires_at'),
+            }, False
     # Disk-Fallback
     path = os.path.join(_SESSION_DIR, f'{token}.json')
-    if not os.path.exists(path): return None
+    if not os.path.exists(path):
+        return None, False
     try:
         with open(path) as f:
             data = json.load(f)
         try:
             exp = datetime.fromisoformat(data['expires'].replace('Z', ''))
             if exp < datetime.utcnow():
-                return None
+                return None, False
         except: pass
-        return data
-    except: return None
+        return data, False
+    except:
+        return None, False
+
+
+def _fetch_error_response():
+    """Liefert die kanonische fetch_error JSON-Response für Supabase-Hangs.
+
+    Wird von /api/session und /api/job verwendet wenn _load_*_safe einen
+    timeout-flag zurückgibt. HTTP-Status: 503 (caller wraps).
+    """
+    ec = AEROTAX_ERROR_CODES['SUPABASE_TIMEOUT']
+    return {
+        'canonical_state':              'fetch_error',
+        'reason_code':                  'SUPABASE_TIMEOUT',
+        'user_title':                   ec['user_title'],
+        'user_message':                 ec['user_message'],
+        'next_actions':                 [{'type': 'retry', 'label': 'Erneut versuchen'}],
+        'pdf_allowed':                  False,
+        'retry_allowed':                True,
+        'support_recommended':          False,
+        'can_chat_explain_calculation': False,
+        'can_show_final_amount':        False,
+        'error':                        ec['user_message'],
+    }
 
 
 @app.route('/api/session-by-code/<code>', methods=['GET'])
@@ -5058,8 +5227,13 @@ def session_recall(token):
 
     v12 Phase A: liefert canonical_state + reason_code + user_title +
     user_message + next_actions[] zusätzlich zu den bestehenden Feldern.
+
+    BUG-005 P0-Fix: Session + Job-Load mit je 5s Timeout. Bei Supabase-Hang:
+    HTTP 503 mit canonical_state='fetch_error' statt 30s-Hang.
     """
-    s = _load_session(token)
+    s, session_timed_out = _load_session_safe(token)
+    if session_timed_out:
+        return jsonify(_fetch_error_response()), 503
     if not s:
         # Token weder gefunden noch erkannt → expired (state-machine response).
         state = _classify_job_state(None, None)
@@ -5073,8 +5247,9 @@ def session_recall(token):
     job_id = s.get('job_id') or ''
     job = None
     if job_id:
-        with _jobs_lock:
-            job = _jobs.get(job_id) or _load_job_from_disk(job_id)
+        job, load_status = _get_or_load_job(job_id)
+        if load_status == 'timeout':
+            return jsonify(_fetch_error_response()), 503
     safe.update(_classify_job_state(job, s))
     return jsonify(safe)
 
