@@ -588,14 +588,21 @@ def _save_pdf(token, pdf_bytes, filename, hours=PDF_TTL_HOURS):
 
 
 def _load_pdf(token):
-    """In-Memory zuerst, dann Supabase. Returns (bytes, filename, expires) or None."""
+    """In-Memory zuerst, dann Supabase. Returns (bytes, filename, expires) or None.
+
+    B-5 P1 Fix: 5s Timeout auf Supabase-Query — vorher konnte hängender PDF-Load
+    den /api/download-Endpoint 30s+ blockieren."""
     entry = _store.get(token)
     if entry and entry.get('pdf_bytes'):
         return entry['pdf_bytes'], entry.get('filename') or 'AeroTax_Auswertung.pdf', entry.get('expires')
     if SB_AVAILABLE:
+        def _do_pdf_load(): return sb.table('pdfs').select('*').eq('token', token).limit(1).execute()
+        r, timed_out = _supabase_execute_with_timeout(
+            f'_load_pdf({token[:12]})', _do_pdf_load, timeout_s=5)
+        if timed_out:
+            return None
         try:
-            r = sb.table('pdfs').select('*').eq('token', token).limit(1).execute()
-            if r.data:
+            if r is not None and r.data:
                 row = r.data[0]
                 exp = None
                 try:
@@ -1668,7 +1675,12 @@ def cleanup_old_job_chunks():
 
 
 def _audit(job_id, event, data=None):
-    """Schreibt Audit-Event in Job-Log + Render-Stdout. Audit-konform für Tax-Compliance."""
+    """Schreibt Audit-Event in Job-Log + Render-Stdout. Audit-konform für Tax-Compliance.
+
+    B-7 Audit-Fix: PII wird VOR stdout-print über _redact_pii gefiltert. Job-Audit-Log
+    wird beim Persist-Step (_save_job_to_disk → _redact_pii) ohnehin redacted, aber
+    stdout-Lines gingen vorher ungeredactet raus.
+    """
     entry = {
         'ts': datetime.utcnow().isoformat() + 'Z',
         'event': event,
@@ -1677,7 +1689,12 @@ def _audit(job_id, event, data=None):
     with _jobs_lock:
         if job_id in _jobs:
             _jobs[job_id].setdefault('audit', []).append(entry)
-    print(f"[AUDIT {job_id[:8]}] {event}: {json.dumps(data, default=str)[:200] if data else ''}")
+    # B-7: Redaction für stdout (nicht für in-memory audit log — der wird beim Save redacted)
+    try:
+        _safe_data = _redact_pii(data) if data else ''
+    except Exception:
+        _safe_data = '<redact-fail>'
+    print(f"[AUDIT {job_id[:8]}] {event}: {json.dumps(_safe_data, default=str)[:200] if _safe_data else ''}")
 
 
 def _validate_file_categories(files):
@@ -4684,16 +4701,23 @@ def full_health_check():
     except Exception as e:
         health['stripe'] = f'fail: {str(e)[:120]}'
     # Supabase — DB read + uploaded_files / pdfs Tabellen erreichbar
+    # B-5 P1 Fix: 3s Timeout pro Query (statt unbounded). Hängende Supabase
+    # darf Health-Endpoint nicht 30s+ blockieren (Load-Balancer würde Container killen).
     if not SB_AVAILABLE:
         health['supabase'] = 'not_configured'
     else:
-        try:
-            sb.table('sessions').select('token').limit(1).execute()
-            sb.table('pdfs').select('token').limit(1).execute()
-            sb.table('uploaded_files').select('id').limit(1).execute()
+        def _sb_sessions(): return sb.table('sessions').select('token').limit(1).execute()
+        def _sb_pdfs():     return sb.table('pdfs').select('token').limit(1).execute()
+        def _sb_files():    return sb.table('uploaded_files').select('id').limit(1).execute()
+        _s_ok, _s_to = _supabase_execute_with_timeout('health_sessions', _sb_sessions, timeout_s=3)
+        _p_ok, _p_to = _supabase_execute_with_timeout('health_pdfs',     _sb_pdfs,     timeout_s=3)
+        _f_ok, _f_to = _supabase_execute_with_timeout('health_files',    _sb_files,    timeout_s=3)
+        if _s_to or _p_to or _f_to:
+            health['supabase'] = 'timeout'
+        elif _s_ok is not None and _p_ok is not None and _f_ok is not None:
             health['supabase'] = 'ok'
-        except Exception as e:
-            health['supabase'] = f'fail: {str(e)[:120]}'
+        else:
+            health['supabase'] = 'fail'
     overall = 'ok' if all(v == 'ok' for k, v in health.items() if k not in ('timestamp', 'server', 'heif')) else 'degraded'
     health['overall'] = overall
     return jsonify(health), 200 if overall == 'ok' else 503
@@ -5208,18 +5232,20 @@ def session_by_short_code(code):
     if not _qa_rate_check(ip, 'short-code', max_per_hour=20):
         return jsonify({'error': 'Zu viele Versuche — bitte später erneut.'}), 429
 
-    # Iteriere über aktive sessions im store + supabase
+    # B-5 P1 Fix: Full-table-scan auf sessions mit Timeout. Wächst linear mit
+    # User-Anzahl — ohne Timeout DoS-Vektor. 5s sollte für ein paar tausend
+    # Rows reichen; bei größeren Tabellen muss Index/Hash-Lookup hinzu.
     matched_token = None
     if SB_AVAILABLE:
-        try:
-            res = sb.table('sessions').select('token').execute()
+        def _scan_sessions(): return sb.table('sessions').select('token').execute()
+        res, timed_out = _supabase_execute_with_timeout(
+            f'session_by_code({code})', _scan_sessions, timeout_s=5)
+        if not timed_out and res is not None:
             for row in (res.data or []):
                 tok = row.get('token', '')
                 if tok and _make_short_code(tok) == code:
                     matched_token = tok
                     break
-        except Exception:
-            pass
     if not matched_token:
         # Fallback: Disk-basierte Sessions durchsuchen
         try:
