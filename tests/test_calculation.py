@@ -6323,12 +6323,17 @@ def test_v829_upload_replacement_uses_fetch_with_timeout():
 
 
 def test_v829_no_session_shows_visible_warning():
-    """Wenn getSession() null returns → renderMsg('assistant', ...) mit Warnung statt silent return."""
+    """Wenn getSession() null returns → renderMsg('assistant', ...) mit Warnung statt silent return.
+
+    F-21 Refactor: _chatSend ist jetzt In-Flight-Guard-Wrapper, der echte session-check
+    ist in _chatSendImpl.
+    """
     import os
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
-    fn_idx = src.find('window._chatSend = async function')
-    block = src[fn_idx:fn_idx+1500]
+    fn_idx = src.find('async function _chatSendImpl')
+    assert fn_idx > 0
+    block = src[fn_idx:fn_idx+3000]
     # if(!session) muss renderMsg-Call enthalten, nicht nur "return;"
     no_session_idx = block.find('if(!session)')
     assert no_session_idx > 0

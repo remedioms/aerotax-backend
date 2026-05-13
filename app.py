@@ -2126,12 +2126,30 @@ def internal_process_job():
     if status == 'cancelled':
         return jsonify({'idempotent': True, 'no_retry': True, 'status': 'cancelled'}), 200
 
-    # processing mit gleicher oder höherer attempt → ignore duplicate
+    # processing mit gleicher oder höherer attempt → ggf. ignore duplicate,
+    # ABER: CR-1 Audit-Fix — wenn `processing_started_at` älter als STALE_THRESHOLD,
+    # nehmen wir an dass der Container mid-process gekillt wurde und der Job stuck ist.
+    # Re-Process erlauben statt für immer im 'processing'-State stehen zu lassen.
     if status == 'processing' and current_attempt >= attempt:
-        return jsonify({
-            'idempotent': True, 'duplicate': True,
-            'current_attempt': current_attempt, 'task_attempt': attempt,
-        }), 200
+        _is_stale = False
+        try:
+            _started_str = (j.get('processing_started_at') or '').replace('Z', '').split('+')[0]
+            if _started_str:
+                _started = datetime.fromisoformat(_started_str)
+                _age_sec = (datetime.utcnow() - _started).total_seconds()
+                # 15min ist großzügig für unsere Pipeline (CAS+Sonnet+ReportLab=max 8min)
+                if _age_sec > 900:
+                    _is_stale = True
+                    print(f"[worker] CR-1 stale-detection: job {job_id[:8]} processing for "
+                          f"{int(_age_sec)}s — re-attempt allowed (vorheriger Container gekillt?)")
+        except Exception as _se:
+            print(f"[worker] CR-1 stale-check failed: {_se} — annahme: not stale")
+        if not _is_stale:
+            return jsonify({
+                'idempotent': True, 'duplicate': True,
+                'current_attempt': current_attempt, 'task_attempt': attempt,
+            }), 200
+        # else: fall through to re-process
 
     # ── Files + Form rekonstruieren ────────────────────────────────────
     form = j.get('form') or {}
@@ -5142,9 +5160,78 @@ def cleanup_old_supabase_state():
 # Der Loop polls Supabase alle 2/30 Min — im API-Container nicht nötig (Stale-Detection
 # greift auf in-memory _jobs, das in cloud_tasks-mode leer bleibt). Cloud Tasks + Supabase-
 # TTLs übernehmen Cleanup. Ein expliziter Cleanup-Service folgt bei Bedarf separat.
+def _cloud_tasks_slim_cleanup_loop():
+    """BG-1 Audit-Fix: minimaler Cleanup-Loop für cloud_tasks-Mode.
+
+    Vorher war der ganze Cleanup-Loop in cloud_tasks-Mode deaktiviert weil er
+    auf in-memory _jobs operierte (das in cloud_tasks-Mode leer ist).
+    Resultat: stuck-processing jobs werden nie als failed markiert (CR-1).
+
+    Diese slim-Version:
+    - Pollt Supabase alle 5 Min nach jobs mit status='processing' AND
+      processing_started_at älter als 15 Min → markiert als failed_retryable
+    - Cleanup von expired sessions + pdfs + uploaded_files alle 30 Min
+    - KEIN in-memory-Cleanup (gibt's hier eh kaum was)
+    """
+    import time as _t
+    cycle = 0
+    while True:
+        try:
+            _t.sleep(300)  # 5 Min
+            cycle += 1
+            if not SB_AVAILABLE:
+                continue
+            # Stale-Job-Detection (alle 5 Min)
+            def _scan_stale():
+                cutoff = (datetime.utcnow() - timedelta(minutes=15)).isoformat() + 'Z'
+                return sb.table('jobs').select('job_id,data').lt('updated_at', cutoff).limit(50).execute()
+            res, timed_out = _supabase_execute_with_timeout(
+                'bg1_stale_scan', _scan_stale, timeout_s=10)
+            if timed_out or res is None:
+                continue
+            for row in (res.data or []):
+                jid = row.get('job_id')
+                jdata = row.get('data') or {}
+                if not isinstance(jdata, dict):
+                    continue
+                st = jdata.get('status')
+                if st != 'processing':
+                    continue
+                # Job hängt — als failed_retryable markieren
+                jdata['status'] = 'failed'
+                jdata['reason_code'] = 'WORKER_RESTARTED'
+                jdata['error'] = 'Auswertung wurde unterbrochen (Container-Restart). Bitte erneut starten — kostenlos.'
+                jdata['failed_at'] = datetime.utcnow().isoformat() + 'Z'
+                def _persist_failed():
+                    return sb.table('jobs').update({
+                        'data': jdata,
+                        'updated_at': datetime.utcnow().isoformat() + 'Z',
+                    }).eq('job_id', jid).execute()
+                _supabase_execute_with_timeout(f'bg1_fail_{jid[:8]}', _persist_failed, timeout_s=5)
+                print(f"[bg1-cleanup] Job {jid[:8]} stale-failed (>15min processing)")
+            # Voll-Cleanup alle 6 Cycles = 30 Min
+            if cycle % 6 == 0:
+                try:
+                    now_iso = datetime.utcnow().isoformat()
+                    def _del_sess(): return sb.table('sessions').delete().lt('expires_at', now_iso).execute()
+                    def _del_pdf():  return sb.table('pdfs').delete().lt('expires_at', now_iso).execute()
+                    def _del_up():   return sb.table('uploaded_files').delete().lt('expires_at', now_iso).execute()
+                    _supabase_execute_with_timeout('bg1_del_sess', _del_sess, timeout_s=5)
+                    _supabase_execute_with_timeout('bg1_del_pdf',  _del_pdf,  timeout_s=5)
+                    _supabase_execute_with_timeout('bg1_del_up',   _del_up,   timeout_s=5)
+                except Exception as _e:
+                    print(f"[bg1-cleanup] full-cleanup fail: {_e}")
+        except Exception as _e:
+            print(f"[bg1-cleanup] cycle exception: {_e}")
+
+
 if os.environ.get('AEROTAX_DISABLE_BG_THREADS') != '1':
     if AEROTAX_EXECUTION_MODE == 'cloud_tasks':
-        print("[boot] cloud_tasks mode: cleanup-loop background thread disabled")
+        # BG-1 Audit-Fix: starte slim-cleanup-thread auch in cloud_tasks-mode
+        print("[boot] cloud_tasks mode: slim cleanup-loop (stale-job-detection only) enabled")
+        __import__('threading').Thread(
+            target=_cloud_tasks_slim_cleanup_loop,
+            daemon=True, name='bg1-cleanup-slim').start()
     else:
         __import__('threading').Thread(target=_cleanup_loop, daemon=True, name='cleanup-loop').start()
 
@@ -6199,7 +6286,14 @@ def _send_support_email_notification(record):
         return
     try:
         import urllib.request, urllib.error
-        subject = f"[AeroTAX Support] {record.get('reason','—')} · {record.get('email','')}"
+        # S-5 Audit-Fix: Email-Felder gegen CRLF-Injection bereinigen. User-Submitted
+        # `email` und `reason` dürfen keine \r/\n im Subject-Header haben, sonst SMTP-
+        # Header-Injection in der Resend-API möglich.
+        def _hdr_safe(s):
+            return (str(s or '').replace('\r', ' ').replace('\n', ' ')[:200]).strip()
+        _safe_email   = _hdr_safe(record.get('email',''))
+        _safe_reason  = _hdr_safe(record.get('reason','—'))
+        subject = f"[AeroTAX Support] {_safe_reason} · {_safe_email}"
         html_body = (
             f"<h2 style='font-family:sans-serif'>Neue Support-Anfrage</h2>"
             f"<p style='font-family:sans-serif;color:#444'>"

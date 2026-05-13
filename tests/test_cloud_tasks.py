@@ -324,7 +324,7 @@ def test_cloud_task_retry_count_persistent():
     src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
     # Worker-Endpoint setzt attempt_id im job
     worker_idx = src.find('def internal_process_job(')
-    block = src[worker_idx:worker_idx + 4000]
+    block = src[worker_idx:worker_idx + 6500]  # window erweitert nach CR-1 stale-detection insertion
     assert "j['attempt_id'] = attempt" in block
     assert '_save_job_to_disk(job_id)' in block  # persistiert
     # Plus initiales setzen in /api/process
@@ -352,7 +352,7 @@ def test_frontend_polling_not_required_for_job_survival():
     Code-Check: _run_process_async wird SYNCHRON im Worker-Endpoint gerufen."""
     src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
     worker_idx = src.find('def internal_process_job(')
-    block = src[worker_idx:worker_idx + 4000]
+    block = src[worker_idx:worker_idx + 6500]  # window erweitert nach CR-1 stale-detection insertion
     # Synchroner Aufruf — kein threading.Thread, kein _calc_queue.put
     assert '_run_process_async(job_id, form, files)' in block
     assert 'threading.Thread' not in block

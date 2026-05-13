@@ -20,11 +20,15 @@ def _read():
 
 
 def _auto_resume_block():
+    """Liefert den _autoResume-Block. Window auf 6000 chars erweitert wegen F-08
+    Race-Guard-Insertion + F-10 Timeout-Wrapper + F-14 pollIv-canonical_state-Pass.
+    """
     src = _read()
-    idx = src.find('_autoResume')
+    idx = src.find('async function _autoResume')
+    if idx < 0:
+        idx = src.find('_autoResume')
     assert idx > 0
-    # nimm ~3000 chars rund um auto-resume
-    return src[idx:idx + 3000]
+    return src[idx:idx + 6000]
 
 
 # ─── Fix verifiziert: canonical_state wird durchgereicht ─────────────────────
