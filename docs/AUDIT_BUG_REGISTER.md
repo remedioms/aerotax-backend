@@ -826,6 +826,57 @@ Alle 3 verbleiben `fixed_unverified` bis BUG-012 gefixed + Browser-QA wiederholt
 
 ---
 
+## Audit-Cycle 3 — Tiefen-Audit „alles erst finden an bugs" (2026-05-13 late)
+
+Zwei parallele Tiefen-Audits (Backend + Frontend) + Live-API-Fuzzing identifizierten ~70 Befunde.
+
+### Gefixt in diesem Cycle
+
+| Bug | Sev | Fix | Status |
+|---|---|---|---|
+| F-14 | **P0** | Auto-Resume pollIv branch reicht canonical_state + 10 weitere state-fields an render() weiter (BUG-009 Regression) | ✅ |
+| F-26 | **P0** | payment_intent persistiert in localStorage; Recovery-Pfad bei reload zwischen Stripe-success und process() | ✅ |
+| F-10 | P1 | Auto-Resume initial-fetch hat jetzt 15s AbortController-Timeout | ✅ |
+| F-11 | P2 | pollIv max-60-iterations cap (5min statt endlos) | ✅ |
+| F-21 | P1 | _chatSend in-flight-guard verhindert Spam-Klicks | ✅ |
+| R-3 | P1 | /api/job/<id> nutzt _get_or_load_job (fetch_error 503 statt false-expired) | ✅ |
+| S-1 | P1 | /api/admin/support-list hmac.compare_digest gegen Timing-Attack | ✅ |
+| I-3 | P1 | MAX_CONTENT_LENGTH = 50 MB | ✅ |
+| SM-1 | P1 | _classify_job_state: pending_reread=True → needs_review (statt done+PDF-Button-409) | ✅ |
+| F-60 safe | P1 | _review_items isinstance(list)-Check gegen Backend-Korruption | ✅ |
+
+### Bewusst NICHT in diesem Cycle (zu komplex / braucht Architektur-Entscheidung)
+
+| Bug | Sev | Reason für Defer |
+|---|---|---|
+| **CR-1** | **P0** | Cloud Tasks Retry stuck-forever wenn Container mid-process gekillt → braucht State-Machine-Update (attempt_id+attempt-counter logik) + cleanup_loop re-enable in cloud_tasks-mode. Eigener Cycle. |
+| **D-1** | **P0** | payment_intent_id Multi-Container-Bypass → braucht Supabase atomic CAS oder Stripe-direct-verify-every-time. Architektur. |
+| R-4 | P1 | /api/internal/process-job hält Lock während Supabase — gleicher Pattern wie BUG-005 aber im Worker übersehen. Refactor. |
+| BG-1 | P1 | _cleanup_loop deaktiviert in cloud_tasks-mode → Stale-Job-Detector läuft nie. Wieder aktivieren mit überschaubarer Logik. |
+| RX-1, RX-4 | P1 | _store + _jobs unbounded → OOM bei langlebigem Container. TTL/LRU einbauen. |
+| D-3 | P1 | _save_job_to_disk ohne Versioning → parallele Endpoints überschreiben sich. Optimistic-Lock via supabase version-column. |
+| S-5 | P1 | Support-Email CRLF-Injection in Header. Email-Sanitize-Helper. |
+| F-42 | P1 | Z-Index-Chaos + ESC-Handler fehlt für Modals. UI-Cleanup-Cycle. |
+| F-27, F-30 | P1 | Keine Frontend-File-Size-Validation. UI-Cleanup. |
+| F-36 | P1 | Optional chaining ohne Transpile — alte Browser crashen. Polyfill oder Babel-Build. |
+| F-59 | P1 | canonical_state='unknown' fallback rendert leeren Hero. UI-Branch hinzufügen. |
+| **F-63** (= B-2) | P1 | next_actions wird in allowed_actions durchgereicht, aber kein DOM-Renderer rendert die Buttons. Renderer-Erweiterung. |
+
+**Total verbleibend: 12 P1, 2 P0 (Cloud-Tasks-Retry + Payment-Multi-Container) + ~50 P2/P3.**
+
+### Disaster-Recovery-Findings die User merken können
+
+1. **Container restart mid-job** (CR-1): User sieht „Auswertung läuft" endlos, kein automatischer Fail nach 15min weil BG-1.
+2. **Payment-success → reload während process()** (F-26 partly fixed): localStorage-Recovery jetzt vorhanden, aber Backend muss noch Idempotenz-Check verbessern (D-1).
+3. **Browser-Tab open mehrere Tage** (F-11 fixed, F-15/F-16): leaks reduziert, aber langfristig immer noch nicht clean.
+4. **Concurrent Recall + Auto-Resume** (F-08): Race-Condition möglich, State-Tearing.
+
+### Tests
+- 162 grün (Subset)
+- Vollregression: 1154 grün
+
+---
+
 ## Bug-Hygiene-Regeln (verbindlich)
 
 1. **Status nur 4 Werte**: `open` / `in_progress` / `fixed_unverified` / `verified_closed`
