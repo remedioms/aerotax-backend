@@ -620,6 +620,79 @@ Plus: Detail-Tabelle nur bei `show_detail_table=true`.
 
 ---
 
+## BUG-011 — Kein sichtbarer kostenloser / QA-Testpfad auf der Landing-Page
+
+| Feld | Inhalt |
+|---|---|
+| **ID** | BUG-011 |
+| **Titel** | Erwartung „kostenlos starten" wird nicht erfüllt — Promo/SMOKETEST-Pfad zu versteckt; „kostenlos"-Wording in FAQ/Hints/Retry-Button suggeriert öffentlichen Free-Modus, der nicht existiert. |
+| **Area** | Frontend Landing/Step3 UX + Wording |
+| **Severity** | P2 — UX-Problem, kein Funktionsbug. Backend + Free-Code-Pfad funktionieren korrekt. |
+| **Reporter** | User (Browser-QA-Session 2026-05-13) |
+| **Status** | `open` — nicht blockierend für Beta-Launch oder BUG-001/005/009. Fix später. |
+
+### Repro Steps
+1. https://aerosteuer.de öffnen
+2. „Kostenlos / kostenlose Auswertung starten"-Button suchen
+3. **Erwartet:** ein sichtbarer, eindeutiger Free-CTA für QA/Beta-Tester
+4. **Beobachtet:** kein public „kostenlos starten"-CTA existiert. Default-Hauptbutton sagt „Jetzt für 19,99 € kaufen". Promo-Pfad ist hinter `<details>` „Promo-Code einlösen?" in Step 3 versteckt (collapsed by default).
+
+### Root Cause (verifiziert via Code-Read)
+**Free-Pfad funktioniert technisch, ist aber UX-unsichtbar:**
+
+- `index.html` Z. 2265: pay-btn default `data-default-text="Jetzt für 19,99 € kaufen"`
+- `index.html` Z. 2281: `<details>` „Promo-Code einlösen?" — collapsed, nur 11.5px-Text, low-contrast
+- `index.html` Z. 2535-2562: `applyPromo()` setzt `_free=true`, ändert pay-btn-Text zu „Kostenlose Auswertung starten", versteckt Stripe-Section
+- `index.html` Z. 2617-2627: `pay()` umgeht Stripe direkt wenn `_free=true`
+- `app.py` Z. 1739-1745: `/api/process` akzeptiert `promo_code` gegen `PROMO_CODES` env-Whitelist (`is_promo` als gültiger Bezahl-Surrogat)
+
+Cloud Run env: `PROMO_CODES = SMOKETEST` ✓ gesetzt
+
+**„kostenlos"-Wording an irreführenden Stellen:**
+- FAQ (Z. 5426): „Belege nachreichen, Chat fortsetzen oder PDF nochmal laden, alles kostenlos" → meint Recall, nicht Erstauswertung
+- Hint (Z. 4855): „können wir kostenlos neu rechnen" → meint Reklamation
+- Retry-Button (Z. 7215): „Jetzt erneut versuchen — kostenlos" → nur nach Failed-Eval
+
+User-Erwartung: „irgendwo gibt's einen kostenlosen Pfad". Realität: nur über manuell-eingegebenen Promo-Code, der nicht öffentlich kommuniziert wird.
+
+### Fix-Optionen (für später, nicht jetzt)
+
+**Option A (minimal — Wording-Korrektur):**
+- FAQ-Text präziser: „Recall ist kostenlos. Erstauswertung kostet 19,99 €."
+- Retry-Button: „Jetzt erneut versuchen (im Rahmen deiner bestehenden Auswertung)"
+- Hint: „können wir auf Anfrage neu rechnen"
+
+**Option B (UX — sichtbarer Promo-Bereich):**
+- Promo-`<details>` in Step 3 default-aufgeklappt, oder zumindest auffälliger
+- Klare Label: „Promo-Code? Klick hier" mit Icon
+
+**Option C (QA-Modus — env-gated CTA):**
+- `AEROTAX_SHOW_QA_BANNER=1` Cloud Run env (off in prod)
+- Wenn aktiv: kleines „🧪 QA-Test-Modus: Code SMOKETEST verfügbar"-Banner auf Landing
+- Setzt voraus dass Backend `PROMO_CODES` enthält
+- Off in prod = absolut keine Spur
+
+**Option D (echter Free-CTA — Produkt-Entscheidung):**
+- „14-Tage Probierperiode" oder „Erste Auswertung gratis"
+- Produkt-/Pricing-Entscheidung des Eigentümers, nicht Engineering-Fix
+
+### Tests Required (wenn Fix implementiert)
+- [ ] `test_promo_code_smoketest_skips_stripe` (DOM-statisch: `_free=true` → pay() ruft process())
+- [ ] `test_promo_code_invalid_rejected` (DOM: `_free=false` bleibt → Stripe-Pfad)
+- [ ] `test_backend_promo_code_validates_env_whitelist` (already exists in test_calculation.py?)
+
+### Workaround (aktuell)
+QA-Tester muss wissen:
+1. 3 Pflichtfiles hochladen
+2. In Step 3 die `<details>` „Promo-Code einlösen?" aufklappen
+3. `SMOKETEST` eingeben + „Einlösen" klicken
+4. Pay-Button-Text ändert sich zu „Kostenlose Auswertung starten"
+5. Klick → kein Stripe, direkt /api/process
+
+**Für aktuelle BUG-001/005/009 Browser-QA:** nicht relevant — QA-Seed-Tokens umgehen `/api/process` komplett (`/api/session/<token>` Recall-Pfad).
+
+---
+
 ## Bug-Hygiene-Regeln (verbindlich)
 
 1. **Status nur 4 Werte**: `open` / `in_progress` / `fixed_unverified` / `verified_closed`
