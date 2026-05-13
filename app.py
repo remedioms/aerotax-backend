@@ -894,7 +894,13 @@ def _normalize_upload(file_bytes, filename=''):
 # ── ASYNC JOB STORE + PERSISTENZ ───────────────────────────────
 # In-Memory Job-Store für schnellen Zugriff, plus Disk-Persistierung für Restart-Resilience.
 _jobs = {}
-_jobs_lock = __import__('threading').Lock()
+_jobs_lock = __import__('threading').RLock()
+# BUG-012 #17: RLock statt Lock — re-entrant für selben Thread.
+# Vorher konnte ein Handler `with _jobs_lock:` haben und intern `_save_job_to_disk`
+# rufen, das selbst `with _jobs_lock:` macht → Deadlock mit threading.Lock.
+# RLock ist re-entrant: gleicher Thread kann den Lock mehrfach acquiren ohne
+# zu blocken (acquire-counter wird inkrementiert). Multi-Thread-Safety bleibt
+# gewährleistet — andere Threads warten wie vorher.
 _JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jobs_state')
 os.makedirs(_JOBS_DIR, exist_ok=True)
 
