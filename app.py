@@ -3933,12 +3933,19 @@ def post_upload_replacement(job_id):
     except Exception:
         pass
 
+    # BUG-012 #10: Lock-Disziplin (gleicher Pattern wie BUG-005 P0-Fix).
+    # Vorher: `with _jobs_lock: j = _jobs.get() or _load_job_from_disk()` →
+    # Lock während Supabase-I/O gehalten. Bei hängender Supabase: 30s+ Timeout
+    # für upload-replacement-Endpoint, Frontend zeigte „Das hat zu lange gedauert".
+    j, load_status = _get_or_load_job(job_id)
+    if load_status == 'timeout':
+        return jsonify(_fetch_error_response()), 503
+    if not j:
+        return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
+    # v8.23: pending_reread-Flag blockiert finalize-pdf bis volle Re-Verarbeitung
+    # implementiert ist. Ehrlich begrenzt — keine UI-Behauptung "aktualisiert".
+    # Mutation: kurzer Lock nur für die _jobs-Updates, keine I/O dazwischen.
     with _jobs_lock:
-        j = _jobs.get(job_id) or _load_job_from_disk(job_id)
-        if not j:
-            return jsonify({'error': 'Diese Auswertung ist nicht mehr verfügbar — bitte starte eine neue Auswertung.'}), 404
-        # v8.23: pending_reread-Flag blockiert finalize-pdf bis volle Re-Verarbeitung
-        # implementiert ist. Ehrlich begrenzt — keine UI-Behauptung "aktualisiert".
         j['pending_reread'] = True
         j['pending_reread_doc_types'] = list(set(
             (j.get('pending_reread_doc_types') or []) + [doc_type]
@@ -3957,10 +3964,12 @@ def post_upload_replacement(job_id):
                 },
                 'timestamp': datetime.now().isoformat(),
             })
-        try:
-            _save_job_to_disk(job_id)
-        except Exception:
-            pass
+        _jobs[job_id] = j
+    # Supabase-Persistenz AUSSERHALB des Locks
+    try:
+        _save_job_to_disk(job_id)
+    except Exception:
+        pass
 
     return jsonify({
         'status': 'received_pending_reread',
@@ -5451,8 +5460,35 @@ def chat_with_aerotax():
     except Exception:
         active_groups_block = ''
 
+    # BUG-012 #11 + #12 + #14: pending_reread-Context für Sonnet sichtbar machen.
+    # Vorher hallucinierte AI „wir aktualisieren deine Auswertung" obwohl Backend
+    # selektives Re-Read laut v8.23-Spec NICHT macht. AI muss ehrlich sagen können
+    # dass die Datei nur vorgemerkt ist, keine automatische Neu-Berechnung folgt.
+    pending_reread_block = ''
+    try:
+        job_id_for_pending = session.get('job_id') or ''
+        if job_id_for_pending:
+            _jpr, _ = _get_or_load_job(job_id_for_pending)
+            if _jpr and _jpr.get('pending_reread'):
+                doc_types = _jpr.get('pending_reread_doc_types') or []
+                pending_reread_block = (
+                    '═══ STATUS: Datei nachgereicht (pending_reread=True) ═══\n'
+                    f'Doc-Types: {", ".join(doc_types) if doc_types else "unbekannt"}\n'
+                    'WICHTIG: Eine vom User nachgereichte Datei wurde empfangen, aber das System\n'
+                    'macht AKTUELL KEINE automatische Re-Auswertung. Sage NIEMALS „wir aktualisieren"\n'
+                    'oder „die Auswertung läuft jetzt neu". Sag stattdessen ehrlich:\n'
+                    '„Datei ist angekommen und vorgemerkt. Aktuell läuft KEINE automatische Neu-Auswertung —\n'
+                    'dafür braucht es eine vollständige Neu-Bearbeitung über Support oder Neustart."\n'
+                    'Sage auch NIEMALS dass du die Datei „gelesen" hast — du hast nur die Metadaten.\n'
+                    'Spekuliere NICHT über Inhalt oder Datum der Datei (kein „Januar-Plan", kein Datum).'
+                )
+    except Exception:
+        pending_reread_block = ''
+
     prompt = f"""Du bist AeroTAX, der Werbungskosten-Auswertungs-Assistent von aerosteuer.de.
 AeroTAX ist eine Berechnungs- und Dokumentationshilfe — KEINE Steuerberatung.
+
+{pending_reread_block}
 
 Du beantwortest STRENG NUR Fragen aus diesen erlaubten Themen:
 
@@ -16456,13 +16492,17 @@ def _marker_family(marker):
 
 
 def _build_review_groups(review_items):
-    """v8.26: Clustert review_items zu sinnvollen Gruppen für Konversation.
+    """v8.26 + BUG-012 #4: Clustert review_items zu sinnvollen Gruppen für Konversation.
 
     Regeln:
-    - office_training_time_missing-Items werden gruppiert (unknown_marker einzeln)
+    - office_training_time_missing-Items werden gruppiert
+    - unknown_marker-Items als eigene Gruppen am Ende (eine Gruppe pro first_token)
     - Aufeinanderfolgende Tage (≤2 Tage Abstand) mit derselben Family → Gruppe
     - Verschiedene Family in dichtem Block (z.B. D4+EK) → mixed-Gruppe
     - Übrigbleibende Einzeltage → "single_days"-Gruppe
+
+    Vorher wurden unknown_marker-Items still fallengelassen (Z. 16297-Filter). Frontend
+    hatte 0 Treffer für „unknown_marker" → User sah nie die X9-Frage.
     """
     from datetime import datetime as _dt, timedelta as _td
 
@@ -16552,6 +16592,40 @@ def _build_review_groups(review_items):
                 f'als „alle über 8h" bestätigen oder einzeln durchgehen?'
             ),
         })
+
+    # BUG-012 #4: unknown_marker-Items als eigene Gruppen anhängen.
+    # Vorher wurden sie aus dem Filter oben (Z. 16297) ausgeschlossen → Frontend sah sie nie.
+    # Jetzt: pro unique first_token eine Gruppe (kann mehrere Tage betreffen).
+    unknown_markers = [it for it in (review_items or [])
+                       if it.get('status') == 'pending'
+                       and it.get('type') == 'unknown_marker']
+    if unknown_markers:
+        # Gruppieren by first_token (gleiche Kennung über mehrere Tage = eine Frage)
+        by_token = {}
+        for it in unknown_markers:
+            tok = (it.get('first_token') or it.get('marker') or 'unknown').upper()
+            by_token.setdefault(tok, []).append(it)
+        next_idx = len([g for g in out]) + 1
+        for tok, items in sorted(by_token.items()):
+            datums = sorted([it.get('datum', '') for it in items if it.get('datum')])
+            out.append({
+                'group_id':       f'g{next_idx}',
+                'label':          f'Unbekannte Kennung „{tok}"',
+                'date_range':     _format_singletons_range(items) if datums else '',
+                'date_range_iso': [datums[0], datums[-1]] if datums else ['', ''],
+                'marker_summary': tok,
+                'item_ids':       [it['id'] for it in items],
+                'datums':         datums,
+                'count':          len(items),
+                'group_type':     'unknown_marker',
+                'suggested_question': (
+                    f'Ich habe die Kennung „{tok}" an {len(items)} Tag{"en" if len(items)>1 else ""} gefunden, '
+                    f'aber sie ist mir noch nicht bekannt. Was bedeutet diese Kennung — '
+                    f'Flugdienst, Schulung, Office, Standby, Frei oder etwas Anderes?'
+                ),
+            })
+            next_idx += 1
+
     return out
 
 
