@@ -3806,10 +3806,14 @@ def post_review_answer_bulk(job_id):
             except Exception as _e:
                 print(f'[review-bulk-text] recalc fail: {_e}')
 
-        try:
-            _save_job_to_disk(job_id)
-        except Exception as _e:
-            print(f'[review-bulk-text] save warning: {_e}')
+    # BUG-012 #17 (DEADLOCK-FIX): _save_job_to_disk und _sync_session_result_with_job
+    # AUSSERHALB des `with _jobs_lock:` aufrufen. Beide acquiren intern den gleichen
+    # Lock → mit threading.Lock (nicht RLock) entsteht ein hard deadlock. Symptom war
+    # User-„Ja, übernehmen" → Frontend hängt 60s → „Das hat zu lange gedauert".
+    try:
+        _save_job_to_disk(job_id)
+    except Exception as _e:
+        print(f'[review-bulk-text] save warning: {_e}')
 
     # v8.37: Session.result_data._review_items mit-updaten, damit Recall den
     # post-review-Stand sieht (nicht stale 22 pending). Suche Session(s) mit gleichem job_id.
