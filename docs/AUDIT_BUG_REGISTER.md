@@ -244,7 +244,7 @@ Sobald BUG-001 gelöst: User soll mit `AT-89080734B3FDC191` recallen und screens
 | **Area** | Cloud Run Infrastruktur + Gunicorn Worker-Klasse |
 | **Severity** | P0 — Backend faktisch unerreichbar aus User-Perspektive (Frontend-Timeouts) |
 | **Reporter** | Diagnostik nach Phase 1 BUG-002-Fix-Deploy (2026-05-12 18:30-18:45 UTC) |
-| **Status** | `fixed_unverified` — **Gthread+Concurrency Teil-Fix wirkt** (Health/Forum/non-existent-tokens schnell, 8 echte concurrent threads). **ABER der Supabase-Load-Path hängt weiterhin**: `/api/job/<random-uuid>` hängt 30s+, `/api/session/<token>` mit valid job_id ebenfalls. Root-cause-Hypothese: `_load_job_from_disk` macht `sb.table('jobs').select(...).execute()` ohne Timeout, supabase-Query auf `jobs`-Table hängt. Browser-QA war "grün" weil QA-Seed-Jobs im in-memory `_jobs`-Dict lagen (von der gleichen Revision erstellt). Nach Container-Restart wäre BUG-005 sofort wieder sichtbar. **Verified_closed wäre falsch gewesen.** |
+| **Status** | `fixed_unverified` — P0-Fix in revision 00032-mfl deployed. **Doppelfix:** (1) `_supabase_execute_with_timeout` cap't supabase-Queries auf 5s; (2) `_get_or_load_job` hält `_jobs_lock` NIE während I/O. Latenz-Beweis (2026-05-13 21:52): cold-container post-restart Session-Lookup für QA-Seed-Tokens 42-266ms (p95=114ms), vorher 30s+ hang. Alle [req] starts haben matching [req] done. Browser-Proof noch ausstehend. |
 
 ### Repro Steps
 1. Cloud Run Service `aerotax-backend` 2+ min idle lassen
