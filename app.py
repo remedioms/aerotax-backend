@@ -6008,6 +6008,195 @@ def admin_support_list():
     return jsonify({'count': len(items), 'items': items})
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# /api/admin/qa-seed — synthetischer Session-Seeder für Browser-QA
+#
+# Dormant by default. Aktiviert sich nur wenn env `AEROTAX_QA_SEED_TOKEN` gesetzt.
+# Erzeugt synthetische Jobs+Sessions die durch die NORMALE _classify_job_state-
+# Pipeline laufen — kein Sonnet, kein echter Tax-Workflow, keine echten Daten.
+#
+# Zweck: BUG-001 / BUG-009 / BUG-005 Browser-QA mit gültigen Tokens proven,
+# ohne einen vollen Tibor-Run starten zu müssen.
+#
+# Scenarios:
+#   - needs_review: status=done + _review_items=[{pending}] → canonical=needs_review,
+#                   pdf_allowed=false, Review-Chat-Pfad
+#   - done:         status=done + _review_items=[] + erstelle_pdf → canonical=done,
+#                   pdf_allowed=true, /api/download/<pdf_token> funktioniert
+#
+# Tests: tests/test_qa_seed.py
+# ════════════════════════════════════════════════════════════════════════════
+
+_QA_SEED_RESULT_TEMPLATE = {
+    'name':              'QA Test User',
+    'year':              2025,
+    'km':                25,
+    'fahr_tage':         52,
+    'arbeitstage':       128,
+    'hotel_naechte':     61,
+    'vma_72_tage':       7,
+    'vma_73_tage':       10,
+    'vma_74_tage':       1,
+    'vma_72':            98.00,
+    'vma_73':            140.00,
+    'vma_74':            28.00,
+    'vma_in':            266.00,
+    'vma_aus':           4521.00,
+    'fahr':              471.20,
+    'reinig':            204.80,
+    'trink':             219.60,
+    'gesamt':            5682.60,
+    'ag_z17':            312.00,
+    'spesen_gesamt':     5180.00,
+    'spesen_steuer':     1240.00,
+    'z77':               3940.00,
+    'netto':             1430.60,
+    'brutto':            52800.00,
+    'lohnsteuer':        7640.00,
+    'arbeitgeber':       'QA Synthetic Airline',
+    'uploaded_summary':  'QA-Seed — synthetische Test-Daten, keine echten Steuerdaten',
+    '_qa_seed':          True,
+    'abrechnungen':      [],
+}
+
+
+def _build_qa_seed_review_items():
+    """Zwei pending review_items in exakt der Form die _build_review_items produziert."""
+    return [
+        {
+            'id':            'office_training_time_missing:2025-04-15',
+            'type':          'office_training_time_missing',
+            'severity':      'yellow',
+            'datum':         '2025-04-15',
+            'marker':        'EK',
+            'activity_type': 'office',
+            'question': (
+                'Am 2025-04-15 war ein Office-/Schulungstag (EK) eingetragen — '
+                'wir konnten keine Uhrzeit erkennen. '
+                'Warst du inklusive Hin- und Rückweg länger als 8 Stunden unterwegs?'
+            ),
+            'options': [
+                {'value': 'yes',    'label': 'Ja, über 8h'},
+                {'value': 'no',     'label': 'Nein, unter 8h'},
+                {'value': 'time',   'label': 'Uhrzeit eingeben'},
+                {'value': 'unsure', 'label': 'Ich weiß es nicht'},
+            ],
+            'money_impact_estimate': 14.0,
+            'status':      'pending',
+            'user_answer': None,
+        },
+        {
+            'id':          'unknown_marker:2025-06-20',
+            'type':        'unknown_marker',
+            'severity':    'yellow',
+            'datum':       '2025-06-20',
+            'marker':      'X9',
+            'first_token': 'X9',
+            'question': (
+                'Am 2025-06-20 habe ich die Kennung „X9" gefunden, kenne sie aber noch nicht. '
+                'Was bedeutet diese Kennung?'
+            ),
+            'options': [
+                {'value': 'flight',   'label': 'Flugdienst'},
+                {'value': 'training', 'label': 'Schulung / Training'},
+                {'value': 'sim',      'label': 'Simulator'},
+                {'value': 'office',   'label': 'Bürodienst'},
+                {'value': 'standby',  'label': 'Standby / Bereitschaft'},
+                {'value': 'free',     'label': 'Frei / Urlaub / Krank'},
+                {'value': 'other',    'label': 'Sonstiges'},
+                {'value': 'unsure',   'label': 'Ich weiß es nicht'},
+            ],
+            'money_impact_estimate': 0.0,
+            'status':      'pending',
+            'user_answer': None,
+        },
+    ]
+
+
+@app.route('/api/admin/qa-seed', methods=['POST'])
+def admin_qa_seed():
+    """Synthetic session seeder für Browser-QA. Dormant bis env gesetzt.
+
+    Body: {"scenario": "needs_review" | "done"}
+    Header: X-QA-Seed-Token: <muss zu env AEROTAX_QA_SEED_TOKEN matchen>
+
+    Returns: {token, short_code, canonical_state, pdf_allowed, download_url, expires_at}
+    """
+    expected = os.environ.get('AEROTAX_QA_SEED_TOKEN', '').strip()
+    if not expected:
+        return jsonify({
+            'error': 'qa-seed endpoint dormant',
+            'hint':  'set env AEROTAX_QA_SEED_TOKEN to enable',
+        }), 403
+    provided = (request.headers.get('X-QA-Seed-Token') or '').strip()
+    if not provided or not hmac.compare_digest(expected, provided):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    body = request.get_json(silent=True) or {}
+    scenario = (body.get('scenario') or '').strip().lower()
+    if scenario not in ('needs_review', 'done'):
+        return jsonify({'error': "scenario must be 'needs_review' or 'done'"}), 400
+
+    job_id = str(uuid.uuid4())
+    result_data = dict(_QA_SEED_RESULT_TEMPLATE)
+    result_data['datum'] = datetime.now().strftime('%d.%m.%Y')
+
+    if scenario == 'needs_review':
+        result_data['_review_items'] = _build_qa_seed_review_items()
+        download_url = None
+    else:  # done
+        result_data['_review_items'] = []
+        try:
+            pdf_bytes = erstelle_pdf(result_data)
+            pdf_token = str(uuid.uuid4())
+            _save_pdf(pdf_token, pdf_bytes, 'AeroTax_QA_Seed_2025.pdf', hours=24)
+            download_url = f'/api/download/{pdf_token}'
+        except Exception as e:
+            print(f"[qa-seed] PDF generation failed: {e}")
+            return jsonify({'error': f'pdf generation failed: {e}'}), 500
+
+    token = _make_session_token(job_id)
+
+    job_entry = {
+        'job_id':         job_id,
+        'status':         'done',
+        'data':           result_data,
+        'session_token':  token,
+        'created_at':     datetime.utcnow().isoformat() + 'Z',
+        'updated_at':     datetime.utcnow().isoformat() + 'Z',
+        '_qa_seed':       True,
+    }
+    with _jobs_lock:
+        _jobs[job_id] = job_entry
+    _save_job_to_disk(job_id)
+
+    _save_session(token, {
+        'job_id':       job_id,
+        'result_data':  result_data,
+        'notes':        [],
+        'download_url': download_url,
+        'chat_history': [],
+    })
+
+    state = _classify_job_state(job_entry, None)
+    expires_at = (datetime.utcnow() + timedelta(hours=SESSION_HOURS)).isoformat() + 'Z'
+
+    print(f"[qa-seed] scenario={scenario} token={token[:12]}... job_id={job_id[:8]} "
+          f"canonical={state['canonical_state']} pdf_allowed={state['pdf_allowed']}")
+
+    return jsonify({
+        'token':            token,
+        'short_code':       _make_short_code(token),
+        'job_id':           job_id,
+        'scenario':         scenario,
+        'canonical_state':  state['canonical_state'],
+        'pdf_allowed':      state['pdf_allowed'],
+        'download_url':     download_url,
+        'expires_at':       expires_at,
+        'note':             'QA test session — synthetic data, no Sonnet, no real customer PDF',
+    }), 201
+
+
 @app.route('/api/qa/<qid>/upvote', methods=['POST'])
 def qa_upvote(qid):
     """Upvote für Frage oder Antwort. Body: {answer_id?}."""
