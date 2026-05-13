@@ -725,6 +725,9 @@ QA-Tester muss wissen:
 | 9 | **Suggestion-Bubbles im Review-Chat** | Hardcoded Buttons [Alle über 8h / Alle unter 8h / CAS hochladen / Weiß ich nicht / Überspringen] sind dem User unnötig sichtbar. Wirken wie Spielzeug, nicht wie tool. User explizit: „remove the suggestion bubbles". | **P1** — User-Request |
 | 10 | **Upload-Endpoint Timeout** | „📅 CAS hochladen" → Screenshot.png → „Das hat zu lange gedauert. Der Server schläft vielleicht gerade." Vom Frontend `AbortError` (Z. 9215). Upload via Chat-Attach (`window._pendingAttachDocType = 'roster_screenshot'`) hat keinen Timeout-Schutz wie BUG-005-Fix für /api/session. | **P1** — gleiche BUG-005-Klasse für Upload-Pfad |
 | 11 | **Chat AI-Antwort kontextfremd** | User lädt Screenshot hoch → AI antwortet „Kein Problem – du kannst deinen Januar-Plan einfach neu hochladen". User hat aber nicht Januar erwähnt, AI halluziniert Bezug. | P1 — Halluzination im Review-Chat |
+| 12 | **AI-Chat lügt zum Backend-Verhalten** | Bei Replacement-Upload sagt AI „wir aktualisieren deine Auswertung" — **falsch** laut CLAUDE.md v8.23 Spec: `/api/job/<id>/upload-replacement` setzt nur `pending_reread=True`, `/finalize-pdf` blockiert, **keine automatische Re-Auswertung**. User wartet auf was, was nicht kommt. | **P0** — System lügt User aktiv an, contra explizite Spec |
+| 13 | **Keine Datei-Validierung beim Upload** | User lädt PNG-Screenshot 14.04. hoch — AI merkt nicht dass Doc-Type (Dienstplan/CAS) nicht zum Datum / nicht zum Schema passt. Sollte sagen „Diese Datei sieht nicht wie ein CAS aus — bitte prüfen". | P1 |
+| 14 | **Keine User-Expectation-Klarheit nach Upload** | User: „weiß nicht mal wie lange ein neuer PDF dauert". Backend macht aktuell GAR KEIN Re-Read (v8.23 stub). UI sagt das aber nicht ehrlich. | P0 — verstärkt #12 |
 
 ### Root-Cause-Hypothesen
 
