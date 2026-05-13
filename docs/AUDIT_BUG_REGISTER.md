@@ -693,6 +693,104 @@ QA-Tester muss wissen:
 
 ---
 
+## BUG-012 — Result-Panel + Chat-Messaging widersprüchlich zum State
+
+| Feld | Inhalt |
+|---|---|
+| **ID** | BUG-012 |
+| **Titel** | Chat sagt „alles richtig / fertig", aber State ist needs_review (PDF blockiert, 2 offene Punkte versteckt im Status-Panel). User wird durch widersprüchliche Signale verwirrt. |
+| **Area** | Frontend Result-Panel + Chat-Greeting (index.html) |
+| **Severity** | P1 — Conversion-Killer. User mit needs_review-Token glaubt Auswertung ist fertig, sieht kein PDF, versteht nicht warum. Bleibt frustriert hängen statt zu klären. |
+| **Reporter** | User (Browser-QA 2026-05-13 mit QA-Seed-Tokens) |
+| **Status** | `open` |
+
+### Repro Steps
+1. https://aerosteuer.de mit Token `AT-6FB9EDE4C51F428E` (canonical_state=needs_review) öffnen
+2. Beobachten: Chat zeigt freundlichen Greeting
+3. **Erwartet:** Chat sagt prominent „2 Punkte müssen geklärt werden, bevor PDF freigegeben wird" + zeigt 2 Klärungs-Fragen
+4. **Beobachtet (User):** Chat erscheint als „alles ist richtig" wirkend. PDF-Button fehlt. „2 Fehler" nur in kleinem Status-Panel-Hinweis am unteren Rand sichtbar.
+
+### Sub-Issues (alle reproducible mit QA-Seed-Tokens)
+
+| Nr | Wo | Symptom | Severity |
+|---|---|---|---|
+| 1 | **Chat needs_review** | wirkt wie „alles ok" / „fertig" — verbirgt Tatsache dass User klären muss um PDF zu bekommen | **P1** |
+| 2 | Result-Panel done | Header sagt „VORLÄUFIGER GESAMTBETRAG" obwohl canonical_state=done — sollte „Einzutragender Gesamtbetrag" sein. Backend curl bestätigt `_review_items=[]`. Wahrscheinlich state-bleeding zwischen Token-Wechseln ohne Hard-Reload. | P1 falls echter Render-Bug, P2 falls nur state-bleeding |
+| 3 | Status-Panel done | „Offene Punkte: 2 im Chat" obwohl 0 — gleiches state-bleeding | P1/P2 |
+| 4 | Result-Panel + Chat done | PDF-Button doppelt sichtbar (Hero-Panel UND Chat-Bubble) | P2 UX |
+| 5 | Header (rtag-year) | „LUFTHANSA 2025" hardcoded — ignoriert backend `arbeitgeber` | P3 Cosmetic |
+| 6 | Chat-Greeting | Wording aus index.html hardcoded statt backend `user_message`/`user_title` | P2 (verstärkt #1) |
+| 7 | Chat unknown_marker | X9-Marker-Frage taucht im Review-Chat nicht auf — `_build_review_groups` filtert unknown_marker raus (Z. 16294-16296) | P2 |
+| 8 | Chat-Greeting done | Kein „Preview/Vorschau"-Thumbnail vom PDF — wäre Polish | P3 Polish |
+| 9 | **Suggestion-Bubbles im Review-Chat** | Hardcoded Buttons [Alle über 8h / Alle unter 8h / CAS hochladen / Weiß ich nicht / Überspringen] sind dem User unnötig sichtbar. Wirken wie Spielzeug, nicht wie tool. User explizit: „remove the suggestion bubbles". | **P1** — User-Request |
+| 10 | **Upload-Endpoint Timeout** | „📅 CAS hochladen" → Screenshot.png → „Das hat zu lange gedauert. Der Server schläft vielleicht gerade." Vom Frontend `AbortError` (Z. 9215). Upload via Chat-Attach (`window._pendingAttachDocType = 'roster_screenshot'`) hat keinen Timeout-Schutz wie BUG-005-Fix für /api/session. | **P1** — gleiche BUG-005-Klasse für Upload-Pfad |
+| 11 | **Chat AI-Antwort kontextfremd** | User lädt Screenshot hoch → AI antwortet „Kein Problem – du kannst deinen Januar-Plan einfach neu hochladen". User hat aber nicht Januar erwähnt, AI halluziniert Bezug. | P1 — Halluzination im Review-Chat |
+
+### Root-Cause-Hypothesen
+
+**Issue 1 (Chat-Wording bei needs_review):**
+- Chat-Greeting ist in index.html hardcoded. Wird nicht aus backend `user_message` gefüllt.
+- Backend liefert für needs_review: `user_title='Auswertung vorbereitet — kurze Klärung nötig'` und `user_message='Ich habe deine Dokumente ausgewertet. 2 Punkte brauche ich noch zur Bestätigung.'` — beide haben den richtigen Conversion-Hinweis.
+- Fix: Chat-Greeting für needs_review aus `user_message` ableiten, oder needs_review-spezifisches Wording mit „⚠️ 2 Punkte offen" + „bevor PDF freigegeben wird".
+
+**Issue 2+3 (Render-Bug oder State-Bleeding bei done):**
+- Code-Inspection: render() in index.html setzt korrekt:
+  - Z. 3692-3694: tagEl-Text basierend auf `(d._review_items || []).filter(pending).length`
+  - Z. 3707/3716: labelEl-Text basierend auf gleicher Logik
+  - Z. 4780-4782: „Offene Punkte"-Zeile nur wenn `pendingReviews > 0`
+- Backend curl bestätigt für done-Token: `_review_items=[]`, `pending=0`
+- → Bei `render(d_done)` SOLLTE keine VORLÄUFIGER / Offene-Punkte-Anzeige erscheinen
+- Wenn User Token A → Token B in selber Tab ohne Hard-Reload öffnet, kann DOM-State bleeden weil:
+  - `dlBtnRow.style.display = 'none'` in Z. 3710 (needs_review-Branch) bleibt erhalten wenn Branch B nicht ausgeführt wird
+  - chat-elements werden nicht voll zurückgesetzt
+- Test offen: Hard-Reload User-seitig + nur Token B öffnen. Falls Render dann korrekt → state-bleeding. Falls weiterhin falsch → render() Bug bei Token-Wechsel.
+
+**Issue 4 (PDF doppelt):**
+- Z. 3719 setzt Hero-PDF-Buttons nicht-sichtbar bei `else`-Zweig (done): „v9.5: PDF-Download ausschließlich im Chat-Bubble. Hero bleibt minimal."
+- ABER: Z. 4045-4046 (skip-review-Flow) macht `dlBtnRow.style.display = 'block'` — könnte stehen bleiben wenn vorher skip-review aktiv war
+- Fix: skip-review-Flow muss bei jedem render() reset werden.
+
+**Issue 7 (unknown_marker fehlt im Chat):**
+- `_build_review_groups` filtert in Z. 16294-16296: `it.get('type') == 'office_training_time_missing'`. unknown_marker-Items werden nicht gruppiert.
+- Frontend hat 0 Treffer für `unknown_marker`-Handling.
+- Fix: Entweder `_build_review_groups` erweitern (unknown_marker als eigene Gruppe) oder UI-Pfad für unknown_marker-Items im Chat hinzufügen.
+
+### Konsequenz für BUG-001 / BUG-005 / BUG-009 Status
+
+- **BUG-005 (Backend-Latenz)**: `fixed_unverified` BLEIBT — der Latenz-Beweis war grün, Browser-QA blockiert aber durch BUG-012-Rendering.
+- **BUG-001 (Code prüfen hängt)**: `fixed_unverified` BLEIBT — Recall funktioniert (Result öffnet sich), aber Inhalt ist falsch.
+- **BUG-009 (Auto-Resume-State-Pass)**: `fixed_unverified` BLEIBT — Frontend gibt canonical_state weiter, aber Render konsumiert es teils falsch.
+
+Alle 3 verbleiben `fixed_unverified` bis BUG-012 gefixed + Browser-QA wiederholt.
+
+### Fix-Plan (vorzuschlagen, NICHT umsetzen ohne User-go)
+
+**Phase 1 — Chat-Messaging klarer (Issue 1+6):**
+1. needs_review-Chat-Greeting: lead mit „⚠️ N Punkte zur Klärung offen — Auswertung kann noch nicht abgeschlossen werden"
+2. Optional Backend `user_message` als Override-Source
+
+**Phase 2 — Render-Reset (Issue 2+3+4):**
+1. render() am Anfang: ALLE state-abhängigen DOM-Elemente explizit zurücksetzen
+2. dlBtnRow/hero-Buttons/labels: für jeden Branch explizit set, kein „bleibt-wenn-nicht-gesetzt"
+3. Optional: hard-state-marker am Result-Panel mit data-attribute, render() prüft + resettet
+
+**Phase 3 — unknown_marker im Chat (Issue 7):**
+1. `_build_review_groups` erweitern für unknown_marker
+2. Frontend zeigt unknown_marker-Frage zwischen office-Fragen
+
+**Phase 4 — Cosmetic (Issue 5+8):**
+1. LUFTHANSA-Header aus result_data.arbeitgeber statt hardcoded
+2. PDF-Thumbnail in Chat-Bubble bei done
+
+### Browser-Proof Required (nach Fix)
+- [ ] needs_review-Token Chat sagt klar „N Punkte müssen geklärt werden"
+- [ ] done-Token Header sagt „Einzutragender Gesamtbetrag" (kein VORLÄUFIGER)
+- [ ] done-Token Status-Panel zeigt 0 offene Punkte (oder Zeile fehlt komplett)
+- [ ] done-Token PDF-Button nur an EINER Stelle
+- [ ] Token-Wechsel A→B ohne Reload: korrekte Anzeige für B
+
+---
+
 ## Bug-Hygiene-Regeln (verbindlich)
 
 1. **Status nur 4 Werte**: `open` / `in_progress` / `fixed_unverified` / `verified_closed`
