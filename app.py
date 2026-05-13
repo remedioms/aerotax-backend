@@ -61,6 +61,11 @@ from reportlab.lib.enums import TA_RIGHT, TA_CENTER, TA_LEFT
 
 # ── APP SETUP ─────────────────────────────────────────────────────
 app = Flask(__name__)
+# I-3 Audit-Fix: MAX_CONTENT_LENGTH = 50 MB. Vorher unbounded → 1 Request mit
+# 1 GB JSON-Body konnte einen Container OOM-en. 50 MB ist großzügig für unsere
+# Multi-Upload-Endpoints (3 Pflichtfiles + Belege, jeweils max 10 MB pro Datei
+# durch Cloud-Run-Edge gecapped, plus JSON-Overhead). Bei größerem Body: 413.
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 # v11 B-014: localhost-Origins NUR in Development. In Production (Render setzt
 # RENDER=true via Service-Default) bleibt die Whitelist auf echte Domains
 # beschränkt — kein localhost-Bypass via Browser-Plugin/Forge möglich.
@@ -2708,11 +2713,22 @@ def _classify_job_state(job, session=None):
 
     # ─── done → ggf. needs_review wenn pending review items ───
     if canonical == 'done':
-        review_items = data.get('_review_items') or []
+        # F-60-safe + SM-1 Audit-Fix: _review_items kann Object/null sein → isinstance-check
+        raw_items = data.get('_review_items')
+        review_items = raw_items if isinstance(raw_items, list) else []
         pending = [it for it in review_items
                    if isinstance(it, dict) and it.get('status') == 'pending']
         if pending and not data.get('_skipped_unanswered'):
             canonical = 'needs_review'
+
+    # SM-1 Audit-Fix: pending_reread=True überschreibt 'done' → needs_review.
+    # Sonst zeigt UI PDF-Button bei done, /finalize-pdf liefert 409, User frust.
+    if canonical == 'done' and job.get('pending_reread'):
+        canonical = 'needs_review'
+        # Marker im data damit der needs_review-Branch weiß warum
+        if 'data' in job and isinstance(job.get('data'), dict):
+            data = dict(data)
+            data['_pending_reread_reason'] = True
 
     # ─── Retry-Limit prüfen: bei >= AEROTAX_MAX_RETRY zu failed_support ───
     retry_count = int(job.get('retry_count', 0) or 0)
@@ -2900,13 +2916,11 @@ def get_job_status(job_id):
     user_title + user_message + next_actions[]. Frontend rendert nach
     canonical_state — keine Heuristik mehr im Frontend nötig.
     """
-    with _jobs_lock:
-        j = _jobs.get(job_id)
-    if not j:
-        j = _load_job_from_disk(job_id)
-        if j:
-            with _jobs_lock:
-                _jobs[job_id] = j
+    # R-3 Audit-Fix: _get_or_load_job statt manueller Lock-Pattern. Distinguished
+    # zwischen 'not_found' (404 expired) und 'timeout' (503 fetch_error).
+    j, load_status = _get_or_load_job(job_id)
+    if load_status == 'timeout':
+        return jsonify(_fetch_error_response()), 503
     if not j:
         # Statt nacktem 404: friendly state-machine response.
         state = _classify_job_state(None, None)
@@ -6225,10 +6239,13 @@ def _send_support_email_notification(record):
 
 @app.route('/api/admin/support-list', methods=['GET'])
 def admin_support_list():
-    """Liest gespeicherte Support-Anfragen — geschützt durch Token-Header."""
+    """Liest gespeicherte Support-Anfragen — geschützt durch Token-Header.
+
+    S-1 Audit-Fix: hmac.compare_digest gegen Timing-Attack (statt naive '!=').
+    """
     auth = request.headers.get('X-Admin-Token', '')
     expected = os.environ.get('RECOVERY_SECRET', '')
-    if not expected or auth != expected:
+    if not expected or not auth or not hmac.compare_digest(auth, expected):
         return jsonify({'error': 'Unauthorized'}), 401
 
     items = []
