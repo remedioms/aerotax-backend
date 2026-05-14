@@ -5397,6 +5397,27 @@ def session_recall(token):
         if load_status == 'timeout':
             return jsonify(_fetch_error_response()), 503
     safe.update(_classify_job_state(job, s))
+    # E2E-SIMULATOR-BUG (2026-05-14): _classify_job_state returnt für done state
+    # immer `pdf_allowed=True` aus _classify_job_state, ABER die session row hat
+    # evtl. `download_url=None` (z.B. nach review-bulk-answer wo PDF noch nicht
+    # generiert wurde). Frontend's canShowPdfDownload returnt dann False wegen
+    # `!download_url` → User sieht „🔒 PDF wird vorbereitet" trotz pdf_allowed=True.
+    # FIX: backend muss konsistent sein — wenn kein download_url, pdf_allowed=False
+    # mit klarer next_action „PDF erstellen".
+    if (safe.get('canonical_state') == 'done'
+            and safe.get('pdf_allowed') is True
+            and not safe.get('download_url')):
+        safe['pdf_allowed'] = False
+        safe['user_title']  = 'Auswertung fertig — PDF erstellen'
+        safe['user_message'] = (
+            'Deine Antworten sind übernommen. Klick „PDF erstellen" — '
+            'wir generieren das PDF (~2 Sekunden) und du kannst es herunterladen.'
+        )
+        # next_actions: ein einziger „create_pdf" Button, plus chat
+        safe['next_actions'] = [
+            {'type': 'create_pdf', 'label': 'PDF erstellen'},
+            {'type': 'open_chat',  'label': 'Frage im Chat stellen'},
+        ]
     return jsonify(safe)
 
 
