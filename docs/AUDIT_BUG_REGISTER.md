@@ -877,6 +877,47 @@ Zwei parallele Tiefen-Audits (Backend + Frontend) + Live-API-Fuzzing identifizie
 
 ---
 
+## Audit-Cycle 4 — „alle fixen full permission" (2026-05-14)
+
+### Gefixt in diesem Cycle
+
+| Bug | Sev | Fix |
+|---|---|---|
+| **CR-1** | **P0** | Stale-job-detection in /api/internal/process-job (15min threshold) + slim cleanup-loop in cloud_tasks-mode reaktiviert (alle 5min, BG-1) |
+| F-14 | **P0** | Auto-Resume pollIv reicht canonical_state durch (BUG-009 Regression in Poll-Branch) |
+| F-26 | **P0** | payment_intent in localStorage persistiert + Recovery-Pfad bei reload zwischen Stripe-success und process() |
+| BG-1 | P1 | cleanup-loop-slim für cloud_tasks-mode (pollt Supabase nach stuck-processing-Jobs) |
+| F-21 | P1 | _chatSend In-Flight-Guard |
+| F-10 | P1 | Auto-Resume Initial-Fetch mit 15s AbortController |
+| F-11 | P2 | pollIv max 60 iterations (5min cap) |
+| F-08 | P1 | window._autoResumeInFlight Race-Guard |
+| F-60 | P1 | _safeReviewPending/-Count Helper für non-Array-Schutz |
+| **F-63/B-2** | **P1** | state-action-buttons div + next_actions Renderer (Retry/Support/Refresh für failed_*/expired/fetch_error) |
+| S-5 | P1 | Email CRLF-Injection-Sanitize |
+| SM-1 | P1 | _classify_job_state: pending_reread=True → needs_review |
+
+### Bewusst NICHT gefixt (Architektur-Level, brauchen eigenen Cycle)
+
+| Bug | Sev | Reason für Defer |
+|---|---|---|
+| **D-1** | **P0** | payment_intent Multi-Container-Bypass → braucht Supabase atomic CAS oder neue `consumed_payment_intents` Tabelle. Schema-Migration nötig. |
+| D-3 | P1 | _save_job_to_disk Optimistic-Lock → braucht `version`-Column in jobs-Tabelle, schema-Migration. |
+| R-4 | P1 | /api/internal/process-job hält Lock während Supabase — gleicher Pattern wie BUG-005, aber im Worker übersehen. Sicherer Refactor benötigt Test-Coverage erst. |
+| RX-1, RX-4 | P1 | _store + _jobs unbounded → braucht LRU mit TTL-tracking. Memory-Profile pre/post sammeln. |
+| F-36 | P1 | Optional chaining ohne Transpile → braucht Build-Pipeline (esbuild/Babel) was aktuell „single-file index.html" widerspricht. |
+| F-42 | P1 | Z-Index-Hierarchie + ESC-Handler — Großrefactor der Modal-Layer (5+ Stellen). |
+| F-27/F-30 | P1 | Frontend File-Size-Validation — straightforward aber 6 Stellen. |
+| F-59 | P1 | canonical_state='unknown' UI-Branch — `deriveUiState` hat Fallback, aber render() rendert noch 0€-Hero. Spezial-Branch in render() nötig. |
+| B-6 | P2 | requires_session_token Legacy-Auth — braucht User-Entscheidung für Cutoff-Datum. |
+| E-1 (BUG-008) | P2 | _qa_async_aerotax Background-Thread in cloud_tasks — bereits dokumentiert, separate UX-Implementation. |
+| B-10, B-11 | P3 | Cleanup tote Elemente + restliche Lufthansa-Hardcodes — kein User-Impact. |
+
+### Test-Status
+- 1154/1154 grün
+- 8 obsolete static-Tests aktualisiert über Cycles 3+4 für die neue Architektur
+
+---
+
 ## Bug-Hygiene-Regeln (verbindlich)
 
 1. **Status nur 4 Werte**: `open` / `in_progress` / `fixed_unverified` / `verified_closed`
