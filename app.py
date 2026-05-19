@@ -15067,9 +15067,52 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     audit_note = f'{datum}: Same-Day mit Auslands-SE {se_ort_v15} trotz prev_overnight → Z76'
                     print(f"[v8-z76-detail] datum={datum} ort={se_ort_v15} reason='Same-Day Auslandstrip prev_overnight'")
                 else:
-                    klass = 'Issue'
-                    reason = 'Heimkehr aus Vortag-Tour — separater Tour-Abschluss'
-                    unresolved_reason = 'same_day nach prev_overnight (Mischfall)'
+                    # ── BH-003a 2026-05-19: Chirurgischer Heimkehr-Rescue ──
+                    # User-Beweis Tibor 2025-01-06: Issue mit reason „Heimkehr aus
+                    # Vortag-Tour" obwohl tatsächlich Z76-An/Ab-Tag (BLR→FRA, duty
+                    # 561min, ends_at_homebase). Golden klassifiziert das als
+                    # Z76 Indien-Bangalore An/Ab 28€.
+                    # Guards (alle müssen erfüllt sein, sonst Issue-Fallback):
+                    #   G1 prev.layover_ort nicht leer
+                    #   G2 prev.layover_ort kein Inland-Code (echter Auslands-Layover)
+                    #   G3 today.ends_at_homebase=True
+                    #   G4 today.routing[0] == prev.layover_ort (Direkt-Rückflug)
+                    #   G5 today.routing[-1] == homebase
+                    #   G6 today.duty_duration_minutes >= 480 (8h)
+                    #   G7 BMF-Mapping liefert ein Land
+                    # Schützt vor false-positives 05-23/06-03/10-28 (Frei laut Golden).
+                    _bh003a_layover = ((prev['dp'].get('layover_ort') if prev else '') or '').upper().strip()
+                    _bh003a_hb_up = (homebase or 'FRA').upper()
+                    _bh003a_routing = [(r or '').upper().strip() for r in (d.get('routing') or [])]
+                    _bh003a_duty = int(d.get('duty_duration_minutes') or 0)
+                    _bh003a_ends_hb = bool(d.get('ends_at_homebase'))
+                    if (_bh003a_layover                                            # G1
+                        and not _is_inland_code(_bh003a_layover)                   # G2
+                        and _bh003a_ends_hb                                        # G3
+                        and len(_bh003a_routing) >= 2
+                        and _bh003a_routing[0] == _bh003a_layover                  # G4
+                        and _bh003a_routing[-1] == _bh003a_hb_up                   # G5
+                        and _bh003a_duty >= 480                                    # G6
+                    ):
+                        _bh003a_bmf = _bmf(_bh003a_layover)
+                        if _bh003a_bmf and _bh003a_bmf.get('an_abreise', 0) > 0:   # G7
+                            klass = 'Z76'
+                            eur_added = float((_bh003a_bmf.get('an_abreise', 0) or 0))
+                            reason = (
+                                f'BH-003a Tour-Heimkehr {_bh003a_layover}→{_bh003a_hb_up} '
+                                f'(Z76 An/Ab, duty {_bh003a_duty}min ≥ 480)'
+                            )
+                            audit_note = (
+                                f'{datum}: BH-003a Issue→Z76 Heimkehr aus {_bh003a_layover}'
+                            )
+                            # bmf_land/key wird unten (Z.~15611) aus prev.layover_ort aufgelöst
+                            # — kein eigener Land-Lookup hier nötig.
+                            print(f"[bh003a-rescue] datum={datum} layover={_bh003a_layover} "
+                                  f"duty={_bh003a_duty}min eur={eur_added}")
+                    if klass != 'Z76':
+                        klass = 'Issue'
+                        reason = 'Heimkehr aus Vortag-Tour — separater Tour-Abschluss'
+                        unresolved_reason = 'same_day nach prev_overnight (Mischfall)'
             elif in_cluster and cluster_today and cluster_today.get('has_foreign'):
                 # Same-Day in Auslands-Cluster: Anreise-Tag der Auslandstour
                 klass = 'Z76'
