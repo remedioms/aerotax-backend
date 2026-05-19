@@ -1417,3 +1417,29 @@ IATA_TO_BMF = {
     "ZQN": "Neuseeland",
     "ZRH": "Schweiz – im Übrigen",
 }
+
+
+# Phase 3: IATA Metro Area Codes — Stadt-/Region-Codes die mehrere Airports
+# einer Stadt zusammenfassen (CHI = Chicago, ROM = Rom, STO = Stockholm, etc.).
+# Werden in SE/CAS gelegentlich verwendet; IATA_TO_BMF kennt nur einzelne
+# Airport-Codes (ORD, FCO, ARN, ...). Diese Map ist Alias-Layer vor dem
+# KI-Fallback. Aliase werden in `_get_bmf_for_iata` als Fallback genutzt
+# (deterministisch, kein KI-Call wenn Code hier gemappt ist).
+IATA_METRO_TO_BMF = {
+    # Nur Metro-Codes die NICHT bereits in IATA_TO_BMF stehen.
+    # Werte müssen exakt zu BMF_AUSLAND_BY_YEAR-Keys passen.
+    'CHI': 'Vereinigte Staaten von Amerika (USA) – Chicago',
+    'ROM': 'Italien – Rom',
+    'STO': 'Schweden',
+    'PAR': 'Frankreich – Paris',
+    'MOW': 'Russische Föderation – Moskau',
+    'OSA': 'Japan – Osaka',
+    'RIO': 'Brasilien – Rio de Janeiro',
+    'BUE': 'Argentinien',
+    'JKT': 'Indonesien',
+    'BJS': 'China – Peking',
+    'YMQ': 'Kanada – im Übrigen',
+    'YTO': 'Kanada – Toronto',
+}
+
+

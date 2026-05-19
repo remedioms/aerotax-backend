@@ -4890,15 +4890,29 @@ def test_v821_review_item_question_no_technical_terms():
 
 
 def test_v821_review_item_question_uses_friendly_language():
-    """Frage muss freundlich/einfach formuliert sein (mind. eins der Schlüsselworte)."""
+    """BH-001 Update 2026-05-15: Frage stellt Marker-Semantik (Bürodienst vs.
+    Schulung mit Anreise), nicht mehr 8h-Symptom. Test prüft dass die Frage
+    den Marker nennt + eine Wahl zwischen passive/aktiv bietet."""
     from app import _build_review_items
+    from unittest import mock
+    import app as _app
     cls_stub = {'office_training_time_missing_candidates': [
         {'datum': '2025-04-09', 'marker': 'D4 SCHULUNG', 'activity_type': 'training'},
     ]}
-    items = _build_review_items(cls_stub)
-    friendly = ['8 Stunden', 'unterwegs', 'Hin- und Rückweg', 'inklusive']
+    # KI mocken (sonst echter Sonnet-Call). Low-Conf → fallback Marker-Frage.
+    with mock.patch.object(_app, '_resolve_uncertain_fact_with_ai',
+                            return_value={'resolved': False, 'value': {},
+                                          'confidence': 0.0, 'reason': '',
+                                          'evidence': [], 'needs_review': True}):
+        items = _build_review_items(cls_stub)
     q = items[0]['question']
-    assert any(f in q for f in friendly), f"Frage zu technisch: {q}"
+    # Marker im Frage-Text
+    assert 'D4 SCHULUNG' in q, f"Frage muss Marker nennen: {q}"
+    # Bietet passive/aktiv Differenzierung
+    assert ('Bürodienst' in q or 'passiv' in q.lower()), f"Frage muss passive Option bieten: {q}"
+    assert ('Anreise' in q or 'Schulung' in q), f"Frage muss aktive Option bieten: {q}"
+    # Keine 8h-Symptom-Sprache
+    assert 'länger als 8 Stunden' not in q, f"BH-001: alte 8h-Frage muss weg: {q}"
 
 
 # ── v8.22 Step A-C: Server-side Recalc Tests ──
@@ -7338,11 +7352,15 @@ def test_v91_no_freitext_interpretation_nicht_verfügbar():
 
 def test_v92_audit_no_fahrtag_review_questions():
     """AUDIT A: Es gibt KEINE Fahrtag-Review-Fragen — Fahrtage sind backend-deterministisch.
-    Wenn das je geändert wird, muss es einen Test geben dafür."""
+    Wenn das je geändert wird, muss es einen Test geben dafür.
+
+    BH-001 Update 2026-05-15: Funktionskörper länger durch KI-Resolver-Integration
+    — Slice auf bis zur nächsten def gestellt, nicht hardcoded 3500 chars."""
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def _build_review_items(')
-    block = src[fn_idx:fn_idx+3500]
+    next_def = src.find('\ndef ', fn_idx + 10)
+    block = src[fn_idx:next_def if next_def > 0 else fn_idx + 8000]
     # Aktueller Stand: nur 2 Item-Types
     assert "office_training_time_missing_candidates" in block
     assert "unknown_marker_candidates" in block
@@ -10303,9 +10321,10 @@ def test_v11_pflicht_error_message_mentions_cas():
 def test_v11_audit_tracks_cas_count():
     """Job-Audit-Log trackt 'cas' (statt nur 'flugstunden')."""
     src = _read_backend()
-    # Window genug groß für /api/process Audit-Section
+    # Window genug groß für /api/process Audit-Section. Nach P0 #90 (pre-persist
+    # vor PI-Consume) ist der Audit-Block weiter nach unten gewandert.
     idx = src.find("@app.route('/api/process'")
-    block = src[idx:idx + 12000]
+    block = src[idx:idx + 20000]
     assert "'cas': len(files.get('cas')" in block, \
         'Audit muss cas-Count tracken'
     # dp_legacy bleibt für Beobachtung wieviele alte FU-Uploads kommen

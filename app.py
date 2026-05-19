@@ -66,6 +66,51 @@ app = Flask(__name__)
 # Multi-Upload-Endpoints (3 Pflichtfiles + Belege, jeweils max 10 MB pro Datei
 # durch Cloud-Run-Edge gecapped, plus JSON-Overhead). Bei größerem Body: 413.
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+
+
+# ── P0 #10 (P1 nach Triage): RECOVERY_SECRET Boot-Check ──────────────
+RECOVERY_SECRET_MIN_LEN = 32
+
+def _validate_recovery_secret_on_boot():
+    """Verifiziert dass RECOVERY_SECRET gesetzt ist und Mindestlänge erfüllt.
+    Wird als IP-Hash-Pepper (DSGVO-Pseudonymisierung) + Admin-Auth-Token
+    verwendet. Leerer Default macht IP-Hashes rainbow-tablebar und ermöglicht
+    versehentlich-leere Admin-Auth-Konfiguration.
+
+    Production: raised RuntimeError beim Boot wenn fehlt/zu kurz.
+    Test/Local: AEROTAX_ALLOW_BOOT_WITHOUT_KEY=1 erlaubt expliziten Test-Boot.
+    Niemals den Wert (oder Hash-Prefix) ausgeben.
+    """
+    sec = os.environ.get('RECOVERY_SECRET', '')
+    allow_boot = os.environ.get('AEROTAX_ALLOW_BOOT_WITHOUT_KEY') == '1'
+    if sec and len(sec) >= RECOVERY_SECRET_MIN_LEN:
+        return  # OK
+    if not sec:
+        reason = 'missing'
+    else:
+        reason = 'too_short'
+    if not allow_boot:
+        raise RuntimeError(
+            f'[boot] RECOVERY_SECRET {reason}. Set a strong secret '
+            f'(min {RECOVERY_SECRET_MIN_LEN} chars) or set '
+            f'AEROTAX_ALLOW_BOOT_WITHOUT_KEY=1 for local tests.'
+        )
+    # Test/Local: warnen aber zulassen
+    app.logger.warning(f'[boot] RECOVERY_SECRET {reason} — running in test-mode')
+
+
+def _recovery_pepper():
+    """Liefert RECOVERY_SECRET. Ersetzt alle direkten env-reads damit
+    nirgendwo mehr ein leerer default `''` an einen Hash-Call gegeben wird.
+    Im Production-Mode garantiert Boot-Check dass nie leer; im Test-Mode
+    mit AEROTAX_ALLOW_BOOT_WITHOUT_KEY=1 kann es leer sein."""
+    sec = os.environ.get('RECOVERY_SECRET', '')
+    if not sec and os.environ.get('AEROTAX_ALLOW_BOOT_WITHOUT_KEY') != '1':
+        raise RuntimeError('RECOVERY_SECRET not configured')
+    return sec
+
+
+_validate_recovery_secret_on_boot()
 # v11 B-014: localhost-Origins NUR in Development. In Production (Render setzt
 # RENDER=true via Service-Default) bleibt die Whitelist auf echte Domains
 # beschränkt — kein localhost-Bypass via Browser-Plugin/Forge möglich.
@@ -363,19 +408,40 @@ AEROTAX_CAPTURE_SNAPSHOTS = os.environ.get('AEROTAX_CAPTURE_SNAPSHOTS', '0') == 
 UPLOAD_TTL_HOURS = 4   # Pre-Upload nur kurz aufbewahren — nach Auswertung gelöscht
 
 
+class UploadPersistError(Exception):
+    """Raised wenn Supabase-Persist der uploaded_files nicht garantiert werden konnte.
+    P0 #90 Fix: zwingt Caller zu reagieren statt silent return False zu schlucken."""
+    pass
+
+
 def _save_uploaded_files_supabase(ref, files_dict, hours=UPLOAD_TTL_HOURS):
     """Persist uploaded files to Supabase 'uploaded_files' table.
     files_dict: { key: [(bytes, filename), ...] } oder { key: [bytes, ...] }
+
+    P0 #90 Fix:
+    - returnt True bei Erfolg
+    - raised UploadPersistError bei jedem Fehler (kein silent return False mehr)
+    - safe logging: nur ref[:8], doc_keys, error_type — keine Bytes, kein Base64,
+      keine Dateinamen, keine PII
+
+    Idempotent: delete-then-insert für gleichen ref.
     """
-    if not SB_AVAILABLE or not files_dict:
-        return False
+    if not SB_AVAILABLE:
+        raise UploadPersistError('supabase_unavailable')
+    if not ref:
+        raise UploadPersistError('missing_ref')
+    if not files_dict:
+        raise UploadPersistError('empty_files_dict')
+
+    doc_keys = sorted([k for k, v in files_dict.items() if v])
     expires = (datetime.utcnow() + timedelta(hours=hours)).isoformat()
     rows = []
+    encode_failures = 0
     for key, items in files_dict.items():
         for idx, item in enumerate(items):
-            data = item[0] if isinstance(item, tuple) else item
-            fname = item[1] if isinstance(item, tuple) and len(item) > 1 else f'{key}_{idx}'
             try:
+                data = item[0] if isinstance(item, tuple) else item
+                fname = item[1] if isinstance(item, tuple) and len(item) > 1 else f'{key}_{idx}'
                 rows.append({
                     'ref':       ref,
                     'key':       key,
@@ -385,20 +451,31 @@ def _save_uploaded_files_supabase(ref, files_dict, hours=UPLOAD_TTL_HOURS):
                     'expires_at': expires,
                 })
             except Exception as e:
-                print(f"[supabase upload] encode fail {key}/{idx}: {e}")
+                encode_failures += 1
+                app.logger.warning(
+                    f"[upload-persist] encode_fail ref={ref[:8]} key={key} idx={idx} "
+                    f"err={type(e).__name__}"
+                )
     if not rows:
-        return False
+        raise UploadPersistError(
+            f'all_encode_failed (keys={doc_keys}, failures={encode_failures})'
+        )
     try:
-        # Erst alte Einträge für ref löschen, dann neu inserten
+        # Erst alte Einträge für ref löschen, dann neu inserten — idempotent.
         sb.table('uploaded_files').delete().eq('ref', ref).execute()
         # In Batches von 5 inserten — JSONB-Rows können groß sein
         for i in range(0, len(rows), 5):
             sb.table('uploaded_files').insert(rows[i:i+5]).execute()
-        print(f"[supabase upload] ref={ref[:8]}: {len(rows)} Dateien persistiert")
+        app.logger.info(
+            f"[upload-persist] ok ref={ref[:8]} rows={len(rows)} keys={doc_keys}"
+        )
         return True
     except Exception as e:
-        print(f"[supabase upload] save fail: {e}")
-        return False
+        app.logger.error(
+            f"[upload-persist] supabase_fail ref={ref[:8]} keys={doc_keys} "
+            f"err={type(e).__name__}"
+        )
+        raise UploadPersistError(f'supabase_insert_failed:{type(e).__name__}')
 
 
 def _load_uploaded_files_supabase(ref):
@@ -424,7 +501,9 @@ def _load_uploaded_files_supabase(ref):
         # Sortieren nach idx, dann strip
         return {k: [(d, f) for (_, d, f) in sorted(v)] for k, v in out.items()}
     except Exception as e:
-        print(f"[supabase upload] load fail: {e}")
+        app.logger.error(
+            f"[upload-load] supabase_fail ref={ref[:8]} err={type(e).__name__}"
+        )
         return {}
 
 
@@ -435,7 +514,9 @@ def _delete_uploaded_files_supabase(ref):
     try:
         sb.table('uploaded_files').delete().eq('ref', ref).execute()
     except Exception as e:
-        print(f"[supabase upload] delete fail: {e}")
+        app.logger.warning(
+            f"[upload-delete] supabase_fail ref={ref[:8]} err={type(e).__name__}"
+        )
 
 
 @app.route('/api/init-upload-session', methods=['POST'])
@@ -473,21 +554,128 @@ def upload_files():
                     normalized.append(_normalize_upload(f.read(), f.filename))
                     saved_count += 1
                 except Exception as e:
-                    print(f"[upload-files] {key}/{f.filename} failed: {e}")
+                    app.logger.warning(
+                        f"[upload-files] normalize_fail ref={ref[:8]} key={key} "
+                        f"err={type(e).__name__}"
+                    )
             if normalized:
                 _store[ref]['files'][key] = normalized
 
-    # Parallel auf Supabase persistieren — überlebt Render-Restart
+    # P0 #90 Fix: Persistenz-Fehler MUSS sichtbar sein. Frontend darf erst zum
+    # Bezahl-Schritt wechseln wenn Supabase-Persist bestätigt ist — sonst riskiert
+    # User Geldverlust (zahlt + Files weg).
     if _store[ref].get('files'):
-        _save_uploaded_files_supabase(ref, _store[ref]['files'])
+        try:
+            _save_uploaded_files_supabase(ref, _store[ref]['files'])
+        except UploadPersistError as e:
+            ec = AEROTAX_ERROR_CODES['UPLOAD_PERSIST_FAILED']
+            app.logger.error(
+                f"[upload-files] persist_failed ref={ref[:8]} err={type(e).__name__}"
+            )
+            return jsonify({
+                'ok':           False,
+                'reason_code':  'UPLOAD_PERSIST_FAILED',
+                'user_title':   ec['user_title'],
+                'user_message': ec['user_message'],
+                'retryable':    ec['retryable'],
+                'support':      ec['support'],
+                'next_actions': ec.get('next_actions', []),
+            }), 503
 
-    print(f"[upload-files] ref={ref[:8]} {saved_count} Dateien gespeichert")
+    app.logger.info(f"[upload-files] ok ref={ref[:8]} count={saved_count}")
     return jsonify({'status': 'ok', 'count': saved_count})
 
 
 _processed_stripe_events = {}  # event_id → timestamp; Idempotenz für Webhooks
-_consumed_payment_intents = {}  # pi_id → consumed_at; verhindert Replay
+# P0 #96: in-memory cache ist nur noch L1 — Source-of-Truth ist Supabase-Tabelle
+# `payment_intent_consumptions`. Cache short-circuits Lookups; bei cache-miss wird
+# atomar gegen Supabase geclaimt.
+_consumed_payment_intents = {}  # pi_id → consumed_at  (L1-Cache, NICHT Source-of-Truth)
 _ip_rate_buckets = {}  # ip → list[ts]; rolling window 1h für /api/process Anti-Abuse
+
+
+# ─── P0 #96: PaymentIntent atomic claim via Supabase ─────────────────────────
+
+def _try_consume_payment_intent_supabase(pi_id, ref=None, job_id=None):
+    """Atomic claim eines PaymentIntent via Supabase-Tabelle
+    `payment_intent_consumptions`. Multi-Container-safe: Primary-Key auf
+    payment_intent_id garantiert dass nur 1 Container je PI claimen kann.
+
+    Returns (outcome, existing_record):
+      ('claimed',          None):           erster Erfolg — Caller darf processen
+      ('already_used',     record_dict):    PI war schon verbraucht (existing-row)
+      ('lock_unavailable', None):           Supabase down / Tabelle fehlt /
+                                            Network-Fehler — Caller MUSS für
+                                            paid PIs fail-closed reagieren
+    """
+    if not pi_id:
+        return ('lock_unavailable', None)
+    if not SB_AVAILABLE:
+        app.logger.error(f"[pi-lock] supabase_unavailable pi={pi_id[:12]}")
+        return ('lock_unavailable', None)
+    try:
+        sb.table('payment_intent_consumptions').insert({
+            'payment_intent_id': pi_id,
+            'ref':               ref or None,
+            'job_id':            job_id,
+            'status':            'claimed',
+        }).execute()
+        app.logger.info(
+            f"[pi-lock] claimed pi={pi_id[:12]} ref={(ref or '')[:8]} "
+            f"job={(job_id or '')[:8]}"
+        )
+        return ('claimed', None)
+    except Exception as e:
+        msg = str(e)
+        msg_lower = msg.lower()
+        is_conflict = (
+            '23505' in msg
+            or 'duplicate key' in msg_lower
+            or 'unique constraint' in msg_lower
+            or 'unique violation' in msg_lower
+        )
+        if is_conflict:
+            try:
+                r = sb.table('payment_intent_consumptions') \
+                      .select('*').eq('payment_intent_id', pi_id).limit(1).execute()
+                existing = (r.data or [None])[0]
+                app.logger.warning(
+                    f"[pi-lock] already_used pi={pi_id[:12]} "
+                    f"existing_job={(existing or {}).get('job_id', '')[:8] if existing else ''}"
+                )
+                return ('already_used', existing)
+            except Exception as _se:
+                app.logger.error(
+                    f"[pi-lock] existing_lookup_fail pi={pi_id[:12]} "
+                    f"err={type(_se).__name__}"
+                )
+                return ('already_used', None)
+        # Kein Conflict → echtes Lock-Problem (Supabase down, schema missing, etc.)
+        app.logger.error(
+            f"[pi-lock] insert_fail pi={pi_id[:12]} err={type(e).__name__}"
+        )
+        return ('lock_unavailable', None)
+
+
+def _update_payment_intent_lock_status(pi_id, status, job_id=None):
+    """Aktualisiert den Lock-Row-Status nach Job-Lifecycle-Events.
+    Wird aus `_set_job_failed` + Done-Path aufgerufen. Best-Effort — kein Raise.
+
+    status: 'claimed', 'failed_retryable', 'failed_support', 'done'
+    """
+    if not pi_id or not SB_AVAILABLE:
+        return
+    try:
+        payload = {'status': status}
+        if job_id:
+            payload['job_id'] = job_id
+        sb.table('payment_intent_consumptions') \
+          .update(payload).eq('payment_intent_id', pi_id).execute()
+    except Exception as e:
+        app.logger.warning(
+            f"[pi-lock] status_update_fail pi={pi_id[:12]} status={status} "
+            f"err={type(e).__name__}"
+        )
 
 
 def _ip_rate_limited(ip, endpoint='process', limit=20, window_sec=3600):
@@ -718,13 +906,16 @@ def restore_session(token):
         return jsonify({'error': 'Keine speicherbaren Form-Werte gefunden — Session zu alt.'}), 422
 
     # Free-Retry-Token vergeben (60 Min Fenster für Neuberechnung)
-    info = _recovery_tokens.get(token, {})
-    _recovery_tokens[token] = {
+    info = _recovery_tokens.get(token, {}) or _load_recovery_token_from_supabase(token) or {}
+    _rt_payload = {
         'token': token,
         'retries_used': int(info.get('retries_used', 0)),  # nicht hochzählen — Edit ≠ Recovery
         'expires': (datetime.utcnow() + timedelta(minutes=60)).isoformat() + 'Z',
         'kind': 'edit',
     }
+    _recovery_tokens[token] = _rt_payload
+    # P1 #111: Multi-Container-Safe via Supabase
+    _save_recovery_token_to_supabase(token, _rt_payload)
     return jsonify({
         'ok': True,
         'form_inputs':      form_inputs,
@@ -1236,13 +1427,27 @@ def _redact_pii(obj):
 
 
 def _save_job_to_disk(job_id):
-    """v9.7: Speichert Job-State in Supabase (persistent über Render-Deploys/Restarts)
-    + Disk-Fallback. PII wird redacted."""
+    """v15 P0 #95 Fix: Speichert Job-State in Supabase (persistent über Restarts)
+    + Disk-Fallback.
+
+    PII (Name etc.) bleibt PERSISTIERT — sonst heißt das PDF nach
+    Container-Restart `[redacted].pdf` und der Chat zeigt „Hallo [redacted]".
+    Persistierung ist sicher weil:
+      - Supabase: Service-Role-Key only (kein public access), RLS enabled,
+        encryption at rest
+      - Disk: Cloud Run ephemeral storage, container-gebunden, restart-gelöscht
+      - Job-Cleanup-Loop löscht expired Jobs nach 24h (DSGVO „Recht auf Vergessen")
+
+    PII wird WEITER redacted bei:
+      - Stdout/Logs (siehe `_audit` / `print`-Calls die _redact_pii nutzen)
+      - Audit-Trail / Diagnostics-Outputs
+    """
     with _jobs_lock:
         j = _jobs.get(job_id, {}).copy()
     if not j: return
     j_safe = {k: v for k, v in j.items() if k != 'files'}
-    j_safe = _redact_pii(j_safe)
+    # NOTE: KEIN _redact_pii(j_safe) hier — PII muss persistent bleiben
+    # für PDF-Filename + Chat-Anrede nach Restart. Logs/Audit redacten weiter.
     # Supabase-Persistenz (überlebt Render-Container-Wipes)
     if SB_AVAILABLE:
         try:
@@ -1252,13 +1457,18 @@ def _save_job_to_disk(job_id):
                 'updated_at': datetime.utcnow().isoformat() + 'Z',
             }).execute()
         except Exception as e:
-            print(f"[persist] Job {job_id[:8]} supabase save fail: {e} — fallback to disk")
+            app.logger.warning(
+                f"[persist] supabase_save_fail job={job_id[:8]} "
+                f"err={type(e).__name__} — falling back to disk"
+            )
     # Disk-Fallback (auch zusätzlich für lokale Dev)
     try:
         with open(os.path.join(_JOBS_DIR, f'{job_id}.json'), 'w') as f:
             json.dump(j_safe, f, default=str)
     except Exception as e:
-        print(f"[persist] Job {job_id[:8]} disk save fail: {e}")
+        app.logger.warning(
+            f"[persist] disk_save_fail job={job_id[:8]} err={type(e).__name__}"
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1781,12 +1991,21 @@ def process_real():
         anreise_modes_raw = set(m.strip() for m in str(anreise).split(',') if m.strip())
         has_km = bool(anreise_modes_raw & {'auto', 'fahrrad'})
 
+        # P1 #5 Fix: Server-Validation für base. CLAUDE.md verbietet hardcoded FRA;
+        # bei fehlender base würde MUC/BER/DUS-Crew silent als FRA-Crew klassifiziert.
+        _base_raw = (request.form.get('base') or '').strip()
+        if not _base_raw:
+            return jsonify({
+                'error': 'Pflichtfeld „Homebase" fehlt. Bitte wähle deine Homebase im Formular.',
+                'reason_code': 'UPLOAD_MISSING_REQUIRED',
+            }), 400
+
         form = {
             'name':    request.form.get('name', 'Flugbegleiter'),
             'vorname': request.form.get('vorname', ''),
             'nachname':request.form.get('nachname', ''),
             'year':    year_input,
-            'base':    request.form.get('base', 'Frankfurt (FRA)'),
+            'base':    _base_raw,
             'anreise': anreise,
             'km':      km_capped if has_km else 0,
             'fahrzeug':   request.form.get('fahrzeug', 'verbrenner'),
@@ -1858,11 +2077,9 @@ def process_real():
         promo_code = (request.form.get('promo_code') or '').strip().upper()
         is_free_retry = _is_valid_recovery_token(free_retry_token)
         is_paid = bool(ref and _store.get(ref, {}).get('paid'))
-        # Replay-Schutz: PI darf nur 1x für /api/process genutzt werden
-        if pi_id and pi_id in _consumed_payment_intents:
-            return jsonify({
-                'error': 'Diese Zahlung wurde bereits für eine Auswertung verwendet. Pro Bezahlung gibt es eine Auswertung.'
-            }), 402
+        # P0 #96: Replay-Schutz wurde verlagert nach unten (NACH payment-gate-
+        # Verifikation + nach pre-persist) und nutzt jetzt persistente Supabase-
+        # Lock-Tabelle — Multi-Container-safe.
         # Wenn Webhook noch nicht durch ist: PaymentIntent direkt bei Stripe verifizieren
         if not is_paid and pi_id:
             try:
@@ -1890,12 +2107,109 @@ def process_real():
                 'error': 'Zahlung nicht verifiziert. Bitte schließe den Bezahlvorgang ab und versuche es dann erneut.'
             }), 402
 
-        # ── ASYNC: Job anlegen, Token sofort generieren, im Hintergrund starten ──
+        # ── P0 #90: PRE-PERSIST vor PI-Consume ──
+        # Im Cloud-Tasks-Mode lädt der Worker Files aus Supabase. Wenn Persistenz
+        # nach PI-Consume fehlschlägt, hat User gezahlt + keine verwertbare
+        # Auswertung. Daher JETZT (vor Consume) persistieren — schlägt das fehl,
+        # 503 mit reason_code UPLOAD_PERSIST_FAILED und KEIN Job, KEIN PI-Consume.
+        # is_free_retry: keine neuen Files; Files müssen vom vorherigen Job in
+        # Supabase noch da sein (TTL=4h). Pre-persist wird übersprungen — Worker
+        # liefert UPLOAD_FILES_MISSING wenn nicht mehr da.
+        sb_ref_pre = ref or (request.form.get('ref') or '').strip()
+        if not sb_ref_pre:
+            sb_ref_pre = f'auto-{uuid.uuid4().hex[:12]}'
+        if AEROTAX_EXECUTION_MODE == 'cloud_tasks' and not is_free_retry:
+            files_pre_format = {}
+            for k, items in files.items():
+                if not items:
+                    continue
+                files_pre_format[k] = []
+                for it in items:
+                    if isinstance(it, tuple) and len(it) >= 2:
+                        files_pre_format[k].append((it[0], it[1] or f'{k}.pdf'))
+                    elif isinstance(it, (bytes, bytearray)):
+                        files_pre_format[k].append((bytes(it), f'{k}.pdf'))
+            if files_pre_format:
+                try:
+                    _save_uploaded_files_supabase(sb_ref_pre, files_pre_format)
+                except UploadPersistError as _pe:
+                    ec = AEROTAX_ERROR_CODES['UPLOAD_PERSIST_FAILED']
+                    app.logger.error(
+                        f"[process] pre_persist_failed ref={sb_ref_pre[:8]} "
+                        f"err={type(_pe).__name__}"
+                    )
+                    return jsonify({
+                        'ok':           False,
+                        'reason_code':  'UPLOAD_PERSIST_FAILED',
+                        'user_title':   ec['user_title'],
+                        'user_message': ec['user_message'],
+                        'retryable':    ec['retryable'],
+                        'support':      ec['support'],
+                        'next_actions': ec.get('next_actions', []),
+                    }), 503
+
+        # ── P0 #96: PaymentIntent atomic-claim VOR Job-Creation ──
+        # Multi-Container-Safe: persistente Lock-Tabelle in Supabase. Nur ein
+        # Container kann je PI claimen. Promo + free_retry brauchen keinen Lock,
+        # weil dort kein pi_id involviert ist.
+        ref = ref or sb_ref_pre
         job_id = str(uuid.uuid4())
+        if pi_id and not is_free_retry and not is_promo:
+            # L1-Cache short-circuit (gleicher Container, gleicher PI)
+            if pi_id in _consumed_payment_intents:
+                ec = AEROTAX_ERROR_CODES['PAYMENT_ALREADY_USED']
+                return jsonify({
+                    'ok':              False,
+                    'reason_code':     'PAYMENT_ALREADY_USED',
+                    'user_title':      ec['user_title'],
+                    'user_message':    ec['user_message'],
+                    'retryable':       ec['retryable'],
+                    'support':         ec['support'],
+                    'next_actions':    ec.get('next_actions', []),
+                }), 409
+            # L2: atomarer Supabase-Insert (multi-container safe)
+            outcome, existing = _try_consume_payment_intent_supabase(pi_id, ref, job_id)
+            if outcome == 'already_used':
+                ec = AEROTAX_ERROR_CODES['PAYMENT_ALREADY_USED']
+                resp = {
+                    'ok':              False,
+                    'reason_code':     'PAYMENT_ALREADY_USED',
+                    'user_title':      ec['user_title'],
+                    'user_message':    ec['user_message'],
+                    'retryable':       ec['retryable'],
+                    'support':         ec['support'],
+                    'next_actions':    ec.get('next_actions', []),
+                }
+                if existing and existing.get('job_id'):
+                    resp['existing_job_id'] = existing['job_id']
+                if existing and existing.get('status'):
+                    resp['existing_status'] = existing['status']
+                # L1 fülle damit nächster Call sofort short-circuited
+                _consumed_payment_intents[pi_id] = datetime.utcnow()
+                return jsonify(resp), 409
+            if outcome == 'lock_unavailable':
+                # Fail-closed bei echter Zahlung — lieber temporär nicht bedienen
+                # als Double-Spending zulassen
+                ec = AEROTAX_ERROR_CODES['PAYMENT_LOCK_FAILED']
+                return jsonify({
+                    'ok':              False,
+                    'reason_code':     'PAYMENT_LOCK_FAILED',
+                    'user_title':      ec['user_title'],
+                    'user_message':    ec['user_message'],
+                    'retryable':       ec['retryable'],
+                    'support':         ec['support'],
+                    'next_actions':    ec.get('next_actions', []),
+                }), 503
+
+        # ── ASYNC: Job anlegen, Token sofort generieren, im Hintergrund starten ──
+        # Ab hier: PI darf consumed werden, weil Files persistiert sind.
         if is_free_retry:
             session_token = free_retry_token
             # Recovery-Token verbrauchen — nur 1x pro Token zulässig
             _recovery_tokens.pop(free_retry_token, None)
+            # P1 #111: auch in Supabase löschen damit anderer Container es nicht
+            # nochmal akzeptiert
+            _delete_recovery_token_from_supabase(free_retry_token)
             _save_session(session_token, {
                 'job_id': job_id,
                 'result_data': {},
@@ -1974,22 +2288,16 @@ def process_real():
         # /api/internal/process-job — Worker läuft SYNCHRON im HTTP-Request, Cloud Run
         # killt nichts mehr wegen idle-Time.
         if AEROTAX_EXECUTION_MODE == 'cloud_tasks':
-            # v13 Cloud Tasks Bug-Fix (Capture-Run #1): /api/process empfängt
-            # Files direkt im POST body (request.files). Im Thread-Mode wurden
-            # sie an _calc_queue.put((id, form, files)) übergeben — die Bytes
-            # waren via Function-Arg verfügbar.
-            # Im cloud_tasks-Mode aber lädt der Worker Files via
-            # _load_uploaded_files_supabase(ref) — wenn /api/process die Files
-            # nicht in der uploaded_files-Tabelle persistiert, hat der Worker
-            # keinen Zugriff (CAS=False im PARALLEL READER → Pipeline fail).
-            #
-            # Fix: vor dem Cloud-Task-Dispatch alle Files in Supabase persistieren.
-            # Wenn kein ref aus /api/upload-files vorhanden: generiere fallback-ref.
+            # P0 #90: defensive idempotenter Re-Persist.
+            # Die Pflicht-Persistenz lief bereits VOR PI-Consume (oben). Dieser
+            # Block ist nur ein Sicherheitsnetz für seltene Sub-Sekunden-Races
+            # (z.B. Supabase-TTL gerade umgeschwungen). Bei Fail jetzt: Job war
+            # bereits angelegt + PI consumed → wir markieren ihn explizit als
+            # UPLOAD_PERSIST_FAILED (retryable, support=true) statt WORKER_RESTARTED.
             sb_ref = (form.get('ref') or '').strip()
             if not sb_ref:
                 sb_ref = f'auto-{job_id[:12]}'
                 form['ref'] = sb_ref
-            # Files zum Supabase-Format formen: {key: [(bytes, fname), ...]}
             files_sb_format = {}
             for k, items in files.items():
                 if not items:
@@ -2001,23 +2309,32 @@ def process_real():
                     elif isinstance(it, (bytes, bytearray)):
                         files_sb_format[k].append((bytes(it), f'{k}.pdf'))
                     else:
-                        # Skip unbekannte Shape (defensive)
                         continue
-            try:
-                _save_uploaded_files_supabase(sb_ref, files_sb_format)
-                _file_count = sum(len(v) for v in files_sb_format.values())
-                print(f"[process] cloud_tasks: {_file_count} Files in Supabase persistiert (ref={sb_ref[:12]})")
-            except Exception as _se:
-                # Hart fail: ohne persistierte Files kann Worker nichts laden
-                _set_job_failed(job_id, 'WORKER_RESTARTED',
-                                 f'Failed to persist files: {str(_se)[:200]}')
-                print(f"[process] cloud_tasks file-persist FAIL: {_se}")
-                return jsonify({
-                    'job_id': job_id,
-                    'status': 'failed',
-                    'error': 'Auswertung konnte nicht gestartet werden — Datei-Persistenz fehlgeschlagen.',
-                    'session_token': session_token,
-                }), 500
+            if files_sb_format:
+                try:
+                    _save_uploaded_files_supabase(sb_ref, files_sb_format)
+                except UploadPersistError as _pe:
+                    # Pre-persist hatte Erfolg, Re-persist scheitert — sehr selten.
+                    # Job wurde schon angelegt, PI ist consumed. Failed_retryable mit
+                    # eigenem reason_code damit Support eingreifen kann.
+                    _set_job_failed(job_id, 'UPLOAD_PERSIST_FAILED',
+                                     f'defensive_repersist_failed:{type(_pe).__name__}')
+                    app.logger.error(
+                        f"[process] defensive_repersist_failed job={job_id[:8]} "
+                        f"ref={sb_ref[:8]} err={type(_pe).__name__}"
+                    )
+                    ec = AEROTAX_ERROR_CODES['UPLOAD_PERSIST_FAILED']
+                    return jsonify({
+                        'job_id':       job_id,
+                        'ok':           False,
+                        'reason_code':  'UPLOAD_PERSIST_FAILED',
+                        'user_title':   ec['user_title'],
+                        'user_message': ec['user_message'],
+                        'retryable':    ec['retryable'],
+                        'support':      ec['support'],
+                        'next_actions': ec.get('next_actions', []),
+                        'session_token': session_token,
+                    }), 503
 
             # Form ans Job hängen — Worker im nächsten Request liest es aus Persistenz
             with _jobs_lock:
@@ -2107,7 +2424,9 @@ def internal_process_job():
         print(f"[worker] job {job_id[:8]} not found — task is no-op")
         return jsonify({'idempotent': True, 'no_op': True, 'reason': 'job not found'}), 200
 
-    status = j.get('status') or 'pending'
+    # P1 #9 Fix: nur DEFAULT bei missing key, NICHT bei falsy values
+    # (vorher: '' / 0 / None wurde fälschlich auf 'pending' gemappt → re-process)
+    status = j.get('status', 'pending') or 'pending'
     current_attempt = int(j.get('attempt_id', 0) or 0)
 
     # ── Idempotenz-Branches ────────────────────────────────────────────
@@ -2164,8 +2483,18 @@ def internal_process_job():
 
     files_raw = _load_uploaded_files_supabase(ref)
     if not files_raw:
-        _set_job_failed(job_id, 'UPLOAD_EXPIRED', 'Uploaded files no longer in storage')
-        return jsonify({'error': 'uploaded files not found', 'reason_code': 'UPLOAD_EXPIRED'}), 200
+        # P0 #90: ref existiert (Job hat pre-persistet bekommen) aber Files sind weg.
+        # Das ist NICHT „Dokumente abgelaufen" (Datenschutz-Cleanup), sondern echtes
+        # Persistenz-Problem. User hat ggf. bezahlt — Support muss eingreifen.
+        _set_job_failed(job_id, 'UPLOAD_FILES_MISSING',
+                         'Uploaded files not retrievable from storage')
+        app.logger.error(
+            f"[worker] upload_files_missing job={job_id[:8]} ref={ref[:8]}"
+        )
+        return jsonify({
+            'error': 'uploaded files not found',
+            'reason_code': 'UPLOAD_FILES_MISSING',
+        }), 200
 
     # Format-Anpassung: _load_uploaded_files_supabase returnt {key: [(bytes, fname), ...]}.
     # Bestehender Code in process()/run_process_async erwartet die selbe Shape — passt.
@@ -2384,6 +2713,10 @@ def _run_process_async(job_id, form, files):
                 'optionale_belege': opt_belege_safe,
                 'notes':        result.get('notes', []),
             }
+            _pi_for_lock = ((_jobs[job_id].get('form') or {}).get('pi_id') or '').strip()
+        # P0 #96: Lock-Status auf 'done' setzen — Cleanup-Cron darf nach 30 Tagen
+        if _pi_for_lock:
+            _update_payment_intent_lock_status(_pi_for_lock, 'done', job_id=job_id)
 
     except Exception as e:
         import traceback
@@ -2399,7 +2732,10 @@ def _run_process_async(job_id, form, files):
                 'completed': datetime.utcnow().isoformat() + 'Z',
             }
         _save_job_to_disk(job_id)
-        print(f"[FAIL {job_id[:8]}] Job failed. Session-Token bleibt gültig: {session_token}")
+        # P1 #114 Fix: kein Session-Token-Leak in Cloud-Logs. Token war 24h gültig,
+        # Cloud-Log-Reader konnte impersonate. Nur Token-Prefix für Audit-Korrelation.
+        _tok_safe = (session_token[:8] + '…') if session_token else 'no-token'
+        app.logger.warning(f"[FAIL {job_id[:8]}] Job failed. session_token_prefix={_tok_safe}")
     finally:
         # Erfolg oder Fehler: persistiere Status nach Disk
         _save_job_to_disk(job_id)
@@ -2462,6 +2798,60 @@ AEROTAX_ERROR_CODES = {
         'user_message': 'Deine hochgeladenen Dateien sind aus Datenschutzgründen nicht mehr verfügbar. Bitte starte eine neue Auswertung.',
         'retryable':    False,
         'support':      False,
+    },
+    # P0 #90 Fix: Pre-Upload-Persistenz konnte nicht garantiert werden — vor Zahlung
+    # abgefangen, kein PI-Consume. User kann einfach erneut hochladen.
+    'UPLOAD_PERSIST_FAILED': {
+        'user_title':   'Upload konnte nicht gespeichert werden',
+        'user_message': 'Bitte versuche den Upload erneut. Es wurde noch keine Zahlung ausgelöst.',
+        'retryable':    True,
+        'support':      True,
+        'next_actions': [
+            {'type': 'retry_upload', 'label': 'Upload erneut versuchen'},
+            {'type': 'contact_support', 'label': 'Support kontaktieren'},
+        ],
+    },
+    # P0 #90 Fix: Worker findet keine persistierten Files. Kann nur passieren wenn
+    # pre-persist trotz Erfolg-Confirmation verschwand (Supabase-TTL-Race) oder bei
+    # Legacy-Jobs ohne pre-persist. Unterscheidet sich von UPLOAD_EXPIRED: hier wurde
+    # bezahlt, Support muss prüfen.
+    'UPLOAD_FILES_MISSING': {
+        'user_title':   'Hochgeladene Dateien nicht auffindbar',
+        'user_message': 'Deine hochgeladenen Dateien konnten nicht geladen werden. Bitte starte den Upload erneut. Falls du bereits bezahlt hast, kontaktiere den Support mit deinem Zugangscode.',
+        'retryable':    True,
+        'support':      True,
+        'next_actions': [
+            {'type': 'retry_upload', 'label': 'Upload erneut versuchen'},
+            {'type': 'contact_support', 'label': 'Support kontaktieren'},
+        ],
+    },
+    # P0 #96: PaymentIntent wurde bereits für eine Auswertung verwendet
+    # (Multi-Container Replay-Schutz via Supabase). User soll bestehende
+    # Auswertung öffnen statt neue starten.
+    'PAYMENT_ALREADY_USED': {
+        'user_title':   'Diese Zahlung ist bereits einer Auswertung zugeordnet',
+        'user_message': 'Diese Zahlung wurde bereits für eine Auswertung verwendet. '
+                        'Öffne deine bestehende Auswertung mit deinem Zugangscode '
+                        'oder kontaktiere den Support.',
+        'retryable':    False,
+        'support':      True,
+        'next_actions': [
+            {'type': 'open_existing', 'label': 'Bestehende Auswertung öffnen'},
+            {'type': 'contact_support', 'label': 'Support kontaktieren'},
+        ],
+    },
+    # P0 #96: Supabase-Lock-Tabelle unerreichbar — fail-closed bei paid PI,
+    # damit kein Double-Spending entsteht. User soll in 1-2 Min retryen.
+    'PAYMENT_LOCK_FAILED': {
+        'user_title':   'Zahlung konnte gerade nicht verarbeitet werden',
+        'user_message': 'Der Replay-Schutz für Zahlungen ist gerade nicht erreichbar. '
+                        'Bitte in 1-2 Minuten erneut versuchen — keine Doppelbelastung.',
+        'retryable':    True,
+        'support':      True,
+        'next_actions': [
+            {'type': 'retry', 'label': 'Erneut versuchen'},
+            {'type': 'contact_support', 'label': 'Support kontaktieren'},
+        ],
     },
     # ── Reader-Probleme (retryable) ────────────────────────────────────────
     'LSB_READ_FAILED': {
@@ -2912,6 +3302,7 @@ def _set_job_failed(job_id, reason_code, error_message=None):
     """
     if reason_code not in AEROTAX_ERROR_CODES:
         reason_code = 'WORKER_RESTARTED'
+    pi_id_for_lock = ''
     with _jobs_lock:
         j = _jobs.get(job_id)
         if j is not None:
@@ -2919,10 +3310,18 @@ def _set_job_failed(job_id, reason_code, error_message=None):
             j['reason_code'] = reason_code
             j['error'] = error_message or AEROTAX_ERROR_CODES[reason_code]['user_message']
             j['completed'] = datetime.utcnow().isoformat() + 'Z'
+            pi_id_for_lock = ((j.get('form') or {}).get('pi_id') or '').strip()
     try:
         _save_job_to_disk(job_id)
     except Exception:
         pass
+    # P0 #96: PI-Lock-Status mitnehmen damit Cleanup-Cron Audit-Records erkennt
+    # und Support sehen kann zu welchem Job der Lock gehört.
+    if pi_id_for_lock:
+        ec = AEROTAX_ERROR_CODES.get(reason_code) or {}
+        lock_status = 'failed_support' if ec.get('support') and not ec.get('retryable') \
+                       else 'failed_retryable'
+        _update_payment_intent_lock_status(pi_id_for_lock, lock_status, job_id=job_id)
 
 
 @app.route('/api/job/<job_id>', methods=['GET'])
@@ -3224,7 +3623,7 @@ def post_review_answer(job_id):
                 'event': 'review_answer',
                 'data': {'review_item_id': review_item_id, 'answer': answer,
                          'datum': datum, 'override': ov, 'delta_eur': delta_eur},
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.utcnow().isoformat(),
             })
 
         # v8.22 Step C: Deterministische Re-Berechnung mit gecachtem State
@@ -3331,7 +3730,7 @@ def post_review_bulk_answer(job_id):
                 'data': {'answer': answer, 'type': typ,
                          'applied_count': len(applied_dates),
                          'applied_dates': applied_dates},
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.utcnow().isoformat(),
             })
 
         # Re-compute mit allen Overrides
@@ -3840,7 +4239,7 @@ def post_review_answer_bulk(job_id):
                 'event': 'review_answer_bulk',
                 'data': {'confirmation_id': confirmation_id, 'applied_count': len(applied),
                          'source': source, 'applied': applied},
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.utcnow().isoformat(),
             })
 
         # Recompute
@@ -3935,7 +4334,7 @@ def post_marker_answer(job_id):
                 'data': {'first_token': first_token, 'meaning': meaning,
                          'activity_type': activity_type, 'datum': datum,
                          'lexicon_status': result.get('status') if result else 'unknown'},
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.utcnow().isoformat(),
             })
             try:
                 _save_job_to_disk(job_id)
@@ -4009,7 +4408,7 @@ def post_upload_replacement(job_id):
         j['pending_reread_doc_types'] = list(set(
             (j.get('pending_reread_doc_types') or []) + [doc_type]
         ))
-        j['pending_reread_at'] = datetime.now().isoformat()
+        j['pending_reread_at'] = datetime.utcnow().isoformat()
         if 'audit' in j and isinstance(j['audit'], list):
             j['audit'].append({
                 'event': 'document_replacement_received_pending_reread',
@@ -4021,7 +4420,7 @@ def post_upload_replacement(job_id):
                     'note': 'Selektives Re-Read pro Doc-Typ noch nicht implementiert. '
                             'Datei vorgemerkt, finalize-pdf blockiert bis Re-Verarbeitung.',
                 },
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.utcnow().isoformat(),
             })
         _jobs[job_id] = j
     # Supabase-Persistenz AUSSERHALB des Locks
@@ -4388,7 +4787,7 @@ def post_upload_roster_screenshot(job_id):
                         'schema_errors': schema_errors,
                         'source': 'user_uploaded_roster_cas_detected',
                     },
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': datetime.utcnow().isoformat(),
                 })
             try: _save_job_to_disk(job_id)
             except Exception: pass
@@ -4583,7 +4982,7 @@ def post_finalize_pdf(job_id):
             j['data']['download_url'] = download_url
             j['download_url'] = download_url
             j['pdf_status'] = 'ready'
-            j['pdf_finalized_at'] = datetime.now().isoformat()
+            j['pdf_finalized_at'] = datetime.utcnow().isoformat()
             if 'audit' in j and isinstance(j['audit'], list):
                 j['audit'].append({
                     'event': 'pdf_finalized',
@@ -4592,7 +4991,7 @@ def post_finalize_pdf(job_id):
                         'answered': answered, 'unsure': unsure_n,
                         'final_total': final_data.get('netto'),
                     },
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': datetime.utcnow().isoformat(),
                 })
             try:
                 _save_job_to_disk(job_id)
@@ -4672,11 +5071,14 @@ def recover_failed_job():
         print(f"[recover] session-persist warn: {_e}")
 
     # 2) Memory-Cache aktualisieren — beschleunigt nächste Reads
-    _recovery_tokens[token] = {
+    _rt_payload = {
         'token':        token,
         'retries_used': new_count,
         'expires':      (datetime.utcnow() + timedelta(minutes=60)).isoformat() + 'Z',
     }
+    _recovery_tokens[token] = _rt_payload
+    # P1 #111: Multi-Container-safe Persistierung
+    _save_recovery_token_to_supabase(token, _rt_payload)
 
     return jsonify({
         'ok':              True,
@@ -4755,19 +5157,84 @@ def full_health_check():
     return jsonify(health), 200 if overall == 'ok' else 503
 
 
-# Recovery-Tokens: erlauben kostenlose Wiederholung in 60-Min-Fenster
+# Recovery-Tokens: erlauben kostenlose Wiederholung in 60-Min-Fenster.
+# P1 #111 Fix: Source-of-Truth ist Supabase-Tabelle `recovery_tokens` —
+# In-Memory dict bleibt nur L1-Cache. Multi-Container-Setups (Cloud Run
+# scale ≥ 2) konnten vorher Tokens nicht teilen → User-Retry trifft anderen
+# Container → 402 für legitimen User.
 _recovery_tokens = {}
 
 
+def _load_recovery_token_from_supabase(token):
+    """Liest Recovery-Token aus Supabase. Returns dict mit
+    {expires, retries_used, job_id} oder None wenn fehlt/expired/SB-down."""
+    if not token or not SB_AVAILABLE:
+        return None
+    try:
+        r = sb.table('recovery_tokens').select('*').eq('token', token).limit(1).execute()
+        row = (r.data or [None])[0]
+        if not row:
+            return None
+        return {
+            'expires':      row.get('expires_at'),
+            'retries_used': int(row.get('retries_used', 0) or 0),
+            'job_id':       row.get('job_id'),
+        }
+    except Exception as e:
+        app.logger.warning(
+            f"[recovery-token] supabase_load_fail tok={token[:8]} err={type(e).__name__}"
+        )
+        return None
+
+
+def _save_recovery_token_to_supabase(token, info):
+    """Upsertet Recovery-Token in Supabase. Best-effort."""
+    if not token or not SB_AVAILABLE:
+        return
+    try:
+        sb.table('recovery_tokens').upsert({
+            'token':        token,
+            'job_id':       info.get('job_id'),
+            'retries_used': int(info.get('retries_used', 0) or 0),
+            'expires_at':   info.get('expires'),
+        }).execute()
+    except Exception as e:
+        app.logger.warning(
+            f"[recovery-token] supabase_save_fail tok={token[:8]} err={type(e).__name__}"
+        )
+
+
+def _delete_recovery_token_from_supabase(token):
+    """Löscht Recovery-Token nach erfolgtem Retry (1×-Use). Best-effort."""
+    if not token or not SB_AVAILABLE:
+        return
+    try:
+        sb.table('recovery_tokens').delete().eq('token', token).execute()
+    except Exception as e:
+        app.logger.warning(
+            f"[recovery-token] supabase_delete_fail tok={token[:8]} err={type(e).__name__}"
+        )
+
+
 def _is_valid_recovery_token(token):
-    """True, wenn Recovery/Edit-Token existiert und noch nicht abgelaufen ist."""
-    info = _recovery_tokens.get(token or '')
+    """True, wenn Recovery/Edit-Token existiert und noch nicht abgelaufen ist.
+    P1 #111: prüft erst L1-Cache, dann Supabase (Multi-Container-safe).
+    """
+    if not token:
+        return False
+    info = _recovery_tokens.get(token)
+    if not info:
+        # L2-Lookup gegen Supabase
+        info = _load_recovery_token_from_supabase(token)
+        if info:
+            _recovery_tokens[token] = info  # Cache-Fill
     if not info:
         return False
     try:
         exp = datetime.fromisoformat(str(info.get('expires', '')).replace('Z', ''))
         if exp < datetime.utcnow():
             _recovery_tokens.pop(token, None)
+            _delete_recovery_token_from_supabase(token)
             return False
     except Exception:
         _recovery_tokens.pop(token, None)
@@ -5219,6 +5686,14 @@ def _cloud_tasks_slim_cleanup_loop():
                     _supabase_execute_with_timeout('bg1_del_sess', _del_sess, timeout_s=5)
                     _supabase_execute_with_timeout('bg1_del_pdf',  _del_pdf,  timeout_s=5)
                     _supabase_execute_with_timeout('bg1_del_up',   _del_up,   timeout_s=5)
+                    # P0 #96: alte PI-Lock-Audit-Records räumen — nur done/failed_support
+                    # (claimed/failed_retryable bleiben für Recovery-Token-Pfad).
+                    pi_cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
+                    def _del_pi_locks():
+                        return sb.table('payment_intent_consumptions') \
+                            .delete().in_('status', ['done', 'failed_support']) \
+                            .lt('consumed_at', pi_cutoff).execute()
+                    _supabase_execute_with_timeout('bg1_del_pi_locks', _del_pi_locks, timeout_s=5)
                 except Exception as _e:
                     print(f"[bg1-cleanup] full-cleanup fail: {_e}")
         except Exception as _e:
@@ -6263,7 +6738,7 @@ def support_message():
         'created_at': datetime.utcnow().isoformat() + 'Z',
         'ip_hash': _hashlib.sha256(
             (request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
-             + os.environ.get('RECOVERY_SECRET','')).encode()
+             + _recovery_pepper()).encode()
         ).hexdigest()[:12],
     }
 
@@ -6359,7 +6834,7 @@ def admin_support_list():
     S-1 Audit-Fix: hmac.compare_digest gegen Timing-Attack (statt naive '!=').
     """
     auth = request.headers.get('X-Admin-Token', '')
-    expected = os.environ.get('RECOVERY_SECRET', '')
+    expected = _recovery_pepper()
     if not expected or not auth or not hmac.compare_digest(auth, expected):
         return jsonify({'error': 'Unauthorized'}), 401
 
@@ -6584,7 +7059,7 @@ def qa_upvote(qid):
         return jsonify({'error': 'Zu viele Upvotes — bitte warte'}), 429
     body = request.get_json(silent=True) or {}
     answer_id = body.get('answer_id')
-    ip_hash = _hashlib.sha256((ip + os.environ.get('RECOVERY_SECRET','')).encode()).hexdigest()[:8]
+    ip_hash = _hashlib.sha256((ip + _recovery_pepper()).encode()).hexdigest()[:8]
     target_type = 'answer' if answer_id else 'question'
     target_id = answer_id if answer_id else qid
 
@@ -6986,9 +7461,18 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
 
 
 def _claude_with_retry(client, model, max_tokens, content, max_retries=3, label='claude'):
-    """Anthropic API mit exponential backoff. Schützt vor transienten Fehlern (429, 5xx, network).
-    Liefert Response-Objekt zurück oder wirft nach max_retries die letzte Exception."""
+    """Anthropic API mit exponential backoff. Schützt vor transienten Fehlern.
+
+    P1 #74 Fix: Retry-Detection nutzt strukturierte Anthropic-Exception-Typen
+    statt substring-match auf err-string. Substring-match hatte 5xx-Codes auch
+    in legitimen 4xx-Error-Bodies erkannt (z.B. '500' in JSON-Beispielen) →
+    Auth-Errors wurden 3× retryt mit gleichem 401-Resultat.
+    """
     import time as _t
+    try:
+        import anthropic as _anthropic
+    except Exception:
+        _anthropic = None
     last_err = None
     for attempt in range(max_retries):
         try:
@@ -6996,14 +7480,37 @@ def _claude_with_retry(client, model, max_tokens, content, max_retries=3, label=
                                           messages=[{'role': 'user', 'content': content}])
         except Exception as e:
             last_err = e
-            err_str = str(e)
-            # Retry bei: rate limit, 5xx, connection, timeout
-            should_retry = any(s in err_str.lower() for s in ['429', '500', '502', '503', '504', 'timeout', 'connection', 'rate'])
+            # Strukturiert: prüfe Anthropic-Exception-Typen
+            should_retry = False
+            if _anthropic is not None:
+                # RateLimitError = 429
+                if isinstance(e, getattr(_anthropic, 'RateLimitError', tuple())):
+                    should_retry = True
+                # APITimeoutError + APIConnectionError = network/transient
+                elif isinstance(e, (
+                    getattr(_anthropic, 'APITimeoutError', tuple()),
+                    getattr(_anthropic, 'APIConnectionError', tuple()),
+                )):
+                    should_retry = True
+                # InternalServerError = 5xx
+                elif isinstance(e, getattr(_anthropic, 'InternalServerError', tuple())):
+                    should_retry = True
+                # APIStatusError mit .status_code 5xx
+                elif isinstance(e, getattr(_anthropic, 'APIStatusError', tuple())):
+                    sc = getattr(e, 'status_code', None)
+                    if isinstance(sc, int) and 500 <= sc < 600:
+                        should_retry = True
             if not should_retry or attempt == max_retries - 1:
-                print(f"[{label}] failed (attempt {attempt+1}/{max_retries}): {err_str[:200]}")
+                app.logger.error(
+                    f"[{label}] failed attempt={attempt+1}/{max_retries} "
+                    f"err={type(e).__name__}"
+                )
                 raise
             wait = 2 ** attempt + 1
-            print(f"[{label}] retry attempt {attempt+1}/{max_retries} in {wait}s — {err_str[:120]}")
+            app.logger.warning(
+                f"[{label}] retry attempt={attempt+1}/{max_retries} wait={wait}s "
+                f"err={type(e).__name__}"
+            )
             _t.sleep(wait)
     if last_err: raise last_err
 
@@ -7039,6 +7546,345 @@ def _claude_stream_with_retry(client, model, max_tokens, content, max_retries=3,
             print(f"[{label}] retry attempt {attempt+1}/{max_retries} in {wait}s — {err_str[:120]}")
             _t.sleep(wait)
     if last_err: raise last_err
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 2: KI-Resolver-Infrastruktur
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Aktive KI-Kontextauflösung NACH deterministic parser, VOR Userfrage.
+# Source-of-Truth-Hierarchie:
+#   1. deterministic parser/mapping
+#   2. KI-Kontextresolver (diese Funktion)
+#   3. Python-Steuerlogik/BMF
+#   4. Userfrage (Last Resort)
+#
+# Eiserne Regel:
+#   - KI darf Fakten/Kontext auflösen (Ort, Land, Code, Marker, Zeit, Layover-Ort)
+#   - KI darf NIEMALS Steuerbeträge berechnen oder BMF-Pauschalen nennen
+#   - Anti-Tax-Sanitizer rejected jeden value mit amount/eur/rate/betrag/euro/tagesatz
+#
+# Kontext-Regel:
+#   - Jeder Prompt enthält Airline-Crew-Kontext (Flugpersonal, Cockpit/Kabine,
+#     Lufthansa-ähnlich, Dienstplan/CAS/SE)
+#   - Marker NIE kontextlos befragt
+#
+# Caching:
+#   - In-Memory pro (job_id, datum, kind, context-hash), TTL 24h
+#   - Verhindert wiederholte API-Calls für selben Fact
+# ════════════════════════════════════════════════════════════════════════════
+
+# Cache: (job_id, datum, kind, context_hash) → (result_dict, expires_at)
+_ai_resolver_cache = {}
+_AI_RESOLVER_CACHE_TTL_HOURS = 24
+_AI_RESOLVER_MODEL = 'claude-sonnet-4-5'
+_AI_RESOLVER_MAX_TOKENS = 512
+_AI_RESOLVER_TIMEOUT_S = 30.0
+
+# Confidence-Schwellen
+_AI_CONF_AUTO_THRESHOLD = 0.90   # ≥ → resolved=True, needs_review=False
+_AI_CONF_REVIEW_THRESHOLD = 0.70  # ≥ → resolved=True, needs_review=True
+# < REVIEW → resolved=False, needs_review=True (Userfrage ohne Vorschlag)
+
+# Verbotene Felder im value (Anti-Tax-Sanitizer)
+_AI_FORBIDDEN_VALUE_KEYS = {
+    'amount', 'eur', 'rate', 'betrag', 'euro', 'tagesatz',
+    'pauschale', 'tax', 'steuer', 'an_abreise', 'voll_24h',
+    'tagestrip_8h', 'price', 'preis', 'satz',
+}
+
+# Erlaubte resolver-Kinds
+_AI_RESOLVER_KINDS = {
+    'place_code',           # IATA/City/Metro-Code → Ort, Land
+    'cas_time_extraction',  # Rohzeile → start/end/duty
+    'marker_semantics',     # ORTSTAG/FRS/LMN → passive/active/office/etc
+    'layover_place',        # overnight ohne layover_ort → wahrscheinlichster Ort
+    'tour_context',         # mehrtägige Tour → Tour-Struktur/Zweck
+}
+
+
+def _ai_resolver_airline_crew_context_block():
+    """Standard-Airline-Crew-Kontext-Header für alle Resolver-Prompts.
+    P2 Regel: KEIN kontextloser KI-Call."""
+    return (
+        "Du analysierst einen Dienstplan für Flugpersonal "
+        "(Cockpit/Kabine, Airline-Crew, Lufthansa-ähnlicher Crew-Roster). "
+        "Die Daten stammen aus CAS/Dienstplan, Streckeneinsatzabrechnung (SE) "
+        "und/oder Lohnsteuerunterlagen (LSB). "
+        "Codes wie ORTSTAG, FRS, LMN_AS, LMN_CR, SB_S, EM, RES, FRA, MUC, DUS, "
+        "LH-Flugnummern, Briefingzeit, Layover-Ort, Streckeneinsatz sind "
+        "Standard-Crew-Begriffe."
+    )
+
+
+def _ai_resolver_kind_context(kind):
+    """Kind-spezifischer Kontext-Hinweis im Prompt."""
+    if kind == 'place_code':
+        return (
+            "Der Code stammt aus einem Airline-Crew-Dienstplan oder "
+            "Streckeneinsatz. Es kann ein Airport-Code (3 Buchstaben, ICAO/IATA), "
+            "City-Code, Metro-Area-Code (z.B. CHI/ROM/STO/LON/NYC), Layover-Ort "
+            "oder Airline-Station-Code sein."
+        )
+    if kind == 'cas_time_extraction':
+        return (
+            "Die Zeile stammt aus einem Crew-Dienstplan. Extrahiere Start/Ende/"
+            "Ort/Aktivität falls vorhanden. Briefingzeit ist Dienstbeginn, "
+            "Landung+Debriefing ist Dienstende. Bei Office/Schulung gilt die "
+            "im Plan stehende Zeitspanne."
+        )
+    if kind == 'marker_semantics':
+        return (
+            "Der Marker stammt aus einem Airline-Crew-Roster für Cockpit/Kabine. "
+            "Beurteile NUR anhand des gegebenen Crew-Kontexts und der Nachbarzeilen, "
+            "ob der Marker wahrscheinlich aktiver Dienst, passive Reserve/zuhause, "
+            "Office/Schulung oder Reise-/Layover-Kontext ist. Vergleiche mit "
+            "Nachbartagen und SE-Spesen."
+        )
+    if kind == 'layover_place':
+        return (
+            "Die Daten stammen aus einer Flugdienst-Tour. Bestimme den "
+            "wahrscheinlichsten Layover-Ort aus Routing, Vortag/Folgetag, "
+            "SE-Spesenort und Crew-Tour-Logik. Tour-Cluster bedeutet "
+            "mehrtägige Flugsequenz mit Übernachtungen vor Rückkehr zur Homebase."
+        )
+    if kind == 'tour_context':
+        return (
+            "Dies ist eine Crew-Tour mit Flügen, Standby, Briefingzeiten, "
+            "Layovern und Rückkehr zur Homebase. Analysiere den Tour-"
+            "Zusammenhang, nicht isoliert den einzelnen Tag."
+        )
+    return ''
+
+
+def _ai_resolver_value_safe(value):
+    """Anti-Tax-Sanitizer: prüft ob value verbotene Felder enthält
+    (Steuerbeträge / BMF-Pauschalen / monetäre Werte).
+    Returns (is_safe, offending_key)."""
+    if not isinstance(value, dict):
+        return (True, None)
+    for k in value.keys():
+        if not isinstance(k, str):
+            continue
+        if k.lower() in _AI_FORBIDDEN_VALUE_KEYS:
+            return (False, k)
+    return (True, None)
+
+
+def _ai_resolver_context_hash(context):
+    """Stabile Hash über context-dict (für Cache-Key).
+    Sortiert Keys damit gleicher Context → gleicher Hash."""
+    try:
+        canonical = json.dumps(context, sort_keys=True, default=str)
+    except Exception:
+        canonical = str(context)
+    return _hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:16]
+
+
+def _ai_resolver_build_prompt(kind, context, uncertain_fact):
+    """Baut den User-Prompt mit Crew-Kontext-Header + kind-spezifischem Block.
+    Output: string. Wird in der Resolver-Funktion an client.messages.create gegeben."""
+    base = _ai_resolver_airline_crew_context_block()
+    kind_ctx = _ai_resolver_kind_context(kind)
+    # Context dict zu kompaktem JSON — alle Plan-Fakten
+    ctx_lines = []
+    for ck, cv in (context or {}).items():
+        if ck == 'uncertain_fact':
+            continue
+        try:
+            ctx_lines.append(f"  {ck}: {json.dumps(cv, ensure_ascii=False, default=str)}")
+        except Exception:
+            ctx_lines.append(f"  {ck}: {str(cv)[:200]}")
+    ctx_block = '\n'.join(ctx_lines[:30])  # Hard-Cap gegen riesige Prompts
+    return (
+        f"{base}\n\n"
+        f"Resolver-Aufgabe: {kind}\n"
+        f"{kind_ctx}\n\n"
+        f"Plan-Kontext:\n{ctx_block}\n\n"
+        f"Unsicherer Fakt: {uncertain_fact}\n\n"
+        f"Frage: Was bedeutet/ist „{uncertain_fact}\" in diesem Crew-Kontext?\n\n"
+        f"Antwortformat (NUR JSON, keine Begleitzeilen):\n"
+        f"{{\n"
+        f'  "resolved": true|false,\n'
+        f'  "value": {{"resolved_place": "...", "country": "...", "bmf_key": "..."}} oder ähnlich,\n'
+        f'  "confidence": 0.0-1.0,\n'
+        f'  "reason": "kurze Begründung mit Evidenz",\n'
+        f'  "evidence": ["Beleg aus Plan-Zeilen"],\n'
+        f'  "needs_review": true|false\n'
+        f"}}\n\n"
+        f"WICHTIG: KEINE Steuerbeträge, Pauschalen, Euro-Werte oder BMF-Sätze nennen. "
+        f"Antworte nur mit faktischer Kontextauflösung. "
+        f"Confidence ≥0.90 nur wenn im Plan-Kontext klar belegbar."
+    )
+
+
+def _ai_resolver_apply_thresholds(parsed):
+    """Wendet die globalen Confidence-Schwellen an.
+    Setzt resolved/needs_review-Flags konsistent."""
+    conf = float(parsed.get('confidence', 0.0) or 0.0)
+    if conf >= _AI_CONF_AUTO_THRESHOLD:
+        parsed['resolved'] = True
+        parsed['needs_review'] = False
+    elif conf >= _AI_CONF_REVIEW_THRESHOLD:
+        parsed['resolved'] = True
+        parsed['needs_review'] = True
+    else:
+        parsed['resolved'] = False
+        parsed['needs_review'] = True
+    return parsed
+
+
+def _ai_resolver_review_fallback(reason='unknown_failure'):
+    """Standard-Fallback-Result wenn KI nicht antwortet/invalid/sanitizer-reject."""
+    return {
+        'resolved':     False,
+        'value':        {},
+        'confidence':   0.0,
+        'reason':       reason,
+        'evidence':     [],
+        'needs_review': True,
+    }
+
+
+def _resolve_uncertain_fact_with_ai(kind, context, job_id=None, datum=None,
+                                     uncertain_fact='', _anthropic_client=None):
+    """Aktiver KI-Kontextresolver. Ruft Sonnet 4.5 mit Airline-Crew-Kontext auf
+    und liefert strukturierten Fakt zurück (KEIN Steuerbetrag).
+
+    Parameters:
+      kind     — einer von _AI_RESOLVER_KINDS
+      context  — dict mit Plan-Fakten (raw CAS lines, SE-fakten, Nachbartage, etc.)
+      job_id   — für Cache-Scope (optional)
+      datum    — für Cache-Scope (optional)
+      uncertain_fact — der konkrete Fakt der aufgelöst werden soll (z.B. 'CHI', 'ORTSTAG')
+      _anthropic_client — DI für Tests (sonst lazy-loaded)
+
+    Returns:
+      {
+        'resolved': bool,
+        'value': dict,
+        'confidence': float,
+        'reason': str,
+        'evidence': list[str],
+        'needs_review': bool,
+      }
+
+    Garantien:
+      - Verbotene value-Keys (amount/eur/rate/...) → reject, needs_review=True
+      - Invalid JSON → review-fallback
+      - Timeout / API-Error → review-fallback
+      - Max 1 retry bei JSON-invalid
+      - Cache pro (job_id, datum, kind, context-hash) für TTL Stunden
+      - Audit-Log ohne PII (nur kind/conf/resolved)
+    """
+    # Validate kind
+    if kind not in _AI_RESOLVER_KINDS:
+        return _ai_resolver_review_fallback(f'unknown_kind:{kind}')
+
+    # Cache-Key
+    ctx_hash = _ai_resolver_context_hash(context)
+    cache_key = (job_id or 'no_job', datum or 'no_datum', kind, ctx_hash)
+    now = datetime.utcnow()
+    cached = _ai_resolver_cache.get(cache_key)
+    if cached:
+        result, expires_at = cached
+        if expires_at > now:
+            return dict(result)  # Defensive copy
+        # Expired → drop
+        _ai_resolver_cache.pop(cache_key, None)
+
+    # Lazy-load Anthropic client (oder via DI für Tests)
+    client = _anthropic_client
+    if client is None:
+        try:
+            import anthropic as _anthropic_mod
+            api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+            if not api_key:
+                return _ai_resolver_review_fallback('no_api_key')
+            client = _anthropic_mod.Anthropic(api_key=api_key, timeout=_AI_RESOLVER_TIMEOUT_S)
+        except Exception as e:
+            app.logger.warning(
+                f"[ai-resolver] anthropic_init_fail kind={kind} err={type(e).__name__}"
+            )
+            return _ai_resolver_review_fallback('anthropic_init_failed')
+
+    prompt = _ai_resolver_build_prompt(kind, context, uncertain_fact)
+
+    # Call mit max 1 retry bei JSON-invalid
+    parsed = None
+    last_error = None
+    for attempt in range(2):
+        try:
+            resp = client.messages.create(
+                model=_AI_RESOLVER_MODEL,
+                max_tokens=_AI_RESOLVER_MAX_TOKENS,
+                messages=[{'role': 'user', 'content': prompt}],
+            )
+            # Anthropic-Response: resp.content[0].text
+            text = ''
+            try:
+                text = resp.content[0].text if resp.content else ''
+            except (AttributeError, IndexError):
+                text = str(resp)
+            # JSON parsen
+            try:
+                # Erstes „{ ... }" aus dem Text extrahieren (falls Vorgeplänkel)
+                first_brace = text.find('{')
+                last_brace = text.rfind('}')
+                if first_brace < 0 or last_brace < 0:
+                    raise ValueError('no_json_braces')
+                parsed = json.loads(text[first_brace:last_brace + 1])
+                break  # erfolgreich
+            except (ValueError, json.JSONDecodeError) as e:
+                last_error = f'json_invalid:{type(e).__name__}'
+                if attempt == 0:
+                    # Retry mit Strict-Hint
+                    continue
+        except Exception as e:
+            last_error = f'api_error:{type(e).__name__}'
+            app.logger.warning(
+                f"[ai-resolver] api_fail kind={kind} attempt={attempt+1} err={type(e).__name__}"
+            )
+            break  # API-Fehler: kein retry (Cost-Schutz)
+
+    if parsed is None:
+        result = _ai_resolver_review_fallback(last_error or 'parse_failed')
+        # Cache auch failure (verhindert wiederholte Calls)
+        expires = now + timedelta(hours=_AI_RESOLVER_CACHE_TTL_HOURS)
+        _ai_resolver_cache[cache_key] = (result, expires)
+        return dict(result)
+
+    # Anti-Tax-Sanitizer
+    val = parsed.get('value') if isinstance(parsed.get('value'), dict) else {}
+    safe, offending = _ai_resolver_value_safe(val)
+    if not safe:
+        app.logger.warning(
+            f"[ai-resolver] value_rejected kind={kind} reason=forbidden_key:{offending}"
+        )
+        result = _ai_resolver_review_fallback(f'value_contains_forbidden_key:{offending}')
+        expires = now + timedelta(hours=_AI_RESOLVER_CACHE_TTL_HOURS)
+        _ai_resolver_cache[cache_key] = (result, expires)
+        return dict(result)
+
+    # Confidence-Schwellen anwenden (override resolved/needs_review)
+    result = {
+        'resolved':     bool(parsed.get('resolved', False)),
+        'value':        val,
+        'confidence':   float(parsed.get('confidence', 0.0) or 0.0),
+        'reason':       str(parsed.get('reason', ''))[:300],
+        'evidence':     [str(e)[:200] for e in (parsed.get('evidence') or [])[:5]],
+        'needs_review': bool(parsed.get('needs_review', False)),
+    }
+    result = _ai_resolver_apply_thresholds(result)
+
+    # Cache + Audit (ohne PII)
+    expires = now + timedelta(hours=_AI_RESOLVER_CACHE_TTL_HOURS)
+    _ai_resolver_cache[cache_key] = (result, expires)
+    app.logger.info(
+        f"[ai-resolver] resolved kind={kind} conf={result['confidence']:.2f} "
+        f"resolved={result['resolved']} needs_review={result['needs_review']}"
+    )
+    return dict(result)
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -7725,11 +8571,18 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
     if ANTHROPIC_KEY:
         try:
             all_text = ''
-            for pdf_bytes in pdf_bytes_list:
+            for _pi, pdf_bytes in enumerate(pdf_bytes_list):
                 try:
                     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                         all_text += '\n=== PDF ===\n' + '\n'.join(p.extract_text() or '' for p in pdf.pages)
-                except: pass
+                except Exception as _pe:
+                    # P0 #75 Fix: pdfplumber-Fail nicht mehr silent — Reader würde
+                    # sonst Sonnet mit fehlenden Daten füttern → falsche Auswertung.
+                    app.logger.warning(
+                        f"[se-fallback-reader] pdf_read_fail idx={_pi} "
+                        f"size={len(pdf_bytes) if pdf_bytes else 0}b "
+                        f"err={type(_pe).__name__}"
+                    )
             if all_text and len(all_text) > 100:
                 hint_block = ''
                 if abrechnungen:
@@ -8035,12 +8888,17 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
         se_kontext = ''
         if se_bytes_list:
             se_texts = []
-            for pb in _bytes_list(se_bytes_list)[:12]:
+            for _si, pb in enumerate(_bytes_list(se_bytes_list)[:12]):
                 try:
                     with pdfplumber.open(io.BytesIO(pb)) as pdf:
                         t = '\n'.join(p.extract_text() or '' for p in pdf.pages)
                         if t.strip(): se_texts.append(t)
-                except: pass
+                except Exception as _pe:
+                    # P0 #75: silent-fail würde SE-Kontext verstümmeln
+                    app.logger.warning(
+                        f"[dp-prompt-builder] se_read_fail idx={_si} "
+                        f"size={len(pb) if pb else 0}b err={type(_pe).__name__}"
+                    )
             if se_texts:
                 se_kontext = '\n\nSTRECKENEINSATZ-ABRECHNUNGEN (alle Monate):\n' + '\n---\n'.join(se_texts)
 
@@ -8048,12 +8906,17 @@ def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hi
         einsatzplan_kontext = ''
         if einsatzplan_bytes_list:
             ep_texts = []
-            for pb in _bytes_list(einsatzplan_bytes_list)[:14]:
+            for _ei, pb in enumerate(_bytes_list(einsatzplan_bytes_list)[:14]):
                 try:
                     with pdfplumber.open(io.BytesIO(pb)) as pdf:
                         t = '\n'.join(p.extract_text() or '' for p in pdf.pages)
                         if t.strip(): ep_texts.append(t)
-                except: pass
+                except Exception as _pe:
+                    # P0 #75: silent-fail würde CAS-Cross-Check verstümmeln
+                    app.logger.warning(
+                        f"[dp-prompt-builder] cas_read_fail idx={_ei} "
+                        f"size={len(pb) if pb else 0}b err={type(_pe).__name__}"
+                    )
             if ep_texts:
                 einsatzplan_kontext = ('\n\nCAS-EINSATZPLAN (PUB-Liste, hoch detailliert pro Tag — '
                                        'mit Briefingzeit, exakter Routing, Tour-Code) — nutze als Cross-Check '
@@ -11923,13 +12786,24 @@ def choose_z77_source(daily_lines=0.0, monthly_z77_list=None, declared_total=0.0
     }
 
 
-def _get_bmf_for_iata(iata, year, _diag=None):
+def _get_bmf_for_iata(iata, year, _diag=None, _allow_ai_resolver=True,
+                       _job_id=None, _datum=None, _context=None):
     """Hilfsfunktion: BMF-Auslandspauschale für einen IATA-Code.
-    Liefert dict {voll_24h, an_abreise} oder None.
+    Liefert dict {voll_24h, an_abreise, _source?, _resolved_via?} oder None.
 
-    v8.6: optional `_diag`-dict mit Listen 'bmf_missing'/'iata_unknown' —
-    wird befüllt wenn Mapping fehlt, damit der Caller die Diagnose
-    bekommt (statt still 0 zu liefern).
+    Phase 3 Source-Kaskade:
+      1. IATA_TO_BMF (direkter Airport-Code)
+      2. IATA_METRO_TO_BMF (Metro Area Codes: CHI/ROM/STO/...)
+      3. KI-Resolver kind='place_code' mit Airline-Crew-Kontext
+         — wenn ≥0.90: BMF-Lookup mit resolved country, mark _source='ai_resolver'
+         — wenn 0.70-0.90: kein auto-resolve, _diag.review_suggestion füllen
+         — wenn <0.70: kein resolve
+
+    KI-Resolver kann via _allow_ai_resolver=False unterdrückt werden
+    (z.B. in unit-tests die nur deterministic prüfen wollen).
+
+    BMF-Betrag kommt IMMER aus BMF_AUSLAND_BY_YEAR-Tabelle (Python+Tabelle).
+    KI liefert nur den Land-Namen, NIE den Betrag.
     """
     if not iata:
         return None
@@ -11938,24 +12812,234 @@ def _get_bmf_for_iata(iata, year, _diag=None):
         return None  # Inland — keine Auslandspauschale
     try:
         from bmf_data import IATA_TO_BMF, BMF_AUSLAND_BY_YEAR
-        land = IATA_TO_BMF.get(iata_upper)
-        if not land:
-            if _diag is not None:
-                _diag.setdefault('iata_unknown', []).append(iata_upper)
-            return None
+        try:
+            from bmf_data import IATA_METRO_TO_BMF
+        except ImportError:
+            IATA_METRO_TO_BMF = {}
+
         bmf_year = BMF_AUSLAND_BY_YEAR.get(year) or BMF_AUSLAND_BY_YEAR.get(2025)
-        raw = bmf_year.get(land)
-        if not raw:
-            if _diag is not None:
-                _diag.setdefault('bmf_missing', []).append({'iata': iata_upper, 'land': land, 'year': year})
+
+        def _land_to_satz(land_key):
+            """Helper: nimmt land-name, returnt {voll_24h, an_abreise} oder None."""
+            if not land_key or not bmf_year:
+                return None
+            raw = bmf_year.get(land_key)
+            if not raw:
+                return None
+            if isinstance(raw, tuple) and len(raw) >= 2:
+                return {'voll_24h': float(raw[0]), 'an_abreise': float(raw[1])}
+            if isinstance(raw, dict):
+                return raw
             return None
-        if isinstance(raw, tuple) and len(raw) >= 2:
-            return {'voll_24h': float(raw[0]), 'an_abreise': float(raw[1])}
-        if isinstance(raw, dict):
-            return raw
+
+        # 1. Direct IATA_TO_BMF
+        land = IATA_TO_BMF.get(iata_upper)
+        if land:
+            satz = _land_to_satz(land)
+            if satz:
+                return satz
+            # land gefunden aber kein BMF-Eintrag (Land fehlt in Tabelle)
+            if _diag is not None:
+                _diag.setdefault('bmf_missing', []).append(
+                    {'iata': iata_upper, 'land': land, 'year': year})
+            return None
+
+        # 2. Metro-Alias-Layer
+        land_metro = IATA_METRO_TO_BMF.get(iata_upper)
+        if land_metro:
+            satz = _land_to_satz(land_metro)
+            if satz:
+                satz['_source'] = 'metro_alias'
+                satz['_resolved_via'] = land_metro
+                if _diag is not None:
+                    _diag.setdefault('metro_alias_used', []).append(
+                        {'iata': iata_upper, 'land': land_metro})
+                return satz
+            # Metro-Alias bekannt aber BMF-Eintrag fehlt — sollte selten passieren
+            if _diag is not None:
+                _diag.setdefault('bmf_missing', []).append(
+                    {'iata': iata_upper, 'land': land_metro, 'year': year,
+                     'via': 'metro_alias'})
+            return None
+
+        # 3. KI-Resolver kind='place_code' (nur wenn erlaubt)
+        if _allow_ai_resolver:
+            try:
+                ai_ctx = {
+                    'code':              iata_upper,
+                    'year':              year,
+                    'iata_known':        False,
+                    'metro_alias_known': False,
+                }
+                if _context:
+                    ai_ctx.update({k: v for k, v in _context.items()
+                                   if k not in ai_ctx})
+                ai_result = _resolve_uncertain_fact_with_ai(
+                    kind='place_code',
+                    context=ai_ctx,
+                    job_id=_job_id,
+                    datum=_datum,
+                    uncertain_fact=iata_upper,
+                )
+                if (ai_result.get('resolved') and not ai_result.get('needs_review')):
+                    # ≥0.90 — auto-resolve
+                    val = ai_result.get('value', {}) or {}
+                    bmf_key = val.get('bmf_key') or val.get('country') \
+                        or val.get('resolved_place') or ''
+                    satz = _land_to_satz(bmf_key) if bmf_key else None
+                    if satz:
+                        satz['_source'] = 'ai_resolver'
+                        satz['_resolved_via'] = bmf_key
+                        satz['_ai_confidence'] = ai_result.get('confidence', 0.0)
+                        if _diag is not None:
+                            _diag.setdefault('ai_resolver_used', []).append({
+                                'iata':       iata_upper,
+                                'bmf_key':    bmf_key,
+                                'confidence': ai_result.get('confidence', 0.0),
+                                'reason':     ai_result.get('reason', '')[:120],
+                            })
+                        return satz
+                elif ai_result.get('needs_review'):
+                    # 0.70-0.90 oder <0.70 — Vorschlag merken (für Review-Items)
+                    if _diag is not None:
+                        _diag.setdefault('ai_resolver_review_pending', []).append({
+                            'iata':            iata_upper,
+                            'suggestion':      (ai_result.get('value', {}) or {}).get(
+                                                  'bmf_key', '') or
+                                              (ai_result.get('value', {}) or {}).get(
+                                                  'country', '') or '',
+                            'confidence':      ai_result.get('confidence', 0.0),
+                            'reason':          ai_result.get('reason', '')[:120],
+                        })
+            except Exception as _ae:
+                app.logger.warning(
+                    f"[bmf-ai-fallback] kind=place_code iata={iata_upper} "
+                    f"err={type(_ae).__name__}"
+                )
+                # Falle durch zu iata_unknown
+
+        # Endgültig kein Mapping
+        if _diag is not None:
+            _diag.setdefault('iata_unknown', []).append(iata_upper)
         return None
     except Exception:
         return None
+
+
+def _infer_layover_ort_from_context(idx, sorted_days, year=2025,
+                                       job_id=None, datum=None,
+                                       _allow_ai_resolver=True):
+    """Phase 4 Layover-Place-Resolver-Kaskade.
+
+    Wenn ein Tag overnight=True hat aber layover_ort leer ist, leite den Ort
+    aus dem Kontext ab. Reihenfolge:
+      1. routing[-1] des aktuellen Tages (Ziel der letzten Etappe)
+      2. SE-stfrei_ort des aktuellen Tages (auch wenn primary-resolver es übersah)
+      3. routing[-1] des Vortags wenn dieser auch overnight war
+      4. routing[0] des Folgetags wenn dieser von Layover wegfliegt
+      5. KI-Resolver kind='layover_place' mit Airline-Crew/Tour-Kontext
+
+    Returns:
+      {'ort': str, 'source': 'routing'|'se'|'prev_routing'|'next_routing'|'ai',
+       'reason': str, 'confidence': float}
+      ODER None wenn nichts klappte.
+    """
+    if idx < 0 or idx >= len(sorted_days):
+        return None
+    m = sorted_days[idx]
+    d = m.get('dp') or {}
+    se = m.get('se') or {}
+    if not d.get('overnight_after_day'):
+        return None
+
+    # 1. routing[-1] des aktuellen Tages (Ziel der letzten Etappe)
+    routing = d.get('routing') or []
+    if routing:
+        last_leg = (routing[-1] or '').upper().strip()
+        if last_leg:
+            return {
+                'ort':        last_leg,
+                'source':     'routing_endpoint',
+                'reason':     f'Layover-Ort abgeleitet aus routing[-1]={last_leg}',
+                'confidence': 0.95,
+            }
+
+    # 2. SE-stfrei_ort
+    se_ort = (se.get('stfrei_ort') or '').upper().strip()
+    if se_ort:
+        return {
+            'ort':        se_ort,
+            'source':     'se_stfrei_ort',
+            'reason':     f'Layover-Ort aus SE-stfrei_ort={se_ort}',
+            'confidence': 0.92,
+        }
+
+    # 3. Vortag routing[-1] wenn auch overnight (Tour-Mitte)
+    if idx > 0:
+        prev = sorted_days[idx - 1]
+        prev_d = prev.get('dp') or {}
+        if prev_d.get('overnight_after_day'):
+            prev_routing = prev_d.get('routing') or []
+            if prev_routing:
+                prev_last = (prev_routing[-1] or '').upper().strip()
+                if prev_last:
+                    return {
+                        'ort':        prev_last,
+                        'source':     'prev_day_routing',
+                        'reason':     f'Layover-Ort abgeleitet vom Vortag-routing[-1]={prev_last}',
+                        'confidence': 0.88,
+                    }
+
+    # 4. Folgetag routing[0] (wenn vom Layover-Ort weg fliegt)
+    if idx + 1 < len(sorted_days):
+        nxt = sorted_days[idx + 1]
+        nxt_d = nxt.get('dp') or {}
+        nxt_routing = nxt_d.get('routing') or []
+        if nxt_routing:
+            nxt_first = (nxt_routing[0] or '').upper().strip()
+            if nxt_first:
+                return {
+                    'ort':        nxt_first,
+                    'source':     'next_day_routing',
+                    'reason':     f'Layover-Ort abgeleitet vom Folgetag-routing[0]={nxt_first}',
+                    'confidence': 0.85,
+                }
+
+    # 5. KI-Resolver kind='layover_place' (last resort vor User-Frage)
+    if _allow_ai_resolver:
+        try:
+            ctx = {
+                'datum':            datum or d.get('datum', ''),
+                'today_routing':    routing,
+                'today_overnight':  True,
+                'today_marker':     (d.get('raw_marker', '') or '')[:60],
+                'prev_routing':     (sorted_days[idx-1].get('dp', {}).get('routing') or []) if idx > 0 else [],
+                'prev_overnight':   bool((sorted_days[idx-1].get('dp', {}).get('overnight_after_day')) if idx > 0 else False),
+                'next_routing':     (sorted_days[idx+1].get('dp', {}).get('routing') or []) if idx+1 < len(sorted_days) else [],
+            }
+            ai_result = _resolve_uncertain_fact_with_ai(
+                kind='layover_place',
+                context=ctx,
+                job_id=job_id,
+                datum=datum or d.get('datum', ''),
+                uncertain_fact='layover_ort (overnight=true, routing-context only)',
+            )
+            if ai_result.get('resolved') and not ai_result.get('needs_review'):
+                val = ai_result.get('value', {}) or {}
+                ort = (val.get('resolved_place') or val.get('ort') or val.get('iata') or '').upper().strip()
+                if ort:
+                    return {
+                        'ort':        ort,
+                        'source':     'ai_resolver',
+                        'reason':     ai_result.get('reason', 'KI hat Layover-Ort aus Kontext abgeleitet')[:120],
+                        'confidence': ai_result.get('confidence', 0.9),
+                    }
+        except Exception as e:
+            app.logger.warning(
+                f"[layover-ai-fallback] err={type(e).__name__}"
+            )
+
+    return None
 
 
 def _sonnet_read_se_structured(pdf_bytes_list, year=2025):
@@ -13690,7 +14774,91 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         #   ''                            — kein Z73 oder anderer Z73-Subtyp
         z73_type = ''
 
+        # v15 Fix 2026-05-14: aktive Auslands-SE-Zeile schlägt 'frei'/'urlaub'/'krank'
+        # aus DP/CAS. Wenn die Streckeneinsatz-Abrechnung für diesen Tag steuerfreie
+        # Spesen mit Auslands-Ort ausweist, war der Crew-Member nachweislich auf
+        # Tour — DP/CAS-Marker ist falsch oder unvollständig. User-Feedback:
+        # „SE sagt SEA/AGP/etc, Backend sagt Frei — warum?"
         if at in ('frei', 'urlaub', 'krank'):
+            _se_active_foreign = (
+                se.get('count', 0) > 0
+                and float(se.get('stfrei_total', 0) or 0) > 0
+                and se.get('stfrei_inland') is False
+                and bool(se.get('stfrei_ort'))
+            )
+            if at == 'frei' and _se_active_foreign:
+                _se_ort_ov = se.get('stfrei_ort', '').upper().strip()
+                _bmf_ov = _bmf(_se_ort_ov)
+                _ab_rate = float((_bmf_ov or {}).get('an_abreise', 0) or 0)
+                if _ab_rate > 0:
+                    # Override: klass=Z76 statt Frei
+                    klass = 'Z76'
+                    eur_added = _ab_rate
+                    reason = f'SE-Override: aktive Auslands-SE {_se_ort_ov} → Z76 (statt Frei)'
+                    try:
+                        from bmf_data import IATA_TO_BMF as _IATA_OV
+                        _land_ov = _IATA_OV.get(_se_ort_ov, '') or ''
+                    except Exception:
+                        _land_ov = ''
+                    rescues.append({
+                        'datum':         datum,
+                        'rescue_type':   'frei_to_z76_active_foreign_se',
+                        'rescue_reason': 'klass war Frei trotz aktiver Auslands-SE-Zeile',
+                        'se_ort':        _se_ort_ov,
+                        'se_betrag':     float(se.get('stfrei_total', 0) or 0),
+                        'bmf_land':      _land_ov,
+                        'bmf_tagtyp':    'an_abreise',
+                        'amount':        eur_added,
+                        'original_klass':'Frei',
+                    })
+                    print(f"[v15-frei-to-z76] datum={datum} ort={_se_ort_ov} betrag={float(se.get('stfrei_total',0) or 0):.2f} → Z76 {eur_added}€")
+                    # tage_detail wird im normalen Loop weiter unten gepflegt
+                    # Wir bauen das hier direkt, damit der Frei-continue nicht greift
+                    tage_detail.append({
+                        'datum': datum, 'klass': klass, 'begruendung': reason,
+                        'marker': d.get('raw_marker', '') or at,
+                        'routing': '-'.join(d.get('routing') or []),
+                        'tour_dauer': 1, 'eur': eur_added,
+                        'dienstlich': True,
+                        'reader_facts': {
+                            'datum': datum,
+                            'activity_type': at,
+                            'marker_raw': d.get('raw_marker', ''),
+                            'routing': list(d.get('routing') or []),
+                            'has_fl': bool(d.get('has_fl')),
+                            'overnight_after_day': bool(d.get('overnight_after_day')),
+                            'layover_ort': d.get('layover_ort', '') or '',
+                            'layover_inland': d.get('layover_inland'),
+                            'starts_at_homebase': bool(d.get('starts_at_homebase')),
+                            'ends_at_homebase': bool(d.get('ends_at_homebase')),
+                            'requires_commute': bool(d.get('requires_commute')),
+                            'is_workday': True,
+                            'start_time': d.get('start_time', '') or '',
+                            'end_time': d.get('end_time', '') or '',
+                            'duty_duration_minutes': int(d.get('duty_duration_minutes') or 0),
+                            'confidence': float(d.get('confidence') or 0),
+                            'raw_lines': list(d.get('raw_lines') or []),
+                        },
+                        'classifier_result': {
+                            'klass': 'Z76',
+                            'amount': float(eur_added),
+                            'reason': reason,
+                            'bmf_land': _land_ov,
+                            'bmf_tagtyp': 'an_abreise',
+                            'counted_as_workday': True,
+                            'counted_as_fahrtag': False,
+                            'counted_as_hotel_nacht': False,
+                        },
+                        'sources': ['DP', 'SE'],
+                        'diagnostics': {
+                            'reader_warning': '',
+                            'classifier_warning': 'SE-Override greift',
+                            'bmf_mapping_issue': '',
+                            'unresolved_reason': '',
+                        },
+                    })
+                    continue
+            # Sonst: normaler Frei/Urlaub/Krank-Pfad
             klass = 'Frei'
             reason = at
             tage_detail.append({
@@ -13752,10 +14920,20 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 # Auslands-Layover-Standby
                 klass = 'Z76'
                 # Land aus IATA-Code ermitteln
-                bmf_land_sb = IATA_TO_BMF.get(_sb_stfrei_ort)
-                _bmf_y_sb = BMF_AUSLAND_BY_YEAR.get(year) or BMF_AUSLAND_BY_YEAR.get(2025) or {}
+                from bmf_data import IATA_TO_BMF as _IATA_SB, BMF_AUSLAND_BY_YEAR as _BMF_Y_SB
+                bmf_land_sb = _IATA_SB.get(_sb_stfrei_ort)
+                _bmf_y_sb = _BMF_Y_SB.get(year) or _BMF_Y_SB.get(2025) or {}
                 if bmf_land_sb and bmf_land_sb in _bmf_y_sb:
                     sat = _bmf_y_sb[bmf_land_sb]
+                    # P0-Fix 2026-05-14 (Job 3aa0570a tuple-Bug):
+                    # bmf_data.py speichert Auslands-Einträge als tuple
+                    # (voll_24h, an_abreise). Hier wurde aber dict-API
+                    # erwartet → AttributeError 'tuple' has no attribute 'get'
+                    # → ganzer Job crashed mit CLASSIFICATION_SCHEMA_FAILED.
+                    if isinstance(sat, tuple) and len(sat) >= 2:
+                        sat = {'voll_24h': float(sat[0]), 'an_abreise': float(sat[1])}
+                    elif not isinstance(sat, dict):
+                        sat = {}
                     # Voller 24h-Satz für Layover-Mid-Tour, An/Ab-Satz für Rand-Tage —
                     # vereinfacht: 24h-Satz, weil FollowMe das auch so macht.
                     eur_added = float(sat.get('voll_24h', 0) or 0)
@@ -13817,6 +14995,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 and se.get('stfrei_inland') is False
                 and bool(se.get('stfrei_ort'))
             )
+            # ROLLBACK 2026-05-14: ORTSTAG ist NICHT pauschal Z72. User-Feedback:
+            # „die sind zuhause" — Marker-Bedeutung ist crew-spezifisch (für
+            # manche Office in Base, für andere on-call zuhause < 8h). Ohne
+            # Briefingzeit darf Backend NICHT pauschal Z72 vergeben — sonst
+            # falscher Steuer-Anspruch. User-Klärung pro Tag bleibt nötig.
             if (not overnight and not prev_overnight and not in_cluster_o
                 and not has_active_foreign_se_o
                 and duty_known_o and total_min_o >= SAME_DAY_Z72_TOTAL_MINUTES):
@@ -13959,6 +15142,25 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             is_abreise = bool(cluster and cluster.get('indices') and i == cluster['indices'][-1])
 
             today_layover_ort = se.get('stfrei_ort') or d.get('layover_ort', '') or ''
+
+            # Phase 4: Layover-Place-Resolver-Kaskade.
+            # Wenn overnight=True aber kein layover_ort → versuche aus Kontext
+            # abzuleiten (routing[-1], Vortag/Folgetag, KI). Audit-Eintrag in rescues.
+            if overnight and not today_layover_ort:
+                inferred = _infer_layover_ort_from_context(i, sorted_days, year=year,
+                                                            job_id=None, datum=datum)
+                if inferred and inferred.get('ort'):
+                    today_layover_ort = inferred['ort']
+                    rescues.append({
+                        'datum':         datum,
+                        'rescue_type':   'layover_place_inferred',
+                        'rescue_reason': inferred.get('reason', ''),
+                        'cas_layover':   today_layover_ort,
+                        'inference_source': inferred.get('source', ''),
+                        'confidence':    inferred.get('confidence', 1.0),
+                        'original_klass': '',
+                    })
+
             today_layover_inland = None
             if overnight and today_layover_ort:
                 today_layover_inland = _is_inland_code(today_layover_ort)
@@ -14009,14 +15211,63 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             elif overnight and today_layover_inland is True:
                 is_volltag = not (is_anreise or is_abreise)
                 hb_upper = (homebase or 'FRA').upper()
+                # v15 Phase-1 Cluster C2: SE-Stempel sagt Inland (≠ Homebase), aber
+                # CAS-layover_ort ist Ausland und Cluster ist foreign → CAS gewinnt
+                # über SE-Stempel.
+                # Beispiel: 2025-09-26 SE-Stempel='MUC' (Inland, ≠ FRA), CAS-Layover='IST'
+                # (Türkei). Crew war physisch in Istanbul → Z76 statt Z74 'Inland MUC'.
+                # Ausnahme: Wenn SE-Stempel selbst die Homebase ist (z.B. FRA), greift
+                # der existing „FRA-Stempel + Abend-Anreise → Z73 Inland"-Pfad (Z.14687+) —
+                # mein Override muss zurückhalten.
+                cas_layover_only = (d.get('layover_ort', '') or '').upper().strip()
+                se_stamp_is_homebase = today_layover_ort.upper().strip() == hb_upper
+                if (cluster_foreign and cas_layover_only
+                        and not _is_inland_code(cas_layover_only)
+                        and cas_layover_only != hb_upper
+                        and not se_stamp_is_homebase):
+                    bmf_aus_cas = _bmf(cas_layover_only)
+                    if bmf_aus_cas:
+                        klass = 'Z76'
+                        if is_anreise or is_abreise:
+                            satz_cas = float(bmf_aus_cas.get('an_abreise', 0) or 0)
+                            position_cas = 'An/Ab'
+                        else:
+                            satz_cas = float(bmf_aus_cas.get('voll_24h', 0) or 0)
+                            position_cas = 'Volltag'
+                        eur_added = satz_cas
+                        reason = (f'Auslands-Layover {cas_layover_only} (Z76 {position_cas} — '
+                                  f'überstimmt SE-Inland-Stempel {today_layover_ort})')
+                        audit_note = (f'{datum}: CAS-Layover {cas_layover_only} (Ausland) gewinnt '
+                                      f'über SE-Stempel {today_layover_ort} (Inland)')
+                        try:
+                            from bmf_data import IATA_TO_BMF as _IATA_C2
+                            _land_c2 = _IATA_C2.get(cas_layover_only, '') or ''
+                        except Exception:
+                            _land_c2 = ''
+                        rescues.append({
+                            'datum':          datum,
+                            'rescue_type':    'cas_foreign_layover_over_se_inland_stamp',
+                            'rescue_reason':  f'SE-Stempel {today_layover_ort} (Inland), CAS-Layover {cas_layover_only} (Ausland) — CAS gewinnt',
+                            'se_ort':         today_layover_ort,
+                            'cas_layover':    cas_layover_only,
+                            'bmf_land':       _land_c2,
+                            'bmf_tagtyp':     'an_abreise' if (is_anreise or is_abreise) else 'voll_24h',
+                            'amount':         eur_added,
+                            'original_klass': 'Z73/Z74-intended',
+                        })
+                        print(f"[v15-cluster-c2] datum={datum} cas_layover={cas_layover_only} se_stempel={today_layover_ort} → Z76 {eur_added}€")
+                        classified = True
+                        # Fall through zur tage_detail-Section unten — KEIN Z73/Z74-Pfad
+                        # (klass/eur_added/reason sind bereits gesetzt)
                 # v8.5: Wenn der Inland-Layover-Ort die Homebase ist UND der
                 # Cluster Auslandscluster ist → das ist ein Homebase-Stempel
                 # auf einem Auslandstour-Tag, kein echter Inland-Layover.
                 # → Z76 (mit Cluster-Ziel-Land), nicht Z73/Z74.
                 # Inland-Layover-Ort ≠ Homebase (z.B. MUC bei FRA-Crew, Mixed-Tour)
                 # = echter Inland-Layover → Z73/Z74 wie gewohnt.
+                # v15 Phase-1 C2: nur wenn Cluster-C2-Override oben NICHT gegriffen hat
                 inland_is_homebase = today_layover_ort.upper() == hb_upper
-                if cluster_foreign and inland_is_homebase:
+                if not classified and cluster_foreign and inland_is_homebase:
                     # v8.12: Vor der Z76-Standard-Logik: Abend-Anreise-Regel auch hier.
                     # Bei FRA-SE-Stempel + cluster_foreign + is_anreise + start_time>=18
                     # → Z73 Inland-Anreise 14€ (statt Z76 An/Ab des Ziellands).
@@ -14058,12 +15309,12 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                         reason = f'Auslandstour-{position} (Homebase-Stempel {today_layover_ort}, Ziel {target_iata or "?"}) Z76'
                         audit_note = f'{datum}: Homebase-SE-Stempel {today_layover_ort} bei Auslands-Cluster — als Z76 {position}'
                         print(f"[v8-inland-blocked-foreign-cluster] datum={datum} stempel={today_layover_ort} reason='Homebase-Stempel auf Auslandstour — kein Z73/Z74'")
-                elif is_volltag:
+                elif not classified and is_volltag:
                     # Echter Inland-Volltag (Inland-Layover ≠ Homebase, oder reiner Inland-Cluster)
                     klass = 'Z74'
                     eur_added = INLAND_VOLL_24H
                     reason = f'Inland-Mittel-Tag {today_layover_ort} (Z74 24h)'
-                else:
+                elif not classified:
                     klass = 'Z73'
                     eur_added = INLAND_AN_ABREISE
                     reason = f'Inland-Layover {today_layover_ort} (Z73 An/Ab{"" if not cluster_mixed else " im Mixed"})'
@@ -14245,19 +15496,41 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 print(f"[v8-anti-stochastik-skip] datum={datum} ort={se_ort_rescue} reason='Issue bleibt — BMF-Mapping fehlt'")
 
         # VMA-Unmapped-SE-Check: aktive SE ohne Z72/73/74/76?
+        # Phase 7 Fix: Standby/ZeroDay mit SE-Inland-Stempel ≤14€ ist AG-Erstattung
+        # (Lufthansa zahlt steuerfrei für >8h Standby/Tagestrip), per BMF auf Z72
+        # angerechnet → KEIN zusätzlicher Werbungskosten-Anspruch → erwartet, kein
+        # „unmapped"-Issue. Stattdessen Audit-Note für Transparenz.
         if has_active_se_final and klass not in ('Z72', 'Z73', 'Z74', 'Z76'):
-            vma_unmapped_se.append({
-                'datum': datum,
-                'stfrei_ort': se.get('stfrei_ort', ''),
-                'stfrei_total': se.get('stfrei_total', 0),
-                'zwoelftel': se.get('zwoelftel', 0),
-                'klass': klass,
-                'reason': reason,
-                'lines_count': se.get('count', 0),
-            })
-            print(f"[v8-vma-unmapped-se] datum={datum} ort={se.get('stfrei_ort','')} "
-                  f"betrag={se.get('stfrei_total',0):.2f} klass={klass} reason='{reason[:60]}'")
-            unresolved_reason = unresolved_reason or f'aktive SE-Zeile ohne VMA-Klassifikation (klass={klass})'
+            _se_inland = se.get('stfrei_inland') is True
+            _se_total = float(se.get('stfrei_total', 0) or 0)
+            _is_ag_inland_reimbursement = (
+                klass in ('Standby', 'ZeroDay')
+                and _se_inland
+                and 0 < _se_total <= INLAND_TAGESTRIP_8H + 0.01
+            )
+            if _is_ag_inland_reimbursement:
+                audit_notes.append(
+                    f'{datum}: SE weist steuerfreie Inlandspauschale {_se_total:.2f}€ '
+                    f'für {se.get("stfrei_ort","?")} aus (AG-Erstattung). '
+                    f'Per BMF auf Z72 angerechnet — kein zusätzlicher Werbungskosten-Anspruch '
+                    f'(Tag-Klassifikation: {klass}).'
+                )
+                print(f"[v8-se-inland-ag-reimbursement] datum={datum} "
+                      f"ort={se.get('stfrei_ort','')} betrag={_se_total:.2f} klass={klass} "
+                      f"→ Audit-Note (kein unresolved)")
+            else:
+                vma_unmapped_se.append({
+                    'datum': datum,
+                    'stfrei_ort': se.get('stfrei_ort', ''),
+                    'stfrei_total': _se_total,
+                    'zwoelftel': se.get('zwoelftel', 0),
+                    'klass': klass,
+                    'reason': reason,
+                    'lines_count': se.get('count', 0),
+                })
+                print(f"[v8-vma-unmapped-se] datum={datum} ort={se.get('stfrei_ort','')} "
+                      f"betrag={_se_total:.2f} klass={klass} reason='{reason[:60]}'")
+                unresolved_reason = unresolved_reason or f'aktive SE-Zeile ohne VMA-Klassifikation (klass={klass})'
 
         if audit_note:
             audit_notes.append(audit_note)
@@ -14916,6 +16189,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         # v8.24: Mehrtagige training_seq-Tage werden NICHT als Einzel-Kandidaten
         # rausgekippt — die Sequenz hat eigene Audit-Logik. Nur isolierte
         # Office/Training-Tage außerhalb erkannter Sequenzen werden zu Items.
+        # v15 Fix 2026-05-14: ORTSTAG/FRS/LMN_AS/LMN_CR ohne Uhrzeit = passive
+        # Marker = User ist zuhause / Reserve = kein 8h-Anspruch. NICHT fragen
+        # (vermeidet 28× Click-Stress für 0€-Tage). Wenn User das doch geltend
+        # machen will, kann er später manuell im Chat „diesen Tag prüfen".
         if klass == 'Office' and at in ('office', 'training'):
             raw_duty_rev = d.get('duty_duration_minutes')
             duty_known_rev = isinstance(raw_duty_rev, (int, float)) and raw_duty_rev > 0
@@ -14928,11 +16205,28 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             # v8.24: Tag ist Teil einer Mehrtages-Schulungssequenz (training_seq_skip)?
             # Wenn ja, NICHT einzeln fragen — nur Tag 1 der Sequenz wird zur Frage.
             in_training_seq_followup = i in training_seq_skip
-            if (not duty_known_rev
+            # v15 Fix: passive Marker (ORTSTAG/FRS/LMN_AS/LMN_CR) ohne Uhrzeit
+            # = nicht-dienstlicher Tag → kein review-item
+            raw_mk_rev = (d.get('raw_marker', '') or '').upper()
+            is_passive_no_duty = (
+                not duty_known_rev
+                and any(mk in raw_mk_rev for mk in ('ORTSTAG', 'FRS', 'LMN_AS', 'LMN_CR'))
+            )
+            # v15 Phase-1 Cluster A: wenn CAS-Reader Uhrzeit liefert (auch wenn
+            # duty_duration_minutes nicht aggregiert wurde), DARF kein review-item
+            # entstehen. Tag wird deterministisch via Z72-Logik klassifiziert.
+            # User-Feedback: „EM 07:30-11:00 steht doch klar im CAS — warum fragen?"
+            has_time_evidence_rev = (
+                duty_known_rev
+                or bool((d.get('start_time') or '').strip())
+                or bool((d.get('end_time') or '').strip())
+            )
+            if (not has_time_evidence_rev
                 and not overnight and not prev_overnight
                 and not in_cluster_rev
                 and not has_active_foreign_se_rev
-                and not in_training_seq_followup):
+                and not in_training_seq_followup
+                and not is_passive_no_duty):
                 office_training_time_missing_candidates.append({
                     'datum': datum,
                     'activity_type': at,
@@ -16558,11 +17852,78 @@ def _build_review_items(cls, manual_day_overrides=None):
     items = []
 
     # office_training_time_missing: Office/Schulung an Homebase ohne Zeitinfo
+    # BH-001 Fix 2026-05-15: KI-Marker-Semantik-Resolver wird VOR Item-Bildung
+    # gerufen. Statt User mit 8h-Symptom-Frage zu nerven („Warst du länger als
+    # 8h weg?") fragen wir jetzt die Ursache: Was bedeutet der Marker?
+    #
+    #   ≥0.90 + semantics=office_passive_at_home → silent-skip (kein Item)
+    #   ≥0.70 → Item mit suggested_answer + Marker-Semantik-Frage
+    #   <0.70 → Item mit Marker-Semantik-Frage statt 8h-Symptom
+    #
+    # Plus deterministische Skip-Liste für bekannte passive Marker (defensive
+    # Fallback wenn KI nicht erreichbar): ORTSTAG/FRS/LMN_AS/LMN_CR/FRD.
+    _DETERMINISTIC_PASSIVE_MARKERS = ('ORTSTAG', 'FRS', 'LMN_AS', 'LMN_CR', 'FRD')
     for c in (cls.get('office_training_time_missing_candidates', []) or []):
         datum = c.get('datum', '')
         ov = overrides.get(datum)
         status = 'answered' if ov else 'pending'
         marker = c.get('marker', '') or 'Schulung/Office'
+        marker_upper = marker.upper().strip()
+        # Deterministische passive-Marker — silent skip ohne KI-Call
+        if any(pm in marker_upper for pm in _DETERMINISTIC_PASSIVE_MARKERS):
+            continue
+        # KI-Marker-Semantik-Resolver mit Airline-Crew-Kontext
+        ai_suggestion = None
+        ai_confidence = 0.0
+        ai_value = {}
+        try:
+            ai_ctx = {
+                'marker':        marker,
+                'activity_type': c.get('activity_type', ''),
+                'sample_dates':  [datum],
+                'context':       (
+                    'Airline-Crew-Dienstplan office/training marker. '
+                    'Cockpit/Kabine Lufthansa-ähnliches Roster. '
+                    'Bekannte LH-Codes: ORTSTAG/FRS/LMN_AS/LMN_CR = passive zuhause; '
+                    'EM = Office-Meeting mit Anreise; '
+                    'Schulungs-Codes = mit Anreise zur Niederlassung.'
+                ),
+            }
+            ai_result = _resolve_uncertain_fact_with_ai(
+                kind='marker_semantics',
+                context=ai_ctx,
+                job_id=None,
+                datum=datum,
+                uncertain_fact=marker,
+            )
+            ai_value = ai_result.get('value', {}) or {}
+            ai_confidence = float(ai_result.get('confidence', 0.0) or 0.0)
+        except Exception:
+            pass
+        semantics_token = (
+            ai_value.get('semantics') or ai_value.get('meaning') or ''
+        ).lower().strip()
+        # Silent-Skip bei hoher KI-Confidence + passive-Semantik
+        is_passive_ai = (
+            ai_confidence >= 0.90
+            and ('passive' in semantics_token
+                 or 'office_passive' in semantics_token
+                 or 'at_home' in semantics_token
+                 or 'zuhause' in semantics_token)
+        )
+        if is_passive_ai:
+            continue
+        # Suggested answer wenn KI conf≥0.70
+        if ai_confidence >= 0.70 and (ai_value.get('semantics') or ai_value.get('meaning')):
+            ai_suggestion = ai_value.get('meaning') or ai_value.get('semantics')
+        # Marker-Semantik-Frage (statt 8h-Symptom)
+        question = (
+            f'Was bedeutet „{marker}" am {datum} bei dir im Plan — '
+            f'Bürodienst zuhause (passiv, ohne Anreise) '
+            f'oder Schulung/Meeting mit Anreise zur Niederlassung?'
+        )
+        if ai_suggestion:
+            question += f' (KI-Vorschlag: {ai_suggestion})'
         items.append({
             'id': f'office_training_time_missing:{datum}',
             'type': 'office_training_time_missing',
@@ -16570,14 +17931,18 @@ def _build_review_items(cls, manual_day_overrides=None):
             'datum': datum,
             'marker': marker,
             'activity_type': c.get('activity_type', ''),
-            'question': (
-                f'Am {datum} war ein Office-/Schulungstag ({marker}) eingetragen — '
-                f'wir konnten keine Uhrzeit erkennen. '
-                f'Warst du inklusive Hin- und Rückweg länger als 8 Stunden unterwegs?'
-            ),
+            'source_type':       'CAS',
+            'source_excerpt':    f'Marker „{marker}" ohne Briefingzeit',
+            'why_not_resolved':  'CAS-Reader liefert für diesen Marker keine Uhrzeit',
+            'suggested_answer':  ai_suggestion,
+            'confidence':        ai_confidence,
+            'affected_days':     [datum],
+            'question':          question,
             'options': [
-                {'value': 'yes',    'label': 'Ja, über 8h'},
-                {'value': 'no',     'label': 'Nein, unter 8h'},
+                {'value': 'office_passive_at_home',
+                 'label': 'Bürodienst zuhause (passiv)'},
+                {'value': 'office_with_commute',
+                 'label': 'Schulung/Meeting mit Anreise'},
                 {'value': 'time',   'label': 'Uhrzeit eingeben'},
                 {'value': 'unsure', 'label': 'Ich weiß es nicht'},
             ],
@@ -16586,23 +17951,77 @@ def _build_review_items(cls, manual_day_overrides=None):
             'user_answer': ov,
         })
 
-    # v8.22 Now-4: unknown_marker-Items (red/yellow je nach Frequenz)
+    # Phase 6: unknown_marker_candidates — Gruppierung nach first_token + KI-Vorschlag.
+    # Gleicher Marker an N Tagen → 1 Gruppen-Item mit affected_days[] statt N Items.
+    # Plus: KI-Resolver kind='marker_semantics' versucht den Marker aus Crew-Kontext
+    # zu deuten. Bei conf≥0.90 wird suggested_answer gesetzt (User bestätigt mit 1 Klick).
+    _unknown_by_token = {}
     for c in (cls.get('unknown_marker_candidates', []) or []):
-        datum = c.get('datum', '')
-        marker = c.get('marker', '')
-        ov = overrides.get(f'_marker:{c.get("first_token","")}')
+        tok = (c.get('first_token', '') or c.get('marker', '') or 'unknown').upper().strip()
+        _unknown_by_token.setdefault(tok, []).append(c)
+    for token, group in _unknown_by_token.items():
+        primary = group[0]
+        primary_datum = primary.get('datum', '')
+        marker = primary.get('marker', '')
+        affected = sorted([c.get('datum', '') for c in group])
+        ov = overrides.get(f'_marker:{token}')
         status = 'answered' if ov else 'pending'
+        is_grouped = len(group) > 1
+
+        # KI-Marker-Semantik-Resolver (Phase 6) — Vorschlag holen wenn möglich
+        ai_suggestion = None
+        ai_confidence = 0.0
+        try:
+            ai_ctx = {
+                'marker':       marker,
+                'first_token':  token,
+                'occurrences':  len(group),
+                'sample_dates': affected[:5],
+                'context':      'Airline-Crew-Dienstplan unknown marker',
+            }
+            ai_result = _resolve_uncertain_fact_with_ai(
+                kind='marker_semantics',
+                context=ai_ctx,
+                job_id=None,
+                datum=primary_datum,
+                uncertain_fact=marker or token,
+            )
+            if ai_result.get('resolved'):
+                val = ai_result.get('value', {}) or {}
+                ai_suggestion = val.get('semantics') or val.get('description') or val.get('meaning')
+                ai_confidence = ai_result.get('confidence', 0.0)
+        except Exception:
+            pass
+
+        # Question state-aware
+        if is_grouped:
+            q = (
+                f'In deinem Crew-Dienstplan steht {len(group)}× die unbekannte '
+                f'Kennung „{marker}". Was bedeutet diese Kennung bei dir?'
+            )
+        else:
+            q = (
+                f'Am {primary_datum} habe ich die Kennung „{marker}" gefunden, '
+                f'kenne sie aber noch nicht. Was bedeutet diese Kennung?'
+            )
         items.append({
-            'id': f'unknown_marker:{datum}',
+            'id': (f'unknown_marker:group:{token}' if is_grouped
+                   else f'unknown_marker:{primary_datum}'),
             'type': 'unknown_marker',
             'severity': 'yellow',
-            'datum': datum,
+            'datum': primary_datum,
             'marker': marker,
-            'first_token': c.get('first_token', ''),
-            'question': (
-                f'Am {datum} habe ich die Kennung „{marker}" gefunden, kenne sie aber noch nicht. '
-                f'Was bedeutet diese Kennung?'
-            ),
+            'first_token': token,
+            # Phase 5 — Schema-Erweiterung
+            'source_type':       'CAS',
+            'source_excerpt':    f'Unbekannte Kennung „{marker}" ({len(group)} Tag(e))',
+            'why_not_resolved':  ('KI-Marker-Semantik liefert nicht conf≥0.90'
+                                   if ai_confidence < 0.90 else
+                                   'KI-Vorschlag liegt vor — User-Bestätigung empfohlen'),
+            'suggested_answer':  ai_suggestion,
+            'confidence':        ai_confidence,
+            'affected_days':     affected,
+            'question': q,
             'options': [
                 {'value': 'flight',   'label': 'Flugdienst'},
                 {'value': 'training', 'label': 'Schulung / Training'},
@@ -16613,7 +18032,7 @@ def _build_review_items(cls, manual_day_overrides=None):
                 {'value': 'other',    'label': 'Sonstiges'},
                 {'value': 'unsure',   'label': 'Ich weiß es nicht'},
             ],
-            'money_impact_estimate': 0.0,  # Marker-Klärung allein hat keinen direkten €-Impact
+            'money_impact_estimate': 0.0,
             'status': status,
             'user_answer': ov,
         })
