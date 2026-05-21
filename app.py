@@ -18895,11 +18895,38 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                         and se.get('stfrei_ort')):
                     se_ort_v15 = se.get('stfrei_ort', '')
                     bmf_aus_v15 = _bmf(se_ort_v15)
-                    eur_added = float((bmf_aus_v15.get('an_abreise', 0) if bmf_aus_v15 else 28.0) or 0)
-                    klass = 'Z76'
-                    reason = f'Same-Day Auslandstrip {se_ort_v15} (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)'
-                    audit_note = f'{datum}: Same-Day mit Auslands-SE {se_ort_v15} trotz prev_overnight → Z76'
-                    print(f"[v8-z76-detail] datum={datum} ort={se_ort_v15} reason='Same-Day Auslandstrip prev_overnight'")
+                    # P0-Fix 2026-05-21: Tag-Position-bewusster Satz.
+                    # Bisher pauschal an_abreise — falsch wenn der Tag mid-tour
+                    # ist (Crew ist immer noch im Ausland, Übernachtung am Ende
+                    # des Tages dort = BMF Zwischentag = voll_24h).
+                    # Signal: today.layover_ort ist ausländisch UND != Homebase.
+                    # → Mid-Tour: voll_24h-Satz
+                    # → Abreise-Tag (today.layover leer / Homebase / Inland):
+                    #   an_abreise-Satz wie bisher (Übernachtung am Ende des
+                    #   Tages NICHT mehr im Ausland → kein Zwischentag).
+                    today_layover_v15 = (d.get('layover_ort') or '').upper().strip()
+                    hb_up_v15 = (homebase or 'FRA').upper()
+                    today_still_foreign = bool(
+                        today_layover_v15
+                        and not _is_inland_code(today_layover_v15)
+                        and today_layover_v15 != hb_up_v15
+                    )
+                    if today_still_foreign:
+                        eur_added = float((bmf_aus_v15.get('voll_24h', 0) if bmf_aus_v15 else 28.0) or 0)
+                        klass = 'Z76'
+                        reason = (f'Mid-Tour Auslandstag {se_ort_v15} '
+                                  f'(Z76 Volltag — prev_overnight + today_layover {today_layover_v15} '
+                                  f'noch Ausland)')
+                        audit_note = (f'{datum}: Mid-Tour mit Auslands-SE {se_ort_v15} '
+                                      f'+ today_layover {today_layover_v15} → Z76 voll_24h')
+                        print(f"[v8-z76-detail] datum={datum} ort={se_ort_v15} "
+                              f"layover={today_layover_v15} → Mid-Tour voll_24h")
+                    else:
+                        eur_added = float((bmf_aus_v15.get('an_abreise', 0) if bmf_aus_v15 else 28.0) or 0)
+                        klass = 'Z76'
+                        reason = f'Same-Day Auslandstrip {se_ort_v15} (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)'
+                        audit_note = f'{datum}: Same-Day mit Auslands-SE {se_ort_v15} trotz prev_overnight → Z76'
+                        print(f"[v8-z76-detail] datum={datum} ort={se_ort_v15} reason='Same-Day Auslandstrip prev_overnight'")
                 else:
                     # ── BH-003a 2026-05-19: Chirurgischer Heimkehr-Rescue ──
                     # User-Beweis Tibor 2025-01-06: Issue mit reason „Heimkehr aus
@@ -19067,22 +19094,89 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     except (ValueError, IndexError):
                         pass
 
-                if evening_anreise:
+                # P0-Fix 2026-05-21 — Highest-defensible Auslands-Anreise.
+                # Default-Regel: Wenn SE foreign stfrei UND CAS layover_ort foreign
+                # → BMF §9 Abs. 4a: Anreisetag = 80% Auslandspauschale.
+                # AG-Beleg (SE foreign stfrei) ist die stärkste Quelle dafür,
+                # dass dieser Tag fiskalisch eine Auslandsdienstreise-Anreise ist —
+                # unabhängig davon, ob die Briefing-Zeit am Abend lag oder nicht.
+                # Nur OHNE foreign-SE-Beleg behalten wir die konservative v8.10-
+                # Inland-14€-Klassifikation (keine AG-Evidence).
+                se_foreign_today = (
+                    se.get('count', 0) > 0
+                    and se.get('stfrei_inland') is False
+                    and bool(se.get('stfrei_ort'))
+                )
+                if evening_anreise and not se_foreign_today:
                     klass = 'Z73'
                     z73_type = 'evening_foreign_tour_start'
                     eur_added = INLAND_AN_ABREISE
-                    reason = f'Auslandstour-Anreise mit Abend-Briefing {start_time_str} (>= {EVENING_FOREIGN_TOUR_START_HOUR}:00) → Inland-Anreise 14€'
-                    audit_note = f'{datum}: Auslandstour-Anreise nach {today_layover_ort}, Briefing {start_time_str} → Z73 Inland (Tag dominant in DE)'
-                    print(f"[v8-z73-detail] datum={datum} ort={today_layover_ort} start={start_time_str} reason='Abend-Anreise → Z73 Inland'")
+                    reason = (f'Auslandstour-Anreise mit Abend-Briefing {start_time_str} '
+                              f'(>= {EVENING_FOREIGN_TOUR_START_HOUR}:00) → Inland-Anreise 14€ '
+                              f'(kein foreign-SE-Beleg → konservativ)')
+                    audit_note = (f'{datum}: Auslandstour-Anreise nach {today_layover_ort}, '
+                                  f'Briefing {start_time_str}, kein foreign-SE → Z73 Inland (konservativ)')
+                    print(f"[v8-z73-detail] datum={datum} ort={today_layover_ort} "
+                          f"start={start_time_str} se_foreign=False → Z73 Inland")
+                elif evening_anreise and se_foreign_today:
+                    # AG-Beleg foreign-stfrei → BMF Auslands-An/Ab (80%) — highest defensible.
+                    klass = 'Z76'
+                    bmf_aus = _bmf(today_layover_ort)
+                    eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+                    reason = (f'Auslands-Anreise {today_layover_ort} (Z76 An/Ab) — '
+                              f'Briefing {start_time_str} ABER SE foreign-stfrei vorhanden '
+                              f'→ BMF Auslandspauschale 80%')
+                    audit_note = (f'{datum}: Auslands-Anreise mit SE foreign-stfrei-Beleg → '
+                                  f'Z76 An/Ab nach BMF §9 Abs. 4a (highest-defensible)')
+                    classified = True
+                    print(f"[v8-z76-detail] datum={datum} ort={today_layover_ort} "
+                          f"start={start_time_str} se_foreign=True → Z76 An/Ab (highest-defensible)")
                 else:
                     klass = 'Z76'
                     bmf_aus = _bmf(today_layover_ort)
-                    if is_anreise or is_abreise:
+                    # P0-Fix #3 2026-05-21 — Highest-defensible Mid-Tour-Erkennung.
+                    # Wenn AG-Beleg (SE foreign stfrei) sowohl HEUTE als auch GESTERN
+                    # vorliegt, ist heute mindestens Tag 2 einer Auslandsdienstreise.
+                    # Wenn auch MORGEN noch SE foreign stfrei vorliegt, ist heute
+                    # ein Zwischentag → voll_24h (BMF §9 Abs. 4a).
+                    # Hintergrund: AT-Cluster-Detection vergisst manchmal Folgetag
+                    # (z.B. Abreise als same_day klassifiziert, nicht im Cluster).
+                    prev_se_foreign = bool(
+                        prev and prev['se'].get('count', 0) > 0
+                        and prev['se'].get('stfrei_inland') is False
+                        and prev['se'].get('stfrei_ort')
+                    )
+                    next_se_foreign = False
+                    if i + 1 < len(sorted_days):
+                        next_se = sorted_days[i + 1].get('se') or {}
+                        next_se_foreign = bool(
+                            next_se.get('count', 0) > 0
+                            and next_se.get('stfrei_inland') is False
+                            and next_se.get('stfrei_ort')
+                        )
+                    today_se_foreign = bool(
+                        se.get('count', 0) > 0
+                        and se.get('stfrei_inland') is False
+                        and se.get('stfrei_ort')
+                    )
+                    mid_tour_by_se = (
+                        today_se_foreign and prev_se_foreign and next_se_foreign
+                    )
+                    if (is_anreise or is_abreise) and not mid_tour_by_se:
                         satz = (bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0)
+                        pos_lbl = 'An/Ab'
                     else:
                         satz = (bmf_aus.get('voll_24h', 0) if bmf_aus else 28.0)
+                        pos_lbl = 'Volltag'
                     eur_added = float(satz or 0)
-                    reason = f'Auslands-Layover {today_layover_ort} (Z76 {"An/Ab" if (is_anreise or is_abreise) else "Volltag"})'
+                    if mid_tour_by_se and (is_anreise or is_abreise):
+                        reason = (f'Auslands-Layover {today_layover_ort} (Z76 Volltag) — '
+                                  f'SE foreign-stfrei Vortag+Heute+Folgetag → Zwischentag '
+                                  f'(highest-defensible, BMF §9 Abs. 4a)')
+                        audit_note = (f'{datum}: Cluster-Boundary überschrieben durch SE-Evidence '
+                                      f'(prev+today+next foreign stfrei) → voll_24h')
+                    else:
+                        reason = f'Auslands-Layover {today_layover_ort} (Z76 {pos_lbl})'
                 classified = True
 
             elif overnight and today_layover_inland is True:

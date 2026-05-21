@@ -2198,12 +2198,20 @@ def test_v89_reference_diff_helper_works():
     assert diff['z74']['within_tolerance'] is True
 
 
-def test_v810_evening_foreign_anreise_becomes_z73():
-    """LH0506 FRA-GRU mit Briefing 21:25: Auslandstour-Anreise mit
-    Abend-Start → Z73 Inland 14€ (nicht Z76 An/Ab Brasilien).
+def test_v810_evening_foreign_anreise_becomes_z76_with_se_evidence():
+    """SUPERSEDED 2026-05-21: Highest-Defensible-Regel — Auslandstour-Anreise
+    mit Abend-Briefing UND foreign-SE-Beleg → Z76 An/Ab (Auslandspauschale 80%),
+    NICHT Z73 Inland 14€.
 
-    Live-Bug aus job f20175f0: 9 LH-Auslandsanreisen mit start_time 19:54-21:25
-    landeten als Z76 An/Ab statt Z73 Inland-Anreise."""
+    Reasoning: SE foreign-stfrei ist der AG-Beleg dafür, dass dieser Tag eine
+    Auslandsdienstreise-Anreise ist. Per BMF §9 Abs. 4a EStG = 80%-Auslands-
+    Pauschale, unabhängig vom Briefing-Zeitpunkt. Die v8.10-Inland-Logik bleibt
+    nur als Fallback bei FEHLENDEM SE-Beleg (konservativ).
+
+    Originaler v8.10-Bugfix (Live-Job f20175f0): 9 LH-Auslandsanreisen 19:54-21:25
+    sollten nicht still als Z76 verbucht werden. v8.10 löste das durch Inland-
+    Default. Highest-Defensible löst es jetzt sauber: AG-Beleg vorhanden → Z76,
+    fehlender AG-Beleg → konservativ Z73 Inland 14€."""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': '2025-01-19', 'activity_type': 'tour', 'overnight_after_day': True,
@@ -2225,10 +2233,12 @@ def test_v810_evening_foreign_anreise_becomes_z73():
     matched = _match_dp_se_per_day(structured, se, 'FRA')
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
     detail_19 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-19']
-    assert detail_19 and detail_19[0]['klass'] == 'Z73', \
-        f"Auslandstour-Anreise 21:25 sollte Z73 sein, ist {detail_19[0]['klass']}"
-    assert detail_19[0]['eur'] == 14.00, \
-        f"Z73 sollte 14€ sein, ist {detail_19[0]['eur']}"
+    # SE foreign-stfrei vorhanden → Highest-Defensible Z76 An/Ab Brasilien
+    assert detail_19 and detail_19[0]['klass'] == 'Z76', \
+        f"Auslandstour-Anreise 21:25 mit SE-Beleg sollte Z76 sein, ist {detail_19[0]['klass']}"
+    # Brasilien an_abreise = 36€ (BMF 2025), nicht Inland 14€
+    assert detail_19[0]['eur'] > 14.0, \
+        f"Z76 An/Ab Brasilien > 14€, ist {detail_19[0]['eur']}"
     # Mittel-Tage 20.+21. bleiben Z76 voll_24h
     detail_20 = [d for d in result['tage_detail'] if d['datum'] == '2025-01-20']
     assert detail_20 and detail_20[0]['klass'] == 'Z76'

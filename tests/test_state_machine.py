@@ -1031,25 +1031,20 @@ _FRONTEND_PATH = '/Users/miguelschumann/Desktop/site/index.html'
 
 
 def test_frontend_has_central_api_config():
-    """index.html hat einen zentralen API-Config-Block."""
+    """index.html hat einen zentralen API-Config-Block (Cloud Run only)."""
     src = open(_FRONTEND_PATH).read()
-    assert 'v12 Phase B: zentrale API-Base-URL' in src
+    assert 'API-Base-URL-Konfiguration' in src or '_initApiBaseUrl' in src
     assert '_initApiBaseUrl' in src
     assert 'window._API' in src
     assert 'window._API_CONFIG' in src
 
 
-def test_frontend_no_hardcoded_render_url_outside_config():
-    """Keine hardcoded onrender.com URL außerhalb des Config-Blocks
-    (RENDER_FALLBACK-Konstante ist erlaubt)."""
+def test_frontend_no_render_url_present():
+    """Render wurde 2026-05-21 entfernt — keine onrender.com URL mehr im Frontend."""
     src = open(_FRONTEND_PATH).read()
-    # Anzahl Vorkommen sollte genau 1 sein — die RENDER_FALLBACK-Constante
-    assert src.count('https://aerotax-backend.onrender.com') == 1, \
-        f'Erwarte genau 1 hardcoded URL (RENDER_FALLBACK), gefunden: {src.count("https://aerotax-backend.onrender.com")}'
-    # Diese eine Stelle ist die Constant-Definition
-    fallback_idx = src.find('https://aerotax-backend.onrender.com')
-    pre = src[max(0, fallback_idx - 100):fallback_idx]
-    assert 'RENDER_FALLBACK' in pre, 'Verbleibende onrender.com URL muss als RENDER_FALLBACK definiert sein'
+    assert src.count('https://aerotax-backend.onrender.com') == 0, \
+        f'Erwarte 0 onrender.com URLs (Render entfernt), gefunden: {src.count("https://aerotax-backend.onrender.com")}'
+    assert 'RENDER_FALLBACK' not in src, 'RENDER_FALLBACK-Konstante wurde 2026-05-21 entfernt'
 
 
 def test_frontend_supports_query_param_override():
@@ -1081,13 +1076,13 @@ def test_frontend_hostname_routing_present():
 
 
 def test_frontend_api_config_exposes_active_url():
-    """window._API_CONFIG.active / is_cloud_run / is_render — UI kann anzeigen welcher Backend aktiv ist."""
+    """window._API_CONFIG.active / is_cloud_run — UI kann anzeigen welcher Backend aktiv ist.
+    is_render-Flag wurde 2026-05-21 entfernt (Render → Cloud Run Migration final)."""
     src = open(_FRONTEND_PATH).read()
     block_idx = src.find('_initApiBaseUrl')
     block = src[block_idx:block_idx + 3000]
     assert "'active'" in block or 'active:' in block
     assert 'is_cloud_run' in block
-    assert 'is_render' in block
 
 
 # ─── Phase B: Dockerfile Cloud-Run-tauglich ──────────────────────────────────
