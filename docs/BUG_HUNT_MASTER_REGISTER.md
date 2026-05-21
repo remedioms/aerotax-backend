@@ -17,7 +17,7 @@ Status-Werte: `open` / `investigating` / `fixed_unverified` / `verified_closed` 
 ### BH-001 · Review-Question fragt Symptom statt Ursache (ORTSTAG/OF >8h)
 - **Ebene:** 7 (KI-Resolver / Review-Quality)
 - **Severity:** P0 (User-vertrauen, falsche Antworten möglich)
-- **Status:** open
+- **Status:** fixed_unverified (deployt revision 00063-422, 9/9 tests grün, Browser-QA mit frischem Token ausstehend — alle Tibor-Token >24h expired)
 - **Owner/Phase:** Phase E — Review Quality
 - **User Impact:** User AT-C33E6274D260FC78 sieht „⚠️ einen Punkt offen — 19.12. — Einzeltage. Frage: warst du an diesem Tag inkl. Hin-/Rückweg länger als 8h weg?". Tag ist Marker `OF` (Office/Schulung an Homebase). User-Aussage: „ein ortstag.. unadmissable!". User wird gefragt was die KI aus dem Marker hätte ableiten können.
 - **Repro:** `https://aerosteuer.de` mit AT-C33E… → Chat-Frage zeigt 8h-Symptomatik
@@ -35,7 +35,7 @@ Status-Werte: `open` / `investigating` / `fixed_unverified` / `verified_closed` 
 ### BH-002 · `/api/job/<id>` HTTP 502 / HTML-Errorseite
 - **Ebene:** 4 (Backend API Contract)
 - **Severity:** P0 (Frontend nur fallback auf /api/session, single-point-of-failure)
-- **Status:** investigating
+- **Status:** fixed_unverified (revision 00063-422: 502 → 403 JSON, kein HTML-crash mehr. Live-Probe: `{"error":"Diese Auswertung konnte nicht geöffnet werden..."}`. Endpoint braucht Session-Auth — strukturell by-design. Restdiagnose: ob Auth-Vertrag konsistent ist mit Frontend-pollen)
 - **Owner/Phase:** Phase D — Backend API Contract
 - **User Impact:** Frontend kann Jobs nicht direkt abfragen; alle Recall-Pfade müssen über `/api/session` laufen. Falls Session-Token unbekannt → User stuck.
 - **Repro:** `curl --max-time 25 https://aerotax-backend.onrender.com/api/job/e132976f-d0dd-4627-9d80-9782721602ba` → HTTP 502, 223 KB HTML.
@@ -100,7 +100,7 @@ Status-Werte: `open` / `investigating` / `fixed_unverified` / `verified_closed` 
 ### BH-006 · `/api/session/<token>` liefert canonical_state=null
 - **Ebene:** 4 (API Contract)
 - **Severity:** P1 (Workaround via Normalizer existiert, aber Backend sollte source-of-truth sein)
-- **Status:** investigating
+- **Status:** fixed_unverified (mit-gefixed durch Recovery-Commit c0078aa: `_classify_job_state` jetzt aktiv im Endpoint. Live-Probe AT-46C9…: response enthält `canonical_state, user_title, user_message, next_actions, pdf_allowed, reason_code` — voller Vertrag)
 - **Owner/Phase:** Phase D — Backend API Contract
 - **User Impact:** Frontend muss aus result_data raten. Wenn Normalizer-Logik buggy → falsche UI.
 - **Repro:** `curl /api/session/AT-…` → response hat `canonical_state: null` (auch bei needs_review/done).

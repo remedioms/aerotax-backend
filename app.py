@@ -2629,6 +2629,105 @@ def _run_process_async(job_id, form, files):
                     'bmf_data_year': int(form.get('year', 2025)),
                 },
                 'tage_detail': _tage_detail,
+                # 2026-05-21 — Source-Labeling per Bucket (Highest-Defensible-
+                # Produktregel). Frontend/PDF rendern „* Nutzerangabe"-Sternchen
+                # und Audit-Hinweise basierend auf source_type pro Bucket.
+                # Schema: {bucket: {type, label, user_inputs, star_required}}
+                'source_breakdown': {
+                    'block_a': {
+                        'fahr': {
+                            'type': 'mixed',
+                            'label': 'CAS-Fahrtage + Nutzerangabe (km) + BMF-Pauschale',
+                            'user_inputs': ['km'],
+                            'star_required': True,
+                            'audit': (
+                                f'{form.get("km", "?")} km × Fahrtage × '
+                                f'0,30 €/km (bis 20 km) bzw. 0,38 €/km (ab 21. km). '
+                                f'Quelle: km vom Nutzer angegeben.'
+                            ),
+                        },
+                        'reinig': {
+                            'type': 'calculated',
+                            'label': 'Pauschal-Ansatz pro Arbeitstag (Crew-Erfahrungswert)',
+                            'user_inputs': [],
+                            'star_required': False,
+                            'audit': 'Reinigungstage × Pauschal-Satz. Pauschal-Erfahrungswert für Crew-Uniform.',
+                        },
+                        'trink': {
+                            'type': 'calculated',
+                            'label': 'Pauschal-Ansatz pro Hotelnacht (Crew-Erfahrungswert)',
+                            'user_inputs': [],
+                            'star_required': False,
+                            'audit': 'Hotelnächte × Pauschal-Satz. Pauschal-Erfahrungswert für Reisenebenkosten.',
+                        },
+                        'opt_zu': {
+                            'type': 'user',
+                            'label': 'Belege vom Nutzer hochgeladen',
+                            'user_inputs': ['optionale_belege'],
+                            'star_required': True,
+                            'audit': 'Telefon, Gewerkschaft, Arbeitsmittel etc. Belege vom Nutzer.',
+                        },
+                    },
+                    'block_b': {
+                        'vma_72': {
+                            'type': 'mixed',
+                            'label': 'CAS-Zeiten + commute_min + BMF-Pauschale',
+                            'user_inputs': ['anfahrt_min'],
+                            'star_required': False,
+                            'audit': 'Inland-Tag >8h. Quellen: CAS-Zeiten, BMF §9 Abs. 4a 2025.',
+                        },
+                        'vma_73': {
+                            'type': 'mixed',
+                            'label': 'CAS-Tour-Cluster + BMF',
+                            'user_inputs': [],
+                            'star_required': False,
+                            'audit': 'Inland An-/Abreisetag. Quellen: CAS-Tour-Kontext, BMF.',
+                        },
+                        'vma_74': {
+                            'type': 'document',
+                            'label': 'CAS overnight Inland + BMF',
+                            'user_inputs': [],
+                            'star_required': False,
+                            'audit': 'Inland 24h-Tag. Quellen: CAS-Übernachtung, BMF.',
+                        },
+                        'vma_aus': {
+                            'type': 'mixed',
+                            'label': 'CAS-Layover + SE-foreign-stfrei + BMF-Land',
+                            'user_inputs': [],
+                            'star_required': False,
+                            'audit': (
+                                'Auslands-Tage (Z76). Highest-defensible: voll_24h für Mid-Tour-Tage '
+                                'wenn SE-Evidence prev+today+next foreign vorhanden. '
+                                'Quellen: CAS-Layover, SE-stfrei_ort, BMF 2025.'
+                            ),
+                        },
+                    },
+                    'erstattung': {
+                        'ag_z17': {
+                            'type': 'document',
+                            'label': 'Lohnsteuerbescheinigung Zeile 17',
+                            'user_inputs': [],
+                            'star_required': False,
+                            'audit': 'AG-Fahrkostenzuschuss. Quelle: LSB Z17 direkt gelesen.',
+                        },
+                        'z77': {
+                            'type': 'document',
+                            'label': 'Streckeneinsatz-Abrechnungen Summenzeilen',
+                            'user_inputs': [],
+                            'star_required': False,
+                            'audit': 'Steuerfreie Spesen pro Monat aus SE-Summenzeilen. Quelle: AG-Beleg.',
+                        },
+                    },
+                    'review_user_inputs': [],  # gefüllt nach review-bulk-answer
+                    'legend': {
+                        '*': 'Nutzerangabe — bitte Plausibilität selbst prüfen.',
+                        'CAS': 'Dienstplan / Crew-Allocation-System',
+                        'SE': 'Streckeneinsatz-Abrechnung (AG-Beleg)',
+                        'LSB': 'Lohnsteuerbescheinigung',
+                        'BMF': 'BMF-Pauschalen § 9 Abs. 4a EStG 2025',
+                        'Pauschal-Ansatz': 'Crew-typischer Erfahrungswert (keine BMF-Pauschale)',
+                    },
+                },
             })
 
         with _jobs_lock:
@@ -18298,6 +18397,11 @@ FEATURE_DYNAMIC_HOMEBASE_MODE = True
 
 
 def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_minutes=0):
+    # 2026-05-21 — Early-declare near_8h_review_candidates so the in-loop
+    # office-branch can append to it (variable used at ~line 18950, full
+    # candidate-list block declared ~line 20100). Python-scope-rule.
+    near_8h_review_candidates = []
+
     """v8.1 Backend-Klassifikator: deterministisch aus DP+SE pro Tag.
 
     Architektur (v7.5):
@@ -18844,6 +18948,28 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             else:
                 klass = 'Office'
                 reason = 'Office am Homebase — AT + FT'
+                # 2026-05-21 — Near-8h-Review-Capture (Highest-Defensible).
+                # Tage knapp unter 8h (7:00-8:00) sind potenziell Z72 wenn
+                # User Fahrtzeit oder mehr Abwesenheit bestätigt. Statt still
+                # zu kürzen → Review-Item mit kontextueller Frage.
+                # Schwelle: 420 ≤ total < 480 (7:00 ≤ total < 8:00).
+                if (duty_known_o and 420 <= total_min_o < SAME_DAY_Z72_TOTAL_MINUTES
+                    and not overnight and not prev_overnight
+                    and not in_cluster_o):
+                    near_8h_review_candidates.append({
+                        'datum':                  datum,
+                        'activity_type':          at,
+                        'marker':                 d.get('raw_marker', '') or at,
+                        'total_min_known':        int(total_min_o),
+                        'time_source':            time_src_o,
+                        'commute_minutes_input':  int(commute_minutes or 0),
+                        'minutes_to_8h':          int(SAME_DAY_Z72_TOTAL_MINUTES - total_min_o),
+                        'money_impact_estimate':  14.0,
+                        'reason':                 (
+                            f'Office knapp unter 8h (computed {total_min_o}min, fehlen '
+                            f'{SAME_DAY_Z72_TOTAL_MINUTES - total_min_o}min bis Z72)'
+                        ),
+                    })
 
         elif at == 'training':
             if overnight and prev_at != 'training':
@@ -19972,6 +20098,8 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
     office_training_time_missing_candidates = []  # v8.21: Office/Schulung ohne Zeitinfo
     unknown_marker_candidates = []  # v8.22 Now-4: unbekannte Kennungen mit raw_marker
     missing_reader_days = []         # Tage in Datum-Range die der DP-Reader weggelassen hat
+    # 2026-05-21 — near_8h_review_candidates ist bereits oben am Function-Start
+    # deklariert (Python-scope-rule, da Office-Branch im Hauptloop appendet).
 
     hb_upper = (homebase or 'FRA').upper()
     for i, m in enumerate(sorted_days):
@@ -20329,6 +20457,7 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         'office_z72_candidates':       office_z72_candidates,
         'office_training_time_missing_candidates': office_training_time_missing_candidates,
         'unknown_marker_candidates':                unknown_marker_candidates,
+        'near_8h_review_candidates':               near_8h_review_candidates,
         'missing_reader_days':         missing_reader_days,
         'hotel_candidate_issues':      hotel_candidate_issues,
         'bmf_missing':            list(_diag_bmf['bmf_missing']),
@@ -21849,6 +21978,75 @@ def _apply_manual_day_overrides(structured_days, overrides):
     return out
 
 
+def _should_create_review(item, money_threshold=5.0):
+    """Globaler Review-Filter (2026-05-21 Produkt-Regel: minimiere User-Talk).
+
+    Safety-Hardening 2026-05-21 (Phase 1):
+      - KI darf KEIN Auto-Resolve, wenn der CAS/SE-Beleg widerspricht
+      - counter_evidence_score braucht echte Quellen-Liste (≥2), nicht
+        einfach „score=3" als Magic-Number
+      - Wenn SE foreign-stfrei vorhanden ist UND money_impact ≥ 14 € →
+        nie silent skip (das wäre Geld-Verlust)
+
+    Filter-Logik:
+      E. Already Answered  → keep
+      F. Source-Conflict-Trap → keep wenn AG-Beleg foreign vorhanden + money≥14
+      B. Low-Value         → skip (audit-only)
+      A. Can Auto-Resolve  → KI conf≥0.90 + suggested_answer + ai_safe_to_resolve
+                              + KEIN Konflikt mit CAS/SE → skip (auto)
+      C. Clear Counter-Ev  → counter_evidence_score≥3 UND counter_evidence_sources
+                              hat ≥2 echte Quellen → skip (audit-only)
+      D. Money-Relevant Ambiguous → keep (Review)
+
+    Returns: (should_create: bool, skip_reason: str)
+    """
+    # E: Already answered → always keep
+    if item.get('status') == 'answered':
+        return True, ''
+
+    money = float(item.get('money_impact_estimate', 0) or 0)
+
+    # F: Source-Conflict-Trap (Safety-Hardening 2026-05-21).
+    # Wenn AG-Beleg (SE foreign stfrei) am Tag vorhanden ist UND money ≥ 14€,
+    # darf der Tag NIE silent geskippt werden — er muss entweder automatisch
+    # Z76 werden (per P0 Fixes) oder als Review erscheinen. Das schützt vor
+    # versehentlichem Geld-Verlust durch zu aggressive KI-Auto-Resolve.
+    has_foreign_se = bool(item.get('se_foreign_evidence'))
+    if has_foreign_se and money >= 14.0:
+        return True, ''  # Source-conflict-trap aktiv: keep review
+
+    # B: Low-Value / Cosmetic
+    if money < money_threshold:
+        return False, f'money_impact={money:.2f}€ unter Threshold {money_threshold}€'
+
+    # A: Auto-Resolved per KI (mit strengerer Safety-Bedingung)
+    confidence = float(item.get('confidence', 0) or 0)
+    suggested = item.get('suggested_answer')
+    ai_safe = item.get('ai_safe_to_resolve', None)
+    # ai_safe_to_resolve muss explizit True sein. Wenn None oder False, kein
+    # Auto-Resolve. KI-Auto-Resolve nur wenn Candidate-Builder bestätigt hat,
+    # dass KEIN CAS/SE-Konflikt vorliegt (z.B. passive-Marker am Homebase
+    # ohne SE-Spesen — sicher passive).
+    if confidence >= 0.90 and suggested and ai_safe is True:
+        return False, (f'auto-resolved (KI confidence {confidence:.2f}, '
+                        f'suggestion: {suggested}, ai_safe_to_resolve=True)')
+
+    # C: Strong counter-evidence — braucht echte Quellen-Liste
+    counter_score = float(item.get('counter_evidence_score', 0) or 0)
+    counter_sources = item.get('counter_evidence_sources') or []
+    # Score allein reicht NICHT — wir wollen mindestens 2 named sources
+    # (z.B. ['cas_clear_off', 'prev_day_frei', 'next_day_frei']).
+    has_real_counter = (counter_score >= 3
+                        and isinstance(counter_sources, list)
+                        and len(counter_sources) >= 2)
+    if has_real_counter:
+        return False, (f'starke Gegenquelle (counter_evidence_score={counter_score}, '
+                        f'sources={counter_sources})')
+
+    # D: Money-relevant + ambiguous → Review erstellen
+    return True, ''
+
+
 def _build_review_items(cls, manual_day_overrides=None):
     """v8.21: Erzeugt die User-facing review_items Liste.
 
@@ -22039,18 +22237,115 @@ def _build_review_items(cls, manual_day_overrides=None):
                 {'value': 'other',    'label': 'Sonstiges'},
                 {'value': 'unsure',   'label': 'Ich weiß es nicht'},
             ],
-            'money_impact_estimate': 0.0,
+            # 2026-05-21 — Money-Impact-Estimate für unknown_marker.
+            # Ein unbekannter Marker an N Tagen kann potenziell VMA (Z72/Z73/Z76)
+            # ergeben — minimum 14€ pro Tag (Inland-Pauschale). Höher wenn
+            # Folgetag/Vortag bereits foreign-Tour. Default-Schätzung: 14€ × N.
+            # (Filter blockt mit money_impact<5€; 14€×1=14€ passt durch.)
+            'money_impact_estimate': 14.0 * max(1, len(affected)),
             'status': status,
             'user_answer': ov,
         })
 
+    # 2026-05-21 — Near-8h-Review-Items (Highest-Defensible-Produktregel).
+    # Tage mit CAS-Zeiten 7:00 bis < 8:00 bekommen kontextuelle Review-Frage
+    # MIT Money-Hebel und konkreter Minutenzahl statt generischer 8h-Frage.
+    for c in (cls.get('near_8h_review_candidates') or []):
+        datum = c.get('datum', '')
+        ov = overrides.get(datum)
+        status = 'answered' if ov else 'pending'
+        total_min = int(c.get('total_min_known') or 0)
+        commute_known = int(c.get('commute_minutes_input') or 0)
+        h = total_min // 60
+        m = total_min % 60
+        # Kontextuelle Frage: zeigt User die echte Zahl + möglichen Geld-Hebel
+        if commute_known > 0:
+            ctx_q = (
+                f'Ich komme für den {datum} auf {h}:{m:02d} Std. Abwesenheit aus dem '
+                f'Dienstplan (inkl. {commute_known}min Fahrtzeit je Richtung). '
+                f'Wenn deine tatsächliche Hin- und Rückfahrt länger war, könntest du über '
+                f'8 Stunden liegen. Ab mehr als 8 Stunden kann eine Verpflegungspauschale '
+                f'(14 €) angesetzt werden. Warst du an diesem Tag inklusive Hin- und '
+                f'Rückweg länger als 8 Stunden unterwegs?'
+            )
+        else:
+            ctx_q = (
+                f'Ich komme für den {datum} auf {h}:{m:02d} Std. Abwesenheit aus dem '
+                f'Dienstplan. Wenn deine tatsächliche Hin- und Rückfahrt dazu kommt, '
+                f'könntest du über 8 Stunden liegen. Ab mehr als 8 Stunden kann eine '
+                f'Verpflegungspauschale (14 €) angesetzt werden. Warst du an diesem Tag '
+                f'inklusive Hin- und Rückweg länger als 8 Stunden unterwegs?'
+            )
+        items.append({
+            'id':                f'near_8h_review:{datum}',
+            'type':              'near_8h_review',
+            'severity':          'yellow',
+            'datum':             datum,
+            'marker':            c.get('marker', ''),
+            'activity_type':     c.get('activity_type', ''),
+            'source_type':       'CAS',
+            'source_excerpt':    f'CAS-Abwesenheit {h}:{m:02d} Std. (computed, {c.get("time_source", "")})',
+            'why_not_resolved':  f'Knapp unter 8h — {total_min}min, {c.get("minutes_to_8h", 0)}min bis Z72',
+            'suggested_answer':  None,
+            'confidence':        0.0,
+            'affected_days':     [datum],
+            'question':          ctx_q,
+            'options': [
+                {'value': 'yes',    'label': 'Ja, über 8 Stunden'},
+                {'value': 'no',     'label': 'Nein, unter 8 Stunden'},
+                {'value': 'time',   'label': 'Ich gebe Uhrzeiten ein'},
+                {'value': 'unsure', 'label': 'Ich weiß es nicht'},
+            ],
+            'money_impact_estimate': float(c.get('money_impact_estimate', 14.0)),
+            'status':            status,
+            'user_answer':       ov,
+            'audit_source':      'CAS + commute_min (computed)',
+        })
+
+    # 2026-05-21 — Globaler Review-Filter (Highest-Defensible-Produktregel:
+    # minimiere User-Talk). Vor Sortierung jedes Item durch _should_create_review
+    # filtern; abgelehnte landen in cls['_audit_skipped_reviews'] für Audit-
+    # Trail mit voller Evidence-Spur (PDF-Audit-Section kann sie anzeigen
+    # ohne den User zu nerven).
+    _filter_money_threshold = 5.0
+    kept = []
+    skipped_audit = []
+    for it in items:
+        should, reason = _should_create_review(it, money_threshold=_filter_money_threshold)
+        if should:
+            kept.append(it)
+        else:
+            skipped_audit.append({
+                'id':                  it.get('id', ''),
+                'type':                it.get('type', ''),
+                'datum':               it.get('datum', ''),
+                'money_impact':        float(it.get('money_impact_estimate', 0) or 0),
+                'skip_reason':         reason,
+                'suggested_answer':    it.get('suggested_answer'),
+                'confidence':          float(it.get('confidence', 0) or 0),
+                # Safety-Hardening 2026-05-21: Full Evidence-Trail.
+                'evidence_for':        it.get('evidence_for') or [],
+                'evidence_against':    it.get('evidence_against') or [],
+                'source_refs':         it.get('source_refs') or [],
+                'ai_safe_to_resolve':  it.get('ai_safe_to_resolve'),
+                'se_foreign_evidence': bool(it.get('se_foreign_evidence')),
+                'high_value':          float(it.get('money_impact_estimate', 0) or 0) >= 14.0,
+            })
+    # Audit-Trail beilegen damit PDF/Backend transparent zeigt was gefiltert wurde
+    if isinstance(cls, dict):
+        cls['_audit_skipped_reviews'] = skipped_audit
+        # Count high-value skipped → PDF kann Hinweis zeigen
+        cls['_audit_high_value_skipped_count'] = sum(
+            1 for s in skipped_audit if s.get('high_value')
+        )
+
     # Sortierung: pending zuerst, dann nach money_impact (absteigend), dann Datum
-    items.sort(key=lambda x: (
+    kept.sort(key=lambda x: (
         0 if x['status'] == 'pending' else 1,
         -float(x.get('money_impact_estimate', 0)),
         x['datum'],
     ))
-    return items
+    return kept
 
 
 # ── v8.26: Review-Gruppierung — zusammenhängende Tage clustern ──
@@ -24229,6 +24524,23 @@ def erstelle_pdf(d):
     # ── Final: Block A + Block B = einzutragender Gesamtbetrag ──
     S.append(Spacer(1, 0.3*cm))
     S.append(kv_total("Einzutragender Gesamtbetrag (A + B)", eur(d.get('netto',0))))
+    S.append(Spacer(1, 0.3*cm))
+
+    # ── Source-Legende 2026-05-21 — Highest-Defensible-Produktregel ──
+    # User soll wissen welche Werte aus Belegen kommen und welche pauschal/
+    # User-Angabe sind. Sternchen *=Nutzerangabe.
+    _legend_lines = [
+        '<b>Quellen-Übersicht:</b>',
+        ('• <b>CAS</b> Dienstplan · <b>SE</b> Streckeneinsatz-Abrechnung · '
+         '<b>LSB</b> Lohnsteuerbescheinigung · <b>BMF</b> §9 Abs. 4a EStG 2025'),
+        '• <b>*</b> = Nutzerangabe (z.B. km-Entfernung, Belege) — bitte selbst auf Plausibilität prüfen.',
+        '• <b>Pauschal-Ansatz</b> = Crew-typischer Erfahrungswert (Reinigung, Trinkgeld) — keine BMF-Pauschale.',
+        ('• Bei VMA Ausland (Z76) gilt: Höchster vertretbarer Ansatz, wenn '
+         'CAS-Layover + SE-stfrei + BMF-Land übereinstimmen.'),
+    ]
+    for _ll in _legend_lines:
+        S.append(Paragraph(_ll, ps(f"slg{id(_ll)}", fontSize=8, textColor=TEXT3,
+            fontName="Helvetica", leading=11, spaceAfter=2)))
     S.append(Spacer(1, 0.5*cm))
 
     # Monate

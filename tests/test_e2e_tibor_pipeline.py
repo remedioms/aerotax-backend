@@ -108,13 +108,22 @@ def test_align_failure_sets_red_health():
     """Wenn Align in classify_v11_cas_pipeline crashed:
     document_health=red wird gesetzt + _followme_align_failed in classification.
 
-    Test prüft Code-Pfad statisch — echter Test braucht volle Pipeline."""
+    Test prüft Code-Pfad statisch — echter Test braucht volle Pipeline.
+
+    2026-05-19 Modernisierung: `except Exception as _ae:` kommt mehrfach im Code
+    vor (Phase 3 bmf-ai-fallback etc). Test sucht jetzt explizit den
+    followme-align-Block über den Crash-Logger.
+    """
     src_path = os.path.join(os.path.dirname(_HERE), 'app.py')
     src = open(src_path).read()
-    # Suche Block der align-crash behandelt
-    idx = src.find('except Exception as _ae:')
-    assert idx > 0, 'align-except-block fehlt'
-    block = src[idx:idx + 2500]
+    # Suche den followme-align crash-Block über Marker
+    idx = src.find('[followme-align] CRASH')
+    if idx < 0:
+        # Fallback: alter Such-Pattern
+        idx = src.find('_followme_align_failed')
+    assert idx > 0, 'followme-align crash-Block fehlt'
+    # Block davor + danach
+    block = src[max(0, idx-500):idx + 2500]
     assert '_followme_align_failed' in block
     assert "'red'" in block
     assert 'document_health' in block.lower() or '_document_health' in block

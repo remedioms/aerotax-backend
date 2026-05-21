@@ -22,7 +22,7 @@ def test_recall_debug_flag_via_query():
     src = _read()
     idx = src.find('window._recallSubmit = async function')
     assert idx > 0
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     assert 'DEBUG_RECALL' in block
     assert "get('debug') === '1'" in block or "get(\"debug\") === '1'" in block or "get('debug')==='1'" in block
 
@@ -31,7 +31,7 @@ def test_recall_dbgStep_function_exists():
     """`_dbgStep(n, label, extra)` Helper in _recallSubmit."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     assert 'function _dbgStep(' in block
     assert "console.log(tag, 'step='" in block or "[recall-debug]" in block
 
@@ -40,7 +40,7 @@ def test_recall_debug_host_lazy_created():
     """recall-debug-host wird lazy erstellt, nur bei DEBUG_RECALL=true."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     assert 'recall-debug-host' in block
     # Nur sichtbar bei DEBUG_RECALL
     assert 'if(!DEBUG_RECALL) return' in block
@@ -147,7 +147,7 @@ def test_recall_finally_resets_button():
     """`finally`-Block in _recallSubmit setzt Button immer wieder aktiv."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     # finally-Block enthält Button-Reset
     finally_idx = block.find('} finally {')
     assert finally_idx > 0, 'finally-Block fehlt'
@@ -160,7 +160,7 @@ def test_recall_has_hard_reset_timer():
     """20s Hard-Reset-Timer: garantierte Button-Reaktivierung."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     assert '_hardResetTimer' in block
     assert 'setTimeout' in block
     assert '20000' in block  # 20s
@@ -170,7 +170,7 @@ def test_recall_fetch_has_abortcontroller():
     """Jeder fetch hat AbortController-Timeout."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     assert 'AbortController' in block
     assert '_fetchTimeout' in block
 
@@ -179,7 +179,7 @@ def test_recall_fetch_timeout_is_15s():
     """Session-fetch hat 15s timeout."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     # 15000 als ms-Wert
     assert '15000' in block
 
@@ -188,7 +188,7 @@ def test_recall_abort_error_friendly():
     """Wenn AbortError (timeout) → friendly 'Verbindung dauert länger'."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     assert 'AbortError' in block
     assert 'dauert länger als erwartet' in block
 
@@ -199,7 +199,7 @@ def test_recall_console_logs_with_prefix():
     """console.log mit '[recall-debug]' Prefix für DevTools."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     assert "'[recall-debug]'" in block
 
 
@@ -209,7 +209,7 @@ def test_recall_every_branch_emits_visible_feedback():
     """Jeder Pfad ruft _setRecallStatus mit success/error UND _dbgStep route=..."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     # routes: progress, error, result
     assert "route=progress_panel" in block
     assert "route=error_state" in block
@@ -227,7 +227,7 @@ def test_recall_no_falltrough_without_route():
     folgt entweder return oder ein klarer 3. Branch (done/needs_review)."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     # Suche „done / needs_review" Kommentar — der signalisiert dass alle States gehandelt sind
     assert 'done / needs_review' in block
 
@@ -247,7 +247,7 @@ def test_recall_empty_code_rejected():
     """Leerer Code → friendly error 'Bitte Code eingeben'."""
     src = _read()
     idx = src.find('window._recallSubmit = async function')
-    block = src[idx:idx + 10000]
+    block = src[idx:idx + 20000]  # 2026-05-19: _recallSubmit wuchs durch BH-001+P0-Fixes
     assert 'Bitte Code eingeben' in block
 
 

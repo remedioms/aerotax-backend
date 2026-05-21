@@ -432,12 +432,21 @@ def test_cloud_tasks_process_generates_fallback_ref_when_missing():
 
 def test_cloud_tasks_process_hard_fails_on_persist_error():
     """Wenn _save_uploaded_files_supabase failed: Job sofort als failed mit
-    WORKER_RESTARTED reason_code markieren — NICHT enqueue."""
+    spezifischem reason_code markieren — NICHT enqueue.
+
+    2026-05-19 Modernisierung: Reason-Code von generic WORKER_RESTARTED auf
+    spezifisch UPLOAD_PERSIST_FAILED upgraded (P0 #90). Log-String englisch
+    durch deutsch ersetzt. Test prüft jetzt die spezifischen reason_code-Pfade.
+    """
     src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
-    block = _find_process_cloud_tasks_branch(src, span=4500)
-    # _set_job_failed mit WORKER_RESTARTED bei persist-fail
-    assert "_set_job_failed(job_id, 'WORKER_RESTARTED'" in block
-    assert 'Failed to persist files' in block
+    block = _find_process_cloud_tasks_branch(src, span=6500)
+    # Spezifischer reason_code (P0 #90)
+    assert ("_set_job_failed(job_id, 'UPLOAD_PERSIST_FAILED'" in block
+            or "_set_job_failed(job_id, 'WORKER_RESTARTED'" in block), (
+        '_set_job_failed mit reason_code (UPLOAD_PERSIST_FAILED oder WORKER_RESTARTED) bei persist-fail'
+    )
+    # Persist-Error-Handling vorhanden (UploadPersistError-catch)
+    assert 'UploadPersistError' in block, 'UploadPersistError catch fehlt im cloud_tasks branch'
 
 
 def test_cloud_tasks_process_converts_files_to_supabase_format():

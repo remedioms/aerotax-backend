@@ -1,0 +1,160 @@
+{
+  "version": "v2",
+  "created_at": "2026-05-20",
+  "year": 2025,
+  "subject": "tibor_anonymized",
+  "documents": [
+    {
+      "doc_type": "lohnsteuerbescheinigung",
+      "filename": "Lohnsteuerbescheinigung 2025.pdf",
+      "size_bytes": 25042,
+      "sha256_16": "5cf87f135610217b",
+      "pages": 1,
+      "role": "primary"
+    },
+    {
+      "doc_type": "streckeneinsatz",
+      "filename": "2025 Streckeneinsatzabrechnungen.pdf",
+      "size_bytes": 316372,
+      "sha256_16": "e153c8c96a8a8754",
+      "pages": 12,
+      "role": "primary",
+      "expected_months": 12
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "NTF_1_1_1_1225191539_2025-12-25.pdf",
+      "size_bytes": 51141,
+      "sha256_16": "498fc6427f39ca69",
+      "pages": 4,
+      "role": "primary",
+      "plan_type": "NTF"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "NTF_2_1_1_2025-01-30.pdf",
+      "size_bytes": 51623,
+      "sha256_16": "16b2f40f66317d32",
+      "pages": 4,
+      "role": "primary",
+      "plan_type": "NTF"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "NTF_8_1_1_2025-07-30.pdf",
+      "size_bytes": 55744,
+      "sha256_16": "b20180ca58fb916d",
+      "pages": 5,
+      "role": "primary",
+      "plan_type": "NTF"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "NTF_9_1_1_0829200801_2025-08-29 2.pdf",
+      "size_bytes": 600811,
+      "sha256_16": "87d0939892574dd0",
+      "pages": 44,
+      "role": "primary",
+      "plan_type": "NTF"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "NTF_9_1_1_0829200801_2025-08-29.pdf",
+      "size_bytes": 53780,
+      "sha256_16": "57006c38e54577e7",
+      "pages": 4,
+      "role": "primary",
+      "plan_type": "NTF"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "PUB_10_1_0_0925122503_2025-09-25.pdf",
+      "size_bytes": 46114,
+      "sha256_16": "2caa8e2e1bc39774",
+      "pages": 3,
+      "role": "primary",
+      "plan_type": "PUB"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "PUB_11_1_0_2025-10-24.pdf",
+      "size_bytes": 46286,
+      "sha256_16": "3be7653c62b74fcb",
+      "pages": 3,
+      "role": "primary",
+      "plan_type": "PUB"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "PUB_12_1_0_1126112255_2025-11-26.pdf",
+      "size_bytes": 46470,
+      "sha256_16": "2e03d9b001e601a7",
+      "pages": 3,
+      "role": "primary",
+      "plan_type": "PUB"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "PUB_3_1_0_2025-02-25.pdf",
+      "size_bytes": 46162,
+      "sha256_16": "07fea4cee082ff34",
+      "pages": 3,
+      "role": "primary",
+      "plan_type": "PUB"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "PUB_4_1_0_0325113348_2025-03-25.pdf",
+      "size_bytes": 46222,
+      "sha256_16": "732c26470e5769c2",
+      "pages": 3,
+      "role": "primary",
+      "plan_type": "PUB"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "PUB_5_1_0_2025-04-25.pdf",
+      "size_bytes": 47442,
+      "sha256_16": "c297b376182b5f09",
+      "pages": 4,
+      "role": "primary",
+      "plan_type": "PUB"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "PUB_6_1_0_2025-05-27.pdf",
+      "size_bytes": 47884,
+      "sha256_16": "a285e1d17a4dd15f",
+      "pages": 4,
+      "role": "primary",
+      "plan_type": "PUB"
+    },
+    {
+      "doc_type": "dienstplan_cas",
+      "filename": "PUB_7_1_0_2025-06-26.pdf",
+      "size_bytes": 48227,
+      "sha256_16": "074ea7a15d1345e4",
+      "pages": 4,
+      "role": "primary",
+      "plan_type": "PUB"
+    },
+    {
+      "doc_type": "legacy_ignored_flight_hours_summary",
+      "filename": "2025 Flugstundenübersichten.pdf",
+      "size_bytes": 458684,
+      "sha256_16": "2f47f112c90fc983",
+      "pages": 18,
+      "role": "IGNORED_LEGACY",
+      "note": "Flugstundenuebersicht — KEINE Quelle in v11 Clean-Release."
+    },
+    {
+      "doc_type": "dienstplanauswertung",
+      "filename": "Dienstplanauswertung_99102_2025.pdf",
+      "size_bytes": 112728,
+      "sha256_16": "61076eb4855809cf",
+      "pages": 18,
+      "role": "reference_only",
+      "note": "Externe Auswertung — Referenz, nicht Primaerquelle."
+    }
+  ]
+}

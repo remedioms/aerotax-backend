@@ -1,0 +1,342 @@
+{
+  "meta": {
+    "source": "CAS PDF Re-Read mit Reader V2 Prompt",
+    "pdf": "2025 Flugstundenübersichten.pdf (PII-gestrippt)",
+    "call_count": 5,
+    "max_calls": 9,
+    "date": "2026-05-20"
+  },
+  "days": [
+    {
+      "datum": "2025-05-17",
+      "label": "USA Tour 20 Abreise",
+      "reader_v2_output": {
+        "datum": "2025-05-05",
+        "raw_marker": "FL",
+        "activity_type": "tour",
+        "routing": [],
+        "start_time": "",
+        "end_time": "",
+        "duty_duration_minutes": null,
+        "has_fl": true,
+        "starts_at_homebase": false,
+        "ends_at_homebase": false,
+        "overnight_after_day": true,
+        "layover_ort": "",
+        "tour_id_candidate": "",
+        "position_in_tour": "",
+        "tour_context": "tour_mid",
+        "continuation_from_prev_day": false,
+        "continuation_to_next_day": true,
+        "reader_confidence": 0.65,
+        "raw_evidence_excerpt": "5.05. FL STRECKENEINSATZTAG",
+        "needs_context_resolution": true,
+        "warnings": [
+          "MISSING_ROUTING_DATA",
+          "FL_WITHOUT_PLACE_CONTEXT"
+        ]
+      }
+    },
+    {
+      "datum": "2025-06-17",
+      "label": "Kroatien Tour 24 Anreise",
+      "reader_v2_output": {
+        "datum": "2024-06-12",
+        "raw_marker": "/-",
+        "activity_type": "frei",
+        "routing": [],
+        "start_time": "",
+        "end_time": "",
+        "duty_duration_minutes": null,
+        "has_fl": false,
+        "starts_at_homebase": false,
+        "ends_at_homebase": false,
+        "overnight_after_day": false,
+        "layover_ort": "",
+        "tour_id_candidate": "",
+        "position_in_tour": "",
+        "tour_context": "homebase_free",
+        "continuation_from_prev_day": false,
+        "continuation_to_next_day": false,
+        "reader_confidence": 0.95,
+        "raw_evidence_excerpt": ". /- FREIER TAG",
+        "needs_context_resolution": false,
+        "warnings": []
+      }
+    },
+    {
+      "datum": "2025-06-18",
+      "label": "Kroatien Tour 24 Abreise",
+      "reader_v2_output": {
+        "datum": "2024-06-17",
+        "raw_marker": "LH1406",
+        "activity_type": "tour",
+        "routing": [
+          "FRA",
+          "ZAG"
+        ],
+        "start_time": "20:13",
+        "end_time": "21:30",
+        "duty_duration_minutes": 77,
+        "has_fl": false,
+        "starts_at_homebase": true,
+        "ends_at_homebase": false,
+        "overnight_after_day": true,
+        "layover_ort": "ZAG",
+        "tour_id_candidate": "LH1406_17JUN",
+        "position_in_tour": "1/2",
+        "tour_context": "tour_start",
+        "continuation_from_prev_day": false,
+        "continuation_to_next_day": true,
+        "reader_confidence": 0.92,
+        "raw_evidence_excerpt": "20:13-21:30 ZAG 00 1,33 1,10 1,47 1,47 1,10 1,47",
+        "needs_context_resolution": false,
+        "warnings": []
+      }
+    },
+    {
+      "datum": "2025-07-23",
+      "label": "Schweden Tour 29 same-day",
+      "reader_v2_output": {
+        "datum": "2023-07-22",
+        "raw_marker": "LH0805",
+        "activity_type": "tour",
+        "routing": [
+          "FRA",
+          "ARN"
+        ],
+        "start_time": "17:00",
+        "end_time": "18:08",
+        "duty_duration_minutes": 68,
+        "has_fl": false,
+        "starts_at_homebase": true,
+        "ends_at_homebase": false,
+        "overnight_after_day": true,
+        "layover_ort": "ARN",
+        "tour_id_candidate": "LH0805_22JUL",
+        "position_in_tour": "1",
+        "tour_context": "tour_start",
+        "continuation_from_prev_day": false,
+        "continuation_to_next_day": true,
+        "reader_confidence": 0.92,
+        "raw_evidence_excerpt": "22.07. LH0805 A FRA 17:00-18:08 FRA 00 1,20 1,10 1,32 1,32 1,10 1,32",
+        "needs_context_resolution": false,
+        "warnings": [
+          "SAME_DEPARTURE_ARRIVAL"
+        ]
+      }
+    },
+    {
+      "datum": "2025-08-22",
+      "label": "Zypern Tour 34 Abreise",
+      "reader_v2_output": {
+        "datum": "2024-08-22",
+        "raw_marker": "FL STRECKENEINSATZTAG",
+        "activity_type": "tour",
+        "routing": [
+          "FRA"
+        ],
+        "start_time": "23:22",
+        "end_time": "",
+        "duty_duration_minutes": null,
+        "has_fl": true,
+        "starts_at_homebase": true,
+        "ends_at_homebase": false,
+        "overnight_after_day": true,
+        "layover_ort": "",
+        "tour_id_candidate": "",
+        "position_in_tour": "tour_start",
+        "tour_context": "tour_start",
+        "continuation_from_prev_day": false,
+        "continuation_to_next_day": true,
+        "reader_confidence": 0.65,
+        "raw_evidence_excerpt": "23:22-03:24 FRA 00 4,03 1,10 4,44 4,44 1,10 4,44\n22.08. FL STRECKENEINSATZTAG",
+        "needs_context_resolution": true,
+        "warnings": [
+          "LAYOVER_ORT_MISSING",
+          "END_TIME_SPANS_NEXT_DAY"
+        ]
+      }
+    },
+    {
+      "datum": "2025-11-18",
+      "label": "Norwegen Tour 48 Abreise",
+      "reader_v2_output": {
+        "datum": "2024-11-17",
+        "raw_marker": "LH0869 E",
+        "activity_type": "tour",
+        "routing": [
+          "FRA",
+          "SVG"
+        ],
+        "start_time": "20:10",
+        "end_time": "21:58",
+        "duty_duration_minutes": 108,
+        "has_fl": true,
+        "starts_at_homebase": true,
+        "ends_at_homebase": false,
+        "overnight_after_day": true,
+        "layover_ort": "SVG",
+        "tour_id_candidate": "LH0869_2024-11-17",
+        "position_in_tour": "1/3",
+        "tour_context": "tour_start",
+        "continuation_from_prev_day": false,
+        "continuation_to_next_day": true,
+        "reader_confidence": 0.92,
+        "raw_evidence_excerpt": "LH0869 E FRA 20:10-21:58 SVG 00 [FL-marker: 00 = foreign overnight]",
+        "needs_context_resolution": false,
+        "warnings": []
+      }
+    },
+    {
+      "datum": "2025-09-26",
+      "label": "Bulgarien Tour 39 Anreise (audit-Konflikt MUC vs Bulgarien)",
+      "reader_v2_output": {
+        "datum": "2024-09-21",
+        "raw_marker": "FREIER TAG",
+        "activity_type": "frei",
+        "routing": [],
+        "start_time": "",
+        "end_time": "",
+        "duty_duration_minutes": null,
+        "has_fl": false,
+        "starts_at_homebase": false,
+        "ends_at_homebase": false,
+        "overnight_after_day": false,
+        "layover_ort": "",
+        "tour_id_candidate": "",
+        "position_in_tour": "",
+        "tour_context": "homebase_free",
+        "continuation_from_prev_day": false,
+        "continuation_to_next_day": false,
+        "reader_confidence": 0.95,
+        "raw_evidence_excerpt": "FREIER TAG",
+        "needs_context_resolution": false,
+        "warnings": []
+      }
+    },
+    {
+      "datum": "2025-10-15",
+      "label": "Frankreich/MRS Tour 42 Anreise",
+      "reader_v2_output": {
+        "datum": "2023-10-10",
+        "raw_marker": "OF",
+        "activity_type": "frei",
+        "routing": [],
+        "start_time": "",
+        "end_time": "",
+        "duty_duration_minutes": null,
+        "has_fl": false,
+        "starts_at_homebase": false,
+        "ends_at_homebase": false,
+        "overnight_after_day": false,
+        "layover_ort": "",
+        "tour_id_candidate": "",
+        "position_in_tour": "",
+        "tour_context": "homebase_free",
+        "continuation_from_prev_day": false,
+        "continuation_to_next_day": false,
+        "reader_confidence": 0.95,
+        "raw_evidence_excerpt": "10.10. OF FREIER TAG",
+        "needs_context_resolution": false,
+        "warnings": []
+      }
+    },
+    {
+      "datum": "2025-10-16",
+      "label": "Spanien/AGP Tour 42 Abreise",
+      "reader_v2_output": {
+        "datum": "2024-10-16",
+        "raw_marker": "LH1087 LH1150 LH1151",
+        "activity_type": "tour",
+        "routing": [
+          "MRS",
+          "FRA",
+          "AGP"
+        ],
+        "start_time": "09:10",
+        "end_time": "14:40",
+        "duty_duration_minutes": 330,
+        "has_fl": false,
+        "starts_at_homebase": false,
+        "ends_at_homebase": false,
+        "overnight_after_day": true,
+        "layover_ort": "AGP",
+        "tour_id_candidate": "LH1087_1016",
+        "position_in_tour": "day_1",
+        "tour_context": "tour_start",
+        "continuation_from_prev_day": true,
+        "continuation_to_next_day": true,
+        "reader_confidence": 0.85,
+        "raw_evidence_excerpt": "16.10. LH1087 MRS 09:10-10:45 FRA 00 / 16.10. LH1150 FRA 11:57-14:40 AGP 00 / 16.10. LH1151 E",
+        "needs_context_resolution": true,
+        "warnings": [
+          "CONTINUATION_FROM_PREV_DAY_DETECTED: starts MRS not homebase FRA",
+          "LH1151_E_INCOMPLETE: flight record truncated, AGP layover inferred from LH1150 destination"
+        ]
+      }
+    },
+    {
+      "datum": "2025-10-25",
+      "label": "UK-London/LON Tour 44 Abreise",
+      "reader_v2_output": {
+        "datum": "2024-10-25",
+        "raw_marker": "LH0907 E + LH0918 A + LH091x",
+        "activity_type": "tour",
+        "routing": [
+          "LHR",
+          "FRA",
+          "LHR"
+        ],
+        "start_time": "12:39",
+        "end_time": "18:02",
+        "duty_duration_minutes": 323,
+        "has_fl": false,
+        "starts_at_homebase": false,
+        "ends_at_homebase": false,
+        "overnight_after_day": true,
+        "layover_ort": "LHR",
+        "tour_id_candidate": "",
+        "position_in_tour": "",
+        "tour_context": "tour_mid",
+        "continuation_from_prev_day": true,
+        "continuation_to_next_day": true,
+        "reader_confidence": 0.75,
+        "raw_evidence_excerpt": "25.10. LH0907 E LHR 12:39-14:19 FRA 00 / LH0918 A FRA 16:23-18:02 LHR 00 / LH091x (fragment)",
+        "needs_context_resolution": true,
+        "warnings": [
+          "INCOMPLETE_FRAGMENT_LH091x",
+          "OVERNIGHT_BEFORE_INFERRED_prev_day_missing",
+          "DUTY_SPANS_multiple_flights_LHR-FRA-LHR"
+        ]
+      }
+    },
+    {
+      "datum": "2025-11-17",
+      "label": "Norwegen/SVG Tour 48 Anreise (SB_M)",
+      "reader_v2_output": {
+        "datum": "2024-11-13",
+        "raw_marker": "FT (STANDBY)",
+        "activity_type": "standby",
+        "routing": [],
+        "start_time": "",
+        "end_time": "",
+        "duty_duration_minutes": null,
+        "has_fl": false,
+        "starts_at_homebase": true,
+        "ends_at_homebase": true,
+        "overnight_after_day": false,
+        "layover_ort": "",
+        "tour_id_candidate": "",
+        "position_in_tour": "",
+        "tour_context": "homebase_standby",
+        "continuation_from_prev_day": false,
+        "continuation_to_next_day": false,
+        "reader_confidence": 0.95,
+        "raw_evidence_excerpt": "FT (STANDBY)",
+        "needs_context_resolution": false,
+        "warnings": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,477 @@
+{
+  "conflict_count": 33,
+  "conflicts": [
+    {
+      "datum": "2025-01-04",
+      "cas_marker": "X",
+      "cas_at": "frei",
+      "cas_layover": "BLR",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-01-06",
+      "cas_marker": "755 LH755-1",
+      "cas_at": "same_day",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Issue",
+      "golden_klass": "Z76",
+      "decision": "X: review needed",
+      "reason": "cas_at=same_day"
+    },
+    {
+      "datum": "2025-01-20",
+      "cas_marker": "X HKG",
+      "cas_at": "frei",
+      "cas_layover": "HKG",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-02-10",
+      "cas_marker": "68617 PU",
+      "cas_at": "same_day",
+      "cas_layover": "",
+      "sources": [
+        "CAS",
+        "SE"
+      ],
+      "se_present": true,
+      "v2_klass": "ZeroDay",
+      "golden_klass": "Z72",
+      "decision": "X: review needed",
+      "reason": "cas_at=same_day"
+    },
+    {
+      "datum": "2025-02-14",
+      "cas_marker": "X HND",
+      "cas_at": "frei",
+      "cas_layover": "HND",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-03-30",
+      "cas_marker": "X BOM",
+      "cas_at": "frei",
+      "cas_layover": "BOM",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-04-01",
+      "cas_marker": "==",
+      "cas_at": "frei",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-04-10",
+      "cas_marker": "X",
+      "cas_at": "frei",
+      "cas_layover": "ICN",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-04-23",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_layover": "",
+      "sources": [
+        "CAS",
+        "SE"
+      ],
+      "se_present": true,
+      "v2_klass": "Standby",
+      "golden_klass": "Z73",
+      "decision": "B: SE wins → Tour rekonstruieren",
+      "reason": "CAS frei aber SE hat Spesen"
+    },
+    {
+      "datum": "2025-04-24",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_layover": "",
+      "sources": [
+        "CAS",
+        "SE"
+      ],
+      "se_present": true,
+      "v2_klass": "Standby",
+      "golden_klass": "Z76",
+      "decision": "B: SE wins → Tour rekonstruieren",
+      "reason": "CAS frei aber SE hat Spesen"
+    },
+    {
+      "datum": "2025-04-25",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_layover": "",
+      "sources": [
+        "CAS",
+        "SE"
+      ],
+      "se_present": true,
+      "v2_klass": "Standby",
+      "golden_klass": "Z76",
+      "decision": "B: SE wins → Tour rekonstruieren",
+      "reason": "CAS frei aber SE hat Spesen"
+    },
+    {
+      "datum": "2025-04-26",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_layover": "",
+      "sources": [
+        "CAS",
+        "SE"
+      ],
+      "se_present": true,
+      "v2_klass": "Standby",
+      "golden_klass": "Z76",
+      "decision": "B: SE wins → Tour rekonstruieren",
+      "reason": "CAS frei aber SE hat Spesen"
+    },
+    {
+      "datum": "2025-05-15",
+      "cas_marker": "X TLV",
+      "cas_at": "frei",
+      "cas_layover": "TLV",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-05-17",
+      "cas_marker": "OFF",
+      "cas_at": "frei",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-05-27",
+      "cas_marker": "X TLV",
+      "cas_at": "frei",
+      "cas_layover": "TLV",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-06-09",
+      "cas_marker": "X",
+      "cas_at": "frei",
+      "cas_layover": "SIN",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-06-17",
+      "cas_marker": "OFF",
+      "cas_at": "frei",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-06-18",
+      "cas_marker": "OFF",
+      "cas_at": "frei",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-07-07",
+      "cas_marker": "X SEA",
+      "cas_at": "frei",
+      "cas_layover": "SEA",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-07-23",
+      "cas_marker": "==",
+      "cas_at": "frei",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-07-29",
+      "cas_marker": "X RIX",
+      "cas_at": "frei",
+      "cas_layover": "RIX",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-08-01",
+      "cas_marker": "X",
+      "cas_at": "frei",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z73",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-08-22",
+      "cas_marker": "X",
+      "cas_at": "frei",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-09-20",
+      "cas_marker": "==",
+      "cas_at": "frei",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z72",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-10-06",
+      "cas_marker": "X",
+      "cas_at": "frei",
+      "cas_layover": "ICN",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-10-07",
+      "cas_marker": "X",
+      "cas_at": "frei",
+      "cas_layover": "ICN",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-10-20",
+      "cas_marker": "RES_SB",
+      "cas_at": "standby",
+      "cas_layover": "",
+      "sources": [
+        "CAS",
+        "SE"
+      ],
+      "se_present": true,
+      "v2_klass": "Standby",
+      "golden_klass": "Z73",
+      "decision": "B: SE wins → Tour rekonstruieren",
+      "reason": "CAS frei aber SE hat Spesen"
+    },
+    {
+      "datum": "2025-10-21",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_layover": "",
+      "sources": [
+        "CAS",
+        "SE"
+      ],
+      "se_present": true,
+      "v2_klass": "Standby",
+      "golden_klass": "Z76",
+      "decision": "B: SE wins → Tour rekonstruieren",
+      "reason": "CAS frei aber SE hat Spesen"
+    },
+    {
+      "datum": "2025-10-23",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_layover": "",
+      "sources": [
+        "CAS",
+        "SE"
+      ],
+      "se_present": true,
+      "v2_klass": "Standby",
+      "golden_klass": "Z73",
+      "decision": "B: SE wins → Tour rekonstruieren",
+      "reason": "CAS frei aber SE hat Spesen"
+    },
+    {
+      "datum": "2025-10-24",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_layover": "",
+      "sources": [
+        "CAS",
+        "SE"
+      ],
+      "se_present": true,
+      "v2_klass": "Standby",
+      "golden_klass": "Z76",
+      "decision": "B: SE wins → Tour rekonstruieren",
+      "reason": "CAS frei aber SE hat Spesen"
+    },
+    {
+      "datum": "2025-11-17",
+      "cas_marker": "SB_M",
+      "cas_at": "standby",
+      "cas_layover": "",
+      "sources": [
+        "CAS",
+        "SE"
+      ],
+      "se_present": true,
+      "v2_klass": "Standby",
+      "golden_klass": "Z76",
+      "decision": "B: SE wins → Tour rekonstruieren",
+      "reason": "CAS frei aber SE hat Spesen"
+    },
+    {
+      "datum": "2025-11-18",
+      "cas_marker": "==",
+      "cas_at": "frei",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    },
+    {
+      "datum": "2025-12-28",
+      "cas_marker": "X TLV",
+      "cas_at": "frei",
+      "cas_layover": "",
+      "sources": [
+        "CAS"
+      ],
+      "se_present": false,
+      "v2_klass": "Frei",
+      "golden_klass": "Z76",
+      "decision": "A: CAS+SE win → KEEP V2 (Frei/Standby)",
+      "reason": "CAS sagt frei/standby UND keine SE-Spesen — kein Tour-Evidence"
+    }
+  ]
+}

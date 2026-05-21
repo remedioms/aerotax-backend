@@ -1,0 +1,410 @@
+{
+  "conflicts": [
+    {
+      "datum": "2025-04-23",
+      "pipeline_klass": "Standby",
+      "golden_klass": "Z73",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "FRA",
+      "se_inland": true,
+      "golden_betrag": 14,
+      "golden_land": "Deutschland",
+      "golden_tour_pos": "1/4",
+      "decision": "B: SE wins (inland) → Tour rekonstruieren",
+      "rationale": "CAS standby aber SE hat Inlandsspesen ort=FRA",
+      "kpi_impact": "+1 Z72/Z73 day"
+    },
+    {
+      "datum": "2025-04-24",
+      "pipeline_klass": "Standby",
+      "golden_klass": "Z76",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "SEL",
+      "se_inland": false,
+      "golden_betrag": 48,
+      "golden_land": "Republik Korea",
+      "golden_tour_pos": "2/4",
+      "decision": "B: SE wins (foreign) → Tour rekonstruieren",
+      "rationale": "CAS standby aber SE hat Auslandsspesen ort=SEL",
+      "kpi_impact": "+1 Z76 day OR Tour-Anreise erzwingen"
+    },
+    {
+      "datum": "2025-04-25",
+      "pipeline_klass": "Standby",
+      "golden_klass": "Z76",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "SEL",
+      "se_inland": false,
+      "golden_betrag": 48,
+      "golden_land": "Republik Korea",
+      "golden_tour_pos": "3/4",
+      "decision": "B: SE wins (foreign) → Tour rekonstruieren",
+      "rationale": "CAS standby aber SE hat Auslandsspesen ort=SEL",
+      "kpi_impact": "+1 Z76 day OR Tour-Anreise erzwingen"
+    },
+    {
+      "datum": "2025-04-26",
+      "pipeline_klass": "Standby",
+      "golden_klass": "Z76",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "SEL",
+      "se_inland": false,
+      "golden_betrag": 32,
+      "golden_land": "Republik Korea",
+      "golden_tour_pos": "4/4",
+      "decision": "B: SE wins (foreign) → Tour rekonstruieren",
+      "rationale": "CAS standby aber SE hat Auslandsspesen ort=SEL",
+      "kpi_impact": "+1 Z76 day OR Tour-Anreise erzwingen"
+    },
+    {
+      "datum": "2025-05-17",
+      "pipeline_klass": "Frei",
+      "golden_klass": "Z76",
+      "cas_marker": "OFF",
+      "cas_at": "frei",
+      "cas_routing": [],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": false,
+      "se_ort": "",
+      "se_inland": null,
+      "golden_betrag": 40,
+      "golden_land": "Vereinigte Staaten von Amerika (USA)",
+      "golden_tour_pos": "4/4",
+      "decision": "A: CAS+SE win → documented_reference_disagreement",
+      "rationale": "CAS frei, KEIN SE-Stempel. Golden zeigt Tour aber keine Belege in CAS+SE.",
+      "kpi_impact": "KEIN KPI-Effekt — Pipeline bleibt CAS-conform"
+    },
+    {
+      "datum": "2025-06-17",
+      "pipeline_klass": "Frei",
+      "golden_klass": "Z76",
+      "cas_marker": "OFF",
+      "cas_at": "frei",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": false,
+      "se_ort": "",
+      "se_inland": null,
+      "golden_betrag": 31,
+      "golden_land": "Kroatien",
+      "golden_tour_pos": "1/2",
+      "decision": "A: CAS+SE win → documented_reference_disagreement",
+      "rationale": "CAS frei, KEIN SE-Stempel. Golden zeigt Tour aber keine Belege in CAS+SE.",
+      "kpi_impact": "KEIN KPI-Effekt — Pipeline bleibt CAS-conform"
+    },
+    {
+      "datum": "2025-07-02",
+      "pipeline_klass": "Issue",
+      "golden_klass": "Z76",
+      "cas_marker": "129023 PU / Tag 2+3",
+      "cas_at": "same_day",
+      "cas_routing": [
+        "OTP",
+        "FRA",
+        "LHR"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "LON",
+      "se_inland": false,
+      "golden_betrag": 44,
+      "golden_land": "Vereinigtes Königreich - London",
+      "golden_tour_pos": "3/3",
+      "decision": "X: cas_at={cas_at}",
+      "rationale": "Unklarer Pfad",
+      "kpi_impact": "?"
+    },
+    {
+      "datum": "2025-08-01",
+      "pipeline_klass": "Frei",
+      "golden_klass": "Z73",
+      "cas_marker": "X",
+      "cas_at": "frei",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": false,
+      "se_ort": "",
+      "se_inland": null,
+      "golden_betrag": 14,
+      "golden_land": "Deutschland",
+      "golden_tour_pos": "5/5",
+      "decision": "A: CAS+SE win → documented_reference_disagreement",
+      "rationale": "CAS frei, KEIN SE-Stempel. Golden zeigt Tour aber keine Belege in CAS+SE.",
+      "kpi_impact": "KEIN KPI-Effekt — Pipeline bleibt CAS-conform"
+    },
+    {
+      "datum": "2025-08-22",
+      "pipeline_klass": "Frei",
+      "golden_klass": "Z76",
+      "cas_marker": "X",
+      "cas_at": "frei",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": false,
+      "se_ort": "",
+      "se_inland": null,
+      "golden_betrag": 28,
+      "golden_land": "Zypern",
+      "golden_tour_pos": "3/3",
+      "decision": "A: CAS+SE win → documented_reference_disagreement",
+      "rationale": "CAS frei, KEIN SE-Stempel. Golden zeigt Tour aber keine Belege in CAS+SE.",
+      "kpi_impact": "KEIN KPI-Effekt — Pipeline bleibt CAS-conform"
+    },
+    {
+      "datum": "2025-09-20",
+      "pipeline_klass": "Frei",
+      "golden_klass": "Z72",
+      "cas_marker": "==",
+      "cas_at": "frei",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": false,
+      "se_ort": "",
+      "se_inland": null,
+      "golden_betrag": 14,
+      "golden_land": "Deutschland",
+      "golden_tour_pos": "1/1",
+      "decision": "A: CAS+SE win → documented_reference_disagreement",
+      "rationale": "CAS frei, KEIN SE-Stempel. Golden zeigt Tour aber keine Belege in CAS+SE.",
+      "kpi_impact": "KEIN KPI-Effekt — Pipeline bleibt CAS-conform"
+    },
+    {
+      "datum": "2025-09-26",
+      "pipeline_klass": "Frei",
+      "golden_klass": "Z76",
+      "cas_marker": "15688 PU (Day 2)",
+      "cas_at": "tour",
+      "cas_routing": [
+        "KRK",
+        "FRA",
+        "IST"
+      ],
+      "cas_layover": "IST",
+      "cas_overnight": true,
+      "se_present": true,
+      "se_ort": "MUC",
+      "se_inland": true,
+      "golden_betrag": 15,
+      "golden_land": "Bulgarien",
+      "golden_tour_pos": "1/3",
+      "decision": "X: Day-Suffix/Continuation-Bug",
+      "rationale": "CAS at=tour, layover=IST, aber Pipeline klassifiziert Frei → Day2/Day3 Continuation-Logik fehlt",
+      "kpi_impact": "+1 Z76 (Tour-Mid)"
+    },
+    {
+      "datum": "2025-09-27",
+      "pipeline_klass": "Frei",
+      "golden_klass": "Z74",
+      "cas_marker": "15688 PU (Day 3)",
+      "cas_at": "tour",
+      "cas_routing": [
+        "IST",
+        "FRA",
+        "AGP"
+      ],
+      "cas_layover": "AGP",
+      "cas_overnight": true,
+      "se_present": true,
+      "se_ort": "DUS",
+      "se_inland": true,
+      "golden_betrag": 28,
+      "golden_land": "Deutschland",
+      "golden_tour_pos": "2/3",
+      "decision": "X: Day-Suffix/Continuation-Bug",
+      "rationale": "CAS at=tour, layover=AGP, aber Pipeline klassifiziert Frei → Day2/Day3 Continuation-Logik fehlt",
+      "kpi_impact": "+1 Z76 (Tour-Mid)"
+    },
+    {
+      "datum": "2025-10-15",
+      "pipeline_klass": "Frei",
+      "golden_klass": "Z76",
+      "cas_marker": "",
+      "cas_at": "unknown",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "MRS",
+      "se_inland": false,
+      "golden_betrag": 36,
+      "golden_land": "Frankreich",
+      "golden_tour_pos": "1/2",
+      "decision": "C: needs_review",
+      "rationale": "CAS unklar, marker='', Golden behauptet Z76",
+      "kpi_impact": "?"
+    },
+    {
+      "datum": "2025-10-20",
+      "pipeline_klass": "Standby",
+      "golden_klass": "Z73",
+      "cas_marker": "RES_SB",
+      "cas_at": "standby",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "HAM",
+      "se_inland": true,
+      "golden_betrag": 14,
+      "golden_land": "Deutschland",
+      "golden_tour_pos": "1/2",
+      "decision": "B: SE wins (inland) → Tour rekonstruieren",
+      "rationale": "CAS standby aber SE hat Inlandsspesen ort=HAM",
+      "kpi_impact": "+1 Z72/Z73 day"
+    },
+    {
+      "datum": "2025-10-21",
+      "pipeline_klass": "Standby",
+      "golden_klass": "Z76",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "AGP",
+      "se_inland": false,
+      "golden_betrag": 23,
+      "golden_land": "Spanien",
+      "golden_tour_pos": "2/2",
+      "decision": "B: SE wins (foreign) → Tour rekonstruieren",
+      "rationale": "CAS standby aber SE hat Auslandsspesen ort=AGP",
+      "kpi_impact": "+1 Z76 day OR Tour-Anreise erzwingen"
+    },
+    {
+      "datum": "2025-10-23",
+      "pipeline_klass": "Standby",
+      "golden_klass": "Z73",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "LEJ",
+      "se_inland": true,
+      "golden_betrag": 14,
+      "golden_land": "Deutschland",
+      "golden_tour_pos": "1/3",
+      "decision": "B: SE wins (inland) → Tour rekonstruieren",
+      "rationale": "CAS standby aber SE hat Inlandsspesen ort=LEJ",
+      "kpi_impact": "+1 Z72/Z73 day"
+    },
+    {
+      "datum": "2025-10-24",
+      "pipeline_klass": "Standby",
+      "golden_klass": "Z76",
+      "cas_marker": "RES",
+      "cas_at": "standby",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "LON",
+      "se_inland": false,
+      "golden_betrag": 66,
+      "golden_land": "Vereinigtes Königreich - London",
+      "golden_tour_pos": "2/3",
+      "decision": "B: SE wins (foreign) → Tour rekonstruieren",
+      "rationale": "CAS standby aber SE hat Auslandsspesen ort=LON",
+      "kpi_impact": "+1 Z76 day OR Tour-Anreise erzwingen"
+    },
+    {
+      "datum": "2025-10-25",
+      "pipeline_klass": "Frei",
+      "golden_klass": "Z76",
+      "cas_marker": "",
+      "cas_at": "unknown",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "LON",
+      "se_inland": false,
+      "golden_betrag": 44,
+      "golden_land": "Vereinigtes Königreich - London",
+      "golden_tour_pos": "3/3",
+      "decision": "C: needs_review",
+      "rationale": "CAS unklar, marker='', Golden behauptet Z76",
+      "kpi_impact": "?"
+    },
+    {
+      "datum": "2025-11-17",
+      "pipeline_klass": "Frei",
+      "golden_klass": "Z76",
+      "cas_marker": "SB_M",
+      "cas_at": "standby",
+      "cas_routing": [
+        "FRA"
+      ],
+      "cas_layover": "",
+      "cas_overnight": false,
+      "se_present": true,
+      "se_ort": "SVG",
+      "se_inland": false,
+      "golden_betrag": 50,
+      "golden_land": "Norwegen",
+      "golden_tour_pos": "1/2",
+      "decision": "B: SE wins (foreign) → Tour rekonstruieren",
+      "rationale": "CAS standby aber SE hat Auslandsspesen ort=SVG",
+      "kpi_impact": "+1 Z76 day OR Tour-Anreise erzwingen"
+    }
+  ],
+  "meta": {
+    "date": "2026-05-20"
+  }
+}

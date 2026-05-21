@@ -1,0 +1,366 @@
+datum,cas_marker,activity_type,routing,layover_ort,overnight,starts_at_homebase,ends_at_homebase,duty_min,has_fl,aerotax_klass,aerotax_eur,aerotax_reason,aerotax_bmf_land,aerotax_counted_as_workday,golden_klass,golden_land,golden_eur,golden_dauer_h,golden_pos_in_tour,golden_is_anreise,golden_is_abreise,klass_match,eur_diff
+2025-01-01,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-02,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-03,31591 P1,tour,FRA→BLR,BLR,True,True,False,784,False,Z76,28.0,Auslands-Layover BLR (Z76 An/Ab),Indien – Bangalore,True,Z73,Deutschland,14,13.75,1/4,True,False,False,14.0
+2025-01-04,X,frei,,BLR,True,False,False,0,False,Frei,0,frei,,False,Z76,Indien - Bangalore,42,24.0,2/4,False,False,False,-42
+2025-01-05,755 LH755-1,tour,BLR→FRA,BLR,True,False,False,31,False,Z73,14.0,Auslandstour-Anreise mit Abend-Briefing 23:28 (>= 18:00) → Inland-Anreise 14€,,True,Z76,Indien - Bangalore,42,24.0,3/4,False,False,False,-28.0
+2025-01-06,755 LH755-1,same_day,BLR→FRA,,False,True,True,561,False,Issue,0,Heimkehr aus Vortag-Tour — separater Tour-Abschluss,,False,Z76,Indien - Bangalore,28,11.516666666666667,4/4,False,True,False,-28
+2025-01-07,ORTSTAG OF,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-08,==,unknown,,,False,False,False,0,False,ZeroDay,0,Activity-Type unknown ohne SE/Cluster-Spur — nicht als Arbeitstag gewertet,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-09,==,unknown,,,False,False,False,0,False,ZeroDay,0,Activity-Type unknown ohne SE/Cluster-Spur — nicht als Arbeitstag gewertet,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-10,EM,training,FRA,,False,True,True,210,False,Office,0,Schulung am Homebase,,True,NO_VMA,-,0,5.333333333333333,1/1,True,True,False,0
+2025-01-11,56381 PU,same_day,FRA→CPH→BER,,False,True,True,496,False,Z76,50.0,Same-Day Auslandstrip CPH (Z76 >8h),Dänemark,True,Z76,Dänemark,50,11.1,1/1,True,True,True,0.0
+2025-01-12,ORTSTAG FRS,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-13,ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-14,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-15,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-16,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-17,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-18,49444 P1 /ZH,tour,FRA→HKG,HKG,True,True,False,239,False,Z73,14.0,Auslandstour-Anreise mit FRA-Stempel + Abend-Briefing 20:00 → Inland 14€,,True,Z73,Deutschland,14,4.666666666666667,1/5,True,False,True,0.0
+2025-01-19,796 LH796-1,tour,FRA→HKG,HKG,True,False,False,546,False,Z76,48.0,Auslands-Layover HKG (Z76 An/Ab),China – Hongkong,True,Z76,China - Hong Kong,71,24.0,2/5,False,False,True,-23.0
+2025-01-20,X HKG,frei,,HKG,True,False,False,0,False,Frei,0,frei,,False,Z76,China - Hong Kong,71,24.0,3/5,False,False,False,-71
+2025-01-21,797 LH797-1,tour,HKG→FRA,HKG,True,False,False,497,False,Z76,48.0,Auslands-Layover HKG (Z76 An/Ab),China – Hongkong,True,Z76,China - Hong Kong,71,24.0,4/5,False,False,True,-23.0
+2025-01-22,797 LH797-1,same_day,HKG→FRA,,False,True,True,321,False,Z76,48.0,"Same-Day Auslandstrip HKG (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",China – Hongkong,True,Z76,China - Hong Kong,48,7.516666666666667,5/5,False,True,True,0.0
+2025-01-23,FRS ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-24,ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-25,ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-26,ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-27,ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-28,,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-29,,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-30,LMN_HT1,training,FRA,,False,True,True,240,False,Office,0,Schulung am Homebase,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-01-31,,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-01,SB_S,standby,FRA,,False,False,False,480,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-02,SB_S,standby,FRA,,False,False,False,480,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-03,,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-04,SB_S,standby,FRA,,False,False,False,480,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-05,SB_S,standby,FRA,,False,False,False,480,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-06,,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-07,,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-08,ORTSTAG OF,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-09,ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-10,68617 PU,same_day,FRA→DUS,,False,True,True,385,False,ZeroDay,0,"Same-Day < 8h (total=445min, duty_plus_commute) — kein VMA",,True,Z72,Deutschland,14,9.25,1/1,True,True,False,-14
+2025-02-11,FRS ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-12,60402 PE /JA,tour,FRA→HND,HND,True,True,False,704,False,Z76,33.0,"Auslandstour-An/Ab (Homebase-Stempel FRA, Ziel TYO) Z76",Japan – Tokio,True,Z73,Deutschland,14,12.416666666666666,1/4,True,False,False,19.0
+2025-02-13,716 LH716-1,tour,FRA→HND,HND,True,False,False,105,False,Z76,33.0,Auslands-Layover TYO (Z76 An/Ab),Japan – Tokio,True,Z76,Japan - Tokyo,50,24.0,2/4,False,False,True,-17.0
+2025-02-14,X HND,frei,,HND,True,False,False,0,False,Frei,0,frei,,False,Z76,Japan - Tokyo,50,24.0,3/4,False,False,False,-50
+2025-02-15,717 LH717-1,same_day,HND→FRA,,False,True,True,865,False,Z76,33.0,"Same-Day Auslandstrip TYO (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Japan – Tokio,True,Z76,Japan - Tokyo,33,20.25,4/4,False,True,True,0.0
+2025-02-16,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-17,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-18,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-19,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-20,==,unknown,,,False,False,False,0,False,ZeroDay,0,Activity-Type unknown ohne SE/Cluster-Spur — nicht als Arbeitstag gewertet,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-21,== FZ,unknown,,,False,False,False,0,False,ZeroDay,0,Activity-Type unknown ohne SE/Cluster-Spur — nicht als Arbeitstag gewertet,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-22,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-23,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-24,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-25,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-26,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-27,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-02-28,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-01,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-02,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-03,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-04,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-05,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-06,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-07,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-08,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-09,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-10,U1,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-11,--,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-12,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-13,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-14,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-15,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-16,82907 PU,tour,FRA→DUS→SVG,SVG,True,True,False,1114,False,Z76,50.0,Auslands-Layover SVG (Z76 An/Ab),Norwegen,True,Z76,Norwegen,50,11.083333333333334,1/1,True,True,True,0.0
+2025-03-17,83003 PU,same_day,FRA→MXP→GVA,,False,True,True,530,False,Z76,44.0,"Same-Day Auslandstrip GVA (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Schweiz – Genf,True,Z76,Schweiz - Genf,44,11.683333333333334,1/1,True,True,True,0.0
+2025-03-18,EH 4 SECCRM 4,training,FRA,,False,True,True,510,False,Z72,14.0,"Schulung Inland >8h (total 570min, duty_plus_commute) → Z72 14€",,True,Z72,Deutschland,14,10.333333333333334,1/1,True,True,True,0.0
+2025-03-19,EMCRM 4,training,FRA,,False,True,True,480,False,Z72,14.0,"Schulung Inland >8h (total 540min, duty_plus_commute) → Z72 14€",,True,Z72,Deutschland,14,9.833333333333334,1/1,True,True,True,0.0
+2025-03-20,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-21,ORTSTAG OF,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-22,83343 PU,same_day,FRA→TOS,,False,True,True,510,False,Z72,14.0,Same-Day Z72 — total=570min (duty_plus_commute) ≥ 480min,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-14.0
+2025-03-23,73724 P1,tour,FRA→IAD,IAD,True,True,False,774,False,Z76,42.0,Auslands-Layover BOS (Z76 An/Ab),Vereinigte Staaten von Amerika (USA) – Boston,True,Z76,Vereinigte Staaten von Amerika (USA) - Boston,42,15.583333333333334,1/3,True,False,True,0.0
+2025-03-24,419,tour,IAD,IAD,True,False,False,69,False,Z76,42.0,Auslands-Layover BOS (Z76 An/Ab),Vereinigte Staaten von Amerika (USA) – Boston,True,Z76,Vereinigte Staaten von Amerika (USA) - Boston,63,24.0,2/3,False,False,True,-21.0
+2025-03-25,X,same_day,IAD→FRA,,False,True,True,455,False,Z76,42.0,"Same-Day Auslandstrip BOS (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Vereinigte Staaten von Amerika (USA) – Boston,True,Z76,Vereinigte Staaten von Amerika (USA) - Boston,42,6.566666666666666,3/3,False,True,True,0.0
+2025-03-26,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-27,ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-03-28,EM /1,training,FRA,,False,True,True,210,False,Office,0,Schulung am Homebase,,True,NO_VMA,-,0,5.333333333333333,1/1,True,True,False,0
+2025-03-29,74016 P1,tour,FRA→BOM,BOM,True,True,False,814,False,Z76,28.0,"Auslandstour-An/Ab (Homebase-Stempel FRA, Ziel ?) Z76",Indien – Mumbai,True,Z73,Deutschland,14,14.25,1/4,True,False,False,14.0
+2025-03-30,X BOM,frei,,BOM,True,False,False,0,False,Frei,0,frei,,False,Z76,Indien - Mumbai,36,23.0,2/4,False,False,False,-36
+2025-03-31,757,tour,BOM→FRA,BOM,True,False,False,169,False,Z73,14.0,Auslandstour-Anreise mit Abend-Briefing 21:10 (>= 18:00) → Inland-Anreise 14€,,True,Z76,Indien - Mumbai,53,24.0,3/4,False,False,False,-39.0
+2025-04-01,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,Z76,Indien - Mumbai,36,9.566666666666666,4/4,False,True,False,-36
+2025-04-02,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-03,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-04,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-05,ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-06,ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-07,ORTSTAG FRS,office,FRA,,False,True,True,1439,False,Z72,14.0,"Office Inland >8h (total 1499min, duty_plus_commute) → Z72 14€",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-14.0
+2025-04-08,90064 P1/KO,tour,FRA→ICN,ICN,True,True,False,619,False,Z76,32.0,"Auslandstour-An/Ab (Homebase-Stempel FRA, Ziel SEL) Z76","Korea, Republik",True,Z73,Deutschland,14,11.0,1/4,True,False,False,18.0
+2025-04-09,LH712-1 cont.,tour,FRA→ICN,ICN,True,False,False,55,False,Z76,32.0,Auslands-Layover SEL (Z76 An/Ab),"Korea, Republik",True,Z76,Republik Korea,48,24.0,2/4,False,False,True,-16.0
+2025-04-10,X,frei,ICN,ICN,True,False,False,0,False,Frei,0,frei,,False,Z76,Republik Korea,48,24.0,3/4,False,False,False,-48
+2025-04-11,LH713,same_day,ICN→FRA,,False,True,True,785,False,Z76,32.0,"Same-Day Auslandstrip SEL (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)","Korea, Republik",True,Z76,Republik Korea,32,19.85,4/4,False,True,True,0.0
+2025-04-12,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-13,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-14,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-15,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-16,90481 P1,tour,FRA→IKA,IKA,True,True,False,689,False,Z76,22.0,Auslands-Layover THR (Z76 An/Ab),Iran,True,Z76,Iran,22,12.166666666666666,1/3,True,False,True,0.0
+2025-04-17,LH601,tour,IKA→FRA,IKA,True,False,False,109,False,Z76,22.0,Auslands-Layover THR (Z76 An/Ab),Iran,True,Z76,Iran,33,24.0,2/3,False,False,True,-11.0
+2025-04-18,LH601 cont.,same_day,IKA→FRA,,False,True,True,220,False,Z76,22.0,"Same-Day Auslandstrip THR (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Iran,True,Z76,Iran,22,6.65,3/3,False,True,True,0.0
+2025-04-19,Sa 19,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-20,OF ORTSTAG,office,,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-21,RB,unknown,FRA,,False,False,False,120,False,ZeroDay,0,Activity-Type unknown ohne SE/Cluster-Spur — nicht als Arbeitstag gewertet,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-22,RES_SB,standby,FRA,,False,False,False,960,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-23,RES,standby,FRA,,False,False,False,960,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,Z73,Deutschland,14,11.0,1/4,True,False,False,-14
+2025-04-24,RES,standby,FRA,,False,False,False,960,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,Z76,Republik Korea,48,24.0,2/4,False,False,False,-48
+2025-04-25,RES,standby,FRA,,False,False,False,960,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,Z76,Republik Korea,48,24.0,3/4,False,False,False,-48
+2025-04-26,RES,standby,FRA,,False,False,False,960,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,Z76,Republik Korea,32,20.016666666666666,4/4,False,True,False,-32
+2025-04-27,So 27,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-28,LMN_AS LMN_CR1,office,FRA,,False,True,True,600,False,Z72,14.0,"Office Inland >8h (total 660min, duty_plus_commute) → Z72 14€",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-14.0
+2025-04-29,Di 29,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-04-30,99761 PU,same_day,FRA→HAM→BHX,,False,True,True,310,False,ZeroDay,0,"Same-Day < 8h (total=370min, duty_plus_commute) — kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-01,111174 PU,tour,FRA→LEJ→KRK,KRK,True,True,False,1099,False,Z76,23.0,Auslands-Layover KRK (Z76 An/Ab),Polen – im Übrigen,True,Z76,Polen - Krakau,23,19.0,1/3,True,False,True,0.0
+2025-05-02,111174 PU,tour,KRK→FRA→PRG→HAM,HAM,True,False,False,475,False,Z76,21.0,Auslands-Layover PRG (Z76 An/Ab),Tschechische Republik,True,Z76,Tschechische Republik,32,24.0,2/3,False,False,True,-11.0
+2025-05-03,111174 PU,same_day,HAM→FRA→TUN,,False,True,True,495,False,Z76,27.0,"Same-Day Auslandstrip TUN (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Tunesien,True,Z76,Tunesien,27,16.416666666666668,3/3,False,True,True,0.0
+2025-05-04,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-05,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-06,102896 P1,tour,FRA→ORD,ORD,True,True,False,899,False,Z76,28.0,Auslands-Layover CHI (Z76 An/Ab),,True,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,44,15.666666666666666,1/3,True,False,True,-16.0
+2025-05-07,102896 P1,tour,ORD,ORD,True,False,False,179,False,Z76,28.0,Auslands-Layover CHI (Z76 An/Ab),,True,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,65,24.0,2/3,False,False,True,-37.0
+2025-05-08,102896 P1,same_day,ORD→FRA,,False,True,True,320,False,Z76,28.0,"Same-Day Auslandstrip CHI (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",,True,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,44,9.05,3/3,False,True,True,-16.0
+2025-05-09,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-10,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-11,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-12,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-13,112232 PU,same_day,FRA→KEF,,False,True,True,475,False,Z76,41.0,Same-Day Auslandstrip REK (Z76 >8h),Island,True,Z76,Island,41,11.516666666666667,1/1,True,True,True,0.0
+2025-05-14,112337 PU,tour,FRA→TLV,TLV,True,True,False,444,False,Z76,40.0,Auslands-Layover SEA (Z76 An/Ab),Vereinigte Staaten von Amerika (USA) – im Übrigen,True,Z76,Vereinigte Staaten von Amerika (USA),40,15.75,1/4,True,False,True,0.0
+2025-05-15,X TLV,frei,,TLV,True,False,False,0,False,Frei,0,frei,,False,Z76,Vereinigte Staaten von Amerika (USA),59,24.0,2/4,False,False,False,-59
+2025-05-16,112337 PU,same_day,TLV→FRA,,False,True,True,275,False,Z76,40.0,"Same-Day Auslandstrip SEA (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Vereinigte Staaten von Amerika (USA) – im Übrigen,True,Z76,Vereinigte Staaten von Amerika (USA),59,24.0,3/4,False,False,True,-19.0
+2025-05-17,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,Z76,Vereinigte Staaten von Amerika (USA),40,10.483333333333333,4/4,False,True,False,-40
+2025-05-18,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-19,LMN_AS / LMN_CR1,office,FRA,,False,True,True,600,False,Z72,14.0,"Office Inland >8h (total 660min, duty_plus_commute) → Z72 14€",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-14.0
+2025-05-20,103703 P1,tour,FRA→LAD,LAD,True,True,False,234,False,Z73,14.0,Auslandstour-Anreise mit Abend-Briefing 20:05 (>= 18:00) → Inland-Anreise 14€,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-14.0
+2025-05-21,103703 P1,tour,LAD,LAD,True,False,False,270,False,Z76,40.0,Auslands-Layover LAD (Z76 Volltag),Angola,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-40.0
+2025-05-22,103703 P1,tour,LAD→FRA,LAD,True,False,False,179,False,Z76,27.0,Auslands-Layover LAD (Z76 An/Ab),Angola,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-27.0
+2025-05-23,103703 P1,same_day,LAD,,False,True,True,330,False,Issue,0,Heimkehr aus Vortag-Tour — separater Tour-Abschluss,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-24,ORTSTAG OF,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-25,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-26,113301 PU,tour,FRA→TLV,TLV,True,True,False,444,False,Z76,28.0,Auslands-Layover CHI (Z76 An/Ab),,True,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,44,9.166666666666666,1/3,True,False,True,-16.0
+2025-05-27,X TLV,frei,,TLV,True,False,False,0,False,Frei,0,frei,,False,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,65,24.0,2/3,False,False,False,-65
+2025-05-28,113301 PU,same_day,TLV→FRA,,False,True,True,275,False,Z76,28.0,"Same-Day Auslandstrip CHI (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",,True,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,44,15.433333333333334,3/3,False,True,True,-16.0
+2025-05-29,OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-30,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-05-31,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-01,126533 PU,tour,FRA→CPH→GOT,GOT,True,True,False,1084,False,Z76,44.0,Auslands-Layover GOT (Z76 An/Ab),Schweden,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-44.0
+2025-06-02,126533 PU,tour,GOT→FRA→SOF,SOF,True,False,False,1189,False,Z76,15.0,Auslands-Layover SOF (Z76 An/Ab),Bulgarien,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-15.0
+2025-06-03,126533 PU,same_day,SOF→FRA→LHR,,False,True,True,465,False,Issue,0,Heimkehr aus Vortag-Tour — separater Tour-Abschluss,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-04,EM,training,FRA,,False,True,True,240,False,Office,0,Schulung am Homebase,,True,NO_VMA,-,0,5.833333333333333,1/1,True,True,False,0
+2025-06-05,OFF,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-06,FRS,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-07,120237 P1/ZH,tour,FRA→SIN,SIN,True,True,False,234,False,Z73,14.0,Auslandstour-Anreise mit FRA-Stempel + Abend-Briefing 20:05 → Inland 14€,,True,Z73,Deutschland,14,4.583333333333333,1/5,True,False,True,0.0
+2025-06-08,X,tour,FRA→SIN,SIN,True,False,False,505,False,Z76,48.0,Auslands-Layover SIN (Z76 An/Ab),Singapur,True,Z76,Singapur,71,24.0,2/5,False,False,True,-23.0
+2025-06-09,X,frei,SIN,SIN,True,False,False,0,False,Frei,0,frei,,False,Z76,Singapur,71,24.0,3/5,False,False,False,-71
+2025-06-10,781,tour,SIN→FRA,FRA,True,False,False,499,False,Z76,48.0,Auslands-Layover SIN (Z76 An/Ab),Singapur,True,Z76,Singapur,71,24.0,4/5,False,False,True,-23.0
+2025-06-11,X,same_day,SIN→FRA,,False,True,True,275,False,Z76,48.0,"Same-Day Auslandstrip SIN (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Singapur,True,Z76,Singapur,48,7.666666666666667,5/5,False,True,True,0.0
+2025-06-12,X,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-13,ORTSTAG OF,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-14,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-15,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-16,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-17,OFF,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,Z76,Kroatien,31,8.333333333333334,1/2,True,False,False,-31
+2025-06-18,OFF,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,Z76,Kroatien,31,18.2,2/2,False,True,False,-31
+2025-06-19,OFF,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-20,OFF,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-21,128322 PU,tour,FRA→CPH→ATH,ATH,True,True,False,759,False,Z76,28.0,Auslands-Layover STO (Z76 An/Ab),,True,Z76,Schweden,44,9.833333333333334,1/5,True,False,True,-16.0
+2025-06-22,128322 PU,tour,ATH→FRA→HAJ→WAW,WAW,True,False,False,774,False,Z76,28.0,Auslands-Layover STO (Z76 Volltag),,True,Z76,Schweden,66,24.0,2/5,False,False,True,-38.0
+2025-06-23,128322 PU,tour,WAW→FRA→SZG→LIN,LIN,True,False,False,699,False,Z76,42.0,Auslands-Layover MAD (Z76 Volltag),Spanien – Madrid,True,Z76,Spanien - Madrid,42,24.0,3/5,False,False,True,0.0
+2025-06-24,128322 PU,tour,LIN→FRA→HAM→BER,BER,True,False,False,794,False,Z76,28.0,Auslands-Layover MAD (Z76 An/Ab),Spanien – Madrid,True,Z76,Spanien - Madrid,42,24.0,4/5,False,False,True,-14.0
+2025-06-25,128322 PU,same_day,BER→FRA→MUC,,False,True,True,345,False,Z76,35.0,"Same-Day Auslandstrip EDI (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Großbritannien und Nordirland – im Übrigen,True,Z76,Vereinigtes Königreich,35,22.283333333333335,5/5,False,True,True,0.0
+2025-06-26,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-27,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-28,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-29,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-06-30,129023 PU,same_day,FRA→BER→NAP,,False,True,True,325,False,Z76,28.0,Same-Day Auslandstrip NAP (Z76 >8h),Italien – im Übrigen,True,Z76,Italien,28,19.0,1/3,True,False,True,0.0
+2025-07-01,129023 PU / Tag 1,tour,FRA→STR→NAP→OTP,OTP,True,True,False,1099,False,Z76,21.0,Auslands-Layover BUH (Z76 An/Ab),Rumänien – Bukarest,True,Z76,Rumänien - Bukarest,32,24.0,2/3,False,False,True,-11.0
+2025-07-02,129023 PU / Tag 2+3,same_day,OTP→FRA→LHR,,False,True,True,1159,False,Z76,44.0,"Same-Day Auslandstrip LON (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Großbritannien und Nordirland – London,True,Z76,Vereinigtes Königreich - London,44,14.15,3/3,False,True,True,0.0
+2025-07-03,129023 PU / Tag 3,same_day,OTP→FRA→LHR,,False,True,True,485,False,Z72,14.0,Same-Day Z72 — total=545min (duty_plus_commute) ≥ 480min,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-14.0
+2025-07-04,frei,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-05,FRS,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-06,131859 P1 / Tag 490,tour,FRA→SEA,SEA,True,True,False,904,False,Z76,40.0,Auslands-Layover SEA (Z76 An/Ab),Vereinigte Staaten von Amerika (USA) – im Übrigen,True,Z76,Vereinigte Staaten von Amerika (USA),40,15.75,1/4,True,False,True,0.0
+2025-07-07,X SEA,frei,SEA,SEA,True,False,False,0,False,Frei,0,frei,,False,Z76,Vereinigte Staaten von Amerika (USA),59,24.0,2/4,False,False,False,-59
+2025-07-08,491 LH491-1,tour,SEA→FRA,SEA,True,False,False,159,False,Z73,14.0,Auslandstour-Anreise mit Abend-Briefing 21:20 (>= 18:00) → Inland-Anreise 14€,,True,Z76,Vereinigte Staaten von Amerika (USA),59,24.0,3/4,False,False,False,-45.0
+2025-07-09,491 LH491-1 (Fortsetzung),same_day,SEA→FRA,,False,True,True,415,False,Z76,40.0,"Same-Day Auslandstrip SEA (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Vereinigte Staaten von Amerika (USA) – im Übrigen,True,Z76,Vereinigte Staaten von Amerika (USA),40,10.116666666666667,4/4,False,True,True,0.0
+2025-07-10,frei,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-11,ORTSTAG OF,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-12,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-13,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-14,frei,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-15,frei,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-16,frei,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-17,frei,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-18,frei,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-19,frei,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-20,143620 PU / Tag 1,tour,FRA→MAN→MAD,MAD,True,True,False,1064,False,Z76,50.0,Auslands-Layover CPH (Z76 An/Ab),Dänemark,True,Z76,Dänemark,50,13.666666666666666,1/3,True,False,True,0.0
+2025-07-21,143620 PU / Tag 2,tour,MAD→FRA,MAD,True,False,False,1044,False,Z76,23.0,Auslands-Layover BCN (Z76 An/Ab),Spanien – Barcelona,True,Z76,Spanien - Barcelona,34,24.0,2/3,False,False,True,-11.0
+2025-07-22,143620 PU / Tag 3,same_day,MAD→FRA→BCN,,False,True,True,600,False,Z76,23.0,"Same-Day Auslandstrip BCN (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Spanien – Barcelona,True,Z76,Spanien - Barcelona,23,21.3,3/3,False,True,True,0.0
+2025-07-23,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,Z76,Schweden,44,8.1,1/1,True,True,False,-44
+2025-07-24,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-25,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-26,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-27,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-07-28,144349 PU / Tag 1,tour,FRA→LHR→RIX,RIX,True,True,False,684,False,Z76,28.0,"Auslandstour-An/Ab (Homebase-Stempel FRA, Ziel ?) Z76",Lettland,True,Z76,Vereinigtes Königreich - London,44,12.083333333333334,1/5,True,False,True,-16.0
+2025-07-29,X RIX,frei,RIX,RIX,True,False,False,0,False,Frei,0,frei,,False,Z76,Lettland,35,24.0,2/5,False,False,False,-35
+2025-07-30,144349 PU / Tag 3,tour,RIX→FRA→MUC→KRK,KRK,True,False,False,1254,False,Z76,23.0,Auslands-Layover KRK (Z76 An/Ab),Polen – im Übrigen,True,Z76,Polen - Krakau,34,24.0,3/5,False,False,True,-11.0
+2025-07-31,144349 PU / Tag 4,same_day,KRK→FRA→HAM,,False,True,True,475,False,Z76,23.0,"Same-Day Auslandstrip KRK (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Polen – im Übrigen,True,Z76,Polen - Krakau,34,24.0,4/5,False,False,True,-11.0
+2025-08-01,X,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,Z73,Deutschland,14,14.1,5/5,False,True,False,-14
+2025-08-02,ORTSTAG OF,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-03,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-04,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-05,158212 PU,same_day,FRA→KEF,,False,True,True,457,False,Z76,41.0,Same-Day Auslandstrip REK (Z76 >8h),Island,True,Z76,Island,41,11.45,1/1,True,True,True,0.0
+2025-08-06,TK,training,FRA,,False,True,True,510,False,Z72,14.0,"Schulung Inland >8h (total 570min, duty_plus_commute) → Z72 14€",,True,Z72,Deutschland,14,10.333333333333334,1/1,True,True,True,0.0
+2025-08-07,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-08,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-09,SB_F,standby,FRA,,False,False,False,570,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-10,SB_M,standby,FRA,,False,False,False,450,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-11,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-12,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-13,SB_S,standby,FRA,,False,False,False,480,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-14,SB_S,standby,FRA,,False,False,False,480,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-15,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-16,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-17,SB_F,standby,FRA,,False,False,False,570,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-18,159313 PU,same_day,FRA→CAI,,False,True,True,540,False,Z76,33.0,Same-Day Auslandstrip CAI (Z76 >8h),Ägypten,True,Z76,Ägypten,33,12.833333333333334,1/1,True,True,True,0.0
+2025-08-19,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-20,2713 PU,tour,FRA→TLV→LCA,LCA,True,True,False,444,False,Z76,44.0,Auslands-Layover TLV (Z76 An/Ab),Israel,True,Z76,Israel,44,8.083333333333334,1/3,True,False,True,0.0
+2025-08-21,LH691-2,same_day,LCA→FRA,,False,True,True,204,False,Z76,28.0,"Same-Day Auslandstrip LCA (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Zypern,True,Z76,Zypern,42,24.0,2/3,False,False,True,-14.0
+2025-08-22,X,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,Z76,Zypern,28,6.566666666666666,3/3,False,True,False,-28
+2025-08-23,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-24,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-25,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-26,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-27,39 PU,tour,FRA→DUB→ARN,ARN,True,True,False,1099,False,Z76,28.0,Auslands-Layover STO (Z76 An/Ab),,True,Z76,Schweden,44,19.0,1/2,True,False,True,-16.0
+2025-08-28,39 PU (Day 2),same_day,ARN→FRA→OSL,,False,True,True,463,False,Z76,50.0,"Same-Day Auslandstrip OSL (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Norwegen,True,Z76,Norwegen,50,16.2,2/2,False,True,True,0.0
+2025-08-29,232 PU,same_day,FRA→CAI,,False,True,True,553,False,Z76,33.0,Same-Day Auslandstrip CAI (Z76 >8h),Ägypten,True,Z76,Ägypten,33,13.066666666666666,1/1,True,True,True,0.0
+2025-08-30,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-08-31,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-01,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-02,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-03,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-04,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-05,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-06,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-07,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-08,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-09,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-10,U,urlaub,FRA,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-11,14542 PU,tour,FRA→SKP→BER,BER,True,True,False,814,False,Z73,14.0,Inland-Layover BER (Z73 An/Ab im Mixed),,True,Z76,Nordmazedonien,18,14.25,1/4,True,False,False,-4.0
+2025-09-12,14542 PU (Day 2),tour,BER→FRA→MAD,MAD,True,False,False,305,False,Z76,42.0,Auslands-Layover MAD (Z76 Volltag),Spanien – Madrid,True,Z76,Spanien - Madrid,42,24.0,2/4,False,False,True,0.0
+2025-09-13,14542 PU (Day 3),tour,MAD→FRA→LIS,LIS,True,False,False,470,False,Z76,28.0,Auslands-Layover MAD (Z76 An/Ab),Spanien – Madrid,True,Z76,Portugal,32,24.0,3/4,False,False,True,-4.0
+2025-09-14,14542 PU (Day 4),same_day,LIS→FRA→LHR,,False,True,True,505,False,Z76,44.0,"Same-Day Auslandstrip LON (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Großbritannien und Nordirland – London,True,Z76,Vereinigtes Königreich - London,44,17.25,4/4,False,True,True,0.0
+2025-09-15,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-16,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-17,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-18,OFF ==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-19,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-20,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,Z72,Deutschland,14,9.0,1/1,True,True,False,-14
+2025-09-21,15370 PU,same_day,FRA→DUS,,False,True,True,290,False,ZeroDay,0,"Same-Day < 8h (total=350min, duty_plus_commute) — kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-22,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-23,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-24,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-25,15688 PU,tour,FRA→BER→KRK,KRK,True,True,False,1059,False,Z76,23.0,Auslands-Layover KRK (Z76 An/Ab),Polen – im Übrigen,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-23.0
+2025-09-26,15688 PU (Day 2),tour,KRK→FRA→IST,IST,True,False,False,355,False,Z74,28.0,Inland-Mittel-Tag MUC (Z74 24h),,True,Z76,Bulgarien,15,18.0,1/3,True,False,False,13.0
+2025-09-27,15688 PU (Day 3),tour,IST→FRA→AGP,AGP,True,False,False,435,False,Z73,14.0,Inland-Layover DUS (Z73 An/Ab),,True,Z74,Deutschland,28,24.0,2/3,False,False,False,-14.0
+2025-09-28,15688 PU (Day 4),same_day,AGP→FRA→CPH,,False,True,True,475,False,Z76,44.0,"Same-Day Auslandstrip GOT (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Schweden,True,Z76,Schweden,44,12.816666666666666,3/3,False,True,True,0.0
+2025-09-29,ORTSTAG OF,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-09-30,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-01,ORTSTAG OF,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-02,29348 PU,tour,FRA→SOF→TLL,TLL,True,True,False,644,False,Z76,15.0,Auslands-Layover SOF (Z76 An/Ab),Bulgarien,True,Z76,Bulgarien,15,11.416666666666666,1/2,True,False,True,0.0
+2025-10-03,29348 PU,same_day,TLL→FRA→VCE,,False,True,True,450,False,Z76,28.0,"Same-Day Auslandstrip VCE (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Italien – im Übrigen,True,Z76,Italien,28,22.066666666666666,2/2,False,True,True,0.0
+2025-10-04,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-05,18776 P1/KO,tour,FRA→ICN,ICN,True,True,False,619,False,Z76,28.0,"Auslandstour-An/Ab (Homebase-Stempel FRA, Ziel ?) Z76","Korea, Republik",True,Z73,Deutschland,14,11.0,1/4,True,False,False,14.0
+2025-10-06,X,frei,ICN,ICN,True,False,False,0,False,Frei,0,frei,,False,Z76,Republik Korea,48,24.0,2/4,False,False,False,-48
+2025-10-07,X,frei,ICN,ICN,True,False,False,0,False,Frei,0,frei,,False,Z76,Republik Korea,48,24.0,3/4,False,False,False,-48
+2025-10-08,18776 P1/KO,same_day,ICN→FRA,,False,True,True,785,False,Z76,32.0,"Same-Day Auslandstrip SEL (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)","Korea, Republik",True,Z76,Republik Korea,32,19.633333333333333,4/4,False,True,True,0.0
+2025-10-09,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-10,== -_A,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-11,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-12,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-13,FRS,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-14,,unknown,FRA,,False,False,False,0,False,ZeroDay,0,Activity-Type unknown ohne SE/Cluster-Spur — nicht als Arbeitstag gewertet,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-15,,unknown,FRA,,False,False,False,0,False,Z76,36.0,Aktive Auslands-SE MRS (DP=unknown) Z76,Frankreich – im Übrigen,True,Z76,Frankreich,36,16.666666666666668,1/2,True,False,True,0.0
+2025-10-16,,unknown,FRA,,False,False,False,0,False,Z76,23.0,Aktive Auslands-SE AGP (DP=unknown) Z76,Spanien – im Übrigen,True,Z76,Spanien,23,22.066666666666666,2/2,False,True,True,0.0
+2025-10-17,,unknown,FRA,,False,False,False,0,False,ZeroDay,0,Activity-Type unknown ohne SE/Cluster-Spur — nicht als Arbeitstag gewertet,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-18,,unknown,FRA,,False,False,False,0,False,ZeroDay,0,Activity-Type unknown ohne SE/Cluster-Spur — nicht als Arbeitstag gewertet,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-19,RB,standby,FRA,,False,False,False,120,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-20,RES_SB,standby,FRA,,False,False,False,960,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,Z73,Deutschland,14,7.083333333333333,1/2,True,False,False,-14
+2025-10-21,RES,standby,FRA,,False,False,False,960,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,Z76,Spanien,23,21.95,2/2,False,True,False,-23
+2025-10-22,RES,standby,FRA,,False,False,False,960,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-23,RES,standby,FRA,,False,False,False,960,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,Z73,Deutschland,14,3.8333333333333335,1/3,True,False,False,-14
+2025-10-24,RES,standby,FRA,,False,False,False,960,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,Z76,Vereinigtes Königreich - London,66,24.0,2/3,False,False,False,-66
+2025-10-25,,unknown,FRA,,False,False,False,0,False,Z76,44.0,Aktive Auslands-SE LON (DP=unknown) Z76,Großbritannien und Nordirland – London,True,Z76,Vereinigtes Königreich - London,44,23.466666666666665,3/3,False,True,True,0.0
+2025-10-26,32935 PU,tour,FRA→TLV,TLV,True,True,False,449,False,Z76,44.0,Auslands-Layover TLV (Z76 An/Ab),Israel,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-44.0
+2025-10-27,X,frei,TLV,TLV,True,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-28,32935 PU,same_day,TLV→FRA,,False,True,True,280,False,Issue,0,Heimkehr aus Vortag-Tour — separater Tour-Abschluss,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-29,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-30,==,frei,FRA,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-10-31,33491 PU,same_day,FRA→ATH,,False,True,True,425,False,Z76,44.0,Same-Day Auslandstrip LON (Z76 >8h),Großbritannien und Nordirland – London,True,Z76,Vereinigtes Königreich - London,44,12.166666666666666,1/1,True,True,True,0.0
+2025-11-01,49928 PU,tour,FRA→ARN→LEJ,LEJ,True,True,False,579,False,Z76,28.0,Auslands-Layover STO (Z76 An/Ab),,True,Z76,Schweden,44,10.333333333333334,1/3,True,False,True,-16.0
+2025-11-02,49928 PU,tour,LEJ→FRA→FCO→GOT,GOT,True,False,False,659,False,Z76,44.0,Auslands-Layover GOT (Z76 An/Ab),Schweden,True,Z76,Schweden,66,24.0,2/3,False,False,True,-22.0
+2025-11-03,49928 PU,same_day,GOT→FRA,,False,True,True,100,False,Z76,44.0,"Same-Day Auslandstrip GOT (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Schweden,True,Z76,Schweden,44,20.916666666666668,3/3,False,True,True,0.0
+2025-11-04,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-05,ORTSTAG OF-_A,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-06,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-07,50632 PU,tour,FRA→CPH→ATH,ATH,True,True,False,1049,False,Z76,27.0,Auslands-Layover ATH (Z76 An/Ab),Griechenland – Athen,True,Z76,Griechenland - Athen,27,18.166666666666668,1/3,True,False,True,0.0
+2025-11-08,50632 PU,tour,ATH→FRA→VNO,VNO,True,False,False,1169,False,Z76,27.0,Auslands-Layover ATH (Z76 An/Ab),Griechenland – Athen,True,Z76,Litauen,26,24.0,2/3,False,False,True,1.0
+2025-11-09,50632 PU,same_day,VNO→FRA→VCE,,False,True,True,430,False,Z76,17.0,"Same-Day Auslandstrip VNO (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Litauen,True,Z76,Litauen,17,17.25,3/3,False,True,True,0.0
+2025-11-10,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-11,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-12,SB_F,standby,FRA,,False,False,False,570,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-13,SB_F,standby,FRA,,False,False,False,570,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-14,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-15,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-16,SB_M,standby,FRA,,False,False,False,450,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-17,SB_M,standby,FRA,,False,False,False,450,False,Standby,0,"Standby zuhause — AT, kein FT, kein VMA",,True,Z76,Norwegen,50,4.916666666666667,1/2,True,False,False,-50
+2025-11-18,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,Z76,Norwegen,50,16.05,2/2,False,True,False,-50
+2025-11-19,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-20,38652 P1,tour,FRA→MIA,MIA,True,True,False,934,False,Z76,44.0,Auslands-Layover MIA (Z76 An/Ab),Vereinigte Staaten von Amerika (USA) – Miami,True,Z76,Vereinigte Staaten von Amerika (USA) - Miami,44,16.25,1/3,True,False,True,0.0
+2025-11-21,38652 P1,tour,MIA→FRA,MIA,True,False,False,139,False,Z76,44.0,Auslands-Layover MIA (Z76 An/Ab),Vereinigte Staaten von Amerika (USA) – Miami,True,Z76,Vereinigte Staaten von Amerika (USA) - Miami,65,24.0,2/3,False,False,True,-21.0
+2025-11-22,38652 P1,same_day,MIA→FRA,,False,True,True,545,False,Z76,44.0,"Same-Day Auslandstrip MIA (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Vereinigte Staaten von Amerika (USA) – Miami,True,Z76,Vereinigte Staaten von Amerika (USA) - Miami,44,9.316666666666666,3/3,False,True,True,0.0
+2025-11-23,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-24,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-25,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-26,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-27,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-28,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-29,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-11-30,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-01,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-02,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-03,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-04,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-05,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-06,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-07,U,urlaub,,,False,False,False,0,False,Frei,0,urlaub,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-08,EM,training,FRA,,False,True,True,210,False,Office,0,Schulung am Homebase,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-09,68354 PU,tour,FRA→BUD→LIN,LIN,True,True,False,1059,False,Z76,28.0,Auslands-Layover MIL (Z76 An/Ab),Italien – Mailand,True,Z76,Italien - Mailand,28,18.333333333333332,1/3,True,False,True,0.0
+2025-12-10,68354 PU Tag 2,tour,LIN→FRA→BER→PRG,PRG,True,False,False,1129,False,Z76,21.0,Auslands-Layover PRG (Z76 An/Ab),Tschechische Republik,True,Z76,Tschechische Republik,32,24.0,2/3,False,False,True,-11.0
+2025-12-11,68354 PU Tag 3,same_day,PRG→FRA→MLA,,False,True,True,565,False,Z76,31.0,"Same-Day Auslandstrip MLA (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",Malta,True,Z76,Malta,31,17.966666666666665,3/3,False,True,True,0.0
+2025-12-12,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-13,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-14,57783 P1,tour,FRA→JFK,JFK,True,True,False,889,False,Z76,39.0,Auslands-Layover SNN (Z76 An/Ab),Irland,True,Z76,Irland,39,13.4,1/1,True,True,True,0.0
+2025-12-15,57783 P1 Tag 2,tour,JFK→FRA,JFK,True,False,False,184,False,Z76,44.0,Auslands-Layover JFK (Z76 An/Ab),Vereinigte Staaten von Amerika (USA) – New York City,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,-44.0
+2025-12-16,X,frei,FRA,,False,False,False,455,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-17,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-18,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-19,OF ORTSTAG,office,FRA,,False,True,True,0,False,Office,0,Office am Homebase — AT + FT,,True,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-20,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-21,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-22,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-23,== OFF,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-24,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-25,70183 PU,tour,FRA→BRE→MUC→BIO,BIO,True,True,False,954,False,Z76,28.0,Auslands-Layover ROM (Z76 An/Ab),,True,Z76,Italien - Rom,32,15.75,1/2,True,False,True,-4.0
+2025-12-26,70183 PU Tag 2,same_day,BIO→FRA→EDI,,False,True,True,535,False,Z76,28.0,"Same-Day Auslandstrip ROM (Z76 >8h, prev_overnight=true Sonnet-Lesefehler)",,True,Z76,Norwegen,50,16.916666666666668,2/2,False,True,True,-22.0
+2025-12-27,70531 PU,tour,FRA→TLV,TLV,True,True,False,449,False,Z76,44.0,Auslands-Layover TLV (Z76 An/Ab),Israel,True,Z76,Israel,44,8.166666666666666,1/3,True,False,True,0.0
+2025-12-28,X TLV,frei,,,False,False,False,0,False,Frei,0,frei,,False,Z76,Israel,66,24.0,2/3,False,False,False,-66
+2025-12-29,70531 PU Tag 3,same_day,TLV→FRA,,False,True,True,280,False,Z76,44.0,Same-Day Auslandstrip TLV (Z76 >8h),Israel,True,Z76,Israel,44,10.366666666666667,3/3,False,True,True,0.0
+2025-12-30,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0
+2025-12-31,==,frei,,,False,False,False,0,False,Frei,0,frei,,False,FREI/NICHT-IN-GOLDEN,,0,,/,,,False,0

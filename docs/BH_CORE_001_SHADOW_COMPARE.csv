@@ -1,0 +1,366 @@
+datum,pflicht,marker,reader_activity,routing,overnight,layover,old_klass,old_eur,new_role,new_location,new_in_tour,new_tour_dest,new_is_standby_hotel,new_is_layover_free,golden_klass,golden_land,golden_eur,shadow_recommendation,risk
+2025-01-01,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-02,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-03,✓,31591 P1,tour,FRA→BLR,True,BLR,Z76,28.0,tour_start,foreign_layover,True,BLR,False,False,Z73,Deutschland,14,Phase 3 classify (alt=Z76 → golden=Z73),med
+2025-01-04,✓,X,frei,,True,BLR,Frei,0,tour_mid,foreign_layover,True,BLR,False,True,Z76,Indien - Bangalore,42,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-01-05,✓,755 LH755-1,tour,BLR→FRA,True,BLR,Z73,14.0,tour_mid,foreign_layover,True,BLR,False,False,Z76,Indien - Bangalore,42,Phase 3 classify (alt=Z73 → golden=Z76),med
+2025-01-06,✓,755 LH755-1,same_day,BLR→FRA,False,,Issue,0,tour_end,in_flight,True,BLR,False,False,Z76,Indien - Bangalore,28,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-01-07,,ORTSTAG OF,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-08,,==,unknown,,False,,ZeroDay,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-09,,==,unknown,,False,,ZeroDay,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-10,,EM,training,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NO_VMA,-,0,Phase 3 classify (alt=Office → golden=NO_VMA),med
+2025-01-11,,56381 PU,same_day,FRA→CPH→BER,False,,Z76,50.0,same_day,in_flight,True,CPH,False,False,Z76,Dänemark,50,keep (correct),none
+2025-01-12,,ORTSTAG FRS,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-13,,ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-14,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-15,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-16,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-17,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-18,,49444 P1 /ZH,tour,FRA→HKG,True,HKG,Z73,14.0,tour_start,foreign_layover,True,HKG,False,False,Z73,Deutschland,14,keep (correct),none
+2025-01-19,,796 LH796-1,tour,FRA→HKG,True,HKG,Z76,48.0,tour_mid,foreign_layover,True,HKG,False,False,Z76,China - Hong Kong,71,keep (correct),none
+2025-01-20,✓,X HKG,frei,,True,HKG,Frei,0,tour_mid,foreign_layover,True,HKG,False,True,Z76,China - Hong Kong,71,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-01-21,,797 LH797-1,tour,HKG→FRA,True,HKG,Z76,48.0,tour_mid,foreign_layover,True,HKG,False,False,Z76,China - Hong Kong,71,keep (correct),none
+2025-01-22,,797 LH797-1,same_day,HKG→FRA,False,,Z76,48.0,tour_end,in_flight,True,HKG,False,False,Z76,China - Hong Kong,48,keep (correct),none
+2025-01-23,,FRS ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-24,,ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-25,,ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-26,,ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-27,,ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-28,,,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-29,,,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-30,,LMN_HT1,training,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-01-31,,,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-01,,SB_S,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-02,,SB_S,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-03,,,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-04,,SB_S,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-05,,SB_S,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-06,,,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-07,,,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-08,,ORTSTAG OF,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-09,,ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-10,,68617 PU,same_day,FRA→DUS,False,,ZeroDay,0,non_tour,unknown,False,,False,False,Z72,Deutschland,14,Phase 3 classify (alt=ZeroDay → golden=Z72),med
+2025-02-11,,FRS ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-12,,60402 PE /JA,tour,FRA→HND,True,HND,Z76,33.0,tour_start,foreign_layover,True,HND,False,False,Z73,Deutschland,14,Phase 3 classify (alt=Z76 → golden=Z73),med
+2025-02-13,,716 LH716-1,tour,FRA→HND,True,HND,Z76,33.0,tour_mid,foreign_layover,True,HND,False,False,Z76,Japan - Tokyo,50,keep (correct),none
+2025-02-14,✓,X HND,frei,,True,HND,Frei,0,tour_mid,foreign_layover,True,HND,False,True,Z76,Japan - Tokyo,50,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-02-15,,717 LH717-1,same_day,HND→FRA,False,,Z76,33.0,tour_end,in_flight,True,HND,False,False,Z76,Japan - Tokyo,33,keep (correct),none
+2025-02-16,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-17,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-18,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-19,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-20,,==,unknown,,False,,ZeroDay,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-21,,== FZ,unknown,,False,,ZeroDay,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-22,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-23,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-24,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-25,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-26,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-27,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-02-28,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-01,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-02,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-03,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-04,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-05,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-06,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-07,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-08,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-09,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-10,,U1,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-11,,--,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-12,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-13,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-14,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-15,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-16,,82907 PU,tour,FRA→DUS→SVG,True,SVG,Z76,50.0,tour_start,foreign_layover,True,SVG,False,False,Z76,Norwegen,50,keep (correct),none
+2025-03-17,,83003 PU,same_day,FRA→MXP→GVA,False,,Z76,44.0,tour_mid,foreign_layover,True,SVG,False,False,Z76,Schweiz - Genf,44,keep (correct),none
+2025-03-18,,EH 4 SECCRM 4,training,FRA,False,,Z72,14.0,non_tour,unknown,False,,False,False,Z72,Deutschland,14,keep (correct),none
+2025-03-19,,EMCRM 4,training,FRA,False,,Z72,14.0,non_tour,unknown,False,,False,False,Z72,Deutschland,14,keep (correct),none
+2025-03-20,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-21,,ORTSTAG OF,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-22,✓,83343 PU,same_day,FRA→TOS,False,,Z72,14.0,same_day,in_flight,True,TOS,False,False,NOT_IN_GOLDEN,,0,Tour-First should NOT count (Golden=Frei),low (AeroTAX overcount)
+2025-03-23,,73724 P1,tour,FRA→IAD,True,IAD,Z76,42.0,tour_start,foreign_layover,True,TOS,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Boston,42,keep (correct),none
+2025-03-24,,419,tour,IAD,True,IAD,Z76,42.0,tour_mid,foreign_layover,True,TOS,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Boston,63,keep (correct),none
+2025-03-25,,X,same_day,IAD→FRA,False,,Z76,42.0,tour_end,in_flight,True,TOS,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Boston,42,keep (correct),none
+2025-03-26,✓,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-27,,ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-03-28,,EM /1,training,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NO_VMA,-,0,Phase 3 classify (alt=Office → golden=NO_VMA),med
+2025-03-29,,74016 P1,tour,FRA→BOM,True,BOM,Z76,28.0,tour_start,foreign_layover,True,BOM,False,False,Z73,Deutschland,14,Phase 3 classify (alt=Z76 → golden=Z73),med
+2025-03-30,✓,X BOM,frei,,True,BOM,Frei,0,tour_mid,foreign_layover,True,BOM,False,True,Z76,Indien - Mumbai,36,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-03-31,,757,tour,BOM→FRA,True,BOM,Z73,14.0,tour_mid,foreign_layover,True,BOM,False,False,Z76,Indien - Mumbai,53,Phase 3 classify (alt=Z73 → golden=Z76),med
+2025-04-01,✓,==,frei,,False,,Frei,0,tour_mid,foreign_layover,True,BOM,False,True,Z76,Indien - Mumbai,36,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-04-02,✓,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-03,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-04,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-05,,ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-06,,ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-07,✓,ORTSTAG FRS,office,FRA,False,,Z72,14.0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-08,,90064 P1/KO,tour,FRA→ICN,True,ICN,Z76,32.0,tour_start,foreign_layover,True,ICN,False,False,Z73,Deutschland,14,Phase 3 classify (alt=Z76 → golden=Z73),med
+2025-04-09,,LH712-1 cont.,tour,FRA→ICN,True,ICN,Z76,32.0,tour_mid,foreign_layover,True,ICN,False,False,Z76,Republik Korea,48,keep (correct),none
+2025-04-10,✓,X,frei,ICN,True,ICN,Frei,0,tour_mid,foreign_layover,True,ICN,False,True,Z76,Republik Korea,48,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-04-11,,LH713,same_day,ICN→FRA,False,,Z76,32.0,tour_end,in_flight,True,ICN,False,False,Z76,Republik Korea,32,keep (correct),none
+2025-04-12,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-13,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-14,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-15,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-16,,90481 P1,tour,FRA→IKA,True,IKA,Z76,22.0,tour_start,foreign_layover,True,IKA,False,False,Z76,Iran,22,keep (correct),none
+2025-04-17,,LH601,tour,IKA→FRA,True,IKA,Z76,22.0,tour_mid,foreign_layover,True,IKA,False,False,Z76,Iran,33,keep (correct),none
+2025-04-18,,LH601 cont.,same_day,IKA→FRA,False,,Z76,22.0,tour_end,in_flight,True,IKA,False,False,Z76,Iran,22,keep (correct),none
+2025-04-19,,Sa 19,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-20,,OF ORTSTAG,office,,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-21,,RB,unknown,FRA,False,,ZeroDay,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-22,,RES_SB,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-23,✓,RES,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,Z73,Deutschland,14,KI-Resolver Phase 5 nötig (RES → Z73),med (KI required)
+2025-04-24,✓,RES,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,Z76,Republik Korea,48,KI-Resolver Phase 5 nötig (RES → Z76),med (KI required)
+2025-04-25,✓,RES,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,Z76,Republik Korea,48,KI-Resolver Phase 5 nötig (RES → Z76),med (KI required)
+2025-04-26,✓,RES,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,Z76,Republik Korea,32,KI-Resolver Phase 5 nötig (RES → Z76),med (KI required)
+2025-04-27,,So 27,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-28,✓,LMN_AS LMN_CR1,office,FRA,False,,Z72,14.0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-29,,Di 29,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-04-30,,99761 PU,same_day,FRA→HAM→BHX,False,,ZeroDay,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-01,,111174 PU,tour,FRA→LEJ→KRK,True,KRK,Z76,23.0,tour_start,foreign_layover,True,KRK,False,False,Z76,Polen - Krakau,23,keep (correct),none
+2025-05-02,,111174 PU,tour,KRK→FRA→PRG→HAM,True,HAM,Z76,21.0,tour_mid,foreign_layover,True,KRK,False,False,Z76,Tschechische Republik,32,keep (correct),none
+2025-05-03,,111174 PU,same_day,HAM→FRA→TUN,False,,Z76,27.0,tour_mid,in_flight,True,KRK,False,False,Z76,Tunesien,27,keep (correct),none
+2025-05-04,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-05,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-06,,102896 P1,tour,FRA→ORD,True,ORD,Z76,28.0,tour_start,foreign_layover,True,ORD,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,44,keep (correct),none
+2025-05-07,,102896 P1,tour,ORD,True,ORD,Z76,28.0,tour_mid,foreign_layover,True,ORD,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,65,keep (correct),none
+2025-05-08,,102896 P1,same_day,ORD→FRA,False,,Z76,28.0,tour_end,in_flight,True,ORD,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,44,keep (correct),none
+2025-05-09,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-10,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-11,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-12,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-13,,112232 PU,same_day,FRA→KEF,False,,Z76,41.0,non_tour,unknown,False,,False,False,Z76,Island,41,keep (correct),none
+2025-05-14,,112337 PU,tour,FRA→TLV,True,TLV,Z76,40.0,tour_start,foreign_layover,True,TLV,False,False,Z76,Vereinigte Staaten von Amerika (USA),40,keep (correct),none
+2025-05-15,✓,X TLV,frei,,True,TLV,Frei,0,tour_mid,foreign_layover,True,TLV,False,True,Z76,Vereinigte Staaten von Amerika (USA),59,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-05-16,,112337 PU,same_day,TLV→FRA,False,,Z76,40.0,tour_end,in_flight,True,TLV,False,False,Z76,Vereinigte Staaten von Amerika (USA),59,keep (correct),none
+2025-05-17,✓,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,Z76,Vereinigte Staaten von Amerika (USA),40,Phase 3 classify (alt=Frei → golden=Z76),med
+2025-05-18,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-19,✓,LMN_AS / LMN_CR1,office,FRA,False,,Z72,14.0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-20,,103703 P1,tour,FRA→LAD,True,LAD,Z73,14.0,tour_start,foreign_layover,True,LAD,False,False,NOT_IN_GOLDEN,,0,Tour-First should NOT count (Golden=Frei),low (AeroTAX overcount)
+2025-05-21,,103703 P1,tour,LAD,True,LAD,Z76,40.0,tour_mid,foreign_layover,True,LAD,False,False,NOT_IN_GOLDEN,,0,Tour-First should NOT count (Golden=Frei),low (AeroTAX overcount)
+2025-05-22,,103703 P1,tour,LAD→FRA,True,LAD,Z76,27.0,tour_mid,foreign_layover,True,LAD,False,False,NOT_IN_GOLDEN,,0,Tour-First should NOT count (Golden=Frei),low (AeroTAX overcount)
+2025-05-23,,103703 P1,same_day,LAD,False,,Issue,0,tour_mid,foreign_layover,True,LAD,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-24,,ORTSTAG OF,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-25,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-26,,113301 PU,tour,FRA→TLV,True,TLV,Z76,28.0,tour_start,foreign_layover,True,TLV,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,44,keep (correct),none
+2025-05-27,✓,X TLV,frei,,True,TLV,Frei,0,tour_mid,foreign_layover,True,TLV,False,True,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,65,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-05-28,,113301 PU,same_day,TLV→FRA,False,,Z76,28.0,tour_end,in_flight,True,TLV,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Chicago,44,keep (correct),none
+2025-05-29,,OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-30,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-05-31,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-01,,126533 PU,tour,FRA→CPH→GOT,True,GOT,Z76,44.0,tour_start,foreign_layover,True,CPH,False,False,NOT_IN_GOLDEN,,0,Tour-First should NOT count (Golden=Frei),low (AeroTAX overcount)
+2025-06-02,,126533 PU,tour,GOT→FRA→SOF,True,SOF,Z76,15.0,tour_mid,foreign_layover,True,CPH,False,False,NOT_IN_GOLDEN,,0,Tour-First should NOT count (Golden=Frei),low (AeroTAX overcount)
+2025-06-03,,126533 PU,same_day,SOF→FRA→LHR,False,,Issue,0,tour_mid,foreign_layover,True,CPH,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-04,,EM,training,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NO_VMA,-,0,Phase 3 classify (alt=Office → golden=NO_VMA),med
+2025-06-05,,OFF,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-06,,FRS,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-07,,120237 P1/ZH,tour,FRA→SIN,True,SIN,Z73,14.0,tour_start,foreign_layover,True,SIN,False,False,Z73,Deutschland,14,keep (correct),none
+2025-06-08,,X,tour,FRA→SIN,True,SIN,Z76,48.0,tour_mid,foreign_layover,True,SIN,False,True,Z76,Singapur,71,keep (correct),none
+2025-06-09,✓,X,frei,SIN,True,SIN,Frei,0,tour_mid,foreign_layover,True,SIN,False,True,Z76,Singapur,71,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-06-10,,781,tour,SIN→FRA,True,FRA,Z76,48.0,tour_mid,foreign_layover,True,SIN,False,False,Z76,Singapur,71,keep (correct),none
+2025-06-11,,X,same_day,SIN→FRA,False,,Z76,48.0,tour_end,in_flight,True,SIN,False,False,Z76,Singapur,48,keep (correct),none
+2025-06-12,,X,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-13,,ORTSTAG OF,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-14,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-15,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-16,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-17,✓,OFF,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,Z76,Kroatien,31,Phase 3 classify (alt=Frei → golden=Z76),med
+2025-06-18,✓,OFF,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,Z76,Kroatien,31,Phase 3 classify (alt=Frei → golden=Z76),med
+2025-06-19,,OFF,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-20,,OFF,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-21,,128322 PU,tour,FRA→CPH→ATH,True,ATH,Z76,28.0,tour_start,foreign_layover,True,CPH,False,False,Z76,Schweden,44,keep (correct),none
+2025-06-22,,128322 PU,tour,ATH→FRA→HAJ→WAW,True,WAW,Z76,28.0,tour_mid,foreign_layover,True,CPH,False,False,Z76,Schweden,66,keep (correct),none
+2025-06-23,✓,128322 PU,tour,WAW→FRA→SZG→LIN,True,LIN,Z76,42.0,tour_mid,foreign_layover,True,CPH,False,False,Z76,Spanien - Madrid,42,keep (correct),none
+2025-06-24,✓,128322 PU,tour,LIN→FRA→HAM→BER,True,BER,Z76,28.0,tour_mid,foreign_layover,True,CPH,False,False,Z76,Spanien - Madrid,42,keep (correct),none
+2025-06-25,,128322 PU,same_day,BER→FRA→MUC,False,,Z76,35.0,tour_mid,in_flight,True,CPH,False,False,Z76,Vereinigtes Königreich,35,keep (correct),none
+2025-06-26,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-27,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-28,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-29,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-06-30,,129023 PU,same_day,FRA→BER→NAP,False,,Z76,28.0,non_tour,unknown,False,,False,False,Z76,Italien,28,keep (correct),none
+2025-07-01,,129023 PU / Tag 1,tour,FRA→STR→NAP→OTP,True,OTP,Z76,21.0,tour_start,foreign_layover,True,NAP,False,False,Z76,Rumänien - Bukarest,32,keep (correct),none
+2025-07-02,,129023 PU / Tag 2+,same_day,OTP→FRA→LHR,False,,Z76,44.0,tour_mid,foreign_layover,True,NAP,False,False,Z76,Vereinigtes Königreich - London,44,keep (correct),none
+2025-07-03,✓,129023 PU / Tag 3,same_day,OTP→FRA→LHR,False,,Z72,14.0,same_day,in_flight,True,NAP,False,False,NOT_IN_GOLDEN,,0,Tour-First should NOT count (Golden=Frei),low (AeroTAX overcount)
+2025-07-04,,frei,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-05,,FRS,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-06,,131859 P1 / Tag 49,tour,FRA→SEA,True,SEA,Z76,40.0,tour_start,foreign_layover,True,SEA,False,False,Z76,Vereinigte Staaten von Amerika (USA),40,keep (correct),none
+2025-07-07,,X SEA,frei,SEA,True,SEA,Frei,0,tour_mid,foreign_layover,True,SEA,False,True,Z76,Vereinigte Staaten von Amerika (USA),59,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-07-08,,491 LH491-1,tour,SEA→FRA,True,SEA,Z73,14.0,tour_mid,foreign_layover,True,SEA,False,False,Z76,Vereinigte Staaten von Amerika (USA),59,Phase 3 classify (alt=Z73 → golden=Z76),med
+2025-07-09,,491 LH491-1 (Forts,same_day,SEA→FRA,False,,Z76,40.0,tour_end,in_flight,True,SEA,False,False,Z76,Vereinigte Staaten von Amerika (USA),40,keep (correct),none
+2025-07-10,,frei,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-11,,ORTSTAG OF,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-12,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-13,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-14,,frei,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-15,,frei,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-16,,frei,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-17,,frei,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-18,,frei,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-19,,frei,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-20,,143620 PU / Tag 1,tour,FRA→MAN→MAD,True,MAD,Z76,50.0,tour_start,foreign_layover,True,MAN,False,False,Z76,Dänemark,50,keep (correct),none
+2025-07-21,,143620 PU / Tag 2,tour,MAD→FRA,True,MAD,Z76,23.0,tour_mid,foreign_layover,True,MAN,False,False,Z76,Spanien - Barcelona,34,keep (correct),none
+2025-07-22,,143620 PU / Tag 3,same_day,MAD→FRA→BCN,False,,Z76,23.0,tour_mid,foreign_layover,True,MAN,False,False,Z76,Spanien - Barcelona,23,keep (correct),none
+2025-07-23,✓,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,Z76,Schweden,44,Phase 3 classify (alt=Frei → golden=Z76),med
+2025-07-24,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-25,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-26,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-27,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-07-28,,144349 PU / Tag 1,tour,FRA→LHR→RIX,True,RIX,Z76,28.0,tour_start,foreign_layover,True,LHR,False,False,Z76,Vereinigtes Königreich - London,44,keep (correct),none
+2025-07-29,,X RIX,frei,RIX,True,RIX,Frei,0,tour_mid,foreign_layover,True,LHR,False,True,Z76,Lettland,35,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-07-30,,144349 PU / Tag 3,tour,RIX→FRA→MUC→KRK,True,KRK,Z76,23.0,tour_mid,foreign_layover,True,LHR,False,False,Z76,Polen - Krakau,34,keep (correct),none
+2025-07-31,,144349 PU / Tag 4,same_day,KRK→FRA→HAM,False,,Z76,23.0,tour_mid,foreign_layover,True,LHR,False,False,Z76,Polen - Krakau,34,keep (correct),none
+2025-08-01,,X,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,Z73,Deutschland,14,Phase 3 classify (alt=Frei → golden=Z73),med
+2025-08-02,,ORTSTAG OF,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-03,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-04,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-05,,158212 PU,same_day,FRA→KEF,False,,Z76,41.0,non_tour,unknown,False,,False,False,Z76,Island,41,keep (correct),none
+2025-08-06,,TK,training,FRA,False,,Z72,14.0,non_tour,unknown,False,,False,False,Z72,Deutschland,14,keep (correct),none
+2025-08-07,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-08,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-09,,SB_F,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-10,,SB_M,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-11,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-12,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-13,,SB_S,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-14,,SB_S,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-15,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-16,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-17,,SB_F,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-18,,159313 PU,same_day,FRA→CAI,False,,Z76,33.0,same_day,in_flight,True,CAI,False,False,Z76,Ägypten,33,keep (correct),none
+2025-08-19,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-20,,2713 PU,tour,FRA→TLV→LCA,True,LCA,Z76,44.0,tour_start,foreign_layover,True,TLV,False,False,Z76,Israel,44,keep (correct),none
+2025-08-21,,LH691-2,same_day,LCA→FRA,False,,Z76,28.0,tour_end,in_flight,True,TLV,False,False,Z76,Zypern,42,keep (correct),none
+2025-08-22,,X,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,Z76,Zypern,28,Phase 3 classify (alt=Frei → golden=Z76),med
+2025-08-23,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-24,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-25,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-26,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-27,,39 PU,tour,FRA→DUB→ARN,True,ARN,Z76,28.0,tour_start,foreign_layover,True,DUB,False,False,Z76,Schweden,44,keep (correct),none
+2025-08-28,,39 PU (Day 2),same_day,ARN→FRA→OSL,False,,Z76,50.0,tour_mid,foreign_layover,True,DUB,False,False,Z76,Norwegen,50,keep (correct),none
+2025-08-29,✓,232 PU,same_day,FRA→CAI,False,,Z76,33.0,same_day,in_flight,True,DUB,False,False,Z76,Ägypten,33,keep (correct),none
+2025-08-30,✓,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-08-31,✓,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-01,,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-02,,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-03,,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-04,,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-05,,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-06,,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-07,,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-08,,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-09,,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-10,,U,urlaub,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-11,,14542 PU,tour,FRA→SKP→BER,True,BER,Z73,14.0,tour_start,inland_layover,True,SKP,False,False,Z76,Nordmazedonien,18,Phase 3 classify (alt=Z73 → golden=Z76),med
+2025-09-12,,14542 PU (Day 2),tour,BER→FRA→MAD,True,MAD,Z76,42.0,tour_mid,foreign_layover,True,SKP,False,False,Z76,Spanien - Madrid,42,keep (correct),none
+2025-09-13,,14542 PU (Day 3),tour,MAD→FRA→LIS,True,LIS,Z76,28.0,tour_mid,foreign_layover,True,SKP,False,False,Z76,Portugal,32,keep (correct),none
+2025-09-14,,14542 PU (Day 4),same_day,LIS→FRA→LHR,False,,Z76,44.0,tour_mid,foreign_layover,True,SKP,False,False,Z76,Vereinigtes Königreich - London,44,keep (correct),none
+2025-09-15,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-16,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-17,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-18,,OFF ==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-19,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-20,✓,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,Z72,Deutschland,14,Phase 3 classify (alt=Frei → golden=Z72),med
+2025-09-21,,15370 PU,same_day,FRA→DUS,False,,ZeroDay,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-22,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-23,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-24,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-25,,15688 PU,tour,FRA→BER→KRK,True,KRK,Z76,23.0,tour_start,foreign_layover,True,KRK,False,False,NOT_IN_GOLDEN,,0,Tour-First should NOT count (Golden=Frei),low (AeroTAX overcount)
+2025-09-26,✓,15688 PU (Day 2),tour,KRK→FRA→IST,True,IST,Z74,28.0,tour_mid,foreign_layover,True,KRK,False,False,Z76,Bulgarien,15,Phase 3 classify (alt=Z74 → golden=Z76),med
+2025-09-27,✓,15688 PU (Day 3),tour,IST→FRA→AGP,True,AGP,Z73,14.0,tour_mid,foreign_layover,True,KRK,False,False,Z74,Deutschland,28,Phase 3 classify (alt=Z73 → golden=Z74),med
+2025-09-28,,15688 PU (Day 4),same_day,AGP→FRA→CPH,False,,Z76,44.0,tour_mid,foreign_layover,True,KRK,False,False,Z76,Schweden,44,keep (correct),none
+2025-09-29,,ORTSTAG OF,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-09-30,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-01,,ORTSTAG OF,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-02,,29348 PU,tour,FRA→SOF→TLL,True,TLL,Z76,15.0,tour_start,foreign_layover,True,SOF,False,False,Z76,Bulgarien,15,keep (correct),none
+2025-10-03,,29348 PU,same_day,TLL→FRA→VCE,False,,Z76,28.0,tour_mid,foreign_layover,True,SOF,False,False,Z76,Italien,28,keep (correct),none
+2025-10-04,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-05,,18776 P1/KO,tour,FRA→ICN,True,ICN,Z76,28.0,tour_start,foreign_layover,True,ICN,False,False,Z73,Deutschland,14,Phase 3 classify (alt=Z76 → golden=Z73),med
+2025-10-06,,X,frei,ICN,True,ICN,Frei,0,tour_mid,foreign_layover,True,ICN,False,True,Z76,Republik Korea,48,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-10-07,,X,frei,ICN,True,ICN,Frei,0,tour_mid,foreign_layover,True,ICN,False,True,Z76,Republik Korea,48,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-10-08,,18776 P1/KO,same_day,ICN→FRA,False,,Z76,32.0,tour_end,in_flight,True,ICN,False,False,Z76,Republik Korea,32,keep (correct),none
+2025-10-09,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-10,,== -_A,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-11,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-12,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-13,,FRS,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-14,,,unknown,FRA,False,,ZeroDay,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-15,,,unknown,FRA,False,,Z76,36.0,non_tour,unknown,False,,False,False,Z76,Frankreich,36,keep (correct),none
+2025-10-16,,,unknown,FRA,False,,Z76,23.0,non_tour,unknown,False,,False,False,Z76,Spanien,23,keep (correct),none
+2025-10-17,,,unknown,FRA,False,,ZeroDay,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-18,,,unknown,FRA,False,,ZeroDay,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-19,,RB,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-20,,RES_SB,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,Z73,Deutschland,14,KI-Resolver Phase 5 nötig (RES → Z73),med (KI required)
+2025-10-21,,RES,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,Z76,Spanien,23,KI-Resolver Phase 5 nötig (RES → Z76),med (KI required)
+2025-10-22,,RES,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-23,,RES,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,Z73,Deutschland,14,KI-Resolver Phase 5 nötig (RES → Z73),med (KI required)
+2025-10-24,,RES,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,Z76,Vereinigtes Königreich - London,66,KI-Resolver Phase 5 nötig (RES → Z76),med (KI required)
+2025-10-25,,,unknown,FRA,False,,Z76,44.0,non_tour,unknown,False,,False,False,Z76,Vereinigtes Königreich - London,44,keep (correct),none
+2025-10-26,,32935 PU,tour,FRA→TLV,True,TLV,Z76,44.0,tour_start,foreign_layover,True,TLV,False,False,NOT_IN_GOLDEN,,0,Tour-First should NOT count (Golden=Frei),low (AeroTAX overcount)
+2025-10-27,,X,frei,TLV,True,TLV,Frei,0,tour_mid,foreign_layover,True,TLV,False,True,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-28,,32935 PU,same_day,TLV→FRA,False,,Issue,0,tour_end,in_flight,True,TLV,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-29,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-30,,==,frei,FRA,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-10-31,,33491 PU,same_day,FRA→ATH,False,,Z76,44.0,non_tour,unknown,False,,False,False,Z76,Vereinigtes Königreich - London,44,keep (correct),none
+2025-11-01,✓,49928 PU,tour,FRA→ARN→LEJ,True,LEJ,Z76,28.0,tour_start,inland_layover,True,ARN,False,False,Z76,Schweden,44,keep (correct),none
+2025-11-02,,49928 PU,tour,LEJ→FRA→FCO→GOT,True,GOT,Z76,44.0,tour_mid,foreign_layover,True,ARN,False,False,Z76,Schweden,66,keep (correct),none
+2025-11-03,,49928 PU,same_day,GOT→FRA,False,,Z76,44.0,tour_end,in_flight,True,ARN,False,False,Z76,Schweden,44,keep (correct),none
+2025-11-04,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-05,,ORTSTAG OF-_A,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-06,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-07,,50632 PU,tour,FRA→CPH→ATH,True,ATH,Z76,27.0,tour_start,foreign_layover,True,CPH,False,False,Z76,Griechenland - Athen,27,keep (correct),none
+2025-11-08,,50632 PU,tour,ATH→FRA→VNO,True,VNO,Z76,27.0,tour_mid,foreign_layover,True,CPH,False,False,Z76,Litauen,26,keep (correct),none
+2025-11-09,,50632 PU,same_day,VNO→FRA→VCE,False,,Z76,17.0,tour_mid,foreign_layover,True,CPH,False,False,Z76,Litauen,17,keep (correct),none
+2025-11-10,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-11,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-12,,SB_F,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-13,,SB_F,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-14,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-15,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-16,,SB_M,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-17,,SB_M,standby,FRA,False,,Standby,0,non_tour,unknown,False,,False,False,Z76,Norwegen,50,KI-Resolver Phase 5 nötig (RES → Z76),med (KI required)
+2025-11-18,✓,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,Z76,Norwegen,50,Phase 3 classify (alt=Frei → golden=Z76),med
+2025-11-19,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-20,,38652 P1,tour,FRA→MIA,True,MIA,Z76,44.0,tour_start,foreign_layover,True,MIA,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Miami,44,keep (correct),none
+2025-11-21,,38652 P1,tour,MIA→FRA,True,MIA,Z76,44.0,tour_mid,foreign_layover,True,MIA,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Miami,65,keep (correct),none
+2025-11-22,,38652 P1,same_day,MIA→FRA,False,,Z76,44.0,tour_end,in_flight,True,MIA,False,False,Z76,Vereinigte Staaten von Amerika (USA) - Miami,44,keep (correct),none
+2025-11-23,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-24,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-25,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-26,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-27,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-28,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-29,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-11-30,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-01,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-02,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-03,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-04,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-05,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-06,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-07,,U,urlaub,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-08,,EM,training,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-09,,68354 PU,tour,FRA→BUD→LIN,True,LIN,Z76,28.0,tour_start,foreign_layover,True,BUD,False,False,Z76,Italien - Mailand,28,keep (correct),none
+2025-12-10,,68354 PU Tag 2,tour,LIN→FRA→BER→PRG,True,PRG,Z76,21.0,tour_mid,foreign_layover,True,BUD,False,False,Z76,Tschechische Republik,32,keep (correct),none
+2025-12-11,,68354 PU Tag 3,same_day,PRG→FRA→MLA,False,,Z76,31.0,tour_mid,foreign_layover,True,BUD,False,False,Z76,Malta,31,keep (correct),none
+2025-12-12,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-13,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-14,,57783 P1,tour,FRA→JFK,True,JFK,Z76,39.0,tour_start,foreign_layover,True,JFK,False,False,Z76,Irland,39,keep (correct),none
+2025-12-15,,57783 P1 Tag 2,tour,JFK→FRA,True,JFK,Z76,44.0,tour_mid,foreign_layover,True,JFK,False,False,NOT_IN_GOLDEN,,0,Tour-First should NOT count (Golden=Frei),low (AeroTAX overcount)
+2025-12-16,✓,X,frei,FRA,False,,Frei,0,tour_mid,foreign_layover,True,JFK,False,True,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-17,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-18,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-19,,OF ORTSTAG,office,FRA,False,,Office,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-20,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-21,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-22,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-23,,== OFF,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-24,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-25,,70183 PU,tour,FRA→BRE→MUC→BIO,True,BIO,Z76,28.0,tour_start,foreign_layover,True,BIO,False,False,Z76,Italien - Rom,32,keep (correct),none
+2025-12-26,,70183 PU Tag 2,same_day,BIO→FRA→EDI,False,,Z76,28.0,tour_mid,foreign_layover,True,BIO,False,False,Z76,Norwegen,50,keep (correct),none
+2025-12-27,,70531 PU,tour,FRA→TLV,True,TLV,Z76,44.0,tour_start,foreign_layover,True,BIO,False,False,Z76,Israel,44,keep (correct),none
+2025-12-28,,X TLV,frei,,False,,Frei,0,tour_mid,foreign_layover,True,BIO,False,True,Z76,Israel,66,Tour-First fix → Z76,low (Sandwich + Golden agreement)
+2025-12-29,,70531 PU Tag 3,same_day,TLV→FRA,False,,Z76,44.0,non_tour,unknown,False,,False,False,Z76,Israel,44,keep (correct),none
+2025-12-30,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none
+2025-12-31,,==,frei,,False,,Frei,0,non_tour,unknown,False,,False,False,NOT_IN_GOLDEN,,0,keep non_tour,none

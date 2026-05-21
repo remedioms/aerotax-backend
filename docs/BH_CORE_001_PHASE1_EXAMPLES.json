@@ -1,0 +1,143 @@
+{
+  "bangalore": {
+    "tour_id": "T01_2025-01-03_FRA-BLR",
+    "start_date": "2025-01-03",
+    "end_date": "2025-01-06",
+    "homebase": "FRA",
+    "primary_destination": "BLR",
+    "destination_country": "Indien – Bangalore",
+    "tour_size": 4,
+    "tour_pattern": "single_dest",
+    "is_foreign": true,
+    "is_inland": false,
+    "is_mixed": false,
+    "confidence": 0.9,
+    "evidence": [
+      "tour built from 4 consecutive service days (role-based, NOT klass-based)"
+    ],
+    "days": [
+      {
+        "datum": "2025-01-03",
+        "raw_marker": "31591 P1",
+        "routing": [
+          "FRA",
+          "BLR"
+        ],
+        "role": "tour_start",
+        "location_context": "foreign_layover",
+        "layover_ort": "BLR",
+        "inferred_layover_ort": "BLR",
+        "bmf_place_code": "BLR",
+        "se_context": {
+          "has_se_stamp": false,
+          "stfrei_ort": "",
+          "stfrei_inland": null,
+          "stfrei_betrag": 0.0
+        },
+        "has_real_duty": true,
+        "is_passive_homebase_marker": false,
+        "is_standby_homebase": false,
+        "is_standby_hotel": false,
+        "is_layover_free_day": false,
+        "confidence": 0.9,
+        "evidence": [
+          "starts_at_homebase=True, has_fl=True, routing=['FRA', 'BLR']"
+        ],
+        "needs_review": false
+      },
+      {
+        "datum": "2025-01-04",
+        "raw_marker": "X",
+        "routing": [],
+        "role": "tour_mid",
+        "location_context": "foreign_layover",
+        "layover_ort": "BLR",
+        "inferred_layover_ort": "BLR",
+        "bmf_place_code": "BLR",
+        "se_context": {
+          "has_se_stamp": false,
+          "stfrei_ort": "",
+          "stfrei_inland": null,
+          "stfrei_betrag": 0.0
+        },
+        "has_real_duty": false,
+        "is_passive_homebase_marker": false,
+        "is_standby_homebase": false,
+        "is_standby_hotel": false,
+        "is_layover_free_day": true,
+        "confidence": 0.9,
+        "evidence": [
+          "prev.overnight=True, prev.layover=BLR",
+          "sandwich marker X between overnight-days"
+        ],
+        "needs_review": false
+      },
+      {
+        "datum": "2025-01-05",
+        "raw_marker": "755 LH755-1",
+        "routing": [
+          "BLR",
+          "FRA"
+        ],
+        "role": "tour_mid",
+        "location_context": "foreign_layover",
+        "layover_ort": "BLR",
+        "inferred_layover_ort": "BLR",
+        "bmf_place_code": "BLR",
+        "se_context": {
+          "has_se_stamp": false,
+          "stfrei_ort": "",
+          "stfrei_inland": null,
+          "stfrei_betrag": 0.0
+        },
+        "has_real_duty": true,
+        "is_passive_homebase_marker": false,
+        "is_standby_homebase": false,
+        "is_standby_hotel": false,
+        "is_layover_free_day": false,
+        "confidence": 0.9,
+        "evidence": [
+          "prev.overnight=True, prev.layover=BLR"
+        ],
+        "needs_review": false
+      },
+      {
+        "datum": "2025-01-06",
+        "raw_marker": "755 LH755-1",
+        "routing": [
+          "BLR",
+          "FRA"
+        ],
+        "role": "tour_end",
+        "location_context": "in_flight",
+        "layover_ort": "",
+        "inferred_layover_ort": "BLR",
+        "bmf_place_code": "BLR",
+        "se_context": {
+          "has_se_stamp": false,
+          "stfrei_ort": "",
+          "stfrei_inland": null,
+          "stfrei_betrag": 0.0
+        },
+        "has_real_duty": true,
+        "is_passive_homebase_marker": false,
+        "is_standby_homebase": false,
+        "is_standby_hotel": false,
+        "is_layover_free_day": false,
+        "confidence": 0.9,
+        "evidence": [
+          "ends_at_homebase=True, prev.overnight=True, routing[-1]=FRA"
+        ],
+        "needs_review": false
+      }
+    ]
+  },
+  "tour_count_2025": 35,
+  "roles_distribution_2025": {
+    "tour_start": 34,
+    "tour_mid": 61,
+    "tour_end": 16,
+    "same_day": 5
+  },
+  "arbeitstage_simulated": 116
+}

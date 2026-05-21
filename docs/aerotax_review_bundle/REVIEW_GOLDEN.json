@@ -1,0 +1,3853 @@
+{
+  "meta": {
+    "source": "FollowMe.aero Dienstplanauswertung_99102_2025.pdf",
+    "crew_id_anonymized": "TIBOR_2025",
+    "year": 2025,
+    "homebase": "FRA",
+    "generated_at": "2026-05-11T20:29:08.443873"
+  },
+  "soll_summary": {
+    "fahrten": {
+      "normal_touren_starts": 53,
+      "zusatz": 5,
+      "total": 58,
+      "km_total": 1624,
+      "fahrtkosten": 524.32,
+      "normal_anfahrten_einzelliste": [
+        {
+          "datum": "2025-01-03",
+          "beginn": "10:15",
+          "km": 28
+        },
+        {
+          "datum": "2025-01-10",
+          "beginn": "07:50",
+          "km": 28
+        },
+        {
+          "datum": "2025-01-11",
+          "beginn": "05:45",
+          "km": 28
+        },
+        {
+          "datum": "2025-01-18",
+          "beginn": "19:20",
+          "km": 28
+        },
+        {
+          "datum": "2025-02-10",
+          "beginn": "04:45",
+          "km": 28
+        },
+        {
+          "datum": "2025-02-12",
+          "beginn": "11:35",
+          "km": 28
+        },
+        {
+          "datum": "2025-03-16",
+          "beginn": "04:45",
+          "km": 28
+        },
+        {
+          "datum": "2025-03-17",
+          "beginn": "07:30",
+          "km": 28
+        },
+        {
+          "datum": "2025-03-18",
+          "beginn": "08:20",
+          "km": 28
+        },
+        {
+          "datum": "2025-03-19",
+          "beginn": "07:50",
+          "km": 28
+        },
+        {
+          "datum": "2025-03-23",
+          "beginn": "08:25",
+          "km": 28
+        },
+        {
+          "datum": "2025-03-28",
+          "beginn": "07:50",
+          "km": 28
+        },
+        {
+          "datum": "2025-03-29",
+          "beginn": "09:45",
+          "km": 28
+        },
+        {
+          "datum": "2025-04-08",
+          "beginn": "13:00",
+          "km": 28
+        },
+        {
+          "datum": "2025-04-16",
+          "beginn": "11:50",
+          "km": 28
+        },
+        {
+          "datum": "2025-04-23",
+          "beginn": "13:00",
+          "km": 28
+        },
+        {
+          "datum": "2025-05-01",
+          "beginn": "05:00",
+          "km": 28
+        },
+        {
+          "datum": "2025-05-06",
+          "beginn": "08:20",
+          "km": 28
+        },
+        {
+          "datum": "2025-05-13",
+          "beginn": "09:15",
+          "km": 28
+        },
+        {
+          "datum": "2025-05-14",
+          "beginn": "08:15",
+          "km": 28
+        },
+        {
+          "datum": "2025-05-26",
+          "beginn": "14:50",
+          "km": 28
+        },
+        {
+          "datum": "2025-06-04",
+          "beginn": "07:20",
+          "km": 28
+        },
+        {
+          "datum": "2025-06-07",
+          "beginn": "19:25",
+          "km": 28
+        },
+        {
+          "datum": "2025-06-17",
+          "beginn": "15:40",
+          "km": 28
+        },
+        {
+          "datum": "2025-06-21",
+          "beginn": "14:10",
+          "km": 28
+        },
+        {
+          "datum": "2025-06-30",
+          "beginn": "05:00",
+          "km": 28
+        },
+        {
+          "datum": "2025-07-06",
+          "beginn": "08:15",
+          "km": 28
+        },
+        {
+          "datum": "2025-07-20",
+          "beginn": "10:20",
+          "km": 28
+        },
+        {
+          "datum": "2025-07-23",
+          "beginn": "14:13",
+          "km": 28
+        },
+        {
+          "datum": "2025-07-28",
+          "beginn": "11:55",
+          "km": 28
+        },
+        {
+          "datum": "2025-08-05",
+          "beginn": "09:15",
+          "km": 28
+        },
+        {
+          "datum": "2025-08-06",
+          "beginn": "09:20",
+          "km": 28
+        },
+        {
+          "datum": "2025-08-18",
+          "beginn": "08:00",
+          "km": 28
+        },
+        {
+          "datum": "2025-08-20",
+          "beginn": "15:55",
+          "km": 28
+        },
+        {
+          "datum": "2025-08-27",
+          "beginn": "05:00",
+          "km": 28
+        },
+        {
+          "datum": "2025-08-29",
+          "beginn": "08:00",
+          "km": 28
+        },
+        {
+          "datum": "2025-09-11",
+          "beginn": "09:45",
+          "km": 28
+        },
+        {
+          "datum": "2025-09-20",
+          "beginn": "07:10",
+          "km": 28
+        },
+        {
+          "datum": "2025-09-26",
+          "beginn": "06:00",
+          "km": 28
+        },
+        {
+          "datum": "2025-10-02",
+          "beginn": "12:35",
+          "km": 28
+        },
+        {
+          "datum": "2025-10-05",
+          "beginn": "13:00",
+          "km": 28
+        },
+        {
+          "datum": "2025-10-15",
+          "beginn": "07:20",
+          "km": 28
+        },
+        {
+          "datum": "2025-10-20",
+          "beginn": "16:55",
+          "km": 28
+        },
+        {
+          "datum": "2025-10-23",
+          "beginn": "20:10",
+          "km": 28
+        },
+        {
+          "datum": "2025-10-31",
+          "beginn": "07:00",
+          "km": 28
+        },
+        {
+          "datum": "2025-11-01",
+          "beginn": "13:40",
+          "km": 28
+        },
+        {
+          "datum": "2025-11-07",
+          "beginn": "05:50",
+          "km": 28
+        },
+        {
+          "datum": "2025-11-17",
+          "beginn": "19:05",
+          "km": 28
+        },
+        {
+          "datum": "2025-11-20",
+          "beginn": "07:45",
+          "km": 28
+        },
+        {
+          "datum": "2025-12-09",
+          "beginn": "05:40",
+          "km": 28
+        },
+        {
+          "datum": "2025-12-14",
+          "beginn": "08:30",
+          "km": 28
+        },
+        {
+          "datum": "2025-12-25",
+          "beginn": "08:15",
+          "km": 28
+        },
+        {
+          "datum": "2025-12-27",
+          "beginn": "15:50",
+          "km": 28
+        }
+      ],
+      "zusatz_count": 5,
+      "zusatz_km_each": 28
+    },
+    "arbeitstage": 133,
+    "hotelaufenthalte": 66,
+    "reinigung": {
+      "tage": 133,
+      "satz": 1.6,
+      "gesamt": 212.8
+    },
+    "trinkgelder": {
+      "naechte": 66,
+      "satz": 3.6,
+      "gesamt": 237.6
+    },
+    "z72": {
+      "tage": 5,
+      "gesamt": 70.0
+    },
+    "z73": {
+      "tage": 11,
+      "gesamt": 154.0
+    },
+    "z74": {
+      "tage": 1,
+      "gesamt": 28.0
+    },
+    "z76": {
+      "gesamt": 4794.0,
+      "country_aggregates": {
+        "Ägypten": {
+          "count_24h": 0,
+          "satz_24h": 50,
+          "count_8h": 2,
+          "satz_8h": 33,
+          "count_an_ab": 0,
+          "satz_an_ab": 33
+        },
+        "Bulgarien": {
+          "count_24h": 0,
+          "satz_24h": 22,
+          "count_8h": 0,
+          "satz_8h": 15,
+          "count_an_ab": 2,
+          "satz_an_ab": 15
+        },
+        "China - Hong Kong": {
+          "count_24h": 3,
+          "satz_24h": 71,
+          "count_8h": 0,
+          "satz_8h": 48,
+          "count_an_ab": 1,
+          "satz_an_ab": 48
+        },
+        "Dänemark": {
+          "count_24h": 0,
+          "satz_24h": 75,
+          "count_8h": 1,
+          "satz_8h": 50,
+          "count_an_ab": 1,
+          "satz_an_ab": 50
+        },
+        "Deutschland": {
+          "count_24h": 1,
+          "satz_24h": 28,
+          "count_8h": 5,
+          "satz_8h": 14,
+          "count_an_ab": 11,
+          "satz_an_ab": 14
+        },
+        "Frankreich": {
+          "count_24h": 0,
+          "satz_24h": 53,
+          "count_8h": 0,
+          "satz_8h": 36,
+          "count_an_ab": 1,
+          "satz_an_ab": 36
+        },
+        "Griechenland - Athen": {
+          "count_24h": 0,
+          "satz_24h": 40,
+          "count_8h": 0,
+          "satz_8h": 27,
+          "count_an_ab": 1,
+          "satz_an_ab": 27
+        },
+        "Indien - Bangalore": {
+          "count_24h": 2,
+          "satz_24h": 42,
+          "count_8h": 0,
+          "satz_8h": 28,
+          "count_an_ab": 1,
+          "satz_an_ab": 28
+        },
+        "Indien - Mumbai": {
+          "count_24h": 1,
+          "satz_24h": 53,
+          "count_8h": 0,
+          "satz_8h": 36,
+          "count_an_ab": 2,
+          "satz_an_ab": 36
+        },
+        "Iran": {
+          "count_24h": 1,
+          "satz_24h": 33,
+          "count_8h": 0,
+          "satz_8h": 22,
+          "count_an_ab": 2,
+          "satz_an_ab": 22
+        },
+        "Irland": {
+          "count_24h": 0,
+          "satz_24h": 58,
+          "count_8h": 1,
+          "satz_8h": 39,
+          "count_an_ab": 0,
+          "satz_an_ab": 39
+        },
+        "Island": {
+          "count_24h": 0,
+          "satz_24h": 62,
+          "count_8h": 2,
+          "satz_8h": 41,
+          "count_an_ab": 0,
+          "satz_an_ab": 41
+        },
+        "Israel": {
+          "count_24h": 1,
+          "satz_24h": 66,
+          "count_8h": 0,
+          "satz_8h": 44,
+          "count_an_ab": 3,
+          "satz_an_ab": 44
+        },
+        "Italien": {
+          "count_24h": 0,
+          "satz_24h": 42,
+          "count_8h": 0,
+          "satz_8h": 28,
+          "count_an_ab": 2,
+          "satz_an_ab": 28
+        },
+        "Italien - Mailand": {
+          "count_24h": 0,
+          "satz_24h": 42,
+          "count_8h": 0,
+          "satz_8h": 28,
+          "count_an_ab": 1,
+          "satz_an_ab": 28
+        },
+        "Italien - Rom": {
+          "count_24h": 0,
+          "satz_24h": 48,
+          "count_8h": 0,
+          "satz_8h": 32,
+          "count_an_ab": 1,
+          "satz_an_ab": 32
+        },
+        "Japan - Tokyo": {
+          "count_24h": 2,
+          "satz_24h": 50,
+          "count_8h": 0,
+          "satz_8h": 33,
+          "count_an_ab": 1,
+          "satz_an_ab": 33
+        },
+        "Kroatien": {
+          "count_24h": 0,
+          "satz_24h": 46,
+          "count_8h": 0,
+          "satz_8h": 31,
+          "count_an_ab": 2,
+          "satz_an_ab": 31
+        },
+        "Lettland": {
+          "count_24h": 1,
+          "satz_24h": 35,
+          "count_8h": 0,
+          "satz_8h": 24,
+          "count_an_ab": 0,
+          "satz_an_ab": 24
+        },
+        "Litauen": {
+          "count_24h": 1,
+          "satz_24h": 26,
+          "count_8h": 0,
+          "satz_8h": 17,
+          "count_an_ab": 1,
+          "satz_an_ab": 17
+        },
+        "Malta": {
+          "count_24h": 0,
+          "satz_24h": 46,
+          "count_8h": 0,
+          "satz_8h": 31,
+          "count_an_ab": 1,
+          "satz_an_ab": 31
+        },
+        "Nordmazedonien": {
+          "count_24h": 0,
+          "satz_24h": 27,
+          "count_8h": 0,
+          "satz_8h": 18,
+          "count_an_ab": 1,
+          "satz_an_ab": 18
+        },
+        "Norwegen": {
+          "count_24h": 0,
+          "satz_24h": 75,
+          "count_8h": 1,
+          "satz_8h": 50,
+          "count_an_ab": 4,
+          "satz_an_ab": 50
+        },
+        "Polen - Krakau": {
+          "count_24h": 2,
+          "satz_24h": 34,
+          "count_8h": 0,
+          "satz_8h": 23,
+          "count_an_ab": 1,
+          "satz_an_ab": 23
+        },
+        "Portugal": {
+          "count_24h": 1,
+          "satz_24h": 32,
+          "count_8h": 0,
+          "satz_8h": 21,
+          "count_an_ab": 0,
+          "satz_an_ab": 21
+        },
+        "Republik Korea": {
+          "count_24h": 6,
+          "satz_24h": 48,
+          "count_8h": 0,
+          "satz_8h": 32,
+          "count_an_ab": 3,
+          "satz_an_ab": 32
+        },
+        "Rumänien - Bukarest": {
+          "count_24h": 1,
+          "satz_24h": 32,
+          "count_8h": 0,
+          "satz_8h": 21,
+          "count_an_ab": 0,
+          "satz_an_ab": 21
+        },
+        "Schweden": {
+          "count_24h": 2,
+          "satz_24h": 66,
+          "count_8h": 1,
+          "satz_8h": 44,
+          "count_an_ab": 5,
+          "satz_an_ab": 44
+        },
+        "Schweiz - Genf": {
+          "count_24h": 0,
+          "satz_24h": 66,
+          "count_8h": 1,
+          "satz_8h": 44,
+          "count_an_ab": 0,
+          "satz_an_ab": 44
+        },
+        "Singapur": {
+          "count_24h": 3,
+          "satz_24h": 71,
+          "count_8h": 0,
+          "satz_8h": 48,
+          "count_an_ab": 1,
+          "satz_an_ab": 48
+        },
+        "Spanien": {
+          "count_24h": 0,
+          "satz_24h": 34,
+          "count_8h": 0,
+          "satz_8h": 23,
+          "count_an_ab": 2,
+          "satz_an_ab": 23
+        },
+        "Spanien - Barcelona": {
+          "count_24h": 1,
+          "satz_24h": 34,
+          "count_8h": 0,
+          "satz_8h": 23,
+          "count_an_ab": 1,
+          "satz_an_ab": 23
+        },
+        "Spanien - Madrid": {
+          "count_24h": 3,
+          "satz_24h": 42,
+          "count_8h": 0,
+          "satz_8h": 28,
+          "count_an_ab": 0,
+          "satz_an_ab": 28
+        },
+        "Tschechische Republik": {
+          "count_24h": 2,
+          "satz_24h": 32,
+          "count_8h": 0,
+          "satz_8h": 21,
+          "count_an_ab": 0,
+          "satz_an_ab": 21
+        },
+        "Tunesien": {
+          "count_24h": 0,
+          "satz_24h": 40,
+          "count_8h": 0,
+          "satz_8h": 27,
+          "count_an_ab": 1,
+          "satz_an_ab": 27
+        },
+        "Vereinigte Staaten von Amerika (USA)": {
+          "count_24h": 4,
+          "satz_24h": 59,
+          "count_8h": 0,
+          "satz_8h": 40,
+          "count_an_ab": 4,
+          "satz_an_ab": 40
+        },
+        "Vereinigte Staaten von Amerika (USA) - Boston": {
+          "count_24h": 1,
+          "satz_24h": 63,
+          "count_8h": 0,
+          "satz_8h": 42,
+          "count_an_ab": 2,
+          "satz_an_ab": 42
+        },
+        "Vereinigte Staaten von Amerika (USA) - Chicago": {
+          "count_24h": 2,
+          "satz_24h": 65,
+          "count_8h": 0,
+          "satz_8h": 44,
+          "count_an_ab": 4,
+          "satz_an_ab": 44
+        },
+        "Vereinigte Staaten von Amerika (USA) - Miami": {
+          "count_24h": 1,
+          "satz_24h": 65,
+          "count_8h": 0,
+          "satz_8h": 44,
+          "count_an_ab": 2,
+          "satz_an_ab": 44
+        },
+        "Vereinigtes Königreich": {
+          "count_24h": 0,
+          "satz_24h": 52,
+          "count_8h": 0,
+          "satz_8h": 35,
+          "count_an_ab": 1,
+          "satz_an_ab": 35
+        },
+        "Vereinigtes Königreich - London": {
+          "count_24h": 1,
+          "satz_24h": 66,
+          "count_8h": 1,
+          "satz_8h": 44,
+          "count_an_ab": 4,
+          "satz_an_ab": 44
+        },
+        "Zypern": {
+          "count_24h": 1,
+          "satz_24h": 42,
+          "count_8h": 0,
+          "satz_8h": 28,
+          "count_an_ab": 1,
+          "satz_an_ab": 28
+        }
+      }
+    },
+    "gesamt": 6020.72
+  },
+  "touren": [
+    {
+      "tour_num": 1,
+      "start_date": "2025-01-03",
+      "end_date": "2025-01-06",
+      "start_time": "10:15",
+      "end_time": "11:31",
+      "tage": [
+        {
+          "datum": "2025-01-03",
+          "dauer_h": 13.75,
+          "land": "Deutschland",
+          "betrag": 14
+        },
+        {
+          "datum": "2025-01-04",
+          "dauer_h": 24.0,
+          "land": "Indien - Bangalore",
+          "betrag": 42
+        },
+        {
+          "datum": "2025-01-05",
+          "dauer_h": 24.0,
+          "land": "Indien - Bangalore",
+          "betrag": 42
+        },
+        {
+          "datum": "2025-01-06",
+          "dauer_h": 11.516666666666667,
+          "land": "Indien - Bangalore",
+          "betrag": 28
+        }
+      ],
+      "tour_size": 4,
+      "tour_summe": 126
+    },
+    {
+      "tour_num": 2,
+      "start_date": "2025-01-10",
+      "end_date": "2025-01-10",
+      "start_time": "07:50",
+      "end_time": "13:10",
+      "tage": [
+        {
+          "datum": "2025-01-10",
+          "dauer_h": 5.333333333333333,
+          "land": "-",
+          "betrag": 0
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 0
+    },
+    {
+      "tour_num": 3,
+      "start_date": "2025-01-11",
+      "end_date": "2025-01-11",
+      "start_time": "05:45",
+      "end_time": "16:51",
+      "tage": [
+        {
+          "datum": "2025-01-11",
+          "dauer_h": 11.1,
+          "land": "Dänemark",
+          "betrag": 50
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 50
+    },
+    {
+      "tour_num": 4,
+      "start_date": "2025-01-18",
+      "end_date": "2025-01-22",
+      "start_time": "19:20",
+      "end_time": "07:31",
+      "tage": [
+        {
+          "datum": "2025-01-18",
+          "dauer_h": 4.666666666666667,
+          "land": "Deutschland",
+          "betrag": 14
+        },
+        {
+          "datum": "2025-01-19",
+          "dauer_h": 24.0,
+          "land": "China - Hong Kong",
+          "betrag": 71
+        },
+        {
+          "datum": "2025-01-20",
+          "dauer_h": 24.0,
+          "land": "China - Hong Kong",
+          "betrag": 71
+        },
+        {
+          "datum": "2025-01-21",
+          "dauer_h": 24.0,
+          "land": "China - Hong Kong",
+          "betrag": 71
+        },
+        {
+          "datum": "2025-01-22",
+          "dauer_h": 7.516666666666667,
+          "land": "China - Hong Kong",
+          "betrag": 48
+        }
+      ],
+      "tour_size": 5,
+      "tour_summe": 275
+    },
+    {
+      "tour_num": 5,
+      "start_date": "2025-02-10",
+      "end_date": "2025-02-10",
+      "start_time": "04:45",
+      "end_time": "14:00",
+      "tage": [
+        {
+          "datum": "2025-02-10",
+          "dauer_h": 9.25,
+          "land": "Deutschland",
+          "betrag": 14
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 14
+    },
+    {
+      "tour_num": 6,
+      "start_date": "2025-02-12",
+      "end_date": "2025-02-15",
+      "start_time": "11:35",
+      "end_time": "20:15",
+      "tage": [
+        {
+          "datum": "2025-02-12",
+          "dauer_h": 12.416666666666666,
+          "land": "Deutschland",
+          "betrag": 14
+        },
+        {
+          "datum": "2025-02-13",
+          "dauer_h": 24.0,
+          "land": "Japan - Tokyo",
+          "betrag": 50
+        },
+        {
+          "datum": "2025-02-14",
+          "dauer_h": 24.0,
+          "land": "Japan - Tokyo",
+          "betrag": 50
+        },
+        {
+          "datum": "2025-02-15",
+          "dauer_h": 20.25,
+          "land": "Japan - Tokyo",
+          "betrag": 33
+        }
+      ],
+      "tour_size": 4,
+      "tour_summe": 147
+    },
+    {
+      "tour_num": 7,
+      "start_date": "2025-03-16",
+      "end_date": "2025-03-16",
+      "start_time": "04:45",
+      "end_time": "15:50",
+      "tage": [
+        {
+          "datum": "2025-03-16",
+          "dauer_h": 11.083333333333334,
+          "land": "Norwegen",
+          "betrag": 50
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 50
+    },
+    {
+      "tour_num": 8,
+      "start_date": "2025-03-17",
+      "end_date": "2025-03-17",
+      "start_time": "07:30",
+      "end_time": "19:11",
+      "tage": [
+        {
+          "datum": "2025-03-17",
+          "dauer_h": 11.683333333333334,
+          "land": "Schweiz - Genf",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 44
+    },
+    {
+      "tour_num": 9,
+      "start_date": "2025-03-18",
+      "end_date": "2025-03-18",
+      "start_time": "08:20",
+      "end_time": "18:40",
+      "tage": [
+        {
+          "datum": "2025-03-18",
+          "dauer_h": 10.333333333333334,
+          "land": "Deutschland",
+          "betrag": 14
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 14
+    },
+    {
+      "tour_num": 10,
+      "start_date": "2025-03-19",
+      "end_date": "2025-03-19",
+      "start_time": "07:50",
+      "end_time": "17:40",
+      "tage": [
+        {
+          "datum": "2025-03-19",
+          "dauer_h": 9.833333333333334,
+          "land": "Deutschland",
+          "betrag": 14
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 14
+    },
+    {
+      "tour_num": 11,
+      "start_date": "2025-03-23",
+      "end_date": "2025-03-25",
+      "start_time": "08:25",
+      "end_time": "06:34",
+      "tage": [
+        {
+          "datum": "2025-03-23",
+          "dauer_h": 15.583333333333334,
+          "land": "Vereinigte Staaten von Amerika (USA) - Boston",
+          "betrag": 42
+        },
+        {
+          "datum": "2025-03-24",
+          "dauer_h": 24.0,
+          "land": "Vereinigte Staaten von Amerika (USA) - Boston",
+          "betrag": 63
+        },
+        {
+          "datum": "2025-03-25",
+          "dauer_h": 6.566666666666666,
+          "land": "Vereinigte Staaten von Amerika (USA) - Boston",
+          "betrag": 42
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 147
+    },
+    {
+      "tour_num": 12,
+      "start_date": "2025-03-28",
+      "end_date": "2025-03-28",
+      "start_time": "07:50",
+      "end_time": "13:10",
+      "tage": [
+        {
+          "datum": "2025-03-28",
+          "dauer_h": 5.333333333333333,
+          "land": "-",
+          "betrag": 0
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 0
+    },
+    {
+      "tour_num": 13,
+      "start_date": "2025-03-29",
+      "end_date": "2025-04-01",
+      "start_time": "09:45",
+      "end_time": "09:34",
+      "tage": [
+        {
+          "datum": "2025-03-29",
+          "dauer_h": 14.25,
+          "land": "Deutschland",
+          "betrag": 14
+        },
+        {
+          "datum": "2025-03-30",
+          "dauer_h": 23.0,
+          "land": "Indien - Mumbai",
+          "betrag": 36
+        },
+        {
+          "datum": "2025-03-31",
+          "dauer_h": 24.0,
+          "land": "Indien - Mumbai",
+          "betrag": 53
+        },
+        {
+          "datum": "2025-04-01",
+          "dauer_h": 9.566666666666666,
+          "land": "Indien - Mumbai",
+          "betrag": 36
+        }
+      ],
+      "tour_size": 4,
+      "tour_summe": 139
+    },
+    {
+      "tour_num": 14,
+      "start_date": "2025-04-08",
+      "end_date": "2025-04-11",
+      "start_time": "13:00",
+      "end_time": "19:51",
+      "tage": [
+        {
+          "datum": "2025-04-08",
+          "dauer_h": 11.0,
+          "land": "Deutschland",
+          "betrag": 14
+        },
+        {
+          "datum": "2025-04-09",
+          "dauer_h": 24.0,
+          "land": "Republik Korea",
+          "betrag": 48
+        },
+        {
+          "datum": "2025-04-10",
+          "dauer_h": 24.0,
+          "land": "Republik Korea",
+          "betrag": 48
+        },
+        {
+          "datum": "2025-04-11",
+          "dauer_h": 19.85,
+          "land": "Republik Korea",
+          "betrag": 32
+        }
+      ],
+      "tour_size": 4,
+      "tour_summe": 142
+    },
+    {
+      "tour_num": 15,
+      "start_date": "2025-04-16",
+      "end_date": "2025-04-18",
+      "start_time": "11:50",
+      "end_time": "06:39",
+      "tage": [
+        {
+          "datum": "2025-04-16",
+          "dauer_h": 12.166666666666666,
+          "land": "Iran",
+          "betrag": 22
+        },
+        {
+          "datum": "2025-04-17",
+          "dauer_h": 24.0,
+          "land": "Iran",
+          "betrag": 33
+        },
+        {
+          "datum": "2025-04-18",
+          "dauer_h": 6.65,
+          "land": "Iran",
+          "betrag": 22
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 77
+    },
+    {
+      "tour_num": 16,
+      "start_date": "2025-04-23",
+      "end_date": "2025-04-26",
+      "start_time": "13:00",
+      "end_time": "20:01",
+      "tage": [
+        {
+          "datum": "2025-04-23",
+          "dauer_h": 11.0,
+          "land": "Deutschland",
+          "betrag": 14
+        },
+        {
+          "datum": "2025-04-24",
+          "dauer_h": 24.0,
+          "land": "Republik Korea",
+          "betrag": 48
+        },
+        {
+          "datum": "2025-04-25",
+          "dauer_h": 24.0,
+          "land": "Republik Korea",
+          "betrag": 48
+        },
+        {
+          "datum": "2025-04-26",
+          "dauer_h": 20.016666666666666,
+          "land": "Republik Korea",
+          "betrag": 32
+        }
+      ],
+      "tour_size": 4,
+      "tour_summe": 142
+    },
+    {
+      "tour_num": 17,
+      "start_date": "2025-05-01",
+      "end_date": "2025-05-03",
+      "start_time": "05:00",
+      "end_time": "16:25",
+      "tage": [
+        {
+          "datum": "2025-05-01",
+          "dauer_h": 19.0,
+          "land": "Polen - Krakau",
+          "betrag": 23
+        },
+        {
+          "datum": "2025-05-02",
+          "dauer_h": 24.0,
+          "land": "Tschechische Republik",
+          "betrag": 32
+        },
+        {
+          "datum": "2025-05-03",
+          "dauer_h": 16.416666666666668,
+          "land": "Tunesien",
+          "betrag": 27
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 82
+    },
+    {
+      "tour_num": 18,
+      "start_date": "2025-05-06",
+      "end_date": "2025-05-08",
+      "start_time": "08:20",
+      "end_time": "09:03",
+      "tage": [
+        {
+          "datum": "2025-05-06",
+          "dauer_h": 15.666666666666666,
+          "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+          "betrag": 44
+        },
+        {
+          "datum": "2025-05-07",
+          "dauer_h": 24.0,
+          "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+          "betrag": 65
+        },
+        {
+          "datum": "2025-05-08",
+          "dauer_h": 9.05,
+          "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 153
+    },
+    {
+      "tour_num": 19,
+      "start_date": "2025-05-13",
+      "end_date": "2025-05-13",
+      "start_time": "09:15",
+      "end_time": "20:46",
+      "tage": [
+        {
+          "datum": "2025-05-13",
+          "dauer_h": 11.516666666666667,
+          "land": "Island",
+          "betrag": 41
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 41
+    },
+    {
+      "tour_num": 20,
+      "start_date": "2025-05-14",
+      "end_date": "2025-05-17",
+      "start_time": "08:15",
+      "end_time": "10:29",
+      "tage": [
+        {
+          "datum": "2025-05-14",
+          "dauer_h": 15.75,
+          "land": "Vereinigte Staaten von Amerika (USA)",
+          "betrag": 40
+        },
+        {
+          "datum": "2025-05-15",
+          "dauer_h": 24.0,
+          "land": "Vereinigte Staaten von Amerika (USA)",
+          "betrag": 59
+        },
+        {
+          "datum": "2025-05-16",
+          "dauer_h": 24.0,
+          "land": "Vereinigte Staaten von Amerika (USA)",
+          "betrag": 59
+        },
+        {
+          "datum": "2025-05-17",
+          "dauer_h": 10.483333333333333,
+          "land": "Vereinigte Staaten von Amerika (USA)",
+          "betrag": 40
+        }
+      ],
+      "tour_size": 4,
+      "tour_summe": 198
+    },
+    {
+      "tour_num": 21,
+      "start_date": "2025-05-26",
+      "end_date": "2025-05-28",
+      "start_time": "14:50",
+      "end_time": "15:26",
+      "tage": [
+        {
+          "datum": "2025-05-26",
+          "dauer_h": 9.166666666666666,
+          "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+          "betrag": 44
+        },
+        {
+          "datum": "2025-05-27",
+          "dauer_h": 24.0,
+          "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+          "betrag": 65
+        },
+        {
+          "datum": "2025-05-28",
+          "dauer_h": 15.433333333333334,
+          "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 153
+    },
+    {
+      "tour_num": 22,
+      "start_date": "2025-06-04",
+      "end_date": "2025-06-04",
+      "start_time": "07:20",
+      "end_time": "13:10",
+      "tage": [
+        {
+          "datum": "2025-06-04",
+          "dauer_h": 5.833333333333333,
+          "land": "-",
+          "betrag": 0
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 0
+    },
+    {
+      "tour_num": 23,
+      "start_date": "2025-06-07",
+      "end_date": "2025-06-11",
+      "start_time": "19:25",
+      "end_time": "07:40",
+      "tage": [
+        {
+          "datum": "2025-06-07",
+          "dauer_h": 4.583333333333333,
+          "land": "Deutschland",
+          "betrag": 14
+        },
+        {
+          "datum": "2025-06-08",
+          "dauer_h": 24.0,
+          "land": "Singapur",
+          "betrag": 71
+        },
+        {
+          "datum": "2025-06-09",
+          "dauer_h": 24.0,
+          "land": "Singapur",
+          "betrag": 71
+        },
+        {
+          "datum": "2025-06-10",
+          "dauer_h": 24.0,
+          "land": "Singapur",
+          "betrag": 71
+        },
+        {
+          "datum": "2025-06-11",
+          "dauer_h": 7.666666666666667,
+          "land": "Singapur",
+          "betrag": 48
+        }
+      ],
+      "tour_size": 5,
+      "tour_summe": 275
+    },
+    {
+      "tour_num": 24,
+      "start_date": "2025-06-17",
+      "end_date": "2025-06-18",
+      "start_time": "15:40",
+      "end_time": "18:12",
+      "tage": [
+        {
+          "datum": "2025-06-17",
+          "dauer_h": 8.333333333333334,
+          "land": "Kroatien",
+          "betrag": 31
+        },
+        {
+          "datum": "2025-06-18",
+          "dauer_h": 18.2,
+          "land": "Kroatien",
+          "betrag": 31
+        }
+      ],
+      "tour_size": 2,
+      "tour_summe": 62
+    },
+    {
+      "tour_num": 25,
+      "start_date": "2025-06-21",
+      "end_date": "2025-06-25",
+      "start_time": "14:10",
+      "end_time": "22:17",
+      "tage": [
+        {
+          "datum": "2025-06-21",
+          "dauer_h": 9.833333333333334,
+          "land": "Schweden",
+          "betrag": 44
+        },
+        {
+          "datum": "2025-06-22",
+          "dauer_h": 24.0,
+          "land": "Schweden",
+          "betrag": 66
+        },
+        {
+          "datum": "2025-06-23",
+          "dauer_h": 24.0,
+          "land": "Spanien - Madrid",
+          "betrag": 42
+        },
+        {
+          "datum": "2025-06-24",
+          "dauer_h": 24.0,
+          "land": "Spanien - Madrid",
+          "betrag": 42
+        },
+        {
+          "datum": "2025-06-25",
+          "dauer_h": 22.283333333333335,
+          "land": "Vereinigtes Königreich",
+          "betrag": 35
+        }
+      ],
+      "tour_size": 5,
+      "tour_summe": 229
+    },
+    {
+      "tour_num": 26,
+      "start_date": "2025-06-30",
+      "end_date": "2025-07-02",
+      "start_time": "05:00",
+      "end_time": "14:09",
+      "tage": [
+        {
+          "datum": "2025-06-30",
+          "dauer_h": 19.0,
+          "land": "Italien",
+          "betrag": 28
+        },
+        {
+          "datum": "2025-07-01",
+          "dauer_h": 24.0,
+          "land": "Rumänien - Bukarest",
+          "betrag": 32
+        },
+        {
+          "datum": "2025-07-02",
+          "dauer_h": 14.15,
+          "land": "Vereinigtes Königreich - London",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 104
+    },
+    {
+      "tour_num": 27,
+      "start_date": "2025-07-06",
+      "end_date": "2025-07-09",
+      "start_time": "08:15",
+      "end_time": "10:07",
+      "tage": [
+        {
+          "datum": "2025-07-06",
+          "dauer_h": 15.75,
+          "land": "Vereinigte Staaten von Amerika (USA)",
+          "betrag": 40
+        },
+        {
+          "datum": "2025-07-07",
+          "dauer_h": 24.0,
+          "land": "Vereinigte Staaten von Amerika (USA)",
+          "betrag": 59
+        },
+        {
+          "datum": "2025-07-08",
+          "dauer_h": 24.0,
+          "land": "Vereinigte Staaten von Amerika (USA)",
+          "betrag": 59
+        },
+        {
+          "datum": "2025-07-09",
+          "dauer_h": 10.116666666666667,
+          "land": "Vereinigte Staaten von Amerika (USA)",
+          "betrag": 40
+        }
+      ],
+      "tour_size": 4,
+      "tour_summe": 198
+    },
+    {
+      "tour_num": 28,
+      "start_date": "2025-07-20",
+      "end_date": "2025-07-22",
+      "start_time": "10:20",
+      "end_time": "21:18",
+      "tage": [
+        {
+          "datum": "2025-07-20",
+          "dauer_h": 13.666666666666666,
+          "land": "Dänemark",
+          "betrag": 50
+        },
+        {
+          "datum": "2025-07-21",
+          "dauer_h": 24.0,
+          "land": "Spanien - Barcelona",
+          "betrag": 34
+        },
+        {
+          "datum": "2025-07-22",
+          "dauer_h": 21.3,
+          "land": "Spanien - Barcelona",
+          "betrag": 23
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 107
+    },
+    {
+      "tour_num": 29,
+      "start_date": "2025-07-23",
+      "end_date": "2025-07-23",
+      "start_time": "14:13",
+      "end_time": "22:19",
+      "tage": [
+        {
+          "datum": "2025-07-23",
+          "dauer_h": 8.1,
+          "land": "Schweden",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 44
+    },
+    {
+      "tour_num": 30,
+      "start_date": "2025-07-28",
+      "end_date": "2025-08-01",
+      "start_time": "11:55",
+      "end_time": "14:06",
+      "tage": [
+        {
+          "datum": "2025-07-28",
+          "dauer_h": 12.083333333333334,
+          "land": "Vereinigtes Königreich - London",
+          "betrag": 44
+        },
+        {
+          "datum": "2025-07-29",
+          "dauer_h": 24.0,
+          "land": "Lettland",
+          "betrag": 35
+        },
+        {
+          "datum": "2025-07-30",
+          "dauer_h": 24.0,
+          "land": "Polen - Krakau",
+          "betrag": 34
+        },
+        {
+          "datum": "2025-07-31",
+          "dauer_h": 24.0,
+          "land": "Polen - Krakau",
+          "betrag": 34
+        },
+        {
+          "datum": "2025-08-01",
+          "dauer_h": 14.1,
+          "land": "Deutschland",
+          "betrag": 14
+        }
+      ],
+      "tour_size": 5,
+      "tour_summe": 161
+    },
+    {
+      "tour_num": 31,
+      "start_date": "2025-08-05",
+      "end_date": "2025-08-05",
+      "start_time": "09:15",
+      "end_time": "20:42",
+      "tage": [
+        {
+          "datum": "2025-08-05",
+          "dauer_h": 11.45,
+          "land": "Island",
+          "betrag": 41
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 41
+    },
+    {
+      "tour_num": 32,
+      "start_date": "2025-08-06",
+      "end_date": "2025-08-06",
+      "start_time": "09:20",
+      "end_time": "19:40",
+      "tage": [
+        {
+          "datum": "2025-08-06",
+          "dauer_h": 10.333333333333334,
+          "land": "Deutschland",
+          "betrag": 14
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 14
+    },
+    {
+      "tour_num": 33,
+      "start_date": "2025-08-18",
+      "end_date": "2025-08-18",
+      "start_time": "08:00",
+      "end_time": "20:50",
+      "tage": [
+        {
+          "datum": "2025-08-18",
+          "dauer_h": 12.833333333333334,
+          "land": "Ägypten",
+          "betrag": 33
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 33
+    },
+    {
+      "tour_num": 34,
+      "start_date": "2025-08-20",
+      "end_date": "2025-08-22",
+      "start_time": "15:55",
+      "end_time": "06:34",
+      "tage": [
+        {
+          "datum": "2025-08-20",
+          "dauer_h": 8.083333333333334,
+          "land": "Israel",
+          "betrag": 44
+        },
+        {
+          "datum": "2025-08-21",
+          "dauer_h": 24.0,
+          "land": "Zypern",
+          "betrag": 42
+        },
+        {
+          "datum": "2025-08-22",
+          "dauer_h": 6.566666666666666,
+          "land": "Zypern",
+          "betrag": 28
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 114
+    },
+    {
+      "tour_num": 35,
+      "start_date": "2025-08-27",
+      "end_date": "2025-08-28",
+      "start_time": "05:00",
+      "end_time": "16:12",
+      "tage": [
+        {
+          "datum": "2025-08-27",
+          "dauer_h": 19.0,
+          "land": "Schweden",
+          "betrag": 44
+        },
+        {
+          "datum": "2025-08-28",
+          "dauer_h": 16.2,
+          "land": "Norwegen",
+          "betrag": 50
+        }
+      ],
+      "tour_size": 2,
+      "tour_summe": 94
+    },
+    {
+      "tour_num": 36,
+      "start_date": "2025-08-29",
+      "end_date": "2025-08-29",
+      "start_time": "08:00",
+      "end_time": "21:04",
+      "tage": [
+        {
+          "datum": "2025-08-29",
+          "dauer_h": 13.066666666666666,
+          "land": "Ägypten",
+          "betrag": 33
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 33
+    },
+    {
+      "tour_num": 37,
+      "start_date": "2025-09-11",
+      "end_date": "2025-09-14",
+      "start_time": "09:45",
+      "end_time": "17:15",
+      "tage": [
+        {
+          "datum": "2025-09-11",
+          "dauer_h": 14.25,
+          "land": "Nordmazedonien",
+          "betrag": 18
+        },
+        {
+          "datum": "2025-09-12",
+          "dauer_h": 24.0,
+          "land": "Spanien - Madrid",
+          "betrag": 42
+        },
+        {
+          "datum": "2025-09-13",
+          "dauer_h": 24.0,
+          "land": "Portugal",
+          "betrag": 32
+        },
+        {
+          "datum": "2025-09-14",
+          "dauer_h": 17.25,
+          "land": "Vereinigtes Königreich - London",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 4,
+      "tour_summe": 136
+    },
+    {
+      "tour_num": 38,
+      "start_date": "2025-09-20",
+      "end_date": "2025-09-20",
+      "start_time": "07:10",
+      "end_time": "16:10",
+      "tage": [
+        {
+          "datum": "2025-09-20",
+          "dauer_h": 9.0,
+          "land": "Deutschland",
+          "betrag": 14
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 14
+    },
+    {
+      "tour_num": 39,
+      "start_date": "2025-09-26",
+      "end_date": "2025-09-28",
+      "start_time": "06:00",
+      "end_time": "12:49",
+      "tage": [
+        {
+          "datum": "2025-09-26",
+          "dauer_h": 18.0,
+          "land": "Bulgarien",
+          "betrag": 15
+        },
+        {
+          "datum": "2025-09-27",
+          "dauer_h": 24.0,
+          "land": "Deutschland",
+          "betrag": 28
+        },
+        {
+          "datum": "2025-09-28",
+          "dauer_h": 12.816666666666666,
+          "land": "Schweden",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 87
+    },
+    {
+      "tour_num": 40,
+      "start_date": "2025-10-02",
+      "end_date": "2025-10-03",
+      "start_time": "12:35",
+      "end_time": "22:04",
+      "tage": [
+        {
+          "datum": "2025-10-02",
+          "dauer_h": 11.416666666666666,
+          "land": "Bulgarien",
+          "betrag": 15
+        },
+        {
+          "datum": "2025-10-03",
+          "dauer_h": 22.066666666666666,
+          "land": "Italien",
+          "betrag": 28
+        }
+      ],
+      "tour_size": 2,
+      "tour_summe": 43
+    },
+    {
+      "tour_num": 41,
+      "start_date": "2025-10-05",
+      "end_date": "2025-10-08",
+      "start_time": "13:00",
+      "end_time": "19:38",
+      "tage": [
+        {
+          "datum": "2025-10-05",
+          "dauer_h": 11.0,
+          "land": "Deutschland",
+          "betrag": 14
+        },
+        {
+          "datum": "2025-10-06",
+          "dauer_h": 24.0,
+          "land": "Republik Korea",
+          "betrag": 48
+        },
+        {
+          "datum": "2025-10-07",
+          "dauer_h": 24.0,
+          "land": "Republik Korea",
+          "betrag": 48
+        },
+        {
+          "datum": "2025-10-08",
+          "dauer_h": 19.633333333333333,
+          "land": "Republik Korea",
+          "betrag": 32
+        }
+      ],
+      "tour_size": 4,
+      "tour_summe": 142
+    },
+    {
+      "tour_num": 42,
+      "start_date": "2025-10-15",
+      "end_date": "2025-10-16",
+      "start_time": "07:20",
+      "end_time": "22:04",
+      "tage": [
+        {
+          "datum": "2025-10-15",
+          "dauer_h": 16.666666666666668,
+          "land": "Frankreich",
+          "betrag": 36
+        },
+        {
+          "datum": "2025-10-16",
+          "dauer_h": 22.066666666666666,
+          "land": "Spanien",
+          "betrag": 23
+        }
+      ],
+      "tour_size": 2,
+      "tour_summe": 59
+    },
+    {
+      "tour_num": 43,
+      "start_date": "2025-10-20",
+      "end_date": "2025-10-21",
+      "start_time": "16:55",
+      "end_time": "21:57",
+      "tage": [
+        {
+          "datum": "2025-10-20",
+          "dauer_h": 7.083333333333333,
+          "land": "Deutschland",
+          "betrag": 14
+        },
+        {
+          "datum": "2025-10-21",
+          "dauer_h": 21.95,
+          "land": "Spanien",
+          "betrag": 23
+        }
+      ],
+      "tour_size": 2,
+      "tour_summe": 37
+    },
+    {
+      "tour_num": 44,
+      "start_date": "2025-10-23",
+      "end_date": "2025-10-25",
+      "start_time": "20:10",
+      "end_time": "23:28",
+      "tage": [
+        {
+          "datum": "2025-10-23",
+          "dauer_h": 3.8333333333333335,
+          "land": "Deutschland",
+          "betrag": 14
+        },
+        {
+          "datum": "2025-10-24",
+          "dauer_h": 24.0,
+          "land": "Vereinigtes Königreich - London",
+          "betrag": 66
+        },
+        {
+          "datum": "2025-10-25",
+          "dauer_h": 23.466666666666665,
+          "land": "Vereinigtes Königreich - London",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 124
+    },
+    {
+      "tour_num": 45,
+      "start_date": "2025-10-31",
+      "end_date": "2025-10-31",
+      "start_time": "07:00",
+      "end_time": "19:10",
+      "tage": [
+        {
+          "datum": "2025-10-31",
+          "dauer_h": 12.166666666666666,
+          "land": "Vereinigtes Königreich - London",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 44
+    },
+    {
+      "tour_num": 46,
+      "start_date": "2025-11-01",
+      "end_date": "2025-11-03",
+      "start_time": "13:40",
+      "end_time": "20:55",
+      "tage": [
+        {
+          "datum": "2025-11-01",
+          "dauer_h": 10.333333333333334,
+          "land": "Schweden",
+          "betrag": 44
+        },
+        {
+          "datum": "2025-11-02",
+          "dauer_h": 24.0,
+          "land": "Schweden",
+          "betrag": 66
+        },
+        {
+          "datum": "2025-11-03",
+          "dauer_h": 20.916666666666668,
+          "land": "Schweden",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 154
+    },
+    {
+      "tour_num": 47,
+      "start_date": "2025-11-07",
+      "end_date": "2025-11-09",
+      "start_time": "05:50",
+      "end_time": "17:15",
+      "tage": [
+        {
+          "datum": "2025-11-07",
+          "dauer_h": 18.166666666666668,
+          "land": "Griechenland - Athen",
+          "betrag": 27
+        },
+        {
+          "datum": "2025-11-08",
+          "dauer_h": 24.0,
+          "land": "Litauen",
+          "betrag": 26
+        },
+        {
+          "datum": "2025-11-09",
+          "dauer_h": 17.25,
+          "land": "Litauen",
+          "betrag": 17
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 70
+    },
+    {
+      "tour_num": 48,
+      "start_date": "2025-11-17",
+      "end_date": "2025-11-18",
+      "start_time": "19:05",
+      "end_time": "16:03",
+      "tage": [
+        {
+          "datum": "2025-11-17",
+          "dauer_h": 4.916666666666667,
+          "land": "Norwegen",
+          "betrag": 50
+        },
+        {
+          "datum": "2025-11-18",
+          "dauer_h": 16.05,
+          "land": "Norwegen",
+          "betrag": 50
+        }
+      ],
+      "tour_size": 2,
+      "tour_summe": 100
+    },
+    {
+      "tour_num": 49,
+      "start_date": "2025-11-20",
+      "end_date": "2025-11-22",
+      "start_time": "07:45",
+      "end_time": "09:19",
+      "tage": [
+        {
+          "datum": "2025-11-20",
+          "dauer_h": 16.25,
+          "land": "Vereinigte Staaten von Amerika (USA) - Miami",
+          "betrag": 44
+        },
+        {
+          "datum": "2025-11-21",
+          "dauer_h": 24.0,
+          "land": "Vereinigte Staaten von Amerika (USA) - Miami",
+          "betrag": 65
+        },
+        {
+          "datum": "2025-11-22",
+          "dauer_h": 9.316666666666666,
+          "land": "Vereinigte Staaten von Amerika (USA) - Miami",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 153
+    },
+    {
+      "tour_num": 50,
+      "start_date": "2025-12-09",
+      "end_date": "2025-12-11",
+      "start_time": "05:40",
+      "end_time": "17:58",
+      "tage": [
+        {
+          "datum": "2025-12-09",
+          "dauer_h": 18.333333333333332,
+          "land": "Italien - Mailand",
+          "betrag": 28
+        },
+        {
+          "datum": "2025-12-10",
+          "dauer_h": 24.0,
+          "land": "Tschechische Republik",
+          "betrag": 32
+        },
+        {
+          "datum": "2025-12-11",
+          "dauer_h": 17.966666666666665,
+          "land": "Malta",
+          "betrag": 31
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 91
+    },
+    {
+      "tour_num": 51,
+      "start_date": "2025-12-14",
+      "end_date": "2025-12-14",
+      "start_time": "08:30",
+      "end_time": "21:54",
+      "tage": [
+        {
+          "datum": "2025-12-14",
+          "dauer_h": 13.4,
+          "land": "Irland",
+          "betrag": 39
+        }
+      ],
+      "tour_size": 1,
+      "tour_summe": 39
+    },
+    {
+      "tour_num": 52,
+      "start_date": "2025-12-25",
+      "end_date": "2025-12-26",
+      "start_time": "08:15",
+      "end_time": "16:55",
+      "tage": [
+        {
+          "datum": "2025-12-25",
+          "dauer_h": 15.75,
+          "land": "Italien - Rom",
+          "betrag": 32
+        },
+        {
+          "datum": "2025-12-26",
+          "dauer_h": 16.916666666666668,
+          "land": "Norwegen",
+          "betrag": 50
+        }
+      ],
+      "tour_size": 2,
+      "tour_summe": 82
+    },
+    {
+      "tour_num": 53,
+      "start_date": "2025-12-27",
+      "end_date": "2025-12-29",
+      "start_time": "15:50",
+      "end_time": "10:22",
+      "tage": [
+        {
+          "datum": "2025-12-27",
+          "dauer_h": 8.166666666666666,
+          "land": "Israel",
+          "betrag": 44
+        },
+        {
+          "datum": "2025-12-28",
+          "dauer_h": 24.0,
+          "land": "Israel",
+          "betrag": 66
+        },
+        {
+          "datum": "2025-12-29",
+          "dauer_h": 10.366666666666667,
+          "land": "Israel",
+          "betrag": 44
+        }
+      ],
+      "tour_size": 3,
+      "tour_summe": 154
+    }
+  ],
+  "day_classification": {
+    "2025-01-03": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 13.75,
+      "tour_num": 1,
+      "tour_size": 4,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-01-04": {
+      "klass": "Z76",
+      "land": "Indien - Bangalore",
+      "betrag": 42,
+      "dauer_h": 24.0,
+      "tour_num": 1,
+      "tour_size": 4,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-01-05": {
+      "klass": "Z76",
+      "land": "Indien - Bangalore",
+      "betrag": 42,
+      "dauer_h": 24.0,
+      "tour_num": 1,
+      "tour_size": 4,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-01-06": {
+      "klass": "Z76",
+      "land": "Indien - Bangalore",
+      "betrag": 28,
+      "dauer_h": 11.516666666666667,
+      "tour_num": 1,
+      "tour_size": 4,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-01-10": {
+      "klass": "NO_VMA",
+      "land": "-",
+      "betrag": 0,
+      "dauer_h": 5.333333333333333,
+      "tour_num": 2,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-01-11": {
+      "klass": "Z76",
+      "land": "Dänemark",
+      "betrag": 50,
+      "dauer_h": 11.1,
+      "tour_num": 3,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-01-18": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 4.666666666666667,
+      "tour_num": 4,
+      "tour_size": 5,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-01-19": {
+      "klass": "Z76",
+      "land": "China - Hong Kong",
+      "betrag": 71,
+      "dauer_h": 24.0,
+      "tour_num": 4,
+      "tour_size": 5,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-01-20": {
+      "klass": "Z76",
+      "land": "China - Hong Kong",
+      "betrag": 71,
+      "dauer_h": 24.0,
+      "tour_num": 4,
+      "tour_size": 5,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-01-21": {
+      "klass": "Z76",
+      "land": "China - Hong Kong",
+      "betrag": 71,
+      "dauer_h": 24.0,
+      "tour_num": 4,
+      "tour_size": 5,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-01-22": {
+      "klass": "Z76",
+      "land": "China - Hong Kong",
+      "betrag": 48,
+      "dauer_h": 7.516666666666667,
+      "tour_num": 4,
+      "tour_size": 5,
+      "position_in_tour": 5,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-02-10": {
+      "klass": "Z72",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 9.25,
+      "tour_num": 5,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-02-12": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 12.416666666666666,
+      "tour_num": 6,
+      "tour_size": 4,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-02-13": {
+      "klass": "Z76",
+      "land": "Japan - Tokyo",
+      "betrag": 50,
+      "dauer_h": 24.0,
+      "tour_num": 6,
+      "tour_size": 4,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-02-14": {
+      "klass": "Z76",
+      "land": "Japan - Tokyo",
+      "betrag": 50,
+      "dauer_h": 24.0,
+      "tour_num": 6,
+      "tour_size": 4,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-02-15": {
+      "klass": "Z76",
+      "land": "Japan - Tokyo",
+      "betrag": 33,
+      "dauer_h": 20.25,
+      "tour_num": 6,
+      "tour_size": 4,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-03-16": {
+      "klass": "Z76",
+      "land": "Norwegen",
+      "betrag": 50,
+      "dauer_h": 11.083333333333334,
+      "tour_num": 7,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-03-17": {
+      "klass": "Z76",
+      "land": "Schweiz - Genf",
+      "betrag": 44,
+      "dauer_h": 11.683333333333334,
+      "tour_num": 8,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-03-18": {
+      "klass": "Z72",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 10.333333333333334,
+      "tour_num": 9,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-03-19": {
+      "klass": "Z72",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 9.833333333333334,
+      "tour_num": 10,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-03-23": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Boston",
+      "betrag": 42,
+      "dauer_h": 15.583333333333334,
+      "tour_num": 11,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-03-24": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Boston",
+      "betrag": 63,
+      "dauer_h": 24.0,
+      "tour_num": 11,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-03-25": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Boston",
+      "betrag": 42,
+      "dauer_h": 6.566666666666666,
+      "tour_num": 11,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-03-28": {
+      "klass": "NO_VMA",
+      "land": "-",
+      "betrag": 0,
+      "dauer_h": 5.333333333333333,
+      "tour_num": 12,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-03-29": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 14.25,
+      "tour_num": 13,
+      "tour_size": 4,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-03-30": {
+      "klass": "Z76",
+      "land": "Indien - Mumbai",
+      "betrag": 36,
+      "dauer_h": 23.0,
+      "tour_num": 13,
+      "tour_size": 4,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-03-31": {
+      "klass": "Z76",
+      "land": "Indien - Mumbai",
+      "betrag": 53,
+      "dauer_h": 24.0,
+      "tour_num": 13,
+      "tour_size": 4,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-04-01": {
+      "klass": "Z76",
+      "land": "Indien - Mumbai",
+      "betrag": 36,
+      "dauer_h": 9.566666666666666,
+      "tour_num": 13,
+      "tour_size": 4,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-04-08": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 11.0,
+      "tour_num": 14,
+      "tour_size": 4,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-04-09": {
+      "klass": "Z76",
+      "land": "Republik Korea",
+      "betrag": 48,
+      "dauer_h": 24.0,
+      "tour_num": 14,
+      "tour_size": 4,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-04-10": {
+      "klass": "Z76",
+      "land": "Republik Korea",
+      "betrag": 48,
+      "dauer_h": 24.0,
+      "tour_num": 14,
+      "tour_size": 4,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-04-11": {
+      "klass": "Z76",
+      "land": "Republik Korea",
+      "betrag": 32,
+      "dauer_h": 19.85,
+      "tour_num": 14,
+      "tour_size": 4,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-04-16": {
+      "klass": "Z76",
+      "land": "Iran",
+      "betrag": 22,
+      "dauer_h": 12.166666666666666,
+      "tour_num": 15,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-04-17": {
+      "klass": "Z76",
+      "land": "Iran",
+      "betrag": 33,
+      "dauer_h": 24.0,
+      "tour_num": 15,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-04-18": {
+      "klass": "Z76",
+      "land": "Iran",
+      "betrag": 22,
+      "dauer_h": 6.65,
+      "tour_num": 15,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-04-23": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 11.0,
+      "tour_num": 16,
+      "tour_size": 4,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-04-24": {
+      "klass": "Z76",
+      "land": "Republik Korea",
+      "betrag": 48,
+      "dauer_h": 24.0,
+      "tour_num": 16,
+      "tour_size": 4,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-04-25": {
+      "klass": "Z76",
+      "land": "Republik Korea",
+      "betrag": 48,
+      "dauer_h": 24.0,
+      "tour_num": 16,
+      "tour_size": 4,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-04-26": {
+      "klass": "Z76",
+      "land": "Republik Korea",
+      "betrag": 32,
+      "dauer_h": 20.016666666666666,
+      "tour_num": 16,
+      "tour_size": 4,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-05-01": {
+      "klass": "Z76",
+      "land": "Polen - Krakau",
+      "betrag": 23,
+      "dauer_h": 19.0,
+      "tour_num": 17,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-05-02": {
+      "klass": "Z76",
+      "land": "Tschechische Republik",
+      "betrag": 32,
+      "dauer_h": 24.0,
+      "tour_num": 17,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-05-03": {
+      "klass": "Z76",
+      "land": "Tunesien",
+      "betrag": 27,
+      "dauer_h": 16.416666666666668,
+      "tour_num": 17,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-05-06": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+      "betrag": 44,
+      "dauer_h": 15.666666666666666,
+      "tour_num": 18,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-05-07": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+      "betrag": 65,
+      "dauer_h": 24.0,
+      "tour_num": 18,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-05-08": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+      "betrag": 44,
+      "dauer_h": 9.05,
+      "tour_num": 18,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-05-13": {
+      "klass": "Z76",
+      "land": "Island",
+      "betrag": 41,
+      "dauer_h": 11.516666666666667,
+      "tour_num": 19,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-05-14": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA)",
+      "betrag": 40,
+      "dauer_h": 15.75,
+      "tour_num": 20,
+      "tour_size": 4,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-05-15": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA)",
+      "betrag": 59,
+      "dauer_h": 24.0,
+      "tour_num": 20,
+      "tour_size": 4,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-05-16": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA)",
+      "betrag": 59,
+      "dauer_h": 24.0,
+      "tour_num": 20,
+      "tour_size": 4,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-05-17": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA)",
+      "betrag": 40,
+      "dauer_h": 10.483333333333333,
+      "tour_num": 20,
+      "tour_size": 4,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-05-26": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+      "betrag": 44,
+      "dauer_h": 9.166666666666666,
+      "tour_num": 21,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-05-27": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+      "betrag": 65,
+      "dauer_h": 24.0,
+      "tour_num": 21,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-05-28": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Chicago",
+      "betrag": 44,
+      "dauer_h": 15.433333333333334,
+      "tour_num": 21,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-06-04": {
+      "klass": "NO_VMA",
+      "land": "-",
+      "betrag": 0,
+      "dauer_h": 5.833333333333333,
+      "tour_num": 22,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-06-07": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 4.583333333333333,
+      "tour_num": 23,
+      "tour_size": 5,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-06-08": {
+      "klass": "Z76",
+      "land": "Singapur",
+      "betrag": 71,
+      "dauer_h": 24.0,
+      "tour_num": 23,
+      "tour_size": 5,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-06-09": {
+      "klass": "Z76",
+      "land": "Singapur",
+      "betrag": 71,
+      "dauer_h": 24.0,
+      "tour_num": 23,
+      "tour_size": 5,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-06-10": {
+      "klass": "Z76",
+      "land": "Singapur",
+      "betrag": 71,
+      "dauer_h": 24.0,
+      "tour_num": 23,
+      "tour_size": 5,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-06-11": {
+      "klass": "Z76",
+      "land": "Singapur",
+      "betrag": 48,
+      "dauer_h": 7.666666666666667,
+      "tour_num": 23,
+      "tour_size": 5,
+      "position_in_tour": 5,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-06-17": {
+      "klass": "Z76",
+      "land": "Kroatien",
+      "betrag": 31,
+      "dauer_h": 8.333333333333334,
+      "tour_num": 24,
+      "tour_size": 2,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-06-18": {
+      "klass": "Z76",
+      "land": "Kroatien",
+      "betrag": 31,
+      "dauer_h": 18.2,
+      "tour_num": 24,
+      "tour_size": 2,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-06-21": {
+      "klass": "Z76",
+      "land": "Schweden",
+      "betrag": 44,
+      "dauer_h": 9.833333333333334,
+      "tour_num": 25,
+      "tour_size": 5,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-06-22": {
+      "klass": "Z76",
+      "land": "Schweden",
+      "betrag": 66,
+      "dauer_h": 24.0,
+      "tour_num": 25,
+      "tour_size": 5,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-06-23": {
+      "klass": "Z76",
+      "land": "Spanien - Madrid",
+      "betrag": 42,
+      "dauer_h": 24.0,
+      "tour_num": 25,
+      "tour_size": 5,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-06-24": {
+      "klass": "Z76",
+      "land": "Spanien - Madrid",
+      "betrag": 42,
+      "dauer_h": 24.0,
+      "tour_num": 25,
+      "tour_size": 5,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-06-25": {
+      "klass": "Z76",
+      "land": "Vereinigtes Königreich",
+      "betrag": 35,
+      "dauer_h": 22.283333333333335,
+      "tour_num": 25,
+      "tour_size": 5,
+      "position_in_tour": 5,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-06-30": {
+      "klass": "Z76",
+      "land": "Italien",
+      "betrag": 28,
+      "dauer_h": 19.0,
+      "tour_num": 26,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-07-01": {
+      "klass": "Z76",
+      "land": "Rumänien - Bukarest",
+      "betrag": 32,
+      "dauer_h": 24.0,
+      "tour_num": 26,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-07-02": {
+      "klass": "Z76",
+      "land": "Vereinigtes Königreich - London",
+      "betrag": 44,
+      "dauer_h": 14.15,
+      "tour_num": 26,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-07-06": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA)",
+      "betrag": 40,
+      "dauer_h": 15.75,
+      "tour_num": 27,
+      "tour_size": 4,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-07-07": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA)",
+      "betrag": 59,
+      "dauer_h": 24.0,
+      "tour_num": 27,
+      "tour_size": 4,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-07-08": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA)",
+      "betrag": 59,
+      "dauer_h": 24.0,
+      "tour_num": 27,
+      "tour_size": 4,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-07-09": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA)",
+      "betrag": 40,
+      "dauer_h": 10.116666666666667,
+      "tour_num": 27,
+      "tour_size": 4,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-07-20": {
+      "klass": "Z76",
+      "land": "Dänemark",
+      "betrag": 50,
+      "dauer_h": 13.666666666666666,
+      "tour_num": 28,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-07-21": {
+      "klass": "Z76",
+      "land": "Spanien - Barcelona",
+      "betrag": 34,
+      "dauer_h": 24.0,
+      "tour_num": 28,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-07-22": {
+      "klass": "Z76",
+      "land": "Spanien - Barcelona",
+      "betrag": 23,
+      "dauer_h": 21.3,
+      "tour_num": 28,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-07-23": {
+      "klass": "Z76",
+      "land": "Schweden",
+      "betrag": 44,
+      "dauer_h": 8.1,
+      "tour_num": 29,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-07-28": {
+      "klass": "Z76",
+      "land": "Vereinigtes Königreich - London",
+      "betrag": 44,
+      "dauer_h": 12.083333333333334,
+      "tour_num": 30,
+      "tour_size": 5,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-07-29": {
+      "klass": "Z76",
+      "land": "Lettland",
+      "betrag": 35,
+      "dauer_h": 24.0,
+      "tour_num": 30,
+      "tour_size": 5,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-07-30": {
+      "klass": "Z76",
+      "land": "Polen - Krakau",
+      "betrag": 34,
+      "dauer_h": 24.0,
+      "tour_num": 30,
+      "tour_size": 5,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-07-31": {
+      "klass": "Z76",
+      "land": "Polen - Krakau",
+      "betrag": 34,
+      "dauer_h": 24.0,
+      "tour_num": 30,
+      "tour_size": 5,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-08-01": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 14.1,
+      "tour_num": 30,
+      "tour_size": 5,
+      "position_in_tour": 5,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-08-05": {
+      "klass": "Z76",
+      "land": "Island",
+      "betrag": 41,
+      "dauer_h": 11.45,
+      "tour_num": 31,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-08-06": {
+      "klass": "Z72",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 10.333333333333334,
+      "tour_num": 32,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-08-18": {
+      "klass": "Z76",
+      "land": "Ägypten",
+      "betrag": 33,
+      "dauer_h": 12.833333333333334,
+      "tour_num": 33,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-08-20": {
+      "klass": "Z76",
+      "land": "Israel",
+      "betrag": 44,
+      "dauer_h": 8.083333333333334,
+      "tour_num": 34,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-08-21": {
+      "klass": "Z76",
+      "land": "Zypern",
+      "betrag": 42,
+      "dauer_h": 24.0,
+      "tour_num": 34,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-08-22": {
+      "klass": "Z76",
+      "land": "Zypern",
+      "betrag": 28,
+      "dauer_h": 6.566666666666666,
+      "tour_num": 34,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-08-27": {
+      "klass": "Z76",
+      "land": "Schweden",
+      "betrag": 44,
+      "dauer_h": 19.0,
+      "tour_num": 35,
+      "tour_size": 2,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-08-28": {
+      "klass": "Z76",
+      "land": "Norwegen",
+      "betrag": 50,
+      "dauer_h": 16.2,
+      "tour_num": 35,
+      "tour_size": 2,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-08-29": {
+      "klass": "Z76",
+      "land": "Ägypten",
+      "betrag": 33,
+      "dauer_h": 13.066666666666666,
+      "tour_num": 36,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-09-11": {
+      "klass": "Z76",
+      "land": "Nordmazedonien",
+      "betrag": 18,
+      "dauer_h": 14.25,
+      "tour_num": 37,
+      "tour_size": 4,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-09-12": {
+      "klass": "Z76",
+      "land": "Spanien - Madrid",
+      "betrag": 42,
+      "dauer_h": 24.0,
+      "tour_num": 37,
+      "tour_size": 4,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-09-13": {
+      "klass": "Z76",
+      "land": "Portugal",
+      "betrag": 32,
+      "dauer_h": 24.0,
+      "tour_num": 37,
+      "tour_size": 4,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-09-14": {
+      "klass": "Z76",
+      "land": "Vereinigtes Königreich - London",
+      "betrag": 44,
+      "dauer_h": 17.25,
+      "tour_num": 37,
+      "tour_size": 4,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-09-20": {
+      "klass": "Z72",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 9.0,
+      "tour_num": 38,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-09-26": {
+      "klass": "Z76",
+      "land": "Bulgarien",
+      "betrag": 15,
+      "dauer_h": 18.0,
+      "tour_num": 39,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-09-27": {
+      "klass": "Z74",
+      "land": "Deutschland",
+      "betrag": 28,
+      "dauer_h": 24.0,
+      "tour_num": 39,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-09-28": {
+      "klass": "Z76",
+      "land": "Schweden",
+      "betrag": 44,
+      "dauer_h": 12.816666666666666,
+      "tour_num": 39,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-10-02": {
+      "klass": "Z76",
+      "land": "Bulgarien",
+      "betrag": 15,
+      "dauer_h": 11.416666666666666,
+      "tour_num": 40,
+      "tour_size": 2,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-10-03": {
+      "klass": "Z76",
+      "land": "Italien",
+      "betrag": 28,
+      "dauer_h": 22.066666666666666,
+      "tour_num": 40,
+      "tour_size": 2,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-10-05": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 11.0,
+      "tour_num": 41,
+      "tour_size": 4,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-10-06": {
+      "klass": "Z76",
+      "land": "Republik Korea",
+      "betrag": 48,
+      "dauer_h": 24.0,
+      "tour_num": 41,
+      "tour_size": 4,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-10-07": {
+      "klass": "Z76",
+      "land": "Republik Korea",
+      "betrag": 48,
+      "dauer_h": 24.0,
+      "tour_num": 41,
+      "tour_size": 4,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-10-08": {
+      "klass": "Z76",
+      "land": "Republik Korea",
+      "betrag": 32,
+      "dauer_h": 19.633333333333333,
+      "tour_num": 41,
+      "tour_size": 4,
+      "position_in_tour": 4,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-10-15": {
+      "klass": "Z76",
+      "land": "Frankreich",
+      "betrag": 36,
+      "dauer_h": 16.666666666666668,
+      "tour_num": 42,
+      "tour_size": 2,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-10-16": {
+      "klass": "Z76",
+      "land": "Spanien",
+      "betrag": 23,
+      "dauer_h": 22.066666666666666,
+      "tour_num": 42,
+      "tour_size": 2,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-10-20": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 7.083333333333333,
+      "tour_num": 43,
+      "tour_size": 2,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-10-21": {
+      "klass": "Z76",
+      "land": "Spanien",
+      "betrag": 23,
+      "dauer_h": 21.95,
+      "tour_num": 43,
+      "tour_size": 2,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-10-23": {
+      "klass": "Z73",
+      "land": "Deutschland",
+      "betrag": 14,
+      "dauer_h": 3.8333333333333335,
+      "tour_num": 44,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-10-24": {
+      "klass": "Z76",
+      "land": "Vereinigtes Königreich - London",
+      "betrag": 66,
+      "dauer_h": 24.0,
+      "tour_num": 44,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-10-25": {
+      "klass": "Z76",
+      "land": "Vereinigtes Königreich - London",
+      "betrag": 44,
+      "dauer_h": 23.466666666666665,
+      "tour_num": 44,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-10-31": {
+      "klass": "Z76",
+      "land": "Vereinigtes Königreich - London",
+      "betrag": 44,
+      "dauer_h": 12.166666666666666,
+      "tour_num": 45,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-11-01": {
+      "klass": "Z76",
+      "land": "Schweden",
+      "betrag": 44,
+      "dauer_h": 10.333333333333334,
+      "tour_num": 46,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-11-02": {
+      "klass": "Z76",
+      "land": "Schweden",
+      "betrag": 66,
+      "dauer_h": 24.0,
+      "tour_num": 46,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-11-03": {
+      "klass": "Z76",
+      "land": "Schweden",
+      "betrag": 44,
+      "dauer_h": 20.916666666666668,
+      "tour_num": 46,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-11-07": {
+      "klass": "Z76",
+      "land": "Griechenland - Athen",
+      "betrag": 27,
+      "dauer_h": 18.166666666666668,
+      "tour_num": 47,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-11-08": {
+      "klass": "Z76",
+      "land": "Litauen",
+      "betrag": 26,
+      "dauer_h": 24.0,
+      "tour_num": 47,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-11-09": {
+      "klass": "Z76",
+      "land": "Litauen",
+      "betrag": 17,
+      "dauer_h": 17.25,
+      "tour_num": 47,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-11-17": {
+      "klass": "Z76",
+      "land": "Norwegen",
+      "betrag": 50,
+      "dauer_h": 4.916666666666667,
+      "tour_num": 48,
+      "tour_size": 2,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-11-18": {
+      "klass": "Z76",
+      "land": "Norwegen",
+      "betrag": 50,
+      "dauer_h": 16.05,
+      "tour_num": 48,
+      "tour_size": 2,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-11-20": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Miami",
+      "betrag": 44,
+      "dauer_h": 16.25,
+      "tour_num": 49,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-11-21": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Miami",
+      "betrag": 65,
+      "dauer_h": 24.0,
+      "tour_num": 49,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-11-22": {
+      "klass": "Z76",
+      "land": "Vereinigte Staaten von Amerika (USA) - Miami",
+      "betrag": 44,
+      "dauer_h": 9.316666666666666,
+      "tour_num": 49,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-12-09": {
+      "klass": "Z76",
+      "land": "Italien - Mailand",
+      "betrag": 28,
+      "dauer_h": 18.333333333333332,
+      "tour_num": 50,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-12-10": {
+      "klass": "Z76",
+      "land": "Tschechische Republik",
+      "betrag": 32,
+      "dauer_h": 24.0,
+      "tour_num": 50,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-12-11": {
+      "klass": "Z76",
+      "land": "Malta",
+      "betrag": 31,
+      "dauer_h": 17.966666666666665,
+      "tour_num": 50,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-12-14": {
+      "klass": "Z76",
+      "land": "Irland",
+      "betrag": 39,
+      "dauer_h": 13.4,
+      "tour_num": 51,
+      "tour_size": 1,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": true
+    },
+    "2025-12-25": {
+      "klass": "Z76",
+      "land": "Italien - Rom",
+      "betrag": 32,
+      "dauer_h": 15.75,
+      "tour_num": 52,
+      "tour_size": 2,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-12-26": {
+      "klass": "Z76",
+      "land": "Norwegen",
+      "betrag": 50,
+      "dauer_h": 16.916666666666668,
+      "tour_num": 52,
+      "tour_size": 2,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": true
+    },
+    "2025-12-27": {
+      "klass": "Z76",
+      "land": "Israel",
+      "betrag": 44,
+      "dauer_h": 8.166666666666666,
+      "tour_num": 53,
+      "tour_size": 3,
+      "position_in_tour": 1,
+      "is_anreise": true,
+      "is_abreise": false
+    },
+    "2025-12-28": {
+      "klass": "Z76",
+      "land": "Israel",
+      "betrag": 66,
+      "dauer_h": 24.0,
+      "tour_num": 53,
+      "tour_size": 3,
+      "position_in_tour": 2,
+      "is_anreise": false,
+      "is_abreise": false
+    },
+    "2025-12-29": {
+      "klass": "Z76",
+      "land": "Israel",
+      "betrag": 44,
+      "dauer_h": 10.366666666666667,
+      "tour_num": 53,
+      "tour_size": 3,
+      "position_in_tour": 3,
+      "is_anreise": false,
+      "is_abreise": true
+    }
+  },
+  "country_aggregates_followme": {
+    "Ägypten": {
+      "count_24h": 0,
+      "satz_24h": 50,
+      "count_8h": 2,
+      "satz_8h": 33,
+      "count_an_ab": 0,
+      "satz_an_ab": 33
+    },
+    "Bulgarien": {
+      "count_24h": 0,
+      "satz_24h": 22,
+      "count_8h": 0,
+      "satz_8h": 15,
+      "count_an_ab": 2,
+      "satz_an_ab": 15
+    },
+    "China - Hong Kong": {
+      "count_24h": 3,
+      "satz_24h": 71,
+      "count_8h": 0,
+      "satz_8h": 48,
+      "count_an_ab": 1,
+      "satz_an_ab": 48
+    },
+    "Dänemark": {
+      "count_24h": 0,
+      "satz_24h": 75,
+      "count_8h": 1,
+      "satz_8h": 50,
+      "count_an_ab": 1,
+      "satz_an_ab": 50
+    },
+    "Deutschland": {
+      "count_24h": 1,
+      "satz_24h": 28,
+      "count_8h": 5,
+      "satz_8h": 14,
+      "count_an_ab": 11,
+      "satz_an_ab": 14
+    },
+    "Frankreich": {
+      "count_24h": 0,
+      "satz_24h": 53,
+      "count_8h": 0,
+      "satz_8h": 36,
+      "count_an_ab": 1,
+      "satz_an_ab": 36
+    },
+    "Griechenland - Athen": {
+      "count_24h": 0,
+      "satz_24h": 40,
+      "count_8h": 0,
+      "satz_8h": 27,
+      "count_an_ab": 1,
+      "satz_an_ab": 27
+    },
+    "Indien - Bangalore": {
+      "count_24h": 2,
+      "satz_24h": 42,
+      "count_8h": 0,
+      "satz_8h": 28,
+      "count_an_ab": 1,
+      "satz_an_ab": 28
+    },
+    "Indien - Mumbai": {
+      "count_24h": 1,
+      "satz_24h": 53,
+      "count_8h": 0,
+      "satz_8h": 36,
+      "count_an_ab": 2,
+      "satz_an_ab": 36
+    },
+    "Iran": {
+      "count_24h": 1,
+      "satz_24h": 33,
+      "count_8h": 0,
+      "satz_8h": 22,
+      "count_an_ab": 2,
+      "satz_an_ab": 22
+    },
+    "Irland": {
+      "count_24h": 0,
+      "satz_24h": 58,
+      "count_8h": 1,
+      "satz_8h": 39,
+      "count_an_ab": 0,
+      "satz_an_ab": 39
+    },
+    "Island": {
+      "count_24h": 0,
+      "satz_24h": 62,
+      "count_8h": 2,
+      "satz_8h": 41,
+      "count_an_ab": 0,
+      "satz_an_ab": 41
+    },
+    "Israel": {
+      "count_24h": 1,
+      "satz_24h": 66,
+      "count_8h": 0,
+      "satz_8h": 44,
+      "count_an_ab": 3,
+      "satz_an_ab": 44
+    },
+    "Italien": {
+      "count_24h": 0,
+      "satz_24h": 42,
+      "count_8h": 0,
+      "satz_8h": 28,
+      "count_an_ab": 2,
+      "satz_an_ab": 28
+    },
+    "Italien - Mailand": {
+      "count_24h": 0,
+      "satz_24h": 42,
+      "count_8h": 0,
+      "satz_8h": 28,
+      "count_an_ab": 1,
+      "satz_an_ab": 28
+    },
+    "Italien - Rom": {
+      "count_24h": 0,
+      "satz_24h": 48,
+      "count_8h": 0,
+      "satz_8h": 32,
+      "count_an_ab": 1,
+      "satz_an_ab": 32
+    },
+    "Japan - Tokyo": {
+      "count_24h": 2,
+      "satz_24h": 50,
+      "count_8h": 0,
+      "satz_8h": 33,
+      "count_an_ab": 1,
+      "satz_an_ab": 33
+    },
+    "Kroatien": {
+      "count_24h": 0,
+      "satz_24h": 46,
+      "count_8h": 0,
+      "satz_8h": 31,
+      "count_an_ab": 2,
+      "satz_an_ab": 31
+    },
+    "Lettland": {
+      "count_24h": 1,
+      "satz_24h": 35,
+      "count_8h": 0,
+      "satz_8h": 24,
+      "count_an_ab": 0,
+      "satz_an_ab": 24
+    },
+    "Litauen": {
+      "count_24h": 1,
+      "satz_24h": 26,
+      "count_8h": 0,
+      "satz_8h": 17,
+      "count_an_ab": 1,
+      "satz_an_ab": 17
+    },
+    "Malta": {
+      "count_24h": 0,
+      "satz_24h": 46,
+      "count_8h": 0,
+      "satz_8h": 31,
+      "count_an_ab": 1,
+      "satz_an_ab": 31
+    },
+    "Nordmazedonien": {
+      "count_24h": 0,
+      "satz_24h": 27,
+      "count_8h": 0,
+      "satz_8h": 18,
+      "count_an_ab": 1,
+      "satz_an_ab": 18
+    },
+    "Norwegen": {
+      "count_24h": 0,
+      "satz_24h": 75,
+      "count_8h": 1,
+      "satz_8h": 50,
+      "count_an_ab": 4,
+      "satz_an_ab": 50
+    },
+    "Polen - Krakau": {
+      "count_24h": 2,
+      "satz_24h": 34,
+      "count_8h": 0,
+      "satz_8h": 23,
+      "count_an_ab": 1,
+      "satz_an_ab": 23
+    },
+    "Portugal": {
+      "count_24h": 1,
+      "satz_24h": 32,
+      "count_8h": 0,
+      "satz_8h": 21,
+      "count_an_ab": 0,
+      "satz_an_ab": 21
+    },
+    "Republik Korea": {
+      "count_24h": 6,
+      "satz_24h": 48,
+      "count_8h": 0,
+      "satz_8h": 32,
+      "count_an_ab": 3,
+      "satz_an_ab": 32
+    },
+    "Rumänien - Bukarest": {
+      "count_24h": 1,
+      "satz_24h": 32,
+      "count_8h": 0,
+      "satz_8h": 21,
+      "count_an_ab": 0,
+      "satz_an_ab": 21
+    },
+    "Schweden": {
+      "count_24h": 2,
+      "satz_24h": 66,
+      "count_8h": 1,
+      "satz_8h": 44,
+      "count_an_ab": 5,
+      "satz_an_ab": 44
+    },
+    "Schweiz - Genf": {
+      "count_24h": 0,
+      "satz_24h": 66,
+      "count_8h": 1,
+      "satz_8h": 44,
+      "count_an_ab": 0,
+      "satz_an_ab": 44
+    },
+    "Singapur": {
+      "count_24h": 3,
+      "satz_24h": 71,
+      "count_8h": 0,
+      "satz_8h": 48,
+      "count_an_ab": 1,
+      "satz_an_ab": 48
+    },
+    "Spanien": {
+      "count_24h": 0,
+      "satz_24h": 34,
+      "count_8h": 0,
+      "satz_8h": 23,
+      "count_an_ab": 2,
+      "satz_an_ab": 23
+    },
+    "Spanien - Barcelona": {
+      "count_24h": 1,
+      "satz_24h": 34,
+      "count_8h": 0,
+      "satz_8h": 23,
+      "count_an_ab": 1,
+      "satz_an_ab": 23
+    },
+    "Spanien - Madrid": {
+      "count_24h": 3,
+      "satz_24h": 42,
+      "count_8h": 0,
+      "satz_8h": 28,
+      "count_an_ab": 0,
+      "satz_an_ab": 28
+    },
+    "Tschechische Republik": {
+      "count_24h": 2,
+      "satz_24h": 32,
+      "count_8h": 0,
+      "satz_8h": 21,
+      "count_an_ab": 0,
+      "satz_an_ab": 21
+    },
+    "Tunesien": {
+      "count_24h": 0,
+      "satz_24h": 40,
+      "count_8h": 0,
+      "satz_8h": 27,
+      "count_an_ab": 1,
+      "satz_an_ab": 27
+    },
+    "Vereinigte Staaten von Amerika (USA)": {
+      "count_24h": 4,
+      "satz_24h": 59,
+      "count_8h": 0,
+      "satz_8h": 40,
+      "count_an_ab": 4,
+      "satz_an_ab": 40
+    },
+    "Vereinigte Staaten von Amerika (USA) - Boston": {
+      "count_24h": 1,
+      "satz_24h": 63,
+      "count_8h": 0,
+      "satz_8h": 42,
+      "count_an_ab": 2,
+      "satz_an_ab": 42
+    },
+    "Vereinigte Staaten von Amerika (USA) - Chicago": {
+      "count_24h": 2,
+      "satz_24h": 65,
+      "count_8h": 0,
+      "satz_8h": 44,
+      "count_an_ab": 4,
+      "satz_an_ab": 44
+    },
+    "Vereinigte Staaten von Amerika (USA) - Miami": {
+      "count_24h": 1,
+      "satz_24h": 65,
+      "count_8h": 0,
+      "satz_8h": 44,
+      "count_an_ab": 2,
+      "satz_an_ab": 44
+    },
+    "Vereinigtes Königreich": {
+      "count_24h": 0,
+      "satz_24h": 52,
+      "count_8h": 0,
+      "satz_8h": 35,
+      "count_an_ab": 1,
+      "satz_an_ab": 35
+    },
+    "Vereinigtes Königreich - London": {
+      "count_24h": 1,
+      "satz_24h": 66,
+      "count_8h": 1,
+      "satz_8h": 44,
+      "count_an_ab": 4,
+      "satz_an_ab": 44
+    },
+    "Zypern": {
+      "count_24h": 1,
+      "satz_24h": 42,
+      "count_8h": 0,
+      "satz_8h": 28,
+      "count_an_ab": 1,
+      "satz_an_ab": 28
+    }
+  },
+  "validation_self": {
+    "touren_parsed": 53,
+    "anfahrten_seite14_15": 53,
+    "klassifizierte_tage": 133,
+    "klassen_counts": {
+      "Z73": 11,
+      "Z76": 113,
+      "NO_VMA": 3,
+      "Z72": 5,
+      "Z74": 1
+    },
+    "tour_summen_total": 5046,
+    "z76_soll_match": true
+  }
+}
