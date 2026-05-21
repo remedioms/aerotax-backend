@@ -981,13 +981,19 @@ REFERENCE_2025_TOLERANCE = {
 
 
 def test_v8_reader_versions_constants_exist():
-    """READER_VERSIONS, ENGINE_VERSION sind exportiert."""
+    """READER_VERSIONS, ENGINE_VERSION sind exportiert.
+
+    v11 Clean-Release: ENGINE_VERSION wechselt auf 'tour_first_v11_*', APP_VERSION auf '11.*'.
+    """
     from app import READER_VERSIONS, ENGINE_VERSION, APP_VERSION, PROMPT_VERSION
     assert 'lsb' in READER_VERSIONS
     assert 'se' in READER_VERSIONS
-    assert 'dp' in READER_VERSIONS
-    assert ENGINE_VERSION.startswith('deterministic_v')
-    assert APP_VERSION.startswith('8.')
+    # v11: cas und dp (dp ist DEPRECATED, bleibt als Audit-Eintrag)
+    assert 'cas' in READER_VERSIONS or 'dp' in READER_VERSIONS
+    # v11: tour_first_*; v8 legacy: deterministic_v*
+    assert ENGINE_VERSION.startswith(('deterministic_v', 'tour_first_v'))
+    # v11: 11.*; v8 legacy: 8.*
+    assert APP_VERSION.startswith(('8.', '11.'))
 
 
 def test_v8_health_check_red_when_lsb_missing():
@@ -1098,7 +1104,8 @@ def test_v8_health_endpoint_format():
     assert 'reader_versions' in data
     assert 'engine' in data
     assert 'version' in data
-    assert data['version'].startswith('8.')
+    # v8.* (legacy) oder v11.* (Clean-Release) erlaubt
+    assert data['version'].startswith(('8.', '11.'))
 
 
 # ── v8.1 Tests: DP-Schema-Erweiterung, requires_commute, Z72-Dauer ──
@@ -6144,13 +6151,18 @@ def test_v827_greeting_no_count_demotivator():
     src = open(site).read()
     fn_idx = src.find('window.startReviewFlowInChat')
     assert fn_idx > 0, 'startReviewFlowInChat muss existieren'
-    block = src[fn_idx:fn_idx + 4000]
+    # 2026-05-20: Window 4000→6000 nach Review-Kind-Copy-Fix
+    # (Intro-Routing für unknown_marker/standby/missing_doc/source_conflict
+    # vergrößert den Function-Body um ~1.5 KB).
+    block = src[fn_idx:fn_idx + 6000]
     # Kein hartes „22 offene Angaben" / „N Angaben offen"-Demotivator
     import re
     nums = re.findall(r"\d{2,3}\s+(?:offene?\s+)?Angaben", block)
     assert not nums, f'Greeting darf keine Roh-Anzahl-Zeile zeigen, fand: {nums}'
     # Aber Tageliste + Antwort-Beispiele MÜSSEN da sein (das ist explizite Klärungs-CTA)
-    assert 'Diese Tage sind noch offen' in block
+    # 2026-05-20: Tageliste-Label ist jetzt singular/plural-getrennt
+    assert ('Diese Tage sind noch offen' in block
+            or 'Dieser Tag ist noch offen' in block)
     assert 'Schreib einfach was du weißt' in block
 
 
@@ -6908,7 +6920,10 @@ def test_v836_progress_pill_called_after_apply():
     site = os.path.expanduser('~/Desktop/site/index.html')
     src = open(site).read()
     fn_idx = src.find('async function _applyPendingProposal')
-    block = src[fn_idx:fn_idx+5000]
+    # 2026-05-20: Window 5000→8000 nach Chat-State-Contract-Fix
+    # (top-level review_items sync + canonical_state-Update + normalize-call
+    # vergrößern den Function-Body um ~2 KB).
+    block = src[fn_idx:fn_idx+8000]
     assert 'updateChatHeaderProgress' in block
 
 
@@ -10583,7 +10598,7 @@ def test_v11_cas_reader_uses_file_hash_cache():
     """CAS-Reader nutzt find_cached_chunk + parser_version für Cache-Lookup."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 6000]
+    block = src[fn_idx:fn_idx + 22000]
     assert 'find_cached_chunk(' in block
     assert '_CAS_PARSER_VERSION' in block
     assert 'sha256' in block.lower() or 'hashlib' in block
@@ -10594,7 +10609,7 @@ def test_v11_cas_reader_per_pdf_separate_call():
     v13 Phase 2A: window vergrößert weil Variante-A-Merge-Code davor liegt."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 12000]
+    block = src[fn_idx:fn_idx + 22000]
     # Loop über cas_list mit _sonnet_read_cas_single_pdf
     assert 'for idx, pdf_bytes in enumerate(cas_list)' in block, \
         'Pro-PDF-Loop muss existieren'
@@ -10606,7 +10621,7 @@ def test_v11_cas_reader_conflict_detection():
     """Mehrere Files für selben Tag mit unterschiedlichen Daten → conflict."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 14000]
+    block = src[fn_idx:fn_idx + 22000]
     assert 'conflicts' in block
     assert 'multiple_files_disagree' in block or 'len(sigs) ==' in block
     assert 'chosen_source' in block
@@ -10616,7 +10631,7 @@ def test_v11_cas_reader_dedupe_identical_days():
     """Mehrere Files mit identischem Tag-Eintrag → dedupe (1 Eintrag)."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 14000]
+    block = src[fn_idx:fn_idx + 22000]
     # Wenn alle Signaturen identisch → behalte 1
     assert 'len(sigs) == 1' in block, \
         'Identische Tag-Signaturen müssen dedupliziert werden'
@@ -10626,7 +10641,7 @@ def test_v11_cas_reader_heartbeat_per_file():
     """Heartbeat-Update pro Datei für Stale-Detector."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 6000]
+    block = src[fn_idx:fn_idx + 22000]
     assert '_heartbeat_phase(' in block
     assert 'cas_file_' in block or 'Dienstplan/CAS wird gelesen' in block
 
@@ -10646,7 +10661,7 @@ def test_v11_cas_reader_memory_release_per_file():
     """gc.collect() nach jeder File für Memory-Release."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 12000]
+    block = src[fn_idx:fn_idx + 22000]
     assert 'gc.collect()' in block, \
         'gc.collect() pro File nötig (Render Free-Tier RAM)'
 
@@ -10655,7 +10670,7 @@ def test_v11_cas_reader_result_contains_metadata():
     """Result-Dict enthält files_total/processed/cache_hits/parser_version."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 14000]
+    block = src[fn_idx:fn_idx + 22000]
     for key in ['_files_total', '_files_processed', '_cache_hits', '_parser_version']:
         assert key in block, f'Result-Metadata „{key}" fehlt'
 
@@ -10919,13 +10934,28 @@ def test_v11p4_hybrid_analyze_calls_v11_pipeline_when_flag_set():
 
 
 def test_v11p4_hybrid_analyze_v10_fallback_intact():
-    """v10-Legacy-Branch (DP-Reader) noch da als Fallback."""
+    """v11 Clean-Release: elif dp_bytes:-Branch ist auf hartes Stop umgestellt.
+
+    Flugstundenuebersicht ist KEINE zulaessige Quelle mehr.
+    Der Branch ist defensiv erhalten, gibt aber sofort health=red zurueck statt
+    den Legacy-DP-Reader (_sonnet_read_dp_structured_chunked_v104) zu rufen.
+    """
     src = _read_backend()
     fn_idx = src.find('def hybrid_analyze(')
-    block = src[fn_idx:fn_idx + 15000]
-    # elif dp_bytes wird genutzt wenn use_v11_cas=False
+    # hybrid_analyze ist ~1500 LOC, daher reichlich Window
+    block = src[fn_idx:fn_idx + 80000]
+    # elif dp_bytes existiert weiterhin (defensive Erkennung)
     assert 'elif dp_bytes' in block
-    assert '_sonnet_read_dp_structured_chunked_v104(' in block
+    # ABER: hard stop statt Legacy-Reader
+    assert "'status': 'red'" in block
+    assert 'Flugstundenuebersicht wird seit v11 nicht mehr als Quelle akzeptiert' in block
+    # Legacy-Reader wird in der ACTIVE branch nicht mehr gerufen.
+    # Vor dem Fix war "_sonnet_read_dp_structured_chunked_v104(" im aktiven Pfad.
+    # Wir akzeptieren das Statement nur noch im toten elif-False-Block oder ueberhaupt nicht.
+    # Strenger Check: vor dem 'elif False:' darf der Aufruf nicht auftauchen.
+    active_block = block.split('elif False:')[0]
+    assert '_sonnet_read_dp_structured_chunked_v104(' not in active_block, \
+        'Legacy-Reader darf nicht im aktiven elif-dp_bytes-Pfad gerufen werden.'
 
 
 def test_v11p4_classification_includes_cas_metadata():
@@ -11384,7 +11414,7 @@ def test_v11_b015_cas_reader_handles_missing_chunk_id():
     """CAS-Reader-Code prüft `if chunk_id:` — bei None überspringt sauber."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured(')
-    block = src[fn_idx:fn_idx + 6000]
+    block = src[fn_idx:fn_idx + 22000]
     # CAS-Reader nutzt das `if chunk_id:` Pattern um None abzufangen
     assert 'if chunk_id:' in block, \
         'CAS-Reader muss chunk_id auf None prüfen vor save_job_chunk_result'
@@ -12084,7 +12114,7 @@ def test_cas_parallel_env_default_2():
     """AEROTAX_CAS_MAX_PARALLEL default 2."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 8000]
+    block = src[fn_idx:fn_idx + 22000]
     assert "os.environ.get('AEROTAX_CAS_MAX_PARALLEL'" in block
     assert "'2'" in block, 'Default Wert 2 muss im environ.get fallback stehen'
 
@@ -12093,7 +12123,7 @@ def test_cas_parallel_env_clamped_1_to_4():
     """ENV-Wert wird auf 1..4 geclampt."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 8000]
+    block = src[fn_idx:fn_idx + 22000]
     assert 'max(1, min(4, cas_max_par))' in block or 'min(4' in block
 
 
@@ -12101,7 +12131,7 @@ def test_cas_parallel_safe_mode_when_1():
     """cas_max_par == 1 → sequenziell (kein ThreadPool-Overhead)."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 8000]
+    block = src[fn_idx:fn_idx + 22000]
     assert 'if cas_max_par == 1:' in block
     assert 'Safe-Mode' in block or 'sequenziell' in block
 
@@ -12111,7 +12141,7 @@ def test_cas_parallel_uses_threadpool():
     v13 Phase 2C: window vergrößert weil after_cas_file Snapshots dazu kamen."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 14000]
+    block = src[fn_idx:fn_idx + 22000]
     assert 'ThreadPoolExecutor' in block
     assert 'max_workers=cas_max_par' in block
 
@@ -12120,7 +12150,7 @@ def test_cas_parallel_deterministic_merge():
     """Merge nach idx sortiert für deterministische Reihenfolge."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 14000]
+    block = src[fn_idx:fn_idx + 22000]
     assert 'sorted(results_by_idx' in block
     # Determinismus-Kommentar
     assert 'Deterministischer Merge' in block or 'Original-Reihenfolge' in block
@@ -12153,7 +12183,7 @@ def test_cas_parallel_no_duplicate_days_after_merge():
     """Merge-Logic: gleicher date aus mehreren Files → dedupe/conflict-detection."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_structured')
-    block = src[fn_idx:fn_idx + 12000]
+    block = src[fn_idx:fn_idx + 22000]
     # Konflikt-Detection bei Duplikaten
     assert 'conflicts' in block
     assert 'multiple_files_disagree' in block

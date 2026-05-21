@@ -41,19 +41,24 @@ Strikte Verantwortungs-Trennung — keine Vermischung:
 - BMF-Mapping fehlt → `tage_detail[i].diagnostics.bmf_mapping_issue` listet Lücke
 - PDF zeigt falsch → result-Dict war richtig, ReportLab-Bug
 
-## Architektur-Grundsatz (v8.0)
+## Architektur-Grundsatz (v11 Clean-Release, gültig ab 2026-05-20)
 
-> **Sonnet liest 3 Dokumente strukturiert. Backend matcht DP+SE pro Datum, klassifiziert deterministisch, prüft Plausi und Health.**
+> **Sonnet liest 3 Dokumente strukturiert. Backend matcht CAS+SE pro Datum, klassifiziert deterministisch, prüft Plausi und Health.**
 
 Pflichtbasis (3 Dokumente + Formularangaben):
-1. Lohnsteuerbescheinigung
-2. Flugstundenübersicht
-3. Streckeneinsatzabrechnung
+1. **Lohnsteuerbescheinigung** (LSB) — 1 PDF, Brutto/Jahres-/AG-Erstattung
+2. **Streckeneinsatz-Abrechnungen** (SE) — ideal 12 Monate, Spesen + AG-gezahlt
+3. **Dienstplan / CAS** (PUB/NTF) — ideal 12 Monate **mit Uhrzeiten**, Touren
 4. Formular: Steuerjahr, Homebase, Entfernung km, optional Fahrzeit, optional Zusatzkosten
+
+**Flugstundenübersicht ist KEINE Pflicht-/Reader-/Plausi-Quelle mehr.** Sie wird beim Upload als `legacy_ignored_flight_hours_summary` markiert, die Auswertung benutzt sie nicht. Die alten DP-Reader-Funktionen (`_parse_flugstunden_deterministic`, `parse_dienstplan_mit_ki`, `_sonnet_read_dp_structured*`) sind hart deaktiviert — sie werfen `RuntimeError` ausser bei explizitem Forensik-Override (`AEROTAX_LEGACY_FLUGSTUNDEN_FORENSIK=1`).
 
 **Einsatzplan ist aus dem Produkt entfernt — nicht wieder als Pflichtdokument einführen.**
 
-Pipeline: `_sonnet_read_lsb_v2` → `_sonnet_read_se_structured` → `_sonnet_read_dp_structured` → `_document_health_check` → `_match_dp_se_per_day` → `_build_tour_clusters` → `_deterministic_classify_v7`. Kein Opus-Hauptklassifikator. Kein produktiver Fallback.
+Pipeline: `_sonnet_read_lsb_v2` → `_sonnet_read_se_structured` → `_sonnet_read_cas_structured` (Reader V2) → `_classify_v11_cas_pipeline` → normalized_tours → tour-aware classification → BMF/Counter. Kein Opus-Hauptklassifikator. Kein produktiver Fallback auf Flugstundenübersicht.
+
+### FollowMe.aero
+FollowMe-Daten sind **Referenz/Benchmark**, KEINE Primärquelle. Bei Konflikten gewinnen CAS+SE+Plausi. Abweichungen werden im Audit (`CAS_FOLLOWME_DISAGREEMENT_AUDIT.md`) dokumentiert, nicht still angepasst.
 
 ### v8-Garantien
 - Jede aktive SE-Zeile landet in Z72/Z73/Z74/Z76 oder `vma_unmapped_se` (sichtbarer Issue, kein stilles Sonstiges).
@@ -121,12 +126,14 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
   - Wrangler v4.86 installiert; Token + Account-ID in `~/.zshrc` als `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`
   - Deploy-Befehl: `wrangler pages deploy ~/Desktop/site --project-name aerosteuer --commit-dirty=true`
 - **PDF-Verarbeitung:** pdfplumber für Text, ReportLab für Output, PIL+pillow-heif für Bilder
-- **KI:** Claude Sonnet 4.5 via `anthropic` SDK — vier Stellen:
+- **KI:** Claude Sonnet 4.5 via `anthropic` SDK — aktive Stellen:
   - `parse_lohnsteuerbescheinigung` (LSB)
   - `parse_streckeneinsatz_mit_ki` (SE — Hybrid Regex+KI)
-  - `parse_dienstplan_mit_ki` (Flugstunden)
+  - `_sonnet_read_cas_structured` + Reader V2 (CAS-Dienstplan)
+  - `_resolve_uncertain_fact_with_ai` (KI-Resolver für NEEDS_AI-Fälle)
   - `parse_optionale_belege` (optionale Belege Vision)
   - `infer_missing_data_with_ki` (Schätzung wenn was fehlt)
+  - DEPRECATED: `parse_dienstplan_mit_ki` (Flugstundenübersicht) — hart deaktiviert, nur via Forensik-Override.
 
 ## Deploy-Workflow
 

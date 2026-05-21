@@ -242,16 +242,23 @@ ANTHROPIC_KEY = os.getenv('ANTHROPIC_API_KEY')
 PRICE_ID              = os.getenv('AEROTAX_PRICE_ID')
 FRONTEND_URL          = os.getenv('FRONTEND_URL','https://aerosteuer.de')
 
-# ── v8: Reader-/Engine-Versionierung ──
-APP_VERSION = '8.3'
-APP_BUILD   = 'strict-fahrtage-arbeitstage-pdf-cleanup-2026-05-10'
+# ── v11 Clean-Release: Reader-/Engine-Versionierung ──
+APP_VERSION = '11.0'
+APP_BUILD   = 'v11-clean-release-flugstunden-removed-2026-05-20'
 READER_VERSIONS = {
     'lsb': 'sonnet_lsb_v8_0',
     'se':  'sonnet_se_structured_v8_0',
-    'dp':  'sonnet_dp_structured_v8_0',
+    'cas': 'sonnet_cas_v11_reader_v2',
+    'dp':  'sonnet_dp_structured_v8_0_DEPRECATED',
 }
-ENGINE_VERSION = 'deterministic_v8_0'
-PROMPT_VERSION = 'v8_0'
+ENGINE_VERSION = 'tour_first_v11_clean_release'
+PROMPT_VERSION = 'v11_0'
+RULESET_VERSION = 'v11_clean_release_2026_05_20'
+AI_RESOLVER_VERSION = 'phase5d_crew_vocab_v1'
+CAS_READER_VERSION = 'v2_with_refuse_non_cas_2026_05_20'
+SE_READER_VERSION = 'sonnet_se_structured_v8_0'
+LSB_READER_VERSION = 'sonnet_lsb_v8_0'
+FRONTEND_CONTRACT_VERSION = 'v11_3doc_lsb_se_cas_2026_05_20'
 
 # In-memory store (in Produktion: Redis oder S3)
 _store = {}
@@ -2023,12 +2030,18 @@ def process_real():
                 files[key] = [_normalize_upload(f.read(), f.filename) for f in uploaded]
 
         # Audit: Wieviele Files kamen direkt im Request an?
-        # Pflicht-Kategorien (lsb/dp=flugstunden/se) explizit, Rest nur wenn vorhanden
+        # v11 Clean-Release: dp = legacy_ignored_flight_hours_summary (nicht mehr aktive Quelle).
+        # Aktiv-Pflicht-Kategorien sind lsb + se + cas.
         direct_parts = []
         for k, v in files.items():
             if not v:
                 continue
-            label = {'dp': 'flugstunden', 'se': 'streckeneinsatz', 'lsb': 'lsb'}.get(k, k)
+            label = {
+                'dp': 'legacy_ignored_flight_hours_summary',
+                'se': 'streckeneinsatz',
+                'lsb': 'lsb',
+                'cas': 'dienstplan_cas',
+            }.get(k, k)
             direct_parts.append(f"{label}={len(v)}")
         print(f"[process] Direct-Upload: {', '.join(direct_parts) or 'KEINE'}")
 
@@ -7219,6 +7232,105 @@ def _bytes_filename_list(file_list):
             result.append((item, ''))
     return result
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 Clean-Release Phase 1 — Document Type Detection final.
+#
+# Klassifiziert eine hochgeladene PDF in eine der 5 finalen Kategorien:
+#   - lohnsteuerbescheinigung
+#   - streckeneinsatz
+#   - dienstplan_cas
+#   - legacy_ignored_flight_hours_summary
+#   - unknown
+#
+# Heuristik basiert auf Text-Markers + Dateinamen-Patterns. Wenn pdfplumber
+# fehlschlaegt: Filename-only. Wenn beides leer: 'unknown'.
+# ════════════════════════════════════════════════════════════════════════════
+
+DOC_TYPE_LSB         = 'lohnsteuerbescheinigung'
+DOC_TYPE_SE          = 'streckeneinsatz'
+DOC_TYPE_CAS         = 'dienstplan_cas'
+DOC_TYPE_LEGACY_FLUG = 'legacy_ignored_flight_hours_summary'
+DOC_TYPE_UNKNOWN     = 'unknown'
+
+DOC_TYPES_ALL = (
+    DOC_TYPE_LSB, DOC_TYPE_SE, DOC_TYPE_CAS,
+    DOC_TYPE_LEGACY_FLUG, DOC_TYPE_UNKNOWN,
+)
+
+
+def classify_uploaded_pdf_doc_type(pdf_bytes, filename=''):
+    """v11 Clean-Release: heuristische Doc-Typ-Erkennung fuer hochgeladene PDFs.
+
+    Args:
+        pdf_bytes: Roh-Bytes der PDF (oder leerer Wert).
+        filename:  Dateiname (case-insensitive, optional).
+
+    Returns:
+        Einer aus DOC_TYPES_ALL.
+
+    Regeln (Priorisierung):
+        1. Filename-Pattern PUB_/NTF_ → dienstplan_cas.
+        2. Filename enthaelt "Flugstunden" / "Stundenuebersicht" → legacy_ignored_flight_hours_summary
+           (egal was im Text steht — Filename ist eindeutig).
+        3. Inhalt: "Lohnsteuerbescheinigung" / "Steueridentifikationsnummer" → lohnsteuerbescheinigung.
+        4. Inhalt: "Streckeneinsatz" / "Einsatzabrechnung" + "stfrei" → streckeneinsatz.
+        5. Inhalt: "Flugstundenuebersicht" / "FLUGSTUNDEN-UEBERSICHT" → legacy_ignored_flight_hours_summary.
+        6. Inhalt: "Briefingzeit" / "LH<num>" + Routing + Uhrzeiten → dienstplan_cas.
+        7. Sonst: unknown.
+    """
+    fname_lower = (filename or '').lower()
+
+    # 1. Filename-only fuer CAS (PUB_/NTF_-Dateien)
+    if re.match(r'^(pub|ntf)_\d+', fname_lower):
+        return DOC_TYPE_CAS
+
+    # 2. Filename-only fuer Flugstundenuebersicht
+    if 'flugstunden' in fname_lower or 'stundenuebersicht' in fname_lower or 'stunden-uebersicht' in fname_lower:
+        return DOC_TYPE_LEGACY_FLUG
+
+    # Text-Extraktion (falls moeglich)
+    text = ''
+    if pdf_bytes:
+        try:
+            import pdfplumber, io
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                # Nur die ersten 3 Seiten — genug fuer Header/Titel
+                for page in pdf.pages[:3]:
+                    text += (page.extract_text() or '') + '\n'
+        except Exception:
+            text = ''
+
+    text_low = text.lower()
+
+    # 3. LSB
+    if 'lohnsteuerbescheinigung' in text_low or 'steueridentifikationsnummer' in text_low:
+        return DOC_TYPE_LSB
+
+    # 4. SE — "Streckeneinsatz" + Spesen-Pattern
+    if 'streckeneinsatz' in text_low or 'einsatzabrechnung' in text_low:
+        # Bestaetigung durch Spesen-Marker
+        if 'stfrei' in text_low or 'pauschal' in text_low or 'verpflegung' in text_low:
+            return DOC_TYPE_SE
+        return DOC_TYPE_SE  # Header allein genuegt
+
+    # 5. Flugstundenuebersicht (Content-basiert)
+    if 'flugstunden-übersicht' in text_low or 'flugstundenübersicht' in text_low \
+       or 'flugstunden-uebersicht' in text_low or 'flugstundenuebersicht' in text_low \
+       or 'flugstunden' in text_low and 'fl strecken' in text_low:
+        return DOC_TYPE_LEGACY_FLUG
+
+    # 6. CAS-Dienstplan (Content-basiert)
+    if 'briefingzeit' in text_low:
+        return DOC_TYPE_CAS
+    # LH-Flugnummer + Uhrzeit + Routing (Dienstplan-Detail)
+    if re.search(r'lh\s?\d{2,4}\b', text_low) and re.search(r'\d{2}:\d{2}', text):
+        if 'roster' in text_low or 'dienstplan' in text_low or 'pub_' in text_low:
+            return DOC_TYPE_CAS
+
+    return DOC_TYPE_UNKNOWN
+
+
 def _lsb_extract_via_regex(text):
     """Liefert numerische Werte direkt aus dem PDF-Text via Regex.
     Nullwerte = nicht gefunden / Format unbekannt."""
@@ -7600,20 +7712,85 @@ _AI_RESOLVER_KINDS = {
     'marker_semantics',     # ORTSTAG/FRS/LMN → passive/active/office/etc
     'layover_place',        # overnight ohne layover_ort → wahrscheinlichster Ort
     'tour_context',         # mehrtägige Tour → Tour-Struktur/Zweck
+    'tour_boundary',        # BH-CORE-001: Tour-Range + primary_destination aus context
+    'standby_context',      # BH-CORE-001: RES/SB im Hotel vs zuhause
+    'routing_consistency',  # Phase 5a: routing transit/Inkonsistenz-Klärung
 }
 
 
 def _ai_resolver_airline_crew_context_block():
     """Standard-Airline-Crew-Kontext-Header für alle Resolver-Prompts.
-    P2 Regel: KEIN kontextloser KI-Call."""
+    P2 Regel: KEIN kontextloser KI-Call.
+
+    Phase 5d/Master-A+B: nur Crew-Code-Vokabular aus repo-belegten Quellen
+    (referenz_faelle.txt, app.py-Konstanten PASSIVE/SANDWICH/LAYOVER_FREE
+    /EXCLUDE-Listen, tests/*.py-Assertions). Belege siehe
+    docs/AEROTAX_CREW_CODE_GLOSSARY.md.
+
+    Begriffe mit `needs_validation=true` (PUR, CR, FO, SECCRM, CRM, TRG,
+    'Roster-ID'-Konzept) sind hier NICHT enthalten — sie sind Soft-
+    Inferenzen, keine User-bestätigten Regeln.
+    """
     return (
         "Du analysierst einen Dienstplan für Flugpersonal "
         "(Cockpit/Kabine, Airline-Crew, Lufthansa-ähnlicher Crew-Roster). "
         "Die Daten stammen aus CAS/Dienstplan, Streckeneinsatzabrechnung (SE) "
-        "und/oder Lohnsteuerunterlagen (LSB). "
-        "Codes wie ORTSTAG, FRS, LMN_AS, LMN_CR, SB_S, EM, RES, FRA, MUC, DUS, "
-        "LH-Flugnummern, Briefingzeit, Layover-Ort, Streckeneinsatz sind "
-        "Standard-Crew-Begriffe."
+        "und/oder Lohnsteuerunterlagen (LSB).\n\n"
+        "CREW-CODE-VOKABULAR (kritisch — nicht mit IATA-Codes verwechseln):\n"
+        "  PU       = Purser / Kabinenchef / Crew-Position. "
+        "**NICHT Pula-Airport (PUY)**.\n"
+        "  P1, P2, P3, P4 = Position-Codes (Pilot 1..4 / Pattern-Slot). "
+        "**NICHT Flughafen-Codes**.\n"
+        "  PA       = (weitere Crew-Position in EXCLUDE-Liste; "
+        "Bedeutung intern).\n"
+        "  RES      = Reserve / Bereitschaftsdienst. Default zuhause = "
+        "Arbeitstag, KEIN Fahrtag. Ausnahme: RES mit Inland-Übernachtung "
+        "(HAM/MUC) = Z73-Kandidat (Schulung mit Hotel). RES nach "
+        "foreign-overnight im Tour-Kontext = standby_hotel-Kandidat.\n"
+        "  SBY, SB  = Standby (Synonym zu RES).\n"
+        "  X        = streckenfrei-Tag / Layover-Off-Day. "
+        "Innerhalb Tour (prev_overnight + foreign_layover): "
+        "tour_mid (Layover-Free-Day im foreign Hotel). "
+        "Zuhause ohne Tour-Continuity: Frei-Tag.\n"
+        "  ==       = Layover-Continuation-Marker. Kontextabhängig wie X.\n"
+        "  OFF, OF  = Off-Day (kein Dienst). Kontextabhängig wie X.\n"
+        "  ORTSTAG  = lokaler Hb-Tag (passive Anwesenheit zuhause). NO_VMA.\n"
+        "  FRS      = Office / Admin-Präsenz am Homebase. NO_VMA.\n"
+        "  LMN, LMN_AS, LMN_CR = Lokale Maßnahmen / Training / Medical am "
+        "Homebase. NO_VMA.\n"
+        "  FRD      = (in PASSIVE_MARKERS, vermutlich Frei-Tag).\n\n"
+        "TRAINING-MARKER (mit AT+FT-Regel — täglich Anfahrt zählt):\n"
+        "  EM       = Erste-Hilfe-Maßnahmen / Briefing. AT + FT pro Tag.\n"
+        "  EH       = Erste-Hilfe-Schulung. AT + FT pro Tag.\n"
+        "  EK       = Bürodienst / Office. AT + FT pro Tag.\n"
+        "  TK       = Kurzschulung. AT + FT.\n"
+        "  D4       = Mehrtägige Präsenz-Schulung. JEDER Tag = AT + FT.\n"
+        "  DD       = Seminar / Abordnung (mehrtägig). JEDER Tag = AT + FT.\n"
+        "  Sequenz-Regel: 3+ aufeinanderfolgende EM/EH/D4-Tage OHNE FREI "
+        "→ FAST IMMER Schulungs-Tour mit Hotel (Z73-Tour-Verdacht).\n\n"
+        "FLIGHT-STATUS-MARKER:\n"
+        "  FL       = Layover-Marker. EINE FL-Markierung IST EINE Hotelnacht "
+        "(EASA ≥10h Bodenzeit). Hotel-Counter: Σ FL-Marker.\n\n"
+        "INLAND-WHITELIST (für Z72/Z73-Klassifikation):\n"
+        "  FRA, MUC, HAM, DUS, STR, CGN, BER, LEJ, NUE, BRE, HAJ, TXL, PAD.\n\n"
+        "NUMERISCHE MARKER (Vorsicht — nicht im Repo explizit definiert):\n"
+        "  Ein 5-6-stelliger numerischer Block (z.B. 103703, 32935, 57783) "
+        "*scheint* in den Fixture-Daten als Crew-Sequenz-/Roster-ID zu "
+        "fungieren, NICHT als LH-Flugnummer (LH-Nummern sind 3-4-stellig "
+        "wie LH404). Diese Interpretation ist **nicht formal user-bestätigt** "
+        "— bei Mismatch zu CAS-Routing/SE prüfe vor Auto-Übernahme.\n"
+        "  Format wie '129023 PU / Tag 3' = (Roster-ID) + (Position-Code) + "
+        "(Day-Sequence-Suffix); PU ist Position-Code, NICHT Pula.\n\n"
+        "IATA-SOURCE-REGEL (kritisch):\n"
+        "  IATA-/Place-Codes bevorzugt aus `routing`, `se.stfrei_ort` oder "
+        "`layover_ort`. NICHT aus der raw_marker-Spalte raten. Die "
+        "EXCLUDE-Liste (intern app.py:14114) sammelt alle Status-/Position-"
+        "Codes die NICHT als IATA missverstanden werden dürfen: "
+        "RES, SBY, OFF, ORTSTAG, FRS, FRD, LMN(.*), EM, OF, P1..P4, PU, PA.\n\n"
+        "FOLLOWME / GOLDEN ist eine externe REFERENZ, NICHT die Wahrheit. "
+        "CAS + SE + Plausibilität bleiben Primärquellen. Bei CAS↔FollowMe-"
+        "Place-Konflikt → reader_misread-Verdacht oder NEEDS_REVIEW, "
+        "NICHT blind CAS bestätigen.\n"
     )
 
 
@@ -7681,14 +7858,254 @@ def _ai_resolver_context_hash(context):
     return _hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:16]
 
 
+# ─── Phase-5b PII-Hardening — Prompt-Builder Whitelist ─────────────────────
+
+# Erlaubte Feldnamen für Top-Level-Context und für day/prev_day/next_day-Dicts
+_AI_SAFE_PLAN_FIELDS = frozenset({
+    'datum', 'kind', 'marker', 'raw_marker',
+    'activity_type', 'routing', 'start_time', 'end_time',
+    'duty_duration_minutes', 'overnight_after_day',
+    'layover_ort', 'starts_at_homebase', 'ends_at_homebase',
+    'has_fl', 'is_workday', 'requires_commute',
+    # Whitelist für evidence-items (lists of (name, weight, detail))
+    'evidence_for', 'evidence_against',
+    # KI-Resolver-Felder
+    'score_for', 'score_against', 'evidence_decision',
+})
+
+# Erlaubte Feldnamen für SE-Sub-Dict
+_AI_SAFE_SE_FIELDS = frozenset({
+    'stfrei_ort', 'stfrei_inland',
+    'se_has_allowance', 'se_amount_present',
+    'count', 'zwoelftel',
+})
+
+# Erlaubte Felder im followme_context (anonymisiert)
+_AI_SAFE_FM_FIELDS = frozenset({
+    'tour_span', 'tour_country', 'tour_role',
+    'position_in_tour', 'has_anfahrt',
+    'in_any_tour_span', 'expected_destinations',
+    'tour_destination', 'tour_size',
+})
+
+# Explizit verbotene Felder (PII / Secrets / Payment / Raw-Files)
+_AI_PII_FORBIDDEN_FIELDS = frozenset({
+    # Personen-Identifikatoren
+    'name', 'vorname', 'nachname', 'fullname', 'first_name', 'last_name',
+    'mitarbeiter', 'mitarbeiter_nr', 'mitarbeiter_id',
+    'personalnummer', 'personal_nr', 'personnel_id',
+    'employee_id', 'employee_name', 'employee_number',
+    'pnr', 'crewid', 'crew_id', 'crewmember_id',
+    'birthdate', 'date_of_birth', 'dob',
+    'email', 'mail', 'email_address',
+    'phone', 'telefon', 'mobile',
+    'address', 'adresse', 'street', 'strasse',
+    'plz', 'postal_code', 'zip',
+    'iban', 'bic', 'bank_account',
+    'tax_id', 'steuer_id', 'steuernummer', 'steuer_nr', 'tin',
+    'sozialversicherung', 'social_security',
+    # Raw-Files / PDF-Inhalte
+    'raw_pdf_text', 'pdf_bytes', 'pdf_content', 'pdf_data',
+    'file_content', 'file_bytes', 'file_data', 'raw_bytes',
+    'raw_lines',  # CAS raw_lines können PII enthalten
+    # Filenames / Pfade
+    'filename', 'filepath', 'file_path', 'original_filename',
+    'pdf_filename', 'pdf_path', 'upload_path',
+    # Session / Tokens / Payment
+    'session_token', 'recovery_token', 'access_token',
+    'refresh_token', 'auth_token', 'api_token',
+    'payment_intent', 'payment_intent_id', 'stripe_id', 'stripe_session',
+    'stripe_customer', 'stripe_payment',
+    # Storage-IDs
+    'supabase_id', 'supabase_user_id', 'storage_id',
+    'job_owner_id', 'user_id', 'auth_user_id',
+    # Misc-PII
+    'anrede', 'titel', 'salutation',
+    'geburtsort', 'geburtsdatum',
+    'wohnort',
+})
+
+
+def _ai_resolver_safe_context(context):
+    """Phase-5b PII-Hardening: liefert sanitiertes Kontext-Dict für KI-Prompts.
+
+    Regeln:
+      - Top-Level: nur Whitelist-Felder + 'day', 'prev_day', 'next_day', 'se',
+        'homebase', 'evidence_for', 'evidence_against'.
+      - day/prev_day/next_day: nur Plan-Fakten (kein raw_lines, kein PNR etc).
+      - se: stfrei_ort, stfrei_inland, count; KEIN stfrei_total (Tax-Wert).
+      - followme: nur anonymisierte Aggregate (kein job_id, kein token).
+      - evidence_for/against: nur (name, weight, detail-string).
+      - PII-Schwarzliste (`_AI_PII_FORBIDDEN_FIELDS`) wird IMMER entfernt,
+        rekursiv auf allen Ebenen.
+    """
+    if not isinstance(context, dict):
+        return {}
+
+    def _strip_pii_recursive(node):
+        if isinstance(node, dict):
+            out = {}
+            for k, v in node.items():
+                ks = str(k).lower().strip()
+                if ks in _AI_PII_FORBIDDEN_FIELDS:
+                    continue
+                # Substring-Match auf bekannte PII-Tokens (defensiv)
+                if any(tok in ks for tok in (
+                        'password', 'secret', 'token', 'apikey', 'api_key',
+                        'auth', 'session', 'cookie',
+                )):
+                    continue
+                out[k] = _strip_pii_recursive(v)
+            return out
+        if isinstance(node, list):
+            return [_strip_pii_recursive(x) for x in node]
+        return node
+
+    def _filter_day(d):
+        if not isinstance(d, dict):
+            return d
+        cleaned = _strip_pii_recursive(d)
+        # Whitelist nur Plan-Fakten
+        return {k: v for k, v in cleaned.items() if k in _AI_SAFE_PLAN_FIELDS}
+
+    def _filter_se(s):
+        if not isinstance(s, dict):
+            return {}
+        cleaned = _strip_pii_recursive(s)
+        out = {k: v for k, v in cleaned.items() if k in _AI_SAFE_SE_FIELDS}
+        # Tax-Wert (`stfrei_total`) NICHT in Prompt
+        out.pop('stfrei_total', None)
+        # Add booleanized se_has_allowance
+        try:
+            cnt = int(cleaned.get('count') or 0)
+            out['se_has_allowance'] = bool(cnt > 0)
+        except (TypeError, ValueError):
+            out['se_has_allowance'] = False
+        return out
+
+    def _filter_fm(f):
+        if not isinstance(f, dict):
+            return {}
+        cleaned = _strip_pii_recursive(f)
+        return {k: v for k, v in cleaned.items() if k in _AI_SAFE_FM_FIELDS}
+
+    safe = {}
+    # day / prev_day / next_day
+    for key in ('day', 'prev_day', 'next_day'):
+        if context.get(key) is not None:
+            safe[key] = _filter_day(context.get(key))
+    # se
+    if context.get('se') is not None:
+        safe['se'] = _filter_se(context.get('se'))
+    # homebase (nur IATA-Code)
+    hb = context.get('homebase')
+    if hb:
+        safe['homebase'] = str(hb).upper()[:6]
+    # followme_context (anonymisiert)
+    fm = context.get('followme_context') or context.get('fm')
+    if fm:
+        safe['followme'] = _filter_fm(fm)
+    # evidence_for / evidence_against: sanitize, behalten
+    for key in ('evidence_for', 'evidence_against'):
+        items = context.get(key)
+        if items and isinstance(items, list):
+            safe[key] = []
+            for item in items:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    # (name, weight, optional detail)
+                    name = str(item[0])[:80]
+                    weight = item[1]
+                    detail = str(item[2])[:140] if len(item) >= 3 else ''
+                    safe[key].append([name, weight, detail])
+                else:
+                    # defensive: nur string
+                    safe[key].append(str(item)[:140])
+    # generische Top-Level-Felder (Whitelist)
+    for k in ('datum', 'kind', 'marker', 'raw_marker', 'score_for',
+              'score_against', 'evidence_decision'):
+        if context.get(k) is not None:
+            safe[k] = context[k]
+
+    # Phase 5d — Cross-Source-Konflikt-Aggregation
+    # Aus evidence_against + day-Fakten + SE + FollowMe rekonstruieren WARUM
+    # die Evidence-Engine unsicher ist. Das hilft KI, den Konflikt direkt
+    # zu adressieren statt naiv das CAS-Routing zu bestätigen.
+    ag_names = set()
+    for item in (context.get('evidence_against') or []):
+        if isinstance(item, (list, tuple)) and len(item) >= 1:
+            ag_names.add(str(item[0]))
+
+    why_uncertain = []
+    if 'cas_followme_place_conflict' in ag_names:
+        why_uncertain.append(
+            'CAS-routing zeigt einen Ort, FollowMe-Tour-Destinations zeigen '
+            'einen anderen Ort. Mögliches reader_misread oder echte Diskrepanz.'
+        )
+    if 'day_suffix_claims_completed_prev' in ag_names:
+        why_uncertain.append(
+            'Marker hat „Tag N≥2" Suffix, aber Vortag war laut FollowMe eine '
+            'abgeschlossene Tour. Day-Suffix könnte legitim sein (Multi-Day-'
+            'Duty) ODER Reader-Bug.'
+        )
+    if 'transit_via_homebase_ends_foreign' in ag_names:
+        why_uncertain.append(
+            'Routing hat Homebase mittig als Transit, endet aber im Ausland. '
+            'KEIN normaler Same-Day-Homebase-Return.'
+        )
+    if 'routing_inconsistent' in ag_names:
+        why_uncertain.append(
+            'starts_at_homebase/ends_at_homebase widerspricht routing[0]/[-1].'
+        )
+    if 'duty_over_ftl' in ag_names:
+        why_uncertain.append(
+            'duty_duration > FTL-Limit (840min). Reader-Bug-Verdacht.'
+        )
+    if 'no_homebase_commute_evidence' in ag_names:
+        why_uncertain.append(
+            'Tag claimt Hb-Departure, aber keine Anfahrt in der Anfahrten-Liste.'
+        )
+    if 'no_se_allowance' in ag_names and 'followme_explicit_other_span' in ag_names:
+        why_uncertain.append(
+            'Keine SE-Auslandsspesen-Zeile UND nicht in FollowMe-Tour-Spans — '
+            'Phantom-Tag-Verdacht oder echte Tour ohne Beleg.'
+        )
+    if 'day_already_in_other_tour' in ag_names:
+        why_uncertain.append(
+            'FollowMe ordnet diesen Tag explizit einer ANDEREN Tour zu.'
+        )
+    if why_uncertain:
+        safe['why_evidence_uncertain'] = why_uncertain
+
+    # SE/Anfahrt-Presence-Boolean — kompakt für KI-Entscheidung
+    se_obj = context.get('se') or {}
+    if isinstance(se_obj, dict):
+        safe['se_has_foreign_allowance'] = bool(
+            int(se_obj.get('count') or 0) > 0
+            and se_obj.get('stfrei_inland') is False
+        )
+    fm_obj = context.get('followme_context') or context.get('fm') or {}
+    if isinstance(fm_obj, dict):
+        anf = fm_obj.get('anfahrten_dates') or fm_obj.get('has_anfahrt')
+        if anf is not None:
+            safe['has_anfahrt_evidence'] = bool(anf)
+
+    return safe
+
+
 def _ai_resolver_build_prompt(kind, context, uncertain_fact):
     """Baut den User-Prompt mit Crew-Kontext-Header + kind-spezifischem Block.
-    Output: string. Wird in der Resolver-Funktion an client.messages.create gegeben."""
+
+    Phase-5b PII-Hardening: nutzt `_ai_resolver_safe_context` als Whitelist-
+    Filter. Output: string. Wird in der Resolver-Funktion an
+    client.messages.create gegeben.
+    """
     base = _ai_resolver_airline_crew_context_block()
     kind_ctx = _ai_resolver_kind_context(kind)
-    # Context dict zu kompaktem JSON — alle Plan-Fakten
+
+    # PII-Sanitisierung: nur Whitelist-Felder gelangen in den Prompt
+    safe_ctx = _ai_resolver_safe_context(context)
     ctx_lines = []
-    for ck, cv in (context or {}).items():
+    for ck, cv in safe_ctx.items():
         if ck == 'uncertain_fact':
             continue
         try:
@@ -7696,25 +8113,72 @@ def _ai_resolver_build_prompt(kind, context, uncertain_fact):
         except Exception:
             ctx_lines.append(f"  {ck}: {str(cv)[:200]}")
     ctx_block = '\n'.join(ctx_lines[:30])  # Hard-Cap gegen riesige Prompts
+
+    # uncertain_fact wird selbst sanitisiert (max 80 Zeichen, kein Email-Pattern)
+    safe_fact = str(uncertain_fact or '')[:80]
+    if '@' in safe_fact:
+        safe_fact = safe_fact.split('@', 1)[0][:40]
+
+    # Phase 5d — Cross-Source-Konflikt-Erklärung im Prompt
+    conflict_note = ''
+    why = safe_ctx.get('why_evidence_uncertain') or []
+    if why:
+        conflict_note = (
+            '\nWARUM EVIDENCE-ENGINE UNSICHER IST '
+            '(Cross-Source-Konflikte):\n'
+            + ''.join(f'  - {w}\n' for w in why)
+            + '\n'
+        )
+
     return (
-        f"{base}\n\n"
+        f"{base}\n"
         f"Resolver-Aufgabe: {kind}\n"
         f"{kind_ctx}\n\n"
-        f"Plan-Kontext:\n{ctx_block}\n\n"
-        f"Unsicherer Fakt: {uncertain_fact}\n\n"
-        f"Frage: Was bedeutet/ist „{uncertain_fact}\" in diesem Crew-Kontext?\n\n"
-        f"Antwortformat (NUR JSON, keine Begleitzeilen):\n"
+        f"Plan-Kontext (anonymisiert, PII-gefiltert):\n{ctx_block}\n"
+        f"{conflict_note}"
+        f"\nUnsicherer Fakt: {safe_fact}\n\n"
+        f"Frage: Wie soll dieser Tag im Tour-Kontext eingeordnet werden?\n\n"
+        f"Antwortformat (NUR strict JSON, keine Begleitzeilen):\n"
         f"{{\n"
         f'  "resolved": true|false,\n'
-        f'  "value": {{"resolved_place": "...", "country": "...", "bmf_key": "..."}} oder ähnlich,\n'
+        f'  "decision": "KEEP_TOUR" | "DROP_TOUR" | "NEEDS_REVIEW",\n'
+        f'  "context_type": "tour_day" | "homebase_free" | "homebase_standby"\n'
+        f'                 | "hotel_standby" | "reader_misread" | "routing_conflict"\n'
+        f'                 | "positioning" | "unknown",\n'
+        f'  "value": {{"resolved_place": "...", "country": "...", "bmf_key": "..."}} '
+        f'oder beschreibend,\n'
         f'  "confidence": 0.0-1.0,\n'
         f'  "reason": "kurze Begründung mit Evidenz",\n'
         f'  "evidence": ["Beleg aus Plan-Zeilen"],\n'
         f'  "needs_review": true|false\n'
         f"}}\n\n"
-        f"WICHTIG: KEINE Steuerbeträge, Pauschalen, Euro-Werte oder BMF-Sätze nennen. "
-        f"Antworte nur mit faktischer Kontextauflösung. "
-        f"Confidence ≥0.90 nur wenn im Plan-Kontext klar belegbar."
+        f"REGELN für decision:\n"
+        f"  - KEEP_TOUR nur wenn CAS+SE+Plausibilität konsistent. "
+        f"Bei FollowMe-Place-Konflikt: NICHT blind KEEP — eher reader_misread oder NEEDS_REVIEW.\n"
+        f"  - DROP_TOUR wenn der Tag im Tour-Kontext nicht plausibel ist "
+        f"(kein SE-Stempel, keine Anfahrt-Evidence, FREI-Lücke um den Tag, "
+        f"keine prev/next-Continuity). Verdacht reader_misread / Sequence-ID.\n"
+        f"  - NEEDS_REVIEW wenn ambig — z.B. RES nach foreign-overnight "
+        f"(könnte standby_hotel ODER standby_home sein und konkret abhängig von "
+        f"Folgetag-Continuity), oder Phantom-Tag mit foreign-Routing aber ohne "
+        f"SE-Stempel.\n\n"
+        f"REGELN für context_type:\n"
+        f"  - tour_day: echter Tour-Tag mit Flug+Layover+SE-Stempel\n"
+        f"  - homebase_free: Frei-Tag zuhause, kein Dienst\n"
+        f"  - homebase_standby: RES/SB zuhause, kein Tour-Kontext\n"
+        f"  - hotel_standby: RES/SB im foreign Hotel während Tour\n"
+        f"  - reader_misread: CAS-Reader hat falsch gelesen (z.B. JFK vs SNN)\n"
+        f"  - routing_conflict: Routing widerspricht sich selbst oder dem Tour-Kontext\n"
+        f"  - positioning: Crew-Positionierungs-Flug (FRA→X→FRA same-day, Crew transfer)\n"
+        f"  - unknown: nicht eindeutig\n\n"
+        f"REGELN für confidence:\n"
+        f"  - ≥0.90 nur wenn alle drei Quellen (CAS, SE/Anfahrt, FollowMe falls "
+        f"vorhanden) konsistent sind. Cross-Source-Konflikt → max 0.85.\n"
+        f"  - 0.70-0.89 wenn Entscheidung defensible aber Konflikt-Hinweise vorliegen.\n"
+        f"  - <0.70 wenn unklar.\n\n"
+        f"VERBOTEN: KEINE Steuerbeträge, Pauschalen, Euro-Werte, Tagesätze, "
+        f"BMF-Sätze, amount/eur/rate/betrag/tax/steuer-Felder. "
+        f"Antworte nur mit faktischer Kontext-Klassifikation."
     )
 
 
@@ -7747,7 +8211,8 @@ def _ai_resolver_review_fallback(reason='unknown_failure'):
 
 
 def _resolve_uncertain_fact_with_ai(kind, context, job_id=None, datum=None,
-                                     uncertain_fact='', _anthropic_client=None):
+                                     uncertain_fact='', _anthropic_client=None,
+                                     _force_mock=False):
     """Aktiver KI-Kontextresolver. Ruft Sonnet 4.5 mit Airline-Crew-Kontext auf
     und liefert strukturierten Fakt zurück (KEIN Steuerbetrag).
 
@@ -7792,6 +8257,62 @@ def _resolve_uncertain_fact_with_ai(kind, context, job_id=None, datum=None,
             return dict(result)  # Defensive copy
         # Expired → drop
         _ai_resolver_cache.pop(cache_key, None)
+
+    # Phase 5a — Mock-Mode-Bypass.
+    # Aktiv wenn:
+    #   - _force_mock=True (explicit shadow-integration request), ODER
+    #   - env-Var AEROTAX_AI_RESOLVER_MODE=mock UND kein _anthropic_client injected.
+    # Default-Verhalten bleibt unverändert (Anthropic-Call wenn API-Key vorhanden),
+    # damit Legacy-Tests + _get_bmf_for_iata-Path unangetastet bleiben.
+    _resolver_mode = (os.environ.get('AEROTAX_AI_RESOLVER_MODE') or 'live').lower().strip()
+    if (_force_mock or
+            (_resolver_mode == 'mock' and _anthropic_client is None)):
+        try:
+            mock_raw = _ai_resolver_mock_dispatch(kind, context or {})
+        except Exception as e:
+            return _ai_resolver_review_fallback(f'mock_error:{type(e).__name__}')
+        # Anti-Tax-Sanitizer auch auf Mock-Output anwenden
+        mval = mock_raw.get('value') if isinstance(mock_raw.get('value'), dict) else {}
+        safe, offending = _ai_resolver_value_safe(mval)
+        if not safe:
+            result = _ai_resolver_review_fallback(
+                f'value_contains_forbidden_key:{offending}'
+            )
+            expires = now + timedelta(hours=_AI_RESOLVER_CACHE_TTL_HOURS)
+            _ai_resolver_cache[cache_key] = (result, expires)
+            return dict(result)
+        # Phase 5d — structured fields (decision + context_type) durchreichen
+        _ALLOWED_DECISIONS = ('KEEP_TOUR', 'DROP_TOUR', 'NEEDS_REVIEW')
+        _ALLOWED_CONTEXTS = (
+            'tour_day', 'homebase_free', 'homebase_standby',
+            'hotel_standby', 'reader_misread', 'routing_conflict',
+            'positioning', 'unknown',
+        )
+        m_dec = str(mock_raw.get('decision') or '').upper().strip()
+        m_dec = m_dec if m_dec in _ALLOWED_DECISIONS else 'NEEDS_REVIEW'
+        m_ctx = str(mock_raw.get('context_type') or '').lower().strip()
+        m_ctx = m_ctx if m_ctx in _ALLOWED_CONTEXTS else 'unknown'
+        result = {
+            'resolved':     bool(mock_raw.get('resolved', False)),
+            'decision':     m_dec,
+            'context_type': m_ctx,
+            'value':        mock_raw.get('value'),
+            'confidence':   float(mock_raw.get('confidence') or 0.0),
+            'reason':       str(mock_raw.get('reason') or '')[:300],
+            'evidence':     [str(e)[:200] for e in (mock_raw.get('evidence') or [])[:5]],
+            'needs_review': bool(mock_raw.get('needs_review', False)),
+        }
+        result = _ai_resolver_apply_thresholds(result)
+        expires = now + timedelta(hours=_AI_RESOLVER_CACHE_TTL_HOURS)
+        _ai_resolver_cache[cache_key] = (result, expires)
+        try:
+            app.logger.info(
+                f"[ai-resolver-mock] kind={kind} conf={result['confidence']:.2f} "
+                f"resolved={result['resolved']} needs_review={result['needs_review']}"
+            )
+        except Exception:
+            pass
+        return dict(result)
 
     # Lazy-load Anthropic client (oder via DI für Tests)
     client = _anthropic_client
@@ -7866,9 +8387,23 @@ def _resolve_uncertain_fact_with_ai(kind, context, job_id=None, datum=None,
         _ai_resolver_cache[cache_key] = (result, expires)
         return dict(result)
 
+    # Phase 5d: structured-output fields (decision + context_type)
+    _ALLOWED_DECISIONS = ('KEEP_TOUR', 'DROP_TOUR', 'NEEDS_REVIEW')
+    _ALLOWED_CONTEXTS = (
+        'tour_day', 'homebase_free', 'homebase_standby',
+        'hotel_standby', 'reader_misread', 'routing_conflict',
+        'positioning', 'unknown',
+    )
+    raw_decision = str(parsed.get('decision') or '').upper().strip()
+    decision = raw_decision if raw_decision in _ALLOWED_DECISIONS else 'NEEDS_REVIEW'
+    raw_ctx_type = str(parsed.get('context_type') or '').lower().strip()
+    context_type = raw_ctx_type if raw_ctx_type in _ALLOWED_CONTEXTS else 'unknown'
+
     # Confidence-Schwellen anwenden (override resolved/needs_review)
     result = {
         'resolved':     bool(parsed.get('resolved', False)),
+        'decision':     decision,
+        'context_type': context_type,
         'value':        val,
         'confidence':   float(parsed.get('confidence', 0.0) or 0.0),
         'reason':       str(parsed.get('reason', ''))[:300],
@@ -7957,9 +8492,16 @@ def _extract_homebase(base_str):
 
 
 def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
-    """Liest LH Flugstunden-Übersicht LITERAL (kein Schätzen, kein Kalibrieren).
+    """[DEPRECATED v11 Clean-Release 2026-05-20]
+    Liest LH Flugstunden-Übersicht LITERAL (kein Schätzen, kein Kalibrieren).
 
-    Logik:
+    Flugstundenübersicht ist KEINE Pflicht-/Reader-/Plausi-Quelle mehr.
+    Die finale Quelle-Hierarchie ist LSB + SE + Dienstplan/CAS.
+    Aufrufe sind hart deaktiviert. Wenn ein Notfall-Forensik-Zugriff
+    nötig ist, kann die ENV `AEROTAX_LEGACY_FLUGSTUNDEN_FORENSIK=1`
+    gesetzt werden — Produktions-Default ist 0.
+
+    Logik (historisch):
     1. Alle Zeilen nach Datum gruppieren (mehrere Zeilen pro Tag möglich, z.B. Same-Day-Tour)
     2. Pro Tag aktivität bestimmen:
        - FREI/URLAUB/KRANK/OF/LM → Frei-Tag
@@ -7973,6 +8515,12 @@ def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
        - hotelnacht = jeder FL STRECKENEINSATZTAG
        - Same-day (A FRA + E FRA gleicher Tag) = 1 Fahrtag, 1 Arbeitstag, 0 Hotel
     """
+    if os.environ.get('AEROTAX_LEGACY_FLUGSTUNDEN_FORENSIK', '0') != '1':
+        raise RuntimeError(
+            '_parse_flugstunden_deterministic() ist seit v11 Clean-Release deaktiviert. '
+            'Pflicht-Quellen sind LSB + SE + Dienstplan/CAS. '
+            'Setze AEROTAX_LEGACY_FLUGSTUNDEN_FORENSIK=1 fuer reinen Forensik-Lauf.'
+        )
     INLAND_IATA = {'FRA','MUC','HAM','DUS','BER','STR','CGN','NUE','LEJ',
                    'HAJ','HHN','BRE','DRS','ERF','NRN','FMO','LBC','TXL','PAD','SCN',
                    'XFW','RLG','SXF','TXF','MHG','FKB','FDH','DTM','FRO','HEI','KEL',
@@ -8802,11 +9350,20 @@ def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
     }
 
 def parse_dienstplan_mit_ki(pdf_bytes_list, se_bytes_list=None, km_form=0, se_hints=None, homebase='FRA', einsatzplan_bytes_list=None):
-    """
+    """[DEPRECATED v11 Clean-Release 2026-05-20]
     Analysiert Lufthansa Flugstunden-Übersichten mit Claude (pure KI, kein Regex).
     Claude liest die PDFs direkt und berechnet alle Werte intelligent.
     km kommt vom Nutzer-Formular, wird als Parameter übergeben.
+
+    Flugstundenübersicht ist KEINE Pflicht-/Reader-/Plausi-Quelle mehr.
+    Aufrufe sind hart deaktiviert, ausser per Forensik-Override.
     """
+    if os.environ.get('AEROTAX_LEGACY_FLUGSTUNDEN_FORENSIK', '0') != '1':
+        raise RuntimeError(
+            'parse_dienstplan_mit_ki() ist seit v11 Clean-Release deaktiviert. '
+            'Pflicht-Quellen sind LSB + SE + Dienstplan/CAS (Reader V2). '
+            'Setze AEROTAX_LEGACY_FLUGSTUNDEN_FORENSIK=1 fuer reinen Forensik-Lauf.'
+        )
     import anthropic, base64, pdfplumber, io, re, json
 
     if not pdf_bytes_list:
@@ -11454,6 +12011,48 @@ def _sonnet_read_cas_structured(cas_bytes, year=2025, homebase='FRA', job_id=Non
     if source_filenames is None:
         source_filenames = [f'cas_{i+1}.pdf' for i in range(len(cas_list))]
 
+    # v11 Clean-Release Phase 3: CAS-Reader darf NUR auf Dienstplan-PDFs laufen.
+    # Wenn ein Caller versehentlich Flugstundenuebersicht-Bytes oder LSB/SE-Bytes
+    # uebergibt, refusen wir mit klarer Warnung. Detection per Doc-Type-Klassifikator.
+    refused_files = []
+    accepted_indices = []
+    for i, pdf_bytes in enumerate(cas_list):
+        fname = source_filenames[i] if i < len(source_filenames) else ''
+        try:
+            dt = classify_uploaded_pdf_doc_type(pdf_bytes, filename=fname)
+        except Exception:
+            dt = DOC_TYPE_UNKNOWN
+        if dt == DOC_TYPE_LEGACY_FLUG:
+            refused_files.append({'filename': fname, 'doc_type': dt,
+                                    'reason': 'Flugstundenuebersicht ist keine zulaessige CAS-Quelle.'})
+            continue
+        # LSB/SE versehentlich in CAS-Slot → ebenfalls refuse, aber mit anderer reason
+        if dt in (DOC_TYPE_LSB, DOC_TYPE_SE):
+            refused_files.append({'filename': fname, 'doc_type': dt,
+                                    'reason': f'Datei wurde als {dt} erkannt, gehoert nicht in CAS-Slot.'})
+            continue
+        accepted_indices.append(i)
+
+    if refused_files:
+        print(f"[cas-reader] refused {len(refused_files)} non-CAS files: "
+              + ', '.join(r['filename'] for r in refused_files))
+
+    if not accepted_indices:
+        print('[cas-reader] keine zulaessige CAS-Datei nach Doc-Type-Check.')
+        return {
+            'days': [], 'conflicts': [], 'warnings': [
+                f'Alle {len(cas_list)} hochgeladenen Dateien wurden refused (kein dienstplan_cas erkannt).'
+            ],
+            '_files_total': len(cas_list), '_files_processed': 0,
+            '_cache_hits': 0, '_merged_mode': False,
+            '_refused_files': refused_files,
+        }
+
+    # Reduziere cas_list + source_filenames auf akzeptierte
+    if len(accepted_indices) != len(cas_list):
+        cas_list = [cas_list[i] for i in accepted_indices]
+        source_filenames = [source_filenames[i] for i in accepted_indices]
+
     import hashlib as _hl
 
     # v13 Phase 2A: Variante A default OFF — per-file parallel ist Default.
@@ -11726,7 +12325,17 @@ def _sonnet_read_dp_structured(dp_bytes, einsatz_bytes=None, year=2025, homebase
       ],
       "warnings": [...]
     }
+
+    [DEPRECATED v11 Clean-Release 2026-05-20]
+    Flugstundenuebersicht-Reader. Pflicht-Quellen sind jetzt LSB + SE + Dienstplan/CAS.
+    Aufrufe sind hart deaktiviert, ausser per Forensik-Override.
     """
+    if os.environ.get('AEROTAX_LEGACY_FLUGSTUNDEN_FORENSIK', '0') != '1':
+        raise RuntimeError(
+            '_sonnet_read_dp_structured() ist seit v11 Clean-Release deaktiviert. '
+            'Pflicht-Quellen sind LSB + SE + Dienstplan/CAS (Reader V2). '
+            'Setze AEROTAX_LEGACY_FLUGSTUNDEN_FORENSIK=1 fuer reinen Forensik-Lauf.'
+        )
     if not ANTHROPIC_KEY:
         return None
     dp_bytes = _bytes_list(dp_bytes) if dp_bytes else []
@@ -12208,7 +12817,17 @@ def _sonnet_read_dp_structured_chunked_v104(dp_bytes, einsatz_bytes=None, year=2
     Wenn PDF klein genug (≤4 Seiten): single call ohne Chunking (kein Overhead).
 
     Returns: dict {days, warnings} — gleiche Shape wie _sonnet_read_dp_structured.
+
+    [DEPRECATED v11 Clean-Release 2026-05-20]
+    Flugstundenuebersicht-Reader. Pflicht-Quellen sind jetzt LSB + SE + Dienstplan/CAS.
+    Aufrufe sind hart deaktiviert, ausser per Forensik-Override.
     """
+    if os.environ.get('AEROTAX_LEGACY_FLUGSTUNDEN_FORENSIK', '0') != '1':
+        raise RuntimeError(
+            '_sonnet_read_dp_structured_chunked_v104() ist seit v11 Clean-Release deaktiviert. '
+            'Pflicht-Quellen sind LSB + SE + Dienstplan/CAS (Reader V2). '
+            'Setze AEROTAX_LEGACY_FLUGSTUNDEN_FORENSIK=1 fuer reinen Forensik-Lauf.'
+        )
     if not dp_bytes:
         return None
     total_pages = _count_dp_pdf_pages(dp_bytes)
@@ -13694,6 +14313,3093 @@ def _followme_identify_tours(tage_detail, homebase='FRA'):
     return tours
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# BH-CORE-001 — Normalized Tours Layer (Tour-First Classifier, Shadow-Mode)
+# ════════════════════════════════════════════════════════════════════════════
+# Stand 2026-05-19. Phase 1: Helper + normalized_tours-Funktion eingebaut,
+# aber NICHT in der bestehenden Pipeline aktiv. Wird in Phase 3 hinter
+# AEROTAX_TOUR_FIRST_CLASSIFIER=1 aktiviert.
+# Doku: docs/BH_CORE_001_TOUR_FIRST_SPEC.md
+# Tests: tests/test_normalized_tours_*.py + test_tibor_2025_golden_acceptance.py
+# ════════════════════════════════════════════════════════════════════════════
+
+import re as _bh_core_re
+
+
+def _extract_iata_from_marker(marker):
+    """Liefert erstes 3-Buchstaben-IATA-ähnlich UPPERCASE-Token aus Marker.
+    Beispiele: 'X HKG' → 'HKG', 'X BLR' → 'BLR', 'X' → '', '755 LH755-1' → ''.
+    Filtert reine Number-Codes + bekannte Status-Tokens ('RES', 'SBY', 'OFF',
+    'ORTSTAG', 'FRS', 'FRD', 'LMN', 'EM').
+    """
+    if not marker:
+        return ''
+    EXCLUDE = {'RES', 'SBY', 'OFF', 'ORTSTAG', 'FRS', 'FRD', 'LMN', 'LMN_AS',
+               'LMN_CR', 'EM', 'OF', 'P1', 'P2', 'P3', 'P4', 'PU', 'PA',
+               'LH', 'ZH', 'TAG'}
+    tokens = _bh_core_re.findall(r'\b[A-Z]{3}\b', (marker or '').upper())
+    for t in tokens:
+        if t in EXCLUDE:
+            continue
+        # Reine Number-Suffixe wie LH1, LH2 ausschließen
+        return t
+    return ''
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CAS Reader V2 — Phase R-Sprint (Mock-Dispatcher + Schema-Validator)
+# Spec: docs/CAS_READER_PROMPT_V2_SPEC.md
+# Phase R3: Mock-Implementation für Tests, KEIN Live-PDF-Read.
+# Phase R4: Live-Re-Read mit reader_v2_prompt (separate Phase, env-gated).
+# ════════════════════════════════════════════════════════════════════════════
+
+# Reader V2 erlaubte tour_context-Werte
+_READER_V2_TOUR_CONTEXTS = frozenset({
+    'tour_start', 'tour_mid', 'tour_end', 'same_day_tour',
+    'homebase_free', 'homebase_standby', 'hotel_standby', 'inland_standby',
+    'office', 'training', 'positioning', 'unknown',
+})
+
+# Reader V2 erlaubte warnings
+_READER_V2_WARNINGS = frozenset({
+    'DUTY_OVER_FTL', 'MARKER_AMBIGUOUS', 'ROUTING_INCOMPLETE',
+    'PII_REMOVED', 'CONTEXT_INSUFFICIENT',
+})
+
+# Pflichtfelder im V2-Output (schema-validation)
+_READER_V2_REQUIRED_FIELDS = frozenset({
+    'datum', 'raw_marker', 'activity_type', 'routing', 'start_time',
+    'end_time', 'duty_duration_minutes', 'has_fl', 'starts_at_homebase',
+    'ends_at_homebase', 'overnight_after_day', 'layover_ort',
+    'tour_id_candidate', 'position_in_tour', 'tour_context',
+    'continuation_from_prev_day', 'continuation_to_next_day',
+    'reader_confidence', 'raw_evidence_excerpt',
+    'needs_context_resolution', 'warnings',
+})
+
+# Forbidden tax-fields im V2-Output (re-use Phase-5a-Set)
+_READER_V2_FORBIDDEN_FIELDS = frozenset({
+    'amount', 'eur', 'euro', 'tagesatz', 'tagessatz', 'tax', 'steuerbetrag',
+    'deduction', 'rate', 'betrag', 'pauschale', 'vma', 'an_abreise',
+    'voll_24h', 'tagestrip_8h', 'price', 'preis', 'satz', 'steuer',
+})
+
+
+def _cas_reader_v2_validate_schema(day_output):
+    """Validiert Reader-V2-Output gegen Pflichtfelder + Forbidden-Fields.
+
+    Returns:
+      (valid: bool, issues: list[str])
+    """
+    issues = []
+    if not isinstance(day_output, dict):
+        return (False, ['NOT_DICT'])
+
+    # Pflichtfelder
+    missing = _READER_V2_REQUIRED_FIELDS - set(day_output.keys())
+    if missing:
+        issues.append(f'MISSING_FIELDS:{sorted(missing)}')
+
+    # Forbidden tax-Fields (rekursiv)
+    def _has_forbidden(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                ks = str(k).lower().strip()
+                if ks in _READER_V2_FORBIDDEN_FIELDS:
+                    return True
+                if any(fk in ks for fk in _READER_V2_FORBIDDEN_FIELDS):
+                    return True
+                if _has_forbidden(v):
+                    return True
+        elif isinstance(node, (list, tuple)):
+            for it in node:
+                if _has_forbidden(it):
+                    return True
+        return False
+
+    if _has_forbidden(day_output):
+        issues.append('FORBIDDEN_TAX_FIELD')
+
+    # tour_context-Enum
+    tc = day_output.get('tour_context')
+    if tc and tc not in _READER_V2_TOUR_CONTEXTS:
+        issues.append(f'INVALID_TOUR_CONTEXT:{tc}')
+
+    # reader_confidence Range
+    rc = day_output.get('reader_confidence')
+    if rc is not None:
+        try:
+            rcf = float(rc)
+            if not 0.0 <= rcf <= 1.0:
+                issues.append(f'CONFIDENCE_OUT_OF_RANGE:{rcf}')
+        except (TypeError, ValueError):
+            issues.append(f'CONFIDENCE_NOT_NUMERIC:{rc}')
+
+    # raw_evidence_excerpt ≤ 200 chars
+    rex = day_output.get('raw_evidence_excerpt')
+    if rex is not None and isinstance(rex, str) and len(rex) > 200:
+        issues.append(f'EXCERPT_TOO_LONG:{len(rex)}')
+
+    # warnings is list[str]
+    ws = day_output.get('warnings')
+    if ws is not None and not isinstance(ws, list):
+        issues.append(f'WARNINGS_NOT_LIST:{type(ws).__name__}')
+
+    return (not issues, issues)
+
+
+def _cas_reader_v2_build_prompt(day_excerpt, prev_day=None, next_day=None,
+                                  homebase='FRA'):
+    """Baut den Reader-V2-Prompt für einen einzelnen Tag.
+    day_excerpt: kurzer PDF-Text-Auszug für DIESEN Tag (PII-gestrippt).
+    prev_day / next_day: optionale Hint-Daten für Tour-Continuity.
+
+    Output: prompt-String (für client.messages.create).
+    """
+    import json as _j
+    crew = _ai_resolver_airline_crew_context_block()  # Phase 5d Vokabular
+
+    # PII-Strip + Hard-Cap auf 200 Zeichen
+    _PII_PATTERNS = (
+        # vereinfacht: Namen/PNRs/...
+        # Reader-V2 erwartet anonymisierten Excerpt vom Caller
+    )
+    safe_excerpt = (day_excerpt or '')[:200]
+
+    prev_hint = ''
+    if isinstance(prev_day, dict):
+        prev_hint = (
+            f'  layover={prev_day.get("layover_ort","")} '
+            f'overnight={prev_day.get("overnight_after_day", False)} '
+            f'routing={prev_day.get("routing", [])}'
+        )
+    next_hint = ''
+    if isinstance(next_day, dict):
+        next_hint = (
+            f'  routing={next_day.get("routing", [])} '
+            f'starts_hb={next_day.get("starts_at_homebase", False)}'
+        )
+
+    return (
+        f'{crew}\n\n'
+        f'AUFGABE: CAS-Tag-Extraktion (Reader V2)\n'
+        f'Lies den PDF-Text-Auszug und extrahiere Tour-Kontext-Fakten pro Tag. '
+        f'Klassifiziere NICHT steuerlich.\n\n'
+        f'ANTI-NAIVE-RULES:\n'
+        f'  - X innerhalb foreign-overnight-Kontext → tour_mid, nicht Frei.\n'
+        f'  - OFF im foreign Layover → tour_mid/hotel_standby, nicht Frei.\n'
+        f'  - RES nach foreign-overnight → hotel_standby; nach Inland → inland_standby.\n'
+        f'  - == braucht prev-foreign-Layover.\n'
+        f'  - Marker-Spalte ≠ Routing-Spalte. IATA NUR aus routing/SE/layover.\n'
+        f'  - 5-6-stellige Numerik = Roster-/Sequence-ID, NICHT Flugnummer.\n'
+        f'  - duty>840min: warnings=["DUTY_OVER_FTL"], confidence ≤ 0.70.\n\n'
+        f'KONTEXT:\n'
+        f'  homebase: {homebase}\n'
+        f'  prev_day:\n{prev_hint or "    (none)"}\n'
+        f'  next_day:\n{next_hint or "    (none)"}\n\n'
+        f'PDF-Auszug (anonymisiert, max 200 chars):\n'
+        f'  ```\n  {safe_excerpt}\n  ```\n\n'
+        f'Output (strict JSON, alle Pflichtfelder):\n'
+        f'{{\n'
+        f'  "datum": "YYYY-MM-DD",\n'
+        f'  "raw_marker": "string max 50",\n'
+        f'  "activity_type": "tour|frei|standby|training|office|unknown",\n'
+        f'  "routing": ["IATA1", "IATA2"],\n'
+        f'  "start_time": "HH:MM or empty",\n'
+        f'  "end_time": "HH:MM or empty",\n'
+        f'  "duty_duration_minutes": null,\n'
+        f'  "has_fl": false,\n'
+        f'  "starts_at_homebase": false,\n'
+        f'  "ends_at_homebase": false,\n'
+        f'  "overnight_after_day": false,\n'
+        f'  "layover_ort": "IATA or empty",\n'
+        f'  "tour_id_candidate": "",\n'
+        f'  "position_in_tour": "",\n'
+        f'  "tour_context": "tour_start|tour_mid|tour_end|same_day_tour|homebase_free|homebase_standby|hotel_standby|inland_standby|office|training|positioning|unknown",\n'
+        f'  "continuation_from_prev_day": false,\n'
+        f'  "continuation_to_next_day": false,\n'
+        f'  "reader_confidence": 0.0,\n'
+        f'  "raw_evidence_excerpt": "max 200 chars",\n'
+        f'  "needs_context_resolution": false,\n'
+        f'  "warnings": []\n'
+        f'}}\n\n'
+        f'WICHTIG: KEINE Steuerbeträge, EUR, Pauschalen, BMF-Sätze. '
+        f'KEINE Namen/PNR/Personalnummern. '
+        f'raw_evidence_excerpt max 200 chars.'
+    )
+
+
+def _cas_reader_v2_mock_dispatch(day_excerpt, prev_day=None, next_day=None,
+                                   homebase='FRA', marker_hint='',
+                                   routing_hint=None, layover_hint='',
+                                   overnight_hint=False, has_fl_hint=False,
+                                   start_time_hint='', duty_hint=0,
+                                   datum=''):
+    """Mock-Reader-V2-Dispatcher für Phase-R3-Tests.
+
+    Verwendet die Anti-Naive-Rules + Crew-Vokabular um Tour-Kontext aus
+    Hint-Parameter zu bestimmen. Kein Live-Call.
+    """
+    hb = (homebase or 'FRA').upper()
+    marker = (marker_hint or '').upper().strip()
+    routing = [str(r).upper() for r in (routing_hint or []) if r]
+    layover = (layover_hint or '').upper().strip()
+    prev = prev_day or {}
+    nxt = next_day or {}
+
+    prev_overnight = bool(prev.get('overnight_after_day'))
+    prev_layover = (prev.get('layover_ort') or '').upper().strip()
+    prev_foreign = bool(
+        prev_layover and not _is_inland_code(prev_layover)
+        and prev_layover != hb
+    )
+    prev_inland = bool(
+        prev_layover and _is_inland_code(prev_layover) and prev_layover != hb
+    )
+
+    warnings = []
+    confidence = 0.85
+    needs_context = False
+    tour_context = 'unknown'
+    activity_type = 'unknown'
+    tour_id_candidate = ''
+    position_in_tour = ''
+    continuation_from_prev = False
+    continuation_to_next = False
+
+    # Day-Suffix-Extraktion
+    import re as _re
+    day_suffix_match = _re.search(
+        r'\b(?:Tag|Day)\s*(\d+)', marker, _re.IGNORECASE
+    )
+    if day_suffix_match:
+        position_in_tour = day_suffix_match.group(1)
+
+    # Roster-ID-Extraktion (5-6 Ziffern am Anfang)
+    roster_match = _re.match(r'^(\d{4,6})\b', marker)
+    if roster_match:
+        tour_id_candidate = roster_match.group(1)
+
+    marker_first = marker.split()[0] if marker else ''
+
+    # Duty-Plausi
+    if duty_hint > _BH_CORE_FTL_MAX_DUTY_MIN:
+        warnings.append('DUTY_OVER_FTL')
+        confidence = min(confidence, 0.70)
+
+    # Marker-Klassifikation mit Anti-Naive-Rules
+    PASSIVE = ('ORTSTAG', 'FRS', 'LMN_AS', 'LMN_CR', 'FRD')
+    TRAINING = ('EM', 'EH', 'EK', 'TK', 'D4', 'DD', 'SECCRM', 'CRM', 'TRG')
+
+    has_foreign_routing = any(
+        r and r != hb and not _is_inland_code(r) for r in routing
+    )
+
+    if (marker_first in ('RES', 'SBY', 'SB', 'RES_SB')
+            or marker_first.startswith('SB_')
+            or marker_first.startswith('RES_')):
+        activity_type = 'standby'
+        if prev_overnight and prev_foreign:
+            tour_context = 'hotel_standby'
+            continuation_from_prev = True
+        elif prev_overnight and prev_inland:
+            tour_context = 'inland_standby'
+            continuation_from_prev = True
+        else:
+            tour_context = 'homebase_standby'
+        confidence = max(confidence, 0.85)
+
+    elif marker_first in ('X', '==', 'OFF', 'OF') or marker.startswith('X '):
+        # Anti-Naive: X/OFF/== mit foreign-Tour-Kontext = tour_mid
+        if prev_overnight and prev_foreign:
+            activity_type = 'tour'
+            tour_context = 'tour_mid'
+            continuation_from_prev = True
+            confidence = 0.85
+        elif (overnight_hint and layover
+              and not _is_inland_code(layover) and layover != hb):
+            # day selbst hat foreign overnight + layover
+            activity_type = 'tour'
+            tour_context = 'tour_mid'
+            confidence = 0.85
+        else:
+            activity_type = 'frei'
+            tour_context = 'homebase_free'
+            confidence = 0.80
+            if not prev_overnight and not overnight_hint:
+                # Wenn KEIN Tour-Kontext vorhanden, sicher Frei
+                confidence = 0.85
+
+    elif any(p in marker for p in PASSIVE):
+        activity_type = 'office'
+        tour_context = 'office'
+        confidence = 0.92
+
+    elif any(t in marker for t in TRAINING):
+        activity_type = 'training'
+        tour_context = 'training'
+        if start_time_hint and duty_hint >= 240:
+            confidence = 0.90
+        else:
+            confidence = 0.80
+            warnings.append('MARKER_AMBIGUOUS')
+
+    elif routing and has_foreign_routing and overnight_hint:
+        # Klassischer Tour-Tag mit foreign-Routing + overnight
+        activity_type = 'tour'
+        if not prev_overnight:
+            tour_context = 'tour_start'
+        else:
+            tour_context = 'tour_mid'
+            continuation_from_prev = True
+        confidence = 0.92
+
+    elif (routing and has_foreign_routing and not overnight_hint
+          and len(routing) >= 2 and routing[0] == hb
+          and routing[-1] == hb):
+        # Same-Day-foreign-Roundtrip
+        activity_type = 'tour'
+        tour_context = 'same_day_tour'
+        confidence = 0.90
+
+    elif (routing and len(routing) >= 3 and hb in routing[1:-1]
+          and routing[-1] != hb):
+        # Transit via Homebase, endet foreign
+        activity_type = 'tour'
+        tour_context = 'positioning'
+        confidence = 0.75
+        needs_context = True
+        warnings.append('MARKER_AMBIGUOUS')
+
+    elif not marker and not routing:
+        # Reader hat nichts → unsicher
+        activity_type = 'unknown'
+        tour_context = 'unknown'
+        confidence = 0.30
+        needs_context = True
+        warnings.append('CONTEXT_INSUFFICIENT')
+
+    else:
+        # Fallback: unklar
+        tour_context = 'unknown'
+        confidence = 0.50
+        needs_context = True
+        warnings.append('MARKER_AMBIGUOUS')
+
+    # IATA-Source-Regel: KEINE IATA aus Marker-Suffix erfinden
+    # (routing nutzt nur die übergebene routing_hint)
+
+    # Final-Cap der confidence wenn DUTY_OVER_FTL — Reader-Bug-Verdacht
+    # muss confidence reduzieren auch wenn andere Indikatoren positiv sind
+    if 'DUTY_OVER_FTL' in warnings:
+        confidence = min(confidence, 0.70)
+
+    # PII-safe excerpt: nur erste 200 chars, KEIN Namen-Marker
+    excerpt = (day_excerpt or '')[:200] if day_excerpt else ''
+
+    return {
+        'datum':                      datum or '',
+        'raw_marker':                 (marker_hint or '')[:50],
+        'activity_type':              activity_type,
+        'routing':                    routing,
+        'start_time':                 start_time_hint,
+        'end_time':                   '',
+        'duty_duration_minutes':      int(duty_hint) if duty_hint else 0,
+        'has_fl':                     bool(has_fl_hint),
+        'starts_at_homebase':         bool(routing and routing[0] == hb),
+        'ends_at_homebase':           bool(routing and routing[-1] == hb),
+        'overnight_after_day':        bool(overnight_hint),
+        'layover_ort':                layover,
+        'tour_id_candidate':          tour_id_candidate,
+        'position_in_tour':           position_in_tour,
+        'tour_context':               tour_context,
+        'continuation_from_prev_day': continuation_from_prev,
+        'continuation_to_next_day':   continuation_to_next,
+        'reader_confidence':          confidence,
+        'raw_evidence_excerpt':       excerpt,
+        'needs_context_resolution':   needs_context,
+        'warnings':                   warnings,
+    }
+
+
+def _load_reader_v2_facts():
+    """Lade Reader-V2-Output-Fixture für Gap-Tage (falls vorhanden).
+    Returns dict[datum → reader_v2_output] oder {}.
+
+    [DEPRECATED v11 Clean-Release 2026-05-20]
+    Die `tibor_cas_reader_v2_gap_days.json`-Fixture wurde aus
+    `Flugstundenübersichten.pdf` re-read generiert. Per Master-Auftrag
+    ist Flugstundenübersicht KEINE Quelle mehr. Diese V2-Merge ist
+    Legacy-Pollution — Phantom-Touren in Tour-First-Layer durch
+    Reader-V2-Halluzinationen aus Flugstunden-Re-Read.
+
+    Aktiv-Status:
+      - Production: gibt {} zurueck (keine Merge).
+      - Forensik: AEROTAX_LEGACY_R5_V2_MERGE=1 → Merge aktiv (nur fuer Audit).
+    """
+    import os as _os
+    if _os.environ.get('AEROTAX_LEGACY_R5_V2_MERGE', '0') != '1':
+        return {}
+    import json as _j
+    v2_file = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        'tests', 'fixtures', 'tibor_cas_reader_v2_gap_days.json'
+    )
+    if not _os.path.exists(v2_file):
+        return {}
+    try:
+        data = _j.load(open(v2_file, encoding='utf-8'))
+    except Exception:
+        return {}
+    out = {}
+    for d in (data.get('days') or []):
+        dt = d.get('datum')
+        v2 = d.get('reader_v2_output')
+        if dt and v2:
+            out[dt] = v2
+    return out
+
+
+def _merge_v2_into_v1_dp(v1_dp, v2_output):
+    """R5-Merge-Regeln (generalisierbar):
+      - V1 ist Hauptquelle. V2 ergänzt nur wenn V1 leer/inkomplet.
+      - V2-confidence ≥ 0.85 + V1-routing leer → V2-routing übernehmen
+      - V2-layover_ort wenn V1-layover leer
+      - V2-overnight_after_day wenn V1-overnight=False + V2-Tour-Context
+      - V2-has_fl wenn V1-has_fl=False + V2-Tour-Context
+      - NIEMALS V1-routing/layover überschreiben wenn V1 explicit Werte hat
+      - V2-low-confidence (<0.85) → V2 ignorieren
+      - V2-tour_context='homebase_free' bei foreign-Tour-Verdacht: KEINE Override
+        (Reader-V2 hat CAS gelesen, CAS sagt Frei → Tour-First bleibt non_tour)
+    """
+    if not isinstance(v2_output, dict):
+        return v1_dp
+    conf = float(v2_output.get('reader_confidence') or 0)
+    if conf < 0.85:
+        return v1_dp   # zu unsicher, kein Merge
+
+    v2_ctx = v2_output.get('tour_context', '')
+    # V2 zeigt homebase_free/homebase_standby/office → V1 behalten (kein Tour-Hint)
+    if v2_ctx in ('homebase_free', 'homebase_standby', 'office', 'unknown'):
+        return v1_dp
+
+    merged = dict(v1_dp)
+    # routing
+    if not v1_dp.get('routing') and v2_output.get('routing'):
+        merged['routing'] = list(v2_output.get('routing') or [])
+    # layover_ort
+    if not v1_dp.get('layover_ort') and v2_output.get('layover_ort'):
+        merged['layover_ort'] = v2_output.get('layover_ort')
+    # overnight_after_day
+    if (not v1_dp.get('overnight_after_day')
+            and v2_output.get('overnight_after_day')):
+        merged['overnight_after_day'] = True
+    # has_fl
+    if (not v1_dp.get('has_fl')
+            and v2_output.get('has_fl')):
+        merged['has_fl'] = True
+    # start_time / end_time
+    if not v1_dp.get('start_time') and v2_output.get('start_time'):
+        merged['start_time'] = v2_output.get('start_time')
+    if not v1_dp.get('end_time') and v2_output.get('end_time'):
+        merged['end_time'] = v2_output.get('end_time')
+    # starts_at_homebase / ends_at_homebase aus routing ableitbar
+    hb = 'FRA'
+    if merged.get('routing'):
+        merged['starts_at_homebase'] = merged['routing'][0] == hb
+        merged['ends_at_homebase'] = merged['routing'][-1] == hb
+    # Audit-Marker: V2-merge angewendet
+    merged.setdefault('_v2_merged', True)
+    merged.setdefault('_v2_confidence', conf)
+    merged.setdefault('_v2_tour_context', v2_ctx)
+    return merged
+
+
+def _build_matched_from_raw(raw_days):
+    """Konvertiert raw tage_detail (Fixture-Format) → matched_days schema
+    {datum, dp, se}-Liste für `_normalize_tours_from_raw_facts`.
+
+    Fixture-Format hat `reader_facts` als nested-Dict, SE-Daten oft nicht
+    enthalten → leeres SE-Dict default.
+    """
+    matched = []
+    for t in raw_days:
+        if not isinstance(t, dict):
+            continue
+        datum = t.get('datum')
+        if not datum:
+            continue
+        rf = t.get('reader_facts') or {}
+        dp = {
+            'datum':                  datum,
+            'activity_type':          rf.get('activity_type') or '',
+            'routing':                list(rf.get('routing') or []),
+            'layover_ort':            rf.get('layover_ort') or '',
+            'overnight_after_day':    bool(rf.get('overnight_after_day')),
+            'start_time':             rf.get('start_time') or '',
+            'end_time':               rf.get('end_time') or '',
+            'duty_duration_minutes':  int(rf.get('duty_duration_minutes') or 0),
+            'raw_marker':             rf.get('marker_raw') or t.get('marker', ''),
+            'has_fl':                 bool(rf.get('has_fl')),
+            'is_workday':             bool(rf.get('is_workday')),
+            'requires_commute':       bool(rf.get('requires_commute')),
+            'starts_at_homebase':     bool(rf.get('starts_at_homebase')),
+            'ends_at_homebase':       bool(rf.get('ends_at_homebase')),
+            'raw_lines':              list(rf.get('raw_lines') or []),
+            'confidence':             float(rf.get('confidence') or 0.9),
+        }
+        # SE-Stempel aus Fixture-Hinweisen rekonstruieren (Production hat SE
+        # direkt; Fixture hat nur den Output). KEIN amount-Wert übernehmen
+        # (Tax-Leak vermeiden) — nur Stempel-Presence + Ort.
+        cr = t.get('classifier_result') or {}
+        sources = t.get('sources') or []
+        bmf_land = cr.get('bmf_land', '')
+        se_ort = (cr.get('se_effective_ort')
+                  or cr.get('classifier_effective_ort')
+                  or rf.get('layover_ort') or '')
+
+        # Inland/foreign-Determination:
+        # - bmf_land vorhanden: prüfe gegen 'Deutschland'
+        # - bmf_land leer: prüfe se_ort gegen Inland-IATA-Whitelist
+        if 'SE' in sources and se_ort:
+            if bmf_land == 'Deutschland':
+                se_is_inland = True
+            elif bmf_land and bmf_land != 'Deutschland':
+                se_is_inland = False
+            else:
+                # bmf_land fehlt — leite aus se_ort ab
+                se_is_inland = _is_inland_code(se_ort)
+            se = {
+                'stfrei_total':  0.0,   # KEIN EUR-Wert (Tax-Leak-Schutz)
+                'stfrei_ort':    se_ort,
+                'stfrei_inland': se_is_inland,
+                'zwoelftel':     1,
+                'lines':         [],
+                'count':         1,
+            }
+        else:
+            se = {
+                'stfrei_total':  0.0,
+                'stfrei_ort':    '',
+                'stfrei_inland': None,
+                'zwoelftel':     0,
+                'lines':         [],
+                'count':         0,
+            }
+        matched.append({'datum': datum, 'dp': dp, 'se': se})
+
+    # Phase R5 — V2-Merge: für Gap-Tage Reader-V2-Facts ergänzen wenn vorhanden
+    v2_facts = _load_reader_v2_facts()
+    if v2_facts:
+        for m in matched:
+            v2 = v2_facts.get(m['datum'])
+            if v2:
+                m['dp'] = _merge_v2_into_v1_dp(m['dp'], v2)
+
+    return matched
+
+
+# BH-CORE-001 Phase 4.6 — FTL-Limit für Reader-Plausi
+_BH_CORE_FTL_MAX_DUTY_MIN = 840   # EASA-FTL ≈ 14h max single-day duty
+_BH_CORE_DAY_SUFFIX_RE = _bh_core_re.compile(r'\b(?:Tag|Day)\s*(\d+)', _bh_core_re.IGNORECASE)
+
+
+def _has_day_suffix_ge_2(marker):
+    """True wenn Marker 'Tag N' / 'Day N' mit N≥2 enthält → Tour-Continuation."""
+    if not marker:
+        return False
+    m = _BH_CORE_DAY_SUFFIX_RE.search(marker)
+    if not m:
+        return False
+    try:
+        return int(m.group(1)) >= 2
+    except (ValueError, TypeError):
+        return False
+
+
+def _normalize_anfahrten_set(known_anfahrten):
+    """Konvertiert anfahrten-Input (Liste von dicts oder set of dates) → set of date-strings."""
+    if not known_anfahrten:
+        return None
+    if isinstance(known_anfahrten, (set, frozenset)):
+        return set(known_anfahrten)
+    if isinstance(known_anfahrten, (list, tuple)):
+        out = set()
+        for a in known_anfahrten:
+            if isinstance(a, dict) and a.get('datum'):
+                out.add(a['datum'])
+            elif isinstance(a, str):
+                out.add(a)
+        return out if out else None
+    return None
+
+
+def _normalize_tours_from_raw_facts(matched_days, homebase='FRA', year=2025,
+                                     known_anfahrten=None,
+                                     followme_context=None):
+    """BH-CORE-001 Layer 1: Baut Touren aus Roh-Fakten OHNE auf Tagesklassen
+    zu schauen.
+
+    Phase 4.6 Stufe 1+2 (2026-05-19):
+      - Reader-Plausi: duty > 840min (FTL-Limit) → reader_warning, kein tour_start
+      - Day-Suffix-Logic: Marker `Tag N`/`Day N` (N≥2) → impliziert Continuation
+      - Anfahrten-Cross-Check (optional `known_anfahrten` Liste):
+        Tour-START nur wenn Datum in Anfahrt-Liste ODER alternative-Evidence
+        ODER Continuation vom Vortag mit echtem Tour-Start.
+
+    Phase 4.8 (2026-05-19) — Evidence-Engine als Audit-Layer (Shadow):
+      - Pro Tag wird `_score_tour_day_evidence` aufgerufen und das Ergebnis
+        (evidence_for/against, score_for/against, decision, explanation,
+        source_refs) an den jeweiligen normalized_day angehängt.
+      - `followme_context` (optional, dict mit anfahrten_dates / tour_spans /
+        day_in_other_span_dates) wird der Evidence-Engine durchgereicht.
+        Wenn nur `known_anfahrten` gegeben ist, wird intern ein minimaler
+        FollowMe-Kontext daraus gebaut (anfahrten_dates).
+      - Tour-Membership selbst bleibt unverändert; Evidence-Decision ist nur
+        Audit-Output und beeinflusst die Berechnung NICHT.
+
+    Spec: docs/BH_CORE_001_TOUR_FIRST_SPEC.md
+
+    Tour-Membership-Regeln (§3 Spec):
+      - Tour-START: starts_at_homebase=True + has_fl=True + routing zeigt
+                    Auslands-/Inland-Ziel
+      - Tour-MID: prev.overnight_after_day=True (Continuation)
+      - Tour-END: ends_at_homebase=True + prev.overnight=True +
+                  routing[-1]==homebase
+      - Same-Day: starts_hb=True + ends_hb=True + routing roundtrip
+      - Non-Tour: keiner der Indikatoren
+
+    Sandwich-Repair (§3.2): X/==/OFF/RES mit prev.overnight=True UND
+    (next.overnight=True ODER next.tour_end) → tour_mid statt non_tour.
+
+    Diese Funktion ist Shadow-Mode in Phase 1: sie wird NICHT in der
+    bestehenden Pipeline genutzt. Activation via Feature-Flag
+    `AEROTAX_TOUR_FIRST_CLASSIFIER=1` (Phase 3).
+    """
+    if not matched_days:
+        return []
+
+    hb = (homebase or 'FRA').upper().strip()
+    sorted_days = sorted(
+        [m for m in matched_days if isinstance(m, dict) and m.get('datum')],
+        key=lambda m: m['datum']
+    )
+    n = len(sorted_days)
+
+    # Phase 4.6: Anfahrten-Set für Tour-Start-Cross-Check
+    anfahrten_set = _normalize_anfahrten_set(known_anfahrten)
+
+    # ── Step 1: Per-day raw signals ─────────────────────────────────────
+    signals = []
+    for i, m in enumerate(sorted_days):
+        dp = m.get('dp') or {}
+        se = m.get('se') or {}
+        prev = sorted_days[i-1] if i > 0 else None
+        nxt = sorted_days[i+1] if i+1 < n else None
+        prev_dp = (prev or {}).get('dp') or {}
+        nxt_dp = (nxt or {}).get('dp') or {}
+
+        marker = ((dp.get('raw_marker') or '') or '').upper().strip()
+        routing = [(r or '').upper().strip() for r in (dp.get('routing') or []) if r]
+        layover_ort = ((dp.get('layover_ort') or '') or '').upper().strip()
+        prev_layover = ((prev_dp.get('layover_ort') or '') or '').upper().strip()
+
+        marker_iata = _extract_iata_from_marker(marker)
+        cur_layover_foreign = bool(layover_ort and not _is_inland_code(layover_ort))
+        cur_layover_inland  = bool(layover_ort and _is_inland_code(layover_ort))
+        prev_layover_foreign = bool(prev_layover and not _is_inland_code(prev_layover))
+
+        signals.append({
+            'idx':                 i,
+            'datum':               m['datum'],
+            'm':                   m,
+            'prev':                prev,
+            'next':                nxt,
+            'marker':              marker,
+            'marker_iata':         marker_iata,
+            'routing':             routing,
+            'layover_ort':         layover_ort,
+            'prev_layover':        prev_layover,
+            'overnight':           bool(dp.get('overnight_after_day')),
+            'prev_overnight':      bool(prev_dp.get('overnight_after_day')),
+            'next_overnight':      bool(nxt_dp.get('overnight_after_day')),
+            'next_ends_hb':        bool(nxt_dp.get('ends_at_homebase')),
+            'starts_hb':           bool(dp.get('starts_at_homebase')),
+            'ends_hb':             bool(dp.get('ends_at_homebase')),
+            'has_fl':              bool(dp.get('has_fl')),
+            'duty_min':            int(dp.get('duty_duration_minutes') or 0),
+            'start_time':          dp.get('start_time') or '',
+            'activity_reader':     (dp.get('activity_type') or '').lower(),
+            'cur_layover_foreign': cur_layover_foreign,
+            'cur_layover_inland':  cur_layover_inland,
+            'prev_layover_foreign': prev_layover_foreign,
+            'se':                  se,
+        })
+
+    # ── Step 2: Initial in_tour + role per Tag ──────────────────────────
+    in_tour = [False] * n
+    role = ['non_tour'] * n
+
+    # Phase-4.6-Reader-Plausi: pro Tag flag setzen
+    reader_warning_idx = [''] * n
+    for i, s in enumerate(signals):
+        if s['duty_min'] > _BH_CORE_FTL_MAX_DUTY_MIN:
+            reader_warning_idx[i] = (
+                f'DUTY_DURATION_PLAUSIBILITY_FAIL: '
+                f'duty={s["duty_min"]}min > FTL-Limit {_BH_CORE_FTL_MAX_DUTY_MIN}min'
+            )
+
+    # v11 Closeout-Fix 1: Standby-Activation-Markers (RES/SB/SB_M etc.).
+    # Wenn marker in dieser Liste UND SE-Stempel vorhanden → Standby-Aktivation:
+    # der Crew war auf Bereitschaft und wurde aktiviert.
+    _STANDBY_ACTIVATION_MARKERS = {
+        'RES', 'RES_SB', 'SB', 'SB_M', 'SBY', 'SBO', 'STANDBY', 'STBY',
+    }
+
+    def _is_standby_activated(sig):
+        marker_first = (sig['marker'].split()[0] if sig['marker'] else '')
+        se = sig.get('se') or {}
+        return (
+            marker_first in _STANDBY_ACTIVATION_MARKERS
+            and int(se.get('count', 0) or 0) > 0
+            and bool(se.get('stfrei_ort') or '')
+        )
+
+    for i, s in enumerate(signals):
+        has_anfahrt_today = (anfahrten_set is not None
+                              and s['datum'] in anfahrten_set)
+
+        # v11 Closeout-Fix 1: Standby-Activation = Tour-Tag (Marker RES/SB/SB_M + SE).
+        # Generalisierbar: jede Airline mit RES/SB-Marker und SE-Spesen am gleichen
+        # Tag → Crew wurde aktiviert und flog. MUSS VOR der FTL-Plausi-Pruefung
+        # stehen — Standby-Activation-Tage haben oft duty > 840 (RES-Window 04-20).
+        #
+        # Unterscheidung:
+        #   - foreign-SE → in_tour=True, tour_mid (Hotel-Uebernachtung mit Z76 voll_24h)
+        #     Tour-Anschluss an Vortag wenn Vortag auch foreign-standby-activated.
+        #     SE-Ort wird in layover_ort + marker_iata gespiegelt, damit Tour-Builder
+        #     die foreign-Destination findet.
+        #   - inland-SE → bleibt non_tour mit duty>=480min → Phase-6b-Z72-Pfad
+        #     (Inland-Tagestrip 14€). Damit kein faelschliches Z76 fuer Tour-Anreise-
+        #     Tage in Deutschland.
+        if _is_standby_activated(s):
+            _se_act = s.get('se') or {}
+            _se_ort_act = (_se_act.get('stfrei_ort') or '').upper().strip()
+            _se_inland_act = _se_act.get('stfrei_inland')
+            # v11 Closeout-Fix 1d: Inland-Standby-Activation als Tour-Anreise
+            # wenn Folgetag foreign-Standby-activated ist (Multi-Day-Tour mit
+            # inland-Anreise-Tag). Beispiel: 04-23 inland-RES + 04-24 foreign-RES
+            # = Korea-Tour pos 1/4 (Z73 Anreise inland).
+            _next_foreign_activation = False
+            if i + 1 < n:
+                _nxt_s = signals[i+1]
+                _nxt_se = _nxt_s.get('se') or {}
+                _next_foreign_activation = (
+                    _is_standby_activated(_nxt_s)
+                    and _nxt_se.get('stfrei_inland') is False
+                    and bool(_nxt_se.get('stfrei_ort') or '')
+                )
+            if _se_inland_act is False and _se_ort_act:
+                # foreign-Standby-Activation: in_tour, tour_mid (voll_24h Z76)
+                in_tour[i] = True
+                if not s.get('marker_iata'):
+                    s['marker_iata'] = _se_ort_act
+                if not s['layover_ort']:
+                    s['layover_ort'] = _se_ort_act
+                    s['cur_layover_foreign'] = True
+                    s['overnight'] = True
+                role[i] = 'tour_mid'
+                continue
+            elif _se_inland_act is True and _next_foreign_activation:
+                # inland-Standby-Activation MIT foreign-Folgetag = Tour-Anreise.
+                # in_tour=True, role=tour_start. SE-ort bleibt inland (FRA/DUS etc.)
+                # → tour_start inland → Z73 Inland-Anreise (14€).
+                in_tour[i] = True
+                role[i] = 'tour_start'
+                continue
+            elif _se_inland_act is True:
+                # inland-Standby-Activation ohne foreign-Folgetag = Inland-Tagestrip.
+                # non_tour bleiben, aber Phase-6b-Z72-Pfad greift via loc=homebase
+                # + has_real_duty + duty>=480.
+                pass
+            # Wenn inland_act None (keine SE-Klarheit): non_tour bleiben.
+
+        # Reader-Plausi-Block: duty > FTL → drop NUR wenn keine Anfahrt-Evidence.
+        # Wenn Anfahrt vorhanden, ist es Tibor's echter Tour-Tag — Reader hat
+        # möglicherweise duty overstated (knapp über FTL); akzeptiere als Tour.
+        if reader_warning_idx[i] and not has_anfahrt_today:
+            # Continuation: prev_overnight UND prev in_tour ohne Plausi-Fail
+            if s['prev_overnight'] and i > 0 and not reader_warning_idx[i-1] and in_tour[i-1]:
+                in_tour[i] = True
+                role[i] = 'tour_mid'
+                continue
+            # Phase E — Tour-Evidence-Override: trotz duty>FTL (Reader-Bug)
+            # akzeptiere als Tour wenn ALLE harten Tour-Indikatoren stimmen:
+            # foreign-routing + foreign-layover + overnight + SE-foreign-Stempel.
+            # Begründung: duty-Aggregation-Bug ist häufiger als Phantom-Tour
+            # mit allen 4 unabhängigen Belegen. Reader-Warning bleibt im Audit.
+            _se_local = s.get('se') or {}
+            _has_se_foreign_local = (
+                int(_se_local.get('count', 0) or 0) > 0
+                and _se_local.get('stfrei_inland') is False
+                and (_se_local.get('stfrei_ort') or '')
+            )
+            _has_foreign_route_local = (
+                s['routing']
+                and any(r and r != hb and not _is_inland_code(r)
+                        for r in s['routing'])
+            )
+            if (_has_se_foreign_local
+                    and _has_foreign_route_local
+                    and s['overnight']
+                    and s['layover_ort']
+                    and not _is_inland_code(s['layover_ort'])):
+                # Vier-Quellen-Bestätigung (CAS-routing + CAS-overnight +
+                # CAS-foreign-layover + SE-foreign-Stempel) überstimmt
+                # duty-Plausi-Bug.
+                in_tour[i] = True
+                role[i] = 'tour_start' if s['starts_hb'] else 'tour_mid'
+                continue
+            # v11 Closeout-Fix 3: Phase E erweitert um CAS-only 3-source Override.
+            # Wenn cas_at='tour' + foreign-route + foreign-layover + overnight:
+            # 3 unabhaengige CAS-Quellen ueberstimmen duty-Bug (auch ohne SE-foreign).
+            # Begruendung: Crew-CAS-Reader (V2) liefert das Tour-Pattern eindeutig
+            # mit foreign-routing+foreign-layover+overnight. Duty>FTL ist meist
+            # Reader-Aggregation, kein echter FTL-Bruch.
+            if (s['activity_reader'] == 'tour'
+                    and _has_foreign_route_local
+                    and s['overnight']
+                    and s['layover_ort']
+                    and not _is_inland_code(s['layover_ort'])):
+                in_tour[i] = True
+                role[i] = 'tour_start' if s['starts_hb'] else 'tour_mid'
+                continue
+            # sonst: bleibt non_tour
+            continue
+
+        # (Standby-Activation Detection wurde an den Anfang des Loops gezogen.)
+
+        # Day-Suffix-Logic: Marker 'Tag 2'/'Day 2' (N≥2)
+        if _has_day_suffix_ge_2(s['marker']):
+            # Continuation des Vortags falls Vortag in_tour
+            if i > 0 and in_tour[i-1]:
+                in_tour[i] = True
+                role[i] = 'tour_mid' if not s['ends_hb'] else 'tour_end'
+                continue
+            # Wenn heute Anfahrt vorhanden + Day-Suffix → Reader-Fehler:
+            # Day-Suffix gehört zu einem nicht-erkannten Vortag. Heute ist
+            # echter tour_start (Anfahrt-Evidence schlägt Marker-Suffix).
+            if has_anfahrt_today and s['routing']:
+                # Tour-START: routing zeigt foreign oder mid-tour-Pattern
+                if s['has_fl'] or s['overnight']:
+                    in_tour[i] = True
+                    role[i] = 'tour_start'
+                    continue
+            # v11 Closeout-Fix 2: Day-Suffix MIT eigener Tour-Evidence.
+            # Wenn cas_at='tour' + layover (foreign oder inland) + overnight:
+            # die Day-N-Continuation ist durch eigene CAS-Evidence ueberbelegt,
+            # nicht abhaengig vom Vortag-Status. Reader hat moeglicherweise
+            # Day-1 wegen FTL-Plausi-Bug verloren → Heute trotzdem als tour_mid.
+            if (s['activity_reader'] == 'tour'
+                    and s['layover_ort']
+                    and s['overnight']):
+                in_tour[i] = True
+                role[i] = 'tour_mid' if not s['ends_hb'] else 'tour_end'
+                # Retroaktiver Day-1-Fix: wenn Prev-Day cas_at='tour' + Tour-Evidence
+                # aber dropped → reaktivieren als tour_start.
+                if i > 0 and not in_tour[i-1]:
+                    prev_s = signals[i-1]
+                    if (prev_s['activity_reader'] == 'tour'
+                            and (prev_s['layover_ort'] or prev_s['routing'])
+                            and prev_s['overnight']):
+                        in_tour[i-1] = True
+                        role[i-1] = ('tour_start' if prev_s['starts_hb']
+                                     else 'tour_mid')
+                continue
+            # Sonst: non_tour (Vortag nicht erkannt, Day-Suffix ohne Continuation)
+            continue
+
+        # Tour-END (prüfe ZUERST). Muss aber von echter Tour kommen (in_tour[i-1]).
+        if (s['ends_hb'] and s['prev_overnight']
+                and s['routing'] and s['routing'][-1] == hb
+                and i > 0 and in_tour[i-1]):
+            in_tour[i] = True
+            role[i] = 'tour_end'
+            continue
+        # Tour-START — mit Anfahrten-Cross-Check (wenn anfahrten gegeben)
+        could_be_tour_start = (
+            s['starts_hb'] and s['routing']
+            and len(s['routing']) >= 2
+            and s['routing'][0] == hb
+            and s['routing'][-1] != hb
+            and not s['ends_hb']
+            and (s['has_fl'] or s['overnight'])
+        )
+        if could_be_tour_start:
+            # Phase 4.6 Stufe 2 — KEIN Anfahrt-Hard-Drop mehr (war Tibor-Overfitting).
+            # Anfahrten-Cross-Check fließt jetzt als EVIDENCE in
+            # _score_tour_day_evidence (Phase 4.7), nicht als hard-rule.
+            # Wenn `known_anfahrten` gesetzt UND datum nicht drin UND
+            # KEINE alternative Auslands-SE-Evidence UND duty unrealistisch
+            # → drop. Sonst keep.
+            if anfahrten_set is not None and s['datum'] not in anfahrten_set:
+                se = s.get('se') or {}
+                has_strong_se = (
+                    se.get('count', 0) > 0
+                    and se.get('stfrei_inland') is False
+                    and se.get('stfrei_ort')
+                    and float(se.get('stfrei_total', 0) or 0) > 0
+                )
+                # Nur drop wenn alle Signale gegen Tour sprechen:
+                # kein SE-Foreign + duty unrealistisch ODER kein duty + kein routing-foreign
+                has_foreign_route = any(
+                    r and r != hb and not _is_inland_code(r) for r in s['routing']
+                )
+                if not has_strong_se and not has_foreign_route:
+                    continue
+                # Bei ungewöhnlich kurzer ODER aggregierter Duty (>FTL) drop
+                if (not has_strong_se and
+                        (s['duty_min'] > _BH_CORE_FTL_MAX_DUTY_MIN
+                         or s['duty_min'] < 60)):
+                    continue
+            in_tour[i] = True
+            role[i] = 'tour_start'
+            continue
+        # Tour-MID (Continuation): Vortag hatte overnight UND in_tour
+        if s['prev_overnight'] and i > 0 and in_tour[i-1]:
+            in_tour[i] = True
+            role[i] = 'tour_mid'
+            continue
+        # Same-Day (foreign roundtrip ODER inland multi-stop ODER inland
+        # single-stop mit duty>=480min) — mit Anfahrten-Check.
+        # Phase 6b: erweitere um inland-single-stop (Cluster C5+C8) damit
+        # FRA→MUC→FRA-Tagestrips als Z72 erkennbar werden.
+        if (s['starts_hb'] and s['ends_hb'] and len(s['routing']) >= 2):
+            has_foreign = any(
+                r and r != hb and not _is_inland_code(r) for r in s['routing']
+            )
+            inland_multistop = (len(s['routing']) >= 3 and not has_foreign)
+            # Phase 6b — inland single-stop: routing=[Hb, X] mit X inland
+            # UND has_fl ODER duty >= 480 → Z72-Kandidat
+            inland_single = (
+                len(s['routing']) == 2 and not has_foreign
+                and s['routing'][0] == hb
+                and s['routing'][1] != hb and _is_inland_code(s['routing'][1])
+                and (s['has_fl'] or s['duty_min'] >= 480)
+            )
+            if ((s['has_fl'] or s['duty_min'] >= 480)
+                    and (has_foreign or inland_multistop or inland_single)):
+                # Anfahrten-Cross-Check für Same-Day auch
+                if anfahrten_set is not None and s['datum'] not in anfahrten_set:
+                    se = s.get('se') or {}
+                    has_strong_se = (
+                        se.get('count', 0) > 0
+                        and se.get('stfrei_inland') is False
+                        and se.get('stfrei_ort')
+                    )
+                    # Inland-single + has_fl darf auch ohne SE-Foreign
+                    # ein Tour-Tag sein (Inland-Tagestrip ist legitim)
+                    if not has_strong_se and not inland_single:
+                        continue
+                in_tour[i] = True
+                role[i] = 'same_day'
+                continue
+
+    # ── Step 3: Sandwich-Repair für X/==/OFF/RES innerhalb aktiver Tour ──
+    SANDWICH_MARKERS = ('X', '==', 'OFF', 'OF', 'RES', 'RES_SB', 'SBY', 'SB')
+    for i in range(1, n - 1):
+        if in_tour[i]:
+            continue
+        s = signals[i]
+        # Sandwich greift NUR wenn Vortag in echter Tour ist
+        if not s['prev_overnight'] or not in_tour[i-1]:
+            continue
+        marker = s['marker']
+        marker_first = marker.split()[0] if marker else ''
+        is_sandwich_marker = (
+            marker_first in SANDWICH_MARKERS
+            or any(marker_first == m for m in SANDWICH_MARKERS)
+            or marker.startswith('OFF')
+            or marker.startswith('X ')
+            or marker == 'X'
+        )
+        if not is_sandwich_marker:
+            continue
+        # Sandwich erfüllt wenn:
+        # - next day in_tour ist (z.B. tour_end)
+        # - oder next.overnight=True (Tour läuft weiter)
+        # - oder next.ends_hb=True (Tour-Ende kommt)
+        next_in_tour = (i + 1 < n) and in_tour[i + 1]
+        if (next_in_tour or s['next_overnight'] or s['next_ends_hb']):
+            in_tour[i] = True
+            role[i] = 'tour_mid'
+
+    # ── Step 3b: Phantom-Tour-Removal (FinalFix 10) ────────────────────
+    # Defensive Post-Pass: ein Tag, der in_tour markiert ist, aber selbst
+    # KEINE eigene CAS-/SE-Evidence für eine echte Tour hat, wird wieder
+    # auf non_tour gesetzt. Generalisierbare Regel (keine Datumsliste).
+    #
+    # Beweis: docs/FIX10_PHANTOM_BEWEIS.md
+    # Konkrete Phantoms in Tibor-Fixture: 11-18 (Z73 phantom), 11-19 (Z76
+    # Norwegen phantom), 07-24 (Z76 Schweden phantom). Alle drei haben:
+    #   marker in {'', '==', 'OFF', '/-', ...} UND routing leer/[Hb] UND
+    #   layover leer UND overnight=False UND duty<60 UND keine SE-Stempel.
+    #
+    # Sichere Ausnahme: NICHT droppen wenn der Tag zwischen zwei echten
+    # Tour-Tagen mit foreign-layover liegt (Layover-OFF-Day innerhalb tour).
+    _PHANTOM_MARKERS = {'', '==', 'OFF', '== OFF', '=', 'OF', '/-'}
+
+    def _has_own_tour_evidence(sig):
+        """True wenn der Tag selbst klare CAS/SE-Evidenz fuer eine Tour hat."""
+        # Eigenes routing > 1 IATA (mehr als nur [Hb]) oder layover
+        own_routing = [r for r in sig['routing'] if r and r != hb]
+        if own_routing:
+            return True
+        if sig['layover_ort']:
+            return True
+        if sig['overnight']:
+            return True
+        if sig['duty_min'] >= 60:
+            return True
+        if sig['has_fl']:
+            return True
+        if sig['start_time']:
+            return True
+        # SE-Stempel?
+        se_local = sig.get('se') or {}
+        if int(se_local.get('count', 0) or 0) > 0 and (se_local.get('stfrei_ort') or ''):
+            return True
+        # Day-Suffix-Marker (Day 2, Tag 3, ...)
+        if _has_day_suffix_ge_2(sig['marker']):
+            return True
+        return False
+
+    def _is_layover_off_day_between_real_tour_days(idx):
+        """True wenn idx-1 und idx+1 echte tour-mid-Tage mit foreign-layover sind."""
+        if idx <= 0 or idx >= n - 1:
+            return False
+        if not in_tour[idx-1] or not in_tour[idx+1]:
+            return False
+        prev_layover = signals[idx-1]['layover_ort']
+        next_layover = signals[idx+1]['layover_ort']
+        return bool(
+            prev_layover and not _is_inland_code(prev_layover)
+            and next_layover and not _is_inland_code(next_layover)
+        )
+
+    phantom_drops = []
+    for i in range(n):
+        if not in_tour[i]:
+            continue
+        s = signals[i]
+        marker_first_norm = (s['marker'].split()[0] if s['marker'] else '').strip()
+        marker_norm = s['marker'].strip()
+        marker_is_phantom = (
+            marker_first_norm in _PHANTOM_MARKERS
+            or marker_norm in _PHANTOM_MARKERS
+            or marker_first_norm == ''
+        )
+        if not marker_is_phantom:
+            continue
+        if _has_own_tour_evidence(s):
+            continue
+        # Ausnahme: echter Layover-OFF-Day zwischen foreign-Tour-Tagen
+        if _is_layover_off_day_between_real_tour_days(i):
+            continue
+        # Demote
+        phantom_drops.append({'idx': i, 'datum': s['datum'],
+                               'prev_role': role[i], 'marker': s['marker']})
+        in_tour[i] = False
+        role[i] = 'non_tour'
+
+    if phantom_drops:
+        print(f"[phantom-removal] {len(phantom_drops)} dropped: "
+              + ', '.join(f"{d['datum']}({d['prev_role']}→non_tour, m={d['marker']!r})"
+                          for d in phantom_drops))
+
+    # ── Step 3.5: Evidence-Engine pro Tag (Shadow, Phase 4.8) ───────────
+    # Berechne FOR/AGAINST-Evidence + Decision für jeden Tag und merge
+    # später beim _build_normalized_day-Aufruf in den NormalizedDay.
+    # Keine Tour-Membership-Änderung! Reines Audit-Layer.
+    _fm_ctx = dict(followme_context or {})
+    if known_anfahrten is not None and 'anfahrten_dates' not in _fm_ctx:
+        _fm_ctx['anfahrten_dates'] = _normalize_anfahrten_set(known_anfahrten) or set()
+
+    evidence_by_idx = {}
+    ai_resolution_by_idx = {}
+    _job_id_for_ai = (followme_context or {}).get('job_id')
+    for i, s in enumerate(signals):
+        try:
+            day_dp = dict(s['m'].get('dp') or {})
+            day_dp['datum'] = s['datum']
+            prev_dp_local = None
+            nxt_dp_local = None
+            if i > 0:
+                prev_dp_local = dict(sorted_days[i-1].get('dp') or {})
+                prev_dp_local['datum'] = sorted_days[i-1]['datum']
+            if i + 1 < n:
+                nxt_dp_local = dict(sorted_days[i+1].get('dp') or {})
+                nxt_dp_local['datum'] = sorted_days[i+1]['datum']
+            evidence_by_idx[i] = _score_tour_day_evidence(
+                day=day_dp,
+                prev_day=prev_dp_local,
+                next_day=nxt_dp_local,
+                se=s.get('se') or {},
+                followme_context=(_fm_ctx if _fm_ctx else None),
+                homebase=hb,
+            )
+        except Exception as _ev_exc:  # pragma: no cover — defensive only
+            evidence_by_idx[i] = {
+                'datum': s['datum'],
+                'evidence_for': [], 'evidence_against': [],
+                'score_for': 0, 'score_against': 0,
+                'decision': 'NEEDS_USER',
+                'explanation': f'evidence-engine error: {_ev_exc}',
+                'source_refs': [],
+            }
+
+        # Phase 5a Shadow — KI-Resolver bei NEEDS_AI ODER ai_required=True
+        # (KEEP_TOUR mit Cross-Source-Konflikt — Phase 5a.1)
+        try:
+            _ev_dec = evidence_by_idx[i].get('decision')
+            _ev_ai_req = bool(evidence_by_idx[i].get('ai_required'))
+            if _ev_dec == 'NEEDS_AI' or _ev_ai_req:
+                _ai_ctx = {
+                    'day':      day_dp,
+                    'prev_day': prev_dp_local,
+                    'next_day': nxt_dp_local,
+                    'se':       s.get('se') or {},
+                    'homebase': hb,
+                    'evidence_for':     evidence_by_idx[i].get('evidence_for') or [],
+                    'evidence_against': evidence_by_idx[i].get('evidence_against') or [],
+                }
+                _kind = _ai_resolver_kind_from_evidence(
+                    evidence_by_idx[i], day_dp
+                )
+                ai_resolution_by_idx[i] = {
+                    'kind': _kind,
+                    'result': _resolve_uncertain_fact_with_ai(
+                        _kind, _ai_ctx,
+                        job_id=_job_id_for_ai,
+                        datum=s['datum'],
+                        uncertain_fact=(day_dp.get('raw_marker') or '')[:50],
+                        # Phase 5a: shadow-integration ALWAYS mock until Phase 5b
+                        _force_mock=True,
+                    ),
+                }
+        except Exception as _ai_exc:  # pragma: no cover — defensive only
+            ai_resolution_by_idx[i] = {
+                'kind': 'unknown',
+                'result': {
+                    'resolved': False, 'value': None, 'confidence': 0.0,
+                    'reason': f'AI_SHADOW_ERROR: {type(_ai_exc).__name__}',
+                    'evidence': [], 'needs_review': True,
+                },
+            }
+
+    # ── Step 4: Group consecutive in_tour days into tours ───────────────
+    try:
+        from bmf_data import IATA_TO_BMF as _IATA_BMF_BH
+    except ImportError:
+        _IATA_BMF_BH = {}
+    try:
+        from bmf_data import IATA_METRO_TO_BMF as _METRO_BH
+    except ImportError:
+        _METRO_BH = {}
+
+    tours = []
+    i = 0
+    while i < n:
+        if not in_tour[i]:
+            # Non-Tour-Tag → eigene 1-Day-virtuelle „Tour" mit role=non_tour
+            sig_nt = signals[i]
+            nt_day = _build_normalized_day(sig_nt, 'non_tour', hb, year,
+                                            _IATA_BMF_BH, _METRO_BH,
+                                            evidence=evidence_by_idx.get(i),
+                                            ai_resolution=ai_resolution_by_idx.get(i))
+            tours.append({
+                'tour_id':              f'NT_{sig_nt["datum"]}',
+                'start_date':           sig_nt['datum'],
+                'end_date':             sig_nt['datum'],
+                'homebase':             hb,
+                'primary_destination':  '',
+                'destination_country':  '',
+                'tour_size':            1,
+                'tour_pattern':         'non_tour',
+                'is_foreign':           False,
+                'is_inland':            False,
+                'is_mixed':             False,
+                'confidence':           0.95,
+                'evidence':             ['non-tour-day, no tour-membership-evidence'],
+                'days':                 [nt_day],
+            })
+            i += 1
+            continue
+        idx_list = [i]
+        j = i + 1
+        while j < n and in_tour[j]:
+            idx_list.append(j)
+            j += 1
+
+        # Tour-level aggregations
+        primary_destination = ''
+        destination_country = ''
+        is_foreign = False
+        is_inland_seen = False
+        tour_evidence = []
+
+        for ti in idx_list:
+            s = signals[ti]
+            # Erkenne destinations aus routing + layover
+            for r in s['routing']:
+                if r and r != hb:
+                    if not _is_inland_code(r):
+                        is_foreign = True
+                        if not primary_destination:
+                            primary_destination = r
+                    else:
+                        is_inland_seen = True
+            if s['layover_ort']:
+                if _is_inland_code(s['layover_ort']):
+                    is_inland_seen = True
+                else:
+                    is_foreign = True
+                    if not primary_destination:
+                        primary_destination = s['layover_ort']
+            if s['marker_iata']:
+                if not _is_inland_code(s['marker_iata']):
+                    is_foreign = True
+                    if not primary_destination:
+                        primary_destination = s['marker_iata']
+
+        if primary_destination:
+            destination_country = (_IATA_BMF_BH.get(primary_destination)
+                                    or _METRO_BH.get(primary_destination)
+                                    or '')
+
+        is_mixed = is_foreign and is_inland_seen
+        is_inland = is_inland_seen and not is_foreign
+
+        # Build day-records
+        tour_days = []
+        for ti in idx_list:
+            tour_days.append(
+                _build_normalized_day(signals[ti], role[ti], hb, year,
+                                      _IATA_BMF_BH, _METRO_BH,
+                                      evidence=evidence_by_idx.get(ti),
+                                      ai_resolution=ai_resolution_by_idx.get(ti))
+            )
+
+        # Tour pattern
+        if len(tour_days) == 1 and tour_days[0]['role'] == 'same_day':
+            tour_pattern = 'same_day'
+        elif is_mixed:
+            tour_pattern = 'multi_stop'
+        else:
+            tour_pattern = 'single_dest'
+
+        start_date = signals[idx_list[0]]['datum']
+        end_date = signals[idx_list[-1]]['datum']
+        tour_id = (
+            f'T{len(tours)+1:02d}_{start_date}_'
+            f'{hb}-{primary_destination or "XX"}'
+        )
+
+        tour_evidence.append(
+            f'tour built from {len(idx_list)} consecutive service days '
+            f'(role-based, NOT klass-based)'
+        )
+
+        tours.append({
+            'tour_id':              tour_id,
+            'start_date':           start_date,
+            'end_date':             end_date,
+            'homebase':             hb,
+            'primary_destination':  primary_destination,
+            'destination_country':  destination_country,
+            'tour_size':            len(tour_days),
+            'tour_pattern':         tour_pattern,
+            'is_foreign':           is_foreign,
+            'is_inland':            is_inland,
+            'is_mixed':             is_mixed,
+            'confidence':           0.9,
+            'evidence':             tour_evidence,
+            'days':                 tour_days,
+        })
+        i = j
+
+    return tours
+
+
+def _build_normalized_day(sig, role, homebase, year, iata_bmf, metro_bmf,
+                          evidence=None, ai_resolution=None):
+    """Helper: pro Tag eine NormalizedDay-Struktur bauen (gemäß SPEC §2.3).
+
+    Phase 4.8: Optional `evidence`-Dict (Output von _score_tour_day_evidence)
+    wird als zusätzliche Audit-Felder angehängt:
+      evidence_for, evidence_against, score_for, score_against,
+      evidence_decision, evidence_explanation, source_refs.
+
+    Phase 5a: Optional `ai_resolution`-Dict (Output von
+    _resolve_uncertain_fact_with_ai für NEEDS_AI-Fälle) wird angehängt als:
+      ai_resolution_kind, ai_resolved, ai_value, ai_confidence,
+      ai_reason, ai_evidence, ai_needs_review.
+    Beeinflusst KEINE Berechnung, ist nur Audit-Layer.
+    """
+    marker = sig['marker']
+    layover_ort = sig['layover_ort']
+
+    # Location-Context
+    if role == 'non_tour':
+        if sig['starts_hb'] and sig['ends_hb']:
+            location_context = 'homebase'
+        else:
+            # v11 Closeout-Fix 1c: nur bei Standby-Activation (RES/SB + SE-Stempel)
+            # mit routing=[Hb] = homebase. Damit greift Phase-6b-Z72-Inland-Tagestrip
+            # NUR bei aktivierten Standbys, nicht bei „RES zuhause"-Tagen ohne SE.
+            _se_loc_check = sig.get('se') or {}
+            _se_loc_activated = (
+                int(_se_loc_check.get('count', 0) or 0) > 0
+                and bool(_se_loc_check.get('stfrei_ort') or '')
+            )
+            _marker_first_loc = (sig['marker'].split()[0] if sig['marker'] else '')
+            _is_standby_act_loc = (
+                _marker_first_loc in ('RES', 'RES_SB', 'SBY', 'SB', 'SB_M')
+                and _se_loc_activated
+            )
+            if (_is_standby_act_loc
+                    and sig['routing']
+                    and all(r == homebase for r in sig['routing'])
+                    and not sig['layover_ort']):
+                location_context = 'homebase'
+            else:
+                location_context = 'unknown'
+    elif sig['cur_layover_foreign'] or (role == 'tour_mid' and sig['prev_layover_foreign']):
+        location_context = 'foreign_layover'
+    elif sig['cur_layover_inland']:
+        location_context = 'inland_layover'
+    elif sig['routing']:
+        location_context = 'in_flight'
+    elif sig['starts_hb'] and sig['ends_hb']:
+        location_context = 'homebase'
+    else:
+        location_context = 'unknown'
+
+    # Passive home marker
+    PASSIVE_MARKERS = ('ORTSTAG', 'FRS', 'LMN_AS', 'LMN_CR', 'FRD')
+    is_passive_home = any(pm in marker for pm in PASSIVE_MARKERS)
+
+    # Standby disambiguation
+    marker_first = marker.split()[0] if marker else ''
+    is_res_marker = (marker_first in ('RES', 'RES_SB', 'SBY', 'SB', 'SB_M')
+                     or marker == 'RES')
+    is_standby_hotel = (
+        is_res_marker
+        and sig['prev_overnight']
+        and sig['prev_layover_foreign']
+    )
+    # v11 Closeout-Fix 1b: Standby-Activation-Override.
+    # Wenn RES/SB-Marker UND SE-Stempel (activated) UND echte Dienstzeit:
+    # is_standby_homebase=False (User wurde aktiviert und flog). Damit greift
+    # die Phase-6b-Z72-Inland-Tagestrip-Logik bei inland-SE statt der
+    # 'Standby zuhause'-Klassifikation.
+    _sb_se = sig.get('se') or {}
+    _sb_se_activated = (
+        int(_sb_se.get('count', 0) or 0) > 0
+        and bool(_sb_se.get('stfrei_ort') or '')
+    )
+    is_standby_homebase = (
+        is_res_marker
+        and not is_standby_hotel
+        and not _sb_se_activated
+    )
+
+    # Layover-Free-Day (X/==/OFF in foreign tour-mitte, no duty)
+    LAYOVER_FREE_MARKERS = ('X', '==', 'OFF', 'OF')
+    is_layover_free = (
+        role == 'tour_mid'
+        and (marker_first in LAYOVER_FREE_MARKERS or marker.startswith('X '))
+        and not is_res_marker
+        and not sig['has_fl']
+    )
+
+    # has_real_duty
+    has_real_duty = bool(
+        sig['duty_min'] > 0
+        or sig['start_time']
+        or sig['has_fl']
+    )
+
+    # bmf_place_code (für foreign tour mid/end).
+    # FinalFix 3: SE-Ort hat Top-Priority (validiert mit Golden 92%
+    # Uebereinstimmung). CAS-Layover ist Fallback (8% Faelle).
+    se_for_bmf = sig.get('se') or {}
+    se_ort_for_bmf = (se_for_bmf.get('stfrei_ort') or '').upper().strip()
+    se_inland_for_bmf = se_for_bmf.get('stfrei_inland')
+    bmf_place_code = ''
+    if se_inland_for_bmf is False and se_ort_for_bmf:
+        # FinalFix 3: SE-Foreign-Ort wins (Golden 92% Match)
+        bmf_place_code = se_ort_for_bmf
+    elif layover_ort and not _is_inland_code(layover_ort):
+        bmf_place_code = layover_ort
+    elif role in ('tour_mid', 'tour_end') and sig['prev_layover_foreign']:
+        bmf_place_code = sig['prev_layover']
+    elif sig['routing']:
+        for r in reversed(sig['routing']):
+            if r and r != homebase and not _is_inland_code(r):
+                bmf_place_code = r
+                break
+
+    # SE-context
+    se = sig['se'] or {}
+    se_context = {
+        'has_se_stamp':  bool(se.get('count', 0)),
+        'stfrei_ort':    se.get('stfrei_ort') or '',
+        'stfrei_inland': se.get('stfrei_inland'),
+        'stfrei_betrag': float(se.get('stfrei_total', 0) or 0),
+    }
+
+    role_evidence = []
+    # Reader-Plausi-Warnings (Phase 4.6 Stufe 1)
+    if sig['duty_min'] > _BH_CORE_FTL_MAX_DUTY_MIN:
+        role_evidence.append(
+            f'reader_warning: DUTY_DURATION_PLAUSIBILITY_FAIL '
+            f'(duty={sig["duty_min"]}min > FTL-Limit {_BH_CORE_FTL_MAX_DUTY_MIN}min)'
+        )
+    if _has_day_suffix_ge_2(sig['marker']):
+        role_evidence.append(f'marker_day_suffix_ge_2 detected: {sig["marker"]}')
+    if role == 'tour_start':
+        role_evidence.append(f'starts_at_homebase=True, has_fl=True, routing={sig["routing"]}')
+    elif role == 'tour_end':
+        role_evidence.append(f'ends_at_homebase=True, prev.overnight=True, routing[-1]={homebase}')
+    elif role == 'tour_mid':
+        if sig['prev_overnight']:
+            role_evidence.append(f'prev.overnight=True, prev.layover={sig["prev_layover"]}')
+        if marker_first in ('X', '==', 'OFF', 'OF'):
+            role_evidence.append(f'sandwich marker {marker_first} between overnight-days')
+        if is_res_marker:
+            role_evidence.append('RES marker with foreign-overnight-context → standby_hotel')
+    elif role == 'same_day':
+        role_evidence.append(f'starts+ends_hb roundtrip, routing={sig["routing"]}')
+    else:
+        if is_passive_home:
+            role_evidence.append(f'passive home marker {marker}')
+        if is_standby_homebase:
+            role_evidence.append('RES without foreign-overnight-context → standby_homebase')
+
+    confidence = 0.9 if role != 'non_tour' else 0.95
+    needs_review = False
+    # Marker_iata mismatch zu layover_ort → senke confidence
+    if (sig['marker_iata'] and layover_ort
+            and sig['marker_iata'] != layover_ort
+            and role in ('tour_mid', 'tour_end')):
+        confidence = 0.75
+        needs_review = True
+        role_evidence.append(
+            f'marker_iata={sig["marker_iata"]} mismatches layover_ort={layover_ort}'
+        )
+
+    nd = {
+        'datum':                       sig['datum'],
+        'raw_marker':                  sig['marker'],
+        'routing':                     sig['routing'],
+        'role':                        role,
+        'location_context':            location_context,
+        'layover_ort':                 sig['layover_ort'],
+        'inferred_layover_ort':        sig['layover_ort'] or sig['prev_layover'] or '',
+        'bmf_place_code':              bmf_place_code,
+        'se_context':                  se_context,
+        'has_real_duty':               has_real_duty,
+        'is_passive_homebase_marker':  is_passive_home,
+        'is_standby_homebase':         is_standby_homebase,
+        'is_standby_hotel':            is_standby_hotel,
+        'is_layover_free_day':         is_layover_free,
+        'confidence':                  confidence,
+        'evidence':                    role_evidence,
+        'needs_review':                needs_review,
+        # Phase 6b — Reader-Fakten für Counter-Logic verfügbar machen
+        'start_time':                  sig.get('start_time') or '',
+        'duty_duration_minutes':       int(sig.get('duty_min') or 0),
+        'has_fl':                      bool(sig.get('has_fl')),
+        'overnight_after_day':         bool(sig.get('overnight')),
+        'starts_at_homebase':          bool(sig.get('starts_hb')),
+        'ends_at_homebase':            bool(sig.get('ends_hb')),
+    }
+
+    # Phase 4.8: Evidence-Engine-Output anhängen (Audit-Layer, Shadow)
+    if isinstance(evidence, dict):
+        nd['evidence_for']         = evidence.get('evidence_for') or []
+        nd['evidence_against']     = evidence.get('evidence_against') or []
+        nd['score_for']            = int(evidence.get('score_for') or 0)
+        nd['score_against']        = int(evidence.get('score_against') or 0)
+        nd['evidence_decision']    = evidence.get('decision') or 'NEEDS_USER'
+        nd['evidence_explanation'] = evidence.get('explanation') or ''
+        nd['source_refs']          = evidence.get('source_refs') or []
+        # Phase 5a.1: ai_required-Flag auch bei KEEP_TOUR mit Cross-Source-Konflikt
+        nd['ai_required']          = bool(evidence.get('ai_required', False))
+    else:
+        nd['evidence_for']         = []
+        nd['evidence_against']     = []
+        nd['score_for']            = 0
+        nd['score_against']        = 0
+        nd['evidence_decision']    = ''
+        nd['evidence_explanation'] = ''
+        nd['source_refs']          = []
+        nd['ai_required']          = False
+
+    # Phase 5a: AI-Resolver-Output anhängen (Audit-Layer, Shadow, Mock-default)
+    if isinstance(ai_resolution, dict):
+        _air = ai_resolution.get('result') or {}
+        nd['ai_resolution_kind']  = ai_resolution.get('kind') or ''
+        nd['ai_resolved']         = bool(_air.get('resolved', False))
+        nd['ai_value']            = _air.get('value')
+        nd['ai_confidence']       = float(_air.get('confidence') or 0.0)
+        nd['ai_reason']           = _air.get('reason') or ''
+        nd['ai_evidence']         = list(_air.get('evidence') or [])
+        nd['ai_needs_review']     = bool(_air.get('needs_review', False))
+    else:
+        nd['ai_resolution_kind']  = ''
+        nd['ai_resolved']         = False
+        nd['ai_value']            = None
+        nd['ai_confidence']       = 0.0
+        nd['ai_reason']           = ''
+        nd['ai_evidence']         = []
+        nd['ai_needs_review']     = False
+
+    # Phase 5c+5d+E — Proposed Tour-Decision aus KI-Decision + Evidence (Shadow)
+    # Hard-Blocker: KI darf NICHT überschreiben bei diesen evidence_against:
+    #   - duty_over_ftl (Reader-Bug-Verdacht)
+    #   - day_already_in_other_tour (FollowMe-Duplikate)
+    #   - cas_followme_place_conflict (Place-Konflikt — KI bestätigt nicht naiv)
+    # Cross-Source-Defensiv (Phase E): wenn Evidence-Engine selbst NEEDS_AI
+    # ausgibt (Multi-Conflict-Override aus Phase 4.8b), darf KI nicht
+    # blind KEEP_TOUR auto-applien — drei oder mehr unabhängige
+    # User-Truth-Quellen rejecten den Tag. KI auto-KEEP wäre Mehrheitsverlust.
+    _ag_for_proposed = {n for n, _, _ in (nd.get('evidence_against') or [])}
+    _hard_blockers = _ag_for_proposed & {
+        'duty_over_ftl', 'day_already_in_other_tour',
+        'cas_followme_place_conflict',
+    }
+    _ai_conf = nd['ai_confidence']
+    _ai_val = nd['ai_value']
+    _ai_resolved = nd['ai_resolved']
+    _ai_kind = nd['ai_resolution_kind']
+    _ev_dec = nd['evidence_decision']
+
+    # Phase 5d: structured decision/context_type aus ai_resolution durchreichen
+    _ai_decision = ''
+    _ai_context_type = 'unknown'
+    if isinstance(ai_resolution, dict):
+        _air = ai_resolution.get('result') or {}
+        _ai_decision = str(_air.get('decision') or '').upper().strip()
+        _ai_context_type = str(_air.get('context_type') or '').lower().strip()
+    nd['ai_decision'] = _ai_decision
+    nd['ai_context_type'] = _ai_context_type or 'unknown'
+
+    # Default: behalte Evidence-Decision
+    proposed = _ev_dec
+    proposed_reason = 'no AI override (use evidence_decision)'
+
+    _ALLOWED_AI_DECISIONS = ('KEEP_TOUR', 'DROP_TOUR', 'NEEDS_REVIEW')
+    if _hard_blockers:
+        # Hard-Blocker → keine KI-Übernahme, NEEDS_REVIEW
+        proposed = 'NEEDS_REVIEW'
+        proposed_reason = (
+            f'hard blocker prevents AI override: {sorted(_hard_blockers)}'
+        )
+    elif (_ev_dec == 'NEEDS_AI' and _ai_decision == 'KEEP_TOUR'
+          and _ai_conf >= 0.90):
+        # Phase E Defensive: Evidence-Engine selbst auf NEEDS_AI (Phase-4.8b
+        # Multi-Conflict-Override: 2+ unabhängige User-Truth-Quellen rejecten).
+        # KI auto-KEEP_TOUR mit hoher Conf wäre Mehrheitsverlust gegenüber
+        # cross-source evidence. → Konservativ NEEDS_REVIEW.
+        # KI darf weiter DROP_TOUR und NEEDS_REVIEW unverändert beitragen.
+        proposed = 'NEEDS_REVIEW'
+        proposed_reason = (
+            f'Evidence-Engine flagged NEEDS_AI (cross-source-conflict, '
+            f'score_for={nd["score_for"]}, score_against={nd["score_against"]}). '
+            f'AI says KEEP_TOUR ({_ai_conf:.2f}) but cannot override majority of '
+            f'user-truth sources. REVIEW required to break tie.'
+        )
+    elif _ai_decision in _ALLOWED_AI_DECISIONS and _ai_resolved:
+        # Phase 5d strukturierte Decision direkt nutzen
+        if _ai_conf >= 0.90:
+            # Auto-Schwelle: KI-Decision wird in Shadow übernommen
+            proposed = _ai_decision
+            proposed_reason = (
+                f'AI decision={_ai_decision} ctx={_ai_context_type} '
+                f'(conf={_ai_conf:.2f}, high) — auto-applied in shadow'
+            )
+        elif 0.70 <= _ai_conf < 0.90:
+            # Medium → review_with_suggestion
+            proposed = 'NEEDS_REVIEW'
+            proposed_reason = (
+                f'AI medium-conf decision={_ai_decision} ctx={_ai_context_type} '
+                f'(conf={_ai_conf:.2f}) — review suggested'
+            )
+        else:
+            # Low conf → user question
+            proposed = 'NEEDS_USER'
+            proposed_reason = (
+                f'AI low-conf decision={_ai_decision} (conf={_ai_conf:.2f}) '
+                f'— user question'
+            )
+    elif _ai_kind and _ai_conf < 0.70:
+        # Legacy: no structured decision, low conf → user question
+        proposed = 'NEEDS_USER'
+        proposed_reason = (
+            f'AI low-conf or unresolved ({_ai_kind}, conf={_ai_conf:.2f}) '
+            f'— user question needed'
+        )
+    elif _ai_kind and _ai_resolved and _ai_conf >= 0.70:
+        # Legacy: no structured decision, but resolved → review
+        proposed = 'NEEDS_REVIEW'
+        proposed_reason = (
+            f'AI resolved without structured decision ({_ai_kind}, '
+            f'conf={_ai_conf:.2f}) — review'
+        )
+
+    nd['proposed_tour_decision_after_ai'] = proposed
+    nd['proposed_tour_decision_reason']   = proposed_reason
+    return nd
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# BH-CORE-001 Phase 3: Classifier-Adapter
+# _classify_days_from_normalized_tours
+# Hinter AEROTAX_TOUR_FIRST_CLASSIFIER=1 aktivierbar, default OFF.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BH-CORE-001 Phase 4.7 — General Evidence Engine (Shadow-Modus)
+# ════════════════════════════════════════════════════════════════════════════
+# Allgemeiner Evidenz-Scorer für tourfragliche Tage. Quelle CAS+SE+Plausibilität.
+# FollowMe-Kontext ist OPTIONAL (Vergleichsbasis), KEIN Hard-Discriminator.
+# Output: evidence_for/against, score_for/against, decision, explanation.
+# Shadow-Modus: noch nicht im Production-Pipeline-Pfad gerufen.
+# Tests: tests/test_evidence_engine.py (Phase 4.7)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+# Evidence-Item-Gewichte (heuristisch, balanciert mit Test-Cases)
+_EV_WEIGHT = {
+    # FOR — starke Tour-Indikatoren
+    'real_flight_routing':         3,   # routing mit ≥2 IATA-codes, kein Hb-only
+    'foreign_iata_in_routing':     3,   # mindestens 1 Auslands-IATA
+    'overnight_with_layover':      3,   # overnight=True + layover_ort gesetzt
+    'foreign_layover':             3,   # layover_ort ist Auslands-Code
+    'se_foreign_stamp':            4,   # SE-Auslandsspesen vorhanden
+    'plausible_duty':              2,   # duty 60-840min (innerhalb FTL)
+    'plausible_briefing_time':     1,   # start_time gesetzt + nicht 00:00
+    'continuation_from_prev_tour': 4,   # prev day war in_tour mit overnight
+    'continuation_to_next_tour':   2,   # next day in_tour mit ends_hb=True
+    'homebase_departure':          2,   # starts_at_homebase + routing[0]=hb
+    'homebase_return':             2,   # ends_at_homebase + routing[-1]=hb
+    'has_anfahrt_evidence':        3,   # heute hat Anfahrt zur Hb (Vergleich-Source)
+    'marker_flight_pattern':       2,   # Marker enthält LH-Flight-Nr (z.B. 'LH755')
+    'day_suffix_with_real_prev':   3,   # 'Tag N≥2' + Vortag in echter Tour
+    # AGAINST — starke Anti-Tour-Indikatoren
+    'no_se_allowance':             2,   # keine SE-Spesen für den Tag
+    'no_homebase_commute_evidence': 2,  # gesetzt wenn anfahrten gegeben + datum nicht drin
+    'duty_over_ftl':               4,   # duty > 840min (Reader-Bug-Verdacht)
+    'duty_very_short':             3,   # duty < 60min ohne andere starke Evidenz
+    'duty_zero_with_route':        2,   # duty=0 aber routing claimed
+    'free_gap_around_day':         2,   # 3+ Tage Frei vor UND nach
+    'sequence_id_marker_only':     3,   # Marker ist reine Sequence-ID (5-6 Ziffern + Buchstaben)
+    'reader_warning_set':          3,   # explizites reader_warning gesetzt
+    'routing_inconsistent':        3,   # routing widerspricht layover oder homebase-Pattern
+    'followme_explicit_other_span': 3,  # FollowMe hat Tour-Span die diesen Tag NICHT enthält
+    'day_already_in_other_tour':   4,   # Tag bereits in anderer Tour gezählt
+    'training_office_passive':     3,   # raw_lines/marker zeigen Schulung/Office/passive
+    'day_suffix_claims_completed_prev': 5, # 'Day N≥2' marker, aber Vortag war abgeschlossene 1-day-Tour
+    # Phase 4.8b — neue Conflict-Signals
+    'transit_via_homebase_ends_foreign': 4,  # routing X→HB→Y mit Y!=HB foreign (kein clean same-day)
+    'routing_ends_foreign_at_claimed_return': 4,  # ends_hb=True ABER routing[-1] != HB
+    # Phase 5a.1 — Cross-Source-Place-Conflict
+    'cas_followme_place_conflict': 4,  # CAS-IATA widerspricht FollowMe-tour_destinations
+}
+
+
+def _score_tour_day_evidence(day, prev_day=None, next_day=None,
+                              se=None, followme_context=None, homebase='FRA'):
+    """BH-CORE-001 Phase 4.7 Evidence Engine (Shadow).
+
+    Quantifiziert FOR/AGAINST-Evidence für einen tourfraglichen Tag aus den
+    primären CAS+SE-Quellen plus optionalem followme_context (Vergleich).
+
+    Parameters:
+      day:                dict mit Reader-Facts (activity_type, routing,
+                          layover_ort, overnight_after_day, start_time,
+                          end_time, duty_duration_minutes, raw_marker, has_fl,
+                          starts_at_homebase, ends_at_homebase, datum)
+      prev_day, next_day: gleiche Struktur für Nachbartage (optional)
+      se:                 dict (stfrei_total, stfrei_ort, stfrei_inland, count)
+      followme_context:   optional dict mit:
+                          - 'anfahrten_dates': set[str]   (Anfahrt-Daten falls verfügbar)
+                          - 'tour_spans':      list[(start_date, end_date, member_dates_set)]
+                          - 'day_in_other_span_dates': set[str]
+                          (NUR Vergleichsquelle, NICHT hard rule)
+      homebase:           IATA-Code des Homebase (default 'FRA')
+
+    Returns:
+      {
+        'datum':              str,
+        'evidence_for':       list[(name, weight, detail)],
+        'evidence_against':   list[(name, weight, detail)],
+        'score_for':          int,
+        'score_against':      int,
+        'decision':           'KEEP_TOUR' | 'DROP_TOUR' | 'NEEDS_AI' | 'NEEDS_USER',
+        'explanation':        str,
+        'source_refs':        list[str],   # 'cas', 'se', 'followme'
+      }
+
+    Entscheidungs-Regel:
+      - score_for ≥ score_against + 5  → KEEP_TOUR
+      - score_against ≥ score_for + 5  → DROP_TOUR
+      - |score_for − score_against| < 3 → NEEDS_AI
+      - sonst (kleiner Vorsprung, < 5)  → KEEP/DROP wenn keine reader_warning
+    """
+    if not isinstance(day, dict):
+        return {
+            'datum': None, 'evidence_for': [], 'evidence_against': [],
+            'score_for': 0, 'score_against': 0,
+            'decision': 'NEEDS_USER',
+            'explanation': 'day-input not a dict',
+            'source_refs': [],
+        }
+
+    datum = day.get('datum') or ''
+    hb = (homebase or 'FRA').upper().strip()
+    marker = ((day.get('raw_marker') or '') or '').upper().strip()
+    routing = [(r or '').upper().strip() for r in (day.get('routing') or []) if r]
+    layover = ((day.get('layover_ort') or '') or '').upper().strip()
+    overnight = bool(day.get('overnight_after_day'))
+    starts_hb = bool(day.get('starts_at_homebase'))
+    ends_hb = bool(day.get('ends_at_homebase'))
+    duty = int(day.get('duty_duration_minutes') or 0)
+    has_fl = bool(day.get('has_fl'))
+    start_time = (day.get('start_time') or '').strip()
+
+    prev_dp = (prev_day or {}) if isinstance(prev_day, dict) else {}
+    next_dp = (next_day or {}) if isinstance(next_day, dict) else {}
+    prev_overnight = bool(prev_dp.get('overnight_after_day'))
+    next_ends_hb = bool(next_dp.get('ends_at_homebase'))
+    prev_layover = ((prev_dp.get('layover_ort') or '') or '').upper().strip()
+
+    se = se or {}
+    se_count = int(se.get('count', 0) or 0)
+    se_foreign = (se_count > 0 and se.get('stfrei_inland') is False
+                  and (se.get('stfrei_ort') or ''))
+
+    fm = followme_context or {}
+    anfahrten = fm.get('anfahrten_dates')
+    if anfahrten is not None and not isinstance(anfahrten, (set, frozenset)):
+        anfahrten = set(anfahrten)
+    other_span_dates = fm.get('day_in_other_span_dates') or set()
+
+    evidence_for = []
+    evidence_against = []
+    source_refs = ['cas']
+    if se_count > 0: source_refs.append('se')
+    if fm: source_refs.append('followme')
+
+    # ─── FOR evidence ──────────────────────────────────────────────────
+    if routing and len(routing) >= 2 and not all(r == hb for r in routing):
+        evidence_for.append(
+            ('real_flight_routing', _EV_WEIGHT['real_flight_routing'],
+             f'routing={routing}')
+        )
+    has_foreign_iata = any(r and r != hb and not _is_inland_code(r) for r in routing)
+    if has_foreign_iata:
+        evidence_for.append(
+            ('foreign_iata_in_routing', _EV_WEIGHT['foreign_iata_in_routing'],
+             f'foreign in routing: {[r for r in routing if r != hb]}')
+        )
+    if overnight and layover:
+        evidence_for.append(
+            ('overnight_with_layover', _EV_WEIGHT['overnight_with_layover'],
+             f'overnight=True, layover={layover}')
+        )
+    if layover and not _is_inland_code(layover):
+        evidence_for.append(
+            ('foreign_layover', _EV_WEIGHT['foreign_layover'],
+             f'layover_ort={layover} (foreign)')
+        )
+    if se_foreign:
+        evidence_for.append(
+            ('se_foreign_stamp', _EV_WEIGHT['se_foreign_stamp'],
+             f'SE-Auslands-Stempel: ort={se.get("stfrei_ort")}, '
+             f'betrag={se.get("stfrei_total")}')
+        )
+    if 60 <= duty <= 840:
+        evidence_for.append(
+            ('plausible_duty', _EV_WEIGHT['plausible_duty'],
+             f'duty={duty}min (within FTL)')
+        )
+    if start_time and start_time != '00:00':
+        evidence_for.append(
+            ('plausible_briefing_time', _EV_WEIGHT['plausible_briefing_time'],
+             f'start_time={start_time}')
+        )
+    if prev_overnight and prev_layover:
+        evidence_for.append(
+            ('continuation_from_prev_tour', _EV_WEIGHT['continuation_from_prev_tour'],
+             f'prev overnight + layover={prev_layover}')
+        )
+    if next_ends_hb and next_dp.get('routing'):
+        evidence_for.append(
+            ('continuation_to_next_tour', _EV_WEIGHT['continuation_to_next_tour'],
+             'next-day routes back home')
+        )
+    if starts_hb and routing and routing[0] == hb:
+        evidence_for.append(
+            ('homebase_departure', _EV_WEIGHT['homebase_departure'],
+             f'starts_at_homebase + routing[0]={hb}')
+        )
+    if ends_hb and routing and routing[-1] == hb:
+        evidence_for.append(
+            ('homebase_return', _EV_WEIGHT['homebase_return'],
+             f'ends_at_homebase + routing[-1]={hb}')
+        )
+    if anfahrten is not None and datum in anfahrten:
+        evidence_for.append(
+            ('has_anfahrt_evidence', _EV_WEIGHT['has_anfahrt_evidence'],
+             f'anfahrt found for {datum}')
+        )
+    # LH-Flight-Pattern (z.B. "LH755-1", "LH8765", "DLH755")
+    if _bh_core_re.search(r'\b(LH|DLH)\s*\d{2,4}', marker):
+        evidence_for.append(
+            ('marker_flight_pattern', _EV_WEIGHT['marker_flight_pattern'],
+             f'marker contains flight-number pattern: {marker}')
+        )
+    if _has_day_suffix_ge_2(marker) and prev_overnight and prev_layover:
+        evidence_for.append(
+            ('day_suffix_with_real_prev', _EV_WEIGHT['day_suffix_with_real_prev'],
+             f'day suffix in marker + prev_overnight + prev_layover')
+        )
+
+    # ─── AGAINST evidence ─────────────────────────────────────────────
+    if se_count == 0 and (routing or has_fl or overnight or duty > 0):
+        # Tag claimt irgendeine Aktivität, aber kein SE-Eintrag → AGAINST.
+        # Foreign-overnight ohne SE-Stempel ist die stärkste Form dieser Lücke
+        # (eigentlich der Kontext in dem SE existieren MÜSSTE).
+        evidence_against.append(
+            ('no_se_allowance', _EV_WEIGHT['no_se_allowance'],
+             'no SE entries for this day despite activity claim')
+        )
+    # no_homebase_commute_evidence: fires nur für echten Tour-Departure-Claim
+    # (routing[0]==hb UND (foreign-IATA in routing ODER overnight ODER has_fl))
+    # — schließt Arrival-Tage und passive-Hb-Tage automatisch aus.
+    _claims_real_departure = (
+        starts_hb and routing and routing[0] == hb
+        and (has_foreign_iata or has_fl or overnight or duty > 60)
+    )
+    if (anfahrten is not None and datum not in anfahrten
+            and _claims_real_departure):
+        evidence_against.append(
+            ('no_homebase_commute_evidence', _EV_WEIGHT['no_homebase_commute_evidence'],
+             f'{datum} claims real tour-departure but not in anfahrten list')
+        )
+    if duty > _BH_CORE_FTL_MAX_DUTY_MIN:
+        evidence_against.append(
+            ('duty_over_ftl', _EV_WEIGHT['duty_over_ftl'],
+             f'duty {duty}min > FTL-Limit {_BH_CORE_FTL_MAX_DUTY_MIN}')
+        )
+    elif 0 < duty < 60 and has_foreign_iata:
+        # Wenn duty extrem kurz + foreign-routing claimed: verdächtig
+        evidence_against.append(
+            ('duty_very_short', _EV_WEIGHT['duty_very_short'],
+             f'duty {duty}min for foreign routing — too short for real flight')
+        )
+    elif duty == 0 and routing:
+        evidence_against.append(
+            ('duty_zero_with_route', _EV_WEIGHT['duty_zero_with_route'],
+             f'duty=0 but routing claimed: {routing}')
+        )
+    # Marker-Sequence-ID-only-Pattern: 5-6 Ziffern + 2-3 Buchstaben, KEIN LH-Pattern
+    if (_bh_core_re.fullmatch(r'\d{4,6}\s*(?:P[1-9U]|PU|PA|HT\d?|AS|CR\d?)?',
+                                marker)
+            and not _bh_core_re.search(r'\b(LH|DLH)\s*\d{2,4}', marker)):
+        evidence_against.append(
+            ('sequence_id_marker_only', _EV_WEIGHT['sequence_id_marker_only'],
+             f'marker "{marker}" is sequence-id only, no flight-evidence')
+        )
+    if datum in other_span_dates:
+        evidence_against.append(
+            ('day_already_in_other_tour', _EV_WEIGHT['day_already_in_other_tour'],
+             f'{datum} already in another tour-span (FollowMe)')
+        )
+    # FollowMe explicit other span — AGAINST wenn tour_spans gegeben UND
+    # der Tag in KEINEM Tour-Span Member ist.
+    _tour_spans = fm.get('tour_spans') or []
+    if _tour_spans:
+        _in_any_span = False
+        for ts in _tour_spans:
+            try:
+                members = ts[2] if (isinstance(ts, (tuple, list))
+                                    and len(ts) >= 3) else None
+                if members and datum in members:
+                    _in_any_span = True
+                    break
+            except (IndexError, TypeError):
+                pass
+        if not _in_any_span:
+            evidence_against.append(
+                ('followme_explicit_other_span',
+                 _EV_WEIGHT['followme_explicit_other_span'],
+                 f'FollowMe has no tour-membership for {datum}')
+            )
+    # Training/Office passive (marker indicates non-tour)
+    PASSIVE_HOME = ('ORTSTAG', 'FRS', 'LMN_AS', 'LMN_CR', 'FRD', 'EM')
+    if any(p in marker for p in PASSIVE_HOME) and starts_hb and ends_hb and not overnight:
+        evidence_against.append(
+            ('training_office_passive', _EV_WEIGHT['training_office_passive'],
+             f'marker {marker} indicates passive/office at homebase')
+        )
+    # day-suffix claims continuation BUT prev-day was a complete tour
+    # (Tour-Span ended at prev day, e.g. 1-Day-Tour)
+    if _has_day_suffix_ge_2(marker) and prev_dp.get('datum'):
+        prev_date = prev_dp.get('datum')
+        # Phase 4.8b: Auto-detect tour-boundary aus tour_spans (kein explizites
+        # day_in_other_span_dates mehr nötig). Prev-Tag IS in einer Tour-Span,
+        # aber aktueller Tag ist NICHT in derselben Span → tour-boundary-mismatch.
+        prev_in_span_id = None
+        cur_in_span_id = None
+        for _ix, _ts in enumerate(_tour_spans):
+            try:
+                _mem = _ts[2] if (isinstance(_ts, (tuple, list))
+                                  and len(_ts) >= 3) else None
+                if _mem:
+                    if prev_date in _mem:
+                        prev_in_span_id = _ix
+                    if datum in _mem:
+                        cur_in_span_id = _ix
+            except (IndexError, TypeError):
+                pass
+        crossed_boundary = (prev_in_span_id is not None
+                            and prev_in_span_id != cur_in_span_id)
+        legacy_other = prev_date in other_span_dates
+        if crossed_boundary or legacy_other:
+            evidence_against.append(
+                ('day_suffix_claims_completed_prev',
+                 _EV_WEIGHT['day_suffix_claims_completed_prev'],
+                 f'marker has day-suffix but prev-day {prev_date} was complete tour')
+            )
+
+    # Phase 4.8b — routing_inconsistent
+    # Tag claimt Hb-Departure aber routing[0] != Hb, ODER claimt Hb-Return aber
+    # routing[-1] != Hb. Beides ist eine Reader/Marker-Inkonsistenz.
+    # AUSNAHME: Arrival-Pattern (prev_overnight + routing[-1]==hb + routing[0]!=hb)
+    # — Sonnet protokolliert "starts_hb=True" weil duty bei 00:00 beginnt, aber
+    # physikalisch startet der Tag im Flugzeug von der Vorabend-Destination.
+    _is_arrival_pattern = (
+        prev_overnight and routing
+        and routing[-1] == hb and routing[0] != hb
+    )
+    _starts_inconsistent = (starts_hb and routing
+                            and routing[0] != hb
+                            and not _is_arrival_pattern)
+    _ends_inconsistent = (ends_hb and routing and routing[-1] != hb)
+    if _starts_inconsistent or _ends_inconsistent:
+        evidence_against.append(
+            ('routing_inconsistent', _EV_WEIGHT['routing_inconsistent'],
+             f'starts_hb={starts_hb}/ends_hb={ends_hb} contradicts routing={routing}')
+        )
+
+    # Phase 4.8b — transit_via_homebase_ends_foreign
+    # routing X→HB→Y mit Y != HB foreign (z.B. OTP→FRA→LHR). Kein sauberer
+    # Same-Day-Return: HB-Transit ohne Foreign-Return-Pattern.
+    if routing and len(routing) >= 3:
+        _mid = routing[1:-1]
+        if hb in _mid and routing[0] != hb and routing[-1] != hb:
+            if not _is_inland_code(routing[-1]):
+                evidence_against.append(
+                    ('transit_via_homebase_ends_foreign',
+                     _EV_WEIGHT['transit_via_homebase_ends_foreign'],
+                     f'routing transits via {hb} but ends foreign {routing[-1]}')
+                )
+
+    # Phase 4.8b — routing_ends_foreign_at_claimed_return
+    # ends_hb=True aber routing[-1] != Hb (Reader sagt "kommt heim" aber routing
+    # zeigt Auslands-Endpunkt). Stärker als reines routing_inconsistent oben.
+    if ends_hb and routing and routing[-1] != hb and not _is_inland_code(routing[-1]):
+        evidence_against.append(
+            ('routing_ends_foreign_at_claimed_return',
+             _EV_WEIGHT['routing_ends_foreign_at_claimed_return'],
+             f'ends_at_homebase=True but routing[-1]={routing[-1]} foreign')
+        )
+
+    # Phase 5a.1 — cas_followme_place_conflict
+    # FollowMe-Kontext liefert optional `tour_destinations`: dict[date] → set of IATAs.
+    # Wenn CAS routing/layover für diesen Tag IATAs hat, die NICHT mit den
+    # FollowMe-erwarteten IATAs überlappen → Cross-Source-Place-Conflict.
+    _fm_destinations = fm.get('tour_destinations') if isinstance(fm.get('tour_destinations'), dict) else None
+    if _fm_destinations and datum in _fm_destinations:
+        _expected_iatas = _fm_destinations.get(datum) or set()
+        if not isinstance(_expected_iatas, (set, frozenset, list, tuple)):
+            _expected_iatas = {str(_expected_iatas).upper().strip()}
+        _expected_iatas = {str(x).upper().strip() for x in _expected_iatas if x}
+        # CAS IATAs aus routing + layover (außer Homebase)
+        _cas_iatas = {r for r in routing if r and r != hb}
+        if layover and layover != hb:
+            _cas_iatas.add(layover)
+        if _cas_iatas and _expected_iatas and not (_cas_iatas & _expected_iatas):
+            evidence_against.append(
+                ('cas_followme_place_conflict',
+                 _EV_WEIGHT['cas_followme_place_conflict'],
+                 f'CAS places {sorted(_cas_iatas)} vs FollowMe expected '
+                 f'{sorted(_expected_iatas)}')
+            )
+
+    # Phase 4.8b — reader_warning_set
+    # Sammlung von "Reader hat geflaggt"-Signalen:
+    #  - Day-Suffix-Marker ohne prev_overnight (Tag-2-Behauptung ohne Vortag)
+    #  - duty > FTL (bereits separat evidence_against, hier zusätzlicher Audit)
+    _reader_warnings = []
+    if _has_day_suffix_ge_2(marker) and not prev_overnight:
+        _reader_warnings.append('day-suffix without prev_overnight')
+    if duty > _BH_CORE_FTL_MAX_DUTY_MIN:
+        _reader_warnings.append(f'duty={duty}min > FTL')
+    if _reader_warnings:
+        evidence_against.append(
+            ('reader_warning_set', _EV_WEIGHT['reader_warning_set'],
+             '; '.join(_reader_warnings))
+        )
+
+    score_for = sum(w for _, w, _ in evidence_for)
+    score_against = sum(w for _, w, _ in evidence_against)
+    diff = score_for - score_against
+
+    # Hard-overrides: spezifische Anti-Tour-Indikatoren erzwingen NEEDS_AI/DROP
+    # unabhängig vom Score (außer wenn extrem starke kompensierende FOR-evidence).
+    has_duty_over_ftl = any(n == 'duty_over_ftl' for n, _, _ in evidence_against)
+    has_already_in_other = any(n == 'day_already_in_other_tour'
+                                for n, _, _ in evidence_against)
+    has_strong_se_for = any(n == 'se_foreign_stamp' for n, _, _ in evidence_for)
+    has_anfahrt_for = any(n == 'has_anfahrt_evidence' for n, _, _ in evidence_for)
+
+    has_completed_prev_conflict = any(
+        n == 'day_suffix_claims_completed_prev' for n, _, _ in evidence_against
+    )
+
+    # Cross-source-rejection: SE-Stempel UND FollowMe-Tour-Spans lehnen den
+    # Tag beide ab, PLUS mindestens ein dritter Anti-Tour-Indikator (entweder
+    # fehlende Anfahrt, duty-Plausi-Auffälligkeit, sequence-id-only-marker,
+    # passive-Marker, reader-warning oder routing-inconsistent).
+    # → drei unabhängige Signale gegen die CAS-Tour-Behauptung. NEEDS_AI minimum.
+    _ag_names = {n for n, _, _ in evidence_against}
+    _supporting_rejection = {
+        'no_homebase_commute_evidence', 'duty_zero_with_route',
+        'duty_very_short', 'duty_over_ftl', 'sequence_id_marker_only',
+        'training_office_passive', 'reader_warning_set',
+        'routing_inconsistent', 'day_suffix_claims_completed_prev',
+        'free_gap_around_day',
+    }
+    has_cross_source_rejection = (
+        'no_se_allowance' in _ag_names
+        and 'followme_explicit_other_span' in _ag_names
+        and bool(_ag_names & _supporting_rejection)
+    )
+
+    # Phase 4.8b — Multi-Conflict-Override
+    # ≥2 starke Konflikt-Signale UND keine SE-Auslands-Bestätigung
+    # → KEEP_TOUR allein aus FOR-Score nicht ausreichend; NEEDS_AI minimum.
+    _strong_conflict_signals = {
+        'followme_explicit_other_span',
+        'day_suffix_claims_completed_prev',
+        'routing_inconsistent',
+        'reader_warning_set',
+        'duty_over_ftl',
+        'no_homebase_commute_evidence',
+        'transit_via_homebase_ends_foreign',
+        'routing_ends_foreign_at_claimed_return',
+        'day_already_in_other_tour',
+        # Phase 5a.1 — Place-Konflikt ist eigenständiger Konfliktindikator
+        'cas_followme_place_conflict',
+    }
+    _conflict_count = len(_ag_names & _strong_conflict_signals)
+    # Override greift nur, wenn der Tag eine echte CAS-Tour-Claim hat
+    # (score_for >= 6). Passive Hb-Tage haben FOR≈0 und gehören in den
+    # natürlichen DROP_TOUR-Pfad, nicht in NEEDS_AI.
+    has_multi_conflict_no_se = (
+        _conflict_count >= 2
+        and not has_strong_se_for
+        and score_for >= 6
+    )
+
+    if has_already_in_other:
+        decision = 'DROP_TOUR'
+        explanation = f'Day already in another tour-span — duplicate prevented'
+    elif has_cross_source_rejection and not has_strong_se_for:
+        decision = 'NEEDS_AI'
+        explanation = (
+            'Three independent user-truth sources reject this day '
+            '(no anfahrt, no SE-stamp, not in any FollowMe-tour-span) '
+            '— CAS-reader-evidence stands alone; AI resolution required'
+        )
+    elif has_multi_conflict_no_se:
+        decision = 'NEEDS_AI'
+        _cs = sorted(_ag_names & _strong_conflict_signals)
+        explanation = (
+            f'Multi-conflict ({_conflict_count} strong signals) without '
+            f'SE-foreign confirmation: {", ".join(_cs)} — AI resolution required'
+        )
+    elif has_completed_prev_conflict:
+        # Day-N-Marker behauptet Continuation einer Tour die laut Quelle
+        # schon abgeschlossen ist → Reader-Bug-Verdacht, KI-Klärung nötig
+        decision = 'NEEDS_AI'
+        explanation = (f'Day-suffix marker claims continuation but prev-day '
+                       f'was a complete tour — Reader-Bug or wrong tour-boundary')
+    elif has_duty_over_ftl and not (has_strong_se_for or has_anfahrt_for):
+        # duty>FTL ohne kompensierende SE oder Anfahrt → NEEDS_AI minimum
+        decision = 'NEEDS_AI'
+        explanation = (f'duty>FTL reader-bug-flag without compensating '
+                       f'SE/anfahrt evidence — needs AI resolution')
+    elif diff >= 8:
+        decision = 'KEEP_TOUR'
+        explanation = f'Strong FOR evidence ({score_for} vs {score_against})'
+    elif -diff >= 6:
+        decision = 'DROP_TOUR'
+        explanation = f'Strong AGAINST evidence ({score_against} vs {score_for})'
+    elif abs(diff) < 4:
+        decision = 'NEEDS_AI'
+        explanation = (f'Ambiguous evidence (for={score_for}, against={score_against})')
+    elif diff > 0:
+        decision = 'KEEP_TOUR'
+        explanation = f'Slight FOR ({score_for} vs {score_against})'
+    else:
+        decision = 'DROP_TOUR'
+        explanation = f'Slight AGAINST ({score_against} vs {score_for})'
+
+    # Phase 5a.1 — ai_required-Flag
+    # Auch bei KEEP_TOUR muss der KI-Resolver gerufen werden, wenn echte
+    # Cross-Source-Konflikte (CAS↔FollowMe oder CAS-intern) vorhanden sind.
+    # NUR harte Konflikte — Absence-Signale (followme_explicit_other_span)
+    # zählen NICHT, da fehlende FollowMe-Daten kein Conflict ist.
+    _ai_required_signals = {
+        'cas_followme_place_conflict',     # CAS-Place vs FollowMe-Place
+        'day_suffix_claims_completed_prev', # day-suffix vs FollowMe-tour-boundary
+        'routing_inconsistent',             # CAS-intern (starts_hb vs routing[0] etc)
+        'transit_via_homebase_ends_foreign',# CAS routing transit-pattern
+        'routing_ends_foreign_at_claimed_return',  # ends_hb vs routing[-1]
+        'day_already_in_other_tour',        # FollowMe-explicit duplicate
+    }
+    ai_required = (
+        decision == 'NEEDS_AI'
+        or bool(_ag_names & _ai_required_signals)
+    )
+
+    return {
+        'datum':            datum,
+        'evidence_for':     evidence_for,
+        'evidence_against': evidence_against,
+        'score_for':        score_for,
+        'score_against':    score_against,
+        'decision':         decision,
+        'explanation':      explanation,
+        'source_refs':      source_refs,
+        'ai_required':      ai_required,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BH-CORE-001 Phase 5a — Resolver-Kind-Wahl + Mock-Heuristik für NEEDS_AI
+# Wiederverwendet existierende _resolve_uncertain_fact_with_ai (Zeile ~7751).
+# Default-Modus: AEROTAX_AI_RESOLVER_MODE=mock (Phase 5a — keine Live-Calls).
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _ai_resolver_kind_from_evidence(evidence_dict, day):
+    """Wählt das passende Resolver-Kind anhand der Evidence-Signature.
+
+    Priorität (Phase 5a + 5a.1):
+      - cas_followme_place_conflict (5a.1) → place_code (höchste Priorität)
+      - RES/SBY marker → standby_context
+      - transit/routing-inconsistencies → routing_consistency
+      - day-suffix/already-in-other → tour_boundary
+      - duty>FTL/reader-warnings → cas_time_extraction
+      - default → tour_boundary
+    """
+    ag_names = {n for n, _, _ in (evidence_dict.get('evidence_against') or [])}
+    marker = ((day or {}).get('raw_marker') or '').upper().strip()
+    marker_first = marker.split()[0] if marker else ''
+    # Phase 5a.1: Place-Konflikt hat Priorität — direkter Ort-Mismatch
+    if 'cas_followme_place_conflict' in ag_names:
+        return 'place_code'
+    if marker_first in ('RES', 'SBY', 'SB', 'RES_SB'):
+        return 'standby_context'
+    if 'transit_via_homebase_ends_foreign' in ag_names \
+       or 'routing_inconsistent' in ag_names \
+       or 'routing_ends_foreign_at_claimed_return' in ag_names:
+        return 'routing_consistency'
+    if 'day_suffix_claims_completed_prev' in ag_names \
+       or 'day_already_in_other_tour' in ag_names \
+       or 'followme_explicit_other_span' in ag_names:
+        return 'tour_boundary'
+    if 'duty_over_ftl' in ag_names or 'reader_warning_set' in ag_names:
+        return 'cas_time_extraction'
+    return 'tour_boundary'
+
+
+def _ai_resolver_mock_dispatch(kind, context):
+    """Phase 5a/5d Mock-Resolver — deterministische Heuristik, kein Live-Call.
+
+    Phase 5d Erweiterungen:
+      - PU/PUR als Crew-Position erkennen (NICHT Pula-Airport)
+      - Phantom-Tag-Detection (LAD/TLV ohne SE+Anfahrt+FollowMe → NEEDS_REVIEW)
+      - Place-Conflict (JFK vs FollowMe) → reader_misread/NEEDS_REVIEW
+      - Transit-Pattern (OTP→FRA→LHR) → routing_conflict
+      - Structured Output mit decision + context_type-Feldern
+
+    Output schema-konform zu existierendem Resolver + Phase-5d-Felder.
+    """
+    ctx = context or {}
+    day = ctx.get('day') or {}
+    prev = ctx.get('prev_day') or {}
+    nxt = ctx.get('next_day') or {}
+    se = ctx.get('se') or {}
+    homebase = (ctx.get('homebase') or 'FRA').upper()
+    fm = ctx.get('followme_context') or ctx.get('fm') or {}
+
+    marker = ((day.get('raw_marker') or '') or '').upper().strip()
+    routing = [(r or '').upper() for r in (day.get('routing') or []) if r]
+    overnight = bool(day.get('overnight_after_day'))
+    layover = ((day.get('layover_ort') or '') or '').upper().strip()
+    prev_overnight = bool(prev.get('overnight_after_day'))
+    prev_layover = ((prev.get('layover_ort') or '') or '').upper().strip()
+    next_overnight = bool(nxt.get('overnight_after_day'))
+    se_count = int(se.get('count', 0) or 0)
+    se_foreign = (se_count > 0
+                  and se.get('stfrei_inland') is False
+                  and (se.get('stfrei_ort') or ''))
+
+    # FollowMe-Signale (read-only, REFERENCE not truth)
+    fm_dest = fm.get('expected_destinations')
+    if fm_dest and not isinstance(fm_dest, (set, frozenset, list, tuple)):
+        fm_dest = [fm_dest]
+    fm_in_any_span = fm.get('in_any_tour_span')
+    fm_anfahrten_dates = fm.get('anfahrten_dates')
+    has_anfahrt = False
+    if fm_anfahrten_dates and day.get('datum') in fm_anfahrten_dates:
+        has_anfahrt = True
+
+    inland = {'FRA','MUC','BER','DUS','HAM','HAJ','TXL','CGN','STR','NUE',
+              'BRE','LEJ','PAD'}
+
+    # Phase 5d — Crew-Code-Detection (PU=Purser, P1/P2=Position, CR=Captain)
+    _CREW_ROLE_TOKENS = ('PU', 'PUR', 'P1', 'P2', 'CR', 'FO')
+    marker_first = marker.split()[0] if marker else ''
+    marker_tokens = set(marker.split())
+    has_crew_role_token = bool(marker_tokens & set(_CREW_ROLE_TOKENS))
+
+    # Cross-Source-Rejection-Signal (phantom-candidate)
+    is_phantom_candidate = (
+        not se_foreign and fm_in_any_span is False and not has_anfahrt
+    )
+
+    # Place-Conflict-Signal
+    has_place_conflict = bool(
+        fm_dest
+        and routing
+        and not (set(r for r in routing if r != homebase) & set(fm_dest))
+    )
+
+    # Transit-via-Homebase-ends-foreign
+    has_transit_conflict = (
+        len(routing) >= 3
+        and homebase in routing[1:-1]
+        and routing and routing[-1] != homebase
+    )
+
+    if kind == 'standby_context':
+        if marker.startswith('RES') or marker_first in ('SBY', 'SB', 'RES_SB'):
+            if prev_overnight and prev_layover and prev_layover != homebase:
+                # Konflikt C4 — Differenzierung Inland vs foreign Übernachtung
+                # referenz_faelle.txt:636: RES mit Inland-Übernachtung
+                # (HAM/MUC/...) = Z73-Kandidat (Schulung mit Inland-Hotel),
+                # NICHT standby_hotel (das wäre Z76).
+                if _is_inland_code(prev_layover):
+                    return {
+                        'resolved': True,
+                        # NEEDS_REVIEW weil Python deterministisch
+                        # Z73-Kandidaten erkennt (3+ EM/EH/D4-Sequenz);
+                        # Standalone-RES-Inland ist user-bestätigungs-würdig.
+                        'decision': 'NEEDS_REVIEW',
+                        'context_type': 'hotel_standby',
+                        'value': {
+                            'meaning': 'standby_inland_hotel',
+                            'tax_hint': (
+                                'Inland-Hotel-Kandidat (Z73 An/Ab), '
+                                'NICHT foreign Z76'
+                            ),
+                        },
+                        'confidence': 0.80,
+                        'reason': (
+                            'RES marker mit prev_overnight am Inland-Layover '
+                            f'({prev_layover}) → Inland-Hotel-Kandidat. '
+                            'Beleg referenz_faelle.txt:636: RES mit Inland-'
+                            'Übernachtung (HAM/MUC/...) = Z73-Kandidat.'
+                        ),
+                        'evidence': [
+                            f'prev_overnight=True at inland {prev_layover}',
+                            f'current marker={marker}',
+                            'rule: referenz_faelle.txt:636',
+                        ],
+                        'needs_review': True,
+                    }
+                # foreign prev_layover → standby_hotel (Phase 5a-Pfad)
+                return {
+                    'resolved': True,
+                    'decision': 'KEEP_TOUR',
+                    'context_type': 'hotel_standby',
+                    'value': 'standby_hotel',
+                    'confidence': 0.90,
+                    'reason': ('RES marker mit prev_overnight am foreign '
+                               'Layover → standby_hotel im Tour-Kontext'),
+                    'evidence': [
+                        f'prev_overnight=True at foreign {prev_layover}',
+                        f'current marker={marker}',
+                    ],
+                    'needs_review': False,
+                }
+            return {
+                'resolved': True,
+                'decision': 'DROP_TOUR',
+                'context_type': 'homebase_standby',
+                'value': 'standby_home',
+                'confidence': 0.85,
+                'reason': 'RES marker ohne foreign-overnight-context → standby_home',
+                'evidence': [f'marker={marker}', 'no prev foreign overnight'],
+                'needs_review': False,
+            }
+        return {
+            'resolved': False, 'decision': 'NEEDS_REVIEW',
+            'context_type': 'unknown',
+            'value': None, 'confidence': 0.5,
+            'reason': 'standby_context inconclusive', 'evidence': [],
+            'needs_review': True,
+        }
+
+    if kind == 'tour_boundary':
+        # Phase 5d — Phantom-Detection HÄRTER vor anderen Branches.
+        # Kein SE, nicht in FollowMe-Span, keine Anfahrt → NEEDS_REVIEW
+        # selbst wenn CAS-routing foreign zeigt.
+        if is_phantom_candidate and routing:
+            has_foreign_in_route = any(
+                r and r != homebase and r not in inland for r in routing
+            )
+            if has_foreign_in_route and not se_foreign:
+                return {
+                    'resolved': True,
+                    'decision': 'NEEDS_REVIEW',
+                    'context_type': 'reader_misread',
+                    'value': {
+                        'phantom_candidate': True,
+                        'cas_routing_unverified': routing,
+                    },
+                    'confidence': 0.65,
+                    'reason': (
+                        'Phantom-Verdacht: CAS-routing zeigt foreign, '
+                        'aber kein SE-Stempel, nicht in FollowMe-Tour-Spans, '
+                        'keine Anfahrt-Evidence. CAS-Reader könnte falsch '
+                        'gelesen haben oder Sequence-ID statt Flight-Nr.'
+                    ),
+                    'evidence': [
+                        f'routing={routing}',
+                        'se_has_foreign_allowance=False',
+                        'fm.in_any_tour_span=False',
+                        'no_anfahrt_for_this_date',
+                    ],
+                    'needs_review': True,
+                }
+
+        # Day-Suffix-Marker mit prev-overnight → legitimer Multi-Day-Duty
+        if '/ TAG' in marker or 'TAG 2' in marker or 'TAG 3' in marker or 'TAG 4' in marker:
+            if prev_overnight and prev_layover:
+                return {
+                    'resolved': True,
+                    'decision': 'KEEP_TOUR',
+                    'context_type': 'tour_day',
+                    'value': 'mid',
+                    'confidence': 0.90,
+                    'reason': (
+                        'Day-Suffix in Marker + prev_overnight + prev_layover → '
+                        'legitimer Multi-Day-Duty-Tag, NICHT Reader-Bug'
+                    ),
+                    'evidence': [
+                        f'marker={marker}',
+                        f'prev_layover={prev_layover}',
+                        'prev_overnight=True',
+                    ],
+                    'needs_review': False,
+                }
+
+        has_foreign_routing = any(r and r != homebase and r not in inland
+                                  for r in routing)
+        if se_foreign and has_foreign_routing and overnight:
+            return {
+                'resolved': True,
+                'decision': 'KEEP_TOUR',
+                'context_type': 'tour_day',
+                'value': 'mid' if prev_overnight else 'start',
+                'confidence': 0.92,
+                'reason': 'SE-foreign-stamp + foreign-routing + overnight konsistent',
+                'evidence': [
+                    f'se_foreign at {se.get("stfrei_ort")}',
+                    f'foreign routing={routing}',
+                ],
+                'needs_review': False,
+            }
+        if not has_foreign_routing and not overnight and not routing:
+            return {
+                'resolved': True,
+                'decision': 'DROP_TOUR',
+                'context_type': 'homebase_free',
+                'value': 'non_tour',
+                'confidence': 0.88,
+                'reason': 'keine foreign-routing, keine overnight, kein Tour-Indikator',
+                'evidence': [f'routing={routing}', f'marker={marker}'],
+                'needs_review': False,
+            }
+        return {
+            'resolved': False,
+            'decision': 'NEEDS_REVIEW',
+            'context_type': 'unknown',
+            'value': None,
+            'confidence': 0.60,
+            'reason': 'tour_boundary ambig',
+            'evidence': [f'marker={marker}', f'routing={routing}'],
+            'needs_review': True,
+        }
+
+    if kind == 'routing_consistency':
+        if has_transit_conflict:
+            return {
+                'resolved': True,
+                'decision': 'NEEDS_REVIEW',
+                'context_type': 'routing_conflict',
+                'value': 'inconsistent',
+                'confidence': 0.85,
+                'reason': (
+                    f'routing transits via homebase ({homebase}) und endet '
+                    f'foreign ({routing[-1]}) — KEIN clean Same-Day-Homebase-Return. '
+                    f'Eher positioning oder reader_misread.'
+                ),
+                'evidence': [f'routing={routing}'],
+                'needs_review': True,
+            }
+        if routing and routing[0] == homebase and routing[-1] == homebase:
+            return {
+                'resolved': True,
+                'decision': 'KEEP_TOUR',
+                'context_type': 'tour_day',
+                'value': 'consistent',
+                'confidence': 0.90,
+                'reason': 'roundtrip Hb→...→Hb konsistent',
+                'evidence': [f'routing={routing}'],
+                'needs_review': False,
+            }
+        return {
+            'resolved': False,
+            'decision': 'NEEDS_REVIEW',
+            'context_type': 'unknown',
+            'value': 'ambiguous',
+            'confidence': 0.55,
+            'reason': 'routing-consistency unklar',
+            'evidence': [f'routing={routing}'],
+            'needs_review': True,
+        }
+
+    if kind == 'marker_semantics':
+        known = {
+            'X': 'foreign-layover free-day (within an active tour)',
+            '==': 'layover continuation marker',
+            'OFF': 'off-day (no duty)',
+            'OF': 'off-day (no duty)',
+            'RES': 'reserve/standby',
+            'ORTSTAG': 'local home-base passive day',
+            'FRS': 'office/admin presence at homebase',
+            'LMN_AS': 'training/medical at homebase',
+            'LMN_CR': 'training/medical at homebase',
+            'EM': 'emergency training at homebase',
+            'EH': 'eintraining',
+            'SECCRM': 'security/CRM training',
+            'CRM': 'crew resource management training',
+            # Phase 5d — Crew-Position-Codes explizit als Position klassifiziert
+            'PU': 'crew_position: Purser/Kabinenchef (NICHT Pula-Airport)',
+            'PUR': 'crew_position: Purser',
+            'P1': 'crew_position: Pilot 1 / Position-Slot 1',
+            'P2': 'crew_position: Pilot 2 / Position-Slot 2',
+            'CR': 'crew_position: Captain',
+            'FO': 'crew_position: First Officer',
+        }
+        m1 = marker_first if marker_first else marker
+        if m1 in known:
+            # Crew-Position-Code = NICHT für Tour-Decision verwertbar
+            is_position_code = m1 in ('PU', 'PUR', 'P1', 'P2', 'CR', 'FO')
+            return {
+                'resolved': True,
+                'decision': 'NEEDS_REVIEW' if is_position_code else 'KEEP_TOUR',
+                'context_type': 'tour_day' if not is_position_code else 'unknown',
+                'value': {
+                    'meaning': known[m1],
+                    'is_crew_position_code': is_position_code,
+                },
+                'confidence': 0.92,
+                'reason': (f'marker {m1} → crew_position-Code (kein Tour-Indikator)'
+                           if is_position_code
+                           else f'marker {m1} ist bekannter Crew-Code'),
+                'evidence': [f'marker={marker}'],
+                'needs_review': is_position_code,
+            }
+        return {
+            'resolved': False,
+            'decision': 'NEEDS_REVIEW',
+            'context_type': 'unknown',
+            'value': None,
+            'confidence': 0.40,
+            'reason': 'unbekannter marker — review nötig',
+            'evidence': [f'marker={marker}'],
+            'needs_review': True,
+        }
+
+    if kind in ('layover_place', 'place_code'):
+        # Phase 5d — Place-Conflict: FollowMe sagt anderen Ort als CAS-routing
+        if has_place_conflict:
+            return {
+                'resolved': False,
+                'decision': 'NEEDS_REVIEW',
+                'context_type': 'reader_misread',
+                'value': {
+                    'cas_place': layover or (routing[-1] if routing else ''),
+                    'followme_expected': list(fm_dest) if fm_dest else [],
+                    'conflict': True,
+                },
+                'confidence': 0.30,
+                'reason': (
+                    'CAS-routing zeigt einen Ort, FollowMe-tour_destinations '
+                    'erwartet einen anderen — Place-Conflict. Mögliches '
+                    'reader_misread. Klärung durch User oder externe Quelle.'
+                ),
+                'evidence': [
+                    f'cas={layover or routing}',
+                    f'followme_expected={list(fm_dest)}',
+                ],
+                'needs_review': True,
+            }
+
+        # Falls Marker reine Crew-Position ist → kein place_code-Resolve
+        if has_crew_role_token and not layover and not any(
+            r and r != homebase and not _is_inland_code(r) for r in routing
+        ):
+            return {
+                'resolved': False,
+                'decision': 'NEEDS_REVIEW',
+                'context_type': 'unknown',
+                'value': None,
+                'confidence': 0.15,
+                'reason': (
+                    f'Marker enthält Crew-Position-Code ({marker_first} = '
+                    f'Purser/Pilot-Slot), KEIN Airport-Code. place_code nicht '
+                    f'aus Marker ableitbar.'
+                ),
+                'evidence': [f'marker={marker}'],
+                'needs_review': True,
+            }
+        if layover:
+            return {
+                'resolved': True,
+                'decision': 'KEEP_TOUR',
+                'context_type': 'tour_day',
+                'value': layover,
+                'confidence': 0.85,
+                'reason': 'explicit layover_ort from CAS',
+                'evidence': [f'layover_ort={layover}'],
+                'needs_review': False,
+            }
+        for r in reversed(routing):
+            if r and r != homebase:
+                return {
+                    'resolved': True,
+                    'decision': 'KEEP_TOUR',
+                    'context_type': 'tour_day',
+                    'value': r,
+                    'confidence': 0.75,
+                    'reason': 'last non-homebase IATA in routing',
+                    'evidence': [f'routing={routing}'],
+                    'needs_review': True,  # medium-conf → review
+                }
+        return {
+            'resolved': False,
+            'decision': 'NEEDS_REVIEW',
+            'context_type': 'unknown',
+            'value': None,
+            'confidence': 0.30,
+            'reason': 'no layover signal',
+            'evidence': [], 'needs_review': True,
+        }
+
+    if kind == 'cas_time_extraction':
+        st = (day.get('start_time') or '').strip()
+        et = (day.get('end_time') or '').strip()
+        if st and et:
+            return {
+                'resolved': True,
+                'decision': 'KEEP_TOUR',
+                'context_type': 'tour_day',
+                'value': {'start': st, 'end': et},
+                'confidence': 0.88,
+                'reason': 'start/end times present in reader output',
+                'evidence': [f'start={st}, end={et}'],
+                'needs_review': False,
+            }
+        return {
+            'resolved': False,
+            'decision': 'NEEDS_REVIEW',
+            'context_type': 'unknown',
+            'value': None,
+            'confidence': 0.40,
+            'reason': 'times missing',
+            'evidence': [], 'needs_review': True,
+        }
+
+    return {
+        'resolved': False,
+        'decision': 'NEEDS_REVIEW',
+        'context_type': 'unknown',
+        'value': None, 'confidence': 0.0,
+        'reason': f'kind {kind} not implemented in mock',
+        'evidence': [], 'needs_review': True,
+    }
+
+
+def _classify_days_from_normalized_tours(normalized_tours, year=2025, homebase='FRA'):
+    """BH-CORE-001 Layer 2: Klassifikation aus Tour-Rolle + Location.
+
+    Spec: docs/BH_CORE_001_TOUR_FIRST_SPEC.md §6.
+
+    Input:  normalized_tours (Liste von Tours mit days, role, location_context)
+    Output: dict mit tage_detail (klass, amount, reason) + _klass_summary +
+            _rescues + audit-Listen + KPI-Counter aus tours.
+
+    SE-Override-Guard (tight, §6.2):
+      Frei → Z76 NUR wenn aktive Auslands-SE UND zusätzlich
+      role in {tour_start, tour_mid, tour_end} (Tour-Evidence).
+    """
+    try:
+        from bmf_data import IATA_TO_BMF as _IATA_BMF_C
+    except ImportError:
+        _IATA_BMF_C = {}
+    try:
+        from bmf_data import IATA_METRO_TO_BMF as _METRO_C
+    except ImportError:
+        _METRO_C = {}
+
+    _bmf_year = BMF_AUSLAND_BY_YEAR.get(year) or BMF_AUSLAND_BY_YEAR.get(2025) or {}
+
+    def _bmf_sat(iata):
+        land = _IATA_BMF_C.get(iata) or _METRO_C.get(iata)
+        if not land:
+            return None, None
+        raw = _bmf_year.get(land)
+        if not raw:
+            return None, land
+        if isinstance(raw, tuple) and len(raw) >= 2:
+            return {'voll_24h': float(raw[0]), 'an_abreise': float(raw[1])}, land
+        if isinstance(raw, dict):
+            return raw, land
+        return None, land
+
+    INLAND_TAGESTRIP_8H = 14.0
+    INLAND_AN_ABREISE   = 14.0
+    INLAND_VOLLTAG_24H  = 28.0
+
+    tage_detail = []
+    rescues = []
+    audit_notes = []
+    klass_counter = {'Z72': 0, 'Z73': 0, 'Z74': 0, 'Z76': 0,
+                     'Office': 0, 'Standby': 0, 'ZeroDay': 0,
+                     'Issue': 0, 'Frei': 0}
+    z76_eur = 0.0
+    z72_eur = 0.0
+    z73_eur = 0.0
+    z74_eur = 0.0
+    arbeitstage = 0
+    hotel_naechte = 0
+    fahr_tage = 0
+    reinigungstage = 0
+
+    # Hotel-counter aus Tour-Layer: pro Tour, days die overnight=True UND
+    # role in {tour_start, tour_mid} UND nicht homebase.
+    # Wir tracken pro day was wir entscheiden.
+
+    for tour in normalized_tours:
+        # Bestimme Tour-Land aus primary_destination
+        tour_dest = (tour.get('primary_destination') or '').upper().strip()
+        tour_country = tour.get('destination_country') or ''
+        is_foreign_tour = bool(tour.get('is_foreign'))
+        is_mixed_tour = bool(tour.get('is_mixed'))
+
+        # Tour-Anreise wurde gezählt? (für fahr_tage = N(Tour-Starts))
+        tour_fahrtag_counted = False
+
+        for day in tour['days']:
+            datum = day['datum']
+            role = day['role']
+            loc = day['location_context']
+            marker = (day.get('raw_marker') or '').upper()
+            bmf_place = day.get('bmf_place_code') or tour_dest
+            se_ctx = day.get('se_context') or {}
+
+            klass = 'Issue'
+            amount = 0.0
+            reason = ''
+            bmf_land = ''
+            counted_workday = False
+            counted_hotel = False
+            counted_fahrtag = False
+
+            # ── Role-based classification ──
+            if role == 'tour_start':
+                counted_workday = True
+                # Phase 6b — Late-evening-briefing-Regel (Cluster C3):
+                # Wenn briefing_time >= 18:00 UND foreign-tour, Crew übernachtet
+                # noch in DE nach late briefing/positioning → Z73 (Inland) An,
+                # nicht Z76 (Auslandsanreise mit Inlandsaufenthalt vor Mitternacht).
+                start_time_str = (day.get('inferred_layover_ort') and '' or '')
+                # Hole start_time aus den ursprünglichen Reader-Facts via day-key
+                _bt = ''
+                try:
+                    # signals werden in normalize gespeichert; hier nehmen wir
+                    # aus normalized_day evidence (Phase 4.8) den start_time
+                    # zurück — Fallback: leer
+                    _bt = (day.get('raw_marker') and '')  # placeholder
+                except Exception:
+                    pass
+                # Hole start_time direkt aus dem normalized day, falls vorhanden
+                _bt = day.get('start_time') or ''
+                _briefing_hour = -1
+                if _bt and ':' in _bt:
+                    try:
+                        _briefing_hour = int(_bt.split(':', 1)[0])
+                    except (ValueError, TypeError):
+                        _briefing_hour = -1
+                _late_evening_briefing = (_briefing_hour >= 18)
+
+                if is_foreign_tour:
+                    # v11 Closeout-Fix 1e: Inland-SE-Anreise auch in foreign-Tour
+                    # bleibt Z73 inland (Crew startet in DE, fliegt erst spaeter
+                    # ins Ausland).
+                    _se_ctx = day.get('se_context') or {}
+                    _se_inland_today = _se_ctx.get('stfrei_inland')
+                    _se_ort_today = _se_ctx.get('stfrei_ort') or ''
+                    if _se_inland_today is True and _se_ort_today:
+                        klass = 'Z73'
+                        amount = INLAND_AN_ABREISE
+                        bmf_land = 'Deutschland'
+                        reason = (f'Tour-START foreign-tour aber SE inland '
+                                  f'({_se_ort_today}) → Z73 Inland-Anreise')
+                    elif _late_evening_briefing:
+                        # Late-evening: Z73 An (Inland-Anreise, foreign-Tour
+                        # startet eigentlich am Folgetag)
+                        klass = 'Z73'
+                        amount = INLAND_AN_ABREISE
+                        reason = (f'Tour-START foreign mit late-briefing '
+                                  f'({_bt}) → Z73 Inland-Anreise')
+                    else:
+                        sat, land = _bmf_sat(bmf_place)
+                        if sat and bmf_place:
+                            amount = float(sat.get('an_abreise', 0) or 0)
+                            klass = 'Z76'
+                            bmf_land = land or ''
+                            reason = f'Tour-START foreign {bmf_place} (Z76 An/Ab)'
+                        else:
+                            klass = 'Z73'
+                            amount = INLAND_AN_ABREISE
+                            reason = f'Tour-START foreign aber kein BMF-Mapping → Z73 fallback'
+                else:
+                    klass = 'Z73'
+                    amount = INLAND_AN_ABREISE
+                    reason = 'Tour-START inland (Z73 An)'
+                if not tour_fahrtag_counted:
+                    counted_fahrtag = True
+                    tour_fahrtag_counted = True
+
+            elif role == 'tour_mid':
+                counted_workday = True
+                # v11 Closeout-Fix 1f: SE-Inland-Override fuer Tour-Mid.
+                # Wenn SE inland-Stempel hat, ueberstimmt das CAS-Foreign-Routing
+                # → Z74 Volltag inland (28€). User war wirklich in Deutschland
+                # an dem Tag (CAS-routing zeigt nur transit-airport).
+                _se_ctx_mid = day.get('se_context') or {}
+                _se_inland_mid = _se_ctx_mid.get('stfrei_inland')
+                _se_ort_mid = _se_ctx_mid.get('stfrei_ort') or ''
+                if _se_inland_mid is True and _se_ort_mid:
+                    klass = 'Z74'
+                    amount = INLAND_VOLLTAG_24H
+                    bmf_land = 'Deutschland'
+                    counted_hotel = True
+                    reason = (f'Tour-MID SE-Inland-Ueberstimmung ({_se_ort_mid}) '
+                              f'→ Z74 Inland-Volltag')
+                elif loc == 'foreign_layover' or (is_foreign_tour and not loc == 'inland_layover'):
+                    sat, land = _bmf_sat(bmf_place)
+                    if sat:
+                        amount = float(sat.get('voll_24h', 0) or 0)
+                        klass = 'Z76'
+                        bmf_land = land or ''
+                        reason = f'Tour-MID foreign {bmf_place} (Z76 voll_24h)'
+                        counted_hotel = True
+                    else:
+                        klass = 'Issue'
+                        reason = f'Tour-MID foreign aber kein BMF für {bmf_place}'
+                elif loc == 'inland_layover':
+                    klass = 'Z74'
+                    amount = INLAND_VOLLTAG_24H
+                    reason = 'Tour-MID inland (Z74 Volltag)'
+                    counted_hotel = True
+                else:
+                    # Standby/Layover-Free ohne klare Location
+                    if day.get('is_standby_hotel'):
+                        sat, land = _bmf_sat(bmf_place)
+                        if sat:
+                            amount = float(sat.get('voll_24h', 0) or 0)
+                            klass = 'Z76'
+                            bmf_land = land or ''
+                            reason = f'Tour-MID standby_hotel {bmf_place} (Z76)'
+                            counted_hotel = True
+                        else:
+                            klass = 'Standby'
+                            reason = 'Tour-MID RES ohne BMF — needs_review'
+                    elif day.get('is_layover_free_day'):
+                        # X/==/OFF in tour, foreign context — Z76 voll_24h
+                        sat, land = _bmf_sat(bmf_place)
+                        if sat:
+                            amount = float(sat.get('voll_24h', 0) or 0)
+                            klass = 'Z76'
+                            bmf_land = land or ''
+                            reason = f'Tour-MID layover-free {bmf_place} (Z76)'
+                            counted_hotel = True
+                        else:
+                            klass = 'Issue'
+                            reason = 'Tour-MID X/==/OFF aber kein BMF-Mapping'
+                    else:
+                        klass = 'Issue'
+                        reason = f'Tour-MID unklare location_context={loc}'
+
+            elif role == 'tour_end':
+                counted_workday = True
+                if is_foreign_tour:
+                    sat, land = _bmf_sat(bmf_place)
+                    if sat:
+                        amount = float(sat.get('an_abreise', 0) or 0)
+                        klass = 'Z76'
+                        bmf_land = land or ''
+                        reason = f'Tour-END foreign {bmf_place} (Z76 An/Ab)'
+                    else:
+                        klass = 'Z73'
+                        amount = INLAND_AN_ABREISE
+                        reason = 'Tour-END foreign ohne BMF → Z73 fallback'
+                else:
+                    klass = 'Z73'
+                    amount = INLAND_AN_ABREISE
+                    reason = 'Tour-END inland (Z73 Ab)'
+
+            elif role == 'same_day':
+                counted_workday = True
+                routing = day.get('routing') or []
+                has_foreign_in_route = any(
+                    r and r != homebase.upper() and not _is_inland_code(r)
+                    for r in routing
+                )
+                if has_foreign_in_route:
+                    # Suche foreign IATA für BMF
+                    foreign_iata = next(
+                        (r for r in routing
+                         if r and r != homebase.upper() and not _is_inland_code(r)),
+                        ''
+                    )
+                    sat, land = _bmf_sat(foreign_iata)
+                    if sat:
+                        amount = float(sat.get('an_abreise', 0) or 0)
+                        klass = 'Z76'
+                        bmf_land = land or ''
+                        reason = f'Same-Day foreign {foreign_iata} (Z76 >8h)'
+                    else:
+                        klass = 'Z72'
+                        amount = INLAND_TAGESTRIP_8H
+                        reason = f'Same-Day foreign {foreign_iata} ohne BMF → Z72 fallback'
+                else:
+                    klass = 'Z72'
+                    amount = INLAND_TAGESTRIP_8H
+                    reason = 'Same-Day inland >8h (Z72)'
+                if not tour_fahrtag_counted:
+                    counted_fahrtag = True
+                    tour_fahrtag_counted = True
+
+            elif role == 'non_tour':
+                # Non-tour-Tage: 4 Klassen
+                #  - is_passive_homebase_marker → Office (NO_VMA)
+                #  - is_standby_homebase → Standby (NO_VMA)
+                #  - homebase + duty >= 480min → Z72 Inland-Tagestrip (Phase 6b)
+                #  - homebase + duty < 480min → Office (kein Z72-Anspruch)
+                #  - sonst → Frei
+                _duty_min = int(day.get('duty_duration_minutes') or 0)
+                if day.get('is_passive_homebase_marker'):
+                    klass = 'Office'
+                    reason = 'Passive home marker (ORTSTAG/FRS/LMN_AS/LMN_CR)'
+                elif day.get('is_standby_homebase'):
+                    klass = 'Standby'
+                    reason = 'Standby zuhause (no foreign-overnight-context)'
+                else:
+                    # FinalFix 1+2 — Non-Tour Day-Klassifikation mit erweiterten Mustern.
+                    _r_local = day.get('routing') or []
+                    _has_foreign_route = any(
+                        r and r != homebase.upper()
+                        and not _is_inland_code(r)
+                        for r in _r_local
+                    )
+                    _se_ctx_nt = day.get('se_context') or {}
+                    _se_ort_nt = (_se_ctx_nt.get('stfrei_ort') or '').upper().strip()
+                    _se_inland_nt = _se_ctx_nt.get('stfrei_inland')
+                    _is_training_marker = (
+                        bool(marker) and any(marker.startswith(t) for t in (
+                            'EM', 'EH', 'TK', 'EMCRM', 'SECCRM', 'EK', 'D4', 'DD', 'FL ',
+                            'SIM', 'TRI', 'TRE',  # cockpit-typical training-marker
+                        ))
+                    )
+                    # Variante A: SE-foreign-Stempel ohne andere Klassifikation
+                    # → Z76 Same-Day-Foreign (Crew flog zu foreign Destination
+                    # auch wenn CAS-routing/duty unvollstaendig ist).
+                    # FinalFix 7: auch bei leerem Marker + SE-foreign (CAS-Reader-
+                    # Luecke, aber SE belegt klar dass der Tag eine Tour war).
+                    if (_se_inland_nt is False and _se_ort_nt):
+                        sat, land = _bmf_sat(_se_ort_nt)
+                        if sat and land:
+                            amount = float(sat.get('an_abreise', 0) or 0)
+                            klass = 'Z76'
+                            bmf_land = land
+                            counted_workday = True
+                            counted_fahrtag = True
+                            reason = (f'FinalFix1+7: Non-tour mit SE-foreign={_se_ort_nt} '
+                                      f'duty={_duty_min}min marker={(marker or "leer")[:10]!r} '
+                                      f'→ Z76 An/Ab same-day')
+                        else:
+                            klass = 'Z72'
+                            amount = INLAND_TAGESTRIP_8H
+                            counted_workday = True
+                            counted_fahrtag = True
+                            reason = (f'FinalFix1: SE-foreign {_se_ort_nt} ohne BMF '
+                                      f'→ Z72 fallback')
+                    # Variante B: Phase 6b Z72-Inland-Tagestrip
+                    elif (loc == 'homebase' and day.get('has_real_duty')
+                          and _duty_min >= 480 and not _has_foreign_route):
+                        klass = 'Z72'
+                        amount = INLAND_TAGESTRIP_8H
+                        bmf_land = 'Deutschland'
+                        counted_workday = True
+                        counted_fahrtag = True
+                        reason = (f'Non-tour Hb inland duty={_duty_min}min '
+                                  f'>= 8h → Z72 Inland-Tagestrip')
+                    elif (loc == 'homebase' and day.get('has_real_duty')
+                          and _duty_min >= 480 and _has_foreign_route):
+                        klass = 'Issue'
+                        reason = (f'Non-tour Hb mit foreign routing '
+                                  f'{_r_local} — Tour-Boundary-Issue')
+                    # Variante C: Training-Marker (EM/EH/TK/...) mit start_time
+                    # → Office mit Fahrtag (Anfahrt zur Schulung), KEIN
+                    # counted_workday (Office-NO_VMA-Tage gehoeren per FollowMe-Logik
+                    # nicht in arbeitstage-Counter).
+                    elif (loc == 'homebase' and _is_training_marker
+                          and day.get('start_time')):
+                        klass = 'Office'
+                        reason = (f'FinalFix2: Training-Marker {marker[:15]} mit '
+                                  f'start_time={day.get("start_time")} → Office Fahrtag')
+                        counted_fahrtag = True
+                    # Variante D: Office am Hb mit duty (non-Training) — Vor-Closeout-Stand
+                    elif loc == 'homebase' and day.get('has_real_duty'):
+                        klass = 'Office'
+                        reason = 'Office am Homebase mit duty (non-tour, NO_VMA)'
+                    else:
+                        klass = 'Frei'
+                        reason = 'Non-tour / Frei'
+
+            # ── Update counters ──
+            klass_counter[klass] = klass_counter.get(klass, 0) + 1
+            if klass == 'Z72':
+                z72_eur += amount
+            elif klass == 'Z73':
+                z73_eur += amount
+            elif klass == 'Z74':
+                z74_eur += amount
+            elif klass == 'Z76':
+                z76_eur += amount
+
+            if counted_workday:
+                arbeitstage += 1
+                # Reinigung folgt arbeitstage außer evening_anreise (Z73 mit briefing>=18:00)
+                reinigungstage += 1
+            if counted_hotel:
+                hotel_naechte += 1
+            if counted_fahrtag:
+                fahr_tage += 1
+
+            tage_detail.append({
+                'datum':                 datum,
+                'klass':                 klass,
+                'amount':                round(amount, 2),
+                'reason':                reason,
+                'bmf_land':              bmf_land,
+                'role':                  role,
+                'location_context':      loc,
+                'tour_id':               tour['tour_id'],
+                'raw_marker':            day.get('raw_marker') or '',
+                'routing':               day.get('routing') or [],
+                'counted_as_workday':    counted_workday,
+                'counted_as_hotel_nacht': counted_hotel,
+                'counted_as_fahrtag':    counted_fahrtag,
+                'counted_as_reinigungstag': counted_workday,
+                'evidence':              day.get('evidence') or [],
+            })
+
+    # ── Counter-Diff für die Tage die NICHT in Touren waren ──
+    # Diese müssen wir explicit als Frei klassifizieren wenn sie nicht klassifiziert wurden.
+
+    return {
+        'tage_detail':     tage_detail,
+        '_klass_summary':  {
+            'arbeitstage':   arbeitstage,
+            'reinigungstage': reinigungstage,
+            'fahr_tage':     fahr_tage,
+            'hotel_naechte': hotel_naechte,
+            'z72_tage':      klass_counter.get('Z72', 0),
+            'z73_tage':      klass_counter.get('Z73', 0),
+            'z74_tage':      klass_counter.get('Z74', 0),
+            'z76_tage':      klass_counter.get('Z76', 0),
+            'z72_eur':       round(z72_eur, 2),
+            'z73_eur':       round(z73_eur, 2),
+            'z74_eur':       round(z74_eur, 2),
+            'z76_eur':       round(z76_eur, 2),
+            'office_tage':   klass_counter.get('Office', 0),
+            'standby_tage':  klass_counter.get('Standby', 0),
+            'issue_tage':    klass_counter.get('Issue', 0),
+        },
+        'arbeitstage':       arbeitstage,
+        'reinigungstage':    reinigungstage,
+        'fahr_tage':         fahr_tage,
+        'hotel_naechte':     hotel_naechte,
+        'z72_tage':          klass_counter.get('Z72', 0),
+        'z73_tage':          klass_counter.get('Z73', 0),
+        'z74_tage':          klass_counter.get('Z74', 0),
+        'z76_eur':           round(z76_eur, 2),
+        'gesamt':            round(z72_eur + z73_eur + z74_eur + z76_eur, 2),
+        '_rescues':          rescues,
+        '_audit_notes':      audit_notes,
+        '_normalized_tours': normalized_tours,
+        '_tour_first_active': True,
+    }
+
+
 def _followme_align_counters(classification, matched_days, year=2025, homebase='FRA'):
     """v11 F3/F4: Post-Klassifikator FollowMe-Align.
 
@@ -14188,6 +17894,134 @@ def _build_tour_clusters(sorted_days):
             else:
                 break
     return clusters
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v11 Clean-Release Phase 2 — Upload-Contract Document-Health.
+#
+# Berechnet Health-Felder aus den 3 Pflicht-Quellen (LSB + SE + CAS):
+#   - lsb_present
+#   - se_months_count
+#   - cas_months_count
+#   - detailed_cas_present
+#   - missing_months_se
+#   - missing_months_cas
+#   - ignored_legacy_files
+#   - warnings
+#
+# Wird in v11_cas-Pfad gerufen — NICHT mehr fuer Flugstundenuebersicht.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _build_v11_upload_health(
+    lsb_data=None,
+    se_structured=None,
+    cas_classification=None,
+    ignored_legacy_filenames=None,
+    cas_filenames=None,
+    se_filenames=None,
+    year=None,
+):
+    """v11 Clean-Release Upload-Contract Health-Builder.
+
+    Args:
+        lsb_data: LSB-Reader-Output (dict oder None).
+        se_structured: SE-Reader-Output mit `se_lines` (dict oder None).
+        cas_classification: _classify_v11_cas_pipeline-Output (dict oder None).
+        ignored_legacy_filenames: Liste Dateinamen die als legacy_ignored_flight_hours_summary erkannt wurden.
+        cas_filenames: Liste der hochgeladenen CAS-Dateinamen.
+        se_filenames: Liste der hochgeladenen SE-Dateinamen.
+        year: Steuerjahr (int).
+
+    Returns:
+        dict mit Health-Feldern siehe oben + status + warnings + issues.
+    """
+    health = {
+        'pipeline': 'v11_cas_primary',
+        'lsb_present': False,
+        'se_months_count': 0,
+        'cas_months_count': 0,
+        'detailed_cas_present': False,
+        'missing_months_se': [],
+        'missing_months_cas': [],
+        'ignored_legacy_files': list(ignored_legacy_filenames or []),
+        'warnings': [],
+        'issues': [],
+        'status': 'green',
+    }
+
+    # LSB
+    if isinstance(lsb_data, dict) and float(lsb_data.get('brutto', 0) or 0) > 0:
+        health['lsb_present'] = True
+    else:
+        health['issues'].append({
+            'source': 'LSB', 'severity': 'red',
+            'reason': 'Lohnsteuerbescheinigung fehlt oder Brutto nicht erkannt'
+        })
+        health['status'] = 'red'
+
+    # SE
+    if isinstance(se_structured, dict) and se_structured.get('se_lines'):
+        se_lines = se_structured['se_lines']
+        active = [s for s in se_lines if not s.get('storno')]
+        months = sorted({
+            int(s.get('datum', '0000-00-00')[5:7])
+            for s in active if s.get('datum')
+        })
+        health['se_months_count'] = len(months)
+        all_months = set(range(1, 13))
+        health['missing_months_se'] = sorted(all_months - set(months))
+        if len(months) < 6:
+            health['warnings'].append(
+                f'Nur {len(months)} SE-Monate vorhanden — bei Vollzeit ungewoehnlich.'
+            )
+            if health['status'] == 'green':
+                health['status'] = 'yellow'
+    else:
+        health['issues'].append({
+            'source': 'SE', 'severity': 'red',
+            'reason': 'Streckeneinsatz konnte nicht gelesen werden — keine Zeilen erkannt'
+        })
+        health['status'] = 'red'
+
+    # CAS
+    if isinstance(cas_classification, dict):
+        tage_detail = cas_classification.get('_tage_detail') or cas_classification.get('tage_detail') or []
+        if tage_detail:
+            health['detailed_cas_present'] = True
+            cas_months = sorted({
+                int((t.get('datum') or '0000-00-00')[5:7])
+                for t in tage_detail if (t.get('datum') or '').startswith('20')
+            })
+            health['cas_months_count'] = len(cas_months)
+            all_months = set(range(1, 13))
+            health['missing_months_cas'] = sorted(all_months - set(cas_months))
+            if len(cas_months) < 6:
+                health['warnings'].append(
+                    f'Nur {len(cas_months)} CAS-Monate erkannt — bei Vollzeit ungewoehnlich.'
+                )
+                if health['status'] == 'green':
+                    health['status'] = 'yellow'
+        else:
+            health['issues'].append({
+                'source': 'CAS', 'severity': 'red',
+                'reason': 'Dienstplan/CAS konnte nicht gelesen werden — keine Tage erkannt'
+            })
+            health['status'] = 'red'
+    else:
+        health['issues'].append({
+            'source': 'CAS', 'severity': 'red',
+            'reason': 'Dienstplan/CAS fehlt'
+        })
+        health['status'] = 'red'
+
+    # Legacy-Files
+    if health['ignored_legacy_files']:
+        health['warnings'].append(
+            f"{len(health['ignored_legacy_files'])} Flugstundenuebersicht-Datei(en) ignoriert — "
+            "sie sind im neuen Ablauf keine zulaessige Quelle."
+        )
+
+    return health
 
 
 def _document_health_check(lsb_data, se_structured, structured_days, year):
@@ -17287,16 +21121,21 @@ def hybrid_analyze(form, files, job_id=None):
             _release_memory_to_os()
 
             if classification:
-                # Document-Health: minimal-Check für v11 (CAS-Tage vorhanden)
-                document_health = {
-                    'status': 'green',
-                    'issues': [],
-                    'pipeline': 'v11_cas_primary',
-                }
+                # v11 Clean-Release Phase 2: Document-Health mit Upload-Contract-Feldern.
+                document_health = _build_v11_upload_health(
+                    lsb_data=lsb_data,
+                    se_structured=se_structured,
+                    cas_classification=classification,
+                    ignored_legacy_filenames=(files.get('dp_filenames') or [])
+                                            if isinstance(files, dict) else [],
+                    cas_filenames=cas_filenames,
+                    year=year,
+                )
                 # Schritt 3b: Bei vielen CAS-Konflikten → yellow
                 cas_confl_n = len(classification.get('_cas_conflicts', []) or [])
                 if cas_confl_n > 5:
-                    document_health['status'] = 'yellow'
+                    if document_health.get('status') == 'green':
+                        document_health['status'] = 'yellow'
                     document_health['issues'].append({
                         'source': 'CAS', 'severity': 'yellow',
                         'reason': f'{cas_confl_n} Konflikte zwischen CAS-Dateien'
@@ -17332,7 +21171,38 @@ def hybrid_analyze(form, files, job_id=None):
             classification = None
 
     elif dp_bytes:
-        # v10 LEGACY DP-PIPELINE (Default bis Phase 6)
+        # [DEPRECATED v11 Clean-Release 2026-05-20]
+        # Flugstundenuebersicht-Pipeline. Pflicht-Quellen sind LSB + SE + Dienstplan/CAS.
+        # Wenn der Pfad trotzdem betreten wird (z.B. cas_bytes leer, dp_bytes da),
+        # ist das ein User-Konfigurationsfehler — wir geben einen klaren Health=red
+        # statt silent fallback auf den Legacy-Reader.
+        print("[v11-clean-release] elif dp_bytes: harter Stop — Flugstunden-Reader deaktiviert.")
+        document_health = {
+            'status': 'red',
+            'issues': [{
+                'source': 'UPLOAD', 'severity': 'red',
+                'reason': 'Es wurde keine Dienstplan/CAS-Datei hochgeladen. '
+                         'Flugstundenuebersicht wird seit v11 nicht mehr als Quelle akzeptiert. '
+                         'Bitte lade deinen Dienstplan (PUB/NTF/CAS/Roster) mit Uhrzeiten hoch.'
+            }],
+            'pipeline': 'v11_cas_primary',
+        }
+        errors.append('Keine Dienstplan/CAS-Datei vorhanden — Flugstundenuebersicht ist keine zulaessige Quelle mehr.')
+        classification = None
+        structured_days = None
+        try:
+            dp_bytes = None
+            einsatz_bytes = None
+            if 'dp' in files:
+                files['dp'] = None
+            if 'einsatz' in files:
+                files['einsatz'] = None
+        except Exception:
+            pass
+        gc.collect()
+        _release_memory_to_os()
+    elif False:
+        # Toter Pfad — historischer Legacy-Block bleibt nur als Vorlage fuer Forensik.
         try:
             _heartbeat_phase(job_id, 'dp_start',
                              {'label': 'Flugstundenübersicht wird in Abschnitten ausgewertet…'})
@@ -20205,12 +24075,66 @@ def erstelle_pdf(d):
         ]))
         S.append(t)
 
-    S.append(kv_total("Summe aller Aufwendungen", eur(d.get('gesamt',0))))
-    S.append(kv(f"Abzug: AG-Fahrkostenzuschuss (Z17)",
-        eur(-d.get('ag_z17',0)), vc=TEXT2))
-    S.append(kv(f"Abzug: Steuerfreie Spesen Lufthansa (Z77)",
-        eur(-d.get('z77',0)), vc=TEXT2))
-    S.append(kv_total("Einzutragender Betrag", eur(d.get('netto',0))))
+    # 2026-05-20 Topf-Display-Fix: bisherige Darstellung „Gesamt − Z77 − AG = Netto"
+    # war mathematisch missverständlich (5339 − 4705 = 634, nicht 976), weil Z77
+    # topf-spezifisch nur gegen VMA verrechnet wird (mit max(0,…)-Clamp), und
+    # AG-Z17 nur gegen Fahrtkosten. Wir zeigen jetzt die Töpfe explizit:
+    #   Block A (sonstige Werbungskosten) = Fahrt-netto + Reinigung + Trink + Opt
+    #   Block B (VMA) = max(0, VMA-brutto − Z77)
+    #   Netto = A + B   ← matches Python netto-calc exakt.
+    _fahr     = float(d.get('fahr', 0) or 0)
+    _reinig   = float(d.get('reinig', 0) or 0)
+    _trink    = float(d.get('trink', 0) or 0)
+    _vma72    = float(d.get('vma_72', 0) or 0)
+    _vma73    = float(d.get('vma_73', 0) or 0)
+    _vma74    = float(d.get('vma_74', 0) or 0)
+    _vma_aus  = float(d.get('vma_aus', 0) or 0)
+    _vma_total = round(_vma72 + _vma73 + _vma74 + _vma_aus, 2)
+    _ag_z17   = float(d.get('ag_z17', 0) or 0)
+    _z77      = float(d.get('z77', 0) or 0)
+    _fahr_netto = round(max(0.0, _fahr - _ag_z17), 2)
+    _vma_netto  = round(max(0.0, _vma_total - _z77), 2)
+    _opt_zu     = round(float(d.get('netto', 0) or 0) - _fahr_netto - _reinig - _trink - _vma_netto, 2)
+    if _opt_zu < 0: _opt_zu = 0.0  # safety; opt_zu wäre additiv, nie negativ
+
+    # ── Block A: Sonstige Werbungskosten (nicht VMA-erstattbar) ──
+    S.append(Spacer(1, 0.3*cm))
+    S.append(Paragraph("A · Sonstige Werbungskosten",
+        ps("blka", fontSize=8, textColor=TEXT3, fontName="Helvetica-Bold",
+           leading=12, spaceBefore=4, spaceAfter=4, letterSpacing=1.2)))
+    if _ag_z17 > 0:
+        # Mit AG-Zuschuss: brutto und Abzug zeigen
+        S.append(kv("Fahrtkosten Homebase (brutto)", eur(_fahr), vc=TEXT2))
+        S.append(kv("Abzug: AG-Fahrkostenzuschuss (Z17)", eur(-_ag_z17), vc=TEXT2))
+        S.append(kv("Fahrtkosten Homebase netto", eur(_fahr_netto)))
+    else:
+        S.append(kv("Fahrtkosten Homebase", eur(_fahr)))
+    S.append(kv("Reinigungskosten", eur(_reinig)))
+    S.append(kv("Trinkgelder / Reisenebenkosten", eur(_trink)))
+    if _opt_zu > 0:
+        S.append(kv("Optionale Werbungskosten-Belege", eur(_opt_zu)))
+    _block_a = round(_fahr_netto + _reinig + _trink + _opt_zu, 2)
+    S.append(kv_total("Zwischensumme A", eur(_block_a)))
+
+    # ── Block B: Verpflegungsmehraufwand (gegen Z77 verrechnet) ──
+    S.append(Spacer(1, 0.3*cm))
+    S.append(Paragraph("B · Verpflegungsmehraufwand (VMA)",
+        ps("blkb", fontSize=8, textColor=TEXT3, fontName="Helvetica-Bold",
+           leading=12, spaceBefore=4, spaceAfter=4, letterSpacing=1.2)))
+    S.append(kv("VMA brutto (Inland + Ausland)", eur(_vma_total)))
+    S.append(kv("Abzug: Steuerfreie Spesen Lufthansa (Z77)", eur(-_z77), vc=TEXT2))
+    if _vma_total < _z77:
+        # Erstattung übersteigt VMA — keine negative Position (clamp).
+        S.append(Paragraph(
+            f"<i>Hinweis: AG-Erstattung übersteigt VMA um {eur(_z77 - _vma_total)}; "
+            f"VMA wird nicht negativ angesetzt.</i>",
+            ps("clamp", fontSize=8, textColor=TEXT3, fontName="Helvetica-Oblique",
+               leading=11, spaceBefore=2)))
+    S.append(kv_total("VMA netto (≥ 0)", eur(_vma_netto)))
+
+    # ── Final: Block A + Block B = einzutragender Gesamtbetrag ──
+    S.append(Spacer(1, 0.3*cm))
+    S.append(kv_total("Einzutragender Gesamtbetrag (A + B)", eur(d.get('netto',0))))
     S.append(Spacer(1, 0.5*cm))
 
     # Monate
