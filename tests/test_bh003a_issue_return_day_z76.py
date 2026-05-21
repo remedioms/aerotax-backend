@@ -188,8 +188,10 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
         self.assertNotEqual(d['klass'], 'Z76',
             f'06-03 darf NICHT Z76 werden (routing endet LHR, duty<480). War: {d["klass"]}')
 
-    def test_bh003a_does_not_apply_to_2025_10_28_duty_280(self):
-        """10-28 TLV→FRA, duty 280min < 480 → bleibt Issue."""
+    def test_bh003b_z76_via_routing_evidence_alone_2025_10_28(self):
+        """2026-05-21: BH-003a → BH-003b. Routing-Evidence (TLV layover →
+        TLV→FRA → ends_at_homebase) genügt JETZT für Z76, auch wenn Sonnet
+        duty<480 gelesen hat. User-Feedback: zu viele „Mischfall"-Issues."""
         matched = [
             _make_day('2025-10-27', dp_kwargs={
                 'activity_type': 'tour', 'routing': ['TLV'],
@@ -202,14 +204,14 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
                 'overnight_after_day': False,
                 'starts_at_homebase': True, 'ends_at_homebase': True,
                 'start_time': '03:15', 'end_time': '07:55',
-                'duty_duration_minutes': 280,  # < 480
+                'duty_duration_minutes': 280,  # < 480 — Sonnet-Lesefehler
                 'raw_marker': '32935 PU', 'has_fl': False,
             }),
         ]
         result = app_module._deterministic_classify_v7(matched, year=2025, homebase='FRA')
         d = next(t for t in result['tage_detail'] if t['datum'] == '2025-10-28')
-        self.assertNotEqual(d['klass'], 'Z76',
-            f'10-28 darf NICHT Z76 werden (duty 280<480). War: {d["klass"]}')
+        self.assertEqual(d['klass'], 'Z76',
+            f'10-28 muss Z76 werden (Routing-Evidence TLV→FRA komplett). War: {d["klass"]}')
 
     def test_bh003a_does_not_apply_to_x_marker_without_routing_2025_01_04(self):
         """01-04 X-marker, kein routing, activity_type='frei' → klass=Frei,
@@ -222,8 +224,10 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
 
     # ─── Guard-Sub-Bedingungen ──────────────────────────────────────────
 
-    def test_bh003a_requires_duty_480(self):
-        """Selber routing/ends_hb wie 01-06, aber duty < 480 → kein BH-003a."""
+    def test_bh003b_no_longer_requires_duty_480(self):
+        """2026-05-21: BH-003b lockert G6 (duty>=480) — Routing-Evidence allein
+        reicht. Test umgekehrt: duty=300, aber JFK-Layover + JFK→FRA + ends_hb
+        → muss Z76 werden."""
         matched = [
             _make_day('2025-04-04', dp_kwargs={
                 'activity_type': 'tour', 'routing': ['JFK', 'FRA'],
@@ -235,13 +239,13 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
                 'overnight_after_day': False,
                 'starts_at_homebase': True, 'ends_at_homebase': True,
                 'start_time': '00:00', 'end_time': '05:00',
-                'duty_duration_minutes': 300,  # < 480
+                'duty_duration_minutes': 300,  # < 480 — egal, Routing-Evidence gilt
                 'raw_marker': '999', 'has_fl': False,
             }),
         ]
         result = app_module._deterministic_classify_v7(matched, year=2025, homebase='FRA')
         d = next(t for t in result['tage_detail'] if t['datum'] == '2025-04-05')
-        self.assertNotEqual(d['klass'], 'Z76', f'duty 300<480, kein Z76. War: {d["klass"]}')
+        self.assertEqual(d['klass'], 'Z76', f'duty 300<480 aber Routing-Evidence komplett → Z76. War: {d["klass"]}')
 
     def test_bh003a_requires_routing_from_layover_to_homebase(self):
         """Wenn routing[0] != prev.layover_ort → kein BH-003a."""

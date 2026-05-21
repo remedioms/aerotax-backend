@@ -19073,28 +19073,38 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     _bh003a_routing = [(r or '').upper().strip() for r in (d.get('routing') or [])]
                     _bh003a_duty = int(d.get('duty_duration_minutes') or 0)
                     _bh003a_ends_hb = bool(d.get('ends_at_homebase'))
-                    if (_bh003a_layover                                            # G1
+                    # BH-003b 2026-05-21: G6 (duty≥480) gelockert — bei vollständigen
+                    # Routing-Evidence-Guards (G1–G5) genügt das Routing-Beweis allein
+                    # (Auslands-Layover → Direktrück → Homebase). Sonnet-Lesefehler
+                    # bei duty_duration_minutes darf nicht den Z76-Anspruch killen.
+                    # User-Feedback Tibor 2025: 9 Mischfall-Days standen ohne Z76,
+                    # obwohl Routing eindeutig war.
+                    _routing_evidence_complete = (
+                        _bh003a_layover                                            # G1
                         and not _is_inland_code(_bh003a_layover)                   # G2
                         and _bh003a_ends_hb                                        # G3
                         and len(_bh003a_routing) >= 2
                         and _bh003a_routing[0] == _bh003a_layover                  # G4
                         and _bh003a_routing[-1] == _bh003a_hb_up                   # G5
-                        and _bh003a_duty >= 480                                    # G6
-                    ):
+                    )
+                    if _routing_evidence_complete:
                         _bh003a_bmf = _bmf(_bh003a_layover)
                         if _bh003a_bmf and _bh003a_bmf.get('an_abreise', 0) > 0:   # G7
                             klass = 'Z76'
                             eur_added = float((_bh003a_bmf.get('an_abreise', 0) or 0))
+                            _duty_qualifier = (
+                                f'duty {_bh003a_duty}min' if _bh003a_duty >= 480
+                                else f'duty {_bh003a_duty}min — routing-evidence'
+                            )
                             reason = (
-                                f'BH-003a Tour-Heimkehr {_bh003a_layover}→{_bh003a_hb_up} '
-                                f'(Z76 An/Ab, duty {_bh003a_duty}min ≥ 480)'
+                                f'BH-003b Tour-Heimkehr {_bh003a_layover}→{_bh003a_hb_up} '
+                                f'(Z76 An/Ab, {_duty_qualifier})'
                             )
                             audit_note = (
-                                f'{datum}: BH-003a Issue→Z76 Heimkehr aus {_bh003a_layover}'
+                                f'{datum}: BH-003b Issue→Z76 Heimkehr aus {_bh003a_layover}'
+                                + (' (Routing-Evidence, duty<480)' if _bh003a_duty < 480 else '')
                             )
-                            # bmf_land/key wird unten (Z.~15611) aus prev.layover_ort aufgelöst
-                            # — kein eigener Land-Lookup hier nötig.
-                            print(f"[bh003a-rescue] datum={datum} layover={_bh003a_layover} "
+                            print(f"[bh003b-rescue] datum={datum} layover={_bh003a_layover} "
                                   f"duty={_bh003a_duty}min eur={eur_added}")
                     if klass != 'Z76':
                         klass = 'Issue'
@@ -19560,7 +19570,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         #    Klassifikations-Pfaden, nie aus Frei-Pfad)
         # Wenn BMF-Mapping fehlt: Issue bleibt + iata_unknown wird sichtbar.
         has_active_se_final = se.get('count', 0) > 0 and float(se.get('stfrei_total', 0) or 0) > 0
-        if (klass == 'Issue' and has_active_se_final
+        # User-Feedback 2026-05-21: Office/Standby-Tage mit aktivem Auslands-SE
+        # waren als „aktive SE-Zeile ohne VMA-Klassifikation" vma_unmapped gelandet.
+        # Wenn die Lufthansa eine Auslands-Spese ZAHLT, war der Crew klar auf Tour
+        # — die Klass-Wahl (Office/Standby) war falsch. Z76 ist der korrekte Topf.
+        if (klass in ('Issue', 'Office', 'Standby') and has_active_se_final
                 and se.get('stfrei_inland') is False and se.get('stfrei_ort')):
             se_ort_rescue = se.get('stfrei_ort', '')
             se_betrag_rescue = float(se.get('stfrei_total', 0) or 0)
@@ -19569,22 +19583,23 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 # Rescue legitim: BMF-Mapping vorhanden
                 eur_added = float(bmf_aus_rescue.get('an_abreise', 0) or 0)
                 old_reason_rescue = reason
+                old_klass_rescue = klass
                 klass = 'Z76'
-                reason = f'Aktive Auslands-SE {se_ort_rescue} → Z76-Rescue (war: {old_reason_rescue[:60]})'
-                audit_note = f'{datum}: aktive Auslands-SE {se_ort_rescue} → Z76 (Issue→Z76-Rescue)'
+                reason = f'Aktive Auslands-SE {se_ort_rescue} → Z76-Rescue (war: {old_klass_rescue}, {old_reason_rescue[:60]})'
+                audit_note = f'{datum}: aktive Auslands-SE {se_ort_rescue} → Z76 ({old_klass_rescue}→Z76-Rescue)'
                 unresolved_reason = None
                 # v8.18.1: strukturierter Rescue-Audit-Eintrag
                 from bmf_data import IATA_TO_BMF
                 rescues.append({
                     'datum':         datum,
-                    'rescue_type':   'active_foreign_se_issue_to_z76',
+                    'rescue_type':   f'active_foreign_se_{old_klass_rescue.lower()}_to_z76',
                     'rescue_reason': old_reason_rescue,
                     'se_ort':        se_ort_rescue,
                     'se_betrag':     se_betrag_rescue,
                     'bmf_land':      IATA_TO_BMF.get(se_ort_rescue.upper(), '') or '',
                     'bmf_tagtyp':    'an_abreise',
                     'amount':        eur_added,
-                    'original_klass':'Issue',
+                    'original_klass':old_klass_rescue,
                 })
                 print(f"[v8-anti-stochastik] datum={datum} ort={se_ort_rescue} betrag={se_betrag_rescue:.2f} reason='Issue→Z76 (BMF-Mapping vorhanden)'")
             else:
@@ -23969,18 +23984,14 @@ def erstelle_pdf(d):
     # ════════════════════════════════════════════════
     S.append(Spacer(1, 5.5*cm))
 
-    # Eyebrow
-    S.append(Paragraph("WERBUNGSKOSTEN-AUSWERTUNG",
-        ps("eye", fontSize=8.5, textColor=TEXT3, fontName="Helvetica-Bold",
-           leading=12, alignment=TA_CENTER, spaceAfter=24, letterSpacing=2.5)))
-
-    # v9.9: Title generisch, Name nur im Subtitle (User-Direktive: keine Person im Titel).
-    # v11 B-010: Name XML-escaped — ReportLab-Paragraph parst minimales HTML.
+    # User-Feedback 2026-05-21: Duplicate Header („WERBUNGSKOSTEN-AUSWERTUNG"
+    # eyebrow + große H1 darunter) sah unsauber aus → Eyebrow entfernt,
+    # nur die H1 bleibt. Subtitle mit Name + Jahr darunter genügt als Kontext.
     _name = _xml_escape_for_paragraph(d.get('name', '') or '')
     _year = _xml_escape_for_paragraph(d.get('year', '') or '')
     S.append(Paragraph("Werbungskosten-Auswertung",
-        ps("h1", fontSize=20, textColor=TEXT, fontName="Helvetica",
-           leading=26, alignment=TA_CENTER, spaceAfter=6, letterSpacing=0)))
+        ps("h1", fontSize=22, textColor=TEXT, fontName="Helvetica",
+           leading=28, alignment=TA_CENTER, spaceAfter=8, letterSpacing=0)))
     _subtitle = f"{_name} · Steuerjahr {_year}" if _name else f"Steuerjahr {_year}"
     S.append(Paragraph(_subtitle,
         ps("h1y", fontSize=11, textColor=TEXT2, fontName="Helvetica",
