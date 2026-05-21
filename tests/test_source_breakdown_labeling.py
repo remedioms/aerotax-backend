@@ -188,13 +188,14 @@ def test_pdf_legend_appears_after_einzutragend():
 # ════════════════════════════════════════════════════════════════════
 
 def test_ui_contains_source_legend_text():
-    """UI Detail-Tabelle enthält die Source-Legende."""
+    """UI Detail-Tabelle enthält die user-friendly Source-Legende „Woher kommen die Werte?"."""
     html = _html()
-    assert 'Nutzerangabe' in html
-    assert 'CAS = Dienstplan' in html
-    assert 'SE = Streckeneinsatz' in html
-    assert 'LSB = Lohnsteuerbescheinigung' in html
-    assert 'BMF' in html
+    assert 'Woher kommen die Werte?' in html
+    assert 'Dienstplan / CAS' in html
+    assert 'Streckeneinsatz' in html
+    assert 'Lohnsteuerdaten' in html
+    assert 'BMF-Pauschalen' in html
+    assert 'Deine Angabe *' in html
     assert 'Pauschal-Ansatz' in html
 
 
