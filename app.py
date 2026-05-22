@@ -19292,17 +19292,40 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             # manche Office in Base, für andere on-call zuhause < 8h). Ohne
             # Briefingzeit darf Backend NICHT pauschal Z72 vergeben — sonst
             # falscher Steuer-Anspruch. User-Klärung pro Tag bleibt nötig.
-            # v14 (2026-05-22) User-Policy: passive Heimat-Marker (ORTSTAG/FRS/
-            # LMN_AS/LMN_CR/FRD/OF/OFF) ohne Uhrzeit = zuhause = kein AT/FT.
+            # v14 (2026-05-22) Marker-Frei-Klassifikation aus offizieller
+            # LH CRS Online-Hilfe (Revision 74, Seiten 332-335).
+            # Drei Kategorien werden hier als Frei klassifiziert (kein AT, kein FT):
+            #
+            # 1) Explicite freie/zusätzliche-freie Tage:
+            #    OFF / OF / FRS / FRN / FM54 / FM/Q / FQ/Q / FZ / QF / ORTSTAG
+            #    Quelle: CRS-Hilfe „zusätzlicher freier Tag" / Purser Manual
+            #
+            # 2) WBT-Pflichtkurse (Web-Based Training, zuhause online):
+            #    LMN_AD / LMN_AL / LMN_AS / LMN_CR / LMN_DS / LMN_FT / LMN_HT /
+            #    LMN_OD / LMHS / AVSEC / AVSEC_N
+            #    Quelle: CRS-Hilfe „gesetzlich vorgegeben (L/OT)" / „WBT"
+            #
+            # 3) Legacy-Defensiv: FRD (nicht in CRS-Tabelle, defensive Frei-Annahme)
+            #
             # Tibor-Bestätigung: „ORTSTAG = Tage zuhause = kein Arbeitstag".
             # Finanzamt-konform: ohne Beweis von Anwesenheit am Flughafen darf
             # kein Fahrtag angerechnet werden.
             _raw_marker_o = (d.get('raw_marker') or '').upper().strip()
-            _is_passive_home = any(pm in _raw_marker_o for pm in
-                ('ORTSTAG', 'FRS', 'LMN_AS', 'LMN_CR', 'FRD', 'OF', 'OFF'))
+            _LH_FREI_MARKERS = (
+                # Kategorie 1: Freie Tage / zusätzliche freie Tage
+                'ORTSTAG', 'OF', 'OFF', 'FRS', 'FRN', 'FM54', 'FM/Q',
+                'FQ/Q', 'FZ', 'QF',
+                # Kategorie 2: WBT (zuhause)
+                'LMN_AD', 'LMN_AL', 'LMN_AS', 'LMN_CR', 'LMN_DS',
+                'LMN_FT', 'LMN_HT', 'LMN_OD', 'LMHS',
+                'AVSEC', 'AVSEC_N',
+                # Kategorie 3: Legacy-defensiv
+                'FRD',
+            )
+            _is_passive_home = any(pm in _raw_marker_o for pm in _LH_FREI_MARKERS)
             if _is_passive_home and not duty_known_o:
                 klass = 'Frei'
-                reason = f'Passiv zuhause ({_raw_marker_o or "Marker"}) — kein AT/FT'
+                reason = f'Passiv zuhause ({_raw_marker_o or "Marker"}) — kein AT/FT (LH-CRS-Hilfe)'
                 print(f"[v14-passive-home] datum={datum} marker={_raw_marker_o} → Frei")
             elif (not overnight and not prev_overnight and not in_cluster_o
                 and not has_active_foreign_se_o
