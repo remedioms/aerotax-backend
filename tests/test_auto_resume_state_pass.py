@@ -164,8 +164,11 @@ def test_derive_ui_state_handles_unknown_safely():
     src_full = _read()
     idx2 = src_full.find('window.canShowPdfDownload')
     block2 = src_full[idx2:idx2 + 2000]
-    assert re.search(r"canonical_state\s*!==?\s*'done'", block2), (
-        "canShowPdfDownload muss `canonical_state !== 'done'` gaten"
+    # v14 P0 (2026-05-21): done split → done_clean / done_with_audit_warnings.
+    # canShowPdfDownload prüft jetzt über lokale Variable cs0 gegen alle 3 erlaubten States.
+    assert (re.search(r"canonical_state\s*!==?\s*'done'", block2)
+            or re.search(r"!==?\s*'done'\s*&&\s*\S+\s*!==?\s*'done_clean'", block2)), (
+        "canShowPdfDownload muss canonical_state gegen done/done_clean/done_with_audit_warnings gaten"
     )
 
 

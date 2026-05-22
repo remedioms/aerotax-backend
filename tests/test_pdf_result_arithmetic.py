@@ -214,7 +214,7 @@ def test_classify_state_done_with_z77_greater_vma_no_pdf_block():
         '_review_items': [],
     }}
     state = app._classify_job_state(job)
-    assert state['canonical_state'] == 'done'
+    assert state['canonical_state'] in ('done', 'done_clean')
     assert state['pdf_allowed'] is True
 
 

@@ -289,7 +289,7 @@ def test_session_endpoint_normal_path_still_works(client, fresh_app, monkeypatch
     r = client.get('/api/session/AT-OK')
     assert r.status_code == 200
     body = r.get_json()
-    assert body['canonical_state'] == 'done'
+    assert body['canonical_state'] in ('done', 'done_clean')
     assert body['pdf_allowed'] is True
     assert body['result_data']['netto'] == 1430.60
 
@@ -365,7 +365,7 @@ def test_valid_session_after_memory_empty_loads_from_supabase(client, fresh_app,
 
     assert r.status_code == 200, f'got {r.status_code}: {r.data[:200]}'
     body = r.get_json()
-    assert body['canonical_state'] == 'done'
+    assert body['canonical_state'] in ('done', 'done_clean')
     assert duration < 2.0, f'load took {duration:.2f}s — should be <2s'
 
 

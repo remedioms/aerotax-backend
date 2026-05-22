@@ -3334,8 +3334,60 @@ def _classify_job_state(job, session=None):
             'can_show_final_amount':        False,  # vorläufiger Wert — kein finaler Betrag
         }
     if canonical == 'done':
+        # v14 P0 (2026-05-21): done → done_clean / done_with_audit_warnings.
+        # Audit-Warnungen sind: unresolved_days, vma_unmapped_se, SE-Monate < 12,
+        # plausi_issues. Bei warnings bleibt pdf_allowed=True, aber Chat/UI muss
+        # die Warnungen ehrlich kommunizieren — nicht „alles fertig".
+        unresolved_n = len(data.get('_unresolved_days') or [])
+        unmapped_se_n = len(data.get('_vma_unmapped_se') or [])
+        plausi_n = len(data.get('_plausi_issues') or [])
+        se_comp = data.get('_se_completeness') or {}
+        se_missing = list(se_comp.get('missing_se_months') or [])
+        se_unreadable = list(se_comp.get('unreadable_se_files') or [])
+        se_duplicates = list(se_comp.get('duplicate_se_months') or [])
+        has_audit_warnings = bool(
+            unresolved_n or unmapped_se_n or se_missing or se_unreadable or se_duplicates
+        )
+        # plausi_n als Soft-Signal — nicht alleinig State-bestimmend
+        if has_audit_warnings:
+            warning_bits = []
+            if unresolved_n:
+                warning_bits.append(f'{unresolved_n} unklare Tag(e)')
+            if unmapped_se_n:
+                warning_bits.append(f'{unmapped_se_n} nicht zugeordnete Streckeneinsatz-Zeile(n)')
+            if se_missing:
+                warning_bits.append(f'{len(se_missing)} fehlende SE-Monat(e)')
+            if se_unreadable:
+                warning_bits.append('SE-Datei(en) nicht lesbar')
+            if se_duplicates:
+                warning_bits.append('SE-Monat doppelt')
+            warn_text = ', '.join(warning_bits)
+            return {
+                'canonical_state':              'done_with_audit_warnings',
+                'reason_code':                  'AUDIT_WARNINGS',
+                'user_title':                   'PDF bereit mit Prüfpunkten',
+                'user_message':                 f'Deine Auswertung ist berechnet. {warn_text} — die Punkte stehen im PDF/Audit. Du kannst das PDF herunterladen, solltest die Hinweise aber prüfen.',
+                'next_actions':                 [
+                    {'type': 'download_pdf',     'label': 'PDF mit Prüfpunkten herunterladen'},
+                    {'type': 'open_chat',        'label': 'Prüfpunkte im Chat klären'},
+                    {'type': 'start_new',        'label': 'Neue Auswertung starten'},
+                ],
+                'pdf_allowed':                  True,
+                'retry_allowed':                False,
+                'support_recommended':          False,
+                'can_chat_explain_calculation': True,
+                'can_show_final_amount':        True,
+                'audit_warnings': {
+                    'unresolved_days_count':    unresolved_n,
+                    'unmapped_se_count':        unmapped_se_n,
+                    'se_missing_months':        se_missing,
+                    'se_unreadable_files':      se_unreadable,
+                    'se_duplicate_months':      se_duplicates,
+                    'plausi_issue_count':       plausi_n,
+                },
+            }
         return {
-            'canonical_state':              'done',
+            'canonical_state':              'done_clean',
             'reason_code':                  None,
             'user_title':                   'Auswertung fertig',
             'user_message':                 'Dein Betrag ist berechnet. Du kannst das PDF herunterladen und den Wert in deiner Steuersoftware übernehmen.',
@@ -3349,6 +3401,7 @@ def _classify_job_state(job, session=None):
             'support_recommended':          False,
             'can_chat_explain_calculation': True,
             'can_show_final_amount':        True,
+            'audit_warnings':               None,
         }
     if canonical == 'failed_retryable':
         if not reason_code:
@@ -3923,6 +3976,16 @@ def _build_ai_chat_context(job, session_data=None):
             'group_type':     g.get('group_type'),
         })
 
+    # v14 P0 (2026-05-21): Audit-Context für ehrlichen Chat.
+    # Ohne diese Felder hat der LLM keinen Schimmer, dass Warnungen existieren,
+    # und behauptet „alles fertig" obwohl Status-Box 23 + 6 zeigt.
+    unresolved_days = list(data.get('_unresolved_days') or [])
+    vma_unmapped_se = list(data.get('_vma_unmapped_se') or [])
+    se_completeness = data.get('_se_completeness') or {}
+    z77_audit       = data.get('_z77_audit') or {}
+    plausi_issues   = list(data.get('_plausi_issues') or [])
+    audit_notes     = list(data.get('_audit_notes') or [])
+
     return {
         'tax_year':        data.get('year'),
         'airline':         data.get('arbeitgeber', 'Lufthansa'),
@@ -3953,10 +4016,43 @@ def _build_ai_chat_context(job, session_data=None):
         'pdf_status':            'pending_reread' if job.get('pending_reread') else (
                                   'ready' if data.get('pdf_finalized') else 'open'),
         'has_review_items':      bool(pending),
+        # v14 P0: Audit-Warning-Felder — chat darf NICHT „alles fertig" sagen
+        # solange einer dieser Counter > 0.
+        'unresolved_days_count': len(unresolved_days),
+        'unresolved_days_examples': [str(x)[:120] for x in unresolved_days[:5]],
+        'unmapped_se_count':     len(vma_unmapped_se),
+        'unmapped_se_examples':  [
+            {'datum': s.get('datum'), 'klass': s.get('klass'),
+             'stfrei_ort': s.get('stfrei_ort'), 'stfrei_total': s.get('stfrei_total')}
+            for s in vma_unmapped_se[:5]
+        ],
+        'se_detected_month_count': int(se_completeness.get('detected_se_month_count') or 0),
+        'se_uploaded_files_count': int(se_completeness.get('uploaded_se_files_count') or 0),
+        'se_missing_months':       list(se_completeness.get('missing_se_months') or []),
+        'se_unreadable_files':     list(se_completeness.get('unreadable_se_files') or []),
+        'se_duplicate_months':     list(se_completeness.get('duplicate_se_months') or []),
+        'z77_total_used':          float(z77_audit.get('verwendeter_wert', 0) or 0),
+        'z77_total_lines':         float(z77_audit.get('einzelzeilen', 0) or 0),
+        'z77_total_summary':       float(z77_audit.get('summenzeilen', 0) or 0),
+        'z77_source':              str(z77_audit.get('quelle', '') or ''),
+        'z77_monthly_audit_summary': [
+            {'monat': m.get('monat'), 'z77_lines': m.get('z77_lines'),
+             'z77_summary': m.get('z77_summary'), 'quelle': m.get('quelle')}
+            for m in (z77_audit.get('monatliche_z77') or [])
+        ][:12],
+        'audit_warnings_active':  bool(
+            unresolved_days or vma_unmapped_se
+            or se_completeness.get('missing_se_months')
+            or se_completeness.get('unreadable_se_files')
+            or se_completeness.get('duplicate_se_months')
+        ),
+        'plausi_issue_count':     len(plausi_issues),
+        'audit_note_count':       len(audit_notes),
         'allowed_actions': [
             'review_answer', 'bulk_review', 'clarification',
             'document_upload', 'wiso_help', 'pdf_help',
             'rechenweg_help', 'zugangscode_help',
+            'explain_audit_warnings', 'explain_z77_audit',
         ],
     }
 
@@ -5991,7 +6087,7 @@ def session_recall(token):
     # `!download_url` → User sieht „🔒 PDF wird vorbereitet" trotz pdf_allowed=True.
     # FIX: backend muss konsistent sein — wenn kein download_url, pdf_allowed=False
     # mit klarer next_action „PDF erstellen".
-    if (safe.get('canonical_state') == 'done'
+    if (safe.get('canonical_state') in ('done', 'done_clean', 'done_with_audit_warnings')
             and safe.get('pdf_allowed') is True
             and not safe.get('download_url')):
         safe['pdf_allowed'] = False
@@ -6063,6 +6159,69 @@ def _is_off_topic_question(message):
         if _re.search(pat, msg, _re.IGNORECASE):
             return True
     return False
+
+
+def _chat_dedupe_answer(answer, chat_history):
+    """v14 P0 (2026-05-21) FIX 3: Duplicate-Guard für Chat-Antworten.
+
+    Vermeidet dass Sonnet bei mehreren PDF-/Warning-Fragen immer wieder die
+    gleiche Block-Antwort wiederholt („Hier ist dein PDF … 23 Tage … Hier
+    ist dein PDF …").
+
+    Strategie:
+      1. Letzte 3 Assistant-Antworten aus chat_history extrahieren
+      2. Normalisierten Text (lowercase + Whitespace-Collapse) der neuen Antwort
+         gegen jede vergleichen
+      3. Bei ≥80% Ähnlichkeit (SequenceMatcher.ratio): collapse zu kurzer
+         Bestätigung — keine erneute Wiederholung der Warnungen/PDF-Hinweise
+
+    Tut nichts, wenn:
+      - chat_history leer
+      - Antwort < 60 Zeichen (zu kurz für sinnvolle Dedup)
+      - User-Message zwischen den Assistant-Antworten enthält das Wort „nochmal" /
+        „nochmals" / „bitte wieder" (User wollte explizit Wiederholung)
+    """
+    if not answer or len(answer) < 60:
+        return answer
+    if not isinstance(chat_history, list) or not chat_history:
+        return answer
+    import re as _re
+    from difflib import SequenceMatcher
+
+    def _norm(t):
+        if not isinstance(t, str):
+            return ''
+        s = t.lower()
+        s = _re.sub(r'[^a-zA-ZäöüÄÖÜß0-9]+', ' ', s)
+        return _re.sub(r'\s+', ' ', s).strip()
+
+    prev_assistants = [m for m in chat_history if m.get('role') == 'assistant'][-3:]
+    if not prev_assistants:
+        return answer
+    last_user = next((m for m in reversed(chat_history) if m.get('role') == 'user'), None)
+    last_user_txt = _norm((last_user or {}).get('content') or '')
+    if any(w in last_user_txt for w in ('nochmal', 'nochmals', 'wieder', 'erneut')):
+        return answer
+
+    new_norm = _norm(answer)
+    for prev in prev_assistants:
+        prev_norm = _norm(prev.get('content') or '')
+        if not prev_norm:
+            continue
+        ratio = SequenceMatcher(None, new_norm, prev_norm).ratio()
+        if ratio >= 0.80:
+            # Sehr ähnlich → collapse. Wenn es um PDF/Warnings ging,
+            # kurze Bestätigung statt komplette Wiederholung.
+            is_pdf_topic = ('pdf' in new_norm or 'prüfpunkt' in new_norm
+                            or 'unklar' in new_norm or 'streckeneinsatz' in new_norm
+                            or 'audit' in new_norm)
+            if is_pdf_topic:
+                return ('Wie gerade geschrieben — dein PDF ist bereit, und die '
+                        'Prüfpunkte stehen darin. Wenn du zu einem konkreten '
+                        'Punkt eine Frage hast, frag gern direkt: „welche Tage?", '
+                        '„welche Spesen-Zeilen?", „welche Monate fehlen?".')
+            return 'Wie gerade beschrieben — magst du eine konkrete Frage stellen?'
+    return answer
 
 
 @app.route('/api/chat', methods=['POST'])
@@ -6156,6 +6315,18 @@ def chat_with_aerotax():
     chat_history = session.get('chat_history', [])
     notes = session.get('notes', [])
 
+    # v14 P0 (2026-05-21): Audit-Warning-Block für ehrlichen Chat.
+    _unresolved = list(result_data.get('_unresolved_days') or [])
+    _unmapped_se = list(result_data.get('_vma_unmapped_se') or [])
+    _se_comp = result_data.get('_se_completeness') or {}
+    _z77_audit = result_data.get('_z77_audit') or {}
+    _audit_active = bool(
+        _unresolved or _unmapped_se
+        or _se_comp.get('missing_se_months')
+        or _se_comp.get('unreadable_se_files')
+        or _se_comp.get('duplicate_se_months')
+    )
+
     summary_lines = [
         f"Mandant: {result_data.get('name','?')}",
         f"Steuerjahr: {result_data.get('year','?')}",
@@ -6174,6 +6345,44 @@ def chat_with_aerotax():
         f"Brutto-Aufwendungen gesamt: {result_data.get('gesamt', 0):.2f} €",
         f"Einzutragender Gesamtbetrag: {result_data.get('netto', 0):.2f} €",
     ]
+
+    # v14 P0: Audit-Warning-Block separat im Prompt — Sonnet MUSS das sehen
+    audit_warning_block = ''
+    if _audit_active:
+        bits = []
+        if _unresolved:
+            bits.append(f"- unresolved_days_count = {len(_unresolved)} (Beispiele: " +
+                        '; '.join(str(x)[:80] for x in _unresolved[:3]) + ')')
+        if _unmapped_se:
+            bits.append(f"- unmapped_se_count = {len(_unmapped_se)} (Beispiele: " +
+                        '; '.join(f"{s.get('datum')}/{s.get('stfrei_ort')}/{s.get('stfrei_total')}€"
+                                  for s in _unmapped_se[:3]) + ')')
+        missing_m = list(_se_comp.get('missing_se_months') or [])
+        if missing_m:
+            bits.append(f"- se_missing_months = {missing_m}")
+        if _se_comp.get('unreadable_se_files'):
+            bits.append(f"- se_unreadable_files = {_se_comp.get('unreadable_se_files')}")
+        if _se_comp.get('duplicate_se_months'):
+            bits.append(f"- se_duplicate_months = {_se_comp.get('duplicate_se_months')}")
+        uploaded = int(_se_comp.get('uploaded_se_files_count') or 0)
+        detected = int(_se_comp.get('detected_se_month_count') or 0)
+        bits.append(f"- se_uploaded_files = {uploaded}, se_detected_months = {detected}/12")
+        if _z77_audit:
+            bits.append(
+                f"- z77_audit: einzelzeilen={_z77_audit.get('einzelzeilen',0):.2f}€ "
+                f"summenzeilen={_z77_audit.get('summenzeilen',0):.2f}€ "
+                f"verwendet={_z77_audit.get('verwendeter_wert',0):.2f}€ "
+                f"quelle={_z77_audit.get('quelle','')}"
+            )
+        audit_warning_block = (
+            '═══ AKTIVE AUDIT-WARNUNGEN (PFLICHT zu erwähnen) ═══\n'
+            + '\n'.join(bits) + '\n'
+            'REGEL: Du DARFST nicht „alles abgeschlossen" / „keine offenen Punkte" / '
+            '„nichts mehr zu klären" sagen. PDF ist zwar erstellbar, aber diese Punkte '
+            'sind echte Hinweise. Wenn der User fragt was unklar ist, NENNE konkrete '
+            'Beispiele aus der Liste oben. Wenn der User Z77-Wert hinterfragt, ZEIG '
+            'die Z77-Audit-Werte (einzelzeilen vs summenzeilen) — keine Blackbox.'
+        )
 
     notes_block = ('\n'.join(f"- {n}" for n in notes)) if notes else 'keine'
     history_block = '\n'.join(
@@ -6265,6 +6474,8 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
 ═══ NUTZER-AUSWERTUNG (Steuerjahr {result_data.get('year','?')}) ═══
 {chr(10).join(summary_lines)}
 
+{audit_warning_block}
+
 ═══ MARKER-GLOSSAR (Lufthansa Crew-Marker) ═══
 {marker_glossary}
 
@@ -6304,6 +6515,13 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
         resp = _claude_with_retry(client, 'claude-sonnet-4-6', 600, prompt,
                                    max_retries=2, label='Chat-AeroTAX')
         answer = resp.content[0].text.strip()
+
+        # v14 P0 (2026-05-21) FIX 3: Duplicate-Guard.
+        # Wenn die LLM-Antwort inhaltlich gleich/sehr ähnlich zur letzten Assistant-
+        # Nachricht ist (PDF-ready oder identischer Warning-Text), wird sie zu einer
+        # kurzen Bestätigung kollabiert. So bekommt der User nicht „Hier ist dein PDF…
+        # 23 Tage… Hier ist dein PDF…" zweimal hintereinander.
+        answer = _chat_dedupe_answer(answer, chat_history)
 
         # Chat-Verlauf updaten + speichern (v8.33: is_review-Flag mitschreiben)
         chat_history.append({
@@ -14303,6 +14521,7 @@ _SCHEMA_CLASSIFICATION = {
                   'arbeitstage_total', 'audit', '_klass_summary',
                   '_review_items', '_unresolved_days', '_vma_unmapped_se',
                   '_document_health', '_plausi_issues', '_plausi_hard_fails',
+                  '_z77_audit', '_se_completeness',
                   '_extra_arbeitstage', '_extra_fahrtage', '_extra_hotelnaechte',
                   '_aerotax_z76_dates_amounts', '_iata_unknown', '_bmf_missing',
                   '_audit_source', '_audit_notes', '_cached_recalc_state',
@@ -21108,6 +21327,165 @@ def _detect_classification_issues(cls, se_summary):
     return issues
 
 
+def _redact_se_filename(name, idx):
+    """SE-Filenames können PII enthalten (Personalnummer). Lightweight redact:
+    behalte Endung + lfd. Nummer + Hash der originalen Bytes (8 chars).
+    Damit ist Monatsaudit möglich, ohne Namen zu speichern."""
+    import hashlib as _h
+    try:
+        ext = '.pdf'
+        if isinstance(name, str) and '.' in name:
+            ext = '.' + name.rsplit('.', 1)[1][:8].lower()
+        digest = _h.sha256((name or f'unknown_{idx}').encode('utf-8', errors='ignore')).hexdigest()[:8]
+        return f'se_{idx:02d}_{digest}{ext}'
+    except Exception:
+        return f'se_{idx:02d}.pdf'
+
+
+def _build_se_completeness_audit(uploaded_count, se_structured, se_summary,
+                                  document_health, se_filenames_redacted=None):
+    """v14 P0 SE-Completeness Audit (2026-05-21).
+
+    Liefert eine PII-arme Übersicht über die SE-Lese-Qualität:
+      - wie viele Dateien hochgeladen
+      - wie viele Monate erkannt
+      - welche fehlen
+      - welche doppelt sind
+      - Z77 pro Monat (aus se_summary.monatliche_z77 oder aus se_structured.se_lines)
+      - Inland/Ausland-Aufteilung
+      - Reader-Confidence (lightweight)
+      - file_hashes (redacted) für Audit
+
+    KEINE Tagesdaten, KEINE Namen, KEINE Routings, KEINE Personalnummer.
+    """
+    audit = {
+        'uploaded_se_files_count': int(uploaded_count or 0),
+        'expected_months':         12,
+        'detected_se_months':      [],
+        'detected_se_month_count': 0,
+        'missing_se_months':       [],
+        'duplicate_se_months':     [],
+        'unreadable_se_files':     [],
+        'z77_by_month':            [],
+        'z77_source_by_month':     {},
+        'z77_total_lines':         0.0,
+        'z77_total_summary':       0.0,
+        'z77_total_used':          0.0,
+        'z77_diff_lines_vs_summary': 0.0,
+        'reader_confidence':       None,
+        'se_files_redacted':       list(se_filenames_redacted or []),
+    }
+
+    se_structured = se_structured or {}
+    se_summary    = se_summary    or {}
+    document_health = document_health or {}
+
+    se_lines = se_structured.get('se_lines') or []
+    active_lines = [s for s in se_lines if not s.get('storno')]
+
+    # Monate aus den aktiven Tageszeilen (Wahrheit)
+    months_from_lines = {}
+    inland_by_month  = {}
+    ausland_by_month = {}
+    for s in active_lines:
+        datum = s.get('datum') or ''
+        if not datum.startswith('20') or len(datum) < 7:
+            continue
+        try:
+            m = int(datum[5:7])
+        except Exception:
+            continue
+        amt = float(s.get('stfrei_betrag', 0) or 0)
+        months_from_lines.setdefault(m, {'sum': 0.0, 'count': 0})
+        months_from_lines[m]['sum'] += amt
+        months_from_lines[m]['count'] += 1
+        if s.get('stfrei_inland') is True:
+            inland_by_month[m] = inland_by_month.get(m, 0.0) + amt
+        elif s.get('stfrei_inland') is False:
+            ausland_by_month[m] = ausland_by_month.get(m, 0.0) + amt
+
+    # Monate aus Sonnet-SE-Summary (monatliche_z77-Liste, falls da)
+    months_from_summary = {}
+    for entry in (se_summary.get('monatliche_z77') or []):
+        try:
+            mo = int(entry.get('monat', 0))
+            if 1 <= mo <= 12:
+                months_from_summary[mo] = {
+                    'sum':   float(entry.get('z77_monat', 0) or 0),
+                    'count': int(entry.get('anzahl_zeilen', 0) or 0),
+                }
+        except Exception:
+            continue
+
+    detected_months = sorted(set(months_from_lines.keys()) | set(months_from_summary.keys()))
+    audit['detected_se_months'] = detected_months
+    audit['detected_se_month_count'] = len(detected_months)
+    audit['missing_se_months'] = sorted(set(range(1, 13)) - set(detected_months))
+
+    # Monatsaudit (kein PII)
+    for mo in range(1, 13):
+        line_data = months_from_lines.get(mo)
+        sum_data  = months_from_summary.get(mo)
+        if not line_data and not sum_data:
+            continue
+        line_sum = round(line_data['sum'], 2) if line_data else 0.0
+        sum_sum  = round(sum_data['sum'], 2)  if sum_data  else 0.0
+        entry = {
+            'monat':         mo,
+            'z77_lines':     line_sum,
+            'z77_summary':   sum_sum,
+            'lines_count':   (line_data['count'] if line_data else 0),
+            'inland':        round(inland_by_month.get(mo, 0.0), 2),
+            'ausland':       round(ausland_by_month.get(mo, 0.0), 2),
+        }
+        if line_sum > 0 and sum_sum > 0:
+            entry['quelle'] = 'beide' if abs(line_sum - sum_sum) < 0.50 else 'konflikt'
+        elif line_sum > 0:
+            entry['quelle'] = 'einzelzeilen'
+        elif sum_sum > 0:
+            entry['quelle'] = 'summenzeilen'
+        else:
+            entry['quelle'] = 'leer'
+        audit['z77_by_month'].append(entry)
+        audit['z77_source_by_month'][str(mo)] = entry['quelle']
+
+    audit['z77_total_lines']   = round(sum(m['z77_lines']   for m in audit['z77_by_month']), 2)
+    audit['z77_total_summary'] = round(sum(m['z77_summary'] for m in audit['z77_by_month']), 2)
+    audit['z77_total_used']    = float(se_summary.get('z77_total', 0) or 0)
+    audit['z77_diff_lines_vs_summary'] = round(
+        abs(audit['z77_total_lines'] - audit['z77_total_summary']), 2
+    )
+
+    # Duplikate (gleicher Monat aus mehreren Dateien) — heuristisch: wenn
+    # uploaded_count > detected_se_month_count UND keine missing_se_months → Verdacht.
+    if (audit['uploaded_se_files_count'] > audit['detected_se_month_count']
+        and not audit['missing_se_months']
+        and audit['detected_se_month_count'] > 0):
+        audit['duplicate_se_months'] = ['unbekannt (Datei-Zuordnung nicht persistiert)']
+
+    # Unlesbare Files: uploaded - erkannt (wenn missing_se_months leer ist)
+    if (audit['uploaded_se_files_count'] > 0
+        and audit['detected_se_month_count'] < audit['uploaded_se_files_count']
+        and not audit['duplicate_se_months']):
+        audit['unreadable_se_files'] = [
+            f'{audit["uploaded_se_files_count"] - audit["detected_se_month_count"]} Datei(en) nicht lesbar oder kein Monatsbezug'
+        ]
+
+    # Reader-Confidence (lightweight)
+    if audit['uploaded_se_files_count'] == 0:
+        audit['reader_confidence'] = 0
+    elif audit['detected_se_month_count'] == 12 and not audit['unreadable_se_files']:
+        audit['reader_confidence'] = 95
+    elif audit['detected_se_month_count'] >= 10:
+        audit['reader_confidence'] = 80
+    elif audit['detected_se_month_count'] >= 6:
+        audit['reader_confidence'] = 60
+    else:
+        audit['reader_confidence'] = 30
+
+    return audit
+
+
 def hybrid_analyze(form, files, job_id=None):
     """Hauptanalyse: Sonnet (LSB+SE-Summen) + Opus (Tag-Klassifikation) SEQUENZIELL.
     Sequenziell statt parallel — schont Memory auf Render Free 512 MB.
@@ -21121,8 +21499,16 @@ def hybrid_analyze(form, files, job_id=None):
     for item in (files.get('lsb') or []):
         lsb_bytes.append(item[0] if isinstance(item, tuple) else item)
     se_bytes = []
+    se_filenames_redacted = []
     for item in (files.get('se') or []):
-        se_bytes.append(item[0] if isinstance(item, tuple) else item)
+        if isinstance(item, tuple) and len(item) >= 2:
+            se_bytes.append(item[0])
+            raw_name = item[1] or f'se_{len(se_filenames_redacted)+1}.pdf'
+            se_filenames_redacted.append(_redact_se_filename(raw_name, len(se_filenames_redacted)+1))
+        else:
+            se_bytes.append(item)
+            se_filenames_redacted.append(f'se_{len(se_filenames_redacted)+1}.pdf')
+    uploaded_se_files_count = len(se_bytes)
     dp_bytes = []
     for item in (files.get('dp') or []):
         dp_bytes.append(item[0] if isinstance(item, tuple) else item)
@@ -21303,6 +21689,14 @@ def hybrid_analyze(form, files, job_id=None):
         se_summary['z77_from_months'] = z77_from_months
         se_summary['z77_diff'] = round(diff, 2)
         se_summary['z77_source'] = 'einzelzeilen' if z77_from_lines >= z77_from_months else 'summenzeilen'
+        # v14 P0: SE-Completeness-Audit (uploaded vs detected vs missing, monatlich)
+        se_summary['_se_completeness_audit'] = _build_se_completeness_audit(
+            uploaded_count=uploaded_se_files_count,
+            se_structured=se_structured,
+            se_summary=se_summary,
+            document_health=None,  # noch nicht berechnet hier
+            se_filenames_redacted=se_filenames_redacted,
+        )
         se_summary.setdefault('auslandsspesen_total', sum(
             float(s.get('stfrei_betrag', 0) or 0)
             for s in se_structured.get('se_lines', [])
@@ -21936,6 +22330,7 @@ def _berechne_via_hybrid(form, files, job_id=None):
         },
         # v8.1.2: Z77-Audit-Detail für aufklappbaren Detail-Bereich (intern,
         # NICHT als Top-Level-Note. Zeigt Einzelzeilen vs Summenzeilen.)
+        # v14 P0 (2026-05-21): erweitert um monatliche Aufschlüsselung + SE-Completeness.
         '_z77_audit': {
             'verwendeter_wert': float(se_sum.get('z77_total', 0) or 0),
             'einzelzeilen':     float(se_sum.get('z77_from_lines', 0) or 0),
@@ -21944,7 +22339,11 @@ def _berechne_via_hybrid(form, files, job_id=None):
             'quelle':           se_sum.get('z77_source', '') or '',
             'auslandsspesen':   auslandsspesen_se,
             'inlandsspesen':    inlandsspesen_se,
+            'monatliche_z77':   list(se_sum.get('monatliche_z77', []) or []),
         },
+        # v14 P0 (2026-05-21): SE-Completeness sichtbar — uploaded vs detected vs missing.
+        # PII-arm: keine Namen, keine Routings, nur Counts + monatliche Beträge.
+        '_se_completeness': (se_sum.get('_se_completeness_audit') or {}),
     }
 
 
@@ -24213,6 +24612,217 @@ def erstelle_pdf(d):
                        fontName="Helvetica", leading=12, spaceAfter=2)))
             S.append(HRFlowable(width="100%", thickness=0.3, color=LINE,
                 spaceBefore=8, spaceAfter=10))
+
+    # ════════════════════════════════════════════════
+    # PRÜFPUNKTE — nur wenn Audit-Warnungen vorliegen (v14 P0 final, 2026-05-21)
+    # Zeigt: unklare Tage, unmapped SE, SE-Monatszählung, Z77-Quelle.
+    # Bei done_clean: Sektion entfällt komplett.
+    # KEINE PII (Namen/Personalnummer/Routings) — nur Datum + Ort + Betrag.
+    # ════════════════════════════════════════════════
+    _pp_unresolved   = list(d.get('_unresolved_days') or [])
+    _pp_unmapped     = list(d.get('_vma_unmapped_se') or [])
+    _pp_se_comp      = d.get('_se_completeness') or {}
+    _pp_z77_audit    = d.get('_z77_audit') or {}
+    _pp_missing      = list(_pp_se_comp.get('missing_se_months') or [])
+    _pp_unreadable   = list(_pp_se_comp.get('unreadable_se_files') or [])
+    _pp_dup          = list(_pp_se_comp.get('duplicate_se_months') or [])
+    _pp_has_warnings = bool(
+        _pp_unresolved or _pp_unmapped or _pp_missing
+        or _pp_unreadable or _pp_dup
+    )
+    if _pp_has_warnings:
+        S.append(PageBreak())
+        S.append(Paragraph("PRÜFPUNKTE",
+            ps("pp_eyebrow", fontSize=8.5, textColor=GOLD, fontName="Helvetica-Bold",
+               leading=12, spaceAfter=4, letterSpacing=2.5)))
+        S.append(Paragraph("Hinweise zu deiner Auswertung",
+            ps("pp_h1", fontSize=18, textColor=TEXT, fontName="Helvetica",
+               leading=24, spaceAfter=10, letterSpacing=-0.2)))
+        S.append(Paragraph(
+            "Diese Punkte wurden nicht still übernommen. Bitte prüfe sie vor der "
+            "Übernahme in dein Steuerprogramm.",
+            ps("pp_intro", fontSize=10, textColor=TEXT2, fontName="Helvetica",
+               leading=15, spaceAfter=14)))
+
+        # Counts-Übersicht (kompakte Tabelle)
+        _pp_rows = []
+        if _pp_unresolved:
+            _pp_rows.append([
+                Paragraph("Nicht eindeutig eingeordnete Tage",
+                    ps("pp_l1", fontSize=10, textColor=TEXT,
+                       fontName="Helvetica", leading=14)),
+                Paragraph(f"<b>{len(_pp_unresolved)}</b>",
+                    ps("pp_v1", fontSize=10, textColor=GOLD,
+                       fontName="Helvetica-Bold", leading=14, alignment=TA_RIGHT)),
+            ])
+        if _pp_unmapped:
+            _pp_rows.append([
+                Paragraph("Nicht zugeordnete Streckeneinsatz-Zeilen",
+                    ps("pp_l2", fontSize=10, textColor=TEXT,
+                       fontName="Helvetica", leading=14)),
+                Paragraph(f"<b>{len(_pp_unmapped)}</b>",
+                    ps("pp_v2", fontSize=10, textColor=GOLD,
+                       fontName="Helvetica-Bold", leading=14, alignment=TA_RIGHT)),
+            ])
+        _detected = int(_pp_se_comp.get('detected_se_month_count') or 0)
+        _expected = int(_pp_se_comp.get('expected_months') or 12)
+        if _pp_se_comp:
+            _pp_rows.append([
+                Paragraph("Streckeneinsatz erkannt",
+                    ps("pp_l3", fontSize=10, textColor=TEXT,
+                       fontName="Helvetica", leading=14)),
+                Paragraph(f"<b>{_detected}/{_expected} Monate</b>",
+                    ps("pp_v3", fontSize=10,
+                       textColor=GOLD if _pp_missing else TEXT,
+                       fontName="Helvetica-Bold", leading=14, alignment=TA_RIGHT)),
+            ])
+        if _pp_missing:
+            _monat_labels = {1:'Jan',2:'Feb',3:'Mär',4:'Apr',5:'Mai',6:'Jun',
+                              7:'Jul',8:'Aug',9:'Sep',10:'Okt',11:'Nov',12:'Dez'}
+            _miss_txt = ', '.join(_monat_labels.get(int(m), str(m)) for m in _pp_missing)
+            _pp_rows.append([
+                Paragraph("Fehlende SE-Monate",
+                    ps("pp_l4", fontSize=10, textColor=TEXT,
+                       fontName="Helvetica", leading=14)),
+                Paragraph(f"<b>{_miss_txt}</b>",
+                    ps("pp_v4", fontSize=10, textColor=GOLD,
+                       fontName="Helvetica-Bold", leading=14, alignment=TA_RIGHT)),
+            ])
+        if _pp_unreadable:
+            _pp_rows.append([
+                Paragraph("SE-Dateien nicht lesbar",
+                    ps("pp_l5", fontSize=10, textColor=TEXT,
+                       fontName="Helvetica", leading=14)),
+                Paragraph(f"<b>{len(_pp_unreadable)}</b>",
+                    ps("pp_v5", fontSize=10, textColor=GOLD,
+                       fontName="Helvetica-Bold", leading=14, alignment=TA_RIGHT)),
+            ])
+        _z77_used = float(_pp_z77_audit.get('verwendeter_wert', 0) or 0)
+        _z77_quelle = str(_pp_z77_audit.get('quelle', '') or '')
+        if _z77_used > 0:
+            _pp_rows.append([
+                Paragraph(f"Z77 verwendet (Quelle: {_z77_quelle or 'einzelzeilen'})",
+                    ps("pp_l6", fontSize=10, textColor=TEXT,
+                       fontName="Helvetica", leading=14)),
+                Paragraph(f"<b>{eur(_z77_used)}</b>",
+                    ps("pp_v6", fontSize=10, textColor=TEXT,
+                       fontName="Helvetica-Bold", leading=14, alignment=TA_RIGHT)),
+            ])
+        _z77_diff = float(_pp_z77_audit.get('differenz', 0) or 0)
+        if _z77_diff > 5.0:
+            _pp_rows.append([
+                Paragraph("Differenz Einzelzeilen vs Summenzeilen",
+                    ps("pp_l7", fontSize=10, textColor=TEXT,
+                       fontName="Helvetica", leading=14)),
+                Paragraph(f"<b>{eur(_z77_diff)}</b>",
+                    ps("pp_v7", fontSize=10, textColor=TEXT2,
+                       fontName="Helvetica-Bold", leading=14, alignment=TA_RIGHT)),
+            ])
+        if _pp_rows:
+            _pp_table = Table(_pp_rows, colWidths=[12.0*cm, 4.8*cm])
+            _pp_table.setStyle(TableStyle([
+                ("TOPPADDING",(0,0),(-1,-1),7),
+                ("BOTTOMPADDING",(0,0),(-1,-1),7),
+                ("LEFTPADDING",(0,0),(-1,-1),0),
+                ("RIGHTPADDING",(0,0),(-1,-1),0),
+                ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+                ("LINEBELOW",(0,0),(-1,-2),0.3,LINE),
+            ]))
+            S.append(_pp_table)
+            S.append(Spacer(1, 0.5*cm))
+
+        # Detail-Tabelle: nicht zugeordnete SE-Zeilen (PII-arm)
+        if _pp_unmapped:
+            S.append(Paragraph("Nicht zugeordnete Streckeneinsatz-Zeilen",
+                ps("pp_t1", fontSize=11, textColor=TEXT,
+                   fontName="Helvetica-Bold", leading=15, spaceAfter=4)))
+            S.append(Paragraph(
+                "Diese Zeilen sind in den steuerfreien Spesen (Z77) enthalten, "
+                "konnten aber keinem VMA-Tag zugeordnet werden.",
+                ps("pp_t1s", fontSize=9, textColor=TEXT2,
+                   fontName="Helvetica", leading=13, spaceAfter=8)))
+            _hdr = [
+                Paragraph("<b>Datum</b>", ps("pp_h_d", fontSize=9, textColor=TEXT2,
+                    fontName="Helvetica-Bold", leading=13)),
+                Paragraph("<b>Ort</b>", ps("pp_h_o", fontSize=9, textColor=TEXT2,
+                    fontName="Helvetica-Bold", leading=13)),
+                Paragraph("<b>Betrag</b>", ps("pp_h_b", fontSize=9, textColor=TEXT2,
+                    fontName="Helvetica-Bold", leading=13, alignment=TA_RIGHT)),
+                Paragraph("<b>Grund</b>", ps("pp_h_r", fontSize=9, textColor=TEXT2,
+                    fontName="Helvetica-Bold", leading=13)),
+                Paragraph("<b>Status</b>", ps("pp_h_s", fontSize=9, textColor=TEXT2,
+                    fontName="Helvetica-Bold", leading=13)),
+            ]
+            _rows = [_hdr]
+            for s_row in _pp_unmapped[:50]:
+                _datum = str(s_row.get('datum') or '')[:10]
+                _ort   = str(s_row.get('stfrei_ort') or '')[:6]
+                _betr  = float(s_row.get('stfrei_total', 0) or 0)
+                _rsn   = str(s_row.get('reason') or '')[:64]
+                _klass = str(s_row.get('klass') or '?')
+                _rows.append([
+                    Paragraph(_datum, ps(f"pp_d_{id(s_row)}", fontSize=9,
+                        textColor=TEXT, fontName="Helvetica", leading=12)),
+                    Paragraph(_ort, ps(f"pp_o_{id(s_row)}", fontSize=9,
+                        textColor=TEXT, fontName="Helvetica", leading=12)),
+                    Paragraph(eur(_betr), ps(f"pp_b_{id(s_row)}", fontSize=9,
+                        textColor=TEXT, fontName="Helvetica", leading=12,
+                        alignment=TA_RIGHT)),
+                    Paragraph(_rsn, ps(f"pp_r_{id(s_row)}", fontSize=9,
+                        textColor=TEXT2, fontName="Helvetica", leading=12)),
+                    Paragraph(_klass, ps(f"pp_s_{id(s_row)}", fontSize=9,
+                        textColor=GOLD, fontName="Helvetica-Bold", leading=12)),
+                ])
+            _t = Table(_rows, colWidths=[2.2*cm, 1.4*cm, 2.4*cm, 8.5*cm, 2.3*cm])
+            _t.setStyle(TableStyle([
+                ("TOPPADDING",(0,0),(-1,-1),5),
+                ("BOTTOMPADDING",(0,0),(-1,-1),5),
+                ("LEFTPADDING",(0,0),(-1,-1),3),
+                ("RIGHTPADDING",(0,0),(-1,-1),3),
+                ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+                ("LINEBELOW",(0,0),(-1,0),0.5,LINE2),
+                ("LINEBELOW",(0,1),(-1,-1),0.2,LINE),
+                ("BACKGROUND",(0,0),(-1,0),BG_CARD),
+            ]))
+            S.append(_t)
+            if len(_pp_unmapped) > 50:
+                S.append(Paragraph(
+                    f"... und {len(_pp_unmapped)-50} weitere — siehe Audit-Trail.",
+                    ps("pp_more", fontSize=8.5, textColor=TEXT3,
+                       fontName="Helvetica-Oblique", leading=12, spaceBefore=4)))
+
+        # Detail-Liste: unresolved_days (kompakt, eine Zeile pro Tag)
+        if _pp_unresolved:
+            S.append(Spacer(1, 0.5*cm))
+            S.append(Paragraph("Nicht eindeutig eingeordnete Tage",
+                ps("pp_u1", fontSize=11, textColor=TEXT,
+                   fontName="Helvetica-Bold", leading=15, spaceAfter=4)))
+            S.append(Paragraph(
+                "Diese Tage konnten aus den Belegen nicht zweifelsfrei klassifiziert "
+                "werden — sie sind im Tagesnachweis weiter hinten gelistet.",
+                ps("pp_u1s", fontSize=9, textColor=TEXT2,
+                   fontName="Helvetica", leading=13, spaceAfter=8)))
+            for _ud in _pp_unresolved[:30]:
+                S.append(Paragraph(
+                    f"• {str(_ud)[:160]}",
+                    ps(f"pp_ud_{id(_ud)}", fontSize=9, textColor=TEXT2,
+                       fontName="Helvetica", leading=13, spaceAfter=2)))
+            if len(_pp_unresolved) > 30:
+                S.append(Paragraph(
+                    f"... und {len(_pp_unresolved)-30} weitere.",
+                    ps("pp_umore", fontSize=8.5, textColor=TEXT3,
+                       fontName="Helvetica-Oblique", leading=12, spaceBefore=2)))
+
+        S.append(Spacer(1, 0.6*cm))
+        S.append(HRFlowable(width="30%", thickness=0.4, color=LINE,
+            hAlign='LEFT', spaceAfter=8))
+        S.append(Paragraph(
+            "Hinweis: Das PDF kann trotzdem in deinem Steuerprogramm eingetragen werden. "
+            "Die markierten Punkte sind keine Berechnungsfehler — sie zeigen, wo die "
+            "Quellen nicht eindeutig waren. Bitte abgleichen oder mit deiner "
+            "Steuerberatung besprechen.",
+            ps("pp_foot", fontSize=9, textColor=TEXT3, fontName="Helvetica",
+               leading=14)))
 
     # ════════════════════════════════════════════════
     # TRENNSEITE — elegant, jahres- und beleg-agnostisch

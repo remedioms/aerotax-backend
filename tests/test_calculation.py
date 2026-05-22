@@ -7316,7 +7316,8 @@ def test_v91_build_chat_context_has_required_fields():
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def _build_ai_chat_context(')
-    block = src[fn_idx:fn_idx+3500]
+    # v14 P0 (2026-05-21): function body grew with audit-warning fields, window widened.
+    block = src[fn_idx:fn_idx+9000]
     for f in ['tax_year', 'current_total', 'review_groups', 'pending_review_items',
               'allowed_actions', 'pdf_status']:
         assert "'" + f + "'" in block, f'Context-Field fehlt: {f}'

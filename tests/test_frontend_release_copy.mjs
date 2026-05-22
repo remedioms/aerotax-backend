@@ -27,54 +27,95 @@ check('hero_contains_fuer_flugpersonal_gemacht',
   html.includes('Für Flugpersonal gemacht'));
 check('hero_mentions_streckeneinsatz_in_subline_or_usp',
   html.includes('Streckeneinsatz'));
-// Subline muss kurz + punchy + level-spannend sein („du fliegst, wir rechnen, du
-// trägst ein") — kein Jargon, kein Newbie-Tutorial, kein Sales-Wall. Detail-
-// Aufzählung steht im USP-Block darunter.
-check('hero_subline_punchy_three_part',
-  html.includes('Du fliegst. Wir rechnen. Du trägst ein.'));
-check('hero_subline_under_60_chars',
-  (function() {
-    // After liquid-glass merge: <p class="hsub" style="..."> carries the gradient styling.
-    // Match `>TEXT</p>` to extract content regardless of attributes.
+// Homepage Master 2026-05-21: Hero komplett neu. „Du fliegst..." entfernt.
+// H1 = „Dienstplan rein. Überblick raus." + Sub erklärt CAS/SE/LSB → PDF.
+check('hero_h1_is_dienstplan_rein_ueberblick_raus',
+  /<div class="htag">Dienstplan rein\. Überblick raus\.<\/div>/.test(html));
+check('hero_does_not_contain_du_fliegst_wir_rechnen',
+  !html.includes('Du fliegst. Wir rechnen. Du trägst ein.') &&
+  !/<p class="hsub"[^>]*>Du fliegst/.test(html));
+check('hero_mentions_cas_streckeneinsatz_lohnsteuerdaten',
+  (function(){
     const m = html.match(/<p class="hsub"[^>]*>([^<]+)<\/p>/);
-    return m && m[1].trim().length < 60;
+    return m && /CAS/.test(m[1]) && /Streckeneinsatz/.test(m[1]) && /Lohnsteuerdaten/.test(m[1]);
   })());
-check('hero_subline_no_jargon_wall',
-  (function() {
+check('hero_mentions_pdf_auswertung',
+  (function(){
     const m = html.match(/<p class="hsub"[^>]*>([^<]+)<\/p>/);
-    return m && !/Lohnsteuerdaten|Streckeneinsatz|absetzen/i.test(m[1]);
+    return m && /PDF-Auswertung/.test(m[1]);
+  })());
+check('hero_supporting_claim_fuer_flugpersonal',
+  /Für Flugpersonal gemacht\. Für die Steuer vorbereitet\./.test(html));
+check('hero_no_long_checkmark_chain',
+  (function(){
+    const heroStart = html.indexOf('<div class="hero">');
+    const heroEnd = html.indexOf('<!-- WIE AEROTAX ARBEITET', heroStart);
+    if (heroStart < 0 || heroEnd < 0) return false;
+    const hero = html.slice(heroStart, heroEnd);
+    const checkmarks = (hero.match(/✓/g) || []).length;
+    return checkmarks < 3;
   })());
 
 // ─── USP-Block ──────────────────────────────────────────────────────────────
 console.log('\n[usp]');
-check('usp_block_present',
-  html.includes('id="usp"') && html.includes('Mehr als nur hochladen'));
-check('usp_block_mentions_cas',
-  /CAS\s*\/\s*Dienstplan|Dienstplan.{0,40}gelesen/.test(html));
-check('usp_block_mentions_streckeneinsatz',
-  html.includes('Spesen werden abgeglichen') || /Streckeneinsatz.{0,60}gegen/.test(html));
-check('usp_block_mentions_z77_automatisch_verrechnet',
-  html.includes('Z77 automatisch verrechnet'));
-check('usp_block_mentions_pdf_eintragen',
-  /PDF.{0,40}zum Eintragen|Fertig zum Eintragen/.test(html));
-check('usp_block_mentions_crew_specific',
-  /Crew-spezifisch|Flugpersonal.{0,80}Logik/.test(html));
+// Iteration 2026-05-21: USP + HOW zu ONE Section zusammengelegt.
+// User-Request: „aus 2 einen element nur machen". id="how" trägt jetzt beide
+// Rollen: Was-macht-es + In-3-Schritten kombiniert in einer Section.
+check('combined_section_present',
+  html.includes('id="how"') && /Wie AeroTAX arbeitet/.test(html));
+// Homepage Master 2026-05-21: USP von 5 Cards auf 3 reduziert, keine
+// langen Texte mehr — Crew-Details (Marker/Standby/Hotelnächte) gehören in FAQ.
+check('combined_section_has_three_cards',
+  (function(){
+    const start = html.indexOf('id="how"');
+    const end = html.indexOf('<!-- TOOL', start);
+    if (start < 0 || end < 0) return false;
+    const block = html.slice(start, end);
+    const cards = (block.match(/<div class="hc reveal">/g) || []).length;
+    return cards === 3;
+  })());
+check('combined_section_no_giant_card_text',
+  (function(){
+    const start = html.indexOf('id="how"');
+    const end = html.indexOf('<!-- TOOL', start);
+    if (start < 0 || end < 0) return false;
+    const block = html.slice(start, end);
+    return !block.includes('Marker, Standby und Tour-Kontext') &&
+           !block.includes('Doppelansatz, kein Verlust');
+  })());
+check('only_one_marketing_snap_section_not_two',
+  (function(){
+    // Should be exactly 1 .snap-section in the main flow (Hero is .hero, not snap).
+    const snapCount = (html.match(/<div class="snap-section">/g) || []).length;
+    return snapCount === 1;
+  })());
+check('combined_section_uses_du_aerotax_du_pattern',
+  /01 · Du[\s\S]{0,1500}02 · AeroTAX[\s\S]{0,1500}03 · Du/.test(html));
+check('combined_section_mentions_cas',
+  /Unterlagen hochladen|Dienstplan\/CAS/.test(html));
+check('combined_section_mentions_streckeneinsatz',
+  html.includes('Streckeneinsatz'));
+check('combined_section_mentions_z77',
+  /Z77\/stfrei/.test(html));
+check('combined_section_mentions_pdf_eintragen',
+  /PDF eintragen[\s\S]{0,200}Steuererklärung/.test(html));
 
 // ─── Trust-Badges ───────────────────────────────────────────────────────────
 console.log('\n[trust badges]');
-check('trust_badges_present',
-  html.includes('CAS / Dienstplan-Auswertung') ||
-  html.includes('CAS/Dienstplan-Auswertung'));
-check('badges_include_streckeneinsatz_abgleich',
-  html.includes('Streckeneinsatz-Abgleich'));
-check('badges_include_pdf_quellen',
+// Homepage Master 2026-05-21: Trust-Badge-Chain im Hero entfernt (zu textlastig).
+// CAS/Dienstplan-Hinweis steckt jetzt in der Hero-Subline + USP-Card.
+check('hero_subline_carries_trust_signals',
+  /<p class="hsub"[^>]*>([^<]*CAS[^<]*Streckeneinsatz[^<]*Lohnsteuerdaten[^<]*PDF-Auswertung)/.test(html));
+// Homepage Master 2026-05-21: lange Häkchen-Kette aus dem Hero entfernt.
+// Trust signals leben jetzt in Result-Panel/Datenschutz/FAQ statt im Hero.
+check('hero_keeps_price_and_supporting_claim',
+  /Einmalig 19,99 €\s*·\s*Kein Abo\s*·\s*PDF mit Quellen/.test(html));
+check('badges_streckeneinsatz_abgleich_still_referenced_in_usp',
+  html.includes('Spesen abgleichen'));
+check('badges_pdf_quellen_in_hero_price_line',
   html.includes('PDF mit Quellen'));
-check('badges_include_einmalzahlung_or_kein_abo',
-  html.includes('Kein Abo'));
-check('badges_include_dateien_geloescht',
-  /Dateien werden gelöscht/.test(html));
-check('badges_include_steuerfrei_oder_z77',
-  /Steuerfreie Spesen automatisch verrechnet|Z77 automatisch verrechnet/.test(html));
+check('badges_z77_referenced_in_usp',
+  /Z77\/stfrei/.test(html));
 
 // ─── Disclaimer / Legal nicht im Hero ───────────────────────────────────────
 console.log('\n[legal placement]');
@@ -161,6 +202,42 @@ check('download_title_positive',
   html.includes('Deine Auswertung ist bereit'));
 check('download_subtext_positive',
   /berechneten Werbungskosten.{0,80}Spesen-Abgleich.{0,80}Quellen|vorbereitet zum Eintragen/.test(html));
+// Homepage Master 2026-05-21: Debug-Copy „Falls die Chat-Bubble nicht lädt"
+// entfernt — klang nach Bug.
+check('no_falls_chat_bubble_nicht_laedt_debug_copy',
+  !html.includes('Falls die Chat-Bubble nicht lädt'));
+check('dl_btn_row_positive_copy',
+  html.includes('Deine Auswertung ist bereit.') &&
+  /24 Stunden über deinen Code/.test(html));
+check('dl_btn_row_uses_glass_system',
+  /id="dl-btn-row"[\s\S]{0,400}backdrop-filter:var\(--glass-blur-soft\)/.test(html));
+check('dl_btn_hint_uses_nicht_bestaetigt_phrasing',
+  /Nicht bestätigte Punkte werden im PDF entsprechend gekennzeichnet/.test(html));
+
+// ─── 3-Step Flow Copy Match ────────────────────────────────────────────────
+console.log('\n[3-step flow copy]');
+// Headline replaced from „Hochladen. Ergänzen. Fertig." → „Aus Unterlagen wird…"
+check('combined_section_uses_aus_unterlagen_headline',
+  /<p class="stit[^"]*">Aus Unterlagen wird dein Steuer-Überblick\.<\/p>/.test(html));
+check('combined_step1_unterlagen_hochladen',
+  /01 · Du[\s\S]{0,400}Unterlagen hochladen/.test(html));
+check('combined_step2_aerotax_auswertet',
+  /02 · AeroTAX[\s\S]{0,400}Auswertet/.test(html));
+check('combined_step3_pdf_eintragen',
+  /03 · Du[\s\S]{0,400}PDF eintragen/.test(html));
+check('no_steuersoftware_uebertragen_step',
+  !html.includes('In Steuersoftware übertragen'));
+check('no_drei_schritte_vollautomatisch',
+  !html.includes('Drei Schritte. Vollautomatisch.'));
+
+// ─── Datenschutz/Provider ──────────────────────────────────────────────────
+console.log('\n[datenschutz provider cleanup]');
+check('privacy_mentions_google_cloud_run_not_render',
+  /<li><strong>Google Cloud Run<\/strong>/.test(html));
+check('no_render_com_in_privacy_modal',
+  !/<li><strong>Render\.com<\/strong>/.test(html));
+check('privacy_mentions_eu_region_frankfurt',
+  /europe-west3 Frankfurt/.test(html));
 check('pdf_button_label_clean',
   html.includes('⬇ PDF herunterladen'));
 
@@ -236,23 +313,65 @@ check('no_scale_zero_entry_keyframe',
   !/from\s*\{\s*transform:\s*scale\(0\)\s*;?\s*\}/.test(html));
 check('popIn_starts_from_six_not_zero',
   /popIn\b[\s\S]{0,200}scale\(\.6\)/.test(html));
-check('usp_cards_have_stagger_animation',
-  /\.hc\.reveal:nth-child\(2\)\{\s*animation-delay:\s*50ms/.test(html));
+// Phase: Scroll-Reveal via IntersectionObserver statt auto-fire keyframe.
+// Stagger jetzt über transition-delay (löst nur wenn Card in Viewport scrollt).
+check('usp_cards_have_scroll_reveal_stagger',
+  /\.hc\.reveal:nth-child\(2\)\.is-visible\{\s*transition-delay:\s*120ms/.test(html));
+check('intersection_observer_wired_for_reveals',
+  /new IntersectionObserver/.test(html) &&
+  /querySelectorAll\('\.hc\.reveal,\s*\.scroll-reveal'\)/.test(html));
+// Iteration 2026-05-21: 3s-Fallback ENTFERNT — fired blind alle is-visible
+// auf Hero-Page wenn User noch nicht runter-scrollt. Stattdessen:
+// - rAF-Check für initially-in-viewport Elements (Hero-Items)
+// - prefers-reduced-motion respektiert (alle sofort sichtbar)
+// - kein No-Scroll-Fallback mehr
+check('no_blanket_3s_fallback_that_kills_scroll_animation',
+  !/setTimeout\(function\(\)\{[\s\S]{0,200}\.reveal:not\(\.is-visible\)[\s\S]{0,200}is-visible[\s\S]{0,200}3000/.test(html));
+check('reveal_threshold_increased_to_35_percent',
+  /threshold:\s*0\.35/.test(html));
+check('reveal_rootMargin_negative_bottom_15_percent',
+  /rootMargin:\s*['"]0px 0px -15% 0px['"]/.test(html));
+check('reveal_initial_viewport_check_via_raf',
+  /requestAnimationFrame\(function\(\)[\s\S]{0,400}getBoundingClientRect/.test(html));
+check('reveal_respects_prefers_reduced_motion_via_matchmedia',
+  /matchMedia\('\(prefers-reduced-motion: reduce\)'\)\.matches[\s\S]{0,300}\.hc\.reveal, \.scroll-reveal/.test(html));
 // Emil: 30-80ms per step. With 5 cards, last delay = 4×50ms = 200ms.
 // Assert: 150ms exists (=3 steps × 50ms), and no per-step jump leaves a gap
 // over 80ms (i.e. no two consecutive delays differ by more than 80ms).
-check('stagger_within_emil_30_80ms_per_step',
+// Iteration 2026-05-21: stagger 120ms per step (war 80ms). User wollte
+// stärker sichtbare scroll-animation. Max-per-step bumped to 150.
+check('stagger_within_per_step_limit',
   (function(){
-    const delays = [...html.matchAll(/\.hc\.reveal:nth-child\(\d\)\{\s*animation-delay:\s*(\d+)ms/g)]
+    const delays = [...html.matchAll(/\.hc\.reveal:nth-child\(\d\)\.is-visible\{\s*transition-delay:\s*(\d+)ms/g)]
       .map(m => parseInt(m[1], 10)).sort((a,b) => a-b);
     if(delays.length < 2) return false;
     for(let i = 1; i < delays.length; i++){
-      if((delays[i] - delays[i-1]) > 80) return false;
+      if((delays[i] - delays[i-1]) > 150) return false;
     }
     return true;
   })());
 check('reduced_motion_respected_in_stagger',
-  /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]{0,200}\.hc\.reveal\{/.test(html));
+  /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]{0,400}\.hc\.reveal[\s\S]{0,100}opacity:1/.test(html));
+// User-Request: equal-height + centered cards via flex+grid.
+check('hgrid_uses_grid_auto_rows_1fr_for_equal_height',
+  /\.hgrid\{[\s\S]{0,200}grid-auto-rows:1fr/.test(html));
+check('hc_uses_flex_column_centered',
+  /\.hc\{[\s\S]{0,800}display:flex;[\s\S]{0,200}flex-direction:column;[\s\S]{0,200}align-items:center;[\s\S]{0,200}text-align:center/.test(html));
+check('hc_height_100_percent_for_grid_fill',
+  /\.hc\{[\s\S]{0,1000}height:100%/.test(html));
+check('scroll_reveal_utility_class_defined',
+  /\.scroll-reveal\{[\s\S]{0,200}opacity:0/.test(html));
+
+// User-Request 2026-05-21: jede Marketing-Section füllt 1 Viewport, Content
+// vertikal zentriert. „alleine mittig, dann scrollen und animation".
+check('hero_uses_min_height_100vh_centered',
+  /\.hero\{[\s\S]{0,400}min-height:100vh[\s\S]{0,200}justify-content:center/.test(html));
+check('snap_section_utility_defined',
+  /\.snap-section\{[\s\S]{0,200}min-height:100vh[\s\S]{0,200}justify-content:center/.test(html));
+check('combined_section_wrapped_in_snap',
+  /<div class="snap-section"><div class="wrap"><div class="how" id="how">/.test(html));
+check('snap_section_fallback_for_short_viewports',
+  /@media\(max-height:680px\)\{\.snap-section\{min-height:auto/.test(html));
 
 // ─── Liquid Glass material system ──────────────────────────────────────────
 console.log('\n[liquid glass]');
@@ -299,12 +418,12 @@ check('no_lgErrorIn_animation',
 check('req_progress_stays_simple_not_glass_pill',
   !/\.req-progress\{[\s\S]{0,300}backdrop-filter:\s*var\(--glass-blur-soft\)/.test(html));
 
-// ─── Hero cleanup ───────────────────────────────────────────────────────────
+// ─── Hero cleanup (Homepage Master 2026-05-21) ─────────────────────────────
 console.log('\n[hero trim]');
 check('hero_drops_redundant_gradient_claim',
   !html.includes('Dienstplan rein. Überblick raus.<br>Für Flugpersonal gemacht.'));
-check('hero_subline_now_carries_gradient',
-  /<p class="hsub"[^>]*linear-gradient[^>]*>Du fliegst\. Wir rechnen\. Du trägst ein\./.test(html));
+check('hero_no_du_fliegst_anymore',
+  !html.includes('Du fliegst. Wir rechnen. Du trägst ein.'));
 
 // ─── Vorteile-Block sichtbar (nicht versteckt) ─────────────────────────────
 console.log('\n[vorteile visible]');
@@ -336,15 +455,18 @@ check('stage_mapping_p2_p3_to_stage2',
 
 // ─── Phase 4: Optional Belege Simplification ──────────────────────────────
 console.log('\n[optional belege simple]');
-check('opt_dropzone_present',
-  /id="opt-dropzone"/.test(html));
-check('opt_dropzone_describes_50_limit',
-  /Bis zu 50 Belege/.test(html));
-check('opt_dropzone_explains_classifier_behavior',
-  /Betrag, Datum und Kategorie automatisch zu erkennen/.test(html) &&
-  /im PDF-Anhang/.test(html));
-check('opt_receipt_summary_block_present',
-  /id="opt-receipt-summary"/.test(html));
+// Iteration 2026-05-21: Dropzone → req-card-Pattern (gleicher Look wie LSB/SE/CAS).
+// User-Request: „warum einfach sagen es ist da wie bei jedem anderen upload button".
+check('opt_uses_req_card_pattern_like_cas',
+  /<div class="req-card" id="rc-opt"/.test(html));
+check('opt_card_describes_what_belege',
+  /z\. B\. Gewerkschaft, Telefon, Fortbildung, Reinigung, Versicherungen/.test(html));
+check('opt_card_uses_50_limit',
+  /Bis 50 Stück/.test(html));
+check('opt_card_has_weitere_hinzufuegen_button',
+  /opt-btns[\s\S]{0,800}Weitere hinzufügen/.test(html));
+check('opt_card_has_alle_loeschen_button',
+  /opt-btns[\s\S]{0,800}Alle löschen/.test(html));
 // User feedback 2026-05-21: „wenn doch nur noch einer mit optional wo einfach
 // alles rein darf?" — Kategorienwand + „Was bringt das?"-Card komplett entfernt.
 // Dropzone ist die EINZIGE optionale Belege-UI.
@@ -356,14 +478,43 @@ check('opt_was_bringt_das_card_removed',
 check('opt_toggle_button_is_lg_pill_not_big_circle',
   /id="opt-plus-btn"[^>]*class="lg-pill"/.test(html) &&
   !/id="opt-plus-btn"[^>]*width:56px;height:56px;border-radius:50%/.test(html));
+
+// LSB: User-Request „warum kann ich beim knopf von lohnsteuerbescheinigung den
+// pdf auch nicht löschen?" — Delete-Button (`lsb-btns`) jetzt vorhanden.
+check('lsb_card_has_delete_button',
+  /id="lsb-btns"[\s\S]{0,400}clearUpload\('lsb'/.test(html));
+check('lsb_delete_button_says_entfernen',
+  /id="clear-lsb"[\s\S]{0,80}✕ Entfernen/.test(html));
+
+// Wake-Bar: User-Request „ready for departure unterhalb weiter zur zahlung
+// mittig platzieren" — wandert aus dem Form-Top in die zentrierte Zeile unter
+// dem Weiter-Button. Disappearing-Behavior bleibt (8130ff).
+check('wake_bar_below_weiter_button_centered',
+  /<button class="bn active-step" id="p2-weiter-btn"[\s\S]{0,400}<div id="wake-bar"/.test(html));
+check('wake_bar_uses_glass_system',
+  /id="wake-bar"[\s\S]{0,400}backdrop-filter:var\(--glass-blur-soft\)/.test(html));
+
+// Bug-Fix 2026-05-21: Free-Pass-Race-Condition. Stripe-`ready`-Callback hat
+// nach applyPromo() den pay-btn-Text zurück auf „Jetzt für 19,99 € kaufen"
+// gesetzt — User hing fest trotz gültigem Smoke-Test-Code.
+check('stripe_ready_callback_respects_free_flag',
+  /paymentElement\.on\('ready'[\s\S]{0,500}if\(_free === true \|\| window\._free === true\)/.test(html));
+check('stripe_ready_callback_logs_skip_when_free',
+  /\[stripe\] ready fired but _free=true — skip pay-btn overwrite/.test(html));
+check('apply_promo_sets_free_globally',
+  /_free=true[\s\S]{0,80}window\._free = true/.test(html));
+check('pay_function_handles_isFree_short_circuit',
+  /var isFree = _free \|\| window\._free === true[\s\S]{0,200}if\(isFree\)/.test(html));
 check('uploadOptAny_handler_defined',
   /window\.uploadOptAny\s*=\s*function/.test(html));
 check('uploadOptAny_enforces_50_file_limit',
   /var MAX\s*=\s*50/.test(html) && /\.slice\(0,\s*MAX\)/.test(html));
 check('uploadOptAny_appends_does_not_replace',
-  /ups\['auto'\]\s*=\s*\(ups\['auto'\]\s*\|\|\s*\[\]\)\.concat/.test(html));
-check('opt_summary_uses_glass_surface',
-  /opt-receipt-summary[\s\S]{0,400}backdrop-filter:var\(--glass-blur-soft\)/.test(html));
+  /ups\['opt'\]\s*=\s*\(ups\['opt'\]\s*\|\|\s*\[\]\)\.concat/.test(html));
+// Receipt-Summary-Card wurde durch req-card-Pattern ersetzt (Iteration 2026-05-21
+// — User-Request: gleiches Verhalten wie LSB/SE/CAS).
+check('opt_card_uses_req_card_inheriting_glass',
+  /<div class="req-card" id="rc-opt"/.test(html));
 
 // ─── Phase 5: Receipt Classifier — Design doc exists ──────────────────────
 console.log('\n[receipt classifier doc]');
@@ -398,8 +549,11 @@ check('lg_pill_info_variant_defined',
   /\.lg-pill\.lg-pill-info\{/.test(html));
 check('lg_pill_success_variant_defined',
   /\.lg-pill\.lg-pill-success\{/.test(html));
-check('datenschutz_pill_uses_lg_pill_class',
-  /<div class="lg-pill">\s*<span>Dateien werden/.test(html));
+// Iteration 2026-05-21: User „will nur text ohne glass pill drum herum".
+// Pill entfernt — Datenschutz-Hinweis ist jetzt schlichter inline-Text.
+check('datenschutz_hint_is_plain_text_not_pill',
+  !/<div class="lg-pill">\s*<span>Dateien werden/.test(html) &&
+  /Dateien werden <strong[^>]*>nur zur Berechnung<\/strong> genutzt und danach sofort gelöscht/.test(html));
 // „💡 Im Zweifel hochladen"-Pille war in der entfernten „Was bringt das?"-Card —
 // nicht mehr vorhanden (intentional, weil Card komplett raus).
 check('zweifel_hint_pill_removed_with_card',
@@ -408,6 +562,22 @@ check('js_status_pill_uses_lg_pill_class',
   /statusEl\.innerHTML\s*=\s*'<div class="lg-pill"/.test(html));
 check('js_success_pill_uses_lg_pill_success_class',
   /<div class="lg-pill lg-pill-success"/.test(html));
+
+// User-Request 2026-05-21: ganze AeroTAX-Nennung in Montserrat (Logo-Font),
+// nicht nur TAX-Teil mit Gradient. Auto-Wrapper baut nun:
+// <span class="aerotax-wordmark">Aero<span class="t">TAX</span></span>
+console.log('\n[wordmark wrap]');
+check('aerotax_wordmark_class_defined',
+  /\.aerotax-wordmark\{[\s\S]{0,200}font-family:\s*'Montserrat'/.test(html));
+check('auto_wrapper_uses_wordmark_class',
+  /mark\.className\s*=\s*['"]aerotax-wordmark['"]/.test(html));
+check('hero_uses_simple_centered_hin_no_min_height_hack',
+  !/\.hin\{[\s\S]{0,800}min-height:\s*calc\(100vh/.test(html));
+check('scroll_reveal_blur_enhanced',
+  /\.scroll-reveal\{[\s\S]{0,400}filter:\s*blur\(6px\)/.test(html) &&
+  /\.hc\.reveal\{[\s\S]{0,400}filter:\s*blur\(8px\)/.test(html));
+check('reveal_duration_longer_900ms',
+  /\.hc\.reveal\{[\s\S]{0,400}transition:[\s\S]{0,200}900ms/.test(html));
 
 // ─── Final ─────────────────────────────────────────────────────────────────
 console.log('\n— Summary: ' + pass + ' passed, ' + fail + ' failed');

@@ -38,12 +38,15 @@ REQUIRED_JOB_FIELDS = REQUIRED_SESSION_FIELDS  # same shape
 
 
 def test_classify_job_state_done_contract():
-    """done-State liefert alle Pflichtfelder."""
+    """done-State (ohne audit-warnings) → done_clean; liefert alle Pflichtfelder.
+
+    v14 P0 (2026-05-21): done wurde gesplittet in done_clean / done_with_audit_warnings.
+    Ohne Warnungen ist die Erwartung done_clean. Beide bleiben pdf_allowed=True."""
     job = {'status': 'done', 'data': {'netto': 100}}
     state = app._classify_job_state(job)
     for k in REQUIRED_JOB_FIELDS:
         assert k in state, f'done-state missing {k}'
-    assert state['canonical_state'] == 'done'
+    assert state['canonical_state'] in ('done', 'done_clean')
     assert state['pdf_allowed'] is True
     assert state['user_title'] == 'Auswertung fertig'
     assert isinstance(state['next_actions'], list) and len(state['next_actions']) > 0

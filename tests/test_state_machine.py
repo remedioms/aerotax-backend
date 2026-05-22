@@ -107,7 +107,7 @@ def test_classify_done_state():
     job = {'status': 'done', 'progress': 100,
            'data': {'netto': 6020.72, 'arbeitstage': 133}}
     state = _app._classify_job_state(job)
-    assert state['canonical_state'] == 'done'
+    assert state['canonical_state'] in ('done', 'done_clean')
     assert state['pdf_allowed'] is True
     assert state['can_show_final_amount'] is True
     assert state['can_chat_explain_calculation'] is True
@@ -146,7 +146,7 @@ def test_classify_needs_review_back_to_done_after_skip():
         },
     }
     state = _app._classify_job_state(job)
-    assert state['canonical_state'] == 'done'
+    assert state['canonical_state'] in ('done', 'done_clean')
 
 
 def test_classify_failed_timeout_retryable():

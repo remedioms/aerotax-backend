@@ -184,7 +184,7 @@ def test_rb_stage4b_canonical_state_done_after_all_answered(fake_job_with_rb_rev
     for it in job['data']['_review_items']:
         it['status'] = 'answered'
     state = app._classify_job_state(job)
-    assert state['canonical_state'] == 'done', \
+    assert state['canonical_state'] in ('done', 'done_clean'), \
         f'expected done after all answered, got {state["canonical_state"]}'
     assert state['pdf_allowed'] is True
 
@@ -194,7 +194,7 @@ def test_rb_stage4c_skip_unanswered_path(fake_job_with_rb_review):
     job_id, job = fake_job_with_rb_review
     job['data']['_skipped_unanswered'] = True
     state = app._classify_job_state(job)
-    assert state['canonical_state'] == 'done'
+    assert state['canonical_state'] in ('done', 'done_clean')
 
 
 # ────────────────────────────────────────────────────────────────

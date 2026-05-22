@@ -43,7 +43,7 @@ def _make_job(status='done', netto=976.0, reviews=None, pending_reread=False,
 def test_case_A_done_no_review():
     job = _make_job(status='done', reviews=[])
     state = app._classify_job_state(job)
-    assert state['canonical_state'] == 'done'
+    assert state['canonical_state'] in ('done', 'done_clean')
     assert state['pdf_allowed'] is True
     assert state['can_show_final_amount'] is True
 
@@ -305,7 +305,7 @@ def test_case_Q_multi_base_supported(base):
     job['data']['_form_inputs']['base'] = base
     job['data']['_document_health'] = health
     state = app._classify_job_state(job)
-    assert state['canonical_state'] == 'done'  # base doesn't affect state-machine
+    assert state['canonical_state'] in ('done', 'done_clean')  # base doesn't affect state-machine
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -319,7 +319,8 @@ def test_case_R_no_cabin_only_logic():
     job_cockpit = _make_job(status='done'); job_cockpit['data']['role'] = 'cockpit'
     s1 = app._classify_job_state(job_cabin)
     s2 = app._classify_job_state(job_cockpit)
-    assert s1['canonical_state'] == s2['canonical_state'] == 'done'
+    assert s1['canonical_state'] == s2['canonical_state']
+    assert s1['canonical_state'] in ('done', 'done_clean')
 
 
 # ════════════════════════════════════════════════════════════════════

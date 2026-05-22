@@ -161,7 +161,7 @@ def test_qa_seed_done_returns_correct_state(client, monkeypatch):
                     headers={'X-QA-Seed-Token': 'secret'})
     assert r.status_code == 201
     body = r.get_json()
-    assert body['canonical_state'] == 'done'
+    assert body['canonical_state'] in ('done', 'done_clean')
     assert body['pdf_allowed'] is True
     assert body['download_url'] is not None
     assert body['download_url'].startswith('/api/download/')
@@ -177,7 +177,7 @@ def test_qa_seed_done_session_lookup_via_api(client, monkeypatch):
     r2 = client.get(f'/api/session/{token}')
     assert r2.status_code == 200
     body = r2.get_json()
-    assert body['canonical_state']       == 'done'
+    assert body['canonical_state'] in ('done', 'done_clean')
     assert body['pdf_allowed']           is True
     assert body['can_show_final_amount'] is True
     assert body['can_chat_explain_calculation'] is True

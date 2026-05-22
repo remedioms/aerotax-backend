@@ -33,13 +33,18 @@ def test_canShowPdfDownload_function_exists():
 
 
 def test_canShowPdfDownload_blocks_non_done():
-    """canShowPdfDownload prüft canonical_state==done als Pflicht."""
+    """canShowPdfDownload prüft canonical_state in (done, done_clean, done_with_audit_warnings).
+
+    v14 P0 (2026-05-21): done wurde aufgespalten. PDF darf in beiden done-Varianten,
+    PLUS Backward-Compat mit altem 'done' (für laufende Sessions vor Deploy)."""
     src = _read()
     idx = src.find('window.canShowPdfDownload = function(')
     block = src[idx:idx + 2500]
-    # canonical_state Check
-    assert "canonical_state !== 'done'" in block, \
-        'canShowPdfDownload muss canonical_state==done erzwingen'
+    # State-Gate vorhanden — Form akzeptiert alle 3 erlaubten Werte
+    assert (
+        ("canonical_state !== 'done'" in block)
+        or ("'done_clean'" in block and "'done_with_audit_warnings'" in block)
+    ), 'canShowPdfDownload muss canonical_state gegen done/done_clean/done_with_audit_warnings gaten'
 
 
 def test_canShowPdfDownload_blocks_pdf_not_allowed():
@@ -411,8 +416,11 @@ def test_mini_run_needs_review_blocks_pdf():
     src = _read()
     idx = src.find('window.canShowPdfDownload = function(')
     block = src[idx:idx + 2500]
-    # Alle drei conditions im Block
-    assert "canonical_state !== 'done'" in block
+    # v14 P0: canonical_state-Check akzeptiert done | done_clean | done_with_audit_warnings.
+    assert (
+        ("canonical_state !== 'done'" in block)
+        or ("'done_clean'" in block and "'done_with_audit_warnings'" in block)
+    )
     assert 'pdf_allowed === false' in block
     assert 'pending' in block.lower()
 
