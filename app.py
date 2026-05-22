@@ -3092,6 +3092,25 @@ AEROTAX_ERROR_CODES = {
         'retryable':    False,
         'support':      False,
     },
+    # v14 (2026-05-22) Release-Blocker-Codes
+    'MISSING_HOMEBASE': {
+        'user_title':   'Homebase fehlt',
+        'user_message': 'Bitte gib deine Homebase an, damit Fahrtage und Tourgrenzen korrekt berechnet werden.',
+        'retryable':    False,
+        'support':      False,
+    },
+    'UNSUPPORTED_HOMEBASE': {
+        'user_title':   'Homebase aktuell nicht unterstützt',
+        'user_message': 'AeroTAX ist aktuell für deutsche Steuerlogik freigegeben. Wien (VIE) und Zürich (ZRH) folgen später.',
+        'retryable':    False,
+        'support':      False,
+    },
+    'AUDIT_WARNINGS': {
+        'user_title':   'PDF bereit mit Prüfpunkten',
+        'user_message': 'Deine Auswertung ist berechnet, enthält aber Prüfpunkte.',
+        'retryable':    False,
+        'support':      False,
+    },
 }
 
 # Job-Status (Roh) → canonical_state. Mappings ohne Heuristik;
@@ -3335,6 +3354,46 @@ def _classify_job_state(job, session=None):
             'can_show_final_amount':        False,  # vorläufiger Wert — kein finaler Betrag
         }
     if canonical == 'done':
+        # v14 (2026-05-22) Release-Blocker: Homebase-Sanity-Gate.
+        # Wenn raw_input leer/unbekannt/unsupported (VIE/ZRH ohne DE-Bestätigung)
+        # → needs_document_attention. PDF blockiert, klare User-Message.
+        hb_audit = data.get('_homebase_audit') or {}
+        hb_reason = (hb_audit.get('reason') or '').lower()
+        if hb_reason in ('missing', 'unknown'):
+            return {
+                'canonical_state':              'needs_document_attention',
+                'reason_code':                  'MISSING_HOMEBASE',
+                'user_title':                   'Homebase fehlt',
+                'user_message':                 'Bitte gib deine Homebase an, damit Fahrtage und Tourgrenzen korrekt berechnet werden.',
+                'next_actions':                 [
+                    {'type': 'edit_form', 'label': 'Homebase ergänzen'},
+                    {'type': 'open_chat', 'label': 'Im Chat klären'},
+                ],
+                'pdf_allowed':                  False,
+                'retry_allowed':                False,
+                'support_recommended':          False,
+                'can_chat_explain_calculation': False,
+                'can_show_final_amount':        False,
+                'audit_warnings':               None,
+            }
+        if hb_reason == 'unsupported_country':
+            return {
+                'canonical_state':              'needs_document_attention',
+                'reason_code':                  'UNSUPPORTED_HOMEBASE',
+                'user_title':                   'Homebase aktuell nicht unterstützt',
+                'user_message':                 f'AeroTAX ist aktuell für deutsche Steuerlogik freigegeben. Die Homebase {hb_audit.get("iata") or ""} (AT/CH) wird in einer späteren Version unterstützt.',
+                'next_actions':                 [
+                    {'type': 'edit_form',   'label': 'Andere Homebase wählen'},
+                    {'type': 'open_chat',   'label': 'Im Chat fragen'},
+                    {'type': 'start_new',   'label': 'Neue Auswertung starten'},
+                ],
+                'pdf_allowed':                  False,
+                'retry_allowed':                False,
+                'support_recommended':          False,
+                'can_chat_explain_calculation': False,
+                'can_show_final_amount':        False,
+                'audit_warnings':               None,
+            }
         # v14 P0 (2026-05-21): done → done_clean / done_with_audit_warnings.
         # Audit-Warnungen sind: unresolved_days, vma_unmapped_se, SE-Monate < 12,
         # plausi_issues. Bei warnings bleibt pdf_allowed=True, aber Chat/UI muss
@@ -8795,10 +8854,20 @@ TRINKGELD_PRO_NACHT_BY_YEAR = {
 }
 
 
+SUPPORTED_DE_HOMEBASES = ('FRA', 'MUC', 'BER', 'DUS', 'HAM', 'STR', 'CGN',
+                          'HAJ', 'NUE', 'LEJ', 'TXL', 'SXF', 'BRE')
+UNSUPPORTED_HOMEBASES = ('VIE', 'ZRH')  # AT/CH — eigener Tax-Modus benötigt
+
+
 def _extract_homebase(base_str):
     """Extrahiert IATA-Code aus dem Form-Feld 'base' (z.B. 'Frankfurt (FRA)' → 'FRA').
-    Fallback: FRA wenn nichts erkennbar."""
-    if not base_str: return 'FRA'
+
+    v14 (2026-05-22) Release-Blocker-Fix: KEIN silent FRA-Fallback mehr.
+    Leerer/unbekannter Input → None. Backend MUSS dann auf
+    needs_document_attention pivoten und die UI bei der Eingabe-Klärung helfen.
+    """
+    if not base_str:
+        return None
     m = re.search(r'\(([A-Z]{3})\)', base_str)
     if m: return m.group(1)
     # Direkt 3-Letter-Code?
@@ -8809,11 +8878,24 @@ def _extract_homebase(base_str):
         'frankfurt':'FRA', 'münchen':'MUC', 'munich':'MUC',
         'hamburg':'HAM', 'düsseldorf':'DUS', 'duesseldorf':'DUS',
         'berlin':'BER', 'stuttgart':'STR', 'köln':'CGN', 'koeln':'CGN',
+        'hannover':'HAJ', 'nürnberg':'NUE', 'nuernberg':'NUE',
+        'leipzig':'LEJ', 'bremen':'BRE',
+        'wien':'VIE', 'vienna':'VIE',
+        'zürich':'ZRH', 'zurich':'ZRH', 'zuerich':'ZRH',
     }
     low = base_str.lower()
     for city, iata in city_map.items():
         if city in low: return iata
-    return 'FRA'
+    return None
+
+
+def _is_supported_homebase(iata):
+    """v14 (2026-05-22): True wenn Homebase im aktuellen Release abgedeckt.
+    VIE/ZRH sind erkannt aber NICHT supported — DE-Steuerlogik nicht direkt
+    anwendbar (eigener AT/CH-Modus folgt in späterer Version)."""
+    if not iata:
+        return False
+    return str(iata).upper() in SUPPORTED_DE_HOMEBASES
 
 
 def _parse_flugstunden_deterministic(flug_text, homebase='FRA'):
@@ -14656,7 +14738,7 @@ _SCHEMA_CLASSIFICATION = {
                   'arbeitstage_total', 'audit', '_klass_summary',
                   '_review_items', '_unresolved_days', '_vma_unmapped_se',
                   '_document_health', '_plausi_issues', '_plausi_hard_fails',
-                  '_z77_audit', '_se_completeness',
+                  '_z77_audit', '_se_completeness', '_homebase_audit',
                   '_extra_arbeitstage', '_extra_fahrtage', '_extra_hotelnaechte',
                   '_aerotax_z76_dates_amounts', '_iata_unknown', '_bmf_missing',
                   '_audit_source', '_audit_notes', '_cached_recalc_state',
@@ -19564,11 +19646,91 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 # (an_abreise-Satz, weil keine Übernachtung).
                 se_ort_fix = se.get('stfrei_ort', '')
                 bmf_aus = _bmf(se_ort_fix)
-                eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
-                klass = 'Z76'
-                reason = f'Same-Day Auslandstrip {se_ort_fix} (Z76 >8h)'
-                audit_note = f'{datum}: Same-Day mit Auslands-SE {se_ort_fix} → Z76'
-                print(f"[v8-z76-detail] datum={datum} ort={se_ort_fix} bmf_land={(bmf_aus or {}).get('land','?')} tagtyp=an_abreise amount={eur_added:.2f} reason='Same-Day Auslandstrip'")
+                # HD-A 2026-05-22 (Highest-Defensible) — Mid-Tour-Erkennung
+                # über today.layover_ort. Tibor-Bug: 01-20 HKG/02-14 TYO wurden
+                # als Same-Day klassifiziert (an_abreise 48€/33€) obwohl
+                # today.layover_ort=HKG/HND ein echtes Auslands-Layover-Signal
+                # ist. CAS-Reader hat prev_overnight nicht gesetzt, aber das
+                # layover_ort=foreign ist eine eigenständige source-backed
+                # Tour-Evidence.
+                # Guards (alle nötig, sonst bleibt es Same-Day):
+                #   T1 today.layover_ort != leer
+                #   T2 today.layover_ort kein Inland-Code (Auslands-Sleep)
+                #   T3 today.layover_ort != Homebase
+                #   T4 (Sicherheits-Anker) prev ODER next ist tour-relacioniert:
+                #      - prev_se foreign-stfrei  ODER
+                #      - next_se foreign-stfrei  ODER
+                #      - prev.layover_ort = today.layover_ort  ODER
+                #      - prev_overnight=true
+                today_layover_hd_a = (d.get('layover_ort') or '').upper().strip()
+                hb_up_hd_a = (homebase or 'FRA').upper()
+                _hd_a_t1 = bool(today_layover_hd_a)
+                _hd_a_t2 = _hd_a_t1 and not _is_inland_code(today_layover_hd_a)
+                _hd_a_t3 = _hd_a_t1 and today_layover_hd_a != hb_up_hd_a
+                # T4 — bestimmen ob umgebende Tour-Evidence existiert
+                _prev_se = (prev or {}).get('se') or {}
+                _prev_se_foreign_hd_a = bool(
+                    _prev_se.get('count', 0) > 0
+                    and _prev_se.get('stfrei_inland') is False
+                    and _prev_se.get('stfrei_ort')
+                )
+                _next_se_foreign_hd_a = False
+                if i + 1 < len(sorted_days):
+                    _next_se_hd_a = sorted_days[i + 1].get('se') or {}
+                    _next_se_foreign_hd_a = bool(
+                        _next_se_hd_a.get('count', 0) > 0
+                        and _next_se_hd_a.get('stfrei_inland') is False
+                        and _next_se_hd_a.get('stfrei_ort')
+                    )
+                _prev_layover_matches = bool(
+                    prev and (prev.get('dp') or {}).get('layover_ort', '').upper().strip()
+                    == today_layover_hd_a
+                )
+                _prev_overnight_hd_a = bool(
+                    prev and (prev.get('dp') or {}).get('overnight_after_day')
+                )
+                _hd_a_t4 = (
+                    _prev_se_foreign_hd_a
+                    or _next_se_foreign_hd_a
+                    or _prev_layover_matches
+                    or _prev_overnight_hd_a
+                )
+                _hd_a_qualifies = _hd_a_t1 and _hd_a_t2 and _hd_a_t3 and _hd_a_t4
+                if _hd_a_qualifies and bmf_aus:
+                    eur_added = float((bmf_aus.get('voll_24h', 0) or 0))
+                    klass = 'Z76'
+                    _hd_a_anchor = (
+                        'prev_se_foreign' if _prev_se_foreign_hd_a else
+                        'next_se_foreign' if _next_se_foreign_hd_a else
+                        'prev_layover_match' if _prev_layover_matches else
+                        'prev_overnight'
+                    )
+                    reason = (
+                        f'Mid-Tour Auslandstag {se_ort_fix} '
+                        f'(Z76 Volltag — today.layover={today_layover_hd_a} foreign + '
+                        f'{_hd_a_anchor}; highest-defensible BMF §9 Abs. 4a)'
+                    )
+                    audit_note = (
+                        f'{datum}: HD-A Mid-Tour-Rescue via layover_ort={today_layover_hd_a} '
+                        f'+ {_hd_a_anchor} → voll_24h ({eur_added:.0f}€)'
+                    )
+                    rescues.append({
+                        'datum': datum,
+                        'rescue_type':   'hd_a_midtour_via_foreign_layover',
+                        'rescue_reason': (
+                            f'Same-Day misclassification corrected — today.layover={today_layover_hd_a} '
+                            f'foreign + anchor={_hd_a_anchor}'
+                        ),
+                        'eur': eur_added,
+                    })
+                    print(f"[hd-a-rescue] datum={datum} ort={se_ort_fix} "
+                          f"layover={today_layover_hd_a} anchor={_hd_a_anchor} eur={eur_added}")
+                else:
+                    eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+                    klass = 'Z76'
+                    reason = f'Same-Day Auslandstrip {se_ort_fix} (Z76 >8h)'
+                    audit_note = f'{datum}: Same-Day mit Auslands-SE {se_ort_fix} → Z76'
+                    print(f"[v8-z76-detail] datum={datum} ort={se_ort_fix} bmf_land={(bmf_aus or {}).get('land','?')} tagtyp=an_abreise amount={eur_added:.2f} reason='Same-Day Auslandstrip'")
             else:
                 # v8.19.1 / v8.20.1 — strikte Trennung "duty bekannt" vs "duty fehlt":
                 #
@@ -19735,7 +19897,55 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     mid_tour_by_se = (
                         today_se_foreign and prev_se_foreign and next_se_foreign
                     )
-                    if (is_anreise or is_abreise) and not mid_tour_by_se:
+                    # HD-B 2026-05-22 (Highest-Defensible) — Mid-Tour vor Heimkehr.
+                    # Tibor-Bug 01-05 BLR: An/Ab-Tag (28€) obwohl es Tag 3 einer
+                    # Bangalore-Tour war (prev=BLR-Layover, next=Heimkehr-Issue).
+                    # mid_tour_by_se feuert nicht weil next-Tag (Heimkehr) keine
+                    # foreign-SE-Zeile hat. Aber prev=foreign-layover + heute
+                    # foreign-Layover + next=Heimkehr ist ein eindeutiger
+                    # Mid-Tour-Vor-Heimkehr-Tag.
+                    # Guards (alle nötig):
+                    #   M1 prev existiert + prev.layover_ort=foreign + matches today
+                    #   M2 next existiert + next ist Heimkehr/Issue/same_day-back-home
+                    #   M3 today.layover_ort foreign
+                    _hd_b_prev_layover = ((prev or {}).get('dp', {}).get('layover_ort', '') or '').upper().strip()
+                    # WICHTIG: HD-B greift nur wenn crew HEUTE NACHT noch im
+                    # Ausland übernachtet (d.layover_ort=foreign). Wenn die
+                    # Übernachtung zuhause stattfindet (z.B. last-day-of-tour
+                    # mit FRA-Layover), ist an_abreise korrekt — voll_24h wäre
+                    # falsch (BMF: Übernachtungsort am Tagesende entscheidet).
+                    _hd_b_today_cas_layover = (d.get('layover_ort') or '').upper().strip()
+                    _hd_b_today_overnight_foreign = bool(
+                        _hd_b_today_cas_layover
+                        and not _is_inland_code(_hd_b_today_cas_layover)
+                        and _hd_b_today_cas_layover != (homebase or 'FRA').upper()
+                    )
+                    _hd_b_today_layover_match = (
+                        _hd_b_prev_layover
+                        and _hd_b_prev_layover == today_layover_ort
+                        and not _is_inland_code(_hd_b_prev_layover)
+                        and _hd_b_today_overnight_foreign  # NEU: crew noch im Ausland
+                    )
+                    _hd_b_next_is_heimkehr = False
+                    if i + 1 < len(sorted_days):
+                        _next_dp = (sorted_days[i + 1].get('dp') or {})
+                        _next_routing = _next_dp.get('routing') or []
+                        _next_ends_hb = bool(_next_dp.get('ends_at_homebase'))
+                        # Heimkehr-Signal: next-Tag endet in Homebase ODER hat keine foreign-SE
+                        _next_se_hd_b = sorted_days[i + 1].get('se') or {}
+                        _next_no_foreign = not bool(
+                            _next_se_hd_b.get('count', 0) > 0
+                            and _next_se_hd_b.get('stfrei_inland') is False
+                        )
+                        _hd_b_next_is_heimkehr = _next_ends_hb or _next_no_foreign
+                    _hd_b_qualifies = (
+                        _hd_b_today_layover_match
+                        and _hd_b_next_is_heimkehr
+                        and (is_anreise or is_abreise)
+                        and not mid_tour_by_se
+                    )
+
+                    if (is_anreise or is_abreise) and not mid_tour_by_se and not _hd_b_qualifies:
                         satz = (bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0)
                         pos_lbl = 'An/Ab'
                     else:
@@ -19748,6 +19958,24 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                                   f'(highest-defensible, BMF §9 Abs. 4a)')
                         audit_note = (f'{datum}: Cluster-Boundary überschrieben durch SE-Evidence '
                                       f'(prev+today+next foreign stfrei) → voll_24h')
+                    elif _hd_b_qualifies:
+                        reason = (f'Auslands-Layover {today_layover_ort} (Z76 Volltag) — '
+                                  f'HD-B Mid-Tour vor Heimkehr (prev+today={today_layover_ort} '
+                                  f'foreign, next=Heimkehr)')
+                        audit_note = (f'{datum}: HD-B Mid-Tour-vor-Heimkehr — '
+                                      f'prev.layover={_hd_b_prev_layover} + today.layover='
+                                      f'{today_layover_ort} → voll_24h')
+                        rescues.append({
+                            'datum': datum,
+                            'rescue_type':   'hd_b_midtour_before_heimkehr',
+                            'rescue_reason': (
+                                f'prev.layover={_hd_b_prev_layover} matches today + '
+                                f'next=Heimkehr → Mid-Tour voll_24h'
+                            ),
+                            'eur': eur_added,
+                        })
+                        print(f"[hd-b-rescue] datum={datum} layover={today_layover_ort} "
+                              f"eur={eur_added}")
                     else:
                         reason = f'Auslands-Layover {today_layover_ort} (Z76 {pos_lbl})'
                 classified = True
@@ -21710,8 +21938,18 @@ def hybrid_analyze(form, files, job_id=None):
     Nach jedem Call: gc.collect() + malloc_trim → maximaler Spike <500 MB.
     Rückgabe: {'lsb': {...}, 'se_summary': {...}, 'classification': {...}, 'errors': [...]}"""
     year = int(form.get('year', 2025))
-    homebase = _extract_homebase(form.get('base', 'Frankfurt (FRA)'))
-    print(f"[hybrid_analyze] start pipeline={AEROTAX_PIPELINE_VERSION} year={year} homebase={homebase} job_id={job_id}", flush=True)
+    # v14 (2026-05-22) Release-Blocker-Fix: kein silent FRA-Fallback.
+    # Leere/unbekannte Base → Klassifikator + State müssen das sichtbar machen.
+    raw_base = form.get('base', '')
+    homebase = _extract_homebase(raw_base)
+    homebase_supported = _is_supported_homebase(homebase) if homebase else False
+    # Fallback NUR für die internen Reader-Aufrufe (deren Default-Parameter ist
+    # auch 'FRA') — diese rufen vor Klassifikation, der canonical_state-Branch
+    # unten bestraft fehlende/unsupported Homebase.
+    homebase_effective = (homebase or 'FRA') if homebase_supported else (homebase or 'FRA')
+    print(f"[hybrid_analyze] start pipeline={AEROTAX_PIPELINE_VERSION} year={year} "
+          f"homebase={homebase!r} supported={homebase_supported} job_id={job_id}", flush=True)
+    homebase = homebase_effective  # downstream existing code expects non-None
 
     lsb_bytes = []
     for item in (files.get('lsb') or []):
@@ -22563,6 +22801,18 @@ def _berechne_via_hybrid(form, files, job_id=None):
         # v14 P0 (2026-05-21): SE-Completeness sichtbar — uploaded vs detected vs missing.
         # PII-arm: keine Namen, keine Routings, nur Counts + monatliche Beträge.
         '_se_completeness': (se_sum.get('_se_completeness_audit') or {}),
+        # v14 (2026-05-22) Release-Blocker-Fix: Homebase-Audit für state-machine.
+        '_homebase_audit': {
+            'raw_input':   form.get('base', '') or '',
+            'iata':        homebase,
+            'supported':   _is_supported_homebase(homebase),
+            'reason':      (
+                'missing' if not (form.get('base', '') or '').strip()
+                else ('unsupported_country' if homebase in UNSUPPORTED_HOMEBASES
+                      else 'unknown' if not _is_supported_homebase(homebase)
+                      else 'ok')
+            ),
+        },
     }
 
 

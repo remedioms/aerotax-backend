@@ -11107,7 +11107,8 @@ def test_v11p6_cas_pipeline_default_active_in_hybrid():
     """Bei Default-Flag fließt cas_bytes durch v11-Pfad, nicht DP."""
     src = _read_backend()
     fn_idx = src.find('def hybrid_analyze(')
-    block = src[fn_idx:fn_idx + 16000]
+    # v14 (2026-05-22): Function body grew with Homebase-Safety. Window widened.
+    block = src[fn_idx:fn_idx + 25000]
     # Branch-Reihenfolge: v11 zuerst, v10 elif
     v11_branch = block.find("if use_v11_cas:")
     v10_branch = block.find("elif dp_bytes:")
