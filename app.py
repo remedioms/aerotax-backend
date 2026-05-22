@@ -19292,7 +19292,19 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             # manche Office in Base, für andere on-call zuhause < 8h). Ohne
             # Briefingzeit darf Backend NICHT pauschal Z72 vergeben — sonst
             # falscher Steuer-Anspruch. User-Klärung pro Tag bleibt nötig.
-            if (not overnight and not prev_overnight and not in_cluster_o
+            # v14 (2026-05-22) User-Policy: passive Heimat-Marker (ORTSTAG/FRS/
+            # LMN_AS/LMN_CR/FRD/OF/OFF) ohne Uhrzeit = zuhause = kein AT/FT.
+            # Tibor-Bestätigung: „ORTSTAG = Tage zuhause = kein Arbeitstag".
+            # Finanzamt-konform: ohne Beweis von Anwesenheit am Flughafen darf
+            # kein Fahrtag angerechnet werden.
+            _raw_marker_o = (d.get('raw_marker') or '').upper().strip()
+            _is_passive_home = any(pm in _raw_marker_o for pm in
+                ('ORTSTAG', 'FRS', 'LMN_AS', 'LMN_CR', 'FRD', 'OF', 'OFF'))
+            if _is_passive_home and not duty_known_o:
+                klass = 'Frei'
+                reason = f'Passiv zuhause ({_raw_marker_o or "Marker"}) — kein AT/FT'
+                print(f"[v14-passive-home] datum={datum} marker={_raw_marker_o} → Frei")
+            elif (not overnight and not prev_overnight and not in_cluster_o
                 and not has_active_foreign_se_o
                 and duty_known_o and total_min_o >= SAME_DAY_Z72_TOTAL_MINUTES):
                 klass = 'Z72'
