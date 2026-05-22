@@ -385,6 +385,7 @@ _ALL_FILE_KEYS = (
     'bu', 'haft', 'kv', 'rv', 'leb', 'haus',
     'arzt', 'zahn', 'medi', 'pfle', 'under', 'kata',
     'spen', 'part', 'kind', 'hand', 'haed',
+    'opt_auto',          # v14 (2026-05-22) Single-Dropzone — KI klassifiziert.
 )
 
 # v11 Pipeline-Version-Flag — Phase 6: DEFAULT FLIPPED to v11_cas_primary.
@@ -6204,14 +6205,15 @@ def _chat_dedupe_answer(answer, chat_history):
         return answer
 
     new_norm = _norm(answer)
+    # v14 (2026-05-22): Threshold von 0.80 → 0.92 angehoben (User-Wunsch:
+    # Claude soll smarter sein, weniger templated collapse).
     for prev in prev_assistants:
         prev_norm = _norm(prev.get('content') or '')
         if not prev_norm:
             continue
         ratio = SequenceMatcher(None, new_norm, prev_norm).ratio()
-        if ratio >= 0.80:
-            # Sehr ähnlich → collapse. Wenn es um PDF/Warnings ging,
-            # kurze Bestätigung statt komplette Wiederholung.
+        if ratio >= 0.92:
+            # Wirklich (nahezu) wortgleich → collapse.
             is_pdf_topic = ('pdf' in new_norm or 'prüfpunkt' in new_norm
                             or 'unklar' in new_norm or 'streckeneinsatz' in new_norm
                             or 'audit' in new_norm)
@@ -6240,15 +6242,11 @@ def chat_with_aerotax():
     if not is_review_context and len(message) < 3:
         return jsonify({'error': 'Frage zu kurz'}), 400
 
-    # v8.22 Rest-4: Server-Pre-Filter — Off-Topic ohne LLM-Call ablehnen
-    if _is_off_topic_question(message):
-        off_topic_reply = (
-            'Ich kann dir hier nur bei deiner AeroTAX-Auswertung helfen — '
-            'also bei deinen Unterlagen, offenen Punkten, dem PDF und der '
-            'Übernahme in deine Steuersoftware. Wenn du dazu eine Frage hast, '
-            'bin ich da.'
-        )
-        return jsonify({'reply': off_topic_reply, 'filtered': 'off_topic'}), 200
+    # v14 (2026-05-22): Off-Topic NICHT mehr hart-blocken. Stattdessen
+    # Hinweis-Tag im Prompt — Sonnet entscheidet kontextuell, ob die Frage
+    # wirklich off-topic ist (oft sind „grenzwertige" Fragen legitim, z.B.
+    # „kann ich Spesen rückwirkend einreichen"). User-Wunsch: weniger dumm.
+    off_topic_hint_active = _is_off_topic_question(message)
 
     session = _load_session(token)
     if not session:
@@ -6259,40 +6257,46 @@ def chat_with_aerotax():
             'user_title':   ec['user_title'],
         }), 401
 
-    # v12 Phase A: State-Gate — bei nicht-done Status, KEIN Sonnet-Call.
-    # Stattdessen state-spezifische fixe Antwort, damit Sonnet nicht aus
-    # unvollständigen result_data einen Final-Betrag halluziniert.
-    # Review-Kontext bypasst dieses Gate (User klärt offene Items im Chat).
+    # v14 (2026-05-22) State-Gate: Sonnet bekommt einen STATE-HINWEIS, KEIN
+    # hartes Bypass mehr. Sonnet darf bei nicht-done-Status keine Final-Beträge
+    # behaupten, aber den State erklären, antworten auf Bedienfragen etc.
+    # User-Wunsch: Chat nicht „dumm" templatisiert.
+    state_gate_hint = None
+    job_state = None
     if not is_review_context:
         job_id = session.get('job_id') or ''
-        job_state = None
         if job_id:
             with _jobs_lock:
                 _j = _jobs.get(job_id) or _load_job_from_disk(job_id)
             job_state = _classify_job_state(_j, session)
         if job_state and not job_state['can_chat_explain_calculation']:
-            # State-Gate aktiv: feste freundliche Antwort + Hinweis auf nächste Aktion.
-            gate_replies = {
-                'processing': 'Deine Auswertung läuft noch — sobald sie fertig ist, kann ich dir die Berechnung erklären. Du kannst hier bleiben oder später mit deinem Zugangscode zurückkommen.',
-                'queued':     'Deine Auswertung wartet auf den nächsten freien Worker. Ich melde mich, sobald sie fertig ist.',
-                'failed_retryable': 'Die Auswertung wurde technisch unterbrochen. Du kannst sie kostenlos erneut starten — bevor wir hier weiterreden, sollte sie erst durchlaufen.',
-                'failed_support':   'Ich habe die Auswertung gestoppt, damit kein unsicherer Betrag entsteht. Über den Chat kann ich keine Berechnung erklären — bitte kontaktiere den Support oder starte eine neue Auswertung.',
-                'expired':    'Dein Zugangscode ist abgelaufen. Bitte starte eine neue Auswertung.',
-                'deleted':    'Diese Auswertung wurde gelöscht.',
-                'created':    'Ich warte noch auf deine Dokumente.',
-                'uploaded':   'Deine Dokumente sind da — die Auswertung startet gleich.',
+            # State-Gate-HINWEIS für Sonnet — als Prompt-Pflicht, nicht als Pre-Reply.
+            state_gate_hint = {
+                'canonical_state':  job_state['canonical_state'],
+                'reason_code':      job_state.get('reason_code'),
+                'next_actions':     job_state.get('next_actions') or [],
+                'reason_text':      {
+                    'processing': 'Auswertung läuft noch — du kannst keine Final-Beträge nennen oder Berechnung erklären. Erkläre kurz dass die Pipeline arbeitet und der User entweder warten oder später mit Zugangscode zurückkommen kann.',
+                    'queued':     'Job wartet auf Worker — keine Berechnungs-Aussagen treffen. Sag dass es gleich losgeht.',
+                    'failed_retryable': 'Auswertung technisch unterbrochen. Keine Beträge erfinden. Hilf bei Neustart-Frage.',
+                    'failed_support':   'Auswertung wurde gestoppt damit kein unsicherer Betrag entsteht. Keine Berechnungs-Erklärung möglich. Hilf bei Support-Kontakt.',
+                    'expired':    'Zugangscode abgelaufen. Verweise auf neue Auswertung.',
+                    'deleted':    'Diese Auswertung wurde gelöscht. Verweise auf neue Auswertung.',
+                    'created':    'Dokumente fehlen noch — User soll hochladen.',
+                    'uploaded':   'Dokumente sind da, Auswertung startet gleich.',
+                }.get(job_state['canonical_state'],
+                       'Status nicht eindeutig — nicht Berechnung-erklärend antworten.'),
             }
-            reply_text = gate_replies.get(
-                job_state['canonical_state'],
-                job_state.get('user_message') or 'Aktuell kann ich dir die Berechnung noch nicht erklären.',
-            )
+        # Wenn Sonnet später crasht/fehlt → Sicherheits-Fallback unten greift mit fixer State-Antwort.
+        if False:
             return jsonify({
-                'reply':           reply_text,
+                'reply':           'unreachable',
                 'filtered':        'state_gate',
-                'canonical_state': job_state['canonical_state'],
-                'reason_code':     job_state.get('reason_code'),
+                'canonical_state': job_state.get('canonical_state') if job_state else None,
+                'reason_code':     job_state.get('reason_code') if job_state else None,
                 'next_actions':    job_state.get('next_actions') or [],
             }), 200
+        # end of dead if-False block
 
     # ── COST-CONTROL: Hard-Caps pro Session ──────────────────
     # v8.33: Review-Kontext bypassed Caps & IP-Rate-Limit komplett
@@ -6475,6 +6479,10 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
 {chr(10).join(summary_lines)}
 
 {audit_warning_block}
+
+{('═══ STATE-HINWEIS ═══' + chr(10) + 'canonical_state=' + state_gate_hint['canonical_state'] + chr(10) + 'Regel: ' + state_gate_hint['reason_text']) if state_gate_hint else ''}
+
+{('═══ OFF-TOPIC-HINWEIS ═══' + chr(10) + 'Die User-Frage matched einen Off-Topic-Pattern (Filter sagt: außerhalb AeroTAX-Scope). PRÜFE selbst kontextuell. Wenn wirklich off-topic (Promis/Politik/Programmierung/allgemeines Weltwissen): höflich ablehnen mit dem Standard-Block-Text. Wenn doch AeroTAX-bezogen (z.B. „kann ich Spesen rückwirkend einreichen", „muss ich was als Crew dazu wissen"): NORMAL antworten. Sei nicht starr — der Filter ist heuristisch.') if off_topic_hint_active else ''}
 
 ═══ MARKER-GLOSSAR (Lufthansa Crew-Marker) ═══
 {marker_glossary}
@@ -10813,6 +10821,104 @@ JSON-Antwort, nichts anderes:
                 'file_bytes_list': files[key],
             })
 
+    # ── v14 (2026-05-22) Auto-Klassifikator für `opt_auto`-Uploads ──
+    # Frontend Single-Dropzone schickt Files unter Key `opt_auto`. Sonnet
+    # bekommt jeden Beleg einzeln + die 26 erlaubten Kategorien und entscheidet:
+    # welche Kategorie + welcher Betrag + welcher Zeitraum.
+    auto_files = files.get('opt_auto') or []
+    if auto_files:
+        auto_tuples = _bytes_filename_list(auto_files)
+        print(f"[opt_auto] {len(auto_tuples)} unzugeordnete Belege — KI-Klassifikation läuft")
+        category_keys_with_names = ', '.join(
+            f"{k}={info['name']}" for k, info in WISO_PFADE.items()
+        )
+        for file_bytes, filename in auto_tuples:
+            blocks = file_to_claude_content(file_bytes, filename)
+            if not blocks:
+                results.append({
+                    'key': 'sonstige_beruf', 'icon': '📄',
+                    'name': 'Nicht erkannter Beleg',
+                    'wiso': 'Werbungskosten → Sonstige Werbungskosten',
+                    'hint': 'Datei konnte nicht gelesen werden — bitte manuell prüfen',
+                    'betrag': 0.0, 'zeitraum': '2025',
+                    'beschreibung': f'Datei {filename or "?"} konnte nicht ausgewertet werden.',
+                    'file_bytes_list': [(file_bytes, filename)],
+                    'needs_review': True,
+                })
+                continue
+            blocks.append({
+                'type': 'text',
+                'text': (
+                    f"Du siehst einen Beleg (Datei: {filename or 'unbenannt'}). "
+                    f"Klassifiziere ihn in EINE der folgenden Kategorien:\n\n"
+                    f"{category_keys_with_names}\n\n"
+                    f"Dann: extrahiere den Betrag (Jahresgesamt — bei Monatsrechnung × 12, "
+                    f"bei Quartalsrechnung × 4 usw.). Gib eine kurze Beschreibung mit "
+                    f"Anbieter und Zeitraum.\n\n"
+                    f"Wenn der Beleg KEINE der Kategorien klar zuordbar ist, nimm 'sonstige_beruf' "
+                    f"(= sonstige berufliche Kosten) und setz needs_review:true.\n\n"
+                    f"Antworte NUR mit JSON, keine Backticks:\n"
+                    f'{{"category_key": "tel", "betrag": 468.00, "zeitraum": "2025", '
+                    f'"beschreibung": "Telekom Mobilfunk 39€/Monat × 12", "needs_review": false}}'
+                ),
+            })
+            try:
+                resp = client.messages.create(
+                    model='claude-sonnet-4-6',
+                    max_tokens=400,
+                    messages=[{'role': 'user', 'content': blocks}],
+                )
+                raw = resp.content[0].text.strip()
+                raw = re.sub(r'```json|```', '', raw).strip()
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    m = re.search(r'\{[\s\S]*\}', raw)
+                    parsed = json.loads(m.group(0)) if m else {}
+                cat_key = (parsed.get('category_key') or 'sonstige_beruf').strip().lower()
+                if cat_key not in WISO_PFADE and cat_key != 'sonstige_beruf':
+                    cat_key = 'sonstige_beruf'
+                info = WISO_PFADE.get(cat_key) or {
+                    'name': 'Sonstige berufliche Kosten',
+                    'wiso': 'Werbungskosten → Sonstige Werbungskosten',
+                    'hint': 'Vom KI-Klassifikator nicht eindeutig zugeordnet',
+                    'icon': '📄',
+                }
+                betrag_raw = float(parsed.get('betrag', 0) or 0)
+                needs_review = bool(parsed.get('needs_review', False))
+                # niedrige confidence (betrag 0) → automatisch review
+                if betrag_raw <= 0:
+                    needs_review = True
+                results.append({
+                    'key': cat_key,
+                    'icon': info.get('icon', '📄'),
+                    'name': info.get('name'),
+                    'wiso': info.get('wiso'),
+                    'hint': info.get('hint'),
+                    'betrag': betrag_raw,
+                    'zeitraum': parsed.get('zeitraum', '2025'),
+                    'beschreibung': parsed.get('beschreibung',
+                                                'KI-klassifiziert aus Auto-Upload.'),
+                    'file_bytes_list': [(file_bytes, filename)],
+                    'source_type': 'opt_auto_classifier',
+                    'needs_review': needs_review,
+                })
+                print(f"[opt_auto] {filename or '?'} → {cat_key} ({betrag_raw:.2f}€) "
+                      f"review={needs_review}")
+            except Exception as e:
+                print(f"[opt_auto] {filename or '?'} fail: {str(e)[:120]}")
+                results.append({
+                    'key': 'sonstige_beruf', 'icon': '📄',
+                    'name': 'Nicht erkannter Beleg',
+                    'wiso': 'Werbungskosten → Sonstige Werbungskosten',
+                    'hint': 'KI-Klassifikation fehlgeschlagen — bitte manuell prüfen',
+                    'betrag': 0.0, 'zeitraum': '2025',
+                    'beschreibung': f'KI-Fehler bei {filename or "?"}.',
+                    'file_bytes_list': [(file_bytes, filename)],
+                    'source_type': 'opt_auto_classifier',
+                    'needs_review': True,
+                })
+
     return results
 
 
@@ -11162,6 +11268,11 @@ def _extract_lsb_field_with_evidence(text, line_num, allow_absent=True):
     Strategie: Zeilen finden die mit Zeilennummer beginnen, dann LAST EUR-Wert
     in der Zeile. Mehrere Zeilen → conflict (außer identische Werte).
 
+    v14 (2026-05-22): Wenn die `17.`-Zeile selbst keinen €-Wert hat (mehrzeiliger
+    Bezeichnungs-Text + LGBS-Layout mit Transferticket dazwischen), prüft ein
+    feldspezifischer Anker-Pattern den Wert in den Folge-Zeilen. Verhindert
+    fälschliches `definitely_absent=True` bei Tibor-Style-LSBs.
+
     Returns dict:
       - value: float oder None
       - confidence: 'high' / 'medium' / 'low' / 'conflict'
@@ -11194,6 +11305,30 @@ def _extract_lsb_field_with_evidence(text, line_num, allow_absent=True):
             candidates.append((val, line.strip()))
 
     if not candidates:
+        # v14 (2026-05-22): Anker-Fallback für mehrzeilige LGBS-Layouts.
+        # Beispiel Z17 Tibor-LSB:
+        #   17. Steuerfreie Arbeitgeberleistungen, die auf die
+        #   Transferticket: eh03346xtjm39r50pa4jbpu83tfwd4jy
+        #   Entfernungspauschale anzurechnen sind 330,00
+        # Der "17."-Pattern matched nur die erste Zeile (ohne €). Der Anker
+        # erfasst den Wert in der dritten Zeile sicher.
+        _line_anchors = {
+            17: r'Entfernungspauschale anzurechnen sind\s+([\d.\s]*\d,\d{2})',
+            18: r'Wohnung und 1\. T[äa]tigkeitsst[äa]tte\s+([\d.\s]*\d,\d{2})',
+            20: r'Verpflegungszusch[üu]sse\s+bei\s+Ausw[äa]rtst[äa]tigkeit\s*([\d.\s]*\d,\d{2})',
+        }
+        anchor_pat = _line_anchors.get(int(line_num))
+        if anchor_pat:
+            m = _re.search(anchor_pat, text)
+            if m:
+                val = _eur(m.group(1))
+                if val is not None:
+                    return {
+                        'value': val, 'confidence': 'high',
+                        'definitely_absent': False,
+                        'evidence': {'reason': f'line_{line_num}_via_anchor',
+                                      'raw': m.group(0)[:80]},
+                    }
         if allow_absent:
             return {
                 'value': 0.0, 'confidence': 'high',
@@ -19325,6 +19460,54 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                             )
                             print(f"[bh003b-rescue] datum={datum} layover={_bh003a_layover} "
                                   f"duty={_bh003a_duty}min eur={eur_added}")
+                    # ── BH-003c 2026-05-22: FollowMe Mischfall-Heimkehr-Rescue ──
+                    # Wenn BH-003b mangels routing-evidence nicht greift, aber der Vortag
+                    # ein echter Auslands-Layover war (klass=Z76, layover_ort kein Inland),
+                    # dann ist heute logisch der An-/Abreise-Tag dieses Lands.
+                    # FollowMe macht das genauso („Heimkehr aus Vortag-Land = Z76 An/Ab").
+                    #
+                    # Schmaler Guard-Set (alle müssen erfüllt sein):
+                    #   H1 prev existiert UND prev.layover_ort nicht leer
+                    #   H2 prev.layover_ort kein Inland-Code (echter Auslands-Layover)
+                    #   H3 prev.layover_ort != homebase (kein Heimat-Zirkel)
+                    #   H4 BMF-Mapping liefert ein an_abreise > 0
+                    #   H5 today.reason war 'Heimkehr aus Vortag-Tour' (kein anderer Issue)
+                    #   H6 today klass noch 'Issue' (BH-003b hat nicht schon gefeuert)
+                    #
+                    # Konservativ: Wert = an_abreise (8h-Satz), nicht voll_24h.
+                    # Audit-Eintrag für Transparenz im Rescues-Log.
+                    if klass != 'Z76':
+                        _bh003c_prev_layover = _bh003a_layover  # bereits oben extrahiert
+                        _bh003c_hb_up = _bh003a_hb_up
+                        if (_bh003c_prev_layover                                              # H1
+                            and not _is_inland_code(_bh003c_prev_layover)                    # H2
+                            and _bh003c_prev_layover != _bh003c_hb_up):                      # H3
+                            _bh003c_bmf = _bmf(_bh003c_prev_layover)
+                            _bh003c_eur = float((_bh003c_bmf.get('an_abreise', 0) or 0)
+                                                if _bh003c_bmf else 0)
+                            if _bh003c_eur > 0:                                              # H4
+                                klass = 'Z76'
+                                eur_added = _bh003c_eur
+                                reason = (
+                                    f'BH-003c FollowMe-Heimkehr aus {_bh003c_prev_layover} '
+                                    f'(Z76 An/Ab, ohne routing-evidence)'
+                                )
+                                audit_note = (
+                                    f'{datum}: BH-003c Issue→Z76 Heimkehr aus '
+                                    f'{_bh003c_prev_layover} (FollowMe-Soft-Rescue, '
+                                    f'{_bh003c_eur:.0f}€)'
+                                )
+                                rescues.append({
+                                    'datum': datum,
+                                    'rescue_type':   'bh003c_followme_heimkehr',
+                                    'rescue_reason': (
+                                        f'prev Z76-Layover in {_bh003c_prev_layover} → '
+                                        f'today Z76 An/Ab BMF({_bh003c_prev_layover})'
+                                    ),
+                                    'eur': _bh003c_eur,
+                                })
+                                print(f"[bh003c-rescue] datum={datum} "
+                                      f"prev_layover={_bh003c_prev_layover} eur={_bh003c_eur}")
                     if klass != 'Z76':
                         klass = 'Issue'
                         reason = 'Heimkehr aus Vortag-Tour — separater Tour-Abschluss'
@@ -22123,7 +22306,8 @@ def _berechne_via_hybrid(form, files, job_id=None):
     opt_keys = ['stb','gew','arb','fort','tel','konz',
                 'lapt','fach','reini','bewer',
                 'bu','haft','kv','rv','leb','haus','arzt','zahn','medi','pfle','under',
-                'kata','spen','part','kind','hand','haed']
+                'kata','spen','part','kind','hand','haed',
+                'opt_auto']  # v14: Single-Dropzone — Sonnet klassifiziert
     opt_files = {k: files[k] for k in opt_keys if files.get(k)}
     optionale_belege = parse_optionale_belege(opt_files) if opt_files else []
 
@@ -23692,7 +23876,8 @@ def berechne(form, files, job_id=None):
     opt_keys = ['stb','gew','arb','fort','tel','konz',
                 'lapt','fach','reini','bewer',
                 'bu','haft','kv','rv','leb','haus','arzt','zahn','medi','pfle','under',
-                'kata','spen','part','kind','hand','haed']
+                'kata','spen','part','kind','hand','haed',
+                'opt_auto']  # v14: Single-Dropzone — Sonnet klassifiziert
     opt_files = {k: files[k] for k in opt_keys if files.get(k)}
     optionale_belege = parse_optionale_belege(opt_files) if opt_files else []
 

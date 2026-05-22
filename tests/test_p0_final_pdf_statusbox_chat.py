@@ -349,19 +349,16 @@ def test_user_asks_pdf_once_gets_single_pdf_ready_with_warnings():
         'als Prüfpunkte markiert, 6 Streckeneinsatz-Zeilen ebenfalls. Details '
         'siehe Prüfpunkte-Sektion im PDF.'
     )
-    # Second turn — bot would naively repeat
-    second_repeat = (
-        'Dein PDF ist bereit zur Übernahme in WISO. Beachte: 23 Tage sind '
-        'als Prüfpunkte markiert, 6 Streckeneinsatz-Zeilen ebenfalls.'
-    )
+    # v14 (2026-05-22): Dedupe-Threshold von 0.80 → 0.92 angehoben für smarteren
+    # Chat. Nur nahezu wortgleiche Antworten werden kollabiert. Test verwendet
+    # daher eine fast 1:1 wiederholte Antwort (≥92% ratio).
+    second_repeat = full_first  # vollkommen identische Wiederholung → ratio = 1.0
     history = [
         {'role': 'user',      'content': 'pdf?'},
         {'role': 'assistant', 'content': full_first},
         {'role': 'user',      'content': 'und das pdf jetzt?'},
     ]
     result = app._chat_dedupe_answer(second_repeat, history)
-    # Resultat muss DEUTLICH anders sein als das naive Re-Send, NICHT identisch.
-    # Ob es kürzer oder ein Verweis ist — egal. Hauptsache nicht 1:1 Wiederholung.
     assert result != second_repeat
     assert ('gerade' in result.lower() or 'bereits' in result.lower()
             or 'wie geschrieben' in result.lower())

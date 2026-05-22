@@ -137,8 +137,13 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
 
     # ─── Guards: Negative-Tage müssen Issue/Frei bleiben ────────────────
 
-    def test_bh003a_does_not_apply_to_2025_05_23_duty_330(self):
-        """05-23 LAD-Route, duty 330min < 480 → Guard greift NICHT, bleibt Issue."""
+    def test_bh003c_applies_to_2025_05_23_via_followme_soft_rescue(self):
+        """05-23 LAD-Route, BH-003b-Strict-Guards greifen nicht (kein routing[-1]=FRA),
+        ABER BH-003c (FollowMe-Soft-Rescue) feuert: prev war LAD-Z76-Auslands-Layover,
+        heute Issue mit Heimkehr-Reason → Z76 An/Ab Angola.
+
+        Policy-Wechsel 2026-05-22: User hat sich für FollowMe entschieden ("macht ja
+        Sinn"). Doku: docs/FOLLOWME_AEROTAX_TIBOR_2025_DAY_DIFF.md Pattern A."""
         matched = [
             _make_day('2025-05-22', dp_kwargs={
                 'activity_type': 'tour', 'routing': ['LAD', 'FRA'],
@@ -153,18 +158,21 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
                 'overnight_after_day': False,
                 'starts_at_homebase': True, 'ends_at_homebase': True,
                 'start_time': '00:00', 'end_time': '05:30',
-                'duty_duration_minutes': 330,  # < 480
+                'duty_duration_minutes': 330,  # < 480 — BH-003b nicht
                 'raw_marker': '103703 P1', 'has_fl': False,
             }),
         ]
         result = app_module._deterministic_classify_v7(matched, year=2025, homebase='FRA')
         d = next(t for t in result['tage_detail'] if t['datum'] == '2025-05-23')
-        self.assertNotEqual(d['klass'], 'Z76',
-            f'05-23 darf NICHT Z76 werden (duty 330 < 480). War: {d["klass"]}')
+        # BH-003c FollowMe-Rescue: prev LAD foreign-layover → today Z76 An/Ab Angola
+        self.assertEqual(d['klass'], 'Z76',
+            f'05-23 muss via BH-003c FollowMe-Soft-Rescue Z76 werden. War: {d["klass"]}')
 
-    def test_bh003a_does_not_apply_to_2025_06_03_duty_465_and_not_homebase_end(self):
-        """06-03 SOF→FRA→LHR endet NICHT in Homebase (LHR letzte Etappe).
-        + duty 465min < 480. Beide Guards schützen."""
+    def test_bh003c_applies_to_2025_06_03_via_followme_soft_rescue(self):
+        """06-03 SOF→FRA→LHR, BH-003b-Strict greift nicht (routing endet LHR, nicht FRA),
+        aber BH-003c feuert: prev war SOF-Z76 → today Z76 An/Ab Bulgarien.
+
+        Policy-Wechsel 2026-05-22 zu FollowMe (siehe Pattern A im Doku)."""
         matched = [
             _make_day('2025-06-02', dp_kwargs={
                 'activity_type': 'tour', 'routing': ['GOT', 'FRA', 'SOF'],
@@ -175,18 +183,18 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
             }),
             _make_day('2025-06-03', dp_kwargs={
                 'activity_type': 'same_day',
-                'routing': ['SOF', 'FRA', 'LHR'],   # endet LHR
+                'routing': ['SOF', 'FRA', 'LHR'],
                 'overnight_after_day': False,
                 'starts_at_homebase': True, 'ends_at_homebase': True,
                 'start_time': '03:20', 'end_time': '11:05',
-                'duty_duration_minutes': 465,  # < 480
+                'duty_duration_minutes': 465,
                 'raw_marker': '126533 PU', 'has_fl': False,
             }),
         ]
         result = app_module._deterministic_classify_v7(matched, year=2025, homebase='FRA')
         d = next(t for t in result['tage_detail'] if t['datum'] == '2025-06-03')
-        self.assertNotEqual(d['klass'], 'Z76',
-            f'06-03 darf NICHT Z76 werden (routing endet LHR, duty<480). War: {d["klass"]}')
+        self.assertEqual(d['klass'], 'Z76',
+            f'06-03 muss via BH-003c FollowMe-Soft-Rescue Z76 werden. War: {d["klass"]}')
 
     def test_bh003b_z76_via_routing_evidence_alone_2025_10_28(self):
         """2026-05-21: BH-003a → BH-003b. Routing-Evidence (TLV layover →
@@ -247,8 +255,13 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
         d = next(t for t in result['tage_detail'] if t['datum'] == '2025-04-05')
         self.assertEqual(d['klass'], 'Z76', f'duty 300<480 aber Routing-Evidence komplett → Z76. War: {d["klass"]}')
 
-    def test_bh003a_requires_routing_from_layover_to_homebase(self):
-        """Wenn routing[0] != prev.layover_ort → kein BH-003a."""
+    def test_bh003c_overrides_strict_routing_requirement(self):
+        """BH-003b-Strict braucht routing[0]==prev.layover_ort. Wenn das fehlt,
+        greift seit 2026-05-22 die FollowMe-Soft-Variante BH-003c — Vortag-
+        Auslands-Layover allein genügt für Z76 An/Ab.
+
+        Vorher (alt-konservativ): wenn routing[0]=DEL ≠ prev.layover_ort=BLR
+        → Issue. Jetzt: BH-003c rescued zu Z76 Indien-Bangalore."""
         matched = [
             _make_day('2025-04-04', dp_kwargs={
                 'activity_type': 'tour', 'routing': ['BLR'],
@@ -257,7 +270,7 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
             }),
             _make_day('2025-04-05', dp_kwargs={
                 'activity_type': 'same_day',
-                'routing': ['DEL', 'FRA'],  # nicht von BLR!
+                'routing': ['DEL', 'FRA'],
                 'overnight_after_day': False,
                 'starts_at_homebase': True, 'ends_at_homebase': True,
                 'duty_duration_minutes': 600,
@@ -266,11 +279,12 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
         ]
         result = app_module._deterministic_classify_v7(matched, year=2025, homebase='FRA')
         d = next(t for t in result['tage_detail'] if t['datum'] == '2025-04-05')
-        self.assertNotEqual(d['klass'], 'Z76',
-            f'routing[0]=DEL != prev.layover_ort=BLR → kein Z76. War: {d["klass"]}')
+        self.assertEqual(d['klass'], 'Z76',
+            f'BH-003c muss zuschlagen (prev BLR foreign-layover). War: {d["klass"]}')
 
-    def test_bh003a_requires_ends_at_homebase(self):
-        """Wenn ends_at_homebase=False → kein BH-003a."""
+    def test_bh003c_overrides_ends_at_homebase_requirement(self):
+        """BH-003b-Strict braucht ends_at_homebase=True. BH-003c (FollowMe) ist
+        toleranter — Vortag-Layover-Land genügt. Policy 2026-05-22."""
         matched = [
             _make_day('2025-04-04', dp_kwargs={
                 'activity_type': 'tour', 'routing': ['BLR'],
@@ -280,14 +294,60 @@ class TestBH003aIssueReturnDayZ76(unittest.TestCase):
             _make_day('2025-04-05', dp_kwargs={
                 'activity_type': 'same_day', 'routing': ['BLR', 'FRA'],
                 'overnight_after_day': False,
-                'starts_at_homebase': True, 'ends_at_homebase': False,  # NICHT zuhause
+                'starts_at_homebase': True, 'ends_at_homebase': False,
                 'duty_duration_minutes': 600,
                 'raw_marker': '999', 'has_fl': False,
             }),
         ]
         result = app_module._deterministic_classify_v7(matched, year=2025, homebase='FRA')
         d = next(t for t in result['tage_detail'] if t['datum'] == '2025-04-05')
-        self.assertNotEqual(d['klass'], 'Z76', f'ends_hb=False → kein Z76. War: {d["klass"]}')
+        self.assertEqual(d['klass'], 'Z76',
+            f'BH-003c muss zuschlagen trotz ends_hb=False. War: {d["klass"]}')
+
+    def test_bh003c_does_NOT_apply_when_prev_layover_is_homebase(self):
+        """BH-003c hat H3-Guard: prev.layover_ort != homebase. Schützt gegen
+        Heimat-Zirkel."""
+        matched = [
+            _make_day('2025-04-04', dp_kwargs={
+                'activity_type': 'tour', 'routing': ['FRA'],
+                'layover_ort': 'FRA',  # HOMEBASE — kein echter Auslands-Layover
+                'overnight_after_day': True,
+                'duty_duration_minutes': 800, 'has_fl': True,
+            }),
+            _make_day('2025-04-05', dp_kwargs={
+                'activity_type': 'same_day', 'routing': ['FRA'],
+                'overnight_after_day': False,
+                'starts_at_homebase': True, 'ends_at_homebase': True,
+                'duty_duration_minutes': 200,
+                'raw_marker': '999', 'has_fl': False,
+            }),
+        ]
+        result = app_module._deterministic_classify_v7(matched, year=2025, homebase='FRA')
+        d = next(t for t in result['tage_detail'] if t['datum'] == '2025-04-05')
+        self.assertNotEqual(d['klass'], 'Z76',
+            f'prev.layover=homebase → BH-003c darf NICHT zuschlagen. War: {d["klass"]}')
+
+    def test_bh003c_does_NOT_apply_when_prev_layover_is_inland(self):
+        """BH-003c hat H2-Guard: prev.layover_ort kein Inland-Code (kein Ausland)."""
+        matched = [
+            _make_day('2025-04-04', dp_kwargs={
+                'activity_type': 'tour', 'routing': ['MUC'],
+                'layover_ort': 'MUC',  # Inland
+                'overnight_after_day': True,
+                'duty_duration_minutes': 600, 'has_fl': True,
+            }),
+            _make_day('2025-04-05', dp_kwargs={
+                'activity_type': 'same_day', 'routing': ['MUC'],
+                'overnight_after_day': False,
+                'starts_at_homebase': True, 'ends_at_homebase': True,
+                'duty_duration_minutes': 300,
+                'raw_marker': '999', 'has_fl': False,
+            }),
+        ]
+        result = app_module._deterministic_classify_v7(matched, year=2025, homebase='FRA')
+        d = next(t for t in result['tage_detail'] if t['datum'] == '2025-04-05')
+        self.assertNotEqual(d['klass'], 'Z76',
+            f'prev.layover=Inland(MUC) → BH-003c darf NICHT Z76 setzen. War: {d["klass"]}')
 
     # ─── No-side-effect ─────────────────────────────────────────────────
 
