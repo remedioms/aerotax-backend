@@ -2988,7 +2988,9 @@ AEROTAX_ERROR_CODES = {
     # ── Server-Probleme (retryable) ────────────────────────────────────────
     'WORKER_RESTARTED': {
         'user_title':   'Auswertung unterbrochen',
-        'user_message': 'Der Server wurde während der Auswertung neu gestartet. Deine Dokumente sind noch da — du kannst die Auswertung erneut starten.',
+        # v14 (2026-05-23): Ehrlich — Dokumente sind NICHT serverseitig persistiert.
+        # Bei Restart/Crash sind die Bytes weg, User muss neu hochladen.
+        'user_message': 'Die Auswertung wurde unterbrochen. Bitte lade deine Dokumente erneut hoch und starte neu — du wirst dafür nicht doppelt belastet.',
         'retryable':    True,
         'support':      False,
     },
@@ -3171,6 +3173,12 @@ def _classify_failure_reason(job):
     if ('attributeerror' in error_low and
         ('tuple' in error_low or 'list' in error_low or 'nonetype' in error_low) and
         'get' in error_low):
+        return 'CLASSIFICATION_SCHEMA_FAILED'
+    # v14 (2026-05-23): NameError / "name 'X' is not defined" sind Code-Bugs
+    # (Scope-Lücke, refactoring-Residue). Wiederholen führt zum gleichen Crash —
+    # also kein User-Retry, sondern Support-Pfad. Beispiel-Bug: homebase nicht
+    # in _berechne_via_hybrid definiert (v14 Release-Blocker 42dddc1 → 7272e82).
+    if 'nameerror' in error_low or 'is not defined' in error_low:
         return 'CLASSIFICATION_SCHEMA_FAILED'
     # _PipelineSchemaError (von _validate_pipeline_shape) → Schema-Verstoß explizit
     if 'pipelineschemaerror' in error_low or 'expected dict, got tuple' in error_low \
