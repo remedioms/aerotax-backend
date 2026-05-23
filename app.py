@@ -22432,6 +22432,9 @@ def _berechne_via_hybrid(form, files, job_id=None):
     cls = (hr or {}).get('classification') or {}
     se_sum = (hr or {}).get('se_summary') or {}
     errors = (hr or {}).get('errors') or []
+    # v14 (2026-05-23) Fix: homebase wird unten im _homebase_audit referenziert
+    # — muss in dieser Funktion ableitbar sein (war Copy-Paste-Lücke aus 42dddc1).
+    homebase = _extract_homebase(form.get('base', '') or '') or 'FRA'
 
     # Mindestanforderung: Klassifikation muss da sein (sonst keine Werbungskosten möglich)
     if not cls or cls.get('arbeitstage', 0) == 0:
