@@ -20078,17 +20078,36 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                                 if cand and not _is_inland_code(cand):
                                     target_iata = cand
                                     break
-                        klass = 'Z76'
-                        bmf_aus = _bmf(target_iata)
-                        if is_anreise or is_abreise:
-                            eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
-                            position = 'An/Ab'
+                        # v14 (2026-05-24) FollowMe-Diff-Fix Pattern A: Wenn das Ziel-Land
+                        # nicht aus dem Cluster ermittelbar ist (target_iata leer), ist
+                        # die Z76-Pauschale ein Raten mit Default 28€. FollowMe behandelt
+                        # Anreise/Abreise-Tage mit Homebase-Stempel und unbekanntem Ziel
+                        # konservativ als Inland (Z73, 14€). Tibor 2025: 3 Tage betroffen
+                        # (2025-03-29 BOM-Anreise, 2025-04-08 SEL-Anreise, 2025-10-05 SEL-
+                        # Anreise) — AeroTAX-Output Z76, FollowMe Deutschland 14€.
+                        # Volltage (Mid-Tour) ohne erkanntes Ziel bleiben Z76 (Default
+                        # 28€), weil dort die Übernachtung im Ausland faktisch stattfand.
+                        if not target_iata and (is_anreise or is_abreise):
+                            klass = 'Z73'
+                            eur_added = INLAND_AN_ABREISE
+                            reason = (f'Auslandstour-An/Ab (Homebase-Stempel {today_layover_ort}, '
+                                      f'Ziel unbekannt → konservativ Inland) Z73')
+                            audit_note = (f'{datum}: Homebase-Stempel {today_layover_ort} + '
+                                          f'kein target_iata → Z73 statt Z76-Default')
+                            print(f"[v14-conservative-z73] datum={datum} stempel={today_layover_ort} "
+                                  f"reason='target_iata leer auf An/Ab → Z73 statt Z76 28€'")
                         else:
-                            eur_added = float((bmf_aus.get('voll_24h', 0) if bmf_aus else 28.0) or 0)
-                            position = 'Volltag'
-                        reason = f'Auslandstour-{position} (Homebase-Stempel {today_layover_ort}, Ziel {target_iata or "?"}) Z76'
-                        audit_note = f'{datum}: Homebase-SE-Stempel {today_layover_ort} bei Auslands-Cluster — als Z76 {position}'
-                        print(f"[v8-inland-blocked-foreign-cluster] datum={datum} stempel={today_layover_ort} reason='Homebase-Stempel auf Auslandstour — kein Z73/Z74'")
+                            klass = 'Z76'
+                            bmf_aus = _bmf(target_iata)
+                            if is_anreise or is_abreise:
+                                eur_added = float((bmf_aus.get('an_abreise', 0) if bmf_aus else 28.0) or 0)
+                                position = 'An/Ab'
+                            else:
+                                eur_added = float((bmf_aus.get('voll_24h', 0) if bmf_aus else 28.0) or 0)
+                                position = 'Volltag'
+                            reason = f'Auslandstour-{position} (Homebase-Stempel {today_layover_ort}, Ziel {target_iata or "?"}) Z76'
+                            audit_note = f'{datum}: Homebase-SE-Stempel {today_layover_ort} bei Auslands-Cluster — als Z76 {position}'
+                            print(f"[v8-inland-blocked-foreign-cluster] datum={datum} stempel={today_layover_ort} reason='Homebase-Stempel auf Auslandstour — kein Z73/Z74'")
                 elif not classified and is_volltag:
                     # Echter Inland-Volltag (Inland-Layover ≠ Homebase, oder reiner Inland-Cluster)
                     klass = 'Z74'
