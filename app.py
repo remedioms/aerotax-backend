@@ -21973,6 +21973,9 @@ def hybrid_analyze(form, files, job_id=None):
             se_bytes.append(item)
             se_filenames_redacted.append(f'se_{len(se_filenames_redacted)+1}.pdf')
     uploaded_se_files_count = len(se_bytes)
+    # v14 (2026-05-23): Upload-Counts früh cachen — Memory-Cleanup setzt files
+    # auf None bevor _berechne_via_hybrid die fehlende-Dokumente-Liste baut.
+    uploaded_lsb_files_count = len(lsb_bytes)
     dp_bytes = []
     for item in (files.get('dp') or []):
         dp_bytes.append(item[0] if isinstance(item, tuple) else item)
@@ -22423,6 +22426,13 @@ def hybrid_analyze(form, files, job_id=None):
         'se_summary': se_summary,
         'classification': classification,
         'errors': errors,
+        # v14 (2026-05-23): Upload-Counts — gecacht VOR Memory-Cleanup damit
+        # _berechne_via_hybrid die "Fehlende Dokumente"-Liste korrekt baut.
+        '_uploaded_counts': {
+            'lsb': uploaded_lsb_files_count,
+            'se':  uploaded_se_files_count,
+            'cas': len(cas_filenames),
+        },
     }
 
 
@@ -22653,16 +22663,22 @@ def _berechne_via_hybrid(form, files, job_id=None):
         _seen = set()
         notes = [n for n in notes if not (n in _seen or _seen.add(n))]
 
-    # Uploaded-Summary
+    # v14 (2026-05-23) Fix: nutze gecachte Counts aus hybrid_analyze — files
+    # wurden für Memory-Cleanup auf None gesetzt, files.get(...) lügt.
+    # Plus: v11 Upload-Contract ist LSB + SE + CAS (Dienstplan/CAS), KEIN
+    # "Flugstunden-Übersichten" mehr — das war Legacy bis v10.
+    _uc = (hr or {}).get('_uploaded_counts') or {}
     uploaded_summary = []
     not_uploaded = []
-    if files.get('lsb'):  uploaded_summary.append(f"LSB ({len(files['lsb'])} Datei(en))")
-    else: not_uploaded.append("Lohnsteuerbescheinigung")
-    if files.get('dp'):   uploaded_summary.append(f"Flugstunden ({len(files['dp'])} Datei(en))")
-    else: not_uploaded.append("Flugstunden-Übersichten")
-    if files.get('se'):   uploaded_summary.append(f"Streckeneinsatz ({len(files['se'])} Datei(en))")
-    else: not_uploaded.append("Streckeneinsatz-Abrechnungen")
-    if files.get('einsatz'): uploaded_summary.append(f"Einsatzplan ({len(files['einsatz'])} Datei(en))")
+    _lsb_n = int(_uc.get('lsb') or 0)
+    _se_n  = int(_uc.get('se')  or 0)
+    _cas_n = int(_uc.get('cas') or 0)
+    if _lsb_n: uploaded_summary.append(f"LSB ({_lsb_n} Datei(en))")
+    else:      not_uploaded.append("Lohnsteuerbescheinigung")
+    if _cas_n: uploaded_summary.append(f"Dienstplan/CAS ({_cas_n} Datei(en))")
+    else:      not_uploaded.append("Dienstplan/CAS")
+    if _se_n:  uploaded_summary.append(f"Streckeneinsatz ({_se_n} Datei(en))")
+    else:      not_uploaded.append("Streckeneinsatz-Abrechnungen")
 
     # ── Confidence (vereinheitlicht: KI-Hauptpfad → 90 als sane default) ──
     confidence = {
