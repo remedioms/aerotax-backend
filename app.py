@@ -393,6 +393,49 @@ _ALL_FILE_KEYS = (
 # Notfall-Rollback: AEROTAX_PIPELINE_VERSION=v10_legacy als Render-ENV setzen.
 AEROTAX_PIPELINE_VERSION = os.environ.get('AEROTAX_PIPELINE_VERSION', 'v11_cas_primary')
 
+# ════════════════════════════════════════════════════════════════════════════
+# v15 (2026-05-25) ARCHITEKTUR-RESET: Defensive Hotfix Feature-Flags
+# ════════════════════════════════════════════════════════════════════════════
+# Diese Flags sind Defaults OFF — kein Behavior-Change baseline. Sie existieren
+# damit das normalized_tours-Modul (Task #222) graduell den Klassifikator
+# ersetzen kann ohne die Production zu brechen.
+#
+# Tibor 2025 Diff zeigt drei strukturelle Probleme im Pattern-basierten
+# Klassifikator:
+#   - BH-003c FollowMe-Heimkehr-Rescue erzeugt 13 Phantom-Z76-Tage (+~600€)
+#   - Standby zuhause wird als Reinigungstag gezählt (+18 Tage Reinigung)
+#   - Hotelnächte werden für Tage ohne echte FL-Layover-Evidence gezählt
+#
+# Diese Flags entkoppeln den Hotfix vom Rest des Codes:
+# ────────────────────────────────────────────────────────────────────────────
+
+# Wenn '1': BH-003c-Rescue (FollowMe-Heimkehr ohne routing-evidence) wird
+# komplett übersprungen. Der Tag bleibt 'Issue', sichtbar im Audit.
+# Default '0' (baseline) — Rescue läuft wie bisher. Aktivieren für Hotfix.
+AEROTAX_BH003C_RESCUE_DISABLED = os.environ.get(
+    'AEROTAX_BH003C_RESCUE_DISABLED', '0') == '1'
+
+# Wenn '1': Hotel-Nacht wird nur gezählt wenn der Tag entweder
+#   - eine echte LH-Flight-Routing-Evidence hat (routing nicht leer + LH/Zahlen)
+#   - ODER vom CAS als overnight_after_day=True UND has_real_duty=True markiert
+# OHNE diese Evidence: kein hotel_naechte-Counter-Increment, audit-warning gesetzt.
+# Default '0' — Hotel-Counter läuft wie bisher.
+AEROTAX_STRICT_HOTEL_NIGHTS = os.environ.get(
+    'AEROTAX_STRICT_HOTEL_NIGHTS', '0') == '1'
+
+# Wenn '1': Klass='Standby' (home standby ohne Aktivierung) zählt nicht mehr
+# als Reinigungstag. Bei aktiviertem Standby (klass=Z76/Z73/Z74 oder Office mit
+# duty) bleibt der Reinigungstag-Counter.
+# Default '0' — Reinigung folgt Arbeitstage wie bisher.
+AEROTAX_STRICT_CLEANING_DAYS = os.environ.get(
+    'AEROTAX_STRICT_CLEANING_DAYS', '0') == '1'
+
+# Wenn '1': normalized_tours-Modul wird parallel zum alten Klassifikator
+# ausgeführt, Output landet in result-dict als '_normalized_tours_audit'.
+# Default '0' — normalized_tours wird nicht aufgerufen.
+AEROTAX_USE_NORMALIZED_TOURS = os.environ.get(
+    'AEROTAX_USE_NORMALIZED_TOURS', '0') == '1'
+
 # v11 B-015: Chunk-Persistence-Flag.
 # v10.4 hatte job_chunks-Persistierung eingeführt, um bei großem DP-Reader (~200
 # Seiten) RAM zu schonen + nach Restart resumen zu können. v11 CAS-Reader macht
@@ -12140,6 +12183,42 @@ REGELN (Hard):
 
 LIEFERE via Tool 'submit_cas_days'."""
 
+    # R14 (2026-05-26) — Reader-V2 unter Feature-Flag AEROTAX_CAS_READER_V2.
+    # R20 (2026-05-26) — V2-TOOL-SCHEMA produktiv: Sonnet liefert direkt
+    # is_tour_continuation / is_tour_return / tour_context_hint, kein Heuristik-
+    # Raten mehr im Postprocessor. Bei V2 wird das Tool ausgetauscht.
+    _v2_active = False
+    _v2_tool_name = 'submit_cas_days'  # default V1
+    _v2_validator_fn = None
+    try:
+        from cas_reader_v2_spec import (
+            V2_PROMPT_INSTRUCTIONS as _V2_INSTR,
+            is_v2_enabled as _is_v2_enabled,
+            get_v2_json_schema as _get_v2_schema,
+            validate_cas_reader_v2_day as _v2_validate_day,
+        )
+        if _is_v2_enabled():
+            _v2_active = True
+            prompt = prompt + "\n\n" + _V2_INSTR
+            # V2-Tool ersetzt V1-Tool (Sonnet sieht jetzt V2-Schema mit
+            # is_tour_continuation, tour_context_hint etc.)
+            _v2_schema_full = _get_v2_schema()
+            cas_tool = {
+                'name': 'submit_cas_days_v2',
+                'description': 'CAS-Reader V2 — Tour-Context-aware, mit '
+                               'is_tour_return/is_tour_continuation Hints.',
+                'input_schema': _v2_schema_full,
+            }
+            _v2_tool_name = 'submit_cas_days_v2'
+            _v2_validator_fn = _v2_validate_day
+            print(f"[CAS-Reader] {source_filename[:40]}: V2-TOOL aktiv (Tour-Hints im Schema)")
+    except Exception as _e:
+        # cas_reader_v2_spec ist optional — bei Import-Fehler stillschweigend
+        # mit V1 weiter (kein Crash der Production-Pipeline).
+        print(f"[CAS-Reader] V2-Spec-Import fail: {type(_e).__name__}: {str(_e)[:120]}")
+        _v2_active = False
+        _v2_tool_name = 'submit_cas_days'
+
     if use_text_path:
         # v11 Text-Pfad: pdfplumber-Text als plain text statt PDF-Bytes.
         # Spart Vision-Latency + ~50 KB base64 im Memory.
@@ -12163,7 +12242,7 @@ LIEFERE via Tool 'submit_cas_days'."""
             model='claude-sonnet-4-6',
             max_tokens=_max_tokens,
             tools=[cas_tool],
-            tool_choice={'type': 'tool', 'name': 'submit_cas_days'},
+            tool_choice={'type': 'tool', 'name': _v2_tool_name},
             messages=[{'role': 'user', 'content': content}],
         )
 
@@ -12204,10 +12283,11 @@ LIEFERE via Tool 'submit_cas_days'."""
 
     # Tool-Output extrahieren
     tool_input = None
+    _accepted_tool_names = (_v2_tool_name, 'submit_cas_days', 'submit_cas_days_v2')
     for block in (resp.content if resp else []):
         btype = getattr(block, 'type', None) if not isinstance(block, dict) else block.get('type')
         bname = getattr(block, 'name', None) if not isinstance(block, dict) else block.get('name')
-        if btype == 'tool_use' and (bname == 'submit_cas_days' or bname is None):
+        if btype == 'tool_use' and (bname in _accepted_tool_names or bname is None):
             tool_input = block.get('input') if isinstance(block, dict) else getattr(block, 'input', None)
             if tool_input: break
     if not tool_input:
@@ -12221,24 +12301,182 @@ LIEFERE via Tool 'submit_cas_days'."""
     # Per-Day-Validation + Sanity
     days_normalized = []
     sanity_warnings = []
+    _v2_validation_errors = []
     for d in days_raw:
-        ok, normalized, warn = _validate_cas_day(d)
-        if ok and normalized:
-            days_normalized.append(normalized)
-        if warn:
-            sanity_warnings.append(warn)
+        if _v2_active and _v2_validator_fn is not None:
+            # R20 V2-Pfad: Sonnet liefert V2-Schema-Felder direkt. Validate
+            # gegen V2-Schema. Normalize zu builder-kompatibler Form.
+            _val = _v2_validator_fn(d)
+            if _val.get('errors'):
+                _v2_validation_errors.extend(_val['errors'])
+                # Log first 2 errors per day
+                for e in _val['errors'][:2]:
+                    sanity_warnings.append(f"{d.get('datum') or d.get('date')}: V2-validator: {e}")
+            normalized = _normalize_cas_day_v2(d)
+            if normalized:
+                days_normalized.append(normalized)
+        else:
+            ok, normalized, warn = _validate_cas_day(d)
+            if ok and normalized:
+                days_normalized.append(normalized)
+            if warn:
+                sanity_warnings.append(warn)
 
     warnings_combined = [str(w) for w in warnings_raw] + sanity_warnings
 
     print(f"[Sonnet-CAS] {source_filename[:40]}: {len(days_normalized)} Tage normalisiert "
-          f"(Monat={month_covered}, {len(warnings_combined)} Warnungen)")
+          f"(Monat={month_covered}, {len(warnings_combined)} Warnungen, "
+          f"v2_errors={len(_v2_validation_errors) if _v2_active else 'n/a'})")
 
-    return {
+    result = {
         'days': days_normalized,
         'warnings': warnings_combined,
         'month_covered': month_covered,
         'source_filename': source_filename,
     }
+    result['_v2_active'] = _v2_active
+    result['_v2_prompt_appended'] = _v2_active
+    result['_v2_tool_used'] = _v2_tool_name
+    result['_v2_validation_errors_count'] = len(_v2_validation_errors) if _v2_active else 0
+    return result
+
+
+def _normalize_cas_day_v2(day_dict):
+    """R20 — V2-Reader-Output → builder-kompatibles dict. Verlustfrei:
+    V2-Felder werden mitgeführt (tour_context_hint, is_tour_continuation, etc.),
+    plus die V1-Felder die der Postprocessor + Bridge erwarten."""
+    if not isinstance(day_dict, dict):
+        return None
+    datum = day_dict.get('datum') or day_dict.get('date') or ''
+    import re as _re
+    if not _re.match(r'^\d{4}-\d{2}-\d{2}$', datum):
+        return None
+    # V2-Activity-Types → V1-CAS-Activity-Types map (für downstream-Compat)
+    v2_act = (day_dict.get('activity_type') or '').lower().strip()
+    if v2_act in ('tour_departure', 'tour_mid', 'tour_return',
+                  'tour_continuation'):
+        legacy_act = 'flight'
+    elif v2_act in ('office', 'training'):
+        legacy_act = v2_act
+    elif v2_act in ('home_standby', 'airport_standby'):
+        legacy_act = 'standby'
+    elif v2_act in ('free', 'off'):
+        legacy_act = 'free'
+    elif v2_act == 'urlaub':
+        legacy_act = 'vacation'
+    elif v2_act in ('krank', 'sick'):
+        legacy_act = 'sick'
+    elif v2_act == 'unknown_tour_context':
+        legacy_act = 'unknown'
+    else:
+        legacy_act = 'unknown'
+
+    flight_numbers = day_dict.get('flight_numbers') or []
+    routing_iatas  = day_dict.get('routing_iatas') or []
+    # Builder erwartet routing[] mit IATAs + flight-numbers gemischt
+    routing_combined = []
+    for r in routing_iatas:
+        if isinstance(r, str) and r.strip():
+            routing_combined.append(r.strip().upper())
+    for f in flight_numbers:
+        if isinstance(f, str) and f.strip():
+            routing_combined.append(f.strip())
+
+    # duty_minutes oder via duty_start/end
+    duty_min = day_dict.get('duty_minutes')
+    if duty_min is None:
+        ds = str(day_dict.get('duty_start_time') or '')[:6]
+        de = str(day_dict.get('duty_end_time') or '')[:6]
+        if ds and de and ':' in ds and ':' in de:
+            try:
+                sh, sm = ds.split(':', 1); eh, em = de.split(':', 1)
+                duty_min = max(0, (int(eh)*60+int(em)) - (int(sh)*60+int(sm)))
+            except Exception:
+                duty_min = 0
+        else:
+            duty_min = 0
+
+    layover_iata = (day_dict.get('layover_iata') or '').strip().upper()
+    starts_at_hb = bool(day_dict.get('starts_at_homebase'))
+    ends_at_hb   = bool(day_dict.get('ends_at_homebase'))
+
+    out = {
+        # V1-Compat-Felder für downstream-Legacy-Klassifikator
+        'date': datum, 'datum': datum,
+        'activity_type': legacy_act,
+        'marker': str(day_dict.get('normalized_marker')
+                      or day_dict.get('raw_marker') or '')[:60],
+        'marker_raw': str(day_dict.get('raw_marker') or '')[:60],
+        'start_time': str(day_dict.get('duty_start_time') or '')[:6],
+        'end_time':   str(day_dict.get('duty_end_time') or '')[:6],
+        'duration_minutes': int(duty_min or 0),
+        'duty_duration_minutes': int(duty_min or 0),
+        'location': (routing_iatas[0].strip().upper()
+                     if routing_iatas and isinstance(routing_iatas[0], str) else ''),
+        'routing': routing_combined,
+        'flights': [{'flight_no': f} for f in flight_numbers if isinstance(f, str) and f.strip()],
+        'flight_numbers': flight_numbers,
+        'routing_iatas': routing_iatas,
+        'overnight_after_day': bool(day_dict.get('overnight_after_day')),
+        'layover_ort':  layover_iata,
+        'layover_iata': layover_iata,
+        'starts_at_homebase': starts_at_hb,
+        'ends_at_homebase':   ends_at_hb,
+        'has_fl':       (legacy_act == 'flight') or bool(flight_numbers),
+        'confidence':   str(day_dict.get('confidence') or 'high'),
+        # V2-spezifische Hints durchreichen — Builder/Postprocessor respektieren sie
+        'is_tour_departure':     bool(day_dict.get('is_tour_departure')),
+        'is_tour_continuation':  bool(day_dict.get('is_tour_continuation')),
+        'is_tour_return':        bool(day_dict.get('is_tour_return')),
+        'return_from_layover':   bool(day_dict.get('return_from_layover')),
+        'has_flight_segment':    bool(day_dict.get('has_flight_segment')),
+        'tour_context_hint':     day_dict.get('tour_context_hint') or 'unclear',
+        'tour_context_confidence': day_dict.get('tour_context_confidence') or 'low',
+        'origin_iata':           (day_dict.get('origin_iata') or '').strip().upper() or None,
+        'destination_iata':      (day_dict.get('destination_iata') or '').strip().upper() or None,
+        'previous_layover_iata': (day_dict.get('previous_layover_iata') or '').strip().upper() or None,
+        'next_layover_iata':     (day_dict.get('next_layover_iata') or '').strip().upper() or None,
+        'briefing_time':         str(day_dict.get('briefing_time') or '')[:6],
+        'reader_should_not_classify_as_free_reason':
+            day_dict.get('reader_should_not_classify_as_free_reason'),
+        'neighbor_evidence':     day_dict.get('neighbor_evidence') or [],
+        'warnings':              day_dict.get('warnings') or [],
+        '_v2_source':            True,
+    }
+    return out
+
+
+def _validate_cas_v2_postprocessed_response(post_days):
+    """R14 — Validiert eine postprocessor-Output-Liste (V2-shaped days) gegen
+    das V2-Schema aus cas_reader_v2_spec.
+
+    Wird vom Caller aufgerufen NACHDEM normalize_cas_days_v2() lief. Bei
+    Validator-Errors loggen wir laut und liefern ein Audit-Dict zurueck;
+    nichts wird stillschweigend akzeptiert.
+
+    Returns dict:
+      {
+        'errors': [...], 'warnings': [...], 'days_total': int,
+        'used': bool,        # True wenn V2-Pfad aktiv war
+      }
+    """
+    try:
+        from cas_reader_v2_spec import (
+            validate_cas_reader_v2_response, is_v2_enabled,
+        )
+    except Exception as _e:
+        return {'errors': [f'v2_spec_import_fail:{type(_e).__name__}'],
+                'warnings': [], 'days_total': len(post_days or []), 'used': False}
+    used = bool(is_v2_enabled())
+    if not used:
+        return {'errors': [], 'warnings': [], 'days_total': len(post_days or []),
+                'used': False}
+    v = validate_cas_reader_v2_response({'days': list(post_days or [])})
+    # Bei Errors laut loggen — kein silent accept
+    if v['errors']:
+        print(f"[CAS-Reader-V2-Validator] errors={len(v['errors'])} "
+              f"first={v['errors'][:3]}")
+    return {**v, 'days_total': len(post_days or []), 'used': True}
 
 
 def _sonnet_read_cas_merged_text(cas_list, year, homebase, source_filenames, job_id):
@@ -17881,9 +18119,32 @@ def _classify_days_from_normalized_tours(normalized_tours, year=2025, homebase='
             if counted_workday:
                 arbeitstage += 1
                 # Reinigung folgt arbeitstage außer evening_anreise (Z73 mit briefing>=18:00)
-                reinigungstage += 1
+                # v15 (2026-05-25) STRICT-CLEANING-Hotfix: Standby-zuhause-Tage zählen
+                # NICHT als Reinigungstag. Tibor-Diff zeigt 18 zu viele Reinigung-Tage
+                # weil Home-Standby in arbeitstage einläuft. FollowMe zählt nur echte
+                # Tour-/Flug-Tage als Reinigungstage.
+                _is_home_standby = (klass == 'Standby')
+                if AEROTAX_STRICT_CLEANING_DAYS and _is_home_standby:
+                    # Standby zuhause: kein Reinigungstag
+                    pass
+                else:
+                    reinigungstage += 1
             if counted_hotel:
-                hotel_naechte += 1
+                # v15 (2026-05-25) STRICT-HOTEL-Hotfix: Hotel-Nacht braucht echte
+                # FL-Layover-Evidence im CAS. Tibor-Diff zeigt 20 zu viele Hotelnächte
+                # durch Phantom-Touren (SE-only) und SE-stfrei-Override-Tage.
+                if AEROTAX_STRICT_HOTEL_NIGHTS:
+                    _routing = day.get('routing') or []
+                    _has_flight_evidence = any(
+                        r and (r.upper().startswith('LH') or any(c.isdigit() for c in r))
+                        for r in _routing
+                    ) if isinstance(_routing, list) else False
+                    _has_real_duty = bool(day.get('has_real_duty'))
+                    if _has_flight_evidence or _has_real_duty:
+                        hotel_naechte += 1
+                    # else: kein Hotel-Counter, Tag bleibt für VMA aber nicht für Trinkgeld
+                else:
+                    hotel_naechte += 1
             if counted_fahrtag:
                 fahr_tage += 1
 
@@ -19601,7 +19862,24 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                     #
                     # Konservativ: Wert = an_abreise (8h-Satz), nicht voll_24h.
                     # Audit-Eintrag für Transparenz im Rescues-Log.
-                    if klass != 'Z76':
+                    #
+                    # v15 (2026-05-25) HOTFIX: AEROTAX_BH003C_RESCUE_DISABLED Flag.
+                    # Tibor-Diff zeigt diese Rescue erzeugt Phantom-Z76-Tage wenn
+                    # SE-Auslandszeilen vorhanden sind aber keine echte Tour-Klammer.
+                    # Bei DISABLED=1 wird der Tag als 'Issue' belassen und im Audit
+                    # markiert — keine stille Z76-Erfindung mehr.
+                    if AEROTAX_BH003C_RESCUE_DISABLED:
+                        if klass != 'Z76':
+                            # Hotfix: kein Rescue, Tag bleibt Issue
+                            audit_note = (audit_note + ' | ' if audit_note else '') + \
+                                f'{datum}: BH-003c-Rescue DISABLED via Hotfix-Flag — Tag bleibt Issue'
+                            rescues.append({
+                                'datum': datum,
+                                'rescue_type': 'bh003c_disabled',
+                                'rescue_reason': 'Hotfix-Flag AEROTAX_BH003C_RESCUE_DISABLED=1 aktiv',
+                                'eur': 0.0,
+                            })
+                    elif klass != 'Z76':
                         _bh003c_prev_layover = _bh003a_layover  # bereits oben extrahiert
                         _bh003c_hb_up = _bh003a_hb_up
                         if (_bh003c_prev_layover                                              # H1
@@ -21959,6 +22237,84 @@ def _build_se_completeness_audit(uploaded_count, se_structured, se_summary,
     return audit
 
 
+def _adapt_cas_reader_to_builder(reader_days, homebase):
+    """R17/R20 (2026-05-26) Bridge: CAS-Reader-Output → Builder-Input.
+
+    Erkennt V2-shape (Tag hat `_v2_source=True`) und reicht ihn direkt
+    durch — die V2-Felder sind bereits builder-kompatibel via _normalize_cas_day_v2.
+
+    Für V1-Reader-Output: heuristisches Mapping wie bisher (flights→routing,
+    location→starts_at_homebase, etc.).
+    """
+    if not reader_days:
+        return []
+    hb_up = (homebase or 'FRA').upper().strip()
+    adapted = []
+    for d in reader_days:
+        if not isinstance(d, dict):
+            continue
+        # R20: V2-Path — bereits builder-kompatibel
+        if d.get('_v2_source'):
+            adapted.append(dict(d))
+            continue
+        date_s = d.get('date') or d.get('datum') or ''
+        marker = str(d.get('marker') or '').strip()
+        location = str(d.get('location') or '').upper().strip()
+        layover_ort = str(d.get('layover_ort') or '').upper().strip()
+        activity_type = str(d.get('activity_type') or '').lower().strip()
+        flights = d.get('flights') or []
+        overnight = bool(d.get('overnight_after_day'))
+
+        # routing: IATAs aus location/layover + flight-numbers + from/to (wenn dict)
+        routing = []
+        if location:
+            routing.append(location)
+        if layover_ort and layover_ort != location:
+            routing.append(layover_ort)
+        for f in flights:
+            if isinstance(f, dict):
+                fno = (f.get('flight_no') or '').strip()
+                if fno:
+                    routing.append(fno)
+                for k in ('from_iata', 'to_iata'):
+                    iata = (f.get(k) or '').strip().upper()
+                    if iata and iata not in routing:
+                        routing.append(iata)
+            elif isinstance(f, str) and f.strip():
+                routing.append(f.strip())
+
+        # has_fl: explicit flag fehlt im Reader-Schema → aus activity_type + flights ableiten
+        has_fl = (activity_type == 'flight') or bool(flights)
+
+        # starts_at_homebase / ends_at_homebase Heuristik:
+        # - location == homebase → Briefing am HB (Anreise- oder Same-Day-Trip)
+        # - overnight_after_day=False UND location==homebase → endet am HB
+        # Heimkehr-Tag (location=foreign) wird via cas_postprocessor R1/R5 geheilt.
+        starts_at_hb = bool(location == hb_up)
+        ends_at_hb = bool(location == hb_up and not overnight)
+
+        # duty_duration_minutes
+        duty_min = int(d.get('duration_minutes') or 0)
+
+        adapted.append({
+            'datum':                 date_s,
+            'date':                  date_s,
+            'marker':                marker,
+            'marker_raw':            marker,
+            'routing':               routing,
+            'has_fl':                has_fl,
+            'duty_duration_minutes': duty_min,
+            'starts_at_homebase':    starts_at_hb,
+            'ends_at_homebase':      ends_at_hb,
+            'overnight_after_day':   overnight,
+            'layover_ort':           layover_ort,
+            'layover_iata':          layover_ort,
+            'activity_type':         activity_type,
+            'confidence':            d.get('confidence', 'medium'),
+        })
+    return adapted
+
+
 def hybrid_analyze(form, files, job_id=None):
     """Hauptanalyse: Sonnet (LSB+SE-Summen) + Opus (Tag-Klassifikation) SEQUENZIELL.
     Sequenziell statt parallel — schont Memory auf Render Free 512 MB.
@@ -22440,6 +22796,173 @@ def hybrid_analyze(form, files, job_id=None):
         gc.collect()
     _release_memory_to_os()
 
+    # ════════════════════════════════════════════════════════════════════════
+    # v15 (2026-05-25) PHASE B PARALLEL AUDIT: normalized_tours
+    # ════════════════════════════════════════════════════════════════════════
+    # Wenn AEROTAX_USE_NORMALIZED_TOURS=1, läuft normalized_tours parallel zum
+    # alten Klassifikator. Ergebnis landet als '_normalized_tours_audit' im
+    # Result-Dict, beeinflusst aber NICHT den finalen Betrag.
+    #
+    # Safety: jeder Crash wird gefangen, der Hauptpfad bleibt unverändert.
+    # Bei Flag=0: kein Call, keine Output-Änderung.
+    _normalized_tours_audit = None
+    _normalized_tours_audit_error = None
+    if AEROTAX_USE_NORMALIZED_TOURS:
+        try:
+            import normalized_tours as _nt
+            # Inputs zusammenbauen
+            _cas_days_raw = []
+            if isinstance(cas_pre_read, dict):
+                # CAS-Reader-Output: structured_days mit days[]
+                _cas_days_raw = list(cas_pre_read.get('structured_days', {}).get('days', [])
+                                     or cas_pre_read.get('days', []) or [])
+            # R17 (2026-05-26) Bridge: Reader-Output-Format → Builder-Input-Format.
+            # Ohne diese Bridge sieht der Builder keine starts_at_homebase, kein
+            # has_fl, kein duty_duration_minutes, keine routing-Liste → tours=0.
+            _cas_days = _adapt_cas_reader_to_builder(_cas_days_raw, homebase)
+            _se_rows = []
+            if isinstance(se_structured, dict):
+                _se_rows = list(se_structured.get('se_lines', []) or [])
+            # v15 B7 (2026-05-25) Fix: BMF-Tabelle keyed nach IATA via
+            # IATA_TO_BMF-Bridge. BMF_AUSLAND_BY_YEAR ist nach Country-Namen
+            # keyed, normalized_tours sucht nach IATA-Codes — Mapping nötig.
+            _bmf_year = BMF_AUSLAND_BY_YEAR.get(year, {}) or {}
+            _bmf_table = {}
+            for _iata, _country in (IATA_TO_BMF or {}).items():
+                _entry = _bmf_year.get(_country)
+                if isinstance(_entry, (tuple, list)) and len(_entry) >= 2:
+                    _an_ab, _voll = float(_entry[0]), float(_entry[1])
+                    _bmf_table[_iata] = {
+                        'an_abreise': _voll * 0.75 if _an_ab == _voll else _an_ab,  # an_abreise typ. 75% von voll
+                        # BMF_AUSLAND_BY_YEAR-Tuples sind (voll_24h, an_abreise),
+                        # je nach Datei-Format. Sicher: erstes = voll, zweites = an_abreise.
+                        'voll_24h':   _an_ab,
+                        'country':    _country,
+                    }
+            # Alternative: BMF_AUSLAND_BY_YEAR-Tuple-Format prüfen über bekannten Eintrag
+            # Bulgarien: (22, 15) — bei FollowMe ist Bulgarien voll=22, an_ab=15
+            # Also: erstes Element = voll_24h, zweites = an_abreise.
+            for _iata, _country in (IATA_TO_BMF or {}).items():
+                _entry = _bmf_year.get(_country)
+                if isinstance(_entry, (tuple, list)) and len(_entry) >= 2:
+                    _bmf_table[_iata] = {
+                        'voll_24h':   float(_entry[0]),
+                        'an_abreise': float(_entry[1]),
+                        'country':    _country,
+                    }
+
+            _norm_tours = _nt.build_normalized_tours(
+                cas_days=_cas_days, se_rows=_se_rows, year=year,
+                employee_context=None, homebase=homebase, rules=None,
+            )
+            _norm_result = _nt.calculate_allowances_from_normalized_tours(
+                _norm_tours, _bmf_table, rules=None,
+                iata_to_bmf=IATA_TO_BMF, se_rows=_se_rows, homebase=homebase,
+            )
+            _diff = _nt.diff_against_legacy(_norm_result, classification or {})
+
+            _normalized_tours_audit = {
+                'tours_count':    len(_norm_tours),
+                'days_count':     sum(len(t.days) for t in _norm_tours),
+                'fahrtage':       _norm_result.fahrtage,
+                'arbeitstage':    _norm_result.arbeitstage,
+                'hotel_naechte':  _norm_result.hotel_naechte,
+                'reinigungstage': _norm_result.reinigungstage,
+                'z72': {'tage': _norm_result.z72_tage, 'eur': round(_norm_result.z72_eur, 2)},
+                'z73': {'tage': _norm_result.z73_tage, 'eur': round(_norm_result.z73_eur, 2)},
+                'z74': {'tage': _norm_result.z74_tage, 'eur': round(_norm_result.z74_eur, 2)},
+                'z76': {'tage': _norm_result.z76_tage, 'eur': round(_norm_result.z76_eur, 2)},
+                'by_date':       _norm_result.by_date,
+                'warnings':      _norm_result.audit_warnings,
+                'tours':         _nt.tours_to_audit_json(_norm_tours),
+                'diff_against_legacy': _diff,
+                'flag_status':   'AEROTAX_USE_NORMALIZED_TOURS=1',
+                'final_amount_unchanged': len(_norm_tours) == 0,
+            }
+            print(f"[normalized_tours] parallel audit: tours={len(_norm_tours)} "
+                  f"z76_eur={_norm_result.z76_eur:.2f} vs legacy_z76_eur="
+                  f"{float(classification.get('vma_aus', 0) or 0):.2f}")
+
+            # R17 (2026-05-26) PRODUKTIV-SWITCH: wenn der Builder echte Touren
+            # produziert hat (mind. 1 Tour), wird der finale Betrag aus dem
+            # _norm_result genommen statt aus dem Legacy-Klassifikator. Damit
+            # wirken R3-Date-Adjacency + R14-Mid-Tour-Duty + B7/B8/B9-Filter
+            # PRODUKTIV. Default OFF: der Audit-only-Pfad bleibt unverändert.
+            if (isinstance(classification, dict)
+                    and len(_norm_tours) > 0):
+                # Snapshot der Legacy-Counter VOR Override (audit-pflichtig)
+                _legacy_counters_snapshot = {
+                    'fahr_tage':      classification.get('fahr_tage'),
+                    'arbeitstage':    classification.get('arbeitstage'),
+                    'hotel_naechte':  classification.get('hotel_naechte'),
+                    'reinigungstage': classification.get('reinigungstage'),
+                    'vma_aus':        classification.get('vma_aus'),
+                    'vma_inland_an_ab': classification.get('vma_inland_an_ab'),
+                    'vma_inland_voll': classification.get('vma_inland_voll'),
+                    'gesamt_wiso':    classification.get('gesamt_wiso'),
+                }
+                # Top-Level-Counter überschreiben
+                classification['fahr_tage']      = _norm_result.fahrtage
+                classification['arbeitstage']    = _norm_result.arbeitstage
+                classification['hotel_naechte']  = _norm_result.hotel_naechte
+                classification['reinigungstage'] = _norm_result.reinigungstage
+                # VMA-Beträge (Z76=Ausland, Z73=Inland-An/Ab, Z74=Inland-Voll, Z72=Same-Day)
+                classification['vma_aus']         = round(_norm_result.z76_eur, 2)
+                classification['vma_inland_an_ab'] = round(_norm_result.z73_eur, 2)
+                classification['vma_inland_voll']  = round(_norm_result.z74_eur, 2)
+                classification['vma_office']       = round(_norm_result.z72_eur, 2)
+                # tage_detail: bestehende Einträge mit norm-Result-by_date matchen
+                # und klass/eur überschreiben. Legacy-Felder (marker, routing,
+                # layover_ort) bleiben — die kommen vom Reader und sind robust.
+                _td = classification.get('tage_detail') or []
+                if isinstance(_td, list):
+                    _by_date_lookup = _norm_result.by_date or {}
+                    for _entry in _td:
+                        if not isinstance(_entry, dict):
+                            continue
+                        _ds = _entry.get('datum') or _entry.get('date')
+                        if not _ds or _ds not in _by_date_lookup:
+                            continue
+                        _norm_day = _by_date_lookup[_ds] or {}
+                        # by_date schreibt 'klass' (uppercase bucket-name) +
+                        # 'amount' (eur). Defensiv beide Varianten lesen.
+                        _norm_klass = (_norm_day.get('klass')
+                                       or _norm_day.get('bucket') or '').upper().strip()
+                        _norm_eur   = (_norm_day.get('amount')
+                                       if _norm_day.get('amount') is not None
+                                       else _norm_day.get('eur') or 0)
+                        if _norm_klass in ('Z72', 'Z73', 'Z74', 'Z76'):
+                            _entry['klass'] = _norm_klass
+                            _entry['eur']   = round(float(_norm_eur), 2)
+                        elif _norm_klass in ('NONE', ''):
+                            # Kein VMA-Bucket im Norm-Pfad → Klass bleibt (Frei/Standby/Issue)
+                            pass
+                _normalized_tours_audit['productive_switch']   = True
+                _normalized_tours_audit['legacy_counters_snapshot'] = _legacy_counters_snapshot
+                print(f"[normalized_tours] PRODUCTIVE override: "
+                      f"fahrtage {_legacy_counters_snapshot['fahr_tage']}→{_norm_result.fahrtage} "
+                      f"arbeitstage {_legacy_counters_snapshot['arbeitstage']}→{_norm_result.arbeitstage} "
+                      f"hotel {_legacy_counters_snapshot['hotel_naechte']}→{_norm_result.hotel_naechte} "
+                      f"z76 {_legacy_counters_snapshot['vma_aus']}→{round(_norm_result.z76_eur,2)}")
+            else:
+                _normalized_tours_audit['productive_switch'] = False
+        except Exception as _nt_exc:
+            import traceback as _nt_tb
+            _normalized_tours_audit_error = {
+                'type':    type(_nt_exc).__name__,
+                'message': str(_nt_exc)[:300],
+                'trace':   _nt_tb.format_exc()[-800:],
+            }
+            print(f"[normalized_tours] parallel audit FAILED (main pipeline unaffected): "
+                  f"{type(_nt_exc).__name__}: {str(_nt_exc)[:200]}")
+
+    # R17 Audit (2026-05-26): V2-Reader-Flag-Status top-level sichtbar machen,
+    # damit Validation-Harness korrekt prüfen kann ob V2 lief.
+    _cas_reader_v2_active = bool(
+        (cas_pre_read or {}).get('_v2_active')
+        if isinstance(cas_pre_read, dict) else False
+    )
+
     return {
         'lsb': lsb_data,
         'se_summary': se_summary,
@@ -22452,6 +22975,11 @@ def hybrid_analyze(form, files, job_id=None):
             'se':  uploaded_se_files_count,
             'cas': len(cas_filenames),
         },
+        # v15 (2026-05-25) Phase B Parallel Audit — nur wenn Flag aktiv.
+        '_normalized_tours_audit':       _normalized_tours_audit,
+        '_normalized_tours_audit_error': _normalized_tours_audit_error,
+        # R17 (2026-05-26): V2-Flag-Audit auf Top-Level
+        'cas_reader_v2_active':          _cas_reader_v2_active,
     }
 
 

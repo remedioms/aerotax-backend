@@ -178,11 +178,14 @@ INDEX_HTML = os.path.expanduser('~/Desktop/site/index.html')
 
 
 def test_frontend_vie_zrh_disabled():
-    """VIE/ZRH müssen als disabled-Option im Dropdown stehen."""
+    """VIE/ZRH NICHT mehr im Dropdown — wurden auf User-Anforderung entfernt
+    (2026-05-24, Liquid-Glass-Cleanup). Backend rejected sie trotzdem via
+    _is_supported_homebase, frontend zeigt sie nicht mehr als Option."""
     with open(INDEX_HTML, encoding='utf-8') as f:
         html = f.read()
-    assert '<option disabled>Wien (VIE) — bald</option>' in html
-    assert '<option disabled>Zürich (ZRH) — bald</option>' in html
+    # Sicherheits-Check: keine VIE/ZRH-Options im Dropdown
+    assert 'Wien (VIE)' not in html, 'VIE sollte nicht mehr im Dropdown sein'
+    assert 'Zürich (ZRH)' not in html, 'ZRH sollte nicht mehr im Dropdown sein'
 
 
 def test_frontend_supported_de_bases_present():
@@ -196,12 +199,15 @@ def test_frontend_supported_de_bases_present():
         assert f'<option>{base}</option>' in html, f'{base} fehlt im Frontend'
 
 
-def test_frontend_homebase_warning_text_present():
-    """Hinweis-Text unter Dropdown: AeroTAX ist für deutsche Steuerlogik."""
+def test_frontend_homebase_warning_text_removed():
+    """Hinweis-Text unter Dropdown wurde auf User-Anforderung 2026-05-24
+    entfernt (UI-Cleanup). Backend gibt die Validierung via canonical_state
+    'needs_document_attention' weiter wenn unsupported base gewählt."""
     with open(INDEX_HTML, encoding='utf-8') as f:
         html = f.read()
-    assert 'deutsche Steuerlogik' in html
-    assert 'späteren Version' in html or 'bald' in html
+    # Der alte Warning-Text wurde explizit entfernt
+    assert 'Aktuell für deutsche Steuerlogik optimiert' not in html
+    assert 'Wien und Zürich folgen in einer späteren Version' not in html
 
 
 def test_frontend_anderer_flughafen_removed():
