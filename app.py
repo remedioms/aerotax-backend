@@ -21295,12 +21295,24 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         # v8.22 Now-4: Unknown-Marker-Kandidaten — Sonnet sieht raw_marker, kann
         # die Aktivität aber nicht zuordnen (activity_type=unknown). Wird im
         # review_items-Flow als "Was bedeutet diese Kennung?" präsentiert.
+        # v8.26 Fix 2026-05-27: bekannte passive LH-Marker (LMN_HT1, ORTSTAG,
+        # FRS, OF, OFF, LMN_AS, LMN_CR) sind KEINE „unbekannten Kennungen" —
+        # raus aus der Frage-Liste, auch wenn Sonnet sie als unknown geliefert
+        # hat. Postprocessor heilt sie zu 'free'; dieser Filter ist Backup.
         if at == 'unknown':
             raw_mk = (d.get('raw_marker') or '').strip()
             if raw_mk and len(raw_mk) <= 30:
                 # First-Token (das ist die Kennung, z.B. "SIM" aus "SIM SIMULATOR")
                 first = raw_mk.split()[0] if raw_mk else ''
-                if first and len(first) <= 8:
+                _KNOWN_PASSIVE = {'ORTSTAG', 'FRS', 'OF', 'OFF', 'LMN_AS',
+                                  'LMN_CR', 'LMN_HT1', 'LMN_HT', 'LMN_AD',
+                                  'LMN_AL', 'LMN_DS', 'LMN_FT', 'FRD'}
+                first_up = first.upper()
+                is_known_passive = (
+                    first_up in _KNOWN_PASSIVE
+                    or any(first_up.startswith(p) for p in ('LMN_',))
+                )
+                if first and len(first) <= 8 and not is_known_passive:
                     unknown_marker_candidates.append({
                         'datum': datum, 'marker': raw_mk, 'first_token': first,
                         'reason': 'Unbekannte Kennung — bitte erklären',

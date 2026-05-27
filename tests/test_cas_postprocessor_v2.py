@@ -207,6 +207,44 @@ def test_normalize_free_day_with_no_neighbor_context_stays_free():
         assert d['activity_type'] == 'urlaub'
 
 
+def test_r0_passive_marker_unknown_heals_to_free():
+    """R0 (2026-05-27): Passive LH-Marker (LMN_HT1, ORTSTAG, FRS, OF, OFF,
+    LMN_AS, LMN_CR) ohne duty/has_fl/routing werden zu activity_type='free'
+    geheilt — damit landen sie nicht als 'unbekannte Kennung' im Chat."""
+    days = [
+        _cas('2025-01-28', marker='OFF', activity_type='free'),
+        _cas('2025-01-29', marker='LMN_HT1', activity_type='unknown'),
+        _cas('2025-01-30', marker='OFF', activity_type='free'),
+    ]
+    out = cp.normalize_cas_days_v2(days, homebase='FRA')
+    target = [d for d in out if d['datum'] == '2025-01-29'][0]
+    assert target['activity_type'] == 'free'
+    assert 'R0_passive_marker_to_free' in target.get('healed_by', [])
+
+
+def test_r0_passive_marker_with_duty_does_not_heal():
+    """Wenn passiver Marker doch duty/Flug-Signale hat (theoretisch), wird
+    NICHT zu free geheilt — Reader hat dann etwas Aktives gelesen, das
+    respektiert wird."""
+    days = [
+        _cas('2025-01-29', marker='LMN_HT1', activity_type='unknown',
+             duty_min=600),
+    ]
+    out = cp.normalize_cas_days_v2(days, homebase='FRA')
+    assert out[0]['activity_type'] == 'unknown'
+    assert 'R0_passive_marker_to_free' not in out[0].get('healed_by', [])
+
+
+def test_r0_already_free_passive_marker_skipped():
+    """Passive Marker die schon free sind, werden nicht doppelt-geheilt."""
+    days = [
+        _cas('2025-01-29', marker='LMN_HT1', activity_type='free'),
+    ]
+    out = cp.normalize_cas_days_v2(days, homebase='FRA')
+    assert out[0]['activity_type'] == 'free'
+    assert 'R0_passive_marker_to_free' not in out[0].get('healed_by', [])
+
+
 def test_normalize_home_standby_stays_home_standby():
     """Home-Standby bleibt Home-Standby (keine Tour-Heilung)."""
     days = [

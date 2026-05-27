@@ -264,6 +264,29 @@ def normalize_cas_days_v2(
             d['next_layover_iata'] = next_layover.upper().strip() or None
 
     # ───────────────────────────────────────────────────────────────────────
+    # Regel 0: Passive-Marker-Heilung (LMN_HT1, ORTSTAG, FRS, OF, OFF,
+    # LMN_AS, LMN_CR). Reader liefert teilweise activity_type='unknown' für
+    # diese bekannten LH-Codes — wir heilen das deterministisch zu 'free',
+    # damit der Tag nicht als „Unbekannte Kennung" im Chat landet.
+    # Voraussetzung: kein duty time, kein Flugsegment, keine Tour-Signale.
+    # ───────────────────────────────────────────────────────────────────────
+    for d in days:
+        marker = d.get('normalized_marker') or ''
+        if not _is_passive_marker(marker):
+            continue
+        at = (d.get('activity_type') or '').lower()
+        if at in _FREE_ACTIVITIES:
+            continue
+        duty = int(d.get('duty_duration_minutes') or 0)
+        has_fl = bool(d.get('has_fl'))
+        routing = d.get('routing_iatas') or []
+        if duty > 0 or has_fl or routing:
+            # Marker ist passiv, aber Tag hat aktive Signale — nicht heilen
+            continue
+        d['activity_type'] = 'free'
+        d['healed_by'].append('R0_passive_marker_to_free')
+
+    # ───────────────────────────────────────────────────────────────────────
     # Regel 1: X-Return-Healing
     # ───────────────────────────────────────────────────────────────────────
     for i, d in enumerate(days):
