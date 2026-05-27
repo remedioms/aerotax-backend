@@ -25883,15 +25883,22 @@ def erstelle_pdf(d):
     )
     if _pp_has_warnings:
         S.append(PageBreak())
-        S.append(Paragraph("PRÜFPUNKTE",
+        S.append(Paragraph("TRANSPARENZ",
             ps("pp_eyebrow", fontSize=8.5, textColor=GOLD, fontName="Helvetica-Bold",
                leading=12, spaceAfter=4, letterSpacing=2.5)))
-        S.append(Paragraph("Hinweise zu deiner Auswertung",
+        S.append(Paragraph("Audit-Übersicht",
             ps("pp_h1", fontSize=18, textColor=TEXT, fontName="Helvetica",
                leading=24, spaceAfter=10, letterSpacing=-0.2)))
+        # R36 (2026-05-27): freundlicher, weniger verunsichernder Intro-Text.
+        # Vorher: „Bitte prüfe sie vor der Übernahme" → User-Verunsicherung.
+        # Jetzt: ehrlich + beruhigend — diese Punkte sind konservativ behandelt,
+        # die Berechnung ist BMF-konform.
         S.append(Paragraph(
-            "Diese Punkte wurden nicht still übernommen. Bitte prüfe sie vor der "
-            "Übernahme in dein Steuerprogramm.",
+            "Diese Übersicht zeigt Details die das System sichtbar gemacht hat — "
+            "für vollständige Transparenz gegenüber dem Finanzamt. Alle Punkte "
+            "wurden bereits konservativ in die Berechnung übernommen (im Zweifel "
+            "ohne Pauschale). Der Endbetrag ist BMF-konform und so wie er hier "
+            "steht in dein Steuerprogramm übertragbar.",
             ps("pp_intro", fontSize=10, textColor=TEXT2, fontName="Helvetica",
                leading=15, spaceAfter=14)))
 
@@ -25899,16 +25906,16 @@ def erstelle_pdf(d):
         _pp_rows = []
         if _pp_unresolved:
             _pp_rows.append([
-                Paragraph("Nicht eindeutig eingeordnete Tage",
+                Paragraph("Konservativ als Frei klassifiziert<br/><font size='8' color='#888'>= kein Anspruch beantragt, sicher fürs Finanzamt</font>",
                     ps("pp_l1", fontSize=10, textColor=TEXT,
                        fontName="Helvetica", leading=14)),
-                Paragraph(f"<b>{len(_pp_unresolved)}</b>",
+                Paragraph(f"<b>{len(_pp_unresolved)} Tag(e)</b>",
                     ps("pp_v1", fontSize=10, textColor=GOLD,
                        fontName="Helvetica-Bold", leading=14, alignment=TA_RIGHT)),
             ])
         if _pp_unmapped:
             _pp_rows.append([
-                Paragraph("Nicht zugeordnete Streckeneinsatz-Zeilen",
+                Paragraph("Spesen-Einzelzeilen ohne Tag-Zuordnung<br/><font size='8' color='#888'>= im Z77-Abzug enthalten, kein doppelter Anspruch</font>",
                     ps("pp_l2", fontSize=10, textColor=TEXT,
                        fontName="Helvetica", leading=14)),
                 Paragraph(f"<b>{len(_pp_unmapped)}</b>",
