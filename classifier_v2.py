@@ -379,11 +379,6 @@ def day_role_in_tour(day: Dict[str, Any], tour: Tour, homebase: str = 'FRA') -> 
     if marker_kind == MarkerKind.STANDBY_AIRPORT:
         return DayRole.STANDBY_AIRPORT
 
-    # Office am HB innerhalb Tour (selten)
-    if (starts_hb and ends_hb and not overnight
-        and not _has_foreign_iata_in_routing(routing, hb_up)):
-        return DayRole.OFFICE_AT_HB
-
     # First Day
     if idx == 0:
         return DayRole.DEPARTURE
@@ -391,6 +386,16 @@ def day_role_in_tour(day: Dict[str, Any], tour: Tour, homebase: str = 'FRA') -> 
     # Last Day mit Heimkehr-Pattern
     if idx == len(days) - 1 and ends_hb and not overnight:
         return DayRole.RETURN
+
+    # OFFICE_AT_HB nur bei isolierten 1-Tages-„Touren" mit Office-Charakter.
+    # Mid-Tour-Tage MIT overnight-Nachbarn sind IMMER MID_FULL_AWAY — auch
+    # wenn der Reader fälschlich starts/ends_at_homebase=True gesetzt hat
+    # (Reader-Stochastik bei Mid-Tour-X-Tagen).
+    prev_overnight = (idx > 0 and bool(days[idx-1].get('overnight_after_day')))
+    if (len(days) == 1 and starts_hb and ends_hb and not overnight
+        and not _has_foreign_iata_in_routing(routing, hb_up)
+        and not prev_overnight):
+        return DayRole.OFFICE_AT_HB
 
     # Mid-Tour
     return DayRole.MID_FULL_AWAY
