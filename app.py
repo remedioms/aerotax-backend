@@ -5316,10 +5316,11 @@ def post_finalize_pdf(job_id):
         notes_existing.append(
             f'ℹ {answered} Schulungs-/Office-Tag(e) durch deine Antworten ergänzt.'
         )
-    if unsure_n > 0:
-        notes_existing.append(
-            f'ℹ {unsure_n} Tag(e) nicht bestätigt (User unsicher) — im Nachweis vermerkt.'
-        )
+    # R31 (2026-05-27): „User unsicher"-Note aus dem PDF entfernt. Das ist
+    # das offizielle Dokument fürs Finanzamt — „unsicher" hat da nichts zu
+    # suchen. Mit R30 wird unsure aus dem Override-Dict ge-pop't, der Recalc
+    # nimmt den deterministischen Default-Pfad. Im PDF erscheint nur der
+    # tatsächliche Wert, ohne Hinweis auf User-Zweifel.
     if skip_unanswered:
         notes_existing.append(
             'ℹ Nicht bestätigte Punkte wurden nicht zusätzlich berücksichtigt.'
