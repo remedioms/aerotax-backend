@@ -3979,12 +3979,14 @@ def post_review_bulk_answer(job_id):
         existing_overrides = dict(j.get('manual_day_overrides') or {})
 
         # Override-Template
+        # R33: unsure-Template wird hier nicht mehr persistiert — die Apply-
+        # Schleife unten (R30) macht stattdessen ein .pop() im existing_overrides.
         if answer == 'yes':
             ov_template = {'over_8h': True, 'source': 'user_bulk_review_chatbot'}
         elif answer == 'no':
             ov_template = {'over_8h': False, 'source': 'user_bulk_review_chatbot'}
         else:
-            ov_template = {'unsure': True, 'source': 'user_bulk_review_chatbot'}
+            ov_template = {'source': 'user_bulk_review_chatbot'}  # Sentinel — wird nicht geschrieben
 
         # Auf alle pending Items vom Typ anwenden
         # R30 (2026-05-27): Re-Apply erlauben — wenn neue Antwort ≠ alte,
@@ -4437,9 +4439,11 @@ Antworte JETZT mit dem strukturierten JSON-Objekt."""
         iid = ch.get('review_item_id')
         ans = ch.get('answer')
         if iid not in items_by_id: continue  # AI darf keine fremden IDs
-        if items_by_id[iid].get('status') != 'pending': continue
+        if iid not in items_by_id: continue
         if ans not in ('yes', 'no', 'unsure'): continue
         if any(c['review_item_id'] == iid for c in sanitized_changes): continue
+        # R33: answered items NICHT mehr filtern — Re-Apply muss Preview liefern,
+        # damit der User seine Antwort ändern und die Auswirkung sehen kann.
         sanitized_changes.append({'review_item_id': iid, 'answer': ans})
     parsed['proposed_changes'] = sanitized_changes
 
@@ -4462,7 +4466,8 @@ Antworte JETZT mit dem strukturierten JSON-Objekt."""
                 elif ch['answer'] == 'no':
                     preview_overrides[d] = {'over_8h': False, 'source': 'user_ai_interpreted_text'}
                 else:
-                    preview_overrides[d] = {'unsure': True, 'source': 'user_ai_interpreted_text'}
+                    # R33: unsure = kein Override, Default-Pfad. Konsistent zu R30.
+                    preview_overrides.pop(d, None)
             rec = _recompute_with_overrides(cached, preview_overrides)
             if rec and rec.get('totals'):
                 new_total = float(rec['totals'].get('netto') or 0)
@@ -4520,7 +4525,8 @@ def post_review_interpret(job_id):
                 elif ch['answer'] == 'no':
                     preview_overrides[d] = {'over_8h': False, 'source': 'user_bulk_review_chatbot_text'}
                 else:
-                    preview_overrides[d] = {'unsure': True, 'source': 'user_bulk_review_chatbot_text'}
+                    # R33: unsure = kein Override, Default-Pfad. Konsistent zu R30.
+                    preview_overrides.pop(d, None)
             rec = _recompute_with_overrides(cached, preview_overrides)
             if rec and rec.get('totals'):
                 new_total = float(rec['totals'].get('netto') or 0)
