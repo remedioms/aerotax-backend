@@ -3987,16 +3987,28 @@ def post_review_bulk_answer(job_id):
             ov_template = {'unsure': True, 'source': 'user_bulk_review_chatbot'}
 
         # Auf alle pending Items vom Typ anwenden
+        # R30 (2026-05-27): Re-Apply erlauben — wenn neue Antwort ≠ alte,
+        # darf überschrieben werden. Override-Dict ist idempotent (gleiches
+        # Datum → letzte Schreibung gewinnt), kein double-count-Risiko.
         applied_dates = []
         for it in review_items:
             if it.get('type') != typ:
                 continue
-            if it.get('status') == 'answered':
-                continue  # bereits beantwortet, überspringen
             d_iso = it.get('datum')
             if not d_iso:
                 continue
-            existing_overrides[d_iso] = dict(ov_template)
+            prev_ov = existing_overrides.get(d_iso) or {}
+            same = (
+                prev_ov.get('over_8h') == ov_template.get('over_8h')
+                and prev_ov.get('unsure') == ov_template.get('unsure')
+            )
+            if it.get('status') == 'answered' and same:
+                continue  # identische Antwort, nichts zu tun
+            if answer == 'unsure':
+                # R30: unsure = Default-Pfad, kein Override
+                existing_overrides.pop(d_iso, None)
+            else:
+                existing_overrides[d_iso] = dict(ov_template)
             applied_dates.append(d_iso)
 
         j['manual_day_overrides'] = existing_overrides
@@ -4573,16 +4585,34 @@ def post_review_answer_bulk(job_id):
             if not it: continue
             d = it.get('datum')
             if not d: continue
-            if it.get('status') == 'answered': continue
+            # R30 (2026-05-27): Re-Apply erlauben wenn User seine Antwort ändert.
+            # Vorher: status=answered → continue → User-Korrektur ging stillschweigend
+            # verloren (z.B. ungenauer KI-Parser → erst unsure, dann präziser → ignoriert).
+            # Jetzt: Re-Apply nur wenn neue Antwort ≠ alte (idempotent).
+            prev_ans = it.get('user_answer') or {}
+            prev_yes = prev_ans.get('over_8h') is True
+            prev_no = prev_ans.get('over_8h') is False
+            prev_unsure = prev_ans.get('unsure') is True
+            unchanged = (
+                (ans == 'yes' and prev_yes)
+                or (ans == 'no' and prev_no)
+                or (ans == 'unsure' and prev_unsure)
+            )
+            if it.get('status') == 'answered' and unchanged:
+                continue  # tatsächlich nichts Neues
             if ans == 'yes':
                 existing_overrides[d] = {'over_8h': True, 'source': source}
             elif ans == 'no':
                 existing_overrides[d] = {'over_8h': False, 'source': source}
             else:
-                existing_overrides[d] = {'unsure': True, 'source': source}
-            applied.append({'datum': d, 'answer': ans, 'review_item_id': iid})
+                # R30: unsure = User weiß es selbst nicht → Override entfernen,
+                # damit der Recalc den deterministischen Default-Pfad nimmt.
+                existing_overrides.pop(d, None)
+            applied.append({'datum': d, 'answer': ans, 'review_item_id': iid,
+                            're_apply': it.get('status') == 'answered'})
             it['status'] = 'answered'
-            it['user_answer'] = existing_overrides[d]
+            it['user_answer'] = (existing_overrides.get(d)
+                                 or {'unsure': True, 'source': source})
 
         j['manual_day_overrides'] = existing_overrides
         if 'audit' in j and isinstance(j['audit'], list):
