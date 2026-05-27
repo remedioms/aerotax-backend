@@ -19814,17 +19814,59 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 'FRD',
             )
             _is_passive_home = any(pm in _raw_marker_o for pm in _LH_FREI_MARKERS)
-            if _is_passive_home and not duty_known_o:
+            # R39 (2026-05-27) BMF-Compliance-Fix: passive-Home-Marker sind IMMER Frei,
+            # egal ob duty bekannt. ORTSTAG/LMN_HT mit duty=540min ist eine Online-
+            # Schulung VON ZUHAUSE — keine Auswärtstätigkeit, kein Z72-Anspruch.
+            # User-95775: 3 false-positives (LMN_AD1, ORTSTAG, LMN_HT) eliminiert.
+            if _is_passive_home:
                 klass = 'Frei'
-                reason = f'Passiv zuhause ({_raw_marker_o or "Marker"}) — kein AT/FT (LH-CRS-Hilfe)'
-                print(f"[v14-passive-home] datum={datum} marker={_raw_marker_o} → Frei")
+                reason = (f'Passiv zuhause ({_raw_marker_o or "Marker"}) — kein AT/FT '
+                          f'(LH-CRS-Hilfe), egal duty')
+                print(f"[r39-passive-home] datum={datum} marker={_raw_marker_o} "
+                      f"duty={total_min_o if duty_known_o else 'n/a'} → Frei")
             elif (not overnight and not prev_overnight and not in_cluster_o
                 and not has_active_foreign_se_o
                 and duty_known_o and total_min_o >= SAME_DAY_Z72_TOTAL_MINUTES):
-                klass = 'Z72'
-                eur_added = INLAND_TAGESTRIP_8H
-                reason = f'Office Inland >8h (total {total_min_o}min, {time_src_o}) → Z72 14€'
-                print(f"[v8-z72-office] datum={datum} total={total_min_o}min src={time_src_o} → Z72")
+                # R39 BMF-Check: Z72 nur bei echter AUSWÄRTSTÄTIGKEIT.
+                # § 9 EStG: erste Tätigkeitsstätte = HB-Flughafen. Schulung
+                # am HB selbst ist KEINE Auswärtstätigkeit → kein Z72-Anspruch.
+                # Kriterium aus CAS-Feldern:
+                #   - Routing enthält anderen Inland-Flughafen (z.B. MUC bei FRA-Crew)
+                #     ODER starts_at_homebase=False ODER ends_at_homebase=False
+                #     → echt auswärts, Z72 erlaubt
+                #   - sonst nur HB-Routing + start/end_at_homebase=True
+                #     → erste Tätigkeitsstätte, KEIN Z72, nur Office+Reinigung
+                _routing_o = d.get('routing') or []
+                _hb_o = homebase.upper().strip() if homebase else 'FRA'
+                _has_other_inland = any(
+                    isinstance(r, str) and len(r.upper().strip()) == 3
+                    and r.upper().strip() != _hb_o
+                    and r.upper().strip() in {'MUC','DUS','TXL','BER','HAM','STR',
+                                              'CGN','HAJ','NUE','LEJ','BRE','DRS'}
+                    for r in (_routing_o if isinstance(_routing_o, list) else [])
+                )
+                _starts_hb_o = bool(d.get('starts_at_homebase'))
+                _ends_hb_o = bool(d.get('ends_at_homebase'))
+                _truly_away = (
+                    _has_other_inland
+                    or not _starts_hb_o
+                    or not _ends_hb_o
+                )
+                if _truly_away:
+                    klass = 'Z72'
+                    eur_added = INLAND_TAGESTRIP_8H
+                    reason = (f'Auswärtstätigkeit Inland >8h (total {total_min_o}min, '
+                              f'{time_src_o}) → Z72 14€')
+                    print(f"[r39-z72-auswaerts] datum={datum} total={total_min_o}min "
+                          f"routing={_routing_o} → Z72")
+                else:
+                    # BMF: Schulung am HB = erste Tätigkeitsstätte = kein Z72.
+                    klass = 'Office'
+                    eur_added = 0.0
+                    reason = (f'Office am HB >8h ({total_min_o}min) — erste Tätigkeits'
+                              f'stätte, kein Z72-Anspruch (§ 9 EStG). Reinigung läuft.')
+                    print(f"[r39-office-am-hb] datum={datum} total={total_min_o}min "
+                          f"marker={_raw_marker_o} → Office (kein Z72)")
             else:
                 klass = 'Office'
                 reason = 'Office am Homebase — AT + FT'
