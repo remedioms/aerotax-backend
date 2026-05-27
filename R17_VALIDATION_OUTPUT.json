@@ -1,0 +1,261 @@
+{
+  "timestamp": "2026-05-26T11:25:15.687120",
+  "git_branch": "main",
+  "tibor_dir": "/Users/miguelschumann/Desktop/Tibor/2025",
+  "homebase": "FRA",
+  "skip_v1": true,
+  "skip_v2": false,
+  "runs": {
+    "v2": {
+      "label": "v2",
+      "ok": true,
+      "error": null,
+      "wallclock_s": 509.7,
+      "kpis": {
+        "gesamt_eur": null,
+        "z72_tage": 6,
+        "z72_eur": 84.0,
+        "z73_tage": 5,
+        "z73_eur": 70.0,
+        "z74_tage": 0,
+        "z74_eur": 0.0,
+        "z76_tage": 136,
+        "z76_eur": 5793.0,
+        "fahrtage": 44,
+        "arbeitstage": 168,
+        "reinigungstage": 148,
+        "hotel_naechte": 124,
+        "trinkgeld_eur": null,
+        "classification_keys": [
+          "_audit_issues",
+          "_cas_cache_hits",
+          "_cas_conflicts",
+          "_cas_files_processed",
+          "_cas_warnings",
+          "_v11_cas_used",
+          "_v7_used",
+          "aerotax_z76_dates_amounts",
+          "arbeitstage",
+          "audit_notes",
+          "bmf_missing",
+          "extra_arbeitstage",
+          "extra_fahrtage",
+          "extra_hotelnaechte",
+          "fahr_tage",
+          "hotel_candidate_issues",
+          "hotel_naechte",
+          "iata_unknown",
+          "issue_tage",
+          "missing_deutschland_14_candidates",
+          "missing_reader_days",
+          "missing_z73_candidates",
+          "missing_z76_candidates",
+          "nachweis",
+          "near_8h_review_candidates",
+          "office_training_time_missing_candidates",
+          "office_z72_candidates",
+          "plausi_hard_fails",
+          "plausi_issues",
+          "reinigungstage",
+          "rescues",
+          "tage_detail",
+          "training_commute_candidates",
+          "training_sequences",
+          "unklare_tage",
+          "unknown_marker_candidates",
+          "unresolved_days",
+          "vma_aus",
+          "vma_inland_an_ab",
+          "vma_inland_voll",
+          "vma_office",
+          "vma_unmapped_se",
+          "wrong_z72_candidates",
+          "z72_eur",
+          "z72_tage",
+          "z73_eur",
+          "z73_tage",
+          "z74_eur",
+          "z74_tage",
+          "z76_eur",
+          "z76_tage"
+        ],
+        "normalized_tours_kpis": {
+          "fahrtage": null,
+          "arbeitstage": null,
+          "hotel_naechte": null,
+          "reinigungstage": null,
+          "z72": null,
+          "z73": null,
+          "z74": null,
+          "z76": null
+        }
+      },
+      "critical_days": [
+        {
+          "datum": "2025-01-06",
+          "note": "BLR Heimkehr \u2014 X darf NICHT als Frei verloren gehen",
+          "legacy": {
+            "klass": "Issue",
+            "marker": "X",
+            "routing": "FRA",
+            "layover_ort": null,
+            "overnight": null,
+            "eur": null,
+            "reason_counted": null,
+            "why_suspicious": null
+          }
+        },
+        {
+          "datum": "2025-01-04",
+          "note": "BLR Mid-Tour \u2014 X innerhalb Layover",
+          "legacy": {
+            "klass": "Z76",
+            "marker": "X",
+            "routing": "BLR",
+            "layover_ort": null,
+            "overnight": null,
+            "eur": 42.0,
+            "reason_counted": null,
+            "why_suspicious": null
+          }
+        },
+        {
+          "datum": "2025-01-05",
+          "note": "BLR Mid-Tour \u2014 X innerhalb Layover",
+          "legacy": {
+            "klass": "Z76",
+            "marker": "755",
+            "routing": "BLR",
+            "layover_ort": null,
+            "overnight": null,
+            "eur": 28.0,
+            "reason_counted": null,
+            "why_suspicious": null
+          }
+        },
+        {
+          "datum": "2025-04-08",
+          "note": "Pattern A residual \u2014 target_iata-Risiko",
+          "legacy": {
+            "klass": "Z76",
+            "marker": "90064",
+            "routing": "FRA",
+            "layover_ort": null,
+            "overnight": null,
+            "eur": 32.0,
+            "reason_counted": null,
+            "why_suspicious": null
+          }
+        },
+        {
+          "datum": "2025-10-05",
+          "note": "Pattern A residual \u2014 target_iata-Risiko",
+          "legacy": {
+            "klass": "Z76",
+            "marker": "18776",
+            "routing": "FRA",
+            "layover_ort": null,
+            "overnight": null,
+            "eur": 32.0,
+            "reason_counted": null,
+            "why_suspicious": null
+          }
+        }
+      ],
+      "phantom_z76": [],
+      "blr_jan_window": [
+        {
+          "datum": "2025-01-01",
+          "klass": "Frei",
+          "marker": "U",
+          "routing": "FRA",
+          "layover_ort": null,
+          "overnight": null,
+          "eur": 0.0,
+          "reason": null,
+          "why_suspicious": null
+        },
+        {
+          "datum": "2025-01-02",
+          "klass": "Frei",
+          "marker": "U",
+          "routing": "FRA",
+          "layover_ort": null,
+          "overnight": null,
+          "eur": 0.0,
+          "reason": null,
+          "why_suspicious": null
+        },
+        {
+          "datum": "2025-01-03",
+          "klass": "Z76",
+          "marker": "31591",
+          "routing": "FRA",
+          "layover_ort": null,
+          "overnight": null,
+          "eur": 28.0,
+          "reason": null,
+          "why_suspicious": null
+        },
+        {
+          "datum": "2025-01-04",
+          "klass": "Z76",
+          "marker": "X",
+          "routing": "BLR",
+          "layover_ort": null,
+          "overnight": null,
+          "eur": 42.0,
+          "reason": null,
+          "why_suspicious": null
+        },
+        {
+          "datum": "2025-01-05",
+          "klass": "Z76",
+          "marker": "755",
+          "routing": "BLR",
+          "layover_ort": null,
+          "overnight": null,
+          "eur": 28.0,
+          "reason": null,
+          "why_suspicious": null
+        },
+        {
+          "datum": "2025-01-06",
+          "klass": "Issue",
+          "marker": "X",
+          "routing": "FRA",
+          "layover_ort": null,
+          "overnight": null,
+          "eur": 0.0,
+          "reason": null,
+          "why_suspicious": null
+        },
+        {
+          "datum": "2025-01-07",
+          "klass": "Frei",
+          "marker": "ORTSTAG",
+          "routing": "FRA",
+          "layover_ort": null,
+          "overnight": null,
+          "eur": 0.0,
+          "reason": null,
+          "why_suspicious": null
+        },
+        {
+          "datum": "2025-01-08",
+          "klass": "ZeroDay",
+          "marker": "==",
+          "routing": "FRA",
+          "layover_ort": null,
+          "overnight": null,
+          "eur": 0.0,
+          "reason": null,
+          "why_suspicious": null
+        }
+      ],
+      "errors_field": [],
+      "_v2_active_seen": false
+    }
+  },
+  "decision": "PENDING \u2014 bitte KPI-Diff + critical days pruefen und manuell PASS_FOR_STAGING oder NEEDS_FIX setzen."
+}

@@ -12281,6 +12281,7 @@ RAW_EXCERPT-Regel (strikt):
 
 REGELN (Hard):
 - KEINE Steuerbewertung. KEINE Beträge. KEINE Z72/Z73/Z76. KEINE VMA.
+- KEINE Notes, KEINE Erklärungen, KEINE Kommentare — nur strukturierte Felder.
 - warnings[] NUR bei echten Lese-Lücken (fehlender Tag, unklarer Plan).
 - Bei unklar: activity_type='unknown' + confidence='low'. NICHT raten.
 - WICHTIG: Tag mit X-Marker UND Landing-Zeit (z.B. "X -09:21 FRA") = flight, NICHT free.

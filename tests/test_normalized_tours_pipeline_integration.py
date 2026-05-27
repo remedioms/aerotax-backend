@@ -117,10 +117,16 @@ def test_flag_on_calls_normalized_tours(monkeypatch):
     assert mock_build.call_count == 1
 
 
-def test_flag_default_off():
-    """Default-State: Flag ist OFF (baseline-unchanged)."""
+def test_flag_default_on_after_r24():
+    """Default-State (seit R24, 2026-05-27): AEROTAX_USE_NORMALIZED_TOURS=ON.
+
+    Die normalized-tours-Pipeline ist produktiv stable, der Default ist
+    auf ON umgeschaltet. Test prüft nur dass die Flag existiert und ein
+    bool ist (ENV kann sie explizit überschreiben)."""
     if 'AEROTAX_USE_NORMALIZED_TOURS' not in os.environ:
-        assert app.AEROTAX_USE_NORMALIZED_TOURS is False
+        assert isinstance(app.AEROTAX_USE_NORMALIZED_TOURS, bool)
+        # R24: Default ist ON
+        assert app.AEROTAX_USE_NORMALIZED_TOURS is True
 
 
 def test_audit_field_present_when_flag_on():

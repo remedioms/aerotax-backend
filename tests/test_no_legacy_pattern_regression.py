@@ -264,16 +264,22 @@ def test_hotfix_flags_exist_in_app():
 
 
 def test_hotfix_flags_default_off():
-    """Defaults müssen OFF sein — kein Behavior-Change baseline."""
-    # Nur ENV nicht gesetzt → default False
+    """Hotfix-Flags-Defaults: Safety-Defaults bleiben OFF, Feature-Flags
+    können explizit ON sein (R24: AEROTAX_USE_NORMALIZED_TOURS Default ON
+    ab 2026-05-27 — Hotfix war erfolgreich produktiv und ist jetzt Standard).
+    """
+    # Defensive Hotfix-Flags: Default OFF (Safety-Default für Notfall-Disable)
     if 'AEROTAX_BH003C_RESCUE_DISABLED' not in os.environ:
         assert app.AEROTAX_BH003C_RESCUE_DISABLED is False
     if 'AEROTAX_STRICT_HOTEL_NIGHTS' not in os.environ:
         assert app.AEROTAX_STRICT_HOTEL_NIGHTS is False
     if 'AEROTAX_STRICT_CLEANING_DAYS' not in os.environ:
         assert app.AEROTAX_STRICT_CLEANING_DAYS is False
+    # Feature-Flag AEROTAX_USE_NORMALIZED_TOURS ist seit R24 Default ON,
+    # weil die normalized-tours-Pipeline produktiv stable ist. Test prüft
+    # nur dass die Flag existiert und ein bool ist.
     if 'AEROTAX_USE_NORMALIZED_TOURS' not in os.environ:
-        assert app.AEROTAX_USE_NORMALIZED_TOURS is False
+        assert isinstance(app.AEROTAX_USE_NORMALIZED_TOURS, bool)
 
 
 def test_bh003c_code_path_has_disabled_branch():
