@@ -268,10 +268,22 @@ def normalize_cas_days_v2(
     # LMN_AS, LMN_CR). Reader liefert teilweise activity_type='unknown' für
     # diese bekannten LH-Codes — wir heilen das deterministisch zu 'free',
     # damit der Tag nicht als „Unbekannte Kennung" im Chat landet.
-    # Voraussetzung: kein duty time, kein Flugsegment, keine Tour-Signale.
+    #
+    # R29 (2026-05-27): zwei Klassen passiver Marker — Marker-Lexikon trägt
+    # Wissen das nicht in den CAS-Feldern steht (z.B. LMN_HT = Online-Training
+    # zuhause, auch wenn duty/start_time gesetzt sind = keine Fahrt zum HB).
+    #   - _PASSIVE_STRICT = passiv unabhängig von CAS-Feldern
+    #     (LMN_HT/LMN_HT1/LMN_AD/LMN_AL/LMN_DS/LMN_FT = Home-Maßnahmen;
+    #      OFF/OF = Off-Day; ORTSTAG = lokaler HB-Passiv-Tag)
+    #   - _PASSIVE_FIELDS_RULE = passiv NUR wenn auch CAS-Felder leer
+    #     (FRS/FRD/LMN_AS/LMN_CR = können auch echte Standort-Termine sein)
     # ───────────────────────────────────────────────────────────────────────
+    _PASSIVE_STRICT_LOCAL = {
+        'ORTSTAG', 'OF', 'OFF',
+        'LMN_HT', 'LMN_HT1', 'LMN_AD', 'LMN_AL', 'LMN_DS', 'LMN_FT',
+    }
     for d in days:
-        marker = d.get('normalized_marker') or ''
+        marker = (d.get('normalized_marker') or '').strip().upper()
         if not _is_passive_marker(marker):
             continue
         at = (d.get('activity_type') or '').lower()
@@ -280,8 +292,27 @@ def normalize_cas_days_v2(
         duty = int(d.get('duty_duration_minutes') or 0)
         has_fl = bool(d.get('has_fl'))
         routing = d.get('routing_iatas') or []
-        if duty > 0 or has_fl or routing:
-            # Marker ist passiv, aber Tag hat aktive Signale — nicht heilen
+        start_time = (d.get('start_time') or '').strip()
+        end_time = (d.get('end_time') or '').strip()
+        overnight = bool(d.get('overnight_after_day'))
+        is_strict = marker in _PASSIVE_STRICT_LOCAL
+
+        if is_strict:
+            # LMN_HT*/OFF/ORTSTAG: immer passiv (User war zuhause, auch wenn
+            # CAS-Felder für Online-Schulung Werte tragen)
+            d['activity_type'] = 'free'
+            d['healed_by'].append('R0_passive_marker_strict_to_free')
+            continue
+
+        # FRS/FRD/LMN_AS/LMN_CR: nur dann free wenn Felder auch leer sind.
+        # Bei Briefing-Zeit könnte echter Standort-Termin gemeint sein
+        # (z.B. FRS mit start=04:45 = Tour-Start statt Frei-Schicht).
+        if duty > 0 or has_fl or routing or start_time or end_time or overnight:
+            d['warnings'].append(
+                f'R0 skip: marker {marker} passive-default but CAS fields '
+                f'active (duty={duty}, start={start_time!r}, routing={routing}, '
+                f'overnight={overnight}) — fields win, leaving as unknown'
+            )
             continue
         d['activity_type'] = 'free'
         d['healed_by'].append('R0_passive_marker_to_free')

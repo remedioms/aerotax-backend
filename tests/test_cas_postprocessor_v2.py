@@ -219,20 +219,51 @@ def test_r0_passive_marker_unknown_heals_to_free():
     out = cp.normalize_cas_days_v2(days, homebase='FRA')
     target = [d for d in out if d['datum'] == '2025-01-29'][0]
     assert target['activity_type'] == 'free'
-    assert 'R0_passive_marker_to_free' in target.get('healed_by', [])
+    # R29: LMN_HT1 ist STRICT-passive (auch ohne Felder) → strict-Label
+    healed = target.get('healed_by', [])
+    assert ('R0_passive_marker_strict_to_free' in healed
+            or 'R0_passive_marker_to_free' in healed)
 
 
-def test_r0_passive_marker_with_duty_does_not_heal():
-    """Wenn passiver Marker doch duty/Flug-Signale hat (theoretisch), wird
-    NICHT zu free geheilt — Reader hat dann etwas Aktives gelesen, das
-    respektiert wird."""
+def test_r29_strict_passive_marker_heals_even_with_duty():
+    """R29 (2026-05-27): STRICT-passive Marker (LMN_HT*, ORTSTAG, OF/OFF)
+    bleiben passiv auch wenn Felder Werte tragen — User war zuhause auch
+    bei Online-Schulung mit duty/start_time. Beispiel: Tibor 29.01.2025
+    LMN_HT1 13:00-17:00 = 4h Online-Schulung von zuhause = kein Fahrtag."""
     days = [
         _cas('2025-01-29', marker='LMN_HT1', activity_type='unknown',
-             duty_min=600),
+             duty_min=240),
+    ]
+    out = cp.normalize_cas_days_v2(days, homebase='FRA')
+    # STRICT passive: heilt trotz duty
+    assert out[0]['activity_type'] == 'free'
+    assert 'R0_passive_marker_strict_to_free' in out[0].get('healed_by', [])
+
+
+def test_r29_flexible_passive_marker_with_briefing_does_not_heal():
+    """R29 (2026-05-27): FRS/FRD/LMN_AS/LMN_CR werden NUR dann zu free
+    geheilt wenn auch CAS-Felder leer sind. Wenn Briefing-Zeit gelesen
+    wurde, ist es ein echter Standort-Termin (z.B. LMN_AS-Schulung am HB)
+    und bleibt unknown → später vom Klassifikator als Office klassifiziert."""
+    # FRS mit Briefing-Zeit
+    days = [
+        {'datum': '2025-02-10', 'marker_raw': 'FRS',
+         'activity_type': 'unknown', 'start_time': '04:45'},
     ]
     out = cp.normalize_cas_days_v2(days, homebase='FRA')
     assert out[0]['activity_type'] == 'unknown'
-    assert 'R0_passive_marker_to_free' not in out[0].get('healed_by', [])
+    assert any('passive-default but CAS fields active' in w
+               for w in out[0].get('warnings', []))
+
+
+def test_r29_flexible_passive_marker_empty_heals():
+    """R29: FRS ohne CAS-Felder → trotzdem zu free geheilt."""
+    days = [
+        _cas('2025-02-11', marker='FRS', activity_type='unknown'),
+    ]
+    out = cp.normalize_cas_days_v2(days, homebase='FRA')
+    assert out[0]['activity_type'] == 'free'
+    assert 'R0_passive_marker_to_free' in out[0].get('healed_by', [])
 
 
 def test_r0_already_free_passive_marker_skipped():
@@ -242,7 +273,10 @@ def test_r0_already_free_passive_marker_skipped():
     ]
     out = cp.normalize_cas_days_v2(days, homebase='FRA')
     assert out[0]['activity_type'] == 'free'
-    assert 'R0_passive_marker_to_free' not in out[0].get('healed_by', [])
+    # Nicht doppelt heilen
+    healed = out[0].get('healed_by', [])
+    assert 'R0_passive_marker_to_free' not in healed
+    assert 'R0_passive_marker_strict_to_free' not in healed
 
 
 def test_normalize_home_standby_stays_home_standby():

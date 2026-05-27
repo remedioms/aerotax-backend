@@ -21373,9 +21373,17 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             in_training_seq_followup = i in training_seq_skip
             # v15 Fix: passive Marker (ORTSTAG/FRS/LMN_AS/LMN_CR) ohne Uhrzeit
             # = nicht-dienstlicher Tag → kein review-item
+            # R29 (2026-05-27) Activity-First-Schärfung: „passiv" nur wenn die
+            # CAS-Felder auch passiv aussehen — kein start_time, kein end_time,
+            # kein duty. Marker übersteuert NIE klare CAS-Felder.
             raw_mk_rev = (d.get('raw_marker', '') or '').upper()
+            _has_any_time_rev = (
+                duty_known_rev
+                or bool((d.get('start_time') or '').strip())
+                or bool((d.get('end_time') or '').strip())
+            )
             is_passive_no_duty = (
-                not duty_known_rev
+                not _has_any_time_rev
                 and any(mk in raw_mk_rev for mk in ('ORTSTAG', 'FRS', 'LMN_AS', 'LMN_CR'))
             )
             # v15 Phase-1 Cluster A: wenn CAS-Reader Uhrzeit liefert (auch wenn
