@@ -19534,6 +19534,29 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         # andere Airline-Codes, …), aber die SE eine aktive Auslands-Zeile zeigt
         # → der Tag war eine Auslandstour. Kein Chat nötig. SE ist autoritative
         # Quelle für „User war wo am Tag X".
+        #
+        # R34 (2026-05-27) Korrektur: SE-Override DARF NICHT greifen wenn der CAS
+        # eindeutig passiv ist (FRS/ORTSTAG/LMN_HT* ohne Uhrzeit/Routing/Overnight).
+        # Eine SE-Zeile am Frei-Tag ist meist Buchhaltungs-Artefakt (z.B. nach-
+        # trägliche Spesen-Auszahlung für andere Tour). User-Feedback Tibor
+        # 25.03 FRS + AMM 38€: User war zuhause, SE-Zeile gehört zu anderer
+        # Amman-Tour. CAS-klar-passiv ist autoritativer als SE-Buchhaltung.
+        _PASSIVE_HOME_OVR = (
+            'FRS', 'FRD', 'ORTSTAG', 'OFF', 'OF', 'URLAUB', 'U1', 'U2',
+            'LMN_HT', 'LMN_HT1', 'LMN_AS', 'LMN_CR',
+            'LMN_AD', 'LMN_AL', 'LMN_DS', 'LMN_FT',
+        )
+        _raw_mk_ovr = (d.get('raw_marker') or '').upper().strip()
+        _is_cas_clear_passive = (
+            any(_raw_mk_ovr == m or _raw_mk_ovr.startswith(m)
+                for m in _PASSIVE_HOME_OVR)
+            and not (d.get('start_time') or '').strip()
+            and not (d.get('end_time') or '').strip()
+            and not (d.get('routing') or [])
+            and not bool(d.get('overnight_after_day'))
+            and not (d.get('layover_ort') or '').strip()
+        )
+
         if at in ('frei', 'urlaub', 'krank', 'unknown'):
             _se_active_foreign = (
                 se.get('count', 0) > 0
@@ -19541,6 +19564,10 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                 and se.get('stfrei_inland') is False
                 and bool(se.get('stfrei_ort'))
             )
+            # R34: klar passiver CAS-Tag → SE-Zeile ist Buchhaltungs-Artefakt,
+            # KEIN Override. Tag bleibt Frei, SE landet als unmapped_se im Audit.
+            if _is_cas_clear_passive:
+                _se_active_foreign = False
             if at in ('frei', 'unknown') and _se_active_foreign:
                 _se_ort_ov = se.get('stfrei_ort', '').upper().strip()
                 _bmf_ov = _bmf(_se_ort_ov)
