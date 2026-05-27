@@ -7263,16 +7263,21 @@ def test_v91_ai_chat_falls_back_to_regex_parser_when_ai_unavailable():
 
 
 def test_v91_ai_chat_validates_proposed_changes_against_pending():
-    """KI-proposed review_item_ids müssen aus pending_items kommen."""
+    """KI-proposed review_item_ids müssen existieren + valide Antwort haben.
+    R33 (2026-05-27): nicht-pending Items werden NICHT mehr gefiltert — Re-Apply
+    erlaubt User-Antwort-Korrektur (siehe auch test_calculation Block R30/R33).
+    Stattdessen wird die Re-Apply-Logik in /review/bulk-text bei status=answered
+    durch Vergleich mit it.user_answer geblockt wenn unchanged."""
     import app as _app
     src = open(_app.__file__).read()
     fn_idx = src.find('def post_ai_chat(')
     block = src[fn_idx:fn_idx+10000]
     assert 'iid not in items_by_id' in block, 'fremde IDs müssen abgelehnt werden'
-    assert "items_by_id[iid].get('status') != 'pending'" in block, \
-        'nicht-pending Items müssen gefiltert werden'
     assert "ans not in ('yes', 'no', 'unsure')" in block, \
         'Ungültige Antworten müssen abgelehnt werden'
+    # R33-Re-Apply: answered items dürfen Preview kriegen — keine pending-Filter
+    assert "items_by_id[iid].get('status') != 'pending'" not in block, \
+        'R33: pending-Filter wurde entfernt für Re-Apply-Support'
 
 
 def test_v91_ai_chat_bulk_forces_confirmation():
@@ -8088,13 +8093,17 @@ def test_v10_cas_upload_handler_present():
     assert 'window._cas_files' in src, 'window._cas_files State fehlt'
 
 
-def test_v10_cas_auto_replay_after_calc():
-    """Nach Calc-Done werden gespeicherte CAS-Files via existing Multi-CAS-Flow ausgewertet."""
+def test_v10_cas_auto_replay_removed():
+    """R26+ (2026-05-27): CAS-Auto-Replay an Vision-OCR-Endpoint entfernt.
+    Begründung: die PDFs wurden bereits vom Backend mit Sonnet ausgelesen, ein
+    nochmaliger Reupload an den Screenshot-Endpoint findet nichts Neues und
+    erzeugte nur den irreführenden Template-Fallback „klarere Screenshots".
+    Chat öffnet jetzt direkt, KI fragt anhand der offenen Review-Items."""
     src = _read_frontend()
-    # Auto-Replay-Hook im setHeroForResult-Pfad
-    assert '_cas_auto_replayed' in src, 'CAS-Auto-Replay-Guard fehlt'
-    assert '_chatAttachedFiles' in src and 'docType: \'roster_screenshot\'' in src, \
-        'CAS-Files müssen via Multi-CAS-Chat-Flow gequeued werden'
+    assert '_cas_auto_replayed' not in src, \
+        'Auto-Replay-Guard wurde bewusst entfernt (R26+)'
+    # Chat-Open bleibt — nur ohne den Auto-Replay-Block dahinter
+    assert '_chatOpen' in src, 'chatOpen muss weiterhin existieren'
 
 
 # ── Targeted CAS Reader v2 ────────────────────────────────────────────────
