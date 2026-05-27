@@ -154,6 +154,55 @@ class TestTourBuilder:
         # Office am HB ohne Foreign-Signal/Overnight → keine Tour
         assert len(tours) == 0
 
+    def test_mid_tour_x_marker_keeps_tour_open(self):
+        """Mid-Tour `X BOM` mit dünnen Reader-Feldern darf Tour nicht zerbrechen.
+
+        Pattern (Tibor 03-29..03-31): Anreise BOM → Layover-Tag mit Marker `X`
+        und activity='frei' (Reader-Bug) → Heimkehr. V2 muss alle 3 als
+        EINE Tour klammern, nicht 2 1-Tages-Touren.
+        """
+        days = [
+            _day('2025-03-29', marker='74016 P1', routing=['FRA', 'BOM'],
+                 layover='BOM', overnight=True, starts_hb=True, duty=814,
+                 start='10:25'),
+            _day('2025-03-30', marker='X BOM', layover='BOM', overnight=True,
+                 activity='frei'),  # Reader-Bug: activity='frei' aber Mid-Tour
+            _day('2025-03-31', marker='757', routing=['BOM', 'FRA'],
+                 ends_hb=True, duty=169, start='21:10'),
+        ]
+        tours = build_tours(days, homebase='FRA')
+        assert len(tours) == 1
+        assert [d['datum'] for d in tours[0].days] == [
+            '2025-03-29', '2025-03-30', '2025-03-31',
+        ]
+
+    def test_phantom_no_active_signal_filtered(self):
+        """Reader-Stempel-Leichen (layover=SFO ohne duty/start/overnight) sind
+        KEINE Touren. Klassischer Phantom: nach Heimkehr stempelt Reader
+        layover_ort vom Vortag auf Folgetage."""
+        days = [
+            _day('2025-04-04', marker='===', layover='SFO'),
+            _day('2025-04-05', marker='===', layover='SFO'),
+            _day('2025-04-06', marker='===', layover='SFO'),
+        ]
+        tours = build_tours(days, homebase='FRA')
+        assert len(tours) == 0
+
+    def test_activity_frei_ignored_when_foreign_layover(self):
+        """activity_type='frei' bei foreign-Layover ist Reader-Bug, kein
+        echter Frei-Tag. Wird in Tour-Klammer aufgenommen."""
+        days = [
+            _day('2025-05-15', marker='LH462', routing=['FRA', 'JFK'],
+                 layover='JFK', overnight=True, starts_hb=True, duty=540),
+            _day('2025-05-16', marker='X', layover='JFK', overnight=True,
+                 activity='frei'),
+            _day('2025-05-17', marker='LH463', routing=['JFK', 'FRA'],
+                 ends_hb=True, duty=520),
+        ]
+        tours = build_tours(days, homebase='FRA')
+        assert len(tours) == 1
+        assert len(tours[0].days) == 3
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Regel 3: day_role_in_tour

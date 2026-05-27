@@ -262,7 +262,21 @@ def build_tours(sorted_days: List[Dict[str, Any]], homebase: str = 'FRA') -> Lis
         nonlocal current, tour_counter
         if not current:
             return
-        # Minimum: 1 Tag mit echtem Tour-Signal sonst verwerfen
+        # R40 fix (2026-05-27): eine echte Tour MUSS mindestens 1 Tag mit
+        # AKTIVEM Signal haben: overnight=True ODER start_time ODER duty>0.
+        # Reine Layover-/Routing-Stempel-Leichen (Reader liefert layover=SFO
+        # für mehrere Tage NACH der Heimkehr ohne neue Aktivität) sind KEINE
+        # neue Tour. Diese Edge-Case-Heilung schließt 1-Tages-Phantom-Touren.
+        has_active_signal = any(
+            bool(d.get('overnight_after_day'))
+            or (d.get('start_time') or '').strip()
+            or int(d.get('duty_duration_minutes') or 0) > 0
+            for d in current
+        )
+        if not has_active_signal:
+            current = []
+            return
+        # Plus: alter Check für irgendeine Foreign-/Flight-Evidence
         has_signal = any(
             _has_foreign_iata_in_routing(d.get('routing'), hb_up)
             or (d.get('layover_ort') and not _is_inland_iata(d.get('layover_ort','')) and d.get('layover_ort','').upper() != hb_up)
@@ -291,8 +305,21 @@ def build_tours(sorted_days: List[Dict[str, Any]], homebase: str = 'FRA') -> Lis
         marker_raw = day.get('marker_raw') or day.get('marker') or ''
         kind = classify_marker(marker_raw, day)
         activity = (day.get('activity_type') or '').lower()
-        is_free_activity = activity in ('frei', 'urlaub', 'krank', 'off')
         cas_empty = _cas_fields_are_empty(day)
+
+        # R40 fix (2026-05-27): activity_type='frei' ist nur dann wirklich
+        # Frei, wenn KEINE Mid-Tour-Signale präsent sind. Reader stempelt
+        # gerne Marker `X`, `===` etc. als activity='frei', auch wenn der
+        # Tag overnight=True ODER ein Foreign-Layover-Ort hat (Mid-Tour-Layover).
+        # Solche Tage gehören weiter in die Tour-Klammer.
+        _ov_now = bool(day.get('overnight_after_day'))
+        _lay_now = (day.get('layover_ort') or '').upper().strip()
+        _has_foreign_lay = _lay_now and not _is_inland_iata(_lay_now) and _lay_now != hb_up
+        is_free_activity = (
+            activity in ('frei', 'urlaub', 'krank', 'off')
+            and not _ov_now
+            and not _has_foreign_lay
+        )
 
         # Außerhalb-Tour-Konditionen
         is_strict_passive = (kind == MarkerKind.STRICT_PASSIVE)
@@ -301,6 +328,19 @@ def build_tours(sorted_days: List[Dict[str, Any]], homebase: str = 'FRA') -> Lis
 
         if is_strict_passive or is_flex_passive_empty or is_standby_home or is_free_activity:
             _flush()
+            continue
+
+        # R40 fix (2026-05-27): Mid-Tour-Klammer. Wenn der vorige Tag in der
+        # offenen Tour overnight_after_day=True hatte UND kein explicit-passive
+        # Marker existiert, ist DIESER Tag automatisch Mid-Tour (Layover-Tag).
+        # Reader-Felder können beim Mid-Tour-Tag lückenhaft sein (kein duty,
+        # kein start_time) — das darf die Tour nicht zerbrechen.
+        if current and bool(current[-1].get('overnight_after_day')) and not is_strict_passive:
+            current.append(day)
+            ends_hb_now = bool(day.get('ends_at_homebase'))
+            overnight_now = bool(day.get('overnight_after_day'))
+            if ends_hb_now and not overnight_now:
+                _flush()
             continue
 
         # In-Tour-Signale
