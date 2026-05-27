@@ -324,6 +324,14 @@ def build_tours(sorted_days: List[Dict[str, Any]], homebase: str = 'FRA') -> Lis
             and not overnight
         )
 
+        # R40 V2 fix (2026-05-27): foreign-routing ALLEIN reicht NICHT für
+        # neue Tour. Reader hinterlässt manchmal Foreign-IATA-Stempel auf
+        # Folgetagen einer beendeten Tour (z.B. 04.-06.04 mit routing=US
+        # nach 03.04 Heimkehr). Diese Phantom-„Touren" verfälschen Zähler.
+        # Korrektur: foreign-routing braucht zusätzliches Signal:
+        #   - Flight-Token im routing ODER
+        #   - overnight=True ODER
+        #   - foreign-Layover-Ort
         has_tour_signal = (
             has_foreign_routing or has_foreign_layover or overnight
             or same_day_inland or is_heimkehr
