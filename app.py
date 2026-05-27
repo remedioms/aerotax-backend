@@ -19802,18 +19802,27 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             # Finanzamt-konform: ohne Beweis von Anwesenheit am Flughafen darf
             # kein Fahrtag angerechnet werden.
             _raw_marker_o = (d.get('raw_marker') or '').upper().strip()
-            _LH_FREI_MARKERS = (
+            # R39 follow-up (2026-05-27): exact-match statt substring.
+            # Vorher: 'OFF' in 'OFFC' → True → Office-Marker wurde fälschlich
+            # passive. Jetzt: exakter Match oder LMN_-prefix (für LMN_HT1 etc).
+            _LH_FREI_EXACT = {
                 # Kategorie 1: Freie Tage / zusätzliche freie Tage
                 'ORTSTAG', 'OF', 'OFF', 'FRS', 'FRN', 'FM54', 'FM/Q',
                 'FQ/Q', 'FZ', 'QF',
-                # Kategorie 2: WBT (zuhause)
+                # Kategorie 2: WBT-Marker (Online-Schulung zuhause)
                 'LMN_AD', 'LMN_AL', 'LMN_AS', 'LMN_CR', 'LMN_DS',
                 'LMN_FT', 'LMN_HT', 'LMN_OD', 'LMHS',
                 'AVSEC', 'AVSEC_N',
                 # Kategorie 3: Legacy-defensiv
                 'FRD',
+            }
+            # LMN_-Prefixe matchen Day-Suffix-Varianten (LMN_HT1, LMN_AD2 etc)
+            _LH_LMN_PREFIXES = ('LMN_HT', 'LMN_AD', 'LMN_AL', 'LMN_AS', 'LMN_CR',
+                                'LMN_DS', 'LMN_FT', 'LMN_OD')
+            _is_passive_home = (
+                _raw_marker_o in _LH_FREI_EXACT
+                or any(_raw_marker_o.startswith(p) for p in _LH_LMN_PREFIXES)
             )
-            _is_passive_home = any(pm in _raw_marker_o for pm in _LH_FREI_MARKERS)
             # R39 (2026-05-27) BMF-Compliance-Fix: passive-Home-Marker sind IMMER Frei,
             # egal ob duty bekannt. ORTSTAG/LMN_HT mit duty=540min ist eine Online-
             # Schulung VON ZUHAUSE — keine Auswärtstätigkeit, kein Z72-Anspruch.
@@ -23205,6 +23214,111 @@ def hybrid_analyze(form, files, job_id=None):
             print(f"[normalized_tours] parallel audit FAILED (main pipeline unaffected): "
                   f"{type(_nt_exc).__name__}: {str(_nt_exc)[:200]}")
 
+    # ════════════════════════════════════════════════════════════════════════
+    # R40 Phase 2 — Classifier V2 Parallel-Audit (2026-05-27)
+    # ════════════════════════════════════════════════════════════════════════
+    # Läuft cleane V2-Architektur (classifier_v2.py) parallel zum Legacy-Pfad.
+    # Schreibt NUR Audit-Diff ins result_data — produktiv läuft weiter Legacy.
+    # Sobald Diffs für Real-User stabil 0 sind, kann auf V2 geswitcht werden.
+    _classifier_v2_audit = None
+    try:
+        from classifier_v2 import (
+            classify_marker, build_tours, day_role_in_tour,
+            resolve_country, is_hotel_night,
+            MarkerKind, DayRole, Tour as V2Tour,
+        )
+        v2_tours = build_tours(_cas_days, homebase=homebase)
+        v2_by_date = {}
+        v2_z76_eur = 0.0
+        v2_z73_eur = 0.0
+        v2_z72_eur = 0.0
+        v2_z74_eur = 0.0
+        v2_hotel = 0
+        v2_fahrtage = len(v2_tours)
+        for v2_tour in v2_tours:
+            for v2_day in v2_tour.days:
+                role = day_role_in_tour(v2_day, v2_tour, homebase)
+                country = resolve_country(v2_day, v2_tour, _se_rows,
+                                          IATA_TO_BMF, homebase)
+                hotel, hotel_reason = is_hotel_night(v2_day, v2_tour,
+                                                     country, role)
+                if hotel:
+                    v2_hotel += 1
+                # Klasse aus Rolle + Country bestimmen
+                v2_klass = 'none'
+                v2_eur = 0.0
+                if country.is_foreign and country.iata in _bmf_table:
+                    rate = _bmf_table[country.iata]
+                    if role == DayRole.MID_FULL_AWAY:
+                        v2_klass = 'Z76'
+                        v2_eur = float(rate.get('voll_24h') or 0)
+                    elif role in (DayRole.DEPARTURE, DayRole.RETURN):
+                        v2_klass = 'Z76'
+                        v2_eur = float(rate.get('an_abreise') or 0)
+                    v2_z76_eur += v2_eur
+                v2_by_date[v2_day.get('datum')] = {
+                    'klass': v2_klass, 'eur': round(v2_eur, 2),
+                    'role': role.value, 'country': country.country,
+                    'hotel': hotel,
+                }
+        # Diff gegen Legacy (classification + normalized_tours-Override)
+        legacy_z76 = float(classification.get('vma_aus', 0) or 0)
+        legacy_hotel = int(classification.get('hotel_naechte', 0) or 0)
+        legacy_fahrtage = int(classification.get('fahr_tage', 0) or 0)
+        # Tag-Level-Diff
+        legacy_td = classification.get('tage_detail') or []
+        tag_diffs = []
+        for entry in legacy_td:
+            if not isinstance(entry, dict):
+                continue
+            ds = entry.get('datum')
+            v2 = v2_by_date.get(ds)
+            if not v2:
+                continue
+            legacy_klass = (entry.get('klass') or '').upper().strip()
+            legacy_eur = float(entry.get('eur') or 0)
+            v2_klass = (v2.get('klass') or '').upper().strip()
+            v2_eur = float(v2.get('eur') or 0)
+            if legacy_klass != v2_klass or abs(legacy_eur - v2_eur) > 0.5:
+                tag_diffs.append({
+                    'datum': ds,
+                    'legacy': {'klass': legacy_klass, 'eur': legacy_eur},
+                    'v2': {'klass': v2_klass, 'eur': v2_eur,
+                           'role': v2.get('role'),
+                           'country': v2.get('country')},
+                })
+        _classifier_v2_audit = {
+            'tours_count':    len(v2_tours),
+            'fahrtage':       v2_fahrtage,
+            'hotel_naechte':  v2_hotel,
+            'z76_eur':        round(v2_z76_eur, 2),
+            'legacy_z76_eur': legacy_z76,
+            'legacy_hotel':   legacy_hotel,
+            'legacy_fahrtage': legacy_fahrtage,
+            'delta_z76':      round(v2_z76_eur - legacy_z76, 2),
+            'delta_hotel':    v2_hotel - legacy_hotel,
+            'delta_fahrtage': v2_fahrtage - legacy_fahrtage,
+            'tag_diffs_count': len(tag_diffs),
+            'tag_diffs':      tag_diffs[:50],  # cap at 50 for size
+        }
+        print(f"[classifier_v2] tours={len(v2_tours)} z76={v2_z76_eur:.0f}€ "
+              f"hotel={v2_hotel} fahrtage={v2_fahrtage} | "
+              f"vs legacy z76={legacy_z76:.0f}€ hotel={legacy_hotel} "
+              f"fahrtage={legacy_fahrtage} | "
+              f"Δz76={v2_z76_eur-legacy_z76:+.0f}€ "
+              f"Δhotel={v2_hotel-legacy_hotel:+d} "
+              f"Δfahrtage={v2_fahrtage-legacy_fahrtage:+d} "
+              f"diffs={len(tag_diffs)}")
+    except Exception as _v2_exc:
+        import traceback as _v2_tb
+        _classifier_v2_audit = {
+            'error':   str(_v2_exc)[:300],
+            'type':    type(_v2_exc).__name__,
+            'trace':   _v2_tb.format_exc()[-600:],
+        }
+        print(f"[classifier_v2] audit FAILED (main pipeline unaffected): "
+              f"{type(_v2_exc).__name__}: {str(_v2_exc)[:200]}")
+
     # R17 Audit (2026-05-26): V2-Reader-Flag-Status top-level sichtbar machen,
     # damit Validation-Harness korrekt prüfen kann ob V2 lief.
     _cas_reader_v2_active = bool(
@@ -23229,6 +23343,8 @@ def hybrid_analyze(form, files, job_id=None):
         '_normalized_tours_audit_error': _normalized_tours_audit_error,
         # R17 (2026-05-26): V2-Flag-Audit auf Top-Level
         'cas_reader_v2_active':          _cas_reader_v2_active,
+        # R40 Phase 2 (2026-05-27): Classifier V2 Parallel-Audit (audit-only)
+        '_classifier_v2_audit':          _classifier_v2_audit,
     }
 
 
