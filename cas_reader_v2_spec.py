@@ -359,6 +359,6 @@ def validate_cas_reader_v2_response(response: dict) -> dict:
 # ════════════════════════════════════════════════════════════════════════════
 
 def is_v2_enabled() -> bool:
-    """True wenn AEROTAX_CAS_READER_V2=1."""
+    """True wenn AEROTAX_CAS_READER_V2!=0. Default ON ab R24 (2026-05-27)."""
     import os
-    return os.environ.get('AEROTAX_CAS_READER_V2', '0') == '1'
+    return os.environ.get('AEROTAX_CAS_READER_V2', '1') != '0'

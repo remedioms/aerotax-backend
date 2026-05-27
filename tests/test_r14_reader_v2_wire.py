@@ -103,7 +103,7 @@ def fake_anthropic(monkeypatch):
 # ────────────────────────────────────────────────────────────────────────────
 
 def test_v2_flag_off_does_not_append_v2_prompt(fake_anthropic, monkeypatch):
-    monkeypatch.delenv('AEROTAX_CAS_READER_V2', raising=False)
+    monkeypatch.setenv('AEROTAX_CAS_READER_V2', '0')  # R24: explizit OFF
     result = app._sonnet_read_cas_single_pdf(
         pdf_bytes=b'fake', year=2025, homebase='FRA',
         source_filename='cas_test.pdf',
@@ -133,7 +133,7 @@ def test_v2_flag_on_appends_v2_prompt(fake_anthropic, monkeypatch):
 
 def test_v2_flag_off_keeps_legacy_prompt_intact(fake_anthropic, monkeypatch):
     """Default-Pfad bleibt unveraendert: alter Prompt wird verwendet."""
-    monkeypatch.delenv('AEROTAX_CAS_READER_V2', raising=False)
+    monkeypatch.setenv('AEROTAX_CAS_READER_V2', '0')  # R24: explizit OFF
     app._sonnet_read_cas_single_pdf(
         pdf_bytes=b'fake', year=2025, homebase='FRA',
         source_filename='cas_test.pdf',
@@ -144,12 +144,12 @@ def test_v2_flag_off_keeps_legacy_prompt_intact(fake_anthropic, monkeypatch):
     assert 'submit_cas_days' in prompt_text
 
 
-def test_v2_flag_default_is_off():
-    """Ohne env-var ist V2 aus (per Spec)."""
+def test_v2_flag_default_is_on():
+    """R24 (2026-05-27): V2 ist Default-ON nach Tibor-Validation."""
     from cas_reader_v2_spec import is_v2_enabled
     saved = os.environ.pop('AEROTAX_CAS_READER_V2', None)
     try:
-        assert is_v2_enabled() is False
+        assert is_v2_enabled() is True
     finally:
         if saved is not None:
             os.environ['AEROTAX_CAS_READER_V2'] = saved
@@ -176,7 +176,7 @@ def _valid_v2_day():
 
 
 def test_validator_hook_off_when_flag_off(monkeypatch):
-    monkeypatch.delenv('AEROTAX_CAS_READER_V2', raising=False)
+    monkeypatch.setenv('AEROTAX_CAS_READER_V2', '0')  # R24: explizit OFF
     v = app._validate_cas_v2_postprocessed_response([_valid_v2_day()])
     assert v['used'] is False
     assert v['errors'] == []

@@ -237,8 +237,15 @@ def test_validator_response_rejects_missing_days():
 # R11.E Feature-Flag
 # ----------------------------------------------------------------------------
 
-def test_v2_flag_off_by_default(monkeypatch):
+def test_v2_flag_on_by_default(monkeypatch):
+    """R24 (2026-05-27): Default-ON nach Tibor-Validation. Rollback via
+    explizitem AEROTAX_CAS_READER_V2=0."""
     monkeypatch.delenv('AEROTAX_CAS_READER_V2', raising=False)
+    assert is_v2_enabled() is True
+
+
+def test_v2_flag_explicit_zero_disables(monkeypatch):
+    monkeypatch.setenv('AEROTAX_CAS_READER_V2', '0')
     assert is_v2_enabled() is False
 
 

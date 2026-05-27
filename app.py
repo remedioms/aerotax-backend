@@ -434,7 +434,7 @@ AEROTAX_STRICT_CLEANING_DAYS = os.environ.get(
 # ausgeführt, Output landet in result-dict als '_normalized_tours_audit'.
 # Default '0' — normalized_tours wird nicht aufgerufen.
 AEROTAX_USE_NORMALIZED_TOURS = os.environ.get(
-    'AEROTAX_USE_NORMALIZED_TOURS', '0') == '1'
+    'AEROTAX_USE_NORMALIZED_TOURS', '1') == '1'  # R24: Default ON ab 2026-05-27
 
 # v11 B-015: Chunk-Persistence-Flag.
 # v10.4 hatte job_chunks-Persistierung eingeführt, um bei großem DP-Reader (~200
