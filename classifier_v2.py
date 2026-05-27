@@ -75,16 +75,19 @@ class Tour:
 
 @dataclass
 class DayClassification:
-    klass: str           # 'Frei'|'Z72'|'Z73'|'Z74'|'Z76'|'Office'|'Standby'|'Issue'
+    klass: str           # 'Frei'|'Z72'|'Z73'|'Z74'|'Z76'|'Office'|'Standby'|'ZeroDay'|'Issue'
     eur: float = 0.0
-    rate_type: str = 'none'
+    rate_type: str = 'none'  # 'voll_24h'|'an_abreise'|'tagestrip_8h'|'none'|'unknown'
     country: Optional[str] = None
+    bmf_land: Optional[str] = None
+    bmf_tagtyp: Optional[str] = None
     is_hotel_night: bool = False
     is_fahrtag: bool = False
     is_arbeitstag: bool = False
     is_reinigungstag: bool = False
     reason: str = ''
     source: str = 'none'
+    warnings: List[str] = field(default_factory=list)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -535,12 +538,19 @@ def resolve_country(
         if r:
             return r
 
-    # 3. day.target_iata (aus routing — erstes Foreign-Token)
+    # 3. day.target_iata (aus routing)
+    # Strategie:
+    #   - kein overnight (Same-Day-Tag): LETZTER foreign-IATA = Tagesziel
+    #     z.B. ['FRA','MXP','GVA'] → GVA (Schweiz), nicht MXP (Italien transit)
+    #   - mit overnight: ERSTER foreign-IATA = Anreise-Ziel (Layover dürfte
+    #     Hauptquelle sein, das hier ist Fallback)
     routing = day.get('routing') or []
-    for tok in (routing if isinstance(routing, list) else []):
-        r = _make_result(tok, 'CAS.routing_target')
-        if r:
-            return r
+    if isinstance(routing, list) and routing:
+        order = list(reversed(routing)) if not day.get('overnight_after_day') else list(routing)
+        for tok in order:
+            r = _make_result(tok, 'CAS.routing_target')
+            if r:
+                return r
 
     # 4. Tour-Neighbor-Layover
     if tour:
@@ -590,3 +600,314 @@ def is_hotel_night(
         return (False, f'role_{role.value}')
 
     return (True, 'ok')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Regel 6: classify_day — finale Tag-Klassifikation (Z72/Z73/Z74/Z76/...)
+# ════════════════════════════════════════════════════════════════════════════
+
+# BMF-Inland-Pauschalen (§9 Abs. 4a EStG, gültig 2023-2026).
+_BMF_INLAND = {
+    'an_abreise': 14.0,
+    'tagestrip_8h': 14.0,
+    'voll_24h': 28.0,
+}
+
+
+def classify_day(
+    day: Dict[str, Any],
+    tour: Optional[Tour],
+    country: CountryResult,
+    hotel_info: Optional[Tuple[bool, str]] = None,
+    bmf_auslandj: Optional[Dict[str, Tuple[float, float]]] = None,
+    homebase: str = 'FRA',
+) -> DayClassification:
+    """Klassifiziert einen Tag final in Z72/Z73/Z74/Z76/Frei/Office/Standby/Issue.
+
+    Verantwortung:
+      - kein Tour ⇒ Frei/Office/Standby/Issue je nach Marker/Aktivität
+      - Tour-Tag ⇒ DayRole + Country → Z-Code + Pauschale
+
+    BMF-Compliance (CLAUDE.md R39):
+      - Z72 nur bei echter Auswärtstätigkeit am HB (Same-Day-Inland >8h)
+      - Schulung am HB ohne Foreign-Routing → Office (erste Tätigkeitsstätte)
+      - Standby (auch aktiviert) → Standby/Z73 nur wenn Auslands-Aktivierung
+        in den Reader-Fakten erscheint
+
+    Args:
+      day:         Reader-Tag-Dict (datum, marker_raw, routing, layover_ort,
+                   overnight_after_day, starts_at_homebase, ends_at_homebase,
+                   duty_duration_minutes, start_time, end_time, activity_type)
+      tour:        Tour aus build_tours() oder None
+      country:     CountryResult aus resolve_country()
+      hotel_info:  (is_hotel_night, reason) aus is_hotel_night() — optional
+      bmf_auslandj: dict country_key → (voll_24h, an_abreise) für das Jahr.
+                   Wenn None: nur Inland-Klassifikation, Ausland-Tage werden
+                   Z76 mit eur=0 markiert + warning.
+      homebase:    IATA-Code
+
+    Returns:
+      DayClassification(klass, eur, rate_type, reason, ...)
+    """
+    marker_raw = day.get('marker_raw') or day.get('marker') or ''
+    marker_kind = classify_marker(marker_raw, day)
+    activity = (day.get('activity_type') or '').lower()
+    starts_hb = bool(day.get('starts_at_homebase'))
+    ends_hb = bool(day.get('ends_at_homebase'))
+    overnight = bool(day.get('overnight_after_day'))
+    duty = int(day.get('duty_duration_minutes') or 0)
+    routing = day.get('routing') or []
+    hb_up = (homebase or 'FRA').upper()
+    has_foreign_routing = _has_foreign_iata_in_routing(routing, hb_up)
+    has_flight = _has_flight_token_in_routing(routing)
+    layover = (day.get('layover_ort') or '').upper().strip()
+    has_foreign_layover = (
+        layover
+        and not _is_inland_iata(layover)
+        and layover != hb_up
+    )
+
+    # ────────────────────────────────────────────────────────────────────
+    # Stage 1: Nicht-Tour-Tage
+    # ────────────────────────────────────────────────────────────────────
+    if tour is None:
+        if marker_kind == MarkerKind.STRICT_PASSIVE:
+            return DayClassification(klass='Frei', reason='strict_passive_marker')
+        if activity in ('frei', 'urlaub', 'krank', 'off') and not (overnight or has_foreign_layover):
+            return DayClassification(klass='Frei', reason='activity_frei')
+        if marker_kind == MarkerKind.FLEXIBLE_PASSIVE and _cas_fields_are_empty(day):
+            return DayClassification(klass='Frei', reason='flexible_passive_empty')
+        if marker_kind == MarkerKind.STANDBY_HOME:
+            return DayClassification(klass='Standby', reason='standby_home')
+        if marker_kind == MarkerKind.STANDBY_AIRPORT:
+            return DayClassification(klass='Standby', reason='standby_airport_no_activation')
+        if marker_kind == MarkerKind.TRAINING and starts_hb and ends_hb and not has_foreign_routing:
+            # Schulung am HB: erste Tätigkeitsstätte (BMF R39) → kein Z72.
+            if duty >= 480:
+                return DayClassification(
+                    klass='Office', reason='training_at_hb_8h_no_z72_bmf_r39')
+            return DayClassification(klass='Office', reason='training_at_hb_short')
+        if duty == 0 and not (day.get('start_time') or '').strip():
+            return DayClassification(klass='ZeroDay', reason='no_duty_no_signal')
+        # Office am HB ohne foreign-Routing, >0 duty
+        if starts_hb and ends_hb and not has_foreign_routing and not overnight:
+            return DayClassification(klass='Office', reason='office_at_hb')
+        return DayClassification(klass='Issue', reason='no_tour_no_clear_pattern')
+
+    # ────────────────────────────────────────────────────────────────────
+    # Stage 2: Tour-Tag
+    # ────────────────────────────────────────────────────────────────────
+    role = day_role_in_tour(day, tour, homebase)
+
+    # SAME_DAY_INLAND ohne foreign-Routing: Inland-Same-Day-Tour
+    if role == DayRole.SAME_DAY_INLAND:
+        if has_foreign_routing or has_foreign_layover:
+            # technisch Same-Day-Foreign
+            if country.is_foreign and bmf_auslandj:
+                rates = bmf_auslandj.get(country.country) or (0.0, 0.0)
+                eur = float(rates[1])  # an_abreise
+                return DayClassification(
+                    klass='Z76', eur=eur, rate_type='an_abreise',
+                    reason=f'foreign_same_day_{country.iata}',
+                    bmf_land=country.country, bmf_tagtyp='an_abreise')
+            return DayClassification(
+                klass='Z76', eur=0.0, rate_type='an_abreise',
+                reason='foreign_same_day_no_country',
+                warnings=['country_unresolved'])
+        # Inland-Same-Day: >=8h → Z72, sonst Office
+        if duty >= 480:
+            return DayClassification(
+                klass='Z72', eur=_BMF_INLAND['tagestrip_8h'],
+                rate_type='tagestrip_8h',
+                reason='inland_same_day_over_8h',
+                bmf_land='Deutschland', bmf_tagtyp='tagestrip_8h')
+        return DayClassification(klass='Office', reason='inland_same_day_under_8h')
+
+    if role == DayRole.STANDBY_AIRPORT:
+        return DayClassification(klass='Standby', reason='standby_airport_in_tour')
+
+    if role == DayRole.OFFICE_AT_HB:
+        return DayClassification(klass='Office', reason='office_at_hb_in_tour')
+
+    # DEPARTURE / MID_FULL_AWAY / RETURN
+    if country.is_foreign and bmf_auslandj is not None:
+        rates = bmf_auslandj.get(country.country)
+        if not rates:
+            return DayClassification(
+                klass='Z76', eur=0.0, rate_type='unknown',
+                reason=f'foreign_{role.value}_country_unmapped',
+                warnings=[f'bmf_missing_{country.country}'],
+                bmf_land=country.country)
+        voll_24h, an_abreise = float(rates[0]), float(rates[1])
+        if role == DayRole.MID_FULL_AWAY:
+            return DayClassification(
+                klass='Z76', eur=voll_24h, rate_type='voll_24h',
+                reason=f'foreign_mid_full_away_{country.iata}',
+                bmf_land=country.country, bmf_tagtyp='voll_24h')
+        # DEPARTURE / RETURN: An/Abreise-Pauschale
+        return DayClassification(
+            klass='Z76', eur=an_abreise, rate_type='an_abreise',
+            reason=f'foreign_{role.value}_{country.iata}',
+            bmf_land=country.country, bmf_tagtyp='an_abreise')
+
+    if country.is_foreign:
+        # bmf_auslandj nicht gegeben → Z76 mit eur=0
+        return DayClassification(
+            klass='Z76', eur=0.0, rate_type='unknown',
+            reason=f'foreign_{role.value}_no_bmf_table',
+            warnings=['bmf_table_missing'],
+            bmf_land=country.country)
+
+    # Inland-Auswärtstätigkeit (Tour mit Inland-Layover/Mid-Tag)
+    if role == DayRole.MID_FULL_AWAY:
+        return DayClassification(
+            klass='Z74', eur=_BMF_INLAND['voll_24h'], rate_type='voll_24h',
+            reason='inland_mid_full_away',
+            bmf_land='Deutschland', bmf_tagtyp='voll_24h')
+    # DEPARTURE / RETURN inland-Mischfall
+    return DayClassification(
+        klass='Z73', eur=_BMF_INLAND['an_abreise'], rate_type='an_abreise',
+        reason=f'inland_{role.value}',
+        bmf_land='Deutschland', bmf_tagtyp='an_abreise')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Orchestrator: classify_pipeline (kombiniert alle 6 Regeln)
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class PipelineResult:
+    """Output des V2-Klassifikations-Orchestrators.
+
+    Bietet alles was app.py braucht um den Legacy-Pfad zu ersetzen oder
+    parallel zu auditieren: tag-für-tag-Klassen, KPI-Counter, Tour-Liste.
+    """
+    tage_detail: List[Dict[str, Any]] = field(default_factory=list)
+    tours_count: int = 0
+    fahrtage: int = 0
+    arbeitstage: int = 0
+    hotel_naechte: int = 0
+    reinigungstage: int = 0
+    z72_eur: float = 0.0
+    z73_eur: float = 0.0
+    z74_eur: float = 0.0
+    z76_eur: float = 0.0
+    z72_tage: int = 0
+    z73_tage: int = 0
+    z74_tage: int = 0
+    z76_tage: int = 0
+    warnings: List[str] = field(default_factory=list)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+
+def classify_pipeline(
+    cas_days: List[Dict[str, Any]],
+    se_rows: Optional[List[Dict[str, Any]]] = None,
+    year: int = 2025,
+    homebase: str = 'FRA',
+    iata_to_bmf: Optional[Dict[str, str]] = None,
+    bmf_auslandj: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> PipelineResult:
+    """Orchestriert die 6 V2-Regeln zu einem End-to-End-Ergebnis.
+
+    Pipeline:
+      sorted_days → build_tours → für jeden Tag:
+        day_role_in_tour + resolve_country + is_hotel_night + classify_day
+      → counters aggregieren → PipelineResult
+
+    Args:
+      cas_days:    Reader-Tage (vom Reader V2 normalisiert)
+      se_rows:     SE-Buchungs-Zeilen (für Country-Resolver)
+      year:        Steuerjahr (für BMF-Lookup, wenn bmf_auslandj=None)
+      homebase:    IATA-Code
+      iata_to_bmf: IATA→Country-Map (für resolve_country)
+      bmf_auslandj: country_key → (voll_24h, an_abreise)
+
+    Returns:
+      PipelineResult mit tage_detail + aggregierten Countern.
+
+    Side-effect-frei. Keine I/O. Deterministisch.
+    """
+    se_rows = se_rows or []
+    iata_to_bmf = iata_to_bmf or {}
+    sorted_days = sorted(cas_days or [], key=lambda d: str(d.get('datum') or ''))
+    tours = build_tours(sorted_days, homebase=homebase)
+    # Index: datum → tour
+    tour_by_date: Dict[str, Tour] = {}
+    for t in tours:
+        for d in t.days:
+            ds = d.get('datum')
+            if ds:
+                tour_by_date[ds] = t
+
+    result = PipelineResult(tours_count=len(tours))
+    result.fahrtage = len(tours)  # Definition: Tour-Start = Fahrtag
+
+    for day in sorted_days:
+        ds = day.get('datum') or ''
+        tour = tour_by_date.get(ds)
+        country = resolve_country(day, tour, se_rows, iata_to_bmf, homebase)
+        role = day_role_in_tour(day, tour, homebase) if tour else None
+        hotel_flag, hotel_reason = (False, 'no_tour')
+        if tour:
+            hotel_flag, hotel_reason = is_hotel_night(day, tour, country, role)
+        cls = classify_day(
+            day, tour, country,
+            hotel_info=(hotel_flag, hotel_reason),
+            bmf_auslandj=bmf_auslandj,
+            homebase=homebase,
+        )
+        # Counter-Logik
+        is_workday = cls.klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby')
+        is_reinigungstag = cls.klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office')
+        if is_workday:
+            result.arbeitstage += 1
+        if is_reinigungstag:
+            result.reinigungstage += 1
+        if hotel_flag:
+            result.hotel_naechte += 1
+        if cls.klass == 'Z72':
+            result.z72_eur += cls.eur
+            result.z72_tage += 1
+        elif cls.klass == 'Z73':
+            result.z73_eur += cls.eur
+            result.z73_tage += 1
+        elif cls.klass == 'Z74':
+            result.z74_eur += cls.eur
+            result.z74_tage += 1
+        elif cls.klass == 'Z76':
+            result.z76_eur += cls.eur
+            result.z76_tage += 1
+
+        result.tage_detail.append({
+            'datum':        ds,
+            'klass':        cls.klass,
+            'eur':          round(cls.eur, 2),
+            'rate_type':    cls.rate_type,
+            'role':         role.value if role else 'no_tour',
+            'country':      country.country,
+            'country_iata': country.iata,
+            'country_src':  country.source,
+            'is_hotel':     hotel_flag,
+            'reason':       cls.reason,
+            'bmf_land':     cls.bmf_land,
+            'bmf_tagtyp':   cls.bmf_tagtyp,
+            'warnings':     list(cls.warnings or []),
+        })
+        if cls.warnings:
+            result.warnings.extend(cls.warnings)
+
+    result.z72_eur = round(result.z72_eur, 2)
+    result.z73_eur = round(result.z73_eur, 2)
+    result.z74_eur = round(result.z74_eur, 2)
+    result.z76_eur = round(result.z76_eur, 2)
+    result.diagnostics = {
+        'tour_count': len(tours),
+        'days_processed': len(sorted_days),
+        'days_in_tour': sum(len(t.days) for t in tours),
+        'unresolved_country': sum(
+            1 for e in result.tage_detail
+            if e['klass'] == 'Z76' and 'country_unresolved' in (e.get('warnings') or [])
+        ),
+    }
+    return result
