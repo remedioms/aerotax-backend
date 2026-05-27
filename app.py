@@ -11795,6 +11795,7 @@ falscher Wert."""
                 try:
                     resp = client.messages.create(
                         model='claude-sonnet-4-6', max_tokens=2000,
+                        temperature=0.0,  # R24: deterministischer Reader
                         tools=[lsb_tool],
                         tool_choice={'type': 'tool', 'name': 'submit_lsb_extraktion'},
                         messages=[{'role': 'user', 'content': content}]
@@ -12241,6 +12242,7 @@ LIEFERE via Tool 'submit_cas_days'."""
         return client.messages.create(
             model='claude-sonnet-4-6',
             max_tokens=_max_tokens,
+            temperature=0.0,  # R24: deterministischer Reader, weniger Stochastik
             tools=[cas_tool],
             tool_choice={'type': 'tool', 'name': _v2_tool_name},
             messages=[{'role': 'user', 'content': content}],
@@ -12656,6 +12658,7 @@ LIEFERE via Tool 'submit_cas_days'."""
         return client.messages.create(
             model='claude-sonnet-4-6',
             max_tokens=_max_tokens,
+            temperature=0.0,  # R24: deterministischer Reader, weniger Stochastik
             tools=[cas_tool],
             tool_choice={'type': 'tool', 'name': 'submit_cas_days'},
             messages=[{'role': 'user', 'content': content}],
@@ -14570,6 +14573,7 @@ LIEFERE jetzt via Tool die strukturierten SE-Zeilen."""
             try:
                 resp = client.messages.create(
                     model='claude-sonnet-4-6', max_tokens=32000,
+                    temperature=0.0,  # R24: deterministischer Reader
                     tools=[se_struct_tool],
                     tool_choice={'type': 'tool', 'name': 'submit_se_lines'},
                     messages=[{'role': 'user', 'content': content}]
