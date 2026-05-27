@@ -826,9 +826,30 @@ def calculate_allowances_from_normalized_tours(
             bool(td.cas_raw.get('is_tour_departure'))
             for td in tour.days
         )
+        # R22 (2026-05-26): Inland-Same-Day-Tour mit echtem Flug-Token zählt
+        # als Tour-Start, auch wenn duty<480 (kein Z72) und kein foreign-signal.
+        # WICHTIG: has_real_flight ist zu liberal (triggert bei duty>=240),
+        # daher Flight-Token im routing als striktes Kriterium nutzen.
+        def _has_real_flight_token(td):
+            for r in (td.routing_evidence or []):
+                if not isinstance(r, str):
+                    continue
+                t = r.upper().strip()
+                if t.startswith('LH'):
+                    return True
+                digits = ''.join(c for c in t if c.isdigit())
+                if len(digits) >= 3 and not t.startswith(hb_up):
+                    return True
+            return False
+        tour_has_inland_flight_same_day = any(
+            td.is_departure_day and td.is_return_day
+            and _has_real_flight_token(td)
+            for td in tour.days
+        )
         is_legitimate_tour_start = (
             tour_has_foreign_signal or tour_has_overnight
             or tour_has_z72_same_day or tour_has_v2_departure_hint
+            or tour_has_inland_flight_same_day
         )
 
         # Fahrtag pro Tour-Start (B9: nur legitime)
@@ -1088,9 +1109,14 @@ def calculate_allowances_from_normalized_tours(
                 # Hotels. STRIKT: cas_overnight als Pflicht-Signal.
                 hotel_evidence = True
                 hotel_source = 'foreign_layover_iata_overnight'
-            elif cas_overnight and tour_has_foreign_signal and not td.is_home_standby:
-                # Reader-Lücke: overnight=True ohne layover_ort,
-                # aber Tour ist foreign → Hotel-Nacht plausibel
+            elif (cas_overnight and tour_has_foreign_signal
+                  and not td.is_home_standby
+                  and not (td.layover_iata and _is_inland_code(td.layover_iata))
+                  and not (td.layover_iata and td.layover_iata.upper() == hb_up)):
+                # R22 (2026-05-26): Re-Position-Tage (overnight=True mit
+                # layover_iata=FRA oder Inland-IATA) sind KEIN Auslands-Hotel,
+                # selbst wenn die Tour-Klammer foreign signal hat. Diese
+                # Phantom-Hotels entstehen bei Aircraft-Rotations-Pattern.
                 hotel_evidence = True
                 hotel_source = 'cas_overnight_in_foreign_tour'
             elif (td.is_full_away_day and tour_has_foreign_signal
@@ -1104,10 +1130,15 @@ def calculate_allowances_from_normalized_tours(
                 hotel_source = 'mid_tour_foreign_context_overnight'
             elif (td.is_departure_day and not td.is_return_day
                   and td.target_iata
-                  and not _is_inland_code(td.target_iata)):
-                # Anreise-Tag mit foreign target — User schläft heute im Ausland
+                  and not _is_inland_code(td.target_iata)
+                  and cas_overnight):
+                # R22 (2026-05-26): Anreise-Tag mit foreign target zählt nur als
+                # Hotel-Nacht, wenn der Reader auch tatsächlich overnight=True
+                # gesetzt hat. Ohne diesen Strict-Guard erzeugt jede Anreise
+                # mit propagiertem target_iata (auch Late-Briefing ohne overnight)
+                # ein Phantom-Hotel.
                 hotel_evidence = True
-                hotel_source = 'foreign_departure_day_target'
+                hotel_source = 'foreign_departure_day_target_overnight'
             else:
                 # SE-Check als letzte Source: SE stfrei am Tag mit Tour-Klammer
                 for se in se_rows:

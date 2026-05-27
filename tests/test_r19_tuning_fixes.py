@@ -129,15 +129,17 @@ def test_r19_same_day_office_no_flight_no_fahrtag():
     )
 
 
-def test_r19_same_day_inland_duty_under_480_no_fahrtag():
-    """Same-Day-Inland mit duty<480 (z.B. 6h Trip): kein Fahrtag (kein Z72-trigger)."""
+def test_r19_same_day_inland_duty_under_480_z72_no_but_fahrtag_yes():
+    """R22-Update: Same-Day-Inland-Flight zählt als Fahrtag (egal welche Duty),
+    aber NICHT als Z72 (braucht weiterhin duty>=480)."""
     days = [
         _day('2025-08-03', marker='LH123', routing=[HB, 'MUC', 'LH123'],
              layover='', overnight=False,
              starts_hb=True, ends_hb=True, has_fl=True, duty=360),
     ]
     _, res = _run(days)
-    assert res.fahrtage == 0
+    assert res.fahrtage == 1, 'R22: Same-Day-Inland-Flight ist Fahrtag'
+    assert res.z72_tage == 0, 'duty=360<480 → kein Z72'
 
 
 # ── R19.4: Regression — Foreign-Tour Fahrtage funktionieren weiter ──────────
