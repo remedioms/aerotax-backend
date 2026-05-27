@@ -19523,22 +19523,28 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         # Spesen mit Auslands-Ort ausweist, war der Crew-Member nachweislich auf
         # Tour — DP/CAS-Marker ist falsch oder unvollständig. User-Feedback:
         # „SE sagt SEA/AGP/etc, Backend sagt Frei — warum?"
-        if at in ('frei', 'urlaub', 'krank'):
+        # R32 (2026-05-27): SE-Override gilt jetzt auch für activity_type='unknown'.
+        # Wenn Sonnet einen Marker nicht zuordnen kann (Cockpit-Marker LOFT/REC/TR,
+        # andere Airline-Codes, …), aber die SE eine aktive Auslands-Zeile zeigt
+        # → der Tag war eine Auslandstour. Kein Chat nötig. SE ist autoritative
+        # Quelle für „User war wo am Tag X".
+        if at in ('frei', 'urlaub', 'krank', 'unknown'):
             _se_active_foreign = (
                 se.get('count', 0) > 0
                 and float(se.get('stfrei_total', 0) or 0) > 0
                 and se.get('stfrei_inland') is False
                 and bool(se.get('stfrei_ort'))
             )
-            if at == 'frei' and _se_active_foreign:
+            if at in ('frei', 'unknown') and _se_active_foreign:
                 _se_ort_ov = se.get('stfrei_ort', '').upper().strip()
                 _bmf_ov = _bmf(_se_ort_ov)
                 _ab_rate = float((_bmf_ov or {}).get('an_abreise', 0) or 0)
                 if _ab_rate > 0:
-                    # Override: klass=Z76 statt Frei
+                    # Override: klass=Z76 statt Frei/Unknown
                     klass = 'Z76'
                     eur_added = _ab_rate
-                    reason = f'SE-Override: aktive Auslands-SE {_se_ort_ov} → Z76 (statt Frei)'
+                    _orig_at_label = 'Unknown' if at == 'unknown' else 'Frei'
+                    reason = f'SE-Override: aktive Auslands-SE {_se_ort_ov} → Z76 (statt {_orig_at_label})'
                     try:
                         from bmf_data import IATA_TO_BMF as _IATA_OV
                         _land_ov = _IATA_OV.get(_se_ort_ov, '') or ''
