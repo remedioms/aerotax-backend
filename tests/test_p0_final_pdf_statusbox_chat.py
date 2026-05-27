@@ -1,9 +1,11 @@
 """P0 Final Completion Tests (2026-05-22).
 
-Deckt drei direkte UI/Output-Fixes ab:
-  FIX 1 — PDF Prüfpunkte-Sektion (Renderlevel)
-  FIX 2 — Statusbox direkter Render aus canonical_state + audit_warnings
-  FIX 3 — Chat Duplicate-Guard gegen wiederholte PDF-Ready/Warnings-Antworten
+OBSOLET nach R37 (2026-05-27): Audit-Prüfpunkte-Sektion wurde komplett
+aus PDF und Frontend entfernt. User-Feedback: „erzeugt Verunsicherung
+statt Sicherheit". Die hier getesteten Strings („PRÜFPUNKTE", „Tage als
+Prüfpunkt markiert" etc.) sind im aktuellen Build nicht mehr vorhanden.
+
+Datei ist ge-skipt. Tests dokumentieren früheres Verhalten.
 """
 import io
 import os
@@ -11,6 +13,9 @@ import re
 import sys
 
 import pytest
+
+# R37 (2026-05-27): ganzes Modul skipt — Audit-UI bewusst entfernt.
+pytestmark = pytest.mark.skip(reason='R37: Audit-Prüfpunkte-Sektion komplett entfernt')
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

@@ -20,6 +20,10 @@ import sys
 
 import pytest
 
+# R37 (2026-05-27): SE-Completeness im PDF-Audit-Block — Block ist komplett
+# entfernt. Daten bleiben im result_data._se_completeness für API-Konsumenten.
+pytestmark = pytest.mark.skip(reason='R37: PDF-Audit-Block (SE-Completeness-Render) entfernt')
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
 

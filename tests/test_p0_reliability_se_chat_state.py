@@ -12,6 +12,13 @@ import json
 import os
 import sys
 
+import pytest
+
+# R37 (2026-05-27): teilweise obsolet — Chat-„alles fertig"-Logik wurde
+# geändert weil audit_warnings nicht mehr verunsichern. 2 Tests prüfen
+# diesen alten state, sind jetzt skipt. Andere Tests in dieser Datei
+# laufen normal (z.B. Z77-Audit-Felder, SE-Completeness-Felder im JSON).
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app  # noqa: E402
@@ -172,6 +179,7 @@ def test_classify_done_clean_when_no_warnings():
     assert st['pdf_allowed'] is True
 
 
+@pytest.mark.skip(reason='R37: done_with_audit_warnings user_message ist nicht mehr „Prüfpunkte"-spezifisch')
 def test_classify_done_with_audit_warnings_when_unresolved_days():
     job = _make_job(unresolved_days=['2025-01-07: unklar', '2025-02-15: Mischfall'])
     st = app._classify_job_state(job)
@@ -339,6 +347,7 @@ def test_se_completeness_in_classification_schema():
 INDEX_HTML = os.path.expanduser('~/Desktop/site/index.html')
 
 
+@pytest.mark.skip(reason='R37: _localBulkApply Frontend-Check entfernt — User-Wunsch keine Verunsicherung')
 def test_frontend_local_bulk_apply_checks_unresolved_days():
     """_localBulkApply darf NICHT mehr blind „keine offenen Tage" sagen wenn
     unresolved_days oder vma_unmapped_se oder missing_months > 0."""
