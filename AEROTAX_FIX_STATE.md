@@ -17,6 +17,12 @@
 | R20 (Z74-Aircraft / Hotel-V2 / Z72-Fahrtag) | + 3 Tuning-Fixes | 55 ✓ | 176 | 114 | 6856 | **Z76 ✓** |
 | **R21 (V2-Tool-Schema)** | Sonnet liefert is_tour_return/tour_context_hint direkt | 41 | **130 ✓** | 87 | **5058 ✓** | **Z76 ✓** |
 | **R22 (Iter 8)** | + V2-Departure-Hint als Fahrtag-Trigger + Z72-Office-Filter | 46 | **135 ✓** | 91 | 5396 | ZeroDay ⚠ Sonnet-Stochastik |
+| **R23 (Iter 10)** | Bug 2: Nachtflug-Heimkehr (return_day + overnight) → Voll-Pauschale | (läuft) | | | | |
+
+**Bug-Liste R23 — User-Feedback BLR-Tour:**
+- **Bug 1 (Briefing-Inland → Z73):** ZURÜCKGEROLLT — widerspricht BMF §9 EStG (Auslandsübernachtung = Auslands-Pauschale auch für Anreise). FollowMe rechnet konservativer, wir bleiben BMF-konform (gibt User mehr Pauschale).
+- **Bug 2 (Nachtflug-Heimkehr Voll-Pauschale):** UMGESETZT — wenn `is_return_day` UND `overnight_after_day=True` (z.B. 05.01 LH755 BLR Departure 23:28), dann Voll-Pauschale 42€ statt An/Ab 28€. BMF-konform.
+- **Bug 3 (06.01 ZeroDay-Stochastik):** offen — Sonnet liest manchmal nur "X" und verliert die Landing-Time-Info. Reparierbar im V2-Prompt.
 
 **Stand R22 vs Tibor-Range (FINAL):**
 - ✓ Z76 Tage 125 (~125 Tibor) **EXAKT**
@@ -103,14 +109,26 @@ CAS + SE
 
 ---
 
-## 4. Noch offen
+## 4. Noch offen / nach Deploy
 
-Alle Aufgaben dieser Session sind abgeschlossen.
+**Deployed (Commit `5829939`):** Code live auf Render via auto-deploy nach `git push origin main`. Default-Flags `AEROTAX_USE_NORMALIZED_TOURS=0` + `AEROTAX_CAS_READER_V2=0` — User-Verhalten unverändert, neue Pipeline schlummert bis Flags gesetzt werden.
 
-Außerhalb dieser Session weiterhin offen (für separate Tickets):
-- BH-003c Phantom-Z76 im Legacy-Pfad — nicht angefasst, aber die normalisierte Pipeline ist beweisbar SE-only-frei.
-- Real Live-Validation gegen einen kontrollierten Dienstplan (Staging, nicht Production-Default).
-- Falls Live-Validation Abweichungen zeigt: by-date-Befund + back to NEEDS_FIX.
+**Um V2-Pipeline in Production zu aktivieren:**
+```bash
+# Render Dashboard → Service aerotax-backend → Environment:
+AEROTAX_USE_NORMALIZED_TOURS=1
+AEROTAX_CAS_READER_V2=1
+# Manuell Deploy triggern (Env-Var-Changes triggern keinen Auto-Deploy)
+```
+
+**Verbleibende KPI-Diffs (Iter 8):**
+- ⚠ Hotel 91 (Range 64–67): +24 — vermutlich Counting-Definition brutto vs netto-nach-Z77
+- ⚠ Fahrtage 46 (Range 52–54): -6 — Foreign-Tour ohne overnight nicht als Tour-Start erkannt
+- ⚠ Sonnet-Stochastik: einzelne kritische Tage (z.B. 01-06 BLR) können zwischen Z76 und ZeroDay schwanken je Lauf
+
+**Außerhalb dieser Session:**
+- BH-003c Phantom-Z76 im Legacy-Pfad — nicht angefasst, aber die V2-Pipeline ist beweisbar SE-only-frei.
+- Real Live-Validation gegen weitere User (nicht nur Tibor).
 
 ---
 

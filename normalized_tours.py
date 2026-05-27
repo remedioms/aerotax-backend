@@ -958,6 +958,11 @@ def calculate_allowances_from_normalized_tours(
                 # else: keine VMA (zu kurz oder Office ohne Flight)
 
             elif td.is_departure_day:
+                # BMF-Regel (§9 EStG): Anreise-Tag mit Auslandsübernachtung
+                # ist Auslands-An/Ab (Z76, z.B. 28€), nicht Inland-An/Ab.
+                # FollowMe rechnet 14€ Inland — das ist konservativ aber
+                # nicht BMF-konform. Wir geben User die volle BMF-Pauschale.
+                # (R23 Bug 1 Fix versucht aber zurückgerollt — BMF gewinnt.)
                 if is_foreign and resolved_rate and not day_inland_evidence:
                     day_eur = float(resolved_rate.get('an_abreise', 0) or 0)
                     day_bucket = 'Z76' if day_eur > 0 else 'none'
@@ -972,7 +977,22 @@ def calculate_allowances_from_normalized_tours(
                     day_source = 'CAS'
 
             elif td.is_return_day:
-                if is_foreign and resolved_rate and not day_inland_evidence:
+                # R23 Bug 2 Fix (2026-05-27): Wenn der Reader den Tag als
+                # is_return_day markiert hat, der Tag aber overnight_after_day=True
+                # zeigt, dann ist der Heimflug ein Nachtflug (Take-off abends in
+                # foreign, Landing am Folgetag). Tibor war an dem Tag VOLLE 24h
+                # im Ausland → Voll-Pauschale, nicht An/Ab.
+                # Beispiel: 05.01 BLR Marker=755 mit LH755-Departure 23:28 LT
+                # → User war 24h in BLR, nicht Heimkehr-An/Ab-Tag.
+                cas_overnight_return = bool(td.cas_raw.get('overnight_after_day'))
+                if cas_overnight_return and is_foreign and resolved_rate:
+                    # Nachtflug-Heimkehr: voll 24h im Ausland
+                    day_eur = float(resolved_rate.get('voll_24h', 0) or 0)
+                    day_bucket = 'Z76' if day_eur > 0 else 'none'
+                    day_country = resolved_country
+                    day_rate = 'voll_24h_night_return'
+                    day_source = day_audit.get('source_used') or 'CAS+BMF-night-return'
+                elif is_foreign and resolved_rate and not day_inland_evidence:
                     day_eur = float(resolved_rate.get('an_abreise', 0) or 0)
                     day_bucket = 'Z76' if day_eur > 0 else 'none'
                     day_country = resolved_country

@@ -49,11 +49,12 @@ IATA_TO_BMF = {
 # ════════════════════════════════════════════════════════════════════════════
 
 def test_foreign_tour_departure_without_target_uses_tour_context_z76():
-    """Anreise-Tag mit routing=['FRA'] (CAS-Reader hat nur Start gelesen) +
-    Mid-Tour-Tage mit routing=['BLR'] → Tour-Propagation → Anreise-Z76."""
+    """Anreise-Tag mit Auslandsübernachtung = Z76 An/Ab (BMF-konform).
+    FollowMe rechnet 14€ Inland — wir nehmen BMF-Auslands-Pauschale 28€ weil
+    formal korrekt und User bekommt mehr Pauschale."""
     cas = [
         _cas('2025-01-03', marker='LH756', routing=['FRA'], starts_hb=True,
-             overnight=True, duty_min=600),  # Anreise, kein eigenes foreign target
+             overnight=True, duty_min=600),
         _cas('2025-01-04', marker='X', routing=['BLR'], overnight=True),
         _cas('2025-01-05', marker='X', routing=['BLR'], overnight=True),
         _cas('2025-01-06', marker='LH755', routing=['FRA'], ends_hb=True,
@@ -66,7 +67,7 @@ def test_foreign_tour_departure_without_target_uses_tour_context_z76():
     d = result.by_date.get('2025-01-03')
     assert d is not None, 'Anreise-Tag muss klassifiziert sein'
     assert d['klass'] == 'Z76', \
-        f'Anreise-Tag mit Tour-Context BLR sollte Z76 sein, got {d["klass"]}'
+        f'Anreise mit Auslands-Übernachtung = Z76 An/Ab (BMF), got {d["klass"]}'
     assert d['country'] == 'Indien-Bangalore'
 
 
@@ -90,10 +91,8 @@ def test_foreign_tour_return_without_origin_uses_tour_context_z76():
 
 
 def test_z73_not_used_when_foreign_tour_context_is_strong():
-    """Tour mit ≥2 foreign-Indizien (Mid-Tour-routing + Anzahl-Tage) →
-    Anreise NICHT silent Z73."""
+    """Korea-Tour-Anreise mit foreign-Tour-Context = Z76 (BMF konform)."""
     cas = [
-        # Tour: 3 Tage Korea
         _cas('2025-04-08', marker='LH', routing=['FRA'], starts_hb=True,
              overnight=True, duty_min=600),
         _cas('2025-04-09', marker='X', routing=['ICN'], overnight=True),
@@ -108,7 +107,7 @@ def test_z73_not_used_when_foreign_tour_context_is_strong():
     d = result.by_date.get('2025-04-08')
     assert d is not None
     assert d['klass'] == 'Z76', \
-        f'Korea-Tour-Anreise sollte Z76 sein, got {d["klass"]}'
+        f'Korea-Tour-Anreise sollte Z76 sein (BMF), got {d["klass"]}'
 
 
 def test_no_z76_without_tour_bracket():

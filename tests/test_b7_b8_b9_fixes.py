@@ -67,7 +67,6 @@ def test_z76_mapping_uses_layover_iata_when_target_missing():
     assert d is not None
     assert d['klass'] == 'Z76'
     audit = d.get('country_resolution_audit') or {}
-    # Source-Used kann CAS oder CAS+TOUR sein
     assert audit.get('source_used') in ('CAS', 'CAS+TOUR'), \
         f'expected CAS-source, got {audit.get("source_used")}'
 
