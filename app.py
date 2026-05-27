@@ -3151,8 +3151,8 @@ AEROTAX_ERROR_CODES = {
         'support':      False,
     },
     'AUDIT_WARNINGS': {
-        'user_title':   'PDF bereit mit Prüfpunkten',
-        'user_message': 'Deine Auswertung ist berechnet, enthält aber Prüfpunkte.',
+        'user_title':   'Auswertung fertig',
+        'user_message': 'Dein Betrag ist berechnet. Du kannst das PDF herunterladen.',
         'retryable':    False,
         'support':      False,
     },
@@ -3472,15 +3472,17 @@ def _classify_job_state(job, session=None):
                 warning_bits.append('SE-Datei(en) nicht lesbar')
             if se_duplicates:
                 warning_bits.append('SE-Monat doppelt')
-            warn_text = ', '.join(warning_bits)
+            # R37 follow-up (2026-05-27): user_message ohne „Prüfpunkte"-Wording.
+            # warn_text bleibt im audit_warnings-Feld für API-Konsumenten, aber
+            # nicht mehr im user_facing user_message/user_title.
             return {
                 'canonical_state':              'done_with_audit_warnings',
                 'reason_code':                  'AUDIT_WARNINGS',
-                'user_title':                   'PDF bereit mit Prüfpunkten',
-                'user_message':                 f'Deine Auswertung ist berechnet. {warn_text} — die Punkte stehen im PDF/Audit. Du kannst das PDF herunterladen, solltest die Hinweise aber prüfen.',
+                'user_title':                   'Auswertung fertig',
+                'user_message':                 'Dein Betrag ist berechnet. Du kannst das PDF herunterladen und den Wert in deiner Steuersoftware übernehmen.',
                 'next_actions':                 [
-                    {'type': 'download_pdf',     'label': 'PDF mit Prüfpunkten herunterladen'},
-                    {'type': 'open_chat',        'label': 'Prüfpunkte im Chat klären'},
+                    {'type': 'download_pdf',     'label': 'PDF herunterladen'},
+                    {'type': 'open_chat',        'label': 'Frage im Chat stellen'},
                     {'type': 'start_new',        'label': 'Neue Auswertung starten'},
                 ],
                 'pdf_allowed':                  True,
@@ -6397,10 +6399,8 @@ def _chat_dedupe_answer(answer, chat_history):
                             or 'unklar' in new_norm or 'streckeneinsatz' in new_norm
                             or 'audit' in new_norm)
             if is_pdf_topic:
-                return ('Wie gerade geschrieben — dein PDF ist bereit, und die '
-                        'Prüfpunkte stehen darin. Wenn du zu einem konkreten '
-                        'Punkt eine Frage hast, frag gern direkt: „welche Tage?", '
-                        '„welche Spesen-Zeilen?", „welche Monate fehlen?".')
+                return ('Dein PDF ist bereit. Wenn du eine konkrete Frage zur '
+                        'Berechnung hast, frag gern direkt.')
             return 'Wie gerade beschrieben — magst du eine konkrete Frage stellen?'
     return answer
 
@@ -25994,16 +25994,9 @@ def erstelle_pdf(d):
             ]))
             S.append(ttab)
             S.append(Spacer(1, 0.4*cm))
-            unklare = d.get('_unklare_tage') or []
-            if unklare:
-                S.append(Paragraph(
-                    f"<b>Unklare Tage ({len(unklare)}):</b> Diese Tage konnten nicht eindeutig klassifiziert werden — bitte selbst prüfen.",
-                    ps("td_unklar", fontSize=8.5, textColor=GOLD, fontName="Helvetica",
-                       leading=12, alignment=TA_LEFT, spaceAfter=6)))
-                for u in unklare[:15]:
-                    S.append(Paragraph(f"• {_xml_escape_for_paragraph(str(u)[:200])}",
-                        ps(f"td_u{id(u)}", fontSize=8, textColor=TEXT3,
-                           fontName="Helvetica", leading=11, leftIndent=10, spaceAfter=2)))
+            # R37 (2026-05-27): „Unklare Tage"-Block aus PDF-Tagesnachweis entfernt.
+            # Die Tage sind in der Detail-Tabelle als „Frei" gelistet (konservativ
+            # klassifiziert). Keine zusätzliche Warnung mehr.
 
     # ════════════════════════════════════════════════
     # BELEGE — nur wenn Fotos vorhanden
