@@ -12159,7 +12159,7 @@ def _sonnet_read_cas_single_pdf(pdf_bytes, year, homebase, source_filename='cas.
         },
     }
 
-    # v13 Slim-Prompt: minimal, klare Output-Disziplin
+    # v13 Slim-Prompt + R24 Few-Shot-Beispiele für die fehleranfälligsten Patterns
     prompt = f"""Lies Lufthansa CAS/Dienstplan/Roster für {year} (Homebase {homebase}).
 
 Pro Kalendertag GENAU EIN Eintrag (auch frei/OFF/Urlaub). Mapping:
@@ -12170,17 +12170,51 @@ U/U1/U2/URLAUB → vacation | K/KRANK → sick | OFF/X/FREI/== → free | sonst 
 marker: Roh-Code WIE IM CAS (NICHT interpretieren — Backend macht Tour-Logik).
 flights[]: nur Flugnummern als String (z.B. ["LH600","LH601"]), nur bei activity_type=flight.
 
+══════════════════════════════════════════════════════════════════════
+KRITISCHE BEISPIELE — diese Pattern werden oft falsch gelesen:
+══════════════════════════════════════════════════════════════════════
+
+PATTERN 1 — Nachtflug-Heimkehr (Take-off abends, Landing nächster Tag):
+  Tag 05.01: "755 LH755-1 B748 BLR 23:28-"           → marker=755, layover_ort=BLR,
+                                                       overnight=true (Tag in BLR),
+                                                       activity_type=flight, flights=["LH755"]
+  Tag 06.01: "X -09:21 FRA 09:53"                   → marker=X, location=FRA,
+                                                       overnight=false (Heimkehr),
+                                                       activity_type=flight (Landing-Time vorhanden!),
+                                                       NICHT free, NICHT unknown.
+
+PATTERN 2 — X-Marker mitten in einer Auslandstour (kein Frei!):
+  Tag 03.01: "31591 LH754 FRA→BLR" overnight=true   → marker=31591, layover_ort=BLR
+  Tag 04.01: "X"  (im selben Tour-Block)            → marker=X, layover_ort=BLR (vom Vortag),
+                                                       overnight=true,
+                                                       activity_type=flight
+                                                       (NICHT free — Vortag overnight in BLR)
+
+PATTERN 3 — Sequence-Nummer ist KEINE Flugnummer:
+  Eintrag: "31591 P1 BLR HKG"                       → 31591 ist eine Tour-/Umlauf-ID,
+                                                       NICHT in flights[] aufnehmen.
+                                                       LH756/LH755 wären echte Flugnummern.
+
+PATTERN 4 — Same-Day-Inland-Trip (Hin- und Rückflug am selben Tag):
+  Tag 11.01: "Ab 07:50, LH-Flug FRA→CPH→FRA, An 15:41" → marker=LH-Nr, location=FRA,
+                                                          overnight=false, layover_ort=leer,
+                                                          activity_type=flight
+
+PATTERN 5 — Office am Homebase (Schulung, kein Flug):
+  Tag: "EM /1" oder "ORTSTAG" oder "EH4" am HB        → activity_type=training oder office,
+                                                          flights=[], layover_ort=leer.
+
+══════════════════════════════════════════════════════════════════════
+
 RAW_EXCERPT-Regel (strikt):
 - LASSE LEER bei confidence='high' und klarem Standard-Marker (OFF, X, ==, LH123, U1, etc.).
 - NUR bei confidence='medium'/'low' ODER unklarem Marker: max 120 Zeichen.
-- Niemals ganze Tabellenzeilen oder Erklärungen.
 
 REGELN (Hard):
 - KEINE Steuerbewertung. KEINE Beträge. KEINE Z72/Z73/Z76. KEINE VMA.
-- KEINE Notes über Tage, KEINE Erklärungen, KEINE Kommentare zur Berechnung.
 - warnings[] NUR bei echten Lese-Lücken (fehlender Tag, unklarer Plan).
 - Bei unklar: activity_type='unknown' + confidence='low'. NICHT raten.
-- KEIN month_covered, KEINE Begründungen.
+- WICHTIG: Tag mit X-Marker UND Landing-Zeit (z.B. "X -09:21 FRA") = flight, NICHT free.
 
 LIEFERE via Tool 'submit_cas_days'."""
 
