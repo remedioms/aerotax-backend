@@ -1,0 +1,74 @@
+{
+  "_meta": {
+    "created_at": "2026-05-27",
+    "subject": "Tibor Quaas 2025 — Live-API Snapshot vor Tour-First-Refactor",
+    "source": "https://aerotax-backend.onrender.com/api/session/AT-A402222012DC2B2C",
+    "purpose": "Baseline-Anker für Tour-First-Refactor. Nach jedem Refactor-Schritt müssen diese Werte stabil sein oder klar besser werden (z.B. Heimkehr-Tage als Z76 An/Ab statt ZeroDay).",
+    "note": "User-bestätigte Werte aus seinem PDF-Vergleich gegen FollowMe"
+  },
+  "totals": {
+    "netto":   1257.12,
+    "gesamt":  6073.12,
+    "fahr":    363.72,
+    "reinig":  214.40,
+    "trink":   252.00,
+    "vma_72":  238.00,
+    "vma_73":  140.00,
+    "vma_74":  0.00,
+    "vma_aus": 4865.00,
+    "z77":     4456.00,
+    "ag_z17":  360.00
+  },
+  "counters": {
+    "fahr_tage":      42,
+    "reinigungstage": 134,
+    "arbeitstage":    134,
+    "hotel_naechte":  70,
+    "vma_72_tage":    17,
+    "vma_73_tage":    10,
+    "vma_74_tage":    0
+  },
+  "known_edge_cases": {
+    "_comment": "Tage die User selbst klassifiziert hat — Refactor sollte diese richtiger einordnen",
+    "2025-02-14": {
+      "user_says": "Heimflug aus Miami, EASA-Ruhezeit blockiert neue Tour",
+      "current_klass": "Issue (Mischfall)",
+      "current_eur": 0.00,
+      "expected_klass": "Z76",
+      "expected_role": "an_abreise",
+      "expected_eur": 44.00,
+      "expected_country": "USA - Miami",
+      "delta_brutto": "+44 €"
+    },
+    "2025-03-25": {
+      "user_says": "FRS = war zuhause, kein Anspruch",
+      "current_klass": "Frei",
+      "current_eur": 0.00,
+      "expected_klass": "Frei",
+      "expected_eur": 0.00,
+      "note": "SE-Zeile AMM 38€ ist Buchhaltungs-Artefakt für andere Tour. Aktuell korrekt klassifiziert (R34 schützt das)."
+    },
+    "2025-03-26": {
+      "user_says": "Frei zuhause nach BOS-Heimkehr am 25.",
+      "current_klass": "ZeroDay",
+      "current_eur": 0.00,
+      "expected_klass": "Frei",
+      "expected_eur": 0.00,
+      "note": "Aktuell als ZeroDay (kosmetisch). Refactor sollte das als Frei klassifizieren."
+    },
+    "2025-12-10": {
+      "user_says": "Rückflug + EASA-Ruhe (analog 14.02)",
+      "current_klass": "Issue (Mischfall)",
+      "current_eur": 0.00,
+      "expected_klass": "Z76",
+      "expected_role": "an_abreise",
+      "delta_brutto": "+~40 €"
+    }
+  },
+  "must_not_regress": {
+    "_comment": "Diese Werte sind die Untergrenze. Tour-First-Refactor darf sie verbessern (Edge-Cases), aber niemals verschlechtern.",
+    "z73_exact_match_followme": 140.00,
+    "z77_exact_match": 4456.00,
+    "z17_exact_match": 360.00
+  }
+}
