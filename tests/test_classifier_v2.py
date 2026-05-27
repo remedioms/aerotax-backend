@@ -188,6 +188,45 @@ class TestTourBuilder:
         tours = build_tours(days, homebase='FRA')
         assert len(tours) == 0
 
+    def test_homecoming_then_same_day_inland_split_in_two(self):
+        """Heimkehr morgens (Reader unsichtbar) + Same-Day-Inland-Tour ab HB.
+
+        Pattern (Tibor 16.-17.03): SVG-Anreise → unsichtbare Heimkehr →
+        GVA-Same-Day. V2 muss 2 Touren erkennen, nicht 1.
+        Trigger: starts_at_homebase=True UND routing[0]==HB UND
+        eigenes Foreign-Routing.
+        """
+        days = [
+            _day('2025-03-16', marker='82907 PU', routing=['FRA', 'DUS', 'SVG'],
+                 layover='SVG', overnight=True, starts_hb=True, duty=1114,
+                 start='05:25'),
+            _day('2025-03-17', marker='83003 PU', routing=['FRA', 'MXP', 'GVA'],
+                 starts_hb=True, ends_hb=True, duty=530, start='08:10',
+                 activity='same_day'),
+        ]
+        tours = build_tours(days, homebase='FRA')
+        assert len(tours) == 2
+        assert tours[0].days[0]['datum'] == '2025-03-16'
+        assert tours[1].days[0]['datum'] == '2025-03-17'
+
+    def test_homecoming_day_routing_foreign_first_no_new_tour(self):
+        """Heimkehrtag mit routing=[FOREIGN,FRA] und starts_hb=True ist
+        Continuation der Vortags-Tour, NICHT neue Tour.
+
+        Pattern: Tag N-1 Anreise FRA→BLR overnight, Tag N Heimkehr BLR→FRA.
+        Tag N hat starts_hb=True, ends_hb=True — aber routing[0]=BLR foreign.
+        """
+        days = [
+            _day('2025-01-03', marker='LH756', routing=['FRA', 'BLR'],
+                 layover='BLR', overnight=True, starts_hb=True, duty=784,
+                 start='10:55'),
+            _day('2025-01-04', marker='LH755-1', routing=['BLR', 'FRA'],
+                 starts_hb=True, ends_hb=True, duty=550, start='01:00'),
+        ]
+        tours = build_tours(days, homebase='FRA')
+        assert len(tours) == 1
+        assert len(tours[0].days) == 2
+
     def test_activity_frei_ignored_when_foreign_layover(self):
         """activity_type='frei' bei foreign-Layover ist Reader-Bug, kein
         echter Frei-Tag. Wird in Tour-Klammer aufgenommen."""

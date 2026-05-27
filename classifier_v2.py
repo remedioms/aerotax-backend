@@ -335,13 +335,43 @@ def build_tours(sorted_days: List[Dict[str, Any]], homebase: str = 'FRA') -> Lis
         # Marker existiert, ist DIESER Tag automatisch Mid-Tour (Layover-Tag).
         # Reader-Felder können beim Mid-Tour-Tag lückenhaft sein (kein duty,
         # kein start_time) — das darf die Tour nicht zerbrechen.
-        if current and bool(current[-1].get('overnight_after_day')) and not is_strict_passive:
+        #
+        # AUSNAHME: starts_at_homebase=True am aktuellen Tag UND der Tag hat
+        # selbst echtes Tour-Signal (foreign-routing/overnight) bedeutet:
+        # Heimkehr passierte nachts (Reader hat Tour-Grenze nicht erfasst),
+        # DIESER Tag startet eine NEUE Tour.
+        _routing_now = day.get('routing') or []
+        _ov_curr = bool(day.get('overnight_after_day'))
+        _lay_curr = (day.get('layover_ort') or '').upper().strip()
+        _has_fr_curr = _has_foreign_iata_in_routing(_routing_now, hb_up)
+        _has_fl_curr = _lay_curr and not _is_inland_iata(_lay_curr) and _lay_curr != hb_up
+        _has_own_tour_signal = _has_fr_curr or _has_fl_curr or _ov_curr
+        # Eine "neue Tour von HB" startet nur wenn routing[0] == HB. Wenn
+        # routing[0] foreign ist (XXX-FRA), ist das ein Heimkehrtag der
+        # Vortags-Tour, kein Same-Day-Start.
+        _route_starts_hb = (
+            len(_routing_now) > 0
+            and (_routing_now[0] or '').upper().strip() == hb_up
+        )
+        _starts_new_at_hb = (
+            bool(day.get('starts_at_homebase'))
+            and _has_own_tour_signal
+            and _route_starts_hb
+        )
+
+        if (current
+                and bool(current[-1].get('overnight_after_day'))
+                and not is_strict_passive
+                and not _starts_new_at_hb):
             current.append(day)
             ends_hb_now = bool(day.get('ends_at_homebase'))
-            overnight_now = bool(day.get('overnight_after_day'))
-            if ends_hb_now and not overnight_now:
+            if ends_hb_now and not _ov_curr:
                 _flush()
             continue
+        if (current
+                and bool(current[-1].get('overnight_after_day'))
+                and _starts_new_at_hb):
+            _flush()
 
         # In-Tour-Signale
         routing = day.get('routing') or []
