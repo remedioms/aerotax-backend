@@ -4266,6 +4266,18 @@ REGEL „Betrag-Auskunft":
 - Du darfst NIEMALS eigenständig sagen, dass sich der Betrag ändert oder nicht ändert.
 - Backend rechnet. Wenn der User „was ändert sich" fragt: setze intent='question_answer',
   message_to_user='Ich übernehme das gleich und das Backend berechnet den genauen Betrag.'
+
+REGEL „Zusätzliche Anfahrten" (Medical/Sprachtest/Personalbüro):
+- Wenn User von außerplanmäßigen Anfahrten zum HB spricht — z.B. Medical-Check,
+  Sprachtest (ICAO Language Proficiency), Personalbüro/HR-Termin, Crew-Einsatz-
+  besprechung, kurze Schulung ohne CAS-Eintrag, Beratungstermin —
+  → intent='question_answer', message_to_user erklärt: „Solche Anfahrten zähle ich
+    aktuell nicht automatisch (sie stehen oft nicht im CAS). Trage sie bitte separat
+    in deiner Steuersoftware (z.B. WISO) als zusätzliche Fahrten ein. Pro Anfahrt
+    eine Hin- und Rückfahrt mit deiner Entfernung × Pendlerpauschale. Beleg sammeln
+    (Termin-Bestätigung, Mail) — das Finanzamt darf Nachweis verlangen."
+- NICHT eigenständig die Werbungskosten ändern. Backend hat dafür aktuell keinen
+  Endpoint. Ehrlich kommunizieren: „kann ich aktuell nicht selbst eintragen".
 """
 
 
@@ -22976,6 +22988,53 @@ def hybrid_analyze(form, files, job_id=None):
                 classification['arbeitstage']    = _norm_result.arbeitstage
                 classification['hotel_naechte']  = _norm_result.hotel_naechte
                 classification['reinigungstage'] = _norm_result.reinigungstage
+
+                # R28 (2026-05-27) — Activity-First-Fix für Office-Solo-Fahrtage.
+                # Office-/Schulungs-Tage am HB mit Briefing-Zeit zählen als Fahrtag,
+                # auch wenn keine Tour existiert. Kriterium ist CAS-Feld (duty +
+                # start_time), nicht der Marker-Code → funktioniert für Kabine
+                # (EM/LMN_AS/D4), Cockpit (LOFT/REC/TR/LPC/OPC), und andere Airlines.
+                # Bedingung: Tag nicht Mitglied einer gebauten Tour (sonst
+                # Doppelzählung), Klass=Office, start_time gelesen (= Briefing
+                # erfolgt = User war dort), duty>=60min (Sanity-Check gegen
+                # Reader-Stochastik bei 0-duty-Phantom-Days).
+                _tour_dates = set()
+                for _t in _norm_tours:
+                    for _td_obj in _t.days:
+                        _tour_dates.add(_td_obj.date.isoformat())
+                _solo_office_dates = []
+                for _entry in (classification.get('tage_detail') or []):
+                    if not isinstance(_entry, dict):
+                        continue
+                    _ds = _entry.get('datum') or _entry.get('date')
+                    if not _ds or _ds in _tour_dates:
+                        continue
+                    if _entry.get('klass') != 'Office':
+                        continue
+                    _rf = _entry.get('reader_facts') or {}
+                    _duty = int(_rf.get('duty_duration_minutes') or 0)
+                    _start = (_rf.get('start_time') or '').strip()
+                    if _duty >= 60 and _start:
+                        _solo_office_dates.append(_ds)
+                if _solo_office_dates:
+                    classification['fahr_tage'] = int(classification['fahr_tage']) + len(_solo_office_dates)
+                    classification.setdefault('_solo_office_fahrtage_audit', []).extend(_solo_office_dates)
+                    print(f"[fahrtage-activity-first] +{len(_solo_office_dates)} "
+                          f"Solo-Office-Fahrtag(e) (Schulung/Training am HB mit Briefing-Zeit): "
+                          f"{_solo_office_dates}")
+
+                # R28 Diagnose-Log — Lücke zwischen Legacy-Counter und normalized_tours
+                _legacy_counted = sum(
+                    1 for _t in (classification.get('tage_detail') or [])
+                    if isinstance(_t, dict)
+                    and (_t.get('classifier_result') or {}).get('counted_as_fahrtag')
+                )
+                print(f"[fahrtage-diag] legacy_counted={_legacy_counted} "
+                      f"normalized={_norm_result.fahrtage} "
+                      f"solo_office={len(_solo_office_dates)} "
+                      f"final={classification['fahr_tage']} "
+                      f"(Lücke legacy vs final = {_legacy_counted - int(classification['fahr_tage'])} — "
+                      f"Mid-Tour-Tage die Legacy zählt, normalized nicht)")
                 # VMA-Beträge (Z76=Ausland, Z73=Inland-An/Ab, Z74=Inland-Voll, Z72=Same-Day)
                 classification['vma_aus']         = round(_norm_result.z76_eur, 2)
                 classification['vma_inland_an_ab'] = round(_norm_result.z73_eur, 2)
