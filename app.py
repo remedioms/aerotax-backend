@@ -23505,6 +23505,28 @@ def _berechne_via_hybrid(form, files, job_id=None):
     reinig_satz = REINIGUNG_PRO_TAG_BY_YEAR.get(year_int, 1.60)
     trink_satz = TRINKGELD_PRO_NACHT_BY_YEAR.get(year_int, 3.60)
 
+    # R43 Settings-Layer (2026-05-28): User-Settings überschreiben Defaults.
+    # Settings kommen als JSON-Field 'user_settings' vom Frontend. Felder:
+    #   cleaning_per_day_eur, tip_per_night_eur: Beleg-Wert statt Pauschale
+    #   standby_location: 'home'|'homebase'|'standby_accommodation'
+    #   travel_time_home_to_hb_min: Fahrzeit Wohnort→HB (für Z72-Schwelle)
+    # Alle Felder optional. Inspiriert von FollowMe-Konzepten, eigene
+    # Implementation.
+    _user_settings = {}
+    try:
+        _us_raw = form.get('user_settings', '') or '{}'
+        _user_settings = json.loads(_us_raw) if isinstance(_us_raw, str) else (_us_raw or {})
+    except Exception:
+        _user_settings = {}
+    _us_cleaning = _user_settings.get('cleaning_per_day_eur')
+    if isinstance(_us_cleaning, (int, float)) and _us_cleaning > 0:
+        reinig_satz = float(_us_cleaning)
+        print(f'[r43-settings] cleaning_per_day_eur override → {reinig_satz}€')
+    _us_tip = _user_settings.get('tip_per_night_eur')
+    if isinstance(_us_tip, (int, float)) and _us_tip > 0:
+        trink_satz = float(_us_tip)
+        print(f'[r43-settings] tip_per_night_eur override → {trink_satz}€')
+
     # LSB-Werte
     brutto       = float(lst.get('brutto', 0) or 0)
     lohnsteuer   = float(lst.get('lohnsteuer', 0) or 0)
