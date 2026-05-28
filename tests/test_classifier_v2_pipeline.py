@@ -256,3 +256,66 @@ class TestFeatureFlagAppIntegration:
         # PipelineResult ist niemals das app.py-classification-Format
         assert isinstance(r, PipelineResult)
         assert not hasattr(r, 'vma_aus')  # nur im wrapped dict
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Leitplanken-Tests (R42, 2026-05-28)
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestLeitplanken:
+    def test_homebase_training_counts_as_fahrtag_LP3(self):
+        """Leitplanke 3: Schulung am HB = Office (kein Z72) ABER zählt
+        als Arbeitstag, Reinigungstag UND Fahrtag (Anfahrt zur ersten
+        Tätigkeitsstätte)."""
+        days = [
+            _day('2025-03-18', marker='EH 4', routing=['FRA'], duty=510,
+                 start='08:00', end='16:30',
+                 starts_hb=True, ends_hb=True, activity='training'),
+        ]
+        r = classify_pipeline(days, homebase='FRA',
+                              iata_to_bmf=_IATA_TO_BMF_TEST,
+                              bmf_auslandj=_BMF_TEST)
+        assert r.fahrtage == 1   # Anfahrt zur Schulung
+        assert r.arbeitstage == 1
+        assert r.reinigungstage == 1
+        assert r.z72_eur == 0.0  # KEIN Z72 (BMF R39)
+
+    def test_standby_home_no_fahrtag_LP1(self):
+        """Leitplanke 1+7: SB_S zuhause ist KEIN Fahrtag, KEIN Arbeitstag."""
+        days = [_day('2025-05-01', marker='SB_S', duty=480)]
+        r = classify_pipeline(days, homebase='FRA',
+                              iata_to_bmf=_IATA_TO_BMF_TEST,
+                              bmf_auslandj=_BMF_TEST)
+        assert r.fahrtage == 0
+        assert r.arbeitstage == 0
+
+    def test_tour_start_only_one_fahrtag_LP7(self):
+        """Leitplanke 7: Heimkehr, Layover, Tourfortsetzung = KEIN extra Fahrtag.
+        3-Tages-Tour Anreise+Mid+Heimkehr → genau 1 Fahrtag (Tour-Start)."""
+        days = [
+            _day('2025-01-03', marker='LH756', routing=['FRA', 'BLR'],
+                 layover='BLR', overnight=True, starts_hb=True, duty=784),
+            _day('2025-01-04', marker='X', layover='BLR', overnight=True),
+            _day('2025-01-05', marker='LH757', routing=['BLR', 'FRA'],
+                 ends_hb=True, duty=550),
+        ]
+        r = classify_pipeline(days, homebase='FRA',
+                              iata_to_bmf=_IATA_TO_BMF_TEST,
+                              bmf_auslandj=_BMF_TEST)
+        assert r.fahrtage == 1  # nur Anreise-Tag
+
+    def test_evidence_flags_visible_LP_audit(self):
+        """Audit-Trail: evidence_flags sichtbar im tage_detail."""
+        days = [
+            _day('2025-03-18', marker='EH 4', routing=['FRA'], duty=510,
+                 start='08:00', starts_hb=True, ends_hb=True, activity='training'),
+            _day('2025-05-01', marker='SB_S', duty=480),
+            _day('2025-01-15', marker='ORTSTAG', activity='frei'),
+        ]
+        r = classify_pipeline(days, homebase='FRA',
+                              iata_to_bmf=_IATA_TO_BMF_TEST,
+                              bmf_auslandj=_BMF_TEST)
+        flags = {e['datum']: e.get('evidence_flags', []) for e in r.tage_detail}
+        assert 'office_at_hb_with_duty_AT_FT_R' in flags['2025-03-18']
+        assert 'standby_home_no_activation' in flags['2025-05-01']
+        assert 'strict_passive_locked' in flags['2025-01-15']

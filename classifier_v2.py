@@ -841,7 +841,12 @@ def classify_pipeline(
                 tour_by_date[ds] = t
 
     result = PipelineResult(tours_count=len(tours))
-    result.fahrtage = len(tours)  # Definition: Tour-Start = Fahrtag
+    # Fahrtage werden im Loop pro Tag entschieden (Leitplanke 7):
+    # Tour-Start ODER Office-am-HB mit Activity ODER Standby-aktiviert
+    # ODER Z72-Inland-Same-Day. Keine Tourfortsetzung, keine Heimkehr.
+    result.fahrtage = 0
+    # Tour-Start-Indizes für O(1) Lookup
+    _tour_start_dates = {t.days[0].get('datum') for t in tours if t.days}
 
     for day in sorted_days:
         ds = day.get('datum') or ''
@@ -893,6 +898,24 @@ def classify_pipeline(
             result.arbeitstage += 1
         if is_reinigungstag:
             result.reinigungstage += 1
+
+        # Fahrtag (Leitplanke 7) — Anfahrt zur ersten Tätigkeitsstätte/Tour:
+        #   1. Tour-Start (erste Tag einer Tour-Klammer)
+        #   2. Aktiver Office-am-HB-Tag (Schulung, duty>0) — Leitplanke 3
+        #   3. Standby-Airport-aktiv (im Tour-Kontext)
+        #   4. Z72-Inland-Same-Day (= eigene Tour)
+        # NICHT: Tourfortsetzung (Mid-Tour-Tage), Heimkehr (RETURN), Standby zuhause
+        is_fahrtag = False
+        if ds in _tour_start_dates:
+            is_fahrtag = True
+        elif cls.klass == 'Office' and _has_office_activity:
+            is_fahrtag = True  # Office-HB mit Schulung → Anfahrt
+        elif cls.klass == 'Standby' and role is not None:
+            is_fahrtag = True  # Standby-aktiv im Tour-Kontext
+        # Z72 ist immer eine Tour, also bereits in tour_start_dates erfasst
+
+        if is_fahrtag:
+            result.fahrtage += 1
         if hotel_flag:
             result.hotel_naechte += 1
         if cls.klass == 'Z72':
@@ -908,6 +931,15 @@ def classify_pipeline(
             result.z76_eur += cls.eur
             result.z76_tage += 1
 
+        # Evidence-Audit-Flags (Leitplanken-Trace)
+        _evidence_flags = []
+        if cls.klass == 'Frei' and _is_passive_marker:
+            _evidence_flags.append('strict_passive_locked')
+        if cls.klass == 'Standby' and role is None:
+            _evidence_flags.append('standby_home_no_activation')
+        if cls.klass == 'Office' and _has_office_activity:
+            _evidence_flags.append('office_at_hb_with_duty_AT_FT_R')
+
         result.tage_detail.append({
             'datum':        ds,
             'klass':        cls.klass,
@@ -916,6 +948,11 @@ def classify_pipeline(
             'role':         role.value if role else 'no_tour',
             'country':      country.country,
             'country_iata': country.iata,
+            'is_fahrtag':   is_fahrtag,
+            'is_workday':   is_workday,
+            'is_reinigung': is_reinigungstag,
+            'is_hotel':     hotel_flag,
+            'evidence_flags': _evidence_flags,
             'country_src':  country.source,
             'is_hotel':     hotel_flag,
             'reason':       cls.reason,
