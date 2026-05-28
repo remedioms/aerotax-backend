@@ -23756,6 +23756,11 @@ def _berechne_via_hybrid(form, files, job_id=None):
                       else 'ok')
             ),
         },
+        # R40 Phase 3 (2026-05-28): V2-Audit-Keys aus _classify_v11_cas_pipeline
+        # ans finale result_data durchreichen, sonst sind sie für read_v2_audit.py
+        # unsichtbar.
+        '_classifier_v2_audit':    cls.get('_classifier_v2_audit'),
+        'classification_v2':       cls.get('classification_v2'),
     }
 
 
