@@ -50,6 +50,21 @@ def main():
         for k in ('canonical_state', 'errors', 'user_message'):
             if k in data:
                 print(f'  {k}: {data[k]}')
+        # Fallback: Cloud-Run-Logs nach dem Audit-Print durchsuchen
+        job_id = data.get('job_id') or ''
+        if job_id:
+            print(f'\n[fallback] Suche V2-Print in Cloud-Run-Logs für job_id={job_id[:8]}…')
+            import subprocess
+            try:
+                out = subprocess.check_output([
+                    'gcloud', 'run', 'services', 'logs', 'read', 'aerotax-backend',
+                    '--region', 'europe-west3', '--limit', '500',
+                ], text=True, stderr=subprocess.DEVNULL)
+                for line in out.split('\n'):
+                    if '[classifier_v2]' in line:
+                        print(' ', line.strip())
+            except Exception as e:
+                print(f'  (gcloud logs unavailable: {e})')
         return 1
 
     print('\n=== Classifier V2 Audit ===')

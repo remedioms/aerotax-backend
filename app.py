@@ -7656,6 +7656,12 @@ def health():
         'engine':  ENGINE_VERSION,
         'prompt_version': PROMPT_VERSION,
         'bmf_data_year': 2025,
+        # R40 Phase 3 (2026-05-28): Flag-Sichtbarkeit für read_v2_audit.py
+        'flags': {
+            'AEROTAX_V2_CLASSIFIER':       os.environ.get('AEROTAX_V2_CLASSIFIER', '0') in ('1', 'true', 'on'),
+            'AEROTAX_USE_NORMALIZED_TOURS': AEROTAX_USE_NORMALIZED_TOURS,
+            'AEROTAX_EXECUTION_MODE':      os.environ.get('AEROTAX_EXECUTION_MODE', 'thread'),
+        },
     })
 
 
