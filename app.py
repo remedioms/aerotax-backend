@@ -2870,6 +2870,26 @@ def _run_process_async(job_id, form, files):
                 'notes':        result.get('notes', []),
             }
             _pi_for_lock = ((_jobs[job_id].get('form') or {}).get('pi_id') or '').strip()
+        # R44 (2026-05-28) Monats-Tracking: Eintrag in User-History für Dashboard
+        try:
+            _hist_token = token
+            _hist_entry = {
+                'job_id':       job_id,
+                'completed_at': datetime.utcnow().isoformat() + 'Z',
+                'year':         int(safe.get('year', 2025) or 2025),
+                'gesamt':       float(safe.get('gesamt', 0) or 0),
+                'vma_aus':      float(safe.get('vma_aus', 0) or 0),
+                'vma_in':       float(safe.get('vma_in', 0) or 0),
+                'hotel_naechte': int(safe.get('hotel_naechte', 0) or 0),
+                'fahr_tage':    int(safe.get('fahr_tage', 0) or 0),
+                'arbeitstage':  int(safe.get('arbeitstage', 0) or 0),
+                'reinigungstage': int(safe.get('reinigungstage', 0) or 0),
+                'name':         safe.get('name', '') or 'Auswertung',
+                'summary_label': f"Steuerjahr {safe.get('year', 2025)}",
+            }
+            _user_history_append(_hist_token, _hist_entry)
+        except Exception as _hist_e:
+            print(f'[r44-history] save failed: {_hist_e}')
         # P0 #96: Lock-Status auf 'done' setzen — Cleanup-Cron darf nach 30 Tagen
         if _pi_for_lock:
             _update_payment_intent_lock_status(_pi_for_lock, 'done', job_id=job_id)
@@ -7644,6 +7664,103 @@ def qa_upvote(qid):
                     'upvotes_total': _qa_total_upvotes(target['upvotes_log']),
                 })
     return jsonify({'error': 'Nicht gefunden'}), 404
+
+
+# ════════════════════════════════════════════════════════════════════════
+# R44 (2026-05-28) — Monats-Tracking-Endpoints für AeroTax-App
+# Speichert vergangene Auswertungen pro User-Token in einem JSON-Index
+# damit das Frontend eine "Verlauf"-View bauen kann. Storage: einfache
+# JSON-Datei pro Token unter _user_history_state/. Privat-tauglich,
+# kein DB-Aufwand.
+# ════════════════════════════════════════════════════════════════════════
+_USER_HISTORY_DIR = '_user_history_state'
+
+def _user_history_path(token):
+    """Token → JSON-Pfad. Token wird sanitized (nur a-z0-9-)."""
+    import os
+    import re
+    if not token or not isinstance(token, str):
+        return None
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+    if not safe:
+        return None
+    os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+    return os.path.join(_USER_HISTORY_DIR, f'{safe}.json')
+
+
+def _user_history_load(token):
+    p = _user_history_path(token)
+    if not p:
+        return {'token': token, 'entries': []}
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {'token': token, 'entries': []}
+    except Exception:
+        return {'token': token, 'entries': []}
+
+
+def _user_history_save(token, data):
+    p = _user_history_path(token)
+    if not p:
+        return False
+    try:
+        with open(p, 'w') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _user_history_append(token, entry):
+    """Hängt eine fertige Auswertung an die Token-History.
+    entry: {datum, year, month?, gesamt, vma_aus, hotel_naechte, fahr_tage,
+            arbeitstage, job_id, summary_label}"""
+    if not token:
+        return False
+    data = _user_history_load(token)
+    if 'entries' not in data or not isinstance(data['entries'], list):
+        data['entries'] = []
+    # Dedup nach job_id wenn vorhanden
+    jid = entry.get('job_id')
+    if jid:
+        data['entries'] = [e for e in data['entries'] if e.get('job_id') != jid]
+    data['entries'].insert(0, entry)
+    data['entries'] = data['entries'][:60]  # max 60 = 5 Jahre Monate
+    data['_last_updated'] = datetime.now().isoformat()
+    return _user_history_save(token, data)
+
+
+@app.route('/api/user/history/<token>', methods=['GET'])
+def get_user_history(token):
+    """Listet alle vergangenen Auswertungen eines Tokens.
+
+    Response: {token, entries: [...], count}
+    entries sind sortiert (neueste zuerst).
+    """
+    data = _user_history_load(token)
+    return jsonify({
+        'token': token,
+        'entries': data.get('entries', []) or [],
+        'count': len(data.get('entries', []) or []),
+        'last_updated': data.get('_last_updated'),
+    })
+
+
+@app.route('/api/user/history/<token>/clear', methods=['POST'])
+def clear_user_history(token):
+    """Löscht die Historie eines Tokens (DSGVO: User-Right-to-Delete)."""
+    p = _user_history_path(token)
+    if not p:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    try:
+        import os
+        if os.path.exists(p):
+            os.remove(p)
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
 @app.route('/')
@@ -18405,7 +18522,7 @@ def _followme_align_counters(classification, matched_days, year=2025, homebase='
 
 def _classify_v11_cas_pipeline(cas_bytes, se_structured, year, homebase, job_id=None,
                                 cas_source_filenames=None, commute_minutes=0,
-                                cas_result_pre_read=None):
+                                cas_result_pre_read=None, user_settings=None):
     """v11 Komplett-Pipeline: CAS-Read → Match mit SE → Klassifikation.
 
     Wird in hybrid_analyze unter Feature-Flag AEROTAX_PIPELINE_VERSION=v11_cas_primary
@@ -22909,11 +23026,19 @@ def hybrid_analyze(form, files, job_id=None):
                 _heartbeat_phase(job_id, 'cas_match',
                                  {'label': 'Dienstplan-Tage werden zugeordnet…'})
             commute_min = commute_min_for_cas
+            # R43 user_settings durchreichen (Settings-Layer)
+            _r43_settings = {}
+            try:
+                _r43_raw = form.get('user_settings', '') or '{}'
+                _r43_settings = json.loads(_r43_raw) if isinstance(_r43_raw, str) else (_r43_raw or {})
+            except Exception:
+                _r43_settings = {}
             classification = _classify_v11_cas_pipeline(
                 cas_bytes, se_structured, year, homebase,
                 job_id=job_id, cas_source_filenames=cas_filenames,
                 commute_minutes=commute_min,
                 cas_result_pre_read=cas_pre_read,
+                user_settings=_r43_settings,
             )
             # Memory-Release nach CAS-Read
             try:
@@ -23351,6 +23476,7 @@ def hybrid_analyze(form, files, job_id=None):
         v2_pipe = classify_pipeline(
             _cas_days, se_rows=_se_rows, year=year, homebase=homebase,
             iata_to_bmf=IATA_TO_BMF, bmf_auslandj=_bmf_year_table,
+            user_settings=user_settings,
         )
         # Diff gegen Legacy
         legacy_z76 = float(classification.get('vma_aus', 0) or 0)

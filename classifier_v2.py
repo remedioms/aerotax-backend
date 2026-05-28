@@ -621,6 +621,7 @@ def classify_day(
     hotel_info: Optional[Tuple[bool, str]] = None,
     bmf_auslandj: Optional[Dict[str, Tuple[float, float]]] = None,
     homebase: str = 'FRA',
+    user_settings: Optional[Dict[str, Any]] = None,
 ) -> DayClassification:
     """Klassifiziert einen Tag final in Z72/Z73/Z74/Z76/Frei/Office/Standby/Issue.
 
@@ -678,8 +679,19 @@ def classify_day(
         if marker_kind == MarkerKind.FLEXIBLE_PASSIVE and _cas_fields_are_empty(day):
             return DayClassification(klass='Frei', reason='flexible_passive_empty')
         if marker_kind == MarkerKind.STANDBY_HOME:
+            # R43 Settings-Override: User kann sagen wo Standby stattfindet.
+            _sb_loc = (user_settings or {}).get('standby_location', 'home')
+            if _sb_loc == 'homebase':
+                return DayClassification(klass='Office', reason='standby_at_homebase_per_user')
+            if _sb_loc == 'standby_accommodation':
+                return DayClassification(klass='Office', reason='standby_at_accommodation_per_user')
             return DayClassification(klass='Standby', reason='standby_home')
         if marker_kind == MarkerKind.STANDBY_AIRPORT:
+            # SB_F / RES = Standby am Flughafen → de facto Office am HB
+            # (User reist tatsächlich zum Flughafen)
+            _sb_loc_air = (user_settings or {}).get('standby_location', 'home')
+            if _sb_loc_air in ('homebase', 'standby_accommodation'):
+                return DayClassification(klass='Office', reason='standby_airport_per_user')
             return DayClassification(klass='Standby', reason='standby_airport_no_activation')
         if marker_kind == MarkerKind.TRAINING and starts_hb and ends_hb and not has_foreign_routing:
             # Schulung am HB: erste Tätigkeitsstätte (BMF R39) → kein Z72.
@@ -807,6 +819,7 @@ def classify_pipeline(
     homebase: str = 'FRA',
     iata_to_bmf: Optional[Dict[str, str]] = None,
     bmf_auslandj: Optional[Dict[str, Tuple[float, float]]] = None,
+    user_settings: Optional[Dict[str, Any]] = None,
 ) -> PipelineResult:
     """Orchestriert die 6 V2-Regeln zu einem End-to-End-Ergebnis.
 
@@ -861,6 +874,7 @@ def classify_pipeline(
             hotel_info=(hotel_flag, hotel_reason),
             bmf_auslandj=bmf_auslandj,
             homebase=homebase,
+            user_settings=user_settings,
         )
         # Counter-Logik — FollowMe-konforme Arbeitstag-Definition (R40 V2.1):
         #
