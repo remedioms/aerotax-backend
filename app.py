@@ -7748,6 +7748,63 @@ def get_user_history(token):
     })
 
 
+# ════════════════════════════════════════════════════════════════════════
+# R45 (2026-05-28) Profile + Friends Stub-Endpoints für AeroCrew-App-Roadmap
+# Aktuell File-Storage. Bei Vollausbau: PostgreSQL-Migration.
+# ════════════════════════════════════════════════════════════════════════
+def _user_profile_path(token):
+    import os, re
+    if not token: return None
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+    if not safe: return None
+    os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+    return os.path.join(_USER_HISTORY_DIR, f'profile_{safe}.json')
+
+
+@app.route('/api/user/profile/<token>', methods=['GET'])
+def get_user_profile(token):
+    p = _user_profile_path(token)
+    if not p:
+        return jsonify({'error': 'invalid token'}), 400
+    try:
+        with open(p) as f:
+            return jsonify(json.load(f))
+    except FileNotFoundError:
+        return jsonify({'token': token, 'profile': {}})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+
+@app.route('/api/user/profile/<token>', methods=['PUT'])
+def put_user_profile(token):
+    p = _user_profile_path(token)
+    if not p:
+        return jsonify({'error': 'invalid token'}), 400
+    body = request.get_json(silent=True) or {}
+    safe_keys = ('name', 'homebase', 'position', 'airline')
+    profile = {k: body.get(k) for k in safe_keys if body.get(k)}
+    try:
+        with open(p, 'w') as f:
+            json.dump({'token': token, 'profile': profile,
+                       '_updated_at': datetime.now().isoformat()}, f, ensure_ascii=False)
+        return jsonify({'ok': True, 'profile': profile})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/user/friends/<token>', methods=['GET'])
+def get_user_friends(token):
+    """Stub für Friends-Liste. Wird in Sprint 4 implementiert mit User-Konten."""
+    return jsonify({
+        'token': token,
+        'friends': [],
+        'pending_requests_in': [],
+        'pending_requests_out': [],
+        'status': 'not_implemented',
+        'message': 'Friends-Feature requires user accounts. Roadmap Sprint 4.',
+    })
+
+
 @app.route('/api/user/history/<token>/clear', methods=['POST'])
 def clear_user_history(token):
     """Löscht die Historie eines Tokens (DSGVO: User-Right-to-Delete)."""
