@@ -108,6 +108,65 @@ class CrewlinkScrapeResult:
         self.raw_count: int = 0
 
 
+def scrape_roster_with_cookies(cookies: dict, days_ahead: int = 60) -> CrewlinkScrapeResult:
+    """User hat sich selbst in WebView eingeloggt (2FA inkl.).
+    Wir bekommen seine Session-Cookies und ziehen damit nur SEIN Roster.
+    Kein Passwort wird gespeichert. Kein DSGVO-Issue mit Drittnutzern.
+    """
+    result = CrewlinkScrapeResult()
+    if requests is None:
+        result.error = 'requests nicht installiert'
+        result.error_code = 'network'
+        return result
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 '
+                      '(KHTML, like Gecko) Version/17.0 Mobile/15E148',
+        'Accept': 'text/html,application/json',
+        'Accept-Language': 'de-DE,de;q=0.9',
+    })
+    for k, v in (cookies or {}).items():
+        try:
+            session.cookies.set(k, v, domain='.lhgroup.com')
+        except Exception:
+            pass
+    try:
+        r = session.get(CREWLINK_BASE + ROSTER_PATH, timeout=DEFAULT_TIMEOUT)
+        if r.status_code == 401 or r.status_code == 403:
+            result.error = 'Session abgelaufen — bitte neu einloggen'
+            result.error_code = 'auth_failed'
+            return result
+        if r.status_code != 200:
+            result.error = f'Roster fetch failed: HTTP {r.status_code}'
+            result.error_code = 'network'
+            return result
+        if BeautifulSoup is None:
+            result.error = 'BeautifulSoup nicht installiert'
+            result.error_code = 'network'
+            return result
+        soup = BeautifulSoup(r.text, 'html.parser')
+        rows = soup.select('table.roster tr.day-row') or soup.select('div.roster-day') or []
+        for row in rows:
+            datum = (row.get('data-date') or '').strip()
+            if not datum or not re.match(r'^\d{4}-\d{2}-\d{2}$', datum):
+                continue
+            result.events.append({
+                'date': datum,
+                'type': (row.get('data-type') or '').strip(),
+                'code': (row.get('data-code') or row.get('data-marker') or '').strip(),
+                'routing': (row.get('data-routing') or '').strip(),
+                'start_time': (row.get('data-start') or '').strip(),
+                'end_time': (row.get('data-end') or '').strip(),
+            })
+        result.raw_count = len(result.events)
+        result.ok = True
+        return result
+    except Exception as e:
+        result.error = f'Unerwarteter Fehler: {str(e)[:200]}'
+        result.error_code = 'unknown'
+        return result
+
+
 def scrape_roster(email: str, password: str, days_ahead: int = 60) -> CrewlinkScrapeResult:
     """Lädt + parsed das Roster von CrewLink.
 

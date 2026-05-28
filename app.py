@@ -9080,6 +9080,43 @@ def lufthansa_sync(token):
     })
 
 
+@app.route('/api/lufthansa/sync-with-cookies/<token>', methods=['POST'])
+def lufthansa_sync_with_cookies(token):
+    """User hat in seiner WebView selbst eingeloggt (mit 2FA).
+    Mobile sendet Session-Cookies; wir holen damit nur SEINEN Roster.
+    Kein Passwort wird je gespeichert.
+    """
+    try:
+        from lufthansa_crewlink import scrape_roster_with_cookies
+    except Exception as e:
+        return jsonify({'ok': False, 'error': 'module_unavailable', 'detail': str(e)[:200]}), 500
+    body = request.get_json(silent=True) or {}
+    cookies = body.get('cookies') or {}
+    if not cookies or not isinstance(cookies, dict):
+        return jsonify({'ok': False, 'error': 'no_cookies'}), 400
+    res = scrape_roster_with_cookies(cookies)
+    # Persist last-sync status (NICHT die Cookies)
+    p = _user_profile_path(token)
+    prof = {}
+    try:
+        with open(p) as f: prof = json.load(f) or {}
+    except Exception: pass
+    prof['lufthansa_last_sync'] = {
+        'at': res.fetched_at, 'ok': res.ok, 'event_count': res.raw_count,
+        'error': res.error, 'error_code': res.error_code,
+        'method': 'webview_cookies',
+    }
+    if res.ok and res.events:
+        prof['lufthansa_events'] = res.events[:300]
+    try:
+        with open(p, 'w') as f: json.dump(prof, f)
+    except Exception: pass
+    return jsonify({
+        'ok': res.ok, 'event_count': res.raw_count,
+        'error': res.error, 'error_code': res.error_code,
+    })
+
+
 @app.route('/api/lufthansa/status/<token>', methods=['GET'])
 def lufthansa_status(token):
     p = _user_profile_path(token)
