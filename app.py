@@ -7792,17 +7792,351 @@ def put_user_profile(token):
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+# ════════════════════════════════════════════════════════════════════════
+# R46 (2026-05-28) Friends-System, Layover-Match, Stats, iCal-Export,
+# Push-Token-Registry — alle file-based für privaten Use. Postgres-Migration
+# bei Skalierung (siehe ROADMAP.md).
+# ════════════════════════════════════════════════════════════════════════
+def _user_friends_path(token):
+    import os, re
+    if not token: return None
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+    if not safe: return None
+    os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+    return os.path.join(_USER_HISTORY_DIR, f'friends_{safe}.json')
+
+
+def _user_push_path(token):
+    import os, re
+    if not token: return None
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+    if not safe: return None
+    os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+    return os.path.join(_USER_HISTORY_DIR, f'push_{safe}.json')
+
+
+def _friends_load(token):
+    p = _user_friends_path(token)
+    if not p: return {'token': token, 'friends': []}
+    try:
+        with open(p) as f: return json.load(f)
+    except (FileNotFoundError, Exception):
+        return {'token': token, 'friends': []}
+
+
+def _friends_save(token, data):
+    p = _user_friends_path(token)
+    if not p: return False
+    try:
+        with open(p, 'w') as f: json.dump(data, f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
 @app.route('/api/user/friends/<token>', methods=['GET'])
 def get_user_friends(token):
-    """Stub für Friends-Liste. Wird in Sprint 4 implementiert mit User-Konten."""
+    """Listet alle Friends eines Users mit deren Profile-Daten."""
+    data = _friends_load(token)
+    enriched = []
+    for friend_token in data.get('friends', []):
+        ppath = _user_profile_path(friend_token)
+        prof = {}
+        try:
+            with open(ppath) as f:
+                prof = (json.load(f) or {}).get('profile', {})
+        except Exception:
+            pass
+        enriched.append({
+            'token': friend_token,
+            'profile': prof,
+            'short': friend_token[:8] + '…',
+        })
     return jsonify({
         'token': token,
-        'friends': [],
-        'pending_requests_in': [],
-        'pending_requests_out': [],
-        'status': 'not_implemented',
-        'message': 'Friends-Feature requires user accounts. Roadmap Sprint 4.',
+        'friends': enriched,
+        'count': len(enriched),
     })
+
+
+@app.route('/api/user/friends/<token>/add', methods=['POST'])
+def add_user_friend(token):
+    """Friend per Token-Code hinzufügen. Body: {friend_token}."""
+    body = request.get_json(silent=True) or {}
+    friend_token = (body.get('friend_token') or '').strip()
+    if not friend_token or friend_token == token:
+        return jsonify({'ok': False, 'error': 'invalid friend_token'}), 400
+    data = _friends_load(token)
+    if 'friends' not in data: data['friends'] = []
+    if friend_token in data['friends']:
+        return jsonify({'ok': True, 'already_added': True})
+    data['friends'].append(friend_token)
+    data['_updated_at'] = datetime.now().isoformat()
+    _friends_save(token, data)
+    # Symmetrisch: Friend bekommt mich auch
+    reverse = _friends_load(friend_token)
+    if 'friends' not in reverse: reverse['friends'] = []
+    if token not in reverse['friends']:
+        reverse['friends'].append(token)
+        reverse['_updated_at'] = datetime.now().isoformat()
+        _friends_save(friend_token, reverse)
+    return jsonify({'ok': True, 'friends_count': len(data['friends'])})
+
+
+@app.route('/api/user/friends/<token>/remove', methods=['POST'])
+def remove_user_friend(token):
+    body = request.get_json(silent=True) or {}
+    friend_token = (body.get('friend_token') or '').strip()
+    if not friend_token:
+        return jsonify({'ok': False, 'error': 'missing friend_token'}), 400
+    data = _friends_load(token)
+    data['friends'] = [f for f in (data.get('friends') or []) if f != friend_token]
+    _friends_save(token, data)
+    # Symmetrisch
+    reverse = _friends_load(friend_token)
+    reverse['friends'] = [f for f in (reverse.get('friends') or []) if f != token]
+    _friends_save(friend_token, reverse)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/user/friends/<token>/overlap', methods=['GET'])
+def get_friends_overlap(token):
+    """Findet Layover-Überlappungen mit Friends.
+    Vergleicht _tage_detail aus jüngster Auswertung mit Friend-Auswertungen.
+    Returns: pro Friend eine Liste {datum, place} überlappender Tage.
+    """
+    # Eigene Tage holen
+    my_session = _store.get(token) or {}
+    my_data = my_session.get('result_data') or {}
+    my_tage = my_data.get('_tage_detail') or []
+    # Build my layover-set: {datum: place}
+    def _extract_layover_set(tage):
+        out = {}
+        for t in tage:
+            if not isinstance(t, dict): continue
+            klass = (t.get('klass') or '').upper()
+            rf = t.get('reader_facts') or {}
+            place = (rf.get('layover_ort') or '').upper().strip()
+            if klass in ('Z76',) and place and len(place) == 3:
+                out[t.get('datum')] = place
+        return out
+
+    my_layovers = _extract_layover_set(my_tage)
+    if not my_layovers:
+        return jsonify({'token': token, 'overlaps': [], 'reason': 'no_layovers_in_my_data'})
+
+    friends = (_friends_load(token).get('friends') or [])
+    overlaps = []
+    for friend_token in friends:
+        friend_session = _store.get(friend_token) or {}
+        friend_tage = (friend_session.get('result_data') or {}).get('_tage_detail') or []
+        friend_layovers = _extract_layover_set(friend_tage)
+        shared = []
+        for datum, place in my_layovers.items():
+            if friend_layovers.get(datum) == place:
+                shared.append({'datum': datum, 'place': place})
+        if shared:
+            ppath = _user_profile_path(friend_token)
+            prof = {}
+            try:
+                with open(ppath) as f:
+                    prof = (json.load(f) or {}).get('profile', {})
+            except Exception: pass
+            overlaps.append({
+                'friend_token': friend_token,
+                'friend_name': prof.get('name', friend_token[:8] + '…'),
+                'shared_layovers': shared,
+                'count': len(shared),
+            })
+    overlaps.sort(key=lambda x: -x['count'])
+    return jsonify({'token': token, 'overlaps': overlaps, 'friends_checked': len(friends)})
+
+
+@app.route('/api/user/stats/<token>', methods=['GET'])
+def get_user_stats(token):
+    """Aggregiert Statistik über jüngste Auswertung."""
+    session = _store.get(token) or {}
+    rd = session.get('result_data') or {}
+    tage = rd.get('_tage_detail') or []
+    # Aggregate
+    from collections import Counter
+    klass_ct = Counter()
+    layover_ct = Counter()
+    z76_eur_by_country = {}
+    monthly = {}
+    for t in tage:
+        if not isinstance(t, dict): continue
+        datum = t.get('datum', '')
+        klass = (t.get('klass') or '').upper()
+        klass_ct[klass] += 1
+        rf = t.get('reader_facts') or {}
+        place = (rf.get('layover_ort') or '').upper().strip()
+        if place and len(place) == 3 and place != 'FRA':
+            layover_ct[place] += 1
+        # Z76 € by country (from classifier_result.bmf_land)
+        cr = t.get('classifier_result') or {}
+        if klass == 'Z76':
+            land = (cr.get('bmf_land') or '').strip()
+            eur = float(cr.get('amount', 0) or 0)
+            if land:
+                z76_eur_by_country[land] = round(z76_eur_by_country.get(land, 0) + eur, 2)
+        # Monthly
+        if datum and len(datum) >= 7:
+            ym = datum[:7]
+            if ym not in monthly:
+                monthly[ym] = {'tour_days': 0, 'hotel': 0, 'free': 0, 'office': 0}
+            m = monthly[ym]
+            if klass in ('Z72', 'Z73', 'Z74', 'Z76'):
+                m['tour_days'] += 1
+            if klass in ('FREI', 'URLAUB', 'KRANK', 'ZERODAY'):
+                m['free'] += 1
+            if klass == 'OFFICE':
+                m['office'] += 1
+            if (cr.get('counted_as_hotel_nacht')):
+                m['hotel'] += 1
+
+    top_layovers = [{'place': k, 'count': v} for k, v in layover_ct.most_common(10)]
+    by_country = sorted(z76_eur_by_country.items(), key=lambda x: -x[1])[:15]
+    return jsonify({
+        'token': token,
+        'klass_distribution': dict(klass_ct),
+        'top_layovers': top_layovers,
+        'z76_by_country': [{'country': k, 'eur': v} for k, v in by_country],
+        'monthly': monthly,
+        'totals': {
+            'tour_days': sum(klass_ct[k] for k in ('Z72', 'Z73', 'Z74', 'Z76')),
+            'hotel_nights': int(rd.get('hotel_naechte', 0) or 0),
+            'fahr_tage': int(rd.get('fahr_tage', 0) or 0),
+            'arbeitstage': int(rd.get('arbeitstage', 0) or 0),
+            'z76_eur': float(rd.get('vma_aus', 0) or 0),
+            'gesamt': float(rd.get('gesamt', 0) or 0),
+        }
+    })
+
+
+@app.route('/api/user/ical/<token>', methods=['GET'])
+def get_user_ical(token):
+    """Generiert iCal-Datei der Touren aus jüngster Auswertung.
+    Kann in iPhone-Kalender importiert werden.
+    """
+    session = _store.get(token) or {}
+    rd = session.get('result_data') or {}
+    tage = rd.get('_tage_detail') or []
+    # Group into tours
+    lines = [
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//AeroTax//Mobile//DE',
+        'CALSCALE:GREGORIAN',
+        'METHOD:PUBLISH',
+        f'X-WR-CALNAME:AeroTax Touren {rd.get("year", "")}',
+        'X-WR-TIMEZONE:Europe/Berlin',
+    ]
+    current = None
+    for t in tage:
+        if not isinstance(t, dict): continue
+        klass = (t.get('klass') or '').upper()
+        datum = t.get('datum', '')
+        rf = t.get('reader_facts') or {}
+        if klass in ('Z72', 'Z73', 'Z74', 'Z76'):
+            if not current:
+                current = {'start': datum, 'end': datum, 'klass': klass,
+                          'places': [], 'markers': []}
+            else:
+                current['end'] = datum
+            place = (rf.get('layover_ort') or '').upper().strip()
+            if place and place not in current['places']:
+                current['places'].append(place)
+            mk = rf.get('marker_raw') or t.get('marker') or ''
+            if mk and mk not in current['markers']:
+                current['markers'].append(mk)
+        else:
+            if current:
+                _ics_emit_tour(lines, current)
+                current = None
+    if current:
+        _ics_emit_tour(lines, current)
+    lines.append('END:VCALENDAR')
+    body = '\r\n'.join(lines) + '\r\n'
+    response = app.response_class(body, mimetype='text/calendar')
+    response.headers['Content-Disposition'] = f'attachment; filename="aerotax_touren_{rd.get("year", "")}.ics"'
+    return response
+
+
+def _ics_emit_tour(lines, tour):
+    """Hängt VEVENT für eine Tour an die ICS-Lines."""
+    dt_start = tour['start'].replace('-', '')
+    # End-Datum exklusiv: end+1
+    try:
+        from datetime import datetime as _dt, timedelta
+        end_d = _dt.strptime(tour['end'], '%Y-%m-%d').date() + timedelta(days=1)
+        dt_end = end_d.strftime('%Y%m%d')
+    except Exception:
+        dt_end = tour['end'].replace('-', '')
+    places = ', '.join(tour['places']) or 'Tour'
+    summary = f"{places}"
+    uid = f"{tour['start']}-{places.replace(' ','').replace(',','-')}@aerotax"
+    lines.extend([
+        'BEGIN:VEVENT',
+        f'UID:{uid}',
+        f'DTSTAMP:{datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}',
+        f'DTSTART;VALUE=DATE:{dt_start}',
+        f'DTEND;VALUE=DATE:{dt_end}',
+        f'SUMMARY:{summary}',
+        f'DESCRIPTION:AeroTax-Tour. Klassifikation: {tour["klass"]}. Marker: {", ".join(tour["markers"][:3])}',
+        'END:VEVENT',
+    ])
+
+
+@app.route('/api/user/push-token/<token>', methods=['POST'])
+def register_push_token(token):
+    """Registriert einen Expo-Push-Token für diesen User. Wird bei
+    Friend-Updates / Layover-Match-Match genutzt (Sprint 6)."""
+    body = request.get_json(silent=True) or {}
+    push_token = (body.get('push_token') or '').strip()
+    if not push_token:
+        return jsonify({'ok': False, 'error': 'missing push_token'}), 400
+    p = _user_push_path(token)
+    if not p:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    try:
+        with open(p, 'w') as f:
+            json.dump({
+                'token': token,
+                'push_token': push_token,
+                'platform': body.get('platform', 'expo'),
+                'registered_at': datetime.now().isoformat(),
+            }, f)
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+def _send_push_notification(token, title, body):
+    """Versendet eine Expo-Push-Nachricht an einen User-Token (best effort).
+    Verwendet Expo Push API — keine APNs-Cert nötig wenn EAS-build verwendet.
+    """
+    p = _user_push_path(token)
+    if not p: return False
+    try:
+        with open(p) as f:
+            data = json.load(f)
+        push_token = data.get('push_token')
+        if not push_token: return False
+        import urllib.request
+        payload = json.dumps({
+            'to': push_token, 'title': title, 'body': body,
+            'sound': 'default', 'priority': 'high',
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            'https://exp.host/--/api/v2/push/send',
+            data=payload, method='POST',
+            headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+        return True
+    except Exception:
+        return False
 
 
 @app.route('/api/user/history/<token>/clear', methods=['POST'])
