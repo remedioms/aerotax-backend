@@ -23762,11 +23762,11 @@ def _berechne_via_hybrid(form, files, job_id=None):
                       else 'ok')
             ),
         },
-        # R40 Phase 3 (2026-05-28): V2-Audit-Keys aus _classify_v11_cas_pipeline
-        # ans finale result_data durchreichen, sonst sind sie für read_v2_audit.py
-        # unsichtbar.
-        '_classifier_v2_audit':    cls.get('_classifier_v2_audit'),
-        'classification_v2':       cls.get('classification_v2'),
+        # R40 Phase 3 (2026-05-28): V2-Audit-Keys aus hybrid_analyze ans finale
+        # result_data durchreichen. hybrid_analyze legt sie TOP-LEVEL in hr ab
+        # (NICHT in hr.classification), darum hier hr.get statt cls.get.
+        '_classifier_v2_audit':    (hr or {}).get('_classifier_v2_audit'),
+        'classification_v2':       (hr or {}).get('classification_v2'),
     }
 
 
