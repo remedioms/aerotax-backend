@@ -119,6 +119,10 @@ class TestPipelineForeignTour:
 
 class TestPipelineCounters:
     def test_arbeitstage_excludes_frei_zerod_issue(self):
+        """R40 V2.1: Standby zuhause OHNE Tour-Aktivierung zählt NICHT als
+        Arbeitstag (steuerliche Konvention: Bereitschaft zu Hause kein
+        Arbeitstag im VMA-Sinn). Nur Tour-aktiviertes Standby zählt.
+        """
         days = [
             _day('2025-01-01', marker='OFF', activity='frei'),
             _day('2025-01-02', marker='LH756', routing=['FRA', 'BLR'],
@@ -126,14 +130,14 @@ class TestPipelineCounters:
             _day('2025-01-03', marker='LH757', routing=['BLR', 'FRA'],
                  ends_hb=True, duty=500),
             _day('2025-01-04', marker='OFF', activity='frei'),
-            _day('2025-01-05', marker='SB_S', duty=480),  # Standby home
+            _day('2025-01-05', marker='SB_S', duty=480),  # Standby home, no tour
         ]
         r = classify_pipeline(days, homebase='FRA',
                               iata_to_bmf=_IATA_TO_BMF_TEST,
                               bmf_auslandj=_BMF_TEST)
-        # 2 tour days (Z76) + 1 Standby = 3 arbeitstage
-        assert r.arbeitstage == 3
-        # Reinigung: Z76-Tage, kein Standby
+        # 2 Tour-Tage (Z76) — Standby zuhause OHNE Aktivierung zählt nicht
+        assert r.arbeitstage == 2
+        # Reinigung = Tour-Tage
         assert r.reinigungstage == 2
 
     def test_hotel_naechte_only_foreign_overnight(self):

@@ -857,9 +857,38 @@ def classify_pipeline(
             bmf_auslandj=bmf_auslandj,
             homebase=homebase,
         )
-        # Counter-Logik
-        is_workday = cls.klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby')
-        is_reinigungstag = cls.klass in ('Z72', 'Z73', 'Z74', 'Z76', 'Office')
+        # Counter-Logik — FollowMe-konforme Arbeitstag-Definition (R40 V2.1):
+        #
+        # Tour-Tage (Z72/Z73/Z74/Z76) sind IMMER Arbeitstage.
+        #
+        # Office zählt nur, wenn aktiv (echte Schulung mit Briefingzeit / duty
+        # >= 240min). Passive ORTSTAG-/FRS-/FRD-Tage am HB ohne Anwesenheits-
+        # Signal zählen NICHT (Crew-Konvention: Heimatstandort ist nicht
+        # Auswärtstätigkeit, FollowMe zählt sie auch nicht).
+        #
+        # Standby zählt nur wenn AKTIVIERT (= im Tour-Kontext aus klassifiziert).
+        # Standby zuhause ohne Anruf ist kein steuerlicher Arbeitstag.
+        _duty = int(day.get('duty_duration_minutes') or 0)
+        _start_time = (day.get('start_time') or '').strip()
+        _marker_raw = (day.get('marker_raw') or day.get('marker') or '').upper()
+        _is_passive_marker = any(
+            m in _marker_raw for m in ('ORTSTAG', 'FRS', 'FRD')
+        )
+        _has_office_activity = (_duty >= 240 or bool(_start_time)) and not _is_passive_marker
+
+        is_workday = False
+        if cls.klass in ('Z72', 'Z73', 'Z74', 'Z76'):
+            is_workday = True
+        elif cls.klass == 'Office':
+            is_workday = _has_office_activity
+        elif cls.klass == 'Standby':
+            # Standby zählt nur als Arbeit wenn in Tour-Klammer
+            # (Standby-Aktivierung → Tour-Tag, V2 erkennt das via role=standby_airport)
+            is_workday = role is not None  # nur wenn Tour-Tag
+
+        # Reinigung folgt arbeitstage MINUS Standby (Reinigung kostet nur
+        # bei echten Tour-Tagen, nicht bei Standby-Sitzdienst am Flughafen)
+        is_reinigungstag = is_workday and cls.klass != 'Standby'
         if is_workday:
             result.arbeitstage += 1
         if is_reinigungstag:
