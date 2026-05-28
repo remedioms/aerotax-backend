@@ -8982,6 +8982,123 @@ def set_marker_mapping(token):
 
 # ── Min-Version-Check ────────────────────────────────────────────────
 
+# ── Lufthansa CrewLink (Option A — Web-Scraping, AGB-Risiko) ──────────
+
+@app.route('/api/lufthansa/credentials/<token>', methods=['POST'])
+def lufthansa_save_credentials(token):
+    """Speichert verschlüsselte CrewLink-Credentials.
+    Body: {email, password, accepted_risk: true}
+    Frontend muss accepted_risk=true senden — Disclaimer dort.
+    """
+    try:
+        from lufthansa_crewlink import encrypt_credentials
+    except Exception as e:
+        return jsonify({'ok': False, 'error': 'crewlink_module_unavailable', 'detail': str(e)[:200]}), 500
+    body = request.get_json(silent=True) or {}
+    email = (body.get('email') or '').strip()
+    pw = body.get('password') or ''
+    accepted = bool(body.get('accepted_risk'))
+    if not accepted:
+        return jsonify({'ok': False, 'error': 'risk_not_accepted'}), 400
+    if not email or '@' not in email or len(pw) < 4:
+        return jsonify({'ok': False, 'error': 'invalid_credentials'}), 400
+    try:
+        blob = encrypt_credentials(email, pw)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': 'encrypt_failed', 'detail': str(e)[:200]}), 500
+    p = _user_profile_path(token)
+    existing = {}
+    try:
+        with open(p) as f: existing = json.load(f) or {}
+    except Exception: pass
+    existing['lufthansa_credentials'] = blob
+    try:
+        with open(p, 'w') as f: json.dump(existing, f)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+    return jsonify({'ok': True, 'saved_at': blob.get('created_at')})
+
+
+@app.route('/api/lufthansa/credentials/<token>', methods=['DELETE'])
+def lufthansa_delete_credentials(token):
+    p = _user_profile_path(token)
+    try:
+        with open(p) as f: existing = json.load(f) or {}
+    except Exception:
+        return jsonify({'ok': True, 'already_gone': True})
+    existing.pop('lufthansa_credentials', None)
+    existing.pop('lufthansa_last_sync', None)
+    try:
+        with open(p, 'w') as f: json.dump(existing, f)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+    return jsonify({'ok': True})
+
+
+@app.route('/api/lufthansa/sync/<token>', methods=['POST'])
+def lufthansa_sync(token):
+    """Triggert einen Scrape-Lauf. Synchron (~5-15 s).
+    Production wäre besser via Cloud Task — hier inline für Einfachheit.
+    """
+    try:
+        from lufthansa_crewlink import decrypt_credentials, scrape_roster
+    except Exception as e:
+        return jsonify({'ok': False, 'error': 'module_unavailable', 'detail': str(e)[:200]}), 500
+    p = _user_profile_path(token)
+    try:
+        with open(p) as f: prof = json.load(f) or {}
+    except Exception:
+        return jsonify({'ok': False, 'error': 'no_profile'}), 404
+    blob = prof.get('lufthansa_credentials')
+    if not blob:
+        return jsonify({'ok': False, 'error': 'no_credentials_saved'}), 404
+    creds = decrypt_credentials(blob)
+    if not creds:
+        return jsonify({'ok': False, 'error': 'decrypt_failed_master_key_changed'}), 500
+    res = scrape_roster(creds['email'], creds['password'])
+
+    # Status persistieren (Credentials NICHT mit returnen!)
+    prof['lufthansa_last_sync'] = {
+        'at': res.fetched_at,
+        'ok': res.ok,
+        'event_count': res.raw_count,
+        'error': res.error,
+        'error_code': res.error_code,
+    }
+    if res.ok and res.events:
+        prof['lufthansa_events'] = res.events[:300]
+    try:
+        with open(p, 'w') as f: json.dump(prof, f)
+    except Exception: pass
+
+    return jsonify({
+        'ok': res.ok,
+        'event_count': res.raw_count,
+        'error': res.error,
+        'error_code': res.error_code,
+        'fetched_at': res.fetched_at,
+    })
+
+
+@app.route('/api/lufthansa/status/<token>', methods=['GET'])
+def lufthansa_status(token):
+    p = _user_profile_path(token)
+    try:
+        with open(p) as f: prof = json.load(f) or {}
+    except Exception:
+        return jsonify({'configured': False})
+    has_creds = bool(prof.get('lufthansa_credentials'))
+    last_sync = prof.get('lufthansa_last_sync') or {}
+    return jsonify({
+        'configured': has_creds,
+        'last_sync_at': last_sync.get('at'),
+        'last_sync_ok': last_sync.get('ok'),
+        'last_event_count': last_sync.get('event_count', 0),
+        'last_error_code': last_sync.get('error_code'),
+        'last_error': last_sync.get('error'),
+    })
+
+
 @app.route('/api/version-check', methods=['GET'])
 def version_check():
     """Frontend ruft beim Start: liefert min-required-version + force-update Flag."""
