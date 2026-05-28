@@ -8152,6 +8152,111 @@ def get_user_ical(token):
     return response
 
 
+@app.route('/api/user/logbook-pdf/<token>', methods=['GET'])
+def get_user_logbook_pdf(token):
+    """Generiert ein einfaches Logbuch-PDF aus dem User-State.
+    Achtung: Duty-Zeit (Briefing→Onblock), nicht echte Block-Time.
+    Nicht AMC1-FCL.050-konform — explizit so beschriftet.
+    """
+    session = _store.get(token) or {}
+    rd = session.get('result_data') or {}
+    tage = rd.get('_tage_detail') or []
+    pname = ''
+    ppath = _user_profile_path(token)
+    try:
+        with open(ppath) as f:
+            pname = ((json.load(f) or {}).get('profile') or {}).get('name', '')
+    except Exception:
+        pass
+
+    flight_days = []
+    for t in tage:
+        if not isinstance(t, dict): continue
+        if (t.get('klass') or '').upper() not in ('Z72', 'Z73', 'Z74', 'Z76'): continue
+        rf = t.get('reader_facts') or {}
+        if not (rf.get('start_time') or rf.get('end_time')): continue
+        flight_days.append(t)
+
+    from io import BytesIO
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.5*cm, rightMargin=1.5*cm,
+                            topMargin=1.5*cm, bottomMargin=1.5*cm)
+    styles = getSampleStyleSheet()
+    elems = []
+    title_style = ParagraphStyle('title', parent=styles['Heading1'],
+                                 fontSize=18, textColor=HexColor('#0a0e1a'))
+    sub_style = ParagraphStyle('sub', parent=styles['Normal'],
+                               fontSize=10, textColor=HexColor('#666666'))
+    cell_style = ParagraphStyle('cell', parent=styles['Normal'],
+                                fontSize=9, leading=11)
+
+    elems.append(Paragraph(f'Logbuch · {rd.get("year", "")}', title_style))
+    if pname:
+        elems.append(Paragraph(pname, sub_style))
+    elems.append(Paragraph('Erstellt mit AeroTax · '
+        + datetime.now().strftime('%d.%m.%Y'), sub_style))
+    elems.append(Spacer(1, 0.4*cm))
+    elems.append(Paragraph(
+        '<b>Hinweis:</b> Duty-Zeit (Briefing → Onblock), nicht AMC1-FCL.050-konform. '
+        'Für offizielle Logbuch-Submissions sind tatsächliche Off-/On-Block-Zeiten erforderlich.',
+        sub_style))
+    elems.append(Spacer(1, 0.4*cm))
+
+    header = ['Datum', 'Routing', 'Briefing', 'Onblock', 'Duty', 'Klass.']
+    data = [header]
+    total_min = 0
+    for t in flight_days:
+        rf = t.get('reader_facts') or {}
+        s = rf.get('start_time') or ''
+        e = rf.get('end_time') or ''
+        duty = ''
+        try:
+            if s and e:
+                sh, sm = [int(x) for x in s.split(':')]
+                eh, em = [int(x) for x in e.split(':')]
+                s_min = sh * 60 + sm
+                e_min = eh * 60 + em
+                d_min = (e_min - s_min) if e_min > s_min else (24*60 - s_min) + e_min
+                duty = f'{d_min // 60}:{d_min % 60:02d}'
+                total_min += d_min
+        except Exception:
+            pass
+        data.append([
+            t.get('datum', ''),
+            (t.get('routing') or '')[:18],
+            s, e, duty, t.get('klass', ''),
+        ])
+    if len(data) == 1:
+        elems.append(Paragraph('Keine Flugtage mit Zeitangaben verfügbar.', cell_style))
+    else:
+        col_widths = [2.4*cm, 4.5*cm, 2.2*cm, 2.2*cm, 1.8*cm, 2.0*cm]
+        tbl = Table(data, colWidths=col_widths, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), HexColor('#0a0e1a')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [white, HexColor('#f5f5f5')]),
+            ('BOX', (0, 0), (-1, -1), 0.5, HexColor('#cccccc')),
+            ('INNERGRID', (0, 0), (-1, -1), 0.25, HexColor('#dddddd')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        elems.append(tbl)
+        elems.append(Spacer(1, 0.4*cm))
+        elems.append(Paragraph(
+            f'<b>Summe Duty-Zeit:</b> {total_min // 60}:{total_min % 60:02d} '
+            f'({len(flight_days)} Flugtage)',
+            styles['Normal']))
+
+    doc.build(elems)
+    pdf_bytes = buf.getvalue()
+    response = app.response_class(pdf_bytes, mimetype='application/pdf')
+    response.headers['Content-Disposition'] = f'attachment; filename="aerotax_logbuch_{rd.get("year", "")}.pdf"'
+    return response
+
+
 def _ics_emit_tour(lines, tour):
     """Hängt VEVENT für eine Tour an die ICS-Lines."""
     dt_start = tour['start'].replace('-', '')
