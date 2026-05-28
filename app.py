@@ -8556,6 +8556,445 @@ def clear_user_history(token):
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+# ── Auth-System (email/password optional auf Token-Flow) ──────────────
+
+def _user_auth_path():
+    import os
+    os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+    return os.path.join(_USER_HISTORY_DIR, 'auth_users.json')
+
+
+def _auth_load():
+    import os, json
+    p = _user_auth_path()
+    if not os.path.exists(p): return {}
+    try:
+        with open(p) as f: return json.load(f) or {}
+    except Exception: return {}
+
+
+def _auth_save(d):
+    import json
+    try:
+        with open(_user_auth_path(), 'w') as f: json.dump(d, f)
+        return True
+    except Exception: return False
+
+
+def _auth_hash(pw):
+    import hashlib
+    return hashlib.sha256((pw or '').encode('utf-8')).hexdigest()
+
+
+@app.route('/api/auth/signup', methods=['POST'])
+def auth_signup():
+    body = request.get_json(silent=True) or {}
+    email = (body.get('email') or '').strip().lower()
+    pw = body.get('password') or ''
+    if not email or '@' not in email or len(pw) < 6:
+        return jsonify({'ok': False, 'error': 'email_or_password_invalid'}), 400
+    users = _auth_load()
+    if email in users:
+        return jsonify({'ok': False, 'error': 'email_already_exists'}), 409
+    import uuid as _u
+    token = 'AT-' + _u.uuid4().hex[:16].upper()
+    users[email] = {'password_hash': _auth_hash(pw), 'token': token,
+                    'created_at': datetime.now().isoformat()}
+    _auth_save(users)
+    return jsonify({'ok': True, 'token': token, 'email': email})
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    body = request.get_json(silent=True) or {}
+    email = (body.get('email') or '').strip().lower()
+    pw = body.get('password') or ''
+    users = _auth_load()
+    user = users.get(email)
+    if not user or user.get('password_hash') != _auth_hash(pw):
+        return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
+    return jsonify({'ok': True, 'token': user['token'], 'email': email})
+
+
+@app.route('/api/auth/forgot', methods=['POST'])
+def auth_forgot():
+    body = request.get_json(silent=True) or {}
+    email = (body.get('email') or '').strip().lower()
+    users = _auth_load()
+    # Antwortet immer 200 (kein E-Mail-Enumeration)
+    if email in users:
+        import uuid as _u
+        reset_token = _u.uuid4().hex[:24]
+        users[email]['reset_token'] = reset_token
+        users[email]['reset_expires'] = (datetime.now() + timedelta(hours=2)).isoformat()
+        _auth_save(users)
+        # Production: Email via SES/SendGrid. Hier nur Log.
+        print(f'[auth] Reset-Token für {email}: {reset_token}')
+    return jsonify({'ok': True, 'sent': True})
+
+
+@app.route('/api/auth/reset', methods=['POST'])
+def auth_reset():
+    body = request.get_json(silent=True) or {}
+    email = (body.get('email') or '').strip().lower()
+    reset_token = (body.get('reset_token') or '').strip()
+    new_pw = body.get('new_password') or ''
+    if len(new_pw) < 6:
+        return jsonify({'ok': False, 'error': 'password_too_short'}), 400
+    users = _auth_load()
+    user = users.get(email)
+    if not user or user.get('reset_token') != reset_token:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    try:
+        from datetime import datetime as _d
+        if _d.fromisoformat(user.get('reset_expires', '1970-01-01T00:00:00')) < datetime.now():
+            return jsonify({'ok': False, 'error': 'token_expired'}), 400
+    except Exception:
+        pass
+    user['password_hash'] = _auth_hash(new_pw)
+    user.pop('reset_token', None)
+    user.pop('reset_expires', None)
+    _auth_save(users)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/auth/delete-account', methods=['POST'])
+def auth_delete_account():
+    body = request.get_json(silent=True) or {}
+    email = (body.get('email') or '').strip().lower()
+    pw = body.get('password') or ''
+    users = _auth_load()
+    user = users.get(email)
+    if not user or user.get('password_hash') != _auth_hash(pw):
+        return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
+    token = user.get('token')
+    del users[email]
+    _auth_save(users)
+    # Lösche User-Daten
+    import os
+    for fn in [f'history_{token}.json', f'profile_{token}.json',
+               f'friends_{token}.json', f'push_{token}.json']:
+        p = os.path.join(_USER_HISTORY_DIR, fn)
+        if os.path.exists(p):
+            try: os.remove(p)
+            except Exception: pass
+    return jsonify({'ok': True})
+
+
+# ── Friend-Requests (statt symmetrisch-add: invite/accept-Flow) ───────
+
+@app.route('/api/user/friend-requests/<token>', methods=['GET'])
+def list_friend_requests(token):
+    d = _friends_load(token)
+    return jsonify({
+        'incoming': d.get('requests_in') or [],
+        'outgoing': d.get('requests_out') or [],
+    })
+
+
+@app.route('/api/user/friend-requests/<token>/send', methods=['POST'])
+def send_friend_request(token):
+    body = request.get_json(silent=True) or {}
+    target = (body.get('friend_token') or '').strip()
+    if not target or target == token:
+        return jsonify({'ok': False, 'error': 'invalid_target'}), 400
+    me = _friends_load(token)
+    them = _friends_load(target)
+    if target in (me.get('friends') or []):
+        return jsonify({'ok': True, 'already_friends': True})
+    me.setdefault('requests_out', [])
+    them.setdefault('requests_in', [])
+    if target not in me['requests_out']: me['requests_out'].append(target)
+    if token not in them['requests_in']: them['requests_in'].append(token)
+    _friends_save(token, me)
+    _friends_save(target, them)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/user/friend-requests/<token>/accept', methods=['POST'])
+def accept_friend_request(token):
+    body = request.get_json(silent=True) or {}
+    from_token = (body.get('friend_token') or '').strip()
+    me = _friends_load(token)
+    them = _friends_load(from_token)
+    if from_token not in (me.get('requests_in') or []):
+        return jsonify({'ok': False, 'error': 'no_request'}), 404
+    me['requests_in'] = [r for r in me['requests_in'] if r != from_token]
+    them['requests_out'] = [r for r in (them.get('requests_out') or []) if r != token]
+    me.setdefault('friends', [])
+    them.setdefault('friends', [])
+    if from_token not in me['friends']: me['friends'].append(from_token)
+    if token not in them['friends']: them['friends'].append(token)
+    _friends_save(token, me)
+    _friends_save(from_token, them)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/user/friend-requests/<token>/decline', methods=['POST'])
+def decline_friend_request(token):
+    body = request.get_json(silent=True) or {}
+    from_token = (body.get('friend_token') or '').strip()
+    me = _friends_load(token)
+    them = _friends_load(from_token)
+    me['requests_in'] = [r for r in (me.get('requests_in') or []) if r != from_token]
+    them['requests_out'] = [r for r in (them.get('requests_out') or []) if r != token]
+    _friends_save(token, me)
+    _friends_save(from_token, them)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/user/friend-remind/<token>', methods=['POST'])
+def friend_remind(token):
+    """Push-Erinnerung an Friend den Dienstplan zu importieren."""
+    body = request.get_json(silent=True) or {}
+    friend_token = (body.get('friend_token') or '').strip()
+    if friend_token not in (_friends_load(token).get('friends') or []):
+        return jsonify({'ok': False, 'error': 'not_friends'}), 403
+    try:
+        _send_push_notification(friend_token, 'Erinnerung',
+                                'Ein Crew-Buddy bittet dich, deinen Dienstplan zu importieren.')
+    except Exception:
+        pass
+    return jsonify({'ok': True})
+
+
+# ── Crew + Aircraft pro Flugtag (lokal-augmented, im Profile gespeichert) ──
+
+def _crew_aircraft_load(token):
+    p = _user_profile_path(token)
+    try:
+        with open(p) as f:
+            return (json.load(f) or {}).get('crew_aircraft', {}) or {}
+    except Exception:
+        return {}
+
+
+def _crew_aircraft_save(token, data):
+    p = _user_profile_path(token)
+    try:
+        existing = {}
+        try:
+            with open(p) as f: existing = json.load(f) or {}
+        except Exception: pass
+        existing['crew_aircraft'] = data
+        with open(p, 'w') as f: json.dump(existing, f)
+        return True
+    except Exception:
+        return False
+
+
+@app.route('/api/user/crew-aircraft/<token>', methods=['GET'])
+def get_crew_aircraft(token):
+    return jsonify({'data': _crew_aircraft_load(token)})
+
+
+@app.route('/api/user/crew-aircraft/<token>/<datum>', methods=['POST'])
+def set_crew_aircraft(token, datum):
+    body = request.get_json(silent=True) or {}
+    data = _crew_aircraft_load(token)
+    entry = data.get(datum, {})
+    if 'aircraft_reg' in body: entry['aircraft_reg'] = (body['aircraft_reg'] or '').upper()[:8]
+    if 'aircraft_type' in body: entry['aircraft_type'] = (body['aircraft_type'] or '')[:16]
+    if 'crew' in body and isinstance(body['crew'], list):
+        entry['crew'] = [{
+            'name': str(c.get('name', ''))[:60],
+            'function': str(c.get('function', ''))[:8],
+        } for c in body['crew'][:12]]
+    if 'notes' in body: entry['notes'] = str(body['notes'])[:500]
+    if 'locked' in body: entry['locked'] = bool(body['locked'])
+    if 'unlock_reason' in body: entry['unlock_reason'] = str(body['unlock_reason'])[:500]
+    data[datum] = entry
+    _crew_aircraft_save(token, data)
+    return jsonify({'ok': True, 'entry': entry})
+
+
+# ── Calendar-Feed-Import (ICS URL) ─────────────────────────────────────
+
+@app.route('/api/user/calendar-feed/<token>/import', methods=['POST'])
+def import_calendar_feed(token):
+    """Lädt ein ICS-File von einer URL und speichert die Events als Roster-Hints."""
+    body = request.get_json(silent=True) or {}
+    url = (body.get('url') or '').strip()
+    if not url.startswith(('http://', 'https://')):
+        return jsonify({'ok': False, 'error': 'invalid_url'}), 400
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={'User-Agent': 'AeroTax/1.0'})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            text = r.read().decode('utf-8', errors='replace')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': str(e)[:200]}), 502
+    # Sehr einfacher ICS-Parser: zählt VEVENTs + SUMMARYs
+    events = []
+    current = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line == 'BEGIN:VEVENT':
+            current = {}
+        elif line == 'END:VEVENT' and current is not None:
+            if current: events.append(current)
+            current = None
+        elif current is not None and ':' in line:
+            k, _, v = line.partition(':')
+            k = k.split(';')[0]
+            if k == 'SUMMARY': current['summary'] = v[:80]
+            elif k == 'DTSTART': current['start'] = v[:16]
+            elif k == 'DTEND': current['end'] = v[:16]
+            elif k == 'LOCATION': current['location'] = v[:60]
+    # Save
+    p = _user_profile_path(token)
+    try:
+        existing = {}
+        try:
+            with open(p) as f: existing = json.load(f) or {}
+        except Exception: pass
+        existing['calendar_feed'] = {'url': url, 'events': events[:300],
+                                      'imported_at': datetime.now().isoformat()}
+        with open(p, 'w') as f: json.dump(existing, f)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'events_count': len(events)})
+
+
+# ── IAP-Mock (UI-only, kein echter StoreKit-Hit) ──────────────────────
+
+@app.route('/api/user/subscription/<token>', methods=['GET'])
+def get_subscription(token):
+    p = _user_profile_path(token)
+    try:
+        with open(p) as f:
+            data = (json.load(f) or {}).get('subscription', {})
+            return jsonify(data or {'tier': 'free', 'active': False})
+    except Exception:
+        return jsonify({'tier': 'free', 'active': False})
+
+
+@app.route('/api/user/subscription/<token>/set', methods=['POST'])
+def set_subscription(token):
+    """Wird vom Mobile mit dem (verifizierten) StoreKit-Receipt aufgerufen.
+    Hier nur Mock — speichert das gewählte Tier.
+    """
+    body = request.get_json(silent=True) or {}
+    tier = (body.get('tier') or 'free').lower()
+    if tier not in ('free', 'lite', 'standard', 'standard_plus', 'premium', 'lifelong'):
+        return jsonify({'ok': False, 'error': 'invalid_tier'}), 400
+    p = _user_profile_path(token)
+    try:
+        existing = {}
+        try:
+            with open(p) as f: existing = json.load(f) or {}
+        except Exception: pass
+        existing['subscription'] = {
+            'tier': tier, 'active': tier != 'free',
+            'started_at': datetime.now().isoformat(),
+            'valid_until': (datetime.now() + timedelta(days=365)).isoformat(),
+        }
+        with open(p, 'w') as f: json.dump(existing, f)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'tier': tier})
+
+
+# ── Sponsored Friends (Familienabo, 4 Slots, gehängt an Standard+/Premium) ─
+
+@app.route('/api/user/sponsored/<token>', methods=['GET'])
+def get_sponsored(token):
+    p = _user_profile_path(token)
+    try:
+        with open(p) as f:
+            return jsonify({'slots': (json.load(f) or {}).get('sponsored_slots', [])})
+    except Exception:
+        return jsonify({'slots': []})
+
+
+@app.route('/api/user/sponsored/<token>/add', methods=['POST'])
+def add_sponsored(token):
+    body = request.get_json(silent=True) or {}
+    friend_token = (body.get('friend_token') or '').strip()
+    if not friend_token:
+        return jsonify({'ok': False, 'error': 'missing_friend'}), 400
+    p = _user_profile_path(token)
+    existing = {}
+    try:
+        with open(p) as f: existing = json.load(f) or {}
+    except Exception: pass
+    slots = existing.get('sponsored_slots', [])
+    if len(slots) >= 4:
+        return jsonify({'ok': False, 'error': 'limit_reached'}), 400
+    if friend_token in slots:
+        return jsonify({'ok': True, 'already': True})
+    slots.append(friend_token)
+    existing['sponsored_slots'] = slots
+    try:
+        with open(p, 'w') as f: json.dump(existing, f)
+    except Exception: pass
+    return jsonify({'ok': True, 'slots': slots})
+
+
+@app.route('/api/user/sponsored/<token>/remove', methods=['POST'])
+def remove_sponsored(token):
+    body = request.get_json(silent=True) or {}
+    friend_token = (body.get('friend_token') or '').strip()
+    p = _user_profile_path(token)
+    existing = {}
+    try:
+        with open(p) as f: existing = json.load(f) or {}
+    except Exception: pass
+    existing['sponsored_slots'] = [s for s in (existing.get('sponsored_slots') or []) if s != friend_token]
+    try:
+        with open(p, 'w') as f: json.dump(existing, f)
+    except Exception: pass
+    return jsonify({'ok': True, 'slots': existing['sponsored_slots']})
+
+
+# ── Marker-Mapping (Assign Event Codes manuell) ──────────────────────
+
+@app.route('/api/user/marker-mapping/<token>', methods=['GET'])
+def get_marker_mapping(token):
+    p = _user_profile_path(token)
+    try:
+        with open(p) as f:
+            return jsonify({'mapping': (json.load(f) or {}).get('marker_mapping', {})})
+    except Exception:
+        return jsonify({'mapping': {}})
+
+
+@app.route('/api/user/marker-mapping/<token>/set', methods=['POST'])
+def set_marker_mapping(token):
+    body = request.get_json(silent=True) or {}
+    code = (body.get('code') or '').strip().upper()[:8]
+    klass = (body.get('klass') or '').strip()
+    if not code or klass not in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby', 'Frei', 'Urlaub', 'Krank', 'Ignore'):
+        return jsonify({'ok': False, 'error': 'invalid'}), 400
+    p = _user_profile_path(token)
+    existing = {}
+    try:
+        with open(p) as f: existing = json.load(f) or {}
+    except Exception: pass
+    mp = existing.get('marker_mapping', {})
+    mp[code] = klass
+    existing['marker_mapping'] = mp
+    try:
+        with open(p, 'w') as f: json.dump(existing, f)
+    except Exception: pass
+    return jsonify({'ok': True, 'mapping': mp})
+
+
+# ── Min-Version-Check ────────────────────────────────────────────────
+
+@app.route('/api/version-check', methods=['GET'])
+def version_check():
+    """Frontend ruft beim Start: liefert min-required-version + force-update Flag."""
+    current = request.args.get('current', '0.0.0')
+    MIN_VERSION = '0.1.0'
+    def parse(v): return tuple(int(x) for x in v.split('.') + ['0', '0'][:3-len(v.split('.'))])
+    try:
+        force = parse(current) < parse(MIN_VERSION)
+    except Exception:
+        force = False
+    return jsonify({'min_version': MIN_VERSION, 'force_update': force, 'current': current})
+
+
 @app.route('/')
 def health():
     return jsonify({
