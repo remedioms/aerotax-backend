@@ -19706,8 +19706,34 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             _sb_stfrei_ort = (se.get('stfrei_ort') or '').upper().strip()
             _sb_stfrei_inland = se.get('stfrei_inland')
             _sb_homebase_iata = (homebase or 'FRA').upper().strip()
+            # R41 (2026-05-28): SE allein reicht NICHT für Z76. CAS muss
+            # mindestens ein Auslandssignal zeigen, sonst ist die SE-Pauschale
+            # ein Buchungs-Artefakt (LH zahlt manchmal "wäre-aktiviert"-Pauschalen
+            # für Standby zu Hause an Tagen wo Crew NICHT geflogen ist).
+            # Reale Auswärtstätigkeit verlangt:
+            #   - Foreign-IATA im Routing, ODER
+            #   - Foreign-Layover-Ort, ODER
+            #   - overnight=True (echte Auswärts-Nacht)
+            _sb_routing = d.get('routing') or []
+            _sb_layover = (d.get('layover_ort') or '').upper().strip()
+            _sb_overnight = bool(d.get('overnight_after_day'))
+            _inland_iatas = {'FRA','MUC','BER','DUS','HAM','STR','CGN','HAJ',
+                             'NUE','LEJ','BRE','TXL','SXF','DRS','PAD','FMM',
+                             'FMO','SCN','FKB','FDH','NRN'}
+            def _is_foreign_iata(x):
+                if not isinstance(x, str):
+                    return False
+                u = x.upper().strip()
+                return (len(u) == 3 and u.isalpha() and u != _sb_homebase_iata
+                        and u not in _inland_iatas)
+            _sb_has_foreign_cas = (
+                any(_is_foreign_iata(r) for r in _sb_routing)
+                or _is_foreign_iata(_sb_layover)
+                or _sb_overnight
+            )
             if (_sb_stfrei_ort and _sb_stfrei_ort != _sb_homebase_iata
-                    and _sb_stfrei_inland is False):
+                    and _sb_stfrei_inland is False
+                    and _sb_has_foreign_cas):
                 # Auslands-Layover-Standby
                 klass = 'Z76'
                 # Land aus IATA-Code ermitteln
@@ -19835,12 +19861,20 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             # egal ob duty bekannt. ORTSTAG/LMN_HT mit duty=540min ist eine Online-
             # Schulung VON ZUHAUSE — keine Auswärtstätigkeit, kein Z72-Anspruch.
             # User-95775: 3 false-positives (LMN_AD1, ORTSTAG, LMN_HT) eliminiert.
+            # R41 (2026-05-28): Default — kein Lock. Wird in passive-home-Branch
+            # auf True gesetzt, dann am Loop-Ende vor tage_detail.append geprüft.
+            _klass_locked_passive_home = False
             if _is_passive_home:
                 klass = 'Frei'
                 reason = (f'Passiv zuhause ({_raw_marker_o or "Marker"}) — kein AT/FT '
                           f'(LH-CRS-Hilfe), egal duty')
+                # Lock — keine spätere Rescue darf passive-Home zu Z76/Z73
+                # hochstufen. Reader-Stempel-Leichen vom Vortag (z.B. ICN-
+                # Layover-Schatten) führten sonst zum Widerspruch zwischen
+                # klass=Z76 und reason="Passiv zuhause".
+                _klass_locked_passive_home = True
                 print(f"[r39-passive-home] datum={datum} marker={_raw_marker_o} "
-                      f"duty={total_min_o if duty_known_o else 'n/a'} → Frei")
+                      f"duty={total_min_o if duty_known_o else 'n/a'} → Frei (locked)")
             elif (not overnight and not prev_overnight and not in_cluster_o
                 and not has_active_foreign_se_o
                 and duty_known_o and total_min_o >= SAME_DAY_Z72_TOTAL_MINUTES):
@@ -20971,6 +21005,23 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
                                   else f'BMF-Mapping fehlt für {d.get("layover_ort","")}',
             'unresolved_reason': unresolved_reason or '',
         }
+
+        # R41 (2026-05-28): Passive-Home-Lock Guard.
+        # Wenn R39 als passive-home gelockt hat aber eine spätere Rescue klass
+        # überstimmt hat (z.B. SE-Standby-Foreign, BH-003c-Heimkehr-Rescue,
+        # Reader-Stempel-Leiche vom Vortag → Z76), revert hier.
+        if (locals().get('_klass_locked_passive_home') is True and klass != 'Frei'):
+            print(f"[r41-passive-guard] {datum}: klass={klass} eur={eur_added} "
+                  f"reverted to Frei (passive-home marker {_raw_marker_o})")
+            klass = 'Frei'
+            eur_added = 0.0
+            bmf_land = ''
+            bmf_key = ''
+            bmf_tagtyp = ''
+            counted_hotel = False
+            # reason behalten — es zeigt "Passiv zuhause" + Override-Hint
+            reason = (f'Passiv zuhause ({_raw_marker_o}) — kein AT/FT '
+                      f'(spätere Z76-Rescue von Lock zurückgenommen)')
 
         tage_detail.append({
             # Backward-Compat (PDF + alte Konsumenten):
