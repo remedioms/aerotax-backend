@@ -20777,8 +20777,29 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
         # waren als „aktive SE-Zeile ohne VMA-Klassifikation" vma_unmapped gelandet.
         # Wenn die Lufthansa eine Auslands-Spese ZAHLT, war der Crew klar auf Tour
         # — die Klass-Wahl (Office/Standby) war falsch. Z76 ist der korrekte Topf.
+        # R41-Master (2026-05-28): Standby/Office/Issue+SE-foreign → Z76-Rescue
+        # darf nur greifen wenn auch CAS Foreign-Signal zeigt. Sonst ist es
+        # ein Buchungs-Artefakt (siehe 04.-07.01 SEL Standby zu Hause).
+        _r41_routing = d.get('routing') or []
+        _r41_layover = (d.get('layover_ort') or '').upper().strip()
+        _r41_overnight = bool(d.get('overnight_after_day'))
+        _r41_hb = (homebase or 'FRA').upper().strip()
+        _r41_inland_set = {'FRA','MUC','BER','DUS','HAM','STR','CGN','HAJ',
+                          'NUE','LEJ','BRE','TXL','SXF','DRS','PAD','FMM',
+                          'FMO','SCN','FKB','FDH','NRN'}
+        def _r41_is_foreign(x):
+            if not isinstance(x, str): return False
+            u = x.upper().strip()
+            return (len(u) == 3 and u.isalpha() and u != _r41_hb
+                    and u not in _r41_inland_set)
+        _r41_cas_foreign = (
+            any(_r41_is_foreign(r) for r in _r41_routing)
+            or _r41_is_foreign(_r41_layover)
+            or _r41_overnight
+        )
         if (klass in ('Issue', 'Office', 'Standby') and has_active_se_final
-                and se.get('stfrei_inland') is False and se.get('stfrei_ort')):
+                and se.get('stfrei_inland') is False and se.get('stfrei_ort')
+                and _r41_cas_foreign):
             se_ort_rescue = se.get('stfrei_ort', '')
             se_betrag_rescue = float(se.get('stfrei_total', 0) or 0)
             bmf_aus_rescue = _bmf(se_ort_rescue)  # tracked iata_unknown / bmf_missing
@@ -21006,22 +21027,62 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'unresolved_reason': unresolved_reason or '',
         }
 
-        # R41 (2026-05-28): Passive-Home-Lock Guard.
-        # Wenn R39 als passive-home gelockt hat aber eine spätere Rescue klass
-        # überstimmt hat (z.B. SE-Standby-Foreign, BH-003c-Heimkehr-Rescue,
-        # Reader-Stempel-Leiche vom Vortag → Z76), revert hier.
-        if (locals().get('_klass_locked_passive_home') is True and klass != 'Frei'):
-            print(f"[r41-passive-guard] {datum}: klass={klass} eur={eur_added} "
-                  f"reverted to Frei (passive-home marker {_raw_marker_o})")
-            klass = 'Frei'
+        # R41-Master (2026-05-28): Pro-Tag-isolierter Passive-Home-Guard.
+        # Vorgängerversion benutzte locals()-Vererbung über Iterationen — Python-
+        # Scope-Bug. Jetzt: pro Tag aus raw_marker direkt erkennen, eigenständig.
+        _r41m_raw = (d.get('raw_marker') or '').upper().strip()
+        _r41m_passive_exact = {
+            'ORTSTAG', 'OFF', 'OF', 'FRS', 'FRN', 'FRD',
+            'URLAUB', 'U', 'U1', 'U2', 'KRANK', 'K',
+            'FREE', 'FREI',
+        }
+        _r41m_passive_prefixes = ('LMN_HT', 'LMN_AD', 'LMN_AL', 'LMN_AS',
+                                  'LMN_CR', 'LMN_DS', 'LMN_FT', 'LMN_OD')
+        _r41m_is_passive = (
+            _r41m_raw in _r41m_passive_exact
+            or any(_r41m_raw.startswith(p) for p in _r41m_passive_prefixes)
+        )
+        # CAS-Felder dürfen nicht überstimmen wenn passive-Marker da ist:
+        # Reader-Stempel-Leichen (Vortag-Layover bleibt im routing) sollen
+        # nicht den passive-Marker brechen. ABER: wenn der Tag echte eigene
+        # Aktivität hat (own start_time + duty), dann ist es kein passive-Tag.
+        _r41m_has_own_activity = (
+            bool((d.get('start_time') or '').strip())
+            and int(d.get('duty_duration_minutes') or 0) > 0
+            and bool(d.get('routing'))
+            and not (d.get('routing') == [_r41m_raw_hb] if False else False)
+        )
+        _r41m_routing_has_foreign = any(
+            isinstance(r, str) and len(r.upper().strip()) == 3
+            and r.upper().strip() != (homebase or 'FRA').upper()
+            and r.upper().strip() not in {'FRA','MUC','BER','DUS','HAM','STR',
+                                          'CGN','HAJ','NUE','LEJ','BRE','TXL'}
+            for r in (d.get('routing') or [])
+        )
+        # Override: Passive-Marker setzt klass=Frei, AUSSER der Tag hat
+        # eindeutig eigene Aktivität (echter Flugnummern-Marker mit Routing).
+        # Kombi-Marker wie 'ORTSTAG / 49264' werden vom Reader leider als
+        # Marker '49264' eingelesen — der Marker selbst ist nicht passiv,
+        # also greift Override nicht.
+        if _r41m_is_passive and klass != 'Frei':
+            # Differenzieren: Training/Schulung am HB → Office, nicht Frei
+            _r41m_is_training_marker = at == 'training' or 'EM' in _r41m_raw or 'D4' in _r41m_raw
+            if _r41m_is_training_marker and int(d.get('duty_duration_minutes') or 0) >= 240:
+                # Schulung mit duty ist Office am HB
+                new_klass = 'Office'
+                new_reason = f'Schulung am Homebase ({_r41m_raw}) — Office (R41-Master)'
+            else:
+                new_klass = 'Frei'
+                new_reason = f'Passiv zuhause ({_r41m_raw}) — kein AT/FT (R41-Master)'
+            print(f"[r41-master] {datum}: marker={_r41m_raw} klass={klass}→{new_klass} "
+                  f"eur={eur_added}→0 (passive-marker override)")
+            klass = new_klass
             eur_added = 0.0
             bmf_land = ''
             bmf_key = ''
             bmf_tagtyp = ''
             counted_hotel = False
-            # reason behalten — es zeigt "Passiv zuhause" + Override-Hint
-            reason = (f'Passiv zuhause ({_raw_marker_o}) — kein AT/FT '
-                      f'(spätere Z76-Rescue von Lock zurückgenommen)')
+            reason = new_reason
 
         tage_detail.append({
             # Backward-Compat (PDF + alte Konsumenten):
