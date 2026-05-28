@@ -7659,6 +7659,7 @@ def health():
         # R40 Phase 3 (2026-05-28): Flag-Sichtbarkeit für read_v2_audit.py
         'flags': {
             'AEROTAX_V2_CLASSIFIER':       os.environ.get('AEROTAX_V2_CLASSIFIER', '0') in ('1', 'true', 'on'),
+            'AEROTAX_V2_DISPLAY':          os.environ.get('AEROTAX_V2_DISPLAY', '0') in ('1', 'true', 'on'),
             'AEROTAX_USE_NORMALIZED_TOURS': AEROTAX_USE_NORMALIZED_TOURS,
             'AEROTAX_EXECUTION_MODE':      os.environ.get('AEROTAX_EXECUTION_MODE', 'thread'),
         },
@@ -23436,19 +23437,36 @@ def _berechne_via_hybrid(form, files, job_id=None):
         notes.append(f'ℹ Steuerfreie Spesen laut Streckeneinsatzabrechnung: {z77:.2f} €. '
                      f'Dieser Betrag wurde bei der Verrechnung berücksichtigt.')
 
+    # R40 Phase 4 (2026-05-28): V2-Display-Override.
+    # Wenn AEROTAX_V2_DISPLAY=1 UND classification_v2 vorhanden:
+    # KPI-Werte für arbeitstage/reinigungstage/hotel/fahrtage/Z76 kommen
+    # aus V2-Pipeline statt Legacy. Z72/Z73/Z74-Tage bleiben Legacy
+    # (V2 macht andere Konvention bei Inland).
+    _v2_display_active = (
+        os.environ.get('AEROTAX_V2_DISPLAY') in ('1', 'true', 'on')
+        and isinstance((hr or {}).get('classification_v2'), dict)
+    )
+    cls_v2 = (hr or {}).get('classification_v2') or {}
+
     # Klassifikations-Werte
-    arbeitstage   = int(cls.get('arbeitstage', 0) or 0)
-    # v8.17 (hotfix): reinigungstage als getrennter Counter — Fallback auf
-    # arbeitstage bei alten v8.16-Result-Dicts ohne reinigungstage.
-    reinigungstage = int(cls.get('reinigungstage', arbeitstage) or arbeitstage)
-    fahr_tage     = int(cls.get('fahr_tage', 0) or 0)
-    hotel_naechte = int(cls.get('hotel_naechte', 0) or 0)
+    arbeitstage   = int((cls_v2 if _v2_display_active else cls).get('arbeitstage', 0) or 0)
+    reinigungstage = int((cls_v2 if _v2_display_active else cls).get('reinigungstage', arbeitstage) or arbeitstage)
+    fahr_tage     = int((cls_v2 if _v2_display_active else cls).get('fahr_tage', 0) or 0)
+    hotel_naechte = int((cls_v2 if _v2_display_active else cls).get('hotel_naechte', 0) or 0)
+    # Z72/Z73/Z74-Tage bleiben Legacy — V2 zählt sie anders (BMF strikt)
     vma_72_tage   = int(cls.get('z72_tage', 0) or 0)
     vma_73_tage   = int(cls.get('z73_tage', 0) or 0)
     vma_74_tage   = int(cls.get('z74_tage', 0) or 0)
-    vma_aus       = float(cls.get('z76_eur', 0) or 0)
+    # Z76-€ aus V2 wenn produktiv (= ohne FollowMe-Align-Hack berechnet)
+    vma_aus       = float((cls_v2 if _v2_display_active else cls).get('z76_eur', 0) or 0)
     nachweis_text = str(cls.get('nachweis', '') or '')
     unklare_tage  = list(cls.get('unklare_tage', []) or [])
+
+    if _v2_display_active:
+        print(f"[v2-display] PRODUCTIVE — arbeit={arbeitstage} fahr={fahr_tage} "
+              f"hotel={hotel_naechte} z76={vma_aus:.0f}€ "
+              f"(legacy was: arbeit={cls.get('arbeitstage')} fahr={cls.get('fahr_tage')} "
+              f"hotel={cls.get('hotel_naechte')} z76={cls.get('z76_eur')}€)")
 
     # ── BMF-Pauschalen × Tage (Inland) ──
     vma_72 = round(vma_72_tage * bmf_inland['tagestrip_8h'], 2)
