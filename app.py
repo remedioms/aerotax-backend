@@ -8084,6 +8084,38 @@ def get_user_stats(token):
             if (cr.get('counted_as_hotel_nacht')):
                 m['hotel'] += 1
 
+    # Sickness + Off-Days monthly
+    sickness_monthly = {}
+    off_monthly = {}
+    duty_min_monthly = {}
+    for t in tage:
+        if not isinstance(t, dict): continue
+        datum = t.get('datum', '')
+        if not datum or len(datum) < 7: continue
+        ym = datum[:7]
+        klass = (t.get('klass') or '').upper()
+        marker_lower = (t.get('marker') or '').lower()
+        # Sickness: explizite Krankheits-Marker oder Klass = KRANK
+        is_sick = (klass == 'KRANK' or 'krank' in marker_lower
+                   or 'sick' in marker_lower or marker_lower in ('k', 'kk'))
+        is_off = klass in ('FREI', 'URLAUB', 'ZERODAY') and not is_sick
+        sickness_monthly[ym] = sickness_monthly.get(ym, 0) + (1 if is_sick else 0)
+        off_monthly[ym] = off_monthly.get(ym, 0) + (1 if is_off else 0)
+        # Duty-Minuten je Monat
+        rf = t.get('reader_facts') or {}
+        s_raw = rf.get('start_time')
+        e_raw = rf.get('end_time')
+        try:
+            if s_raw and e_raw:
+                sh, sm = [int(x) for x in s_raw.split(':')]
+                eh, em = [int(x) for x in e_raw.split(':')]
+                s_m = sh * 60 + sm
+                e_m = eh * 60 + em
+                dm = (e_m - s_m) if e_m > s_m else (24*60 - s_m) + e_m
+                duty_min_monthly[ym] = duty_min_monthly.get(ym, 0) + dm
+        except Exception:
+            pass
+
     top_layovers = [{'place': k, 'count': v} for k, v in layover_ct.most_common(10)]
     by_country = sorted(z76_eur_by_country.items(), key=lambda x: -x[1])[:15]
     return jsonify({
@@ -8092,6 +8124,9 @@ def get_user_stats(token):
         'top_layovers': top_layovers,
         'z76_by_country': [{'country': k, 'eur': v} for k, v in by_country],
         'monthly': monthly,
+        'sickness_monthly': sickness_monthly,
+        'off_days_monthly': off_monthly,
+        'duty_min_monthly': duty_min_monthly,
         'totals': {
             'tour_days': sum(klass_ct[k] for k in ('Z72', 'Z73', 'Z74', 'Z76')),
             'hotel_nights': int(rd.get('hotel_naechte', 0) or 0),
@@ -8099,7 +8134,60 @@ def get_user_stats(token):
             'arbeitstage': int(rd.get('arbeitstage', 0) or 0),
             'z76_eur': float(rd.get('vma_aus', 0) or 0),
             'gesamt': float(rd.get('gesamt', 0) or 0),
+            'sickness_days': sum(sickness_monthly.values()),
+            'off_days': sum(off_monthly.values()),
+            'duty_min_total': sum(duty_min_monthly.values()),
         }
+    })
+
+
+@app.route('/api/user/friend-compare/<token>/<friend_token>', methods=['GET'])
+def friend_compare(token, friend_token):
+    """Side-by-side Vergleich der KPIs zwischen User und Friend.
+    Beide müssen eine Auswertung gemacht haben.
+    """
+    def _summary(tok):
+        sess = _store.get(tok) or {}
+        rd = sess.get('result_data') or {}
+        tage = rd.get('_tage_detail') or []
+        from collections import Counter
+        klass_ct = Counter()
+        layover_ct = Counter()
+        for t in tage:
+            if not isinstance(t, dict): continue
+            klass_ct[(t.get('klass') or '').upper()] += 1
+            place = ((t.get('reader_facts') or {}).get('layover_ort') or '').upper().strip()
+            if place and len(place) == 3 and place != 'FRA':
+                layover_ct[place] += 1
+        return {
+            'tour_days': sum(klass_ct[k] for k in ('Z72', 'Z73', 'Z74', 'Z76')),
+            'hotel_nights': int(rd.get('hotel_naechte', 0) or 0),
+            'fahr_tage': int(rd.get('fahr_tage', 0) or 0),
+            'arbeitstage': int(rd.get('arbeitstage', 0) or 0),
+            'z76_eur': float(rd.get('vma_aus', 0) or 0),
+            'gesamt': float(rd.get('gesamt', 0) or 0),
+            'top_layovers': [{'place': k, 'count': v} for k, v in layover_ct.most_common(5)],
+        }
+
+    # Friend muss tatsächlich Freund sein
+    friends = (_friends_load(token).get('friends') or [])
+    if friend_token not in friends:
+        return jsonify({'ok': False, 'error': 'not_friends'}), 403
+
+    me = _summary(token)
+    them = _summary(friend_token)
+    # Friend-Profil
+    ppath = _user_profile_path(friend_token)
+    friend_prof = {}
+    try:
+        with open(ppath) as f:
+            friend_prof = (json.load(f) or {}).get('profile', {})
+    except Exception:
+        pass
+    return jsonify({
+        'me': me,
+        'friend': them,
+        'friend_name': friend_prof.get('name', friend_token[:8] + '…'),
     })
 
 
@@ -8254,6 +8342,126 @@ def get_user_logbook_pdf(token):
     pdf_bytes = buf.getvalue()
     response = app.response_class(pdf_bytes, mimetype='application/pdf')
     response.headers['Content-Disposition'] = f'attachment; filename="aerotax_logbuch_{rd.get("year", "")}.pdf"'
+    return response
+
+
+@app.route('/api/user/calendar-pdf/<token>', methods=['GET'])
+def get_user_calendar_pdf(token):
+    """Generiert einen druckbaren Monatskalender.
+    Query: ?month=YYYY-MM (Default: aktueller Monat).
+    Zeigt pro Tag Klassifikation + Routing-Kürzel.
+    """
+    from datetime import date, timedelta
+    import calendar as _cal
+    from io import BytesIO
+
+    month_q = (request.args.get('month') or '').strip()
+    try:
+        y, m = [int(x) for x in month_q.split('-')]
+    except Exception:
+        today = date.today()
+        y, m = today.year, today.month
+
+    session = _store.get(token) or {}
+    rd = session.get('result_data') or {}
+    tage_by_date = {}
+    for t in (rd.get('_tage_detail') or []):
+        if isinstance(t, dict) and t.get('datum'):
+            tage_by_date[t['datum']] = t
+
+    KLASS_BG = {
+        'Z76': HexColor('#fde68a'),
+        'Z74': HexColor('#fef3c7'),
+        'Z73': HexColor('#fef9c3'),
+        'Z72': HexColor('#fefce8'),
+        'Office': HexColor('#dbeafe'),
+        'Standby': HexColor('#e9d5ff'),
+        'Frei': HexColor('#dcfce7'),
+        'Urlaub': HexColor('#bbf7d0'),
+    }
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1*cm, rightMargin=1*cm,
+                            topMargin=1*cm, bottomMargin=1*cm)
+    styles = getSampleStyleSheet()
+    elems = []
+    month_name = ['', 'Januar', 'Februar', 'März', 'April', 'Mai', 'Juni',
+                  'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'][m]
+    elems.append(Paragraph(f'<b>{month_name} {y}</b> · AeroTax Monatsplan',
+                            ParagraphStyle('t', parent=styles['Heading1'],
+                                           fontSize=16, alignment=TA_CENTER,
+                                           textColor=HexColor('#0a0e1a'))))
+    elems.append(Spacer(1, 0.4*cm))
+
+    weekdays = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']
+    cal = _cal.Calendar(firstweekday=0)
+    weeks = cal.monthdatescalendar(y, m)
+
+    grid = [weekdays]
+    grid_bg = [[HexColor('#0a0e1a')] * 7]
+    for week in weeks:
+        row = []
+        bg_row = []
+        for d in week:
+            ds = d.isoformat()
+            entry = tage_by_date.get(ds)
+            in_month = (d.month == m)
+            if not in_month:
+                row.append('')
+                bg_row.append(white)
+                continue
+            line1 = str(d.day)
+            line2 = ''
+            line3 = ''
+            if entry:
+                line2 = entry.get('klass', '') or ''
+                routing = (entry.get('routing') or '').strip()
+                if routing and routing != '-':
+                    parts = [p for p in routing.split('-') if p and len(p) == 3 and p != 'FRA']
+                    if parts:
+                        line3 = parts[0]
+            row.append(f'<b>{line1}</b><br/><font size="7">{line2}</font><br/><font size="7" color="#666666">{line3}</font>')
+            bg_row.append(KLASS_BG.get(line2, white) if in_month else white)
+        grid.append(row)
+        grid_bg.append(bg_row)
+
+    cell_style = ParagraphStyle('c', parent=styles['Normal'], fontSize=9, leading=12)
+    grid_paras = []
+    for row in grid:
+        grid_paras.append([Paragraph(c, cell_style) if c else '' for c in row])
+
+    col_w = (A4[0] - 2*cm) / 7
+    tbl = Table(grid_paras, colWidths=[col_w]*7, rowHeights=[0.8*cm] + [2.2*cm]*len(weeks))
+    cell_styles = [
+        ('BACKGROUND', (0, 0), (-1, 0), HexColor('#0a0e1a')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 10),
+        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, 0), 'MIDDLE'),
+        ('VALIGN', (0, 1), (-1, -1), 'TOP'),
+        ('BOX', (0, 0), (-1, -1), 0.5, HexColor('#cccccc')),
+        ('INNERGRID', (0, 0), (-1, -1), 0.25, HexColor('#dddddd')),
+        ('LEFTPADDING', (0, 1), (-1, -1), 4),
+        ('TOPPADDING', (0, 1), (-1, -1), 4),
+    ]
+    for r_idx, row_bgs in enumerate(grid_bg[1:], start=1):
+        for c_idx, bg in enumerate(row_bgs):
+            if bg != white:
+                cell_styles.append(('BACKGROUND', (c_idx, r_idx), (c_idx, r_idx), bg))
+    tbl.setStyle(TableStyle(cell_styles))
+    elems.append(tbl)
+    elems.append(Spacer(1, 0.4*cm))
+    elems.append(Paragraph(
+        '<font size="8" color="#666666">Generiert mit AeroTax am '
+        + datetime.now().strftime('%d.%m.%Y') + ' · '
+        + 'Z76 Ausland · Z73/Z74 Inland · Office Schulung/Homebase</font>',
+        styles['Normal']))
+
+    doc.build(elems)
+    pdf_bytes = buf.getvalue()
+    response = app.response_class(pdf_bytes, mimetype='application/pdf')
+    response.headers['Content-Disposition'] = f'attachment; filename="aerotax_kalender_{y}_{m:02d}.pdf"'
     return response
 
 
