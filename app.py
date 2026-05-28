@@ -7925,16 +7925,36 @@ def get_friends_overlap(token):
     if not my_layovers:
         return jsonify({'token': token, 'overlaps': [], 'reason': 'no_layovers_in_my_data'})
 
+    def _hhmm_to_min(s):
+        if not s or not isinstance(s, str): return None
+        try:
+            parts = s.strip().split(':')
+            if len(parts) < 2: return None
+            return int(parts[0]) * 60 + int(parts[1])
+        except Exception:
+            return None
+
+    my_tage_by_date = {t.get('datum'): t for t in my_tage if isinstance(t, dict)}
     friends = (_friends_load(token).get('friends') or [])
     overlaps = []
     for friend_token in friends:
         friend_session = _store.get(friend_token) or {}
         friend_tage = (friend_session.get('result_data') or {}).get('_tage_detail') or []
         friend_layovers = _extract_layover_set(friend_tage)
+        friend_tage_by_date = {t.get('datum'): t for t in friend_tage if isinstance(t, dict)}
         shared = []
         for datum, place in my_layovers.items():
             if friend_layovers.get(datum) == place:
-                shared.append({'datum': datum, 'place': place})
+                my_t = my_tage_by_date.get(datum) or {}
+                fr_t = friend_tage_by_date.get(datum) or {}
+                my_start = _hhmm_to_min((my_t.get('reader_facts') or {}).get('start_time'))
+                fr_start = _hhmm_to_min((fr_t.get('reader_facts') or {}).get('start_time'))
+                briefing_diff = (fr_start - my_start) if (my_start is not None and fr_start is not None) else None
+                shared.append({
+                    'datum': datum,
+                    'place': place,
+                    'briefing_diff_min': briefing_diff,
+                })
         if shared:
             ppath = _user_profile_path(friend_token)
             prof = {}
@@ -7950,6 +7970,75 @@ def get_friends_overlap(token):
             })
     overlaps.sort(key=lambda x: -x['count'])
     return jsonify({'token': token, 'overlaps': overlaps, 'friends_checked': len(friends)})
+
+
+@app.route('/api/user/friend-groups/<token>', methods=['GET'])
+def list_friend_groups(token):
+    """Listet alle Friend-Groups des Users."""
+    data = _friends_load(token)
+    groups = data.get('groups') or []
+    return jsonify({'token': token, 'groups': groups, 'count': len(groups)})
+
+
+@app.route('/api/user/friend-groups/<token>/create', methods=['POST'])
+def create_friend_group(token):
+    """Erstellt eine neue Friend-Group. Body: {name, member_tokens: [...]}"""
+    import uuid as _uuid
+    body = request.get_json(silent=True) or {}
+    name = (body.get('name') or '').strip()
+    members = body.get('member_tokens') or []
+    if not name:
+        return jsonify({'ok': False, 'error': 'name_required'}), 400
+    if not isinstance(members, list):
+        return jsonify({'ok': False, 'error': 'member_tokens_must_be_list'}), 400
+    # Nur tatsächliche Friends dürfen Members sein
+    data = _friends_load(token)
+    friends_set = set(data.get('friends') or [])
+    members = [m for m in members if isinstance(m, str) and m in friends_set]
+    new_group = {
+        'id': str(_uuid.uuid4())[:8],
+        'name': name[:60],
+        'members': members,
+        'created_at': datetime.now().isoformat(),
+    }
+    if 'groups' not in data: data['groups'] = []
+    data['groups'].append(new_group)
+    _friends_save(token, data)
+    return jsonify({'ok': True, 'group': new_group})
+
+
+@app.route('/api/user/friend-groups/<token>/<group_id>/update', methods=['POST'])
+def update_friend_group(token, group_id):
+    body = request.get_json(silent=True) or {}
+    data = _friends_load(token)
+    groups = data.get('groups') or []
+    friends_set = set(data.get('friends') or [])
+    found = False
+    for g in groups:
+        if g.get('id') == group_id:
+            if 'name' in body and isinstance(body['name'], str):
+                g['name'] = body['name'].strip()[:60]
+            if 'member_tokens' in body and isinstance(body['member_tokens'], list):
+                g['members'] = [m for m in body['member_tokens'] if isinstance(m, str) and m in friends_set]
+            g['updated_at'] = datetime.now().isoformat()
+            found = True
+            break
+    if not found:
+        return jsonify({'ok': False, 'error': 'group_not_found'}), 404
+    _friends_save(token, data)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/user/friend-groups/<token>/<group_id>/delete', methods=['POST'])
+def delete_friend_group(token, group_id):
+    data = _friends_load(token)
+    groups = data.get('groups') or []
+    new_groups = [g for g in groups if g.get('id') != group_id]
+    if len(new_groups) == len(groups):
+        return jsonify({'ok': False, 'error': 'group_not_found'}), 404
+    data['groups'] = new_groups
+    _friends_save(token, data)
+    return jsonify({'ok': True})
 
 
 @app.route('/api/user/stats/<token>', methods=['GET'])
