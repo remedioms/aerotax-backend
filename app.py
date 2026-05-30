@@ -808,6 +808,21 @@ def _is_private_or_local_ip(host):
         return True
 
 
+def _token_rate_limited(token, endpoint, limit, window_sec):
+    """Rate-Limit pro User-Token (statt IP, da hinter NAT mehrere User).
+    Returns True wenn Limit erreicht. Shared Bucket-Dict mit _ip_rate_limited."""
+    if not token: return False
+    now = datetime.utcnow().timestamp()
+    cutoff = now - window_sec
+    key = f'tok:{token}:{endpoint}'
+    bucket = _ip_rate_buckets.setdefault(key, [])
+    bucket[:] = [t for t in bucket if t > cutoff]
+    if len(bucket) >= limit:
+        return True
+    bucket.append(now)
+    return False
+
+
 def _ip_rate_limited(ip, endpoint='process', limit=20, window_sec=3600):
     """Sliding-Window Rate-Limit pro IP. Liefert True wenn limit überschritten.
     Default: 20 Versuche pro Stunde pro IP für /api/process. Stripe-Payment ist
@@ -8964,8 +8979,24 @@ def get_dm(token, friend_token):
 
 @app.route('/api/crew-chat/<token>/dm/<friend_token>/send', methods=['POST'])
 def send_dm(token, friend_token):
+    if token.startswith('AT-GUEST-'):
+        return jsonify({'ok': False, 'error': 'demo_mode_cannot_dm'}), 403
     ch = _dm_channel(token, friend_token)
     if not ch: return jsonify({'ok': False, 'error':'invalid_tokens'}), 400
+    # J14-Fix: DM nur zwischen Friends. Vorher: jeder mit token konnte
+    # jedem fremden DMs schicken → Spam/Harassment-Vektor.
+    try:
+        friends = set((_friends_load(token).get('friends') or []))
+    except Exception:
+        friends = set()
+    if friend_token not in friends:
+        # Empfänger muss erst Friend-Request annehmen
+        return jsonify({'ok': False, 'error': 'not_friends',
+                        'message': 'DMs sind nur an Buddies möglich. Sende erst eine Buddy-Anfrage.'}), 403
+    # Rate-Limit: 30 DMs/min/User (Spam-Bremse)
+    if _token_rate_limited(token, 'dm_send', limit=30, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited',
+                        'message': 'Bitte langsamer.'}), 429
     resp = send_chat_message(token, ch)
     # Push an den Empfänger (nicht-blocking, best-effort)
     try:
@@ -9072,6 +9103,13 @@ def serve_wall_image(token_safe, fname):
 @app.route('/api/wall/<token>/post', methods=['POST'])
 def create_wall_post(token):
     """Body: {text, image_url?, layover_iata?}. Author = token."""
+    # Guest-Token-Block (J23): AT-GUEST-* sind Demo-Tokens die nicht posten dürfen
+    if token.startswith('AT-GUEST-'):
+        return jsonify({'ok': False, 'error': 'demo_mode_cannot_post'}), 403
+    # Rate-Limit: max 10 Wall-Posts pro Stunde pro User
+    if _token_rate_limited(token, 'wall_post', limit=10, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited',
+                        'message': 'Zu viele Posts in kurzer Zeit. Bitte später erneut.'}), 429
     body = request.get_json(silent=True) or {}
     text = (body.get('text') or '').strip()
     image_url = (body.get('image_url') or '').strip() or None
@@ -9428,6 +9466,12 @@ def forum_list_threads(token):
 @app.route('/api/forum/<token>/threads', methods=['POST'])
 def forum_create_thread(token):
     """Body: {category_id, title, body, image_url?, gif_url?, hashtags?}"""
+    if token.startswith('AT-GUEST-'):
+        return jsonify({'ok': False, 'error': 'demo_mode_cannot_post'}), 403
+    # Max 5 Threads pro Stunde
+    if _token_rate_limited(token, 'forum_thread', limit=5, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited',
+                        'message': 'Zu viele Threads in kurzer Zeit.'}), 429
     body = request.get_json(silent=True) or {}
     category = (body.get('category_id') or '').strip().lower()
     title = (body.get('title') or '').strip()
@@ -10577,8 +10621,72 @@ def _auth_save(d):
 
 
 def _auth_hash(pw):
+    """LEGACY: sha256 unsalted. Bleibt für Backward-Verify alter Hashes.
+    Neue Hashes via _password_hash(). Beim Login-Erfolg wird alter Hash
+    auf den neuen Format migriert (on-the-fly Re-Hash)."""
     import hashlib
     return hashlib.sha256((pw or '').encode('utf-8')).hexdigest()
+
+
+_PBKDF2_ITERATIONS = 600_000  # OWASP 2023 für PBKDF2-SHA256
+_PBKDF2_DKLEN = 32
+
+def _password_hash(pw):
+    """PBKDF2-SHA256 600k iters mit 16-byte salt.
+    Format: pbkdf2$<iters>$<salt-hex>$<hash-hex>.
+    Hashlib.scrypt ist auf manchen Python-Builds nicht verfügbar (OpenSSL-
+    config), PBKDF2 ist stdlib-garantiert. ~100ms login auf Cloud-Run-CPU."""
+    import hashlib, os
+    salt = os.urandom(16)
+    h = hashlib.pbkdf2_hmac('sha256', (pw or '').encode('utf-8'),
+                            salt, _PBKDF2_ITERATIONS, _PBKDF2_DKLEN)
+    return f'pbkdf2${_PBKDF2_ITERATIONS}${salt.hex()}${h.hex()}'
+
+
+def _password_verify(pw, stored):
+    """Verifiziert pw gegen stored. Supports beide Formate:
+    - pbkdf2$<iters>$<salt>$<hash>: neuer Hash
+    - 64-hex-string: legacy sha256
+    Returns (ok: bool, needs_rehash: bool)."""
+    import hashlib, hmac
+    if not stored or not pw:
+        return (False, False)
+    if stored.startswith('pbkdf2$'):
+        try:
+            _, iters_s, salt_hex, hash_hex = stored.split('$')
+            iters = int(iters_s)
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(hash_hex)
+            actual = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'),
+                                        salt, iters, len(expected))
+            ok = hmac.compare_digest(actual, expected)
+            # Re-hash wenn unter aktueller Iterations-Anforderung
+            needs_rehash = ok and iters < _PBKDF2_ITERATIONS
+            return (ok, needs_rehash)
+        except Exception:
+            return (False, False)
+    # Legacy sha256 path (unsalted, alte Accounts vor Wave 21)
+    legacy = hashlib.sha256(pw.encode('utf-8')).hexdigest()
+    ok = hmac.compare_digest(legacy, stored)
+    return (ok, ok)  # ok → also needs rehash
+
+
+def _password_policy_ok(pw):
+    """Min 8 Zeichen + mind. 1 Buchstabe + mind. 1 Ziffer.
+    Verhindert die schwächsten Passwörter ("12345678", "password").
+    Returns (ok, error_message)."""
+    if not pw or len(pw) < 8:
+        return (False, 'password_too_short')
+    has_digit = any(c.isdigit() for c in pw)
+    has_letter = any(c.isalpha() for c in pw)
+    if not (has_digit and has_letter):
+        return (False, 'password_too_weak')
+    # Block top-25 common passwords (kurz-Liste)
+    common = {'password', 'password1', 'qwerty123', '12345678', 'iloveyou',
+              'admin123', 'welcome1', 'letmein1', 'monkey123', 'football1'}
+    if pw.lower() in common:
+        return (False, 'password_too_common')
+    return (True, None)
 
 
 @app.route('/api/auth/signup', methods=['POST'])
@@ -10586,15 +10694,21 @@ def auth_signup():
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip().lower()
     pw = body.get('password') or ''
-    if not email or '@' not in email or len(pw) < 6:
-        return jsonify({'ok': False, 'error': 'email_or_password_invalid'}), 400
+    if not email or '@' not in email:
+        return jsonify({'ok': False, 'error': 'email_invalid'}), 400
+    ok_pw, err = _password_policy_ok(pw)
+    if not ok_pw:
+        return jsonify({'ok': False, 'error': err}), 400
     users = _auth_load()
     if email in users:
         return jsonify({'ok': False, 'error': 'email_already_exists'}), 409
     import uuid as _u
     token = 'AT-' + _u.uuid4().hex[:16].upper()
-    users[email] = {'password_hash': _auth_hash(pw), 'token': token,
-                    'created_at': datetime.now().isoformat()}
+    users[email] = {
+        'password_hash': _password_hash(pw),
+        'token': token,
+        'created_at': datetime.now().isoformat(),
+    }
     _auth_save(users)
     return jsonify({'ok': True, 'token': token, 'email': email})
 
@@ -10606,8 +10720,21 @@ def auth_login():
     pw = body.get('password') or ''
     users = _auth_load()
     user = users.get(email)
-    if not user or user.get('password_hash') != _auth_hash(pw):
+    if not user:
         return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
+    ok, needs_rehash = _password_verify(pw, user.get('password_hash', ''))
+    if not ok:
+        return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
+    if needs_rehash:
+        # Transparente Migration: alter sha256-Hash → neuer scrypt-Hash
+        try:
+            user['password_hash'] = _password_hash(pw)
+            user['hash_migrated_at'] = datetime.now().isoformat()
+            users[email] = user
+            _auth_save(users)
+            app.logger.info(f'[auth] migrated hash for {email[:3]}***')
+        except Exception as e:
+            app.logger.warning(f'[auth] rehash failed: {e}')
     return jsonify({'ok': True, 'token': user['token'], 'email': email})
 
 
@@ -10770,8 +10897,9 @@ def auth_reset():
     email = (body.get('email') or '').strip().lower()
     reset_token = (body.get('reset_token') or '').strip()
     new_pw = body.get('new_password') or ''
-    if len(new_pw) < 6:
-        return jsonify({'ok': False, 'error': 'password_too_short'}), 400
+    ok_pw, err = _password_policy_ok(new_pw)
+    if not ok_pw:
+        return jsonify({'ok': False, 'error': err}), 400
     users = _auth_load()
     user = users.get(email)
     if not user or user.get('reset_token') != reset_token:
@@ -10782,7 +10910,7 @@ def auth_reset():
             return jsonify({'ok': False, 'error': 'token_expired'}), 400
     except Exception:
         pass
-    user['password_hash'] = _auth_hash(new_pw)
+    user['password_hash'] = _password_hash(new_pw)
     user.pop('reset_token', None)
     user.pop('reset_expires', None)
     _auth_save(users)
@@ -10808,7 +10936,10 @@ def auth_delete_account():
     user_email = None
     if email and pw:
         user = users.get(email)
-        if not user or user.get('password_hash') != _auth_hash(pw):
+        if not user:
+            return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
+        ok, _ = _password_verify(pw, user.get('password_hash', ''))
+        if not ok:
             return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
         user_email = email
     elif bearer_token:
