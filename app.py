@@ -110,7 +110,34 @@ def _recovery_pepper():
     return sec
 
 
+def _validate_crypto_key_on_boot():
+    """Verifiziert AEROTAX_CRYPTO_KEY für CrewLink-Cookie-Encryption.
+    Ohne Key fällt lufthansa_crewlink.py auf einen flüchtigen In-Memory-Key
+    zurück → bei jedem Container-Restart sind alle gespeicherten LH-Sessions
+    UNENTSCHLÜSSELBAR korrupt. User-Symptom: 'roster sync' → silent fail.
+    BUG-005-pattern.
+
+    Production: raised RuntimeError beim Boot wenn fehlt.
+    Test/Local: AEROTAX_ALLOW_BOOT_WITHOUT_KEY=1 erlaubt expliziten Test-Boot.
+    """
+    key = os.environ.get('AEROTAX_CRYPTO_KEY', '').strip()
+    allow_boot = os.environ.get('AEROTAX_ALLOW_BOOT_WITHOUT_KEY') == '1'
+    if key and len(key) >= 32:
+        return
+    if not allow_boot:
+        raise RuntimeError(
+            '[boot] AEROTAX_CRYPTO_KEY missing or too short. '
+            'Set a base64-encoded 32-byte key (Fernet-kompatibel) — sonst '
+            'gehen alle gespeicherten CrewLink-Cookies bei Container-Restart '
+            'verloren. Set AEROTAX_ALLOW_BOOT_WITHOUT_KEY=1 für lokale Tests.'
+        )
+    app.logger.warning(
+        '[boot] AEROTAX_CRYPTO_KEY missing — CrewLink-Encryption nutzt '
+        'volatile in-memory key (Tests/Local)')
+
+
 _validate_recovery_secret_on_boot()
+_validate_crypto_key_on_boot()
 # v11 B-014: localhost-Origins NUR in Development. In Production (Render setzt
 # RENDER=true via Service-Default) bleibt die Whitelist auf echte Domains
 # beschränkt — kein localhost-Bypass via Browser-Plugin/Forge möglich.
@@ -729,20 +756,23 @@ def _update_payment_intent_lock_status(pi_id, status, job_id=None):
         )
 
 
-def _atomic_write_json(path, data, max_items=None):
+def _atomic_write_json(path, data, max_items=None, **json_kwargs):
     """Atomares Schreiben: temp-file → fsync → os.replace.
     Verhindert halb-geschriebene Dateien bei Container-Crash + race-conditions
     bei parallelen Writes (POSIX-Garantie: rename ist atomic).
-    Optional: cap der Liste auf max_items (älteste raus).
+    Optional: cap der Liste auf max_items (älteste raus). Zusätzliche kwargs
+    werden an json.dump weitergereicht (z.B. indent=2, default=str).
+    Default-ensure_ascii=False außer override.
     """
     if max_items is not None and isinstance(data, list):
         data = data[-max_items:]
+    json_kwargs.setdefault('ensure_ascii', False)
     target_dir = os.path.dirname(path) or '.'
     os.makedirs(target_dir, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix='.tmp_', dir=target_dir)
     try:
         with os.fdopen(fd, 'w') as f:
-            json.dump(data, f, ensure_ascii=False)
+            json.dump(data, f, **json_kwargs)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
@@ -7755,8 +7785,7 @@ def _user_history_save(token, data):
     if not p:
         return False
     try:
-        with open(p, 'w') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(p, data, ensure_ascii=False, indent=2)
         return True
     except Exception:
         return False
@@ -7877,7 +7906,7 @@ def _friends_save(token, data):
     p = _user_friends_path(token)
     if not p: return False
     try:
-        with open(p, 'w') as f: json.dump(data, f, ensure_ascii=False)
+        _atomic_write_json(p, data)
         return True
     except Exception:
         return False
@@ -8920,9 +8949,11 @@ def _wall_load_posts():
 
 def _wall_save_posts(posts):
     p = _wall_posts_path()
-    # Cap to last 5000 posts global
-    posts = posts[-5000:]
-    with open(p, 'w') as f: json.dump(posts, f, ensure_ascii=False)
+    # Cap to last 5000 posts global · atomic write verhindert Race-Lost-Writes
+    try:
+        _atomic_write_json(p, posts, max_items=5000)
+    except Exception as e:
+        app.logger.warning(f'[wall] save failed: {e}')
 
 
 @app.route('/api/wall/<token>/upload-image', methods=['POST'])
@@ -9061,7 +9092,11 @@ def toggle_like(token, post_id):
     else:
         liked.add(post_id); delta = +1
         liked_by_me = True
-    with open(likes_p, 'w') as f: json.dump(list(liked), f)
+    try:
+        _atomic_write_json(likes_p, list(liked))
+    except Exception:
+        # Best-effort fallback (Like ist nicht-kritisch)
+        with open(likes_p, 'w') as f: json.dump(list(liked), f)
     posts = _wall_load_posts()
     new_count = 0
     for p in posts:
@@ -9204,10 +9239,10 @@ def _forum_load_threads():
 
 def _forum_save_threads(threads):
     p = _forum_threads_path()
-    # Cap to last 10000 threads
-    threads = threads[-10000:]
-    with open(p, 'w') as f:
-        json.dump(threads, f, ensure_ascii=False)
+    try:
+        _atomic_write_json(p, threads, max_items=10000)
+    except Exception as e:
+        app.logger.warning(f'[forum-threads] save failed: {e}')
 
 
 def _forum_load_replies(thread_id):
@@ -9227,10 +9262,10 @@ def _forum_save_replies(thread_id, replies):
     p = _forum_replies_path(thread_id)
     if not p:
         return
-    # Cap per-thread
-    replies = replies[-2000:]
-    with open(p, 'w') as f:
-        json.dump(replies, f, ensure_ascii=False)
+    try:
+        _atomic_write_json(p, replies, max_items=2000)
+    except Exception as e:
+        app.logger.warning(f'[forum-replies] save failed thread={thread_id[:8]}: {e}')
 
 
 def _forum_load_likes(token):
@@ -9256,8 +9291,10 @@ def _forum_save_likes(token, likes):
         return
     data = {'threads': list(likes.get('threads') or []),
             'replies': list(likes.get('replies') or [])}
-    with open(p, 'w') as f:
-        json.dump(data, f)
+    try:
+        _atomic_write_json(p, data)
+    except Exception as e:
+        app.logger.warning(f'[forum-likes] save failed: {e}')
 
 
 def _forum_author_snapshot(token):
@@ -10457,11 +10494,15 @@ def _auth_load():
 
 
 def _auth_save(d):
-    import json
+    """KRITISCH: auth_users.json darf nicht halb-geschrieben werden
+    (würde alle Logins killen). _atomic_write_json garantiert all-or-nothing
+    via tempfile + os.replace."""
     try:
-        with open(_user_auth_path(), 'w') as f: json.dump(d, f)
+        _atomic_write_json(_user_auth_path(), d)
         return True
-    except Exception: return False
+    except Exception as e:
+        app.logger.error(f'[auth] save failed: {e}')
+        return False
 
 
 def _auth_hash(pw):
