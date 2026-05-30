@@ -7859,15 +7859,82 @@ def put_user_profile(token):
     if not p:
         return jsonify({'error': 'invalid token'}), 400
     body = request.get_json(silent=True) or {}
-    safe_keys = ('name', 'homebase', 'position', 'airline')
+    # Whitelist erweitert: hometown + employers waren vorher silent-gedroppt
+    # (G3-Finding) → User editiert "Hometown" → kein round-trip-Sync.
+    safe_keys = ('name', 'homebase', 'position', 'airline', 'hometown')
     profile = {k: body.get(k) for k in safe_keys if body.get(k)}
+    # employers ist eine Liste — separat validieren (max 10, jeweils dict)
+    emps = body.get('employers')
+    if isinstance(emps, list):
+        profile['employers'] = [e for e in emps if isinstance(e, dict)][:10]
     try:
-        with open(p, 'w') as f:
-            json.dump({'token': token, 'profile': profile,
-                       '_updated_at': datetime.now().isoformat()}, f, ensure_ascii=False)
+        _atomic_write_json(p, {
+            'token': token, 'profile': profile,
+            '_updated_at': datetime.now().isoformat()
+        })
         return jsonify({'ok': True, 'profile': profile})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/user/search', methods=['GET'])
+def user_search():
+    """Crew-Discovery (J11). Query: ?q=&airline=&homebase=&limit=20&token=<own>.
+    token-Param wird genutzt um (a) eigene Blocks rauszufiltern und (b) den
+    Searcher selbst nicht zurückzugeben. Privacy: liefert nur public profile-
+    Felder, NIEMALS email/apple_sub/internal.
+    Rate-Limit: max 20 Ergebnisse pro Call, Query muss ≥2 Zeichen haben.
+    """
+    q = (request.args.get('q') or '').strip().lower()
+    airline = (request.args.get('airline') or '').strip().lower()
+    homebase = (request.args.get('homebase') or '').strip().upper()
+    limit = min(int(request.args.get('limit') or 20), 50)
+    searcher_token = (request.args.get('token') or '').strip()
+    # Mindestens ein Filter muss gesetzt sein damit das nicht zu User-Listing wird
+    if len(q) < 2 and not airline and not homebase:
+        return jsonify({'count': 0, 'users': [],
+                        'error': 'min_query_or_filter_required'}), 400
+    blocked = _blocked_by(searcher_token) if searcher_token else set()
+    results = []
+    try:
+        for fn in os.listdir(_USER_HISTORY_DIR):
+            if not fn.startswith('profile_') or not fn.endswith('.json'):
+                continue
+            try:
+                with open(os.path.join(_USER_HISTORY_DIR, fn)) as f:
+                    data = json.load(f) or {}
+            except Exception:
+                continue
+            target_token = data.get('token')
+            if not target_token or target_token == searcher_token:
+                continue
+            if target_token in blocked:
+                continue
+            pr = data.get('profile') or {}
+            name = (pr.get('name') or '').strip()
+            a = (pr.get('airline') or '').strip().lower()
+            h = (pr.get('homebase') or '').strip().upper()
+            # Match-Logik
+            if q and q not in name.lower():
+                continue
+            if airline and airline != a:
+                continue
+            if homebase and homebase != h:
+                continue
+            results.append({
+                'token': target_token,
+                'name': name,
+                'airline': pr.get('airline'),
+                'homebase': pr.get('homebase'),
+                'position': pr.get('position'),
+            })
+            if len(results) >= limit:
+                break
+    except FileNotFoundError:
+        pass
+    # Sortiere alphabetisch nach Name
+    results.sort(key=lambda u: (u.get('name') or '').lower())
+    return jsonify({'count': len(results), 'users': results})
 
 
 # ════════════════════════════════════════════════════════════════════════
