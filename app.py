@@ -4496,9 +4496,12 @@ Antworte JETZT mit dem strukturierten JSON-Objekt."""
     if ANTHROPIC_KEY:
         try:
             client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=60.0)
+            # Wave 23: Prompt-Caching (ephemeral, 5-min TTL).
+            # _AI_SYSTEM_PROMPT ist stabil → bei Cache-Hit 90% Token-Kosten gespart.
             resp = client.messages.create(
                 model='claude-sonnet-4-6', max_tokens=1500,
-                system=_AI_SYSTEM_PROMPT,
+                system=[{'type': 'text', 'text': _AI_SYSTEM_PROMPT,
+                         'cache_control': {'type': 'ephemeral'}}],
                 messages=[{'role': 'user', 'content': user_prompt}],
             )
             text_out = resp.content[0].text.strip()
@@ -12193,8 +12196,14 @@ def parse_lohnsteuerbescheinigung(pdf_bytes_list):
 
 
 
-def _claude_with_retry(client, model, max_tokens, content, max_retries=3, label='claude'):
-    """Anthropic API mit exponential backoff. Schützt vor transienten Fehlern.
+def _claude_with_retry(client, model, max_tokens, content, max_retries=3,
+                       label='claude', system=None, cache_system=True):
+    """Anthropic API mit exponential backoff + Prompt-Caching für stabile
+    System-Prompts (Wave 23 — cost-Killer).
+
+    Wenn system gesetzt wird, wird der System-Block automatisch mit
+    cache_control=ephemeral markiert (90% Token-Cost-Reduktion bei Cache-Hit,
+    5-Min TTL). Default cache_system=True.
 
     P1 #74 Fix: Retry-Detection nutzt strukturierte Anthropic-Exception-Typen
     statt substring-match auf err-string. Substring-match hatte 5xx-Codes auch
@@ -12207,10 +12216,26 @@ def _claude_with_retry(client, model, max_tokens, content, max_retries=3, label=
     except Exception:
         _anthropic = None
     last_err = None
+
+    # Build kwargs einmal vor der Retry-Schleife
+    kwargs = {
+        'model': model,
+        'max_tokens': max_tokens,
+        'messages': [{'role': 'user', 'content': content}],
+    }
+    if system:
+        if cache_system and isinstance(system, str) and len(system) > 1024:
+            # Prompt-Caching: nur für Prompts >1024 Tokens lohnt sich der Roundtrip
+            kwargs['system'] = [
+                {'type': 'text', 'text': system,
+                 'cache_control': {'type': 'ephemeral'}}
+            ]
+        else:
+            kwargs['system'] = system
+
     for attempt in range(max_retries):
         try:
-            return client.messages.create(model=model, max_tokens=max_tokens,
-                                          messages=[{'role': 'user', 'content': content}])
+            return client.messages.create(**kwargs)
         except Exception as e:
             last_err = e
             # Strukturiert: prüfe Anthropic-Exception-Typen
