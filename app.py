@@ -10929,20 +10929,80 @@ def auth_apple():
     return jsonify({'ok': True, 'token': token, 'email': email})
 
 
+def _send_password_reset_email(to_email, reset_token):
+    """Schickt Reset-Token via Resend. Failures werden geloggt, User-Response
+    bleibt 200 (kein Email-Enumeration). Returns True/False für Telemetrie."""
+    api_key = os.environ.get('RESEND_API_KEY', '').strip()
+    from_addr = os.environ.get('RESET_FROM_EMAIL',
+                               'AeroX <noreply@aerosteuer.de>').strip()
+    if not api_key:
+        app.logger.warning(
+            '[auth-reset] RESEND_API_KEY nicht gesetzt — '
+            f'Token für {to_email[:3]}*** wäre: {reset_token[:6]}…')
+        return False
+    try:
+        import urllib.request
+        html_body = f"""
+        <div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:24px;">
+          <h2 style="color:#0F1A3D;margin:0 0 16px">Passwort zurücksetzen</h2>
+          <p style="color:#3a3a3a;line-height:1.5;font-size:14px">
+            Wir haben eine Anfrage erhalten dein AeroX-Passwort zurückzusetzen.
+            Verwende diesen Token in der App:
+          </p>
+          <div style="background:#f5f5f7;border-radius:12px;padding:20px;margin:20px 0;
+                      text-align:center;font-family:'SF Mono',Menlo,monospace;
+                      font-size:18px;letter-spacing:1.5px;color:#0F1A3D;
+                      border:1px solid #e0e0e6">
+            {reset_token}
+          </div>
+          <p style="color:#666;font-size:13px;line-height:1.5">
+            Der Token ist 2 Stunden gültig. Wenn du das Reset nicht angefordert
+            hast, ignoriere diese E-Mail — dein Passwort bleibt unverändert.
+          </p>
+          <p style="color:#888;font-size:11px;margin-top:32px">
+            AeroX · aerosteuer.de · automatische Nachricht, bitte nicht antworten.
+          </p>
+        </div>
+        """
+        payload = json.dumps({
+            'from': from_addr,
+            'to': [to_email],
+            'subject': 'AeroX · Passwort zurücksetzen',
+            'html': html_body,
+        }).encode()
+        req = urllib.request.Request(
+            'https://api.resend.com/emails',
+            data=payload,
+            headers={'Authorization': f'Bearer {api_key}',
+                     'Content-Type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ok = 200 <= resp.status < 300
+            if ok:
+                app.logger.info(f'[auth-reset] mail sent to {to_email[:3]}***')
+            else:
+                app.logger.warning(f'[auth-reset] resend status {resp.status}')
+            return ok
+    except Exception as e:
+        app.logger.warning(f'[auth-reset] send failed: {e}')
+        return False
+
+
 @app.route('/api/auth/forgot', methods=['POST'])
 def auth_forgot():
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip().lower()
     users = _auth_load()
-    # Antwortet immer 200 (kein E-Mail-Enumeration)
+    # Antwortet immer 200 ohne Detail (kein E-Mail-Enumeration).
+    # Aber wenn Email existiert UND Resend nicht konfiguriert, gibt es
+    # einen separaten Telemetrie-Pfad damit Admins das mitbekommen.
     if email in users:
         import uuid as _u
         reset_token = _u.uuid4().hex[:24]
         users[email]['reset_token'] = reset_token
         users[email]['reset_expires'] = (datetime.now() + timedelta(hours=2)).isoformat()
         _auth_save(users)
-        # Production: Email via SES/SendGrid. Hier nur Log.
-        print(f'[auth] Reset-Token für {email}: {reset_token}')
+        _send_password_reset_email(email, reset_token)
     return jsonify({'ok': True, 'sent': True})
 
 
