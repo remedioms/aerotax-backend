@@ -10585,25 +10585,114 @@ def auth_reset():
 
 @app.route('/api/auth/delete-account', methods=['POST'])
 def auth_delete_account():
+    """DSGVO Art. 17 · Apple Guideline 5.1.1(v) — kompletter Account-Wipe.
+
+    Auth-Modi:
+    - Email/Password: body{email, password} → verifiziert via hash
+    - Token-based (Apple-Sign-In oder loggedin): body{token} → identifiziert
+      user via token-match in users-dict (apple-sign-in user hat keinen
+      password_hash, daher diese Variante)
+    """
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip().lower()
     pw = body.get('password') or ''
+    bearer_token = (body.get('token') or '').strip()
     users = _auth_load()
-    user = users.get(email)
-    if not user or user.get('password_hash') != _auth_hash(pw):
-        return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
+    user = None
+    user_email = None
+    if email and pw:
+        user = users.get(email)
+        if not user or user.get('password_hash') != _auth_hash(pw):
+            return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
+        user_email = email
+    elif bearer_token:
+        # Find user via stored token (Apple-Sign-In / authenticated session)
+        for ex_email, ex_user in users.items():
+            if ex_user.get('token') == bearer_token:
+                user = ex_user
+                user_email = ex_email
+                break
+        if not user:
+            return jsonify({'ok': False, 'error': 'invalid_token'}), 401
+    else:
+        return jsonify({'ok': False, 'error': 'auth_required'}), 400
+
     token = user.get('token')
-    del users[email]
+    if user_email and user_email in users:
+        del users[user_email]
     _auth_save(users)
-    # Lösche User-Daten
+
     import os
-    for fn in [f'history_{token}.json', f'profile_{token}.json',
-               f'friends_{token}.json', f'push_{token}.json']:
+    deleted = []
+    # 1. Direkte Token-Files
+    direct_files = [
+        f'history_{token}.json', f'profile_{token}.json',
+        f'friends_{token}.json', f'push_{token}.json',
+        f'crashes_{token}.json',
+    ]
+    for fn in direct_files:
         p = os.path.join(_USER_HISTORY_DIR, fn)
         if os.path.exists(p):
-            try: os.remove(p)
+            try: os.remove(p); deleted.append(fn)
             except Exception: pass
-    return jsonify({'ok': True})
+
+    # 2. Briefings + Voice-Notes pro Token
+    for subdir in ('briefings', 'voice_notes'):
+        sub_p = os.path.join(_USER_HISTORY_DIR, subdir,
+                              re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64] + '.json')
+        if os.path.exists(sub_p):
+            try: os.remove(sub_p); deleted.append(f'{subdir}/...')
+            except Exception: pass
+
+    # 3. Wall-Posts mit diesem author_token entfernen
+    try:
+        posts = _wall_load_posts()
+        new_posts = [p for p in posts if p.get('author_token') != token]
+        if len(new_posts) != len(posts):
+            _wall_save_posts(new_posts)
+            deleted.append(f'wall_posts:{len(posts) - len(new_posts)}')
+    except Exception:
+        pass
+
+    # 4. Forum-Threads mit diesem author_token
+    try:
+        threads = _forum_load_threads()
+        new_threads = [t for t in threads if t.get('author_token') != token]
+        if len(new_threads) != len(threads):
+            _forum_save_threads(new_threads)
+            deleted.append(f'forum_threads:{len(threads) - len(new_threads)}')
+    except Exception:
+        pass
+
+    # 5. Wall-Likes-File
+    likes_p = _wall_likes_path(token)
+    if likes_p and os.path.exists(likes_p):
+        try: os.remove(likes_p); deleted.append('wall_likes')
+        except Exception: pass
+
+    # 6. Forum-Likes-File
+    flikes_p = _forum_likes_path(token)
+    if flikes_p and os.path.exists(flikes_p):
+        try: os.remove(flikes_p); deleted.append('forum_likes')
+        except Exception: pass
+
+    # 7. Aus friends-Liste anderer User entfernen (best-effort)
+    try:
+        friends_dir = os.path.join(_USER_HISTORY_DIR)
+        for fn in os.listdir(friends_dir):
+            if not fn.startswith('friends_'): continue
+            fp = os.path.join(friends_dir, fn)
+            try:
+                with open(fp) as f: data = json.load(f) or {}
+                fl = data.get('friends') or []
+                if token in fl:
+                    data['friends'] = [t for t in fl if t != token]
+                    with open(fp, 'w') as f: json.dump(data, f)
+            except Exception: pass
+    except Exception:
+        pass
+
+    return jsonify({'ok': True, 'deleted': deleted})
 
 
 # ── Friend-Requests (statt symmetrisch-add: invite/accept-Flow) ───────
