@@ -10499,21 +10499,107 @@ def auth_login():
     return jsonify({'ok': True, 'token': user['token'], 'email': email})
 
 
+# Apple JWKS-Cache (15 Min TTL — Apple rotiert Keys selten)
+_APPLE_JWKS_CACHE = {'keys': None, 'expires': 0.0}
+APPLE_BUNDLE_ID = os.environ.get('APPLE_BUNDLE_ID', 'de.aerosteuer.aeris')
+
+def _fetch_apple_jwks():
+    now = time.time()
+    if _APPLE_JWKS_CACHE['keys'] and _APPLE_JWKS_CACHE['expires'] > now:
+        return _APPLE_JWKS_CACHE['keys']
+    try:
+        import urllib.request as _u
+        with _u.urlopen('https://appleid.apple.com/auth/keys', timeout=5) as r:
+            jwks = json.loads(r.read().decode('utf-8'))
+        _APPLE_JWKS_CACHE['keys'] = jwks.get('keys') or []
+        _APPLE_JWKS_CACHE['expires'] = now + 900
+        return _APPLE_JWKS_CACHE['keys']
+    except Exception as e:
+        app.logger.warning(f'[apple-jwt] JWKS fetch failed: {e}')
+        return []
+
+def _verify_apple_identity_token(token, expected_sub=None):
+    """Verifiziert Apple identity_token (JWT).
+    Returns: (ok, sub, email) — wenn ok=False sind sub/email None.
+    Verifiziert: Signatur (RS256 via JWKS), iss, aud, exp, nbf.
+    """
+    if not token or token.count('.') != 2:
+        return (False, None, None)
+    try:
+        import base64
+        def b64dec(s):
+            s += '=' * (-len(s) % 4)
+            return base64.urlsafe_b64decode(s)
+        header_b64, payload_b64, sig_b64 = token.split('.')
+        header = json.loads(b64dec(header_b64))
+        payload = json.loads(b64dec(payload_b64))
+        # Claims-Check
+        if payload.get('iss') != 'https://appleid.apple.com':
+            return (False, None, None)
+        if payload.get('aud') != APPLE_BUNDLE_ID:
+            return (False, None, None)
+        now = int(time.time())
+        if int(payload.get('exp') or 0) < now:
+            return (False, None, None)
+        if int(payload.get('nbf') or 0) > now + 60:
+            return (False, None, None)
+        sub = payload.get('sub')
+        if expected_sub and sub != expected_sub:
+            return (False, None, None)
+        # Signatur-Check via JWKS
+        kid = header.get('kid')
+        keys = _fetch_apple_jwks()
+        jwk = next((k for k in keys if k.get('kid') == kid), None)
+        if not jwk:
+            app.logger.warning(f'[apple-jwt] kid {kid} not in JWKS')
+            return (False, None, None)
+        try:
+            from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+            from cryptography.hazmat.primitives.asymmetric import padding
+            from cryptography.hazmat.primitives import hashes
+            n = int.from_bytes(b64dec(jwk['n']), 'big')
+            e = int.from_bytes(b64dec(jwk['e']), 'big')
+            pubkey = RSAPublicNumbers(e, n).public_key()
+            signed = f'{header_b64}.{payload_b64}'.encode('ascii')
+            pubkey.verify(b64dec(sig_b64), signed, padding.PKCS1v15(), hashes.SHA256())
+        except Exception as e:
+            app.logger.warning(f'[apple-jwt] signature verify failed: {e}')
+            return (False, None, None)
+        return (True, sub, payload.get('email'))
+    except Exception as e:
+        app.logger.warning(f'[apple-jwt] parse failed: {e}')
+        return (False, None, None)
+
+
 @app.route('/api/auth/apple', methods=['POST'])
 def auth_apple():
-    """Sign-in-with-Apple · iOS sendet identity_token + Apple-sub + Email.
-    Backend trustet die Tokens da sie nur vom signierten Apple-Login kommen können.
-    JWT-Signatur-Check würde production-hard — minimal-Implementation reicht für AppStore.
+    """Sign-in-with-Apple. Verifiziert identity_token kryptographisch
+    (RS256 via Apple JWKS) wenn iOS-Client das Token mitschickt. Fallback
+    ohne Token = legacy-Pfad mit Warnung.
 
-    Body: {apple_sub: str, email: str, name?: str}
-    Returns: {ok, token, email} · existing oder neu erstellt.
+    Body: {apple_sub, email?, name?, identity_token?}
     """
     body = request.get_json(silent=True) or {}
     apple_sub = (body.get('apple_sub') or '').strip()
     email = (body.get('email') or '').strip().lower()
     name = (body.get('name') or '').strip()
+    identity_token = (body.get('identity_token') or '').strip()
     if not apple_sub:
         return jsonify({'ok': False, 'error': 'apple_sub_required'}), 400
+
+    # Wenn identity_token mitgeschickt → kryptographisch verifizieren.
+    # Wenn nicht → Legacy-Pfad (alte iOS-Clients), aber loggen.
+    if identity_token:
+        ok, verified_sub, verified_email = _verify_apple_identity_token(
+            identity_token, expected_sub=apple_sub)
+        if not ok:
+            return jsonify({'ok': False, 'error': 'invalid_apple_token'}), 401
+        # Email aus dem Token bevorzugen wenn vorhanden (kann private relay sein)
+        if verified_email and '@' in verified_email:
+            email = verified_email.lower()
+    else:
+        app.logger.warning(
+            f'[apple-auth] no identity_token provided for sub {apple_sub[:8]}… — legacy path')
     # Apple liefert manchmal eine "private-relay" Email · ok als unique key
     if not email or '@' not in email:
         # Fallback: use sub as pseudo-email
