@@ -9011,7 +9011,10 @@ def toggle_like(token, post_id):
 def add_comment(token, post_id):
     body = request.get_json(silent=True) or {}
     text = (body.get('text') or '').strip()
-    if not text: return jsonify({'ok': False, 'error': 'empty_comment'}), 400
+    image_url = (body.get('image_url') or '').strip() or None
+    parent_comment_id = (body.get('parent_comment_id') or '').strip() or None
+    if not text and not image_url:
+        return jsonify({'ok': False, 'error': 'empty_comment'}), 400
     if len(text) > 500: return jsonify({'ok': False, 'error': 'too_long'}), 413
     cp = _wall_comments_path(post_id)
     if not cp: return jsonify({'ok': False, 'error': 'invalid_post'}), 400
@@ -9028,9 +9031,12 @@ def add_comment(token, post_id):
         pass
     c = {
         'id': str(uuid.uuid4())[:10],
+        'author_token': token,
         'author_short': token[:8],
         'author_name': name,
         'text': text,
+        'image_url': image_url,
+        'parent_comment_id': parent_comment_id,
         'created_at': datetime.now().isoformat(),
     }
     comments.append(c)
@@ -9042,7 +9048,9 @@ def add_comment(token, post_id):
             p['comment_count'] = (p.get('comment_count') or 0) + 1
             break
     _wall_save_posts(posts)
-    return jsonify({'ok': True, 'comment': c})
+    response_c = dict(c)
+    response_c.pop('author_token', None)
+    return jsonify({'ok': True, 'comment': response_c})
 
 
 @app.route('/api/wall/<token>/post/<post_id>/comments', methods=['GET'])
@@ -9053,6 +9061,9 @@ def get_comments(token, post_id):
         with open(cp) as f: comments = json.load(f) or []
     except FileNotFoundError:
         comments = []
+    # Strip author_token from response
+    for c in comments:
+        c.pop('author_token', None)
     return jsonify({'post_id': post_id, 'comments': comments})
 
 
