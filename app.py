@@ -9017,8 +9017,11 @@ def get_wall_feed(token):
     before_ts = float(request.args.get('before_ts') or 0)
     friends = set((_friends_load(token).get('friends') or []))
     friends.add(token)
+    blocked = _blocked_by(token)
     posts = _wall_load_posts()
-    feed = [p for p in posts if p.get('author_token') in friends]
+    feed = [p for p in posts
+            if p.get('author_token') in friends
+            and p.get('author_token') not in blocked]
     feed.sort(key=lambda p: -(p.get('ts') or 0))
     if before_ts > 0:
         feed = [p for p in feed if (p.get('ts') or 0) < before_ts]
@@ -9283,6 +9286,11 @@ def forum_list_threads(token):
     threads = _forum_load_threads()
     if category and category in FORUM_CATEGORIES:
         threads = [t for t in threads if t.get('category_id') == category]
+
+    # Geblockte Author-Tokens ausfiltern (Apple Guideline 1.4.1)
+    blocked = _blocked_by(token)
+    if blocked:
+        threads = [t for t in threads if t.get('author_token') not in blocked]
 
     # Sort
     now = time.time()
@@ -10693,6 +10701,216 @@ def auth_delete_account():
         pass
 
     return jsonify({'ok': True, 'deleted': deleted})
+
+
+# ── UGC-Moderation (Apple Guideline 1.4.1) ─────────────────────────────
+# Report (Inhalts-Meldung), Block (User komplett ausblenden), Mute (nur
+# Notifications stumm). Globale reports_log.json sammelt für Review,
+# per-User blocks_<token>.json / mutes_<token>.json filtern Feed/Forum.
+
+def _safe_token(t):
+    return re.sub(r'[^A-Za-z0-9_-]', '', t or '')[:64]
+
+def _blocks_path(token):
+    s = _safe_token(token)
+    return os.path.join(_USER_HISTORY_DIR, f'blocks_{s}.json') if s else None
+
+def _mutes_path(token):
+    s = _safe_token(token)
+    return os.path.join(_USER_HISTORY_DIR, f'mutes_{s}.json') if s else None
+
+def _load_set_file(path):
+    if not path or not os.path.exists(path): return set()
+    try:
+        with open(path) as f:
+            return set(json.load(f) or [])
+    except Exception:
+        return set()
+
+def _save_set_file(path, s):
+    if not path: return
+    try:
+        _atomic_write_json(path, sorted(list(s)))
+    except Exception:
+        try:
+            with open(path, 'w') as f: json.dump(sorted(list(s)), f)
+        except Exception: pass
+
+def _blocked_by(token):
+    """Set von Tokens die der User geblockt hat."""
+    return _load_set_file(_blocks_path(token))
+
+def _muted_by(token):
+    return _load_set_file(_mutes_path(token))
+
+
+@app.route('/api/moderation/<token>/report', methods=['POST'])
+def moderation_report(token):
+    """Inhalts-Meldung. Body: {kind: 'wall_post'|'wall_comment'|'forum_thread'|
+    'forum_reply'|'layoverrec'|'chat_msg'|'user', target_id: str,
+    target_token: str?, reason: str, note: str?}"""
+    body = request.get_json(silent=True) or {}
+    kind = (body.get('kind') or '').strip()
+    target_id = (body.get('target_id') or '').strip()
+    target_token = (body.get('target_token') or '').strip()
+    reason = (body.get('reason') or '').strip()[:64]
+    note = (body.get('note') or '').strip()[:2000]
+    if not kind or not reason:
+        return jsonify({'ok': False, 'error': 'kind_and_reason_required'}), 400
+    if kind not in ('wall_post', 'wall_comment', 'forum_thread', 'forum_reply',
+                    'layoverrec', 'layoverrec_comment', 'chat_msg', 'user'):
+        return jsonify({'ok': False, 'error': 'invalid_kind'}), 400
+
+    reports_p = os.path.join(_USER_HISTORY_DIR, 'reports_log.json')
+    try:
+        with open(reports_p) as f: reports = json.load(f) or []
+    except Exception:
+        reports = []
+    entry = {
+        'id': uuid.uuid4().hex[:12],
+        'ts': time.time(),
+        'reporter_token': token,
+        'kind': kind,
+        'target_id': target_id,
+        'target_token': target_token,
+        'reason': reason,
+        'note': note,
+        'status': 'pending',
+    }
+    reports.append(entry)
+    # Cap auf 50k Reports — älteste droppen
+    if len(reports) > 50000:
+        reports = reports[-50000:]
+    try:
+        _atomic_write_json(reports_p, reports)
+    except Exception:
+        try:
+            with open(reports_p, 'w') as f: json.dump(reports, f)
+        except Exception: pass
+    return jsonify({'ok': True, 'report_id': entry['id']})
+
+
+@app.route('/api/moderation/<token>/block', methods=['POST'])
+def moderation_block(token):
+    """Body: {target_token: str}"""
+    body = request.get_json(silent=True) or {}
+    target = (body.get('target_token') or '').strip()
+    if not target:
+        return jsonify({'ok': False, 'error': 'target_required'}), 400
+    if target == token:
+        return jsonify({'ok': False, 'error': 'cannot_block_self'}), 400
+    blocks = _blocked_by(token)
+    blocks.add(target)
+    _save_set_file(_blocks_path(token), blocks)
+    # Optional: aus Friends-Liste entfernen (Block = harte Trennung)
+    try:
+        d = _friends_load(token)
+        fl = d.get('friends') or []
+        if target in fl:
+            d['friends'] = [t for t in fl if t != target]
+            _friends_save(token, d)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'blocked_count': len(blocks)})
+
+
+@app.route('/api/moderation/<token>/unblock', methods=['POST'])
+def moderation_unblock(token):
+    body = request.get_json(silent=True) or {}
+    target = (body.get('target_token') or '').strip()
+    blocks = _blocked_by(token)
+    blocks.discard(target)
+    _save_set_file(_blocks_path(token), blocks)
+    return jsonify({'ok': True, 'blocked_count': len(blocks)})
+
+
+@app.route('/api/moderation/<token>/blocks', methods=['GET'])
+def moderation_list_blocks(token):
+    blocks = list(_blocked_by(token))
+    # Enrich mit Profilen wenn vorhanden
+    enriched = []
+    for t in blocks:
+        info = {'token': t}
+        try:
+            with open(_user_profile_path(t)) as f:
+                pr = json.load(f).get('profile', {})
+            info['name'] = pr.get('name')
+            info['airline'] = pr.get('airline')
+            info['homebase'] = pr.get('homebase')
+        except Exception:
+            pass
+        enriched.append(info)
+    return jsonify({'blocks': enriched, 'count': len(enriched)})
+
+
+@app.route('/api/moderation/<token>/mute', methods=['POST'])
+def moderation_mute(token):
+    body = request.get_json(silent=True) or {}
+    target = (body.get('target_token') or '').strip()
+    if not target or target == token:
+        return jsonify({'ok': False, 'error': 'invalid_target'}), 400
+    mutes = _muted_by(token)
+    mutes.add(target)
+    _save_set_file(_mutes_path(token), mutes)
+    return jsonify({'ok': True, 'muted_count': len(mutes)})
+
+
+@app.route('/api/moderation/<token>/unmute', methods=['POST'])
+def moderation_unmute(token):
+    body = request.get_json(silent=True) or {}
+    target = (body.get('target_token') or '').strip()
+    mutes = _muted_by(token)
+    mutes.discard(target)
+    _save_set_file(_mutes_path(token), mutes)
+    return jsonify({'ok': True, 'muted_count': len(mutes)})
+
+
+@app.route('/api/moderation/<token>/mutes', methods=['GET'])
+def moderation_list_mutes(token):
+    return jsonify({'mutes': list(_muted_by(token))})
+
+
+@app.route('/api/moderation/<token>/block-by-content', methods=['POST'])
+def moderation_block_by_content(token):
+    """Body: {kind, target_id}. Server löst author_token serverseitig auf,
+    sodass author-Token nicht client-seitig exponiert werden muss. Z.B.
+    Forum-Threads in der List-Response haben author_token gestripped —
+    der User soll trotzdem blocken können."""
+    body = request.get_json(silent=True) or {}
+    kind = (body.get('kind') or '').strip()
+    target_id = (body.get('target_id') or '').strip()
+    if not kind or not target_id:
+        return jsonify({'ok': False, 'error': 'kind_and_target_required'}), 400
+    author_token = None
+    if kind == 'wall_post':
+        for p in _wall_load_posts():
+            if p.get('id') == target_id:
+                author_token = p.get('author_token'); break
+    elif kind == 'forum_thread':
+        for t in _forum_load_threads():
+            if t.get('id') == target_id:
+                author_token = t.get('author_token'); break
+    elif kind == 'forum_reply':
+        # Reply-ID kollidiert evtl. zwischen Threads — wir durchsuchen alle
+        for t in _forum_load_threads():
+            try:
+                replies_p = os.path.join(_USER_HISTORY_DIR, 'forum',
+                                          f'replies_{t.get("id")}.json')
+                with open(replies_p) as f: replies = json.load(f) or []
+                for r in replies:
+                    if r.get('id') == target_id:
+                        author_token = r.get('author_token'); break
+            except Exception: pass
+            if author_token: break
+    if not author_token:
+        return jsonify({'ok': False, 'error': 'author_not_found'}), 404
+    if author_token == token:
+        return jsonify({'ok': False, 'error': 'cannot_block_self'}), 400
+    blocks = _blocked_by(token)
+    blocks.add(author_token)
+    _save_set_file(_blocks_path(token), blocks)
+    return jsonify({'ok': True, 'blocked_token': author_token,
+                    'blocked_count': len(blocks)})
 
 
 # ── Friend-Requests (statt symmetrisch-add: invite/accept-Flow) ───────
