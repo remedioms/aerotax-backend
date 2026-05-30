@@ -11635,8 +11635,25 @@ def import_calendar_feed(token):
     except Exception:
         pass
 
+    # Kumulative Stats — der iCal-Feed liefert nur ein rollendes Fenster
+    # (z.B. -30 / +60 Tage), aber wir behalten alle früher importierten Tage
+    # in der briefings-Map. Frontend zeigt damit "X Tage seit März 2024".
+    total_briefings = 0
+    oldest_date = None
+    newest_date = None
+    try:
+        total_briefings = len(briefings)
+        if briefings:
+            keys = sorted(briefings.keys())
+            oldest_date = keys[0]
+            newest_date = keys[-1]
+    except Exception:
+        pass
     return jsonify({'ok': True, 'events_count': len(events),
-                    'briefings_imported': imported_briefings})
+                    'briefings_imported': imported_briefings,
+                    'total_briefings': total_briefings,
+                    'oldest_date': oldest_date,
+                    'newest_date': newest_date})
 
 
 @app.route('/api/user/calendar-events/<token>/upload', methods=['POST'])
