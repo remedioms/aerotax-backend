@@ -10795,7 +10795,7 @@ def auth_login():
 
 # Apple JWKS-Cache (15 Min TTL — Apple rotiert Keys selten)
 _APPLE_JWKS_CACHE = {'keys': None, 'expires': 0.0}
-APPLE_BUNDLE_ID = os.environ.get('APPLE_BUNDLE_ID', 'de.aerosteuer.aeris')
+APPLE_BUNDLE_ID = os.environ.get('APPLE_BUNDLE_ID', 'aerotax.AeroTax')
 
 def _fetch_apple_jwks():
     now = time.time()
