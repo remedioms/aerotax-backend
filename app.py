@@ -2007,6 +2007,42 @@ def find_cached_chunk(file_hash, document_type, chunk_index, parser_version):
     return None
 
 
+def cleanup_old_wall_images(max_age_days: int = 180):
+    """Löscht hochgeladene Wall-Bilder älter als N Tage (Default 180).
+    posts.json ist auf 5000 Einträge gecapped — Bilder zu noch älteren Posts sind
+    unauffindbar, würden aber sonst auf der Disk verbleiben (Storage-Leak).
+    Wird im _cleanup_loop aufgerufen.
+    """
+    try:
+        img_root = os.path.join(_USER_HISTORY_DIR, 'wall_images')
+        if not os.path.isdir(img_root):
+            return
+        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+        deleted = 0
+        for token_dir in os.listdir(img_root):
+            full_dir = os.path.join(img_root, token_dir)
+            if not os.path.isdir(full_dir):
+                continue
+            try:
+                for fn in os.listdir(full_dir):
+                    fp = os.path.join(full_dir, fn)
+                    try:
+                        if datetime.utcfromtimestamp(os.path.getmtime(fp)) < cutoff:
+                            os.remove(fp)
+                            deleted += 1
+                    except Exception:
+                        pass
+                if not os.listdir(full_dir):
+                    try: os.rmdir(full_dir)
+                    except Exception: pass
+            except Exception:
+                continue
+        if deleted:
+            print(f"[cleanup] wall_images: {deleted} files (>{max_age_days}d) deleted")
+    except Exception as e:
+        print(f"[cleanup] wall_images fail: {str(e)[:120]}")
+
+
 def cleanup_old_job_chunks():
     """Löscht job_chunks älter als 7 Tage. Wird im _cleanup_loop aufgerufen."""
     if not SB_AVAILABLE:
@@ -6023,6 +6059,8 @@ def _cleanup_loop():
                     print(f"[cleanup] supabase pdfs: {e}")
             # v10.3: Auch jobs (>7 Tage) + sessions (expired) cleanen
             cleanup_old_supabase_state()
+            # Wall-Image-Storage-Leak: Bilder > 180 Tage löschen
+            cleanup_old_wall_images()
         except: pass
 
 
@@ -8815,6 +8853,17 @@ def take_roster_snapshot(token):
         with open(cp, 'w') as f: json.dump(existing, f, ensure_ascii=False)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    if diff:
+        try:
+            n = len(diff)
+            kinds = {c.get('kind') for c in diff}
+            if n == 1:
+                body = 'Eine Änderung im Dienstplan erkannt — bitte prüfen.'
+            else:
+                body = f'{n} Änderungen im Dienstplan erkannt — bitte prüfen.'
+            _send_push_notification(token, 'Dienstplan-Änderung', body)
+        except Exception:
+            pass
     return jsonify({'ok': True, 'changes_count': len(diff), 'changes': diff})
 
 
@@ -11403,6 +11452,18 @@ def accept_friend_request(token):
     if token not in them['friends']: them['friends'].append(token)
     _friends_save(token, me)
     _friends_save(from_token, them)
+    try:
+        my_name = ''
+        try:
+            with open(_user_profile_path(token)) as _pf:
+                my_name = (json.load(_pf) or {}).get('name') or ''
+        except Exception:
+            my_name = ''
+        who = my_name.strip() or 'Jemand'
+        _send_push_notification(from_token, 'Neue Crew-Verbindung',
+                                f'{who} hat deine Anfrage angenommen.')
+    except Exception:
+        pass
     return jsonify({'ok': True})
 
 
@@ -11574,6 +11635,71 @@ def import_calendar_feed(token):
     except Exception:
         pass
 
+    return jsonify({'ok': True, 'events_count': len(events),
+                    'briefings_imported': imported_briefings})
+
+
+@app.route('/api/user/calendar-events/<token>/upload', methods=['POST'])
+def upload_calendar_events(token):
+    """iOS sendet hier eine Liste von EKEvent-Objekten direkt (nicht via URL).
+    Body: {events: [{summary, location, start_iso, end_iso}, ...]}
+    Speichert sie als Briefing-Hints — gleiches Mapping wie ICS-Import, aber
+    Datum kommt schon im ISO-Format aus iOS (kein DTSTART-Parsing nötig).
+    """
+    body = request.get_json(silent=True) or {}
+    raw_events = body.get('events') or []
+    if not isinstance(raw_events, list):
+        return jsonify({'ok': False, 'error': 'events_must_be_list'}), 400
+    if len(raw_events) > 500:
+        raw_events = raw_events[:500]
+    # Normalisieren
+    events = []
+    for ev in raw_events:
+        if not isinstance(ev, dict): continue
+        events.append({
+            'summary': str(ev.get('summary') or '')[:80],
+            'location': str(ev.get('location') or '')[:60],
+            'start_iso': str(ev.get('start_iso') or '')[:25],
+            'end_iso': str(ev.get('end_iso') or '')[:25],
+        })
+    # Profil-Notiz
+    p = _user_profile_path(token)
+    try:
+        existing = {}
+        try:
+            with open(p) as f: existing = json.load(f) or {}
+        except Exception: pass
+        existing['calendar_feed'] = {
+            'source': 'ios_ekeventstore', 'events': events[:300],
+            'imported_at': datetime.now().isoformat(),
+        }
+        with open(p, 'w') as f: json.dump(existing, f)
+    except Exception:
+        pass
+    # Briefing-Map befüllen — gleicher Pfad wie ICS-Import
+    imported_briefings = 0
+    try:
+        briefings = {}
+        safe_t = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+        bp = os.path.join(_USER_HISTORY_DIR, 'briefings', f'{safe_t}.json')
+        try:
+            with open(bp) as f: briefings = json.load(f) or {}
+        except Exception: pass
+        for ev in events:
+            iso = (ev.get('start_iso') or '').strip()
+            # akzeptiert '2026-03-15' oder '2026-03-15T14:00:00Z'
+            date_str = iso[:10]
+            if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str): continue
+            existing_b = briefings.get(date_str, {})
+            existing_b['ical_summary'] = ev.get('summary') or ''
+            existing_b['ical_location'] = ev.get('location') or ''
+            existing_b['ical_imported_at'] = datetime.now().isoformat()
+            briefings[date_str] = existing_b
+            imported_briefings += 1
+        os.makedirs(os.path.dirname(bp), exist_ok=True)
+        with open(bp, 'w') as f: json.dump(briefings, f, ensure_ascii=False)
+    except Exception:
+        pass
     return jsonify({'ok': True, 'events_count': len(events),
                     'briefings_imported': imported_briefings})
 
