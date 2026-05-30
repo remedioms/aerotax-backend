@@ -9136,6 +9136,9 @@ def get_wall_feed(token):
             pass
     for p in feed:
         p['liked_by_me'] = p['id'] in liked_ids
+        # is_mine: Owner-Flag damit iOS-Client einen "Löschen"-Button
+        # auf eigene Posts zeigen kann (DSGVO Art. 17 sub-right).
+        p['is_mine'] = (p.get('author_token') == token)
         # Strip author_token for privacy in feed
         p.pop('author_token', None)
     return jsonify({'count': len(feed), 'posts': feed})
@@ -9412,10 +9415,11 @@ def forum_list_threads(token):
 
     threads = threads[:limit]
 
-    # Add liked_by_me
+    # Add liked_by_me + is_mine (Owner-Flag für eigene-Löschen-Button, DSGVO)
     likes = _forum_load_likes(token)
     for t in threads:
         t['liked_by_me'] = t.get('id') in likes['threads']
+        t['is_mine'] = (t.get('author_token') == token)
         # Strip author_token from public response
         t.pop('author_token', None)
     return jsonify({'count': len(threads), 'threads': threads})
