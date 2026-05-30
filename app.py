@@ -8233,6 +8233,58 @@ def get_friends_homebases(token):
     return jsonify({'token': token, 'homebases': homebases})
 
 
+@app.route('/api/user/friend-roster/<token>/<friend_token>', methods=['GET'])
+def get_friend_roster(token, friend_token):
+    """Liefert das Roster eines Friends (Tag-Detail-Liste) für Tour-Compare.
+    Privacy: nur wenn beide friends sind UND Friend hat share_roster=true im
+    Profile (Default off). Honest empty array wenn nicht geteilt.
+    Query: ?days=30 (default 30, max 90)
+    """
+    from datetime import date as _date, timedelta as _td
+    days_limit = min(int(request.args.get('days') or 30), 90)
+    # Friend-Check
+    me = _friends_load(token)
+    if friend_token not in (me.get('friends') or []):
+        return jsonify({'ok': False, 'shared': False,
+                        'error': 'not_friends', 'days': []}), 403
+    # Share-Roster-Opt-in-Check
+    try:
+        with open(_user_profile_path(friend_token)) as f:
+            friend_profile = json.load(f).get('profile', {})
+    except Exception:
+        friend_profile = {}
+    if not friend_profile.get('share_roster'):
+        return jsonify({'ok': True, 'shared': False,
+                        'reason': 'friend_opted_out', 'days': []})
+    # Friend roster aus _store (best-effort, nur wenn Friend kürzlich aktiv war)
+    sess = _store.get(friend_token) or {}
+    tage = (sess.get('result_data') or {}).get('_tage_detail') or []
+    today = _date.today()
+    cutoff = today + _td(days=days_limit)
+    out = []
+    for day in tage:
+        if not isinstance(day, dict): continue
+        d = day.get('datum')
+        if not d: continue
+        try:
+            day_date = _date.fromisoformat(d[:10])
+            if day_date > cutoff or day_date < today - _td(days=30): continue
+        except Exception:
+            continue
+        rf = day.get('reader_facts') or {}
+        out.append({
+            'datum': d,
+            'klass': day.get('klass'),
+            'marker': day.get('marker'),
+            'routing': day.get('routing'),
+            'eur': day.get('eur'),
+            'layover_ort': rf.get('layover_ort'),
+            'start_time': rf.get('start_time'),
+            'end_time': rf.get('end_time'),
+        })
+    return jsonify({'ok': True, 'shared': True, 'count': len(out), 'days': out})
+
+
 @app.route('/api/user/friends-today/<token>', methods=['GET'])
 def get_friends_today(token):
     """OffBlock-Pattern: Was machen meine Friends HEUTE (oder an gegebenem Datum).
