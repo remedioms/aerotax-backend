@@ -8041,6 +8041,1770 @@ def delete_friend_group(token, group_id):
     return jsonify({'ok': True})
 
 
+@app.route('/api/user/friends-homebases/<token>', methods=['GET'])
+def get_friends_homebases(token):
+    """OffBlock-Pattern: Liste Friends gruppiert nach Homebase.
+    Returns: {homebases: [{iata, count, friends:[{token, name}]}]}
+    """
+    from collections import defaultdict
+    data = _friends_load(token)
+    friends = data.get('friends') or []
+    grouped = defaultdict(list)
+    for fr in friends:
+        ppath = _user_profile_path(fr)
+        try:
+            with open(ppath) as f:
+                pr = json.load(f).get('profile', {})
+        except Exception:
+            pr = {}
+        hb = (pr.get('homebase') or '').upper().strip()
+        if not hb or len(hb) != 3: hb = '???'
+        grouped[hb].append({
+            'token': fr[:16] + '…',  # truncate for privacy
+            'name': pr.get('name') or 'Friend',
+            'airline': pr.get('airline') or '',
+            'position': pr.get('position') or '',
+        })
+    homebases = [{'iata': hb, 'count': len(fl), 'friends': fl}
+                 for hb, fl in sorted(grouped.items(), key=lambda x: -len(x[1]))]
+    return jsonify({'token': token, 'homebases': homebases})
+
+
+@app.route('/api/user/friends-today/<token>', methods=['GET'])
+def get_friends_today(token):
+    """OffBlock-Pattern: Was machen meine Friends HEUTE (oder an gegebenem Datum).
+    Query: ?datum=YYYY-MM-DD (default today)
+    """
+    from datetime import date as _date
+    datum = request.args.get('datum') or _date.today().isoformat()
+    data = _friends_load(token)
+    friends = data.get('friends') or []
+    out = []
+    for fr in friends:
+        sess = _store.get(fr) or {}
+        rd = sess.get('result_data') or {}
+        tage = rd.get('_tage_detail') or []
+        day = next((t for t in tage if isinstance(t, dict) and t.get('datum') == datum), None)
+        if not day: continue
+        ppath = _user_profile_path(fr)
+        try:
+            with open(ppath) as f:
+                pr = json.load(f).get('profile', {})
+        except Exception:
+            pr = {}
+        rf = day.get('reader_facts') or {}
+        out.append({
+            'token': fr[:16] + '…',
+            'name': pr.get('name') or 'Friend',
+            'homebase': pr.get('homebase') or '',
+            'klass': day.get('klass'),
+            'marker': day.get('marker'),
+            'routing': day.get('routing'),
+            'layover': rf.get('layover_ort'),
+            'start': rf.get('start_time'),
+            'end': rf.get('end_time'),
+        })
+    return jsonify({'datum': datum, 'count': len(out), 'friends_today': out})
+
+
+def _flight_ops_path(token):
+    import os, re
+    if not token: return None
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+    if not safe: return None
+    os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+    return os.path.join(_USER_HISTORY_DIR, f'flightops_{safe}.json')
+
+
+@app.route('/api/user/flight-ops/<token>', methods=['GET'])
+def get_flight_ops(token):
+    """Liefert alle Per-Flight-Operational-Details (Catering/Pax/Fuel/SSR/Endorsement) zurück.
+    Optional: ?datum=YYYY-MM-DD für einzelnen Tag.
+    """
+    p = _flight_ops_path(token)
+    if not p:
+        return jsonify({'error': 'invalid token'}), 400
+    try:
+        with open(p) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+    datum = request.args.get('datum')
+    if datum:
+        return jsonify({'datum': datum, 'ops': data.get(datum, {})})
+    return jsonify({'count': len(data), 'ops_by_date': data})
+
+
+@app.route('/api/user/flight-ops/<token>/<datum>', methods=['PUT'])
+def put_flight_ops(token, datum):
+    """Speichert/aktualisiert Per-Flight-Operational-Details für einen Tag.
+    Body: full FlightOps-Object (kein Patch, replace).
+    """
+    import re
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', datum or ''):
+        return jsonify({'ok': False, 'error': 'invalid_datum'}), 400
+    p = _flight_ops_path(token)
+    if not p:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({'ok': False, 'error': 'body_must_be_object'}), 400
+    # Strip oversize payloads (DOS protection)
+    if len(json.dumps(body)) > 16_000:
+        return jsonify({'ok': False, 'error': 'payload_too_large'}), 413
+    try:
+        try:
+            with open(p) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            data = {}
+        data[datum] = body
+        with open(p, 'w') as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True, 'datum': datum})
+
+
+@app.route('/api/user/flight-ops/<token>/<datum>', methods=['DELETE'])
+def delete_flight_ops(token, datum):
+    """Löscht Operational-Details für einen Tag."""
+    p = _flight_ops_path(token)
+    if not p:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    try:
+        with open(p) as f:
+            data = json.load(f)
+        if datum in data:
+            del data[datum]
+            with open(p, 'w') as f:
+                json.dump(data, f, ensure_ascii=False)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True})
+
+
+# ─── Aviation Master-Data Endpoints ──────────────────────────────────────────
+# METAR, Currency, Aircraft-Registry, NOTAMs — alle aus public APIs (CC0/PD)
+
+_AVIATION_CACHE = {}  # in-mem TTL cache: key -> (expires_at, value)
+def _aviation_cache_get(key, ttl_sec):
+    import time
+    rec = _AVIATION_CACHE.get(key)
+    if rec and rec[0] > time.time():
+        return rec[1]
+    return None
+
+def _aviation_cache_set(key, value, ttl_sec):
+    import time
+    _AVIATION_CACHE[key] = (time.time() + ttl_sec, value)
+    if len(_AVIATION_CACHE) > 500:
+        oldest = sorted(_AVIATION_CACHE.items(), key=lambda x: x[1][0])[:200]
+        for k, _ in oldest:
+            _AVIATION_CACHE.pop(k, None)
+
+
+@app.route('/api/aviation/metar/<icao>', methods=['GET'])
+def get_metar(icao):
+    """METAR Wetter-Report von aviationweather.gov (US Public Domain).
+    Beispiel: /api/aviation/metar/EDDF → Frankfurt METAR
+    """
+    import re
+    icao = (icao or '').strip().upper()
+    if not re.match(r'^[A-Z]{4}$', icao):
+        return jsonify({'error': 'invalid icao'}), 400
+    cached = _aviation_cache_get(f'metar:{icao}', 600)
+    if cached is not None:
+        return jsonify(cached)
+    try:
+        import urllib.request as ur
+        url = f'https://aviationweather.gov/api/data/metar?ids={icao}&format=json&hours=1'
+        req = ur.Request(url, headers={'User-Agent': 'Aeris/1.0'})
+        with ur.urlopen(req, timeout=10) as r:
+            raw = json.loads(r.read().decode('utf-8'))
+        if not raw:
+            result = {'icao': icao, 'reports': []}
+        else:
+            result = {'icao': icao, 'reports': [
+                {
+                    'raw': r.get('rawOb'),
+                    'time': r.get('reportTime'),
+                    'temp_c': r.get('temp'),
+                    'dewpoint_c': r.get('dewp'),
+                    'wind_dir': r.get('wdir'),
+                    'wind_speed_kt': r.get('wspd'),
+                    'wind_gust_kt': r.get('wgst'),
+                    'visibility_sm': r.get('visib'),
+                    'altimeter_hpa': r.get('altim'),
+                    'flight_category': r.get('fltCat'),
+                } for r in raw[:5]
+            ]}
+        _aviation_cache_set(f'metar:{icao}', result, 600)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'icao': icao, 'reports': [], 'error': str(e)[:200]}), 502
+
+
+@app.route('/api/aviation/taf/<icao>', methods=['GET'])
+def get_taf(icao):
+    """TAF Wetter-Forecast von aviationweather.gov."""
+    import re
+    icao = (icao or '').strip().upper()
+    if not re.match(r'^[A-Z]{4}$', icao):
+        return jsonify({'error': 'invalid icao'}), 400
+    cached = _aviation_cache_get(f'taf:{icao}', 1800)
+    if cached is not None:
+        return jsonify(cached)
+    try:
+        import urllib.request as ur
+        url = f'https://aviationweather.gov/api/data/taf?ids={icao}&format=json'
+        req = ur.Request(url, headers={'User-Agent': 'Aeris/1.0'})
+        with ur.urlopen(req, timeout=10) as r:
+            raw = json.loads(r.read().decode('utf-8'))
+        result = {'icao': icao, 'forecasts': raw[:3] if raw else []}
+        _aviation_cache_set(f'taf:{icao}', result, 1800)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'icao': icao, 'forecasts': [], 'error': str(e)[:200]}), 502
+
+
+@app.route('/api/aviation/currency', methods=['GET'])
+def get_currency_rates():
+    """Wechselkurse via exchangerate.host (frei).
+    Query: ?base=EUR&symbols=USD,GBP,CHF
+    """
+    base = (request.args.get('base') or 'EUR').upper()[:3]
+    symbols = (request.args.get('symbols') or 'USD,GBP,CHF,JPY,CNY,CAD,AUD,SGD,AED').upper()
+    cache_key = f'cur:{base}:{symbols}'
+    cached = _aviation_cache_get(cache_key, 3600 * 12)
+    if cached is not None:
+        return jsonify(cached)
+    try:
+        import urllib.request as ur
+        url = f'https://api.exchangerate.host/latest?base={base}&symbols={symbols}'
+        with ur.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read().decode('utf-8'))
+        result = {'base': base, 'date': data.get('date'), 'rates': data.get('rates', {})}
+        _aviation_cache_set(cache_key, result, 3600 * 12)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'base': base, 'rates': {}, 'error': str(e)[:200]}), 502
+
+
+@app.route('/api/aviation/aircraft/<icao24>', methods=['GET'])
+def get_aircraft_by_icao24(icao24):
+    """Live-Aircraft-State von OpenSky-Network (frei, anonym).
+    Beispiel: /api/aviation/aircraft/3c6589
+    Returns current lat/lon/altitude/velocity wenn airborne.
+    """
+    import re
+    icao24 = (icao24 or '').strip().lower()
+    if not re.match(r'^[0-9a-f]{6}$', icao24):
+        return jsonify({'error': 'invalid icao24'}), 400
+    cached = _aviation_cache_get(f'os:{icao24}', 60)
+    if cached is not None:
+        return jsonify(cached)
+    try:
+        import urllib.request as ur
+        url = f'https://opensky-network.org/api/states/all?icao24={icao24}'
+        with ur.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read().decode('utf-8'))
+        states = data.get('states') or []
+        if not states:
+            result = {'icao24': icao24, 'state': None}
+        else:
+            s = states[0]
+            result = {
+                'icao24': icao24,
+                'callsign': (s[1] or '').strip() if s[1] else None,
+                'origin_country': s[2],
+                'time_position': s[3],
+                'last_contact': s[4],
+                'lon': s[5], 'lat': s[6],
+                'baro_altitude_m': s[7],
+                'on_ground': s[8],
+                'velocity_ms': s[9],
+                'heading': s[10],
+                'vertical_rate_ms': s[11],
+                'geo_altitude_m': s[13],
+            }
+        _aviation_cache_set(f'os:{icao24}', result, 60)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'icao24': icao24, 'state': None, 'error': str(e)[:200]}), 502
+
+
+@app.route('/api/aviation/notams/<icao>', methods=['GET'])
+def get_notams(icao):
+    """NOTAM-Liste für Flughafen via FAA NOTAM Search (frei).
+    Beispiel: /api/aviation/notams/KJFK
+    Hinweis: nur US-Airports werden von FAA gehostet — EU via Eurocontrol API würde Account brauchen.
+    """
+    import re
+    icao = (icao or '').strip().upper()
+    if not re.match(r'^[A-Z]{4}$', icao):
+        return jsonify({'error': 'invalid icao'}), 400
+    cached = _aviation_cache_get(f'notam:{icao}', 1800)
+    if cached is not None:
+        return jsonify(cached)
+    try:
+        import urllib.request as ur
+        url = f'https://external-api.faa.gov/notamapi/v1/notams?icaoLocation={icao}&pageSize=20'
+        req = ur.Request(url, headers={'User-Agent': 'Aeris/1.0'})
+        with ur.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode('utf-8'))
+        items = data.get('items', [])
+        result = {'icao': icao, 'count': len(items), 'notams': [
+            {
+                'id': it.get('properties', {}).get('notamNumber'),
+                'effective': it.get('properties', {}).get('effectiveStart'),
+                'expires': it.get('properties', {}).get('effectiveEnd'),
+                'text': it.get('properties', {}).get('coreNOTAMData', {}).get('notam', {}).get('text', '')[:500],
+            } for it in items[:20]
+        ]}
+        _aviation_cache_set(f'notam:{icao}', result, 1800)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'icao': icao, 'notams': [], 'error': 'notam_unavailable'}), 502
+
+
+# ─── Logbook HTML-Export (EASA AMC1 FCL.050 + FAA FAR 61.51) ────────────────
+
+def _flight_ops_load(token):
+    p = _flight_ops_path(token)
+    if not p: return {}
+    try:
+        with open(p) as f:
+            return json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _build_logbook_html(token, standard='EASA'):
+    """Erzeugt HTML-Logbuch — EASA-Format (AMC1 FCL.050 Felder) oder FAA (FAR 61.51).
+    Tage werden aus der jüngsten Auswertung (tage_detail) + FlightOps zusammengeführt.
+    """
+    sess = _store.get(token) or {}
+    rd = sess.get('result_data') or {}
+    tage = rd.get('_tage_detail') or []
+    ops_by_date = _flight_ops_load(token)
+    profile = {}
+    try:
+        with open(_user_profile_path(token)) as f:
+            profile = json.load(f).get('profile', {}) or {}
+    except Exception:
+        pass
+
+    rows_html = []
+    for t in tage:
+        if not isinstance(t, dict): continue
+        klass = (t.get('klass') or '').upper()
+        if klass not in ('Z72','Z73','Z74','Z76'): continue
+        datum = t.get('datum') or ''
+        rf = t.get('reader_facts') or {}
+        ops = ops_by_date.get(datum, {}) or {}
+        routing = (t.get('routing') or '').replace('-', ' → ')
+        flight_no = ops.get('flightNumber') or ''
+        reg = ops.get('aircraftReg') or ''
+        atype = ops.get('aircraftType') or ''
+        start = rf.get('start_time') or ''
+        end = rf.get('end_time') or ''
+        pax = (ops.get('pax_adults') or 0) + (ops.get('pax_children') or 0) + (ops.get('pax_infants') or 0)
+        rows_html.append(f'<tr><td>{datum}</td><td>{flight_no}</td><td>{atype}</td><td>{reg}</td>'
+                         f'<td>{routing}</td><td>{start}</td><td>{end}</td><td>{pax or ""}</td>'
+                         f'<td>{ops.get("remarks","")[:60]}</td></tr>')
+
+    name = (profile.get('name') or '').replace('<','').replace('>','')
+    title = 'AMC1 FCL.050 Logbook' if standard == 'EASA' else 'FAR 61.51 Pilot Logbook'
+    cols = ('Datum | Flugnr | Type | Reg | Routing | OffBl | OnBl | PAX | Bemerkungen'
+            if standard == 'EASA'
+            else 'Date | Flight | Type | Reg | Route | Off | On | PAX | Remarks')
+    head = ''.join(f'<th>{c.strip()}</th>' for c in cols.split('|'))
+
+    html = f"""<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><title>{title} — {name}</title>
+<style>
+  body{{font-family:-apple-system,system-ui,sans-serif;background:#0b0e1a;color:#dde2ee;margin:0;padding:24px}}
+  h1{{font-weight:800;letter-spacing:-0.5px;margin:0 0 4px 0;font-size:22px}}
+  .sub{{color:#8a93a6;font-size:13px;margin-bottom:18px}}
+  table{{width:100%;border-collapse:collapse;font-size:11px}}
+  th,td{{padding:6px 8px;border-bottom:1px solid #1d2235;text-align:left;vertical-align:top}}
+  th{{background:#11162a;color:#c0c6d4;font-weight:600;text-transform:uppercase;letter-spacing:1px;font-size:9px}}
+  tr:nth-child(even) td{{background:#0d1124}}
+  .foot{{margin-top:24px;color:#5e6679;font-size:10px}}
+  .sig{{margin-top:50px;border-top:1px solid #1d2235;padding-top:8px;color:#8a93a6;font-size:10px}}
+  @media print{{body{{background:white;color:black}} th{{background:#eee;color:#000}} tr:nth-child(even) td{{background:#fafafa}}}}
+</style></head><body>
+<h1>{title}</h1>
+<div class="sub">{name} · {profile.get('position','')} · {profile.get('airline','')} · Homebase {profile.get('homebase','')}</div>
+<table><thead><tr>{head}</tr></thead><tbody>
+{''.join(rows_html) if rows_html else '<tr><td colspan="9" style="text-align:center;color:#5e6679;padding:30px">Keine Flugtage vorhanden.</td></tr>'}
+</tbody></table>
+<div class="foot">Erzeugt: {datetime.now().strftime('%Y-%m-%d %H:%M')} · Standard: {standard} · Tage gesamt: {len(rows_html)}</div>
+<div class="sig">Unterschrift: ____________________________ Datum: ______________</div>
+</body></html>"""
+    return html
+
+
+@app.route('/api/user/logbook-html/<token>', methods=['GET'])
+def get_logbook_html(token):
+    """HTML-Logbook gemäß EASA (Standard) oder FAA.
+    Query: ?standard=EASA|FAA
+    """
+    std = (request.args.get('standard') or 'EASA').upper()
+    if std not in ('EASA','FAA'): std = 'EASA'
+    html = _build_logbook_html(token, std)
+    from flask import Response
+    return Response(html, mimetype='text/html; charset=utf-8')
+
+
+# ─── Briefing-Items pro Datum (Pre-Flight Briefing-Notes) ───────────────────
+
+def _briefing_path(token):
+    import os, re
+    if not token: return None
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+    if not safe: return None
+    os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+    return os.path.join(_USER_HISTORY_DIR, f'briefing_{safe}.json')
+
+
+@app.route('/api/user/briefing/<token>', methods=['GET'])
+def get_briefings(token):
+    """Alle Briefing-Items (key: Datum) für User."""
+    p = _briefing_path(token)
+    if not p: return jsonify({'error':'invalid token'}), 400
+    try:
+        with open(p) as f: data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+    datum = request.args.get('datum')
+    if datum:
+        return jsonify({'datum': datum, 'briefing': data.get(datum, {})})
+    return jsonify({'count': len(data), 'briefings': data})
+
+
+@app.route('/api/user/briefing/<token>/<datum>', methods=['PUT'])
+def put_briefing(token, datum):
+    """Speichert Briefing-Item für einen Tag.
+    Body: {weather_summary, ato_min, fuel_planned_kg, alternate_icao, mel_items:[], remarks}
+    """
+    import re
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', datum or ''):
+        return jsonify({'ok': False, 'error': 'invalid_datum'}), 400
+    p = _briefing_path(token)
+    if not p: return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({'ok': False, 'error': 'body_must_be_object'}), 400
+    if len(json.dumps(body)) > 8000:
+        return jsonify({'ok': False, 'error': 'payload_too_large'}), 413
+    try:
+        try:
+            with open(p) as f: data = json.load(f)
+        except FileNotFoundError:
+            data = {}
+        data[datum] = body
+        with open(p, 'w') as f: json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True, 'datum': datum})
+
+
+# ─── Duty-Changes: Roster-Diff + Approve-Workflow ───────────────────────────
+
+def _roster_snapshot_path(token):
+    import os, re
+    if not token: return None
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+    if not safe: return None
+    os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+    return os.path.join(_USER_HISTORY_DIR, f'roster_snapshot_{safe}.json')
+
+
+def _roster_changes_path(token):
+    import os, re
+    if not token: return None
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+    if not safe: return None
+    os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+    return os.path.join(_USER_HISTORY_DIR, f'roster_changes_{safe}.json')
+
+
+def _compute_roster_diff(old_tage, new_tage):
+    """Returns list of {datum, kind, old, new} where kind ∈ added/removed/modified."""
+    old_by = {t.get('datum'): t for t in (old_tage or []) if isinstance(t, dict)}
+    new_by = {t.get('datum'): t for t in (new_tage or []) if isinstance(t, dict)}
+    changes = []
+    keys = set(old_by.keys()) | set(new_by.keys())
+    def _digest(t):
+        if not t: return None
+        rf = t.get('reader_facts') or {}
+        return (t.get('klass'), t.get('routing'), rf.get('start_time'), rf.get('end_time'), rf.get('layover_ort'))
+    for k in sorted(keys):
+        a, b = old_by.get(k), new_by.get(k)
+        if a is None and b is not None:
+            changes.append({'datum': k, 'kind': 'added', 'new': b})
+        elif b is None and a is not None:
+            changes.append({'datum': k, 'kind': 'removed', 'old': a})
+        elif a and b and _digest(a) != _digest(b):
+            changes.append({'datum': k, 'kind': 'modified', 'old': a, 'new': b})
+    return changes
+
+
+@app.route('/api/user/roster-snapshot/<token>', methods=['POST'])
+def take_roster_snapshot(token):
+    """Speichert aktuellen tage_detail-Stand als Snapshot. Vergleicht mit vorigem Snapshot
+    und persistiert Diff als pending changes.
+    """
+    sess = _store.get(token) or {}
+    rd = sess.get('result_data') or {}
+    new_tage = rd.get('_tage_detail') or []
+    sp = _roster_snapshot_path(token)
+    if not sp: return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    try:
+        with open(sp) as f: old_data = json.load(f)
+        old_tage = old_data.get('tage') or []
+    except FileNotFoundError:
+        old_tage = []
+    except Exception:
+        old_tage = []
+    diff = _compute_roster_diff(old_tage, new_tage)
+    # Persist new snapshot
+    try:
+        with open(sp, 'w') as f:
+            json.dump({'taken_at': datetime.now().isoformat(), 'tage': new_tage}, f, ensure_ascii=False)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    # Append diff to changes log
+    cp = _roster_changes_path(token)
+    try:
+        try:
+            with open(cp) as f: existing = json.load(f)
+        except FileNotFoundError:
+            existing = {'pending': [], 'history': []}
+        pending = existing.get('pending') or []
+        for ch in diff:
+            ch['detected_at'] = datetime.now().isoformat()
+            ch['status'] = 'pending'
+            pending.append(ch)
+        existing['pending'] = pending
+        with open(cp, 'w') as f: json.dump(existing, f, ensure_ascii=False)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True, 'changes_count': len(diff), 'changes': diff})
+
+
+@app.route('/api/user/roster-changes/<token>', methods=['GET'])
+def get_roster_changes(token):
+    """Liste aller pending + history Roster-Änderungen."""
+    cp = _roster_changes_path(token)
+    if not cp: return jsonify({'error': 'invalid token'}), 400
+    try:
+        with open(cp) as f: data = json.load(f)
+    except FileNotFoundError:
+        data = {'pending': [], 'history': []}
+    return jsonify({
+        'pending': data.get('pending') or [],
+        'history': (data.get('history') or [])[-50:],
+    })
+
+
+@app.route('/api/user/roster-changes/<token>/decide', methods=['POST'])
+def decide_roster_change(token):
+    """Body: {datum, decision: 'accept'|'reject'} — verschiebt Change von pending → history."""
+    body = request.get_json(silent=True) or {}
+    datum = body.get('datum')
+    decision = (body.get('decision') or '').lower()
+    if decision not in ('accept', 'reject'):
+        return jsonify({'ok': False, 'error': 'invalid_decision'}), 400
+    cp = _roster_changes_path(token)
+    if not cp: return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    try:
+        with open(cp) as f: data = json.load(f)
+    except FileNotFoundError:
+        return jsonify({'ok': False, 'error': 'no_changes'}), 404
+    pending = data.get('pending') or []
+    matched = next((c for c in pending if c.get('datum') == datum), None)
+    if not matched:
+        return jsonify({'ok': False, 'error': 'change_not_found'}), 404
+    matched['decision'] = decision
+    matched['decided_at'] = datetime.now().isoformat()
+    matched['status'] = decision + 'ed'
+    data['pending'] = [c for c in pending if c.get('datum') != datum]
+    history = data.get('history') or []
+    history.append(matched)
+    data['history'] = history
+    try:
+        with open(cp, 'w') as f: json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True})
+
+
+# ─── Crash-Reporting Endpoint ───────────────────────────────────────────────
+
+@app.route('/api/crash-report', methods=['POST'])
+def post_crash_report():
+    """Empfängt Crash-Reports vom iOS-Client. Speichert in JSON-Log.
+    Body: {token?, error_type, message, stack, device, ios, app_version, build, ts}
+    """
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({'ok': False, 'error': 'body_must_be_object'}), 400
+    if len(json.dumps(body)) > 32_000:
+        return jsonify({'ok': False, 'error': 'payload_too_large'}), 413
+    import os
+    crash_dir = os.path.join(_USER_HISTORY_DIR, 'crashes')
+    os.makedirs(crash_dir, exist_ok=True)
+    fname = f'crash_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}.json'
+    try:
+        body['received_at'] = datetime.now().isoformat()
+        with open(os.path.join(crash_dir, fname), 'w') as f:
+            json.dump(body, f, ensure_ascii=False)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True})
+
+
+# ─── Voice-Notes Storage (Per-Day Audio) ────────────────────────────────────
+
+def _voice_note_path(token, datum):
+    import os, re
+    if not token: return None
+    safe_t = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+    safe_d = re.sub(r'[^0-9-]', '', datum or '')[:10]
+    if not safe_t or not safe_d: return None
+    voice_dir = os.path.join(_USER_HISTORY_DIR, 'voice_notes', safe_t)
+    os.makedirs(voice_dir, exist_ok=True)
+    return os.path.join(voice_dir, f'{safe_d}.m4a')
+
+
+@app.route('/api/user/voice-note/<token>/<datum>', methods=['POST'])
+def upload_voice_note(token, datum):
+    """Upload M4A Voice-Note für einen Flugtag. Max 60s / 2 MB."""
+    p = _voice_note_path(token, datum)
+    if not p: return jsonify({'ok': False, 'error': 'invalid_path'}), 400
+    audio = request.files.get('audio')
+    if not audio:
+        return jsonify({'ok': False, 'error': 'no_audio_file'}), 400
+    data = audio.read()
+    if len(data) > 2 * 1024 * 1024:
+        return jsonify({'ok': False, 'error': 'audio_too_large'}), 413
+    try:
+        with open(p, 'wb') as f: f.write(data)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True, 'datum': datum, 'size_kb': len(data) // 1024})
+
+
+@app.route('/api/user/voice-note/<token>/<datum>', methods=['GET'])
+def get_voice_note(token, datum):
+    p = _voice_note_path(token, datum)
+    if not p: return jsonify({'error':'invalid_path'}), 400
+    import os
+    if not os.path.exists(p):
+        return jsonify({'error': 'not_found'}), 404
+    from flask import send_file
+    return send_file(p, mimetype='audio/mp4')
+
+
+@app.route('/api/user/voice-note/<token>/<datum>', methods=['DELETE'])
+def delete_voice_note(token, datum):
+    p = _voice_note_path(token, datum)
+    if not p: return jsonify({'ok': False, 'error':'invalid_path'}), 400
+    import os
+    try:
+        if os.path.exists(p): os.remove(p)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True})
+
+
+@app.route('/api/user/voice-note/<token>', methods=['GET'])
+def list_voice_notes(token):
+    """Liste aller voice-note-Tage für User."""
+    import os, re
+    safe_t = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    if not safe_t: return jsonify({'error':'invalid token'}), 400
+    voice_dir = os.path.join(_USER_HISTORY_DIR, 'voice_notes', safe_t)
+    if not os.path.isdir(voice_dir):
+        return jsonify({'dates': []})
+    dates = sorted([f.replace('.m4a','') for f in os.listdir(voice_dir) if f.endswith('.m4a')])
+    return jsonify({'dates': dates, 'count': len(dates)})
+
+
+# ─── Crew Chat Messages (HTTP-Polling-Fallback; WebSocket optional) ─────────
+# Keep API simple: messages stored per-channel. Channel = sorted(token1, token2) für DMs
+# oder explicit group_id für Group-Chats.
+
+def _chat_path(channel_id):
+    import os, re
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', channel_id or '')[:128]
+    if not safe: return None
+    chat_dir = os.path.join(_USER_HISTORY_DIR, 'chat')
+    os.makedirs(chat_dir, exist_ok=True)
+    return os.path.join(chat_dir, f'{safe}.json')
+
+
+def _dm_channel(token_a, token_b):
+    import re
+    a = re.sub(r'[^A-Za-z0-9_-]', '', token_a or '')[:64]
+    b = re.sub(r'[^A-Za-z0-9_-]', '', token_b or '')[:64]
+    if not a or not b: return None
+    return 'dm__' + '__'.join(sorted([a, b]))
+
+
+@app.route('/api/crew-chat/<token>/channel/<channel_id>', methods=['GET'])
+def get_chat_messages(token, channel_id):
+    """Liefert Messages für Channel. Query: ?since_ts=epoch (nur neuere)."""
+    p = _chat_path(channel_id)
+    if not p: return jsonify({'error':'invalid_channel'}), 400
+    try:
+        with open(p) as f: data = json.load(f)
+    except FileNotFoundError:
+        data = {'messages': []}
+    msgs = data.get('messages') or []
+    since = float(request.args.get('since_ts') or 0)
+    if since:
+        msgs = [m for m in msgs if (m.get('ts') or 0) > since]
+    return jsonify({'channel': channel_id, 'messages': msgs[-100:]})
+
+
+@app.route('/api/crew-chat/<token>/channel/<channel_id>/send', methods=['POST'])
+def send_chat_message(token, channel_id):
+    """Body: {text}. Author = token."""
+    body = request.get_json(silent=True) or {}
+    text = (body.get('text') or '').strip()
+    if not text: return jsonify({'ok': False, 'error': 'empty_text'}), 400
+    if len(text) > 2000: return jsonify({'ok': False, 'error': 'text_too_long'}), 413
+    p = _chat_path(channel_id)
+    if not p: return jsonify({'ok': False, 'error': 'invalid_channel'}), 400
+    import uuid, time
+    try:
+        try:
+            with open(p) as f: data = json.load(f)
+        except FileNotFoundError:
+            data = {'messages': []}
+        msg = {
+            'id': str(uuid.uuid4())[:12],
+            'author_token': token[:16] + '…',
+            'text': text,
+            'ts': time.time(),
+            'iso': datetime.now().isoformat(),
+        }
+        msgs = (data.get('messages') or []) + [msg]
+        data['messages'] = msgs[-500:]  # cap to last 500
+        with open(p, 'w') as f: json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True, 'message': msg})
+
+
+@app.route('/api/crew-chat/<token>/dm/<friend_token>', methods=['GET'])
+def get_dm(token, friend_token):
+    """Convenience-Wrapper für 1:1 DMs."""
+    ch = _dm_channel(token, friend_token)
+    if not ch: return jsonify({'error':'invalid_tokens'}), 400
+    return get_chat_messages(token, ch)
+
+
+@app.route('/api/crew-chat/<token>/dm/<friend_token>/send', methods=['POST'])
+def send_dm(token, friend_token):
+    ch = _dm_channel(token, friend_token)
+    if not ch: return jsonify({'ok': False, 'error':'invalid_tokens'}), 400
+    return send_chat_message(token, ch)
+
+
+# ─── Social Wall: Posts / Likes / Comments ──────────────────────────────────
+
+def _wall_dir():
+    import os
+    d = os.path.join(_USER_HISTORY_DIR, 'wall')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _wall_posts_path():
+    import os
+    return os.path.join(_wall_dir(), 'posts.json')
+
+def _wall_likes_path(token):
+    import os, re
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    return os.path.join(_wall_dir(), f'likes_{safe}.json') if safe else None
+
+def _wall_comments_path(post_id):
+    import os, re
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', post_id or '')[:32]
+    return os.path.join(_wall_dir(), f'comments_{safe}.json') if safe else None
+
+def _wall_load_posts():
+    p = _wall_posts_path()
+    try:
+        with open(p) as f: return json.load(f) or []
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+def _wall_save_posts(posts):
+    p = _wall_posts_path()
+    # Cap to last 5000 posts global
+    posts = posts[-5000:]
+    with open(p, 'w') as f: json.dump(posts, f, ensure_ascii=False)
+
+
+@app.route('/api/wall/<token>/upload-image', methods=['POST'])
+def upload_wall_image(token):
+    """Upload Bild für Wall-Post. Returns {url} zum nachträglichen Einbetten in /post."""
+    img = request.files.get('image')
+    if not img:
+        return jsonify({'ok': False, 'error': 'no_image'}), 400
+    data = img.read()
+    if len(data) > 5 * 1024 * 1024:
+        return jsonify({'ok': False, 'error': 'too_large_5mb'}), 413
+    import os, re, uuid
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    if not safe:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    img_dir = os.path.join(_USER_HISTORY_DIR, 'wall_images', safe)
+    os.makedirs(img_dir, exist_ok=True)
+    ext = '.jpg'
+    name = img.filename or ''
+    if name.lower().endswith('.png'): ext = '.png'
+    elif name.lower().endswith('.heic'): ext = '.heic'
+    fname = f'{uuid.uuid4().hex[:12]}{ext}'
+    try:
+        with open(os.path.join(img_dir, fname), 'wb') as f:
+            f.write(data)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True, 'url': f'/api/wall/image/{safe}/{fname}'})
+
+
+@app.route('/api/wall/image/<token_safe>/<fname>', methods=['GET'])
+def serve_wall_image(token_safe, fname):
+    """Serve uploaded image — public (kein Auth da im Feed-Kontext zugänglich)."""
+    import os, re
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '', fname or '')
+    safe_t = re.sub(r'[^A-Za-z0-9_-]', '', token_safe or '')[:64]
+    if not safe or not safe_t:
+        return jsonify({'error': 'invalid'}), 400
+    path = os.path.join(_USER_HISTORY_DIR, 'wall_images', safe_t, safe)
+    if not os.path.exists(path):
+        return jsonify({'error': 'not_found'}), 404
+    from flask import send_file
+    mime = 'image/jpeg'
+    if safe.lower().endswith('.png'): mime = 'image/png'
+    elif safe.lower().endswith('.heic'): mime = 'image/heic'
+    return send_file(path, mimetype=mime)
+
+
+@app.route('/api/wall/<token>/post', methods=['POST'])
+def create_wall_post(token):
+    """Body: {text, image_url?, layover_iata?}. Author = token."""
+    body = request.get_json(silent=True) or {}
+    text = (body.get('text') or '').strip()
+    image_url = (body.get('image_url') or '').strip() or None
+    layover = (body.get('layover_iata') or '').strip().upper() or None
+    if not text and not image_url:
+        return jsonify({'ok': False, 'error': 'empty_post'}), 400
+    if len(text) > 2000:
+        return jsonify({'ok': False, 'error': 'text_too_long'}), 413
+    import uuid, time
+    post = {
+        'id': str(uuid.uuid4())[:12],
+        'author_token': token,
+        'author_short': token[:8],
+        'text': text,
+        'image_url': image_url,
+        'layover_iata': layover if layover and len(layover) == 3 else None,
+        'created_at': datetime.now().isoformat(),
+        'ts': time.time(),
+        'like_count': 0,
+        'comment_count': 0,
+    }
+    # Add author profile snapshot
+    try:
+        with open(_user_profile_path(token)) as f:
+            pr = json.load(f).get('profile', {})
+        post['author_name'] = pr.get('name')
+        post['author_airline'] = pr.get('airline')
+        post['author_homebase'] = pr.get('homebase')
+    except Exception:
+        pass
+    posts = _wall_load_posts()
+    posts.append(post)
+    _wall_save_posts(posts)
+    return jsonify({'ok': True, 'post': post})
+
+
+@app.route('/api/wall/<token>/feed', methods=['GET'])
+def get_wall_feed(token):
+    """Feed = eigene Posts + Posts von Friends. Query: ?limit=30&before_ts=…"""
+    limit = min(int(request.args.get('limit') or 30), 100)
+    before_ts = float(request.args.get('before_ts') or 0)
+    friends = set((_friends_load(token).get('friends') or []))
+    friends.add(token)
+    posts = _wall_load_posts()
+    feed = [p for p in posts if p.get('author_token') in friends]
+    feed.sort(key=lambda p: -(p.get('ts') or 0))
+    if before_ts > 0:
+        feed = [p for p in feed if (p.get('ts') or 0) < before_ts]
+    feed = feed[:limit]
+    # Add liked-by-me flag
+    likes_p = _wall_likes_path(token)
+    liked_ids = set()
+    if likes_p:
+        try:
+            with open(likes_p) as f: liked_ids = set(json.load(f) or [])
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    for p in feed:
+        p['liked_by_me'] = p['id'] in liked_ids
+        # Strip author_token for privacy in feed
+        p.pop('author_token', None)
+    return jsonify({'count': len(feed), 'posts': feed})
+
+
+@app.route('/api/wall/<token>/like/<post_id>', methods=['POST'])
+def toggle_like(token, post_id):
+    """Toggle like on a post. Returns new like_count + liked_by_me."""
+    likes_p = _wall_likes_path(token)
+    if not likes_p: return jsonify({'ok': False, 'error':'invalid_token'}), 400
+    try:
+        with open(likes_p) as f: liked = set(json.load(f) or [])
+    except FileNotFoundError:
+        liked = set()
+    except Exception:
+        liked = set()
+    delta = 0
+    if post_id in liked:
+        liked.remove(post_id); delta = -1
+        liked_by_me = False
+    else:
+        liked.add(post_id); delta = +1
+        liked_by_me = True
+    with open(likes_p, 'w') as f: json.dump(list(liked), f)
+    posts = _wall_load_posts()
+    new_count = 0
+    for p in posts:
+        if p.get('id') == post_id:
+            p['like_count'] = max(0, (p.get('like_count') or 0) + delta)
+            new_count = p['like_count']
+            break
+    _wall_save_posts(posts)
+    return jsonify({'ok': True, 'like_count': new_count, 'liked_by_me': liked_by_me})
+
+
+@app.route('/api/wall/<token>/post/<post_id>/comment', methods=['POST'])
+def add_comment(token, post_id):
+    body = request.get_json(silent=True) or {}
+    text = (body.get('text') or '').strip()
+    if not text: return jsonify({'ok': False, 'error': 'empty_comment'}), 400
+    if len(text) > 500: return jsonify({'ok': False, 'error': 'too_long'}), 413
+    cp = _wall_comments_path(post_id)
+    if not cp: return jsonify({'ok': False, 'error': 'invalid_post'}), 400
+    import uuid
+    try:
+        with open(cp) as f: comments = json.load(f) or []
+    except FileNotFoundError:
+        comments = []
+    name = ''
+    try:
+        with open(_user_profile_path(token)) as f:
+            name = json.load(f).get('profile', {}).get('name', '') or ''
+    except Exception:
+        pass
+    c = {
+        'id': str(uuid.uuid4())[:10],
+        'author_short': token[:8],
+        'author_name': name,
+        'text': text,
+        'created_at': datetime.now().isoformat(),
+    }
+    comments.append(c)
+    with open(cp, 'w') as f: json.dump(comments[-200:], f, ensure_ascii=False)
+    # Bump comment_count on post
+    posts = _wall_load_posts()
+    for p in posts:
+        if p.get('id') == post_id:
+            p['comment_count'] = (p.get('comment_count') or 0) + 1
+            break
+    _wall_save_posts(posts)
+    return jsonify({'ok': True, 'comment': c})
+
+
+@app.route('/api/wall/<token>/post/<post_id>/comments', methods=['GET'])
+def get_comments(token, post_id):
+    cp = _wall_comments_path(post_id)
+    if not cp: return jsonify({'comments': []})
+    try:
+        with open(cp) as f: comments = json.load(f) or []
+    except FileNotFoundError:
+        comments = []
+    return jsonify({'post_id': post_id, 'comments': comments})
+
+
+@app.route('/api/wall/<token>/post/<post_id>', methods=['DELETE'])
+def delete_wall_post(token, post_id):
+    """Nur Author darf löschen."""
+    posts = _wall_load_posts()
+    new_posts = [p for p in posts if not (p.get('id') == post_id and p.get('author_token') == token)]
+    if len(new_posts) == len(posts):
+        return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
+    _wall_save_posts(new_posts)
+    # Auch Comments-File löschen
+    cp = _wall_comments_path(post_id)
+    if cp:
+        try:
+            import os; os.remove(cp)
+        except Exception:
+            pass
+    return jsonify({'ok': True})
+
+
+# ─── Crew Forum (Themen-Foren) ──────────────────────────────────────────────
+# Kategorien: cabin | cockpit | general | pay | standby | layover
+FORUM_CATEGORIES = {'cabin', 'cockpit', 'general', 'pay', 'standby', 'layover'}
+FORUM_HASHTAG_RE = re.compile(r'#([\wÀ-ſ]{2,32})', re.UNICODE)
+
+
+def _forum_dir():
+    import os
+    d = os.path.join(_USER_HISTORY_DIR, 'forum')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _forum_threads_path():
+    import os
+    return os.path.join(_forum_dir(), 'threads.json')
+
+
+def _forum_replies_path(thread_id):
+    import os
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', thread_id or '')[:32]
+    return os.path.join(_forum_dir(), f'replies_{safe}.json') if safe else None
+
+
+def _forum_likes_path(token):
+    import os
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    return os.path.join(_forum_dir(), f'likes_{safe}.json') if safe else None
+
+
+def _forum_load_threads():
+    p = _forum_threads_path()
+    try:
+        with open(p) as f:
+            return json.load(f) or []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    except Exception:
+        return []
+
+
+def _forum_save_threads(threads):
+    p = _forum_threads_path()
+    # Cap to last 10000 threads
+    threads = threads[-10000:]
+    with open(p, 'w') as f:
+        json.dump(threads, f, ensure_ascii=False)
+
+
+def _forum_load_replies(thread_id):
+    p = _forum_replies_path(thread_id)
+    if not p:
+        return []
+    try:
+        with open(p) as f:
+            return json.load(f) or []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    except Exception:
+        return []
+
+
+def _forum_save_replies(thread_id, replies):
+    p = _forum_replies_path(thread_id)
+    if not p:
+        return
+    # Cap per-thread
+    replies = replies[-2000:]
+    with open(p, 'w') as f:
+        json.dump(replies, f, ensure_ascii=False)
+
+
+def _forum_load_likes(token):
+    p = _forum_likes_path(token)
+    if not p:
+        return {'threads': set(), 'replies': set()}
+    try:
+        with open(p) as f:
+            data = json.load(f) or {}
+        return {
+            'threads': set(data.get('threads') or []),
+            'replies': set(data.get('replies') or []),
+        }
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {'threads': set(), 'replies': set()}
+    except Exception:
+        return {'threads': set(), 'replies': set()}
+
+
+def _forum_save_likes(token, likes):
+    p = _forum_likes_path(token)
+    if not p:
+        return
+    data = {'threads': list(likes.get('threads') or []),
+            'replies': list(likes.get('replies') or [])}
+    with open(p, 'w') as f:
+        json.dump(data, f)
+
+
+def _forum_author_snapshot(token):
+    """Returns dict with author_name / author_role / author_airline / author_homebase from profile."""
+    try:
+        with open(_user_profile_path(token)) as f:
+            pr = json.load(f).get('profile', {})
+        return {
+            'author_name': pr.get('name') or '',
+            'author_role': pr.get('role') or pr.get('position') or '',
+            'author_airline': pr.get('airline') or '',
+            'author_homebase': pr.get('homebase') or '',
+        }
+    except Exception:
+        return {'author_name': '', 'author_role': '', 'author_airline': '', 'author_homebase': ''}
+
+
+@app.route('/api/forum/<token>/threads', methods=['GET'])
+def forum_list_threads(token):
+    """Query: ?category=cabin&sort=hot|new|active&limit=50"""
+    category = (request.args.get('category') or '').strip().lower()
+    sort = (request.args.get('sort') or 'active').strip().lower()
+    limit = min(int(request.args.get('limit') or 50), 200)
+
+    import time
+    threads = _forum_load_threads()
+    if category and category in FORUM_CATEGORIES:
+        threads = [t for t in threads if t.get('category_id') == category]
+
+    # Sort
+    now = time.time()
+    if sort == 'new':
+        threads.sort(key=lambda t: -(t.get('created_ts') or 0))
+    elif sort == 'hot':
+        # Hot = (likes + replies*2) / age_hours^1.5
+        def hot_score(t):
+            age_h = max(1.0, (now - (t.get('created_ts') or now)) / 3600.0)
+            engagement = (t.get('like_count') or 0) + (t.get('reply_count') or 0) * 2
+            return -(engagement / (age_h ** 1.5))
+        threads.sort(key=hot_score)
+    else:  # active = last activity
+        threads.sort(key=lambda t: -((t.get('last_reply_ts') or t.get('created_ts') or 0)))
+
+    threads = threads[:limit]
+
+    # Add liked_by_me
+    likes = _forum_load_likes(token)
+    for t in threads:
+        t['liked_by_me'] = t.get('id') in likes['threads']
+        # Strip author_token from public response
+        t.pop('author_token', None)
+    return jsonify({'count': len(threads), 'threads': threads})
+
+
+@app.route('/api/forum/<token>/threads', methods=['POST'])
+def forum_create_thread(token):
+    """Body: {category_id, title, body, image_url?, gif_url?, hashtags?}"""
+    body = request.get_json(silent=True) or {}
+    category = (body.get('category_id') or '').strip().lower()
+    title = (body.get('title') or '').strip()
+    text = (body.get('body') or '').strip()
+    image_url = (body.get('image_url') or '').strip() or None
+    gif_url = (body.get('gif_url') or '').strip() or None
+    explicit_tags = body.get('hashtags') or []
+
+    if category not in FORUM_CATEGORIES:
+        return jsonify({'ok': False, 'error': 'invalid_category'}), 400
+    if not title:
+        return jsonify({'ok': False, 'error': 'empty_title'}), 400
+    if len(title) > 200:
+        return jsonify({'ok': False, 'error': 'title_too_long'}), 413
+    if not text and not image_url:
+        return jsonify({'ok': False, 'error': 'empty_body'}), 400
+    if len(text) > 5000:
+        return jsonify({'ok': False, 'error': 'body_too_long'}), 413
+
+    # Extract hashtags from title + body, merge with explicit
+    auto_tags = set()
+    for m in FORUM_HASHTAG_RE.finditer(title + ' ' + text):
+        auto_tags.add(m.group(1).lower())
+    for t in explicit_tags:
+        if isinstance(t, str):
+            tag = t.strip().lstrip('#').lower()
+            if 2 <= len(tag) <= 32:
+                auto_tags.add(tag)
+    hashtags = sorted(auto_tags)[:20]
+
+    import uuid, time
+    thread = {
+        'id': str(uuid.uuid4())[:12],
+        'category_id': category,
+        'author_token': token,
+        'author_short': token[:8],
+        'title': title,
+        'body': text,
+        'image_url': image_url,
+        'gif_url': gif_url,
+        'hashtags': hashtags,
+        'created_at': datetime.now().isoformat(),
+        'created_ts': time.time(),
+        'like_count': 0,
+        'reply_count': 0,
+        'last_reply_ts': None,
+    }
+    thread.update(_forum_author_snapshot(token))
+
+    threads = _forum_load_threads()
+    threads.append(thread)
+    _forum_save_threads(threads)
+
+    # Return without author_token
+    response_thread = dict(thread)
+    response_thread.pop('author_token', None)
+    response_thread['liked_by_me'] = False
+    return jsonify({'ok': True, 'thread': response_thread})
+
+
+@app.route('/api/forum/<token>/threads/<thread_id>', methods=['DELETE'])
+def forum_delete_thread(token, thread_id):
+    threads = _forum_load_threads()
+    new_threads = [t for t in threads if not (t.get('id') == thread_id and t.get('author_token') == token)]
+    if len(new_threads) == len(threads):
+        return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
+    _forum_save_threads(new_threads)
+    # Delete replies file
+    rp = _forum_replies_path(thread_id)
+    if rp:
+        try:
+            import os
+            os.remove(rp)
+        except Exception:
+            pass
+    return jsonify({'ok': True})
+
+
+@app.route('/api/forum/<token>/threads/<thread_id>/like', methods=['POST'])
+def forum_toggle_thread_like(token, thread_id):
+    likes = _forum_load_likes(token)
+    threads = _forum_load_threads()
+    target = next((t for t in threads if t.get('id') == thread_id), None)
+    if not target:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    if thread_id in likes['threads']:
+        likes['threads'].discard(thread_id)
+        target['like_count'] = max(0, (target.get('like_count') or 0) - 1)
+        liked_by_me = False
+    else:
+        likes['threads'].add(thread_id)
+        target['like_count'] = (target.get('like_count') or 0) + 1
+        liked_by_me = True
+    _forum_save_likes(token, likes)
+    _forum_save_threads(threads)
+    return jsonify({'ok': True, 'like_count': target['like_count'], 'liked_by_me': liked_by_me})
+
+
+@app.route('/api/forum/<token>/threads/<thread_id>/replies', methods=['GET'])
+def forum_list_replies(token, thread_id):
+    replies = _forum_load_replies(thread_id)
+    likes = _forum_load_likes(token)
+    for r in replies:
+        r['liked_by_me'] = r.get('id') in likes['replies']
+        r.pop('author_token', None)
+    replies.sort(key=lambda r: (r.get('created_ts') or 0))
+    return jsonify({'thread_id': thread_id, 'count': len(replies), 'replies': replies})
+
+
+@app.route('/api/forum/<token>/threads/<thread_id>/reply', methods=['POST'])
+def forum_create_reply(token, thread_id):
+    """Body: {body, image_url?, gif_url?, parent_reply_id?, mentioned_token?}"""
+    body = request.get_json(silent=True) or {}
+    text = (body.get('body') or '').strip()
+    image_url = (body.get('image_url') or '').strip() or None
+    gif_url = (body.get('gif_url') or '').strip() or None
+    parent_reply_id = (body.get('parent_reply_id') or '').strip() or None
+    mentioned_token = (body.get('mentioned_token') or '').strip() or None
+
+    if not text and not image_url:
+        return jsonify({'ok': False, 'error': 'empty_reply'}), 400
+    if len(text) > 3000:
+        return jsonify({'ok': False, 'error': 'too_long'}), 413
+
+    threads = _forum_load_threads()
+    target = next((t for t in threads if t.get('id') == thread_id), None)
+    if not target:
+        return jsonify({'ok': False, 'error': 'thread_not_found'}), 404
+
+    import uuid, time
+    reply = {
+        'id': str(uuid.uuid4())[:10],
+        'thread_id': thread_id,
+        'author_token': token,
+        'author_short': token[:8],
+        'body': text,
+        'image_url': image_url,
+        'gif_url': gif_url,
+        'parent_reply_id': parent_reply_id,
+        'mentioned_token': mentioned_token,
+        'created_at': datetime.now().isoformat(),
+        'created_ts': time.time(),
+        'like_count': 0,
+    }
+    reply.update(_forum_author_snapshot(token))
+    # Add mentioned-user name snapshot (so UI can show "@Maria K." even after token is gone)
+    if mentioned_token:
+        try:
+            with open(_user_profile_path(mentioned_token)) as f:
+                m_pr = json.load(f).get('profile', {})
+            reply['mentioned_name'] = m_pr.get('name') or ''
+        except Exception:
+            reply['mentioned_name'] = ''
+
+    replies = _forum_load_replies(thread_id)
+    replies.append(reply)
+    _forum_save_replies(thread_id, replies)
+
+    # Bump reply_count + last_reply_ts on thread
+    target['reply_count'] = (target.get('reply_count') or 0) + 1
+    target['last_reply_ts'] = reply['created_ts']
+    _forum_save_threads(threads)
+
+    response_reply = dict(reply)
+    response_reply.pop('author_token', None)
+    response_reply['liked_by_me'] = False
+    return jsonify({'ok': True, 'reply': response_reply})
+
+
+@app.route('/api/forum/<token>/replies/<reply_id>', methods=['DELETE'])
+def forum_delete_reply(token, reply_id):
+    """Search all reply files for the reply — expensive but okay for current scale."""
+    import os
+    forum_d = _forum_dir()
+    deleted = False
+    parent_thread_id = None
+    for fname in os.listdir(forum_d):
+        if not fname.startswith('replies_'):
+            continue
+        try:
+            with open(os.path.join(forum_d, fname)) as f:
+                arr = json.load(f) or []
+        except Exception:
+            continue
+        new_arr = [r for r in arr if not (r.get('id') == reply_id and r.get('author_token') == token)]
+        if len(new_arr) != len(arr):
+            deleted = True
+            parent_thread_id = arr[0].get('thread_id') if arr else None
+            with open(os.path.join(forum_d, fname), 'w') as f:
+                json.dump(new_arr, f, ensure_ascii=False)
+            break
+    if not deleted:
+        return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
+
+    # Decrement reply_count on parent thread
+    if parent_thread_id:
+        threads = _forum_load_threads()
+        for t in threads:
+            if t.get('id') == parent_thread_id:
+                t['reply_count'] = max(0, (t.get('reply_count') or 0) - 1)
+                break
+        _forum_save_threads(threads)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/forum/<token>/replies/<reply_id>/like', methods=['POST'])
+def forum_toggle_reply_like(token, reply_id):
+    """Search reply files for reply_id (linear)."""
+    import os
+    forum_d = _forum_dir()
+    target_fname = None
+    target_reply = None
+    for fname in os.listdir(forum_d):
+        if not fname.startswith('replies_'):
+            continue
+        try:
+            with open(os.path.join(forum_d, fname)) as f:
+                arr = json.load(f) or []
+        except Exception:
+            continue
+        for r in arr:
+            if r.get('id') == reply_id:
+                target_fname = fname
+                target_reply = r
+                target_list = arr
+                break
+        if target_reply:
+            break
+    if not target_reply:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+
+    likes = _forum_load_likes(token)
+    if reply_id in likes['replies']:
+        likes['replies'].discard(reply_id)
+        target_reply['like_count'] = max(0, (target_reply.get('like_count') or 0) - 1)
+        liked_by_me = False
+    else:
+        likes['replies'].add(reply_id)
+        target_reply['like_count'] = (target_reply.get('like_count') or 0) + 1
+        liked_by_me = True
+    _forum_save_likes(token, likes)
+    with open(os.path.join(forum_d, target_fname), 'w') as f:
+        json.dump(target_list, f, ensure_ascii=False)
+    return jsonify({'ok': True, 'like_count': target_reply['like_count'], 'liked_by_me': liked_by_me})
+
+
+@app.route('/api/forum/<token>/trending', methods=['GET'])
+def forum_trending_hashtags(token):
+    """Top hashtags in threads created in last 7 days."""
+    import time
+    from collections import Counter
+    threads = _forum_load_threads()
+    cutoff = time.time() - 7 * 86400
+    counter = Counter()
+    for t in threads:
+        if (t.get('created_ts') or 0) < cutoff:
+            continue
+        for tag in (t.get('hashtags') or []):
+            counter[tag] += 1
+    top = [{'tag': k, 'count': v} for k, v in counter.most_common(15)]
+    return jsonify({'count': len(top), 'tags': top})
+
+
+# ─── Crew Layover Recommendations (per Airport) ─────────────────────────────
+# Kategorien: food | sight | sleep | gym | transport | nightlife | shopping
+LAYOVER_CATEGORIES = {'food','sight','sleep','gym','transport','nightlife','shopping','coffee','other'}
+
+def _recs_dir():
+    import os
+    d = os.path.join(_USER_HISTORY_DIR, 'layover_recs')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _recs_path(iata):
+    import os, re
+    safe = re.sub(r'[^A-Z]', '', (iata or '').upper())[:3]
+    if len(safe) != 3: return None
+    return os.path.join(_recs_dir(), f'{safe}.json')
+
+def _votes_path(token):
+    import os, re
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    if not safe: return None
+    return os.path.join(_recs_dir(), f'votes_{safe}.json')
+
+
+@app.route('/api/layover-recs/<iata>', methods=['GET'])
+def get_layover_recs(iata):
+    """Liefert alle Recs für Airport, sortiert nach vote_score absteigend.
+    Query: ?category=food → filter; ?token=… → markiert eigene Votes.
+    """
+    rp = _recs_path(iata)
+    if not rp: return jsonify({'error': 'invalid_iata'}), 400
+    try:
+        with open(rp) as f: recs = json.load(f) or []
+    except FileNotFoundError:
+        recs = []
+    cat = (request.args.get('category') or '').lower()
+    if cat and cat in LAYOVER_CATEGORIES:
+        recs = [r for r in recs if r.get('category') == cat]
+    recs.sort(key=lambda r: -(r.get('vote_score') or 0))
+    # Apply voted-by-me
+    token = request.args.get('token') or ''
+    voted = {}
+    if token:
+        vp = _votes_path(token)
+        if vp:
+            try:
+                with open(vp) as f: voted = json.load(f) or {}
+            except FileNotFoundError:
+                voted = {}
+            except Exception:
+                voted = {}
+    for r in recs:
+        r['my_vote'] = voted.get(r.get('id'), 0)
+    return jsonify({'iata': iata.upper(), 'count': len(recs), 'recs': recs})
+
+
+@app.route('/api/layover-recs/<token>/add', methods=['POST'])
+def add_layover_rec(token):
+    """Body: {iata, category, title, description, rating, price_band, location_hint?}"""
+    body = request.get_json(silent=True) or {}
+    iata = (body.get('iata') or '').strip().upper()
+    cat = (body.get('category') or 'other').lower()
+    title = (body.get('title') or '').strip()
+    desc = (body.get('description') or '').strip()
+    rating = body.get('rating')
+    price = (body.get('price_band') or '').strip()
+    location_hint = (body.get('location_hint') or '').strip()[:200]
+    if len(iata) != 3: return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
+    if cat not in LAYOVER_CATEGORIES: cat = 'other'
+    if not title or len(title) > 120: return jsonify({'ok': False, 'error': 'invalid_title'}), 400
+    if len(desc) > 800: return jsonify({'ok': False, 'error': 'desc_too_long'}), 413
+    try:
+        rating_n = int(rating) if rating is not None else 0
+        rating_n = max(0, min(5, rating_n))
+    except Exception:
+        rating_n = 0
+    if price not in ('€','€€','€€€','€€€€',''):
+        price = ''
+    rp = _recs_path(iata)
+    if not rp: return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
+    import uuid, time
+    rec = {
+        'id': str(uuid.uuid4())[:12],
+        'iata': iata,
+        'category': cat,
+        'title': title[:120],
+        'description': desc,
+        'rating': rating_n,
+        'price_band': price,
+        'location_hint': location_hint,
+        'author_short': token[:8],
+        'created_at': datetime.now().isoformat(),
+        'ts': time.time(),
+        'vote_score': 1,  # Author auto-up-votes
+        'vote_count': 1,
+    }
+    # Author profile snapshot
+    try:
+        with open(_user_profile_path(token)) as f:
+            pr = json.load(f).get('profile', {})
+        rec['author_name'] = pr.get('name')
+        rec['author_airline'] = pr.get('airline')
+    except Exception:
+        pass
+    try:
+        with open(rp) as f: recs = json.load(f) or []
+    except FileNotFoundError:
+        recs = []
+    recs.append(rec)
+    with open(rp, 'w') as f: json.dump(recs[-500:], f, ensure_ascii=False)
+    # Auto-record author's +1 vote
+    vp = _votes_path(token)
+    if vp:
+        try:
+            with open(vp) as f: votes = json.load(f) or {}
+        except FileNotFoundError:
+            votes = {}
+        except Exception:
+            votes = {}
+        votes[rec['id']] = 1
+        with open(vp, 'w') as f: json.dump(votes, f)
+    return jsonify({'ok': True, 'rec': rec})
+
+
+@app.route('/api/layover-recs/<token>/vote/<rec_id>', methods=['POST'])
+def vote_layover_rec(token, rec_id):
+    """Body: {direction: 1 (up) | -1 (down) | 0 (clear)}"""
+    body = request.get_json(silent=True) or {}
+    try:
+        direction = int(body.get('direction') or 0)
+    except Exception:
+        direction = 0
+    if direction not in (-1, 0, 1):
+        return jsonify({'ok': False, 'error':'invalid_direction'}), 400
+    # Find rec across all airport files
+    import os
+    rdir = _recs_dir()
+    vp = _votes_path(token)
+    if not vp: return jsonify({'ok': False, 'error':'invalid_token'}), 400
+    try:
+        with open(vp) as f: votes = json.load(f) or {}
+    except FileNotFoundError:
+        votes = {}
+    except Exception:
+        votes = {}
+    prev = int(votes.get(rec_id) or 0)
+    delta = direction - prev
+    # Apply delta to the rec
+    found = False
+    new_score = 0
+    for fname in os.listdir(rdir):
+        if not fname.endswith('.json') or fname.startswith('votes_'): continue
+        path = os.path.join(rdir, fname)
+        try:
+            with open(path) as f: recs = json.load(f) or []
+        except Exception:
+            continue
+        modified = False
+        for r in recs:
+            if r.get('id') == rec_id:
+                r['vote_score'] = (r.get('vote_score') or 0) + delta
+                r['vote_count'] = max(0, (r.get('vote_count') or 0) + (1 if prev == 0 and direction != 0 else (-1 if direction == 0 and prev != 0 else 0)))
+                new_score = r['vote_score']
+                modified = True; found = True; break
+        if modified:
+            with open(path, 'w') as f: json.dump(recs, f, ensure_ascii=False)
+            break
+    if not found:
+        return jsonify({'ok': False, 'error':'rec_not_found'}), 404
+    if direction == 0:
+        votes.pop(rec_id, None)
+    else:
+        votes[rec_id] = direction
+    with open(vp, 'w') as f: json.dump(votes, f)
+    return jsonify({'ok': True, 'vote_score': new_score, 'my_vote': direction})
+
+
+@app.route('/api/layover-recs/<token>/<rec_id>', methods=['DELETE'])
+def delete_layover_rec(token, rec_id):
+    """Author löscht eigene Empfehlung."""
+    import os
+    rdir = _recs_dir()
+    for fname in os.listdir(rdir):
+        if not fname.endswith('.json') or fname.startswith('votes_'): continue
+        path = os.path.join(rdir, fname)
+        try:
+            with open(path) as f: recs = json.load(f) or []
+        except Exception:
+            continue
+        new_recs = [r for r in recs if not (r.get('id') == rec_id and r.get('author_short') == token[:8])]
+        if len(new_recs) != len(recs):
+            with open(path, 'w') as f: json.dump(new_recs, f, ensure_ascii=False)
+            return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error':'not_found_or_not_author'}), 404
+
+
+# ─── LayoverRec Comments (per Rec) ──────────────────────────────────────────
+
+def _layover_comments_path(rec_id):
+    import os
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', rec_id or '')[:32]
+    return os.path.join(_recs_dir(), f'comments_{safe}.json') if safe else None
+
+
+def _layover_load_comments(rec_id):
+    p = _layover_comments_path(rec_id)
+    if not p: return []
+    try:
+        with open(p) as f: return json.load(f) or []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    except Exception:
+        return []
+
+
+def _layover_save_comments(rec_id, comments):
+    p = _layover_comments_path(rec_id)
+    if not p: return
+    comments = comments[-500:]
+    with open(p, 'w') as f: json.dump(comments, f, ensure_ascii=False)
+
+
+@app.route('/api/layover-recs/<token>/<rec_id>/comments', methods=['GET'])
+def layover_rec_get_comments(token, rec_id):
+    comments = _layover_load_comments(rec_id)
+    comments.sort(key=lambda c: (c.get('created_ts') or 0))
+    return jsonify({'rec_id': rec_id, 'count': len(comments), 'comments': comments})
+
+
+@app.route('/api/layover-recs/<token>/<rec_id>/comments', methods=['POST'])
+def layover_rec_add_comment(token, rec_id):
+    """Body: {body, image_url?, parent_comment_id?}"""
+    body = request.get_json(silent=True) or {}
+    text = (body.get('body') or '').strip()
+    image_url = (body.get('image_url') or '').strip() or None
+    parent_comment_id = (body.get('parent_comment_id') or '').strip() or None
+    if not text and not image_url:
+        return jsonify({'ok': False, 'error': 'empty'}), 400
+    if len(text) > 1500:
+        return jsonify({'ok': False, 'error': 'too_long'}), 413
+
+    import uuid, time
+    name = ''
+    try:
+        with open(_user_profile_path(token)) as f:
+            name = json.load(f).get('profile', {}).get('name') or ''
+    except Exception:
+        pass
+    comment = {
+        'id': str(uuid.uuid4())[:10],
+        'rec_id': rec_id,
+        'author_token': token,
+        'author_short': token[:8],
+        'author_name': name,
+        'body': text,
+        'image_url': image_url,
+        'parent_comment_id': parent_comment_id,
+        'created_at': datetime.now().isoformat(),
+        'created_ts': time.time(),
+    }
+    comments = _layover_load_comments(rec_id)
+    comments.append(comment)
+    _layover_save_comments(rec_id, comments)
+    response_c = dict(comment)
+    response_c.pop('author_token', None)
+    return jsonify({'ok': True, 'comment': response_c})
+
+
+@app.route('/api/layover-recs/<token>/<rec_id>/comments/<comment_id>', methods=['DELETE'])
+def layover_rec_delete_comment(token, rec_id, comment_id):
+    comments = _layover_load_comments(rec_id)
+    new_comments = [c for c in comments if not (c.get('id') == comment_id and c.get('author_token') == token)]
+    if len(new_comments) == len(comments):
+        return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
+    _layover_save_comments(rec_id, new_comments)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/layover-recs/discover/<token>', methods=['GET'])
+def discover_layover_recs(token):
+    """„Trending"-Recs für Layover-Airports der nächsten 4 Wochen des Users."""
+    sess = _store.get(token) or {}
+    rd = sess.get('result_data') or {}
+    tage = rd.get('_tage_detail') or []
+    from datetime import date as _date, timedelta as _td
+    today = _date.today()
+    horizon = today + _td(days=28)
+    upcoming_iatas = set()
+    for t in tage:
+        if not isinstance(t, dict): continue
+        try:
+            d = _date.fromisoformat(t.get('datum'))
+        except Exception:
+            continue
+        if not (today <= d <= horizon): continue
+        rf = t.get('reader_facts') or {}
+        lo = (rf.get('layover_ort') or '').upper().strip()
+        if lo and len(lo) == 3:
+            upcoming_iatas.add(lo)
+    import os
+    rdir = _recs_dir()
+    out = []
+    for iata in upcoming_iatas:
+        rp = _recs_path(iata)
+        if not rp: continue
+        try:
+            with open(rp) as f: recs = json.load(f) or []
+        except FileNotFoundError:
+            continue
+        top = sorted(recs, key=lambda r: -(r.get('vote_score') or 0))[:3]
+        if top:
+            out.append({'iata': iata, 'top_recs': top})
+    return jsonify({'upcoming_iatas': sorted(upcoming_iatas), 'recommendations': out})
+
+
 @app.route('/api/user/stats/<token>', methods=['GET'])
 def get_user_stats(token):
     """Aggregiert Statistik über jüngste Auswertung."""
@@ -24658,6 +26422,23 @@ def hybrid_analyze(form, files, job_id=None):
                 # CAS-Reader-Output: structured_days mit days[]
                 _cas_days_raw = list(cas_pre_read.get('structured_days', {}).get('days', [])
                                      or cas_pre_read.get('days', []) or [])
+            # Deterministischer CAS-Abgleich (Flag: AEROTAX_USE_CAS_RECONCILE).
+            # Korrigiert Flugnummern/Routing/overnight aus den HARTEN PDF-Fakten
+            # (cas_table_parser), bevor der Builder die Tage adaptiert. Defensiv:
+            # Flag aus / fremdes Layout / jeder Fehler → _cas_days_raw unverändert.
+            _cas_recon_audit = {'applied': False, 'reason': 'not_run'}
+            try:
+                from cas_integration import reconcile_cas_days
+                _cas_days_raw, _cas_recon_audit = reconcile_cas_days(
+                    cas_bytes_for_reconcile, _cas_days_raw, homebase,
+                )
+                if _cas_recon_audit.get('applied'):
+                    print(f"[cas-reconcile] {_cas_recon_audit.get('corrections_count', 0)} "
+                          f"Korrekturen, det_only={_cas_recon_audit.get('det_only_dates')}")
+            except Exception as _cr_exc:
+                print(f"[cas-reconcile] skipped: {type(_cr_exc).__name__}: {_cr_exc}")
+                _cas_recon_audit = {'applied': False, 'reason': 'wiring_error'}
+
             # R17 (2026-05-26) Bridge: Reader-Output-Format → Builder-Input-Format.
             # Ohne diese Bridge sieht der Builder keine starts_at_homebase, kein
             # has_fl, kein duty_duration_minutes, keine routing-Liste → tours=0.
@@ -24723,7 +26504,7 @@ def hybrid_analyze(form, files, job_id=None):
             }
             print(f"[normalized_tours] parallel audit: tours={len(_norm_tours)} "
                   f"z76_eur={_norm_result.z76_eur:.2f} vs legacy_z76_eur="
-                  f"{float(classification.get('vma_aus', 0) or 0):.2f}")
+                  f"{float((classification or {}).get('vma_aus', 0) or 0):.2f}")
 
             # R17 (2026-05-26) PRODUKTIV-SWITCH: wenn der Builder echte Touren
             # produziert hat (mind. 1 Tour), wird der finale Betrag aus dem
@@ -24862,14 +26643,21 @@ def hybrid_analyze(form, files, job_id=None):
         v2_pipe = classify_pipeline(
             _cas_days, se_rows=_se_rows, year=year, homebase=homebase,
             iata_to_bmf=IATA_TO_BMF, bmf_auslandj=_bmf_year_table,
-            user_settings=user_settings,
+            # FIX (2026-05-29): 'user_settings' war hier nicht definiert
+            # (_run_full_calculation hat kein settings-Arg) → NameError, der den
+            # parallelen classifier_v2-Audit still abbrach. Audit-only-Pfad,
+            # daher None (V2-Settings-Layer ist optional via **kwargs).
+            user_settings=None,
         )
-        # Diff gegen Legacy
-        legacy_z76 = float(classification.get('vma_aus', 0) or 0)
-        legacy_hotel = int(classification.get('hotel_naechte', 0) or 0)
-        legacy_fahrtage = int(classification.get('fahr_tage', 0) or 0)
-        legacy_arbeitstage = int(classification.get('arbeitstage', 0) or 0)
-        legacy_td = classification.get('tage_detail') or []
+        # Diff gegen Legacy. FIX (2026-05-29): classification kann None sein
+        # (z.B. CAS-Reader lieferte 0 Tage) → .get() crashte mit
+        # 'NoneType has no attribute get' und brach den V2-Audit still ab.
+        _cls = classification or {}
+        legacy_z76 = float(_cls.get('vma_aus', 0) or 0)
+        legacy_hotel = int(_cls.get('hotel_naechte', 0) or 0)
+        legacy_fahrtage = int(_cls.get('fahr_tage', 0) or 0)
+        legacy_arbeitstage = int(_cls.get('arbeitstage', 0) or 0)
+        legacy_td = _cls.get('tage_detail') or []
         v2_by_date = {e['datum']: e for e in v2_pipe.tage_detail}
         tag_diffs = []
         for entry in legacy_td:
