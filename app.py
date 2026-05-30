@@ -729,6 +729,55 @@ def _update_payment_intent_lock_status(pi_id, status, job_id=None):
         )
 
 
+def _atomic_write_json(path, data, max_items=None):
+    """Atomares Schreiben: temp-file → fsync → os.replace.
+    Verhindert halb-geschriebene Dateien bei Container-Crash + race-conditions
+    bei parallelen Writes (POSIX-Garantie: rename ist atomic).
+    Optional: cap der Liste auf max_items (älteste raus).
+    """
+    if max_items is not None and isinstance(data, list):
+        data = data[-max_items:]
+    target_dir = os.path.dirname(path) or '.'
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix='.tmp_', dir=target_dir)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try: os.remove(tmp_path)
+        except Exception: pass
+        raise
+
+
+def _is_private_or_local_ip(host):
+    """Returns True wenn host eine private/loopback/link-local-IP ist.
+    Schützt gegen SSRF gegen interne Services (169.254 metadata, 10.x, etc.).
+    """
+    import ipaddress, socket
+    try:
+        # Hostname auflösen (IDN-safe)
+        candidates = []
+        try:
+            infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC)
+            for info in infos:
+                ip_str = info[4][0]
+                candidates.append(ipaddress.ip_address(ip_str))
+        except Exception:
+            # Hostname kann auch direkt eine IP sein
+            candidates.append(ipaddress.ip_address(host))
+        for ip in candidates:
+            if (ip.is_private or ip.is_loopback or ip.is_link_local or
+                ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+                return True
+        return False
+    except Exception:
+        # Wenn DNS fehlschlägt, lieber blockieren als zulassen
+        return True
+
+
 def _ip_rate_limited(ip, endpoint='process', limit=20, window_sec=3600):
     """Sliding-Window Rate-Limit pro IP. Liefert True wenn limit überschritten.
     Default: 20 Versuche pro Stunde pro IP für /api/process. Stripe-Payment ist
@@ -10587,16 +10636,34 @@ def set_crew_aircraft(token, datum):
 
 @app.route('/api/user/calendar-feed/<token>/import', methods=['POST'])
 def import_calendar_feed(token):
-    """Lädt ein ICS-File von einer URL und speichert die Events als Roster-Hints."""
+    """Lädt ein ICS-File von einer URL und speichert die Events als Roster-Hints.
+    SSRF-geschützt: nur HTTPS, keine privaten IPs, max 1 MB Response.
+    """
     body = request.get_json(silent=True) or {}
     url = (body.get('url') or '').strip()
-    if not url.startswith(('http://', 'https://')):
-        return jsonify({'ok': False, 'error': 'invalid_url'}), 400
+    # HTTP raus · nur HTTPS akzeptieren (sonst Klartext-Cookies leakable)
+    if not url.startswith('https://'):
+        return jsonify({'ok': False, 'error': 'https_required'}), 400
+    # SSRF-Block: Host darf nicht privat/loopback/link-local sein
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        host = parsed.hostname or ''
+        if not host:
+            return jsonify({'ok': False, 'error': 'invalid_host'}), 400
+        if _is_private_or_local_ip(host):
+            return jsonify({'ok': False, 'error': 'internal_host_blocked'}), 400
+    except Exception:
+        return jsonify({'ok': False, 'error': 'url_parse_failed'}), 400
     try:
         import urllib.request
         req = urllib.request.Request(url, headers={'User-Agent': 'AeroTax/1.0'})
+        # Max 1 MB · verhindert Memory-Bomb bei riesigen ICS-Files
         with urllib.request.urlopen(req, timeout=20) as r:
-            text = r.read().decode('utf-8', errors='replace')
+            raw = r.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                return jsonify({'ok': False, 'error': 'response_too_large'}), 413
+            text = raw.decode('utf-8', errors='replace')
     except Exception as e:
         return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': str(e)[:200]}), 502
     # Sehr einfacher ICS-Parser: zählt VEVENTs + SUMMARYs
