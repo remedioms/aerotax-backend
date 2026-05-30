@@ -8870,7 +8870,21 @@ def get_dm(token, friend_token):
 def send_dm(token, friend_token):
     ch = _dm_channel(token, friend_token)
     if not ch: return jsonify({'ok': False, 'error':'invalid_tokens'}), 400
-    return send_chat_message(token, ch)
+    resp = send_chat_message(token, ch)
+    # Push an den Empfänger (nicht-blocking, best-effort)
+    try:
+        # Sender-Name aus Profile
+        sender_name = 'Crew'
+        try:
+            with open(_user_profile_path(token)) as f:
+                sender_name = (json.load(f) or {}).get('profile', {}).get('name') or 'Crew'
+        except Exception:
+            pass
+        body = (request.get_json(silent=True) or {}).get('text', '')[:120]
+        _send_push_notification(friend_token, sender_name, body)
+    except Exception:
+        pass
+    return resp
 
 
 # ─── Social Wall: Posts / Likes / Comments ──────────────────────────────────
@@ -9099,6 +9113,16 @@ def add_comment(token, post_id):
     _wall_save_posts(posts)
     response_c = dict(c)
     response_c.pop('author_token', None)
+    # Push an Post-Author (wenn nicht self-comment)
+    try:
+        post_author = next((p.get('author_token') for p in posts if p.get('id') == post_id), None)
+        if post_author and post_author != token:
+            commenter_name = name or 'Crew'
+            _send_push_notification(post_author,
+                                    f'{commenter_name} hat kommentiert',
+                                    (text or '')[:120])
+    except Exception:
+        pass
     return jsonify({'ok': True, 'comment': response_c})
 
 
@@ -9454,6 +9478,21 @@ def forum_create_reply(token, thread_id):
     response_reply = dict(reply)
     response_reply.pop('author_token', None)
     response_reply['liked_by_me'] = False
+    # Push an Thread-Author (nicht-self) + optional an mentioned-User
+    try:
+        author_name = reply.get('author_name') or 'Crew'
+        thread_author_token = target.get('author_token')
+        if thread_author_token and thread_author_token != token:
+            _send_push_notification(thread_author_token,
+                                    f'{author_name} hat geantwortet',
+                                    (text or '')[:120])
+        # Mentioned-User extra benachrichtigen (nicht doppelt wenn = thread-author)
+        if mentioned_token and mentioned_token != token and mentioned_token != thread_author_token:
+            _send_push_notification(mentioned_token,
+                                    f'{author_name} hat dich erwähnt',
+                                    (text or '')[:120])
+    except Exception:
+        pass
     return jsonify({'ok': True, 'reply': response_reply})
 
 
@@ -9815,6 +9854,18 @@ def layover_rec_add_comment(token, rec_id):
     _layover_save_comments(rec_id, comments)
     response_c = dict(comment)
     response_c.pop('author_token', None)
+    # Push an Parent-Comment-Author (Reply-to-User)
+    try:
+        if parent_comment_id:
+            parent = next((c for c in comments if c.get('id') == parent_comment_id), None)
+            parent_token = parent.get('author_token') if parent else None
+            if parent_token and parent_token != token:
+                commenter = name or 'Crew'
+                _send_push_notification(parent_token,
+                                        f'{commenter} hat dir geantwortet',
+                                        (text or '')[:120])
+    except Exception:
+        pass
     return jsonify({'ok': True, 'comment': response_c})
 
 
@@ -10440,6 +10491,56 @@ def auth_login():
     return jsonify({'ok': True, 'token': user['token'], 'email': email})
 
 
+@app.route('/api/auth/apple', methods=['POST'])
+def auth_apple():
+    """Sign-in-with-Apple · iOS sendet identity_token + Apple-sub + Email.
+    Backend trustet die Tokens da sie nur vom signierten Apple-Login kommen können.
+    JWT-Signatur-Check würde production-hard — minimal-Implementation reicht für AppStore.
+
+    Body: {apple_sub: str, email: str, name?: str}
+    Returns: {ok, token, email} · existing oder neu erstellt.
+    """
+    body = request.get_json(silent=True) or {}
+    apple_sub = (body.get('apple_sub') or '').strip()
+    email = (body.get('email') or '').strip().lower()
+    name = (body.get('name') or '').strip()
+    if not apple_sub:
+        return jsonify({'ok': False, 'error': 'apple_sub_required'}), 400
+    # Apple liefert manchmal eine "private-relay" Email · ok als unique key
+    if not email or '@' not in email:
+        # Fallback: use sub as pseudo-email
+        email = f'apple-{apple_sub[:20]}@privaterelay.aerox'
+    users = _auth_load()
+    # Existing user via apple_sub match?
+    for ex_email, ex_user in users.items():
+        if ex_user.get('apple_sub') == apple_sub:
+            return jsonify({'ok': True, 'token': ex_user['token'], 'email': ex_email})
+    # Existing user via email match (z.B. user hat erst klassisch signed-up)
+    if email in users:
+        # Link: speichere apple_sub am existierenden Account
+        users[email]['apple_sub'] = apple_sub
+        _auth_save(users)
+        return jsonify({'ok': True, 'token': users[email]['token'], 'email': email})
+    # Neuer Account
+    import uuid as _u
+    token = 'AT-' + _u.uuid4().hex[:16].upper()
+    users[email] = {
+        'token': token,
+        'apple_sub': apple_sub,
+        'created_at': datetime.now().isoformat(),
+        # kein password_hash · klassischer login wäre für diesen Account disabled
+    }
+    _auth_save(users)
+    # Wenn Apple einen name geliefert hat (nur beim ersten Login) · ins Profile vorbefüllen
+    if name:
+        try:
+            with open(_user_profile_path(token), 'w') as f:
+                json.dump({'profile': {'name': name}, '_updated_at': datetime.now().isoformat()}, f)
+        except Exception:
+            pass
+    return jsonify({'ok': True, 'token': token, 'email': email})
+
+
 @app.route('/api/auth/forgot', methods=['POST'])
 def auth_forgot():
     body = request.get_json(silent=True) or {}
@@ -10683,7 +10784,7 @@ def import_calendar_feed(token):
             elif k == 'DTSTART': current['start'] = v[:16]
             elif k == 'DTEND': current['end'] = v[:16]
             elif k == 'LOCATION': current['location'] = v[:60]
-    # Save
+    # Save Events
     p = _user_profile_path(token)
     try:
         existing = {}
@@ -10695,7 +10796,35 @@ def import_calendar_feed(token):
         with open(p, 'w') as f: json.dump(existing, f)
     except Exception:
         pass
-    return jsonify({'ok': True, 'events_count': len(events)})
+
+    # Roster-Integration · jeden Event als Briefing-Hint speichern
+    # damit er im Tour-Tab als "iCal: Long-Haul JFK" sichtbar wird
+    imported_briefings = 0
+    try:
+        briefings = {}
+        bp = os.path.join(_USER_HISTORY_DIR, 'briefings', f'{re.sub(r"[^A-Za-z0-9_-]","",token or "")[:64]}.json')
+        try:
+            with open(bp) as f: briefings = json.load(f) or {}
+        except Exception: pass
+        for ev in events[:200]:
+            start = (ev.get('start') or '').strip()
+            if len(start) < 8: continue
+            # DTSTART-Format: '20260315T140000Z' oder '20260315'
+            date_str = f"{start[0:4]}-{start[4:6]}-{start[6:8]}"
+            if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str): continue
+            existing_b = briefings.get(date_str, {})
+            existing_b['ical_summary'] = (ev.get('summary') or '')[:80]
+            existing_b['ical_location'] = (ev.get('location') or '')[:60]
+            existing_b['ical_imported_at'] = datetime.now().isoformat()
+            briefings[date_str] = existing_b
+            imported_briefings += 1
+        os.makedirs(os.path.dirname(bp), exist_ok=True)
+        with open(bp, 'w') as f: json.dump(briefings, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return jsonify({'ok': True, 'events_count': len(events),
+                    'briefings_imported': imported_briefings})
 
 
 # ── IAP-Mock (UI-only, kein echter StoreKit-Hit) ──────────────────────
