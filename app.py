@@ -9584,12 +9584,14 @@ def get_briefings(token):
                 if not isinstance(v, dict): continue
                 merged = dict(data.get(k) or {})
                 # iCal-Felder gewinnen — sind die einzige authoritative Quelle dafür
-                for fld in ('ical_summary', 'ical_location', 'ical_imported_at'):
+                for fld in ('ical_summary', 'ical_location', 'ical_imported_at',
+                            'ical_start_iso', 'ical_end_iso'):
                     if v.get(fld) is not None:
                         merged[fld] = v.get(fld)
                 # Fallback: alle übrigen iCal-Felder nur übernehmen wenn nicht schon gesetzt
                 for fk, fv in v.items():
-                    if fk in ('ical_summary', 'ical_location', 'ical_imported_at'): continue
+                    if fk in ('ical_summary', 'ical_location', 'ical_imported_at',
+                              'ical_start_iso', 'ical_end_iso'): continue
                     merged.setdefault(fk, fv)
                 data[k] = merged
     except FileNotFoundError:
@@ -13261,8 +13263,19 @@ def import_calendar_feed(token):
                 continue
             if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str): continue
             existing_b = briefings.get(date_str, {})
-            existing_b['ical_summary'] = (ev.get('summary') or '')[:80]
-            existing_b['ical_location'] = (ev.get('location') or '')[:60]
+            summary = (ev.get('summary') or '')[:80]
+            location = (ev.get('location') or '')[:60]
+            start_iso = (ev.get('start_iso') or '')[:25]
+            end_iso = (ev.get('end_iso') or '')[:25]
+            # Skip nur wenn ALLES leer (sonst Office-Days mit nur Location +
+            # Zeitfenster ohne SUMMARY werden silent gedropt — User-Pain
+            # "büro tage fehlen, briefing zeiten fehlen, pickup zeiten fehlen").
+            if not summary and not location and not start_iso:
+                continue
+            existing_b['ical_summary'] = summary
+            existing_b['ical_location'] = location
+            existing_b['ical_start_iso'] = start_iso
+            existing_b['ical_end_iso'] = end_iso
             existing_b['ical_imported_at'] = datetime.now().isoformat()
             briefings[date_str] = existing_b
             imported_briefings += 1
