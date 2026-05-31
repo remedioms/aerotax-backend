@@ -17533,7 +17533,7 @@ LIEFERE via Tool 'submit_cas_days'."""
 
     start = _t.time()
     try:
-        resp = _call_sonnet(12000)
+        resp = _call_sonnet(32000)
     except Exception as e:
         print(f"[Sonnet-CAS] fail: {type(e).__name__}: {str(e)[:200]}")
         return None
@@ -17548,9 +17548,9 @@ LIEFERE via Tool 'submit_cas_days'."""
 
     # v11 Retry bei max_tokens-Truncation
     if stop_reason == 'max_tokens':
-        print(f"[Sonnet-CAS] {source_filename[:40]}: truncation @12k → retry @20k")
+        print(f"[Sonnet-CAS] {source_filename[:40]}: truncation @32k → retry @64k")
         try:
-            resp = _call_sonnet(20000)
+            resp = _call_sonnet(64000)
             elapsed = _t.time() - start
             stop_reason = getattr(resp, 'stop_reason', None) if resp else 'no_response'
             usage = getattr(resp, 'usage', None) if resp else None
@@ -17560,7 +17560,7 @@ LIEFERE via Tool 'submit_cas_days'."""
                 print(f"[Sonnet-CAS] {source_filename[:40]} retry: stop={stop_reason} in_tok={in_tok} out_tok={out_tok} {elapsed:.1f}s")
             if stop_reason == 'max_tokens':
                 # Auch bei 20k truncated — friendly fail
-                print(f"[Sonnet-CAS] {source_filename[:40]}: STILL truncated @20k — friendly fail, kein silent loss")
+                print(f"[Sonnet-CAS] {source_filename[:40]}: STILL truncated @64k — friendly fail, kein silent loss")
                 return None
         except Exception as e:
             print(f"[Sonnet-CAS] {source_filename[:40]} retry fail: {type(e).__name__}: {str(e)[:200]}")
