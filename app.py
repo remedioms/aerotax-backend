@@ -7923,6 +7923,10 @@ def put_user_profile(token):
     emps = body.get('employers')
     if isinstance(emps, list):
         profile['employers'] = [e for e in emps if isinstance(e, dict)][:10]
+    # share_roster: Privacy-Opt-In für Tour-Compare. Boolean. Default false.
+    # Wird vom friend-roster-Endpoint geprüft bevor Daten geliefert werden.
+    if 'share_roster' in body:
+        profile['share_roster'] = bool(body.get('share_roster'))
     try:
         _atomic_write_json(p, {
             'token': token, 'profile': profile,
