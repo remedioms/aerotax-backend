@@ -8860,15 +8860,50 @@ def _briefing_path(token):
 
 @app.route('/api/user/briefing/<token>', methods=['GET'])
 def get_briefings(token):
-    """Alle Briefing-Items (key: Datum) für User."""
+    """Alle Briefing-Items (key: Datum) für User.
+
+    Liest aus BEIDEN Pfaden und merged:
+      - `_briefing_path(token)`            → User-PUT Briefings (`briefing_<token>.json`)
+      - `_USER_HISTORY_DIR/briefings/<token>.json` → iCal-Importe (ICS-Feed + EKEventStore)
+    Beide Pfade haben historische Gründe; ein Reader-Merge ist die least-risk-Fix.
+    iCal-Felder (ical_summary/ical_location/ical_imported_at) gewinnen aus der iCal-Datei,
+    sonst gewinnt die User-PUT-Datei (manuelle Notizen).
+    """
+    import os, re as _re
     p = _briefing_path(token)
     if not p: return jsonify({'error':'invalid token'}), 400
+    data = {}
+    # 1) User-PUT Briefings (singular file)
     try:
-        with open(p) as f: data = json.load(f)
+        with open(p) as f: data = json.load(f) or {}
     except FileNotFoundError:
         data = {}
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
+    # 2) iCal-Importe (plural subdir) — merge per-key
+    try:
+        safe_t = _re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+        if safe_t:
+            ical_path = os.path.join(_USER_HISTORY_DIR, 'briefings', f'{safe_t}.json')
+            with open(ical_path) as f:
+                ical_data = json.load(f) or {}
+            for k, v in (ical_data or {}).items():
+                if not isinstance(v, dict): continue
+                merged = dict(data.get(k) or {})
+                # iCal-Felder gewinnen — sind die einzige authoritative Quelle dafür
+                for fld in ('ical_summary', 'ical_location', 'ical_imported_at'):
+                    if v.get(fld) is not None:
+                        merged[fld] = v.get(fld)
+                # Fallback: alle übrigen iCal-Felder nur übernehmen wenn nicht schon gesetzt
+                for fk, fv in v.items():
+                    if fk in ('ical_summary', 'ical_location', 'ical_imported_at'): continue
+                    merged.setdefault(fk, fv)
+                data[k] = merged
+    except FileNotFoundError:
+        pass
+    except Exception:
+        # Defensiv: iCal-Read-Fehler darf User-PUT-Daten nicht blocken
+        pass
     datum = request.args.get('datum')
     if datum:
         return jsonify({'datum': datum, 'briefing': data.get(datum, {})})
