@@ -8911,6 +8911,40 @@ def decide_roster_change(token):
         with open(cp, 'w') as f: json.dump(data, f, ensure_ascii=False)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    # Snapshot-Baseline aktualisieren — sonst würde der nächste Snapshot den
+    # gleichen Diff erneut als "pending" detektieren. Bei 'accept' nehmen wir
+    # den neuen Wert in den Baseline-Snapshot auf; bei 'reject' wird der alte
+    # Wert beibehalten (User sagt "die Änderung ist falsch / wird zurückgenommen").
+    try:
+        sp = _roster_snapshot_path(token)
+        if sp and os.path.exists(sp):
+            with open(sp) as f: snap = json.load(f)
+            snap_tage = snap.get('tage') or []
+            kind = matched.get('kind')
+            new_payload = matched.get('new') or {}
+            old_payload = matched.get('old') or {}
+            keep_value = new_payload if decision == 'accept' else old_payload
+            idx = next((i for i, t in enumerate(snap_tage) if t.get('datum') == datum), None)
+            if kind == 'removed' and decision == 'accept':
+                # Tag wurde tatsächlich entfernt → aus Baseline raus
+                if idx is not None:
+                    snap_tage.pop(idx)
+            elif kind == 'added':
+                # 'accept' = neuer Tag bleibt (ist schon im neuen tage_detail);
+                # 'reject' = User behauptet er sei nicht hinzugekommen → trotzdem
+                # in Baseline aufnehmen damit es nicht erneut als "added" gemeldet wird.
+                if idx is None and keep_value:
+                    snap_tage.append(keep_value)
+            elif kind == 'modified':
+                if idx is not None and keep_value:
+                    snap_tage[idx] = keep_value
+                elif keep_value:
+                    snap_tage.append(keep_value)
+            snap['tage'] = snap_tage
+            snap['baseline_updated_at'] = datetime.now().isoformat()
+            with open(sp, 'w') as f: json.dump(snap, f, ensure_ascii=False)
+    except Exception as e:
+        app.logger.warning(f'[roster-decide] baseline merge failed: {e}')
     return jsonify({'ok': True})
 
 
@@ -9073,6 +9107,75 @@ def send_chat_message(token, channel_id):
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
     return jsonify({'ok': True, 'message': msg})
+
+
+@app.route('/api/crew-chat/<token>/inbox', methods=['GET'])
+def get_dm_inbox(token):
+    """Aggregierter Inbox für den Crew-Chat-Tab.
+
+    Liest für jeden Friend den letzten Message-Eintrag (best-effort über die
+    DM-Channel-Files) + zählt unread (Messages neuer als last_seen_<channel>).
+    Vorher: Frontend musste N+1 Calls machen pro Friend.
+    """
+    import os
+    friends = (_friends_load(token).get('friends') or [])
+    chat_dir = os.path.join(_USER_HISTORY_DIR, 'chat')
+    last_seen_p = os.path.join(_USER_HISTORY_DIR, f'dm_lastseen_{token}.json')
+    last_seen = {}
+    try:
+        if os.path.exists(last_seen_p):
+            with open(last_seen_p) as f: last_seen = json.load(f) or {}
+    except Exception: pass
+    inbox = []
+    for friend_token in friends:
+        ch = _dm_channel(token, friend_token)
+        if not ch: continue
+        cp = os.path.join(chat_dir, f'{ch}.json')
+        last_msg = None
+        unread = 0
+        if os.path.exists(cp):
+            try:
+                with open(cp) as f: msgs = json.load(f) or []
+                if msgs:
+                    last_msg = msgs[-1]
+                    seen_ts = float(last_seen.get(ch) or 0)
+                    unread = sum(1 for m in msgs
+                                 if m.get('author_token') != token
+                                 and float(m.get('ts') or 0) > seen_ts)
+            except Exception: pass
+        inbox.append({
+            'friend_token': friend_token,
+            'channel_id': ch,
+            'last_message_at': (last_msg or {}).get('ts'),
+            'last_message_preview': ((last_msg or {}).get('text') or '')[:80],
+            'last_message_from_me': (last_msg or {}).get('author_token') == token,
+            'unread_count': unread,
+        })
+    inbox.sort(key=lambda x: -(x.get('last_message_at') or 0))
+    return jsonify({'count': len(inbox), 'inbox': inbox})
+
+
+@app.route('/api/crew-chat/<token>/inbox/mark-read', methods=['POST'])
+def dm_mark_read(token):
+    """Body: {channel_id} — setzt last_seen_<channel> auf jetzt (für Unread-Counter)."""
+    import os
+    body = request.get_json(silent=True) or {}
+    channel = (body.get('channel_id') or '').strip()
+    if not channel:
+        return jsonify({'ok': False, 'error': 'channel_id_required'}), 400
+    last_seen_p = os.path.join(_USER_HISTORY_DIR, f'dm_lastseen_{token}.json')
+    data = {}
+    try:
+        if os.path.exists(last_seen_p):
+            with open(last_seen_p) as f: data = json.load(f) or {}
+    except Exception: pass
+    import time as _t
+    data[channel] = _t.time()
+    try:
+        with open(last_seen_p, 'w') as f: json.dump(data, f)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:120]}), 500
+    return jsonify({'ok': True})
 
 
 @app.route('/api/crew-chat/<token>/dm/<friend_token>', methods=['GET'])
