@@ -7560,7 +7560,8 @@ def _send_support_email_notification(record):
         req = urllib.request.Request(
             'https://api.resend.com/emails',
             data=payload,
-            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json',
+                     'User-Agent': 'AeroX-Backend/1.0'},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             if 200 <= resp.status < 300:
@@ -11395,7 +11396,8 @@ def _send_password_reset_email(to_email, reset_token):
             'https://api.resend.com/emails',
             data=payload,
             headers={'Authorization': f'Bearer {api_key}',
-                     'Content-Type': 'application/json'},
+                     'Content-Type': 'application/json',
+                     'User-Agent': 'AeroX-Backend/1.0'},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             ok = 200 <= resp.status < 300
