@@ -9509,37 +9509,56 @@ def get_wall_feed(token):
     return jsonify({'count': len(feed), 'posts': feed})
 
 
+# Per-Post-Lock-Dict für Like-Counter-Race-Schutz.
+# Flask läuft mit gthread + threads=8 — ohne Lock können zwei parallele
+# Like-Requests den Counter um nur +1 statt +2 erhöhen (read-modify-write race).
+_LIKE_LOCKS_LOCK = __import__('threading').Lock()
+_LIKE_LOCKS = {}
+
+def _like_lock(post_id):
+    with _LIKE_LOCKS_LOCK:
+        lk = _LIKE_LOCKS.get(post_id)
+        if lk is None:
+            lk = __import__('threading').Lock()
+            _LIKE_LOCKS[post_id] = lk
+            # Cleanup wenn Dict zu groß (>5000 alte Locks)
+            if len(_LIKE_LOCKS) > 5000:
+                for k in list(_LIKE_LOCKS.keys())[:2500]:
+                    _LIKE_LOCKS.pop(k, None)
+        return lk
+
+
 @app.route('/api/wall/<token>/like/<post_id>', methods=['POST'])
 def toggle_like(token, post_id):
     """Toggle like on a post. Returns new like_count + liked_by_me."""
     likes_p = _wall_likes_path(token)
     if not likes_p: return jsonify({'ok': False, 'error':'invalid_token'}), 400
-    try:
-        with open(likes_p) as f: liked = set(json.load(f) or [])
-    except FileNotFoundError:
-        liked = set()
-    except Exception:
-        liked = set()
-    delta = 0
-    if post_id in liked:
-        liked.remove(post_id); delta = -1
-        liked_by_me = False
-    else:
-        liked.add(post_id); delta = +1
-        liked_by_me = True
-    try:
-        _atomic_write_json(likes_p, list(liked))
-    except Exception:
-        # Best-effort fallback (Like ist nicht-kritisch)
-        with open(likes_p, 'w') as f: json.dump(list(liked), f)
-    posts = _wall_load_posts()
-    new_count = 0
-    for p in posts:
-        if p.get('id') == post_id:
-            p['like_count'] = max(0, (p.get('like_count') or 0) + delta)
-            new_count = p['like_count']
-            break
-    _wall_save_posts(posts)
+    with _like_lock(post_id):
+        try:
+            with open(likes_p) as f: liked = set(json.load(f) or [])
+        except FileNotFoundError:
+            liked = set()
+        except Exception:
+            liked = set()
+        delta = 0
+        if post_id in liked:
+            liked.remove(post_id); delta = -1
+            liked_by_me = False
+        else:
+            liked.add(post_id); delta = +1
+            liked_by_me = True
+        try:
+            _atomic_write_json(likes_p, list(liked))
+        except Exception:
+            with open(likes_p, 'w') as f: json.dump(list(liked), f)
+        posts = _wall_load_posts()
+        new_count = 0
+        for p in posts:
+            if p.get('id') == post_id:
+                p['like_count'] = max(0, (p.get('like_count') or 0) + delta)
+                new_count = p['like_count']
+                break
+        _wall_save_posts(posts)
     return jsonify({'ok': True, 'like_count': new_count, 'liked_by_me': liked_by_me})
 
 
@@ -10780,8 +10799,18 @@ def get_user_logbook_pdf(token):
 
     doc.build(elems)
     pdf_bytes = buf.getvalue()
+    # ETag-Cache (H16): PDF wird aus _tage_detail deterministisch generiert —
+    # solange sich der Inhalt nicht ändert, identisches Output. ETag basiert auf
+    # SHA-256 der PDF-Bytes. Bei If-None-Match-Match → 304 ohne Body.
+    import hashlib
+    etag = '"' + hashlib.sha256(pdf_bytes).hexdigest()[:32] + '"'
+    if_match = request.headers.get('If-None-Match', '')
+    if if_match == etag:
+        return ('', 304, {'ETag': etag, 'Cache-Control': 'private, max-age=300'})
     response = app.response_class(pdf_bytes, mimetype='application/pdf')
     response.headers['Content-Disposition'] = f'attachment; filename="aerotax_logbuch_{rd.get("year", "")}.pdf"'
+    response.headers['ETag'] = etag
+    response.headers['Cache-Control'] = 'private, max-age=300'
     return response
 
 
