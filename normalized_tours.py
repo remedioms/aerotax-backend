@@ -201,10 +201,94 @@ _INLAND_CODES = {
     'LEJ', 'BRE', 'DRS', 'PAD', 'FMM', 'FMO', 'SCN', 'FKB', 'FDH', 'NRN',
 }
 
+# Optionale Airport→Land/Zeitzone-DB (~11k Airports, aus offblock locations.json).
+# Additiv: schließt die Lücke der bisher nur 20 hartkodierten Inland-Codes und
+# liefert eine Land-Auflösung für Airports, die nicht in IATA_TO_BMF stehen.
+# Defensiv geladen — fehlt das Modul, bleibt das Verhalten exakt wie vorher.
+try:
+    from airport_tz import airport_country as _atz_country  # type: ignore
+except Exception:  # pragma: no cover - defensiver Fallback
+    _atz_country = None  # type: ignore
+
+# Optionale Zeitzonen-Logik ("Ort um 24:00 Ortszeit", BMF §9 EStG).
+# Additiv: liefert eine zeitbasierte Nachtflug-Heimkehr-Erkennung als Alternative
+# zum Sonnet-Marker `overnight_after_day`. Defensiv geladen.
+try:
+    import tz_midnight as _tzm  # type: ignore
+except Exception:  # pragma: no cover
+    _tzm = None  # type: ignore
+
+import os as _os
+
+
+def _tz_midnight_enabled() -> bool:
+    """Feature-Flag AEROTAX_USE_TZ_MIDNIGHT — steuert ob die zeitbasierte
+    Nachtflug-Erkennung das Marker-Flag OVERRIDED. Default off: dann wird nur
+    eine Audit-Notiz erzeugt, das Live-Ergebnis bleibt unverändert."""
+    return _os.environ.get('AEROTAX_USE_TZ_MIDNIGHT', '') in ('1', 'true', 'on')
+
+
+def _tz_night_return(td: 'TourDay', homebase: str) -> Optional[bool]:
+    """Zeitbasierte Nachtflug-Heimkehr-Erkennung für einen Return-Day.
+
+    Returnt True/False wenn aus den (UTC-)Flugzeiten + Flughafen-TZ ableitbar,
+    sonst None (dann gilt weiter das Marker-Flag). Rein lesend, keine Seiteneffekte.
+    """
+    if _tzm is None:
+        return None
+    raw = td.cas_raw or {}
+    dep_iata = (raw.get('origin_iata') or raw.get('previous_layover_iata')
+                or td.layover_iata or '')
+    arr_iata = (raw.get('destination_iata') or homebase or 'FRA')
+    dep_t = raw.get('departure_time')
+    arr_t = raw.get('arrival_time')
+    datum = td.date.isoformat() if hasattr(td.date, 'isoformat') else str(td.date)
+    if not (dep_iata and arr_t and dep_t):
+        return None
+    try:
+        return _tzm.is_night_return_flight(datum, dep_t, dep_iata, arr_t, arr_iata)
+    except Exception:  # pragma: no cover
+        return None
+
 
 def _is_inland_code(iata: str) -> bool:
-    """True wenn IATA-Code ein deutscher Flughafen ist."""
-    return bool(iata) and iata.upper().strip() in _INLAND_CODES
+    """True wenn IATA-Code ein deutscher Flughafen ist.
+
+    Primär die kuratierte 20er-Liste (schnell, bewährt). Zusätzlich — falls die
+    Airport-DB verfügbar ist — JEDER Flughafen mit Land == 'DE'. Das fixt
+    deutsche Regional-/Nebenflughäfen (z. B. ERF, KSF, SCN-Varianten), die bisher
+    fälschlich als Ausland galten. Rein additiv: erkennt nur ZUSÄTZLICHE Inland-
+    Codes, macht nie aus Inland Ausland.
+    """
+    if not iata:
+        return False
+    code = iata.upper().strip()
+    if code in _INLAND_CODES:
+        return True
+    if _atz_country is not None:
+        try:
+            return _atz_country(code) == 'DE'
+        except Exception:  # pragma: no cover
+            return False
+    return False
+
+
+def _apply_tz_hotel(day: 'TourDay', hotel_evidence: bool, hotel_source: str,
+                    ds: str, audit_notes: List[str]) -> Tuple[bool, str]:
+    """CAS-Reconcile Schritt C: unterdrueckt eine vermutete Hotelnacht, wenn die
+    zeitbasierte Wahrheit (tz_hotel_night, aus cas_reconcile) sagt: an diesem Tag
+    KEINE Uebernachtung (im Flug / Nachtflug-Heimkehr). Konservativ: nur
+    unterdruecken, nie eine Hotelnacht erfinden. Schreibt ggf. eine Audit-Notiz.
+    Gesamte Verzweigung liegt HIER, nicht in der Hauptfunktion (Branch-Count).
+    Returnt (hotel_evidence, hotel_source)."""
+    tz_hotel = (day.cas_raw or {}).get('tz_hotel_night')
+    suppress = (tz_hotel is False) and bool(hotel_evidence)
+    if suppress:
+        audit_notes.append(
+            f'{ds}: Hotelnacht unterdrueckt — zeitbasiert keine '
+            f'Uebernachtung (im Flug/Heimkehr).')
+        return False, 'tz_no_hotel_in_flight'
+    return hotel_evidence, hotel_source
 
 
 def _has_real_flight_evidence(cas_day: Dict[str, Any]) -> bool:
@@ -412,6 +496,25 @@ def resolve_bmf_country_for_tour_day(
 
     if not selected_iata:
         reason = 'missing_bmf_country — keine belastbare Quelle für Land'
+        # Additive Diagnose: Wenn die Airport-DB das Land KENNT, der BMF-Lookup
+        # aber gescheitert ist, ist das ein behebbarer Tabellen-/Mapping-Fehler —
+        # KEIN echtes "Land unbekannt". Statt still 0€ zu rechnen, machen wir es
+        # sichtbar (Audit), damit kein Z76 leise verloren geht.
+        if _atz_country is not None:
+            for cand in candidates_considered:
+                ci = (cand.get('iata') or '').upper().strip()
+                try:
+                    iso = _atz_country(ci)
+                except Exception:
+                    iso = None
+                if iso and iso != 'DE':
+                    reason = (
+                        f'missing_bmf_country_RESOLVABLE — Airport {ci} liegt in '
+                        f'Land {iso} (laut Airport-DB), aber kein BMF-Satz in '
+                        f'bmf_table/IATA_TO_BMF gefunden. Tabelle/Mapping prüfen — '
+                        f'hier geht potenziell Z76 verloren.'
+                    )
+                    break
 
     return {
         'selected_country':      selected_country,
@@ -985,6 +1088,22 @@ def calculate_allowances_from_normalized_tours(
                 # Beispiel: 05.01 BLR Marker=755 mit LH755-Departure 23:28 LT
                 # → User war 24h in BLR, nicht Heimkehr-An/Ab-Tag.
                 cas_overnight_return = bool(td.cas_raw.get('overnight_after_day'))
+                # Zeitbasierte Nachtflug-Erkennung (BMF 24:00-Ortszeit). Additiv:
+                # Wenn die Flugzeiten+TZ eine eindeutige Antwort liefern, die vom
+                # Sonnet-Marker abweicht, wird das als Audit festgehalten. Nur bei
+                # aktivem Flag AEROTAX_USE_TZ_MIDNIGHT überschreibt die TZ-Wahrheit
+                # das Marker-Flag (sonst bleibt das Live-Ergebnis unverändert).
+                _tz_nr = _tz_night_return(td, homebase)
+                if _tz_nr is not None and _tz_nr != cas_overnight_return:
+                    result.audit_notes.append(
+                        f'{ds}: tz_midnight night_return={_tz_nr} weicht von '
+                        f'marker overnight_after_day={cas_overnight_return} ab '
+                        f'(dep={td.cas_raw.get("departure_time")} '
+                        f'arr={td.cas_raw.get("arrival_time")} '
+                        f'from={td.cas_raw.get("origin_iata") or td.layover_iata})'
+                    )
+                    if _tz_midnight_enabled():
+                        cas_overnight_return = _tz_nr
                 if cas_overnight_return and is_foreign and resolved_rate:
                     # Nachtflug-Heimkehr: voll 24h im Ausland
                     day_eur = float(resolved_rate.get('voll_24h', 0) or 0)
@@ -1181,6 +1300,13 @@ def calculate_allowances_from_normalized_tours(
             if td.is_return_day and not td.is_departure_day:
                 hotel_evidence = False
                 hotel_source = 'return_day_no_hotel_after'
+
+            # Schritt C (CAS-Reconcile): zeitbasierte Wahrheit respektieren.
+            # Gesamte Logik (inkl. Audit-Notiz) in _apply_tz_hotel ausgelagert,
+            # damit die Hauptfunktion KEINE zusaetzliche Verzweigung bekommt
+            # (Branch-Count-Test haelt <50).
+            hotel_evidence, hotel_source = _apply_tz_hotel(
+                td, hotel_evidence, hotel_source, ds, result.audit_notes)
 
             if hotel_evidence:
                 td.hotel_night_after_this_day = True
