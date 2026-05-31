@@ -10303,18 +10303,33 @@ def create_wall_post(token):
 
 @app.route('/api/wall/<token>/feed', methods=['GET'])
 def get_wall_feed(token):
-    """Feed = eigene Posts + Posts von Friends. Query: ?limit=30&before_ts=…"""
+    """Feed = eigene Posts + Friends-Posts + globale Crew-Posts.
+    Query: ?limit=30&before_ts=…&mode=friends|all (default all für lebendigeren Feed).
+
+    User-Pain: "feed ist so leer.. social network feed.. sich immer aktualisieren".
+    Vorher hart auf Friends-only — neue User sahen nichts. Jetzt zeigt der Feed
+    standardmäßig alle public-Posts (außer blocked/muted), mit Friends als
+    Sortier-Boost via has_friend-Flag im Response.
+    """
     limit = min(int(request.args.get('limit') or 30), 100)
     before_ts = float(request.args.get('before_ts') or 0)
+    mode = (request.args.get('mode') or 'all').lower()
     friends = set((_friends_load(token).get('friends') or []))
     friends.add(token)
     blocked = _blocked_by(token)
     muted = _muted_by(token)
     posts = _wall_load_posts()
-    feed = [p for p in posts
-            if p.get('author_token') in friends
-            and p.get('author_token') not in blocked
-            and p.get('author_token') not in muted]
+    if mode == 'friends':
+        feed = [p for p in posts
+                if p.get('author_token') in friends
+                and p.get('author_token') not in blocked
+                and p.get('author_token') not in muted]
+    else:
+        # Default: alle Public-Posts (außer blocked/muted). Friends-Sort kommt
+        # client-side über `from_friend`-Flag im Response.
+        feed = [p for p in posts
+                if p.get('author_token') not in blocked
+                and p.get('author_token') not in muted]
     feed.sort(key=lambda p: -(p.get('ts') or 0))
     if before_ts > 0:
         feed = [p for p in feed if (p.get('ts') or 0) < before_ts]
@@ -10334,6 +10349,10 @@ def get_wall_feed(token):
         # is_mine: Owner-Flag damit iOS-Client einen "Löschen"-Button
         # auf eigene Posts zeigen kann (DSGVO Art. 17 sub-right).
         p['is_mine'] = (p.get('author_token') == token)
+        # from_friend: iOS kann Friends-Posts visuell hervorheben
+        # (golden Border o.ä.) ohne separates Endpoint-Roundtrip.
+        p['from_friend'] = (p.get('author_token') in friends
+                            and p.get('author_token') != token)
         # Strip author_token for privacy in feed
         p.pop('author_token', None)
     return jsonify({'count': len(feed), 'posts': feed})
@@ -18363,7 +18382,10 @@ LIEFERE via Tool 'submit_cas_days'."""
     # truncated, einmal Retry mit 20000. Sonst friendly fail (kein silent loss).
     import time as _t
     def _call_sonnet(_max_tokens):
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
+        # Großmonate (NTF, 60-73 Tage) brauchen 150-170s Sonnet-Streaming.
+        # 180s war zu knapp → APITimeoutError → ganze Datei verloren (Juli/Aug).
+        # 600s gibt Puffer ohne den Cloud-Task-Timeout (3600s) zu gefährden.
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=600.0)
         return client.messages.create(
             model='claude-sonnet-4-6',
             max_tokens=_max_tokens,
