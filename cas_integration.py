@@ -59,16 +59,26 @@ def reconcile_cas_days(
         audit['reason'] = f'import_failed:{type(e).__name__}'
         return cas_days, audit
 
-    try:
-        det = ctp.parse_cas_pdf(cas_pdf_bytes)
-    except Exception as e:
-        audit['reason'] = f'parse_failed:{type(e).__name__}'
-        return cas_days, audit
-
-    if det.get('confidence') == 'none':
+    # cas_pdf_bytes kann EIN PDF (bytes) ODER eine Liste von Monats-PDFs sein.
+    blobs = cas_pdf_bytes if isinstance(cas_pdf_bytes, (list, tuple)) else [cas_pdf_bytes]
+    det_days_all = []
+    parsed_ok = 0
+    for blob in blobs:
+        if not blob:
+            continue
+        try:
+            d = ctp.parse_cas_pdf(blob)
+        except Exception:
+            continue
+        if d.get('confidence') == 'none':
+            continue
+        det_days_all.extend(d.get('days') or [])
+        parsed_ok += 1
+    if parsed_ok == 0 or not det_days_all:
         audit['reason'] = 'layout_not_recognized'
-        audit['parser_warnings'] = det.get('warnings')
         return cas_days, audit
+    det = {'days': det_days_all, 'confidence': 'high'}
+    audit['parser_files_ok'] = parsed_ok
 
     try:
         result = rec.reconcile_days(det.get('days') or [], cas_days, homebase)

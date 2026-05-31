@@ -28043,6 +28043,11 @@ def hybrid_analyze(form, files, job_id=None):
     document_health = None
 
     use_v11_cas = (AEROTAX_PIPELINE_VERSION == 'v11_cas_primary' and cas_bytes)
+    # CAS-Bytes-Kopie fuer deterministischen Reconcile sichern (vor Memory-Release).
+    try:
+        cas_bytes_for_reconcile = list(cas_bytes) if isinstance(cas_bytes, (list, tuple)) else cas_bytes
+    except Exception:
+        cas_bytes_for_reconcile = None
 
     if use_v11_cas:
         # v11 PHASE 4 CAS-PIPELINE
