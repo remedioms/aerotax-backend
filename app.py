@@ -13,7 +13,7 @@
 
 import os, io, uuid, json, re, tempfile, gc, hmac
 import hashlib as _hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, send_file, abort
 from flask_cors import CORS
 import stripe
@@ -7983,24 +7983,162 @@ def _user_profile_path(token):
     return os.path.join(_USER_HISTORY_DIR, f'profile_{safe}.json')
 
 
-@app.route('/api/user/profile/<token>', methods=['GET'])
-def get_user_profile(token):
+# ── P0-Fix Phase 2 (2026-05-31): user_profiles + user_friends + user_push_tokens
+# in Supabase persistieren. Vorher lebten alle 3 nur auf ephemeral Container-disk
+# → bei jedem Cloud-Run-Redeploy = wiped. Pattern wie _auth_load/_save:
+#   load_from_sb → primary; load_from_disk → fallback; lazy-migration einmalig
+#   beim ersten Read wenn SB leer aber Disk-Daten vorhanden.
+# Scope-Hinweis: NUR die profile{...}-Whitelist-Felder werden in SB gespiegelt
+# (name/homebase/position/airline/hometown/share_*/current_city/employers +
+# metadata-jsonb für unknown keys). Andere Top-Level-Keys der disk-Datei
+# (subscription, sponsored_slots, marker_mapping, lufthansa_*, calendar_feed,
+# crew_aircraft) bleiben disk-only — separater Patch.
+
+_PROFILE_KNOWN_COLS = {
+    'name', 'homebase', 'position', 'airline', 'hometown',
+    'share_roster', 'employers',
+}
+
+
+def _profile_load_from_supabase(token):
+    """Liest eine Profile-Row aus Supabase. None bei SB-down/error oder wenn
+    Token keine Row hat. Dict bei Hit (auch wenn alle Felder leer)."""
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = sb.table('user_profiles').select('*').eq('token', token).limit(1).execute()
+        rows = r.data or []
+        if not rows:
+            return None
+        row = rows[0]
+        prof = {}
+        for k in _PROFILE_KNOWN_COLS:
+            v = row.get(k)
+            if v is not None:
+                prof[k] = v
+        if prof.get('employers') is None:
+            prof['employers'] = []
+        md = row.get('metadata') or {}
+        if isinstance(md, dict):
+            # share_location, current_city und andere unknown-keys als
+            # Top-Level zurückfalten — damit Caller die alte Profil-Shape sehen
+            for k, v in md.items():
+                if k not in prof:
+                    prof[k] = v
+        return prof
+    except Exception as e:
+        app.logger.warning(
+            f'[profile] sb_load_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:120]}'
+        )
+        return None
+
+
+def _profile_save_to_supabase(token, profile):
+    """Upsert einer Profile-Row. True/False für Erfolg."""
+    if not SB_AVAILABLE or not token:
+        return False
+    profile = profile or {}
+    row = {'token': token, 'updated_at': datetime.now(timezone.utc).isoformat()}
+    meta = {}
+    for k, v in profile.items():
+        if k in _PROFILE_KNOWN_COLS:
+            row[k] = v
+        else:
+            meta[k] = v
+    row['metadata'] = meta
+    try:
+        sb.table('user_profiles').upsert(row, on_conflict='token').execute()
+        return True
+    except Exception as e:
+        app.logger.error(
+            f'[profile] sb_save_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:200]}'
+        )
+        return False
+
+
+def _profile_load_from_disk(token):
+    """Liest komplette profile-Disk-Datei. Returns dict (mind. {token,profile:{}})."""
     p = _user_profile_path(token)
     if not p:
-        return jsonify({'error': 'invalid token'}), 400
+        return {'token': token, 'profile': {}}
     try:
         with open(p) as f:
-            return jsonify(json.load(f))
+            return json.load(f) or {'token': token, 'profile': {}}
     except FileNotFoundError:
-        return jsonify({'token': token, 'profile': {}})
+        return {'token': token, 'profile': {}}
+    except Exception:
+        return {'token': token, 'profile': {}}
+
+
+def _profile_load(token):
+    """SB primary, Disk fallback. Lazy-migriert disk→SB beim ersten Read wenn
+    SB-Row fehlt aber Disk-Daten existieren.
+    Returns gleiche Shape wie früher: {token, profile, [_updated_at, ...]} — d.h.
+    SB-Daten werden in den 'profile'-Subkey gewrappt damit alle bestehenden
+    Caller (`(json.load() or {}).get('profile', {})`) ohne Änderung weiterlaufen.
+    Bei Disk-Fallback bleibt der komplette Disk-Inhalt erhalten (subscription,
+    crew_aircraft, etc.) — die SB-only-Path liefert nur 'profile'.
+    """
+    if not token:
+        return {'token': token, 'profile': {}}
+    sb_prof = _profile_load_from_supabase(token)
+    if sb_prof is not None:
+        disk_full = _profile_load_from_disk(token)
+        out = {k: v for k, v in (disk_full or {}).items() if k not in ('token', 'profile')}
+        out['token'] = token
+        out['profile'] = sb_prof
+        return out
+    # SB-Miss: disk-Fallback + lazy-Migration wenn SB up
+    disk_full = _profile_load_from_disk(token)
+    disk_prof = (disk_full or {}).get('profile') or {}
+    if SB_AVAILABLE and disk_prof:
+        app.logger.info(f'[profile] lazy-migrate tok={token[:8]} disk→supabase')
+        _profile_save_to_supabase(token, disk_prof)
+    return disk_full
+
+
+def _profile_save(token, profile, full_disk_payload=None):
+    """Schreibt profile in SB (primary) + Disk (best-effort Cache).
+    full_disk_payload: optional komplettes Disk-Dict (für Endpoints die
+    Side-Keys wie crew_aircraft mit-schreiben). Wenn None: minimaler Wrap.
+    Returns True wenn mind. ein Pfad gehalten hat.
+    """
+    if not token:
+        return False
+    sb_ok = _profile_save_to_supabase(token, profile)
+    disk_ok = False
+    p = _user_profile_path(token)
+    if p:
+        payload = full_disk_payload if full_disk_payload is not None else {
+            'token': token, 'profile': profile,
+            '_updated_at': datetime.now().isoformat(),
+        }
+        try:
+            _atomic_write_json(p, payload)
+            disk_ok = True
+        except Exception as e:
+            app.logger.warning(f'[profile] disk_save_fail tok={token[:8]}: {e}')
+    if not (sb_ok or disk_ok):
+        app.logger.error(
+            f'[profile] CRITICAL tok={token[:8]}: weder SB noch Disk gesichert!'
+        )
+        return False
+    return True
+
+
+@app.route('/api/user/profile/<token>', methods=['GET'])
+def get_user_profile(token):
+    if not token:
+        return jsonify({'error': 'invalid token'}), 400
+    try:
+        return jsonify(_profile_load(token))
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
 
 
 @app.route('/api/user/profile/<token>', methods=['PUT'])
 def put_user_profile(token):
-    p = _user_profile_path(token)
-    if not p:
+    if not token:
         return jsonify({'error': 'invalid token'}), 400
     body = request.get_json(silent=True) or {}
     # Whitelist erweitert: hometown + employers waren vorher silent-gedroppt
@@ -8011,16 +8149,97 @@ def put_user_profile(token):
     emps = body.get('employers')
     if isinstance(emps, list):
         profile['employers'] = [e for e in emps if isinstance(e, dict)][:10]
-    # share_roster: Privacy-Opt-In für Tour-Compare. Boolean. Default false.
-    # Wird vom friend-roster-Endpoint geprüft bevor Daten geliefert werden.
+    # share_roster: Reziprozität — User teilt seinen Plan + sieht im Gegenzug
+    # die Pläne der Buddies. Default TRUE (User-Anweisung, reziproker Social-
+    # Mechanismus). User kann in Settings jederzeit ausschalten.
     if 'share_roster' in body:
         profile['share_roster'] = bool(body.get('share_roster'))
+    # share_location: aktuelle Stadt teilen (NUR Stadt, keine GPS-Koordinaten).
+    # Default TRUE. iOS-LocationStore sendet ~1×/Stunde im Foreground.
+    if 'share_location' in body:
+        profile['share_location'] = bool(body.get('share_location'))
+    # current_city: vom iOS-Client gepushte aktuelle Stadt (reverse-geocoded).
+    # Backend speichert as-is, prüft beim Friend-Lookup ob share_location=true.
+    if 'current_city' in body:
+        cc = body.get('current_city')
+        if isinstance(cc, str) and 0 < len(cc) <= 64:
+            profile['current_city'] = cc
+    # Disk-Payload erhält Side-Keys (subscription, crew_aircraft, …) die NICHT
+    # in SB sind — lesen, profile-Subkey ersetzen, zurückschreiben. Sonst würde
+    # ein PUT alles andere im disk-File zerstören.
+    disk_full = dict(_profile_load_from_disk(token) or {})
+    disk_full['token'] = token
+    disk_full['profile'] = profile
+    disk_full['_updated_at'] = datetime.now().isoformat()
+    if _profile_save(token, profile, full_disk_payload=disk_full):
+        return jsonify({'ok': True, 'profile': profile})
+    return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+
+
+@app.route('/api/user/location', methods=['POST'])
+def post_user_location():
+    """LocationStore (iOS) pusht ~1×/Stunde die aktuelle Stadt — NUR
+    Stadt-String, KEINE GPS-Koordinaten (Privacy-by-Design).
+
+    Body: {token, city} — city max 64 chars, non-empty, kein HTML.
+    Token-Auth: Body-Feld `token` (analog put_user_profile-Pattern).
+
+    Persistence: gleicher Pfad wie put_user_profile → setzt `current_city`
+    im profile-JSON. Wenn `share_location=False` im Profil → silent 200
+    (kein Speichern, aber keine Fehlermeldung für den Client).
+
+    Rate-Limit: 24 calls/Tag pro Token (Spam-Schutz, falls iOS-Client
+    durch Bug öfter als 1×/h pushed).
+    """
+    body = request.get_json(silent=True) or {}
+    token = (body.get('token') or '').strip()
+    if not token:
+        return jsonify({'ok': False, 'error': 'missing token'}), 400
+
+    # Rate-Limit: 24 calls/Tag pro Token (24h window).
+    if _token_rate_limited(token, 'user_location', limit=24, window_sec=86400):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+
+    raw_city = body.get('city')
+    if not isinstance(raw_city, str):
+        return jsonify({'ok': False, 'error': 'missing city'}), 400
+    # Sanitize: strip whitespace, strip HTML-Tags (defensiv — iOS sendet
+    # CLPlacemark.locality, aber Server-Side validieren ist Pflicht).
+    city = raw_city.strip()
+    # HTML/Control-Char Filter: alles ausser printable Unicode raus.
+    city = ''.join(c for c in city if c.isprintable() and c not in '<>')
+    city = city[:64]
+    if not city:
+        return jsonify({'ok': False, 'error': 'empty city'}), 400
+
+    p = _user_profile_path(token)
+    if not p:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+
+    # Existing profile laden (oder leer wenn noch nichts gespeichert).
+    profile = {}
+    try:
+        with open(p) as f:
+            existing = json.load(f) or {}
+            profile = existing.get('profile', {}) or {}
+    except FileNotFoundError:
+        pass
+    except Exception:
+        # Korruptes Profile-JSON → wir überschreiben es lieber nicht stillschweigend.
+        return jsonify({'ok': False, 'error': 'profile read error'}), 500
+
+    # share_location default TRUE (User-Anweisung: "aus prinzip immer aktuelle
+    # location teilen"). Nur wenn explizit auf False gesetzt → silent skip.
+    if profile.get('share_location', True) is False:
+        return jsonify({'ok': True, 'skipped': 'sharing_off'})
+
+    profile['current_city'] = city
     try:
         _atomic_write_json(p, {
             'token': token, 'profile': profile,
             '_updated_at': datetime.now().isoformat()
         })
-        return jsonify({'ok': True, 'profile': profile})
+        return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
@@ -8085,6 +8304,70 @@ def user_search():
     return jsonify({'count': len(results), 'users': results})
 
 
+@app.route('/api/user/lookup-by-short/<short>', methods=['GET'])
+def user_lookup_by_short(short):
+    """Resolve 8-char Token-Prefix → full Token + public profile fields.
+
+    Wall-Post/Forum-Posts carry `author_short = token[:8]` only (privacy).
+    Wenn der User auf den Avatar/Namen tappt, braucht der iOS-Client den
+    vollen Token um Buddy-Requests/DMs zu starten. Dieser Endpoint löst
+    das Prefix auf — strict whitelisted auf die exakt gleichen public-Profil-
+    Felder wie /api/user/search (token, name, airline, homebase, position).
+
+    Privacy-Audit:
+    - NIEMALS: email, apple_sub, friends-list, blocks/mutes, internal IDs
+    - Min-Prefix-Länge: 8 (entspricht `token[:8]` aus Wall/Forum)
+    - 404 wenn kein Match
+    - 409 wenn >1 Match (Ambiguität — kein Auto-Resolve, Client entscheidet)
+
+    Skaliert linear über alle profile_*.json — bei <10k Usern OK, danach
+    Index nötig (Postgres-Migration siehe ROADMAP.md).
+    """
+    short = (short or '').strip()
+    if len(short) < 8:
+        return jsonify({'error': 'short_too_short_min_8'}), 400
+    if len(short) > 64:
+        return jsonify({'error': 'short_too_long'}), 400
+    # Whitelist allowed chars (matches token alphabet from _user_profile_path)
+    import re as _re_lookup
+    if not _re_lookup.match(r'^[A-Za-z0-9_-]+$', short):
+        return jsonify({'error': 'short_invalid_chars'}), 400
+
+    matches = []
+    try:
+        for fn in os.listdir(_USER_HISTORY_DIR):
+            if not fn.startswith('profile_') or not fn.endswith('.json'):
+                continue
+            try:
+                with open(os.path.join(_USER_HISTORY_DIR, fn)) as f:
+                    data = json.load(f) or {}
+            except Exception:
+                continue
+            target_token = data.get('token') or ''
+            if not target_token or not target_token.startswith(short):
+                continue
+            pr = data.get('profile') or {}
+            matches.append({
+                'token': target_token,
+                'name': (pr.get('name') or '').strip() or None,
+                'homebase': pr.get('homebase'),
+                'airline': pr.get('airline'),
+                'position': pr.get('position'),
+            })
+            if len(matches) > 1:
+                # Mehr als 1 Match — ambiguous, früh abbrechen
+                break
+    except FileNotFoundError:
+        pass
+
+    if not matches:
+        return jsonify({'error': 'not_found'}), 404
+    if len(matches) > 1:
+        # 409 Conflict — Client soll User-Hint anzeigen ("Profil unvollständig")
+        return jsonify({'error': 'ambiguous', 'count': len(matches)}), 409
+    return jsonify(matches[0])
+
+
 # ════════════════════════════════════════════════════════════════════════
 # R46 (2026-05-28) Friends-System, Layover-Match, Stats, iCal-Export,
 # Push-Token-Registry — alle file-based für privaten Use. Postgres-Migration
@@ -8108,23 +8391,276 @@ def _user_push_path(token):
     return os.path.join(_USER_HISTORY_DIR, f'push_{safe}.json')
 
 
-def _friends_load(token):
-    p = _user_friends_path(token)
-    if not p: return {'token': token, 'friends': []}
+# ── Push-Token SB-Layer ─────────────────────────────────────────────
+# Tabelle: user_push_tokens (user_token PK, expo_token, apns_token, device_id,
+# platform, metadata jsonb). Eine Row pro User-Token; Re-Install = Update.
+
+_PUSH_KNOWN_COLS = {'expo_token', 'apns_token', 'device_id', 'platform'}
+
+
+def _push_load_from_supabase(token):
+    """Returns dict in legacy-shape ({token, push_token, apns_token, …}) oder
+    None bei SB-down / Row fehlt."""
+    if not SB_AVAILABLE or not token:
+        return None
     try:
-        with open(p) as f: return json.load(f)
-    except (FileNotFoundError, Exception):
+        r = sb.table('user_push_tokens').select('*').eq('user_token', token).limit(1).execute()
+        rows = r.data or []
+        if not rows:
+            return None
+        row = rows[0]
+        out = {'token': token}
+        # Mapping: expo_token → push_token (legacy file-field-name)
+        if row.get('expo_token') is not None:
+            out['push_token'] = row.get('expo_token') or ''
+        if row.get('apns_token') is not None:
+            out['apns_token'] = row.get('apns_token') or ''
+        if row.get('platform') is not None:
+            out['platform'] = row.get('platform') or ''
+        if row.get('device_id') is not None:
+            out['device_id'] = row.get('device_id') or ''
+        md = row.get('metadata') or {}
+        if isinstance(md, dict):
+            for k, v in md.items():
+                if k not in out:
+                    out[k] = v
+        return out
+    except Exception as e:
+        app.logger.warning(
+            f'[push] sb_load_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:120]}'
+        )
+        return None
+
+
+def _push_save_to_supabase(token, registry):
+    """Upsert. Erwartet legacy-shape ({token, push_token, apns_token, …}).
+    push_token wird in expo_token-Column gemappt."""
+    if not SB_AVAILABLE or not token:
+        return False
+    reg = registry or {}
+    row = {
+        'user_token': token,
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+    }
+    # legacy 'push_token' → expo_token
+    if 'push_token' in reg:
+        row['expo_token'] = reg.get('push_token') or None
+    if 'apns_token' in reg:
+        row['apns_token'] = reg.get('apns_token') or None
+    if 'platform' in reg:
+        row['platform'] = reg.get('platform') or None
+    if 'device_id' in reg:
+        row['device_id'] = reg.get('device_id') or None
+    meta = {}
+    legacy_meta_keys = ('bundle_id', 'registered_at')
+    for k in legacy_meta_keys:
+        if k in reg:
+            meta[k] = reg.get(k)
+    # Auch echte unknown-Felder durchreichen
+    for k, v in reg.items():
+        if k in ('token', 'push_token') or k in _PUSH_KNOWN_COLS:
+            continue
+        if k not in meta:
+            meta[k] = v
+    row['metadata'] = meta
+    try:
+        sb.table('user_push_tokens').upsert(row, on_conflict='user_token').execute()
+        return True
+    except Exception as e:
+        app.logger.error(
+            f'[push] sb_save_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:200]}'
+        )
+        return False
+
+
+def _push_load_from_disk(token):
+    """Returns legacy-shape ({token, push_token, apns_token, …}) oder {}."""
+    p = _user_push_path(token)
+    if not p:
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _push_load(token):
+    """SB primary, Disk fallback, lazy-migration. Returns dict (evt. leer)."""
+    if not token:
+        return {}
+    sb_reg = _push_load_from_supabase(token)
+    if sb_reg is not None:
+        return sb_reg
+    disk_reg = _push_load_from_disk(token)
+    if SB_AVAILABLE and disk_reg and (disk_reg.get('push_token') or disk_reg.get('apns_token')):
+        app.logger.info(f'[push] lazy-migrate tok={token[:8]} disk→supabase')
+        _push_save_to_supabase(token, disk_reg)
+    return disk_reg
+
+
+def _push_save(token, registry):
+    """SB (primary) + Disk (cache)."""
+    if not token:
+        return False
+    sb_ok = _push_save_to_supabase(token, registry)
+    disk_ok = False
+    p = _user_push_path(token)
+    if p:
+        try:
+            _atomic_write_json(p, registry)
+            disk_ok = True
+        except Exception as e:
+            app.logger.warning(f'[push] disk_save_fail tok={token[:8]}: {e}')
+    if not (sb_ok or disk_ok):
+        app.logger.error(
+            f'[push] CRITICAL tok={token[:8]}: weder SB noch Disk gesichert!'
+        )
+        return False
+    return True
+
+
+def _friends_load_from_supabase(token):
+    """Liest alle Friend-Edges (out-bound) für owner_token aus Supabase.
+    Returns dict in der Shape {token, friends:[...], requests_out:[...],
+    requests_in:[...]} — None bei SB-down. Empty-Dict ist OK (kein Eintrag).
+    Reziproke Pending-in werden ebenfalls geholt (friend_token=token UND
+    status=pending → fließt in requests_in).
+    Groups bleiben disk-only und werden hier NICHT touched.
+    """
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        # Outgoing edges (owner=token)
+        r1 = sb.table('user_friends').select('friend_token,status').eq(
+            'owner_token', token).execute()
+        out_rows = r1.data or []
+        # Incoming pending (someone else's request to me)
+        r2 = sb.table('user_friends').select('owner_token,status').eq(
+            'friend_token', token).eq('status', 'pending').execute()
+        in_rows = r2.data or []
+        friends = []
+        requests_out = []
+        for row in out_rows:
+            ft = row.get('friend_token')
+            st = (row.get('status') or 'accepted').lower()
+            if not ft:
+                continue
+            if st == 'accepted':
+                friends.append(ft)
+            elif st == 'pending':
+                requests_out.append(ft)
+        requests_in = [row.get('owner_token') for row in in_rows if row.get('owner_token')]
+        return {
+            'token': token,
+            'friends': friends,
+            'requests_out': requests_out,
+            'requests_in': requests_in,
+        }
+    except Exception as e:
+        app.logger.warning(
+            f'[friends] sb_load_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:120]}'
+        )
+        return None
+
+
+def _friends_save_to_supabase(token, data):
+    """Replaces alle out-bound Edges für owner_token in Supabase mit dem,
+    was in `data` steht (friends → status=accepted, requests_out → pending).
+    Strategie: delete-all-by-owner + insert. Atomic via PostgREST RPC wäre
+    schöner, aber 2 Queries reichen — bei Race kommen Daten leicht out-of-sync,
+    aber lazy-reload heilt das beim nächsten Read.
+    requests_in werden NICHT geschrieben — die gehören dem anderen Owner."""
+    if not SB_AVAILABLE or not token:
+        return False
+    data = data or {}
+    friends = [t for t in (data.get('friends') or []) if isinstance(t, str)]
+    reqs_out = [t for t in (data.get('requests_out') or []) if isinstance(t, str)]
+    rows = []
+    seen = set()
+    for ft in friends:
+        if ft in seen or ft == token:
+            continue
+        seen.add(ft)
+        rows.append({'owner_token': token, 'friend_token': ft, 'status': 'accepted'})
+    for ft in reqs_out:
+        if ft in seen or ft == token:
+            continue
+        seen.add(ft)
+        rows.append({'owner_token': token, 'friend_token': ft, 'status': 'pending'})
+    try:
+        sb.table('user_friends').delete().eq('owner_token', token).execute()
+        if rows:
+            for i in range(0, len(rows), 500):
+                sb.table('user_friends').upsert(
+                    rows[i:i+500], on_conflict='owner_token,friend_token'
+                ).execute()
+        return True
+    except Exception as e:
+        app.logger.error(
+            f'[friends] sb_save_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:200]}'
+        )
+        return False
+
+
+def _friends_load_from_disk(token):
+    """Liest komplette friends-Disk-Datei. Returns mind. {token, friends:[]}."""
+    p = _user_friends_path(token)
+    if not p:
+        return {'token': token, 'friends': []}
+    try:
+        with open(p) as f:
+            return json.load(f) or {'token': token, 'friends': []}
+    except Exception:
         return {'token': token, 'friends': []}
 
 
+def _friends_load(token):
+    """SB primary, Disk fallback. Lazy-Migration disk→SB beim ersten Read.
+    SB-Daten + disk-only Felder (groups) werden gemerged damit Caller die
+    alte Shape sehen.
+    """
+    if not token:
+        return {'token': token, 'friends': []}
+    sb_data = _friends_load_from_supabase(token)
+    if sb_data is not None:
+        # SB-Hit: groups (disk-only) dazumergen
+        disk = _friends_load_from_disk(token)
+        out = dict(sb_data)
+        if 'groups' in (disk or {}):
+            out['groups'] = disk.get('groups')
+        return out
+    # SB-Miss (down or error) → Disk-Fallback + lazy-Migration wenn SB up
+    disk = _friends_load_from_disk(token)
+    if SB_AVAILABLE and (disk.get('friends') or disk.get('requests_out') or
+                          disk.get('requests_in')):
+        # Lazy-Migration: nur ausführen wenn nicht-leer (sonst leere File
+        # provoziert ständig leeren SB-write).
+        app.logger.info(f'[friends] lazy-migrate tok={token[:8]} disk→supabase')
+        _friends_save_to_supabase(token, disk)
+    return disk
+
+
 def _friends_save(token, data):
-    p = _user_friends_path(token)
-    if not p: return False
-    try:
-        _atomic_write_json(p, data)
-        return True
-    except Exception:
+    """Schreibt sowohl Disk (cache) als auch SB (primary). True wenn mind.
+    eines erfolgreich war (analog _auth_save)."""
+    if not token:
         return False
+    disk_ok = False
+    p = _user_friends_path(token)
+    if p:
+        try:
+            _atomic_write_json(p, data)
+            disk_ok = True
+        except Exception as e:
+            app.logger.warning(f'[friends] disk_save_fail tok={token[:8]}: {e}')
+    sb_ok = _friends_save_to_supabase(token, data)
+    if not (sb_ok or disk_ok):
+        app.logger.error(
+            f'[friends] CRITICAL tok={token[:8]}: weder SB noch Disk gesichert!'
+        )
+        return False
+    return True
 
 
 @app.route('/api/user/friends/<token>', methods=['GET'])
@@ -8377,13 +8913,14 @@ def get_friend_roster(token, friend_token):
     if friend_token not in (me.get('friends') or []):
         return jsonify({'ok': False, 'shared': False,
                         'error': 'not_friends', 'days': []}), 403
-    # Share-Roster-Opt-in-Check
+    # Share-Roster-Default-Allow: User-Anweisung — Reziprozität, default an.
+    # Nur explizit auf False gesetzt heißt Opt-Out. Missing field = teilt.
     try:
         with open(_user_profile_path(friend_token)) as f:
             friend_profile = json.load(f).get('profile', {})
     except Exception:
         friend_profile = {}
-    if not friend_profile.get('share_roster'):
+    if friend_profile.get('share_roster') is False:
         return jsonify({'ok': True, 'shared': False,
                         'reason': 'friend_opted_out', 'days': []})
     # Friend roster: 1) aus _store (in-memory, frisch wenn Friend gerade aktiv),
@@ -8726,6 +9263,162 @@ def get_notams(icao):
         return jsonify(result)
     except Exception as e:
         return jsonify({'icao': icao, 'notams': [], 'error': 'notam_unavailable'}), 502
+
+
+# ─── Aviation-News Vollartikel-Proxy (aero.de) ──────────────────────────────
+# RSS-Feed liefert nur kurze <description>-Summaries (~150 chars). Die iOS-Card
+# zeigt jetzt Vollartikel inline → wir fetchen die Article-URL serverseitig,
+# extrahieren den Hauptartikel-Text per Regex-Heuristik und cachen 5min.
+# SSRF-Schutz: NUR aero.de-Host erlaubt — keinen beliebigen URL akzeptieren.
+
+@app.route('/api/news/article', methods=['GET'])
+def get_news_article():
+    """Vollartikel-Text einer aero.de-News-URL.
+    Query: ?url=<encoded full aero.de article URL>
+    Return: {ok: true, url, fulltext: "..."}  ·  bei Fehler 4xx/5xx mit ok:false.
+    SSRF-Schutz: host MUSS aero.de oder www.aero.de sein.
+    """
+    import re
+    from urllib.parse import urlparse, unquote
+    raw_url = request.args.get('url') or ''
+    raw_url = unquote(raw_url).strip()
+    if not raw_url:
+        return jsonify({'ok': False, 'error': 'missing_url'}), 400
+    try:
+        parsed = urlparse(raw_url)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'invalid_url'}), 400
+    if parsed.scheme not in ('http', 'https'):
+        return jsonify({'ok': False, 'error': 'invalid_scheme'}), 400
+    host = (parsed.netloc or '').lower().split(':')[0]
+    # SSRF-Schutz: nur aero.de erlauben (keine Subdomain-Spoofs wie aero.de.evil.com)
+    if host not in ('aero.de', 'www.aero.de'):
+        return jsonify({'ok': False, 'error': 'host_not_allowed'}), 403
+    cache_key = f'news_article:{raw_url}'
+    cached = _aviation_cache_get(cache_key, 300)
+    if cached is not None:
+        return jsonify(cached)
+    try:
+        import urllib.request as ur
+        # User-Agent: identifiziert AeroX-Research-Fetch, damit aero.de uns
+        # nicht als Bot bannt. Kein Cloudflare-Challenge-Bypass — wenn aero.de
+        # härter wird, muss man die Strategie überdenken.
+        req = ur.Request(raw_url, headers={
+            'User-Agent': 'AeroX/1.0 (research-fetch; +https://aerosteuer.de)',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'de-DE,de;q=0.9',
+        })
+        with ur.urlopen(req, timeout=10) as resp:
+            raw_bytes = resp.read()
+            charset = resp.headers.get_content_charset() or 'utf-8'
+        html = raw_bytes.decode(charset, errors='replace')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': str(e)[:200]}), 502
+
+    fulltext = _extract_article_text(html)
+    if not fulltext or len(fulltext) < 80:
+        # Extraction fehlgeschlagen — Client behält stattdessen die RSS-summary.
+        return jsonify({'ok': False, 'error': 'extraction_failed', 'url': raw_url}), 200
+
+    result = {'ok': True, 'url': raw_url, 'fulltext': fulltext}
+    _aviation_cache_set(cache_key, result, 300)
+    return jsonify(result)
+
+
+def _extract_article_text(html):
+    """Heuristische HTML→Text-Extraktion für aero.de Article-Pages.
+
+    Strategie (robust gegen Layout-Änderungen):
+      1. Strip <script>/<style>/<aside>/<nav>/<header>/<footer>/<form> blocks.
+      2. Versuche Container-Match in dieser Reihenfolge:
+         - <article ...> ... </article>
+         - <div class="article-content"> / id="article-content"
+         - <div class="news-text">
+         - <div class="entry-content"> (WordPress-Fallback)
+         - <main> ... </main>
+         - kompletter <body> (last-resort)
+      3. Aus dem Container: <p>-Tags zu Absätzen, andere Tags strippen.
+      4. HTML-Entities normalisieren.
+    """
+    import re
+    if not html:
+        return ''
+    # 1. Junk-Blocks komplett entfernen (inkl. ihrer Inhalte).
+    for tag in ('script', 'style', 'aside', 'nav', 'header', 'footer', 'form', 'noscript'):
+        html = re.sub(rf'<{tag}\b[^>]*>.*?</{tag}>', ' ',
+                      html, flags=re.IGNORECASE | re.DOTALL)
+    # HTML-Kommentare raus.
+    html = re.sub(r'<!--.*?-->', ' ', html, flags=re.DOTALL)
+
+    # 2. Container-Kandidaten in Reihenfolge ihrer Spezifizität.
+    container = None
+    patterns = [
+        r'<article\b[^>]*>(.*?)</article>',
+        r'<div\b[^>]*class="[^"]*article-content[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)',
+        r'<div\b[^>]*id="article-content"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)',
+        r'<div\b[^>]*class="[^"]*news-text[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)',
+        r'<div\b[^>]*class="[^"]*entry-content[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)',
+        r'<main\b[^>]*>(.*?)</main>',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
+        if m and len(m.group(1)) > 200:
+            container = m.group(1)
+            break
+    if not container:
+        # Last-resort: ganzer body.
+        m = re.search(r'<body\b[^>]*>(.*?)</body>', html,
+                      flags=re.IGNORECASE | re.DOTALL)
+        container = m.group(1) if m else html
+
+    # 3. <p>-Tags zu Absätzen, <br> zu Newline, dann restliche Tags raus.
+    container = re.sub(r'<br\s*/?>', '\n', container, flags=re.IGNORECASE)
+    container = re.sub(r'</p\s*>', '\n\n', container, flags=re.IGNORECASE)
+    container = re.sub(r'<p\b[^>]*>', '', container, flags=re.IGNORECASE)
+    container = re.sub(r'</?(h[1-6])\b[^>]*>', '\n\n', container, flags=re.IGNORECASE)
+    container = re.sub(r'</li\s*>', '\n', container, flags=re.IGNORECASE)
+    # alle restlichen Tags strippen
+    container = re.sub(r'<[^>]+>', '', container)
+
+    # 4. Entity-Normalisierung (named + numeric).
+    container = container.replace('&nbsp;', ' ')
+    container = container.replace('&amp;', '&')
+    container = container.replace('&quot;', '"')
+    container = container.replace('&apos;', "'")
+    container = container.replace('&lt;', '<')
+    container = container.replace('&gt;', '>')
+    container = container.replace('&ndash;', '–')
+    container = container.replace('&mdash;', '—')
+    container = container.replace('&laquo;', '«')
+    container = container.replace('&raquo;', '»')
+    container = container.replace('&bdquo;', '„')
+    container = container.replace('&ldquo;', '"')
+    container = container.replace('&rdquo;', '"')
+    container = container.replace('&euro;', '€')
+    # numerische entities &#123; und &#x1F4;
+    def _num_ent(m):
+        try:
+            code = m.group(1)
+            n = int(code[1:], 16) if code.startswith('x') or code.startswith('X') else int(code)
+            return chr(n)
+        except Exception:
+            return m.group(0)
+    container = re.sub(r'&#(x[0-9a-fA-F]+|[0-9]+);', _num_ent, container)
+
+    # Whitespace-Normalisierung: Tabs/CR raus, Mehrfach-Spaces collapsen,
+    # aber Absatz-Trennung (\n\n) erhalten.
+    container = container.replace('\r', '\n').replace('\t', ' ')
+    # collapse Mehrfach-Spaces pro Zeile
+    container = re.sub(r'[  ]+', ' ', container)
+    # >2 Newlines collapsen zu genau \n\n
+    container = re.sub(r'\n{3,}', '\n\n', container)
+    # Leerraum pro Zeile trimmen
+    lines = [ln.strip() for ln in container.split('\n')]
+    container = '\n'.join(lines).strip()
+    # Final: max 2 newlines, dann hard-cap auf 20k Zeichen damit Response nicht explodiert.
+    if len(container) > 20000:
+        container = container[:20000].rsplit('\n\n', 1)[0]
+    return container
 
 
 # ─── Logbook HTML-Export (EASA AMC1 FCL.050 + FAA FAR 61.51) ────────────────
@@ -11098,43 +11791,194 @@ def _ics_emit_tour(lines, tour):
 
 @app.route('/api/user/push-token/<token>', methods=['POST'])
 def register_push_token(token):
-    """Registriert einen Expo-Push-Token für diesen User. Wird bei
-    Friend-Updates / Layover-Match-Match genutzt (Sprint 6)."""
-    body = request.get_json(silent=True) or {}
-    push_token = (body.get('push_token') or '').strip()
-    if not push_token:
-        return jsonify({'ok': False, 'error': 'missing push_token'}), 400
-    p = _user_push_path(token)
-    if not p:
-        return jsonify({'ok': False, 'error': 'invalid token'}), 400
-    try:
-        with open(p, 'w') as f:
-            json.dump({
-                'token': token,
-                'push_token': push_token,
-                'platform': body.get('platform', 'expo'),
-                'registered_at': datetime.now().isoformat(),
-            }, f)
-        return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    """Registriert einen Push-Token (Expo *oder* APNs) für diesen User.
 
-
-def _send_push_notification(token, title, body):
-    """Versendet eine Expo-Push-Nachricht an einen User-Token (best effort).
-    Verwendet Expo Push API — keine APNs-Cert nötig wenn EAS-build verwendet.
+    Backwards-Compat: Akzeptiert sowohl `push_token` (Expo-Legacy, Web-Clients)
+    als auch `apns_token` (native iOS, R47). Beide werden im selben File
+    persistiert — `_send_push_notification` bevorzugt APNs wenn beides da ist.
     """
-    p = _user_push_path(token)
-    if not p: return False
+    body = request.get_json(silent=True) or {}
+    expo_token = (body.get('push_token') or '').strip()
+    apns_token = (body.get('apns_token') or '').strip()
+    if not expo_token and not apns_token:
+        return jsonify({'ok': False, 'error': 'missing push_token or apns_token'}), 400
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    existing = _push_load(token) or {}
+    merged = {
+        'token': token,
+        'push_token': expo_token or existing.get('push_token') or '',
+        'apns_token': apns_token or existing.get('apns_token') or '',
+        'platform': body.get('platform') or existing.get('platform') or ('ios' if apns_token else 'expo'),
+        'bundle_id': body.get('bundle_id') or existing.get('bundle_id') or 'de.aerosteuer.aeris',
+        'device_id': body.get('device_id') or existing.get('device_id') or '',
+        'registered_at': datetime.now().isoformat(),
+    }
+    if _push_save(token, merged):
+        return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+
+
+@app.route('/api/push/register-apns', methods=['POST'])
+def register_push_apns():
+    """Native iOS Push-Registration. Body: {token, apns_token, platform}.
+
+    Eigener Endpoint (zusätzlich zum legacy `/api/user/push-token/<token>`), damit
+    der iOS-Client einen klaren APNs-Pfad hat — der alte Endpoint bleibt aus
+    Backwards-Compat-Gründen bestehen.
+    """
+    body = request.get_json(silent=True) or {}
+    user_token = (body.get('token') or '').strip()
+    apns_token = (body.get('apns_token') or '').strip()
+    if not user_token or not apns_token:
+        return jsonify({'ok': False, 'error': 'missing token or apns_token'}), 400
+    existing = _push_load(user_token) or {}
+    merged = {
+        'token': user_token,
+        'push_token': existing.get('push_token') or '',  # Expo nicht überschreiben
+        'apns_token': apns_token,
+        'platform': body.get('platform', 'ios'),
+        'bundle_id': body.get('bundle_id') or existing.get('bundle_id') or 'de.aerosteuer.aeris',
+        'device_id': body.get('device_id') or existing.get('device_id') or '',
+        'registered_at': datetime.now().isoformat(),
+    }
+    if _push_save(user_token, merged):
+        return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+
+
+# ── APNs HTTP/2 Sender ───────────────────────────────────────────────────
+# Konfig via env-vars:
+#   APNS_AUTH_KEY      base64-encoded .p8 Datei (von Apple Developer Console)
+#   APNS_KEY_ID        10-Zeichen Key-ID (z.B. "ABCD123456")
+#   APNS_TEAM_ID       10-Zeichen Apple Team-ID
+#   APNS_TOPIC         Bundle-ID (default "de.aerosteuer.aeris")
+#   APNS_USE_SANDBOX   "1" für api.sandbox.push.apple.com (Dev-Builds)
+#
+# Wenn APNS_AUTH_KEY nicht gesetzt ist → wird übersprungen (warning gelogged,
+# kein Crash, keine Exception nach oben).
+
+_APNS_JWT_CACHE = {'token': None, 'iat': 0}
+
+
+def _apns_get_jwt():
+    """Generiert ein ES256-JWT für APNs Token-Auth. Cached für 50 Minuten
+    (Apple invalidiert Tokens nach 60 min, wir refreshen 10 min früher)."""
+    import os, time
+    now = int(time.time())
+    cached = _APNS_JWT_CACHE.get('token')
+    iat = _APNS_JWT_CACHE.get('iat', 0)
+    if cached and (now - iat) < 50 * 60:
+        return cached
+    auth_key_b64 = os.environ.get('APNS_AUTH_KEY', '').strip()
+    key_id = os.environ.get('APNS_KEY_ID', '').strip()
+    team_id = os.environ.get('APNS_TEAM_ID', '').strip()
+    if not (auth_key_b64 and key_id and team_id):
+        return None
     try:
-        with open(p) as f:
-            data = json.load(f)
-        push_token = data.get('push_token')
-        if not push_token: return False
+        import base64
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+        pem = base64.b64decode(auth_key_b64)
+        private_key = serialization.load_pem_private_key(pem, password=None)
+        header = {'alg': 'ES256', 'kid': key_id, 'typ': 'JWT'}
+        payload = {'iss': team_id, 'iat': now}
+
+        def _b64url(b):
+            return base64.urlsafe_b64encode(b).rstrip(b'=').decode('ascii')
+        header_b64 = _b64url(json.dumps(header, separators=(',', ':')).encode())
+        payload_b64 = _b64url(json.dumps(payload, separators=(',', ':')).encode())
+        signing_input = f"{header_b64}.{payload_b64}".encode('ascii')
+        der_sig = private_key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
+        r, s = decode_dss_signature(der_sig)
+        # JOSE: raw R||S, 32 bytes each
+        sig_raw = r.to_bytes(32, 'big') + s.to_bytes(32, 'big')
+        jwt = f"{header_b64}.{payload_b64}.{_b64url(sig_raw)}"
+        _APNS_JWT_CACHE['token'] = jwt
+        _APNS_JWT_CACHE['iat'] = now
+        return jwt
+    except Exception as e:
+        print(f"[APNS] JWT generation failed: {e}")
+        return None
+
+
+def _send_apns(apns_token, title, body, data=None):
+    """Sendet eine Push-Notification via APNs HTTP/2. Returns True bei 200.
+
+    Braucht `httpx[http2]` im Environment (HTTP/2 ist Pflicht — Apple lehnt
+    HTTP/1.1 ab). Wenn httpx/h2 fehlt → return False mit warning.
+    """
+    import os
+    jwt = _apns_get_jwt()
+    if not jwt:
+        return False  # caller handles fallback / skip
+    topic = os.environ.get('APNS_TOPIC', 'de.aerosteuer.aeris')
+    use_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
+    host = 'api.sandbox.push.apple.com' if use_sandbox else 'api.push.apple.com'
+    payload = {'aps': {'alert': {'title': title, 'body': body}, 'sound': 'default'}}
+    if data and isinstance(data, dict):
+        for k, v in data.items():
+            if k != 'aps':
+                payload[k] = v
+    try:
+        import httpx
+    except ImportError:
+        print("[APNS] httpx not installed — add 'httpx[http2]' to requirements.txt")
+        return False
+    try:
+        with httpx.Client(http2=True, timeout=10.0) as client:
+            resp = client.post(
+                f"https://{host}/3/device/{apns_token}",
+                headers={
+                    'authorization': f'bearer {jwt}',
+                    'apns-topic': topic,
+                    'apns-push-type': 'alert',
+                    'apns-priority': '10',
+                },
+                content=json.dumps(payload).encode('utf-8'),
+            )
+            if resp.status_code == 200:
+                return True
+            # 410 = device-token invalid/unregistered → caller könnte token löschen,
+            # aber für jetzt nur loggen.
+            print(f"[APNS] send failed status={resp.status_code} body={resp.text[:200]}")
+            return False
+    except Exception as e:
+        print(f"[APNS] transport error: {e}")
+        return False
+
+
+def _send_push_notification(token, title, body, data=None):
+    """Push-Send mit APNs-Bevorzugung + Expo-Fallback (best effort).
+
+    1. Lade Push-Registry für `token`.
+    2. Wenn `apns_token` gesetzt UND APNS_AUTH_KEY konfiguriert → APNs HTTP/2.
+    3. Sonst Expo (legacy, für Web-Clients ohne native App).
+    4. Wenn weder noch → silent return False.
+    """
+    import os
+    if not token:
+        return False
+    reg = _push_load(token) or {}
+    if not reg:
+        return False
+    apns_token = (reg.get('apns_token') or '').strip()
+    expo_token = (reg.get('push_token') or '').strip()
+    if apns_token and os.environ.get('APNS_AUTH_KEY', '').strip():
+        if _send_apns(apns_token, title, body, data=data):
+            return True
+        # APNs schlug fehl — falls Expo verfügbar, weiterversuchen.
+    elif apns_token and not os.environ.get('APNS_AUTH_KEY', '').strip():
+        print(f"[PUSH] APNS_AUTH_KEY not set — skipping APNs for user {token[:8]}")
+    if not expo_token:
+        return False
+    try:
         import urllib.request
         payload = json.dumps({
-            'to': push_token, 'title': title, 'body': body,
+            'to': expo_token, 'title': title, 'body': body,
             'sound': 'default', 'priority': 'high',
+            **({'data': data} if data else {}),
         }).encode('utf-8')
         req = urllib.request.Request(
             'https://exp.host/--/api/v2/push/send',
