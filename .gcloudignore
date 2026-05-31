@@ -1,0 +1,11 @@
+.git/
+.gitignore
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+_job_chunks_state/
+tests/
+*.md
+support_inbox/

@@ -67,6 +67,21 @@ app = Flask(__name__)
 # durch Cloud-Run-Edge gecapped, plus JSON-Overhead). Bei größerem Body: 413.
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
+# ── Logging-Level Boot-Setup ───────────────────────────────────────
+# Backend-Ops-Audit 2026-05-31: Flask/gunicorn default ist WARNING — d.h.
+# alle 47 app.logger.info(...) Calls (z.B. "[auth-reset] mail sent",
+# "[upload-files] ok ref=...") sind in Cloud-Run-Logs UNSICHTBAR.
+# Heißt: erfolgreiche Resend-Sends, erfolgreiche Uploads, Hash-Migrationen —
+# alles silent. LOG_LEVEL=INFO als Default; via env überschreibbar für Debug.
+import logging as _aerox_logging
+_log_level_name = os.environ.get('LOG_LEVEL', 'INFO').upper()
+_log_level = getattr(_aerox_logging, _log_level_name, _aerox_logging.INFO)
+app.logger.setLevel(_log_level)
+# Auch root + gunicorn.error Logger heben, sonst werden app.logger.info-Records
+# vom propagierten gunicorn-handler trotzdem geschluckt.
+_aerox_logging.getLogger().setLevel(_log_level)
+_aerox_logging.getLogger('gunicorn.error').setLevel(_log_level)
+
 
 # ── P0 #10 (P1 nach Triage): RECOVERY_SECRET Boot-Check ──────────────
 RECOVERY_SECRET_MIN_LEN = 32
@@ -8742,14 +8757,29 @@ def _build_logbook_html(token, standard='EASA'):
     except Exception:
         pass
 
+    import html as _html_escape
+    def _esc(v, maxlen=200):
+        s = '' if v is None else str(v)
+        if maxlen and len(s) > maxlen: s = s[:maxlen]
+        return _html_escape.escape(s, quote=True)
+
     rows_html = []
+    # EASA AMC1 FCL.050 / FAR 61.51: PIC-Zeiten auch für Standby-with-Activation,
+    # Ferry, Training → wenn FlightOps eine flightNumber kennt, zeige den Tag
+    # auch wenn klass nicht Z72/73/74/76 ist. Sonst fehlen activated-SBY-Flights.
+    seen_dates = set()
     for t in tage:
         if not isinstance(t, dict): continue
         klass = (t.get('klass') or '').upper()
-        if klass not in ('Z72','Z73','Z74','Z76'): continue
         datum = t.get('datum') or ''
         rf = t.get('reader_facts') or {}
         ops = ops_by_date.get(datum, {}) or {}
+        is_flight_klass = klass in ('Z72','Z73','Z74','Z76')
+        has_flight_ops = bool(ops.get('flightNumber'))
+        if not (is_flight_klass or has_flight_ops):
+            continue
+        if datum in seen_dates: continue
+        seen_dates.add(datum)
         routing = (t.get('routing') or '').replace('-', ' → ')
         flight_no = ops.get('flightNumber') or ''
         reg = ops.get('aircraftReg') or ''
@@ -8757,16 +8787,28 @@ def _build_logbook_html(token, standard='EASA'):
         start = rf.get('start_time') or ''
         end = rf.get('end_time') or ''
         pax = (ops.get('pax_adults') or 0) + (ops.get('pax_children') or 0) + (ops.get('pax_infants') or 0)
-        rows_html.append(f'<tr><td>{datum}</td><td>{flight_no}</td><td>{atype}</td><td>{reg}</td>'
-                         f'<td>{routing}</td><td>{start}</td><td>{end}</td><td>{pax or ""}</td>'
-                         f'<td>{ops.get("remarks","")[:60]}</td></tr>')
+        remarks = (ops.get('remarks') or '')[:60]
+        if has_flight_ops and not is_flight_klass:
+            tag = f'[{klass or "SBY-ACT"}] '
+            remarks = (tag + remarks)[:60]
+        rows_html.append(
+            f'<tr><td>{_esc(datum, 10)}</td><td>{_esc(flight_no, 20)}</td>'
+            f'<td>{_esc(atype, 20)}</td><td>{_esc(reg, 20)}</td>'
+            f'<td>{_esc(routing, 120)}</td><td>{_esc(start, 10)}</td>'
+            f'<td>{_esc(end, 10)}</td><td>{_esc(pax or "", 10)}</td>'
+            f'<td>{_esc(remarks, 60)}</td></tr>'
+        )
 
-    name = (profile.get('name') or '').replace('<','').replace('>','')
+    name = _esc(profile.get('name') or '', 80)
+    position = _esc(profile.get('position') or '', 60)
+    airline = _esc(profile.get('airline') or '', 80)
+    homebase = _esc(profile.get('homebase') or '', 10)
     title = 'AMC1 FCL.050 Logbook' if standard == 'EASA' else 'FAR 61.51 Pilot Logbook'
     cols = ('Datum | Flugnr | Type | Reg | Routing | OffBl | OnBl | PAX | Bemerkungen'
             if standard == 'EASA'
             else 'Date | Flight | Type | Reg | Route | Off | On | PAX | Remarks')
-    head = ''.join(f'<th>{c.strip()}</th>' for c in cols.split('|'))
+    head = ''.join(f'<th>{_esc(c.strip(), 30)}</th>' for c in cols.split('|'))
+    std_esc = _esc(standard, 10)
 
     html = f"""<!doctype html>
 <html lang="de"><head><meta charset="utf-8"><title>{title} — {name}</title>
@@ -8783,11 +8825,11 @@ def _build_logbook_html(token, standard='EASA'):
   @media print{{body{{background:white;color:black}} th{{background:#eee;color:#000}} tr:nth-child(even) td{{background:#fafafa}}}}
 </style></head><body>
 <h1>{title}</h1>
-<div class="sub">{name} · {profile.get('position','')} · {profile.get('airline','')} · Homebase {profile.get('homebase','')}</div>
+<div class="sub">{name} · {position} · {airline} · Homebase {homebase}</div>
 <table><thead><tr>{head}</tr></thead><tbody>
 {''.join(rows_html) if rows_html else '<tr><td colspan="9" style="text-align:center;color:#5e6679;padding:30px">Keine Flugtage vorhanden.</td></tr>'}
 </tbody></table>
-<div class="foot">Erzeugt: {datetime.now().strftime('%Y-%m-%d %H:%M')} · Standard: {standard} · Tage gesamt: {len(rows_html)}</div>
+<div class="foot">Erzeugt: {datetime.now().strftime('%Y-%m-%d %H:%M')} · Standard: {std_esc} · Tage gesamt: {len(rows_html)}</div>
 <div class="sig">Unterschrift: ____________________________ Datum: ______________</div>
 </body></html>"""
     return html
@@ -9215,6 +9257,11 @@ def get_dm_inbox(token):
             with open(last_seen_p) as f: last_seen = json.load(f) or {}
     except Exception: pass
     inbox = []
+    # send_chat_message speichert author_token PII-truncated als
+    # `token[:16] + "…"`. Beim Vergleich hier muessen wir gegen dieselbe
+    # truncated Form pruefen — sonst zaehlt jede eigene Message faelschlich
+    # als unread (Bug pre-2026-05-31).
+    my_author_id = (token[:16] + '…') if token else ''
     for friend_token in friends:
         ch = _dm_channel(token, friend_token)
         if not ch: continue
@@ -9223,12 +9270,20 @@ def get_dm_inbox(token):
         unread = 0
         if os.path.exists(cp):
             try:
-                with open(cp) as f: msgs = json.load(f) or []
+                with open(cp) as f: raw = json.load(f)
+                # send_chat_message schreibt {'messages': [...]} dict-wrapped;
+                # alte Files koennen evtl. flat-list sein → beides tolerieren.
+                if isinstance(raw, dict):
+                    msgs = raw.get('messages') or []
+                elif isinstance(raw, list):
+                    msgs = raw
+                else:
+                    msgs = []
                 if msgs:
                     last_msg = msgs[-1]
                     seen_ts = float(last_seen.get(ch) or 0)
                     unread = sum(1 for m in msgs
-                                 if m.get('author_token') != token
+                                 if m.get('author_token') != my_author_id
                                  and float(m.get('ts') or 0) > seen_ts)
             except Exception: pass
         inbox.append({
@@ -9236,7 +9291,7 @@ def get_dm_inbox(token):
             'channel_id': ch,
             'last_message_at': (last_msg or {}).get('ts'),
             'last_message_preview': ((last_msg or {}).get('text') or '')[:80],
-            'last_message_from_me': (last_msg or {}).get('author_token') == token,
+            'last_message_from_me': (last_msg or {}).get('author_token') == my_author_id,
             'unread_count': unread,
         })
     inbox.sort(key=lambda x: -(x.get('last_message_at') or 0))
@@ -9476,6 +9531,19 @@ def create_wall_post(token):
     if len(raw_text) > 2000:
         return jsonify({'ok': False, 'error': 'text_too_long'}), 413
     text = _sanitize_user_text(raw_text, max_len=2000)
+    # Hashtags aus Body extrahieren — analog Forum (FORUM_HASHTAG_RE).
+    # Frontend hängt Picker-Tags als "#tag1 #tag2" an den Body an; das
+    # Backend persistiert hier eine deduplizierte Liste für Display + Suche.
+    extracted_tags = []
+    try:
+        seen = set()
+        for m in FORUM_HASHTAG_RE.finditer(raw_text or ''):
+            t = (m.group(1) or '').lower()
+            if t and t not in seen and len(extracted_tags) < 20:
+                seen.add(t)
+                extracted_tags.append(t)
+    except Exception:
+        extracted_tags = []
     import uuid, time
     post = {
         'id': str(uuid.uuid4())[:12],
@@ -9484,6 +9552,7 @@ def create_wall_post(token):
         'text': text,
         'image_url': image_url,
         'layover_iata': layover if layover and len(layover) == 3 else None,
+        'hashtags': extracted_tags,
         'created_at': datetime.now().isoformat(),
         'ts': time.time(),
         'like_count': 0,
@@ -11066,25 +11135,121 @@ def _user_auth_path():
     return os.path.join(_USER_HISTORY_DIR, 'auth_users.json')
 
 
-def _auth_load():
+_AUTH_KNOWN_COLS = {
+    'password_hash', 'token', 'apple_sub', 'reset_token', 'reset_expires',
+    'reset_used_at', 'hash_migrated_at', 'created_at', 'last_login_at',
+}
+
+
+def _auth_load_from_supabase():
+    """Liest alle Auth-Records aus Supabase. None bei SB-down/Fehler.
+    Paginiert (Supabase default range-Limit ist 1000)."""
+    if not SB_AVAILABLE:
+        return None
+    try:
+        out = {}
+        offset = 0
+        page = 1000
+        while True:
+            r = sb.table('auth_users').select('*').range(offset, offset + page - 1).execute()
+            rows = r.data or []
+            for row in rows:
+                email = row.get('email')
+                if not email:
+                    continue
+                rec = {}
+                for k in _AUTH_KNOWN_COLS:
+                    v = row.get(k)
+                    if v is not None:
+                        rec[k] = v
+                md = row.get('metadata') or {}
+                if isinstance(md, dict):
+                    rec.update(md)
+                out[email] = rec
+            if len(rows) < page:
+                break
+            offset += page
+        return out
+    except Exception as e:
+        app.logger.warning(f'[auth] sb_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _auth_save_to_supabase(d):
+    """Bulk-upsert aller Auth-Records nach Supabase. True bei vollem Erfolg,
+    False bei Fehler. Splittet in 500er Batches."""
+    if not SB_AVAILABLE or not d:
+        return False
+    rows = []
+    for email, rec in (d or {}).items():
+        if not email:
+            continue
+        row = {'email': email}
+        meta = {}
+        for k, v in (rec or {}).items():
+            if k in _AUTH_KNOWN_COLS:
+                row[k] = v
+            else:
+                meta[k] = v
+        row['metadata'] = meta
+        rows.append(row)
+    if not rows:
+        return False
+    try:
+        for i in range(0, len(rows), 500):
+            sb.table('auth_users').upsert(rows[i:i+500], on_conflict='email').execute()
+        return True
+    except Exception as e:
+        app.logger.error(f'[auth] sb_save_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _auth_load_from_disk():
+    """Read auth_users.json from disk. Returns dict (possibly empty)."""
     import os, json
     p = _user_auth_path()
-    if not os.path.exists(p): return {}
+    if not os.path.exists(p):
+        return {}
     try:
-        with open(p) as f: return json.load(f) or {}
-    except Exception: return {}
+        with open(p) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _auth_load():
+    """P0-Fix 2026-05-31: Supabase primary (ohne wäre auf Cloud Run jeder
+    Redeploy = Wipe). Bei leerer SB + Disk-Daten: einmalige Migration."""
+    sb_data = _auth_load_from_supabase()
+    if sb_data is None:
+        # SB-Ausfall — Disk-Fallback
+        return _auth_load_from_disk()
+    if sb_data:
+        return sb_data
+    # SB erreichbar aber leer — prüfen ob Disk Legacy-Daten hat, einmalig migrieren
+    disk_data = _auth_load_from_disk()
+    if disk_data and SB_AVAILABLE:
+        app.logger.info(f'[auth] lazy-migrate {len(disk_data)} disk users → supabase')
+        _auth_save_to_supabase(disk_data)
+        return disk_data
+    return {}
 
 
 def _auth_save(d):
-    """KRITISCH: auth_users.json darf nicht halb-geschrieben werden
-    (würde alle Logins killen). _atomic_write_json garantiert all-or-nothing
-    via tempfile + os.replace."""
+    """P0-Fix 2026-05-31: schreibt zu Supabase (primary) + Disk (best-effort
+    Read-Cache). Atomic-Write garantiert dass disk nie halb-geschrieben ist.
+    Returns True wenn mindestens ein Pfad gehalten hat."""
+    disk_ok = False
     try:
         _atomic_write_json(_user_auth_path(), d)
-        return True
+        disk_ok = True
     except Exception as e:
-        app.logger.error(f'[auth] save failed: {e}')
+        app.logger.warning(f'[auth] disk_save_fail (ok wenn SB läuft): {e}')
+    sb_ok = _auth_save_to_supabase(d)
+    if not (sb_ok or disk_ok):
+        app.logger.error('[auth] CRITICAL: weder Supabase noch Disk gesichert — Daten verloren!')
         return False
+    return True
 
 
 def _auth_hash(pw):
@@ -11156,12 +11321,26 @@ def _password_policy_ok(pw):
     return (True, None)
 
 
+_EMAIL_RX = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]{2,}$')
+
+def _email_valid(email: str) -> bool:
+    """Server-seitige Email-Plausi.
+    Akzeptiert: max-length, mind. 1 Punkt nach @, kein Whitespace, Plus-Addresses
+    (`foo+bar@x.de`), Akzente / IDN-Hosts werden vom Backend nicht punkt-genau
+    verifiziert — sind aber kein hartes Verbot (manche Crew-Mitglieder haben
+    realen Umlaut im Username-Part). 'a@b' wird abgelehnt (kein TLD).
+    """
+    if not email or len(email) > 254:
+        return False
+    return bool(_EMAIL_RX.match(email))
+
+
 @app.route('/api/auth/signup', methods=['POST'])
 def auth_signup():
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip().lower()
     pw = body.get('password') or ''
-    if not email or '@' not in email:
+    if not _email_valid(email):
         return jsonify({'ok': False, 'error': 'email_invalid'}), 400
     ok_pw, err = _password_policy_ok(pw)
     if not ok_pw:
@@ -11185,6 +11364,10 @@ def auth_login():
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip().lower()
     pw = body.get('password') or ''
+    # Leere Felder direkt ablehnen — sonst landen wir mit pw='' im hash-vergleich,
+    # was unnötig CPU kostet und das Email-rate-limit unnötig hochzieht.
+    if not email or not pw:
+        return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
     # Brute-Force-Schutz: 10 Login-Versuche pro Email + 30 pro IP pro 10 Min.
     # Email-Limit verhindert gezieltes Knacken eines Accounts; IP-Limit blockt
     # User-Enumeration über viele Emails von gleicher Quelle.
@@ -11290,10 +11473,10 @@ def _verify_apple_identity_token(token, expected_sub=None):
 @app.route('/api/auth/apple', methods=['POST'])
 def auth_apple():
     """Sign-in-with-Apple. Verifiziert identity_token kryptographisch
-    (RS256 via Apple JWKS) wenn iOS-Client das Token mitschickt. Fallback
-    ohne Token = legacy-Pfad mit Warnung.
+    (RS256 via Apple JWKS). identity_token ist PFLICHT — kein Legacy-Pfad
+    (sonst koennte jeder mit beliebigem apple_sub einen Account uebernehmen).
 
-    Body: {apple_sub, email?, name?, identity_token?}
+    Body: {apple_sub, email?, name?, identity_token}
     """
     body = request.get_json(silent=True) or {}
     apple_sub = (body.get('apple_sub') or '').strip()
@@ -11302,35 +11485,37 @@ def auth_apple():
     identity_token = (body.get('identity_token') or '').strip()
     if not apple_sub:
         return jsonify({'ok': False, 'error': 'apple_sub_required'}), 400
+    # identity_token ist Pflicht — Security-Hardening (kein anonymes
+    # apple_sub-Trust mehr, sonst koennte jeder einen Account uebernehmen).
+    if not identity_token:
+        return jsonify({'ok': False, 'error': 'identity_token_required',
+                        'message': 'iOS-Client muss identity_token mitschicken.'}), 400
 
-    # Wenn identity_token mitgeschickt → kryptographisch verifizieren.
-    # Wenn nicht → Legacy-Pfad (alte iOS-Clients), aber loggen.
-    if identity_token:
-        ok, verified_sub, verified_email = _verify_apple_identity_token(
-            identity_token, expected_sub=apple_sub)
-        if not ok:
-            return jsonify({'ok': False, 'error': 'invalid_apple_token'}), 401
-        # Email aus dem Token bevorzugen wenn vorhanden (kann private relay sein)
-        if verified_email and '@' in verified_email:
-            email = verified_email.lower()
-    else:
-        app.logger.warning(
-            f'[apple-auth] no identity_token provided for sub {apple_sub[:8]}… — legacy path')
+    ok, verified_sub, verified_email = _verify_apple_identity_token(
+        identity_token, expected_sub=apple_sub)
+    if not ok:
+        return jsonify({'ok': False, 'error': 'invalid_apple_token'}), 401
+    # Email aus dem Token bevorzugen wenn vorhanden (kann private relay sein)
+    if verified_email and '@' in verified_email:
+        email = verified_email.lower()
     # Apple liefert manchmal eine "private-relay" Email · ok als unique key
     if not email or '@' not in email:
         # Fallback: use sub as pseudo-email
         email = f'apple-{apple_sub[:20]}@privaterelay.aerox'
     users = _auth_load()
-    # Existing user via apple_sub match?
+    # Existing user via apple_sub match? (bereits verknuepft → ok)
     for ex_email, ex_user in users.items():
         if ex_user.get('apple_sub') == apple_sub:
             return jsonify({'ok': True, 'token': ex_user['token'], 'email': ex_email})
-    # Existing user via email match (z.B. user hat erst klassisch signed-up)
+    # Existing user via email match: NICHT automatisch linken — Sicherheit.
+    # Jemand koennte sonst per Apple-Sign-In Zugriff auf einen fremden
+    # Email/Password-Account erlangen, falls die Email zufaellig matched.
+    # User muss sich erst klassisch einloggen und dann manuell verknuepfen.
     if email in users:
-        # Link: speichere apple_sub am existierenden Account
-        users[email]['apple_sub'] = apple_sub
-        _auth_save(users)
-        return jsonify({'ok': True, 'token': users[email]['token'], 'email': email})
+        return jsonify({'ok': False, 'error': 'account_exists_unlink',
+                        'message': 'Es existiert bereits ein Account mit dieser E-Mail. '
+                                   'Bitte logge dich erst per Passwort ein und verknuepfe '
+                                   'dann Apple-Sign-In im Profil.'}), 409
     # Neuer Account
     import uuid as _u
     token = 'AT-' + _u.uuid4().hex[:16].upper()
@@ -12033,23 +12218,116 @@ def import_calendar_feed(token):
             text = raw.decode('utf-8', errors='replace')
     except Exception as e:
         return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': str(e)[:200]}), 502
-    # Sehr einfacher ICS-Parser: zählt VEVENTs + SUMMARYs
+    # RFC-5545-konformer ICS-Parser (minimal, ohne icalendar-Dep):
+    #  1) Line-Folding (§3.1): Zeilen die mit SPACE/TAB beginnen sind
+    #     Continuations der vorherigen Zeile → vor dem Parsen unfolden.
+    #  2) TZID-Parameter: DTSTART;TZID=Europe/Berlin:20260315T140000 →
+    #     in UTC umrechnen (via stdlib zoneinfo). Floating-Times bleiben
+    #     als naive UTC behandelt (Best-Effort), 'Z'-Suffix ist UTC.
+    #  3) STATUS:CANCELLED → Event skippen (nicht importieren).
+    #  4) Datum-Bucket wird aus dem TZ-aware datetime in UTC abgeleitet,
+    #     nicht naiv string-slice.
+    try:
+        from zoneinfo import ZoneInfo
+        _ZI_OK = True
+    except Exception:
+        ZoneInfo = None  # type: ignore
+        _ZI_OK = False
+
+    def _ics_unfold(src):
+        out = []
+        for raw in src.splitlines():
+            # RFC 5545 §3.1: führender SPACE oder TAB = Fortsetzung
+            if raw.startswith((' ', '\t')) and out:
+                out[-1] = out[-1] + raw[1:]
+            else:
+                out.append(raw)
+        return out
+
+    def _parse_ics_dt(value, params):
+        """Liefert (utc_datetime_or_None, date_bucket_yyyy_mm_dd_or_None).
+        Akzeptiert: 20260315T140000Z (UTC) · 20260315T140000 (floating/TZID) ·
+        20260315 (DATE).
+        """
+        v = (value or '').strip()
+        if not v:
+            return None, None
+        # DATE-only
+        if len(v) == 8 and v.isdigit():
+            return None, f'{v[0:4]}-{v[4:6]}-{v[6:8]}'
+        # DATETIME
+        m = re.match(r'^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$', v)
+        if not m:
+            digits = re.sub(r'\D', '', v)[:8]
+            if len(digits) == 8:
+                return None, f'{digits[0:4]}-{digits[4:6]}-{digits[6:8]}'
+            return None, None
+        Y, M, D, h, mi, s, z = m.groups()
+        try:
+            naive = datetime(int(Y), int(M), int(D), int(h), int(mi), int(s))
+        except Exception:
+            return None, None
+        tzid = params.get('TZID') if params else None
+        utc_dt = None
+        if z == 'Z':
+            try:
+                utc_dt = naive.replace(tzinfo=ZoneInfo('UTC')) if _ZI_OK else naive
+            except Exception:
+                utc_dt = naive
+        elif tzid and _ZI_OK:
+            try:
+                aware = naive.replace(tzinfo=ZoneInfo(tzid))
+                utc_dt = aware.astimezone(ZoneInfo('UTC'))
+            except Exception:
+                utc_dt = naive  # unbekannte TZID → floating
+        else:
+            utc_dt = naive  # floating local time
+        bucket = (utc_dt.strftime('%Y-%m-%d') if utc_dt is not None
+                  else f'{Y}-{M}-{D}')
+        return utc_dt, bucket
+
     events = []
     current = None
-    for line in text.splitlines():
-        line = line.strip()
+    for raw_line in _ics_unfold(text):
+        line = raw_line.strip()
+        if not line:
+            continue
         if line == 'BEGIN:VEVENT':
-            current = {}
+            current = {'_cancelled': False}
         elif line == 'END:VEVENT' and current is not None:
-            if current: events.append(current)
+            if current and not current.get('_cancelled'):
+                current.pop('_cancelled', None)
+                events.append(current)
             current = None
         elif current is not None and ':' in line:
-            k, _, v = line.partition(':')
-            k = k.split(';')[0]
-            if k == 'SUMMARY': current['summary'] = v[:80]
-            elif k == 'DTSTART': current['start'] = v[:16]
-            elif k == 'DTEND': current['end'] = v[:16]
-            elif k == 'LOCATION': current['location'] = v[:60]
+            name_part, _, value = line.partition(':')
+            segs = name_part.split(';')
+            k = segs[0].upper()
+            params = {}
+            for seg in segs[1:]:
+                if '=' in seg:
+                    pk, _, pv = seg.partition('=')
+                    params[pk.strip().upper()] = pv.strip()
+            v = value.strip()
+            if k == 'SUMMARY':
+                current['summary'] = v[:80]
+            elif k == 'LOCATION':
+                current['location'] = v[:60]
+            elif k == 'STATUS':
+                if v.upper() == 'CANCELLED':
+                    current['_cancelled'] = True
+            elif k == 'DTSTART':
+                utc_dt, bucket = _parse_ics_dt(v, params)
+                if bucket:
+                    current['start'] = bucket  # date-bucket (yyyy-mm-dd)
+                if utc_dt is not None:
+                    current['start_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            elif k == 'DTEND':
+                utc_dt, bucket = _parse_ics_dt(v, params)
+                if bucket:
+                    current['end'] = bucket
+                if utc_dt is not None:
+                    current['end_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
     # Save Events
     p = _user_profile_path(token)
     try:
@@ -12073,10 +12351,16 @@ def import_calendar_feed(token):
             with open(bp) as f: briefings = json.load(f) or {}
         except Exception: pass
         for ev in events[:200]:
+            # 'start' ist seit RFC-5545-Parser bereits 'yyyy-mm-dd' (TZ-korrekt).
+            # Falls aus altem Pfad noch ein DTSTART-Roh-String hineinrutscht
+            # ('20260315T140000Z'), tolerant beide Formate akzeptieren.
             start = (ev.get('start') or '').strip()
-            if len(start) < 8: continue
-            # DTSTART-Format: '20260315T140000Z' oder '20260315'
-            date_str = f"{start[0:4]}-{start[4:6]}-{start[6:8]}"
+            if re.match(r'^\d{4}-\d{2}-\d{2}$', start):
+                date_str = start
+            elif len(start) >= 8 and start[:8].isdigit():
+                date_str = f"{start[0:4]}-{start[4:6]}-{start[6:8]}"
+            else:
+                continue
             if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str): continue
             existing_b = briefings.get(date_str, {})
             existing_b['ical_summary'] = (ev.get('summary') or '')[:80]
@@ -16659,18 +16943,9 @@ def _sonnet_read_lsb_v2(pdf_bytes_list):
     }
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
-    is_first = True
-    for pdf_bytes in pdf_bytes_list:
-        try:
-            content = [
-                {
-                    'type': 'document',
-                    'source': {'type': 'base64', 'media_type': 'application/pdf',
-                               'data': base64.b64encode(pdf_bytes).decode()}
-                },
-                {
-                    'type': 'text',
-                    'text': """Du bekommst eine deutsche elektronische Lohnsteuerbescheinigung (eLSTB).
+    # Prompt-Caching (ephemeral, 5-min TTL): _LSB_SYSTEM_PROMPT ist 100% statisch
+    # (keine User-Variablen) → bei Multi-LSB oder Re-Read voller Cache-Hit.
+    _LSB_SYSTEM_PROMPT = """Du bekommst eine deutsche elektronische Lohnsteuerbescheinigung (eLSTB).
 
 ═══ FORMAT EINER eLSTB ═══
 
@@ -16708,6 +16983,18 @@ Manche Felder können auf Folgeseiten weitergehen — lies ALLE Seiten.
 
 Liefere via Tool. Bei UNSICHER welcher Wert zu welcher Zeile gehört: lieber 0 als
 falscher Wert."""
+    is_first = True
+    for pdf_bytes in pdf_bytes_list:
+        try:
+            content = [
+                {
+                    'type': 'document',
+                    'source': {'type': 'base64', 'media_type': 'application/pdf',
+                               'data': base64.b64encode(pdf_bytes).decode()}
+                },
+                {
+                    'type': 'text',
+                    'text': 'Liefere via Tool die strukturierten LSB-Werte.'
                 }
             ]
             resp = None
@@ -16716,6 +17003,8 @@ falscher Wert."""
                     resp = client.messages.create(
                         model='claude-sonnet-4-6', max_tokens=2000,
                         temperature=0.0,  # R24: deterministischer Reader
+                        system=[{'type': 'text', 'text': _LSB_SYSTEM_PROMPT,
+                                 'cache_control': {'type': 'ephemeral'}}],
                         tools=[lsb_tool],
                         tool_choice={'type': 'tool', 'name': 'submit_lsb_extraktion'},
                         messages=[{'role': 'user', 'content': content}]
@@ -17175,18 +17464,20 @@ LIEFERE via Tool 'submit_cas_days'."""
         _v2_active = False
         _v2_tool_name = 'submit_cas_days'
 
+    # Prompt-Caching: prompt enthält {year}+{homebase}+optional _V2_INSTR —
+    # pro Job stabil. Bei Multi-CAS-PDFs (~12 PDFs) volle Cache-Trefferquote
+    # ab dem zweiten Call.
     if use_text_path:
         # v11 Text-Pfad: pdfplumber-Text als plain text statt PDF-Bytes.
         # Spart Vision-Latency + ~50 KB base64 im Memory.
         content = [
-            {'type': 'text', 'text': f'CAS-Plan (extrahiert via pdfplumber):\n\n{cas_text}\n\n---\n{prompt}'},
+            {'type': 'text', 'text': f'CAS-Plan (extrahiert via pdfplumber):\n\n{cas_text}'},
         ]
     else:
         # Vision-Fallback: PDF als base64 (OCR-PDFs, leere text-Layer, etc.)
         content = [
             {'type': 'document', 'source': {'type': 'base64', 'media_type': 'application/pdf',
                                               'data': _b64.b64encode(pdf_bytes).decode()}},
-            {'type': 'text', 'text': prompt},
         ]
 
     # v11 Commit 2: max_tokens=12000 default. Wenn Sonnet bei max_tokens
@@ -17198,6 +17489,8 @@ LIEFERE via Tool 'submit_cas_days'."""
             model='claude-sonnet-4-6',
             max_tokens=_max_tokens,
             temperature=0.0,  # R24: deterministischer Reader, weniger Stochastik
+            system=[{'type': 'text', 'text': prompt,
+                     'cache_control': {'type': 'ephemeral'}}],
             tools=[cas_tool],
             tool_choice={'type': 'tool', 'name': _v2_tool_name},
             messages=[{'role': 'user', 'content': content}],
@@ -19517,7 +19810,9 @@ sollte der Output in 32k Tokens passen.
 
 LIEFERE jetzt via Tool die strukturierten SE-Zeilen."""
 
-    content.append({'type': 'text', 'text': prompt})
+    # Prompt-Caching: prompt enthält nur {year} als Variable — pro Tax-Year stabil.
+    # Bei Multi-PDF / Re-Read voller Cache-Hit auf system-Prefix.
+    content.append({'type': 'text', 'text': 'Liefere via Tool die strukturierten SE-Zeilen.'})
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=300.0)
     import time as _t
@@ -19529,6 +19824,8 @@ LIEFERE jetzt via Tool die strukturierten SE-Zeilen."""
                 resp = client.messages.create(
                     model='claude-sonnet-4-6', max_tokens=32000,
                     temperature=0.0,  # R24: deterministischer Reader
+                    system=[{'type': 'text', 'text': prompt,
+                             'cache_control': {'type': 'ephemeral'}}],
                     tools=[se_struct_tool],
                     tool_choice={'type': 'tool', 'name': 'submit_se_lines'},
                     messages=[{'role': 'user', 'content': content}]
@@ -26765,6 +27062,11 @@ hast du Monate übersehen oder Storno-Zeilen mitgezählt.
 
 Liefere via Tool das strukturierte Ergebnis."""
     })
+    # Prompt-Caching: das Text-prompt ist letzte content-Position. Wir
+    # extrahieren das prompt-Stück und legen es als system-Block mit
+    # cache_control ab — Variable ist nur {year}, pro Tax-Year stabil.
+    _se_summary_system_prompt = content[-1]['text']
+    content = content[:-1] + [{'type': 'text', 'text': 'Liefere via Tool das strukturierte SE-Summen-Ergebnis.'}]
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
     try:
@@ -26773,6 +27075,8 @@ Liefere via Tool das strukturierte Ergebnis."""
             try:
                 resp = client.messages.create(
                     model='claude-sonnet-4-6', max_tokens=2000,
+                    system=[{'type': 'text', 'text': _se_summary_system_prompt,
+                             'cache_control': {'type': 'ephemeral'}}],
                     tools=[se_tool],
                     tool_choice={'type': 'tool', 'name': 'submit_se_summen'},
                     messages=[{'role': 'user', 'content': content}]
