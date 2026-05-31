@@ -2986,6 +2986,27 @@ def _run_process_async(job_id, form, files):
             })
             # Verknüpfung dl_token → session_token, damit Download den Token consumen kann
             _store.setdefault(token, {})['session_token'] = session_token
+            # B9-Fix: Wenn User share_roster aktiv hat, persistieren wir das
+            # tage_detail in roster_snapshot_<token>.json, damit Friends
+            # darauf auch nach Container-Restart Zugriff haben (vorher: nur
+            # in-memory _store → bei Render-Sleep verlor man alle Friend-Rosters).
+            try:
+                pp = _user_profile_path(session_token)
+                if pp and os.path.exists(pp):
+                    with open(pp) as _pf:
+                        _pdata = json.load(_pf) or {}
+                    if (_pdata.get('profile') or {}).get('share_roster'):
+                        _sp = _roster_snapshot_path(session_token)
+                        if _sp:
+                            _tage = safe.get('_tage_detail') or []
+                            with open(_sp, 'w') as _sf:
+                                json.dump({
+                                    'taken_at': datetime.now().isoformat(),
+                                    'auto_saved': True,
+                                    'tage': _tage,
+                                }, _sf, ensure_ascii=False)
+            except Exception as _e:
+                app.logger.warning(f'[share-roster-auto-save] {_e}')
 
         with _jobs_lock:
             _jobs[job_id] = {
@@ -8349,9 +8370,20 @@ def get_friend_roster(token, friend_token):
     if not friend_profile.get('share_roster'):
         return jsonify({'ok': True, 'shared': False,
                         'reason': 'friend_opted_out', 'days': []})
-    # Friend roster aus _store (best-effort, nur wenn Friend kürzlich aktiv war)
+    # Friend roster: 1) aus _store (in-memory, frisch wenn Friend gerade aktiv),
+    # 2) Fallback auf persistenten roster_snapshot — überlebt Container-Restart.
+    # Vorher: nur _store → bei Render-Sleep waren alle Friend-Rosters leer.
     sess = _store.get(friend_token) or {}
     tage = (sess.get('result_data') or {}).get('_tage_detail') or []
+    if not tage:
+        sp = _roster_snapshot_path(friend_token)
+        if sp and os.path.exists(sp):
+            try:
+                with open(sp) as f:
+                    snap = json.load(f) or {}
+                tage = snap.get('tage') or []
+            except Exception:
+                tage = []
     today = _date.today()
     cutoff = today + _td(days=days_limit)
     out = []
