@@ -3212,6 +3212,12 @@ AEROTAX_ERROR_CODES = {
         'retryable':    False,
         'support':      True,
     },
+    'PLAUSI_HARD_FAIL': {
+        'user_title':   'Auswertung blockiert — Plausibilitätsfehler',
+        'user_message': 'Die Auswertung enthält einen mathematisch unplausiblen Wert (z.B. mehr Hotelnächte als Arbeitstage). Damit kein falscher Betrag in deine Steuererklärung kommt, blockieren wir das PDF. Bitte prüfe die hochgeladenen Dokumente.',
+        'retryable':    False,
+        'support':      True,
+    },
     'ALIGN_SCHEMA_FAILED': {
         'user_title':   'Berechnung konnte nicht vollständig geprüft werden',
         'user_message': 'Die Auswertung wurde gestoppt, weil die interne Plausibilitäts-Prüfung Fehler gefunden hat. Bitte kontaktiere den Support.',
@@ -3594,6 +3600,35 @@ def _classify_job_state(job, session=None):
                 'can_chat_explain_calculation': False,
                 'can_show_final_amount':        False,
                 'audit_warnings':               None,
+            }
+        # Hard-Plausi-Gate (E2E-Tax-Audit Release-Blocker, 2026-05-31):
+        # Bestimmte mathematische Unmöglichkeiten dürfen NIE zu einer PDF führen.
+        # Beispiele: Hotelnächte > Arbeitstage; Arbeitstage > 230 (max möglich bei
+        # 7-Tage-Woche ohne Urlaub = ~250, alles darüber ist ein Lese-Fehler).
+        # Vor diesem Fix: hard_fails wurden nur als audit_notes angehängt, PDF
+        # wurde trotzdem generiert — Finanzamt würde Kalkulation ablehnen.
+        plausi_hard_fails = list(data.get('_plausi_hard_fails') or [])
+        if plausi_hard_fails:
+            return {
+                'canonical_state':              'failed_support',
+                'reason_code':                  'PLAUSI_HARD_FAIL',
+                'user_title':                   'Auswertung blockiert — Plausibilitätsfehler',
+                'user_message':                 ('Die Auswertung enthält einen mathematisch unplausiblen Wert ('
+                                                 + plausi_hard_fails[0]
+                                                 + '). Bitte prüfe die hochgeladenen Dokumente oder kontaktiere uns.'),
+                'next_actions': [
+                    {'type': 'replace_file',  'label': 'Dateien ersetzen'},
+                    {'type': 'support',       'label': 'Support kontaktieren'},
+                    {'type': 'open_chat',     'label': 'Im Chat besprechen'},
+                ],
+                'pdf_allowed':                  False,
+                'retry_allowed':                False,
+                'support_recommended':          True,
+                'can_chat_explain_calculation': True,
+                'can_show_final_amount':        False,
+                'audit_warnings': {
+                    'plausi_hard_fails':        plausi_hard_fails,
+                },
             }
         # v14 P0 (2026-05-21): done → done_clean / done_with_audit_warnings.
         # Audit-Warnungen sind: unresolved_days, vma_unmapped_se, SE-Monate < 12,
@@ -6061,6 +6096,22 @@ def _cleanup_loop():
             cleanup_old_supabase_state()
             # Wall-Image-Storage-Leak: Bilder > 180 Tage löschen
             cleanup_old_wall_images()
+            # Layover-Bilder ebenso (180 Tage TTL)
+            cleanup_old_wall_images.__call__ if False else None
+            try:
+                _layover_img_root = os.path.join(_USER_HISTORY_DIR, 'layover_images')
+                if os.path.isdir(_layover_img_root):
+                    _cutoff = datetime.utcnow() - timedelta(days=180)
+                    for _td in os.listdir(_layover_img_root):
+                        _full = os.path.join(_layover_img_root, _td)
+                        if not os.path.isdir(_full): continue
+                        for _fn in os.listdir(_full):
+                            _fp = os.path.join(_full, _fn)
+                            try:
+                                if datetime.utcfromtimestamp(os.path.getmtime(_fp)) < _cutoff:
+                                    os.remove(_fp)
+                            except Exception: pass
+            except Exception: pass
         except: pass
 
 
@@ -10107,6 +10158,57 @@ def get_layover_recs(iata):
     return jsonify({'iata': iata.upper(), 'count': len(recs), 'recs': recs})
 
 
+@app.route('/api/layover-recs/<token>/upload-image', methods=['POST'])
+def upload_layover_image(token):
+    """Photo-Upload für Layover-Rec oder Comment. Returns {url} zum Einbetten."""
+    # Rate-Limit: max 20 Bilder pro Stunde (gleiches Pattern wie wall/upload-image)
+    if _token_rate_limited(token, 'layover_image_upload', limit=20, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited',
+                        'message': 'Zu viele Bild-Uploads. Bitte später erneut.'}), 429
+    img = request.files.get('image')
+    if not img:
+        return jsonify({'ok': False, 'error': 'no_image'}), 400
+    data = img.read()
+    if len(data) > 5 * 1024 * 1024:
+        return jsonify({'ok': False, 'error': 'too_large_5mb'}), 413
+    detected_type, detected_ext = _detect_image_type(data)
+    if not detected_type:
+        return jsonify({'ok': False, 'error': 'invalid_image',
+                        'message': 'Nur JPEG/PNG/HEIC/WebP erlaubt.'}), 415
+    import os, re, uuid
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    if not safe:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    img_dir = os.path.join(_USER_HISTORY_DIR, 'layover_images', safe)
+    os.makedirs(img_dir, exist_ok=True)
+    fname = f'{uuid.uuid4().hex[:12]}{detected_ext}'
+    try:
+        with open(os.path.join(img_dir, fname), 'wb') as f:
+            f.write(data)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True, 'url': f'/api/layover-recs/image/{safe}/{fname}'})
+
+
+@app.route('/api/layover-recs/image/<token_safe>/<fname>', methods=['GET'])
+def serve_layover_image(token_safe, fname):
+    """Serve uploaded Layover-Bild — public (Layover-Recs sind allgemein sichtbar)."""
+    import os, re
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '', fname or '')
+    safe_t = re.sub(r'[^A-Za-z0-9_-]', '', token_safe or '')[:64]
+    if not safe or not safe_t:
+        return jsonify({'error': 'invalid'}), 400
+    path = os.path.join(_USER_HISTORY_DIR, 'layover_images', safe_t, safe)
+    if not os.path.exists(path):
+        return jsonify({'error': 'not_found'}), 404
+    from flask import send_file
+    mime = 'image/jpeg'
+    if safe.lower().endswith('.png'): mime = 'image/png'
+    elif safe.lower().endswith('.heic'): mime = 'image/heic'
+    elif safe.lower().endswith('.webp'): mime = 'image/webp'
+    return send_file(path, mimetype=mime)
+
+
 @app.route('/api/layover-recs/<token>/add', methods=['POST'])
 def add_layover_rec(token):
     """Body: {iata, category, title, description, rating, price_band, location_hint?}"""
@@ -10118,7 +10220,8 @@ def add_layover_rec(token):
     rating = body.get('rating')
     price = (body.get('price_band') or '').strip()
     location_hint = (body.get('location_hint') or '').strip()[:200]
-    if len(iata) != 3: return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
+    if len(iata) != 3 or not iata.isalpha():
+        return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
     if cat not in LAYOVER_CATEGORIES: cat = 'other'
     if not title or len(title) > 120: return jsonify({'ok': False, 'error': 'invalid_title'}), 400
     if len(desc) > 800: return jsonify({'ok': False, 'error': 'desc_too_long'}), 413
