@@ -8978,7 +8978,9 @@ def get_voice_note(token, datum):
     if not os.path.exists(p):
         return jsonify({'error': 'not_found'}), 404
     from flask import send_file
-    return send_file(p, mimetype='audio/mp4')
+    # M4A-Container mit AAC-Audio — korrekter MIME ist audio/mp4 für QuickTime/MP4-Container
+    # mit AAC. iOS spielt beides ab, aber audio/mp4 ist semantisch korrekter.
+    return send_file(p, mimetype='audio/mp4', conditional=True)
 
 
 @app.route('/api/user/voice-note/<token>/<datum>', methods=['DELETE'])
@@ -9075,9 +9077,23 @@ def send_chat_message(token, channel_id):
 
 @app.route('/api/crew-chat/<token>/dm/<friend_token>', methods=['GET'])
 def get_dm(token, friend_token):
-    """Convenience-Wrapper für 1:1 DMs."""
+    """Convenience-Wrapper für 1:1 DMs.
+
+    Friend-Auth-Check ist Pflicht — sonst könnte jeder mit einem eigenen Token
+    fremde DMs lesen, indem er beliebige andere Tokens als friend_token nutzt
+    (das DM-Channel-File-Naming ist deterministisch).
+    """
     ch = _dm_channel(token, friend_token)
     if not ch: return jsonify({'error':'invalid_tokens'}), 400
+    # Friendship verifizieren — beide Richtungen prüfen, weil eine Seite
+    # entfernt sein kann (z.B. nach asymmetrischem Block).
+    try:
+        my_friends = set((_friends_load(token).get('friends') or []))
+        their_friends = set((_friends_load(friend_token).get('friends') or []))
+    except Exception:
+        my_friends = set(); their_friends = set()
+    if friend_token not in my_friends and token not in their_friends:
+        return jsonify({'error': 'not_friends'}), 403
     return get_chat_messages(token, ch)
 
 
@@ -9158,25 +9174,70 @@ def _wall_save_posts(posts):
         app.logger.warning(f'[wall] save failed: {e}')
 
 
+def _sanitize_user_text(text, max_len=None):
+    """UGC-Text-Sanitizer: HTML-Escape + Control-Char-Strip + optionaler Truncate.
+
+    Wird auf JEDES User-generierte Textfeld angewendet das später irgendwo
+    gerendert wird (Wall-Posts, Comments, Forum-Threads/Replies, DMs). iOS
+    rendert mit Text() safe, aber sobald wir einen Web-Client oder ein PDF
+    ausliefern, ist <script>-Stored-XSS möglich. Daher zentral hier blocken.
+    """
+    if not text:
+        return ''
+    import html as _html
+    s = str(text)
+    # Control-Chars (außer \n, \t) entfernen — diese können Render brechen.
+    s = ''.join(c for c in s if c == '\n' or c == '\t' or ord(c) >= 32)
+    # HTML-Escape — &<>" werden in Entities umgewandelt.
+    s = _html.escape(s, quote=True)
+    if max_len:
+        s = s[:max_len]
+    return s.strip()
+
+
+def _detect_image_type(data: bytes):
+    """Magic-Byte-Sniff. Returns ('jpeg'|'png'|'heic'|'webp'|None, extension).
+    Verhindert dass jemand .jpg-Extension auf eine .html-Datei klebt.
+    """
+    if not data or len(data) < 12:
+        return (None, None)
+    head = data[:12]
+    if head[:3] == b'\xff\xd8\xff':
+        return ('jpeg', '.jpg')
+    if head[:8] == b'\x89PNG\r\n\x1a\n':
+        return ('png', '.png')
+    if head[4:8] == b'ftyp' and (head[8:12] in (b'heic', b'heix', b'mif1', b'msf1', b'hevc', b'hevx')):
+        return ('heic', '.heic')
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+        return ('webp', '.webp')
+    return (None, None)
+
+
 @app.route('/api/wall/<token>/upload-image', methods=['POST'])
 def upload_wall_image(token):
     """Upload Bild für Wall-Post. Returns {url} zum nachträglichen Einbetten in /post."""
+    # Rate-Limit: max 20 Bilder pro Stunde pro User (verhindert Storage-Flood)
+    if _token_rate_limited(token, 'wall_image_upload', limit=20, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited',
+                        'message': 'Zu viele Bild-Uploads. Bitte später erneut.'}), 429
     img = request.files.get('image')
     if not img:
         return jsonify({'ok': False, 'error': 'no_image'}), 400
     data = img.read()
     if len(data) > 5 * 1024 * 1024:
         return jsonify({'ok': False, 'error': 'too_large_5mb'}), 413
+    # Magic-Byte-Validation — Extension-Check alleine ist unsicher
+    detected_type, detected_ext = _detect_image_type(data)
+    if not detected_type:
+        return jsonify({'ok': False, 'error': 'invalid_image',
+                        'message': 'Nur JPEG/PNG/HEIC/WebP-Bilder erlaubt.'}), 415
     import os, re, uuid
     safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
     if not safe:
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
     img_dir = os.path.join(_USER_HISTORY_DIR, 'wall_images', safe)
     os.makedirs(img_dir, exist_ok=True)
-    ext = '.jpg'
-    name = img.filename or ''
-    if name.lower().endswith('.png'): ext = '.png'
-    elif name.lower().endswith('.heic'): ext = '.heic'
+    ext = detected_ext  # Extension aus Magic-Byte, nicht aus filename
     fname = f'{uuid.uuid4().hex[:12]}{ext}'
     try:
         with open(os.path.join(img_dir, fname), 'wb') as f:
@@ -9201,6 +9262,7 @@ def serve_wall_image(token_safe, fname):
     mime = 'image/jpeg'
     if safe.lower().endswith('.png'): mime = 'image/png'
     elif safe.lower().endswith('.heic'): mime = 'image/heic'
+    elif safe.lower().endswith('.webp'): mime = 'image/webp'
     return send_file(path, mimetype=mime)
 
 
@@ -9215,13 +9277,14 @@ def create_wall_post(token):
         return jsonify({'ok': False, 'error': 'rate_limited',
                         'message': 'Zu viele Posts in kurzer Zeit. Bitte später erneut.'}), 429
     body = request.get_json(silent=True) or {}
-    text = (body.get('text') or '').strip()
+    raw_text = (body.get('text') or '').strip()
     image_url = (body.get('image_url') or '').strip() or None
     layover = (body.get('layover_iata') or '').strip().upper() or None
-    if not text and not image_url:
+    if not raw_text and not image_url:
         return jsonify({'ok': False, 'error': 'empty_post'}), 400
-    if len(text) > 2000:
+    if len(raw_text) > 2000:
         return jsonify({'ok': False, 'error': 'text_too_long'}), 413
+    text = _sanitize_user_text(raw_text, max_len=2000)
     import uuid, time
     post = {
         'id': str(uuid.uuid4())[:12],
@@ -9258,10 +9321,12 @@ def get_wall_feed(token):
     friends = set((_friends_load(token).get('friends') or []))
     friends.add(token)
     blocked = _blocked_by(token)
+    muted = _muted_by(token)
     posts = _wall_load_posts()
     feed = [p for p in posts
             if p.get('author_token') in friends
-            and p.get('author_token') not in blocked]
+            and p.get('author_token') not in blocked
+            and p.get('author_token') not in muted]
     feed.sort(key=lambda p: -(p.get('ts') or 0))
     if before_ts > 0:
         feed = [p for p in feed if (p.get('ts') or 0) < before_ts]
@@ -9392,19 +9457,42 @@ def get_comments(token, post_id):
 
 @app.route('/api/wall/<token>/post/<post_id>', methods=['DELETE'])
 def delete_wall_post(token, post_id):
-    """Nur Author darf löschen."""
+    """Nur Author darf löschen. DSGVO Art. 17 sub-right.
+
+    Räumt zusätzlich:
+    - Comments-File des Posts
+    - das image-File falls der Post ein Bild hatte (Storage-Leak verhindern)
+    """
     posts = _wall_load_posts()
-    new_posts = [p for p in posts if not (p.get('id') == post_id and p.get('author_token') == token)]
-    if len(new_posts) == len(posts):
+    target_post = next((p for p in posts
+                        if p.get('id') == post_id and p.get('author_token') == token), None)
+    if target_post is None:
         return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
+    new_posts = [p for p in posts if p is not target_post]
     _wall_save_posts(new_posts)
-    # Auch Comments-File löschen
+    # Comments-File entfernen
     cp = _wall_comments_path(post_id)
     if cp:
         try:
             import os; os.remove(cp)
         except Exception:
             pass
+    # Image-File entfernen (image_url-Pattern: /api/wall/image/<token_safe>/<fname>)
+    img_url = (target_post.get('image_url') or '').strip()
+    if img_url.startswith('/api/wall/image/'):
+        try:
+            parts = img_url.strip('/').split('/')
+            # ['api','wall','image','<token_safe>','<fname>']
+            if len(parts) >= 5:
+                import os, re as _re
+                safe_t = _re.sub(r'[^A-Za-z0-9_-]', '', parts[3] or '')[:64]
+                safe_f = _re.sub(r'[^A-Za-z0-9_.-]', '', parts[4] or '')
+                if safe_t and safe_f:
+                    img_path = os.path.join(_USER_HISTORY_DIR, 'wall_images', safe_t, safe_f)
+                    if os.path.exists(img_path):
+                        os.remove(img_path)
+        except Exception as e:
+            app.logger.warning(f'[wall-delete] image cleanup failed: {e}')
     return jsonify({'ok': True})
 
 
@@ -9578,26 +9666,28 @@ def forum_create_thread(token):
                         'message': 'Zu viele Threads in kurzer Zeit.'}), 429
     body = request.get_json(silent=True) or {}
     category = (body.get('category_id') or '').strip().lower()
-    title = (body.get('title') or '').strip()
-    text = (body.get('body') or '').strip()
+    raw_title = (body.get('title') or '').strip()
+    raw_text = (body.get('body') or '').strip()
     image_url = (body.get('image_url') or '').strip() or None
     gif_url = (body.get('gif_url') or '').strip() or None
     explicit_tags = body.get('hashtags') or []
 
     if category not in FORUM_CATEGORIES:
         return jsonify({'ok': False, 'error': 'invalid_category'}), 400
-    if not title:
+    if not raw_title:
         return jsonify({'ok': False, 'error': 'empty_title'}), 400
-    if len(title) > 200:
+    if len(raw_title) > 200:
         return jsonify({'ok': False, 'error': 'title_too_long'}), 413
-    if not text and not image_url:
+    if not raw_text and not image_url:
         return jsonify({'ok': False, 'error': 'empty_body'}), 400
-    if len(text) > 5000:
+    if len(raw_text) > 5000:
         return jsonify({'ok': False, 'error': 'body_too_long'}), 413
+    title = _sanitize_user_text(raw_title, max_len=200)
+    text = _sanitize_user_text(raw_text, max_len=5000)
 
     # Extract hashtags from title + body, merge with explicit
     auto_tags = set()
-    for m in FORUM_HASHTAG_RE.finditer(title + ' ' + text):
+    for m in FORUM_HASHTAG_RE.finditer(raw_title + ' ' + raw_text):
         auto_tags.add(m.group(1).lower())
     for t in explicit_tags:
         if isinstance(t, str):
@@ -9689,16 +9779,17 @@ def forum_list_replies(token, thread_id):
 def forum_create_reply(token, thread_id):
     """Body: {body, image_url?, gif_url?, parent_reply_id?, mentioned_token?}"""
     body = request.get_json(silent=True) or {}
-    text = (body.get('body') or '').strip()
+    raw_text = (body.get('body') or '').strip()
     image_url = (body.get('image_url') or '').strip() or None
     gif_url = (body.get('gif_url') or '').strip() or None
     parent_reply_id = (body.get('parent_reply_id') or '').strip() or None
     mentioned_token = (body.get('mentioned_token') or '').strip() or None
 
-    if not text and not image_url:
+    if not raw_text and not image_url:
         return jsonify({'ok': False, 'error': 'empty_reply'}), 400
-    if len(text) > 3000:
+    if len(raw_text) > 3000:
         return jsonify({'ok': False, 'error': 'too_long'}), 413
+    text = _sanitize_user_text(raw_text, max_len=3000)
 
     threads = _forum_load_threads()
     target = next((t for t in threads if t.get('id') == thread_id), None)
@@ -10822,6 +10913,16 @@ def auth_login():
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip().lower()
     pw = body.get('password') or ''
+    # Brute-Force-Schutz: 10 Login-Versuche pro Email + 30 pro IP pro 10 Min.
+    # Email-Limit verhindert gezieltes Knacken eines Accounts; IP-Limit blockt
+    # User-Enumeration über viele Emails von gleicher Quelle.
+    if email and _token_rate_limited(f'login:{email}', 'auth_login', limit=10, window_sec=600):
+        return jsonify({'ok': False, 'error': 'too_many_attempts',
+                        'message': 'Zu viele Login-Versuche. Bitte in einigen Minuten erneut.'}), 429
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
+    if client_ip and _ip_rate_limited(client_ip, endpoint='auth_login', limit=30, window_sec=600):
+        return jsonify({'ok': False, 'error': 'too_many_attempts',
+                        'message': 'Zu viele Login-Versuche. Bitte in einigen Minuten erneut.'}), 429
     users = _auth_load()
     user = users.get(email)
     if not user:
@@ -11041,17 +11142,27 @@ def _send_password_reset_email(to_email, reset_token):
 def auth_forgot():
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip().lower()
+    # Rate-Limit: 5 Forgot-Versuche pro Email + 10 pro IP pro 10 Min.
+    # Verhindert Email-Bombing (Spammer fluten User mit Reset-Mails).
+    if email and _token_rate_limited(f'forgot:{email}', 'auth_forgot', limit=5, window_sec=600):
+        return jsonify({'ok': True, 'sent': True}), 200  # silent, kein Enumeration
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
+    if client_ip and _ip_rate_limited(client_ip, endpoint='auth_forgot', limit=10, window_sec=600):
+        return jsonify({'ok': True, 'sent': True}), 200
     users = _auth_load()
     # Antwortet immer 200 ohne Detail (kein E-Mail-Enumeration).
-    # Aber wenn Email existiert UND Resend nicht konfiguriert, gibt es
-    # einen separaten Telemetrie-Pfad damit Admins das mitbekommen.
     if email in users:
         import uuid as _u
         reset_token = _u.uuid4().hex[:24]
         users[email]['reset_token'] = reset_token
         users[email]['reset_expires'] = (datetime.now() + timedelta(hours=2)).isoformat()
+        users[email].pop('reset_used_at', None)  # alter used_at-Marker entfernen, neuer Token
         _auth_save(users)
-        _send_password_reset_email(email, reset_token)
+        sent_ok = _send_password_reset_email(email, reset_token)
+        if not sent_ok:
+            # Resend-Key fehlt oder API-Fehler — User-Antwort bleibt neutral (kein
+            # Enumeration), aber Admin-Log macht den Fehler sichtbar.
+            app.logger.error(f'[auth-forgot] reset-mail NICHT versendet für {email[:3]}*** — Resend-Key prüfen!')
     return jsonify({'ok': True, 'sent': True})
 
 
@@ -11068,6 +11179,10 @@ def auth_reset():
     user = users.get(email)
     if not user or user.get('reset_token') != reset_token:
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    # Single-Use-Audit: wenn used_at gesetzt ist, wurde der Token bereits einmal
+    # verwendet — verweigern (Replay-Schutz auch wenn Token noch nicht abgelaufen).
+    if user.get('reset_used_at'):
+        return jsonify({'ok': False, 'error': 'token_already_used'}), 400
     try:
         from datetime import datetime as _d
         if _d.fromisoformat(user.get('reset_expires', '1970-01-01T00:00:00')) < datetime.now():
@@ -11075,9 +11190,11 @@ def auth_reset():
     except Exception:
         pass
     user['password_hash'] = _password_hash(new_pw)
+    user['reset_used_at'] = datetime.now().isoformat()  # Audit-Marker
     user.pop('reset_token', None)
     user.pop('reset_expires', None)
     _auth_save(users)
+    app.logger.info(f'[auth-reset] PW erfolgreich gesetzt für {email[:3]}***')
     return jsonify({'ok': True})
 
 
@@ -11123,13 +11240,18 @@ def auth_delete_account():
         del users[user_email]
     _auth_save(users)
 
-    import os
+    import os, shutil
     deleted = []
-    # 1. Direkte Token-Files
+    safe_token = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    # 1. Direkte Token-Files (Moderation + Roster + Auth-Daten)
     direct_files = [
         f'history_{token}.json', f'profile_{token}.json',
         f'friends_{token}.json', f'push_{token}.json',
         f'crashes_{token}.json',
+        f'blocks_{token}.json', f'mutes_{token}.json',
+        f'wall_likes_{token}.json', f'forum_likes_{token}.json',
+        f'roster_snapshot_{token}.json', f'roster_changes_{token}.json',
+        f'crew_aircraft_{token}.json',
     ]
     for fn in direct_files:
         p = os.path.join(_USER_HISTORY_DIR, fn)
@@ -11137,13 +11259,51 @@ def auth_delete_account():
             try: os.remove(p); deleted.append(fn)
             except Exception: pass
 
-    # 2. Briefings + Voice-Notes pro Token
-    for subdir in ('briefings', 'voice_notes'):
-        sub_p = os.path.join(_USER_HISTORY_DIR, subdir,
-                              re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64] + '.json')
-        if os.path.exists(sub_p):
-            try: os.remove(sub_p); deleted.append(f'{subdir}/...')
-            except Exception: pass
+    # 2. Briefings + Voice-Notes pro Token (sub-dirs/<safe-token>.json oder <safe-token>/)
+    for subdir, suffix in (('briefings', '.json'), ('voice_notes', None)):
+        if suffix:
+            sub_p = os.path.join(_USER_HISTORY_DIR, subdir, safe_token + suffix)
+            if os.path.exists(sub_p):
+                try: os.remove(sub_p); deleted.append(f'{subdir}/{safe_token}{suffix}')
+                except Exception: pass
+        else:
+            # voice_notes/<token>/ enthält mehrere m4a-Dateien
+            sub_dir = os.path.join(_USER_HISTORY_DIR, subdir, safe_token)
+            if os.path.isdir(sub_dir):
+                try: shutil.rmtree(sub_dir); deleted.append(f'{subdir}/{safe_token}/')
+                except Exception: pass
+
+    # 2b. Wall-Images-Verzeichnis pro Token
+    img_dir = os.path.join(_USER_HISTORY_DIR, 'wall_images', safe_token)
+    if os.path.isdir(img_dir):
+        try: shutil.rmtree(img_dir); deleted.append(f'wall_images/{safe_token}/')
+        except Exception: pass
+
+    # 2c. DM-Channel-Files in denen dieser Token Teilnehmer ist
+    try:
+        cm_root = os.path.join(_USER_HISTORY_DIR, 'chat_messages')
+        if os.path.isdir(cm_root):
+            for fn in os.listdir(cm_root):
+                # Format: dm__<sortedA>__<sortedB>.json
+                if not fn.endswith('.json'): continue
+                if f'__{token}__' in fn or fn.endswith(f'__{token}.json') or fn.startswith(f'dm__{token}__'):
+                    try: os.remove(os.path.join(cm_root, fn)); deleted.append(fn[:40])
+                    except Exception: pass
+    except Exception: pass
+
+    # 2d. Layover-Recs + Comments des Users (best-effort, anhand author_token)
+    try:
+        from glob import glob
+        for pat in ('layover_recs.json', 'layover_recs_comments_*.json'):
+            for fp in glob(os.path.join(_USER_HISTORY_DIR, pat)):
+                try:
+                    with open(fp) as f: items = json.load(f) or []
+                    new_items = [it for it in items if it.get('author_token') != token]
+                    if len(new_items) != len(items):
+                        with open(fp, 'w') as f: json.dump(new_items, f)
+                        deleted.append(os.path.basename(fp))
+                except Exception: pass
+    except Exception: pass
 
     # 3. Wall-Posts mit diesem author_token entfernen
     try:
@@ -11285,7 +11445,12 @@ def moderation_report(token):
 
 @app.route('/api/moderation/<token>/block', methods=['POST'])
 def moderation_block(token):
-    """Body: {target_token: str}"""
+    """Body: {target_token: str}
+
+    Block ist bidirektional + räumt offene Friend-Requests/Friendships in BEIDEN
+    Richtungen weg. Vorher: asymmetrisch — A blockt B, aber B hatte A noch in
+    friends_B.json + offene Requests, konnte erneut anfragen.
+    """
     body = request.get_json(silent=True) or {}
     target = (body.get('target_token') or '').strip()
     if not target:
@@ -11295,15 +11460,20 @@ def moderation_block(token):
     blocks = _blocked_by(token)
     blocks.add(target)
     _save_set_file(_blocks_path(token), blocks)
-    # Optional: aus Friends-Liste entfernen (Block = harte Trennung)
+    # Bidirektionaler Cleanup: friends, requests_in, requests_out auf BEIDEN Seiten
     try:
-        d = _friends_load(token)
-        fl = d.get('friends') or []
-        if target in fl:
-            d['friends'] = [t for t in fl if t != target]
-            _friends_save(token, d)
-    except Exception:
-        pass
+        me = _friends_load(token)
+        them = _friends_load(target)
+        me['friends'] = [t for t in (me.get('friends') or []) if t != target]
+        them['friends'] = [t for t in (them.get('friends') or []) if t != token]
+        me['requests_in'] = [t for t in (me.get('requests_in') or []) if t != target]
+        me['requests_out'] = [t for t in (me.get('requests_out') or []) if t != target]
+        them['requests_in'] = [t for t in (them.get('requests_in') or []) if t != token]
+        them['requests_out'] = [t for t in (them.get('requests_out') or []) if t != token]
+        _friends_save(token, me)
+        _friends_save(target, them)
+    except Exception as e:
+        app.logger.warning(f'[block] bidir cleanup failed: {e}')
     return jsonify({'ok': True, 'blocked_count': len(blocks)})
 
 
@@ -11423,6 +11593,17 @@ def send_friend_request(token):
     target = (body.get('friend_token') or '').strip()
     if not target or target == token:
         return jsonify({'ok': False, 'error': 'invalid_target'}), 400
+    # Rate-Limit: max 30 Friend-Requests pro Stunde (verhindert Spam)
+    if _token_rate_limited(token, 'friend_req_send', limit=30, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited',
+                        'message': 'Zu viele Anfragen — bitte später erneut.'}), 429
+    # Wenn target dich blockt, dürfen wir keinen Request senden (silent return ok).
+    try:
+        their_blocks = _blocked_by(target)
+        if token in their_blocks:
+            return jsonify({'ok': True, 'silenced': True})
+    except Exception:
+        pass
     me = _friends_load(token)
     them = _friends_load(target)
     if target in (me.get('friends') or []):
