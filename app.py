@@ -12456,6 +12456,363 @@ def get_user_stats(token):
     })
 
 
+# ─── Trip-Stats (YTD + Lifetime; FlightOps + tage_detail) ─────────────────────
+# Info-Reichtum, den FollowMe/OFFblock nicht bieten: km, Länder, Top-Airline,
+# Top-Aircraft, Sparkline pro Monat, Achievements. 5-min Memory-Cache.
+_AIRPORTS_COMPACT_CACHE = None   # {IATA: (lat, lon, country)}
+_TRIP_STATS_CACHE = {}            # token -> (expires_ts, payload)
+
+
+def _airports_compact_lookup():
+    """Lazy-loaded IATA → (lat, lon, country) Map aus airports_compact.json."""
+    global _AIRPORTS_COMPACT_CACHE
+    if _AIRPORTS_COMPACT_CACHE is not None:
+        return _AIRPORTS_COMPACT_CACHE
+    out = {}
+    try:
+        ap_path = os.path.join(os.path.dirname(__file__), 'airports_compact.json')
+        with open(ap_path) as f:
+            data = json.load(f)
+        fields = data.get('fields') or []
+        rows = data.get('rows') or []
+        try:
+            i_iata = fields.index('iata')
+            i_lat = fields.index('lat')
+            i_lon = fields.index('lon')
+            i_country = fields.index('country')
+        except ValueError:
+            _AIRPORTS_COMPACT_CACHE = {}
+            return _AIRPORTS_COMPACT_CACHE
+        for r in rows:
+            try:
+                iata = (r[i_iata] or '').upper()
+                if not iata or len(iata) != 3:
+                    continue
+                lat = float(r[i_lat]); lon = float(r[i_lon])
+                country = (r[i_country] or '').upper()
+                out[iata] = (lat, lon, country)
+            except (ValueError, TypeError, IndexError):
+                continue
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    _AIRPORTS_COMPACT_CACHE = out
+    return _AIRPORTS_COMPACT_CACHE
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Great-circle distance in km via Haversine. R=6371.0088 km."""
+    import math
+    R = 6371.0088
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+    return 2 * R * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _trip_stats_achievements(life):
+    """Achievement-Badges; nur tatsächlich verdiente werden zurückgegeben."""
+    out = []
+    hrs = life['hours_flown_min'] / 60.0
+    for threshold, key, label in [
+        (1000, 'h1k', '1000h Captain'),
+        (5000, 'h5k', '5000h Veteran'),
+        (10000, 'h10k', '10000h Legend'),
+    ]:
+        if hrs >= threshold:
+            out.append({'key': key, 'label': label, 'tier': 'gold'})
+    for threshold, key, label in [
+        (25, 'c25', '25 Länder'),
+        (50, 'c50', '50 Länder'),
+        (100, 'c100', '100 Länder'),
+    ]:
+        if len(life['countries']) >= threshold:
+            out.append({'key': key, 'label': label, 'tier': 'gold'})
+    for threshold, key, label in [
+        (100_000, 'km100k', '100k km'),
+        (500_000, 'km500k', '500k km'),
+        (1_000_000, 'km1m', '1M km'),
+    ]:
+        if life['distance_km'] >= threshold:
+            out.append({'key': key, 'label': label, 'tier': 'gold'})
+    if life['flights'] >= 500:
+        out.append({'key': 'fl500', 'label': '500 Flüge', 'tier': 'gold'})
+    if life['flights'] >= 1000:
+        out.append({'key': 'fl1k', 'label': '1000 Flüge', 'tier': 'gold'})
+    return out
+
+
+def _trip_stats_compute(token):
+    """Berechnet YTD + Lifetime Trip-Stats aus session.result_data._tage_detail
+    + FlightOps. Returns dict mit ehrlichem Empty-State wenn beide leer.
+    """
+    from collections import Counter
+    session = _store.get(token) or {}
+    rd = session.get('result_data') or {}
+    tage = rd.get('_tage_detail') or []
+
+    fops = {}
+    p = _flight_ops_path(token)
+    if p:
+        try:
+            with open(p) as f:
+                fops = json.load(f) or {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            fops = {}
+
+    current_year = datetime.utcnow().year
+    ap_lookup = _airports_compact_lookup()
+
+    def _zero():
+        return {
+            'hours_flown_min': 0,
+            'flights': 0,
+            'distance_km': 0.0,
+            'countries': set(),
+            'airlines': Counter(),
+            'aircraft_types': Counter(),
+            'aircraft_regs': Counter(),
+            'frei_days': 0,
+            'sickness_days': 0,
+            'standby_days': 0,
+            'tour_days': 0,
+        }
+    life = _zero()
+    ytd = _zero()
+    monthly_hours = {}
+    monthly_flights = {}
+    longest_layover_days = 0
+    longest_layover_place = None
+    fastest_turn_min = None
+    longest_tour_days = 0
+    longest_tour_routing = ''
+    destinations_ct = Counter()
+
+    def _accumulate_distance(routing_str, target):
+        if not routing_str or not isinstance(routing_str, str):
+            return 0
+        parts = [pp.strip().upper() for pp in routing_str.split('-')
+                if pp and len(pp.strip()) == 3]
+        if len(parts) < 2:
+            return 0
+        legs = 0
+        for a, b in zip(parts[:-1], parts[1:]):
+            ca = ap_lookup.get(a)
+            cb = ap_lookup.get(b)
+            if ca and cb:
+                target['distance_km'] += _haversine_km(ca[0], ca[1], cb[0], cb[1])
+                legs += 1
+        return legs
+
+    for t in tage:
+        if not isinstance(t, dict): continue
+        datum = t.get('datum') or ''
+        if not datum or len(datum) < 10:
+            continue
+        try:
+            year = int(datum[:4])
+        except ValueError:
+            continue
+        ym = datum[:7]
+        klass = (t.get('klass') or '').upper()
+        marker_lower = (t.get('marker') or '').lower()
+        rf = t.get('reader_facts') or {}
+        is_sick = (klass == 'KRANK' or 'krank' in marker_lower or 'sick' in marker_lower
+                   or marker_lower in ('k', 'kk'))
+        is_standby = ('standby' in marker_lower or marker_lower in ('sby', 'st'))
+        is_frei = klass in ('FREI', 'URLAUB', 'ZERODAY') and not is_sick
+
+        targets = [life]
+        if year == current_year:
+            targets.append(ytd)
+        for tg in targets:
+            if is_sick: tg['sickness_days'] += 1
+            if is_standby: tg['standby_days'] += 1
+            if is_frei: tg['frei_days'] += 1
+            if klass in ('Z72', 'Z73', 'Z74', 'Z76'): tg['tour_days'] += 1
+
+        routing = t.get('routing') or ''
+        legs = _accumulate_distance(routing, life)
+        if year == current_year:
+            _accumulate_distance(routing, ytd)
+        if legs > 0:
+            life['flights'] += legs
+            if year == current_year:
+                ytd['flights'] += legs
+            monthly_flights[ym] = monthly_flights.get(ym, 0) + legs
+
+        for code in [pp.strip().upper() for pp in routing.split('-')
+                    if pp and len(pp.strip()) == 3]:
+            ent = ap_lookup.get(code)
+            if ent and ent[2]:
+                life['countries'].add(ent[2])
+                if year == current_year:
+                    ytd['countries'].add(ent[2])
+        lo = (rf.get('layover_ort') or '').upper().strip()
+        if lo and len(lo) == 3 and lo != 'FRA':
+            destinations_ct[lo] += 1
+            ent = ap_lookup.get(lo)
+            if ent and ent[2]:
+                life['countries'].add(ent[2])
+                if year == current_year:
+                    ytd['countries'].add(ent[2])
+
+        s_raw = rf.get('start_time')
+        e_raw = rf.get('end_time')
+        try:
+            if s_raw and e_raw:
+                sh, sm = [int(x) for x in s_raw.split(':')]
+                eh, em = [int(x) for x in e_raw.split(':')]
+                s_m = sh * 60 + sm
+                e_m = eh * 60 + em
+                dm = (e_m - s_m) if e_m > s_m else (24*60 - s_m) + e_m
+                if klass in ('Z72', 'Z73', 'Z74', 'Z76'):
+                    life['hours_flown_min'] += dm
+                    if year == current_year:
+                        ytd['hours_flown_min'] += dm
+                    monthly_hours[ym] = monthly_hours.get(ym, 0.0) + dm / 60.0
+        except (ValueError, TypeError):
+            pass
+
+    # FlightOps für Airline + Aircraft-Type
+    for datum, ops in (fops.items() if isinstance(fops, dict) else []):
+        if not isinstance(ops, dict): continue
+        try:
+            year = int((datum or '')[:4])
+        except ValueError:
+            continue
+        targets = [life]
+        if year == current_year:
+            targets.append(ytd)
+        fn = (ops.get('flightNumber') or '').strip().upper()
+        if fn:
+            airline = ''.join(c for c in fn if c.isalpha())[:3]
+            if airline:
+                for tg in targets:
+                    tg['airlines'][airline] += 1
+        ac_type = (ops.get('aircraftType') or '').strip().upper()
+        if ac_type:
+            for tg in targets:
+                tg['aircraft_types'][ac_type] += 1
+        ac_reg = (ops.get('aircraftReg') or '').strip().upper()
+        if ac_reg:
+            for tg in targets:
+                tg['aircraft_regs'][ac_reg] += 1
+
+    # Tour/Layover-Längen + fastest turn
+    cur_tour_len = 0
+    cur_tour_routing = ''
+    cur_layover = None
+    cur_layover_len = 0
+    sorted_tage = sorted([t for t in tage if isinstance(t, dict) and t.get('datum')],
+                        key=lambda x: x.get('datum'))
+    for t in sorted_tage:
+        klass = (t.get('klass') or '').upper()
+        rf = t.get('reader_facts') or {}
+        lo = (rf.get('layover_ort') or '').upper().strip()
+        if klass in ('Z72', 'Z73', 'Z74', 'Z76'):
+            if cur_tour_len == 0:
+                cur_tour_routing = t.get('routing') or ''
+            cur_tour_len += 1
+        else:
+            if cur_tour_len > longest_tour_days:
+                longest_tour_days = cur_tour_len
+                longest_tour_routing = cur_tour_routing
+            cur_tour_len = 0
+            cur_tour_routing = ''
+        if lo and lo != 'FRA':
+            if cur_layover == lo:
+                cur_layover_len += 1
+            else:
+                cur_layover = lo
+                cur_layover_len = 1
+            if cur_layover_len > longest_layover_days:
+                longest_layover_days = cur_layover_len
+                longest_layover_place = lo
+        else:
+            cur_layover = None
+            cur_layover_len = 0
+    if cur_tour_len > longest_tour_days:
+        longest_tour_days = cur_tour_len
+        longest_tour_routing = cur_tour_routing
+
+    for i in range(len(sorted_tage) - 1):
+        a = sorted_tage[i]; b = sorted_tage[i+1]
+        if (a.get('klass') or '').upper() not in ('Z72', 'Z73', 'Z74', 'Z76'): continue
+        if (b.get('klass') or '').upper() not in ('Z72', 'Z73', 'Z74', 'Z76'): continue
+        rfa = a.get('reader_facts') or {}
+        rfb = b.get('reader_facts') or {}
+        e_raw = rfa.get('end_time'); s_raw = rfb.get('start_time')
+        try:
+            if e_raw and s_raw:
+                eh, em = [int(x) for x in e_raw.split(':')]
+                sh, sm = [int(x) for x in s_raw.split(':')]
+                e_m = eh*60 + em
+                s_m = sh*60 + sm
+                gap = (24*60 - e_m) + s_m
+                if gap > 0 and gap < (fastest_turn_min if fastest_turn_min is not None else 24*60 + 1):
+                    fastest_turn_min = gap
+        except (ValueError, TypeError):
+            pass
+
+    has_data = bool(tage) or bool(fops)
+
+    def _serialize(bucket):
+        return {
+            'hours_flown': round(bucket['hours_flown_min'] / 60.0, 1),
+            'flights': bucket['flights'],
+            'distance_km': round(bucket['distance_km']),
+            'countries_visited': len(bucket['countries']),
+            'countries_list': sorted(list(bucket['countries'])),
+            'top_airline': (bucket['airlines'].most_common(1)[0][0]
+                           if bucket['airlines'] else None),
+            'top_aircraft': (bucket['aircraft_types'].most_common(1)[0][0]
+                            if bucket['aircraft_types'] else None),
+            'top_aircraft_reg': (bucket['aircraft_regs'].most_common(1)[0][0]
+                                if bucket['aircraft_regs'] else None),
+            'frei_days': bucket['frei_days'],
+            'sickness_days': bucket['sickness_days'],
+            'standby_days': bucket['standby_days'],
+            'tour_days': bucket['tour_days'],
+        }
+
+    return {
+        'token': token,
+        'has_data': has_data,
+        'empty_reason': None if has_data else 'no_tax_eval_no_flightops',
+        'empty_hint': (None if has_data else
+                      'Importiere zuerst deinen Dienstplan + Tax-Auswertung.'),
+        'current_year': current_year,
+        'lifetime': _serialize(life),
+        'ytd': _serialize(ytd),
+        'monthly_hours_flown': {k: round(v, 1) for k, v in sorted(monthly_hours.items())},
+        'monthly_flights': dict(sorted(monthly_flights.items())),
+        'top_destinations': [{'place': k, 'count': v}
+                            for k, v in destinations_ct.most_common(10)],
+        'longest_tour': ({'days': longest_tour_days, 'routing': longest_tour_routing}
+                        if longest_tour_days > 0 else None),
+        'longest_layover': ({'place': longest_layover_place, 'days': longest_layover_days}
+                           if longest_layover_place else None),
+        'fastest_turnaround_min': fastest_turn_min,
+        'achievements': _trip_stats_achievements(life),
+    }
+
+
+@app.route('/api/user/trip-stats/<token>', methods=['GET'])
+def get_trip_stats(token):
+    """Trip-Stats YTD + Lifetime. 5-min Memory-Cache.
+    Empty-State (`has_data=False`) wenn _tage_detail UND FlightOps leer.
+    """
+    import time
+    now = time.time()
+    cached = _TRIP_STATS_CACHE.get(token)
+    if cached and cached[0] > now:
+        return jsonify(cached[1])
+    payload = _trip_stats_compute(token)
+    _TRIP_STATS_CACHE[token] = (now + 300, payload)
+    return jsonify(payload)
+
+
 @app.route('/api/user/friend-compare/<token>/<friend_token>', methods=['GET'])
 def friend_compare(token, friend_token):
     """Side-by-side Vergleich der KPIs zwischen User und Friend.
