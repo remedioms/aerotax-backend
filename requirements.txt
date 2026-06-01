@@ -15,5 +15,6 @@ pytest>=8.0.0
 cryptography>=43.0.0
 requests>=2.32.0
 beautifulsoup4>=4.12.0
+feedparser>=6.0
 # httpx[http2] benötigt für APNs HTTP/2 (P5/W17). h2-Extra bringt das HTTP/2-Modul.
 httpx[http2]>=0.27.0
