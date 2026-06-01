@@ -12225,6 +12225,199 @@ def delete_layover_rec(token, rec_id):
     return jsonify({'ok': False, 'error':'not_found_or_not_author'}), 404
 
 
+# ─── Layover Reviews (Sterne-Ratings pro Stadt + Kategorie) ─────────────────
+# Worker P6, 2026-06-01: zusätzlich zu den per-Tipp-Votes ein aggregiertes
+# Stadt-Rating. Persistenz: SB-Tabelle `layover_reviews` (PK iata, user_token,
+# category). Disk-Fallback bei SB-down — file-Mode pro IATA, atomarer rewrite.
+LAYOVER_REVIEW_CATEGORIES = ('overall', 'hotel', 'food', 'safety', 'nightlife')
+
+
+def _layover_reviews_disk_path(iata):
+    """Disk-Fallback wenn Supabase nicht verfügbar. Pro IATA eine JSON-Datei
+    mit der Liste aller Reviews (jedes Item: user_token, category, stars, ts).
+    """
+    import os, re
+    safe = re.sub(r'[^A-Z]', '', (iata or '').upper())[:3]
+    if len(safe) != 3:
+        return None
+    return os.path.join(_recs_dir(), f'reviews_{safe}.json')
+
+
+def _layover_reviews_load_all(iata):
+    """Lädt alle Reviews für IATA — SB primär, Disk-Fallback.
+    Returns list[{user_token, category, stars, ...}] oder [] bei Fehler.
+    Wichtig: user_token wird im Response NICHT exposed (kommt nur intern
+    für PK-Match in rate_layover/Aggregate-Computation rein).
+    """
+    if SB_AVAILABLE:
+        try:
+            r = sb.table('layover_reviews') \
+                .select('user_token,category,stars,created_at,updated_at') \
+                .eq('iata', iata).execute()
+            return list(r.data or [])
+        except Exception as e:
+            app.logger.warning(
+                f'[lreview] sb_load_fail iata={iata} err={type(e).__name__}: {str(e)[:120]}'
+            )
+            # Fall-through zu Disk-Read damit Aggregate noch funktioniert
+    p = _layover_reviews_disk_path(iata)
+    if not p:
+        return []
+    try:
+        with open(p) as f:
+            data = json.load(f) or []
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    except Exception:
+        return []
+
+
+def _layover_reviews_upsert(iata, user_token, category, stars):
+    """Schreibt 1 Review. SB primär, Disk-Fallback bei SB-down.
+    Re-Rate ist idempotent (PK-Upsert auf SB, Replace-in-list auf Disk).
+    Returns True/False.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row = {
+        'iata': iata,
+        'user_token': user_token,
+        'category': category,
+        'stars': int(stars),
+        'updated_at': now_iso,
+    }
+    if SB_AVAILABLE:
+        try:
+            sb.table('layover_reviews').upsert(
+                row, on_conflict='iata,user_token,category'
+            ).execute()
+            return True
+        except Exception as e:
+            app.logger.warning(
+                f'[lreview] sb_upsert_fail iata={iata} cat={category} '
+                f'err={type(e).__name__}: {str(e)[:200]}'
+            )
+            # Fall-through zu Disk-Write
+    p = _layover_reviews_disk_path(iata)
+    if not p:
+        return False
+    try:
+        try:
+            with open(p) as f:
+                data = json.load(f) or []
+            if not isinstance(data, list):
+                data = []
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = []
+        new_data = [
+            x for x in data
+            if not (
+                isinstance(x, dict)
+                and x.get('user_token') == user_token
+                and x.get('category') == category
+            )
+        ]
+        row_disk = dict(row)
+        row_disk['created_at'] = now_iso
+        new_data.append(row_disk)
+        with open(p, 'w') as f:
+            json.dump(new_data[-5000:], f, ensure_ascii=False)
+        return True
+    except Exception as e:
+        app.logger.error(
+            f'[lreview] disk_upsert_fail iata={iata} err={type(e).__name__}: {str(e)[:200]}'
+        )
+        return False
+
+
+@app.route('/api/layover-rec/<iata>/rate', methods=['POST'])
+def rate_layover(iata):
+    """Body: {token, stars: 1-5, category: overall|hotel|food|safety|nightlife}.
+
+    Best-Effort: kein Token → 401, ungültige Category/Stars → 400. Doppel-Rate
+    ist idempotent (PK-Upsert auf iata+user_token+category).
+    """
+    import re as _re
+    safe_iata = _re.sub(r'[^A-Z]', '', (iata or '').upper())[:3]
+    if len(safe_iata) != 3:
+        return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
+    body = request.get_json(silent=True) or {}
+    token = (body.get('token') or '').strip()
+    if not token:
+        return jsonify({'ok': False, 'error': 'no_token'}), 401
+    try:
+        stars = int(body.get('stars') or 0)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'invalid_stars'}), 400
+    if stars < 1 or stars > 5:
+        return jsonify({'ok': False, 'error': 'invalid_stars'}), 400
+    category = (body.get('category') or '').strip().lower()
+    if category not in LAYOVER_REVIEW_CATEGORIES:
+        return jsonify({'ok': False, 'error': 'invalid_category'}), 400
+    ok = _layover_reviews_upsert(safe_iata, token, category, stars)
+    if not ok:
+        return jsonify({'ok': False, 'error': 'persistence_failed'}), 500
+    return jsonify({'ok': True, 'iata': safe_iata, 'category': category, 'stars': stars})
+
+
+@app.route('/api/layover-rec/<iata>/aggregate', methods=['GET'])
+def aggregate_layover(iata):
+    """Aggregiert Sterne pro Kategorie + Gesamt.
+
+    Response:
+      {iata, avg_stars (= overall avg if any, else avg über alle Kategorien),
+       total_reviews (distinct user_token count über alle categories),
+       breakdown: {overall: 4.2, hotel: 3.8, ...},
+       counts:    {overall: 12,  hotel: 9,   ...}}
+
+    Kategorien ohne Reviews erscheinen im breakdown NICHT (App-Side zeigt "—").
+    Werte gerundet auf 1 Nachkommastelle.
+    """
+    import re as _re
+    safe_iata = _re.sub(r'[^A-Z]', '', (iata or '').upper())[:3]
+    if len(safe_iata) != 3:
+        return jsonify({'error': 'invalid_iata'}), 400
+    reviews = _layover_reviews_load_all(safe_iata)
+    by_cat = {}
+    distinct_users = set()
+    for r in reviews:
+        if not isinstance(r, dict):
+            continue
+        cat = r.get('category')
+        if cat not in LAYOVER_REVIEW_CATEGORIES:
+            continue
+        try:
+            s = int(r.get('stars') or 0)
+        except Exception:
+            continue
+        if s < 1 or s > 5:
+            continue
+        by_cat.setdefault(cat, []).append(s)
+        ut = r.get('user_token')
+        if isinstance(ut, str) and ut:
+            distinct_users.add(ut)
+    breakdown = {}
+    counts = {}
+    for cat, lst in by_cat.items():
+        if lst:
+            breakdown[cat] = round(sum(lst) / len(lst), 1)
+            counts[cat] = len(lst)
+    if 'overall' in breakdown:
+        avg_stars = breakdown['overall']
+    elif by_cat:
+        all_stars = [s for lst in by_cat.values() for s in lst]
+        avg_stars = round(sum(all_stars) / len(all_stars), 1) if all_stars else 0.0
+    else:
+        avg_stars = 0.0
+    return jsonify({
+        'iata': safe_iata,
+        'avg_stars': avg_stars,
+        'total_reviews': len(distinct_users),
+        'breakdown': breakdown,
+        'counts': counts,
+    })
+
+
 # ─── LayoverRec Comments (per Rec) ──────────────────────────────────────────
 
 def _layover_comments_path(rec_id):
