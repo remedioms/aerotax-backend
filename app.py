@@ -82,6 +82,7 @@ for _bp_path, _bp_name in [
     ('blueprints.crew_graph_blueprint',      'crew_graph_bp'),
     ('blueprints.trip_trade_blueprint',      'trip_trade_bp'),
     ('blueprints.aircraft_health_blueprint', 'aircraft_health_bp'),
+    ('blueprints.hotel_rooms_blueprint',     'hotel_rooms_bp'),
     ('blueprints.status_blueprint',          'status_bp'),
 ]:
     try:
