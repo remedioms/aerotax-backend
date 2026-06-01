@@ -75,17 +75,26 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 #   P6a crew_graph       — Crew-Network-Graph (wer-mit-wem)
 #   P6b trip_trade       — Open-Time Trip-Trade Board
 for _bp_path, _bp_name in [
-    ('blueprints.adsb_blueprint',          'adsb_bp'),
-    ('blueprints.license_wallet_blueprint','license_wallet_bp'),
-    ('blueprints.news_blueprint',          'news_bp'),
-    ('blueprints.crew_graph_blueprint',    'crew_graph_bp'),
-    ('blueprints.trip_trade_blueprint',    'trip_trade_bp'),
+    ('blueprints.adsb_blueprint',            'adsb_bp'),
+    ('blueprints.license_wallet_blueprint',  'license_wallet_bp'),
+    ('blueprints.news_blueprint',            'news_bp'),
+    ('blueprints.crew_graph_blueprint',      'crew_graph_bp'),
+    ('blueprints.trip_trade_blueprint',      'trip_trade_bp'),
+    ('blueprints.aircraft_health_blueprint', 'aircraft_health_bp'),
+    ('blueprints.status_blueprint',          'status_bp'),
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
         app.register_blueprint(getattr(_mod, _bp_name))
     except Exception as _e:
         app.logger.warning(f'[boot] blueprint-register-skip {_bp_path}: {type(_e).__name__}: {str(_e)[:120]}')
+
+# Sentry: optional, soft-fail. CLOUD_RUN_REVISION wird automatisch injiziert.
+try:
+    from observability.sentry_setup import init_sentry
+    init_sentry(os.getenv('SENTRY_DSN'), os.getenv('CLOUD_RUN_REVISION', 'dev'))
+except Exception as _e:
+    app.logger.info(f'[boot] sentry-skip: {type(_e).__name__}: {str(_e)[:80]}')
 
 # ── Logging-Level Boot-Setup ───────────────────────────────────────
 # Backend-Ops-Audit 2026-05-31: Flask/gunicorn default ist WARNING — d.h.
@@ -31354,6 +31363,7 @@ def hybrid_analyze(form, files, job_id=None):
             _norm_result = _nt.calculate_allowances_from_normalized_tours(
                 _norm_tours, _bmf_table, rules=None,
                 iata_to_bmf=IATA_TO_BMF, se_rows=_se_rows, homebase=homebase,
+                cas_days=_cas_days,
             )
             _diff = _nt.diff_against_legacy(_norm_result, classification or {})
 

@@ -1,14 +1,12 @@
 -- ────────────────────────────────────────────────────────────────────────
 -- AEROTAX/AERIS — Konsolidierte Migrations für Supabase Dashboard
--- Stand: 2026-06-01 (Update: 7 neue Pro-Feature-Tabellen)
---
--- Anleitung:
--- 1. https://app.supabase.com/project/jyrbijvmwacuivssbxlg → SQL Editor → New query
--- 2. KOMPLETTEN Inhalt einfügen + Run
--- 3. Idempotent (CREATE TABLE IF NOT EXISTS) — zweiter Run schadet nicht
+-- Stand: 2026-06-01 (Update: + Aircraft-Health + Rate-Limit-Buckets)
+-- 10 Tabellen-Blöcke. Idempotent (CREATE TABLE IF NOT EXISTS).
+-- 
+-- https://app.supabase.com/project/jyrbijvmwacuivssbxlg → SQL Editor → New query → Run
 -- ────────────────────────────────────────────────────────────────────────
 
--- ╔════════ Block 1/7 — user_profiles + user_friends + user_push_tokens ════════╗
+-- ╔════ 20260531_user_data ════╗
 -- User-Daten in Supabase persistieren (P0-Fix Phase 2): Profile + Friends +
 -- Push-Tokens. Vorher lebten profile_<token>.json, friends_<token>.json,
 -- push_<token>.json auf Container-ephemeral-disk und verschwanden bei jedem
@@ -73,7 +71,7 @@ create index if not exists idx_push_expo on public.user_push_tokens(expo_token) 
 create index if not exists idx_push_apns on public.user_push_tokens(apns_token) where apns_token is not null;
 alter table public.user_push_tokens enable row level security;
 
--- ╔════════ Block 2/7 — Wall + Forum + DM (Posts/Threads/Likes/...)  ══════════╗
+-- ╔════ 20260601_social ════╗
 -- Social-Persistenz in Supabase: Wall-Posts, Forum-Threads/Replies, DM-Messages.
 -- Vorher lebten alle drei in ephemeral disk-Files unter _USER_HISTORY_DIR (wall/
 -- posts.json, forum/threads.json + replies_<id>.json, chat/<channel>.json).
@@ -205,7 +203,7 @@ create index if not exists idx_dm_lastseen_user
     on public.dm_lastseen(user_token);
 alter table public.dm_lastseen enable row level security;
 
--- ╔════════ Block 3/7 — Layover Reviews (5-Kategorie Sterne) ══════════════════╗
+-- ╔════ 20260601_layover_reviews ════╗
 -- Layover-Reviews (Worker P6, 2026-06-01).
 -- Sterne-Ratings pro (iata, user_token, category) — User darf in jeder
 -- Kategorie genau ein Rating pro Airport abgeben. Re-Bewertung = Upsert.
@@ -235,7 +233,7 @@ create index if not exists idx_layover_reviews_iata_cat
     on public.layover_reviews(iata, category);
 alter table public.layover_reviews enable row level security;
 
--- ╔════════ Block 4/7 — Friend Groups ═════════════════════════════════════════╗
+-- ╔════ 20260601_friend_groups ════╗
 -- Friend-Groups in Supabase persistieren (Worker-H Polish, 2026-06-01).
 -- Vorher lebten groups[] nur im disk-File friends_<token>.json — die SB-
 -- Migration der Friends in 20260531_user_data.sql hat groups bewusst nicht
@@ -260,7 +258,7 @@ create index if not exists idx_user_friend_groups_owner
     on public.user_friend_groups(owner_token);
 alter table public.user_friend_groups enable row level security;
 
--- ╔════════ Block 5/7 — License/Recurrent/Medical Wallet (Worker P4) ══════════╗
+-- ╔════ 20260601_license_wallet ════╗
 -- License-Wallet cross-device-sync (Worker P4, 2026-06-01).
 -- Persistiert die iOS LicenseItem-SwiftData-Models in Supabase damit der
 -- gleiche User auf einem zweiten Gerät (oder nach Reinstall) seine Wallet
@@ -322,7 +320,7 @@ create index if not exists idx_user_licenses_expiry
 
 alter table public.user_licenses enable row level security;
 
--- ╔════════ Block 6/7 — Crew-Network-Graph (Worker P6a) ═══════════════════════╗
+-- ╔════ 20260601_crew_graph ════╗
 -- Worker-P6a Crew-Graph Edges — Server-side aggregation of "who-flew-with-whom".
 --
 -- Pendant zur iOS-CrewGraphEdge (SwiftData @Model). Lokal auf dem Device gilt
@@ -423,7 +421,7 @@ begin
 end;
 $$;
 
--- ╔════════ Block 7/7 — Trip-Trade Board (Worker P6b) ═════════════════════════╗
+-- ╔════ 20260601_trip_trade ════╗
 -- Trip-Trade Board (Worker P6b, 2026-06-01).
 -- Open-Time / Swap / Pickup-Marketplace für Crew-Touren.
 --
@@ -485,6 +483,101 @@ create index if not exists idx_trade_interests_token
 alter table public.trade_posts enable row level security;
 alter table public.trade_interests enable row level security;
 
--- ────────────────────────────────────────────────────────────────────────
--- ENDE — wenn keine Errors: alle 7 Blöcke angelegt
--- ────────────────────────────────────────────────────────────────────────
+-- ╔════ 20260601_aircraft_health ════╗
+-- Aircraft-Health Crowd-Reports (Worker W-USP, 2026-06-01).
+--
+-- Crews reichen tail-spezifische Reports ein (IFE row 24-30 broken, Galley
+-- freezer warm, Toilet vac intermittent). Die naechste Crew die auf derselben
+-- Tail-Reg fliegt sieht beim Boarding "3 Berichte letzter 7 Tage · Tap fuer
+-- Details".
+--
+-- Schema-Entscheidungen:
+--  · PK report_id (uuid) statt composite — Listing-Queries gehen
+--    immer ueber `tail_reg + created_at`, lookup by PK ist selten.
+--  · `reported_by_token` ist gespeichert (Spam-/Abuse-Tracking serverseitig)
+--    aber NIE im Listing-Output gerendert (siehe blueprint).
+--  · `system` + `severity` als CHECK statt FK auf Enum-Tabellen — Werte sind
+--    stabil im App-Code (siehe AircraftHealthClient.SystemCategory/Severity).
+--  · `status` default 'open' — spaeter koennte ein Maintenance-Mod einen
+--    Report als 'resolved' markieren (Listing kappt das dann optional).
+--  · Description-Cap 280 chars wie iOS/Server-Validation.
+
+create table if not exists public.aircraft_health_reports (
+    report_id           uuid          primary key default gen_random_uuid(),
+    tail_reg            text          not null,
+    system              text          not null,
+    severity            text          not null,
+    description         text          not null,
+    reported_by_token   text          not null,
+    status              text          not null default 'open',
+    created_at          timestamptz   not null default now(),
+    updated_at          timestamptz   not null default now(),
+    check (system in ('ife', 'galley', 'cabin', 'lavatory', 'avionics', 'other')),
+    check (severity in ('info', 'minor', 'major')),
+    check (status   in ('open', 'resolved')),
+    check (char_length(description) between 6 and 280),
+    check (char_length(tail_reg) between 3 and 12)
+);
+
+-- Hot-path: Listing pro Tail in einem Zeitfenster.
+create index if not exists idx_aircraft_health_tail_created
+    on public.aircraft_health_reports(tail_reg, created_at desc);
+
+-- Defensive: Wenn ein Token mehrere Reports am gleichen Tag fuer den gleichen
+-- Tail einreicht (Abuse-Pattern), koennen wir das spaeter im Blueprint
+-- detecten via diesem Index.
+create index if not exists idx_aircraft_health_token_created
+    on public.aircraft_health_reports(reported_by_token, created_at desc);
+
+-- Service-Role-Key umgeht RLS. Anon-Client bleibt geblockt (Reports kommen
+-- nur via Blueprint-Endpoint mit Token, nie direkt vom Client).
+alter table public.aircraft_health_reports enable row level security;
+
+-- ╔════ 20260601_rate_limit_buckets ════╗
+-- Rate-limit sliding-window buckets per (token, scope, window_sec).
+-- Used by rate_limits/config.py for hard per-endpoint limits + 5/60s burst.
+--
+-- One row per (token, scope, window_sec). When the current epoch crosses
+-- window_start_epoch + window_sec we treat the row as expired and start a
+-- new window in-place (upsert on conflict).
+--
+-- We deliberately do not delete expired rows in the hot path -- a nightly
+-- cleanup keeps the table small.
+
+create table if not exists public.rate_limit_buckets (
+    token              text   not null,
+    scope              text   not null,
+    window_sec         int    not null,
+    window_start_epoch bigint not null,
+    count              int    not null default 0,
+    updated_at         timestamptz not null default now(),
+    primary key (token, scope, window_sec)
+);
+
+create index if not exists idx_rl_buckets_updated
+    on public.rate_limit_buckets(updated_at);
+
+-- service-role key bypasses RLS; anon clients must never read/write this table
+alter table public.rate_limit_buckets enable row level security;
+
+-- Cleanup helper: deletes rows whose window has been expired for >2x window.
+-- Schedule via pg_cron (Supabase extension) or run manually:
+--   select public.rate_limit_buckets_cleanup();
+create or replace function public.rate_limit_buckets_cleanup()
+returns int
+language plpgsql
+as $$
+declare
+    deleted_count int;
+begin
+    delete from public.rate_limit_buckets
+    where window_start_epoch + (window_sec * 2) < extract(epoch from now())::bigint;
+    get diagnostics deleted_count = row_count;
+    return deleted_count;
+end;
+$$;
+
+-- pg_cron schedule (uncomment if pg_cron is enabled on the project):
+--   select cron.schedule('rate_limit_buckets_cleanup', '17 3 * * *',
+--                        'select public.rate_limit_buckets_cleanup();');
+
