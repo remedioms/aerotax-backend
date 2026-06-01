@@ -10025,51 +10025,297 @@ def _briefing_path(token):
     return os.path.join(_USER_HISTORY_DIR, f'briefing_{safe}.json')
 
 
+def _ical_briefings_path(token):
+    """Pfad zur iCal-Importe-Datei (plural subdir). Disk-Fallback und Lazy-Migrate."""
+    import os, re
+    if not token: return None
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+    if not safe: return None
+    d = os.path.join(_USER_HISTORY_DIR, 'briefings')
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f'{safe}.json')
+
+
+# ── Briefings SB persistence (P0, 2026-06-01) ──
+# Disk-only war auf Cloud Run ein Wipe-pro-Redeploy. Pattern wie wall_posts:
+#   primary = SB, fallback = Disk, einmal-Lazy-Migrate beim ersten SB-leeren Read.
+# Zwei Tabellen, weil die Daten unterschiedlich entstehen:
+#   · user_ical_briefings  → ICS-Feed / EKEventStore-Sync (Backend-write only)
+#   · user_manual_briefings → User-PUT (manuelle Notizen)
+# Beide werden in get_briefings gemerged (iCal-Felder gewinnen).
+
+_MANUAL_BRIEFING_KNOWN_COLS = {
+    'weather_summary', 'alternate_icao', 'mel_items', 'remarks',
+}
+
+
+def _ical_briefings_load_from_supabase(token):
+    """Liest iCal-Briefings für einen Token. dict[datum_str → event_dict] | None bei SB-down."""
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = (sb.table('user_ical_briefings').select('*')
+             .eq('token', token).execute())
+        out = {}
+        for row in (r.data or []):
+            datum = row.get('datum')
+            if not datum:
+                continue
+            ev = {}
+            if row.get('ical_summary') is not None:
+                ev['ical_summary'] = row.get('ical_summary')
+            if row.get('ical_location') is not None:
+                ev['ical_location'] = row.get('ical_location')
+            if row.get('ical_start') is not None:
+                ev['ical_start_iso'] = str(row.get('ical_start'))[:25]
+            if row.get('ical_end') is not None:
+                ev['ical_end_iso'] = str(row.get('ical_end'))[:25]
+            if row.get('updated_at') is not None:
+                ev['ical_imported_at'] = str(row.get('updated_at'))
+            raw = row.get('raw_event') or {}
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    if k not in ev:
+                        ev[k] = v
+            out[str(datum)] = ev
+        return out
+    except Exception as e:
+        app.logger.warning(f'[ical-briefings] sb_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _ical_briefings_save_to_supabase(token, events_dict):
+    """Bulk-upsert aller iCal-Briefings für einen Token. True bei vollem Erfolg."""
+    if not SB_AVAILABLE or not token or events_dict is None:
+        return False
+    rows = []
+    for datum, ev in (events_dict or {}).items():
+        if not isinstance(ev, dict):
+            continue
+        if not isinstance(datum, str) or len(datum) < 10:
+            continue
+        row = {'token': token, 'datum': datum[:10]}
+        if ev.get('ical_summary') is not None:
+            row['ical_summary'] = str(ev.get('ical_summary'))[:200]
+        if ev.get('ical_location') is not None:
+            row['ical_location'] = str(ev.get('ical_location'))[:200]
+        # iso-strings -> timestamptz (Postgres parsed das tolerant);
+        # leere strings nicht reinschreiben (würde 400 werfen).
+        si = (ev.get('ical_start_iso') or '').strip()
+        if si:
+            row['ical_start'] = si
+        ei = (ev.get('ical_end_iso') or '').strip()
+        if ei:
+            row['ical_end'] = ei
+        # Rest in raw_event jsonb (alles ausser den whitelisted columns
+        # und Re-Hydrationsfelder).
+        raw = {}
+        for k, v in ev.items():
+            if k in ('ical_summary', 'ical_location',
+                     'ical_start_iso', 'ical_end_iso',
+                     'ical_imported_at'):
+                continue
+            raw[k] = v
+        row['raw_event'] = raw
+        rows.append(row)
+    if not rows:
+        return True
+    try:
+        for i in range(0, len(rows), 500):
+            sb.table('user_ical_briefings').upsert(
+                rows[i:i+500], on_conflict='token,datum').execute()
+        return True
+    except Exception as e:
+        app.logger.error(f'[ical-briefings] sb_save_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _ical_briefings_load_from_disk(token):
+    p = _ical_briefings_path(token)
+    if not p:
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _ical_briefings_load(token):
+    """SB primary, Disk fallback, lazy-migrate (analog _wall_load_posts)."""
+    sb_data = _ical_briefings_load_from_supabase(token)
+    if sb_data is None:
+        return _ical_briefings_load_from_disk(token)
+    if sb_data:
+        return sb_data
+    # SB ok aber leer → Disk-Reste lazy-migraten
+    disk_data = _ical_briefings_load_from_disk(token)
+    if disk_data and SB_AVAILABLE:
+        app.logger.info(f'[ical-briefings] lazy-migrate {len(disk_data)} disk briefings → supabase')
+        _ical_briefings_save_to_supabase(token, disk_data)
+        return disk_data
+    return {}
+
+
+def _ical_briefings_save(token, events_dict):
+    """SB primary + Disk best-effort. Cap auf 1000 Events (rolling window)."""
+    if not isinstance(events_dict, dict):
+        return
+    # Cap: behalte die jüngsten 1000 (sortiert nach Datum-Key)
+    if len(events_dict) > 1000:
+        keys = sorted(events_dict.keys())
+        keep = keys[-1000:]
+        events_dict = {k: events_dict[k] for k in keep}
+    sb_ok = _ical_briefings_save_to_supabase(token, events_dict)
+    p = _ical_briefings_path(token)
+    if p:
+        try:
+            _atomic_write_json(p, events_dict)
+        except Exception as e:
+            app.logger.warning(f'[ical-briefings] disk_save_fail (ok wenn SB lief): {e}')
+            if not sb_ok:
+                app.logger.error('[ical-briefings] CRITICAL: weder SB noch Disk gesichert!')
+
+
+def _manual_briefings_load_from_supabase(token):
+    """Liest manuelle Briefings für einen Token. dict[datum_str → body_dict] | None."""
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = (sb.table('user_manual_briefings').select('*')
+             .eq('token', token).execute())
+        out = {}
+        for row in (r.data or []):
+            datum = row.get('datum')
+            if not datum:
+                continue
+            body = {}
+            for k in _MANUAL_BRIEFING_KNOWN_COLS:
+                v = row.get(k)
+                if v is not None:
+                    body[k] = v
+            extra = row.get('extra') or {}
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if k not in body:
+                        body[k] = v
+            out[str(datum)] = body
+        return out
+    except Exception as e:
+        app.logger.warning(f'[manual-briefings] sb_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _manual_briefings_save_to_supabase(token, briefings_dict):
+    """Bulk-upsert aller manuellen Briefings."""
+    if not SB_AVAILABLE or not token or briefings_dict is None:
+        return False
+    rows = []
+    for datum, body in (briefings_dict or {}).items():
+        if not isinstance(body, dict):
+            continue
+        if not isinstance(datum, str) or len(datum) < 10:
+            continue
+        row = {'token': token, 'datum': datum[:10]}
+        extra = {}
+        for k, v in body.items():
+            if k in _MANUAL_BRIEFING_KNOWN_COLS:
+                row[k] = v
+            else:
+                extra[k] = v
+        row['extra'] = extra
+        rows.append(row)
+    if not rows:
+        return True
+    try:
+        for i in range(0, len(rows), 500):
+            sb.table('user_manual_briefings').upsert(
+                rows[i:i+500], on_conflict='token,datum').execute()
+        return True
+    except Exception as e:
+        app.logger.error(f'[manual-briefings] sb_save_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _manual_briefings_load_from_disk(token):
+    p = _briefing_path(token)
+    if not p:
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _manual_briefings_load(token):
+    """SB primary, Disk fallback, lazy-migrate."""
+    sb_data = _manual_briefings_load_from_supabase(token)
+    if sb_data is None:
+        return _manual_briefings_load_from_disk(token)
+    if sb_data:
+        return sb_data
+    disk_data = _manual_briefings_load_from_disk(token)
+    if disk_data and SB_AVAILABLE:
+        app.logger.info(f'[manual-briefings] lazy-migrate {len(disk_data)} disk briefings → supabase')
+        _manual_briefings_save_to_supabase(token, disk_data)
+        return disk_data
+    return {}
+
+
+def _manual_briefings_save(token, briefings_dict):
+    """SB primary + Disk best-effort."""
+    if not isinstance(briefings_dict, dict):
+        return
+    sb_ok = _manual_briefings_save_to_supabase(token, briefings_dict)
+    p = _briefing_path(token)
+    if p:
+        try:
+            _atomic_write_json(p, briefings_dict)
+        except Exception as e:
+            app.logger.warning(f'[manual-briefings] disk_save_fail (ok wenn SB lief): {e}')
+            if not sb_ok:
+                app.logger.error('[manual-briefings] CRITICAL: weder SB noch Disk gesichert!')
+
+
 @app.route('/api/user/briefing/<token>', methods=['GET'])
 def get_briefings(token):
     """Alle Briefing-Items (key: Datum) für User.
 
-    Liest aus BEIDEN Pfaden und merged:
-      - `_briefing_path(token)`            → User-PUT Briefings (`briefing_<token>.json`)
-      - `_USER_HISTORY_DIR/briefings/<token>.json` → iCal-Importe (ICS-Feed + EKEventStore)
-    Beide Pfade haben historische Gründe; ein Reader-Merge ist die least-risk-Fix.
-    iCal-Felder (ical_summary/ical_location/ical_imported_at) gewinnen aus der iCal-Datei,
-    sonst gewinnt die User-PUT-Datei (manuelle Notizen).
+    Liest aus BEIDEN Quellen und merged (SB primary, Disk fallback):
+      - `user_manual_briefings`  → User-PUT Briefings (`briefing_<token>.json` als Disk-Fallback)
+      - `user_ical_briefings`    → iCal-Importe (ICS-Feed + EKEventStore)
+    Beide Quellen haben historische Gründe; ein Reader-Merge ist die least-risk-Fix.
+    iCal-Felder (ical_summary/ical_location/ical_imported_at) gewinnen aus iCal,
+    sonst gewinnt die User-PUT-Quelle (manuelle Notizen).
     """
-    import os, re as _re
-    p = _briefing_path(token)
-    if not p: return jsonify({'error':'invalid token'}), 400
-    data = {}
-    # 1) User-PUT Briefings (singular file)
+    import re as _re
+    if not token or not _re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]:
+        return jsonify({'error': 'invalid token'}), 400
     try:
-        with open(p) as f: data = json.load(f) or {}
-    except FileNotFoundError:
-        data = {}
+        data = dict(_manual_briefings_load(token) or {})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
-    # 2) iCal-Importe (plural subdir) — merge per-key
     try:
-        safe_t = _re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
-        if safe_t:
-            ical_path = os.path.join(_USER_HISTORY_DIR, 'briefings', f'{safe_t}.json')
-            with open(ical_path) as f:
-                ical_data = json.load(f) or {}
-            for k, v in (ical_data or {}).items():
-                if not isinstance(v, dict): continue
-                merged = dict(data.get(k) or {})
-                # iCal-Felder gewinnen — sind die einzige authoritative Quelle dafür
-                for fld in ('ical_summary', 'ical_location', 'ical_imported_at',
-                            'ical_start_iso', 'ical_end_iso'):
-                    if v.get(fld) is not None:
-                        merged[fld] = v.get(fld)
-                # Fallback: alle übrigen iCal-Felder nur übernehmen wenn nicht schon gesetzt
-                for fk, fv in v.items():
-                    if fk in ('ical_summary', 'ical_location', 'ical_imported_at',
-                              'ical_start_iso', 'ical_end_iso'): continue
-                    merged.setdefault(fk, fv)
-                data[k] = merged
-    except FileNotFoundError:
-        pass
+        ical_data = _ical_briefings_load(token) or {}
+        for k, v in (ical_data or {}).items():
+            if not isinstance(v, dict): continue
+            merged = dict(data.get(k) or {})
+            # iCal-Felder gewinnen — sind die einzige authoritative Quelle dafür
+            for fld in ('ical_summary', 'ical_location', 'ical_imported_at',
+                        'ical_start_iso', 'ical_end_iso'):
+                if v.get(fld) is not None:
+                    merged[fld] = v.get(fld)
+            # Fallback: alle übrigen iCal-Felder nur übernehmen wenn nicht schon gesetzt
+            for fk, fv in v.items():
+                if fk in ('ical_summary', 'ical_location', 'ical_imported_at',
+                          'ical_start_iso', 'ical_end_iso'): continue
+                merged.setdefault(fk, fv)
+            data[k] = merged
     except Exception:
         # Defensiv: iCal-Read-Fehler darf User-PUT-Daten nicht blocken
         pass
@@ -10081,26 +10327,23 @@ def get_briefings(token):
 
 @app.route('/api/user/briefing/<token>/<datum>', methods=['PUT'])
 def put_briefing(token, datum):
-    """Speichert Briefing-Item für einen Tag.
+    """Speichert Briefing-Item für einen Tag (manuelles User-PUT → SB primary, Disk best-effort).
     Body: {weather_summary, ato_min, fuel_planned_kg, alternate_icao, mel_items:[], remarks}
     """
     import re
     if not re.match(r'^\d{4}-\d{2}-\d{2}$', datum or ''):
         return jsonify({'ok': False, 'error': 'invalid_datum'}), 400
-    p = _briefing_path(token)
-    if not p: return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    if not token or not re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict):
         return jsonify({'ok': False, 'error': 'body_must_be_object'}), 400
     if len(json.dumps(body)) > 8000:
         return jsonify({'ok': False, 'error': 'payload_too_large'}), 413
     try:
-        try:
-            with open(p) as f: data = json.load(f)
-        except FileNotFoundError:
-            data = {}
+        data = dict(_manual_briefings_load(token) or {})
         data[datum] = body
-        with open(p, 'w') as f: json.dump(data, f, ensure_ascii=False)
+        _manual_briefings_save(token, data)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
     return jsonify({'ok': True, 'datum': datum})
@@ -14588,6 +14831,19 @@ def auth_delete_account():
     except Exception:
         pass
 
+    # 3b. Briefings (SB + Disk) — beide Tabellen per Token leeren
+    if SB_AVAILABLE and token:
+        try:
+            sb.table('user_ical_briefings').delete().eq('token', token).execute()
+            deleted.append('sb:user_ical_briefings')
+        except Exception as _e:
+            app.logger.warning(f'[delete] sb_ical_briefings_fail: {str(_e)[:120]}')
+        try:
+            sb.table('user_manual_briefings').delete().eq('token', token).execute()
+            deleted.append('sb:user_manual_briefings')
+        except Exception as _e:
+            app.logger.warning(f'[delete] sb_manual_briefings_fail: {str(_e)[:120]}')
+
     # 4. Forum-Threads mit diesem author_token
     try:
         threads = _forum_load_threads()
@@ -15298,14 +15554,12 @@ def import_calendar_feed(token):
         pass
 
     # Roster-Integration · jeden Event als Briefing-Hint speichern
-    # damit er im Tour-Tab als "iCal: Long-Haul JFK" sichtbar wird
+    # damit er im Tour-Tab als "iCal: Long-Haul JFK" sichtbar wird.
+    # SB primary + Disk best-effort, sonst Wipe-pro-Redeploy.
     imported_briefings = 0
+    briefings = {}
     try:
-        briefings = {}
-        bp = os.path.join(_USER_HISTORY_DIR, 'briefings', f'{re.sub(r"[^A-Za-z0-9_-]","",token or "")[:64]}.json')
-        try:
-            with open(bp) as f: briefings = json.load(f) or {}
-        except Exception: pass
+        briefings = dict(_ical_briefings_load(token) or {})
         for ev in events[:200]:
             # 'start' ist seit RFC-5545-Parser bereits 'yyyy-mm-dd' (TZ-korrekt).
             # Falls aus altem Pfad noch ein DTSTART-Roh-String hineinrutscht
@@ -15335,10 +15589,9 @@ def import_calendar_feed(token):
             existing_b['ical_imported_at'] = datetime.now().isoformat()
             briefings[date_str] = existing_b
             imported_briefings += 1
-        os.makedirs(os.path.dirname(bp), exist_ok=True)
-        with open(bp, 'w') as f: json.dump(briefings, f, ensure_ascii=False)
-    except Exception:
-        pass
+        _ical_briefings_save(token, briefings)
+    except Exception as e:
+        app.logger.warning(f'[ical-briefings] import-persist-fail: {str(e)[:200]}')
 
     # Kumulative Stats — der iCal-Feed liefert nur ein rollendes Fenster
     # (z.B. -30 / +60 Tage), aber wir behalten alle früher importierten Tage
@@ -15409,30 +15662,27 @@ def upload_calendar_events(token):
             with open(p, 'w') as f: json.dump(existing, f)
     except Exception:
         pass
-    # Briefing-Map befüllen — gleicher Pfad wie ICS-Import
+    # Briefing-Map befüllen — gleicher Pfad wie ICS-Import.
+    # SB primary + Disk best-effort, sonst Wipe-pro-Redeploy.
     imported_briefings = 0
     try:
-        briefings = {}
-        safe_t = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
-        bp = os.path.join(_USER_HISTORY_DIR, 'briefings', f'{safe_t}.json')
-        try:
-            with open(bp) as f: briefings = json.load(f) or {}
-        except Exception: pass
+        briefings = dict(_ical_briefings_load(token) or {})
         for ev in events:
             iso = (ev.get('start_iso') or '').strip()
             # akzeptiert '2026-03-15' oder '2026-03-15T14:00:00Z'
             date_str = iso[:10]
             if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str): continue
             existing_b = briefings.get(date_str, {})
-            existing_b['ical_summary'] = ev.get('summary') or ''
-            existing_b['ical_location'] = ev.get('location') or ''
+            existing_b['ical_summary'] = (ev.get('summary') or '')[:80]
+            existing_b['ical_location'] = (ev.get('location') or '')[:60]
+            existing_b['ical_start_iso'] = (ev.get('start_iso') or '')[:25]
+            existing_b['ical_end_iso'] = (ev.get('end_iso') or '')[:25]
             existing_b['ical_imported_at'] = datetime.now().isoformat()
             briefings[date_str] = existing_b
             imported_briefings += 1
-        os.makedirs(os.path.dirname(bp), exist_ok=True)
-        with open(bp, 'w') as f: json.dump(briefings, f, ensure_ascii=False)
-    except Exception:
-        pass
+        _ical_briefings_save(token, briefings)
+    except Exception as e:
+        app.logger.warning(f'[ical-briefings] ekevent-persist-fail: {str(e)[:200]}')
     return jsonify({'ok': True, 'events_count': len(events),
                     'briefings_imported': imported_briefings})
 
