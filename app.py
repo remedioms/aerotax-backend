@@ -9726,20 +9726,96 @@ def get_metar_by_iata(iata):
     return jsonify(result)
 
 
-# ─── Aviation-News Vollartikel-Proxy (aero.de) ──────────────────────────────
-# RSS-Feed liefert nur kurze <description>-Summaries (~150 chars). Die iOS-Card
-# zeigt jetzt Vollartikel inline → wir fetchen die Article-URL serverseitig,
-# extrahieren den Hauptartikel-Text per Regex-Heuristik und cachen 5min.
-# SSRF-Schutz: NUR aero.de-Host erlaubt — keinen beliebigen URL akzeptieren.
+# ─── Aviation-News Vollartikel-Proxy (Multi-Source) ─────────────────────────
+# W-Article (2026-06-01): erweitert von aero.de-only auf 6 Aviation-Quellen.
+# Pipeline:
+#   1. SSRF-Whitelist: Host MUSS in NEWS_ARTICLE_ALLOWED_HOSTS sein.
+#   2. 24h-Cache (in-mem dict + threading.Lock, key=sha256(url)).
+#   3. Fetch via requests (10s timeout, identifizierender User-Agent).
+#   4. Fulltext-Extraction Priorität:
+#         (a) readability-lxml (Mozilla-Algorithmus, robust pro Source)
+#         (b) BeautifulSoup-Heuristik (article/main/.entry-content/.article-content)
+#         (c) Legacy-Regex (`_extract_article_text`, aero.de-tuned)
+#      Es gewinnt das längste Resultat ≥80 Zeichen.
+#   5. Optional: Title + image_url + published_at aus <meta og:*>-Tags.
+# Whitelist ist HARDCODED — kein User-Input, kein DB-Lookup, kein Bypass.
+
+NEWS_ARTICLE_ALLOWED_HOSTS = frozenset({
+    # aero.de · deutsche Hauptquelle
+    'aero.de', 'www.aero.de',
+    # Reuters Aerospace & Defense
+    'reuters.com', 'www.reuters.com',
+    # AvHerald · Incident-Reports
+    'avherald.com', 'www.avherald.com',
+    # Simple Flying
+    'simpleflying.com', 'www.simpleflying.com',
+    # The Air Current
+    'theaircurrent.com', 'www.theaircurrent.com',
+    # Flightradar24 Blog (Squawk)
+    'flightradar24.com', 'www.flightradar24.com',
+})
+
+NEWS_ARTICLE_CACHE_TTL_SECONDS = 24 * 3600   # 24h — Artikel ändern sich nach Publish quasi nie.
+_NEWS_ARTICLE_CACHE = {}                     # key = sha256(url)[:24] → (expires_at, payload)
+try:
+    import threading as _news_threading
+    _NEWS_ARTICLE_CACHE_LOCK = _news_threading.Lock()
+except Exception:
+    _NEWS_ARTICLE_CACHE_LOCK = None
+
+
+def _news_article_cache_get(url):
+    """Cache-Lookup; gibt None bei Miss/Stale zurück."""
+    import time as _t
+    import hashlib as _hl
+    key = _hl.sha256(url.encode('utf-8', errors='replace')).hexdigest()[:24]
+    if _NEWS_ARTICLE_CACHE_LOCK:
+        _NEWS_ARTICLE_CACHE_LOCK.acquire()
+    try:
+        rec = _NEWS_ARTICLE_CACHE.get(key)
+        if not rec:
+            return None
+        exp, payload = rec
+        if exp <= _t.time():
+            _NEWS_ARTICLE_CACHE.pop(key, None)
+            return None
+        return payload
+    finally:
+        if _NEWS_ARTICLE_CACHE_LOCK:
+            _NEWS_ARTICLE_CACHE_LOCK.release()
+
+
+def _news_article_cache_set(url, payload):
+    """Cache-Insert; soft-GC bei >800 Einträgen (älteste 200 raus)."""
+    import time as _t
+    import hashlib as _hl
+    key = _hl.sha256(url.encode('utf-8', errors='replace')).hexdigest()[:24]
+    if _NEWS_ARTICLE_CACHE_LOCK:
+        _NEWS_ARTICLE_CACHE_LOCK.acquire()
+    try:
+        _NEWS_ARTICLE_CACHE[key] = (_t.time() + NEWS_ARTICLE_CACHE_TTL_SECONDS, payload)
+        if len(_NEWS_ARTICLE_CACHE) > 800:
+            oldest = sorted(_NEWS_ARTICLE_CACHE.items(), key=lambda kv: kv[1][0])[:200]
+            for k, _v in oldest:
+                _NEWS_ARTICLE_CACHE.pop(k, None)
+    finally:
+        if _NEWS_ARTICLE_CACHE_LOCK:
+            _NEWS_ARTICLE_CACHE_LOCK.release()
+
 
 @app.route('/api/news/article', methods=['GET'])
 def get_news_article():
-    """Vollartikel-Text einer aero.de-News-URL.
-    Query: ?url=<encoded full aero.de article URL>
-    Return: {ok: true, url, fulltext: "..."}  ·  bei Fehler 4xx/5xx mit ok:false.
-    SSRF-Schutz: host MUSS aero.de oder www.aero.de sein.
+    """Vollartikel-Text einer Aviation-News-URL.
+
+    Query: ?url=<encoded article URL>
+    Whitelist: aero.de, reuters.com, avherald.com, simpleflying.com,
+               theaircurrent.com, flightradar24.com (jeweils +www.).
+    Return:
+        ok=True  → {ok, url, source, fulltext, title, image_url,
+                    published_at, cache_hit, cache_ttl_seconds}
+        ok=False → {ok:false, error, [detail]} mit passendem HTTP-Status.
+    Cache: 24h pro URL, in-memory.
     """
-    import re
     from urllib.parse import urlparse, unquote
     raw_url = request.args.get('url') or ''
     raw_url = unquote(raw_url).strip()
@@ -9752,38 +9828,252 @@ def get_news_article():
     if parsed.scheme not in ('http', 'https'):
         return jsonify({'ok': False, 'error': 'invalid_scheme'}), 400
     host = (parsed.netloc or '').lower().split(':')[0]
-    # SSRF-Schutz: nur aero.de erlauben (keine Subdomain-Spoofs wie aero.de.evil.com)
-    if host not in ('aero.de', 'www.aero.de'):
-        return jsonify({'ok': False, 'error': 'host_not_allowed'}), 403
-    cache_key = f'news_article:{raw_url}'
-    cached = _aviation_cache_get(cache_key, 300)
+    # SSRF-Schutz: nur Whitelist-Hosts (keine Subdomain-Spoofs wie aero.de.evil.com,
+    # weil exact-Match auf den ganzen netloc geprüft wird).
+    if host not in NEWS_ARTICLE_ALLOWED_HOSTS:
+        return jsonify({
+            'ok': False,
+            'error': 'host_not_allowed',
+            'allowed_hosts': sorted(NEWS_ARTICLE_ALLOWED_HOSTS),
+        }), 403
+
+    # Cache hit?
+    cached = _news_article_cache_get(raw_url)
     if cached is not None:
-        return jsonify(cached)
+        return jsonify({**cached, 'cache_hit': True})
+
+    # Fetch HTML
     try:
-        import urllib.request as ur
-        # User-Agent: identifiziert AeroX-Research-Fetch, damit aero.de uns
-        # nicht als Bot bannt. Kein Cloudflare-Challenge-Bypass — wenn aero.de
-        # härter wird, muss man die Strategie überdenken.
-        req = ur.Request(raw_url, headers={
-            'User-Agent': 'AeroX/1.0 (research-fetch; +https://aerosteuer.de)',
-            'Accept': 'text/html,application/xhtml+xml',
-            'Accept-Language': 'de-DE,de;q=0.9',
-        })
-        with ur.urlopen(req, timeout=10) as resp:
-            raw_bytes = resp.read()
-            charset = resp.headers.get_content_charset() or 'utf-8'
-        html = raw_bytes.decode(charset, errors='replace')
+        import requests as _requests
+        resp = _requests.get(
+            raw_url,
+            timeout=10,
+            headers={
+                'User-Agent': 'AeroX/1.0 (research-fetch; +https://aerosteuer.de)',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.7,en;q=0.5',
+            },
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return jsonify({
+                'ok': False,
+                'error': 'upstream_status',
+                'status': resp.status_code,
+            }), 502
+        # requests entscheidet selbst via apparent_encoding wenn der Header lügt.
+        if not resp.encoding or resp.encoding.lower() == 'iso-8859-1':
+            resp.encoding = resp.apparent_encoding or 'utf-8'
+        html = resp.text
     except Exception as e:
         return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': str(e)[:200]}), 502
 
-    fulltext = _extract_article_text(html)
+    # Extract via mehrere Strategien, längstes valides Ergebnis gewinnt.
+    fulltext = _news_extract_best_fulltext(html, source_host=host)
     if not fulltext or len(fulltext) < 80:
-        # Extraction fehlgeschlagen — Client behält stattdessen die RSS-summary.
         return jsonify({'ok': False, 'error': 'extraction_failed', 'url': raw_url}), 200
 
-    result = {'ok': True, 'url': raw_url, 'fulltext': fulltext}
-    _aviation_cache_set(cache_key, result, 300)
+    # Metadata aus <meta og:*>/<title>/<time>
+    meta = _news_extract_metadata(html)
+
+    result = {
+        'ok': True,
+        'url': raw_url,
+        'source': host,
+        'fulltext': fulltext,
+        'title': meta.get('title'),
+        'image_url': meta.get('image_url'),
+        'published_at': meta.get('published_at'),
+        'cache_hit': False,
+        'cache_ttl_seconds': NEWS_ARTICLE_CACHE_TTL_SECONDS,
+    }
+    _news_article_cache_set(raw_url, result)
     return jsonify(result)
+
+
+def _news_extract_best_fulltext(html, source_host=''):
+    """Multi-Strategy-Extraktion: readability → bs4-Heuristik → Legacy-Regex.
+    Längstes Resultat ≥80 Zeichen gewinnt — so bekommen wir Robustheit gegen
+    Layout-Änderungen einzelner Quellen ohne pro-Source-Tuning.
+    """
+    candidates = []
+
+    # Strategie 1: readability-lxml (Mozilla-Algorithmus)
+    try:
+        from readability import Document as _ReadabilityDoc  # type: ignore
+        doc = _ReadabilityDoc(html)
+        summary_html = doc.summary(html_partial=True)
+        plain = _news_html_to_plain(summary_html)
+        if plain and len(plain) >= 80:
+            candidates.append(('readability', plain))
+    except ImportError:
+        # readability-lxml fehlt — graceful fallback auf bs4/legacy.
+        pass
+    except Exception:
+        # readability kann auf Cloudflare-Challenges/leeren Pages crashen — skip.
+        pass
+
+    # Strategie 2: BeautifulSoup-Heuristik (article, main, .entry-content, …)
+    try:
+        bs_plain = _news_bs4_extract(html)
+        if bs_plain and len(bs_plain) >= 80:
+            candidates.append(('bs4', bs_plain))
+    except Exception:
+        pass
+
+    # Strategie 3: Legacy-Regex (aero.de-tuned, funktioniert dort am besten)
+    try:
+        legacy = _extract_article_text(html)
+        if legacy and len(legacy) >= 80:
+            candidates.append(('legacy', legacy))
+    except Exception:
+        pass
+
+    if not candidates:
+        return ''
+    # Längstes Ergebnis bevorzugen (mehr Text = wahrscheinlich vollständiger).
+    # Hard-Cap 20k Zeichen damit Response nicht explodiert.
+    candidates.sort(key=lambda kv: len(kv[1]), reverse=True)
+    best = candidates[0][1]
+    if len(best) > 20000:
+        best = best[:20000].rsplit('\n\n', 1)[0]
+    return best
+
+
+def _news_bs4_extract(html):
+    """BeautifulSoup-basierte Main-Content-Extraktion. Probiert eine Liste
+    von CSS-Selektoren in absteigender Spezifizität. Erstes Element mit
+    ≥200 Zeichen Plain-Text gewinnt."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return ''
+    if not html:
+        return ''
+    soup = BeautifulSoup(html, 'html.parser')
+    # Junk-Tags raus (script/style/nav/header/footer/aside/form/noscript).
+    for junk in soup(['script', 'style', 'nav', 'header', 'footer', 'aside',
+                      'form', 'noscript', 'iframe']):
+        junk.decompose()
+    # Kandidaten-Selektoren in Reihenfolge der Spezifizität.
+    selectors = [
+        'article',
+        'main article',
+        'div.article-content', 'div.article-body', 'div.article__body',
+        'div[itemprop="articleBody"]',
+        'div.entry-content',           # WordPress (theaircurrent, simpleflying)
+        'div.post-content',
+        'div.news-text',
+        'div.story-body', 'div.story-content',  # Reuters-ish
+        'main',
+        'div#article-content',
+        'div.article',
+    ]
+    for sel in selectors:
+        try:
+            el = soup.select_one(sel)
+        except Exception:
+            continue
+        if not el:
+            continue
+        text = el.get_text(separator='\n', strip=True)
+        if text and len(text) >= 200:
+            return _news_normalize_text(text)
+    # Fallback: alle <p>-Tags des body sammeln, wenn Summe ≥200 ist nehmen.
+    paragraphs = [p.get_text(' ', strip=True) for p in soup.find_all('p')]
+    joined = '\n\n'.join(p for p in paragraphs if p and len(p) > 30)
+    if len(joined) >= 200:
+        return _news_normalize_text(joined)
+    return ''
+
+
+def _news_html_to_plain(html):
+    """Konvertiert HTML-Fragment (z.B. readability-summary) zu Plain-Text.
+    Erhält Absatz-Struktur via \\n\\n nach </p>/<br><br>."""
+    import re as _re
+    import html as _html_lib
+    if not html:
+        return ''
+    s = html
+    # script/style strippen
+    s = _re.sub(r'<(script|style)\b[^>]*>.*?</\1>', ' ', s,
+                flags=_re.IGNORECASE | _re.DOTALL)
+    # <br> → \n
+    s = _re.sub(r'<br\s*/?>', '\n', s, flags=_re.IGNORECASE)
+    # </p>/</div>/</h*>/</li> → \n\n
+    s = _re.sub(r'</(p|div|h[1-6]|li|blockquote)\s*>', '\n\n', s, flags=_re.IGNORECASE)
+    # restliche Tags strippen
+    s = _re.sub(r'<[^>]+>', ' ', s)
+    # Entities
+    try:
+        s = _html_lib.unescape(s)
+    except Exception:
+        pass
+    return _news_normalize_text(s)
+
+
+def _news_normalize_text(text):
+    """Whitespace-Normalisierung: \\xa0 → Space, Mehrfach-Spaces collapsen,
+    >2 Newlines → \\n\\n, pro Zeile trimmen."""
+    import re as _re
+    if not text:
+        return ''
+    s = text.replace('\xa0', ' ').replace('\r', '\n').replace('\t', ' ')
+    s = _re.sub(r'[  ]+', ' ', s)
+    s = _re.sub(r'\n{3,}', '\n\n', s)
+    lines = [ln.strip() for ln in s.split('\n')]
+    return '\n'.join(lines).strip()
+
+
+def _news_extract_metadata(html):
+    """Extrahiert Title, Image-URL und Published-At aus <meta og:*> / <title> / <time>.
+    Bestes-Effort, alle Felder optional."""
+    import re as _re
+    out = {'title': None, 'image_url': None, 'published_at': None}
+    if not html:
+        return out
+
+    def _meta(prop_or_name, attr_kind='property'):
+        # <meta property="og:title" content="..."> bzw. name="..."
+        pat = (rf'<meta\s+[^>]*{attr_kind}\s*=\s*["\']{_re.escape(prop_or_name)}["\']'
+               rf'[^>]*\bcontent\s*=\s*["\']([^"\']+)["\']')
+        m = _re.search(pat, html, flags=_re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        # Reverse-Reihenfolge: content kommt vor property im <meta>-Tag
+        pat2 = (rf'<meta\s+[^>]*\bcontent\s*=\s*["\']([^"\']+)["\'][^>]*'
+                rf'{attr_kind}\s*=\s*["\']{_re.escape(prop_or_name)}["\']')
+        m2 = _re.search(pat2, html, flags=_re.IGNORECASE)
+        if m2:
+            return m2.group(1).strip()
+        return None
+
+    title = _meta('og:title') or _meta('twitter:title', 'name')
+    if not title:
+        m = _re.search(r'<title[^>]*>(.*?)</title>', html,
+                       flags=_re.IGNORECASE | _re.DOTALL)
+        if m:
+            try:
+                import html as _html_lib
+                title = _html_lib.unescape(m.group(1).strip())
+            except Exception:
+                title = m.group(1).strip()
+    out['title'] = title
+
+    out['image_url'] = (_meta('og:image')
+                       or _meta('twitter:image', 'name')
+                       or _meta('twitter:image:src', 'name'))
+
+    out['published_at'] = (_meta('article:published_time')
+                          or _meta('og:article:published_time')
+                          or _meta('date', 'name')
+                          or _meta('publication_date', 'name'))
+    if not out['published_at']:
+        m = _re.search(r'<time\b[^>]*\bdatetime\s*=\s*["\']([^"\']+)["\']',
+                       html, flags=_re.IGNORECASE)
+        if m:
+            out['published_at'] = m.group(1).strip()
+    return out
 
 
 def _extract_article_text(html):
