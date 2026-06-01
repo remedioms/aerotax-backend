@@ -15548,6 +15548,400 @@ def set_crew_aircraft(token, datum):
 
 
 # ── Calendar-Feed-Import (ICS URL) ─────────────────────────────────────
+#
+# W19-Fix (2026-06-01): iCal-Parser end-to-end repariert. User-Memory:
+# "iCal 1:1 lesen — keine Office-Fallbacks erfinden, exakt was im LH-Kalender
+# steht." Findings die in dieser Iteration gefixt wurden:
+#
+#   F1 (TZ-bucket aus UTC statt local) — Ein Briefing 23:30 Berlin lokal
+#      wurde als UTC-Tag (22:30 UTC, evt. Vortag) gebucketed. LH-Crew-Plan
+#      arbeitet operational am LOKAL-Datum. → bucket = lokal nach TZID.
+#   F2 (Multi-Day-Event) — SIN-Tour Jun 25 14:00 → Jun 27 12:00 wurde nur
+#      Jun 25 zugewiesen. Tag 2 + 3 fielen raus. → expandiere über alle Tage.
+#   F3 (All-Day DTEND-exclusiv) — RFC-5545: DTEND;VALUE=DATE ist EXKLUSIV.
+#      Jun 15 + Jun 16 (DTEND=Jun 17) bedeutet 2 Tage, nicht 3.
+#   F4 (RRULE COUNT off-by-one) — COUNT=5 inkludiert Master-Event. Wir
+#      brauchen N-1 Expansions zusätzlich, nicht N.
+#   F5 (Multi-Event-Day Overwrite) — Briefing 06:00 + Pickup 14:30 am selben
+#      Tag → zweites Event hat erstes überschrieben. → Merge: concat summary,
+#      earliest start_iso, latest end_iso.
+#   F6 (Empty-DTSTART tolerant) — Events ohne parsebares DTSTART wurden
+#      silent gedropt. → log + skip mit Audit-Marker.
+
+def _ics_unfold_lines(src):
+    """RFC-5545 §3.1 Line-Unfolding: führender SPACE/TAB = Fortsetzung."""
+    out = []
+    for raw in (src or '').splitlines():
+        if raw.startswith((' ', '\t')) and out:
+            out[-1] = out[-1] + raw[1:]
+        else:
+            out.append(raw)
+    return out
+
+
+def _ics_parse_dt(value, params):
+    """Parse DTSTART/DTEND-Value zu (utc_dt | None, local_date_str | None,
+    is_date_only). Bucket = LOKAL nach TZID (siehe F1). All-Day → utc_dt=None.
+
+    Akzeptiert: 20260315T140000Z (UTC) · 20260315T140000 (floating/TZID) ·
+    20260315 (DATE-only).
+    """
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        _zi_ok = True
+    except Exception:
+        _ZI = None  # type: ignore
+        _zi_ok = False
+    v = (value or '').strip()
+    if not v:
+        return None, None, False
+    # DATE-only (all-day events): "20260315"
+    if len(v) == 8 and v.isdigit():
+        return None, f'{v[0:4]}-{v[4:6]}-{v[6:8]}', True
+    # DATETIME: 20260315T140000 (mit optionalem Z für UTC)
+    m = re.match(r'^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$', v)
+    if not m:
+        # Fallback: erstes 8-stellige Datum aus dem String ziehen
+        digits = re.sub(r'\D', '', v)[:8]
+        if len(digits) == 8:
+            return None, f'{digits[0:4]}-{digits[4:6]}-{digits[6:8]}', True
+        return None, None, False
+    Y, M, D, h, mi, s, z = m.groups()
+    try:
+        naive = datetime(int(Y), int(M), int(D), int(h), int(mi), int(s))
+    except Exception:
+        return None, None, False
+    tzid = (params or {}).get('TZID')
+    if z == 'Z':
+        # Explicit UTC. Lokaler Bucket = User-TZ; LH-Crew nutzt typischerweise
+        # Berlin/Frankfurt als Operations-TZ, also fallback auf Europe/Berlin.
+        if _zi_ok:
+            try:
+                utc_dt = naive.replace(tzinfo=_ZI('UTC'))
+                local = utc_dt.astimezone(_ZI('Europe/Berlin'))
+                return utc_dt, local.strftime('%Y-%m-%d'), False
+            except Exception:
+                pass
+        return naive, f'{Y}-{M}-{D}', False
+    if tzid and _zi_ok:
+        try:
+            aware = naive.replace(tzinfo=_ZI(tzid))
+            utc_dt = aware.astimezone(_ZI('UTC'))
+            # F1: bucket = LOKAL-Datum (aware), nicht UTC-Datum.
+            return utc_dt, aware.strftime('%Y-%m-%d'), False
+        except Exception:
+            return naive, f'{Y}-{M}-{D}', False
+    # Floating local time: bucket = wie geschrieben.
+    return naive, f'{Y}-{M}-{D}', False
+
+
+def _ics_parse_rrule(value):
+    """Parse RRULE-Value zu dict {FREQ, INTERVAL, COUNT, UNTIL, BYDAY, ...}."""
+    rr = {}
+    for part in (value or '').split(';'):
+        if '=' in part:
+            rk, _, rv = part.partition('=')
+            rr[rk.strip().upper()] = rv.strip()
+    return rr
+
+
+def _ics_expand_rrule(master, max_per_event=100):
+    """Expandiere RRULE-Master zu Liste von occurrence-event-dicts.
+
+    F4: COUNT=N inkludiert das Master-Event — wir produzieren also N-1
+    zusätzliche Expansions, nicht N.
+
+    Limits: max 366-Tage-Lookahead, max 100 Expansions/Master, FREQ ∈
+    {DAILY, WEEKLY}. MONTHLY/YEARLY/BYMONTHDAY/EXDATE bleiben ignoriert.
+    """
+    from datetime import timedelta as _td
+    rr = master.get('_rrule') or {}
+    freq = (rr.get('FREQ') or '').upper()
+    if freq not in ('DAILY', 'WEEKLY'):
+        return []
+    start_bucket = master.get('start')
+    if not start_bucket or not re.match(r'^\d{4}-\d{2}-\d{2}$', start_bucket):
+        return []
+    try:
+        base_date = datetime.strptime(start_bucket, '%Y-%m-%d').date()
+    except Exception:
+        return []
+    try:
+        interval = max(1, int(rr.get('INTERVAL', '1')))
+    except Exception:
+        interval = 1
+    # F4: COUNT=N → N total inkl. Master → N-1 Expansions.
+    count_raw = rr.get('COUNT')
+    if count_raw:
+        try:
+            count_total = int(count_raw)
+            count_extra = max(0, count_total - 1)
+        except Exception:
+            count_extra = max_per_event
+    else:
+        count_extra = max_per_event
+    count_extra = min(count_extra, max_per_event)
+    # UNTIL: 20260601T235959Z oder 20260601
+    until_date = None
+    u = (rr.get('UNTIL') or '').strip()
+    if u:
+        udigits = re.sub(r'\D', '', u)[:8]
+        if len(udigits) == 8:
+            try:
+                until_date = datetime.strptime(udigits, '%Y%m%d').date()
+            except Exception:
+                until_date = None
+    try:
+        max_lookahead = base_date.replace(year=base_date.year + 1)
+    except ValueError:  # 29 Feb
+        max_lookahead = base_date + _td(days=366)
+    if until_date and until_date < max_lookahead:
+        max_lookahead = until_date
+    weekday_map = {'MO': 0, 'TU': 1, 'WE': 2, 'TH': 3,
+                   'FR': 4, 'SA': 5, 'SU': 6}
+    byday = []
+    if rr.get('BYDAY'):
+        for d in rr['BYDAY'].split(','):
+            d_clean = re.sub(r'^[+-]?\d+', '', d.strip().upper())
+            if d_clean in weekday_map:
+                byday.append(weekday_map[d_clean])
+    expansions = []
+    if freq == 'WEEKLY' and byday:
+        week_anchor = base_date - _td(days=base_date.weekday())
+        week_idx = 0
+        while len(expansions) < count_extra:
+            cur_week_start = week_anchor + _td(weeks=week_idx * interval)
+            if cur_week_start > max_lookahead:
+                break
+            for wd in sorted(byday):
+                occ = cur_week_start + _td(days=wd)
+                if occ <= base_date:
+                    continue
+                if occ > max_lookahead:
+                    break
+                expansions.append(occ)
+                if len(expansions) >= count_extra:
+                    break
+            week_idx += 1
+            if week_idx > 100:
+                break
+    else:
+        step_days = interval if freq == 'DAILY' else 7 * interval
+        cur = base_date + _td(days=step_days)
+        iters = 0
+        while cur <= max_lookahead and len(expansions) < count_extra and iters < 500:
+            expansions.append(cur)
+            cur = cur + _td(days=step_days)
+            iters += 1
+    out = []
+    for occ_date in expansions:
+        clone = {k: v for k, v in master.items()
+                 if k not in ('_rrule', 'start_iso', 'end_iso',
+                              '_multiday_dates')}
+        clone['start'] = occ_date.strftime('%Y-%m-%d')
+        clone['end'] = occ_date.strftime('%Y-%m-%d')
+        clone['_recurrence_of'] = start_bucket
+        out.append(clone)
+    return out
+
+
+def _ics_multiday_dates(ev):
+    """Liefert die Liste lokaler Datums-Strings, an denen das Event den User
+    beschäftigt. F2: Multi-Day-Tour Jun 25 → Jun 27 → [Jun 25, Jun 26, Jun 27].
+    F3: All-Day DTEND-exclusiv → Jun 15 (DTEND Jun 16) = [Jun 15].
+
+    Bei fehlendem DTEND: nur Start-Tag.
+    """
+    from datetime import timedelta as _td
+    start = ev.get('start')
+    end = ev.get('end')
+    if not start or not re.match(r'^\d{4}-\d{2}-\d{2}$', start):
+        return []
+    try:
+        s_d = datetime.strptime(start, '%Y-%m-%d').date()
+    except Exception:
+        return []
+    if not end or not re.match(r'^\d{4}-\d{2}-\d{2}$', end):
+        return [start]
+    try:
+        e_d = datetime.strptime(end, '%Y-%m-%d').date()
+    except Exception:
+        return [start]
+    # All-Day → DTEND ist exklusiv (RFC 5545 §3.8.2.2).
+    # Timed → DTEND ist der Zeitpunkt, der Tag selbst zählt noch zur Tour.
+    inclusive_end = e_d
+    if ev.get('_is_date_only_end'):
+        inclusive_end = e_d - _td(days=1)
+    if inclusive_end < s_d:
+        return [start]
+    days = []
+    cur = s_d
+    safety = 0
+    while cur <= inclusive_end and safety < 32:
+        days.append(cur.strftime('%Y-%m-%d'))
+        cur = cur + _td(days=1)
+        safety += 1
+    return days or [start]
+
+
+def _parse_ics_to_events(text):
+    """Parser-Kern (pure function). Liefert Liste von Event-Dicts mit Keys:
+    start (lokal yyyy-mm-dd), end, start_iso (UTC), end_iso (UTC),
+    summary, location, _multiday_dates, _rrule (falls vorhanden).
+
+    Pure, ohne Flask-Context — testbar via tests/fixtures/lh_synthetic.ics.
+    """
+    events = []
+    current = None
+    for raw_line in _ics_unfold_lines(text):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == 'BEGIN:VEVENT':
+            current = {'_cancelled': False}
+        elif line == 'END:VEVENT' and current is not None:
+            if current and not current.get('_cancelled'):
+                current.pop('_cancelled', None)
+                # Multi-Day-Expansion (F2/F3): Datumsliste merken.
+                current['_multiday_dates'] = _ics_multiday_dates(current)
+                events.append(current)
+            current = None
+        elif current is not None and ':' in line:
+            name_part, _, value = line.partition(':')
+            segs = name_part.split(';')
+            k = segs[0].upper()
+            params = {}
+            for seg in segs[1:]:
+                if '=' in seg:
+                    pk, _, pv = seg.partition('=')
+                    params[pk.strip().upper()] = pv.strip()
+            v = value.strip()
+            if k == 'SUMMARY':
+                current['summary'] = v[:120]
+            elif k == 'LOCATION':
+                current['location'] = v[:80]
+            elif k == 'STATUS':
+                if v.upper() == 'CANCELLED':
+                    current['_cancelled'] = True
+            elif k == 'DTSTART':
+                utc_dt, bucket, is_date = _ics_parse_dt(v, params)
+                if bucket:
+                    current['start'] = bucket
+                if utc_dt is not None:
+                    current['start_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                current['_is_date_only_start'] = is_date
+            elif k == 'DTEND':
+                utc_dt, bucket, is_date = _ics_parse_dt(v, params)
+                if bucket:
+                    current['end'] = bucket
+                if utc_dt is not None:
+                    current['end_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                current['_is_date_only_end'] = is_date
+            elif k == 'RRULE':
+                rr = _ics_parse_rrule(v)
+                if rr:
+                    current['_rrule'] = rr
+    # RRULE-Expansion (max 1000 total)
+    expanded = []
+    total_cap = 1000
+    for ev in events:
+        if not ev.get('_rrule'):
+            continue
+        try:
+            new_evs = _ics_expand_rrule(ev)
+        except Exception:
+            new_evs = []
+        if not new_evs:
+            continue
+        room = total_cap - len(expanded)
+        if room <= 0:
+            break
+        # Expansions auch durch Multi-Day-Expansion schicken.
+        for ne in new_evs[:room]:
+            ne['_multiday_dates'] = _ics_multiday_dates(ne)
+        expanded.extend(new_evs[:room])
+    for ev in events:
+        ev.pop('_rrule', None)
+    events.extend(expanded)
+    return events
+
+
+def _ics_events_to_briefings(events, existing=None):
+    """Konsumiert Event-Liste → dict[datum_str → briefing_dict]. F2 expandiert
+    Multi-Day-Events auf alle Tage, F5 merged Same-Day-Events.
+
+    Merge-Regel: SUMMARY concat mit " · ", LOCATION concat mit ", " (dedupe),
+    earliest start_iso, latest end_iso.
+    """
+    briefings = dict(existing or {})
+    imported = 0
+    for ev in events:
+        # F2: ein Event kann an mehreren Tagen zählen.
+        days = ev.get('_multiday_dates') or []
+        if not days:
+            s = (ev.get('start') or '').strip()
+            if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
+                days = [s]
+        if not days:
+            continue
+        summary = (ev.get('summary') or '').strip()[:120]
+        location = (ev.get('location') or '').strip()[:80]
+        start_iso = (ev.get('start_iso') or '')[:25]
+        end_iso = (ev.get('end_iso') or '')[:25]
+        # Skip nur wenn ALLES leer.
+        if not summary and not location and not start_iso:
+            continue
+        for i, date_str in enumerate(days):
+            if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+                continue
+            existing_b = briefings.get(date_str) or {}
+            # Multi-Day-Marker bei Tagen 2..N: Summary erweitert um " (Tag k/N)"
+            day_summary = summary
+            if len(days) > 1 and summary:
+                day_summary = f"{summary} (Tag {i+1}/{len(days)})"[:120]
+            # F5: Same-Day-Merge.
+            prev_summary = (existing_b.get('ical_summary') or '').strip()
+            prev_location = (existing_b.get('ical_location') or '').strip()
+            prev_start = (existing_b.get('ical_start_iso') or '').strip()
+            prev_end = (existing_b.get('ical_end_iso') or '').strip()
+            merged_summary = day_summary
+            if prev_summary and day_summary and prev_summary != day_summary \
+                    and day_summary not in prev_summary:
+                merged_summary = f"{prev_summary} · {day_summary}"[:200]
+            elif prev_summary and not day_summary:
+                merged_summary = prev_summary
+            merged_location = location
+            if prev_location and location and prev_location != location \
+                    and location not in prev_location:
+                merged_location = f"{prev_location}, {location}"[:120]
+            elif prev_location and not location:
+                merged_location = prev_location
+            # earliest start, latest end
+            merged_start = start_iso
+            if prev_start and start_iso:
+                merged_start = min(prev_start, start_iso)
+            elif prev_start:
+                merged_start = prev_start
+            merged_end = end_iso
+            if prev_end and end_iso:
+                merged_end = max(prev_end, end_iso)
+            elif prev_end:
+                merged_end = prev_end
+            # Bei Multi-Day-Folgetagen: start_iso/end_iso vom Original-Tag
+            # NICHT auf den Folgetag schreiben (wäre irreführend). Nur Tag 1.
+            if i > 0:
+                # Folgetage: nur Summary + Location, keine spezifische Zeit.
+                merged_start = prev_start
+                merged_end = prev_end
+            existing_b['ical_summary'] = merged_summary
+            existing_b['ical_location'] = merged_location
+            existing_b['ical_start_iso'] = merged_start
+            existing_b['ical_end_iso'] = merged_end
+            existing_b['ical_imported_at'] = datetime.now().isoformat()
+            briefings[date_str] = existing_b
+            imported += 1
+    return briefings, imported
+
 
 @app.route('/api/user/calendar-feed/<token>/import', methods=['POST'])
 def import_calendar_feed(token):
@@ -15581,253 +15975,14 @@ def import_calendar_feed(token):
             text = raw.decode('utf-8', errors='replace')
     except Exception as e:
         return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': str(e)[:200]}), 502
-    # RFC-5545-konformer ICS-Parser (minimal, ohne icalendar-Dep):
-    #  1) Line-Folding (§3.1): Zeilen die mit SPACE/TAB beginnen sind
-    #     Continuations der vorherigen Zeile → vor dem Parsen unfolden.
-    #  2) TZID-Parameter: DTSTART;TZID=Europe/Berlin:20260315T140000 →
-    #     in UTC umrechnen (via stdlib zoneinfo). Floating-Times bleiben
-    #     als naive UTC behandelt (Best-Effort), 'Z'-Suffix ist UTC.
-    #  3) STATUS:CANCELLED → Event skippen (nicht importieren).
-    #  4) Datum-Bucket wird aus dem TZ-aware datetime in UTC abgeleitet,
-    #     nicht naiv string-slice.
+    # RFC-5545-konformer ICS-Parser via module-level pure functions —
+    # siehe _parse_ics_to_events oberhalb. Erlaubt isolierte Test-Coverage
+    # (tests/test_ical_parser.py) ohne Flask-Context.
     try:
-        from zoneinfo import ZoneInfo
-        _ZI_OK = True
-    except Exception:
-        ZoneInfo = None  # type: ignore
-        _ZI_OK = False
-
-    def _ics_unfold(src):
-        out = []
-        for raw in src.splitlines():
-            # RFC 5545 §3.1: führender SPACE oder TAB = Fortsetzung
-            if raw.startswith((' ', '\t')) and out:
-                out[-1] = out[-1] + raw[1:]
-            else:
-                out.append(raw)
-        return out
-
-    def _parse_ics_dt(value, params):
-        """Liefert (utc_datetime_or_None, date_bucket_yyyy_mm_dd_or_None).
-        Akzeptiert: 20260315T140000Z (UTC) · 20260315T140000 (floating/TZID) ·
-        20260315 (DATE).
-        """
-        v = (value or '').strip()
-        if not v:
-            return None, None
-        # DATE-only
-        if len(v) == 8 and v.isdigit():
-            return None, f'{v[0:4]}-{v[4:6]}-{v[6:8]}'
-        # DATETIME
-        m = re.match(r'^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$', v)
-        if not m:
-            digits = re.sub(r'\D', '', v)[:8]
-            if len(digits) == 8:
-                return None, f'{digits[0:4]}-{digits[4:6]}-{digits[6:8]}'
-            return None, None
-        Y, M, D, h, mi, s, z = m.groups()
-        try:
-            naive = datetime(int(Y), int(M), int(D), int(h), int(mi), int(s))
-        except Exception:
-            return None, None
-        tzid = params.get('TZID') if params else None
-        utc_dt = None
-        if z == 'Z':
-            try:
-                utc_dt = naive.replace(tzinfo=ZoneInfo('UTC')) if _ZI_OK else naive
-            except Exception:
-                utc_dt = naive
-        elif tzid and _ZI_OK:
-            try:
-                aware = naive.replace(tzinfo=ZoneInfo(tzid))
-                utc_dt = aware.astimezone(ZoneInfo('UTC'))
-            except Exception:
-                utc_dt = naive  # unbekannte TZID → floating
-        else:
-            utc_dt = naive  # floating local time
-        bucket = (utc_dt.strftime('%Y-%m-%d') if utc_dt is not None
-                  else f'{Y}-{M}-{D}')
-        return utc_dt, bucket
-
-    events = []
-    current = None
-    for raw_line in _ics_unfold(text):
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line == 'BEGIN:VEVENT':
-            current = {'_cancelled': False}
-        elif line == 'END:VEVENT' and current is not None:
-            if current and not current.get('_cancelled'):
-                current.pop('_cancelled', None)
-                events.append(current)
-            current = None
-        elif current is not None and ':' in line:
-            name_part, _, value = line.partition(':')
-            segs = name_part.split(';')
-            k = segs[0].upper()
-            params = {}
-            for seg in segs[1:]:
-                if '=' in seg:
-                    pk, _, pv = seg.partition('=')
-                    params[pk.strip().upper()] = pv.strip()
-            v = value.strip()
-            if k == 'SUMMARY':
-                current['summary'] = v[:80]
-            elif k == 'LOCATION':
-                current['location'] = v[:60]
-            elif k == 'STATUS':
-                if v.upper() == 'CANCELLED':
-                    current['_cancelled'] = True
-            elif k == 'DTSTART':
-                utc_dt, bucket = _parse_ics_dt(v, params)
-                if bucket:
-                    current['start'] = bucket  # date-bucket (yyyy-mm-dd)
-                if utc_dt is not None:
-                    current['start_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-            elif k == 'DTEND':
-                utc_dt, bucket = _parse_ics_dt(v, params)
-                if bucket:
-                    current['end'] = bucket
-                if utc_dt is not None:
-                    current['end_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-            elif k == 'RRULE':
-                # W14-Note (2026-06-01): Recurring-Events (z.B. wöchentliche
-                # Standby-Slots) parsen. Wir unterstützen NUR die häufigsten
-                # LH-Patterns: FREQ=DAILY/WEEKLY, optional INTERVAL, COUNT,
-                # UNTIL, BYDAY. Komplexere Rules (BYMONTHDAY/BYSETPOS/EXDATE)
-                # werden ignoriert — Master-Event bleibt erhalten, Expansions
-                # fehlen dann (User sieht zumindest den Master-Termin).
-                rr = {}
-                for part in v.split(';'):
-                    if '=' in part:
-                        rk, _, rv = part.partition('=')
-                        rr[rk.strip().upper()] = rv.strip()
-                if rr:
-                    current['_rrule'] = rr
-
-    # ── RRULE-Expansion (W14-Fix, 2026-06-01) ─────────────────────────
-    # Nach VEVENT-Sammlung jeden Master mit _rrule expandieren. Hard-Limits:
-    # · max 366 Tage Lookahead vom Master-DTSTART (1 Jahr — entspricht ~52
-    #   wöchentlichen Standby-Slots, mehr braucht kein Steuer-Report)
-    # · max 100 Expansions pro Master-Event (Memory-Schutz, ungewöhnlich
-    #   große Recurrences cappen)
-    # · max 1000 Expansions total über alle Master-Events
-    def _expand_rrule(master):
-        rr = master.get('_rrule') or {}
-        freq = (rr.get('FREQ') or '').upper()
-        if freq not in ('DAILY', 'WEEKLY'):
-            return []  # MONTHLY/YEARLY/etc nicht unterstützt
-        # Master-DTSTART → date
-        start_bucket = master.get('start')
-        if not start_bucket or not re.match(r'^\d{4}-\d{2}-\d{2}$', start_bucket):
-            return []
-        try:
-            base_date = datetime.strptime(start_bucket, '%Y-%m-%d').date()
-        except Exception:
-            return []
-        try:
-            interval = max(1, int(rr.get('INTERVAL', '1')))
-        except Exception:
-            interval = 1
-        try:
-            count_cap = int(rr.get('COUNT', '0')) or 100
-        except Exception:
-            count_cap = 100
-        count_cap = min(count_cap, 100)
-        # UNTIL: ICS-Format 20260601T235959Z oder 20260601
-        until_date = None
-        u = (rr.get('UNTIL') or '').strip()
-        if u:
-            udigits = re.sub(r'\D', '', u)[:8]
-            if len(udigits) == 8:
-                try:
-                    until_date = datetime.strptime(udigits, '%Y%m%d').date()
-                except Exception:
-                    until_date = None
-        # 366-day hard cap auch wenn UNTIL fehlt
-        max_lookahead = base_date.replace(year=base_date.year + 1) \
-            if (base_date.month, base_date.day) != (2, 29) else base_date
-        if until_date and until_date < max_lookahead:
-            max_lookahead = until_date
-        # BYDAY: SU,MO,TU,WE,TH,FR,SA (RFC-5545)
-        weekday_map = {'MO': 0, 'TU': 1, 'WE': 2, 'TH': 3, 'FR': 4, 'SA': 5, 'SU': 6}
-        byday = []
-        if rr.get('BYDAY'):
-            for d in rr['BYDAY'].split(','):
-                d = d.strip().upper()
-                # Strip BYDAY position prefixes (z.B. "1MO" für ersten Montag)
-                d_clean = re.sub(r'^[+-]?\d+', '', d)
-                if d_clean in weekday_map:
-                    byday.append(weekday_map[d_clean])
-        expansions = []
-        # Step-Size: DAILY = interval Tage, WEEKLY = interval Wochen (7*interval Tage)
-        if freq == 'DAILY':
-            step_days = interval
-        else:
-            step_days = 7 * interval
-        from datetime import timedelta as _td
-        # WEEKLY+BYDAY: iteriere wochenweise + emit für jeden BYDAY-Wochentag
-        if freq == 'WEEKLY' and byday:
-            # Anchor: Wochenstart des Master-Datums (Montag = 0)
-            week_anchor = base_date - _td(days=base_date.weekday())
-            week_idx = 0
-            while len(expansions) < count_cap:
-                cur_week_start = week_anchor + _td(weeks=week_idx * interval)
-                if cur_week_start > max_lookahead:
-                    break
-                for wd in sorted(byday):
-                    occ = cur_week_start + _td(days=wd)
-                    if occ <= base_date:
-                        continue  # Master-Date selbst ist schon im events[]
-                    if occ > max_lookahead:
-                        break
-                    expansions.append(occ)
-                    if len(expansions) >= count_cap:
-                        break
-                week_idx += 1
-                if week_idx > 100:
-                    break  # belt+suspenders
-        else:
-            # DAILY oder WEEKLY ohne BYDAY: linearer Step ab base_date
-            cur = base_date + _td(days=step_days)
-            iters = 0
-            while cur <= max_lookahead and len(expansions) < count_cap and iters < 500:
-                expansions.append(cur)
-                cur = cur + _td(days=step_days)
-                iters += 1
-        # Convert occurrence-dates → event-dicts (klonen Master ohne _rrule)
-        out = []
-        for occ_date in expansions:
-            occ_iso = occ_date.strftime('%Y-%m-%d')
-            clone = {k: v for k, v in master.items()
-                     if k not in ('_rrule', 'start_iso', 'end_iso')}
-            clone['start'] = occ_iso
-            clone['end'] = occ_iso
-            clone['_recurrence_of'] = start_bucket
-            out.append(clone)
-        return out
-
-    expanded = []
-    total_cap = 1000
-    for ev in events:
-        if not ev.get('_rrule'):
-            continue
-        try:
-            new_evs = _expand_rrule(ev)
-        except Exception as _exc:
-            app.logger.warning(f'[ics] rrule_expand_fail: {type(_exc).__name__}: {str(_exc)[:80]}')
-            new_evs = []
-        if not new_evs:
-            continue
-        room = total_cap - len(expanded)
-        if room <= 0:
-            break
-        expanded.extend(new_evs[:room])
-    # Master-Events behalten _rrule-Marker NICHT (Output-clean)
-    for ev in events:
-        ev.pop('_rrule', None)
-    events.extend(expanded)
+        events = _parse_ics_to_events(text)
+    except Exception as _exc:
+        app.logger.warning(f'[ics] parse-fail: {type(_exc).__name__}: {str(_exc)[:200]}')
+        events = []
     # Save Events — über _profile_save routen, damit calendar_feed in SB
     # (metadata-jsonb) landet und Cloud-Run-Redeploy überlebt.
     feed_obj = {'url': url, 'events': events[:300],
@@ -15845,42 +16000,16 @@ def import_calendar_feed(token):
     except Exception:
         pass
 
-    # Roster-Integration · jeden Event als Briefing-Hint speichern
-    # damit er im Tour-Tab als "iCal: Long-Haul JFK" sichtbar wird.
-    # SB primary + Disk best-effort, sonst Wipe-pro-Redeploy.
+    # Roster-Integration · jeden Event via _ics_events_to_briefings auf die
+    # Briefing-Map mappen. F2/F3 (Multi-Day) und F5 (Same-Day-Merge) handled
+    # die Helper. SB primary + Disk best-effort, sonst Wipe-pro-Redeploy.
     imported_briefings = 0
     briefings = {}
     try:
-        briefings = dict(_ical_briefings_load(token) or {})
-        for ev in events[:200]:
-            # 'start' ist seit RFC-5545-Parser bereits 'yyyy-mm-dd' (TZ-korrekt).
-            # Falls aus altem Pfad noch ein DTSTART-Roh-String hineinrutscht
-            # ('20260315T140000Z'), tolerant beide Formate akzeptieren.
-            start = (ev.get('start') or '').strip()
-            if re.match(r'^\d{4}-\d{2}-\d{2}$', start):
-                date_str = start
-            elif len(start) >= 8 and start[:8].isdigit():
-                date_str = f"{start[0:4]}-{start[4:6]}-{start[6:8]}"
-            else:
-                continue
-            if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str): continue
-            existing_b = briefings.get(date_str, {})
-            summary = (ev.get('summary') or '')[:80]
-            location = (ev.get('location') or '')[:60]
-            start_iso = (ev.get('start_iso') or '')[:25]
-            end_iso = (ev.get('end_iso') or '')[:25]
-            # Skip nur wenn ALLES leer (sonst Office-Days mit nur Location +
-            # Zeitfenster ohne SUMMARY werden silent gedropt — User-Pain
-            # "büro tage fehlen, briefing zeiten fehlen, pickup zeiten fehlen").
-            if not summary and not location and not start_iso:
-                continue
-            existing_b['ical_summary'] = summary
-            existing_b['ical_location'] = location
-            existing_b['ical_start_iso'] = start_iso
-            existing_b['ical_end_iso'] = end_iso
-            existing_b['ical_imported_at'] = datetime.now().isoformat()
-            briefings[date_str] = existing_b
-            imported_briefings += 1
+        existing = dict(_ical_briefings_load(token) or {})
+        # Cap auf 200 Events (Performance) — entspricht ~6 Monate LH-Crew-Plan.
+        briefings, imported_briefings = _ics_events_to_briefings(
+            events[:200], existing=existing)
         _ical_briefings_save(token, briefings)
     except Exception as e:
         app.logger.warning(f'[ical-briefings] import-persist-fail: {str(e)[:200]}')
@@ -15955,23 +16084,34 @@ def upload_calendar_events(token):
     except Exception:
         pass
     # Briefing-Map befüllen — gleicher Pfad wie ICS-Import.
-    # SB primary + Disk best-effort, sonst Wipe-pro-Redeploy.
+    # W19: nutzt _ics_events_to_briefings für Multi-Day + Same-Day-Merge.
+    # iOS schickt schon ISO-Strings → wir adaptieren auf die ICS-Helper-Inputs.
     imported_briefings = 0
     try:
-        briefings = dict(_ical_briefings_load(token) or {})
+        existing_briefings = dict(_ical_briefings_load(token) or {})
+        adapted = []
         for ev in events:
-            iso = (ev.get('start_iso') or '').strip()
-            # akzeptiert '2026-03-15' oder '2026-03-15T14:00:00Z'
-            date_str = iso[:10]
-            if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str): continue
-            existing_b = briefings.get(date_str, {})
-            existing_b['ical_summary'] = (ev.get('summary') or '')[:80]
-            existing_b['ical_location'] = (ev.get('location') or '')[:60]
-            existing_b['ical_start_iso'] = (ev.get('start_iso') or '')[:25]
-            existing_b['ical_end_iso'] = (ev.get('end_iso') or '')[:25]
-            existing_b['ical_imported_at'] = datetime.now().isoformat()
-            briefings[date_str] = existing_b
-            imported_briefings += 1
+            s_iso = (ev.get('start_iso') or '').strip()
+            e_iso = (ev.get('end_iso') or '').strip()
+            s_date = s_iso[:10]
+            e_date = e_iso[:10] if e_iso else s_date
+            if not re.match(r'^\d{4}-\d{2}-\d{2}$', s_date):
+                continue
+            adapted_ev = {
+                'summary': (ev.get('summary') or '')[:120],
+                'location': (ev.get('location') or '')[:80],
+                'start_iso': s_iso[:25],
+                'end_iso': e_iso[:25],
+                'start': s_date,
+                'end': e_date,
+                # iOS-EKEvent: DTEND ist immer der echte End-Zeitpunkt
+                # (nicht exklusiv wie bei All-Day-ICS). _is_date_only_end=False.
+                '_is_date_only_end': False,
+            }
+            adapted_ev['_multiday_dates'] = _ics_multiday_dates(adapted_ev)
+            adapted.append(adapted_ev)
+        briefings, imported_briefings = _ics_events_to_briefings(
+            adapted, existing=existing_briefings)
         _ical_briefings_save(token, briefings)
     except Exception as e:
         app.logger.warning(f'[ical-briefings] ekevent-persist-fail: {str(e)[:200]}')
