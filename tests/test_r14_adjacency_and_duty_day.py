@@ -312,8 +312,11 @@ def test_se_only_does_not_create_tour_or_hotel():
     assert res.arbeitstage == 0
 
 
-def test_mid_tour_continuation_does_not_increase_reinigung_for_layover_rest():
-    """Layover-Free-Day bekommt arbeitstag aber KEIN Reinigung (im Hotel)."""
+def test_mid_tour_continuation_reinigung_follows_workday():
+    """Reinigung = Arbeitstage (FollowMe-Konvention, verifiziert gegen echte
+    Tibor-Auswertung 133=133). Auch Mid-Tour-Layover-Tage sind Uniform-
+    Reinigungstage. (2026-06-01: von 'nur dep+ret' auf 'Reinigung==Arbeitstage'
+    umgestellt, weil FollowMe so rechnet.)"""
     days = [
         _dep('2025-04-01', 'BLR'),
         _mid('2025-04-02', 'BLR'),  # Layover-Rest
@@ -321,10 +324,10 @@ def test_mid_tour_continuation_does_not_increase_reinigung_for_layover_rest():
         _ret('2025-04-04', 'BLR'),
     ]
     _, res = _run(days)
-    # 4 arbeitstage, aber reinigung nur fuer dep+ret (2)
+    # FollowMe: Reinigung == Arbeitstage (alle 4 Tour-Tage)
     assert res.arbeitstage == 4
-    assert res.reinigungstage == 2, (
-        f'reinigung sollte 2 sein (nur dep+ret), got {res.reinigungstage}'
+    assert res.reinigungstage == 4, (
+        f'reinigung sollte == arbeitstage (4) sein, got {res.reinigungstage}'
     )
 
 

@@ -10700,15 +10700,17 @@ def test_v11_cas_reader_heartbeat_per_file():
     assert 'cas_file_' in block or 'Dienstplan/CAS wird gelesen' in block
 
 
-def test_v11_cas_reader_max_tokens_12k_with_20k_retry():
-    """v11 Commit 2: max_tokens=12000 default + 20000 Retry bei Truncation."""
+def test_v11_cas_reader_max_tokens_32k_with_64k_retry():
+    """Token-Budget (Commit f61e959): max_tokens=32000 default + 64000 Retry bei
+    Truncation. Erhöht von 12k/20k, weil große NTF-Monate (60-73 Tage) bei 12k
+    truncateten → max_tokens-Retry-Schleife. 32k/64k eliminiert die Retries."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     block = src[fn_idx:fn_idx + 12000]
-    assert '_call_sonnet(12000)' in block or 'max_tokens=12000' in block, \
-        '12k max_tokens default'
-    assert '_call_sonnet(20000)' in block or 'max_tokens=20000' in block, \
-        '20k max_tokens als Retry-Stufe'
+    assert '_call_sonnet(32000)' in block or 'max_tokens=32000' in block, \
+        '32k max_tokens default'
+    assert '_call_sonnet(64000)' in block or 'max_tokens=64000' in block, \
+        '64k max_tokens als Retry-Stufe'
 
 
 def test_v11_cas_reader_memory_release_per_file():
@@ -12115,19 +12117,21 @@ def test_cas_max_tokens_default_12000():
 
 
 def test_cas_retry_on_max_tokens():
-    """Retry mit 20000 wenn stop_reason='max_tokens'."""
+    """Retry mit 64000 wenn stop_reason='max_tokens' (Token-Budget f61e959:
+    32k default → 64k Retry, vorher 12k/20k)."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
-    block = src[fn_idx:fn_idx + 12000]
+    # Fenster groß genug für den langen Reader-Prompt + Retry-Block dahinter.
+    block = src[fn_idx:fn_idx + 16000]
     assert "stop_reason == 'max_tokens'" in block
-    assert '_call_sonnet(20000)' in block or 'max_tokens=20000' in block
+    assert '_call_sonnet(64000)' in block or 'max_tokens=64000' in block
 
 
 def test_cas_no_silent_truncation():
-    """Bei 20k auch truncated: friendly fail (return None), kein stille Datenverlust."""
+    """Bei 64k auch truncated: friendly fail (return None), kein stiller Datenverlust."""
     src = _read_backend()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
-    block = src[fn_idx:fn_idx + 12000]
+    block = src[fn_idx:fn_idx + 16000]
     # Nach Retry: if stop_reason == 'max_tokens' return None
     assert 'STILL truncated' in block or 'still truncated' in block.lower()
 

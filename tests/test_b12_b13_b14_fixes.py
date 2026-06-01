@@ -181,12 +181,15 @@ def test_tibor_z76_moves_toward_followme():
 # B13 — Arbeitstage/Reinigung Refinement
 # ════════════════════════════════════════════════════════════════════════════
 
-def test_layover_free_day_not_cleaning_day():
-    """Mid-Tour-Tag ohne Flug/Duty/Training → kein Reinigungstag."""
+def test_layover_free_day_reinigung_equals_workday():
+    """Reinigung = Arbeitstage (FollowMe-Konvention). Ein Mid-Tour-Tag ohne
+    Flug/Duty/Training (leeres Routing, duty=0) ist gar kein Arbeitstag und
+    zählt damit auch nicht als Reinigung — aber die Invariante ist
+    Reinigung==Arbeitstage, nicht ein fixer Abzug. (2026-06-01 umgestellt.)"""
     cas = [
         _cas('2025-01-03', marker='LH', routing=['BLR'], starts_hb=True,
              layover_ort='BLR', overnight=True, duty_min=600, has_fl=True),
-        # Mid-tour-free-day: kein duty, kein has_fl
+        # Mid-tour-free-day: kein duty, kein has_fl → kein Arbeitstag
         _cas('2025-01-04', marker='X', routing=[], layover_ort='',
              overnight=True, duty_min=0, has_fl=False),
         _cas('2025-01-06', marker='LH', routing=['BLR'], ends_hb=True,
@@ -196,14 +199,16 @@ def test_layover_free_day_not_cleaning_day():
     result = nt.calculate_allowances_from_normalized_tours(
         tours, BMF, iata_to_bmf=IATA_TO_BMF, homebase='FRA',
     )
-    # 01-04 (Mid-Tour-Free) sollte nicht in reinigungstage zählen
-    # arbeitstage: 01-03 (dep) + 01-06 (ret) = 2; 01-04 nicht
-    assert result.reinigungstage <= 2, \
-        f'Mid-Tour-Free-Day zählt als Reinigung: {result.reinigungstage}'
+    # FollowMe-Invariante: Reinigung == Arbeitstage (01-04 ist kein Arbeitstag)
+    assert result.reinigungstage == result.arbeitstage
 
 
-def test_mid_tour_free_day_not_cleaning_day():
-    """Klar isolierter Mid-Tour-Free-Day → kein Reinigungstag."""
+def test_mid_tour_free_day_cleaning_follows_workday():
+    """Reinigung = Arbeitstage (FollowMe-Konvention, verifiziert gegen die echte
+    Tibor-Auswertung 133=133). Jeder Tour-Tag inkl. Mid-Tour-Layover ist ein
+    Uniform-Reinigungstag — Crew trägt/pflegt Uniform über die ganze Tour.
+    (2026-06-01: Regel von 'Layover-Abzug' auf 'Reinigung==Arbeitstage'
+    umgestellt, weil FollowMe so rechnet.)"""
     cas = [
         _cas('2025-01-03', marker='LH', routing=['BLR'], starts_hb=True,
              overnight=True, duty_min=600, has_fl=True),
@@ -218,8 +223,8 @@ def test_mid_tour_free_day_not_cleaning_day():
     result = nt.calculate_allowances_from_normalized_tours(
         tours, BMF, iata_to_bmf=IATA_TO_BMF, homebase='FRA',
     )
-    # 2 Mid-Tour-Free-Days (04, 05) sollten nicht als Reinigungstage zählen
-    assert result.reinigungstage <= 2
+    # FollowMe: Reinigung == Arbeitstage (alle 4 Tour-Tage)
+    assert result.reinigungstage == result.arbeitstage
 
 
 def test_flight_day_cleaning_day():

@@ -52,14 +52,28 @@ class _FakeMessages:
         self._parent = parent
 
     def create(self, **kwargs):
-        # Speichere den Prompt zur Inspektion durch Tests
+        # Speichere den Prompt zur Inspektion durch Tests.
         self._parent.last_call_kwargs = kwargs
-        msgs = kwargs.get('messages', [])
-        if msgs and isinstance(msgs[0].get('content'), list):
-            for block in msgs[0]['content']:
+        # Der CAS-Reader übergibt den Prompt im `system`-Parameter (mit
+        # cache_control für Prompt-Caching), NICHT in messages. Beide Quellen
+        # abdecken, damit der Mock robust gegen den system-/messages-Pfad ist.
+        captured = ''
+        system = kwargs.get('system')
+        if isinstance(system, str):
+            captured = system
+        elif isinstance(system, list):
+            for block in system:
                 if isinstance(block, dict) and block.get('type') == 'text':
-                    self._parent.last_prompt_text = block.get('text', '')
+                    captured = block.get('text', '')
                     break
+        if not captured:
+            msgs = kwargs.get('messages', [])
+            if msgs and isinstance(msgs[0].get('content'), list):
+                for block in msgs[0]['content']:
+                    if isinstance(block, dict) and block.get('type') == 'text':
+                        captured = block.get('text', '')
+                        break
+        self._parent.last_prompt_text = captured
         return _FakeResp(days=[
             {'date': '2025-01-15', 'activity_type': 'flight', 'marker': 'LH756',
              'start_time': '10:15', 'end_time': '', 'location': 'FRA',

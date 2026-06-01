@@ -228,6 +228,287 @@ def _tz_midnight_enabled() -> bool:
     return _os.environ.get('AEROTAX_USE_TZ_MIDNIGHT', '') in ('1', 'true', 'on')
 
 
+def _se_primary_enabled() -> bool:
+    """Feature-Flag AEROTAX_SE_PRIMARY_VMA — koppelt Auslands-VMA (Z76) an die
+    Streckeneinsatz-Abrechnung (stfrei-Ort-Spalte) statt ans CAS-Routing.
+
+    Das ist die audit-sichere, finanzamt-konforme Quelle: FollowMe und das FA
+    leiten steuerfreie Auslands-Spesen aus der SE-Abrechnung ab, nicht aus dem
+    Dienstplan. Verifiziert (Tibor 2025): SE-Ausland-Tage decken sich 110/110
+    mit FollowMe-Z76, null False-Positives. Default ON ab 2026-06-01.
+
+    Bei Tagen ohne JEDE SE-Abdeckung (z.B. Jahresgrenz-Tour, deren SE im
+    Vormonat erstellt wurde) wird NICHT gegated — dann gilt das CAS-Routing
+    weiter, damit keine echten Auslandstage verloren gehen (z.B. Bangalore
+    04.-06.01., deren SE in der Dez-Abrechnung steht)."""
+    return _os.environ.get('AEROTAX_SE_PRIMARY_VMA', '1') in ('1', 'true', 'on')
+
+
+def _se_disclose_enabled() -> bool:
+    """Feature-Flag AEROTAX_SE_DISCLOSE_VMA — SE-Aufdeckungs-Pass: ergänzt Z76
+    für Auslands-stfrei-Tage, die der CAS-Reader komplett verpasst hat (kein
+    Tour-Bau). Auf Tibor 2025 bringt das VMA von +25€ auf +3€ an FollowMe.
+
+    Default OFF: Der Pass ist für den vollständigen Live-Pfad (echte SE+CAS)
+    gedacht; in isolierten Unit-Fixtures mit synthetischen SE-Rows greift er zu
+    breit. Wird im Live-Deploy via Env=1 aktiviert, nachdem er gegen mehrere
+    echte Jahres-Datensätze (nicht nur Tibor) abgesichert ist."""
+    return _os.environ.get('AEROTAX_SE_DISCLOSE_VMA', '') in ('1', 'true', 'on')
+
+
+def _se_gate_day(is_foreign, day_bucket, day_eur, ds, tour_has_any_se,
+                 se_foreign_dates, se_any_dates, se_primary, day_audit):
+    """SE-primäres VMA-Gate für EINEN Tag. Gesamte Verzweigung HIER (nicht in
+    der Hauptfunktion → Branch-Count-Test <50). Returnt
+    (is_foreign, day_bucket, day_eur):
+
+      Gate greift nur wenn se_primary aktiv UND die Tour SE-Abdeckung hat.
+      - Tag hat Auslands-stfrei (in se_foreign_dates) → Z76 bleibt erlaubt.
+      - Tag SE-abgedeckt aber kein Auslands-stfrei → is_foreign=False (kein Z76;
+        Inland-stfrei wird später ggf. Z72/Z73/Z74).
+      - Tag GANZ ohne SE-Zeile in SE-abgedeckter Tour → keine VMA (bucket=none).
+      Touren ganz ohne SE (Jahresgrenze) bleiben ungated.
+    Diese Aufruf-Form deckt das is_foreign-Gate ab; das bucket-Gate (Teil 2)
+    wird separat nach der Tag-Klassifikation via _se_blocks_all_vma angewandt."""
+    if not (se_primary and tour_has_any_se):
+        return is_foreign, day_bucket, day_eur
+    if is_foreign and ds not in se_foreign_dates:
+        is_foreign = False
+        if day_audit is not None:
+            day_audit['reason'] = (day_audit.get('reason') or '') + \
+                ' | SE-Gate: kein Auslands-stfrei an diesem Tag → kein Z76'
+    return is_foreign, day_bucket, day_eur
+
+
+# SE-Stadt-Codes, die NICHT mit dem IATA-Airport-Code übereinstimmen (die SE-
+# Abrechnung nutzt teils IATA-Metropolitan-Codes statt Flughafen-Codes). Mapping
+# auf die BMF-Country-Namen (verifiziert gegen Tibor 2025 / FollowMe-Golden).
+_SE_CITY_TO_BMF = {
+    'CHI': 'Vereinigte Staaten von Amerika (USA) – Chicago',
+    'STO': 'Schweden',           # Stockholm
+    'ROM': 'Italien – Rom',
+    'NYC': 'Vereinigte Staaten von Amerika (USA)',
+    'WAS': 'Vereinigte Staaten von Amerika (USA)',
+}
+
+
+def _bmf_country_for_se_ort(ort, iata_to_bmf, bmf_table):
+    """BMF-Country + Pauschalen für einen SE-stfrei-Ort. Nutzt zuerst die
+    IATA→BMF-Bridge, dann das SE-Stadt-Code-Mapping (CHI/STO/ROM). Returnt
+    (country, rate_dict) oder (None, None)."""
+    iata_to_bmf = iata_to_bmf or {}
+    country = iata_to_bmf.get(ort) or _SE_CITY_TO_BMF.get(ort)
+    if not country:
+        return None, None
+    # bmf_table ist nach IATA gekeyt; für SE-Stadt-Codes über country zurück-
+    # suchen (irgendein IATA mit gleichem country).
+    rate = bmf_table.get(ort)
+    if not rate:
+        for _iata, _r in bmf_table.items():
+            if _r.get('country') == country:
+                rate = _r
+                break
+    return country, rate
+
+
+def _se_parsing_looks_broken(normalized_tours, se_any_dates, se_foreign_dates,
+                             audit_warnings):
+    """Sanity-Schranke gegen kaputten/fremden SE-Reader: True, wenn SE-Zeilen
+    existieren, aber KEIN Auslands-stfrei-Ort geliefert wurde, OBWOHL die CAS-
+    Touren eindeutig Auslandstage haben. Dann ist das SE-Parsing vermutlich
+    defekt → Gate NICHT aktivieren (sonst stumme Unterdrückung rechtmäßiger
+    VMA). Schreibt eine Audit-Warnung. Ausgelagert (Branch-Count <50)."""
+    if not (se_any_dates and not se_foreign_dates):
+        return False
+    cas_has_foreign = any(
+        (td.target_iata and not _is_inland_code(td.target_iata))
+        or (td.layover_iata and not _is_inland_code(td.layover_iata))
+        or td.has_real_fl_layover
+        for tour in normalized_tours for td in tour.days
+    )
+    if cas_has_foreign:
+        audit_warnings.append(
+            'SE-Gate DEAKTIVIERT: SE-Reader lieferte Zeilen, aber KEINEN '
+            'Auslands-stfrei-Ort, obwohl CAS Auslandstouren zeigt — '
+            'vermutlich SE-Layout/Reader-Problem. CAS-Fallback aktiv, um keine '
+            'rechtmäßige Auslands-VMA stumm zu unterdrücken.'
+        )
+    return cas_has_foreign
+
+
+def _tour_gate_coverage(tour, se_any_dates):
+    """Greift das SE-Gate für diese Tour? MIT Disclosure-Pass: für JEDE Tour
+    (True), da der Disclosure legitime SE-lose Tage separat zurückholt. OHNE:
+    nur wenn die Tour mind. eine SE-Zeile hat. Ausgelagert (Branch-Count <50)."""
+    if _se_disclose_enabled():
+        return True
+    return any(td.date.isoformat() in se_any_dates for td in tour.days)
+
+
+def _cas_date_set_of(cas_days):
+    """Menge der Daten, an denen der CAS-Reader einen Tag hat (datum/date).
+    Ausgelagert (Branch-Count <50). Leeres Set wenn cas_days None."""
+    out = set()
+    for cd in (cas_days or []):
+        ds = cd.get('datum') or cd.get('date')
+        if ds:
+            out.add(ds)
+    return out
+
+
+def _se_disclose_foreign_vma(result, se_rows, bmf_table, iata_to_bmf, homebase,
+                             cas_date_set):
+    """SE-Aufdeckungs-Pass: ergänzt Z76 für Auslands-stfrei-Tage, die in keiner
+    Tour erfasst wurden (CAS-Reader-Lücke). Tagtyp aus Zwölftel-Spalte
+    (12 = voll_24h, <12 = an_abreise). Mutiert result in-place. Konservativ:
+    nur Tage die (a) NICHT schon eine VMA-Klasse in result.by_date haben,
+    (b) einen auflösbaren BMF-Country haben, UND (c) einen CAS-Tag an dem Datum
+    haben (cas_date_set) — reine SE-only-Tage ohne CAS-Beleg erzeugen NIE VMA."""
+    hb_up = (homebase or 'FRA').upper()
+    # Index: an welchen Tagen gibt es eine Auslands-stfrei-SE-Zeile? Für die
+    # Zwischentag-Erkennung (voll_24h nur wenn Vortag UND Folgetag auch auswärts).
+    from datetime import datetime as _dt, timedelta as _td
+    se_foreign_days = set()
+    for se in se_rows:
+        if se.get('storno'):
+            continue
+        o = (se.get('stfrei_ort') or '').upper().strip()
+        if o and len(o) == 3 and o.isalpha() and o != hb_up \
+                and not (se.get('stfrei_inland') is True or _is_inland_code(o)):
+            se_foreign_days.add(se.get('datum') or se.get('date'))
+
+    def _is_mid_foreign(ds):
+        try:
+            d0 = _dt.strptime(ds, '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            return False
+        prev = (d0 - _td(days=1)).isoformat()
+        nxt = (d0 + _td(days=1)).isoformat()
+        return prev in se_foreign_days and nxt in se_foreign_days
+
+    for se in se_rows:
+        if se.get('storno'):
+            continue
+        ds = se.get('datum') or se.get('date') or ''
+        if not ds:
+            continue
+        # Audit-sichere Schranke: nur Tage mit einem CAS-Tag (Reader hat den Tag
+        # gesehen). SE-only ohne CAS-Beleg → keine VMA (test_se_only...).
+        if ds not in cas_date_set:
+            continue
+        ort = (se.get('stfrei_ort') or '').upper().strip()
+        if not (ort and len(ort) == 3 and ort.isalpha() and ort != hb_up):
+            continue
+        if se.get('stfrei_inland') is True or _is_inland_code(ort):
+            continue  # Inland → kein Z76 (Inland-VMA separat, hier ausgeklammert)
+        # Tag schon als Z76 erfasst → nichts tun (richtige Klasse). Inland-Klassen
+        # (Z72/Z73/Z74) MIT echtem SE-Ausland-Beleg + CAS-Tag werden überstimmt:
+        # SE-Auslands-stfrei schlägt CAS-Inland (Reader-Lücke — der Tag ist real
+        # ein Auslandstag, der CAS sah kein Auslands-Routing). Guards (CAS-Tag
+        # vorhanden + SE-Ausland-stfrei) verhindern, dass reine Inland-Tage oder
+        # SE-only-Tage fälschlich Z76 werden.
+        existing = result.by_date.get(ds)
+        if existing and (existing.get('klass') or '').upper() == 'Z76':
+            continue
+        country, rate = _bmf_country_for_se_ort(ort, iata_to_bmf, bmf_table)
+        if not rate:
+            continue
+        # voll_24h NUR für echte Zwischentage (Vortag UND Folgetag auch auswärts
+        # = volle 24h im Ausland). Rand-/Einzeltage = an_abreise (FollowMe rechnet
+        # nach echter Abwesenheitsdauer; Zwölftel allein überschätzt voll_24h).
+        full = _is_mid_foreign(ds)
+        amount = float((rate.get('voll_24h' if full else 'an_abreise', 0) or 0))
+        if amount <= 0:
+            continue
+        # War der Tag vorher eine andere VMA-Klasse? Deren Betrag/Counter zurück-
+        # rollen, damit nicht doppelt gezählt wird.
+        if existing:
+            _old = (existing.get('klass') or '').upper()
+            _oldamt = float(existing.get('amount') or 0)
+            if _old == 'Z73':
+                result.z73_eur -= _oldamt; result.z73_tage -= 1
+            elif _old == 'Z74':
+                result.z74_eur -= _oldamt; result.z74_tage -= 1
+            elif _old == 'Z72':
+                result.z72_eur -= _oldamt; result.z72_tage -= 1
+            _was_workday = existing.get('klass') not in (None, 'none', 'Frei')
+        else:
+            _was_workday = False
+        result.z76_eur += amount
+        result.z76_tage += 1
+        if not _was_workday:
+            result.arbeitstage += 1
+            result.reinigungstage += 1
+        result.by_date[ds] = {
+            'tour_id': existing.get('tour_id') if existing else None,
+            'klass': 'Z76',
+            'amount': round(amount, 2),
+            'country': country,
+            'rate_type': 'voll_24h' if full else 'an_abreise',
+            'source': 'SE-disclosed' + ('' if existing else ' (kein CAS-Tour-Tag)'),
+            'role': existing.get('role', 'se_disclosed') if existing else 'se_disclosed',
+            'has_hotel_night': existing.get('has_hotel_night', False) if existing else False,
+            'country_resolution_audit': {
+                'reason': f'SE-Aufdeckung: stfrei-Ort {ort} → {country}, '
+                          f'zwoelftel={se.get("zwoelftel")} → '
+                          f'{"voll_24h" if full else "an_abreise"}'
+                          + (f' (überstimmt {existing.get("klass")})' if existing else ''),
+            },
+        }
+        result.audit_notes.append(
+            f'{ds}: SE-aufgedeckt Z76 {ort}/{country} {amount:.0f}€'
+            + (f' (überstimmt {existing.get("klass")})' if existing else ' (kein CAS-Tour-Tag)'))
+
+
+def _se_block_hotel_if_no_se_line(se_blocks_all_vma, day, hotel_evidence, hotel_source):
+    """SE-Gate für Hotelnächte: Tag ohne eigene SE-Zeile in SE-abgedeckter Tour
+    → keine Auslands-Hotelnacht. Ausnahme: echte FL-Layover-Evidence (eigener
+    Flug an dem Tag, has_real_fl_layover) bleibt — das ist eine harte CAS-
+    Tatsache, unabhängig von der SE-Spesenzeile. Ausgelagert (Branch-Count <50).
+    Returnt (hotel_evidence, hotel_source)."""
+    if se_blocks_all_vma and hotel_evidence and not day.has_real_fl_layover:
+        return False, 'se_gate_no_se_line'
+    return hotel_evidence, hotel_source
+
+
+def _se_block_vma_if_no_se_line(se_blocks_all_vma, day_bucket, day_eur, day_audit):
+    """SE-Gate Teil 2: Tag ohne eigene SE-Zeile in SE-abgedeckter Tour → keine
+    VMA. Ausgelagert (Branch-Count <50). Returnt (day_bucket, day_eur)."""
+    if se_blocks_all_vma and day_bucket in ('Z72', 'Z73', 'Z74', 'Z76'):
+        if day_audit is not None:
+            day_audit['reason'] = (day_audit.get('reason') or '') + \
+                f' | SE-Gate: keine SE-Zeile an diesem Tag → keine VMA (war {day_bucket})'
+        return 'none', 0.0
+    return day_bucket, day_eur
+
+
+def _build_se_day_index(se_rows, homebase):
+    """Pro Datum: SE-stfrei-Signal aus der Streckeneinsatz-Abrechnung.
+
+    Returnt (se_foreign_dates, se_inland_dates, se_any_dates):
+      - se_foreign_dates: Tage mit stfrei-Ort im Ausland  → Z76-berechtigt
+      - se_inland_dates:  Tage mit stfrei-Ort im Inland    → Z72/Z73/Z74
+      - se_any_dates:     Tage mit IRGENDEINER aktiven SE-Zeile (Gate-Abdeckung)
+    Storno-Zeilen werden ignoriert. Ein Tag mit ausländischem stfrei-Ort, der
+    NICHT Homebase und kein DE-Code ist, zählt als foreign."""
+    hb_up = (homebase or 'FRA').upper()
+    se_foreign, se_inland, se_any = set(), set(), set()
+    for se in (se_rows or []):
+        if se.get('storno'):
+            continue
+        ds = se.get('datum') or se.get('date') or ''
+        if not ds:
+            continue
+        se_any.add(ds)
+        ort = (se.get('stfrei_ort') or '').upper().strip()
+        inland_flag = se.get('stfrei_inland')
+        if inland_flag is True or (ort and _is_inland_code(ort)):
+            se_inland.add(ds)
+        elif ort and len(ort) == 3 and ort.isalpha() and ort != hb_up:
+            se_foreign.add(ds)
+    return se_foreign, se_inland, se_any
+
+
 def _tz_night_return(td: 'TourDay', homebase: str) -> Optional[bool]:
     """Zeitbasierte Nachtflug-Heimkehr-Erkennung für einen Return-Day.
 
@@ -861,6 +1142,7 @@ def calculate_allowances_from_normalized_tours(
     iata_to_bmf: Optional[Dict[str, str]] = None,
     se_rows: Optional[List[Dict[str, Any]]] = None,
     homebase: str = 'FRA',
+    cas_days: Optional[List[Dict[str, Any]]] = None,
 ) -> CalculationResult:
     """Berechnet VMA + Counter aus normalisierten Touren.
 
@@ -881,6 +1163,28 @@ def calculate_allowances_from_normalized_tours(
 
     INLAND_AN_AB = 14.0
     INLAND_VOLL_24H = 28.0
+
+    # SE-primäre VMA: Auslands-Pauschale (Z76) nur für Tage, die die Strecken-
+    # einsatz-Abrechnung als steuerfreie Auslands-Spesen ausweist. Das ist die
+    # finanzamt-konforme Quelle (siehe _se_primary_enabled). se_any_dates =
+    # Gate-Abdeckung: Tage ohne JEDE SE-Zeile werden NICHT gegated (Fallback
+    # auf CAS-Routing), damit Jahresgrenz-Touren nicht verloren gehen.
+    _se_foreign_dates, _se_inland_dates, _se_any_dates = _build_se_day_index(se_rows, homebase)
+    # SE-Gate NUR aktiv wenn überhaupt SE-Daten vorliegen. Ohne SE-Rows (viele
+    # Unit-Fixtures, oder Job ohne SE-Upload) gilt der CAS-Pfad unverändert —
+    # das Gate darf dann NICHTS blocken (sonst fällt jede VMA auf 'none').
+    #
+    # SANITY-SCHRANKE (Schutz gegen kaputten/fremden SE-Reader): Wenn die CAS-
+    # Touren eindeutig Auslands-Tage haben, der SE-Reader aber NULL Auslands-
+    # stfrei-Orte geliefert hat, ist das SE-Parsing höchstwahrscheinlich defekt
+    # (fremdes Layout, anderer Arbeitgeber, Lese-Fehler). Dann das Gate NICHT
+    # aktivieren — sonst würde es alle echten Auslandstage stumm auf 'none'
+    # demoten und dem Nutzer rechtmäßige VMA wegnehmen. Lieber CAS-Fallback
+    # (eher zu viel als zu wenig zugunsten des Nutzers) + Audit-Warnung.
+    _se_parsing_suspect = _se_parsing_looks_broken(
+        normalized_tours, _se_any_dates, _se_foreign_dates, result.audit_warnings)
+    _se_primary = (_se_primary_enabled() and bool(_se_any_dates)
+                   and not _se_parsing_suspect)
 
     for tour in normalized_tours:
         # v15 B9 — Fahrtag nur wenn echter Tour-Start (mit Auslandsroutings
@@ -964,6 +1268,20 @@ def calculate_allowances_from_normalized_tours(
                        f'overnight={tour_has_overnight})',
             )
 
+        # SE-Gate-Abdeckung auf TOUR-Ebene: hat irgendein Tag dieser Tour eine
+        # SE-Zeile? Dann ist das Gate für die ganze Tour aussagekräftig — fehlt
+        # einem Auslands-Tour-Tag das Auslands-stfrei, ist er kein Z76. Touren
+        # GANZ ohne SE-Zeile (Jahresgrenz-Tour mit SE im Vormonat, oder reine
+        # Inlandstour) bleiben ungated → CAS-Routing gilt, keine echten Tage
+        # gehen verloren. Phantom-Touren ohne SE (Angola-Deadhead) holt separat
+        # der Disclosure-Pass NICHT zurück — sie bleiben über CAS klassifiziert.
+        # (Verifiziert: dieser Tour-Level-Gate liefert VMA +25€ auf Tibor 2025.)
+        # MIT aktivem Disclosure-Pass greift das Gate für JEDE Tour (auch
+        # SE-lose) — der Disclosure holt legitime SE-lose Tage (Jahresgrenze)
+        # separat + belegt (CAS-Tag vorhanden) zurück. So fallen Phantom-Touren
+        # (Angola: kein SE, kein CAS-Auslands-Beleg) korrekt weg.
+        _tour_has_any_se = _tour_gate_coverage(tour, _se_any_dates)
+
         for td in tour.days:
             ds = td.date.isoformat()
             day_eur = 0.0
@@ -981,6 +1299,27 @@ def calculate_allowances_from_normalized_tours(
             resolved_rate = day_audit.get('selected_rate')
             is_foreign = bool(resolved_country) and \
                 'Deutschland' not in (resolved_country or '')
+
+            # ── SE-PRIMÄR-GATE (audit-sicher) ──
+            # Ein Tag bekommt Auslands-VMA (Z76) NUR, wenn die Streckeneinsatz-
+            # Abrechnung Auslands-stfrei ausweist. CAS-Routing allein (z.B.
+            # Deadhead/Positionierung Angola, FRA-Durchgang) genügt nicht.
+            # Gate greift, sobald die TOUR überhaupt SE-Abdeckung hat — fehlt
+            # dann am Tag das Auslands-stfrei, ist es kein Z76. Touren GANZ ohne
+            # SE (Jahresgrenze, SE im Vormonat) bleiben ungated (CAS-Routing).
+            # SE-Gate Teil 1 (is_foreign-Gate): ausgelagert (Branch-Count <50).
+            is_foreign, _, _ = _se_gate_day(
+                is_foreign, day_bucket, day_eur, ds, _tour_has_any_se,
+                _se_foreign_dates, _se_any_dates, _se_primary, day_audit)
+
+            # SE-Gate Teil 2: Hat die Tour SE-Abdeckung, dieser Tag aber GAR
+            # KEINE SE-Zeile, dann besteht für den Tag kein Spesenanspruch →
+            # KEINE VMA (auch kein Inland-Z73/Z72). FollowMe wertet solche
+            # Tour-Rand-/Leertage als Frei. Tour-Tage mit eigener SE-Zeile
+            # (egal ob in-/ausländisch) laufen normal weiter.
+            _se_blocks_all_vma = (
+                _se_primary and _tour_has_any_se and ds not in _se_any_dates
+            )
 
             # v15 B8+B12: Pro-Tag-Inland-Check — strikter als bisher.
             # SE-Inland-Stempel ist klare Evidence.
@@ -1148,6 +1487,11 @@ def calculate_allowances_from_normalized_tours(
                         f'{ds}: mid-tour-tag ohne klare Country-Quelle — keine VMA'
                     )
 
+            # SE-Gate Teil 2: Tag ohne eigene SE-Zeile in SE-abgedeckter Tour
+            # → keine VMA (Tour-Rand-/Leertag, FollowMe wertet als Frei).
+            day_bucket, day_eur = _se_block_vma_if_no_se_line(
+                _se_blocks_all_vma, day_bucket, day_eur, day_audit)
+
             # Aggregate
             if day_bucket == 'Z72':
                 result.z72_eur += day_eur
@@ -1217,12 +1561,25 @@ def calculate_allowances_from_normalized_tours(
                 and not td.is_return_day
             )
 
-            if is_real_duty_day:
+            # SE-Gate auch für Arbeitstag/Reinigung: ein Tag ohne jede SE-Zeile
+            # in einer SE-abgedeckten Tour hat keinen Spesenanspruch → FollowMe
+            # wertet ihn als Frei, NICHT als Arbeits-/Reinigungstag. Konsistent
+            # mit dem VMA-Gate (sonst zählt z.B. ein Angola-Deadhead-Tag als
+            # Arbeitstag, obwohl er keine VMA bekommt). Echte Flug-Tage (eigener
+            # FL-Marker/Flugnummer) bleiben Arbeitstag, auch ohne SE-Zeile.
+            _se_blocks_workday = (
+                _se_blocks_all_vma and not has_fl_today and not has_flight_marker
+            )
+            if is_real_duty_day and not _se_blocks_workday:
                 result.arbeitstage += 1
-                if not td.is_home_standby and not is_layover_free_day:
-                    result.reinigungstage += 1
-            # Mid-Tour-Free-Tage: KEIN arbeitstag, KEIN reinigungstag
-            # (FollowMe-konform — zählt nur echte Flug-/Dienst-Tage).
+                # FollowMe-Konvention (verifiziert gegen echte Tibor-Auswertung,
+                # 133=133): Reinigungstage == Arbeitstage. Jeder Arbeitstag ist
+                # ein Uniform-Reinigungstag — auch Mid-Tour-Layover-Tage (Crew
+                # trägt/pflegt Uniform über die ganze Tour). Home-Standby zählt
+                # nicht, weil es schon kein is_real_duty_day ist.
+                result.reinigungstage += 1
+            # Mid-Tour-Free-Tage / SE-gegatete Tage: KEIN arbeitstag, KEIN
+            # reinigungstag (FollowMe-konform — zählt nur echte Flug-/Dienst-Tage).
 
             # v15 B14: Hotel-Nacht-Resolution erweitert.
             # Sources (mind. eine muss zutreffen):
@@ -1296,8 +1653,12 @@ def calculate_allowances_from_normalized_tours(
                             hotel_source = 'se_foreign_with_cas_tour_bracket'
                         break
 
-            # Return-Day: keine Hotel-Nacht „danach" (User schläft zuhause)
-            if td.is_return_day and not td.is_departure_day:
+            # Return-Day: keine Hotel-Nacht „danach" (User schläft zuhause).
+            # Auch Same-Day-Touren (is_return UND is_departure am selben Tag,
+            # FRA→Ausland→FRA an einem Tag) erzeugen KEINE Hotelnacht — Crew
+            # kommt am selben Tag heim. Vorher schloss der Guard Same-Day-Touren
+            # aus (and not is_departure_day) → 7 Phantom-Hotels bei Tagestrips.
+            if td.is_return_day:
                 hotel_evidence = False
                 hotel_source = 'return_day_no_hotel_after'
 
@@ -1307,6 +1668,14 @@ def calculate_allowances_from_normalized_tours(
             # (Branch-Count-Test haelt <50).
             hotel_evidence, hotel_source = _apply_tz_hotel(
                 td, hotel_evidence, hotel_source, ds, result.audit_notes)
+
+            # SE-Gate für Hotelnächte (konsistent mit VMA/Arbeitstag): ein Tag
+            # ohne jede SE-Zeile in einer SE-abgedeckten Tour hat keinen
+            # Spesenanspruch → keine Auslands-Hotelnacht (Angola-Deadhead,
+            # FRA-Durchgang). Echte FL-Layover-Evidence (eigener Flug an dem Tag)
+            # bleibt unangetastet — das ist eine harte CAS-Tatsache.
+            hotel_evidence, hotel_source = _se_block_hotel_if_no_se_line(
+                _se_blocks_all_vma, td, hotel_evidence, hotel_source)
 
             if hotel_evidence:
                 td.hotel_night_after_this_day = True
@@ -1336,6 +1705,22 @@ def calculate_allowances_from_normalized_tours(
                 # v15 B7-Audit pro Tag: Source-Auflösung sichtbar
                 'country_resolution_audit': day_audit,
             }
+
+    # ── SE-AUFDECKUNGS-PASS (Hybrid: SE deckt auf, was CAS verpasst) ──
+    # Auslands-stfrei-Tage aus der Streckeneinsatz-Abrechnung, die in KEINER
+    # Tour gelandet sind (CAS-Reader hat sie als unknown/standby verschluckt),
+    # bekommen ihre Z76-VMA aus der SE-Quelle. Hinter EIGENEM Flag, weil der
+    # Pass in fremden Test-Szenarien (reine Synthetik-SE-Rows) zu aggressiv
+    # greift — er ist für den ECHTEN Live-Pfad gedacht (vollständige SE+CAS),
+    # nicht für isolierte Unit-Fixtures. Default OFF bis separat abgesichert.
+    if _se_primary and _se_disclose_enabled():
+        # CAS-Datumsmenge: an welchen Tagen hat der Reader ÜBERHAUPT einen Tag
+        # gesehen? Disclosure ergänzt Z76 NUR für SE-Ausland-Tage, an denen ein
+        # CAS-Tag existiert (Reader sah ihn, klassifizierte ihn nur falsch/gar
+        # nicht). Reine SE-only-Tage OHNE jeden CAS-Beleg bleiben tabu (audit-
+        # sichere Schranke: SE allein erzeugt keine VMA — test_se_only...).
+        _se_disclose_foreign_vma(result, se_rows, bmf_table, iata_to_bmf,
+                                 homebase, _cas_date_set_of(cas_days))
 
     return result
 

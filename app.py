@@ -76,6 +76,7 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 #   P6b trip_trade       — Open-Time Trip-Trade Board
 for _bp_path, _bp_name in [
     ('blueprints.adsb_blueprint',            'adsb_bp'),
+    ('blueprints.aircraft_info_blueprint',   'aircraft_info_bp'),
     ('blueprints.license_wallet_blueprint',  'license_wallet_bp'),
     ('blueprints.news_blueprint',            'news_bp'),
     ('blueprints.crew_graph_blueprint',      'crew_graph_bp'),
@@ -34432,18 +34433,14 @@ def erstelle_pdf(d):
         ps("toch", fontSize=9, textColor=TEXT3, fontName="Helvetica-Bold",
            leading=13, alignment=TA_CENTER, spaceAfter=14)))
 
-    pg = 2
+    # 2026-06-01: TOC an neue Struktur angepasst — Belege-Anhang entfernt,
+    # Berechnung nach vorne. Seitenzahlen entfernt (waren fix hochgezählt und
+    # stimmten nicht mit dem echten mehrseitigen Layout überein).
     toc = [
-        ("01", "Reisekosten & weitere absetzbare Kosten", str(pg)),
-    ]; pg+=1
-    toc += [
-        ("02", "Belege & Anlagen", str(pg)),
-    ]; pg+=1
-    toc += [
-        ("03", "Berechnung im Detail", str(pg)),
-    ]; pg+=1
-    toc += [
-        ("04", "Bestätigung & Unterschrift", str(pg)),
+        ("01", "Reisekosten & weitere absetzbare Kosten", ""),
+        ("02", "Berechnung im Detail", ""),
+        ("03", "Tag-für-Tag-Nachweis", ""),
+        ("04", "Bestätigung & Unterschrift", ""),
     ]
 
     for i, (num, title, page) in enumerate(toc):
@@ -34454,7 +34451,7 @@ def erstelle_pdf(d):
             Paragraph(title,
                 ps(f"tt{i}", fontSize=10, textColor=TEXT,
                    fontName="Helvetica", leading=14)),
-            Paragraph(f"PAGE — {page.zfill(2)}",
+            Paragraph("",
                 ps(f"tp{i}", fontSize=8, textColor=TEXT3,
                    fontName="Helvetica", leading=12, alignment=TA_RIGHT)),
         ]], colWidths=[0.9*cm, 10.8*cm, 1.5*cm])
@@ -34631,6 +34628,11 @@ def erstelle_pdf(d):
     # ════════════════════════════════════════════════
 
 
+    # 2026-06-01: Berechnungstabelle nach VORNE — sie wird unten regulär gebaut,
+    # aber per Index-Marker hierher (direkt nach der WISO-Anleitung, VOR die
+    # Trennseite) verschoben. _calc_anchor merkt sich die Einfügeposition.
+    _calc_anchor = len(S)
+
     # ════════════════════════════════════════════════
     # TRENNSEITE — elegant, jahres- und beleg-agnostisch
     # ════════════════════════════════════════════════
@@ -34657,8 +34659,8 @@ def erstelle_pdf(d):
            leading=13, alignment=TA_CENTER, spaceAfter=14, letterSpacing=1.8)))
     S.append(Paragraph(
         "Die folgenden Seiten dienen als Nachweis und Begleit-Dokumentation deiner Auswertung: "
-        "die detaillierte Berechnung nach den jeweils gültigen BMF-Pauschalen, "
-        "alle hochgeladenen Belege als Anlagen sowie die Bestätigungsseite zur Unterschrift.",
+        "der Tag-für-Tag-Nachweis deiner Einsätze, die Lohnsteuerbescheinigungs-Übersicht "
+        "sowie die Bestätigungsseite zur Unterschrift.",
         ps("sep3", fontSize=9.5, textColor=TEXT2, fontName="Helvetica",
            leading=16, alignment=TA_CENTER, spaceAfter=12)))
     S.append(Paragraph(
@@ -34714,29 +34716,28 @@ def erstelle_pdf(d):
             Paragraph('Marker', cell_head_style),
             Paragraph('Routing', cell_head_style),
             Paragraph('Klass.', cell_head_style),
-            Paragraph('Begründung', cell_head_style),
         ]]
         # v8.18.6: Cap auf 366 (volles Jahr inkl. Schaltjahr) — vorher 200 → Cut-off Mitte Juli
+        # 2026-06-01: Begründung-Spalte („Bemerkung") entfernt — die Texte waren
+        # nicht zuverlässig (Routing≠Begründung-Versatz aus dem Legacy-Klassifikator).
         for entry in tage_detail[:366]:
             if not isinstance(entry, dict):
                 continue
             datum = _safe_cell(entry.get('datum', ''))[:10]
-            # v10: Marker/Routing/Klass/Begründung NICHT mehr hart truncaten —
+            # v10: Marker/Routing/Klass NICHT mehr hart truncaten —
             # wordWrap='CJK' fließt in die nächste Zeile innerhalb der Zelle.
             marker = _safe_cell(entry.get('marker', ''))[:40]
             routing = _safe_cell(entry.get('routing', ''))[:80]
             klass = _safe_cell(entry.get('klass', ''))[:12]
-            begr = _safe_cell(entry.get('begruendung', ''))[:240]
             tdata.append([
                 Paragraph(datum, cell_body_style),
                 Paragraph(marker, cell_body_style),
                 Paragraph(routing, cell_body_style),
                 Paragraph(klass, cell_body_style),
-                Paragraph(begr, cell_body_style),
             ])
         if len(tdata) > 1:
-            # v10: Routing-Spalte etwas breiter (lange Flugnummer+Routing wie 'LH0400 A FRA 0 FRA-JFK')
-            ttab = LongTable(tdata, colWidths=[1.7*cm, 1.7*cm, 2.6*cm, 1.4*cm, 8.9*cm], repeatRows=1)
+            # Spaltenbreiten ohne Begründung neu verteilt (Datum|Marker|Routing|Klass.)
+            ttab = LongTable(tdata, colWidths=[3.0*cm, 3.4*cm, 6.5*cm, 3.4*cm], repeatRows=1)
             ttab.setStyle(TableStyle([
                 ('BACKGROUND', (0,0), (-1,0), BG_CARD),
                 # FONTNAME/FONTSIZE/TEXTCOLOR werden von Paragraph-Style getragen,
@@ -34757,99 +34758,17 @@ def erstelle_pdf(d):
             # klassifiziert). Keine zusätzliche Warnung mehr.
 
     # ════════════════════════════════════════════════
-    # BELEGE — nur wenn Fotos vorhanden
+    # BELEGE-ANHANG: 2026-06-01 KOMPLETT ENTFERNT.
+    # Der Beleg-Anhang (Bild-/PDF-Einbettung) funktionierte aus PDF und Website
+    # nicht zuverlässig (HEIC/große Bilder/Embed-Fehler). Belege werden weiterhin
+    # in der Berechnung als Betrag berücksichtigt, aber NICHT mehr im PDF angehängt.
     # ════════════════════════════════════════════════
-    # Belege page — always shown
-    S.append(PageBreak())
-    for el in section("Belege — Hochgeladene Dokumente"): S.append(el)
-    if not has_fotos:
-        S.append(Spacer(1, 1.5*cm))
-        S.append(Paragraph("Keine Belege hochgeladen.",
-            ps("no_belege", fontSize=11, textColor=TEXT2,
-               fontName="Helvetica", leading=16, alignment=TA_CENTER,
-               spaceAfter=8)))
-        S.append(Paragraph(
-            "Es wurden keine Belege hochgeladen. Lade beim nächsten Mal deine Rechnungen unter Schritt 2 hoch — dann musst du sie nicht manuell in WISO suchen.",
-            ps("no_belege_sub", fontSize=9, textColor=TEXT3,
-               fontName="Helvetica", leading=14, alignment=TA_CENTER)))
-    if has_fotos:
-      W_c = A4[0] - 3.2*cm
-      first = True
-      for b in belege:
-            fbl = b.get('file_bytes_list') or []
-            if not fbl: continue
-            betrag = b.get('betrag', 0)
-            for fidx, fb_item in enumerate(fbl):
-                # Normalisieren: kann bytes oder (bytes, filename) sein
-                fb = fb_item[0] if isinstance(fb_item, tuple) else fb_item
-                if not first: S.append(PageBreak())
-                first = False
-                S.append(Paragraph(_xml_escape_for_paragraph(b.get('name','') or ''),
-                    ps(f"bpn{id(b)}{fidx}", fontSize=11, textColor=TEXT,
-                       fontName="Helvetica-Bold", leading=15, spaceAfter=4)))
-                S.append(Paragraph(
-                    f"Betrag: {eur(betrag)}" if betrag>0 else "— Betrag nicht erkannt —",
-                    ps(f"bpp{id(b)}{fidx}", fontSize=8.5, textColor=TEXT2,
-                       fontName="Helvetica", leading=12, spaceAfter=10)))
-                S.append(hr(0, 12))
-                try:
-                    # HEIC (iPhone) ODER große Bilder → erst auf max 1500px skalieren
-                    # spart massiv RAM (12MP-iPhone-Foto: 100MB → 5MB) ohne PDF-Qualitätsverlust
-                    is_heic = b'ftypheic' in fb[:32] or b'ftypheix' in fb[:32] or b'ftypmif1' in fb[:32]
-                    is_image = (is_heic or fb[:3]==b'\xff\xd8\xff' or fb[:4]==b'\x89PNG' or
-                                fb[:6]==b'GIF87a' or fb[:6]==b'GIF89a' or fb[8:12]==b'WEBP')
-                    if is_image and PIL_AVAILABLE:
-                        src_img = None
-                        try:
-                            from PIL import Image as PILImage
-                            src_img = PILImage.open(io.BytesIO(fb))
-                            max_dim = 1500
-                            if max(src_img.size) > max_dim:
-                                ratio = max_dim / max(src_img.size)
-                                new_size = (int(src_img.size[0]*ratio), int(src_img.size[1]*ratio))
-                                src_img = src_img.resize(new_size, PILImage.LANCZOS)
-                                print(f"[img-scale] {b.get('name','?')}: → {new_size[0]}×{new_size[1]}")
-                            buf_jpg = io.BytesIO()
-                            src_img.convert('RGB').save(buf_jpg, format='JPEG', quality=82, optimize=True)
-                            fb = buf_jpg.getvalue()
-                        except Exception as _hc:
-                            print(f"[img-scale] fail: {_hc}")
-                        finally:
-                            try:
-                                if src_img is not None:
-                                    src_img.close()
-                            except: pass
-                    if fb[:3]==b'\xff\xd8\xff' or fb[:4]==b'\x89PNG' or fb[:6]==b'GIF87a' or fb[:6]==b'GIF89a' or fb[8:12]==b'WEBP':
-                        img = RLImage(io.BytesIO(fb))
-                        iw,ih = img.drawWidth,img.drawHeight
-                        if iw and ih:
-                            scale = min(W_c/iw, 20*cm/ih, 1.0)  # 20cm cap (war 22cm) wegen Header/Footer
-                            img.drawWidth=iw*scale; img.drawHeight=ih*scale
-                            S.append(img)
-                        else:
-                            S.append(Paragraph("⚠ Bild konnte nicht eingebettet werden (unbekannte Dimensionen).",
-                                ps(f"bpe{id(b)}{fidx}", fontSize=9, textColor=TEXT3, fontName="Helvetica")))
-                    else:
-                        with pdfplumber.open(io.BytesIO(fb)) as pdoc:
-                            for pgi,pg_ in enumerate(pdoc.pages):
-                                if pgi>0: S.append(PageBreak())
-                                for line in (pg_.extract_text() or '').split('\n'):
-                                    if line.strip():
-                                        S.append(Paragraph(
-                                            line.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;'),
-                                            ps(f"pl{id(b)}{pgi}{id(line)}", fontSize=8.5,
-                                               textColor=TEXT, fontName="Courier", leading=12)))
-                                    else:
-                                        S.append(Spacer(1, 0.1*cm))
-                except Exception as embed_err:
-                    print(f"PDF-Embed fail [{b.get('name','?')}/{fidx}, {len(fb)}B, magic={fb[:8].hex()}]: {type(embed_err).__name__}: {embed_err}")
-                    S.append(Paragraph("Datei konnte nicht eingebettet werden.",
-                        ps(f"fe{id(b)}{fidx}", fontSize=9, textColor=TEXT3,
-                           fontName="Helvetica", leading=12)))
 
     # ════════════════════════════════════════════════
     # BERECHNUNG — minimalistisch auf Dark Navy
+    # (wird unten via _calc_anchor nach vorne verschoben)
     # ════════════════════════════════════════════════
+    _calc_start = len(S)
     S.append(PageBreak())
     for el in section("Berechnung — Zur Information"): S.append(el)
 
@@ -34991,6 +34910,19 @@ def erstelle_pdf(d):
             ]))
             S.append(t)
         S.append(kv_total("Gesamt Steuerfrei (= Z77)", eur(d.get('z77',0))))
+
+    # 2026-06-01: Berechnungsblock [_calc_start:_calc_end] nach vorne an
+    # _calc_anchor verschieben (direkt nach WISO-Anleitung, vor Trennseite).
+    # Der erste Flowable im Block ist ein PageBreak — der entfällt vorne, weil
+    # die Anleitung schon mit der Berechnung auf einer logischen Sequenz steht;
+    # stattdessen sauberer Abstand. Slicing erhält die Reihenfolge.
+    _calc_end = len(S)
+    _calc_block = S[_calc_start:_calc_end]
+    del S[_calc_start:_calc_end]
+    # führenden PageBreak des Blocks durch einen Spacer ersetzen (kein leeres Blatt)
+    if _calc_block and isinstance(_calc_block[0], PageBreak):
+        _calc_block[0] = Spacer(1, 0.8*cm)
+    S[_calc_anchor:_calc_anchor] = _calc_block
 
     # ════════════════════════════════════════════════
     # SONDERAUSGABEN & LSB-ÜBERSICHT
