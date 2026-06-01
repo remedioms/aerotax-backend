@@ -14,12 +14,18 @@
 #      GET /api/adsb/state?reg=<reg>      → Lookup-Reg→Hex → Position
 #      GET /api/adsb/route?dep=&arr=      → Great-Circle-Waypoints
 #
+#  Fallback-Chain (2026-06-01):
+#      OpenSky-anon ist unzuverlässig (400/day-Limit, häufige 5xx unter Last).
+#      Statt direkt 502 zu liefern, kaskadieren wir:
+#        1) OpenSky `/api/states/all?icao24=<hex>` (3s timeout)
+#        2) adsb.lol `/v2/icao/<hex>` (5s timeout, kein Auth, gentleman's API)
+#        3) last-known-state aus In-Memory-Cache (TTL 30 min)
+#      Nur wenn alle 3 scheitern → 502 mit detaillierter `tried`-Liste.
+#
 #  Rate-Limit-Strategie:
-#      OpenSky-anon: 400 calls/day. Mit 60s cache + N Clients pro Hex
-#      bündeln wir die Calls auf 1/min/Hex → ~1440/day pro getrackter
-#      Maschine, also pro AeroTax-User maximal eine Maschine zur Zeit.
-#      Bei "viele Crew tracken dieselbe inbound Maschine" hat das Cache
-#      sogar coalescing-Effekt.
+#      Mit 60s Fresh-Cache + N Clients pro Hex bündeln wir die Calls auf
+#      1/min/Hex. OpenSky-Quota wird durch adsb.lol-Fallback nicht weiter
+#      belastet wenn OpenSky bereits 4xx/5xx geliefert hat.
 # ═══════════════════════════════════════════════════════════════
 
 import json
@@ -34,32 +40,81 @@ from flask import Blueprint, request, jsonify
 adsb_bp = Blueprint('adsb', __name__)
 
 # ── Cache ─────────────────────────────────────────────────────
-# Struktur: {hex: {"fetched_at": float_unix, "row": list|None}}
-# `row` ist die OpenSky-State-Row direkt durchgereicht (kein Re-Encoding).
-# `None` bedeutet "wir haben gerade gepollt aber kein Signal" — ist legitim
-# (Maschine am Boden ohne ADS-B-Out aktiv). 404 wäre missverständlich.
+# Struktur: {hex: {"fetched_at": float_unix, "row": list|None, "source": str}}
+# `row` ist die normalisierte State-Row (OpenSky-Layout-kompatibel) — egal
+# welche Upstream-Quelle sie geliefert hat. `None` bedeutet "Hex ist
+# bekannt aber gerade kein Live-Signal" (Maschine am Boden ohne ADS-B-Out).
+# `source` ist informativ: 'opensky' | 'adsb.lol' — landet im JSON-Response
+# damit Clients debuggen können wer gerade liefert.
 _CACHE = {}
 _CACHE_TTL_SECONDS = 60
+# Last-Known-State Cache hält längere TTL für Fallback-Use-Case: wenn alle
+# Upstreams down sind, geben wir den letzten erfolgreichen Ping zurück,
+# markiert als `stale_due_to_upstream_outage`. 30 min ist ein vernünftiges
+# Time-Window — länger wäre irreführend (Maschine könnte längst gelandet
+# sein), kürzer würde Cold-Start-Recoverys nicht überbrücken.
+_LAST_KNOWN_TTL_SECONDS = 1800
 _CACHE_LOCK = threading.Lock()
 
 # Rate-Limit-Tracking: wenn OpenSky uns 429't, blocken wir global für die
-# vom Retry-After-Header angegebene Dauer (oder 60s default).
+# vom Retry-After-Header angegebene Dauer (oder 60s default). adsb.lol hat
+# kein hard rate-limit dokumentiert; wir tracken nur OpenSky.
 _BACKOFF = {"until": 0.0, "lock": threading.Lock()}
 
 # Hardcoded Reg→Hex Map als Last-Line-of-Defense. iOS hat eine eigene
 # umfangreichere Tabelle — die hier ist nur dafür gedacht, dass Client-Calls
 # mit ?reg=… auch dann funktionieren wenn ein anderer Client das Backend
-# direkt nutzt (Web-Frontend, Curl-Debug). Wir halten sie absichtlich kurz.
+# direkt nutzt (Web-Frontend, Curl-Debug). Stand 2026-05.
+# Quelle: planespotters.net + jetphotos.com Cross-Check.
 _BACKEND_REG_HEX = {
+    # Lufthansa A320-Family
     "D-AIPA": "3c64a8", "D-AIPB": "3c64a9", "D-AIPC": "3c64aa",
-    "D-AIXA": "3c675c", "D-AIXB": "3c675d",
-    "D-AIMA": "3c4dd9",
-    "HB-JCA": "4b1903", "HB-JHA": "4b1813",
+    "D-AIPD": "3c64ab", "D-AIPE": "3c64ac", "D-AIPF": "3c64ad",
+    "D-AIPH": "3c64af", "D-AIPK": "3c64b1", "D-AIPL": "3c64b2",
+    "D-AIQA": "3c656e", "D-AIQB": "3c656f", "D-AIQC": "3c6570",
+    "D-AIQD": "3c6571", "D-AIQE": "3c6572", "D-AIQF": "3c6573",
+    "D-AIUA": "3c66c1", "D-AIUB": "3c66c2", "D-AIUC": "3c66c3",
+    "D-AIUD": "3c66c4", "D-AIUE": "3c66c5",
+    # Lufthansa A330/A340
+    "D-AIKA": "3c4dc8", "D-AIKB": "3c4dc9", "D-AIKC": "3c4dca",
+    "D-AIKD": "3c4dcb", "D-AIKE": "3c4dcc",
+    "D-AIHA": "3c4dad", "D-AIHB": "3c4dae", "D-AIHC": "3c4daf",
+    # Lufthansa A350-900
+    "D-AIXA": "3c675c", "D-AIXB": "3c675d", "D-AIXC": "3c675e",
+    "D-AIXD": "3c675f", "D-AIXE": "3c6760", "D-AIXF": "3c6761",
+    # Lufthansa A380
+    "D-AIMA": "3c4dd9", "D-AIMB": "3c4dda", "D-AIMC": "3c4ddb",
+    "D-AIMD": "3c4ddc", "D-AIME": "3c4ddd",
+    # Lufthansa 747-8
+    "D-ABYA": "3c4a85", "D-ABYB": "3c4a86", "D-ABYC": "3c4a87",
+    "D-ABYD": "3c4a88", "D-ABYE": "3c4a89",
+    # Eurowings A320
+    "D-AEWA": "3c4d4f", "D-AEWB": "3c4d50", "D-AEWC": "3c4d51",
+    "D-AIZA": "3c674a", "D-AIZB": "3c674b",
+    # SWISS A220 + A330
+    "HB-JCA": "4b1903", "HB-JCB": "4b1904", "HB-JCC": "4b1905",
+    "HB-JHA": "4b1813", "HB-JHB": "4b1814",
+    # Austrian A320
+    "OE-LBA": "440189", "OE-LBB": "44018a", "OE-LBC": "44018b",
+    # Brussels A320
+    "OO-SNA": "4485c1", "OO-SNB": "4485c2",
 }
 
+
+def resolve_reg_to_hex(reg):
+    """Public helper für andere Blueprints (z.B. aircraft_info_blueprint).
+    Liefert lowercase Hex oder None. Reg wird upper-cased."""
+    if not reg:
+        return None
+    return _BACKEND_REG_HEX.get(reg.strip().upper())
+
 OPENSKY_URL = "https://opensky-network.org/api/states/all"
-HTTP_TIMEOUT = 10  # Sekunden — OpenSky kann unter Last langsam sein
-USER_AGENT = "AeroTax-Backend/1.0 (ADS-B-Proxy)"
+ADSB_LOL_URL = "https://api.adsb.lol/v2/icao"
+# Per-Upstream Timeouts (kürzer als vorher 10s — User wartet sonst zu lange
+# wenn OpenSky hängt):
+OPENSKY_TIMEOUT = 3
+ADSB_LOL_TIMEOUT = 5
+USER_AGENT = "AeroTax-Backend/1.1 (ADS-B-Proxy; mailto:ops@aerotax.de)"
 
 
 # ─── /api/adsb/state ─────────────────────────────────────────
@@ -85,32 +140,17 @@ def get_adsb_state():
     if not hex_param and not reg_param:
         return jsonify({"error": "missing hex or reg parameter"}), 400
 
+    # Wenn Client beides mitschickt (reg+hex) bevorzugen wir den expliziten
+    # Hex — sonst Server-Lookup über Backend-Reg-Map.
     if not hex_param and reg_param:
         hex_param = _BACKEND_REG_HEX.get(reg_param)
         if not hex_param:
-            return jsonify({"error": f"unknown registration {reg_param}"}), 404
-
-    # Backoff check
-    now = time.time()
-    with _BACKOFF["lock"]:
-        backoff_until = _BACKOFF["until"]
-    if now < backoff_until:
-        retry_after = int(backoff_until - now) + 1
-        cached_row = _cache_get(hex_param)
-        # Wenn wir noch einen halbwegs frischen Cache haben, geben wir den raus.
-        if cached_row is not None:
             return jsonify({
-                "hex": hex_param,
-                "position": cached_row["row"],
-                "fetched_at": cached_row["fetched_at"],
-                "cached": True,
-                "stale_due_to_backoff": True,
-            }), 200
-        resp = jsonify({"error": "rate_limited", "retry_after": retry_after})
-        resp.headers["Retry-After"] = str(retry_after)
-        return resp, 429
+                "error": f"unknown registration {reg_param}",
+                "hint": "pass ?hex=<icao24> if client knows the mapping",
+            }), 404
 
-    # Cache check
+    # Fresh-Cache-Hit (60s TTL) — sofort raus.
     cached = _cache_get(hex_param)
     if cached is not None:
         return jsonify({
@@ -118,30 +158,91 @@ def get_adsb_state():
             "position": cached["row"],
             "fetched_at": cached["fetched_at"],
             "cached": True,
+            "source": cached.get("source", "cache"),
         }), 200
 
-    # Fetch live
-    try:
-        row = _fetch_opensky(hex_param)
-    except _OpenSkyRateLimit as e:
-        with _BACKOFF["lock"]:
-            _BACKOFF["until"] = time.time() + e.retry_after
-        resp = jsonify({"error": "rate_limited", "retry_after": e.retry_after})
-        resp.headers["Retry-After"] = str(e.retry_after)
-        return resp, 429
-    except _OpenSkyError as e:
-        # Bei transient errors geben wir 502 — Client soll exponentiell
-        # nochmal probieren, aber wir lassen den Backoff aus (das Problem
-        # ist bei OpenSky, nicht bei uns).
-        return jsonify({"error": "upstream_error", "detail": str(e)}), 502
+    # Backoff-Status für OpenSky tracken — wenn aktiv, OpenSky-Step
+    # überspringen aber adsb.lol weiter probieren.
+    now = time.time()
+    with _BACKOFF["lock"]:
+        backoff_until = _BACKOFF["until"]
+    opensky_skipped = now < backoff_until
 
-    _cache_put(hex_param, row)
+    tried = []
+    row = None
+    source = None
+
+    # ─── Step 1: OpenSky (außer wenn im Backoff) ───
+    if not opensky_skipped:
+        try:
+            row = _fetch_opensky(hex_param)
+            source = "opensky"
+            tried.append({"upstream": "opensky", "ok": True})
+        except _OpenSkyRateLimit as e:
+            # 429 → globaler Backoff setzen, dann adsb.lol versuchen.
+            with _BACKOFF["lock"]:
+                _BACKOFF["until"] = time.time() + e.retry_after
+            tried.append({"upstream": "opensky", "ok": False,
+                          "reason": f"rate_limited(retry={e.retry_after}s)"})
+        except _OpenSkyError as e:
+            tried.append({"upstream": "opensky", "ok": False,
+                          "reason": str(e)[:80]})
+    else:
+        tried.append({"upstream": "opensky", "ok": False,
+                      "reason": f"backoff_active({int(backoff_until - now)}s)"})
+
+    # ─── Step 2: adsb.lol (wenn OpenSky nichts brauchbares lieferte) ───
+    # `row is None` heißt entweder Upstream-Fehler oder "kein Signal".
+    # Wir unterscheiden: bei Upstream-Fehler tried[-1].ok == False, dann
+    # macht adsb.lol Sinn. Bei "kein Signal" (ok=True, row=None) NICHT
+    # nochmal probieren — der Client soll "Maschine ist gerade nicht in
+    # der Luft" sehen, nicht eine zweite leere Antwort von einer anderen
+    # Quelle.
+    if row is None and tried and not tried[-1].get("ok"):
+        try:
+            row = _fetch_adsb_lol(hex_param)
+            if row is not None:
+                source = "adsb.lol"
+                tried.append({"upstream": "adsb.lol", "ok": True})
+            else:
+                tried.append({"upstream": "adsb.lol", "ok": True,
+                              "reason": "no_signal"})
+        except _UpstreamError as e:
+            tried.append({"upstream": "adsb.lol", "ok": False,
+                          "reason": str(e)[:80]})
+
+    # ─── Erfolg: cachen + ausgeben ───
+    if source is not None:
+        _cache_put(hex_param, row, source)
+        return jsonify({
+            "hex": hex_param,
+            "position": row,
+            "fetched_at": time.time(),
+            "cached": False,
+            "source": source,
+            "tried": tried,
+        }), 200
+
+    # ─── Step 3: Last-known-state aus 30-min-Cache ───
+    last_known = _last_known_get(hex_param)
+    if last_known is not None:
+        return jsonify({
+            "hex": hex_param,
+            "position": last_known["row"],
+            "fetched_at": last_known["fetched_at"],
+            "cached": True,
+            "stale_due_to_upstream_outage": True,
+            "stale_age_seconds": int(time.time() - last_known["fetched_at"]),
+            "source": last_known.get("source", "cache"),
+            "tried": tried,
+        }), 200
+
+    # ─── Alles fehlgeschlagen → 502 mit detaillierter Diagnose ───
     return jsonify({
+        "error": "all_upstreams_failed",
         "hex": hex_param,
-        "position": row,
-        "fetched_at": time.time(),
-        "cached": False,
-    }), 200
+        "tried": tried,
+    }), 502
 
 
 # ─── /api/adsb/route ─────────────────────────────────────────
@@ -228,7 +329,7 @@ def get_health():
 # ─── Cache Helpers ──────────────────────────────────────────
 
 def _cache_get(hex_id):
-    """Gibt eine frische Cache-Row zurück oder None."""
+    """Gibt eine frische Cache-Row (innerhalb _CACHE_TTL_SECONDS) zurück."""
     now = time.time()
     with _CACHE_LOCK:
         entry = _CACHE.get(hex_id)
@@ -239,9 +340,30 @@ def _cache_get(hex_id):
         return entry
 
 
-def _cache_put(hex_id, row):
+def _last_known_get(hex_id):
+    """Gibt einen Eintrag innerhalb _LAST_KNOWN_TTL_SECONDS zurück, auch
+    wenn er älter als 60s ist. Wird nur als Last-Resort genutzt wenn alle
+    Upstreams scheitern. Liefert nicht zurück wenn row=None (es macht
+    keinen Sinn, "kein Signal" als stale-fallback zu reportieren)."""
+    now = time.time()
     with _CACHE_LOCK:
-        _CACHE[hex_id] = {"fetched_at": time.time(), "row": row}
+        entry = _CACHE.get(hex_id)
+        if entry is None:
+            return None
+        if entry.get("row") is None:
+            return None
+        if now - entry["fetched_at"] > _LAST_KNOWN_TTL_SECONDS:
+            return None
+        return entry
+
+
+def _cache_put(hex_id, row, source="opensky"):
+    with _CACHE_LOCK:
+        _CACHE[hex_id] = {
+            "fetched_at": time.time(),
+            "row": row,
+            "source": source,
+        }
         # Cache-Cap: halte max 200 Einträge. Bei Überlauf evicte die
         # ältesten 50 — kein LRU-Overhead, einfach Bulk-Cleanup.
         if len(_CACHE) > 200:
@@ -252,14 +374,23 @@ def _cache_put(hex_id, row):
 
 # ─── OpenSky Fetch ──────────────────────────────────────────
 
-class _OpenSkyError(Exception):
+class _UpstreamError(Exception):
+    """Base für alle Upstream-Fetch-Fehler — egal welche Quelle."""
     pass
 
 
-class _OpenSkyRateLimit(Exception):
+class _OpenSkyError(_UpstreamError):
+    pass
+
+
+class _OpenSkyRateLimit(_OpenSkyError):
     def __init__(self, retry_after):
         super().__init__("rate limited")
         self.retry_after = int(retry_after)
+
+
+class _AdsbLolError(_UpstreamError):
+    pass
 
 
 def _fetch_opensky(hex_id):
@@ -280,7 +411,7 @@ def _fetch_opensky(hex_id):
         "Accept": "application/json",
     })
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=OPENSKY_TIMEOUT) as resp:
             data = resp.read()
     except urllib.error.HTTPError as e:
         if e.code == 429:
@@ -290,19 +421,140 @@ def _fetch_opensky(hex_id):
             except (TypeError, ValueError):
                 retry_after = 60
             raise _OpenSkyRateLimit(retry_after) from e
-        raise _OpenSkyError(f"http {e.code}") from e
+        raise _OpenSkyError(f"opensky http {e.code}") from e
     except urllib.error.URLError as e:
-        raise _OpenSkyError(f"network: {e.reason}") from e
+        raise _OpenSkyError(f"opensky network: {e.reason}") from e
+    except Exception as e:  # socket timeout etc.
+        raise _OpenSkyError(f"opensky transport: {type(e).__name__}") from e
 
     try:
         obj = json.loads(data)
     except (ValueError, json.JSONDecodeError) as e:
-        raise _OpenSkyError("invalid json") from e
+        raise _OpenSkyError("opensky invalid json") from e
 
     states = obj.get("states") or []
     if not states:
         return None
     return states[0]
+
+
+def _fetch_adsb_lol(hex_id):
+    """
+    Fallback-Upstream: adsb.lol `/v2/icao/<hex24>`.
+
+    adsb.lol antwortet `{"ac": [{ ...aircraft-fields... }], "msg": "...", ...}`.
+    Wir normalisieren das in das OpenSky-State-Row-Layout (siehe
+    AircraftPosition.from(openSkyRow:) in iOS) damit Clients KEINE
+    Quellen-bedingte Parser-Variante brauchen.
+
+    Field-Mapping (adsb.lol → OpenSky-Index):
+        hex          → [0] icao24
+        flight       → [1] callsign
+        r (registration) → benutzt für [2] origin_country (best-effort)
+        seen_pos     → [3] time_position (negativer Offset → unix)
+        seen         → [4] last_contact
+        lon          → [5]
+        lat          → [6]
+        alt_baro     → [7] baro_altitude (ft → m)
+        alt_geom     → [13] geo_altitude (ft → m)
+        gs           → [9] velocity (kts → m/s)
+        track        → [10] true_track
+        baro_rate    → [11] vertical_rate (fpm → m/s)
+        squawk       → [14]
+        ground       → [8] on_ground (alt_baro == "ground")
+
+    Returns: list im OpenSky-Layout oder None wenn `ac` leer.
+    Raises: _AdsbLolError bei HTTP-/Parse-/Timeout-Fehler.
+    """
+    safe_hex = urllib.parse.quote(hex_id, safe='')
+    url = f"{ADSB_LOL_URL}/{safe_hex}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=ADSB_LOL_TIMEOUT) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        raise _AdsbLolError(f"adsb.lol http {e.code}") from e
+    except urllib.error.URLError as e:
+        raise _AdsbLolError(f"adsb.lol network: {e.reason}") from e
+    except Exception as e:
+        raise _AdsbLolError(f"adsb.lol transport: {type(e).__name__}") from e
+
+    try:
+        obj = json.loads(data)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise _AdsbLolError("adsb.lol invalid json") from e
+
+    ac_list = obj.get("ac") or []
+    if not ac_list:
+        return None
+    ac = ac_list[0]
+
+    # Numeric helpers — adsb.lol sendet "ground" als String wenn am Boden,
+    # sonst float. Wir parsen defensiv.
+    def _f(v):
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    alt_baro_raw = ac.get("alt_baro")
+    on_ground = alt_baro_raw == "ground"
+    alt_baro_ft = _f(alt_baro_raw) if not on_ground else None
+    alt_geom_ft = _f(ac.get("alt_geom"))
+    gs_kts = _f(ac.get("gs"))
+    baro_rate_fpm = _f(ac.get("baro_rate"))
+
+    # ft → m für altitude (1 ft = 0.3048 m)
+    alt_baro_m = alt_baro_ft * 0.3048 if alt_baro_ft is not None else None
+    alt_geom_m = alt_geom_ft * 0.3048 if alt_geom_ft is not None else None
+    # kts → m/s (1 kts = 0.514444 m/s)
+    velocity_ms = gs_kts * 0.514444 if gs_kts is not None else None
+    # fpm → m/s (1 fpm = 0.00508 m/s)
+    vertical_rate_ms = baro_rate_fpm * 0.00508 if baro_rate_fpm is not None else None
+
+    now = time.time()
+    seen_age = _f(ac.get("seen"))
+    last_contact = (now - seen_age) if seen_age is not None else now
+    seen_pos_age = _f(ac.get("seen_pos"))
+    time_position = (now - seen_pos_age) if seen_pos_age is not None else last_contact
+
+    flight = (ac.get("flight") or "").strip() or None
+    reg = (ac.get("r") or "").strip() or None  # adsb.lol's "r" = registration
+
+    # OpenSky-State-Row Layout (siehe AircraftPosition.from):
+    # [0] icao24, [1] callsign, [2] origin_country, [3] time_position,
+    # [4] last_contact, [5] lon, [6] lat, [7] baro_altitude_m, [8] on_ground,
+    # [9] velocity_m_s, [10] true_track, [11] vertical_rate_m_s, [12] sensors,
+    # [13] geo_altitude_m, [14] squawk, [15] spi, [16] position_source
+    row = [
+        (ac.get("hex") or hex_id).lower(),    # 0
+        flight,                                # 1
+        reg,                                   # 2  (Reg statt origin_country — best-effort)
+        time_position,                         # 3
+        last_contact,                          # 4
+        _f(ac.get("lon")),                     # 5
+        _f(ac.get("lat")),                     # 6
+        alt_baro_m,                            # 7
+        on_ground,                             # 8
+        velocity_ms,                           # 9
+        _f(ac.get("track")),                   # 10
+        vertical_rate_ms,                      # 11
+        None,                                  # 12 sensors
+        alt_geom_m,                            # 13
+        (ac.get("squawk") or None),            # 14
+        False,                                 # 15 spi
+        0,                                     # 16 position_source
+    ]
+    # adsb.lol sendet manchmal Records ohne lat/lon (Mode-S only, kein ADS-B).
+    # Wir geben dann None zurück — kein "Position" verfügbar.
+    if row[5] is None or row[6] is None:
+        return None
+    return row
 
 
 # ─── Great-Circle Math ──────────────────────────────────────
