@@ -7178,7 +7178,13 @@ def _qa_rate_cleanup(now):
 
 
 def _qa_aerotax_answer(question_title, question_body):
-    """Generiert AeroTAX-Bot-Antwort via Claude. Wird automatisch zu jeder Frage gerufen."""
+    """Generiert AeroTAX-Bot-Antwort via Claude. Wird automatisch zu jeder Frage gerufen.
+
+    Worker-H Polish (2026-06-01): EASA-Wissensbuch + Antwort-Richtlinien
+    in den system-Prompt verschoben → Prompt-Caching greift, weil die
+    static-Teile zwischen QA-Calls identisch sind. Nur Titel+Body bleiben
+    user-message (dynamisch). Bei Cache-Hit ~90% Token-Cost-Reduktion.
+    """
     if not ANTHROPIC_KEY: return None
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
@@ -7191,15 +7197,15 @@ def _qa_aerotax_answer(question_title, question_body):
                     easa_kontext = f.read()
         except: pass
 
-        prompt = f"""Du bist AeroTAX — der Tax-Advisor-Bot von aerosteuer.de für Lufthansa-Kabinenpersonal und Cockpit-Crew.
-Beantworte die folgende Community-Frage kurz, präzise, fundiert. Nutze §9 EStG, EASA-FTL, BMF-Schreiben als Wissensbasis.
+        # System-Prompt: STATIC zwischen Calls (Wissensbuch + Richtlinien) →
+        # cache_control via _claude_with_retry(system=..., cache_system=True).
+        # easa_kontext kann sich ändern wenn referenz_easa.txt deployed wird —
+        # dann invalidiert sich der Cache automatisch (anderer system-string).
+        system_prompt = f"""Du bist AeroTAX — der Tax-Advisor-Bot von aerosteuer.de für Lufthansa-Kabinenpersonal und Cockpit-Crew.
+Beantworte Community-Fragen kurz, präzise, fundiert. Nutze §9 EStG, EASA-FTL, BMF-Schreiben als Wissensbasis.
 
 ═══ FACHWISSEN (zur Referenz, nicht zitieren) ═══
 {easa_kontext[:8000]}
-
-═══ COMMUNITY-FRAGE ═══
-Titel: {question_title}
-Frage: {question_body}
 
 ═══ ANTWORT-RICHTLINIEN ═══
 - 3-6 Absätze, klar strukturiert
@@ -7214,8 +7220,14 @@ Frage: {question_body}
 ℹ Hinweis: AeroTAX ist eine Berechnungs- und Dokumentationshilfe und ersetzt keine individuelle steuerliche Beratung. Bei komplexen Einzelfällen ziehe einen Steuerberater oder Lohnsteuerhilfeverein zu Rate.
 
 Antworte direkt mit dem Antworttext (kein Header, kein "Hallo X")."""
-        resp = _claude_with_retry(client, 'claude-sonnet-4-6', 1200, prompt,
-                                   max_retries=2, label='AeroTAX-QA')
+
+        user_prompt = f"""═══ COMMUNITY-FRAGE ═══
+Titel: {question_title}
+Frage: {question_body}"""
+
+        resp = _claude_with_retry(client, 'claude-sonnet-4-6', 1200, user_prompt,
+                                   max_retries=2, label='AeroTAX-QA',
+                                   system=system_prompt, cache_system=True)
         return resp.content[0].text.strip()
     except Exception as e:
         print(f"[qa] AeroTAX answer failed: {e}")
@@ -8263,45 +8275,99 @@ def user_search():
                         'error': 'min_query_or_filter_required'}), 400
     blocked = _blocked_by(searcher_token) if searcher_token else set()
     results = []
-    try:
-        for fn in os.listdir(_USER_HISTORY_DIR):
-            if not fn.startswith('profile_') or not fn.endswith('.json'):
-                continue
-            try:
-                with open(os.path.join(_USER_HISTORY_DIR, fn)) as f:
-                    data = json.load(f) or {}
-            except Exception:
-                continue
-            target_token = data.get('token')
-            if not target_token or target_token == searcher_token:
-                continue
-            if target_token in blocked:
-                continue
-            pr = data.get('profile') or {}
-            name = (pr.get('name') or '').strip()
-            a = (pr.get('airline') or '').strip().lower()
-            h = (pr.get('homebase') or '').strip().upper()
-            # Match-Logik
-            if q and q not in name.lower():
-                continue
-            if airline and airline != a:
-                continue
-            if homebase and homebase != h:
-                continue
-            results.append({
-                'token': target_token,
-                'name': name,
-                'airline': pr.get('airline'),
-                'homebase': pr.get('homebase'),
-                'position': pr.get('position'),
-            })
-            if len(results) >= limit:
-                break
-    except FileNotFoundError:
-        pass
+    used_source = 'disk'
+
+    # W18-Fix (2026-06-01): Primär gegen Supabase suchen — Disk-Iteration
+    # über profile_*.json verliert nach jedem Cloud-Run-Redeploy alle Hits.
+    # SB-Query nutzt ilike auf name + eq auf homebase/airline (indiziert via
+    # idx_user_profiles_homebase/idx_user_profiles_airline). Fallback auf
+    # Disk wenn SB nicht erreichbar.
+    sb_done = False
+    if SB_AVAILABLE:
+        try:
+            qbuilder = sb.table('user_profiles').select(
+                'token,name,homebase,airline,"position"'
+            )
+            if q:
+                # ilike ist case-insensitive — name enthält Substring q
+                qbuilder = qbuilder.ilike('name', f'%{q}%')
+            if airline:
+                qbuilder = qbuilder.ilike('airline', airline)
+            if homebase:
+                qbuilder = qbuilder.eq('homebase', homebase)
+            # Höheres SB-Limit als Endpoint-Limit, da blocks/self-filter
+            # nachträglich Rows entfernen können.
+            qbuilder = qbuilder.limit(max(limit * 3, 60))
+            r = qbuilder.execute()
+            for row in (r.data or []):
+                target_token = row.get('token')
+                if not target_token or target_token == searcher_token:
+                    continue
+                if target_token in blocked:
+                    continue
+                name = (row.get('name') or '').strip()
+                # Filter "kein-Name" raus — sonst wirkt's wie ein User-Listing
+                if not name:
+                    continue
+                results.append({
+                    'token': target_token,
+                    'name': name,
+                    'airline': row.get('airline'),
+                    'homebase': row.get('homebase'),
+                    'position': row.get('position'),
+                })
+                if len(results) >= limit:
+                    break
+            sb_done = True
+            used_source = 'supabase'
+        except Exception as e:
+            app.logger.warning(
+                f'[user_search] sb_fail err={type(e).__name__}: {str(e)[:120]} → disk fallback'
+            )
+            sb_done = False
+            results = []
+
+    if not sb_done:
+        # Disk-Fallback (alte Logik) — bei SB-down oder vor erster Migration
+        try:
+            for fn in os.listdir(_USER_HISTORY_DIR):
+                if not fn.startswith('profile_') or not fn.endswith('.json'):
+                    continue
+                try:
+                    with open(os.path.join(_USER_HISTORY_DIR, fn)) as f:
+                        data = json.load(f) or {}
+                except Exception:
+                    continue
+                target_token = data.get('token')
+                if not target_token or target_token == searcher_token:
+                    continue
+                if target_token in blocked:
+                    continue
+                pr = data.get('profile') or {}
+                name = (pr.get('name') or '').strip()
+                a = (pr.get('airline') or '').strip().lower()
+                h = (pr.get('homebase') or '').strip().upper()
+                # Match-Logik
+                if q and q not in name.lower():
+                    continue
+                if airline and airline != a:
+                    continue
+                if homebase and homebase != h:
+                    continue
+                results.append({
+                    'token': target_token,
+                    'name': name,
+                    'airline': pr.get('airline'),
+                    'homebase': pr.get('homebase'),
+                    'position': pr.get('position'),
+                })
+                if len(results) >= limit:
+                    break
+        except FileNotFoundError:
+            pass
     # Sortiere alphabetisch nach Name
     results.sort(key=lambda u: (u.get('name') or '').lower())
-    return jsonify({'count': len(results), 'users': results})
+    return jsonify({'count': len(results), 'users': results, 'source': used_source})
 
 
 @app.route('/api/user/lookup-by-short/<short>', methods=['GET'])
@@ -8333,32 +8399,77 @@ def user_lookup_by_short(short):
     if not _re_lookup.match(r'^[A-Za-z0-9_-]+$', short):
         return jsonify({'error': 'short_invalid_chars'}), 400
 
+    # W19-Hardening (2026-06-01): Per-IP Rate-Limit gegen Token-Enumeration.
+    # Endpoint ist unauthenticated (kein User-Token im Header) → Worst-Case
+    # könnte ein Angreifer 8-char-Prefixes brute-forcen um aktive User-Tokens
+    # zu erraten. 30 calls / 10min reichen für legitime UX (User-Tap auf Avatar),
+    # blockieren aber Massen-Enumeration (~6.8e12 möglich Prefix-Werte sind
+    # bei 30 calls/10min auch ohne Limit unpraktisch, aber das Limit stoppt
+    # gezielte Scanning-Versuche und reduziert Log-Lärm).
+    client_ip = _client_ip()
+    if client_ip and _ip_rate_limited(client_ip, endpoint='lookup_by_short',
+                                       limit=30, window_sec=600):
+        return jsonify({
+            'error': 'rate_limited',
+            'detail': 'Zu viele Lookup-Anfragen — bitte 10 Minuten warten.',
+        }), 429
+
     matches = []
-    try:
-        for fn in os.listdir(_USER_HISTORY_DIR):
-            if not fn.startswith('profile_') or not fn.endswith('.json'):
-                continue
-            try:
-                with open(os.path.join(_USER_HISTORY_DIR, fn)) as f:
-                    data = json.load(f) or {}
-            except Exception:
-                continue
-            target_token = data.get('token') or ''
-            if not target_token or not target_token.startswith(short):
-                continue
-            pr = data.get('profile') or {}
-            matches.append({
-                'token': target_token,
-                'name': (pr.get('name') or '').strip() or None,
-                'homebase': pr.get('homebase'),
-                'airline': pr.get('airline'),
-                'position': pr.get('position'),
-            })
-            if len(matches) > 1:
-                # Mehr als 1 Match — ambiguous, früh abbrechen
-                break
-    except FileNotFoundError:
-        pass
+
+    # SB-primary: Token-Prefix-Match via LIKE 'short%' — nutzt PK-Index (token).
+    sb_done = False
+    if SB_AVAILABLE:
+        try:
+            r = sb.table('user_profiles').select(
+                'token,name,homebase,airline,"position"'
+            ).like('token', f'{short}%').limit(2).execute()
+            for row in (r.data or []):
+                target_token = row.get('token') or ''
+                if not target_token or not target_token.startswith(short):
+                    continue
+                matches.append({
+                    'token': target_token,
+                    'name': (row.get('name') or '').strip() or None,
+                    'homebase': row.get('homebase'),
+                    'airline': row.get('airline'),
+                    'position': row.get('position'),
+                })
+                if len(matches) > 1:
+                    break
+            sb_done = True
+        except Exception as e:
+            app.logger.warning(
+                f'[lookup_by_short] sb_fail err={type(e).__name__}: {str(e)[:120]} → disk fallback'
+            )
+            sb_done = False
+            matches = []
+
+    if not sb_done:
+        try:
+            for fn in os.listdir(_USER_HISTORY_DIR):
+                if not fn.startswith('profile_') or not fn.endswith('.json'):
+                    continue
+                try:
+                    with open(os.path.join(_USER_HISTORY_DIR, fn)) as f:
+                        data = json.load(f) or {}
+                except Exception:
+                    continue
+                target_token = data.get('token') or ''
+                if not target_token or not target_token.startswith(short):
+                    continue
+                pr = data.get('profile') or {}
+                matches.append({
+                    'token': target_token,
+                    'name': (pr.get('name') or '').strip() or None,
+                    'homebase': pr.get('homebase'),
+                    'airline': pr.get('airline'),
+                    'position': pr.get('position'),
+                })
+                if len(matches) > 1:
+                    # Mehr als 1 Match — ambiguous, früh abbrechen
+                    break
+        except FileNotFoundError:
+            pass
 
     if not matches:
         return jsonify({'error': 'not_found'}), 404
@@ -8603,6 +8714,79 @@ def _friends_save_to_supabase(token, data):
         return False
 
 
+def _friend_groups_load_from_supabase(token):
+    """Lädt Friend-Groups aus user_friend_groups in SB. Returns list[dict] oder
+    None bei SB-down. Empty-list = keine Groups (kein Fehler).
+    Migration 20260601_friend_groups.sql muss applied sein.
+    """
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = sb.table('user_friend_groups').select(
+            'id,name,members,created_at,updated_at'
+        ).eq('owner_token', token).execute()
+        out = []
+        for row in (r.data or []):
+            mem = row.get('members')
+            if not isinstance(mem, list):
+                mem = []
+            out.append({
+                'id': row.get('id'),
+                'name': row.get('name') or '',
+                'members': [m for m in mem if isinstance(m, str)],
+                'created_at': row.get('created_at'),
+                'updated_at': row.get('updated_at'),
+            })
+        return out
+    except Exception as e:
+        app.logger.warning(
+            f'[fgroups] sb_load_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:120]}'
+        )
+        return None
+
+
+def _friend_groups_save_to_supabase(token, groups):
+    """Replaces alle Gruppen für owner_token. Strategie: delete-by-owner + upsert.
+    Wie _friends_save_to_supabase — atomic-genug für die UX (User-CRUD läuft
+    serialisiert, kein concurrent edit).
+    Returns True/False für Erfolg.
+    """
+    if not SB_AVAILABLE or not token:
+        return False
+    groups = groups or []
+    rows = []
+    seen_ids = set()
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        gid = (g.get('id') or '').strip()
+        if not gid or gid in seen_ids:
+            continue
+        seen_ids.add(gid)
+        name = (g.get('name') or '').strip()[:60]
+        members = [m for m in (g.get('members') or []) if isinstance(m, str)]
+        rows.append({
+            'id': gid,
+            'owner_token': token,
+            'name': name or 'Gruppe',
+            'members': members,
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        })
+    try:
+        sb.table('user_friend_groups').delete().eq('owner_token', token).execute()
+        if rows:
+            for i in range(0, len(rows), 200):
+                sb.table('user_friend_groups').upsert(
+                    rows[i:i+200], on_conflict='id'
+                ).execute()
+        return True
+    except Exception as e:
+        app.logger.error(
+            f'[fgroups] sb_save_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:200]}'
+        )
+        return False
+
+
 def _friends_load_from_disk(token):
     """Liest komplette friends-Disk-Datei. Returns mind. {token, friends:[]}."""
     p = _user_friends_path(token)
@@ -8617,18 +8801,31 @@ def _friends_load_from_disk(token):
 
 def _friends_load(token):
     """SB primary, Disk fallback. Lazy-Migration disk→SB beim ersten Read.
-    SB-Daten + disk-only Felder (groups) werden gemerged damit Caller die
-    alte Shape sehen.
+    Friend-`groups` werden seit 2026-06-01 ebenfalls aus user_friend_groups
+    geladen (vorher disk-only). Bei SB-down fällt groups auf disk zurück.
     """
     if not token:
         return {'token': token, 'friends': []}
     sb_data = _friends_load_from_supabase(token)
+    # Groups separat aus SB nachladen (eigene Tabelle).
+    sb_groups = _friend_groups_load_from_supabase(token) if sb_data is not None else None
     if sb_data is not None:
-        # SB-Hit: groups (disk-only) dazumergen
         disk = _friends_load_from_disk(token)
         out = dict(sb_data)
-        if 'groups' in (disk or {}):
+        if sb_groups is not None and sb_groups:
+            out['groups'] = sb_groups
+        elif sb_groups is not None and not sb_groups and disk.get('groups'):
+            # Disk hat groups, SB nicht → lazy-migrate
+            app.logger.info(f'[fgroups] lazy-migrate tok={token[:8]} disk→supabase')
+            _friend_groups_save_to_supabase(token, disk['groups'])
+            out['groups'] = disk['groups']
+        elif sb_groups is None and 'groups' in (disk or {}):
+            # SB-Groups-Load fehlte (table missing/SB-down) → disk-Fallback
             out['groups'] = disk.get('groups')
+        elif sb_groups is not None:
+            # SB-Groups leer + Disk leer → leeres groups[] zurückgeben damit
+            # Caller (Endpoints) keinen None-Branch braucht
+            out['groups'] = []
         return out
     # SB-Miss (down or error) → Disk-Fallback + lazy-Migration wenn SB up
     disk = _friends_load_from_disk(token)
@@ -8638,12 +8835,15 @@ def _friends_load(token):
         # provoziert ständig leeren SB-write).
         app.logger.info(f'[friends] lazy-migrate tok={token[:8]} disk→supabase')
         _friends_save_to_supabase(token, disk)
+    if SB_AVAILABLE and disk.get('groups'):
+        _friend_groups_save_to_supabase(token, disk['groups'])
     return disk
 
 
 def _friends_save(token, data):
     """Schreibt sowohl Disk (cache) als auch SB (primary). True wenn mind.
-    eines erfolgreich war (analog _auth_save)."""
+    eines erfolgreich war (analog _auth_save).
+    Groups werden separat in user_friend_groups persistiert."""
     if not token:
         return False
     disk_ok = False
@@ -8655,6 +8855,14 @@ def _friends_save(token, data):
         except Exception as e:
             app.logger.warning(f'[friends] disk_save_fail tok={token[:8]}: {e}')
     sb_ok = _friends_save_to_supabase(token, data)
+    # Groups separat persistieren — eigene Tabelle, eigener Save-Path.
+    # Fehler hier NICHT als Save-Fail werten (Friends sind primär; Groups
+    # können bei SB-down weiterhin disk-only existieren).
+    if SB_AVAILABLE and 'groups' in (data or {}):
+        try:
+            _friend_groups_save_to_supabase(token, data.get('groups') or [])
+        except Exception as e:
+            app.logger.warning(f'[fgroups] save during friends_save fail tok={token[:8]}: {e}')
     if not (sb_ok or disk_ok):
         app.logger.error(
             f'[friends] CRITICAL tok={token[:8]}: weder SB noch Disk gesichert!'
@@ -9351,16 +9559,24 @@ def _extract_article_text(html):
     html = re.sub(r'<!--.*?-->', ' ', html, flags=re.DOTALL)
 
     # 2. Container-Kandidaten in Reihenfolge ihrer Spezifizität.
+    # Worker-H Polish (2026-06-01): aero.de-spezifischer Pattern voran
+    # ('<div class="article noh">' wrapper), dann generische Fallbacks.
+    # Greedy bis socialshareprivacy/comments — aero.de hat den Article-Body
+    # bis dahin in einem flat-Container ohne saubere </div>-Grenze.
     container = None
     patterns = [
-        r'<article\b[^>]*>(.*?)</article>',
-        r'<div\b[^>]*class="[^"]*article-content[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)',
-        r'<div\b[^>]*id="article-content"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)',
-        r'<div\b[^>]*class="[^"]*news-text[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)',
-        r'<div\b[^>]*class="[^"]*entry-content[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)',
-        r'<main\b[^>]*>(.*?)</main>',
+        # aero.de v2026: <div class="article noh">…<div id="socialshareprivacy"|<div class="article-comments">
+        # Greedy + nicht-greedy bis zum Comment/Social-Share-Marker
+        (r'<div\b[^>]*class="article(?:\s+noh)?"[^>]*>(.*?)<div\b[^>]*(?:id="socialshareprivacy"|class="article-comments")',
+         True),
+        (r'<article\b[^>]*>(.*?)</article>', False),
+        (r'<div\b[^>]*class="[^"]*article-content[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)', False),
+        (r'<div\b[^>]*id="article-content"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)', False),
+        (r'<div\b[^>]*class="[^"]*news-text[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)', False),
+        (r'<div\b[^>]*class="[^"]*entry-content[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<section|<footer|$)', False),
+        (r'<main\b[^>]*>(.*?)</main>', False),
     ]
-    for pat in patterns:
+    for pat, _is_aerode in patterns:
         m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
         if m and len(m.group(1)) > 200:
             container = m.group(1)
@@ -9370,6 +9586,19 @@ def _extract_article_text(html):
         m = re.search(r'<body\b[^>]*>(.*?)</body>', html,
                       flags=re.IGNORECASE | re.DOTALL)
         container = m.group(1) if m else html
+
+    # aero.de-spezifisch: <h4>Verwandte Themen</h4>...<ul>...</ul> raus, das
+    # ist eine Sidebar-Liste der zugehörigen Artikel die mitten im Container
+    # liegt und sonst als Body-Text mit-extrahiert wird.
+    container = re.sub(r'<h4[^>]*>Verwandte Themen</h4>\s*<ul[^>]*>.*?</ul>',
+                       ' ', container, flags=re.IGNORECASE | re.DOTALL)
+    # Slider-Markup (`<div id="sliderp"...><div u="slides"...></div></div>`)
+    # ist leer aber stört die Spaltenzählung — raus.
+    container = re.sub(r'<div\b[^>]*id="sliderp"[^>]*>.*?</div>\s*</div>',
+                       ' ', container, flags=re.IGNORECASE | re.DOTALL)
+    # Inline-Bild-Wrapper: <a class="highslide"...>img</a><br><span class="cr2">…</span>
+    container = re.sub(r'<span\b[^>]*class="cr2[^"]*"[^>]*>.*?</span>',
+                       ' ', container, flags=re.IGNORECASE | re.DOTALL)
 
     # 3. <p>-Tags zu Absätzen, <br> zu Newline, dann restliche Tags raus.
     container = re.sub(r'<br\s*/?>', '\n', container, flags=re.IGNORECASE)
@@ -9381,29 +9610,23 @@ def _extract_article_text(html):
     container = re.sub(r'<[^>]+>', '', container)
 
     # 4. Entity-Normalisierung (named + numeric).
-    container = container.replace('&nbsp;', ' ')
-    container = container.replace('&amp;', '&')
-    container = container.replace('&quot;', '"')
-    container = container.replace('&apos;', "'")
-    container = container.replace('&lt;', '<')
-    container = container.replace('&gt;', '>')
-    container = container.replace('&ndash;', '–')
-    container = container.replace('&mdash;', '—')
-    container = container.replace('&laquo;', '«')
-    container = container.replace('&raquo;', '»')
-    container = container.replace('&bdquo;', '„')
-    container = container.replace('&ldquo;', '"')
-    container = container.replace('&rdquo;', '"')
-    container = container.replace('&euro;', '€')
-    # numerische entities &#123; und &#x1F4;
-    def _num_ent(m):
-        try:
-            code = m.group(1)
-            n = int(code[1:], 16) if code.startswith('x') or code.startswith('X') else int(code)
-            return chr(n)
-        except Exception:
-            return m.group(0)
-    container = re.sub(r'&#(x[0-9a-fA-F]+|[0-9]+);', _num_ent, container)
+    # Worker-H Polish (2026-06-01): html.unescape() statt manueller Liste —
+    # aero.de nutzt &ouml;/&auml;/&uuml;/&szlig; im Body, die alte Liste
+    # hatte nur ASCII + ein paar typografische Quotes. html.unescape deckt
+    # alle HTML5-Named-Entities + numeric ab.
+    try:
+        import html as _html
+        container = _html.unescape(container)
+    except Exception:
+        # Fallback auf manuelle Liste (alte Logik)
+        container = container.replace('&nbsp;', ' ')
+        container = container.replace('&amp;', '&')
+        container = container.replace('&quot;', '"')
+        container = container.replace('&apos;', "'")
+        container = container.replace('&lt;', '<')
+        container = container.replace('&gt;', '>')
+    # &nbsp; → 0xA0 (non-breaking space); für Lesbarkeit zu normalem Space.
+    container = container.replace('\xa0', ' ')
 
     # Whitespace-Normalisierung: Tabs/CR raus, Mehrfach-Spaces collapsen,
     # aber Absatz-Trennung (\n\n) erhalten.
@@ -13228,16 +13451,157 @@ def import_calendar_feed(token):
                     current['end'] = bucket
                 if utc_dt is not None:
                     current['end_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-    # Save Events
-    p = _user_profile_path(token)
-    try:
-        existing = {}
+            elif k == 'RRULE':
+                # W14-Note (2026-06-01): Recurring-Events (z.B. wöchentliche
+                # Standby-Slots) parsen. Wir unterstützen NUR die häufigsten
+                # LH-Patterns: FREQ=DAILY/WEEKLY, optional INTERVAL, COUNT,
+                # UNTIL, BYDAY. Komplexere Rules (BYMONTHDAY/BYSETPOS/EXDATE)
+                # werden ignoriert — Master-Event bleibt erhalten, Expansions
+                # fehlen dann (User sieht zumindest den Master-Termin).
+                rr = {}
+                for part in v.split(';'):
+                    if '=' in part:
+                        rk, _, rv = part.partition('=')
+                        rr[rk.strip().upper()] = rv.strip()
+                if rr:
+                    current['_rrule'] = rr
+
+    # ── RRULE-Expansion (W14-Fix, 2026-06-01) ─────────────────────────
+    # Nach VEVENT-Sammlung jeden Master mit _rrule expandieren. Hard-Limits:
+    # · max 366 Tage Lookahead vom Master-DTSTART (1 Jahr — entspricht ~52
+    #   wöchentlichen Standby-Slots, mehr braucht kein Steuer-Report)
+    # · max 100 Expansions pro Master-Event (Memory-Schutz, ungewöhnlich
+    #   große Recurrences cappen)
+    # · max 1000 Expansions total über alle Master-Events
+    def _expand_rrule(master):
+        rr = master.get('_rrule') or {}
+        freq = (rr.get('FREQ') or '').upper()
+        if freq not in ('DAILY', 'WEEKLY'):
+            return []  # MONTHLY/YEARLY/etc nicht unterstützt
+        # Master-DTSTART → date
+        start_bucket = master.get('start')
+        if not start_bucket or not re.match(r'^\d{4}-\d{2}-\d{2}$', start_bucket):
+            return []
         try:
-            with open(p) as f: existing = json.load(f) or {}
-        except Exception: pass
-        existing['calendar_feed'] = {'url': url, 'events': events[:300],
-                                      'imported_at': datetime.now().isoformat()}
-        with open(p, 'w') as f: json.dump(existing, f)
+            base_date = datetime.strptime(start_bucket, '%Y-%m-%d').date()
+        except Exception:
+            return []
+        try:
+            interval = max(1, int(rr.get('INTERVAL', '1')))
+        except Exception:
+            interval = 1
+        try:
+            count_cap = int(rr.get('COUNT', '0')) or 100
+        except Exception:
+            count_cap = 100
+        count_cap = min(count_cap, 100)
+        # UNTIL: ICS-Format 20260601T235959Z oder 20260601
+        until_date = None
+        u = (rr.get('UNTIL') or '').strip()
+        if u:
+            udigits = re.sub(r'\D', '', u)[:8]
+            if len(udigits) == 8:
+                try:
+                    until_date = datetime.strptime(udigits, '%Y%m%d').date()
+                except Exception:
+                    until_date = None
+        # 366-day hard cap auch wenn UNTIL fehlt
+        max_lookahead = base_date.replace(year=base_date.year + 1) \
+            if (base_date.month, base_date.day) != (2, 29) else base_date
+        if until_date and until_date < max_lookahead:
+            max_lookahead = until_date
+        # BYDAY: SU,MO,TU,WE,TH,FR,SA (RFC-5545)
+        weekday_map = {'MO': 0, 'TU': 1, 'WE': 2, 'TH': 3, 'FR': 4, 'SA': 5, 'SU': 6}
+        byday = []
+        if rr.get('BYDAY'):
+            for d in rr['BYDAY'].split(','):
+                d = d.strip().upper()
+                # Strip BYDAY position prefixes (z.B. "1MO" für ersten Montag)
+                d_clean = re.sub(r'^[+-]?\d+', '', d)
+                if d_clean in weekday_map:
+                    byday.append(weekday_map[d_clean])
+        expansions = []
+        # Step-Size: DAILY = interval Tage, WEEKLY = interval Wochen (7*interval Tage)
+        if freq == 'DAILY':
+            step_days = interval
+        else:
+            step_days = 7 * interval
+        from datetime import timedelta as _td
+        # WEEKLY+BYDAY: iteriere wochenweise + emit für jeden BYDAY-Wochentag
+        if freq == 'WEEKLY' and byday:
+            # Anchor: Wochenstart des Master-Datums (Montag = 0)
+            week_anchor = base_date - _td(days=base_date.weekday())
+            week_idx = 0
+            while len(expansions) < count_cap:
+                cur_week_start = week_anchor + _td(weeks=week_idx * interval)
+                if cur_week_start > max_lookahead:
+                    break
+                for wd in sorted(byday):
+                    occ = cur_week_start + _td(days=wd)
+                    if occ <= base_date:
+                        continue  # Master-Date selbst ist schon im events[]
+                    if occ > max_lookahead:
+                        break
+                    expansions.append(occ)
+                    if len(expansions) >= count_cap:
+                        break
+                week_idx += 1
+                if week_idx > 100:
+                    break  # belt+suspenders
+        else:
+            # DAILY oder WEEKLY ohne BYDAY: linearer Step ab base_date
+            cur = base_date + _td(days=step_days)
+            iters = 0
+            while cur <= max_lookahead and len(expansions) < count_cap and iters < 500:
+                expansions.append(cur)
+                cur = cur + _td(days=step_days)
+                iters += 1
+        # Convert occurrence-dates → event-dicts (klonen Master ohne _rrule)
+        out = []
+        for occ_date in expansions:
+            occ_iso = occ_date.strftime('%Y-%m-%d')
+            clone = {k: v for k, v in master.items()
+                     if k not in ('_rrule', 'start_iso', 'end_iso')}
+            clone['start'] = occ_iso
+            clone['end'] = occ_iso
+            clone['_recurrence_of'] = start_bucket
+            out.append(clone)
+        return out
+
+    expanded = []
+    total_cap = 1000
+    for ev in events:
+        if not ev.get('_rrule'):
+            continue
+        try:
+            new_evs = _expand_rrule(ev)
+        except Exception as _exc:
+            app.logger.warning(f'[ics] rrule_expand_fail: {type(_exc).__name__}: {str(_exc)[:80]}')
+            new_evs = []
+        if not new_evs:
+            continue
+        room = total_cap - len(expanded)
+        if room <= 0:
+            break
+        expanded.extend(new_evs[:room])
+    # Master-Events behalten _rrule-Marker NICHT (Output-clean)
+    for ev in events:
+        ev.pop('_rrule', None)
+    events.extend(expanded)
+    # Save Events — über _profile_save routen, damit calendar_feed in SB
+    # (metadata-jsonb) landet und Cloud-Run-Redeploy überlebt.
+    feed_obj = {'url': url, 'events': events[:300],
+                'imported_at': datetime.now().isoformat()}
+    try:
+        disk_full = dict(_profile_load_from_disk(token) or {})
+        disk_full['token'] = token
+        profile = dict(disk_full.get('profile') or {})
+        profile['calendar_feed'] = feed_obj
+        disk_full['profile'] = profile
+        # Backwards-compat: top-level calendar_feed bleibt für alte Reader.
+        disk_full['calendar_feed'] = feed_obj
+        disk_full['_updated_at'] = datetime.now().isoformat()
+        _profile_save(token, profile, full_disk_payload=disk_full)
     except Exception:
         pass
 
@@ -13335,11 +13699,22 @@ def upload_calendar_events(token):
         try:
             with open(p) as f: existing = json.load(f) or {}
         except Exception: pass
-        existing['calendar_feed'] = {
+        feed_obj_ios = {
             'source': 'ios_ekeventstore', 'events': events[:300],
             'imported_at': datetime.now().isoformat(),
         }
-        with open(p, 'w') as f: json.dump(existing, f)
+        existing['calendar_feed'] = feed_obj_ios
+        # Persist über _profile_save (SB metadata + disk) — siehe import_calendar_feed.
+        try:
+            disk_full = dict(existing)
+            disk_full['token'] = token
+            profile = dict(disk_full.get('profile') or {})
+            profile['calendar_feed'] = feed_obj_ios
+            disk_full['profile'] = profile
+            disk_full['_updated_at'] = datetime.now().isoformat()
+            _profile_save(token, profile, full_disk_payload=disk_full)
+        except Exception:
+            with open(p, 'w') as f: json.dump(existing, f)
     except Exception:
         pass
     # Briefing-Map befüllen — gleicher Pfad wie ICS-Import
@@ -13392,20 +13767,25 @@ def set_subscription(token):
     tier = (body.get('tier') or 'free').lower()
     if tier not in ('free', 'lite', 'standard', 'standard_plus', 'premium', 'lifelong'):
         return jsonify({'ok': False, 'error': 'invalid_tier'}), 400
-    p = _user_profile_path(token)
-    try:
-        existing = {}
-        try:
-            with open(p) as f: existing = json.load(f) or {}
-        except Exception: pass
-        existing['subscription'] = {
-            'tier': tier, 'active': tier != 'free',
-            'started_at': datetime.now().isoformat(),
-            'valid_until': (datetime.now() + timedelta(days=365)).isoformat(),
-        }
-        with open(p, 'w') as f: json.dump(existing, f)
-    except Exception:
-        pass
+    # W18-Hardening (2026-06-01): durch _profile_save routen, damit subscription
+    # in der Supabase-Spalte metadata.subscription landet (vorher: nur disk →
+    # bei Cloud-Run-Redeploy weg). _profile_save spiegelt subscription über
+    # die _PROFILE_KNOWN_COLS-Whitelist hinweg in metadata-jsonb.
+    sub_obj = {
+        'tier': tier, 'active': tier != 'free',
+        'started_at': datetime.now().isoformat(),
+        'valid_until': (datetime.now() + timedelta(days=365)).isoformat(),
+    }
+    disk_full = dict(_profile_load_from_disk(token) or {})
+    disk_full['token'] = token
+    profile = dict(disk_full.get('profile') or {})
+    profile['subscription'] = sub_obj
+    disk_full['profile'] = profile
+    # Backwards-compat: subscription bleibt parallel als top-level disk-Key
+    # (alte Reader greifen über existing['subscription'] zu).
+    disk_full['subscription'] = sub_obj
+    disk_full['_updated_at'] = datetime.now().isoformat()
+    _profile_save(token, profile, full_disk_payload=disk_full)
     return jsonify({'ok': True, 'tier': tier})
 
 
@@ -20038,7 +20418,13 @@ def _opus_classify_structured_days_v6(structured_days, se_summary, year=2025, ho
 
     days_json = json.dumps(days, ensure_ascii=False, default=str)
 
-    prompt = f"""Du bist erfahrener Werbungskosten-Klassifikator für Lufthansa-Kabinenpersonal (Homebase {homebase}, {year}).
+    # Worker-H Polish (2026-06-01): System-Prompt = STATIC (Klassifikations-
+    # Regeln + Wissensbuch). User-Prompt = DYNAMIC (Z77/days_json/feedback).
+    # Bei Cache-Hit (gleicher year+homebase + unverändertes Wissensbuch)
+    # ~30k Chars Wissensbuch werden aus Cache geliefert → ~85% Token-Save.
+    # Cache-TTL ist 5min; bei 1 Job mit mehreren Opus-Calls in Folge greift
+    # der Cache zuverlässig. Single-Job-Loads bleiben gleich teuer (1 miss).
+    system_prompt = f"""Du bist erfahrener Werbungskosten-Klassifikator für Lufthansa-Kabinenpersonal (Homebase {homebase}, {year}).
 
 ═════ DU BEKOMMST STRUKTURIERTE TAGESDATEN — KEINE PDFs! ═══════════════════
 
@@ -20072,16 +20458,22 @@ Bei activity_type=mixed_handover_sameday:
     (von Vortag-Tour). Same-Day-Komponente in der begruendung erwähnen,
     aber kein zusätzliches Z72 (Tag hat bereits VMA aus Tour-Abreise).
 
-═════ KONTEXT ═══════════════════════════════════════════════════════════════
+═════ WISSENS-BUCH (Decision-Tree, Anti-Pattern, EStG-Bezug) ════════════════
+
+{wissensbuch[:30000]}
+
+WICHTIG:
+- Konsistenz mit Lese-Fakten ist PFLICHT (Z72 nur wenn overnight=false UND
+  has_fl=false; Z73 nur wenn layover_inland=true; Z76 nur wenn layover_inland=false)
+- Bei Mehrtages-Schulungen: erste+letzte Tag als Z73, mittlere als Office
+- Bei Multi-Stop-Touren: jeden Tag einzeln nach layover_ort klassifizieren"""
+
+    user_prompt = f"""═════ KONTEXT ═══════════════════════════════════════════════════════════════
 
 Z77 (LH stfrei gezahlt): {z77:.2f}€
 Auslandsspesen-SE:        {auslandsspesen_se:.2f}€
 
 Z76-Plausibilität: ähnlich Auslandsspesen-SE ±30%.
-
-═════ WISSENS-BUCH (Decision-Tree, Anti-Pattern, EStG-Bezug) ════════════════
-
-{wissensbuch[:30000]}
 
 ═════ TAGESDATEN ════════════════════════════════════════════════════════════
 
@@ -20093,29 +20485,27 @@ Liefere via Tool 'submit_v6_classifications':
 1. classifications: pro Tag mit Aktivität (Tour/Office/Standby/Schulung) ein
    Eintrag mit datum + klass + begruendung
 2. nachweis: monatliche Zusammenfassung
-3. unklare_tage: Tage die nicht eindeutig waren
-
-WICHTIG:
-- Konsistenz mit Lese-Fakten ist PFLICHT (Z72 nur wenn overnight=false UND
-  has_fl=false; Z73 nur wenn layover_inland=true; Z76 nur wenn layover_inland=false)
-- Bei Mehrtages-Schulungen: erste+letzte Tag als Z73, mittlere als Office
-- Bei Multi-Stop-Touren: jeden Tag einzeln nach layover_ort klassifizieren"""
+3. unklare_tage: Tage die nicht eindeutig waren"""
 
     if feedback and feedback.get('issues'):
-        prompt += "\n\n═════ KORREKTUR-AUFTRAG aus Self-Reflection ═════\n"
+        user_prompt += "\n\n═════ KORREKTUR-AUFTRAG aus Self-Reflection ═════\n"
         for iss in feedback['issues']:
-            prompt += f"  • {iss}\n"
-        prompt += "\nKorrigiere die spezifischen Probleme. Behalte konsistente Lese-Fakten."
+            user_prompt += f"  • {iss}\n"
+        user_prompt += "\nKorrigiere die spezifischen Probleme. Behalte konsistente Lese-Fakten."
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=300.0)
     import time as _t
     start = _t.time()
     try:
+        # System-Prompt mit cache_control=ephemeral. Dynamic-Teil bleibt in user-msg.
+        system_block = [{'type': 'text', 'text': system_prompt,
+                          'cache_control': {'type': 'ephemeral'}}]
         resp = client.messages.create(
             model='claude-opus-4-7', max_tokens=12000,
             tools=[classify_tool],
             tool_choice={'type': 'tool', 'name': 'submit_v6_classifications'},
-            messages=[{'role': 'user', 'content': prompt}]
+            system=system_block,
+            messages=[{'role': 'user', 'content': user_prompt}]
         )
         elapsed = _t.time() - start
         tool_input = None
