@@ -67,6 +67,14 @@ app = Flask(__name__)
 # durch Cloud-Run-Edge gecapped, plus JSON-Overhead). Bei größerem Body: 413.
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
+# Worker-P1 Blueprint-Wiring: Live ADS-B Aircraft Tracking (OpenSky-Network)
+try:
+    from blueprints.adsb_blueprint import adsb_bp
+    app.register_blueprint(adsb_bp)
+except Exception as _e:
+    # Don't crash on missing blueprint dir during local dev/tests
+    pass
+
 # ── Logging-Level Boot-Setup ───────────────────────────────────────
 # Backend-Ops-Audit 2026-05-31: Flask/gunicorn default ist WARNING — d.h.
 # alle 47 app.logger.info(...) Calls (z.B. "[auth-reset] mail sent",
