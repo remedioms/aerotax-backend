@@ -1,21 +1,14 @@
 -- ────────────────────────────────────────────────────────────────────────
 -- AEROTAX/AERIS — Konsolidierte Migrations für Supabase Dashboard
--- Stand: 2026-06-01
--- 
--- Anleitung:
--- 1. Supabase Dashboard öffnen: https://app.supabase.com/project/jyrbijvmwacuivssbxlg
--- 2. SQL Editor → New query
--- 3. KOMPLETTEN Inhalt dieser Datei einfügen + Run
--- 4. Erfolg prüfen: alle Tabellen erscheinen unter Table Editor
+-- Stand: 2026-06-01 (Update: 7 neue Pro-Feature-Tabellen)
 --
--- Idempotent: alle CREATE TABLE/INDEX nutzen IF NOT EXISTS,
--- ein zweiter Run macht keinen Schaden.
+-- Anleitung:
+-- 1. https://app.supabase.com/project/jyrbijvmwacuivssbxlg → SQL Editor → New query
+-- 2. KOMPLETTEN Inhalt einfügen + Run
+-- 3. Idempotent (CREATE TABLE IF NOT EXISTS) — zweiter Run schadet nicht
 -- ────────────────────────────────────────────────────────────────────────
 
-
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║ Block 1/4 — user_profiles + user_friends + user_push_tokens         ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ╔════════ Block 1/7 — user_profiles + user_friends + user_push_tokens ════════╗
 -- User-Daten in Supabase persistieren (P0-Fix Phase 2): Profile + Friends +
 -- Push-Tokens. Vorher lebten profile_<token>.json, friends_<token>.json,
 -- push_<token>.json auf Container-ephemeral-disk und verschwanden bei jedem
@@ -80,10 +73,7 @@ create index if not exists idx_push_expo on public.user_push_tokens(expo_token) 
 create index if not exists idx_push_apns on public.user_push_tokens(apns_token) where apns_token is not null;
 alter table public.user_push_tokens enable row level security;
 
-
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║ Block 2/4 — Wall + Forum + DM (Posts/Threads/Replies/Likes/...)     ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ╔════════ Block 2/7 — Wall + Forum + DM (Posts/Threads/Likes/...)  ══════════╗
 -- Social-Persistenz in Supabase: Wall-Posts, Forum-Threads/Replies, DM-Messages.
 -- Vorher lebten alle drei in ephemeral disk-Files unter _USER_HISTORY_DIR (wall/
 -- posts.json, forum/threads.json + replies_<id>.json, chat/<channel>.json).
@@ -215,10 +205,7 @@ create index if not exists idx_dm_lastseen_user
     on public.dm_lastseen(user_token);
 alter table public.dm_lastseen enable row level security;
 
-
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║ Block 3/4 — Layover Reviews (5-Kategorie Sterne)                    ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ╔════════ Block 3/7 — Layover Reviews (5-Kategorie Sterne) ══════════════════╗
 -- Layover-Reviews (Worker P6, 2026-06-01).
 -- Sterne-Ratings pro (iata, user_token, category) — User darf in jeder
 -- Kategorie genau ein Rating pro Airport abgeben. Re-Bewertung = Upsert.
@@ -248,10 +235,7 @@ create index if not exists idx_layover_reviews_iata_cat
     on public.layover_reviews(iata, category);
 alter table public.layover_reviews enable row level security;
 
-
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║ Block 4/4 — Friend Groups                                            ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ╔════════ Block 4/7 — Friend Groups ═════════════════════════════════════════╗
 -- Friend-Groups in Supabase persistieren (Worker-H Polish, 2026-06-01).
 -- Vorher lebten groups[] nur im disk-File friends_<token>.json — die SB-
 -- Migration der Friends in 20260531_user_data.sql hat groups bewusst nicht
@@ -276,7 +260,231 @@ create index if not exists idx_user_friend_groups_owner
     on public.user_friend_groups(owner_token);
 alter table public.user_friend_groups enable row level security;
 
+-- ╔════════ Block 5/7 — License/Recurrent/Medical Wallet (Worker P4) ══════════╗
+-- License-Wallet cross-device-sync (Worker P4, 2026-06-01).
+-- Persistiert die iOS LicenseItem-SwiftData-Models in Supabase damit der
+-- gleiche User auf einem zweiten Gerät (oder nach Reinstall) seine Wallet
+-- wieder bekommt. Disk-Fallback (licenses_<token>.json) übernimmt wenn SB
+-- down ist — Schema spiegelt deshalb 1:1 die iOS-Item-Felder.
+--
+-- Schema-Entscheidungen:
+--  · PK auf item-id (UUID-Text) — iOS generiert die UUID lokal, beim Sync
+--    landet sie unverändert in der Tabelle. Bei Mehrgerät-Konflikt gewinnt
+--    Last-Writer (updated_at).
+--  · user_token getrennt indiziert, weil die häufigste Query
+--    "list all items for token, deleted=false" ist.
+--  · category als CHECK statt enum-Tabelle — die Liste ändert sich selten,
+--    iOS-LicenseCategory.rawValue ist das single-source-of-truth.
+--  · item_type als freier text — iOS LicenseItemType wächst mit neuen Lizenz-
+--    Klassen (z.B. neue Type-Ratings); ein DB-Constraint hier wäre ein
+--    Deploy-Blocker bei jeder neuen Konstante.
+--  · photo_blob_id als text (Referenz auf separates Storage, falls je
+--    server-side Photo-Upload kommt). Aktuell bleibt das Foto AES-GCM
+--    verschlüsselt nur auf dem Device — der Server sieht den Cipher-Blob
+--    bewusst NICHT (Privacy-by-default).
+--  · custom_notes als text — der User kann hier Klartext eintippen; das ist
+--    persönlich, RLS verhindert Cross-User-Access.
+--  · alert_window_days als jsonb mit Default [90,60,30,7] passend zum
+--    iOS-Default in LicenseItem.swift.
+--  · deleted als boolean für Soft-Delete — App-Side filtert deleted=false,
+--    Sync-Kollisionen können so noch erkannt werden ohne Hard-Delete.
+--  · metadata jsonb als Catch-all für Felder die zukünftig vom Client
+--    geschickt werden ohne dass die Tabelle migriert werden muss
+--    (issuing_authority-Codes, Revalidation-Daten, etc.).
+create table if not exists public.user_licenses (
+    id                  text         primary key,
+    user_token          text         not null,
+    category            text         not null,
+    item_type           text         not null,
+    label               text,
+    issue_date          date,
+    expiry_date         date,
+    issuing_authority   text,
+    document_number     text,
+    photo_blob_id       text,
+    custom_notes        text,
+    alert_window_days   jsonb        not null default '[90,60,30,7]'::jsonb,
+    deleted             boolean      not null default false,
+    metadata            jsonb        not null default '{}'::jsonb,
+    created_at          timestamptz  not null default now(),
+    updated_at          timestamptz  not null default now(),
+    check (category in ('cockpit', 'cabin', 'general'))
+);
+
+-- Häufigste Query: "alle nicht-gelöschten Items für diesen User-Token".
+create index if not exists idx_user_licenses_token
+    on public.user_licenses(user_token) where deleted = false;
+
+-- Sekundär-Query (Notification-Scheduler, Aggregat-Statistik): items die
+-- in den nächsten N Tagen ablaufen.
+create index if not exists idx_user_licenses_expiry
+    on public.user_licenses(expiry_date) where deleted = false;
+
+alter table public.user_licenses enable row level security;
+
+-- ╔════════ Block 6/7 — Crew-Network-Graph (Worker P6a) ═══════════════════════╗
+-- Worker-P6a Crew-Graph Edges — Server-side aggregation of "who-flew-with-whom".
+--
+-- Pendant zur iOS-CrewGraphEdge (SwiftData @Model). Lokal auf dem Device gilt
+-- das Privacy-by-Default-Modell: Klarnamen werden NICHT gespeichert, nur
+-- otherShortName ("Schumann M.") + opaker otherToken. Server-side spiegeln wir
+-- exakt dasselbe Modell, plus eine `other_id` Spalte die als stabiler Composite-
+-- Key-Part dient (otherToken wenn App-User, sonst sha256(self_token+shortname)
+-- truncated — siehe blueprint).
+--
+-- Composite-PK statt einzelne id: pro (self_token, other_id) gibt es genau eine
+-- Edge — verhindert Race-induzierte Duplikate. Counter-Increment läuft
+-- entweder via RPC (atomic update) oder SELECT-then-UPSERT-fallback in der App.
+--
+-- shared_layovers/shared_routes sind jsonb-Arrays (max 20 Einträge, capped im
+-- Blueprint), nicht 1:N Tabellen — Cross-Edge-Queries auf Layover gibt es nicht,
+-- und ein Edge-Read fasst beide atomar an.
+
+create table if not exists public.crew_edges (
+    self_token          text         not null,
+    other_id            text         not null,
+    other_token         text,
+    other_display_name  text,
+    other_position      text,
+    tour_count          int          not null default 1,
+    last_flown_date     date,
+    shared_layovers     jsonb        not null default '[]'::jsonb,
+    shared_routes       jsonb        not null default '[]'::jsonb,
+    created_at          timestamptz  not null default now(),
+    updated_at          timestamptz  not null default now(),
+    primary key (self_token, other_id)
+);
+
+-- Hot-path: "Top-N strongest connections for me" sortiert nach tour_count desc.
+create index if not exists idx_crew_edges_self
+    on public.crew_edges(self_token, tour_count desc);
+
+-- Reverse-Lookup: "ist <other_token> bekannt im Graph?" Bei NULL otherToken
+-- (= nicht-App-User, nur shortname-hash) kein Sinn — partial index.
+create index if not exists idx_crew_edges_other_token
+    on public.crew_edges(other_token) where other_token is not null;
+
+-- Service-Role-Key umgeht RLS. Anon-Client bleibt geblockt (kein Read/Write).
+alter table public.crew_edges enable row level security;
+
+-- Atomic-Counter-RPC (optional, blueprint nutzt SELECT-then-UPSERT als Fallback
+-- wenn die RPC nicht existiert). Inkrementiert tour_count und merged die jsonb-
+-- Arrays atomar in einer Transaction. Bei Race kein Doppel-Insert dank
+-- ON CONFLICT.
+create or replace function public.crew_edges_upsert_increment(
+    p_self_token          text,
+    p_other_id            text,
+    p_other_token         text,
+    p_other_display_name  text,
+    p_other_position      text,
+    p_tour_date           date,
+    p_new_layovers        jsonb,
+    p_new_routes          jsonb
+) returns void
+language plpgsql
+as $$
+begin
+    insert into public.crew_edges (
+        self_token, other_id, other_token, other_display_name, other_position,
+        tour_count, last_flown_date, shared_layovers, shared_routes
+    ) values (
+        p_self_token, p_other_id, p_other_token, p_other_display_name,
+        coalesce(p_other_position, ''),
+        1, p_tour_date,
+        coalesce(p_new_layovers, '[]'::jsonb),
+        coalesce(p_new_routes,   '[]'::jsonb)
+    )
+    on conflict (self_token, other_id) do update
+    set tour_count          = public.crew_edges.tour_count + 1,
+        other_token         = coalesce(excluded.other_token, public.crew_edges.other_token),
+        other_display_name  = coalesce(excluded.other_display_name, public.crew_edges.other_display_name),
+        other_position      = coalesce(nullif(excluded.other_position, ''), public.crew_edges.other_position),
+        last_flown_date     = greatest(
+                                  coalesce(excluded.last_flown_date, public.crew_edges.last_flown_date),
+                                  coalesce(public.crew_edges.last_flown_date, excluded.last_flown_date)
+                              ),
+        shared_layovers     = (
+            select coalesce(jsonb_agg(distinct val), '[]'::jsonb)
+            from (
+                select val from jsonb_array_elements_text(public.crew_edges.shared_layovers) as val
+                union
+                select val from jsonb_array_elements_text(coalesce(excluded.shared_layovers, '[]'::jsonb)) as val
+            ) merged
+        ),
+        shared_routes       = (
+            select coalesce(jsonb_agg(distinct val), '[]'::jsonb)
+            from (
+                select val from jsonb_array_elements_text(public.crew_edges.shared_routes) as val
+                union
+                select val from jsonb_array_elements_text(coalesce(excluded.shared_routes, '[]'::jsonb)) as val
+            ) merged
+        ),
+        updated_at          = now();
+end;
+$$;
+
+-- ╔════════ Block 7/7 — Trip-Trade Board (Worker P6b) ═════════════════════════╗
+-- Trip-Trade Board (Worker P6b, 2026-06-01).
+-- Open-Time / Swap / Pickup-Marketplace für Crew-Touren.
+--
+-- Schema-Entscheidungen:
+--  · trade_posts.id als text-PK (UUID-string vom Backend generiert) statt
+--    bigserial — passt zu unserer Token-Welt + leichter idempotent zu handeln.
+--  · soft-delete via deleted-Boolean statt DELETE-Row → Audit-Spur bleibt,
+--    Author-Side kann sehen welche Posts er zurückgezogen hat.
+--  · status open|in_negotiation|closed als text statt enum-Type — Migrations
+--    bei zusätzlichen Status sind einfacher (kein ALTER TYPE).
+--  · swap_or_dump = 'swap' | 'dump' | 'pickup'. Default 'swap' weil das der
+--    häufigste Use-Case ist.
+--  · Partial-Index `WHERE deleted=false AND status='open'` weil das Board
+--    nur diese Posts listet — Index ist kompakt und Query selektiv.
+--  · trade_interests separat (1:N): ein Post kann viele Interessenten haben.
+--    Self-Interest wird im Backend geblockt (Self-Trade-Prevention), nicht
+--    via DB-Constraint, weil der Author-Token nicht denormalisiert ist.
+create table if not exists public.trade_posts (
+    id                     text         primary key,
+    author_token           text         not null,
+    author_short_name      text,
+    position               text,
+    base                   text,
+    airline                text,
+    tour_start_date        date         not null,
+    tour_end_date          date,
+    routing                text,
+    swap_or_dump           text         not null default 'swap',
+    compensation_offered   text,
+    qualification_required text,
+    message                text,
+    status                 text         not null default 'open',
+    deleted                boolean      not null default false,
+    created_at             timestamptz  not null default now(),
+    updated_at             timestamptz  not null default now()
+);
+
+create index if not exists idx_trade_posts_filter
+    on public.trade_posts(airline, base, tour_start_date)
+    where deleted = false and status = 'open';
+
+create index if not exists idx_trade_posts_author
+    on public.trade_posts(author_token);
+
+create table if not exists public.trade_interests (
+    id                text         primary key,
+    post_id           text         not null,
+    interested_token  text         not null,
+    message           text,
+    created_at        timestamptz  not null default now()
+);
+
+create index if not exists idx_trade_interests_post
+    on public.trade_interests(post_id);
+
+create index if not exists idx_trade_interests_token
+    on public.trade_interests(interested_token);
+
+alter table public.trade_posts enable row level security;
+alter table public.trade_interests enable row level security;
 
 -- ────────────────────────────────────────────────────────────────────────
--- ENDE — wenn keine Errors: alle 4 Blöcke wurden angelegt
+-- ENDE — wenn keine Errors: alle 7 Blöcke angelegt
 -- ────────────────────────────────────────────────────────────────────────

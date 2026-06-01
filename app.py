@@ -67,13 +67,25 @@ app = Flask(__name__)
 # durch Cloud-Run-Edge gecapped, plus JSON-Overhead). Bei größerem Body: 413.
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-# Worker-P1 Blueprint-Wiring: Live ADS-B Aircraft Tracking (OpenSky-Network)
-try:
-    from blueprints.adsb_blueprint import adsb_bp
-    app.register_blueprint(adsb_bp)
-except Exception as _e:
-    # Don't crash on missing blueprint dir during local dev/tests
-    pass
+# Worker-P1..P6 Blueprint-Wiring (soft-fail je Blueprint, damit ein einzelner
+# Import-Fehler nicht das ganze Backend killt):
+#   P1 adsb              — Live ADS-B Aircraft Tracking (OpenSky-Network)
+#   P4 license_wallet    — Cross-Device Sync für Lizenz-/Recurrent-/Medical-Wallet
+#   P5 news              — Multi-Source Aviation-News-Aggregator (feedparser+AvHerald)
+#   P6a crew_graph       — Crew-Network-Graph (wer-mit-wem)
+#   P6b trip_trade       — Open-Time Trip-Trade Board
+for _bp_path, _bp_name in [
+    ('blueprints.adsb_blueprint',          'adsb_bp'),
+    ('blueprints.license_wallet_blueprint','license_wallet_bp'),
+    ('blueprints.news_blueprint',          'news_bp'),
+    ('blueprints.crew_graph_blueprint',    'crew_graph_bp'),
+    ('blueprints.trip_trade_blueprint',    'trip_trade_bp'),
+]:
+    try:
+        _mod = __import__(_bp_path, fromlist=[_bp_name])
+        app.register_blueprint(getattr(_mod, _bp_name))
+    except Exception as _e:
+        app.logger.warning(f'[boot] blueprint-register-skip {_bp_path}: {type(_e).__name__}: {str(_e)[:120]}')
 
 # ── Logging-Level Boot-Setup ───────────────────────────────────────
 # Backend-Ops-Audit 2026-05-31: Flask/gunicorn default ist WARNING — d.h.
