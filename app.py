@@ -9473,6 +9473,228 @@ def get_notams(icao):
         return jsonify({'icao': icao, 'notams': [], 'error': 'notam_unavailable'}), 502
 
 
+# ─── IATA → ICAO Mapping für METAR-Lookup ───────────────────────────────────
+# Tabelle der wichtigsten LH-/Crew-Destinationen + DACH-Bases. Für IATAs, die
+# hier fehlen, gibt's `/api/weather/metar/<iata>` ein 404 mit Status, statt
+# einer falschen Konversion. Volle Airport-DB liegt im iOS-Client (8800 IATAs);
+# Backend hält nur die gängigen Crew-Routen.
+_IATA_TO_ICAO = {
+    # DACH Homebases
+    'FRA': 'EDDF', 'MUC': 'EDDM', 'DUS': 'EDDL', 'HAM': 'EDDH',
+    'TXL': 'EDDT', 'BER': 'EDDB', 'STR': 'EDDS', 'CGN': 'EDDK',
+    'HAJ': 'EDDV', 'NUE': 'EDDN', 'LEJ': 'EDDP', 'BRE': 'EDDW',
+    'VIE': 'LOWW', 'ZRH': 'LSZH', 'GVA': 'LSGG', 'SZG': 'LOWS',
+    'INN': 'LOWI', 'BSL': 'LFSB', 'BRN': 'LSZB',
+    # Europa
+    'LHR': 'EGLL', 'LGW': 'EGKK', 'LCY': 'EGLC', 'MAN': 'EGCC',
+    'CDG': 'LFPG', 'ORY': 'LFPO', 'NCE': 'LFMN', 'LYS': 'LFLL',
+    'MAD': 'LEMD', 'BCN': 'LEBL', 'PMI': 'LEPA', 'LPA': 'GCLP',
+    'FCO': 'LIRF', 'MXP': 'LIMC', 'LIN': 'LIML', 'VCE': 'LIPZ',
+    'BLQ': 'LIPE', 'NAP': 'LIRN', 'CTA': 'LICC',
+    'AMS': 'EHAM', 'BRU': 'EBBR', 'CPH': 'EKCH', 'OSL': 'ENGM',
+    'ARN': 'ESSA', 'HEL': 'EFHK', 'KEF': 'BIKF', 'DUB': 'EIDW',
+    'WAW': 'EPWA', 'PRG': 'LKPR', 'BUD': 'LHBP', 'OTP': 'LROP',
+    'SOF': 'LBSF', 'ATH': 'LGAV', 'IST': 'LTFM', 'SAW': 'LTFJ',
+    'LIS': 'LPPT', 'OPO': 'LPPR', 'FNC': 'LPMA',
+    'KEF': 'BIKF', 'TLV': 'LLBG',
+    # Naher Osten
+    'DXB': 'OMDB', 'DWC': 'OMDW', 'AUH': 'OMAA', 'DOH': 'OTHH',
+    'JED': 'OEJN', 'RUH': 'OERK', 'BAH': 'OBBI', 'KWI': 'OKBK',
+    'MCT': 'OOMS', 'CAI': 'HECA', 'AMM': 'OJAI',
+    # Nordamerika
+    'JFK': 'KJFK', 'EWR': 'KEWR', 'LGA': 'KLGA', 'BOS': 'KBOS',
+    'IAD': 'KIAD', 'DCA': 'KDCA', 'BWI': 'KBWI',
+    'ORD': 'KORD', 'ATL': 'KATL', 'MIA': 'KMIA', 'MCO': 'KMCO',
+    'FLL': 'KFLL', 'TPA': 'KTPA',
+    'LAX': 'KLAX', 'SFO': 'KSFO', 'SEA': 'KSEA', 'PDX': 'KPDX',
+    'DEN': 'KDEN', 'IAH': 'KIAH', 'DFW': 'KDFW', 'PHX': 'KPHX',
+    'LAS': 'KLAS', 'SAN': 'KSAN', 'CLT': 'KCLT', 'DTW': 'KDTW',
+    'YYZ': 'CYYZ', 'YVR': 'CYVR', 'YUL': 'CYUL', 'YYC': 'CYYC',
+    'MEX': 'MMMX', 'CUN': 'MMUN', 'HAV': 'MUHA',
+    # Asien
+    'NRT': 'RJAA', 'HND': 'RJTT', 'KIX': 'RJBB', 'NGO': 'RJGG',
+    'ICN': 'RKSI', 'GMP': 'RKSS', 'PEK': 'ZBAA', 'PKX': 'ZBAD',
+    'PVG': 'ZSPD', 'SHA': 'ZSSS', 'CAN': 'ZGGG', 'CTU': 'ZUUU',
+    'HKG': 'VHHH', 'TPE': 'RCTP', 'SIN': 'WSSS', 'KUL': 'WMKK',
+    'BKK': 'VTBS', 'DMK': 'VTBD', 'HKT': 'VTSP', 'CGK': 'WIII',
+    'DPS': 'WADD', 'MNL': 'RPLL', 'DEL': 'VIDP', 'BOM': 'VABB',
+    'MAA': 'VOMM', 'BLR': 'VOBL', 'HYD': 'VOHS', 'CCU': 'VECC',
+    # Südamerika
+    'GRU': 'SBGR', 'GIG': 'SBGL', 'EZE': 'SAEZ', 'SCL': 'SCEL',
+    'BOG': 'SKBO', 'LIM': 'SPJC', 'UIO': 'SEQM',
+    # Afrika
+    'JNB': 'FAOR', 'CPT': 'FACT', 'NBO': 'HKJK', 'ADD': 'HAAB',
+    'LOS': 'DNMM', 'CMN': 'GMMN', 'TUN': 'DTTA', 'ALG': 'DAAG',
+    # Australien / Pazifik
+    'SYD': 'YSSY', 'MEL': 'YMML', 'BNE': 'YBBN', 'PER': 'YPPH',
+    'AKL': 'NZAA', 'CHC': 'NZCH', 'NAN': 'NFFN', 'PPT': 'NTAA',
+    # Karibik / Inseln
+    'MLE': 'VRMM', 'SEZ': 'FSIA', 'MRU': 'FIMP', 'TFS': 'GCTS',
+    'ACE': 'GCRR', 'FUE': 'GCFV', 'AYT': 'LTAI', 'HRG': 'HEGN',
+    'SSH': 'HESH', 'RAK': 'GMMX', 'AGA': 'GMAD',
+}
+
+
+def _iata_to_icao(iata):
+    """IATA → ICAO. Returns None wenn unbekannt."""
+    if not iata:
+        return None
+    return _IATA_TO_ICAO.get(iata.strip().upper())
+
+
+def _decode_metar_human(raw, temp_c, wind_kt, wind_dir, visibility_sm, conditions):
+    """Wandelt METAR-Rohdaten in einen kurzen deutschen Klartext um.
+    Beispiel: "12 °C, leichter Wind aus Süd (12 kt), Sicht 10 km, klar"
+    Bewusst defensiv: jeder fehlende Wert wird stillschweigend weggelassen.
+    """
+    parts = []
+    if temp_c is not None:
+        try:
+            parts.append(f"{int(round(float(temp_c)))} °C")
+        except (TypeError, ValueError):
+            pass
+    if wind_kt is not None:
+        try:
+            kt = float(wind_kt)
+            if kt < 7:
+                wind_label = "leichter Wind"
+            elif kt < 17:
+                wind_label = "mäßiger Wind"
+            elif kt < 28:
+                wind_label = "frischer Wind"
+            else:
+                wind_label = "starker Wind"
+            dir_label = ""
+            if wind_dir is not None:
+                try:
+                    deg = int(float(wind_dir))
+                    dirs = ['Nord', 'Nordost', 'Ost', 'Südost',
+                            'Süd', 'Südwest', 'West', 'Nordwest']
+                    idx = int(((deg + 22.5) % 360) // 45)
+                    dir_label = f" aus {dirs[idx]}"
+                except (TypeError, ValueError):
+                    pass
+            parts.append(f"{wind_label}{dir_label} ({int(round(kt))} kt)")
+        except (TypeError, ValueError):
+            pass
+    # Sicht: aviationweather liefert in statute miles (SM) → in km umrechnen
+    if visibility_sm is not None:
+        try:
+            sm = float(visibility_sm)
+            km = sm * 1.609
+            if km >= 10:
+                parts.append("Sicht > 10 km")
+            else:
+                parts.append(f"Sicht {km:.1f} km")
+        except (TypeError, ValueError):
+            pass
+    if conditions:
+        parts.append(str(conditions))
+    elif raw:
+        # Cloud-Layer aus rawOb extrahieren (CLR/SKC/FEW/SCT/BKN/OVC)
+        import re as _re
+        if _re.search(r'\b(CLR|SKC|NSC|CAVOK)\b', raw):
+            parts.append("klar")
+        elif _re.search(r'\bOVC\d{3}\b', raw):
+            parts.append("bedeckt")
+        elif _re.search(r'\bBKN\d{3}\b', raw):
+            parts.append("stark bewölkt")
+        elif _re.search(r'\bSCT\d{3}\b', raw):
+            parts.append("locker bewölkt")
+        elif _re.search(r'\bFEW\d{3}\b', raw):
+            parts.append("leicht bewölkt")
+        if _re.search(r'\b(RA|SHRA|DZ)\b', raw):
+            parts.append("Regen")
+        if _re.search(r'\b(SN|SHSN)\b', raw):
+            parts.append("Schnee")
+        if _re.search(r'\b(TS|TSRA)\b', raw):
+            parts.append("Gewitter")
+        if _re.search(r'\bFG\b', raw):
+            parts.append("Nebel")
+    return ", ".join(parts) if parts else "—"
+
+
+@app.route('/api/weather/metar/<iata>', methods=['GET'])
+def get_metar_by_iata(iata):
+    """METAR-Live-Report für IATA-Code (mit IATA→ICAO Mapping + decoded text).
+    Beispiel: /api/weather/metar/FRA → Frankfurt EDDF METAR.
+    Return-Shape kompatibel zu iOS `MetarReportLive`.
+    Cache: 15 min in-mem.
+    """
+    import re
+    iata_clean = (iata or '').strip().upper()
+    if not re.match(r'^[A-Z]{3}$', iata_clean):
+        return jsonify({'error': 'invalid_iata', 'iata': iata_clean,
+                        'status': 'invalid'}), 400
+    icao = _iata_to_icao(iata_clean)
+    if not icao:
+        return jsonify({'error': 'icao_mapping_missing', 'iata': iata_clean,
+                        'status': 'unknown_airport'}), 404
+
+    cache_key = f'metar_v2:{icao}'
+    cached = _aviation_cache_get(cache_key, 900)
+    if cached is not None:
+        return jsonify(cached)
+
+    try:
+        import urllib.request as ur
+        url = f'https://aviationweather.gov/api/data/metar?ids={icao}&format=json&hours=1'
+        req = ur.Request(url, headers={
+            'User-Agent': 'AeroX/1.0 (aviation-app; +https://aerosteuer.de)',
+            'Accept': 'application/json',
+        })
+        with ur.urlopen(req, timeout=8) as r:
+            raw = json.loads(r.read().decode('utf-8'))
+    except Exception as e:
+        # Silent return None mit Status — iOS zeigt dann kein Wetter, ohne crash.
+        return jsonify({'iata': iata_clean, 'icao': icao,
+                        'status': 'fetch_failed',
+                        'error': str(e)[:120]}), 502
+
+    if not raw:
+        result = {'iata': iata_clean, 'icao': icao, 'status': 'no_data',
+                  'raw': None, 'temp_c': None, 'wind_kt': None,
+                  'visibility_km': None, 'conditions': None,
+                  'time_iso': None, 'decoded': None}
+        _aviation_cache_set(cache_key, result, 900)
+        return jsonify(result)
+
+    first = raw[0] if isinstance(raw, list) else raw
+    raw_ob = first.get('rawOb')
+    temp_c = first.get('temp')
+    wind_kt = first.get('wspd')
+    wind_dir = first.get('wdir')
+    vis_sm = first.get('visib')
+    # `wxString` ist das human-readable Wetter-Phänomen (Rain, Snow, etc.)
+    conditions = first.get('wxString') or first.get('clouds')
+    if isinstance(conditions, list):
+        conditions = ', '.join(str(c) for c in conditions if c)
+    time_iso = first.get('reportTime')
+    visibility_km = None
+    if vis_sm is not None:
+        try:
+            visibility_km = round(float(vis_sm) * 1.609, 1)
+        except (TypeError, ValueError):
+            pass
+    decoded = _decode_metar_human(raw_ob, temp_c, wind_kt, wind_dir,
+                                  vis_sm, conditions)
+    result = {
+        'iata': iata_clean,
+        'icao': icao,
+        'status': 'ok',
+        'raw': raw_ob,
+        'temp_c': temp_c,
+        'wind_kt': wind_kt,
+        'wind_dir': wind_dir,
+        'visibility_km': visibility_km,
+        'conditions': conditions,
+        'time_iso': time_iso,
+        'decoded': decoded,
+    }
+    _aviation_cache_set(cache_key, result, 900)
+    return jsonify(result)
+
+
 # ─── Aviation-News Vollartikel-Proxy (aero.de) ──────────────────────────────
 # RSS-Feed liefert nur kurze <description>-Summaries (~150 chars). Die iOS-Card
 # zeigt jetzt Vollartikel inline → wir fetchen die Article-URL serverseitig,
@@ -10125,6 +10347,112 @@ def list_voice_notes(token):
     return jsonify({'dates': dates, 'count': len(dates)})
 
 
+# ─── Flight-Notes (Per-Day Text-Notes, plain-text, max 500 chars) ───────────
+# Ergänzung zu Voice-Notes — User kann pro Flugtag eine kurze Text-Notiz
+# tippen ("Catering vergessen", "FO neu eingeschult", …). Storage:
+# profile.metadata.flight_notes[datum] = "<text>".
+# Persistenz läuft über die bestehende _profile_load/_profile_save-Pipeline —
+# d.h. SB metadata-jsonb (primary) + Disk (Cache). Damit überlebt der Inhalt
+# Cloud-Run-Redeploys automatisch.
+
+_FLIGHT_NOTE_MAX_CHARS = 500
+_FLIGHT_NOTE_DATUM_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _sanitize_flight_note(raw):
+    """Plain text only — strippt HTML-Tags + Control-Chars, cap auf 500."""
+    if not isinstance(raw, str):
+        return ''
+    # HTML/Tags raus (defensiv — Backend speichert; Frontend rendert plain).
+    s = re.sub(r'<[^>]*>', '', raw)
+    # Control-Chars raus außer \n und \t (Multi-line erlaubt).
+    s = ''.join(c for c in s if c == '\n' or c == '\t' or c.isprintable())
+    s = s.strip()
+    return s[:_FLIGHT_NOTE_MAX_CHARS]
+
+
+@app.route('/api/user/flight-notes/<token>', methods=['GET'])
+def list_flight_notes(token):
+    """Liefert dict {datum: note} für alle Flugtag-Text-Notizen des Users."""
+    if not token:
+        return jsonify({'error': 'invalid token'}), 400
+    try:
+        full = _profile_load(token) or {}
+        prof = full.get('profile') or {}
+        # profile.metadata.flight_notes — _profile_save_to_supabase legt
+        # unknown keys in metadata-jsonb ab, _profile_load_from_supabase
+        # faltet die wieder ins prof-Dict hoch. Daher direkt aus prof.
+        notes = prof.get('flight_notes') or {}
+        if not isinstance(notes, dict):
+            notes = {}
+        return jsonify({'notes': notes, 'count': len(notes)})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+
+@app.route('/api/user/flight-notes/<token>/<datum>', methods=['PUT'])
+def put_flight_note(token, datum):
+    """Speichert/Updated eine Per-Day Text-Notiz. Body: {note: "..."}.
+    Empty-String → Eintrag wird entfernt (User hat Notiz gelöscht).
+    """
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    if not _FLIGHT_NOTE_DATUM_RE.match(datum or ''):
+        return jsonify({'ok': False, 'error': 'invalid datum'}), 400
+    body = request.get_json(silent=True) or {}
+    raw = body.get('note') if isinstance(body.get('note'), str) else ''
+    # Frühe Abwehr gegen riesige Payloads — sanitize kappt auch, aber
+    # 4×500 = 2000 char Roh-Limit verhindert Memory-Waste bei Abuse.
+    if len(raw) > _FLIGHT_NOTE_MAX_CHARS * 4:
+        return jsonify({'ok': False, 'error': 'note_too_long'}), 413
+    note = _sanitize_flight_note(raw)
+    try:
+        # Vollständigen Disk-Profile-Inhalt laden (inkl. Side-Keys wie
+        # subscription, crew_aircraft) — _profile_save würde diese sonst
+        # killen wenn full_disk_payload None ist.
+        disk_full = dict(_profile_load_from_disk(token) or {})
+        # Profile aus SB (oder Disk) als Quelle für das flight_notes-Dict —
+        # damit zwei gleichzeitige PUTs aus verschiedenen Geräten nicht
+        # gegenseitig überschreiben (best-effort, kein echter Lock).
+        full = _profile_load(token) or {}
+        prof = dict(full.get('profile') or {})
+        notes_raw = prof.get('flight_notes') or {}
+        notes = dict(notes_raw) if isinstance(notes_raw, dict) else {}
+        if note:
+            notes[datum] = note
+        else:
+            notes.pop(datum, None)
+        prof['flight_notes'] = notes
+        disk_full['token'] = token
+        disk_full['profile'] = prof
+        disk_full['_updated_at'] = datetime.now().isoformat()
+        if not _profile_save(token, prof, full_disk_payload=disk_full):
+            return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+        return jsonify({'ok': True, 'datum': datum,
+                        'note': note, 'len': len(note)})
+    except Exception as e:
+        app.logger.exception('[flight-notes] put_failed')
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/user/flight-notes/<token>/<datum>', methods=['GET'])
+def get_flight_note(token, datum):
+    """Liefert eine einzelne Per-Day Text-Notiz."""
+    if not token:
+        return jsonify({'error': 'invalid token'}), 400
+    if not _FLIGHT_NOTE_DATUM_RE.match(datum or ''):
+        return jsonify({'error': 'invalid datum'}), 400
+    try:
+        full = _profile_load(token) or {}
+        prof = full.get('profile') or {}
+        notes = prof.get('flight_notes') or {}
+        if not isinstance(notes, dict):
+            notes = {}
+        return jsonify({'datum': datum, 'note': notes.get(datum, '')})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+
 # ─── Crew Chat Messages (HTTP-Polling-Fallback; WebSocket optional) ─────────
 # Keep API simple: messages stored per-channel. Channel = sorted(token1, token2) für DMs
 # oder explicit group_id für Group-Chats.
@@ -10138,6 +10466,149 @@ def _chat_path(channel_id):
     return os.path.join(chat_dir, f'{safe}.json')
 
 
+# ── DM-Messages SB persistence (P0 Worker-P1, 2026-06-01) ──
+# Disk-only wipte alle DMs bei jedem Cloud-Run-Redeploy. SB als Primary.
+# Schema: 1 Row pro Message. SB-Spalte body ↔ disk-Feld text.
+_DM_MSG_KNOWN_COLS = {
+    'id', 'channel_id', 'author_token', 'ts', 'image_url',
+}
+
+
+def _dm_messages_load_from_supabase(channel_id):
+    """Liest Messages für channel_id aus SB. None bei SB-down/error.
+    Re-hydrated: SB-body → disk-text, iso aus metadata."""
+    if not SB_AVAILABLE or not channel_id:
+        return None
+    try:
+        r = (sb.table('dm_messages').select('*')
+             .eq('channel_id', channel_id)
+             .order('ts', desc=False)
+             .limit(2000).execute())
+        rows = r.data or []
+        out = []
+        for row in rows:
+            m = {}
+            for k in _DM_MSG_KNOWN_COLS:
+                v = row.get(k)
+                if v is not None:
+                    m[k] = v
+            if row.get('body') is not None:
+                m['text'] = row.get('body')
+            md = row.get('metadata') or {}
+            if isinstance(md, dict):
+                for k, v in md.items():
+                    if k not in m:
+                        m[k] = v
+            out.append(m)
+        return out
+    except Exception as e:
+        app.logger.warning(
+            f'[dm] sb_load_fail ch={(channel_id or "")[:16]} '
+            f'err={type(e).__name__}: {str(e)[:120]}'
+        )
+        return None
+
+
+def _dm_messages_save_to_supabase(channel_id, messages):
+    """Bulk-upsert Messages eines Channels nach SB. True bei vollem Erfolg."""
+    if not SB_AVAILABLE or not channel_id or messages is None:
+        return False
+    rows = []
+    for m in (messages or []):
+        if not isinstance(m, dict):
+            continue
+        mid = m.get('id')
+        if not mid:
+            continue
+        row = {'id': mid, 'channel_id': channel_id}
+        meta = {}
+        for k, v in m.items():
+            if k == 'text':
+                row['body'] = v
+            elif k == 'body':
+                row['body'] = v
+            elif k == 'channel_id':
+                continue
+            elif k in _DM_MSG_KNOWN_COLS:
+                row[k] = v
+            else:
+                meta[k] = v
+        if row.get('author_token') is None:
+            row['author_token'] = ''
+        if row.get('ts') is None:
+            row['ts'] = 0
+        row['metadata'] = meta
+        rows.append(row)
+    if not rows:
+        return True
+    try:
+        for i in range(0, len(rows), 500):
+            sb.table('dm_messages').upsert(rows[i:i+500], on_conflict='id').execute()
+        return True
+    except Exception as e:
+        app.logger.error(
+            f'[dm] sb_save_fail ch={(channel_id or "")[:16]} '
+            f'err={type(e).__name__}: {str(e)[:200]}'
+        )
+        return False
+
+
+def _dm_load_messages_from_disk(channel_id):
+    """Disk-Fallback. Tolerant ggü. älterer flat-list-Shape."""
+    p = _chat_path(channel_id)
+    if not p:
+        return []
+    try:
+        with open(p) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+    if isinstance(raw, dict):
+        return raw.get('messages') or []
+    if isinstance(raw, list):
+        return raw
+    return []
+
+
+def _dm_load_messages(channel_id):
+    """SB primary, Disk fallback, lazy-migrate."""
+    if not channel_id:
+        return []
+    sb_data = _dm_messages_load_from_supabase(channel_id)
+    if sb_data is None:
+        return _dm_load_messages_from_disk(channel_id)
+    if sb_data:
+        return sb_data
+    disk_data = _dm_load_messages_from_disk(channel_id)
+    if disk_data and SB_AVAILABLE:
+        app.logger.info(
+            f'[dm] lazy-migrate ch={(channel_id or "")[:16]} '
+            f'{len(disk_data)} msgs → supabase'
+        )
+        _dm_messages_save_to_supabase(channel_id, disk_data)
+        return disk_data
+    return []
+
+
+def _dm_save_messages(channel_id, messages):
+    """SB primary + Disk Read-Cache. Cap auf letzte 500 Messages je Channel."""
+    if not channel_id:
+        return
+    capped = (messages or [])[-500:] if isinstance(messages, list) else messages
+    sb_ok = _dm_messages_save_to_supabase(channel_id, capped)
+    p = _chat_path(channel_id)
+    if not p:
+        return
+    try:
+        _atomic_write_json(p, {'messages': capped})
+    except Exception as e:
+        app.logger.warning(f'[dm] disk_save_fail ch={(channel_id or "")[:16]}: {e}')
+        if not sb_ok:
+            app.logger.error('[dm] CRITICAL: weder SB noch Disk gesichert!')
+
+
 def _dm_channel(token_a, token_b):
     import re
     a = re.sub(r'[^A-Za-z0-9_-]', '', token_a or '')[:64]
@@ -10149,13 +10620,9 @@ def _dm_channel(token_a, token_b):
 @app.route('/api/crew-chat/<token>/channel/<channel_id>', methods=['GET'])
 def get_chat_messages(token, channel_id):
     """Liefert Messages für Channel. Query: ?since_ts=epoch (nur neuere)."""
-    p = _chat_path(channel_id)
-    if not p: return jsonify({'error':'invalid_channel'}), 400
-    try:
-        with open(p) as f: data = json.load(f)
-    except FileNotFoundError:
-        data = {'messages': []}
-    msgs = data.get('messages') or []
+    if not _chat_path(channel_id):
+        return jsonify({'error': 'invalid_channel'}), 400
+    msgs = _dm_load_messages(channel_id) or []
     since = float(request.args.get('since_ts') or 0)
     if since:
         msgs = [m for m in msgs if (m.get('ts') or 0) > since]
@@ -10169,24 +10636,21 @@ def send_chat_message(token, channel_id):
     text = (body.get('text') or '').strip()
     if not text: return jsonify({'ok': False, 'error': 'empty_text'}), 400
     if len(text) > 2000: return jsonify({'ok': False, 'error': 'text_too_long'}), 413
-    p = _chat_path(channel_id)
-    if not p: return jsonify({'ok': False, 'error': 'invalid_channel'}), 400
+    if not _chat_path(channel_id):
+        return jsonify({'ok': False, 'error': 'invalid_channel'}), 400
     import uuid, time
     try:
-        try:
-            with open(p) as f: data = json.load(f)
-        except FileNotFoundError:
-            data = {'messages': []}
+        msgs = _dm_load_messages(channel_id) or []
         msg = {
             'id': str(uuid.uuid4())[:12],
+            'channel_id': channel_id,
             'author_token': token[:16] + '…',
             'text': text,
             'ts': time.time(),
             'iso': datetime.now().isoformat(),
         }
-        msgs = (data.get('messages') or []) + [msg]
-        data['messages'] = msgs[-500:]  # cap to last 500
-        with open(p, 'w') as f: json.dump(data, f, ensure_ascii=False)
+        msgs.append(msg)
+        _dm_save_messages(channel_id, msgs[-500:])
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
     return jsonify({'ok': True, 'message': msg})
@@ -10202,7 +10666,6 @@ def get_dm_inbox(token):
     """
     import os
     friends = (_friends_load(token).get('friends') or [])
-    chat_dir = os.path.join(_USER_HISTORY_DIR, 'chat')
     last_seen_p = os.path.join(_USER_HISTORY_DIR, f'dm_lastseen_{token}.json')
     last_seen = {}
     try:
@@ -10218,27 +10681,19 @@ def get_dm_inbox(token):
     for friend_token in friends:
         ch = _dm_channel(token, friend_token)
         if not ch: continue
-        cp = os.path.join(chat_dir, f'{ch}.json')
         last_msg = None
         unread = 0
-        if os.path.exists(cp):
-            try:
-                with open(cp) as f: raw = json.load(f)
-                # send_chat_message schreibt {'messages': [...]} dict-wrapped;
-                # alte Files koennen evtl. flat-list sein → beides tolerieren.
-                if isinstance(raw, dict):
-                    msgs = raw.get('messages') or []
-                elif isinstance(raw, list):
-                    msgs = raw
-                else:
-                    msgs = []
-                if msgs:
-                    last_msg = msgs[-1]
-                    seen_ts = float(last_seen.get(ch) or 0)
-                    unread = sum(1 for m in msgs
-                                 if m.get('author_token') != my_author_id
-                                 and float(m.get('ts') or 0) > seen_ts)
-            except Exception: pass
+        try:
+            # _dm_load_messages: SB primary, Disk fallback (P0 2026-06-01).
+            msgs = _dm_load_messages(ch) or []
+            if msgs:
+                last_msg = msgs[-1]
+                seen_ts = float(last_seen.get(ch) or 0)
+                unread = sum(1 for m in msgs
+                             if m.get('author_token') != my_author_id
+                             and float(m.get('ts') or 0) > seen_ts)
+        except Exception:
+            pass
         inbox.append({
             'friend_token': friend_token,
             'channel_id': ch,
@@ -10355,22 +10810,136 @@ def _wall_comments_path(post_id):
     safe = re.sub(r'[^A-Za-z0-9_-]', '', post_id or '')[:32]
     return os.path.join(_wall_dir(), f'comments_{safe}.json') if safe else None
 
-def _wall_load_posts():
+# ── Wall-Posts SB persistence (P0 Worker-P1, 2026-06-01) ──
+# Disk-only war auf Cloud Run ein Wipe-pro-Redeploy. Pattern wie _auth_load/_save:
+#   primary = SB, fallback = Disk, einmal-Lazy-Migrate beim ersten SB-leeren Read.
+# Schema: 1 Row pro Post mit Whitelist-Columns + metadata jsonb für Rest
+# (author_short, author_name, author_airline, author_homebase, created_at, etc.).
+_WALL_POST_KNOWN_COLS = {
+    'id', 'author_token', 'ts', 'layover_iata', 'image_url',
+    'hashtags', 'like_count', 'comment_count', 'deleted',
+}
+
+
+def _wall_posts_load_from_supabase():
+    """Liest alle nicht-gelöschten Wall-Posts aus SB. None bei SB-down/error.
+    Paginiert in 1000er-Schritten. Re-hydrated post-dict shape (text/hashtags/
+    author_* aus metadata zurückfalten)."""
+    if not SB_AVAILABLE:
+        return None
+    try:
+        out = []
+        offset = 0
+        page = 1000
+        while True:
+            r = (sb.table('wall_posts').select('*')
+                 .eq('deleted', False)
+                 .order('ts', desc=False)
+                 .range(offset, offset + page - 1).execute())
+            rows = r.data or []
+            for row in rows:
+                post = {}
+                for k in _WALL_POST_KNOWN_COLS:
+                    v = row.get(k)
+                    if v is not None:
+                        post[k] = v
+                # body-column → text-feld (Frontend erwartet 'text'; die SB-
+                # Spalte heisst 'body' weil das semantisch konsistent zu
+                # forum_threads.body / forum_replies.body ist).
+                if row.get('body') is not None:
+                    post['text'] = row.get('body')
+                md = row.get('metadata') or {}
+                if isinstance(md, dict):
+                    for k, v in md.items():
+                        if k not in post:
+                            post[k] = v
+                out.append(post)
+            if len(rows) < page:
+                break
+            offset += page
+        return out
+    except Exception as e:
+        app.logger.warning(f'[wall] sb_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _wall_posts_save_to_supabase(posts):
+    """Bulk-upsert aller Wall-Posts nach SB. True bei vollem Erfolg, False sonst.
+    Splittet in 500er Batches. Posts ohne id werden ignoriert."""
+    if not SB_AVAILABLE or posts is None:
+        return False
+    rows = []
+    for p in (posts or []):
+        if not isinstance(p, dict):
+            continue
+        pid = p.get('id')
+        if not pid:
+            continue
+        row = {'id': pid}
+        meta = {}
+        for k, v in p.items():
+            if k == 'text':
+                row['body'] = v
+            elif k == 'body':
+                row['body'] = v
+            elif k in _WALL_POST_KNOWN_COLS:
+                row[k] = v
+            else:
+                meta[k] = v
+        if row.get('author_token') is None:
+            row['author_token'] = ''
+        if row.get('ts') is None:
+            row['ts'] = 0
+        row['metadata'] = meta
+        rows.append(row)
+    if not rows:
+        return True
+    try:
+        for i in range(0, len(rows), 500):
+            sb.table('wall_posts').upsert(rows[i:i+500], on_conflict='id').execute()
+        return True
+    except Exception as e:
+        app.logger.error(f'[wall] sb_save_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _wall_load_posts_from_disk():
     p = _wall_posts_path()
     try:
-        with open(p) as f: return json.load(f) or []
+        with open(p) as f:
+            return json.load(f) or []
     except FileNotFoundError:
         return []
     except Exception:
         return []
 
+
+def _wall_load_posts():
+    """SB primary, Disk fallback, lazy-migrate (analog _auth_load)."""
+    sb_data = _wall_posts_load_from_supabase()
+    if sb_data is None:
+        return _wall_load_posts_from_disk()
+    if sb_data:
+        return sb_data
+    disk_data = _wall_load_posts_from_disk()
+    if disk_data and SB_AVAILABLE:
+        app.logger.info(f'[wall] lazy-migrate {len(disk_data)} disk posts → supabase')
+        _wall_posts_save_to_supabase(disk_data)
+        return disk_data
+    return []
+
+
 def _wall_save_posts(posts):
+    """SB primary + Disk best-effort Read-Cache. Cap auf letzte 5000 Posts."""
+    capped = (posts or [])[-5000:] if isinstance(posts, list) else posts
+    sb_ok = _wall_posts_save_to_supabase(capped)
     p = _wall_posts_path()
-    # Cap to last 5000 posts global · atomic write verhindert Race-Lost-Writes
     try:
-        _atomic_write_json(p, posts, max_items=5000)
+        _atomic_write_json(p, capped, max_items=5000)
     except Exception as e:
-        app.logger.warning(f'[wall] save failed: {e}')
+        app.logger.warning(f'[wall] disk_save_fail (ok wenn SB läuft): {e}')
+        if not sb_ok:
+            app.logger.error('[wall] CRITICAL: weder SB noch Disk gesichert!')
 
 
 def _sanitize_user_text(text, max_len=None):
@@ -10777,7 +11346,103 @@ def _forum_likes_path(token):
     return os.path.join(_forum_dir(), f'likes_{safe}.json') if safe else None
 
 
-def _forum_load_threads():
+# ── Forum-Threads/Replies SB persistence (P0 Worker-P1, 2026-06-01) ──
+# Disk-only war auf Cloud Run ein Wipe-pro-Redeploy.
+# Threads-Schema: 1 Row pro Thread. ts ← created_ts. body ← body-text.
+# Replies-Schema: 1 Row pro Reply, thread_id fkey-mässig referenziert.
+_FORUM_THREAD_KNOWN_COLS = {
+    'id', 'category_id', 'author_token', 'title', 'ts',
+    'hashtags', 'like_count', 'reply_count', 'deleted',
+}
+_FORUM_REPLY_KNOWN_COLS = {
+    'id', 'thread_id', 'author_token', 'ts', 'parent_reply_id',
+    'mentioned_token', 'image_url', 'like_count',
+}
+
+
+def _forum_threads_load_from_supabase():
+    """Liest alle nicht-gelöschten Forum-Threads aus SB. None bei SB-down.
+    Re-hydrated Disk-Shape: ts ↔ created_ts, body ↔ Spalte body."""
+    if not SB_AVAILABLE:
+        return None
+    try:
+        out = []
+        offset = 0
+        page = 1000
+        while True:
+            r = (sb.table('forum_threads').select('*')
+                 .eq('deleted', False)
+                 .order('ts', desc=False)
+                 .range(offset, offset + page - 1).execute())
+            rows = r.data or []
+            for row in rows:
+                t = {}
+                for k in _FORUM_THREAD_KNOWN_COLS:
+                    v = row.get(k)
+                    if v is not None:
+                        t[k] = v
+                # Spalte ts → Disk-Feld created_ts (legacy Naming)
+                if 'ts' in t:
+                    t.setdefault('created_ts', t['ts'])
+                if row.get('body') is not None:
+                    t['body'] = row.get('body')
+                md = row.get('metadata') or {}
+                if isinstance(md, dict):
+                    for k, v in md.items():
+                        if k not in t:
+                            t[k] = v
+                out.append(t)
+            if len(rows) < page:
+                break
+            offset += page
+        return out
+    except Exception as e:
+        app.logger.warning(f'[forum-threads] sb_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _forum_threads_save_to_supabase(threads):
+    """Bulk-upsert nach SB. True bei vollem Erfolg."""
+    if not SB_AVAILABLE or threads is None:
+        return False
+    rows = []
+    for t in (threads or []):
+        if not isinstance(t, dict):
+            continue
+        tid = t.get('id')
+        if not tid:
+            continue
+        row = {'id': tid}
+        meta = {}
+        for k, v in t.items():
+            if k == 'body':
+                row['body'] = v
+            elif k == 'created_ts' and 'ts' not in t:
+                row['ts'] = v
+            elif k in _FORUM_THREAD_KNOWN_COLS:
+                row[k] = v
+            else:
+                meta[k] = v
+        if row.get('category_id') is None:
+            row['category_id'] = ''
+        if row.get('author_token') is None:
+            row['author_token'] = ''
+        if row.get('ts') is None:
+            row['ts'] = t.get('created_ts') or 0
+        row['metadata'] = meta
+        rows.append(row)
+    if not rows:
+        return True
+    try:
+        for i in range(0, len(rows), 500):
+            sb.table('forum_threads').upsert(rows[i:i+500], on_conflict='id').execute()
+        return True
+    except Exception as e:
+        app.logger.error(f'[forum-threads] sb_save_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _forum_threads_load_from_disk():
     p = _forum_threads_path()
     try:
         with open(p) as f:
@@ -10788,15 +11453,116 @@ def _forum_load_threads():
         return []
 
 
+def _forum_load_threads():
+    """SB primary, Disk fallback, lazy-migrate."""
+    sb_data = _forum_threads_load_from_supabase()
+    if sb_data is None:
+        return _forum_threads_load_from_disk()
+    if sb_data:
+        return sb_data
+    disk_data = _forum_threads_load_from_disk()
+    if disk_data and SB_AVAILABLE:
+        app.logger.info(f'[forum-threads] lazy-migrate {len(disk_data)} disk threads → supabase')
+        _forum_threads_save_to_supabase(disk_data)
+        return disk_data
+    return []
+
+
 def _forum_save_threads(threads):
+    """SB primary + Disk Read-Cache."""
+    capped = (threads or [])[-10000:] if isinstance(threads, list) else threads
+    sb_ok = _forum_threads_save_to_supabase(capped)
     p = _forum_threads_path()
     try:
-        _atomic_write_json(p, threads, max_items=10000)
+        _atomic_write_json(p, capped, max_items=10000)
     except Exception as e:
-        app.logger.warning(f'[forum-threads] save failed: {e}')
+        app.logger.warning(f'[forum-threads] disk_save_fail: {e}')
+        if not sb_ok:
+            app.logger.error('[forum-threads] CRITICAL: weder SB noch Disk gesichert!')
 
 
-def _forum_load_replies(thread_id):
+def _forum_replies_load_from_supabase(thread_id):
+    """Liest alle Replies für thread_id aus SB. None bei SB-down."""
+    if not SB_AVAILABLE or not thread_id:
+        return None
+    try:
+        r = (sb.table('forum_replies').select('*')
+             .eq('thread_id', thread_id)
+             .order('ts', desc=False)
+             .limit(2000).execute())
+        rows = r.data or []
+        out = []
+        for row in rows:
+            rep = {}
+            for k in _FORUM_REPLY_KNOWN_COLS:
+                v = row.get(k)
+                if v is not None:
+                    rep[k] = v
+            if 'ts' in rep:
+                rep.setdefault('created_ts', rep['ts'])
+            if row.get('body') is not None:
+                rep['body'] = row.get('body')
+            md = row.get('metadata') or {}
+            if isinstance(md, dict):
+                for k, v in md.items():
+                    if k not in rep:
+                        rep[k] = v
+            out.append(rep)
+        return out
+    except Exception as e:
+        app.logger.warning(
+            f'[forum-replies] sb_load_fail tid={(thread_id or "")[:8]} '
+            f'err={type(e).__name__}: {str(e)[:120]}'
+        )
+        return None
+
+
+def _forum_replies_save_to_supabase(thread_id, replies):
+    """Bulk-upsert Replies eines Threads nach SB."""
+    if not SB_AVAILABLE or not thread_id or replies is None:
+        return False
+    rows = []
+    for rep in (replies or []):
+        if not isinstance(rep, dict):
+            continue
+        rid = rep.get('id')
+        if not rid:
+            continue
+        row = {'id': rid, 'thread_id': thread_id}
+        meta = {}
+        for k, v in rep.items():
+            if k == 'body':
+                row['body'] = v
+            elif k == 'created_ts' and 'ts' not in rep:
+                row['ts'] = v
+            elif k == 'thread_id':
+                # already forced above
+                continue
+            elif k in _FORUM_REPLY_KNOWN_COLS:
+                row[k] = v
+            else:
+                meta[k] = v
+        if row.get('author_token') is None:
+            row['author_token'] = ''
+        if row.get('ts') is None:
+            row['ts'] = rep.get('created_ts') or 0
+        row['metadata'] = meta
+        rows.append(row)
+    if not rows:
+        return True
+    try:
+        for i in range(0, len(rows), 500):
+            sb.table('forum_replies').upsert(rows[i:i+500], on_conflict='id').execute()
+        return True
+    except Exception as e:
+        app.logger.error(
+            f'[forum-replies] sb_save_fail tid={(thread_id or "")[:8]} '
+            f'err={type(e).__name__}: {str(e)[:200]}'
+        )
+        return False
+
+
+def _forum_replies_load_from_disk(thread_id):
     p = _forum_replies_path(thread_id)
     if not p:
         return []
@@ -10809,14 +11575,37 @@ def _forum_load_replies(thread_id):
         return []
 
 
+def _forum_load_replies(thread_id):
+    """SB primary, Disk fallback, lazy-migrate."""
+    sb_data = _forum_replies_load_from_supabase(thread_id)
+    if sb_data is None:
+        return _forum_replies_load_from_disk(thread_id)
+    if sb_data:
+        return sb_data
+    disk_data = _forum_replies_load_from_disk(thread_id)
+    if disk_data and SB_AVAILABLE:
+        app.logger.info(
+            f'[forum-replies] lazy-migrate tid={(thread_id or "")[:8]} '
+            f'{len(disk_data)} replies → supabase'
+        )
+        _forum_replies_save_to_supabase(thread_id, disk_data)
+        return disk_data
+    return []
+
+
 def _forum_save_replies(thread_id, replies):
+    """SB primary + Disk Read-Cache."""
+    capped = (replies or [])[-2000:] if isinstance(replies, list) else replies
+    sb_ok = _forum_replies_save_to_supabase(thread_id, capped)
     p = _forum_replies_path(thread_id)
     if not p:
         return
     try:
-        _atomic_write_json(p, replies, max_items=2000)
+        _atomic_write_json(p, capped, max_items=2000)
     except Exception as e:
-        app.logger.warning(f'[forum-replies] save failed thread={thread_id[:8]}: {e}')
+        app.logger.warning(f'[forum-replies] disk_save_fail thread={(thread_id or "")[:8]}: {e}')
+        if not sb_ok:
+            app.logger.error('[forum-replies] CRITICAL: weder SB noch Disk gesichert!')
 
 
 def _forum_load_likes(token):
@@ -11104,32 +11893,29 @@ def forum_create_reply(token, thread_id):
 
 @app.route('/api/forum/<token>/replies/<reply_id>', methods=['DELETE'])
 def forum_delete_reply(token, reply_id):
-    """Search all reply files for the reply — expensive but okay for current scale."""
-    import os
-    forum_d = _forum_dir()
+    """Linear search across alle Threads. SB primary (P0 2026-06-01) statt
+    blind über disk replies_<id>.json — sonst miss-ten wir nach Migration die
+    SB-only Replies."""
+    threads = _forum_load_threads()
     deleted = False
     parent_thread_id = None
-    for fname in os.listdir(forum_d):
-        if not fname.startswith('replies_'):
+    for t in threads:
+        tid = t.get('id')
+        if not tid:
             continue
-        try:
-            with open(os.path.join(forum_d, fname)) as f:
-                arr = json.load(f) or []
-        except Exception:
-            continue
-        new_arr = [r for r in arr if not (r.get('id') == reply_id and r.get('author_token') == token)]
-        if len(new_arr) != len(arr):
+        replies = _forum_load_replies(tid)
+        new_replies = [r for r in replies
+                       if not (r.get('id') == reply_id
+                               and r.get('author_token') == token)]
+        if len(new_replies) != len(replies):
             deleted = True
-            parent_thread_id = arr[0].get('thread_id') if arr else None
-            with open(os.path.join(forum_d, fname), 'w') as f:
-                json.dump(new_arr, f, ensure_ascii=False)
+            parent_thread_id = tid
+            _forum_save_replies(tid, new_replies)
             break
     if not deleted:
         return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
 
-    # Decrement reply_count on parent thread
     if parent_thread_id:
-        threads = _forum_load_threads()
         for t in threads:
             if t.get('id') == parent_thread_id:
                 t['reply_count'] = max(0, (t.get('reply_count') or 0) - 1)
@@ -11140,24 +11926,21 @@ def forum_delete_reply(token, reply_id):
 
 @app.route('/api/forum/<token>/replies/<reply_id>/like', methods=['POST'])
 def forum_toggle_reply_like(token, reply_id):
-    """Search reply files for reply_id (linear)."""
-    import os
-    forum_d = _forum_dir()
-    target_fname = None
+    """Linear search across alle Threads (SB primary)."""
+    threads = _forum_load_threads()
+    target_thread_id = None
     target_reply = None
-    for fname in os.listdir(forum_d):
-        if not fname.startswith('replies_'):
+    target_replies = None
+    for t in threads:
+        tid = t.get('id')
+        if not tid:
             continue
-        try:
-            with open(os.path.join(forum_d, fname)) as f:
-                arr = json.load(f) or []
-        except Exception:
-            continue
-        for r in arr:
+        replies = _forum_load_replies(tid)
+        for r in replies:
             if r.get('id') == reply_id:
-                target_fname = fname
+                target_thread_id = tid
                 target_reply = r
-                target_list = arr
+                target_replies = replies
                 break
         if target_reply:
             break
@@ -11174,8 +11957,7 @@ def forum_toggle_reply_like(token, reply_id):
         target_reply['like_count'] = (target_reply.get('like_count') or 0) + 1
         liked_by_me = True
     _forum_save_likes(token, likes)
-    with open(os.path.join(forum_d, target_fname), 'w') as f:
-        json.dump(target_list, f, ensure_ascii=False)
+    _forum_save_replies(target_thread_id, target_replies)
     return jsonify({'ok': True, 'like_count': target_reply['like_count'], 'liked_by_me': liked_by_me})
 
 
