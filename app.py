@@ -10656,6 +10656,61 @@ def send_chat_message(token, channel_id):
     return jsonify({'ok': True, 'message': msg})
 
 
+def _dm_lastseen_load_from_supabase(token):
+    """{channel_id: last_seen_ts} aus SB. None bei SB-down."""
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = (sb.table('dm_lastseen').select('channel_id,last_seen_ts')
+             .eq('user_token', token).execute())
+        return {row['channel_id']: float(row.get('last_seen_ts') or 0)
+                for row in (r.data or []) if row.get('channel_id')}
+    except Exception as e:
+        app.logger.warning(f'[dm-lastseen] sb_load_fail: {str(e)[:120]}')
+        return None
+
+
+def _dm_lastseen_sb_upsert(token, channel_id, ts):
+    if not SB_AVAILABLE or not token or not channel_id:
+        return False
+    try:
+        sb.table('dm_lastseen').upsert(
+            {'user_token': token, 'channel_id': channel_id, 'last_seen_ts': float(ts)},
+            on_conflict='user_token,channel_id').execute()
+        return True
+    except Exception as e:
+        app.logger.warning(f'[dm-lastseen] sb_save_fail: {str(e)[:120]}')
+        return False
+
+
+def _dm_lastseen_load(token):
+    """SB primary, Disk fallback, lazy-migrate. Returns {channel_id: ts}."""
+    import os
+    sb_data = _dm_lastseen_load_from_supabase(token)
+    disk_p = os.path.join(_USER_HISTORY_DIR, f'dm_lastseen_{token}.json')
+    if sb_data is not None:
+        if not sb_data:
+            # Lazy-migrate von Disk
+            try:
+                if os.path.exists(disk_p):
+                    with open(disk_p) as f:
+                        disk_data = json.load(f) or {}
+                    if disk_data and SB_AVAILABLE:
+                        for ch, ts in disk_data.items():
+                            _dm_lastseen_sb_upsert(token, ch, ts)
+                        app.logger.info(f'[dm-lastseen] lazy-migrated {len(disk_data)} channels')
+                        return disk_data
+            except Exception: pass
+        return sb_data
+    # SB down → Disk
+    try:
+        if os.path.exists(disk_p):
+            with open(disk_p) as f:
+                return json.load(f) or {}
+    except Exception: pass
+    return {}
+
+
 @app.route('/api/crew-chat/<token>/inbox', methods=['GET'])
 def get_dm_inbox(token):
     """Aggregierter Inbox für den Crew-Chat-Tab.
@@ -10664,14 +10719,8 @@ def get_dm_inbox(token):
     DM-Channel-Files) + zählt unread (Messages neuer als last_seen_<channel>).
     Vorher: Frontend musste N+1 Calls machen pro Friend.
     """
-    import os
     friends = (_friends_load(token).get('friends') or [])
-    last_seen_p = os.path.join(_USER_HISTORY_DIR, f'dm_lastseen_{token}.json')
-    last_seen = {}
-    try:
-        if os.path.exists(last_seen_p):
-            with open(last_seen_p) as f: last_seen = json.load(f) or {}
-    except Exception: pass
+    last_seen = _dm_lastseen_load(token) or {}
     inbox = []
     # send_chat_message speichert author_token PII-truncated als
     # `token[:16] + "…"`. Beim Vergleich hier muessen wir gegen dieselbe
@@ -10708,24 +10757,27 @@ def get_dm_inbox(token):
 
 @app.route('/api/crew-chat/<token>/inbox/mark-read', methods=['POST'])
 def dm_mark_read(token):
-    """Body: {channel_id} — setzt last_seen_<channel> auf jetzt (für Unread-Counter)."""
-    import os
+    """Body: {channel_id} — setzt last_seen_<channel> auf jetzt (für Unread-Counter).
+    SB primary + Disk best-effort (Read-Cache)."""
+    import os, time as _t
     body = request.get_json(silent=True) or {}
     channel = (body.get('channel_id') or '').strip()
     if not channel:
         return jsonify({'ok': False, 'error': 'channel_id_required'}), 400
+    now = _t.time()
+    sb_ok = _dm_lastseen_sb_upsert(token, channel, now)
     last_seen_p = os.path.join(_USER_HISTORY_DIR, f'dm_lastseen_{token}.json')
     data = {}
     try:
         if os.path.exists(last_seen_p):
             with open(last_seen_p) as f: data = json.load(f) or {}
     except Exception: pass
-    import time as _t
-    data[channel] = _t.time()
+    data[channel] = now
     try:
         with open(last_seen_p, 'w') as f: json.dump(data, f)
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:120]}), 500
+        if not sb_ok:
+            return jsonify({'ok': False, 'error': str(e)[:120]}), 500
     return jsonify({'ok': True})
 
 
@@ -10901,6 +10953,216 @@ def _wall_posts_save_to_supabase(posts):
     except Exception as e:
         app.logger.error(f'[wall] sb_save_fail err={type(e).__name__}: {str(e)[:200]}')
         return False
+
+
+# ── Wall-Likes per User SB persistence (P1-Leftover, 2026-06-01) ──
+# Eine Row pro (post_id, user_token). Disk-Cache als Fallback (likes_<token>.json).
+def _wall_likes_load_from_supabase(token):
+    """Set aller post_ids die dieser user_token geliked hat. None bei SB-down."""
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = (sb.table('wall_likes').select('post_id')
+             .eq('user_token', token).execute())
+        return {row['post_id'] for row in (r.data or []) if row.get('post_id')}
+    except Exception as e:
+        app.logger.warning(f'[wall-likes] sb_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _wall_likes_sb_add(token, post_id):
+    if not SB_AVAILABLE or not token or not post_id:
+        return False
+    try:
+        sb.table('wall_likes').upsert(
+            {'post_id': post_id, 'user_token': token},
+            on_conflict='post_id,user_token').execute()
+        return True
+    except Exception as e:
+        app.logger.warning(f'[wall-likes] sb_add_fail: {str(e)[:120]}')
+        return False
+
+
+def _wall_likes_sb_remove(token, post_id):
+    if not SB_AVAILABLE or not token or not post_id:
+        return False
+    try:
+        (sb.table('wall_likes').delete()
+         .eq('user_token', token).eq('post_id', post_id).execute())
+        return True
+    except Exception as e:
+        app.logger.warning(f'[wall-likes] sb_del_fail: {str(e)[:120]}')
+        return False
+
+
+def _wall_likes_load(token):
+    """SB primary, Disk fallback, lazy-migrate. Returns set of post_ids."""
+    sb_data = _wall_likes_load_from_supabase(token)
+    if sb_data is not None:
+        if not sb_data:
+            # Lazy-migrate von Disk wenn SB leer
+            disk_p = _wall_likes_path(token)
+            if disk_p:
+                try:
+                    with open(disk_p) as f:
+                        disk_ids = set(json.load(f) or [])
+                    if disk_ids and SB_AVAILABLE:
+                        rows = [{'post_id': pid, 'user_token': token} for pid in disk_ids]
+                        try:
+                            sb.table('wall_likes').upsert(
+                                rows, on_conflict='post_id,user_token').execute()
+                            app.logger.info(f'[wall-likes] lazy-migrated {len(disk_ids)} disk likes')
+                            return disk_ids
+                        except Exception:
+                            pass
+                    return disk_ids
+                except (FileNotFoundError, json.JSONDecodeError, Exception):
+                    pass
+        return sb_data
+    # SB down → Disk
+    disk_p = _wall_likes_path(token)
+    if not disk_p:
+        return set()
+    try:
+        with open(disk_p) as f:
+            return set(json.load(f) or [])
+    except (FileNotFoundError, json.JSONDecodeError, Exception):
+        return set()
+
+
+# ── Wall-Comments SB persistence (P1-Leftover, 2026-06-01) ──
+# Eine Row pro Comment. body ↔ text (analog wall_posts).
+_WALL_COMMENT_KNOWN_COLS = {
+    'id', 'post_id', 'author_token', 'ts', 'parent_id', 'image_url',
+}
+
+
+def _wall_comments_load_from_supabase(post_id):
+    """Liest Comments für genau einen Post. None bei SB-down."""
+    if not SB_AVAILABLE or not post_id:
+        return None
+    try:
+        r = (sb.table('wall_comments').select('*')
+             .eq('post_id', post_id)
+             .order('ts', desc=False)
+             .range(0, 999).execute())
+        out = []
+        for row in (r.data or []):
+            c = {}
+            for k in _WALL_COMMENT_KNOWN_COLS:
+                v = row.get(k)
+                if v is not None:
+                    c[k] = v
+            if row.get('body') is not None:
+                c['text'] = row.get('body')
+            # parent_comment_id ist iOS-Naming, SB-Spalte ist parent_id
+            if 'parent_id' in c:
+                c['parent_comment_id'] = c.pop('parent_id')
+            md = row.get('metadata') or {}
+            if isinstance(md, dict):
+                for k, v in md.items():
+                    if k not in c:
+                        c[k] = v
+            # iOS erwartet `created_at` als ISO-String — aus ts rekonstruieren
+            if 'created_at' not in c and c.get('ts'):
+                try:
+                    c['created_at'] = datetime.fromtimestamp(float(c['ts'])).isoformat()
+                except Exception:
+                    pass
+            out.append(c)
+        return out
+    except Exception as e:
+        app.logger.warning(f'[wall-comments] sb_load_fail post={(post_id or "")[:8]}: {str(e)[:120]}')
+        return None
+
+
+def _wall_comments_save_to_supabase(post_id, comments):
+    """Upsert für gesamten Comment-Stream eines Posts. Splittet in 200er Batches."""
+    if not SB_AVAILABLE or not post_id or comments is None:
+        return False
+    rows = []
+    import time as _t
+    for c in (comments or []):
+        if not isinstance(c, dict):
+            continue
+        cid = c.get('id')
+        if not cid:
+            continue
+        row = {'id': cid, 'post_id': post_id}
+        meta = {}
+        for k, v in c.items():
+            if k == 'text':
+                row['body'] = v
+            elif k == 'body':
+                row['body'] = v
+            elif k == 'parent_comment_id':
+                row['parent_id'] = v
+            elif k in _WALL_COMMENT_KNOWN_COLS:
+                row[k] = v
+            else:
+                meta[k] = v
+        if row.get('author_token') is None:
+            row['author_token'] = ''
+        if row.get('ts') is None:
+            # falls created_at vorhanden, dort parsen, sonst now()
+            ca = c.get('created_at')
+            if ca:
+                try:
+                    row['ts'] = datetime.fromisoformat(ca).timestamp()
+                except Exception:
+                    row['ts'] = _t.time()
+            else:
+                row['ts'] = _t.time()
+        row['metadata'] = meta
+        rows.append(row)
+    if not rows:
+        return True
+    try:
+        for i in range(0, len(rows), 200):
+            sb.table('wall_comments').upsert(rows[i:i+200], on_conflict='id').execute()
+        return True
+    except Exception as e:
+        app.logger.error(f'[wall-comments] sb_save_fail post={(post_id or "")[:8]} err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _wall_comments_load(post_id):
+    """SB primary, Disk fallback, lazy-migrate."""
+    sb_data = _wall_comments_load_from_supabase(post_id)
+    cp = _wall_comments_path(post_id)
+    if sb_data is None:
+        # SB down → Disk
+        try:
+            with open(cp) as f:
+                return json.load(f) or []
+        except (FileNotFoundError, json.JSONDecodeError, Exception):
+            return []
+    if sb_data:
+        return sb_data
+    # SB ok aber leer → vielleicht Disk-Reste lazy-migraten
+    try:
+        with open(cp) as f:
+            disk_data = json.load(f) or []
+        if disk_data and SB_AVAILABLE:
+            app.logger.info(f'[wall-comments] lazy-migrate {len(disk_data)} disk comments post={(post_id or "")[:8]}')
+            _wall_comments_save_to_supabase(post_id, disk_data)
+        return disk_data
+    except (FileNotFoundError, json.JSONDecodeError, Exception):
+        return []
+
+
+def _wall_comments_save(post_id, comments):
+    """SB primary + Disk best-effort. Cap auf 200 Comments."""
+    capped = (comments or [])[-200:] if isinstance(comments, list) else comments
+    sb_ok = _wall_comments_save_to_supabase(post_id, capped)
+    cp = _wall_comments_path(post_id)
+    if cp:
+        try:
+            _atomic_write_json(cp, capped, max_items=200)
+        except Exception as e:
+            app.logger.warning(f'[wall-comments] disk_save_fail (ok wenn SB lief): {e}')
+            if not sb_ok:
+                app.logger.error('[wall-comments] CRITICAL: weder SB noch Disk gesichert!')
 
 
 def _wall_load_posts_from_disk():
@@ -11128,16 +11390,8 @@ def get_wall_feed(token):
     if before_ts > 0:
         feed = [p for p in feed if (p.get('ts') or 0) < before_ts]
     feed = feed[:limit]
-    # Add liked-by-me flag
-    likes_p = _wall_likes_path(token)
-    liked_ids = set()
-    if likes_p:
-        try:
-            with open(likes_p) as f: liked_ids = set(json.load(f) or [])
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
+    # Add liked-by-me flag (SB primary, Disk fallback via _wall_likes_load)
+    liked_ids = _wall_likes_load(token) or set()
     for p in feed:
         p['liked_by_me'] = p['id'] in liked_ids
         # is_mine: Owner-Flag damit iOS-Client einen "Löschen"-Button
@@ -11173,27 +11427,27 @@ def _like_lock(post_id):
 
 @app.route('/api/wall/<token>/like/<post_id>', methods=['POST'])
 def toggle_like(token, post_id):
-    """Toggle like on a post. Returns new like_count + liked_by_me."""
+    """Toggle like on a post. SB primary + Disk fallback."""
     likes_p = _wall_likes_path(token)
     if not likes_p: return jsonify({'ok': False, 'error':'invalid_token'}), 400
     with _like_lock(post_id):
-        try:
-            with open(likes_p) as f: liked = set(json.load(f) or [])
-        except FileNotFoundError:
-            liked = set()
-        except Exception:
-            liked = set()
+        liked = _wall_likes_load(token) or set()
         delta = 0
         if post_id in liked:
             liked.remove(post_id); delta = -1
             liked_by_me = False
+            _wall_likes_sb_remove(token, post_id)
         else:
             liked.add(post_id); delta = +1
             liked_by_me = True
+            _wall_likes_sb_add(token, post_id)
+        # Disk best-effort als Read-Cache wenn SB ausfällt
         try:
             _atomic_write_json(likes_p, list(liked))
         except Exception:
-            with open(likes_p, 'w') as f: json.dump(list(liked), f)
+            try:
+                with open(likes_p, 'w') as f: json.dump(list(liked), f)
+            except Exception: pass
         posts = _wall_load_posts()
         new_count = 0
         for p in posts:
@@ -11216,29 +11470,29 @@ def add_comment(token, post_id):
     if len(text) > 500: return jsonify({'ok': False, 'error': 'too_long'}), 413
     cp = _wall_comments_path(post_id)
     if not cp: return jsonify({'ok': False, 'error': 'invalid_post'}), 400
-    import uuid
-    try:
-        with open(cp) as f: comments = json.load(f) or []
-    except FileNotFoundError:
-        comments = []
+    import uuid, time as _t
+    comments = _wall_comments_load(post_id) or []
     name = ''
     try:
         with open(_user_profile_path(token)) as f:
             name = json.load(f).get('profile', {}).get('name', '') or ''
     except Exception:
         pass
+    now_ts = _t.time()
     c = {
         'id': str(uuid.uuid4())[:10],
+        'post_id': post_id,
         'author_token': token,
         'author_short': token[:8],
         'author_name': name,
         'text': text,
         'image_url': image_url,
         'parent_comment_id': parent_comment_id,
+        'ts': now_ts,
         'created_at': datetime.now().isoformat(),
     }
     comments.append(c)
-    with open(cp, 'w') as f: json.dump(comments[-200:], f, ensure_ascii=False)
+    _wall_comments_save(post_id, comments[-200:])
     # Bump comment_count on post
     posts = _wall_load_posts()
     for p in posts:
@@ -11265,10 +11519,7 @@ def add_comment(token, post_id):
 def get_comments(token, post_id):
     cp = _wall_comments_path(post_id)
     if not cp: return jsonify({'comments': []})
-    try:
-        with open(cp) as f: comments = json.load(f) or []
-    except FileNotFoundError:
-        comments = []
+    comments = _wall_comments_load(post_id) or []
     # Strip author_token from response
     for c in comments:
         c.pop('author_token', None)
@@ -11290,7 +11541,16 @@ def delete_wall_post(token, post_id):
         return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
     new_posts = [p for p in posts if p is not target_post]
     _wall_save_posts(new_posts)
-    # Comments-File entfernen
+    # Comments aus SB + Disk entfernen
+    if SB_AVAILABLE:
+        try:
+            sb.table('wall_comments').delete().eq('post_id', post_id).execute()
+        except Exception as e:
+            app.logger.warning(f'[wall-delete] sb comments cleanup failed: {e}')
+        try:
+            sb.table('wall_likes').delete().eq('post_id', post_id).execute()
+        except Exception as e:
+            app.logger.warning(f'[wall-delete] sb likes cleanup failed: {e}')
     cp = _wall_comments_path(post_id)
     if cp:
         try:
@@ -11608,8 +11868,72 @@ def _forum_save_replies(thread_id, replies):
             app.logger.error('[forum-replies] CRITICAL: weder SB noch Disk gesichert!')
 
 
+def _forum_likes_load_from_supabase(token):
+    """{'threads': set, 'replies': set} aller liked-IDs für user_token. None bei SB-down."""
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = (sb.table('forum_likes').select('target_type,target_id')
+             .eq('user_token', token).execute())
+        threads = set()
+        replies = set()
+        for row in (r.data or []):
+            tt = row.get('target_type')
+            tid = row.get('target_id')
+            if not tid:
+                continue
+            if tt == 'thread':
+                threads.add(tid)
+            elif tt == 'reply':
+                replies.add(tid)
+        return {'threads': threads, 'replies': replies}
+    except Exception as e:
+        app.logger.warning(f'[forum-likes] sb_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _forum_likes_sb_diff(token, kind, old_set, new_set):
+    """Diff-Schreibe: nur add/remove was sich verändert hat (zwischen old und new)."""
+    if not SB_AVAILABLE or not token or kind not in ('thread', 'reply'):
+        return False
+    added = list(new_set - old_set)
+    removed = list(old_set - new_set)
+    try:
+        if added:
+            rows = [{'user_token': token, 'target_type': kind, 'target_id': i} for i in added]
+            sb.table('forum_likes').upsert(
+                rows, on_conflict='user_token,target_type,target_id').execute()
+        for tid in removed:
+            (sb.table('forum_likes').delete()
+             .eq('user_token', token).eq('target_type', kind).eq('target_id', tid).execute())
+        return True
+    except Exception as e:
+        app.logger.warning(f'[forum-likes] sb_diff_fail kind={kind}: {str(e)[:120]}')
+        return False
+
+
 def _forum_load_likes(token):
+    """SB primary + Disk fallback + lazy-migrate."""
+    sb_data = _forum_likes_load_from_supabase(token)
     p = _forum_likes_path(token)
+    if sb_data is not None:
+        if not (sb_data['threads'] or sb_data['replies']):
+            # Lazy-migrate von Disk
+            if p:
+                try:
+                    with open(p) as f:
+                        data = json.load(f) or {}
+                    disk_threads = set(data.get('threads') or [])
+                    disk_replies = set(data.get('replies') or [])
+                    if (disk_threads or disk_replies) and SB_AVAILABLE:
+                        _forum_likes_sb_diff(token, 'thread', set(), disk_threads)
+                        _forum_likes_sb_diff(token, 'reply', set(), disk_replies)
+                        app.logger.info(f'[forum-likes] lazy-migrated t={len(disk_threads)} r={len(disk_replies)}')
+                        return {'threads': disk_threads, 'replies': disk_replies}
+                except (FileNotFoundError, json.JSONDecodeError, Exception):
+                    pass
+        return sb_data
+    # SB down → Disk
     if not p:
         return {'threads': set(), 'replies': set()}
     try:
@@ -11619,13 +11943,20 @@ def _forum_load_likes(token):
             'threads': set(data.get('threads') or []),
             'replies': set(data.get('replies') or []),
         }
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {'threads': set(), 'replies': set()}
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, Exception):
         return {'threads': set(), 'replies': set()}
 
 
 def _forum_save_likes(token, likes):
+    """SB-Diff (gegenüber aktuellem SB-Stand) + Disk best-effort."""
+    # SB-Diff: vergleiche neu vs SB-Snapshot, nicht vs vorher übergebenes likes-dict
+    if SB_AVAILABLE:
+        current_sb = _forum_likes_load_from_supabase(token)
+        if current_sb is not None:
+            new_threads = set(likes.get('threads') or [])
+            new_replies = set(likes.get('replies') or [])
+            _forum_likes_sb_diff(token, 'thread', current_sb['threads'], new_threads)
+            _forum_likes_sb_diff(token, 'reply', current_sb['replies'], new_replies)
     p = _forum_likes_path(token)
     if not p:
         return
@@ -11634,7 +11965,7 @@ def _forum_save_likes(token, likes):
     try:
         _atomic_write_json(p, data)
     except Exception as e:
-        app.logger.warning(f'[forum-likes] save failed: {e}')
+        app.logger.warning(f'[forum-likes] disk_save_fail (ok wenn SB lief): {e}')
 
 
 def _forum_author_snapshot(token):

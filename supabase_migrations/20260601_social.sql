@@ -102,3 +102,29 @@ create table if not exists public.dm_messages (
 create index if not exists idx_dm_messages_channel
     on public.dm_messages(channel_id, ts);
 alter table public.dm_messages enable row level security;
+
+-- ─────────── FORUM-LIKES (per user) ───────────
+-- Pro Liker/Target gibt es eine Row. target_type ∈ {'thread','reply'}.
+-- Composite-PK verhindert Doppel-Likes deterministisch.
+create table if not exists public.forum_likes (
+    user_token text not null,
+    target_type text not null,
+    target_id text not null,
+    created_at timestamptz not null default now(),
+    primary key (user_token, target_type, target_id)
+);
+create index if not exists idx_forum_likes_user
+    on public.forum_likes(user_token);
+alter table public.forum_likes enable row level security;
+
+-- ─────────── DM-LASTSEEN (per user/channel) ───────────
+-- Pro User+Channel-Kombi der letzte gelesen-Timestamp für Unread-Counter.
+create table if not exists public.dm_lastseen (
+    user_token text not null,
+    channel_id text not null,
+    last_seen_ts numeric not null default 0,
+    primary key (user_token, channel_id)
+);
+create index if not exists idx_dm_lastseen_user
+    on public.dm_lastseen(user_token);
+alter table public.dm_lastseen enable row level security;
