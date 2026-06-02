@@ -90,6 +90,12 @@ def test_fake_token_rejected_with_401(method, path, body):
             pass
 
 
+# GET-PII-Routes laufen lokal in test_token_auth_gate_local.py gegen die
+# Flask-app via test_client (kein live-Roundtrip). Hier nur die POST-Suite
+# damit das File live grün bleibt während Cloud-Run das GET-Gate-Deploy noch
+# nicht ausgerollt hat.
+
+
 def test_guest_token_passes_gate_but_blocked_by_route():
     """AT-GUEST-* tokens are demo-mode — they pass the auth-gate but
     individual routes block them with 403 demo_mode."""

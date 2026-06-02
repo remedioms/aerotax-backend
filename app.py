@@ -304,20 +304,91 @@ _BUG004_WHITELIST_PREFIXES = (
     '/api/aerotax/',
 )
 
+# GET-Routes die token-spezifische PII zurückgeben → Auth-Check erforderlich,
+# auch wenn die HTTP-Methode ein Read ist. Liste wurde nach BE-11-Audit
+# (2026-06-02) zusammengestellt: alles wo der Response-Body Daten enthält
+# die nur dem Token-Owner gehören (Voice-Notes, DM-Inbox, Logbook, Roster,
+# iCal-Feed, Subscription-Status, etc).
+#
+# NICHT in dieser Liste — bewusst offen für Token-Owner-only Sharing oder
+# Pre-Friendship-Discovery:
+#   /api/user/profile/<token>     — Friend-Discovery (Profil-Lookup vor Add)
+#   /api/user/friends/<token>     — Friend-Discovery (sehe welche Freunde X hat)
+#   /api/wall/<token>/feed        — Public-Wall Feed
+#   /api/forum/<token>/threads    — Public Forum
+#   /api/layover-recs/discover/<token> — Public Discovery
+#   /api/download/<token>         — ShareLink-Pattern (gestaltet als bearer-URL)
+#
+# Der Match ist Pfad-PREFIX-basiert: alle Sub-Routen unter dem Prefix sind
+# abgedeckt (z.B. /api/user/voice-note/<token>/<datum> wird von
+# `/api/user/voice-note/` erfasst).
+_BUG004_GET_PII_PREFIXES = (
+    '/api/user/history/',
+    '/api/user/voice-note/',
+    '/api/user/flight-notes/',
+    '/api/user/flight-ops/',
+    '/api/user/briefing/',
+    '/api/user/roster-changes/',
+    '/api/user/logbook-html/',
+    '/api/user/logbook-pdf/',
+    '/api/user/calendar-pdf/',
+    '/api/user/ical/',
+    '/api/user/stats/',
+    '/api/user/trip-stats/',
+    '/api/user/marker-mapping/',
+    '/api/user/subscription/',
+    '/api/user/sponsored/',
+    '/api/user/crew-aircraft/',
+    '/api/user/friend-requests/',
+    '/api/user/friend-roster/',
+    '/api/user/friend-compare/',
+    '/api/user/friends-homebases/',
+    '/api/user/friends-today/',
+    '/api/user/friends/',   # /friends/<token>/overlap → PII
+    '/api/crew-chat/',      # alle DM/Inbox/Channel-Reads
+    '/api/moderation/',     # block/mute-Listen
+    '/api/lufthansa/status/',
+)
+
+
+def _bug004_get_route_needs_auth(path):
+    """True wenn ein GET-Path token-spezifische PII liefert (siehe
+    _BUG004_GET_PII_PREFIXES). Bewusst Prefix-basiert damit Sub-Pfade
+    (/dm/<friend>, /channel/<id>, /<datum>) automatisch erfasst sind.
+    """
+    for prefix in _BUG004_GET_PII_PREFIXES:
+        if path.startswith(prefix):
+            return True
+    return False
+
+
 @app.before_request
 def _bug004_token_auth_gate():
-    """Reject POST/PUT/DELETE requests with fake AT-... tokens that don't
-    exist in auth_users. Read methods stay open (intentional: feed-reads,
-    profile-lookups in friend-flow). Whitelisted-prefixes are bypassed."""
+    """Reject Requests mit gefakeden AT-...-Tokens die nicht in auth_users
+    existieren.
+
+    Coverage:
+    - POST/PUT/DELETE/PATCH: ALLE Routes mit AT-...-Pattern werden geprüft
+      (ausser Whitelist-Prefixes für Auth/Payment/Tax-Job).
+    - GET/HEAD: nur Routes die PII zurückgeben (siehe _BUG004_GET_PII_PREFIXES).
+      Friend-Discovery-Routes (/profile/, /wall/, /forum/) bleiben offen.
+    """
     try:
         method = (request.method or '').upper()
-        if method not in ('POST', 'PUT', 'DELETE', 'PATCH'):
-            return None
         path = request.path or ''
-        # Whitelist-Check: Auth/Health/Payment/Tax-Job-Pipeline → durchlassen
+        # Frühe Whitelist auch für GET-Pfad — public-Endpoints bypassen.
         for prefix in _BUG004_WHITELIST_PREFIXES:
             if path.startswith(prefix):
                 return None
+        # Welche Methoden kommen ins Gate?
+        if method in ('POST', 'PUT', 'DELETE', 'PATCH'):
+            requires_check = True
+        elif method in ('GET', 'HEAD'):
+            requires_check = _bug004_get_route_needs_auth(path)
+        else:
+            requires_check = False
+        if not requires_check:
+            return None
         m = _BUG004_TOKEN_PATH_RE.search(path)
         if not m:
             return None  # kein AT-...-Token im Pfad → kein Auth-Gate
@@ -7921,7 +7992,10 @@ def admin_qa_seed():
     state = _classify_job_state(job_entry, None)
     expires_at = (datetime.utcnow() + timedelta(hours=SESSION_HOURS)).isoformat() + 'Z'
 
-    print(f"[qa-seed] scenario={scenario} token={token[:12]}... job_id={job_id[:8]} "
+    # Token-Prefix wird gehasht statt raw geloggt, damit Cloud-Run-Logs kein
+    # tatsächliches Session-Token-Material enthalten (Security FAIL BE-8).
+    token_hash = _hashlib.sha256(token.encode('utf-8')).hexdigest()[:12]
+    print(f"[qa-seed] scenario={scenario} token_h={token_hash} job_id={job_id[:8]} "
           f"canonical={state['canonical_state']} pdf_allowed={state['pdf_allowed']}")
 
     return jsonify({
@@ -8254,6 +8328,12 @@ def _profile_save(token, profile, full_disk_payload=None):
 
 @app.route('/api/user/profile/<token>', methods=['GET'])
 def get_user_profile(token):
+    # PUBLIC-BY-DESIGN (BUG-004 audit, 2026-06-02): Profile-Lookup ist im
+    # Friend-Discovery-Flow notwendig BEVOR eine Friendship besteht — d.h. ein
+    # User scannt z.B. einen QR-Code, möchte Profil sehen vor Accept. Daher
+    # bewusst NICHT durch _bug004_token_auth_gate gedeckt. Daten sind auf
+    # opt-in-Felder beschränkt (name, homebase, position, airline, hometown).
+    # Private Felder (email, billing) NIEMALS hier zurückliefern.
     if not token:
         return jsonify({'error': 'invalid token'}), 400
     try:
@@ -15981,6 +16061,42 @@ def _ics_unfold_lines(src):
     return out
 
 
+def _ics_split_escaped(value):
+    """RFC 5545 §3.3.11: comma-separated TEXT-Liste mit `\\,` als Literal-Komma.
+    Liefert Liste der entescapten Einzelwerte. Auch `\\;` und `\\\\` werden
+    unescaped — alles andere bleibt literal. Leere Segmente werden gedroppt.
+    """
+    parts = []
+    buf = []
+    i = 0
+    s = value or ''
+    while i < len(s):
+        ch = s[i]
+        if ch == '\\' and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt in (',', ';', '\\'):
+                buf.append(nxt)
+                i += 2
+                continue
+            if nxt in ('n', 'N'):
+                buf.append('\n')
+                i += 2
+                continue
+        if ch == ',':
+            seg = ''.join(buf)
+            if seg:
+                parts.append(seg)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    seg = ''.join(buf)
+    if seg:
+        parts.append(seg)
+    return parts
+
+
 def _ics_parse_dt(value, params):
     """Parse DTSTART/DTEND-Value zu (utc_dt | None, local_date_str | None,
     is_date_only). Bucket = LOKAL nach TZID (siehe F1). All-Day → utc_dt=None.
@@ -16239,6 +16355,24 @@ def _parse_ics_to_events(text):
                 if utc_dt is not None:
                     current['end_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
                 current['_is_date_only_end'] = is_date
+            elif k == 'CATEGORIES':
+                # RFC 5545 §3.8.1.2: CATEGORIES ist comma-separated. Escaped
+                # commas (\,) zählen als Literal. Werte werden lowercased +
+                # gestripped damit Downstream-Mapping case-insensitive ist.
+                # Mehrfach-CATEGORIES-Zeilen pro Event sind erlaubt und werden
+                # akkumuliert.
+                cats_raw = _ics_split_escaped(v)
+                cats = [c.strip().lower() for c in cats_raw if c and c.strip()]
+                if cats:
+                    if 'categories' in current and isinstance(current['categories'], list):
+                        # Akkumulieren bei wiederholter CATEGORIES-Zeile (dedupe).
+                        seen = set(current['categories'])
+                        for c in cats:
+                            if c not in seen:
+                                current['categories'].append(c)
+                                seen.add(c)
+                    else:
+                        current['categories'] = cats
             elif k == 'RRULE':
                 rr = _ics_parse_rrule(v)
                 if rr:
@@ -16268,12 +16402,36 @@ def _parse_ics_to_events(text):
     return events
 
 
+def _ics_classify_from_categories(categories):
+    """Map RFC-5545 CATEGORIES → AeroX-klass-String.
+
+    Priorisierung: LAYOVER > STANDBY > OFF (Layover dominiert weil
+    Hotel-Übernachtung steuerlich relevanter ist als Standby/OFF).
+    Liefert None falls keine bekannte Kategorie gefunden.
+    """
+    if not categories:
+        return None
+    cats = set(c.lower() for c in categories if c)
+    # Priorisierung — LAYOVER ist das eindeutigste Signal für Hotel.
+    if 'layover' in cats or 'hotel' in cats:
+        return 'hotel_layover'
+    if 'standby' in cats or 'sby' in cats:
+        return 'standby'
+    if 'off' in cats or 'dayoff' in cats or 'day_off' in cats or 'frei' in cats:
+        return 'frei'
+    return None
+
+
 def _ics_events_to_briefings(events, existing=None):
     """Konsumiert Event-Liste → dict[datum_str → briefing_dict]. F2 expandiert
     Multi-Day-Events auf alle Tage, F5 merged Same-Day-Events.
 
     Merge-Regel: SUMMARY concat mit " · ", LOCATION concat mit ", " (dedupe),
     earliest start_iso, latest end_iso.
+
+    CATEGORIES → ical_klass: LAYOVER/HOTEL → hotel_layover, STANDBY → standby,
+    OFF → frei. Bestehende SUMMARY-basierte Klassifikation (downstream) bleibt
+    Fallback wenn `ical_klass` leer ist.
     """
     briefings = dict(existing or {})
     imported = 0
@@ -16290,6 +16448,8 @@ def _ics_events_to_briefings(events, existing=None):
         location = (ev.get('location') or '').strip()[:80]
         start_iso = (ev.get('start_iso') or '')[:25]
         end_iso = (ev.get('end_iso') or '')[:25]
+        categories = ev.get('categories') or []
+        klass_from_cats = _ics_classify_from_categories(categories)
         # Skip nur wenn ALLES leer.
         if not summary and not location and not start_iso:
             continue
@@ -16340,6 +16500,16 @@ def _ics_events_to_briefings(events, existing=None):
             existing_b['ical_start_iso'] = merged_start
             existing_b['ical_end_iso'] = merged_end
             existing_b['ical_imported_at'] = datetime.now().isoformat()
+            # CATEGORIES-Mapping: nur setzen wenn ein bekanntes Mapping
+            # gefunden wurde. Bei Same-Day-Merge: existing klass nicht überschreiben
+            # ausser das neue Event hat ein klares Signal (LAYOVER > STANDBY > frei).
+            if klass_from_cats:
+                prev_klass = (existing_b.get('ical_klass') or '').strip()
+                # Priorität: hotel_layover > standby > frei (das stärkere Signal
+                # gewinnt bei Konflikt; gleiche Stärke = bleibt).
+                priority = {'hotel_layover': 3, 'standby': 2, 'frei': 1}
+                if not prev_klass or priority.get(klass_from_cats, 0) > priority.get(prev_klass, 0):
+                    existing_b['ical_klass'] = klass_from_cats
             briefings[date_str] = existing_b
             imported += 1
     return briefings, imported
