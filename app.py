@@ -15295,6 +15295,15 @@ def auth_delete_account():
     if user_email and user_email in users:
         del users[user_email]
     _auth_save(users)
+    # _auth_save_to_supabase macht NUR upsert, KEIN row-delete. Wenn wir hier
+    # nur upsert'n, bleibt die SB-Row bestehen und ein nächster `_auth_load`
+    # liefert den User zurück → Login-on-deleted-Account würde noch erfolgreich
+    # sein. Explicit SB-delete der email-row ergänzen:
+    if SB_AVAILABLE and sb is not None and user_email:
+        try:
+            sb.table('auth_users').delete().eq('email', user_email).execute()
+        except Exception as e:
+            app.logger.warning(f'[auth-delete] sb_row_delete_fail: {type(e).__name__}: {str(e)[:120]}')
     # Wave-1 BUG-004: cache-invalidate damit der gerade gelöschte Token im
     # before_request-Gate ab sofort als unbekannt zählt.
     try: _invalidate_token_cache()
