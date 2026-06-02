@@ -14,7 +14,7 @@
 import os, io, uuid, json, re, tempfile, gc, hmac
 import hashlib as _hashlib
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request, jsonify, send_file, abort
+from flask import Flask, request, jsonify, send_file, abort, make_response
 from flask_cors import CORS
 import stripe
 import anthropic
@@ -84,6 +84,7 @@ for _bp_path, _bp_name in [
     ('blueprints.aircraft_health_blueprint', 'aircraft_health_bp'),
     ('blueprints.hotel_rooms_blueprint',     'hotel_rooms_bp'),
     ('blueprints.status_blueprint',          'status_bp'),
+    ('blueprints.family_watch',              'family_watch_bp'),  # Wave-1 BUG-002
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
@@ -252,6 +253,88 @@ _REQ_LOG_PREFIX = '[req]'
 #   /api/progress (SSE-Endpoint, langer Open)
 #   statische Assets (gibts hier nicht aber als Safety)
 _REQ_LOG_SKIP = ('/api/progress',)
+
+
+# ── Wave-1 BUG-004 (2026-06-02): Token-Auth-Gate via before_request ──
+# Wir matchen alle POST/PUT/DELETE-Pfade die ein `<token>`-Segment direkt
+# nach `/api/` haben (also `/api/wall/<token>/...`, `/api/user/profile/<token>`,
+# `/api/forum/<token>/...`, etc.) und prüfen das Token gegen auth_users.
+# Unbekannte Tokens → 401 unauthorized, kein Backend-Roundtrip.
+#
+# Whitelist-Patterns (kein Auth-Check):
+#   /api/auth/*               — Signup/Login selbst (token wird erst hier vergeben)
+#   /api/health, /api/version — public probe
+#   /api/wall/image/*         — public image-serve (Feed-Embed)
+#   /api/aerotax/...          — Steuer-Job-Pipeline (eigene Auth-Mechanik)
+#   /api/payment/*, /webhook  — Stripe payment-flow
+#   /api/upload/*, /api/restore-session/*, /api/session/*, /api/download/*
+#                             — Tax-Job-Tokens (job_id, NICHT auth-token)
+#   /api/feedback             — anon feedback
+#   /api/follow-me/*, /api/ical-* — public iCal/Followme
+#
+# Read-Methoden (GET, HEAD, OPTIONS) sind absichtlich NICHT auth-blocked —
+# das matched die existierende Architektur (Wall-Feed darf von jedem token
+# gelesen werden, der Profile-Lookup ist im Friend-Request-Flow notwendig
+# bevor Friendship besteht).
+import re as _bug004_re
+# Match any path segment after /api/ that starts with AT-... — used to find
+# the auth-token regardless of whether it's the 2nd or 3rd segment.
+# Examples:
+#   /api/wall/AT-XYZ/post              → AT-XYZ
+#   /api/user/profile/AT-XYZ           → AT-XYZ
+#   /api/family-share/AT-XYZ/revoke/AT-FAM → AT-XYZ (first match wins)
+_BUG004_TOKEN_PATH_RE = _bug004_re.compile(r'/(AT-[A-Za-z0-9_\-]+)(?:/|$)')
+_BUG004_WHITELIST_PREFIXES = (
+    '/api/auth/',
+    '/api/health',
+    '/api/version',
+    '/api/wall/image/',
+    '/api/upload/',
+    '/api/restore-session/',  # tax-job tokens, nicht auth-tokens
+    '/api/session/',
+    '/api/download/',
+    '/api/payment/',
+    '/api/webhook',
+    '/api/feedback',
+    '/api/follow-me/',
+    '/api/ical-',
+    '/api/job/',
+    '/api/finalize-pdf',
+    '/api/audit',
+    '/api/aerotax/',
+)
+
+@app.before_request
+def _bug004_token_auth_gate():
+    """Reject POST/PUT/DELETE requests with fake AT-... tokens that don't
+    exist in auth_users. Read methods stay open (intentional: feed-reads,
+    profile-lookups in friend-flow). Whitelisted-prefixes are bypassed."""
+    try:
+        method = (request.method or '').upper()
+        if method not in ('POST', 'PUT', 'DELETE', 'PATCH'):
+            return None
+        path = request.path or ''
+        # Whitelist-Check: Auth/Health/Payment/Tax-Job-Pipeline → durchlassen
+        for prefix in _BUG004_WHITELIST_PREFIXES:
+            if path.startswith(prefix):
+                return None
+        m = _BUG004_TOKEN_PATH_RE.search(path)
+        if not m:
+            return None  # kein AT-...-Token im Pfad → kein Auth-Gate
+        token = m.group(1)
+        # Guest-Tokens: explicit pass-through (Route entscheidet selbst)
+        if token.startswith('AT-GUEST-'):
+            return None
+        # Bekanntes Token? — _validate_token_exists nutzt 60s-Cache
+        if _validate_token_exists(token) is None:
+            return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    except Exception as e:
+        # Auth-Gate-Bugs dürfen die App nicht killen — log + pass-through
+        try:
+            app.logger.warning(f'[bug004-gate] error {type(e).__name__}: {str(e)[:120]}')
+        except Exception:
+            pass
+        return None
 
 
 @app.before_request
@@ -8186,8 +8269,25 @@ def put_user_profile(token):
     body = request.get_json(silent=True) or {}
     # Whitelist erweitert: hometown + employers waren vorher silent-gedroppt
     # (G3-Finding) → User editiert "Hometown" → kein round-trip-Sync.
+    # Wave-1 BUG-003 (2026-06-02): account_type + family_share_defaults
+    # waren silent-gedroppt → iOS UserProfile.isFamily-Flag konnte nicht
+    # persistiert werden, Family-Watcher-Root-Stack wurde nie geladen.
     safe_keys = ('name', 'homebase', 'position', 'airline', 'hometown')
     profile = {k: body.get(k) for k in safe_keys if body.get(k)}
+    # account_type: 'crew' | 'family' — validate strikt, sonst 400.
+    if 'account_type' in body:
+        at = body.get('account_type')
+        if at not in ('crew', 'family'):
+            return jsonify({'ok': False, 'error': 'invalid_account_type'}), 400
+        profile['account_type'] = at
+    # family_share_defaults: optional Liste mit Feld-Strings
+    fsd = body.get('family_share_defaults')
+    if isinstance(fsd, list):
+        # Whitelist gegen FamilyShareField-Enum (iOS-Side)
+        allowed = {'layover_place', 'current_city', 'landed_status',
+                   'next_flight', 'photos', 'voice_notes', 'aircraft_reg'}
+        profile['family_share_defaults'] = [f for f in fsd
+                                            if isinstance(f, str) and f in allowed][:20]
     # employers ist eine Liste — separat validieren (max 10, jeweils dict)
     emps = body.get('employers')
     if isinstance(emps, list):
@@ -11741,31 +11841,75 @@ def _wall_load_posts_from_disk():
 
 
 def _wall_load_posts():
-    """SB primary, Disk fallback, lazy-migrate (analog _auth_load)."""
+    """SB+Disk merge, dedupe by id, sorted by ts.
+
+    BUG-FIX (Wave-1 P0, 2026-06-02): Vorher war's SB-or-Disk (SB gewinnt wenn
+    non-empty). Konsequenz: Wenn `_wall_save_posts` Supabase-upsert silent failt
+    (caught Exception → warn-log only), aber Disk-Write succeeds, liefert der
+    nächste `_wall_load_posts`-Call die *stale* SB-Daten zurück, der frische
+    Post auf Disk ist invisible. Cross-Instance auf Cloud Run war's noch
+    schlimmer: Disk ist per-Instance, neue Posts auf Instance-A blieben für
+    Instance-B unsichtbar bis SB-Sync wieder lief.
+
+    Fix: MERGE statt either-or. Lade beide Quellen, dedupliziere nach `id`,
+    bei Konflikt gewinnt der höhere `ts` (frischere Daten). So sieht jede
+    Instanz den letzten gesicherten Post — egal welche Quelle ihn hat.
+    """
     sb_data = _wall_posts_load_from_supabase()
-    if sb_data is None:
-        return _wall_load_posts_from_disk()
-    if sb_data:
-        return sb_data
     disk_data = _wall_load_posts_from_disk()
-    if disk_data and SB_AVAILABLE:
+    if sb_data is None:
+        # SB down → reine Disk-Antwort
+        return disk_data or []
+    # Beide Quellen vorhanden — merge by id, neueres ts gewinnt
+    merged = {}
+    for p in (sb_data or []):
+        pid = p.get('id') if isinstance(p, dict) else None
+        if pid:
+            merged[pid] = p
+    for p in (disk_data or []):
+        pid = p.get('id') if isinstance(p, dict) else None
+        if not pid:
+            continue
+        existing = merged.get(pid)
+        if existing is None:
+            merged[pid] = p
+        else:
+            # Bei Konflikt: höheres ts (frischere Version) gewinnt.
+            new_ts = float(p.get('ts') or 0)
+            old_ts = float(existing.get('ts') or 0)
+            if new_ts >= old_ts:
+                merged[pid] = p
+    # Lazy-migrate disk → SB wenn SB leer + Disk-Daten vorhanden + SB up
+    if not sb_data and disk_data and SB_AVAILABLE:
         app.logger.info(f'[wall] lazy-migrate {len(disk_data)} disk posts → supabase')
         _wall_posts_save_to_supabase(disk_data)
-        return disk_data
-    return []
+    out = list(merged.values())
+    # Stable order by ts ascending (Append-Pattern erhalten — _wall_save_posts
+    # cappt nach `-5000:` auf den hinteren Slice; das setzt aufsteigende Ordnung
+    # voraus, sonst werden ältere Posts weggeschnitten).
+    out.sort(key=lambda p: float(p.get('ts') or 0))
+    return out
 
 
 def _wall_save_posts(posts):
-    """SB primary + Disk best-effort Read-Cache. Cap auf letzte 5000 Posts."""
+    """SB primary + Disk best-effort Read-Cache. Cap auf letzte 5000 Posts.
+
+    BUG-FIX (Wave-1 P0, 2026-06-02): Returnt jetzt True/False statt None.
+    Caller können entscheiden ob sie ein Schreib-Fehler propagieren wollen.
+    `create_wall_post` macht das nicht (Best-Effort UX), aber neuere Routes
+    sollen explizit prüfen können."""
     capped = (posts or [])[-5000:] if isinstance(posts, list) else posts
     sb_ok = _wall_posts_save_to_supabase(capped)
     p = _wall_posts_path()
+    disk_ok = False
     try:
         _atomic_write_json(p, capped, max_items=5000)
+        disk_ok = True
     except Exception as e:
         app.logger.warning(f'[wall] disk_save_fail (ok wenn SB läuft): {e}')
         if not sb_ok:
             app.logger.error('[wall] CRITICAL: weder SB noch Disk gesichert!')
+    return bool(sb_ok or disk_ok)
 
 
 def _sanitize_user_text(text, max_len=None):
@@ -11866,6 +12010,9 @@ def create_wall_post(token):
     # Guest-Token-Block (J23): AT-GUEST-* sind Demo-Tokens die nicht posten dürfen
     if token.startswith('AT-GUEST-'):
         return jsonify({'ok': False, 'error': 'demo_mode_cannot_post'}), 403
+    # Wave-1 BUG-004 (2026-06-02): Token-Auth wird zentral via @app.before_request
+    # `_bug004_token_auth_gate` durchgesetzt — wir kommen hier nur an mit
+    # bekanntem Token (oder AT-GUEST-*, das oben geblockt ist).
     # Rate-Limit: max 10 Wall-Posts pro Stunde pro User
     if _token_rate_limited(token, 'wall_post', limit=10, window_sec=3600):
         return jsonify({'ok': False, 'error': 'rate_limited',
@@ -14610,6 +14757,101 @@ def _auth_hash(pw):
     return hashlib.sha256((pw or '').encode('utf-8')).hexdigest()
 
 
+# ── Wave-1 BUG-004 (2026-06-02): Token-Auth Helper ──────────────────
+# In-process TTL-Cache (60s) damit _validate_token_exists nicht jeden
+# Auth-Check zu einem voll-SB-Read macht. _auth_load selbst liest 1000er-
+# Batches aus Supabase — bei 100 RPS würden wir SB unnötig belasten.
+_TOKEN_VALIDATE_CACHE = {'tokens': None, 'expires': 0.0}
+_TOKEN_VALIDATE_CACHE_TTL = 60.0
+
+def _validate_token_exists(token):
+    """Returns user-email (str) wenn token in auth_users existiert, sonst None.
+
+    Verwendet 60s in-process Cache. Bei Cache-Miss für ein unbekanntes
+    Token wird der Cache einmal nachgeladen (cover-Pfad für frische Signups
+    die noch nicht im Cache stehen) — danach bleibt der Cache für 60s gültig.
+
+    BUG-004 motiviert: vorher konnte jeder eine beliebige AT-...-string als
+    Token in URL packen und Posts/Comments unter forged Identität ablegen.
+    """
+    if not token or not isinstance(token, str):
+        return None
+    # Guest-Demo-Tokens werden separat behandelt (rejected vor diesem Helper)
+    import time as _t
+    now = _t.time()
+    cached = _TOKEN_VALIDATE_CACHE['tokens']
+    cache_stale = cached is None or _TOKEN_VALIDATE_CACHE['expires'] < now
+    if cache_stale:
+        cached = _refresh_token_cache(now)
+        if cached is None:
+            return None
+    hit = cached.get(token)
+    if hit is None and not cache_stale:
+        # Token nicht im Cache, aber Cache ist nicht stale. Möglich: neuer
+        # Signup seit letztem Refresh. Einmal force-refresh, dann erneut checken.
+        cached = _refresh_token_cache(now, force=True)
+        if cached is None:
+            return None
+        hit = cached.get(token)
+    return hit
+
+
+def _refresh_token_cache(now=None, force=False):
+    """Lädt _TOKEN_VALIDATE_CACHE neu aus auth_users. Returns das tmap
+    oder None bei Fehler."""
+    import time as _t
+    if now is None:
+        now = _t.time()
+    try:
+        users = _auth_load() or {}
+        tmap = {}
+        for email, rec in (users or {}).items():
+            tok = (rec or {}).get('token')
+            if tok:
+                tmap[tok] = email
+        _TOKEN_VALIDATE_CACHE['tokens'] = tmap
+        _TOKEN_VALIDATE_CACHE['expires'] = now + _TOKEN_VALIDATE_CACHE_TTL
+        return tmap
+    except Exception as e:
+        try:
+            app.logger.warning(f'[token-auth] cache_refresh_fail: {type(e).__name__}: {str(e)[:120]}')
+        except Exception:
+            pass
+        return None
+
+
+def _invalidate_token_cache():
+    """Force-refresh beim nächsten _validate_token_exists call. Wird von
+    Signup/Login/Delete-Account aufgerufen damit eben gemachte Token-Mutations
+    sofort im Auth-Gate sichtbar sind."""
+    _TOKEN_VALIDATE_CACHE['expires'] = 0.0
+
+
+def _token_auth_required(token):
+    """Wrapper für POST/PUT/DELETE-Routes mit <token>-Pfad.
+    Returns (None, None) wenn ok, sonst (jsonify-response, status-code).
+
+    Usage:
+        @app.route('/api/foo/<token>/bar', methods=['POST'])
+        def my_route(token):
+            err = _token_auth_required(token)
+            if err: return err
+            # ... continue ...
+    """
+    # Guest-Demo-Tokens haben kein Auth-Record — eigene Block-Logik in jeder
+    # Route (z.B. wall/post sendet 403 demo_mode). Hier behandeln wir nur den
+    # Real-User-Case.
+    if not token:
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    if token.startswith('AT-GUEST-'):
+        # Guest tokens haben keinen Auth-Record. Eigene Routes müssen
+        # explizit 403 returnen wenn sie Guest blocken. Hier: pass-through.
+        return None
+    if _validate_token_exists(token) is None:
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    return None
+
+
 _PBKDF2_ITERATIONS = 600_000  # OWASP 2023 für PBKDF2-SHA256
 _PBKDF2_DKLEN = 32
 
@@ -14706,6 +14948,10 @@ def auth_signup():
         'created_at': datetime.now().isoformat(),
     }
     _auth_save(users)
+    # Wave-1 BUG-004: cache-invalidate damit der eben erstellte Token sofort
+    # im before_request-Auth-Gate sichtbar ist (sonst 401 bis 60s-TTL abläuft).
+    try: _invalidate_token_cache()
+    except Exception: pass
     return jsonify({'ok': True, 'token': token, 'email': email})
 
 
@@ -14876,6 +15122,8 @@ def auth_apple():
         # kein password_hash · klassischer login wäre für diesen Account disabled
     }
     _auth_save(users)
+    try: _invalidate_token_cache()
+    except Exception: pass
     # Wenn Apple einen name geliefert hat (nur beim ersten Login) · ins Profile vorbefüllen
     if name:
         try:
@@ -15047,6 +15295,10 @@ def auth_delete_account():
     if user_email and user_email in users:
         del users[user_email]
     _auth_save(users)
+    # Wave-1 BUG-004: cache-invalidate damit der gerade gelöschte Token im
+    # before_request-Gate ab sofort als unbekannt zählt.
+    try: _invalidate_token_cache()
+    except Exception: pass
 
     import os, shutil
     deleted = []
@@ -15175,6 +15427,147 @@ def auth_delete_account():
         pass
 
     return jsonify({'ok': True, 'deleted': deleted})
+
+
+# ════════════════════════════════════════════════════════════════════
+#  DSGVO Art. 15 — Auskunftsrecht / Datenexport  (Wave-1 BUG-005, 2026-06-02)
+# ════════════════════════════════════════════════════════════════════
+
+@app.route('/api/auth/export-data', methods=['GET', 'POST'])
+def auth_export_data():
+    """DSGVO Art. 15 — User exportiert alle gespeicherten Daten als JSON.
+
+    Auth via Bearer-Token im Authorization-Header ODER per ?token=... Query-Param
+    ODER per body.token (POST). iOS APIClient.exportData() schickt den Header.
+
+    Response: application/json mit Content-Disposition attachment header
+    (iOS speichert direkt als file). Felder: profile, wall_posts (own),
+    wall_comments (own), friends, employers, voice_notes_metadata,
+    briefings, ical_events, license_wallet_items.
+    """
+    # Token aus Header > Query > Body
+    auth_h = (request.headers.get('Authorization') or '').strip()
+    token = None
+    if auth_h.lower().startswith('bearer '):
+        token = auth_h[7:].strip()
+    if not token:
+        token = (request.args.get('token') or '').strip()
+    if not token and request.method == 'POST':
+        body = request.get_json(silent=True) or {}
+        token = (body.get('token') or '').strip()
+    if not token:
+        return jsonify({'ok': False, 'error': 'missing_token'}), 401
+
+    # Validate via auth_users (gleiche Quelle wie _validate_token_exists)
+    user_email = _validate_token_exists(token)
+    if user_email is None:
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+
+    export = {
+        'meta': {
+            'token': token,
+            'email': user_email,
+            'exported_at': datetime.now().isoformat(),
+            'export_version': '1.0',
+            'dsgvo_article': 'Art. 15 EU-DSGVO (Right to Access)',
+        },
+        'profile': {},
+        'friends': [],
+        'wall_posts': [],
+        'wall_comments': [],
+        'voice_notes_metadata': [],
+        'briefings': [],
+        'ical_events': [],
+        'license_wallet_items': [],
+        'family_shares_granted': [],
+    }
+
+    # ── Profile ────────────────────────────────────────────────────────
+    try:
+        pp = _user_profile_path(token)
+        if pp and os.path.exists(pp):
+            with open(pp) as f:
+                export['profile'] = json.load(f) or {}
+    except Exception as e:
+        export['profile'] = {'_read_error': str(e)[:200]}
+
+    # ── Friends ────────────────────────────────────────────────────────
+    try:
+        fr = _friends_load(token) or {}
+        export['friends'] = fr.get('friends') or []
+    except Exception as e:
+        export['friends'] = []
+        export['_friends_error'] = str(e)[:200]
+
+    # ── Wall-Posts (own) + Wall-Comments (own) ─────────────────────────
+    try:
+        all_posts = _wall_load_posts() or []
+        export['wall_posts'] = [p for p in all_posts if p.get('author_token') == token]
+        # Comments: pro Post-Datei lesen, filtern auf author_token
+        own_comments = []
+        for p in all_posts:
+            try:
+                cmts = _wall_comments_load(p.get('id')) or []
+                for c in cmts:
+                    if c.get('author_token') == token:
+                        own_comments.append({**c, 'post_id': p.get('id')})
+            except Exception:
+                pass
+        export['wall_comments'] = own_comments
+    except Exception as e:
+        export['_wall_error'] = str(e)[:200]
+
+    # ── Voice-Notes (Metadata-only, KEIN m4a-Inhalt) ────────────────────
+    try:
+        safe = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+        vn_dir = os.path.join(_USER_HISTORY_DIR, 'voice_notes', safe)
+        if os.path.isdir(vn_dir):
+            for fn in os.listdir(vn_dir):
+                fp = os.path.join(vn_dir, fn)
+                try:
+                    st = os.stat(fp)
+                    export['voice_notes_metadata'].append({
+                        'filename': fn,
+                        'size_bytes': st.st_size,
+                        'modified_iso': datetime.fromtimestamp(st.st_mtime).isoformat(),
+                    })
+                except Exception:
+                    pass
+    except Exception as e:
+        export['_voice_notes_error'] = str(e)[:200]
+
+    # ── Briefings / iCal-Events (SB primary) ───────────────────────────
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = sb.table('briefings').select('*').eq('user_token', token).execute()
+            export['briefings'] = r.data or []
+        except Exception as e:
+            export['_briefings_error'] = str(e)[:200]
+        try:
+            r = sb.table('ical_events').select('*').eq('user_token', token).execute()
+            export['ical_events'] = r.data or []
+        except Exception:
+            pass
+        try:
+            r = sb.table('user_licenses').select('*').eq('user_token', token).execute()
+            export['license_wallet_items'] = r.data or []
+        except Exception:
+            pass
+        try:
+            r = (sb.table('family_shares').select('*')
+                 .eq('crew_token', token).eq('deleted', False).execute())
+            export['family_shares_granted'] = r.data or []
+        except Exception:
+            pass
+
+    # JSON-Response mit attachment-Header (iOS speichert als File)
+    today_str = datetime.now().date().isoformat()
+    fname = f'aerox-export-{today_str}.json'
+    payload = json.dumps(export, ensure_ascii=False, indent=2, default=str)
+    resp = make_response(payload)
+    resp.headers['Content-Type'] = 'application/json; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename="{fname}"'
+    return resp
 
 
 # ── UGC-Moderation (Apple Guideline 1.4.1) ─────────────────────────────

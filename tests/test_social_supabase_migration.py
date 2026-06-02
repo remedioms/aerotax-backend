@@ -22,15 +22,38 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 # WALL-POSTS
 # ════════════════════════════════════════════════════════════════════
 
-def test_wall_posts_load_uses_supabase_when_available():
-    """SB-Hit → SB-Daten zurueck; Disk wird ignoriert."""
+def test_wall_posts_load_merges_supabase_and_disk_dedupe_by_id():
+    """Wave-1 BUG-001 fix (2026-06-02): _wall_load_posts MERGED SB+Disk
+    statt either-or. SB-Posts haben Vorrang bei id-Konflikt (höherer ts);
+    Disk-Posts deren id nicht in SB sind, kommen mit.
+
+    Vorher: SB-or-Disk → frische Disk-Posts auf Cloud Run unsichtbar
+    wenn SB-upsert silent failt.
+    """
     import app as A
-    sb_posts = [{'id': 'p1', 'author_token': 'AT-X', 'ts': 1.0, 'text': 'hi'}]
-    with patch.object(A, '_wall_posts_load_from_supabase', return_value=sb_posts):
+    sb_post = {'id': 'p1', 'author_token': 'AT-X', 'ts': 1.0, 'text': 'sb'}
+    disk_only_post = {'id': 'd1', 'author_token': 'AT-D', 'ts': 2.0, 'text': 'disk-fresh'}
+    with patch.object(A, '_wall_posts_load_from_supabase', return_value=[sb_post]):
         with patch.object(A, '_wall_load_posts_from_disk',
-                          return_value=[{'id': 'stale', 'ts': 0}]):
+                          return_value=[disk_only_post]):
             posts = A._wall_load_posts()
-    assert posts == sb_posts, "SB-Posts muessen Disk ueberschreiben"
+    ids = sorted([p['id'] for p in posts])
+    assert ids == ['d1', 'p1'], (
+        f"Merge muss beide IDs enthalten (SB-Posts + Disk-only). Got: {ids!r}"
+    )
+
+
+def test_wall_posts_load_higher_ts_wins_on_id_conflict():
+    """Bei gleicher id: höherer ts (frischere Version) gewinnt. Sichert
+    dass eine stale-disk-Kopie einen frischen SB-Post nicht überschreibt."""
+    import app as A
+    sb_fresh = {'id': 'p1', 'ts': 100.0, 'text': 'fresh-sb'}
+    disk_stale = {'id': 'p1', 'ts': 50.0, 'text': 'stale-disk'}
+    with patch.object(A, '_wall_posts_load_from_supabase', return_value=[sb_fresh]):
+        with patch.object(A, '_wall_load_posts_from_disk', return_value=[disk_stale]):
+            posts = A._wall_load_posts()
+    assert len(posts) == 1
+    assert posts[0]['text'] == 'fresh-sb', f"Höheres ts muss gewinnen, got {posts[0]!r}"
 
 
 def test_wall_posts_load_falls_back_to_disk_when_sb_down():
@@ -326,7 +349,8 @@ def test_dm_messages_save_to_supabase_text_to_body_column():
 if __name__ == '__main__':
     tests = [
         # wall
-        test_wall_posts_load_uses_supabase_when_available,
+        test_wall_posts_load_merges_supabase_and_disk_dedupe_by_id,
+        test_wall_posts_load_higher_ts_wins_on_id_conflict,
         test_wall_posts_load_falls_back_to_disk_when_sb_down,
         test_wall_posts_save_writes_both_sb_and_disk,
         test_wall_posts_lazy_migrates_disk_to_sb,
