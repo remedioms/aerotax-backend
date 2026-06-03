@@ -450,3 +450,56 @@ def test_foreign_outstation_standby_stays_real():
     d = r.by_date.get('2025-01-04')
     assert d is not None and d['klass'] == 'Z76', f'Auslands-Standby muss Z76 bleiben, got {d}'
     assert r.hotel_naechte == 2, f'Auslands-Standby-Nacht muss zählen, got {r.hotel_naechte}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 10: Standby ohne VMA + Office-Fahrtag-Mislabel (2026-06-03)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_absorbed_home_standby_gets_no_vma_on_se_less_path():
+    """SB_S, der über eine Reader-Lücke als Tour-Heimkehrtag absorbiert wird,
+    bekommt keine VMA (klass 'none'), auch ohne SE-Zeilen. (Verfügbarkeit = keine
+    Spesen.) In Prod ohnehin SE-gegated; dies deckt den SE-losen Pfad."""
+    cas = [
+        _cas('2025-01-03', marker='31591', routing=['FRA', 'BLR'],
+             starts_hb=True, layover_ort='BLR', overnight=True, duty_min=600),
+        _cas('2025-01-04', marker='X', layover_ort='BLR', overnight=True),
+        _cas('2025-01-05', marker='X', routing=['BLR', 'FRA'], duty_min=600),
+        _cas('2025-01-06', marker='SB_S'),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF_2025)
+    d = r.by_date.get('2025-01-06')
+    assert d is None or d.get('klass') != 'Z76', f'Home-Standby darf kein Z76 sein, got {d}'
+
+
+def _cas_dep(datum, marker='', routing=None, duty_min=0, starts_hb=False,
+             ends_hb=False, activity='', is_dep=False):
+    d = _cas(datum, marker, routing, '', False, starts_hb, ends_hb, duty_min)
+    d['activity_type'] = activity
+    if is_dep:
+        d['is_tour_departure'] = True
+    return d
+
+
+def test_office_mislabeled_as_departure_is_not_fahrtag():
+    """Ein Office/Training-Tag (EM @ FRA, kein Flug), den der V2-Reader fälschlich
+    mit is_tour_departure stempelt, ist KEIN Tour-Start → kein Fahrtag (Miguel
+    61 vs 53)."""
+    cas = [_cas_dep('2025-02-01', marker='EM', routing=['FRA'], duty_min=500,
+                    starts_hb=True, ends_hb=True, activity='office', is_dep=True)]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF_2025)
+    assert r.fahrtage == 0, f'Office-Mislabel darf kein Fahrtag sein, got {r.fahrtage}'
+
+
+def test_inland_same_day_flight_stays_a_fahrtag():
+    """Abgrenzung: echte Inland-Eintages-Auswärtstätigkeit FRA->MUC->FRA (>8h,
+    echter Flug-Token) bleibt ein Fahrtag — der Office-Guard darf sie nicht killen."""
+    cas = [_cas_dep('2025-02-02', marker='LH100', routing=['FRA', 'MUC', 'FRA'],
+                    duty_min=540, starts_hb=True, ends_hb=True,
+                    activity='flight', is_dep=True)]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'),
+        {'MUC': {'an_abreise': 14.0, 'voll_24h': 28.0, 'country': 'Deutschland'}})
+    assert r.fahrtage == 1, f'Inland-Eintagesfahrt muss Fahrtag bleiben, got {r.fahrtage}'

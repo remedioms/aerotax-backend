@@ -482,6 +482,19 @@ def _se_block_vma_if_no_se_line(se_blocks_all_vma, day_bucket, day_eur, day_audi
     return day_bucket, day_eur
 
 
+def _block_vma_if_home_standby(is_home_standby, day_bucket, day_eur, day_audit):
+    """Home-Standby (Verfügbarkeit zuhause, inkl. homebound Airport-Standby) hat
+    NIE VMA — auch wenn ein Reader-Lücken-Bracket ihn als Tour-(Heimkehr-)Tag
+    absorbiert hat. In Prod meist schon SE-gegated; dies schließt den SE-losen
+    Pfad. Ausgelagert (Branch-Count <50). Returnt (day_bucket, day_eur)."""
+    if is_home_standby and day_bucket in ('Z72', 'Z73', 'Z74', 'Z76'):
+        if day_audit is not None:
+            day_audit['reason'] = (day_audit.get('reason') or '') + \
+                f' | Home-Standby → keine VMA (war {day_bucket})'
+        return 'none', 0.0
+    return day_bucket, day_eur
+
+
 def _build_se_day_index(se_rows, homebase):
     """Pro Datum: SE-stfrei-Signal aus der Streckeneinsatz-Abrechnung.
 
@@ -1288,8 +1301,15 @@ def calculate_allowances_from_normalized_tours(
         # R21 (2026-05-26): V2-Reader liefert is_tour_departure direkt. Wenn
         # Sonnet einen Tag als Tour-Departure markiert hat, ist das ein
         # legitimer Tour-Start auch ohne andere Heuristiken.
+        # FIX (2026-06-03): Office/Training/Frei-Tag, den der V2-Reader fälschlich
+        # mit is_tour_departure stempelt, ist KEIN Tour-Start → kein Fahrtag
+        # (Miguel: 61 vs 53). Echte Touren zählen weiter über foreign_signal/
+        # overnight; legitime Inland-Eintages-Fahrten über tour_has_inland_flight_
+        # same_day (echter Flug-Token). NUR der nackte LLM-Hint auf Office/Frei
+        # wird entwertet. (tibor_diff-neutral: Fahrtage bleiben 56.)
         tour_has_v2_departure_hint = any(
             bool(td.cas_raw.get('is_tour_departure'))
+            and not td.is_training and not td.is_free
             for td in tour.days
         )
         # R22 (2026-05-26): Inland-Same-Day-Tour mit echtem Flug-Token zählt
@@ -1555,6 +1575,11 @@ def calculate_allowances_from_normalized_tours(
             # → keine VMA (Tour-Rand-/Leertag, FollowMe wertet als Frei).
             day_bucket, day_eur = _se_block_vma_if_no_se_line(
                 _se_blocks_all_vma, day_bucket, day_eur, day_audit)
+
+            # FIX (2026-06-03): Home-Standby hat NIE VMA (s. Helfer). Ausgelagert,
+            # um den Branch-Count der allowance-calc-Funktion <50 zu halten.
+            day_bucket, day_eur = _block_vma_if_home_standby(
+                td.is_home_standby, day_bucket, day_eur, day_audit)
 
             # Aggregate
             if day_bucket == 'Z72':
