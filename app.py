@@ -15820,6 +15820,86 @@ def _muted_by(token):
     return _load_set_file(_mutes_path(token))
 
 
+# ── Airport Live-Board (FRA) — KOSTENLOSE öffentliche Fraport-JSON-Quelle ──
+# https://www.frankfurt-airport.com/de/_jcr_content.flights.json (?page=N) liefert
+# Abflüge mit reg/gate/status/delay. Wir proxyen + cachen serverseitig (iOS hätte
+# ATS/CORS-Probleme + die Quelle blockt evtl. Direct-Clients). KEINE Erfindung —
+# 1:1 was Fraport liefert; bei Quelle-down → ehrlicher source_unavailable.
+_AIRPORT_BOARD_CACHE = {}     # key -> (ts, list)
+_AIRPORT_BOARD_TTL = 120      # 2 Min — Board ändert sich nicht schneller sinnvoll.
+
+def _fetch_fra_departures(max_pages=6):
+    if requests is None:
+        return None
+    out = []
+    base = 'https://www.frankfurt-airport.com/de/_jcr_content.flights.json'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+                      'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148',
+        'Accept': 'application/json',
+    }
+    for page in range(1, max_pages + 1):
+        try:
+            params = {} if page == 1 else {'page': page}
+            r = requests.get(base, params=params, headers=headers, timeout=12)
+            if r.status_code != 200:
+                break
+            data = (r.json() or {}).get('data') or []
+            if not data:
+                break
+            for f in data:
+                out.append({
+                    'airline': (f.get('al') or '').strip(),
+                    'airline_name': (f.get('alname') or '').strip(),
+                    'flight': (f.get('fnr') or '').replace(' ', ''),
+                    'dest_iata': (f.get('iata') or '').strip(),
+                    'dest_name': (f.get('apname') or '').strip(),
+                    'sched': f.get('sched'),
+                    'gate': (f.get('gate') or '').strip(),
+                    'terminal': (f.get('terminal') or '').strip(),
+                    'hall': (f.get('halle') or '').strip(),
+                    'status': (f.get('status') or '').strip(),
+                    'delayed': bool(f.get('s')),
+                    'reg': (f.get('reg') or '').strip(),
+                    'aircraft': (f.get('ac') or '').strip(),
+                })
+            if len(data) < 25:
+                break
+        except Exception:
+            break
+    return out
+
+@app.route('/api/airport/<token>/board', methods=['GET'])
+def airport_board(token):
+    """FRA-Abflug-Board (live). Query: ?airport=FRA&airline=LH&limit=60.
+    Nur FRA (kostenlose Fraport-Quelle) — andere Airports ehrlich abgelehnt."""
+    airport = (request.args.get('airport') or 'FRA').upper()
+    airline = (request.args.get('airline') or '').upper().strip()
+    try:
+        limit = min(int(request.args.get('limit') or 60), 200)
+    except Exception:
+        limit = 60
+    if airport != 'FRA':
+        return jsonify({'ok': False, 'error': 'airport_not_supported', 'airport': airport,
+                        'message': 'Aktuell nur FRA-Abflüge (kostenlose Fraport-Quelle).'}), 200
+    import time as _t
+    ckey = 'FRA_dep'
+    cached = _AIRPORT_BOARD_CACHE.get(ckey)
+    if cached and (_t.time() - cached[0]) < _AIRPORT_BOARD_TTL:
+        flights = cached[1]
+    else:
+        flights = _fetch_fra_departures()
+        if flights is None:
+            return jsonify({'ok': False, 'error': 'source_unavailable',
+                            'message': 'FRA-Board gerade nicht erreichbar.'}), 200
+        _AIRPORT_BOARD_CACHE[ckey] = (_t.time(), flights)
+    if airline:
+        flights = [f for f in flights if f.get('airline') == airline]
+    return jsonify({'ok': True, 'airport': 'FRA', 'type': 'departure',
+                    'count': len(flights[:limit]), 'flights': flights[:limit],
+                    'source': 'fraport', 'cached_ttl': _AIRPORT_BOARD_TTL})
+
+
 @app.route('/api/moderation/<token>/report', methods=['POST'])
 def moderation_report(token):
     """Inhalts-Meldung. Body: {kind: 'wall_post'|'wall_comment'|'forum_thread'|
