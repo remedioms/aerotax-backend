@@ -965,6 +965,24 @@ def build_normalized_tours(
             [d for d in (cas_days or []) if isinstance(d, dict)],
             key=lambda d: d.get('datum', '') or '')
 
+    # FIX (2026-06-04): Dedup nach Kalendertag. VMA/Hotel sind streng pro
+    # Kalendertag (§9 Abs.4a) — zwei CAS-Zeilen mit demselben datum dürfen nicht
+    # doppelt zählen. Ohne Dedup zählte die Per-TourDay-Summation (z76_eur/tage,
+    # hotel_naechte) den Dublettentag doppelt, während by_date (dict-keyed)
+    # dedupte → summary ≠ by_date. Erste Vorkommen behalten; Zeilen ohne datum
+    # bleiben (werden später per day_date=None verworfen). Auf Echtdaten ein
+    # No-op (Tibor hat 0 Dublettentage).
+    _seen_dates = set()
+    _deduped = []
+    for _d in sorted_days:
+        _ds = (_d.get('datum') or '') if isinstance(_d, dict) else ''
+        if _ds and _ds in _seen_dates:
+            continue
+        if _ds:
+            _seen_dates.add(_ds)
+        _deduped.append(_d)
+    sorted_days = _deduped
+
     tours: List[NormalizedTour] = []
     current_tour_days: List[TourDay] = []
     current_tour_evidence: Dict[str, Any] = {'cas': [], 'se': [], 'reasoning': []}

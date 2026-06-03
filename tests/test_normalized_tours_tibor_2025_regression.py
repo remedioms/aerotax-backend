@@ -607,3 +607,27 @@ def test_inland_same_day_trip_no_phantom_hotel():
     r = calculate_allowances_from_normalized_tours(
         build_normalized_tours(cas, [], 2025, homebase='FRA'), {})
     assert r.hotel_naechte == 0, f'Tagestrip = keine Hotelnacht, got {r.hotel_naechte}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 14: Doppelte Kalendertage dedupen (Round 3, 2026-06-04)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_duplicate_calendar_date_not_double_counted():
+    """Zwei CAS-Zeilen mit demselben datum dürfen VMA/Hotel/Tage nicht doppelt
+    zählen (§9 Abs.4a: pro Kalendertag). Vorher: Per-TourDay-Summation zählte
+    doppelt, by_date (dict) dedupte → summary != by_date."""
+    BMF = {'JFK': {'an_abreise': 40.0, 'voll_24h': 59.0, 'country': 'USA'}}
+    cas = [
+        _cas('2025-06-01', marker='LH400', routing=['FRA', 'JFK'], layover_ort='JFK',
+             overnight=True, starts_hb=True, duty_min=600),
+        _cas('2025-06-02', marker='X', routing=['JFK'], layover_ort='JFK', overnight=True),
+        _cas('2025-06-02', marker='X', routing=['JFK'], layover_ort='JFK', overnight=True),  # DUP
+        _cas('2025-06-03', marker='LH401', routing=['JFK', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF)
+    bd_z76 = sum(v.get('amount', 0) for v in r.by_date.values() if v.get('klass') == 'Z76')
+    assert r.z76_tage == 3, f'3 Kalendertage erwartet (Dublette dedupt), got {r.z76_tage}'
+    assert r.hotel_naechte == 2, f'2 Hotelnächte erwartet, got {r.hotel_naechte}'
+    assert abs(r.z76_eur - bd_z76) < 0.01, f'summary z76_eur {r.z76_eur} != sum(by_date) {bd_z76}'
