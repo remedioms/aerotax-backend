@@ -11614,6 +11614,41 @@ def _wall_comments_path(post_id):
     safe = re.sub(r'[^A-Za-z0-9_-]', '', post_id or '')[:32]
     return os.path.join(_wall_dir(), f'comments_{safe}.json') if safe else None
 
+# ── Dislikes + Reports (P0 Social-Feed, 2026-06-03) — Disk-only (kein SB-Table
+#    nötig; analog der Disk-Fallback-Pfade der Likes). Reports keyed per post. ──
+def _wall_dislikes_path(token):
+    import os, re
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    return os.path.join(_wall_dir(), f'dislikes_{safe}.json') if safe else None
+
+def _wall_dislikes_load(token):
+    p = _wall_dislikes_path(token)
+    if not p:
+        return set()
+    try:
+        with open(p) as f:
+            return set(json.load(f) or [])
+    except Exception:
+        return set()
+
+# Wall-Report Auto-Hide-Schwelle: ab so vielen DISTINCT-Reportern wird ein
+# Post im Feed versteckt (Logik in moderation_report, kind='wall_post').
+_WALL_REPORT_HIDE_THRESHOLD = 3
+
+# Anonyme Layover-Stories: stabiler, NICHT-umkehrbarer Handle pro Author.
+# Gleicher Author → gleicher Handle (im Feed wiedererkennbar), aber kein
+# Rückschluss auf Identität (sha256, kein Token im Response).
+_ANON_ADJ = ['Silent', 'Night', 'Mach', 'Tail', 'Jet', 'Cloud', 'Sky', 'Delta', 'Echo',
+             'Foxtrot', 'Cruise', 'Apron', 'Crosswind', 'Redeye', 'Galley', 'Standby']
+_ANON_NOUN = ['Captain', 'Cruiser', 'Skipper', 'Nomad', 'Falcon', 'Albatross', 'Comet',
+              'Voyager', 'Ranger', 'Drifter', 'Aviator', 'Wanderer', 'Phantom', 'Maverick']
+def _anon_handle_for(token):
+    import hashlib
+    h = hashlib.sha256(('anonwall:' + (token or '')).encode()).hexdigest()
+    a = _ANON_ADJ[int(h[0:4], 16) % len(_ANON_ADJ)]
+    n = _ANON_NOUN[int(h[4:8], 16) % len(_ANON_NOUN)]
+    return f'{a}{n}{int(h[8:10], 16) % 100:02d}'
+
 # ── Wall-Posts SB persistence (P0 Worker-P1, 2026-06-01) ──
 # Disk-only war auf Cloud Run ein Wipe-pro-Redeploy. Pattern wie _auth_load/_save:
 #   primary = SB, fallback = Disk, einmal-Lazy-Migrate beim ersten SB-leeren Read.
@@ -12127,11 +12162,14 @@ def create_wall_post(token):
                 extracted_tags.append(t)
     except Exception:
         extracted_tags = []
+    # Anonyme Layover-Story: KEIN Author-Snapshot, stattdessen stabiler
+    # anon_handle. Load-bearing für "anonym posten" — sonst nur pseudonym.
+    is_anonymous = bool(body.get('is_anonymous'))
     import uuid, time
     post = {
         'id': str(uuid.uuid4())[:12],
         'author_token': token,
-        'author_short': token[:8],
+        'author_short': None if is_anonymous else token[:8],
         'text': text,
         'image_url': image_url,
         'layover_iata': layover if layover and len(layover) == 3 else None,
@@ -12139,17 +12177,24 @@ def create_wall_post(token):
         'created_at': datetime.now().isoformat(),
         'ts': time.time(),
         'like_count': 0,
+        'dislike_count': 0,
         'comment_count': 0,
+        'is_anonymous': is_anonymous,
     }
-    # Add author profile snapshot
-    try:
-        with open(_user_profile_path(token)) as f:
-            pr = json.load(f).get('profile', {})
-        post['author_name'] = pr.get('name')
-        post['author_airline'] = pr.get('airline')
-        post['author_homebase'] = pr.get('homebase')
-    except Exception:
-        pass
+    if is_anonymous:
+        # Stabiler Handle, kein Profil. author_token bleibt server-seitig
+        # NUR für Moderation/Ownership (wird im Feed wegstripped).
+        post['anon_handle'] = _anon_handle_for(token)
+    else:
+        # Author profile snapshot (nur bei nicht-anonym).
+        try:
+            with open(_user_profile_path(token)) as f:
+                pr = json.load(f).get('profile', {})
+            post['author_name'] = pr.get('name')
+            post['author_airline'] = pr.get('airline')
+            post['author_homebase'] = pr.get('homebase')
+        except Exception:
+            pass
     posts = _wall_load_posts()
     posts.append(post)
     _wall_save_posts(posts)
@@ -12174,25 +12219,30 @@ def get_wall_feed(token):
     blocked = _blocked_by(token)
     muted = _muted_by(token)
     posts = _wall_load_posts()
+    # Auto-versteckte Posts (≥N Reports) raus — außer für den Author selbst.
+    def _visible(p):
+        if p.get('author_token') in blocked or p.get('author_token') in muted:
+            return False
+        if p.get('hidden') and p.get('author_token') != token:
+            return False
+        return True
     if mode == 'friends':
-        feed = [p for p in posts
-                if p.get('author_token') in friends
-                and p.get('author_token') not in blocked
-                and p.get('author_token') not in muted]
+        feed = [p for p in posts if p.get('author_token') in friends and _visible(p)]
     else:
-        # Default: alle Public-Posts (außer blocked/muted). Friends-Sort kommt
-        # client-side über `from_friend`-Flag im Response.
-        feed = [p for p in posts
-                if p.get('author_token') not in blocked
-                and p.get('author_token') not in muted]
+        # Default: alle Public-Posts (außer blocked/muted/hidden). Friends-Sort
+        # kommt client-side über `from_friend`-Flag im Response.
+        feed = [p for p in posts if _visible(p)]
     feed.sort(key=lambda p: -(p.get('ts') or 0))
     if before_ts > 0:
         feed = [p for p in feed if (p.get('ts') or 0) < before_ts]
     feed = feed[:limit]
-    # Add liked-by-me flag (SB primary, Disk fallback via _wall_likes_load)
+    # Add liked/disliked-by-me flags (SB primary, Disk fallback)
     liked_ids = _wall_likes_load(token) or set()
+    disliked_ids = _wall_dislikes_load(token) or set()
     for p in feed:
         p['liked_by_me'] = p['id'] in liked_ids
+        p['disliked_by_me'] = p['id'] in disliked_ids
+        p.setdefault('dislike_count', 0)
         # is_mine: Owner-Flag damit iOS-Client einen "Löschen"-Button
         # auf eigene Posts zeigen kann (DSGVO Art. 17 sub-right).
         p['is_mine'] = (p.get('author_token') == token)
@@ -12200,7 +12250,13 @@ def get_wall_feed(token):
         # (golden Border o.ä.) ohne separates Endpoint-Roundtrip.
         p['from_friend'] = (p.get('author_token') in friends
                             and p.get('author_token') != token)
-        # Strip author_token for privacy in feed
+        # Anonyme Posts: jeden Profil-Rest entfernen, nur anon_handle bleibt.
+        if p.get('is_anonymous'):
+            if not p.get('anon_handle'):
+                p['anon_handle'] = _anon_handle_for(p.get('author_token'))
+            for k in ('author_name', 'author_airline', 'author_homebase', 'author_short'):
+                p.pop(k, None)
+        # Strip author_token for privacy in feed (NACH allen Flags).
         p.pop('author_token', None)
     return jsonify({'count': len(feed), 'posts': feed})
 
@@ -12258,6 +12314,53 @@ def toggle_like(token, post_id):
     return jsonify({'ok': True, 'like_count': new_count, 'liked_by_me': liked_by_me})
 
 
+@app.route('/api/wall/<token>/dislike/<post_id>', methods=['POST'])
+def toggle_dislike(token, post_id):
+    """Toggle dislike. Exklusiv zu Like (Disliken entfernt ein evtl. Like).
+    Disk-only (kein SB-Table); gleiches Per-Post-Lock wie Likes gegen Races."""
+    dp = _wall_dislikes_path(token)
+    if not dp:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    with _like_lock(post_id):
+        disliked = _wall_dislikes_load(token) or set()
+        liked = _wall_likes_load(token) or set()
+        d_delta = 0
+        like_delta = 0
+        if post_id in disliked:
+            disliked.remove(post_id); d_delta = -1; disliked_by_me = False
+        else:
+            disliked.add(post_id); d_delta = +1; disliked_by_me = True
+            # Mutual-Exclusivity: ein bestehendes Like zurücknehmen.
+            if post_id in liked:
+                liked.remove(post_id); like_delta = -1
+                _wall_likes_sb_remove(token, post_id)
+                lp = _wall_likes_path(token)
+                if lp:
+                    try: _atomic_write_json(lp, list(liked))
+                    except Exception:
+                        try:
+                            with open(lp, 'w') as f: json.dump(list(liked), f)
+                        except Exception: pass
+        try:
+            _atomic_write_json(dp, list(disliked))
+        except Exception:
+            try:
+                with open(dp, 'w') as f: json.dump(list(disliked), f)
+            except Exception: pass
+        posts = _wall_load_posts()
+        new_dislike = 0; new_like = 0
+        for p in posts:
+            if p.get('id') == post_id:
+                p['dislike_count'] = max(0, (p.get('dislike_count') or 0) + d_delta)
+                if like_delta:
+                    p['like_count'] = max(0, (p.get('like_count') or 0) + like_delta)
+                new_dislike = p['dislike_count']; new_like = p.get('like_count') or 0
+                break
+        _wall_save_posts(posts)
+    return jsonify({'ok': True, 'dislike_count': new_dislike, 'like_count': new_like,
+                    'disliked_by_me': disliked_by_me, 'liked_by_me': post_id in liked})
+
+
 @app.route('/api/wall/<token>/post/<post_id>/comment', methods=['POST'])
 def add_comment(token, post_id):
     body = request.get_json(silent=True) or {}
@@ -12269,24 +12372,28 @@ def add_comment(token, post_id):
     if len(text) > 500: return jsonify({'ok': False, 'error': 'too_long'}), 413
     cp = _wall_comments_path(post_id)
     if not cp: return jsonify({'ok': False, 'error': 'invalid_post'}), 400
+    is_anonymous = bool(body.get('is_anonymous'))
     import uuid, time as _t
     comments = _wall_comments_load(post_id) or []
     name = ''
-    try:
-        with open(_user_profile_path(token)) as f:
-            name = json.load(f).get('profile', {}).get('name', '') or ''
-    except Exception:
-        pass
+    if not is_anonymous:
+        try:
+            with open(_user_profile_path(token)) as f:
+                name = json.load(f).get('profile', {}).get('name', '') or ''
+        except Exception:
+            pass
     now_ts = _t.time()
     c = {
         'id': str(uuid.uuid4())[:10],
         'post_id': post_id,
         'author_token': token,
-        'author_short': token[:8],
+        'author_short': None if is_anonymous else token[:8],
         'author_name': name,
         'text': text,
         'image_url': image_url,
         'parent_comment_id': parent_comment_id,
+        'is_anonymous': is_anonymous,
+        'anon_handle': _anon_handle_for(token) if is_anonymous else None,
         'ts': now_ts,
         'created_at': datetime.now().isoformat(),
     }
@@ -12319,8 +12426,13 @@ def get_comments(token, post_id):
     cp = _wall_comments_path(post_id)
     if not cp: return jsonify({'comments': []})
     comments = _wall_comments_load(post_id) or []
-    # Strip author_token from response
+    # Strip author_token; anonyme Kommentare zusätzlich von Profil-Resten säubern.
     for c in comments:
+        if c.get('is_anonymous'):
+            if not c.get('anon_handle'):
+                c['anon_handle'] = _anon_handle_for(c.get('author_token'))
+            c.pop('author_name', None)
+            c.pop('author_short', None)
         c.pop('author_token', None)
     return jsonify({'post_id': post_id, 'comments': comments})
 
@@ -15751,7 +15863,24 @@ def moderation_report(token):
         try:
             with open(reports_p, 'w') as f: json.dump(reports, f)
         except Exception: pass
-    return jsonify({'ok': True, 'report_id': entry['id']})
+    # Auto-Hide: ab N DISTINCT-Reportern einen Wall-Post verstecken. Der Feed
+    # (get_wall_feed) filtert hidden raus — außer für den Author selbst.
+    auto_hidden = False
+    if kind == 'wall_post' and target_id:
+        try:
+            reporters = {r.get('reporter_token') for r in reports
+                         if r.get('kind') == 'wall_post' and r.get('target_id') == target_id}
+            if len(reporters) >= _WALL_REPORT_HIDE_THRESHOLD:
+                posts = _wall_load_posts()
+                for p in posts:
+                    if p.get('id') == target_id and not p.get('hidden'):
+                        p['hidden'] = True; auto_hidden = True
+                        break
+                if auto_hidden:
+                    _wall_save_posts(posts)
+        except Exception:
+            pass
+    return jsonify({'ok': True, 'report_id': entry['id'], 'hidden': auto_hidden})
 
 
 @app.route('/api/moderation/<token>/block', methods=['POST'])
