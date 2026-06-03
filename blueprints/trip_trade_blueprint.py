@@ -630,8 +630,14 @@ def list_board():
 
 
 @trip_trade_bp.route('/api/trade/<token>/my-posts', methods=['GET'])
+@trip_trade_bp.route('/api/trade/<token>/my-offers', methods=['GET'])
 def my_posts(token):
-    """Listet alle Posts des Tokens (any status, exklusive soft-deleted)."""
+    """Listet alle Posts des Tokens (any status, exklusive soft-deleted).
+
+    `/my-offers` ist ein Alias für `/my-posts` — der iOS-Client (TripTradeBoardView
+    'Meine Angebote'-Tab) rief `/my-offers`, das Backend servte nur `/my-posts`
+    → 404 (2026-06 Audit). Beide Pfade zeigen jetzt auf dieselbe Funktion.
+    """
     if not _valid_token(token):
         return jsonify({'ok': False, 'error': 'Ungültiges Token.'}), 400
     posts = _list_my_posts(token)
