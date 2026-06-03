@@ -393,3 +393,60 @@ def test_reader_noise_frei_return_day_still_counts():
     tours = build_normalized_tours(cas, [], 2025, homebase='FRA')
     tour_dates = {td.date.isoformat() for t in tours for td in t.days}
     assert '2025-05-16' in tour_dates, 'Heimkehrtag (Reader-Rausch frei) muss Tour-Tag bleiben'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 9: Standby ist nie Dienst/Hotel (Fix A+B 2026-06-03)
+# Home-Standby (SB_S) und homebound Airport-Standby (SBY@FRA) dürfen NICHT als
+# arbeitstag/reinigungstag/Hotel-Nacht zählen, auch wenn ein Reader-Lücken-
+# Tour-Bracket sie absorbiert. Auslands-Outstation-Standby bleibt echter Tag.
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_home_standby_absorbed_as_return_day_not_counted():
+    """SB_S nach Tour deren letzter Flugtag ends_at_homebase verfehlt (Reader-
+    Lücke): der Standby-Tag wird positional zum 'return day', darf aber NICHT
+    als arbeitstag/reinigungstag zählen (war 4/4, korrekt 3/3)."""
+    cas = [
+        _cas('2025-01-03', marker='31591', routing=['FRA', 'BLR'],
+             starts_hb=True, layover_ort='BLR', overnight=True, duty_min=600),
+        _cas('2025-01-04', marker='X', layover_ort='BLR', overnight=True),
+        _cas('2025-01-05', marker='X', routing=['BLR', 'FRA'], duty_min=600),  # ends_hb FEHLT
+        _cas('2025-01-06', marker='SB_S'),  # HOME STANDBY
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF_2025)
+    assert r.arbeitstage == 3, f'home-standby darf kein arbeitstag sein, got {r.arbeitstage}'
+    assert r.reinigungstage == 3, f'reinigung==arbeitstage, got {r.reinigungstage}'
+
+
+def test_homebound_airport_standby_not_hotel_or_workday():
+    """SBY am Homebase FRA mitten in einer Tour (Verfügbarkeit, kein Auswärts-
+    einsatz): kein Hotel, kein arbeitstag (war hotel=2/AT=3, korrekt hotel=1/AT=2)."""
+    cas = [
+        _cas('2025-01-03', marker='31591', routing=['FRA', 'BLR'],
+             starts_hb=True, layover_ort='BLR', overnight=True, duty_min=600),
+        _cas('2025-01-04', marker='SBY', routing=['FRA'], layover_ort='FRA', overnight=True),
+        _cas('2025-01-05', marker='31592', routing=['BLR', 'FRA'],
+             ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF_2025)
+    assert r.hotel_naechte == 1, f'SBY@FRA ist keine Hotel-Nacht, got {r.hotel_naechte}'
+    assert r.arbeitstage == 2, f'SBY@FRA ist kein arbeitstag, got {r.arbeitstage}'
+
+
+def test_foreign_outstation_standby_stays_real():
+    """Abgrenzung: SBY am AUSLANDS-Outstation BLR während eines echten Layovers
+    IST Auswärtstätigkeit — Z76 + Hotel müssen erhalten bleiben."""
+    cas = [
+        _cas('2025-01-03', marker='31591', routing=['FRA', 'BLR'],
+             starts_hb=True, layover_ort='BLR', overnight=True, duty_min=600),
+        _cas('2025-01-04', marker='SBY', routing=['BLR'], layover_ort='BLR', overnight=True),
+        _cas('2025-01-05', marker='31592', routing=['BLR', 'FRA'],
+             ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF_2025)
+    d = r.by_date.get('2025-01-04')
+    assert d is not None and d['klass'] == 'Z76', f'Auslands-Standby muss Z76 bleiben, got {d}'
+    assert r.hotel_naechte == 2, f'Auslands-Standby-Nacht muss zählen, got {r.hotel_naechte}'

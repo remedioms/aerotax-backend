@@ -1035,14 +1035,40 @@ def build_normalized_tours(
                 target = r_up
                 break
 
+        # (hochgezogen vor den Konstruktor für FIX-B: homebound-Airport-Standby)
+        has_foreign_routing_token = any(
+            isinstance(r, str) and len(r.upper().strip()) == 3
+            and r.upper().strip().isalpha()
+            and not _is_inland_code(r.upper().strip())
+            and r.upper().strip() != homebase_up
+            for r in (routing if isinstance(routing, list) else [])
+        )
+        # FIX (2026-06-03): Airport-Standby OHNE Auslands-Evidenz ist faktisch
+        # Verfügbarkeit am Homebase (RES/SBY/SBA am FRA) — kein Auswärtseinsatz.
+        # is_airport_standby war ein toter Flag (nirgends gelesen), wodurch so ein
+        # Tag bei offener Tour alle Home-Standby-Guards umging und als VMA/Hotel/
+        # Arbeitstag durchrutschte (Miguel: Nächte/Arbeitstage zu hoch). Wir
+        # behandeln ihn wie Home-Standby; Auslands-Outstation-Standby (foreign
+        # layover/target/routing) bleibt echter Tour-Tag.
+        _foreign_layover = bool(layover_ort and layover_ort != homebase_up
+                                and not _is_inland_code(layover_ort))
+        airport_sb_is_homebound = (
+            is_standby and sb_kind == 'airport'
+            and not has_foreign_routing_token
+            and not target
+            and not _foreign_layover
+        )
+
         # TourDay erstellen
         td = TourDay(
             date=day_date,
             cas_marker=marker or None,
             cas_raw=dict(cas_day),
             duty_type='unknown',
-            is_home_standby=(is_standby and sb_kind == 'home'),
-            is_airport_standby=(is_standby and sb_kind == 'airport'),
+            is_home_standby=((is_standby and sb_kind == 'home')
+                             or airport_sb_is_homebound),
+            is_airport_standby=(is_standby and sb_kind == 'airport'
+                                and not airport_sb_is_homebound),
             is_training=is_training,
             is_free=is_free,
             routing_evidence=list(routing) if isinstance(routing, list) else [],
@@ -1058,15 +1084,7 @@ def build_normalized_tours(
 
         # Tour-Klammer-Logik
         is_tour_continuation = bool(current_tour_days)
-        # v15 B7: Tour-Continuation auch wenn marker='X' + foreign routing
-        # (typischer Tibor-CAS-Reader-Output für Mid-Tour-Tage ohne overnight-Flag)
-        has_foreign_routing_token = any(
-            isinstance(r, str) and len(r.upper().strip()) == 3
-            and r.upper().strip().isalpha()
-            and not _is_inland_code(r.upper().strip())
-            and r.upper().strip() != homebase_up
-            for r in (routing if isinstance(routing, list) else [])
-        )
+        # has_foreign_routing_token ist oben (vor dem Konstruktor) berechnet.
         # v15 Reader-V2: Postprocessor-Hints respektieren
         is_postproc_tour_return = bool(cas_day.get('is_tour_return'))
         is_postproc_continuation = bool(cas_day.get('is_tour_continuation'))
@@ -1083,8 +1101,13 @@ def build_normalized_tours(
 
         # v15 B18 (final): Home-Standby NIE Tour-Trigger, auch wenn duty>=240.
         # SB_S/SB_F/SB_M/RB/RES_SB mit Standby-Bereitschaft ist KEIN Auswärts-
-        # tätigkeit, sondern reine Verfügbarkeitspflicht zuhause.
-        if (is_standby and sb_kind == 'home') and not is_tour_continuation:
+        # tätigkeit, sondern reine Verfügbarkeitspflicht zuhause. td.is_home_standby
+        # umfasst seit FIX-B auch homebound Airport-Standby (RES/SBY am FRA).
+        # (Kein struktureller Flush bei offener Tour: das fragmentiert echte
+        # Auslandstouren und verliert legitime Tour-Tage — Arbeitstage 133→125 auf
+        # Tibor. Stattdessen verhindert der is_real_duty_day-Gate + die
+        # is_home_standby-Hotelguards, dass ein absorbierter Standby-Tag zählt.)
+        if td.is_home_standby and not is_tour_continuation:
             continue
 
         # FIX (2026-06-03): Echter Urlaub/Krank ist NIE Teil einer Tour — es gibt
@@ -1281,7 +1304,12 @@ def calculate_allowances_from_normalized_tours(
                 if t.startswith('LH'):
                     return True
                 digits = ''.join(c for c in t if c.isdigit())
-                if len(digits) >= 3 and not t.startswith(hb_up):
+                # FIX (2026-06-03): war `hb_up` — in dieser Funktion erst ab der
+                # späteren Schleife (Z. ~1390) gebunden → NameError bei numerischen
+                # Routing-Tokens (z.B. '456'). In Prod unerreichbar (Reader liefert
+                # nur 3-Letter-IATA), aber latenter Crash. `_hb_local` (Z. 1267)
+                # ist hier im Closure-Scope korrekt gebunden.
+                if len(digits) >= 3 and not t.startswith(_hb_local):
                     return True
             return False
         tour_has_inland_flight_same_day = any(
@@ -1579,13 +1607,27 @@ def calculate_allowances_from_normalized_tours(
                 and not td.is_free
             )
 
+            # FIX (2026-06-03): Home-Standby ist NIE ein Dienst-/Reinigungstag —
+            # auch nicht, wenn der Builder ihm positional einen dep/return-Flag
+            # gegeben hat (Reader-Lücke: fehlendes ends_at_homebase lässt die Tour
+            # offen, der folgende Standby-Tag wird zum „Heimkehr"-Tag). Die
+            # is_departure_day/is_return_day-OR-Terme hebelten sonst die
+            # is_home_standby-Ausnahme (s. is_within_real_normalized_tour) aus →
+            # Standby zählte als arbeitstage+reinigungstage (Miguel 142 vs 129).
+            # NUR is_home_standby gaten, NICHT is_free: ein Mid-Tour-Layover-Tag den
+            # der Reader als activity='frei' (Marker 'X'/'==') stempelt ist ein
+            # echter Auswärts-/Reinigungstag, den FollowMe zählt (`not is_free`
+            # hätte ~8 legitime Tibor-Tage gekillt: 141→125 statt →133).
             is_real_duty_day = (
-                has_fl_today                  # explizit Flug-Marker (FL)
-                or has_flight_marker          # marker/routing = Flugnummer
-                or td.is_departure_day        # Tour-Anreise (Briefing+Boarding)
-                or td.is_return_day           # Tour-Heimkehr (Landung+Debrief)
-                or td.is_training             # Office/Schulung
-                or is_within_real_normalized_tour  # R14: Mid-Tour-Continuation
+                not td.is_home_standby
+                and (
+                    has_fl_today                  # explizit Flug-Marker (FL)
+                    or has_flight_marker          # marker/routing = Flugnummer
+                    or td.is_departure_day        # Tour-Anreise (Briefing+Boarding)
+                    or td.is_return_day           # Tour-Heimkehr (Landung+Debrief)
+                    or td.is_training             # Office/Schulung
+                    or is_within_real_normalized_tour  # R14: Mid-Tour-Continuation
+                )
             )
             # Mid-Tour-Layover-Rest-Day: in Tour, kein Flug-Beleg, kein dep/ret.
             # User ist im Layover-Hotel — bekommt VMA aber KEINE Reinigung.
