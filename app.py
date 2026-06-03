@@ -16430,6 +16430,39 @@ def _ics_classify_from_categories(categories):
     return None
 
 
+def _ev_is_flight_leg(summary):
+    """True wenn das Event ein echtes Flug-Leg ist (für EASA-Block). Deadheads,
+    Briefings, Layover, Standby zählen NICHT als Block."""
+    up = (summary or '').upper()
+    if up.startswith('DH ') or 'DH LH' in up or 'DEADHEAD' in up:
+        return False
+    if re.search(r'[A-Z]{3}\s*-\s*[A-Z]{3}', up):
+        return True
+    if re.match(r'^(LH|CL|EW|EN|LX|OS|SN|4Y)\s*\d', up):
+        return True
+    return False
+
+
+def _ev_extends_duty(summary):
+    """False für Layover/Off — diese erweitern das Duty-Fenster NICHT. Sonst
+    zählt die Layover-Endzeit (nächster Morgen) als Duty-Ende → Belastung 2-4×
+    zu hoch (2026-06 Audit, gegen echten myTime-Roster bewiesen)."""
+    up = (summary or '').upper()
+    if 'LAYOVER' in up or 'OFF DAY' in up or up.startswith('OFF') or 'ABSENCE' in up:
+        return False
+    return True
+
+
+def _iso_minutes_between(a, b):
+    """Minuten zwischen zwei ISO-Zeitstempeln; None bei Parse-Fehler."""
+    try:
+        da = datetime.fromisoformat((a or '').replace('Z', '+00:00'))
+        db = datetime.fromisoformat((b or '').replace('Z', '+00:00'))
+        return int((db - da).total_seconds() / 60)
+    except Exception:
+        return None
+
+
 def _ics_events_to_briefings(events, existing=None):
     """Konsumiert Event-Liste → dict[datum_str → briefing_dict]. F2 expandiert
     Multi-Day-Events auf alle Tage, F5 merged Same-Day-Events.
@@ -16486,16 +16519,16 @@ def _ics_events_to_briefings(events, existing=None):
                 merged_location = f"{prev_location}, {location}"[:120]
             elif prev_location and not location:
                 merged_location = prev_location
-            # earliest start, latest end
-            merged_start = start_iso
-            if prev_start and start_iso:
-                merged_start = min(prev_start, start_iso)
-            elif prev_start:
+            # earliest start, latest end — ABER nur duty-relevante Events
+            # (Flug/Briefing/Standby) erweitern das Fenster; Layover/Off NICHT
+            # (sonst zählt das Layover-Ende am nächsten Morgen als Duty-Ende →
+            # Block/Belastung 2-4× zu hoch).
+            ev_extends = _ev_extends_duty(day_summary)
+            if ev_extends:
+                merged_start = min(prev_start, start_iso) if (prev_start and start_iso) else (prev_start or start_iso)
+                merged_end = max(prev_end, end_iso) if (prev_end and end_iso) else (prev_end or end_iso)
+            else:
                 merged_start = prev_start
-            merged_end = end_iso
-            if prev_end and end_iso:
-                merged_end = max(prev_end, end_iso)
-            elif prev_end:
                 merged_end = prev_end
             # Bei Multi-Day-Folgetagen: start_iso/end_iso vom Original-Tag
             # NICHT auf den Folgetag schreiben (wäre irreführend). Nur Tag 1.
@@ -16508,6 +16541,16 @@ def _ics_events_to_briefings(events, existing=None):
             existing_b['ical_start_iso'] = merged_start
             existing_b['ical_end_iso'] = merged_end
             existing_b['ical_imported_at'] = datetime.now().isoformat()
+            # EASA-Block-Minuten: NUR echte Flug-Legs (Gate-to-Gate DTSTART→DTEND),
+            # summiert über Same-Day-Merges. Kein Deadhead/Briefing/Layover/
+            # Standby. iOS nutzt block_minutes statt der Duty-Spanne als Block.
+            if i == 0:
+                block_min = int(existing_b.get('block_minutes') or 0)
+                if _ev_is_flight_leg(day_summary) and start_iso and end_iso:
+                    dur = _iso_minutes_between(start_iso, end_iso)
+                    if dur and 0 < dur < 24 * 60:
+                        block_min += dur
+                existing_b['block_minutes'] = block_min
             # CATEGORIES-Mapping: nur setzen wenn ein bekanntes Mapping
             # gefunden wurde. Bei Same-Day-Merge: existing klass nicht überschreiben
             # ausser das neue Event hat ein klares Signal (LAYOVER > STANDBY > frei).
