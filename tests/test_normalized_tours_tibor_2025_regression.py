@@ -330,3 +330,66 @@ def test_jfk_tour_with_proper_bracket():
     # JFK ist tour_target (aus layover_iata)
     targets = {td.target_iata for td in t.days}
     assert 'JFK' in targets or any('SNN' == td.target_iata for td in t.days)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 8: Urlaub ist NIE Tour-Tag (Fix 2026-06-03)
+# Es gibt keinen Urlaub mitten in der Tour — ein U/URLAUB/K/KRANK schließt die
+# offene Tour am Vortag und gehört selbst nie dazu. (Miguel Schumann 2025-05-16:
+# 'U' nach TLV-Flug am 15.05. wurde fälschlich Z76.)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _cas_act(datum, marker='', routing=None, layover_ort='', overnight=False,
+             starts_hb=False, ends_hb=False, duty_min=0, activity=''):
+    d = _cas(datum, marker, routing, layover_ort, overnight,
+             starts_hb, ends_hb, duty_min)
+    d['activity_type'] = activity
+    return d
+
+
+def test_urlaub_marker_after_overnight_tour_is_not_tour_day():
+    """05-16 'U' direkt nach Auslands-Übernachtungstag → NICHT in Tour, kein Z76."""
+    cas = [
+        _cas('2025-05-15', marker='112355', routing=['FRA', 'TLV'],
+             starts_hb=True, layover_ort='TLV', overnight=True, duty_min=600),
+        _cas('2025-05-16', marker='U'),  # Urlaub, keine Reise-Evidenz
+    ]
+    tours = build_normalized_tours(cas, [], 2025, homebase='FRA')
+    tour_dates = {td.date.isoformat() for t in tours for td in t.days}
+    assert '2025-05-16' not in tour_dates, '05-16 U darf NIE Tour-Tag sein'
+
+    result = calculate_allowances_from_normalized_tours(tours, BMF_2025)
+    d = result.by_date.get('2025-05-16')
+    assert d is None or d.get('klass') != 'Z76', \
+        f'05-16 Urlaub darf nicht Z76 sein, got {d}'
+
+
+def test_urlaub_activity_after_overnight_tour_is_not_tour_day():
+    """Gleicher Fall, aber Reader stempelt activity='urlaub' (realistischer Output)."""
+    cas = [
+        _cas_act('2025-05-15', marker='112355', routing=['FRA', 'TLV'],
+                 starts_hb=True, layover_ort='TLV', overnight=True, duty_min=600),
+        _cas_act('2025-05-16', marker='U', activity='urlaub'),
+    ]
+    tours = build_normalized_tours(cas, [], 2025, homebase='FRA')
+    tour_dates = {td.date.isoformat() for t in tours for td in t.days}
+    assert '2025-05-16' not in tour_dates
+
+    result = calculate_allowances_from_normalized_tours(tours, BMF_2025)
+    d = result.by_date.get('2025-05-16')
+    assert d is None or d.get('klass') != 'Z76', \
+        f'05-16 Urlaub darf nicht Z76 sein, got {d}'
+
+
+def test_reader_noise_frei_return_day_still_counts():
+    """Abgrenzung: activity='frei' Heimkehrtag (Marker 'X', Routing TLV->FRA) bleibt
+    legitimer Tour-Tag — der Fix darf echte Rückreisetage NICHT verwerfen."""
+    cas = [
+        _cas_act('2025-05-15', marker='112355', routing=['FRA', 'TLV'],
+                 starts_hb=True, layover_ort='TLV', overnight=True, duty_min=600),
+        _cas_act('2025-05-16', marker='X', routing=['TLV', 'FRA'],
+                 ends_hb=True, duty_min=600, activity='frei'),
+    ]
+    tours = build_normalized_tours(cas, [], 2025, homebase='FRA')
+    tour_dates = {td.date.isoformat() for t in tours for td in t.days}
+    assert '2025-05-16' in tour_dates, 'Heimkehrtag (Reader-Rausch frei) muss Tour-Tag bleiben'

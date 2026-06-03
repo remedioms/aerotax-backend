@@ -821,6 +821,30 @@ def _detect_passive_marker(marker: str) -> bool:
     return m_up in PASSIVE
 
 
+def _is_hard_off_day(marker: str, activity: str) -> bool:
+    """Echter Urlaub/Krank — NIEMALS Teil einer Tour, auch nicht mitten in einer
+    offenen Tour-Klammer.
+
+    Fachlich gibt es keinen Urlaub mitten in einer Tour: taucht ein U/URLAUB/
+    K/KRANK auf, während die Tour-Klammer noch offen ist, war die Tour in
+    Wahrheit am Vortag zu Ende (die Grenzerkennung hat sie nicht geschlossen).
+    Ein solcher Tag ist daher ein HARTER Tour-Terminator und wird selbst nie
+    in die Tour aufgenommen.
+
+    Abgrenzung zu Reader-Rausch: ein bloßes activity='frei' auf einem Mid-Tour-
+    Layover/Heimkehrtag (Marker 'X'/'===' mit Reise-Evidenz) ist KEIN hard-off
+    und bleibt — wie bisher — legitimer Tour-Tag (Rückreise/An-Abreise).
+    """
+    m = (marker or '').upper().strip()
+    a = (activity or '').lower().strip()
+    if a in ('urlaub', 'krank'):
+        return True
+    # Explizite LH-CAS-Abwesenheitsmarker: U/U1/U2.. = Urlaub, K/KRANK = Krank.
+    if m in {'U', 'U1', 'U2', 'U3', 'UU', 'URLAUB', 'K', 'KK', 'KRANK', 'SICK'}:
+        return True
+    return False
+
+
 def _detect_standby_marker(marker: str) -> Tuple[bool, str]:
     """Liefert (is_standby, kind) wobei kind in {'home', 'airport', ''}.
 
@@ -1061,6 +1085,18 @@ def build_normalized_tours(
         # SB_S/SB_F/SB_M/RB/RES_SB mit Standby-Bereitschaft ist KEIN Auswärts-
         # tätigkeit, sondern reine Verfügbarkeitspflicht zuhause.
         if (is_standby and sb_kind == 'home') and not is_tour_continuation:
+            continue
+
+        # FIX (2026-06-03): Echter Urlaub/Krank ist NIE Teil einer Tour — es gibt
+        # keinen Urlaub mitten in der Tour. Taucht ein U/URLAUB/K/KRANK bei offener
+        # Tour-Klammer auf, war die Tour am Vortag zu Ende. Vorher zog
+        # is_tour_continuation den U-Tag in die Tour (append unten) und der
+        # is_free-Branch flushte die Tour MIT dem Urlaubstag als Heimkehrtag →
+        # er bekam fälschlich Z76. Jetzt: offene Tour am VORTAG schließen, den
+        # Urlaubstag selbst NIE anhängen.
+        if _is_hard_off_day(marker, activity):
+            if is_tour_continuation:
+                _flush_tour()
             continue
 
         if is_free and not is_tour_continuation:
