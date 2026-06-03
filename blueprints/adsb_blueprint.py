@@ -653,3 +653,97 @@ _AIRPORTS = {
     "BOM": (19.0896, 72.8656),
     "DEL": (28.5562, 77.1000),
 }
+
+
+# =============================================================================
+#  Flight-Number → Aircraft-Registration (best-effort, live)
+#  ---------------------------------------------------------------------------
+#  GET /api/flight-reg?flight=LH439
+#    → { ok:true,  flight, callsign, reg, hex, type, source }   (200)
+#    → { ok:false, flight, reason }                             (200, nicht airborne)
+#
+#  Quelle: adsb.lol /v2/callsign/<ICAO-Callsign> — liefert die Registration des
+#  Flugzeugs das GERADE diesen Callsign fliegt. Nutzbar für Inbound-Tracking,
+#  Delay-Impact und Aircraft-Health, die alle die Tail-Reg brauchen. Funktioniert
+#  wenn der Flug airborne ist UND die Airline ihren Flugnummer-Callsign nutzt
+#  (Langstrecke meist ja; manche Kurzstrecke scrambled → dann ok:false, KEIN
+#  Fake-Wert). IATA-Flugnummer → ICAO-Callsign via Airline-Map (LH→DLH etc.).
+# =============================================================================
+
+_IATA_ICAO_AIRLINE = {
+    # Lufthansa Group
+    "LH": "DLH", "CL": "CLH", "EN": "DLA", "EW": "EWG", "4Y": "OCN",
+    "OS": "AUA", "LX": "SWR", "SN": "BEL", "WK": "EDW", "DE": "CFG",
+    # Europa
+    "BA": "BAW", "AF": "AFR", "KL": "KLM", "IB": "IBE", "AZ": "ITY",
+    "TP": "TAP", "AY": "FIN", "SK": "SAS", "LO": "LOT", "OK": "CSA",
+    "UX": "AEA", "VY": "VLG", "FR": "RYR", "U2": "EZY",
+    # Langstrecke
+    "EK": "UAE", "QR": "QTR", "TK": "THY", "EY": "ETD", "SQ": "SIA",
+    "CX": "CPA", "UA": "UAL", "AA": "AAL", "DL": "DAL", "AC": "ACA",
+    "NH": "ANA", "JL": "JAL", "ET": "ETH", "QF": "QFA",
+}
+
+
+def _parse_flight_number(flight):
+    """IATA-Flugnummer → (Airline-Code, Nummer). IATA-Airline-Codes sind immer
+    2-stellig (alphanumerisch), der Rest ist die Flugnummer."""
+    f = "".join((flight or "").upper().split())
+    if len(f) < 3:
+        return None, None
+    code, num = f[:2], f[2:]
+    if not num[:1].isdigit():
+        return None, None
+    return code, num
+
+
+def _adsb_lol_callsign_reg(callsign):
+    """Aktuell unter `callsign` fliegendes Flugzeug (reg/hex/type) von adsb.lol.
+    None bei nichts-airborne oder Fehler — bewusst weich (kein Raise)."""
+    safe = urllib.parse.quote(callsign, safe="")
+    url = f"https://api.adsb.lol/v2/callsign/{safe}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=ADSB_LOL_TIMEOUT) as resp:
+            obj = json.loads(resp.read())
+    except Exception:
+        return None
+    ac_list = obj.get("ac") or []
+    if not ac_list:
+        return None
+    ac = ac_list[0]
+    reg = (ac.get("r") or "").strip()
+    if not reg:
+        return None
+    return {"reg": reg, "hex": ac.get("hex"), "type": ac.get("t")}
+
+
+@adsb_bp.route("/api/flight-reg", methods=["GET"])
+def get_flight_reg():
+    flight = (request.args.get("flight") or "").strip()
+    if not flight:
+        return jsonify({"ok": False, "error": "missing flight parameter"}), 400
+    code, num = _parse_flight_number(flight)
+    if not code or not num:
+        return jsonify({"ok": False, "error": f"unparseable flight '{flight}'"}), 400
+    # Kandidaten: ICAO-Mapping bevorzugt, IATA-Callsign als Fallback.
+    candidates = []
+    icao = _IATA_ICAO_AIRLINE.get(code)
+    if icao:
+        candidates.append(icao + num)
+    candidates.append(code + num)
+    for cs in candidates:
+        hit = _adsb_lol_callsign_reg(cs)
+        if hit:
+            return jsonify({
+                "ok": True, "flight": flight, "callsign": cs,
+                "reg": hit["reg"], "hex": hit["hex"], "type": hit["type"],
+                "source": "adsb.lol",
+            }), 200
+    return jsonify({
+        "ok": False, "flight": flight,
+        "reason": "no live aircraft for this callsign (not airborne or non-standard callsign)",
+    }), 200
