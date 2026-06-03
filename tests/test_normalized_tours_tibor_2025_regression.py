@@ -546,3 +546,33 @@ def test_stby_standby_dialect_recognised_as_standby():
         build_normalized_tours(cas, [], 2025, homebase='FRA'), {})
     assert r.arbeitstage == 0, f'Home-STBY ist kein arbeitstag, got {r.arbeitstage}'
     assert r.fahrtage == 0, f'Home-STBY ist kein Fahrtag, got {r.fahrtage}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 12: Metro-Stadt-Codes + Malformed-Robustheit (Round 2b, 2026-06-04)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_metro_city_code_in_routing_resolves_foreign_not_inland():
+    """Ein Metropol-Code (CHI/STO/ROM) im CAS-Routing muss als Ausland aufgelöst
+    werden (Z76), nicht als deutsches Inland (Z73). Der Satz kommt über einen
+    gleichland-Airport (ORD) in der BMF-Tabelle."""
+    BMF = {'ORD': {'an_abreise': 44.0, 'voll_24h': 65.0,
+                   'country': 'Vereinigte Staaten von Amerika (USA) – Chicago'}}
+    cas = [
+        _cas('2025-02-01', marker='LH', routing=['FRA', 'CHI'], starts_hb=True, duty_min=600),
+        _cas('2025-02-02', marker='X', routing=['CHI'], layover_ort='CHI', overnight=True),
+        _cas('2025-02-03', marker='LH', routing=['CHI', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    se = [{'datum': '2025-02-02', 'stfrei_ort': 'CHI', 'stfrei_betrag': 65.0}]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, se, 2025, homebase='FRA'), BMF)
+    assert r.z76_eur > 0, f'Metro-Code CHI muss Z76 (Ausland) ergeben, got z76={r.z76_eur}'
+    d = r.by_date.get('2025-02-02')
+    assert d and 'Chicago' in (d.get('country') or ''), f'soll Chicago sein, got {d}'
+
+
+def test_malformed_cas_input_does_not_crash():
+    """Nicht-dict-Elemente im cas_days-List dürfen nicht crashen (graceful)."""
+    out = build_normalized_tours(
+        ['not-a-dict', None, 5, _cas('2025-01-01', marker='X')], [], 2025, homebase='FRA')
+    assert isinstance(out, list)  # kein AttributeError

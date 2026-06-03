@@ -698,13 +698,28 @@ def resolve_bmf_country_for_tour_day(
             source_used = source
             reason = f'{label} → {u} ({selected_country})'
             return True
-        # IATA → Country-Mapping versuchen
+        # IATA → Country-Mapping versuchen. FIX (2026-06-03): auch Metropol-/
+        # Stadt-Codes (CHI/STO/ROM/PAR…) auflösen — der primäre Resolver kannte
+        # bisher nur IATA_TO_BMF, sodass ein Metro-Code im CAS-Routing fälschlich
+        # als Inland (Z73 Deutschland) statt Ausland (Z76) klassifiziert wurde.
+        # Reihenfolge: IATA_TO_BMF (exakt) → bmf_data.IATA_METRO_TO_BMF (kanonisch)
+        # → lokales _SE_CITY_TO_BMF (legacy). Den Satz holt der Country-basierte
+        # Rate-Lookup downstream von einem gleichland-Airport in bmf_table.
         country = iata_to_bmf.get(u)
+        via = 'IATA_TO_BMF'
+        if not country:
+            try:
+                from bmf_data import IATA_METRO_TO_BMF as _METRO
+            except Exception:
+                _METRO = {}
+            country = _METRO.get(u) or _SE_CITY_TO_BMF.get(u)
+            if country:
+                via = 'METRO/SE_CITY'
         if country:
             selected_iata = u
             selected_country = country
             source_used = source
-            reason = f'{label} → {u} → {country} (via IATA_TO_BMF)'
+            reason = f'{label} → {u} → {country} (via {via})'
             return True
         rejected.append({**cand, 'reason': 'iata_unknown_in_bmf_or_iata_to_bmf'})
         return False
@@ -942,8 +957,13 @@ def build_normalized_tours(
             cas_days, homebase=homebase_up, se_rows=se_rows,
         )
     except Exception:
-        # Falls Postprocessor crasht → fall through auf raw days (defensiv)
-        sorted_days = sorted(cas_days, key=lambda d: d.get('datum', ''))
+        # Falls Postprocessor crasht → fall through auf raw days (defensiv).
+        # FIX (2026-06-03): nur dict-Elemente — ein Nicht-dict (str/None/int) im
+        # cas_days-List ließ d.get(...) mit AttributeError crashen statt sanft zu
+        # degradieren.
+        sorted_days = sorted(
+            [d for d in (cas_days or []) if isinstance(d, dict)],
+            key=lambda d: d.get('datum', '') or '')
 
     tours: List[NormalizedTour] = []
     current_tour_days: List[TourDay] = []
