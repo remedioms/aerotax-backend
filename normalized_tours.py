@@ -1311,6 +1311,20 @@ def calculate_allowances_from_normalized_tours(
             for td in tour.days
         )
         tour_has_overnight = any(td.has_real_fl_layover for td in tour.days)
+        # FIX (2026-06-04): Inland-Übernachtungstour (deutsche mehrtägige
+        # Auswärtstätigkeit mit Hotel, z.B. Training in Bremen). has_real_fl_layover
+        # ist nur foreign → ohne dieses Signal galt eine Inland-Übernachtungstour
+        # als „nicht real" → kein Fahrtag, keine Hotelnacht. Inland-Layover =
+        # overnight + Inland-IATA ≠ Homebase, kein Home-Standby.
+        _hb_for_inland = (homebase or 'FRA').upper().strip()
+        tour_has_inland_overnight = any(
+            bool(td.cas_raw.get('overnight_after_day'))
+            and td.layover_iata
+            and _is_inland_code(td.layover_iata)
+            and td.layover_iata.upper() != _hb_for_inland
+            and not td.is_home_standby
+            for td in tour.days
+        )
         # R19 (2026-05-26): Same-Day-Inland-Trip mit duty>=480 ist auch ein
         # legitimer Tour-Start (Z72-Same-Day). Vorher: wurde nicht als Fahrtag
         # gezählt → fahrtage zu niedrig.
@@ -1382,6 +1396,7 @@ def calculate_allowances_from_normalized_tours(
             tour_has_foreign_signal or tour_has_overnight
             or tour_has_z72_same_day or tour_has_v2_departure_hint
             or tour_has_inland_flight_same_day
+            or tour_has_inland_overnight  # FIX: Inland-Übernachtungstour = 1 Fahrtag
         )
 
         # Fahrtag pro Tour-Start (B9: nur legitime)
@@ -1740,15 +1755,18 @@ def calculate_allowances_from_normalized_tours(
                 hotel_evidence = True
                 hotel_source = 'has_real_fl_layover'
             elif (td.layover_iata
-                  and not _is_inland_code(td.layover_iata)
                   and td.layover_iata.upper() != hb_up
-                  and cas_overnight):
-                # R19 (2026-05-26): Foreign-Layover-IATA allein reicht nicht.
-                # Reader markiert manchmal layover_iata für den Tour-Folgetag
-                # ohne overnight=True. Diese Phantom-Pfade lieferten Doppel-
-                # Hotels. STRIKT: cas_overnight als Pflicht-Signal.
+                  and cas_overnight
+                  and not td.is_home_standby):
+                # R19 (2026-05-26): Layover-IATA ≠ Homebase mit cas_overnight =
+                # echte Hotelnacht. STRIKT: cas_overnight als Pflicht-Signal (sonst
+                # Phantom-Hotels bei Reader-Folgetag-Stempeln).
+                # FIX (2026-06-04): gilt jetzt auch für INLAND-Übernachtungen
+                # (deutsche mehrtägige Auswärtstätigkeit mit Hotel, z.B. Training
+                # Bremen) — Übernachtung ist ortsunabhängig. Home-Standby ausgenommen.
                 hotel_evidence = True
-                hotel_source = 'foreign_layover_iata_overnight'
+                hotel_source = ('foreign' if not _is_inland_code(td.layover_iata)
+                                else 'inland') + '_layover_iata_overnight'
             elif (cas_overnight and tour_has_foreign_signal
                   and not td.is_home_standby
                   and not (td.layover_iata and _is_inland_code(td.layover_iata))

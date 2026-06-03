@@ -576,3 +576,34 @@ def test_malformed_cas_input_does_not_crash():
     out = build_normalized_tours(
         ['not-a-dict', None, 5, _cas('2025-01-01', marker='X')], [], 2025, homebase='FRA')
     assert isinstance(out, list)  # kein AttributeError
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 13: Inland-Übernachtungstour (Round 2b, 2026-06-04)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_inland_overnight_tour_counts_hotel_and_fahrtag():
+    """Mehrtägige DEUTSCHE Auswärtstätigkeit mit Hotel (z.B. Training Bremen):
+    Hotelnächte + Pendel-Fahrtag müssen zählen (Übernachtung ist ortsunabhängig).
+    Vorher: hotel=0, fahrtage=0, weil nur Auslands-Layover als Tour-Signal galt."""
+    cas = [
+        _cas('2025-04-01', marker='LH010', routing=['FRA', 'BRE'], layover_ort='BRE',
+             overnight=True, starts_hb=True, duty_min=600),
+        _cas('2025-04-02', marker='SIM', routing=['BRE'], layover_ort='BRE',
+             overnight=True, duty_min=480),
+        _cas('2025-04-03', marker='LH011', routing=['BRE', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), {})
+    assert r.hotel_naechte == 2, f'inland 2 Hotelnächte erwartet, got {r.hotel_naechte}'
+    assert r.fahrtage == 1, f'inland Übernachtungstour = 1 Fahrtag, got {r.fahrtage}'
+    assert r.z73_eur == 28.0 and r.z74_eur == 28.0, f'An/Ab 2x14 + Voll 28 erwartet, got z73={r.z73_eur} z74={r.z74_eur}'
+
+
+def test_inland_same_day_trip_no_phantom_hotel():
+    """Abgrenzung: Inland-Tagestrip OHNE Übernachtung erzeugt KEINE Hotelnacht."""
+    cas = [_cas('2025-04-10', marker='LH100', routing=['FRA', 'MUC', 'FRA'],
+                starts_hb=True, ends_hb=True, duty_min=540)]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), {})
+    assert r.hotel_naechte == 0, f'Tagestrip = keine Hotelnacht, got {r.hotel_naechte}'
