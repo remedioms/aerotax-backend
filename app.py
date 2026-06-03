@@ -9097,6 +9097,7 @@ def get_user_friends(token):
             pass
         enriched.append({
             'token': friend_token,
+            'match_id': hashlib.sha256(friend_token.encode()).hexdigest()[:16],
             'profile': prof,
             'short': friend_token[:8] + '…',
         })
@@ -9407,8 +9408,15 @@ def get_friends_today(token):
         rf = day.get('reader_facts') or {}
         out.append({
             'token': fr[:16] + '…',
+            # Stabile match_id (Hash) statt vollem Token — iOS matcht Friend↔
+            # FriendToday hierüber (vorher: truncated token != voller Token aus
+            # /friends → CrewMap-Pins fanden ihr Profil nie). Kein Token-Leak.
+            'match_id': hashlib.sha256(fr.encode()).hexdigest()[:16],
             'name': pr.get('name') or 'Friend',
             'homebase': pr.get('homebase') or '',
+            # GPS-reverse-geocodete Stadt (nur Stadt, nie exakte Koordinate) —
+            # iOS zeigt damit die echte Layover-Location statt nur dem Airport.
+            'current_city': pr.get('current_city'),
             'klass': day.get('klass'),
             'marker': day.get('marker'),
             'routing': day.get('routing'),
