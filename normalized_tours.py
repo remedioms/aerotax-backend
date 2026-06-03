@@ -862,15 +862,21 @@ def _detect_standby_marker(marker: str) -> Tuple[bool, str]:
     """Liefert (is_standby, kind) wobei kind in {'home', 'airport', ''}.
 
     Home-Standby-Marker: SB_S, SB_F, SB_M, RB (default home).
-    Airport-Standby-Marker: SBY, SBA (mit Airport-Kontext).
+    Airport-Standby-Marker: SBY, SBA, STBY, STANDBY (mit Airport-Kontext).
     RES: ambiguous — wird im Kontext entschieden.
+
+    STBY/STANDBY (FIX 2026-06-03): andere Airline-Dialekte (Eurowings/Condor)
+    nutzen diese Schreibweise. Als 'airport' geführt, weil die airport_sb_is_
+    homebound-Demotion (Pass 1) sie ohne Auslands-Evidenz korrekt wie Home-
+    Standby behandelt (kein arbeitstag/reinigung/Tour) und nur bei echter
+    Auslands-Aktivierung als Auswärtstätigkeit zählt.
     """
     if not marker:
         return (False, '')
     m_up = marker.upper().strip()
     if m_up in {'SB_S', 'SB_F', 'SB_M', 'RB', 'RES_SB'}:
         return (True, 'home')
-    if m_up in {'SBA', 'SBY'}:
+    if m_up in {'SBA', 'SBY', 'STBY', 'STANDBY'}:
         return (True, 'airport')
     if m_up == 'RES':
         # RES kann beides sein — context entscheidet
@@ -974,7 +980,22 @@ def build_normalized_tours(
                 td.is_return_day = True
             else:
                 if idx == 0:
-                    td.is_departure_day = True
+                    # FIX (2026-06-03): Jahresgrenzen-Continuation. Ein erster
+                    # Tour-Tag, der explizit als is_tour_continuation gehintet ist,
+                    # NICHT am Homebase startet und eine Übernachtung danach hat,
+                    # ist ein echter Voll-24h-Zwischentag (die reale Abreise von
+                    # zuhause liegt im Vorjahr) — kein An-/Abreisetag. Sonst zahlt
+                    # der is_departure_day-Zweig fälschlich den niedrigeren
+                    # An-/Abreise-Satz (Unterzahlung, §9 Abs. 4a EStG).
+                    _yb_continuation = (
+                        bool(td.cas_raw.get('is_tour_continuation'))
+                        and not bool(td.cas_raw.get('starts_at_homebase'))
+                        and bool(td.cas_raw.get('overnight_after_day'))
+                    )
+                    if _yb_continuation:
+                        td.is_full_away_day = True
+                    else:
+                        td.is_departure_day = True
                 if idx == n_days - 1:
                     td.is_return_day = True
                 if 0 < idx < n_days - 1:
@@ -1761,6 +1782,11 @@ def calculate_allowances_from_normalized_tours(
             # FRA→Ausland→FRA an einem Tag) erzeugen KEINE Hotelnacht — Crew
             # kommt am selben Tag heim. Vorher schloss der Guard Same-Day-Touren
             # aus (and not is_departure_day) → 7 Phantom-Hotels bei Tagestrips.
+            # NB (2026-06-03): Eine vorgeschlagene Ausnahme für den Sick-mid-tour-
+            # Single-Day-Collapse (echte Auslandsnacht behalten) wurde VERWORFEN —
+            # sie addierte auf Echtdaten-Tibor eine Phantom-Hotelnacht (76→77),
+            # falsche Richtung (Hotel ist dort ohnehin schon über Golden). Der
+            # seltene Sick-Collapse-Fall wiegt das nicht auf. tibor_diff = Schiedsrichter.
             if td.is_return_day:
                 hotel_evidence = False
                 hotel_source = 'return_day_no_hotel_after'

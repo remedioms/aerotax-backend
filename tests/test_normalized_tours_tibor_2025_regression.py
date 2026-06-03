@@ -503,3 +503,46 @@ def test_inland_same_day_flight_stays_a_fahrtag():
         build_normalized_tours(cas, [], 2025, homebase='FRA'),
         {'MUC': {'an_abreise': 14.0, 'voll_24h': 28.0, 'country': 'Deutschland'}})
     assert r.fahrtage == 1, f'Inland-Eintagesfahrt muss Fahrtag bleiben, got {r.fahrtage}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 11: Generalisierung Round 1 (2026-06-03)
+# Jahresgrenzen-Continuation = voll_24h; STBY/STANDBY-Dialekt = Standby.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _cas_cont(datum, marker='', routing=None, layover_ort='', overnight=False,
+              starts_hb=False, ends_hb=False, duty_min=0, cont=False):
+    d = _cas(datum, marker, routing, layover_ort, overnight, starts_hb, ends_hb, duty_min)
+    if cont:
+        d['is_tour_continuation'] = True
+    return d
+
+
+def test_year_boundary_continuation_is_voll_24h_not_an_abreise():
+    """Tour-Tail ins neue Jahr: 1. Roster-Tag ist is_tour_continuation, startet
+    NICHT am Homebase, hat overnight → echter Voll-24h-Zwischentag (reale Abreise
+    im Vorjahr), NICHT An-/Abreise. (§9 Abs.4a: nur An-/Abreisetage reduziert.)"""
+    BMF = {'GRU': {'an_abreise': 36.0, 'voll_24h': 53.0, 'country': 'Brasilien'}}
+    cas = [
+        _cas_cont('2025-01-01', marker='X', routing=['GRU'], layover_ort='GRU',
+                  overnight=True, cont=True),
+        _cas('2025-01-02', marker='LH507', routing=['GRU', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF)
+    d = r.by_date.get('2025-01-01')
+    assert d is not None and d['amount'] == 53.0, f'Jahresgrenzen-Zwischentag = voll_24h 53, got {d}'
+
+
+def test_stby_standby_dialect_recognised_as_standby():
+    """Andere Airline-Schreibweise STBY/STANDBY wird als Standby erkannt (nicht
+    als unbekannter Marker). Home-Kontext → kein arbeitstag/reinigung."""
+    from normalized_tours import _detect_standby_marker
+    assert _detect_standby_marker('STBY') == (True, 'airport')
+    assert _detect_standby_marker('STANDBY') == (True, 'airport')
+    # STBY am Homebase (keine Auslands-Evidenz) zählt nicht als Dienst
+    cas = [_cas('2025-03-01', marker='STBY', routing=['FRA'], duty_min=480)]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), {})
+    assert r.arbeitstage == 0, f'Home-STBY ist kein arbeitstag, got {r.arbeitstage}'
+    assert r.fahrtage == 0, f'Home-STBY ist kein Fahrtag, got {r.fahrtage}'
