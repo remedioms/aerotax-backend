@@ -35421,7 +35421,7 @@ def erstelle_pdf(d):
     BG_CARD  = HexColor("#0f1830")   # subtle "card" tint
     TEXT     = HexColor("#f1f5f9")   # primary white
     TEXT2    = HexColor("#94a3b8")   # secondary
-    TEXT3    = HexColor("#4a5a72")   # muted
+    TEXT3    = HexColor("#6b7c96")   # muted (2026-06-04: von #4a5a72 angehoben — Footnotes/Labels/Rechtl. Hinweis waren auf dem dunklen BG kaum lesbar; bleibt klar unter TEXT2)
     TEXT_D   = HexColor("#1e3a8a")   # (für legacy white-card calls — unused)
     TEXT_D2  = HexColor("#3b5cae")
     TEXT_D3  = HexColor("#64748b")
@@ -35777,14 +35777,16 @@ def erstelle_pdf(d):
             ps("bb_l", fontSize=7.5, textColor=TEXT3, fontName="Helvetica-Bold",
                leading=11, letterSpacing=1.8)),
         Paragraph(eur(d['netto']),
-            ps("bb_v", fontSize=20, textColor=TEXT, fontName="Helvetica",
-               leading=24, alignment=TA_RIGHT, letterSpacing=-0.3)),
+            ps("bb_v", fontSize=21, textColor=TEXT, fontName="Helvetica",
+               leading=25, alignment=TA_RIGHT, letterSpacing=-0.3)),
     ]], colWidths=[10.0*cm, 6.8*cm])
     betrag_box.setStyle(TableStyle([
-        ("TOPPADDING",(0,0),(-1,-1),14),("BOTTOMPADDING",(0,0),(-1,-1),14),
-        ("LEFTPADDING",(0,0),(-1,-1),16),("RIGHTPADDING",(0,0),(-1,-1),16),
-        ("BACKGROUND",(0,0),(-1,-1), HexColor("#0a1224")),
-        ("BOX",(0,0),(-1,-1), 0.6, LINE2),
+        ("TOPPADDING",(0,0),(-1,-1),16),("BOTTOMPADDING",(0,0),(-1,-1),16),
+        ("LEFTPADDING",(0,0),(-1,-1),18),("RIGHTPADDING",(0,0),(-1,-1),18),
+        # 2026-06-04: Hero-Box mit mehr Präsenz — leicht angehobener BG + dezenter
+        # blauer Akzent-Rahmen (statt blassem Grau), damit der wichtigste Wert „poppt".
+        ("BACKGROUND",(0,0),(-1,-1), HexColor("#0e1730")),
+        ("BOX",(0,0),(-1,-1), 1.1, HexColor("#345a9e")),
         ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
     ]))
     try: betrag_box.cornerRadii = [10,10,10,10]
@@ -36286,10 +36288,21 @@ def erstelle_pdf(d):
         ps("sig_l", fontSize=7.5, textColor=TEXT3,
            fontName="Helvetica-Bold", leading=11,
            spaceAfter=10, letterSpacing=1.5)))
-    sig = Table([[""]], colWidths=[16.8*cm], rowHeights=[4.2*cm])
+    # Signatur-Feld: dezente dunkle Karte (statt knallweißem Rechteck, das auf dem
+    # dunklen Theme als Fremdkörper wirkte) mit klarer Umrandung + feiner
+    # Unterschriftslinie am unteren Rand als Affordance.
+    _sig_line = Paragraph(
+        "<font color='#3a4d6b'>____________________________________________</font>",
+        ps("sig_line", fontSize=11, textColor=LINE2, fontName="Helvetica",
+           leading=13, alignment=TA_CENTER))
+    sig = Table([["" ], [_sig_line]], colWidths=[16.8*cm],
+                rowHeights=[3.3*cm, 0.9*cm])
     sig.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,-1), WHITE),
-        ("BOX",(0,0),(-1,-1), 0.6, LINE2),
+        ("BACKGROUND",(0,0),(-1,-1), BG_CARD),
+        ("BOX",(0,0),(-1,-1), 0.8, LINE2),
+        ("VALIGN",(0,1),(-1,1), "MIDDLE"),
+        ("ALIGN",(0,0),(-1,-1), "CENTER"),
+        ("ROUNDEDCORNERS",[8,8,8,8]),
     ]))
     S.append(sig)
     S.append(Spacer(1, 0.8*cm))
