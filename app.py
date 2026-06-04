@@ -15882,6 +15882,55 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
     return out
 
 
+def _fetch_opensky_board(icao, flight_type='departure'):
+    """Per-Airport-Board via OpenSky (GRATIS, jeder ICAO). Liefert die ZULETZT
+    tatsächlich abgeflogenen/angekommenen Flüge (~letzte 2h) — KEINE Gates/
+    Scheduled (das hat nur Fraport für FRA). Ehrlich gelabelt source='opensky'."""
+    try:
+        import requests
+        import time as _t
+        from datetime import datetime, timezone
+    except Exception:
+        return None
+    icao = (icao or '').upper().strip()
+    if len(icao) != 4:
+        return None
+    now = int(_t.time())
+    begin = now - 2 * 3600
+    ep = 'arrival' if flight_type == 'arrival' else 'departure'
+    try:
+        r = requests.get('https://opensky-network.org/api/flights/' + ep,
+                         params={'airport': icao, 'begin': begin, 'end': now}, timeout=10)
+        if r.status_code != 200:
+            return None
+        rows = r.json() or []
+    except Exception:
+        return None
+    out = []
+    for f in rows:
+        cs = (f.get('callsign') or '').strip()
+        if not cs:
+            continue
+        other = f.get('estArrivalAirport') if ep == 'departure' else f.get('estDepartureAirport')
+        ts = f.get('firstSeen') if ep == 'departure' else f.get('lastSeen')
+        try:
+            sched = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
+        except Exception:
+            sched = None
+        out.append({
+            'airline': cs[:3],            # ICAO-Airline-Prefix (DLH=LH)
+            'airline_name': '',
+            'flight': cs,
+            'dest_iata': (other or '').strip(),   # ICAO des anderen Flughafens
+            'dest_name': '',
+            'sched': sched,
+            'gate': '', 'terminal': '', 'hall': '',
+            'status': '', 'delayed': False, 'reg': '', 'aircraft': '',
+        })
+    out.sort(key=lambda x: x.get('sched') or '', reverse=True)
+    return out
+
+
 def _fra_board_cached(flight_type):
     """Gecachtes FRA-Board (dep/arr). None bei Quelle-down."""
     import time as _t
@@ -15909,18 +15958,26 @@ def airport_board(token):
         limit = min(int(request.args.get('limit') or 60), 200)
     except Exception:
         limit = 60
-    if airport != 'FRA':
-        return jsonify({'ok': False, 'error': 'airport_not_supported', 'airport': airport,
-                        'message': 'Aktuell nur FRA (kostenlose Fraport-Quelle).'}), 200
-    flights = _fra_board_cached(ftype)
+    # FRA (IATA) / EDDF (ICAO) → Fraport (live, Gates/Status). Sonst jeder
+    # andere ICAO → OpenSky (gratis, zuletzt geflogene Flüge, keine Gates).
+    if airport in ('FRA', 'EDDF'):
+        flights = _fra_board_cached(ftype)
+        src = 'fraport'
+        out_airport = 'FRA'
+    else:
+        flights = _fetch_opensky_board(airport, ftype)
+        src = 'opensky'
+        out_airport = airport
     if flights is None:
-        return jsonify({'ok': False, 'error': 'source_unavailable',
-                        'message': 'FRA-Board gerade nicht erreichbar.'}), 200
+        return jsonify({'ok': False, 'error': 'source_unavailable', 'airport': out_airport,
+                        'message': airport in ('FRA', 'EDDF')
+                            and 'FRA-Board gerade nicht erreichbar.'
+                            or 'Für diesen Airport (ICAO) gerade keine Live-Daten.'}), 200
     if airline:
         flights = [f for f in flights if f.get('airline') == airline]
-    return jsonify({'ok': True, 'airport': 'FRA', 'type': ftype,
+    return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
                     'count': len(flights[:limit]), 'flights': flights[:limit],
-                    'source': 'fraport', 'cached_ttl': _AIRPORT_BOARD_TTL})
+                    'source': src, 'cached_ttl': _AIRPORT_BOARD_TTL})
 
 
 # Fraport-Status-Strings, die "annulliert/gestrichen" bedeuten.
