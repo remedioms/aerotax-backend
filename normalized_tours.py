@@ -1631,10 +1631,20 @@ def calculate_allowances_from_normalized_tours(
                     day_rate = 'voll_24h'
                     day_source = 'CAS+SE-inland'
                 elif is_foreign and resolved_rate:
-                    day_eur = float(resolved_rate.get('voll_24h', 0) or 0)
+                    # FIX (2026-06-04): voll_24h NUR wenn der Tag wirklich ein
+                    # voller Kalendertag im Ausland war (§9 Abs.4a). Ein als
+                    # is_full_away_day geroleter Tag OHNE overnight_after_day ist
+                    # kein Volltag — die Crew hat dort nicht (mehr) übernachtet
+                    # (Abreise/partieller Tag) → An-/Abreise-Satz. Behebt den
+                    # positionalen Über-Ansatz (voll statt an_ab) auf ~14 realen
+                    # Tibor-Tagen (Z76 +49 vs Golden). Mid-Tour-Volltage haben
+                    # overnight_after_day=True → unverändert voll_24h.
+                    _full_day = bool(td.cas_raw.get('overnight_after_day'))
+                    _rk = 'voll_24h' if _full_day else 'an_abreise'
+                    day_eur = float(resolved_rate.get(_rk, 0) or 0)
                     day_bucket = 'Z76' if day_eur > 0 else 'none'
                     day_country = resolved_country
-                    day_rate = 'voll_24h'
+                    day_rate = _rk
                     day_source = day_audit.get('source_used') or 'CAS+BMF'
                 else:
                     # Kein klares Foreign UND kein klares Inland → audit warning

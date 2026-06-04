@@ -631,3 +631,42 @@ def test_duplicate_calendar_date_not_double_counted():
     assert r.z76_tage == 3, f'3 Kalendertage erwartet (Dublette dedupt), got {r.z76_tage}'
     assert r.hotel_naechte == 2, f'2 Hotelnächte erwartet, got {r.hotel_naechte}'
     assert abs(r.z76_eur - bd_z76) < 0.01, f'summary z76_eur {r.z76_eur} != sum(by_date) {bd_z76}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 15: voll_24h nur bei echtem Volltag (overnight) — Round 3 (2026-06-04)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_full_away_day_without_overnight_is_an_abreise_not_voll():
+    """Ein positional als is_full_away_day geroleter Auslands-Tag OHNE
+    overnight_after_day ist kein voller Kalendertag (§9 Abs.4a) → An-/Abreise-Satz,
+    nicht voll_24h. Echte Mid-Tour-Volltage (overnight=True) bleiben voll_24h."""
+    BMF = {'JFK': {'an_abreise': 40.0, 'voll_24h': 59.0, 'country': 'USA'}}
+    # 4-Tage-Struktur, aber der 3. Tag (full_away-Position) hat KEINE Übernachtung
+    cas = [
+        _cas('2025-07-01', marker='LH400', routing=['FRA', 'JFK'], layover_ort='JFK',
+             overnight=True, starts_hb=True, duty_min=600),
+        _cas('2025-07-02', marker='X', routing=['JFK'], layover_ort='JFK', overnight=True),
+        _cas('2025-07-03', marker='X', routing=['JFK'], layover_ort='JFK', overnight=False),  # kein Volltag
+        _cas('2025-07-04', marker='LH401', routing=['JFK', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF)
+    d3 = r.by_date.get('2025-07-03')
+    assert d3 and d3.get('rate_type') == 'an_abreise', \
+        f'full_away ohne overnight = an_abreise erwartet, got {d3}'
+
+
+def test_clean_midtour_days_stay_voll_24h():
+    """Abgrenzung: echte Mid-Tour-Tage MIT Übernachtung bleiben voll_24h."""
+    BMF = {'JFK': {'an_abreise': 40.0, 'voll_24h': 59.0, 'country': 'USA'}}
+    cas = [
+        _cas('2025-08-01', marker='LH400', routing=['FRA', 'JFK'], layover_ort='JFK',
+             overnight=True, starts_hb=True, duty_min=600),
+        _cas('2025-08-02', marker='X', routing=['JFK'], layover_ort='JFK', overnight=True),
+        _cas('2025-08-03', marker='X', routing=['JFK'], layover_ort='JFK', overnight=True),
+        _cas('2025-08-04', marker='LH401', routing=['JFK', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF)
+    assert r.z76_eur == 198.0, f'40+59+59+40=198 erwartet, got {r.z76_eur}'
