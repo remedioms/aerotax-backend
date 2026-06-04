@@ -15867,11 +15867,16 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
                     'dest_iata': (f.get('iata') or '').strip(),
                     'dest_name': (f.get('apname') or '').strip(),
                     'sched': f.get('sched'),
+                    # `esti` = geschätzte Zeit → ECHTE Verspätung (esti vs sched).
+                    # `s` (Fraport-Delay-Flag) ist bei Vorab-Flügen immer False,
+                    # daher unbrauchbar → wir rechnen aus esti.
+                    'esti': f.get('esti'),
+                    'delay_min': _fra_delay_min(f.get('sched'), f.get('esti')),
                     'gate': (f.get('gate') or '').strip(),
                     'terminal': (f.get('terminal') or '').strip(),
                     'hall': (f.get('halle') or '').strip(),
                     'status': (f.get('status') or '').strip(),
-                    'delayed': bool(f.get('s')),
+                    'delayed': _fra_delay_min(f.get('sched'), f.get('esti')) >= 5,
                     'reg': (f.get('reg') or '').strip(),
                     'aircraft': (f.get('ac') or '').strip(),
                 })
@@ -15880,6 +15885,19 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
         except Exception:
             break
     return out
+
+
+def _fra_delay_min(sched, esti):
+    """Verspätung in Minuten aus geplanter vs geschätzter Zeit (Fraport `esti`)."""
+    if not sched or not esti:
+        return 0
+    try:
+        from datetime import datetime
+        ds = datetime.fromisoformat(sched)
+        de = datetime.fromisoformat(esti)
+        return max(0, int((de - ds).total_seconds() / 60))
+    except Exception:
+        return 0
 
 
 def _fetch_opensky_board(icao, flight_type='departure'):
