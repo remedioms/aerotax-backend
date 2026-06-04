@@ -10081,8 +10081,11 @@ def get_news_article():
 
 def _news_extract_best_fulltext(html, source_host=''):
     """Multi-Strategy-Extraktion: readability → bs4-Heuristik → Legacy-Regex.
-    Längstes Resultat ≥80 Zeichen gewinnt — so bekommen wir Robustheit gegen
-    Layout-Änderungen einzelner Quellen ohne pro-Source-Tuning.
+
+    Jeder Kandidat wird durch `_news_strip_boilerplate` von Rest-Müll befreit
+    (Nav/Share/Related/Newsletter/Cookie/Footer/Author-Bio/Promo-Cards). Es
+    gewinnt der Kandidat mit der **größten bereinigten** Textlänge — NICHT der
+    roh-längste, weil "viel Text" oft "viel Boilerplate" bedeutet.
     """
     candidates = []
 
@@ -10119,13 +10122,189 @@ def _news_extract_best_fulltext(html, source_host=''):
 
     if not candidates:
         return ''
-    # Längstes Ergebnis bevorzugen (mehr Text = wahrscheinlich vollständiger).
-    # Hard-Cap 20k Zeichen damit Response nicht explodiert.
-    candidates.sort(key=lambda kv: len(kv[1]), reverse=True)
-    best = candidates[0][1]
+
+    # Boilerplate-Filter auf jeden Kandidaten (robust: bei Fehler Roh-Text).
+    cleaned = []
+    for strat, raw in candidates:
+        try:
+            cl = _news_strip_boilerplate(raw, source_host=source_host)
+        except Exception:
+            cl = raw
+        # Wenn der Filter fast alles wegfrisst (überaggressiv / unerwartetes
+        # Layout), lieber den Roh-Text behalten als einen leeren Artikel.
+        if not cl or len(cl) < max(80, int(len(raw) * 0.30)):
+            cl = raw
+        cleaned.append((strat, cl))
+
+    # Größte BEREINIGTE Länge gewinnt. Hard-Cap 20k.
+    cleaned.sort(key=lambda kv: len(kv[1]), reverse=True)
+    best = cleaned[0][1]
     if len(best) > 20000:
         best = best[:20000].rsplit('\n\n', 1)[0]
     return best
+
+
+# Zeilen-Marker für Boilerplate (Nav/Share/Related/Newsletter/Cookie/Footer).
+# Wird gegen die *unterere-gecastete* Zeile geprüft (substring-Match). Bewusst
+# konservativ gehalten — nur eindeutig nicht-redaktionelle Phrasen, damit kein
+# Artikel-Satz fälschlich rausfliegt.
+_NEWS_BOILERPLATE_SUBSTR = (
+    # Cookie / Consent / Datenschutz
+    'cookie', 'consent', 'akzeptieren', 'datenschutz', 'privacy policy',
+    'privacy settings', 'wir verwenden', 'einwilligung',
+    # Newsletter / Abo
+    'newsletter', 'jetzt abonnieren', 'subscribe', 'sign up for', 'anmelden',
+    'jetzt anmelden', 'kostenlos registrieren',
+    # Social / Share
+    'teilen auf', 'jetzt teilen', 'share this', 'share on', 'auf facebook',
+    'auf twitter', 'auf whatsapp', 'auf linkedin', 'follow us', 'folge uns',
+    'folgen sie uns', 'pic.twitter.com', 'read more on x', 'view on twitter',
+    # Related / Mehr zum Thema
+    'mehr zum thema', 'verwandte themen', 'das könnte sie auch interessieren',
+    'auch interessant', 'lesen sie auch', 'related articles', 'related stories',
+    'recommended for you', 'you might also like', 'mehr aus', 'weitere artikel',
+    # Auth / Account
+    'sign in to your', 'log in to', 'create an account', 'einloggen',
+    # Promo / CTA (Flightradar24 "Open tracker" Card etc.)
+    'catch what other trackers miss', 'open tracker', 'no signup',
+    'download the app', 'get the app', 'jetzt herunterladen', 'app store',
+    'google play',
+    # Footer / Legal / Copyright-Linien
+    'all rights reserved', 'alle rechte vorbehalten', 'impressum', 'agb',
+    'terms of use', 'terms of service', 'editorial guidelines',
+    # Kommentar-Bereich
+    'kommentar schreiben', 'leave a comment', 'comments', 'kommentare',
+    'jetzt kommentieren',
+)
+
+# Eigenständige (exakte, getrimmte) Müll-Zeilen.
+_NEWS_BOILERPLATE_EXACT = frozenset({
+    'new', 'update', 'anzeige', 'advertisement', 'werbung', 'sponsored',
+    'close', 'schließen', 'menu', 'menü', 'home', 'startseite',
+    'mehr', 'weiterlesen', 'read more', 'mehr lesen', 'zurück', 'next',
+    'previous', 'vor', 'teilen', 'share', 'drucken', 'print',
+})
+
+
+def _news_strip_boilerplate(text, source_host=''):
+    """Entfernt Rest-Boilerplate aus bereits extrahiertem Plain-Text.
+
+    Wirkt zeilenweise:
+      - Drop von Zeilen mit eindeutigen Boilerplate-Phrasen (Cookie/Newsletter/
+        Share/Related/Footer/Promo) — siehe `_NEWS_BOILERPLATE_SUBSTR/_EXACT`.
+      - Drop von Tweet-Attributionen (`— Name (@handle) Datum`).
+      - Drop von Copyright-/Quellen-Fußzeilen (`© aero.de | Abb.: … | Datum`).
+      - Drop von Autoren-Byline/-Bio bei Simple Flying (`By` + Folge-Zeilen,
+        `Published …`, `Based in …`).
+      - Drop sehr kurzer, link-dichter Menü-Zeilen.
+      - Dedup exakt wiederholter Zeilen (Promo-Cards die 2× auftauchen).
+    Reine String-Operation, mutiert nichts, wirft nie (Caller fängt zusätzlich).
+    Erhält Absatz-Struktur (\\n\\n) wo möglich.
+    """
+    import re as _re
+    if not text:
+        return ''
+
+    raw_lines = text.split('\n')
+    out = []
+    seen_nonempty = set()
+    # "Header-Zone": alles vor dem ersten echten Artikel-Absatz. Hier ist
+    # Meta-Chrome (Byline/Name/Bio/Timestamp/UPDATE-Label/Flugnummer-Header)
+    # zu erwarten und wird aggressiver entfernt. Sobald ein substanzieller
+    # Absatz (≥120 Zeichen mit Satzende) erscheint, gilt der Artikel als
+    # gestartet und wir filtern nur noch Keyword/Footer-Müll.
+    article_started = False
+    drop_next_content = 0   # Anzahl folgender Nicht-Leer-Zeilen die wir noch droppen (Byline-Name)
+
+    def _looks_like_article_para(txt):
+        return len(txt) >= 120 and _re.search(r'[.!?]["”’)]?\s', txt + ' ')
+
+    for ln in raw_lines:
+        s = ln.strip()
+
+        # Leerzeile → Absatztrenner (mehrfach collapsen wir später).
+        if not s:
+            out.append('')
+            continue
+
+        low = s.lower()
+
+        # Byline-Folgezeile (Autor-Name nach "By") überspringen — auch über
+        # Leerzeilen hinweg, da Extraktoren Blank-Lines einstreuen.
+        if drop_next_content > 0 and not article_started:
+            drop_next_content -= 1
+            continue
+
+        # 1) Tweet-Attribution: "— Flightradar24 (@flightradar24) June 4, 2026"
+        if _re.match(r'^[—\-–]\s*.+\(@[\w]+\)', s):
+            continue
+        # 2) Copyright/Quellen-Footer: "© aero.de | Abb.: Lufthansa | 04.06.2026"
+        if s.startswith('©') or low.startswith('(c)') or ' © ' in s:
+            continue
+        if _re.match(r'^abb\.?\s*:', low) or low.startswith('foto:') or low.startswith('quelle:') or low.startswith('bild:'):
+            continue
+        # Bild-Credit-Zeilen: "Credit: aeroTELEGRAPH", "Photo: …", "Image: …", "Source: …"
+        if _re.match(r'^(credit|photo|image|source|copyright)\s*:', low) and len(s) < 80:
+            continue
+        # 3) Byline "By"/"Von" (allein oder "By Jake Hardiman") → Name-Folgezeile mit weg.
+        if low in ('by', 'von'):
+            drop_next_content = 1
+            continue
+        if _re.match(r'^(by|von)\s+[A-ZÄÖÜ][\w.\-]+(\s+[A-ZÄÖÜ][\w.\-]+){0,3}$', s):
+            continue
+        # 4) "Published Jun 4, 2026, 9:59 AM EDT" / "Last Updated: …" / "Veröffentlicht am …"
+        if _re.match(r'^(published|updated|last updated|veröffentlicht|aktualisiert)\b', low):
+            continue
+
+        # 5) Eindeutige Boilerplate-Phrasen.
+        if low in _NEWS_BOILERPLATE_EXACT:
+            continue
+        if any(kw in low for kw in _NEWS_BOILERPLATE_SUBSTR):
+            continue
+
+        # --- Header-Zone-spezifische Filter (nur solange Artikel nicht gestartet) ---
+        if not article_started:
+            # Autoren-Bio-Satz (z.B. "A graduate in German, Jake has …
+            # Based in Norfolk, UK.") — erkennbar an "Based in". MUSS vor dem
+            # Artikel-Absatz-Check stehen, da die Bio selbst ein langer Satz ist.
+            if 'based in ' in low and len(s) < 360:
+                continue
+            # "17:12 Uhr UPDATE", "UPDATE", "LIVE", reine Zeit-/Label-Header.
+            if _re.match(r'^\d{1,2}[:.]\d{2}\s*(uhr)?\s*(update|live)?$', low):
+                continue
+            if low in ('update', 'live', 'breaking', 'eilmeldung'):
+                continue
+            # "Flug LH450" / "Flight AB123" — Flugnummern-Header-Chrome.
+            if _re.match(r'^(flug|flight)\s+[a-z]{1,3}\s?\d{1,4}[a-z]?$', low):
+                continue
+
+        # 6) Sehr kurze Menü-/Link-Zeile (kein Satzende, wenige Wörter, kein
+        #    Punkt/Komma) — typische Nav-Items. Echte kurze Artikel-Zeilen
+        #    haben i.d.R. Satzzeichen oder Ziffern (Flugnummern, Daten).
+        words = s.split()
+        if len(s) < 25 and len(words) <= 3 and not _re.search(r'[.,:;!?0-9]', s):
+            continue
+
+        # Ab erstem substanziellen Absatz gilt der Artikel als gestartet.
+        if not article_started and _looks_like_article_para(s):
+            article_started = True
+
+        # 7) Dedup exakt wiederholter inhaltlicher Zeilen (Promo-Cards 2×).
+        #    Nur für kurze/mittlere Zeilen; lange Absätze nie deduppen (könnten
+        #    legitim ähnlich beginnen — wir matchen exakt, daher safe, aber
+        #    Längen-Cap spart Memory).
+        if len(s) <= 200:
+            if s in seen_nonempty:
+                continue
+            seen_nonempty.add(s)
+
+        out.append(s)
+
+    # Reassemble + Whitespace normalisieren (>2 \n → \n\n, trailing trim).
+    joined = '\n'.join(out)
+    joined = _re.sub(r'\n{3,}', '\n\n', joined)
+    # Führende/abschließende Leerzeilen weg.
+    return joined.strip()
 
 
 def _news_bs4_extract(html):
