@@ -15828,7 +15828,7 @@ def _muted_by(token):
 _AIRPORT_BOARD_CACHE = {}     # key -> (ts, list)
 _AIRPORT_BOARD_TTL = 120      # 2 Min — Board ändert sich nicht schneller sinnvoll.
 
-def _fetch_fra_departures(max_pages=6):
+def _fetch_fra_departures(max_pages=3):
     # `requests` ist in app.py NICHT module-level importiert (andere Funktionen
     # importieren es lokal) → lokaler Import statt bare-name-Referenz (sonst
     # NameError auf Cloud Run).
@@ -15846,7 +15846,7 @@ def _fetch_fra_departures(max_pages=6):
     for page in range(1, max_pages + 1):
         try:
             params = {} if page == 1 else {'page': page}
-            r = requests.get(base, params=params, headers=headers, timeout=12)
+            r = requests.get(base, params=params, headers=headers, timeout=8)
             if r.status_code != 200:
                 break
             data = (r.json() or {}).get('data') or []
