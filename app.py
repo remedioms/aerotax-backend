@@ -15828,16 +15828,18 @@ def _muted_by(token):
 _AIRPORT_BOARD_CACHE = {}     # key -> (ts, list)
 _AIRPORT_BOARD_TTL = 120      # 2 Min — Board ändert sich nicht schneller sinnvoll.
 
-def _fetch_fra_departures(max_pages=3):
-    # `requests` ist in app.py NICHT module-level importiert (andere Funktionen
-    # importieren es lokal) → lokaler Import statt bare-name-Referenz (sonst
-    # NameError auf Cloud Run).
+def _fetch_fra_flights(flight_type='departure', max_pages=3):
+    # `requests` ist in app.py NICHT module-level importiert → lokaler Import.
+    # flight_type='arrival' → Fraport-Filter-Endpoint; `iata`/`apname` ist dann
+    # der HERKUNFTS-Flughafen (iOS labelt "von X" via `type`).
     try:
         import requests
     except Exception:
         return None
     out = []
     base = 'https://www.frankfurt-airport.com/de/_jcr_content.flights.json'
+    if flight_type == 'arrival':
+        base = base + '/filter'
     headers = {
         'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
                       'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148',
@@ -15845,7 +15847,11 @@ def _fetch_fra_departures(max_pages=3):
     }
     for page in range(1, max_pages + 1):
         try:
-            params = {} if page == 1 else {'page': page}
+            params = {}
+            if flight_type == 'arrival':
+                params['type'] = 'arrival'
+            if page > 1:
+                params['page'] = page
             r = requests.get(base, params=params, headers=headers, timeout=8)
             if r.status_code != 200:
                 break
@@ -15857,6 +15863,7 @@ def _fetch_fra_departures(max_pages=3):
                     'airline': (f.get('al') or '').strip(),
                     'airline_name': (f.get('alname') or '').strip(),
                     'flight': (f.get('fnr') or '').replace(' ', ''),
+                    # bei Ankunft = Herkunft, bei Abflug = Ziel.
                     'dest_iata': (f.get('iata') or '').strip(),
                     'dest_name': (f.get('apname') or '').strip(),
                     'sched': f.get('sched'),
@@ -15874,35 +15881,74 @@ def _fetch_fra_departures(max_pages=3):
             break
     return out
 
+
+def _fra_board_cached(flight_type):
+    """Gecachtes FRA-Board (dep/arr). None bei Quelle-down."""
+    import time as _t
+    ckey = 'FRA_' + ('arr' if flight_type == 'arrival' else 'dep')
+    cached = _AIRPORT_BOARD_CACHE.get(ckey)
+    if cached and (_t.time() - cached[0]) < _AIRPORT_BOARD_TTL:
+        return cached[1]
+    flights = _fetch_fra_flights(flight_type)
+    if flights is None:
+        return None
+    _AIRPORT_BOARD_CACHE[ckey] = (_t.time(), flights)
+    return flights
+
+
 @app.route('/api/airport/<token>/board', methods=['GET'])
 def airport_board(token):
-    """FRA-Abflug-Board (live). Query: ?airport=FRA&airline=LH&limit=60.
-    Nur FRA (kostenlose Fraport-Quelle) — andere Airports ehrlich abgelehnt."""
+    """FRA-Board (live). Query: ?airport=FRA&type=departure|arrival&airline=LH&limit=60.
+    Nur FRA (kostenlose Fraport-Quelle)."""
     airport = (request.args.get('airport') or 'FRA').upper()
     airline = (request.args.get('airline') or '').upper().strip()
+    ftype = (request.args.get('type') or 'departure').lower()
+    if ftype not in ('departure', 'arrival'):
+        ftype = 'departure'
     try:
         limit = min(int(request.args.get('limit') or 60), 200)
     except Exception:
         limit = 60
     if airport != 'FRA':
         return jsonify({'ok': False, 'error': 'airport_not_supported', 'airport': airport,
-                        'message': 'Aktuell nur FRA-Abflüge (kostenlose Fraport-Quelle).'}), 200
-    import time as _t
-    ckey = 'FRA_dep'
-    cached = _AIRPORT_BOARD_CACHE.get(ckey)
-    if cached and (_t.time() - cached[0]) < _AIRPORT_BOARD_TTL:
-        flights = cached[1]
-    else:
-        flights = _fetch_fra_departures()
-        if flights is None:
-            return jsonify({'ok': False, 'error': 'source_unavailable',
-                            'message': 'FRA-Board gerade nicht erreichbar.'}), 200
-        _AIRPORT_BOARD_CACHE[ckey] = (_t.time(), flights)
+                        'message': 'Aktuell nur FRA (kostenlose Fraport-Quelle).'}), 200
+    flights = _fra_board_cached(ftype)
+    if flights is None:
+        return jsonify({'ok': False, 'error': 'source_unavailable',
+                        'message': 'FRA-Board gerade nicht erreichbar.'}), 200
     if airline:
         flights = [f for f in flights if f.get('airline') == airline]
-    return jsonify({'ok': True, 'airport': 'FRA', 'type': 'departure',
+    return jsonify({'ok': True, 'airport': 'FRA', 'type': ftype,
                     'count': len(flights[:limit]), 'flights': flights[:limit],
                     'source': 'fraport', 'cached_ttl': _AIRPORT_BOARD_TTL})
+
+
+# Fraport-Status-Strings, die "annulliert/gestrichen" bedeuten.
+_FRA_CANCEL_MARKERS = ('annull', 'cancel', 'gestrich')
+
+@app.route('/api/airport/<token>/punctuality', methods=['GET'])
+def airport_punctuality(token):
+    """Heutige Pünktlichkeit einer Airline ab FRA — aus der Fraport-Abflugtafel
+    (status/delayed). Query: ?airline=LH. EHRLICH: nur die aktuell auf der Tafel
+    gelisteten Abflüge (heutiger Tag), keine historischen OTP-Daten."""
+    airline = (request.args.get('airline') or 'LH').upper().strip()
+    flights = _fra_board_cached('departure')
+    if flights is None:
+        return jsonify({'ok': False, 'error': 'source_unavailable'}), 200
+    al = [f for f in flights if f.get('airline') == airline]
+    total = len(al)
+    cancelled = sum(1 for f in al
+                    if any(m in (f.get('status') or '').lower() for m in _FRA_CANCEL_MARKERS))
+    delayed = sum(1 for f in al
+                  if f.get('delayed') and not any(m in (f.get('status') or '').lower()
+                                                   for m in _FRA_CANCEL_MARKERS))
+    on_time = max(0, total - cancelled - delayed)
+    active = max(0, total - cancelled)
+    pct = round(100.0 * on_time / active, 0) if active > 0 else None
+    return jsonify({'ok': True, 'airport': 'FRA', 'airline': airline,
+                    'total': total, 'on_time': on_time, 'delayed': delayed,
+                    'cancelled': cancelled, 'on_time_pct': pct,
+                    'source': 'fraport', 'scope': 'heute_FRA_abflug_tafel'})
 
 
 @app.route('/api/moderation/<token>/report', methods=['POST'])
