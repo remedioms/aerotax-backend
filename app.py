@@ -15829,7 +15829,12 @@ _AIRPORT_BOARD_CACHE = {}     # key -> (ts, list)
 _AIRPORT_BOARD_TTL = 120      # 2 Min — Board ändert sich nicht schneller sinnvoll.
 
 def _fetch_fra_departures(max_pages=6):
-    if requests is None:
+    # `requests` ist in app.py NICHT module-level importiert (andere Funktionen
+    # importieren es lokal) → lokaler Import statt bare-name-Referenz (sonst
+    # NameError auf Cloud Run).
+    try:
+        import requests
+    except Exception:
         return None
     out = []
     base = 'https://www.frankfurt-airport.com/de/_jcr_content.flights.json'
