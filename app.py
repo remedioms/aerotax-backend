@@ -9347,8 +9347,7 @@ def get_friend_roster(token, friend_token):
     # Share-Roster-Default-Allow: User-Anweisung — Reziprozität, default an.
     # Nur explizit auf False gesetzt heißt Opt-Out. Missing field = teilt.
     try:
-        with open(_user_profile_path(friend_token)) as f:
-            friend_profile = json.load(f).get('profile', {})
+        friend_profile = (_profile_load(friend_token) or {}).get('profile', {}) or {}
     except Exception:
         friend_profile = {}
     if friend_profile.get('share_roster') is False:
@@ -12381,10 +12380,10 @@ def create_wall_post(token):
         # NUR für Moderation/Ownership (wird im Feed wegstripped).
         post['anon_handle'] = _anon_handle_for(token)
     else:
-        # Author profile snapshot (nur bei nicht-anonym).
+        # Author profile snapshot (nur bei nicht-anonym). SB-primary statt Disk —
+        # auf Cloud Run ist die Disk-Datei ephemer → Posts erschienen als „Crew".
         try:
-            with open(_user_profile_path(token)) as f:
-                pr = json.load(f).get('profile', {})
+            pr = (_profile_load(token) or {}).get('profile', {}) or {}
             post['author_name'] = pr.get('name')
             post['author_airline'] = pr.get('airline')
             post['author_homebase'] = pr.get('homebase')
@@ -12573,8 +12572,7 @@ def add_comment(token, post_id):
     name = ''
     if not is_anonymous:
         try:
-            with open(_user_profile_path(token)) as f:
-                name = json.load(f).get('profile', {}).get('name', '') or ''
+            name = ((_profile_load(token) or {}).get('profile', {}) or {}).get('name', '') or ''
         except Exception:
             pass
     now_ts = _t.time()
@@ -13077,8 +13075,8 @@ def _forum_save_likes(token, likes):
 def _forum_author_snapshot(token):
     """Returns dict with author_name / author_role / author_airline / author_homebase from profile."""
     try:
-        with open(_user_profile_path(token)) as f:
-            pr = json.load(f).get('profile', {})
+        # SB-primary statt Disk (Cloud-Run-ephemer) → Forum-Autoren namenlos sonst.
+        pr = (_profile_load(token) or {}).get('profile', {}) or {}
         return {
             'author_name': pr.get('name') or '',
             'author_role': pr.get('role') or pr.get('position') or '',
@@ -13292,8 +13290,7 @@ def forum_create_reply(token, thread_id):
     # Add mentioned-user name snapshot (so UI can show "@Maria K." even after token is gone)
     if mentioned_token:
         try:
-            with open(_user_profile_path(mentioned_token)) as f:
-                m_pr = json.load(f).get('profile', {})
+            m_pr = (_profile_load(mentioned_token) or {}).get('profile', {}) or {}
             reply['mentioned_name'] = m_pr.get('name') or ''
         except Exception:
             reply['mentioned_name'] = ''
@@ -13562,10 +13559,9 @@ def add_layover_rec(token):
         'vote_score': 1,  # Author auto-up-votes
         'vote_count': 1,
     }
-    # Author profile snapshot
+    # Author profile snapshot (SB-primary, Cloud-Run-ephemer-Disk sonst namenlos).
     try:
-        with open(_user_profile_path(token)) as f:
-            pr = json.load(f).get('profile', {})
+        pr = (_profile_load(token) or {}).get('profile', {}) or {}
         rec['author_name'] = pr.get('name')
         rec['author_airline'] = pr.get('airline')
     except Exception:
@@ -13903,8 +13899,7 @@ def layover_rec_add_comment(token, rec_id):
     import uuid, time
     name = ''
     try:
-        with open(_user_profile_path(token)) as f:
-            name = json.load(f).get('profile', {}).get('name') or ''
+        name = ((_profile_load(token) or {}).get('profile', {}) or {}).get('name') or ''
     except Exception:
         pass
     comment = {

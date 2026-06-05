@@ -269,15 +269,17 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         'last_seen_iso': None,
     }
     try:
-        pp = _user_profile_path(crew_token)
-        if pp and os.path.exists(pp):
-            with open(pp) as f:
-                doc = json.load(f) or {}
-            prof = doc.get('profile') or {}
-            if 'current_city' in allowed_fields:
-                status['current_city'] = prof.get('current_city')
-            # last_seen aus _updated_at
-            status['last_seen_iso'] = doc.get('_updated_at')
+        # SB-primary statt Disk: auf Cloud Run ist die Profil-Disk-Datei ephemer/
+        # leer → die Family-Watcher sahen weder current_city noch last_seen
+        # („selbst wenn verbunden, sieht sie nichts vom Plan"). _load_crew_profile
+        # + _profile_load lesen Supabase-first.
+        prof = _load_crew_profile(crew_token) or {}
+        if 'current_city' in allowed_fields:
+            status['current_city'] = prof.get('current_city')
+        _pl = _app_attr('_profile_load')
+        if callable(_pl):
+            full = _pl(crew_token) or {}
+            status['last_seen_iso'] = full.get('_updated_at')
     except Exception as e:
         _log().info(f'[family-watch] profile_read_skip {type(e).__name__}')
     # next_flight: nur wenn 'next_flight' in allowed_fields. Best-effort read aus
