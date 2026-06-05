@@ -16006,6 +16006,36 @@ def _muted_by(token):
 # 1:1 was Fraport liefert; bei Quelle-down → ehrlicher source_unavailable.
 _AIRPORT_BOARD_CACHE = {}     # key -> (ts, list)
 _AIRPORT_BOARD_TTL = 120      # 2 Min — Board ändert sich nicht schneller sinnvoll.
+# Volle Tages-Tafel (für Pünktlichkeit) separat + länger gecacht — viele Seiten,
+# teurer zu holen, ändert sich für die Tagesstatistik nicht im Minutentakt.
+_AIRPORT_DAY_CACHE = {}        # key -> (ts, list)
+_AIRPORT_DAY_TTL = 300         # 5 Min.
+# AeroDataBox-Pünktlichkeit (Nicht-FRA-Airports, RapidAPI, env-gated). Aggressiv
+# gecacht — Free-Tier = 600 Units/Monat, also pro (airport,airline) 15 Min TTL.
+# key (airport, airline) -> (ts, result-dict).
+_AERODATABOX_CACHE = {}
+_AERODATABOX_TTL = 900         # 15 Min.
+_AERODATABOX_DELAY_THRESHOLD = 5   # Minuten — wie FRA (>=5 = verspätet).
+
+
+def _clean_city_name(name, iata=''):
+    """Fraport `apname` kann nicht-lateinische Schreibweisen liefern (z.B.
+    chinesische Stadtnamen wie '多特蒙德'). HARTE Anforderung: KEINE CJK/nicht-
+    lateinischen Zeichen in der iOS-Tafel. Strategie: enthält der Name Zeichen
+    außerhalb des Latin-1/Latin-Extended-Bereichs (oder gängiger Akzente), fällt
+    er auf den IATA-Code zurück. Sonst 1:1 der Name."""
+    s = (name or '').strip()
+    if not s:
+        return (iata or '').strip()
+    # Erlaubt: ASCII + Latin-1-Supplement/Extended (Umlaute, Akzente, ß),
+    # Satzzeichen/Leerzeichen. Alles ab U+0250 (IPA/CJK/Kyrillisch/Arabisch/…)
+    # gilt als nicht-lateinisch → Code-Fallback.
+    for ch in s:
+        o = ord(ch)
+        if o > 0x024F:
+            return (iata or '').strip() or s
+    return s
+
 
 def _fetch_fra_flights(flight_type='departure', max_pages=3):
     # `requests` ist in app.py NICHT module-level importiert → lokaler Import.
@@ -16044,7 +16074,9 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
                     'flight': (f.get('fnr') or '').replace(' ', ''),
                     # bei Ankunft = Herkunft, bei Abflug = Ziel.
                     'dest_iata': (f.get('iata') or '').strip(),
-                    'dest_name': (f.get('apname') or '').strip(),
+                    # CJK/nicht-lateinische Stadtnamen → IATA-Code-Fallback
+                    # (harte iOS-Anforderung, kein '多特蒙德' auf der Tafel).
+                    'dest_name': _clean_city_name(f.get('apname'), f.get('iata')),
                     'sched': f.get('sched'),
                     # `esti` = geschätzte Zeit → ECHTE Verspätung (esti vs sched).
                     # `s` (Fraport-Delay-Flag) ist bei Vorab-Flügen immer False,
@@ -16142,6 +16174,44 @@ def _fra_board_cached(flight_type):
     return flights
 
 
+def _fra_day_board_cached(flight_type='departure'):
+    """Gecachte VOLLE Tages-Tafel (für Pünktlichkeit). Holt deutlich mehr Seiten
+    als das normale Board und behält nur Flüge mit `sched` am heutigen Datum
+    (Europe/Berlin) → echte Tagesaggregation statt Momentaufnahme. None bei
+    Quelle-down. Dedupliziert über (flight, sched)."""
+    import time as _t
+    ckey = 'FRA_DAY_' + ('arr' if flight_type == 'arrival' else 'dep')
+    cached = _AIRPORT_DAY_CACHE.get(ckey)
+    if cached and (_t.time() - cached[0]) < _AIRPORT_DAY_TTL:
+        return cached[1]
+    # Viele Seiten → so viel vom Tag wie Fraport ausliefert.
+    flights = _fetch_fra_flights(flight_type, max_pages=20)
+    if flights is None:
+        return None
+    # Auf heutiges Datum (Europe/Berlin) filtern. `sched` ist ISO mit tz.
+    try:
+        from datetime import datetime, timezone, timedelta
+        # Europe/Berlin: CEST = +2 (Sommer). Wir nehmen den Datums-Anteil
+        # direkt aus dem ISO-String (Fraport liefert lokale tz), das ist robust
+        # gegen DST ohne pytz-Abhängigkeit.
+        today_str = datetime.now(timezone(timedelta(hours=2))).strftime('%Y-%m-%d')
+    except Exception:
+        today_str = None
+    seen = set()
+    day = []
+    for f in flights:
+        sch = (f.get('sched') or '')
+        key = (f.get('flight') or '', sch)
+        if key in seen:
+            continue
+        seen.add(key)
+        if today_str and sch and not sch.startswith(today_str):
+            continue
+        day.append(f)
+    _AIRPORT_DAY_CACHE[ckey] = (_t.time(), day)
+    return day
+
+
 @app.route('/api/airport/<token>/board', methods=['GET'])
 def airport_board(token):
     """FRA-Board (live). Query: ?airport=FRA&type=departure|arrival&airline=LH&limit=60.
@@ -16180,29 +16250,219 @@ def airport_board(token):
 # Fraport-Status-Strings, die "annulliert/gestrichen" bedeuten.
 _FRA_CANCEL_MARKERS = ('annull', 'cancel', 'gestrich')
 
-@app.route('/api/airport/<token>/punctuality', methods=['GET'])
-def airport_punctuality(token):
-    """Heutige Pünktlichkeit einer Airline ab FRA — aus der Fraport-Abflugtafel
-    (status/delayed). Query: ?airline=LH. EHRLICH: nur die aktuell auf der Tafel
-    gelisteten Abflüge (heutiger Tag), keine historischen OTP-Daten."""
-    airline = (request.args.get('airline') or 'LH').upper().strip()
-    flights = _fra_board_cached('departure')
-    if flights is None:
-        return jsonify({'ok': False, 'error': 'source_unavailable'}), 200
-    al = [f for f in flights if f.get('airline') == airline]
-    total = len(al)
-    cancelled = sum(1 for f in al
-                    if any(m in (f.get('status') or '').lower() for m in _FRA_CANCEL_MARKERS))
-    delayed = sum(1 for f in al
-                  if f.get('delayed') and not any(m in (f.get('status') or '').lower()
-                                                   for m in _FRA_CANCEL_MARKERS))
+def _is_cancelled(f):
+    return any(m in (f.get('status') or '').lower() for m in _FRA_CANCEL_MARKERS)
+
+
+def _punctuality_stats(flights):
+    """Aggregiert on-time/delayed/cancelled über eine Flugliste."""
+    total = len(flights)
+    cancelled = sum(1 for f in flights if _is_cancelled(f))
+    delayed = sum(1 for f in flights if f.get('delayed') and not _is_cancelled(f))
     on_time = max(0, total - cancelled - delayed)
     active = max(0, total - cancelled)
     pct = round(100.0 * on_time / active, 0) if active > 0 else None
-    return jsonify({'ok': True, 'airport': 'FRA', 'airline': airline,
-                    'total': total, 'on_time': on_time, 'delayed': delayed,
-                    'cancelled': cancelled, 'on_time_pct': pct,
-                    'source': 'fraport', 'scope': 'heute_FRA_abflug_tafel'})
+    avg_delay = 0
+    delay_vals = [int(f.get('delay_min') or 0) for f in flights
+                  if not _is_cancelled(f) and int(f.get('delay_min') or 0) > 0]
+    if delay_vals:
+        avg_delay = round(sum(delay_vals) / len(delay_vals))
+    return {'total': total, 'on_time': on_time, 'delayed': delayed,
+            'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay}
+
+
+def _aerodatabox_punctuality(iata, airline):
+    """Heutige Abflug-Pünktlichkeit eines beliebigen IATA-Airports via AeroDataBox
+    (RapidAPI, env-gated über AERODATABOX_KEY). Aggressiv gecacht (15 Min/Schlüssel),
+    weil der Free-Tier nur 600 Units/Monat hat. Liefert ein Dict im selben Contract
+    wie die FRA-Aggregation (on_time_pct/on_time/delayed/cancelled/avg_delay_min) oder
+    None bei Quelle-down/leer (Caller degradiert dann ehrlich). KEINE Erfindung —
+    1:1 was AeroDataBox liefert."""
+    import os as _os
+    key = _os.environ.get('AERODATABOX_KEY')
+    if not key:
+        return None
+    iata = (iata or '').upper().strip()
+    airline = (airline or '').upper().strip()
+    if len(iata) != 3:
+        return None
+    import time as _t
+    ckey = (iata, airline)
+    cached = _AERODATABOX_CACHE.get(ckey)
+    if cached and (_t.time() - cached[0]) < _AERODATABOX_TTL:
+        return cached[1]
+    try:
+        import requests
+        from datetime import datetime, timezone
+    except Exception:
+        return None
+    # Lokales Tagesfenster. Ohne robuste tz-DB nehmen wir UTC-Tag (akzeptabel laut
+    # Spec) — AeroDataBox akzeptiert lokal-ISO ohne Offset. 00:00..23:59 UTC heute.
+    now = datetime.now(timezone.utc)
+    from_iso = now.strftime('%Y-%m-%dT00:00')
+    to_iso = now.strftime('%Y-%m-%dT23:59')
+    url = ('https://aerodatabox.p.rapidapi.com/flights/airports/iata/'
+           + iata + '/' + from_iso + '/' + to_iso)
+    try:
+        r = requests.get(url,
+                         params={'direction': 'Departure', 'withLocation': 'false',
+                                 'withCancelled': 'true', 'withCodeshared': 'false'},
+                         headers={'X-RapidAPI-Key': key,
+                                  'X-RapidAPI-Host': 'aerodatabox.p.rapidapi.com'},
+                         timeout=15)
+    except Exception:
+        return None
+    if r.status_code != 200:
+        # Non-200 (Quote/Auth/Server) → ehrlich None, niemals 500.
+        return None
+    try:
+        body = r.json() or {}
+    except Exception:
+        return None
+    deps = body.get('departures') or []
+    if not deps:
+        # Leerer Tag (oder gefilterte Antwort) → ehrlich kein-Daten.
+        result = {'total': 0, 'on_time': 0, 'delayed': 0, 'cancelled': 0,
+                  'on_time_pct': None, 'avg_delay_min': 0}
+        _AERODATABOX_CACHE[ckey] = (_t.time(), result)
+        return result
+
+    def _airline_iata(f):
+        return ((f.get('airline') or {}).get('iata') or '').upper().strip()
+
+    def _callsign_prefix(f):
+        # ICAO-Callsign-Prefix als Fallback-Filter (z.B. DLH für LH).
+        cs = ((f.get('aircraft') or {}).get('reg') or '')  # nicht zuverlässig
+        num = (f.get('number') or '').replace(' ', '').upper()
+        return num[:2]
+
+    def _matches_airline(f):
+        if not airline:
+            return True
+        if _airline_iata(f) == airline:
+            return True
+        # Flight-Number-Prefix (z.B. "LH 441" → LH) als Fallback.
+        return _callsign_prefix(f) == airline
+
+    def _parse_t(v):
+        if not v:
+            return None
+        try:
+            return datetime.fromisoformat(str(v).replace('Z', '+00:00'))
+        except Exception:
+            return None
+
+    total = 0
+    cancelled = 0
+    delayed = 0
+    on_time = 0
+    delay_vals = []
+    for f in deps:
+        if not _matches_airline(f):
+            continue
+        total += 1
+        status = (f.get('status') or '').lower()
+        if 'cancel' in status:
+            cancelled += 1
+            continue
+        mv = f.get('departure') or {}
+        sched = _parse_t(((mv.get('scheduledTime') or {}).get('local'))
+                         or ((mv.get('scheduledTime') or {}).get('utc')))
+        revised = _parse_t(((mv.get('revisedTime') or {}).get('local'))
+                           or ((mv.get('revisedTime') or {}).get('utc'))
+                           or ((mv.get('actualTime') or {}).get('local'))
+                           or ((mv.get('actualTime') or {}).get('utc')))
+        dmin = 0
+        if sched and revised:
+            try:
+                dmin = int((revised - sched).total_seconds() / 60)
+            except Exception:
+                dmin = 0
+        if dmin >= _AERODATABOX_DELAY_THRESHOLD:
+            delayed += 1
+            delay_vals.append(dmin)
+        else:
+            on_time += 1
+    active = max(0, total - cancelled)
+    pct = round(100.0 * on_time / active, 0) if active > 0 else None
+    avg_delay = round(sum(delay_vals) / len(delay_vals)) if delay_vals else 0
+    result = {'total': total, 'on_time': on_time, 'delayed': delayed,
+              'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay}
+    _AERODATABOX_CACHE[ckey] = (_t.time(), result)
+    return result
+
+
+@app.route('/api/airport/<token>/punctuality', methods=['GET'])
+def airport_punctuality(token):
+    """Heutige Pünktlichkeit einer Airline ab FRA — über die GANZE Tages-Tafel
+    aggregiert (nicht nur die aktuelle Momentaufnahme). Query: ?airline=LH.
+    Liefert zusätzlich airline-weite FRA-Tagesstatistik, häufigste Verspätungen
+    und die meistgeflogenen Ziele. EHRLICH: Tagestafel, keine historische OTP."""
+    airline = (request.args.get('airline') or 'LH').upper().strip()
+    airport = (request.args.get('airport') or 'FRA').upper().strip()
+    # Nur FRA hat die kostenlose Fraport-Tages-Tafel. Für jeden ANDEREN Airport
+    # nutzen wir AeroDataBox (RapidAPI, env-gated, aggressiv gecacht). Ohne Key
+    # degradieren wir ehrlich — KEINE FRA-Zahlen unter fremdem Label.
+    if airport and airport not in ('FRA', 'EDDF'):
+        adb = _aerodatabox_punctuality(airport, airline)
+        if adb is None:
+            import os as _os
+            if not _os.environ.get('AERODATABOX_KEY'):
+                note = ('Pünktlichkeits-Daten für ' + airport
+                        + ' brauchen einen AeroDataBox-Key (nur FRA ist gratis verfügbar).')
+            else:
+                note = ('Für ' + airport + ' gerade keine Pünktlichkeits-Daten '
+                        '(Quelle nicht erreichbar oder leer).')
+            return jsonify({'ok': True, 'airport': airport, 'airline': airline,
+                            'source': 'aerodatabox', 'scope': 'heute_tages_tafel',
+                            'total': 0, 'on_time': 0, 'delayed': 0, 'cancelled': 0,
+                            'on_time_pct': None, 'avg_delay_min': 0, 'note': note})
+        out = {'ok': True, 'airport': airport, 'airline': airline,
+               'source': 'aerodatabox', 'scope': 'heute_tages_tafel'}
+        out.update(adb)   # total/on_time/delayed/cancelled/on_time_pct/avg_delay_min
+        if (adb.get('total') or 0) == 0:
+            out['note'] = ('Heute keine ' + airline + '-Abflüge ab ' + airport
+                           + ' bei AeroDataBox — oder die Quelle ist gerade leer.')
+        return jsonify(out)
+    # Tages-Tafel (volle heute-Liste) — DAS ist der Fix für "misst aktuellen
+    # Stand statt Tagesstand".
+    flights = _fra_day_board_cached('departure')
+    if flights is None:
+        return jsonify({'ok': False, 'error': 'source_unavailable'}), 200
+    al = [f for f in flights if f.get('airline') == airline]
+    stats = _punctuality_stats(al)
+    # Airline-weite FRA-Tages-Sicht (alle Carrier) als Kontext.
+    all_stats = _punctuality_stats(flights)
+    # Verspätungs-Ticker: die am stärksten verspäteten (nicht annullierten)
+    # Flüge der Airline, absteigend nach Minuten.
+    delayed_rows = sorted(
+        [f for f in al if not _is_cancelled(f) and int(f.get('delay_min') or 0) >= 5],
+        key=lambda f: int(f.get('delay_min') or 0), reverse=True)[:8]
+    ticker = [{'flight': f.get('flight'), 'dest_iata': f.get('dest_iata'),
+               'dest_name': f.get('dest_name'), 'delay_min': int(f.get('delay_min') or 0),
+               'sched': f.get('sched'), 'status': f.get('status')} for f in delayed_rows]
+    # Annullierte heute (Liste für UI).
+    cancels = [{'flight': f.get('flight'), 'dest_iata': f.get('dest_iata'),
+                'dest_name': f.get('dest_name'), 'sched': f.get('sched')}
+               for f in al if _is_cancelled(f)][:8]
+    # Meistgeflogene Ziele der Airline heute.
+    from collections import Counter
+    dest_counter = Counter((f.get('dest_iata') or '') for f in al if f.get('dest_iata'))
+    busiest = [{'dest_iata': d, 'dest_name': _dest_name_for(al, d), 'count': c}
+               for d, c in dest_counter.most_common(5)]
+    out = {'ok': True, 'airport': 'FRA', 'airline': airline,
+           'source': 'fraport', 'scope': 'heute_FRA_tages_tafel',
+           'ticker': ticker, 'cancellations': cancels, 'busiest_routes': busiest,
+           'all_airlines': all_stats}
+    out.update(stats)   # total/on_time/delayed/cancelled/on_time_pct/avg_delay_min
+    return jsonify(out)
+
+
+def _dest_name_for(flights, iata):
+    for f in flights:
+        if f.get('dest_iata') == iata and (f.get('dest_name') or ''):
+            return f.get('dest_name')
+    return iata
 
 
 @app.route('/api/moderation/<token>/report', methods=['POST'])

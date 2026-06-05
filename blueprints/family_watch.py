@@ -71,6 +71,41 @@ def _user_profile_path(token):
     return None
 
 
+def _load_crew_profile(token):
+    """Lädt das Crew-Profil-Dict ({name, homebase, ...}) GENAU so wie der
+    Endpoint GET /api/user/profile/<token> es liest:
+      Supabase-primary (user_profiles) → Disk-Fallback (_user_profile_path).
+    Vorher lasen die Family-Helper NUR die Disk-Datei — auf Render/Cloud-Run
+    liegt das Profil aber in Supabase, die Disk-Datei ist ephemeral/leer, daher
+    kamen Token-Slice als Name + None als Homebase zurück.
+    Returns dict (kann leer sein), nie None."""
+    if not token:
+        return {}
+    # 1) Bevorzugt _profile_load aus app.py (SB-primary, Disk-Fallback) — exakt
+    #    der Pfad den GET /api/user/profile nutzt.
+    fn = _app_attr('_profile_load')
+    if callable(fn):
+        try:
+            doc = fn(token) or {}
+            prof = doc.get('profile')
+            if isinstance(prof, dict):
+                return prof
+        except Exception as e:
+            _log().info(f'[family-pair] profile_load_skip {type(e).__name__}')
+    # 2) Disk-only Fallback (falls _profile_load nicht verfügbar).
+    try:
+        pp = _user_profile_path(token)
+        if pp and os.path.exists(pp):
+            with open(pp) as f:
+                doc = json.load(f) or {}
+            prof = doc.get('profile')
+            if isinstance(prof, dict):
+                return prof
+    except Exception:
+        pass
+    return {}
+
+
 def _get_sb():
     return _app_attr('SB_AVAILABLE', False), _app_attr('sb', None)
 
@@ -299,19 +334,145 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
 
 def _crew_short_name(crew_token):
     """Display-Name für die Family-Card. Privacy: kein Email-Leak, nur
-    profile.name (kann selbst-gewählt sein) oder Token-Slice."""
+    profile.name (kann selbst-gewählt sein). Liest SB-primary via
+    _load_crew_profile (gleicher Pfad wie GET /api/user/profile).
+    Fallback NIE der rohe Token (der ist ein Auth-Slice, kein Anzeigename),
+    sondern ein neutraler Platzhalter."""
+    prof = _load_crew_profile(crew_token)
+    n = prof.get('name')
+    if isinstance(n, str) and n.strip():
+        return n.strip()
+    return 'AeroX-Crew'
+
+
+def _crew_homebase(crew_token):
+    """Homebase-IATA aus dem Crew-Profil (für die Redeem-Bestätigung der
+    Family-Person). Liest SB-primary via _load_crew_profile (gleicher Pfad wie
+    GET /api/user/profile). None wenn nicht gesetzt."""
+    prof = _load_crew_profile(crew_token)
+    hb = prof.get('homebase') or prof.get('home_base')
+    if isinstance(hb, str) and hb.strip():
+        return hb.strip()
+    return None
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Pairing-Code + Scoped Family-Token  (Security-Fix 2026-06-05)
+#
+#  Vorher teilte die iOS-App den ROHEN Crew-Bearer (appState.token) als
+#  "Verbindungs-Code" — ein App-weites Auth-Credential. Wer es abfing,
+#  konnte sich als der Crew-Account ausgeben.
+#
+#  Neuer Flow:
+#    1) Crew ruft  POST /api/family/pair-code/<crew_token>/create
+#       → kurzer Code (6 Zeichen, A-Z2-9 ohne Ambiguität), TTL 30 min,
+#         regenerieren invalidiert den vorherigen Code dieses Crews.
+#    2) Family ruft POST /api/family/pair-code/redeem  body={code,family_name}
+#       → erzeugt einen SCOPED, read-only family_token (NICHT der Crew-Bearer),
+#         der nur die family-watch-Read-Pfade für diesen Crew freischaltet.
+#         Returns {family_token, crew_name, crew_homebase}.
+#
+#  Der scoped family_token (Prefix AT-FAM-) wird in einer eigenen Tabelle
+#  family_token -> crew_token (read-only scope) gehalten. Der bestehende
+#  /api/family-watch/<token>/feed akzeptiert BEIDE: den scoped Token (neu,
+#  bevorzugt) und — back-compat — jeden family_token der via grant existiert.
+# ════════════════════════════════════════════════════════════════════
+
+_PAIR_CODE_TTL_SEC = 30 * 60          # 30 Minuten
+_PAIR_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'  # ohne I/O/0/1
+_PAIR_CODE_LEN = 6
+
+
+def _pair_codes_disk_path():
+    hist = _get_history_dir()
+    os.makedirs(hist, exist_ok=True)
+    return os.path.join(hist, 'family_pair_codes.json')
+
+
+def _scoped_tokens_disk_path():
+    hist = _get_history_dir()
+    os.makedirs(hist, exist_ok=True)
+    return os.path.join(hist, 'family_scoped_tokens.json')
+
+
+def _pair_codes_load():
+    p = _pair_codes_disk_path()
+    if not os.path.exists(p):
+        return {}
     try:
-        pp = _user_profile_path(crew_token)
-        if pp and os.path.exists(pp):
-            with open(pp) as f:
-                doc = json.load(f) or {}
-            prof = doc.get('profile') or {}
-            n = prof.get('name')
-            if n:
-                return n
+        with open(p) as f:
+            return json.load(f) or {}
     except Exception:
-        pass
-    return (crew_token or '')[:8]
+        return {}
+
+
+def _pair_codes_save(codes):
+    try:
+        _atomic_write_json(_pair_codes_disk_path(), codes)
+        return True
+    except Exception as e:
+        _log().warning(f'[family-pair] codes_save_fail {e}')
+        return False
+
+
+def _scoped_tokens_load():
+    p = _scoped_tokens_disk_path()
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _scoped_tokens_save(toks):
+    try:
+        _atomic_write_json(_scoped_tokens_disk_path(), toks)
+        return True
+    except Exception as e:
+        _log().warning(f'[family-pair] scoped_save_fail {e}')
+        return False
+
+
+def _scoped_token_crew(family_token):
+    """Returns crew_token wenn family_token ein gültiger scoped read-only
+    Family-Token ist (Prefix AT-FAM- in family_scoped_tokens), sonst None."""
+    if not family_token:
+        return None
+    toks = _scoped_tokens_load()
+    rec = toks.get(family_token)
+    if isinstance(rec, dict):
+        return rec.get('crew_token')
+    return None
+
+
+def _gen_pair_code():
+    import secrets
+    return ''.join(secrets.choice(_PAIR_CODE_ALPHABET) for _ in range(_PAIR_CODE_LEN))
+
+
+def _gen_scoped_family_token():
+    import secrets
+    return 'AT-FAM-' + secrets.token_urlsafe(18)
+
+
+def _normalize_code(raw):
+    """Uppercase, Whitespace/Bindestriche weg, dann tolerant gegen die typischen
+    Tipp-Verwechsler mappen (0→O, 1→I, I→? ...). Da das Generator-Alphabet
+    weder I/O/0/1 enthält, mappen wir die wahrscheinlichen Verwechsler auf ihr
+    Alphabet-Pendant: 0→O ist NICHT im Alphabet, also nutzen wir die andere
+    Richtung — wir behandeln O als 0-Tippfehler? Beides ambig. Einfacher: wir
+    werfen alles raus was NICHT im Alphabet ist (A-HJ-NP-Z + 2-9)."""
+    if not raw or not isinstance(raw, str):
+        return ''
+    s = re.sub(r'[^A-Za-z0-9]', '', raw).upper()
+    # Häufige Tippfehler auf gültige Alphabet-Zeichen korrigieren:
+    #   0 (Null)  → O ist NICHT im Alphabet → verwerfen
+    #   1 (Eins)  → I ist NICHT im Alphabet → verwerfen
+    # Wir verwerfen daher schlicht alle Nicht-Alphabet-Zeichen.
+    s = re.sub(r'[^A-HJ-NP-Z2-9]', '', s)
+    return s[:_PAIR_CODE_LEN]
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -325,8 +486,20 @@ def family_watch_feed(token):
     if not safe:
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
     shares = _shares_load()
-    # Filter: alle grants mit family_token == this token
+    # Scoped read-only Family-Token (neu, bevorzugt): er ist NICHT der Crew-Bearer,
+    # sondern ein per Pairing-Code gemünzter Token der genau auf einen Crew zeigt.
+    # Wenn das eingehende Token ein solcher ist, verwenden wir die scoped-Tabelle
+    # als zusätzliche Quelle (ein Crew-Eintrag, auch wenn noch kein grant existiert).
+    scoped_crew = _scoped_token_crew(token)
+    # Filter: alle grants mit family_token == this token (back-compat)
     relevant = [s for s in shares if s.get('family_token') == token]
+    if scoped_crew:
+        # Sicherstellen dass der gepairte Crew im Feed auftaucht, auch falls der
+        # Crew noch keine Felder explizit gegranted hat → dann mit leerer
+        # allowed_fields-Liste (Card zeigt "wartet auf Freigabe").
+        if not any(s.get('crew_token') == scoped_crew for s in relevant):
+            relevant.append({'crew_token': scoped_crew, 'family_token': token,
+                             'fields': []})
     out = []
     for s in relevant:
         crew_token = s.get('crew_token')
@@ -448,3 +621,106 @@ def family_share_revoke(token, family_token):
         except Exception as e:
             _log().warning(f'[family-share] sb_revoke_skip {type(e).__name__}')
     return jsonify({'ok': True, 'revoked': True})
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Pairing-Code-Endpunkte
+# ════════════════════════════════════════════════════════════════════
+
+@family_watch_bp.route('/api/family/pair-code/<token>/create', methods=['POST'])
+def family_pair_code_create(token):
+    """Crew erzeugt einen kurzen, kurzlebigen Pairing-Code.
+
+    Auth: der Crew-Bearer steht im Pfad (<token>) → der zentrale
+    before_request-Gate (_bug004_token_auth_gate) validiert ihn gegen
+    auth_users, weil das AT-...-Pattern matched und es ein POST ist.
+
+    Regenerieren invalidiert den vorherigen Code dieses Crews (1 aktiver Code
+    pro Crew). Returns {code, expires_in}.
+    """
+    safe = _safe_token(token)
+    if not safe:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+
+    codes = _pair_codes_load()
+    now = time.time()
+    # Alte/abgelaufene Codes ausmisten + jeden vorhandenen Code DIESES Crews
+    # entfernen (Regenerate invalidiert den vorigen).
+    codes = {c: rec for c, rec in codes.items()
+             if isinstance(rec, dict)
+             and (now - float(rec.get('created_at', 0))) < _PAIR_CODE_TTL_SEC
+             and rec.get('crew_token') != token}
+
+    # Neuen, kollisionsfreien Code generieren.
+    code = _gen_pair_code()
+    tries = 0
+    while code in codes and tries < 10:
+        code = _gen_pair_code()
+        tries += 1
+
+    codes[code] = {
+        'crew_token': token,
+        'created_at': now,
+        'consumed': False,
+    }
+    _pair_codes_save(codes)
+    return jsonify({'ok': True, 'code': code, 'expires_in': _PAIR_CODE_TTL_SEC})
+
+
+@family_watch_bp.route('/api/family/pair-code/redeem', methods=['POST'])
+def family_pair_code_redeem():
+    """Family-Person löst einen Pairing-Code ein.
+
+    Public (kein Auth-Gate): der Family-User hat noch keinen Crew-Token; der
+    kurze Code IST das Geheimnis. body={code, family_name?}.
+
+    Bei gültigem, nicht-abgelaufenem Code wird ein SCOPED, read-only
+    family_token (Prefix AT-FAM-) gemünzt der nur auf diesen einen Crew zeigt —
+    NICHT der Crew-Bearer. Returns {family_token, crew_name, crew_homebase}.
+    """
+    body = request.get_json(silent=True) or {}
+    code = _normalize_code(body.get('code') or '')
+    if not code or len(code) != _PAIR_CODE_LEN:
+        return jsonify({'ok': False, 'error': 'invalid_code'}), 400
+
+    codes = _pair_codes_load()
+    now = time.time()
+    rec = codes.get(code)
+    if not isinstance(rec, dict):
+        return jsonify({'ok': False, 'error': 'code_not_found'}), 404
+    if (now - float(rec.get('created_at', 0))) >= _PAIR_CODE_TTL_SEC:
+        # Abgelaufen → aufräumen.
+        codes.pop(code, None)
+        _pair_codes_save(codes)
+        return jsonify({'ok': False, 'error': 'code_expired'}), 410
+
+    crew_token = rec.get('crew_token')
+    if not crew_token:
+        return jsonify({'ok': False, 'error': 'code_invalid'}), 400
+
+    family_name = (body.get('family_name') or '').strip()[:60] or None
+
+    # Scoped, read-only Family-Token münzen und persistieren.
+    family_token = _gen_scoped_family_token()
+    toks = _scoped_tokens_load()
+    toks[family_token] = {
+        'crew_token': crew_token,
+        'scope': 'family_read',
+        'family_name': family_name,
+        'created_at': now,
+    }
+    _scoped_tokens_save(toks)
+
+    # Code als konsumiert markieren (bleibt bis TTL einlösbar für den Fall eines
+    # Retry, aber wir merken consumed für Audit).
+    rec['consumed'] = True
+    rec['consumed_at'] = now
+    codes[code] = rec
+    _pair_codes_save(codes)
+
+    return jsonify({
+        'ok': True,
+        'family_token': family_token,
+        'crew_name': _crew_short_name(crew_token),
+        'crew_homebase': _crew_homebase(crew_token),
+    })
