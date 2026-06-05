@@ -9100,13 +9100,12 @@ def get_user_friends(token):
     data = _friends_load(token)
     enriched = []
     for friend_token in data.get('friends', []):
-        ppath = _user_profile_path(friend_token)
-        prof = {}
-        try:
-            with open(ppath) as f:
-                prof = (json.load(f) or {}).get('profile', {})
-        except Exception:
-            pass
+        # #29B: SB-primary statt Disk-only. Auf Cloud Run ist die Disk ephemer/
+        # per-Instanz — `open(_user_profile_path(...))` traf die Profil-Datei der
+        # Freunde meist NICHT (andere Instanz / nach Redeploy weg) → prof={} →
+        # Client zeigte den rohen Token-Prefix als Namen ("falscher Name") und
+        # Chat sagte "keine Freunde". `_profile_load` liest SB-first.
+        prof = (_profile_load(friend_token) or {}).get('profile', {}) or {}
         enriched.append({
             'token': friend_token,
             'match_id': hashlib.sha256(friend_token.encode()).hexdigest()[:16],
@@ -9896,8 +9895,13 @@ def get_metar_by_iata(iata):
     wind_kt = first.get('wspd')
     wind_dir = first.get('wdir')
     vis_sm = first.get('visib')
-    # `wxString` ist das human-readable Wetter-Phänomen (Rain, Snow, etc.)
-    conditions = first.get('wxString') or first.get('clouds')
+    # `wxString` ist das human-readable Wetter-Phänomen (Rain, Snow, etc.).
+    # #9: NICHT auf `clouds` zurückfallen — das ist eine Liste von Dicts
+    # ({'cover': 'FEW', 'base': 3500}), die als roher Python-Repr in den
+    # `decoded`-Text leakte ("…, {'cover': 'FEW', 'base': 3500}"). Die Wolken
+    # decodiert `_decode_metar_human` ohnehin sauber aus dem rohen METAR
+    # (FEW/SCT/BKN/OVC → "leicht/locker/stark bewölkt/bedeckt").
+    conditions = first.get('wxString')
     if isinstance(conditions, list):
         conditions = ', '.join(str(c) for c in conditions if c)
     time_iso = first.get('reportTime')
@@ -16055,6 +16059,86 @@ def _clean_city_name(name, iata=''):
     return s
 
 
+# ── Bahn/Bus-Filter (Lufthansa Express Rail / AIRail) ──────────────────────
+# Produkt-Vorgabe: "es sollen nur Flieger sein". Fraport listet ICE-Züge unter
+# LH-Flugnummern auf der Tafel (Lufthansa Express Rail, früher AIRail). Diese
+# Einträge sind KEINE Flüge und dürfen weder im Board noch in der Pünktlichkeits-
+# quote auftauchen.
+#
+# Live verifizierte Marker im Fraport-Feed (2026-06, dep+arr):
+#   ac  == 'TRS'   → Fraport-„Aircraft"-Code für AIRail-Züge (jeder Zug-Eintrag)
+#   reg  startswith 'ICE' → ICE-Zugnummer statt Luftfahrzeug-Kennung (z.B. ICE616)
+#   apname endet auf Bahnhof ("… Central St.", "… Main St.", "… Railway St")
+# Beispiel-Ziele: ZMB Hamburg, ZMU München, QPP Berlin, QDU Düsseldorf, DTZ
+# Dortmund. ACHTUNG: NICHT auf rohem IATA-Prefix Z*/X* filtern — ZRH (Zürich)
+# und andere echte Airports beginnen ebenfalls mit Z, und Bahnhöfe haben auch
+# Q*/D*-Codes (QPP, QDU, DTZ). Darum: ac/reg/Stationsname als Marker, plus eine
+# kuratierte Whitelist bekannter LH-Express-Rail-Bahnhofs-IATA-Codes als Backstop.
+
+# Bekannte Lufthansa-Express-Rail-/AIRail-Bahnhofs-IATA-Codes (Fraport/IATA-
+# „City/Rail"-Codes). Backstop, falls der ac/reg-Marker mal fehlt.
+_RAIL_STATION_IATA = {
+    'ZPP',  # Siegburg/Bonn ICE
+    'QKL',  # Köln Hbf (alt)
+    'QDU',  # Düsseldorf Hbf
+    'DTZ',  # Dortmund Hbf
+    'ZMB',  # Hamburg Hbf
+    'ZMU',  # München Hbf
+    'QPP',  # Berlin Hbf
+    'ZWS',  # Stuttgart Hbf
+    'QFB',  # Freiburg Hbf
+    'XHQ',  # Stuttgart (Rail)
+    'ZNV',  # Nürnberg Hbf
+    'BNF',  # Bonn (Rail)
+    'ZBA',  # Basel Bad Bahnhof
+    'XIK',  # Karlsruhe Hbf
+    'QWU',  # Würzburg Hbf
+    'ZCB',  # Ulm Hbf
+}
+
+# „Aircraft"-/Equipment-Codes, die KEIN Luftfahrzeug sind (Bahn/Bus).
+_NON_AIRCRAFT_EQUIP = {'TRS', 'RAIL', 'TRN', 'TRA', 'BUS', 'ICE', 'BAH', 'AIR'}
+
+# Reg-/Kennungs-Präfixe, die einen Zug/Bus statt eines Flugzeugs markieren.
+_RAIL_REG_PREFIXES = ('ICE', 'IC ', 'RAIL', 'TRN', 'BUS', 'TRS')
+
+
+def _is_rail_or_bus(flight):
+    """True, wenn der Eintrag ein Bahn-/Bus-Segment ist (Lufthansa Express Rail /
+    AIRail, ICE-Züge unter LH-Flugnummern) — KEIN echtes Flugzeug-Segment.
+
+    Robust gegen Feld-Varianten: prüft Equipment-Code (`aircraft`/`ac`),
+    Registrierung (`reg`, z.B. 'ICE616'), kuratierte Bahnhofs-IATA-Whitelist und
+    den Stationsnamen ('… Hbf'/'… Railway St'/'Bahnhof'). Greift sowohl auf die
+    normalisierte FRA-Zeile als auch direkt auf das rohe Fraport-/AeroDataBox-
+    Dict (Keys `ac`/`aircraft`)."""
+    if not isinstance(flight, dict):
+        return False
+    # 1) Equipment-/Aircraft-Code (normalisiert: 'aircraft'; roh: 'ac').
+    equip = (flight.get('aircraft') or flight.get('ac') or '').strip().upper()
+    if equip in _NON_AIRCRAFT_EQUIP:
+        return True
+    # 2) Registrierung — ICE-Zugnummer statt Luftfahrzeug-Kennung.
+    reg = (flight.get('reg') or '').strip().upper()
+    if reg:
+        for p in _RAIL_REG_PREFIXES:
+            if reg.startswith(p):
+                return True
+    # 3) Kuratierte Bahnhofs-IATA-Whitelist (Backstop).
+    dest = (flight.get('dest_iata') or flight.get('iata') or '').strip().upper()
+    if dest and dest in _RAIL_STATION_IATA:
+        return True
+    # 4) Stationsname als letzte Absicherung (Bahnhof/Railway/Hbf).
+    name = (flight.get('dest_name') or flight.get('apname') or '').strip().lower()
+    if name:
+        for marker in ('railway st', 'central st.', 'central station',
+                       'main st.', 'main station', 'hauptbahnhof', 'hbf',
+                       'bahnhof', ' bf', 'train station'):
+            if marker in name:
+                return True
+    return False
+
+
 def _fetch_fra_flights(flight_type='departure', max_pages=3):
     # `requests` ist in app.py NICHT module-level importiert → lokaler Import.
     # flight_type='arrival' → Fraport-Filter-Endpoint; `iata`/`apname` ist dann
@@ -16086,6 +16170,10 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
             if not data:
                 break
             for f in data:
+                # Bahn/Bus (LH Express Rail / AIRail ICE) raus — nur Flieger.
+                # Roh-Dict prüfen (ac/iata/apname/reg) BEVOR normalisiert wird.
+                if _is_rail_or_bus(f):
+                    continue
                 out.append({
                     'airline': (f.get('al') or '').strip(),
                     'airline_name': (f.get('alname') or '').strip(),
@@ -16710,6 +16798,9 @@ def _aerodatabox_board(iata, flight_type='departure'):
             row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
             row['delayed'] = (row['delay_min'] >= _AERODATABOX_DELAY_THRESHOLD
                               and 'cancel' not in row['status'].lower())
+            # Bahn/Bus (falls AeroDataBox mal Nicht-Luftfahrzeug liefert) raus.
+            if _is_rail_or_bus(row):
+                continue
             out.append(row)
         except Exception:
             continue
@@ -16944,6 +17035,9 @@ def _punctuality_stats(flights):
     nur, wenn weitere Flüge tatsächlich abfliegen. Das Tages-Fenster selbst ist in
     `_fra_day_board_cached` ab 05:00 Ortszeit fixiert."""
     now_local = _fra_local_now()
+    # Bahn/Bus (LH Express Rail / AIRail) raus — defensiv, falls ein Altbestand
+    # aus dem Cache (vor dem Source-Filter gebaut) noch Zug-Zeilen enthält.
+    flights = [f for f in (flights or []) if not _is_rail_or_bus(f)]
     # Nur bereits abgeflogene/bekannte Flüge in die Quote — Zukunft ignorieren.
     completed = [f for f in flights if _flight_sched_passed(f, now_local)]
     total = len(completed)
@@ -17053,8 +17147,24 @@ def _aerodatabox_punctuality(iata, airline):
     delayed = 0
     on_time = 0
     delay_vals = []
+    def _adb_is_rail(f):
+        # AeroDataBox-Roh-Dict in den _is_rail_or_bus-Contract bringen
+        # (aircraft/reg sind hier NESTED unter f['aircraft']).
+        acft = f.get('aircraft') or {}
+        mv = f.get('departure') or f.get('movement') or {}
+        ap = mv.get('airport') or {}
+        return _is_rail_or_bus({
+            'aircraft': (acft.get('model') or '').strip(),
+            'reg': (acft.get('reg') or '').strip(),
+            'dest_iata': (ap.get('iata') or '').strip(),
+            'dest_name': (ap.get('name') or '').strip(),
+        })
+
     for f in deps:
         if not _matches_airline(f):
+            continue
+        # Bahn/Bus (LH Express Rail) niemals in die Pünktlichkeits-Quote.
+        if _adb_is_rail(f):
             continue
         status = (f.get('status') or '').lower()
         if 'cancel' in status:
