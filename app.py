@@ -8352,8 +8352,20 @@ def put_user_profile(token):
     # Wave-1 BUG-003 (2026-06-02): account_type + family_share_defaults
     # waren silent-gedroppt → iOS UserProfile.isFamily-Flag konnte nicht
     # persistiert werden, Family-Watcher-Root-Stack wurde nie geladen.
+    #
+    # MERGE statt CLOBBER (2026-06-05): Vorher baute der PUT ein FRISCHES
+    # profile-Dict NUR aus den im Body gesendeten Feldern und schrieb es als
+    # komplette Row zurück → jeder partielle PUT (z.B. EmployersView pusht nur
+    # employers, OnboardingView pusht nur name/homebase) LÖSCHTE alle anderen
+    # bereits gespeicherten Felder (hometown, position, airline, share_*…).
+    # Das war der "warum bleibt nichts gespeichert"-Bug. Jetzt: existierendes
+    # Profil als Basis laden, nur die im Body vorhandenen Felder überschreiben.
+    existing = (_profile_load(token) or {}).get('profile') or {}
+    profile = dict(existing) if isinstance(existing, dict) else {}
     safe_keys = ('name', 'homebase', 'position', 'airline', 'hometown')
-    profile = {k: body.get(k) for k in safe_keys if body.get(k)}
+    for k in safe_keys:
+        if k in body and body.get(k):
+            profile[k] = body.get(k)
     # account_type: 'crew' | 'family' — validate strikt, sonst 400.
     if 'account_type' in body:
         at = body.get('account_type')
@@ -16017,6 +16029,12 @@ _AERODATABOX_CACHE = {}
 _AERODATABOX_TTL = 900         # 15 Min.
 _AERODATABOX_DELAY_THRESHOLD = 5   # Minuten — wie FRA (>=5 = verspätet).
 
+# Per-Airport-Board-Cache (native Scraper + AeroDataBox-Board). Eigener Topf,
+# getrennt vom FRA-Board. key (IATA, type, source) -> (ts, list). 12 Min TTL —
+# Board-Daten ändern sich nicht schneller sinnvoll, und schont fremde Quellen.
+_NATIVE_BOARD_CACHE = {}
+_NATIVE_BOARD_TTL = 720        # 12 Min.
+
 
 def _clean_city_name(name, iata=''):
     """Fraport `apname` kann nicht-lateinische Schreibweisen liefern (z.B.
@@ -16160,6 +16178,578 @@ def _fetch_opensky_board(icao, flight_type='departure'):
     return out
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Per-Airport NATIVE Boards (echte Abflug-/Ankunfts-Tafeln deutscher Airports)
+# ──────────────────────────────────────────────────────────────────────────
+# Grundsatz: jede Helper-Funktion FÄNGT alle Fehler ab und gibt [] oder None
+# zurück — niemals raise/500. Liefert Rows im selben Contract wie _fetch_fra_
+# flights (airline/airline_name/flight/dest_iata/dest_name/sched/esti/delay_min/
+# gate/terminal/status/delayed/...). Stadtnamen laufen durch _clean_city_name
+# (keine CJK/nicht-lateinischen Zeichen auf der iOS-Tafel).
+#
+# Native-Quellen (verifiziert per curl, ohne JS-Rendering, ohne Datacenter-Block):
+#   MUC → munich-airport.com/flightsearch/departures?day=  (server-rendered HTML)
+#   DUS → dus.com/api/sitecore/flightapi/SearchFlightsWithOutParams (JSON, X-Requested-With)
+#   HAJ → hannover-airport.de/.../departures|arrivals/ (server-rendered HTML)
+#   FMO → fmo.de/en/arrival-departure/ (server-rendered HTML)
+#   LEJ → mdf-ag.com/.../leipzig-halle-airport/.../departures-arrivals/ (HTML, dep+arr in einer Page)
+#   DRS → mdf-ag.com/.../dresden-airport/.../departures-arrivals/ (gleiches Vendor-Template)
+
+_BOARD_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+             '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+
+def _board_delay_min(sched_iso, revised_iso):
+    """Verspätung in Minuten aus ISO-geplant vs ISO-erwartet/-tatsächlich."""
+    if not sched_iso or not revised_iso:
+        return 0
+    try:
+        from datetime import datetime
+        ds = datetime.fromisoformat(str(sched_iso).replace('Z', '+00:00'))
+        de = datetime.fromisoformat(str(revised_iso).replace('Z', '+00:00'))
+        return max(0, int((de - ds).total_seconds() / 60))
+    except Exception:
+        return 0
+
+
+def _empty_board_row():
+    return {'airline': '', 'airline_name': '', 'flight': '', 'dest_iata': '',
+            'dest_name': '', 'sched': None, 'esti': None, 'delay_min': 0,
+            'gate': '', 'terminal': '', 'hall': '', 'status': '',
+            'delayed': False, 'reg': '', 'aircraft': ''}
+
+
+def _split_flightno(raw):
+    """'4Y 1410 (A320)' → ('4Y', '4Y 1410', 'A320'). 'EW3590' → ('EW','EW 3590','').
+    Airline-Code = führende Buchstaben + max. 1 Ziffer (IATA: 2 alnum, z.B. 4Y/LH/2L);
+    Rest = Flugnummer. Bei vorhandenem Leerzeichen wird auf diesem getrennt
+    (zuverlässiger als die Regex-Heuristik)."""
+    import re as _re
+    raw = (raw or '').strip()
+    ac = ''
+    m = _re.search(r'\(([^)]+)\)\s*$', raw)
+    if m:
+        ac = m.group(1).strip()
+        raw = raw[:m.start()].strip()
+    raw = _re.sub(r'\s+', ' ', raw)
+    code = ''
+    flight = raw
+    if ' ' in raw:
+        # Auf erstem Leerzeichen trennen: 'LH 441' / '4Y 1410'.
+        head, _, tail = raw.partition(' ')
+        if _re.match(r'^[A-Z0-9]{2,3}$', head) and _re.match(r'^\d{1,4}[A-Z]?$', tail.strip()):
+            return head, head + ' ' + tail.strip(), ac
+    # Kein/uneindeutiges Leerzeichen → IATA-Designator = 2 Zeichen (alnum) bevorzugt,
+    # sonst 2 Buchstaben + optional 1 Ziffer.
+    compact = raw.replace(' ', '')
+    m2 = (_re.match(r'^([A-Z]\d|\d[A-Z]|[A-Z]{2})(\d{1,4}[A-Z]?)$', compact)
+          or _re.match(r'^([A-Z0-9]{3})(\d{1,4}[A-Z]?)$', compact))
+    if m2:
+        code = m2.group(1)
+        flight = code + ' ' + m2.group(2)
+    else:
+        parts = raw.split(' ')
+        code = (parts[0] or '')[:3] if parts else ''
+    return code, flight, ac
+
+
+def _muc_board(flight_type='departure'):
+    """MUC — munich-airport.com/flightsearch/{departures|arrivals}?day=YYYY-MM-DD.
+    Server-rendered HTML-Tabelle (kein JS). Spalten: Airline / Nach(Von) (IATA) /
+    Flugnr (Typ) / Status / MUC-Zeit (Geplant | Erwartet) / Andere-Zeit / Bereich."""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        from datetime import datetime, timezone, timedelta
+        import re as _re
+    except Exception:
+        return None
+    arr = (flight_type == 'arrival')
+    path = 'arrivals' if arr else 'departures'
+    try:
+        day = datetime.now(timezone(timedelta(hours=2))).strftime('%Y-%m-%d')
+    except Exception:
+        day = None
+    url = 'https://www.munich-airport.com/flightsearch/' + path
+    try:
+        r = requests.get(url, params={'day': day} if day else {},
+                         headers={'User-Agent': _BOARD_UA,
+                                  'X-Requested-With': 'XMLHttpRequest',
+                                  'Accept': 'text/html'},
+                         timeout=12)
+        if r.status_code != 200 or not r.text:
+            return None
+        soup = BeautifulSoup(r.text, 'html.parser')
+    except Exception:
+        return None
+    out = []
+    for tr in soup.select('tr.fp-flight-item'):
+        try:
+            row = _empty_board_row()
+            # Airline-Name aus dem Tooltip / aria-label.
+            al = tr.select_one('.fp-flight-airline .info-content') \
+                or tr.select_one('.fp-flight-airline [aria-label]')
+            if al:
+                row['airline_name'] = (al.get('aria-label') or al.get_text(strip=True) or '').strip()
+            # Ziel/Herkunft: 'Varna (VAR)'.
+            ap = tr.select_one('.fp-flight-airport')
+            if ap:
+                txt = ap.get_text(' ', strip=True)
+                m = _re.search(r'\(([A-Z]{3})\)\s*$', txt)
+                if m:
+                    row['dest_iata'] = m.group(1)
+                    city = _re.sub(r'\s*\([A-Z]{3}\)\s*$', '', txt).strip()
+                else:
+                    city = txt
+                row['dest_name'] = _clean_city_name(city, row['dest_iata'])
+            # Flugnummer '4Y 1410 (A320)'.
+            fn = tr.select_one('.fp-flight-number')
+            if fn:
+                code, flight, ac = _split_flightno(fn.get_text(' ', strip=True))
+                row['airline'] = code or row['airline']
+                row['flight'] = flight
+                row['aircraft'] = ac
+            # Status (deutsch: 'gestartet', 'gelandet', 'annulliert', …).
+            st = tr.select_one('.fp-flight-status')
+            if st:
+                row['status'] = st.get_text(' ', strip=True)
+            # Zeit-Zelle 'HH:MM | HH:MM' = Geplant | Erwartet.
+            tcell = tr.select_one('.fp-flight-time-muc')
+            if tcell:
+                ttxt = tcell.get_text(' ', strip=True)
+                tm = _re.findall(r'(\d{2}:\d{2})', ttxt)
+                if tm and day:
+                    row['sched'] = day + 'T' + tm[0] + ':00'
+                    if len(tm) > 1 and tm[1] != tm[0]:
+                        row['esti'] = day + 'T' + tm[1] + ':00'
+            area = tr.select_one('.fp-flight-area')
+            if area:
+                row['terminal'] = area.get_text(' ', strip=True)
+            row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
+            row['delayed'] = row['delay_min'] >= 5
+            if row['flight'] or row['dest_iata']:
+                out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+def _dus_board(flight_type='departure'):
+    """DUS — dus.com/api/sitecore/flightapi/SearchFlightsWithOutParams (JSON).
+    Braucht X-Requested-With + Referer (sonst 400). arrival=true|false."""
+    try:
+        import requests
+    except Exception:
+        return None
+    arr = (flight_type == 'arrival')
+    url = 'https://www.dus.com/api/sitecore/flightapi/SearchFlightsWithOutParams'
+    try:
+        r = requests.get(url,
+                         params={'lang': 'en', 'arrival': 'true' if arr else 'false',
+                                 'offset': 0, 'count': 80, 'codeshare': 'true',
+                                 'showDetails': 'false'},
+                         headers={'User-Agent': _BOARD_UA,
+                                  'Accept': 'application/json, text/plain, */*',
+                                  'X-Requested-With': 'XMLHttpRequest',
+                                  'Referer': 'https://www.dus.com/en/flights/'
+                                             + ('arrivals' if arr else 'departures')},
+                         timeout=12)
+        if r.status_code != 200:
+            return None
+        flights = ((r.json() or {}).get('data') or {}).get('flights') or []
+    except Exception:
+        return None
+    out = []
+    for f in flights:
+        try:
+            row = _empty_board_row()
+            airline = f.get('airline') or {}
+            other = f.get('destination') or {}   # bei Ankunft = Herkunft
+            row['airline'] = (airline.get('iataCode') or '').strip()
+            row['airline_name'] = (airline.get('name') or '').strip()
+            row['flight'] = (f.get('flightNumber') or '').strip()
+            row['dest_iata'] = (other.get('iataCode') or '').strip()
+            row['dest_name'] = _clean_city_name(other.get('name'), row['dest_iata'])
+            row['sched'] = f.get('scheduledTime')
+            row['esti'] = f.get('estimatedTime') or f.get('actualTime')
+            stat = f.get('status') or {}
+            pub = (stat.get('publicStatus') or {}).get('name') or stat.get('description') or ''
+            row['status'] = (pub or '').strip()
+            g = f.get('gate')
+            row['gate'] = ', '.join(str(x) for x in g) if isinstance(g, list) else (str(g or '')).strip()
+            # Terminal aus airline-Mapping (Checkin/Gate je nach Richtung).
+            term = airline.get('terminalGateArrival' if arr else 'terminalCheckin')
+            if isinstance(term, list):
+                term = ', '.join(str(x) for x in term)
+            row['terminal'] = (str(term or '')).strip()
+            row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
+            row['delayed'] = row['delay_min'] >= 5
+            if 'cancel' in row['status'].lower() or 'annul' in row['status'].lower():
+                row['delayed'] = False
+            out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+def _haj_board(flight_type='departure'):
+    """HAJ — hannover-airport.de/.../{departures|arrivals}/ (server-rendered HTML).
+    .flightplan-item: Zeit / Ziel / FlightNo / Check-in / Terminal / Airline / Status."""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        from datetime import datetime, timezone, timedelta
+        import re as _re
+    except Exception:
+        return None
+    arr = (flight_type == 'arrival')
+    seg = 'arrivals' if arr else 'departures'
+    url = 'https://www.hannover-airport.de/en/all-about-your-flight/' + seg + '/'
+    try:
+        r = requests.get(url, headers={'User-Agent': _BOARD_UA, 'Accept': 'text/html'},
+                         timeout=12)
+        if r.status_code != 200 or not r.text:
+            return None
+        soup = BeautifulSoup(r.text, 'html.parser')
+        day = datetime.now(timezone(timedelta(hours=2))).strftime('%Y-%m-%d')
+    except Exception:
+        return None
+    out = []
+    for it in soup.select('.flightplan-item'):
+        try:
+            row = _empty_board_row()
+            tnode = it.select_one('.flightplan-item-time')
+            if tnode:
+                m = _re.search(r'(\d{2}:\d{2})', tnode.get_text(' ', strip=True))
+                if m:
+                    row['sched'] = day + 'T' + m.group(1) + ':00'
+            info = it.select_one('.flightplan-item-info')
+            if info:
+                a = info.find('a')
+                if a:
+                    row['dest_name'] = _clean_city_name(a.get_text(' ', strip=True))
+            summ = it.select_one('.flightplan-item-info-summary')
+            if summ:
+                spans = [s.get_text(' ', strip=True) for s in summ.find_all('span')]
+                strong = summ.find('strong')
+                if strong:
+                    code, flight, ac = _split_flightno(strong.get_text(' ', strip=True))
+                    row['airline'] = code
+                    row['flight'] = flight
+                for s in spans:
+                    sl = s.lower()
+                    if 'check-in' in sl:
+                        row['hall'] = s.split(':', 1)[-1].strip()
+                    elif 'terminal' in sl:
+                        row['terminal'] = _re.sub(r'(?i)terminal', '', s).strip()
+                    else:
+                        # 'Eurowings (EW)' → airline name.
+                        am = _re.search(r'^(.*?)\s*\(([A-Z0-9]{2,3})\)\s*$', s)
+                        if am and not row['airline_name']:
+                            row['airline_name'] = am.group(1).strip()
+                            row['airline'] = row['airline'] or am.group(2)
+            st = it.select_one('.flightplan-item-status')
+            if st:
+                row['status'] = st.get_text(' ', strip=True)
+            if row['flight'] or row['dest_name']:
+                out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+def _fmo_board(flight_type='departure'):
+    """FMO — fmo.de/en/arrival-departure/ (server-rendered HTML). Eine Page mit
+    Abflügen UND Ankünften: .flight-list-item, data-destination=IATA. Richtung über
+    den Detail-Link / die Item-Gruppierung — wir nehmen data-destination + den
+    Listen-Kontext. FMO mischt dep/arr in EINER Liste, daher filtern wir grob auf
+    Basis der Sektion-Überschrift."""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        from datetime import datetime, timezone, timedelta
+        import re as _re
+    except Exception:
+        return None
+    arr = (flight_type == 'arrival')
+    url = 'https://www.fmo.de/en/arrival-departure/'
+    try:
+        r = requests.get(url, headers={'User-Agent': _BOARD_UA, 'Accept': 'text/html'},
+                         timeout=12)
+        if r.status_code != 200 or not r.text:
+            return None
+        soup = BeautifulSoup(r.text, 'html.parser')
+        day = datetime.now(timezone(timedelta(hours=2))).strftime('%Y-%m-%d')
+    except Exception:
+        return None
+    # FMO trennt Abflug/Ankunft über zwei tab-panes: #abflug / #ankunft.
+    scope = soup.find(id='ankunft' if arr else 'abflug')
+    items = (scope or soup).select('.flight-list-item')
+    out = []
+    for it in items:
+        try:
+            # Header-/Titelzeilen (class 'title') überspringen.
+            if 'title' in (it.get('class') or []):
+                continue
+            row = _empty_board_row()
+            tnode = it.select_one('.flight-list-item-time')
+            if tnode:
+                m = _re.search(r'(\d{2}:\d{2})', tnode.get_text(' ', strip=True))
+                if m:
+                    row['sched'] = day + 'T' + m.group(1) + ':00'
+            row['dest_iata'] = (it.get('data-destination') or '').strip().upper()
+            dest = it.select_one('.flight-list-item-destination-target')
+            if dest:
+                # Der Stadtname steht im ersten <span> (das verschachtelte <p> mit
+                # der Flugnummer NICHT mitnehmen — FMO nestet ungültig).
+                city_span = dest.find('span')
+                city = (city_span.get_text(' ', strip=True) if city_span
+                        else dest.get_text(' ', strip=True))
+                row['dest_name'] = _clean_city_name(city, row['dest_iata'])
+            num = it.select_one('.flight-list-item-destination-number')
+            if num:
+                code, flight, ac = _split_flightno(num.get_text(' ', strip=True))
+                row['airline'] = code
+                row['flight'] = flight
+            st = it.select_one('.flight-list-item-status')
+            if st:
+                row['status'] = st.get_text(' ', strip=True)
+            if row['flight'] or row['dest_iata']:
+                out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+def _mdfag_board(slug, iata, flight_type='departure'):
+    """LEJ/DRS — mdf-ag.com TYPO3-Vendor (nrc-flightplan). EINE Page rendert dep+arr:
+    #collapse-parent-departure / #collapse-parent-arrival. Row=tr.tx-nrc-flightplan__
+    table-overview: .flightnumber / .airlinename / Route(>) / Zeit(durchgestrichen=
+    geplant, darunter=erwartet/aktuell) / Status / GATE."""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        from datetime import datetime, timezone, timedelta
+        import re as _re
+    except Exception:
+        return None
+    arr = (flight_type == 'arrival')
+    url = ('https://www.mdf-ag.com/en/passengers-and-visitors/' + slug
+           + '/flights/departures-arrivals/')
+    try:
+        r = requests.get(url, headers={'User-Agent': _BOARD_UA, 'Accept': 'text/html'},
+                         timeout=12)
+        if r.status_code != 200 or not r.text:
+            return None
+        soup = BeautifulSoup(r.text, 'html.parser')
+        day = datetime.now(timezone(timedelta(hours=2))).strftime('%Y-%m-%d')
+    except Exception:
+        return None
+    scope = soup.select_one('#collapse-parent-arrival' if arr
+                            else '#collapse-parent-departure')
+    if scope is None:
+        return None
+    out = []
+    for tr in scope.select('tr.tx-nrc-flightplan__table-overview'):
+        try:
+            row = _empty_board_row()
+            fn = tr.select_one('.flightnumber')
+            if fn:
+                code, flight, ac = _split_flightno(fn.get_text(' ', strip=True))
+                row['airline'] = code
+                row['flight'] = flight
+            an = tr.select_one('.airlinename')
+            if an:
+                row['airline_name'] = (an.get('title') or an.get_text(' ', strip=True) or '').strip()
+            # Route-Zelle: 'Leipzig/Halle > Nottingham East Midl'. Die andere Seite
+            # (nicht der Heimatflughafen) ist Ziel/Herkunft.
+            route_td = None
+            for td in tr.find_all('td'):
+                if td.select_one('[class*="flightplan-destination-"]'):
+                    route_td = td
+                    break
+            if route_td:
+                parts = [p.strip() for p in route_td.get_text(' ', strip=True).split('>')]
+                parts = [p for p in parts if p]
+                if len(parts) >= 2:
+                    other = parts[0] if arr else parts[-1]
+                    row['dest_name'] = _clean_city_name(other)
+            # Zeit-Zelle: durchgestrichen = geplant; sichtbar = erwartet/aktuell.
+            sched_t = esti_t = None
+            for td in tr.find_all('td'):
+                strikes = td.select('[style*="line-through"]')
+                if strikes:
+                    sm = _re.search(r'(\d{2}:\d{2})', strikes[0].get_text())
+                    if sm:
+                        sched_t = sm.group(1)
+                    # erste nicht-durchgestrichene Zeit in derselben Zelle
+                    for div in td.find_all('div'):
+                        style = (div.get('style') or '')
+                        if 'line-through' in style:
+                            continue
+                        em = _re.search(r'^(\d{2}:\d{2})$', div.get_text(strip=True))
+                        if em:
+                            esti_t = em.group(1)
+                            break
+                    break
+            if sched_t:
+                row['sched'] = day + 'T' + sched_t + ':00'
+            if esti_t and esti_t != sched_t:
+                row['esti'] = day + 'T' + esti_t + ':00'
+            # GATE (im Mobile/Status-Text als 'GATE 14').
+            gm = _re.search(r'GATE\s*([0-9A-Z]+)', tr.get_text(' ', strip=True))
+            if gm:
+                row['gate'] = gm.group(1)
+            # Status: letzte sinnvolle Statuszelle ('departed','landed','cancelled').
+            for td in reversed(tr.find_all('td')):
+                t = td.get_text(' ', strip=True).lower()
+                if t in ('departed', 'landed', 'cancelled', 'boarding', 'on time',
+                         'delayed', 'expected', 'arrived', 'gate closed'):
+                    row['status'] = td.get_text(' ', strip=True)
+                    break
+            row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
+            row['delayed'] = row['delay_min'] >= 5
+            if row['flight'] or row['dest_name']:
+                out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+# Registry: IATA → (native-Scraper-Callable, ICAO-für-OpenSky-Fallback).
+_NATIVE_BOARD_SCRAPERS = {
+    'MUC': lambda ft: _muc_board(ft),
+    'DUS': lambda ft: _dus_board(ft),
+    'HAJ': lambda ft: _haj_board(ft),
+    'FMO': lambda ft: _fmo_board(ft),
+    'LEJ': lambda ft: _mdfag_board('leipzig-halle-airport', 'LEJ', ft),
+    'DRS': lambda ft: _mdfag_board('dresden-airport', 'DRS', ft),
+}
+
+
+def _aerodatabox_board(iata, flight_type='departure'):
+    """Board (Abflug/Ankunft) eines beliebigen IATA-Airports via AeroDataBox
+    (RapidAPI, env-gated AERODATABOX_KEY). Liefert Rows im FRA-Contract oder None
+    (kein Key / Quelle down / leer → Caller degradiert ehrlich). KEINE Erfindung."""
+    import os as _os
+    key = _os.environ.get('AERODATABOX_KEY')
+    if not key:
+        return None
+    iata = (iata or '').upper().strip()
+    if len(iata) != 3:
+        return None
+    try:
+        import requests
+        from datetime import datetime, timezone, timedelta
+        import re as _re
+    except Exception:
+        return None
+    arr = (flight_type == 'arrival')
+    try:
+        now = datetime.now(timezone(timedelta(hours=2)))
+    except Exception:
+        now = datetime.now(timezone.utc)
+    # 12h-Fenster ab jetzt (AeroDataBox: max 12h pro Call).
+    frm = now.strftime('%Y-%m-%dT%H:%M')
+    to = (now + timedelta(hours=12)).strftime('%Y-%m-%dT%H:%M')
+    url = ('https://aerodatabox.p.rapidapi.com/flights/airports/iata/'
+           + iata + '/' + frm + '/' + to)
+    try:
+        r = requests.get(url,
+                         params={'direction': 'Arrival' if arr else 'Departure',
+                                 'withLocation': 'false', 'withCancelled': 'true',
+                                 'withCodeshared': 'false', 'withCargo': 'true',
+                                 'withPrivate': 'false'},
+                         headers={'X-RapidAPI-Key': key,
+                                  'X-RapidAPI-Host': 'aerodatabox.p.rapidapi.com'},
+                         timeout=15)
+        if r.status_code != 200:
+            return None
+        body = r.json() or {}
+    except Exception:
+        return None
+    items = body.get('arrivals' if arr else 'departures') or []
+
+    def _t_local(v):
+        node = v or {}
+        return ((node.get('local') or node.get('utc')) or None)
+
+    out = []
+    for f in items:
+        try:
+            row = _empty_board_row()
+            al = f.get('airline') or {}
+            row['airline'] = (al.get('iata') or '').strip().upper()
+            row['airline_name'] = (al.get('name') or '').strip()
+            row['flight'] = (f.get('number') or '').replace('  ', ' ').strip()
+            if not row['airline'] and row['flight']:
+                row['airline'] = (row['flight'].split(' ')[0] or '')[:3]
+            # Beim Board-Eintrag steht das ANDERE Ende unter movement.airport.
+            # AeroDataBox liefert je nach API-Variante 'movement' ODER ein nach der
+            # Richtung benanntes Sub-Objekt ('departure'/'arrival') — beides stützen.
+            mv = (f.get('movement') or f.get('arrival' if arr else 'departure')
+                  or f.get('departure' if arr else 'arrival') or {})
+            ap = mv.get('airport') or {}
+            row['dest_iata'] = (ap.get('iata') or '').strip().upper()
+            row['dest_name'] = _clean_city_name(ap.get('name'), row['dest_iata'])
+            sched = _t_local(mv.get('scheduledTime'))
+            revised = (_t_local(mv.get('revisedTime'))
+                       or _t_local(mv.get('predictedTime'))
+                       or _t_local(mv.get('actualTime')))
+            row['sched'] = (sched or '').replace(' ', 'T') if sched else None
+            if revised:
+                rev = revised.replace(' ', 'T')
+                if rev != row['sched']:
+                    row['esti'] = rev
+            row['gate'] = (mv.get('gate') or '').strip()
+            row['terminal'] = (mv.get('terminal') or '').strip()
+            row['status'] = (f.get('status') or '').strip()
+            acft = f.get('aircraft') or {}
+            row['aircraft'] = (acft.get('model') or '').strip()
+            row['reg'] = (acft.get('reg') or '').strip()
+            row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
+            row['delayed'] = (row['delay_min'] >= _AERODATABOX_DELAY_THRESHOLD
+                              and 'cancel' not in row['status'].lower())
+            out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+def _native_board_cached(iata, flight_type):
+    """Gecachtes Native-Board (12 Min TTL). Reihenfolge: nativer Scraper →
+    AeroDataBox-Board → None. Gibt (rows, source) zurück; None-rows = alle Quellen
+    down/leer/kein-Key → Caller degradiert ehrlich. Niemals raise."""
+    import time as _t
+    iata = (iata or '').upper().strip()
+    ft = 'arrival' if flight_type == 'arrival' else 'departure'
+    ckey = (iata, ft)
+    cached = _NATIVE_BOARD_CACHE.get(ckey)
+    if cached and (_t.time() - cached[0]) < _NATIVE_BOARD_TTL:
+        return cached[1]
+    result = (None, None)
+    scraper = _NATIVE_BOARD_SCRAPERS.get(iata)
+    if scraper:
+        try:
+            rows = scraper(ft)
+        except Exception:
+            rows = None
+        if rows:   # nur cachen/zurückgeben wenn nicht-leer
+            result = (rows, iata.lower() + '_native')
+    if result[0] is None:
+        try:
+            rows = _aerodatabox_board(iata, ft)
+        except Exception:
+            rows = None
+        if rows is not None:
+            result = (rows, 'aerodatabox')
+    # Nur erfolgreiche/definitive Ergebnisse cachen (None nicht — sonst bleibt ein
+    # transienter Quellen-Ausfall 12 Min „kleben").
+    if result[0] is not None:
+        _NATIVE_BOARD_CACHE[ckey] = (_t.time(), result)
+    return result
+
+
 def _fra_board_cached(flight_type):
     """Gecachtes FRA-Board (dep/arr). None bei Quelle-down."""
     import time as _t
@@ -16174,11 +16764,56 @@ def _fra_board_cached(flight_type):
     return flights
 
 
+# Betriebstag-Anker: der Tag beginnt um 05:00 Ortszeit (Europe/Berlin). Alles vor
+# 05:00 (Frühschicht-Vorlauf / Nacht-Restflüge des Vortags) zählt NICHT zum heutigen
+# Pünktlichkeits-Tag. So ist das Fenster TAGES-fixiert (immer ab 05:00) statt
+# now-relativ → stabile %-Zahl, die nur wächst statt zu springen.
+_FRA_OPERATING_DAY_START_HOUR = 5
+
+
+def _fra_local_now():
+    """Aktuelle Europe/Berlin-Lokalzeit als naive datetime (gleiche Basis wie die
+    Fraport-`sched`-Strings, die lokal ohne Offset kommen). DST-robust via ZoneInfo,
+    Fallback +2 (CEST) / grob, ohne harte pytz-Abhängigkeit."""
+    from datetime import datetime, timezone, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo('Europe/Berlin')).replace(tzinfo=None)
+    except Exception:
+        # Fallback: CEST (+2). Im Winter minimal off, aber 05:00-Anker bleibt stabil.
+        return datetime.now(timezone(timedelta(hours=2))).replace(tzinfo=None)
+
+
+def _parse_local_iso(s):
+    """Parst einen Fraport-ISO-String (lokal, evtl. mit Offset) zu naiver
+    Lokalzeit. None bei Unparsbar."""
+    if not s:
+        return None
+    from datetime import datetime
+    try:
+        dt = datetime.fromisoformat(str(s))
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    except Exception:
+        # Fallback: nur Datum+Uhrzeit-Prefix.
+        try:
+            return datetime.strptime(str(s)[:19], '%Y-%m-%dT%H:%M:%S')
+        except Exception:
+            return None
+
+
 def _fra_day_board_cached(flight_type='departure'):
-    """Gecachte VOLLE Tages-Tafel (für Pünktlichkeit). Holt deutlich mehr Seiten
-    als das normale Board und behält nur Flüge mit `sched` am heutigen Datum
-    (Europe/Berlin) → echte Tagesaggregation statt Momentaufnahme. None bei
-    Quelle-down. Dedupliziert über (flight, sched)."""
+    """Gecachte VOLLE Tages-Tafel (für Pünktlichkeit), TAGES-ANKERT ab 05:00
+    Ortszeit (Europe/Berlin). Holt deutlich mehr Seiten als das normale Board und
+    behält jeden Flug mit `sched` >= heute 05:00 lokal → echte Tagesaggregation,
+    fixiertes Fenster statt now-relative Momentaufnahme. None bei Quelle-down.
+    Dedupliziert über (flight, sched).
+
+    WICHTIG: Hier ist KEINE now-Obergrenze — die volle Liste (auch noch nicht
+    abgeflogene Flüge) wird gecacht, damit Ticker/Cancellations/Busiest-Routes den
+    ganzen Tag sehen. Die Pünktlichkeits-Quote (`_punctuality_stats`) zählt davon
+    nur die bereits abgeflogenen (sched <= now) → stabile, nur-wachsende Zahl."""
     import time as _t
     ckey = 'FRA_DAY_' + ('arr' if flight_type == 'arrival' else 'dep')
     cached = _AIRPORT_DAY_CACHE.get(ckey)
@@ -16188,15 +16823,13 @@ def _fra_day_board_cached(flight_type='departure'):
     flights = _fetch_fra_flights(flight_type, max_pages=20)
     if flights is None:
         return None
-    # Auf heutiges Datum (Europe/Berlin) filtern. `sched` ist ISO mit tz.
+    # Betriebstag-Start = heute 05:00 Ortszeit (Europe/Berlin).
     try:
-        from datetime import datetime, timezone, timedelta
-        # Europe/Berlin: CEST = +2 (Sommer). Wir nehmen den Datums-Anteil
-        # direkt aus dem ISO-String (Fraport liefert lokale tz), das ist robust
-        # gegen DST ohne pytz-Abhängigkeit.
-        today_str = datetime.now(timezone(timedelta(hours=2))).strftime('%Y-%m-%d')
+        local_now = _fra_local_now()
+        day_start = local_now.replace(hour=_FRA_OPERATING_DAY_START_HOUR,
+                                      minute=0, second=0, microsecond=0)
     except Exception:
-        today_str = None
+        day_start = None
     seen = set()
     day = []
     for f in flights:
@@ -16205,18 +16838,33 @@ def _fra_day_board_cached(flight_type='departure'):
         if key in seen:
             continue
         seen.add(key)
-        if today_str and sch and not sch.startswith(today_str):
-            continue
+        if day_start is not None:
+            sdt = _parse_local_iso(sch)
+            # Nur Flüge des heutigen Betriebstags (sched >= heute 05:00 lokal).
+            if sdt is None or sdt < day_start:
+                continue
         day.append(f)
     _AIRPORT_DAY_CACHE[ckey] = (_t.time(), day)
     return day
 
 
+# ICAO→IATA für die großen deutschen Bases (iOS kann ICAO schicken). FRA bleibt
+# der einzige Sonderweg (Fraport-Gratis-Feed). Native-Scraper + AeroDataBox laufen
+# über IATA.
+_DE_ICAO_TO_IATA = {
+    'EDDF': 'FRA', 'EDDM': 'MUC', 'EDDL': 'DUS', 'EDDH': 'HAM', 'EDDB': 'BER',
+    'EDDV': 'HAJ', 'EDDK': 'CGN', 'EDDS': 'STR', 'EDDN': 'NUE', 'EDDP': 'LEJ',
+    'EDDC': 'DRS', 'EDLW': 'DTM', 'EDDW': 'BRE', 'EDLV': 'NRN', 'EDJA': 'FMM',
+    'EDDG': 'FMO', 'EDLP': 'PAD', 'EDHL': 'LBC', 'EDHI': 'XFW',
+}
+
+
 @app.route('/api/airport/<token>/board', methods=['GET'])
 def airport_board(token):
-    """FRA-Board (live). Query: ?airport=FRA&type=departure|arrival&airline=LH&limit=60.
-    Nur FRA (kostenlose Fraport-Quelle)."""
-    airport = (request.args.get('airport') or 'FRA').upper()
+    """Per-Airport-Board (live). Query: ?airport=MUC&type=departure|arrival&airline=LH&limit=60.
+    FRA → Fraport (gratis). MUC/DUS/HAJ/FMO/LEJ/DRS → native Scraper. Sonst →
+    AeroDataBox (env-gated) → OpenSky (zuletzt geflogen) → ehrlich kein-Daten."""
+    airport = (request.args.get('airport') or 'FRA').upper().strip()
     airline = (request.args.get('airline') or '').upper().strip()
     ftype = (request.args.get('type') or 'departure').lower()
     if ftype not in ('departure', 'arrival'):
@@ -16225,26 +16873,44 @@ def airport_board(token):
         limit = min(int(request.args.get('limit') or 60), 200)
     except Exception:
         limit = 60
-    # FRA (IATA) / EDDF (ICAO) → Fraport (live, Gates/Status). Sonst jeder
-    # andere ICAO → OpenSky (gratis, zuletzt geflogene Flüge, keine Gates).
-    if airport in ('FRA', 'EDDF'):
+    # ICAO → IATA normalisieren (FRA/EDDF gesondert).
+    iata = _DE_ICAO_TO_IATA.get(airport, airport)
+    src = None
+    flights = None
+    if iata in ('FRA', 'EDDF') or airport in ('FRA', 'EDDF'):
         flights = _fra_board_cached(ftype)
         src = 'fraport'
         out_airport = 'FRA'
     else:
-        flights = _fetch_opensky_board(airport, ftype)
-        src = 'opensky'
-        out_airport = airport
+        out_airport = iata
+        # 1) Native-Scraper (für die großen Bases) bzw. AeroDataBox-Board.
+        rows, board_src = _native_board_cached(iata, ftype)
+        if rows is not None:
+            flights = rows
+            src = board_src
+        elif len(airport) == 4 and airport.startswith('ED'):
+            # 2) Letzter Fallback: OpenSky (nur ICAO, zuletzt geflogene Flüge).
+            flights = _fetch_opensky_board(airport, ftype)
+            src = 'opensky'
     if flights is None:
-        return jsonify({'ok': False, 'error': 'source_unavailable', 'airport': out_airport,
-                        'message': airport in ('FRA', 'EDDF')
-                            and 'FRA-Board gerade nicht erreichbar.'
-                            or 'Für diesen Airport (ICAO) gerade keine Live-Daten.'}), 200
+        # Ehrlich: kein Native-Scraper getroffen, kein AeroDataBox-Key/leer.
+        import os as _os
+        if out_airport in ('FRA', 'EDDF'):
+            msg = 'FRA-Board gerade nicht erreichbar.'
+        elif not _os.environ.get('AERODATABOX_KEY') and iata not in _NATIVE_BOARD_SCRAPERS:
+            msg = ('Keine Board-Daten für ' + out_airport
+                   + ' (kein nativer Scraper, AeroDataBox-Key fehlt).')
+        else:
+            msg = 'Keine Board-Daten für ' + out_airport + ' (Quelle nicht erreichbar oder leer).'
+        return jsonify({'ok': False, 'error': 'source_unavailable',
+                        'airport': out_airport, 'type': ftype, 'message': msg}), 200
     if airline:
         flights = [f for f in flights if f.get('airline') == airline]
     return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
                     'count': len(flights[:limit]), 'flights': flights[:limit],
-                    'source': src, 'cached_ttl': _AIRPORT_BOARD_TTL})
+                    'source': src,
+                    'cached_ttl': (_AIRPORT_BOARD_TTL if src == 'fraport'
+                                   else _NATIVE_BOARD_TTL)})
 
 
 # Fraport-Status-Strings, die "annulliert/gestrichen" bedeuten.
@@ -16254,16 +16920,40 @@ def _is_cancelled(f):
     return any(m in (f.get('status') or '').lower() for m in _FRA_CANCEL_MARKERS)
 
 
+def _flight_sched_passed(f, now_local):
+    """True wenn der geplante Abflug (`sched`) bereits in der Vergangenheit liegt
+    (bzw. unparsbar → wir zählen ihn konservativ als bekannt). Annullierte gelten
+    immer als 'bekannt'. now_local = naive Europe/Berlin-Zeit."""
+    if _is_cancelled(f):
+        return True
+    if now_local is None:
+        return True
+    sdt = _parse_local_iso(f.get('sched'))
+    if sdt is None:
+        return True
+    return sdt <= now_local
+
+
 def _punctuality_stats(flights):
-    """Aggregiert on-time/delayed/cancelled über eine Flugliste."""
-    total = len(flights)
-    cancelled = sum(1 for f in flights if _is_cancelled(f))
-    delayed = sum(1 for f in flights if f.get('delayed') and not _is_cancelled(f))
+    """Aggregiert on-time/delayed/cancelled über eine TAGES-Flugliste.
+
+    STABILITÄTS-FIX: Die Quote basiert NUR auf Flügen, deren geplante Zeit bereits
+    PASSIERT ist (sched <= jetzt) — also abgeschlossene/bekannte Flüge. Noch nicht
+    abgeflogene Flüge (Zukunft im selben Tag) werden NICHT als 'on time' gezählt.
+    Dadurch springt die Zahl beim Neu-Laden (09:00 vs 09:05) nicht mehr, sie wächst
+    nur, wenn weitere Flüge tatsächlich abfliegen. Das Tages-Fenster selbst ist in
+    `_fra_day_board_cached` ab 05:00 Ortszeit fixiert."""
+    now_local = _fra_local_now()
+    # Nur bereits abgeflogene/bekannte Flüge in die Quote — Zukunft ignorieren.
+    completed = [f for f in flights if _flight_sched_passed(f, now_local)]
+    total = len(completed)
+    cancelled = sum(1 for f in completed if _is_cancelled(f))
+    delayed = sum(1 for f in completed if f.get('delayed') and not _is_cancelled(f))
     on_time = max(0, total - cancelled - delayed)
     active = max(0, total - cancelled)
     pct = round(100.0 * on_time / active, 0) if active > 0 else None
     avg_delay = 0
-    delay_vals = [int(f.get('delay_min') or 0) for f in flights
+    delay_vals = [int(f.get('delay_min') or 0) for f in completed
                   if not _is_cancelled(f) and int(f.get('delay_min') or 0) > 0]
     if delay_vals:
         avg_delay = round(sum(delay_vals) / len(delay_vals))
@@ -16296,11 +16986,15 @@ def _aerodatabox_punctuality(iata, airline):
         from datetime import datetime, timezone
     except Exception:
         return None
-    # Lokales Tagesfenster. Ohne robuste tz-DB nehmen wir UTC-Tag (akzeptabel laut
-    # Spec) — AeroDataBox akzeptiert lokal-ISO ohne Offset. 00:00..23:59 UTC heute.
+    # TAGES-ANKER: Betriebstag ab 05:00 LOKAL bis Tagesende. AeroDataBox akzeptiert
+    # lokal-ISO ohne Offset und liefert lokale Zeiten — wir ankern das Fenster also
+    # am Flughafen-Tag, nicht now-relativ. Das `from` ist FIX auf heute 05:00 →
+    # gleiches Fenster beim Neu-Laden (Stabilität). Die Quote zählt unten nur Flüge
+    # mit bereits passierter Plan-Zeit.
     now = datetime.now(timezone.utc)
-    from_iso = now.strftime('%Y-%m-%dT00:00')
-    to_iso = now.strftime('%Y-%m-%dT23:59')
+    day = now.strftime('%Y-%m-%d')
+    from_iso = day + 'T05:00'
+    to_iso = day + 'T23:59'
     url = ('https://aerodatabox.p.rapidapi.com/flights/airports/iata/'
            + iata + '/' + from_iso + '/' + to_iso)
     try:
@@ -16352,6 +17046,8 @@ def _aerodatabox_punctuality(iata, airline):
         except Exception:
             return None
 
+    # now als tz-aware UTC — Vergleichsbasis für "Plan-Zeit bereits passiert?".
+    now_aware = datetime.now(timezone.utc)
     total = 0
     cancelled = 0
     delayed = 0
@@ -16360,9 +17056,10 @@ def _aerodatabox_punctuality(iata, airline):
     for f in deps:
         if not _matches_airline(f):
             continue
-        total += 1
         status = (f.get('status') or '').lower()
         if 'cancel' in status:
+            # Annulliert = bekannt → zählt mit.
+            total += 1
             cancelled += 1
             continue
         mv = f.get('departure') or {}
@@ -16372,6 +17069,17 @@ def _aerodatabox_punctuality(iata, airline):
                            or ((mv.get('revisedTime') or {}).get('utc'))
                            or ((mv.get('actualTime') or {}).get('local'))
                            or ((mv.get('actualTime') or {}).get('utc')))
+        # STABILITÄTS-FIX: Nur Flüge in die Quote, deren PLAN-Zeit bereits passiert
+        # ist (oder die schon eine revidierte/tatsächliche Zeit haben = bekannt).
+        # Künftige Flüge ohne Bewegungsdaten würden sonst als 'on time' gezählt und
+        # die Zahl beim Neu-Laden springen lassen.
+        if revised is None and sched is not None:
+            try:
+                if sched > now_aware:
+                    continue
+            except Exception:
+                pass
+        total += 1
         dmin = 0
         if sched and revised:
             try:

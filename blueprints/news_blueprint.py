@@ -274,14 +274,18 @@ def get_news_feed():
     """Aggregierter News-Feed (multi-source, dedupe, filter, sort desc).
 
     Query-Params:
-      airline=  optional IATA-Code (LH) oder Name (Lufthansa) — filtert auf
-                Artikel die diese Airline erwähnen. Case-insensitive.
+      airline=  optional IATA-Code (LH) oder Name (Lufthansa) — BOOSTET Artikel
+                die diese Airline erwähnen nach OBEN (sie kommen zuerst),
+                allgemeine News bleiben danach erhalten. Case-insensitive.
+                Jeder Artikel erhält `relevance` (0/1/2) und `is_own_airline`.
       category= optional safety|labor|industry|technical|regulatory|general.
+                Das IST ein harter Filter.
       limit=    1..200, default 50.
 
     Antwort:
-      { ok: true, articles: [...], count, sources_ok, sources_failed,
-        cache_hit, generated_at }
+      { ok: true, articles: [...], count, own_airline_count, airline,
+        sources_ok, sources_failed, cache_hit, generated_at }
+      Jeder Artikel: + relevance:int, is_own_airline:bool, mentioned_airlines:[].
     """
     airline_raw = (request.args.get('airline') or '').strip()
     category_raw = (request.args.get('category') or '').strip().lower()
@@ -326,14 +330,35 @@ def get_news_feed():
         art['mentioned_airlines'] = mentions
         enriched.append(art)
 
-    filtered = _filter_articles(enriched, airline_raw=airline_raw, category=category_raw)
-    filtered.sort(key=lambda a: a.get('published_at') or 0, reverse=True)
+    # Nur Category ist ein echter FILTER. Airline ist KEIN Filter mehr — sie
+    # BOOSTET (airline-relevante Artikel zuerst, allgemeine News danach), damit
+    # der Feed nie leer/dünn wird und der iOS-Client eine "Deine Airline"-Sektion
+    # bauen kann (is_own_airline-Flag).
+    filtered = _filter_articles(enriched, airline_raw='', category=category_raw)
+
+    # Airline-Relevanz taggen (relevance-Score + is_own_airline-Bool).
+    needles = _normalize_airline_input(airline_raw) if airline_raw else set()
+    for art in filtered:
+        rel, own = _airline_relevance(art, needles)
+        art['relevance'] = rel
+        art['is_own_airline'] = own
+
+    # Sort: airline-relevant ZUERST (höchste relevance), innerhalb gleicher
+    # Relevanz nach Datum desc. Ohne airline-Param: relevance überall 0 →
+    # reiner Datums-Sort wie bisher.
+    filtered.sort(
+        key=lambda a: (a.get('relevance') or 0, a.get('published_at') or 0),
+        reverse=True,
+    )
 
     payload = {
         'ok': True,
         'articles': filtered[:limit],
         'count': min(len(filtered), limit),
         'total_before_limit': len(filtered),
+        # Wie viele Artikel airline-relevant sind (für "Deine Airline"-Sektion).
+        'own_airline_count': sum(1 for a in filtered if a.get('is_own_airline')),
+        'airline': airline_raw or None,
         'sources_ok': [s for s, ok in source_status.items() if ok],
         'sources_failed': [s for s, ok in source_status.items() if not ok],
         'cache_hit': False,
@@ -834,8 +859,34 @@ def _classify_category(title, summary):
     return _DEFAULT_CATEGORY
 
 
+def _airline_relevance(art, needles):
+    """Berechnet (relevance:int, is_own_airline:bool) eines Artikels für die
+    gewählte Airline. `needles` ist die Menge der Match-Tokens aus
+    `_normalize_airline_input` (leer = kein Airline-Filter → (0, False)).
+
+    Scoring (höher = relevanter, kommt zuerst):
+      2  — strukturierter Treffer in mentioned_airlines (IATA-Code passt)
+      1  — Name/Alias als Substring im title+summary (>=4 Zeichen)
+      0  — keine Airline-Relevanz (allgemeine News)
+    is_own_airline ist True bei jedem Score >= 1.
+    """
+    if not needles:
+        return 0, False
+    mentioned_lower = {m.lower() for m in (art.get('mentioned_airlines') or [])}
+    if mentioned_lower & needles:
+        return 2, True
+    blob = f'{art.get("title", "")}\n{art.get("summary", "")}'.lower()
+    for needle in needles:
+        if len(needle) >= 4 and needle in blob:
+            return 1, True
+    return 0, False
+
+
 def _filter_articles(articles, airline_raw, category):
-    """Wendet Airline- und Category-Filter an."""
+    """Wendet die echten Filter an. Category ist ein harter Filter.
+    Airline ist KEIN Filter mehr (nur noch Boost/Sort im Caller via
+    `_airline_relevance`) — `airline_raw` bleibt aus Kompatibilität in der
+    Signatur, wird aber nur noch genutzt wenn explizit gesetzt (Legacy)."""
     out = articles
 
     if category:
@@ -846,14 +897,8 @@ def _filter_articles(articles, airline_raw, category):
         # Match wenn (a) mentioned_airlines IATA-Code passt oder (b) eine
         # der needle-Strings substring im title/summary ist.
         def _matches(art):
-            mentioned_lower = {m.lower() for m in (art.get('mentioned_airlines') or [])}
-            if mentioned_lower & needles:
-                return True
-            blob = f'{art.get("title", "")}\n{art.get("summary", "")}'.lower()
-            for needle in needles:
-                if len(needle) >= 4 and needle in blob:
-                    return True
-            return False
+            rel, _own = _airline_relevance(art, needles)
+            return rel > 0
         out = [a for a in out if _matches(a)]
 
     return out
