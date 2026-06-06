@@ -16251,7 +16251,7 @@ _AIRPORT_BOARD_TTL = 120      # 2 Min — Board ändert sich nicht schneller sin
 # Volle Tages-Tafel (für Pünktlichkeit) separat + länger gecacht — viele Seiten,
 # teurer zu holen, ändert sich für die Tagesstatistik nicht im Minutentakt.
 _AIRPORT_DAY_CACHE = {}        # key -> (ts, list)
-_AIRPORT_DAY_TTL = 300         # 5 Min.
+_AIRPORT_DAY_TTL = 180         # 3 Min — für Delay-Capture-Genauigkeit reduziert (war 5 Min).
 # AeroDataBox-Pünktlichkeit (Nicht-FRA-Airports, RapidAPI, env-gated). Aggressiv
 # gecacht — Free-Tier = 600 Units/Monat, also pro (airport,airline) 15 Min TTL.
 # key (airport, airline) -> (ts, result-dict).
@@ -16930,6 +16930,126 @@ def _mdfag_board(slug, iata, flight_type='departure'):
     return out
 
 
+def _ham_board(flight_type='departure'):
+    """HAM — Hamburg Airport. HTML-Scraping ähnlich HAJ. Needs curl-verify."""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        from datetime import datetime, timezone, timedelta
+        import re as _re
+    except Exception:
+        return None
+    arr = (flight_type == 'arrival')
+    try:
+        day = _fra_local_now().strftime('%Y-%m-%d')
+    except Exception:
+        day = None
+    url = ('https://www.flughafen-hamburg.de/en/passengers/at-the-airport/departure-arrival-times/'
+           + ('arrivals/' if arr else 'departures/'))
+    try:
+        r = requests.get(url,
+                         headers={'User-Agent': _BOARD_UA, 'Accept': 'text/html,*/*',
+                                  'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'},
+                         timeout=14)
+        if r.status_code != 200 or not r.text:
+            return None
+        soup = BeautifulSoup(r.text, 'html.parser')
+    except Exception:
+        return None
+    out = []
+    for row in soup.select('tr.flight-row, tr[data-flight], .flight-item, tr.js-flight'):
+        try:
+            r2 = _empty_board_row()
+            fn_el = row.select_one('[class*="flight-number"], [class*="flightnumber"], .fn, .flight_no')
+            if fn_el:
+                code, flight, ac = _split_flightno(fn_el.get_text(' ', strip=True))
+                r2['airline'] = code or r2['airline']
+                r2['flight'] = flight
+                r2['aircraft'] = ac
+            dest_el = row.select_one('[class*="destination"], [class*="origin"], [class*="route"]')
+            if dest_el:
+                txt = dest_el.get_text(' ', strip=True)
+                m = _re.search(r'\(([A-Z]{3})\)', txt)
+                if m:
+                    r2['dest_iata'] = m.group(1)
+                    r2['dest_name'] = _clean_city_name(txt.replace(m.group(0), '').strip(), m.group(1))
+            time_el = row.select_one('[class*="time"], [class*="sched"], td.time')
+            if time_el and day:
+                times = _re.findall(r'(\d{2}:\d{2})', time_el.get_text())
+                if times:
+                    r2['sched'] = day + 'T' + times[0] + ':00'
+                    if len(times) > 1 and times[1] != times[0]:
+                        r2['esti'] = day + 'T' + times[1] + ':00'
+            st_el = row.select_one('[class*="status"]')
+            if st_el:
+                r2['status'] = st_el.get_text(' ', strip=True)
+            r2['delay_min'] = _board_delay_min(r2['sched'], r2['esti'])
+            r2['delayed'] = r2['delay_min'] >= 5
+            if r2['flight'] or r2['dest_iata']:
+                out.append(r2)
+        except Exception:
+            continue
+    return out if out else None
+
+
+def _ber_board(flight_type='departure'):
+    """BER — Berlin Brandenburg Airport JSON-API. Needs curl-verify."""
+    try:
+        import requests
+        from datetime import datetime, timezone, timedelta
+    except Exception:
+        return None
+    arr = (flight_type == 'arrival')
+    try:
+        day = _fra_local_now().strftime('%Y-%m-%d')
+    except Exception:
+        day = None
+    url = ('https://www.berlin-airport.de/en/travellers-ber/flights/'
+           + ('arrivals' if arr else 'departures') + '/index.php')
+    try:
+        r = requests.get(url,
+                         params={'date': day} if day else {},
+                         headers={'User-Agent': _BOARD_UA,
+                                  'Accept': 'application/json, text/html, */*',
+                                  'X-Requested-With': 'XMLHttpRequest'},
+                         timeout=14)
+        if r.status_code != 200:
+            return None
+        try:
+            data = r.json()
+            flights = data.get('flights') or data.get('data') or []
+        except Exception:
+            flights = []
+    except Exception:
+        return None
+    if not flights:
+        return None
+    out = []
+    for f in flights:
+        try:
+            row = _empty_board_row()
+            row['flight'] = (f.get('flightNumber') or f.get('flight_number') or '').strip().upper()
+            row['airline'] = row['flight'][:2] if len(row['flight']) >= 2 else ''
+            dest = f.get('destination') or f.get('origin') or {}
+            if isinstance(dest, dict):
+                row['dest_iata'] = (dest.get('iata') or dest.get('code') or '').upper()
+                row['dest_name'] = dest.get('city') or dest.get('name') or ''
+            sched = f.get('scheduledTime') or f.get('scheduled') or ''
+            esti = f.get('estimatedTime') or f.get('estimated') or f.get('actualTime') or ''
+            if sched and day:
+                row['sched'] = (day + 'T' + sched + ':00') if len(sched) == 5 else sched
+            if esti and day:
+                row['esti'] = (day + 'T' + esti + ':00') if len(esti) == 5 else esti
+            row['status'] = f.get('status') or f.get('statusText') or ''
+            row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
+            row['delayed'] = row['delay_min'] >= 5
+            if row['flight'] or row['dest_iata']:
+                out.append(row)
+        except Exception:
+            continue
+    return out if out else None
+
+
 # Registry: IATA → (native-Scraper-Callable, ICAO-für-OpenSky-Fallback).
 _NATIVE_BOARD_SCRAPERS = {
     'MUC': lambda ft: _muc_board(ft),
@@ -16943,6 +17063,8 @@ _NATIVE_BOARD_SCRAPERS = {
     'RLG': lambda ft: _mdfag_board('rostock-laage-airport', 'RLG', ft),
     'KSF': lambda ft: _mdfag_board('kassel-airport', 'KSF', ft),
     'SCN': lambda ft: _mdfag_board('saarbrucken-airport', 'SCN', ft),
+    'HAM': lambda ft: _ham_board(ft),
+    'BER': lambda ft: _ber_board(ft),
 }
 
 
@@ -17166,6 +17288,12 @@ def _fra_day_board_cached(flight_type='departure'):
             if sdt is None or sdt < day_start:
                 continue
         day.append(f)
+    # Proactive delay-capture: auch ohne Pünktlichkeits-Endpoint-Aufruf persistieren.
+    try:
+        today_str = _fra_local_now().strftime('%Y-%m-%d')
+        _merge_into_delay_store(day, today_str)
+    except Exception:
+        pass
     _AIRPORT_DAY_CACHE[ckey] = (_t.time(), day)
     return day
 
