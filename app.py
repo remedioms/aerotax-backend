@@ -16572,7 +16572,7 @@ def _muc_board(flight_type='departure'):
     arr = (flight_type == 'arrival')
     path = 'arrivals' if arr else 'departures'
     try:
-        day = datetime.now(timezone(timedelta(hours=2))).strftime('%Y-%m-%d')
+        day = _fra_local_now().strftime('%Y-%m-%d')
     except Exception:
         day = None
     url = 'https://www.munich-airport.com/flightsearch/' + path
@@ -17489,10 +17489,38 @@ def airport_punctuality(token):
     und die meistgeflogenen Ziele. EHRLICH: Tagestafel, keine historische OTP."""
     airline = (request.args.get('airline') or 'LH').upper().strip()
     airport = (request.args.get('airport') or 'FRA').upper().strip()
-    # Nur FRA hat die kostenlose Fraport-Tages-Tafel. Für jeden ANDEREN Airport
-    # nutzen wir AeroDataBox (RapidAPI, env-gated, aggressiv gecacht). Ohne Key
-    # degradieren wir ehrlich — KEINE FRA-Zahlen unter fremdem Label.
+    # Nur FRA hat die kostenlose Fraport-Tages-Tafel. Für Airports mit eigenem
+    # nativen Scraper (MUC, DUS, HAJ, …) nutzen wir deren Board direkt — kein
+    # AeroDataBox-Key nötig. Erst danach AeroDataBox als letzter Fallback.
     if airport and airport not in ('FRA', 'EDDF'):
+        # Schritt 1: nativer Scraper (MUC, DUS, HAJ, FMO, LEJ, DRS, ERF, …)
+        if airport in _NATIVE_BOARD_SCRAPERS:
+            rows, src = _native_board_cached(airport, 'departure') or (None, None)
+            if rows:
+                al_rows = [f for f in rows if (f.get('airline') or '').upper() == airline]
+                stats = _punctuality_stats(al_rows if al_rows else rows)
+                all_stats = _punctuality_stats(rows)
+                from collections import Counter as _Ctr
+                dest_counter = _Ctr((f.get('dest_iata') or '') for f in al_rows if f.get('dest_iata'))
+                busiest = [{'dest_iata': d, 'dest_name': _dest_name_for(al_rows, d), 'count': c}
+                           for d, c in dest_counter.most_common(5)]
+                delayed_rows = sorted(
+                    [f for f in al_rows if not _is_cancelled(f) and int(f.get('delay_min') or 0) >= 5],
+                    key=lambda f: int(f.get('delay_min') or 0), reverse=True)[:8]
+                ticker = [{'flight': f.get('flight'), 'dest_iata': f.get('dest_iata'),
+                           'dest_name': f.get('dest_name'), 'delay_min': int(f.get('delay_min') or 0),
+                           'sched': f.get('sched'), 'status': f.get('status')} for f in delayed_rows]
+                cancels = [{'flight': f.get('flight'), 'dest_iata': f.get('dest_iata'),
+                            'dest_name': f.get('dest_name'), 'sched': f.get('sched')}
+                           for f in al_rows if _is_cancelled(f)][:8]
+                out = {'ok': True, 'airport': airport, 'airline': airline,
+                       'source': src or 'native_board', 'scope': 'heute_tages_tafel',
+                       'ticker': ticker, 'cancellations': cancels, 'busiest_routes': busiest,
+                       'all_airlines': all_stats}
+                out.update(stats)
+                return jsonify(out)
+        # Schritt 2: AeroDataBox (RapidAPI, env-gated, aggressiv gecacht). Ohne Key
+        # degradieren wir ehrlich — KEINE FRA-Zahlen unter fremdem Label.
         adb = _aerodatabox_punctuality(airport, airline)
         if adb is None:
             import os as _os
