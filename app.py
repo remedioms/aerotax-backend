@@ -516,6 +516,133 @@ def bmf_lookup(iata, year):
 # Backward-Compat-Alias für alten Code
 BMF_2025 = {iata: bmf_lookup(iata, 2025) for iata in IATA_TO_BMF if bmf_lookup(iata, 2025)}
 
+
+# ── ALLOWANCE / PER-DIEM EXACT-RATE (für iOS SpesenEstimator) ──────
+# Die App hatte hartcodierte 2023-LH-Sätze. Dieser Endpoint liefert den EXAKTEN
+# BMF-Auslandstagegeld-Satz aus der offiziellen Tabelle (bmf_data.py). KEINE neuen
+# Zahlen — alles kommt aus BMF_AUSLAND_BY_YEAR via bmf_lookup. Ehrlich {found:false}
+# wenn weder IATA noch Land matchen.
+#
+# ISO-2 → deutscher BMF-Ländername. Nur die geläufigsten Crew-Ziele; unbekannte
+# Codes degradieren über den IATA-Pfad oder ehrlich auf found:false. Keys sind
+# exakte BMF-Tabellen-Keys (siehe BMF_AUSLAND_BY_YEAR).
+_ISO2_TO_BMF_LAND = {
+    'US': 'Vereinigte Staaten von Amerika (USA) – im Übrigen',
+    'GB': 'Großbritannien und Nordirland – im Übrigen',
+    'UK': 'Großbritannien und Nordirland – im Übrigen',
+    'FR': 'Frankreich – im Übrigen',
+    'ES': 'Spanien – im Übrigen',
+    'IT': 'Italien – im Übrigen',
+    'PT': 'Portugal', 'NL': 'Niederlande', 'BE': 'Belgien', 'PL': 'Polen – im Übrigen',
+    'CH': 'Schweiz – im Übrigen', 'AT': 'Österreich', 'GR': 'Griechenland – im Übrigen',
+    'TR': 'Türkei – im Übrigen', 'AE': 'Vereinigte Arabische Emirate',
+    'CN': 'China – im Übrigen', 'JP': 'Japan – im Übrigen',
+    'IN': 'Indien – im Übrigen', 'TH': 'Thailand', 'SG': 'Singapur',
+    'CA': 'Kanada – im Übrigen', 'MX': 'Mexiko', 'BR': 'Brasilien – im Übrigen',
+    'ZA': 'Südafrika – im Übrigen', 'EG': 'Ägypten', 'IL': 'Israel',
+    'AU': 'Australien – im Übrigen', 'DK': 'Dänemark', 'SE': 'Schweden',
+    'NO': 'Norwegen', 'FI': 'Finnland', 'IE': 'Irland',
+    'RU': 'Russische Föderation – im Übrigen', 'KR': 'Korea, Republik',
+    'HK': 'China – Hongkong', 'QA': 'Katar', 'KE': 'Kenia', 'MA': 'Marokko',
+}
+
+
+def _resolve_bmf_land_rate(year, land_key):
+    """(24h, an_abreise)-Tuple für einen deutschen BMF-Ländernamen + Jahr.
+    Fallback-Kette identisch zu bmf_lookup: Stadt-Key → '– im Übrigen' → Parent.
+    None wenn nichts matcht."""
+    bmf = BMF_AUSLAND_BY_YEAR.get(year) or BMF_AUSLAND_BY_YEAR.get(2025)
+    if not bmf or not land_key:
+        return None
+    if land_key in bmf:
+        return bmf[land_key]
+    if ' – ' in land_key:
+        parent = land_key.split(' – ')[0]
+        alt = f"{parent} – im Übrigen"
+        if alt in bmf:
+            return bmf[alt]
+        if parent in bmf:
+            return bmf[parent]
+    return None
+
+
+@app.route('/api/allowance/<token>', methods=['GET'])
+def allowance_exact_rate(token):
+    """Exakter BMF-Auslandstagegeld-Satz für die iOS-Spesen-Schätzung.
+    Query: ?country=XX (ISO-2 oder exakter BMF-Ländername) & iata=YYY & date=YYYY-MM-DD.
+
+    Auflösung (erste Quelle die trifft gewinnt):
+      1) iata → IATA_TO_BMF → bmf_lookup (volle Stadt/Land-Fallback-Kette).
+      2) country: exakter BMF-Ländername ODER ISO-2 via _ISO2_TO_BMF_LAND.
+    Jahr aus date (sonst 2025-Default, geclampt auf vorhandene BMF-Jahre).
+
+    Antwort bei Treffer:
+      {found:true, country, daily_rate_eur, partial_rate_eur, source:'BMF <year>',
+       currency:'EUR', iata?, matched_by:'iata'|'country'}
+    Ehrlich {found:false, ...} wenn kein BMF-Eintrag matcht — KEINE erfundenen
+    Zahlen, kein stiller Default-Satz."""
+    iata = (request.args.get('iata') or '').upper().strip()
+    country = (request.args.get('country') or '').strip()
+    date_str = (request.args.get('date') or '').strip()
+    # Jahr aus date herleiten, auf vorhandene BMF-Jahre clampen.
+    year = 2025
+    if len(date_str) >= 4 and date_str[:4].isdigit():
+        try:
+            y = int(date_str[:4])
+            if y in BMF_AUSLAND_BY_YEAR:
+                year = y
+            elif y < min(BMF_AUSLAND_BY_YEAR):
+                year = min(BMF_AUSLAND_BY_YEAR)
+            elif y > max(BMF_AUSLAND_BY_YEAR):
+                year = max(BMF_AUSLAND_BY_YEAR)
+        except Exception:
+            pass
+
+    rate = None
+    matched_by = None
+    resolved_land = None
+
+    # 1) IATA-Pfad (präziseste Quelle — Stadt-genaue BMF-Sätze).
+    if iata and len(iata) == 3:
+        r = bmf_lookup(iata, year)
+        if r:
+            rate = r
+            matched_by = 'iata'
+            resolved_land = IATA_TO_BMF.get(iata)
+
+    # 2) Country-Pfad (ISO-2 ODER exakter deutscher BMF-Ländername).
+    if rate is None and country:
+        land_key = _ISO2_TO_BMF_LAND.get(country.upper(), country)
+        r = _resolve_bmf_land_rate(year, land_key)
+        if r:
+            rate = r
+            matched_by = 'country'
+            resolved_land = land_key
+
+    if not rate:
+        return jsonify({
+            'found': False,
+            'country': country or None,
+            'iata': iata or None,
+            'source': f'BMF {year}',
+            'currency': 'EUR',
+        })
+
+    # rate ist (24h_satz, an_abreise_satz) als Tuple.
+    daily = rate[0] if isinstance(rate, (list, tuple)) and rate else rate
+    partial = rate[1] if isinstance(rate, (list, tuple)) and len(rate) > 1 else None
+    return jsonify({
+        'found': True,
+        'country': resolved_land or country or None,
+        'iata': iata or None,
+        'daily_rate_eur': daily,
+        'partial_rate_eur': partial,
+        'source': f'BMF {year}',
+        'currency': 'EUR',
+        'matched_by': matched_by,
+    })
+
+
 # ══════════════════════════════════════════════════════════════════
 #  STRIPE ROUTEN
 # ══════════════════════════════════════════════════════════════════
@@ -11904,6 +12031,9 @@ def _anon_handle_for(token):
 _WALL_POST_KNOWN_COLS = {
     'id', 'author_token', 'ts', 'layover_iata', 'image_url',
     'hashtags', 'like_count', 'comment_count', 'deleted',
+    # Privacy: explizite Spalten statt metadata-jsonb (02_supabase_rebuild.sql).
+    # Load-bearing für "anonym posten" — anon_handle pseudonymisiert den Author.
+    'is_anonymous', 'anon_handle',
 }
 
 
@@ -12068,6 +12198,8 @@ def _wall_likes_load(token):
 # Eine Row pro Comment. body ↔ text (analog wall_posts).
 _WALL_COMMENT_KNOWN_COLS = {
     'id', 'post_id', 'author_token', 'ts', 'parent_id', 'image_url',
+    # Privacy: explizite Spalten statt metadata-jsonb (02_supabase_rebuild.sql).
+    'is_anonymous', 'anon_handle',
 }
 
 
@@ -17431,15 +17563,94 @@ def _flight_sched_passed(f, now_local):
 # Wird bei jedem Board-Rebuild gemergt (nur max, nie zurückgesetzt bis 05:00 Rollover).
 _delay_store: dict = {}
 _delay_store_date: str = ''  # YYYY-MM-DD des aktuellen Betriebstages
+# Cancelled-Flüge separat (key (date_str, fn, hhmm) → True), damit der SB-Write-
+# Through pro Flug genau eine Row (max_delay_min + cancelled-Flag) schreiben kann.
+_delay_store_cancelled: dict = {}
+# Marker: für welchen Betriebstag wurde bereits aus airport_delay_obs (SB) geladen.
+# Verhindert, dass jeder Punctuality-Call die SB-Tabelle erneut voll liest.
+_delay_store_sb_loaded_date: str = ''
 
 
-def _merge_into_delay_store(flights, date_str):
+def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport, status):
+    """Best-effort Write-Through einer Delay-Beobachtung nach airport_delay_obs.
+    Mirror des wall-posts/disk-Patterns: SB-down/Tabelle-fehlt → still degrade,
+    der In-Memory-Store bleibt die Wahrheit. Nur max-Wert (upsert überschreibt,
+    aber wir schreiben hier bereits das laufende Maximum aus dem Store)."""
+    if not SB_AVAILABLE or sb is None:
+        return
+    try:
+        sb.table('airport_delay_obs').upsert({
+            'date': date_str,
+            'airport': airport or 'FRA',
+            'flight': fn,
+            'sched': hhmm,
+            'max_delay_min': int(max_delay or 0),
+            'cancelled': bool(cancelled),
+            'status': (status or None),
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }, on_conflict='date,flight,sched').execute()
+    except Exception as e:
+        # Tabelle fehlt / SB down → ehrlich nur in-memory weiter, kein Crash.
+        app.logger.info(
+            f'[delay-obs] sb_write_skip {type(e).__name__}: {str(e)[:100]}')
+
+
+def _delay_store_load_from_sb(date_str):
+    """Lädt die heutigen Delay-Beobachtungen aus airport_delay_obs zurück in den
+    In-Memory-Store (einmal pro Betriebstag). Damit überlebt die Tages-Stichprobe
+    einen Cloud-Run-Restart und wächst cross-instance. Degradiert still wenn SB
+    down ist oder die Tabelle fehlt — dann bleibt nur die in-memory-Sicht."""
+    global _delay_store_sb_loaded_date
+    if not SB_AVAILABLE or sb is None:
+        return
+    if _delay_store_sb_loaded_date == date_str:
+        return  # heute schon geladen
+    try:
+        offset = 0
+        page = 1000
+        while True:
+            r = (sb.table('airport_delay_obs').select('*')
+                 .eq('date', date_str)
+                 .range(offset, offset + page - 1).execute())
+            rows = r.data or []
+            for row in rows:
+                fn = row.get('flight') or ''
+                hhmm = row.get('sched') or ''
+                if not fn or not hhmm:
+                    continue
+                key = (date_str, fn, hhmm)
+                md = int(row.get('max_delay_min') or 0)
+                if md > 0:
+                    _delay_store[key] = max(_delay_store.get(key, 0), md)
+                if row.get('cancelled'):
+                    _delay_store[(date_str, fn, hhmm + '_cancelled')] = 1
+            if len(rows) < page:
+                break
+            offset += page
+        _delay_store_sb_loaded_date = date_str
+    except Exception as e:
+        app.logger.info(
+            f'[delay-obs] sb_load_skip {type(e).__name__}: {str(e)[:100]}')
+
+
+def _merge_into_delay_store(flights, date_str, airport='FRA'):
     """Mergt beobachtete Delays aus flights in den globalen _delay_store.
-    Nur max-Wert pro Flug — nie zurücksetzen, nie aus dem Store löschen."""
-    global _delay_store, _delay_store_date
+    Nur max-Wert pro Flug — nie zurücksetzen, nie aus dem Store löschen.
+    Schreibt jede geänderte Beobachtung best-effort nach airport_delay_obs (SB)
+    durch, sodass die Tages-Stichprobe cross-instance/cross-restart akkumuliert.
+    SB-down/Tabelle-fehlt → still degrade auf rein-in-memory."""
+    global _delay_store, _delay_store_date, _delay_store_cancelled
+    global _delay_store_sb_loaded_date
     if _delay_store_date != date_str:
         _delay_store.clear()
+        _delay_store_cancelled.clear()
         _delay_store_date = date_str
+        # Tagesrollover → SB-Load-Marker zurücksetzen, damit der neue Tag seine
+        # (ggf. von anderen Instanzen bereits geschriebenen) Beobachtungen lädt.
+        _delay_store_sb_loaded_date = ''
+    # Beim ersten Merge eines neuen Tages: vorhandene SB-Beobachtungen
+    # zurückladen (cross-instance Akkumulation), bevor wir die neuen mergen.
+    _delay_store_load_from_sb(date_str)
     for f in (flights or []):
         fn = f.get('flight') or f.get('flightNumber') or ''
         sched = f.get('sched') or ''
@@ -17450,10 +17661,25 @@ def _merge_into_delay_store(flights, date_str):
         hhmm = sched[11:16] if len(sched) >= 16 else sched
         key = (date_str, fn, hhmm)
         delay = f.get('delay_min') or 0
+        cancelled = bool(f.get('cancelled'))
+        changed = False
         if delay and delay > 0:
-            _delay_store[key] = max(_delay_store.get(key, 0), delay)
-        if f.get('cancelled'):
+            prev = _delay_store.get(key, 0)
+            if delay > prev:
+                _delay_store[key] = delay
+                changed = True
+        if cancelled:
             _delay_store[(date_str, fn, hhmm + '_cancelled')] = 1
+            if not _delay_store_cancelled.get(key):
+                _delay_store_cancelled[key] = True
+                changed = True
+        # Write-Through nur bei tatsächlicher Änderung (max gewachsen oder neu
+        # cancelled) → wir hämmern die SB-Tabelle nicht pro Board-Rebuild voll.
+        if changed:
+            _delay_obs_write_through(
+                date_str, fn, hhmm, _delay_store.get(key, 0),
+                cancelled or bool(_delay_store_cancelled.get(key)),
+                airport, f.get('status'))
 
 
 def _punctuality_stats(flights):
@@ -17465,10 +17691,19 @@ def _punctuality_stats(flights):
     Dadurch springt die Zahl beim Neu-Laden (09:00 vs 09:05) nicht mehr, sie wächst
     nur, wenn weitere Flüge tatsächlich abfliegen. Das Tages-Fenster selbst ist in
     `_fra_day_board_cached` ab 05:00 Ortszeit fixiert."""
-    # Tages-Datum ermitteln und Delay-Store mergen.
+    # Tages-Datum ermitteln und Delay-Store mergen. Load-on-Read: vorhandene
+    # SB-Beobachtungen (airport_delay_obs) für heute zurückholen, damit die
+    # Tages-Stichprobe einen Restart/Instanz-Wechsel überlebt — auch wenn die
+    # aktuelle Flugliste leer ist (Quelle down). Beides degradiert still auf
+    # rein-in-memory, wenn SB nicht erreichbar ist.
     try:
         today = _fra_local_now().strftime('%Y-%m-%d')
+        # merge handhabt Rollover (clear) UND lädt vorhandene SB-Beobachtungen
+        # zurück bevor es die neue Flugliste mergt.
         _merge_into_delay_store(flights, today)
+        # Defensiv: falls flights leer war (Quelle down) und der Store für heute
+        # noch nie initialisiert wurde, trotzdem aus SB nachladen.
+        _delay_store_load_from_sb(today)
     except Exception:
         today = ''
     now_local = _fra_local_now()
