@@ -10969,6 +10969,40 @@ def _manual_briefings_save(token, briefings_dict):
                 app.logger.error('[manual-briefings] CRITICAL: weder SB noch Disk gesichert!')
 
 
+_BRIEFING_TIME_RE = re.compile(r'(\d{1,2}:\d{2})\s*(?:LT|UTC|Z|L)?\s*Briefing',
+                               re.IGNORECASE)
+
+
+def _corrected_briefing_start_iso(date_str, summary, current_start_iso):
+    """Root-Cause-Fix „Dienstbeginn 08:30": Der DTSTART aus der Roster-Pipeline ist
+    bei LH/CRA oft ein bedeutungsloser Default (06:30 UTC → 08:30 LT) und NICHT die
+    echte Report-/Briefing-Zeit. Wenn das Summary eine explizite Report-Zeit nennt
+    (z.B. „12:15 LT Briefing FRA · …"), ist DIE die maßgebliche Dienstbeginn-Zeit —
+    wir übernehmen sie 1:1 (Europe/Berlin → UTC) in `ical_start_iso`.
+
+    Rein additiv: ohne explizite Briefing-Zeit im Summary bleibt `current_start_iso`
+    unverändert (kein Raten). Idempotent. Liefert immer einen iso-String oder den
+    Originalwert.
+    """
+    s = (summary or '')
+    if not s or not re.match(r'^\d{4}-\d{2}-\d{2}$', (date_str or '')):
+        return current_start_iso
+    m = _BRIEFING_TIME_RE.search(s)
+    if not m:
+        return current_start_iso
+    try:
+        hh, mm = m.group(1).split(':')
+        hh, mm = int(hh), int(mm)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return current_start_iso
+        from zoneinfo import ZoneInfo as _ZI
+        Y, M, D = (int(x) for x in date_str.split('-'))
+        local = datetime(Y, M, D, hh, mm, tzinfo=_ZI('Europe/Berlin'))
+        return local.astimezone(_ZI('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
+    except Exception:
+        return current_start_iso
+
+
 @app.route('/api/user/briefing/<token>', methods=['GET'])
 def get_briefings(token):
     """Alle Briefing-Items (key: Datum) für User.
@@ -11002,6 +11036,10 @@ def get_briefings(token):
                 if fk in ('ical_summary', 'ical_location', 'ical_imported_at',
                           'ical_start_iso', 'ical_end_iso'): continue
                 merged.setdefault(fk, fv)
+            # Root-Cause-Fix „Dienstbeginn 08:30": echte Briefing-Zeit aus dem
+            # Summary schlägt den bedeutungslosen DTSTART-Default (06:30 UTC).
+            merged['ical_start_iso'] = _corrected_briefing_start_iso(
+                k, merged.get('ical_summary'), merged.get('ical_start_iso'))
             data[k] = merged
     except Exception:
         # Defensiv: iCal-Read-Fehler darf User-PUT-Daten nicht blocken
