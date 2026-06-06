@@ -17404,6 +17404,11 @@ def airport_board(token):
 # Fraport-Status-Strings, die "annulliert/gestrichen" bedeuten.
 _FRA_CANCEL_MARKERS = ('annull', 'cancel', 'gestrich')
 
+# Mindest-Stichprobe (abgeflogene Flüge), ab der eine Pünktlichkeits-Quote als
+# aussagekräftig gilt. Darunter → data_incomplete (UI: "Daten unvollständig"),
+# statt eine irreführende 100%-über-7-Flüge-Zahl zu behaupten.
+_PUNCTUALITY_MIN_SAMPLE = 15
+
 def _is_cancelled(f):
     return any(m in (f.get('status') or '').lower() for m in _FRA_CANCEL_MARKERS)
 
@@ -17501,8 +17506,17 @@ def _punctuality_stats(flights):
                 on_time += 1
     active = max(0, total - cancelled)
     pct = round(100.0 * on_time / active, 0) if active > 0 else None
+    # EHRLICHKEIT (User-Pain "7 Flüge, 0 verspätet → 100%"): bei zu kleiner
+    # Stichprobe ist eine Pünktlichkeits-Quote nicht aussagekräftig. Statt eine
+    # irreführende 100%-Zahl zu zeigen, flaggen wir data_incomplete → UI zeigt
+    # "Daten unvollständig". Die volle Tages-Stichprobe wächst über Supabase-
+    # Snapshots (airport_delay_obs) — bis genug Flüge abgeflogen sind bleibt's
+    # ehrlich als unvollständig markiert.
+    incomplete = active < _PUNCTUALITY_MIN_SAMPLE
     return {'total': total, 'on_time': on_time, 'delayed': delayed,
-            'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay}
+            'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay,
+            'sample_size': active, 'data_incomplete': incomplete,
+            'min_sample': _PUNCTUALITY_MIN_SAMPLE}
 
 
 def _aerodatabox_punctuality(iata, airline):
@@ -17750,7 +17764,12 @@ def airport_punctuality(token):
            'source': 'fraport', 'scope': 'heute_FRA_tages_tafel',
            'ticker': ticker, 'cancellations': cancels, 'busiest_routes': busiest,
            'all_airlines': all_stats}
-    out.update(stats)   # total/on_time/delayed/cancelled/on_time_pct/avg_delay_min
+    out.update(stats)   # total/on_time/delayed/cancelled/on_time_pct/avg_delay_min/sample_size/data_incomplete
+    if stats.get('data_incomplete'):
+        out['note'] = ('Erst ' + str(stats.get('sample_size') or 0) + ' '
+                       + airline + '-Abflüge heute abgeschlossen — zu wenig für eine '
+                       'belastbare Pünktlichkeits-Quote. Die Statistik wächst im '
+                       'Tagesverlauf.')
     return jsonify(out)
 
 
