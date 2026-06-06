@@ -19,8 +19,8 @@ feedparser>=6.0
 # W-Article: readability-lxml für robuste Main-Content-Extraktion aus
 # News-Article-HTML (aero.de, Reuters, AvHerald, SimpleFlying,
 # TheAirCurrent, Flightradar24). Liefert deutlich konsistentere
-# fulltext-Erkennung als reine Regex-Heuristik; bs4-Heuristik und
-# Legacy-Regex bleiben als Fallback wenn das Lib nicht installiert ist.
+# fulltext-Erkennung als reine Regex-Heuristik; bs4-Heuristik bleibt
+# als Fallback wenn das Lib nicht installiert ist.
 readability-lxml>=0.8.1
 lxml>=5.0
 # httpx[http2] benötigt für APNs HTTP/2 (P5/W17). h2-Extra bringt das HTTP/2-Modul.

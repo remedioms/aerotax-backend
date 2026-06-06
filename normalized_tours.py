@@ -482,6 +482,19 @@ def _se_block_vma_if_no_se_line(se_blocks_all_vma, day_bucket, day_eur, day_audi
     return day_bucket, day_eur
 
 
+def _block_vma_if_home_standby(is_home_standby, day_bucket, day_eur, day_audit):
+    """Home-Standby (Verfügbarkeit zuhause, inkl. homebound Airport-Standby) hat
+    NIE VMA — auch wenn ein Reader-Lücken-Bracket ihn als Tour-(Heimkehr-)Tag
+    absorbiert hat. In Prod meist schon SE-gegated; dies schließt den SE-losen
+    Pfad. Ausgelagert (Branch-Count <50). Returnt (day_bucket, day_eur)."""
+    if is_home_standby and day_bucket in ('Z72', 'Z73', 'Z74', 'Z76'):
+        if day_audit is not None:
+            day_audit['reason'] = (day_audit.get('reason') or '') + \
+                f' | Home-Standby → keine VMA (war {day_bucket})'
+        return 'none', 0.0
+    return day_bucket, day_eur
+
+
 def _build_se_day_index(se_rows, homebase):
     """Pro Datum: SE-stfrei-Signal aus der Streckeneinsatz-Abrechnung.
 
@@ -685,13 +698,28 @@ def resolve_bmf_country_for_tour_day(
             source_used = source
             reason = f'{label} → {u} ({selected_country})'
             return True
-        # IATA → Country-Mapping versuchen
+        # IATA → Country-Mapping versuchen. FIX (2026-06-03): auch Metropol-/
+        # Stadt-Codes (CHI/STO/ROM/PAR…) auflösen — der primäre Resolver kannte
+        # bisher nur IATA_TO_BMF, sodass ein Metro-Code im CAS-Routing fälschlich
+        # als Inland (Z73 Deutschland) statt Ausland (Z76) klassifiziert wurde.
+        # Reihenfolge: IATA_TO_BMF (exakt) → bmf_data.IATA_METRO_TO_BMF (kanonisch)
+        # → lokales _SE_CITY_TO_BMF (legacy). Den Satz holt der Country-basierte
+        # Rate-Lookup downstream von einem gleichland-Airport in bmf_table.
         country = iata_to_bmf.get(u)
+        via = 'IATA_TO_BMF'
+        if not country:
+            try:
+                from bmf_data import IATA_METRO_TO_BMF as _METRO
+            except Exception:
+                _METRO = {}
+            country = _METRO.get(u) or _SE_CITY_TO_BMF.get(u)
+            if country:
+                via = 'METRO/SE_CITY'
         if country:
             selected_iata = u
             selected_country = country
             source_used = source
-            reason = f'{label} → {u} → {country} (via IATA_TO_BMF)'
+            reason = f'{label} → {u} → {country} (via {via})'
             return True
         rejected.append({**cand, 'reason': 'iata_unknown_in_bmf_or_iata_to_bmf'})
         return False
@@ -821,19 +849,49 @@ def _detect_passive_marker(marker: str) -> bool:
     return m_up in PASSIVE
 
 
+def _is_hard_off_day(marker: str, activity: str) -> bool:
+    """Echter Urlaub/Krank — NIEMALS Teil einer Tour, auch nicht mitten in einer
+    offenen Tour-Klammer.
+
+    Fachlich gibt es keinen Urlaub mitten in einer Tour: taucht ein U/URLAUB/
+    K/KRANK auf, während die Tour-Klammer noch offen ist, war die Tour in
+    Wahrheit am Vortag zu Ende (die Grenzerkennung hat sie nicht geschlossen).
+    Ein solcher Tag ist daher ein HARTER Tour-Terminator und wird selbst nie
+    in die Tour aufgenommen.
+
+    Abgrenzung zu Reader-Rausch: ein bloßes activity='frei' auf einem Mid-Tour-
+    Layover/Heimkehrtag (Marker 'X'/'===' mit Reise-Evidenz) ist KEIN hard-off
+    und bleibt — wie bisher — legitimer Tour-Tag (Rückreise/An-Abreise).
+    """
+    m = (marker or '').upper().strip()
+    a = (activity or '').lower().strip()
+    if a in ('urlaub', 'krank'):
+        return True
+    # Explizite LH-CAS-Abwesenheitsmarker: U/U1/U2.. = Urlaub, K/KRANK = Krank.
+    if m in {'U', 'U1', 'U2', 'U3', 'UU', 'URLAUB', 'K', 'KK', 'KRANK', 'SICK'}:
+        return True
+    return False
+
+
 def _detect_standby_marker(marker: str) -> Tuple[bool, str]:
     """Liefert (is_standby, kind) wobei kind in {'home', 'airport', ''}.
 
     Home-Standby-Marker: SB_S, SB_F, SB_M, RB (default home).
-    Airport-Standby-Marker: SBY, SBA (mit Airport-Kontext).
+    Airport-Standby-Marker: SBY, SBA, STBY, STANDBY (mit Airport-Kontext).
     RES: ambiguous — wird im Kontext entschieden.
+
+    STBY/STANDBY (FIX 2026-06-03): andere Airline-Dialekte (Eurowings/Condor)
+    nutzen diese Schreibweise. Als 'airport' geführt, weil die airport_sb_is_
+    homebound-Demotion (Pass 1) sie ohne Auslands-Evidenz korrekt wie Home-
+    Standby behandelt (kein arbeitstag/reinigung/Tour) und nur bei echter
+    Auslands-Aktivierung als Auswärtstätigkeit zählt.
     """
     if not marker:
         return (False, '')
     m_up = marker.upper().strip()
     if m_up in {'SB_S', 'SB_F', 'SB_M', 'RB', 'RES_SB'}:
         return (True, 'home')
-    if m_up in {'SBA', 'SBY'}:
+    if m_up in {'SBA', 'SBY', 'STBY', 'STANDBY'}:
         return (True, 'airport')
     if m_up == 'RES':
         # RES kann beides sein — context entscheidet
@@ -899,8 +957,31 @@ def build_normalized_tours(
             cas_days, homebase=homebase_up, se_rows=se_rows,
         )
     except Exception:
-        # Falls Postprocessor crasht → fall through auf raw days (defensiv)
-        sorted_days = sorted(cas_days, key=lambda d: d.get('datum', ''))
+        # Falls Postprocessor crasht → fall through auf raw days (defensiv).
+        # FIX (2026-06-03): nur dict-Elemente — ein Nicht-dict (str/None/int) im
+        # cas_days-List ließ d.get(...) mit AttributeError crashen statt sanft zu
+        # degradieren.
+        sorted_days = sorted(
+            [d for d in (cas_days or []) if isinstance(d, dict)],
+            key=lambda d: d.get('datum', '') or '')
+
+    # FIX (2026-06-04): Dedup nach Kalendertag. VMA/Hotel sind streng pro
+    # Kalendertag (§9 Abs.4a) — zwei CAS-Zeilen mit demselben datum dürfen nicht
+    # doppelt zählen. Ohne Dedup zählte die Per-TourDay-Summation (z76_eur/tage,
+    # hotel_naechte) den Dublettentag doppelt, während by_date (dict-keyed)
+    # dedupte → summary ≠ by_date. Erste Vorkommen behalten; Zeilen ohne datum
+    # bleiben (werden später per day_date=None verworfen). Auf Echtdaten ein
+    # No-op (Tibor hat 0 Dublettentage).
+    _seen_dates = set()
+    _deduped = []
+    for _d in sorted_days:
+        _ds = (_d.get('datum') or '') if isinstance(_d, dict) else ''
+        if _ds and _ds in _seen_dates:
+            continue
+        if _ds:
+            _seen_dates.add(_ds)
+        _deduped.append(_d)
+    sorted_days = _deduped
 
     tours: List[NormalizedTour] = []
     current_tour_days: List[TourDay] = []
@@ -937,7 +1018,22 @@ def build_normalized_tours(
                 td.is_return_day = True
             else:
                 if idx == 0:
-                    td.is_departure_day = True
+                    # FIX (2026-06-03): Jahresgrenzen-Continuation. Ein erster
+                    # Tour-Tag, der explizit als is_tour_continuation gehintet ist,
+                    # NICHT am Homebase startet und eine Übernachtung danach hat,
+                    # ist ein echter Voll-24h-Zwischentag (die reale Abreise von
+                    # zuhause liegt im Vorjahr) — kein An-/Abreisetag. Sonst zahlt
+                    # der is_departure_day-Zweig fälschlich den niedrigeren
+                    # An-/Abreise-Satz (Unterzahlung, §9 Abs. 4a EStG).
+                    _yb_continuation = (
+                        bool(td.cas_raw.get('is_tour_continuation'))
+                        and not bool(td.cas_raw.get('starts_at_homebase'))
+                        and bool(td.cas_raw.get('overnight_after_day'))
+                    )
+                    if _yb_continuation:
+                        td.is_full_away_day = True
+                    else:
+                        td.is_departure_day = True
                 if idx == n_days - 1:
                     td.is_return_day = True
                 if 0 < idx < n_days - 1:
@@ -1011,14 +1107,40 @@ def build_normalized_tours(
                 target = r_up
                 break
 
+        # (hochgezogen vor den Konstruktor für FIX-B: homebound-Airport-Standby)
+        has_foreign_routing_token = any(
+            isinstance(r, str) and len(r.upper().strip()) == 3
+            and r.upper().strip().isalpha()
+            and not _is_inland_code(r.upper().strip())
+            and r.upper().strip() != homebase_up
+            for r in (routing if isinstance(routing, list) else [])
+        )
+        # FIX (2026-06-03): Airport-Standby OHNE Auslands-Evidenz ist faktisch
+        # Verfügbarkeit am Homebase (RES/SBY/SBA am FRA) — kein Auswärtseinsatz.
+        # is_airport_standby war ein toter Flag (nirgends gelesen), wodurch so ein
+        # Tag bei offener Tour alle Home-Standby-Guards umging und als VMA/Hotel/
+        # Arbeitstag durchrutschte (Miguel: Nächte/Arbeitstage zu hoch). Wir
+        # behandeln ihn wie Home-Standby; Auslands-Outstation-Standby (foreign
+        # layover/target/routing) bleibt echter Tour-Tag.
+        _foreign_layover = bool(layover_ort and layover_ort != homebase_up
+                                and not _is_inland_code(layover_ort))
+        airport_sb_is_homebound = (
+            is_standby and sb_kind == 'airport'
+            and not has_foreign_routing_token
+            and not target
+            and not _foreign_layover
+        )
+
         # TourDay erstellen
         td = TourDay(
             date=day_date,
             cas_marker=marker or None,
             cas_raw=dict(cas_day),
             duty_type='unknown',
-            is_home_standby=(is_standby and sb_kind == 'home'),
-            is_airport_standby=(is_standby and sb_kind == 'airport'),
+            is_home_standby=((is_standby and sb_kind == 'home')
+                             or airport_sb_is_homebound),
+            is_airport_standby=(is_standby and sb_kind == 'airport'
+                                and not airport_sb_is_homebound),
             is_training=is_training,
             is_free=is_free,
             routing_evidence=list(routing) if isinstance(routing, list) else [],
@@ -1034,15 +1156,7 @@ def build_normalized_tours(
 
         # Tour-Klammer-Logik
         is_tour_continuation = bool(current_tour_days)
-        # v15 B7: Tour-Continuation auch wenn marker='X' + foreign routing
-        # (typischer Tibor-CAS-Reader-Output für Mid-Tour-Tage ohne overnight-Flag)
-        has_foreign_routing_token = any(
-            isinstance(r, str) and len(r.upper().strip()) == 3
-            and r.upper().strip().isalpha()
-            and not _is_inland_code(r.upper().strip())
-            and r.upper().strip() != homebase_up
-            for r in (routing if isinstance(routing, list) else [])
-        )
+        # has_foreign_routing_token ist oben (vor dem Konstruktor) berechnet.
         # v15 Reader-V2: Postprocessor-Hints respektieren
         is_postproc_tour_return = bool(cas_day.get('is_tour_return'))
         is_postproc_continuation = bool(cas_day.get('is_tour_continuation'))
@@ -1059,8 +1173,25 @@ def build_normalized_tours(
 
         # v15 B18 (final): Home-Standby NIE Tour-Trigger, auch wenn duty>=240.
         # SB_S/SB_F/SB_M/RB/RES_SB mit Standby-Bereitschaft ist KEIN Auswärts-
-        # tätigkeit, sondern reine Verfügbarkeitspflicht zuhause.
-        if (is_standby and sb_kind == 'home') and not is_tour_continuation:
+        # tätigkeit, sondern reine Verfügbarkeitspflicht zuhause. td.is_home_standby
+        # umfasst seit FIX-B auch homebound Airport-Standby (RES/SBY am FRA).
+        # (Kein struktureller Flush bei offener Tour: das fragmentiert echte
+        # Auslandstouren und verliert legitime Tour-Tage — Arbeitstage 133→125 auf
+        # Tibor. Stattdessen verhindert der is_real_duty_day-Gate + die
+        # is_home_standby-Hotelguards, dass ein absorbierter Standby-Tag zählt.)
+        if td.is_home_standby and not is_tour_continuation:
+            continue
+
+        # FIX (2026-06-03): Echter Urlaub/Krank ist NIE Teil einer Tour — es gibt
+        # keinen Urlaub mitten in der Tour. Taucht ein U/URLAUB/K/KRANK bei offener
+        # Tour-Klammer auf, war die Tour am Vortag zu Ende. Vorher zog
+        # is_tour_continuation den U-Tag in die Tour (append unten) und der
+        # is_free-Branch flushte die Tour MIT dem Urlaubstag als Heimkehrtag →
+        # er bekam fälschlich Z76. Jetzt: offene Tour am VORTAG schließen, den
+        # Urlaubstag selbst NIE anhängen.
+        if _is_hard_off_day(marker, activity):
+            if is_tour_continuation:
+                _flush_tour()
             continue
 
         if is_free and not is_tour_continuation:
@@ -1198,6 +1329,20 @@ def calculate_allowances_from_normalized_tours(
             for td in tour.days
         )
         tour_has_overnight = any(td.has_real_fl_layover for td in tour.days)
+        # FIX (2026-06-04): Inland-Übernachtungstour (deutsche mehrtägige
+        # Auswärtstätigkeit mit Hotel, z.B. Training in Bremen). has_real_fl_layover
+        # ist nur foreign → ohne dieses Signal galt eine Inland-Übernachtungstour
+        # als „nicht real" → kein Fahrtag, keine Hotelnacht. Inland-Layover =
+        # overnight + Inland-IATA ≠ Homebase, kein Home-Standby.
+        _hb_for_inland = (homebase or 'FRA').upper().strip()
+        tour_has_inland_overnight = any(
+            bool(td.cas_raw.get('overnight_after_day'))
+            and td.layover_iata
+            and _is_inland_code(td.layover_iata)
+            and td.layover_iata.upper() != _hb_for_inland
+            and not td.is_home_standby
+            for td in tour.days
+        )
         # R19 (2026-05-26): Same-Day-Inland-Trip mit duty>=480 ist auch ein
         # legitimer Tour-Start (Z72-Same-Day). Vorher: wurde nicht als Fahrtag
         # gezählt → fahrtage zu niedrig.
@@ -1229,8 +1374,15 @@ def calculate_allowances_from_normalized_tours(
         # R21 (2026-05-26): V2-Reader liefert is_tour_departure direkt. Wenn
         # Sonnet einen Tag als Tour-Departure markiert hat, ist das ein
         # legitimer Tour-Start auch ohne andere Heuristiken.
+        # FIX (2026-06-03): Office/Training/Frei-Tag, den der V2-Reader fälschlich
+        # mit is_tour_departure stempelt, ist KEIN Tour-Start → kein Fahrtag
+        # (Miguel: 61 vs 53). Echte Touren zählen weiter über foreign_signal/
+        # overnight; legitime Inland-Eintages-Fahrten über tour_has_inland_flight_
+        # same_day (echter Flug-Token). NUR der nackte LLM-Hint auf Office/Frei
+        # wird entwertet. (tibor_diff-neutral: Fahrtage bleiben 56.)
         tour_has_v2_departure_hint = any(
             bool(td.cas_raw.get('is_tour_departure'))
+            and not td.is_training and not td.is_free
             for td in tour.days
         )
         # R22 (2026-05-26): Inland-Same-Day-Tour mit echtem Flug-Token zählt
@@ -1245,7 +1397,12 @@ def calculate_allowances_from_normalized_tours(
                 if t.startswith('LH'):
                     return True
                 digits = ''.join(c for c in t if c.isdigit())
-                if len(digits) >= 3 and not t.startswith(hb_up):
+                # FIX (2026-06-03): war `hb_up` — in dieser Funktion erst ab der
+                # späteren Schleife (Z. ~1390) gebunden → NameError bei numerischen
+                # Routing-Tokens (z.B. '456'). In Prod unerreichbar (Reader liefert
+                # nur 3-Letter-IATA), aber latenter Crash. `_hb_local` (Z. 1267)
+                # ist hier im Closure-Scope korrekt gebunden.
+                if len(digits) >= 3 and not t.startswith(_hb_local):
                     return True
             return False
         tour_has_inland_flight_same_day = any(
@@ -1257,6 +1414,7 @@ def calculate_allowances_from_normalized_tours(
             tour_has_foreign_signal or tour_has_overnight
             or tour_has_z72_same_day or tour_has_v2_departure_hint
             or tour_has_inland_flight_same_day
+            or tour_has_inland_overnight  # FIX: Inland-Übernachtungstour = 1 Fahrtag
         )
 
         # Fahrtag pro Tour-Start (B9: nur legitime)
@@ -1473,10 +1631,20 @@ def calculate_allowances_from_normalized_tours(
                     day_rate = 'voll_24h'
                     day_source = 'CAS+SE-inland'
                 elif is_foreign and resolved_rate:
-                    day_eur = float(resolved_rate.get('voll_24h', 0) or 0)
+                    # FIX (2026-06-04): voll_24h NUR wenn der Tag wirklich ein
+                    # voller Kalendertag im Ausland war (§9 Abs.4a). Ein als
+                    # is_full_away_day geroleter Tag OHNE overnight_after_day ist
+                    # kein Volltag — die Crew hat dort nicht (mehr) übernachtet
+                    # (Abreise/partieller Tag) → An-/Abreise-Satz. Behebt den
+                    # positionalen Über-Ansatz (voll statt an_ab) auf ~14 realen
+                    # Tibor-Tagen (Z76 +49 vs Golden). Mid-Tour-Volltage haben
+                    # overnight_after_day=True → unverändert voll_24h.
+                    _full_day = bool(td.cas_raw.get('overnight_after_day'))
+                    _rk = 'voll_24h' if _full_day else 'an_abreise'
+                    day_eur = float(resolved_rate.get(_rk, 0) or 0)
                     day_bucket = 'Z76' if day_eur > 0 else 'none'
                     day_country = resolved_country
-                    day_rate = 'voll_24h'
+                    day_rate = _rk
                     day_source = day_audit.get('source_used') or 'CAS+BMF'
                 else:
                     # Kein klares Foreign UND kein klares Inland → audit warning
@@ -1491,6 +1659,11 @@ def calculate_allowances_from_normalized_tours(
             # → keine VMA (Tour-Rand-/Leertag, FollowMe wertet als Frei).
             day_bucket, day_eur = _se_block_vma_if_no_se_line(
                 _se_blocks_all_vma, day_bucket, day_eur, day_audit)
+
+            # FIX (2026-06-03): Home-Standby hat NIE VMA (s. Helfer). Ausgelagert,
+            # um den Branch-Count der allowance-calc-Funktion <50 zu halten.
+            day_bucket, day_eur = _block_vma_if_home_standby(
+                td.is_home_standby, day_bucket, day_eur, day_audit)
 
             # Aggregate
             if day_bucket == 'Z72':
@@ -1543,13 +1716,27 @@ def calculate_allowances_from_normalized_tours(
                 and not td.is_free
             )
 
+            # FIX (2026-06-03): Home-Standby ist NIE ein Dienst-/Reinigungstag —
+            # auch nicht, wenn der Builder ihm positional einen dep/return-Flag
+            # gegeben hat (Reader-Lücke: fehlendes ends_at_homebase lässt die Tour
+            # offen, der folgende Standby-Tag wird zum „Heimkehr"-Tag). Die
+            # is_departure_day/is_return_day-OR-Terme hebelten sonst die
+            # is_home_standby-Ausnahme (s. is_within_real_normalized_tour) aus →
+            # Standby zählte als arbeitstage+reinigungstage (Miguel 142 vs 129).
+            # NUR is_home_standby gaten, NICHT is_free: ein Mid-Tour-Layover-Tag den
+            # der Reader als activity='frei' (Marker 'X'/'==') stempelt ist ein
+            # echter Auswärts-/Reinigungstag, den FollowMe zählt (`not is_free`
+            # hätte ~8 legitime Tibor-Tage gekillt: 141→125 statt →133).
             is_real_duty_day = (
-                has_fl_today                  # explizit Flug-Marker (FL)
-                or has_flight_marker          # marker/routing = Flugnummer
-                or td.is_departure_day        # Tour-Anreise (Briefing+Boarding)
-                or td.is_return_day           # Tour-Heimkehr (Landung+Debrief)
-                or td.is_training             # Office/Schulung
-                or is_within_real_normalized_tour  # R14: Mid-Tour-Continuation
+                not td.is_home_standby
+                and (
+                    has_fl_today                  # explizit Flug-Marker (FL)
+                    or has_flight_marker          # marker/routing = Flugnummer
+                    or td.is_departure_day        # Tour-Anreise (Briefing+Boarding)
+                    or td.is_return_day           # Tour-Heimkehr (Landung+Debrief)
+                    or td.is_training             # Office/Schulung
+                    or is_within_real_normalized_tour  # R14: Mid-Tour-Continuation
+                )
             )
             # Mid-Tour-Layover-Rest-Day: in Tour, kein Flug-Beleg, kein dep/ret.
             # User ist im Layover-Hotel — bekommt VMA aber KEINE Reinigung.
@@ -1596,15 +1783,18 @@ def calculate_allowances_from_normalized_tours(
                 hotel_evidence = True
                 hotel_source = 'has_real_fl_layover'
             elif (td.layover_iata
-                  and not _is_inland_code(td.layover_iata)
                   and td.layover_iata.upper() != hb_up
-                  and cas_overnight):
-                # R19 (2026-05-26): Foreign-Layover-IATA allein reicht nicht.
-                # Reader markiert manchmal layover_iata für den Tour-Folgetag
-                # ohne overnight=True. Diese Phantom-Pfade lieferten Doppel-
-                # Hotels. STRIKT: cas_overnight als Pflicht-Signal.
+                  and cas_overnight
+                  and not td.is_home_standby):
+                # R19 (2026-05-26): Layover-IATA ≠ Homebase mit cas_overnight =
+                # echte Hotelnacht. STRIKT: cas_overnight als Pflicht-Signal (sonst
+                # Phantom-Hotels bei Reader-Folgetag-Stempeln).
+                # FIX (2026-06-04): gilt jetzt auch für INLAND-Übernachtungen
+                # (deutsche mehrtägige Auswärtstätigkeit mit Hotel, z.B. Training
+                # Bremen) — Übernachtung ist ortsunabhängig. Home-Standby ausgenommen.
                 hotel_evidence = True
-                hotel_source = 'foreign_layover_iata_overnight'
+                hotel_source = ('foreign' if not _is_inland_code(td.layover_iata)
+                                else 'inland') + '_layover_iata_overnight'
             elif (cas_overnight and tour_has_foreign_signal
                   and not td.is_home_standby
                   and not (td.layover_iata and _is_inland_code(td.layover_iata))
@@ -1658,6 +1848,11 @@ def calculate_allowances_from_normalized_tours(
             # FRA→Ausland→FRA an einem Tag) erzeugen KEINE Hotelnacht — Crew
             # kommt am selben Tag heim. Vorher schloss der Guard Same-Day-Touren
             # aus (and not is_departure_day) → 7 Phantom-Hotels bei Tagestrips.
+            # NB (2026-06-03): Eine vorgeschlagene Ausnahme für den Sick-mid-tour-
+            # Single-Day-Collapse (echte Auslandsnacht behalten) wurde VERWORFEN —
+            # sie addierte auf Echtdaten-Tibor eine Phantom-Hotelnacht (76→77),
+            # falsche Richtung (Hotel ist dort ohnehin schon über Golden). Der
+            # seltene Sick-Collapse-Fall wiegt das nicht auf. tibor_diff = Schiedsrichter.
             if td.is_return_day:
                 hotel_evidence = False
                 hotel_source = 'return_day_no_hotel_after'

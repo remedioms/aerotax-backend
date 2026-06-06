@@ -27,12 +27,16 @@
 
 import hashlib
 import html as html_lib
+import json
 import logging
+import os
 import re
 import threading
 import time
 import urllib.parse
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import requests
 from flask import Blueprint, current_app, jsonify, request
@@ -274,14 +278,18 @@ def get_news_feed():
     """Aggregierter News-Feed (multi-source, dedupe, filter, sort desc).
 
     Query-Params:
-      airline=  optional IATA-Code (LH) oder Name (Lufthansa) — filtert auf
-                Artikel die diese Airline erwähnen. Case-insensitive.
+      airline=  optional IATA-Code (LH) oder Name (Lufthansa) — BOOSTET Artikel
+                die diese Airline erwähnen nach OBEN (sie kommen zuerst),
+                allgemeine News bleiben danach erhalten. Case-insensitive.
+                Jeder Artikel erhält `relevance` (0/1/2) und `is_own_airline`.
       category= optional safety|labor|industry|technical|regulatory|general.
+                Das IST ein harter Filter.
       limit=    1..200, default 50.
 
     Antwort:
-      { ok: true, articles: [...], count, sources_ok, sources_failed,
-        cache_hit, generated_at }
+      { ok: true, articles: [...], count, own_airline_count, airline,
+        sources_ok, sources_failed, cache_hit, generated_at }
+      Jeder Artikel: + relevance:int, is_own_airline:bool, mentioned_airlines:[].
     """
     airline_raw = (request.args.get('airline') or '').strip()
     category_raw = (request.args.get('category') or '').strip().lower()
@@ -326,14 +334,35 @@ def get_news_feed():
         art['mentioned_airlines'] = mentions
         enriched.append(art)
 
-    filtered = _filter_articles(enriched, airline_raw=airline_raw, category=category_raw)
-    filtered.sort(key=lambda a: a.get('published_at') or 0, reverse=True)
+    # Nur Category ist ein echter FILTER. Airline ist KEIN Filter mehr — sie
+    # BOOSTET (airline-relevante Artikel zuerst, allgemeine News danach), damit
+    # der Feed nie leer/dünn wird und der iOS-Client eine "Deine Airline"-Sektion
+    # bauen kann (is_own_airline-Flag).
+    filtered = _filter_articles(enriched, airline_raw='', category=category_raw)
+
+    # Airline-Relevanz taggen (relevance-Score + is_own_airline-Bool).
+    needles = _normalize_airline_input(airline_raw) if airline_raw else set()
+    for art in filtered:
+        rel, own = _airline_relevance(art, needles)
+        art['relevance'] = rel
+        art['is_own_airline'] = own
+
+    # Sort: airline-relevant ZUERST (höchste relevance), innerhalb gleicher
+    # Relevanz nach Datum desc. Ohne airline-Param: relevance überall 0 →
+    # reiner Datums-Sort wie bisher.
+    filtered.sort(
+        key=lambda a: (a.get('relevance') or 0, a.get('published_at') or 0),
+        reverse=True,
+    )
 
     payload = {
         'ok': True,
         'articles': filtered[:limit],
         'count': min(len(filtered), limit),
         'total_before_limit': len(filtered),
+        # Wie viele Artikel airline-relevant sind (für "Deine Airline"-Sektion).
+        'own_airline_count': sum(1 for a in filtered if a.get('is_own_airline')),
+        'airline': airline_raw or None,
         'sources_ok': [s for s, ok in source_status.items() if ok],
         'sources_failed': [s for s, ok in source_status.items() if not ok],
         'cache_hit': False,
@@ -834,8 +863,34 @@ def _classify_category(title, summary):
     return _DEFAULT_CATEGORY
 
 
+def _airline_relevance(art, needles):
+    """Berechnet (relevance:int, is_own_airline:bool) eines Artikels für die
+    gewählte Airline. `needles` ist die Menge der Match-Tokens aus
+    `_normalize_airline_input` (leer = kein Airline-Filter → (0, False)).
+
+    Scoring (höher = relevanter, kommt zuerst):
+      2  — strukturierter Treffer in mentioned_airlines (IATA-Code passt)
+      1  — Name/Alias als Substring im title+summary (>=4 Zeichen)
+      0  — keine Airline-Relevanz (allgemeine News)
+    is_own_airline ist True bei jedem Score >= 1.
+    """
+    if not needles:
+        return 0, False
+    mentioned_lower = {m.lower() for m in (art.get('mentioned_airlines') or [])}
+    if mentioned_lower & needles:
+        return 2, True
+    blob = f'{art.get("title", "")}\n{art.get("summary", "")}'.lower()
+    for needle in needles:
+        if len(needle) >= 4 and needle in blob:
+            return 1, True
+    return 0, False
+
+
 def _filter_articles(articles, airline_raw, category):
-    """Wendet Airline- und Category-Filter an."""
+    """Wendet die echten Filter an. Category ist ein harter Filter.
+    Airline ist KEIN Filter mehr (nur noch Boost/Sort im Caller via
+    `_airline_relevance`) — `airline_raw` bleibt aus Kompatibilität in der
+    Signatur, wird aber nur noch genutzt wenn explizit gesetzt (Legacy)."""
     out = articles
 
     if category:
@@ -846,14 +901,8 @@ def _filter_articles(articles, airline_raw, category):
         # Match wenn (a) mentioned_airlines IATA-Code passt oder (b) eine
         # der needle-Strings substring im title/summary ist.
         def _matches(art):
-            mentioned_lower = {m.lower() for m in (art.get('mentioned_airlines') or [])}
-            if mentioned_lower & needles:
-                return True
-            blob = f'{art.get("title", "")}\n{art.get("summary", "")}'.lower()
-            for needle in needles:
-                if len(needle) >= 4 and needle in blob:
-                    return True
-            return False
+            rel, _own = _airline_relevance(art, needles)
+            return rel > 0
         out = [a for a in out if _matches(a)]
 
     return out
@@ -903,3 +952,471 @@ def _log_warn(msg):
         current_app.logger.warning(msg)
     except Exception:
         _logger.warning(msg)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Community Debrief Board  (anonymes Incident-Debrief-Forum)
+#
+#  Der iOS-News-Tab ("Community Debrief") ruft drei Endpunkte:
+#      GET  /api/news/debrief                 → { items: [post...] }
+#      POST /api/news/debrief                 → erstellter Post (IncidentDebriefPost)
+#      POST /api/news/debrief/<id>/upvote     → { upvotes, did_upvote }
+#
+#  Response-Shape spiegelt EXAKT die Swift-Codable IncidentDebriefPost
+#  (NewsArticle.swift): id, created_at, pseudonym, poster_role, body,
+#  hashtags, upvotes, did_upvote, comment_count.
+#
+#  Persistenz: Supabase-primär (Tabellen `debrief_posts` + `debrief_upvotes`),
+#  Disk-Fallback (JSON im _USER_HISTORY_DIR) damit der Cloud-Run-Ephemeral-FS
+#  nicht alles verliert. Spiegelt das Pattern aus trip_trade_blueprint.py.
+#
+#  Anonym: Lesen ohne Auth. Posten/Upvoten verlangt ein Bearer-Token
+#  (Authorization-Header), aus dem ein deterministisches Pseudonym
+#  ("Crew #NNNN") abgeleitet wird — niemals der echte Token/Username.
+# ══════════════════════════════════════════════════════════════════
+
+# Allowlist — IDENTISCH zur iOS-`DebriefHashtag`-Enum (NewsArticle.swift).
+# Wenn sich eine Seite ändert, beide anpassen.
+_DEBRIEF_HASHTAG_ALLOWLIST = {
+    '#go-around',
+    '#diversion',
+    '#engine-issue',
+    '#medical',
+    '#tcas-ra',
+    '#turbulence',
+    '#bird-strike',
+    '#lightning-strike',
+    '#tech-stop',
+    '#decompression',
+    '#fuel-emergency',
+    '#rejected-takeoff',
+    '#smoke',
+    '#unruly-pax',
+    '#weather-delay',
+}
+
+# Poster-Rollen die wir akzeptieren (alles andere → None). Frei, aber kurz.
+_DEBRIEF_ROLE_ALLOWLIST = {'CC', 'FO', 'CPT', 'PURSER'}
+
+_DEBRIEF_BODY_MIN = 50
+_DEBRIEF_BODY_MAX = 2000
+_DEBRIEF_POST_LIMIT_PER_DAY = 3
+_DEBRIEF_DEFAULT_PAGE = 50
+_DEBRIEF_MAX_PAGE = 100
+
+_DEBRIEF_DISK_LOCK = threading.Lock()
+
+
+# ─── Lazy app-Module / Supabase access (Pattern aus trip_trade) ─────
+
+def _debrief_get_app_module():
+    try:
+        import app as _app_module  # noqa: F401
+        return _app_module
+    except Exception:
+        return None
+
+
+def _debrief_get_sb():
+    """Returns (sb_client, available_bool). (None, False) bei Importfehler."""
+    m = _debrief_get_app_module()
+    if m is None:
+        return None, False
+    return getattr(m, 'sb', None), bool(getattr(m, 'SB_AVAILABLE', False))
+
+
+def _debrief_history_dir():
+    m = _debrief_get_app_module()
+    if m is not None:
+        d = getattr(m, '_USER_HISTORY_DIR', None)
+        if d:
+            return d
+    # TODO: Wenn app.py nicht ladbar ist (z.B. isolierter Blueprint-Test) fällt
+    # das auf ein relatives Verzeichnis zurück — auf Cloud Run ist das ephemer.
+    # Produktiv kommt der Pfad immer aus app._USER_HISTORY_DIR + SB ist Wahrheit.
+    return '_user_history_state'
+
+
+def _debrief_rate_limited(token, limit, window_sec):
+    """True wenn Token sein Limit erreicht hat. Nutzt app._token_rate_limited
+    wenn vorhanden, sonst lokales Sliding-Window-Bucket."""
+    if not token:
+        return False
+    m = _debrief_get_app_module()
+    if m is not None:
+        fn = getattr(m, '_token_rate_limited', None)
+        if callable(fn):
+            try:
+                return bool(fn(token, 'news_debrief_post', limit, window_sec))
+            except Exception:
+                pass
+    now = time.time()
+    cutoff = now - window_sec
+    key = f'debrief:{token}'
+    with _DEBRIEF_DISK_LOCK:
+        bucket = _DEBRIEF_RATE_BUCKETS.setdefault(key, [])
+        bucket[:] = [t for t in bucket if t > cutoff]
+        if len(bucket) >= limit:
+            return True
+        bucket.append(now)
+        if len(_DEBRIEF_RATE_BUCKETS) > 5000:
+            for k in list(_DEBRIEF_RATE_BUCKETS.keys())[:2500]:
+                _DEBRIEF_RATE_BUCKETS.pop(k, None)
+        return False
+
+
+_DEBRIEF_RATE_BUCKETS = {}
+
+
+# ─── Token-Helpers ──────────────────────────────────────────────────
+
+def _debrief_extract_token():
+    """Holt das Bearer-Token aus dem Authorization-Header. None wenn keins."""
+    auth = request.headers.get('Authorization', '') or ''
+    if auth.lower().startswith('bearer '):
+        tok = auth[7:].strip()
+        return tok or None
+    return None
+
+
+def _debrief_valid_token(token):
+    if not isinstance(token, str):
+        return False
+    t = token.strip()
+    return bool(re.match(r'^[A-Za-z0-9_\-]{8,128}$', t))
+
+
+def _debrief_pseudonym(token):
+    """Deterministisches anonymes Pseudonym 'Crew #NNNN' aus Token-Hash.
+    Gleiches Token → gleiches Pseudonym, aber nicht rückführbar auf das Token."""
+    if not token:
+        return 'Crew'
+    h = hashlib.sha256(token.encode('utf-8')).hexdigest()
+    num = int(h[:6], 16) % 9000 + 1000  # 1000..9999
+    return f'Crew #{num}'
+
+
+def _debrief_upvoter_hash(token):
+    """Stabiler, nicht-rückführbarer Hash des Upvoter-Tokens für Idempotenz."""
+    return hashlib.sha256(('upvote:' + (token or '')).encode('utf-8')).hexdigest()[:32]
+
+
+# ─── Disk-Persistenz ────────────────────────────────────────────────
+
+def _debrief_disk_path():
+    d = _debrief_history_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(d, 'debrief_posts.json')
+
+
+def _debrief_load_disk():
+    p = _debrief_disk_path()
+    try:
+        with open(p) as f:
+            data = json.load(f) or []
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    except Exception:
+        return []
+
+
+def _debrief_save_disk(posts):
+    p = _debrief_disk_path()
+    try:
+        with _DEBRIEF_DISK_LOCK:
+            with open(p, 'w') as f:
+                json.dump(posts[-10000:], f, ensure_ascii=False, default=str)
+        return True
+    except Exception as e:
+        _log_warn(f'[debrief] disk_save_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+# ─── Supabase-Persistenz ────────────────────────────────────────────
+
+def _debrief_sb_insert(row):
+    sb, available = _debrief_get_sb()
+    if not available or sb is None:
+        return False
+    try:
+        sb.table('debrief_posts').insert(row).execute()
+        return True
+    except Exception as e:
+        _log_warn(f'[debrief] sb_insert_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _debrief_sb_list(before_iso=None, limit=50):
+    """Neueste zuerst. None bei SB-down → Caller fällt auf Disk zurück."""
+    sb, available = _debrief_get_sb()
+    if not available or sb is None:
+        return None
+    try:
+        q = (sb.table('debrief_posts')
+             .select('*')
+             .eq('deleted', False)
+             .order('created_at', desc=True))
+        if before_iso:
+            q = q.lt('created_at', before_iso)
+        r = q.limit(limit).execute()
+        return list(r.data or [])
+    except Exception as e:
+        _log_warn(f'[debrief] sb_list_fail err={type(e).__name__}: {str(e)[:200]}')
+        return None
+
+
+def _debrief_sb_get(post_id):
+    sb, available = _debrief_get_sb()
+    if not available or sb is None:
+        return None
+    try:
+        r = sb.table('debrief_posts').select('*').eq('id', post_id).limit(1).execute()
+        data = list(r.data or [])
+        return data[0] if data else None
+    except Exception:
+        return None
+
+
+def _debrief_sb_set_upvotes(post_id, upvotes, upvoters):
+    sb, available = _debrief_get_sb()
+    if not available or sb is None:
+        return False
+    try:
+        sb.table('debrief_posts').update({
+            'upvotes': upvotes,
+            'upvoters': upvoters,
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }).eq('id', post_id).execute()
+        return True
+    except Exception as e:
+        _log_warn(f'[debrief] sb_upvote_fail id={post_id} err={type(e).__name__}')
+        return False
+
+
+# ─── Persist-Layer (SB primär, Disk-Spiegel) ────────────────────────
+
+def _debrief_persist_new(row):
+    """Insert in SB + Disk-Spiegel. True wenn mind. ein Pfad hielt."""
+    sb_ok = _debrief_sb_insert(row)
+    with _DEBRIEF_DISK_LOCK:
+        posts = _debrief_load_disk()
+        posts.append(row)
+    disk_ok = _debrief_save_disk(posts)
+    return sb_ok or disk_ok
+
+
+def _debrief_list(before_iso=None, limit=50):
+    """SB primär, Disk-Fallback. Liefert eine sortierte (neueste zuerst) Liste."""
+    sb_rows = _debrief_sb_list(before_iso=before_iso, limit=limit)
+    if sb_rows is not None:
+        return sb_rows
+    posts = [p for p in _debrief_load_disk()
+             if isinstance(p, dict) and not p.get('deleted')]
+    posts.sort(key=lambda x: str(x.get('created_at') or ''), reverse=True)
+    if before_iso:
+        posts = [p for p in posts if str(p.get('created_at') or '') < before_iso]
+    return posts[:limit]
+
+
+def _debrief_apply_upvote(post_id, upvoter_hash):
+    """Idempotenter Toggle. Returns (upvotes:int, did_upvote:bool) oder None
+    wenn der Post nicht existiert."""
+    # SB primär laden
+    post = _debrief_sb_get(post_id)
+    from_disk = False
+    if post is None:
+        with _DEBRIEF_DISK_LOCK:
+            posts = _debrief_load_disk()
+        for p in posts:
+            if isinstance(p, dict) and p.get('id') == post_id and not p.get('deleted'):
+                post = p
+                from_disk = True
+                break
+    if post is None:
+        return None
+
+    upvoters = list(post.get('upvoters') or [])
+    if upvoter_hash in upvoters:
+        upvoters.remove(upvoter_hash)
+        did_upvote = False
+    else:
+        upvoters.append(upvoter_hash)
+        did_upvote = True
+    upvotes = len(upvoters)
+
+    _debrief_sb_set_upvotes(post_id, upvotes, upvoters)
+    # Disk-Spiegel immer aktualisieren (auch wenn Quelle SB war)
+    with _DEBRIEF_DISK_LOCK:
+        posts = _debrief_load_disk()
+        changed = False
+        for p in posts:
+            if isinstance(p, dict) and p.get('id') == post_id:
+                p['upvotes'] = upvotes
+                p['upvoters'] = upvoters
+                p['updated_at'] = datetime.now(timezone.utc).isoformat()
+                changed = True
+                break
+        if changed:
+            with open(_debrief_disk_path(), 'w') as f:
+                json.dump(posts[-10000:], f, ensure_ascii=False, default=str)
+    return upvotes, did_upvote
+
+
+# ─── Serialisierung → IncidentDebriefPost-Shape (Swift Codable) ─────
+
+def _debrief_to_client(row, viewer_upvoter_hash=None):
+    """Mapped eine Storage-Row auf das EXAKTE iOS-IncidentDebriefPost-JSON."""
+    upvoters = row.get('upvoters') or []
+    did_upvote = bool(viewer_upvoter_hash and viewer_upvoter_hash in upvoters)
+    return {
+        'id': str(row.get('id') or ''),
+        'created_at': row.get('created_at') or '',
+        'pseudonym': row.get('pseudonym') or 'Crew',
+        'poster_role': row.get('poster_role'),  # nullable → Swift posterRole: String?
+        'body': row.get('body') or '',
+        'hashtags': list(row.get('hashtags') or []),
+        'upvotes': int(row.get('upvotes') or len(upvoters) or 0),
+        'did_upvote': did_upvote,
+        'comment_count': int(row.get('comment_count') or 0),
+    }
+
+
+def _debrief_sanitize_hashtags(raw):
+    """Nur Allowlist-Tags, dedupe, max 5. Case-insensitive normalisiert."""
+    out = []
+    for h in (raw or []):
+        if not isinstance(h, str):
+            continue
+        tag = h.strip().lower()
+        if not tag.startswith('#'):
+            tag = '#' + tag
+        if tag in _DEBRIEF_HASHTAG_ALLOWLIST and tag not in out:
+            out.append(tag)
+        if len(out) >= 5:
+            break
+    return out
+
+
+# ─── Routes ─────────────────────────────────────────────────────────
+
+@news_bp.route('/api/news/debrief', methods=['GET'])
+def get_news_debrief():
+    """Community-Debrief-Feed. Public-Read (kein Token erforderlich).
+
+    Query:
+      limit   — 1..100 (default 50)
+      before  — ISO8601-Cursor (createdAt des letzten gesehenen Posts) für
+                Infinite-Scroll; liefert nur ältere Posts.
+
+    Antwort: { "items": [IncidentDebriefPost, ...] }  (leer → { "items": [] }).
+    `did_upvote` wird gegen das optionale Bearer-Token des Viewers berechnet.
+    """
+    try:
+        limit = int(request.args.get('limit', str(_DEBRIEF_DEFAULT_PAGE)))
+    except (TypeError, ValueError):
+        limit = _DEBRIEF_DEFAULT_PAGE
+    limit = max(1, min(_DEBRIEF_MAX_PAGE, limit))
+
+    before_iso = (request.args.get('before') or '').strip() or None
+
+    viewer_token = _debrief_extract_token()
+    viewer_hash = _debrief_upvoter_hash(viewer_token) if viewer_token else None
+
+    rows = _debrief_list(before_iso=before_iso, limit=limit)
+    items = [_debrief_to_client(r, viewer_hash) for r in rows if isinstance(r, dict)]
+    return jsonify({'items': items}), 200
+
+
+@news_bp.route('/api/news/debrief', methods=['POST'])
+def post_news_debrief():
+    """Erstellt einen anonymen Debrief-Post. Verlangt Bearer-Token.
+
+    Body: { body: str (50..2000), hashtags: [allowlist], poster_role: str? }
+    Rate-Limit: 3 Posts / 24h / Token.
+    Antwort: der erstellte IncidentDebriefPost (Swift-Shape), HTTP 200.
+    """
+    token = _debrief_extract_token()
+    if not _debrief_valid_token(token):
+        return jsonify({'ok': False, 'error': 'Auth-Token fehlt oder ungültig.'}), 401
+
+    if _debrief_rate_limited(token, _DEBRIEF_POST_LIMIT_PER_DAY, 86400):
+        return jsonify({
+            'ok': False,
+            'error': 'Tageslimit erreicht (max. 3 Debrief-Posts pro Tag).',
+        }), 429
+
+    payload = request.get_json(silent=True) or {}
+    body_text = payload.get('body')
+    if not isinstance(body_text, str):
+        body_text = ''
+    body_text = body_text.strip()
+    if len(body_text) < _DEBRIEF_BODY_MIN:
+        return jsonify({
+            'ok': False,
+            'error': f'Text zu kurz (min. {_DEBRIEF_BODY_MIN} Zeichen).',
+        }), 400
+    if len(body_text) > _DEBRIEF_BODY_MAX:
+        body_text = body_text[:_DEBRIEF_BODY_MAX]
+
+    hashtags = _debrief_sanitize_hashtags(payload.get('hashtags'))
+
+    poster_role = payload.get('poster_role')
+    if isinstance(poster_role, str):
+        poster_role = poster_role.strip().upper() or None
+        if poster_role not in _DEBRIEF_ROLE_ALLOWLIST:
+            poster_role = None
+    else:
+        poster_role = None
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    post_id = uuid.uuid4().hex
+    row = {
+        'id': post_id,
+        'author_token_hash': _debrief_upvoter_hash(token),  # nie das Klartext-Token speichern
+        'pseudonym': _debrief_pseudonym(token),
+        'poster_role': poster_role,
+        'body': body_text,
+        'hashtags': hashtags,
+        'upvotes': 0,
+        'upvoters': [],
+        'comment_count': 0,
+        'deleted': False,
+        'created_at': now_iso,
+        'updated_at': now_iso,
+    }
+    ok = _debrief_persist_new(row)
+    if not ok:
+        return jsonify({'ok': False, 'error': 'Speichern fehlgeschlagen.'}), 500
+
+    _log_warn(f'[debrief] post_created id={post_id} tags={hashtags}')
+    # Viewer = Author → did_upvote ist False (hat sich selbst nicht upgevotet)
+    return jsonify(_debrief_to_client(row, _debrief_upvoter_hash(token))), 200
+
+
+@news_bp.route('/api/news/debrief/<post_id>/upvote', methods=['POST'])
+def upvote_news_debrief(post_id):
+    """Idempotenter Upvote-Toggle. Verlangt Bearer-Token.
+
+    Antwort: { ok: true, upvotes: N, did_upvote: bool }.
+    Gleiches Token zweimal → toggelt zurück (kein Doppel-Vote).
+    """
+    token = _debrief_extract_token()
+    if not _debrief_valid_token(token):
+        return jsonify({'ok': False, 'error': 'Auth-Token fehlt oder ungültig.'}), 401
+
+    if not post_id or not re.match(r'^[A-Za-z0-9_\-]{1,64}$', post_id):
+        return jsonify({'ok': False, 'error': 'Ungültige Post-ID.'}), 400
+
+    if _debrief_rate_limited('upvote:' + token, 120, 3600):
+        return jsonify({'ok': False, 'error': 'Zu viele Upvotes — kurz warten.'}), 429
+
+    result = _debrief_apply_upvote(post_id, _debrief_upvoter_hash(token))
+    if result is None:
+        return jsonify({'ok': False, 'error': 'Post nicht gefunden.'}), 404
+
+    upvotes, did_upvote = result
+    return jsonify({'ok': True, 'upvotes': upvotes, 'did_upvote': did_upvote}), 200

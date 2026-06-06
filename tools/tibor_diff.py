@@ -27,7 +27,7 @@ os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
 import app as app_module
 import normalized_tours as nt
 
-CAS_DIR = '/Users/miguelschumann/Desktop/Steuer 25/CAS'
+CAS_DIR = '/Users/miguelschumann/Desktop/Tibor/2025/Dienstplan'  # FIX 2026-06-04: war fälschlich Miguels Steuer-25-CAS (Person 95775) — Golden/SE/Reader sind aber Tibor (99102); der falsche CAS-Overlay verfälschte die Validierung
 
 
 def _load_cas_pdf_bytes():

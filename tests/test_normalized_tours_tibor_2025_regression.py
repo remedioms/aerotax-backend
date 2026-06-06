@@ -330,3 +330,343 @@ def test_jfk_tour_with_proper_bracket():
     # JFK ist tour_target (aus layover_iata)
     targets = {td.target_iata for td in t.days}
     assert 'JFK' in targets or any('SNN' == td.target_iata for td in t.days)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 8: Urlaub ist NIE Tour-Tag (Fix 2026-06-03)
+# Es gibt keinen Urlaub mitten in der Tour — ein U/URLAUB/K/KRANK schließt die
+# offene Tour am Vortag und gehört selbst nie dazu. (Miguel Schumann 2025-05-16:
+# 'U' nach TLV-Flug am 15.05. wurde fälschlich Z76.)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _cas_act(datum, marker='', routing=None, layover_ort='', overnight=False,
+             starts_hb=False, ends_hb=False, duty_min=0, activity=''):
+    d = _cas(datum, marker, routing, layover_ort, overnight,
+             starts_hb, ends_hb, duty_min)
+    d['activity_type'] = activity
+    return d
+
+
+def test_urlaub_marker_after_overnight_tour_is_not_tour_day():
+    """05-16 'U' direkt nach Auslands-Übernachtungstag → NICHT in Tour, kein Z76."""
+    cas = [
+        _cas('2025-05-15', marker='112355', routing=['FRA', 'TLV'],
+             starts_hb=True, layover_ort='TLV', overnight=True, duty_min=600),
+        _cas('2025-05-16', marker='U'),  # Urlaub, keine Reise-Evidenz
+    ]
+    tours = build_normalized_tours(cas, [], 2025, homebase='FRA')
+    tour_dates = {td.date.isoformat() for t in tours for td in t.days}
+    assert '2025-05-16' not in tour_dates, '05-16 U darf NIE Tour-Tag sein'
+
+    result = calculate_allowances_from_normalized_tours(tours, BMF_2025)
+    d = result.by_date.get('2025-05-16')
+    assert d is None or d.get('klass') != 'Z76', \
+        f'05-16 Urlaub darf nicht Z76 sein, got {d}'
+
+
+def test_urlaub_activity_after_overnight_tour_is_not_tour_day():
+    """Gleicher Fall, aber Reader stempelt activity='urlaub' (realistischer Output)."""
+    cas = [
+        _cas_act('2025-05-15', marker='112355', routing=['FRA', 'TLV'],
+                 starts_hb=True, layover_ort='TLV', overnight=True, duty_min=600),
+        _cas_act('2025-05-16', marker='U', activity='urlaub'),
+    ]
+    tours = build_normalized_tours(cas, [], 2025, homebase='FRA')
+    tour_dates = {td.date.isoformat() for t in tours for td in t.days}
+    assert '2025-05-16' not in tour_dates
+
+    result = calculate_allowances_from_normalized_tours(tours, BMF_2025)
+    d = result.by_date.get('2025-05-16')
+    assert d is None or d.get('klass') != 'Z76', \
+        f'05-16 Urlaub darf nicht Z76 sein, got {d}'
+
+
+def test_reader_noise_frei_return_day_still_counts():
+    """Abgrenzung: activity='frei' Heimkehrtag (Marker 'X', Routing TLV->FRA) bleibt
+    legitimer Tour-Tag — der Fix darf echte Rückreisetage NICHT verwerfen."""
+    cas = [
+        _cas_act('2025-05-15', marker='112355', routing=['FRA', 'TLV'],
+                 starts_hb=True, layover_ort='TLV', overnight=True, duty_min=600),
+        _cas_act('2025-05-16', marker='X', routing=['TLV', 'FRA'],
+                 ends_hb=True, duty_min=600, activity='frei'),
+    ]
+    tours = build_normalized_tours(cas, [], 2025, homebase='FRA')
+    tour_dates = {td.date.isoformat() for t in tours for td in t.days}
+    assert '2025-05-16' in tour_dates, 'Heimkehrtag (Reader-Rausch frei) muss Tour-Tag bleiben'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 9: Standby ist nie Dienst/Hotel (Fix A+B 2026-06-03)
+# Home-Standby (SB_S) und homebound Airport-Standby (SBY@FRA) dürfen NICHT als
+# arbeitstag/reinigungstag/Hotel-Nacht zählen, auch wenn ein Reader-Lücken-
+# Tour-Bracket sie absorbiert. Auslands-Outstation-Standby bleibt echter Tag.
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_home_standby_absorbed_as_return_day_not_counted():
+    """SB_S nach Tour deren letzter Flugtag ends_at_homebase verfehlt (Reader-
+    Lücke): der Standby-Tag wird positional zum 'return day', darf aber NICHT
+    als arbeitstag/reinigungstag zählen (war 4/4, korrekt 3/3)."""
+    cas = [
+        _cas('2025-01-03', marker='31591', routing=['FRA', 'BLR'],
+             starts_hb=True, layover_ort='BLR', overnight=True, duty_min=600),
+        _cas('2025-01-04', marker='X', layover_ort='BLR', overnight=True),
+        _cas('2025-01-05', marker='X', routing=['BLR', 'FRA'], duty_min=600),  # ends_hb FEHLT
+        _cas('2025-01-06', marker='SB_S'),  # HOME STANDBY
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF_2025)
+    assert r.arbeitstage == 3, f'home-standby darf kein arbeitstag sein, got {r.arbeitstage}'
+    assert r.reinigungstage == 3, f'reinigung==arbeitstage, got {r.reinigungstage}'
+
+
+def test_homebound_airport_standby_not_hotel_or_workday():
+    """SBY am Homebase FRA mitten in einer Tour (Verfügbarkeit, kein Auswärts-
+    einsatz): kein Hotel, kein arbeitstag (war hotel=2/AT=3, korrekt hotel=1/AT=2)."""
+    cas = [
+        _cas('2025-01-03', marker='31591', routing=['FRA', 'BLR'],
+             starts_hb=True, layover_ort='BLR', overnight=True, duty_min=600),
+        _cas('2025-01-04', marker='SBY', routing=['FRA'], layover_ort='FRA', overnight=True),
+        _cas('2025-01-05', marker='31592', routing=['BLR', 'FRA'],
+             ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF_2025)
+    assert r.hotel_naechte == 1, f'SBY@FRA ist keine Hotel-Nacht, got {r.hotel_naechte}'
+    assert r.arbeitstage == 2, f'SBY@FRA ist kein arbeitstag, got {r.arbeitstage}'
+
+
+def test_foreign_outstation_standby_stays_real():
+    """Abgrenzung: SBY am AUSLANDS-Outstation BLR während eines echten Layovers
+    IST Auswärtstätigkeit — Z76 + Hotel müssen erhalten bleiben."""
+    cas = [
+        _cas('2025-01-03', marker='31591', routing=['FRA', 'BLR'],
+             starts_hb=True, layover_ort='BLR', overnight=True, duty_min=600),
+        _cas('2025-01-04', marker='SBY', routing=['BLR'], layover_ort='BLR', overnight=True),
+        _cas('2025-01-05', marker='31592', routing=['BLR', 'FRA'],
+             ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF_2025)
+    d = r.by_date.get('2025-01-04')
+    assert d is not None and d['klass'] == 'Z76', f'Auslands-Standby muss Z76 bleiben, got {d}'
+    assert r.hotel_naechte == 2, f'Auslands-Standby-Nacht muss zählen, got {r.hotel_naechte}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 10: Standby ohne VMA + Office-Fahrtag-Mislabel (2026-06-03)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_absorbed_home_standby_gets_no_vma_on_se_less_path():
+    """SB_S, der über eine Reader-Lücke als Tour-Heimkehrtag absorbiert wird,
+    bekommt keine VMA (klass 'none'), auch ohne SE-Zeilen. (Verfügbarkeit = keine
+    Spesen.) In Prod ohnehin SE-gegated; dies deckt den SE-losen Pfad."""
+    cas = [
+        _cas('2025-01-03', marker='31591', routing=['FRA', 'BLR'],
+             starts_hb=True, layover_ort='BLR', overnight=True, duty_min=600),
+        _cas('2025-01-04', marker='X', layover_ort='BLR', overnight=True),
+        _cas('2025-01-05', marker='X', routing=['BLR', 'FRA'], duty_min=600),
+        _cas('2025-01-06', marker='SB_S'),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF_2025)
+    d = r.by_date.get('2025-01-06')
+    assert d is None or d.get('klass') != 'Z76', f'Home-Standby darf kein Z76 sein, got {d}'
+
+
+def _cas_dep(datum, marker='', routing=None, duty_min=0, starts_hb=False,
+             ends_hb=False, activity='', is_dep=False):
+    d = _cas(datum, marker, routing, '', False, starts_hb, ends_hb, duty_min)
+    d['activity_type'] = activity
+    if is_dep:
+        d['is_tour_departure'] = True
+    return d
+
+
+def test_office_mislabeled_as_departure_is_not_fahrtag():
+    """Ein Office/Training-Tag (EM @ FRA, kein Flug), den der V2-Reader fälschlich
+    mit is_tour_departure stempelt, ist KEIN Tour-Start → kein Fahrtag (Miguel
+    61 vs 53)."""
+    cas = [_cas_dep('2025-02-01', marker='EM', routing=['FRA'], duty_min=500,
+                    starts_hb=True, ends_hb=True, activity='office', is_dep=True)]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF_2025)
+    assert r.fahrtage == 0, f'Office-Mislabel darf kein Fahrtag sein, got {r.fahrtage}'
+
+
+def test_inland_same_day_flight_stays_a_fahrtag():
+    """Abgrenzung: echte Inland-Eintages-Auswärtstätigkeit FRA->MUC->FRA (>8h,
+    echter Flug-Token) bleibt ein Fahrtag — der Office-Guard darf sie nicht killen."""
+    cas = [_cas_dep('2025-02-02', marker='LH100', routing=['FRA', 'MUC', 'FRA'],
+                    duty_min=540, starts_hb=True, ends_hb=True,
+                    activity='flight', is_dep=True)]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'),
+        {'MUC': {'an_abreise': 14.0, 'voll_24h': 28.0, 'country': 'Deutschland'}})
+    assert r.fahrtage == 1, f'Inland-Eintagesfahrt muss Fahrtag bleiben, got {r.fahrtage}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 11: Generalisierung Round 1 (2026-06-03)
+# Jahresgrenzen-Continuation = voll_24h; STBY/STANDBY-Dialekt = Standby.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _cas_cont(datum, marker='', routing=None, layover_ort='', overnight=False,
+              starts_hb=False, ends_hb=False, duty_min=0, cont=False):
+    d = _cas(datum, marker, routing, layover_ort, overnight, starts_hb, ends_hb, duty_min)
+    if cont:
+        d['is_tour_continuation'] = True
+    return d
+
+
+def test_year_boundary_continuation_is_voll_24h_not_an_abreise():
+    """Tour-Tail ins neue Jahr: 1. Roster-Tag ist is_tour_continuation, startet
+    NICHT am Homebase, hat overnight → echter Voll-24h-Zwischentag (reale Abreise
+    im Vorjahr), NICHT An-/Abreise. (§9 Abs.4a: nur An-/Abreisetage reduziert.)"""
+    BMF = {'GRU': {'an_abreise': 36.0, 'voll_24h': 53.0, 'country': 'Brasilien'}}
+    cas = [
+        _cas_cont('2025-01-01', marker='X', routing=['GRU'], layover_ort='GRU',
+                  overnight=True, cont=True),
+        _cas('2025-01-02', marker='LH507', routing=['GRU', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF)
+    d = r.by_date.get('2025-01-01')
+    assert d is not None and d['amount'] == 53.0, f'Jahresgrenzen-Zwischentag = voll_24h 53, got {d}'
+
+
+def test_stby_standby_dialect_recognised_as_standby():
+    """Andere Airline-Schreibweise STBY/STANDBY wird als Standby erkannt (nicht
+    als unbekannter Marker). Home-Kontext → kein arbeitstag/reinigung."""
+    from normalized_tours import _detect_standby_marker
+    assert _detect_standby_marker('STBY') == (True, 'airport')
+    assert _detect_standby_marker('STANDBY') == (True, 'airport')
+    # STBY am Homebase (keine Auslands-Evidenz) zählt nicht als Dienst
+    cas = [_cas('2025-03-01', marker='STBY', routing=['FRA'], duty_min=480)]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), {})
+    assert r.arbeitstage == 0, f'Home-STBY ist kein arbeitstag, got {r.arbeitstage}'
+    assert r.fahrtage == 0, f'Home-STBY ist kein Fahrtag, got {r.fahrtage}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 12: Metro-Stadt-Codes + Malformed-Robustheit (Round 2b, 2026-06-04)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_metro_city_code_in_routing_resolves_foreign_not_inland():
+    """Ein Metropol-Code (CHI/STO/ROM) im CAS-Routing muss als Ausland aufgelöst
+    werden (Z76), nicht als deutsches Inland (Z73). Der Satz kommt über einen
+    gleichland-Airport (ORD) in der BMF-Tabelle."""
+    BMF = {'ORD': {'an_abreise': 44.0, 'voll_24h': 65.0,
+                   'country': 'Vereinigte Staaten von Amerika (USA) – Chicago'}}
+    cas = [
+        _cas('2025-02-01', marker='LH', routing=['FRA', 'CHI'], starts_hb=True, duty_min=600),
+        _cas('2025-02-02', marker='X', routing=['CHI'], layover_ort='CHI', overnight=True),
+        _cas('2025-02-03', marker='LH', routing=['CHI', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    se = [{'datum': '2025-02-02', 'stfrei_ort': 'CHI', 'stfrei_betrag': 65.0}]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, se, 2025, homebase='FRA'), BMF)
+    assert r.z76_eur > 0, f'Metro-Code CHI muss Z76 (Ausland) ergeben, got z76={r.z76_eur}'
+    d = r.by_date.get('2025-02-02')
+    assert d and 'Chicago' in (d.get('country') or ''), f'soll Chicago sein, got {d}'
+
+
+def test_malformed_cas_input_does_not_crash():
+    """Nicht-dict-Elemente im cas_days-List dürfen nicht crashen (graceful)."""
+    out = build_normalized_tours(
+        ['not-a-dict', None, 5, _cas('2025-01-01', marker='X')], [], 2025, homebase='FRA')
+    assert isinstance(out, list)  # kein AttributeError
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 13: Inland-Übernachtungstour (Round 2b, 2026-06-04)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_inland_overnight_tour_counts_hotel_and_fahrtag():
+    """Mehrtägige DEUTSCHE Auswärtstätigkeit mit Hotel (z.B. Training Bremen):
+    Hotelnächte + Pendel-Fahrtag müssen zählen (Übernachtung ist ortsunabhängig).
+    Vorher: hotel=0, fahrtage=0, weil nur Auslands-Layover als Tour-Signal galt."""
+    cas = [
+        _cas('2025-04-01', marker='LH010', routing=['FRA', 'BRE'], layover_ort='BRE',
+             overnight=True, starts_hb=True, duty_min=600),
+        _cas('2025-04-02', marker='SIM', routing=['BRE'], layover_ort='BRE',
+             overnight=True, duty_min=480),
+        _cas('2025-04-03', marker='LH011', routing=['BRE', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), {})
+    assert r.hotel_naechte == 2, f'inland 2 Hotelnächte erwartet, got {r.hotel_naechte}'
+    assert r.fahrtage == 1, f'inland Übernachtungstour = 1 Fahrtag, got {r.fahrtage}'
+    assert r.z73_eur == 28.0 and r.z74_eur == 28.0, f'An/Ab 2x14 + Voll 28 erwartet, got z73={r.z73_eur} z74={r.z74_eur}'
+
+
+def test_inland_same_day_trip_no_phantom_hotel():
+    """Abgrenzung: Inland-Tagestrip OHNE Übernachtung erzeugt KEINE Hotelnacht."""
+    cas = [_cas('2025-04-10', marker='LH100', routing=['FRA', 'MUC', 'FRA'],
+                starts_hb=True, ends_hb=True, duty_min=540)]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), {})
+    assert r.hotel_naechte == 0, f'Tagestrip = keine Hotelnacht, got {r.hotel_naechte}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 14: Doppelte Kalendertage dedupen (Round 3, 2026-06-04)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_duplicate_calendar_date_not_double_counted():
+    """Zwei CAS-Zeilen mit demselben datum dürfen VMA/Hotel/Tage nicht doppelt
+    zählen (§9 Abs.4a: pro Kalendertag). Vorher: Per-TourDay-Summation zählte
+    doppelt, by_date (dict) dedupte → summary != by_date."""
+    BMF = {'JFK': {'an_abreise': 40.0, 'voll_24h': 59.0, 'country': 'USA'}}
+    cas = [
+        _cas('2025-06-01', marker='LH400', routing=['FRA', 'JFK'], layover_ort='JFK',
+             overnight=True, starts_hb=True, duty_min=600),
+        _cas('2025-06-02', marker='X', routing=['JFK'], layover_ort='JFK', overnight=True),
+        _cas('2025-06-02', marker='X', routing=['JFK'], layover_ort='JFK', overnight=True),  # DUP
+        _cas('2025-06-03', marker='LH401', routing=['JFK', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF)
+    bd_z76 = sum(v.get('amount', 0) for v in r.by_date.values() if v.get('klass') == 'Z76')
+    assert r.z76_tage == 3, f'3 Kalendertage erwartet (Dublette dedupt), got {r.z76_tage}'
+    assert r.hotel_naechte == 2, f'2 Hotelnächte erwartet, got {r.hotel_naechte}'
+    assert abs(r.z76_eur - bd_z76) < 0.01, f'summary z76_eur {r.z76_eur} != sum(by_date) {bd_z76}'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cluster 15: voll_24h nur bei echtem Volltag (overnight) — Round 3 (2026-06-04)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_full_away_day_without_overnight_is_an_abreise_not_voll():
+    """Ein positional als is_full_away_day geroleter Auslands-Tag OHNE
+    overnight_after_day ist kein voller Kalendertag (§9 Abs.4a) → An-/Abreise-Satz,
+    nicht voll_24h. Echte Mid-Tour-Volltage (overnight=True) bleiben voll_24h."""
+    BMF = {'JFK': {'an_abreise': 40.0, 'voll_24h': 59.0, 'country': 'USA'}}
+    # 4-Tage-Struktur, aber der 3. Tag (full_away-Position) hat KEINE Übernachtung
+    cas = [
+        _cas('2025-07-01', marker='LH400', routing=['FRA', 'JFK'], layover_ort='JFK',
+             overnight=True, starts_hb=True, duty_min=600),
+        _cas('2025-07-02', marker='X', routing=['JFK'], layover_ort='JFK', overnight=True),
+        _cas('2025-07-03', marker='X', routing=['JFK'], layover_ort='JFK', overnight=False),  # kein Volltag
+        _cas('2025-07-04', marker='LH401', routing=['JFK', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF)
+    d3 = r.by_date.get('2025-07-03')
+    assert d3 and d3.get('rate_type') == 'an_abreise', \
+        f'full_away ohne overnight = an_abreise erwartet, got {d3}'
+
+
+def test_clean_midtour_days_stay_voll_24h():
+    """Abgrenzung: echte Mid-Tour-Tage MIT Übernachtung bleiben voll_24h."""
+    BMF = {'JFK': {'an_abreise': 40.0, 'voll_24h': 59.0, 'country': 'USA'}}
+    cas = [
+        _cas('2025-08-01', marker='LH400', routing=['FRA', 'JFK'], layover_ort='JFK',
+             overnight=True, starts_hb=True, duty_min=600),
+        _cas('2025-08-02', marker='X', routing=['JFK'], layover_ort='JFK', overnight=True),
+        _cas('2025-08-03', marker='X', routing=['JFK'], layover_ort='JFK', overnight=True),
+        _cas('2025-08-04', marker='LH401', routing=['JFK', 'FRA'], ends_hb=True, duty_min=600),
+    ]
+    r = calculate_allowances_from_normalized_tours(
+        build_normalized_tours(cas, [], 2025, homebase='FRA'), BMF)
+    assert r.z76_eur == 198.0, f'40+59+59+40=198 erwartet, got {r.z76_eur}'

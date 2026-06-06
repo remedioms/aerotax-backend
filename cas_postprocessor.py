@@ -222,9 +222,10 @@ def normalize_cas_days_v2(
         if d:
             se_by_date.setdefault(d, []).append(se)
 
-    # Sortieren nach Datum
+    # Sortieren nach Datum (FIX 2026-06-03: nur dict-Elemente — ein Nicht-dict
+    # im Input ließ dict(d)/x.get(...) crashen statt sanft zu degradieren)
     days = sorted(
-        [dict(d) for d in (structured_days or [])],
+        [dict(d) for d in (structured_days or []) if isinstance(d, dict)],
         key=lambda x: x.get('datum') or x.get('date') or '',
     )
 
