@@ -16847,7 +16847,7 @@ def _mdfag_board(slug, iata, flight_type='departure'):
         if r.status_code != 200 or not r.text:
             return None
         soup = BeautifulSoup(r.text, 'html.parser')
-        day = datetime.now(timezone(timedelta(hours=2))).strftime('%Y-%m-%d')
+        day = _fra_local_now().strftime('%Y-%m-%d')
     except Exception:
         return None
     scope = soup.select_one('#collapse-parent-arrival' if arr
@@ -16929,6 +16929,11 @@ _NATIVE_BOARD_SCRAPERS = {
     'FMO': lambda ft: _fmo_board(ft),
     'LEJ': lambda ft: _mdfag_board('leipzig-halle-airport', 'LEJ', ft),
     'DRS': lambda ft: _mdfag_board('dresden-airport', 'DRS', ft),
+    'ERF': lambda ft: _mdfag_board('erfurt-weimar-airport', 'ERF', ft),
+    'DTM': lambda ft: _mdfag_board('dortmund-airport', 'DTM', ft),
+    'RLG': lambda ft: _mdfag_board('rostock-laage-airport', 'RLG', ft),
+    'KSF': lambda ft: _mdfag_board('kassel-airport', 'KSF', ft),
+    'SCN': lambda ft: _mdfag_board('saarbrucken-airport', 'SCN', ft),
 }
 
 
@@ -17242,6 +17247,32 @@ def _flight_sched_passed(f, now_local):
     return sdt <= now_local
 
 
+# Tages-keyed Verspätungs-Store: (date_str, flight_no, sched_hhmm) → max beobachtete Verspätung (min).
+# Wird bei jedem Board-Rebuild gemergt (nur max, nie zurückgesetzt bis 05:00 Rollover).
+_delay_store: dict = {}
+_delay_store_date: str = ''  # YYYY-MM-DD des aktuellen Betriebstages
+
+
+def _merge_into_delay_store(flights, date_str):
+    """Mergt beobachtete Delays aus flights in den globalen _delay_store.
+    Nur max-Wert pro Flug — nie zurücksetzen, nie aus dem Store löschen."""
+    global _delay_store, _delay_store_date
+    if _delay_store_date != date_str:
+        _delay_store.clear()
+        _delay_store_date = date_str
+    for f in (flights or []):
+        fn = f.get('flight') or f.get('flightNumber') or ''
+        sched = f.get('sched') or ''
+        if not fn or not sched:
+            continue
+        key = (date_str, fn, sched[:5])
+        delay = f.get('delay_min') or 0
+        if delay and delay > 0:
+            _delay_store[key] = max(_delay_store.get(key, 0), delay)
+        if f.get('cancelled'):
+            _delay_store[(date_str, fn, sched[:5] + '_cancelled')] = 1
+
+
 def _punctuality_stats(flights):
     """Aggregiert on-time/delayed/cancelled über eine TAGES-Flugliste.
 
@@ -17251,6 +17282,12 @@ def _punctuality_stats(flights):
     Dadurch springt die Zahl beim Neu-Laden (09:00 vs 09:05) nicht mehr, sie wächst
     nur, wenn weitere Flüge tatsächlich abfliegen. Das Tages-Fenster selbst ist in
     `_fra_day_board_cached` ab 05:00 Ortszeit fixiert."""
+    # Tages-Datum ermitteln und Delay-Store mergen.
+    try:
+        today = _fra_local_now().strftime('%Y-%m-%d')
+        _merge_into_delay_store(flights, today)
+    except Exception:
+        today = ''
     now_local = _fra_local_now()
     # Bahn/Bus (LH Express Rail / AIRail) raus — defensiv, falls ein Altbestand
     # aus dem Cache (vor dem Source-Filter gebaut) noch Zug-Zeilen enthält.
@@ -17261,13 +17298,30 @@ def _punctuality_stats(flights):
     cancelled = sum(1 for f in completed if _is_cancelled(f))
     delayed = sum(1 for f in completed if f.get('delayed') and not _is_cancelled(f))
     on_time = max(0, total - cancelled - delayed)
-    active = max(0, total - cancelled)
-    pct = round(100.0 * on_time / active, 0) if active > 0 else None
     avg_delay = 0
     delay_vals = [int(f.get('delay_min') or 0) for f in completed
                   if not _is_cancelled(f) and int(f.get('delay_min') or 0) > 0]
     if delay_vals:
         avg_delay = round(sum(delay_vals) / len(delay_vals))
+    # Store-basierte Nachhol-Zählung: Flüge die aus der Tafel verschwunden sind
+    # (departed) behalten ihr Urteil. Nur addieren was NICHT schon in completed ist.
+    if today:
+        known_keys = {(today, (f.get('flight') or ''), (f.get('sched') or '')[:5]) for f in completed}
+        for (d, fn, sc), max_delay in list(_delay_store.items()):
+            if sc.endswith('_cancelled'):
+                continue  # cancelled separat
+            if d != today:
+                continue
+            if (today, fn, sc) in known_keys:
+                continue  # schon oben gezählt
+            # Dieser Flug hat geheilt — sein gespeichertes Max zurückholen.
+            total += 1
+            if max_delay > 15:
+                delayed += 1
+            else:
+                on_time += 1
+    active = max(0, total - cancelled)
+    pct = round(100.0 * on_time / active, 0) if active > 0 else None
     return {'total': total, 'on_time': on_time, 'delayed': delayed,
             'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay}
 
@@ -20761,6 +20815,14 @@ def _parse_se_lines_deterministic(all_se_text):
         'z76_eur':  round(z76_eur, 2),
         'unklare_zeilen': unklare,
     }
+
+
+def lh_abwesenheitsgeld(days: int, hours: int, region: str = 'de_eu') -> float:
+    """LH-Tarif Abwesenheitsgeld (Stand 01.01.2023).
+    region: 'de_eu' (Deutschland+Europa, 4.20€/h) oder 'ausland' (4.80€/h).
+    Formel: (days * 12 + hours) * rate — linear pro Stunde, max 15 Tage × 12h Tabelle."""
+    rate = 4.80 if region == 'ausland' else 4.20
+    return round((days * 12 + hours) * rate, 2)
 
 
 def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
