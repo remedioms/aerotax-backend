@@ -276,10 +276,16 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         prof = _load_crew_profile(crew_token) or {}
         if 'current_city' in allowed_fields:
             status['current_city'] = prof.get('current_city')
-        _pl = _app_attr('_profile_load')
-        if callable(_pl):
-            full = _pl(crew_token) or {}
-            status['last_seen_iso'] = full.get('_updated_at')
+        # last_seen_iso ist selbst eine Aktivitäts-Info ("zuletzt online/aktiv")
+        # und darf NUR geleakt werden wenn der Crew ein relevantes Live-Feld
+        # freigegeben hat. Vorher wurde es bedingungslos gesetzt (ausserhalb des
+        # allowed_fields-Gates) → Family sah Aktivität auch ohne jede Freigabe.
+        _ls_allowed = bool(allowed_fields & {'current_city', 'last_seen', 'landed_status', 'next_flight'})
+        if _ls_allowed:
+            _pl = _app_attr('_profile_load')
+            if callable(_pl):
+                full = _pl(crew_token) or {}
+                status['last_seen_iso'] = full.get('_updated_at')
     except Exception as e:
         _log().info(f'[family-watch] profile_read_skip {type(e).__name__}')
     # next_flight: nur wenn 'next_flight' in allowed_fields. Best-effort read aus
@@ -331,6 +337,8 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         status['landed'] = None
     if 'photos' not in allowed_fields:
         status['photo_count_today'] = None
+    if not (allowed_fields & {'current_city', 'last_seen', 'landed_status', 'next_flight'}):
+        status['last_seen_iso'] = None
     return status
 
 

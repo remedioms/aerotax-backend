@@ -8399,6 +8399,11 @@ def put_user_profile(token):
         cc = body.get('current_city')
         if isinstance(cc, str) and 0 < len(cc) <= 64:
             profile['current_city'] = cc
+    # Privacy: wenn share_location explizit ausgeschaltet wird, den bereits
+    # gespeicherten current_city aktiv löschen — sonst bleibt der alte Wert im
+    # Profil liegen und könnte bei einem späteren Bug/Re-Enable wieder leaken.
+    if profile.get('share_location', True) is False:
+        profile.pop('current_city', None)
     # Disk-Payload erhält Side-Keys (subscription, crew_aircraft, …) die NICHT
     # in SB sind — lesen, profile-Subkey ersetzen, zurückschreiben. Sonst würde
     # ein PUT alles andere im disk-File zerstören.
@@ -9416,6 +9421,10 @@ def get_friends_today(token):
         except Exception:
             pr = {}
         rf = day.get('reader_facts') or {}
+        # Privacy-Gate: current_city nur ausgeben wenn der Friend share_location
+        # NICHT explizit auf False gesetzt hat (Default True). Vorher wurde
+        # current_city bedingungslos geleakt, auch bei share_location=off.
+        share_loc = pr.get('share_location', True) is not False
         out.append({
             'token': fr[:16] + '…',
             # Stabile match_id (Hash) statt vollem Token — iOS matcht Friend↔
@@ -9426,7 +9435,8 @@ def get_friends_today(token):
             'homebase': pr.get('homebase') or '',
             # GPS-reverse-geocodete Stadt (nur Stadt, nie exakte Koordinate) —
             # iOS zeigt damit die echte Layover-Location statt nur dem Airport.
-            'current_city': pr.get('current_city'),
+            # NUR wenn der Friend share_location nicht ausgeschaltet hat.
+            'current_city': pr.get('current_city') if share_loc else None,
             'klass': day.get('klass'),
             'marker': day.get('marker'),
             'routing': day.get('routing'),
@@ -15787,6 +15797,132 @@ def auth_delete_account():
         except Exception as _e:
             app.logger.warning(f'[delete] sb_manual_briefings_fail: {str(_e)[:120]}')
 
+    # 3c. DSGVO Art. 17 — vollständige Supabase-Cascade. Vorher überlebten die
+    # sensibelsten User-Daten (Steuer-Sessions, Profile, Wall/Forum/DM, Friends,
+    # Licenses, Push-Tokens, Family-Shares, Crew-Reports) den Account-Delete in
+    # SB, weil _auth_save nur upsert macht und der alte Delete nur Disk + 3 SB-
+    # Tabellen anfasste. Jeder Delete ist STRIKT token-scoped (nur Rows die DIESEM
+    # Token gehören) und best-effort (eine fehlschlagende Tabelle bricht den
+    # gesamten Delete nicht ab). Key-Spalte je Tabelle stammt aus dem jeweiligen
+    # Write-Pfad (upsert/insert) — siehe Kommentare.
+    if SB_AVAILABLE and sb is not None and token:
+        sb_deleted = {}
+        # (table, column) — column ist die im Write-Pfad genutzte Owner-Spalte.
+        _cascade = [
+            ('user_profiles',     'token'),         # upsert on_conflict='token'
+            ('wall_posts',        'author_token'),  # row['author_token']
+            ('wall_comments',     'author_token'),  # row['author_token']
+            ('wall_likes',        'user_token'),    # {'post_id','user_token'}
+            ('forum_threads',     'author_token'),  # row['author_token']
+            ('forum_replies',     'author_token'),  # row['author_token']
+            ('forum_likes',       'user_token'),    # {'user_token',...}
+            ('dm_messages',       'author_token'),  # row['author_token']
+            ('dm_lastseen',       'user_token'),    # {'user_token','channel_id'}
+            ('user_friends',      'owner_token'),   # {'owner_token','friend_token'}
+            ('user_friend_groups','owner_token'),   # {'owner_token',...}
+            ('crew_edges',        'self_token'),    # on_conflict='self_token,other_id'
+            ('briefings',         'user_token'),    # .eq('user_token', token)
+            ('ical_events',       'user_token'),    # .eq('user_token', token)
+            ('user_licenses',     'user_token'),    # .eq('user_token', token)
+            ('user_push_tokens',  'user_token'),    # on_conflict='user_token'
+            ('layover_reviews',   'user_token'),    # on_conflict='iata,user_token,category'
+            ('aircraft_health_reports', 'reported_by_token'),  # row['reported_by_token']
+            ('hotel_room_reports',      'reported_by_token'),  # row['reported_by_token']
+            ('trade_posts',             'author_token'),       # .eq('author_token', token)
+        ]
+        for _tbl, _col in _cascade:
+            try:
+                _r = sb.table(_tbl).delete().eq(_col, token).execute()
+                _n = len((_r and getattr(_r, 'data', None)) or [])
+                sb_deleted[_tbl] = _n
+            except Exception as _e:
+                app.logger.warning(f'[delete] sb_cascade_fail {_tbl}: {type(_e).__name__}: {str(_e)[:100]}')
+
+        # Friend-Edges anderer User auf diesen Token (crew_edges.other_id ist die
+        # Gegenrichtung — Rows in denen DIESER Token referenziert wird). Strikt
+        # token-scoped: eq auf den fremd-referenzierenden Wert, kein Broad-Delete.
+        try:
+            _r = sb.table('crew_edges').delete().eq('other_id', token).execute()
+            sb_deleted['crew_edges_other'] = len((_r and getattr(_r, 'data', None)) or [])
+        except Exception as _e:
+            app.logger.warning(f'[delete] sb_cascade_fail crew_edges_other: {str(_e)[:100]}')
+
+        # ── Steuer-Sessions / Jobs / Job-Chunks ──────────────────────────────
+        # Die sensibelste Tabelle: sessions.result_data (komplette Steuer-Aus-
+        # wertung). sessions ist NICHT per Auth-Token gekeyed, sondern per kurz-
+        # lebigem session_token; SB-Row trägt aber eine job_id-Spalte. Die job_ids
+        # des Users stehen in seiner History-Datei (_user_history). Wir leiten die
+        # job_ids daraus ab und löschen sessions/jobs/job_chunks STRIKT per job_id
+        # (nur Jobs die DIESER User ausgewertet hat).
+        try:
+            _hist = _user_history_load(token) or {}
+            _job_ids = []
+            for _e in (_hist.get('entries') or []):
+                _jid = _e.get('job_id') if isinstance(_e, dict) else None
+                if _jid and _jid not in _job_ids:
+                    _job_ids.append(_jid)
+            _sess_n = _jobs_n = _chunks_n = 0
+            for _jid in _job_ids:
+                try:
+                    _r = sb.table('sessions').delete().eq('job_id', _jid).execute()
+                    _sess_n += len((_r and getattr(_r, 'data', None)) or [])
+                except Exception: pass
+                try:
+                    _r = sb.table('jobs').delete().eq('job_id', _jid).execute()
+                    _jobs_n += len((_r and getattr(_r, 'data', None)) or [])
+                except Exception: pass
+                try:
+                    _r = sb.table('job_chunks').delete().eq('job_id', _jid).execute()
+                    _chunks_n += len((_r and getattr(_r, 'data', None)) or [])
+                except Exception: pass
+            if _job_ids:
+                sb_deleted['sessions'] = _sess_n
+                sb_deleted['jobs'] = _jobs_n
+                sb_deleted['job_chunks'] = _chunks_n
+        except Exception as _e:
+            app.logger.warning(f'[delete] sb_sessions_cascade_fail: {str(_e)[:120]}')
+
+        # ── Family-Shares (beide Richtungen) ─────────────────────────────────
+        # family_shares-Row: {crew_token, family_token}. Dieser Token kann als
+        # Crew (teilt) ODER als Family (empfängt) auftreten → beide Spalten.
+        try:
+            _r = sb.table('family_shares').delete().eq('crew_token', token).execute()
+            sb_deleted['family_shares_crew'] = len((_r and getattr(_r, 'data', None)) or [])
+        except Exception as _e:
+            app.logger.warning(f'[delete] sb_family_shares_crew_fail: {str(_e)[:100]}')
+        try:
+            _r = sb.table('family_shares').delete().eq('family_token', token).execute()
+            sb_deleted['family_shares_family'] = len((_r and getattr(_r, 'data', None)) or [])
+        except Exception as _e:
+            app.logger.warning(f'[delete] sb_family_shares_family_fail: {str(_e)[:100]}')
+
+        # family_scoped_tokens (KV: key=family_token, data.crew_token) +
+        # family_pair_codes (KV: key=code, data.crew_token). Beide Tabellen tragen
+        # die crew_token-Referenz IN der jsonb-`data`-Spalte → laden, eigene Keys
+        # ermitteln, einzeln per Key löschen (kein Broad-Delete).
+        for _kv_tbl, _kv_key in (('family_scoped_tokens', 'family_token'),
+                                 ('family_pair_codes', 'code')):
+            try:
+                _all = sb.table(_kv_tbl).select('*').execute()
+                _del_keys = []
+                for _row in (_all.data or []):
+                    _d = _row.get('data') or {}
+                    _k = _row.get(_kv_key)
+                    if _k and isinstance(_d, dict) and _d.get('crew_token') == token:
+                        _del_keys.append(_k)
+                for _k in _del_keys:
+                    try:
+                        sb.table(_kv_tbl).delete().eq(_kv_key, _k).execute()
+                    except Exception: pass
+                if _del_keys:
+                    sb_deleted[_kv_tbl] = len(_del_keys)
+            except Exception as _e:
+                app.logger.warning(f'[delete] sb_{_kv_tbl}_fail: {str(_e)[:100]}')
+
+        _summary = ', '.join(f'{k}={v}' for k, v in sb_deleted.items() if v)
+        app.logger.info(f'[delete] sb_cascade_done token={(token or "")[:8]} {_summary or "(no rows)"}')
+        deleted.append(f'sb_cascade:{{{_summary}}}')
+
     # 4. Forum-Threads mit diesem author_token
     try:
         threads = _forum_load_threads()
@@ -15935,8 +16071,19 @@ def auth_export_data():
     except Exception as e:
         export['_voice_notes_error'] = str(e)[:200]
 
-    # ── Briefings / iCal-Events (SB primary) ───────────────────────────
+    # ── Supabase-Quellen (DSGVO Art. 15: vollständig, SB-primary) ───────
+    # Vorher kam der Export grösstenteils von der ephemeren Disk (auf Cloud Run
+    # leer/teilweise) und LIESS die sensibelsten Daten aus: die Steuer-Sessions
+    # (sessions.result_data), DM-Nachrichten, Push-Tokens, Profil (SB-Version).
+    # Jetzt aus SB für dieselben Tabellen wie die Delete-Cascade, best-effort.
     if SB_AVAILABLE and sb is not None:
+        # Profil (SB-Version ergänzt/überschreibt die Disk-Version)
+        try:
+            r = sb.table('user_profiles').select('*').eq('token', token).execute()
+            if r.data:
+                export['profile'] = {**(export.get('profile') or {}), '_supabase': r.data}
+        except Exception:
+            pass
         try:
             r = sb.table('briefings').select('*').eq('user_token', token).execute()
             export['briefings'] = r.data or []
@@ -15958,6 +16105,81 @@ def auth_export_data():
             export['family_shares_granted'] = r.data or []
         except Exception:
             pass
+        # Family-Shares die DIESER Token als Family EMPFÄNGT
+        try:
+            r = (sb.table('family_shares').select('*')
+                 .eq('family_token', token).eq('deleted', False).execute())
+            export['family_shares_received'] = r.data or []
+        except Exception:
+            pass
+        # Wall-Posts/Comments (SB-Version, eigene)
+        try:
+            r = sb.table('wall_posts').select('*').eq('author_token', token).execute()
+            export['wall_posts_supabase'] = r.data or []
+        except Exception:
+            pass
+        try:
+            r = sb.table('wall_comments').select('*').eq('author_token', token).execute()
+            export['wall_comments_supabase'] = r.data or []
+        except Exception:
+            pass
+        # Forum (eigene Threads + Replies)
+        try:
+            r = sb.table('forum_threads').select('*').eq('author_token', token).execute()
+            export['forum_threads'] = r.data or []
+        except Exception:
+            pass
+        try:
+            r = sb.table('forum_replies').select('*').eq('author_token', token).execute()
+            export['forum_replies'] = r.data or []
+        except Exception:
+            pass
+        # Direct-Messages (eigene gesendete Nachrichten)
+        try:
+            r = sb.table('dm_messages').select('*').eq('author_token', token).execute()
+            export['dm_messages'] = r.data or []
+        except Exception:
+            pass
+        # Friends (SB-Version)
+        try:
+            r = sb.table('user_friends').select('*').eq('owner_token', token).execute()
+            export['friends_supabase'] = r.data or []
+        except Exception:
+            pass
+        # Push-Tokens
+        try:
+            r = sb.table('user_push_tokens').select('*').eq('user_token', token).execute()
+            export['push_tokens'] = r.data or []
+        except Exception:
+            pass
+        # Layover-Reviews (eigene)
+        try:
+            r = sb.table('layover_reviews').select('*').eq('user_token', token).execute()
+            export['layover_reviews'] = r.data or []
+        except Exception:
+            pass
+        # ── Steuer-Sessions (DAS sensibelste Datum: result_data) ─────────
+        # sessions ist per session_token gekeyed; die job_ids des Users stehen in
+        # seiner History. Wir exportieren die kompletten Session-Rows (inkl.
+        # result_data) für jede eigene job_id.
+        try:
+            hist = _user_history_load(token) or {}
+            job_ids = []
+            for e in (hist.get('entries') or []):
+                jid = e.get('job_id') if isinstance(e, dict) else None
+                if jid and jid not in job_ids:
+                    job_ids.append(jid)
+            tax_sessions = []
+            for jid in job_ids:
+                try:
+                    r = sb.table('sessions').select('*').eq('job_id', jid).execute()
+                    tax_sessions.extend(r.data or [])
+                except Exception:
+                    pass
+            export['tax_sessions'] = tax_sessions
+            export['tax_history'] = hist.get('entries') or []
+        except Exception as e:
+            export['_tax_sessions_error'] = str(e)[:200]
 
     # JSON-Response mit attachment-Header (iOS speichert als File)
     today_str = datetime.now().date().isoformat()
