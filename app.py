@@ -8399,10 +8399,10 @@ def put_user_profile(token):
         cc = body.get('current_city')
         if isinstance(cc, str) and 0 < len(cc) <= 64:
             profile['current_city'] = cc
-    # Privacy: wenn share_location explizit ausgeschaltet wird, den bereits
-    # gespeicherten current_city aktiv löschen — sonst bleibt der alte Wert im
-    # Profil liegen und könnte bei einem späteren Bug/Re-Enable wieder leaken.
-    if profile.get('share_location', True) is False:
+    # Privacy: current_city NUR löschen wenn share_location in DIESEM Request
+    # explizit auf False gesetzt wird — nicht bei jedem PUT bei dem der gespeicherte
+    # Wert zufällig False ist (das würde city bei jedem name-/employer-PUT löschen).
+    if 'share_location' in body and body.get('share_location') is False:
         profile.pop('current_city', None)
     # Disk-Payload erhält Side-Keys (subscription, crew_aircraft, …) die NICHT
     # in SB sind — lesen, profile-Subkey ersetzen, zurückschreiben. Sonst würde
@@ -17265,12 +17265,15 @@ def _merge_into_delay_store(flights, date_str):
         sched = f.get('sched') or ''
         if not fn or not sched:
             continue
-        key = (date_str, fn, sched[:5])
+        # sched ist ISO: '2026-06-06T14:30:00' → [11:16] = 'HH:MM' als Diskriminator.
+        # NICHT [:5] — das würde '2026-' liefern und alle Flüge desselben Tages kollidierten.
+        hhmm = sched[11:16] if len(sched) >= 16 else sched
+        key = (date_str, fn, hhmm)
         delay = f.get('delay_min') or 0
         if delay and delay > 0:
             _delay_store[key] = max(_delay_store.get(key, 0), delay)
         if f.get('cancelled'):
-            _delay_store[(date_str, fn, sched[:5] + '_cancelled')] = 1
+            _delay_store[(date_str, fn, hhmm + '_cancelled')] = 1
 
 
 def _punctuality_stats(flights):
@@ -17306,7 +17309,8 @@ def _punctuality_stats(flights):
     # Store-basierte Nachhol-Zählung: Flüge die aus der Tafel verschwunden sind
     # (departed) behalten ihr Urteil. Nur addieren was NICHT schon in completed ist.
     if today:
-        known_keys = {(today, (f.get('flight') or ''), (f.get('sched') or '')[:5]) for f in completed}
+        def _hhmm(s): return s[11:16] if s and len(s) >= 16 else s
+        known_keys = {(today, (f.get('flight') or ''), _hhmm(f.get('sched') or '')) for f in completed}
         for (d, fn, sc), max_delay in list(_delay_store.items()):
             if sc.endswith('_cancelled'):
                 continue  # cancelled separat
@@ -20848,8 +20852,11 @@ def _parse_se_lines_deterministic(all_se_text):
 def lh_abwesenheitsgeld(days: int, hours: int, region: str = 'de_eu') -> float:
     """LH-Tarif Abwesenheitsgeld (Stand 01.01.2023).
     region: 'de_eu' (Deutschland+Europa, 4.20€/h) oder 'ausland' (4.80€/h).
-    Formel: (days * 12 + hours) * rate — linear pro Stunde, max 15 Tage × 12h Tabelle."""
+    Formel: (days * 12 + hours) * rate — linear pro Stunde, max 15 Tage × 12h Tabelle.
+    hours wird auf [0, 12] geclampt — laut Tarif max 12 Stunden pro Einheit."""
     rate = 4.80 if region == 'ausland' else 4.20
+    hours = max(0, min(12, int(hours)))
+    days = max(0, int(days))
     return round((days * 12 + hours) * rate, 2)
 
 
