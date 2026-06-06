@@ -397,7 +397,53 @@ def _scoped_tokens_disk_path():
     return os.path.join(hist, 'family_scoped_tokens.json')
 
 
-def _pair_codes_load():
+# --- SB-Persistenz für Pair-Codes + Scoped-Tokens (#31) ------------------------
+# Vorher waren beide NUR auf Disk → auf Cloud Run (ephemer, multi-instance, bei
+# jedem Deploy gewiped) verloren sich Pair-Codes (Redeem schlug fehl) und
+# Scoped-Family-Tokens (Family-Watcher sah „seinen" Plan nicht mehr). Jetzt
+# SB-primary mit Disk-Fallback. SICHER: existieren die SB-Tabellen noch nicht
+# (User hat PASTE_ME_IN_SUPABASE.sql noch nicht ausgeführt), werfen die SB-Calls
+# → None/False → es bleibt beim bisherigen Disk-Verhalten (keine Regression).
+# `data` ist ein jsonb-Blob (der komplette Record), Key ist code bzw. family_token.
+def _kv_load_from_sb(table, key_col):
+    sb_avail, sb = _get_sb()
+    if not sb_avail or sb is None:
+        return None
+    try:
+        out = {}
+        r = sb.table(table).select('*').execute()
+        for row in (r.data or []):
+            k = row.get(key_col)
+            if k:
+                out[k] = row.get('data') or {}
+        return out
+    except Exception as e:
+        _log().warning(f'[family-kv] {table} sb_load_fail {type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _kv_save_to_sb(table, key_col, data):
+    """Reconciliert SB exakt auf `data` (kleine Tabellen): entfernte Keys löschen,
+    vorhandene upserten. So propagieren auch Deletes (z.B. eingelöster Pair-Code)."""
+    sb_avail, sb = _get_sb()
+    if not sb_avail or sb is None:
+        return False
+    try:
+        new_keys = {k for k in (data or {}).keys() if k}
+        existing = sb.table(table).select(key_col).execute()
+        existing_keys = {row.get(key_col) for row in (existing.data or []) if row.get(key_col)}
+        for rk in (existing_keys - new_keys):
+            sb.table(table).delete().eq(key_col, rk).execute()
+        rows = [{key_col: k, 'data': v} for k, v in (data or {}).items() if k]
+        for i in range(0, len(rows), 500):
+            sb.table(table).upsert(rows[i:i+500], on_conflict=key_col).execute()
+        return True
+    except Exception as e:
+        _log().warning(f'[family-kv] {table} sb_save_fail {type(e).__name__}: {str(e)[:160]}')
+        return False
+
+
+def _pair_codes_load_from_disk():
     p = _pair_codes_disk_path()
     if not os.path.exists(p):
         return {}
@@ -408,16 +454,27 @@ def _pair_codes_load():
         return {}
 
 
+def _pair_codes_load():
+    sb = _kv_load_from_sb('family_pair_codes', 'code')
+    disk = _pair_codes_load_from_disk()
+    if sb is None:
+        return disk
+    merged = dict(disk); merged.update(sb)   # SB-primary
+    return merged
+
+
 def _pair_codes_save(codes):
+    sb_ok = _kv_save_to_sb('family_pair_codes', 'code', codes)
+    disk_ok = False
     try:
         _atomic_write_json(_pair_codes_disk_path(), codes)
-        return True
+        disk_ok = True
     except Exception as e:
         _log().warning(f'[family-pair] codes_save_fail {e}')
-        return False
+    return bool(sb_ok or disk_ok)
 
 
-def _scoped_tokens_load():
+def _scoped_tokens_load_from_disk():
     p = _scoped_tokens_disk_path()
     if not os.path.exists(p):
         return {}
@@ -428,13 +485,24 @@ def _scoped_tokens_load():
         return {}
 
 
+def _scoped_tokens_load():
+    sb = _kv_load_from_sb('family_scoped_tokens', 'family_token')
+    disk = _scoped_tokens_load_from_disk()
+    if sb is None:
+        return disk
+    merged = dict(disk); merged.update(sb)   # SB-primary
+    return merged
+
+
 def _scoped_tokens_save(toks):
+    sb_ok = _kv_save_to_sb('family_scoped_tokens', 'family_token', toks)
+    disk_ok = False
     try:
         _atomic_write_json(_scoped_tokens_disk_path(), toks)
-        return True
+        disk_ok = True
     except Exception as e:
         _log().warning(f'[family-pair] scoped_save_fail {e}')
-        return False
+    return bool(sb_ok or disk_ok)
 
 
 def _scoped_token_crew(family_token):

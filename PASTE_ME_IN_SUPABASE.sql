@@ -742,3 +742,17 @@ create index if not exists idx_aircraft_info_fetched_at
 -- Service-Role-Key umgeht RLS. Anon-Client bleibt geblockt (Cache wird
 -- nur via Blueprint-Endpoint befüllt, nie direkt vom Client).
 alter table public.aircraft_info_cache enable row level security;
+
+-- #31 Family pairing persistence (vorher Disk-only → auf Cloud Run verloren).
+-- Pair-Codes (kurzlebig, 30min TTL) + Scoped-Family-Tokens (AT-FAM-…, langlebig).
+-- `data` = kompletter Record als jsonb. Idempotent.
+create table if not exists public.family_pair_codes (
+  code        text primary key,
+  data        jsonb not null default '{}'::jsonb,
+  created_at  timestamptz default now()
+);
+create table if not exists public.family_scoped_tokens (
+  family_token text primary key,
+  data         jsonb not null default '{}'::jsonb,
+  created_at   timestamptz default now()
+);
