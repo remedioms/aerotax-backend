@@ -16678,6 +16678,7 @@ def _fetch_opensky_board(icao, flight_type='departure'):
 #   FMO → fmo.de/en/arrival-departure/ (server-rendered HTML)
 #   LEJ → mdf-ag.com/.../leipzig-halle-airport/.../departures-arrivals/ (HTML, dep+arr in einer Page)
 #   DRS → mdf-ag.com/.../dresden-airport/.../departures-arrivals/ (gleiches Vendor-Template)
+#   BER → ber.berlin-airport.de/api.flights.json (JSON, AEM-Sling-Selector, Browser-Header gg. CloudFront-403)
 
 _BOARD_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
              '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -17163,56 +17164,115 @@ def _ham_board(flight_type='departure'):
 
 
 def _ber_board(flight_type='departure'):
-    """BER — Berlin Brandenburg Airport JSON-API. Needs curl-verify."""
+    """BER — Berlin Brandenburg Airport (ber.berlin-airport.de).
+
+    Datenquelle (reverse-engineered, LIVE verifiziert 2026-06-06):
+      GET https://ber.berlin-airport.de/api.flights.json
+          ?arrivalDeparture={D|A}
+          &dateFrom=YYYY-MM-DDT00:00:00
+          &dateUntil=YYYY-MM-DD            (Folgetag)
+          &search=&lang=EN&page=1&terminal=&itemsPerPage=100
+    Die Seite /en/flying/departures-arrivals.html fetcht genau diese AEM-Sling-
+    Selector-JSON (apiUrl = "/api.flights.json" im clientlib-base-Bundle). CloudFront
+    blockt ohne Browser-Header (403) → Referer + Sec-Fetch-* + Accept-Language mit.
+    Response: {"data":{"updated_at":..., "items":[ {flight…} ]}}.
+
+    Feld-Mapping (aus dem JS-Renderer, je Richtung):
+      flight_number, airline_code, airline_name
+      Abflug (D): arr_airport_iata/_name = Ziel,  gate, checkin_counter, dep_estimated_time
+      Ankunft (A): dep_airport_iata/_name = Herkunft, arr_belt, arr_exit, arr_estimated_time
+      scheduled_time (richtungsabhängig), terminal, flight_status_label/_id,
+      aircraft_type, aircraft_reg.
+    Status-Beispiele: 'Departed'/'departed', 'Arrived'/'arrived', i.d.R. auch
+    'Cancelled'/'cancelled' (BER liefert flight_status_label als Klartext)."""
     try:
         import requests
-        from datetime import datetime, timezone, timedelta
+        from datetime import timedelta
+        import re as _re
     except Exception:
         return None
     arr = (flight_type == 'arrival')
     try:
-        day = _fra_local_now().strftime('%Y-%m-%d')
+        now = _fra_local_now()
+        day = now.strftime('%Y-%m-%d')
+        tomorrow = (now + timedelta(days=1)).strftime('%Y-%m-%d')
     except Exception:
-        day = None
-    url = ('https://www.berlin-airport.de/en/travellers-ber/flights/'
-           + ('arrivals' if arr else 'departures') + '/index.php')
+        return None
+    url = 'https://ber.berlin-airport.de/api.flights.json'
+    headers = {
+        'User-Agent': _BOARD_UA,
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9,de;q=0.8',
+        'Referer': 'https://ber.berlin-airport.de/en/flying/departures-arrivals.html',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Dest': 'empty',
+    }
+    params = {
+        'arrivalDeparture': 'A' if arr else 'D',
+        'dateFrom': day + 'T00:00:00',
+        'dateUntil': tomorrow,
+        'search': '',
+        'lang': 'EN',
+        'page': 1,
+        'terminal': '',
+        'itemsPerPage': 100,
+    }
     try:
-        r = requests.get(url,
-                         params={'date': day} if day else {},
-                         headers={'User-Agent': _BOARD_UA,
-                                  'Accept': 'application/json, text/html, */*',
-                                  'X-Requested-With': 'XMLHttpRequest'},
-                         timeout=14)
+        r = requests.get(url, params=params, headers=headers, timeout=14)
         if r.status_code != 200:
             return None
-        try:
-            data = r.json()
-            flights = data.get('flights') or data.get('data') or []
-        except Exception:
-            flights = []
+        data = (r.json() or {}).get('data') or {}
+        flights = data.get('items') or []
     except Exception:
         return None
     if not flights:
         return None
+
+    def _strip_iata_suffix(name, iata):
+        # BER hängt manchmal den Code an den Stadtnamen ('Izmir ADB').
+        s = (name or '').strip()
+        if iata and s.upper().endswith(' ' + iata.upper()):
+            s = s[: -(len(iata) + 1)].strip()
+        return s
+
     out = []
     for f in flights:
         try:
             row = _empty_board_row()
-            row['flight'] = (f.get('flightNumber') or f.get('flight_number') or '').strip().upper()
-            row['airline'] = row['flight'][:2] if len(row['flight']) >= 2 else ''
-            dest = f.get('destination') or f.get('origin') or {}
-            if isinstance(dest, dict):
-                row['dest_iata'] = (dest.get('iata') or dest.get('code') or '').upper()
-                row['dest_name'] = dest.get('city') or dest.get('name') or ''
-            sched = f.get('scheduledTime') or f.get('scheduled') or ''
-            esti = f.get('estimatedTime') or f.get('estimated') or f.get('actualTime') or ''
-            if sched and day:
-                row['sched'] = (day + 'T' + sched + ':00') if len(sched) == 5 else sched
-            if esti and day:
-                row['esti'] = (day + 'T' + esti + ':00') if len(esti) == 5 else esti
-            row['status'] = f.get('status') or f.get('statusText') or ''
+            row['flight'] = _re.sub(r'\s+', ' ', (f.get('flight_number') or '').strip()).upper()
+            row['airline'] = (f.get('airline_code') or '').strip().upper()
+            row['airline_name'] = (f.get('airline_name') or '').strip()
+            if not row['airline'] and row['flight']:
+                row['airline'] = (row['flight'].split(' ')[0] or '')[:3]
+            if arr:
+                # Bei Ankunft = HERKUNFT.
+                other_iata = (f.get('dep_airport_iata') or '').strip().upper()
+                other_name = f.get('dep_airport_name')
+                row['gate'] = (f.get('arr_belt') or '').strip()      # Gepäckband
+                row['hall'] = (f.get('arr_exit') or '').strip()      # Ausgang
+                esti = f.get('arr_estimated_time')
+            else:
+                other_iata = (f.get('arr_airport_iata') or '').strip().upper()
+                other_name = f.get('arr_airport_name')
+                row['gate'] = (f.get('gate') or '').strip()
+                row['hall'] = (f.get('checkin_counter') or '').strip()
+                esti = f.get('dep_estimated_time')
+            row['dest_iata'] = other_iata
+            row['dest_name'] = _clean_city_name(_strip_iata_suffix(other_name, other_iata), other_iata)
+            row['sched'] = f.get('scheduled_time') or None
+            if esti and esti != row['sched']:
+                row['esti'] = esti
+            row['terminal'] = (f.get('terminal') or '').strip()
+            row['status'] = (f.get('flight_status_label') or f.get('flight_status_id') or '').strip()
+            row['aircraft'] = (f.get('aircraft_type') or '').strip()
+            row['reg'] = (f.get('aircraft_reg') or '').strip()
             row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
-            row['delayed'] = row['delay_min'] >= 5
+            sid = (f.get('flight_status_id') or '').lower()
+            cancelled = ('cancel' in sid or 'cancel' in row['status'].lower()
+                         or 'annul' in row['status'].lower())
+            row['delayed'] = (row['delay_min'] >= 5) and not cancelled
             if row['flight'] or row['dest_iata']:
                 out.append(row)
         except Exception:
