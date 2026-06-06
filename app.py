@@ -17595,22 +17595,26 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport, 
             f'[delay-obs] sb_write_skip {type(e).__name__}: {str(e)[:100]}')
 
 
-def _delay_store_load_from_sb(date_str):
+def _delay_store_load_from_sb(date_str, airport='FRA'):
     """Lädt die heutigen Delay-Beobachtungen aus airport_delay_obs zurück in den
-    In-Memory-Store (einmal pro Betriebstag). Damit überlebt die Tages-Stichprobe
-    einen Cloud-Run-Restart und wächst cross-instance. Degradiert still wenn SB
-    down ist oder die Tabelle fehlt — dann bleibt nur die in-memory-Sicht."""
+    In-Memory-Store (einmal pro Betriebstag UND Airport). Damit überlebt die
+    Tages-Stichprobe einen Cloud-Run-Restart und wächst cross-instance. Degradiert
+    still wenn SB down ist oder die Tabelle fehlt — dann bleibt nur die
+    in-memory-Sicht. Store-Keys sind airport-gekeyt, damit MUC/BER/FRA sich nicht
+    gegenseitig kontaminieren."""
     global _delay_store_sb_loaded_date
     if not SB_AVAILABLE or sb is None:
         return
-    if _delay_store_sb_loaded_date == date_str:
-        return  # heute schon geladen
+    airport = (airport or 'FRA').upper()
+    load_marker = date_str + '|' + airport
+    if _delay_store_sb_loaded_date == load_marker:
+        return  # heute+airport schon geladen
     try:
         offset = 0
         page = 1000
         while True:
             r = (sb.table('airport_delay_obs').select('*')
-                 .eq('date', date_str)
+                 .eq('date', date_str).eq('airport', airport)
                  .range(offset, offset + page - 1).execute())
             rows = r.data or []
             for row in rows:
@@ -17618,16 +17622,22 @@ def _delay_store_load_from_sb(date_str):
                 hhmm = row.get('sched') or ''
                 if not fn or not hhmm:
                     continue
-                key = (date_str, fn, hhmm)
+                key = (date_str, airport, fn, hhmm)
                 md = int(row.get('max_delay_min') or 0)
+                cxl = bool(row.get('cancelled'))
                 if md > 0:
                     _delay_store[key] = max(_delay_store.get(key, 0), md)
-                if row.get('cancelled'):
-                    _delay_store[(date_str, fn, hhmm + '_cancelled')] = 1
+                elif not cxl:
+                    # On-Time-Beobachtung (delay 0) ebenfalls in den Store laden, damit
+                    # ein leeres Live-Board die volle Tages-Stichprobe behält und nicht
+                    # nur die verspäteten Flüge zurückbekommt (sonst Quote zu pessimistisch).
+                    _delay_store.setdefault(key, 0)
+                if cxl:
+                    _delay_store[(date_str, airport, fn, hhmm + '_cancelled')] = 1
             if len(rows) < page:
                 break
             offset += page
-        _delay_store_sb_loaded_date = date_str
+        _delay_store_sb_loaded_date = load_marker
     except Exception as e:
         app.logger.info(
             f'[delay-obs] sb_load_skip {type(e).__name__}: {str(e)[:100]}')
@@ -17641,6 +17651,7 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
     SB-down/Tabelle-fehlt → still degrade auf rein-in-memory."""
     global _delay_store, _delay_store_date, _delay_store_cancelled
     global _delay_store_sb_loaded_date
+    airport = (airport or 'FRA').upper()
     if _delay_store_date != date_str:
         _delay_store.clear()
         _delay_store_cancelled.clear()
@@ -17648,9 +17659,13 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
         # Tagesrollover → SB-Load-Marker zurücksetzen, damit der neue Tag seine
         # (ggf. von anderen Instanzen bereits geschriebenen) Beobachtungen lädt.
         _delay_store_sb_loaded_date = ''
-    # Beim ersten Merge eines neuen Tages: vorhandene SB-Beobachtungen
+    # Beim ersten Merge eines neuen Tages+Airports: vorhandene SB-Beobachtungen
     # zurückladen (cross-instance Akkumulation), bevor wir die neuen mergen.
-    _delay_store_load_from_sb(date_str)
+    _delay_store_load_from_sb(date_str, airport)
+    try:
+        now_local = _fra_local_now()
+    except Exception:
+        now_local = None
     for f in (flights or []):
         fn = f.get('flight') or f.get('flightNumber') or ''
         sched = f.get('sched') or ''
@@ -17659,22 +17674,33 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
         # sched ist ISO: '2026-06-06T14:30:00' → [11:16] = 'HH:MM' als Diskriminator.
         # NICHT [:5] — das würde '2026-' liefern und alle Flüge desselben Tages kollidierten.
         hhmm = sched[11:16] if len(sched) >= 16 else sched
-        key = (date_str, fn, hhmm)
+        key = (date_str, airport, fn, hhmm)
         delay = f.get('delay_min') or 0
         cancelled = bool(f.get('cancelled'))
+        # Nur bereits abgeflogene Flüge sind echte Tages-Beobachtungen. Zukunft NICHT
+        # persistieren — sonst zählte ein leeres Live-Board sie später fälschlich als
+        # on-time. (now_local None → defensiv alles aufnehmen, wie zuvor.)
+        passed = (now_local is None) or _flight_sched_passed(f, now_local)
         changed = False
         if delay and delay > 0:
             prev = _delay_store.get(key, 0)
             if delay > prev:
                 _delay_store[key] = delay
                 changed = True
+        elif passed and not cancelled and key not in _delay_store:
+            # On-Time-Beobachtung eines abgeflogenen Fluges festhalten (delay 0).
+            # WICHTIG für Task: damit ein temporär leeres Live-Board die volle
+            # Tages-Stichprobe behält, nicht nur die verspäteten/annullierten Flüge.
+            # Nur reale, abgeschlossene Flüge — keine Erfindung.
+            _delay_store[key] = 0
+            changed = True
         if cancelled:
-            _delay_store[(date_str, fn, hhmm + '_cancelled')] = 1
+            _delay_store[(date_str, airport, fn, hhmm + '_cancelled')] = 1
             if not _delay_store_cancelled.get(key):
                 _delay_store_cancelled[key] = True
                 changed = True
-        # Write-Through nur bei tatsächlicher Änderung (max gewachsen oder neu
-        # cancelled) → wir hämmern die SB-Tabelle nicht pro Board-Rebuild voll.
+        # Write-Through nur bei tatsächlicher Änderung (max gewachsen, neu on-time
+        # oder neu cancelled) → wir hämmern die SB-Tabelle nicht pro Board-Rebuild voll.
         if changed:
             _delay_obs_write_through(
                 date_str, fn, hhmm, _delay_store.get(key, 0),
@@ -17682,7 +17708,7 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
                 airport, f.get('status'))
 
 
-def _punctuality_stats(flights):
+def _punctuality_stats(flights, airport='FRA'):
     """Aggregiert on-time/delayed/cancelled über eine TAGES-Flugliste.
 
     STABILITÄTS-FIX: Die Quote basiert NUR auf Flügen, deren geplante Zeit bereits
@@ -17690,7 +17716,12 @@ def _punctuality_stats(flights):
     abgeflogene Flüge (Zukunft im selben Tag) werden NICHT als 'on time' gezählt.
     Dadurch springt die Zahl beim Neu-Laden (09:00 vs 09:05) nicht mehr, sie wächst
     nur, wenn weitere Flüge tatsächlich abfliegen. Das Tages-Fenster selbst ist in
-    `_fra_day_board_cached` ab 05:00 Ortszeit fixiert."""
+    `_fra_day_board_cached` ab 05:00 Ortszeit fixiert.
+
+    `airport` keyt den Delay-Store und die SB-Persistenz, damit MUC/BER/HAJ ihre
+    eigene Tages-Stichprobe akkumulieren (keine FRA-Kontamination) und genauso wie
+    FRA cross-restart/cross-instance über airport_delay_obs wachsen."""
+    airport = (airport or 'FRA').upper()
     # Tages-Datum ermitteln und Delay-Store mergen. Load-on-Read: vorhandene
     # SB-Beobachtungen (airport_delay_obs) für heute zurückholen, damit die
     # Tages-Stichprobe einen Restart/Instanz-Wechsel überlebt — auch wenn die
@@ -17700,10 +17731,10 @@ def _punctuality_stats(flights):
         today = _fra_local_now().strftime('%Y-%m-%d')
         # merge handhabt Rollover (clear) UND lädt vorhandene SB-Beobachtungen
         # zurück bevor es die neue Flugliste mergt.
-        _merge_into_delay_store(flights, today)
+        _merge_into_delay_store(flights, today, airport)
         # Defensiv: falls flights leer war (Quelle down) und der Store für heute
         # noch nie initialisiert wurde, trotzdem aus SB nachladen.
-        _delay_store_load_from_sb(today)
+        _delay_store_load_from_sb(today, airport)
     except Exception:
         today = ''
     now_local = _fra_local_now()
@@ -17723,15 +17754,17 @@ def _punctuality_stats(flights):
         avg_delay = round(sum(delay_vals) / len(delay_vals))
     # Store-basierte Nachhol-Zählung: Flüge die aus der Tafel verschwunden sind
     # (departed) behalten ihr Urteil. Nur addieren was NICHT schon in completed ist.
+    # Store-Keys sind airport-gekeyt — wir zählen NUR die heutigen Beobachtungen
+    # DIESES Airports, sonst würden MUC-Flüge in eine FRA-Quote einsickern.
     if today:
         def _hhmm(s): return s[11:16] if s and len(s) >= 16 else s
-        known_keys = {(today, (f.get('flight') or ''), _hhmm(f.get('sched') or '')) for f in completed}
-        for (d, fn, sc), max_delay in list(_delay_store.items()):
+        known_keys = {(today, airport, (f.get('flight') or ''), _hhmm(f.get('sched') or '')) for f in completed}
+        for (d, ap, fn, sc), max_delay in list(_delay_store.items()):
             if sc.endswith('_cancelled'):
                 continue  # cancelled separat
-            if d != today:
+            if d != today or ap != airport:
                 continue
-            if (today, fn, sc) in known_keys:
+            if (today, airport, fn, sc) in known_keys:
                 continue  # schon oben gezählt
             # Dieser Flug hat geheilt — sein gespeichertes Max zurückholen.
             total += 1
@@ -17926,8 +17959,13 @@ def airport_punctuality(token):
             rows, src = _native_board_cached(airport, 'departure') or (None, None)
             if rows:
                 al_rows = [f for f in rows if (f.get('airline') or '').upper() == airline]
-                stats = _punctuality_stats(al_rows if al_rows else rows)
-                all_stats = _punctuality_stats(rows)
+                # Gleicher Weg wie FRA: airport-gekeyter Delay-Store + SB-Persistenz
+                # (airport_delay_obs) + data_incomplete/sample_size-Guard. So
+                # akkumuliert MUC/BER/HAJ ihre Tages-Stichprobe ehrlich übers Tages-
+                # fenster — und zeigt bei kleiner Stichprobe "Daten unvollständig"
+                # statt einer irreführenden 100%-Quote.
+                stats = _punctuality_stats(al_rows if al_rows else rows, airport)
+                all_stats = _punctuality_stats(rows, airport)
                 from collections import Counter as _Ctr
                 dest_counter = _Ctr((f.get('dest_iata') or '') for f in al_rows if f.get('dest_iata'))
                 busiest = [{'dest_iata': d, 'dest_name': _dest_name_for(al_rows, d), 'count': c}
@@ -17945,14 +17983,28 @@ def airport_punctuality(token):
                        'source': src or 'native_board', 'scope': 'heute_tages_tafel',
                        'ticker': ticker, 'cancellations': cancels, 'busiest_routes': busiest,
                        'all_airlines': all_stats}
-                out.update(stats)
+                out.update(stats)   # ...+sample_size/data_incomplete (gleicher Guard wie FRA)
+                if stats.get('data_incomplete'):
+                    out['note'] = ('Erst ' + str(stats.get('sample_size') or 0) + ' '
+                                   + airline + '-Abflüge heute ab ' + airport
+                                   + ' abgeschlossen — zu wenig für eine belastbare '
+                                   'Pünktlichkeits-Quote. Die Statistik wächst im '
+                                   'Tagesverlauf.')
                 return jsonify(out)
         # Schritt 2: AeroDataBox (RapidAPI, env-gated, aggressiv gecacht). Ohne Key
         # degradieren wir ehrlich — KEINE FRA-Zahlen unter fremdem Label.
         adb = _aerodatabox_punctuality(airport, airline)
         if adb is None:
             import os as _os
-            if not _os.environ.get('AERODATABOX_KEY'):
+            if airport == 'BER':
+                # BER hat einen nativen Scraper, aber dessen Endpoint ist unverifiziert
+                # (oft leer) — wenn er nichts liefert und kein AeroDataBox-Key da ist,
+                # ehrlich sagen statt eine fremde Quelle unter BER-Label zu zeigen.
+                note = ('Vollständige Tafel für BER noch nicht verfügbar — der native '
+                        'Feed liefert aktuell keine belastbaren Daten'
+                        + ('' if _os.environ.get('AERODATABOX_KEY')
+                           else ' und es ist kein AeroDataBox-Key hinterlegt') + '.')
+            elif not _os.environ.get('AERODATABOX_KEY'):
                 note = ('Pünktlichkeits-Daten für ' + airport
                         + ' brauchen einen AeroDataBox-Key (nur FRA ist gratis verfügbar).')
             else:
