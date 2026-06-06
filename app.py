@@ -17681,7 +17681,7 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport, 
             'cancelled': bool(cancelled),
             'status': (status or None),
             'updated_at': datetime.now(timezone.utc).isoformat(),
-        }, on_conflict='date,flight,sched').execute()
+        }, on_conflict='date,airport,flight,sched').execute()
     except Exception as e:
         # Tabelle fehlt / SB down → ehrlich nur in-memory weiter, kein Crash.
         app.logger.info(
