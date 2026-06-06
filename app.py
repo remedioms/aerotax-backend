@@ -8324,6 +8324,11 @@ def _user_profile_path(token):
 _PROFILE_KNOWN_COLS = {
     'name', 'homebase', 'position', 'airline', 'hometown',
     'share_roster', 'employers',
+    # Home-Address (2026-06-06): Commute-Distance / Smart-Pickup. Vorher
+    # on-device-only → bei Re-Install verloren. Echte Top-Level-Spalten
+    # (siehe Migration 20260606_home_address.sql), nicht metadata-jsonb.
+    'home_address', 'home_latitude', 'home_longitude',
+    'home_transport_mode', 'home_geocoded',
 }
 
 
@@ -8537,6 +8542,34 @@ def put_user_profile(token):
     if ('share_location' in body and body.get('share_location') is False) or \
        (stored_share_loc is False and 'current_city' in body):
         profile.pop('current_city', None)
+    # Home-Address (2026-06-06): Commute-Distance / Smart-Pickup. Felder kommen
+    # partiell — nur die im Body vorhandenen überschreiben (MERGE-Semantik wie
+    # oben). Floats + bool defensiv casten, damit ein iOS-Tippfehler/None kein
+    # 500 auslöst (ungültige Zahl → Feld wird übersprungen, nicht gespeichert).
+    if 'home_address' in body:
+        ha = body.get('home_address')
+        if isinstance(ha, str) and 0 < len(ha) <= 256:
+            profile['home_address'] = ha
+        elif ha in (None, ''):
+            profile.pop('home_address', None)
+    for _coord_key in ('home_latitude', 'home_longitude'):
+        if _coord_key in body:
+            cv = body.get(_coord_key)
+            if cv is None or cv == '':
+                profile.pop(_coord_key, None)
+            else:
+                try:
+                    profile[_coord_key] = float(cv)
+                except (TypeError, ValueError):
+                    pass  # ungültige Koordinate → still überspringen
+    if 'home_transport_mode' in body:
+        tm = body.get('home_transport_mode')
+        if isinstance(tm, str) and 0 < len(tm) <= 32:
+            profile['home_transport_mode'] = tm
+        elif tm in (None, ''):
+            profile.pop('home_transport_mode', None)
+    if 'home_geocoded' in body:
+        profile['home_geocoded'] = bool(body.get('home_geocoded'))
     # Disk-Payload erhält Side-Keys (subscription, crew_aircraft, …) die NICHT
     # in SB sind — lesen, profile-Subkey ersetzen, zurückschreiben. Sonst würde
     # ein PUT alles andere im disk-File zerstören.

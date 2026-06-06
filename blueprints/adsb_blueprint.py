@@ -35,9 +35,153 @@ import threading
 import urllib.parse
 import urllib.request
 import urllib.error
-from flask import Blueprint, request, jsonify
+from datetime import datetime, timezone, timedelta
+from flask import Blueprint, request, jsonify, current_app
 
 adsb_bp = Blueprint('adsb', __name__)
+
+# ── Supabase-Anbindung (lazy-resolve wie aircraft_health_blueprint) ──
+# Persistiert die letzte bekannte Aircraft-Position pro Registration als
+# Fallback, wenn Live-ADS-B (OpenSky/adsb.lol) gerade nichts liefert.
+try:
+    from app import sb as _sb, SB_AVAILABLE as _SB_AVAILABLE
+except ImportError:
+    _sb = None
+    _SB_AVAILABLE = False
+
+# Fallback-Position gilt 24h als brauchbar — danach ist sie zu alt um sie
+# der Crew als "letzte bekannte Position" zu zeigen.
+_FALLBACK_TTL_SECONDS = 24 * 3600
+
+
+def _sb_client():
+    """Lazy re-resolve, damit init-Order zwischen app.py und Blueprint egal ist."""
+    global _sb, _SB_AVAILABLE
+    if _sb is not None and _SB_AVAILABLE:
+        return _sb, True
+    try:
+        from app import sb as live_sb, SB_AVAILABLE as live_av
+        _sb = live_sb
+        _SB_AVAILABLE = bool(live_av)
+        return _sb, _SB_AVAILABLE
+    except ImportError:
+        return None, False
+
+
+def _normalize_registration(raw):
+    """Reg-Normalisierung: uppercase, strip. None bei leer/zu kurz."""
+    if not raw or not isinstance(raw, str):
+        return None
+    reg = raw.strip().upper()
+    if len(reg) < 2 or len(reg) > 12:
+        return None
+    return reg
+
+
+def _coerce_float(v):
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _persist_position_row(row):
+    """Upsert einer aircraft_positions-Row (keyed on registration).
+    Returns True bei Erfolg, False bei SB-down/Fehler."""
+    sb, ok = _sb_client()
+    if not ok:
+        return False
+    try:
+        sb.table('aircraft_positions').upsert(
+            row, on_conflict='registration').execute()
+        return True
+    except Exception as e:
+        try:
+            current_app.logger.warning(
+                f'[adsb] persist_position_fail reg={row.get("registration", "?")} '
+                f'err={type(e).__name__}: {str(e)[:120]}'
+            )
+        except Exception:
+            pass
+        return False
+
+
+def _warm_persist_from_opensky_row(hex_id, opensky_row, source):
+    """Best-effort: schreibt eine frisch gefetchte Live-Position in
+    aircraft_positions, damit die Tabelle auch ohne iOS-POST warm bleibt.
+    Wird im Live-Fetch-Pfad aufgerufen und darf NIE die Live-Response brechen
+    (alles in try/except).
+
+    OpenSky-State-Row-Layout (siehe _fetch_adsb_lol):
+      [0] icao24, [1] callsign, [5] lon, [6] lat, [7] baro_altitude_m,
+      [8] on_ground, [9] velocity_m_s, [10] true_track, [14] squawk,
+      [3] time_position (unix).
+    """
+    try:
+        if not opensky_row or not isinstance(opensky_row, (list, tuple)):
+            return
+        lat = _coerce_float(opensky_row[6]) if len(opensky_row) > 6 else None
+        lon = _coerce_float(opensky_row[5]) if len(opensky_row) > 5 else None
+        if lat is None or lon is None:
+            return  # keine Position → nicht persistieren
+        # Reg aus dem Row (adsb.lol legt sie in [2]) oder inverse aus Hex-Map.
+        reg = None
+        if len(opensky_row) > 2 and isinstance(opensky_row[2], str):
+            cand = opensky_row[2].strip().upper()
+            # adsb.lol nutzt [2] als Reg; OpenSky als origin_country (Ländername).
+            # Heuristik: Reg enthält keine Leerzeichen und ist <=12 Zeichen.
+            if cand and ' ' not in cand and 2 <= len(cand) <= 12:
+                reg = cand
+        if not reg:
+            reg = _hex_to_reg(hex_id)
+        if not reg:
+            return  # ohne Reg kein PK → skip (Live-Response bleibt unberührt)
+
+        callsign = None
+        if len(opensky_row) > 1 and isinstance(opensky_row[1], str):
+            callsign = opensky_row[1].strip() or None
+        vel_ms = _coerce_float(opensky_row[9]) if len(opensky_row) > 9 else None
+        gs_kts = (vel_ms / 0.514444) if vel_ms is not None else None
+        alt_m = _coerce_float(opensky_row[7]) if len(opensky_row) > 7 else None
+        hdg = _coerce_float(opensky_row[10]) if len(opensky_row) > 10 else None
+        on_ground = bool(opensky_row[8]) if len(opensky_row) > 8 and opensky_row[8] is not None else None
+        squawk = None
+        if len(opensky_row) > 14 and opensky_row[14]:
+            squawk = str(opensky_row[14])
+        last_seen = _coerce_float(opensky_row[3]) if len(opensky_row) > 3 else None
+
+        row = {
+            'registration': reg,
+            'hex24': (hex_id or '').lower() or None,
+            'callsign': callsign,
+            'latitude': lat,
+            'longitude': lon,
+            'altitude_m': alt_m,
+            'ground_speed_kts': round(gs_kts, 1) if gs_kts is not None else None,
+            'heading_deg': hdg,
+            'on_ground': on_ground,
+            'squawk': squawk,
+            'last_seen_unix': last_seen,
+            'aircraft_type': None,
+            'fetched_at': datetime.now(timezone.utc).isoformat(),
+        }
+        _persist_position_row(row)
+    except Exception:
+        # Warm-Persist ist best-effort — niemals die Live-Response brechen.
+        pass
+
+
+def _hex_to_reg(hex_id):
+    """Inverse-Lookup Hex→Reg aus der Backend-Map. None wenn unbekannt."""
+    if not hex_id:
+        return None
+    target = hex_id.strip().lower()
+    for reg, hx in _BACKEND_REG_HEX.items():
+        if hx == target:
+            return reg
+    return None
 
 # ── Cache ─────────────────────────────────────────────────────
 # Struktur: {hex: {"fetched_at": float_unix, "row": list|None, "source": str}}
@@ -214,6 +358,11 @@ def get_adsb_state():
     # ─── Erfolg: cachen + ausgeben ───
     if source is not None:
         _cache_put(hex_param, row, source)
+        # Best-effort warm-keep der Supabase-Fallback-Tabelle — niemals die
+        # Live-Response brechen (alles in try/except, row kann None sein wenn
+        # "kein Signal").
+        if row is not None:
+            _warm_persist_from_opensky_row(hex_param, row, source)
         return jsonify({
             "hex": hex_param,
             "position": row,
@@ -243,6 +392,156 @@ def get_adsb_state():
         "hex": hex_param,
         "tried": tried,
     }), 502
+
+
+# ─── /api/adsb/persist-position ──────────────────────────────
+
+@adsb_bp.route('/api/adsb/persist-position', methods=['POST'])
+def persist_position():
+    """Persistiert die zuletzt bekannte Aircraft-Position (iOS-Push).
+
+    Body:
+        {
+          "registration": "D-AIPB",        # required (PK)
+          "hex24": "3c64a9",               # optional
+          "callsign": "DLH439",            # optional
+          "position": {                     # required: lat + lon
+            "lat": 50.03, "lon": 8.55,
+            "altM": 11000, "gsKts": 450, "hdgDeg": 270,
+            "onGround": false, "lastSeenUnix": 1717689600, "squawk": "1000"
+          },
+          "route_start_iata": "FRA",       # optional
+          "aircraft_type": "A320"           # optional
+        }
+
+    Response 200: {"ok": true}
+    Response 400: registration / lat / lon fehlt.
+    Response 503: Supabase nicht verfügbar.
+    """
+    body = request.get_json(silent=True) or {}
+    reg = _normalize_registration(body.get('registration'))
+    pos = body.get('position') or {}
+    if not isinstance(pos, dict):
+        pos = {}
+    lat = _coerce_float(pos.get('lat'))
+    lon = _coerce_float(pos.get('lon'))
+    if not reg or lat is None or lon is None:
+        return jsonify({
+            "ok": False,
+            "error": "missing registration, lat or lon",
+        }), 400
+
+    callsign = body.get('callsign')
+    callsign = callsign.strip() if isinstance(callsign, str) and callsign.strip() else None
+    hex24 = body.get('hex24')
+    hex24 = hex24.strip().lower() if isinstance(hex24, str) and hex24.strip() else None
+    rsi = body.get('route_start_iata')
+    rsi = rsi.strip().upper() if isinstance(rsi, str) and rsi.strip() else None
+    atype = body.get('aircraft_type')
+    atype = atype.strip() if isinstance(atype, str) and atype.strip() else None
+    squawk = pos.get('squawk')
+    squawk = str(squawk).strip() if squawk not in (None, '') else None
+    on_ground_raw = pos.get('onGround')
+    on_ground = bool(on_ground_raw) if on_ground_raw is not None else None
+
+    row = {
+        'registration': reg,
+        'hex24': hex24,
+        'callsign': callsign,
+        'latitude': lat,
+        'longitude': lon,
+        'altitude_m': _coerce_float(pos.get('altM')),
+        'ground_speed_kts': _coerce_float(pos.get('gsKts')),
+        'heading_deg': _coerce_float(pos.get('hdgDeg')),
+        'on_ground': on_ground,
+        'squawk': squawk,
+        'last_seen_unix': _coerce_float(pos.get('lastSeenUnix')),
+        'route_start_iata': rsi,
+        'aircraft_type': atype,
+        'fetched_at': datetime.now(timezone.utc).isoformat(),
+    }
+
+    if _persist_position_row(row):
+        return jsonify({"ok": True}), 200
+    return jsonify({"ok": False, "error": "supabase_unavailable"}), 503
+
+
+# ─── /api/adsb/fallback-position ─────────────────────────────
+
+@adsb_bp.route('/api/adsb/fallback-position', methods=['GET'])
+def fallback_position():
+    """Liefert die persistierte letzte Position einer Registration, wenn sie
+    innerhalb der letzten 24h gespeichert wurde.
+
+    Query: reg=<registration>
+
+    Response 200 (Hit):
+        {"ok": true, "position": {lat,lon,altM,gsKts,hdgDeg,onGround,
+         lastSeenUnix,squawk}, "registration": ..., "route_start_iata": ...,
+         "aircraft_type": ..., "last_seen_unix": ..., "on_ground": ...}
+    Response 200 (kein Treffer / stale): {"ok": false}
+    """
+    reg = _normalize_registration(request.args.get('reg'))
+    if not reg:
+        return jsonify({"ok": False, "error": "missing reg parameter"}), 400
+
+    sb, ok = _sb_client()
+    if not ok:
+        return jsonify({"ok": False, "error": "supabase_unavailable"}), 503
+
+    try:
+        r = (sb.table('aircraft_positions')
+             .select('*')
+             .eq('registration', reg)
+             .limit(1)
+             .execute())
+        rows = r.data or []
+    except Exception as e:
+        try:
+            current_app.logger.warning(
+                f'[adsb] fallback_position_fail reg={reg} '
+                f'err={type(e).__name__}: {str(e)[:120]}'
+            )
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": "lookup_failed"}), 200
+
+    if not rows:
+        return jsonify({"ok": False}), 200
+    row = rows[0]
+
+    # Staleness-Check: fetched_at innerhalb 24h?
+    fetched_at = row.get('fetched_at')
+    if fetched_at:
+        try:
+            dt = datetime.fromisoformat(str(fetched_at).replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - dt
+            if age > timedelta(seconds=_FALLBACK_TTL_SECONDS):
+                return jsonify({"ok": False, "stale": True}), 200
+        except (ValueError, TypeError):
+            # Unparsebar → vorsichtshalber als stale behandeln.
+            return jsonify({"ok": False}), 200
+
+    return jsonify({
+        "ok": True,
+        "registration": row.get('registration'),
+        "position": {
+            "lat": row.get('latitude'),
+            "lon": row.get('longitude'),
+            "altM": row.get('altitude_m'),
+            "gsKts": row.get('ground_speed_kts'),
+            "hdgDeg": row.get('heading_deg'),
+            "onGround": row.get('on_ground'),
+            "lastSeenUnix": row.get('last_seen_unix'),
+            "squawk": row.get('squawk'),
+        },
+        "route_start_iata": row.get('route_start_iata'),
+        "aircraft_type": row.get('aircraft_type'),
+        "last_seen_unix": row.get('last_seen_unix'),
+        "on_ground": row.get('on_ground'),
+    }), 200
 
 
 # ─── /api/adsb/route ─────────────────────────────────────────
