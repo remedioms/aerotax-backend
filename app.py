@@ -8402,7 +8402,13 @@ def put_user_profile(token):
     # Privacy: current_city NUR löschen wenn share_location in DIESEM Request
     # explizit auf False gesetzt wird — nicht bei jedem PUT bei dem der gespeicherte
     # Wert zufällig False ist (das würde city bei jedem name-/employer-PUT löschen).
-    if 'share_location' in body and body.get('share_location') is False:
+    # Privacy: current_city löschen wenn:
+    # (a) share_location in DIESEM Request explizit auf False gesetzt, ODER
+    # (b) das gespeicherte Profil hat share_location=False UND der Request enthält current_city
+    #     (sonst würde ein partial-PUT die Stadt speichern trotz gespeichertem Opt-out).
+    stored_share_loc = profile.get('share_location', True)
+    if ('share_location' in body and body.get('share_location') is False) or \
+       (stored_share_loc is False and 'current_city' in body):
         profile.pop('current_city', None)
     # Disk-Payload erhält Side-Keys (subscription, crew_aircraft, …) die NICHT
     # in SB sind — lesen, profile-Subkey ersetzen, zurückschreiben. Sonst würde
@@ -9415,16 +9421,13 @@ def get_friends_today(token):
         day = next((t for t in tage if isinstance(t, dict) and t.get('datum') == datum), None)
         if not day: continue
         ppath = _user_profile_path(fr)
-        try:
-            with open(ppath) as f:
-                pr = json.load(f).get('profile', {})
-        except Exception:
-            pr = {}
+        # SB-primary (wie get_user_friends): Disk-Datei ist auf Cloud Run ephemer.
+        # Verhindert auch stale-0-Bug: int 0 ist not False → True → city-leak.
+        pr = (_profile_load(fr) or {}).get('profile', {}) or {}
         rf = day.get('reader_facts') or {}
-        # Privacy-Gate: current_city nur ausgeben wenn der Friend share_location
-        # NICHT explizit auf False gesetzt hat (Default True). Vorher wurde
-        # current_city bedingungslos geleakt, auch bei share_location=off.
-        share_loc = pr.get('share_location', True) is not False
+        # Privacy-Gate: share_location=False (bool) oder =0 (legacy int) → kein city.
+        share_loc_val = pr.get('share_location', True)
+        share_loc = share_loc_val is not False and share_loc_val != 0
         out.append({
             'token': fr[:16] + '…',
             # Stabile match_id (Hash) statt vollem Token — iOS matcht Friend↔
@@ -11851,7 +11854,9 @@ def _anon_handle_for(token):
     h = hashlib.sha256(('anonwall:' + (token or '')).encode()).hexdigest()
     a = _ANON_ADJ[int(h[0:4], 16) % len(_ANON_ADJ)]
     n = _ANON_NOUN[int(h[4:8], 16) % len(_ANON_NOUN)]
-    return f'{a}{n}{int(h[8:10], 16) % 100:02d}'
+    # h[8:11] → 3 hex chars → 0-4095; %1000 → 0-999 als :03d suffix.
+    # Vorher h[8:10] (0-255) % 100 → nur 00-55 erreichbar (56-99 unmöglich).
+    return f'{a}{n}{int(h[8:11], 16) % 1000:03d}'
 
 # ── Wall-Posts SB persistence (P0 Worker-P1, 2026-06-01) ──
 # Disk-only war auf Cloud Run ein Wipe-pro-Redeploy. Pattern wie _auth_load/_save:
@@ -12452,8 +12457,12 @@ def get_wall_feed(token):
         p['is_mine'] = (p.get('author_token') == token)
         # from_friend: iOS kann Friends-Posts visuell hervorheben
         # (golden Border o.ä.) ohne separates Endpoint-Roundtrip.
+        # from_friend MUSS vor dem anon-Strip berechnet werden (author_token noch vorhanden),
+        # aber bei anonymen Posts auf False zwingen — sonst leakt from_friend=True die Identität
+        # (goldener Border verrät: dieser anonyme Post kommt aus deiner Freundesliste).
         p['from_friend'] = (p.get('author_token') in friends
-                            and p.get('author_token') != token)
+                            and p.get('author_token') != token
+                            and not p.get('is_anonymous'))
         # Anonyme Posts: jeden Profil-Rest entfernen, nur anon_handle bleibt.
         if p.get('is_anonymous'):
             if not p.get('anon_handle'):
