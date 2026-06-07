@@ -11904,6 +11904,66 @@ def _chat_path(channel_id):
     return os.path.join(chat_dir, f'{safe}.json')
 
 
+# ── Social-Persistenz: kanonisches Row-Schema (P0 Fix, 2026-06-07) ──
+# WURZEL-BUG (live reproduziert): PostgREST-Bulk-Upsert verlangt, dass ALLE
+# Objekte im Array DIESELBEN Keys haben ("PGRST102: All object keys must
+# match"). Zusätzlich füllt PostgREST fehlende Keys NICHT mit der Spalten-
+# DEFAULT, sondern schickt explizit NULL → NOT-NULL-Verletzung (23502) bei
+# Spalten wie `deleted`, `hashtags`, `like_count`, `is_anonymous`.
+#
+# Symptom: Frisch erstellte Forum-Threads/Wall-Posts/DMs/Replies hatten nach
+# dem metadata-Split nicht exakt dieselben Keys wie die aus SB geladenen
+# Altzeilen → der GESAMTE Batch wurde verworfen → der Post „blieb nicht".
+# Disk-Fallback maskierte das lokal, Cloud-Run-Redeploy wipte ihn → weg.
+#
+# FIX: Jede Row wird gegen ein festes Spalten→Default-Schema normalisiert.
+# Garantiert (a) identische Key-Sets über alle Rows und (b) keine NULL in
+# NOT-NULL-Spalten. `metadata` und `body` sind immer present.
+def _sb_normalize_rows(rows, schema_defaults):
+    """Erzwingt für jede Row exakt die Keys aus schema_defaults (+ vorhandene
+    Werte). Fehlende Keys → Default. None in NOT-NULL-Defaults → Default.
+    schema_defaults: dict col→default (default None ⇒ Spalte ist nullable)."""
+    out = []
+    for r in rows:
+        norm = {}
+        for col, default in schema_defaults.items():
+            v = r.get(col, None)
+            if v is None and default is not None:
+                v = default
+            norm[col] = v
+        out.append(norm)
+    return out
+
+
+# Default-Schemata pro Tabelle. None ⇒ nullable (Wert darf NULL bleiben).
+# Nicht-None ⇒ NOT-NULL-Spalte, fehlend/NULL wird durch Default ersetzt.
+_SB_SCHEMA_DM_MESSAGES = {
+    'id': '', 'channel_id': '', 'author_token': '', 'ts': 0,
+    'body': None, 'image_url': None, 'metadata': {},
+}
+_SB_SCHEMA_WALL_POSTS = {
+    'id': '', 'author_token': '', 'ts': 0, 'body': None,
+    'layover_iata': None, 'image_url': None, 'hashtags': [],
+    'like_count': 0, 'comment_count': 0, 'deleted': False,
+    'is_anonymous': False, 'anon_handle': None, 'metadata': {},
+}
+_SB_SCHEMA_WALL_COMMENTS = {
+    'id': '', 'post_id': '', 'author_token': '', 'body': None,
+    'ts': 0, 'parent_id': None, 'image_url': None,
+    'is_anonymous': False, 'anon_handle': None, 'metadata': {},
+}
+_SB_SCHEMA_FORUM_THREADS = {
+    'id': '', 'category_id': '', 'author_token': '', 'title': None,
+    'body': None, 'ts': 0, 'hashtags': [], 'like_count': 0,
+    'reply_count': 0, 'deleted': False, 'metadata': {},
+}
+_SB_SCHEMA_FORUM_REPLIES = {
+    'id': '', 'thread_id': '', 'author_token': '', 'body': None,
+    'ts': 0, 'parent_reply_id': None, 'mentioned_token': None,
+    'image_url': None, 'like_count': 0, 'metadata': {},
+}
+
+
 # ── DM-Messages SB persistence (P0 Worker-P1, 2026-06-01) ──
 # Disk-only wipte alle DMs bei jedem Cloud-Run-Redeploy. SB als Primary.
 # Schema: 1 Row pro Message. SB-Spalte body ↔ disk-Feld text.
@@ -11979,6 +12039,7 @@ def _dm_messages_save_to_supabase(channel_id, messages):
         rows.append(row)
     if not rows:
         return True
+    rows = _sb_normalize_rows(rows, _SB_SCHEMA_DM_MESSAGES)
     try:
         for i in range(0, len(rows), 500):
             sb.table('dm_messages').upsert(rows[i:i+500], on_conflict='id').execute()
@@ -12424,6 +12485,7 @@ def _wall_posts_save_to_supabase(posts):
         rows.append(row)
     if not rows:
         return True
+    rows = _sb_normalize_rows(rows, _SB_SCHEMA_WALL_POSTS)
     try:
         for i in range(0, len(rows), 500):
             sb.table('wall_posts').upsert(rows[i:i+500], on_conflict='id').execute()
@@ -12597,6 +12659,7 @@ def _wall_comments_save_to_supabase(post_id, comments):
         rows.append(row)
     if not rows:
         return True
+    rows = _sb_normalize_rows(rows, _SB_SCHEMA_WALL_COMMENTS)
     try:
         for i in range(0, len(rows), 200):
             sb.table('wall_comments').upsert(rows[i:i+200], on_conflict='id').execute()
@@ -13300,6 +13363,7 @@ def _forum_threads_save_to_supabase(threads):
         rows.append(row)
     if not rows:
         return True
+    rows = _sb_normalize_rows(rows, _SB_SCHEMA_FORUM_THREADS)
     try:
         for i in range(0, len(rows), 500):
             sb.table('forum_threads').upsert(rows[i:i+500], on_conflict='id').execute()
@@ -13417,6 +13481,7 @@ def _forum_replies_save_to_supabase(thread_id, replies):
         rows.append(row)
     if not rows:
         return True
+    rows = _sb_normalize_rows(rows, _SB_SCHEMA_FORUM_REPLIES)
     try:
         for i in range(0, len(rows), 500):
             sb.table('forum_replies').upsert(rows[i:i+500], on_conflict='id').execute()
@@ -13938,6 +14003,314 @@ def _votes_path(token):
     return os.path.join(_recs_dir(), f'votes_{safe}.json')
 
 
+# ── Layover-Recs SB persistence (P0 Fix, 2026-06-07) ──
+# Vorher disk-only → Cloud-Run-Redeploy wipte alle Tipps/Votes/Kommentare.
+# SB-primary + Disk-Read-Cache, gleiches Muster wie wall_posts/forum_threads.
+# Tabellen: layover_recs, layover_rec_votes, layover_rec_comments
+# (siehe supabase_migrations/20260607_layover_recs.sql).
+_SB_SCHEMA_LAYOVER_RECS = {
+    'id': '', 'iata': '', 'category': 'other', 'title': None,
+    'description': None, 'rating': 0, 'price_band': '',
+    'location_hint': None, 'author_token': '', 'author_short': None,
+    'ts': 0, 'vote_score': 0, 'vote_count': 0, 'deleted': False,
+    'metadata': {},
+}
+_LAYOVER_REC_KNOWN_COLS = set(_SB_SCHEMA_LAYOVER_RECS.keys())
+_SB_SCHEMA_LAYOVER_COMMENTS = {
+    'id': '', 'rec_id': '', 'author_token': '', 'author_short': None,
+    'author_name': None, 'body': None, 'image_url': None,
+    'parent_comment_id': None, 'ts': 0, 'metadata': {},
+}
+_LAYOVER_COMMENT_KNOWN_COLS = set(_SB_SCHEMA_LAYOVER_COMMENTS.keys())
+
+
+def _layover_recs_load_from_supabase(iata):
+    """Alle nicht-gelöschten Recs für IATA aus SB. None bei SB-down/Tabelle-fehlt."""
+    if not SB_AVAILABLE:
+        return None
+    safe = re.sub(r'[^A-Z]', '', (iata or '').upper())[:3]
+    if len(safe) != 3:
+        return None
+    try:
+        r = (sb.table('layover_recs').select('*')
+             .eq('iata', safe).eq('deleted', False)
+             .order('vote_score', desc=True).limit(500).execute())
+        out = []
+        for row in (r.data or []):
+            rec = {}
+            for k in _LAYOVER_REC_KNOWN_COLS:
+                if k == 'metadata':
+                    continue
+                v = row.get(k)
+                if v is not None:
+                    rec[k] = v
+            md = row.get('metadata') or {}
+            if isinstance(md, dict):
+                for k, v in md.items():
+                    rec.setdefault(k, v)
+            out.append(rec)
+        return out
+    except Exception as e:
+        app.logger.warning(f'[layover-recs] sb_load_fail iata={safe} err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _layover_recs_save_to_supabase(recs):
+    """Bulk-upsert Recs nach SB. True bei vollem Erfolg."""
+    if not SB_AVAILABLE or recs is None:
+        return False
+    rows = []
+    for rec in (recs or []):
+        if not isinstance(rec, dict):
+            continue
+        rid = rec.get('id')
+        if not rid:
+            continue
+        row = {'id': rid}
+        meta = {}
+        for k, v in rec.items():
+            if k in _LAYOVER_REC_KNOWN_COLS:
+                row[k] = v
+            else:
+                meta[k] = v
+        row['metadata'] = meta
+        rows.append(row)
+    if not rows:
+        return True
+    rows = _sb_normalize_rows(rows, _SB_SCHEMA_LAYOVER_RECS)
+    try:
+        for i in range(0, len(rows), 500):
+            sb.table('layover_recs').upsert(rows[i:i+500], on_conflict='id').execute()
+        return True
+    except Exception as e:
+        app.logger.error(f'[layover-recs] sb_save_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _layover_recs_delete_from_supabase(rec_id):
+    if not SB_AVAILABLE or not rec_id:
+        return False
+    try:
+        sb.table('layover_recs').update({'deleted': True}).eq('id', rec_id).execute()
+        return True
+    except Exception as e:
+        app.logger.warning(f'[layover-recs] sb_delete_fail err={type(e).__name__}: {str(e)[:120]}')
+        return False
+
+
+def _layover_votes_load_from_supabase(token):
+    """{rec_id: direction} aus SB für diesen User. None bei SB-down."""
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = (sb.table('layover_rec_votes').select('rec_id,direction')
+             .eq('user_token', token).limit(5000).execute())
+        return {row['rec_id']: int(row.get('direction') or 0)
+                for row in (r.data or []) if row.get('rec_id')}
+    except Exception as e:
+        app.logger.warning(f'[layover-votes] sb_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _layover_vote_sb_set(token, rec_id, direction):
+    """direction ∈ {-1,1} → upsert; 0 → delete. True bei Erfolg."""
+    if not SB_AVAILABLE or not token or not rec_id:
+        return False
+    try:
+        if direction == 0:
+            sb.table('layover_rec_votes').delete().eq('user_token', token).eq('rec_id', rec_id).execute()
+        else:
+            sb.table('layover_rec_votes').upsert(
+                {'user_token': token, 'rec_id': rec_id, 'direction': int(direction)},
+                on_conflict='user_token,rec_id').execute()
+        return True
+    except Exception as e:
+        app.logger.warning(f'[layover-votes] sb_save_fail err={type(e).__name__}: {str(e)[:120]}')
+        return False
+
+
+def _layover_comments_load_from_supabase(rec_id):
+    """Alle Kommentare für rec_id aus SB. None bei SB-down."""
+    if not SB_AVAILABLE or not rec_id:
+        return None
+    try:
+        r = (sb.table('layover_rec_comments').select('*')
+             .eq('rec_id', rec_id).order('ts', desc=False).limit(2000).execute())
+        out = []
+        for row in (r.data or []):
+            c = {}
+            for k in _LAYOVER_COMMENT_KNOWN_COLS:
+                if k == 'metadata':
+                    continue
+                v = row.get(k)
+                if v is not None:
+                    c[k] = v
+            # SB-Spalte ts → disk-Feld created_ts (Reader nutzt created_ts)
+            if 'ts' in c:
+                c.setdefault('created_ts', c['ts'])
+            md = row.get('metadata') or {}
+            if isinstance(md, dict):
+                for k, v in md.items():
+                    c.setdefault(k, v)
+            out.append(c)
+        return out
+    except Exception as e:
+        app.logger.warning(f'[layover-comments] sb_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _layover_comments_save_to_supabase(rec_id, comments):
+    """Bulk-upsert Kommentare eines Recs nach SB."""
+    if not SB_AVAILABLE or not rec_id or comments is None:
+        return False
+    rows = []
+    for c in (comments or []):
+        if not isinstance(c, dict):
+            continue
+        cid = c.get('id')
+        if not cid:
+            continue
+        row = {'id': cid, 'rec_id': rec_id}
+        meta = {}
+        for k, v in c.items():
+            if k == 'created_ts' and 'ts' not in c:
+                row['ts'] = v
+            elif k == 'rec_id':
+                continue
+            elif k in _LAYOVER_COMMENT_KNOWN_COLS:
+                row[k] = v
+            else:
+                meta[k] = v
+        row['metadata'] = meta
+        rows.append(row)
+    if not rows:
+        return True
+    rows = _sb_normalize_rows(rows, _SB_SCHEMA_LAYOVER_COMMENTS)
+    try:
+        for i in range(0, len(rows), 200):
+            sb.table('layover_rec_comments').upsert(rows[i:i+200], on_conflict='id').execute()
+        return True
+    except Exception as e:
+        app.logger.error(f'[layover-comments] sb_save_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _layover_find_rec_iata(rec_id):
+    """Findet die IATA eines Recs by id — SB primär, sonst Disk-Scan.
+    Returns iata-string oder None."""
+    if SB_AVAILABLE:
+        try:
+            r = (sb.table('layover_recs').select('iata')
+                 .eq('id', rec_id).limit(1).execute())
+            if r.data:
+                return (r.data[0].get('iata') or '').upper() or None
+        except Exception as e:
+            app.logger.warning(f'[layover-recs] find_iata_fail err={type(e).__name__}: {str(e)[:120]}')
+    # Disk-Scan fallback
+    import os
+    rdir = _recs_dir()
+    try:
+        for fname in os.listdir(rdir):
+            if not fname.endswith('.json') or fname.startswith(('votes_', 'comments_', 'reviews_')):
+                continue
+            try:
+                with open(os.path.join(rdir, fname)) as f:
+                    recs = json.load(f) or []
+            except Exception:
+                continue
+            for r in recs:
+                if r.get('id') == rec_id:
+                    return (r.get('iata') or fname[:-5]).upper()
+    except Exception:
+        pass
+    return None
+
+
+def _recs_load_from_disk(iata):
+    rp = _recs_path(iata)
+    if not rp:
+        return []
+    try:
+        with open(rp) as f:
+            return json.load(f) or []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    except Exception:
+        return []
+
+
+def _recs_load(iata):
+    """SB primary, Disk fallback, lazy-migrate (gleiches Muster wie Forum)."""
+    sb_data = _layover_recs_load_from_supabase(iata)
+    if sb_data is None:
+        return _recs_load_from_disk(iata)
+    if sb_data:
+        return sb_data
+    disk_data = _recs_load_from_disk(iata)
+    if disk_data and SB_AVAILABLE:
+        app.logger.info(f'[layover-recs] lazy-migrate {len(disk_data)} disk recs → supabase')
+        _layover_recs_save_to_supabase(disk_data)
+        return disk_data
+    return []
+
+
+def _recs_save(iata, recs):
+    """SB primary + Disk Read-Cache."""
+    capped = (recs or [])[-500:]
+    sb_ok = _layover_recs_save_to_supabase(capped)
+    rp = _recs_path(iata)
+    if rp:
+        try:
+            with open(rp, 'w') as f:
+                json.dump(capped, f, ensure_ascii=False)
+        except Exception as e:
+            app.logger.warning(f'[layover-recs] disk_save_fail: {e}')
+            if not sb_ok:
+                app.logger.error('[layover-recs] CRITICAL: weder SB noch Disk gesichert!')
+    return sb_ok
+
+
+def _votes_load_from_disk(token):
+    vp = _votes_path(token)
+    if not vp:
+        return {}
+    try:
+        with open(vp) as f:
+            return json.load(f) or {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    except Exception:
+        return {}
+
+
+def _votes_load(token):
+    """SB primary, Disk fallback, lazy-migrate."""
+    sb_data = _layover_votes_load_from_supabase(token)
+    if sb_data is None:
+        return _votes_load_from_disk(token)
+    if sb_data:
+        return sb_data
+    disk_data = _votes_load_from_disk(token)
+    if disk_data and SB_AVAILABLE:
+        for rid, d in disk_data.items():
+            try:
+                _layover_vote_sb_set(token, rid, int(d))
+            except Exception:
+                pass
+        return disk_data
+    return {}
+
+
+def _votes_save_disk(token, votes):
+    vp = _votes_path(token)
+    if vp:
+        try:
+            with open(vp, 'w') as f:
+                json.dump(votes, f)
+        except Exception as e:
+            app.logger.warning(f'[layover-votes] disk_save_fail: {e}')
+
+
 @app.route('/api/layover-recs/<iata>', methods=['GET'])
 def get_layover_recs(iata):
     """Liefert alle Recs für Airport, sortiert nach vote_score absteigend.
@@ -13945,26 +14318,14 @@ def get_layover_recs(iata):
     """
     rp = _recs_path(iata)
     if not rp: return jsonify({'error': 'invalid_iata'}), 400
-    try:
-        with open(rp) as f: recs = json.load(f) or []
-    except FileNotFoundError:
-        recs = []
+    recs = _recs_load(iata)
     cat = (request.args.get('category') or '').lower()
     if cat and cat in LAYOVER_CATEGORIES:
         recs = [r for r in recs if r.get('category') == cat]
     recs.sort(key=lambda r: -(r.get('vote_score') or 0))
     # Apply voted-by-me
     token = request.args.get('token') or ''
-    voted = {}
-    if token:
-        vp = _votes_path(token)
-        if vp:
-            try:
-                with open(vp) as f: voted = json.load(f) or {}
-            except FileNotFoundError:
-                voted = {}
-            except Exception:
-                voted = {}
+    voted = _votes_load(token) if token else {}
     for r in recs:
         r['my_vote'] = voted.get(r.get('id'), 0)
     return jsonify({'iata': iata.upper(), 'count': len(recs), 'recs': recs})
@@ -14069,23 +14430,14 @@ def add_layover_rec(token):
         rec['author_airline'] = pr.get('airline')
     except Exception:
         pass
-    try:
-        with open(rp) as f: recs = json.load(f) or []
-    except FileNotFoundError:
-        recs = []
+    recs = _recs_load(iata)
     recs.append(rec)
-    with open(rp, 'w') as f: json.dump(recs[-500:], f, ensure_ascii=False)
+    _recs_save(iata, recs)
     # Auto-record author's +1 vote
-    vp = _votes_path(token)
-    if vp:
-        try:
-            with open(vp) as f: votes = json.load(f) or {}
-        except FileNotFoundError:
-            votes = {}
-        except Exception:
-            votes = {}
-        votes[rec['id']] = 1
-        with open(vp, 'w') as f: json.dump(votes, f)
+    votes = _votes_load(token)
+    votes[rec['id']] = 1
+    _layover_vote_sb_set(token, rec['id'], 1)
+    _votes_save_disk(token, votes)
     return jsonify({'ok': True, 'rec': rec})
 
 
@@ -14099,64 +14451,48 @@ def vote_layover_rec(token, rec_id):
         direction = 0
     if direction not in (-1, 0, 1):
         return jsonify({'ok': False, 'error':'invalid_direction'}), 400
-    # Find rec across all airport files
-    import os
-    rdir = _recs_dir()
-    vp = _votes_path(token)
-    if not vp: return jsonify({'ok': False, 'error':'invalid_token'}), 400
-    try:
-        with open(vp) as f: votes = json.load(f) or {}
-    except FileNotFoundError:
-        votes = {}
-    except Exception:
-        votes = {}
+    if not _votes_path(token):
+        return jsonify({'ok': False, 'error':'invalid_token'}), 400
+    votes = _votes_load(token)
     prev = int(votes.get(rec_id) or 0)
     delta = direction - prev
-    # Apply delta to the rec
-    found = False
-    new_score = 0
-    for fname in os.listdir(rdir):
-        if not fname.endswith('.json') or fname.startswith('votes_'): continue
-        path = os.path.join(rdir, fname)
-        try:
-            with open(path) as f: recs = json.load(f) or []
-        except Exception:
-            continue
-        modified = False
-        for r in recs:
-            if r.get('id') == rec_id:
-                r['vote_score'] = (r.get('vote_score') or 0) + delta
-                r['vote_count'] = max(0, (r.get('vote_count') or 0) + (1 if prev == 0 and direction != 0 else (-1 if direction == 0 and prev != 0 else 0)))
-                new_score = r['vote_score']
-                modified = True; found = True; break
-        if modified:
-            with open(path, 'w') as f: json.dump(recs, f, ensure_ascii=False)
-            break
-    if not found:
+    # Rec finden (SB-primär) und Score idempotent neu berechnen.
+    iata = _layover_find_rec_iata(rec_id)
+    if not iata:
         return jsonify({'ok': False, 'error':'rec_not_found'}), 404
+    recs = _recs_load(iata)
+    target = next((r for r in recs if r.get('id') == rec_id), None)
+    if not target:
+        return jsonify({'ok': False, 'error':'rec_not_found'}), 404
+    target['vote_score'] = (target.get('vote_score') or 0) + delta
+    target['vote_count'] = max(0, (target.get('vote_count') or 0) + (
+        1 if prev == 0 and direction != 0
+        else (-1 if direction == 0 and prev != 0 else 0)))
+    new_score = target['vote_score']
+    _recs_save(iata, recs)
+    # Vote persistieren (SB upsert/delete + Disk-Cache).
     if direction == 0:
         votes.pop(rec_id, None)
     else:
         votes[rec_id] = direction
-    with open(vp, 'w') as f: json.dump(votes, f)
+    _layover_vote_sb_set(token, rec_id, direction)
+    _votes_save_disk(token, votes)
     return jsonify({'ok': True, 'vote_score': new_score, 'my_vote': direction})
 
 
 @app.route('/api/layover-recs/<token>/<rec_id>', methods=['DELETE'])
 def delete_layover_rec(token, rec_id):
     """Author löscht eigene Empfehlung."""
-    import os
-    rdir = _recs_dir()
-    for fname in os.listdir(rdir):
-        if not fname.endswith('.json') or fname.startswith('votes_'): continue
-        path = os.path.join(rdir, fname)
-        try:
-            with open(path) as f: recs = json.load(f) or []
-        except Exception:
-            continue
-        new_recs = [r for r in recs if not (r.get('id') == rec_id and r.get('author_short') == token[:8])]
+    iata = _layover_find_rec_iata(rec_id)
+    if iata:
+        recs = _recs_load(iata)
+        new_recs = [r for r in recs
+                    if not (r.get('id') == rec_id and r.get('author_short') == token[:8])]
         if len(new_recs) != len(recs):
-            with open(path, 'w') as f: json.dump(new_recs, f, ensure_ascii=False)
+            # SB: soft-delete (deleted=true) damit Bulk-Upsert die Row nicht
+            # re-inserted; Disk-Cache überschreiben.
+            _layover_recs_delete_from_supabase(rec_id)
+            _recs_save(iata, new_recs)
             return jsonify({'ok': True})
     return jsonify({'ok': False, 'error':'not_found_or_not_author'}), 404
 
@@ -14362,7 +14698,7 @@ def _layover_comments_path(rec_id):
     return os.path.join(_recs_dir(), f'comments_{safe}.json') if safe else None
 
 
-def _layover_load_comments(rec_id):
+def _layover_load_comments_from_disk(rec_id):
     p = _layover_comments_path(rec_id)
     if not p: return []
     try:
@@ -14373,11 +14709,31 @@ def _layover_load_comments(rec_id):
         return []
 
 
+def _layover_load_comments(rec_id):
+    """SB primary, Disk fallback, lazy-migrate."""
+    sb_data = _layover_comments_load_from_supabase(rec_id)
+    if sb_data is None:
+        return _layover_load_comments_from_disk(rec_id)
+    if sb_data:
+        return sb_data
+    disk_data = _layover_load_comments_from_disk(rec_id)
+    if disk_data and SB_AVAILABLE:
+        app.logger.info(f'[layover-comments] lazy-migrate {len(disk_data)} disk comments → supabase')
+        _layover_comments_save_to_supabase(rec_id, disk_data)
+        return disk_data
+    return []
+
+
 def _layover_save_comments(rec_id, comments):
+    """SB primary + Disk Read-Cache."""
+    comments = comments[-500:]
+    _layover_comments_save_to_supabase(rec_id, comments)
     p = _layover_comments_path(rec_id)
     if not p: return
-    comments = comments[-500:]
-    with open(p, 'w') as f: json.dump(comments, f, ensure_ascii=False)
+    try:
+        with open(p, 'w') as f: json.dump(comments, f, ensure_ascii=False)
+    except Exception as e:
+        app.logger.warning(f'[layover-comments] disk_save_fail: {e}')
 
 
 @app.route('/api/layover-recs/<token>/<rec_id>/comments', methods=['GET'])
