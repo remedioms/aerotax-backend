@@ -6078,7 +6078,24 @@ def full_health_check():
             health['supabase'] = 'ok'
         else:
             health['supabase'] = 'fail'
-    overall = 'ok' if all(v == 'ok' for k, v in health.items() if k not in ('timestamp', 'server', 'heif')) else 'degraded'
+    # Persistenz-Diagnose für Pünktlichkeit (airport_delay_obs) und Aircraft-
+    # Positionen (aircraft_positions). Macht still scheiternde Write-Throughs
+    # sichtbar — Root-Cause des "Daten verschwinden nach Restart"-Reports.
+    # NICHT in die overall-Bewertung einbezogen (rein informativ), aber sofort
+    # diagnostizierbar: write_fail_count > 0 ⇒ Persistenz bricht.
+    try:
+        from blueprints.adsb_blueprint import get_persist_stats as _adsb_stats
+        _aircraft_persist = _adsb_stats()
+    except Exception:
+        _aircraft_persist = {'available': False}
+    health['persistence'] = {
+        'delay_obs_write_ok_count':  _delay_obs_write_ok_count,
+        'delay_obs_write_fail_count': _delay_obs_write_fail_count,
+        'delay_obs_load_fail_count':  _delay_obs_load_fail_count,
+        'delay_obs_last_error':       (_delay_obs_last_error or None),
+        'aircraft': _aircraft_persist,
+    }
+    overall = 'ok' if all(v == 'ok' for k, v in health.items() if k not in ('timestamp', 'server', 'heif', 'persistence')) else 'degraded'
     health['overall'] = overall
     return jsonify(health), 200 if overall == 'ok' else 503
 
@@ -17663,12 +17680,26 @@ _delay_store_cancelled: dict = {}
 # Verhindert, dass jeder Punctuality-Call die SB-Tabelle erneut voll liest.
 _delay_store_sb_loaded_date: str = ''
 
+# Persistenz-Diagnose (vom /api/health/full exponiert). Ein still
+# fehlschlagender Write-Through war die Wurzel des "Pünktlichkeit verschwindet"-
+# Bugs — die Fail-Counter + last-error machen das jetzt sichtbar, ohne dass man
+# in Cloud-Run-Logs graben muss.
+_delay_obs_write_fail_count: int = 0
+_delay_obs_write_ok_count: int = 0
+_delay_obs_load_fail_count: int = 0
+_delay_obs_last_error: str = ''
+
 
 def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport, status):
     """Best-effort Write-Through einer Delay-Beobachtung nach airport_delay_obs.
     Mirror des wall-posts/disk-Patterns: SB-down/Tabelle-fehlt → still degrade,
     der In-Memory-Store bleibt die Wahrheit. Nur max-Wert (upsert überschreibt,
-    aber wir schreiben hier bereits das laufende Maximum aus dem Store)."""
+    aber wir schreiben hier bereits das laufende Maximum aus dem Store).
+
+    Fehler werden LAUT (logger.warning) geloggt + in einem Fail-Counter gehalten,
+    damit ein dauerhaft scheiternder Write (Schema-Mismatch, RLS, SB down) im
+    /api/health/full sichtbar wird statt still die Tages-Stichprobe zu verlieren."""
+    global _delay_obs_write_fail_count, _delay_obs_write_ok_count, _delay_obs_last_error
     if not SB_AVAILABLE or sb is None:
         return
     try:
@@ -17682,10 +17713,16 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport, 
             'status': (status or None),
             'updated_at': datetime.now(timezone.utc).isoformat(),
         }, on_conflict='date,airport,flight,sched').execute()
+        _delay_obs_write_ok_count += 1
     except Exception as e:
-        # Tabelle fehlt / SB down → ehrlich nur in-memory weiter, kein Crash.
-        app.logger.info(
-            f'[delay-obs] sb_write_skip {type(e).__name__}: {str(e)[:100]}')
+        # Tabelle fehlt / SB down / Schema-Mismatch → ehrlich nur in-memory
+        # weiter, kein Crash. ABER laut loggen + zählen, damit es nicht still
+        # die Persistenz killt (Root-Cause "Pünktlichkeit verschwindet").
+        _delay_obs_write_fail_count += 1
+        _delay_obs_last_error = f'write {type(e).__name__}: {str(e)[:140]}'
+        app.logger.warning(
+            f'[delay-obs] sb_write_FAIL date={date_str} airport={airport} '
+            f'flight={fn} sched={hhmm} {type(e).__name__}: {str(e)[:160]}')
 
 
 def _delay_store_load_from_sb(date_str, airport='FRA'):
@@ -17694,8 +17731,12 @@ def _delay_store_load_from_sb(date_str, airport='FRA'):
     Tages-Stichprobe einen Cloud-Run-Restart und wächst cross-instance. Degradiert
     still wenn SB down ist oder die Tabelle fehlt — dann bleibt nur die
     in-memory-Sicht. Store-Keys sind airport-gekeyt, damit MUC/BER/FRA sich nicht
-    gegenseitig kontaminieren."""
-    global _delay_store_sb_loaded_date
+    gegenseitig kontaminieren.
+
+    Ein SB-Read-Fehler wird LAUT (logger.warning) geloggt + gezählt — wenn der
+    Load-on-Read bricht, überlebt die Tages-Stichprobe keinen Restart, also darf
+    das nicht still passieren."""
+    global _delay_store_sb_loaded_date, _delay_obs_load_fail_count, _delay_obs_last_error
     if not SB_AVAILABLE or sb is None:
         return
     airport = (airport or 'FRA').upper()
@@ -17732,8 +17773,13 @@ def _delay_store_load_from_sb(date_str, airport='FRA'):
             offset += page
         _delay_store_sb_loaded_date = load_marker
     except Exception as e:
-        app.logger.info(
-            f'[delay-obs] sb_load_skip {type(e).__name__}: {str(e)[:100]}')
+        # Load-on-Read gebrochen → Tages-Stichprobe übersteht keinen Restart.
+        # Laut loggen + zählen statt still schlucken.
+        _delay_obs_load_fail_count += 1
+        _delay_obs_last_error = f'load {type(e).__name__}: {str(e)[:140]}'
+        app.logger.warning(
+            f'[delay-obs] sb_load_FAIL date={date_str} airport={airport} '
+            f'{type(e).__name__}: {str(e)[:160]}')
 
 
 def _merge_into_delay_store(flights, date_str, airport='FRA'):

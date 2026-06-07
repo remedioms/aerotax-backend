@@ -53,6 +53,25 @@ except ImportError:
 # der Crew als "letzte bekannte Position" zu zeigen.
 _FALLBACK_TTL_SECONDS = 24 * 3600
 
+# Persistenz-Diagnose (vom /api/health/full via get_persist_stats() exponiert).
+# Ein still scheiternder Upsert war die Wurzel des "Flieger verschwinden aus dem
+# Cache"-Bugs — die Counter machen das sichtbar, ohne Cloud-Run-Logs zu graben.
+_PERSIST_STATS = {
+    'persist_ok_count':   0,
+    'persist_fail_count': 0,
+    'backfill_ok_count':  0,
+    'backfill_miss_count': 0,
+    'last_error':         None,
+}
+
+
+def get_persist_stats():
+    """Snapshot der Persistenz-Counter für den Health-Endpoint (app.py)."""
+    _sb, ok = _sb_client()
+    snap = dict(_PERSIST_STATS)
+    snap['available'] = bool(ok)
+    return snap
+
 
 def _sb_client():
     """Lazy re-resolve, damit init-Order zwischen app.py und Blueprint egal ist."""
@@ -89,19 +108,26 @@ def _coerce_float(v):
 
 def _persist_position_row(row):
     """Upsert einer aircraft_positions-Row (keyed on registration).
-    Returns True bei Erfolg, False bei SB-down/Fehler."""
+    Returns True bei Erfolg, False bei SB-down/Fehler.
+
+    Fehler werden LAUT (logger.error) geloggt + in _PERSIST_STATS gezählt, damit
+    ein dauerhaft scheiternder Upsert (Schema-Mismatch, RLS, SB down) im
+    /api/health/full sichtbar wird statt still den Cache-Inhalt zu verlieren."""
     sb, ok = _sb_client()
     if not ok:
         return False
     try:
         sb.table('aircraft_positions').upsert(
             row, on_conflict='registration').execute()
+        _PERSIST_STATS['persist_ok_count'] += 1
         return True
     except Exception as e:
+        _PERSIST_STATS['persist_fail_count'] += 1
+        _PERSIST_STATS['last_error'] = f'persist {type(e).__name__}: {str(e)[:140]}'
         try:
-            current_app.logger.warning(
-                f'[adsb] persist_position_fail reg={row.get("registration", "?")} '
-                f'err={type(e).__name__}: {str(e)[:120]}'
+            current_app.logger.error(
+                f'[adsb] persist_position_FAIL reg={row.get("registration", "?")} '
+                f'err={type(e).__name__}: {str(e)[:160]}'
             )
         except Exception:
             pass
@@ -303,6 +329,21 @@ def get_adsb_state():
             "fetched_at": cached["fetched_at"],
             "cached": True,
             "source": cached.get("source", "cache"),
+        }), 200
+
+    # Cold-Start-Backfill: nach einem Cloud-Run-Restart ist der In-Memory-_CACHE
+    # leer — bevor wir externe APIs anfassen, holen wir die zuletzt persistierte
+    # Position (< 24h) aus aircraft_positions zurück in den Cache. So verschwinden
+    # Flieger NICHT mehr nach jedem Instanz-Wechsel. Best-effort: SB-down/Miss
+    # → wir fallen sauber weiter in die Live-Fetch-Kaskade.
+    backfilled = _backfill_cache_from_sb(hex_param)
+    if backfilled is not None:
+        return jsonify({
+            "hex": hex_param,
+            "position": backfilled["row"],
+            "fetched_at": backfilled["fetched_at"],
+            "cached": True,
+            "source": backfilled.get("source", "supabase-backfill"),
         }), 200
 
     # Backoff-Status für OpenSky tracken — wenn aktiv, OpenSky-Step
@@ -622,6 +663,7 @@ def get_health():
         "cache_ttl_seconds": _CACHE_TTL_SECONDS,
         "backoff_active": now < backoff_until,
         "backoff_remaining": max(0, int(backoff_until - now)),
+        "persistence": get_persist_stats(),
     }), 200
 
 
@@ -669,6 +711,119 @@ def _cache_put(hex_id, row, source="opensky"):
             items = sorted(_CACHE.items(), key=lambda kv: kv[1]["fetched_at"])
             for k, _ in items[:50]:
                 _CACHE.pop(k, None)
+
+
+def _row_from_aircraft_positions(rec):
+    """Baut aus einer aircraft_positions-Row (Supabase) eine OpenSky-State-Row,
+    damit der Cold-Start-Backfill dasselbe Layout in den _CACHE legt wie ein
+    Live-Fetch. None wenn keine Position (lat/lon fehlt).
+
+    OpenSky-State-Row Layout (siehe _fetch_adsb_lol):
+      [0] icao24, [1] callsign, [2] reg, [3] time_position, [4] last_contact,
+      [5] lon, [6] lat, [7] baro_altitude_m, [8] on_ground, [9] velocity_m_s,
+      [10] true_track, [14] squawk.
+    """
+    lat = _coerce_float(rec.get('latitude'))
+    lon = _coerce_float(rec.get('longitude'))
+    if lat is None or lon is None:
+        return None
+    gs_kts = _coerce_float(rec.get('ground_speed_kts'))
+    velocity_ms = (gs_kts * 0.514444) if gs_kts is not None else None
+    last_seen = _coerce_float(rec.get('last_seen_unix'))
+    on_ground_raw = rec.get('on_ground')
+    on_ground = bool(on_ground_raw) if on_ground_raw is not None else None
+    squawk = rec.get('squawk')
+    squawk = str(squawk) if squawk not in (None, '') else None
+    return [
+        (rec.get('hex24') or '').lower() or None,          # 0 icao24
+        (rec.get('callsign') or None),                     # 1 callsign
+        (rec.get('registration') or None),                 # 2 reg
+        last_seen,                                         # 3 time_position
+        last_seen,                                         # 4 last_contact
+        lon,                                               # 5 lon
+        lat,                                               # 6 lat
+        _coerce_float(rec.get('altitude_m')),              # 7 baro_altitude_m
+        on_ground,                                         # 8 on_ground
+        velocity_ms,                                       # 9 velocity_m_s
+        _coerce_float(rec.get('heading_deg')),             # 10 true_track
+        None,                                              # 11 vertical_rate
+        None,                                              # 12 sensors
+        None,                                              # 13 geo_altitude_m
+        squawk,                                            # 14 squawk
+        False,                                             # 15 spi
+        0,                                                 # 16 position_source
+    ]
+
+
+def _backfill_cache_from_sb(hex_id):
+    """Cold-Start-Backfill: liest die frischeste persistierte Position aus
+    aircraft_positions (per hex24, sonst per Reg über die Backend-Map) und seedet
+    damit den In-Memory-_CACHE, BEVOR externe APIs (OpenSky/adsb.lol) probiert
+    werden. So überleben Flieger-Positionen einen Cloud-Run-Restart, statt nach
+    jedem Instanz-Wechsel aus dem Cache zu verschwinden.
+
+    Nutzt dieselbe SB-Read-Logik wie fallback_position(): Freshness < 24h via
+    fetched_at. Gibt die geseedete _CACHE-Entry zurück oder None bei Miss/SB-down.
+    Best-effort — Fehler werden gezählt + geloggt, brechen aber nie den Call."""
+    sb, ok = _sb_client()
+    if not ok:
+        return None
+    hex_l = (hex_id or '').strip().lower()
+    if not hex_l:
+        return None
+    try:
+        # Primär per hex24 suchen; wenn die Backend-Map die Reg kennt, auch per
+        # Reg (Tabelle ist reg-PK, der iOS-POST schreibt evtl. ohne hex24).
+        rows = []
+        r = (sb.table('aircraft_positions').select('*')
+             .eq('hex24', hex_l).limit(1).execute())
+        rows = r.data or []
+        if not rows:
+            reg = _hex_to_reg(hex_l)
+            if reg:
+                r = (sb.table('aircraft_positions').select('*')
+                     .eq('registration', reg).limit(1).execute())
+                rows = r.data or []
+    except Exception as e:
+        _PERSIST_STATS['persist_fail_count'] += 1
+        _PERSIST_STATS['last_error'] = f'backfill {type(e).__name__}: {str(e)[:140]}'
+        try:
+            current_app.logger.warning(
+                f'[adsb] backfill_lookup_FAIL hex={hex_l} '
+                f'err={type(e).__name__}: {str(e)[:160]}'
+            )
+        except Exception:
+            pass
+        return None
+
+    if not rows:
+        _PERSIST_STATS['backfill_miss_count'] += 1
+        return None
+    rec = rows[0]
+
+    # Staleness-Check (identisch zu fallback_position): fetched_at < 24h.
+    fetched_at = rec.get('fetched_at')
+    if fetched_at:
+        try:
+            dt = datetime.fromisoformat(str(fetched_at).replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - dt > timedelta(seconds=_FALLBACK_TTL_SECONDS):
+                _PERSIST_STATS['backfill_miss_count'] += 1
+                return None  # zu alt, nicht in den Cache seeden
+        except (ValueError, TypeError):
+            _PERSIST_STATS['backfill_miss_count'] += 1
+            return None
+
+    row = _row_from_aircraft_positions(rec)
+    if row is None:
+        _PERSIST_STATS['backfill_miss_count'] += 1
+        return None
+    # In den _CACHE seeden, markiert als 'supabase-backfill' damit Clients sehen
+    # dass das eine persistierte letzte Position ist, kein frischer Live-Ping.
+    _cache_put(hex_l, row, source='supabase-backfill')
+    _PERSIST_STATS['backfill_ok_count'] += 1
+    return _cache_get(hex_l)
 
 
 # ─── OpenSky Fetch ──────────────────────────────────────────
