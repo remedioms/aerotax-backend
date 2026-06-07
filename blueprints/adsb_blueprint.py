@@ -818,6 +818,20 @@ def get_adsb_state():
             "tried": tried,
         }), 200
 
+    # ─── Ehrlich: hat ein Upstream SAUBER geantwortet (ok=True, aber row=None,
+    # d.h. "kein ADS-B-Signal / gerade nicht in der Luft"), ist das KEIN Fehler.
+    # Dann 200 mit position=null statt 502 — die Maschine ist nur am Boden ohne
+    # ADS-B-Out. 502 nur, wenn ALLE Upstreams wirklich gescheitert sind. ───
+    if any(t.get("ok") for t in tried):
+        return jsonify({
+            "hex": hex_param,
+            "position": None,
+            "fetched_at": time.time(),
+            "cached": False,
+            "source": "no_signal",
+            "tried": tried,
+        }), 200
+
     # ─── Alles fehlgeschlagen → 502 mit detaillierter Diagnose ───
     return jsonify({
         "error": "all_upstreams_failed",

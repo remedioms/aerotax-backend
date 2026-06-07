@@ -9499,7 +9499,7 @@ def get_user_friends(token):
         prof = (_profile_load(friend_token) or {}).get('profile', {}) or {}
         enriched.append({
             'token': friend_token,
-            'match_id': hashlib.sha256(friend_token.encode()).hexdigest()[:16],
+            'match_id': _hashlib.sha256(friend_token.encode()).hexdigest()[:16],
             'profile': prof,
             'short': friend_token[:8] + '…',
         })
