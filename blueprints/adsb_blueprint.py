@@ -354,28 +354,271 @@ def resolve_reg_to_hex(reg):
         return hx
     return _BACKEND_REG_HEX.get(reg_u)
 
+
+# ─── Watch-Set + Poll-State (Cloud-Run-safe, alles in Supabase) ──────────────
+#
+# adsb_watch  = nutzer-getriebenes Set "welche Maschinen pollen wir aktiv".
+# poll_state  = persistenter Scheduler-/Budget-/Token-Zustand (Key-Value).
+#
+# Cloud-Run ist serverless+ephemer: KEIN Hintergrund-Thread, KEIN In-Process-
+# Scheduler. Aller Cross-Request-State liegt in Supabase, damit jeder /poll-Tick
+# (von Cloud Scheduler getriggert) den korrekten Zustand sieht — egal welche
+# Instanz ihn abarbeitet.
+
+# Wie lange eine zuletzt angefragte Maschine im aktiven Watch-Set bleibt.
+_WATCH_TTL_SECONDS = 4 * 3600           # ~4h
+# Wie selten /flights/aircraft (Inbound-Origin) pro Hex erneut geholt wird.
+_FLIGHTS_REFRESH_SECONDS = 2 * 3600     # ~2h
+
+
+def _touch_watch(hex_id, registration=None, priority=None):
+    """UPSERT eines Hex ins adsb_watch-Set (nutzer-getrieben). Setzt
+    last_requested_at=now, damit die Maschine im aktiven TTL-Fenster bleibt.
+    Best-effort: SB-down/Fehler → still (NIE die aufrufende Response brechen).
+
+    Wird aus /api/adsb/state und /api/aircraft/<token>/by-reg aufgerufen — so
+    wächst das Poll-Set genau um die Maschinen, die User gerade ansehen, und
+    schrumpft per TTL wieder. Kein Roster-Scan, beschränkt + selbst-regulierend."""
+    sb, ok = _sb_client()
+    if not ok:
+        return
+    hex_l = (hex_id or '').strip().lower()
+    if not hex_l:
+        return
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        row = {
+            'hex24': hex_l,
+            'last_requested_at': now_iso,
+        }
+        if registration:
+            reg_u = (registration or '').strip().upper()
+            if reg_u:
+                row['registration'] = reg_u
+        if priority is not None:
+            try:
+                row['priority'] = int(priority)
+            except (TypeError, ValueError):
+                pass
+        sb.table('adsb_watch').upsert(row, on_conflict='hex24').execute()
+    except Exception as e:
+        try:
+            current_app.logger.warning(
+                f'[adsb] touch_watch_FAIL hex={hex_l} '
+                f'{type(e).__name__}: {str(e)[:120]}')
+        except Exception:
+            pass
+
+
+def _load_active_watch():
+    """Liest das aktive Watch-Set (last_requested_at innerhalb TTL) aus Supabase.
+    Liefert eine Liste von Dicts. Best-effort: SB-down/Fehler → []. Wirft NIE."""
+    sb, ok = _sb_client()
+    if not ok:
+        return []
+    try:
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(seconds=_WATCH_TTL_SECONDS)).isoformat()
+        r = (sb.table('adsb_watch')
+             .select('*')
+             .gte('last_requested_at', cutoff)
+             .order('priority', desc=True)
+             .limit(2000)
+             .execute())
+        return r.data or []
+    except Exception as e:
+        try:
+            current_app.logger.warning(
+                f'[adsb] load_watch_FAIL {type(e).__name__}: {str(e)[:120]}')
+        except Exception:
+            pass
+        return []
+
+
+def _prune_stale_watch():
+    """Löscht Watch-Rows die länger als TTL nicht mehr angefragt wurden. Hält das
+    Set beschränkt. Best-effort, wirft NIE."""
+    sb, ok = _sb_client()
+    if not ok:
+        return
+    try:
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(seconds=_WATCH_TTL_SECONDS)).isoformat()
+        sb.table('adsb_watch').delete().lt('last_requested_at', cutoff).execute()
+    except Exception:
+        pass
+
+
+def _poll_state_get(key):
+    """Liest value_json einer poll_state-Row. None bei Miss/SB-down. Wirft NIE."""
+    sb, ok = _sb_client()
+    if not ok:
+        return None
+    try:
+        r = (sb.table('poll_state').select('value_json')
+             .eq('key', key).limit(1).execute())
+        rows = r.data or []
+        if not rows:
+            return None
+        v = rows[0].get('value_json')
+        return v if isinstance(v, dict) else None
+    except Exception:
+        return None
+
+
+def _poll_state_put(key, value_json):
+    """UPSERT einer poll_state-Row. Best-effort, wirft NIE."""
+    sb, ok = _sb_client()
+    if not ok:
+        return
+    try:
+        sb.table('poll_state').upsert({
+            'key': key,
+            'value_json': value_json,
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }, on_conflict='key').execute()
+    except Exception:
+        pass
+
+
+# ─── Regionale Bounding-Boxes ────────────────────────────────────────────────
+#
+# Statt pro Maschine einzeln /states/all?icao24= zu callen (1 Credit/Maschine),
+# gruppieren wir gewatchte Hexes in wenige grobe Regionen und holen je Region
+# EINEN bbox-Request (/states/all?lamin&lomin&lamax&lomax). Ein bbox-Call kostet
+# weniger Credits als ein globaler Call und deckt viele Maschinen auf einmal ab.
+# (lamin, lomin, lamax, lomax) = (min lat, min lon, max lat, max lon).
+_BBOXES = {
+    'europe':        (33.0,  -12.0,  72.0,   45.0),
+    'north_atlantic': (20.0,  -65.0,  72.0,  -12.0),
+    'north_america': (10.0, -170.0,  72.0,  -50.0),
+    'asia_pacific':  (-50.0,  60.0,   60.0,  180.0),
+    'row':           (-90.0, -180.0,  90.0,  180.0),  # Rest-of-World Catch-All
+}
+
+
+def _bbox_for_point(lat, lon):
+    """Ordnet eine Position der ersten passenden Region zu (row als Catch-All
+    immer zuletzt). None nur wenn lat/lon fehlt."""
+    if lat is None or lon is None:
+        return None
+    for name in ('europe', 'north_atlantic', 'north_america', 'asia_pacific'):
+        lamin, lomin, lamax, lomax = _BBOXES[name]
+        if lamin <= lat <= lamax and lomin <= lon <= lomax:
+            return name
+    return 'row'
+
+
 OPENSKY_URL = "https://opensky-network.org/api/states/all"
 OPENSKY_FLIGHTS_URL = "https://opensky-network.org/api/flights/aircraft"
+# OpenSky 2025 OAuth2 client-credentials Token-Endpoint (Keycloak).
+OPENSKY_TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
+                     "opensky-network/protocol/openid-connect/token")
 ADSB_LOL_URL = "https://api.adsb.lol/v2/icao"
 # Per-Upstream Timeouts (kürzer als vorher 10s — User wartet sonst zu lange
 # wenn OpenSky hängt):
 OPENSKY_TIMEOUT = 3
 OPENSKY_FLIGHTS_TIMEOUT = 6
 ADSB_LOL_TIMEOUT = 5
+OPENSKY_TOKEN_TIMEOUT = 6
 USER_AGENT = "AeroTax-Backend/1.1 (ADS-B-Proxy; mailto:ops@aerotax.de)"
+
+# In-Process OAuth2-Token-Cache (zusätzlich zum persistenten poll_state-Cache).
+# Spart pro Cloud-Run-Instanz den Token-Roundtrip; bei Cold-Start re-fetcht die
+# erste Anfrage. Token leben ~30min, wir nutzen 25min als sichere TTL.
+_OAUTH_CACHE = {"token": None, "expires_at": 0.0, "lock": threading.Lock()}
+_OAUTH_TTL_SAFETY = 25 * 60  # 25 min, OpenSky-Token gilt ~30min
+
+
+def _opensky_oauth_token():
+    """Holt/cacht ein OAuth2-Bearer-Token via client_credentials, wenn
+    OPENSKY_CLIENT_ID + OPENSKY_CLIENT_SECRET gesetzt sind. None wenn keine
+    Creds gesetzt ODER der Token-Fetch scheitert (Caller fällt dann auf Basic-
+    Auth bzw. anonym zurück). Wirft NIE.
+
+    Caching-Strategie (zweistufig):
+      1) In-Process-Cache (_OAUTH_CACHE) — schnellster Pfad pro Instanz.
+      2) poll_state['oauth_token'] — überlebt Cold-Starts, von allen Instanzen
+         geteilt (eine Instanz fetcht, der Rest liest).
+    """
+    cid = os.environ.get('OPENSKY_CLIENT_ID', '').strip()
+    secret = os.environ.get('OPENSKY_CLIENT_SECRET', '')
+    if not cid or not secret:
+        return None
+
+    now = time.time()
+    # 1) In-Process-Cache.
+    with _OAUTH_CACHE["lock"]:
+        if _OAUTH_CACHE["token"] and now < _OAUTH_CACHE["expires_at"]:
+            return _OAUTH_CACHE["token"]
+
+    # 2) Persistenter poll_state-Cache (geteilt über Instanzen).
+    cached = _poll_state_get('oauth_token')
+    if cached:
+        tok = cached.get('access_token')
+        exp = _coerce_float(cached.get('expires_at_unix')) or 0.0
+        if tok and now < exp:
+            with _OAUTH_CACHE["lock"]:
+                _OAUTH_CACHE["token"] = tok
+                _OAUTH_CACHE["expires_at"] = exp
+            return tok
+
+    # 3) Frisch holen (client_credentials grant).
+    try:
+        body = urllib.parse.urlencode({
+            "grant_type": "client_credentials",
+            "client_id": cid,
+            "client_secret": secret,
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            OPENSKY_TOKEN_URL, data=body, method='POST',
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "User-Agent": USER_AGENT,
+            })
+        with urllib.request.urlopen(req, timeout=OPENSKY_TOKEN_TIMEOUT) as resp:
+            obj = json.loads(resp.read())
+    except Exception as e:
+        try:
+            current_app.logger.warning(
+                f'[adsb] oauth_token_fetch_FAIL {type(e).__name__}: {str(e)[:120]}')
+        except Exception:
+            pass
+        return None
+
+    tok = obj.get('access_token')
+    if not tok:
+        return None
+    expires_in = _coerce_float(obj.get('expires_in')) or 1800.0
+    ttl = min(_OAUTH_TTL_SAFETY, max(60.0, expires_in - 60.0))
+    exp = now + ttl
+    with _OAUTH_CACHE["lock"]:
+        _OAUTH_CACHE["token"] = tok
+        _OAUTH_CACHE["expires_at"] = exp
+    # Best-effort in poll_state spiegeln (geteilt über Instanzen).
+    _poll_state_put('oauth_token', {
+        'access_token': tok,
+        'expires_at_unix': exp,
+    })
+    return tok
 
 
 def _opensky_auth_header():
-    """Optionaler HTTP-Basic-Auth-Header für OpenSky. Wenn OPENSKY_USERNAME +
-    OPENSKY_PASSWORD gesetzt sind, geben wir den Header zurück (höhere Credits);
-    sonst {} → anonymer Call (aktuelles Default-Verhalten). Wird konsistent auf
-    /states/all UND /flights/aircraft angewandt."""
+    """Auth-Header für OpenSky-Calls. Priorität:
+      1) OAuth2-Bearer (OPENSKY_CLIENT_ID/SECRET) — 2025-Standard, mehr Credits.
+      2) HTTP-Basic (OPENSKY_USERNAME/PASSWORD) — Legacy-Konto.
+      3) {} → anonymer Call (aktuelles Default-Verhalten, ZERO Creds).
+    Wird konsistent auf /states/all UND /flights/aircraft angewandt."""
+    token = _opensky_oauth_token()
+    if token:
+        return {"Authorization": f"Bearer {token}"}
     user = os.environ.get('OPENSKY_USERNAME', '').strip()
     pw = os.environ.get('OPENSKY_PASSWORD', '')
     if not user or not pw:
         return {}
-    token = base64.b64encode(f"{user}:{pw}".encode('utf-8')).decode('ascii')
-    return {"Authorization": f"Basic {token}"}
+    basic = base64.b64encode(f"{user}:{pw}".encode('utf-8')).decode('ascii')
+    return {"Authorization": f"Basic {basic}"}
 
 
 # ─── /api/adsb/state ─────────────────────────────────────────
@@ -410,6 +653,11 @@ def get_adsb_state():
                 "error": f"unknown registration {reg_param}",
                 "hint": "pass ?hex=<icao24> if client knows the mapping",
             }), 404
+
+    # Nutzer-getriebenes Watch-Set füttern: dieser Client interessiert sich
+    # gerade für diesen Hex → in adsb_watch upserten, damit der Shared-Poller
+    # ihn ins aktive Poll-Set aufnimmt (best-effort, bricht die Response nie).
+    _touch_watch(hex_param, registration=reg_param or None)
 
     # Fresh-Cache-Hit (60s TTL) — sofort raus.
     cached = _cache_get(hex_param)
@@ -985,6 +1233,68 @@ def _fetch_opensky(hex_id):
     return states[0]
 
 
+def _fetch_opensky_bbox(lamin, lomin, lamax, lomax):
+    """EIN batched /states/all-Call über eine Bounding-Box. Liefert
+    (states_list, credits_remaining):
+      states_list      = Liste von OpenSky-State-Rows (kann [] sein)
+      credits_remaining = int aus X-Rate-Limit-Remaining oder None
+
+    Raises:
+        _OpenSkyRateLimit bei 429 (retry_after aus X-Rate-Limit-Retry-After-
+            Seconds oder Retry-After).
+        _OpenSkyError bei anderen Fehlern.
+
+    Nutzt denselben Auth-Header-Pfad (OAuth2/Basic/anon) wie der Einzel-Fetch."""
+    qs = urllib.parse.urlencode({
+        "lamin": lamin, "lomin": lomin, "lamax": lamax, "lomax": lomax,
+    })
+    url = f"{OPENSKY_URL}?{qs}"
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    }
+    headers.update(_opensky_auth_header())
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        # bbox-Calls können größer sein → etwas großzügigeres Timeout.
+        with urllib.request.urlopen(req, timeout=max(OPENSKY_TIMEOUT, 8)) as resp:
+            data = resp.read()
+            remaining = _parse_rate_remaining(resp.headers)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            ra = (e.headers.get("X-Rate-Limit-Retry-After-Seconds")
+                  or e.headers.get("Retry-After") or "60")
+            try:
+                ra = int(ra)
+            except (TypeError, ValueError):
+                ra = 60
+            raise _OpenSkyRateLimit(ra) from e
+        raise _OpenSkyError(f"opensky bbox http {e.code}") from e
+    except urllib.error.URLError as e:
+        raise _OpenSkyError(f"opensky bbox network: {e.reason}") from e
+    except Exception as e:
+        raise _OpenSkyError(f"opensky bbox transport: {type(e).__name__}") from e
+
+    try:
+        obj = json.loads(data)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise _OpenSkyError("opensky bbox invalid json") from e
+
+    return (obj.get("states") or []), remaining
+
+
+def _parse_rate_remaining(headers):
+    """Liest X-Rate-Limit-Remaining (OpenSky Budget-Governor-Signal). None wenn
+    Header fehlt/unparsebar."""
+    try:
+        raw = headers.get("X-Rate-Limit-Remaining")
+        if raw is None:
+            return None
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def fetch_live_state(hex_id):
     """Public wrapper um den OpenSky→adsb.lol-Live-Fetch (Tier-1 für by-reg).
     Liefert die OpenSky-State-Row (Layout siehe _fetch_adsb_lol) oder None, ohne
@@ -1348,6 +1658,271 @@ def _adsb_lol_callsign_reg(callsign):
     if not reg:
         return None
     return {"reg": reg, "hex": ac.get("hex"), "type": ac.get("t")}
+
+
+# =============================================================================
+#  Shared-Poller: POST /api/adsb/poll  (Cloud-Scheduler-getriggert, ~60s)
+#  ---------------------------------------------------------------------------
+#  EIN gemeinsames Konto pollt OpenSky; ALLE User werden aus dem
+#  aircraft_positions-Cache serviert. Credit-Last unabhängig von Nutzerzahl.
+#
+#  Ein /poll-Tick = EIN Cycle:
+#    1) aktives Watch-Set laden (last_requested_at < TTL).
+#    2) Hexes in regionale Bounding-Boxes gruppieren.
+#    3) pro Box Cadence-Tier (hot/warm/cold) aus den dringendsten gewatchten
+#       Maschinen ableiten; nur callen wenn die Cadence abgelaufen ist
+#       (last_polled_at aus poll_state).
+#    4) Budget-Governor: X-Rate-Limit-Remaining lesen, bei Knappheit alle
+#       Cadences strecken; 429 → globaler _BACKOFF.
+#    5) je fällige Box EIN bbox-Call; Ergebnisse auf gewatchte Hexes filtern;
+#       als Keyframe in aircraft_positions persistieren.
+#    6) sparsam pro neu-gewatchtem Hex /flights/aircraft (Inbound-Origin).
+#
+#  Serverless: KEIN Hintergrund-Thread. Cloud Scheduler ruft diesen Endpoint
+#  zyklisch auf (siehe manuelle Schritte). Aller Zustand in Supabase.
+# =============================================================================
+
+# Cadence-Tiers in Sekunden (Default / unter Budget-Druck "stretched").
+_CADENCE = {
+    'hot':  {'normal': 45,  'stretched': 60},
+    'warm': {'normal': 150, 'stretched': 270},
+    'cold': {'normal': 300, 'stretched': 10 ** 9},  # cold gestretcht = on-demand/aus
+}
+# Konservatives Tages-Credit-Ziel (anon OpenSky ~400/Tag; OAuth2 mehr). Der
+# Governor streckt Cadences sobald die verbleibenden Credits unter dem
+# zeit-anteiligen Soll liegen.
+_DAILY_CREDIT_TARGET = 350
+
+
+def _poll_authorized(req):
+    """Shared-Secret-Check für /api/adsb/poll.
+      · ADSB_POLL_SECRET gesetzt → Header X-Poll-Secret MUSS exakt matchen.
+      · ADSB_POLL_SECRET NICHT gesetzt → nur localhost erlauben (deny remote),
+        damit der Endpoint ohne Konfiguration nicht offen im Netz steht.
+    """
+    secret = os.environ.get('ADSB_POLL_SECRET', '').strip()
+    if secret:
+        return (req.headers.get('X-Poll-Secret') or '').strip() == secret
+    # Kein Secret konfiguriert → nur lokale Aufrufe.
+    remote = (req.remote_addr or '')
+    return remote in ('127.0.0.1', '::1', 'localhost')
+
+
+def _budget_stretched(credits_remaining):
+    """Budget-Governor-Entscheidung: sollen wir Cadences strecken?
+    True wenn die verbleibenden Credits unter dem zeit-anteiligen Tages-Soll
+    liegen. Ohne bekanntes `credits_remaining` (anon-Header fehlt) → False
+    (nicht künstlich drosseln, wenn OpenSky uns nichts sagt)."""
+    if credits_remaining is None:
+        return False
+    # Anteil des Tages, der noch übrig ist (UTC).
+    now = datetime.now(timezone.utc)
+    secs_into_day = now.hour * 3600 + now.minute * 60 + now.second
+    frac_remaining_of_day = max(0.0, 1.0 - secs_into_day / 86400.0)
+    # Soll: mindestens so viele Credits wie der Rest-Tag anteilig braucht.
+    target_floor = _DAILY_CREDIT_TARGET * frac_remaining_of_day
+    return credits_remaining < target_floor
+
+
+def _tier_for_watch_rows(rows):
+    """Leitet das Cadence-Tier einer Box aus ihren gewatchten Maschinen ab.
+      hot  = irgendeine priority>0 (explizit erwartet) ODER airborne & landet
+             bald (Heuristik: niedrige Höhe & sinkend — hier vereinfacht auf
+             priority/aktuelle Höhe aus dem letzten Keyframe).
+      warm = irgendeine Maschine airborne.
+      cold = sonst (alle am Boden / kein Signal).
+
+    Wir nutzen den zuletzt persistierten Keyframe (aircraft_positions) als
+    Zustandsquelle — der Poller liest keine rohen Dokumente, nur Fakten."""
+    tier = 'cold'
+    for r in rows:
+        if (r.get('priority') or 0) > 0:
+            return 'hot'
+        kf = r.get('_keyframe') or {}
+        on_ground = kf.get('on_ground')
+        alt_m = kf.get('altitude_m')
+        if on_ground is False:
+            # Airborne. Niedrig (<3000m ≈ FL100) → wahrscheinlich An-/Abflug → hot.
+            if alt_m is not None and alt_m < 3000:
+                return 'hot'
+            tier = 'warm'
+    return tier
+
+
+def _attach_keyframes(rows):
+    """Reichert Watch-Rows um ihren letzten persistierten Keyframe an
+    (on_ground/altitude_m/lat/lon für die Tier-Heuristik + bbox-Zuordnung).
+    Best-effort: pro Hex ein Lookup; fehlende Keyframes bleiben leer."""
+    sb, ok = _sb_client()
+    if not ok:
+        return rows
+    for r in rows:
+        hex_l = (r.get('hex24') or '').strip().lower()
+        if not hex_l:
+            continue
+        try:
+            res = (sb.table('aircraft_positions')
+                   .select('latitude,longitude,altitude_m,on_ground')
+                   .eq('hex24', hex_l).limit(1).execute())
+            data = res.data or []
+            if data:
+                r['_keyframe'] = data[0]
+        except Exception:
+            pass
+    return rows
+
+
+def _persist_state_row_as_keyframe(state_row):
+    """Persistiert eine OpenSky-State-Row als aircraft_positions-Keyframe.
+    Reuse von _warm_persist_from_opensky_row (kennt das Row-Layout + Reg-
+    Auflösung + best-effort-Semantik)."""
+    try:
+        hex_id = (state_row[0] or '').lower() if state_row and state_row[0] else None
+        if not hex_id:
+            return
+        _warm_persist_from_opensky_row(hex_id, state_row, 'opensky-poll')
+    except Exception:
+        pass
+
+
+@adsb_bp.route('/api/adsb/poll', methods=['POST'])
+def adsb_poll():
+    """EIN Poll-Cycle für den Shared-Poller. Geschützt per X-Poll-Secret.
+    Antwort: {polled_boxes, calls_made, credits_remaining, watch_size, ...}."""
+    if not _poll_authorized(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    now = time.time()
+    # Globaler OpenSky-Backoff aktiv? (429 zuvor) → diesen Tick aussetzen.
+    with _BACKOFF["lock"]:
+        backoff_until = _BACKOFF["until"]
+    if now < backoff_until:
+        return jsonify({
+            "ok": True, "skipped": "backoff_active",
+            "backoff_remaining": int(backoff_until - now),
+            "polled_boxes": [], "calls_made": 0,
+            "credits_remaining": None, "watch_size": 0,
+        }), 200
+
+    # 1) aktives Watch-Set laden + Keyframes anhängen.
+    watch = _load_active_watch()
+    watch = _attach_keyframes(watch)
+    watch_size = len(watch)
+
+    # 2) Hexes in Bounding-Boxes gruppieren (per letztem Keyframe; ohne Position
+    #    → 'europe' als Default-Heimatregion der Nutzerbasis).
+    boxes = {}
+    for r in watch:
+        kf = r.get('_keyframe') or {}
+        box = _bbox_for_point(kf.get('latitude'), kf.get('longitude')) or 'europe'
+        boxes.setdefault(box, []).append(r)
+
+    calls_made = 0
+    credits_remaining = None
+    polled_boxes = []
+    stretched = False  # erst nach erstem Header-Read bekannt
+    today_key = 'budget:' + datetime.now(timezone.utc).strftime('%Y%m%d')
+
+    # 3+4+5) pro Box: Cadence prüfen, ggf. bbox-Call, persistieren.
+    for box_name, rows in boxes.items():
+        tier = _tier_for_watch_rows(rows)
+        cadence = _CADENCE[tier]['stretched' if stretched else 'normal']
+
+        st = _poll_state_get('bbox:' + box_name) or {}
+        last_polled = _coerce_float(st.get('last_polled_at')) or 0.0
+        if (now - last_polled) < cadence:
+            continue  # Cadence noch nicht abgelaufen → diese Box überspringen
+
+        lamin, lomin, lamax, lomax = _BBOXES[box_name]
+        watched_hexes = {(r.get('hex24') or '').lower() for r in rows}
+        try:
+            states, remaining = _fetch_opensky_bbox(lamin, lomin, lamax, lomax)
+            calls_made += 1
+            if remaining is not None:
+                credits_remaining = remaining
+                # Budget-Governor: ab jetzt ggf. strecken (gilt für Folge-Boxen).
+                stretched = stretched or _budget_stretched(remaining)
+        except _OpenSkyRateLimit as e:
+            with _BACKOFF["lock"]:
+                _BACKOFF["until"] = time.time() + e.retry_after
+            polled_boxes.append({"box": box_name, "tier": tier,
+                                 "ok": False, "reason": f"rate_limited({e.retry_after}s)"})
+            break  # 429 → restliche Boxen diesen Tick nicht mehr callen
+        except _OpenSkyError as e:
+            polled_boxes.append({"box": box_name, "tier": tier,
+                                 "ok": False, "reason": str(e)[:80]})
+            continue
+
+        # Auf gewatchte Hexes filtern + als Keyframes persistieren.
+        matched = 0
+        for srow in states:
+            if not srow:
+                continue
+            shex = (srow[0] or '').lower() if srow[0] else ''
+            if shex in watched_hexes:
+                _persist_state_row_as_keyframe(srow)
+                matched += 1
+
+        _poll_state_put('bbox:' + box_name, {
+            'last_polled_at': time.time(),
+            'last_tier': tier,
+            'last_count': matched,
+        })
+        polled_boxes.append({"box": box_name, "tier": tier, "ok": True,
+                             "matched": matched, "in_box_watched": len(watched_hexes)})
+
+    # 6) sparsam: /flights/aircraft pro neu-gewatchtem Hex (Inbound-Origin).
+    #    Rate-limit per flights_fetched_at (≥ _FLIGHTS_REFRESH_SECONDS her).
+    flights_fetched = 0
+    sb, sb_ok = _sb_client()
+    for r in watch:
+        if flights_fetched >= 5:  # pro Tick deckeln (Credit-Schonung)
+            break
+        ff = r.get('flights_fetched_at')
+        stale = True
+        if ff:
+            try:
+                dt = datetime.fromisoformat(str(ff).replace('Z', '+00:00'))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                stale = (datetime.now(timezone.utc) - dt
+                         > timedelta(seconds=_FLIGHTS_REFRESH_SECONDS))
+            except (ValueError, TypeError):
+                stale = True
+        if not stale:
+            continue
+        hex_l = (r.get('hex24') or '').lower()
+        if not hex_l:
+            continue
+        try:
+            fetch_recent_flight(hex_l)  # best-effort, Ergebnis nutzt by-reg live
+            flights_fetched += 1
+            if sb_ok:
+                sb.table('adsb_watch').update({
+                    'flights_fetched_at': datetime.now(timezone.utc).isoformat()
+                }).eq('hex24', hex_l).execute()
+        except Exception:
+            pass
+
+    # Budget-Counter persistieren + Stale-Watch prunen (TTL-Hygiene).
+    if calls_made:
+        budget = _poll_state_get(today_key) or {}
+        budget['calls_made'] = int(budget.get('calls_made', 0)) + calls_made
+        if credits_remaining is not None:
+            budget['remaining_seen'] = credits_remaining
+        budget['updated_at'] = datetime.now(timezone.utc).isoformat()
+        _poll_state_put(today_key, budget)
+    _prune_stale_watch()
+
+    return jsonify({
+        "ok": True,
+        "polled_boxes": polled_boxes,
+        "calls_made": calls_made,
+        "flights_fetched": flights_fetched,
+        "credits_remaining": credits_remaining,
+        "budget_stretched": stretched,
+        "watch_size": watch_size,
+    }), 200
 
 
 @adsb_bp.route("/api/flight-reg", methods=["GET"])

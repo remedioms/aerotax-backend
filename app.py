@@ -18200,9 +18200,11 @@ def aircraft_by_reg(token):
     try:
         from blueprints.adsb_blueprint import (
             resolve_reg_to_hex, fetch_live_state, fetch_recent_flight,
+            _touch_watch,
         )
     except Exception:
         resolve_reg_to_hex = fetch_live_state = fetch_recent_flight = None
+        _touch_watch = None
 
     now_unix = time.time()
     base = {'ok': True, 'registration': reg, 'hex': None, 'state': 'unknown',
@@ -18216,6 +18218,15 @@ def aircraft_by_reg(token):
         # Tail unbekannt → leise unknown, KEINE Fehlermeldung (Spec).
         return jsonify(base), 200
     base['hex'] = hex_id
+
+    # Nutzer-getriebenes Watch-Set füttern: dieser User trackt gerade diese
+    # Maschine → in adsb_watch upserten (priority=1 = explizit nachgefragt),
+    # damit der Shared-Poller sie aufnimmt. Best-effort, bricht by-reg nie.
+    if _touch_watch is not None:
+        try:
+            _touch_watch(hex_id, registration=reg, priority=1)
+        except Exception:
+            pass
 
     # ── Tier 1: Live-Position (OpenSky → adsb.lol) ──
     row = None
