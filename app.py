@@ -13211,8 +13211,15 @@ def delete_wall_post(token, post_id):
         return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
     new_posts = [p for p in posts if p is not target_post]
     _wall_save_posts(new_posts)
-    # Comments aus SB + Disk entfernen
+    # Post-Row aus SB + Comments + Likes entfernen.
+    # _wall_save_posts macht nur ein UPSERT (on_conflict='id') — das entfernt die
+    # gelöschte Row NICHT, der SB-primary Loader liefert sie sonst wieder zurück.
+    # Darum hier ein expliziter Row-Delete.
     if SB_AVAILABLE:
+        try:
+            sb.table('wall_posts').delete().eq('id', post_id).execute()
+        except Exception as e:
+            app.logger.warning(f'[wall-delete] sb post row delete failed: {e}')
         try:
             sb.table('wall_comments').delete().eq('post_id', post_id).execute()
         except Exception as e:
@@ -13776,6 +13783,19 @@ def forum_delete_thread(token, thread_id):
     if len(new_threads) == len(threads):
         return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
     _forum_save_threads(new_threads)
+    # Thread-Row + zugehörige Replies aus SB entfernen.
+    # _forum_save_threads/_forum_save_replies machen nur UPSERT (on_conflict='id') —
+    # ohne expliziten Row-Delete liefert der SB-primary Loader die gelöschte Row
+    # wieder zurück. Best-effort, guarded.
+    if SB_AVAILABLE:
+        try:
+            sb.table('forum_threads').delete().eq('id', thread_id).execute()
+        except Exception as e:
+            app.logger.warning(f'[forum-delete] sb thread row delete failed: {e}')
+        try:
+            sb.table('forum_replies').delete().eq('thread_id', thread_id).execute()
+        except Exception as e:
+            app.logger.warning(f'[forum-delete] sb replies cleanup failed: {e}')
     # Delete replies file
     rp = _forum_replies_path(thread_id)
     if rp:
@@ -13913,6 +13933,14 @@ def forum_delete_reply(token, reply_id):
             deleted = True
             parent_thread_id = tid
             _forum_save_replies(tid, new_replies)
+            # Reply-Row explizit aus SB löschen. _forum_save_replies macht nur
+            # UPSERT (on_conflict='id') — die gelöschte Row bliebe sonst in SB
+            # und der SB-primary Loader würde sie wieder zurückliefern.
+            if SB_AVAILABLE:
+                try:
+                    sb.table('forum_replies').delete().eq('id', reply_id).execute()
+                except Exception as e:
+                    app.logger.warning(f'[forum-delete] sb reply row delete failed: {e}')
             break
     if not deleted:
         return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
@@ -14800,6 +14828,14 @@ def layover_rec_delete_comment(token, rec_id, comment_id):
     if len(new_comments) == len(comments):
         return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
     _layover_save_comments(rec_id, new_comments)
+    # Comment-Row explizit aus SB löschen. _layover_save_comments macht nur
+    # UPSERT (on_conflict='id') — ohne Row-Delete liefert der SB-primary Loader
+    # den gelöschten Kommentar wieder zurück. Best-effort, guarded.
+    if SB_AVAILABLE:
+        try:
+            sb.table('layover_rec_comments').delete().eq('id', comment_id).execute()
+        except Exception as e:
+            app.logger.warning(f'[layover-comments] sb comment row delete failed: {e}')
     return jsonify({'ok': True})
 
 
