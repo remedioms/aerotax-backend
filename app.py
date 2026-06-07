@@ -17370,26 +17370,55 @@ def _aerodatabox_board(iata, flight_type='departure'):
         now = datetime.now(timezone(timedelta(hours=2)))
     except Exception:
         now = datetime.now(timezone.utc)
-    # 12h-Fenster ab jetzt (AeroDataBox: max 12h pro Call).
-    frm = now.strftime('%Y-%m-%dT%H:%M')
-    to = (now + timedelta(hours=12)).strftime('%Y-%m-%dT%H:%M')
-    url = ('https://aerodatabox.p.rapidapi.com/flights/airports/iata/'
-           + iata + '/' + frm + '/' + to)
-    try:
-        r = requests.get(url,
-                         params={'direction': 'Arrival' if arr else 'Departure',
-                                 'withLocation': 'false', 'withCancelled': 'true',
-                                 'withCodeshared': 'false', 'withCargo': 'true',
-                                 'withPrivate': 'false'},
-                         headers={'X-RapidAPI-Key': key,
-                                  'X-RapidAPI-Host': 'aerodatabox.p.rapidapi.com'},
-                         timeout=15)
-        if r.status_code != 200:
+
+    def _adb_window(frm_dt, to_dt):
+        """Ein AeroDataBox-Call für ein <=12h-Fenster. Rohe Items oder None."""
+        frm = frm_dt.strftime('%Y-%m-%dT%H:%M')
+        to = to_dt.strftime('%Y-%m-%dT%H:%M')
+        url = ('https://aerodatabox.p.rapidapi.com/flights/airports/iata/'
+               + iata + '/' + frm + '/' + to)
+        try:
+            r = requests.get(url,
+                             params={'direction': 'Arrival' if arr else 'Departure',
+                                     'withLocation': 'false', 'withCancelled': 'true',
+                                     'withCodeshared': 'false', 'withCargo': 'true',
+                                     'withPrivate': 'false'},
+                             headers={'X-RapidAPI-Key': key,
+                                      'X-RapidAPI-Host': 'aerodatabox.p.rapidapi.com'},
+                             timeout=15)
+            if r.status_code != 200:
+                return None
+            body = r.json() or {}
+        except Exception:
             return None
-        body = r.json() or {}
-    except Exception:
+        return body.get('arrivals' if arr else 'departures') or []
+
+    # AeroDataBox: max 12h pro Call. EIN 12h-Fenster ab jetzt schnitt Langstrecken-
+    # Flüge ab, die erst später am Tag abfliegen (LH-Langstrecke). Darum ZWEI
+    # aufeinanderfolgende 12h-Fenster (= 24h ab jetzt) holen und mergen → der ganze
+    # verbleibende Betriebstag ist sichtbar. Dedup über (number, scheduledTime).
+    # KEINE Erfindung — nur nicht mehr droppen. Schlägt der erste Call fehl → None
+    # (ehrlich Quelle-down); der zweite ist best-effort (None → einfach kein Extra).
+    first = _adb_window(now, now + timedelta(hours=12))
+    if first is None:
         return None
-    items = body.get('arrivals' if arr else 'departures') or []
+    second = _adb_window(now + timedelta(hours=12), now + timedelta(hours=24)) or []
+    items = []
+    seen_keys = set()
+    for f in list(first) + list(second):
+        try:
+            mv0 = (f.get('movement') or f.get('arrival' if arr else 'departure')
+                   or f.get('departure' if arr else 'arrival') or {})
+            sch0 = ((mv0.get('scheduledTime') or {}).get('local')
+                    or (mv0.get('scheduledTime') or {}).get('utc') or '')
+            dk = ((f.get('number') or '').strip(), sch0)
+        except Exception:
+            dk = None
+        if dk is not None:
+            if dk in seen_keys:
+                continue
+            seen_keys.add(dk)
+        items.append(f)
 
     def _t_local(v):
         node = v or {}
@@ -17481,7 +17510,13 @@ def _fra_board_cached(flight_type):
     cached = _AIRPORT_BOARD_CACHE.get(ckey)
     if cached and (_t.time() - cached[0]) < _AIRPORT_BOARD_TTL:
         return cached[1]
-    flights = _fetch_fra_flights(flight_type)
+    # Viele Seiten holen — der Fraport-Feed ist eine now-relative, nach sched
+    # sortierte Rolling-Liste (~25 Flüge/Seite). Mit nur 3 Seiten (~75 Flüge)
+    # fielen Langstrecken-Flüge, die erst später am Tag abfliegen (viele LH-
+    # Langstrecken), aus dem Fenster — nach dem "Nur LH"-Filter fehlten sie ganz.
+    # Gleiche Tiefe wie die Tages-Tafel (`_fra_day_board_cached`), damit ALLE
+    # echten Flüge des Tages sichtbar sind. KEINE Erfindung — nur nicht mehr droppen.
+    flights = _fetch_fra_flights(flight_type, max_pages=20)
     if flights is None:
         return None
     _AIRPORT_BOARD_CACHE[ckey] = (_t.time(), flights)
