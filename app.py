@@ -362,23 +362,82 @@ def _bug004_get_route_needs_auth(path):
     return False
 
 
-# ── AUTH-BINDING (BUG-AUDIT 2026-06-07) ──────────────────────────────────
+# ── AUTH-BINDING (BUG-AUDIT 2026-06-07, gehärtet 2026-06-08) ─────────────
 # Cross-User-/Public-Pfade: hier ist das AT-Token im Pfad ABSICHTLICH das
-# eines ANDEREN Users (Friend-Discovery, Public-Feed). Für diese Pfade darf
-# der Bearer NICHT gleich dem Pfad-Token sein müssen — sonst bräche der
-# Friend-Lookup. Alle übrigen owner-scoped Pfade binden (wenn ein Bearer
-# anliegt) den Bearer constant-time an das Pfad-Token.
+# eines ANDEREN Users (Friend-Discovery) ODER der Pfad läuft bevor überhaupt
+# ein Token existiert (Auth/Signup). Für diese Pfade darf der Bearer NICHT
+# gleich dem Pfad-Token sein müssen — sonst bräche der Friend-Lookup bzw.
+# der Login. Alle ÜBRIGEN owner-scoped Pfade binden den Bearer constant-time
+# an das Pfad-Token (Verhalten siehe _bug004_token_auth_gate, abhängig vom
+# Enforcement-Flag AEROX_REQUIRE_TOKEN_BINDING).
+#
+# WICHTIG zur Regex-Semantik: _BUG004_TOKEN_PATH_RE matcht das ERSTE AT-…-
+# Segment im Pfad ("first match wins"). Für Routen wie
+#   /api/user/friend-roster/<token>/<friend_token>
+#   /api/user/friend-compare/<token>/<friend_token>
+#   /api/crew-chat/<token>/dm/<friend_token>
+# ist das erste Segment IMMER das EIGENE Token des Callers → owner-scoped →
+# Binding ist korrekt (der Caller-Bearer muss dem eigenen Token gleichen).
+# Es gibt aktuell KEINE Route, bei der ein FREMDES Token als erstes AT-…-
+# Segment auftaucht ausser den beiden expliziten Discovery-GETs unten.
 #
 # Hinweis Wall/Forum: dort ist das Pfad-Token das EIGENE Token des Callers
 # (Author-Identität), also owner-scoped — der iOS-Client schickt dort aktuell
-# KEINEN Bearer, daher greift die "Bearer absent → nur warnen"-Regel und es
-# bricht nichts. Sobald ein Bearer anliegt, muss er passen.
+# KEINEN Bearer; bei Flag=OFF greift "Bearer absent → nur warnen" und es
+# bricht nichts. Bei Flag=ON MUSS ein Bearer anliegen und passen.
+#
+# ⚠️ FOLLOW-UP / RESTLAST (echte Security erst danach vollständig):
+#   1. iOS-Client muss den Authorization: Bearer <token> auf JEDER owner-
+#      scoped Route mitsenden (wird parallel ausgerollt). SOLANGE der Client
+#      das nicht tut, MUSS AEROX_REQUIRE_TOKEN_BINDING=OFF bleiben, sonst
+#      sperrt das Gate legitime Requests aus.
+#   2. Das Token muss langfristig AUS DER URL RAUS — nur noch im Header. Solange
+#      es im Pfad steht (Access-Logs, Proxy-Logs, Referer, Browser-History,
+#      Sentry-Breadcrumbs) bleibt der URL-Leak-Vektor offen; Bearer-Binding
+#      schützt nur gegen das WIEDERVERWENDEN eines geleakten Tokens durch einen
+#      ANDEREN authentifizierten Aufrufer, NICHT gegen das Leak selbst.
+#      => Header-only-Token ist der eigentliche Fix, Bearer-Binding ist Stufe 1.
+#
+# Enforcement-Flag: AEROX_REQUIRE_TOKEN_BINDING == '1' schaltet die strikte
+# Bindung EIN (default AUS → altes Verhalten, deploy-sicher).
+_BUG004_REQUIRE_TOKEN_BINDING = (os.environ.get('AEROX_REQUIRE_TOKEN_BINDING') == '1')
+
 _BUG004_CROSS_USER_PREFIXES = (
-    '/api/user/profile/',   # GET = Friend-Profil-Lookup (fremdes Token)
-    '/api/user/friends/',   # GET = Friend-of-Friend-Discovery (fremdes Token)
-    '/api/layover-recs/',   # Discovery/Recs über fremde Tokens
-    '/api/crews-on-flight/',
+    # Genuin cross-user: erstes AT-…-Segment ist das Token eines ANDEREN Users.
+    '/api/user/profile/',   # GET = Friend-Profil-Lookup (fremdes Token; Owner
+                            #       bekommt via _request_bearer_matches Vollprofil,
+                            #       Fremder die Public-Whitelist).
+                            #   ⚠ PUT /api/user/profile/<token> ist owner-scoped
+                            #     (eigenes Profil schreiben) und wird durch dieses
+                            #     PREFIX MIT-exempted → Binding greift dort NICHT.
+                            #     Folge: nur SCHWÄCHER (kein Binding), bricht nichts.
+                            #     TODO-REVIEW: PUT aus dem Cross-User-Exempt nehmen.
+    '/api/user/friends/',   # GET /api/user/friends/<token> = Friend-of-Friend-
+                            #     Discovery (fremdes Token).
+                            #   ⚠ Sub-Routen friends/<token>/add|remove|overlap und
+                            #     friend-groups/* sind owner-scoped (erstes Token =
+                            #     eigenes) und werden durch dieses PREFIX MIT-
+                            #     exempted → kein Binding. Nur schwächer, bricht
+                            #     nichts. TODO-REVIEW: präziser auf den reinen
+                            #     friends/<token>-GET einschränken.
+    # ── Folgende Prefixes sind NICHT genuin cross-user (erstes Token = eigenes),
+    #    bleiben aber konservativ exempt, damit Enforcement nichts bricht.
+    #    Sie SCHWÄCHEN die Bindung nur (kein 401), öffnen keine fremden Daten.
+    '/api/layover-recs/',   # discover/<token>, add, vote, comments: erstes Token
+                            #     ist das EIGENE → eigentlich owner-scoped.
+                            #     TODO-REVIEW: könnte enforced werden.
+    '/api/crews-on-flight/',  # Legacy-Prefix; die LIVE-Route ist /api/crew/flight/
+                              #   und owner-scoped. Dieser Prefix matcht keine
+                              #   aktive Route — harmlos, zur Sicherheit drin.
 )
+
+# Unauthenticated-Routen: laufen BEVOR ein Token existiert (Signup/Login/
+# Apple/Forgot/Reset). Diese sind bereits über _BUG004_WHITELIST_PREFIXES
+# ('/api/auth/') gedeckt und erreichen das Binding gar nicht erst. Family-
+# Pair-Code-/Redeem-Routen existieren in diesem Backend nicht (liegen in den
+# AeroX-Blueprints); falls sie hier eingeführt werden, MÜSSEN sie in
+# _BUG004_WHITELIST_PREFIXES (nicht hier) als pre-token public eingetragen
+# werden, da sie noch kein AT-…-Token tragen.
 
 
 def _bug004_is_cross_user_path(path):
@@ -453,29 +512,48 @@ def _bug004_token_auth_gate():
         # Bekanntes Token? — _validate_token_exists nutzt 60s-Cache
         if _validate_token_exists(token) is None:
             return jsonify({'ok': False, 'error': 'unauthorized'}), 401
-        # AUTH-BINDING (BUG-AUDIT 2026-06-07): Das alte Gate prüfte NUR ob das
-        # Pfad-Token in auth_users existiert — es band es NICHT an den
-        # authentifizierten Aufrufer. Jeder mit irgendeinem gültigen Bearer
-        # konnte fremde owner-scoped Pfade ansprechen, solange das Pfad-Token
-        # existierte. Härtung ohne den iOS-Client zu brechen:
-        #   - Cross-User-/Public-Pfade (Friend-Lookup etc.) → kein Binding.
-        #   - Sonst owner-scoped: WENN ein Bearer anliegt, MUSS er constant-time
-        #     gleich dem Pfad-Token sein (Mismatch → 401).
-        #   - Kein Bearer (aktueller iOS-Default für owner-Routen) → nur warnen,
-        #     NICHT blocken, damit die App nicht bricht.
+        # AUTH-BINDING (BUG-AUDIT 2026-06-07, gehärtet 2026-06-08): Das alte Gate
+        # prüfte NUR ob das Pfad-Token in auth_users existiert — es band es NICHT
+        # an den authentifizierten Aufrufer. Jeder mit irgendeinem gültigen Bearer
+        # (oder, ohne Bearer, mit Kenntnis eines fremden Pfad-Tokens) konnte fremde
+        # owner-scoped Pfade ansprechen, solange das Pfad-Token existierte.
+        #
+        # Zwei Modi, gesteuert über AEROX_REQUIRE_TOKEN_BINDING:
+        #
+        #   ENFORCE  (Flag == '1'): Für jede owner-scoped Route (NICHT in
+        #     _BUG004_CROSS_USER_PREFIXES) MUSS ein Authorization: Bearer <t>
+        #     anliegen und constant-time gleich dem Pfad-Token sein.
+        #       - Bearer fehlt        → 401 token_binding_required
+        #       - Bearer ≠ Pfad-Token → 401 token_binding_mismatch
+        #     Voraussetzung: der iOS-Client sendet den Bearer bereits (parallel
+        #     ausgerollt). Solange das nicht flächendeckend ist → Flag AUS lassen.
+        #
+        #   LEGACY   (Flag default AUS): altes Verhalten, deploy-sicher.
+        #       - Bearer anliegend & Mismatch → 401 token_binding_mismatch
+        #       - Bearer fehlt                → nur warnen, NICHT blocken
+        #         (aktueller iOS-Default für owner-Routen, App bricht sonst).
         if not _bug004_is_cross_user_path(path):
             bearer = _request_bearer_token()
-            if bearer is not None:
+            if _BUG004_REQUIRE_TOKEN_BINDING:
+                # ENFORCE: Bearer ist Pflicht und muss passen.
+                if bearer is None:
+                    return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
                 if not hmac.compare_digest(bearer, token):
                     return jsonify({'ok': False, 'error': 'token_binding_mismatch'}), 401
             else:
-                try:
-                    app.logger.warning(
-                        f'[bug004-gate] owner-route ohne Authorization-Bearer '
-                        f'method={method} path-tok={token[:8]} — binding nicht '
-                        f'erzwingbar (client sendet keinen Bearer)')
-                except Exception:
-                    pass
+                # LEGACY: nur Mismatch-bei-anliegendem-Bearer blockt.
+                if bearer is not None:
+                    if not hmac.compare_digest(bearer, token):
+                        return jsonify({'ok': False, 'error': 'token_binding_mismatch'}), 401
+                else:
+                    try:
+                        app.logger.warning(
+                            f'[bug004-gate] owner-route ohne Authorization-Bearer '
+                            f'method={method} path-tok={token[:8]} — binding nicht '
+                            f'erzwingbar (client sendet keinen Bearer; '
+                            f'AEROX_REQUIRE_TOKEN_BINDING aus)')
+                    except Exception:
+                        pass
     except Exception as e:
         # Auth-Gate-Bugs dürfen die App nicht killen — log + pass-through
         try:
