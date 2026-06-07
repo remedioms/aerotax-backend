@@ -18078,7 +18078,13 @@ def _aerodatabox_parse_flight(f, fallback_number=''):
 
 
 def _aerodatabox_flight_by_reg(registration, date_iso=None):
-    """Aktueller/nächster Flug einer Tail-Registration via AeroDataBox
+    """DEPRECATED (2026-06-07): NICHT mehr im by-reg-Pfad verdrahtet. Der
+    /api/aircraft/<token>/by-reg-Endpoint nutzt jetzt ausschließlich OpenSky
+    (permanent gratis, kein RapidAPI-Key). Diese Funktion bleibt nur stehen, weil
+    sie sich `_aerodatabox_parse_flight` mit dem flight-by-NUMBER-Pfad teilt; sie
+    wird nirgends mehr aufgerufen.
+
+    Aktueller/nächster Flug einer Tail-Registration via AeroDataBox
     /flights/reg/{registration}[/{date}] (RapidAPI, env-gated). registration =
     Tail wie 'D-AIXG'. Liefert dasselbe kompakte Dict wie
     `_aerodatabox_flight_by_number` (Route, Soll-/erwartete Zeiten, Status,
@@ -18152,37 +18158,213 @@ def flight_status(token):
                     'source': 'aerodatabox'})
 
 
+def _icao_to_iata_best(code):
+    """ICAO-Airport-Code → IATA, best-effort über die DE-Map; sonst der Code
+    unverändert (iOS hat eine eigene umfangreichere AirportDB für die Anzeige)."""
+    if not code:
+        return None
+    c = code.strip().upper()
+    return _DE_ICAO_TO_IATA.get(c, c)
+
+
 @app.route('/api/aircraft/<token>/by-reg', methods=['GET'])
 def aircraft_by_reg(token):
-    """Flugplan/Status nach Tail-REGISTRATION. Query: ?reg=D-AIXG&date=YYYY-MM-DD
-    (date optional). Quelle: AeroDataBox /flights/reg/{reg} (dieselbe Tafel-Quelle
-    wie /board und /api/flight/<token>/status). Ehrlich: ohne AERODATABOX_KEY oder
-    ohne Treffer → ok=False + Klartext, KEINE Erfindung.
+    """Live-Position/Inbound-Status nach Tail-REGISTRATION — OpenSky-only
+    (permanent gratis, funktioniert ANONYM; KEINE bezahlte Flug-API).
 
-    Tier-1 des iOS-Live-Fliegers: Tail bekannt → Inbound-Route + Soll-/erwartete
-    Zeiten + Status, BEVOR Flugnummer-Board oder ADS-B-Hex befragt wird. Das
-    `flight`-Schema ist identisch zu /status, sodass der Client beide Pfade mit
-    demselben Decoder liest."""
-    import os as _os
+    Query: ?reg=D-AIXG  (date wird ignoriert — OpenSky liefert ist-Daten, keine
+    Termin-Pläne; der Parameter bleibt für Client-Abwärtskompatibilität erlaubt).
+
+    Wasserfall (ehrlich, nichts erfunden):
+      Reg → Hex (resolve_reg_to_hex: Supabase tail_hex → hartkodierte Map).
+        kein Hex → state='unknown', source='unknown' (kein Fehler, leise).
+      Tier 1 (live):   OpenSky /states/all?icao24=hex → Position (lat/lng/alt/…).
+      Tier 2 (flights):OpenSky /flights/aircraft (letzte ~36h) → jüngster Flug →
+                       Inbound-Herkunft (estDepartureAirport) + Ziel + last-seen.
+                       OpenSky gibt HISTORISCHE Flüge, KEINE geplante ETA — wir
+                       erfinden keine eta_minutes.
+      Tier 3 (cache):  aircraft_positions letzte bekannte Position (mit Alter).
+      Tier 4:          unknown.
+
+    Response: {ok, registration, hex, state, position?, inbound_from_icao?,
+               eta_minutes?, source:'live'|'flights'|'cache'|'unknown', fetched_at}.
+    Niemals ein bezahlter Provider als source. Stale wird NIE als aktuell verkauft."""
+    import time
     reg = (request.args.get('reg') or '').upper().replace(' ', '').strip()
-    date_iso = (request.args.get('date') or '').strip() or None
-    if date_iso:
-        import re as _re
-        if not _re.match(r'^\d{4}-\d{2}-\d{2}$', date_iso):
-            date_iso = None
     if len(reg) < 3:
-        return jsonify({'ok': False, 'error': 'bad_reg',
+        return jsonify({'ok': False, 'error': 'bad_reg', 'registration': reg,
                         'message': 'Keine gültige Registrierung.'}), 200
-    if not _os.environ.get('AERODATABOX_KEY'):
-        return jsonify({'ok': False, 'error': 'source_unavailable', 'reg': reg,
-                        'message': 'Flugplan-Quelle aktuell nicht verfügbar.'}), 200
-    flight = _aerodatabox_flight_by_reg(reg, date_iso)
-    if not flight:
-        return jsonify({'ok': False, 'error': 'not_found', 'reg': reg,
-                        'message': ('Für ' + reg + ' liegt aktuell kein '
-                                    'Flugplan vor.')}), 200
-    return jsonify({'ok': True, 'reg': reg, 'flight': flight,
-                    'source': 'aerodatabox'})
+
+    # Blueprint-Helfer (Reg→Hex, OpenSky-Fetch, Cache). Soft-Import: wenn das
+    # Blueprint nicht geladen ist, degradieren wir ehrlich auf 'unknown'.
+    try:
+        from blueprints.adsb_blueprint import (
+            resolve_reg_to_hex, fetch_live_state, fetch_recent_flight,
+        )
+    except Exception:
+        resolve_reg_to_hex = fetch_live_state = fetch_recent_flight = None
+
+    now_unix = time.time()
+    base = {'ok': True, 'registration': reg, 'hex': None, 'state': 'unknown',
+            'source': 'unknown', 'fetched_at': now_unix}
+
+    if resolve_reg_to_hex is None:
+        return jsonify(base), 200
+
+    hex_id = resolve_reg_to_hex(reg)
+    if not hex_id:
+        # Tail unbekannt → leise unknown, KEINE Fehlermeldung (Spec).
+        return jsonify(base), 200
+    base['hex'] = hex_id
+
+    # ── Tier 1: Live-Position (OpenSky → adsb.lol) ──
+    row = None
+    try:
+        row = fetch_live_state(hex_id)
+    except Exception:
+        row = None
+    if row and isinstance(row, (list, tuple)) and len(row) > 6:
+        lat = row[6]
+        lon = row[5]
+        if lat is not None and lon is not None:
+            on_ground = bool(row[8]) if len(row) > 8 and row[8] is not None else False
+            vel_ms = row[9] if len(row) > 9 else None
+            try:
+                gs_kts = round(float(vel_ms) / 0.514444, 1) if vel_ms is not None else None
+            except (TypeError, ValueError):
+                gs_kts = None
+            alt_m = row[7] if len(row) > 7 else None
+            try:
+                alt_ft = round(float(alt_m) / 0.3048) if alt_m is not None else None
+            except (TypeError, ValueError):
+                alt_ft = None
+            heading = row[10] if len(row) > 10 else None
+            out = dict(base)
+            out['state'] = 'at_gate' if on_ground else 'in_flight'
+            out['source'] = 'live'
+            out['position'] = {
+                'lat': lat, 'lng': lon,
+                'altitude_ft': alt_ft,
+                'ground_speed_kts': gs_kts,
+                'heading': heading,
+                'on_ground': on_ground,
+            }
+            # Inbound-Herkunft best-effort aus dem jüngsten Flug anreichern
+            # (keine ETA — OpenSky liefert keine geplante Ankunft).
+            try:
+                fl = fetch_recent_flight(hex_id)
+            except Exception:
+                fl = None
+            if fl and fl.get('est_departure_icao'):
+                out['inbound_from_icao'] = fl['est_departure_icao']
+            out['flight'] = _by_reg_legacy_flight(out, fl)
+            return jsonify(out), 200
+
+    # ── Tier 2: Letzter/aktueller Flug (historisch, keine ETA) ──
+    fl = None
+    try:
+        fl = fetch_recent_flight(hex_id)
+    except Exception:
+        fl = None
+    if fl and (fl.get('est_departure_icao') or fl.get('est_arrival_icao')):
+        out = dict(base)
+        out['source'] = 'flights'
+        # Airborne vs. abgeschlossen: wenn der Track noch "frisch" endet (<10min),
+        # behandeln wir ihn als in_flight, sonst als gelandet. KEINE eta_minutes.
+        last_seen = fl.get('last_seen_unix')
+        try:
+            age = now_unix - float(last_seen) if last_seen is not None else None
+        except (TypeError, ValueError):
+            age = None
+        if age is not None and age < 600:
+            out['state'] = 'in_flight'
+        else:
+            out['state'] = 'landed'
+        if fl.get('est_departure_icao'):
+            out['inbound_from_icao'] = fl['est_departure_icao']
+        if last_seen is not None:
+            out['last_seen_unix'] = last_seen
+        out['flight'] = _by_reg_legacy_flight(out, fl)
+        return jsonify(out), 200
+
+    # ── Tier 3: Letzte bekannte Position aus aircraft_positions (mit Alter) ──
+    if SB_AVAILABLE:
+        try:
+            r = (sb.table('aircraft_positions').select('*')
+                 .eq('registration', reg).limit(1).execute())
+            rows = r.data or []
+        except Exception:
+            rows = []
+        if rows:
+            rec = rows[0]
+            lat = rec.get('latitude')
+            lon = rec.get('longitude')
+            fetched_at_iso = rec.get('fetched_at')
+            cache_age = None
+            if fetched_at_iso:
+                try:
+                    dt = datetime.fromisoformat(str(fetched_at_iso).replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    cache_age = (datetime.now(timezone.utc) - dt).total_seconds()
+                except (ValueError, TypeError):
+                    cache_age = None
+            # Nur < 24h als "letzte bekannte Position" zeigen — älter ist wertlos.
+            if lat is not None and lon is not None and (cache_age is None or cache_age < 24 * 3600):
+                alt_m = rec.get('altitude_m')
+                try:
+                    alt_ft = round(float(alt_m) / 0.3048) if alt_m is not None else None
+                except (TypeError, ValueError):
+                    alt_ft = None
+                out = dict(base)
+                out['state'] = 'landed' if rec.get('on_ground') else 'in_flight'
+                out['source'] = 'cache'
+                out['position'] = {
+                    'lat': lat, 'lng': lon,
+                    'altitude_ft': alt_ft,
+                    'ground_speed_kts': rec.get('ground_speed_kts'),
+                    'heading': rec.get('heading_deg'),
+                    'on_ground': rec.get('on_ground'),
+                }
+                if rec.get('last_seen_unix') is not None:
+                    out['last_seen_unix'] = rec.get('last_seen_unix')
+                if cache_age is not None:
+                    out['cache_age_seconds'] = int(cache_age)
+                out['flight'] = _by_reg_legacy_flight(out, None)
+                return jsonify(out), 200
+
+    # ── Tier 4: unknown ──
+    return jsonify(base), 200
+
+
+def _by_reg_legacy_flight(out, fl):
+    """Baut ein `flight`-Dict im alten /status-Schema aus dem neuen OpenSky-
+    Waterfall-Ergebnis — damit ältere iOS-Builds (die `resp.flight.dep_iata`
+    lesen) NICHT brechen, während neue Builds die expliziten Top-Level-Felder
+    (inbound_from_icao/state/source) nutzen. EHRLICH: keine erfundenen Zeiten —
+    nur was wir aus OpenSky kennen (Inbound-Origin, Status-Kategorie)."""
+    inbound_icao = out.get('inbound_from_icao')
+    dep_iata = _icao_to_iata_best(inbound_icao) if inbound_icao else ''
+    arr_iata = ''
+    if fl and fl.get('est_arrival_icao'):
+        arr_iata = _icao_to_iata_best(fl['est_arrival_icao']) or ''
+    state = out.get('state')
+    status_category = {
+        'in_flight': 'enroute', 'at_gate': 'scheduled',
+        'landed': 'arrived', 'scheduled': 'scheduled',
+    }.get(state, '')
+    return {
+        'flight': (fl.get('callsign').strip() if fl and fl.get('callsign') else ''),
+        'dep_iata': dep_iata or '',
+        'dep_name': '',
+        'arr_iata': arr_iata,
+        'arr_name': '',
+        'sched_dep': None, 'sched_arr': None,
+        'est_dep': None, 'est_arr': None,
+        'status': state or '',
+        'status_category': status_category,
+        'reg': out.get('registration', ''),
+    }
 
 
 # Fraport-Status-Strings, die "annulliert/gestrichen" bedeuten.

@@ -28,8 +28,10 @@
 #      belastet wenn OpenSky bereits 4xx/5xx geliefert hat.
 # ═══════════════════════════════════════════════════════════════
 
+import base64
 import json
 import math
+import os
 import time
 import threading
 import urllib.parse
@@ -271,20 +273,109 @@ _BACKEND_REG_HEX = {
 }
 
 
+# ── Reg→Hex Resolver-Cache (in-process, TTL) ─────────────────
+# Cacht Supabase-tail_hex-Treffer (und Misses) pro Reg, damit nicht jeder
+# Tracker-Poll dieselbe Reg erneut gegen SB auflöst. Wert None = "in SB nicht
+# gefunden" (negativer Cache, kürzere TTL — die Maschine könnte beim nächsten
+# Monats-Import dazukommen).
+_REG_HEX_CACHE = {}                 # reg(upper) -> {"hex": str|None, "at": float}
+_REG_HEX_CACHE_LOCK = threading.Lock()
+_REG_HEX_TTL_HIT = 12 * 3600        # bestätigte Treffer 12h cachen
+_REG_HEX_TTL_MISS = 600             # negatives Ergebnis nur 10 min cachen
+
+
+def _reg_hex_cache_get(reg_u):
+    now = time.time()
+    with _REG_HEX_CACHE_LOCK:
+        e = _REG_HEX_CACHE.get(reg_u)
+        if e is None:
+            return False, None
+        ttl = _REG_HEX_TTL_HIT if e["hex"] else _REG_HEX_TTL_MISS
+        if now - e["at"] > ttl:
+            return False, None
+        return True, e["hex"]
+
+
+def _reg_hex_cache_put(reg_u, hex_val):
+    with _REG_HEX_CACHE_LOCK:
+        _REG_HEX_CACHE[reg_u] = {"hex": hex_val, "at": time.time()}
+        if len(_REG_HEX_CACHE) > 5000:
+            items = sorted(_REG_HEX_CACHE.items(), key=lambda kv: kv[1]["at"])
+            for k, _ in items[:1000]:
+                _REG_HEX_CACHE.pop(k, None)
+
+
+def _sb_lookup_tail_hex(reg_u):
+    """Supabase-tail_hex-Lookup → lowercase Hex oder None. Graceful: SB down /
+    Tabelle fehlt / Fehler → None (Caller fällt auf die hartkodierte Map zurück).
+    Wirft NIE."""
+    sb, ok = _sb_client()
+    if not ok:
+        return None
+    try:
+        r = (sb.table('tail_hex')
+             .select('icao24')
+             .eq('registration', reg_u)
+             .limit(1)
+             .execute())
+        rows = r.data or []
+    except Exception:
+        return None
+    if not rows:
+        return None
+    hx = (rows[0].get('icao24') or '').strip().lower()
+    return hx or None
+
+
 def resolve_reg_to_hex(reg):
     """Public helper für andere Blueprints (z.B. aircraft_info_blueprint).
-    Liefert lowercase Hex oder None. Reg wird upper-cased."""
+    Liefert lowercase Hex oder None. Reg wird upper-cased.
+
+    Auflösungs-Reihenfolge:
+      1) In-Process-TTL-Cache (Treffer 12h, Miss 10min)
+      2) Supabase `tail_hex` (OpenSky-Aircraft-DB-Import, ~hunderttausende Tails)
+      3) hartkodierte `_BACKEND_REG_HEX`-Map (Last-Line-of-Defense)
+    Graceful: SB down/Miss → hartkodierte Map. Crasht NIE auf fehlendem Tail."""
     if not reg:
         return None
-    return _BACKEND_REG_HEX.get(reg.strip().upper())
+    reg_u = reg.strip().upper()
+    if not reg_u:
+        return None
+
+    cached, val = _reg_hex_cache_get(reg_u)
+    if cached:
+        # Negativer Cache-Hit: trotzdem noch die hartkodierte Map prüfen (sie
+        # ist statisch und kostet nichts — könnte einen Tail kennen, den SB nicht hat).
+        return val or _BACKEND_REG_HEX.get(reg_u)
+
+    hx = _sb_lookup_tail_hex(reg_u)
+    _reg_hex_cache_put(reg_u, hx)
+    if hx:
+        return hx
+    return _BACKEND_REG_HEX.get(reg_u)
 
 OPENSKY_URL = "https://opensky-network.org/api/states/all"
+OPENSKY_FLIGHTS_URL = "https://opensky-network.org/api/flights/aircraft"
 ADSB_LOL_URL = "https://api.adsb.lol/v2/icao"
 # Per-Upstream Timeouts (kürzer als vorher 10s — User wartet sonst zu lange
 # wenn OpenSky hängt):
 OPENSKY_TIMEOUT = 3
+OPENSKY_FLIGHTS_TIMEOUT = 6
 ADSB_LOL_TIMEOUT = 5
 USER_AGENT = "AeroTax-Backend/1.1 (ADS-B-Proxy; mailto:ops@aerotax.de)"
+
+
+def _opensky_auth_header():
+    """Optionaler HTTP-Basic-Auth-Header für OpenSky. Wenn OPENSKY_USERNAME +
+    OPENSKY_PASSWORD gesetzt sind, geben wir den Header zurück (höhere Credits);
+    sonst {} → anonymer Call (aktuelles Default-Verhalten). Wird konsistent auf
+    /states/all UND /flights/aircraft angewandt."""
+    user = os.environ.get('OPENSKY_USERNAME', '').strip()
+    pw = os.environ.get('OPENSKY_PASSWORD', '')
+    if not user or not pw:
+        return {}
+    token = base64.b64encode(f"{user}:{pw}".encode('utf-8')).decode('ascii')
+    return {"Authorization": f"Basic {token}"}
 
 
 # ─── /api/adsb/state ─────────────────────────────────────────
@@ -313,7 +404,7 @@ def get_adsb_state():
     # Wenn Client beides mitschickt (reg+hex) bevorzugen wir den expliziten
     # Hex — sonst Server-Lookup über Backend-Reg-Map.
     if not hex_param and reg_param:
-        hex_param = _BACKEND_REG_HEX.get(reg_param)
+        hex_param = resolve_reg_to_hex(reg_param)
         if not hex_param:
             return jsonify({
                 "error": f"unknown registration {reg_param}",
@@ -860,10 +951,12 @@ def _fetch_opensky(hex_id):
     """
     qs = urllib.parse.urlencode({"icao24": hex_id})
     url = f"{OPENSKY_URL}?{qs}"
-    req = urllib.request.Request(url, headers={
+    headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
-    })
+    }
+    headers.update(_opensky_auth_header())
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=OPENSKY_TIMEOUT) as resp:
             data = resp.read()
@@ -890,6 +983,88 @@ def _fetch_opensky(hex_id):
     if not states:
         return None
     return states[0]
+
+
+def fetch_live_state(hex_id):
+    """Public wrapper um den OpenSky→adsb.lol-Live-Fetch (Tier-1 für by-reg).
+    Liefert die OpenSky-State-Row (Layout siehe _fetch_adsb_lol) oder None, ohne
+    je zu werfen — Upstream-Fehler/RateLimit → None. Nutzt KEINE bezahlte API."""
+    try:
+        row = _fetch_opensky(hex_id)
+        if row is not None:
+            return row
+    except _OpenSkyRateLimit:
+        with _BACKOFF["lock"]:
+            _BACKOFF["until"] = time.time() + 60
+    except _OpenSkyError:
+        pass
+    try:
+        return _fetch_adsb_lol(hex_id)
+    except _UpstreamError:
+        return None
+
+
+def fetch_recent_flight(hex_id, lookback_hours=36):
+    """OpenSky `/api/flights/aircraft` über die letzten `lookback_hours` Stunden →
+    der JÜNGSTE Flug dieser Maschine als kompaktes Dict, oder None.
+
+    EHRLICH: OpenSky liefert HISTORISCHE/tatsächliche Flüge, KEINE geplanten ETAs.
+    Wir erfinden hier keine Ankunftsprognose. Felder:
+        {
+          'icao24', 'callsign',
+          'est_departure_icao',  # Inbound-Herkunft (ICAO), kann None sein
+          'est_arrival_icao',    # Ziel (ICAO), kann None sein
+          'first_seen_unix',     # Start des Tracks (unix)
+          'last_seen_unix',      # Ende des Tracks (unix) = "zuletzt gesehen"
+        }
+    None bei Fehler/leerer Antwort — der Caller degradiert dann auf Tier-3/4.
+    Wirft NIE (best-effort)."""
+    if not hex_id:
+        return None
+    now = int(time.time())
+    begin = now - int(lookback_hours * 3600)
+    qs = urllib.parse.urlencode({
+        "icao24": hex_id.lower(),
+        "begin": begin,
+        "end": now,
+    })
+    url = f"{OPENSKY_FLIGHTS_URL}?{qs}"
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    }
+    headers.update(_opensky_auth_header())
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=OPENSKY_FLIGHTS_TIMEOUT) as resp:
+            data = resp.read()
+    except Exception:
+        # 404 (kein Flug im Fenster), 429, Timeout, Netzfehler → still degrade.
+        return None
+    try:
+        flights = json.loads(data)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(flights, list) or not flights:
+        return None
+    # OpenSky sortiert nicht garantiert — wir nehmen den mit dem größten lastSeen.
+    def _last_seen(f):
+        try:
+            return int(f.get("lastSeen") or 0)
+        except (TypeError, ValueError):
+            return 0
+    f = max(flights, key=_last_seen)
+    callsign = (f.get("callsign") or "").strip() or None
+    dep = (f.get("estDepartureAirport") or "").strip().upper() or None
+    arr = (f.get("estArrivalAirport") or "").strip().upper() or None
+    return {
+        "icao24": (f.get("icao24") or hex_id).lower(),
+        "callsign": callsign,
+        "est_departure_icao": dep,
+        "est_arrival_icao": arr,
+        "first_seen_unix": f.get("firstSeen"),
+        "last_seen_unix": f.get("lastSeen"),
+    }
 
 
 def _fetch_adsb_lol(hex_id):
