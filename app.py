@@ -17643,6 +17643,161 @@ def airport_board(token):
                                    else _NATIVE_BOARD_TTL)})
 
 
+# ── Einzelflug-Status (Flugnummer → Flugplan/Status) ──────────────────────
+# Hintergrund (User-Brief): Im Radar zeigt ein Flug, der gerade KEIN ADS-B-Signal
+# sendet (noch nicht gestartet / gelandet / keine ADS-B-Abdeckung), nur eine leere
+# "nicht in der Luft"-Karte — obwohl der Flug auf der Abflugtafel und bei anderen
+# Quellen auffindbar ist. Dieser Endpoint liefert den FLUGPLAN/STATUS eines
+# einzelnen Fluges (Soll-Ab/-An, Route, Status, Gate/Terminal) aus derselben
+# Quelle, die die Tafel nutzt: AeroDataBox (RapidAPI, env-gated AERODATABOX_KEY).
+# KEINE Erfindung: ohne Key oder ohne Treffer → ehrlich ok=False + Klartext.
+
+# AeroDataBox-Status-Strings → kompaktes Schema für die iOS-Karte. Wir geben den
+# Roh-Status zusätzlich durch, die Kategorie ist nur eine Lesehilfe (kein Override).
+def _flight_status_category(raw):
+    s = (raw or '').strip().lower()
+    if not s:
+        return 'unknown'
+    if 'cancel' in s or 'annull' in s:
+        return 'cancelled'
+    if 'arriv' in s or 'land' in s:
+        return 'arrived'
+    if 'enroute' in s or 'en route' in s or 'air' in s or 'departed' in s:
+        return 'enroute'
+    if 'board' in s:
+        return 'boarding'
+    if 'expected' in s or 'scheduled' in s or 'gate' in s or 'check' in s:
+        return 'scheduled'
+    if 'delay' in s:
+        return 'delayed'
+    if 'divert' in s:
+        return 'diverted'
+    return 'unknown'
+
+
+def _aerodatabox_flight_by_number(number, date_iso=None):
+    """Einzelflug via AeroDataBox /flights/number/{number}[/{date}] (RapidAPI,
+    env-gated). number = IATA-Flugnummer ohne Leerzeichen, z.B. 'LH752'. Liefert
+    ein kompaktes Dict (Soll-Ab/-An, Route, Status, Gate/Terminal) oder None
+    (kein Key / Quelle down / kein Treffer → Caller degradiert ehrlich)."""
+    import os as _os
+    key = _os.environ.get('AERODATABOX_KEY')
+    if not key:
+        return None
+    num = (number or '').upper().replace(' ', '').strip()
+    if len(num) < 3:
+        return None
+    try:
+        import requests
+    except Exception:
+        return None
+    # /flights/number/{num} ohne Datum = heutiger/nächster Flug dieser Nummer.
+    # Mit Datum (YYYY-MM-DD) gezielt der Flug an diesem Tag.
+    base = 'https://aerodatabox.p.rapidapi.com/flights/number/' + num
+    url = base + ('/' + date_iso if date_iso else '')
+    try:
+        r = requests.get(url,
+                         params={'withAircraftImage': 'false',
+                                 'withLocation': 'false'},
+                         headers={'X-RapidAPI-Key': key,
+                                  'X-RapidAPI-Host': 'aerodatabox.p.rapidapi.com'},
+                         timeout=15)
+        if r.status_code != 200:
+            return None
+        body = r.json()
+    except Exception:
+        return None
+    # AeroDataBox liefert eine LISTE von Flügen (mehrere Tage/Legs). Wir nehmen
+    # den ersten mit verwertbaren Zeiten.
+    items = body if isinstance(body, list) else [body]
+    if not items:
+        return None
+
+    def _t(node):
+        n = node or {}
+        return ((n.get('local') or n.get('utc')) or None)
+
+    for f in items:
+        try:
+            if not isinstance(f, dict):
+                continue
+            dep = f.get('departure') or {}
+            arr = f.get('arrival') or {}
+            dep_ap = dep.get('airport') or {}
+            arr_ap = arr.get('airport') or {}
+            sched_dep = _t(dep.get('scheduledTime'))
+            sched_arr = _t(arr.get('scheduledTime'))
+            est_dep = (_t(dep.get('revisedTime')) or _t(dep.get('predictedTime'))
+                       or _t(dep.get('actualTime')))
+            est_arr = (_t(arr.get('revisedTime')) or _t(arr.get('predictedTime'))
+                       or _t(arr.get('actualTime')))
+            raw_status = (f.get('status') or '').strip()
+            al = f.get('airline') or {}
+            acft = f.get('aircraft') or {}
+            out = {
+                'flight': (f.get('number') or num).strip(),
+                'airline': (al.get('iata') or al.get('icao') or '').strip().upper(),
+                'airline_name': (al.get('name') or '').strip(),
+                'dep_iata': (dep_ap.get('iata') or '').strip().upper(),
+                'dep_name': _clean_city_name(dep_ap.get('name'),
+                                             (dep_ap.get('iata') or '')),
+                'arr_iata': (arr_ap.get('iata') or '').strip().upper(),
+                'arr_name': _clean_city_name(arr_ap.get('name'),
+                                             (arr_ap.get('iata') or '')),
+                'sched_dep': (sched_dep or '').replace(' ', 'T') or None,
+                'sched_arr': (sched_arr or '').replace(' ', 'T') or None,
+                'est_dep': ((est_dep or '').replace(' ', 'T') or None),
+                'est_arr': ((est_arr or '').replace(' ', 'T') or None),
+                'dep_gate': (dep.get('gate') or '').strip(),
+                'dep_terminal': (dep.get('terminal') or '').strip(),
+                'arr_gate': (arr.get('gate') or '').strip(),
+                'arr_terminal': (arr.get('terminal') or '').strip(),
+                'arr_baggage': (arr.get('baggageBelt') or '').strip(),
+                'status': raw_status,
+                'status_category': _flight_status_category(raw_status),
+                'aircraft': (acft.get('model') or '').strip(),
+                'reg': (acft.get('reg') or '').strip(),
+            }
+            # Verspätung (Abflug) aus Soll vs. erwartet, wie im Board.
+            out['dep_delay_min'] = _board_delay_min(out['sched_dep'], out['est_dep'])
+            # Mindestens eine verwertbare Zeit ODER Route nötig, sonst skip.
+            if out['sched_dep'] or out['sched_arr'] or out['dep_iata'] or out['arr_iata']:
+                return out
+        except Exception:
+            continue
+    return None
+
+
+@app.route('/api/flight/<token>/status', methods=['GET'])
+def flight_status(token):
+    """Einzelflug-Status/-Flugplan nach Flugnummer. Query: ?number=LH752&date=YYYY-MM-DD
+    (date optional). Quelle: AeroDataBox (dieselbe wie die Airport-Tafel). Ehrlich:
+    ohne AERODATABOX_KEY oder ohne Treffer → ok=False + Klartext, KEINE Erfindung.
+
+    Genutzt vom Radar/Flug-Detail, wenn der Flug gerade KEIN ADS-B-Signal sendet:
+    dann zeigt die App statt einer leeren Karte den echten Flugplan/Status."""
+    import os as _os
+    number = (request.args.get('number') or '').upper().replace(' ', '').strip()
+    date_iso = (request.args.get('date') or '').strip() or None
+    if date_iso:
+        import re as _re
+        if not _re.match(r'^\d{4}-\d{2}-\d{2}$', date_iso):
+            date_iso = None
+    if len(number) < 3:
+        return jsonify({'ok': False, 'error': 'bad_number',
+                        'message': 'Keine gültige Flugnummer.'}), 200
+    if not _os.environ.get('AERODATABOX_KEY'):
+        return jsonify({'ok': False, 'error': 'source_unavailable', 'number': number,
+                        'message': 'Flugplan-Quelle aktuell nicht verfügbar.'}), 200
+    flight = _aerodatabox_flight_by_number(number, date_iso)
+    if not flight:
+        return jsonify({'ok': False, 'error': 'not_found', 'number': number,
+                        'message': ('Für ' + number + ' liegt aktuell kein '
+                                    'Flugplan vor.')}), 200
+    return jsonify({'ok': True, 'number': number, 'flight': flight,
+                    'source': 'aerodatabox'})
+
+
 # Fraport-Status-Strings, die "annulliert/gestrichen" bedeuten.
 _FRA_CANCEL_MARKERS = ('annull', 'cancel', 'gestrich')
 
