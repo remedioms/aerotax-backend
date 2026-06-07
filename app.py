@@ -9623,6 +9623,12 @@ def get_friends_today(token):
             'layover': rf.get('layover_ort'),
             'start': rf.get('start_time'),
             'end': rf.get('end_time'),
+            # Flugnummer(n) des Tages (z.B. "LH400") — iOS leitet daraus den
+            # ADS-B-Callsign ab und zeigt das echte Live-Flugzeug, wenn der
+            # Friend gerade fliegt (klass=Z72). Nur durchgereicht, keine neue
+            # Privacy-Stufe: gleiche Sichtbarkeit wie routing (Mutual-Friend-Gate
+            # gilt bereits über _friends_load). Leere Liste wenn nichts gelesen.
+            'flight_numbers': list(rf.get('flight_numbers') or []),
         })
     return jsonify({'datum': datum, 'count': len(out), 'friends_today': out})
 
@@ -33103,6 +33109,11 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'activity_type': d.get('activity_type', ''),
             'marker_raw': d.get('raw_marker', ''),
             'routing': list(d.get('routing') or []),
+            # Flugnummern des Tages (z.B. ["LH400"]) — gebraucht für Live-ADS-B-
+            # Auflösung des aktuellen Flugzeugs eines Friends (friends-today).
+            # Reader liefert sie via _v2_to_v1_day; ohne sie kein Callsign.
+            'flight_numbers': [str(f).strip() for f in (d.get('flight_numbers') or [])
+                               if isinstance(f, str) and f.strip()],
             'has_fl': bool(d.get('has_fl')),
             'overnight_after_day': bool(d.get('overnight_after_day')),
             'layover_ort': d.get('layover_ort', '') or '',
