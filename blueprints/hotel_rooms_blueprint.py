@@ -217,7 +217,8 @@ def _sb_list_by_hotel(hotel_name, hotel_iata):
     try:
         q = (sb.table('hotel_room_reports')
              .select('id,hotel_name,hotel_iata,room_number_low,room_number_high,'
-                     'side,noise_rating,view_rating,comfort_rating,note,'
+                     'side,noise_rating,view_rating,comfort_rating,'
+                     'overall_rating,breakfast_rating,fitness_rating,note,'
                      'renovated_year,upvote_count,created_at')
              .eq('deleted', False)
              .eq('hotel_name', hotel_name))
@@ -239,7 +240,8 @@ def _sb_list_by_iata(iata):
     try:
         r = (sb.table('hotel_room_reports')
              .select('id,hotel_name,hotel_iata,room_number_low,room_number_high,'
-                     'side,noise_rating,view_rating,comfort_rating,note,'
+                     'side,noise_rating,view_rating,comfort_rating,'
+                     'overall_rating,breakfast_rating,fitness_rating,note,'
                      'renovated_year,upvote_count,created_at')
              .eq('deleted', False)
              .eq('hotel_iata', iata)
@@ -250,6 +252,31 @@ def _sb_list_by_iata(iata):
     except Exception as e:
         current_app.logger.warning(
             f'[hotel-rooms] sb_list_iata_fail err={type(e).__name__}: {str(e)[:120]}'
+        )
+        return None
+
+
+def _sb_list_for_summary(iata):
+    """Alle nicht-geloeschten Reports am IATA (fuer Hotel-Level-Aggregation).
+
+    Nicht upvote-sortiert/LISTING_MAX-gekappt wie das Listing — wir brauchen die
+    volle Stichprobe pro Hotel, sonst verzerren gekappte Reihen die Durchschnitte.
+    """
+    sb, ok = _sb_client()
+    if not ok:
+        return None
+    try:
+        r = (sb.table('hotel_room_reports')
+             .select('hotel_name,comfort_rating,overall_rating,'
+                     'breakfast_rating,fitness_rating')
+             .eq('deleted', False)
+             .eq('hotel_iata', iata)
+             .limit(5000)
+             .execute())
+        return r.data or []
+    except Exception as e:
+        current_app.logger.warning(
+            f'[hotel-rooms] sb_summary_fail err={type(e).__name__}: {str(e)[:120]}'
         )
         return None
 
@@ -331,6 +358,9 @@ def _clean_report(r):
         'noise_rating': r.get('noise_rating'),
         'view_rating': r.get('view_rating'),
         'comfort_rating': r.get('comfort_rating'),
+        'overall_rating': r.get('overall_rating'),
+        'breakfast_rating': r.get('breakfast_rating'),
+        'fitness_rating': r.get('fitness_rating'),
         'note': r.get('note'),
         'renovated_year': r.get('renovated_year'),
         'upvote_count': r.get('upvote_count') or 0,
@@ -367,11 +397,14 @@ def hotel_rooms_post(token):
     noise = _norm_rating(body.get('noise_rating'))
     view = _norm_rating(body.get('view_rating'))
     comfort = _norm_rating(body.get('comfort_rating'))
+    overall = _norm_rating(body.get('overall_rating'))
+    breakfast = _norm_rating(body.get('breakfast_rating'))
+    fitness = _norm_rating(body.get('fitness_rating'))
     note = _norm_note(body.get('note'))
     renovated = _norm_year(body.get('renovated_year'))
 
     # Mindest-Inhalt: mindestens 1 Rating oder note >= 6 chars oder room-range
-    has_signal = (noise or view or comfort or
+    has_signal = (noise or view or comfort or overall or breakfast or fitness or
                   (note and len(note) >= 6) or
                   (room_low is not None))
     if not has_signal:
@@ -394,6 +427,9 @@ def hotel_rooms_post(token):
         'noise_rating': noise,
         'view_rating': view,
         'comfort_rating': comfort,
+        'overall_rating': overall,
+        'breakfast_rating': breakfast,
+        'fitness_rating': fitness,
         'note': note,
         'renovated_year': renovated,
         'upvote_count': 0,
@@ -464,6 +500,78 @@ def hotel_rooms_by_iata():
         'iata': iata,
         'count': len(rows),
         'reports': [_clean_report(r) for r in rows],
+    })
+
+
+def _avg_or_none(values):
+    """Mittelwert auf 1 Dezimale gerundet, oder None wenn keine Werte.
+
+    Ehrlich: kein erfundener 0-Wert wenn fuer eine Sub-Dimension nichts vorliegt.
+    """
+    vals = [v for v in values if isinstance(v, (int, float)) and v is not None]
+    if not vals:
+        return None
+    return round(sum(vals) / len(vals), 1)
+
+
+def _aggregate_hotels(rows):
+    """Aggregiert flache Report-Rows zu Hotel-Level-Sub-Ratings.
+
+    Pro distinct hotel_name: report_count + avg_overall / avg_room (=comfort) /
+    avg_breakfast / avg_fitness. Sortiert nach report_count desc.
+    """
+    buckets = {}
+    for r in rows:
+        name = r.get('hotel_name')
+        if not name:
+            continue
+        b = buckets.setdefault(name, {
+            'overall': [], 'room': [], 'breakfast': [], 'fitness': [],
+        })
+        if r.get('overall_rating') is not None:
+            b['overall'].append(r['overall_rating'])
+        if r.get('comfort_rating') is not None:
+            b['room'].append(r['comfort_rating'])
+        if r.get('breakfast_rating') is not None:
+            b['breakfast'].append(r['breakfast_rating'])
+        if r.get('fitness_rating') is not None:
+            b['fitness'].append(r['fitness_rating'])
+
+    out = []
+    for name, b in buckets.items():
+        # report_count = Anzahl Reports am Hotel (auch ohne Sub-Rating).
+        count = sum(1 for r in rows if r.get('hotel_name') == name)
+        out.append({
+            'hotel_name': name,
+            'report_count': count,
+            'avg_overall': _avg_or_none(b['overall']),
+            'avg_room': _avg_or_none(b['room']),
+            'avg_breakfast': _avg_or_none(b['breakfast']),
+            'avg_fitness': _avg_or_none(b['fitness']),
+        })
+    out.sort(key=lambda x: x['report_count'], reverse=True)
+    return out
+
+
+@hotel_rooms_bp.route('/api/hotel-rooms/<iata>/summary', methods=['GET'])
+def hotel_rooms_summary(iata):
+    norm = _norm_iata(iata)
+    if not norm:
+        return jsonify({'ok': False, 'error': 'iata fehlt oder ungueltig.'}), 400
+
+    rows = _sb_list_for_summary(norm)
+    if rows is None:
+        # Disk-fallback: volle nicht-geloeschte Stichprobe am IATA.
+        all_rows = _disk_load(_DISK_REPORTS)
+        rows = [r for r in all_rows
+                if not r.get('deleted') and r.get('hotel_iata') == norm]
+
+    hotels = _aggregate_hotels(rows)
+    return jsonify({
+        'ok': True,
+        'iata': norm,
+        'count': len(hotels),
+        'hotels': hotels,
     })
 
 
