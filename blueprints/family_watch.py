@@ -772,6 +772,13 @@ def family_pair_code_redeem():
         _pair_codes_save(codes)
         return jsonify({'ok': False, 'error': 'code_expired'}), 410
 
+    # Single-Use: ein bereits eingelöster Code mintet KEIN zweites Family-Token.
+    # (Security-Audit 2026-06-07: vorher blieb ein konsumierter Code bis TTL
+    # einlösbar → wer den Code abfängt, könnte nach dem legitimen User ein
+    # eigenes Family-Token münzen.)
+    if rec.get('consumed'):
+        return jsonify({'ok': False, 'error': 'code_already_used'}), 409
+
     crew_token = rec.get('crew_token')
     if not crew_token:
         return jsonify({'ok': False, 'error': 'code_invalid'}), 400

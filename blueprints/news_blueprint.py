@@ -1139,14 +1139,33 @@ def _debrief_save_disk(posts):
 # ─── Supabase-Persistenz ────────────────────────────────────────────
 
 def _debrief_sb_insert(row):
+    # Upsert mit on_conflict='id' (idempotent wie license_wallet/layover_recs):
+    # gleicher Post-Insert bleibt ohne Dupe-Fehler, und der lazy-migrate-Pfad
+    # kann Disk-Rows ohne Kollision hochschreiben.
     sb, available = _debrief_get_sb()
     if not available or sb is None:
         return False
     try:
-        sb.table('debrief_posts').insert(row).execute()
+        sb.table('debrief_posts').upsert(row, on_conflict='id').execute()
         return True
     except Exception as e:
         _log_warn(f'[debrief] sb_insert_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _debrief_sb_bulk_upsert(rows):
+    """Bulk-Upsert für lazy-migrate (Disk → SB). True nur wenn der Batch hält."""
+    sb, available = _debrief_get_sb()
+    if not available or sb is None:
+        return False
+    clean = [r for r in (rows or []) if isinstance(r, dict) and r.get('id')]
+    if not clean:
+        return False
+    try:
+        sb.table('debrief_posts').upsert(clean, on_conflict='id').execute()
+        return True
+    except Exception as e:
+        _log_warn(f'[debrief] sb_bulk_upsert_fail err={type(e).__name__}: {str(e)[:200]}')
         return False
 
 
@@ -1209,17 +1228,36 @@ def _debrief_persist_new(row):
     return sb_ok or disk_ok
 
 
-def _debrief_list(before_iso=None, limit=50):
-    """SB primär, Disk-Fallback. Liefert eine sortierte (neueste zuerst) Liste."""
-    sb_rows = _debrief_sb_list(before_iso=before_iso, limit=limit)
-    if sb_rows is not None:
-        return sb_rows
+def _debrief_disk_sorted(before_iso=None, limit=50):
     posts = [p for p in _debrief_load_disk()
              if isinstance(p, dict) and not p.get('deleted')]
     posts.sort(key=lambda x: str(x.get('created_at') or ''), reverse=True)
     if before_iso:
         posts = [p for p in posts if str(p.get('created_at') or '') < before_iso]
     return posts[:limit]
+
+
+def _debrief_list(before_iso=None, limit=50):
+    """SB primär, Disk-Fallback. Liefert eine sortierte (neueste zuerst) Liste.
+
+    Lazy-Migrate (wie license_wallet): SB up, aber leer + Disk hat alte Posts
+    (Hinterlassenschaft der Disk-only-Ära vor der debrief_posts-Tabelle) →
+    einmalig hochschreiben, dann kanonisch aus SB re-lesen."""
+    sb_rows = _debrief_sb_list(before_iso=before_iso, limit=limit)
+    if sb_rows is not None:
+        if not sb_rows and not before_iso:
+            disk_raw = [p for p in _debrief_load_disk()
+                        if isinstance(p, dict) and p.get('id')]
+            if disk_raw:
+                _log_warn(f'[debrief] lazy_migrate disk→sb count={len(disk_raw)}')
+                if _debrief_sb_bulk_upsert(disk_raw):
+                    re_read = _debrief_sb_list(before_iso=before_iso, limit=limit)
+                    if re_read is not None:
+                        return re_read
+                # Migrate fehlgeschlagen → wenigstens die Disk-Posts ausliefern
+                return _debrief_disk_sorted(before_iso=before_iso, limit=limit)
+        return sb_rows
+    return _debrief_disk_sorted(before_iso=before_iso, limit=limit)
 
 
 def _debrief_apply_upvote(post_id, upvoter_hash):

@@ -133,6 +133,49 @@ def _normalize_position(p):
     return p[:32]
 
 
+def _opaque_peer_id(other_id, other_token):
+    """Liefert eine stabile, NICHT-zurückführbare ID für einen anderen Crew-User,
+    die gefahrlos an Clients ausgeliefert werden darf.
+
+    SECURITY (P6a): `other_token` ist bei App-Usern das ROHE Bearer-Credential des
+    anderen Users — es darf NIE in einer Response erscheinen (Account-Takeover).
+    Bei App-Usern ist `other_id` im Schema identisch zum Token, also auch dieser
+    Wert ist roh. Wir hashen daher: peer = sha256(other_token || other_id)[:16].
+
+    · App-User (other_token gesetzt): opaker sha256-Hash → keine Token-Leakage.
+    · Anon-Crew (other_token NULL, other_id = _hash_anon_id-Form, 12 hex): bereits
+      ein per-self-token gesalzener Hash, KEIN Credential. Geben wir 1:1 durch,
+      damit iOS denselben Anker behält.
+    Stabil über Calls hinweg (gleicher Input → gleicher Hash)."""
+    if other_token:
+        raw = f'{other_token}::{other_id or ""}'
+        return 'peer_' + hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
+    # Kein App-Token → other_id ist schon ein anon-Hash, kein Credential.
+    return other_id
+
+
+def _serialize_edge(row, *, extra=None):
+    """Baut die client-sichere Repräsentation einer Edge.
+
+    SECURITY: enthält bewusst KEIN `other_token` (und keinen anderen rohen
+    Fremd-Token). Korrelation läuft ausschließlich über das opake `other_id`."""
+    other_token = row.get('other_token')
+    raw_other_id = row.get('other_id')
+    out = {
+        'other_id': _opaque_peer_id(raw_other_id, other_token),
+        'short_name': row.get('other_display_name'),
+        'position': row.get('other_position'),
+        'tour_count': int(row.get('tour_count') or 0),
+        'last_flown_date': row.get('last_flown_date'),
+        'shared_layovers': row.get('shared_layovers') or [],
+        'shared_routes': row.get('shared_routes') or [],
+        'strength': _classify_strength(int(row.get('tour_count') or 0)),
+    }
+    if extra:
+        out.update(extra)
+    return out
+
+
 def _resolve_other_id(self_token, member):
     """Bestimmt other_id + other_token aus einem crew_list-Member.
     Returns (other_id: str, other_token: Optional[str], display_name: Optional[str]).
@@ -554,7 +597,9 @@ def crew_graph_ingest(token):
             d = _disk_load(safe_tok)
             edge = d.get(other_id)
             if edge:
-                result_edges.append(edge)
+                # SECURITY: niemals die rohe Disk-Row (enthält other_token)
+                # zurückgeben — nur die client-sichere Serialisierung.
+                result_edges.append(_serialize_edge(edge))
         else:
             skipped += 1
             current_app.logger.warning(
@@ -593,7 +638,7 @@ def crew_graph_match(token):
           "ok": true,
           "date": "...",
           "today_crew": [
-            {"other_id": "...", "other_token": "..." | null, "short_name": "...",
+            {"other_id": "<opaque>", "short_name": "...",
              "position": "...", "tour_count": N, "last_flown_date": "...",
              "shared_layovers": [...], "shared_routes": [...],
              "strength": "occasional"}
@@ -634,29 +679,25 @@ def crew_graph_match(token):
         edge = by_id.get(other_id) or (by_token.get(other_token) if other_token else None)
         if edge:
             matched += 1
-            today_crew_out.append({
-                'other_id': edge.get('other_id') or other_id,
-                'other_token': edge.get('other_token'),
-                'short_name': edge.get('other_display_name') or display_name,
-                'position': edge.get('other_position') or _normalize_position(m.get('position')),
-                'tour_count': int(edge.get('tour_count') or 0),
-                'last_flown_date': edge.get('last_flown_date'),
-                'shared_layovers': edge.get('shared_layovers') or [],
-                'shared_routes': edge.get('shared_routes') or [],
-                'strength': _classify_strength(int(edge.get('tour_count') or 0)),
-            })
+            # short_name/position aus dem heutigen Member nachziehen wenn die Edge
+            # leer ist — Serializer baut den Rest (inkl. opakem other_id, ohne Token).
+            row = dict(edge)
+            if not row.get('other_display_name'):
+                row['other_display_name'] = display_name
+            if not row.get('other_position'):
+                row['other_position'] = _normalize_position(m.get('position'))
+            today_crew_out.append(_serialize_edge(row))
         else:
-            today_crew_out.append({
+            today_crew_out.append(_serialize_edge({
                 'other_id': other_id,
                 'other_token': other_token,
-                'short_name': display_name,
-                'position': _normalize_position(m.get('position')),
+                'other_display_name': display_name,
+                'other_position': _normalize_position(m.get('position')),
                 'tour_count': 0,
                 'last_flown_date': None,
                 'shared_layovers': [],
                 'shared_routes': [],
-                'strength': 'firstFlight',
-            })
+            }))
 
     return jsonify({
         'ok': True,
@@ -696,19 +737,7 @@ def crew_graph_edges(token):
     rows_all = _load_edges(safe_tok, limit=offset + limit) or []
     paged = rows_all[offset:offset + limit]
 
-    out = []
-    for r in paged:
-        out.append({
-            'other_id': r.get('other_id'),
-            'other_token': r.get('other_token'),
-            'short_name': r.get('other_display_name'),
-            'position': r.get('other_position'),
-            'tour_count': int(r.get('tour_count') or 0),
-            'last_flown_date': r.get('last_flown_date'),
-            'shared_layovers': r.get('shared_layovers') or [],
-            'shared_routes': r.get('shared_routes') or [],
-            'strength': _classify_strength(int(r.get('tour_count') or 0)),
-        })
+    out = [_serialize_edge(r) for r in paged]
     return jsonify({
         'ok': True,
         'edges': out,
@@ -780,15 +809,9 @@ def crew_graph_common(token):
                 continue
             inter = anchor_layovers & set(e.get('shared_layovers') or [])
             if inter:
-                mutuals.append({
-                    'other_id': e.get('other_id'),
-                    'other_token': e.get('other_token'),
-                    'short_name': e.get('other_display_name'),
-                    'position': e.get('other_position'),
-                    'tour_count': int(e.get('tour_count') or 0),
+                mutuals.append(_serialize_edge(e, extra={
                     'shared_layovers_with_anchor': sorted(inter),
-                    'strength': _classify_strength(int(e.get('tour_count') or 0)),
-                })
+                }))
         # Sortiere nach Anzahl Schnittmenge (mehr = besser), dann tour_count.
         mutuals.sort(key=lambda m: (-len(m['shared_layovers_with_anchor']),
                                     -int(m.get('tour_count') or 0)))
@@ -802,17 +825,7 @@ def crew_graph_common(token):
 
     return jsonify({
         'ok': True,
-        'edge': {
-            'other_id': edge.get('other_id'),
-            'other_token': edge.get('other_token'),
-            'short_name': edge.get('other_display_name'),
-            'position': edge.get('other_position'),
-            'tour_count': int(edge.get('tour_count') or 0),
-            'last_flown_date': edge.get('last_flown_date'),
-            'shared_layovers': edge.get('shared_layovers') or [],
-            'shared_routes': edge.get('shared_routes') or [],
-            'strength': _classify_strength(int(edge.get('tour_count') or 0)),
-        },
+        'edge': _serialize_edge(edge),
         'mutuals': mutuals,
         'mutual_friends': mutual_friends,
     })
@@ -870,7 +883,11 @@ def _resolve_today_crew_from_snapshot(self_token, date_q):
 def _compute_mutual_friends(self_token, other_token):
     """Schnittmenge der akzeptierten Friends beider App-User. Liest user_friends
     aus SB direkt — keine Disk-Variante, weil bei SB-down die Berechnung eh
-    unzuverlässig wäre. Returns Liste von Friend-Token-Strings (NICHT Klarnamen)."""
+    unzuverlässig wäre.
+
+    SECURITY (P6a): `friend_token` ist das ROHE Bearer-Credential eines dritten
+    App-Users. Es darf NIE an den Client. Wir liefern opake `_opaque_peer_id`-
+    Hashes der Schnittmenge zurück (stabil korrelierbar, nicht zurückführbar)."""
     sb, ok = _sb_client()
     if not ok:
         return []
@@ -887,7 +904,8 @@ def _compute_mutual_friends(self_token, other_token):
         # Self und Other entfernen — können nicht "mit sich selbst befreundet" sein.
         inter.discard(self_token)
         inter.discard(other_token)
-        return sorted(inter)
+        # Rohe Friend-Tokens NIE ausliefern → opake Peer-IDs.
+        return sorted(_opaque_peer_id(ft, ft) for ft in inter)
     except Exception as e:
         current_app.logger.warning(
             f'[crew-graph] mutual_friends_fail tok={self_token[:8]}/'

@@ -389,13 +389,18 @@ def _load_post_by_id(post_id):
 
 
 def _persist_post(row):
-    """Schreibt Post in SB + Disk (Disk als persistenter Fallback-Mirror)."""
+    """Schreibt Post in SB + Disk (Disk als persistenter Fallback-Mirror).
+
+    Gibt (sb_ok, disk_ok) zurück — der echte SB-Insert-Status wird NICHT mehr
+    geschluckt. Wenn SB up ist aber den Insert ablehnt (Constraint/NOT-NULL/PGRST),
+    landet der Post nur auf der ephemeren Disk; das wird dem Caller via Flag
+    sichtbar gemacht und beim nächsten Read (_list_posts) nach SB reconciled."""
     sb_ok = _sb_insert_post(row)
     # Disk mirror auch bei SB-Erfolg — robuster bei späterer SB-Outage.
     posts = _load_disk_posts()
     posts.append(row)
-    _save_disk_posts(posts)
-    return sb_ok or True  # mindestens Disk-OK reicht
+    disk_ok = _save_disk_posts(posts)
+    return sb_ok, disk_ok
 
 
 def _update_post(post_id, fields):
@@ -414,9 +419,63 @@ def _update_post(post_id, fields):
     return sb_ok or changed
 
 
+def _sb_post_exists(post_id):
+    """True wenn der Post bereits in SB liegt. None bei SB-down (= unklar)."""
+    if not post_id:
+        return None
+    sb, available = _get_sb()
+    if not available or sb is None:
+        return None
+    try:
+        r = sb.table('trade_posts').select('id').eq('id', post_id).limit(1).execute()
+        return bool(list(r.data or []))
+    except Exception:
+        return None
+
+
+def _reconcile_posts_disk_to_sb():
+    """Read-Time-Reconcile: Disk-only-Posts (entstanden während SB-Outage ODER
+    SB-up-aber-Insert-rejected) werden nach SB geheilt. Analog license_wallet
+    lazy-migrate. Best-effort — bei SB-down passiert nichts, bei Insert-Fehler
+    bleibt der Post auf Disk und wird beim nächsten Read erneut versucht.
+
+    Idempotent: wir prüfen pro Post-ID ob er schon in SB liegt; nur fehlende
+    werden inserted."""
+    sb, available = _get_sb()
+    if not available or sb is None:
+        return
+    disk = _load_disk_posts()
+    if not disk:
+        return
+    healed = 0
+    for row in disk:
+        if not isinstance(row, dict):
+            continue
+        pid = row.get('id')
+        if not pid:
+            continue
+        exists = _sb_post_exists(pid)
+        if exists is None:
+            return  # SB mittendrin weg → Reconcile abbrechen, nächster Read retry
+        if exists:
+            continue
+        if _sb_insert_post(row):
+            healed += 1
+    if healed:
+        try:
+            current_app.logger.info(f'[trade] reconcile_posts_disk_to_sb healed={healed}')
+        except Exception:
+            pass
+
+
 def _list_posts(airline=None, base=None, qualification=None, position=None,
                 swap_or_dump=None, limit=50, offset=0):
-    """SB primär; bei SB-down filtert/sortiert wir die Disk-Liste."""
+    """SB primär; bei SB-down filtert/sortiert wir die Disk-Liste.
+
+    Vor dem SB-Read werden Disk-only-Posts nach SB reconciled (heal), damit
+    während einer SB-Outage ODER eines SB-Insert-Rejects entstandene Posts
+    nicht beim Cloud-Run-Restart verloren gehen."""
+    _reconcile_posts_disk_to_sb()
     sb_rows = _sb_list_posts(airline=airline, base=base, qualification=qualification,
                              position=position, swap_or_dump=swap_or_dump,
                              limit=limit, offset=offset)
@@ -472,16 +531,72 @@ def _list_my_posts(token):
 
 
 def _persist_interest(row, author_token):
-    """SB-Insert + Disk-Spiegel an Author-Token-Datei."""
-    _sb_insert_interest(row)
+    """SB-Insert + Disk-Spiegel an Author-Token-Datei.
+
+    Gibt (sb_ok, disk_ok) zurück — das echte SB-Insert-Resultat wird NICHT mehr
+    ignoriert. Bei SB-up-aber-rejected liegt das Interesse nur auf Disk; das wird
+    sichtbar gemacht und beim nächsten Read (_list_incoming_interests) reconciled."""
+    sb_ok = _sb_insert_interest(row)
     interests = _load_disk_interests(author_token)
     interests.append(row)
-    _save_disk_interests(author_token, interests)
-    return True
+    disk_ok = _save_disk_interests(author_token, interests)
+    return sb_ok, disk_ok
+
+
+def _sb_interest_exists(interest_id):
+    """True wenn das Interesse bereits in SB liegt. None bei SB-down."""
+    if not interest_id:
+        return None
+    sb, available = _get_sb()
+    if not available or sb is None:
+        return None
+    try:
+        r = (sb.table('trade_interests').select('id')
+             .eq('id', interest_id).limit(1).execute())
+        return bool(list(r.data or []))
+    except Exception:
+        return None
+
+
+def _reconcile_interests_disk_to_sb(author_token):
+    """Read-Time-Reconcile für die incoming-Interessen eines Authors. Disk-only-
+    Interessen (SB-Outage ODER SB-Insert-rejected) werden nach SB geheilt, analog
+    _reconcile_posts_disk_to_sb. Best-effort + idempotent (Existenz-Check pro ID)."""
+    sb, available = _get_sb()
+    if not available or sb is None:
+        return
+    disk = _load_disk_interests(author_token)
+    if not disk:
+        return
+    healed = 0
+    for row in disk:
+        if not isinstance(row, dict):
+            continue
+        iid = row.get('id')
+        if not iid:
+            continue
+        exists = _sb_interest_exists(iid)
+        if exists is None:
+            return  # SB mittendrin weg → abbrechen, nächster Read retry
+        if exists:
+            continue
+        if _sb_insert_interest(row):
+            healed += 1
+    if healed:
+        try:
+            current_app.logger.info(
+                f'[trade] reconcile_interests_disk_to_sb healed={healed}'
+            )
+        except Exception:
+            pass
 
 
 def _list_incoming_interests(author_token):
-    """Listet Interessen auf Posts dieses Authors. SB primär, Disk-Fallback."""
+    """Listet Interessen auf Posts dieses Authors. SB primär, Disk-Fallback.
+
+    Vor dem SB-Read werden Disk-only-Interessen dieses Authors nach SB geheilt,
+    damit ein SB-Insert-Reject nicht still beim Restart verschwindet."""
+    _reconcile_interests_disk_to_sb(author_token)
     sb_rows = _sb_list_interests_for_author(author_token)
     if sb_rows is not None:
         return sb_rows
@@ -579,12 +694,25 @@ def create_trade_post(token):
         'created_at': now_iso,
         'updated_at': now_iso,
     }
-    _persist_post(row)
+    sb_ok, disk_ok = _persist_post(row)
+    if not sb_ok and not disk_ok:
+        current_app.logger.error(
+            f'[trade] post_persist_fail id={post_id} token={token[:8]} '
+            f'sb={sb_ok} disk={disk_ok}'
+        )
+        return jsonify({
+            'ok': False,
+            'error': 'Speichern fehlgeschlagen. Bitte später erneut versuchen.'
+        }), 500
     current_app.logger.info(
         f'[trade] post_created id={post_id} token={token[:8]} '
-        f'kind={swap_or_dump} start={tour_start}'
+        f'kind={swap_or_dump} start={tour_start} sb={sb_ok} disk={disk_ok}'
     )
-    return jsonify({'ok': True, 'post': row}), 200
+    return jsonify({
+        'ok': True,
+        'post': row,
+        'persisted_to': {'supabase': sb_ok, 'disk': disk_ok},
+    }), 200
 
 
 @trip_trade_bp.route('/api/trade/board', methods=['GET'])
@@ -723,7 +851,16 @@ def express_interest(token, post_id):
         'message': msg,
         'created_at': now_iso,
     }
-    _persist_interest(row, author_token)
+    sb_ok, disk_ok = _persist_interest(row, author_token)
+    if not sb_ok and not disk_ok:
+        current_app.logger.error(
+            f'[trade] interest_persist_fail id={interest_id} post={post_id} '
+            f'sb={sb_ok} disk={disk_ok}'
+        )
+        return jsonify({
+            'ok': False,
+            'error': 'Speichern fehlgeschlagen. Bitte später erneut versuchen.'
+        }), 500
 
     # Status auf in_negotiation hochstufen (erste Interesse-Meldung)
     if post.get('status') == 'open':
@@ -744,9 +881,13 @@ def express_interest(token, post_id):
 
     current_app.logger.info(
         f'[trade] interest_created id={interest_id} post={post_id} '
-        f'token={token[:8]} author={author_token[:8]}'
+        f'token={token[:8]} author={author_token[:8]} sb={sb_ok} disk={disk_ok}'
     )
-    return jsonify({'ok': True, 'interest_id': interest_id}), 200
+    return jsonify({
+        'ok': True,
+        'interest_id': interest_id,
+        'persisted_to': {'supabase': sb_ok, 'disk': disk_ok},
+    }), 200
 
 
 @trip_trade_bp.route('/api/trade/<token>/incoming-interests', methods=['GET'])

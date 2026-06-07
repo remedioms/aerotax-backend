@@ -29,6 +29,7 @@
 # ═══════════════════════════════════════════════════════════════
 
 import base64
+import hmac
 import json
 import math
 import os
@@ -73,6 +74,33 @@ def get_persist_stats():
     snap = dict(_PERSIST_STATS)
     snap['available'] = bool(ok)
     return snap
+
+
+def _rate_limited(*, ip=None, token=None, endpoint='adsb', limit=60, window_sec=60):
+    """Best-effort Rate-Limit über die app.py-Helper (_ip_rate_limited /
+    _token_rate_limited). Lazy-Import wie _sb_client, damit init-Order egal ist.
+    Liefert True wenn das Limit erreicht ist. Wenn die Helper (noch) nicht
+    auflösbar sind, NIE blocken (False) — der Live-/Anon-Pfad bleibt unberührt."""
+    try:
+        from app import _ip_rate_limited as _ipl, _token_rate_limited as _tkl
+    except ImportError:
+        return False
+    try:
+        if token and _tkl(token, endpoint, limit, window_sec):
+            return True
+        if ip and _ipl(ip, endpoint=endpoint, limit=limit, window_sec=window_sec):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _req_ip(req):
+    """Client-IP aus X-Forwarded-For (Cloudflare/Render-Proxies), sonst remote_addr."""
+    xff = req.headers.get('X-Forwarded-For', '')
+    if xff:
+        return xff.split(',')[0].strip()
+    return req.remote_addr or ''
 
 
 def _sb_client():
@@ -154,11 +182,15 @@ def _warm_persist_from_opensky_row(hex_id, opensky_row, source):
         lon = _coerce_float(opensky_row[5]) if len(opensky_row) > 5 else None
         if lat is None or lon is None:
             return  # keine Position → nicht persistieren
-        # Reg aus dem Row (adsb.lol legt sie in [2]) oder inverse aus Hex-Map.
+        # Reg-Auflösung: NUR adsb.lol legt die Registration in [2]. OpenSky-
+        # State-Vektoren haben dort origin_country (Ländername, z.B. "Germany")
+        # — der ist KEINE Registration und darf NICHT als PK landen. Wir trauen
+        # [2] daher ausschließlich bei adsb.lol-Quellen; bei OpenSky (inkl.
+        # 'opensky-poll') lösen wir die Reg ausschließlich über die Hex-Map auf.
         reg = None
-        if len(opensky_row) > 2 and isinstance(opensky_row[2], str):
+        src = (source or '').lower()
+        if 'adsb.lol' in src and len(opensky_row) > 2 and isinstance(opensky_row[2], str):
             cand = opensky_row[2].strip().upper()
-            # adsb.lol nutzt [2] als Reg; OpenSky als origin_country (Ländername).
             # Heuristik: Reg enthält keine Leerzeichen und ist <=12 Zeichen.
             if cand and ' ' not in cand and 2 <= len(cand) <= 12:
                 reg = cand
@@ -563,40 +595,49 @@ def _opensky_oauth_token():
                 _OAUTH_CACHE["expires_at"] = exp
             return tok
 
-    # 3) Frisch holen (client_credentials grant).
-    try:
-        body = urllib.parse.urlencode({
-            "grant_type": "client_credentials",
-            "client_id": cid,
-            "client_secret": secret,
-        }).encode('utf-8')
-        req = urllib.request.Request(
-            OPENSKY_TOKEN_URL, data=body, method='POST',
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-                "User-Agent": USER_AGENT,
-            })
-        with urllib.request.urlopen(req, timeout=OPENSKY_TOKEN_TIMEOUT) as resp:
-            obj = json.loads(resp.read())
-    except Exception as e:
-        try:
-            current_app.logger.warning(
-                f'[adsb] oauth_token_fetch_FAIL {type(e).__name__}: {str(e)[:120]}')
-        except Exception:
-            pass
-        return None
-
-    tok = obj.get('access_token')
-    if not tok:
-        return None
-    expires_in = _coerce_float(obj.get('expires_in')) or 1800.0
-    ttl = min(_OAUTH_TTL_SAFETY, max(60.0, expires_in - 60.0))
-    exp = now + ttl
+    # 3) Frisch holen (client_credentials grant). Den Netzwerk-Fetch unter dem
+    #    In-Process-Lock serialisieren, damit bei einem Cache-Miss nicht mehrere
+    #    Threads parallel ein Token ziehen (Thundering-Herd). Nach dem Acquire
+    #    Cache nochmals prüfen — ein anderer Thread könnte ihn gerade gefüllt
+    #    haben, während wir gewartet haben.
     with _OAUTH_CACHE["lock"]:
+        now = time.time()
+        if _OAUTH_CACHE["token"] and now < _OAUTH_CACHE["expires_at"]:
+            return _OAUTH_CACHE["token"]
+        try:
+            body = urllib.parse.urlencode({
+                "grant_type": "client_credentials",
+                "client_id": cid,
+                "client_secret": secret,
+            }).encode('utf-8')
+            req = urllib.request.Request(
+                OPENSKY_TOKEN_URL, data=body, method='POST',
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                    "User-Agent": USER_AGENT,
+                })
+            with urllib.request.urlopen(req, timeout=OPENSKY_TOKEN_TIMEOUT) as resp:
+                obj = json.loads(resp.read())
+        except Exception as e:
+            try:
+                current_app.logger.warning(
+                    f'[adsb] oauth_token_fetch_FAIL {type(e).__name__}: {str(e)[:120]}')
+            except Exception:
+                pass
+            return None
+
+        tok = obj.get('access_token')
+        if not tok:
+            return None
+        expires_in = _coerce_float(obj.get('expires_in')) or 1800.0
+        ttl = min(_OAUTH_TTL_SAFETY, max(60.0, expires_in - 60.0))
+        exp = now + ttl
         _OAUTH_CACHE["token"] = tok
         _OAUTH_CACHE["expires_at"] = exp
-    # Best-effort in poll_state spiegeln (geteilt über Instanzen).
+
+    # Best-effort in poll_state spiegeln (geteilt über Instanzen) — außerhalb des
+    # Locks, der Netzwerk-/DB-Write muss den Token-Lock nicht halten.
     _poll_state_put('oauth_token', {
         'access_token': tok,
         'expires_at_unix': exp,
@@ -638,6 +679,13 @@ def get_adsb_state():
     Antwort 400 wenn weder hex noch reg gegeben.
     Antwort 429 wenn OpenSky uns geratelimited hat — `Retry-After`-Header gesetzt.
     """
+    # Rate-Limit pro IP (token-los, da öffentlicher Live-Endpoint). Großzügig,
+    # damit normales App-Polling (mehrere Flieger/Minute) nicht getroffen wird,
+    # aber Brute-Force/Scraper abgefangen werden.
+    ip = _req_ip(request)
+    if _rate_limited(ip=ip, endpoint='adsb_state', limit=120, window_sec=60):
+        return jsonify({"error": "rate_limited"}), 429
+
     hex_param = (request.args.get('hex') or '').strip().lower()
     reg_param = (request.args.get('reg') or '').strip().upper()
 
@@ -654,12 +702,10 @@ def get_adsb_state():
                 "hint": "pass ?hex=<icao24> if client knows the mapping",
             }), 404
 
-    # Nutzer-getriebenes Watch-Set füttern: dieser Client interessiert sich
-    # gerade für diesen Hex → in adsb_watch upserten, damit der Shared-Poller
-    # ihn ins aktive Poll-Set aufnimmt (best-effort, bricht die Response nie).
-    _touch_watch(hex_param, registration=reg_param or None)
-
-    # Fresh-Cache-Hit (60s TTL) — sofort raus.
+    # Fresh-Cache-Hit (60s TTL) — sofort raus. Watch-Touch (Supabase-Upsert)
+    # bewusst NICHT vor diesem Early-Return: ein frischer Cache-Hit darf KEINE
+    # DB-Schreiblast erzeugen. Wir touchen das Watch-Set erst, wenn wir gleich
+    # tatsächlich upstream fetchen (s. unten).
     cached = _cache_get(hex_param)
     if cached is not None:
         return jsonify({
@@ -669,6 +715,12 @@ def get_adsb_state():
             "cached": True,
             "source": cached.get("source", "cache"),
         }), 200
+
+    # Nutzer-getriebenes Watch-Set füttern: dieser Client interessiert sich
+    # gerade für diesen Hex → in adsb_watch upserten, damit der Shared-Poller
+    # ihn ins aktive Poll-Set aufnimmt (best-effort, bricht die Response nie).
+    # Erst NACH dem Fresh-Cache-Hit, damit Cache-Hits keine DB-Writes auslösen.
+    _touch_watch(hex_param, registration=reg_param or None)
 
     # Cold-Start-Backfill: nach einem Cloud-Run-Restart ist der In-Memory-_CACHE
     # leer — bevor wir externe APIs anfassen, holen wir die zuletzt persistierte
@@ -958,8 +1010,17 @@ def get_route_polyline():
         try:
             lat1, lon1 = float(dep_lat), float(dep_lon)
             lat2, lon2 = float(arr_lat), float(arr_lon)
-        except ValueError:
+        except (TypeError, ValueError):
             return jsonify({"error": "invalid coordinates"}), 400
+        # Wertebereich prüfen — NaN/Inf und out-of-range (lat∈[-90,90],
+        # lon∈[-180,180]) ablehnen statt Müll in die Great-Circle-Rechnung zu
+        # geben (float() schluckt 'nan'/'inf' klaglos).
+        if not (math.isfinite(lat1) and math.isfinite(lon1)
+                and math.isfinite(lat2) and math.isfinite(lon2)):
+            return jsonify({"error": "invalid coordinates"}), 400
+        if not (-90.0 <= lat1 <= 90.0 and -90.0 <= lat2 <= 90.0
+                and -180.0 <= lon1 <= 180.0 and -180.0 <= lon2 <= 180.0):
+            return jsonify({"error": "coordinates out of range"}), 400
     else:
         dep = (request.args.get('dep') or '').strip().upper()
         arr = (request.args.get('arr') or '').strip().upper()
@@ -1702,7 +1763,9 @@ def _poll_authorized(req):
     """
     secret = os.environ.get('ADSB_POLL_SECRET', '').strip()
     if secret:
-        return (req.headers.get('X-Poll-Secret') or '').strip() == secret
+        provided = (req.headers.get('X-Poll-Secret') or '').strip()
+        # Konstant-Zeit-Vergleich gegen Timing-Attacks (statt naivem '==').
+        return hmac.compare_digest(provided, secret)
     # Kein Secret konfiguriert → nur lokale Aufrufe.
     remote = (req.remote_addr or '')
     return remote in ('127.0.0.1', '::1', 'localhost')
@@ -1792,6 +1855,11 @@ def adsb_poll():
     if not _poll_authorized(request):
         return jsonify({"error": "unauthorized"}), 403
 
+    # Rate-Limit pro IP zusätzlich zum Shared-Secret — der Scheduler tickt ~60s,
+    # also ist ein knappes Limit sicher und fängt Fehlkonfig/Loops ab.
+    if _rate_limited(ip=_req_ip(request), endpoint='adsb_poll', limit=10, window_sec=60):
+        return jsonify({"error": "rate_limited"}), 429
+
     now = time.time()
     # Globaler OpenSky-Backoff aktiv? (429 zuvor) → diesen Tick aussetzen.
     with _BACKOFF["lock"]:
@@ -1820,8 +1888,16 @@ def adsb_poll():
     calls_made = 0
     credits_remaining = None
     polled_boxes = []
-    stretched = False  # erst nach erstem Header-Read bekannt
     today_key = 'budget:' + datetime.now(timezone.utc).strftime('%Y%m%d')
+
+    # Budget-Governor mit dem zuletzt gesehenen Rest-Credit aus poll_state seeden,
+    # damit schon die ERSTE Box des Ticks die Budget-Lage respektiert (vorher lief
+    # Box #1 immer auf 'normal', weil X-Rate-Limit-Remaining erst nach dem ersten
+    # bbox-Call bekannt war). Best-effort: ohne bekannten Wert → False (kein
+    # künstliches Drosseln).
+    _prev_budget = _poll_state_get(today_key) or {}
+    _prev_remaining = _coerce_float(_prev_budget.get('remaining_seen'))
+    stretched = _budget_stretched(_prev_remaining) if _prev_remaining is not None else False
 
     # 3+4+5) pro Box: Cadence prüfen, ggf. bbox-Call, persistieren.
     for box_name, rows in boxes.items():

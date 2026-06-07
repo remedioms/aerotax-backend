@@ -210,7 +210,59 @@ def _sb_insert_report(row):
         return False
 
 
+def _sb_report_exists(report_id):
+    """True wenn der Report bereits in SB liegt. None bei SB-down (= unklar)."""
+    if not report_id:
+        return None
+    sb, ok = _sb_client()
+    if not ok:
+        return None
+    try:
+        r = (sb.table('hotel_room_reports')
+             .select('id').eq('id', report_id).limit(1).execute())
+        return bool(r.data or [])
+    except Exception:
+        return None
+
+
+def _reconcile_reports_disk_to_sb():
+    """Read-Time-Reconcile: Disk-only-Reports (SB-Outage ODER SB-Insert-rejected,
+    z.B. NOT-NULL/Constraint/PGRST) werden nach SB geheilt — analog license_wallet
+    lazy-migrate. So überleben Reports, die während einer SB-Ablehnung nur auf die
+    ephemere Disk geschrieben wurden, einen Cloud-Run-Restart und tauchen wieder
+    im SB-primären Listing auf.
+
+    Best-effort + idempotent (Existenz-Check pro report_id). Bei SB-down passiert
+    nichts; der nächste Read versucht es erneut."""
+    sb, ok = _sb_client()
+    if not ok:
+        return
+    with _DISK_LOCK:
+        rows = _disk_load(_DISK_REPORTS)
+    if not rows:
+        return
+    healed = 0
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        rid = r.get('id')
+        if not rid:
+            continue
+        exists = _sb_report_exists(rid)
+        if exists is None:
+            return  # SB mittendrin weg → abbrechen, nächster Read retry
+        if exists:
+            continue
+        if _sb_insert_report(r):
+            healed += 1
+    if healed:
+        current_app.logger.info(
+            f'[hotel-rooms] reconcile_reports_disk_to_sb healed={healed}'
+        )
+
+
 def _sb_list_by_hotel(hotel_name, hotel_iata):
+    _reconcile_reports_disk_to_sb()
     sb, ok = _sb_client()
     if not ok:
         return None
@@ -234,6 +286,7 @@ def _sb_list_by_hotel(hotel_name, hotel_iata):
 
 
 def _sb_list_by_iata(iata):
+    _reconcile_reports_disk_to_sb()
     sb, ok = _sb_client()
     if not ok:
         return None
@@ -262,6 +315,7 @@ def _sb_list_for_summary(iata):
     Nicht upvote-sortiert/LISTING_MAX-gekappt wie das Listing — wir brauchen die
     volle Stichprobe pro Hotel, sonst verzerren gekappte Reihen die Durchschnitte.
     """
+    _reconcile_reports_disk_to_sb()
     sb, ok = _sb_client()
     if not ok:
         return None
@@ -439,19 +493,37 @@ def hotel_rooms_post(token):
 
     sb_ok = _sb_insert_report(row)
     # Disk-fallback als zweiter "Beleg" (idempotent append).
+    disk_ok = False
     with _DISK_LOCK:
         rows = _disk_load(_DISK_REPORTS)
         rows.append(row)
         if len(rows) > 5000:
             rows = rows[-5000:]
-        _disk_save(_DISK_REPORTS, rows)
+        disk_ok = _disk_save(_DISK_REPORTS, rows)
+
+    if not sb_ok and not disk_ok:
+        current_app.logger.error(
+            f'[hotel-rooms] report_persist_fail id={report_id[:8]} '
+            f'sb={sb_ok} disk={disk_ok}'
+        )
+        return jsonify({
+            'ok': False,
+            'error': 'Speichern fehlgeschlagen. Bitte später erneut versuchen.'
+        }), 500
 
     current_app.logger.info(
         f'[hotel-rooms] report_in hotel={hotel_name[:30]} iata={hotel_iata} '
-        f'tok={safe_tok[:8]} id={report_id[:8]} sb_ok={sb_ok}'
+        f'tok={safe_tok[:8]} id={report_id[:8]} sb_ok={sb_ok} disk_ok={disk_ok}'
     )
 
-    return jsonify({'ok': True, 'report': _clean_report(row)})
+    # sb_ok/disk_ok ehrlich an den Client durchreichen (wie license_wallet):
+    # bei sb_ok=False liegt der Report nur auf der ephemeren Disk und wird beim
+    # nächsten Listing-Read via _reconcile_reports_disk_to_sb nach SB geheilt.
+    return jsonify({
+        'ok': True,
+        'report': _clean_report(row),
+        'persisted_to': {'supabase': sb_ok, 'disk': disk_ok},
+    })
 
 
 @hotel_rooms_bp.route('/api/hotel-rooms/by-hotel', methods=['GET'])

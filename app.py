@@ -362,6 +362,60 @@ def _bug004_get_route_needs_auth(path):
     return False
 
 
+# ── AUTH-BINDING (BUG-AUDIT 2026-06-07) ──────────────────────────────────
+# Cross-User-/Public-Pfade: hier ist das AT-Token im Pfad ABSICHTLICH das
+# eines ANDEREN Users (Friend-Discovery, Public-Feed). Für diese Pfade darf
+# der Bearer NICHT gleich dem Pfad-Token sein müssen — sonst bräche der
+# Friend-Lookup. Alle übrigen owner-scoped Pfade binden (wenn ein Bearer
+# anliegt) den Bearer constant-time an das Pfad-Token.
+#
+# Hinweis Wall/Forum: dort ist das Pfad-Token das EIGENE Token des Callers
+# (Author-Identität), also owner-scoped — der iOS-Client schickt dort aktuell
+# KEINEN Bearer, daher greift die "Bearer absent → nur warnen"-Regel und es
+# bricht nichts. Sobald ein Bearer anliegt, muss er passen.
+_BUG004_CROSS_USER_PREFIXES = (
+    '/api/user/profile/',   # GET = Friend-Profil-Lookup (fremdes Token)
+    '/api/user/friends/',   # GET = Friend-of-Friend-Discovery (fremdes Token)
+    '/api/layover-recs/',   # Discovery/Recs über fremde Tokens
+    '/api/crews-on-flight/',
+)
+
+
+def _bug004_is_cross_user_path(path):
+    for prefix in _BUG004_CROSS_USER_PREFIXES:
+        if path.startswith(prefix):
+            return True
+    return False
+
+
+def _request_bearer_token():
+    """Extrahiert das Bearer-Token aus dem Authorization-Header. None wenn
+    kein/kein-Bearer-Header anliegt."""
+    try:
+        auth = request.headers.get('Authorization') or ''
+    except Exception:
+        return None
+    if not auth:
+        return None
+    parts = auth.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == 'bearer':
+        tok = parts[1].strip()
+        return tok or None
+    return None
+
+
+def _request_bearer_matches(path_token):
+    """True wenn ein Authorization-Bearer anliegt UND constant-time gleich
+    `path_token` ist. False wenn kein Bearer anliegt oder er nicht passt."""
+    bearer = _request_bearer_token()
+    if not bearer or not path_token:
+        return False
+    try:
+        return hmac.compare_digest(bearer, path_token)
+    except Exception:
+        return False
+
+
 @app.before_request
 def _bug004_token_auth_gate():
     """Reject Requests mit gefakeden AT-...-Tokens die nicht in auth_users
@@ -399,6 +453,29 @@ def _bug004_token_auth_gate():
         # Bekanntes Token? — _validate_token_exists nutzt 60s-Cache
         if _validate_token_exists(token) is None:
             return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+        # AUTH-BINDING (BUG-AUDIT 2026-06-07): Das alte Gate prüfte NUR ob das
+        # Pfad-Token in auth_users existiert — es band es NICHT an den
+        # authentifizierten Aufrufer. Jeder mit irgendeinem gültigen Bearer
+        # konnte fremde owner-scoped Pfade ansprechen, solange das Pfad-Token
+        # existierte. Härtung ohne den iOS-Client zu brechen:
+        #   - Cross-User-/Public-Pfade (Friend-Lookup etc.) → kein Binding.
+        #   - Sonst owner-scoped: WENN ein Bearer anliegt, MUSS er constant-time
+        #     gleich dem Pfad-Token sein (Mismatch → 401).
+        #   - Kein Bearer (aktueller iOS-Default für owner-Routen) → nur warnen,
+        #     NICHT blocken, damit die App nicht bricht.
+        if not _bug004_is_cross_user_path(path):
+            bearer = _request_bearer_token()
+            if bearer is not None:
+                if not hmac.compare_digest(bearer, token):
+                    return jsonify({'ok': False, 'error': 'token_binding_mismatch'}), 401
+            else:
+                try:
+                    app.logger.warning(
+                        f'[bug004-gate] owner-route ohne Authorization-Bearer '
+                        f'method={method} path-tok={token[:8]} — binding nicht '
+                        f'erzwingbar (client sendet keinen Bearer)')
+                except Exception:
+                    pass
     except Exception as e:
         # Auth-Gate-Bugs dürfen die App nicht killen — log + pass-through
         try:
@@ -8258,7 +8335,65 @@ def _user_history_path(token):
     return os.path.join(_USER_HISTORY_DIR, f'{safe}.json')
 
 
-def _user_history_load(token):
+# ── User-History SB persistence (PERSISTENCE-FIX 2026-06-07) ──────────────
+# Vorher disk-only (_user_history_state/<token>.json) → auf Cloud Run bei jedem
+# Redeploy/Restart weg. Pattern wie user_licenses/layover_recs:
+#   SB primary, Disk mirror, Lazy-Migrate beim ersten SB-leeren Read.
+# Schema: 1 Row pro Auswertung, PK (token, key). key = job_id wenn vorhanden,
+# sonst datum (= bestehende Dedup-Identität). Felder liegen in entry-jsonb.
+def _user_history_entry_key(entry):
+    """Dedup-/PK-key einer History-Entry: job_id wenn vorhanden, sonst datum."""
+    if not isinstance(entry, dict):
+        return None
+    jid = entry.get('job_id')
+    if jid:
+        return str(jid)
+    dt = entry.get('datum')
+    if dt:
+        return str(dt)
+    return None
+
+
+def _user_history_load_from_supabase(token):
+    """Alle History-Entries eines Tokens aus SB, neueste zuerst.
+    None bei SB-down/error. Dict {token, entries:[...]} bei Hit (auch leer)."""
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = (sb.table('user_history').select('entry,created_at')
+             .eq('token', token).order('created_at', desc=True)
+             .limit(60).execute())
+        entries = []
+        for row in (r.data or []):
+            e = row.get('entry')
+            if isinstance(e, dict):
+                entries.append(e)
+        return {'token': token, 'entries': entries}
+    except Exception as e:
+        app.logger.warning(
+            f'[user-history] sb_load_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _user_history_upsert_to_supabase(token, entry):
+    """Upsert einer einzelnen History-Entry (PK token,key). True bei Erfolg."""
+    if not SB_AVAILABLE or not token:
+        return False
+    key = _user_history_entry_key(entry)
+    if not key:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    row = {'token': token, 'key': key, 'entry': entry, 'updated_at': now}
+    try:
+        sb.table('user_history').upsert(row, on_conflict='token,key').execute()
+        return True
+    except Exception as e:
+        app.logger.error(
+            f'[user-history] sb_upsert_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _user_history_load_from_disk(token):
     p = _user_history_path(token)
     if not p:
         return {'token': token, 'entries': []}
@@ -8271,7 +8406,26 @@ def _user_history_load(token):
         return {'token': token, 'entries': []}
 
 
-def _user_history_save(token, data):
+def _user_history_load(token):
+    """SB primary, Disk fallback. Lazy-migriert disk→SB beim ersten Read wenn
+    SB leer aber Disk-Entries existieren. Gleiche Shape wie früher:
+    {token, entries:[...], _last_updated?}."""
+    if not token:
+        return {'token': token, 'entries': []}
+    sb_data = _user_history_load_from_supabase(token)
+    if sb_data is not None and sb_data.get('entries'):
+        return sb_data
+    # SB leer/down → Disk-Fallback (+ Lazy-Migrate wenn SB up aber leer)
+    disk = _user_history_load_from_disk(token)
+    disk_entries = (disk or {}).get('entries') or []
+    if sb_data is not None and not sb_data.get('entries') and disk_entries:
+        app.logger.info(f'[user-history] lazy-migrate tok={token[:8]} disk→supabase ({len(disk_entries)})')
+        for e in disk_entries:
+            _user_history_upsert_to_supabase(token, e)
+    return disk
+
+
+def _user_history_save_to_disk(token, data):
     p = _user_history_path(token)
     if not p:
         return False
@@ -8285,20 +8439,28 @@ def _user_history_save(token, data):
 def _user_history_append(token, entry):
     """Hängt eine fertige Auswertung an die Token-History.
     entry: {datum, year, month?, gesamt, vma_aus, hotel_naechte, fahr_tage,
-            arbeitstage, job_id, summary_label}"""
+            arbeitstage, job_id, summary_label}
+    SB-primary (single-Entry-Upsert) + Disk-Mirror (best-effort)."""
     if not token:
         return False
-    data = _user_history_load(token)
+    # SB: einzelne Entry upsert (PK token,key dedupt nach job_id/datum)
+    sb_ok = _user_history_upsert_to_supabase(token, entry)
+    # Disk-Mirror: bestehende Liste lesen, dedup + insert + cap, zurückschreiben
+    data = _user_history_load_from_disk(token)
     if 'entries' not in data or not isinstance(data['entries'], list):
         data['entries'] = []
-    # Dedup nach job_id wenn vorhanden
-    jid = entry.get('job_id')
-    if jid:
-        data['entries'] = [e for e in data['entries'] if e.get('job_id') != jid]
+    key = _user_history_entry_key(entry)
+    if key:
+        data['entries'] = [e for e in data['entries']
+                           if _user_history_entry_key(e) != key]
     data['entries'].insert(0, entry)
     data['entries'] = data['entries'][:60]  # max 60 = 5 Jahre Monate
     data['_last_updated'] = datetime.now().isoformat()
-    return _user_history_save(token, data)
+    disk_ok = _user_history_save_to_disk(token, data)
+    if not (sb_ok or disk_ok):
+        app.logger.error(f'[user-history] CRITICAL tok={token[:8]}: weder SB noch Disk gesichert!')
+        return False
+    return True
 
 
 @app.route('/api/user/history/<token>', methods=['GET'])
@@ -8478,18 +8640,56 @@ def _profile_save(token, profile, full_disk_payload=None):
     return True
 
 
+# PUBLIC-Profile-Whitelist (BUG-AUDIT 2026-06-07, PII-LEAK-FIX):
+# Der Profile-GET ist Friend-Discovery → PUBLIC. Er darf NUR opt-in-/Anzeige-
+# Felder liefern. Insbesondere DÜRFEN home_address/home_latitude/
+# home_longitude/home_transport_mode (Commute-Distance, 2026-06-06) NIEMALS
+# hier raus — das ist die Wohnadresse + GPS-Koordinaten des Users. Vorher gab
+# der Endpoint das KOMPLETTE profile-Dict 1:1 zurück → Wohnadresse für jeden
+# mit dem (nicht-geheimen) AT-Token abrufbar.
+_PUBLIC_PROFILE_FIELDS = (
+    'name', 'homebase', 'position', 'airline', 'hometown',
+    'avatar_url', 'account_type', 'share_roster', 'share_location',
+)
+
+
+def _public_profile_projection(token):
+    """Lädt das volle Profil und projiziert es auf die PUBLIC-Whitelist.
+    Liefert {token, profile:{nur-whitelist-felder}} — gleiche Shape wie früher,
+    aber ohne private Felder (home_address/lat/lon/transport_mode, email,
+    billing, subscription, marker_mapping, …)."""
+    full = _profile_load(token) or {}
+    prof = (full.get('profile') or {}) if isinstance(full, dict) else {}
+    public = {}
+    for k in _PUBLIC_PROFILE_FIELDS:
+        v = prof.get(k)
+        if v is not None:
+            public[k] = v
+    return {'token': token, 'profile': public}
+
+
 @app.route('/api/user/profile/<token>', methods=['GET'])
 def get_user_profile(token):
     # PUBLIC-BY-DESIGN (BUG-004 audit, 2026-06-02): Profile-Lookup ist im
     # Friend-Discovery-Flow notwendig BEVOR eine Friendship besteht — d.h. ein
     # User scannt z.B. einen QR-Code, möchte Profil sehen vor Accept. Daher
-    # bewusst NICHT durch _bug004_token_auth_gate gedeckt. Daten sind auf
-    # opt-in-Felder beschränkt (name, homebase, position, airline, hometown).
-    # Private Felder (email, billing) NIEMALS hier zurückliefern.
+    # bewusst NICHT durch _bug004_token_auth_gate gedeckt.
+    #
+    # PII-LEAK-FIX (2026-06-07): Antwort ist auf _PUBLIC_PROFILE_FIELDS
+    # WHITELISTED. Vorher floss das komplette Profil (inkl. home_address +
+    # GPS-Koordinaten + transport_mode) verbatim raus. Private Felder
+    # (home_*, email, billing, subscription) werden NIE zurückgeliefert.
     if not token:
         return jsonify({'error': 'invalid token'}), 400
     try:
-        return jsonify(_profile_load(token))
+        # Owner-Pfad: wenn der Caller einen Authorization-Bearer schickt, der
+        # mit dem Pfad-Token übereinstimmt (constant-time), ist es der Owner
+        # selbst → volles Profil (inkl. home_*) für Cross-Device-Sync
+        # (BackgroundSyncService/Stores.swift liest home_address zurück).
+        # Sonst (Friend-Discovery, kein/falscher Bearer): PUBLIC-Whitelist.
+        if _request_bearer_matches(token):
+            return jsonify(_profile_load(token))
+        return jsonify(_public_profile_projection(token))
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
 
@@ -11158,6 +11358,24 @@ def _manual_briefings_save(token, briefings_dict):
 _BRIEFING_TIME_RE = re.compile(r'(\d{1,2}:\d{2})\s*(?:LT|UTC|Z|L)?\s*Briefing',
                                re.IGNORECASE)
 
+# Der bedeutungslose DTSTART-Default der LH/CRA-Roster-Pipeline ist 06:30 UTC
+# (→ 08:30 LT Sommerzeit / 07:30 LT Winterzeit). Diese UTC-Uhrzeit ist KEINE
+# echte Report-/Briefing-Zeit — sie wird gesetzt wenn der Feed keine Zeit
+# kennt. Solche Werte dürfen NICHT als „Dienstbeginn" surfaced werden.
+_BRIEFING_MEANINGLESS_DTSTART_UTC = ('06:30',)
+
+
+def _briefing_start_is_bare_default(current_start_iso):
+    """True wenn `current_start_iso` der bedeutungslose 06:30-UTC-Default ist
+    (z.B. '2026-06-07T06:30:00Z'). Nur die UTC-Uhrzeit zählt — Datum egal."""
+    si = (current_start_iso or '').strip()
+    if not si:
+        return False
+    m = re.search(r'T(\d{2}:\d{2})(?::\d{2})?Z?', si)
+    if not m:
+        return False
+    return m.group(1) in _BRIEFING_MEANINGLESS_DTSTART_UTC
+
 
 def _corrected_briefing_start_iso(date_str, summary, current_start_iso):
     """Root-Cause-Fix „Dienstbeginn 08:30": Der DTSTART aus der Roster-Pipeline ist
@@ -11166,15 +11384,21 @@ def _corrected_briefing_start_iso(date_str, summary, current_start_iso):
     (z.B. „12:15 LT Briefing FRA · …"), ist DIE die maßgebliche Dienstbeginn-Zeit —
     wir übernehmen sie 1:1 (Europe/Berlin → UTC) in `ical_start_iso`.
 
-    Rein additiv: ohne explizite Briefing-Zeit im Summary bleibt `current_start_iso`
-    unverändert (kein Raten). Idempotent. Liefert immer einen iso-String oder den
-    Originalwert.
+    HONESTY-FIX (2026-06-07): Liegt KEINE explizite Briefing-Zeit im Summary vor
+    UND ist `current_start_iso` nur der bedeutungslose 06:30-UTC-Default, geben
+    wir `None` zurück statt die erfundene 08:30 zu surfacen. Die UI zeigt dann
+    „keine Zeit" statt einer fabrizierten Uhrzeit. Echte Zeiten (alles ≠ der
+    Default) bleiben unangetastet. Idempotent.
     """
     s = (summary or '')
-    if not s or not re.match(r'^\d{4}-\d{2}-\d{2}$', (date_str or '')):
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', (date_str or '')):
         return current_start_iso
-    m = _BRIEFING_TIME_RE.search(s)
+    m = _BRIEFING_TIME_RE.search(s) if s else None
     if not m:
+        # Keine explizite Report-Zeit. Wenn der vorhandene Wert nur der
+        # bedeutungslose DTSTART-Default ist → nicht als echte Zeit surfacen.
+        if _briefing_start_is_bare_default(current_start_iso):
+            return None
         return current_start_iso
     try:
         hh, mm = m.group(1).split(':')
@@ -12389,13 +12613,37 @@ _ANON_ADJ = ['Silent', 'Night', 'Mach', 'Tail', 'Jet', 'Cloud', 'Sky', 'Delta', 
              'Foxtrot', 'Cruise', 'Apron', 'Crosswind', 'Redeye', 'Galley', 'Standby']
 _ANON_NOUN = ['Captain', 'Cruiser', 'Skipper', 'Nomad', 'Falcon', 'Albatross', 'Comet',
               'Voyager', 'Ranger', 'Drifter', 'Aviator', 'Wanderer', 'Phantom', 'Maverick']
-def _anon_handle_for(token):
-    import hashlib
-    h = hashlib.sha256(('anonwall:' + (token or '')).encode()).hexdigest()
+def _anon_handle_secret():
+    """Server-Secret für die Anon-Handle-HMAC. Primär AEROTAX_CRYPTO_KEY (ist
+    in Production garantiert gesetzt, siehe _validate_crypto_key_on_boot).
+    Local/Test-Fallback ist ein stabiler Prozess-String — Handles bleiben dann
+    innerhalb eines Boots konsistent, sind aber nicht aus dem Token allein
+    rekonstruierbar."""
+    key = (os.environ.get('AEROTAX_CRYPTO_KEY') or '').strip()
+    if key:
+        return key.encode()
+    return b'aerotax-anon-handle-local-fallback'
+
+
+def _anon_handle_for(token, salt=None):
+    """Pseudonymer Anon-Handle. SECURITY-FIX (2026-06-07): vorher
+    sha256('anonwall:'+token) — deterministisch & aus dem (nicht-geheimen)
+    Token rekonstruierbar, und alle Posts eines Users clusterten unter dem
+    GLEICHEN Handle. Jetzt: HMAC-SHA256 mit Server-Secret (nicht aus dem Token
+    allein berechenbar) + optionalem Per-Post-`salt` (z.B. post_id), damit die
+    anonymen Posts eines Users NICHT mehr untereinander verkettbar sind.
+
+    Bestehende Posts behalten ihren bereits gespeicherten anon_handle und
+    bleiben lesbar — diese Funktion wird beim Read nur als Fallback für
+    Legacy-Posts OHNE gespeicherten Handle aufgerufen.
+    """
+    msg = 'anonwall:' + (token or '')
+    if salt:
+        msg += ':' + str(salt)
+    h = hmac.new(_anon_handle_secret(), msg.encode(), _hashlib.sha256).hexdigest()
     a = _ANON_ADJ[int(h[0:4], 16) % len(_ANON_ADJ)]
     n = _ANON_NOUN[int(h[4:8], 16) % len(_ANON_NOUN)]
     # h[8:11] → 3 hex chars → 0-4095; %1000 → 0-999 als :03d suffix.
-    # Vorher h[8:10] (0-255) % 100 → nur 00-55 erreichbar (56-99 unmöglich).
     return f'{a}{n}{int(h[8:11], 16) % 1000:03d}'
 
 # ── Wall-Posts SB persistence (P0 Worker-P1, 2026-06-01) ──
@@ -12938,9 +13186,10 @@ def create_wall_post(token):
         'is_anonymous': is_anonymous,
     }
     if is_anonymous:
-        # Stabiler Handle, kein Profil. author_token bleibt server-seitig
-        # NUR für Moderation/Ownership (wird im Feed wegstripped).
-        post['anon_handle'] = _anon_handle_for(token)
+        # Pseudonymer Handle, kein Profil. author_token bleibt server-seitig
+        # NUR für Moderation/Ownership (wird im Feed wegstripped). Per-Post-Salt
+        # (post-id) → anonyme Posts eines Users sind nicht mehr verkettbar.
+        post['anon_handle'] = _anon_handle_for(token, salt=post['id'])
     else:
         # Author profile snapshot (nur bei nicht-anonym). SB-primary statt Disk —
         # auf Cloud Run ist die Disk-Datei ephemer → Posts erschienen als „Crew".
@@ -13142,8 +13391,9 @@ def add_comment(token, post_id):
         except Exception:
             pass
     now_ts = _t.time()
+    _comment_id = str(uuid.uuid4())[:10]
     c = {
-        'id': str(uuid.uuid4())[:10],
+        'id': _comment_id,
         'post_id': post_id,
         'author_token': token,
         'author_short': None if is_anonymous else token[:8],
@@ -13152,7 +13402,8 @@ def add_comment(token, post_id):
         'image_url': image_url,
         'parent_comment_id': parent_comment_id,
         'is_anonymous': is_anonymous,
-        'anon_handle': _anon_handle_for(token) if is_anonymous else None,
+        # Per-Comment-Salt → anonyme Kommentare eines Users nicht verkettbar.
+        'anon_handle': _anon_handle_for(token, salt=_comment_id) if is_anonymous else None,
         'ts': now_ts,
         'created_at': datetime.now().isoformat(),
     }
