@@ -3332,6 +3332,9 @@ def _run_process_async(job_id, form, files):
                                     'auto_saved': True,
                                     'tage': _tage,
                                 }, _sf, ensure_ascii=False)
+                            # Crews-on-Flight: Flugnummer-Assignments ingesten
+                            # (best-effort). Speist /api/crew/flight-Lookup.
+                            _crew_flight_ingest(session_token, _tage)
             except Exception as _e:
                 app.logger.warning(f'[share-roster-auto-save] {_e}')
 
@@ -11257,6 +11260,258 @@ def put_briefing(token, datum):
     return jsonify({'ok': True, 'datum': datum})
 
 
+# ─── Crews-on-Flight: "Wer ist heute/morgen noch auf meinem Flug?" ──────────
+# Datenquelle: dedizierte SB-Tabelle `crew_flight_assignments` (Migration
+# 20260607_crew_flight_assignments.sql), gespeist aus dem bestehenden Roster-
+# Ingest-Pfad. Cross-User-Lookup auf (flight_number, date) — die per-Token-
+# Roster-Snapshots haben keinen Cross-User-Index. Spiegelt das crew_edges-Muster
+# (eigene SB-Tabelle + Disk-Fallback + Opt-in-Gating). Disk-Fallback hält das
+# Feature bei SB-down lokal funktionsfähig (gleicher Worker).
+
+_CREW_FLIGHT_DISK = 'crew_flight_assignments'
+
+def _crew_flight_disk_path():
+    import os
+    d = os.path.join(_USER_HISTORY_DIR, _CREW_FLIGHT_DISK)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _crew_flight_disk_file(flight_number, flight_date):
+    """Ein File pro (flight_number, date) — Cross-User-Read ohne Snapshot-Scan."""
+    import os, re
+    fn = re.sub(r'[^A-Za-z0-9]', '', (flight_number or '').upper())[:12]
+    fd = re.sub(r'[^0-9-]', '', (flight_date or ''))[:10]
+    if not fn or not re.match(r'^\d{4}-\d{2}-\d{2}$', fd):
+        return None
+    return os.path.join(_crew_flight_disk_path(), f'{fn}__{fd}.json')
+
+def _crew_flight_extract_assignments(token, tage):
+    """Aus tage_detail → Liste {flight_number, flight_date} (deduped). Quelle ist
+    reader_facts.flight_numbers (gleiches Feld wie /friends-today). Nur Tage mit
+    echtem Datum + mind. einer Flugnummer."""
+    out = []
+    seen = set()
+    for t in (tage or []):
+        if not isinstance(t, dict):
+            continue
+        datum = (t.get('datum') or '')[:10]
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', datum):
+            continue
+        rf = t.get('reader_facts') or {}
+        for fn in (rf.get('flight_numbers') or []):
+            fn_norm = re.sub(r'[^A-Za-z0-9]', '', str(fn or '').upper())[:12]
+            if not fn_norm:
+                continue
+            key = (fn_norm, datum)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({'flight_number': fn_norm, 'flight_date': datum})
+    return out
+
+def _crew_flight_ingest(token, tage):
+    """Populiert crew_flight_assignments aus dem aktuellen tage_detail. Wird vom
+    Roster-Ingest-Pfad aufgerufen (best-effort, wirft nie). opt_in spiegelt
+    share_roster: explizit False → opt_in=False (User taucht in keiner Liste auf).
+    Profil-Snapshot (name/homebase/position) wird mitgeschrieben, damit der
+    Cross-User-Read token-frei bleibt."""
+    if not token:
+        return
+    try:
+        assignments = _crew_flight_extract_assignments(token, tage)
+        if not assignments:
+            return
+        pr = (_profile_load(token) or {}).get('profile', {}) or {}
+        display_name = pr.get('name') or ''
+        base = (pr.get('homebase') or '').upper()
+        position = pr.get('position') or ''
+        # share_roster-Reziprozität (default an): nur explizit False = Opt-Out.
+        opt_in = pr.get('share_roster') is not False
+        now_iso = datetime.now().isoformat()
+        # 1) SB-primary
+        if SB_AVAILABLE:
+            try:
+                rows = [{
+                    'self_token': token,
+                    'flight_number': a['flight_number'],
+                    'flight_date': a['flight_date'],
+                    'display_name': display_name,
+                    'base': base,
+                    'position': position,
+                    'opt_in': opt_in,
+                    'updated_at': now_iso,
+                } for a in assignments]
+                for i in range(0, len(rows), 500):
+                    sb.table('crew_flight_assignments').upsert(
+                        rows[i:i+500],
+                        on_conflict='self_token,flight_number,flight_date',
+                    ).execute()
+            except Exception as e:
+                app.logger.warning(
+                    f'[crew-flight] sb_ingest_fail tok={token[:8]} '
+                    f'err={type(e).__name__}: {str(e)[:120]}'
+                )
+        # 2) Disk-Fallback/Mirror — ein File pro (flight, date), Key=token.
+        for a in assignments:
+            fp = _crew_flight_disk_file(a['flight_number'], a['flight_date'])
+            if not fp:
+                continue
+            try:
+                try:
+                    with open(fp) as f:
+                        bucket = json.load(f) or {}
+                except FileNotFoundError:
+                    bucket = {}
+                bucket[token] = {
+                    'display_name': display_name,
+                    'base': base,
+                    'position': position,
+                    'opt_in': opt_in,
+                    'updated_at': now_iso,
+                }
+                with open(fp, 'w') as f:
+                    json.dump(bucket, f, ensure_ascii=False)
+            except Exception:
+                pass
+    except Exception as e:
+        app.logger.warning(f'[crew-flight] ingest_fail {type(e).__name__}: {str(e)[:120]}')
+
+
+@app.route('/api/crew/flight/<token>/<flight_number>/<date>', methods=['GET'])
+def crew_on_flight(token, flight_number, date):
+    """Andere opt-in-Crew auf der GLEICHEN Flugnummer am GLEICHEN Datum.
+
+    Privacy: exponiert NUR display_name, base, position, avatar_url — KEIN Token,
+    KEINE exakte Location. Nur User mit opt_in=true (= share_roster nicht explizit
+    aus) tauchen auf. Der Aufrufer selbst wird ausgeschlossen.
+
+    Antwort 200:
+        {"ok": true, "flight_number": "LH400", "date": "2026-06-07",
+         "count": N, "crew": [{"display_name": "...", "base": "FRA",
+         "position": "FA", "avatar_url": null}]}
+    """
+    if not token or not _validate_token_exists(token):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 401
+    if _token_rate_limited(token, 'crew_on_flight', limit=120, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    fn = re.sub(r'[^A-Za-z0-9]', '', (flight_number or '').upper())[:12]
+    fd = (date or '')[:10]
+    if not fn or not re.match(r'^\d{4}-\d{2}-\d{2}$', fd):
+        return jsonify({'ok': False, 'error': 'invalid_params'}), 400
+
+    crew = []
+    # 1) SB-primary: indizierter Cross-User-Lookup auf (flight_number, date).
+    sb_ok = False
+    if SB_AVAILABLE:
+        try:
+            r = (sb.table('crew_flight_assignments')
+                 .select('self_token,display_name,base,position,opt_in')
+                 .eq('flight_number', fn)
+                 .eq('flight_date', fd)
+                 .eq('opt_in', True)
+                 .execute())
+            sb_ok = True
+            for row in (r.data or []):
+                if row.get('self_token') == token:
+                    continue
+                crew.append({
+                    'display_name': row.get('display_name') or 'Crew',
+                    'base': (row.get('base') or '').upper(),
+                    'position': row.get('position') or '',
+                    'avatar_url': None,
+                })
+        except Exception as e:
+            app.logger.warning(
+                f'[crew-flight] sb_lookup_fail err={type(e).__name__}: {str(e)[:120]}'
+            )
+    # 2) Disk-Fallback nur wenn SB nicht erreichbar — sonst doppelte Einträge.
+    if not sb_ok:
+        fp = _crew_flight_disk_file(fn, fd)
+        if fp:
+            try:
+                with open(fp) as f:
+                    bucket = json.load(f) or {}
+            except FileNotFoundError:
+                bucket = {}
+            except Exception:
+                bucket = {}
+            for tok, entry in bucket.items():
+                if tok == token or not isinstance(entry, dict):
+                    continue
+                if entry.get('opt_in') is False:
+                    continue
+                crew.append({
+                    'display_name': entry.get('display_name') or 'Crew',
+                    'base': (entry.get('base') or '').upper(),
+                    'position': entry.get('position') or '',
+                    'avatar_url': None,
+                })
+
+    return jsonify({
+        'ok': True,
+        'flight_number': fn,
+        'date': fd,
+        'count': len(crew),
+        'crew': crew,
+    })
+
+
+# ─── Crews-on-Station: "Willkommen in <Stadt>" Aktivitäts-Banner ────────────
+
+@app.route('/api/station/<token>/<iata>/activity', methods=['GET'])
+def station_activity(token, iata):
+    """Anzahl frischer Crew-Beiträge an einer Station — speist das iOS-Banner
+    "Willkommen in <Stadt>. N Kollegen haben heute hier gepostet."
+
+    Zählt ehrlich Layover-Recs (Disk-Quelle `layover_recs/<IATA>.json`, Feld `ts`)
+    der letzten 24h + Gesamt. Keine erfundenen Zahlen — leere Station → 0.
+
+    Antwort 200:
+        {"ok": true, "iata": "SFO", "posts_24h": N, "posts_total": M}
+    """
+    if not token or not _validate_token_exists(token):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 401
+    import time as _t
+    safe_iata = re.sub(r'[^A-Z]', '', (iata or '').upper())[:3]
+    if len(safe_iata) != 3:
+        return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
+    rp = _recs_path(safe_iata)
+    recs = []
+    if rp:
+        try:
+            with open(rp) as f:
+                recs = json.load(f) or []
+        except FileNotFoundError:
+            recs = []
+        except Exception:
+            recs = []
+    cutoff = _t.time() - 86400
+    posts_24h = 0
+    for r in recs:
+        if not isinstance(r, dict):
+            continue
+        ts = r.get('ts')
+        if ts is None:
+            # Legacy-Recs ohne ts → aus created_at rekonstruieren (best-effort).
+            ca = r.get('created_at')
+            if ca:
+                try:
+                    ts = datetime.fromisoformat(ca).timestamp()
+                except Exception:
+                    ts = None
+        try:
+            if ts is not None and float(ts) >= cutoff:
+                posts_24h += 1
+        except (TypeError, ValueError):
+            continue
+    return jsonify({
+        'ok': True,
+        'iata': safe_iata,
+        'posts_24h': posts_24h,
+        'posts_total': len(recs),
+    })
+
+
 # ─── Duty-Changes: Roster-Diff + Approve-Workflow ───────────────────────────
 
 def _roster_snapshot_path(token):
@@ -11322,6 +11577,9 @@ def take_roster_snapshot(token):
             json.dump({'taken_at': datetime.now().isoformat(), 'tage': new_tage}, f, ensure_ascii=False)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    # Crews-on-Flight: Flugnummer-Assignments aus dem neuen Snapshot ingesten
+    # (best-effort, wirft nie). Speist /api/crew/flight-Lookup.
+    _crew_flight_ingest(token, new_tage)
     # Append diff to changes log
     cp = _roster_changes_path(token)
     try:
@@ -17753,59 +18011,114 @@ def _aerodatabox_flight_by_number(number, date_iso=None):
     items = body if isinstance(body, list) else [body]
     if not items:
         return None
+    for f in items:
+        out = _aerodatabox_parse_flight(f, fallback_number=num)
+        if out is not None:
+            return out
+    return None
 
+
+def _aerodatabox_parse_flight(f, fallback_number=''):
+    """Ein rohes AeroDataBox-Flight-Objekt → kompaktes Karten-Dict (gleiches
+    Schema wie das Airport-Board / `/api/flight/<token>/status`). None, wenn das
+    Objekt keine verwertbare Zeit ODER Route trägt. Gemeinsam genutzt von
+    `_aerodatabox_flight_by_number` und `_aerodatabox_flight_by_reg`, damit beide
+    Pfade exakt dasselbe Schema liefern (keine Doppel-Pflege)."""
     def _t(node):
         n = node or {}
         return ((n.get('local') or n.get('utc')) or None)
+    try:
+        if not isinstance(f, dict):
+            return None
+        dep = f.get('departure') or {}
+        arr = f.get('arrival') or {}
+        dep_ap = dep.get('airport') or {}
+        arr_ap = arr.get('airport') or {}
+        sched_dep = _t(dep.get('scheduledTime'))
+        sched_arr = _t(arr.get('scheduledTime'))
+        est_dep = (_t(dep.get('revisedTime')) or _t(dep.get('predictedTime'))
+                   or _t(dep.get('actualTime')))
+        est_arr = (_t(arr.get('revisedTime')) or _t(arr.get('predictedTime'))
+                   or _t(arr.get('actualTime')))
+        raw_status = (f.get('status') or '').strip()
+        al = f.get('airline') or {}
+        acft = f.get('aircraft') or {}
+        out = {
+            'flight': (f.get('number') or fallback_number or '').strip(),
+            'airline': (al.get('iata') or al.get('icao') or '').strip().upper(),
+            'airline_name': (al.get('name') or '').strip(),
+            'dep_iata': (dep_ap.get('iata') or '').strip().upper(),
+            'dep_name': _clean_city_name(dep_ap.get('name'),
+                                         (dep_ap.get('iata') or '')),
+            'arr_iata': (arr_ap.get('iata') or '').strip().upper(),
+            'arr_name': _clean_city_name(arr_ap.get('name'),
+                                         (arr_ap.get('iata') or '')),
+            'sched_dep': (sched_dep or '').replace(' ', 'T') or None,
+            'sched_arr': (sched_arr or '').replace(' ', 'T') or None,
+            'est_dep': ((est_dep or '').replace(' ', 'T') or None),
+            'est_arr': ((est_arr or '').replace(' ', 'T') or None),
+            'dep_gate': (dep.get('gate') or '').strip(),
+            'dep_terminal': (dep.get('terminal') or '').strip(),
+            'arr_gate': (arr.get('gate') or '').strip(),
+            'arr_terminal': (arr.get('terminal') or '').strip(),
+            'arr_baggage': (arr.get('baggageBelt') or '').strip(),
+            'status': raw_status,
+            'status_category': _flight_status_category(raw_status),
+            'aircraft': (acft.get('model') or '').strip(),
+            'reg': (acft.get('reg') or '').strip(),
+        }
+        # Verspätung (Abflug) aus Soll vs. erwartet, wie im Board.
+        out['dep_delay_min'] = _board_delay_min(out['sched_dep'], out['est_dep'])
+        # Mindestens eine verwertbare Zeit ODER Route nötig, sonst skip.
+        if out['sched_dep'] or out['sched_arr'] or out['dep_iata'] or out['arr_iata']:
+            return out
+    except Exception:
+        return None
+    return None
 
+
+def _aerodatabox_flight_by_reg(registration, date_iso=None):
+    """Aktueller/nächster Flug einer Tail-Registration via AeroDataBox
+    /flights/reg/{registration}[/{date}] (RapidAPI, env-gated). registration =
+    Tail wie 'D-AIXG'. Liefert dasselbe kompakte Dict wie
+    `_aerodatabox_flight_by_number` (Route, Soll-/erwartete Zeiten, Status,
+    Gate/Terminal, dep_delay_min) oder None (kein Key / Quelle down / kein
+    Treffer → Caller degradiert ehrlich, KEINE Erfindung).
+
+    Das ist die Tier-1-Quelle des iOS-Live-Fliegers: Tail bekannt → woher kommt
+    sie, wann landet sie, welcher Status — VOR jedem Flugnummer-/ADS-B-Fallback."""
+    import os as _os
+    key = _os.environ.get('AERODATABOX_KEY')
+    if not key:
+        return None
+    reg = (registration or '').upper().replace(' ', '').strip()
+    if len(reg) < 3:
+        return None
+    try:
+        import requests
+    except Exception:
+        return None
+    base = 'https://aerodatabox.p.rapidapi.com/flights/reg/' + reg
+    url = base + ('/' + date_iso if date_iso else '')
+    try:
+        r = requests.get(url,
+                         params={'withAircraftImage': 'false',
+                                 'withLocation': 'false'},
+                         headers={'X-RapidAPI-Key': key,
+                                  'X-RapidAPI-Host': 'aerodatabox.p.rapidapi.com'},
+                         timeout=15)
+        if r.status_code != 200:
+            return None
+        body = r.json()
+    except Exception:
+        return None
+    items = body if isinstance(body, list) else [body]
+    if not items:
+        return None
     for f in items:
-        try:
-            if not isinstance(f, dict):
-                continue
-            dep = f.get('departure') or {}
-            arr = f.get('arrival') or {}
-            dep_ap = dep.get('airport') or {}
-            arr_ap = arr.get('airport') or {}
-            sched_dep = _t(dep.get('scheduledTime'))
-            sched_arr = _t(arr.get('scheduledTime'))
-            est_dep = (_t(dep.get('revisedTime')) or _t(dep.get('predictedTime'))
-                       or _t(dep.get('actualTime')))
-            est_arr = (_t(arr.get('revisedTime')) or _t(arr.get('predictedTime'))
-                       or _t(arr.get('actualTime')))
-            raw_status = (f.get('status') or '').strip()
-            al = f.get('airline') or {}
-            acft = f.get('aircraft') or {}
-            out = {
-                'flight': (f.get('number') or num).strip(),
-                'airline': (al.get('iata') or al.get('icao') or '').strip().upper(),
-                'airline_name': (al.get('name') or '').strip(),
-                'dep_iata': (dep_ap.get('iata') or '').strip().upper(),
-                'dep_name': _clean_city_name(dep_ap.get('name'),
-                                             (dep_ap.get('iata') or '')),
-                'arr_iata': (arr_ap.get('iata') or '').strip().upper(),
-                'arr_name': _clean_city_name(arr_ap.get('name'),
-                                             (arr_ap.get('iata') or '')),
-                'sched_dep': (sched_dep or '').replace(' ', 'T') or None,
-                'sched_arr': (sched_arr or '').replace(' ', 'T') or None,
-                'est_dep': ((est_dep or '').replace(' ', 'T') or None),
-                'est_arr': ((est_arr or '').replace(' ', 'T') or None),
-                'dep_gate': (dep.get('gate') or '').strip(),
-                'dep_terminal': (dep.get('terminal') or '').strip(),
-                'arr_gate': (arr.get('gate') or '').strip(),
-                'arr_terminal': (arr.get('terminal') or '').strip(),
-                'arr_baggage': (arr.get('baggageBelt') or '').strip(),
-                'status': raw_status,
-                'status_category': _flight_status_category(raw_status),
-                'aircraft': (acft.get('model') or '').strip(),
-                'reg': (acft.get('reg') or '').strip(),
-            }
-            # Verspätung (Abflug) aus Soll vs. erwartet, wie im Board.
-            out['dep_delay_min'] = _board_delay_min(out['sched_dep'], out['est_dep'])
-            # Mindestens eine verwertbare Zeit ODER Route nötig, sonst skip.
-            if out['sched_dep'] or out['sched_arr'] or out['dep_iata'] or out['arr_iata']:
-                return out
-        except Exception:
-            continue
+        out = _aerodatabox_parse_flight(f, fallback_number='')
+        if out is not None:
+            return out
     return None
 
 
@@ -17836,6 +18149,39 @@ def flight_status(token):
                         'message': ('Für ' + number + ' liegt aktuell kein '
                                     'Flugplan vor.')}), 200
     return jsonify({'ok': True, 'number': number, 'flight': flight,
+                    'source': 'aerodatabox'})
+
+
+@app.route('/api/aircraft/<token>/by-reg', methods=['GET'])
+def aircraft_by_reg(token):
+    """Flugplan/Status nach Tail-REGISTRATION. Query: ?reg=D-AIXG&date=YYYY-MM-DD
+    (date optional). Quelle: AeroDataBox /flights/reg/{reg} (dieselbe Tafel-Quelle
+    wie /board und /api/flight/<token>/status). Ehrlich: ohne AERODATABOX_KEY oder
+    ohne Treffer → ok=False + Klartext, KEINE Erfindung.
+
+    Tier-1 des iOS-Live-Fliegers: Tail bekannt → Inbound-Route + Soll-/erwartete
+    Zeiten + Status, BEVOR Flugnummer-Board oder ADS-B-Hex befragt wird. Das
+    `flight`-Schema ist identisch zu /status, sodass der Client beide Pfade mit
+    demselben Decoder liest."""
+    import os as _os
+    reg = (request.args.get('reg') or '').upper().replace(' ', '').strip()
+    date_iso = (request.args.get('date') or '').strip() or None
+    if date_iso:
+        import re as _re
+        if not _re.match(r'^\d{4}-\d{2}-\d{2}$', date_iso):
+            date_iso = None
+    if len(reg) < 3:
+        return jsonify({'ok': False, 'error': 'bad_reg',
+                        'message': 'Keine gültige Registrierung.'}), 200
+    if not _os.environ.get('AERODATABOX_KEY'):
+        return jsonify({'ok': False, 'error': 'source_unavailable', 'reg': reg,
+                        'message': 'Flugplan-Quelle aktuell nicht verfügbar.'}), 200
+    flight = _aerodatabox_flight_by_reg(reg, date_iso)
+    if not flight:
+        return jsonify({'ok': False, 'error': 'not_found', 'reg': reg,
+                        'message': ('Für ' + reg + ' liegt aktuell kein '
+                                    'Flugplan vor.')}), 200
+    return jsonify({'ok': True, 'reg': reg, 'flight': flight,
                     'source': 'aerodatabox'})
 
 
