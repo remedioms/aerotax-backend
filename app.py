@@ -19086,6 +19086,46 @@ _DE_ICAO_TO_IATA = {
 }
 
 
+def _departed_rows_from_store(airport):
+    """Bereits abgeflogene Flüge des heutigen Betriebstags aus dem Delay-Store
+    rekonstruieren — für die „früher heute"-Ansicht der Tafel (User-Wunsch:
+    zurück in der Zeit). Quelle ist die akkumulierte Pünktlichkeits-Beobachtung
+    (airport_delay_obs), die der Poller über den Tag füllt. SPARSE: Flugnummer,
+    Soll-Zeit, Verspätung/Status — KEIN Gate/Ziel (im Store nicht gehalten).
+    Für FRA der einzige Weg an abgeflogene Flüge (der Live-Feed ist now-relativ)."""
+    try:
+        today = _fra_local_now().strftime('%Y-%m-%d')
+    except Exception:
+        return []
+    ap = (airport or 'FRA').upper()
+    try:
+        _delay_store_load_from_sb(today, ap)
+    except Exception:
+        pass
+    rows = []
+    for (d, a, fn, sc), max_delay in list(_delay_store.items()):
+        if d != today or a != ap or not isinstance(sc, str) or sc.endswith('_cancelled'):
+            continue
+        if len(sc) != 5:
+            continue
+        cancelled = bool(_delay_store_cancelled.get((d, a, fn, sc)))
+        try:
+            al, _num = _split_flightno(fn)
+        except Exception:
+            al = (fn[:2] if fn else '')
+        rows.append({
+            'airline': al, 'airline_name': '', 'flight': fn,
+            'dest_iata': '', 'dest_name': '',
+            'sched': today + 'T' + sc + ':00', 'esti': None,
+            'delay_min': int(max_delay or 0), 'delayed': int(max_delay or 0) >= 5,
+            'cancelled': cancelled, 'gate': '', 'terminal': '', 'hall': '',
+            'status': ('Annulliert' if cancelled else 'Abgeflogen'),
+            'reg': '', 'aircraft': '', 'departed': True,
+        })
+    rows.sort(key=lambda f: f.get('sched') or '')
+    return rows
+
+
 @app.route('/api/airport/<token>/board', methods=['GET'])
 def airport_board(token):
     """Per-Airport-Board (live). Query: ?airport=MUC&type=departure|arrival&airline=LH&limit=60.
@@ -19133,8 +19173,22 @@ def airport_board(token):
                         'airport': out_airport, 'type': ftype, 'message': msg}), 200
     if airline:
         flights = [f for f in flights if f.get('airline') == airline]
+    # „Früher heute" — bereits abgeflogene Flüge aus der akkumulierten Beobachtung,
+    # die NICHT mehr im Live-Feed stehen (dedup über flight+hh:mm). Nur Departures.
+    departed = []
+    if ftype == 'departure':
+        try:
+            live_keys = {((f.get('flight') or ''), (f.get('sched') or '')[11:16]) for f in flights}
+            for dr in _departed_rows_from_store(out_airport):
+                if ((dr['flight'], (dr['sched'] or '')[11:16]) not in live_keys):
+                    departed.append(dr)
+            if airline:
+                departed = [d for d in departed if (d.get('airline') or '').upper() == airline]
+        except Exception:
+            departed = []
     return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
                     'count': len(flights[:limit]), 'flights': flights[:limit],
+                    'departed_today': departed[:120],
                     'source': src,
                     'cached_ttl': (_AIRPORT_BOARD_TTL if src == 'fraport'
                                    else _NATIVE_BOARD_TTL)})
