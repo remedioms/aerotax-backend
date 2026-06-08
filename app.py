@@ -19162,6 +19162,18 @@ def airport_board(token):
         if rows is not None:
             flights = rows
             src = board_src
+            # Proaktive TAGES-Akkumulation wie bei FRA: abgeflogene Flüge in den
+            # Delay-/Beobachtungs-Store mergen, damit die „Früher heute"-Ansicht
+            # über den Tag WÄCHST und nichts verloren geht. Vorher akkumulierte
+            # NUR FRA (`_fra_day_board_cached`) — die anderen deutschen Flughäfen
+            # zeigten nur das Live-Fenster (User: „die Ankunfts-/Abflugstabellen
+            # der deutschen Flughäfen speichern nicht alle ab").
+            if ftype == 'departure':
+                try:
+                    _merge_into_delay_store(
+                        rows, _fra_local_now().strftime('%Y-%m-%d'), out_airport)
+                except Exception:
+                    pass
         elif len(airport) == 4 and airport.startswith('ED'):
             # 2) Letzter Fallback: OpenSky (nur ICAO, zuletzt geflogene Flüge).
             flights = _fetch_opensky_board(airport, ftype)
