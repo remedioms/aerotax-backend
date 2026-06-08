@@ -21107,11 +21107,18 @@ def _ics_events_to_briefings(events, existing=None):
             # (sonst zählt das Layover-Ende am nächsten Morgen als Duty-Ende →
             # Block/Belastung 2-4× zu hoch).
             ev_extends = _ev_extends_duty(day_summary)
+            # START: IMMER die früheste verfügbare Zeit übernehmen — auch von
+            # Nicht-Duty-Events (z.B. „EM ab 13:00"). Vorher ging die Tages-
+            # Startzeit verloren, wenn der einzige/erste Eintrag des Tages kein
+            # Flug/Briefing/Standby war (User: „EM ab 13:00 wird nicht gelesen").
+            # Inflations-Risiko liegt nur beim END (Layover-Ende am nächsten
+            # Morgen), nicht beim START.
+            merged_start = min(prev_start, start_iso) if (prev_start and start_iso) else (prev_start or start_iso)
+            # END nur von duty-relevanten Events erweitern (Layover/Off blähen die
+            # Duty-Spanne sonst auf → Block/Belastung 2-4× zu hoch).
             if ev_extends:
-                merged_start = min(prev_start, start_iso) if (prev_start and start_iso) else (prev_start or start_iso)
                 merged_end = max(prev_end, end_iso) if (prev_end and end_iso) else (prev_end or end_iso)
             else:
-                merged_start = prev_start
                 merged_end = prev_end
             # Bei Multi-Day-Folgetagen: start_iso/end_iso vom Original-Tag
             # NICHT auf den Folgetag schreiben (wäre irreführend). Nur Tag 1.
