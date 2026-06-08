@@ -12816,9 +12816,14 @@ def _channel_access_error(token, channel_id):
         return jsonify({'error': 'not_a_member'}), 403
     gid = _group_id_from_channel(cid)
     if gid is not None:
-        if _is_group_member(token, gid):
-            return None
-        return jsonify({'error': 'not_a_member'}), 403
+        # CAPABILITY-Modell: die Gruppen-ID ist das Geheimnis (nur per Invite-Code/
+        # QR bekannt). Wer sie hat, ist eingeladen — Crew ODER Nicht-Crew. KEIN
+        # Owner-Mitgliederlisten-Check: der sperrte per-Code-Beigetretene mit 403 aus
+        # → der Layover-Chat war für genau die Eingeladenen kaputt (sie sahen die
+        # Gruppe lokal, bekamen aber beim Lesen/Senden 403). Bearer==path-token ist
+        # über den _bug004-Gate bereits geprüft (Caller ist als er selbst auth'd).
+        # Identisch zum /api/layover-group-Meta-Endpoint (gleiche Gruppe, gleiches Modell).
+        return None
     return jsonify({'error': 'invalid_channel'}), 400
 
 
