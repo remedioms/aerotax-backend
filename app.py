@@ -85,6 +85,7 @@ for _bp_path, _bp_name in [
     ('blueprints.hotel_rooms_blueprint',     'hotel_rooms_bp'),
     ('blueprints.status_blueprint',          'status_bp'),
     ('blueprints.family_watch',              'family_watch_bp'),  # Wave-1 BUG-002
+    ('blueprints.layover_group_blueprint',   'layover_group_bp'),  # geteilter Layover-Plan + Polls
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
