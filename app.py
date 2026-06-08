@@ -9753,6 +9753,278 @@ def get_friends_overlap(token):
     return jsonify({'token': token, 'overlaps': overlaps, 'friends_checked': len(friends)})
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Crew at my Destination (Feature 2026-06-08)
+# ───────────────────────────────────────────────────────────────────────────
+# Modus A (Layover-basiert): wer von meinen Friends hat ±24h einen Layover an
+#   DERSELBEN Station wie ich → Avatare auf der Crew Map. Opt-in (default an)
+#   über layover_visibility; respektiert zusätzlich share_roster=False.
+# Modus B (manueller Pin): „ich will hier am <Datum> was machen" → nur für
+#   gegenseitige Friends sichtbar (manual_pins, gefiltert über user_friends).
+# Tabellen: supabase_migrations/20260608_crew_at_destination.sql
+# Mutationen (POST) sind automatisch durch _bug004_token_auth_gate gebunden
+#   (Bearer == path-token).
+# ═══════════════════════════════════════════════════════════════════════════
+
+_CREW_DEST_LAYOVER_KLASSEN = ('Z76',)  # wie _extract_layover_set/overlap: Layover-Tag
+
+def _layover_visibility_get(token):
+    """True = meine Layover dürfen als Match erscheinen. Opt-in DEFAULT-ON:
+    fehlender Row → True. SB-primary; bei SB-down konservativ True (sichtbar)."""
+    if not token:
+        return False
+    if SB_AVAILABLE:
+        try:
+            r = (sb.table('layover_visibility').select('enabled')
+                 .eq('user_token', token).limit(1).execute())
+            if r.data:
+                return bool(r.data[0].get('enabled'))
+        except Exception as e:
+            app.logger.warning(f'[crew-dest] vis_load_fail err={type(e).__name__}: {str(e)[:120]}')
+    return True  # default-on (Opt-in: Row entsteht erst beim aktiven Umlegen)
+
+def _layover_visibility_set(token, enabled):
+    if not token or not SB_AVAILABLE:
+        return False
+    try:
+        sb.table('layover_visibility').upsert(
+            {'user_token': token, 'enabled': bool(enabled),
+             'updated_at': datetime.now().isoformat()},
+            on_conflict='user_token').execute()
+        return True
+    except Exception as e:
+        app.logger.warning(f'[crew-dest] vis_save_fail err={type(e).__name__}: {str(e)[:120]}')
+        return False
+
+def _manual_pins_load(token):
+    """Eigene Pins (zur Verwaltung). Liste von Row-Dicts."""
+    if not token or not SB_AVAILABLE:
+        return []
+    try:
+        r = (sb.table('manual_pins').select('*')
+             .eq('user_token', token).order('pin_date').limit(500).execute())
+        return r.data or []
+    except Exception as e:
+        app.logger.warning(f'[crew-dest] pins_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return []
+
+def _manual_pins_for_friends(token, friend_tokens):
+    """Pins der GEGENSEITIGEN Friends (Privacy: nur mutual). friend_tokens ist
+    bereits die mutual-Liste (user_friends ist bidirektional beim Add)."""
+    if not friend_tokens or not SB_AVAILABLE:
+        return []
+    try:
+        r = (sb.table('manual_pins').select('*')
+             .in_('user_token', list(friend_tokens)[:500]).limit(2000).execute())
+        return r.data or []
+    except Exception as e:
+        app.logger.warning(f'[crew-dest] friend_pins_fail err={type(e).__name__}: {str(e)[:120]}')
+        return []
+
+def _user_future_layovers(token, days_ahead=60):
+    """Layover-Tage eines Users im Fenster [heute, heute+days_ahead] als Liste
+    {datum, date_obj, iata, start_time, end_time}. Quelle: _store (frisch) ODER
+    persistenter roster_snapshot (überlebt Container-Restart)."""
+    from datetime import date as _d, timedelta as _td
+    sess = _store.get(token) or {}
+    tage = (sess.get('result_data') or {}).get('_tage_detail') or []
+    if not tage:
+        sp = _roster_snapshot_path(token)
+        if sp and os.path.exists(sp):
+            try:
+                with open(sp) as f:
+                    tage = (json.load(f) or {}).get('tage') or []
+            except Exception:
+                tage = []
+    today = _d.today()
+    cutoff = today + _td(days=days_ahead)
+    out = []
+    for t in tage:
+        if not isinstance(t, dict):
+            continue
+        klass = (t.get('klass') or '').upper()
+        rf = t.get('reader_facts') or {}
+        place = (rf.get('layover_ort') or '').upper().strip()
+        if klass not in _CREW_DEST_LAYOVER_KLASSEN or len(place) != 3:
+            continue
+        d = t.get('datum')
+        try:
+            dd = _d.fromisoformat((d or '')[:10])
+        except Exception:
+            continue
+        if dd < today or dd > cutoff:
+            continue
+        out.append({'datum': (d or '')[:10], 'date_obj': dd, 'iata': place,
+                    'start_time': rf.get('start_time'), 'end_time': rf.get('end_time')})
+    return out
+
+
+@app.route('/api/user/crew-at-destination/<token>', methods=['GET'])
+def get_crew_at_destination(token):
+    """Crew an MEINEN Zielen. Returns:
+      { ok, layover_matches: [{iata, lat, lng, my_dates, friends:[...]}],
+        manual_pins: [{id, iata, lat, lng, date, note, owner_token, owner_name,
+                       owner_match_id, mine}] }
+    Modus A: Friends mit Layover an meiner Station ±24h (Opt-in + share_roster).
+    Modus B: Pins meiner gegenseitigen Friends + meine eigenen.
+    """
+    from collections import defaultdict
+    ap = _airports_compact_lookup()
+    my_layovers = _user_future_layovers(token)
+    friends = _friends_load(token).get('friends') or []
+    friend_set = set(friends)
+
+    # ── Modus A: Layover-Matches gruppiert nach IATA ──
+    by_iata = defaultdict(lambda: {'friends': {}, 'my_dates': set()})
+    for myl in my_layovers:
+        by_iata[myl['iata']]['my_dates'].add(myl['datum'])
+
+    for fr in friends:
+        if not _layover_visibility_get(fr):
+            continue
+        prof = (_profile_load(fr) or {}).get('profile', {}) or {}
+        if prof.get('share_roster') is False:
+            continue
+        for fl in _user_future_layovers(fr):
+            if fl['iata'] not in by_iata:
+                continue  # nur an MEINEN Zielen
+            # ±24h gegen irgendeinen meiner Layover an dieser Station
+            if not any(myl['iata'] == fl['iata'] and abs((fl['date_obj'] - myl['date_obj']).days) <= 1
+                       for myl in my_layovers):
+                continue
+            slot = by_iata[fl['iata']]['friends']
+            if fr not in slot:  # ein Eintrag pro Friend (frühestes Match)
+                slot[fr] = {
+                    'token': fr,
+                    'name': prof.get('name') or (fr[:8] + '…'),
+                    'match_id': _hashlib.sha256(fr.encode()).hexdigest()[:16],
+                    'datum': fl['datum'],
+                    'start_time': fl['start_time'],
+                    'end_time': fl['end_time'],
+                }
+
+    layover_matches = []
+    for iata, info in by_iata.items():
+        if not info['friends']:
+            continue
+        coord = ap.get(iata)
+        layover_matches.append({
+            'iata': iata,
+            'lat': coord[0] if coord else None,
+            'lng': coord[1] if coord else None,
+            'my_dates': sorted(info['my_dates']),
+            'friends': sorted(info['friends'].values(), key=lambda x: x['datum']),
+        })
+    layover_matches.sort(key=lambda m: -len(m['friends']))
+
+    # ── Modus B: manuelle Pins (eigene + gegenseitige Friends) ──
+    pins_out = []
+    seen = set()
+    for p in (_manual_pins_load(token) + _manual_pins_for_friends(token, friend_set)):
+        pid = p.get('id')
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        owner = p.get('user_token') or ''
+        mine = owner == token
+        if not mine and owner not in friend_set:
+            continue  # Privacy: nur mutual
+        oprof = {} if mine else ((_profile_load(owner) or {}).get('profile', {}) or {})
+        pins_out.append({
+            'id': pid,
+            'iata': p.get('iata_code'),
+            'lat': p.get('lat'),
+            'lng': p.get('lng'),
+            'date': str(p.get('pin_date')) if p.get('pin_date') else None,
+            'note': p.get('note'),
+            'owner_token': owner,
+            'owner_name': 'Du' if mine else (oprof.get('name') or (owner[:8] + '…')),
+            'owner_match_id': _hashlib.sha256(owner.encode()).hexdigest()[:16],
+            'mine': mine,
+        })
+
+    return jsonify({'ok': True, 'layover_matches': layover_matches,
+                    'manual_pins': pins_out})
+
+
+@app.route('/api/user/layover-visibility/<token>', methods=['GET'])
+def get_layover_visibility(token):
+    return jsonify({'ok': True, 'enabled': _layover_visibility_get(token)})
+
+
+@app.route('/api/user/layover-visibility/<token>', methods=['POST'])
+def set_layover_visibility(token):
+    """Body: {enabled: bool}. Token-binding durch _bug004-Gate."""
+    body = request.get_json(silent=True) or {}
+    enabled = bool(body.get('enabled'))
+    ok = _layover_visibility_set(token, enabled)
+    return jsonify({'ok': ok, 'enabled': enabled})
+
+
+@app.route('/api/user/manual-pins/<token>', methods=['GET'])
+def list_manual_pins(token):
+    """Eigene Pins (zur Verwaltung/Löschen)."""
+    rows = _manual_pins_load(token)
+    out = [{
+        'id': p.get('id'), 'iata': p.get('iata_code'),
+        'lat': p.get('lat'), 'lng': p.get('lng'),
+        'date': str(p.get('pin_date')) if p.get('pin_date') else None,
+        'note': p.get('note'),
+    } for p in rows]
+    return jsonify({'ok': True, 'pins': out})
+
+
+@app.route('/api/user/manual-pins/<token>', methods=['POST'])
+def create_manual_pin(token):
+    """Body: {iata, date (YYYY-MM-DD), note, lat?, lng?}. lat/lng werden aus iata
+    aufgelöst wenn nicht mitgegeben. Token-binding durch _bug004-Gate."""
+    import uuid as _uuid
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    body = request.get_json(silent=True) or {}
+    iata = (body.get('iata') or '').upper().strip()
+    if len(iata) != 3:
+        return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
+    ap = _airports_compact_lookup()
+    coord = ap.get(iata)
+    lat = body.get('lat')
+    lng = body.get('lng')
+    if lat is None or lng is None:
+        if not coord:
+            return jsonify({'ok': False, 'error': 'iata_not_found'}), 400
+        lat, lng = coord[0], coord[1]
+    pin_date = (body.get('date') or '').strip() or None
+    note = (body.get('note') or '').strip()[:280] or None
+    pin_id = _uuid.uuid4().hex[:16]
+    row = {
+        'id': pin_id, 'user_token': token, 'iata_code': iata,
+        'lat': float(lat), 'lng': float(lng), 'pin_date': pin_date, 'note': note,
+        'created_at': datetime.now().isoformat(),
+    }
+    try:
+        sb.table('manual_pins').insert(row).execute()
+    except Exception as e:
+        app.logger.warning(f'[crew-dest] pin_insert_fail err={type(e).__name__}: {str(e)[:120]}')
+        return jsonify({'ok': False, 'error': 'insert_failed'}), 500
+    return jsonify({'ok': True, 'pin': {
+        'id': pin_id, 'iata': iata, 'lat': lat, 'lng': lng,
+        'date': pin_date, 'note': note}})
+
+
+@app.route('/api/user/manual-pins/<token>/<pin_id>/delete', methods=['POST'])
+def delete_manual_pin(token, pin_id):
+    """Löscht NUR den eigenen Pin (gezielter Delete, owner-scoped). Token-binding
+    durch _bug004-Gate."""
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    try:
+        sb.table('manual_pins').delete().eq('id', pin_id).eq('user_token', token).execute()
+    except Exception as e:
+        app.logger.warning(f'[crew-dest] pin_delete_fail err={type(e).__name__}: {str(e)[:120]}')
+        return jsonify({'ok': False, 'error': 'delete_failed'}), 500
+    return jsonify({'ok': True})
+
+
 @app.route('/api/user/friend-groups/<token>', methods=['GET'])
 def list_friend_groups(token):
     """Listet alle Friend-Groups des Users."""
