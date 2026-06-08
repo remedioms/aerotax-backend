@@ -31,7 +31,9 @@ from flask import Blueprint, request, jsonify
 layover_group_bp = Blueprint('layover_group', __name__)
 
 _SB_TABLE = 'layover_group_meta'
-_DISK_DIR = os.environ.get('AEROTAX_STATE_DIR', '_user_history_state')
+# Cloud Run: nur /tmp ist zuverlässig beschreibbar → Disk-Fallback dorthin, sonst
+# schlägt makedirs auf dem read-only Container-FS fehl und der Fallback ist tot.
+_DISK_DIR = os.environ.get('AEROTAX_STATE_DIR') or '/tmp/aerotax_state'
 
 
 # ── Lazy-Bindings an die App (SB-Client + Bearer-Gate) ──
@@ -107,8 +109,8 @@ def _load(group_id):
                     'pinned_note': row.get('pinned_note') or '',
                     'updated_at': float(row.get('updated_at') or 0),
                 }
-        except Exception:
-            pass  # → Disk-Fallback
+        except Exception as e:
+            print(f'[layover_group] SB_LOAD_FAIL gid={group_id}: {type(e).__name__}: {str(e)[:200]}', flush=True)
     disk = _disk_load(group_id)
     if disk is not None:
         return {
@@ -134,7 +136,8 @@ def _save(group_id, blob):
         try:
             sb.table(_SB_TABLE).upsert(blob, on_conflict='group_id').execute()
             sb_ok = True
-        except Exception:
+        except Exception as e:
+            print(f'[layover_group] SB_SAVE_FAIL gid={group_id}: {type(e).__name__}: {str(e)[:200]}', flush=True)
             sb_ok = False
     # Disk immer als Read-Cache/Fallback mitschreiben.
     _disk_save(group_id, blob)
