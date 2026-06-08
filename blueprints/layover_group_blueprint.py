@@ -25,6 +25,7 @@ import os
 import json
 import time
 import re
+import hmac
 import tempfile
 from flask import Blueprint, request, jsonify
 
@@ -35,18 +36,37 @@ _SB_TABLE = 'layover_group_meta'
 # schlägt makedirs auf dem read-only Container-FS fehl und der Fallback ist tot.
 _DISK_DIR = os.environ.get('AEROTAX_STATE_DIR') or '/tmp/aerotax_state'
 
+# ── EIGENER Supabase-Client (aus denselben Env-Vars wie app.py) ──
+# Bewusst NICHT `import app` zur Laufzeit: das fragile Cross-Modul-Binding lieferte
+# in der Praxis `SB_AVAILABLE=False` (SB-Branch wurde still übersprungen → Daten
+# nur auf Disk → pro Cloud-Run-Instanz → „verschwinden"). Ein eigener Client aus
+# SUPABASE_URL/SUPABASE_SERVICE_KEY ist robust und instanz-unabhängig.
+_SB = None
+try:
+    from supabase import create_client as _create_sb
+    _SB_URL = os.environ.get('SUPABASE_URL', '')
+    _SB_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
+    if _SB_URL and _SB_KEY:
+        _SB = _create_sb(_SB_URL, _SB_KEY)
+        print('[layover_group] own Supabase client ready', flush=True)
+    else:
+        print('[layover_group] SB env vars missing → disk-only', flush=True)
+except Exception as _e:
+    print(f'[layover_group] SB init failed: {type(_e).__name__}: {_e} → disk-only', flush=True)
 
-# ── Lazy-Bindings an die App (SB-Client + Bearer-Gate) ──
-def _app():
-    """Liefert (sb, SB_AVAILABLE, request_bearer_matches) lazy aus app.py.
-    Lazy, weil der Blueprint beim Import von app.py registriert wird — ein
-    Top-Level-Import würde zirkulär."""
-    try:
-        import app as _a
-        return getattr(_a, 'sb', None), bool(getattr(_a, 'SB_AVAILABLE', False)), \
-            getattr(_a, '_request_bearer_matches', None)
-    except Exception:
-        return None, False, None
+
+def _auth_ok(token):
+    """Bearer == path-token (constant-time). Die Gruppen-ID ist die Capability
+    (nur per Invite-Code/QR bekannt) — deckt auch per-Code beigetretene Mitglieder,
+    die NICHT in der Owner-Mitgliederliste stehen (Channel-offen wie der Chat)."""
+    auth = request.headers.get('Authorization', '') or ''
+    parts = auth.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == 'bearer' and token:
+        try:
+            return hmac.compare_digest(parts[1].strip(), token)
+        except Exception:
+            return False
+    return False
 
 
 def _safe_id(s):
@@ -95,10 +115,9 @@ _DEFAULT = {'plan': {}, 'polls': [], 'pinned_note': '', 'updated_at': 0}
 
 
 def _load(group_id):
-    sb, ok, _ = _app()
-    if ok and sb is not None:
+    if _SB is not None:
         try:
-            r = (sb.table(_SB_TABLE).select('*')
+            r = (_SB.table(_SB_TABLE).select('*')
                  .eq('group_id', group_id).limit(1).execute())
             rows = r.data or []
             if rows:
@@ -130,11 +149,10 @@ def _save(group_id, blob):
         'pinned_note': blob.get('pinned_note') or '',
         'updated_at': float(blob.get('updated_at') or time.time()),
     }
-    sb, ok, _ = _app()
     sb_ok = False
-    if ok and sb is not None:
+    if _SB is not None:
         try:
-            sb.table(_SB_TABLE).upsert(blob, on_conflict='group_id').execute()
+            _SB.table(_SB_TABLE).upsert(blob, on_conflict='group_id').execute()
             sb_ok = True
         except Exception as e:
             print(f'[layover_group] SB_SAVE_FAIL gid={group_id}: {type(e).__name__}: {str(e)[:200]}', flush=True)
@@ -142,20 +160,6 @@ def _save(group_id, blob):
     # Disk immer als Read-Cache/Fallback mitschreiben.
     _disk_save(group_id, blob)
     return sb_ok
-
-
-def _auth_ok(token):
-    """Bearer muss == path-token sein (wie die Crew-Chat-PII-Endpoints). Die
-    Gruppen-ID selbst ist die Capability (nur per Invite-Code/QR bekannt) — das
-    deckt auch per-Code beigetretene Mitglieder ab, die NICHT in der Owner-
-    Mitgliederliste stehen (Channel-offen, identisch zum Gruppen-Chat)."""
-    _, _, matches = _app()
-    if matches is None:
-        return True  # Gate nicht verfügbar (lokal/Test) → nicht hart blocken
-    try:
-        return bool(matches(token))
-    except Exception:
-        return False
 
 
 # ── Poll-Merge: Server-Stimmen bei Struktur-PUT bewahren ──
