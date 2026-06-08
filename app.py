@@ -19926,10 +19926,18 @@ def _punctuality_stats(flights, airport='FRA'):
     # Snapshots (airport_delay_obs) — bis genug Flüge abgeflogen sind bleibt's
     # ehrlich als unvollständig markiert.
     incomplete = active < _PUNCTUALITY_MIN_SAMPLE
+    # VOLLER TAGES-FLUGPLAN als ehrlicher Kontext (User: „denkst du wirklich FRA
+    # hat so wenig Abflüge?"). `total` zählt nur die BEREITS BEWERTETEN (abgeflogenen)
+    # Flüge — früh am Tag/bei lückenhaftem Poller ist das wenig. `scheduled_total`
+    # ist die GESAMTZAHL der heutigen Flüge in der Tages-Tafel (abgeflogen + noch
+    # offen), damit die UI „18 von ~210 ausgewertet" statt nur „18 Flüge" zeigt und
+    # die niedrige Zahl nicht als FRA-Tagesvolumen missverstanden wird.
+    scheduled_total = len(flights)
     return {'total': total, 'on_time': on_time, 'delayed': delayed,
             'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay,
             'sample_size': active, 'data_incomplete': incomplete,
-            'min_sample': _PUNCTUALITY_MIN_SAMPLE}
+            'min_sample': _PUNCTUALITY_MIN_SAMPLE,
+            'scheduled_total': scheduled_total}
 
 
 def _aerodatabox_punctuality(iata, airline):
