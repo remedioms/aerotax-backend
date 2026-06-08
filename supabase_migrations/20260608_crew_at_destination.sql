@@ -1,19 +1,21 @@
--- "Crew at my Destination" — Layover-Sichtbarkeit (Opt-in) + manuelle Pins.
--- Feature 2026-06-08: zwei Modi —
---   A) Layover-basiert (automatisch): wer von meinen Friends hat ±24h einen
---      Layover an DERSELBEN Station wie ich → Avatare auf der Crew Map.
---   B) Manueller Pin: „ich will hier am <Datum> was machen" → nur für
---      gegenseitige Friends sichtbar.
+-- "Crew at my Destination" - layover visibility (opt-in) + manual pins.
+-- Feature 2026-06-08. Two modes:
+--   A) Layover-based (auto): which friends have a layover at the same station
+--      within +/-24h -> avatars on the Crew Map.
+--   B) Manual pin: "I want to do something here on <date>" -> visible only to
+--      mutual friends (filtered server-side via the user_friends edges).
 --
--- Pattern wie layover_recs/wall_posts (20260607_layover_recs.sql,
--- 20260601_social.sql): SB-primary, Service-Role umgeht RLS, idempotente
--- Upserts via PK/on_conflict. Häufig gefilterte Felder als columns.
+-- Pattern like layover_recs/wall_posts (20260607_layover_recs.sql,
+-- 20260601_social.sql): SB-primary, service-role bypasses RLS, idempotent
+-- upserts via PK/on_conflict. Frequently filtered fields as columns.
+--
+-- NOTE: comments kept ASCII-only on purpose - the Supabase SQL editor choked on
+-- em-dashes / smart-quotes / arrows / box-drawing chars from a previous version.
 
--- ─────────── LAYOVER-VISIBILITY (Opt-in, default an) ───────────
--- Ein Row pro User. enabled=true heißt: meine Layover dürfen Friends auf der
--- Crew Map als Match sehen. Fehlt der Row → Default „an" (Opt-in default-on),
--- wird im Backend (_layover_visibility_get) so behandelt; ein Row entsteht erst
--- wenn der User den Toggle aktiv umlegt.
+-- LAYOVER-VISIBILITY (opt-in, default on)
+-- One row per user. enabled=true means my layovers may appear as a match on my
+-- friends' Crew Map. Missing row -> default "on" (handled in the backend by
+-- _layover_visibility_get); a row is only written when the user flips the toggle.
 create table if not exists public.layover_visibility (
     user_token text        primary key,
     enabled    boolean     not null default true,
@@ -21,10 +23,10 @@ create table if not exists public.layover_visibility (
 );
 alter table public.layover_visibility enable row level security;
 
--- ─────────── MANUAL-PINS (Intent-Pins „hier will ich was machen") ───────────
--- Sichtbar NUR für gegenseitige Friends (Filter im Backend über die
--- user_friends-Kanten). lat/lng werden beim Anlegen aus iata_code aufgelöst
--- (airports_compact.json) oder direkt vom Client (Map-Tap) mitgegeben.
+-- MANUAL-PINS (intent pins "I want to do something here")
+-- Visible ONLY to mutual friends (filtered in the backend over the user_friends
+-- edges). lat/lng are resolved from iata_code on insert (airports_compact.json)
+-- or sent directly by the client (map tap).
 create table if not exists public.manual_pins (
     id         text        primary key,
     user_token text        not null,
