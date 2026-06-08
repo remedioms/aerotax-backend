@@ -120,7 +120,6 @@ def _load(group_id):
             r = (_SB.table(_SB_TABLE).select('*')
                  .eq('group_id', group_id).limit(1).execute())
             rows = r.data or []
-            print(f'[layover_group] SB_LOAD gid={group_id} rows={len(rows)}', flush=True)
             if rows:
                 row = rows[0]
                 return {
@@ -153,9 +152,7 @@ def _save(group_id, blob):
     sb_ok = False
     if _SB is not None:
         try:
-            resp = _SB.table(_SB_TABLE).upsert(blob, on_conflict='group_id').execute()
-            n = len(getattr(resp, 'data', None) or [])
-            print(f'[layover_group] SB_SAVE gid={group_id} wrote_rows={n}', flush=True)
+            _SB.table(_SB_TABLE).upsert(blob, on_conflict='group_id').execute()
             sb_ok = True
         except Exception as e:
             print(f'[layover_group] SB_SAVE_FAIL gid={group_id}: {type(e).__name__}: {str(e)[:300]}', flush=True)
