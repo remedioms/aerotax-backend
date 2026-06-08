@@ -9823,6 +9823,24 @@ def _manual_pins_for_friends(token, friend_tokens):
         app.logger.warning(f'[crew-dest] friend_pins_fail err={type(e).__name__}: {str(e)[:120]}')
         return []
 
+
+def _public_pins_at_iatas(iatas):
+    """ÖFFENTLICHE Treffpunkt-Pins an den DESTINATIONS-Flughäfen des Users — von
+    ALLER Crew, nicht nur Buddies (User: „alle Flieger Zugang zum Pin"). Ein Pin
+    ist ein öffentlicher Meetup-Spot an einem Ort; die LIVE-Crew-Position bleibt
+    davon unberührt friends-only. Nur Pins an Orten, wo der User selbst hin fliegt,
+    damit es relevant + nicht global-überflutet ist."""
+    iatas = [i for i in (iatas or []) if i]
+    if not iatas or not SB_AVAILABLE:
+        return []
+    try:
+        r = (sb.table('manual_pins').select('*')
+             .in_('iata_code', list(set(iatas))[:60]).limit(2000).execute())
+        return r.data or []
+    except Exception as e:
+        app.logger.warning(f'[crew-dest] public_pins_fail err={type(e).__name__}: {str(e)[:120]}')
+        return []
+
 def _user_future_layovers(token, days_ahead=60):
     """Layover-Tage eines Users im Fenster [heute, heute+days_ahead] als Liste
     {datum, date_obj, iata, start_time, end_time}. Quelle: _store (frisch) ODER
@@ -9919,18 +9937,25 @@ def get_crew_at_destination(token):
         })
     layover_matches.sort(key=lambda m: -len(m['friends']))
 
-    # ── Modus B: manuelle Pins (eigene + gegenseitige Friends) ──
+    # ── Modus B: manuelle Treffpunkt-Pins ──
+    # Sichtbar: eigene + gegenseitige Buddies + ÖFFENTLICHE Pins an MEINEN
+    # Destinations-Flughäfen (alle Crew — der Pin ist ein öffentlicher Meetup-Spot,
+    # zu dem jeder beitreten kann). Die LIVE-Crew-POSITION bleibt friends-only.
+    dest_iatas = set(by_iata.keys())
     pins_out = []
     seen = set()
-    for p in (_manual_pins_load(token) + _manual_pins_for_friends(token, friend_set)):
+    for p in (_manual_pins_load(token)
+              + _manual_pins_for_friends(token, friend_set)
+              + _public_pins_at_iatas(dest_iatas)):
         pid = p.get('id')
         if not pid or pid in seen:
             continue
         seen.add(pid)
         owner = p.get('user_token') or ''
         mine = owner == token
-        if not mine and owner not in friend_set:
-            continue  # Privacy: nur mutual
+        is_public_meetup = (p.get('iata_code') or '').upper() in dest_iatas
+        if not mine and owner not in friend_set and not is_public_meetup:
+            continue  # Privacy: nur mutual ODER öffentlicher Pin an meinem Ziel
         oprof = {} if mine else ((_profile_load(owner) or {}).get('profile', {}) or {})
         pins_out.append({
             'id': pid,
