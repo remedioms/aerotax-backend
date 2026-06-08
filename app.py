@@ -20014,6 +20014,50 @@ def _aerodatabox_punctuality(iata, airline):
     return result
 
 
+@app.route('/api/airport/poll-punctuality', methods=['POST', 'GET'])
+def poll_punctuality_accumulate():
+    """Cloud-Scheduler-getriggert (~10 min): triggert die TAGES-Akkumulation der
+    Pünktlichkeits-Beobachtungen für die großen DE-Airports.
+
+    WARUM: Die Fraport-/Flughafen-Feeds sind now-relativ — ein bereits abgeflogener
+    Flug verschwindet kurz nach Abflug aus dem Feed. Die Quote akkumuliert ihn nur,
+    wenn _punctuality_stats GENAU in diesem kurzen Fenster läuft. Ohne Poller
+    passierte das nur bei zufälligen User-Requests → winzige Stichprobe (User:
+    „weiß nicht wie pünktlich LH ist"). Mit diesem 10-Minuten-Tick wird jeder Flug
+    in seinem Abflug-Fenster erfasst und nach airport_delay_obs persistiert → die
+    Tages-Stichprobe wächst von 05:00 bis Mitternacht, Rollover löscht sie täglich.
+
+    Security: X-Poll-Secret == ADSB_POLL_SECRET (reuse). Ohne Secret nur localhost."""
+    import os as _os, hmac as _hmac
+    secret = _os.environ.get('ADSB_POLL_SECRET', '').strip()
+    if secret:
+        provided = (request.headers.get('X-Poll-Secret') or '').strip()
+        if not provided or not _hmac.compare_digest(provided, secret):
+            return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    elif (request.remote_addr or '') not in ('127.0.0.1', '::1'):
+        return jsonify({'ok': False, 'error': 'forbidden_no_secret'}), 403
+    results = {}
+    for ap in ('FRA', 'MUC', 'BER', 'DUS', 'HAM', 'HAJ'):
+        try:
+            if ap in ('FRA', 'EDDF'):
+                flights = _fra_day_board_cached('departure')
+            elif ap in _NATIVE_BOARD_SCRAPERS:
+                rows, _src = (_native_board_cached(ap, 'departure') or (None, None))
+                flights = rows
+            else:
+                flights = None
+            if not flights:
+                results[ap] = 'no_flights'
+                continue
+            # _punctuality_stats ruft intern _merge_into_delay_store → persistiert
+            # die neuen Beobachtungen nach airport_delay_obs (cross-instance).
+            stats = _punctuality_stats(flights, ap)
+            results[ap] = stats.get('sample_size')
+        except Exception as e:
+            results[ap] = 'err:' + type(e).__name__
+    return jsonify({'ok': True, 'accumulated': results})
+
+
 @app.route('/api/airport/<token>/punctuality', methods=['GET'])
 def airport_punctuality(token):
     """Heutige Pünktlichkeit einer Airline ab FRA — über die GANZE Tages-Tafel
