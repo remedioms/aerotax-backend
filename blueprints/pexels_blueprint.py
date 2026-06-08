@@ -77,7 +77,8 @@ def pexels_search():
 
     q = urllib.parse.quote(query)
     url = f'https://api.pexels.com/v1/search?query={q}&per_page={per_page}&orientation={orientation}'
-    req = urllib.request.Request(url, headers={'Authorization': _KEY})
+    # Pexels blockt den Default-`Python-urllib`-User-Agent mit 403 → eigenen UA setzen.
+    req = urllib.request.Request(url, headers={'Authorization': _KEY, 'User-Agent': 'AeroX/1.0'})
     try:
         with urllib.request.urlopen(req, timeout=12) as r:
             raw = r.read()
