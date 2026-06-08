@@ -9406,6 +9406,40 @@ def _friends_save_to_supabase(token, data):
         return False
 
 
+def _friends_edge_upsert(owner_token, friend_token, status):
+    """Atomarer Single-Edge-Upsert auf user_friends (PK owner_token,friend_token).
+    Idempotent: gleicher Edge konvergiert statt zu clobbern. True bei Erfolg."""
+    if not SB_AVAILABLE or sb is None or not owner_token or not friend_token:
+        return False
+    if owner_token == friend_token:
+        return False
+    try:
+        sb.table('user_friends').upsert(
+            {'owner_token': owner_token, 'friend_token': friend_token, 'status': status},
+            on_conflict='owner_token,friend_token').execute()
+        return True
+    except Exception as e:
+        app.logger.warning(
+            f'[friends] edge_upsert_fail {owner_token[:6]}->{friend_token[:6]} '
+            f'err={type(e).__name__}: {str(e)[:120]}')
+        return False
+
+
+def _friends_edge_delete(owner_token, friend_token):
+    """Atomarer Single-Edge-Delete auf user_friends. True bei Erfolg."""
+    if not SB_AVAILABLE or sb is None or not owner_token or not friend_token:
+        return False
+    try:
+        (sb.table('user_friends').delete()
+         .eq('owner_token', owner_token).eq('friend_token', friend_token).execute())
+        return True
+    except Exception as e:
+        app.logger.warning(
+            f'[friends] edge_delete_fail {owner_token[:6]}->{friend_token[:6]} '
+            f'err={type(e).__name__}: {str(e)[:120]}')
+        return False
+
+
 def _friend_groups_load_from_supabase(token):
     """Lädt Friend-Groups aus user_friend_groups in SB. Returns list[dict] oder
     None bei SB-down. Empty-list = keine Groups (kein Fehler).
@@ -9530,6 +9564,24 @@ def _friends_load(token):
     if SB_AVAILABLE and disk.get('groups'):
         _friend_groups_save_to_supabase(token, disk['groups'])
     return disk
+
+
+def _friends_save_disk_only(token, data):
+    """Schreibt NUR den Disk-Read-Cache, ohne den ganzen Blob nach SB zu pushen.
+    Genutzt nachdem SB bereits atomar per-Edge aktualisiert wurde (Friend-Accept/
+    -Decline) — ein zusätzlicher Blob-Upsert würde genau den lost-update-Clobber
+    wieder einführen, den die per-Edge-Writes vermeiden."""
+    if not token:
+        return False
+    p = _user_friends_path(token)
+    if not p:
+        return False
+    try:
+        _atomic_write_json(p, data)
+        return True
+    except Exception as e:
+        app.logger.warning(f'[friends] disk_only_save_fail tok={token[:8]}: {e}')
+        return False
 
 
 def _friends_save(token, data):
@@ -12418,11 +12470,95 @@ def _dm_channel(token_a, token_b):
     return 'dm__' + '__'.join(sorted([a, b]))
 
 
+def _group_id_from_channel(channel_id):
+    """Extrahiert die friend-group-id aus einer Group-Channel-id.
+    Akzeptiert die Präfixe `group__<gid>` und `grp__<gid>`. Gibt None zurück
+    wenn channel_id kein Group-Channel ist (z.B. ein DM-Channel)."""
+    cid = channel_id or ''
+    for prefix in ('group__', 'grp__'):
+        if cid.startswith(prefix):
+            gid = cid[len(prefix):]
+            return gid or None
+    return None
+
+
+def _is_group_member(token, gid):
+    """True wenn `token` Mitglied (oder Owner) der friend-group `gid` ist.
+
+    Membership-Quelle: user_friend_groups (owner_token + members-jsonb). Groups
+    sind owner-scoped, daher per gid global nachschlagen (id ist PK). Owner zählt
+    immer als Mitglied, alle Tokens in members[] ebenfalls.
+    Bei SB-down: Disk-Fallback über die friends_<token>.json des Callers (nur dort
+    sehen wir, ob der Caller Owner einer Group mit dieser gid ist) — kann
+    Mitglieder fremder Owner-Gruppen nicht verifizieren und liefert dann False
+    (fail-closed, kein Isolation-Leak)."""
+    if not token or not gid:
+        return False
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = (sb.table('user_friend_groups')
+                 .select('owner_token,members').eq('id', gid).limit(1).execute())
+            if r.data:
+                row = r.data[0]
+                if row.get('owner_token') == token:
+                    return True
+                mem = row.get('members')
+                if isinstance(mem, list) and token in mem:
+                    return True
+            return False
+        except Exception as e:
+            app.logger.warning(
+                f'[crew-chat] group_member_check_fail gid={gid[:8]} '
+                f'err={type(e).__name__}: {str(e)[:120]}')
+            # SB-Fehler → fail-closed weiter unten via Disk-Fallback.
+    # Disk-Fallback: nur die eigenen (Owner-)Gruppen des Callers sind hier
+    # sichtbar. Genügt für Owner-Self-Access; fremde Mitgliedschaften → False.
+    try:
+        disk = _friends_load_from_disk(token)
+        for g in (disk.get('groups') or []):
+            if isinstance(g, dict) and g.get('id') == gid:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _channel_access_error(token, channel_id):
+    """Membership-Gate für generische Channel-Endpoints. Returns None wenn Zugriff
+    erlaubt, sonst ein (jsonify, status)-Tuple für 403/400.
+
+    - DM-Channel (`dm__a__b`): Caller-Token muss einer der beiden Teilnehmer sein.
+      (Die /dm-Wrapper haben zusätzlich einen Friend-Gate; dieser hier verhindert
+      direkten Zugriff auf die generische /channel-Route ohne Friend-Check.)
+    - Group-Channel (`group__<gid>`): Caller muss Mitglied der Group sein.
+    - Unbekanntes Format → 400 invalid_channel (kein still-erlaubter Catch-all)."""
+    cid = channel_id or ''
+    if cid.startswith('dm__'):
+        import re
+        safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+        parts = cid[len('dm__'):].split('__')
+        if safe and safe in parts:
+            return None
+        return jsonify({'error': 'not_a_member'}), 403
+    gid = _group_id_from_channel(cid)
+    if gid is not None:
+        if _is_group_member(token, gid):
+            return None
+        return jsonify({'error': 'not_a_member'}), 403
+    return jsonify({'error': 'invalid_channel'}), 400
+
+
 @app.route('/api/crew-chat/<token>/channel/<channel_id>', methods=['GET'])
 def get_chat_messages(token, channel_id):
     """Liefert Messages für Channel. Query: ?since_ts=epoch (nur neuere)."""
     if not _chat_path(channel_id):
         return jsonify({'error': 'invalid_channel'}), 400
+    # Membership-Gate: ohne diesen konnte JEDER auth'd User einen beliebigen
+    # Group-Channel (oder fremden DM-Channel) lesen, nur indem er die channel_id
+    # kannte (Isolation-Leak). DMs sind zusätzlich friend-gated via /dm-Wrapper.
+    _gate = _channel_access_error(token, channel_id)
+    if _gate is not None:
+        return _gate
     msgs = _dm_load_messages(channel_id) or []
     since = float(request.args.get('since_ts') or 0)
     if since:
@@ -12439,6 +12575,13 @@ def send_chat_message(token, channel_id):
     if len(text) > 2000: return jsonify({'ok': False, 'error': 'text_too_long'}), 413
     if not _chat_path(channel_id):
         return jsonify({'ok': False, 'error': 'invalid_channel'}), 400
+    # Membership-Gate (siehe get_chat_messages): kein Schreiben in fremde
+    # Group-/DM-Channels nur weil die channel_id bekannt ist.
+    _gate = _channel_access_error(token, channel_id)
+    if _gate is not None:
+        _, status = _gate
+        err = 'not_a_member' if status == 403 else 'invalid_channel'
+        return jsonify({'ok': False, 'error': err}), status
     import uuid, time
     try:
         msgs = _dm_load_messages(channel_id) or []
@@ -13281,7 +13424,13 @@ def create_wall_post(token):
     posts = _wall_load_posts()
     posts.append(post)
     _wall_save_posts(posts)
-    return jsonify({'ok': True, 'post': post})
+    # author_token aus der Create-Response strippen (Privacy-Leak-Fix 2026-06-08):
+    # im Feed/Listing wird er bereits entfernt, nur die unmittelbare POST-Response
+    # echote ihn noch zurück. Nur opake/Short-Author-Felder bleiben.
+    response_post = dict(post)
+    response_post.pop('author_token', None)
+    response_post['is_mine'] = True
+    return jsonify({'ok': True, 'post': response_post})
 
 
 @app.route('/api/wall/<token>/feed', methods=['GET'])
@@ -14486,6 +14635,29 @@ def _layover_vote_sb_set(token, rec_id, direction):
         return False
 
 
+def _layover_vote_tally_from_supabase(rec_id):
+    """Aggregiert vote_score (Σ direction) + vote_count (#Stimmen) für rec_id
+    direkt aus der idempotenten Tabelle layover_rec_votes (PK user_token,rec_id).
+
+    Source-of-Truth statt denormalisiertem Zähler: der read-modify-write auf
+    rec.vote_score hat unter gleichzeitigen Votes verloren (9 Upvotes → netto 0).
+    Weil layover_rec_votes per composite-PK pro User idempotent ist, ist die
+    Summe daraus rennsicher. Returns (vote_score, vote_count) oder None bei
+    SB-down — dann fällt der Caller auf den alten Inkrement-Wert zurück."""
+    if not SB_AVAILABLE or sb is None or not rec_id:
+        return None
+    try:
+        r = (sb.table('layover_rec_votes').select('direction')
+             .eq('rec_id', rec_id).limit(100000).execute())
+        rows = r.data or []
+        score = sum(int(row.get('direction') or 0) for row in rows)
+        count = sum(1 for row in rows if int(row.get('direction') or 0) != 0)
+        return score, count
+    except Exception as e:
+        app.logger.warning(f'[layover-votes] tally_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
 def _layover_comments_load_from_supabase(rec_id):
     """Alle Kommentare für rec_id aus SB. None bei SB-down."""
     if not SB_AVAILABLE or not rec_id:
@@ -14821,19 +14993,28 @@ def vote_layover_rec(token, rec_id):
     target = next((r for r in recs if r.get('id') == rec_id), None)
     if not target:
         return jsonify({'ok': False, 'error':'rec_not_found'}), 404
-    target['vote_score'] = (target.get('vote_score') or 0) + delta
-    target['vote_count'] = max(0, (target.get('vote_count') or 0) + (
-        1 if prev == 0 and direction != 0
-        else (-1 if direction == 0 and prev != 0 else 0)))
-    new_score = target['vote_score']
-    _recs_save(iata, recs)
-    # Vote persistieren (SB upsert/delete + Disk-Cache).
+    # P0-Concurrency-Fix (2026-06-08): ZUERST die per-User-Stimme persistieren
+    # (idempotent via composite-PK), DANN vote_score/count aus layover_rec_votes
+    # neu ableiten — statt den denormalisierten Zähler read-modify-write
+    # hochzuzählen. Gleichzeitige Upvotes konnten den Zähler clobbern
+    # (9 Upvotes → netto 0); die abgeleitete Summe ist rennsicher.
     if direction == 0:
         votes.pop(rec_id, None)
     else:
         votes[rec_id] = direction
     _layover_vote_sb_set(token, rec_id, direction)
     _votes_save_disk(token, votes)
+    tally = _layover_vote_tally_from_supabase(rec_id)
+    if tally is not None:
+        target['vote_score'], target['vote_count'] = tally
+    else:
+        # SB-down → degradierter Inkrement-Fallback (best-effort, nicht rennsicher).
+        target['vote_score'] = (target.get('vote_score') or 0) + delta
+        target['vote_count'] = max(0, (target.get('vote_count') or 0) + (
+            1 if prev == 0 and direction != 0
+            else (-1 if direction == 0 and prev != 0 else 0)))
+    new_score = target['vote_score']
+    _recs_save(iata, recs)
     return jsonify({'ok': True, 'vote_score': new_score, 'my_vote': direction})
 
 
@@ -16363,6 +16544,30 @@ def _auth_save(d):
     return True
 
 
+def _auth_delete_disk_row(user_email):
+    """Entfernt NUR die eine email-Row aus dem Disk-Auth-Cache, ohne den Rest
+    des Dicts neu zu schreiben (re-read → drop → write).
+
+    WARUM nicht _auth_save(users): _auth_save macht einen Bulk-Upsert des GANZEN
+    users-Dicts. Unter gleichzeitigen Deletes (Cloud Run = mehrere Instanzen)
+    re-inserted dieser Bulk-Upsert genau die Rows, die ein paralleler Delete
+    gerade gelöscht hat — lost-update / Wiederauferstehung gelöschter Accounts.
+    Der SB-seitige Row-Delete (.delete().eq('email', ...)) ist atomar pro Row und
+    bleibt der Source-of-Truth; hier räumen wir nur den lokalen Read-Cache auf."""
+    try:
+        p = _user_auth_path()
+        import os
+        if not os.path.exists(p):
+            return
+        with open(p) as f:
+            disk = json.load(f) or {}
+        if user_email in disk:
+            del disk[user_email]
+            _atomic_write_json(p, disk)
+    except Exception as e:
+        app.logger.warning(f'[auth-delete] disk_row_delete_fail: {type(e).__name__}: {str(e)[:120]}')
+
+
 def _auth_hash(pw):
     """LEGACY: sha256 unsalted. Bleibt für Backward-Verify alter Hashes.
     Neue Hashes via _password_hash(). Beim Login-Erfolg wird alter Hash
@@ -16906,18 +17111,18 @@ def auth_delete_account():
         return jsonify({'ok': False, 'error': 'auth_required'}), 400
 
     token = user.get('token')
-    if user_email and user_email in users:
-        del users[user_email]
-    _auth_save(users)
-    # _auth_save_to_supabase macht NUR upsert, KEIN row-delete. Wenn wir hier
-    # nur upsert'n, bleibt die SB-Row bestehen und ein nächster `_auth_load`
-    # liefert den User zurück → Login-on-deleted-Account würde noch erfolgreich
-    # sein. Explicit SB-delete der email-row ergänzen:
+    # P0 GDPR/Data-Loss-Fix (2026-06-08): NUR den eigenen Account-Row gezielt
+    # löschen — KEIN _auth_save(users) Bulk-Upsert mehr. Der alte Bulk-Upsert des
+    # gesamten Rest-Dicts hat unter gleichzeitigen Deletes (multi-instance) Rows
+    # wieder eingefügt, die ein paralleler Delete gerade entfernt hatte
+    # (10 concurrent deletes → 6 überlebten). Jetzt: SB-Row-Delete (atomar pro
+    # Row) + gezieltes Disk-Row-Remove. Kein stale-Snapshot-Re-Insert.
     if SB_AVAILABLE and sb is not None and user_email:
         try:
             sb.table('auth_users').delete().eq('email', user_email).execute()
         except Exception as e:
             app.logger.warning(f'[auth-delete] sb_row_delete_fail: {type(e).__name__}: {str(e)[:120]}')
+    _auth_delete_disk_row(user_email)
     # Wave-1 BUG-004: cache-invalidate damit der gerade gelöschte Token im
     # before_request-Gate ab sofort als unbekannt zählt.
     try: _invalidate_token_cache()
@@ -19907,14 +20112,39 @@ def accept_friend_request(token):
     them = _friends_load(from_token)
     if from_token not in (me.get('requests_in') or []):
         return jsonify({'ok': False, 'error': 'no_request'}), 404
+    # P0-Concurrency-Fix (2026-06-08): atomare per-Edge-Upserts statt
+    # read-modify-write des ganzen friends-Blobs via _friends_save. Der alte
+    # Blob-Rewrite (delete-all-by-owner + re-insert) hat unter gleichzeitigen
+    # Accepts geclobbert (24/30 verloren). user_friends hat PK
+    # (owner_token,friend_token) → idempotenter Upsert konvergiert.
+    #  · (me  -> from_token, accepted): meine Friend-Kante
+    #  · (from_token -> me, accepted): überschreibt die vorhandene
+    #    (from_token -> me, pending)-Kante per gleichem PK. Damit verschwindet
+    #    requests_in[me] (server-seitig aus pending-Edges abgeleitet) und
+    #    requests_out[from_token] ATOMAR mit dem Accept — kein separater
+    #    Clear-Write der clobbern könnte.
+    sb_primary = SB_AVAILABLE and sb is not None
+    if sb_primary:
+        ok_a = _friends_edge_upsert(token, from_token, 'accepted')
+        ok_b = _friends_edge_upsert(from_token, token, 'accepted')
+        if not (ok_a and ok_b):
+            # Mind. ein Edge-Write fehlgeschlagen → auf Blob-Fallback unten.
+            sb_primary = False
+    # Disk-Cache (und Blob-Fallback wenn SB down/teilfehlerhaft): best-effort.
     me['requests_in'] = [r for r in me['requests_in'] if r != from_token]
     them['requests_out'] = [r for r in (them.get('requests_out') or []) if r != token]
     me.setdefault('friends', [])
     them.setdefault('friends', [])
     if from_token not in me['friends']: me['friends'].append(from_token)
     if token not in them['friends']: them['friends'].append(token)
-    _friends_save(token, me)
-    _friends_save(from_token, them)
+    if sb_primary:
+        # SB ist Source-of-Truth + bereits atomar geschrieben → nur Disk-Cache
+        # aktualisieren, NICHT erneut den ganzen Blob nach SB pushen.
+        _friends_save_disk_only(token, me)
+        _friends_save_disk_only(from_token, them)
+    else:
+        _friends_save(token, me)
+        _friends_save(from_token, them)
     try:
         my_name = ''
         try:
@@ -19936,10 +20166,22 @@ def decline_friend_request(token):
     from_token = (body.get('friend_token') or '').strip()
     me = _friends_load(token)
     them = _friends_load(from_token)
+    # P0-Concurrency-Fix (2026-06-08): die pending-Kante atomar löschen statt
+    # Blob-Rewrite. requests_in[me] + requests_out[from_token] sind beide aus der
+    # einen Kante (from_token -> me, pending) abgeleitet → ein Edge-Delete
+    # erledigt beides ohne Clobber-Risiko.
+    sb_primary = SB_AVAILABLE and sb is not None
+    if sb_primary:
+        if not _friends_edge_delete(from_token, token):
+            sb_primary = False
     me['requests_in'] = [r for r in (me.get('requests_in') or []) if r != from_token]
     them['requests_out'] = [r for r in (them.get('requests_out') or []) if r != token]
-    _friends_save(token, me)
-    _friends_save(from_token, them)
+    if sb_primary:
+        _friends_save_disk_only(token, me)
+        _friends_save_disk_only(from_token, them)
+    else:
+        _friends_save(token, me)
+        _friends_save(from_token, them)
     return jsonify({'ok': True})
 
 
