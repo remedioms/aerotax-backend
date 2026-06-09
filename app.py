@@ -12867,7 +12867,16 @@ def get_chat_messages(token, channel_id):
     since = float(request.args.get('since_ts') or 0)
     if since:
         msgs = [m for m in msgs if (m.get('ts') or 0) > since]
-    return jsonify({'channel': channel_id, 'messages': msgs[-100:]})
+    # `is_mine` explizit mitgeben → iOS muss nicht mehr den GEKÜRZTEN author_token
+    # (token[:16]+'…') prefix-vergleichen (fragil bei Token-Prefix-Kollision).
+    # Vergleich gegen DIESELBE Kürzung, mit der gesendet wurde.
+    my_trunc = (token or '')[:16] + '…'
+    out = []
+    for m in msgs[-100:]:
+        mm = dict(m)
+        mm['is_mine'] = (m.get('author_token') == my_trunc)
+        out.append(mm)
+    return jsonify({'channel': channel_id, 'messages': out})
 
 
 @app.route('/api/crew-chat/<token>/channel/<channel_id>/send', methods=['POST'])
@@ -17411,6 +17420,16 @@ def auth_delete_account():
                 break
         if not user:
             return jsonify({'ok': False, 'error': 'invalid_token'}), 401
+        # SECURITY (P0, 2026-06-09): ein Email/Passwort-Account MUSS auch auf dem
+        # Token-Pfad das Passwort re-verifizieren. Vorher genügte der Token allein
+        # (ODER ein leeres Passwort fiel still in diesen Branch) → ein geleakter/
+        # eingeloggter Token konnte den Account ohne Passwort-Kenntnis löschen.
+        # Apple-Sign-In-Accounts haben KEIN password_hash → Token-Identität genügt
+        # (sie haben kein Passwort; Re-Auth läuft über Apple).
+        if user.get('password_hash'):
+            ok, _ = _password_verify(pw, user.get('password_hash', ''))
+            if not ok:
+                return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
     else:
         return jsonify({'ok': False, 'error': 'auth_required'}), 400
 

@@ -111,9 +111,10 @@ def account():
     token = body.get("token")
     _assert_token_format(token, where="signup")
     yield {"token": token, "email": email, "password": password}
-    # Teardown: best-effort delete-account
+    # Teardown: best-effort delete-account. Passwort MUSS mit (Email/PW-Account):
+    # der Token-Pfad allein löscht seit dem P0-Security-Fix keinen PW-Account mehr.
     try:
-        _post("api/auth/delete-account", {"token": token})
+        _post("api/auth/delete-account", {"token": token, "email": email, "password": password})
     except Exception:
         pass
 
@@ -132,8 +133,8 @@ def test_auth_signup_contract():
     assert isinstance(body["ok"], bool), "AuthResponse.ok must be Bool"
     assert "token" in body, "signup missing 'token' expected by iOS APIClient.signup"
     _assert_token_format(body["token"], where="POST /api/auth/signup")
-    # Cleanup
-    try: _post("api/auth/delete-account", {"token": body["token"]})
+    # Cleanup (Passwort mit — Token-Pfad allein löscht keinen PW-Account mehr).
+    try: _post("api/auth/delete-account", {"token": body["token"], "email": email, "password": pw})
     except Exception: pass
 
 
