@@ -12976,6 +12976,11 @@ def get_chat_messages(token, channel_id):
     if _gate is not None:
         return _gate
     msgs = _dm_load_messages(channel_id) or []
+    # Soft-Delete-Gate: vom Autor geloeschte Messages (deleted==True, gesetzt vom
+    # DELETE-Endpoint) werden NIE ausgeliefert. Ohne dieses Filter taucht eine
+    # geloeschte Nachricht beim naechsten Poll/Reload (oder auf einem neuen Geraet)
+    # wieder auf, weil der Server das Original sonst weiterhin zurueckgibt.
+    msgs = [m for m in msgs if not m.get('deleted')]
     since = float(request.args.get('since_ts') or 0)
     if since:
         msgs = [m for m in msgs if (m.get('ts') or 0) > since]
@@ -13027,6 +13032,59 @@ def send_chat_message(token, channel_id):
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
     return jsonify({'ok': True, 'message': msg})
+
+
+def _soft_delete_chat_message(token, channel_id, message_id):
+    """Markiert eine Message als geloescht (Soft-Delete) und persistiert das.
+
+    Echte serverseitige Loeschung: ohne sie blieb das Original in SB/Disk und kam
+    beim naechsten Poll/Reload (oder auf einem neuen Geraet) wieder hoch — der
+    iOS-Client hielt es nur lokal versteckt. `deleted=True` ist KEINE bekannte
+    SB-Spalte → landet in metadata-jsonb und wird beim Laden re-hydratisiert; das
+    List-Route-Filter (`not m.get('deleted')`) blendet die Message dann ueberall aus.
+    Nur der Autor darf loeschen (Author-Token PII-truncated `token[:16]+'…'`).
+    """
+    import time
+    if not message_id:
+        return jsonify({'ok': False, 'error': 'message_id_required'}), 400
+    my_trunc = (token or '')[:16] + '…'
+    try:
+        msgs = _dm_load_messages(channel_id) or []
+        found = None
+        for m in msgs:
+            if m.get('id') == message_id:
+                found = m
+                break
+        if found is None:
+            # Schon weg/nie existiert → idempotent ok (Client soll nicht retryen).
+            return jsonify({'ok': True, 'already_gone': True})
+        if found.get('author_token') != my_trunc:
+            return jsonify({'ok': False, 'error': 'not_author'}), 403
+        if found.get('deleted'):
+            return jsonify({'ok': True, 'already_deleted': True})
+        found['deleted'] = True
+        found['deleted_ts'] = time.time()
+        # Text nicht mehr ausliefern: falls ein alter Client doch mal eine
+        # deleted-Message bekaeme, ist der Inhalt trotzdem fort.
+        found['text'] = ''
+        _dm_save_messages(channel_id, msgs[-500:])
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True, 'deleted': message_id})
+
+
+@app.route('/api/crew-chat/<token>/channel/<channel_id>/message/<message_id>',
+           methods=['DELETE'])
+def delete_chat_message(token, channel_id, message_id):
+    """Soft-Delete einer eigenen Message in einem (Group-/DM-)Channel."""
+    if not _chat_path(channel_id):
+        return jsonify({'ok': False, 'error': 'invalid_channel'}), 400
+    _gate = _channel_access_error(token, channel_id)
+    if _gate is not None:
+        _, status = _gate
+        err = 'not_a_member' if status == 403 else 'invalid_channel'
+        return jsonify({'ok': False, 'error': err}), status
+    return _soft_delete_chat_message(token, channel_id, message_id)
 
 
 def _dm_lastseen_load_from_supabase(token):
@@ -13107,7 +13165,9 @@ def get_dm_inbox(token):
         unread = 0
         try:
             # _dm_load_messages: SB primary, Disk fallback (P0 2026-06-01).
-            msgs = _dm_load_messages(ch) or []
+            # Soft-deletete Messages raus, sonst zeigt die Inbox eine geloeschte
+            # Nachricht als letzte Preview bzw. zaehlt sie als unread.
+            msgs = [m for m in (_dm_load_messages(ch) or []) if not m.get('deleted')]
             if msgs:
                 last_msg = msgs[-1]
                 seen_ts = float(last_seen.get(ch) or 0)
@@ -13211,6 +13271,17 @@ def send_dm(token, friend_token):
     except Exception:
         pass
     return resp
+
+
+@app.route('/api/crew-chat/<token>/dm/<friend_token>/message/<message_id>',
+           methods=['DELETE'])
+def delete_dm_message(token, friend_token, message_id):
+    """Soft-Delete einer eigenen Message in einem 1:1-DM (Convenience-Wrapper,
+    spiegelt /channel/<id>/message/<id>). Channel deterministisch aus beiden Tokens."""
+    ch = _dm_channel(token, friend_token)
+    if not ch:
+        return jsonify({'ok': False, 'error': 'invalid_tokens'}), 400
+    return _soft_delete_chat_message(token, ch, message_id)
 
 
 # ─── Social Wall: Posts / Likes / Comments ──────────────────────────────────
@@ -20200,6 +20271,85 @@ def _punctuality_stats(flights, airport='FRA'):
             'scheduled_total': scheduled_total}
 
 
+def _delay_obs_rows_for_date(date_str, airport='FRA'):
+    """Liest ALLE persistierten Delay-Beobachtungen eines BELIEBIGEN (auch
+    vergangenen) Betriebstags direkt aus airport_delay_obs — OHNE den
+    In-Memory-Store (_delay_store) zu beruehren. Der Store haelt nur den heutigen
+    Tag; fuer „zurueck in der Zeit" (iOS-Tabelle) muessen wir die SB-Tabelle
+    selbst abfragen. Gibt eine flache Liste roher Rows zurueck (leere Liste bei
+    SB-down/leer — der Caller degradiert dann ehrlich)."""
+    if not SB_AVAILABLE or sb is None or not date_str:
+        return []
+    airport = (airport or 'FRA').upper()
+    out = []
+    try:
+        offset = 0
+        page = 1000
+        while True:
+            r = (sb.table('airport_delay_obs').select('*')
+                 .eq('date', date_str).eq('airport', airport)
+                 .range(offset, offset + page - 1).execute())
+            rows = r.data or []
+            out.extend(rows)
+            if len(rows) < page:
+                break
+            offset += page
+    except Exception as e:
+        app.logger.warning(
+            f'[delay-obs] sb_date_read_FAIL date={date_str} airport={airport} '
+            f'{type(e).__name__}: {str(e)[:160]}')
+        return []
+    return out
+
+
+def _punctuality_stats_from_obs(date_str, airport='FRA', airline=None):
+    """Pünktlichkeits-Quote eines VERGANGENEN (oder beliebigen) Betriebstags rein
+    aus den persistierten Beobachtungen (airport_delay_obs) — kein Live-Board,
+    kein In-Memory-Store. Damit kann die iOS-Tabelle in der Zeit zurueckgehen.
+
+    Jede Row ist ein abgeschlossener Flug des Tages (der Poller hat ihn in seinem
+    Abflug-Fenster erfasst). delayed = max_delay_min > 15 (gleiche Schwelle wie die
+    Live-Aggregation). `airline` (z.B. 'LH') filtert per Flugnummer-Prefix.
+    Liefert denselben Contract wie _punctuality_stats."""
+    rows = _delay_obs_rows_for_date(date_str, airport)
+    airline = (airline or '').upper().strip()
+    total = 0
+    cancelled = 0
+    delayed = 0
+    on_time = 0
+    delay_vals = []
+    for row in rows:
+        fn = row.get('flight') or ''
+        if not fn:
+            continue
+        if airline:
+            try:
+                al, _num = _split_flightno(fn)
+            except Exception:
+                al = (fn[:2] if fn else '')
+            if (al or '').upper() != airline:
+                continue
+        total += 1
+        if bool(row.get('cancelled')):
+            cancelled += 1
+            continue
+        md = int(row.get('max_delay_min') or 0)
+        if md > 15:
+            delayed += 1
+            delay_vals.append(md)
+        else:
+            on_time += 1
+    active = max(0, total - cancelled)
+    pct = round(100.0 * on_time / active, 0) if active > 0 else None
+    avg_delay = round(sum(delay_vals) / len(delay_vals)) if delay_vals else 0
+    incomplete = active < _PUNCTUALITY_MIN_SAMPLE
+    return {'total': total, 'on_time': on_time, 'delayed': delayed,
+            'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay,
+            'sample_size': active, 'data_incomplete': incomplete,
+            'min_sample': _PUNCTUALITY_MIN_SAMPLE,
+            'scheduled_total': total}
+
+
 def _aerodatabox_punctuality(iata, airline):
     """Heutige Abflug-Pünktlichkeit eines beliebigen IATA-Airports via AeroDataBox
     (RapidAPI, env-gated über AERODATABOX_KEY). Aggressiv gecacht (15 Min/Schlüssel),
@@ -20407,6 +20557,38 @@ def airport_punctuality(token):
     und die meistgeflogenen Ziele. EHRLICH: Tagestafel, keine historische OTP."""
     airline = (request.args.get('airline') or 'LH').upper().strip()
     airport = (request.args.get('airport') or 'FRA').upper().strip()
+    # ── PAST-DATE-Query (iOS-Tabelle „zurück in der Zeit") ──────────────────
+    # ?date=YYYY-MM-DD → ausschließlich aus den persistierten Beobachtungen
+    # (airport_delay_obs) aggregieren. Der Live-Feed ist now-relativ und kennt
+    # vergangene Tage nicht — die SB-Tabelle hält sie. Heute/Zukunft fallen
+    # bewusst NICHT in diesen Pfad (die nutzen weiter die Live-Tages-Tafel, deren
+    # Store-Replay die abgeflogenen Flüge ohnehin mitzählt).
+    date_param = (request.args.get('date') or '').strip()
+    if date_param:
+        import re as _re
+        if not _re.match(r'^\d{4}-\d{2}-\d{2}$', date_param):
+            return jsonify({'ok': False, 'error': 'invalid_date',
+                            'message': 'date muss YYYY-MM-DD sein.'}), 400
+        try:
+            today_str = _fra_local_now().strftime('%Y-%m-%d')
+        except Exception:
+            today_str = ''
+        if date_param != today_str:
+            stats = _punctuality_stats_from_obs(date_param, airport, airline)
+            all_stats = _punctuality_stats_from_obs(date_param, airport, None)
+            out = {'ok': True, 'airport': airport, 'airline': airline,
+                   'source': 'airport_delay_obs', 'scope': 'historischer_tag',
+                   'date': date_param, 'ticker': [], 'cancellations': [],
+                   'busiest_routes': [], 'all_airlines': all_stats}
+            out.update(stats)
+            if (stats.get('sample_size') or 0) == 0:
+                out['note'] = ('Für ' + date_param + ' liegen keine gespeicherten '
+                               + airline + '-Abflüge ab ' + airport + ' vor.')
+            elif stats.get('data_incomplete'):
+                out['note'] = ('Nur ' + str(stats.get('sample_size') or 0) + ' '
+                               + airline + '-Abflüge am ' + date_param + ' ab ' + airport
+                               + ' gespeichert — wenig für eine belastbare Quote.')
+            return jsonify(out)
     # Nur FRA hat die kostenlose Fraport-Tages-Tafel. Für Airports mit eigenem
     # nativen Scraper (MUC, DUS, HAJ, …) nutzen wir deren Board direkt — kein
     # AeroDataBox-Key nötig. Erst danach AeroDataBox als letzter Fallback.
