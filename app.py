@@ -18439,7 +18439,8 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
                     'terminal': (f.get('terminal') or '').strip(),
                     'hall': (f.get('halle') or '').strip(),
                     'status': (f.get('status') or '').strip(),
-                    'delayed': _fra_delay_min(f.get('sched'), f.get('esti')) >= 5,
+                    'delayed': (_fra_delay_min(f.get('sched'), f.get('esti'))
+                                >= _PUNCTUALITY_DELAY_THRESHOLD_MIN),
                     'reg': (f.get('reg') or '').strip(),
                     'aircraft': (f.get('ac') or '').strip(),
                 })
@@ -19455,7 +19456,8 @@ def _departed_rows_from_store(airport):
             'airline': al, 'airline_name': '', 'flight': fn,
             'dest_iata': '', 'dest_name': '',
             'sched': today + 'T' + sc + ':00', 'esti': None,
-            'delay_min': int(max_delay or 0), 'delayed': int(max_delay or 0) >= 5,
+            'delay_min': int(max_delay or 0),
+            'delayed': int(max_delay or 0) >= _PUNCTUALITY_DELAY_THRESHOLD_MIN,
             'cancelled': cancelled, 'gate': '', 'terminal': '', 'hall': '',
             'status': ('Annulliert' if cancelled else 'Abgeflogen'),
             'reg': '', 'aircraft': '', 'departed': True,
@@ -19988,6 +19990,13 @@ _FRA_CANCEL_MARKERS = ('annull', 'cancel', 'gestrich')
 # statt eine irreführende 100%-über-7-Flüge-Zahl zu behaupten.
 _PUNCTUALITY_MIN_SAMPLE = 15
 
+# Verspätungs-Schwelle (Minuten) für „delayed". MUSS identisch zur Live-Board-
+# Flag (`delayed = _fra_delay_min(...) >= 5` in `_fetch_fra_flights`) sein, sonst
+# wechselt das Urteil eines Fluges, sobald er aus dem Live-Feed in den Store-Replay
+# wandert (live „verspätet" → replay „pünktlich") → springende Quote + falsche
+# Tabellen-Klassifikation. Eine Quelle der Wahrheit für alle Pünktlichkeits-Pfade.
+_PUNCTUALITY_DELAY_THRESHOLD_MIN = 5
+
 def _is_cancelled(f):
     return any(m in (f.get('status') or '').lower() for m in _FRA_CANCEL_MARKERS)
 
@@ -20158,18 +20167,31 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
         # on-time. (now_local None → defensiv alles aufnehmen, wie zuvor.)
         passed = (now_local is None) or _flight_sched_passed(f, now_local)
         changed = False
-        if delay and delay > 0:
-            prev = _delay_store.get(key, 0)
-            if delay > prev:
-                _delay_store[key] = delay
+        # Persistenz-Regel (BUGFIX 2026-06-10 „abgeflogene Flüge verschwinden"):
+        # Eine Beobachtung wird NUR festgehalten, wenn der Flug bereits ABGEFLOGEN
+        # ist (passed) bzw. annulliert. Vorher schrieb der delay>0-Zweig auch noch
+        # NICHT abgeflogene Flüge mit einer prognostizierten `esti`-Verspätung in
+        # den Store/airport_delay_obs — ein Phantom-„departed". Schlimmer: war so
+        # ein Key einmal mit einem flüchtigen Vorab-Delay gesetzt, konnte der
+        # On-Time-Zweig ihn nach echtem (pünktlichem) Abflug NICHT mehr auf 0
+        # korrigieren (`key not in _delay_store` war False) → der Flug blieb falsch
+        # als „verspätet" markiert, während echte On-Time-Flüge, die der Poller im
+        # engen Post-Sched-Fenster nicht erwischte, ganz fehlten → Stichprobe fiel
+        # unter MIN_SAMPLE → „Daten unvollständig". Jetzt symmetrisch: erst ab
+        # Abflug erfassen, dann Delay wachsen lassen ODER on-time (0) setzen.
+        if passed and not cancelled:
+            if delay and delay > 0:
+                prev = _delay_store.get(key, 0)
+                if delay > prev:
+                    _delay_store[key] = delay
+                    changed = True
+            elif key not in _delay_store:
+                # On-Time-Beobachtung eines abgeflogenen Fluges festhalten (delay 0).
+                # Damit ein temporär leeres Live-Board die volle Tages-Stichprobe
+                # behält, nicht nur die verspäteten/annullierten Flüge. Reale,
+                # abgeschlossene Flüge — keine Erfindung.
+                _delay_store[key] = 0
                 changed = True
-        elif passed and not cancelled and key not in _delay_store:
-            # On-Time-Beobachtung eines abgeflogenen Fluges festhalten (delay 0).
-            # WICHTIG für Task: damit ein temporär leeres Live-Board die volle
-            # Tages-Stichprobe behält, nicht nur die verspäteten/annullierten Flüge.
-            # Nur reale, abgeschlossene Flüge — keine Erfindung.
-            _delay_store[key] = 0
-            changed = True
         if cancelled:
             _delay_store[(date_str, airport, fn, hhmm + '_cancelled')] = 1
             if not _delay_store_cancelled.get(key):
@@ -20244,7 +20266,7 @@ def _punctuality_stats(flights, airport='FRA'):
                 continue  # schon oben gezählt
             # Dieser Flug hat geheilt — sein gespeichertes Max zurückholen.
             total += 1
-            if max_delay > 15:
+            if max_delay >= _PUNCTUALITY_DELAY_THRESHOLD_MIN:
                 delayed += 1
             else:
                 on_time += 1
@@ -20334,7 +20356,7 @@ def _punctuality_stats_from_obs(date_str, airport='FRA', airline=None):
             cancelled += 1
             continue
         md = int(row.get('max_delay_min') or 0)
-        if md > 15:
+        if md >= _PUNCTUALITY_DELAY_THRESHOLD_MIN:
             delayed += 1
             delay_vals.append(md)
         else:
@@ -21559,18 +21581,24 @@ def _ics_events_to_briefings(events, existing=None):
             prev_location = (existing_b.get('ical_location') or '').strip()
             prev_start = (existing_b.get('ical_start_iso') or '').strip()
             prev_end = (existing_b.get('ical_end_iso') or '').strip()
-            merged_summary = day_summary
+            # BUGFIX (2026-06-10 „Multi-Event-Tag verliert SUMMARY/LOCATION"):
+            # Default war früher der NEUE Wert (day_summary/location). Wenn aber
+            # das neue Event-Feld bereits ein Teilstring des bisherigen Merge-
+            # Ergebnisses war (z.B. LAYOVER-LOCATION „MIA" ist Substring von
+            # „FRA, FRA - MIA"), feuerte WEDER der Concat- NOCH der Keep-Zweig →
+            # merged fiel auf den nackten neuen Wert zurück und ÜBERSCHRIEB den
+            # vollständigen vorherigen („MIA" statt „FRA, FRA - MIA"). Real gegen
+            # /tmp/lh_roster.ics 09./10.06 reproduziert. Fix: bei vorhandenem prev
+            # ist prev der Default; der neue Wert wird nur ANGEHÄNGT, wenn er
+            # echte neue Information bringt (nicht leer, nicht bereits enthalten).
+            merged_summary = prev_summary or day_summary
             if prev_summary and day_summary and prev_summary != day_summary \
                     and day_summary not in prev_summary:
                 merged_summary = f"{prev_summary} · {day_summary}"[:200]
-            elif prev_summary and not day_summary:
-                merged_summary = prev_summary
-            merged_location = location
+            merged_location = prev_location or location
             if prev_location and location and prev_location != location \
                     and location not in prev_location:
                 merged_location = f"{prev_location}, {location}"[:120]
-            elif prev_location and not location:
-                merged_location = prev_location
             # earliest start, latest end — ABER nur duty-relevante Events
             # (Flug/Briefing/Standby) erweitern das Fenster; Layover/Off NICHT
             # (sonst zählt das Layover-Ende am nächsten Morgen als Duty-Ende →
