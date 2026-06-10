@@ -3480,18 +3480,16 @@ def _run_process_async(job_id, form, files):
                     with open(pp) as _pf:
                         _pdata = json.load(_pf) or {}
                     if (_pdata.get('profile') or {}).get('share_roster'):
-                        _sp = _roster_snapshot_path(session_token)
-                        if _sp:
-                            _tage = safe.get('_tage_detail') or []
-                            with open(_sp, 'w') as _sf:
-                                json.dump({
-                                    'taken_at': datetime.now().isoformat(),
-                                    'auto_saved': True,
-                                    'tage': _tage,
-                                }, _sf, ensure_ascii=False)
-                            # Crews-on-Flight: Flugnummer-Assignments ingesten
-                            # (best-effort). Speist /api/crew/flight-Lookup.
-                            _crew_flight_ingest(session_token, _tage)
+                        _tage = safe.get('_tage_detail') or []
+                        # Supabase-first + Disk (multi-instance-sicher).
+                        _roster_snapshot_save(session_token, {
+                            'taken_at': datetime.now().isoformat(),
+                            'auto_saved': True,
+                            'tage': _tage,
+                        })
+                        # Crews-on-Flight: Flugnummer-Assignments ingesten
+                        # (best-effort). Speist /api/crew/flight-Lookup.
+                        _crew_flight_ingest(session_token, _tage)
             except Exception as _e:
                 app.logger.warning(f'[share-roster-auto-save] {_e}')
 
@@ -9896,13 +9894,7 @@ def _user_future_layovers(token, days_ahead=60):
     sess = _store.get(token) or {}
     tage = (sess.get('result_data') or {}).get('_tage_detail') or []
     if not tage:
-        sp = _roster_snapshot_path(token)
-        if sp and os.path.exists(sp):
-            try:
-                with open(sp) as f:
-                    tage = (json.load(f) or {}).get('tage') or []
-            except Exception:
-                tage = []
+        tage = (_roster_snapshot_read(token) or {}).get('tage') or []
     today = _d.today()
     cutoff = today + _td(days=days_ahead)
     out = []
@@ -9975,11 +9967,25 @@ def get_crew_at_destination(token):
         if not info['friends']:
             continue
         coord = ap.get(iata)
+        # Kanonische Gruppen-Channel-ID (Multi-Agent-Review 2026-06-10, Welle A):
+        # Der iOS-Client errechnete die ID vorher aus my_dates.first — also dem
+        # EIGENEN Datum. Bei einem ±24h-Match (A am 10., B am 11.) kamen beide
+        # auf verschiedene IDs und landeten in getrennten Räumen. Wir liefern die
+        # ID jetzt serverseitig aus dem FRÜHESTEN Datum im Match-Cluster
+        # (eigene Layover ∪ gematchte Friend-Tage an dieser Station). Für den
+        # häufigen Paar-Fall (gleiche Nacht) deterministisch identisch für alle;
+        # die seltene 3er-Kette (A-10/B-11/C-12, A≁C) degradiert sauber.
+        _cluster_dates = set(info['my_dates']) | {
+            f.get('datum') for f in info['friends'].values() if f.get('datum')
+        }
+        _canon = min((d for d in _cluster_dates if d), default='')
+        channel_id = f"group__lo_{iata.upper()}_{''.join(ch for ch in _canon if ch.isdigit())}"
         layover_matches.append({
             'iata': iata,
             'lat': coord[0] if coord else None,
             'lng': coord[1] if coord else None,
             'my_dates': sorted(info['my_dates']),
+            'channel_id': channel_id,
             'friends': sorted(info['friends'].values(), key=lambda x: x['datum']),
         })
     layover_matches.sort(key=lambda m: -len(m['friends']))
@@ -10229,14 +10235,7 @@ def get_friend_roster(token, friend_token):
     sess = _store.get(friend_token) or {}
     tage = (sess.get('result_data') or {}).get('_tage_detail') or []
     if not tage:
-        sp = _roster_snapshot_path(friend_token)
-        if sp and os.path.exists(sp):
-            try:
-                with open(sp) as f:
-                    snap = json.load(f) or {}
-                tage = snap.get('tage') or []
-            except Exception:
-                tage = []
+        tage = (_roster_snapshot_read(friend_token) or {}).get('tage') or []
     today = _date.today()
     cutoff = today + _td(days=days_limit)
     out = []
@@ -12235,6 +12234,76 @@ def _roster_changes_path(token):
     return os.path.join(_USER_HISTORY_DIR, f'roster_changes_{safe}.json')
 
 
+# ── Roster-Snapshot: Supabase-first mit Disk-Fallback ────────────────────
+# Multi-Agent-Review 2026-06-10 (Welle A): Snapshots lagen NUR auf der Disk der
+# schreibenden Cloud-Run-Instanz. Bei >1 Instanz (Skalierung auf viele User)
+# oder Container-Wipe sah die lesende Instanz nichts → Friends-Roster leer.
+# Tabelle: supabase_migrations/20260610_roster_snapshots.sql. Fehlt sie noch,
+# degradiert alles sauber auf Disk-only (kein Hard-Fail).
+
+def _sb_roster_snapshot_upsert(token, payload):
+    """Best-effort Write-Through nach Supabase. True bei Erfolg."""
+    if not (SB_AVAILABLE and token and isinstance(payload, dict)):
+        return False
+    try:
+        def _do():
+            return sb.table('roster_snapshots').upsert({
+                'token': token,
+                'payload': payload,
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+            }, on_conflict='token').execute()
+        _supabase_execute_with_timeout('roster_snapshot_upsert', _do)
+        return True
+    except Exception:
+        return False  # Tabelle fehlt / SB down → Disk bleibt die Quelle
+
+
+def _sb_roster_snapshot_load(token):
+    """Liest den Snapshot-Payload aus Supabase. None wenn nicht vorhanden."""
+    if not (SB_AVAILABLE and token):
+        return None
+    try:
+        def _do():
+            return sb.table('roster_snapshots').select('payload').eq(
+                'token', token).limit(1).execute()
+        r = _supabase_execute_with_timeout('roster_snapshot_load', _do)
+        rows = getattr(r, 'data', None) or []
+        if rows:
+            return rows[0].get('payload')
+    except Exception:
+        return None
+    return None
+
+
+def _roster_snapshot_save(token, payload):
+    """Schreibt Snapshot nach Supabase UND Disk. True wenn mind. eines klappt."""
+    sb_ok = _sb_roster_snapshot_upsert(token, payload)
+    disk_ok = False
+    sp = _roster_snapshot_path(token)
+    if sp:
+        try:
+            with open(sp, 'w') as f:
+                json.dump(payload, f, ensure_ascii=False)
+            disk_ok = True
+        except Exception:
+            pass
+    return sb_ok or disk_ok
+
+
+def _roster_snapshot_read(token):
+    """Liest Snapshot: Supabase-first (multi-instance-sicher), dann Disk."""
+    payload = _sb_roster_snapshot_load(token)
+    if not payload:
+        sp = _roster_snapshot_path(token)
+        if sp and os.path.exists(sp):
+            try:
+                with open(sp) as f:
+                    payload = json.load(f)
+            except Exception:
+                payload = None
+    return payload or {}
+
+
 def _compute_roster_diff(old_tage, new_tage):
     """Returns list of {datum, kind, old, new} where kind ∈ added/removed/modified."""
     old_by = {t.get('datum'): t for t in (old_tage or []) if isinstance(t, dict)}
@@ -12264,22 +12333,15 @@ def take_roster_snapshot(token):
     sess = _store.get(token) or {}
     rd = sess.get('result_data') or {}
     new_tage = rd.get('_tage_detail') or []
-    sp = _roster_snapshot_path(token)
-    if not sp: return jsonify({'ok': False, 'error': 'invalid token'}), 400
-    try:
-        with open(sp) as f: old_data = json.load(f)
-        old_tage = old_data.get('tage') or []
-    except FileNotFoundError:
-        old_tage = []
-    except Exception:
-        old_tage = []
+    if not _roster_snapshot_path(token):
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    old_tage = (_roster_snapshot_read(token) or {}).get('tage') or []
     diff = _compute_roster_diff(old_tage, new_tage)
-    # Persist new snapshot
-    try:
-        with open(sp, 'w') as f:
-            json.dump({'taken_at': datetime.now().isoformat(), 'tage': new_tage}, f, ensure_ascii=False)
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    # Persist new snapshot (Supabase-first + Disk, multi-instance-sicher)
+    if not _roster_snapshot_save(token, {
+        'taken_at': datetime.now().isoformat(), 'tage': new_tage,
+    }):
+        return jsonify({'ok': False, 'error': 'snapshot_persist_failed'}), 500
     # Crews-on-Flight: Flugnummer-Assignments aus dem neuen Snapshot ingesten
     # (best-effort, wirft nie). Speist /api/crew/flight-Lookup.
     _crew_flight_ingest(token, new_tage)
@@ -16657,7 +16719,7 @@ def register_push_token(token):
         'push_token': expo_token or existing.get('push_token') or '',
         'apns_token': apns_token or existing.get('apns_token') or '',
         'platform': body.get('platform') or existing.get('platform') or ('ios' if apns_token else 'expo'),
-        'bundle_id': body.get('bundle_id') or existing.get('bundle_id') or 'de.aerosteuer.aeris',
+        'bundle_id': body.get('bundle_id') or existing.get('bundle_id') or 'aerotax.AeroTax',
         'device_id': body.get('device_id') or existing.get('device_id') or '',
         'registered_at': datetime.now().isoformat(),
     }
@@ -16685,11 +16747,36 @@ def register_push_apns():
         'push_token': existing.get('push_token') or '',  # Expo nicht überschreiben
         'apns_token': apns_token,
         'platform': body.get('platform', 'ios'),
-        'bundle_id': body.get('bundle_id') or existing.get('bundle_id') or 'de.aerosteuer.aeris',
+        'bundle_id': body.get('bundle_id') or existing.get('bundle_id') or 'aerotax.AeroTax',
         'device_id': body.get('device_id') or existing.get('device_id') or '',
         'registered_at': datetime.now().isoformat(),
     }
     if _push_save(user_token, merged):
+        return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+
+
+@app.route('/api/push/unregister-apns', methods=['POST'])
+def unregister_push_apns():
+    """Entfernt den Push-Token eines Geräts für diesen User. Body: {token}.
+
+    Multi-Agent-Review 2026-06-10 (Welle A): Beim Logout blieb die APNs-Registrierung
+    unter dem alten user_token bestehen → loggte sich auf demselben Gerät ein anderer
+    Account ein, bekam er weiter Pushes (Roster/Chat) des VORIGEN Users (Cross-User-PII
+    auf geteilten Geräten). iOS ruft das beim Logout best-effort auf.
+    """
+    body = request.get_json(silent=True) or {}
+    user_token = (body.get('token') or '').strip()
+    if not user_token:
+        return jsonify({'ok': False, 'error': 'missing token'}), 400
+    existing = _push_load(user_token) or {}
+    if not existing:
+        return jsonify({'ok': True, 'noop': True})
+    # apns/expo-Token leeren → _send_push_notification sendet nichts mehr an dieses
+    # Gerät. Registry-Eintrag bleibt (kein neuer SB-Delete-Pfad nötig).
+    cleared = {**existing, 'apns_token': '', 'push_token': '',
+               'unregistered_at': datetime.now().isoformat()}
+    if _push_save(user_token, cleared):
         return jsonify({'ok': True})
     return jsonify({'ok': False, 'error': 'persist_failed'}), 500
 
@@ -16699,7 +16786,7 @@ def register_push_apns():
 #   APNS_AUTH_KEY      base64-encoded .p8 Datei (von Apple Developer Console)
 #   APNS_KEY_ID        10-Zeichen Key-ID (z.B. "ABCD123456")
 #   APNS_TEAM_ID       10-Zeichen Apple Team-ID
-#   APNS_TOPIC         Bundle-ID (default "de.aerosteuer.aeris")
+#   APNS_TOPIC         Bundle-ID (default "aerotax.AeroTax", per-Gerät via bundle_id)
 #   APNS_USE_SANDBOX   "1" für api.sandbox.push.apple.com (Dev-Builds)
 #
 # Wenn APNS_AUTH_KEY nicht gesetzt ist → wird übersprungen (warning gelogged,
@@ -16750,17 +16837,22 @@ def _apns_get_jwt():
         return None
 
 
-def _send_apns(apns_token, title, body, data=None):
+def _send_apns(apns_token, title, body, data=None, topic=None):
     """Sendet eine Push-Notification via APNs HTTP/2. Returns True bei 200.
 
     Braucht `httpx[http2]` im Environment (HTTP/2 ist Pflicht — Apple lehnt
     HTTP/1.1 ab). Wenn httpx/h2 fehlt → return False mit warning.
+
+    `topic` = APNs-Topic (= Bundle-ID des Ziel-Geräts). Caller übergibt die pro
+    Gerät gespeicherte bundle_id; Fallback auf APNS_TOPIC-env, dann die korrekte
+    App-Bundle-ID. (Vorher war der Default 'de.aerosteuer.aeris' — die App nutzt
+    aber 'aerotax.AeroTax', sodass Apple JEDEN Push mit 400 BadTopic ablehnte.)
     """
     import os
     jwt = _apns_get_jwt()
     if not jwt:
         return False  # caller handles fallback / skip
-    topic = os.environ.get('APNS_TOPIC', 'de.aerosteuer.aeris')
+    topic = (topic or os.environ.get('APNS_TOPIC') or 'aerotax.AeroTax').strip()
     use_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
     host = 'api.sandbox.push.apple.com' if use_sandbox else 'api.push.apple.com'
     payload = {'aps': {'alert': {'title': title, 'body': body}, 'sound': 'default'}}
@@ -16812,8 +16904,9 @@ def _send_push_notification(token, title, body, data=None):
         return False
     apns_token = (reg.get('apns_token') or '').strip()
     expo_token = (reg.get('push_token') or '').strip()
+    apns_topic = (reg.get('bundle_id') or '').strip() or None
     if apns_token and os.environ.get('APNS_AUTH_KEY', '').strip():
-        if _send_apns(apns_token, title, body, data=data):
+        if _send_apns(apns_token, title, body, data=data, topic=apns_topic):
             return True
         # APNs schlug fehl — falls Expo verfügbar, weiterversuchen.
     elif apns_token and not os.environ.get('APNS_AUTH_KEY', '').strip():
