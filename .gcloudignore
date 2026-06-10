@@ -9,3 +9,6 @@ _job_chunks_state/
 tests/
 *.md
 support_inbox/
+sessions/
+docs/
+*.log
