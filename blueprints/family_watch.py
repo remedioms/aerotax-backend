@@ -34,6 +34,7 @@ import os
 import re
 import json
 import time
+import hashlib
 import logging
 import datetime as _dt
 from flask import Blueprint, request, jsonify, current_app
@@ -587,8 +588,17 @@ def family_watch_feed(token):
         # nur erlaubte Felder durchlassen
         fields_clean = [f for f in fields if f in ALLOWED_FIELDS]
         status = _load_crew_status_for_family(crew_token, set(fields_clean))
+        # SECURITY (2026-06 Audit): NIE das echte Crew-Bearer-Token an die
+        # Family-Seite ausliefern — damit wäre voller Account-Zugriff möglich
+        # (Roster, DMs, Grants widerrufen, Account löschen). Der Client nutzt
+        # das Feld nur als stabile Identifiable-ID, also liefern wir unter dem
+        # alten Key einen opaken, pro Pairing stabilen Hash (Salt = Family-
+        # Token, damit IDs nicht über Familien hinweg korrelierbar sind).
+        opaque_id = hashlib.sha256(
+            f'{crew_token}:{token}'.encode('utf-8')
+        ).hexdigest()[:16]
         out.append({
-            'crew_token': crew_token,
+            'crew_token': opaque_id,
             'crew_short_name': _crew_short_name(crew_token),
             'crew_avatar_url': None,
             'status': status,

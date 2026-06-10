@@ -626,6 +626,21 @@ def _truncate(value, n):
     return v[:n]
 
 
+def _public_post(row, viewer_token=None):
+    """Serialisiert einen Post für Client-Responses OHNE author_token.
+
+    SECURITY (2026-06 Audit): author_token ist das App-weite Bearer-Token des
+    Autors — es darf das Backend nie verlassen (Board ist public-read; ein
+    geleaktes Token = voller Account-Takeover über alle <token>-Routen).
+    Statt des Tokens liefern wir `is_mine` (Server-Vergleich gegen das vom
+    Viewer mitgesendete Token) — mehr braucht der Client nicht.
+    """
+    item = dict(row)
+    author = item.pop('author_token', None)
+    item['is_mine'] = bool(viewer_token) and author == viewer_token
+    return item
+
+
 # ─── Routes ───────────────────────────────────────────────────────────
 
 @trip_trade_bp.route('/api/trade/<token>/post', methods=['POST'])
@@ -710,16 +725,17 @@ def create_trade_post(token):
     )
     return jsonify({
         'ok': True,
-        'post': row,
+        'post': _public_post(row, viewer_token=token),
         'persisted_to': {'supabase': sb_ok, 'disk': disk_ok},
     }), 200
 
 
 @trip_trade_bp.route('/api/trade/board', methods=['GET'])
 def list_board():
-    """Query: airline, base, qualification, position, swap_or_dump, limit, offset.
+    """Query: airline, base, qualification, position, swap_or_dump, limit, offset,
+    token (optional — nur für die is_mine-Berechnung, kein Auth-Gate).
     Public-Read (kein Token erforderlich) — sortiert nach tour_start_date asc,
-    dann created_at desc."""
+    dann created_at desc. Responses enthalten NIE author_token (s. _public_post)."""
     try:
         limit = int(request.args.get('limit', '50'))
     except (TypeError, ValueError):
@@ -744,13 +760,17 @@ def list_board():
                 'error': 'swap_or_dump muss swap, dump oder pickup sein.'
             }), 400
 
+    viewer_token = request.args.get('token')
+    if viewer_token and not _valid_token(viewer_token):
+        viewer_token = None
+
     posts = _list_posts(airline=airline, base=base, qualification=qualification,
                         position=position, swap_or_dump=swap_or_dump,
                         limit=limit, offset=offset)
     # interest_count anreichern (best effort — bei SB-down ist count None)
     out = []
     for p in posts:
-        item = dict(p)
+        item = _public_post(p, viewer_token=viewer_token)
         cnt = _sb_count_interests_for_post(item.get('id') or '')
         item['interest_count'] = cnt if cnt is not None else 0
         out.append(item)
@@ -771,7 +791,7 @@ def my_posts(token):
     posts = _list_my_posts(token)
     out = []
     for p in posts:
-        item = dict(p)
+        item = _public_post(p, viewer_token=token)
         cnt = _sb_count_interests_for_post(item.get('id') or '')
         item['interest_count'] = cnt if cnt is not None else 0
         out.append(item)
@@ -908,6 +928,12 @@ def incoming_interests(token):
             post_cache[pid] = _load_post_by_id(pid)
         post = post_cache.get(pid) if pid else None
         item = dict(r)
+        # SECURITY: das volle Token des Interessenten nie an den Author
+        # ausliefern — Prefix reicht für Anzeige/Disambiguierung (gleiches
+        # Muster wie crew-chat author_token-Truncation).
+        it = item.pop('interested_token', None)
+        if isinstance(it, str) and it:
+            item['interested_token'] = it[:16] + '…'
         if post:
             item['post_snapshot'] = {
                 'id': post.get('id'),

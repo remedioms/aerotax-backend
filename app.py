@@ -8579,9 +8579,11 @@ def _user_profile_path(token):
 #   beim ersten Read wenn SB leer aber Disk-Daten vorhanden.
 # Scope-Hinweis: NUR die profile{...}-Whitelist-Felder werden in SB gespiegelt
 # (name/homebase/position/airline/hometown/share_*/current_city/employers +
-# metadata-jsonb für unknown keys). Andere Top-Level-Keys der disk-Datei
-# (subscription, sponsored_slots, marker_mapping, lufthansa_*, calendar_feed,
-# crew_aircraft) bleiben disk-only — separater Patch.
+# metadata-jsonb für unknown keys). Side-Keys: subscription (W18) sowie
+# sponsored_slots, marker_mapping, lufthansa_credentials, lufthansa_last_sync
+# (W18-Followup 2026-06-10, via _profile_sidekey_get/_set) werden in
+# metadata-jsonb mitgespiegelt; lufthansa_events + crew_aircraft bleiben
+# disk-only (Bloat bzw. separater Patch).
 
 _PROFILE_KNOWN_COLS = {
     'name', 'homebase', 'position', 'airline', 'hometown',
@@ -8718,6 +8720,51 @@ def _profile_save(token, profile, full_disk_payload=None):
         )
         return False
     return True
+
+
+# ── W18-Followup (2026-06-10): Side-Key-Persistenz für Top-Level-Disk-Keys ──
+# subscription wurde mit W18 bereits durch _profile_save nach SB gespiegelt,
+# die übrigen Side-Keys (sponsored_slots, marker_mapping, lufthansa_*) blieben
+# disk-only (siehe Scope-Hinweis oben) → auf Cloud Run nach jedem Redeploy weg.
+# Diese zwei Helper wenden das W18-Pattern generisch an: Key landet BEIDES im
+# profile-Subkey (→ SB metadata-jsonb, da nicht in _PROFILE_KNOWN_COLS) und
+# als Top-Level-Disk-Key (Backwards-compat für alte Reader).
+
+def _profile_sidekey_get(token, key, default=None):
+    """Liest einen Side-Key SB-first (profile-Subkey via metadata-jsonb),
+    Legacy-Top-Level-Disk-Key als Fallback."""
+    try:
+        full = _profile_load(token) or {}
+        prof = full.get('profile') or {}
+        if prof.get(key) is not None:
+            return prof.get(key)
+        if full.get(key) is not None:
+            return full.get(key)
+    except Exception:
+        pass
+    return default
+
+
+def _profile_sidekey_set(token, key, value, remove=False):
+    """Schreibt (oder entfernt, remove=True) einen Side-Key in SB + Disk.
+    Basis-Profil kommt aus _profile_load (SB-first) — NICHT disk-only, sonst
+    würde der metadata-Upsert auf einer frischen Instanz bestehende
+    metadata-Keys (z.B. subscription) wegwischen."""
+    full = _profile_load(token) or {}
+    profile = dict(full.get('profile') or {})
+    if remove:
+        profile.pop(key, None)
+    else:
+        profile[key] = value
+    disk_full = dict(_profile_load_from_disk(token) or {})
+    disk_full['token'] = token
+    disk_full['profile'] = profile
+    if remove:
+        disk_full.pop(key, None)
+    else:
+        disk_full[key] = value
+    disk_full['_updated_at'] = datetime.now().isoformat()
+    return _profile_save(token, profile, full_disk_payload=disk_full)
 
 
 # PUBLIC-Profile-Whitelist (BUG-AUDIT 2026-06-07, PII-LEAK-FIX):
@@ -9964,7 +10011,10 @@ def get_crew_at_destination(token):
             'lng': p.get('lng'),
             'date': str(p.get('pin_date')) if p.get('pin_date') else None,
             'note': p.get('note'),
-            'owner_token': owner,
+            # Token-Leak-Fix: owner_token ist das Bearer-Credential — NUR für
+            # eigene Pins + mutual Friends (DM-Flow). Öffentliche Meetup-Pins
+            # von Fremden liefern nur owner_match_id (opak) + owner_name.
+            'owner_token': owner if (mine or owner in friend_set) else None,
             'owner_name': 'Du' if mine else (oprof.get('name') or (owner[:8] + '…')),
             'owner_match_id': _hashlib.sha256(owner.encode()).hexdigest()[:16],
             'mine': mine,
@@ -12875,6 +12925,10 @@ def get_chat_messages(token, channel_id):
     for m in msgs[-100:]:
         mm = dict(m)
         mm['is_mine'] = (m.get('author_token') == my_trunc)
+        # Token-Leak-Fix: alte Photo-Messages tragen Legacy-Bild-URLs (mit
+        # vollem Token) im Text → auf den opaken Key umschreiben.
+        if mm.get('text'):
+            mm['text'] = _wall_img_sanitize_urls(mm['text'])
         out.append(mm)
     return jsonify({'channel': channel_id, 'messages': out})
 
@@ -13612,6 +13666,53 @@ def _detect_image_type(data: bytes):
     return (None, None)
 
 
+# ── Wall-Image Token-Leak-Fix (2026-06-10) ──────────────────────────────────
+# Vorher lag das volle AT-Token (= Bearer-Credential!) als Verzeichnis-Segment
+# in der ÖFFENTLICHEN Bild-URL (/api/wall/image/<token>/<fname>) → Deanonymi-
+# sierung anonymer Posts + Account-Takeover für jeden Feed-Leser. Jetzt: opaker,
+# deterministisch abgeleiteter Key. Legacy-URLs in alten Posts/Kommentaren/
+# Chat-Nachrichten bleiben serve-bar (Key→Dir-Mapping), werden aber in allen
+# Responses auf den opaken Key umgeschrieben.
+
+_WALL_IMG_LEGACY_URL_RE = re.compile(r'/api/wall/image/(AT-[A-Za-z0-9_-]{1,64})/')
+_WALL_IMG_KEY_DIRS = {}  # opaque key → Legacy-Token-Verzeichnisname (lazy Cache)
+
+
+def _wall_img_key(token):
+    """Opaker Verzeichnis-Key, deterministisch aus dem Token abgeleitet —
+    das Token selbst darf NIE in öffentlichen URLs auftauchen."""
+    return _hashlib.sha256(('wall-img:' + (token or '')).encode()).hexdigest()[:32]
+
+
+def _wall_img_legacy_dir(key):
+    """Mappt einen opaken Key zurück auf das Legacy-Token-Verzeichnis
+    (alte Uploads liegen noch unter wall_images/<token>/)."""
+    d = _WALL_IMG_KEY_DIRS.get(key)
+    if d:
+        return d
+    base = os.path.join(_USER_HISTORY_DIR, 'wall_images')
+    try:
+        for name in os.listdir(base):
+            if name.startswith('AT-') and os.path.isdir(os.path.join(base, name)):
+                _WALL_IMG_KEY_DIRS[_wall_img_key(name)] = name
+    except Exception:
+        pass
+    return _WALL_IMG_KEY_DIRS.get(key)
+
+
+def _wall_img_sanitize_urls(text):
+    """Ersetzt Legacy-Token-Segmente in Wall-Image-URLs durch den opaken Key.
+    Arbeitet auf beliebigen Strings (image_url-Felder UND Chat-Texte mit
+    eingebetteten Photo-URLs)."""
+    if not text or '/api/wall/image/AT-' not in text:
+        return text
+    try:
+        return _WALL_IMG_LEGACY_URL_RE.sub(
+            lambda m: f'/api/wall/image/{_wall_img_key(m.group(1))}/', text)
+    except Exception:
+        return text
+
+
 @app.route('/api/wall/<token>/upload-image', methods=['POST'])
 def upload_wall_image(token):
     """Upload Bild für Wall-Post. Returns {url} zum nachträglichen Einbetten in /post."""
@@ -13634,7 +13735,9 @@ def upload_wall_image(token):
     safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
     if not safe:
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
-    img_dir = os.path.join(_USER_HISTORY_DIR, 'wall_images', safe)
+    # Token-Leak-Fix: opaker Key statt Token als öffentliches URL-Segment.
+    dir_key = _wall_img_key(token)
+    img_dir = os.path.join(_USER_HISTORY_DIR, 'wall_images', dir_key)
     os.makedirs(img_dir, exist_ok=True)
     ext = detected_ext  # Extension aus Magic-Byte, nicht aus filename
     fname = f'{uuid.uuid4().hex[:12]}{ext}'
@@ -13643,7 +13746,7 @@ def upload_wall_image(token):
             f.write(data)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
-    return jsonify({'ok': True, 'url': f'/api/wall/image/{safe}/{fname}'})
+    return jsonify({'ok': True, 'url': f'/api/wall/image/{dir_key}/{fname}'})
 
 
 @app.route('/api/wall/image/<token_safe>/<fname>', methods=['GET'])
@@ -13655,6 +13758,12 @@ def serve_wall_image(token_safe, fname):
     if not safe or not safe_t:
         return jsonify({'error': 'invalid'}), 400
     path = os.path.join(_USER_HISTORY_DIR, 'wall_images', safe_t, safe)
+    if not os.path.exists(path):
+        # Token-Leak-Fix: URLs tragen jetzt den opaken Key, ältere Dateien
+        # liegen aber noch unter dem Legacy-Token-Verzeichnis → Mapping.
+        legacy = _wall_img_legacy_dir(safe_t)
+        if legacy:
+            path = os.path.join(_USER_HISTORY_DIR, 'wall_images', legacy, safe)
     if not os.path.exists(path):
         return jsonify({'error': 'not_found'}), 404
     from flask import send_file
@@ -13807,6 +13916,10 @@ def get_wall_feed(token):
                 p.pop(k, None)
         # Strip author_token for privacy in feed (NACH allen Flags).
         p.pop('author_token', None)
+        # Token-Leak-Fix: Legacy-Bild-URLs tragen das volle Token im Pfad —
+        # für ALLE Posts (nicht nur anonyme) auf den opaken Key umschreiben.
+        if p.get('image_url'):
+            p['image_url'] = _wall_img_sanitize_urls(p['image_url'])
     return jsonify({'count': len(feed), 'posts': feed})
 
 
@@ -13984,6 +14097,9 @@ def get_comments(token, post_id):
             c.pop('author_name', None)
             c.pop('author_short', None)
         c.pop('author_token', None)
+        # Token-Leak-Fix: Legacy-Bild-URLs auf opaken Key umschreiben.
+        if c.get('image_url'):
+            c['image_url'] = _wall_img_sanitize_urls(c['image_url'])
     return jsonify({'post_id': post_id, 'comments': comments})
 
 
@@ -14037,6 +14153,11 @@ def delete_wall_post(token, post_id):
                 safe_f = _re.sub(r'[^A-Za-z0-9_.-]', '', parts[4] or '')
                 if safe_t and safe_f:
                     img_path = os.path.join(_USER_HISTORY_DIR, 'wall_images', safe_t, safe_f)
+                    if not os.path.exists(img_path):
+                        # Token-Leak-Fix: opaker Key → Legacy-Token-Verzeichnis
+                        legacy = _wall_img_legacy_dir(safe_t)
+                        if legacy:
+                            img_path = os.path.join(_USER_HISTORY_DIR, 'wall_images', legacy, safe_f)
                     if os.path.exists(img_path):
                         os.remove(img_path)
         except Exception as e:
@@ -17484,11 +17605,13 @@ def auth_delete_account():
                 try: shutil.rmtree(sub_dir); deleted.append(f'{subdir}/{safe_token}/')
                 except Exception: pass
 
-    # 2b. Wall-Images-Verzeichnis pro Token
-    img_dir = os.path.join(_USER_HISTORY_DIR, 'wall_images', safe_token)
-    if os.path.isdir(img_dir):
-        try: shutil.rmtree(img_dir); deleted.append(f'wall_images/{safe_token}/')
-        except Exception: pass
+    # 2b. Wall-Images-Verzeichnis pro Token (Legacy-Token-Dir + opaker Key-Dir
+    # aus dem Token-Leak-Fix — neue Uploads liegen unter dem opaken Key)
+    for _wi in (safe_token, _wall_img_key(token)):
+        img_dir = os.path.join(_USER_HISTORY_DIR, 'wall_images', _wi)
+        if os.path.isdir(img_dir):
+            try: shutil.rmtree(img_dir); deleted.append(f'wall_images/{_wi}/')
+            except Exception: pass
 
     # 2c. DM-Channel-Files in denen dieser Token Teilnehmer ist
     try:
@@ -21407,11 +21530,16 @@ def upload_calendar_events(token):
 
 @app.route('/api/user/subscription/<token>', methods=['GET'])
 def get_subscription(token):
-    p = _user_profile_path(token)
+    # W18-Followup (2026-06-10): GET las nur disk (ephemeral auf Cloud Run),
+    # während der Setter via _profile_save nach Supabase spiegelt → Pro-Tier
+    # fiel nach jedem Redeploy still auf 'free' zurück. Jetzt SB-first via
+    # _profile_load (profile.subscription aus metadata-jsonb), Legacy-Top-
+    # Level-Disk-Key als Fallback.
     try:
-        with open(p) as f:
-            data = (json.load(f) or {}).get('subscription', {})
-            return jsonify(data or {'tier': 'free', 'active': False})
+        full = _profile_load(token) or {}
+        sub = ((full.get('profile') or {}).get('subscription')
+               or full.get('subscription') or {})
+        return jsonify(sub or {'tier': 'free', 'active': False})
     except Exception:
         return jsonify({'tier': 'free', 'active': False})
 
@@ -21451,12 +21579,8 @@ def set_subscription(token):
 
 @app.route('/api/user/sponsored/<token>', methods=['GET'])
 def get_sponsored(token):
-    p = _user_profile_path(token)
-    try:
-        with open(p) as f:
-            return jsonify({'slots': (json.load(f) or {}).get('sponsored_slots', [])})
-    except Exception:
-        return jsonify({'slots': []})
+    # W18-Followup (2026-06-10): SB-first statt disk-only (ephemeral).
+    return jsonify({'slots': _profile_sidekey_get(token, 'sponsored_slots', []) or []})
 
 
 @app.route('/api/user/sponsored/<token>/add', methods=['POST'])
@@ -21465,21 +21589,15 @@ def add_sponsored(token):
     friend_token = (body.get('friend_token') or '').strip()
     if not friend_token:
         return jsonify({'ok': False, 'error': 'missing_friend'}), 400
-    p = _user_profile_path(token)
-    existing = {}
-    try:
-        with open(p) as f: existing = json.load(f) or {}
-    except Exception: pass
-    slots = existing.get('sponsored_slots', [])
+    # W18-Followup: SB-first lesen + via _profile_save schreiben (vorher
+    # disk-only → Slots nach Cloud-Run-Redeploy weg).
+    slots = list(_profile_sidekey_get(token, 'sponsored_slots', []) or [])
     if len(slots) >= 4:
         return jsonify({'ok': False, 'error': 'limit_reached'}), 400
     if friend_token in slots:
         return jsonify({'ok': True, 'already': True})
     slots.append(friend_token)
-    existing['sponsored_slots'] = slots
-    try:
-        with open(p, 'w') as f: json.dump(existing, f)
-    except Exception: pass
+    _profile_sidekey_set(token, 'sponsored_slots', slots)
     return jsonify({'ok': True, 'slots': slots})
 
 
@@ -21487,28 +21605,19 @@ def add_sponsored(token):
 def remove_sponsored(token):
     body = request.get_json(silent=True) or {}
     friend_token = (body.get('friend_token') or '').strip()
-    p = _user_profile_path(token)
-    existing = {}
-    try:
-        with open(p) as f: existing = json.load(f) or {}
-    except Exception: pass
-    existing['sponsored_slots'] = [s for s in (existing.get('sponsored_slots') or []) if s != friend_token]
-    try:
-        with open(p, 'w') as f: json.dump(existing, f)
-    except Exception: pass
-    return jsonify({'ok': True, 'slots': existing['sponsored_slots']})
+    # W18-Followup: SB-first lesen + via _profile_save schreiben.
+    slots = [s for s in (_profile_sidekey_get(token, 'sponsored_slots', []) or [])
+             if s != friend_token]
+    _profile_sidekey_set(token, 'sponsored_slots', slots)
+    return jsonify({'ok': True, 'slots': slots})
 
 
 # ── Marker-Mapping (Assign Event Codes manuell) ──────────────────────
 
 @app.route('/api/user/marker-mapping/<token>', methods=['GET'])
 def get_marker_mapping(token):
-    p = _user_profile_path(token)
-    try:
-        with open(p) as f:
-            return jsonify({'mapping': (json.load(f) or {}).get('marker_mapping', {})})
-    except Exception:
-        return jsonify({'mapping': {}})
+    # W18-Followup (2026-06-10): SB-first statt disk-only (ephemeral).
+    return jsonify({'mapping': _profile_sidekey_get(token, 'marker_mapping', {}) or {}})
 
 
 @app.route('/api/user/marker-mapping/<token>/set', methods=['POST'])
@@ -21518,17 +21627,11 @@ def set_marker_mapping(token):
     klass = (body.get('klass') or '').strip()
     if not code or klass not in ('Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby', 'Frei', 'Urlaub', 'Krank', 'Ignore'):
         return jsonify({'ok': False, 'error': 'invalid'}), 400
-    p = _user_profile_path(token)
-    existing = {}
-    try:
-        with open(p) as f: existing = json.load(f) or {}
-    except Exception: pass
-    mp = existing.get('marker_mapping', {})
+    # W18-Followup: SB-first lesen + via _profile_save schreiben (vorher
+    # disk-only → Mappings nach Cloud-Run-Redeploy weg).
+    mp = dict(_profile_sidekey_get(token, 'marker_mapping', {}) or {})
     mp[code] = klass
-    existing['marker_mapping'] = mp
-    try:
-        with open(p, 'w') as f: json.dump(existing, f)
-    except Exception: pass
+    _profile_sidekey_set(token, 'marker_mapping', mp)
     return jsonify({'ok': True, 'mapping': mp})
 
 
@@ -21558,31 +21661,20 @@ def lufthansa_save_credentials(token):
         blob = encrypt_credentials(email, pw)
     except Exception as e:
         return jsonify({'ok': False, 'error': 'encrypt_failed', 'detail': str(e)[:200]}), 500
-    p = _user_profile_path(token)
-    existing = {}
-    try:
-        with open(p) as f: existing = json.load(f) or {}
-    except Exception: pass
-    existing['lufthansa_credentials'] = blob
-    try:
-        with open(p, 'w') as f: json.dump(existing, f)
-    except Exception:
+    # W18-Followup (2026-06-10): via _profile_save nach SB spiegeln (vorher
+    # disk-only → gespeicherte Credentials nach Cloud-Run-Redeploy weg).
+    # Blob ist verschlüsselt (encrypt_credentials), kein Klartext in SB.
+    if not _profile_sidekey_set(token, 'lufthansa_credentials', blob):
         return jsonify({'ok': False, 'error': 'persist_failed'}), 500
     return jsonify({'ok': True, 'saved_at': blob.get('created_at')})
 
 
 @app.route('/api/lufthansa/credentials/<token>', methods=['DELETE'])
 def lufthansa_delete_credentials(token):
-    p = _user_profile_path(token)
-    try:
-        with open(p) as f: existing = json.load(f) or {}
-    except Exception:
-        return jsonify({'ok': True, 'already_gone': True})
-    existing.pop('lufthansa_credentials', None)
-    existing.pop('lufthansa_last_sync', None)
-    try:
-        with open(p, 'w') as f: json.dump(existing, f)
-    except Exception:
+    # W18-Followup: Keys auch aus SB-metadata entfernen, nicht nur von Disk.
+    ok1 = _profile_sidekey_set(token, 'lufthansa_credentials', None, remove=True)
+    ok2 = _profile_sidekey_set(token, 'lufthansa_last_sync', None, remove=True)
+    if not (ok1 and ok2):
         return jsonify({'ok': False, 'error': 'persist_failed'}), 500
     return jsonify({'ok': True})
 
@@ -21596,12 +21688,9 @@ def lufthansa_sync(token):
         from lufthansa_crewlink import decrypt_credentials, scrape_roster
     except Exception as e:
         return jsonify({'ok': False, 'error': 'module_unavailable', 'detail': str(e)[:200]}), 500
-    p = _user_profile_path(token)
-    try:
-        with open(p) as f: prof = json.load(f) or {}
-    except Exception:
-        return jsonify({'ok': False, 'error': 'no_profile'}), 404
-    blob = prof.get('lufthansa_credentials')
+    # W18-Followup (2026-06-10): Credentials SB-first lesen (vorher disk-only
+    # → nach Cloud-Run-Redeploy "no_credentials_saved" trotz Speicherung).
+    blob = _profile_sidekey_get(token, 'lufthansa_credentials')
     if not blob:
         return jsonify({'ok': False, 'error': 'no_credentials_saved'}), 404
     creds = decrypt_credentials(blob)
@@ -21609,19 +21698,22 @@ def lufthansa_sync(token):
         return jsonify({'ok': False, 'error': 'decrypt_failed_master_key_changed'}), 500
     res = scrape_roster(creds['email'], creds['password'])
 
-    # Status persistieren (Credentials NICHT mit returnen!)
-    prof['lufthansa_last_sync'] = {
+    # Status persistieren (Credentials NICHT mit returnen!) — last_sync via
+    # SB-Spiegel; Events NUR auf Disk (bis 300 Stück → metadata-jsonb-Bloat).
+    _profile_sidekey_set(token, 'lufthansa_last_sync', {
         'at': res.fetched_at,
         'ok': res.ok,
         'event_count': res.raw_count,
         'error': res.error,
         'error_code': res.error_code,
-    }
+    })
     if res.ok and res.events:
-        prof['lufthansa_events'] = res.events[:300]
-    try:
-        with open(p, 'w') as f: json.dump(prof, f)
-    except Exception: pass
+        p = _user_profile_path(token)
+        try:
+            existing = _profile_load_from_disk(token) or {}
+            existing['lufthansa_events'] = res.events[:300]
+            with open(p, 'w') as f: json.dump(existing, f)
+        except Exception: pass
 
     return jsonify({
         'ok': res.ok,
@@ -21647,22 +21739,20 @@ def lufthansa_sync_with_cookies(token):
     if not cookies or not isinstance(cookies, dict):
         return jsonify({'ok': False, 'error': 'no_cookies'}), 400
     res = scrape_roster_with_cookies(cookies)
-    # Persist last-sync status (NICHT die Cookies)
-    p = _user_profile_path(token)
-    prof = {}
-    try:
-        with open(p) as f: prof = json.load(f) or {}
-    except Exception: pass
-    prof['lufthansa_last_sync'] = {
+    # Persist last-sync status (NICHT die Cookies) — W18-Followup: last_sync
+    # via SB-Spiegel; Events NUR auf Disk (metadata-jsonb-Bloat vermeiden).
+    _profile_sidekey_set(token, 'lufthansa_last_sync', {
         'at': res.fetched_at, 'ok': res.ok, 'event_count': res.raw_count,
         'error': res.error, 'error_code': res.error_code,
         'method': 'webview_cookies',
-    }
+    })
     if res.ok and res.events:
-        prof['lufthansa_events'] = res.events[:300]
-    try:
-        with open(p, 'w') as f: json.dump(prof, f)
-    except Exception: pass
+        p = _user_profile_path(token)
+        try:
+            existing = _profile_load_from_disk(token) or {}
+            existing['lufthansa_events'] = res.events[:300]
+            with open(p, 'w') as f: json.dump(existing, f)
+        except Exception: pass
     return jsonify({
         'ok': res.ok, 'event_count': res.raw_count,
         'error': res.error, 'error_code': res.error_code,
@@ -21671,13 +21761,10 @@ def lufthansa_sync_with_cookies(token):
 
 @app.route('/api/lufthansa/status/<token>', methods=['GET'])
 def lufthansa_status(token):
-    p = _user_profile_path(token)
-    try:
-        with open(p) as f: prof = json.load(f) or {}
-    except Exception:
-        return jsonify({'configured': False})
-    has_creds = bool(prof.get('lufthansa_credentials'))
-    last_sync = prof.get('lufthansa_last_sync') or {}
+    # W18-Followup (2026-06-10): SB-first statt disk-only — vorher meldete der
+    # Status nach jedem Redeploy configured:false trotz gespeicherter Credentials.
+    has_creds = bool(_profile_sidekey_get(token, 'lufthansa_credentials'))
+    last_sync = _profile_sidekey_get(token, 'lufthansa_last_sync') or {}
     return jsonify({
         'configured': has_creds,
         'last_sync_at': last_sync.get('at'),
