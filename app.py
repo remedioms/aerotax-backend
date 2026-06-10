@@ -21720,6 +21720,37 @@ def import_calendar_feed(token):
         # Cap auf 200 Events (Performance) — entspricht ~6 Monate LH-Crew-Plan.
         briefings, imported_briefings = _ics_events_to_briefings(
             events[:200], existing=existing)
+        # RECONCILE (2026-06-11): Lücken-Tage INNERHALB des aktuellen Feed-Fensters,
+        # die im neuen Feed NICHT mehr vorkommen, von veralteten ical_*-Daten
+        # säubern. Sonst überlebt z.B. ein früher importierter „Office Day" als
+        # Geister-Bürotag, obwohl der echte Roster den Tag längst als frei führt
+        # (User: „Kalender meldet Büro-Tage obwohl keine da sind"). Tage AUSSERHALB
+        # des Fensters bleiben unangetastet (kumulative Historie).
+        try:
+            feed_dates = set()
+            for ev in events[:200]:
+                ds = ev.get('_multiday_dates') or ([ev.get('start')] if ev.get('start') else [])
+                for d in ds:
+                    if isinstance(d, str) and re.match(r'^\d{4}-\d{2}-\d{2}$', d.strip()):
+                        feed_dates.add(d.strip())
+            if feed_dates:
+                fmin, fmax = min(feed_dates), max(feed_dates)
+                ical_keys = ('ical_summary', 'ical_location', 'ical_start_iso',
+                             'ical_end_iso', 'ical_klass', 'ical_imported_at',
+                             'block_minutes')
+                for dkey in list(briefings.keys()):
+                    if fmin <= dkey <= fmax and dkey not in feed_dates:
+                        b = briefings.get(dkey) or {}
+                        if any(b.get(k) for k in ('ical_summary', 'ical_location',
+                                                  'ical_start_iso', 'ical_end_iso')):
+                            for k in ical_keys:
+                                b.pop(k, None)
+                            if b:
+                                briefings[dkey] = b
+                            else:
+                                briefings.pop(dkey, None)
+        except Exception as _re:
+            app.logger.warning(f'[ical-reconcile] {str(_re)[:150]}')
         _ical_briefings_save(token, briefings)
     except Exception as e:
         app.logger.warning(f'[ical-briefings] import-persist-fail: {str(e)[:200]}')
