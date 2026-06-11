@@ -13998,8 +13998,25 @@ def get_wall_feed(token):
     standardmäßig alle public-Posts (außer blocked/muted), mit Friends als
     Sortier-Boost via has_friend-Flag im Response.
     """
-    limit = min(int(request.args.get('limit') or 30), 100)
-    before_ts = float(request.args.get('before_ts') or 0)
+    # BUG-FIX (#25, 2026-06-09): "Feed-Scroll meldet 'nicht erreichbar'".
+    # Der Load-More-Pfad ist der EINZIGE, der `before_ts` schickt — ein
+    # ValueError beim Parsen (iOS-Double in Scientific-Notation, NaN/Inf,
+    # leerer Param nach `&before_ts=`) wurde zu einem 500, das iOS als
+    # "nicht erreichbar" zeigt. Parsen daher defensiv: ungültige Cursor/Limits
+    # fallen auf den Default zurück statt die ganze Seite zu killen.
+    try:
+        limit = min(int(float(request.args.get('limit') or 30)), 100)
+    except (TypeError, ValueError):
+        limit = 30
+    if limit < 1:
+        limit = 30
+    try:
+        before_ts = float(request.args.get('before_ts') or 0)
+        # NaN/Inf würden den `< before_ts`-Filter unbrauchbar machen.
+        if before_ts != before_ts or before_ts in (float('inf'), float('-inf')):
+            before_ts = 0
+    except (TypeError, ValueError):
+        before_ts = 0
     mode = (request.args.get('mode') or 'all').lower()
     friends = set((_friends_load(token).get('friends') or []))
     friends.add(token)
@@ -14027,8 +14044,11 @@ def get_wall_feed(token):
     liked_ids = _wall_likes_load(token) or set()
     disliked_ids = _wall_dislikes_load(token) or set()
     for p in feed:
-        p['liked_by_me'] = p['id'] in liked_ids
-        p['disliked_by_me'] = p['id'] in disliked_ids
+        # `id` defensiv lesen — ein Post ohne id (Legacy/teil-migrierte SB-Row)
+        # würde sonst per KeyError die ganze Feed-Seite mit 500 killen (#25).
+        pid = p.get('id')
+        p['liked_by_me'] = pid in liked_ids
+        p['disliked_by_me'] = pid in disliked_ids
         p.setdefault('dislike_count', 0)
         # is_mine: Owner-Flag damit iOS-Client einen "Löschen"-Button
         # auf eigene Posts zeigen kann (DSGVO Art. 17 sub-right).
@@ -19482,6 +19502,38 @@ def airport_board(token):
         limit = 60
     # ICAO → IATA normalisieren (FRA/EDDF gesondert).
     iata = _DE_ICAO_TO_IATA.get(airport, airport)
+    # FRA/EDDF normalisiert auf das IATA-Label, das wir persistieren ('FRA') —
+    # damit ein Historien-Read denselben airport-Key trifft wie der Live-Poller.
+    board_ap = 'FRA' if (iata in ('FRA', 'EDDF') or airport in ('FRA', 'EDDF')) else iata
+    # ── PAST-DATE-Tafel (iOS „zurück in der Zeit", #24) ─────────────────────
+    # ?date=YYYY-MM-DD für einen VERGANGENEN Tag → die gespeicherten Abflüge
+    # dieses Airport+Tags aus airport_delay_obs rekonstruieren. Der Live-Feed ist
+    # now-relativ und kennt vergangene Tage nicht; die SB-Tabelle hält sie pro
+    # Airport. Heute/Zukunft fallen NICHT in diesen Pfad (Live-Tafel unten).
+    date_param = (request.args.get('date') or '').strip()
+    if date_param:
+        import re as _re
+        if not _re.match(r'^\d{4}-\d{2}-\d{2}$', date_param):
+            return jsonify({'ok': False, 'error': 'invalid_date',
+                            'airport': board_ap, 'type': ftype,
+                            'message': 'date muss YYYY-MM-DD sein.'}), 400
+        try:
+            today_str = _fra_local_now().strftime('%Y-%m-%d')
+        except Exception:
+            today_str = ''
+        if date_param != today_str:
+            # Nur Departures werden persistiert — Ankunfts-Historie gibt es nicht.
+            if ftype != 'departure':
+                return jsonify({'ok': True, 'airport': board_ap, 'type': ftype,
+                                'date': date_param, 'count': 0, 'flights': [],
+                                'departed_today': [], 'source': 'airport_delay_obs',
+                                'message': ('Für vergangene Tage ist nur die '
+                                            'Abflug-Tafel archiviert.')})
+            hist = _board_rows_from_obs_for_date(date_param, board_ap, airline or None)
+            return jsonify({'ok': True, 'airport': board_ap, 'type': ftype,
+                            'date': date_param, 'count': len(hist[:limit]),
+                            'flights': hist[:limit], 'departed_today': [],
+                            'source': 'airport_delay_obs'})
     src = None
     flights = None
     if iata in ('FRA', 'EDDF') or airport in ('FRA', 'EDDF'):
@@ -20321,6 +20373,47 @@ def _delay_obs_rows_for_date(date_str, airport='FRA'):
             f'[delay-obs] sb_date_read_FAIL date={date_str} airport={airport} '
             f'{type(e).__name__}: {str(e)[:160]}')
         return []
+    return out
+
+
+def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None):
+    """Tafel-Zeilen eines BELIEBIGEN (auch vergangenen) Betriebstags aus den
+    persistierten Beobachtungen (airport_delay_obs) rekonstruieren — für die
+    iOS-Tafel „zurück in der Zeit" (#24: Tafeln pro Airport speichern → Historie).
+
+    Gleiche sparse-Zeilenform wie `_departed_rows_from_store` (Flugnummer,
+    Soll-Zeit, Verspätung/Status — KEIN Gate/Ziel, das hält die Tabelle nicht).
+    Quelle ist airport-gekeyt, also liefert auch ein Nicht-FRA-Flughafen seine
+    eigenen gespeicherten Abflüge. Leere Liste bei SB-down/leer → Caller degradiert
+    ehrlich. NUR Departures (Ankünfte werden nicht in airport_delay_obs gehalten)."""
+    rows = _delay_obs_rows_for_date(date_str, airport)
+    airline = (airline or '').upper().strip()
+    out = []
+    for row in rows:
+        fn = row.get('flight') or ''
+        sc = row.get('sched') or ''
+        # sched ist als 'HH:MM' persistiert; nur valide Slots übernehmen.
+        if not fn or not isinstance(sc, str) or len(sc) != 5:
+            continue
+        try:
+            al, _num = _split_flightno(fn)
+        except Exception:
+            al = (fn[:2] if fn else '')
+        if airline and (al or '').upper() != airline:
+            continue
+        cancelled = bool(row.get('cancelled'))
+        md = int(row.get('max_delay_min') or 0)
+        out.append({
+            'airline': al, 'airline_name': '', 'flight': fn,
+            'dest_iata': '', 'dest_name': '',
+            'sched': date_str + 'T' + sc + ':00', 'esti': None,
+            'delay_min': md,
+            'delayed': md >= _PUNCTUALITY_DELAY_THRESHOLD_MIN,
+            'cancelled': cancelled, 'gate': '', 'terminal': '', 'hall': '',
+            'status': ('Annulliert' if cancelled else 'Abgeflogen'),
+            'reg': '', 'aircraft': '', 'departed': True,
+        })
+    out.sort(key=lambda f: f.get('sched') or '')
     return out
 
 
