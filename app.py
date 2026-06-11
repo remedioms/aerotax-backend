@@ -21743,6 +21743,13 @@ def import_calendar_feed(token):
                     if isinstance(d, str) and re.match(r'^\d{4}-\d{2}-\d{2}$', d.strip()):
                         feed_dates.add(d.strip())
             _reconcile_dbg['feed_dates'] = len(feed_dates)
+            _reconcile_dbg['probe'] = {
+                'fd_20': '2026-06-20' in feed_dates,
+                'fd_21': '2026-06-21' in feed_dates,
+                'ical_20': bool((briefings.get('2026-06-20') or {}).get('ical_summary')),
+                'man_20': bool((_manual_briefings_load(token) or {}).get('2026-06-20', {}).get('ical_summary')),
+            }
+            removed_dates = set()
             if feed_dates:
                 fmin, fmax = min(feed_dates), max(feed_dates)
                 _reconcile_dbg['window'] = f'{fmin}..{fmax}'
@@ -21757,6 +21764,7 @@ def import_calendar_feed(token):
                             for k in ical_keys:
                                 b.pop(k, None)
                             _reconcile_dbg['cleared'] += 1
+                            removed_dates.add(dkey)
                             if b:
                                 briefings[dkey] = b
                             else:
@@ -21778,6 +21786,7 @@ def import_calendar_feed(token):
                                 for k in ical_keys:
                                     mb.pop(k, None)
                                 _reconcile_dbg['cleared'] += 1
+                                removed_dates.add(dkey)
                                 m_changed = True
                                 if mb:
                                     manual[dkey] = mb
@@ -21787,6 +21796,18 @@ def import_calendar_feed(token):
                         _manual_briefings_save(token, manual)
                 except Exception as _me:
                     _reconcile_dbg['manual_error'] = str(_me)[:100]
+                # KERN-FIX (2026-06-11): Upsert löscht entfernte Tage NICHT aus
+                # Supabase → der veraltete „Office Day" lebte in der SB-Tabelle
+                # weiter und wurde beim nächsten Load zurückgelesen. Hier die
+                # geräumten Lücken-Tage EXPLIZIT aus beiden SB-Tabellen löschen.
+                if removed_dates and SB_AVAILABLE:
+                    try:
+                        dl = sorted(removed_dates)
+                        for tbl in ('user_ical_briefings', 'user_manual_briefings'):
+                            sb.table(tbl).delete().eq('token', token).in_('datum', dl).execute()
+                        _reconcile_dbg['sb_deleted'] = len(dl)
+                    except Exception as _de:
+                        _reconcile_dbg['sb_delete_error'] = str(_de)[:100]
         except Exception as _re:
             _reconcile_dbg['error'] = str(_re)[:120]
             app.logger.warning(f'[ical-reconcile] {str(_re)[:150]}')
