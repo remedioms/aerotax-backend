@@ -21715,6 +21715,7 @@ def import_calendar_feed(token):
     # die Helper. SB primary + Disk best-effort, sonst Wipe-pro-Redeploy.
     imported_briefings = 0
     briefings = {}
+    _reconcile_dbg = {'feed_dates': 0, 'cleared': 0, 'window': None}
     try:
         existing = dict(_ical_briefings_load(token) or {})
         # Cap auf 200 Events (Performance) — entspricht ~6 Monate LH-Crew-Plan.
@@ -21729,12 +21730,22 @@ def import_calendar_feed(token):
         try:
             feed_dates = set()
             for ev in events[:200]:
+                # Leere Events (kein Summary/Location/Start) schreiben NICHTS in die
+                # Briefing-Map → sie „decken" einen Tag NICHT ab. Sonst markiert ein
+                # leeres Multi-Day-Event (Feed-Lücke) den Tag fälschlich als belegt,
+                # und ein veralteter „Office Day" wird nie geräumt.
+                if not (ev.get('summary') or '').strip() \
+                   and not (ev.get('location') or '').strip() \
+                   and not (ev.get('start_iso') or '').strip():
+                    continue
                 ds = ev.get('_multiday_dates') or ([ev.get('start')] if ev.get('start') else [])
                 for d in ds:
                     if isinstance(d, str) and re.match(r'^\d{4}-\d{2}-\d{2}$', d.strip()):
                         feed_dates.add(d.strip())
+            _reconcile_dbg['feed_dates'] = len(feed_dates)
             if feed_dates:
                 fmin, fmax = min(feed_dates), max(feed_dates)
+                _reconcile_dbg['window'] = f'{fmin}..{fmax}'
                 ical_keys = ('ical_summary', 'ical_location', 'ical_start_iso',
                              'ical_end_iso', 'ical_klass', 'ical_imported_at',
                              'block_minutes')
@@ -21745,11 +21756,13 @@ def import_calendar_feed(token):
                                                   'ical_start_iso', 'ical_end_iso')):
                             for k in ical_keys:
                                 b.pop(k, None)
+                            _reconcile_dbg['cleared'] += 1
                             if b:
                                 briefings[dkey] = b
                             else:
                                 briefings.pop(dkey, None)
         except Exception as _re:
+            _reconcile_dbg['error'] = str(_re)[:120]
             app.logger.warning(f'[ical-reconcile] {str(_re)[:150]}')
         _ical_briefings_save(token, briefings)
     except Exception as e:
@@ -21773,7 +21786,8 @@ def import_calendar_feed(token):
                     'briefings_imported': imported_briefings,
                     'total_briefings': total_briefings,
                     'oldest_date': oldest_date,
-                    'newest_date': newest_date})
+                    'newest_date': newest_date,
+                    'reconcile': _reconcile_dbg})
 
 
 @app.route('/api/user/calendar-events/<token>/upload', methods=['POST'])
