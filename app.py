@@ -21761,6 +21761,32 @@ def import_calendar_feed(token):
                                 briefings[dkey] = b
                             else:
                                 briefings.pop(dkey, None)
+                # ZWEITE Quelle: der Briefing-GET merged auch die MANUELLE Briefing-
+                # Map (user_manual_briefings). Ein früherer Import (z.B. ein zweiter,
+                # veralteter Feed) hat dort ical_*-Felder (z.B. „Office Day") hinter-
+                # lassen, die mein iCal-Reconcile nicht erreicht → Geister-Bürotag
+                # blieb. Hier dieselben Lücken-Tage auch dort von ical_*-Resten
+                # säubern (User-Notizen wie personal_note bleiben erhalten).
+                try:
+                    manual = dict(_manual_briefings_load(token) or {})
+                    m_changed = False
+                    for dkey in list(manual.keys()):
+                        if fmin <= dkey <= fmax and dkey not in feed_dates:
+                            mb = manual.get(dkey) or {}
+                            if any(mb.get(k) for k in ('ical_summary', 'ical_location',
+                                                       'ical_start_iso', 'ical_end_iso')):
+                                for k in ical_keys:
+                                    mb.pop(k, None)
+                                _reconcile_dbg['cleared'] += 1
+                                m_changed = True
+                                if mb:
+                                    manual[dkey] = mb
+                                else:
+                                    manual.pop(dkey, None)
+                    if m_changed:
+                        _manual_briefings_save(token, manual)
+                except Exception as _me:
+                    _reconcile_dbg['manual_error'] = str(_me)[:100]
         except Exception as _re:
             _reconcile_dbg['error'] = str(_re)[:120]
             app.logger.warning(f'[ical-reconcile] {str(_re)[:150]}')
