@@ -10044,6 +10044,75 @@ def set_layover_visibility(token):
     return jsonify({'ok': ok, 'enabled': enabled})
 
 
+@app.route('/api/leaderboard/<iata>/<token>', methods=['GET'])
+def get_destination_leaderboard(iata, token):
+    """Crew-Competition: Wer fliegt am häufigsten nach <iata>? Rankt alle Crew,
+    die ihren Plan teilen (share_roster != False), nach Anzahl Dienst-Tage mit
+    diesem Ziel im Routing/Location. Liefert Top-20 + den eigenen Rang.
+
+    { ok, iata, total_crew, ranking:[{rank, name, count, mine}], my_rank, my_count }
+    Privacy: nur opt-in-Crew (share_roster); Namen aus user_profiles, kein Token.
+    """
+    iata = (iata or '').upper().strip()[:3]
+    if not SB_AVAILABLE or len(iata) != 3:
+        return jsonify({'ok': False, 'iata': iata, 'ranking': [],
+                        'my_rank': None, 'my_count': 0, 'total_crew': 0})
+    from collections import defaultdict
+    counts = defaultdict(int)
+    try:
+        # EIN Query über alle Briefings, die das IATA in Location/Summary tragen.
+        pat = f'%{iata}%'
+        for col in ('ical_location', 'ical_summary'):
+            try:
+                r = (sb.table('user_ical_briefings')
+                     .select('token,datum').ilike(col, pat).limit(20000).execute())
+                seen = set()
+                for row in (r.data or []):
+                    tk = row.get('token'); dt = row.get('datum')
+                    if not tk or not dt:
+                        continue
+                    key = (tk, dt)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    counts[tk] += 1
+            except Exception:
+                continue
+    except Exception as e:
+        app.logger.warning(f'[leaderboard] query-fail: {str(e)[:150]}')
+        return jsonify({'ok': False, 'iata': iata, 'ranking': [],
+                        'my_rank': None, 'my_count': 0, 'total_crew': 0})
+
+    # Pro Token EINMAL gezählt (datum-dedupe oben). Namen + opt-in joinen.
+    ranked = []
+    for tk, cnt in counts.items():
+        prof = (_profile_load(tk) or {}).get('profile', {}) or {}
+        if prof.get('share_roster') is False:
+            continue
+        ranked.append({
+            'token': tk,
+            'name': (prof.get('name') or 'Crew').strip() or 'Crew',
+            'count': cnt,
+            'mine': tk == token,
+        })
+    ranked.sort(key=lambda x: (-x['count'], x['name'].lower()))
+
+    my_rank = None
+    my_count = 0
+    out = []
+    for i, e in enumerate(ranked):
+        rank = i + 1
+        if e['mine']:
+            my_rank = rank
+            my_count = e['count']
+        if rank <= 20 or e['mine']:
+            out.append({'rank': rank, 'name': e['name'],
+                        'count': e['count'], 'mine': e['mine']})
+    # eigenen Eintrag anhängen wenn außerhalb Top-20 (damit man seinen Rang sieht).
+    return jsonify({'ok': True, 'iata': iata, 'total_crew': len(ranked),
+                    'ranking': out[:21], 'my_rank': my_rank, 'my_count': my_count})
+
+
 @app.route('/api/user/manual-pins/<token>', methods=['GET'])
 def list_manual_pins(token):
     """Eigene Pins (zur Verwaltung/Löschen)."""
