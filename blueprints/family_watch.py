@@ -155,6 +155,35 @@ def _shares_load_from_disk():
         return []
 
 
+# ── Family-Watch-ANFRAGEN (Suche statt Code) ─────────────────────────────────
+# Familie sucht die Crew-Person (searchUsers → token), schickt eine Anfrage; die
+# Crew bestätigt → daraus entsteht der normale family_shares-Grant. Disk-Store
+# (klein, kurzlebig); SB optional. Kein Code mehr nötig.
+def _requests_disk_path():
+    hist = _get_history_dir()
+    os.makedirs(hist, exist_ok=True)
+    return os.path.join(hist, 'family_requests.json')
+
+
+def _requests_load():
+    p = _requests_disk_path()
+    if not os.path.exists(p):
+        return []
+    try:
+        with open(p) as f:
+            return json.load(f) or []
+    except Exception:
+        return []
+
+
+def _requests_save(reqs):
+    try:
+        _atomic_write_json(_requests_disk_path(), reqs, max_items=2000)
+        return True
+    except Exception:
+        return False
+
+
 def _shares_load_from_sb():
     sb_avail, sb = _get_sb()
     if not sb_avail or sb is None:
@@ -677,6 +706,96 @@ def family_share_grant(token):
     if not _shares_save(shares):
         return jsonify({'ok': False, 'error': 'persist_failed'}), 500
     return jsonify({'ok': True, 'fields': fields, 'relation': relation})
+
+
+@family_watch_bp.route('/api/family-request/<family_token>', methods=['POST'])
+def family_request_create(family_token):
+    """Familie schickt einer GESUCHTEN Crew-Person eine Beobachtungs-Anfrage.
+    Body: {crew_token, relation}. Ersetzt den Pair-Code-Flow."""
+    if not _safe_token(family_token):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    body = request.get_json(silent=True) or {}
+    crew_token = (body.get('crew_token') or '').strip()
+    if not crew_token or crew_token == family_token:
+        return jsonify({'ok': False, 'error': 'bad_crew_token'}), 400
+    relation = (body.get('relation') or 'family').strip().lower()
+    if relation not in ALLOWED_RELATIONS:
+        relation = 'family'
+    fam_prof = _load_crew_profile(family_token) or {}
+    reqs = _requests_load()
+    if any(r.get('crew_token') == crew_token and r.get('family_token') == family_token
+           for r in reqs):
+        return jsonify({'ok': True, 'already': True})
+    reqs.append({
+        'crew_token': crew_token, 'family_token': family_token, 'relation': relation,
+        'requester_name': (fam_prof.get('name') or 'Familie'),
+        'created_at': _dt.datetime.now().isoformat(),
+    })
+    _requests_save(reqs)
+    return jsonify({'ok': True})
+
+
+@family_watch_bp.route('/api/family-request/<crew_token>/pending', methods=['GET'])
+def family_request_pending(crew_token):
+    """Crew-Person: offene Familie-Anfragen zum Bestätigen/Ablehnen."""
+    if not _safe_token(crew_token):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    reqs = _requests_load()
+    out = [{
+        'family_token': r['family_token'],
+        'requester_name': r.get('requester_name') or 'Familie',
+        'relation': r.get('relation') or 'family',
+        'created_at': r.get('created_at'),
+    } for r in reqs if r.get('crew_token') == crew_token]
+    return jsonify({'ok': True, 'requests': out})
+
+
+@family_watch_bp.route('/api/family-request/<crew_token>/approve', methods=['POST'])
+def family_request_approve(crew_token):
+    """Crew bestätigt eine Familie-Anfrage → erstellt den family_shares-Grant.
+    Body: {family_token, fields?}. fields default = alle erlaubten."""
+    if not _safe_token(crew_token):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    body = request.get_json(silent=True) or {}
+    family_token = (body.get('family_token') or '').strip()
+    if not family_token:
+        return jsonify({'ok': False, 'error': 'missing_family_token'}), 400
+    reqs = _requests_load()
+    match = next((r for r in reqs
+                  if r.get('crew_token') == crew_token
+                  and r.get('family_token') == family_token), None)
+    if not match:
+        return jsonify({'ok': False, 'error': 'no_request'}), 404
+    raw_fields = body.get('fields') or list(ALLOWED_FIELDS)
+    fields = [f for f in raw_fields if f in ALLOWED_FIELDS] or list(ALLOWED_FIELDS)
+    relation = match.get('relation') or 'family'
+    shares = _shares_load()
+    if not any(s.get('crew_token') == crew_token and s.get('family_token') == family_token
+               for s in shares):
+        shares.append({
+            'crew_token': crew_token, 'family_token': family_token,
+            'relation': relation, 'fields': fields,
+            'created_at': _dt.datetime.now().isoformat(),
+        })
+        _shares_save(shares)
+    _requests_save([r for r in reqs
+                    if not (r.get('crew_token') == crew_token
+                            and r.get('family_token') == family_token)])
+    return jsonify({'ok': True, 'fields': fields})
+
+
+@family_watch_bp.route('/api/family-request/<crew_token>/reject', methods=['POST'])
+def family_request_reject(crew_token):
+    """Crew lehnt eine Familie-Anfrage ab (Anfrage entfernen). Body: {family_token}."""
+    if not _safe_token(crew_token):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    body = request.get_json(silent=True) or {}
+    family_token = (body.get('family_token') or '').strip()
+    reqs = _requests_load()
+    _requests_save([r for r in reqs
+                    if not (r.get('crew_token') == crew_token
+                            and r.get('family_token') == family_token)])
+    return jsonify({'ok': True})
 
 
 @family_watch_bp.route('/api/family-share/<token>/revoke/<family_token>',
