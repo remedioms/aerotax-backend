@@ -21712,6 +21712,10 @@ def _ics_events_to_briefings(events, existing=None):
     """
     briefings = dict(existing or {})
     imported = 0
+    # Block-Minuten dürfen pro Import-Lauf nur EINMAL pro Datum frisch summiert
+    # werden — sonst akkumuliert jeder Re-Sync auf den persistierten Wert (Bug:
+    # 224h/28d). Dieses Set merkt, welche Tage in DIESEM Lauf schon genullt wurden.
+    block_reset_dates = set()
     for ev in events:
         # F2: ein Event kann an mehreren Tagen zählen.
         days = ev.get('_multiday_dates') or []
@@ -21793,7 +21797,19 @@ def _ics_events_to_briefings(events, existing=None):
             # EASA-Block-Minuten: NUR echte Flug-Legs (Gate-to-Gate DTSTART→DTEND),
             # summiert über Same-Day-Merges. Kein Deadhead/Briefing/Layover/
             # Standby. iOS nutzt block_minutes statt der Duty-Spanne als Block.
+            #
+            # ROOT-CAUSE-FIX (2026-06-12 „Block 224h/223% EASA"): block_min wurde
+            # aus dem PERSISTIERTEN Wert weitergezählt (`existing_b.block_minutes
+            # + dur`). Bei jedem erneuten iCal-Sync akkumulierte der Tag erneut →
+            # nach 8 Importen z.B. 8×339=2712 min (=45h Block an EINEM Tag,
+            # physikalisch unmöglich) → 28-Tage-Summe 224h. Fix: block_minutes
+            # pro Import-Lauf EINMAL pro Datum auf 0 zurücksetzen, dann die Legs
+            # dieses Laufs frisch summieren. Re-Import liefert jetzt denselben
+            # korrekten Wert (≈ echte Gate-to-Gate-Summe) statt zu wachsen.
             if i == 0:
+                if date_str not in block_reset_dates:
+                    existing_b['block_minutes'] = 0
+                    block_reset_dates.add(date_str)
                 block_min = int(existing_b.get('block_minutes') or 0)
                 if _ev_is_flight_leg(day_summary) and start_iso and end_iso:
                     dur = _iso_minutes_between(start_iso, end_iso)
