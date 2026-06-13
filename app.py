@@ -651,6 +651,13 @@ _store = {}
 # Quelle: bundesfinanzministerium.de offizielle BMF-Schreiben 2023-2026
 # Auto-generated via /tmp/parse_bmf_v5.py (Spalten: 24h, An-/Abreise+8h)
 from bmf_data import BMF_AUSLAND_BY_YEAR, IATA_TO_BMF
+try:
+    # IANA-Zeitzone pro IATA — für die Flughafen-lokale „jetzt"-Ankerung der
+    # Pünktlichkeits-/Tafel-Persistenz (sonst wird gegen Berlin-Zeit verglichen).
+    from airport_tz import airport_tz as airport_tz
+except Exception:
+    def airport_tz(iata):  # noqa: D401 — Fallback wenn Modul fehlt
+        return None
 
 
 def bmf_lookup(iata, year):
@@ -10059,25 +10066,40 @@ def get_destination_leaderboard(iata, token):
                         'my_rank': None, 'my_count': 0, 'total_crew': 0})
     from collections import defaultdict
     counts = defaultdict(int)
+
+    def _is_outbound_arrival(summary, location, iata):
+        txt = f"{summary or ''} {location or ''}".upper()
+        for grp in re.findall(r'[A-Z]{3}(?:\s*-\s*[A-Z]{3})+', txt):
+            legs = [p.strip() for p in grp.split('-')]
+            if legs and legs[-1] == iata:
+                return True
+        return False
+
     try:
         # EIN Query über alle Briefings, die das IATA in Location/Summary tragen.
+        # Ein Mehrtages-Layover liegt als 1 Row pro Kalendertag vor — wir zählen
+        # NUR die Hinflug-Ankunft (letztes Leg eines Routings == iata), nie
+        # Return-Legs oder Layover-Fortsetzungstage (ical_klass == 'hotel_layover').
         pat = f'%{iata}%'
-        for col in ('ical_location', 'ical_summary'):
-            try:
-                r = (sb.table('user_ical_briefings')
-                     .select('token,datum').ilike(col, pat).limit(20000).execute())
-                seen = set()
-                for row in (r.data or []):
-                    tk = row.get('token'); dt = row.get('datum')
-                    if not tk or not dt:
-                        continue
-                    key = (tk, dt)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    counts[tk] += 1
-            except Exception:
+        r = (sb.table('user_ical_briefings')
+             .select('token,datum,ical_summary,ical_location,ical_klass')
+             .or_(f'ical_location.ilike.{pat},ical_summary.ilike.{pat}')
+             .limit(20000).execute())
+        seen = set()
+        for row in (r.data or []):
+            tk = row.get('token'); dt = row.get('datum')
+            if not tk or not dt:
                 continue
+            if (row.get('ical_klass') or '') == 'hotel_layover':
+                continue
+            if not _is_outbound_arrival(row.get('ical_summary'),
+                                        row.get('ical_location'), iata):
+                continue
+            key = (tk, dt)
+            if key in seen:
+                continue
+            seen.add(key)
+            counts[tk] += 1
     except Exception as e:
         app.logger.warning(f'[leaderboard] query-fail: {str(e)[:150]}')
         return jsonify({'ok': False, 'iata': iata, 'ranking': [],
@@ -10088,6 +10110,9 @@ def get_destination_leaderboard(iata, token):
     for tk, cnt in counts.items():
         prof = (_profile_load(tk) or {}).get('profile', {}) or {}
         if prof.get('share_roster') is False:
+            continue
+        # Eigene Homebase ist kein "Besuch" — raus aus dem Ranking.
+        if (prof.get('homebase') or '').upper().strip() == iata:
             continue
         ranked.append({
             'token': tk,
@@ -19433,6 +19458,37 @@ def _fra_local_now():
         return datetime.now(timezone(timedelta(hours=2))).replace(tzinfo=None)
 
 
+def _airport_local_now(iata):
+    """Aktuelle LOKALZEIT am Flughafen `iata` als naive datetime — gleiche Basis
+    wie die `sched`-Strings, die die Board-Quellen (Fraport/native/AeroDataBox)
+    lokal (ohne verlässlichen Offset) liefern. FRA/None/unbekannt → Europe/Berlin.
+
+    WARUM (BUGFIX 2026-06-13 „Tafel speichert nicht vollständig"): Der
+    `passed`-Check (`_flight_sched_passed`) verglich JEDEN Flughafen gegen die
+    Berlin-Zeit. Für einen Flughafen in einer anderen Zeitzone (z.B. JFK, UTC-4)
+    war „jetzt" so um Stunden verschoben → noch nicht abgeflogene Flüge wurden
+    voreilig als abgeflogen persistiert (Phantom) ODER bereits abgeflogene gar
+    nicht als „passed" erkannt → die Tages-Stichprobe war systematisch falsch/
+    unvollständig. Jetzt ankern wir an der ECHTEN Flughafen-Ortszeit."""
+    from datetime import datetime, timezone, timedelta
+    tzname = None
+    try:
+        ap = (iata or '').upper().strip().split('#', 1)[0]  # '#ARR'-Suffix entfernen
+        ap = _DE_ICAO_TO_IATA.get(ap, ap)
+        if ap and ap not in ('FRA', 'EDDF'):
+            tzname = airport_tz(ap)
+    except Exception:
+        tzname = None
+    if not tzname:
+        return _fra_local_now()
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tzname)).replace(tzinfo=None)
+    except Exception:
+        # Kein zoneinfo/unbekannte TZ → ehrlich auf Berlin zurückfallen.
+        return _fra_local_now()
+
+
 def _parse_local_iso(s):
     """Parst einen Fraport-ISO-String (lokal, evtl. mit Offset) zu naiver
     Lokalzeit. None bei Unparsbar."""
@@ -19514,6 +19570,22 @@ _DE_ICAO_TO_IATA = {
 }
 
 
+def _store_key_for(airport, ftype):
+    """Store-/Persistenz-Schlüssel pro Airport+Richtung. Departures behalten den
+    nackten IATA-Key ('FRA') — abwärtskompatibel mit bereits persistierten Rows.
+    Arrivals bekommen den Suffix '#ARR' ('FRA#ARR'), damit An- und Abflüge sich im
+    selben airport_delay_obs nicht überschreiben (gleiche Flugnummer+Zeit kann in
+    beiden Richtungen vorkommen) und jede Tafel ihre eigene Historie aufbaut."""
+    ap = (airport or 'FRA').upper().strip()
+    return (ap + '#ARR') if ftype == 'arrival' else ap
+
+
+def _store_key_base(airport):
+    """Nackter IATA-Code aus einem Store-Key ('FRA#ARR' → 'FRA') — für TZ-Lookup."""
+    ap = (airport or 'FRA').upper().strip()
+    return ap.split('#', 1)[0]
+
+
 def _departed_rows_from_store(airport):
     """Bereits abgeflogene Flüge des heutigen Betriebstags aus dem Delay-Store
     rekonstruieren — für die „früher heute"-Ansicht der Tafel (User-Wunsch:
@@ -19521,11 +19593,14 @@ def _departed_rows_from_store(airport):
     (airport_delay_obs), die der Poller über den Tag füllt. SPARSE: Flugnummer,
     Soll-Zeit, Verspätung/Status — KEIN Gate/Ziel (im Store nicht gehalten).
     Für FRA der einzige Weg an abgeflogene Flüge (der Live-Feed ist now-relativ)."""
+    ap = (airport or 'FRA').upper()
+    is_arr = ap.endswith('#ARR')
     try:
-        today = _fra_local_now().strftime('%Y-%m-%d')
+        # Betriebstag in der FLUGHAFEN-Ortszeit (nicht stur Berlin) — sonst trifft
+        # der Tages-Read für Nicht-Europa-Flughäfen den falschen Kalendertag.
+        today = _airport_local_now(ap).strftime('%Y-%m-%d')
     except Exception:
         return []
-    ap = (airport or 'FRA').upper()
     try:
         _delay_store_load_from_sb(today, ap)
     except Exception:
@@ -19548,7 +19623,8 @@ def _departed_rows_from_store(airport):
             'delay_min': int(max_delay or 0),
             'delayed': int(max_delay or 0) >= _PUNCTUALITY_DELAY_THRESHOLD_MIN,
             'cancelled': cancelled, 'gate': '', 'terminal': '', 'hall': '',
-            'status': ('Annulliert' if cancelled else 'Abgeflogen'),
+            'status': ('Annulliert' if cancelled
+                       else ('Gelandet' if is_arr else 'Abgeflogen')),
             'reg': '', 'aircraft': '', 'departed': True,
         })
     rows.sort(key=lambda f: f.get('sched') or '')
@@ -19591,14 +19667,11 @@ def airport_board(token):
         except Exception:
             today_str = ''
         if date_param != today_str:
-            # Nur Departures werden persistiert — Ankunfts-Historie gibt es nicht.
-            if ftype != 'departure':
-                return jsonify({'ok': True, 'airport': board_ap, 'type': ftype,
-                                'date': date_param, 'count': 0, 'flights': [],
-                                'departed_today': [], 'source': 'airport_delay_obs',
-                                'message': ('Für vergangene Tage ist nur die '
-                                            'Abflug-Tafel archiviert.')})
-            hist = _board_rows_from_obs_for_date(date_param, board_ap, airline or None)
+            # BUGFIX 2026-06-13: Ankünfte werden jetzt EBENFALLS persistiert
+            # (Store-Key '<AP>#ARR') → auch die Ankunfts-Historie vergangener Tage
+            # ist abrufbar. Departures: '<AP>', Arrivals: '<AP>#ARR'.
+            hist = _board_rows_from_obs_for_date(
+                date_param, _store_key_for(board_ap, ftype), airline or None)
             return jsonify({'ok': True, 'airport': board_ap, 'type': ftype,
                             'date': date_param, 'count': len(hist[:limit]),
                             'flights': hist[:limit], 'departed_today': [],
@@ -19609,6 +19682,21 @@ def airport_board(token):
         flights = _fra_board_cached(ftype)
         src = 'fraport'
         out_airport = 'FRA'
+        # BUGFIX (User: „Tafel zeigt Flüge, aber nicht die alten/vergangenen"):
+        # Der FRA-Pfad merged die aktuellen Abflüge bisher NIE in den Beobachtungs-
+        # Store — nur der Native-Scraper-Pfad unten tat das. Folge: `departed_today`
+        # und die persistente Historie (airport_delay_obs / vergangene Tage) blieben
+        # für FRA dauerhaft LEER. Jetzt akkumuliert auch FRA bei jeder Abfrage →
+        # abgeflogene Flüge wachsen über den Tag und bleiben (SB) erhalten.
+        # BUGFIX 2026-06-13: AUCH Ankünfte persistieren (eigener Store-Key '<AP>#ARR'),
+        # damit die Ankunfts-Tafel genauso eine „Früher heute"-Historie aufbaut.
+        if flights:
+            try:
+                _merge_into_delay_store(
+                    flights, _fra_local_now().strftime('%Y-%m-%d'),
+                    _store_key_for('FRA', ftype))
+            except Exception:
+                pass
     else:
         out_airport = iata
         # 1) Native-Scraper (für die großen Bases) bzw. AeroDataBox-Board.
@@ -19622,12 +19710,15 @@ def airport_board(token):
             # NUR FRA (`_fra_day_board_cached`) — die anderen deutschen Flughäfen
             # zeigten nur das Live-Fenster (User: „die Ankunfts-/Abflugstabellen
             # der deutschen Flughäfen speichern nicht alle ab").
-            if ftype == 'departure':
-                try:
-                    _merge_into_delay_store(
-                        rows, _fra_local_now().strftime('%Y-%m-%d'), out_airport)
-                except Exception:
-                    pass
+            # BUGFIX 2026-06-13: ftype-Restriktion entfernt — Ankünfte landen unter
+            # dem eigenen Store-Key '<AP>#ARR' (siehe _store_key_for), Abflüge wie
+            # bisher unter '<AP>'. So baut JEDE Tafel (dep UND arr) ihre Historie auf.
+            try:
+                _merge_into_delay_store(
+                    rows, _fra_local_now().strftime('%Y-%m-%d'),
+                    _store_key_for(out_airport, ftype))
+            except Exception:
+                pass
         elif len(airport) == 4 and airport.startswith('ED'):
             # 2) Letzter Fallback: OpenSky (nur ICAO, zuletzt geflogene Flüge).
             flights = _fetch_opensky_board(airport, ftype)
@@ -19646,19 +19737,20 @@ def airport_board(token):
                         'airport': out_airport, 'type': ftype, 'message': msg}), 200
     if airline:
         flights = [f for f in flights if f.get('airline') == airline]
-    # „Früher heute" — bereits abgeflogene Flüge aus der akkumulierten Beobachtung,
-    # die NICHT mehr im Live-Feed stehen (dedup über flight+hh:mm). Nur Departures.
+    # „Früher heute" — bereits abgeflogene/angekommene Flüge aus der akkumulierten
+    # Beobachtung, die NICHT mehr im Live-Feed stehen (dedup über flight+hh:mm).
+    # BUGFIX 2026-06-13: jetzt für BEIDE Richtungen (Departures UND Arrivals) — die
+    # Quelle ist der richtungs-spezifische Store-Key '<AP>' bzw. '<AP>#ARR'.
     departed = []
-    if ftype == 'departure':
-        try:
-            live_keys = {((f.get('flight') or ''), (f.get('sched') or '')[11:16]) for f in flights}
-            for dr in _departed_rows_from_store(out_airport):
-                if ((dr['flight'], (dr['sched'] or '')[11:16]) not in live_keys):
-                    departed.append(dr)
-            if airline:
-                departed = [d for d in departed if (d.get('airline') or '').upper() == airline]
-        except Exception:
-            departed = []
+    try:
+        live_keys = {((f.get('flight') or ''), (f.get('sched') or '')[11:16]) for f in flights}
+        for dr in _departed_rows_from_store(_store_key_for(out_airport, ftype)):
+            if ((dr['flight'], (dr['sched'] or '')[11:16]) not in live_keys):
+                departed.append(dr)
+        if airline:
+            departed = [d for d in departed if (d.get('airline') or '').upper() == airline]
+    except Exception:
+        departed = []
     return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
                     'count': len(flights[:limit]), 'flights': flights[:limit],
                     'departed_today': departed[:120],
@@ -20169,17 +20261,39 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport, 
     global _delay_obs_write_fail_count, _delay_obs_write_ok_count, _delay_obs_last_error
     if not SB_AVAILABLE or sb is None:
         return
+    payload = {
+        'date': date_str,
+        'airport': airport or 'FRA',
+        'flight': fn,
+        'sched': hhmm,
+        'max_delay_min': int(max_delay or 0),
+        'cancelled': bool(cancelled),
+        'status': (status or None),
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+    }
     try:
-        sb.table('airport_delay_obs').upsert({
-            'date': date_str,
-            'airport': airport or 'FRA',
-            'flight': fn,
-            'sched': hhmm,
-            'max_delay_min': int(max_delay or 0),
-            'cancelled': bool(cancelled),
-            'status': (status or None),
-            'updated_at': datetime.now(timezone.utc).isoformat(),
-        }, on_conflict='date,airport,flight,sched').execute()
+        # BUGFIX 2026-06-13 (ROOT CAUSE „Tafel/Pünktlichkeit speichert nicht"):
+        # `upsert(on_conflict='date,airport,flight,sched')` schlug in PROD bei JEDEM
+        # Write mit Postgres 42P10 fehl („there is no unique or exclusion constraint
+        # matching the ON CONFLICT specification") — die Live-Tabelle hatte den
+        # zusammengesetzten Primary Key NICHT (Migration nie/early ohne PK angewandt,
+        # `create table if not exists` no-opte danach). Folge: write_ok=0,
+        # write_fail=132 → NICHTS wurde je persistiert, die Historie lebte nur im
+        # flüchtigen In-Memory-Store einer Instanz und verschwand bei jedem Restart.
+        #
+        # Fix: manueller Upsert OHNE DB-seitige ON-CONFLICT-Abhängigkeit. Erst
+        # UPDATE auf den Schlüssel; matchte keine Row → INSERT. Funktioniert auch
+        # ohne den Unique-Key, also sofort nach Deploy — unabhängig davon, ob die
+        # korrigierende Migration (20260613_*) schon im SQL-Editor lief.
+        upd = (sb.table('airport_delay_obs')
+               .update({'max_delay_min': payload['max_delay_min'],
+                        'cancelled': payload['cancelled'],
+                        'status': payload['status'],
+                        'updated_at': payload['updated_at']})
+               .eq('date', date_str).eq('airport', payload['airport'])
+               .eq('flight', fn).eq('sched', hhmm).execute())
+        if not (upd.data or []):
+            sb.table('airport_delay_obs').insert(payload).execute()
         _delay_obs_write_ok_count += 1
     except Exception as e:
         # Tabelle fehlt / SB down / Schema-Mismatch → ehrlich nur in-memory
@@ -20269,7 +20383,9 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
     # zurückladen (cross-instance Akkumulation), bevor wir die neuen mergen.
     _delay_store_load_from_sb(date_str, airport)
     try:
-        now_local = _fra_local_now()
+        # Flughafen-LOKALE Jetzt-Zeit (nicht Berlin) — sonst ist der `passed`-Check
+        # für Nicht-Europa-Flughäfen um Stunden verschoben (siehe _airport_local_now).
+        now_local = _airport_local_now(airport)
     except Exception:
         now_local = None
     for f in (flights or []):
@@ -20356,7 +20472,8 @@ def _punctuality_stats(flights, airport='FRA'):
         _delay_store_load_from_sb(today, airport)
     except Exception:
         today = ''
-    now_local = _fra_local_now()
+    # Flughafen-lokale Jetzt-Zeit für den passed-Check (siehe _airport_local_now).
+    now_local = _airport_local_now(airport)
     # Bahn/Bus (LH Express Rail / AIRail) raus — defensiv, falls ein Altbestand
     # aus dem Cache (vor dem Source-Filter gebaut) noch Zug-Zeilen enthält.
     flights = [f for f in (flights or []) if not _is_rail_or_bus(f)]
@@ -20452,9 +20569,11 @@ def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None):
 
     Gleiche sparse-Zeilenform wie `_departed_rows_from_store` (Flugnummer,
     Soll-Zeit, Verspätung/Status — KEIN Gate/Ziel, das hält die Tabelle nicht).
-    Quelle ist airport-gekeyt, also liefert auch ein Nicht-FRA-Flughafen seine
-    eigenen gespeicherten Abflüge. Leere Liste bei SB-down/leer → Caller degradiert
-    ehrlich. NUR Departures (Ankünfte werden nicht in airport_delay_obs gehalten)."""
+    Quelle ist airport-gekeyt ('<AP>' für Abflüge, '<AP>#ARR' für Ankünfte), also
+    liefert auch ein Nicht-FRA-Flughafen seine eigenen gespeicherten Flüge — und
+    seit 2026-06-13 AUCH die Ankunfts-Historie. Leere Liste bei SB-down/leer →
+    Caller degradiert ehrlich."""
+    is_arr = (airport or '').upper().endswith('#ARR')
     rows = _delay_obs_rows_for_date(date_str, airport)
     airline = (airline or '').upper().strip()
     out = []
@@ -20712,24 +20831,31 @@ def poll_punctuality_accumulate():
     elif (request.remote_addr or '') not in ('127.0.0.1', '::1'):
         return jsonify({'ok': False, 'error': 'forbidden_no_secret'}), 403
     results = {}
+    # BUGFIX 2026-06-13: BEIDE Richtungen pollen (Abflug UND Ankunft). Vorher lief
+    # der Poller nur über 'departure' → die Ankunfts-Tafel akkumulierte NIE eine
+    # Historie. Arrivals landen unter dem Store-Key '<AP>#ARR' (siehe _store_key_for).
     for ap in ('FRA', 'MUC', 'BER', 'DUS', 'HAM', 'HAJ'):
-        try:
-            if ap in ('FRA', 'EDDF'):
-                flights = _fra_day_board_cached('departure')
-            elif ap in _NATIVE_BOARD_SCRAPERS:
-                rows, _src = (_native_board_cached(ap, 'departure') or (None, None))
-                flights = rows
-            else:
-                flights = None
-            if not flights:
-                results[ap] = 'no_flights'
-                continue
-            # _punctuality_stats ruft intern _merge_into_delay_store → persistiert
-            # die neuen Beobachtungen nach airport_delay_obs (cross-instance).
-            stats = _punctuality_stats(flights, ap)
-            results[ap] = stats.get('sample_size')
-        except Exception as e:
-            results[ap] = 'err:' + type(e).__name__
+        for ftype in ('departure', 'arrival'):
+            tag = ap if ftype == 'departure' else (ap + '#ARR')
+            try:
+                if ap in ('FRA', 'EDDF'):
+                    flights = (_fra_day_board_cached(ftype) if ftype == 'departure'
+                               else _fra_board_cached(ftype))
+                elif ap in _NATIVE_BOARD_SCRAPERS:
+                    rows, _src = (_native_board_cached(ap, ftype) or (None, None))
+                    flights = rows
+                else:
+                    flights = None
+                if not flights:
+                    results[tag] = 'no_flights'
+                    continue
+                # _punctuality_stats ruft intern _merge_into_delay_store → persistiert
+                # die neuen Beobachtungen nach airport_delay_obs (cross-instance).
+                # Store-Key trägt die Richtung ('<AP>' bzw. '<AP>#ARR').
+                stats = _punctuality_stats(flights, _store_key_for(ap, ftype))
+                results[tag] = stats.get('sample_size')
+            except Exception as e:
+                results[tag] = 'err:' + type(e).__name__
     return jsonify({'ok': True, 'accumulated': results})
 
 
