@@ -14974,6 +14974,65 @@ def _forum_author_snapshot(token):
         return {'author_name': '', 'author_role': '', 'author_airline': '', 'author_homebase': ''}
 
 
+def _wall_post_as_forum_thread(p):
+    """Projiziert einen Wall-Post in die Forum-Thread-Form, FALLS er einen
+    Forum-Kategorie-Hashtag trägt (#cabin/#cockpit/…). So erscheint ein im
+    Crew-Feed erstellter Post auch im passenden Forum-Board (BUG-3: Feed und
+    Forum sind getrennte Stores — wall_posts vs forum_threads — der Composer
+    hängt die Kategorie als ersten Hashtag an, hier lesen wir sie wieder).
+
+    Read-only-Brücke: id mit Prefix 'wall:' (kollidiert nicht mit echten
+    Thread-IDs); Replies/Likes laufen im Forum gegen diese synthetische ID ins
+    Leere — Interaktion bleibt im Crew-Feed. Anonyme Posts werden NICHT
+    eingeblendet (kein Author-Snapshot, Identitäts-Schutz). Returns None wenn der
+    Post in kein Forum-Board gehört.
+    """
+    if p.get('is_anonymous'):
+        return None
+    tags = [str(t).lower() for t in (p.get('hashtags') or [])]
+    cat = next((t for t in tags if t in FORUM_CATEGORIES), None)
+    if not cat:
+        return None
+    text = (p.get('text') or '').strip()
+    # Titel = erste Zeile/erster Satz (gekürzt), Body = voller Text.
+    first_line = text.splitlines()[0].strip() if text else ''
+    title = (first_line or 'Crew-Feed Beitrag')[:200]
+    return {
+        'id': 'wall:' + str(p.get('id') or ''),
+        'category_id': cat,
+        'author_token': p.get('author_token'),
+        'author_short': p.get('author_short'),
+        'author_name': p.get('author_name'),
+        'author_role': None,
+        'author_airline': p.get('author_airline'),
+        'author_homebase': p.get('author_homebase'),
+        'title': title,
+        'body': text,
+        'image_url': p.get('image_url'),
+        'gif_url': None,
+        'hashtags': tags,
+        'created_at': p.get('created_at'),
+        'created_ts': p.get('ts') or 0,
+        'like_count': p.get('like_count') or 0,
+        'reply_count': p.get('comment_count') or 0,
+        'last_reply_ts': None,
+        'from_crew_feed': True,
+    }
+
+
+def _wall_posts_for_forum():
+    """Alle Wall-Posts, die als Forum-Threads taugen (Kategorie-Hashtag)."""
+    out = []
+    try:
+        for p in _wall_load_posts():
+            proj = _wall_post_as_forum_thread(p)
+            if proj is not None:
+                out.append(proj)
+    except Exception as e:
+        app.logger.warning(f'[forum] wall→thread bridge failed: {str(e)[:120]}')
+    return out
+
+
 @app.route('/api/forum/<token>/threads', methods=['GET'])
 def forum_list_threads(token):
     """Query: ?category=cabin&sort=hot|new|active&limit=50"""
@@ -14983,6 +15042,12 @@ def forum_list_threads(token):
 
     import time
     threads = _forum_load_threads()
+    # BUG-3: Crew-Feed-Posts mit Forum-Kategorie-Hashtag im Forum mit-einblenden.
+    # Dedup gegen evtl. doppelte IDs (sollte durch 'wall:'-Prefix nicht passieren).
+    existing_ids = {t.get('id') for t in threads}
+    for wt in _wall_posts_for_forum():
+        if wt.get('id') not in existing_ids:
+            threads.append(wt)
     if category and category in FORUM_CATEGORIES:
         threads = [t for t in threads if t.get('category_id') == category]
 
