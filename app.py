@@ -14001,6 +14001,105 @@ def serve_wall_image(token_safe, fname):
     return send_file(path, mimetype=mime)
 
 
+# ── Profil-Avatar Upload + Serve (2026-06-14) ───────────────────────────────
+# Persistiert das Profilfoto des Users SERVER-SEITIG, damit es überall (Feed,
+# Kommentare, Freunde) — auch für andere User — angezeigt werden kann, statt
+# bloß lokal auf dem Gerät zu liegen (vorher: Emoji-Platzhalter für jeden).
+# Storage reuse: gleiches file-based Pattern wie Wall-Images (opaker Dir-Key,
+# kein Token-Leak in der public URL). Der `avatar_url`-Verweis landet auf der
+# Profile-Row (SB-primary via _profile_sidekey_set) und ist bereits in
+# _PUBLIC_PROFILE_FIELDS → fließt automatisch durch get_user_friends /
+# get_user_profile zu anderen Usern.
+
+def _avatar_img_key(token):
+    """Opaker, deterministischer Verzeichnis-Key — Token nie in public URL.
+    Eigener Salt ('avatar:') statt Wall-Img-Key, damit beide Namespaces
+    getrennt bleiben."""
+    return _hashlib.sha256(('avatar:' + (token or '')).encode()).hexdigest()[:32]
+
+
+@app.route('/api/user/avatar/<token>', methods=['POST'])
+def upload_user_avatar(token):
+    """Upload Profilfoto. Body: JSON {image_b64} ODER multipart {image}.
+    Persistiert das Bild als Datei + speichert avatar_url auf der Profile-Row.
+    Returns {ok, avatar_url}. Idempotent: überschreibt das vorhandene Avatar.
+    """
+    if _token_rate_limited(token, 'avatar_upload', limit=30, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited',
+                        'message': 'Zu viele Uploads. Bitte später erneut.'}), 429
+    import os, re, uuid
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    if not safe:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    # Bild aus Multipart ODER base64-JSON lesen (der Client base64-kodiert Bilder
+    # bereits an anderer Stelle — beide Pfade unterstützen).
+    data = None
+    f = request.files.get('image')
+    if f:
+        data = f.read()
+    else:
+        body = request.get_json(silent=True) or {}
+        b64 = body.get('image_b64') or body.get('image') or ''
+        if b64:
+            # Optionaler data:-URI-Prefix abschneiden.
+            if ',' in b64 and b64.strip().startswith('data:'):
+                b64 = b64.split(',', 1)[1]
+            try:
+                data = base64.b64decode(b64)
+            except Exception:
+                return jsonify({'ok': False, 'error': 'invalid_base64'}), 400
+    if not data:
+        return jsonify({'ok': False, 'error': 'no_image'}), 400
+    if len(data) > 5 * 1024 * 1024:
+        return jsonify({'ok': False, 'error': 'too_large_5mb'}), 413
+    detected_type, detected_ext = _detect_image_type(data)
+    if not detected_type:
+        return jsonify({'ok': False, 'error': 'invalid_image',
+                        'message': 'Nur JPEG/PNG/HEIC/WebP-Bilder erlaubt.'}), 415
+    dir_key = _avatar_img_key(token)
+    img_dir = os.path.join(_USER_HISTORY_DIR, 'avatars', dir_key)
+    os.makedirs(img_dir, exist_ok=True)
+    # Alte Avatare desselben Users entfernen (sonst Storage-Leak + stale Files).
+    try:
+        for old in os.listdir(img_dir):
+            os.remove(os.path.join(img_dir, old))
+    except Exception:
+        pass
+    # Cache-Buster im Dateinamen → Clients/CDN ziehen das neue Bild nach Wechsel.
+    fname = f'{uuid.uuid4().hex[:12]}{detected_ext}'
+    try:
+        with open(os.path.join(img_dir, fname), 'wb') as fp:
+            fp.write(data)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    avatar_url = f'/api/user/avatar/{dir_key}/{fname}'
+    # avatar_url auf die Profile-Row schreiben (SB-primary + Disk) — damit Feed/
+    # Freunde/Profil den Verweis ausliefern können.
+    try:
+        _profile_sidekey_set(token, 'avatar_url', avatar_url)
+    except Exception as e:
+        app.logger.warning(f'[avatar] profile_set_fail tok={token[:8]}: {e}')
+    return jsonify({'ok': True, 'avatar_url': avatar_url})
+
+
+@app.route('/api/user/avatar/<key_safe>/<fname>', methods=['GET'])
+def serve_user_avatar(key_safe, fname):
+    """Serve Profilfoto — public (im Feed-/Friends-Kontext für alle sichtbar)."""
+    import os, re
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '', fname or '')
+    safe_k = re.sub(r'[^A-Za-z0-9_-]', '', key_safe or '')[:64]
+    if not safe or not safe_k:
+        return jsonify({'error': 'invalid'}), 400
+    path = os.path.join(_USER_HISTORY_DIR, 'avatars', safe_k, safe)
+    if not os.path.exists(path):
+        return jsonify({'error': 'not_found'}), 404
+    mime = 'image/jpeg'
+    if safe.lower().endswith('.png'): mime = 'image/png'
+    elif safe.lower().endswith('.heic'): mime = 'image/heic'
+    elif safe.lower().endswith('.webp'): mime = 'image/webp'
+    return send_file(path, mimetype=mime)
+
+
 @app.route('/api/wall/<token>/post', methods=['POST'])
 def create_wall_post(token):
     """Body: {text, image_url?, layover_iata?}. Author = token."""
@@ -14068,6 +14167,9 @@ def create_wall_post(token):
             post['author_name'] = pr.get('name')
             post['author_airline'] = pr.get('airline')
             post['author_homebase'] = pr.get('homebase')
+            # author_avatar: serverseitig persistiertes Profilfoto → andere User
+            # sehen das echte Foto im Feed statt Emoji-Platzhalter.
+            post['author_avatar'] = pr.get('avatar_url')
         except Exception:
             pass
     posts = _wall_load_posts()
@@ -14137,6 +14239,22 @@ def get_wall_feed(token):
     # Add liked/disliked-by-me flags (SB primary, Disk fallback)
     liked_ids = _wall_likes_load(token) or set()
     disliked_ids = _wall_dislikes_load(token) or set()
+    # author_avatar LIVE aus dem Profil auflösen (statt dem evtl. veralteten
+    # Post-Snapshot) — so zeigt ein neu gesetztes Profilfoto sofort auf ALLEN
+    # alten Posts des Users. Pro-Author einmal cachen (Feed hat oft mehrere
+    # Posts desselben Users).
+    _avatar_cache = {}
+    def _author_avatar(tok):
+        if not tok:
+            return None
+        if tok in _avatar_cache:
+            return _avatar_cache[tok]
+        try:
+            av = ((_profile_load(tok) or {}).get('profile', {}) or {}).get('avatar_url')
+        except Exception:
+            av = None
+        _avatar_cache[tok] = av
+        return av
     for p in feed:
         # `id` defensiv lesen — ein Post ohne id (Legacy/teil-migrierte SB-Row)
         # würde sonst per KeyError die ganze Feed-Seite mit 500 killen (#25).
@@ -14159,8 +14277,17 @@ def get_wall_feed(token):
         if p.get('is_anonymous'):
             if not p.get('anon_handle'):
                 p['anon_handle'] = _anon_handle_for(p.get('author_token'))
-            for k in ('author_name', 'author_airline', 'author_homebase', 'author_short'):
+            for k in ('author_name', 'author_airline', 'author_homebase',
+                      'author_short', 'author_avatar'):
                 p.pop(k, None)
+        else:
+            # author_avatar live aus dem Profil (frisch) — überschreibt den
+            # evtl. veralteten Snapshot. None wenn der User (noch) keins hat.
+            av = _author_avatar(p.get('author_token'))
+            if av:
+                p['author_avatar'] = av
+            else:
+                p.pop('author_avatar', None)
         # Strip author_token for privacy in feed (NACH allen Flags).
         p.pop('author_token', None)
         # Token-Leak-Fix: Legacy-Bild-URLs tragen das volle Token im Pfad —
@@ -14285,9 +14412,12 @@ def add_comment(token, post_id):
     import uuid, time as _t
     comments = _wall_comments_load(post_id) or []
     name = ''
+    avatar_url = None
     if not is_anonymous:
         try:
-            name = ((_profile_load(token) or {}).get('profile', {}) or {}).get('name', '') or ''
+            pr = (_profile_load(token) or {}).get('profile', {}) or {}
+            name = pr.get('name', '') or ''
+            avatar_url = pr.get('avatar_url')
         except Exception:
             pass
     now_ts = _t.time()
@@ -14298,6 +14428,8 @@ def add_comment(token, post_id):
         'author_token': token,
         'author_short': None if is_anonymous else token[:8],
         'author_name': name,
+        # author_avatar: persistiertes Profilfoto → Avatar im Kommentar-Thread.
+        'author_avatar': avatar_url,
         'text': text,
         'image_url': image_url,
         'parent_comment_id': parent_comment_id,
@@ -14336,6 +14468,19 @@ def get_comments(token, post_id):
     cp = _wall_comments_path(post_id)
     if not cp: return jsonify({'comments': []})
     comments = _wall_comments_load(post_id) or []
+    # author_avatar pro Author live cachen (mehrere Kommentare desselben Users).
+    _c_avatar_cache = {}
+    def _c_author_avatar(tok):
+        if not tok:
+            return None
+        if tok in _c_avatar_cache:
+            return _c_avatar_cache[tok]
+        try:
+            av = ((_profile_load(tok) or {}).get('profile', {}) or {}).get('avatar_url')
+        except Exception:
+            av = None
+        _c_avatar_cache[tok] = av
+        return av
     # Strip author_token; anonyme Kommentare zusätzlich von Profil-Resten säubern.
     for c in comments:
         if c.get('is_anonymous'):
@@ -14343,6 +14488,14 @@ def get_comments(token, post_id):
                 c['anon_handle'] = _anon_handle_for(c.get('author_token'))
             c.pop('author_name', None)
             c.pop('author_short', None)
+            c.pop('author_avatar', None)
+        else:
+            # Live-Avatar (frisch) statt evtl. veraltetem Snapshot.
+            av = _c_author_avatar(c.get('author_token'))
+            if av:
+                c['author_avatar'] = av
+            else:
+                c.pop('author_avatar', None)
         c.pop('author_token', None)
         # Token-Leak-Fix: Legacy-Bild-URLs auf opaken Key umschreiben.
         if c.get('image_url'):
@@ -18391,7 +18544,22 @@ _AIRPORT_DAY_TTL = 180         # 3 Min — für Delay-Capture-Genauigkeit reduzi
 # key (airport, airline) -> (ts, result-dict).
 _AERODATABOX_CACHE = {}
 _AERODATABOX_TTL = 900         # 15 Min.
-_AERODATABOX_DELAY_THRESHOLD = 5   # Minuten — wie FRA (>=5 = verspätet).
+
+# ── EINE Pünktlichkeits-Schwelle für ALLE Pfade (Live-Board-Flag, Store-Replay,
+# historische Aggregation, AeroDataBox) ───────────────────────────────────────
+# DELAY_THRESHOLD_MIN: ein Abflug gilt ab dieser Verspätung (Minuten) als
+# „verspätet". 15 Minuten ist die international übliche On-Time-Performance-
+# Definition (D15: „pünktlich = innerhalb 15 Min nach Plan", wie Eurocontrol/
+# OAG/Lufthansa-OTP). Vorher 5 Min — das klassifizierte deutlich mehr Flüge als
+# verspätet als die offizielle Branchenkennzahl und machte die Quote unnötig
+# pessimistisch. Mit 15 Min ist „Pünktlichkeit heute" vergleichbar mit der
+# veröffentlichten Airline-OTP. Die Schwelle ist EHRLICH dokumentiert und wird
+# in der API-Antwort als `delay_threshold_min` mitgeliefert, damit die UI sie
+# benennen kann („pünktlich = max. 15 Min Verspätung"). EINE Quelle der Wahrheit:
+# alle delayed-Flags + alle Aggregationspfade lesen diesen Wert, sonst springt
+# das Urteil eines Fluges beim Wechsel Live→Replay.
+_DELAY_THRESHOLD_MIN = 15
+_AERODATABOX_DELAY_THRESHOLD = _DELAY_THRESHOLD_MIN  # identisch zu FRA/Store.
 
 # Per-Airport-Board-Cache (native Scraper + AeroDataBox-Board). Eigener Topf,
 # getrennt vom FRA-Board. key (IATA, type, source) -> (ts, list). 12 Min TTL —
@@ -18776,7 +18944,7 @@ def _muc_board(flight_type='departure'):
             if area:
                 row['terminal'] = area.get_text(' ', strip=True)
             row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
-            row['delayed'] = row['delay_min'] >= 5
+            row['delayed'] = row['delay_min'] >= _DELAY_THRESHOLD_MIN
             if row['flight'] or row['dest_iata']:
                 out.append(row)
         except Exception:
@@ -18833,7 +19001,7 @@ def _dus_board(flight_type='departure'):
                 term = ', '.join(str(x) for x in term)
             row['terminal'] = (str(term or '')).strip()
             row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
-            row['delayed'] = row['delay_min'] >= 5
+            row['delayed'] = row['delay_min'] >= _DELAY_THRESHOLD_MIN
             if 'cancel' in row['status'].lower() or 'annul' in row['status'].lower():
                 row['delayed'] = False
             out.append(row)
@@ -19058,7 +19226,7 @@ def _mdfag_board(slug, iata, flight_type='departure'):
                     row['status'] = td.get_text(' ', strip=True)
                     break
             row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
-            row['delayed'] = row['delay_min'] >= 5
+            row['delayed'] = row['delay_min'] >= _DELAY_THRESHOLD_MIN
             if row['flight'] or row['dest_name']:
                 out.append(row)
         except Exception:
@@ -19120,7 +19288,7 @@ def _ham_board(flight_type='departure'):
             if st_el:
                 r2['status'] = st_el.get_text(' ', strip=True)
             r2['delay_min'] = _board_delay_min(r2['sched'], r2['esti'])
-            r2['delayed'] = r2['delay_min'] >= 5
+            r2['delayed'] = r2['delay_min'] >= _DELAY_THRESHOLD_MIN
             if r2['flight'] or r2['dest_iata']:
                 out.append(r2)
         except Exception:
@@ -19237,7 +19405,7 @@ def _ber_board(flight_type='departure'):
             sid = (f.get('flight_status_id') or '').lower()
             cancelled = ('cancel' in sid or 'cancel' in row['status'].lower()
                          or 'annul' in row['status'].lower())
-            row['delayed'] = (row['delay_min'] >= 5) and not cancelled
+            row['delayed'] = (row['delay_min'] >= _DELAY_THRESHOLD_MIN) and not cancelled
             if row['flight'] or row['dest_iata']:
                 out.append(row)
         except Exception:
@@ -19612,19 +19780,26 @@ def _departed_rows_from_store(airport):
         if len(sc) != 5:
             continue
         cancelled = bool(_delay_store_cancelled.get((d, a, fn, sc)))
+        meta = _delay_store_meta.get((d, a, fn, sc)) or {}
         try:
             al, _num = _split_flightno(fn)
         except Exception:
             al = (fn[:2] if fn else '')
+        # VOLLE Felder aus dem Meta-Store (dest/gate/terminal/esti) — so zeigt die
+        # „Früher heute"-Ansicht von→nach + Gate, nicht nur die nackte Flugnummer.
         rows.append({
-            'airline': al, 'airline_name': '', 'flight': fn,
-            'dest_iata': '', 'dest_name': '',
-            'sched': today + 'T' + sc + ':00', 'esti': None,
+            'airline': (meta.get('airline') or al), 'airline_name': '', 'flight': fn,
+            'dest_iata': (meta.get('dest_iata') or ''),
+            'dest_name': (meta.get('dest_name') or ''),
+            'sched': today + 'T' + sc + ':00', 'esti': (meta.get('esti') or None),
             'delay_min': int(max_delay or 0),
             'delayed': int(max_delay or 0) >= _PUNCTUALITY_DELAY_THRESHOLD_MIN,
-            'cancelled': cancelled, 'gate': '', 'terminal': '', 'hall': '',
-            'status': ('Annulliert' if cancelled
-                       else ('Gelandet' if is_arr else 'Abgeflogen')),
+            'cancelled': cancelled,
+            'gate': (meta.get('gate') or ''),
+            'terminal': (meta.get('terminal') or ''), 'hall': '',
+            'status': ((meta.get('status') or '') or
+                       ('Annulliert' if cancelled
+                        else ('Gelandet' if is_arr else 'Abgeflogen'))),
             'reg': '', 'aircraft': '', 'departed': True,
         })
     rows.sort(key=lambda f: f.get('sched') or '')
@@ -19676,6 +19851,47 @@ def airport_board(token):
                             'date': date_param, 'count': len(hist[:limit]),
                             'flights': hist[:limit], 'departed_today': [],
                             'source': 'airport_delay_obs'})
+    # ── RECENT-Tafel: „Früher heute" über die LETZTEN ~3 TAGE ───────────────
+    # ?days=N (N=1..3) → die gespeicherten/abgeflogenen Flüge der letzten N
+    # Betriebstage (heute + N-1 vorige) aus airport_delay_obs, gruppiert pro Tag.
+    # Heute kommt aus dem In-Memory-Store (`_departed_rows_from_store`, wächst
+    # live), vorige Tage rein aus der SB-Persistenz (`_board_rows_from_obs_for_date`).
+    # So sieht die iOS-Tafel nicht nur den heutigen Verlauf, sondern auch gestern/
+    # vorgestern, ohne pro Tag einen eigenen `?date=`-Call zu brauchen.
+    days_param = (request.args.get('days') or '').strip()
+    if days_param:
+        try:
+            ndays = max(1, min(int(days_param), 3))
+        except Exception:
+            ndays = 3
+        from datetime import timedelta as _td
+        try:
+            base = _airport_local_now(_store_key_for(board_ap, ftype))
+        except Exception:
+            base = None
+        if base is None:
+            return jsonify({'ok': False, 'error': 'date_unavailable',
+                            'airport': board_ap, 'type': ftype,
+                            'message': 'Lokaldatum für ' + board_ap
+                                       + ' nicht bestimmbar.'}), 200
+        store_key = _store_key_for(board_ap, ftype)
+        recent = []
+        for i in range(ndays):
+            d = (base - _td(days=i)).strftime('%Y-%m-%d')
+            if i == 0:
+                # Heute: live-wachsender In-Memory-Store (inkl. SB-Reload).
+                day_rows = _departed_rows_from_store(store_key)
+                if airline:
+                    day_rows = [r for r in day_rows
+                                if (r.get('airline') or '').upper() == airline]
+            else:
+                # Vorige Tage: rein aus der Persistenz.
+                day_rows = _board_rows_from_obs_for_date(d, store_key, airline or None)
+            recent.append({'date': d, 'count': len(day_rows[:limit]),
+                           'flights': day_rows[:limit]})
+        return jsonify({'ok': True, 'airport': board_ap, 'type': ftype,
+                        'days': ndays, 'recent_days': recent,
+                        'source': 'airport_delay_obs'})
     src = None
     flights = None
     if iata in ('FRA', 'EDDF') or airport in ('FRA', 'EDDF'):
@@ -20204,11 +20420,12 @@ _FRA_CANCEL_MARKERS = ('annull', 'cancel', 'gestrich')
 _PUNCTUALITY_MIN_SAMPLE = 15
 
 # Verspätungs-Schwelle (Minuten) für „delayed". MUSS identisch zur Live-Board-
-# Flag (`delayed = _fra_delay_min(...) >= 5` in `_fetch_fra_flights`) sein, sonst
+# Flag (`delayed = _fra_delay_min(...) >= _DELAY_THRESHOLD_MIN`) sein, sonst
 # wechselt das Urteil eines Fluges, sobald er aus dem Live-Feed in den Store-Replay
 # wandert (live „verspätet" → replay „pünktlich") → springende Quote + falsche
-# Tabellen-Klassifikation. Eine Quelle der Wahrheit für alle Pünktlichkeits-Pfade.
-_PUNCTUALITY_DELAY_THRESHOLD_MIN = 5
+# Tabellen-Klassifikation. Eine Quelle der Wahrheit für alle Pünktlichkeits-Pfade:
+# _DELAY_THRESHOLD_MIN (15 Min = übliche D15-OTP-Definition, siehe oben).
+_PUNCTUALITY_DELAY_THRESHOLD_MIN = _DELAY_THRESHOLD_MIN
 
 def _is_cancelled(f):
     return any(m in (f.get('status') or '').lower() for m in _FRA_CANCEL_MARKERS)
@@ -20248,8 +20465,17 @@ _delay_obs_write_ok_count: int = 0
 _delay_obs_load_fail_count: int = 0
 _delay_obs_last_error: str = ''
 
+# VOLLE Flug-Felder pro Beobachtung (dest/gate/terminal/airline/esti). Der
+# _delay_store hält nur das max_delay (int) pro Key — die reichen Felder kommen
+# vom Live-Board und werden hier parallel gehalten, damit die Historie (vergangene
+# Tage / „Früher heute") von→nach + Gate/Terminal zurückgeben kann. Key = derselbe
+# (date, airport, flight, sched)-Tupel wie _delay_store. Best-effort: SB-Load
+# füllt das auch aus persistierten Rows zurück, falls vorhanden.
+_delay_store_meta: dict = {}
 
-def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport, status):
+
+def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
+                             status, meta=None):
     """Best-effort Write-Through einer Delay-Beobachtung nach airport_delay_obs.
     Mirror des wall-posts/disk-Patterns: SB-down/Tabelle-fehlt → still degrade,
     der In-Memory-Store bleibt die Wahrheit. Nur max-Wert (upsert überschreibt,
@@ -20271,6 +20497,19 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport, 
         'status': (status or None),
         'updated_at': datetime.now(timezone.utc).isoformat(),
     }
+    # VOLLE Felder (dest/gate/terminal/airline/esti) best-effort mitschreiben, damit
+    # die Historie von→nach + Gate/Terminal zeigen kann (nicht nur die Flugnummer).
+    # Nur nicht-leere Werte ins Payload — so überschreibt ein späterer, ärmerer
+    # Snapshot (Live-Feed ohne Gate kurz vor Abflug) einen früheren reichen NICHT
+    # mit Leerstrings. Spalten sind nullable (Migration 20260614) → fehlt eine
+    # Spalte in einer alten Tabelle, degradiert der Write still (Exception unten).
+    meta = meta or {}
+    for col in ('dest_iata', 'dest_name', 'gate', 'terminal', 'airline', 'esti'):
+        v = (meta.get(col) or '')
+        if isinstance(v, str):
+            v = v.strip()
+        if v:
+            payload[col] = v
     try:
         # BUGFIX 2026-06-13 (ROOT CAUSE „Tafel/Pünktlichkeit speichert nicht"):
         # `upsert(on_conflict='date,airport,flight,sched')` schlug in PROD bei JEDEM
@@ -20318,6 +20557,7 @@ def _delay_store_load_from_sb(date_str, airport='FRA'):
     Load-on-Read bricht, überlebt die Tages-Stichprobe keinen Restart, also darf
     das nicht still passieren."""
     global _delay_store_sb_loaded_date, _delay_obs_load_fail_count, _delay_obs_last_error
+    global _delay_store_meta
     if not SB_AVAILABLE or sb is None:
         return
     airport = (airport or 'FRA').upper()
@@ -20340,6 +20580,20 @@ def _delay_store_load_from_sb(date_str, airport='FRA'):
                 key = (date_str, airport, fn, hhmm)
                 md = int(row.get('max_delay_min') or 0)
                 cxl = bool(row.get('cancelled'))
+                # VOLLE Felder (dest/gate/terminal/airline/esti) aus der Row in den
+                # Meta-Store laden, damit die Historie von→nach + Gate zeigen kann.
+                # Alte Rows ohne diese Spalten liefern None → leere Strings.
+                meta = {
+                    'dest_iata': (row.get('dest_iata') or ''),
+                    'dest_name': (row.get('dest_name') or ''),
+                    'gate':      (row.get('gate') or ''),
+                    'terminal':  (row.get('terminal') or ''),
+                    'airline':   (row.get('airline') or ''),
+                    'esti':      (row.get('esti') or ''),
+                    'status':    (row.get('status') or ''),
+                }
+                if any(v for v in meta.values()):
+                    _delay_store_meta[key] = meta
                 if md > 0:
                     _delay_store[key] = max(_delay_store.get(key, 0), md)
                 elif not cxl:
@@ -20370,11 +20624,12 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
     durch, sodass die Tages-Stichprobe cross-instance/cross-restart akkumuliert.
     SB-down/Tabelle-fehlt → still degrade auf rein-in-memory."""
     global _delay_store, _delay_store_date, _delay_store_cancelled
-    global _delay_store_sb_loaded_date
+    global _delay_store_sb_loaded_date, _delay_store_meta
     airport = (airport or 'FRA').upper()
     if _delay_store_date != date_str:
         _delay_store.clear()
         _delay_store_cancelled.clear()
+        _delay_store_meta.clear()
         _delay_store_date = date_str
         # Tagesrollover → SB-Load-Marker zurücksetzen, damit der neue Tag seine
         # (ggf. von anderen Instanzen bereits geschriebenen) Beobachtungen lädt.
@@ -20399,6 +20654,28 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
         key = (date_str, airport, fn, hhmm)
         delay = f.get('delay_min') or 0
         cancelled = bool(f.get('cancelled'))
+        # VOLLE Felder aus dem Live-Board festhalten (von→nach, Gate, Terminal,
+        # Airline, esti) → die Historie kann später mehr als die Flugnummer zeigen.
+        # Nur nicht-leere Werte mergen, damit ein späterer ärmerer Snapshot einen
+        # früheren reichen nicht überschreibt (z.B. Gate fällt kurz vor Abflug weg).
+        flight_meta = {
+            'dest_iata': (f.get('dest_iata') or '').strip(),
+            'dest_name': (f.get('dest_name') or '').strip(),
+            'gate':      (f.get('gate') or '').strip(),
+            'terminal':  (f.get('terminal') or '').strip(),
+            'airline':   (f.get('airline') or '').strip(),
+            'esti':      (f.get('esti') or '').strip() if isinstance(f.get('esti'), str) else '',
+            'status':    (f.get('status') or '').strip(),
+        }
+        prev_meta = _delay_store_meta.get(key) or {}
+        merged_meta = dict(prev_meta)
+        meta_changed = False
+        for mk, mv in flight_meta.items():
+            if mv and mv != prev_meta.get(mk):
+                merged_meta[mk] = mv
+                meta_changed = True
+        if merged_meta:
+            _delay_store_meta[key] = merged_meta
         # Nur bereits abgeflogene Flüge sind echte Tages-Beobachtungen. Zukunft NICHT
         # persistieren — sonst zählte ein leeres Live-Board sie später fälschlich als
         # on-time. (now_local None → defensiv alles aufnehmen, wie zuvor.)
@@ -20434,16 +20711,20 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
             if not _delay_store_cancelled.get(key):
                 _delay_store_cancelled[key] = True
                 changed = True
-        # Write-Through nur bei tatsächlicher Änderung (max gewachsen, neu on-time
-        # oder neu cancelled) → wir hämmern die SB-Tabelle nicht pro Board-Rebuild voll.
-        if changed:
+        # Write-Through bei tatsächlicher Änderung (max gewachsen, neu on-time, neu
+        # cancelled ODER neue/aktualisierte Voll-Felder) → wir hämmern die SB-Tabelle
+        # nicht pro Board-Rebuild voll, halten aber dest/gate/terminal aktuell. Der
+        # Meta-Write läuft nur für bereits erfasste (passed/cancelled) Flüge mit, also
+        # nicht für reine Zukunfts-Snapshots (key noch nicht im Store).
+        if changed or (meta_changed and (key in _delay_store
+                                         or _delay_store_cancelled.get(key))):
             _delay_obs_write_through(
                 date_str, fn, hhmm, _delay_store.get(key, 0),
                 cancelled or bool(_delay_store_cancelled.get(key)),
-                airport, f.get('status'))
+                airport, f.get('status'), merged_meta)
 
 
-def _punctuality_stats(flights, airport='FRA'):
+def _punctuality_stats(flights, airport='FRA', airline=None):
     """Aggregiert on-time/delayed/cancelled über eine TAGES-Flugliste.
 
     STABILITÄTS-FIX: Die Quote basiert NUR auf Flügen, deren geplante Zeit bereits
@@ -20455,8 +20736,15 @@ def _punctuality_stats(flights, airport='FRA'):
 
     `airport` keyt den Delay-Store und die SB-Persistenz, damit MUC/BER/HAJ ihre
     eigene Tages-Stichprobe akkumulieren (keine FRA-Kontamination) und genauso wie
-    FRA cross-restart/cross-instance über airport_delay_obs wachsen."""
+    FRA cross-restart/cross-instance über airport_delay_obs wachsen.
+
+    `airline` (IATA-Code wie LH/4Y/EW) — wenn gesetzt, zählt die Quote NUR Flüge
+    dieser Airline. Der Caller filtert `flights` bereits airline-rein; dieser
+    Parameter filtert ZUSÄTZLICH die Store-Replay-Nachzählung (departed Flüge aus
+    _delay_store), die sonst über ALLE Airlines dieses Airports liefe — sonst
+    sickern fremde Carrier (z.B. LH) in eine 4Y/EW-Quote ein."""
     airport = (airport or 'FRA').upper()
+    airline = (airline or '').upper().strip()
     # Tages-Datum ermitteln und Delay-Store mergen. Load-on-Read: vorhandene
     # SB-Beobachtungen (airport_delay_obs) für heute zurückholen, damit die
     # Tages-Stichprobe einen Restart/Instanz-Wechsel überlebt — auch wenn die
@@ -20502,6 +20790,16 @@ def _punctuality_stats(flights, airport='FRA'):
                 continue
             if (today, airport, fn, sc) in known_keys:
                 continue  # schon oben gezählt
+            # Airline-Filter (LH/4Y/EW): nur Flüge dieser Airline nachzählen, sonst
+            # sickern fremde Carrier aus dem (airport-, nicht airline-gekeyten) Store
+            # in eine airline-spezifische Quote ein.
+            if airline:
+                try:
+                    al, _num = _split_flightno(fn)
+                except Exception:
+                    al = (fn[:2] if fn else '')
+                if (al or '').upper() != airline:
+                    continue
             # Dieser Flug hat geheilt — sein gespeichertes Max zurückholen.
             total += 1
             if max_delay >= _PUNCTUALITY_DELAY_THRESHOLD_MIN:
@@ -20528,6 +20826,8 @@ def _punctuality_stats(flights, airport='FRA'):
             'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay,
             'sample_size': active, 'data_incomplete': incomplete,
             'min_sample': _PUNCTUALITY_MIN_SAMPLE,
+            # EHRLICH: ab wann ein Flug als „verspätet" zählt (D15-Standard, 15 Min).
+            'delay_threshold_min': _PUNCTUALITY_DELAY_THRESHOLD_MIN,
             'scheduled_total': scheduled_total}
 
 
@@ -20591,14 +20891,21 @@ def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None):
             continue
         cancelled = bool(row.get('cancelled'))
         md = int(row.get('max_delay_min') or 0)
+        # VOLLE Felder direkt aus der persistierten Row (von→nach + Gate/Terminal).
+        # Alte Rows (vor 2026-06-14) haben diese Spalten nicht → fallen auf '' zurück.
         out.append({
-            'airline': al, 'airline_name': '', 'flight': fn,
-            'dest_iata': '', 'dest_name': '',
-            'sched': date_str + 'T' + sc + ':00', 'esti': None,
+            'airline': ((row.get('airline') or '') or al), 'airline_name': '', 'flight': fn,
+            'dest_iata': (row.get('dest_iata') or ''),
+            'dest_name': (row.get('dest_name') or ''),
+            'sched': date_str + 'T' + sc + ':00', 'esti': (row.get('esti') or None),
             'delay_min': md,
             'delayed': md >= _PUNCTUALITY_DELAY_THRESHOLD_MIN,
-            'cancelled': cancelled, 'gate': '', 'terminal': '', 'hall': '',
-            'status': ('Annulliert' if cancelled else 'Abgeflogen'),
+            'cancelled': cancelled,
+            'gate': (row.get('gate') or ''),
+            'terminal': (row.get('terminal') or ''), 'hall': '',
+            'status': ((row.get('status') or '') or
+                       ('Annulliert' if cancelled
+                        else ('Gelandet' if is_arr else 'Abgeflogen'))),
             'reg': '', 'aircraft': '', 'departed': True,
         })
     out.sort(key=lambda f: f.get('sched') or '')
@@ -20611,8 +20918,9 @@ def _punctuality_stats_from_obs(date_str, airport='FRA', airline=None):
     kein In-Memory-Store. Damit kann die iOS-Tabelle in der Zeit zurueckgehen.
 
     Jede Row ist ein abgeschlossener Flug des Tages (der Poller hat ihn in seinem
-    Abflug-Fenster erfasst). delayed = max_delay_min > 15 (gleiche Schwelle wie die
-    Live-Aggregation). `airline` (z.B. 'LH') filtert per Flugnummer-Prefix.
+    Abflug-Fenster erfasst). delayed = max_delay_min >= _PUNCTUALITY_DELAY_THRESHOLD_MIN
+    (15 Min D15, gleiche Schwelle wie die Live-Aggregation — eine Quelle der
+    Wahrheit). `airline` (z.B. 'LH') filtert per Flugnummer-Prefix.
     Liefert denselben Contract wie _punctuality_stats."""
     rows = _delay_obs_rows_for_date(date_str, airport)
     airline = (airline or '').upper().strip()
@@ -20650,6 +20958,8 @@ def _punctuality_stats_from_obs(date_str, airport='FRA', airline=None):
             'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay,
             'sample_size': active, 'data_incomplete': incomplete,
             'min_sample': _PUNCTUALITY_MIN_SAMPLE,
+            # EHRLICH: ab wann ein Flug als „verspätet" zählt (D15-Standard, 15 Min).
+            'delay_threshold_min': _PUNCTUALITY_DELAY_THRESHOLD_MIN,
             'scheduled_total': total}
 
 
@@ -20859,6 +21169,106 @@ def poll_punctuality_accumulate():
     return jsonify({'ok': True, 'accumulated': results})
 
 
+# Standard-Airport-Set für den server-seitigen Poller. FRA + MUC sind Pflicht
+# (User-Brief), die großen DE-Bases sind sinnvolle Defaults. Über die Env-Variable
+# POLL_BOARDS_AIRPORTS (Komma-Liste, z.B. "FRA,MUC,BER,JFK") überschreibbar.
+_POLL_BOARDS_DEFAULT = ('FRA', 'MUC', 'BER', 'DUS', 'HAM', 'HAJ')
+
+
+def _poll_boards_airports():
+    """Liste der zu pollenden IATA-Codes — Env-konfigurierbar, FRA+MUC garantiert."""
+    import os as _os
+    raw = (_os.environ.get('POLL_BOARDS_AIRPORTS') or '').strip()
+    if raw:
+        aps = [a.strip().upper() for a in raw.replace(';', ',').split(',') if a.strip()]
+    else:
+        aps = list(_POLL_BOARDS_DEFAULT)
+    # FRA + MUC sind Pflicht (Brief) — auch wenn die Env-Liste sie vergisst.
+    for must in ('MUC', 'FRA'):
+        if must not in aps:
+            aps.insert(0, must)
+    # Dedup unter Beibehaltung der Reihenfolge.
+    seen = set()
+    out = []
+    for a in aps:
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
+
+
+def _poll_boards_once(airports):
+    """Holt + persistiert die Abflug- UND Ankunfts-Tafel für jeden Airport (beide
+    Richtungen → Store-Keys '<AP>' / '<AP>#ARR'). Das Fetchen läuft über die
+    gecachten Board-Helfer (FRA = Fraport-Tagestafel, sonst Native-Scraper/
+    AeroDataBox); `_punctuality_stats` merged + persistiert nach airport_delay_obs.
+    Liefert ein Diagnose-Dict {airport#dir: sample_size|'no_flights'|'err:…'}.
+    Niemals raise — jeder Airport degradiert einzeln."""
+    results = {}
+    for ap in airports:
+        ap = (ap or '').upper().strip()
+        if not ap:
+            continue
+        for ftype in ('departure', 'arrival'):
+            tag = ap if ftype == 'departure' else (ap + '#ARR')
+            try:
+                if ap in ('FRA', 'EDDF'):
+                    flights = (_fra_day_board_cached(ftype) if ftype == 'departure'
+                               else _fra_board_cached(ftype))
+                elif ap in _NATIVE_BOARD_SCRAPERS:
+                    rows, _src = (_native_board_cached(ap, ftype) or (None, None))
+                    flights = rows
+                else:
+                    # Letzter Versuch über AeroDataBox-Board (env-gated).
+                    rows, _src = (_native_board_cached(ap, ftype) or (None, None))
+                    flights = rows
+                if not flights:
+                    results[tag] = 'no_flights'
+                    continue
+                stats = _punctuality_stats(flights, _store_key_for(ap, ftype))
+                results[tag] = stats.get('sample_size')
+            except Exception as e:
+                results[tag] = 'err:' + type(e).__name__
+    return results
+
+
+@app.route('/api/internal/poll-boards', methods=['POST'])
+def internal_poll_boards():
+    """Server-seitiger Tafel-Poller (Cloud-Scheduler, ~10-15 min). Holt + persistiert
+    die Abflug-/Ankunfts-Tafeln eines konfigurierten Airport-Sets (mind. FRA + MUC,
+    Env POLL_BOARDS_AIRPORTS überschreibbar) nach airport_delay_obs — UNABHÄNGIG von
+    User-Aktivität. Damit ist ein Flug wie LH848 (FRA→Helsinki) auch dann später
+    auffindbar, wenn in seinem Abflug-Fenster KEIN User FRA geöffnet hat.
+
+    AUTH: shared-secret Header `X-Poll-Secret` == Env ADSB_POLL_SECRET (gleiches
+    Muster wie /api/airport/poll-punctuality). Ist kein Secret gesetzt, sind nur
+    localhost-Aufrufe erlaubt (Fail-closed in PROD, wo das Secret gesetzt sein muss).
+
+    WIRING (manuell, einmalig) — Cloud Scheduler alle 10 Minuten:
+      gcloud scheduler jobs create http aerotax-poll-boards \
+        --location=europe-west3 \
+        --schedule="*/10 * * * *" \
+        --uri="https://aerotax-backend-XXXX.europe-west3.run.app/api/internal/poll-boards" \
+        --http-method=POST \
+        --headers="X-Poll-Secret=${ADSB_POLL_SECRET}" \
+        --time-zone="Europe/Berlin" \
+        --attempt-deadline=120s
+    (Job-URI auf die echte Cloud-Run-URL setzen; Secret = derselbe Wert wie die
+    ADSB_POLL_SECRET-Env-Var des Services. Update statt create: `jobs update http`.)
+    """
+    import os as _os, hmac as _hmac
+    secret = _os.environ.get('ADSB_POLL_SECRET', '').strip()
+    if secret:
+        provided = (request.headers.get('X-Poll-Secret') or '').strip()
+        if not provided or not _hmac.compare_digest(provided, secret):
+            return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    elif (request.remote_addr or '') not in ('127.0.0.1', '::1'):
+        return jsonify({'ok': False, 'error': 'forbidden_no_secret'}), 403
+    airports = _poll_boards_airports()
+    results = _poll_boards_once(airports)
+    return jsonify({'ok': True, 'airports': airports, 'persisted': results})
+
+
 @app.route('/api/airport/<token>/punctuality', methods=['GET'])
 def airport_punctuality(token):
     """Heutige Pünktlichkeit einer Airline ab FRA — über die GANZE Tages-Tafel
@@ -20913,7 +21323,8 @@ def airport_punctuality(token):
                 # akkumuliert MUC/BER/HAJ ihre Tages-Stichprobe ehrlich übers Tages-
                 # fenster — und zeigt bei kleiner Stichprobe "Daten unvollständig"
                 # statt einer irreführenden 100%-Quote.
-                stats = _punctuality_stats(al_rows if al_rows else rows, airport)
+                stats = _punctuality_stats(al_rows if al_rows else rows, airport,
+                                           airline if al_rows else None)
                 all_stats = _punctuality_stats(rows, airport)
                 from collections import Counter as _Ctr
                 dest_counter = _Ctr((f.get('dest_iata') or '') for f in al_rows if f.get('dest_iata'))
@@ -20976,7 +21387,7 @@ def airport_punctuality(token):
     if flights is None:
         return jsonify({'ok': False, 'error': 'source_unavailable'}), 200
     al = [f for f in flights if f.get('airline') == airline]
-    stats = _punctuality_stats(al)
+    stats = _punctuality_stats(al, 'FRA', airline)
     # Airline-weite FRA-Tages-Sicht (alle Carrier) als Kontext.
     all_stats = _punctuality_stats(flights)
     # Verspätungs-Ticker: die am stärksten verspäteten (nicht annullierten)
