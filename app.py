@@ -14467,6 +14467,13 @@ def get_wall_feed(token):
     except (TypeError, ValueError):
         before_ts = 0
     mode = (request.args.get('mode') or 'all').lower()
+    # Optionaler Airline-Filter (?airline=LH): Viewer will nur Posts der eigenen
+    # Airline sehen (z.B. „LH-Crew sieht nur LH"). Default (kein Param) = alle
+    # Airlines — Posting bleibt für alle offen, gefiltert wird NUR die Ansicht.
+    # Anonyme Posts tragen kein author_airline (wird unten gestrippt) → fallen aus
+    # einer airline-gefilterten Ansicht heraus (man kann sie keiner Airline
+    # zuordnen, ohne die Anonymität zu brechen).
+    airline_filter = (request.args.get('airline') or '').strip().upper() or None
     friends = set((_friends_load(token).get('friends') or []))
     friends.add(token)
     blocked = _blocked_by(token)
@@ -14485,6 +14492,12 @@ def get_wall_feed(token):
         # Default: alle Public-Posts (außer blocked/muted/hidden). Friends-Sort
         # kommt client-side über `from_friend`-Flag im Response.
         feed = [p for p in posts if _visible(p)]
+    # Airline-Filter anwenden (falls ?airline gesetzt). Anonyme Posts explizit
+    # raus — ihre author_airline würde sonst die Anonymität untergraben.
+    if airline_filter:
+        feed = [p for p in feed
+                if not p.get('is_anonymous')
+                and (p.get('author_airline') or '').strip().upper() == airline_filter]
     feed.sort(key=lambda p: -(p.get('ts') or 0))
     if before_ts > 0:
         feed = [p for p in feed if (p.get('ts') or 0) < before_ts]
