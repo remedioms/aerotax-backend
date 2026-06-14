@@ -2041,3 +2041,484 @@ def get_flight_reg():
         "ok": False, "flight": flight,
         "reason": "no live aircraft for this callsign (not airborne or non-standard callsign)",
     }), 200
+
+
+# =============================================================================
+#  FREE-Datenquellen-Erweiterung (2026-06-14) — mehr Radar-Power ohne paid API
+#  ---------------------------------------------------------------------------
+#  Drei zusätzliche Live-Endpunkte, alle gegen die COMMUNITY-Quelle adsb.lol
+#  (non-commercial, gentleman's API → aggressiv server-cachen!) mit OpenSky als
+#  Fallback wo sinnvoll. Wir wiederverwenden:
+#    · _coerce_float / _opensky_auth_header / _fetch_opensky_bbox / USER_AGENT
+#    · die Backoff-Mechanik (_BACKOFF) wie der Single-Aircraft-Pfad
+#    · die Great-Circle-Helfer für die Route-Linie (route-info)
+#
+#  Normalisierte Aircraft-Row-Form (FLACHES Dict, NICHT die OpenSky-Index-Liste!):
+#    {hex, flight, lat, lon, alt, speed, heading, squawk, reg, type}
+#  Das ist die im Task gewünschte client-freundliche Form für die Area-/Alert-
+#  Listen. Der Single-Aircraft-/state-Endpoint behält bewusst sein OpenSky-Index-
+#  Listen-Layout (iOS AircraftPosition.from(openSkyRow:) hängt daran) — diese
+#  Listen-Endpunkte liefern die handlichere Dict-Form.
+# =============================================================================
+
+# ── Area-/Alert-Cache (getrennt vom Single-Aircraft-_CACHE) ──────────────────
+# adsb.lol ist community-betrieben → wir cachen Area-Queries 45s und Alerts 30s,
+# gekeyed auf gerundete Parameter, damit N Clients ≈ 1 Upstream-Call/Fenster
+# auslösen. Eigener Lock, damit Area-Traffic den Single-Aircraft-Cache nicht
+# blockiert.
+_AREA_CACHE = {}                 # key -> {"at": float, "payload": dict}
+_AREA_CACHE_LOCK = threading.Lock()
+_AREA_TTL_SECONDS = 45
+_ALERTS_TTL_SECONDS = 30
+_ROUTEINFO_TTL_SECONDS = 6 * 3600  # Routen sind statisch genug für lange TTL
+
+ADSB_LOL_BASE = "https://api.adsb.lol"
+ADSB_LOL_AREA_TIMEOUT = 8
+HEXDB_TIMEOUT = 5
+# adsb.lol point-radius cap (nm). Über ~250nm wird die Antwort riesig und die
+# community-API unfair belastet → hart deckeln.
+_AREA_RADIUS_CAP_NM = 250
+
+
+def _area_cache_get(key, ttl):
+    now = time.time()
+    with _AREA_CACHE_LOCK:
+        e = _AREA_CACHE.get(key)
+        if e is None:
+            return None
+        if now - e["at"] > ttl:
+            return None
+        return e["payload"]
+
+
+def _area_cache_put(key, payload):
+    with _AREA_CACHE_LOCK:
+        _AREA_CACHE[key] = {"at": time.time(), "payload": payload}
+        if len(_AREA_CACHE) > 300:
+            items = sorted(_AREA_CACHE.items(), key=lambda kv: kv[1]["at"])
+            for k, _ in items[:80]:
+                _AREA_CACHE.pop(k, None)
+
+
+def _normalize_adsb_lol_ac(ac):
+    """adsb.lol-Aircraft-Dict → flache normalisierte Row.
+    {hex, flight, lat, lon, alt, speed, heading, squawk, reg, type}.
+    None wenn keine Position (lat/lon fehlt) — Mode-S-only-Records droppen wir.
+
+    alt_baro kann "ground" (String) sein → alt=0, on_ground=True."""
+    if not isinstance(ac, dict):
+        return None
+    lat = _coerce_float(ac.get("lat"))
+    lon = _coerce_float(ac.get("lon"))
+    if lat is None or lon is None:
+        return None
+    alt_raw = ac.get("alt_baro")
+    on_ground = (alt_raw == "ground")
+    alt = 0 if on_ground else _coerce_float(alt_raw)
+    flight = (ac.get("flight") or "").strip() or None
+    reg = (ac.get("r") or "").strip() or None
+    return {
+        "hex": (ac.get("hex") or "").strip().lower() or None,
+        "flight": flight,
+        "callsign": flight,           # Alias — manche Clients erwarten `callsign`
+        "lat": lat,
+        "lon": lon,
+        "alt": alt,                   # ft (baro), 0 wenn am Boden
+        "speed": _coerce_float(ac.get("gs")),      # ground speed kts
+        "heading": _coerce_float(ac.get("track")),  # track deg
+        "squawk": (ac.get("squawk") or None),
+        "reg": reg,
+        "type": (ac.get("t") or None),
+        "on_ground": on_ground,
+    }
+
+
+def _normalize_opensky_state(s):
+    """OpenSky /states/all-Row (Index-Liste) → dieselbe flache normalisierte Row.
+    Wird im Area-Fallback genutzt (Einheiten an adsb.lol angeglichen:
+    alt in ft, speed in kts). None wenn keine Position."""
+    if not s or not isinstance(s, (list, tuple)) or len(s) < 11:
+        return None
+    lat = _coerce_float(s[6])
+    lon = _coerce_float(s[5])
+    if lat is None or lon is None:
+        return None
+    on_ground = bool(s[8]) if s[8] is not None else False
+    alt_m = _coerce_float(s[7])
+    alt_ft = (alt_m / 0.3048) if alt_m is not None else None
+    if on_ground:
+        alt_ft = 0
+    vel_ms = _coerce_float(s[9])
+    gs_kts = (vel_ms / 0.514444) if vel_ms is not None else None
+    callsign = (s[1] or "").strip() if s[1] else None
+    squawk = s[14] if len(s) > 14 and s[14] else None
+    return {
+        "hex": (s[0] or "").strip().lower() or None,
+        "flight": callsign,
+        "callsign": callsign,
+        "lat": lat,
+        "lon": lon,
+        "alt": round(alt_ft) if alt_ft is not None else None,
+        "speed": round(gs_kts, 1) if gs_kts is not None else None,
+        "heading": _coerce_float(s[10]),
+        "squawk": str(squawk) if squawk else None,
+        "reg": None,                  # OpenSky-State liefert keine Reg
+        "type": None,
+        "on_ground": on_ground,
+    }
+
+
+def _fetch_adsb_lol_point(lat, lon, radius_nm):
+    """adsb.lol /v2/point/{lat}/{lon}/{radius} → Liste normalisierter Rows.
+    Raises _AdsbLolError bei HTTP/Parse/Timeout. Leere Antwort → []."""
+    url = f"{ADSB_LOL_BASE}/v2/point/{lat}/{lon}/{int(radius_nm)}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT, "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=ADSB_LOL_AREA_TIMEOUT) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        raise _AdsbLolError(f"adsb.lol point http {e.code}") from e
+    except urllib.error.URLError as e:
+        raise _AdsbLolError(f"adsb.lol point network: {e.reason}") from e
+    except Exception as e:
+        raise _AdsbLolError(f"adsb.lol point transport: {type(e).__name__}") from e
+    try:
+        obj = json.loads(data)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise _AdsbLolError("adsb.lol point invalid json") from e
+    out = []
+    for ac in (obj.get("ac") or []):
+        row = _normalize_adsb_lol_ac(ac)
+        if row is not None:
+            out.append(row)
+    return out
+
+
+def _bbox_from_point(lat, lon, radius_nm):
+    """Grobe Bounding-Box (lamin, lomin, lamax, lomax) um einen Punkt für den
+    OpenSky-Area-Fallback. 1 nm Breitengrad ≈ 1/60°; Längengrad mit cos(lat)
+    korrigiert. Gedeckelt auf gültige Wertebereiche."""
+    dlat = radius_nm / 60.0
+    cos_lat = max(0.01, math.cos(math.radians(lat)))
+    dlon = radius_nm / (60.0 * cos_lat)
+    lamin = max(-90.0, lat - dlat)
+    lamax = min(90.0, lat + dlat)
+    lomin = max(-180.0, lon - dlon)
+    lomax = min(180.0, lon + dlon)
+    return lamin, lomin, lamax, lomax
+
+
+@adsb_bp.route('/api/adsb/area', methods=['GET'])
+def get_adsb_area():
+    """Live-Aircraft in einem Radius um einen Punkt.
+
+    Query: lat= lon= radius= (nm, default 100, cap 250).
+    Quelle: adsb.lol /v2/point/{lat}/{lon}/{radius} (community, cache 45s).
+    Fallback: OpenSky /states/all über eine bbox aus lat/lon/radius.
+
+    200: {ok, count, aircraft:[{hex,flight,lat,lon,alt,speed,heading,squawk,reg,type,on_ground}], source, cached}
+    400: lat/lon fehlt oder out-of-range.
+    """
+    if _rate_limited(ip=_req_ip(request), endpoint='adsb_area', limit=120, window_sec=60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    lat = _coerce_float(request.args.get('lat'))
+    lon = _coerce_float(request.args.get('lon'))
+    if lat is None or lon is None:
+        return jsonify({"ok": False, "error": "missing lat/lon"}), 400
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        return jsonify({"ok": False, "error": "invalid lat/lon"}), 400
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return jsonify({"ok": False, "error": "lat/lon out of range"}), 400
+
+    radius = _coerce_float(request.args.get('radius'))
+    if radius is None or radius <= 0:
+        radius = 100.0
+    radius = min(_AREA_RADIUS_CAP_NM, max(1.0, radius))
+
+    # Cache-Key auf ~0.1° (≈6nm) gerundet, damit leicht abweichende GPS-Punkte
+    # denselben Cache-Eintrag treffen (N Clients → 1 Upstream-Call/Fenster).
+    ck = f"area:{round(lat, 1)}:{round(lon, 1)}:{int(round(radius / 10) * 10)}"
+    cached = _area_cache_get(ck, _AREA_TTL_SECONDS)
+    if cached is not None:
+        out = dict(cached)
+        out["cached"] = True
+        return jsonify(out), 200
+
+    tried = []
+    aircraft = None
+    source = None
+
+    # ─── Primär: adsb.lol point-radius ───
+    try:
+        aircraft = _fetch_adsb_lol_point(lat, lon, radius)
+        source = "adsb.lol"
+        tried.append({"upstream": "adsb.lol", "ok": True})
+    except _AdsbLolError as e:
+        tried.append({"upstream": "adsb.lol", "ok": False, "reason": str(e)[:80]})
+
+    # ─── Fallback: OpenSky bbox (außer im Backoff) ───
+    if aircraft is None:
+        now = time.time()
+        with _BACKOFF["lock"]:
+            backoff_until = _BACKOFF["until"]
+        if now < backoff_until:
+            tried.append({"upstream": "opensky", "ok": False,
+                          "reason": f"backoff_active({int(backoff_until - now)}s)"})
+        else:
+            lamin, lomin, lamax, lomax = _bbox_from_point(lat, lon, radius)
+            try:
+                states, _rem = _fetch_opensky_bbox(lamin, lomin, lamax, lomax)
+                aircraft = []
+                for s in states:
+                    row = _normalize_opensky_state(s)
+                    if row is not None:
+                        aircraft.append(row)
+                source = "opensky"
+                tried.append({"upstream": "opensky", "ok": True})
+            except _OpenSkyRateLimit as e:
+                with _BACKOFF["lock"]:
+                    _BACKOFF["until"] = time.time() + e.retry_after
+                tried.append({"upstream": "opensky", "ok": False,
+                              "reason": f"rate_limited({e.retry_after}s)"})
+            except _OpenSkyError as e:
+                tried.append({"upstream": "opensky", "ok": False, "reason": str(e)[:80]})
+
+    if aircraft is None:
+        return jsonify({"ok": False, "error": "all_upstreams_failed",
+                        "lat": lat, "lon": lon, "radius_nm": radius,
+                        "tried": tried}), 502
+
+    payload = {
+        "ok": True,
+        "count": len(aircraft),
+        "aircraft": aircraft,
+        "lat": lat, "lon": lon, "radius_nm": radius,
+        "source": source,
+        "cached": False,
+        "tried": tried,
+    }
+    _area_cache_put(ck, payload)
+    return jsonify(payload), 200
+
+
+@adsb_bp.route('/api/adsb/alerts', methods=['GET'])
+def get_adsb_alerts():
+    """Emergency-/Special-Squawks (+ optional Military), gemerged & normalisiert.
+
+    Quelle: adsb.lol /v2/squawk/{7700,7600,7500} (+ /v2/mil wenn ?mil=1),
+    Community-API → cache 30s. Jede Row bekommt `alert_type`:
+      7700 → emergency, 7600 → radio, 7500 → hijack, mil → military.
+
+    200: {ok, count, aircraft:[{...row..., alert_type}], cached}
+    """
+    if _rate_limited(ip=_req_ip(request), endpoint='adsb_alerts', limit=60, window_sec=60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    include_mil = (request.args.get('mil') or '').strip() in ('1', 'true', 'yes')
+    ck = f"alerts:{1 if include_mil else 0}"
+    cached = _area_cache_get(ck, _ALERTS_TTL_SECONDS)
+    if cached is not None:
+        out = dict(cached)
+        out["cached"] = True
+        return jsonify(out), 200
+
+    sources = [
+        ("/v2/squawk/7700", "emergency"),
+        ("/v2/squawk/7600", "radio"),
+        ("/v2/squawk/7500", "hijack"),
+    ]
+    if include_mil:
+        sources.append(("/v2/mil", "military"))
+
+    merged = {}          # hex (oder synthetischer Key) -> row
+    tried = []
+    any_ok = False
+    for path, alert_type in sources:
+        url = f"{ADSB_LOL_BASE}{path}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": USER_AGENT, "Accept": "application/json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=ADSB_LOL_AREA_TIMEOUT) as resp:
+                obj = json.loads(resp.read())
+            any_ok = True
+            tried.append({"path": path, "ok": True})
+        except Exception as e:
+            tried.append({"path": path, "ok": False, "reason": f"{type(e).__name__}"})
+            continue
+        for ac in (obj.get("ac") or []):
+            row = _normalize_adsb_lol_ac(ac)
+            if row is None:
+                continue
+            row["alert_type"] = alert_type
+            # Dedupe per Hex; emergency hat Vorrang vor military, wenn ein Flieger
+            # in mehreren Listen auftaucht (Reihenfolge der `sources`-Liste).
+            key = row.get("hex") or f"{row.get('flight')}:{row.get('lat')}:{row.get('lon')}"
+            if key not in merged:
+                merged[key] = row
+
+    if not any_ok:
+        return jsonify({"ok": False, "error": "all_upstreams_failed",
+                        "tried": tried}), 502
+
+    aircraft = list(merged.values())
+    payload = {
+        "ok": True,
+        "count": len(aircraft),
+        "aircraft": aircraft,
+        "source": "adsb.lol",
+        "cached": False,
+        "tried": tried,
+    }
+    _area_cache_put(ck, payload)
+    return jsonify(payload), 200
+
+
+# ── Route-Resolve: callsign → origin/destination airport ─────────────────────
+#
+# Zwei Quellen:
+#   1) adsb.lol /api/0/routeset (POST {planes:[{callsign,lat,lng}]}) — liefert
+#      _airports[]-Liste (erstes = origin, letztes = destination) mit
+#      iata/icao/lat/lon. lat/lng des Planes verbessert die Disambiguierung bei
+#      mehrdeutigen Callsigns; wir senden 0/0 wenn unbekannt.
+#   2) hexdb.io /api/v1/route/iata/<callsign> — Fallback, liefert "route":"FRA-JFK".
+#      hexdb kennt aber nur Codes, keine Koordinaten → wir reichern lat/lon aus
+#      der eingebauten _AIRPORTS-Map an (best-effort, kann None bleiben).
+
+
+def _airport_obj_from_adsb_lol(a):
+    """adsb.lol routeset-_airports-Eintrag → {iata,icao,lat,lon}. None bei Müll."""
+    if not isinstance(a, dict):
+        return None
+    iata = (a.get("iata") or "").strip().upper() or None
+    icao = (a.get("icao") or "").strip().upper() or None
+    if not iata and not icao:
+        return None
+    return {
+        "iata": iata,
+        "icao": icao,
+        "lat": _coerce_float(a.get("lat")),
+        "lon": _coerce_float(a.get("lon")),
+    }
+
+
+def _resolve_route_adsb_lol(callsign, lat, lng):
+    """adsb.lol /api/0/routeset POST-Batch. Liefert (origin, destination) als
+    Dicts oder (None, None). Wirft NIE — Fehler → (None, None)."""
+    body = json.dumps({"planes": [{
+        "callsign": callsign,
+        "lat": lat if lat is not None else 0,
+        "lng": lng if lng is not None else 0,
+    }]}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{ADSB_LOL_BASE}/api/0/routeset", data=body, method="POST",
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        })
+    try:
+        with urllib.request.urlopen(req, timeout=ADSB_LOL_AREA_TIMEOUT) as resp:
+            obj = json.loads(resp.read())
+    except Exception:
+        return None, None
+    # routeset liefert eine Liste pro Plane; jedes Element hat _airports[].
+    entries = obj if isinstance(obj, list) else obj.get("planes") or []
+    if not entries:
+        return None, None
+    first = entries[0] if isinstance(entries[0], dict) else {}
+    airports = first.get("_airports") or []
+    if not isinstance(airports, list) or len(airports) < 2:
+        return None, None
+    origin = _airport_obj_from_adsb_lol(airports[0])
+    destination = _airport_obj_from_adsb_lol(airports[-1])
+    return origin, destination
+
+
+def _resolve_route_hexdb(callsign):
+    """hexdb.io Fallback: /api/v1/route/iata/<callsign> → "route":"FRA-JFK".
+    lat/lon werden aus der eingebauten _AIRPORTS-Map angereichert (IATA-keyed).
+    Liefert (origin, destination) oder (None, None). Wirft NIE."""
+    safe = urllib.parse.quote(callsign, safe="")
+    url = f"https://hexdb.io/api/v1/route/iata/{safe}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT, "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=HEXDB_TIMEOUT) as resp:
+            obj = json.loads(resp.read())
+    except Exception:
+        return None, None
+    route = (obj.get("route") or "").strip().upper()
+    if not route or "-" not in route:
+        return None, None
+    parts = [p.strip() for p in route.split("-") if p.strip()]
+    if len(parts) < 2:
+        return None, None
+    dep_iata, arr_iata = parts[0], parts[-1]
+
+    def _mk(iata):
+        coord = _AIRPORTS.get(iata)
+        return {
+            "iata": iata,
+            "icao": None,
+            "lat": coord[0] if coord else None,
+            "lon": coord[1] if coord else None,
+        }
+    return _mk(dep_iata), _mk(arr_iata)
+
+
+@adsb_bp.route('/api/adsb/route-info', methods=['GET'])
+def get_route_info():
+    """Resolve callsign → origin/destination airport (zum Zeichnen der Linie).
+
+    Query: callsign= (required), optional lat= lng= (verbessert Disambiguierung).
+    Quelle: adsb.lol /api/0/routeset → Fallback hexdb.io /api/v1/route/iata.
+    Cache: 6h (Routen sind statisch).
+
+    200 (Treffer): {ok, callsign, origin:{iata,icao,lat,lon}, destination:{...}, source}
+    200 (kein Treffer): {ok:false, callsign, reason:"no_route_data"}
+    """
+    if _rate_limited(ip=_req_ip(request), endpoint='adsb_route_info', limit=120, window_sec=60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    callsign = (request.args.get('callsign') or '').strip().upper()
+    if not callsign:
+        return jsonify({"ok": False, "error": "missing callsign"}), 400
+    lat = _coerce_float(request.args.get('lat'))
+    lng = _coerce_float(request.args.get('lng') or request.args.get('lon'))
+
+    ck = f"route:{callsign}"
+    cached = _area_cache_get(ck, _ROUTEINFO_TTL_SECONDS)
+    if cached is not None:
+        out = dict(cached)
+        out["cached"] = True
+        return jsonify(out), 200
+
+    source = None
+    origin, destination = _resolve_route_adsb_lol(callsign, lat, lng)
+    if origin and destination:
+        source = "adsb.lol"
+    else:
+        origin, destination = _resolve_route_hexdb(callsign)
+        if origin and destination:
+            source = "hexdb.io"
+
+    if not (origin and destination):
+        # Kein Cache für Misses — Routen können nachträglich in den DBs auftauchen.
+        return jsonify({"ok": False, "callsign": callsign,
+                        "reason": "no_route_data"}), 200
+
+    payload = {
+        "ok": True,
+        "callsign": callsign,
+        "origin": origin,
+        "destination": destination,
+        "source": source,
+        "cached": False,
+    }
+    _area_cache_put(ck, payload)
+    return jsonify(payload), 200

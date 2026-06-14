@@ -10900,6 +10900,259 @@ def get_metar_by_iata(iata):
     return jsonify(result)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Airport-Enrichment: /api/airport/<icao>/detail
+#  ---------------------------------------------------------------------------
+#  Kombiniert (alle FREE-Quellen, keine paid API):
+#    · METAR + TAF  → aviationweather.gov (US Public Domain), via demselben
+#      Fetch-Pfad + `_decode_metar_human` wie /api/weather/metar.
+#    · Runways + Frequencies + Elevation → OurAirports CSVs (Public Domain,
+#      davidmegginson.github.io/ourairports-data).
+#
+#  OurAirports-Load-Strategie: LAZY + Prozess-weiter Cache. Beim ERSTEN Call
+#  laden wir runways.csv / airport-frequencies.csv / airports.csv einmal herunter,
+#  parsen sie in ICAO-gekeyte Dicts und halten sie im Speicher (_OURAIRPORTS_*).
+#  KEIN Download beim Startup (würde Cold-Start blocken). Ein Lock serialisiert
+#  den Erst-Load (Thundering-Herd-Schutz); schlägt der Download fehl, liefern wir
+#  ehrlich runways/frequencies=[] statt zu crashen — METAR/TAF kommen trotzdem.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_OURAIRPORTS_BASE = "https://davidmegginson.github.io/ourairports-data"
+_OURAIRPORTS_LOCK = __import__('threading').Lock()
+_OURAIRPORTS_LOADED = False
+_OURAIRPORTS_RUNWAYS = {}       # ICAO(upper) -> [runway dicts]
+_OURAIRPORTS_FREQS = {}         # ICAO(upper) -> [freq dicts]
+_OURAIRPORTS_AIRPORTS = {}      # ICAO(upper) -> {elevation_ft, name, ...}
+_OURAIRPORTS_LOAD_ERROR = None
+
+
+def _ourairports_fetch_csv(name):
+    """Lädt eine OurAirports-CSV und gibt sie als Liste von Dicts zurück.
+    Wirft bei Netz-/Parse-Fehler (Caller fängt + degradiert)."""
+    import csv as _csv
+    import urllib.request as ur
+    url = f'{_OURAIRPORTS_BASE}/{name}'
+    req = ur.Request(url, headers={'User-Agent': 'AeroX/1.0 (aviation-app)'})
+    with ur.urlopen(req, timeout=20) as r:
+        text = r.read().decode('utf-8', errors='replace')
+    return list(_csv.DictReader(io.StringIO(text)))
+
+
+def _ourairports_ensure_loaded():
+    """Lazy one-shot Load der OurAirports-Daten in Prozess-Caches. Idempotent.
+    Returns True wenn Daten verfügbar sind (auch teilweise), False bei total-Fail.
+    Blockt NIE den Startup — wird erst beim ersten /detail-Call aufgerufen."""
+    global _OURAIRPORTS_LOADED, _OURAIRPORTS_LOAD_ERROR
+    if _OURAIRPORTS_LOADED:
+        return True
+    with _OURAIRPORTS_LOCK:
+        if _OURAIRPORTS_LOADED:
+            return True
+        try:
+            # airports.csv: ident (ICAO) -> elevation/name. Index für die anderen
+            # CSVs nutzt airport_ref (numeric id) → wir brauchen die id→ICAO-Map.
+            airports = _ourairports_fetch_csv('airports.csv')
+            id_to_icao = {}
+            for a in airports:
+                icao = (a.get('ident') or '').strip().upper()
+                if not icao:
+                    continue
+                aid = (a.get('id') or '').strip()
+                if aid:
+                    id_to_icao[aid] = icao
+                _OURAIRPORTS_AIRPORTS[icao] = {
+                    'elevation_ft': _to_int_or_none(a.get('elevation_ft')),
+                    'name': a.get('name') or None,
+                    'iata': (a.get('iata_code') or '').strip().upper() or None,
+                    'lat': _to_float_or_none(a.get('latitude_deg')),
+                    'lon': _to_float_or_none(a.get('longitude_deg')),
+                }
+
+            runways = _ourairports_fetch_csv('runways.csv')
+            for rw in runways:
+                aref = (rw.get('airport_ref') or '').strip()
+                icao = id_to_icao.get(aref)
+                if not icao:
+                    icao = (rw.get('airport_ident') or '').strip().upper()
+                if not icao:
+                    continue
+                lit = (rw.get('lighted') or '').strip()
+                _OURAIRPORTS_RUNWAYS.setdefault(icao, []).append({
+                    'le_ident': (rw.get('le_ident') or '').strip() or None,
+                    'he_ident': (rw.get('he_ident') or '').strip() or None,
+                    'length_ft': _to_int_or_none(rw.get('length_ft')),
+                    'width_ft': _to_int_or_none(rw.get('width_ft')),
+                    'surface': (rw.get('surface') or '').strip() or None,
+                    'lit': (lit == '1') if lit in ('0', '1') else None,
+                })
+
+            freqs = _ourairports_fetch_csv('airport-frequencies.csv')
+            for fr in freqs:
+                aref = (fr.get('airport_ref') or '').strip()
+                icao = id_to_icao.get(aref)
+                if not icao:
+                    icao = (fr.get('airport_ident') or '').strip().upper()
+                if not icao:
+                    continue
+                _OURAIRPORTS_FREQS.setdefault(icao, []).append({
+                    'type': (fr.get('type') or '').strip() or None,
+                    'description': (fr.get('description') or '').strip() or None,
+                    'mhz': _to_float_or_none(fr.get('frequency_mhz')),
+                })
+            _OURAIRPORTS_LOADED = True
+            _OURAIRPORTS_LOAD_ERROR = None
+            return True
+        except Exception as e:
+            _OURAIRPORTS_LOAD_ERROR = f'{type(e).__name__}: {str(e)[:120]}'
+            try:
+                app.logger.warning(f'[airport-detail] ourairports load FAIL: {_OURAIRPORTS_LOAD_ERROR}')
+            except Exception:
+                pass
+            return False
+
+
+def _to_int_or_none(v):
+    try:
+        s = str(v).strip()
+        if not s:
+            return None
+        return int(float(s))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float_or_none(v):
+    try:
+        s = str(v).strip()
+        if not s:
+            return None
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_aviationweather(kind, icao):
+    """Holt rohe METAR- oder TAF-JSON-Liste von aviationweather.gov. kind ∈
+    {'metar','taf'}. Liefert die JSON-Liste oder None bei Fehler. Wirft NIE."""
+    import urllib.request as ur
+    hours = '&hours=1' if kind == 'metar' else ''
+    url = f'https://aviationweather.gov/api/data/{kind}?ids={icao}&format=json{hours}'
+    try:
+        req = ur.Request(url, headers={
+            'User-Agent': 'AeroX/1.0 (aviation-app; +https://aerosteuer.de)',
+            'Accept': 'application/json',
+        })
+        with ur.urlopen(req, timeout=8) as r:
+            return json.loads(r.read().decode('utf-8'))
+    except Exception:
+        return None
+
+
+@app.route('/api/airport/<icao>/detail', methods=['GET'])
+def get_airport_detail(icao):
+    """Kombinierte Airport-Info: METAR + TAF (aviationweather.gov) +
+    Runways/Frequencies/Elevation (OurAirports). Alle Quellen frei.
+
+    200: {ok, icao, name, metar:{raw,decoded,...}|null, taf:{raw}|null,
+          runways:[{le_ident,he_ident,length_ft,surface,lit}],
+          frequencies:[{type,description,mhz}], elevation_ft}
+    400: ungültiger ICAO.
+
+    Ehrlich: einzelne Quellen können fehlen — dann ist das jeweilige Feld
+    null/[] mit `*_status` statt eines Fehlers für den ganzen Call.
+    """
+    import re
+    icao = (icao or '').strip().upper()
+    if not re.match(r'^[A-Z0-9]{4}$', icao):
+        return jsonify({'ok': False, 'error': 'invalid_icao'}), 400
+
+    cache_key = f'airport_detail:{icao}'
+    cached = _aviation_cache_get(cache_key, 600)
+    if cached is not None:
+        return jsonify(cached)
+
+    # ─── METAR (raw + decoded via shared helper) ───
+    metar = None
+    metar_status = 'no_data'
+    raw_metar = _fetch_aviationweather('metar', icao)
+    if raw_metar is None:
+        metar_status = 'fetch_failed'
+    elif raw_metar:
+        m = raw_metar[0] if isinstance(raw_metar, list) else raw_metar
+        vis_sm = m.get('visib')
+        visibility_km = None
+        if vis_sm is not None:
+            try:
+                visibility_km = round(float(vis_sm) * 1.609, 1)
+            except (TypeError, ValueError):
+                pass
+        conditions = m.get('wxString')
+        if isinstance(conditions, list):
+            conditions = ', '.join(str(c) for c in conditions if c)
+        metar = {
+            'raw': m.get('rawOb'),
+            'temp_c': m.get('temp'),
+            'dewpoint_c': m.get('dewp'),
+            'wind_dir': m.get('wdir'),
+            'wind_kt': m.get('wspd'),
+            'wind_gust_kt': m.get('wgst'),
+            'visibility_km': visibility_km,
+            'altimeter_hpa': m.get('altim'),
+            'flight_category': m.get('fltCat'),
+            'time_iso': m.get('reportTime'),
+            'decoded': _decode_metar_human(m.get('rawOb'), m.get('temp'),
+                                           m.get('wspd'), m.get('wdir'),
+                                           vis_sm, conditions),
+        }
+        metar_status = 'ok'
+
+    # ─── TAF (raw forecast) ───
+    taf = None
+    taf_status = 'no_data'
+    raw_taf = _fetch_aviationweather('taf', icao)
+    if raw_taf is None:
+        taf_status = 'fetch_failed'
+    elif raw_taf:
+        t = raw_taf[0] if isinstance(raw_taf, list) else raw_taf
+        taf = {
+            'raw': t.get('rawTAF'),
+            'time_iso': t.get('issueTime'),
+            'valid_from': t.get('validTimeFrom'),
+            'valid_to': t.get('validTimeTo'),
+        }
+        taf_status = 'ok'
+
+    # ─── Runways / Frequencies / Elevation (OurAirports, lazy-loaded) ───
+    oa_ok = _ourairports_ensure_loaded()
+    runways = _OURAIRPORTS_RUNWAYS.get(icao, []) if oa_ok else []
+    frequencies = _OURAIRPORTS_FREQS.get(icao, []) if oa_ok else []
+    ap = _OURAIRPORTS_AIRPORTS.get(icao, {}) if oa_ok else {}
+    elevation_ft = ap.get('elevation_ft')
+    static_status = 'ok' if oa_ok else 'unavailable'
+
+    result = {
+        'ok': True,
+        'icao': icao,
+        'name': ap.get('name'),
+        'iata': ap.get('iata'),
+        'lat': ap.get('lat'),
+        'lon': ap.get('lon'),
+        'elevation_ft': elevation_ft,
+        'metar': metar,
+        'metar_status': metar_status,
+        'taf': taf,
+        'taf_status': taf_status,
+        'runways': runways,
+        'frequencies': frequencies,
+        'static_status': static_status,
+    }
+    # Nur cachen wenn mindestens eine dynamische Quelle echte Daten lieferte —
+    # so retryt ein transienter aviationweather-Fail nicht erst nach 10 min.
+    if metar_status == 'ok' or taf_status == 'ok' or static_status == 'ok':
+        _aviation_cache_set(cache_key, result, 600)
+    return jsonify(result)
+
+
 # ─── Aviation-News Vollartikel-Proxy (Multi-Source) ─────────────────────────
 # W-Article (2026-06-01): erweitert von aero.de-only auf 6 Aviation-Quellen.
 # Pipeline:
