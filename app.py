@@ -22702,6 +22702,79 @@ def _iso_minutes_between(a, b):
         return None
 
 
+def _ics_iso_to_station_hhmm(iso_utc, iata):
+    """UTC-ISO-Zeitstempel → station-lokales 'HH:MM'.
+
+    Konvertiert nach der IANA-TZ des angegebenen IATA (via airport_tz). Wenn
+    die Station unbekannt ist ODER keine TZ-DB verfügbar ist, fällt auf
+    Europe/Berlin zurück (dieselbe Operations-TZ, die _ics_parse_dt für die
+    Tages-Buckets nutzt). Liefert None bei Parse-Fehler.
+
+    EHRLICHKEIT: Eine echte stationslokale Zeit setzt voraus, dass die IATA im
+    airport_tz-Datensatz steht. Fehlt sie, ist die Zeit Berlin-lokal — bei
+    Interkont-Legs also NICHT die Wanduhr am Zielflughafen.
+    """
+    s = (iso_utc or '').strip()
+    if not s:
+        return None
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+    except Exception:
+        _ZI = None  # type: ignore
+    try:
+        dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except Exception:
+        return None
+    tzname = None
+    try:
+        tzname = airport_tz(iata) if iata else None
+    except Exception:
+        tzname = None
+    if _ZI is not None:
+        try:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_ZI('UTC'))
+            local = dt.astimezone(_ZI(tzname or 'Europe/Berlin'))
+            return local.strftime('%H:%M')
+        except Exception:
+            pass
+    # Ohne zoneinfo: nackte (UTC-)Zeit — besser als nichts.
+    try:
+        return dt.strftime('%H:%M')
+    except Exception:
+        return None
+
+
+def _ics_parse_flight_leg_summary(summary):
+    """Parst eine Flug-Leg-SUMMARY → (flight, from_iata, to_iata) oder Nones.
+
+    Erkennt das myTime-Format 'LH 390: FRA-LUX' (Carrier+Nummer, Doppelpunkt,
+    Routing IATA-IATA). Toleriert fehlende Flugnummer ('FRA-LUX') und DH-Legs
+    ('DH LH 123: FRA-MUC' → flight='DH LH 123'). Liefert (None,None,None) wenn
+    kein Routing erkennbar.
+    """
+    s = (summary or '').strip()
+    if not s:
+        return None, None, None
+    # Routing: erstes IATA-IATA-Paar (3 Buchstaben - 3 Buchstaben).
+    m = re.search(r'\b([A-Za-z]{3})\s*-\s*([A-Za-z]{3})\b', s)
+    if not m:
+        return None, None, None
+    frm = m.group(1).upper()
+    to = m.group(2).upper()
+    # Flug = Teil vor dem ':' (falls vorhanden), sonst alles vor dem Routing.
+    flight = None
+    if ':' in s:
+        cand = s.split(':', 1)[0].strip()
+        if cand:
+            flight = cand[:24]
+    if not flight:
+        pre = s[:m.start()].strip(' -')
+        if pre:
+            flight = pre[:24]
+    return flight, frm, to
+
+
 def _ics_events_to_briefings(events, existing=None):
     """Konsumiert Event-Liste → dict[datum_str → briefing_dict]. F2 expandiert
     Multi-Day-Events auf alle Tage, F5 merged Same-Day-Events.
@@ -22853,6 +22926,35 @@ def _ics_events_to_briefings(events, existing=None):
                     if dur and 0 < dur < 24 * 60:
                         block_min += dur
                 existing_b['block_minutes'] = block_min
+                # ── Strukturierte Per-Leg-Liste (additiv) ───────────────────
+                # Jedes Flug-Leg-VEVENT wird als {from,to,flight,dep,arr} in
+                # `legs` gesammelt, damit der Client pro Leg Dep/Arr-Zeiten
+                # zeigen kann (die Tages-Spanne ical_start/-end reicht dafür
+                # nicht). dep/arr sind station-LOKAL (HH:MM): dep aus DTSTART in
+                # der TZ der Abflug-Station, arr aus DTEND in der TZ der Ankunft.
+                # Re-Import baut die Liste pro Tag frisch auf (an block_reset
+                # gekoppelt, dedupe gegen Doppelung).
+                if date_str in block_reset_dates and 'legs' not in existing_b:
+                    existing_b['legs'] = []
+                if _ev_is_flight_leg(day_summary):
+                    _flt, _frm, _to = _ics_parse_flight_leg_summary(summary)
+                    if _frm and _to:
+                        _leg = {
+                            'from': _frm,
+                            'to': _to,
+                            'flight': _flt or '',
+                            'dep': _ics_iso_to_station_hhmm(start_iso, _frm) or '',
+                            'arr': _ics_iso_to_station_hhmm(end_iso, _to) or '',
+                        }
+                        _legs = existing_b.get('legs')
+                        if not isinstance(_legs, list):
+                            _legs = []
+                        # Dedupe: gleiche Route+Flug+Dep nicht doppelt anhängen.
+                        _sig = (_leg['from'], _leg['to'], _leg['flight'], _leg['dep'])
+                        if not any((l.get('from'), l.get('to'), l.get('flight'),
+                                    l.get('dep')) == _sig for l in _legs if isinstance(l, dict)):
+                            _legs.append(_leg)
+                        existing_b['legs'] = _legs
             # CATEGORIES-Mapping: nur setzen wenn ein bekanntes Mapping
             # gefunden wurde. Bei Same-Day-Merge: existing klass nicht überschreiben
             # ausser das neue Event hat ein klares Signal (LAYOVER > STANDBY > frei).
