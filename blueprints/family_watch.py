@@ -165,7 +165,7 @@ def _requests_disk_path():
     return os.path.join(hist, 'family_requests.json')
 
 
-def _requests_load():
+def _requests_load_from_disk():
     p = _requests_disk_path()
     if not os.path.exists(p):
         return []
@@ -176,12 +176,95 @@ def _requests_load():
         return []
 
 
+def _requests_load_from_sb():
+    """SB-Read der offenen Family-Anfragen. None wenn SB nicht verfügbar/Tabelle
+    fehlt → Caller fällt auf Disk zurück."""
+    sb_avail, sb = _get_sb()
+    if not sb_avail or sb is None:
+        return None
+    try:
+        out = []
+        r = sb.table('family_requests').select('*').execute()
+        for row in (r.data or []):
+            out.append({
+                'crew_token': row.get('crew_token'),
+                'family_token': row.get('family_token'),
+                'relation': row.get('relation'),
+                'requester_name': row.get('requester_name'),
+                'requester_avatar': row.get('requester_avatar'),
+                'created_at': row.get('created_at'),
+            })
+        return out
+    except Exception as e:
+        _log().warning(f'[family-req] sb_load_fail {type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _requests_save_to_sb(reqs):
+    """Reconciliert SB exakt auf `reqs` (klein): entfernte (crew,family)-Paare löschen,
+    vorhandene upserten. So propagiert auch das Zurückziehen einer Anfrage."""
+    sb_avail, sb = _get_sb()
+    if not sb_avail or sb is None:
+        return False
+    try:
+        want = {}
+        for r in (reqs or []):
+            ct, ft = r.get('crew_token'), r.get('family_token')
+            if ct and ft:
+                want[(ct, ft)] = r
+        existing = sb.table('family_requests').select('crew_token,family_token').execute()
+        for row in (existing.data or []):
+            key = (row.get('crew_token'), row.get('family_token'))
+            if key[0] and key[1] and key not in want:
+                (sb.table('family_requests').delete()
+                 .eq('crew_token', key[0]).eq('family_token', key[1]).execute())
+        rows = [{
+            'crew_token': r.get('crew_token'),
+            'family_token': r.get('family_token'),
+            'relation': r.get('relation') or 'family',
+            'requester_name': r.get('requester_name'),
+            'requester_avatar': r.get('requester_avatar'),
+            'created_at': r.get('created_at') or _dt.datetime.now().isoformat(),
+        } for r in want.values()]
+        for i in range(0, len(rows), 500):
+            sb.table('family_requests').upsert(
+                rows[i:i+500], on_conflict='crew_token,family_token').execute()
+        return True
+    except Exception as e:
+        _log().warning(f'[family-req] sb_save_fail {type(e).__name__}: {str(e)[:160]}')
+        return False
+
+
+def _requests_load():
+    """SB-primary + Disk-merge, dedupliziert nach (crew_token, family_token).
+    KRITISCH auf Cloud Run: die Disk ist ephemer/multi-instance → eine nur auf Disk
+    gespeicherte Anfrage sah die Crew-Person (anderer Container) NIE („Anfrage von
+    der Familie poppt nicht auf"). Jetzt SB-primary."""
+    sb_data = _requests_load_from_sb()
+    disk_data = _requests_load_from_disk()
+    if sb_data is None:
+        return disk_data or []
+    merged = {}
+    for r in (sb_data or []):
+        key = (r.get('crew_token'), r.get('family_token'))
+        if key[0] and key[1]:
+            merged[key] = r
+    for r in (disk_data or []):
+        key = (r.get('crew_token'), r.get('family_token'))
+        if key[0] and key[1] and key not in merged:
+            merged[key] = r
+    return list(merged.values())
+
+
 def _requests_save(reqs):
+    sb_ok = _requests_save_to_sb(reqs)
+    disk_ok = False
     try:
         _atomic_write_json(_requests_disk_path(), reqs, max_items=2000)
-        return True
+        disk_ok = True
     except Exception:
-        return False
+        pass
+    return bool(sb_ok or disk_ok)
 
 
 def _shares_load_from_sb():

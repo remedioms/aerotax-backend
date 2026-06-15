@@ -15419,6 +15419,28 @@ def forum_list_threads(token):
     if blocked:
         threads = [t for t in threads if t.get('author_token') not in blocked]
 
+    # Airline-Scope (User-Feature): (1) erzwungene Sichtbarkeit — Threads mit
+    # scope='airline' sieht NUR die gleiche Airline; (2) optionaler Nutzer-Filter
+    # ?airline_scope=mine → nur Threads der eigenen Airline.
+    try:
+        my_airline = (((_profile_load(token) or {}).get('profile', {}) or {})
+                      .get('airline') or '').strip().upper()
+    except Exception:
+        my_airline = ''
+    airline_filter = (request.args.get('airline_scope') or 'all').strip().lower()
+
+    def _airline_visible(t):
+        tscope = (t.get('scope') or 'all')
+        tair = (t.get('author_airline') or '').strip().upper()
+        # scope='airline' → nur gleiche Airline (wenn beide Airlines bekannt).
+        if tscope == 'airline' and tair and my_airline and tair != my_airline:
+            return False
+        # Nutzer-Filter „nur meine Airline".
+        if airline_filter == 'mine' and my_airline and tair and tair != my_airline:
+            return False
+        return True
+    threads = [t for t in threads if _airline_visible(t)]
+
     # Sort
     now = time.time()
     if sort == 'new':
@@ -15481,6 +15503,11 @@ def forum_create_thread(token):
     image_url = (body.get('image_url') or '').strip() or None
     gif_url = (body.get('gif_url') or '').strip() or None
     explicit_tags = body.get('hashtags') or []
+    # Sichtbarkeits-Scope (User-Feature): 'all' = alle Airlines sehen den Thread,
+    # 'airline' = nur die eigene Airline. Default 'all'.
+    scope = (body.get('scope') or 'all').strip().lower()
+    if scope not in ('all', 'airline'):
+        scope = 'all'
 
     if category not in FORUM_CATEGORIES:
         return jsonify({'ok': False, 'error': 'invalid_category'}), 400
@@ -15522,6 +15549,7 @@ def forum_create_thread(token):
         'like_count': 0,
         'reply_count': 0,
         'last_reply_ts': None,
+        'scope': scope,
     }
     thread.update(_forum_author_snapshot(token))
 
@@ -22210,6 +22238,40 @@ def decline_friend_request(token):
     else:
         _friends_save(token, me)
         _friends_save(from_token, them)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/user/friend-requests/<token>/cancel', methods=['POST'])
+def cancel_friend_request(token):
+    """Sender ZIEHT seine eigene ausgehende Anfrage zurück.
+    Body: {friend_token} = der Empfänger. Löscht die gerichtete pending-Kante
+    (token -> friend_token): token.requests_out[friend] + friend.requests_in[token].
+
+    BUG-FIX (User: „hab ne Anfrage zurückgezogen, jetzt ist sie wieder da"):
+    Vorher rief der Client zum Zurückziehen `decline` mit (token=Sender,
+    from=Empfänger) auf — decline löscht aber die GEGENRICHTUNG (from->token),
+    also eine nicht-existente Kante, und ließ die echte Sender->Empfänger-Kante
+    stehen → beim nächsten Load tauchte die Anfrage wieder auf. Dieser Endpoint
+    löscht die richtige Richtung."""
+    body = request.get_json(silent=True) or {}
+    friend_token = (body.get('friend_token') or '').strip()
+    if not friend_token:
+        return jsonify({'ok': False, 'error': 'missing_friend_token'}), 400
+    me = _friends_load(token)
+    them = _friends_load(friend_token)
+    sb_primary = SB_AVAILABLE and sb is not None
+    if sb_primary:
+        # Gerichtete Kante Sender(token) -> Empfänger(friend_token) löschen.
+        if not _friends_edge_delete(token, friend_token):
+            sb_primary = False
+    me['requests_out'] = [r for r in (me.get('requests_out') or []) if r != friend_token]
+    them['requests_in'] = [r for r in (them.get('requests_in') or []) if r != token]
+    if sb_primary:
+        _friends_save_disk_only(token, me)
+        _friends_save_disk_only(friend_token, them)
+    else:
+        _friends_save(token, me)
+        _friends_save(friend_token, them)
     return jsonify({'ok': True})
 
 
