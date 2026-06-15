@@ -87,6 +87,7 @@ for _bp_path, _bp_name in [
     ('blueprints.family_watch',              'family_watch_bp'),  # Wave-1 BUG-002
     ('blueprints.layover_group_blueprint',   'layover_group_bp'),  # geteilter Layover-Plan + Polls
     ('blueprints.pexels_blueprint',          'pexels_bp'),  # Pexels-Proxy (Key server-seitig)
+    ('blueprints.feed_status_blueprint',     'feed_status_bp'),  # 24h verschwindende Feed-Updates
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
@@ -347,6 +348,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/friends-homebases/',
     '/api/user/friends-today/',
     '/api/user/friends/',   # /friends/<token>/overlap → PII
+    '/api/feed-status/',    # /<token>/friends → Friends-PII (Name/Avatar/Status)
     '/api/crew-chat/',      # alle DM/Inbox/Channel-Reads
     '/api/moderation/',     # block/mute-Listen
     '/api/lufthansa/status/',

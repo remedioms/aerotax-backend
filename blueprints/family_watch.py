@@ -729,6 +729,7 @@ def family_request_create(family_token):
     reqs.append({
         'crew_token': crew_token, 'family_token': family_token, 'relation': relation,
         'requester_name': (fam_prof.get('name') or 'Familie'),
+        'requester_avatar': fam_prof.get('avatar_url'),
         'created_at': _dt.datetime.now().isoformat(),
     })
     _requests_save(reqs)
@@ -744,6 +745,7 @@ def family_request_pending(crew_token):
     out = [{
         'family_token': r['family_token'],
         'requester_name': r.get('requester_name') or 'Familie',
+        'requester_avatar': r.get('requester_avatar'),
         'relation': r.get('relation') or 'family',
         'created_at': r.get('created_at'),
     } for r in reqs if r.get('crew_token') == crew_token]
@@ -833,6 +835,100 @@ def family_share_revoke(token, family_token):
 # ════════════════════════════════════════════════════════════════════
 #  Pairing-Code-Endpunkte
 # ════════════════════════════════════════════════════════════════════
+
+def _resolve_crew_for_family(family_token):
+    """Findet den Crew-Token zu einem Family-Token.
+    1) Scoped read-only Family-Token (AT-FAM-, bevorzugt) → family_scoped_tokens.
+    2) Back-compat: irgendein family_shares-Grant mit diesem family_token.
+    Returns crew_token oder None."""
+    scoped = _scoped_token_crew(family_token)
+    if scoped:
+        return scoped
+    try:
+        for s in _shares_load():
+            if s.get('family_token') == family_token and s.get('crew_token'):
+                return s.get('crew_token')
+    except Exception:
+        pass
+    return None
+
+
+def _load_crew_roster_days(crew_token, days_limit):
+    """Lädt das Roster der Crew als Tag-Detail-Liste — EXAKT die gleiche Quelle
+    wie GET /api/user/friend-roster (in-memory _store, Fallback roster_snapshot).
+    Privacy: liefert KEINE Geld-Felder (eur), nur Plan-Infos (Klasse, Routing,
+    Layover, Zeiten) — Family sieht den Plan, nicht die Steuer."""
+    from datetime import date as _date, timedelta as _td
+    _store = _app_attr('_store', {}) or {}
+    sess = _store.get(crew_token) or {}
+    tage = (sess.get('result_data') or {}).get('_tage_detail') or []
+    if not tage:
+        snap_fn = _app_attr('_roster_snapshot_read')
+        if callable(snap_fn):
+            try:
+                tage = (snap_fn(crew_token) or {}).get('tage') or []
+            except Exception:
+                tage = []
+    today = _date.today()
+    cutoff = today + _td(days=days_limit)
+    out = []
+    for day in tage:
+        if not isinstance(day, dict):
+            continue
+        d = day.get('datum')
+        if not d:
+            continue
+        try:
+            day_date = _date.fromisoformat(d[:10])
+            if day_date > cutoff or day_date < today - _td(days=45):
+                continue
+        except Exception:
+            continue
+        rf = day.get('reader_facts') or {}
+        out.append({
+            'datum': d,
+            'klass': day.get('klass'),
+            'marker': day.get('marker'),
+            'routing': day.get('routing'),
+            # bewusst KEIN 'eur' — Family sieht keine Geld-Daten
+            'layover_ort': rf.get('layover_ort'),
+            'start_time': rf.get('start_time'),
+            'end_time': rf.get('end_time'),
+        })
+    return out
+
+
+@family_watch_bp.route('/api/family-roster/<family_token>', methods=['GET'])
+def family_roster(family_token):
+    """Family-Person holt den (read-only) Kalender/Plan der gepairten Crew.
+    Query: ?days=60 (default 60, max 120).
+    Privacy: nur Plan-Infos, keine Geld-/Steuer-Daten. Respektiert ein explizites
+    share_roster=False als Opt-Out (honest empty)."""
+    if not _safe_token(family_token):
+        return jsonify({'ok': False, 'error': 'invalid_token', 'days': []}), 400
+    try:
+        days_limit = min(max(int(request.args.get('days') or 60), 1), 120)
+    except Exception:
+        days_limit = 60
+    crew_token = _resolve_crew_for_family(family_token)
+    if not crew_token:
+        return jsonify({'ok': False, 'shared': False,
+                        'error': 'not_paired', 'days': []}), 404
+    # Explizites Opt-Out respektieren (Pairing IST eigentlich die Zustimmung,
+    # aber wenn die Crew share_roster hart auf False stellt → honest empty).
+    prof = _load_crew_profile(crew_token) or {}
+    if prof.get('share_roster') is False:
+        return jsonify({'ok': True, 'shared': False,
+                        'reason': 'crew_opted_out',
+                        'crew_name': _crew_short_name(crew_token),
+                        'crew_homebase': _crew_homebase(crew_token), 'days': []})
+    days = _load_crew_roster_days(crew_token, days_limit)
+    return jsonify({
+        'ok': True, 'shared': True, 'count': len(days), 'days': days,
+        'crew_name': _crew_short_name(crew_token),
+        'crew_homebase': _crew_homebase(crew_token),
+    })
+
 
 @family_watch_bp.route('/api/family/pair-code/<token>/create', methods=['POST'])
 def family_pair_code_create(token):
