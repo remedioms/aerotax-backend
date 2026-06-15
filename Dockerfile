@@ -7,7 +7,7 @@
 #   - workers=1 (Spec: concurrency=1 pro Container, weniger gleichzeitige RAM-Pressure)
 #   - timeout=1800 (30 Min für lange CAS+Klassifikations-Jobs)
 #   - PYTHONUNBUFFERED=1 → stdout/stderr direkt ans Logging
-# Kompatibel mit Render (Procfile wird ignoriert wenn Dockerfile vorhanden).
+# Cloud Run nutzt dieses Dockerfile direkt (gunicorn CMD, bindet auf $PORT).
 # ════════════════════════════════════════════════════════════════════════════
 
 FROM python:3.12.0-slim AS builder

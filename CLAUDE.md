@@ -91,7 +91,7 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
 - Prompt-Tuning für Claude (Wording in `parse_*_mit_ki` Funktionen)
 - Variable-Renames, Tippfehler, Kommentar-Updates
 - Nach Code-Änderungen: `git add <file> && git commit -m "..." && git push` ohne zu fragen
-- Render-Logs ziehen, Render-Deploys triggern, Render-Env-Vars *hinzufügen* (z.B. `PYTHONUNBUFFERED`)
+- Cloud-Run-Logs ziehen, Deploys triggern (`gcloud run deploy … --source .`), Env-Vars *hinzufügen* via `--update-env-vars` (z.B. `PYTHONUNBUFFERED`)
 - `python3 -m py_compile` als Sanity-Check
 
 ### Vorher fragen (große Änderungen)
@@ -100,7 +100,7 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
 - `requirements.txt` Versions-Bumps oder neue Dependencies
 - Frontend-Code spontan ändern oder von dir nicht angefragte Edits an `~/Desktop/site/`
   (wenn der Nutzer aber explizit eine Frontend-Änderung anfragt: ohne Rückfrage ändern + `wrangler pages deploy ~/Desktop/site --project-name aerosteuer --commit-dirty=true` ausführen)
-- Render-Env-Vars *löschen* oder existierende Werte *überschreiben*
+- Cloud-Run-Env-Vars *löschen* (`--remove-env-vars`) oder existierende Werte *überschreiben* (`--set-env-vars`)
 - Stripe-Webhook / Payment-Logik
 - Datenbankschema (falls hinzukommt)
 - Branch-Operationen außer `main` (rebase, force-push, branch-deletion)
@@ -114,10 +114,11 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
 
 ## Tech-Stack
 
-- **Backend:** Flask (`app.py`, ~2100 Zeilen Single-File), gehostet auf **Render**
-  - Service: `srv-d7o6qbe8bjmc7398acdg`, Owner: `tea-d7np5om8bjmc73909ea0`
-  - URL: `https://aerotax-backend.onrender.com`
-  - Auto-Deploy bei `git push origin main` aktiv
+- **Backend:** Flask (`app.py`, ~2100 Zeilen Single-File), gehostet auf **Google Cloud Run**
+  - Service: `aerotax-backend`, Region: `europe-west3`
+  - Build: Dockerfile (gunicorn, bindet auf `$PORT`)
+  - GitHub-Repo: `https://github.com/remedioms/aerotax-backend` → Cloud Run Continuous Deployment ab `main`
+  - (Render-Hosting entfernt — Migration auf Cloud Run abgeschlossen, „Phase B")
 - **Frontend:** statisches `index.html` in `~/Desktop/site/` (kein Build-Step, kein Repo)
   - Cloudflare Pages Projekt: `aerosteuer`
   - Account-ID: `28a9e1f1409d83cc94ef2c12db769985`
@@ -135,11 +136,12 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
   - `infer_missing_data_with_ki` (Schätzung wenn was fehlt)
   - DEPRECATED: `parse_dienstplan_mit_ki` (Flugstundenübersicht) — hart deaktiviert, nur via Forensik-Override.
 
-## Deploy-Workflow
+## Deploy-Workflow (Google Cloud Run)
 
 1. Code-Änderung → `git push origin main`
-2. Render auto-deployt (Build ~3-4 Min, Deploy ~30s)
-3. Bei Env-Var-Änderungen: manuell triggern via `POST /v1/services/.../deploys` (Render auto-redeployt nicht bei Env-Changes)
+2. Cloud Run Continuous Deployment (GitHub-Trigger) baut die Dockerfile-Revision und deployt sie (Cloud Build ~3-5 Min).
+   - Alternativ direkt: `gcloud run deploy aerotax-backend --source . --region europe-west3`
+3. Env-Vars: NUR `--update-env-vars` / `--remove-env-vars` (siehe Warnung unten), nie `--set-env-vars`.
 
 ## Cloud Run env-Vars — VORSICHT
 
@@ -153,8 +155,7 @@ Tat sich am 2026-05-12 ein P0-Incident weil ich `--set-env-vars="_BUG_002_REDEPL
 
 **Force-Restart ohne env-Risiko:** `gcloud run deploy aerotax-backend --source . --region europe-west3` triggert eine neue Source-Build-Revision, ohne env-Vars anzufassen.
 
-## Logs-Zugriff
+## Logs-Zugriff (Cloud Run)
 
-Render API mit Token aus `RENDER_API_KEY` Env-Var (oder im Dashboard hinterlegt).
-Endpoint: `GET https://api.render.com/v1/logs?ownerId=...&resource=srv-...&type=app`
-Ein Test-Call zum Verifizieren genügt — keine Wiederholungs-Polls.
+`gcloud run services logs read aerotax-backend --region europe-west3 --limit 100`
+(oder Cloud-Logging-Console). Ein Abruf zum Verifizieren genügt — keine Wiederholungs-Polls.
