@@ -8820,7 +8820,19 @@ def get_user_profile(token):
         # (BackgroundSyncService/Stores.swift liest home_address zurück).
         # Sonst (Friend-Discovery, kein/falscher Bearer): PUBLIC-Whitelist.
         if _request_bearer_matches(token):
-            return jsonify(_profile_load(token))
+            full = _profile_load(token) or {}
+            # Interne Avatar-Storage-Keys (base64-Bytes) NICHT an den Client
+            # zurückgeben — sie dienen nur dem serverseitigen Serve-Fallback und
+            # würden den Profile-Sync unnötig um ~270 KB aufblähen. Der Client
+            # braucht nur `avatar_url`.
+            prof = dict(full.get('profile') or {})
+            for _k in ('avatar_b64', 'avatar_mime', 'avatar_dir_key'):
+                prof.pop(_k, None)
+            full = dict(full)
+            full['profile'] = prof
+            for _k in ('avatar_b64', 'avatar_mime', 'avatar_dir_key'):
+                full.pop(_k, None)
+            return jsonify(full)
         return jsonify(_public_profile_projection(token))
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -8930,7 +8942,10 @@ def put_user_profile(token):
     disk_full['profile'] = profile
     disk_full['_updated_at'] = datetime.now().isoformat()
     if _profile_save(token, profile, full_disk_payload=disk_full):
-        return jsonify({'ok': True, 'profile': profile})
+        # Avatar-Storage-Bytes nicht in die Save-Antwort spiegeln (Bandbreite).
+        resp_profile = {k: v for k, v in profile.items()
+                        if k not in ('avatar_b64', 'avatar_mime', 'avatar_dir_key')}
+        return jsonify({'ok': True, 'profile': resp_profile})
     return jsonify({'ok': False, 'error': 'persist_failed'}), 500
 
 
@@ -9681,6 +9696,13 @@ def get_user_friends(token):
         # Client zeigte den rohen Token-Prefix als Namen ("falscher Name") und
         # Chat sagte "keine Freunde". `_profile_load` liest SB-first.
         prof = (_profile_load(friend_token) or {}).get('profile', {}) or {}
+        # Interne Avatar-Storage-Keys NICHT mit ausliefern: die base64-Bytes
+        # (~270 KB/Friend) würden die Friends-Antwort enorm aufblähen und die
+        # rohen Bild-Bytes leaken. Der Client braucht nur `avatar_url` (CrewAvatar
+        # lädt das Bild über den serve-Endpoint). (DURABILITY-FIX 2026-06-15)
+        if isinstance(prof, dict):
+            prof = {k: v for k, v in prof.items()
+                    if k not in ('avatar_b64', 'avatar_mime', 'avatar_dir_key')}
         enriched.append({
             'token': friend_token,
             'match_id': _hashlib.sha256(friend_token.encode()).hexdigest()[:16],
@@ -14328,11 +14350,66 @@ def upload_user_avatar(token):
     avatar_url = f'/api/user/avatar/{dir_key}/{fname}'
     # avatar_url auf die Profile-Row schreiben (SB-primary + Disk) — damit Feed/
     # Freunde/Profil den Verweis ausliefern können.
+    #
+    # DURABILITY-FIX (2026-06-15): Render's Filesystem ist EPHEMERAL — die oben
+    # geschriebene Datei (`_USER_HISTORY_DIR/avatars/...`) verschwindet bei jedem
+    # Redeploy/Restart. Vorher landete nur die `avatar_url` durabel in Supabase,
+    # die Bild-DATEI aber nur auf der flüchtigen Disk → nach dem nächsten Deploy
+    # lieferte `serve_user_avatar` 404 und überall erschienen die Emoji-/Fake-
+    # Platzhalter. URSACHE des "Foto wird nicht gespeichert"-Bugs.
+    # Lösung: die Bytes ZUSÄTZLICH base64 in die (Supabase-persistente) Profile-
+    # Metadata schreiben — keyed mit dem opaken dir_key, damit `serve_user_avatar`
+    # (das nur den dir_key kennt, nicht den Token) sie wiederfinden kann. Reuse
+    # des bestehenden _profile_sidekey_set-Persistenz-Pfads (SB metadata-jsonb +
+    # Disk-Cache), kein neues Schema. ~200 KB JPEG → ~270 KB base64, passt in JSONB.
+    # Alle vier Keys in EINEM Load+Save schreiben (statt 4× _profile_sidekey_set
+    # mit je einem SB-Roundtrip) — gleiche SB-primary+Disk-Persistenz, 1 Upsert.
     try:
-        _profile_sidekey_set(token, 'avatar_url', avatar_url)
+        full = _profile_load(token) or {}
+        profile = dict(full.get('profile') or {})
+        profile['avatar_url'] = avatar_url
+        profile['avatar_dir_key'] = dir_key
+        profile['avatar_b64'] = base64.b64encode(data).decode()
+        profile['avatar_mime'] = detected_type
+        disk_full = dict(_profile_load_from_disk(token) or {})
+        disk_full['token'] = token
+        disk_full['profile'] = profile
+        disk_full['avatar_url'] = avatar_url
+        disk_full['_updated_at'] = datetime.now().isoformat()
+        _profile_save(token, profile, full_disk_payload=disk_full)
     except Exception as e:
         app.logger.warning(f'[avatar] profile_set_fail tok={token[:8]}: {e}')
     return jsonify({'ok': True, 'avatar_url': avatar_url})
+
+
+def _avatar_bytes_from_supabase(dir_key):
+    """Reverse-Lookup der durabel gespeicherten Avatar-Bytes über den opaken
+    dir_key (für `serve_user_avatar`, wenn die ephemere Disk-Datei nach einem
+    Render-Redeploy weg ist). Sucht die user_profiles-Row, deren metadata-jsonb
+    `avatar_dir_key == dir_key` enthält. Returns (bytes, mime) oder (None, None)."""
+    if not SB_AVAILABLE or not dir_key:
+        return None, None
+    try:
+        def _do():
+            return (sb.table('user_profiles')
+                      .select('metadata')
+                      .eq('metadata->>avatar_dir_key', dir_key)
+                      .limit(1).execute())
+        r, timed_out = _supabase_execute_with_timeout('avatar_lookup', _do, timeout_s=5)
+        if timed_out or r is None:
+            return None, None
+        rows = getattr(r, 'data', None) or []
+        if not rows:
+            return None, None
+        meta = rows[0].get('metadata') or {}
+        b64 = meta.get('avatar_b64')
+        mime = meta.get('avatar_mime') or 'image/jpeg'
+        if not b64:
+            return None, None
+        return base64.b64decode(b64), mime
+    except Exception as e:
+        app.logger.warning(f'[avatar] sb_lookup_fail dir={dir_key[:8]}: {type(e).__name__}')
+        return None, None
 
 
 @app.route('/api/user/avatar/<key_safe>/<fname>', methods=['GET'])
@@ -14344,13 +14421,28 @@ def serve_user_avatar(key_safe, fname):
     if not safe or not safe_k:
         return jsonify({'error': 'invalid'}), 400
     path = os.path.join(_USER_HISTORY_DIR, 'avatars', safe_k, safe)
-    if not os.path.exists(path):
-        return jsonify({'error': 'not_found'}), 404
     mime = 'image/jpeg'
     if safe.lower().endswith('.png'): mime = 'image/png'
     elif safe.lower().endswith('.heic'): mime = 'image/heic'
     elif safe.lower().endswith('.webp'): mime = 'image/webp'
-    return send_file(path, mimetype=mime)
+    if os.path.exists(path):
+        return send_file(path, mimetype=mime)
+    # DURABILITY-FIX (2026-06-15): Disk-Datei fehlt (typisch nach Render-Redeploy,
+    # ephemeres FS) → durabel in Supabase gespeicherte Bytes ausliefern statt 404.
+    # Genau das ist der Pfad, der "Foto verschwindet / Fake-Avatar nach Deploy"
+    # behebt. Best-effort wird die Disk-Datei dabei rehydriert, damit Folge-
+    # Requests wieder vom schnellen send_file kommen.
+    data, sb_mime = _avatar_bytes_from_supabase(safe_k)
+    if data:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'wb') as fp:
+                fp.write(data)
+        except Exception:
+            pass
+        from flask import Response
+        return Response(data, mimetype=sb_mime or mime)
+    return jsonify({'error': 'not_found'}), 404
 
 
 @app.route('/api/wall/<token>/post', methods=['POST'])
@@ -15235,9 +15327,12 @@ def _forum_author_snapshot(token):
             'author_role': pr.get('role') or pr.get('position') or '',
             'author_airline': pr.get('airline') or '',
             'author_homebase': pr.get('homebase') or '',
+            # Server-persistiertes Profilfoto → echtes Foto im Forum statt Emoji.
+            'author_avatar': pr.get('avatar_url') or '',
         }
     except Exception:
-        return {'author_name': '', 'author_role': '', 'author_airline': '', 'author_homebase': ''}
+        return {'author_name': '', 'author_role': '', 'author_airline': '',
+                'author_homebase': '', 'author_avatar': ''}
 
 
 def _wall_post_as_forum_thread(p):
@@ -15340,9 +15435,29 @@ def forum_list_threads(token):
 
     # Add liked_by_me + is_mine (Owner-Flag für eigene-Löschen-Button, DSGVO)
     likes = _forum_load_likes(token)
+    # author_avatar LIVE auflösen (wie im Wall-Feed): der am Thread gespeicherte
+    # Snapshot kann veraltet/leer sein (Thread vor dem Avatar-Feature erstellt,
+    # oder User hat sein Foto nachträglich gesetzt). Pro Author 1× cachen.
+    _av_cache = {}
+    def _resolve_av(tok):
+        if not tok:
+            return None
+        if tok in _av_cache:
+            return _av_cache[tok]
+        try:
+            av = ((_profile_load(tok) or {}).get('profile', {}) or {}).get('avatar_url')
+        except Exception:
+            av = None
+        _av_cache[tok] = av
+        return av
     for t in threads:
         t['liked_by_me'] = t.get('id') in likes['threads']
         t['is_mine'] = (t.get('author_token') == token)
+        av = _resolve_av(t.get('author_token'))
+        if av:
+            t['author_avatar'] = av
+        elif not t.get('author_avatar'):
+            t.pop('author_avatar', None)
         # Strip author_token from public response
         t.pop('author_token', None)
     return jsonify({'count': len(threads), 'threads': threads})
@@ -15474,8 +15589,28 @@ def forum_toggle_thread_like(token, thread_id):
 def forum_list_replies(token, thread_id):
     replies = _forum_load_replies(thread_id)
     likes = _forum_load_likes(token)
+    # author_avatar live auflösen (echtes Foto im Reply-Thread) + is_mine, damit
+    # der Client das eigene Profilfoto an seinen Replies zeigt. Pro Author cachen.
+    _av_cache = {}
+    def _resolve_av(tok):
+        if not tok:
+            return None
+        if tok in _av_cache:
+            return _av_cache[tok]
+        try:
+            av = ((_profile_load(tok) or {}).get('profile', {}) or {}).get('avatar_url')
+        except Exception:
+            av = None
+        _av_cache[tok] = av
+        return av
     for r in replies:
         r['liked_by_me'] = r.get('id') in likes['replies']
+        r['is_mine'] = (r.get('author_token') == token)
+        av = _resolve_av(r.get('author_token'))
+        if av:
+            r['author_avatar'] = av
+        else:
+            r.pop('author_avatar', None)
         r.pop('author_token', None)
     replies.sort(key=lambda r: (r.get('created_ts') or 0))
     return jsonify({'thread_id': thread_id, 'count': len(replies), 'replies': replies})
@@ -22602,6 +22737,40 @@ def _ics_events_to_briefings(events, existing=None):
         # Skip nur wenn ALLES leer.
         if not summary and not location and not start_iso:
             continue
+        # ── Per-Tag Layover-Ort aus dem LAYOVER-VEVENT (noon-span rule) ──────
+        # Der echte myTime-iCal trägt eine Übernachtung als eigenes VEVENT
+        # SUMMARY:LAYOVER, LOCATION=<IATA>, mit einer DTSTART…DTEND-Spanne über
+        # die Nacht (z.B. MIA DTSTART Jun9 19:25Z, DTEND Jun10 19:40Z). Für die
+        # Tages-Station gilt: ein Kalendertag D zeigt die Layover-Stadt, wenn die
+        # Spanne den NACHMITTAG/ABEND von D abdeckt, also
+        #   DTEND >= D@12:00Z  UND  DTSTART <= D@23:59Z.
+        # Damit zählt der Ankunfts-/Schlaftag (DTSTART abends) UND ein voller
+        # Folgetag, NICHT aber der Heimkehr-Morgen (DTEND vor 12:00Z) — exakt
+        # die verifizierte Roster-Wahrheit (Jun5=BCN, Jun6=FRA; Jun9/10=MIA,
+        # Jun11=FRA; Jun17/18=JFK, Jun19=FRA). Die IATA kommt aus der LOCATION
+        # (genau 3 Buchstaben). Wir berechnen pro Event die abgedeckten Tage.
+        layover_iata = None
+        layover_noon_days = set()
+        up_summary = summary.upper()
+        if 'LAYOVER' in up_summary:
+            loc3 = location.strip().upper()
+            if len(loc3) == 3 and loc3.isalpha():
+                layover_iata = loc3
+                try:
+                    s_dt = datetime.fromisoformat((start_iso or '').replace('Z', '+00:00'))
+                    e_dt = datetime.fromisoformat((end_iso or '').replace('Z', '+00:00'))
+                    for _d in (days or []):
+                        if not re.match(r'^\d{4}-\d{2}-\d{2}$', _d):
+                            continue
+                        d0 = datetime.fromisoformat(_d + 'T00:00:00+00:00')
+                        noon = d0 + timedelta(hours=12)
+                        eod = d0 + timedelta(hours=23, minutes=59)
+                        if e_dt >= noon and s_dt <= eod:
+                            layover_noon_days.add(_d)
+                except Exception:
+                    # Ohne parsbare Zeiten konservativ: nur der Start-Tag.
+                    if days:
+                        layover_noon_days.add(days[0])
         for i, date_str in enumerate(days):
             if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
                 continue
@@ -22694,6 +22863,14 @@ def _ics_events_to_briefings(events, existing=None):
                 priority = {'hotel_layover': 3, 'standby': 2, 'frei': 1}
                 if not prev_klass or priority.get(klass_from_cats, 0) > priority.get(prev_klass, 0):
                     existing_b['ical_klass'] = klass_from_cats
+            # Per-Tag Layover-Ort setzen, wenn DIESER Tag von der LAYOVER-Spanne
+            # (noon-span, siehe oben) abgedeckt ist. Heimkehr-Morgen/Tagestour
+            # ohne deckende LAYOVER-Spanne bleiben ohne ical_layover_ort → der
+            # Client zeigt dort die Homebase. Ein bereits gesetzter Wert wird nur
+            # von einer ECHTEN Deckung dieses Tages überschrieben (kein Reset
+            # durch ein anderes, denselben Tag mergendes Event wie der Heimflug).
+            if layover_iata and date_str in layover_noon_days:
+                existing_b['ical_layover_ort'] = layover_iata
             briefings[date_str] = existing_b
             imported += 1
     return briefings, imported
@@ -22800,8 +22977,8 @@ def import_calendar_feed(token):
                 fmin, fmax = min(feed_dates), max(feed_dates)
                 _reconcile_dbg['window'] = f'{fmin}..{fmax}'
                 ical_keys = ('ical_summary', 'ical_location', 'ical_start_iso',
-                             'ical_end_iso', 'ical_klass', 'ical_imported_at',
-                             'block_minutes')
+                             'ical_end_iso', 'ical_klass', 'ical_layover_ort',
+                             'ical_imported_at', 'block_minutes')
                 for dkey in list(briefings.keys()):
                     if fmin <= dkey <= fmax and dkey not in feed_dates:
                         b = briefings.get(dkey) or {}
