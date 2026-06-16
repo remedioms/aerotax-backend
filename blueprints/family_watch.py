@@ -441,7 +441,11 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
             _log().info(f'[family-watch] briefing_read_skip {type(e).__name__}')
     if 'layover_place' in allowed_fields and sb_avail and sb is not None:
         # Layover-IATA = erstes Token in ical_location („JFK, FRA-JFK-FRA").
+        # FIX (User: „im Layover statt zuhause weil in Frankfurt"): an einem Tag,
+        # der an der HOMEBASE liegt (Tag-Trip FRA-LUX-FRA-… → erstes Token = FRA),
+        # ist man NICHT im Layover, sondern zuhause. Nur setzen wenn ≠ Homebase.
         try:
+            hb = (prof.get('homebase') or prof.get('home_base') or '').strip().upper()
             today = _dt.datetime.now().date().isoformat()
             r = (sb.table('user_ical_briefings').select('ical_location')
                  .eq('token', crew_token).eq('datum', today).limit(1).execute())
@@ -449,7 +453,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
             if rows:
                 loc = (rows[0].get('ical_location') or '').strip()
                 first = loc.split(',')[0].strip().upper()
-                if len(first) == 3 and first.isalpha():
+                if len(first) == 3 and first.isalpha() and first != hb:
                     status['layover_place'] = first
         except Exception:
             pass
@@ -1049,6 +1053,48 @@ def _load_crew_roster_days(crew_token, days_limit):
             'start_time': rf.get('start_time'),
             'end_time': rf.get('end_time'),
         })
+
+    # FALLBACK (User: „bin bei Family drin und kann den Kalender nicht sehen"):
+    # kein Tax-_tage_detail und kein roster_snapshot → den Plan DIREKT aus
+    # user_ical_briefings bauen (gleiche Quelle wie der Live-Status). So sieht die
+    # Family den Kalender auch ohne dass die Crew je eine Steuer-Auswertung lief.
+    if not out:
+        sb_avail, sb = _get_sb()
+        if sb_avail and sb is not None:
+            try:
+                start = (today - _td(days=45)).isoformat()
+                end = cutoff.isoformat()
+                r = (sb.table('user_ical_briefings')
+                     .select('datum,ical_summary,ical_location,ical_klass,ical_start,ical_end')
+                     .eq('token', crew_token)
+                     .gte('datum', start).lte('datum', end)
+                     .order('datum').limit(150).execute())
+
+                def _hhmm(x):
+                    m = re.search(r'T(\d{2}:\d{2})', str(x or ''))
+                    return m.group(1) if m else None
+
+                for row in (r.data or []):
+                    d = row.get('datum')
+                    if not d:
+                        continue
+                    codes = re.findall(r'\b[A-Z]{3}\b', (row.get('ical_location') or '').upper())
+                    dedup = []
+                    for c in codes:
+                        if not dedup or dedup[-1] != c:
+                            dedup.append(c)
+                    routing = '-'.join(dedup) if len(dedup) >= 2 else None
+                    out.append({
+                        'datum': d,
+                        'klass': row.get('ical_klass'),
+                        'marker': row.get('ical_summary'),
+                        'routing': routing,
+                        'layover_ort': None,
+                        'start_time': _hhmm(row.get('ical_start')),
+                        'end_time': _hhmm(row.get('ical_end')),
+                    })
+            except Exception as e:
+                _log().info(f'[family-roster] ical_fallback_skip {type(e).__name__}')
     return out
 
 
