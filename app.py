@@ -350,6 +350,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/friends-today/',
     '/api/user/friends/',   # /friends/<token>/overlap → PII
     '/api/feed-status/',    # /<token>/friends → Friends-PII (Name/Avatar/Status)
+    '/api/flight/',         # /<callsign>/crew/<token> → Friend-PII (wer fliegt mit)
     '/api/crew-chat/',      # alle DM/Inbox/Channel-Reads
     '/api/moderation/',     # block/mute-Listen
     '/api/lufthansa/status/',
@@ -514,6 +515,19 @@ def _bug004_token_auth_gate():
         # Guest-Tokens: explicit pass-through (Route entscheidet selbst)
         if token.startswith('AT-GUEST-'):
             return None
+        # Scoped Family-Tokens (AT-FAM-): liegen NICHT in auth_users, sondern in
+        # family_scoped_tokens (per Pair-Code gemünzt). Ohne Pass-through gibt das
+        # Gate 401 → das gesamte Family→Crew-Feature (feed-status family/…,
+        # family-roster) war tot. Pass-through nur wenn der scoped Token gültig auf
+        # einen Crew zeigt; die Route validiert/auflöst selbst.
+        if token.startswith('AT-FAM-'):
+            try:
+                from blueprints.family_watch import _scoped_token_crew
+                if _scoped_token_crew(token):
+                    return None
+            except Exception:
+                pass
+            return jsonify({'ok': False, 'error': 'unauthorized'}), 401
         # Bekanntes Token? — _validate_token_exists nutzt 60s-Cache
         if _validate_token_exists(token) is None:
             return jsonify({'ok': False, 'error': 'unauthorized'}), 401
@@ -8629,6 +8643,10 @@ def _profile_load_from_supabase(token):
             for k, v in md.items():
                 if k not in prof:
                     prof[k] = v
+        # FIX (Bug-Hunt #10): updated_at durchreichen, damit die Family-Card
+        # „zuletzt aktiv" (last_seen_iso) auf SB-primary-Hosting funktioniert.
+        if row.get('updated_at') is not None:
+            prof['_updated_at'] = row.get('updated_at')
         return prof
     except Exception as e:
         app.logger.warning(
@@ -15453,9 +15471,13 @@ def forum_list_threads(token):
     def _airline_visible(t):
         tscope = (t.get('scope') or 'all')
         tair = (t.get('author_airline') or '').strip().upper()
-        # scope='airline' → nur gleiche Airline (wenn beide Airlines bekannt).
-        if tscope == 'airline' and tair and my_airline and tair != my_airline:
-            return False
+        # scope='airline' → NUR sichtbar wenn die Airline des Betrachters die des
+        # Threads matcht. FIX (Bug-Hunt #7): vorher war ein airline-only-Thread für
+        # jeden OHNE gesetzte Airline sichtbar (Leak). Jetzt restriktiv: kein
+        # my_airline ODER kein tair ODER ungleich → verstecken.
+        if tscope == 'airline':
+            if not my_airline or not tair or tair != my_airline:
+                return False
         # Nutzer-Filter „nur meine Airline".
         if airline_filter == 'mine' and my_airline and tair and tair != my_airline:
             return False

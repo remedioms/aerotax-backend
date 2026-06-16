@@ -87,6 +87,15 @@ def observe_flight(callsign):
     cs = _safe_callsign(callsign)
     if not cs:
         return jsonify({'ok': False, 'error': 'invalid_callsign'}), 400
+    # FIX (Bug-Hunt #15): observe baut die GETEILTE Flug-DB → nur mit gültigem
+    # Bearer (echter Account) zulassen, sonst kann jeder Aircraft-Typ/Route
+    # vergiften. Der Client sendet seinen eigenen Token als Bearer auf jedem POST.
+    bearer_fn = _app_attr('_request_bearer_token')
+    validate_fn = _app_attr('_validate_token_exists')
+    if callable(bearer_fn) and callable(validate_fn):
+        bt = bearer_fn()
+        if not bt or validate_fn(bt) is None:
+            return jsonify({'ok': False, 'error': 'auth_required'}), 401
     body = request.get_json(silent=True) or {}
     date = (body.get('date') or _dt.datetime.now(_dt.timezone.utc).date().isoformat()).strip()[:10]
     reg = (body.get('reg') or '').strip().upper()[:12] or None
@@ -179,8 +188,14 @@ def flight_crew(callsign, token):
     cs = _safe_callsign(callsign)
     if not cs:
         return jsonify({'ok': False, 'error': 'invalid_callsign'}), 400
-    # IATA-Variante (LH976) zusätzlich matchen — Roster nutzt oft IATA-Nummern.
-    num = re.sub(r'^[A-Z]{3}', '', cs)            # DLH976 → 976
+    # Flugnummer = Ziffern nach dem (beliebig langen) Airline-Prefix.
+    # FIX (Bug-Hunt #22): vorher ^[A-Z]{3} → bei IATA-Callsign „LH976" blieb „976"
+    # nur durch Zufall; bei „EW7" o.ä. falsch. Jetzt jeglicher Buchstaben-Prefix weg.
+    num = re.sub(r'^[A-Z]+', '', cs)              # DLH976→976, LH976→976
+    # Flugnummern-Token-Regex: 1–3 Buchstaben + (führende Nullen) + Nummer, als
+    # ganzes Wort. So matcht „LH976"/„DLH976"/„EW976", aber NICHT eine nackte „976"
+    # die irgendwo im Marker steht (FIX #8: Crew vom falschen Flug).
+    flightno_re = re.compile(rf'\b[A-Z]{{1,3}}0*{re.escape(num)}\b') if num else None
     friends_fn = _app_attr('_friends_load')
     profile_fn = _app_attr('_profile_load')
     snap_fn = _app_attr('_roster_snapshot_read')
@@ -212,10 +227,15 @@ def flight_crew(callsign, token):
                     continue
                 marker = day.get('marker') or ''
                 hay = f"{marker} {day.get('routing') or ''}".upper()
-                if num and (cs in hay or f"LH{num}" in hay or f" {num} " in f" {hay} "):
-                    # Erste Uhrzeit im Marker ≈ Report/Abflugzeit des Tages.
-                    m = time_re.search(marker)
-                    t = m.group(1) if m else None
+                # Match: voller ICAO-Callsign ODER ein Flugnummern-Token (Prefix+Num).
+                if cs in hay or (flightno_re and flightno_re.search(hay)):
+                    # Report/Abflugzeit: bevorzugt reader_facts.start_time (echte
+                    # Dienstbeginn-Zeit), sonst erste Uhrzeit im Marker (FIX #26).
+                    rf = day.get('reader_facts') or {}
+                    t = rf.get('start_time')
+                    if not t:
+                        m = time_re.search(marker)
+                        t = m.group(1) if m else None
                     if t:
                         times.append(t)
                     out.append({'name': prof.get('name') or 'Crew', 'date': d, 'time': t})

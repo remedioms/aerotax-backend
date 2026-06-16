@@ -193,7 +193,15 @@ def post_family_status(family_token):
     if not _safe_token(family_token):
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
     fw = _fw()
-    crew_token = fw._scoped_token_crew(family_token) if fw else None
+    # _resolve_crew_for_family deckt BEIDE Pairing-Wege ab (scoped Pair-Code UND
+    # Such-/Anfrage-Flow via share-grant). _scoped_token_crew allein verfehlt die
+    # per Suche gepairten Familien → Nachricht schlug für den Hauptflow immer fehl.
+    crew_token = None
+    if fw:
+        if hasattr(fw, '_resolve_crew_for_family'):
+            crew_token = fw._resolve_crew_for_family(family_token)
+        if not crew_token:
+            crew_token = fw._scoped_token_crew(family_token)
     if not crew_token:
         return jsonify({'ok': False, 'error': 'not_paired'}), 404
     body = request.get_json(silent=True) or {}
@@ -204,14 +212,22 @@ def post_family_status(family_token):
     emoji = (body.get('emoji') or '').strip()[:_MAX_EMOJI_LEN] or None
     # Absender-Identität (Name/Foto) aus dem Family-Profil.
     fam_prof = (fw._load_crew_profile(family_token) if fw else {}) or {}
-    # Relation aus dem scoped-Token-Record (mama/papa/partner …) best-effort.
+    # Relation (mama/papa/partner …) aus dem share-GRANT lesen — der Scoped-Token
+    # speichert KEINE relation, daher fiel der Wert vorher auf den NAMEN zurück
+    # (Bug-Hunt #17/21/25). Grant ist die Wahrheit; sonst neutral 'family'.
     relation = None
     try:
-        toks = fw._scoped_tokens_load() if fw else {}
-        rec = toks.get(family_token) or {}
-        relation = rec.get('relation') or rec.get('family_name')
+        if fw and hasattr(fw, '_shares_load'):
+            for s in (fw._shares_load() or []):
+                if s.get('crew_token') == crew_token and s.get('family_token') == family_token:
+                    relation = s.get('relation')
+                    break
+        if not relation and fw:
+            relation = (fw._scoped_tokens_load() or {}).get(family_token, {}).get('relation')
     except Exception:
         pass
+    if not relation:
+        relation = 'family'
     now = _dt.datetime.now(_dt.timezone.utc)
     rec = {
         'crew_token': crew_token,

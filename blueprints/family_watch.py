@@ -404,35 +404,45 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     # next_flight: nur wenn 'next_flight' in allowed_fields. Best-effort read aus
     # briefings/roster state via SB. Wenn nicht ladbar → bleibt None.
     sb_avail, sb = _get_sb()
+    # FIX (Bug-Hunt #3): die Tabelle 'briefings' EXISTIERT NICHT — die echten
+    # Briefing-Daten liegen in user_ical_briefings (ical_summary „FRA-JFK 10:30-
+    # 13:20, …", ical_location „JFK, FRA-JFK-FRA", ical_start). Vorher las dieser
+    # Code eine Phantom-Tabelle → next_flight/layover blieben IMMER leer, auch
+    # wenn die Crew die Felder freigegeben hatte.
     if 'next_flight' in allowed_fields and sb_avail and sb is not None:
         try:
             today = _dt.datetime.now().date().isoformat()
-            r = (sb.table('briefings').select('*')
-                 .eq('user_token', crew_token)
+            r = (sb.table('user_ical_briefings')
+                 .select('datum,ical_summary,ical_location,ical_start')
+                 .eq('token', crew_token)
                  .gte('datum', today)
                  .order('datum', desc=False)
                  .limit(1).execute())
             rows = r.data or []
             if rows:
                 br = rows[0]
-                status['next_flight_no'] = br.get('flight_no')
-                status['next_flight_dep_iata'] = br.get('dep_iata')
-                status['next_flight_arr_iata'] = br.get('arr_iata')
-                status['next_flight_etd_iso'] = br.get('etd_iso')
+                summ = br.get('ical_summary') or ''
+                mleg = re.search(r'\b([A-Z]{3})-([A-Z]{3})\b', summ)
+                if mleg:
+                    status['next_flight_dep_iata'] = mleg.group(1)
+                    status['next_flight_arr_iata'] = mleg.group(2)
+                st = br.get('ical_start')
+                if st:
+                    status['next_flight_etd_iso'] = str(st)[:25]
         except Exception as e:
             _log().info(f'[family-watch] briefing_read_skip {type(e).__name__}')
-    if 'layover_place' in allowed_fields:
-        # Layover-Ort kommt aus aktivem briefing (Layover-IATA)
+    if 'layover_place' in allowed_fields and sb_avail and sb is not None:
+        # Layover-IATA = erstes Token in ical_location („JFK, FRA-JFK-FRA").
         try:
-            if sb_avail and sb is not None:
-                today = _dt.datetime.now().date().isoformat()
-                r = (sb.table('briefings').select('layover_iata')
-                     .eq('user_token', crew_token)
-                     .eq('datum', today)
-                     .limit(1).execute())
-                rows = r.data or []
-                if rows:
-                    status['layover_place'] = rows[0].get('layover_iata')
+            today = _dt.datetime.now().date().isoformat()
+            r = (sb.table('user_ical_briefings').select('ical_location')
+                 .eq('token', crew_token).eq('datum', today).limit(1).execute())
+            rows = r.data or []
+            if rows:
+                loc = (rows[0].get('ical_location') or '').strip()
+                first = loc.split(',')[0].strip().upper()
+                if len(first) == 3 and first.isalpha():
+                    status['layover_place'] = first
         except Exception:
             pass
     # Felder die NICHT in allowed_fields sind: explicit auf None setzen
