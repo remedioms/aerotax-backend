@@ -192,19 +192,23 @@ def post_family_status(family_token):
     """Family postet eine 24h-Nachricht in den Feed der gepairten Crew."""
     if not _safe_token(family_token):
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    body = request.get_json(silent=True) or {}
     fw = _fw()
-    # _resolve_crew_for_family deckt BEIDE Pairing-Wege ab (scoped Pair-Code UND
-    # Such-/Anfrage-Flow via share-grant). _scoped_token_crew allein verfehlt die
-    # per Suche gepairten Familien → Nachricht schlug für den Hauptflow immer fehl.
+    # `crew` (opaker Hash aus dem Watch-Feed) wählt bei mehreren gepairten Crew
+    # GENAU eine an (#9). Ohne id → der primäre Crew. _resolve_crew_for_family
+    # deckt beide Pairing-Wege ab (Pair-Code + Such-/Anfrage-Grant).
+    opaque = (body.get('crew') or '').strip() or None
     crew_token = None
     if fw:
         if hasattr(fw, '_resolve_crew_for_family'):
-            crew_token = fw._resolve_crew_for_family(family_token)
+            try:
+                crew_token = fw._resolve_crew_for_family(family_token, opaque_id=opaque)
+            except TypeError:
+                crew_token = fw._resolve_crew_for_family(family_token)
         if not crew_token:
             crew_token = fw._scoped_token_crew(family_token)
     if not crew_token:
         return jsonify({'ok': False, 'error': 'not_paired'}), 404
-    body = request.get_json(silent=True) or {}
     text = (body.get('text') or '').strip()
     if not text:
         return jsonify({'ok': False, 'error': 'empty_text'}), 400
