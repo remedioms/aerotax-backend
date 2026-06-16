@@ -1064,8 +1064,10 @@ def _load_crew_roster_days(crew_token, days_limit):
             try:
                 start = (today - _td(days=45)).isoformat()
                 end = cutoff.isoformat()
+                # Nur EXISTIERENDE Spalten selektieren (ical_klass gibt es NICHT —
+                # ein Select darauf wirft 42703 → Fallback lieferte leer).
                 r = (sb.table('user_ical_briefings')
-                     .select('datum,ical_summary,ical_location,ical_klass,ical_start,ical_end')
+                     .select('datum,ical_summary,ical_location,ical_start,ical_end')
                      .eq('token', crew_token)
                      .gte('datum', start).lte('datum', end)
                      .order('datum').limit(150).execute())
@@ -1078,6 +1080,9 @@ def _load_crew_roster_days(crew_token, days_limit):
                     d = row.get('datum')
                     if not d:
                         continue
+                    summ = (row.get('ical_summary') or '')
+                    up = summ.upper()
+                    klass = 'OFF' if 'OFF DAY' in up else ('Z76' if 'LAYOVER' in up else None)
                     codes = re.findall(r'\b[A-Z]{3}\b', (row.get('ical_location') or '').upper())
                     dedup = []
                     for c in codes:
@@ -1086,8 +1091,8 @@ def _load_crew_roster_days(crew_token, days_limit):
                     routing = '-'.join(dedup) if len(dedup) >= 2 else None
                     out.append({
                         'datum': d,
-                        'klass': row.get('ical_klass'),
-                        'marker': row.get('ical_summary'),
+                        'klass': klass,
+                        'marker': summ,
                         'routing': routing,
                         'layover_ort': None,
                         'start_time': _hhmm(row.get('ical_start')),
