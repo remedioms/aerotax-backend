@@ -174,7 +174,9 @@ def _incoming_for_crew(crew_token):
 
 def _public_view(rec):
     return {
-        'text': rec.get('text'),
+        # DB-Spalte heißt `body` (das Wort `text` ist ein Postgres-Typname);
+        # die API gibt das Feld weiterhin als `text` an die iOS-App.
+        'text': rec.get('body', rec.get('text')),
         'emoji': rec.get('emoji'),
         'from_name': rec.get('from_name'),
         'from_avatar': rec.get('from_avatar'),
@@ -216,7 +218,7 @@ def post_family_status(family_token):
         'from_name': fam_prof.get('name') or 'Familie',
         'from_avatar': fam_prof.get('avatar_url'),
         'relation': relation,
-        'text': text,
+        'body': text,                 # DB-Spalte `body` (nicht `text` = PG-Typname)
         'emoji': emoji,
         'created_at': now.isoformat(),
         'expires_at': (now + _dt.timedelta(seconds=_TTL_SECONDS)).isoformat(),
