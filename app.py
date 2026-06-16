@@ -351,6 +351,8 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/friends/',   # /friends/<token>/overlap → PII
     '/api/feed-status/',    # /<token>/friends → Friends-PII (Name/Avatar/Status)
     '/api/flight/',         # /<callsign>/crew/<token> → Friend-PII (wer fliegt mit)
+    '/api/family-request/', # /<crew_token>/pending → Requester-PII (Name/Avatar)
+    '/api/family-watch/',   # /<family_token>/feed → Crew-Status (AT-FAM-Gate greift)
     '/api/crew-chat/',      # alle DM/Inbox/Channel-Reads
     '/api/moderation/',     # block/mute-Listen
     '/api/lufthansa/status/',
@@ -866,14 +868,20 @@ def payment_status(ref):
     return jsonify({'paid': bool(entry.get('paid')), 'ref': ref})
 
 
+# Serverseitig fixer Preis (Cent). Per Env überschreibbar, NIE vom Client.
+EXPECTED_PRICE_CENTS = int(os.environ.get('AEROTAX_PRICE_CENTS', '1999'))
+
+
 @app.route('/api/create-payment-intent', methods=['POST'])
 def create_payment_intent():
     """Creates a Stripe PaymentIntent for Stripe Elements (no redirect).
     Reused ein Pre-Upload-ref wenn vom Frontend mitgegeben (so überleben Files den Reload)."""
     try:
         data = request.get_json() or {}
-        amount = int(data.get('amount', 1999))
-        currency = data.get('currency', 'eur')
+        # SECURITY (Bug-Hunt CRITICAL): Betrag NIE vom Client übernehmen — sonst
+        # zahlt jeder 1 Cent für eine volle Auswertung. Preis ist serverseitig fix.
+        amount = EXPECTED_PRICE_CENTS
+        currency = 'eur'
         existing_ref = (data.get('ref') or '').strip()
         # Reuse pre-upload ref wenn vorhanden + im Store
         if existing_ref and existing_ref in _store:
@@ -2780,6 +2788,13 @@ def process_real():
             try:
                 pi = stripe.PaymentIntent.retrieve(pi_id)
                 pi_ref = ((pi.metadata or {}).get('ref') or '').strip() if pi else ''
+                # SECURITY (Bug-Hunt CRITICAL): Betrag + Währung gegen den
+                # Serverpreis prüfen — ein „succeeded" PI über 1 Cent darf NICHT
+                # freischalten. Defense-in-depth zusätzlich zum fixen Create-Betrag.
+                _pi_amt = int(getattr(pi, 'amount_received', 0) or getattr(pi, 'amount', 0) or 0) if pi else 0
+                _pi_cur = (getattr(pi, 'currency', '') or '').lower() if pi else ''
+                if pi and pi.status == 'succeeded' and (_pi_amt < EXPECTED_PRICE_CENTS or (_pi_cur and _pi_cur != 'eur')):
+                    return jsonify({'error': 'Zahlungsbetrag ungültig.'}), 402
                 if pi and pi.status == 'succeeded' and pi_ref:
                     # WICHTIG: PaymentIntent darf nur die eigene Upload-ref freischalten.
                     # Sonst könnte ein bezahlter PI versehentlich/absichtlich für fremde refs genutzt werden.
@@ -8072,20 +8087,30 @@ def _send_support_email_notification(record):
         _safe_email   = _hdr_safe(record.get('email',''))
         _safe_reason  = _hdr_safe(record.get('reason','—'))
         subject = f"[AeroTAX Support] {_safe_reason} · {_safe_email}"
+        # SECURITY-FIX (Bug-Hunt): ALLE user-submitted Felder HTML-escapen — vorher
+        # waren reason/email/phone/created_at/ip_hash roh interpoliert (stored HTML-
+        # Injection in der Support-Mail). `message` war schon escaped.
+        import html as _html
+        e_reason  = _html.escape(str(record.get('reason', '') or ''))
+        e_email   = _html.escape(str(record.get('email', '') or ''))
+        e_phone   = _html.escape(str(record.get('phone', '') or '') or '—')
+        e_created = _html.escape(str(record.get('created_at', '') or ''))
+        e_iphash  = _html.escape(str(record.get('ip_hash', '') or ''))
+        e_message = _html.escape(str(record.get('message', '') or ''))
         html_body = (
             f"<h2 style='font-family:sans-serif'>Neue Support-Anfrage</h2>"
             f"<p style='font-family:sans-serif;color:#444'>"
-            f"<b>Grund:</b> {record.get('reason','')}<br>"
-            f"<b>Email:</b> <a href='mailto:{record.get('email','')}'>{record.get('email','')}</a><br>"
-            f"<b>Telefon:</b> {record.get('phone','') or '—'}<br>"
-            f"<b>Eingegangen:</b> {record.get('created_at','')}<br>"
-            f"<b>IP-Hash:</b> {record.get('ip_hash','')}"
+            f"<b>Grund:</b> {e_reason}<br>"
+            f"<b>Email:</b> <a href='mailto:{e_email}'>{e_email}</a><br>"
+            f"<b>Telefon:</b> {e_phone}<br>"
+            f"<b>Eingegangen:</b> {e_created}<br>"
+            f"<b>IP-Hash:</b> {e_iphash}"
             f"</p>"
             f"<div style='background:#f5f5f7;border-radius:8px;padding:16px;font-family:sans-serif;white-space:pre-wrap;color:#222;border-left:3px solid #2563eb'>"
-            f"{(record.get('message','') or '').replace('<','&lt;').replace('>','&gt;')}"
+            f"{e_message}"
             f"</div>"
             f"<p style='font-family:sans-serif;font-size:12px;color:#888;margin-top:20px'>"
-            f"Antworte direkt auf diese Mail — sie geht an <b>{record.get('email','')}</b> raus."
+            f"Antworte direkt auf diese Mail — sie geht an <b>{e_email}</b> raus."
             f"</p>"
         )
         payload = json.dumps({
@@ -9741,9 +9766,14 @@ def get_user_friends(token):
         # (~270 KB/Friend) würden die Friends-Antwort enorm aufblähen und die
         # rohen Bild-Bytes leaken. Der Client braucht nur `avatar_url` (CrewAvatar
         # lädt das Bild über den serve-Endpoint). (DURABILITY-FIX 2026-06-15)
+        # PII-LEAK-FIX (Bug-Hunt): NUR Public-Whitelist ausliefern — vorher ging
+        # das VOLLE Profil raus inkl. home_address + GPS-Koordinaten der Freunde.
         if isinstance(prof, dict):
-            prof = {k: v for k, v in prof.items()
-                    if k not in ('avatar_b64', 'avatar_mime', 'avatar_dir_key')}
+            pub = {k: v for k, v in prof.items() if k in _PUBLIC_PROFILE_FIELDS}
+            # current_city (Layover-Stadt) nur wenn Location-Sharing nicht aus ist.
+            if prof.get('share_location') is not False and prof.get('current_city'):
+                pub['current_city'] = prof.get('current_city')
+            prof = pub
         enriched.append({
             'token': friend_token,
             'match_id': _hashlib.sha256(friend_token.encode()).hexdigest()[:16],
@@ -10439,6 +10469,11 @@ def get_friends_today(token):
         # SB-primary (wie get_user_friends): Disk-Datei ist auf Cloud Run ephemer.
         # Verhindert auch stale-0-Bug: int 0 ist not False → True → city-leak.
         pr = (_profile_load(fr) or {}).get('profile', {}) or {}
+        # PRIVACY-FIX (Bug-Hunt): Friend mit share_roster=False NICHT zeigen —
+        # vorher wurde sein voller Tagesplan (Marker/Routing/Layover/Zeiten/Flug-
+        # nummern) trotz Opt-out durchgereicht. Spiegelt get_friend_roster.
+        if pr.get('share_roster') is False:
+            continue
         rf = day.get('reader_facts') or {}
         # Privacy-Gate: share_location=False (bool) oder =0 (legacy int) → kein city.
         share_loc_val = pr.get('share_location', True)
@@ -13402,6 +13437,10 @@ def get_chat_messages(token, channel_id):
     for m in msgs[-100:]:
         mm = dict(m)
         mm['is_mine'] = (m.get('author_token') == my_trunc)
+        # PRIVACY-FIX (Bug-Hunt): author_token (auch gekürzt = 13 Hex-Zeichen)
+        # NICHT ausliefern — is_mine ist serverseitig berechnet, der Client braucht
+        # den Token nicht (konsistent mit Wall/Forum).
+        mm.pop('author_token', None)
         # Token-Leak-Fix: alte Photo-Messages tragen Legacy-Bild-URLs (mit
         # vollem Token) im Text → auf den opaken Key umschreiben.
         if mm.get('text'):
@@ -14867,6 +14906,10 @@ def get_comments(token, post_id):
     cp = _wall_comments_path(post_id)
     if not cp: return jsonify({'comments': []})
     comments = _wall_comments_load(post_id) or []
+    # PRIVACY-FIX (Bug-Hunt): Kommentare geblockter Autoren ausblenden.
+    _blk = _blocked_by(token)
+    if _blk:
+        comments = [c for c in comments if c.get('author_token') not in _blk]
     # author_avatar pro Author live cachen (mehrere Kommentare desselben Users).
     _c_avatar_cache = {}
     def _c_author_avatar(tok):
@@ -15661,6 +15704,11 @@ def forum_toggle_thread_like(token, thread_id):
 @app.route('/api/forum/<token>/threads/<thread_id>/replies', methods=['GET'])
 def forum_list_replies(token, thread_id):
     replies = _forum_load_replies(thread_id)
+    # PRIVACY-FIX (Bug-Hunt): Replies geblockter Autoren ausblenden (wie die
+    # Thread-Liste). Vorher sah der Blocker die Antworten der geblockten Person.
+    _blk = _blocked_by(token)
+    if _blk:
+        replies = [r for r in replies if r.get('author_token') not in _blk]
     likes = _forum_load_likes(token)
     # author_avatar live auflösen (echtes Foto im Reply-Thread) + is_mine, damit
     # der Client das eigene Profilfoto an seinen Replies zeigt. Pro Author cachen.
