@@ -3514,21 +3514,22 @@ def _run_process_async(job_id, form, files):
             # darauf auch nach Container-Restart Zugriff haben (vorher: nur
             # in-memory _store → bei Render-Sleep verlor man alle Friend-Rosters).
             try:
-                pp = _user_profile_path(session_token)
-                if pp and os.path.exists(pp):
-                    with open(pp) as _pf:
-                        _pdata = json.load(_pf) or {}
-                    if (_pdata.get('profile') or {}).get('share_roster'):
-                        _tage = safe.get('_tage_detail') or []
-                        # Supabase-first + Disk (multi-instance-sicher).
-                        _roster_snapshot_save(session_token, {
-                            'taken_at': datetime.now().isoformat(),
-                            'auto_saved': True,
-                            'tage': _tage,
-                        })
-                        # Crews-on-Flight: Flugnummer-Assignments ingesten
-                        # (best-effort). Speist /api/crew/flight-Lookup.
-                        _crew_flight_ingest(session_token, _tage)
+                # BUG-017-Fix: share_roster SB-primary lesen (default-on), nicht
+                # disk-only mit truthy-Check. Auf einer frischen Cloud-Run-Instanz
+                # ist das Disk-File leer → der alte truthy-Check unterdrückte das
+                # Auto-Save obwohl der User share_roster (default an) hat.
+                prof = (_profile_load(session_token) or {}).get('profile') or {}
+                if prof.get('share_roster') is not False:
+                    _tage = safe.get('_tage_detail') or []
+                    # Supabase-first + Disk (multi-instance-sicher).
+                    _roster_snapshot_save(session_token, {
+                        'taken_at': datetime.now().isoformat(),
+                        'auto_saved': True,
+                        'tage': _tage,
+                    })
+                    # Crews-on-Flight: Flugnummer-Assignments ingesten
+                    # (best-effort). Speist /api/crew/flight-Lookup.
+                    _crew_flight_ingest(session_token, _tage)
             except Exception as _e:
                 app.logger.warning(f'[share-roster-auto-save] {_e}')
 
@@ -6397,9 +6398,15 @@ os.makedirs(_SESSION_DIR, exist_ok=True)
 
 SESSION_HOURS = 24  # Session-Token nur 24h gültig — Datenschutz-First
 
+# BUG-038-Fix: kein vorhersagbarer Default-Secret im Quellcode. Aus ENV lesen,
+# sonst per-Prozess zufälliges Secret (Sessions funktionieren weiter, aber nichts
+# Vorhersagbares im Repo). Bewusst NICHT raisen — non-breaking.
+import secrets as _secrets
+SESSION_SECRET = os.environ.get('SESSION_SECRET') or _secrets.token_hex(32)
+
 def _make_session_token(job_id):
     """Generiert kurzlebigen Session-Token nach erfolgreicher Auswertung."""
-    secret = os.environ.get('SESSION_SECRET', 'aerosteuer-session-default-2025')
+    secret = SESSION_SECRET
     raw = f"{job_id}:{datetime.utcnow().isoformat()}:{secret}"
     return 'AT-' + _hashlib.sha256(raw.encode()).hexdigest()[:16].upper()
 
@@ -8988,6 +8995,17 @@ def put_user_profile(token):
     disk_full['profile'] = profile
     disk_full['_updated_at'] = datetime.now().isoformat()
     if _profile_save(token, profile, full_disk_payload=disk_full):
+        # BUG-018-Fix: Wenn share_roster in DIESEM Request getoggelt wurde, die
+        # bereits existierenden crew_flight_assignments-Rows mit-aktualisieren —
+        # sonst bleibt opt_in auf dem alten Wert (z.B. User schaltet Sharing aus,
+        # ist aber weiter auf der Crew-on-Flight-Tafel sichtbar).
+        if 'share_roster' in body and SB_AVAILABLE and sb is not None:
+            try:
+                sb.table('crew_flight_assignments').update(
+                    {'opt_in': bool(body['share_roster'])}
+                ).eq('self_token', token).execute()
+            except Exception:
+                pass
         # Avatar-Storage-Bytes nicht in die Save-Antwort spiegeln (Bandbreite).
         resp_profile = {k: v for k, v in profile.items()
                         if k not in ('avatar_b64', 'avatar_mime', 'avatar_dir_key')}
@@ -9053,14 +9071,16 @@ def post_user_location():
         return jsonify({'ok': True, 'skipped': 'sharing_off'})
 
     profile['current_city'] = city
-    try:
-        _atomic_write_json(p, {
-            'token': token, 'profile': profile,
-            '_updated_at': datetime.now().isoformat()
-        })
+    # BUG-005-Fix: SB-primary persistieren (wie put_user_profile) statt disk-only —
+    # sonst landet current_city nie in Supabase (metadata-jsonb) und ist nach jedem
+    # Cloud-Run-Redeploy weg. Disk-Side-Keys erhalten, profile-Subkey ersetzen.
+    disk_full = dict(_profile_load_from_disk(token) or {})
+    disk_full['token'] = token
+    disk_full['profile'] = profile
+    disk_full['_updated_at'] = datetime.now().isoformat()
+    if _profile_save(token, profile, full_disk_payload=disk_full):
         return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': False, 'error': 'persist_failed'}), 500
 
 
 @app.route('/api/user/search', methods=['GET'])
@@ -9884,12 +9904,9 @@ def get_friends_overlap(token):
                     'briefing_diff_min': briefing_diff,
                 })
         if shared:
-            ppath = _user_profile_path(friend_token)
-            prof = {}
-            try:
-                with open(ppath) as f:
-                    prof = (json.load(f) or {}).get('profile', {})
-            except Exception: pass
+            # BUG-035-Fix: Friend-Name SB-primary lesen (wie get_user_friends),
+            # nicht disk-only — auf einer frischen Instanz ist das Disk-Profil leer.
+            prof = (_profile_load(friend_token) or {}).get('profile', {}) or {}
             overlaps.append({
                 'friend_token': friend_token,
                 'friend_name': prof.get('name', friend_token[:8] + '…'),
@@ -13465,6 +13482,10 @@ def send_chat_message(token, channel_id):
         _, status = _gate
         err = 'not_a_member' if status == 403 else 'invalid_channel'
         return jsonify({'ok': False, 'error': err}), status
+    # BUG-021-Fix: Rate-Limit wie bei DMs (30 msgs/min pro Token) — vorher konnte
+    # ein Token unbegrenzt Channel-Messages senden (Spam/Flood).
+    if _token_rate_limited(token, 'chat_send', limit=30, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     import uuid, time
     try:
         msgs = _dm_load_messages(channel_id) or []
@@ -15683,6 +15704,8 @@ def forum_delete_thread(token, thread_id):
 
 @app.route('/api/forum/<token>/threads/<thread_id>/like', methods=['POST'])
 def forum_toggle_thread_like(token, thread_id):
+    if token.startswith('AT-GUEST-'):
+        return jsonify({'ok': False, 'error': 'demo_mode_cannot_post'}), 403
     likes = _forum_load_likes(token)
     threads = _forum_load_threads()
     target = next((t for t in threads if t.get('id') == thread_id), None)
@@ -15740,6 +15763,12 @@ def forum_list_replies(token, thread_id):
 @app.route('/api/forum/<token>/threads/<thread_id>/reply', methods=['POST'])
 def forum_create_reply(token, thread_id):
     """Body: {body, image_url?, gif_url?, parent_reply_id?, mentioned_token?}"""
+    # BUG-022-Fix: Guest-Block + Rate-Limit wie bei forum_create_thread —
+    # Demo-Mode darf nicht posten, und max 20 Replies/Stunde gegen Flood.
+    if token.startswith('AT-GUEST-'):
+        return jsonify({'ok': False, 'error': 'demo_mode_cannot_post'}), 403
+    if _token_rate_limited(token, 'forum_reply', limit=20, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     body = request.get_json(silent=True) or {}
     raw_text = (body.get('body') or '').strip()
     image_url = (body.get('image_url') or '').strip() or None
@@ -15856,6 +15885,8 @@ def forum_delete_reply(token, reply_id):
 @app.route('/api/forum/<token>/replies/<reply_id>/like', methods=['POST'])
 def forum_toggle_reply_like(token, reply_id):
     """Linear search across alle Threads (SB primary)."""
+    if token.startswith('AT-GUEST-'):
+        return jsonify({'ok': False, 'error': 'demo_mode_cannot_post'}), 403
     threads = _forum_load_threads()
     target_thread_id = None
     target_reply = None
@@ -19616,7 +19647,7 @@ def _haj_board(flight_type='departure'):
         if r.status_code != 200 or not r.text:
             return None
         soup = BeautifulSoup(r.text, 'html.parser')
-        day = datetime.now(timezone(timedelta(hours=2))).strftime('%Y-%m-%d')
+        day = _fra_local_now().strftime('%Y-%m-%d')
     except Exception:
         return None
     out = []
@@ -19684,7 +19715,7 @@ def _fmo_board(flight_type='departure'):
         if r.status_code != 200 or not r.text:
             return None
         soup = BeautifulSoup(r.text, 'html.parser')
-        day = datetime.now(timezone(timedelta(hours=2))).strftime('%Y-%m-%d')
+        day = _fra_local_now().strftime('%Y-%m-%d')
     except Exception:
         return None
     # FMO trennt Abflug/Ankunft über zwei tab-panes: #abflug / #ankunft.
@@ -20037,7 +20068,7 @@ def _aerodatabox_board(iata, flight_type='departure'):
         return None
     arr = (flight_type == 'arrival')
     try:
-        now = datetime.now(timezone(timedelta(hours=2)))
+        now = _airport_local_now(iata)
     except Exception:
         now = datetime.now(timezone.utc)
 
@@ -21580,8 +21611,15 @@ def _aerodatabox_punctuality(iata, airline):
     # am Flughafen-Tag, nicht now-relativ. Das `from` ist FIX auf heute 05:00 →
     # gleiches Fenster beim Neu-Laden (Stabilität). Die Quote zählt unten nur Flüge
     # mit bereits passierter Plan-Zeit.
-    now = datetime.now(timezone.utc)
-    day = now.strftime('%Y-%m-%d')
+    # BUG-023-Fix: Betriebstag aus der FLUGHAFEN-Ortszeit ableiten, nicht UTC —
+    # sonst rollt der Tag für westliche Flughäfen (z.B. JFK) zu früh/spät um und
+    # das 05:00–23:59-Fenster trifft den falschen Kalendertag.
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(airport_tz(iata) or 'UTC')
+    except Exception:
+        tz = timezone.utc
+    day = datetime.now(tz).strftime('%Y-%m-%d')
     from_iso = day + 'T05:00'
     to_iso = day + 'T23:59'
     url = ('https://aerodatabox.p.rapidapi.com/flights/airports/iata/'
@@ -22242,12 +22280,25 @@ def send_friend_request(token):
     them = _friends_load(target)
     if target in (me.get('friends') or []):
         return jsonify({'ok': True, 'already_friends': True})
+    # P0-Concurrency-Fix (BUG-006): die ausgehende pending-Kante atomar upserten
+    # statt den ganzen friends-Blob des Empfängers (them) zu re-schreiben. Der alte
+    # Blob-Rewrite (_friends_save(target, them)) clobberte parallele Edges des
+    # Empfängers (lost-update). requests_out[me] + requests_in[target] werden beide
+    # aus der einen Kante (token -> target, pending) abgeleitet.
+    sb_primary = SB_AVAILABLE and sb is not None
+    if sb_primary:
+        if not _friends_edge_upsert(token, target, 'pending'):
+            sb_primary = False
     me.setdefault('requests_out', [])
     them.setdefault('requests_in', [])
     if target not in me['requests_out']: me['requests_out'].append(target)
     if token not in them['requests_in']: them['requests_in'].append(token)
-    _friends_save(token, me)
-    _friends_save(target, them)
+    if sb_primary:
+        _friends_save_disk_only(token, me)
+        _friends_save_disk_only(target, them)
+    else:
+        _friends_save(token, me)
+        _friends_save(target, them)
     return jsonify({'ok': True})
 
 
@@ -22293,12 +22344,10 @@ def accept_friend_request(token):
         _friends_save(token, me)
         _friends_save(from_token, them)
     try:
-        my_name = ''
-        try:
-            with open(_user_profile_path(token)) as _pf:
-                my_name = (json.load(_pf) or {}).get('name') or ''
-        except Exception:
-            my_name = ''
+        # BUG-034-Fix: Name SB-primary + aus dem richtigen Subkey (profile.name)
+        # lesen. Der alte disk-only-Read griff auf den Top-Level-Key 'name' zu, den
+        # es nicht gibt → Push hieß immer 'Jemand'.
+        my_name = ((_profile_load(token) or {}).get('profile', {}) or {}).get('name') or ''
         who = my_name.strip() or 'Jemand'
         _send_push_notification(from_token, 'Neue Crew-Verbindung',
                                 f'{who} hat deine Anfrage angenommen.')
@@ -30983,6 +31032,7 @@ def _cas_day_to_dp_format(cas_day, year=2025, homebase='FRA'):
         'start_time':            cas_day.get('start_time', ''),
         'end_time':              cas_day.get('end_time', ''),
         'duration_minutes':      int(cas_day.get('duration_minutes', 0) or 0),
+        'duty_duration_minutes': int(cas_day.get('duty_duration_minutes', cas_day.get('duration_minutes', 0)) or 0),
         '_cas_v11':              True,
         '_cas_source_file_id':   cas_day.get('source_file_id', ''),
         '_cas_source_filename':  cas_day.get('source_filename', ''),

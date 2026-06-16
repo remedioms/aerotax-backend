@@ -197,6 +197,11 @@ def _warm_persist_from_opensky_row(hex_id, opensky_row, source):
         if not reg:
             reg = _hex_to_reg(hex_id)
         if not reg:
+            # #24: Hex außerhalb der winzigen hardcoded Map → inverse SB-Lookup
+            # in tail_hex, sonst würde die Position NIE warm-persistiert und der
+            # Cold-Start-Backfill liefe leer. Guarded → degradiert sauber.
+            reg = _hex_to_reg_sb(hex_id)
+        if not reg:
             return  # ohne Reg kein PK → skip (Live-Response bleibt unberührt)
 
         callsign = None
@@ -242,6 +247,51 @@ def _hex_to_reg(hex_id):
         if hx == target:
             return reg
     return None
+
+
+# #24: Inverse Hex→Reg-Auflösung über die SB-Tabelle `tail_hex` (icao24→
+# registration). Deckt Flugzeuge ab, die NICHT in der winzigen hardcoded
+# _BACKEND_REG_HEX-Map stehen — ohne sie blieb deren Live-Position un-persistiert
+# und der Cold-Start-Backfill lief leer. Kleiner Prozess-lokaler Cache (auch für
+# Misses), damit wir nicht pro Live-Fetch dieselbe Hex erneut gegen SB schicken.
+_HEX_REG_SB_CACHE = {}
+_HEX_REG_SB_LOCK = threading.Lock()
+
+
+def _hex_to_reg_sb(hex_id):
+    """Inverse-Lookup Hex→Reg aus SB (`tail_hex`). Gecacht (inkl. Misses).
+    Guarded → wirft nie, gibt None bei SB-down/Fehler/unbekannt."""
+    if not hex_id:
+        return None
+    target = hex_id.strip().lower()
+    if not target:
+        return None
+    with _HEX_REG_SB_LOCK:
+        if target in _HEX_REG_SB_CACHE:
+            return _HEX_REG_SB_CACHE[target]
+    reg = None
+    try:
+        sb, ok = _sb_client()
+        if ok and sb is not None:
+            r = (sb.table('tail_hex').select('registration')
+                 .eq('icao24', target).limit(1).execute())
+            rows = r.data or []
+            if rows:
+                reg = _normalize_registration(rows[0].get('registration'))
+    except Exception as e:
+        try:
+            current_app.logger.info(
+                f'[adsb] hex_to_reg_sb_skip hex={target} '
+                f'err={type(e).__name__}: {str(e)[:120]}'
+            )
+        except Exception:
+            pass
+        # Miss NICHT cachen wenn der Lookup wegen eines Fehlers (SB down)
+        # fehlschlug — sonst bliebe die Hex bis Prozess-Restart geblockt.
+        return None
+    with _HEX_REG_SB_LOCK:
+        _HEX_REG_SB_CACHE[target] = reg
+    return reg
 
 # ── Cache ─────────────────────────────────────────────────────
 # Struktur: {hex: {"fetched_at": float_unix, "row": list|None, "source": str}}

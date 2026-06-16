@@ -201,8 +201,12 @@ def _requests_load_from_sb():
 
 
 def _requests_save_to_sb(reqs):
-    """Reconciliert SB exakt auf `reqs` (klein): entfernte (crew,family)-Paare löschen,
-    vorhandene upserten. So propagiert auch das Zurückziehen einer Anfrage."""
+    """UPSERT-ONLY: upsertet die vorhandenen (crew,family)-Paare in SB.
+    KEIN Reconcile-Delete mehr (#7/#19): auf Cloud Run multi-instance hätte das
+    Löschen von "fehlenden" Keys aus einem stalen In-Memory-Snapshot Anfragen
+    anderer User/Container weggewischt (Instance A löscht was Instance B gerade
+    angelegt hat). Echte Deletes (Zurückziehen/Approve/Reject) machen die Caller
+    jetzt per gezieltem .delete().eq(...)."""
     sb_avail, sb = _get_sb()
     if not sb_avail or sb is None:
         return False
@@ -212,12 +216,6 @@ def _requests_save_to_sb(reqs):
             ct, ft = r.get('crew_token'), r.get('family_token')
             if ct and ft:
                 want[(ct, ft)] = r
-        existing = sb.table('family_requests').select('crew_token,family_token').execute()
-        for row in (existing.data or []):
-            key = (row.get('crew_token'), row.get('family_token'))
-            if key[0] and key[1] and key not in want:
-                (sb.table('family_requests').delete()
-                 .eq('crew_token', key[0]).eq('family_token', key[1]).execute())
         rows = [{
             'crew_token': r.get('crew_token'),
             'family_token': r.get('family_token'),
@@ -389,6 +387,16 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         prof = _load_crew_profile(crew_token) or {}
         if 'current_city' in allowed_fields:
             status['current_city'] = prof.get('current_city')
+        # #36: landed/photo_count aus dem bereits geladenen Crew-Profil wiren —
+        # vorher blieben beide selbst bei Freigabe IMMER None. Privacy-gegated:
+        # nur setzen wenn das jeweilige Feld in allowed_fields ist.
+        if 'landed_status' in allowed_fields:
+            status['landed'] = prof.get('landed')
+        if 'photos' in allowed_fields:
+            # Kein dedizierter Foto-Zähler-Quell-Tisch vorhanden; wir wiren nur
+            # einen ggf. existierenden Profilschlüssel. Fehlt er → bleibt None
+            # (keine erfundenen Daten).
+            status['photo_count_today'] = prof.get('photo_count_today')
         # last_seen_iso ist selbst eine Aktivitäts-Info ("zuletzt online/aktiv")
         # und darf NUR geleakt werden wenn der Crew ein relevantes Live-Feld
         # freigegeben hat. Vorher wurde es bedingungslos gesetzt (ausserhalb des
@@ -554,23 +562,55 @@ def _kv_load_from_sb(table, key_col):
 
 
 def _kv_save_to_sb(table, key_col, data):
-    """Reconciliert SB exakt auf `data` (kleine Tabellen): entfernte Keys löschen,
-    vorhandene upserten. So propagieren auch Deletes (z.B. eingelöster Pair-Code)."""
+    """UPSERT-ONLY: upsertet die vorhandenen Keys in SB. KEIN Reconcile-Delete
+    mehr (#7/#19): auf Cloud Run multi-instance hätte das Löschen von Keys, die
+    in einem stalen In-Memory-Snapshot fehlen, Pair-Codes/Scoped-Tokens anderer
+    Crews weggewischt (Race: Instance A löscht was Instance B gerade angelegt
+    hat → fremder Redeem brach). Echte Deletes (konsumierter/abgelaufener Code)
+    machen die Caller jetzt per gezieltem .delete().eq(...)."""
     sb_avail, sb = _get_sb()
     if not sb_avail or sb is None:
         return False
     try:
-        new_keys = {k for k in (data or {}).keys() if k}
-        existing = sb.table(table).select(key_col).execute()
-        existing_keys = {row.get(key_col) for row in (existing.data or []) if row.get(key_col)}
-        for rk in (existing_keys - new_keys):
-            sb.table(table).delete().eq(key_col, rk).execute()
         rows = [{key_col: k, 'data': v} for k, v in (data or {}).items() if k]
         for i in range(0, len(rows), 500):
             sb.table(table).upsert(rows[i:i+500], on_conflict=key_col).execute()
         return True
     except Exception as e:
         _log().warning(f'[family-kv] {table} sb_save_fail {type(e).__name__}: {str(e)[:160]}')
+        return False
+
+
+def _kv_delete_from_sb(table, key_col, key):
+    """Gezieltes Löschen eines einzelnen Keys (#7/#19): ersetzt das frühere
+    blanket Reconcile-Delete. Guarded, wirft nie."""
+    if not key:
+        return False
+    sb_avail, sb = _get_sb()
+    if not sb_avail or sb is None:
+        return False
+    try:
+        sb.table(table).delete().eq(key_col, key).execute()
+        return True
+    except Exception as e:
+        _log().warning(f'[family-kv] {table} sb_delete_fail {type(e).__name__}: {str(e)[:160]}')
+        return False
+
+
+def _requests_delete_from_sb(crew_token, family_token):
+    """Gezieltes Löschen einer Anfrage in SB (#7): ersetzt das Reconcile-Delete
+    in _requests_save_to_sb. Guarded, wirft nie."""
+    if not crew_token or not family_token:
+        return False
+    sb_avail, sb = _get_sb()
+    if not sb_avail or sb is None:
+        return False
+    try:
+        (sb.table('family_requests').delete()
+         .eq('crew_token', crew_token).eq('family_token', family_token).execute())
+        return True
+    except Exception as e:
+        _log().warning(f'[family-req] sb_delete_fail {type(e).__name__}: {str(e)[:160]}')
         return False
 
 
@@ -873,6 +913,10 @@ def family_request_approve(crew_token):
             'created_at': _dt.datetime.now().isoformat(),
         })
         _shares_save(shares)
+    # Genuine Delete: die genehmigte Anfrage gezielt aus SB entfernen (#7).
+    # _requests_save upsertet nur noch (kein Reconcile-Delete), darum hier
+    # explizit. Disk wird über _requests_save mitgeschrieben.
+    _requests_delete_from_sb(crew_token, family_token)
     _requests_save([r for r in reqs
                     if not (r.get('crew_token') == crew_token
                             and r.get('family_token') == family_token)])
@@ -887,6 +931,8 @@ def family_request_reject(crew_token):
     body = request.get_json(silent=True) or {}
     family_token = (body.get('family_token') or '').strip()
     reqs = _requests_load()
+    # Genuine Delete: die abgelehnte Anfrage gezielt aus SB entfernen (#7).
+    _requests_delete_from_sb(crew_token, family_token)
     _requests_save([r for r in reqs
                     if not (r.get('crew_token') == crew_token
                             and r.get('family_token') == family_token)])
@@ -1101,8 +1147,10 @@ def family_pair_code_redeem():
     if not isinstance(rec, dict):
         return jsonify({'ok': False, 'error': 'code_not_found'}), 404
     if (now - float(rec.get('created_at', 0))) >= _PAIR_CODE_TTL_SEC:
-        # Abgelaufen → aufräumen.
+        # Abgelaufen → aufräumen. Gezieltes SB-Delete (#7/#19): _pair_codes_save
+        # upsertet nur noch, darum den Key hier explizit aus SB entfernen.
         codes.pop(code, None)
+        _kv_delete_from_sb('family_pair_codes', 'code', code)
         _pair_codes_save(codes)
         return jsonify({'ok': False, 'error': 'code_expired'}), 410
 
@@ -1119,6 +1167,51 @@ def family_pair_code_redeem():
 
     family_name = (body.get('family_name') or '').strip()[:60] or None
 
+    # --- TOCTOU-Schutz (#20): Single-Use atomar durchsetzen, BEVOR ein Token
+    # gemünzt wird. Vorher war read→check→mint→mark-consumed nicht atomar: zwei
+    # parallele Redeems desselben Codes konnten beide zwei Family-Tokens münzen.
+    # Strategie:
+    #   1) Wenn SB verfügbar: atomares conditional update
+    #        update(data=consumed) WHERE code=? AND data->>consumed='false'
+    #      Nur wenn das genau diese Zeile getroffen hat (r.data nicht leer),
+    #      haben WIR das Rennen gewonnen → mint erlaubt. Trifft es 0 Zeilen,
+    #      hat ein anderer Redeemer den Code schon konsumiert (oder der Code
+    #      existiert nur auf Disk) → wir verweigern bzw. fallen auf Disk zurück.
+    #   2) Ohne SB: consumed=True setzen und ZUERST speichern, DANN minten —
+    #      das verkleinert das Fenster auf die Disk-Schreiblatenz.
+    consumed_rec = dict(rec)
+    consumed_rec['consumed'] = True
+    consumed_rec['consumed_at'] = now
+
+    sb_avail, sb = _get_sb()
+    won_via_sb = False
+    if sb_avail and sb is not None:
+        try:
+            r = (sb.table('family_pair_codes')
+                 .update({'data': consumed_rec})
+                 .eq('code', code)
+                 .eq('data->>consumed', 'false')
+                 .execute())
+            if r.data:
+                won_via_sb = True
+            else:
+                # 0 Zeilen getroffen. Existiert der Code in SB bereits als
+                # consumed → eindeutig schon eingelöst → ablehnen. Existiert er
+                # gar nicht in SB (nur Disk) → unten auf Disk-Pfad zurückfallen.
+                exists = (sb.table('family_pair_codes').select('code')
+                          .eq('code', code).limit(1).execute())
+                if exists.data:
+                    return jsonify({'ok': False, 'error': 'code_already_used'}), 409
+        except Exception as e:
+            _log().warning(f'[family-pair] redeem_sb_consume_fail {type(e).__name__}: {str(e)[:140]}')
+
+    if not won_via_sb:
+        # Disk-Pfad (SB nicht verfügbar / Code nur auf Disk): consumed FIRST
+        # speichern, DANN minten — verkleinert das TOCTOU-Fenster maximal ohne
+        # echte Atomarität zu garantieren.
+        codes[code] = consumed_rec
+        _pair_codes_save(codes)
+
     # Scoped, read-only Family-Token münzen und persistieren.
     family_token = _gen_scoped_family_token()
     toks = _scoped_tokens_load()
@@ -1130,12 +1223,14 @@ def family_pair_code_redeem():
     }
     _scoped_tokens_save(toks)
 
-    # Code als konsumiert markieren (bleibt bis TTL einlösbar für den Fall eines
-    # Retry, aber wir merken consumed für Audit).
-    rec['consumed'] = True
-    rec['consumed_at'] = now
-    codes[code] = rec
-    _pair_codes_save(codes)
+    if won_via_sb:
+        # SB ist bereits konsumiert (atomar). Disk-Spiegel best-effort
+        # nachziehen, damit ein späterer Disk-only-Read nicht „unconsumed" sieht.
+        codes[code] = consumed_rec
+        try:
+            _atomic_write_json(_pair_codes_disk_path(), codes)
+        except Exception:
+            pass
 
     return jsonify({
         'ok': True,
