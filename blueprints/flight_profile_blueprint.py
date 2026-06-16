@@ -192,6 +192,8 @@ def flight_crew(callsign, token):
         friends = []
     today = _dt.date.today()
     out = []
+    times = []
+    time_re = re.compile(r'(\d{1,2}:\d{2})')
     for ft in friends:
         try:
             prof = (profile_fn(ft) or {}).get('profile', {}) if callable(profile_fn) else {}
@@ -208,11 +210,22 @@ def flight_crew(callsign, token):
                         continue
                 except Exception:
                     continue
-                hay = f"{day.get('marker') or ''} {day.get('routing') or ''}".upper()
+                marker = day.get('marker') or ''
+                hay = f"{marker} {day.get('routing') or ''}".upper()
                 if num and (cs in hay or f"LH{num}" in hay or f" {num} " in f" {hay} "):
-                    out.append({'name': prof.get('name') or 'Crew', 'date': d})
+                    # Erste Uhrzeit im Marker ≈ Report/Abflugzeit des Tages.
+                    m = time_re.search(marker)
+                    t = m.group(1) if m else None
+                    if t:
+                        times.append(t)
+                    out.append({'name': prof.get('name') or 'Crew', 'date': d, 'time': t})
                     break
         except Exception:
             continue
     out.sort(key=lambda x: x.get('date') or '')
-    return jsonify({'ok': True, 'crew': out[:10], 'count': len(out)})
+    # Typische Zeit = häufigste beobachtete Marker-Startzeit (Crew-Plan, kostenlos).
+    typical_time = None
+    if times:
+        typical_time = Counter(times).most_common(1)[0][0]
+    return jsonify({'ok': True, 'crew': out[:10], 'count': len(out),
+                    'typical_time': typical_time})

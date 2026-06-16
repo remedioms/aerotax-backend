@@ -9033,6 +9033,9 @@ def user_search():
     homebase = (request.args.get('homebase') or '').strip().upper()
     limit = min(int(request.args.get('limit') or 20), 50)
     searcher_token = (request.args.get('token') or '').strip()
+    # exclude_family=1 → Family-Accounts ausblenden (eine Family sucht ihre CREW,
+    # nicht andere Familien). „Crew" = account_type None/'crew', nie 'family'.
+    exclude_family = str(request.args.get('exclude_family') or '').strip() in ('1', 'true', 'yes')
     # Mindestens ein Filter muss gesetzt sein damit das nicht zu User-Listing wird
     if len(q) < 2 and not airline and not homebase:
         return jsonify({'count': 0, 'users': [],
@@ -9050,7 +9053,7 @@ def user_search():
     if SB_AVAILABLE:
         try:
             qbuilder = sb.table('user_profiles').select(
-                'token,name,homebase,airline,"position"'
+                'token,name,homebase,airline,"position",avatar_url,account_type'
             )
             if q:
                 # ilike ist case-insensitive — name enthält Substring q
@@ -9073,12 +9076,17 @@ def user_search():
                 # Filter "kein-Name" raus — sonst wirkt's wie ein User-Listing
                 if not name:
                     continue
+                acct = (row.get('account_type') or '').strip().lower()
+                if exclude_family and acct == 'family':
+                    continue
                 results.append({
                     'token': target_token,
                     'name': name,
                     'airline': row.get('airline'),
                     'homebase': row.get('homebase'),
                     'position': row.get('position'),
+                    'avatar_url': row.get('avatar_url'),
+                    'account_type': acct or 'crew',
                 })
                 if len(results) >= limit:
                     break
@@ -9111,6 +9119,7 @@ def user_search():
                 name = (pr.get('name') or '').strip()
                 a = (pr.get('airline') or '').strip().lower()
                 h = (pr.get('homebase') or '').strip().upper()
+                acct = (pr.get('account_type') or '').strip().lower()
                 # Match-Logik
                 if q and q not in name.lower():
                     continue
@@ -9118,12 +9127,16 @@ def user_search():
                     continue
                 if homebase and homebase != h:
                     continue
+                if exclude_family and acct == 'family':
+                    continue
                 results.append({
                     'token': target_token,
                     'name': name,
                     'airline': pr.get('airline'),
                     'homebase': pr.get('homebase'),
                     'position': pr.get('position'),
+                    'avatar_url': pr.get('avatar_url'),
+                    'account_type': acct or 'crew',
                 })
                 if len(results) >= limit:
                     break

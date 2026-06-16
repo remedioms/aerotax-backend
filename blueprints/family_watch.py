@@ -919,21 +919,36 @@ def family_share_revoke(token, family_token):
 #  Pairing-Code-Endpunkte
 # ════════════════════════════════════════════════════════════════════
 
-def _resolve_crew_for_family(family_token):
-    """Findet den Crew-Token zu einem Family-Token.
-    1) Scoped read-only Family-Token (AT-FAM-, bevorzugt) → family_scoped_tokens.
-    2) Back-compat: irgendein family_shares-Grant mit diesem family_token.
-    Returns crew_token oder None."""
+def _resolve_crews_for_family(family_token):
+    """ALLE Crew-Tokens zu einem Family-Token (scoped + alle Grants), dedupliziert."""
+    out = []
+    seen = set()
     scoped = _scoped_token_crew(family_token)
-    if scoped:
-        return scoped
+    if scoped and scoped not in seen:
+        seen.add(scoped); out.append(scoped)
     try:
         for s in _shares_load():
-            if s.get('family_token') == family_token and s.get('crew_token'):
-                return s.get('crew_token')
+            if s.get('family_token') == family_token:
+                ct = s.get('crew_token')
+                if ct and ct not in seen:
+                    seen.add(ct); out.append(ct)
     except Exception:
         pass
-    return None
+    return out
+
+
+def _resolve_crew_for_family(family_token, opaque_id=None):
+    """Findet den Crew-Token zu einem Family-Token. Mit `opaque_id` (der pro
+    Pairing stabile sha256(crew:family)[:16]-Hash aus dem Watch-Feed) wird GENAU
+    der gemeinte Crew aufgelöst → Family kann mehreren Crew folgen. Ohne id:
+    der primäre (scoped) Crew."""
+    crews = _resolve_crews_for_family(family_token)
+    if opaque_id:
+        for ct in crews:
+            h = hashlib.sha256(f'{ct}:{family_token}'.encode('utf-8')).hexdigest()[:16]
+            if h == opaque_id:
+                return ct
+    return crews[0] if crews else None
 
 
 def _load_crew_roster_days(crew_token, days_limit):
@@ -993,7 +1008,8 @@ def family_roster(family_token):
         days_limit = min(max(int(request.args.get('days') or 60), 1), 120)
     except Exception:
         days_limit = 60
-    crew_token = _resolve_crew_for_family(family_token)
+    opaque_id = (request.args.get('crew') or '').strip() or None
+    crew_token = _resolve_crew_for_family(family_token, opaque_id=opaque_id)
     if not crew_token:
         return jsonify({'ok': False, 'shared': False,
                         'error': 'not_paired', 'days': []}), 404
