@@ -9052,8 +9052,12 @@ def user_search():
     sb_done = False
     if SB_AVAILABLE:
         try:
+            # avatar_url + account_type sind KEINE Spalten — sie liegen im
+            # metadata-jsonb (siehe _profile_save_to_supabase). Daher metadata
+            # selektieren und daraus auslesen, NICHT als Spalten (sonst 42703 →
+            # SB-Fail → Disk-Fallback → leere Suche).
             qbuilder = sb.table('user_profiles').select(
-                'token,name,homebase,airline,"position",avatar_url,account_type'
+                'token,name,homebase,airline,"position",metadata'
             )
             if q:
                 # ilike ist case-insensitive — name enthält Substring q
@@ -9076,7 +9080,10 @@ def user_search():
                 # Filter "kein-Name" raus — sonst wirkt's wie ein User-Listing
                 if not name:
                     continue
-                acct = (row.get('account_type') or '').strip().lower()
+                md = row.get('metadata') or {}
+                if not isinstance(md, dict):
+                    md = {}
+                acct = (md.get('account_type') or '').strip().lower()
                 if exclude_family and acct == 'family':
                     continue
                 results.append({
@@ -9085,7 +9092,7 @@ def user_search():
                     'airline': row.get('airline'),
                     'homebase': row.get('homebase'),
                     'position': row.get('position'),
-                    'avatar_url': row.get('avatar_url'),
+                    'avatar_url': md.get('avatar_url'),
                     'account_type': acct or 'crew',
                 })
                 if len(results) >= limit:
