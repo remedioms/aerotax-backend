@@ -178,6 +178,9 @@ def _public_view(rec):
         # die API gibt das Feld weiterhin als `text` an die iOS-App.
         'text': rec.get('body', rec.get('text')),
         'emoji': rec.get('emoji'),
+        # Crew-Reaktion (❤️ zurück) — Family sieht sie auf ihrer Compose-Karte.
+        'reaction': rec.get('reaction'),
+        'reacted_at': rec.get('reacted_at'),
         'from_name': rec.get('from_name'),
         'from_avatar': rec.get('from_avatar'),
         'relation': rec.get('relation'),
@@ -294,3 +297,49 @@ def incoming_statuses(crew_token):
     out = [_public_view(r) for r in rows]
     out.sort(key=lambda v: v.get('created_at') or '', reverse=True)
     return jsonify({'ok': True, 'statuses': out, 'count': len(out)})
+
+
+@feed_status_bp.route('/api/feed-status/<crew_token>/react', methods=['POST'])
+def react_to_status(crew_token):
+    """Crew schickt eine Reaktion (z. B. ❤️) auf eine Family-Nachricht zurück.
+    Identifiziert die Nachricht über created_at (eindeutig genug, KEIN family_token-
+    Leak an die Crew). Die Family sieht die Reaktion auf ihrer Compose-Karte."""
+    if not _safe_token(crew_token):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    body = request.get_json(silent=True) or {}
+    emoji = (body.get('emoji') or '❤️').strip()[:8] or '❤️'
+    created_at = (body.get('created_at') or '').strip()
+    now = _now_iso()
+    sb_avail, sb = _get_sb()
+    if sb_avail and sb is not None:
+        try:
+            q = sb.table('feed_statuses').update(
+                {'reaction': emoji, 'reacted_at': now}).eq('crew_token', crew_token)
+            if created_at:
+                q = q.eq('created_at', created_at)
+            q.execute()
+            return jsonify({'ok': True, 'reaction': emoji})
+        except Exception as e:
+            _log().info(f'[feed-status] react_skip {type(e).__name__}')
+    # Disk-Fallback: passende(n) Note(s) finden + Reaktion setzen.
+    try:
+        d = _history_dir()
+        for fn in os.listdir(d):
+            if not fn.startswith('feed_status_') or not fn.endswith('.json'):
+                continue
+            p = os.path.join(d, fn)
+            try:
+                with open(p) as f:
+                    rec = json.load(f)
+            except Exception:
+                continue
+            if rec.get('crew_token') != crew_token:
+                continue
+            if created_at and rec.get('created_at') != created_at:
+                continue
+            rec['reaction'] = emoji
+            rec['reacted_at'] = now
+            _atomic_write_json(p, rec)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'reaction': emoji})
