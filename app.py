@@ -88,6 +88,7 @@ for _bp_path, _bp_name in [
     ('blueprints.layover_group_blueprint',   'layover_group_bp'),  # geteilter Layover-Plan + Polls
     ('blueprints.pexels_blueprint',          'pexels_bp'),  # Pexels-Proxy (Key server-seitig)
     ('blueprints.feed_status_blueprint',     'feed_status_bp'),  # 24h verschwindende Feed-Updates
+    ('blueprints.flight_profile_blueprint',  'flight_profile_bp'),  # selbst-bauende Flug-DB + Crew-Ebene
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
