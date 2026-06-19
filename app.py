@@ -17292,7 +17292,96 @@ def get_trip_stats(token):
         return jsonify(cached[1])
     payload = _trip_stats_compute(token)
     _TRIP_STATS_CACHE[token] = (now + 300, payload)
+    # #111: anonymisierte YTD-Kernmetriken ins Community-Aggregat (best-effort).
+    if payload.get('has_data'):
+        _community_upsert_stats(token, payload.get('ytd') or {})
     return jsonify(payload)
+
+
+def _community_token_hash(token):
+    import hashlib
+    return hashlib.sha256((token or '').encode('utf-8')).hexdigest()[:32]
+
+
+def _community_upsert_stats(token, ytd):
+    """Best-effort: persistiert die ANONYMISIERTEN YTD-Kernmetriken des Users in der
+    Supabase-Tabelle `community_stats` für den AeroX-weiten Benchmark (#111). Der
+    Token wird gehasht (keine Klartext-Identität). Fehlertolerant — blockiert den
+    Stats-Call nie. Tabelle (einmalig in Supabase anlegen):
+        create table community_stats (
+          token_hash text primary key,
+          hours_flown float8, flights int, countries int,
+          tour_days int, distance_km float8, updated timestamptz
+        );
+    """
+    if sb is None:
+        return
+    try:
+        row = {
+            'token_hash': _community_token_hash(token),
+            'hours_flown': float(ytd.get('hours_flown') or 0),
+            'flights': int(ytd.get('flights') or 0),
+            'countries': int(ytd.get('countries_visited') or 0),
+            'tour_days': int(ytd.get('tour_days') or 0),
+            'distance_km': float(ytd.get('distance_km') or 0),
+            'updated': datetime.utcnow().isoformat(),
+        }
+        def _do():
+            return sb.table('community_stats').upsert(row, on_conflict='token_hash').execute()
+        _supabase_execute_with_timeout('community_upsert', _do, timeout_s=4)
+    except Exception as e:
+        app.logger.warning(f'[community] upsert-fail: {str(e)[:120]}')
+
+
+@app.route('/api/community/benchmark/<token>', methods=['GET'])
+def community_benchmark(token):
+    """AeroX-weiter Vergleich (#111): die YTD-Kernmetriken des Users gegen den
+    Durchschnitt ALLER AeroX-User (anonymisiert, Supabase-Aggregat). Ehrlicher
+    Empty-State wenn der User noch keine Daten hat (has_data=False) oder zu wenige
+    Vergleichs-User existieren (community=null, < 3 Profile).
+    """
+    payload = _trip_stats_compute(token)
+    you = payload.get('ytd') or {}
+    has_data = payload.get('has_data', False)
+    # Eigene Werte gleich mit-persistieren — hält das Aggregat frisch.
+    if has_data:
+        _community_upsert_stats(token, you)
+
+    community = None
+    percentile_hours = None
+    if sb is not None:
+        try:
+            def _do():
+                return sb.table('community_stats').select(
+                    'hours_flown,flights,countries,tour_days,distance_km').execute()
+            res, timed_out = _supabase_execute_with_timeout('community_select', _do, timeout_s=5)
+            rows = (res.data if res and hasattr(res, 'data') else []) or []
+            n = len(rows)
+            if n >= 3:  # erst ab 3 Profilen ein ehrlicher Durchschnitt
+                def _avg(key):
+                    vals = [float(r.get(key) or 0) for r in rows]
+                    return (sum(vals) / len(vals)) if vals else 0.0
+                community = {
+                    'sample_size': n,
+                    'avg_hours_flown': round(_avg('hours_flown'), 1),
+                    'avg_flights': round(_avg('flights')),
+                    'avg_countries': round(_avg('countries')),
+                    'avg_tour_days': round(_avg('tour_days')),
+                    'avg_distance_km': round(_avg('distance_km')),
+                }
+                my_hours = float(you.get('hours_flown') or 0)
+                below = sum(1 for r in rows if float(r.get('hours_flown') or 0) < my_hours)
+                percentile_hours = round(100.0 * below / n)
+        except Exception as e:
+            app.logger.warning(f'[community] benchmark-fail: {str(e)[:120]}')
+
+    return jsonify({
+        'token': token,
+        'has_data': has_data,
+        'you': you,
+        'community': community,
+        'percentile_hours': percentile_hours,
+    })
 
 
 @app.route('/api/user/friend-compare/<token>/<friend_token>', methods=['GET'])
