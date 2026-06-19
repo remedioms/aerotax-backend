@@ -23443,6 +23443,43 @@ def upload_calendar_events(token):
             adapted.append(adapted_ev)
         briefings, imported_briefings = _ics_events_to_briefings(
             adapted, existing=existing_briefings)
+        # PRO-LEG-SEKTOREN BEWAHREN (User: „alle iCal-Infos übernehmen"): der
+        # Tages-Merge oben fasst alle VEVENTs eines Tages zu EINEM Summary
+        # zusammen und verliert dabei die einzelnen Flug-Ab-/Ankunftszeiten.
+        # Hier bauen wir aus den EINZEL-Events je Tag ein `ical_sectors`-Array
+        # (Flugnr + from/to + dep/arr-ISO) und hängen es an den Tagessatz. Es
+        # persistiert via raw_event (Supabase) und wird vom GET-Briefing
+        # unverändert durchgereicht.
+        try:
+            sec_by_day = {}
+            for _ev in adapted:
+                _s = (_ev.get('start_iso') or '')
+                _d = _s[:10]
+                if not re.match(r'^\d{4}-\d{2}-\d{2}$', _d):
+                    continue
+                _summ = (_ev.get('summary') or '').upper()
+                _loc = (_ev.get('location') or '').upper()
+                _m = re.search(r'([A-Z]{2,3}\s*\d{1,4})\s*:?\s*([A-Z]{3})\s*-\s*([A-Z]{3})', _summ)
+                if _m:
+                    _flight = re.sub(r'\s+', '', _m.group(1)); _frm = _m.group(2); _to = _m.group(3)
+                else:
+                    _ml = re.search(r'\b([A-Z]{3})\s*-\s*([A-Z]{3})\b', _loc)
+                    if not _ml:
+                        continue
+                    _flight = None; _frm = _ml.group(1); _to = _ml.group(2)
+                sec_by_day.setdefault(_d, []).append({
+                    'flight': _flight, 'from': _frm, 'to': _to,
+                    'dep_iso': (_ev.get('start_iso') or ''),
+                    'arr_iso': (_ev.get('end_iso') or ''),
+                })
+            for _d, _secs in sec_by_day.items():
+                _secs.sort(key=lambda x: x.get('dep_iso') or '')
+                if isinstance(briefings.get(_d), dict):
+                    briefings[_d]['ical_sectors'] = _secs
+                else:
+                    briefings.setdefault(_d, {})['ical_sectors'] = _secs
+        except Exception as _se:
+            app.logger.warning(f'[ical-briefings] sectors-build-fail: {str(_se)[:160]}')
         _ical_briefings_save(token, briefings)
     except Exception as e:
         app.logger.warning(f'[ical-briefings] ekevent-persist-fail: {str(e)[:200]}')
