@@ -23182,6 +23182,48 @@ def _ics_events_to_briefings(events, existing=None):
     return briefings, imported
 
 
+def _build_ical_sectors(events):
+    """Aus EINZEL-iCal-Events je Tag ein sectors[]-Array bauen (Flugnr + from/to +
+    dep/arr-ISO) — die echten Pro-Leg-Flugzeiten, die der Tages-Merge sonst
+    verliert. Eingabe: dicts mit summary/location/start_iso/end_iso (so liefern es
+    `_parse_ics_to_events` UND der EKEvent-Upload-Adapter). Geteilt von beiden
+    Import-Pfaden (User: „alle iCal-Infos übernehmen")."""
+    sec_by_day = {}
+    for ev in (events or []):
+        d = (ev.get('start_iso') or '')[:10]
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
+            continue
+        summ = (ev.get('summary') or '').upper()
+        loc = (ev.get('location') or '').upper()
+        m = re.search(r'([A-Z]{2,3}\s*\d{1,4})\s*:?\s*([A-Z]{3})\s*-\s*([A-Z]{3})', summ)
+        if m:
+            flight = re.sub(r'\s+', '', m.group(1)); frm = m.group(2); to = m.group(3)
+        else:
+            ml = re.search(r'\b([A-Z]{3})\s*-\s*([A-Z]{3})\b', loc)
+            if not ml:
+                continue
+            flight = None; frm = ml.group(1); to = ml.group(2)
+        sec_by_day.setdefault(d, []).append({
+            'flight': flight, 'from': frm, 'to': to,
+            'dep_iso': (ev.get('start_iso') or ''), 'arr_iso': (ev.get('end_iso') or ''),
+        })
+    for d in sec_by_day:
+        sec_by_day[d].sort(key=lambda x: x.get('dep_iso') or '')
+    return sec_by_day
+
+
+def _attach_sectors(briefings, events):
+    """Hängt die aus `events` gebauten Pro-Leg-Sektoren an die Tagessätze."""
+    try:
+        for d, secs in _build_ical_sectors(events).items():
+            if isinstance(briefings.get(d), dict):
+                briefings[d]['ical_sectors'] = secs
+            else:
+                briefings.setdefault(d, {})['ical_sectors'] = secs
+    except Exception as e:
+        app.logger.warning(f'[ical-briefings] sectors-attach-fail: {str(e)[:160]}')
+
+
 @app.route('/api/user/calendar-feed/<token>/import', methods=['POST'])
 def import_calendar_feed(token):
     """Lädt ein ICS-File von einer URL und speichert die Events als Roster-Hints.
@@ -23340,6 +23382,8 @@ def import_calendar_feed(token):
         except Exception as _re:
             _reconcile_dbg['error'] = str(_re)[:120]
             app.logger.warning(f'[ical-reconcile] {str(_re)[:150]}')
+        # Pro-Leg-Sektoren auch im ICS-URL-Pfad bewahren (gleich wie EKEvent-Upload).
+        _attach_sectors(briefings, events[:200])
         _ical_briefings_save(token, briefings)
     except Exception as e:
         app.logger.warning(f'[ical-briefings] import-persist-fail: {str(e)[:200]}')
@@ -23443,43 +23487,8 @@ def upload_calendar_events(token):
             adapted.append(adapted_ev)
         briefings, imported_briefings = _ics_events_to_briefings(
             adapted, existing=existing_briefings)
-        # PRO-LEG-SEKTOREN BEWAHREN (User: „alle iCal-Infos übernehmen"): der
-        # Tages-Merge oben fasst alle VEVENTs eines Tages zu EINEM Summary
-        # zusammen und verliert dabei die einzelnen Flug-Ab-/Ankunftszeiten.
-        # Hier bauen wir aus den EINZEL-Events je Tag ein `ical_sectors`-Array
-        # (Flugnr + from/to + dep/arr-ISO) und hängen es an den Tagessatz. Es
-        # persistiert via raw_event (Supabase) und wird vom GET-Briefing
-        # unverändert durchgereicht.
-        try:
-            sec_by_day = {}
-            for _ev in adapted:
-                _s = (_ev.get('start_iso') or '')
-                _d = _s[:10]
-                if not re.match(r'^\d{4}-\d{2}-\d{2}$', _d):
-                    continue
-                _summ = (_ev.get('summary') or '').upper()
-                _loc = (_ev.get('location') or '').upper()
-                _m = re.search(r'([A-Z]{2,3}\s*\d{1,4})\s*:?\s*([A-Z]{3})\s*-\s*([A-Z]{3})', _summ)
-                if _m:
-                    _flight = re.sub(r'\s+', '', _m.group(1)); _frm = _m.group(2); _to = _m.group(3)
-                else:
-                    _ml = re.search(r'\b([A-Z]{3})\s*-\s*([A-Z]{3})\b', _loc)
-                    if not _ml:
-                        continue
-                    _flight = None; _frm = _ml.group(1); _to = _ml.group(2)
-                sec_by_day.setdefault(_d, []).append({
-                    'flight': _flight, 'from': _frm, 'to': _to,
-                    'dep_iso': (_ev.get('start_iso') or ''),
-                    'arr_iso': (_ev.get('end_iso') or ''),
-                })
-            for _d, _secs in sec_by_day.items():
-                _secs.sort(key=lambda x: x.get('dep_iso') or '')
-                if isinstance(briefings.get(_d), dict):
-                    briefings[_d]['ical_sectors'] = _secs
-                else:
-                    briefings.setdefault(_d, {})['ical_sectors'] = _secs
-        except Exception as _se:
-            app.logger.warning(f'[ical-briefings] sectors-build-fail: {str(_se)[:160]}')
+        # Pro-Leg-Sektoren bewahren (geteilte Logik mit dem ICS-URL-Pfad).
+        _attach_sectors(briefings, adapted)
         _ical_briefings_save(token, briefings)
     except Exception as e:
         app.logger.warning(f'[ical-briefings] ekevent-persist-fail: {str(e)[:200]}')
