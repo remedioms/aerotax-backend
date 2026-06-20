@@ -578,13 +578,21 @@ def ax_schedule(frm, to):
     if len(a) < 3 or len(b) < 3:
         return jsonify({'ok': False, 'error': 'need IATA'}), 400
     route = f'{a}-{b}'
-    cached = _cache_get('ax_schedule_cache', 'route', route)
-    if cached is not None:
-        return jsonify({'ok': True, 'route': route, 'source': 'cache', **cached})
-
     key = os.environ.get('AVIATIONSTACK_KEY', '')
     month = time.strftime('%Y-%m', time.gmtime())
     remaining, used = _budget_remaining(month)
+
+    cached = _cache_get('ax_schedule_cache', 'route', route)
+    if cached is not None:
+        # Schedules driften saisonal: nur wenn der Cache SEHR alt ist (>180 Tage)
+        # UND noch reichlich Budget frei ist (>=30), einmal neu ziehen. Sonst
+        # immer aus dem Cache (0 Budget) — die 90/Monat sind nur für NEUE Routen.
+        stale_days = int(os.environ.get('AVIATIONSTACK_REFRESH_DAYS', '180'))
+        fetched = cached.get('_fetched', 0)
+        age_days = (time.time() - fetched) / 86400.0 if fetched else 0
+        if not (key and remaining >= 30 and age_days > stale_days):
+            return jsonify({'ok': True, 'route': route, 'source': 'cache', **cached})
+        # sonst: durchfallen und einmal auffrischen
     if not key or remaining <= 0:
         # Kein Budget/Key → ehrlich leer (App zeigt dann nur die Airlines-Liste).
         return jsonify({'ok': True, 'route': route, 'source': 'budget-exhausted',
@@ -618,7 +626,7 @@ def ax_schedule(frm, to):
             'arr_scheduled': arr.get('scheduled'),
             'status': r.get('flight_status'),
         })
-    payload = {'flights': flights, 'count': len(flights)}
+    payload = {'flights': flights, 'count': len(flights), '_fetched': int(time.time())}
     _cache_put('ax_schedule_cache',
                {'route': route, 'payload': payload,
                 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
