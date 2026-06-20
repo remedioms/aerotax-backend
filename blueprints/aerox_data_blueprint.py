@@ -294,6 +294,14 @@ def ax_aircraft(hexid):
                 out['age_years'] = age
         except (ValueError, TypeError):
             pass
+    # Registrierungsland aus der ICAO-Hex-Allokation — komplett offline, NULL API.
+    try:
+        from blueprints.icao_country import country_for_hex
+        c = country_for_hex(hexid)
+        if c:
+            out['country'] = c['iso']; out['country_name'] = c['name']; out['flag'] = c['flag']
+    except Exception:
+        pass
     return jsonify(out)
 
 
