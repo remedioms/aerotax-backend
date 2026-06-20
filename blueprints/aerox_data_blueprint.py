@@ -279,6 +279,18 @@ def ax_aircraft(hexid):
                            {'hex': hexid, 'payload': live,
                             'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
             else:
+                # Keine Stammdaten — ABER Land/Flagge aus der ICAO-Hex-Allokation
+                # geht immer (offline). So zeigt das Radar selbst für unbekannte
+                # Maschinen wenigstens die Flagge, statt eines leeren 404.
+                out['source'] = 'icao-hex'
+                try:
+                    from blueprints.icao_country import country_for_hex
+                    c = country_for_hex(hexid)
+                    if c:
+                        out['country'] = c['iso']; out['country_name'] = c['name']; out['flag'] = c['flag']
+                        return jsonify(out)
+                except Exception:
+                    pass
                 return jsonify({'ok': False, 'hex': hexid}), 404
     # Muster-Vollname + Alter anreichern.
     tc = out.get('typecode')
