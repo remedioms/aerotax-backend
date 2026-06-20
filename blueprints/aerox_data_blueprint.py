@@ -42,6 +42,7 @@ _DB_PATH = os.path.join(os.environ.get('AEROX_DB_TMP', '/tmp'), 'aerox_reference
 _conn = None
 _conn_lock = threading.Lock()
 _METAR_CACHE = {}   # icao → (expires_ts, dict)
+_MEM_BUDGET = {}    # „YYYY-MM" → verbrauchte AviationStack-Calls (In-Memory-Fallback)
 
 
 def _ensure_db():
@@ -535,22 +536,25 @@ def ax_metar(icao):
 
 
 def _budget_remaining(month):
-    """Wie viele AviationStack-Calls bleiben diesen Monat (Free-Tier-Schutz)."""
+    """Wie viele AviationStack-Calls bleiben diesen Monat (Free-Tier-Schutz).
+    Nutzt Supabase (persistent) UND einen In-Memory-Zähler als Fallback, damit
+    das Limit auch dann greift, wenn die Budget-Tabelle noch nicht existiert."""
     cap = int(os.environ.get('AVIATIONSTACK_CAP', '90'))   # < 100 Free-Limit
+    used = _MEM_BUDGET.get(month, 0)
     sb = _sb()
-    used = 0
     if sb is not None:
         try:
             res = sb.table('ax_api_budget').select('n').eq('month', month).limit(1).execute()
             rows = getattr(res, 'data', None) or []
             if rows:
-                used = int(rows[0].get('n') or 0)
+                used = max(used, int(rows[0].get('n') or 0))
         except Exception:
             pass
     return max(0, cap - used), used
 
 
 def _budget_inc(month, used):
+    _MEM_BUDGET[month] = used + 1   # In-Memory IMMER zählen (Safety-Net)
     sb = _sb()
     if sb is None:
         return
