@@ -30,5 +30,15 @@ create table if not exists public.ax_route_cache (
 );
 alter table public.ax_route_cache enable row level security;
 
+-- ── Foto-Link-Cache (Hex → planespotters-Foto-URL) ───────────────────
+-- NUR die URL-Strings (kein Bild-Storage). Ein planespotters-Call je Flieger,
+-- danach teilen alle Nutzer denselben Link → wächst die eigene Foto-Link-DB.
+create table if not exists public.ax_photo_cache (
+    hex         text         primary key,
+    payload     jsonb        not null default '{}'::jsonb,
+    updated_at  timestamptz  not null default now()
+);
+alter table public.ax_photo_cache enable row level security;
+
 -- Fertig. Das Backend schreibt mit dem Service-Role-Key (umgeht RLS),
 -- daher sind keine zusätzlichen Policies nötig.

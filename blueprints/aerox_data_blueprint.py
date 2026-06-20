@@ -154,6 +154,21 @@ def _hexdb_aircraft(hexid):
     }
 
 
+def _planespotters_photo(hexid):
+    """Foto-URL + Fotograf von planespotters — nur die URL-Strings (KEIN Bild-
+    Storage). Frei, kein Key."""
+    d = _http_json(f'https://api.planespotters.net/pub/photos/hex/{urllib.parse.quote(hexid)}')
+    photos = (d or {}).get('photos') or []
+    if not photos:
+        return None
+    p = photos[0]
+    thumb = (p.get('thumbnail_large') or p.get('thumbnail') or {})
+    url = thumb.get('src')
+    if not url:
+        return None
+    return {'photo': url, 'photographer': p.get('photographer'), 'link': p.get('link')}
+
+
 def _adsbdb_route(callsign):
     d = _http_json(f'https://api.adsbdb.com/v0/callsign/{urllib.parse.quote(callsign)}')
     fr = (((d or {}).get('response') or {}).get('flightroute')) if d else None
@@ -385,6 +400,26 @@ def ax_flight(flightno):
     if 'airline' not in out and 'origin' not in out:
         return jsonify({'ok': False, 'flight': raw}), 404
     return jsonify(out)
+
+
+@aerox_data_bp.route('/api/ax/photo/<hexid>', methods=['GET'])
+def ax_photo(hexid):
+    """Hex → Foto-URL + Fotograf. NUR die URL wird in Supabase gecacht (winziger
+    String, kein Bild-Storage) → ein planespotters-Call je Flieger, danach
+    teilen alle Nutzer denselben Treffer. Wächst die eigene Foto-Link-DB."""
+    hexid = (hexid or '').strip().lower()
+    if not hexid:
+        return jsonify({'ok': False, 'error': 'empty'}), 400
+    cached = _cache_get('ax_photo_cache', 'hex', hexid)
+    if cached:
+        return jsonify({'ok': True, 'hex': hexid, 'source': 'cache', **cached})
+    photo = _planespotters_photo(hexid)
+    if not photo:
+        return jsonify({'ok': False, 'hex': hexid}), 404
+    _cache_put('ax_photo_cache',
+               {'hex': hexid, 'payload': photo,
+                'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+    return jsonify({'ok': True, 'hex': hexid, 'source': 'planespotters', **photo})
 
 
 @aerox_data_bp.route('/api/ax/callsign/<callsign>', methods=['GET'])
