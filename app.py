@@ -17557,9 +17557,10 @@ def aircraft_age(hex):
     if not key:
         return jsonify({'ok': False, 'error': 'not_configured'})
     try:
-        r = _requests.get(f"https://aerodatabox.p.rapidapi.com/aircrafts/icao24/{h}",
-                          headers={'x-rapidapi-key': key,
-                                   'x-rapidapi-host': 'aerodatabox.p.rapidapi.com'}, timeout=8)
+        import requests
+        r = requests.get(f"https://aerodatabox.p.rapidapi.com/aircrafts/icao24/{h}",
+                         headers={'x-rapidapi-key': key,
+                                  'x-rapidapi-host': 'aerodatabox.p.rapidapi.com'}, timeout=8)
         if r.status_code != 200:
             return jsonify({'ok': False, 'error': f'http_{r.status_code}'})
         d = r.json() or {}
