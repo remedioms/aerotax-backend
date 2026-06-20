@@ -17333,6 +17333,85 @@ def _community_upsert_stats(token, ytd):
         app.logger.warning(f'[community] upsert-fail: {str(e)[:120]}')
 
 
+def _community_metrics_from_ical(token):
+    """YTD-Kernmetriken aus den PERSISTENTEN iCal-Briefings (Supabase) berechnen —
+    Fallback für die Community-Aggregation (#111), wenn keine Tax-Auswertung
+    vorliegt. So zählt jeder iCal-verbundene User mit, unabhängig von der ephemeren
+    In-Memory-Session. Liefert dieselben Keys wie der trip-stats `ytd`-Bucket.
+    """
+    try:
+        briefings = _ical_briefings_load(token) or {}
+    except Exception:
+        briefings = {}
+    if not isinstance(briefings, dict) or not briefings:
+        return None
+
+    year = datetime.utcnow().year
+    ap_lookup = _airports_compact_lookup()
+    total_min = 0.0
+    flights = 0
+    distance_km = 0.0
+    countries = set()
+    tour_days = 0
+
+    def _parse_iso(s):
+        if not s or not isinstance(s, str):
+            return None
+        try:
+            return datetime.fromisoformat(s.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+
+    for d, b in briefings.items():
+        if not isinstance(d, str) or len(d) < 4 or not d[:4].isdigit():
+            continue
+        if int(d[:4]) != year:
+            continue
+        if not isinstance(b, dict):
+            continue
+        secs = b.get('ical_sectors') or []
+        day_has_flight = False
+        for s in secs:
+            if not isinstance(s, dict):
+                continue
+            frm = (s.get('from') or '').upper()
+            to = (s.get('to') or '').upper()
+            dep = _parse_iso(s.get('dep_iso'))
+            arr = _parse_iso(s.get('arr_iso'))
+            if dep and arr:
+                mins = (arr - dep).total_seconds() / 60.0
+                if mins < 0:
+                    mins += 24 * 60  # Mitternachts-Wrap
+                if 0 < mins < 20 * 60:  # plausibler Flug
+                    total_min += mins
+            flights += 1
+            day_has_flight = True
+            ca = ap_lookup.get(frm); cb = ap_lookup.get(to)
+            if ca and cb:
+                distance_km += _haversine_km(ca[0], ca[1], cb[0], cb[1])
+            for code in (frm, to):
+                ent = ap_lookup.get(code)
+                if ent and ent[2]:
+                    countries.add(ent[2])
+        lo = ((b.get('reader_facts') or {}).get('layover_ort') or '').upper().strip()
+        if len(lo) == 3:
+            ent = ap_lookup.get(lo)
+            if ent and ent[2]:
+                countries.add(ent[2])
+        if day_has_flight:
+            tour_days += 1
+
+    if flights == 0:
+        return None
+    return {
+        'hours_flown': round(total_min / 60.0, 1),
+        'flights': flights,
+        'distance_km': round(distance_km),
+        'countries_visited': len(countries),
+        'tour_days': tour_days,
+    }
+
+
 @app.route('/api/community/benchmark/<token>', methods=['GET'])
 def community_benchmark(token):
     """AeroX-weiter Vergleich (#111): die YTD-Kernmetriken des Users gegen den
@@ -17343,6 +17422,13 @@ def community_benchmark(token):
     payload = _trip_stats_compute(token)
     you = payload.get('ytd') or {}
     has_data = payload.get('has_data', False)
+    # Fallback auf die PERSISTENTEN iCal-Briefings, wenn keine (oder leere) Tax-
+    # Auswertung vorliegt — sonst zählt ein nur-iCal-User nie mit (#111).
+    if not has_data or float(you.get('hours_flown') or 0) == 0:
+        ical_you = _community_metrics_from_ical(token)
+        if ical_you:
+            you = ical_you
+            has_data = True
     # Eigene Werte gleich mit-persistieren — hält das Aggregat frisch.
     if has_data:
         _community_upsert_stats(token, you)
@@ -17382,6 +17468,121 @@ def community_benchmark(token):
         'community': community,
         'percentile_hours': percentile_hours,
     })
+
+
+_FLIGHT_TIMES_CACHE = {}
+
+@app.route('/api/flight-times/<flightno>', methods=['GET'])
+def flight_times(flightno):
+    """Echte geplante/aktuelle Ab-/Ankunftszeiten einer Flugnummer (#139) via
+    AeroDataBox (RapidAPI). Key NUR server-seitig (Cloud-Run-Env AERODATABOX_KEY),
+    Antwort 10 min gecacht → ein Key, geteilt, bleibt im Free-Limit (10k User)."""
+    import time
+    key = os.environ.get('AERODATABOX_KEY', '')
+    if not key:
+        return jsonify({'ok': False, 'error': 'not_configured'})
+    fn = (flightno or '').strip().upper().replace(' ', '')
+    date = request.args.get('date') or datetime.utcnow().strftime('%Y-%m-%d')
+    ckey = f"{fn}|{date}"
+    now = time.time()
+    if (hit := _FLIGHT_TIMES_CACHE.get(ckey)) and hit[0] > now:
+        return jsonify(hit[1])
+
+    def _cache(out, ttl):
+        _FLIGHT_TIMES_CACHE[ckey] = (now + ttl, out)
+        if len(_FLIGHT_TIMES_CACHE) > 800:
+            for k in list(_FLIGHT_TIMES_CACHE.keys())[:400]:
+                _FLIGHT_TIMES_CACHE.pop(k, None)
+        return jsonify(out)
+
+    url = f"https://aerodatabox.p.rapidapi.com/flights/number/{fn}/{date}"
+    try:
+        r = _requests.get(url, headers={'x-rapidapi-key': key,
+                                        'x-rapidapi-host': 'aerodatabox.p.rapidapi.com'}, timeout=8)
+        if r.status_code != 200:
+            return _cache({'ok': False, 'error': f'http_{r.status_code}'}, 300)
+        flights = r.json() if isinstance(r.json(), list) else []
+        if not flights:
+            return _cache({'ok': False, 'error': 'no_flight'}, 600)
+        f = flights[0]
+        def ap(side):
+            a = (f.get(side) or {}); air = (a.get('airport') or {})
+            return {
+                'iata': air.get('iata'),
+                'name': air.get('name') or air.get('shortName'),
+                'city': air.get('municipalityName'),
+                'scheduled': (a.get('scheduledTime') or {}).get('local'),
+                'revised': (a.get('revisedTime') or {}).get('local')
+                           or (a.get('predictedTime') or {}).get('local'),
+                'terminal': a.get('terminal'),
+            }
+        out = {'ok': True, 'flight': fn,
+               'airline': (f.get('airline') or {}).get('name'),
+               'aircraft': (f.get('aircraft') or {}).get('model'),
+               'status': f.get('status'),
+               'departure': ap('departure'), 'arrival': ap('arrival')}
+        return _cache(out, 600)
+    except Exception as e:
+        app.logger.warning(f'[flighttimes] {str(e)[:120]}')
+        return jsonify({'ok': False, 'error': 'exception'})
+
+
+@app.route('/api/aircraft-age/<hex>', methods=['GET'])
+def aircraft_age(hex):
+    """AeroX-eigene, WACHSENDE Flieger-Alters-DB (#127, User-Idee): einmal pro Hex
+    AeroDataBox abfragen (Baujahr aus rollout/firstFlight/delivery) und in Supabase
+    `aircraft_age` CACHEN/TEILEN → über echte Nutzung baut AeroX eine globale
+    Alters-DB auf, free-tier-schonend (ein Key, geteilter Cache). Tabelle einmalig:
+        create table aircraft_age (hex text primary key, year int, reg text,
+          type text, updated timestamptz);
+    """
+    h = (hex or '').strip().lower()
+    if len(h) != 6:
+        return jsonify({'ok': False})
+    # 1) Geteilter Supabase-Cache (AeroX-DB).
+    if sb is not None:
+        try:
+            def _do(): return sb.table('aircraft_age').select('*').eq('hex', h).limit(1).execute()
+            res, _ = _supabase_execute_with_timeout('age_get', _do, timeout_s=4)
+            rows = (res.data if res and hasattr(res, 'data') else []) or []
+            if rows:
+                r = rows[0]
+                return jsonify({'ok': r.get('year') is not None, 'hex': h, 'year': r.get('year'),
+                                'reg': r.get('reg'), 'type': r.get('type'), 'cached': True})
+        except Exception as e:
+            app.logger.warning(f'[age] cache-get {str(e)[:100]}')
+    # 2) AeroDataBox-Lookup (Baujahr).
+    key = os.environ.get('AERODATABOX_KEY', '')
+    if not key:
+        return jsonify({'ok': False, 'error': 'not_configured'})
+    try:
+        r = _requests.get(f"https://aerodatabox.p.rapidapi.com/aircrafts/icao24/{h}",
+                          headers={'x-rapidapi-key': key,
+                                   'x-rapidapi-host': 'aerodatabox.p.rapidapi.com'}, timeout=8)
+        if r.status_code != 200:
+            return jsonify({'ok': False, 'error': f'http_{r.status_code}'})
+        d = r.json() or {}
+        year = None
+        for f in ('rolloutDate', 'firstFlightDate', 'deliveryDate'):
+            v = d.get(f)
+            if isinstance(v, str) and len(v) >= 4 and v[:4].isdigit():
+                y = int(v[:4])
+                if 1950 <= y <= 2026:
+                    year = y; break
+        reg = d.get('reg'); typ = d.get('typeName')
+        # 3) In die AeroX-DB schreiben (auch ohne Jahr → kein Re-Fetch-Sturm).
+        if sb is not None:
+            try:
+                row = {'hex': h, 'year': year, 'reg': reg, 'type': typ,
+                       'updated': datetime.utcnow().isoformat()}
+                def _up(): return sb.table('aircraft_age').upsert(row, on_conflict='hex').execute()
+                _supabase_execute_with_timeout('age_put', _up, timeout_s=4)
+            except Exception as e:
+                app.logger.warning(f'[age] cache-put {str(e)[:100]}')
+        return jsonify({'ok': year is not None, 'hex': h, 'year': year, 'reg': reg, 'type': typ})
+    except Exception as e:
+        app.logger.warning(f'[age] {str(e)[:120]}')
+        return jsonify({'ok': False, 'error': 'exception'})
 
 
 @app.route('/api/user/friend-compare/<token>/<friend_token>', methods=['GET'])
