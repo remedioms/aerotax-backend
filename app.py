@@ -89,6 +89,7 @@ for _bp_path, _bp_name in [
     ('blueprints.pexels_blueprint',          'pexels_bp'),  # Pexels-Proxy (Key server-seitig)
     ('blueprints.feed_status_blueprint',     'feed_status_bp'),  # 24h verschwindende Feed-Updates
     ('blueprints.flight_profile_blueprint',  'flight_profile_bp'),  # selbst-bauende Flug-DB + Crew-Ebene
+    ('blueprints.aerox_data_blueprint',      'aerox_data_bp'),  # self-hosted Luftfahrt-DB (/api/ax/*)
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
