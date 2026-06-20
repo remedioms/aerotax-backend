@@ -255,9 +255,23 @@ def ax_airline(code):
     r = _airline_row(code)
     if not r:
         return jsonify({'ok': False, 'code': code}), 404
+    # Bediente Ziele (aus dem Routen-Seed) — füllt die Airline-Seite, NULL API.
+    dests = []
+    code = (r.get('iata') or '').strip().upper()
+    if code:
+        seen = set()
+        for row in _q('SELECT DISTINCT dst FROM routes WHERE airline=? LIMIT 60', (code,)):
+            d = (row.get('dst') or '').strip().upper()
+            if not d or d in seen:
+                continue
+            seen.add(d)
+            ap = _airport_row(d)
+            dests.append({'iata': d, 'city': (ap or {}).get('city'),
+                          'country': (ap or {}).get('country')})
     return jsonify({'ok': True, 'iata': r.get('iata'), 'icao': r.get('icao'),
                     'name': r.get('name'), 'callsign': r.get('callsign'),
-                    'country': r.get('country'), 'logo': _airline_logo(r.get('iata'))})
+                    'country': r.get('country'), 'logo': _airline_logo(r.get('iata')),
+                    'destinations': dests, 'destinations_count': len(dests)})
 
 
 @aerox_data_bp.route('/api/ax/type/<code>', methods=['GET'])
@@ -453,3 +467,74 @@ def ax_callsign(callsign):
     out['origin'] = enrich(route.get('src') or route.get('src_icao'))
     out['destination'] = enrich(route.get('dst') or route.get('dst_icao'))
     return jsonify(out)
+
+
+def _airport_full(code):
+    ap = _airport_row(code)
+    if not ap:
+        return {'iata': code}
+    return {'iata': ap.get('iata'), 'icao': ap.get('icao'), 'name': ap.get('name'),
+            'city': ap.get('city'), 'country': ap.get('country'),
+            'lat': ap.get('lat'), 'lon': ap.get('lon')}
+
+
+@aerox_data_bp.route('/api/ax/route/<frm>/<to>', methods=['GET'])
+def ax_route(frm, to):
+    """Städtepaar (z.B. FRA/LIS) → welche Airlines die Strecke fliegen, plus
+    beide Flughäfen. Quelle: 67k-Routen-Seed (lokal, NULL API). Behebt die
+    leere „FRA-LIS"-Suche."""
+    a = (frm or '').strip().upper()
+    b = (to or '').strip().upper()
+    if len(a) < 3 or len(b) < 3:
+        return jsonify({'ok': False, 'error': 'need IATA codes'}), 400
+    rows = _q('SELECT DISTINCT airline FROM routes WHERE src=? AND dst=?', (a, b))
+    airlines = []
+    seen = set()
+    for r in rows:
+        code = (r.get('airline') or '').strip().upper()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        al = _airline_row(code)
+        airlines.append({'iata': code, 'name': (al or {}).get('name'),
+                         'icao': (al or {}).get('icao'), 'logo': _airline_logo(code)})
+    airlines.sort(key=lambda x: (x['name'] is None, x['name'] or x['iata']))
+    return jsonify({'ok': True, 'origin': _airport_full(a), 'destination': _airport_full(b),
+                    'airlines': airlines, 'count': len(airlines)})
+
+
+@aerox_data_bp.route('/api/ax/suggest', methods=['GET'])
+def ax_suggest():
+    """Type-ahead: Präfix → bis zu ~10 Vorschläge über Flughäfen / Airlines /
+    Muster. Komplett lokal (gebackene DB), NULL API."""
+    from flask import request
+    q = (request.args.get('q') or '').strip()
+    if len(q) < 2:
+        return jsonify({'ok': True, 'suggestions': []})
+    qu = q.upper()
+    like = q + '%'
+    likeu = qu + '%'
+    out = []
+    # Flughäfen: Code-Präfix zuerst, dann Stadt/Name.
+    for r in _q('''SELECT iata, icao, name, city, country FROM airports
+                   WHERE iata=? OR icao=? OR city LIKE ? OR name LIKE ?
+                   ORDER BY (iata=?) DESC, (city LIKE ?) DESC LIMIT 6''',
+                (qu, qu, like, like, qu, likeu)):
+        if not (r.get('iata') or r.get('icao')):
+            continue
+        out.append({'type': 'airport', 'code': r.get('iata') or r.get('icao'),
+                    'label': r.get('city') or r.get('name'),
+                    'sub': f"{r.get('iata') or r.get('icao')} · {r.get('country') or ''}".strip(' ·')})
+    # Airlines: IATA/ICAO/Name.
+    for r in _q('''SELECT iata, icao, name FROM airlines
+                   WHERE iata=? OR icao=? OR name LIKE ? LIMIT 4''', (qu, qu, like)):
+        if not r.get('name'):
+            continue
+        out.append({'type': 'airline', 'code': r.get('iata') or r.get('icao'),
+                    'label': r.get('name'), 'sub': r.get('iata') or r.get('icao') or ''})
+    # Muster: Typecode/Name.
+    for r in _q('''SELECT typecode, name FROM aircraft_types
+                   WHERE typecode=? OR name LIKE ? LIMIT 3''', (qu, like)):
+        out.append({'type': 'aircraft_type', 'code': r.get('typecode'),
+                    'label': r.get('name') or r.get('typecode'), 'sub': r.get('typecode')})
+    return jsonify({'ok': True, 'suggestions': out})
