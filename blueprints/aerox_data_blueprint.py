@@ -246,10 +246,19 @@ def ax_type(code):
     if not r:
         return jsonify({'ok': False, 'code': code}), 404
     cnt = _q1('SELECT COUNT(*) AS n FROM aircraft WHERE typecode=?', (code,))
-    return jsonify({'ok': True, 'typecode': r.get('typecode'), 'name': r.get('name'),
-                    'manufacturer': r.get('manufacturer'), 'model': r.get('model'),
-                    'class': r.get('class'), 'engines': r.get('engines'),
-                    'fleet_seen': (cnt or {}).get('n', 0)})
+    out = {'ok': True, 'typecode': r.get('typecode'), 'name': r.get('name'),
+           'manufacturer': r.get('manufacturer'), 'model': r.get('model'),
+           'class': r.get('class'), 'engines': r.get('engines'),
+           'fleet_seen': (cnt or {}).get('n', 0)}
+    # Kuratierte Eckdaten (Sitze/Reichweite/Cruise/Wake) — offline.
+    try:
+        from blueprints.aircraft_specs import specs_for_type
+        s = specs_for_type(code)
+        if s:
+            out['specs'] = s
+    except Exception:
+        pass
+    return jsonify(out)
 
 
 @aerox_data_bp.route('/api/ax/aircraft/<hexid>', methods=['GET'])
@@ -299,6 +308,14 @@ def ax_aircraft(hexid):
         if t:
             out['type_name'] = t.get('name')
             out['engines'] = t.get('engines')
+        # Kuratierte Eckdaten (Sitze/Reichweite/Cruise/Wake) — offline.
+        try:
+            from blueprints.aircraft_specs import specs_for_type
+            s = specs_for_type(tc)
+            if s:
+                out['specs'] = s
+        except Exception:
+            pass
     if out.get('built'):
         try:
             age = _now_year() - int(out['built'])
