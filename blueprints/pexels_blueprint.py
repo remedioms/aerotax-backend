@@ -98,7 +98,8 @@ def pexels_search():
         out_photos.append({'src': {
             'landscape': src.get('landscape'),
             'large': src.get('large'),
-        }})
+        # avg_color durchreichen (#134): iOS bevorzugt damit bunte statt grau-blaue Fotos.
+        }, 'avg_color': p.get('avg_color')})
     body = {'photos': out_photos}
     with _cache_lock:
         _cache[ckey] = (now + _CACHE_TTL, body)
