@@ -196,6 +196,12 @@ def _now_year():
     return time.gmtime().tm_year
 
 
+def _airline_logo(iata):
+    """Freies Logo-CDN (avs.io) — externe URL, KEIN eigener Storage."""
+    iata = (iata or '').strip().upper()
+    return f'https://pics.avs.io/120/120/{iata}.png' if len(iata) == 2 else None
+
+
 # ---------------------------------------------------------------- endpoints
 @aerox_data_bp.route('/api/ax/stats', methods=['GET'])
 def ax_stats():
@@ -236,7 +242,7 @@ def ax_airline(code):
         return jsonify({'ok': False, 'code': code}), 404
     return jsonify({'ok': True, 'iata': r.get('iata'), 'icao': r.get('icao'),
                     'name': r.get('name'), 'callsign': r.get('callsign'),
-                    'country': r.get('country')})
+                    'country': r.get('country'), 'logo': _airline_logo(r.get('iata'))})
 
 
 @aerox_data_bp.route('/api/ax/type/<code>', methods=['GET'])
@@ -349,7 +355,8 @@ def ax_flight(flightno):
     airline = _airline_row(prefix)
     if airline:
         out['airline'] = {'iata': airline.get('iata'), 'icao': airline.get('icao'),
-                          'name': airline.get('name'), 'callsign': airline.get('callsign')}
+                          'name': airline.get('name'), 'callsign': airline.get('callsign'),
+                          'logo': _airline_logo(airline.get('iata'))}
 
     # Route: Cache → adsbdb-Callsign (ICAO-Präfix + Nummer) → zurückschreiben.
     route = _cache_get('ax_route_cache', 'flight', raw)
@@ -377,4 +384,37 @@ def ax_flight(flightno):
 
     if 'airline' not in out and 'origin' not in out:
         return jsonify({'ok': False, 'flight': raw}), 404
+    return jsonify(out)
+
+
+@aerox_data_bp.route('/api/ax/callsign/<callsign>', methods=['GET'])
+def ax_callsign(callsign):
+    """ICAO-Callsign (z.B. DLH506) → Route. Das Radar fragt für jeden
+    angetippten Flieger hier an → Treffer werden in ax_route_cache zurück-
+    geschrieben, d.h. die Routen-DB wächst aus dem realen Verkehr, den die
+    Crew sieht (cache → adsbdb → cache, höchstens ein externer Call je Callsign)."""
+    cs = (callsign or '').strip().upper().replace(' ', '')
+    if not cs:
+        return jsonify({'ok': False, 'error': 'empty'}), 400
+    out = {'ok': True, 'callsign': cs, 'source': 'cache'}
+    route = _cache_get('ax_route_cache', 'flight', cs)
+    if not route:
+        route = _adsbdb_route(cs)
+        if route:
+            out['source'] = 'adsbdb'
+            _cache_put('ax_route_cache',
+                       {'flight': cs, 'payload': route,
+                        'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+    if not route:
+        return jsonify({'ok': False, 'callsign': cs}), 404
+
+    def enrich(code):
+        ap = _airport_row(code)
+        if not ap:
+            return {'iata': code}
+        return {'iata': ap.get('iata'), 'icao': ap.get('icao'),
+                'name': ap.get('name'), 'city': ap.get('city'),
+                'country': ap.get('country'), 'lat': ap.get('lat'), 'lon': ap.get('lon')}
+    out['origin'] = enrich(route.get('src') or route.get('src_icao'))
+    out['destination'] = enrich(route.get('dst') or route.get('dst_icao'))
     return jsonify(out)
