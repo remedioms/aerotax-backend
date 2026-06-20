@@ -534,6 +534,94 @@ def ax_metar(icao):
     return jsonify({'ok': True, 'icao': code, 'source': 'aviationweather', **out})
 
 
+def _budget_remaining(month):
+    """Wie viele AviationStack-Calls bleiben diesen Monat (Free-Tier-Schutz)."""
+    cap = int(os.environ.get('AVIATIONSTACK_CAP', '90'))   # < 100 Free-Limit
+    sb = _sb()
+    used = 0
+    if sb is not None:
+        try:
+            res = sb.table('ax_api_budget').select('n').eq('month', month).limit(1).execute()
+            rows = getattr(res, 'data', None) or []
+            if rows:
+                used = int(rows[0].get('n') or 0)
+        except Exception:
+            pass
+    return max(0, cap - used), used
+
+
+def _budget_inc(month, used):
+    sb = _sb()
+    if sb is None:
+        return
+    try:
+        sb.table('ax_api_budget').upsert(
+            {'month': month, 'n': used + 1,
+             'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}).execute()
+    except Exception:
+        pass
+
+
+@aerox_data_bp.route('/api/ax/schedule/<frm>/<to>', methods=['GET'])
+def ax_schedule(frm, to):
+    """Echte Flugnummern + geplante Zeiten auf einem Städtepaar (AviationStack).
+    Architektur: Supabase-Cache FÜR IMMER (Schedules ändern sich kaum) → nur bei
+    Cache-Miss UND solange das Monats-Budget reicht ein einziger externer Call,
+    Ergebnis wird gecacht. So bleibt AeroX im Free-Tier (100/Monat) und ALLE
+    Nutzer ziehen danach aus unserem Backend."""
+    a = (frm or '').strip().upper()
+    b = (to or '').strip().upper()
+    if len(a) < 3 or len(b) < 3:
+        return jsonify({'ok': False, 'error': 'need IATA'}), 400
+    route = f'{a}-{b}'
+    cached = _cache_get('ax_schedule_cache', 'route', route)
+    if cached is not None:
+        return jsonify({'ok': True, 'route': route, 'source': 'cache', **cached})
+
+    key = os.environ.get('AVIATIONSTACK_KEY', '')
+    month = time.strftime('%Y-%m', time.gmtime())
+    remaining, used = _budget_remaining(month)
+    if not key or remaining <= 0:
+        # Kein Budget/Key → ehrlich leer (App zeigt dann nur die Airlines-Liste).
+        return jsonify({'ok': True, 'route': route, 'source': 'budget-exhausted',
+                        'flights': [], 'budget_remaining': remaining})
+
+    # Free-Tier = HTTP (kein HTTPS). dep_iata + arr_iata Filter.
+    url = (f'http://api.aviationstack.com/v1/flights?access_key={urllib.parse.quote(key)}'
+           f'&dep_iata={a}&arr_iata={b}&limit=100')
+    d = _http_json(url, timeout=12)
+    rows = (d or {}).get('data') if isinstance(d, dict) else None
+    if rows is None:
+        return jsonify({'ok': True, 'route': route, 'source': 'error',
+                        'flights': [], 'budget_remaining': remaining})
+    _budget_inc(month, used)   # Call gezählt (auch bei 0 Treffern — er wurde verbraucht)
+
+    seen, flights = set(), []
+    for r in rows:
+        fl = (r.get('flight') or {})
+        al = (r.get('airline') or {})
+        dep = (r.get('departure') or {})
+        arr = (r.get('arrival') or {})
+        no = (fl.get('iata') or '').upper()
+        if not no or no in seen:
+            continue
+        seen.add(no)
+        flights.append({
+            'flight': no,
+            'airline': al.get('name'),
+            'airline_iata': al.get('iata'),
+            'dep_scheduled': dep.get('scheduled'),
+            'arr_scheduled': arr.get('scheduled'),
+            'status': r.get('flight_status'),
+        })
+    payload = {'flights': flights, 'count': len(flights)}
+    _cache_put('ax_schedule_cache',
+               {'route': route, 'payload': payload,
+                'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+    return jsonify({'ok': True, 'route': route, 'source': 'aviationstack',
+                    'budget_remaining': remaining - 1, **payload})
+
+
 @aerox_data_bp.route('/api/ax/suggest', methods=['GET'])
 def ax_suggest():
     """Type-ahead: Präfix → bis zu ~10 Vorschläge über Flughäfen / Airlines /

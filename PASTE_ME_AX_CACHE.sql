@@ -40,5 +40,25 @@ create table if not exists public.ax_photo_cache (
 );
 alter table public.ax_photo_cache enable row level security;
 
+-- ── Schedule-Cache (Städtepaar → echte Flugnummern/Zeiten) ────────────
+-- Befüllt aus AviationStack (Free-Tier 100/Monat), dann FÜR IMMER gecacht →
+-- ein Call seedet eine Route für ALLE Nutzer.
+create table if not exists public.ax_schedule_cache (
+    route       text         primary key,   -- z.B. „FRA-LIS"
+    payload     jsonb        not null default '{}'::jsonb,
+    updated_at  timestamptz  not null default now()
+);
+alter table public.ax_schedule_cache enable row level security;
+
+-- ── API-Budget-Zähler (schützt das AviationStack-Free-Limit) ──────────
+-- Eine Zeile pro Monat („2026-06"), n = verbrauchte Calls. Backend stoppt bei
+-- AVIATIONSTACK_CAP (Default 90) → Free-Tier kann nie überschritten werden.
+create table if not exists public.ax_api_budget (
+    month       text         primary key,   -- „YYYY-MM"
+    n           integer      not null default 0,
+    updated_at  timestamptz  not null default now()
+);
+alter table public.ax_api_budget enable row level security;
+
 -- Fertig. Das Backend schreibt mit dem Service-Role-Key (umgeht RLS),
 -- daher sind keine zusätzlichen Policies nötig.
