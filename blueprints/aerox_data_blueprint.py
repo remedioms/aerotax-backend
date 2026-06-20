@@ -41,6 +41,7 @@ _DB_PATH = os.path.join(os.environ.get('AEROX_DB_TMP', '/tmp'), 'aerox_reference
 
 _conn = None
 _conn_lock = threading.Lock()
+_METAR_CACHE = {}   # icao → (expires_ts, dict)
 
 
 def _ensure_db():
@@ -501,6 +502,36 @@ def ax_route(frm, to):
     airlines.sort(key=lambda x: (x['name'] is None, x['name'] or x['iata']))
     return jsonify({'ok': True, 'origin': _airport_full(a), 'destination': _airport_full(b),
                     'airlines': airlines, 'count': len(airlines)})
+
+
+@aerox_data_bp.route('/api/ax/metar/<icao>', methods=['GET'])
+def ax_metar(icao):
+    """METAR-Wetter eines Flughafens (aviationweather.gov, frei). 10-min-Cache
+    im Prozess. Für die Airport-Seite der Suche."""
+    code = (icao or '').strip().upper()
+    if len(code) < 3:
+        return jsonify({'ok': False, 'error': 'need ICAO'}), 400
+    now = time.time()
+    hit = _METAR_CACHE.get(code)
+    if hit and hit[0] > now:
+        return jsonify({'ok': True, 'icao': code, 'source': 'cache', **hit[1]})
+    d = _http_json(f'https://aviationweather.gov/api/data/metar?ids={urllib.parse.quote(code)}&format=json', timeout=8)
+    rows = d if isinstance(d, list) else []
+    if not rows:
+        return jsonify({'ok': False, 'icao': code}), 404
+    m = rows[0]
+    out = {
+        'raw': m.get('rawOb'),
+        'temp_c': m.get('temp'),
+        'dewpoint_c': m.get('dewp'),
+        'wind_dir': m.get('wdir'),
+        'wind_kt': m.get('wspd'),
+        'visibility': m.get('visib'),
+        'flight_category': m.get('fltCat'),   # VFR/MVFR/IFR/LIFR
+        'name': m.get('name'),
+    }
+    _METAR_CACHE[code] = (now + 600, out)
+    return jsonify({'ok': True, 'icao': code, 'source': 'aviationweather', **out})
 
 
 @aerox_data_bp.route('/api/ax/suggest', methods=['GET'])
