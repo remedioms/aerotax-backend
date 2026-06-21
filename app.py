@@ -14450,16 +14450,31 @@ def _r2_client():
             aws_secret_access_key=R2_SECRET_ACCESS_KEY,
             region_name='auto')
     return _r2_client_obj
-def _r2_put_avatar(dir_key, fname, data, content_type):
-    """Avatar-Bytes nach R2 schreiben → oeffentliche Custom-Domain-URL. None bei Fehler."""
+def _r2_put_bytes(key, data, content_type):
+    """Bytes unter `key` nach R2 schreiben → oeffentliche URL. None bei Fehler."""
     cli = _r2_client()
     if cli is None:
         return None
-    key = f'av/{dir_key}/{fname}'
     cli.put_object(Bucket=R2_AVATARS_BUCKET, Key=key, Body=data,
-                   ContentType=content_type,
+                   ContentType=content_type or 'application/octet-stream',
                    CacheControl='public, max-age=31536000, immutable')
     return f'{R2_PUBLIC_BASE}/{key}'
+def _r2_put_avatar(dir_key, fname, data, content_type):
+    return _r2_put_bytes(f'av/{dir_key}/{fname}', data, content_type)
+def _r2_object_exists(key):
+    cli = _r2_client()
+    if cli is None:
+        return False
+    try:
+        cli.head_object(Bucket=R2_AVATARS_BUCKET, Key=key)
+        return True
+    except Exception:
+        return False
+def _r2_redirect(key):
+    from flask import redirect
+    resp = redirect(f'{R2_PUBLIC_BASE}/{key}', code=302)
+    resp.headers['Cache-Control'] = 'public, max-age=86400'   # Redirect 1 Tag cachen
+    return resp
 
 
 @app.route('/api/user/avatar/<token>', methods=['POST'])
@@ -14604,29 +14619,47 @@ def serve_user_avatar(key_safe, fname):
     safe_k = re.sub(r'[^A-Za-z0-9_-]', '', key_safe or '')[:64]
     if not safe or not safe_k:
         return jsonify({'error': 'invalid'}), 400
-    path = os.path.join(_USER_HISTORY_DIR, 'avatars', safe_k, safe)
     mime = 'image/jpeg'
     if safe.lower().endswith('.png'): mime = 'image/png'
     elif safe.lower().endswith('.heic'): mime = 'image/heic'
     elif safe.lower().endswith('.webp'): mime = 'image/webp'
+    # R2-LAZY-MIGRATION (Kostenhebel): liegt der Avatar schon in R2 → direkt
+    # dorthin umleiten (Zero-Egress, Bytes kommen nie übers Backend).
+    r2_key = f'av/{safe_k}/{safe}'
+    if R2_AVATARS_ENABLED and _r2_object_exists(r2_key):
+        return _r2_redirect(r2_key)
+    # Bytes holen: erst Disk (ephemer), sonst durabel aus Supabase (base64).
+    path = os.path.join(_USER_HISTORY_DIR, 'avatars', safe_k, safe)
+    data = None
+    out_mime = mime
     if os.path.exists(path):
-        return send_file(path, mimetype=mime)
-    # DURABILITY-FIX (2026-06-15): Disk-Datei fehlt (typisch nach Render-Redeploy,
-    # ephemeres FS) → durabel in Supabase gespeicherte Bytes ausliefern statt 404.
-    # Genau das ist der Pfad, der "Foto verschwindet / Fake-Avatar nach Deploy"
-    # behebt. Best-effort wird die Disk-Datei dabei rehydriert, damit Folge-
-    # Requests wieder vom schnellen send_file kommen.
-    data, sb_mime = _avatar_bytes_from_supabase(safe_k)
-    if data:
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, 'wb') as fp:
-                fp.write(data)
+            with open(path, 'rb') as fp:
+                data = fp.read()
         except Exception:
-            pass
-        from flask import Response
-        return Response(data, mimetype=sb_mime or mime)
-    return jsonify({'error': 'not_found'}), 404
+            data = None
+    if data is None:
+        data, sb_mime = _avatar_bytes_from_supabase(safe_k)
+        if sb_mime:
+            out_mime = sb_mime
+    if not data:
+        return jsonify({'error': 'not_found'}), 404
+    # Beim ERSTEN Aufruf nach R2 schieben → ab dann von dort (Zero-Egress).
+    if R2_AVATARS_ENABLED:
+        try:
+            _r2_put_bytes(r2_key, data, out_mime)
+            return _r2_redirect(r2_key)
+        except Exception as e:
+            app.logger.warning(f'[avatar] r2_lazy_fail {safe_k}: {e}')
+    # Fallback (R2 aus/Fehler): direkt ausliefern + Disk rehydrieren.
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as fp:
+            fp.write(data)
+    except Exception:
+        pass
+    from flask import Response
+    return Response(data, mimetype=out_mime)
 
 
 @app.route('/api/wall/<token>/post', methods=['POST'])
