@@ -184,6 +184,45 @@ def _adsbdb_route(callsign):
     }
 
 
+def _aviationstack_route(callsign):
+    """AUTORITATIVE Live-Route per ICAO-Callsign (AviationStack /flights). Anders
+    als die STATISCHE adsbdb-Tabelle kennt das die TATSÄCHLICHE Strecke des Fluges
+    (richtungssicher) + Live-Status (active/landed). Budget-geschützt: ein Floor
+    reserviert Calls für die Schedule-Funktion; nur bei Cache-Miss aufgerufen und
+    FÜR IMMER in ax_route_cache gecacht (Route je Flugnummer stabil) → die Routen-
+    DB wächst autoritativ aus dem realen Verkehr, künftige Taps sind gratis."""
+    key = os.environ.get('AVIATIONSTACK_KEY', '')
+    if not key:
+        return None
+    month = time.strftime('%Y-%m', time.gmtime())
+    remaining, used = _budget_remaining(month)
+    floor = int(os.environ.get('AVIATIONSTACK_ROUTE_FLOOR', '25'))
+    if remaining <= floor:          # Schedules haben Vorrang → nur aus dem Überschuss
+        return None
+    url = (f'http://api.aviationstack.com/v1/flights?access_key={urllib.parse.quote(key)}'
+           f'&flight_icao={urllib.parse.quote(callsign)}&limit=1')
+    d = _http_json(url, timeout=12)
+    if not isinstance(d, dict):
+        return None
+    _budget_inc(month, used)        # Call verbraucht (auch bei 0 Treffern)
+    rows = d.get('data') or []
+    if not rows:
+        return None
+    r0 = rows[0]
+    dep = (r0.get('departure') or {})
+    arr = (r0.get('arrival') or {})
+    src = ((dep.get('iata') or '').upper() or None)
+    dst = ((arr.get('iata') or '').upper() or None)
+    if not src or not dst:
+        return None
+    return {
+        'src': src, 'src_icao': ((dep.get('icao') or '').upper() or None),
+        'dst': dst, 'dst_icao': ((arr.get('icao') or '').upper() or None),
+        'callsign': callsign, 'source': 'aviationstack',
+        'status': r0.get('flight_status'),
+    }
+
+
 # ---------------------------------------------------------------- helpers
 def _airport_row(code):
     code = (code or '').strip().upper()
@@ -467,10 +506,14 @@ def ax_callsign(callsign):
         return jsonify({'ok': False, 'error': 'empty'}), 400
     out = {'ok': True, 'callsign': cs, 'source': 'cache'}
     route = _cache_get('ax_route_cache', 'flight', cs)
-    if not route:
-        route = _adsbdb_route(cs)
+    if route:
+        out['source'] = route.get('source', 'cache')
+    else:
+        # AUTORITATIV zuerst (AviationStack, budget-gated), sonst statische adsbdb-DB.
+        route = _aviationstack_route(cs) or _adsbdb_route(cs)
         if route:
-            out['source'] = 'adsbdb'
+            out['source'] = route.get('source', 'adsbdb')
+            out['status'] = route.get('status')
             _cache_put('ax_route_cache',
                        {'flight': cs, 'payload': route,
                         'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
