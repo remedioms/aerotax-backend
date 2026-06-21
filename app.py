@@ -17631,10 +17631,12 @@ def flight_times(flightno):
                 'revised': (a.get('revisedTime') or {}).get('local')
                            or (a.get('predictedTime') or {}).get('local'),
                 'terminal': a.get('terminal'),
+                'gate': a.get('gate'),   # FIX: Gate wurde nie extrahiert (Google-Panel-Feld)
             }
         out = {'ok': True, 'flight': fn,
                'airline': (f.get('airline') or {}).get('name'),
                'aircraft': (f.get('aircraft') or {}).get('model'),
+               'reg': (f.get('aircraft') or {}).get('reg'),
                'status': f.get('status'),
                'departure': ap('departure'), 'arrival': ap('arrival')}
         return _cache(out, 600)
@@ -20888,6 +20890,42 @@ def ax_route_history(frm, to):
                     'on_time_pct': pct, 'total': total, 'on_time': on_time,
                     'late': late, 'cancelled': cancelled_cnt,
                     'recent_days': days_out, 'source': 'airport_delay_obs'})
+
+
+@app.route('/api/ax/flight-info/<flightno>', methods=['GET'])
+def ax_flight_info(flightno):
+    """Flugnummer → Strecke/Gate/Terminal/Status — ZUERST GRATIS aus der self-
+    growing `airport_delay_obs`-DB (von unseren Board-Polls aufgebaut: pro Flug
+    origin/dest/gate/terminal/status/Zeiten). Treffer = kein Drittanbieter-Call.
+    `found: false` → der Client holt den Long-Tail on-tap via /api/flight-times
+    (AeroDataBox, budgetiert + gecacht). So wächst die DB über echte Nutzung auf
+    ganz Europa, ohne Bulk-/Free-Tier-Limit zu sprengen."""
+    fn = (flightno or '').upper().replace(' ', '').strip()
+    if len(fn) < 3:
+        return jsonify({'ok': False, 'error': 'bad_flight'}), 400
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = (sb.table('airport_delay_obs').select('*')
+                 .eq('flight', fn)
+                 .order('date', desc=True).order('updated_at', desc=True)
+                 .limit(1).execute())
+            rows = r.data or []
+            if rows:
+                o = rows[0]
+                resp = jsonify({
+                    'ok': True, 'found': True, 'flight': fn, 'source': 'aerox_obs',
+                    'origin': o.get('airport'), 'dest': o.get('dest_iata'),
+                    'dest_name': o.get('dest_name'), 'airline': o.get('airline'),
+                    'gate': o.get('gate'), 'terminal': o.get('terminal'),
+                    'status': o.get('status'), 'sched': o.get('sched'),
+                    'esti': o.get('esti'), 'delay_min': o.get('max_delay_min'),
+                    'cancelled': o.get('cancelled'), 'date': o.get('date'),
+                })
+                return _public_cache_headers(resp)
+        except Exception as e:
+            app.logger.warning(f'[flight-info] obs_fail {str(e)[:120]}')
+    # Nicht in unserer DB → Client fällt auf AeroDataBox (/api/flight-times) zurück.
+    return jsonify({'ok': True, 'found': False, 'flight': fn, 'source': 'none'})
 
 
 @app.route('/api/airport/<token>/board', methods=['GET'])
