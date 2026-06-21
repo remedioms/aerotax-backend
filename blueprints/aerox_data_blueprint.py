@@ -184,6 +184,47 @@ def _adsbdb_route(callsign):
     }
 
 
+def _route_from_obs(callsign):
+    """ECHTE Strecke + Gate aus der eigenen Airport-Tafel-DB (`airport_delay_obs`,
+    von den flughafen-EIGENEN Boards gepollt, die wir schon ziehen). User-Idee:
+    „wir kennen Reg + Standort → der Flughafen weiß woher/wohin/wann". Wir mappen
+    den ICAO-Callsign (CFG9XY) auf die IATA-Flugnummer (DE9XY) und schlagen den
+    letzten ABFLUG-Record nach. Das ist autoritativ (echte Tafel) → wird VOR adsbdb
+    genutzt. None, wenn der Flug (noch) in keiner gepollten Tafel steht."""
+    import re as _re
+    sb = _sb()
+    if sb is None:
+        return None
+    cs = (callsign or '').upper().strip()
+    m = _re.match(r'^([A-Z]{2,3})(\w+)$', cs)
+    if not m:
+        return None
+    prefix, suffix = m.group(1), m.group(2)
+    cands = []
+    al = _airline_row(prefix)
+    if al and al.get('iata'):
+        cands.append(f"{al['iata']}{suffix}")
+    cands.append(cs)                       # falls die Tafel die ICAO-Flugnr führt
+    for fn in cands:
+        try:
+            r = (sb.table('airport_delay_obs')
+                 .select('airport,dest_iata,gate,terminal')
+                 .eq('flight', fn)
+                 .order('date', desc=True).order('updated_at', desc=True)
+                 .limit(6).execute())
+            rows = r.data or []
+            # Abflug-Record (airport=Origin); Ankunfts-Keys ('<AP>#ARR') überspringen.
+            dep = next((x for x in rows if '#' not in (x.get('airport') or '')), None)
+            if dep and dep.get('dest_iata'):
+                return {'src': (dep.get('airport') or '').split('#', 1)[0],
+                        'dst': dep.get('dest_iata'),
+                        'gate': dep.get('gate'), 'terminal': dep.get('terminal'),
+                        'source': 'aerox_board', 'callsign': cs}
+        except Exception:
+            pass
+    return None
+
+
 def _aviationstack_route(callsign):
     """AUTORITATIVE Live-Route per ICAO-Callsign (AviationStack /flights). Anders
     als die STATISCHE adsbdb-Tabelle kennt das die TATSÄCHLICHE Strecke des Fluges
@@ -509,8 +550,9 @@ def ax_callsign(callsign):
     if route:
         out['source'] = route.get('source', 'cache')
     else:
-        # AUTORITATIV zuerst (AviationStack, budget-gated), sonst statische adsbdb-DB.
-        route = _aviationstack_route(cs) or _adsbdb_route(cs)
+        # ECHTE Airport-Tafel ZUERST (flughafen-eigene Daten, woher/wohin/Gate),
+        # dann AviationStack (budget-gated), dann statische adsbdb-DB als Fallback.
+        route = _route_from_obs(cs) or _aviationstack_route(cs) or _adsbdb_route(cs)
         if route:
             out['source'] = route.get('source', 'adsbdb')
             out['status'] = route.get('status')
