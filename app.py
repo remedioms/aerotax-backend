@@ -20831,6 +20831,65 @@ def _departed_rows_from_store(airport):
     return rows
 
 
+@app.route('/api/ax/route-history/<frm>/<to>', methods=['GET'])
+def ax_route_history(frm, to):
+    """Strecken-Historie (Pünktlichkeit pro Tag) für ein Städtepaar — aus den
+    bereits gesammelten Abflug-Beobachtungen (airport_delay_obs, je Flug mit
+    dest_iata + max_delay_min + cancelled). Liefert pro Tag die Flüge frm→to mit
+    Status (ontime ≤15 / minor ≤45 / late / cancelled) plus eine Pünktlichkeits-
+    Quote. KEINE neue Datenquelle/kein Drittanbieter-Spend — nur Aggregation des
+    Vorhandenen. Fenster = was gespeichert ist (bis ?days=7), ehrlich begrenzt."""
+    frm = _DE_ICAO_TO_IATA.get((frm or '').upper().strip()[:4], (frm or '').upper().strip()[:4])
+    to = _DE_ICAO_TO_IATA.get((to or '').upper().strip()[:4], (to or '').upper().strip()[:4])
+    if not frm or not to:
+        return jsonify({'ok': False, 'error': 'bad_route'}), 400
+    board_ap = 'FRA' if frm in ('FRA', 'EDDF') else frm
+    try:
+        ndays = max(1, min(int(request.args.get('days') or 7), 7))
+    except Exception:
+        ndays = 7
+    store_key = _store_key_for(board_ap, 'departure')
+    from datetime import timedelta as _td
+    base = _airport_local_now(store_key)
+    if base is None:
+        return jsonify({'ok': True, 'origin': board_ap, 'dest': to, 'days': ndays,
+                        'on_time_pct': None, 'total': 0, 'recent_days': [],
+                        'source': 'airport_delay_obs'})
+    on_time = late = cancelled_cnt = total = 0
+    days_out = []
+    for i in range(ndays):
+        d = (base - _td(days=i)).strftime('%Y-%m-%d')
+        rows = (_departed_rows_from_store(store_key) if i == 0
+                else _board_rows_from_obs_for_date(d, store_key, None))
+        flights = []
+        for r in rows:
+            if (r.get('dest_iata') or '').upper() != to:
+                continue
+            delay = int(r.get('max_delay_min') or 0)
+            canc = bool(r.get('cancelled'))
+            status = ('cancelled' if canc else
+                      'ontime' if delay <= 15 else
+                      'minor' if delay <= 45 else 'late')
+            flights.append({'flight': r.get('flight'), 'airline': r.get('airline'),
+                            'sched': r.get('sched'), 'delay_min': delay,
+                            'cancelled': canc, 'status': status})
+            total += 1
+            if canc:
+                cancelled_cnt += 1
+            elif delay <= 15:
+                on_time += 1
+            else:
+                late += 1
+        if flights:
+            flights.sort(key=lambda f: (f.get('sched') or ''))
+            days_out.append({'date': d, 'count': len(flights), 'flights': flights})
+    pct = round(100 * on_time / total) if total else None
+    return jsonify({'ok': True, 'origin': board_ap, 'dest': to, 'days': ndays,
+                    'on_time_pct': pct, 'total': total, 'on_time': on_time,
+                    'late': late, 'cancelled': cancelled_cnt,
+                    'recent_days': days_out, 'source': 'airport_delay_obs'})
+
+
 @app.route('/api/airport/<token>/board', methods=['GET'])
 def airport_board(token):
     """Per-Airport-Board (live). Query: ?airport=MUC&type=departure|arrival&airline=LH&limit=60.
