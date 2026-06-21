@@ -305,7 +305,8 @@ def ax_aircraft(hexid):
     r = _q1('SELECT * FROM aircraft WHERE hex=? LIMIT 1', (hexid,))
     if r:
         out.update({k: r.get(k) for k in
-                    ('reg', 'typecode', 'manufacturer', 'model', 'operator', 'owner', 'built', 'category')})
+                    ('reg', 'typecode', 'manufacturer', 'model', 'operator', 'owner', 'built', 'built_date', 'category')
+                    if r.get(k) is not None})
     else:
         # Cache → sonst genau ein externer Call, dann zurückschreiben.
         cached = _cache_get('ax_aircraft_cache', 'hex', hexid)
@@ -353,7 +354,24 @@ def ax_aircraft(hexid):
                 out['specs'] = s
         except Exception:
             pass
-    if out.get('built'):
+    # Alter: TAGESGENAU wenn ein built_date (YYYY-MM-DD) vorliegt (LH-Gruppe via
+    # planespotters), sonst jahresbasiert aus `built`. age_months ist der Rest-Monat
+    # für eine „X Jahre Y Monate"-Anzeige im Radar (User: „Alter mit Tag und Monat").
+    bd = out.get('built_date')
+    if bd:
+        try:
+            import datetime
+            d = datetime.date.fromisoformat(str(bd)[:10])
+            t = datetime.date.today()
+            months = (t.year - d.year) * 12 + (t.month - d.month) - (1 if t.day < d.day else 0)
+            if 0 <= months < 1200:
+                out['age_years'] = months // 12
+                out['age_months'] = months % 12
+                if not out.get('built'):
+                    out['built'] = d.year
+        except Exception:
+            pass
+    if out.get('age_years') is None and out.get('built'):
         try:
             age = _now_year() - int(out['built'])
             if 0 <= age < 100:
@@ -578,11 +596,15 @@ def ax_schedule(frm, to):
     if len(a) < 3 or len(b) < 3:
         return jsonify({'ok': False, 'error': 'need IATA'}), 400
     route = f'{a}-{b}'
+    # Cache-Key mit Schema-Version: '#cs2' = Codeshares werden jetzt rausgefiltert.
+    # Alte Cache-Einträge (mit Dutzenden Codeshare-Duplikaten gleicher Zeit) werden
+    # so umgangen und beim ersten Abruf frisch + sauber neu gezogen.
+    cache_key = f'{route}#cs2'
     key = os.environ.get('AVIATIONSTACK_KEY', '')
     month = time.strftime('%Y-%m', time.gmtime())
     remaining, used = _budget_remaining(month)
 
-    cached = _cache_get('ax_schedule_cache', 'route', route)
+    cached = _cache_get('ax_schedule_cache', 'route', cache_key)
     if cached is not None:
         # Schedules driften saisonal: nur wenn der Cache SEHR alt ist (>180 Tage)
         # UND noch reichlich Budget frei ist (>=30), einmal neu ziehen. Sonst
@@ -614,6 +636,12 @@ def ax_schedule(frm, to):
         al = (r.get('airline') or {})
         dep = (r.get('departure') or {})
         arr = (r.get('arrival') or {})
+        # Codeshares überspringen: derselbe PHYSISCHE Flug wird von vielen
+        # Marketing-Airlines unter eigener Nummer verkauft (gleiche Zeiten) →
+        # nur den operierenden Carrier behalten, sonst sieht die Liste aus wie
+        # Fake-Duplikate (z.B. 6×„06:05 → 08:20" für FRA→LIS).
+        if fl.get('codeshared'):
+            continue
         no = (fl.get('iata') or '').upper()
         if not no or no in seen:
             continue
@@ -628,7 +656,7 @@ def ax_schedule(frm, to):
         })
     payload = {'flights': flights, 'count': len(flights), '_fetched': int(time.time())}
     _cache_put('ax_schedule_cache',
-               {'route': route, 'payload': payload,
+               {'route': cache_key, 'payload': payload,
                 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
     return jsonify({'ok': True, 'route': route, 'source': 'aviationstack',
                     'budget_remaining': remaining - 1, **payload})
