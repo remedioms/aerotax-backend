@@ -14427,6 +14427,41 @@ def _avatar_img_key(token):
     return _hashlib.sha256(('avatar:' + (token or '')).encode()).hexdigest()[:32]
 
 
+# ─── Cloudflare R2 (Avatare/Fotos) — Zero-Egress, durabel ────────────────────
+# Kostenhebel AeroX: Bilder NICHT mehr als base64 in Supabase + ueber Cloud Run
+# ausliefern (Egress + DB-Bloat + ephemere-Disk-Fragilitaet), sondern in R2 und
+# direkt ueber die Cloudflare-Custom-Domain. Aktiv NUR wenn alle Env gesetzt sind
+# (sonst alter Disk+base64-Pfad → null Risiko).
+R2_AVATARS_BUCKET   = os.environ.get('R2_AVATARS_BUCKET', '')
+R2_ENDPOINT         = os.environ.get('R2_ENDPOINT', '')
+R2_ACCESS_KEY_ID    = os.environ.get('R2_ACCESS_KEY_ID', '')
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY', '')
+R2_PUBLIC_BASE      = os.environ.get('R2_PUBLIC_BASE', '').rstrip('/')   # z.B. https://avatars.aerosteuer.de
+R2_AVATARS_ENABLED  = bool(R2_AVATARS_BUCKET and R2_ENDPOINT and R2_ACCESS_KEY_ID
+                           and R2_SECRET_ACCESS_KEY and R2_PUBLIC_BASE)
+_r2_client_obj = None
+def _r2_client():
+    global _r2_client_obj
+    if _r2_client_obj is None and R2_AVATARS_ENABLED:
+        import boto3
+        _r2_client_obj = boto3.client(
+            's3', endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name='auto')
+    return _r2_client_obj
+def _r2_put_avatar(dir_key, fname, data, content_type):
+    """Avatar-Bytes nach R2 schreiben → oeffentliche Custom-Domain-URL. None bei Fehler."""
+    cli = _r2_client()
+    if cli is None:
+        return None
+    key = f'av/{dir_key}/{fname}'
+    cli.put_object(Bucket=R2_AVATARS_BUCKET, Key=key, Body=data,
+                   ContentType=content_type,
+                   CacheControl='public, max-age=31536000, immutable')
+    return f'{R2_PUBLIC_BASE}/{key}'
+
+
 @app.route('/api/user/avatar/<token>', methods=['POST'])
 def upload_user_avatar(token):
     """Upload Profilfoto. Body: JSON {image_b64} ODER multipart {image}.
@@ -14476,12 +14511,23 @@ def upload_user_avatar(token):
         pass
     # Cache-Buster im Dateinamen → Clients/CDN ziehen das neue Bild nach Wechsel.
     fname = f'{uuid.uuid4().hex[:12]}{detected_ext}'
-    try:
-        with open(os.path.join(img_dir, fname), 'wb') as fp:
-            fp.write(data)
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
-    avatar_url = f'/api/user/avatar/{dir_key}/{fname}'
+    # NEU: bevorzugt nach R2 (Zero-Egress, durabel) → avatar_url = oeffentliche
+    # R2-URL (die App handhabt absolute URLs bereits via hasPrefix("http")).
+    r2_url = None
+    if R2_AVATARS_ENABLED:
+        try:
+            r2_url = _r2_put_avatar(dir_key, fname, data, detected_type)
+        except Exception as e:
+            app.logger.warning(f'[avatar] r2_put_fail tok={token[:8]}: {e}')
+            r2_url = None
+    if not r2_url:
+        # Fallback (R2 aus/Fehler): wie bisher auf die (ephemere) Disk.
+        try:
+            with open(os.path.join(img_dir, fname), 'wb') as fp:
+                fp.write(data)
+        except Exception as e:
+            return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    avatar_url = r2_url or f'/api/user/avatar/{dir_key}/{fname}'
     # avatar_url auf die Profile-Row schreiben (SB-primary + Disk) — damit Feed/
     # Freunde/Profil den Verweis ausliefern können.
     #
@@ -14503,8 +14549,12 @@ def upload_user_avatar(token):
         profile = dict(full.get('profile') or {})
         profile['avatar_url'] = avatar_url
         profile['avatar_dir_key'] = dir_key
-        profile['avatar_b64'] = base64.b64encode(data).decode()
         profile['avatar_mime'] = detected_type
+        if r2_url:
+            # R2 ist durabel → KEIN base64-Backup mehr in Supabase (spart DB+Egress).
+            profile.pop('avatar_b64', None)
+        else:
+            profile['avatar_b64'] = base64.b64encode(data).decode()
         disk_full = dict(_profile_load_from_disk(token) or {})
         disk_full['token'] = token
         disk_full['profile'] = profile
