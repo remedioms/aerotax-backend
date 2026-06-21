@@ -22706,6 +22706,18 @@ def send_friend_request(token):
     else:
         _friends_save(token, me)
         _friends_save(target, them)
+    # BUG-FIX (2026-06-21): Push an den EMPFÄNGER fehlte komplett — nur `accept`
+    # pushte. Folge: "Freundschaftsanfragen kommen nicht an" (der Empfänger merkte
+    # nichts, bis er zufällig die Anfragen-Liste öffnete). Jetzt benachrichtigen wir
+    # ihn sofort. Best-effort: Push-Fehler darf den 200 nicht kippen.
+    try:
+        my_name = ((_profile_load(token) or {}).get('profile', {}) or {}).get('name') or ''
+        who = my_name.strip() or 'Jemand'
+        _send_push_notification(target, 'Neue Folge-Anfrage',
+                                f'{who} möchte dir folgen.',
+                                data={'type': 'friend_request', 'from': token})
+    except Exception:
+        pass
     return jsonify({'ok': True})
 
 
