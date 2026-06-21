@@ -622,6 +622,38 @@ def _bug005_after_request(response):
     return response
 
 
+@app.after_request
+def _public_cache_headers(response):
+    """Kosten-Hebel: Cache-Control auf öffentliche, cachebare GET-Endpunkte der
+    APP (kostenlose Nutzer). Clients/CDN liefern Wiederholungen selbst aus →
+    weniger Cloud-Run-Requests + Supabase-Reads + Egress. NUR GET 200, nur wenn
+    nicht schon gesetzt, nur diese unkritischen Pfade. KEINE Auth-/POST-Routen.
+    Avatare: URL ist pro Upload eindeutig (uuid im Dateinamen) → `immutable`."""
+    try:
+        if request.method != 'GET' or response.status_code != 200:
+            return response
+        if response.headers.get('Cache-Control'):
+            return response
+        path = request.path or ''
+        cc = None
+        if path.startswith('/api/user/avatar/') and path.count('/') >= 4:
+            cc = 'public, max-age=31536000, immutable'          # Bild fix pro URL
+        elif path.startswith('/api/ax/suggest'):
+            cc = 'public, max-age=86400'                        # quasi statisch
+        elif (path.startswith('/api/ax/callsign/') or path.startswith('/api/ax/aircraft/')
+              or path.startswith('/api/ax/photo/') or path.startswith('/api/ax/route/')):
+            cc = 'public, max-age=21600'                        # Route/Foto stabil (6h)
+        elif path.startswith('/api/ax/schedule/'):
+            cc = 'public, max-age=1800'                         # Fahrplan (30 min)
+        elif path.startswith('/api/adsb/area'):
+            cc = 'public, max-age=20'                           # live, aber CDN-coalesce
+        if cc:
+            response.headers['Cache-Control'] = cc
+    except Exception:
+        pass
+    return response
+
+
 @app.teardown_request
 def _bug005_teardown(exc):
     try:
