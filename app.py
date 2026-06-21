@@ -22307,7 +22307,17 @@ def poll_punctuality_accumulate():
 # Standard-Airport-Set für den server-seitigen Poller. FRA + MUC sind Pflicht
 # (User-Brief), die großen DE-Bases sind sinnvolle Defaults. Über die Env-Variable
 # POLL_BOARDS_AIRPORTS (Komma-Liste, z.B. "FRA,MUC,BER,JFK") überschreibbar.
-_POLL_BOARDS_DEFAULT = ('FRA', 'MUC', 'BER', 'DUS', 'HAM', 'HAJ')
+# Deutsche Hubs = freie Native-Scraper (beide Richtungen). Große EU-Hubs danach =
+# AeroDataBox (Budget) → liefern Gate/Route für viele Radar-Flieger; bei leerem
+# Budget degradieren sie still. Für Nicht-Deutsche pollt der Poller nur Abflüge
+# (halbiert die Calls — Abflug trägt Route+Gate, die wir brauchen).
+_POLL_BOARDS_DEFAULT = ('FRA', 'MUC', 'BER', 'DUS', 'HAM', 'HAJ',
+                        # Größte EU-Hubs (AeroDataBox, best-effort):
+                        'LHR', 'CDG', 'AMS', 'MAD', 'BCN', 'FCO', 'ZRH',
+                        'VIE', 'CPH', 'OSL', 'ARN', 'LIS', 'DUB', 'BRU')
+# Welche Codes haben einen FREIEN Native-/Fraport-Scraper (beide Richtungen ok)?
+_FREE_BOARD_CODES = frozenset({'FRA', 'EDDF', 'MUC', 'DUS', 'HAJ', 'FMO',
+                               'LEJ', 'DRS', 'ERF', 'DTM', 'RLG', 'KSF', 'SCN', 'HAM', 'BER'})
 
 
 def _poll_boards_airports():
@@ -22344,7 +22354,10 @@ def _poll_boards_once(airports):
         ap = (ap or '').upper().strip()
         if not ap:
             continue
-        for ftype in ('departure', 'arrival'):
+        # Budget-Schutz: Airports OHNE freien Scraper (AeroDataBox) nur ABFLÜGE
+        # pollen — der Abflug-Record trägt Route + Gate; Ankünfte sparen wir.
+        directions = ('departure', 'arrival') if ap in _FREE_BOARD_CODES else ('departure',)
+        for ftype in directions:
             tag = ap if ftype == 'departure' else (ap + '#ARR')
             try:
                 if ap in ('FRA', 'EDDF'):
