@@ -20908,10 +20908,16 @@ def ax_flight_info(flightno):
             r = (sb.table('airport_delay_obs').select('*')
                  .eq('flight', fn)
                  .order('date', desc=True).order('updated_at', desc=True)
-                 .limit(1).execute())
+                 .limit(6).execute())
             rows = r.data or []
+            # ABFLUG-Record bevorzugen: dort ist `airport` = Origin + `dest_iata` =
+            # Ziel (korrekte Richtung). Ankunfts-Records ('<AP>#ARR') haben die
+            # Richtung gespiegelt → würden Origin/Dest vertauschen. Fallback: erster.
+            dep = next((x for x in rows if '#' not in (x.get('airport') or '')), None)
             if rows:
-                o = rows[0]
+                o = dep or rows[0]
+                o = dict(o)
+                o['airport'] = (o.get('airport') or '').split('#', 1)[0]   # Store-Key säubern
                 resp = jsonify({
                     'ok': True, 'found': True, 'flight': fn, 'source': 'aerox_obs',
                     'origin': o.get('airport'), 'dest': o.get('dest_iata'),
