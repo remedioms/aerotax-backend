@@ -536,6 +536,33 @@ def ax_photo(hexid):
     return jsonify({'ok': True, 'hex': hexid, 'source': 'planespotters', **photo})
 
 
+@aerox_data_bp.route('/api/ax/photo-reg/<reg>', methods=['GET'])
+def ax_photo_reg(reg):
+    """Registrierung (z.B. D-ATCC) → Foto-URL. Für den Kein-Live-Signal-Fall, wo
+    wir keinen Hex haben, aber die Reg (User: „kein Signal → Foto vom Flieger").
+    planespotters /reg/, in ax_photo_cache gecacht (geteilt, free)."""
+    rg = (reg or '').strip().upper()
+    if not rg:
+        return jsonify({'ok': False, 'error': 'empty'}), 400
+    cached = _cache_get('ax_photo_cache', 'hex', rg)
+    if cached:
+        return jsonify({'ok': True, 'reg': rg, 'source': 'cache', **cached})
+    d = _http_json(f'https://api.planespotters.net/pub/photos/reg/{urllib.parse.quote(rg)}')
+    photos = (d or {}).get('photos') or []
+    if not photos:
+        return jsonify({'ok': False, 'reg': rg}), 404
+    p = photos[0]
+    thumb = (p.get('thumbnail_large') or p.get('thumbnail') or {})
+    url = thumb.get('src')
+    if not url:
+        return jsonify({'ok': False, 'reg': rg}), 404
+    photo = {'photo': url, 'photographer': p.get('photographer'), 'link': p.get('link')}
+    _cache_put('ax_photo_cache',
+               {'hex': rg, 'payload': photo,
+                'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+    return jsonify({'ok': True, 'reg': rg, 'source': 'planespotters', **photo})
+
+
 @aerox_data_bp.route('/api/ax/callsign/<callsign>', methods=['GET'])
 def ax_callsign(callsign):
     """ICAO-Callsign (z.B. DLH506) → Route. Das Radar fragt für jeden
