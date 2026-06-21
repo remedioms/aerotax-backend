@@ -571,6 +571,11 @@ def ax_callsign(callsign):
                 'country': ap.get('country'), 'lat': ap.get('lat'), 'lon': ap.get('lon')}
     out['origin'] = enrich(route.get('src') or route.get('src_icao'))
     out['destination'] = enrich(route.get('dst') or route.get('dst_icao'))
+    # Gate/Terminal (nur aus der echten Airport-Tafel, _route_from_obs) → Live-Map.
+    if route.get('gate'):
+        out['gate'] = route.get('gate')
+    if route.get('terminal'):
+        out['terminal'] = route.get('terminal')
     return jsonify(out)
 
 
