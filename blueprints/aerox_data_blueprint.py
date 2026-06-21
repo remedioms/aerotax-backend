@@ -749,3 +749,67 @@ def ax_suggest():
         out.append({'type': 'aircraft_type', 'code': r.get('typecode'),
                     'label': r.get('name') or r.get('typecode'), 'sub': r.get('typecode')})
     return jsonify({'ok': True, 'suggestions': out})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Crowdsourced Crewbus-Transferzeiten (Flughafen → Crew-Hotel), pro IATA.
+#
+# User-Wunsch: Crew gibt die TATSÄCHLICHE Crewbus-Fahrzeit zur Destination ein;
+# die App zeigt den DURCHSCHNITT aller Eingaben. Die erste Eingabe IST der
+# Schnitt (n=1), jede weitere verfeinert ihn. Speist die Hotel-Ankunft-Schätzung
+# im Feed mit echten Crowd-Daten statt der statischen Tabelle.
+#
+# Storage: In-Memory (sofort nutzbar) + best-effort Supabase (`ax_crewbus`,
+# key=iata, payload={minutes:[...]}). Ohne Tabelle no-op't der SB-Write (durable
+# sobald die Tabelle angelegt ist) — die App funktioniert trotzdem.
+_CREWBUS_MEM = {}
+_CREWBUS_CAP = 50          # je IATA die letzten 50 Eingaben mitteln (Drift-Schutz)
+
+
+def _crewbus_get(iata):
+    cached = _cache_get('ax_crewbus', 'iata', iata)
+    if isinstance(cached, dict) and isinstance(cached.get('minutes'), list):
+        return [int(x) for x in cached['minutes'] if isinstance(x, (int, float))]
+    return list(_CREWBUS_MEM.get(iata) or [])
+
+
+def _crewbus_put(iata, minutes):
+    minutes = minutes[-_CREWBUS_CAP:]
+    _CREWBUS_MEM[iata] = minutes
+    _cache_put('ax_crewbus', {'iata': iata, 'payload': {'minutes': minutes}})
+
+
+def _crewbus_avg(minutes):
+    return round(sum(minutes) / len(minutes)) if minutes else None
+
+
+@aerox_data_bp.route('/api/ax/crewbus/<iata>', methods=['GET'])
+def ax_crewbus_get(iata):
+    iata = (iata or '').upper().strip()[:4]
+    if not iata:
+        return jsonify({'ok': False, 'error': 'bad_iata'}), 400
+    mins = _crewbus_get(iata)
+    return jsonify({'ok': True, 'iata': iata,
+                    'avg': _crewbus_avg(mins), 'count': len(mins)})
+
+
+@aerox_data_bp.route('/api/ax/crewbus/<iata>', methods=['POST'])
+def ax_crewbus_post(iata):
+    from flask import request
+    iata = (iata or '').upper().strip()[:4]
+    if not iata:
+        return jsonify({'ok': False, 'error': 'bad_iata'}), 400
+    body = request.get_json(silent=True) or {}
+    try:
+        m = int(round(float(body.get('minutes'))))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'bad_minutes'}), 400
+    if not (1 <= m <= 240):
+        return jsonify({'ok': False, 'error': 'out_of_range',
+                        'message': 'Minuten müssen zwischen 1 und 240 liegen.'}), 400
+    mins = _crewbus_get(iata)
+    mins.append(m)
+    _crewbus_put(iata, mins)
+    mins = _crewbus_get(iata)
+    return jsonify({'ok': True, 'iata': iata,
+                    'avg': _crewbus_avg(mins), 'count': len(mins), 'your_minutes': m})
