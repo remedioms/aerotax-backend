@@ -596,10 +596,10 @@ def ax_schedule(frm, to):
     if len(a) < 3 or len(b) < 3:
         return jsonify({'ok': False, 'error': 'need IATA'}), 400
     route = f'{a}-{b}'
-    # Cache-Key mit Schema-Version: '#cs2' = Codeshares werden jetzt rausgefiltert.
-    # Alte Cache-Einträge (mit Dutzenden Codeshare-Duplikaten gleicher Zeit) werden
-    # so umgangen und beim ersten Abruf frisch + sauber neu gezogen.
-    cache_key = f'{route}#cs2'
+    # Cache-Key mit Schema-Version: '#cs3' = Codeshares gefiltert + estimated/actual
+    # Zeiten ergänzt. Schema-Bump umgeht alte Cache-Einträge (Duplikate / ohne
+    # actual) → erster Abruf zieht frisch + sauber neu.
+    cache_key = f'{route}#cs3'
     key = os.environ.get('AVIATIONSTACK_KEY', '')
     month = time.strftime('%Y-%m', time.gmtime())
     remaining, used = _budget_remaining(month)
@@ -652,6 +652,15 @@ def ax_schedule(frm, to):
             'airline_iata': al.get('iata'),
             'dep_scheduled': dep.get('scheduled'),
             'arr_scheduled': arr.get('scheduled'),
+            # Tatsächliche/erwartete Zeiten + Verspätung (AviationStack liefert sie,
+            # vorher weggeworfen → App zeigte nur „geplant"). actual = abgeflogen/
+            # gelandet, estimated = erwartet; delay in Minuten.
+            'dep_estimated': dep.get('estimated'),
+            'dep_actual': dep.get('actual'),
+            'dep_delay': dep.get('delay'),
+            'arr_estimated': arr.get('estimated'),
+            'arr_actual': arr.get('actual'),
+            'arr_delay': arr.get('delay'),
             'status': r.get('flight_status'),
         })
     payload = {'flights': flights, 'count': len(flights), '_fetched': int(time.time())}
