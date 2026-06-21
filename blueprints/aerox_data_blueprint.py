@@ -532,6 +532,45 @@ def ax_callsign(callsign):
     return jsonify(out)
 
 
+@aerox_data_bp.route('/api/ax/harvest-routes', methods=['POST'])
+def ax_harvest_routes():
+    """Route-Harvester (User-Wunsch: „die restlichen Flugnummern suchen + von wo
+    wohin speichern", öffentlich verfügbar). Die App schickt die Callsigns, die sie
+    ohnehin vom Radar-Area-Poll hat; wir speichern für jeden NOCH NICHT gecachten
+    die Strecke dauerhaft in `ax_route_cache` — Quelle ausschließlich `adsbdb`
+    (frei + öffentlich, KEIN AviationStack-Budget). Pro Request hart gedeckelt
+    (Rate-Schutz für adsbdb), der Rest kommt beim nächsten Poll dran → die Routen-
+    DB wächst über echten Verkehr auf ganz Europa, ohne Bulk-/Budget-Limit."""
+    from flask import request
+    body = request.get_json(silent=True) or {}
+    csigns = body.get('callsigns') or []
+    if not isinstance(csigns, list):
+        return jsonify({'ok': False, 'error': 'bad_body'}), 400
+    MAX_NEW = 12               # höchstens 12 neue adsbdb-Calls pro Request
+    harvested = cached = checked = 0
+    seen = set()
+    for raw in csigns[:300]:
+        cs = (str(raw) or '').strip().upper().replace(' ', '')
+        if not cs or len(cs) < 4 or cs in seen:
+            continue
+        seen.add(cs)
+        checked += 1
+        if _cache_get('ax_route_cache', 'flight', cs):
+            cached += 1
+            continue
+        if harvested >= MAX_NEW:
+            continue           # Rest beim nächsten Poll
+        route = _adsbdb_route(cs)
+        if route and (route.get('src') or route.get('src_icao')) \
+           and (route.get('dst') or route.get('dst_icao')):
+            _cache_put('ax_route_cache',
+                       {'flight': cs, 'payload': route,
+                        'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+            harvested += 1
+    return jsonify({'ok': True, 'checked': checked,
+                    'cached': cached, 'harvested': harvested})
+
+
 def _airport_full(code):
     ap = _airport_row(code)
     if not ap:
