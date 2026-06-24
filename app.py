@@ -21155,7 +21155,6 @@ def ax_route_history(frm, to):
                     'recent_days': days_out, 'source': 'airport_delay_obs'})
 
 
-@app.route('/api/ax/flight-info/<flightno>', methods=['GET'])
 def _flight_from_live_board(iata, fn):
     """Sucht eine Flugnummer im LIVE-Board-Feed (gratis, gecacht) eines Abflug-
     Flughafens — für HEUTE/künftig abfliegende Flüge, die noch NICHT in der
@@ -21183,6 +21182,7 @@ def _flight_from_live_board(iata, fn):
     return None
 
 
+@app.route('/api/ax/flight-info/<flightno>', methods=['GET'])
 def ax_flight_info(flightno):
     """Flugnummer → Strecke/Gate/Terminal/Status/TAIL — ZUERST GRATIS aus der self-
     growing `airport_delay_obs`-DB (Board-Poll-Historie: abgeflogene Flüge mit
