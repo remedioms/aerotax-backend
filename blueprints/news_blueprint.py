@@ -88,6 +88,43 @@ SOURCES = [
         'logo_url': 'https://www.google.com/s2/favicons?domain=aero.de&sz=64',
         'language': 'de',
     },
+    # ── Weitere deutschsprachige Luftfahrt-/Airline-Quellen ──────────
+    # (User: „Mehr deutsche Airline-News-Quellen verfügbar?") Reputable
+    # DE-Branchenmedien mit öffentlichem RSS. Sollte ein Feed mal 404en,
+    # degradiert _pull_one_source_safe sauber (source_status=False) ohne
+    # den Gesamt-Feed zu stören.
+    {
+        'id': 'aerotelegraph',
+        'name': 'aeroTELEGRAPH',
+        'url': 'https://www.aerotelegraph.com/feed',
+        'kind': 'rss',
+        'logo_url': 'https://www.google.com/s2/favicons?domain=aerotelegraph.com&sz=64',
+        'language': 'de',
+    },
+    {
+        'id': 'aerobuzz_de',
+        'name': 'AEROBUZZ',
+        'url': 'https://www.aerobuzz.de/feed/',
+        'kind': 'rss',
+        'logo_url': 'https://www.google.com/s2/favicons?domain=aerobuzz.de&sz=64',
+        'language': 'de',
+    },
+    {
+        'id': 'aviation_direct',
+        'name': 'Aviation.Direct',
+        'url': 'https://aviation.direct/feed/',
+        'kind': 'rss',
+        'logo_url': 'https://www.google.com/s2/favicons?domain=aviation.direct&sz=64',
+        'language': 'de',
+    },
+    {
+        'id': 'austrian_wings',
+        'name': 'Austrian Wings',
+        'url': 'https://www.austrianwings.info/feed/',
+        'kind': 'rss',
+        'logo_url': 'https://www.google.com/s2/favicons?domain=austrianwings.info&sz=64',
+        'language': 'de',
+    },
     {
         'id': 'reuters_aerospace',
         'name': 'Reuters Aerospace & Defense',

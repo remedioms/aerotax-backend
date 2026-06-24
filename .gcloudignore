@@ -12,3 +12,6 @@ support_inbox/
 sessions/
 docs/
 *.log
+
+# raw uncompressed DB (runtime reads the .gz only)
+data/aerox_reference.sqlite

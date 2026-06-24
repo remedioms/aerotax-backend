@@ -349,6 +349,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/friend-compare/',
     '/api/user/friends-homebases/',
     '/api/user/friends-today/',
+    '/api/user/hangouts/',  # globaler Hangout-Feed (owner_name/-token-PII)
     '/api/user/friends/',   # /friends/<token>/overlap → PII
     '/api/feed-status/',    # /<token>/friends → Friends-PII (Name/Avatar/Status)
     '/api/flight/',         # /<callsign>/crew/<token> → Friend-PII (wer fliegt mit)
@@ -10068,6 +10069,29 @@ def _user_future_layovers(token, days_ahead=60):
     return out
 
 
+def _user_current_iata(token):
+    """IATA des Flughafens, an dem der User HEUTE physisch ist — gleiche Quelle
+    wie friends_today/Live-City (heutiger Roster-Tag, reader_facts.layover_ort).
+    Anders als _user_future_layovers NICHT auf Z76 gefiltert: wer heute an einem
+    Airport sitzt (Turnaround/positioniert/wohnt dort), soll lokale öffentliche
+    Hangout-Pins sehen, auch wenn der Tag nicht als Layover klassifiziert ist.
+    Returns 3-letter IATA (uppercase) oder None."""
+    from datetime import date as _d
+    sess = _store.get(token) or {}
+    tage = (sess.get('result_data') or {}).get('_tage_detail') or []
+    if not tage:
+        tage = (_roster_snapshot_read(token) or {}).get('tage') or []
+    today = _d.today().isoformat()
+    for t in tage:
+        if not isinstance(t, dict) or (t.get('datum') or '')[:10] != today:
+            continue
+        place = ((t.get('reader_facts') or {}).get('layover_ort') or '').upper().strip()
+        if len(place) == 3 and place.isalpha():
+            return place
+        return None
+    return None
+
+
 @app.route('/api/user/crew-at-destination/<token>', methods=['GET'])
 def get_crew_at_destination(token):
     """Crew an MEINEN Zielen. Returns:
@@ -10145,18 +10169,27 @@ def get_crew_at_destination(token):
     # Destinations-Flughäfen (alle Crew — der Pin ist ein öffentlicher Meetup-Spot,
     # zu dem jeder beitreten kann). Die LIVE-Crew-POSITION bleibt friends-only.
     dest_iatas = set(by_iata.keys())
+    # Hangouts auch für Crew VOR ORT sichtbar: der aktuelle Standort-Flughafen
+    # des Users (heutiger Roster-Tag / Live-City) zählt als öffentlicher Meetup-
+    # Ort, auch wenn er kein eigenes Layover-Ziel ist. Sonst sieht Crew, die
+    # gerade an einem Airport ist, lokale Hangouts nie. Nur DIESE eine IATA dazu —
+    # keine Ausweitung auf „alle Pins überall".
+    public_iatas = set(dest_iatas)
+    cur_iata = _user_current_iata(token)
+    if cur_iata:
+        public_iatas.add(cur_iata)
     pins_out = []
     seen = set()
     for p in (_manual_pins_load(token)
               + _manual_pins_for_friends(token, friend_set)
-              + _public_pins_at_iatas(dest_iatas)):
+              + _public_pins_at_iatas(public_iatas)):
         pid = p.get('id')
         if not pid or pid in seen:
             continue
         seen.add(pid)
         owner = p.get('user_token') or ''
         mine = owner == token
-        is_public_meetup = (p.get('iata_code') or '').upper() in dest_iatas
+        is_public_meetup = (p.get('iata_code') or '').upper() in public_iatas
         if not mine and owner not in friend_set and not is_public_meetup:
             continue  # Privacy: nur mutual ODER öffentlicher Pin an meinem Ziel
         oprof = {} if mine else ((_profile_load(owner) or {}).get('profile', {}) or {})
@@ -10178,6 +10211,71 @@ def get_crew_at_destination(token):
 
     return jsonify({'ok': True, 'layover_matches': layover_matches,
                     'manual_pins': pins_out})
+
+
+def _hangouts_load_all_active():
+    """ALLE noch aktiven (nicht abgelaufenen) Treffpunkt-Pins — global, von ALLER
+    Crew. Ein Hangout ist ein öffentlicher, beitretbarer Meetup-Spot; jeder soll
+    ihn sehen + per Pin-Channel beitreten können (Capability-Modell).
+
+    „Aktiv" = pin_date >= heute ODER pin_date NULL (datumslose Pins altern nicht,
+    konsistent mit der iOS-isPinActive-Logik). Server-seitiger Zeitfilter, damit
+    abgelaufene Pins gar nicht erst übertragen werden; der Client filtert via
+    isPinActive zusätzlich (yyyy-MM-dd lexikografisch korrekt). Liste von Rows."""
+    if not SB_AVAILABLE:
+        return []
+    from datetime import date as _d
+    today = _d.today().isoformat()
+    try:
+        # pin_date >= today  ODER  pin_date IS NULL. or_() mit gte+is.null.
+        r = (sb.table('manual_pins').select('*')
+             .or_(f'pin_date.gte.{today},pin_date.is.null')
+             .limit(5000).execute())
+        return r.data or []
+    except Exception as e:
+        app.logger.warning(f'[hangouts] load_all_fail err={type(e).__name__}: {str(e)[:120]}')
+        return []
+
+
+@app.route('/api/user/hangouts/<token>', methods=['GET'])
+def list_hangouts(token):
+    """GLOBALER öffentlicher Hangout-Feed: ALLE aktiven manual_pins, sichtbar für
+    jeden authentifizierten Viewer — unabhängig von Standort oder Freundschaft.
+    Ein Hangout ist ein öffentlicher Meetup; jeder kann ihn sehen + (über den
+    Pin-Channel `group__pin_<id>`) beitreten.
+
+    Returns: { ok, hangouts: [{id, iata, lat, lng, date, note, owner_name,
+                               owner_match_id, owner_token?, mine}] }
+
+    Privacy: das rohe owner_token (= Bearer-Credential) wird NUR für eigene Pins
+    und gegenseitige Friends ausgeliefert (DM-Flow). Fremde Hangouts liefern nur
+    die opake owner_match_id + owner_name. Die LIVE-Crew-Position bleibt unberührt
+    friends-only (separater Endpoint crew-at-destination). Dieser Feed ist ADDITIV.
+    """
+    friend_set = set(_friends_load(token).get('friends') or [])
+    out = []
+    for p in _hangouts_load_all_active():
+        pid = p.get('id')
+        if not pid:
+            continue
+        owner = p.get('user_token') or ''
+        mine = owner == token
+        is_friend = owner in friend_set
+        oprof = {} if mine else ((_profile_load(owner) or {}).get('profile', {}) or {})
+        out.append({
+            'id': pid,
+            'iata': p.get('iata_code'),
+            'lat': p.get('lat'),
+            'lng': p.get('lng'),
+            'date': str(p.get('pin_date')) if p.get('pin_date') else None,
+            'note': p.get('note'),
+            # Token-Leak-Schutz: rohes owner_token NUR für self + mutual Friends.
+            'owner_token': owner if (mine or is_friend) else None,
+            'owner_name': 'Du' if mine else (oprof.get('name') or (owner[:8] + '…')),
+            'owner_match_id': _hashlib.sha256(owner.encode()).hexdigest()[:16],
+            'mine': mine,
+        })
+    return jsonify({'ok': True, 'hangouts': out})
 
 
 @app.route('/api/user/layover-visibility/<token>', methods=['GET'])
@@ -12209,10 +12307,12 @@ def _ical_briefings_save(token, events_dict):
     """SB primary + Disk best-effort. Cap auf 1000 Events (rolling window)."""
     if not isinstance(events_dict, dict):
         return
-    # Cap: behalte die jüngsten 1000 (sortiert nach Datum-Key)
-    if len(events_dict) > 1000:
+    # Cap: behalte die jüngsten 4000 Tage (~11 Jahre) — User-Wunsch: Roster-Historie
+    # NICHT löschen, mind. 10 Jahre aufbewahren (vorher 1000 ≈ 2,7 Jahre → ältere
+    # Monate fielen raus). 4000 deckt 10+ Jahre tägliche Einträge ab.
+    if len(events_dict) > 4000:
         keys = sorted(events_dict.keys())
-        keep = keys[-1000:]
+        keep = keys[-4000:]
         events_dict = {k: events_dict[k] for k in keep}
     sb_ok = _ical_briefings_save_to_supabase(token, events_dict)
     p = _ical_briefings_path(token)
@@ -12350,7 +12450,8 @@ def _briefing_start_is_bare_default(current_start_iso):
     return m.group(1) in _BRIEFING_MEANINGLESS_DTSTART_UTC
 
 
-def _corrected_briefing_start_iso(date_str, summary, current_start_iso):
+def _corrected_briefing_start_iso(date_str, summary, current_start_iso,
+                                  current_end_iso=None):
     """Root-Cause-Fix „Dienstbeginn 08:30": Der DTSTART aus der Roster-Pipeline ist
     bei LH/CRA oft ein bedeutungsloser Default (06:30 UTC → 08:30 LT) und NICHT die
     echte Report-/Briefing-Zeit. Wenn das Summary eine explizite Report-Zeit nennt
@@ -12362,6 +12463,14 @@ def _corrected_briefing_start_iso(date_str, summary, current_start_iso):
     wir `None` zurück statt die erfundene 08:30 zu surfacen. Die UI zeigt dann
     „keine Zeit" statt einer fabrizierten Uhrzeit. Echte Zeiten (alles ≠ der
     Default) bleiben unangetastet. Idempotent.
+
+    OFFICE-DAY-FIX (2026-06-23): Ein echter Office Day im LH-iCal trägt
+    DTSTART:…T063000Z UND DTEND:…T150000Z — der Start 06:30 UTC ist hier die
+    ECHTE Report-Zeit (08:30 LT), kein Default. Die 06:30-„bare default"-Heuristik
+    nullte ihn fälschlich (User-Bug: „Office-Tag zeigt keine Stunden", 2026-05-21).
+    Disambiguierung: ein bedeutungsloser Default-DTSTART kommt OHNE echte Endzeit;
+    ein Office Day hat eine reale DTEND. Liegt also ein `current_end_iso` vor, ist
+    06:30 eine echte Start-Zeit → NICHT nullen.
     """
     s = (summary or '')
     if not re.match(r'^\d{4}-\d{2}-\d{2}$', (date_str or '')):
@@ -12370,7 +12479,10 @@ def _corrected_briefing_start_iso(date_str, summary, current_start_iso):
     if not m:
         # Keine explizite Report-Zeit. Wenn der vorhandene Wert nur der
         # bedeutungslose DTSTART-Default ist → nicht als echte Zeit surfacen.
-        if _briefing_start_is_bare_default(current_start_iso):
+        # AUSNAHME: liegt eine echte DTEND vor (Office Day mit Start+Ende), ist
+        # der 06:30-DTSTART die echte Report-Zeit → bewahren statt nullen.
+        if _briefing_start_is_bare_default(current_start_iso) \
+                and not (current_end_iso or '').strip():
             return None
         return current_start_iso
     try:
@@ -12422,7 +12534,8 @@ def get_briefings(token):
             # Root-Cause-Fix „Dienstbeginn 08:30": echte Briefing-Zeit aus dem
             # Summary schlägt den bedeutungslosen DTSTART-Default (06:30 UTC).
             merged['ical_start_iso'] = _corrected_briefing_start_iso(
-                k, merged.get('ical_summary'), merged.get('ical_start_iso'))
+                k, merged.get('ical_summary'), merged.get('ical_start_iso'),
+                merged.get('ical_end_iso'))
             data[k] = merged
     except Exception:
         # Defensiv: iCal-Read-Fehler darf User-PUT-Daten nicht blocken
@@ -17645,6 +17758,23 @@ def flight_times(flightno):
         return jsonify({'ok': False, 'error': 'exception'})
 
 
+def _age_from_built_date(bd):
+    """YYYY-MM-DD → {'age_years': X, 'age_months': Y} (tagesgenau, kalendrisch).
+    Leeres Dict bei unparsbar. Gleiche Logik wie /api/ax/aircraft, damit das Radar
+    überall ein konsistentes „X Jahre Y Monate"-Alter zeigt (User-Wunsch
+    Tag/Monat/Jahr)."""
+    try:
+        import datetime as _d
+        d = _d.date.fromisoformat(str(bd)[:10])
+        t = _d.date.today()
+        months = (t.year - d.year) * 12 + (t.month - d.month) - (1 if t.day < d.day else 0)
+        if 0 <= months < 1200:
+            return {'age_years': months // 12, 'age_months': months % 12}
+    except Exception:
+        pass
+    return {}
+
+
 @app.route('/api/aircraft-age/<hex>', methods=['GET'])
 def aircraft_age(hex):
     """AeroX-eigene, WACHSENDE Flieger-Alters-DB (#127, User-Idee): einmal pro Hex
@@ -17665,8 +17795,15 @@ def aircraft_age(hex):
             rows = (res.data if res and hasattr(res, 'data') else []) or []
             if rows:
                 r = rows[0]
-                return jsonify({'ok': r.get('year') is not None, 'hex': h, 'year': r.get('year'),
-                                'reg': r.get('reg'), 'type': r.get('type'), 'cached': True})
+                bd = r.get('built_date')
+                out = {'ok': r.get('year') is not None, 'hex': h, 'year': r.get('year'),
+                       'reg': r.get('reg'), 'type': r.get('type'), 'cached': True}
+                # Tagesgenaues Baujahr (YYYY-MM-DD) + abgeleitetes Alter, falls
+                # vorhanden (LH-Gruppe via AeroDataBox rollout/firstFlight/delivery).
+                if bd:
+                    out['built_date'] = bd
+                    out.update(_age_from_built_date(bd))
+                return jsonify(out)
         except Exception as e:
             app.logger.warning(f'[age] cache-get {str(e)[:100]}')
     # 2) AeroDataBox-Lookup (Baujahr).
@@ -17682,23 +17819,37 @@ def aircraft_age(hex):
             return jsonify({'ok': False, 'error': f'http_{r.status_code}'})
         d = r.json() or {}
         year = None
+        built_date = None
+        # AeroDataBox liefert volle ISO-Daten (YYYY-MM-DD). Reihenfolge = best:
+        # rollout > firstFlight > delivery. Wir behalten das ERSTE volle Datum als
+        # tagesgenaues Baujahr (User: „LH-Flugzeuge brauchen Baujahr Tag/Monat/Jahr"),
+        # damit die ganze LH-Gruppe — die in der gebackenen OpenSky-DB KEIN built hat —
+        # ein echtes Datum bekommt, nicht nur das Jahr.
         for f in ('rolloutDate', 'firstFlightDate', 'deliveryDate'):
             v = d.get(f)
             if isinstance(v, str) and len(v) >= 4 and v[:4].isdigit():
                 y = int(v[:4])
                 if 1950 <= y <= 2026:
-                    year = y; break
+                    year = y
+                    if len(v) >= 10 and v[4] == '-' and v[7] == '-':
+                        built_date = v[:10]
+                    break
         reg = d.get('reg'); typ = d.get('typeName')
         # 3) In die AeroX-DB schreiben (auch ohne Jahr → kein Re-Fetch-Sturm).
+        #    built_date (tagesgenau) mitschreiben, sofern AeroDataBox es lieferte.
         if sb is not None:
             try:
-                row = {'hex': h, 'year': year, 'reg': reg, 'type': typ,
-                       'updated': datetime.utcnow().isoformat()}
+                row = {'hex': h, 'year': year, 'built_date': built_date,
+                       'reg': reg, 'type': typ, 'updated': datetime.utcnow().isoformat()}
                 def _up(): return sb.table('aircraft_age').upsert(row, on_conflict='hex').execute()
                 _supabase_execute_with_timeout('age_put', _up, timeout_s=4)
             except Exception as e:
                 app.logger.warning(f'[age] cache-put {str(e)[:100]}')
-        return jsonify({'ok': year is not None, 'hex': h, 'year': year, 'reg': reg, 'type': typ})
+        out = {'ok': year is not None, 'hex': h, 'year': year, 'reg': reg, 'type': typ}
+        if built_date:
+            out['built_date'] = built_date
+            out.update(_age_from_built_date(built_date))
+        return jsonify(out)
     except Exception as e:
         app.logger.warning(f'[age] {str(e)[:120]}')
         return jsonify({'ok': False, 'error': 'exception'})
@@ -17941,6 +18092,82 @@ def get_user_calendar_pdf(token):
     for t in (rd.get('_tage_detail') or []):
         if isinstance(t, dict) and t.get('datum'):
             tage_by_date[t['datum']] = t
+
+    # FALLBACK (Root-Cause „Monatsplan leer", 2026-06-23): Die meisten User haben
+    # KEINE volle Steuer-Auswertung laufen lassen (kein `_tage_detail`), aber sie
+    # haben ihren Dienstplan via iCal/EKEventStore importiert. Dann ist die Tabelle
+    # leer, obwohl 44 Briefings vorliegen. Für jeden Tag ohne `_tage_detail`-Eintrag
+    # synthetisieren wir aus dem Briefing-Store (gleicher Merge wie `get_briefings`)
+    # ein {klass, routing}-Surrogat, damit die Tabelle die echten Diensttage zeigt.
+    try:
+        _briefings_for_pdf = dict(_manual_briefings_load(token) or {})
+        _ical_for_pdf = _ical_briefings_load(token) or {}
+        for _bk, _bv in (_ical_for_pdf or {}).items():
+            if not isinstance(_bv, dict):
+                continue
+            _merged = dict(_briefings_for_pdf.get(_bk) or {})
+            for _fld in ('ical_summary', 'ical_location', 'ical_start_iso',
+                         'ical_end_iso', 'legs'):
+                if _bv.get(_fld) is not None:
+                    _merged[_fld] = _bv.get(_fld)
+            for _fk, _fv in _bv.items():
+                _merged.setdefault(_fk, _fv)
+            _briefings_for_pdf[_bk] = _merged
+    except Exception:
+        _briefings_for_pdf = {}
+
+    def _briefing_to_klass_routing(bv):
+        """Leitet (klass_label, routing_kuerzel) aus einem Briefing-Item ab.
+        Heuristik auf `ical_summary` + `legs` — KEINE Steuerklassifikation, nur
+        ein menschenlesbares Label für den gedruckten Monatsplan."""
+        summary = (bv.get('ical_summary') or '').strip()
+        low = summary.lower()
+        legs = bv.get('legs') if isinstance(bv.get('legs'), list) else []
+        # Routing-Kürzel: erstes Nicht-Homebase-Ziel aus den Legs, sonst aus dem Summary.
+        routing = ''
+        for lg in legs:
+            if not isinstance(lg, dict):
+                continue
+            to = (lg.get('to') or '').strip().upper()
+            if len(to) == 3 and to != 'FRA':
+                routing = to
+                break
+        if not routing:
+            import re as _re2
+            # Summary-Form „FRA-BUD" / „BUD-FRA" → erstes 3-Letter ≠ FRA
+            for tok in _re2.findall(r'\b([A-Z]{3})\b', summary):
+                if tok != 'FRA':
+                    routing = tok
+                    break
+        # Label-Mapping (Anzeigeklassen, decken sich grob mit KLASS_BG-Keys).
+        if 'off day' in low or low == 'off' or 'rest day' in low:
+            return 'Frei', ''
+        if 'absence' in low or 'urlaub' in low or 'vacation' in low or 'leave' in low:
+            return 'Urlaub', ''
+        if 'office' in low or 'training' in low or 'schulung' in low or 'ground' in low:
+            return 'Office', ''
+        if 'standby' in low or 'sby' in low or 'reserve' in low or 'bereitschaft' in low:
+            return 'Standby', ''
+        if 'layover' in low or legs or '-' in summary.replace(' ', ''):
+            # Aktiver Flugdiensttag / Layover → Z76 (Auslandstour) als Default-Farbe.
+            return 'Z76', routing
+        if summary:
+            return 'Duty', routing
+        return '', ''
+
+    for _bk, _bv in (_briefings_for_pdf or {}).items():
+        if _bk in tage_by_date:
+            continue  # echte Auswertung gewinnt
+        if not isinstance(_bv, dict):
+            continue
+        _klass, _routing = _briefing_to_klass_routing(_bv)
+        if not _klass:
+            continue
+        tage_by_date[_bk] = {
+            'datum': _bk,
+            'klass': _klass,
+            'routing': _routing,
+        }
 
     KLASS_BG = {
         'Z76': HexColor('#fde68a'),
@@ -20262,62 +20489,94 @@ def _mdfag_board(slug, iata, flight_type='departure'):
 
 
 def _ham_board(flight_type='departure'):
-    """HAM — Hamburg Airport. HTML-Scraping ähnlich HAJ. Needs curl-verify."""
+    """HAM — Hamburg Airport. FREIER JSON-Feed (reverse-engineered aus dem Board-JS,
+    LIVE verifiziert 2026-06-24):
+        GET https://www.hamburg-airport.de/service/flightdata/{departures|arrivals}
+    → JSON-Array. Felder pro Flug: flightnumber ('KL 1758'), airline2LCode, airlineName,
+    {destination|origin}Airport3LCode + …Name, planned/expected/actual{Departure|Arrival}Time
+    (ISO **UTC**), gate (nur Abflug), {departure|arrival}Terminal, aircraftType (Klartext,
+    KEIN Code), flightStatus{Departure|Arrival}, cancelled. HAM publiziert KEINE Tail-Reg
+    → reg bleibt leer, Muster (aircraftType) wird übernommen.
+
+    Der Feed ist ein MEHR-TAGE-Fenster → wir filtern auf den heutigen Betriebstag
+    (Europe/Berlin) und rechnen die UTC-Zeiten in Berlin-Lokalzeit um (gleiche naive
+    'YYYY-MM-DDTHH:MM:00'-Form wie alle anderen Board-Quellen)."""
     try:
         import requests
-        from bs4 import BeautifulSoup
-        from datetime import datetime, timezone, timedelta
-        import re as _re
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo
+            _berlin = ZoneInfo('Europe/Berlin')
+        except Exception:
+            _berlin = None
     except Exception:
         return None
     arr = (flight_type == 'arrival')
+    path = 'arrivals' if arr else 'departures'
+    url = 'https://www.hamburg-airport.de/service/flightdata/' + path
     try:
-        day = _fra_local_now().strftime('%Y-%m-%d')
-    except Exception:
-        day = None
-    url = ('https://www.flughafen-hamburg.de/en/passengers/at-the-airport/departure-arrival-times/'
-           + ('arrivals/' if arr else 'departures/'))
-    try:
-        r = requests.get(url,
-                         headers={'User-Agent': _BOARD_UA, 'Accept': 'text/html,*/*',
-                                  'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'},
-                         timeout=14)
-        if r.status_code != 200 or not r.text:
+        r = requests.get(url, headers={'User-Agent': _BOARD_UA,
+                                       'Accept': 'application/json'}, timeout=14)
+        if r.status_code != 200:
             return None
-        soup = BeautifulSoup(r.text, 'html.parser')
+        data = r.json()
+        if not isinstance(data, list):
+            return None
     except Exception:
         return None
-    out = []
-    for row in soup.select('tr.flight-row, tr[data-flight], .flight-item, tr.js-flight'):
+    try:
+        today = _fra_local_now().strftime('%Y-%m-%d')
+    except Exception:
+        today = None
+
+    def _to_local(iso):
+        """ISO-UTC ('…Z') → naive Europe/Berlin 'YYYY-MM-DDTHH:MM:00'. None bei leer."""
+        if not iso or not isinstance(iso, str):
+            return None
         try:
-            r2 = _empty_board_row()
-            fn_el = row.select_one('[class*="flight-number"], [class*="flightnumber"], .fn, .flight_no')
-            if fn_el:
-                code, flight, ac = _split_flightno(fn_el.get_text(' ', strip=True))
-                r2['airline'] = code or r2['airline']
-                r2['flight'] = flight
-                r2['aircraft'] = ac
-            dest_el = row.select_one('[class*="destination"], [class*="origin"], [class*="route"]')
-            if dest_el:
-                txt = dest_el.get_text(' ', strip=True)
-                m = _re.search(r'\(([A-Z]{3})\)', txt)
-                if m:
-                    r2['dest_iata'] = m.group(1)
-                    r2['dest_name'] = _clean_city_name(txt.replace(m.group(0), '').strip(), m.group(1))
-            time_el = row.select_one('[class*="time"], [class*="sched"], td.time')
-            if time_el and day:
-                times = _re.findall(r'(\d{2}:\d{2})', time_el.get_text())
-                if times:
-                    r2['sched'] = day + 'T' + times[0] + ':00'
-                    if len(times) > 1 and times[1] != times[0]:
-                        r2['esti'] = day + 'T' + times[1] + ':00'
-            st_el = row.select_one('[class*="status"]')
-            if st_el:
-                r2['status'] = st_el.get_text(' ', strip=True)
-            r2['delay_min'] = _board_delay_min(r2['sched'], r2['esti'])
-            r2['delayed'] = r2['delay_min'] >= _DELAY_THRESHOLD_MIN
-            if r2['flight'] or r2['dest_iata']:
-                out.append(r2)
+            dt = datetime.fromisoformat(iso.replace('Z', '+00:00'))
+            if _berlin is not None:
+                dt = dt.astimezone(_berlin)
+            return dt.strftime('%Y-%m-%dT%H:%M:00')
+        except Exception:
+            return None
+
+    k_iata = 'originAirport3LCode' if arr else 'destinationAirport3LCode'
+    k_name = 'originAirportName' if arr else 'destinationAirportName'
+    k_term = 'arrivalTerminal' if arr else 'departureTerminal'
+    k_plan = 'plannedArrivalTime' if arr else 'plannedDepartureTime'
+    k_exp = 'expectedArrivalTime' if arr else 'expectedDepartureTime'
+    k_act = 'actualArrivalTime' if arr else 'actualDepartureTime'
+    k_stat = 'flightStatusArrival' if arr else 'flightStatusDeparture'
+    out = []
+    for f in data:
+        try:
+            row = _empty_board_row()
+            code, _flight, _ac = _split_flightno(f.get('flightnumber') or '')
+            # Flugnummer leerzeichen-frei + großgeschrieben speichern (wie FRA) —
+            # sonst matcht /api/ax/flight-info (Query: upper, no-space) nicht.
+            row['flight'] = (f.get('flightnumber') or '').replace(' ', '').strip().upper()
+            row['airline'] = (f.get('airline2LCode') or code or '').strip().upper()
+            row['airline_name'] = (f.get('airlineName') or '').strip()
+            row['dest_iata'] = (f.get(k_iata) or '').strip().upper()
+            row['dest_name'] = _clean_city_name(f.get(k_name), row['dest_iata'])
+            planned = _to_local(f.get(k_plan))
+            est = _to_local(f.get(k_exp)) or _to_local(f.get(k_act))
+            row['sched'] = planned
+            if est and est != planned:
+                row['esti'] = est
+            row['gate'] = (f.get('gate') or '').strip()      # nur Abflug belegt
+            row['terminal'] = (f.get(k_term) or '').strip()
+            row['status'] = (f.get(k_stat) or '').strip()
+            row['aircraft'] = (f.get('aircraftType') or '').strip()
+            row['cancelled'] = bool(f.get('cancelled'))
+            row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
+            row['delayed'] = row['delay_min'] >= _DELAY_THRESHOLD_MIN
+            # Nur heutiger Betriebstag (der Feed liefert mehrere Tage).
+            if today and row['sched'] and not row['sched'].startswith(today):
+                continue
+            if row['flight'] or row['dest_iata']:
+                out.append(row)
         except Exception:
             continue
     return out if out else None
@@ -20827,7 +21086,11 @@ def _departed_rows_from_store(airport):
             'status': ((meta.get('status') or '') or
                        ('Annulliert' if cancelled
                         else ('Gelandet' if is_arr else 'Abgeflogen'))),
-            'reg': '', 'aircraft': '', 'departed': True,
+            # reg/type_code AUS dem Meta-Store mit ausgeben (User: Tail-Reg + Muster
+            # gehören auch auf die „Früher heute"-Zeilen, nicht nur auf die Live-Flüge
+            # — sie liegen seit dem Aircraft-Meta-Merge ohnehin im Store).
+            'reg': (meta.get('reg') or ''), 'aircraft': (meta.get('type_code') or ''),
+            'departed': True,
         })
     rows.sort(key=lambda f: f.get('sched') or '')
     return rows
@@ -20893,22 +21156,53 @@ def ax_route_history(frm, to):
 
 
 @app.route('/api/ax/flight-info/<flightno>', methods=['GET'])
+def _flight_from_live_board(iata, fn):
+    """Sucht eine Flugnummer im LIVE-Board-Feed (gratis, gecacht) eines Abflug-
+    Flughafens — für HEUTE/künftig abfliegende Flüge, die noch NICHT in der
+    airport_delay_obs-Historie stehen (die hält nur bereits ABGEFLOGENE). Damit
+    findet der eigene Umlauf in ein paar Stunden seinen bereits zugeteilten Tail
+    (Fraport-Feed: now→+27h, ~95 % Tail-Fill <15h). Liefert die Board-Zeile (inkl.
+    reg/aircraft, sofern die Quelle sie schon trägt) + `_arr`-Richtung, sonst None.
+    Niemals raise — reiner Best-Effort-Enrich."""
+    iata = (iata or 'FRA').upper().strip()
+    iata = _DE_ICAO_TO_IATA.get(iata, iata)
+    fn = (fn or '').replace(' ', '').upper()
+    for ftype in ('departure', 'arrival'):
+        try:
+            if iata in ('FRA', 'EDDF'):
+                flights = (_fra_day_board_cached(ftype) if ftype == 'departure'
+                           else _fra_board_cached(ftype))
+            else:
+                rows, _src = (_native_board_cached(iata, ftype) or (None, None))
+                flights = rows
+        except Exception:
+            flights = None
+        for bf in (flights or []):
+            if (bf.get('flight') or '').replace(' ', '').upper() == fn:
+                return dict(bf, _arr=(ftype == 'arrival'))
+    return None
+
+
 def ax_flight_info(flightno):
-    """Flugnummer → Strecke/Gate/Terminal/Status — ZUERST GRATIS aus der self-
-    growing `airport_delay_obs`-DB (von unseren Board-Polls aufgebaut: pro Flug
-    origin/dest/gate/terminal/status/Zeiten). Treffer = kein Drittanbieter-Call.
-    `found: false` → der Client holt den Long-Tail on-tap via /api/flight-times
-    (AeroDataBox, budgetiert + gecacht). So wächst die DB über echte Nutzung auf
-    ganz Europa, ohne Bulk-/Free-Tier-Limit zu sprengen."""
+    """Flugnummer → Strecke/Gate/Terminal/Status/TAIL — ZUERST GRATIS aus der self-
+    growing `airport_delay_obs`-DB (Board-Poll-Historie: abgeflogene Flüge mit
+    origin/dest/gate/reg/type). Findet die Historie keinen Tail (oder der Flug ist
+    HEUTE/künftig → noch nicht abgeflogen), wird der LIVE-Board-Feed des Abflug-
+    Flughafens (`?airport=`, Default FRA) als Fallback gescannt — so trägt der
+    eigene bevorstehende Umlauf seinen bereits zugeteilten Tail. `found:false` nur,
+    wenn weder Historie noch Live-Feed etwas haben → Client holt /api/flight-times
+    (AeroDataBox) on-tap. Nur GRATIS-Quellen, gecacht."""
     fn = (flightno or '').upper().replace(' ', '').strip()
     if len(fn) < 3:
         return jsonify({'ok': False, 'error': 'bad_flight'}), 400
+    board_ap = (request.args.get('airport') or 'FRA').upper().strip()
+    out = None        # Historien-Ergebnis (falls vorhanden)
     if SB_AVAILABLE and sb is not None:
         try:
             r = (sb.table('airport_delay_obs').select('*')
                  .eq('flight', fn)
                  .order('date', desc=True).order('updated_at', desc=True)
-                 .limit(6).execute())
+                 .limit(60).execute())
             rows = r.data or []
             # ABFLUG-Record bevorzugen: dort ist `airport` = Origin + `dest_iata` =
             # Ziel (korrekte Richtung). Ankunfts-Records ('<AP>#ARR') haben die
@@ -20918,7 +21212,17 @@ def ax_flight_info(flightno):
                 o = dep or rows[0]
                 o = dict(o)
                 o['airport'] = (o.get('airport') or '').split('#', 1)[0]   # Store-Key säubern
-                resp = jsonify({
+                # Letzte beobachtete Maschine: jüngster Record mit reg/type.
+                ac_row = next((x for x in rows if (x.get('reg') or x.get('type_code'))), None)
+                # Tail-Historie über die letzten Tage (dedupe nach reg, jüngste zuerst).
+                seen_reg = set(); regs = []
+                for x in rows:
+                    rg = (x.get('reg') or '').strip().upper()
+                    if rg and rg not in seen_reg:
+                        seen_reg.add(rg)
+                        regs.append({'reg': rg, 'type': x.get('type_code'),
+                                     'date': x.get('date')})
+                out = {
                     'ok': True, 'found': True, 'flight': fn, 'source': 'aerox_obs',
                     'origin': o.get('airport'), 'dest': o.get('dest_iata'),
                     'dest_name': o.get('dest_name'), 'airline': o.get('airline'),
@@ -20926,12 +21230,104 @@ def ax_flight_info(flightno):
                     'status': o.get('status'), 'sched': o.get('sched'),
                     'esti': o.get('esti'), 'delay_min': o.get('max_delay_min'),
                     'cancelled': o.get('cancelled'), 'date': o.get('date'),
+                    'reg': (ac_row or {}).get('reg'),
+                    'type': (ac_row or {}).get('type_code'),
+                    'recent_regs': regs[:8], 'observations': len(rows),
+                }
+        except Exception as e:
+            app.logger.warning(f'[flight-info] obs_fail {str(e)[:120]}')
+    # LIVE-ENRICH: kein Tail aus der Historie (oder gar kein Treffer) → Live-Board
+    # des Abflug-Flughafens scannen. So bekommt ein HEUTE/künftig abfliegender Flug
+    # seinen bereits zugeteilten Tail, den die (nur-abgeflogen-)Historie nie hätte.
+    if out is None or not out.get('reg'):
+        try:
+            bf = _flight_from_live_board(board_ap, fn)
+        except Exception:
+            bf = None
+        if bf is not None:
+            arr = bf.get('_arr')
+            b_reg = (bf.get('reg') or '').strip().upper() or None
+            b_type = (bf.get('aircraft') or '').strip() or None
+            if out is None:
+                # Origin/Dest richtungsrichtig: Abflug-Board → origin=board_ap;
+                # Ankunfts-Board → der Flug kommt VON dest_iata, geht NACH board_ap.
+                origin = (bf.get('dest_iata') if arr else board_ap)
+                dest = (board_ap if arr else bf.get('dest_iata'))
+                out = {
+                    'ok': True, 'found': True, 'flight': fn, 'source': 'live_board',
+                    'origin': origin, 'dest': dest,
+                    'dest_name': bf.get('dest_name'), 'airline': bf.get('airline'),
+                    'gate': bf.get('gate'), 'terminal': bf.get('terminal'),
+                    'status': bf.get('status'), 'sched': bf.get('sched'),
+                    'esti': bf.get('esti'), 'delay_min': bf.get('delay_min'),
+                    'cancelled': bf.get('cancelled'), 'date': (bf.get('sched') or '')[:10] or None,
+                    'reg': b_reg, 'type': b_type,
+                    'recent_regs': ([{'reg': b_reg, 'type': b_type,
+                                      'date': (bf.get('sched') or '')[:10]}] if b_reg else []),
+                    'observations': 0,
+                }
+            else:
+                # Historie hatte Strecke/Gate, aber keinen Tail → nur Tail/Typ + frische
+                # Live-Zeiten ergänzen, Quelle markieren.
+                if b_reg:
+                    out['reg'] = b_reg
+                    if b_type and not out.get('type'):
+                        out['type'] = b_type
+                    out['source'] = 'aerox_obs+live'
+                    if not out.get('recent_regs'):
+                        out['recent_regs'] = [{'reg': b_reg, 'type': b_type,
+                                               'date': (bf.get('sched') or '')[:10]}]
+                if bf.get('gate') and not out.get('gate'):
+                    out['gate'] = bf.get('gate')
+                if bf.get('esti'):
+                    out['esti'] = bf.get('esti')
+    if out is not None:
+        return _public_cache_headers(jsonify(out))
+    # Weder Historie noch Live-Feed → Client fällt auf AeroDataBox zurück.
+    return jsonify({'ok': True, 'found': False, 'flight': fn, 'source': 'none'})
+
+
+@app.route('/api/ax/aircraft-history/<reg>', methods=['GET'])
+def ax_aircraft_history(reg):
+    """Tail-Historie: welche Flüge/Strecken hat eine konkrete Registrierung (z.B.
+    D-AIXG) geflogen — GRATIS aus der self-growing `airport_delay_obs`-DB (von den
+    Board-Polls aufgebaut, jetzt mit reg/type pro Flug). Liefert die letzten
+    Beobachtungen (Datum, Flugnummer, von→nach, Status) + den typischen Typ-Code.
+    `found:false` → noch keine Beobachtung dieser Reg in unserer DB. Keine
+    Drittanbieter-Calls, kein Spend — nur Aggregation des Vorhandenen."""
+    rg = (reg or '').upper().replace(' ', '').strip()[:12]
+    if len(rg) < 3:
+        return jsonify({'ok': False, 'error': 'bad_reg'}), 400
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = (sb.table('airport_delay_obs').select('*')
+                 .eq('reg', rg)
+                 .order('date', desc=True).order('updated_at', desc=True)
+                 .limit(120).execute())
+            rows = r.data or []
+            if rows:
+                from collections import Counter as _C
+                types = _C((x.get('type_code') or '').strip()
+                           for x in rows if (x.get('type_code') or '').strip())
+                flights = []
+                for x in rows:
+                    ap = (x.get('airport') or '').split('#', 1)[0]
+                    flights.append({
+                        'date': x.get('date'), 'flight': x.get('flight'),
+                        'origin': ap, 'dest': x.get('dest_iata'),
+                        'dest_name': x.get('dest_name'), 'airline': x.get('airline'),
+                        'sched': x.get('sched'), 'delay_min': x.get('max_delay_min'),
+                        'cancelled': x.get('cancelled'), 'status': x.get('status'),
+                    })
+                resp = jsonify({
+                    'ok': True, 'found': True, 'reg': rg, 'source': 'aerox_obs',
+                    'typical_type': (types.most_common(1)[0][0] if types else None),
+                    'observations': len(rows), 'flights': flights[:60],
                 })
                 return _public_cache_headers(resp)
         except Exception as e:
-            app.logger.warning(f'[flight-info] obs_fail {str(e)[:120]}')
-    # Nicht in unserer DB → Client fällt auf AeroDataBox (/api/flight-times) zurück.
-    return jsonify({'ok': True, 'found': False, 'flight': fn, 'source': 'none'})
+            app.logger.warning(f'[aircraft-history] obs_fail {str(e)[:120]}')
+    return jsonify({'ok': True, 'found': False, 'reg': rg, 'source': 'none'})
 
 
 @app.route('/api/airport/<token>/board', methods=['GET'])
@@ -21632,7 +22028,8 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
     # mit Leerstrings. Spalten sind nullable (Migration 20260614) → fehlt eine
     # Spalte in einer alten Tabelle, degradiert der Write still (Exception unten).
     meta = meta or {}
-    for col in ('dest_iata', 'dest_name', 'gate', 'terminal', 'airline', 'esti'):
+    for col in ('dest_iata', 'dest_name', 'gate', 'terminal', 'airline', 'esti',
+                'reg', 'type_code'):
         v = (meta.get(col) or '')
         if isinstance(v, str):
             v = v.strip()
@@ -21652,15 +22049,47 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
         # UPDATE auf den Schlüssel; matchte keine Row → INSERT. Funktioniert auch
         # ohne den Unique-Key, also sofort nach Deploy — unabhängig davon, ob die
         # korrigierende Migration (20260613_*) schon im SQL-Editor lief.
-        upd = (sb.table('airport_delay_obs')
-               .update({'max_delay_min': payload['max_delay_min'],
-                        'cancelled': payload['cancelled'],
-                        'status': payload['status'],
-                        'updated_at': payload['updated_at']})
-               .eq('date', date_str).eq('airport', payload['airport'])
-               .eq('flight', fn).eq('sched', hhmm).execute())
-        if not (upd.data or []):
-            sb.table('airport_delay_obs').insert(payload).execute()
+        upd_fields = {'max_delay_min': payload['max_delay_min'],
+                      'cancelled': payload['cancelled'],
+                      'status': payload['status'],
+                      'updated_at': payload['updated_at']}
+        # reg/type_code/dest nur dann mit-aktualisieren, wenn dieser Snapshot sie
+        # trägt — so reichert ein späterer reicher Board-Poll eine frühere Row an,
+        # ohne sie bei einem ärmeren Poll wieder zu leeren.
+        for col in ('reg', 'type_code', 'dest_iata', 'dest_name', 'airline',
+                    'gate', 'terminal', 'esti'):
+            if payload.get(col):
+                upd_fields[col] = payload[col]
+        try:
+            upd = (sb.table('airport_delay_obs')
+                   .update(upd_fields)
+                   .eq('date', date_str).eq('airport', payload['airport'])
+                   .eq('flight', fn).eq('sched', hhmm).execute())
+            if not (upd.data or []):
+                sb.table('airport_delay_obs').insert(payload).execute()
+        except Exception as inner:
+            # SCHEMA-SAFE FALLBACK: läuft die reg/type_code-Migration (20260623)
+            # noch nicht, kennt PostgREST diese Spalten nicht (Fehler enthält
+            # 'reg'/'type_code'/PGRST204/42703). Dann den Write OHNE die neuen
+            # Spalten wiederholen — die Pünktlichkeits-/Delay-Daten dürfen NICHT
+            # verloren gehen, nur weil die Aircraft-Spalten noch fehlen. Sobald die
+            # Migration läuft, greift der reiche Pfad automatisch.
+            msg = str(inner).lower()
+            if ("type_code" in msg or "'reg'" in msg or '"reg"' in msg
+                    or 'pgrst204' in msg or '42703' in msg
+                    or 'column' in msg):
+                slim_payload = {k: v for k, v in payload.items()
+                                if k not in ('reg', 'type_code')}
+                slim_upd = {k: v for k, v in upd_fields.items()
+                            if k not in ('reg', 'type_code')}
+                upd = (sb.table('airport_delay_obs')
+                       .update(slim_upd)
+                       .eq('date', date_str).eq('airport', payload['airport'])
+                       .eq('flight', fn).eq('sched', hhmm).execute())
+                if not (upd.data or []):
+                    sb.table('airport_delay_obs').insert(slim_payload).execute()
+            else:
+                raise
         _delay_obs_write_ok_count += 1
     except Exception as e:
         # Tabelle fehlt / SB down / Schema-Mismatch → ehrlich nur in-memory
@@ -21718,6 +22147,8 @@ def _delay_store_load_from_sb(date_str, airport='FRA'):
                     'terminal':  (row.get('terminal') or ''),
                     'airline':   (row.get('airline') or ''),
                     'esti':      (row.get('esti') or ''),
+                    'reg':       (row.get('reg') or ''),
+                    'type_code': (row.get('type_code') or ''),
                     'status':    (row.get('status') or ''),
                 }
                 if any(v for v in meta.values()):
@@ -21743,6 +22174,20 @@ def _delay_store_load_from_sb(date_str, airport='FRA'):
         app.logger.warning(
             f'[delay-obs] sb_load_FAIL date={date_str} airport={airport} '
             f'{type(e).__name__}: {str(e)[:160]}')
+
+
+def _board_type_code(f):
+    """Best-effort ICAO/IATA-Typ-Code aus einer Board-Row. `type`/`type_code`
+    sind schon kurz; `aircraft` ist je nach Quelle „A320" ODER „Airbus A320 neo".
+    Nur kurze, code-artige Werte (≤8, keine Leerzeichen, alnum) durchlassen."""
+    for k in ('type', 'type_code', 'aircraft'):
+        v = (f.get(k) or '')
+        if not isinstance(v, str):
+            continue
+        v = v.strip().upper()
+        if v and len(v) <= 8 and ' ' not in v and v.replace('-', '').isalnum():
+            return v
+    return ''
 
 
 def _merge_into_delay_store(flights, date_str, airport='FRA'):
@@ -21772,7 +22217,13 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
     except Exception:
         now_local = None
     for f in (flights or []):
-        fn = f.get('flight') or f.get('flightNumber') or ''
+        # Flugnummer kanonisch leerzeichen-frei + groß persistieren — manche
+        # Scraper liefern sie mit Leerzeichen ('4Y 450'), aber /api/ax/flight-info
+        # fragt no-space/upper ab ('4Y450'). Ohne Normalisierung blieb die MUC-/
+        # Native-Scraper-Historie unauffindbar und der PK (date,airport,flight,sched)
+        # spaltete denselben Flug in zwei Zeilen. Quelle bleibt unverändert — nur
+        # der gespeicherte Key wird vereinheitlicht.
+        fn = (f.get('flight') or f.get('flightNumber') or '').replace(' ', '').upper()
         sched = f.get('sched') or ''
         if not fn or not sched:
             continue
@@ -21794,6 +22245,13 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
             'airline':   (f.get('airline') or '').strip(),
             'esti':      (f.get('esti') or '').strip() if isinstance(f.get('esti'), str) else '',
             'status':    (f.get('status') or '').strip(),
+            # Aircraft-Identität aus dem Board festhalten (Tail-Reg + Typ-Code), damit
+            # airport_delay_obs auch „welche Maschine flog Flug X" / „wo war Tail Y"
+            # beantworten kann — bisher fielen reg/type still weg.
+            'reg':       (f.get('reg') or f.get('aircraft_reg') or '').strip().upper()[:12],
+            # `aircraft` ist je nach Quelle ein Typ-Code (A320) ODER ein langer
+            # Modellname (Airbus A320) — nur kurze Codes als type_code übernehmen.
+            'type_code': _board_type_code(f),
         }
         prev_meta = _delay_store_meta.get(key) or {}
         merged_meta = dict(prev_meta)
@@ -22034,7 +22492,10 @@ def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None):
             'status': ((row.get('status') or '') or
                        ('Annulliert' if cancelled
                         else ('Gelandet' if is_arr else 'Abgeflogen'))),
-            'reg': '', 'aircraft': '', 'departed': True,
+            # reg/type_code aus der persistierten Row mit ausgeben (Tail + Muster
+            # auch auf vergangenen Tagen — select('*') liest sie bereits).
+            'reg': (row.get('reg') or ''), 'aircraft': (row.get('type_code') or ''),
+            'departed': True,
         })
     out.sort(key=lambda f: f.get('sched') or '')
     return out
@@ -22415,6 +22876,118 @@ def internal_poll_boards():
     airports = _poll_boards_airports()
     results = _poll_boards_once(airports)
     return jsonify({'ok': True, 'airports': airports, 'persisted': results})
+
+
+# Welche Airports haben einen FREIEN nativen Echtzeit-Scraper (estimated/actual
+# Zeiten, keine bezahlte Quelle)? Genau die in _FREE_BOARD_CODES — modulo der
+# zwei FRA-Aliasse. So scrapt /scrape-boards NUR kostenlose Boards mit echten
+# Verspätungs-Daten und fasst KEINE AeroDataBox-Budget-Calls an.
+_SCRAPE_BOARDS_FREE_DEFAULT = ('FRA', 'MUC', 'DUS', 'HAM', 'BER', 'HAJ', 'FMO',
+                               'LEJ', 'DRS', 'ERF', 'DTM', 'RLG', 'KSF', 'SCN')
+
+
+def _scrape_boards_airports():
+    """IATA-Liste für /scrape-boards — NUR Airports mit freiem nativem Scraper.
+    Env SCRAPE_BOARDS_AIRPORTS (Komma-Liste) überschreibbar; unbekannte/nicht-freie
+    Codes werden verworfen, damit hier nie eine bezahlte Quelle (AeroDataBox)
+    angefasst wird. FRA + MUC sind garantiert dabei."""
+    import os as _os
+    raw = (_os.environ.get('SCRAPE_BOARDS_AIRPORTS') or '').strip()
+    if raw:
+        cand = [a.strip().upper() for a in raw.replace(';', ',').split(',') if a.strip()]
+    else:
+        cand = list(_SCRAPE_BOARDS_FREE_DEFAULT)
+    # Nur freie Codes zulassen (FRA/EDDF + Native-Scraper).
+    free = []
+    seen = set()
+    for a in cand:
+        if a in _FREE_BOARD_CODES and a not in seen:
+            seen.add(a)
+            free.append(a)
+    for must in ('MUC', 'FRA'):
+        if must not in seen:
+            seen.add(must)
+            free.insert(0, must)
+    return free
+
+
+def _scrape_boards_once(airports, deadline_ts=None):
+    """Holt + persistiert DEP und ARR jeder freien Tafel und liefert die vom Brief
+    geforderte Zusammenfassung {airport: {dep: n, arr: n}} (n = persistierte
+    Sample-Size / 0 / -1 bei Fehler). Reused den bestehenden Fetch+Persist-Pfad
+    (_fra_*_cached / _native_board_cached → _punctuality_stats → _merge_into_delay_store
+    → _delay_obs_write_through nach airport_delay_obs). Per-Airport-/Richtungs-
+    try/except, optional zeit-begrenzt (deadline_ts), niemals raise."""
+    import time as _t
+    summary = {}
+    for ap in airports:
+        ap = (ap or '').upper().strip()
+        if not ap:
+            continue
+        ap_out = {'dep': 0, 'arr': 0}
+        for ftype in ('departure', 'arrival'):
+            key = 'dep' if ftype == 'departure' else 'arr'
+            if deadline_ts is not None and _t.time() >= deadline_ts:
+                ap_out[key] = 'skipped_deadline'
+                continue
+            try:
+                if ap in ('FRA', 'EDDF'):
+                    flights = (_fra_day_board_cached(ftype) if ftype == 'departure'
+                               else _fra_board_cached(ftype))
+                else:
+                    rows, _src = (_native_board_cached(ap, ftype) or (None, None))
+                    flights = rows
+                if not flights:
+                    ap_out[key] = 0
+                    continue
+                stats = _punctuality_stats(flights, _store_key_for(ap, ftype))
+                ap_out[key] = stats.get('sample_size') or 0
+            except Exception as e:
+                ap_out[key] = 'err:' + type(e).__name__
+        summary[ap] = ap_out
+    return summary
+
+
+@app.route('/api/internal/scrape-boards', methods=['POST'])
+def internal_scrape_boards():
+    """Server-seitiger Tafel-Scraper (Cloud Scheduler, alle 15-20 Min). Holt für
+    jeden Airport mit FREIEM nativem Echtzeit-Scraper (FRA, MUC, DUS, HAM, BER, HAJ,
+    FMO + die mdfag-Regionalflughäfen) ABFLÜGE und ANKÜNFTE und persistiert jede
+    Zeile über den bestehenden Write-Through nach airport_delay_obs — UNABHÄNGIG von
+    User-Traffic. So füllt sich die Tafel durabel mit ECHTEN estimated/actual-Zeiten
+    (nicht die fake "alles pünktlich"-Scheduled-Quellen). KEINE bezahlte Quelle.
+
+    AUTH (fail-closed): Header `X-Scrape-Secret` (oder ?token=) muss == Env
+    AEROX_SCRAPE_SECRET sein. Ist AEROX_SCRAPE_SECRET NICHT gesetzt → 503 (reject),
+    der Endpoint ist dann komplett zu.
+
+    Antwort: {ok, airports:[…], summary:{IATA:{dep:n, arr:n}}, elapsed_s}.
+    n = persistierte Sample-Size (Flüge mit bekannter sched-Zeit), 0 = Tafel leer/
+    Quelle down, 'err:Typ' = Airport degradierte einzeln (kein Gesamt-Crash).
+
+    WIRING (manuell, einmalig) — siehe Report / gcloud-Befehle unten im Code-Review.
+    """
+    import os as _os, hmac as _hmac, time as _t
+    secret = _os.environ.get('AEROX_SCRAPE_SECRET', '').strip()
+    if not secret:
+        # Kein Secret konfiguriert → Endpoint bleibt geschlossen (fail-closed).
+        return jsonify({'ok': False, 'error': 'scrape_secret_unset'}), 503
+    provided = ((request.headers.get('X-Scrape-Secret')
+                 or request.args.get('token') or '').strip())
+    if not provided or not _hmac.compare_digest(provided, secret):
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    # Zeit-Budget: Cloud-Scheduler-attempt-deadline schützt ohnehin, aber wir
+    # begrenzen die Scrape-Schleife selbst hart, damit kein hängender Airport den
+    # Request über das Deadline-Fenster zieht.
+    try:
+        budget_s = float(_os.environ.get('SCRAPE_BOARDS_BUDGET_S') or '90')
+    except Exception:
+        budget_s = 90.0
+    start = _t.time()
+    airports = _scrape_boards_airports()
+    summary = _scrape_boards_once(airports, deadline_ts=start + budget_s)
+    return jsonify({'ok': True, 'airports': airports, 'summary': summary,
+                    'elapsed_s': round(_t.time() - start, 2)})
 
 
 @app.route('/api/airport/<token>/punctuality', methods=['GET'])
@@ -23426,7 +23999,11 @@ def _ev_extends_duty(summary):
     zählt die Layover-Endzeit (nächster Morgen) als Duty-Ende → Belastung 2-4×
     zu hoch (2026-06 Audit, gegen echten myTime-Roster bewiesen)."""
     up = (summary or '').upper()
-    if 'LAYOVER' in up or 'OFF DAY' in up or up.startswith('OFF') or 'ABSENCE' in up:
+    # OFF nur als eigenständiges Wort matchen (Tages-OFF), NICHT als Präfix —
+    # sonst frisst `startswith('OFF')` ein „Office Day" und nullt dessen echte
+    # DTEND (User-Bug 2026-06-23: Office-Tag verliert Endzeit/Stunden).
+    if 'LAYOVER' in up or 'OFF DAY' in up or 'ABSENCE' in up \
+            or re.match(r'^OFF(?!ICE)', up):
         return False
     return True
 
@@ -23858,6 +24435,13 @@ def import_calendar_feed(token):
             removed_dates = set()
             if feed_dates:
                 fmin, fmax = min(feed_dates), max(feed_dates)
+                # HISTORIE NIE LÖSCHEN (User: Roster 10 J. behalten): das Reconcile-
+                # Fenster beginnt frühestens HEUTE — vergangene Tage sind unveränder-
+                # liche Historie und werden nie geleert. Nur zukünftige Tage, die aus
+                # dem Feed verschwinden (echte Roster-Änderung), werden bereinigt.
+                _today_str = datetime.now().strftime('%Y-%m-%d')
+                if fmin < _today_str:
+                    fmin = _today_str
                 _reconcile_dbg['window'] = f'{fmin}..{fmax}'
                 ical_keys = ('ical_summary', 'ical_location', 'ical_start_iso',
                              'ical_end_iso', 'ical_klass', 'ical_layover_ort',

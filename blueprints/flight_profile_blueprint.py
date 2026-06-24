@@ -6,7 +6,11 @@
 #    ADS-B-Maschine (reg/type) + die geplante Route (adsbdb) gesehen hat,
 #    meldet er eine Beobachtung. Über die Zeit entsteht eine eigene
 #    Flugzeug-/Routen-Historie für genau die Flüge die die Nutzer fliegen.
-#      POST /api/flight/<callsign>/observe   body {date, reg?, type?, dep?, arr?}
+#      POST /api/flight/<callsign>/observe
+#        body {date, reg?, type?, dep?, arr?,
+#              sched?(HH:MM), delay_min?(int), status?(text), cancelled?(bool)}
+#        → schreibt zusätzlich (wenn dep+sched+Delay-Signal da) eine Zeile nach
+#          airport_delay_obs (kanonischer Board-Pfad), keyed auf Abflug-Airport+Tag.
 #      GET  /api/flight/<callsign>/history   → typische Maschine + zuletzt gesehen
 #
 #  Stage 3 — Crew-Ebene:
@@ -102,12 +106,54 @@ def observe_flight(callsign):
     type_code = (body.get('type') or '').strip().upper()[:8] or None
     dep = (body.get('dep') or '').strip().upper()[:4] or None
     arr = (body.get('arr') or '').strip().upper()[:4] or None
+    # Optionale Verspätungs-Felder (back-compat: fehlen sie, ändert sich nichts).
+    # sched = geplante lokale Abflugzeit als 'HH:MM' (Tafel-Diskriminator pro Tag).
+    sched = (body.get('sched') or '').strip()[:5] or None
+    delay_min = body.get('delay_min')
+    try:
+        delay_min = int(delay_min) if delay_min is not None else None
+    except (TypeError, ValueError):
+        delay_min = None
+    status = (body.get('status') or '').strip()[:40] or None
+    cancelled = bool(body.get('cancelled')) if body.get('cancelled') is not None else None
     # Mindestens eine sinnvolle Info nötig, sonst keine leere Zeile schreiben.
     if not (reg or type_code or dep or arr):
         return jsonify({'ok': True, 'skipped': True})
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     row = {'callsign': cs, 'obs_date': date, 'reg': reg, 'type_code': type_code,
            'dep': dep, 'arr': arr, 'last_seen': now}
+    # Delay/Status nur mit-upserten wenn der Client sie geschickt hat — sonst die
+    # Spalten NICHT anfassen (None würde eine frühere Beobachtung überschreiben).
+    if sched is not None:
+        row['sched'] = sched
+    if delay_min is not None:
+        row['delay_min'] = delay_min
+    if status is not None:
+        row['status'] = status
+    if cancelled is not None:
+        row['cancelled'] = cancelled
+
+    # Write-Through in den Tafel/Pünktlichkeits-Store (airport_delay_obs), keyed
+    # auf ABFLUG-Airport + Betriebstag — gleicher kanonischer Pfad wie das Board
+    # (_delay_obs_write_through). So liest Route-History/Tafel die Verspätung
+    # später zurück, auch wenn an dem Tag niemand das Board geöffnet hat.
+    # Nur wenn genug da ist (sched + irgendein Delay-Signal) und ein Abflughafen.
+    if dep and sched and (delay_min is not None or status or cancelled is not None):
+        try:
+            wt = _app_attr('_delay_obs_write_through')
+            icao2iata = _app_attr('_icao_to_iata_best')
+            if callable(wt):
+                dep_iata = (icao2iata(dep) if callable(icao2iata) else dep) or dep
+                dep_iata = (dep_iata or '').upper()[:4]
+                arr_iata = ''
+                if arr and callable(icao2iata):
+                    arr_iata = (icao2iata(arr) or '').upper()
+                meta = {'dest_iata': arr_iata} if arr_iata else None
+                wt(date, cs, sched, int(delay_min or 0),
+                   bool(cancelled), dep_iata, status, meta)
+        except Exception as e:
+            _log().info(f'[flight-obs] delay_wt_skip {type(e).__name__}: {str(e)[:120]}')
+
     sb_avail, sb = _get_sb()
     if sb_avail and sb is not None:
         try:

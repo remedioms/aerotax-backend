@@ -81,7 +81,7 @@ def build():
             iata TEXT, icao TEXT, name TEXT, callsign TEXT, country TEXT, active TEXT);
         CREATE TABLE aircraft (
             hex TEXT PRIMARY KEY, reg TEXT, typecode TEXT, manufacturer TEXT,
-            model TEXT, operator TEXT, owner TEXT, built INTEGER, category TEXT);
+            model TEXT, operator TEXT, owner TEXT, built INTEGER, built_date TEXT, category TEXT);
         CREATE TABLE aircraft_types (
             typecode TEXT PRIMARY KEY, class TEXT, engines TEXT,
             manufacturer TEXT, model TEXT, name TEXT);
@@ -188,24 +188,28 @@ def build():
         hexid = hexid.strip().lower()
         built = acol(r, 'built')
         year = None
+        built_date = None
         if built:
             # Formate: "1998", "1998-03-12", "1998-03-12T..."
             try:
                 year = int(built[:4])
                 if year < 1930 or year > 2100:
                     year = None
+                # Volles Datum (YYYY-MM-DD) mitnehmen → tagesgenaues Alter (User).
+                elif len(built) >= 10 and built[4] == '-' and built[7] == '-':
+                    built_date = built[:10]
             except ValueError:
                 year = None
         batch.append((
             hexid, acol(r, 'registration'), acol(r, 'typecode'),
             acol(r, 'manufacturername') or acol(r, 'manufacturericao'),
             acol(r, 'model'), acol(r, 'operator'), acol(r, 'owner'),
-            year, acol(r, 'categoryDescription')))
+            year, built_date, acol(r, 'categoryDescription')))
         if len(batch) >= 20000:
-            db.executemany('INSERT OR IGNORE INTO aircraft VALUES (?,?,?,?,?,?,?,?,?)', batch)
+            db.executemany('INSERT OR IGNORE INTO aircraft VALUES (?,?,?,?,?,?,?,?,?,?)', batch)
             n += len(batch); batch = []
     if batch:
-        db.executemany('INSERT OR IGNORE INTO aircraft VALUES (?,?,?,?,?,?,?,?,?)', batch)
+        db.executemany('INSERT OR IGNORE INTO aircraft VALUES (?,?,?,?,?,?,?,?,?,?)', batch)
         n += len(batch)
     counts['aircraft'] = n
 
