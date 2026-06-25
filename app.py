@@ -8921,19 +8921,11 @@ def user_entitlement(token):
     # Kohorten-Stempel: persistiertes pro_first_seen → echtes Auth-Signup-Datum →
     # sonst JETZT (und einmalig persistieren). So gilt jeder, der die App vor dem
     # Wall-Datum öffnet, als Gründungs-Crew, auch ohne E-Mail-Signup (Apple/Family).
-    seen = prof.get('pro_first_seen') or _auth_created_at_for_token(token)
-    if not seen:
-        seen = datetime.now().isoformat()
-    if not prof.get('pro_first_seen'):
-        try:
-            prof['pro_first_seen'] = seen
-            disk_full = dict(loaded)
-            disk_full['token'] = token
-            disk_full['profile'] = prof
-            disk_full['_updated_at'] = datetime.now().isoformat()
-            _profile_save(token, prof, full_disk_payload=disk_full)
-        except Exception:
-            pass
+    # KEIN Profil-Re-Save hier — ein partielles Save würde andere Felder (z.B.
+    # account_type → Family!) clobbern. Wer die App vor dem Wall-Datum öffnet,
+    # rechnet ohnehin seen=jetzt < Wall = Gründungs-Crew; das reicht.
+    seen = prof.get('pro_first_seen') or _auth_created_at_for_token(token) \
+        or datetime.now().isoformat()
     today = datetime.now().date().isoformat()
     seen_date = str(seen)[:10]
     if is_family:
