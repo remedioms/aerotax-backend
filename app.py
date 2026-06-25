@@ -8887,6 +8887,66 @@ def _public_profile_projection(token):
     return {'token': token, 'profile': public}
 
 
+# ── Paywall-Rollout (User 2026-06-25) ────────────────────────────────────────
+# Modell: Die Bezahlschranke aktiviert 6 Monate nach Launch (WALL_DATE). Wer
+# VOR dem Wall-Datum schon da war ("Gründungs-Crew") bekommt danach NOCHMAL
+# 6 Monate gratis (bis GRANDFATHER_UNTIL); erst dann 11,99 €/Jahr. Wer ERST
+# AB dem Wall-Datum dazukommt, bekommt die 1-Woche-Apple-Trial und dann 11,99 €.
+# Family-Accounts sind FÜR IMMER gratis. Die App liest diesen Endpoint und
+# blendet die Wall genau dann ein, wenn pro_required==true und kein aktives Abo.
+_PAYWALL_WALL_DATE = '2026-12-25'          # +6 Monate ab Launch (2026-06-25)
+_PAYWALL_GRANDFATHER_UNTIL = '2027-06-25'  # Gründungs-Crew: nochmal +6 Monate
+
+
+def _auth_created_at_for_token(token):
+    """Echtes Signup-Datum (E-Mail-Auth) für einen Token, falls vorhanden."""
+    try:
+        for v in (_auth_load() or {}).values():
+            if isinstance(v, dict) and v.get('token') == token:
+                return v.get('created_at')
+    except Exception:
+        pass
+    return None
+
+
+@app.route('/api/user/entitlement/<token>', methods=['GET'])
+def user_entitlement(token):
+    """Sagt der App, ob die Bezahlschranke für diesen User gilt — siehe Paywall-
+    Rollout-Kommentar oben. Antwort: {ok, pro_required, free_until, family}."""
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    loaded = _profile_load(token) or {}
+    prof = dict(loaded.get('profile') or {})
+    is_family = (prof.get('account_type') == 'family')
+    # Kohorten-Stempel: persistiertes pro_first_seen → echtes Auth-Signup-Datum →
+    # sonst JETZT (und einmalig persistieren). So gilt jeder, der die App vor dem
+    # Wall-Datum öffnet, als Gründungs-Crew, auch ohne E-Mail-Signup (Apple/Family).
+    seen = prof.get('pro_first_seen') or _auth_created_at_for_token(token)
+    if not seen:
+        seen = datetime.now().isoformat()
+    if not prof.get('pro_first_seen'):
+        try:
+            prof['pro_first_seen'] = seen
+            disk_full = dict(loaded)
+            disk_full['token'] = token
+            disk_full['profile'] = prof
+            disk_full['_updated_at'] = datetime.now().isoformat()
+            _profile_save(token, prof, full_disk_payload=disk_full)
+        except Exception:
+            pass
+    today = datetime.now().date().isoformat()
+    seen_date = str(seen)[:10]
+    if is_family:
+        return jsonify({'ok': True, 'pro_required': False,
+                        'free_until': None, 'family': True})
+    # Vor dem Wall-Datum dabei → Gründungs-Crew (+6 Monate). Sonst sofort
+    # (die Apple-1-Woche-Trial deckt die Probephase ab).
+    free_until = _PAYWALL_GRANDFATHER_UNTIL if seen_date < _PAYWALL_WALL_DATE else seen_date
+    pro_required = today >= free_until
+    return jsonify({'ok': True, 'pro_required': pro_required,
+                    'free_until': free_until, 'family': False})
+
+
 @app.route('/api/user/profile/<token>', methods=['GET'])
 def get_user_profile(token):
     # PUBLIC-BY-DESIGN (BUG-004 audit, 2026-06-02): Profile-Lookup ist im
