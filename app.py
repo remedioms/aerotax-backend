@@ -8176,6 +8176,66 @@ def _send_support_email_notification(record):
         print(f"[support-mail] send fail: {e}")
 
 
+def _send_report_email_notification(entry):
+    """Schickt eine Notification-Mail bei neuer Inhalts-Meldung (Forum/Wall/Chat)
+    via Resend. Best-effort — der Report gilt auch ohne Mail als gespeichert.
+    Empfänger: SUPPORT_NOTIFY_EMAIL (Default aerox@aerosteuer.de → Cloudflare-
+    Routing leitet an den Betreiber weiter)."""
+    api_key = os.environ.get('RESEND_API_KEY', '').strip()
+    to_email = os.environ.get('SUPPORT_NOTIFY_EMAIL', 'aerox@aerosteuer.de').strip()
+    if not api_key:
+        print("[report-mail] RESEND_API_KEY nicht gesetzt — überspringe Email-Notification")
+        return
+    try:
+        import urllib.request, urllib.error
+        import html as _html
+        # CRLF-sicher für Subject-Header (reason ist server-seitig auf 64 gekappt,
+        # aber free-form → gegen Header-Injection bereinigen).
+        def _hdr_safe(s):
+            return (str(s or '').replace('\r', ' ').replace('\n', ' ')[:120]).strip()
+        e_kind    = _html.escape(str(entry.get('kind', '') or ''))
+        e_reason  = _html.escape(str(entry.get('reason', '') or ''))
+        e_target  = _html.escape(str(entry.get('target_id', '') or '') or '—')
+        e_ttoken  = _html.escape(str(entry.get('target_token', '') or '') or '—')
+        e_note    = _html.escape(str(entry.get('note', '') or '') or '—')
+        e_rid     = _html.escape(str(entry.get('id', '') or ''))
+        e_reporter = _html.escape(str(entry.get('reporter_token', '') or '')[:8] + '…')
+        subject = f"[AeroX Meldung] {_hdr_safe(entry.get('reason'))} · {_hdr_safe(entry.get('kind'))}"
+        html_body = (
+            f"<h2 style='font-family:sans-serif'>Neue Inhalts-Meldung</h2>"
+            f"<p style='font-family:sans-serif;color:#444'>"
+            f"<b>Grund:</b> {e_reason}<br>"
+            f"<b>Typ:</b> {e_kind}<br>"
+            f"<b>Inhalt-ID:</b> {e_target}<br>"
+            f"<b>Gemeldeter Nutzer:</b> {e_ttoken}<br>"
+            f"<b>Melder:</b> {e_reporter}<br>"
+            f"<b>Report-ID:</b> {e_rid}"
+            f"</p>"
+            f"<div style='background:#f5f5f7;border-radius:8px;padding:16px;font-family:sans-serif;white-space:pre-wrap;color:#222;border-left:3px solid #dc2626'>"
+            f"{e_note}"
+            f"</div>"
+        )
+        payload = json.dumps({
+            'from': 'AeroX Moderation <support@aerosteuer.de>',
+            'to': [to_email],
+            'subject': subject,
+            'html': html_body,
+        }).encode()
+        req = urllib.request.Request(
+            'https://api.resend.com/emails',
+            data=payload,
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json',
+                     'User-Agent': 'AeroX-Backend/1.0'},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                print(f"[report-mail] sent to {to_email}")
+            else:
+                print(f"[report-mail] unexpected status {resp.status}")
+    except Exception as e:
+        print(f"[report-mail] send fail: {e}")
+
+
 @app.route('/api/admin/support-list', methods=['GET'])
 def admin_support_list():
     """Liest gespeicherte Support-Anfragen — geschützt durch Token-Header.
@@ -23388,6 +23448,11 @@ def moderation_report(token):
                     _wall_save_posts(posts)
         except Exception:
             pass
+    # ── Email-Notification an Betreiber via Resend (best-effort, blockt nicht) ──
+    try:
+        _send_report_email_notification(entry)
+    except Exception:
+        pass
     return jsonify({'ok': True, 'report_id': entry['id'], 'hidden': auto_hidden})
 
 
