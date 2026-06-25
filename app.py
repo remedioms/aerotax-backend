@@ -24150,6 +24150,14 @@ def _ics_events_to_briefings(events, existing=None):
     # werden — sonst akkumuliert jeder Re-Sync auf den persistierten Wert (Bug:
     # 224h/28d). Dieses Set merkt, welche Tage in DIESEM Lauf schon genullt wurden.
     block_reset_dates = set()
+    # REPLACE-NOT-ACCUMULATE (2026-06-25): Tage, die DIESER Import-Lauf schon
+    # einmal angefasst hat. Beim ERSTEN Anfassen wird der Tag FRISCH aufgebaut
+    # (die zuvor gespeicherten iCal-Legs des Tages werden verworfen), damit ein
+    # geänderter Roster nicht alte + neue Legs mischt (Bug „FCO/JFK gemischt" —
+    # JFK-Trip → krank → Ersatz-Trip, alte Legs blieben hängen). Tage, die dieser
+    # Import NICHT enthält (alte Historie außerhalb des ~2-Monats-Fensters), bleiben
+    # unangetastet — wir löschen NIE Tage, die der neue Feed nicht abdeckt.
+    rebuilt_dates = set()
     for ev in events:
         # F2: ein Event kann an mehreren Tagen zählen.
         days = ev.get('_multiday_dates') or []
@@ -24205,7 +24213,15 @@ def _ics_events_to_briefings(events, existing=None):
         for i, date_str in enumerate(days):
             if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
                 continue
-            existing_b = briefings.get(date_str) or {}
+            # Erstes Anfassen in DIESEM Lauf → frisch aufbauen (alte iCal-Legs des
+            # Tages verwerfen). Weitere VEVENTs DESSELBEN Tages in DIESEM Lauf
+            # mergen weiter zusammen. (Manuelle Briefings liegen in einer separaten
+            # Tabelle und werden erst in get_briefings gemerged → bleiben erhalten.)
+            if date_str in rebuilt_dates:
+                existing_b = briefings.get(date_str) or {}
+            else:
+                existing_b = {}
+                rebuilt_dates.add(date_str)
             # Multi-Day-Marker bei Tagen 2..N: Summary erweitert um " (Tag k/N)"
             day_summary = summary
             if len(days) > 1 and summary:
