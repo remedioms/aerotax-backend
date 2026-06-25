@@ -8176,11 +8176,170 @@ def _send_support_email_notification(record):
         print(f"[support-mail] send fail: {e}")
 
 
+_PUBLIC_BASE_URL = os.environ.get(
+    'PUBLIC_BASE_URL',
+    'https://aerotax-backend-443401186607.europe-west3.run.app').strip()
+
+
+def _admin_mod_secret():
+    return os.environ.get('ADMIN_MODERATION_SECRET', '').strip()
+
+
+def _reports_log_path():
+    return os.path.join(_USER_HISTORY_DIR, 'reports_log.json')
+
+
+def _load_reports():
+    try:
+        with open(_reports_log_path()) as f:
+            return json.load(f) or []
+    except Exception:
+        return []
+
+
+def _save_reports(reports):
+    try:
+        _atomic_write_json(_reports_log_path(), reports)
+    except Exception:
+        try:
+            with open(_reports_log_path(), 'w') as f:
+                json.dump(reports, f)
+        except Exception:
+            pass
+
+
+def _resolve_reported_content(kind, target_id):
+    """Best-effort: holt den tatsächlichen Text eines gemeldeten Items, damit man
+    in Mail/Panel SIEHT was gemeldet wurde. Returns {text, author_token,
+    author_name} oder None wenn nicht auflösbar (z.B. chat_msg/layoverrec)."""
+    try:
+        raw = target_id or ''
+        tid = raw[5:] if raw.startswith('wall:') else raw
+        if kind == 'wall_post' or (kind == 'forum_thread' and raw.startswith('wall:')):
+            p = next((x for x in _wall_load_posts() if x.get('id') == tid), None)
+            if p:
+                return {'text': p.get('text') or '', 'author_token': p.get('author_token') or '',
+                        'author_name': p.get('author_name') or p.get('author_short') or ''}
+        if kind == 'forum_thread':
+            t = next((x for x in _forum_load_threads() if x.get('id') == tid), None)
+            if t:
+                txt = ((t.get('title') or '') + '\n' + (t.get('body') or '')).strip()
+                return {'text': txt, 'author_token': t.get('author_token') or '',
+                        'author_name': t.get('author_name') or ''}
+        if kind == 'forum_reply':
+            import glob
+            for fp in glob.glob(os.path.join(_forum_dir(), 'replies_*.json')):
+                try:
+                    with open(fp) as f:
+                        reps = json.load(f) or []
+                except Exception:
+                    continue
+                r = next((x for x in reps if x.get('id') == tid), None)
+                if r:
+                    return {'text': r.get('body') or '', 'author_token': r.get('author_token') or '',
+                            'author_name': r.get('author_name') or ''}
+        if kind == 'wall_comment':
+            import glob
+            for fp in glob.glob(os.path.join(_wall_dir(), 'comments_*.json')):
+                try:
+                    with open(fp) as f:
+                        cs = json.load(f) or []
+                except Exception:
+                    continue
+                c = next((x for x in cs if x.get('id') == tid), None)
+                if c:
+                    return {'text': c.get('text') or c.get('body') or '',
+                            'author_token': c.get('author_token') or '',
+                            'author_name': c.get('author_name') or c.get('author_short') or ''}
+    except Exception:
+        pass
+    return None
+
+
+def _admin_delete_content(kind, target_id):
+    """Admin-Override-Löschung OHNE Author-Check. Returns (ok, detail)."""
+    try:
+        raw = target_id or ''
+        tid = raw[5:] if raw.startswith('wall:') else raw
+        if kind == 'wall_post' or (kind == 'forum_thread' and raw.startswith('wall:')):
+            posts = _wall_load_posts()
+            tp = next((p for p in posts if p.get('id') == tid), None)
+            if not tp:
+                return False, 'not_found'
+            _wall_save_posts([p for p in posts if p is not tp])
+            if SB_AVAILABLE:
+                for tbl, col in (('wall_posts', 'id'), ('wall_comments', 'post_id'),
+                                 ('wall_likes', 'post_id')):
+                    try:
+                        sb.table(tbl).delete().eq(col, tid).execute()
+                    except Exception:
+                        pass
+            return True, 'deleted'
+        if kind == 'forum_thread':
+            threads = _forum_load_threads()
+            tt = next((t for t in threads if t.get('id') == tid), None)
+            if not tt:
+                return False, 'not_found'
+            _forum_save_threads([t for t in threads if t is not tt])
+            if SB_AVAILABLE:
+                for tbl, col in (('forum_threads', 'id'), ('forum_replies', 'thread_id')):
+                    try:
+                        sb.table(tbl).delete().eq(col, tid).execute()
+                    except Exception:
+                        pass
+            return True, 'deleted'
+        if kind == 'forum_reply':
+            import glob
+            for fp in glob.glob(os.path.join(_forum_dir(), 'replies_*.json')):
+                try:
+                    with open(fp) as f:
+                        reps = json.load(f) or []
+                except Exception:
+                    continue
+                hit = next((r for r in reps if r.get('id') == tid), None)
+                if hit:
+                    _forum_save_replies(hit.get('thread_id'), [r for r in reps if r is not hit])
+                    if SB_AVAILABLE:
+                        try:
+                            sb.table('forum_replies').delete().eq('id', tid).execute()
+                        except Exception:
+                            pass
+                    return True, 'deleted'
+            return False, 'not_found'
+        if kind == 'wall_comment':
+            import glob
+            for fp in glob.glob(os.path.join(_wall_dir(), 'comments_*.json')):
+                try:
+                    with open(fp) as f:
+                        cs = json.load(f) or []
+                except Exception:
+                    continue
+                hit = next((c for c in cs if c.get('id') == tid), None)
+                if hit:
+                    new = [c for c in cs if c is not hit]
+                    try:
+                        _atomic_write_json(fp, new)
+                    except Exception:
+                        with open(fp, 'w') as f:
+                            json.dump(new, f)
+                    if SB_AVAILABLE:
+                        try:
+                            sb.table('wall_comments').delete().eq('id', tid).execute()
+                        except Exception:
+                            pass
+                    return True, 'deleted'
+            return False, 'not_found'
+    except Exception as e:
+        return False, str(e)[:120]
+    return False, 'unsupported_kind'
+
+
 def _send_report_email_notification(entry):
     """Schickt eine Notification-Mail bei neuer Inhalts-Meldung (Forum/Wall/Chat)
     via Resend. Best-effort — der Report gilt auch ohne Mail als gespeichert.
     Empfänger: SUPPORT_NOTIFY_EMAIL (Default aerox@aerosteuer.de → Cloudflare-
-    Routing leitet an den Betreiber weiter)."""
+    Routing leitet an den Betreiber weiter). Enthält den gemeldeten Inhalt +
+    Direktlink ins Moderations-Panel zum sofortigen Löschen."""
     api_key = os.environ.get('RESEND_API_KEY', '').strip()
     to_email = os.environ.get('SUPPORT_NOTIFY_EMAIL', 'aerox@aerosteuer.de').strip()
     if not api_key:
@@ -8189,8 +8348,7 @@ def _send_report_email_notification(entry):
     try:
         import urllib.request, urllib.error
         import html as _html
-        # CRLF-sicher für Subject-Header (reason ist server-seitig auf 64 gekappt,
-        # aber free-form → gegen Header-Injection bereinigen).
+
         def _hdr_safe(s):
             return (str(s or '').replace('\r', ' ').replace('\n', ' ')[:120]).strip()
         e_kind    = _html.escape(str(entry.get('kind', '') or ''))
@@ -8200,20 +8358,43 @@ def _send_report_email_notification(entry):
         e_note    = _html.escape(str(entry.get('note', '') or '') or '—')
         e_rid     = _html.escape(str(entry.get('id', '') or ''))
         e_reporter = _html.escape(str(entry.get('reporter_token', '') or '')[:8] + '…')
+        # Tatsächlichen gemeldeten Inhalt auflösen (best-effort).
+        content = _resolve_reported_content(entry.get('kind', ''), entry.get('target_id', ''))
+        if content and (content.get('text') or '').strip():
+            e_content = _html.escape(content['text'][:1500])
+            e_author = _html.escape(content.get('author_name') or content.get('author_token') or '—')
+        else:
+            e_content = "(Inhalt nicht automatisch auflösbar — im Panel prüfen)"
+            e_author = e_ttoken
+        # Direktlink ins Moderations-Panel.
+        _secret = _admin_mod_secret()
+        if _secret:
+            panel_url = f"{_PUBLIC_BASE_URL}/api/admin/moderate/{_secret}"
+            panel_btn = (
+                f"<p style='margin-top:20px'>"
+                f"<a href='{_html.escape(panel_url)}' style='background:#2563eb;color:#fff;"
+                f"text-decoration:none;padding:11px 20px;border-radius:8px;font-family:sans-serif;"
+                f"font-weight:600'>→ Im Moderations-Panel öffnen &amp; löschen</a></p>")
+        else:
+            panel_btn = ("<p style='color:#888;font-size:12px;font-family:sans-serif'>"
+                         "(Admin-Panel nicht konfiguriert — ADMIN_MODERATION_SECRET setzen)</p>")
         subject = f"[AeroX Meldung] {_hdr_safe(entry.get('reason'))} · {_hdr_safe(entry.get('kind'))}"
         html_body = (
             f"<h2 style='font-family:sans-serif'>Neue Inhalts-Meldung</h2>"
             f"<p style='font-family:sans-serif;color:#444'>"
             f"<b>Grund:</b> {e_reason}<br>"
             f"<b>Typ:</b> {e_kind}<br>"
-            f"<b>Inhalt-ID:</b> {e_target}<br>"
-            f"<b>Gemeldeter Nutzer:</b> {e_ttoken}<br>"
+            f"<b>Autor des Inhalts:</b> {e_author}<br>"
+            f"<b>Gemeldeter Nutzer-Token:</b> {e_ttoken}<br>"
             f"<b>Melder:</b> {e_reporter}<br>"
-            f"<b>Report-ID:</b> {e_rid}"
+            f"<b>Inhalt-ID:</b> {e_target} · <b>Report-ID:</b> {e_rid}"
             f"</p>"
-            f"<div style='background:#f5f5f7;border-radius:8px;padding:16px;font-family:sans-serif;white-space:pre-wrap;color:#222;border-left:3px solid #dc2626'>"
-            f"{e_note}"
-            f"</div>"
+            f"<p style='font-family:sans-serif;font-weight:600;margin-bottom:4px'>Gemeldeter Inhalt:</p>"
+            f"<div style='background:#fff4f4;border-radius:8px;padding:16px;font-family:sans-serif;"
+            f"white-space:pre-wrap;color:#222;border-left:3px solid #dc2626'>{e_content}</div>"
+            f"<p style='font-family:sans-serif;font-size:13px;color:#555;margin-top:12px'>"
+            f"<b>Notiz des Melders:</b> {e_note}</p>"
+            f"{panel_btn}"
         )
         payload = json.dumps({
             'from': 'AeroX Moderation <support@aerosteuer.de>',
@@ -8234,6 +8415,108 @@ def _send_report_email_notification(entry):
                 print(f"[report-mail] unexpected status {resp.status}")
     except Exception as e:
         print(f"[report-mail] send fail: {e}")
+
+
+@app.route('/api/admin/moderate/<secret>', methods=['GET'])
+def admin_moderate_panel(secret):
+    """Passwortgeschützte Moderations-Inbox: zeigt alle Meldungen MIT dem echten
+    gemeldeten Inhalt und erlaubt Löschen/Erledigt per Klick. Schutz: geheimer
+    Pfad-Token == env ADMIN_MODERATION_SECRET (hmac.compare_digest)."""
+    import hmac
+    import html as _html
+    s = _admin_mod_secret()
+    if not s or not hmac.compare_digest(str(secret), s):
+        return ('forbidden', 403)
+    reports = _load_reports()
+    reports = sorted(reports, key=lambda r: ((r.get('status') == 'resolved'),
+                                             -(r.get('ts') or 0)))
+    open_n = sum(1 for r in reports if r.get('status') != 'resolved')
+    cards = []
+    for r in reports[:300]:
+        kind = r.get('kind', '')
+        c = _resolve_reported_content(kind, r.get('target_id', ''))
+        if c and (c.get('text') or '').strip():
+            content_html = _html.escape(c['text'][:3000])
+            author = _html.escape(c.get('author_name') or c.get('author_token') or '—')
+        else:
+            content_html = "<i style='color:#999'>(Inhalt nicht auto-auflösbar — Typ %s)</i>" % _html.escape(kind)
+            author = _html.escape(r.get('target_token', '') or '—')
+        status = r.get('status', 'pending')
+        badge = ("<span style='color:#16a34a'>✅ erledigt</span>" if status == 'resolved'
+                 else "<span style='color:#dc2626'>🔴 offen</span>")
+        try:
+            when = datetime.fromtimestamp(r.get('ts') or 0).strftime('%d.%m.%Y %H:%M')
+        except Exception:
+            when = '—'
+        rid = _html.escape(r.get('id', ''))
+        e_kind = _html.escape(kind)
+        e_reason = _html.escape(r.get('reason', ''))
+        e_note = _html.escape(r.get('note', '') or '—')
+        e_tid = _html.escape(r.get('target_id', ''))
+        e_sec = _html.escape(str(secret))
+        buttons = (
+            f"<form method='post' action='/api/admin/moderate/{e_sec}/act' style='display:inline'>"
+            f"<input type='hidden' name='report_id' value='{rid}'>"
+            f"<input type='hidden' name='kind' value='{e_kind}'>"
+            f"<input type='hidden' name='target_id' value='{e_tid}'>"
+            f"<button name='action' value='delete' "
+            f"onclick=\"return confirm('Inhalt wirklich löschen?')\" "
+            f"style='background:#dc2626;color:#fff;border:0;padding:9px 16px;border-radius:8px;"
+            f"cursor:pointer;font-weight:600'>Inhalt löschen</button> "
+            f"<button name='action' value='resolve' "
+            f"style='background:#6b7280;color:#fff;border:0;padding:9px 16px;border-radius:8px;"
+            f"cursor:pointer'>Als erledigt markieren</button>"
+            f"</form>") if status != 'resolved' else "<i style='color:#999;font-size:13px'>%s</i>" % _html.escape(r.get('resolution', 'erledigt'))
+        cards.append(
+            f"<div style='border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin:14px 0'>"
+            f"<div style='font-size:12px;color:#888'>{badge} · {e_kind} · {when} · report {rid}</div>"
+            f"<div style='margin:8px 0'><b>Grund:</b> {e_reason} &nbsp;·&nbsp; <b>Autor:</b> {author}</div>"
+            f"<div style='background:#f7f7f8;border-left:3px solid #dc2626;border-radius:8px;"
+            f"padding:12px;white-space:pre-wrap;color:#222;margin:8px 0'>{content_html}</div>"
+            f"<div style='font-size:13px;color:#555'><b>Notiz des Melders:</b> {e_note}</div>"
+            f"<div style='margin-top:12px'>{buttons}</div>"
+            f"</div>")
+    page = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>AeroX Moderation</title></head>"
+        "<body style='font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:780px;"
+        "margin:0 auto;padding:20px;background:#fff;color:#111'>"
+        "<h1 style='margin-bottom:4px'>AeroX Moderation</h1>"
+        f"<p style='color:#888;margin-top:0'>{open_n} offen · {len(reports)} gesamt</p>"
+        f"{''.join(cards) or '<p>Keine Meldungen.</p>'}"
+        "</body></html>")
+    return page
+
+
+@app.route('/api/admin/moderate/<secret>/act', methods=['POST'])
+def admin_moderate_act(secret):
+    """Führt eine Moderations-Aktion aus (delete|resolve) und markiert den Report
+    als erledigt. Gleicher Secret-Schutz wie das Panel."""
+    import hmac
+    from flask import redirect
+    s = _admin_mod_secret()
+    if not s or not hmac.compare_digest(str(secret), s):
+        return ('forbidden', 403)
+    action = (request.form.get('action') or '').strip()
+    report_id = (request.form.get('report_id') or '').strip()
+    kind = (request.form.get('kind') or '').strip()
+    target_id = (request.form.get('target_id') or '').strip()
+    detail = ''
+    if action == 'delete':
+        ok, detail = _admin_delete_content(kind, target_id)
+        resolution = f"gelöscht ({detail})" if ok else f"löschen fehlgeschlagen ({detail})"
+    else:
+        resolution = "als erledigt markiert"
+    reports = _load_reports()
+    for r in reports:
+        if r.get('id') == report_id:
+            r['status'] = 'resolved'
+            r['resolved_ts'] = time.time()
+            r['resolution'] = resolution
+            break
+    _save_reports(reports)
+    return redirect(f'/api/admin/moderate/{secret}')
 
 
 @app.route('/api/admin/support-list', methods=['GET'])
@@ -23431,23 +23714,10 @@ def moderation_report(token):
         try:
             with open(reports_p, 'w') as f: json.dump(reports, f)
         except Exception: pass
-    # Auto-Hide: ab N DISTINCT-Reportern einen Wall-Post verstecken. Der Feed
-    # (get_wall_feed) filtert hidden raus — außer für den Author selbst.
+    # KEIN Auto-Hide/Auto-Delete mehr (User-Entscheid 2026-06-25): Meldungen
+    # werden NICHT automatisch bei N Reportern versteckt. Der Betreiber bekommt
+    # jede Meldung per Mail + Panel und entscheidet manuell (löschen/erledigt).
     auto_hidden = False
-    if kind == 'wall_post' and target_id:
-        try:
-            reporters = {r.get('reporter_token') for r in reports
-                         if r.get('kind') == 'wall_post' and r.get('target_id') == target_id}
-            if len(reporters) >= _WALL_REPORT_HIDE_THRESHOLD:
-                posts = _wall_load_posts()
-                for p in posts:
-                    if p.get('id') == target_id and not p.get('hidden'):
-                        p['hidden'] = True; auto_hidden = True
-                        break
-                if auto_hidden:
-                    _wall_save_posts(posts)
-        except Exception:
-            pass
     # ── Email-Notification an Betreiber via Resend (best-effort, blockt nicht) ──
     try:
         _send_report_email_notification(entry)
