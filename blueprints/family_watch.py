@@ -410,6 +410,10 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         'today_arr_iata': None,
         'today_dep_iso': None,
         'today_arr_iso': None,
+        # Zuhause/Feierabend: heute an der Homebase (reiner Heimtag) ODER nach
+        # Landung an der Homebase (Dienst vorbei) — die Card zeigt „Feierabend"
+        # statt eines falschen Layovers (User 2026-06-25).
+        'home_now': None,
     }
     try:
         # SB-primary statt Disk: auf Cloud Run ist die Profil-Disk-Datei ephemer/
@@ -554,6 +558,8 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         status['today_arr_iso'] = today_arr_iso
     if 'layover_place' in allowed_fields:
         status['layover_place'] = roster_layover
+        # Feierabend/Zuhause: heute an der Homebase und NICHT gerade in der Luft.
+        status['home_now'] = bool(roster_today_home) and not flying_now
     # Reconcile current_city gegen den Roster: wenn der heutige Plan POSITIV an
     # der Homebase liegt (roster_today_home — erstes ical_location-Token == hb),
     # ist die Crew laut Plan zuhause — eine widersprechende GPS-Stadt (anderer
@@ -609,6 +615,15 @@ def _crew_short_name(crew_token):
     if isinstance(n, str) and n.strip():
         return n.strip()
     return 'AeroX-Crew'
+
+
+def _crew_avatar(crew_token):
+    """Profilfoto-URL der Crew für die Family-Avatare (User 2026-06-25: „Avatars
+    mit Profilfoto oben, ein Klick wechselt zwischen mehreren Crew"). Nur die
+    öffentliche avatar_url — kein Token/PII."""
+    prof = _load_crew_profile(crew_token) or {}
+    a = prof.get('avatar_url')
+    return a if (isinstance(a, str) and a.strip()) else None
 
 
 def _crew_homebase(crew_token):
@@ -887,7 +902,7 @@ def family_watch_feed(token):
         out.append({
             'crew_token': opaque_id,
             'crew_short_name': _crew_short_name(crew_token),
-            'crew_avatar_url': None,
+            'crew_avatar_url': _crew_avatar(crew_token),
             'status': status,
             'allowed_fields': fields_clean,
         })
