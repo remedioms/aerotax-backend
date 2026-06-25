@@ -17132,7 +17132,7 @@ def serve_layover_image(token_safe, fname):
 
 @app.route('/api/layover-recs/<token>/add', methods=['POST'])
 def add_layover_rec(token):
-    """Body: {iata, category, title, description, rating, price_band, location_hint?}"""
+    """Body: {iata, category, title, description, rating, price_band, location_hint?, lat?, lon?}"""
     body = request.get_json(silent=True) or {}
     iata = (body.get('iata') or '').strip().upper()
     cat = (body.get('category') or 'other').lower()
@@ -17141,6 +17141,21 @@ def add_layover_rec(token):
     rating = body.get('rating')
     price = (body.get('price_band') or '').strip()
     location_hint = (body.get('location_hint') or '').strip()[:200]
+    # Optionale, vom Autor gepickte Pin-Koordinate (Karten-Picker im Composer).
+    # Backward-compatible: fehlt/ungültig → None (Rec wird per Titel/Katalog gemappt).
+    def _parse_coord(v, lo, hi):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        if f != f or f < lo or f > hi:  # NaN / out-of-range
+            return None
+        return f
+    lat = _parse_coord(body.get('lat'), -90.0, 90.0)
+    lon = _parse_coord(body.get('lon'), -180.0, 180.0)
+    # (0,0) = „nichts gesetzt"-Sentinel (Null-Insel), kein echter Pick.
+    if (lat == 0.0 and lon == 0.0) or lat is None or lon is None:
+        lat = lon = None
     if len(iata) != 3 or not iata.isalpha():
         return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
     if cat not in LAYOVER_CATEGORIES: cat = 'other'
@@ -17165,6 +17180,8 @@ def add_layover_rec(token):
         'rating': rating_n,
         'price_band': price,
         'location_hint': location_hint,
+        'lat': lat,
+        'lon': lon,
         'author_short': token[:8],
         'created_at': datetime.now().isoformat(),
         'ts': time.time(),
