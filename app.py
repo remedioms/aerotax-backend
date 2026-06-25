@@ -8933,10 +8933,15 @@ def user_entitlement(token):
                         'free_until': None, 'family': True})
     # Vor dem Wall-Datum dabei → Gründungs-Crew (+6 Monate). Sonst sofort
     # (die Apple-1-Woche-Trial deckt die Probephase ab).
-    free_until = _PAYWALL_GRANDFATHER_UNTIL if seen_date < _PAYWALL_WALL_DATE else seen_date
+    founding = seen_date < _PAYWALL_WALL_DATE
+    free_until = _PAYWALL_GRANDFATHER_UNTIL if founding else seen_date
     pro_required = today >= free_until
+    # „Danke schön"-Phase: die Gründungs-Crew-Gnadenfrist läuft GERADE (ab dem
+    # Wall-Datum, solange noch gratis). Die App zeigt dann EINMALIG den Danke-Screen.
+    founding_grace_active = founding and (today >= _PAYWALL_WALL_DATE) and not pro_required
     return jsonify({'ok': True, 'pro_required': pro_required,
-                    'free_until': free_until, 'family': False})
+                    'free_until': free_until, 'family': False,
+                    'founding': founding, 'founding_grace_active': founding_grace_active})
 
 
 @app.route('/api/user/profile/<token>', methods=['GET'])
