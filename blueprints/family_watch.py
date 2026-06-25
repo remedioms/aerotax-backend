@@ -362,6 +362,30 @@ def _shares_save(shares):
     return bool(sb_ok or disk_ok)
 
 
+def _iso_or_none(v):
+    """Roher DB-Zeitwert → getrimmter ISO-String (oder None). NICHT abschneiden —
+    der Offset (+00:00)/Mikrosekunden müssen erhalten bleiben, sonst parst die
+    Zeitzone falsch."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _parse_iso(s):
+    """Toleranter ISO→aware-UTC-Parser. Naive (ohne Zone) wird als UTC gewertet."""
+    if not s:
+        return None
+    try:
+        t = str(s).strip().replace('Z', '+00:00')
+        d = _dt.datetime.fromisoformat(t)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=_dt.timezone.utc)
+        return d.astimezone(_dt.timezone.utc)
+    except Exception:
+        return None
+
+
 def _load_crew_status_for_family(crew_token, allowed_fields):
     """Liest aus dem Crew-Profile + briefing-state nur die erlaubten Felder.
     Returns dict mit den status-feldern fuer die WatchedCrew.CrewStatus
@@ -378,6 +402,14 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         'next_flight_etd_iso': None,
         'photo_count_today': None,
         'last_seen_iso': None,
+        # „Fliegt gerade"-Block (User 2026-06-25): heute aktiver Flugtag → die
+        # Family sieht ein Radar-Widget mit interpoliertem Flieger statt „In <Abflug>".
+        # iOS rechnet Position/Animation selbst aus dep/arr-IATA + den Zeiten.
+        'flying_now': None,
+        'today_dep_iata': None,
+        'today_arr_iata': None,
+        'today_dep_iso': None,
+        'today_arr_iso': None,
     }
     try:
         # SB-primary statt Disk: auf Cloud Run ist die Profil-Disk-Datei ephemer/
@@ -454,25 +486,72 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     hb = (prof.get('homebase') or prof.get('home_base') or '').strip().upper()
     roster_layover = None   # IATA des heutigen Layover-Orts (≠ Homebase), wenn ermittelbar
     roster_today_home = False  # heutiger Roster-Tag liegt POSITIV an der Homebase
+    flying_now = False          # NOW im heutigen Dienst-Zeitfenster → „Fliegt gerade"
+    today_dep = today_arr = None
+    today_dep_iso = today_arr_iso = None
     if sb_avail and sb is not None:
         # ical_location-Format: „JFK, FRA-JFK-FRA". Erstes Token = Aufenthaltsort
         # des Tages. An einem HOMEBASE-Tag (Tag-Trip FRA-LUX-FRA → erstes Token =
         # FRA) ist man NICHT im Layover, sondern zuhause → nicht als Layover werten.
         try:
             today = _dt.datetime.now().date().isoformat()
-            r = (sb.table('user_ical_briefings').select('ical_location')
+            r = (sb.table('user_ical_briefings')
+                 .select('ical_location,ical_summary,ical_start,ical_end')
                  .eq('token', crew_token).eq('datum', today).limit(1).execute())
             rows = r.data or []
             if rows:
-                loc = (rows[0].get('ical_location') or '').strip()
+                row = rows[0]
+                loc = (row.get('ical_location') or '').strip()
                 first = loc.split(',')[0].strip().upper()
-                if len(first) == 3 and first.isalpha():
+                summ = row.get('ical_summary') or ''
+                # Heutige Flug-Legs: erste DEP, letzte ARR. Bevorzugt aus dem Summary
+                # („FRA-MUC-BIO 14:30-…" / mehrere „XXX-YYY"), sonst die Routing-Kette
+                # aus ical_location (Teil nach dem Komma, z.B. „BCN-BIO-MUC").
+                legs = re.findall(r'\b([A-Z]{3})-([A-Z]{3})\b', summ)
+                chain = None
+                if legs:
+                    chain = [legs[0][0]] + [b for _, b in legs]
+                else:
+                    mchain = re.search(r'\b([A-Z]{3}(?:-[A-Z]{3})+)\b', loc)
+                    if mchain:
+                        chain = mchain.group(1).split('-')
+                is_flight_today = bool(chain) and len(chain) >= 2
+                if is_flight_today:
+                    today_dep, today_arr = chain[0], chain[-1]
+                    today_dep_iso = _iso_or_none(row.get('ical_start'))
+                    today_arr_iso = _iso_or_none(row.get('ical_end'))
+                    # In-Flight-Fenster: NOW zwischen Dienst-Start und -Ende. Beide ISO
+                    # mit Zone (Upload speichert Europe/Berlin→UTC). Fehlt das Ende →
+                    # grobes Fenster Start … Start+10h (Langstrecke abgedeckt).
+                    st = _parse_iso(today_dep_iso)
+                    en = _parse_iso(today_arr_iso)
+                    now = _dt.datetime.now(_dt.timezone.utc)
+                    if st and not en:
+                        en = st + _dt.timedelta(hours=10)
+                    if st and en and st <= now <= en:
+                        flying_now = True
+                    # Nach der Landung (now > Ende) ist die Crew am ZIEL → das ist der
+                    # echte Layover-Ort, nicht der Abflug. Vor/während Flug KEIN
+                    # „In <Abflug>"-Layover (der Bug). Homebase-Ziel = zuhause.
+                    if en and now > en and today_arr:
+                        if today_arr == hb and hb:
+                            roster_today_home = True
+                        else:
+                            roster_layover = today_arr
+                elif len(first) == 3 and first.isalpha():
+                    # Kein Flugtag → erstes Token ist der echte Aufenthaltsort.
                     if first == hb and hb:
                         roster_today_home = True
                     elif first != hb:
                         roster_layover = first
         except Exception:
             pass
+    if 'next_flight' in allowed_fields:
+        status['flying_now'] = flying_now
+        status['today_dep_iata'] = today_dep
+        status['today_arr_iata'] = today_arr
+        status['today_dep_iso'] = today_dep_iso
+        status['today_arr_iso'] = today_arr_iso
     if 'layover_place' in allowed_fields:
         status['layover_place'] = roster_layover
     # Reconcile current_city gegen den Roster: wenn der heutige Plan POSITIV an
