@@ -8888,14 +8888,15 @@ def _public_profile_projection(token):
 
 
 # ── Paywall-Rollout (User 2026-06-25) ────────────────────────────────────────
-# Modell: Die Bezahlschranke aktiviert 6 Monate nach Launch (WALL_DATE). Wer
-# VOR dem Wall-Datum schon da war ("Gründungs-Crew") bekommt danach NOCHMAL
-# 6 Monate gratis (bis GRANDFATHER_UNTIL); erst dann 11,99 €/Jahr. Wer ERST
-# AB dem Wall-Datum dazukommt, bekommt die 1-Woche-Apple-Trial und dann 11,99 €.
-# Family-Accounts sind FÜR IMMER gratis. Die App liest diesen Endpoint und
-# blendet die Wall genau dann ein, wenn pro_required==true und kein aktives Abo.
-_PAYWALL_WALL_DATE = '2026-12-25'          # +6 Monate ab Launch (2026-06-25)
-_PAYWALL_GRANDFATHER_UNTIL = '2027-06-25'  # Gründungs-Crew: nochmal +6 Monate
+# HARD WALL ab dem Wall-Datum (26.12.2026): bis dahin ALLES gratis (Beta). Ab dann
+# beim NÄCHSTEN App-Öffnen entweder zahlen ODER die Gratis-Phase nutzen:
+#   - Gründungs-Crew (vor dem Wall-Datum dabei): löst einen 6-Monate-Offer-Code ein
+#     (auto-renew) → 6 Monate gratis, dann 11,99 €/Jahr.
+#   - Neue ab dem Wall-Datum: 1-Woche-Apple-Trial → dann 11,99 €/Jahr.
+#   - Family: für immer gratis.
+# KEINE passive Gnadenfrist mehr — die +6 Monate kommen aus dem eingelösten Code,
+# nicht aus einem free_until. So landet die Gründungs-Crew wirklich im Auto-Renew.
+_PAYWALL_WALL_DATE = '2026-12-26'          # Hard Wall ab hier (6 Monate Beta ab 2026-06-25)
 
 
 def _auth_created_at_for_token(token):
@@ -8931,17 +8932,16 @@ def user_entitlement(token):
     if is_family:
         return jsonify({'ok': True, 'pro_required': False,
                         'free_until': None, 'family': True})
-    # Vor dem Wall-Datum dabei → Gründungs-Crew (+6 Monate). Sonst sofort
-    # (die Apple-1-Woche-Trial deckt die Probephase ab).
+    # HARD WALL: bis zum Wall-Datum gratis, danach erforderlich (Code/Trial/Kauf).
+    # Gründungs-Crew = vor dem Wall-Datum dabei → free bis zum Wall-Datum, danach
+    # über den 6-Monate-Code (KEINE passive Gnadenfrist mehr, sonst kein Auto-Renew-
+    # „Catch"). Neue ab dem Wall-Datum → sofort erforderlich (1-Woche-Trial deckt die
+    # Probe). pro_required steuert die Wall; founding wählt Code-Screen vs 1-Woche.
     founding = seen_date < _PAYWALL_WALL_DATE
-    free_until = _PAYWALL_GRANDFATHER_UNTIL if founding else seen_date
+    free_until = _PAYWALL_WALL_DATE if founding else seen_date
     pro_required = today >= free_until
-    # „Danke schön"-Phase: die Gründungs-Crew-Gnadenfrist läuft GERADE (ab dem
-    # Wall-Datum, solange noch gratis). Die App zeigt dann EINMALIG den Danke-Screen.
-    founding_grace_active = founding and (today >= _PAYWALL_WALL_DATE) and not pro_required
     return jsonify({'ok': True, 'pro_required': pro_required,
-                    'free_until': free_until, 'family': False,
-                    'founding': founding, 'founding_grace_active': founding_grace_active})
+                    'free_until': free_until, 'family': False, 'founding': founding})
 
 
 @app.route('/api/storekit/promo-offer', methods=['GET'])
