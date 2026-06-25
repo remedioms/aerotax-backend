@@ -19921,6 +19921,46 @@ def _is_rail_or_bus(flight):
     return False
 
 
+# Fraport liefert `status` teils CJK-/fremdsprachig (z.B. '登机' = Boarding) — analog
+# zu _clean_city_name (das Städtenamen entCJK-t) auf sauberes Deutsch normalisieren,
+# sonst stehen chinesische Zeichen auf Tafel + Flug-Info (User: „chinesische zahlen").
+_FRA_STATUS_DE = {
+    '登机': 'Boarding', '登机口开放': 'Boarding', '登机口即将关闭': 'Last Call',
+    '登机口关闭': 'Gate zu', '最后登机': 'Last Call', '值机': 'Check-in',
+    '已起飞': 'Abgeflogen', '起飞': 'Abgeflogen', '出发': 'Abgeflogen',
+    '已降落': 'Gelandet', '降落': 'Gelandet', '抵达': 'Gelandet',
+    '取消': 'Annulliert', '已取消': 'Annulliert', '延误': 'Verspätet',
+    '准时': 'Pünktlich', '预计': 'Erwartet', '计划': 'Geplant',
+}
+def _de_flight_status(raw):
+    """Fraport-Status → sauberes Deutsch. Bekannte CJK-Strings gemappt; sonst
+    unbekanntes CJK/nicht-lateinisch → LEER (iOS leitet den Zustand aus
+    delay_min/cancelled ab), nie rohe chinesische Zeichen anzeigen."""
+    s = (raw or '').strip()
+    if not s:
+        return ''
+    if s in _FRA_STATUS_DE:
+        return _FRA_STATUS_DE[s]
+    # CJK (Chinesisch/Japanisch/Koreanisch) erkannt → nicht anzeigen.
+    if any('　' <= c <= '鿿' or '가' <= c <= '힯' for c in s):
+        return ''
+    return s
+
+
+_PRE_DEP_STATUS = {'', 'geplant', 'boarding', 'gate', 'gate zu', 'gate offen',
+                   'check-in', 'erwartet', 'last call', 'planned', 'scheduled'}
+def _departed_status(stored, cancelled, is_arr):
+    """Status einer BEREITS ABGEFLOGENEN „Früher heute"-Zeile: ein veralteter
+    Vor-Abflug-Status (Geplant/Boarding/Gate) wird durch Abgeflogen/Gelandet ersetzt
+    (der Flug ist weg, „Geplant" ist falsch — User). Echte Info (verspätet etc.) bleibt."""
+    if cancelled:
+        return 'Annulliert'
+    s = _de_flight_status(stored)
+    if s.lower() in _PRE_DEP_STATUS:
+        return 'Gelandet' if is_arr else 'Abgeflogen'
+    return s
+
+
 def _fetch_fra_flights(flight_type='departure', max_pages=3):
     # `requests` ist in app.py NICHT module-level importiert → lokaler Import.
     # flight_type='arrival' → Fraport-Filter-Endpoint; `iata`/`apname` ist dann
@@ -19974,7 +20014,7 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
                     'gate': (f.get('gate') or '').strip(),
                     'terminal': (f.get('terminal') or '').strip(),
                     'hall': (f.get('halle') or '').strip(),
-                    'status': (f.get('status') or '').strip(),
+                    'status': _de_flight_status(f.get('status')),
                     'delayed': (_fra_delay_min(f.get('sched'), f.get('esti'))
                                 >= _PUNCTUALITY_DELAY_THRESHOLD_MIN),
                     'reg': (f.get('reg') or '').strip(),
@@ -21083,9 +21123,7 @@ def _departed_rows_from_store(airport):
             'cancelled': cancelled,
             'gate': (meta.get('gate') or ''),
             'terminal': (meta.get('terminal') or ''), 'hall': '',
-            'status': ((meta.get('status') or '') or
-                       ('Annulliert' if cancelled
-                        else ('Gelandet' if is_arr else 'Abgeflogen'))),
+            'status': _departed_status(meta.get('status'), cancelled, is_arr),
             # reg/type_code AUS dem Meta-Store mit ausgeben (User: Tail-Reg + Muster
             # gehören auch auf die „Früher heute"-Zeilen, nicht nur auf die Live-Flüge
             # — sie liegen seit dem Aircraft-Meta-Merge ohnehin im Store).
@@ -22489,9 +22527,7 @@ def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None):
             'cancelled': cancelled,
             'gate': (row.get('gate') or ''),
             'terminal': (row.get('terminal') or ''), 'hall': '',
-            'status': ((row.get('status') or '') or
-                       ('Annulliert' if cancelled
-                        else ('Gelandet' if is_arr else 'Abgeflogen'))),
+            'status': _departed_status(row.get('status'), cancelled, is_arr),
             # reg/type_code aus der persistierten Row mit ausgeben (Tail + Muster
             # auch auf vergangenen Tagen — select('*') liest sie bereits).
             'reg': (row.get('reg') or ''), 'aircraft': (row.get('type_code') or ''),
