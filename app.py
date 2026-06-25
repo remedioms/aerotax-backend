@@ -214,6 +214,7 @@ CORS(app, origins=_cors_origins)
 # Logs sind 1 Zeile pro Event, JSON-kompatibles Format, kein I/O-overhead.
 import threading as _req_threading
 import time as _req_time
+import time  # modulweit verfügbar (manche Handler nutzten bisher nur lokale Imports)
 import uuid as _req_uuid
 
 
