@@ -19982,7 +19982,12 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
         try:
             params = {}
             if flight_type == 'arrival':
-                params['type'] = 'arrival'
+                # FIX 2026-06-25: Fraport-Filter-Param ist `flighttype=arrivals`
+                # (so ruft die echte Ankunfts-Seite ankuenfte.html den /filter-
+                # Endpoint auf). Der bisherige `type=arrival` wurde von Fraport
+                # IGNORIERT → der Endpoint lieferte ABFLÜGE, die wir fälschlich als
+                # Ankünfte zeigten (FRA-Ankunftstafel = Abflüge mit Zielen/„Boarding").
+                params['flighttype'] = 'arrivals'
             if page > 1:
                 params['page'] = page
             r = requests.get(base, params=params, headers=headers, timeout=8)
