@@ -8944,6 +8944,60 @@ def user_entitlement(token):
                     'founding': founding, 'founding_grace_active': founding_grace_active})
 
 
+@app.route('/api/storekit/promo-offer', methods=['GET'])
+def storekit_promo_offer():
+    """Signiert das 6-Monate-Gründungs-Crew-Promo-Offer (Apple „Promotional Offer").
+    NUR für die Gründungs-Crew (vor dem Wall-Datum dabei, nicht Family) → 6+6.
+
+    Owner-Setup (App Store Connect, einmalig — NUR der Owner):
+      1) Beim Abo aerox.pro.yearly ein „Promotional Offer" anlegen:
+         Offer-ID z.B. `founding6m`, Typ Free, Dauer 6 Monate, Auto-Renew.
+      2) Einen „Subscription Key" (.p8) in ASC erzeugen (Users & Access → Keys →
+         In-App-Purchase). Key-ID notieren.
+      3) Diese Env-Vars auf Cloud Run setzen:
+           ASC_SUB_KEY_P8   = kompletter .p8-PEM-Inhalt (-----BEGIN PRIVATE KEY----- …)
+           ASC_SUB_KEY_ID   = die Key-ID
+           ASC_FOUNDING_OFFER_ID = founding6m   (oder die gewählte Offer-ID)
+           ASC_BUNDLE_ID    = aerotax.AeroTax   (Default, falls abweichend)
+    Ohne diese Config → 503 (App fällt sauber auf das normale Intro-Offer zurück).
+    """
+    token = (request.headers.get('Authorization', '') or '').replace('Bearer ', '').strip()
+    if not token or len(token) < 8:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    key_pem = os.environ.get('ASC_SUB_KEY_P8')
+    key_id = os.environ.get('ASC_SUB_KEY_ID')
+    bundle_id = os.environ.get('ASC_BUNDLE_ID', 'aerotax.AeroTax')
+    offer_id = os.environ.get('ASC_FOUNDING_OFFER_ID', 'founding6m')
+    product_id = (request.args.get('product') or 'aerox.pro.yearly').strip()
+    if not key_pem or not key_id:
+        return jsonify({'ok': False, 'error': 'not_configured',
+                        'message': 'ASC promo key not set'}), 503
+    # Founding-Check (gleiche Logik wie /entitlement).
+    prof = (_profile_load(token) or {}).get('profile') or {}
+    if prof.get('account_type') == 'family':
+        return jsonify({'ok': False, 'error': 'family_exempt'}), 403
+    seen = prof.get('pro_first_seen') or _auth_created_at_for_token(token) \
+        or datetime.now().isoformat()
+    if str(seen)[:10] >= _PAYWALL_WALL_DATE:
+        return jsonify({'ok': False, 'error': 'not_founding'}), 403
+    # Apple-Signatur-Algorithmus: Felder mit U+2063 verbunden, ES256 (P-256/SHA-256),
+    # DER-Signatur base64-kodiert. applicationUsername = leer (StoreKit-2-Flow).
+    import uuid as _uuid
+    nonce = str(_uuid.uuid4()).lower()
+    ts = int(datetime.now().timestamp() * 1000)
+    payload = '\u2063'.join([bundle_id, key_id, product_id, offer_id, '', nonce, str(ts)])
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        pkey = serialization.load_pem_private_key(key_pem.encode('utf-8'), password=None)
+        sig = pkey.sign(payload.encode('utf-8'), ec.ECDSA(hashes.SHA256()))
+        sig_b64 = base64.b64encode(sig).decode('ascii')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': 'sign_failed', 'message': str(e)[:120]}), 500
+    return jsonify({'ok': True, 'offer_id': offer_id, 'key_id': key_id,
+                    'nonce': nonce, 'timestamp': ts, 'signature_b64': sig_b64})
+
+
 @app.route('/api/user/profile/<token>', methods=['GET'])
 def get_user_profile(token):
     # PUBLIC-BY-DESIGN (BUG-004 audit, 2026-06-02): Profile-Lookup ist im
