@@ -8366,18 +8366,13 @@ def _send_report_email_notification(entry):
         else:
             e_content = "(Inhalt nicht automatisch auflösbar — im Panel prüfen)"
             e_author = e_ttoken
-        # Direktlink ins Moderations-Panel.
-        _secret = _admin_mod_secret()
-        if _secret:
-            panel_url = f"{_PUBLIC_BASE_URL}/api/admin/moderate/{_secret}"
-            panel_btn = (
-                f"<p style='margin-top:20px'>"
-                f"<a href='{_html.escape(panel_url)}' style='background:#2563eb;color:#fff;"
-                f"text-decoration:none;padding:11px 20px;border-radius:8px;font-family:sans-serif;"
-                f"font-weight:600'>→ Im Moderations-Panel öffnen &amp; löschen</a></p>")
-        else:
-            panel_btn = ("<p style='color:#888;font-size:12px;font-family:sans-serif'>"
-                         "(Admin-Panel nicht konfiguriert — ADMIN_MODERATION_SECRET setzen)</p>")
+        # Direktlink ins Moderations-Panel (Login-geschützt).
+        panel_url = f"{_PUBLIC_BASE_URL}/api/admin/moderate"
+        panel_btn = (
+            f"<p style='margin-top:20px'>"
+            f"<a href='{_html.escape(panel_url)}' style='background:#2563eb;color:#fff;"
+            f"text-decoration:none;padding:11px 20px;border-radius:8px;font-family:sans-serif;"
+            f"font-weight:600'>→ Im Moderations-Panel öffnen</a></p>")
         subject = f"[AeroX Meldung] {_hdr_safe(entry.get('reason'))} · {_hdr_safe(entry.get('kind'))}"
         html_body = (
             f"<h2 style='font-family:sans-serif'>Neue Inhalts-Meldung</h2>"
@@ -8417,16 +8412,116 @@ def _send_report_email_notification(entry):
         print(f"[report-mail] send fail: {e}")
 
 
-@app.route('/api/admin/moderate/<secret>', methods=['GET'])
-def admin_moderate_panel(secret):
-    """Passwortgeschützte Moderations-Inbox: zeigt alle Meldungen MIT dem echten
-    gemeldeten Inhalt und erlaubt Löschen/Erledigt per Klick. Schutz: geheimer
-    Pfad-Token == env ADMIN_MODERATION_SECRET (hmac.compare_digest)."""
+# ─── Admin-Login (eigenes signiertes Cookie, da app.secret_key nicht gesetzt) ──
+def _admin_creds():
+    return (os.environ.get('ADMIN_USER', 'miguelschumann').strip(),
+            os.environ.get('ADMIN_PASS', '').strip())
+
+
+def _admin_make_cookie():
+    import hmac, hashlib, base64
+    payload = f"admin:{int(time.time())}"
+    sig = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode()).decode()
+
+
+def _admin_logged_in():
+    import hmac, hashlib, base64
+    val = request.cookies.get('ax_admin', '')
+    if not val:
+        return False
+    try:
+        raw = base64.urlsafe_b64decode(val.encode()).decode()
+        payload, sig = raw.rsplit(':', 1)
+        expect = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expect):
+            return False
+        ts = int(payload.split(':')[1])
+        return (time.time() - ts) <= 14 * 24 * 3600  # 14 Tage gültig
+    except Exception:
+        return False
+
+
+_ADMIN_CSS = (
+    "<style>*{box-sizing:border-box}"
+    "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+    "margin:0;background:#f5f5f7;color:#1d1d1f;line-height:1.45}"
+    ".wrap{max-width:680px;margin:0 auto;padding:28px 18px 60px}"
+    "h1{font-size:26px;margin:0 0 2px;letter-spacing:-.02em}"
+    ".sub{color:#86868b;margin:0 0 22px;font-size:15px}"
+    ".card{background:#fff;border-radius:16px;padding:18px;margin:14px 0;"
+    "box-shadow:0 1px 2px rgba(0,0,0,.06)}"
+    ".meta{font-size:12px;color:#86868b;margin-bottom:6px}"
+    ".who{font-size:15px;margin:2px 0 10px}"
+    ".reason{font-weight:600}"
+    ".content{background:#f5f5f7;border-radius:12px;padding:13px 15px;"
+    "white-space:pre-wrap;margin:0 0 10px;font-size:15px}"
+    ".open{color:#d70015;font-weight:600}.done{color:#34c759;font-weight:600}"
+    "button{font-size:15px;border:0;border-radius:11px;padding:11px 16px;"
+    "cursor:pointer;font-weight:600;margin:4px 8px 0 0}"
+    ".del{background:#ff3b30;color:#fff}.ok{background:#e8e8ed;color:#1d1d1f}"
+    ".btn{background:#0071e3;color:#fff;width:100%;padding:14px;font-size:17px;margin-top:6px}"
+    "input{width:100%;font-size:17px;padding:13px 15px;border:1px solid #d2d2d7;"
+    "border-radius:11px;margin:7px 0;background:#fff}"
+    "a.logout{float:right;font-size:14px;color:#0071e3;text-decoration:none;margin-top:6px}"
+    ".err{color:#d70015;font-size:14px;margin:0 0 6px}"
+    "</style>")
+
+
+def _admin_html(title, inner):
+    return (f"<!doctype html><html lang='de'><head><meta charset='utf-8'>"
+            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{title}</title>{_ADMIN_CSS}</head>"
+            f"<body><div class='wrap'>{inner}</div></body></html>")
+
+
+@app.route('/api/admin', methods=['GET'])
+def admin_login_form():
+    from flask import redirect
+    if _admin_logged_in():
+        return redirect('/api/admin/moderate')
+    err = "<p class='err'>Falscher Benutzername oder Passwort.</p>" if request.args.get('e') else ""
+    form = (
+        "<h1>AeroX Admin</h1><p class='sub'>Moderation — bitte einloggen</p>"
+        f"<form method='post' action='/api/admin/login' class='card'>{err}"
+        "<input name='user' placeholder='Benutzername' autocomplete='username' autofocus>"
+        "<input name='pass' type='password' placeholder='Passwort' autocomplete='current-password'>"
+        "<button class='btn' type='submit'>Einloggen</button></form>")
+    return _admin_html("AeroX Admin Login", form)
+
+
+@app.route('/api/admin/login', methods=['POST'])
+def admin_login():
     import hmac
+    from flask import redirect, make_response
+    user, pw = _admin_creds()
+    in_user = (request.form.get('user') or '').strip()
+    in_pw = (request.form.get('pass') or '').strip()
+    ok = bool(pw) and hmac.compare_digest(in_user, user) and hmac.compare_digest(in_pw, pw)
+    if not ok:
+        return redirect('/api/admin?e=1')
+    resp = make_response(redirect('/api/admin/moderate'))
+    resp.set_cookie('ax_admin', _admin_make_cookie(), max_age=14 * 24 * 3600,
+                    httponly=True, secure=True, samesite='Lax')
+    return resp
+
+
+@app.route('/api/admin/logout', methods=['GET'])
+def admin_logout():
+    from flask import redirect, make_response
+    resp = make_response(redirect('/api/admin'))
+    resp.delete_cookie('ax_admin')
+    return resp
+
+
+@app.route('/api/admin/moderate', methods=['GET'])
+def admin_moderate_panel():
+    """Login-geschützte Moderations-Inbox: zeigt alle Meldungen MIT dem echten
+    gemeldeten Inhalt und erlaubt Löschen/Erledigt per Klick."""
     import html as _html
-    s = _admin_mod_secret()
-    if not s or not hmac.compare_digest(str(secret), s):
-        return ('forbidden', 403)
+    from flask import redirect
+    if not _admin_logged_in():
+        return redirect('/api/admin')
     reports = _load_reports()
     reports = sorted(reports, key=lambda r: ((r.get('status') == 'resolved'),
                                              -(r.get('ts') or 0)))
@@ -8439,13 +8534,13 @@ def admin_moderate_panel(secret):
             content_html = _html.escape(c['text'][:3000])
             author = _html.escape(c.get('author_name') or c.get('author_token') or '—')
         else:
-            content_html = "<i style='color:#999'>(Inhalt nicht auto-auflösbar — Typ %s)</i>" % _html.escape(kind)
+            content_html = "<i style='color:#aaa'>(Inhalt nicht auto-auflösbar)</i>"
             author = _html.escape(r.get('target_token', '') or '—')
         status = r.get('status', 'pending')
-        badge = ("<span style='color:#16a34a'>✅ erledigt</span>" if status == 'resolved'
-                 else "<span style='color:#dc2626'>🔴 offen</span>")
+        badge = ("<span class='done'>✓ erledigt</span>" if status == 'resolved'
+                 else "<span class='open'>● offen</span>")
         try:
-            when = datetime.fromtimestamp(r.get('ts') or 0).strftime('%d.%m.%Y %H:%M')
+            when = datetime.fromtimestamp(r.get('ts') or 0).strftime('%d.%m. %H:%M')
         except Exception:
             when = '—'
         rid = _html.escape(r.get('id', ''))
@@ -8453,56 +8548,43 @@ def admin_moderate_panel(secret):
         e_reason = _html.escape(r.get('reason', ''))
         e_note = _html.escape(r.get('note', '') or '—')
         e_tid = _html.escape(r.get('target_id', ''))
-        e_sec = _html.escape(str(secret))
-        buttons = (
-            f"<form method='post' action='/api/admin/moderate/{e_sec}/act' style='display:inline'>"
-            f"<input type='hidden' name='report_id' value='{rid}'>"
-            f"<input type='hidden' name='kind' value='{e_kind}'>"
-            f"<input type='hidden' name='target_id' value='{e_tid}'>"
-            f"<button name='action' value='delete' "
-            f"onclick=\"return confirm('Inhalt wirklich löschen?')\" "
-            f"style='background:#dc2626;color:#fff;border:0;padding:9px 16px;border-radius:8px;"
-            f"cursor:pointer;font-weight:600'>Inhalt löschen</button> "
-            f"<button name='action' value='resolve' "
-            f"style='background:#6b7280;color:#fff;border:0;padding:9px 16px;border-radius:8px;"
-            f"cursor:pointer'>Als erledigt markieren</button>"
-            f"</form>") if status != 'resolved' else "<i style='color:#999;font-size:13px'>%s</i>" % _html.escape(r.get('resolution', 'erledigt'))
+        if status != 'resolved':
+            actions = (
+                "<form method='post' action='/api/admin/moderate/act'>"
+                f"<input type='hidden' name='report_id' value='{rid}'>"
+                f"<input type='hidden' name='kind' value='{e_kind}'>"
+                f"<input type='hidden' name='target_id' value='{e_tid}'>"
+                "<button class='del' name='action' value='delete' "
+                "onclick=\"return confirm('Inhalt wirklich löschen?')\">Inhalt löschen</button>"
+                "<button class='ok' name='action' value='resolve'>Erledigt</button></form>")
+        else:
+            actions = f"<div class='meta'>{_html.escape(r.get('resolution', 'erledigt'))}</div>"
         cards.append(
-            f"<div style='border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin:14px 0'>"
-            f"<div style='font-size:12px;color:#888'>{badge} · {e_kind} · {when} · report {rid}</div>"
-            f"<div style='margin:8px 0'><b>Grund:</b> {e_reason} &nbsp;·&nbsp; <b>Autor:</b> {author}</div>"
-            f"<div style='background:#f7f7f8;border-left:3px solid #dc2626;border-radius:8px;"
-            f"padding:12px;white-space:pre-wrap;color:#222;margin:8px 0'>{content_html}</div>"
-            f"<div style='font-size:13px;color:#555'><b>Notiz des Melders:</b> {e_note}</div>"
-            f"<div style='margin-top:12px'>{buttons}</div>"
-            f"</div>")
-    page = (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>AeroX Moderation</title></head>"
-        "<body style='font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:780px;"
-        "margin:0 auto;padding:20px;background:#fff;color:#111'>"
-        "<h1 style='margin-bottom:4px'>AeroX Moderation</h1>"
-        f"<p style='color:#888;margin-top:0'>{open_n} offen · {len(reports)} gesamt</p>"
-        f"{''.join(cards) or '<p>Keine Meldungen.</p>'}"
-        "</body></html>")
-    return page
+            f"<div class='card'>"
+            f"<div class='meta'>{badge} · {e_kind} · {when}</div>"
+            f"<div class='who'><span class='reason'>{e_reason}</span> · {author}</div>"
+            f"<div class='content'>{content_html}</div>"
+            f"<div class='meta'>Notiz: {e_note}</div>"
+            f"{actions}</div>")
+    inner = (
+        "<a class='logout' href='/api/admin/logout'>Logout</a>"
+        "<h1>Moderation</h1>"
+        f"<p class='sub'>{open_n} offen · {len(reports)} gesamt</p>"
+        f"{''.join(cards) or '<p class=sub>Keine Meldungen 🎉</p>'}")
+    return _admin_html("AeroX Moderation", inner)
 
 
-@app.route('/api/admin/moderate/<secret>/act', methods=['POST'])
-def admin_moderate_act(secret):
+@app.route('/api/admin/moderate/act', methods=['POST'])
+def admin_moderate_act():
     """Führt eine Moderations-Aktion aus (delete|resolve) und markiert den Report
-    als erledigt. Gleicher Secret-Schutz wie das Panel."""
-    import hmac
+    als erledigt. Login-geschützt."""
     from flask import redirect
-    s = _admin_mod_secret()
-    if not s or not hmac.compare_digest(str(secret), s):
-        return ('forbidden', 403)
+    if not _admin_logged_in():
+        return redirect('/api/admin')
     action = (request.form.get('action') or '').strip()
     report_id = (request.form.get('report_id') or '').strip()
     kind = (request.form.get('kind') or '').strip()
     target_id = (request.form.get('target_id') or '').strip()
-    detail = ''
     if action == 'delete':
         ok, detail = _admin_delete_content(kind, target_id)
         resolution = f"gelöscht ({detail})" if ok else f"löschen fehlgeschlagen ({detail})"
@@ -8516,7 +8598,7 @@ def admin_moderate_act(secret):
             r['resolution'] = resolution
             break
     _save_reports(reports)
-    return redirect(f'/api/admin/moderate/{secret}')
+    return redirect('/api/admin/moderate')
 
 
 @app.route('/api/admin/support-list', methods=['GET'])
