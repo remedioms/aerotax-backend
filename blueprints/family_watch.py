@@ -439,13 +439,26 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                     status['next_flight_etd_iso'] = str(st)[:25]
         except Exception as e:
             _log().info(f'[family-watch] briefing_read_skip {type(e).__name__}')
-    if 'layover_place' in allowed_fields and sb_avail and sb is not None:
-        # Layover-IATA = erstes Token in ical_location („JFK, FRA-JFK-FRA").
-        # FIX (User: „im Layover statt zuhause weil in Frankfurt"): an einem Tag,
-        # der an der HOMEBASE liegt (Tag-Trip FRA-LUX-FRA-… → erstes Token = FRA),
-        # ist man NICHT im Layover, sondern zuhause. Nur setzen wenn ≠ Homebase.
+    # Roster-derived Layover-Stadt + Reconcile von current_city.
+    #
+    # THEME-B FIX (Family-Watch zeigt falsche Stadt): `current_city` (oben, Z.389)
+    # ist NUR ein vom iOS-LocationStore gepushter, reverse-geocodeter GPS-String
+    # (POST /api/user/location, ~1×/h) bzw. ein PUT-Wert. Er wird vom Roster-/
+    # Briefing-Import NIE aktualisiert oder gelöscht → ein alter GPS-Sample
+    # („München", früher „San Francisco") friert ein und widerspricht dem echten
+    # Plan (z.B. OPO-FRA). Der Roster (user_ical_briefings.ical_location) ist die
+    # zuverlässige, plan-verankerte Quelle. Die iOS-Family-Card bevorzugt ohnehin
+    # `layover_place ?? current_city` (CrewStatusBigCard.swift) — wir machen die
+    # layover_place-Ableitung robuster und unterdrücken eine stale current_city,
+    # die dem Roster widerspricht.
+    hb = (prof.get('homebase') or prof.get('home_base') or '').strip().upper()
+    roster_layover = None   # IATA des heutigen Layover-Orts (≠ Homebase), wenn ermittelbar
+    roster_today_home = False  # heutiger Roster-Tag liegt POSITIV an der Homebase
+    if sb_avail and sb is not None:
+        # ical_location-Format: „JFK, FRA-JFK-FRA". Erstes Token = Aufenthaltsort
+        # des Tages. An einem HOMEBASE-Tag (Tag-Trip FRA-LUX-FRA → erstes Token =
+        # FRA) ist man NICHT im Layover, sondern zuhause → nicht als Layover werten.
         try:
-            hb = (prof.get('homebase') or prof.get('home_base') or '').strip().upper()
             today = _dt.datetime.now().date().isoformat()
             r = (sb.table('user_ical_briefings').select('ical_location')
                  .eq('token', crew_token).eq('datum', today).limit(1).execute())
@@ -453,10 +466,39 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
             if rows:
                 loc = (rows[0].get('ical_location') or '').strip()
                 first = loc.split(',')[0].strip().upper()
-                if len(first) == 3 and first.isalpha() and first != hb:
-                    status['layover_place'] = first
+                if len(first) == 3 and first.isalpha():
+                    if first == hb and hb:
+                        roster_today_home = True
+                    elif first != hb:
+                        roster_layover = first
         except Exception:
             pass
+    if 'layover_place' in allowed_fields:
+        status['layover_place'] = roster_layover
+    # Reconcile current_city gegen den Roster: wenn der heutige Plan POSITIV an
+    # der Homebase liegt (roster_today_home — erstes ical_location-Token == hb),
+    # ist die Crew laut Plan zuhause — eine widersprechende GPS-Stadt (anderer
+    # Ort) ist dann ein veralteter Sample und wird NICHT an die Family geleakt.
+    # Wir erfinden keine Stadt, wir entfernen nur eine nachweislich plan-widrige.
+    # WICHTIG: nur bei POSITIVEM Home-Signal — ein OFF-/Rest-Tag OHNE IATA-Code
+    # (z.B. mehrtägiger Layover-Ruhetag fern der Base) lässt current_city stehen,
+    # sonst würden wir eine legitime Layover-GPS-Stadt fälschlich unterdrücken.
+    # Hat der Roster einen echten Layover (roster_layover gesetzt), ist DER die
+    # Wahrheit; eine current_city, die diese IATA nicht erkennbar enthält (ein
+    # einfacher Contains scheitert für ausgeschriebene Städtenamen wie „München"),
+    # wird unterdrückt, weil die Family bereits layover_place sieht und zwei
+    # widersprüchliche Orte nur verwirren.
+    if 'current_city' in allowed_fields and status.get('current_city'):
+        if roster_today_home:
+            # Plan = Homebase-Tag → keine widersprechende GPS-Stadt servieren.
+            status['current_city'] = None
+        elif roster_layover is not None:
+            # Plan = Layover an roster_layover → wenn die GPS-Stadt diesen Ort
+            # nicht erkennbar enthält, ist sie stale → unterdrücken (layover_place
+            # trägt die korrekte Info).
+            cc = str(status['current_city']).strip().upper()
+            if roster_layover not in cc:
+                status['current_city'] = None
     # Felder die NICHT in allowed_fields sind: explicit auf None setzen
     # (Privacy-Garantie: Server filtert, Client kann nicht durchgeben was nicht gegranted).
     if 'current_city' not in allowed_fields:
@@ -1120,14 +1162,10 @@ def family_roster(family_token):
     if not crew_token:
         return jsonify({'ok': False, 'shared': False,
                         'error': 'not_paired', 'days': []}), 404
-    # Explizites Opt-Out respektieren (Pairing IST eigentlich die Zustimmung,
-    # aber wenn die Crew share_roster hart auf False stellt → honest empty).
-    prof = _load_crew_profile(crew_token) or {}
-    if prof.get('share_roster') is False:
-        return jsonify({'ok': True, 'shared': False,
-                        'reason': 'crew_opted_out',
-                        'crew_name': _crew_short_name(crew_token),
-                        'crew_homebase': _crew_homebase(crew_token), 'days': []})
+    # KEIN Opt-Out mehr (Produkt-Entscheidung 2026-06-25): das Annehmen einer
+    # Familie-Anfrage IST die Zustimmung, den Plan zu teilen. Der share_roster-
+    # Aus-Schalter ist im Client entfernt — eine bestätigte Familie sieht den
+    # Plan immer (read-only, weiterhin OHNE Geld-/Steuer-Daten).
     days = _load_crew_roster_days(crew_token, days_limit)
     return jsonify({
         'ok': True, 'shared': True, 'count': len(days), 'days': days,

@@ -10561,9 +10561,10 @@ def get_friend_roster(token, friend_token):
         friend_profile = (_profile_load(friend_token) or {}).get('profile', {}) or {}
     except Exception:
         friend_profile = {}
-    if friend_profile.get('share_roster') is False:
-        return jsonify({'ok': True, 'shared': False,
-                        'reason': 'friend_opted_out', 'days': []})
+    # KEIN share_roster-Opt-Out mehr (Produkt-Entscheidung 2026-06-25): eine
+    # ANGENOMMENE Freundschaft IST die Zustimmung, den Plan zu teilen. Es gibt
+    # keinen Aus-Schalter mehr (im Client entfernt) — wer dich als Freund:in
+    # bestätigt, sieht deinen Plan, reziprok.
     # Friend roster: 1) aus _store (in-memory, frisch wenn Friend gerade aktiv),
     # 2) Fallback auf persistenten roster_snapshot — überlebt Container-Restart.
     # Vorher: nur _store → bei Render-Sleep waren alle Friend-Rosters leer.
