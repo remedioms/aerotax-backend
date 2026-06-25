@@ -20044,15 +20044,42 @@ _FRA_STATUS_DE = {
     '取消': 'Annulliert', '已取消': 'Annulliert', '延误': 'Verspätet',
     '准时': 'Pünktlich', '预计': 'Erwartet', '计划': 'Geplant',
 }
-def _de_flight_status(raw):
-    """Fraport-Status → sauberes Deutsch. Bekannte CJK-Strings gemappt; sonst
-    unbekanntes CJK/nicht-lateinisch → LEER (iOS leitet den Zustand aus
-    delay_min/cancelled ab), nie rohe chinesische Zeichen anzeigen."""
+# Fraport liefert ZUSÄTZLICH englische Status-Strings (approaching/landed/departed
+# /boarding…). KONTEXT IST KRITISCH: bei einer ANKUNFT heißt `departed`, dass der
+# Inbound-Flieger seinen HERKUNFTS-Flughafen verlassen hat (= unterwegs nach FRA) —
+# NICHT „Abgeflogen" (Bug „Ankunftstafel sagt ab obwohl es an ist", User 2026-06-25).
+_EN_STATUS_COMMON = {
+    'cancelled': 'Annulliert', 'canceled': 'Annulliert', 'delayed': 'Verspätet',
+    'scheduled': 'Geplant', 'planned': 'Geplant', 'on time': 'Pünktlich',
+    'boarding': 'Boarding', 'last call': 'Last Call', 'gate closed': 'Gate zu',
+    'gate open': 'Gate offen', 'check-in': 'Check-in', 'expected': 'Erwartet',
+    'delayed departure': 'Verspätet', 'diverted': 'Umgeleitet',
+}
+_EN_STATUS_ARR = {   # Ankunfts-Kontext
+    'departed': 'Unterwegs', 'en route': 'Unterwegs', 'enroute': 'Unterwegs',
+    'in flight': 'Unterwegs', 'approaching': 'Im Anflug', 'expected': 'Erwartet',
+    'landed': 'Gelandet', 'on position': 'Gelandet', 'on blocks': 'Gelandet',
+    'arrived': 'Gelandet', 'at gate': 'Gelandet',
+}
+_EN_STATUS_DEP = {   # Abflugs-Kontext
+    'departed': 'Abgeflogen', 'lifted off': 'Abgeflogen', 'airborne': 'Abgeflogen',
+}
+def _de_flight_status(raw, is_arr=False):
+    """Fraport-Status → sauberes Deutsch, ANKUNFTS-/ABFLUGS-bewusst. Bekannte CJK-
+    und englische Strings gemappt; unbekanntes CJK → LEER (iOS leitet den Zustand
+    aus delay_min/cancelled ab), nie rohe chinesische Zeichen anzeigen."""
     s = (raw or '').strip()
     if not s:
         return ''
     if s in _FRA_STATUS_DE:
         return _FRA_STATUS_DE[s]
+    low = s.lower()
+    if is_arr and low in _EN_STATUS_ARR:
+        return _EN_STATUS_ARR[low]
+    if (not is_arr) and low in _EN_STATUS_DEP:
+        return _EN_STATUS_DEP[low]
+    if low in _EN_STATUS_COMMON:
+        return _EN_STATUS_COMMON[low]
     # CJK (Chinesisch/Japanisch/Koreanisch) erkannt → nicht anzeigen.
     if any('　' <= c <= '鿿' or '가' <= c <= '힯' for c in s):
         return ''
@@ -20131,7 +20158,7 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
                     'gate': (f.get('gate') or '').strip(),
                     'terminal': (f.get('terminal') or '').strip(),
                     'hall': (f.get('halle') or '').strip(),
-                    'status': _de_flight_status(f.get('status')),
+                    'status': _de_flight_status(f.get('status'), is_arr=(flight_type == 'arrival')),
                     'delayed': (_fra_delay_min(f.get('sched'), f.get('esti'))
                                 >= _PUNCTUALITY_DELAY_THRESHOLD_MIN),
                     'reg': (f.get('reg') or '').strip(),
