@@ -9328,9 +9328,11 @@ _PAYWALL_WALL_DATE = '2026-12-26'          # Hard Wall ab hier (6 Monate Beta ab
 def _auth_created_at_for_token(token):
     """Echtes Signup-Datum (E-Mail-Auth) für einen Token, falls vorhanden."""
     try:
-        for v in (_auth_load() or {}).values():
-            if isinstance(v, dict) and v.get('token') == token:
-                return v.get('created_at')
+        # SCALE-FIX: Single-Row-Lookup by token statt Full-Table-Scan
+        # (Entitlement-Endpoint kann häufig gepollt werden).
+        _em, rec = _auth_find_user_by('token', token)
+        if rec:
+            return rec.get('created_at')
     except Exception:
         pass
     return None
@@ -11070,6 +11072,7 @@ def get_friends_homebases(token):
         grouped[hb].append({
             'token': fr[:16] + '…',  # truncate for privacy
             'name': pr.get('name') or 'Friend',
+            'avatar_url': pr.get('avatar_url'),
             'airline': pr.get('airline') or '',
             'position': pr.get('position') or '',
         })
@@ -11171,6 +11174,7 @@ def get_friends_today(token):
             # /friends → CrewMap-Pins fanden ihr Profil nie). Kein Token-Leak.
             'match_id': hashlib.sha256(fr.encode()).hexdigest()[:16],
             'name': pr.get('name') or 'Friend',
+            'avatar_url': pr.get('avatar_url'),
             'homebase': pr.get('homebase') or '',
             # GPS-reverse-geocodete Stadt (nur Stadt, nie exakte Koordinate) —
             # iOS zeigt damit die echte Layover-Location statt nur dem Airport.
@@ -14027,6 +14031,35 @@ def _dm_channel(token_a, token_b):
     return 'dm__' + '__'.join(sorted([a, b]))
 
 
+def _resolve_friend_token(my_token, friend_token):
+    """Eine über /friends-today gereichte friend_token-Variante kann PII-gekürzt
+    sein (`fr[:16] + '…'`). Die DM-Endpoints brauchen aber den VOLLEN Token: sonst
+    schlägt der Friendship-Check fehl (Chat-Sheet bleibt leer) UND der DM-Channel
+    wäre asymmetrisch (jede Seite kombiniert ihren vollen mit dem gekürzten Gegen-
+    Token → unterschiedliche `dm__`-IDs → Nachricht „kommt nicht an"). Wir lösen die
+    gekürzte Variante über die eigene Freundschafts-Kante auf: der volle Friend-Token,
+    der mit dem gesäuberten Prefix beginnt. Volle Tokens (exakt in der Friend-Liste)
+    laufen UNVERÄNDERT durch — der Resolver kann also nur FIXEN, nie einen
+    funktionierenden Voll-Token-Flow brechen."""
+    if not friend_token:
+        return friend_token
+    import re
+    cleaned = re.sub(r'[^A-Za-z0-9_-]', '', friend_token)
+    if not cleaned:
+        return friend_token
+    try:
+        friends = (_friends_load(my_token) or {}).get('friends') or []
+    except Exception:
+        return friend_token
+    full = [f for f in friends if isinstance(f, str)]
+    if cleaned in full:
+        return cleaned                      # schon voll → unverändert
+    matches = [f for f in full if f.startswith(cleaned)]
+    if len(matches) == 1:
+        return matches[0]                   # eindeutige Prefix-Auflösung → voller Token
+    return friend_token                     # nicht eindeutig → unverändert lassen
+
+
 def _group_id_from_channel(channel_id):
     """Extrahiert die friend-group-id aus einer Group-Channel-id.
     Akzeptiert die Präfixe `group__<gid>` und `grp__<gid>`. Gibt None zurück
@@ -14376,6 +14409,7 @@ def get_dm(token, friend_token):
     fremde DMs lesen, indem er beliebige andere Tokens als friend_token nutzt
     (das DM-Channel-File-Naming ist deterministisch).
     """
+    friend_token = _resolve_friend_token(token, friend_token)
     ch = _dm_channel(token, friend_token)
     if not ch: return jsonify({'error':'invalid_tokens'}), 400
     # Friendship verifizieren — beide Richtungen prüfen, weil eine Seite
@@ -14394,6 +14428,7 @@ def get_dm(token, friend_token):
 def send_dm(token, friend_token):
     if token.startswith('AT-GUEST-'):
         return jsonify({'ok': False, 'error': 'demo_mode_cannot_dm'}), 403
+    friend_token = _resolve_friend_token(token, friend_token)
     ch = _dm_channel(token, friend_token)
     if not ch: return jsonify({'ok': False, 'error':'invalid_tokens'}), 400
     # J14-Fix: DM nur zwischen Friends. Vorher: jeder mit token konnte
@@ -14432,6 +14467,7 @@ def send_dm(token, friend_token):
 def delete_dm_message(token, friend_token, message_id):
     """Soft-Delete einer eigenen Message in einem 1:1-DM (Convenience-Wrapper,
     spiegelt /channel/<id>/message/<id>). Channel deterministisch aus beiden Tokens."""
+    friend_token = _resolve_friend_token(token, friend_token)
     ch = _dm_channel(token, friend_token)
     if not ch:
         return jsonify({'ok': False, 'error': 'invalid_tokens'}), 400
@@ -19242,6 +19278,147 @@ def _auth_delete_disk_row(user_email):
         app.logger.warning(f'[auth-delete] disk_row_delete_fail: {type(e).__name__}: {str(e)[:120]}')
 
 
+# ── SCALE-FIX (2026-06-25): Single-Row Auth-Pfade ────────────────────
+# Problem: _auth_load()/_auth_save() lesen + schreiben die GANZE auth_users-
+# Tabelle bei JEDEM Login/Signup. Bei 5k gleichzeitigen Logins schmilzt SB.
+# Lösung: indizierter Single-Row-SELECT (email/token/apple_sub) + Single-Row-
+# UPSERT statt Load-All/Save-All. Semantik bleibt IDENTISCH — die Row-Bau-/
+# Row-Parse-Logik ist exakt aus _auth_save_to_supabase / _auth_load_from_supabase
+# herauskopiert, damit Spalten-Payload (und damit das ON-CONFLICT-Verhalten)
+# bit-für-bit gleich bleibt. _auth_load/_auth_save bleiben für den 60s-Token-
+# Cache + Nicht-Hot-Path-Aufrufer erhalten.
+
+def _auth_user_row(email, rec):
+    """Baut die Supabase-Row für genau einen User — identisch zur Bulk-Logik
+    in _auth_save_to_supabase (known cols → Spalten, Rest → metadata)."""
+    row = {'email': email}
+    meta = {}
+    for k, v in (rec or {}).items():
+        if k in _AUTH_KNOWN_COLS:
+            row[k] = v
+        else:
+            meta[k] = v
+    row['metadata'] = meta
+    return row
+
+
+def _auth_row_to_rec(row):
+    """Supabase-Row → in-memory rec — identisch zur Logik in
+    _auth_load_from_supabase (known cols + metadata-merge)."""
+    rec = {}
+    for k in _AUTH_KNOWN_COLS:
+        v = row.get(k)
+        if v is not None:
+            rec[k] = v
+    md = row.get('metadata') or {}
+    if isinstance(md, dict):
+        rec.update(md)
+    return rec
+
+
+def _auth_get_user_sb(email):
+    """Indizierter Single-Row-SELECT by email. Returns (rec_or_None, sb_ok).
+    sb_ok=False → Supabase nicht erreichbar (Caller nimmt Disk-Fallback)."""
+    if not SB_AVAILABLE or sb is None:
+        return (None, False)
+    try:
+        r = sb.table('auth_users').select('*').eq('email', email).limit(1).execute()
+        rows = r.data or []
+        if not rows:
+            return (None, True)
+        return (_auth_row_to_rec(rows[0]), True)
+    except Exception as e:
+        app.logger.warning(f'[auth] sb_get_user_fail err={type(e).__name__}: {str(e)[:120]}')
+        return (None, False)
+
+
+def _auth_get_user(email):
+    """Hot-Path Single-User-Read: SB primary (indiziert by email), Disk-Fallback
+    bei SB-Ausfall ODER für noch nicht migrierte Legacy-Disk-User.
+    Ersetzt `(_auth_load() or {}).get(email)` ohne Full-Table-Read.
+    Returns rec dict oder None."""
+    if not email:
+        return None
+    rec, sb_ok = _auth_get_user_sb(email)
+    if rec is not None:
+        return rec
+    # SB-Miss (sb_ok=True) ODER SB-down (sb_ok=False) → Disk prüfen:
+    # deckt Legacy-un-migrated User UND SB-Outage ab (nie User aussperren).
+    disk_rec = _auth_load_from_disk().get(email)
+    if disk_rec is not None and sb_ok and SB_AVAILABLE:
+        # Legacy Disk-only User, SB erreichbar → diese eine Row lazy-migrieren
+        try: _auth_upsert_user_sb(email, disk_rec)
+        except Exception: pass
+    return disk_rec
+
+
+def _auth_find_user_by(col, value):
+    """Single-Row-SELECT über eine known/indizierbare Spalte (token/apple_sub).
+    Returns (email, rec) oder (None, None). Bei SB-Miss/SB-down: Disk-Fallback-
+    Scan (selten — nur Apple-Sign-In / Delete-Account / Entitlement, kein
+    Login-Storm-Pfad)."""
+    if not value:
+        return (None, None)
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = sb.table('auth_users').select('*').eq(col, value).limit(1).execute()
+            rows = r.data or []
+            if rows:
+                row = rows[0]
+                return (row.get('email'), _auth_row_to_rec(row))
+        except Exception as e:
+            app.logger.warning(f'[auth] sb_find_{col}_fail err={type(e).__name__}: {str(e)[:120]}')
+    # Disk-Fallback (SB-down ODER Legacy-un-migrated)
+    for em, rec in (_auth_load_from_disk() or {}).items():
+        if (rec or {}).get(col) == value:
+            return (em, rec)
+    return (None, None)
+
+
+def _auth_upsert_user_sb(email, rec):
+    """Single-Row-UPSERT (on_conflict='email'). True bei Erfolg.
+    Payload exakt wie _auth_save_to_supabase pro Row → identisches Verhalten."""
+    if not SB_AVAILABLE or sb is None or not email:
+        return False
+    try:
+        sb.table('auth_users').upsert(_auth_user_row(email, rec), on_conflict='email').execute()
+        return True
+    except Exception as e:
+        app.logger.error(f'[auth] sb_upsert_user_fail err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _auth_upsert_disk_row(email, rec):
+    """Schreibt NUR die eine email-Row in den Disk-Read-Cache (re-read → set →
+    write), analog _auth_delete_disk_row. True bei Erfolg."""
+    if not email:
+        return False
+    try:
+        import os
+        p = _user_auth_path()
+        disk = {}
+        if os.path.exists(p):
+            with open(p) as f:
+                disk = json.load(f) or {}
+        disk[email] = rec
+        _atomic_write_json(p, disk)
+        return True
+    except Exception as e:
+        app.logger.warning(f'[auth] disk_row_upsert_fail: {type(e).__name__}: {str(e)[:120]}')
+        return False
+
+
+def _auth_upsert_user(email, rec):
+    """Single-Row-Save: SB primary + targeted Disk-Row. Ersetzt `_auth_save(users)`
+    auf dem Hot-Path ohne den ganzen Table neu zu schreiben.
+    Returns True wenn mindestens ein Pfad gehalten hat."""
+    sb_ok = _auth_upsert_user_sb(email, rec)
+    disk_ok = _auth_upsert_disk_row(email, rec)
+    if not (sb_ok or disk_ok):
+        app.logger.error('[auth] CRITICAL: single-row weder SB noch Disk gesichert — Daten verloren!')
+    return sb_ok or disk_ok
+
+
 def _auth_hash(pw):
     """LEGACY: sha256 unsalted. Bleibt für Backward-Verify alter Hashes.
     Neue Hashes via _password_hash(). Beim Login-Erfolg wird alter Hash
@@ -19430,17 +19607,18 @@ def auth_signup():
     ok_pw, err = _password_policy_ok(pw)
     if not ok_pw:
         return jsonify({'ok': False, 'error': err}), 400
-    users = _auth_load()
-    if email in users:
+    # SCALE-FIX: indizierter Single-Row-Check statt Full-Table-Load.
+    if _auth_get_user(email) is not None:
         return jsonify({'ok': False, 'error': 'email_already_exists'}), 409
     import uuid as _u
     token = 'AT-' + _u.uuid4().hex[:16].upper()
-    users[email] = {
+    rec = {
         'password_hash': _password_hash(pw),
         'token': token,
         'created_at': datetime.now().isoformat(),
     }
-    _auth_save(users)
+    # SCALE-FIX: Single-Row-Upsert (on_conflict email) statt Full-Table-Save.
+    _auth_upsert_user(email, rec)
     # Wave-1 BUG-004: cache-invalidate damit der eben erstellte Token sofort
     # im before_request-Auth-Gate sichtbar ist (sonst 401 bis 60s-TTL abläuft).
     try: _invalidate_token_cache()
@@ -19467,8 +19645,8 @@ def auth_login():
     if client_ip and _ip_rate_limited(client_ip, endpoint='auth_login', limit=30, window_sec=600):
         return jsonify({'ok': False, 'error': 'too_many_attempts',
                         'message': 'Zu viele Login-Versuche. Bitte in einigen Minuten erneut.'}), 429
-    users = _auth_load()
-    user = users.get(email)
+    # SCALE-FIX: indizierter Single-Row-Read statt Full-Table-Load.
+    user = _auth_get_user(email)
     if not user:
         return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
     ok, needs_rehash = _password_verify(pw, user.get('password_hash', ''))
@@ -19479,8 +19657,8 @@ def auth_login():
         try:
             user['password_hash'] = _password_hash(pw)
             user['hash_migrated_at'] = datetime.now().isoformat()
-            users[email] = user
-            _auth_save(users)
+            # SCALE-FIX: Single-Row-Upsert statt Full-Table-Save.
+            _auth_upsert_user(email, user)
             app.logger.info(f'[auth] migrated hash for {email[:3]}***')
         except Exception as e:
             app.logger.warning(f'[auth] rehash failed: {e}')
@@ -19591,16 +19769,15 @@ def auth_apple():
     if not email or '@' not in email:
         # Fallback: use sub as pseudo-email
         email = f'apple-{apple_sub[:20]}@privaterelay.aerox'
-    users = _auth_load()
-    # Existing user via apple_sub match? (bereits verknuepft → ok)
-    for ex_email, ex_user in users.items():
-        if ex_user.get('apple_sub') == apple_sub:
-            return jsonify({'ok': True, 'token': ex_user['token'], 'email': ex_email})
+    # SCALE-FIX: Single-Row-Lookup by apple_sub statt Full-Table-Scan.
+    ex_email, ex_user = _auth_find_user_by('apple_sub', apple_sub)
+    if ex_user is not None:
+        return jsonify({'ok': True, 'token': ex_user['token'], 'email': ex_email})
     # Existing user via email match: NICHT automatisch linken — Sicherheit.
     # Jemand koennte sonst per Apple-Sign-In Zugriff auf einen fremden
     # Email/Password-Account erlangen, falls die Email zufaellig matched.
     # User muss sich erst klassisch einloggen und dann manuell verknuepfen.
-    if email in users:
+    if _auth_get_user(email) is not None:
         return jsonify({'ok': False, 'error': 'account_exists_unlink',
                         'message': 'Es existiert bereits ein Account mit dieser E-Mail. '
                                    'Bitte logge dich erst per Passwort ein und verknuepfe '
@@ -19608,13 +19785,14 @@ def auth_apple():
     # Neuer Account
     import uuid as _u
     token = 'AT-' + _u.uuid4().hex[:16].upper()
-    users[email] = {
+    rec = {
         'token': token,
         'apple_sub': apple_sub,
         'created_at': datetime.now().isoformat(),
         # kein password_hash · klassischer login wäre für diesen Account disabled
     }
-    _auth_save(users)
+    # SCALE-FIX: Single-Row-Upsert statt Full-Table-Save.
+    _auth_upsert_user(email, rec)
     try: _invalidate_token_cache()
     except Exception: pass
     # Wenn Apple einen name geliefert hat (nur beim ersten Login) · ins Profile vorbefüllen
@@ -19698,15 +19876,16 @@ def auth_forgot():
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
     if client_ip and _ip_rate_limited(client_ip, endpoint='auth_forgot', limit=10, window_sec=600):
         return jsonify({'ok': True, 'sent': True}), 200
-    users = _auth_load()
+    # SCALE-FIX: Single-Row-Read/Upsert statt Full-Table-Load/Save.
     # Antwortet immer 200 ohne Detail (kein E-Mail-Enumeration).
-    if email in users:
+    user = _auth_get_user(email)
+    if user is not None:
         import uuid as _u
         reset_token = _u.uuid4().hex[:24]
-        users[email]['reset_token'] = reset_token
-        users[email]['reset_expires'] = (datetime.now() + timedelta(hours=2)).isoformat()
-        users[email].pop('reset_used_at', None)  # alter used_at-Marker entfernen, neuer Token
-        _auth_save(users)
+        user['reset_token'] = reset_token
+        user['reset_expires'] = (datetime.now() + timedelta(hours=2)).isoformat()
+        user.pop('reset_used_at', None)  # alter used_at-Marker entfernen, neuer Token
+        _auth_upsert_user(email, user)
         sent_ok = _send_password_reset_email(email, reset_token)
         if not sent_ok:
             # Resend-Key fehlt oder API-Fehler — User-Antwort bleibt neutral (kein
@@ -19724,8 +19903,8 @@ def auth_reset():
     ok_pw, err = _password_policy_ok(new_pw)
     if not ok_pw:
         return jsonify({'ok': False, 'error': err}), 400
-    users = _auth_load()
-    user = users.get(email)
+    # SCALE-FIX: indizierter Single-Row-Read statt Full-Table-Load.
+    user = _auth_get_user(email)
     if not user or user.get('reset_token') != reset_token:
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
     # Single-Use-Audit: wenn used_at gesetzt ist, wurde der Token bereits einmal
@@ -19742,7 +19921,10 @@ def auth_reset():
     user['reset_used_at'] = datetime.now().isoformat()  # Audit-Marker
     user.pop('reset_token', None)
     user.pop('reset_expires', None)
-    _auth_save(users)
+    # SCALE-FIX: Single-Row-Upsert statt Full-Table-Save. ON-CONFLICT-Verhalten
+    # identisch zum alten Bulk-Save (gepoppte Spalten bleiben SB-seitig stehen,
+    # Replay-Schutz greift über reset_used_at — unverändert).
+    _auth_upsert_user(email, user)
     app.logger.info(f'[auth-reset] PW erfolgreich gesetzt für {email[:3]}***')
     return jsonify({'ok': True})
 
@@ -19761,11 +19943,11 @@ def auth_delete_account():
     email = (body.get('email') or '').strip().lower()
     pw = body.get('password') or ''
     bearer_token = (body.get('token') or '').strip()
-    users = _auth_load()
+    # SCALE-FIX: Single-Row-Lookups statt Full-Table-Load.
     user = None
     user_email = None
     if email and pw:
-        user = users.get(email)
+        user = _auth_get_user(email)
         if not user:
             return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
         ok, _ = _password_verify(pw, user.get('password_hash', ''))
@@ -19774,11 +19956,10 @@ def auth_delete_account():
         user_email = email
     elif bearer_token:
         # Find user via stored token (Apple-Sign-In / authenticated session)
-        for ex_email, ex_user in users.items():
-            if ex_user.get('token') == bearer_token:
-                user = ex_user
-                user_email = ex_email
-                break
+        ex_email, ex_user = _auth_find_user_by('token', bearer_token)
+        if ex_user is not None:
+            user = ex_user
+            user_email = ex_email
         if not user:
             return jsonify({'ok': False, 'error': 'invalid_token'}), 401
         # SECURITY (P0, 2026-06-09): ein Email/Passwort-Account MUSS auch auf dem
@@ -23964,16 +24145,38 @@ def moderation_block_by_content(token):
 @app.route('/api/user/friend-requests/<token>', methods=['GET'])
 def list_friend_requests(token):
     d = _friends_load(token)
+    incoming = d.get('requests_in') or []
+    # NEU (additiv, backward-compat): volle Profile der Anfrage-Sender gleich mit-
+    # liefern, damit das Anfrage-UI Name/Avatar SOFORT zeigt statt N× getProfile
+    # pro Token (ein hängender Lookup ließ die Anfrage-Karte WEISS/leer rendern).
+    # Alte Clients lesen weiter `incoming` (Token-Liste); neue `incoming_profiles`.
+    incoming_profiles = []
+    for rt in incoming:
+        try:
+            pr = (_profile_load(rt) or {}).get('profile') or {}
+        except Exception:
+            pr = {}
+        incoming_profiles.append({
+            'token': rt,
+            'name': pr.get('name'),
+            'position': pr.get('position'),
+            'airline': pr.get('airline'),
+            'homebase': pr.get('homebase'),
+            'avatar_url': pr.get('avatar_url'),
+            'account_type': pr.get('account_type'),
+        })
     return jsonify({
-        'incoming': d.get('requests_in') or [],
+        'incoming': incoming,
+        'incoming_profiles': incoming_profiles,
         'outgoing': d.get('requests_out') or [],
     })
 
 
-@app.route('/api/user/friend-requests/<token>/send', methods=['POST'])
-def send_friend_request(token):
-    body = request.get_json(silent=True) or {}
-    target = (body.get('friend_token') or '').strip()
+def _send_friend_request_core(token, target):
+    """Gemeinsame Friend-Request-Logik — von /send (friend_token im Body) UND von
+    /redeem-invite (Aussteller aus signiertem Invite rekonstruiert) genutzt.
+    <token> = authentifizierter Absender, target = Empfänger."""
+    target = (target or '').strip()
     if not target or target == token:
         return jsonify({'ok': False, 'error': 'invalid_target'}), 400
     # Rate-Limit: max 30 Friend-Requests pro Stunde (verhindert Spam)
@@ -24023,6 +24226,85 @@ def send_friend_request(token):
     except Exception:
         pass
     return jsonify({'ok': True})
+
+
+@app.route('/api/user/friend-requests/<token>/send', methods=['POST'])
+def send_friend_request(token):
+    body = request.get_json(silent=True) or {}
+    target = (body.get('friend_token') or '').strip()
+    return _send_friend_request_core(token, target)
+
+
+# ── Friend-Invite (Security-Fix 2026-06-25) ─────────────────────────────────
+# Der Friend-QR trug bisher das ROHE AT-Bearer-Token (`{"t": "AT-…"}`). Ein
+# Screenshot/Shoulder-Surf des QR = Account-Übernahme (das AT-Token IST das
+# Bearer-Credential). Jetzt trägt der QR einen kurzlebigen, HMAC-signierten
+# Invite; das Aussteller-Token wird serverseitig aus der Signatur rekonstruiert
+# und verlässt das Gerät nie im QR.
+_FRIEND_INVITE_TTL_SEC = 15 * 60
+
+def _friend_invite_secret():
+    # RECOVERY_SECRET ist boot-validiert UND über alle Cloud-Run-Instanzen
+    # identisch. SESSION_SECRET ist per-Prozess zufällig → würde Invites über
+    # Instanzen/Restarts hinweg brechen, daher nur als Test-Fallback.
+    try:
+        sec = _recovery_pepper()
+    except Exception:
+        sec = ''
+    return ((sec or SESSION_SECRET) + '|friend-invite-v1').encode()
+
+def _make_friend_invite(issuer_token, ttl_sec=_FRIEND_INVITE_TTL_SEC):
+    exp = int(time.time()) + int(ttl_sec)
+    msg = f'{issuer_token}|{exp}'
+    sig = hmac.new(_friend_invite_secret(), msg.encode(), _hashlib.sha256).hexdigest()[:24]
+    raw = f'{msg}|{sig}'.encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip('=')
+
+def _verify_friend_invite(invite):
+    """Returns issuer_token bei gültigem, nicht-abgelaufenem Invite, sonst None."""
+    if not invite or not isinstance(invite, str):
+        return None
+    try:
+        pad = '=' * (-len(invite) % 4)
+        raw = base64.urlsafe_b64decode(invite + pad).decode()
+        issuer, exp_s, sig = raw.rsplit('|', 2)
+        exp = int(exp_s)
+    except Exception:
+        return None
+    expect = hmac.new(_friend_invite_secret(), f'{issuer}|{exp}'.encode(),
+                      _hashlib.sha256).hexdigest()[:24]
+    if not hmac.compare_digest(sig, expect):
+        return None
+    if exp < int(time.time()):
+        return None
+    if not issuer.startswith('AT-'):
+        return None
+    return issuer
+
+
+@app.route('/api/user/friend-requests/<token>/invite', methods=['POST'])
+def mint_friend_invite(token):
+    """Mintet einen kurzlebigen, signierten Invite für den eigenen Account.
+    Owner-scoped: das before_request-Auth-Gate bindet den Bearer an <token>.
+    Der zurückgegebene Invite enthält das AT-Token NUR HMAC-signiert."""
+    if not token.startswith('AT-'):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    return jsonify({'ok': True, 'invite': _make_friend_invite(token),
+                    'ttl': _FRIEND_INVITE_TTL_SEC})
+
+
+@app.route('/api/user/friend-requests/<token>/redeem-invite', methods=['POST'])
+def redeem_friend_invite(token):
+    """Scanner (authentifiziert als <token>) löst den gescannten Invite ein →
+    Friend-Request an den Aussteller. Das Aussteller-Token kommt aus der
+    Signatur, NICHT vom Client — ein rohes AT-Token wird hier nie akzeptiert."""
+    body = request.get_json(silent=True) or {}
+    issuer = _verify_friend_invite((body.get('invite') or '').strip())
+    if not issuer:
+        return jsonify({'ok': False, 'error': 'invalid_or_expired_invite'}), 400
+    if issuer == token:
+        return jsonify({'ok': False, 'error': 'own_invite'}), 400
+    return _send_friend_request_core(token, issuer)
 
 
 @app.route('/api/user/friend-requests/<token>/accept', methods=['POST'])
