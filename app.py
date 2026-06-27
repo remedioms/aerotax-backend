@@ -254,6 +254,36 @@ def _supabase_execute_with_timeout(label, fn, timeout_s=5):
         print(f'[supabase-timeout] {label} error: {type(e).__name__}: {e}')
         return None, True
 
+
+# Transiente httpx-Fehler beim Wiederverwenden einer stale Supabase-Connection
+# ("RemoteProtocolError: Server disconnected"). Cloud Run + supabase-py/httpx
+# halten Keep-Alive-Connections, die Supabase nach Idle schließt — der nächste
+# Call auf der gleichen Connection scheitert, ein RETRY auf frischer Connection
+# klappt. Symptom in den Logs: [delay-obs] sb_load/sb_write_FAIL.
+_SB_TRANSIENT_ERRORS = (
+    'RemoteProtocolError', 'RemoteDisconnected', 'ConnectError', 'ConnectTimeout',
+    'ReadError', 'ReadTimeout', 'WriteError', 'PoolTimeout', 'ConnectionError',
+)
+
+def _sb_retry(label, fn, retries=2, backoff=0.35):
+    """Führt fn() (typisch ein supabase `.execute()`) aus und wiederholt bei
+    TRANSIENTEN Verbindungsfehlern (stale Keep-Alive). Gibt das Ergebnis zurück
+    oder wirft den letzten Fehler nach `retries` Versuchen (Caller behält sein
+    bestehendes try/except + Disk-Fallback)."""
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if type(e).__name__ not in _SB_TRANSIENT_ERRORS or attempt >= retries:
+                raise
+            last = e
+            print(f'[sb-retry] {label}: {type(e).__name__} — retry {attempt + 1}/{retries}')
+            try: time.sleep(backoff * (attempt + 1))
+            except Exception: pass
+    if last:
+        raise last
+
 _REQ_LOG_PREFIX = '[req]'
 # Pfade die NICHT instrumentiert werden (zu noisy oder uninteressant):
 #   /api/progress (SSE-Endpoint, langer Open)
@@ -9468,6 +9498,13 @@ def get_user_profile(token):
 def put_user_profile(token):
     if not token:
         return jsonify({'error': 'invalid token'}), 400
+    # SECURITY (IDOR-Fix): PUT ist owner-scoped, wird aber über das Cross-User-Prefix
+    # (für den GET-Friend-Lookup) vom Binding-Gate AUSGENOMMEN. Schreiben MUSS an den
+    # Caller gebunden sein — sonst kann jeder ein fremdes Profil (Name/Homebase/
+    # Adresse/account_type) überschreiben. iOS sendet auf jedem Request den eigenen
+    # Bearer → legit passt; ein fremder Bearer matcht nicht.
+    if not _request_bearer_matches(token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
     body = request.get_json(silent=True) or {}
     # Whitelist erweitert: hometown + employers waren vorher silent-gedroppt
     # (G3-Finding) → User editiert "Hometown" → kein round-trip-Sync.
@@ -9605,6 +9642,11 @@ def post_user_location():
     token = (body.get('token') or '').strip()
     if not token:
         return jsonify({'ok': False, 'error': 'missing token'}), 400
+    # SECURITY (IDOR-Fix): Body-Token-Endpoint umgeht das Pfad-Token-Binding-Gate
+    # → expliziter Bearer-Match. Sonst könnte jeder die Stadt eines fremden Users
+    # setzen. iOS sendet auf JEDEM Request den eigenen Bearer → legit passt.
+    if not _request_bearer_matches(token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
 
     # Rate-Limit: 24 calls/Tag pro Token (24h window).
     if _token_rate_limited(token, 'user_location', limit=24, window_sec=86400):
@@ -13957,7 +13999,9 @@ def _dm_messages_save_to_supabase(channel_id, messages):
     rows = _sb_normalize_rows(rows, _SB_SCHEMA_DM_MESSAGES)
     try:
         for i in range(0, len(rows), 500):
-            sb.table('dm_messages').upsert(rows[i:i+500], on_conflict='id').execute()
+            _sb_retry('dm_save',
+                      lambda batch=rows[i:i+500]:
+                          sb.table('dm_messages').upsert(batch, on_conflict='id').execute())
         return True
     except Exception as e:
         app.logger.error(
@@ -17427,6 +17471,10 @@ def rate_layover(iata):
     token = (body.get('token') or '').strip()
     if not token:
         return jsonify({'ok': False, 'error': 'no_token'}), 401
+    # SECURITY (IDOR-Fix): Body-Token umgeht das Pfad-Binding-Gate → Bearer-Match,
+    # sonst kann man Ratings unter fremder Identität abgeben (Rating-Spoofing).
+    if not _request_bearer_matches(token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
     try:
         stars = int(body.get('stars') or 0)
     except Exception:
@@ -18924,6 +18972,11 @@ def register_push_apns():
     apns_token = (body.get('apns_token') or '').strip()
     if not user_token or not apns_token:
         return jsonify({'ok': False, 'error': 'missing token or apns_token'}), 400
+    # SECURITY (IDOR-Fix): Body-Token umgeht das Pfad-Binding-Gate → expliziter
+    # Bearer-Match. Sonst könnte ein Angreifer das APNs-Device eines fremden Users
+    # überschreiben (Push-Hijack: fremde DM-/Anfrage-Notifications abgreifen).
+    if not _request_bearer_matches(user_token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
     existing = _push_load(user_token) or {}
     merged = {
         'token': user_token,
@@ -19599,6 +19652,12 @@ def _email_valid(email: str) -> bool:
 
 @app.route('/api/auth/signup', methods=['POST'])
 def auth_signup():
+    # Anti-Abuse: IP-Rate-Limit gegen Massen-Account-Erstellung (Enumeration,
+    # Reset-Token-Brute-Force, Squatting). 15 Signups/Stunde/IP ist großzügig für
+    # NAT (mehrere echte User), stoppt aber Bots.
+    _ip = (request.headers.get('X-Forwarded-For', '') or request.remote_addr or '').split(',')[0].strip()
+    if _ip and _ip_rate_limited(_ip, 'signup', limit=15, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'too_many_signups'}), 429
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip().lower()
     pw = body.get('password') or ''
@@ -22931,9 +22990,10 @@ def _delay_store_load_from_sb(date_str, airport='FRA'):
         offset = 0
         page = 1000
         while True:
-            r = (sb.table('airport_delay_obs').select('*')
-                 .eq('date', date_str).eq('airport', airport)
-                 .range(offset, offset + page - 1).execute())
+            r = _sb_retry('delay_load',
+                          lambda: (sb.table('airport_delay_obs').select('*')
+                                   .eq('date', date_str).eq('airport', airport)
+                                   .range(offset, offset + page - 1).execute()))
             rows = r.data or []
             for row in rows:
                 fn = row.get('flight') or ''
@@ -23957,6 +24017,10 @@ def moderation_report(token):
     """Inhalts-Meldung. Body: {kind: 'wall_post'|'wall_comment'|'forum_thread'|
     'forum_reply'|'layoverrec'|'chat_msg'|'user', target_id: str,
     target_token: str?, reason: str, note: str?}"""
+    # Anti-Spam: max 30 Meldungen/Stunde/User — verhindert Report-Flooding eines
+    # fremden Users / der Moderations-Queue.
+    if _token_rate_limited(token, 'moderation_report', limit=30, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     body = request.get_json(silent=True) or {}
     kind = (body.get('kind') or '').strip()
     target_id = (body.get('target_id') or '').strip()
