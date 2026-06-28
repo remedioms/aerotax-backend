@@ -22201,16 +22201,6 @@ def ax_aircraft_history(reg):
     return jsonify({'ok': True, 'found': False, 'reg': rg, 'source': 'none'})
 
 
-def _transit_haversine_m(lat1, lon1, lat2, lon2):
-    """Luftlinie in Metern (für Fußweg Haus→erste Station)."""
-    import math
-    R = 6371000.0
-    p1 = math.radians(lat1); p2 = math.radians(lat2)
-    dp = math.radians(lat2 - lat1); dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(min(1.0, math.sqrt(a)))
-
-
 # Fernverkehr-Linien-Präfixe (für Post-Filter, falls products-Keys nicht greifen)
 _FERN_PREFIXES = ('ICE', 'IC', 'EC', 'ECE', 'RJ', 'RJX', 'TGV', 'NJ', 'EN', 'FLX')
 
@@ -22229,14 +22219,16 @@ def _leg_is_fern(name):
 
 @app.route('/api/ax/transit', methods=['GET'])
 def ax_transit():
-    """ÖPNV-Route Haus→Flughafen via db-rest (GRATIS DB-HAFAS-Proxy, kein API-Key).
-    Nahverkehr-only per Default (S-/U-/Bus/RE/RB/Tram) — Fernverkehr (ICE/IC/EC)
-    wird per Produktfilter UND zusätzlich per Linien-Post-Filter ausgeschlossen
-    (`?fern=1` erlaubt Fern). Native arrive-by-Suche: liefert `leave_at` (wann aus
-    dem Haus inkl. Fußweg zur ersten Station) + Legs [Fuß/U4/S8 mit dep/arr]. ALLES
-    in try/except → kann den Live-Service nie crashen; die App fällt zur Not auf
-    Apple-Transit-ETA zurück. Deckt ganz DE + Verkehrsverbünde ab.
-    Query: from_lat,from_lon,to_lat,to_lon,arrival(ISO mit TZ),fern(0/1)."""
+    """ÖPNV-Route Haus→Flughafen über GRATIS, kein-Key Router (Multi-Source):
+    ZUERST Transitous/MOTIS (purpose-built DE-weiter ÖPNV-Router), dann db-rest
+    v6/v5 (DB-HAFAS-Proxy) als Fallback — erster mit Treffer gewinnt, jeder eigener
+    try (langsamer/down Provider blockt nicht). Nahverkehr-only per Default (S-/U-/
+    Bus/RE/RB/Tram); Fernverkehr (ICE/IC/EC) wird per Produkt-/Mode-Filter UND per
+    Linien-Post-Filter ausgeschlossen (`?fern=1` erlaubt Fern). Native arrive-by-
+    Suche → `leave_at` (wann aus dem Haus inkl. Fußweg zur ersten Station) + Legs
+    [Fuß/U4/S8 mit dep/arr]. ALLES in try/except → kann den Live-Service nie
+    crashen; die App fällt zur Not auf Apple-Transit-ETA zurück.
+    Query: from_lat,from_lon,to_lat,to_lon,arrival(ISO mit TZ),fern(0/1),debug(0/1)."""
     try:
         flat = float(request.args.get('from_lat'))
         flon = float(request.args.get('from_lon'))
@@ -22249,54 +22241,120 @@ def ax_transit():
     try:
         import requests
         from datetime import datetime, timedelta
-        # db-rest: maintained REST-Proxy auf DB-HAFAS (gratis, kein Key, ganz DE +
-        # Verkehrsverbünde). Wir benutzen NICHT pyhafas-direct: dessen DBProfile zeigt
-        # auf DBs altes mgate-Host `reiseauskunft.bahn.de`, der abgeschaltet ist
-        # (NXDOMAIN). db-rest kann nativ „arrive-by" + Produktfilter via Query.
-        DBREST_HOSTS = ['https://v6.db.transport.rest', 'https://v5.db.transport.rest']
         UA = {'User-Agent': 'AeroX/1.0 (+https://aerosteuer.de; aerox@aerosteuer.de)'}
 
-        def _rest_get(host, path, params):
-            r = requests.get(host + path, params=params, headers=UA, timeout=18)
+        def _get_json(url, params, timeout):
+            r = requests.get(url, params=params, headers=UA, timeout=timeout)
             r.raise_for_status()
             return r.json()
 
-        # Produktfilter: Nahverkehr an, Fern (ICE/IC/EC) aus außer ?fern=1.
-        # EINE Tür-zu-Tür-Abfrage direkt mit Koordinaten (from.latitude/longitude +
-        # Adress-Label) → db-rest liefert den Fußweg Haus→Station als eigenes Leg
-        # nativ mit, kein separater nearby-Call, weniger Roundtrips (= weniger Timeout).
+        # MOTIS-Fern-Modes (Transitous) → bei Nahverkehr-only ausschließen.
+        _MOTIS_FERN = ('HIGHSPEED_RAIL', 'LONG_DISTANCE', 'NIGHT_RAIL', 'COACH', 'AIRPLANE')
+
+        def _norm_motis(data):
+            """Transitous/MOTIS-Itineraries → normalisierte Leg-Listen."""
+            out = []
+            for it in (data or {}).get('itineraries', []) or []:
+                legs = []
+                for leg in it.get('legs', []) or []:
+                    mode = (leg.get('mode') or '').upper()
+                    is_walk = mode in ('WALK', 'BIKE', 'CAR')
+                    short = leg.get('routeShortName') or leg.get('displayName') or leg.get('headsign')
+                    f = leg.get('from') or {}
+                    t = leg.get('to') or {}
+                    is_fern = (mode in _MOTIS_FERN) or _leg_is_fern(short)
+                    legs.append({
+                        'mode': 'walk' if is_walk else 'transit',
+                        'line': None if is_walk else short, 'product': mode.lower(),
+                        'fern': is_fern,
+                        'from': f.get('name'), 'to': t.get('name'),
+                        'from_lat': f.get('lat'), 'from_lon': f.get('lon'),
+                        'dep': leg.get('startTime'), 'arr': leg.get('endTime'),
+                    })
+                if legs:
+                    out.append(legs)
+            return out
+
+        def _norm_dbrest(data):
+            """db-rest-Journeys → normalisierte Leg-Listen."""
+            out = []
+            for j in (data or {}).get('journeys', []) or []:
+                legs = []
+                for leg in j.get('legs', []) or []:
+                    is_walk = bool(leg.get('walking'))
+                    line = leg.get('line') or {}
+                    name = line.get('name')
+                    product = (line.get('product') or '')
+                    o = leg.get('origin') or {}
+                    d = leg.get('destination') or {}
+                    oloc = o.get('location') or {}
+                    is_fern = product in ('nationalExpress', 'national') or _leg_is_fern(name)
+                    legs.append({
+                        'mode': 'walk' if is_walk else 'transit',
+                        'line': None if is_walk else name, 'product': product,
+                        'fern': is_fern,
+                        'from': o.get('name'), 'to': d.get('name'),
+                        'from_lat': oloc.get('latitude'), 'from_lon': oloc.get('longitude'),
+                        'dep': leg.get('departure') or leg.get('plannedDeparture'),
+                        'arr': leg.get('arrival') or leg.get('plannedArrival'),
+                    })
+                if legs:
+                    out.append(legs)
+            return out
+
         prod = 'true'
         fern = 'true' if want_fern else 'false'
-        jparams = {
+        # db-rest: EINE Tür-zu-Tür-Abfrage direkt mit Koordinaten → Fußweg als Leg.
+        dbrest_params = {
             'from.latitude': flat, 'from.longitude': flon, 'from.address': 'Zuhause',
             'to.latitude': tlat, 'to.longitude': tlon, 'to.address': 'Flughafen',
-            'nationalExpress': fern, 'national': fern,            # ICE / IC,EC
+            'nationalExpress': fern, 'national': fern,
             'regionalExpress': prod, 'regional': prod,
             'suburban': prod, 'subway': prod, 'tram': prod,
             'bus': prod, 'ferry': prod, 'taxi': 'false',
-            'results': 5, 'stopovers': 'false', 'remarks': 'false',
-            'walkingSpeed': 'normal',
+            'results': 5, 'stopovers': 'false', 'remarks': 'false', 'walkingSpeed': 'normal',
         }
         if arrival_s:
-            jparams['arrival'] = arrival_s     # arrive-by: alle Treffer landen ≤ Ziel
+            dbrest_params['arrival'] = arrival_s
         else:
-            jparams['departure'] = 'now'
+            dbrest_params['departure'] = 'now'
 
-        dbg = {'hosts': []}
+        # Transitous (MOTIS): freier, kein-Key, DE-weiter ÖPNV-Router. Native
+        # arrive-by-Suche (`arriveBy`+`time`). Wird ZUERST versucht (purpose-built,
+        # zuverlässiger als die langsamen db-rest-Public-Proxies), db-rest als Fallback.
+        motis_params = {'fromPlace': f'{flat},{flon}', 'toPlace': f'{tlat},{tlon}',
+                        'numItineraries': 5}
+        if arrival_s:
+            motis_params['time'] = arrival_s
+            motis_params['arriveBy'] = 'true'
+
+        # Provider-Reihenfolge: (Name, callable→normalisierte Journeys). Erster mit
+        # Treffer gewinnt. Jeder eigener try → ein langsamer/down Provider blockt nicht.
+        providers = [
+            ('transitous', lambda: _norm_motis(
+                _get_json('https://api.transitous.org/api/v1/plan', motis_params, 12))),
+            ('db_rest_v6', lambda: _norm_dbrest(
+                _get_json('https://v6.db.transport.rest/journeys', dbrest_params, 10))),
+            ('db_rest_v5', lambda: _norm_dbrest(
+                _get_json('https://v5.db.transport.rest/journeys', dbrest_params, 10))),
+        ]
+
+        dbg = {'providers': []}
         journeys = None
-        for host in DBREST_HOSTS:
-            h = {'host': host}
+        source = None
+        for name, fn in providers:
+            p = {'name': name}
             try:
-                data = _rest_get(host, '/journeys', jparams)
-                js = (data or {}).get('journeys') or []
-                h['n_journeys'] = len(js)
-                dbg['hosts'].append(h)
+                js = fn() or []
+                p['n'] = len(js)
+                dbg['providers'].append(p)
                 if js:
                     journeys = js
+                    source = name
                     break
-            except Exception as he:
-                h['err'] = f'{type(he).__name__}: {str(he)[:140]}'
-                dbg['hosts'].append(h)
+            except Exception as pe:
+                p['err'] = f'{type(pe).__name__}: {str(pe)[:120]}'
+                dbg['providers'].append(p)
                 continue
         if not journeys:
             out = {'ok': True, 'found': False, 'reason': 'no_journey'}
@@ -22304,50 +22362,21 @@ def ax_transit():
                 out['debug'] = dbg
             return jsonify(out)
 
-        def _legs_of(j):
-            out = []
-            for leg in j.get('legs', []) or []:
-                is_walk = bool(leg.get('walking'))
-                line = leg.get('line') or {}
-                name = line.get('name')
-                product = (line.get('product') or '')
-                o = leg.get('origin') or {}
-                d = leg.get('destination') or {}
-                oloc = o.get('location') or {}
-                is_fern = product in ('nationalExpress', 'national') or _leg_is_fern(name)
-                out.append({
-                    'mode': 'walk' if is_walk else 'transit',
-                    'line': name,
-                    'product': product,
-                    'fern': is_fern,
-                    'from': o.get('name'),
-                    'to': d.get('name'),
-                    'from_lat': oloc.get('latitude'),
-                    'from_lon': oloc.get('longitude'),
-                    'dep': leg.get('departure') or leg.get('plannedDeparture'),
-                    'arr': leg.get('arrival') or leg.get('plannedArrival'),
-                })
-            return out
-
-        # db-rest liefert bei arrival= alle Verbindungen, die rechtzeitig ankommen,
-        # nach Abfahrt aufsteigend → SPÄTESTE Nahverkehr-Verbindung = so spät wie
-        # möglich aus dem Haus. Fern-Treffer (falls Filter mal durchlässt) verwerfen.
         def _mins(a, b):
             try:
                 return max(0, int((datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds() // 60))
             except Exception:
                 return 0
 
+        # SPÄTESTE rechtzeitige, Nahverkehr-only Verbindung = so spät wie möglich
+        # aus dem Haus. Fern-Treffer (falls Filter durchlässt) verwerfen.
         best = None
-        for j in journeys:
-            legs = _legs_of(j)
+        for legs in journeys:
             transit_legs = [l for l in legs if l['mode'] == 'transit']
             if not transit_legs:
                 continue
             if (not want_fern) and any(l['fern'] for l in transit_legs):
                 continue
-            # leave_at = Abfahrt des ALLERERSTEN Legs (der Fußweg Haus→Station) =
-            # wann aus dem Haus. transit_dep = Abfahrt des ersten Zugs/U-Bahn.
             leave_at = next((l['dep'] for l in legs if l['dep']), None)
             transit_dep = next((l['dep'] for l in transit_legs if l['dep']), None)
             last_arr = next((l['arr'] for l in reversed(legs) if l['arr']), None)
@@ -22356,15 +22385,17 @@ def ax_transit():
             walk_min = _mins(wleg['dep'], wleg['arr']) if wleg else 0
             cand = {'legs': legs, 'leave_at': leave_at, 'transit_dep': transit_dep,
                     'last_arr': last_arr, 'first_stop': ft['from'], 'walk_min': walk_min}
-            # SPÄTESTE rechtzeitige Verbindung = so spät wie möglich aus dem Haus
             if best is None or (leave_at and best['leave_at'] and leave_at > best['leave_at']):
                 best = cand
 
         if best is None:
-            return jsonify({'ok': True, 'found': False, 'reason': 'no_nahverkehr'})
+            out = {'ok': True, 'found': False, 'reason': 'no_nahverkehr'}
+            if request.args.get('debug') == '1':
+                out['debug'] = dbg
+            return jsonify(out)
 
-        return jsonify({
-            'ok': True, 'found': True, 'source': 'db_rest',
+        out = {
+            'ok': True, 'found': True, 'source': source,
             'leave_at': best['leave_at'],          # wann aus dem Haus (Fußweg-Start)
             'walk_to_stop_min': best['walk_min'],
             'first_stop': best['first_stop'],
@@ -22372,7 +22403,10 @@ def ax_transit():
             'last_arr': best['last_arr'],
             'arrival_target': arrival_s,
             'legs': best['legs'],
-        })
+        }
+        if request.args.get('debug') == '1':
+            out['debug'] = dbg
+        return jsonify(out)
     except Exception as e:
         app.logger.warning(f'[ax_transit] fail {type(e).__name__}: {str(e)[:400]}')
         return jsonify({'ok': False, 'error': f'{type(e).__name__}: {str(e)[:300]}'}), 200
