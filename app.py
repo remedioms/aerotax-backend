@@ -22247,6 +22247,7 @@ def ax_transit():
     arrival_s = (request.args.get('arrival') or '').strip()   # ISO: "spätestens da sein"
     want_fern = request.args.get('fern') == '1'
     try:
+        import requests
         from datetime import datetime, timedelta
         # db-rest: maintained REST-Proxy auf DB-HAFAS (gratis, kein Key, ganz DE +
         # Verkehrsverbünde). Wir benutzen NICHT pyhafas-direct: dessen DBProfile zeigt
