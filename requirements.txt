@@ -29,8 +29,7 @@ httpx[http2]>=0.27.0
 sentry-sdk[flask]>=2.0.0
 # Cloudflare R2 (S3-kompatibel) für Avatar-/Foto-Storage — Zero-Egress, durabel.
 boto3>=1.34.0
-# pyhafas: GRATIS DB-HAFAS-Client (kein API-Key) für ÖPNV-Routing Haus→Flughafen
-# (/api/ax/transit). Nahverkehr-only, ganz DE + Verkehrsverbünde. Defensiv in
-# try/except gekapselt — fehlt das Lib oder failt HAFAS, fällt die App auf
-# Apple-Transit-ETA zurück.
-pyhafas>=0.4.0
+# ÖPNV-Routing (/api/ax/transit) nutzt den gratis db-rest REST-Proxy auf DB-HAFAS
+# (kein API-Key, ganz DE + Verkehrsverbünde) — reine HTTP-Calls über `requests`,
+# KEINE Extra-Dependency nötig. pyhafas-direct wäre tot (sein DBProfile zeigt auf
+# DBs abgeschaltetes mgate-Host reiseauskunft.bahn.de → NXDOMAIN).
