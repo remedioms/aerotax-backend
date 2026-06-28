@@ -22332,11 +22332,11 @@ def ax_transit():
         # Treffer gewinnt. Jeder eigener try → ein langsamer/down Provider blockt nicht.
         providers = [
             ('transitous', lambda: _norm_motis(
-                _get_json('https://api.transitous.org/api/v1/plan', motis_params, 12))),
+                _get_json('https://api.transitous.org/api/v6/plan', motis_params, 14))),
             ('db_rest_v6', lambda: _norm_dbrest(
-                _get_json('https://v6.db.transport.rest/journeys', dbrest_params, 10))),
+                _get_json('https://v6.db.transport.rest/journeys', dbrest_params, 9))),
             ('db_rest_v5', lambda: _norm_dbrest(
-                _get_json('https://v5.db.transport.rest/journeys', dbrest_params, 10))),
+                _get_json('https://v5.db.transport.rest/journeys', dbrest_params, 9))),
         ]
 
         dbg = {'providers': []}
