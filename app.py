@@ -22448,9 +22448,22 @@ def ax_transit():
             except Exception:
                 return 0
 
-        # SPÄTESTE rechtzeitige, Nahverkehr-only Verbindung = so spät wie möglich
-        # aus dem Haus. Fern-Treffer (falls Filter durchlässt) verwerfen.
-        best = None
+        # Zielzeit (für die Pünktlichkeits-Prüfung): PÜNKTLICH heißt am Flughafen
+        # spätestens zur `arrival_s` sein. Wir dürfen NIE eine Verbindung empfehlen,
+        # die zu spät ankommt.
+        def _parse(s):
+            try:
+                dt = datetime.fromisoformat((s or '').replace('Z', '+00:00'))
+                return dt.replace(tzinfo=None) if dt.tzinfo else dt
+            except Exception:
+                return None
+        target_dt = _parse(arrival_s) if arrival_s else None
+
+        # SPÄTESTE PÜNKTLICHE, Nahverkehr-only Verbindung = so spät wie möglich aus
+        # dem Haus, aber rechtzeitig am Flughafen. Fern-Treffer verwerfen. Kommt KEINE
+        # rechtzeitig an (Randfall), nimm die am wenigsten verspätete (früheste Ankunft).
+        best = None              # späteste pünktliche
+        fallback = None          # früheste Ankunft, falls keine pünktlich ist
         for legs in journeys:
             transit_legs = [l for l in legs if l['mode'] == 'transit']
             if not transit_legs:
@@ -22465,8 +22478,20 @@ def ax_transit():
             walk_min = _mins(wleg['dep'], wleg['arr']) if wleg else 0
             cand = {'legs': legs, 'leave_at': leave_at, 'transit_dep': transit_dep,
                     'last_arr': last_arr, 'first_stop': ft['from'], 'walk_min': walk_min}
+            arr_dt = _parse(last_arr)
+            # früheste-Ankunft-Fallback unabhängig von Pünktlichkeit
+            if fallback is None or (arr_dt and fallback.get('_arr') and arr_dt < fallback['_arr']):
+                fallback = dict(cand, _arr=arr_dt)
+            # pünktlich? (2 Min Toleranz). Ohne Zielzeit gilt jede als ok.
+            on_time = (target_dt is None) or (arr_dt is not None and
+                                              arr_dt <= target_dt + timedelta(minutes=2))
+            if not on_time:
+                continue
             if best is None or (leave_at and best['leave_at'] and leave_at > best['leave_at']):
                 best = cand
+        if best is None and fallback is not None:
+            fallback.pop('_arr', None)
+            best = fallback
 
         if best is None:
             out = {'ok': True, 'found': False, 'reason': 'no_nahverkehr'}
