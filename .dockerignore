@@ -20,6 +20,8 @@ jobs/
 sessions/
 pdfs/
 _job_chunks_state/
+jobs_state/
+_user_history_state/
 debug_snapshots/
 
 # Editor-Artefakte

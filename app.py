@@ -22389,8 +22389,8 @@ def ax_transit():
             'legs': best['legs'],
         })
     except Exception as e:
-        app.logger.warning(f'[ax_transit] fail {str(e)[:160]}')
-        return jsonify({'ok': False, 'error': str(e)[:160]}), 200
+        app.logger.warning(f'[ax_transit] fail {type(e).__name__}: {str(e)[:400]}')
+        return jsonify({'ok': False, 'error': f'{type(e).__name__}: {str(e)[:300]}'}), 200
 
 
 @app.route('/api/airport/<token>/board', methods=['GET'])
