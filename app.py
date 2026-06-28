@@ -22201,6 +22201,198 @@ def ax_aircraft_history(reg):
     return jsonify({'ok': True, 'found': False, 'reg': rg, 'source': 'none'})
 
 
+def _transit_haversine_m(lat1, lon1, lat2, lon2):
+    """Luftlinie in Metern (für Fußweg Haus→erste Station)."""
+    import math
+    R = 6371000.0
+    p1 = math.radians(lat1); p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1); dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(min(1.0, math.sqrt(a)))
+
+
+# Fernverkehr-Linien-Präfixe (für Post-Filter, falls products-Keys nicht greifen)
+_FERN_PREFIXES = ('ICE', 'IC', 'EC', 'ECE', 'RJ', 'RJX', 'TGV', 'NJ', 'EN', 'FLX')
+
+
+def _leg_is_fern(name):
+    n = (name or '').upper().replace(' ', '')
+    # "IC2045" / "ICE 599" → Fern; "S8"/"U4"/"RE"/"RB"/"Bus" → Nah
+    for p in _FERN_PREFIXES:
+        if n.startswith(p):
+            # "ICE..." ja, aber NICHT "ICExyz"-Fehlmatch wie "IC E..." abdecken:
+            rest = n[len(p):]
+            if not rest or rest[0].isdigit() or rest[0] == ' ':
+                return True
+    return False
+
+
+@app.route('/api/ax/transit', methods=['GET'])
+def ax_transit():
+    """ÖPNV-Route Haus→Flughafen via DB-HAFAS (pyhafas, GRATIS, kein API-Key).
+    Nahverkehr-only per Default (S-/U-/Bus/RE/RB/Tram) — Fernverkehr (ICE/IC/EC)
+    wird per products-Filter UND zusätzlich per Linien-Post-Filter ausgeschlossen
+    (`?fern=1` erlaubt Fern). Liefert `leave_at` (wann aus dem Haus inkl. Fußweg
+    zur ersten Station) + Legs [Fuß/U4/S8 mit dep/arr]. ALLES in try/except →
+    kann den Live-Service nie crashen; die App fällt zur Not auf Apple-Transit-
+    ETA zurück. Quelle: Deutsche-Bahn-HAFAS, deckt ganz DE + Verkehrsverbünde ab."""
+    try:
+        flat = float(request.args.get('from_lat'))
+        flon = float(request.args.get('from_lon'))
+        tlat = float(request.args.get('to_lat'))
+        tlon = float(request.args.get('to_lon'))
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'bad_coords'}), 400
+    arrival_s = (request.args.get('arrival') or '').strip()   # ISO: "spätestens da sein"
+    want_fern = request.args.get('fern') == '1'
+    try:
+        from datetime import datetime, timedelta
+        from pyhafas import HafasClient
+        from pyhafas.profile import DBProfile
+        from pyhafas.types.nearby import LatLng
+
+        client = HafasClient(DBProfile())
+
+        # Haus + Flughafen → nächstgelegene HAFAS-Station (nearby nimmt LatLng)
+        near_o = client.nearby(LatLng(latitude=flat, longitude=flon))
+        near_d = client.nearby(LatLng(latitude=tlat, longitude=tlon))
+        if not near_o or not near_d:
+            return jsonify({'ok': True, 'found': False, 'reason': 'no_station'})
+        origin = near_o[0]
+        dest = near_d[0]
+
+        # Zielzeit: "spätestens am Flughafen sein". pyhafas sucht ab Abfahrtszeit →
+        # wir suchen ab (Ziel − 150min) und nehmen die SPÄTESTE Verbindung, die noch
+        # rechtzeitig ankommt (= so spät wie möglich aus dem Haus).
+        try:
+            arr_dt = (datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+                      if arrival_s else datetime.now())
+            if arr_dt.tzinfo is not None:
+                arr_dt = arr_dt.replace(tzinfo=None)
+        except Exception:
+            arr_dt = datetime.now()
+        search_from = arr_dt - timedelta(minutes=150)
+
+        products = {
+            'long_distance_express': want_fern,   # ICE
+            'long_distance': want_fern,            # IC / EC
+            'regional_express': True, 'regional': True,
+            'suburban': True, 'subway': True, 'tram': True, 'bus': True,
+            'ferry': True, 'taxi': want_fern,
+        }
+        journeys = None
+        for use_products in (True, False):
+            try:
+                kw = dict(origin=origin, destination=dest, date=search_from,
+                          max_changes=-1, min_change_time=0)
+                if use_products:
+                    kw['products'] = products
+                journeys = client.journeys(**kw)
+                if journeys:
+                    break
+            except Exception:
+                journeys = None
+                continue
+        if not journeys:
+            return jsonify({'ok': True, 'found': False, 'reason': 'no_journey'})
+
+        def _legs_of(j):
+            out = []
+            for leg in getattr(j, 'legs', []) or []:
+                mode_raw = getattr(leg, 'mode', None)
+                mode_v = getattr(mode_raw, 'value', None) or str(mode_raw or '')
+                is_walk = 'walk' in mode_v.lower()
+                name = getattr(leg, 'name', None)
+                o = getattr(leg, 'origin', None)
+                d = getattr(leg, 'destination', None)
+                dep = getattr(leg, 'departure', None)
+                arr = getattr(leg, 'arrival', None)
+                out.append({
+                    'mode': 'walk' if is_walk else 'transit',
+                    'line': name,
+                    'fern': _leg_is_fern(name),
+                    'from': getattr(o, 'name', None),
+                    'to': getattr(d, 'name', None),
+                    'from_lat': getattr(o, 'latitude', None),
+                    'from_lon': getattr(o, 'longitude', None),
+                    'dep': dep.isoformat() if dep else None,
+                    'arr': arr.isoformat() if arr else None,
+                })
+            return out
+
+        # SPÄTESTE rechtzeitige, Nahverkehr-only Verbindung wählen
+        best = None
+        for j in journeys:
+            legs = _legs_of(j)
+            transit_legs = [l for l in legs if l['mode'] == 'transit']
+            if not transit_legs:
+                continue
+            if (not want_fern) and any(l['fern'] for l in transit_legs):
+                continue
+            last_arr = None
+            for l in reversed(legs):
+                if l['arr']:
+                    last_arr = l['arr']; break
+            try:
+                last_arr_dt = datetime.fromisoformat(last_arr) if last_arr else None
+                if last_arr_dt and last_arr_dt.tzinfo is not None:
+                    last_arr_dt = last_arr_dt.replace(tzinfo=None)
+            except Exception:
+                last_arr_dt = None
+            if last_arr_dt and last_arr_dt > arr_dt + timedelta(minutes=3):
+                continue   # kommt zu spät
+            # erste echte (nicht-Fuß) Abfahrt
+            first_dep = None
+            for l in legs:
+                if l['dep']:
+                    first_dep = l['dep']; break
+            cand = {'legs': legs, 'first_dep': first_dep, 'last_arr': last_arr,
+                    'first_stop_lat': transit_legs[0]['from_lat'],
+                    'first_stop_lon': transit_legs[0]['from_lon'],
+                    'first_stop': transit_legs[0]['from']}
+            # "späteste" = größte first_dep
+            if best is None or (first_dep and best['first_dep'] and first_dep > best['first_dep']):
+                best = cand
+
+        if best is None:
+            return jsonify({'ok': True, 'found': False, 'reason': 'no_nahverkehr'})
+
+        # Fußweg Haus → erste Station (HAFAS-Journey startet an der Station, nicht
+        # an der Haustür) → Abfahrt-zuhause = erste Abfahrt − Fußweg.
+        walk_min = 0
+        try:
+            if best['first_stop_lat'] and best['first_stop_lon']:
+                d_m = _transit_haversine_m(flat, flon,
+                                           float(best['first_stop_lat']),
+                                           float(best['first_stop_lon']))
+                walk_min = int(round(d_m / 75.0))   # ~4.5 km/h Gehweg
+        except Exception:
+            walk_min = 0
+        leave_at = None
+        try:
+            if best['first_dep']:
+                fd = datetime.fromisoformat(best['first_dep'])
+                fd_naive = fd.replace(tzinfo=None) if fd.tzinfo else fd
+                leave_at = (fd_naive - timedelta(minutes=walk_min))
+                leave_at = leave_at.replace(tzinfo=fd.tzinfo).isoformat() if fd.tzinfo else leave_at.isoformat()
+        except Exception:
+            leave_at = best['first_dep']
+
+        return jsonify({
+            'ok': True, 'found': True, 'source': 'db_hafas',
+            'leave_at': leave_at,
+            'walk_to_stop_min': walk_min,
+            'first_stop': best['first_stop'],
+            'first_dep': best['first_dep'],
+            'last_arr': best['last_arr'],
+            'arrival_target': arrival_s,
+            'legs': best['legs'],
+        })
+    except Exception as e:
+        app.logger.warning(f'[ax_transit] fail {str(e)[:160]}')
+        return jsonify({'ok': False, 'error': str(e)[:160]}), 200
+
+
 @app.route('/api/airport/<token>/board', methods=['GET'])
 def airport_board(token):
     """Per-Airport-Board (live). Query: ?airport=MUC&type=departure|arrival&airline=LH&limit=60.
