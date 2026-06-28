@@ -22356,7 +22356,15 @@ def ax_transit():
         motis_params = {'fromPlace': f'{flat},{flon}', 'toPlace': f'{tlat},{tlon}',
                         'numItineraries': 5}
         if arrival_s:
-            motis_params['time'] = arrival_s
+            # MOTIS will RFC3339; ein TZ-Offset („+02:00") lässt v6 500en → immer auf
+            # UTC-„Z" normalisieren (db-rest/EFA bekommen weiter ihr eigenes Format).
+            try:
+                _au = datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+                from datetime import timezone as _tz
+                motis_time = (_au.astimezone(_tz.utc) if _au.tzinfo else _au).strftime('%Y-%m-%dT%H:%M:%SZ')
+            except Exception:
+                motis_time = arrival_s
+            motis_params['time'] = motis_time
             motis_params['arriveBy'] = 'true'
 
         # MVV-EFA (Großraum München): die eigene, authoritative ÖPNV-Auskunft des
