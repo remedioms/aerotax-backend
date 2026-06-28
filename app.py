@@ -8221,6 +8221,21 @@ def _reports_log_path():
 
 
 def _load_reports():
+    # DURABEL: zuerst aus Supabase (überlebt Cloud-Run-Restarts/Redeploys + ist über
+    # mehrere Instanzen konsistent). Die lokale JSON liegt auf der EPHEMEREN Disk und
+    # wird bei jedem Deploy/Restart gewischt — DAS war der Grund, warum gemeldete
+    # Inhalte im Panel „verschwanden". Disk bleibt nur als Fallback (z.B. Tabelle
+    # existiert noch nicht).
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = (sb.table('ax_moderation_reports').select('data')
+                 .eq('id', 'all').limit(1).execute())
+            if r.data:
+                d = r.data[0].get('data')
+                if isinstance(d, list):
+                    return d
+        except Exception:
+            pass
     try:
         with open(_reports_log_path()) as f:
             return json.load(f) or []
@@ -8229,6 +8244,14 @@ def _load_reports():
 
 
 def _save_reports(reports):
+    # Durabel nach Supabase (ein JSON-Blob-Row) + Disk-Fallback. Schlägt der
+    # Supabase-Write fehl (Tabelle fehlt o.ä.), bleibt wenigstens die Disk-Kopie.
+    if SB_AVAILABLE and sb is not None:
+        try:
+            sb.table('ax_moderation_reports').upsert(
+                {'id': 'all', 'data': reports}).execute()
+        except Exception:
+            pass
     try:
         _atomic_write_json(_reports_log_path(), reports)
     except Exception:
@@ -24355,11 +24378,9 @@ def moderation_report(token):
                     'layoverrec', 'layoverrec_comment', 'chat_msg', 'user'):
         return jsonify({'ok': False, 'error': 'invalid_kind'}), 400
 
-    reports_p = os.path.join(_USER_HISTORY_DIR, 'reports_log.json')
-    try:
-        with open(reports_p) as f: reports = json.load(f) or []
-    except Exception:
-        reports = []
+    # Durabel laden (Supabase-first, Disk-Fallback) — NICHT mehr direkt von der
+    # ephemeren Disk, sonst gehen Meldungen bei jedem Deploy/Restart verloren.
+    reports = _load_reports()
     entry = {
         'id': uuid.uuid4().hex[:12],
         'ts': time.time(),
@@ -24375,12 +24396,7 @@ def moderation_report(token):
     # Cap auf 50k Reports — älteste droppen
     if len(reports) > 50000:
         reports = reports[-50000:]
-    try:
-        _atomic_write_json(reports_p, reports)
-    except Exception:
-        try:
-            with open(reports_p, 'w') as f: json.dump(reports, f)
-        except Exception: pass
+    _save_reports(reports)
     # KEIN Auto-Hide/Auto-Delete mehr (User-Entscheid 2026-06-25): Meldungen
     # werden NICHT automatisch bei N Reportern versteckt. Der Betreiber bekommt
     # jede Meldung per Mail + Panel und entscheidet manuell (löschen/erledigt).
