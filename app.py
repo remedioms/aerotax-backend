@@ -22286,25 +22286,36 @@ def ax_transit():
         else:
             jparams['departure'] = 'now'
 
+        dbg = {'hosts': []}
         journeys = None
         first_stop_geo = None    # (lat, lon, name) der ersten Station für Fußweg
         for host in DBREST_HOSTS:
+            h = {'host': host}
             try:
                 oid, ogeo = _nearest_id(host, flat, flon)
-                did, _ = _nearest_id(host, tlat, tlon)
+                did, dgeo = _nearest_id(host, tlat, tlon)
+                h['origin'] = (oid, ogeo[2] if ogeo else None)
+                h['dest'] = (did, dgeo[2] if dgeo else None)
                 if not oid or not did:
-                    continue
+                    h['err'] = 'no_stop'; dbg['hosts'].append(h); continue
                 p = dict(jparams); p['from'] = oid; p['to'] = did
                 data = _rest_get(host, '/journeys', p)
                 js = (data or {}).get('journeys') or []
+                h['n_journeys'] = len(js)
+                dbg['hosts'].append(h)
                 if js:
                     journeys = js
                     first_stop_geo = ogeo
                     break
-            except Exception:
+            except Exception as he:
+                h['err'] = f'{type(he).__name__}: {str(he)[:140]}'
+                dbg['hosts'].append(h)
                 continue
         if not journeys:
-            return jsonify({'ok': True, 'found': False, 'reason': 'no_journey'})
+            out = {'ok': True, 'found': False, 'reason': 'no_journey'}
+            if request.args.get('debug') == '1':
+                out['debug'] = dbg
+            return jsonify(out)
 
         def _legs_of(j):
             out = []
