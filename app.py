@@ -22220,8 +22220,9 @@ def _leg_is_fern(name):
 @app.route('/api/ax/transit', methods=['GET'])
 def ax_transit():
     """ÖPNV-Route Haus→Flughafen über GRATIS, kein-Key Router (Multi-Source):
-    ZUERST Transitous/MOTIS (purpose-built DE-weiter ÖPNV-Router), dann db-rest
-    v6/v5 (DB-HAFAS-Proxy) als Fallback — erster mit Treffer gewinnt, jeder eigener
+    im Großraum München ZUERST MVV-EFA (authoritative Verbund-Auskunft, echte U4/
+    S8-Linien), sonst/zusätzlich Transitous/MOTIS (DE-weit) und db-rest v6/v5
+    (DB-HAFAS-Proxy) als Fallback — erster mit Treffer gewinnt, jeder eigener
     try (langsamer/down Provider blockt nicht). Nahverkehr-only per Default (S-/U-/
     Bus/RE/RB/Tram); Fernverkehr (ICE/IC/EC) wird per Produkt-/Mode-Filter UND per
     Linien-Post-Filter ausgeschlossen (`?fern=1` erlaubt Fern). Native arrive-by-
@@ -22270,6 +22271,36 @@ def ax_transit():
                         'from': f.get('name'), 'to': t.get('name'),
                         'from_lat': f.get('lat'), 'from_lon': f.get('lon'),
                         'dep': leg.get('startTime'), 'arr': leg.get('endTime'),
+                    })
+                if legs:
+                    out.append(legs)
+            return out
+
+        def _norm_efa(data):
+            """MVV-EFA (rapidJSON) Journeys → normalisierte Leg-Listen. Fußwege =
+            product.class 99/100 (oder fehlende transportation). Liniennamen aus
+            disassembledName/number (z.B. „S8", „U4", „Tram 19"). Zeiten sind UTC."""
+            out = []
+            for j in (data or {}).get('journeys', []) or []:
+                legs = []
+                for leg in j.get('legs', []) or []:
+                    tr = leg.get('transportation') or {}
+                    prod = tr.get('product') or {}
+                    cls = prod.get('class')
+                    is_walk = (cls in (98, 99, 100)) or (cls is None)
+                    name = tr.get('disassembledName') or tr.get('number') or tr.get('name')
+                    o = leg.get('origin') or {}
+                    d = leg.get('destination') or {}
+                    ocoord = o.get('coord') or []
+                    legs.append({
+                        'mode': 'walk' if is_walk else 'transit',
+                        'line': None if is_walk else name, 'product': str(cls),
+                        'fern': _leg_is_fern(name),
+                        'from': o.get('name'), 'to': d.get('name'),
+                        'from_lat': ocoord[0] if len(ocoord) >= 2 else None,
+                        'from_lon': ocoord[1] if len(ocoord) >= 2 else None,
+                        'dep': o.get('departureTimeEstimated') or o.get('departureTimePlanned'),
+                        'arr': d.get('arrivalTimeEstimated') or d.get('arrivalTimePlanned'),
                     })
                 if legs:
                     out.append(legs)
@@ -22328,9 +22359,44 @@ def ax_transit():
             motis_params['time'] = arrival_s
             motis_params['arriveBy'] = 'true'
 
+        # MVV-EFA (Großraum München): die eigene, authoritative ÖPNV-Auskunft des
+        # Verkehrsverbunds — gratis, kein Key, liefert echte U-/S-/Tram-/Bus-Linien
+        # mit „arrive-by". Deckt den Haupt-User (München, U4+S8 → MUC) zuverlässig ab,
+        # wo Transitous (keine MVV-GTFS) leer bleibt und db-rest gerade down ist. EFA
+        # erwartet Koordinaten als `lon:lat:WGS84[DD.ddddd]` und LOKALE Zeit (Europe/
+        # Berlin) als itdDate/itdTime.
+        in_mvv = (47.6 <= flat <= 48.7) and (10.7 <= flon <= 12.4)
+        efa_params = None
+        if in_mvv:
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo('Europe/Berlin')
+                if arrival_s:
+                    a = datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+                    a = a.astimezone(tz) if a.tzinfo else a.replace(tzinfo=tz)
+                else:
+                    a = datetime.now(tz)
+                efa_params = {
+                    'outputFormat': 'rapidJSON',
+                    'coordOutputFormat': 'WGS84[DD.ddddd]',
+                    'type_origin': 'coord',
+                    'name_origin': f'{flon}:{flat}:WGS84[DD.ddddd]',   # EFA = lon:lat!
+                    'type_destination': 'coord',
+                    'name_destination': f'{tlon}:{tlat}:WGS84[DD.ddddd]',
+                    'itdDate': a.strftime('%Y%m%d'), 'itdTime': a.strftime('%H%M'),
+                    'itdTripDateTimeDepArr': 'arr',
+                    'calcNumberOfTrips': 5, 'useRealtime': 1,
+                }
+            except Exception:
+                efa_params = None
+
         # Provider-Reihenfolge: (Name, callable→normalisierte Journeys). Erster mit
         # Treffer gewinnt. Jeder eigener try → ein langsamer/down Provider blockt nicht.
-        providers = [
+        providers = []
+        if efa_params is not None:
+            providers.append(('mvv_efa', lambda: _norm_efa(
+                _get_json('https://efa.mvv-muenchen.de/ng/XML_TRIP_REQUEST2', efa_params, 12))))
+        providers += [
             ('transitous', lambda: _norm_motis(
                 _get_json('https://api.transitous.org/api/v6/plan', motis_params, 14))),
             ('db_rest_v6', lambda: _norm_dbrest(
