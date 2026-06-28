@@ -22257,24 +22257,19 @@ def ax_transit():
         UA = {'User-Agent': 'AeroX/1.0 (+https://aerosteuer.de; aerox@aerosteuer.de)'}
 
         def _rest_get(host, path, params):
-            r = requests.get(host + path, params=params, headers=UA, timeout=9)
+            r = requests.get(host + path, params=params, headers=UA, timeout=18)
             r.raise_for_status()
             return r.json()
 
-        def _nearest_id(host, lat, lon):
-            arr = _rest_get(host, '/locations/nearby',
-                            {'latitude': lat, 'longitude': lon, 'results': 1,
-                             'stops': 'true', 'poi': 'false'})
-            if not arr:
-                return None, None
-            s = arr[0]
-            loc = s.get('location') or {}
-            return s.get('id'), (loc.get('latitude'), loc.get('longitude'), s.get('name'))
-
-        # Produktfilter: Nahverkehr an, Fern (ICE/IC/EC) aus außer ?fern=1
+        # Produktfilter: Nahverkehr an, Fern (ICE/IC/EC) aus außer ?fern=1.
+        # EINE Tür-zu-Tür-Abfrage direkt mit Koordinaten (from.latitude/longitude +
+        # Adress-Label) → db-rest liefert den Fußweg Haus→Station als eigenes Leg
+        # nativ mit, kein separater nearby-Call, weniger Roundtrips (= weniger Timeout).
         prod = 'true'
         fern = 'true' if want_fern else 'false'
         jparams = {
+            'from.latitude': flat, 'from.longitude': flon, 'from.address': 'Zuhause',
+            'to.latitude': tlat, 'to.longitude': tlon, 'to.address': 'Flughafen',
             'nationalExpress': fern, 'national': fern,            # ICE / IC,EC
             'regionalExpress': prod, 'regional': prod,
             'suburban': prod, 'subway': prod, 'tram': prod,
@@ -22289,24 +22284,15 @@ def ax_transit():
 
         dbg = {'hosts': []}
         journeys = None
-        first_stop_geo = None    # (lat, lon, name) der ersten Station für Fußweg
         for host in DBREST_HOSTS:
             h = {'host': host}
             try:
-                oid, ogeo = _nearest_id(host, flat, flon)
-                did, dgeo = _nearest_id(host, tlat, tlon)
-                h['origin'] = (oid, ogeo[2] if ogeo else None)
-                h['dest'] = (did, dgeo[2] if dgeo else None)
-                if not oid or not did:
-                    h['err'] = 'no_stop'; dbg['hosts'].append(h); continue
-                p = dict(jparams); p['from'] = oid; p['to'] = did
-                data = _rest_get(host, '/journeys', p)
+                data = _rest_get(host, '/journeys', jparams)
                 js = (data or {}).get('journeys') or []
                 h['n_journeys'] = len(js)
                 dbg['hosts'].append(h)
                 if js:
                     journeys = js
-                    first_stop_geo = ogeo
                     break
             except Exception as he:
                 h['err'] = f'{type(he).__name__}: {str(he)[:140]}'
@@ -22346,6 +22332,12 @@ def ax_transit():
         # db-rest liefert bei arrival= alle Verbindungen, die rechtzeitig ankommen,
         # nach Abfahrt aufsteigend → SPÄTESTE Nahverkehr-Verbindung = so spät wie
         # möglich aus dem Haus. Fern-Treffer (falls Filter mal durchlässt) verwerfen.
+        def _mins(a, b):
+            try:
+                return max(0, int((datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds() // 60))
+            except Exception:
+                return 0
+
         best = None
         for j in journeys:
             legs = _legs_of(j)
@@ -22354,43 +22346,29 @@ def ax_transit():
                 continue
             if (not want_fern) and any(l['fern'] for l in transit_legs):
                 continue
-            first_dep = next((l['dep'] for l in legs if l['dep']), None)
+            # leave_at = Abfahrt des ALLERERSTEN Legs (der Fußweg Haus→Station) =
+            # wann aus dem Haus. transit_dep = Abfahrt des ersten Zugs/U-Bahn.
+            leave_at = next((l['dep'] for l in legs if l['dep']), None)
+            transit_dep = next((l['dep'] for l in transit_legs if l['dep']), None)
             last_arr = next((l['arr'] for l in reversed(legs) if l['arr']), None)
             ft = transit_legs[0]
-            cand = {'legs': legs, 'first_dep': first_dep, 'last_arr': last_arr,
-                    'first_stop_lat': ft['from_lat'], 'first_stop_lon': ft['from_lon'],
-                    'first_stop': ft['from']}
-            if best is None or (first_dep and best['first_dep'] and first_dep > best['first_dep']):
+            wleg = next((l for l in legs if l['mode'] == 'walk' and l['dep'] and l['arr']), None)
+            walk_min = _mins(wleg['dep'], wleg['arr']) if wleg else 0
+            cand = {'legs': legs, 'leave_at': leave_at, 'transit_dep': transit_dep,
+                    'last_arr': last_arr, 'first_stop': ft['from'], 'walk_min': walk_min}
+            # SPÄTESTE rechtzeitige Verbindung = so spät wie möglich aus dem Haus
+            if best is None or (leave_at and best['leave_at'] and leave_at > best['leave_at']):
                 best = cand
 
         if best is None:
             return jsonify({'ok': True, 'found': False, 'reason': 'no_nahverkehr'})
 
-        # Fußweg Haus → erste Station (Journey startet an der Station, nicht an der
-        # Haustür) → Abfahrt-zuhause = erste Abfahrt − Fußweg.
-        walk_min = 0
-        try:
-            slat = best['first_stop_lat'] or (first_stop_geo[0] if first_stop_geo else None)
-            slon = best['first_stop_lon'] or (first_stop_geo[1] if first_stop_geo else None)
-            if slat and slon:
-                d_m = _transit_haversine_m(flat, flon, float(slat), float(slon))
-                walk_min = int(round(d_m / 75.0))   # ~4.5 km/h Gehweg
-        except Exception:
-            walk_min = 0
-        leave_at = best['first_dep']
-        try:
-            if best['first_dep'] and walk_min:
-                fd = datetime.fromisoformat(best['first_dep'])
-                leave_at = (fd - timedelta(minutes=walk_min)).isoformat()
-        except Exception:
-            leave_at = best['first_dep']
-
         return jsonify({
             'ok': True, 'found': True, 'source': 'db_rest',
-            'leave_at': leave_at,
-            'walk_to_stop_min': walk_min,
+            'leave_at': best['leave_at'],          # wann aus dem Haus (Fußweg-Start)
+            'walk_to_stop_min': best['walk_min'],
             'first_stop': best['first_stop'],
-            'first_dep': best['first_dep'],
+            'first_dep': best['transit_dep'],       # erste echte ÖPNV-Abfahrt
             'last_arr': best['last_arr'],
             'arrival_target': arrival_s,
             'legs': best['legs'],
