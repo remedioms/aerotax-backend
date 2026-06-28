@@ -22061,12 +22061,18 @@ def ax_flight_info(flightno):
     if len(fn) < 3:
         return jsonify({'ok': False, 'error': 'bad_flight'}), 400
     board_ap = (request.args.get('airport') or 'FRA').upper().strip()
+    # NEU: optionaler `?date=YYYY-MM-DD` → Tail/Ist-Zeit/Delay für EINEN konkreten
+    # Flugtag (statt nur der jüngsten Beobachtung). Der Kalender braucht das, um pro
+    # Leg den echten Tail + Delay genau dieses Datums zu zeigen (gratis aus dem
+    # Warehouse, keine bezahlte API).
+    date_param = (request.args.get('date') or '').strip()
     out = None        # Historien-Ergebnis (falls vorhanden)
     if SB_AVAILABLE and sb is not None:
         try:
-            r = (sb.table('airport_delay_obs').select('*')
-                 .eq('flight', fn)
-                 .order('date', desc=True).order('updated_at', desc=True)
+            q = sb.table('airport_delay_obs').select('*').eq('flight', fn)
+            if date_param:
+                q = q.eq('date', date_param)
+            r = (q.order('date', desc=True).order('updated_at', desc=True)
                  .limit(60).execute())
             rows = r.data or []
             # ABFLUG-Record bevorzugen: dort ist `airport` = Origin + `dest_iata` =
@@ -25117,14 +25123,21 @@ def _ics_events_to_briefings(events, existing=None):
                 try:
                     s_dt = datetime.fromisoformat((start_iso or '').replace('Z', '+00:00'))
                     e_dt = datetime.fromisoformat((end_iso or '').replace('Z', '+00:00'))
-                    for _d in (days or []):
-                        if not re.match(r'^\d{4}-\d{2}-\d{2}$', _d):
-                            continue
-                        d0 = datetime.fromisoformat(_d + 'T00:00:00+00:00')
-                        noon = d0 + timedelta(hours=12)
-                        eod = d0 + timedelta(hours=23, minutes=59)
-                        if e_dt >= noon and s_dt <= eod:
-                            layover_noon_days.add(_d)
+                    # MINDEST-BODENZEIT (User: ein TLV-Turnaround — Ankunft 23:15,
+                    # Weiterflug 01:10, ~2 h am Boden — wurde fälschlich als „über
+                    # Nacht / Layover TLV" gezeigt). Unter 6 h zwischen Ankunft und
+                    # Weiterflug ist es ein Transit, KEINE Hotel-Übernachtung.
+                    if (e_dt - s_dt).total_seconds() / 3600.0 < 6.0:
+                        layover_iata = None
+                    else:
+                        for _d in (days or []):
+                            if not re.match(r'^\d{4}-\d{2}-\d{2}$', _d):
+                                continue
+                            d0 = datetime.fromisoformat(_d + 'T00:00:00+00:00')
+                            noon = d0 + timedelta(hours=12)
+                            eod = d0 + timedelta(hours=23, minutes=59)
+                            if e_dt >= noon and s_dt <= eod:
+                                layover_noon_days.add(_d)
                 except Exception:
                     # Ohne parsbare Zeiten konservativ: nur der Start-Tag.
                     if days:
