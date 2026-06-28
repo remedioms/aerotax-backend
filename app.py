@@ -22237,7 +22237,11 @@ def ax_transit():
         tlon = float(request.args.get('to_lon'))
     except (TypeError, ValueError):
         return jsonify({'ok': False, 'error': 'bad_coords'}), 400
-    arrival_s = (request.args.get('arrival') or '').strip()   # ISO: "spätestens da sein"
+    # ISO „spätestens da sein". Ein `+` im TZ-Offset wird in der Query als Leerzeichen
+    # dekodiert ("…09:00:00 02:00") → fromisoformat/Provider failen. ISO-Strings haben
+    # sonst keine Leerzeichen → Space wieder zu `+` machen ist sicher. (Die App sendet
+    # ohnehin UTC-„Z" ohne `+`; das hier rettet `+offset`-Clients/Tests.)
+    arrival_s = (request.args.get('arrival') or '').strip().replace(' ', '+')
     want_fern = request.args.get('fern') == '1'
     try:
         import requests
