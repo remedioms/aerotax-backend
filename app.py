@@ -22375,6 +22375,7 @@ def ax_transit():
         # Berlin) als itdDate/itdTime.
         in_mvv = (47.6 <= flat <= 48.7) and (10.7 <= flon <= 12.4)
         efa_params = None
+        efa_dbg = {'in_mvv': in_mvv}
         if in_mvv:
             try:
                 from zoneinfo import ZoneInfo
@@ -22395,8 +22396,9 @@ def ax_transit():
                     'itdTripDateTimeDepArr': 'arr',
                     'calcNumberOfTrips': 5, 'useRealtime': 1,
                 }
-            except Exception:
+            except Exception as ee:
                 efa_params = None
+                efa_dbg['build_err'] = f'{type(ee).__name__}: {str(ee)[:140]}'
 
         # Provider-Reihenfolge: (Name, callable→normalisierte Journeys). Erster mit
         # Treffer gewinnt. Jeder eigener try → ein langsamer/down Provider blockt nicht.
@@ -22413,7 +22415,7 @@ def ax_transit():
                 _get_json('https://v5.db.transport.rest/journeys', dbrest_params, 9))),
         ]
 
-        dbg = {'providers': []}
+        dbg = {'providers': [], 'efa': efa_dbg}
         journeys = None
         source = None
         for name, fn in providers:
