@@ -14573,10 +14573,23 @@ def get_chat_messages(token, channel_id):
     for m in msgs[-100:]:
         mm = dict(m)
         mm['is_mine'] = (m.get('author_token') == my_trunc)
-        # PRIVACY-FIX (Bug-Hunt): author_token (auch gekürzt = 13 Hex-Zeichen)
-        # NICHT ausliefern — is_mine ist serverseitig berechnet, der Client braucht
-        # den Token nicht (konsistent mit Wall/Forum).
-        mm.pop('author_token', None)
+        # iOS-CONTRACT-FIX (DM „Nachricht nicht im Verlauf sichtbar", 2026-06-29):
+        # author_token MUSS im Payload bleiben — das iOS-`ChatMessage`-Struct
+        # deklariert `author_token` als NICHT-optionales Feld. Der vorige
+        # Privacy-Pop (2026-06-16) entfernte es, wodurch JEDER Chat-/DM-History-
+        # Decode mit keyNotFound fehlschlug; load()/pollOnce schlucken den
+        # decode-Error still → der GESAMTE Server-Verlauf wurde verworfen.
+        # Gesendete DMs überlebten dann nur als lokale Optimistic-Bubble, der
+        # echte Verlauf (inkl. Gegenseite) lud nie. Der Client braucht den
+        # author_token weiterhin als stabilen Per-Autor-Key (Gruppierung,
+        # Avatar, Profil-Öffnen, Block-Target).
+        # Privacy bleibt gewahrt: NUR die bereits gespeicherte GEKÜRZTE Form
+        # (token[:16]+'…') wird ausgeliefert, nie der volle Token — defensiv
+        # re-truncaten falls eine Legacy-Zeile doch einen längeren Wert trägt.
+        at = m.get('author_token') or ''
+        if at and ('…' not in at) and len(at) > 17:
+            at = at[:16] + '…'
+        mm['author_token'] = at
         # Token-Leak-Fix: alte Photo-Messages tragen Legacy-Bild-URLs (mit
         # vollem Token) im Text → auf den opaken Key umschreiben.
         if mm.get('text'):
