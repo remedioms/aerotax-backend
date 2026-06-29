@@ -22549,21 +22549,23 @@ def ax_transit():
         # Provider-Reihenfolge: (Name, callable→normalisierte Journeys). Erster mit
         # Treffer gewinnt. Jeder eigener try → ein langsamer/down Provider blockt nicht.
         # MVV-EFA zuerst (authoritativ für München), dann bahn.de (ganz DE), dann Rest.
+        # HINWEIS: bahn.de-Vendo (_norm_bahnde/_post_json/_BAHN_HEADERS/bahn_body) ist
+        # bewusst NICHT in der aktiven Kette: von Cloud Run aus liefert www.bahn.de
+        # konstant 403 (Akamai blockt Google-Datacenter-IPs) — genau wie DBs interne
+        # Vendo-Hosts per DNS NXDOMAIN sind. Die Helfer bleiben dormant, falls je ein
+        # Proxy AUSSERHALB Googles (z.B. NAS/VPS) dazukommt, der DB erreichen darf.
+        _ = bahn_body  # dormant
         providers = []
         if efa_params is not None:
             providers.append(('mvv_efa', lambda: _norm_efa(
                 _get_json('https://efa.mvv-muenchen.de/ng/XML_TRIP_REQUEST2', efa_params, 12))))
-        if bahn_body is not None:
-            providers.append(('bahn_de', lambda: _norm_bahnde(
-                _post_json('https://www.bahn.de/web/api/angebote/fahrplan', bahn_body, 14,
-                           headers=_BAHN_HEADERS))))
         providers += [
             ('transitous', lambda: _norm_motis(
-                _get_json('https://api.transitous.org/api/v6/plan', motis_params, 14))),
+                _get_json('https://api.transitous.org/api/v6/plan', motis_params, 12))),
+            # db-rest derzeit dauer-down → kurzer Timeout, damit Nicht-München-Calls
+            # SCHNELL auf found:false fallen (App → Apple-Transit-ETA) statt zu hängen.
             ('db_rest_v6', lambda: _norm_dbrest(
-                _get_json('https://v6.db.transport.rest/journeys', dbrest_params, 9))),
-            ('db_rest_v5', lambda: _norm_dbrest(
-                _get_json('https://v5.db.transport.rest/journeys', dbrest_params, 9))),
+                _get_json('https://v6.db.transport.rest/journeys', dbrest_params, 6))),
         ]
 
         dbg = {'providers': [], 'efa': efa_dbg}
