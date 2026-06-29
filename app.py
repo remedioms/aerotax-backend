@@ -18241,6 +18241,33 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(min(1.0, math.sqrt(a)))
 
 
+# Flughafen → Bahn-Station-Snap (User 2026-06-29): Setzt die ÖPNV-Route auf das
+# geometrische Terminal-ZENTRUM eines Groß-Flughafens, routet HAFAS zur Terminal-
+# Haltestelle und hängt einen Flughafen-People-Mover an (FRA „SkyLine", DUS
+# „SkyTrain") — ein längerer, falscher Weg. Crew steigt real am REGIONAL-/S-BAHNHOF
+# UNTER dem Terminal aus und läuft ~10 Min zur Basis. Liegt das Routing-Ziel
+# < _AIRPORT_RAIL_SNAP_KM an einem bekannten Flughafen, das Ziel auf dessen
+# Bahn-Station-Koordinate snappen → Route endet am Bahnhof, kein People-Mover-Leg.
+# NUR exakt (OSM) verifizierte Stationen — keine geratenen Koordinaten. (lat, lon, label)
+_AIRPORT_RAIL_SNAP = [
+    (50.05130, 8.57175, 'Frankfurt Flughafen Regionalbahnhof'),   # FRA — OSM-verifiziert
+    (48.35377, 11.78613, 'München Flughafen Terminal (S1/S8)'),   # MUC — OSM-verifiziert
+]
+_AIRPORT_RAIL_SNAP_KM = 3.0
+
+
+def _snap_to_airport_rail(lat, lon):
+    """Liegt (lat,lon) < _AIRPORT_RAIL_SNAP_KM an einem bekannten Flughafen-Bahnhof,
+    gib (snap_lat, snap_lon, label) der nächsten Station zurück, sonst None.
+    Defensiv & additiv: kein Match → None → Routing verhält sich exakt wie zuvor."""
+    best = None
+    for slat, slon, label in _AIRPORT_RAIL_SNAP:
+        d = _haversine_km(lat, lon, slat, slon)
+        if d <= _AIRPORT_RAIL_SNAP_KM and (best is None or d < best[3]):
+            best = (slat, slon, label, d)
+    return (best[0], best[1], best[2]) if best else None
+
+
 def _trip_stats_achievements(life):
     """Achievement-Badges; nur tatsächlich verdiente werden zurückgegeben."""
     out = []
@@ -22992,13 +23019,20 @@ def ax_transit():
                     a = a.astimezone(tz) if a.tzinfo else a.replace(tzinfo=tz)
                 else:
                     a = datetime.now(tz)
+                # Ziel ggf. auf den Flughafen-Bahnhof snappen (MUC: München Flughafen
+                # Terminal S1/S8) statt aufs Terminal-Zentrum — Route endet am Bahnhof.
+                _elat, _elon = tlat, tlon
+                _esnap = _snap_to_airport_rail(tlat, tlon)
+                if _esnap:
+                    _elat, _elon = _esnap[0], _esnap[1]
+                    efa_dbg['airport_rail_snap'] = _esnap[2]
                 efa_params = {
                     'outputFormat': 'rapidJSON',
                     'coordOutputFormat': 'WGS84[DD.ddddd]',
                     'type_origin': 'coord',
                     'name_origin': f'{flon}:{flat}:WGS84[DD.ddddd]',   # EFA = lon:lat!
                     'type_destination': 'coord',
-                    'name_destination': f'{tlon}:{tlat}:WGS84[DD.ddddd]',
+                    'name_destination': f'{_elon}:{_elat}:WGS84[DD.ddddd]',
                     'itdDate': a.strftime('%Y%m%d'), 'itdTime': a.strftime('%H%M'),
                     'itdTripDateTimeDepArr': 'arr',
                     'calcNumberOfTrips': 5, 'useRealtime': 1,
@@ -23072,11 +23106,20 @@ def ax_transit():
                 # daher auf die nächste BAHN-Station snappen (Regionalbahnhof), Bus
                 # (Produkt-Bit 32) ausgeschlossen, damit nicht ein Vorfeld-Bus-Stop
                 # gewählt wird. Der ORIGIN bleibt Koordinate → echter Fußweg-aus-dem-Haus.
+                # Ziel ggf. vom Terminal-Zentrum auf den Flughafen-Bahnhof snappen
+                # (s. _snap_to_airport_rail): so endet die Route am Regional-/S-Bahnhof
+                # und HAFAS hängt KEINEN People-Mover (SkyLine/SkyTrain) an. Kein
+                # Treffer → Ziel bleibt die Original-Koordinate (Verhalten wie zuvor).
+                _dlat, _dlon = tlat, tlon
+                _snap = _snap_to_airport_rail(tlat, tlon)
+                if _snap:
+                    _dlat, _dlon, _snap_label = _snap[0], _snap[1], _snap[2]
+                    efa_dbg['airport_rail_snap'] = _snap_label
                 rmv_dest_ext = None
                 try:
                     _nb = _get_json('https://www.rmv.de/hapi/location.nearbystops', {
                         'accessId': rmv_key, 'format': 'json',
-                        'originCoordLat': tlat, 'originCoordLong': tlon,
+                        'originCoordLat': _dlat, 'originCoordLong': _dlon,
                         'maxNo': 1, 'r': 6000, 'products': 447,
                     }, 8)
                     _items = (_nb or {}).get('stopLocationOrCoordLocation') or []
@@ -23093,8 +23136,8 @@ def ax_transit():
                 if rmv_dest_ext:
                     rmv_params['destExtId'] = rmv_dest_ext
                 else:
-                    rmv_params['destCoordLat'] = tlat
-                    rmv_params['destCoordLong'] = tlon
+                    rmv_params['destCoordLat'] = _dlat
+                    rmv_params['destCoordLong'] = _dlon
             except Exception:
                 rmv_params = None
 
