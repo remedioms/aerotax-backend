@@ -220,7 +220,14 @@ def _save_disk_interests(author_token, interests):
 # ─── Persistence-Layer: trade_posts ───────────────────────────────────
 
 def _sb_insert_post(row):
-    """Inserts row in SB. True/False."""
+    """Inserts row in SB. True/False.
+
+    DURABILITÄT-FALLBACK (2026-06-29): Das `aircraft`-Feld ist neu. Falls die
+    Migration (add column aircraft) im Ziel-Projekt noch NICHT eingespielt ist,
+    würde der Insert mit der unbekannten Spalte scheitern und der Post NUR auf
+    der ephemeren Disk landen. Deshalb: bei einem Insert-Fehler EINMAL ohne das
+    optionale `aircraft`-Feld erneut versuchen, bevor wir aufgeben. So bleibt
+    der Post in SB durabel; nur das Muster fehlt bis die Migration läuft."""
     sb, available = _get_sb()
     if not available or sb is None:
         return False
@@ -228,6 +235,21 @@ def _sb_insert_post(row):
         sb.table('trade_posts').insert(row).execute()
         return True
     except Exception as e:
+        # Retry ohne optionale Neu-Spalte(n), wenn vorhanden.
+        if isinstance(row, dict) and row.get('aircraft') is not None:
+            slim = {k: v for k, v in row.items() if k != 'aircraft'}
+            try:
+                sb.table('trade_posts').insert(slim).execute()
+                try:
+                    current_app.logger.warning(
+                        '[trade] sb_insert_post retried without aircraft column '
+                        '(migration pending?)'
+                    )
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                pass
         try:
             current_app.logger.warning(
                 f'[trade] sb_insert_post_fail err={type(e).__name__}: {str(e)[:200]}'
@@ -269,7 +291,7 @@ def _sb_update_post(post_id, fields):
 
 
 def _sb_list_posts(airline=None, base=None, qualification=None, position=None,
-                   swap_or_dump=None, limit=50, offset=0):
+                   swap_or_dump=None, aircraft=None, limit=50, offset=0):
     """Filtered list nur open + not-deleted. Sort: tour_start_date asc, created_at desc."""
     sb, available = _get_sb()
     if not available or sb is None:
@@ -282,6 +304,8 @@ def _sb_list_posts(airline=None, base=None, qualification=None, position=None,
             q = q.eq('base', base)
         if position:
             q = q.eq('position', position)
+        if aircraft:
+            q = q.eq('aircraft', aircraft)
         if swap_or_dump:
             q = q.eq('swap_or_dump', swap_or_dump)
         if qualification:
@@ -469,7 +493,7 @@ def _reconcile_posts_disk_to_sb():
 
 
 def _list_posts(airline=None, base=None, qualification=None, position=None,
-                swap_or_dump=None, limit=50, offset=0):
+                swap_or_dump=None, aircraft=None, limit=50, offset=0):
     """SB primär; bei SB-down filtert/sortiert wir die Disk-Liste.
 
     Vor dem SB-Read werden Disk-only-Posts nach SB reconciled (heal), damit
@@ -478,7 +502,7 @@ def _list_posts(airline=None, base=None, qualification=None, position=None,
     _reconcile_posts_disk_to_sb()
     sb_rows = _sb_list_posts(airline=airline, base=base, qualification=qualification,
                              position=position, swap_or_dump=swap_or_dump,
-                             limit=limit, offset=offset)
+                             aircraft=aircraft, limit=limit, offset=offset)
     if sb_rows is not None:
         return sb_rows
     # Disk-Fallback
@@ -496,6 +520,8 @@ def _list_posts(airline=None, base=None, qualification=None, position=None,
         if base and r.get('base') != base:
             continue
         if position and r.get('position') != position:
+            continue
+        if aircraft and (r.get('aircraft') or '') != aircraft:
             continue
         if swap_or_dump and r.get('swap_or_dump') != swap_or_dump:
             continue
@@ -626,6 +652,29 @@ def _truncate(value, n):
     return v[:n]
 
 
+def _canonical_airline(value):
+    """Normalisiert den Airline-String auf einen kanonischen Wert, damit das
+    Board AIRLINE-WEIT konsistent matcht.
+
+    Hintergrund (2026-06-29): Crew-Profile tragen die Airline mal als
+    "Lufthansa", mal als "LH"/"DLH". Speichern wir den Roh-String und filtern
+    per exaktem `==`, würde ein "LH"-Author NICHT in der "Lufthansa"-Sicht eines
+    Kollegen auftauchen → die airline-weite Sichtbarkeit wäre löchrig. Wir
+    normalisieren deshalb SOWOHL beim Speichern (create) ALS AUCH beim Filtern
+    (board) auf denselben kanonischen Wert. Lufthansa-Varianten → "Lufthansa";
+    alles andere bleibt unverändert (nur getrimmt), damit andere Airlines wie
+    bisher exakt matchen."""
+    if not isinstance(value, str):
+        return value
+    v = value.strip()
+    if not v:
+        return None
+    low = v.lower()
+    if 'lufthansa' in low or low in ('lh', 'dlh'):
+        return 'Lufthansa'
+    return v
+
+
 def _public_post(row, viewer_token=None):
     """Serialisiert einen Post für Client-Responses OHNE author_token.
 
@@ -646,8 +695,8 @@ def _public_post(row, viewer_token=None):
 @trip_trade_bp.route('/api/trade/<token>/post', methods=['POST'])
 def create_trade_post(token):
     """Body: {tour_start_date, tour_end_date?, routing?, swap_or_dump (default swap),
-             compensation_offered?, qualification_required?, position?, base?,
-             airline?, message?, author_short_name?}.
+             aircraft?, compensation_offered?, qualification_required?, position?,
+             base?, airline?, message?, author_short_name?}.
 
     Rate-Limit: 3 Posts pro Tag pro Token.
     """
@@ -696,11 +745,14 @@ def create_trade_post(token):
         'author_short_name': _truncate(body.get('author_short_name'), 64),
         'position': _truncate(body.get('position'), 32),
         'base': _truncate(body.get('base'), 8),
-        'airline': _truncate(body.get('airline'), 32),
+        # Airline kanonisch speichern (LH-Varianten → "Lufthansa"), damit das
+        # Board airline-weit konsistent matcht (s. _canonical_airline).
+        'airline': _canonical_airline(_truncate(body.get('airline'), 32)),
         'tour_start_date': tour_start,
         'tour_end_date': tour_end or tour_start,
         'routing': _truncate(body.get('routing'), 256),
         'swap_or_dump': swap_or_dump,
+        'aircraft': _truncate(body.get('aircraft'), 16),
         'compensation_offered': _truncate(body.get('compensation_offered'), 256),
         'qualification_required': _truncate(body.get('qualification_required'), 256),
         'message': _truncate(body.get('message'), 2000),
@@ -732,10 +784,12 @@ def create_trade_post(token):
 
 @trip_trade_bp.route('/api/trade/board', methods=['GET'])
 def list_board():
-    """Query: airline, base, qualification, position, swap_or_dump, limit, offset,
-    token (optional — nur für die is_mine-Berechnung, kein Auth-Gate).
-    Public-Read (kein Token erforderlich) — sortiert nach tour_start_date asc,
-    dann created_at desc. Responses enthalten NIE author_token (s. _public_post)."""
+    """Query: airline, base, qualification, position, aircraft, swap_or_dump,
+    limit, offset, token (optional — nur für die is_mine-Berechnung, kein
+    Auth-Gate). `airline` wird kanonisch normalisiert (LH-Varianten → "Lufthansa")
+    → airline-weite Sichtbarkeit. Public-Read (kein Token erforderlich) —
+    sortiert nach tour_start_date asc, dann created_at desc. Responses enthalten
+    NIE author_token (s. _public_post)."""
     try:
         limit = int(request.args.get('limit', '50'))
     except (TypeError, ValueError):
@@ -747,10 +801,16 @@ def list_board():
     limit = max(1, min(200, limit))
     offset = max(0, offset)
 
-    airline = _truncate(request.args.get('airline'), 32)
+    # Airline kanonisch normalisieren — identisch zum Speicher-Pfad, damit alle
+    # LH-Crew (egal ob "Lufthansa"/"LH"/"DLH" im Profil) dieselbe LH-weite Liste
+    # sehen (airline-weite Sichtbarkeit, kein self/friends-Scope).
+    airline = _canonical_airline(_truncate(request.args.get('airline'), 32))
     base = _truncate(request.args.get('base'), 8)
     qualification = _truncate(request.args.get('qualification'), 64)
     position = _truncate(request.args.get('position'), 32)
+    aircraft = _truncate(request.args.get('aircraft'), 16)
+    if aircraft:
+        aircraft = aircraft.upper()
     swap_or_dump = _truncate(request.args.get('swap_or_dump'), 16)
     if swap_or_dump:
         swap_or_dump = swap_or_dump.lower()
@@ -766,7 +826,7 @@ def list_board():
 
     posts = _list_posts(airline=airline, base=base, qualification=qualification,
                         position=position, swap_or_dump=swap_or_dump,
-                        limit=limit, offset=offset)
+                        aircraft=aircraft, limit=limit, offset=offset)
     # interest_count anreichern (best effort — bei SB-down ist count None)
     out = []
     for p in posts:
