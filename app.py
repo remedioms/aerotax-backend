@@ -12146,6 +12146,149 @@ def _news_article_cache_set(url, payload):
             _NEWS_ARTICLE_CACHE_LOCK.release()
 
 
+# ── Persistenter Server-Side-Cache (Supabase) ──────────────────────────────
+# Der In-Memory-Cache oben (_NEWS_ARTICLE_CACHE) lebt nur pro Worker-Prozess und
+# ist nach jedem Cloud-Run-Restart weg → jeder Artikel würde dann wieder pro User
+# frisch gescraped, was die Server-IP bei den Quellseiten flaggt. Diese zweite
+# Cache-Ebene liegt in Supabase (`news_article_cache`), wird über alle Worker und
+# Restarts hinweg geteilt und sorgt dafür, dass eine Quelle pro Artikel höchstens
+# ~1× pro TTL angefasst wird statt 1× pro Leser.
+NEWS_ARTICLE_SB_CACHE_TTL_SECONDS = 14 * 24 * 3600   # 14 Tage — Artikel ändern sich nach Publish quasi nie.
+
+
+def _news_article_url_key(url):
+    """Stabiler Cache-Key: sha256(url) hex, erste 32 Zeichen."""
+    import hashlib as _hl
+    return _hl.sha256((url or '').encode('utf-8', errors='replace')).hexdigest()[:32]
+
+
+def _news_sb_cache_get(url):
+    """Persistenter Supabase-Cache-Lookup. Returns payload-dict bei frischem Hit,
+    sonst None (Miss / stale / Tabelle fehlt / Fehler / Timeout). Wirft nie."""
+    if not SB_AVAILABLE:
+        return None
+    try:
+        key = _news_article_url_key(url)
+
+        def _do():
+            return (sb.table('news_article_cache')
+                      .select('url, fulltext, title, source, image_url, published_at, fetched_at')
+                      .eq('url_key', key).limit(1).execute())
+        res, timed_out = _supabase_execute_with_timeout('news_cache_get', _do, timeout_s=5)
+        if timed_out or res is None or not getattr(res, 'data', None):
+            return None
+        row = res.data[0]
+        fulltext = row.get('fulltext')
+        if not fulltext or len(fulltext) < 80:
+            return None
+        # TTL-Prüfung gegen fetched_at.
+        import time as _t
+        from datetime import datetime as _dt
+        fetched_raw = (row.get('fetched_at') or '').replace('Z', '+00:00')
+        try:
+            fetched = _dt.fromisoformat(fetched_raw)
+            age = _t.time() - fetched.timestamp()
+            if age > NEWS_ARTICLE_SB_CACHE_TTL_SECONDS:
+                return None
+        except Exception:
+            # Unparsebares fetched_at → vorsichtshalber als stale behandeln.
+            return None
+        return {
+            'ok': True,
+            'url': row.get('url') or url,
+            'source': row.get('source'),
+            'fulltext': fulltext,
+            'title': row.get('title'),
+            'image_url': row.get('image_url'),
+            'published_at': row.get('published_at'),
+            'cache_ttl_seconds': NEWS_ARTICLE_SB_CACHE_TTL_SECONDS,
+        }
+    except Exception as e:
+        print(f'[news-cache] get error: {type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _news_sb_cache_set(url, payload):
+    """Upsert eines extrahierten Artikels in den persistenten Supabase-Cache.
+    Best-effort: jeder Fehler (Tabelle fehlt, Timeout, …) wird geschluckt, der
+    Artikel wurde dem User ja trotzdem geliefert."""
+    if not SB_AVAILABLE:
+        return
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        record = {
+            'url_key': _news_article_url_key(url),
+            'url': url,
+            'fulltext': payload.get('fulltext'),
+            'title': payload.get('title'),
+            'source': payload.get('source'),
+            'image_url': payload.get('image_url'),
+            'published_at': payload.get('published_at'),
+            'fetched_at': _dt.now(_tz.utc).isoformat(),
+        }
+
+        def _do():
+            return sb.table('news_article_cache').upsert(record, on_conflict='url_key').execute()
+        _supabase_execute_with_timeout('news_cache_set', _do, timeout_s=5)
+    except Exception as e:
+        print(f'[news-cache] set error: {type(e).__name__}: {str(e)[:120]}')
+
+
+def _tidy_article_text(text):
+    """Leichte Lesbarkeits-Politur direkt vor Caching/Ausgabe.
+
+    Konservativ — nur eindeutiger Müll fällt raus, Redaktionstext bleibt:
+      * Whitespace pro Zeile normalisieren (NBSP, Mehrfach-Spaces, Tabs).
+      * Absätze durch genau eine Leerzeile trennen (max. 1 Leerzeile am Stück).
+      * Offensichtliche Rest-Boilerplate-Zeilen droppen (Cookie/Consent-Hinweise,
+        "Lesen Sie auch", "Mehr zum Thema", Share-Prompts, Bild-Credits "Foto: …").
+    Reine String-Operation, wirft nie nach außen.
+    """
+    import re as _re
+    if not text:
+        return text
+
+    # Kurze, eindeutig nicht-redaktionelle Zeilen (komplette Zeile = Boilerplate).
+    _DROP_LINE_SUBSTR = (
+        'lesen sie auch', 'mehr zum thema', 'das könnte sie auch interessieren',
+        'auch interessant', 'weiterlesen', 'related articles', 'read also',
+        'jetzt teilen', 'artikel teilen', 'beitrag teilen', 'share this article',
+        'auf facebook teilen', 'auf twitter teilen', 'auf whatsapp teilen',
+        'diesen artikel teilen', 'cookie', 'consent', 'wir verwenden cookies',
+        'akzeptieren sie', 'datenschutzerklärung', 'zur startseite',
+    )
+    # Bild-Credit-/Caption-Präfixe (ganze Zeile beginnt damit).
+    _CREDIT_PREFIX = (
+        'foto:', 'fotos:', 'bild:', 'bilder:', 'photo:', 'image:', 'quelle:',
+        'grafik:', 'symbolbild:', 'archivfoto:', '© ', '(c) ',
+    )
+
+    def _is_drop(line):
+        low = line.strip().lower()
+        if not low:
+            return False
+        # Reine Credit-/Caption-Zeile (kurz) → raus.
+        if any(low.startswith(p) for p in _CREDIT_PREFIX) and len(low) <= 160:
+            return True
+        # Kurze Zeile, die voll aus einem Boilerplate-Marker besteht.
+        if len(low) <= 90 and any(m in low for m in _DROP_LINE_SUBSTR):
+            return True
+        return False
+
+    out_lines = []
+    for raw_line in text.split('\n'):
+        line = raw_line.replace('\xa0', ' ').replace('\t', ' ')
+        line = _re.sub(r'[ ]{2,}', ' ', line).strip()
+        if _is_drop(line):
+            continue
+        out_lines.append(line)
+
+    joined = '\n'.join(out_lines)
+    # Mehr als eine Leerzeile am Stück → genau eine (= ein Absatz-Abstand).
+    joined = _re.sub(r'\n{3,}', '\n\n', joined)
+    return joined.strip()
+
+
 @app.route('/api/news/article', methods=['GET'])
 def get_news_article():
     """Vollartikel-Text einer Aviation-News-URL.
@@ -12181,10 +12324,24 @@ def get_news_article():
             'allowed_hosts': sorted(NEWS_ARTICLE_ALLOWED_HOSTS),
         }), 403
 
-    # Cache hit?
+    # Cache hit? (L1: In-Memory pro Worker)
     cached = _news_article_cache_get(raw_url)
     if cached is not None:
         return jsonify({**cached, 'cache_hit': True})
+
+    # L2: Persistenter Supabase-Cache (geteilt über Worker/Restarts hinweg).
+    # Bei frischem Hit liefern wir OHNE die Quellseite anzufassen → kein Re-Scrape
+    # pro User, Server-IP wird nicht geflaggt. Defensiv: jeder Cache-Fehler fällt
+    # still auf den Live-Scrape unten zurück.
+    sb_cached = _news_sb_cache_get(raw_url)
+    if sb_cached is not None:
+        result = {**sb_cached, 'cache_hit': True}
+        # In den schnellen In-Memory-Cache hochziehen für Folge-Requests.
+        try:
+            _news_article_cache_set(raw_url, {**sb_cached, 'cache_hit': False})
+        except Exception:
+            pass
+        return jsonify(result)
 
     # Fetch HTML
     try:
@@ -12213,9 +12370,18 @@ def get_news_article():
         return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': str(e)[:200]}), 502
 
     # Extract via mehrere Strategien, längstes valides Ergebnis gewinnt.
+    # (_news_extract_best_fulltext entfernt bereits Boilerplate + Spenden-Appelle.)
     fulltext = _news_extract_best_fulltext(html, source_host=host)
     if not fulltext or len(fulltext) < 80:
         return jsonify({'ok': False, 'error': 'extraction_failed', 'url': raw_url}), 200
+
+    # Lesbarkeits-Politur direkt vor Cache/Ausgabe (Whitespace/Absätze/Rest-Müll).
+    try:
+        tidied = _tidy_article_text(fulltext)
+        if tidied and len(tidied) >= 80:
+            fulltext = tidied
+    except Exception:
+        pass
 
     # Metadata aus <meta og:*>/<title>/<time>
     meta = _news_extract_metadata(html)
@@ -12232,6 +12398,9 @@ def get_news_article():
         'cache_ttl_seconds': NEWS_ARTICLE_CACHE_TTL_SECONDS,
     }
     _news_article_cache_set(raw_url, result)
+    # Persistent in Supabase ablegen, damit die Quelle nicht pro User neu
+    # gescraped wird. Best-effort — Fehler beeinflussen die Antwort nicht.
+    _news_sb_cache_set(raw_url, result)
     return jsonify(result)
 
 
@@ -22491,6 +22660,18 @@ def ax_transit():
             r.raise_for_status()
             return r.json()
 
+        def _delay_min(planned_iso, rt_iso):
+            """Echtzeit-Verspätung in Minuten = Echtzeit − Plan. None wenn unbekannt
+            (kein Echtzeit-Wert oder unparsebar). Beide Strings sind ISO mit TZ
+            (Europe/Berlin oder „Z") → Subtraktion ist zonensicher. Kann negativ sein
+            (Zug ist früh/Plan-Verschiebung), wird NICHT auf 0 geklemmt."""
+            try:
+                p = datetime.fromisoformat((planned_iso or '').replace('Z', '+00:00'))
+                r = datetime.fromisoformat((rt_iso or '').replace('Z', '+00:00'))
+                return int((r - p).total_seconds() // 60)
+            except Exception:
+                return None
+
         # bahn.de hängt hinter Akamai-Bot-Protection → braucht Browser-ähnliche Header
         # (echte SPA-Header), sonst 403. Origin/Referer = die echte Fahrplan-Suche.
         _BAHN_HEADERS = {
@@ -22520,13 +22701,23 @@ def ax_transit():
                     is_walk = typ in ('FUSSWEG', 'WALK', 'TRANSFER') or kat == 'FUSSWEG'
                     name = vm.get('name') or vm.get('kurzText') or vm.get('mittelText')
                     is_fern = kat in ('ICE', 'EC_IC', 'IR') or _leg_is_fern(name)
+                    # bahn.de-Vendo: `*Zeitpunkt` = Fahrplan, `ez*Zeitpunkt` = Echtzeit.
+                    dep_plan = ab.get('abfahrtsZeitpunkt')
+                    arr_plan = ab.get('ankunftsZeitpunkt')
+                    dep_rt = ab.get('ezAbfahrtsZeitpunkt')
+                    arr_rt = ab.get('ezAnkunftsZeitpunkt')
                     legs.append({
                         'mode': 'walk' if is_walk else 'transit',
                         'line': None if is_walk else name, 'product': kat,
                         'fern': is_fern,
                         'from': ab.get('abfahrtsOrt'), 'to': ab.get('ankunftsOrt'),
                         'from_lat': None, 'from_lon': None,
-                        'dep': ab.get('abfahrtsZeitpunkt'), 'arr': ab.get('ankunftsZeitpunkt'),
+                        'dep': dep_rt or dep_plan,
+                        'arr': arr_rt or arr_plan,
+                        'dep_planned': dep_plan,
+                        'arr_planned': arr_plan,
+                        'delay_min': (None if is_walk or not (dep_rt and dep_plan)
+                                      else _delay_min(dep_plan, dep_rt)),
                     })
                 if legs:
                     out.append(legs)
@@ -22547,6 +22738,8 @@ def ax_transit():
                     f = leg.get('from') or {}
                     t = leg.get('to') or {}
                     is_fern = (mode in _MOTIS_FERN) or _leg_is_fern(short)
+                    # MOTIS: startTime/endTime sind bereits Echtzeit-korrigiert, ein
+                    # separater Fahrplan-Wert wird nicht geliefert → delay_min unbekannt.
                     legs.append({
                         'mode': 'walk' if is_walk else 'transit',
                         'line': None if is_walk else short, 'product': mode.lower(),
@@ -22554,6 +22747,11 @@ def ax_transit():
                         'from': f.get('name'), 'to': t.get('name'),
                         'from_lat': f.get('lat'), 'from_lon': f.get('lon'),
                         'dep': leg.get('startTime'), 'arr': leg.get('endTime'),
+                        'dep_planned': leg.get('scheduledStartTime') or leg.get('startTime'),
+                        'arr_planned': leg.get('scheduledEndTime') or leg.get('endTime'),
+                        'delay_min': (None if is_walk
+                                      else _delay_min(leg.get('scheduledStartTime'),
+                                                      leg.get('startTime'))),
                     })
                 if legs:
                     out.append(legs)
@@ -22575,6 +22773,11 @@ def ax_transit():
                     o = leg.get('origin') or {}
                     d = leg.get('destination') or {}
                     ocoord = o.get('coord') or []
+                    # EFA (useRealtime=1): *Estimated = Echtzeit, *Planned = Fahrplan.
+                    dep_plan = o.get('departureTimePlanned')
+                    dep_rt = o.get('departureTimeEstimated')
+                    arr_plan = d.get('arrivalTimePlanned')
+                    arr_rt = d.get('arrivalTimeEstimated')
                     legs.append({
                         'mode': 'walk' if is_walk else 'transit',
                         'line': None if is_walk else name, 'product': str(cls),
@@ -22582,8 +22785,12 @@ def ax_transit():
                         'from': o.get('name'), 'to': d.get('name'),
                         'from_lat': ocoord[0] if len(ocoord) >= 2 else None,
                         'from_lon': ocoord[1] if len(ocoord) >= 2 else None,
-                        'dep': o.get('departureTimeEstimated') or o.get('departureTimePlanned'),
-                        'arr': d.get('arrivalTimeEstimated') or d.get('arrivalTimePlanned'),
+                        'dep': dep_rt or dep_plan,
+                        'arr': arr_rt or arr_plan,
+                        'dep_planned': dep_plan,
+                        'arr_planned': arr_plan,
+                        'delay_min': (None if is_walk or not dep_rt
+                                      else _delay_min(dep_plan, dep_rt)),
                     })
                 if legs:
                     out.append(legs)
@@ -22625,14 +22832,27 @@ def ax_transit():
                     o = leg.get('Origin') or {}
                     d = leg.get('Destination') or {}
                     is_fern = cat in ('ICE', 'IC', 'EC', 'IR') or _leg_is_fern(name)
+                    # HAFAS-Echtzeit (rtMode=REALTIME): Stop trägt Plan (date/time) UND
+                    # Echtzeit (rtDate/rtTime). rtDate fehlt oft bei selbem Tag → auf
+                    # die Plan-date zurückfallen. Fehlt rtTime ganz → keine Echtzeit.
+                    dep_plan = _hafas_iso(o.get('date'), o.get('time'))
+                    arr_plan = _hafas_iso(d.get('date'), d.get('time'))
+                    dep_rt = (_hafas_iso(o.get('rtDate') or o.get('date'), o.get('rtTime'))
+                              if o.get('rtTime') else None)
+                    arr_rt = (_hafas_iso(d.get('rtDate') or d.get('date'), d.get('rtTime'))
+                              if d.get('rtTime') else None)
                     legs.append({
                         'mode': 'walk' if is_walk else 'transit',
                         'line': None if is_walk else (name or '').strip(), 'product': cat,
                         'fern': is_fern,
                         'from': o.get('name'), 'to': d.get('name'),
                         'from_lat': o.get('lat'), 'from_lon': o.get('lon'),
-                        'dep': _hafas_iso(o.get('date'), o.get('time')),
-                        'arr': _hafas_iso(d.get('date'), d.get('time')),
+                        'dep': dep_rt or dep_plan,
+                        'arr': arr_rt or arr_plan,
+                        'dep_planned': dep_plan,
+                        'arr_planned': arr_plan,
+                        'delay_min': (None if is_walk or not dep_rt
+                                      else _delay_min(dep_plan, dep_rt)),
                     })
                 if legs:
                     out.append(legs)
@@ -22652,14 +22872,24 @@ def ax_transit():
                     d = leg.get('destination') or {}
                     oloc = o.get('location') or {}
                     is_fern = product in ('nationalExpress', 'national') or _leg_is_fern(name)
+                    # db-rest (HAFAS-Proxy): `departure`/`arrival` = Echtzeit, `planned*`
+                    # = Fahrplan.
+                    dep_plan = leg.get('plannedDeparture')
+                    arr_plan = leg.get('plannedArrival')
+                    dep_rt = leg.get('departure')
+                    arr_rt = leg.get('arrival')
                     legs.append({
                         'mode': 'walk' if is_walk else 'transit',
                         'line': None if is_walk else name, 'product': product,
                         'fern': is_fern,
                         'from': o.get('name'), 'to': d.get('name'),
                         'from_lat': oloc.get('latitude'), 'from_lon': oloc.get('longitude'),
-                        'dep': leg.get('departure') or leg.get('plannedDeparture'),
-                        'arr': leg.get('arrival') or leg.get('plannedArrival'),
+                        'dep': dep_rt or dep_plan,
+                        'arr': arr_rt or arr_plan,
+                        'dep_planned': dep_plan,
+                        'arr_planned': arr_plan,
+                        'delay_min': (None if is_walk or not (dep_rt and dep_plan)
+                                      else _delay_min(dep_plan, dep_rt)),
                     })
                 if legs:
                     out.append(legs)
@@ -22896,7 +23126,9 @@ def ax_transit():
             wleg = next((l for l in legs if l['mode'] == 'walk' and l['dep'] and l['arr']), None)
             walk_min = _mins(wleg['dep'], wleg['arr']) if wleg else 0
             cand = {'legs': legs, 'leave_at': leave_at, 'transit_dep': transit_dep,
-                    'last_arr': last_arr, 'first_stop': ft['from'], 'walk_min': walk_min}
+                    'last_arr': last_arr, 'first_stop': ft['from'], 'walk_min': walk_min,
+                    'first_dep_planned': ft.get('dep_planned'),
+                    'first_dep_delay_min': ft.get('delay_min')}
             arr_dt = _parse(last_arr)
             # früheste-Ankunft-Fallback unabhängig von Pünktlichkeit
             if fallback is None or (arr_dt and fallback.get('_arr') and arr_dt < fallback['_arr']):
@@ -22923,7 +23155,9 @@ def ax_transit():
             'leave_at': best['leave_at'],          # wann aus dem Haus (Fußweg-Start)
             'walk_to_stop_min': best['walk_min'],
             'first_stop': best['first_stop'],
-            'first_dep': best['transit_dep'],       # erste echte ÖPNV-Abfahrt
+            'first_dep': best['transit_dep'],       # erste echte ÖPNV-Abfahrt (Echtzeit)
+            'first_dep_planned': best.get('first_dep_planned'),  # planmäßige Abfahrt
+            'first_dep_delay_min': best.get('first_dep_delay_min'),  # Verspätung Min (None=unbekannt)
             'last_arr': best['last_arr'],
             'arrival_target': arrival_s,
             'legs': best['legs'],
