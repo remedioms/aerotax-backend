@@ -22633,6 +22633,13 @@ def ax_transit():
             except Exception:
                 rmv_params = None
 
+        # SCHLANKE Kette (User: „besser einfach RMV nutzen"): RMV deckt als
+        # bundesweite DELFI-HAFAS GANZ DE ab → wird primäre Quelle. MVV-EFA bleibt
+        # als verifiziertes München-Sicherheitsnetz davor (falls RMV mal lokale
+        # MVV-Linien verpasst). Transitous + public-db-rest sind RAUS (limitiert/
+        # dauer-down); für Städte ohne Treffer fällt die App ohnehin auf Apple-
+        # Transit-ETA zurück. (motis_params/dbrest_params bleiben dormant ungenutzt.)
+        _ = (motis_params, dbrest_params)  # dormant
         providers = []
         if efa_params is not None:
             providers.append(('mvv_efa', lambda: _norm_efa(
@@ -22640,14 +22647,6 @@ def ax_transit():
         if rmv_params is not None:
             providers.append(('rmv', lambda: _norm_rmv(
                 _get_json('https://www.rmv.de/hapi/trip', rmv_params, 12))))
-        providers += [
-            ('transitous', lambda: _norm_motis(
-                _get_json('https://api.transitous.org/api/v6/plan', motis_params, 12))),
-            # db-rest derzeit dauer-down → kurzer Timeout, damit Nicht-München-Calls
-            # SCHNELL auf found:false fallen (App → Apple-Transit-ETA) statt zu hängen.
-            ('db_rest_v6', lambda: _norm_dbrest(
-                _get_json('https://v6.db.transport.rest/journeys', dbrest_params, 6))),
-        ]
 
         dbg = {'providers': [], 'efa': efa_dbg}
         journeys = None
