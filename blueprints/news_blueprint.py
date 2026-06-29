@@ -335,6 +335,10 @@ def get_news_feed():
     except (TypeError, ValueError):
         limit = 50
     limit = max(1, min(limit, 200))
+    # ?readable_only=1 → nur Artikel, die DIREKT in der App lesbar sind (Volltext
+    # oder ausreichende Zusammenfassung). Kein „Volltext nicht verfügbar / nur im
+    # Browser"-Sackgassen mehr (User-Wunsch).
+    readable_only = (request.args.get('readable_only') or '').strip().lower() in ('1', 'true', 'yes')
 
     if category_raw and category_raw not in _ALLOWED_CATEGORIES:
         return jsonify({
@@ -351,9 +355,12 @@ def get_news_feed():
     if cached is not None:
         payload = dict(cached)
         payload['cache_hit'] = True
-        # limit auch im cache-hit-pfad anwenden (verschiedene Clients,
-        # verschiedene Limits — der Cache hält die volle Liste).
-        payload['articles'] = payload.get('articles', [])[:limit]
+        # limit + readable_only im cache-hit-pfad anwenden (Cache hält die volle
+        # Liste inkl. `in_app_readable`-Flag pro Artikel).
+        arts = payload.get('articles', [])
+        if readable_only:
+            arts = [a for a in arts if a.get('in_app_readable')]
+        payload['articles'] = arts[:limit]
         payload['count'] = len(payload['articles'])
         return jsonify(payload)
 
@@ -392,10 +399,14 @@ def get_news_feed():
         reverse=True,
     )
 
+    # readable_only NACH dem Cachen anwenden (der Cache unten hält die volle Liste
+    # mit `in_app_readable`-Flag, damit andere Clients ohne Filter sie noch sehen).
+    visible = [a for a in filtered if a.get('in_app_readable')] if readable_only else filtered
+
     payload = {
         'ok': True,
-        'articles': filtered[:limit],
-        'count': min(len(filtered), limit),
+        'articles': visible[:limit],
+        'count': min(len(visible), limit),
         'total_before_limit': len(filtered),
         # Wie viele Artikel airline-relevant sind (für "Deine Airline"-Sektion).
         'own_airline_count': sum(1 for a in filtered if a.get('is_own_airline')),
@@ -570,8 +581,27 @@ def _entry_to_article(entry, src):
 
     summary_raw = entry.get('summary') or entry.get('description') or ''
     summary = _strip_html(summary_raw).strip()
+    full_summary_len = len(summary)
     if len(summary) > 300:
         summary = summary[:297].rstrip() + '...'
+
+    # Volltext aus RSS <content:encoded> (viele DE-Aviation-Feeds liefern den
+    # ganzen Artikel) → direkt IN-APP lesbar, kein Reader/Browser nötig.
+    content_raw = ''
+    try:
+        cont = entry.get('content')
+        if cont and isinstance(cont, list):
+            content_raw = cont[0].get('value') or ''
+    except Exception:
+        content_raw = ''
+    fulltext = _strip_html(content_raw).strip()
+    # „In-App lesbar" = es gibt einen echten Volltext im RSS ODER die
+    # Zusammenfassung ist lang genug für einen sinnvollen Read. Reine
+    # Ein-Satz-Teaser (z.B. „Spezifisches Angebot für Kunden in China"), die
+    # nur „Im Browser öffnen" anbieten, sind NICHT in-app lesbar → werden bei
+    # ?readable_only=1 aus dem Feed gefiltert (User: „keine News die nicht
+    # direkt in der App lesbar sind").
+    in_app_readable = len(fulltext) >= 400 or full_summary_len >= 140
 
     published_at = _entry_unix_ts(entry)
     image_url = _entry_image_url(entry)
@@ -591,6 +621,8 @@ def _entry_to_article(entry, src):
         'image_url': image_url,
         'article_url': link,
         'hashtags': hashtags,
+        'fulltext': fulltext[:8000] if fulltext else None,
+        'in_app_readable': in_app_readable,
         'mentioned_airlines': [],  # wird im Caller gefüllt
         'category': _DEFAULT_CATEGORY,  # wird im Caller überschrieben
     }
