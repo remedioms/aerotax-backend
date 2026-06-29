@@ -22224,6 +22224,46 @@ def ax_aircraft_history(reg):
     return jsonify({'ok': True, 'found': False, 'reg': rg, 'source': 'none'})
 
 
+@app.route('/api/ax/flight-route/<callsign>', methods=['GET'])
+def ax_flight_route(callsign):
+    """Globaler Flug-Route-Lookup (Airline + Origin→Destination) via adsbdb (GRATIS,
+    kein Key) — auch für Nicht-LH-Carrier (z.B. LATAM „TAM8071") und wenn der Flieger
+    NICHT live ist. So zeigt die Suche etwas Sinnvolles (Airline + Strecke) statt
+    „keine Ergebnisse". `found:false` nur, wenn adsbdb die Route nicht kennt."""
+    cs = (callsign or '').upper().replace(' ', '').strip()[:12]
+    if len(cs) < 3:
+        return jsonify({'ok': False, 'error': 'bad_callsign'}), 400
+    try:
+        import requests
+        r = requests.get(f'https://api.adsbdb.com/v0/callsign/{cs}', timeout=8,
+                         headers={'User-Agent': 'AeroX/1.0 (+https://aerosteuer.de)'})
+        if r.status_code == 404:
+            return _public_cache_headers(jsonify({'ok': True, 'found': False, 'callsign': cs}))
+        r.raise_for_status()
+        fr = ((r.json() or {}).get('response') or {}).get('flightroute') or {}
+        if not fr:
+            return jsonify({'ok': True, 'found': False, 'callsign': cs})
+
+        def _ap(x):
+            x = x or {}
+            return {'iata': x.get('iata_code'), 'icao': x.get('icao_code'),
+                    'name': x.get('name'), 'city': x.get('municipality'),
+                    'country': x.get('country_name'),
+                    'lat': x.get('latitude'), 'lon': x.get('longitude')}
+        air = fr.get('airline') or {}
+        out = {
+            'ok': True, 'found': True, 'callsign': fr.get('callsign') or cs,
+            'flight_iata': fr.get('callsign_iata'), 'flight_icao': fr.get('callsign_icao'),
+            'airline': air.get('name'), 'airline_iata': air.get('iata'),
+            'airline_icao': air.get('icao'),
+            'origin': _ap(fr.get('origin')), 'destination': _ap(fr.get('destination')),
+        }
+        return _public_cache_headers(jsonify(out))
+    except Exception as e:
+        app.logger.warning(f'[ax_flight_route] {cs} {str(e)[:120]}')
+        return jsonify({'ok': False, 'error': str(e)[:160]}), 200
+
+
 # Fernverkehr-Linien-Präfixe (für Post-Filter, falls products-Keys nicht greifen)
 _FERN_PREFIXES = ('ICE', 'IC', 'EC', 'ECE', 'RJ', 'RJX', 'TGV', 'NJ', 'EN', 'FLX')
 
@@ -22275,6 +22315,42 @@ def ax_transit():
             r = requests.get(url, params=params, headers=UA, timeout=timeout)
             r.raise_for_status()
             return r.json()
+
+        def _post_json(url, body, timeout):
+            r = requests.post(url, json=body, timeout=timeout,
+                              headers={**UA, 'Accept': 'application/json',
+                                       'Content-Type': 'application/json'})
+            r.raise_for_status()
+            return r.json()
+
+        def _norm_bahnde(data):
+            """bahn.de-Vendo (dbweb) Verbindungen → normalisierte Leg-Listen. DIES ist
+            die einzige Quelle die von Cloud Run aus GANZ Deutschland abdeckt (FRA,
+            Köln, Berlin, Mainz, Wiesbaden …): www.bahn.de ist öffentlich auflösbar,
+            anders als DBs interne Vendo-Hosts (app.vendo.noncd.db.de = NXDOMAIN von
+            Google aus). Fußweg = verkehrsmittel.typ FUSSWEG; Linie = name/kurzText."""
+            out = []
+            for v in (data or {}).get('verbindungen', []) or []:
+                vb = v.get('verbindung') or v
+                legs = []
+                for ab in vb.get('verbindungsAbschnitte', []) or []:
+                    vm = ab.get('verkehrsmittel') or {}
+                    typ = (vm.get('typ') or '').upper()
+                    kat = (vm.get('produktGattung') or vm.get('kategorie') or '').upper()
+                    is_walk = typ in ('FUSSWEG', 'WALK', 'TRANSFER') or kat == 'FUSSWEG'
+                    name = vm.get('name') or vm.get('kurzText') or vm.get('mittelText')
+                    is_fern = kat in ('ICE', 'EC_IC', 'IR') or _leg_is_fern(name)
+                    legs.append({
+                        'mode': 'walk' if is_walk else 'transit',
+                        'line': None if is_walk else name, 'product': kat,
+                        'fern': is_fern,
+                        'from': ab.get('abfahrtsOrt'), 'to': ab.get('ankunftsOrt'),
+                        'from_lat': None, 'from_lon': None,
+                        'dep': ab.get('abfahrtsZeitpunkt'), 'arr': ab.get('ankunftsZeitpunkt'),
+                    })
+                if legs:
+                    out.append(legs)
+            return out
 
         # MOTIS-Fern-Modes (Transitous) → bei Nahverkehr-only ausschließen.
         _MOTIS_FERN = ('HIGHSPEED_RAIL', 'LONG_DISTANCE', 'NIGHT_RAIL', 'COACH', 'AIRPLANE')
@@ -22427,12 +22503,47 @@ def ax_transit():
                 efa_params = None
                 efa_dbg['build_err'] = f'{type(ee).__name__}: {str(ee)[:140]}'
 
+        # bahn.de-Vendo (dbweb): GANZ-Deutschland-Abdeckung (FRA/Köln/Berlin/Mainz/
+        # Wiesbaden …), gratis, kein Key, von Cloud Run aus erreichbar (www.bahn.de
+        # ist öffentlich, anders als DBs interne Vendo-Hosts). Koordinaten als
+        # ADR-Location-Id `A=2@O=…@X=lon*1e6@Y=lat*1e6@`; arrive-by via ankunftSuche.
+        bahn_body = None
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            _tzb = _ZI('Europe/Berlin')
+            if arrival_s:
+                _ab = datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+                _ab = _ab.astimezone(_tzb) if _ab.tzinfo else _ab.replace(tzinfo=_tzb)
+            else:
+                _ab = datetime.now(_tzb)
+            _nah = ['IR', 'REGIONAL', 'SBAHN', 'BUS', 'SCHIFF', 'UBAHN', 'TRAM', 'ANRUFPFLICHTIG']
+            _prod = (['ICE', 'EC_IC'] + _nah) if want_fern else _nah
+            bahn_body = {
+                'abfahrtsHalt': f'A=2@O=Zuhause@X={int(round(flon * 1e6))}@Y={int(round(flat * 1e6))}@',
+                'ankunftsHalt': f'A=2@O=Flughafen@X={int(round(tlon * 1e6))}@Y={int(round(tlat * 1e6))}@',
+                'anfrageZeitpunkt': _ab.strftime('%Y-%m-%dT%H:%M:%S'),
+                'ankunftSuche': 'ANKUNFT',          # arrive-by
+                'klasse': 'KLASSE_2',
+                'produktgattungen': _prod,
+                'reisende': [{'typ': 'ERWACHSENER',
+                              'ermaessigungen': [{'art': 'KEINE_ERMAESSIGUNG', 'klasse': 'KLASSENLOS'}],
+                              'alter': [], 'anzahl': 1}],
+                'schnelleVerbindungen': True, 'sitzplatzOnly': False,
+                'bikeCarriage': False, 'reservierungsKontingenteVorhanden': False,
+            }
+        except Exception:
+            bahn_body = None
+
         # Provider-Reihenfolge: (Name, callable→normalisierte Journeys). Erster mit
         # Treffer gewinnt. Jeder eigener try → ein langsamer/down Provider blockt nicht.
+        # MVV-EFA zuerst (authoritativ für München), dann bahn.de (ganz DE), dann Rest.
         providers = []
         if efa_params is not None:
             providers.append(('mvv_efa', lambda: _norm_efa(
                 _get_json('https://efa.mvv-muenchen.de/ng/XML_TRIP_REQUEST2', efa_params, 12))))
+        if bahn_body is not None:
+            providers.append(('bahn_de', lambda: _norm_bahnde(
+                _post_json('https://www.bahn.de/web/api/angebote/fahrplan', bahn_body, 14))))
         providers += [
             ('transitous', lambda: _norm_motis(
                 _get_json('https://api.transitous.org/api/v6/plan', motis_params, 14))),
