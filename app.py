@@ -22850,6 +22850,10 @@ def ax_transit():
                     dep_rt = o.get('departureTimeEstimated')
                     arr_plan = d.get('arrivalTimePlanned')
                     arr_rt = d.get('arrivalTimeEstimated')
+                    # EFA: Gleis am Abfahrts-Stop = `platform` (kurz, z.B. „3") bzw.
+                    # `platformName` (Langtext). Kurzform bevorzugen, sonst Langtext.
+                    _plat = o.get('platform') or o.get('platformName')
+                    dep_platform = (str(_plat).strip() or None) if _plat not in (None, '') else None
                     legs.append({
                         'mode': 'walk' if is_walk else 'transit',
                         'line': None if is_walk else name, 'product': str(cls),
@@ -22863,6 +22867,7 @@ def ax_transit():
                         'arr_planned': arr_plan,
                         'delay_min': (None if is_walk or not dep_rt
                                       else _delay_min(dep_plan, dep_rt)),
+                        'platform': None if is_walk else dep_platform,
                     })
                 if legs:
                     out.append(legs)
@@ -22913,6 +22918,10 @@ def ax_transit():
                               if o.get('rtTime') else None)
                     arr_rt = (_hafas_iso(d.get('rtDate') or d.get('date'), d.get('rtTime'))
                               if d.get('rtTime') else None)
+                    # HAFAS-REST: Gleis am Abfahrts-Stop = `track` (Plan) / `rtTrack`
+                    # (Echtzeit). Echtzeit bevorzugen, sonst Plan, sonst None.
+                    _trk = o.get('rtTrack') or o.get('track')
+                    dep_platform = (str(_trk).strip() or None) if _trk not in (None, '') else None
                     legs.append({
                         'mode': 'walk' if is_walk else 'transit',
                         'line': None if is_walk else (name or '').strip(), 'product': cat,
@@ -22925,6 +22934,7 @@ def ax_transit():
                         'arr_planned': arr_plan,
                         'delay_min': (None if is_walk or not dep_rt
                                       else _delay_min(dep_plan, dep_rt)),
+                        'platform': None if is_walk else dep_platform,
                     })
                 if legs:
                     out.append(legs)
