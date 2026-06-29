@@ -18286,6 +18286,8 @@ def _trip_stats_compute(token):
             'sickness_days': 0,
             'standby_days': 0,
             'tour_days': 0,
+            'spesen_eur': 0.0,
+            'spesen_days': 0,
         }
     life = _zero()
     ytd = _zero()
@@ -18327,6 +18329,9 @@ def _trip_stats_compute(token):
         klass = (t.get('klass') or '').upper()
         marker_lower = (t.get('marker') or '').lower()
         rf = t.get('reader_facts') or {}
+        cr = t.get('classifier_result') or {}
+        # Per-Tag VMA-Betrag (Spesen-Schätzbasis, Issue #spesen-honest).
+        spesen_amt = float(cr.get('amount', 0) or 0)
         is_sick = (klass == 'KRANK' or 'krank' in marker_lower or 'sick' in marker_lower
                    or marker_lower in ('k', 'kk'))
         is_standby = ('standby' in marker_lower or marker_lower in ('sby', 'st'))
@@ -18339,7 +18344,13 @@ def _trip_stats_compute(token):
             if is_sick: tg['sickness_days'] += 1
             if is_standby: tg['standby_days'] += 1
             if is_frei: tg['frei_days'] += 1
-            if klass in ('Z72', 'Z73', 'Z74', 'Z76'): tg['tour_days'] += 1
+            if klass in ('Z72', 'Z73', 'Z74', 'Z76'):
+                tg['tour_days'] += 1
+                # Spesen-Schätzung: Summe der pro-Tag-VMA aus dem importierten Plan.
+                # KEIN geprüfter Jahres-Wert → wird ehrlich als Schätzung markiert.
+                if spesen_amt > 0:
+                    tg['spesen_eur'] += spesen_amt
+                    tg['spesen_days'] += 1
 
         routing = t.get('routing') or ''
         legs = _accumulate_distance(routing, life)
@@ -18360,7 +18371,14 @@ def _trip_stats_compute(token):
                     ytd['countries'].add(ent[2])
         lo = (rf.get('layover_ort') or '').upper().strip()
         if lo and len(lo) == 3 and lo != 'FRA':
-            destinations_ct[lo] += 1
+            # Issue1: Top-Ziele nach ÜBERNACHTUNGEN ranken, nicht nach Hinflügen.
+            # Eine Layover-Nacht = Tag, an dem die Crew auswärts (≠ Homebase) an
+            # diesem Ort schläft. counted_as_hotel_nacht ist der kanonische
+            # "schläft auswärts vom Homebase"-Marker; overnight_after_day als
+            # Fallback. So zählen Mehr-Nächte-Aufenthalte mit ihren Nächten,
+            # Same-Day-/Heimkehr-Tage (kein Overnight) zählen nicht mit.
+            if bool(cr.get('counted_as_hotel_nacht')) or bool(rf.get('overnight_after_day')):
+                destinations_ct[lo] += 1   # zählt Nächte, nicht Hinflüge
             ent = ap_lookup.get(lo)
             if ent and ent[2]:
                 life['countries'].add(ent[2])
@@ -18484,6 +18502,12 @@ def _trip_stats_compute(token):
             'sickness_days': bucket['sickness_days'],
             'standby_days': bucket['standby_days'],
             'tour_days': bucket['tour_days'],
+            # Spesen: ehrlich als SCHÄTZUNG aus dem importierten Plan markiert,
+            # KEIN geprüfter Jahres-Wert (Issue: "Jahr-Spesen ohne Beweise").
+            # Client soll labeln: "geschätzt aus deinem Plan (X Tage)".
+            'spesen_estimate': round(bucket['spesen_eur'], 2),
+            'spesen_is_estimate': True,
+            'spesen_basis_days': bucket['spesen_days'],
         }
 
     return {
