@@ -595,13 +595,12 @@ def _entry_to_article(entry, src):
     except Exception:
         content_raw = ''
     fulltext = _strip_html(content_raw).strip()
-    # „In-App lesbar" = es gibt einen echten Volltext im RSS ODER die
-    # Zusammenfassung ist lang genug für einen sinnvollen Read. Reine
-    # Ein-Satz-Teaser (z.B. „Spezifisches Angebot für Kunden in China"), die
-    # nur „Im Browser öffnen" anbieten, sind NICHT in-app lesbar → werden bei
-    # ?readable_only=1 aus dem Feed gefiltert (User: „keine News die nicht
-    # direkt in der App lesbar sind").
-    in_app_readable = len(fulltext) >= 400 or full_summary_len >= 140
+    # „In-App lesbar" = es gibt einen ECHTEN Volltext im RSS (content:encoded).
+    # NICHT mehr „lange Zusammenfassung reicht" — der frühere Summary-Fallback ließ
+    # Teaser durch, die in der App nur „Volltext nicht verfügbar / Im Browser öffnen"
+    # zeigen (User: „wenn kein Volltext wegen Scraping, dann die Seite nicht für News
+    # benutzen"). Quellen ohne content:encoded fallen so bei ?readable_only=1 raus.
+    in_app_readable = len(fulltext) >= 400
 
     published_at = _entry_unix_ts(entry)
     image_url = _entry_image_url(entry)
