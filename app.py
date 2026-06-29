@@ -18432,14 +18432,12 @@ def _trip_stats_compute(token):
                     ytd['countries'].add(ent[2])
         lo = (rf.get('layover_ort') or '').upper().strip()
         if lo and len(lo) == 3 and lo != 'FRA':
-            # Issue1: Top-Ziele nach ÜBERNACHTUNGEN ranken, nicht nach Hinflügen.
-            # Eine Layover-Nacht = Tag, an dem die Crew auswärts (≠ Homebase) an
-            # diesem Ort schläft. counted_as_hotel_nacht ist der kanonische
-            # "schläft auswärts vom Homebase"-Marker; overnight_after_day als
-            # Fallback. So zählen Mehr-Nächte-Aufenthalte mit ihren Nächten,
-            # Same-Day-/Heimkehr-Tage (kein Overnight) zählen nicht mit.
-            if bool(cr.get('counted_as_hotel_nacht')) or bool(rf.get('overnight_after_day')):
-                destinations_ct[lo] += 1   # zählt Nächte, nicht Hinflüge
+            # Top-Ziele = wie OFT man da war (Besuche/Hinflüge), NICHT Nächte.
+            # Die eigentliche Besuchszählung passiert weiter unten in der
+            # chronologisch sortierten Schleife (sorted_tage), weil ein
+            # Aufenthalt über mehrere Nächte EIN Besuch ist und sich nur in
+            # Datums-Reihenfolge zuverlässig als ein zusammenhängender Block
+            # erkennen lässt. Hier nur noch Länder-Aggregation.
             ent = ap_lookup.get(lo)
             if ent and ent[2]:
                 life['countries'].add(ent[2])
@@ -18495,9 +18493,11 @@ def _trip_stats_compute(token):
     cur_layover_len = 0
     sorted_tage = sorted([t for t in tage if isinstance(t, dict) and t.get('datum')],
                         key=lambda x: x.get('datum'))
+    visit_prev_lo = None   # letzter Ort eines zusammenhängenden Übernacht-Blocks
     for t in sorted_tage:
         klass = (t.get('klass') or '').upper()
         rf = t.get('reader_facts') or {}
+        cr = t.get('classifier_result') or {}
         lo = (rf.get('layover_ort') or '').upper().strip()
         if klass in ('Z72', 'Z73', 'Z74', 'Z76'):
             if cur_tour_len == 0:
@@ -18509,6 +18509,18 @@ def _trip_stats_compute(token):
                 longest_tour_routing = cur_tour_routing
             cur_tour_len = 0
             cur_tour_routing = ''
+        # Top-Ziele nach BESUCHEN zählen: wie oft man da war = wie oft man einen
+        # Hinflug dahin hatte. Ein Aufenthalt über mehrere Nächte = EIN Besuch.
+        # Ein neuer Besuch beginnt, sobald eine Auswärts-Übernachtung an einem
+        # Ort startet, der NICHT der unmittelbar vorhergehende Übernacht-Ort ist
+        # (gleiches Gating wie zuvor: counted_as_hotel_nacht / overnight_after_day).
+        overnight = bool(cr.get('counted_as_hotel_nacht')) or bool(rf.get('overnight_after_day'))
+        if lo and len(lo) == 3 and lo != 'FRA' and overnight:
+            if lo != visit_prev_lo:
+                destinations_ct[lo] += 1   # ein Besuch je Aufenthalt (Hinflug)
+            visit_prev_lo = lo
+        else:
+            visit_prev_lo = None
         if lo and lo != 'FRA':
             if cur_layover == lo:
                 cur_layover_len += 1
