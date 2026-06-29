@@ -13865,7 +13865,12 @@ def take_roster_snapshot(token):
     if not _roster_snapshot_path(token):
         return jsonify({'ok': False, 'error': 'invalid token'}), 400
     old_tage = (_roster_snapshot_read(token) or {}).get('tage') or []
-    diff = _compute_roster_diff(old_tage, new_tage)
+    # ERSTE Baseline (noch kein Snapshot vorhanden): NICHT alle Tage als „added"
+    # melden — das flutete den User mit Hunderten Pseudo-Änderungen (User
+    # 2026-06-29: „dachte mein Plan wird per Push verbunden"). Beim allerersten
+    # Push nur still die Baseline setzen, Diff bleibt leer. Änderungen erst ab
+    # dem ZWEITEN Push (echter Vorher/Nachher-Vergleich).
+    diff = _compute_roster_diff(old_tage, new_tage) if old_tage else []
     # Persist new snapshot (Supabase-first + Disk, multi-instance-sicher)
     if not _roster_snapshot_save(token, {
         'taken_at': datetime.now().isoformat(), 'tage': new_tage,
@@ -13934,6 +13939,22 @@ def decide_roster_change(token):
     except FileNotFoundError:
         return jsonify({'ok': False, 'error': 'no_changes'}), 404
     pending = data.get('pending') or []
+    # BULK (User 2026-06-29: „alle auf einmal akzeptieren oder ablehnen, sonst
+    # sammeln sich tausend an"): datum='*' ODER all=true → ALLE pending auf einmal
+    # entscheiden und nach history verschieben.
+    if body.get('all') or datum in ('*', None, ''):
+        now_iso = datetime.now().isoformat()
+        for c in pending:
+            c['decision'] = decision; c['decided_at'] = now_iso
+            c['status'] = decision + 'ed'
+        history = (data.get('history') or []) + pending
+        data['pending'] = []
+        data['history'] = history[-500:]   # history deckeln, sonst wächst sie ewig
+        try:
+            with open(cp, 'w') as f: json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        return jsonify({'ok': True, 'decided': len(pending), 'pending_remaining': 0})
     matched = next((c for c in pending if c.get('datum') == datum), None)
     if not matched:
         return jsonify({'ok': False, 'error': 'change_not_found'}), 404
