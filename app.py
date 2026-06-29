@@ -23211,10 +23211,21 @@ def ax_transit():
         # Zielzeit (für die Pünktlichkeits-Prüfung): PÜNKTLICH heißt am Flughafen
         # spätestens zur `arrival_s` sein. Wir dürfen NIE eine Verbindung empfehlen,
         # die zu spät ankommt.
+        # TZ-FIX (User 2026-06-29 „im feed bin ich viel zu früh da, nicht 15 min vor
+        # Briefing"): vorher wurde die tzinfo ABGESCHNITTEN und naiv verglichen. Aber
+        # die Provider liefern UNTERSCHIEDLICHE Zonen — EFA (München) UTC („…Z"),
+        # RMV/HAFAS (Frankfurt + ganz DE) Europe/Berlin („+02:00"). Die Zielzeit
+        # `arrival_s` kommt als UTC vom Client. Naiv verglichen sah JEDE RMV-Ankunft
+        # 2 h „zu spät" aus → KEINE galt als pünktlich → es fiel immer auf die
+        # früheste Verbindung zurück = viel zu früh am Flughafen. Fix: ALLES auf
+        # UTC-aware normalisieren, dann vergleichen (naive Werte als UTC annehmen).
+        from datetime import timezone as _utctz
         def _parse(s):
             try:
                 dt = datetime.fromisoformat((s or '').replace('Z', '+00:00'))
-                return dt.replace(tzinfo=None) if dt.tzinfo else dt
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_utctz.utc)
+                return dt.astimezone(_utctz.utc)
             except Exception:
                 return None
         target_dt = _parse(arrival_s) if arrival_s else None
