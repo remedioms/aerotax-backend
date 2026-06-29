@@ -12023,6 +12023,14 @@ def get_airport_detail(icao):
 NEWS_ARTICLE_ALLOWED_HOSTS = frozenset({
     # aero.de · deutsche Hauptquelle
     'aero.de', 'www.aero.de',
+    # aeroTELEGRAPH · DE-Branchenmedium (WordPress)
+    'aerotelegraph.com', 'www.aerotelegraph.com',
+    # AEROBUZZ · DE-Branchenmedium (WordPress)
+    'aerobuzz.de', 'www.aerobuzz.de',
+    # Aviation.Direct · DE-Branchenmedium (WordPress)
+    'aviation.direct', 'www.aviation.direct',
+    # Austrian Wings · AT-Branchenmedium (WordPress)
+    'austrianwings.info', 'www.austrianwings.info',
     # Reuters Aerospace & Defense
     'reuters.com', 'www.reuters.com',
     # AvHerald · Incident-Reports
@@ -12088,7 +12096,8 @@ def get_news_article():
     """Vollartikel-Text einer Aviation-News-URL.
 
     Query: ?url=<encoded article URL>
-    Whitelist: aero.de, reuters.com, avherald.com, simpleflying.com,
+    Whitelist: aero.de, aerotelegraph.com, aerobuzz.de, aviation.direct,
+               austrianwings.info, reuters.com, avherald.com, simpleflying.com,
                theaircurrent.com, flightradar24.com (jeweils +www.).
     Return:
         ok=True  → {ok, url, source, fulltext, title, image_url,
