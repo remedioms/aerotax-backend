@@ -9592,6 +9592,15 @@ def put_user_profile(token):
     if ('share_location' in body and body.get('share_location') is False) or \
        (stored_share_loc is False and 'current_city' in body):
         profile.pop('current_city', None)
+    # location_source: 'roster' (Dienstplan-Modus, Default) | 'gps'. Steuert
+    # SERVERSEITIG, ob die gespeicherte current_city überhaupt an Freunde/Family
+    # geleakt werden darf. Im roster-Modus NIE — sonst könnten Freunde erfahren,
+    # dass die Crew während eines Layovers tatsächlich woanders hingeflogen ist
+    # (Privacy-Anweisung User 2026-06-29). Nur 'gps'/'roster' zulässig.
+    if 'location_source' in body:
+        ls = body.get('location_source')
+        if ls in ('roster', 'gps'):
+            profile['location_source'] = ls
     # Home-Address (2026-06-06): Commute-Distance / Smart-Pickup. Felder kommen
     # partiell — nur die im Body vorhandenen überschreiben (MERGE-Semantik wie
     # oben). Floats + bool defensiv casten, damit ein iOS-Tippfehler/None kein
@@ -10408,6 +10417,31 @@ def _friends_save(token, data):
     return True
 
 
+def _friend_facing_city(prof, roster_city=None):
+    """Privacy-Gate für die an FREUNDE/Family ausgelieferte Standort-Stadt.
+
+    Im Dienstplan-Modus (`location_source` == 'roster' ODER fehlend → Default)
+    wird die gespeicherte GPS-`current_city` IGNORIERT und stattdessen NUR die
+    aus dem geteilten Roster abgeleitete Stadt (heutiger Layover/Dienst-Ort)
+    serviert. Sonst könnten Freunde erfahren, dass die Crew während eines
+    Layovers tatsächlich woanders hingeflogen ist (User-Anweisung 2026-06-29).
+    Nur bei `location_source` == 'gps' darf die echte reverse-geocodete GPS-Stadt
+    raus. Die Entscheidung fällt SERVERSEITIG — robust gegen einen stale Wert,
+    den der Client evtl. noch mitschickt.
+
+    Returns die anzuzeigende Stadt (str) oder None. Der share_location-Hard-Gate
+    bleibt dem Aufrufer vorgelagert (None/False = gar keine Location).
+    """
+    if not isinstance(prof, dict):
+        return None
+    src = prof.get('location_source')
+    src = src.strip().lower() if isinstance(src, str) else ''
+    if src == 'gps':
+        return prof.get('current_city')
+    # roster-Modus (Default): GPS-Stadt verwerfen, nur den Roster-Ort servieren.
+    return roster_city or None
+
+
 @app.route('/api/user/friends/<token>', methods=['GET'])
 def get_user_friends(token):
     """Listet alle Friends eines Users mit deren Profile-Daten."""
@@ -10428,9 +10462,15 @@ def get_user_friends(token):
         # das VOLLE Profil raus inkl. home_address + GPS-Koordinaten der Freunde.
         if isinstance(prof, dict):
             pub = {k: v for k, v in prof.items() if k in _PUBLIC_PROFILE_FIELDS}
-            # current_city (Layover-Stadt) nur wenn Location-Sharing nicht aus ist.
-            if prof.get('share_location') is not False and prof.get('current_city'):
-                pub['current_city'] = prof.get('current_city')
+            # current_city nur wenn Location-Sharing nicht aus ist. PRIVACY:
+            # im Dienstplan-Modus (location_source != 'gps') wird die gespeicherte
+            # GPS-Stadt verworfen und NUR der heutige Roster-Ort serviert — sonst
+            # leaken wir, dass die Crew während eines Layovers woanders hingeflogen
+            # ist. _user_current_iata = heutiger Layover/Dienst-Ort aus dem Roster.
+            if prof.get('share_location') is not False:
+                _fc = _friend_facing_city(prof, _user_current_iata(friend_token))
+                if _fc:
+                    pub['current_city'] = _fc
             prof = pub
         enriched.append({
             'token': friend_token,
@@ -11241,10 +11281,13 @@ def get_friends_today(token):
             'name': pr.get('name') or 'Friend',
             'avatar_url': pr.get('avatar_url'),
             'homebase': pr.get('homebase') or '',
-            # GPS-reverse-geocodete Stadt (nur Stadt, nie exakte Koordinate) —
-            # iOS zeigt damit die echte Layover-Location statt nur dem Airport.
-            # NUR wenn der Friend share_location nicht ausgeschaltet hat.
-            'current_city': pr.get('current_city') if share_loc else None,
+            # Standort-Stadt — nur wenn share_location an ist UND (Dienstplan-Modus)
+            # serverseitig freigegeben: im roster-Modus (location_source != 'gps')
+            # wird die GPS-current_city verworfen und stattdessen der heutige
+            # Roster-Layover-Ort serviert, damit Freunde NICHT sehen, dass die Crew
+            # während eines Layovers woanders hingeflogen ist (User 2026-06-29).
+            'current_city': (_friend_facing_city(pr, rf.get('layover_ort'))
+                             if share_loc else None),
             'klass': day.get('klass'),
             'marker': day.get('marker'),
             'routing': day.get('routing'),

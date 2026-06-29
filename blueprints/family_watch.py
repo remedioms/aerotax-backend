@@ -573,6 +573,16 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     # einfacher Contains scheitert für ausgeschriebene Städtenamen wie „München"),
     # wird unterdrückt, weil die Family bereits layover_place sieht und zwei
     # widersprüchliche Orte nur verwirren.
+    # PRIVACY HARD-GATE (User-Anweisung 2026-06-29): im Dienstplan-Modus
+    # (location_source != 'gps' ODER fehlend → Default) NIE die gespeicherte
+    # GPS-current_city an die Family leaken — sie soll nicht erfahren, dass die
+    # Crew während eines Layovers tatsächlich woanders hingeflogen ist. Der
+    # Roster-Ort steht bereits in layover_place; current_city wird komplett
+    # verworfen. Nur bei explizitem GPS-Modus bleibt die reverse-geocodete Stadt.
+    _loc_src = prof.get('location_source') if isinstance(prof, dict) else None
+    _loc_src = _loc_src.strip().lower() if isinstance(_loc_src, str) else ''
+    if _loc_src != 'gps':
+        status['current_city'] = None
     if 'current_city' in allowed_fields and status.get('current_city'):
         if roster_today_home:
             # Plan = Homebase-Tag → keine widersprechende GPS-Stadt servieren.
