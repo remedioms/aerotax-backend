@@ -22316,12 +22316,24 @@ def ax_transit():
             r.raise_for_status()
             return r.json()
 
-        def _post_json(url, body, timeout):
+        def _post_json(url, body, timeout, headers=None):
             r = requests.post(url, json=body, timeout=timeout,
-                              headers={**UA, 'Accept': 'application/json',
-                                       'Content-Type': 'application/json'})
+                              headers=headers or {**UA, 'Accept': 'application/json',
+                                                  'Content-Type': 'application/json'})
             r.raise_for_status()
             return r.json()
+
+        # bahn.de hängt hinter Akamai-Bot-Protection → braucht Browser-ähnliche Header
+        # (echte SPA-Header), sonst 403. Origin/Referer = die echte Fahrplan-Suche.
+        _BAHN_HEADERS = {
+            'User-Agent': ('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+                           'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 '
+                           'Mobile/15E148 Safari/604.1'),
+            'Accept': 'application/json', 'Accept-Language': 'de-DE,de;q=0.9',
+            'Content-Type': 'application/json',
+            'Origin': 'https://www.bahn.de',
+            'Referer': 'https://www.bahn.de/buchung/fahrplan/suche',
+        }
 
         def _norm_bahnde(data):
             """bahn.de-Vendo (dbweb) Verbindungen → normalisierte Leg-Listen. DIES ist
@@ -22543,7 +22555,8 @@ def ax_transit():
                 _get_json('https://efa.mvv-muenchen.de/ng/XML_TRIP_REQUEST2', efa_params, 12))))
         if bahn_body is not None:
             providers.append(('bahn_de', lambda: _norm_bahnde(
-                _post_json('https://www.bahn.de/web/api/angebote/fahrplan', bahn_body, 14))))
+                _post_json('https://www.bahn.de/web/api/angebote/fahrplan', bahn_body, 14,
+                           headers=_BAHN_HEADERS))))
         providers += [
             ('transitous', lambda: _norm_motis(
                 _get_json('https://api.transitous.org/api/v6/plan', motis_params, 14))),
