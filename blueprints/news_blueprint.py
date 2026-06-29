@@ -595,6 +595,12 @@ def _entry_to_article(entry, src):
     except Exception:
         content_raw = ''
     fulltext = _strip_html(content_raw).strip()
+    # Spenden-/Förder-Appelle aus dem RSS-Volltext entfernen, bevor er als
+    # in-app-lesbar gilt oder ausgeliefert wird.
+    try:
+        fulltext = _strip_donation_appeals(fulltext)
+    except Exception:
+        pass
     # „In-App lesbar" = es gibt einen ECHTEN Volltext im RSS (content:encoded).
     # NICHT mehr „lange Zusammenfassung reicht" — der frühere Summary-Fallback ließ
     # Teaser durch, die in der App nur „Volltext nicht verfügbar / Im Browser öffnen"
@@ -1012,6 +1018,65 @@ def _strip_html(s):
     no_tags = _TAG_RE.sub(' ', s)
     unescaped = html_lib.unescape(no_tags)
     return _WS_RE.sub(' ', unescaped).strip()
+
+
+# Spenden-/Solicitation-Marker (case-insensitive). "strong" = an sich schon ein
+# Aufruf; "weak" = braucht zusätzlich ein Call-to-Action-Verb im selben Satz.
+# Bewusst konservativ: nur der anstößige Satz fliegt, nie der ganze Artikel.
+_DONATION_MARKERS_STRONG = (
+    'spendenaufruf', 'unterstützen sie uns', 'unterstütze uns',
+    'jetzt unterstützen', 'jetzt unterstützen sie', 'spendenkonto',
+    'werde mitglied', 'werden sie mitglied', 'werde fördermitglied',
+    'support us', 'donate', 'buy us a coffee', 'buy me a coffee',
+    'abonnieren sie',
+)
+_DONATION_MARKERS_WEAK = (
+    'spende', 'paypal', 'patreon', 'steady', 'iban', 'fördermitglied',
+    'newsletter', 'membership',
+)
+_DONATION_CTA_VERBS = (
+    'unterstützen sie', 'unterstütze uns', 'unterstütz uns',
+    'spenden sie', 'jetzt spenden', 'spende jetzt', 'bitte spende',
+    'abonnier', 'registrier', 'klicken sie', 'helfen sie',
+    'werde mitglied', 'werden sie mitglied', 'jetzt unterstützen',
+    'pledge', 'please support', 'support our', 'please donate',
+    'subscribe', 'join us', 'become a', 'sign up',
+)
+
+
+def _strip_donation_appeals(text):
+    """Entfernt Spenden-/Förder-/Solicitation-Sätze aus Artikel-Volltext.
+
+    Wirkt absatz- und satzweise: nur der konkrete anstößige Satz fällt raus,
+    der Rest bleibt. Ein Satz fliegt nur bei strong-Marker ODER weak-Marker +
+    CTA-Verb. Reine String-Operation, wirft nie nach außen.
+    """
+    if not text:
+        return text
+
+    def _is_appeal(sentence):
+        low = sentence.lower()
+        if any(m in low for m in _DONATION_MARKERS_STRONG):
+            return True
+        if any(m in low for m in _DONATION_MARKERS_WEAK):
+            if any(v in low for v in _DONATION_CTA_VERBS):
+                return True
+        return False
+
+    out_lines = []
+    for line in text.split('\n'):
+        if not line.strip():
+            out_lines.append(line)
+            continue
+        parts = re.split(r'(?<=[.!?])\s+', line)
+        kept = [p for p in parts if not _is_appeal(p)]
+        if not kept:
+            continue
+        out_lines.append(' '.join(kept).strip())
+
+    joined = '\n'.join(out_lines)
+    joined = re.sub(r'\n{3,}', '\n\n', joined)
+    return joined.strip()
 
 
 def _log_warn(msg):

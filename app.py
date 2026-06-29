@@ -12295,9 +12295,79 @@ def _news_extract_best_fulltext(html, source_host=''):
     # Größte BEREINIGTE Länge gewinnt. Hard-Cap 20k.
     cleaned.sort(key=lambda kv: len(kv[1]), reverse=True)
     best = cleaned[0][1]
+    # Spenden-/Förder-Appelle aus dem finalen Volltext entfernen.
+    try:
+        best = _strip_donation_appeals(best)
+    except Exception:
+        pass
     if len(best) > 20000:
         best = best[:20000].rsplit('\n\n', 1)[0]
     return best
+
+
+# Marker für Spenden-/Solicitation-Appelle (case-insensitive substring).
+# Zweistufig: "strong" = an sich schon ein Aufruf (Satz wird gedroppt sobald
+# ein solcher Marker vorkommt). "weak" = Marker braucht ZUSÄTZLICH ein
+# Call-to-Action-Verb im selben Satz, damit nicht jeder Artikel der z.B. "IBAN"
+# oder "Newsletter" beiläufig erwähnt zerschossen wird. Bewusst konservativ.
+_DONATION_MARKERS_STRONG = (
+    'spendenaufruf', 'unterstützen sie uns', 'unterstütze uns',
+    'jetzt unterstützen', 'jetzt unterstützen sie', 'spendenkonto',
+    'werde mitglied', 'werden sie mitglied', 'werde fördermitglied',
+    'support us', 'donate', 'buy us a coffee', 'buy me a coffee',
+    'abonnieren sie',
+)
+_DONATION_MARKERS_WEAK = (
+    'spende', 'paypal', 'patreon', 'steady', 'iban', 'fördermitglied',
+    'newsletter', 'membership',
+)
+_DONATION_CTA_VERBS = (
+    'unterstützen sie', 'unterstütze uns', 'unterstütz uns',
+    'spenden sie', 'jetzt spenden', 'spende jetzt', 'bitte spende',
+    'abonnier', 'registrier', 'klicken sie', 'helfen sie',
+    'werde mitglied', 'werden sie mitglied', 'jetzt unterstützen',
+    'pledge', 'please support', 'support our', 'please donate',
+    'subscribe', 'join us', 'become a', 'sign up',
+)
+
+
+def _strip_donation_appeals(text):
+    """Entfernt Spenden-/Förder-/Solicitation-Sätze aus Artikel-Volltext.
+
+    Wirkt absatz- und satzweise: nur der konkrete anstößige Satz/Absatz fällt
+    raus, der Rest bleibt erhalten. Ein Satz fliegt nur dann, wenn er einen
+    eindeutigen Spenden-Marker (strong) ODER einen schwachen Marker PLUS ein
+    Call-to-Action-Verb enthält. Reine String-Operation, wirft nie nach außen.
+    """
+    import re as _re
+    if not text:
+        return text
+
+    def _is_appeal(sentence):
+        low = sentence.lower()
+        if any(m in low for m in _DONATION_MARKERS_STRONG):
+            return True
+        if any(m in low for m in _DONATION_MARKERS_WEAK):
+            if any(v in low for v in _DONATION_CTA_VERBS):
+                return True
+        return False
+
+    out_lines = []
+    for line in text.split('\n'):
+        if not line.strip():
+            out_lines.append(line)
+            continue
+        # Satzweise splitten (Satzende-Zeichen + Whitespace), Trenner behalten.
+        parts = _re.split(r'(?<=[.!?])\s+', line)
+        kept = [p for p in parts if not _is_appeal(p)]
+        if not kept:
+            # Ganze Zeile war Appell → als Leerzeile droppen.
+            continue
+        out_lines.append(' '.join(kept).strip())
+
+    joined = '\n'.join(out_lines)
+    joined = _re.sub(r'\n{3,}', '\n\n', joined)
+    return joined.strip()
 
 
 # Zeilen-Marker für Boilerplate (Nav/Share/Related/Newsletter/Cookie/Footer).
