@@ -22421,6 +22421,55 @@ def ax_transit():
                     out.append(legs)
             return out
 
+        def _hafas_iso(d, t):
+            """HAFAS-REST liefert date='YYYY-MM-DD' + time='HH:MM:SS' LOKAL ohne TZ.
+            → kombinieren und Europe/Berlin-Offset anhängen, damit iOS es parsen kann."""
+            if not d or not t:
+                return None
+            try:
+                from zoneinfo import ZoneInfo as _Z
+                from datetime import datetime as _dt
+                naive = _dt.fromisoformat(f'{d}T{t[:8]}')
+                aware = naive.replace(tzinfo=_Z('Europe/Berlin'))
+                return aware.isoformat()
+            except Exception:
+                return f'{d}T{t[:8]}'
+
+        def _norm_rmv(data):
+            """RMV-HAPI (HAFAS-REST `trip`) → normalisierte Leg-Listen. Leg.type WALK =
+            Fußweg; Linie = Product.catOut/name (S8/U4/Bus). RMV-Host ist von Cloud
+            Run erreichbar (kein DB/Akamai-Block) → deckt Frankfurt/Mainz/Wiesbaden/
+            Hessen ab. Braucht einen GRATIS accessId-Key (opendata.rmv.de)."""
+            out = []
+            for trip in (data or {}).get('Trip', []) or []:
+                legs = []
+                ll = (trip.get('LegList') or {}).get('Leg') or []
+                for leg in ll:
+                    typ = (leg.get('type') or '').upper()
+                    is_walk = typ in ('WALK', 'TRSF', 'DEVI')
+                    prod = leg.get('Product')
+                    if isinstance(prod, list):
+                        prod = prod[0] if prod else {}
+                    prod = prod or {}
+                    name = (leg.get('name') or prod.get('name')
+                            or prod.get('catOut') or prod.get('displayNumber'))
+                    cat = (prod.get('catOut') or prod.get('catCode') or '').upper()
+                    o = leg.get('Origin') or {}
+                    d = leg.get('Destination') or {}
+                    is_fern = cat in ('ICE', 'IC', 'EC', 'IR') or _leg_is_fern(name)
+                    legs.append({
+                        'mode': 'walk' if is_walk else 'transit',
+                        'line': None if is_walk else (name or '').strip(), 'product': cat,
+                        'fern': is_fern,
+                        'from': o.get('name'), 'to': d.get('name'),
+                        'from_lat': o.get('lat'), 'from_lon': o.get('lon'),
+                        'dep': _hafas_iso(o.get('date'), o.get('time')),
+                        'arr': _hafas_iso(d.get('date'), d.get('time')),
+                    })
+                if legs:
+                    out.append(legs)
+            return out
+
         def _norm_dbrest(data):
             """db-rest-Journeys → normalisierte Leg-Listen."""
             out = []
@@ -22555,10 +22604,40 @@ def ax_transit():
         # Vendo-Hosts per DNS NXDOMAIN sind. Die Helfer bleiben dormant, falls je ein
         # Proxy AUSSERHALB Googles (z.B. NAS/VPS) dazukommt, der DB erreichen darf.
         _ = bahn_body  # dormant
+
+        # RMV-HAPI (Frankfurt/Mainz/Wiesbaden/Hessen) — HAFAS-REST `trip` mit GRATIS
+        # accessId-Key (env RMV_ACCESS_ID, Registrierung opendata.rmv.de). RMV-Host
+        # ist von Cloud Run erreichbar (kein DB/Akamai-Block). Koordinaten-basiert
+        # (inkl. Fußweg) + arrive-by. Fern (ICE/IC) per Linien-Post-Filter raus.
+        rmv_key = os.environ.get('RMV_ACCESS_ID', '').strip()
+        in_rmv = (49.3 <= flat <= 51.7) and (7.6 <= flon <= 10.3)
+        rmv_params = None
+        if rmv_key and in_rmv:
+            try:
+                from zoneinfo import ZoneInfo as _ZR
+                _tzr = _ZR('Europe/Berlin')
+                if arrival_s:
+                    _ar = datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+                    _ar = _ar.astimezone(_tzr) if _ar.tzinfo else _ar.replace(tzinfo=_tzr)
+                else:
+                    _ar = datetime.now(_tzr)
+                rmv_params = {
+                    'accessId': rmv_key, 'format': 'json',
+                    'originCoordLat': flat, 'originCoordLong': flon,
+                    'destCoordLat': tlat, 'destCoordLong': tlon,
+                    'date': _ar.strftime('%Y-%m-%d'), 'time': _ar.strftime('%H:%M'),
+                    'searchForArrival': 1, 'numB': 0, 'numF': 4, 'rtMode': 'REALTIME',
+                }
+            except Exception:
+                rmv_params = None
+
         providers = []
         if efa_params is not None:
             providers.append(('mvv_efa', lambda: _norm_efa(
                 _get_json('https://efa.mvv-muenchen.de/ng/XML_TRIP_REQUEST2', efa_params, 12))))
+        if rmv_params is not None:
+            providers.append(('rmv', lambda: _norm_rmv(
+                _get_json('https://www.rmv.de/hapi/trip', rmv_params, 12))))
         providers += [
             ('transitous', lambda: _norm_motis(
                 _get_json('https://api.transitous.org/api/v6/plan', motis_params, 12))),
