@@ -22675,13 +22675,35 @@ def ax_transit():
                     _ar = _ar.astimezone(_tzr) if _ar.tzinfo else _ar.replace(tzinfo=_tzr)
                 else:
                     _ar = datetime.now(_tzr)
+                # FLUGHAFEN-FIX (User 2026-06-29): das geometrische Flughafen-Zentrum
+                # (z.B. FRA 50.0379,8.5622) liegt mitten im Vorfeld OHNE Haltestelle →
+                # HAFAS antwortet SVC_LOC/H9220 „keine Station in der Nähe". Das ZIEL
+                # daher auf die nächste BAHN-Station snappen (Regionalbahnhof), Bus
+                # (Produkt-Bit 32) ausgeschlossen, damit nicht ein Vorfeld-Bus-Stop
+                # gewählt wird. Der ORIGIN bleibt Koordinate → echter Fußweg-aus-dem-Haus.
+                rmv_dest_ext = None
+                try:
+                    _nb = _get_json('https://www.rmv.de/hapi/location.nearbystops', {
+                        'accessId': rmv_key, 'format': 'json',
+                        'originCoordLat': tlat, 'originCoordLong': tlon,
+                        'maxNo': 1, 'r': 6000, 'products': 447,
+                    }, 8)
+                    _items = (_nb or {}).get('stopLocationOrCoordLocation') or []
+                    if _items:
+                        rmv_dest_ext = (_items[0].get('StopLocation') or {}).get('extId')
+                except Exception:
+                    rmv_dest_ext = None
                 rmv_params = {
                     'accessId': rmv_key, 'format': 'json',
                     'originCoordLat': flat, 'originCoordLong': flon,
-                    'destCoordLat': tlat, 'destCoordLong': tlon,
                     'date': _ar.strftime('%Y-%m-%d'), 'time': _ar.strftime('%H:%M'),
                     'searchForArrival': 1, 'numB': 0, 'numF': 4, 'rtMode': 'REALTIME',
                 }
+                if rmv_dest_ext:
+                    rmv_params['destExtId'] = rmv_dest_ext
+                else:
+                    rmv_params['destCoordLat'] = tlat
+                    rmv_params['destCoordLong'] = tlon
             except Exception:
                 rmv_params = None
 
