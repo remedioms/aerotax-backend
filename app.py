@@ -9212,6 +9212,24 @@ def _profile_save_to_supabase(token, profile):
             row[k] = v
         else:
             meta[k] = v
+    # DURABILITY-FIX (2026-06-29): metadata-jsonb NICHT clobbern. Mehrere Caller
+    # (post_user_location stuendlich, weitere *_save-Pfade) laden das Profil von
+    # der EPHEMEREN Cloud-Run-Disk — nach einem Restart ist die leer, und ein
+    # voller Overwrite der metadata-Spalte loeschte avatar_url/location_source/
+    # current_city/share_location fuer JEDEN aktiven User (das war DER Avatar-
+    # Verschwinde-Bug: Foto in R2 vorhanden, aber der Pointer in metadata weg).
+    # Loesung: bestehende SB-metadata lesen und nur die uebergebenen Keys mergen.
+    # Explizit loeschen bleibt moeglich via key=None (wird als None geschrieben).
+    try:
+        prev = sb.table('user_profiles').select('metadata') \
+                 .eq('token', token).limit(1).execute().data or []
+        if prev:
+            base = prev[0].get('metadata') or {}
+            if isinstance(base, dict):
+                base.update(meta)
+                meta = base
+    except Exception:
+        pass  # Merge best-effort — im Zweifel schreiben statt 500
     row['metadata'] = meta
     try:
         sb.table('user_profiles').upsert(row, on_conflict='token').execute()
@@ -9700,17 +9718,11 @@ def post_user_location():
     if not p:
         return jsonify({'ok': False, 'error': 'invalid token'}), 400
 
-    # Existing profile laden (oder leer wenn noch nichts gespeichert).
-    profile = {}
-    try:
-        with open(p) as f:
-            existing = json.load(f) or {}
-            profile = existing.get('profile', {}) or {}
-    except FileNotFoundError:
-        pass
-    except Exception:
-        # Korruptes Profile-JSON → wir überschreiben es lieber nicht stillschweigend.
-        return jsonify({'ok': False, 'error': 'profile read error'}), 500
+    # Existing profile SB-PRIMARY laden (nicht disk-only!). Die Cloud-Run-Disk ist
+    # ephemer — nach einem Restart ist sie leer, und ein disk-only-Load + Save
+    # haette die komplette metadata-Spalte (avatar_url etc.) ueberschrieben. Mit
+    # SB-primary sieht der Save den echten aktuellen Profil-Stand.
+    profile = dict((_profile_load(token) or {}).get('profile') or {})
 
     # share_location default TRUE (User-Anweisung: "aus prinzip immer aktuelle
     # location teilen"). Nur wenn explizit auf False gesetzt → silent skip.
@@ -13597,9 +13609,20 @@ def take_roster_snapshot(token):
     """Speichert aktuellen tage_detail-Stand als Snapshot. Vergleicht mit vorigem Snapshot
     und persistiert Diff als pending changes.
     """
+    body = request.get_json(silent=True) or {}
     sess = _store.get(token) or {}
     rd = sess.get('result_data') or {}
     new_tage = rd.get('_tage_detail') or []
+    # AeroX (Crew-App) liefert sein iCal-geparstes Roster DIREKT im Body mit — es
+    # durchlaeuft nicht die Tax-Pipeline, also ist _store leer. Ohne das war der
+    # gespeicherte Snapshot leer → Friends sahen NIE den Plan. Body hat Vorrang.
+    # Shape je Tag: {datum, klass, marker, routing, eur?, reader_facts:{layover_ort,
+    # start_time, end_time}}. Defensiv: nur dicts mit datum, Cap 400.
+    body_tage = body.get('tage') or body.get('tage_detail')
+    if isinstance(body_tage, list):
+        clean = [t for t in body_tage if isinstance(t, dict) and t.get('datum')][:400]
+        if clean:
+            new_tage = clean
     if not _roster_snapshot_path(token):
         return jsonify({'ok': False, 'error': 'invalid token'}), 400
     old_tage = (_roster_snapshot_read(token) or {}).get('tage') or []
@@ -15281,6 +15304,19 @@ def _r2_redirect(key):
     resp = redirect(f'{R2_PUBLIC_BASE}/{key}', code=302)
     resp.headers['Cache-Control'] = 'public, max-age=86400'   # Redirect 1 Tag cachen
     return resp
+def _r2_get_bytes(key):
+    """Bytes aus R2 ziehen (mit Credentials). (data, content_type) oder (None,None).
+    Wird zum DURCHREICHEN genutzt statt 302→r2.dev: die r2.dev-Public-Domain ist
+    nicht aktiviert (liefert 403), also streamt das Backend die Bytes selbst —
+    funktioniert unabhaengig von der Bucket-Public-Einstellung."""
+    cli = _r2_client()
+    if cli is None:
+        return None, None
+    try:
+        obj = cli.get_object(Bucket=R2_AVATARS_BUCKET, Key=key)
+        return obj['Body'].read(), obj.get('ContentType') or 'image/jpeg'
+    except Exception:
+        return None, None
 
 
 @app.route('/api/user/avatar/<token>', methods=['POST'])
@@ -15334,21 +15370,24 @@ def upload_user_avatar(token):
     fname = f'{uuid.uuid4().hex[:12]}{detected_ext}'
     # NEU: bevorzugt nach R2 (Zero-Egress, durabel) → avatar_url = oeffentliche
     # R2-URL (die App handhabt absolute URLs bereits via hasPrefix("http")).
-    r2_url = None
+    r2_ok = False
     if R2_AVATARS_ENABLED:
         try:
-            r2_url = _r2_put_avatar(dir_key, fname, data, detected_type)
+            _r2_put_avatar(dir_key, fname, data, detected_type)
+            r2_ok = True
         except Exception as e:
             app.logger.warning(f'[avatar] r2_put_fail tok={token[:8]}: {e}')
-            r2_url = None
-    if not r2_url:
+            r2_ok = False
+    if not r2_ok:
         # Fallback (R2 aus/Fehler): wie bisher auf die (ephemere) Disk.
         try:
             with open(os.path.join(img_dir, fname), 'wb') as fp:
                 fp.write(data)
         except Exception as e:
             return jsonify({'ok': False, 'error': str(e)[:200]}), 500
-    avatar_url = r2_url or f'/api/user/avatar/{dir_key}/{fname}'
+    # avatar_url IMMER der Backend-Serve-Pfad (nicht die rohe r2.dev-URL: deren
+    # Public-Domain ist deaktiviert → 403). serve_user_avatar streamt aus R2.
+    avatar_url = f'/api/user/avatar/{dir_key}/{fname}'
     # avatar_url auf die Profile-Row schreiben (SB-primary + Disk) — damit Feed/
     # Freunde/Profil den Verweis ausliefern können.
     #
@@ -15371,9 +15410,9 @@ def upload_user_avatar(token):
         profile['avatar_url'] = avatar_url
         profile['avatar_dir_key'] = dir_key
         profile['avatar_mime'] = detected_type
-        if r2_url:
+        if r2_ok:
             # R2 ist durabel → KEIN base64-Backup mehr in Supabase (spart DB+Egress).
-            profile.pop('avatar_b64', None)
+            profile['avatar_b64'] = None
         else:
             profile['avatar_b64'] = base64.b64encode(data).decode()
         disk_full = dict(_profile_load_from_disk(token) or {})
@@ -15429,11 +15468,18 @@ def serve_user_avatar(key_safe, fname):
     if safe.lower().endswith('.png'): mime = 'image/png'
     elif safe.lower().endswith('.heic'): mime = 'image/heic'
     elif safe.lower().endswith('.webp'): mime = 'image/webp'
-    # R2-LAZY-MIGRATION (Kostenhebel): liegt der Avatar schon in R2 → direkt
-    # dorthin umleiten (Zero-Egress, Bytes kommen nie übers Backend).
+    # R2: liegt der Avatar in R2 → Bytes durchstreamen. NICHT mehr 302→r2.dev,
+    # weil die r2.dev-Public-Domain nicht aktiviert ist (403). Das Backend zieht
+    # die Bytes mit Credentials und liefert sie aus (Client-/CDN-cachebar via
+    # immutable Cache-Control). Robust unabhaengig von der Bucket-Public-Setting.
+    from flask import Response
     r2_key = f'av/{safe_k}/{safe}'
-    if R2_AVATARS_ENABLED and _r2_object_exists(r2_key):
-        return _r2_redirect(r2_key)
+    if R2_AVATARS_ENABLED:
+        r2_data, r2_ct = _r2_get_bytes(r2_key)
+        if r2_data:
+            resp = Response(r2_data, mimetype=r2_ct or mime)
+            resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+            return resp
     # Bytes holen: erst Disk (ephemer), sonst durabel aus Supabase (base64).
     path = os.path.join(_USER_HISTORY_DIR, 'avatars', safe_k, safe)
     data = None
@@ -15450,22 +15496,22 @@ def serve_user_avatar(key_safe, fname):
             out_mime = sb_mime
     if not data:
         return jsonify({'error': 'not_found'}), 404
-    # Beim ERSTEN Aufruf nach R2 schieben → ab dann von dort (Zero-Egress).
+    # Beim ERSTEN Aufruf nach R2 schieben (Durabilitaet) → Bytes direkt ausliefern.
     if R2_AVATARS_ENABLED:
         try:
             _r2_put_bytes(r2_key, data, out_mime)
-            return _r2_redirect(r2_key)
         except Exception as e:
             app.logger.warning(f'[avatar] r2_lazy_fail {safe_k}: {e}')
-    # Fallback (R2 aus/Fehler): direkt ausliefern + Disk rehydrieren.
+    # Disk rehydrieren (best-effort Cache) + Bytes ausliefern.
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'wb') as fp:
             fp.write(data)
     except Exception:
         pass
-    from flask import Response
-    return Response(data, mimetype=out_mime)
+    resp = Response(data, mimetype=out_mime)
+    resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    return resp
 
 
 @app.route('/api/wall/<token>/post', methods=['POST'])
