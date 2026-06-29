@@ -22605,12 +22605,14 @@ def ax_transit():
         # Proxy AUSSERHALB Googles (z.B. NAS/VPS) dazukommt, der DB erreichen darf.
         _ = bahn_body  # dormant
 
-        # RMV-HAPI (Frankfurt/Mainz/Wiesbaden/Hessen) — HAFAS-REST `trip` mit GRATIS
-        # accessId-Key (env RMV_ACCESS_ID, Registrierung opendata.rmv.de). RMV-Host
-        # ist von Cloud Run erreichbar (kein DB/Akamai-Block). Koordinaten-basiert
-        # (inkl. Fußweg) + arrive-by. Fern (ICE/IC) per Linien-Post-Filter raus.
+        # RMV-HAPI — HAFAS-REST `trip` mit GRATIS accessId-Key (env RMV_ACCESS_ID,
+        # Registrierung opendata.rmv.de). RMVs HAFAS sitzt auf dem BUNDESWEITEN
+        # DELFI-Fahrplan → routet ÖPNV in GANZ Deutschland (Frankfurt, Köln, Berlin,
+        # Hamburg …), nicht nur Hessen. RMV-Host ist von Cloud Run erreichbar (kein
+        # DB/Akamai-Block). Koordinaten-basiert (inkl. Fußweg) + arrive-by; Fern per
+        # Post-Filter raus. Gate = grobe Deutschland-Bbox (kein Sinn außerhalb DE).
         rmv_key = os.environ.get('RMV_ACCESS_ID', '').strip()
-        in_rmv = (49.3 <= flat <= 51.7) and (7.6 <= flon <= 10.3)
+        in_rmv = (47.2 <= flat <= 55.1) and (5.8 <= flon <= 15.1)   # ganz DE
         rmv_params = None
         if rmv_key and in_rmv:
             try:
