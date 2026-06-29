@@ -23206,11 +23206,18 @@ def ax_transit():
                 return None
         target_dt = _parse(arrival_s) if arrival_s else None
 
-        # SPÄTESTE PÜNKTLICHE, Nahverkehr-only Verbindung = so spät wie möglich aus
-        # dem Haus, aber rechtzeitig am Flughafen. Fern-Treffer verwerfen. Kommt KEINE
-        # rechtzeitig an (Randfall), nimm die am wenigsten verspätete (früheste Ankunft).
-        best = None              # späteste pünktliche
+        # ECHTE "arrive-by"-Auswahl: die Verbindung, die SO SPÄT WIE MÖGLICH ankommt,
+        # aber noch rechtzeitig (Ankunft ≤ `arrival_s`) — also Ankunft so NAH wie
+        # möglich an der Zielzeit. NICHT nach Haus-Abfahrtszeit wählen: zwei Routen zu
+        # verschiedenen ersten Stationen haben unterschiedlich lange Fußwege, sodass
+        # "spätestes Losgehen" eine kurze Route zu einer NÄHEREN Station treffen kann,
+        # die VIEL ZU FRÜH ankommt (User-Bug 2026-06-29: 14:32 statt ~15:15). Fern-
+        # Treffer verwerfen. Kommt KEINE rechtzeitig an (Randfall), nimm die früheste
+        # Ankunft (besser zu früh als verpasst).
+        best = None              # späteste pünktliche Ankunft (≤ Zielzeit, max. Ankunft)
+        best_arr = None          # deren Ankunfts-datetime (zum Vergleich)
         fallback = None          # früheste Ankunft, falls keine pünktlich ist
+        fallback_arr = None
         for legs in journeys:
             transit_legs = [l for l in legs if l['mode'] == 'transit']
             if not transit_legs:
@@ -23229,17 +23236,20 @@ def ax_transit():
                     'first_dep_delay_min': ft.get('delay_min')}
             arr_dt = _parse(last_arr)
             # früheste-Ankunft-Fallback unabhängig von Pünktlichkeit
-            if fallback is None or (arr_dt and fallback.get('_arr') and arr_dt < fallback['_arr']):
-                fallback = dict(cand, _arr=arr_dt)
+            if arr_dt is not None and (fallback is None or fallback_arr is None
+                                       or arr_dt < fallback_arr):
+                fallback, fallback_arr = cand, arr_dt
             # pünktlich? (2 Min Toleranz). Ohne Zielzeit gilt jede als ok.
             on_time = (target_dt is None) or (arr_dt is not None and
                                               arr_dt <= target_dt + timedelta(minutes=2))
             if not on_time:
                 continue
-            if best is None or (leave_at and best['leave_at'] and leave_at > best['leave_at']):
-                best = cand
+            # LATESTE pünktliche Ankunft gewinnt (am nächsten an der Zielzeit). Bei
+            # fehlender Ankunftszeit (arr_dt None) nur als allererster Treffer nehmen.
+            if best is None or (arr_dt is not None and
+                                (best_arr is None or arr_dt > best_arr)):
+                best, best_arr = cand, arr_dt
         if best is None and fallback is not None:
-            fallback.pop('_arr', None)
             best = fallback
 
         if best is None:
