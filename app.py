@@ -11275,13 +11275,25 @@ def get_friend_roster(token, friend_token):
                         continue
                 except Exception:
                     continue
+                # Routing aus dem Marker ableiten (User 2026-06-30: „Kalender-Balken
+                # sind nicht wie die normalen"): die Kalender-Tour-Balken brauchen ein
+                # `routing` (RosterLabels.collapseRouting) — sonst rendert ein Flugtag
+                # nur als blasse Marker-Pille statt als blauer Tour-Balken wie beim
+                # eigenen Plan. Aus „BCN - FRA" / „LH 1286: FRA-SKG" die IATA-Kette ziehen.
+                _summary = ev.get('summary') or ''
+                _routing = None
+                import re as _re2
+                if _re2.search(r'[A-Z]{3}\s*-\s*[A-Z]{3}', _summary.upper()):
+                    _codes = _re2.findall(r'\b[A-Z]{3}\b', _summary.upper())
+                    if len(_codes) >= 2:
+                        _routing = '-'.join(_codes)
                 out.append({
                     'datum': datum,
                     'klass': None,
                     # SUMMARY = Marker (LH 1286: FRA-SKG / Off / StandBy …) → der
-                    # iOS-RosterEventClassifier leitet Typ + Routing daraus ab.
-                    'marker': ev.get('summary'),
-                    'routing': None,
+                    # iOS-RosterEventClassifier leitet Typ daraus ab.
+                    'marker': _summary or None,
+                    'routing': _routing,
                     'eur': None,
                     'layover_ort': ev.get('location') or None,
                     # Zeiten bewusst NICHT aus dem UTC-`*_iso` ableiten (würden um den
