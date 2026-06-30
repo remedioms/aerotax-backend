@@ -11252,7 +11252,50 @@ def get_friend_roster(token, friend_token):
             'start_time': rf.get('start_time'),
             'end_time': rf.get('end_time'),
         })
-    return jsonify({'ok': True, 'shared': True, 'count': len(out), 'days': out})
+    # FALLBACK (User 2026-06-30: „der Plan ist gespeichert, muss nur verlinkt
+    # werden"): hat der Friend KEINEN gepushten Roster-Snapshot (z.B. er hat den
+    # Plan nur als Kalender-Feed importiert, aber die App nie zum Snapshot-Push
+    # geöffnet), bauen wir seinen Plan DIREKT aus dem gespeicherten `calendar_feed`
+    # seines Profils. So sieht man den Plan eines Freundes, sobald die Freundschaft
+    # steht — ohne dass er extra etwas pushen muss. (Roster-Snapshot bleibt die
+    # bevorzugte, exaktere Quelle; das hier greift nur, wenn sie leer ist.)
+    if not out:
+        try:
+            fprof = (_profile_load(friend_token) or {}).get('profile', {}) or {}
+            feed = fprof.get('calendar_feed') or {}
+            for ev in (feed.get('events') or []):
+                if not isinstance(ev, dict):
+                    continue
+                datum = (ev.get('start') or '')[:10]
+                if len(datum) != 10:
+                    continue
+                try:
+                    dd = _date.fromisoformat(datum)
+                    if dd > cutoff or dd < today - _td(days=30):
+                        continue
+                except Exception:
+                    continue
+                out.append({
+                    'datum': datum,
+                    'klass': None,
+                    # SUMMARY = Marker (LH 1286: FRA-SKG / Off / StandBy …) → der
+                    # iOS-RosterEventClassifier leitet Typ + Routing daraus ab.
+                    'marker': ev.get('summary'),
+                    'routing': None,
+                    'eur': None,
+                    'layover_ort': ev.get('location') or None,
+                    # Zeiten bewusst NICHT aus dem UTC-`*_iso` ableiten (würden um den
+                    # TZ-Offset falsch angezeigt) — der Snapshot-Pfad liefert die
+                    # exakten Stations-Lokalzeiten, dieser Fallback nur Tag + Marker.
+                    'start_time': None,
+                    'end_time': None,
+                })
+            out.sort(key=lambda d: d.get('datum') or '')
+        except Exception:
+            pass
+    return jsonify({'ok': True, 'shared': True, 'count': len(out),
+                    'days': out,
+                    'source': 'snapshot' if out and tage else 'calendar_feed'})
 
 
 @app.route('/api/user/friends-today/<token>', methods=['GET'])
