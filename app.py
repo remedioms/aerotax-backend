@@ -23502,9 +23502,10 @@ def airport_board(token):
             if bt is not None and bt < _stale_cut:
                 return True                       # > 90 min alt → weg/stale
             return False
+        _just_removed = [f for f in flights if _is_past(f)]
         flights = [f for f in flights if not _is_past(f)]
     except Exception:
-        pass
+        _just_removed = []
     # „Früher heute" — bereits abgeflogene/angekommene Flüge aus der akkumulierten
     # Beobachtung, die NICHT mehr im Live-Feed stehen (dedup über flight+hh:mm).
     # BUGFIX 2026-06-13: jetzt für BEIDE Richtungen (Departures UND Arrivals) — die
@@ -23512,11 +23513,28 @@ def airport_board(token):
     departed = []
     try:
         live_keys = {((f.get('flight') or ''), (f.get('sched') or '')[11:16]) for f in flights}
+        # GAP-FIX (User 2026-06-30: „Früher heute endet 7:30, jetzt 10:25 → Flüge
+        # fehlen"): die gerade aus der ANSTEHENDEN Tafel herausgefilterten Stale-/
+        # Abgeflogenen DIREKT in „Früher heute" übernehmen — nicht nur auf den
+        # Store-Pfad verlassen (der erfasst frische Zeilen evtl. noch nicht). So
+        # entsteht keine Lücke zwischen dem letzten „Früher heute" und dem ersten
+        # anstehenden Flug.
+        _seen = set()
+        for dr in _just_removed:
+            k = ((dr.get('flight') or ''), (dr.get('sched') or '')[11:16])
+            if k not in live_keys and k not in _seen:
+                _seen.add(k)
+                departed.append(dr)
         for dr in _departed_rows_from_store(_store_key_for(out_airport, ftype)):
-            if ((dr['flight'], (dr['sched'] or '')[11:16]) not in live_keys):
+            k = ((dr['flight'], (dr['sched'] or '')[11:16]))
+            if k not in live_keys and k not in _seen:
+                _seen.add(k)
                 departed.append(dr)
         if airline:
             departed = [d for d in departed if (d.get('airline') or '').upper() == airline]
+        # Neueste zuerst (chronologisch absteigend) → „Früher heute" liest sauber
+        # vom jüngsten zum ältesten, kein Loch in der Reihenfolge.
+        departed.sort(key=lambda x: (x.get('sched') or ''), reverse=True)
     except Exception:
         departed = []
     return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
