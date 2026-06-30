@@ -11259,15 +11259,21 @@ def get_friend_roster(token, friend_token):
     # seines Profils. So sieht man den Plan eines Freundes, sobald die Freundschaft
     # steht — ohne dass er extra etwas pushen muss. (Roster-Snapshot bleibt die
     # bevorzugte, exaktere Quelle; das hier greift nur, wenn sie leer ist.)
+    # FALLBACK = EXAKT die REICHE Quelle des Family-Pfads (_load_crew_roster_days):
+    # hat der Friend keinen gepushten Snapshot, bauen wir den Plan aus seinen
+    # `user_ical_briefings` (Routing aus den ical_location-IATAs, Zeiten aus
+    # ical_start/end_iso). Der alte calendar_feed-Fallback lieferte routing=None →
+    # nur Punkte/Per-Tag-Pillen statt verbundener Tour-Balken (Bild #55). Die FAMILIE
+    # sieht den Plan über genau diese Quelle KORREKT — Friends jetzt genauso
+    # (User 2026-06-30: „mach es einfach wie bei Family, die sehen es komplett richtig").
     if not out:
         try:
-            fprof = (_profile_load(friend_token) or {}).get('profile', {}) or {}
-            feed = fprof.get('calendar_feed') or {}
-            for ev in (feed.get('events') or []):
-                if not isinstance(ev, dict):
-                    continue
-                datum = (ev.get('start') or '')[:10]
-                if len(datum) != 10:
+            briefs = _ical_briefings_load(friend_token) or {}
+            def _hhmm(x):
+                m = re.search(r'T(\d{2}:\d{2})', str(x or ''))
+                return m.group(1) if m else None
+            for datum, row in briefs.items():
+                if not isinstance(row, dict) or len(str(datum)) != 10:
                     continue
                 try:
                     dd = _date.fromisoformat(datum)
@@ -11275,30 +11281,31 @@ def get_friend_roster(token, friend_token):
                         continue
                 except Exception:
                     continue
-                # Reiner Sicherheits-Bridge (Tag + Marker), bis der Friend seinen
-                # vollwertigen Roster-Snapshot gepusht hat. Die KORREKTEN Balken
-                # (Routing/Klass/Zeiten) kommen aus dem Snapshot, den die iOS-App jetzt
-                # SOFORT beim Kalender-Import pusht — kein Marker-Routing-Hack mehr
-                # (User 2026-06-30: „bau es nicht so, mach es gleich richtig").
+                summ = (row.get('ical_summary') or '')
+                up = summ.upper()
+                klass = 'OFF' if 'OFF DAY' in up else ('Z76' if 'LAYOVER' in up else None)
+                codes = re.findall(r'\b[A-Z]{3}\b', (row.get('ical_location') or '').upper())
+                dedup = []
+                for c in codes:
+                    if not dedup or dedup[-1] != c:
+                        dedup.append(c)
+                routing = '-'.join(dedup) if len(dedup) >= 2 else None
                 out.append({
                     'datum': datum,
-                    'klass': None,
-                    'marker': ev.get('summary') or None,
-                    'routing': None,
+                    'klass': klass,
+                    'marker': summ or None,
+                    'routing': routing,
                     'eur': None,
-                    'layover_ort': ev.get('location') or None,
-                    # Zeiten bewusst NICHT aus dem UTC-`*_iso` ableiten (würden um den
-                    # TZ-Offset falsch angezeigt) — der Snapshot-Pfad liefert die
-                    # exakten Stations-Lokalzeiten, dieser Fallback nur Tag + Marker.
-                    'start_time': None,
-                    'end_time': None,
+                    'layover_ort': row.get('ical_layover_ort'),
+                    'start_time': _hhmm(row.get('ical_start_iso') or row.get('ical_start')),
+                    'end_time': _hhmm(row.get('ical_end_iso') or row.get('ical_end')),
                 })
             out.sort(key=lambda d: d.get('datum') or '')
         except Exception:
             pass
     return jsonify({'ok': True, 'shared': True, 'count': len(out),
                     'days': out,
-                    'source': 'snapshot' if out and tage else 'calendar_feed'})
+                    'source': 'snapshot' if tage else 'ical_briefings'})
 
 
 @app.route('/api/user/friends-today/<token>', methods=['GET'])
