@@ -26639,13 +26639,19 @@ def import_calendar_feed(token):
             removed_dates = set()
             if feed_dates:
                 fmin, fmax = min(feed_dates), max(feed_dates)
-                # HISTORIE NIE LÖSCHEN (User: Roster 10 J. behalten): das Reconcile-
-                # Fenster beginnt frühestens HEUTE — vergangene Tage sind unveränder-
-                # liche Historie und werden nie geleert. Nur zukünftige Tage, die aus
-                # dem Feed verschwinden (echte Roster-Änderung), werden bereinigt.
-                _today_str = datetime.now().strftime('%Y-%m-%d')
-                if fmin < _today_str:
-                    fmin = _today_str
+                # GANZEN AKTUELLEN MONAT NEU SCHREIBEN, vergangene Monate einfrieren
+                # (User 2026-06-30: „aktualisiere den ganzen Monat, aber nie einen
+                # Monat der in der Vergangenheit liegt — einmal vorbei, bleibt er.
+                # Dann bleibt der Kalender aktuell und schreibt den Monat korrekt neu").
+                # Krankmeldungen ändern Touren rückwirkend INNERHALB des laufenden
+                # Monats; ein „ab-heute"-Fenster ließ stornierte Tage VOR heute stehen
+                # (Bild #44: Juni war falsch). Das Reconcile-Fenster beginnt jetzt am
+                # 1. des aktuellen Monats. Voll-vergangene Monate bleiben unangetastete
+                # Historie (LH-Feed reicht ~30 Tage zurück → der laufende Monat ist
+                # immer voll abgedeckt, der Monatsanfang also nie „aus Versehen leer").
+                _month_start = datetime.now().strftime('%Y-%m-01')
+                if fmin < _month_start:
+                    fmin = _month_start
                 _reconcile_dbg['window'] = f'{fmin}..{fmax}'
                 ical_keys = ('ical_summary', 'ical_location', 'ical_start_iso',
                              'ical_end_iso', 'ical_klass', 'ical_layover_ort',
