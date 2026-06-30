@@ -15525,11 +15525,23 @@ def upload_wall_image(token):
     os.makedirs(img_dir, exist_ok=True)
     ext = detected_ext  # Extension aus Magic-Byte, nicht aus filename
     fname = f'{uuid.uuid4().hex[:12]}{ext}'
-    try:
-        with open(os.path.join(img_dir, fname), 'wb') as f:
-            f.write(data)
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    # DURABILITY (2026-06-30, User #43 „Bild nicht ladbar"): Cloud-Run-Disk ist
+    # EPHEMER → Wall-/Chat-Bilder verschwanden bei jedem Redeploy. Wie bei Avataren
+    # bevorzugt nach R2 (Zero-Egress, durabel) schreiben; Disk nur noch Fallback.
+    # Die public URL bleibt der Backend-Serve-Pfad — serve_wall_image streamt aus R2.
+    r2_ok = False
+    if R2_AVATARS_ENABLED:
+        try:
+            _r2_put_bytes(f'wall/{dir_key}/{fname}', data, detected_type)
+            r2_ok = True
+        except Exception as e:
+            app.logger.warning(f'[wall-img] r2_put_fail: {str(e)[:120]}')
+    if not r2_ok:
+        try:
+            with open(os.path.join(img_dir, fname), 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            return jsonify({'ok': False, 'error': str(e)[:200]}), 500
     return jsonify({'ok': True, 'url': f'/api/wall/image/{dir_key}/{fname}'})
 
 
@@ -15549,6 +15561,15 @@ def serve_wall_image(token_safe, fname):
         if legacy:
             path = os.path.join(_USER_HISTORY_DIR, 'wall_images', legacy, safe)
     if not os.path.exists(path):
+        # DURABILITY: Datei nicht (mehr) auf der ephemeren Disk → aus R2 streamen
+        # (neue Uploads liegen in R2, Disk ist nur Fallback). Behebt „Bild nicht
+        # ladbar" nach Redeploy (User #43).
+        if R2_AVATARS_ENABLED:
+            r2_data, r2_ctype = _r2_get_bytes(f'wall/{safe_t}/{safe}')
+            if r2_data:
+                from flask import Response
+                return Response(r2_data, mimetype=r2_ctype or 'image/jpeg',
+                                headers={'Cache-Control': 'public, max-age=31536000, immutable'})
         return jsonify({'error': 'not_found'}), 404
     from flask import send_file
     mime = 'image/jpeg'
