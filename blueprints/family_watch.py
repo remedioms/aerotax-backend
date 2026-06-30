@@ -944,20 +944,25 @@ def family_share_list(token):
             continue
         seen.add(ft)
         rel = (s.get('relation') or '').strip().lower()
-        # Echter Anzeigename statt Token-Fragment (User #48 „hat keinen Namen"):
-        # gespeicherter Anfrage-Name → Profilname des Family-Tokens → Relation-Label.
-        disp = s.get('requester_name')
-        if not disp and ft and _pl:
+        # Profil der Family-Person EINMAL laden — für Name UND Avatar (damit die
+        # „Familie"-Karte genauso aussieht wie die normalen Crew-Karten: Foto + Name,
+        # User #48/#10 „kein Name, kein Foto, nicht uniform").
+        prof = {}
+        if ft and _pl:
             try:
-                disp = ((_pl(ft) or {}).get('profile', {}) or {}).get('name')
+                prof = (_pl(ft) or {}).get('profile', {}) or {}
             except Exception:
-                disp = None
+                prof = {}
+        # Echter Anzeigename statt Token-Fragment: gespeicherter Anfrage-Name →
+        # Profilname → Relation-Label.
+        disp = s.get('requester_name') or prof.get('name')
         if not disp:
             disp = _rel_label.get(rel, 'Familie')
         grants.append({
             'family_token': ft,
             'family_short_name': disp,
             'family_relation': s.get('relation'),
+            'avatar_url': prof.get('avatar_url'),
             'fields': [f for f in (s.get('fields') or []) if f in ALLOWED_FIELDS],
             'created_at': s.get('created_at'),
         })
