@@ -370,12 +370,28 @@ def get_news_feed():
     # Per-Article Klassifikation + Airline-Tagging (vor Filter — damit der
     # Cache-Eintrag auch für andere Airline-Filter wiederverwendbar wäre,
     # falls wir später einen "all"-Cache einbauen).
+    # Externe Backend-Basis EINMAL pro Request bestimmen (im Request-Context,
+    # damit der Image-Proxy absolute URLs liefern kann — die Article-Konstruktion
+    # selbst läuft in Worker-Threads OHNE request-Context).
+    proxy_base = _news_external_base()
     enriched = []
     for art in aggregated:
         cat = _classify_category(art.get('title', ''), art.get('summary', ''))
         mentions = _extract_mentioned_airlines(art.get('title', ''), art.get('summary', ''))
         art['category'] = cat
         art['mentioned_airlines'] = mentions
+        # Bild NICHT mehr direkt von der Fremdquelle hot-linken. Viele Verlage/CDNs
+        # blocken Hotlinking per Referer-Check (403), lassen signierte URLs ablaufen
+        # oder liefern nur über http (Mixed-Content) → in der App lädt das Bild dann
+        # gar nicht. Stattdessen über den Backend-Proxy /api/news/image leiten, der
+        # das Bild serverseitig zieht, kurz cached (R2 wenn verfügbar) und stabil
+        # ausliefert. image_url_original bleibt als Debug/Fallback erhalten.
+        orig_img = art.get('image_url')
+        if orig_img and proxy_base:
+            proxied = _news_proxy_url(orig_img, proxy_base)
+            if proxied and proxied != orig_img:
+                art['image_url'] = proxied
+                art['image_url_original'] = orig_img
         enriched.append(art)
 
     # Nur Category ist ein echter FILTER. Airline ist KEIN Filter mehr — sie
@@ -451,6 +467,230 @@ def get_news_sources():
             for s in SOURCES
         ],
     })
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Image-Proxy  (verhindert kaputte Hotlinks im News-Feed)
+#
+#  Warum: image_url im Feed zeigte bisher DIREKT auf die Fremdquelle
+#  (og:image / media:content / <img src>). Viele Verlage blocken
+#  Hotlinking per Referer-Check (403), nutzen ablaufende signierte CDN-
+#  URLs oder liefern nur http → in der iOS-App lädt das Bild nicht.
+#
+#  /api/news/image?u=<absolute-url> zieht das Bild serverseitig (mit
+#  Browser-UA + Referer auf die Bild-Origin), validiert content-type,
+#  cached es (R2 wenn verfügbar, sonst kurzlebiger In-Memory-Cache) und
+#  streamt die Bytes mit langlebigem Cache-Header zurück. Schlägt der
+#  Remote-Fetch fehl, 302-Redirect auf die Originalquelle (best effort).
+# ──────────────────────────────────────────────────────────────────
+
+_NEWS_IMG_FETCH_TIMEOUT = 6          # Sekunden pro Remote-Image-Fetch
+_NEWS_IMG_MAX_BYTES = 6 * 1024 * 1024  # 6 MB Hard-Cap pro Bild
+_NEWS_IMG_MEM_TTL = 6 * 3600         # In-Memory-Cache-TTL (R2-loser Fallback)
+_NEWS_IMG_MEM_MAX = 150              # max. Einträge im In-Memory-Cache
+_NEWS_IMG_MEM_CACHE = {}             # key -> {"ts": float, "ct": str, "data": bytes}
+_NEWS_IMG_MEM_LOCK = threading.Lock()
+
+# Browser-naher UA — viele Bild-CDNs liefern nichts an „Bot"-UAs aus.
+_NEWS_IMG_UA = (
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 '
+    '(KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+)
+
+
+def _news_external_base():
+    """Absolute Backend-Basis-URL (Schema+Host, ohne Trailing-Slash) aus dem
+    aktuellen Request. '' wenn kein Request-Context — dann bleibt image_url die
+    Originalquelle (degradiert sauber statt einer kaputten relativen URL)."""
+    try:
+        # request.host_url respektiert auf Cloud Run die X-Forwarded-Proto/Host
+        # via Werkzeug-Proxy bereits; falls nicht, korrigieren wir das Schema.
+        base = (request.host_url or '').rstrip('/')
+        if not base:
+            return ''
+        proto = (request.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip()
+        if proto in ('http', 'https') and base.startswith(('http://', 'https://')):
+            rest = base.split('://', 1)[1]
+            base = f'{proto}://{rest}'
+        return base
+    except Exception:
+        return ''
+
+
+def _news_proxy_url(remote_url, base):
+    """Baut die absolute Proxy-URL für ein Remote-Bild. Gibt remote_url
+    unverändert zurück, wenn es kein http(s)-Link ist (z.B. data:-URI)."""
+    if not remote_url or not isinstance(remote_url, str):
+        return remote_url
+    low = remote_url.strip().lower()
+    if not low.startswith(('http://', 'https://')):
+        return remote_url
+    if not base:
+        return remote_url
+    q = urllib.parse.quote(remote_url.strip(), safe='')
+    return f'{base}/api/news/image?u={q}'
+
+
+def _news_host_is_safe(host):
+    """SSRF-Schutz: löst den Host auf und lehnt private/loopback/link-local/
+    reservierte/metadata-Adressen ab. False bei Auflösungsfehler."""
+    if not host:
+        return False
+    try:
+        import socket
+        import ipaddress
+    except Exception:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = info[4][0]
+            addr = ipaddress.ip_address(ip)
+        except Exception:
+            return False
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False
+    return True
+
+
+def _news_img_mem_get(key):
+    with _NEWS_IMG_MEM_LOCK:
+        entry = _NEWS_IMG_MEM_CACHE.get(key)
+        if not entry:
+            return None
+        if (time.time() - entry['ts']) > _NEWS_IMG_MEM_TTL:
+            _NEWS_IMG_MEM_CACHE.pop(key, None)
+            return None
+        return entry['ct'], entry['data']
+
+
+def _news_img_mem_set(key, content_type, data):
+    with _NEWS_IMG_MEM_LOCK:
+        _NEWS_IMG_MEM_CACHE[key] = {'ts': time.time(), 'ct': content_type, 'data': data}
+        if len(_NEWS_IMG_MEM_CACHE) > _NEWS_IMG_MEM_MAX:
+            oldest = sorted(_NEWS_IMG_MEM_CACHE.items(), key=lambda kv: kv[1]['ts'])
+            for k, _ in oldest[:len(_NEWS_IMG_MEM_CACHE) - _NEWS_IMG_MEM_MAX]:
+                _NEWS_IMG_MEM_CACHE.pop(k, None)
+
+
+def _news_fetch_remote_image(url):
+    """Zieht ein Remote-Bild. (bytes, content_type) oder (None, None).
+    Erzwingt content-type=image/*, hartes Größen-Cap und kurzes Timeout."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        referer = f'{parsed.scheme}://{parsed.netloc}/'
+        resp = requests.get(
+            url,
+            timeout=_NEWS_IMG_FETCH_TIMEOUT,
+            headers={
+                'User-Agent': _NEWS_IMG_UA,
+                'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                'Accept-Language': 'de-DE,de;q=0.9,en;q=0.7',
+                # Referer = Origin des Bildes selbst → umgeht die meisten
+                # Hotlink-Schutz-Checks (die nur „fremde" Referer blocken).
+                'Referer': referer,
+            },
+            allow_redirects=True,
+            stream=True,
+        )
+    except requests.RequestException as exc:
+        _log_warn(f'[news/image] fetch-error: {exc!r}')
+        return None, None
+    try:
+        if resp.status_code != 200:
+            _log_warn(f'[news/image] status={resp.status_code} url={url[:120]}')
+            return None, None
+        ct = (resp.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+        if not ct.startswith('image/'):
+            _log_warn(f'[news/image] non-image content-type={ct!r} url={url[:120]}')
+            return None, None
+        data = b''
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            data += chunk
+            if len(data) > _NEWS_IMG_MAX_BYTES:
+                _log_warn(f'[news/image] oversize >{_NEWS_IMG_MAX_BYTES}B url={url[:120]}')
+                return None, None
+        if not data:
+            return None, None
+        return data, ct
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
+def _news_img_response(data, content_type):
+    from flask import Response
+    resp = Response(data, mimetype=content_type or 'image/jpeg')
+    # Lange cachebar — News-Bilder ändern sich unter derselben URL praktisch nie.
+    resp.headers['Cache-Control'] = 'public, max-age=604800, immutable'
+    resp.headers['Content-Length'] = str(len(data))
+    return resp
+
+
+@news_bp.route('/api/news/image', methods=['GET'])
+def get_news_image():
+    """Backend-Image-Proxy für den News-Feed (siehe Section-Header).
+    Query: u=<absolute http(s)-Bild-URL> (urlencoded)."""
+    from flask import redirect
+    raw = (request.args.get('u') or '').strip()
+    if not raw:
+        return jsonify({'ok': False, 'error': 'missing_url'}), 400
+
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'bad_url'}), 400
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return jsonify({'ok': False, 'error': 'bad_url'}), 400
+    if not _news_host_is_safe(parsed.hostname):
+        return jsonify({'ok': False, 'error': 'blocked_host'}), 400
+
+    key_hash = hashlib.sha256(raw.encode('utf-8', errors='replace')).hexdigest()[:24]
+
+    # 1) In-Memory-Cache (überlebt nur die aktuelle Instanz, aber spart Egress).
+    cached = _news_img_mem_get(key_hash)
+    if cached:
+        ct, data = cached
+        return _news_img_response(data, ct)
+
+    # 2) R2-Cache (durabel, instanzübergreifend) — nur wenn app.py R2 aktiv hat.
+    m = _debrief_get_app_module()
+    r2_enabled = bool(m and getattr(m, 'R2_AVATARS_ENABLED', False))
+    r2_key = f'news/img/{key_hash}'
+    if r2_enabled:
+        try:
+            data, ct = m._r2_get_bytes(r2_key)
+        except Exception:
+            data, ct = None, None
+        if data:
+            ct = ct or 'image/jpeg'
+            _news_img_mem_set(key_hash, ct, data)
+            return _news_img_response(data, ct)
+
+    # 3) Remote ziehen.
+    data, ct = _news_fetch_remote_image(raw)
+    if not data:
+        # Best-effort: 302 auf die Originalquelle, damit die App es selbst
+        # versuchen kann (statt eines harten 404 = leeres Bild).
+        return redirect(raw, code=302)
+
+    _news_img_mem_set(key_hash, ct, data)
+    if r2_enabled:
+        try:
+            m._r2_put_bytes(r2_key, data, ct)
+        except Exception as exc:
+            _log_warn(f'[news/image] r2_put_fail: {exc!r}')
+    return _news_img_response(data, ct)
 
 
 # ──────────────────────────────────────────────────────────────────

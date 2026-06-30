@@ -1303,6 +1303,9 @@ def family_roster(family_token):
         'ok': True, 'shared': True, 'count': len(days), 'days': days,
         'crew_name': _crew_short_name(crew_token),
         'crew_homebase': _crew_homebase(crew_token),
+        # Profilfoto der Crew → die Family-App zeigt das echte Foto im Header statt
+        # nur Initialen (User: „Name UND Foto vom Crew-Member fehlt").
+        'crew_avatar_url': _crew_avatar(crew_token),
     })
 
 

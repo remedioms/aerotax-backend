@@ -15573,10 +15573,23 @@ def serve_wall_image(token_safe, fname):
         # ladbar" nach Redeploy (User #43).
         if R2_AVATARS_ENABLED:
             r2_data, r2_ctype = _r2_get_bytes(f'wall/{safe_t}/{safe}')
+            # LEGACY-RECOVERY: trägt die (alte, evtl. un-sanitisierte) URL noch das
+            # rohe Token (AT-…) statt des opaken Keys, dann liegt das R2-Objekt unter
+            # dem opaken Key (R2-Uploads schreiben IMMER mit _wall_img_key). Einmal
+            # mit dem abgeleiteten opaken Key nachfassen → rettet post-R2-Bilder,
+            # deren gespeicherte URL der Sanitizer nicht erwischt hat.
+            if not r2_data and safe_t.startswith('AT-'):
+                try:
+                    r2_data, r2_ctype = _r2_get_bytes(f'wall/{_wall_img_key(safe_t)}/{safe}')
+                except Exception:
+                    r2_data = None
             if r2_data:
                 from flask import Response
                 return Response(r2_data, mimetype=r2_ctype or 'image/jpeg',
                                 headers={'Cache-Control': 'public, max-age=31536000, immutable'})
+        # Pre-R2-Bilder lagen NUR auf der ephemeren Cloud-Run-Disk (kein R2-, kein
+        # Supabase-Backup) → nach einem Redeploy unwiederbringlich weg. Hier sauber
+        # 404 (JSON), damit die iOS-Tafel/Chat einen Platzhalter zeigt statt zu hängen.
         return jsonify({'error': 'not_found'}), 404
     from flask import send_file
     mime = 'image/jpeg'
@@ -21147,6 +21160,17 @@ _AERODATABOX_DELAY_THRESHOLD = _DELAY_THRESHOLD_MIN  # identisch zu FRA/Store.
 _NATIVE_BOARD_CACHE = {}
 _NATIVE_BOARD_TTL = 720        # 12 Min.
 
+# „Last-known-good"-Board-Snapshot je (airport, type, airline). Wenn ALLE Live-
+# Quellen (Fraport/native/AeroDataBox/OpenSky) im Moment down/leer sind, serviert
+# das Board die ZULETZT erfolgreich zusammengestellte, fertige Liste (als `stale`
+# markiert) statt einer leeren Tafel / source_unavailable. Hintergrund (User: „bei
+# der Tafel fehlen wieder Flüge … will dass sie nur mit Backend kommuniziert um die
+# richtigen fertigen Infos zu holen"): die App liest weiter backend-fertige Infos,
+# auch wenn die externe Quelle gerade einen Schluckauf hat. Nach _MAX_AGE lieber
+# ehrlich „nicht erreichbar" als eine veraltete Tafel.
+_BOARD_LAST_GOOD = {}          # (airport, type, airline) -> (ts, flights, departed)
+_BOARD_LAST_GOOD_MAX_AGE = 1800  # 30 Min.
+
 
 def _clean_city_name(name, iata=''):
     """Fraport `apname` kann nicht-lateinische Schreibweisen liefern (z.B.
@@ -23522,6 +23546,25 @@ def airport_board(token):
             flights = _fetch_opensky_board(airport, ftype)
             src = 'opensky'
     if flights is None:
+        # GRACEFUL DEGRADE (User „bei der Tafel fehlen wieder Flüge"): bevor wir
+        # eine LEERE Tafel / source_unavailable melden, die zuletzt erfolgreich
+        # zusammengestellte Liste für GENAU diese Abfrage servieren (als `stale`
+        # markiert). So bleibt die Tafel auch bei einem transienten Quellen-Ausfall
+        # gefüllt — die App liest weiter fertige, backend-zusammengestellte Infos.
+        try:
+            import time as _t_lg
+            _lg = _BOARD_LAST_GOOD.get((out_airport, ftype, airline))
+            if _lg and (_t_lg.time() - _lg[0]) < _BOARD_LAST_GOOD_MAX_AGE:
+                _lg_flights = _lg[1] or []
+                _lg_dep = _lg[2] or []
+                return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
+                                'count': len(_lg_flights[:limit]),
+                                'flights': _lg_flights[:limit],
+                                'departed_today': _lg_dep[:120],
+                                'source': 'cache_stale', 'stale': True,
+                                'stale_age_sec': int(_t_lg.time() - _lg[0])})
+        except Exception:
+            pass
         # Ehrlich: kein Native-Scraper getroffen, kein AeroDataBox-Key/leer.
         import os as _os
         if out_airport in ('FRA', 'EDDF'):
@@ -23611,6 +23654,16 @@ def airport_board(token):
         departed.sort(key=lambda x: (x.get('sched') or ''), reverse=True)
     except Exception:
         departed = []
+    # „Last-known-good" festhalten: die fertige, gemergte Liste für genau diese
+    # Abfrage cachen, damit ein späterer Quellen-Ausfall (flights is None) diese
+    # statt einer leeren Tafel servieren kann. Nur nicht-leere Boards merken.
+    try:
+        if flights:
+            import time as _t_lgs
+            _BOARD_LAST_GOOD[(out_airport, ftype, airline)] = (
+                _t_lgs.time(), list(flights), list(departed))
+    except Exception:
+        pass
     return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
                     'count': len(flights[:limit]), 'flights': flights[:limit],
                     'departed_today': departed[:120],
@@ -26568,6 +26621,106 @@ def _attach_sectors(briefings, events):
         app.logger.warning(f'[ical-briefings] sectors-attach-fail: {str(e)[:160]}')
 
 
+def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
+    """RECONCILE: säubert veraltete/stornierte iCal-Tage aus `briefings` (in-place)
+    UND aus der manuellen Briefing-Map + Supabase, sodass ein RE-IMPORT den Monat
+    WIRKLICH ERSETZT (Tage, die der neue Feed nicht mehr enthält, verschwinden).
+
+    GETEILT von BEIDEN Import-Pfaden — dem ICS-URL-Import (`import_calendar_feed`)
+    UND dem iOS-EKEventStore-Push (`upload_calendar_events`). Vorher lief das
+    Reconcile NUR im URL-Pfad → über den EKEvent-Push importierte Phantom-Touren
+    (z.B. eine stornierte SFO-Tour) überlebten für immer (User C: „Flüge im Kalender
+    die ich nicht habe"). Jetzt räumen beide Pfade identisch.
+
+    Fenster: [Monatsanfang(aktuell) .. max(feed_dates)]. Voll-vergangene Monate
+    bleiben eingefroren (Historie). `full_clean=True` zieht den Anfang NICHT auf den
+    Monatsanfang hoch, sondern räumt das GANZE vom Feed abgedeckte Fenster
+    (min(feed_dates)..max) — für ein explizites „force full re-import/clean".
+
+    Gibt ein Debug-Dict zurück (feed_dates/cleared/window/...). Wirft nie.
+    """
+    dbg = {'feed_dates': 0, 'cleared': 0, 'window': None}
+    try:
+        feed_dates = set()
+        for ev in (feed_events or []):
+            # Leere Events (kein Summary/Location/Start) „decken" keinen Tag ab —
+            # sonst markiert eine Feed-Lücke den Tag fälschlich als belegt und ein
+            # veralteter Eintrag wird nie geräumt.
+            if not (ev.get('summary') or '').strip() \
+               and not (ev.get('location') or '').strip() \
+               and not (ev.get('start_iso') or '').strip():
+                continue
+            ds = ev.get('_multiday_dates') or ([ev.get('start')] if ev.get('start') else [])
+            for d in ds:
+                if isinstance(d, str) and re.match(r'^\d{4}-\d{2}-\d{2}$', d.strip()):
+                    feed_dates.add(d.strip())
+        dbg['feed_dates'] = len(feed_dates)
+        removed_dates = set()
+        if feed_dates:
+            fmin, fmax = min(feed_dates), max(feed_dates)
+            # GANZEN AKTUELLEN MONAT NEU SCHREIBEN, vergangene Monate einfrieren.
+            # Krankmeldungen ändern Touren rückwirkend INNERHALB des laufenden Monats;
+            # ein „ab-heute"-Fenster ließe stornierte Tage VOR heute stehen.
+            if not full_clean:
+                _month_start = datetime.now().strftime('%Y-%m-01')
+                if fmin < _month_start:
+                    fmin = _month_start
+            dbg['window'] = f'{fmin}..{fmax}'
+            ical_keys = ('ical_summary', 'ical_location', 'ical_start_iso',
+                         'ical_end_iso', 'ical_klass', 'ical_layover_ort',
+                         'ical_imported_at', 'block_minutes')
+            for dkey in list(briefings.keys()):
+                if fmin <= dkey <= fmax and dkey not in feed_dates:
+                    b = briefings.get(dkey) or {}
+                    if any(b.get(k) for k in ('ical_summary', 'ical_location',
+                                              'ical_start_iso', 'ical_end_iso')):
+                        for k in ical_keys:
+                            b.pop(k, None)
+                        dbg['cleared'] += 1
+                        removed_dates.add(dkey)
+                        if b:
+                            briefings[dkey] = b
+                        else:
+                            briefings.pop(dkey, None)
+            # ZWEITE Quelle: die manuelle Briefing-Map (user_manual_briefings) von
+            # ical_*-Resten säubern; User-Notizen (personal_note) bleiben erhalten.
+            try:
+                manual = dict(_manual_briefings_load(token) or {})
+                m_changed = False
+                for dkey in list(manual.keys()):
+                    if fmin <= dkey <= fmax and dkey not in feed_dates:
+                        mb = manual.get(dkey) or {}
+                        if any(mb.get(k) for k in ('ical_summary', 'ical_location',
+                                                   'ical_start_iso', 'ical_end_iso')):
+                            for k in ical_keys:
+                                mb.pop(k, None)
+                            dbg['cleared'] += 1
+                            removed_dates.add(dkey)
+                            m_changed = True
+                            if mb:
+                                manual[dkey] = mb
+                            else:
+                                manual.pop(dkey, None)
+                if m_changed:
+                    _manual_briefings_save(token, manual)
+            except Exception as _me:
+                dbg['manual_error'] = str(_me)[:100]
+            # KERN: geräumte Tage EXPLIZIT aus beiden SB-Tabellen löschen — sonst
+            # lebt der stornierte Tag in Supabase weiter und kommt beim Load zurück.
+            if removed_dates and SB_AVAILABLE:
+                try:
+                    dl = sorted(removed_dates)
+                    for tbl in ('user_ical_briefings', 'user_manual_briefings'):
+                        sb.table(tbl).delete().eq('token', token).in_('datum', dl).execute()
+                    dbg['sb_deleted'] = len(dl)
+                except Exception as _de:
+                    dbg['sb_delete_error'] = str(_de)[:100]
+    except Exception as _re:
+        dbg['error'] = str(_re)[:120]
+        app.logger.warning(f'[ical-reconcile] {str(_re)[:150]}')
+    return dbg
+
+
 @app.route('/api/user/calendar-feed/<token>/import', methods=['POST'])
 def import_calendar_feed(token):
     """Lädt ein ICS-File von einer URL und speichert die Events als Roster-Hints.
@@ -26631,114 +26784,21 @@ def import_calendar_feed(token):
     imported_briefings = 0
     briefings = {}
     _reconcile_dbg = {'feed_dates': 0, 'cleared': 0, 'window': None}
+    # Optionaler Voll-Clean: ?full=1 (oder Body {"full_clean":true}) räumt das GANZE
+    # Feed-Fenster statt nur ab Monatsanfang — „force full re-import/clean" pro User,
+    # wenn ein hartnäckiger Phantom-Tag auch außerhalb des laufenden Monats klebt.
+    _full_clean = (str(request.args.get('full') or '').strip() in ('1', 'true', 'yes')
+                   or bool((request.get_json(silent=True) or {}).get('full_clean')))
     try:
         existing = dict(_ical_briefings_load(token) or {})
         # Cap auf 200 Events (Performance) — entspricht ~6 Monate LH-Crew-Plan.
         briefings, imported_briefings = _ics_events_to_briefings(
             events[:200], existing=existing)
-        # RECONCILE (2026-06-11): Lücken-Tage INNERHALB des aktuellen Feed-Fensters,
-        # die im neuen Feed NICHT mehr vorkommen, von veralteten ical_*-Daten
-        # säubern. Sonst überlebt z.B. ein früher importierter „Office Day" als
-        # Geister-Bürotag, obwohl der echte Roster den Tag längst als frei führt
-        # (User: „Kalender meldet Büro-Tage obwohl keine da sind"). Tage AUSSERHALB
-        # des Fensters bleiben unangetastet (kumulative Historie).
-        try:
-            feed_dates = set()
-            for ev in events[:200]:
-                # Leere Events (kein Summary/Location/Start) schreiben NICHTS in die
-                # Briefing-Map → sie „decken" einen Tag NICHT ab. Sonst markiert ein
-                # leeres Multi-Day-Event (Feed-Lücke) den Tag fälschlich als belegt,
-                # und ein veralteter „Office Day" wird nie geräumt.
-                if not (ev.get('summary') or '').strip() \
-                   and not (ev.get('location') or '').strip() \
-                   and not (ev.get('start_iso') or '').strip():
-                    continue
-                ds = ev.get('_multiday_dates') or ([ev.get('start')] if ev.get('start') else [])
-                for d in ds:
-                    if isinstance(d, str) and re.match(r'^\d{4}-\d{2}-\d{2}$', d.strip()):
-                        feed_dates.add(d.strip())
-            _reconcile_dbg['feed_dates'] = len(feed_dates)
-            _reconcile_dbg['probe'] = {
-                'fd_20': '2026-06-20' in feed_dates,
-                'fd_21': '2026-06-21' in feed_dates,
-                'ical_20': bool((briefings.get('2026-06-20') or {}).get('ical_summary')),
-                'man_20': bool((_manual_briefings_load(token) or {}).get('2026-06-20', {}).get('ical_summary')),
-            }
-            removed_dates = set()
-            if feed_dates:
-                fmin, fmax = min(feed_dates), max(feed_dates)
-                # GANZEN AKTUELLEN MONAT NEU SCHREIBEN, vergangene Monate einfrieren
-                # (User 2026-06-30: „aktualisiere den ganzen Monat, aber nie einen
-                # Monat der in der Vergangenheit liegt — einmal vorbei, bleibt er.
-                # Dann bleibt der Kalender aktuell und schreibt den Monat korrekt neu").
-                # Krankmeldungen ändern Touren rückwirkend INNERHALB des laufenden
-                # Monats; ein „ab-heute"-Fenster ließ stornierte Tage VOR heute stehen
-                # (Bild #44: Juni war falsch). Das Reconcile-Fenster beginnt jetzt am
-                # 1. des aktuellen Monats. Voll-vergangene Monate bleiben unangetastete
-                # Historie (LH-Feed reicht ~30 Tage zurück → der laufende Monat ist
-                # immer voll abgedeckt, der Monatsanfang also nie „aus Versehen leer").
-                _month_start = datetime.now().strftime('%Y-%m-01')
-                if fmin < _month_start:
-                    fmin = _month_start
-                _reconcile_dbg['window'] = f'{fmin}..{fmax}'
-                ical_keys = ('ical_summary', 'ical_location', 'ical_start_iso',
-                             'ical_end_iso', 'ical_klass', 'ical_layover_ort',
-                             'ical_imported_at', 'block_minutes')
-                for dkey in list(briefings.keys()):
-                    if fmin <= dkey <= fmax and dkey not in feed_dates:
-                        b = briefings.get(dkey) or {}
-                        if any(b.get(k) for k in ('ical_summary', 'ical_location',
-                                                  'ical_start_iso', 'ical_end_iso')):
-                            for k in ical_keys:
-                                b.pop(k, None)
-                            _reconcile_dbg['cleared'] += 1
-                            removed_dates.add(dkey)
-                            if b:
-                                briefings[dkey] = b
-                            else:
-                                briefings.pop(dkey, None)
-                # ZWEITE Quelle: der Briefing-GET merged auch die MANUELLE Briefing-
-                # Map (user_manual_briefings). Ein früherer Import (z.B. ein zweiter,
-                # veralteter Feed) hat dort ical_*-Felder (z.B. „Office Day") hinter-
-                # lassen, die mein iCal-Reconcile nicht erreicht → Geister-Bürotag
-                # blieb. Hier dieselben Lücken-Tage auch dort von ical_*-Resten
-                # säubern (User-Notizen wie personal_note bleiben erhalten).
-                try:
-                    manual = dict(_manual_briefings_load(token) or {})
-                    m_changed = False
-                    for dkey in list(manual.keys()):
-                        if fmin <= dkey <= fmax and dkey not in feed_dates:
-                            mb = manual.get(dkey) or {}
-                            if any(mb.get(k) for k in ('ical_summary', 'ical_location',
-                                                       'ical_start_iso', 'ical_end_iso')):
-                                for k in ical_keys:
-                                    mb.pop(k, None)
-                                _reconcile_dbg['cleared'] += 1
-                                removed_dates.add(dkey)
-                                m_changed = True
-                                if mb:
-                                    manual[dkey] = mb
-                                else:
-                                    manual.pop(dkey, None)
-                    if m_changed:
-                        _manual_briefings_save(token, manual)
-                except Exception as _me:
-                    _reconcile_dbg['manual_error'] = str(_me)[:100]
-                # KERN-FIX (2026-06-11): Upsert löscht entfernte Tage NICHT aus
-                # Supabase → der veraltete „Office Day" lebte in der SB-Tabelle
-                # weiter und wurde beim nächsten Load zurückgelesen. Hier die
-                # geräumten Lücken-Tage EXPLIZIT aus beiden SB-Tabellen löschen.
-                if removed_dates and SB_AVAILABLE:
-                    try:
-                        dl = sorted(removed_dates)
-                        for tbl in ('user_ical_briefings', 'user_manual_briefings'):
-                            sb.table(tbl).delete().eq('token', token).in_('datum', dl).execute()
-                        _reconcile_dbg['sb_deleted'] = len(dl)
-                    except Exception as _de:
-                        _reconcile_dbg['sb_delete_error'] = str(_de)[:100]
-        except Exception as _re:
-            _reconcile_dbg['error'] = str(_re)[:120]
-            app.logger.warning(f'[ical-reconcile] {str(_re)[:150]}')
+        # RECONCILE (geteilter Helper): Tage im aktuellen Monatsfenster, die der neue
+        # Feed nicht mehr enthält, von veralteten ical_*-Daten säubern (inkl. manueller
+        # Map + Supabase). Tage AUSSERHALB des Fensters bleiben Historie.
+        _reconcile_dbg = _reconcile_month_briefings(
+            token, briefings, events[:200], full_clean=_full_clean)
         # Pro-Leg-Sektoren auch im ICS-URL-Pfad bewahren (gleich wie EKEvent-Upload).
         _attach_sectors(briefings, events[:200])
         _ical_briefings_save(token, briefings)
@@ -26844,13 +26904,24 @@ def upload_calendar_events(token):
             adapted.append(adapted_ev)
         briefings, imported_briefings = _ics_events_to_briefings(
             adapted, existing=existing_briefings)
+        # RECONCILE (FIX User C „Flüge im Kalender die ich nicht habe"): auch der
+        # EKEventStore-Push muss den Monat ERSETZEN — stornierte/abgesagte Tage (z.B.
+        # eine Phantom-SFO-Tour), die der neue Push nicht mehr enthält, im aktuellen
+        # Monatsfenster räumen. Vorher lief das nur im ICS-URL-Pfad → Phantom-Touren
+        # über den iOS-Push überlebten dauerhaft. ?full=1 → ganzes Feed-Fenster.
+        _full_clean = (str(request.args.get('full') or '').strip() in ('1', 'true', 'yes')
+                       or bool(body.get('full_clean')))
+        _reconcile_dbg = _reconcile_month_briefings(
+            token, briefings, adapted, full_clean=_full_clean)
         # Pro-Leg-Sektoren bewahren (geteilte Logik mit dem ICS-URL-Pfad).
         _attach_sectors(briefings, adapted)
         _ical_briefings_save(token, briefings)
     except Exception as e:
+        _reconcile_dbg = {'error': str(e)[:120]}
         app.logger.warning(f'[ical-briefings] ekevent-persist-fail: {str(e)[:200]}')
     return jsonify({'ok': True, 'events_count': len(events),
-                    'briefings_imported': imported_briefings})
+                    'briefings_imported': imported_briefings,
+                    'reconcile': _reconcile_dbg})
 
 
 # ── IAP-Mock (UI-only, kein echter StoreKit-Hit) ──────────────────────
