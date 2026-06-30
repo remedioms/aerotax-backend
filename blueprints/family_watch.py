@@ -931,12 +931,32 @@ def family_share_list(token):
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
     shares = _shares_load()
     own = [s for s in shares if s.get('crew_token') == token]
+    _pl = _app_attr('_profile_load')
+    _rel_label = {'papa': 'Papa', 'mama': 'Mama', 'partner': 'Partner',
+                  'freund': 'Freund/in', 'kind': 'Kind', 'family': 'Familie'}
     grants = []
+    seen = set()
     for s in own:
         ft = s.get('family_token')
+        # DEDUPE nach family_token: dieselbe Person darf nicht doppelt erscheinen
+        # (User #48: „2 Family-Zeilen für eine Person").
+        if ft in seen:
+            continue
+        seen.add(ft)
+        rel = (s.get('relation') or '').strip().lower()
+        # Echter Anzeigename statt Token-Fragment (User #48 „hat keinen Namen"):
+        # gespeicherter Anfrage-Name → Profilname des Family-Tokens → Relation-Label.
+        disp = s.get('requester_name')
+        if not disp and ft and _pl:
+            try:
+                disp = ((_pl(ft) or {}).get('profile', {}) or {}).get('name')
+            except Exception:
+                disp = None
+        if not disp:
+            disp = _rel_label.get(rel, 'Familie')
         grants.append({
             'family_token': ft,
-            'family_short_name': (ft or '')[:8] if ft else None,
+            'family_short_name': disp,
             'family_relation': s.get('relation'),
             'fields': [f for f in (s.get('fields') or []) if f in ALLOWED_FIELDS],
             'created_at': s.get('created_at'),
@@ -1060,6 +1080,9 @@ def family_request_approve(crew_token):
         shares.append({
             'crew_token': crew_token, 'family_token': family_token,
             'relation': relation, 'fields': fields,
+            # Anzeigename der Familien-Person mitnehmen (sonst zeigte die „Familie"-
+            # Verwaltung nur ein Token-Fragment, User #48 „hat keinen Namen").
+            'requester_name': match.get('requester_name'),
             'created_at': _dt.datetime.now().isoformat(),
         })
         _shares_save(shares)
