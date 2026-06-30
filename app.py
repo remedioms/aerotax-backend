@@ -23461,6 +23461,50 @@ def airport_board(token):
                         'airport': out_airport, 'type': ftype, 'message': msg}), 200
     if airline:
         flights = [f for f in flights if f.get('airline') == airline]
+    # ── #29-FIX: STALE/abgeflogene Flüge aus der ANSTEHENDEN Tafel ziehen ────────
+    # Der Fraport-/Scraper-Feed liefert ein Zeitfenster, das auch schon ABGEFLOGENE
+    # Zeilen enthält (z.B. um 10:04 noch die 06:35-„geschlossen"). Nachts um 01:30
+    # rutschten so die 18-19-Uhr-Flüge des Vortags als „anstehend" rein (User #29:
+    # „was machen die Flüge hier wenn es schon 1:30 ist?"). Wir entfernen Flüge,
+    # deren BESTE Zeit (esti sonst sched, beide tz-aware ISO mit Offset) deutlich in
+    # der Vergangenheit liegt ODER deren Status klar „abgeflogen" sagt. Verspätete
+    # Flüge bleiben sichtbar (zukünftige esti → behalten). Die herausgefilterten
+    # landen automatisch in `departed_today` (sie sind im Beobachtungs-Store und
+    # stehen dann nicht mehr in `live_keys`). Datums-bewusst → kein Tag-Übertrag.
+    try:
+        from datetime import datetime as _dtp, timezone as _tzp, timedelta as _tdp
+        def _board_dt(s):
+            if not s:
+                return None
+            t = str(s).strip().replace('Z', '+00:00')
+            # „+0200" → „+02:00" für fromisoformat-Kompatibilität.
+            if len(t) >= 5 and t[-5] in '+-' and t[-3] != ':':
+                t = t[:-2] + ':' + t[-2:]
+            try:
+                dt = _dtp.fromisoformat(t)
+            except Exception:
+                return None
+            # Nur tz-aware Zeiten (mit Offset, z.B. FRA „+02:00") sicher vergleichbar.
+            # Naive Scraper-Zeiten OHNE Offset lassen wir ungefiltert (kein Tag-/TZ-
+            # Ratespiel → keine Regression für Nicht-FRA-Boards).
+            return dt if dt.tzinfo is not None else None
+        _now_utc = _dtp.now(_tzp.utc)
+        _stale_cut = _now_utc - _tdp(minutes=90)
+        _gone = {'geschlossen', 'gestartet', 'abgeflogen', 'departed', 'gelandet',
+                 'landed', 'closed', 'left', 'ges.'}
+        def _is_past(f):
+            st = (f.get('status') or '').strip().lower()
+            bt = _board_dt(f.get('esti')) or _board_dt(f.get('sched'))
+            if bt is not None and bt >= _now_utc:
+                return False                      # Zukunft (inkl. verspätet) → behalten
+            if st in _gone:
+                return True                       # eindeutig weg
+            if bt is not None and bt < _stale_cut:
+                return True                       # > 90 min alt → weg/stale
+            return False
+        flights = [f for f in flights if not _is_past(f)]
+    except Exception:
+        pass
     # „Früher heute" — bereits abgeflogene/angekommene Flüge aus der akkumulierten
     # Beobachtung, die NICHT mehr im Live-Feed stehen (dedup über flight+hh:mm).
     # BUGFIX 2026-06-13: jetzt für BEIDE Richtungen (Departures UND Arrivals) — die
