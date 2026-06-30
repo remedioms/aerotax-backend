@@ -176,7 +176,11 @@ def _public_view(rec):
     return {
         # DB-Spalte heißt `body` (das Wort `text` ist ein Postgres-Typname);
         # die API gibt das Feld weiterhin als `text` an die iOS-App.
-        'text': rec.get('body', rec.get('text')),
+        # ROBUSTHEIT (User 2026-06-30: „Family-Nachricht kam OHNE Text an"): `or`
+        # statt `get(key, default)` — fällt auch dann auf `text`/`message` zurück,
+        # wenn `body` zwar als Spalte EXISTIERT, aber null/leer ist (alte Zeilen /
+        # SB-Schema ohne body-Wert). So geht der Text nie verloren.
+        'text': rec.get('body') or rec.get('text') or rec.get('message') or '',
         'emoji': rec.get('emoji'),
         # Crew-Reaktion (❤️ zurück) — Family sieht sie auf ihrer Compose-Karte.
         'reaction': rec.get('reaction'),
