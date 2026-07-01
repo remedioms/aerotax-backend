@@ -9,8 +9,9 @@ os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
 
 import pytest  # noqa: E402
 import cas_integration as ci  # noqa: E402
+import conftest as _cft  # noqa: E402
 
-REAL_PDF = '/Users/miguelschumann/Desktop/Steuer 25/CAS/PUB_1_1_0_1220115246_2024-12-20.pdf'
+REAL_PDF = _cft.private_doc('Steuer 25', 'CAS', 'PUB_1_1_0_1220115246_2024-12-20.pdf')
 _HAVE_PDF = os.path.exists(REAL_PDF)
 
 

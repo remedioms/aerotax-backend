@@ -7,7 +7,14 @@
 
 import fs from 'node:fs';
 
-const SITE = '/Users/miguelschumann/Desktop/site/index.html';
+const SITE = process.env.AEROTAX_SITE_ROOT
+  ? `${process.env.AEROTAX_SITE_ROOT}/index.html`
+  : [
+      `${process.env.HOME}/Desktop/AeroTax/site/index.html`,
+      `${process.env.HOME}/Desktop/site/index.html`,
+      `${process.env.HOME}/Developer/site/index.html`,
+    ].find(p => fs.existsSync(p));
+if (!SITE) { console.log('SKIP: site repo not found (set AEROTAX_SITE_ROOT)'); process.exit(0); }
 const html = fs.readFileSync(SITE, 'utf8');
 
 let pass = 0;
@@ -519,10 +526,10 @@ check('opt_card_uses_req_card_inheriting_glass',
 // ─── Phase 5: Receipt Classifier — Design doc exists ──────────────────────
 console.log('\n[receipt classifier doc]');
 check('receipt_classifier_design_doc_exists',
-  fs.existsSync('/Users/miguelschumann/Desktop/aerotax-backend/docs/RECEIPT_CLASSIFIER_DESIGN.md'));
+  fs.existsSync(new URL('../docs/RECEIPT_CLASSIFIER_DESIGN.md', import.meta.url).pathname));
 check('receipt_classifier_doc_specifies_inclusion_rules',
   (function(){
-    const doc = fs.readFileSync('/Users/miguelschumann/Desktop/aerotax-backend/docs/RECEIPT_CLASSIFIER_DESIGN.md','utf8');
+    const doc = fs.readFileSync(new URL('../docs/RECEIPT_CLASSIFIER_DESIGN.md', import.meta.url).pathname,'utf8');
     return doc.includes('Inclusion-Regeln') &&
            doc.includes('included_in_total') &&
            doc.includes('needs_review') &&
@@ -530,7 +537,7 @@ check('receipt_classifier_doc_specifies_inclusion_rules',
   })());
 check('receipt_classifier_doc_specifies_z77_z17_hard_constraint',
   (function(){
-    const doc = fs.readFileSync('/Users/miguelschumann/Desktop/aerotax-backend/docs/RECEIPT_CLASSIFIER_DESIGN.md','utf8');
+    const doc = fs.readFileSync(new URL('../docs/RECEIPT_CLASSIFIER_DESIGN.md', import.meta.url).pathname,'utf8');
     return doc.includes('NICHT von Z77') && doc.includes('NICHT von Z17');
   })());
 

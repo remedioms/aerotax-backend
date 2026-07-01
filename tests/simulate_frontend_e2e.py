@@ -20,7 +20,26 @@ import sys
 
 
 BACKEND_URL = 'https://aerotax-backend-443401186607.europe-west3.run.app'
-SITE_HTML = '/Users/miguelschumann/Desktop/site/index.html'
+
+
+def _resolve_site_html():
+    import os
+    env = os.environ.get('AEROTAX_SITE_ROOT')
+    if env:
+        return os.path.join(env, 'index.html')
+    home = os.path.expanduser('~')
+    candidates = (
+        os.path.join(home, 'Desktop', 'AeroTax', 'site', 'index.html'),
+        os.path.join(home, 'Desktop', 'site', 'index.html'),
+        os.path.join(home, 'Developer', 'site', 'index.html'),
+    )
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return candidates[0]
+
+
+SITE_HTML = _resolve_site_html()
 
 
 def fetch_session(token):

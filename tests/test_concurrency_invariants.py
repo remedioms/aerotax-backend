@@ -9,6 +9,8 @@ after_request, teardown_request mit pid + thread_id + duration_ms).
 import os
 import re
 
+import pytest
+
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCKERFILE = os.path.join(ROOT, 'Dockerfile')
@@ -69,7 +71,13 @@ def test_dockerfile_max_requests_jitter_20():
 
 def test_procfile_matches_dockerfile_gthread():
     """Procfile (Render fallback) muss gthread+threads=8 matchen, sonst
-    bei Rollback auf Render würde altes blocking-Pattern zurückkommen."""
+    bei Rollback auf Render würde altes blocking-Pattern zurückkommen.
+
+    Deploy ist seit „Phase B" Cloud Run/Dockerfile — das Procfile wurde
+    bewusst gelöscht (commit be758f6 „Render entfernt → Cloud Run"). Der
+    Guard bleibt für den Fall, dass je wieder ein Procfile auftaucht."""
+    if not os.path.exists(PROCFILE):
+        pytest.skip('Procfile entfernt (Cloud-Run-Deploy, commit be758f6) — Guard nur bei vorhandenem Procfile')
     src = _read(PROCFILE)
     assert '--worker-class gthread' in src or '--worker-class=gthread' in src
     assert re.search(r'--threads[ =]+8\b', src)

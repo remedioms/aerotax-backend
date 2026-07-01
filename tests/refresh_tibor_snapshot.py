@@ -32,7 +32,10 @@ if not os.environ.get('ANTHROPIC_API_KEY'):
 
 import app  # noqa: E402
 
-TIBOR_BASE = Path('/Users/miguelschumann/Desktop/Tibor/2025')
+# Private Original-PDFs (nicht im Repo) — Override: env AEROTAX_PRIVATE_DOCS_ROOT
+TIBOR_BASE = Path(
+    os.environ.get('AEROTAX_PRIVATE_DOCS_ROOT') or Path.home() / 'Desktop' / 'Downloads'
+) / 'Tibor' / '2025'
 TIBOR_DP_DIR = TIBOR_BASE / 'Dienstplan'
 LSB_PDF = TIBOR_BASE / 'Lohnsteuerbescheinigung 2025.pdf'
 SE_PDF = TIBOR_BASE / '2025 Streckeneinsatzabrechnungen.pdf'

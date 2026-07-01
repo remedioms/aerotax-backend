@@ -8,7 +8,14 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const SITE = '/Users/miguelschumann/Desktop/site/index.html';
+const SITE = process.env.AEROTAX_SITE_ROOT
+  ? `${process.env.AEROTAX_SITE_ROOT}/index.html`
+  : [
+      `${process.env.HOME}/Desktop/AeroTax/site/index.html`,
+      `${process.env.HOME}/Desktop/site/index.html`,
+      `${process.env.HOME}/Developer/site/index.html`,
+    ].find(p => fs.existsSync(p));
+if (!SITE) { console.log('SKIP: site repo not found (set AEROTAX_SITE_ROOT)'); process.exit(0); }
 const html = fs.readFileSync(SITE, 'utf8');
 
 // Inline-Scripts extrahieren

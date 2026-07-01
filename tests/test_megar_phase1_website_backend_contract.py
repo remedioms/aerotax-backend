@@ -12,6 +12,7 @@ Verifiziert:
 Spec: docs/WEBSITE_BACKEND_CONTRACT_AUDIT.md
 """
 import os
+import conftest as _cft
 import sys
 import re
 
@@ -19,7 +20,7 @@ import pytest
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(THIS_DIR)
-SITE_HTML = '/Users/miguelschumann/Desktop/site/index.html'
+SITE_HTML = _cft.SITE_INDEX_HTML
 
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)

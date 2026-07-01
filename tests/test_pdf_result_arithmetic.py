@@ -17,6 +17,7 @@ Tests decken 12 Variants ab.
 """
 
 import pytest
+import conftest as _cft
 
 
 def _compute(fahr, reinig, trink, vma_72, vma_73, vma_74, vma_aus,
@@ -242,7 +243,7 @@ def test_pdf_table_no_misleading_subtract_line_static():
 def test_ui_table_no_misleading_brutto_minus_z77_static():
     """Static: UI table shows blocks, NOT „Brutto-Aufwendungen − Z77 = Netto"."""
     import os
-    html = open('/Users/miguelschumann/Desktop/site/index.html', encoding='utf-8').read()
+    html = open(_cft.site_index_html(), encoding='utf-8').read()
     # Old misleading row must be gone
     assert '= Brutto-Aufwendungen gesamt' not in html, \
         'Old misleading „= Brutto-Aufwendungen gesamt" line must be removed'

@@ -9,14 +9,15 @@ pdf_allowed, _review_items, user_title, user_message, next_actions).
 Statische Tests — Browser-Beweis siehe AUDIT_BROWSER_QA.md R.5 / R.6.
 """
 import os
+import conftest as _cft
 import re
 
 
-_FRONTEND = '/Users/miguelschumann/Desktop/site/index.html'
+_FRONTEND = _cft.SITE_INDEX_HTML
 
 
 def _read():
-    return open(_FRONTEND).read()
+    return open(_cft.site_index_html()).read()
 
 
 def _auto_resume_block():

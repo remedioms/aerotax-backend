@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
 
 import app  # noqa: E402
+import conftest as _cft  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,14 +175,14 @@ def test_no_silent_fra_fallback_in_backend():
 # FIX 3 — Frontend Homebase Dropdown
 # ─────────────────────────────────────────────────────────────────────────────
 
-INDEX_HTML = os.path.expanduser('~/Desktop/site/index.html')
+# site-Repo-Pfad wird pro Test via _cft.site_index_html() aufgelöst (skippt wenn fehlend)
 
 
 def test_frontend_vie_zrh_disabled():
     """VIE/ZRH NICHT mehr im Dropdown — wurden auf User-Anforderung entfernt
     (2026-05-24, Liquid-Glass-Cleanup). Backend rejected sie trotzdem via
     _is_supported_homebase, frontend zeigt sie nicht mehr als Option."""
-    with open(INDEX_HTML, encoding='utf-8') as f:
+    with open(_cft.site_index_html(), encoding='utf-8') as f:
         html = f.read()
     # Sicherheits-Check: keine VIE/ZRH-Options im Dropdown
     assert 'Wien (VIE)' not in html, 'VIE sollte nicht mehr im Dropdown sein'
@@ -190,7 +191,7 @@ def test_frontend_vie_zrh_disabled():
 
 def test_frontend_supported_de_bases_present():
     """DE-Bases müssen im Dropdown stehen — supported homebases."""
-    with open(INDEX_HTML, encoding='utf-8') as f:
+    with open(_cft.site_index_html(), encoding='utf-8') as f:
         html = f.read()
     for base in ('Frankfurt (FRA)', 'München (MUC)', 'Berlin (BER)',
                  'Düsseldorf (DUS)', 'Hamburg (HAM)', 'Stuttgart (STR)',
@@ -203,7 +204,7 @@ def test_frontend_homebase_warning_text_removed():
     """Hinweis-Text unter Dropdown wurde auf User-Anforderung 2026-05-24
     entfernt (UI-Cleanup). Backend gibt die Validierung via canonical_state
     'needs_document_attention' weiter wenn unsupported base gewählt."""
-    with open(INDEX_HTML, encoding='utf-8') as f:
+    with open(_cft.site_index_html(), encoding='utf-8') as f:
         html = f.read()
     # Der alte Warning-Text wurde explizit entfernt
     assert 'Aktuell für deutsche Steuerlogik optimiert' not in html
@@ -212,6 +213,6 @@ def test_frontend_homebase_warning_text_removed():
 
 def test_frontend_anderer_flughafen_removed():
     """„Anderer Flughafen" raus — verhindert dass User unknown-input macht."""
-    with open(INDEX_HTML, encoding='utf-8') as f:
+    with open(_cft.site_index_html(), encoding='utf-8') as f:
         html = f.read()
     assert '<option>Anderer Flughafen</option>' not in html

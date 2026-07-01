@@ -93,9 +93,20 @@ def test_bug002_family_share_grant_then_list(client, user):
 
 
 def test_bug002_family_watch_feed_returns_watched_envelope(client, user):
-    # Even with no grants, the endpoint must exist + return the right envelope shape.
+    # The endpoint must exist + return the right envelope shape.
+    # FIX 2026-07-01: Seit 7dfead1 401t das Auth-Gate UNBEKANNTE AT-FAM-Tokens
+    # (korrektes Prod-Verhalten) — der Test münzt deshalb einen ECHTEN scoped
+    # Family-Token über den Pair-Code-Flow statt eines Random-Fakes.
     token = user["token"]
-    fam_token = "AT-FAM-" + uuid.uuid4().hex[:8].upper()
+    r = client.post(f"/api/family/pair-code/{token}/create")
+    assert r.status_code == 200, r.get_data(as_text=True)[:300]
+    code = json.loads(r.get_data(as_text=True))["code"]
+    r = client.post("/api/family/pair-code/redeem",
+                    json={"code": code, "family_name": "Smoke Fam"})
+    assert r.status_code == 200, r.get_data(as_text=True)[:300]
+    fam_token = json.loads(r.get_data(as_text=True))["family_token"]
+    assert fam_token.startswith("AT-FAM-"), fam_token
+
     r = client.get(f"/api/family-watch/{fam_token}/feed")
     assert r.status_code == 200, r.get_data(as_text=True)[:300]
     body = json.loads(r.get_data(as_text=True))
@@ -120,6 +131,14 @@ def test_bug002_family_share_revoke(client, user):
 # BUG-003: Profile-PUT account_type whitelist
 # ─────────────────────────────────────────────────────────────────
 
+def _bearer(token):
+    """iOS-Client-Kontrakt: owner-scoped Requests senden IMMER den eigenen
+    Bearer. PUT /api/user/profile ist seit dem IDOR-Fix hart daran gebunden
+    (token_binding_required, 401 ohne Header); der GET liefert nur MIT Bearer
+    das Vollprofil (sonst Public-Whitelist-Projektion)."""
+    return {"Authorization": f"Bearer {token}"}
+
+
 def test_bug003_profile_put_persists_account_type(client, user):
     token = user["token"]
     r = client.put(f"/api/user/profile/{token}", json={
@@ -127,12 +146,12 @@ def test_bug003_profile_put_persists_account_type(client, user):
         "position": "CC", "airline": "DLH",
         "account_type": "family",
         "family_share_defaults": ["layover_place", "current_city"],
-    })
+    }, headers=_bearer(token))
     assert r.status_code == 200, r.get_data(as_text=True)
     body = json.loads(r.get_data(as_text=True))
     assert body.get("ok") is True
 
-    r = client.get(f"/api/user/profile/{token}")
+    r = client.get(f"/api/user/profile/{token}", headers=_bearer(token))
     body = json.loads(r.get_data(as_text=True))
     prof = body.get("profile") or {}
     assert prof.get("account_type") == "family", f"account_type not persisted: {prof!r}"
@@ -142,7 +161,8 @@ def test_bug003_profile_put_persists_account_type(client, user):
 def test_bug003_invalid_account_type_rejected(client, user):
     token = user["token"]
     r = client.put(f"/api/user/profile/{token}",
-                   json={"account_type": "admin"})  # invalid
+                   json={"account_type": "admin"},  # invalid
+                   headers=_bearer(token))
     assert r.status_code == 400, r.get_data(as_text=True)
     body = json.loads(r.get_data(as_text=True))
     assert body.get("error") == "invalid_account_type"

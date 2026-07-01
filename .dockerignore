@@ -9,10 +9,15 @@ __pycache__/
 
 # Test/Dev-Only
 tests/
+qa_data/
+loadtest/
+docs/
 *.test
 .envrc
 .env
 .env.*
+# HINWEIS: rate_limits/ ist ein Python-Package (app.py: `from rate_limits import …`)
+# und MUSS ins Image — NICHT hier eintragen.
 
 # Lokale Job-/Session-State (nicht persistent über Container hinweg —
 # Supabase ist primary persistence; lokale Files nur Fallback)

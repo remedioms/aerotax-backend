@@ -9,6 +9,7 @@ synthetische job-dicts.
 """
 
 import pytest
+import conftest as _cft
 import app
 
 
@@ -84,7 +85,7 @@ def test_case_C_unknown_marker_RB_review_kind():
 
 def test_case_C_static_frontend_unknown_marker_template_exists():
     """Static: Frontend has kind-specific copy for unknown_marker."""
-    html = open('/Users/miguelschumann/Desktop/site/index.html', encoding='utf-8').read()
+    html = open(_cft.site_index_html(), encoding='utf-8').read()
     # The kind-routing block exists
     assert "_itType === 'unknown_marker'" in html
     assert 'Unbekannte Kennung' in html
@@ -96,7 +97,7 @@ def test_case_C_static_frontend_unknown_marker_template_exists():
 
 def test_case_C_static_frontend_no_cas_upload_when_present():
     """Static: Frontend checks missing_months_cas before suggesting CAS upload."""
-    html = open('/Users/miguelschumann/Desktop/site/index.html', encoding='utf-8').read()
+    html = open(_cft.site_index_html(), encoding='utf-8').read()
     assert 'missing_months_cas' in html
     assert '_trulyMissingMonths' in html
     # Honest fallback when CAS is present
@@ -110,7 +111,7 @@ def test_case_C_static_frontend_no_cas_upload_when_present():
 def test_case_D_all_answered_chat_does_not_demand_answers():
     """Wenn _all_reviews_answered=True und pending=0, darf der chat-PDF-handler
     NIE „brauche zuerst deine Antworten" sagen."""
-    html = open('/Users/miguelschumann/Desktop/site/index.html', encoding='utf-8').read()
+    html = open(_cft.site_index_html(), encoding='utf-8').read()
     # Live-pending-count is checked before showing the „brauche Antworten" message
     assert '_livePending' in html or '_livePending > 0' in html
     # Fallback for needs_review + pending=0: friendly "PDF gleich bereit"
@@ -119,7 +120,7 @@ def test_case_D_all_answered_chat_does_not_demand_answers():
 
 def test_case_D_static_pdf_handler_uses_live_state():
     """Static: PDF-Frage-Handler reads live _data._review_items, not stale snapshot."""
-    html = open('/Users/miguelschumann/Desktop/site/index.html', encoding='utf-8').read()
+    html = open(_cft.site_index_html(), encoding='utf-8').read()
     # The handler must compute _livePending from _data._review_items
     assert '_dCheck._review_items' in html or '_dCheck && _dCheck._review_items' in html
 
@@ -129,7 +130,7 @@ def test_case_D_static_pdf_handler_uses_live_state():
 # ════════════════════════════════════════════════════════════════════
 
 def test_case_E_progress_escalates_at_90s_and_300s():
-    html = open('/Users/miguelschumann/Desktop/site/index.html', encoding='utf-8').read()
+    html = open(_cft.site_index_html(), encoding='utf-8').read()
     assert 'heartbeatStart' in html
     assert 'kann bei vielen Dokumenten ein paar Minuten dauern' in html
     assert 'Du kannst mit deinem Zugangscode später zurückkommen' in html
@@ -201,7 +202,7 @@ def test_case_I_missing_lsb():
 
 def test_case_J_wrong_file_doctype_error():
     """Static: Backend kennt 'WRONG_DOCUMENT_TYPE'-Code."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py', encoding='utf-8').read()
+    src = open(_cft.backend_path('app.py'), encoding='utf-8').read()
     # Doc-type detection exists
     assert 'document_type' in src or 'doc_type' in src
     # Reject patterns
@@ -248,7 +249,7 @@ def test_case_M_failed_retryable_no_done():
 
 def test_case_N_no_tax_guarantee_in_user_messages():
     """Static: User-facing copies enthalten NIE „garantiert"/„prüfungsfest"/„finanzamt-sicher"."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py', encoding='utf-8').read()
+    src = open(_cft.backend_path('app.py'), encoding='utf-8').read()
     # Forbidden marketing claims in user-visible strings (excluding code/docs)
     # Wir prüfen nur user_message/user_title-bereich der state-machine
     # (per pattern: nur die State-Antworten in _classify_job_state).
@@ -270,7 +271,7 @@ def test_case_N_no_tax_guarantee_in_user_messages():
 
 def test_case_O_homebase_dynamic_not_hardcoded():
     """No FRA hardcoded in comparison logic (CLAUDE.md rule)."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py', encoding='utf-8').read()
+    src = open(_cft.backend_path('app.py'), encoding='utf-8').read()
     # Kein hardcoded "FRA" als Default-Homebase in Comparison-Code.
     # Acceptable: FRA in BMF_INLAND tables, REFERENCE_*_2025_MIGUEL test consts,
     # iata_unknown lists. Wir suchen nach if-elif-Branches mit hardcoded 'FRA'.
@@ -286,7 +287,7 @@ def test_case_O_homebase_dynamic_not_hardcoded():
 # ════════════════════════════════════════════════════════════════════
 
 def test_case_P_km_dynamic():
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py', encoding='utf-8').read()
+    src = open(_cft.backend_path('app.py'), encoding='utf-8').read()
     # km wird aus cached_state gelesen (siehe _recompute_with_overrides L3415-3420 area)
     assert "cached_state.get('km'" in src or 'km =' in src
 
@@ -355,7 +356,7 @@ def test_case_T_z17_only_offsets_fahrt():
 
 def test_case_T_static_recompute_separates_buckets():
     """Static: _recompute_with_overrides uses two separate clamps."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py', encoding='utf-8').read()
+    src = open(_cft.backend_path('app.py'), encoding='utf-8').read()
     import re
     assert re.search(r'fahr_netto\s*=\s*round\(\s*max\(\s*0', src)
     assert re.search(r'fahr\s*-\s*ag_z17', src)

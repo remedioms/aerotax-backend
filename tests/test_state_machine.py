@@ -9,6 +9,7 @@ Deckt ab:
 - Chat-Gate
 """
 import os
+import conftest as _cft
 import sys
 import importlib
 
@@ -399,7 +400,7 @@ def test_pdf_blocked_returns_reason_code_and_next_actions(monkeypatch):
 
 def test_pdf_lock_response_structure():
     """Helper-Funktion existiert in finalize-pdf endpoint."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find('def post_finalize_pdf')
     block = src[fn_idx:fn_idx + 8000]
     # Strukturierte Helper-Response
@@ -413,7 +414,7 @@ def test_pdf_lock_response_structure():
 
 def test_retry_count_persistent_via_session():
     """/api/recover schreibt retry_count in session.result_data._retry_count."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find('def recover_failed_job')
     block = src[fn_idx:fn_idx + 3000]
     assert "_retry_count" in block
@@ -423,7 +424,7 @@ def test_retry_count_persistent_via_session():
 
 def test_retry_limit_two_enforced():
     """/api/recover: nach 2 Retries → support response, kein neuer Retry."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find('def recover_failed_job')
     block = src[fn_idx:fn_idx + 3000]
     assert "RETRY_LIMIT_REACHED" in block
@@ -453,7 +454,7 @@ def test_chat_processing_state_gets_state_hint_in_prompt(monkeypatch):
     anweist, keine Final-Beträge zu nennen. User-Wunsch: smarter Chat."""
     _app = _load_app_fresh()
     # Statisches Audit: State-Hint kommt im Prompt vor
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "state_gate_hint" in src, 'state_gate_hint variable muss existieren'
     assert "STATE-HINWEIS" in src, 'Prompt muss STATE-HINWEIS-Block enthalten'
     # processing-Pfad führt zu state_gate_hint != None
@@ -462,7 +463,7 @@ def test_chat_processing_state_gets_state_hint_in_prompt(monkeypatch):
 
 def test_chat_failed_support_state_hint_present(monkeypatch):
     """failed_support: Sonnet bekommt Hinweis, dass Support-Kontakt erwartet wird."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "'failed_support':" in src
     # State-Hint enthält Support-Verweis
     assert 'Support' in src and 'unsicher' in src.lower()
@@ -470,14 +471,14 @@ def test_chat_failed_support_state_hint_present(monkeypatch):
 
 def test_chat_failed_retryable_state_hint_present(monkeypatch):
     """failed_retryable: Sonnet bekommt Hinweis, dass Retry der natürliche Schritt ist."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "'failed_retryable':" in src
     assert 'technisch unterbrochen' in src.lower() or 'neustart' in src.lower()
 
 
 def test_chat_done_allows_sonnet_call():
     """Bei status=done passiert der Chat-Gate NICHT — Sonnet wird gerufen."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     chat_idx = src.find('def chat_with_aerotax')
     block = src[chat_idx:chat_idx + 4000]
     # Im State-Gate sollte 'can_chat_explain_calculation' geprüft werden
@@ -577,7 +578,7 @@ def test_v11_cas_pipeline_sets_explicit_reason_code_on_schema_crash():
     """hybrid_analyze cas-pipeline-except-Block ruft _set_job_failed mit
     'CLASSIFICATION_SCHEMA_FAILED' bei tuple/list/None-AttributeError.
     Liegt nicht in _classify_v11_cas_pipeline selbst, sondern in der Caller-Stelle."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     # Marker für den catch-block ist [v11-cas-pipeline] TRACEBACK
     idx = src.find("[v11-cas-pipeline] TRACEBACK")
     assert idx > 0
@@ -589,7 +590,7 @@ def test_v11_cas_pipeline_sets_explicit_reason_code_on_schema_crash():
 
 def test_pre_classify_v7_snapshot_captures_non_dict_indices():
     """Snapshot pre_classify_v7 enthält non_dict_indices (die wir suchen)."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find("'pre_classify_v7'")
     assert fn_idx > 0
     block = src[fn_idx:fn_idx + 1500]
@@ -671,7 +672,7 @@ def test_pipeline_schema_error_routed_to_classification_schema_failed():
 
 def test_v11_cas_pipeline_validates_matched_before_classify():
     """_classify_v11_cas_pipeline ruft _validate_pipeline_shape auf matched VOR classify_v7."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     # Reihenfolge: Validator vor classify-Aufruf
     pipeline_idx = src.find('def _classify_v11_cas_pipeline')
     block = src[pipeline_idx:pipeline_idx + 15000]
@@ -684,7 +685,7 @@ def test_v11_cas_pipeline_validates_matched_before_classify():
 
 def test_cas_merge_default_off():
     """v13 Phase 2A: AEROTAX_CAS_MERGE Default ist '0' (per-file parallel)."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     # Default in _sonnet_read_cas_structured
     assert "os.environ.get('AEROTAX_CAS_MERGE', '0')" in src
     # Begründung im Kommentar
@@ -696,7 +697,7 @@ def test_cas_merge_default_off():
 def test_cas_slim_schema_no_duration_minutes():
     """v13 Phase 2B: duration_minutes ist NICHT mehr im Sonnet-Schema
     (wird deterministisch aus start/end in _validate_cas_day berechnet)."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     block = src[fn_idx:fn_idx + 5000]
     # Im Tool-Schema KEIN duration_minutes mehr
@@ -707,7 +708,7 @@ def test_cas_slim_schema_no_duration_minutes():
 
 def test_cas_slim_schema_no_month_covered():
     """month_covered nicht mehr im Schema — aus dates ableitbar."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     block = src[fn_idx:fn_idx + 5000]
     schema_block = block[block.find("cas_tool = {"):block.find("LIEFERE via Tool")]
@@ -716,7 +717,7 @@ def test_cas_slim_schema_no_month_covered():
 
 def test_cas_slim_schema_flights_as_strings():
     """flights[] sind jetzt Strings (Flugnummer), nicht mehr Objects."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     block = src[fn_idx:fn_idx + 5000]
     schema_block = block[block.find("'flights':"):block.find("'overnight_after_day':", block.find("'flights':"))]
@@ -729,7 +730,7 @@ def test_cas_slim_schema_flights_as_strings():
 
 def test_cas_slim_raw_excerpt_conditional():
     """raw_excerpt nur bei confidence!=high oder unklarem Marker — slim prompt sagt das."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     block = src[fn_idx:fn_idx + 8000]
     # Prompt enthält die Regel
@@ -739,7 +740,7 @@ def test_cas_slim_raw_excerpt_conditional():
 
 def test_cas_slim_prompt_no_notes_no_explanations():
     """Slim-Prompt verbietet explizit Notes/Erklärungen/Kommentare."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     block = src[fn_idx:fn_idx + 8000]
     # KEINE Notes, KEINE Erklärungen, KEINE Kommentare
@@ -749,7 +750,7 @@ def test_cas_slim_prompt_no_notes_no_explanations():
 
 def test_cas_slim_prompt_preserves_marker_codes():
     """Marker X / OFF / == / ORTSTAG / RES bleiben explizit im Prompt erwähnt."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     block = src[fn_idx:fn_idx + 8000]
     for code in ('OFF', 'X', '==', 'ORTSTAG', 'RES'):
@@ -758,7 +759,7 @@ def test_cas_slim_prompt_preserves_marker_codes():
 
 def test_cas_slim_prompt_forbids_tax_calculations():
     """Prompt sagt explizit: KEINE Steuerbewertung, kein Z72/Z73/Z76, kein VMA."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     fn_idx = src.find('def _sonnet_read_cas_single_pdf')
     block = src[fn_idx:fn_idx + 8000]
     assert 'KEINE Steuerbewertung' in block
@@ -839,13 +840,13 @@ def test_validate_cas_day_caps_raw_excerpt_120():
 
 def test_snapshot_after_lsb_exists():
     """after_lsb Snapshot wird nach Reader-Stage gespeichert."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "_save_pipeline_snapshot(job_id, 'after_lsb'" in src
 
 
 def test_snapshot_after_se_exists():
     """after_se Snapshot mit se_lines_count + z77_summary."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "_save_pipeline_snapshot(job_id, 'after_se'" in src
     after_se_idx = src.find("_save_pipeline_snapshot(job_id, 'after_se'")
     block = src[after_se_idx:after_se_idx + 600]
@@ -855,7 +856,7 @@ def test_snapshot_after_se_exists():
 
 def test_snapshot_after_each_cas_file_exists():
     """Pro CAS-Datei ein Snapshot mit non_dict_indices + type_distribution."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "after_cas_file_" in src
     # Pro-File-Snapshot enthält wichtige Felder
     snap_idx = src.find("f'after_cas_file_")
@@ -867,14 +868,14 @@ def test_snapshot_after_each_cas_file_exists():
 
 def test_snapshot_cas_file_failed_separate():
     """Bei CAS-File-Fail wird separater Snapshot 'cas_file_NN_FAILED' gespeichert."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "_FAILED" in src
     assert "cas_file_" in src
 
 
 def test_snapshot_after_cas_merge_exists():
     """after_cas_merge Snapshot mit type_distribution + non_dict_indices."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "_save_pipeline_snapshot(job_id, 'after_cas_merge'" in src
     idx = src.find("_save_pipeline_snapshot(job_id, 'after_cas_merge'")
     block = src[idx:idx + 1000]
@@ -884,7 +885,7 @@ def test_snapshot_after_cas_merge_exists():
 
 def test_snapshot_after_match_cas_se_exists():
     """after_match_cas_se Snapshot mit matched_count + type_distribution."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "_save_pipeline_snapshot(job_id, 'after_match_cas_se'" in src
     idx = src.find("_save_pipeline_snapshot(job_id, 'after_match_cas_se'")
     block = src[idx:idx + 1000]
@@ -894,7 +895,7 @@ def test_snapshot_after_match_cas_se_exists():
 
 def test_snapshot_post_classify_v7_exists():
     """post_classify_v7 Snapshot mit Counter-Übersicht."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "_save_pipeline_snapshot(job_id, 'post_classify_v7'" in src
     idx = src.find("_save_pipeline_snapshot(job_id, 'post_classify_v7'")
     block = src[idx:idx + 1500]
@@ -905,7 +906,7 @@ def test_snapshot_post_classify_v7_exists():
 
 def test_snapshot_followme_align_success_exists():
     """followme_align_success Snapshot nach erfolgreichem Align."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "_save_pipeline_snapshot(job_id, 'followme_align_success'" in src
 
 
@@ -983,12 +984,12 @@ def test_invariant_no_raw_errors_in_user_messages():
 
 # ─── Phase B: Frontend API_BASE_URL konfigurierbar ────────────────────────────
 
-_FRONTEND_PATH = '/Users/miguelschumann/Desktop/site/index.html'
+_FRONTEND_PATH = _cft.SITE_INDEX_HTML
 
 
 def test_frontend_has_central_api_config():
     """index.html hat einen zentralen API-Config-Block (Cloud Run only)."""
-    src = open(_FRONTEND_PATH).read()
+    src = open(_cft.site_index_html()).read()
     assert 'API-Base-URL-Konfiguration' in src or '_initApiBaseUrl' in src
     assert '_initApiBaseUrl' in src
     assert 'window._API' in src
@@ -997,7 +998,7 @@ def test_frontend_has_central_api_config():
 
 def test_frontend_no_render_url_present():
     """Render wurde 2026-05-21 entfernt — keine onrender.com URL mehr im Frontend."""
-    src = open(_FRONTEND_PATH).read()
+    src = open(_cft.site_index_html()).read()
     assert src.count('https://aerotax-backend.onrender.com') == 0, \
         f'Erwarte 0 onrender.com URLs (Render entfernt), gefunden: {src.count("https://aerotax-backend.onrender.com")}'
     assert 'RENDER_FALLBACK' not in src, 'RENDER_FALLBACK-Konstante wurde 2026-05-21 entfernt'
@@ -1005,7 +1006,7 @@ def test_frontend_no_render_url_present():
 
 def test_frontend_supports_query_param_override():
     """?api=... Query-Param kann window._API überschreiben (für QA/Staging)."""
-    src = open(_FRONTEND_PATH).read()
+    src = open(_cft.site_index_html()).read()
     block_idx = src.find('_initApiBaseUrl')
     block = src[block_idx:block_idx + 3000]
     assert "p.get('api')" in block or 'p.get("api")' in block
@@ -1015,7 +1016,7 @@ def test_frontend_supports_query_param_override():
 
 def test_frontend_supports_localstorage_override():
     """localStorage.aerotax_api kann window._API überschreiben (für Dev)."""
-    src = open(_FRONTEND_PATH).read()
+    src = open(_cft.site_index_html()).read()
     block_idx = src.find('_initApiBaseUrl')
     block = src[block_idx:block_idx + 3000]
     assert "'aerotax_api'" in block or '"aerotax_api"' in block
@@ -1023,7 +1024,7 @@ def test_frontend_supports_localstorage_override():
 
 def test_frontend_hostname_routing_present():
     """Hostname-basiertes Routing: localhost → LOCAL_DEV, aerosteuer → DEFAULT_PRIMARY."""
-    src = open(_FRONTEND_PATH).read()
+    src = open(_cft.site_index_html()).read()
     block_idx = src.find('_initApiBaseUrl')
     block = src[block_idx:block_idx + 3000]
     assert 'localhost' in block
@@ -1034,7 +1035,7 @@ def test_frontend_hostname_routing_present():
 def test_frontend_api_config_exposes_active_url():
     """window._API_CONFIG.active / is_cloud_run — UI kann anzeigen welcher Backend aktiv ist.
     is_render-Flag wurde 2026-05-21 entfernt (Render → Cloud Run Migration final)."""
-    src = open(_FRONTEND_PATH).read()
+    src = open(_cft.site_index_html()).read()
     block_idx = src.find('_initApiBaseUrl')
     block = src[block_idx:block_idx + 3000]
     assert "'active'" in block or 'active:' in block
@@ -1043,7 +1044,7 @@ def test_frontend_api_config_exposes_active_url():
 
 # ─── Phase B: Dockerfile Cloud-Run-tauglich ──────────────────────────────────
 
-_DOCKERFILE = '/Users/miguelschumann/Desktop/aerotax-backend/Dockerfile'
+_DOCKERFILE = _cft.backend_path('Dockerfile')
 
 
 def test_dockerfile_uses_gunicorn_not_flask_dev_server():
@@ -1091,14 +1092,14 @@ def test_dockerfile_libheif_for_pillow_heif():
 
 def test_dockerignore_excludes_local_state():
     """jobs/, sessions/, pdfs/ nicht ins Image (Supabase ist primary)."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/.dockerignore').read()
+    src = open(_cft.backend_path('.dockerignore')).read()
     for p in ('jobs/', 'sessions/', 'pdfs/', '_job_chunks_state/'):
         assert p in src, f'{p} muss in .dockerignore sein'
 
 
 # ─── v12 Speed-1: Parallel Reader Stage ──────────────────────────────────────
 
-_APP_PY = '/Users/miguelschumann/Desktop/aerotax-backend/app.py'
+_APP_PY = _cft.backend_path('app.py')
 
 
 def test_hybrid_analyze_has_parallel_reader_stage():

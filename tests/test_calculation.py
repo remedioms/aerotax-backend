@@ -5,6 +5,7 @@ Lokal ausführen:
     cd ~/Desktop/aerotax-backend && python3 -m pytest tests/ -v
 """
 import os
+import conftest as _cft
 import sys
 
 import pytest
@@ -5353,7 +5354,7 @@ def test_v823_marker_learning_no_future_promise_in_response():
     from app import _record_marker_learning
     import os
     bk = None
-    p = '/Users/miguelschumann/Desktop/aerotax-backend/marker_lexicon.json'
+    p = _cft.backend_path('marker_lexicon.json')
     if os.path.exists(p):
         with open(p) as f: bk = f.read()
         os.remove(p)
@@ -5628,7 +5629,7 @@ def test_v825_chat_response_includes_remaining_and_cap():
 def test_v825_chat_drawer_has_glassmorphism_styles():
     """Chat-Drawer hat backdrop-filter UND rgba-alpha-Background (kein solid #111)."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('function buildChatOverlay')
     assert fn_idx > 0
@@ -5652,7 +5653,7 @@ def test_v825_chat_drawer_has_glassmorphism_styles():
 def test_v825_chat_footer_has_upload_button():
     """Chat-Footer enthält Upload-Button neben Textarea + Send."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'id="chat-upload-btn"' in src, 'Upload-Button im Footer fehlt'
     assert 'id="chat-input"' in src
@@ -5666,7 +5667,7 @@ def test_v825_chat_footer_has_upload_button():
 def test_v825_chat_input_min_height_and_padding():
     """Textarea hat min-height passend zu Send/Plus-Button-Höhe und kein Text-Clipping."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     m = re.search(r'<textarea id="chat-input"[^>]*>', src)
     assert m is not None
@@ -5680,7 +5681,7 @@ def test_v825_chat_input_min_height_and_padding():
 def test_v825_chat_counter_not_prominent_visible_default():
     """Chat-Counter ist standardmäßig display:none — nur sichtbar wenn ≤5 übrig."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     m = re.search(r'id="chat-counter"[^>]*>', src)
     assert m is not None
@@ -5700,7 +5701,7 @@ def test_v825_chat_greeting_never_empty():
     state-aware Greetings für failed_*/expired/processing/done.
     """
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     greetings = [
         'Hallo 👋\\n\\nDeine Auswertung ist fertig',  # done
@@ -5723,7 +5724,7 @@ def test_v825_quick_chips_function_present():
     Code-Pfad bestehen (eventuell future re-enable).
     """
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'function renderQuickChips' in src
     # Chip-Labels noch im Code (chipClick-Handler nutzt sie via intent)
@@ -5736,7 +5737,7 @@ def test_v825_quick_chips_function_present():
 def test_v825_chip_intent_handler_routes_locally():
     """Chip-Click ruft lokal Funktionen — keine Sonnet-Calls für Standard-Intents."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'window._chatChipClick' in src
     # WISO-Antwort lokal generiert (kein /api/chat-Call drinhin)
@@ -5751,7 +5752,7 @@ def test_v825_chip_intent_handler_routes_locally():
 def test_v825_freitext_review_parser_present():
     """Freitext-Parser für 'ja'/'nein'/'8 bis 18' im Chat-Send."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert '_parseReviewIntent' in src
     assert '_hasActiveReviewQuestion' in src
@@ -5762,7 +5763,7 @@ def test_v825_freitext_review_parser_present():
 def test_v825_no_review_cards_on_main_page():
     """Hauptseite zeigt KEINE 22 Review-Karten — Review läuft im Chat."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # review-section-wrap muss display:none default haben
     import re
@@ -5776,7 +5777,7 @@ def test_v825_no_review_cards_on_main_page():
 def test_v825_data_global_set_on_render():
     """render(d) setzt _data + window._data global — auch bei Recall."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Defensive _data-Sync am Anfang von render()
     assert "_data = d; window._data = d" in src or "window._data = d" in src
@@ -5785,7 +5786,7 @@ def test_v825_data_global_set_on_render():
 def test_v825_recall_sets_job_id_for_chat():
     """Recall-Flow setzt window._lastJobId, damit Review-Flow im Chat funktioniert."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'window._lastJobId = j.job_id' in src, \
         'Recall muss _lastJobId setzen für Review-Endpoint im Chat'
@@ -5794,7 +5795,7 @@ def test_v825_recall_sets_job_id_for_chat():
 def test_v825_header_amount_no_dash_fallback():
     """Header-Amount darf nicht '—' anzeigen wenn Daten verfügbar — 'wird geladen…' als Fallback."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Funktionsblock zwischen 'updateChatHeaderAmount = function' und nächstem 'function renderQuickChips'
     fn_start = src.find('updateChatHeaderAmount = function')
@@ -6051,7 +6052,7 @@ def test_v826_bulk_endpoint_requires_confirmation_id():
 def test_v826_chat_modal_centered_desktop():
     """Desktop-Chat ist centered modal (nicht mehr right-Drawer mit 480px)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Suche das Drawer-Style-Pattern für Desktop
     assert 'isDesktop' in src
@@ -6066,7 +6067,7 @@ def test_v826_chat_modal_centered_desktop():
 def test_v826_chat_no_giant_body_cta_buttons():
     """Keine großen isolierten 'Offene Angaben'/'+ Datei hochladen'-Buttons im Body."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Im Chat-Body-Bereich gibt es keinen großen CTA-Button "+ Datei hochladen"
     # (nur Footer-Paperclip + Chip „Dokumente")
@@ -6079,7 +6080,7 @@ def test_v826_chat_no_giant_body_cta_buttons():
 def test_v826_chat_premium_glass_multi_layer_gradient():
     """Drawer-Glass nutzt mehrlagigen gradient für echte Tiefe."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # mehrlagig: zwei linear-gradient + backdrop-filter
     import re
@@ -6091,7 +6092,7 @@ def test_v826_chat_premium_glass_multi_layer_gradient():
 def test_v826_no_promo_marketing_phrases_in_chat():
     """Chat enthält KEINE Marketing-Floskeln (Mehr absetzen, AeroTAX kennt deine Zahlen, ...)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     forbidden = ['Mehr absetzen', 'AeroTAX kennt deine Zahlen',
                  'garantiert korrekt', 'Steuerberater-sicher']
@@ -6105,7 +6106,7 @@ def test_v827_chat_opens_with_display_flex_for_centering():
     """v9.4: Inline-Mode setzt 'block' (Container fließt im Layout),
     Modal-Mode setzt 'flex' (zentriert via align-items:center)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Beide Modi müssen vertreten sein
     assert "ov.style.display = 'flex'" in src, 'Modal-Mode-Display fehlt'
@@ -6117,7 +6118,7 @@ def test_v827_chat_opens_with_display_flex_for_centering():
 def test_v827_modal_background_neutral_not_blue():
     """v8.27: Modal-Background hat keinen blauen Tint (rgba(30,45,90,...) entfernt)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Der explizite Blau-Gradient von v8.26 ist weg
     assert 'rgba(30,45,90' not in src, 'Modal darf keinen blauen Tint mehr haben'
@@ -6128,7 +6129,7 @@ def test_v827_modal_background_neutral_not_blue():
 def test_v827_plus_btn_opens_attach_menu_not_chat_msg():
     """+ Button öffnet Attach-Popover statt Chat-Message zu schreiben."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # +-Button onclick ruft _chatToggleAttachMenu (nicht _chatToggleUploadMenu)
     assert 'onclick="window._chatToggleAttachMenu' in src
@@ -6141,7 +6142,7 @@ def test_v827_plus_btn_opens_attach_menu_not_chat_msg():
 def test_v827_attach_menu_has_doc_type_pills():
     """v11: Attach-Popover bietet Doc-Type-Auswahl (CAS/LSB/SE/Other) — FU entfernt."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatToggleAttachMenu = function')
     assert fn_idx > 0
@@ -6156,7 +6157,7 @@ def test_v827_attach_menu_has_doc_type_pills():
 def test_v827_attach_file_creates_pill_in_footer():
     """_chatAttachFile zeigt Attachment-Pill im Footer (nicht direkt Upload)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'function _chatAttachFile' in src
     # Pill wird im chat-attachments slot angelegt
@@ -6166,7 +6167,7 @@ def test_v827_attach_file_creates_pill_in_footer():
 def test_v827_send_uploads_attached_file():
     """_chatSend uploadet attached file via roster-screenshot oder upload-replacement."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
     assert fn_idx > 0
@@ -6183,7 +6184,7 @@ def test_v827_greeting_no_count_demotivator():
     war: 'Chat sagte alles ist richtig, aber 2 Fehler unten' → Lösung: ehrlich Count nennen.
     """
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window.startReviewFlowInChat')
     assert fn_idx > 0, 'startReviewFlowInChat muss existieren'
@@ -6205,7 +6206,7 @@ def test_v827_greeting_no_count_demotivator():
 def test_v827_local_grouping_fallback_exists():
     """Frontend hat lokales Grouping als Fallback wenn /review-groups nicht erreichbar."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'window._localGroupReviewItems' in src
     assert 'familyOf' in src and 'fmtRange' in src
@@ -6225,7 +6226,7 @@ def test_v827_upload_replacement_accepts_other_doc_type():
 def test_v827_input_row_align_items_flex_end():
     """Input-Row align-items:flex-end damit textarea bei Wachstum nach unten ankert."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('id="chat-input-row"')
     assert fn_idx > 0
@@ -6237,7 +6238,7 @@ def test_v827_input_row_align_items_flex_end():
 def test_v827_send_button_height_matches_input_height():
     """Send-Button + Plus-Button haben gleiche Höhe wie Textarea-min-height (44px)."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Send-Button height:44px
     send_match = re.search(r'id="chat-send"[^>]*style="([^"]*)"', src)
@@ -6259,7 +6260,7 @@ def test_v828_BUG_glass_alpha_must_be_low_for_translucency():
     """v9.5: Inline-Mode = matched-Style mit anderen Cards (rgba(255,255,255,0.04)).
     Modal-Mode glassBg-Gradient max ~0.32 Alpha (nicht der dunkle Backdrop dahinter)."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('function buildChatOverlay')
     block = src[fn_idx:fn_idx+10000]
@@ -6279,7 +6280,7 @@ def test_v828_BUG_no_22_offen_pill_visible_by_default():
     """BUG 2: Header-Pill „22 offen" demotiviert — soll standardmäßig versteckt
     bleiben oder sehr dezent (kleine Text-Andeutung statt gelbe Pille)."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # In updateChatHeaderAmount: pill darf NICHT mit display:inline-block bei pending>0 erscheinen
     fn_idx = src.find('window.updateChatHeaderAmount = function')
@@ -6297,7 +6298,7 @@ def test_v828_BUG_chat_send_not_hijacked_by_review_mode():
     """BUG 3 (P0): Freitext „Hallo wie gehts?" muss zu /api/chat gehen, nicht zu
     /review-interpret. Aktuell: _chatReviewMode=true hijackt jede Message."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
     block = src[fn_idx:fn_idx+20000]
@@ -6310,7 +6311,7 @@ def test_v828_BUG_file_input_not_cleared_before_upload():
     """BUG 4 (P0): fileInput.value='' vor Upload kann File auf manchen Browsern
     invalidieren. Reset darf nur NACH erfolgreichem Upload oder bei Pill-Remove."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Suche das change-Handler-Block
     handler_start = src.find("fileInput.addEventListener('change'")
@@ -6330,7 +6331,7 @@ def test_v828_BUG_input_row_align_items_center_for_equal_heights():
     """BUG 5: Bei drei Elementen mit gleicher Höhe (44px) ist align-items:center
     semantisch korrekter als flex-end (vermeidet Sub-Pixel-Versatz)."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     m = re.search(r'id="chat-input-row"[^>]*style="([^"]*)"', src)
     assert m is not None
@@ -6347,7 +6348,7 @@ def test_v828_BUG_input_row_align_items_center_for_equal_heights():
 def test_v829_fetchWithTimeout_helper_exists():
     """_fetchWithTimeout helper muss in chat-IIFE existieren."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'function _fetchWithTimeout' in src
     assert 'AbortController' in src
@@ -6357,7 +6358,7 @@ def test_v829_fetchWithTimeout_helper_exists():
 def test_v829_chat_send_uses_fetch_with_timeout():
     """/api/chat call uses _fetchWithTimeout statt naked fetch."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
     block = src[fn_idx:fn_idx+25000]
@@ -6373,7 +6374,7 @@ def test_v829_upload_replacement_uses_fetch_with_timeout():
     """Im neuen Chat-Footer-Upload (_chatSend Attachment-Branch) muss
     _fetchWithTimeout genutzt werden — verhindert unendlich ladende Loader."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Suche im _chatSend-Block (nicht in legacy uploads außerhalb)
     fn_idx = src.find('window._chatSend = async function')
@@ -6391,7 +6392,7 @@ def test_v829_no_session_shows_visible_warning():
     ist in _chatSendImpl.
     """
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _chatSendImpl')
     assert fn_idx > 0
@@ -6408,7 +6409,7 @@ def test_v829_chat_error_messages_are_assistant_bubbles_not_system():
     """Errors aus /api/chat sollen als assistant-bubbles erscheinen (sichtbar),
     nicht als system-bubbles (11px gray, einfach übersehen)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
     block = src[fn_idx:fn_idx+25000]
@@ -6421,7 +6422,7 @@ def test_v829_chat_error_messages_are_assistant_bubbles_not_system():
 def test_v829_review_interpret_uses_timeout():
     """/review-interpret call uses Timeout."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     idx = src.find("/review-interpret'")
     assert idx > 0
@@ -6432,7 +6433,7 @@ def test_v829_review_interpret_uses_timeout():
 def test_v829_review_answer_bulk_uses_timeout():
     """/review-answer-bulk call uses Timeout."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     idx = src.find("/review-answer-bulk'")
     assert idx > 0
@@ -6443,7 +6444,7 @@ def test_v829_review_answer_bulk_uses_timeout():
 def test_v829_abort_error_message_human_readable():
     """AbortError (Timeout) bekommt verständliche User-Message."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'AbortError' in src
     assert 'Server hat zu lange gebraucht' in src or 'Timeout' in src
@@ -6454,7 +6455,7 @@ def test_v829_abort_error_message_human_readable():
 def test_v830_chat_send_has_outer_try_catch_wrapper():
     """_chatSend ist defensiv mit try/catch gewrappt — silent failures unmöglich."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
     block = src[fn_idx:fn_idx+1500]
@@ -6466,7 +6467,7 @@ def test_v830_chat_send_has_outer_try_catch_wrapper():
 def test_v830_chat_send_impl_function_exists():
     """_chatSendImpl ist als separate Funktion implementiert, kann gewrappt werden."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'async function _chatSendImpl(' in src
 
@@ -6474,7 +6475,7 @@ def test_v830_chat_send_impl_function_exists():
 def test_v830_chat_open_resets_state():
     """_chatOpen resettet review-mode/pending-proposal/attached-file von voriger Session."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatOpen = async function')
     block = src[fn_idx:fn_idx+2500]
@@ -6486,7 +6487,7 @@ def test_v830_chat_open_resets_state():
 def test_v830_review_groups_uses_timeout():
     """/review-groups call uses timeout — sonst hängt der Greeting-Flow."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     idx = src.find("/review-groups',")
     if idx < 0:
@@ -6499,7 +6500,7 @@ def test_v830_review_groups_uses_timeout():
 def test_v830_input_field_missing_shows_warning():
     """Wenn chat-input nicht im DOM, zeigt _chatSend sichtbare Warnung statt silent return."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _chatSendImpl')
     block = src[fn_idx:fn_idx+600]
@@ -6632,7 +6633,7 @@ def test_v833_frontend_chat_send_passes_kind():
     Plus pre-filter für PDF-Keywords (#21). Window 28000 für ausreichend.
     """
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Suche im _chatSendImpl (das ist wo /api/chat called wird)
     fn_idx = src.find('async function _chatSendImpl')
@@ -6652,7 +6653,7 @@ def test_v833_frontend_short_msgs_allowed_in_review():
     """v9.8.1: Frontend hat KEIN „Magst du ausführlicher fragen?"-Wording mehr.
     Stattdessen: „Schreib mir gern in einem Satz mehr"."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # User-facing renderMsg darf das alte Wording nicht enthalten
     import re
@@ -6702,8 +6703,8 @@ def test_v834_forbidden_phrases_not_in_codebase():
         'AeroTAX kennt deine Zahlen',
     ]
     files = [
-        '/Users/miguelschumann/Desktop/aerotax-backend/app.py',
-        '/Users/miguelschumann/Desktop/site/index.html',
+        _cft.backend_path('app.py'),
+        _cft.site_index_html(),
     ]
     whitelist_markers = [
         'VERBOTEN', 'verboten:', 'Verbotene Wörter', 'forbidden', 'Forbidden',
@@ -6745,7 +6746,7 @@ def test_v834_apply_pending_proposal_clears_state_after_apply():
     """Nach _applyPendingProposal wird _chatPendingProposal genullt
     (verhindert Doppel-Apply)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _applyPendingProposal')
     block = src[fn_idx:fn_idx+800]
@@ -6845,7 +6846,7 @@ def test_v835_parser_rest_0h():
 def test_v835_frontend_confirm_synonyms_apply_pending():
     """„richtig"/„passt"/„stimmt"/„genau"/„korrekt" → Apply Pending."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
     block = src[fn_idx:fn_idx+20000]
@@ -6860,7 +6861,7 @@ def test_v835_frontend_confirm_synonyms_apply_pending():
 def test_v835_frontend_cancel_synonyms_clear_pending():
     """„war ausversehen"/„stop"/„abbrechen"/„nochmal" → Cancel Pending."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatSend = async function')
     block = src[fn_idx:fn_idx+20000]
@@ -6874,7 +6875,7 @@ def test_v835_frontend_cancel_synonyms_clear_pending():
 def test_v835_frontend_looks_like_review_matches_beim_rest_0():
     """Frontend _looksLikeReviewAnswer matched „beim rest 0" + „alle 0h"."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('function _looksLikeReviewAnswer')
     block = src[fn_idx:fn_idx+2500]
@@ -6889,7 +6890,7 @@ def test_v835_frontend_looks_like_review_matches_beim_rest_0():
 def test_v836_chat_conv_state_object_initialized_on_open():
     """_chatOpen initialisiert window._chatConv mit appliedItems/applyHistory/lastBotQuestion."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatOpen = async function')
     block = src[fn_idx:fn_idx+3500]
@@ -6902,7 +6903,7 @@ def test_v836_chat_conv_state_object_initialized_on_open():
 def test_v836_apply_pending_tracks_in_chat_conv():
     """Nach Apply werden applied review_item_ids in window._chatConv.appliedItems gespeichert."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _applyPendingProposal')
     block = src[fn_idx:fn_idx+3500]
@@ -6914,7 +6915,7 @@ def test_v836_apply_pending_tracks_in_chat_conv():
 def test_v836_idempotency_check_prevents_double_apply():
     """Wenn proposed_changes alle schon in appliedItems sind, freundliche Hinweismeldung."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _applyPendingProposal')
     block = src[fn_idx:fn_idx+1500]
@@ -6925,7 +6926,7 @@ def test_v836_idempotency_check_prevents_double_apply():
 def test_v836_header_has_progress_pill():
     """Header hat progress-pill DOM-Element."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'id="chat-header-progress-pill"' in src
 
@@ -6934,7 +6935,7 @@ def test_v836_update_chat_header_progress_function_exists():
     """v9.5: updateChatHeaderProgress existiert noch, ist jetzt aber no-op
     (Pill versteckt — Chat-Body sagt den Stand). Funktion bleibt für Aufruf-Sites."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'window.updateChatHeaderProgress = function' in src
 
@@ -6942,7 +6943,7 @@ def test_v836_update_chat_header_progress_function_exists():
 def test_v836_apply_renders_progress_in_acknowledgement():
     """Apply-Acknowledgement enthält progress-Hinweis (X von Y geklärt)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _applyPendingProposal')
     block = src[fn_idx:fn_idx+5000]
@@ -6953,7 +6954,7 @@ def test_v836_apply_renders_progress_in_acknowledgement():
 def test_v836_progress_pill_called_after_apply():
     """Nach Apply wird updateChatHeaderProgress aufgerufen."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _applyPendingProposal')
     # 2026-05-20: Window 5000→8000 nach Chat-State-Contract-Fix
@@ -7027,7 +7028,7 @@ def test_v838_parser_alle_ja_ausser_datum():
 def test_v838_floating_badge_hidden_on_main():
     """Floating Chat-Badge auf Hauptseite ist hidden (User-Feedback '22 raus')."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     m = re.search(r'id="floating-chat-badge"[^>]*style="([^"]*)"', src)
     assert m is not None
@@ -7066,7 +7067,7 @@ def test_v840_health_endpoint_returns_ok():
 def test_v840_friendly_error_helper_exists():
     """_renderFriendlyChatError ist im Code definiert + auf window exposed."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'function _renderFriendlyChatError(' in src
     assert 'window._renderFriendlyChatError = _renderFriendlyChatError' in src
@@ -7078,7 +7079,7 @@ def test_v840_no_raw_load_failed_in_user_facing_strings():
     """User-facing renderMsg/Bubble-Texte enthalten kein rohes „Load failed" /
     „TypeError" / „Failed to fetch" / „NetworkError"."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Suche renderMsg-Aufrufe die rohe Fehler-Strings enthalten
     forbidden_in_user = ['Load failed', 'Failed to fetch', 'TypeError', 'NetworkError']
@@ -7098,7 +7099,7 @@ def test_v840_no_raw_load_failed_in_user_facing_strings():
 def test_v840_friendly_error_classified_into_categories():
     """_classifyFetchError unterscheidet network / timeout / server / 404 / auth."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('function _classifyFetchError(')
     block = src[fn_idx:fn_idx+1500]
@@ -7111,7 +7112,7 @@ def test_v840_friendly_error_has_retry_button():
     """Friendly-Error-Card bietet „Erneut versuchen". „Seite neu laden" optional
     via opts.showReload (Default off — würde Chat-Kontext zerstören)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('function _renderFriendlyChatError(')
     block = src[fn_idx:fn_idx+3500]
@@ -7123,7 +7124,7 @@ def test_v840_friendly_error_has_retry_button():
 def test_v840_chat_send_uses_friendly_error_in_catch():
     """_chatSend / _chatSendImpl /api/chat-Catch nutzt _renderFriendlyChatError."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _chatSendImpl(')
     block = src[fn_idx:fn_idx+18000]
@@ -7135,7 +7136,7 @@ def test_v840_chat_send_uses_friendly_error_in_catch():
 def test_v840_handle_review_free_text_uses_friendly_error():
     """_handleReviewFreeText catch-Block nutzt friendly Helper."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _handleReviewFreeText(')
     block = src[fn_idx:fn_idx+3500]
@@ -7145,7 +7146,7 @@ def test_v840_handle_review_free_text_uses_friendly_error():
 def test_v840_apply_pending_proposal_uses_friendly_error():
     """_applyPendingProposal catch-Block nutzt friendly Helper."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _applyPendingProposal(')
     block = src[fn_idx:fn_idx+9000]
@@ -7155,7 +7156,7 @@ def test_v840_apply_pending_proposal_uses_friendly_error():
 def test_v840_stale_chat_history_filtered_on_load():
     """Beim chat-history-Load werden alte Error-Bubbles gefiltert (Stale-Patterns)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'STALE_PATTERNS' in src
     # Wichtige Patterns
@@ -7166,7 +7167,7 @@ def test_v840_stale_chat_history_filtered_on_load():
 def test_v840_fetch_with_timeout_has_retry():
     """_fetchWithTimeout retried 1x bei Network-Errors."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _fetchWithTimeout(')
     block = src[fn_idx:fn_idx+1800]
@@ -7230,7 +7231,7 @@ def test_v90_parser_kein_split_wenn_keine_keywords():
 def test_v90_localstorage_persistenz_helper_exists():
     """window._persistChatConv exists + speichert in localStorage."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'window._persistChatConv = function' in src
     assert "localStorage.setItem(key, JSON.stringify" in src
@@ -7240,7 +7241,7 @@ def test_v90_localstorage_persistenz_helper_exists():
 def test_v90_localstorage_24h_expiry():
     """Beim Reload nur akzeptieren wenn _savedAt < 24h."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert "Date.now() - parsed._savedAt) < 24*3600*1000" in src
 
@@ -7248,7 +7249,7 @@ def test_v90_localstorage_24h_expiry():
 def test_v90_apply_persists_state():
     """Nach Apply wird _persistChatConv() aufgerufen."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _applyPendingProposal')
     block = src[fn_idx:fn_idx+5000]
@@ -7378,7 +7379,7 @@ def test_v91_system_prompt_has_marker_glossary():
 def test_v91_frontend_uses_ai_chat_endpoint():
     """_handleReviewFreeText ruft /ai-chat statt /review-interpret."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _handleReviewFreeText(txt)')
     block = src[fn_idx:fn_idx+5000]
@@ -7390,7 +7391,7 @@ def test_v91_frontend_uses_ai_chat_endpoint():
 def test_v91_frontend_renders_message_to_user():
     """Frontend zeigt message_to_user aus AI-Response."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _handleReviewFreeText(txt)')
     block = src[fn_idx:fn_idx+5000]
@@ -7400,7 +7401,7 @@ def test_v91_frontend_renders_message_to_user():
 def test_v91_no_freitext_interpretation_nicht_verfügbar():
     """User darf NIE „Freitext-Interpretation ist gerade nicht verfügbar" sehen."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'Freitext-Interpretation ist gerade nicht verfügbar' not in src
 
@@ -7485,7 +7486,7 @@ def test_v92_audit_ai_system_prompt_multi_turn_rule():
 def test_v92_audit_friendly_job_not_found_in_frontend():
     """AUDIT B: Frontend mappt „job not found" auf freundliche User-Message."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # Globale Suche — Pattern + Friendly-Text müssen irgendwo im Frontend sein
     assert '/job\\s*not\\s*found/i' in src, 'Frontend muss „job not found" detecten'
@@ -7497,7 +7498,7 @@ def test_v92_audit_pdf_cta_bubble_after_review_complete():
     v10: Inline-CTA-Builder wurde durch unified `_refreshPdfBubble()` ersetzt —
     Button-Text ist jetzt „PDF herunterladen" (statt „Finales PDF erstellen")."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'chat-pdf-cta' in src
     # v10: Unified PDF-Bubble verwendet „PDF herunterladen" / „PDF bereit" Wording
@@ -7515,7 +7516,7 @@ def test_v92_audit_header_pill_says_offen_not_geklaert():
     """v9.5: Header-Pill ist jetzt no-op (Chat-Body sagt den Stand).
     Hauptregel: kein „X von Y geklärt"-Wording mehr."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window.updateChatHeaderProgress = function')
     block = src[fn_idx:fn_idx+2000]
@@ -7546,7 +7547,7 @@ def test_v92_audit_multi_cas_works_via_status_filter():
 def test_v93_chat_auto_opens_on_pending_reviews():
     """v9.5: Chat öffnet sich IMMER auto (auch ohne pending → mit PDF-CTA)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert '_chatAutoOpenedThisRender' in src
     assert "!window._chatAutoOpenedThisRender" in src
@@ -7558,7 +7559,7 @@ def test_v93_user_close_disables_auto_reopen():
     """v9.5: _chatClose existiert + setzt _chatUserClosedManually=true (Legacy-Modal-Mode).
     Inline-Mode hat aber keinen Close-Button — Chat ist permanent."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatClose = function')
     block = src[fn_idx:fn_idx+500]
@@ -7575,7 +7576,7 @@ def test_v93_user_close_disables_auto_reopen():
 def test_v94_inline_chat_host_in_dom():
     """chat-inline-host existiert in result-page DOM zwischen Hero und Berechnung."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'id="chat-inline-host"' in src
     # Position: NACH dl-btn-row, VOR „Berechnung im Detail"
@@ -7591,7 +7592,7 @@ def test_v94_inline_chat_host_in_dom():
 def test_v94_buildChatOverlay_inline_mode_branch():
     """buildChatOverlay erkennt inline-mode wenn chat-inline-host existiert."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('function buildChatOverlay()')
     block = src[fn_idx:fn_idx+30000]  # weit genug — Funktion ist groß wegen innerHTML-Template
@@ -7605,7 +7606,7 @@ def test_v94_chat_close_hides_inline_host():
     Nur Legacy-Modal-Mode schließt. v9.4-Verhalten (hide inline-host) wurde
     explizit zurückgenommen, weil Chat „fix da sein" soll."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatClose = function')
     block = src[fn_idx:fn_idx+600]
@@ -7643,7 +7644,7 @@ def test_v96_chat_clear_resets_history_only():
 def test_v96_chat_reset_button_in_dom():
     """↻ Reset-Button im Chat-Header anstelle des X-Close-Buttons."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'id="chat-reset-btn"' in src
     assert 'window._chatReset()' in src
@@ -7654,7 +7655,7 @@ def test_v96_chat_reset_button_in_dom():
 def test_v96_chat_reset_clears_localStorage_and_state():
     """_chatReset entfernt localStorage-Eintrag + setzt window._chatConv=null."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._chatReset = async function')
     block = src[fn_idx:fn_idx+2000]
@@ -7666,7 +7667,7 @@ def test_v96_chat_reset_clears_localStorage_and_state():
 def test_v96_text_command_clear_reset_routes_to_reset():
     """„/clear" / „/reset" / „chat zurücksetzen" als Text triggert Reset."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _chatSendImpl')
     block = src[fn_idx:fn_idx+2500]
@@ -7678,7 +7679,7 @@ def test_v96_text_command_clear_reset_routes_to_reset():
 def test_v96_chat_header_amount_row_hidden():
     """Header-Amount-Row ist hidden (Hero ist Single-Source)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     import re
     m = re.search(r'id="chat-header-amount-row"[^>]*style="([^"]*)"', src)
@@ -7695,7 +7696,7 @@ def test_v96_chat_send_routes_to_ai_chat_for_free_questions():
     gerendert ohne /ai-chat-Call. Window auf 30000 erhöht.
     """
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _chatSendImpl')
     block = src[fn_idx:fn_idx+30000]
@@ -7711,7 +7712,7 @@ def test_v96_chat_send_routes_to_ai_chat_for_free_questions():
 def test_v98_local_bulk_detector_exists():
     """_detectLocalBulkIntent + _localBulkApply existieren als window-Helper."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     assert 'function _detectLocalBulkIntent(' in src
     assert 'window._localBulkApply = function' in src
@@ -7721,7 +7722,7 @@ def test_v98_local_bulk_detector_exists():
 def test_v98_chat_send_runs_local_bulk_first():
     """Im _chatSendImpl läuft Local-Bulk-Detector VOR /ai-chat."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('async function _chatSendImpl')
     block = src[fn_idx:fn_idx+25000]
@@ -7736,7 +7737,7 @@ def test_v98_chat_send_runs_local_bulk_first():
 def test_v98_local_bulk_pattern_matches_alle_ueber_8h():
     """Pattern-Test: 'alle über 8h' und Varianten matchen yes."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('function _detectLocalBulkIntent(')
     end_idx = src.find('window._detectLocalBulkIntent', fn_idx)
@@ -7756,7 +7757,7 @@ def test_v98_local_bulk_pattern_matches_alle_ueber_8h():
 def test_v98_local_bulk_pattern_matches_alle_unter_8h():
     """Pattern-Test: 'alle unter 8h' / 'alle 0' matchen no."""
     import os, re
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('function _detectLocalBulkIntent(')
     end_idx = src.find('window._detectLocalBulkIntent', fn_idx)
@@ -7784,7 +7785,7 @@ def test_v98_no_quote_back_user_input_in_fallback():
 def test_v98_frontend_fallback_no_quote_back_user_input():
     """Frontend-Fallback (legacy) zitiert User-Eingabe nicht zurück."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     forbidden = 'Ich konnte das gerade nicht zuordnen — magst du es kurz anders schreiben? z.B. „April ja, September nein" oder „alle über 8h".'
     assert forbidden not in src
@@ -7793,7 +7794,7 @@ def test_v98_frontend_fallback_no_quote_back_user_input():
 def test_v98_local_bulk_uses_pseudo_confirmation_id():
     """Local-Apply nutzt Pseudo-confirmation_id (kein Round-Trip zu Server)."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     fn_idx = src.find('window._localBulkApply = function')
     block = src[fn_idx:fn_idx+2500]
@@ -7821,7 +7822,7 @@ def test_v99_pdf_title_has_no_personal_name():
 def test_v99_no_mehr_rausholen_user_facing_in_frontend():
     """„Mehr rausholen" darf nicht user-facing in opt-plus-label vorkommen."""
     import os
-    site = os.path.expanduser('~/Desktop/site/index.html')
+    site = _cft.site_index_html()
     src = open(site).read()
     # opt-plus-label-Element
     import re
@@ -7850,8 +7851,8 @@ def test_v99_comprehensive_forbidden_audit():
         'Was bedeutet EM': 'AI-marker-question',
     }
     files = [
-        '/Users/miguelschumann/Desktop/site/index.html',
-        '/Users/miguelschumann/Desktop/aerotax-backend/app.py',
+        _cft.site_index_html(),
+        _cft.backend_path('app.py'),
     ]
     violations = []
     for fp in files:
@@ -7911,12 +7912,12 @@ def test_v99_review_messages_dont_count_against_chat_limit():
 # Targeted CAS Reader v2, PDF Long-Routing-Wrap, CAS-Source-Note, Skipped-Note)
 # ════════════════════════════════════════════════════════════════════════════
 
-_FRONTEND_HTML = '/Users/miguelschumann/Desktop/site/index.html'
+_FRONTEND_HTML = _cft.SITE_INDEX_HTML
 _APP_PY = os.path.join(os.path.dirname(__file__), '..', 'app.py')
 
 
 def _read_frontend():
-    return open(_FRONTEND_HTML).read()
+    return open(_cft.site_index_html()).read()
 
 
 def _read_backend():
@@ -8372,7 +8373,10 @@ def test_v10_pdf_cas_source_note_when_cas_overrides_present():
     src = _read_backend()
     idx = src.find('def post_finalize_pdf')
     assert idx > 0
-    block = src[idx:idx + 6000]
+    # 8000 statt 6000: die Note steht am Ende des CAS-Blocks; Kommentar-Edits
+    # weiter oben in der Funktion hatten sie knapp aus dem 6000er-Fenster
+    # geschoben (String begann bei ~5997 → 'Die' abgeschnitten).
+    block = src[idx:idx + 8000]
     assert 'user_uploaded_roster_cas_detected' in block or 'cas_used_count' in block, \
         'CAS-Quellen-Erkennung in finalize-pdf'
     assert 'Dienstplan/CAS erkannt' in block or 'Dienstplan/CAS' in block, \
@@ -8616,7 +8620,7 @@ def test_v103_supabase_migration_sql_file_exists():
 
 def test_v103_no_raw_job_not_found_user_facing():
     """„job not found" darf nicht user-facing erscheinen — nur als interne ID-Phrase."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     # Nur in Comments/Tests OK
     import re as _re
     for m in _re.finditer(r'job not found', site, _re.IGNORECASE):
@@ -8816,7 +8820,7 @@ def test_v103_z77_audit_in_se_result():
 
 def test_v103_no_user_facing_technical_z77_warning():
     """Frontend zeigt KEINE technischen Z77-Strings."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     forbidden = ['monatliche_z77', 'z77_total', 'declared_total', 'daily_lines',
                  'tool_input', 'max_tokens', 'Sonnet']
     for needle in forbidden:
@@ -9239,7 +9243,7 @@ def test_v104_chunk_sanitize_nested_dict():
 
 def test_v104_no_chunk_word_user_facing_in_frontend():
     """Frontend zeigt das Wort „chunk" nicht user-facing."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     # Erlaubt: in HTML comments, console.log, STALE_PATTERNS
     import re as _re
     for m in _re.finditer(r'\\bchunk', site, _re.IGNORECASE):
@@ -9259,7 +9263,7 @@ def test_v104_no_chunk_word_user_facing_in_frontend():
 def test_v104_no_oom_user_facing():
     """„OOM" / „out of memory" darf nicht user-facing als Text gezeigt werden.
     Erlaubt: in `.includes()` Detector-Logik die Error-Patterns klassifiziert."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     import re as _re
     for needle in ['OOM', 'out of memory', 'OutOfMemory']:
         for m in _re.finditer(_re.escape(needle), site, _re.IGNORECASE):
@@ -9619,7 +9623,7 @@ def test_v1041_existing_v103_z77_still_works():
 
 def test_v1041_no_chunk_word_user_facing_in_frontend():
     """Frontend-Wording: kein „chunk" als User-Text."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     # Phase-label aus Backend wird im Frontend gezeigt — kein „chunk" dort
     import re as _re
     # Suche nach „chunk" außerhalb von JS-Code
@@ -10405,7 +10409,7 @@ def test_v11_audit_tracks_cas_count():
 
 def test_v11_frontend_has_no_rc_dp_card():
     """v11: rc-dp Kachel ist entfernt."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     # In der req-grid Sektion zwischen <div class="req-grid"> und der nächsten </div>-Schließung
     grid_start = site.find('<div class="req-grid">')
     grid_end = site.find('<!-- Progress der Pflicht-Docs -->')
@@ -10415,7 +10419,7 @@ def test_v11_frontend_has_no_rc_dp_card():
 
 def test_v11_frontend_has_rc_cas_in_pflicht_grid():
     """v11: rc-cas Kachel ist innerhalb req-grid (3. Pflicht)."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     grid_start = site.find('<div class="req-grid">')
     grid_end = site.find('<!-- Progress der Pflicht-Docs -->')
     grid = site[grid_start:grid_end]
@@ -10426,7 +10430,7 @@ def test_v11_frontend_has_rc_cas_in_pflicht_grid():
 
 def test_v11_frontend_three_pflicht_cards():
     """Genau 3 req-card-Kacheln in req-grid: LSB + SE + CAS."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     grid_start = site.find('<div class="req-grid">')
     grid_end = site.find('<!-- Progress der Pflicht-Docs -->')
     grid = site[grid_start:grid_end]
@@ -10437,7 +10441,7 @@ def test_v11_frontend_three_pflicht_cards():
 
 def test_v11_frontend_cas_badge_not_empfohlen():
     """v11: CAS-Kachel hat KEIN 'Empfohlen'-Badge mehr (ist jetzt Pflicht)."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     # rc-cas Block
     idx = site.find('id="rc-cas"')
     block = site[idx:idx + 3000]
@@ -10450,7 +10454,7 @@ def test_v11_frontend_cas_badge_not_empfohlen():
 
 def test_v11_frontend_toS2_requires_cas_not_dp():
     """toS2() prüft CAS statt DP."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     fn_idx = site.find('window.toS2 = function')
     block = site[fn_idx:fn_idx + 1500]
     assert "_hasReqFile('cas')" in block, \
@@ -10461,7 +10465,7 @@ def test_v11_frontend_toS2_requires_cas_not_dp():
 
 def test_v11_grid_css_three_columns():
     """req-grid CSS ist wieder 3-spaltig."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     idx = site.find('.req-grid{')
     block = site[idx:idx + 200]
     assert 'repeat(3,1fr)' in block or 'repeat(3, 1fr)' in block, \
@@ -10470,7 +10474,7 @@ def test_v11_grid_css_three_columns():
 
 def test_v11_no_flugstunden_in_upload_psub():
     """Upload-Hilfetext erwähnt nicht mehr Flugstundenübersicht als Pflicht."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     idx = site.find('class="psub" style="text-align:center;">Lohnsteuerbescheinigung')
     if idx < 0:
         # Suche im weiteren Kontext
@@ -11063,7 +11067,7 @@ def test_v11p4_invalid_cas_day_returns_none():
 
 def test_v11p5_frontend_error_message_no_flugstunden():
     """Frontend-Error-Message bei fehlenden Docs nennt CAS, nicht Flugstunden."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     # Die showError-Message bei fehlenden Pflicht-Docs
     idx = site.find('Pflicht-Dokumente fehlen')
     assert idx > 0
@@ -11075,7 +11079,7 @@ def test_v11p5_frontend_error_message_no_flugstunden():
 
 def test_v11p5_progress_animation_no_flugstunden():
     """Progress-Animation-Texte (messages) nennen Dienstplan/CAS, nicht Flugstundenübersicht."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     msgs_idx = site.find('const messages=[')
     msgs_block = site[msgs_idx:msgs_idx + 5000]
     assert 'Flugstundenübersicht' not in msgs_block, \
@@ -11110,7 +11114,7 @@ def test_v11p5_progress_endpoint_no_flugstunden():
 
 def test_v11p5_datenschutz_text_mentions_cas():
     """Datenschutz-Text listet Pflicht-Dokumente inkl. CAS."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     idx = site.find('Originaldokumente (Lohnsteuer')
     if idx > 0:
         block = site[idx:idx + 600]
@@ -11185,7 +11189,7 @@ def test_v11p6_reference_tibor_baseline_constants():
 def test_v11p6_no_user_facing_flugstunden_anywhere_critical():
     """Kritische user-facing Pfade enthalten kein „Flugstundenübersicht" mehr.
     Erlaubt: in Legacy-DP-Reader-Code (intern), Comments, Test-Code, Anti-Listen."""
-    site = open(_FRONTEND_HTML).read()
+    site = open(_cft.site_index_html()).read()
     backend = _read_backend()
     # Frontend: Production-Sektionen müssen sauber sein
     site_user_sections = [
@@ -11213,7 +11217,7 @@ def test_v11p6_pipeline_branch_logs_version():
 
 def test_qa_b001_chat_picker_no_flugstunden():
     """Chat-Attach-Picker bietet keine Flugstundenübersicht-Option mehr."""
-    src = open(_FRONTEND_HTML).read()
+    src = open(_cft.site_index_html()).read()
     fn_idx = src.find('window._chatToggleAttachMenu = function')
     block = src[fn_idx:fn_idx + 3500]
     assert "key:'dp'" not in block, 'dp-Eintrag muss aus Chat-Picker entfernt sein'
@@ -11222,13 +11226,13 @@ def test_qa_b001_chat_picker_no_flugstunden():
 
 def test_qa_b001_doclabels_no_legacy_wording():
     """docLabels enthalten kein „Flugstunden (Legacy)" mehr."""
-    src = open(_FRONTEND_HTML).read()
+    src = open(_cft.site_index_html()).read()
     assert "Flugstunden (Legacy)" not in src, '„Legacy"-Wording user-facing entfernen'
 
 
 def test_qa_b007_chat_intent_regex_no_flugstunden():
     """Chat-Intent-Detection-Regex matcht keine flugstunden-Keywords mehr."""
-    src = open(_FRONTEND_HTML).read()
+    src = open(_cft.site_index_html()).read()
     # Suche die docs-Regex-Zeile
     idx = src.find("return 'docs'")
     block_before = src[max(0, idx-400):idx]
@@ -11267,7 +11271,7 @@ def test_qa_b005_review_bulk_returns_preview_breakdown():
 
 def test_qa_b005_frontend_applies_preview_breakdown():
     """Frontend ruft _applyPreviewBreakdown bei jeder Review-Response."""
-    src = open(_FRONTEND_HTML).read()
+    src = open(_cft.site_index_html()).read()
     assert 'window._applyPreviewBreakdown = function' in src
     # Mindestens 2 Call-Sites — Backend liefert es in 3 verschiedenen Routes
     count = src.count('_applyPreviewBreakdown(j.preview_breakdown)')
@@ -11276,7 +11280,7 @@ def test_qa_b005_frontend_applies_preview_breakdown():
 
 def test_qa_b005_render_detail_table_extracted():
     """_renderDetailTable als standalone Funktion — wiederverwendbar."""
-    src = open(_FRONTEND_HTML).read()
+    src = open(_cft.site_index_html()).read()
     assert 'function _renderDetailTable(d, _y)' in src
 
 
@@ -11309,7 +11313,7 @@ def test_qa_b002_all_job_routes_decorated():
 
 def test_qa_b002_frontend_injects_session_token_header():
     """Frontend patcht fetch + _fetchWithTimeout für X-Session-Token-Header."""
-    src = open(_FRONTEND_HTML).read()
+    src = open(_cft.site_index_html()).read()
     assert 'window._jobAuthHeaders = function' in src
     assert "'X-Session-Token'" in src
     assert '__aero_patched_v11' in src
@@ -11321,7 +11325,7 @@ def test_qa_b003_rls_migration_exists():
     mig_dir = _os.path.join(_os.path.dirname(_FRONTEND_HTML), '..',
                              'aerotax-backend', 'supabase_migrations')
     if not _os.path.isdir(mig_dir):
-        mig_dir = '/Users/miguelschumann/Desktop/aerotax-backend/supabase_migrations'
+        mig_dir = _cft.backend_path('supabase_migrations')
     files = _os.listdir(mig_dir)
     rls_migs = [f for f in files if 'rls' in f.lower() or 'enable_rls' in f]
     assert rls_migs, f'Keine RLS-Migration in {mig_dir}'
@@ -11335,7 +11339,7 @@ def test_qa_b003_no_disable_rls_in_current_migrations():
     """In der RLS-Migration steht kein 'disable row level security' mehr.
     (alte job_chunks-Migration hat es noch, das ist akzeptiert da später überschrieben)"""
     import os as _os
-    mig_dir = '/Users/miguelschumann/Desktop/aerotax-backend/supabase_migrations'
+    mig_dir = _cft.backend_path('supabase_migrations')
     rls_mig_path = _os.path.join(mig_dir, '20260511_enable_rls.sql')
     content = open(rls_mig_path).read()
     assert 'disable row level security' not in content
@@ -11351,7 +11355,7 @@ def test_qa_b004_no_default_promo_code_in_backend():
 def test_qa_b004_no_default_promo_code_in_frontend():
     """Frontend PROMOS-Dict enthält keinen hardcoded Bypass-Code mehr.
     Test-/Beta-Codes (SMOKETEST) dürfen drin sein, AEROTAXFREEPASS26 nicht."""
-    src = open(_FRONTEND_HTML).read()
+    src = open(_cft.site_index_html()).read()
     assert "AEROTAXFREEPASS26" not in src, 'Alter Bypass-Code muss raus'
 
 
@@ -11939,7 +11943,7 @@ def test_followme_tibor_z73_count_with_synth_f6():
 def test_frontend_no_auto_retry_with_new_process_call():
     """finishProcess macht KEIN process() bei transient error — sonst doppelte
     Jobs + doppelte Sonnet-Kosten."""
-    src = open(_FRONTEND_HTML).read()
+    src = open(_cft.site_index_html()).read()
     fn_idx = src.find('function finishProcess')
     assert fn_idx > 0
     block = src[fn_idx:fn_idx + 2000]
@@ -11982,7 +11986,7 @@ def test_isTransientError_definition_unchanged_for_documentation():
     """_isTransientError-Helper existiert noch — wird nicht mehr für Auto-Retry
     genutzt, könnte aber für UI-Hint („Engpass — versuche es nochmal mit Code")
     nützlich sein. Tests dokumentieren dass er noch da ist."""
-    src = open(_FRONTEND_HTML).read()
+    src = open(_cft.site_index_html()).read()
     assert 'function _isTransientError' in src
 
 
@@ -12039,7 +12043,7 @@ def test_cas_extract_text_handles_invalid_pdf():
 def test_cas_extract_text_extracts_from_real_cas():
     """Extrahiert echten Text aus Tibor-CAS-PDF."""
     import os
-    pdf_path = '/Users/miguelschumann/Desktop/Tibor/2025/Dienstplan/NTF_2_1_1_2025-01-30.pdf'
+    pdf_path = _cft.private_doc('Tibor', '2025', 'Dienstplan', 'NTF_2_1_1_2025-01-30.pdf')
     if not os.path.exists(pdf_path):
         import pytest as _pt
         _pt.skip('Tibor-CAS-PDF nicht verfügbar')
@@ -12056,7 +12060,7 @@ def test_cas_extract_text_extracts_from_real_cas():
 def test_cas_text_sufficiency_real_cas():
     """Echtes Tibor-CAS muss text-sufficient sein (sonst geht jeder Run via Vision)."""
     import os
-    pdf_path = '/Users/miguelschumann/Desktop/Tibor/2025/Dienstplan/NTF_2_1_1_2025-01-30.pdf'
+    pdf_path = _cft.private_doc('Tibor', '2025', 'Dienstplan', 'NTF_2_1_1_2025-01-30.pdf')
     if not os.path.exists(pdf_path):
         import pytest as _pt
         _pt.skip()

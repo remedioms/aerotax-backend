@@ -2,12 +2,12 @@
 
 This directory holds the **automated** layers of the AeroX test pyramid.
 Manual QA (Layer 12) lives in
-`/Users/miguelschumann/Desktop/aeris-ios/AeroTax/tests/MANUAL_QA_CHECKLIST.md`.
+`/Users/miguelschumann/Developer/AeroX/ios/AeroTax/tests/MANUAL_QA_CHECKLIST.md`.
 
 ## One-command runner
 
 ```bash
-bash /Users/miguelschumann/Desktop/aerotax-backend/run_all_tests.sh
+bash /Users/miguelschumann/Developer/Backend/aerotax-backend/run_all_tests.sh
 # options:
 #   --keep-going  → continue after a layer fails (default: fail-fast)
 #   --quick       → skip live-network layers (Layer 2)

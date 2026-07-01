@@ -7,12 +7,13 @@ Statik-Audit gegen app.py + index.html (kein Live-Backend).
 """
 
 import os
+import conftest as _cft
 import re
 import pytest
 
 
-APP_PY = '/Users/miguelschumann/Desktop/aerotax-backend/app.py'
-INDEX  = '/Users/miguelschumann/Desktop/site/index.html'
+APP_PY = _cft.backend_path('app.py')
+INDEX  = _cft.SITE_INDEX_HTML
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -23,7 +24,7 @@ def _src():
     return open(APP_PY, encoding='utf-8').read()
 
 def _html():
-    return open(INDEX, encoding='utf-8').read()
+    return open(_cft.site_index_html(), encoding='utf-8').read()
 
 
 def test_result_data_has_source_breakdown_block():

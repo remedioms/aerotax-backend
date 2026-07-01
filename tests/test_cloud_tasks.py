@@ -8,6 +8,7 @@ Architektur:
 Mode-Switch via AEROTAX_EXECUTION_MODE = 'thread' | 'cloud_tasks'.
 """
 import os
+import conftest as _cft
 import sys
 import json as _json
 import importlib
@@ -225,7 +226,7 @@ def test_no_background_thread_in_cloud_tasks_mode():
     Wir suchen den `/api/process`-spezifischen Branch — nicht den Boot-Disable-
     Branch in `_start_calc_worker` (BUG-002), der vorne im File steht.
     """
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     # Suche den Branch in /api/process der `_enqueue_cloud_task(` aufruft (= Call-Site,
     # nicht die Funktions-Definition). Wir verankern am Call-Pattern (Aufruf mit
     # attempt=1) und gehen rückwärts zum cloud_tasks-Check davor.
@@ -254,7 +255,7 @@ def test_no_background_thread_in_cloud_tasks_mode():
 
 def test_thread_mode_still_works_local_dev():
     """Thread-Mode (default) ruft _calc_queue.put — Legacy bleibt funktionsfähig."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     # Markiert als „Thread-Mode (Default / Legacy)"
     assert 'Thread-Mode (Default / Legacy)' in src
     assert '_calc_queue.put((job_id, form, files))' in src
@@ -321,7 +322,7 @@ def test_cloud_task_done_job_is_idempotent(monkeypatch):
 
 def test_cloud_task_retry_count_persistent():
     """attempt_id wird im Job-Dict persistiert — überlebt Container-Restart via Disk/Supabase."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     # Worker-Endpoint setzt attempt_id im job
     worker_idx = src.find('def internal_process_job(')
     block = src[worker_idx:worker_idx + 6500]  # window erweitert nach CR-1 stale-detection insertion
@@ -336,7 +337,7 @@ def test_cloud_task_retry_count_persistent():
 def test_access_code_works_while_task_processing():
     """/api/session/<token> liefert canonical_state auch während task läuft.
     Frontend pollt /api/job/<id> → state-machine response funktioniert."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     # /api/job/<id> returnt canonical_state immer (von _classify_job_state)
     job_endpoint_idx = src.find('def get_job_status(')
     block = src[job_endpoint_idx:job_endpoint_idx + 2000]
@@ -350,7 +351,7 @@ def test_access_code_works_while_task_processing():
 def test_frontend_polling_not_required_for_job_survival():
     """Worker-Endpoint läuft IN dem HTTP-Request — keine Abhängigkeit von Frontend-Pings.
     Code-Check: _run_process_async wird SYNCHRON im Worker-Endpoint gerufen."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     worker_idx = src.find('def internal_process_job(')
     block = src[worker_idx:worker_idx + 6500]  # window erweitert nach CR-1 stale-detection insertion
     # Synchroner Aufruf — kein threading.Thread, kein _calc_queue.put
@@ -408,7 +409,7 @@ def test_cloud_tasks_process_persists_files_to_supabase():
 
     Capture-Run #1 (2026-05-12) zeigte: ohne diesen Step kommt CAS=False im
     PARALLEL READER STAGE, weil Worker via _load_uploaded_files_supabase(ref) lädt."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     # Im cloud_tasks-Branch muss _save_uploaded_files_supabase ausgeführt werden
     block = _find_process_cloud_tasks_branch(src, span=4000)
     assert '_save_uploaded_files_supabase(' in block, \
@@ -424,7 +425,7 @@ def test_cloud_tasks_process_persists_files_to_supabase():
 def test_cloud_tasks_process_generates_fallback_ref_when_missing():
     """Falls /api/process ohne ref aufgerufen wird (Direct-Upload-Only): generiert
     einen fallback-ref aus job_id."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     block = _find_process_cloud_tasks_branch(src, span=4000)
     # Fallback-ref Generation: f'auto-{job_id[:12]}'
     assert "f'auto-" in block, 'Fallback-ref-Generation fehlt'
@@ -438,7 +439,7 @@ def test_cloud_tasks_process_hard_fails_on_persist_error():
     spezifisch UPLOAD_PERSIST_FAILED upgraded (P0 #90). Log-String englisch
     durch deutsch ersetzt. Test prüft jetzt die spezifischen reason_code-Pfade.
     """
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     block = _find_process_cloud_tasks_branch(src, span=6500)
     # Spezifischer reason_code (P0 #90)
     assert ("_set_job_failed(job_id, 'UPLOAD_PERSIST_FAILED'" in block
@@ -451,7 +452,7 @@ def test_cloud_tasks_process_hard_fails_on_persist_error():
 
 def test_cloud_tasks_process_converts_files_to_supabase_format():
     """Files-Dict {key: [(bytes, fname)|bytes]} → Supabase-Format {key: [(bytes, fname)]}."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     block = _find_process_cloud_tasks_branch(src, span=4500)
     # Format-Konvertierung-Logik
     assert 'files_sb_format' in block

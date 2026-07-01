@@ -27,8 +27,9 @@ for arg in "$@"; do
     esac
 done
 
-BACKEND_ROOT="/Users/miguelschumann/Desktop/aerotax-backend"
-IOS_TESTS="/Users/miguelschumann/Desktop/aeris-ios/AeroTax/tests"
+# Backend-Root = Verzeichnis dieses Scripts (Override: AEROTAX_BACKEND_ROOT)
+BACKEND_ROOT="${AEROTAX_BACKEND_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
+IOS_TESTS="${AEROX_IOS_TESTS:-/Users/miguelschumann/Developer/AeroX/ios/AeroTax/tests}"
 
 LAYERS_PASSED=()
 LAYERS_FAILED=()

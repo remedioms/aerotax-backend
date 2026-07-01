@@ -7,6 +7,7 @@ Ziel:
   Keine Sonnet-Calls. Nur strukturierte Reader-Outputs als Fixtures.
 """
 import os, sys, json
+import conftest as _cft
 import pytest
 
 # Disable BG-Threads damit App-Import isoliert bleibt
@@ -306,7 +307,7 @@ def test_frontend_timeout_running_is_not_fail():
     """Wenn Backend running/processing/queued → friendly message statt throw."""
     if not os.path.exists(_FRONTEND_PATH):
         pytest.skip()
-    src = open(_FRONTEND_PATH).read()
+    src = open(_cft.site_index_html()).read()
     # Suche Backend-Status-Check
     assert "_backendStillRunning" in src or "running.*processing.*queued" in src
     # Friendly Text
@@ -322,7 +323,7 @@ def test_frontend_no_auto_retry_in_finishprocess():
     """finishProcess ruft KEIN process() mehr auf."""
     if not os.path.exists(_FRONTEND_PATH):
         pytest.skip()
-    src = open(_FRONTEND_PATH).read()
+    src = open(_cft.site_index_html()).read()
     idx = src.find('function finishProcess')
     block = src[idx:idx + 2500]
     assert 'window._autoRetryTimer = setTimeout' not in block

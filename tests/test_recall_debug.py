@@ -6,13 +6,14 @@ Browser-Beweis fehlt explizit — siehe AUDIT_BUG_REGISTER.md BUG-001.
 Status der Tests: ergänzen NICHT ersetzen Browser-Verifikation.
 """
 import os
+import conftest as _cft
 import re
 
-_FRONTEND = '/Users/miguelschumann/Desktop/site/index.html'
+_FRONTEND = _cft.SITE_INDEX_HTML
 
 
 def _read():
-    return open(_FRONTEND).read()
+    return open(_cft.site_index_html()).read()
 
 
 # ─── Debug-Stepper-Existenz ──────────────────────────────────────────────────
@@ -256,7 +257,7 @@ def test_recall_empty_code_rejected():
 def test_browser_proof_required_marker():
     """Diese Test-Suite ersetzt NICHT Browser-Verifikation.
     AUDIT_BUG_REGISTER.md BUG-001 Browser-Proof: noch offen."""
-    register = open('/Users/miguelschumann/Desktop/aerotax-backend/docs/AUDIT_BUG_REGISTER.md').read()
+    register = open(_cft.backend_path('docs/AUDIT_BUG_REGISTER.md')).read()
     # BUG-001 ist `open` mit Browser-Proof required
     assert 'BUG-001' in register
     assert 'Browser Proof Required' in register

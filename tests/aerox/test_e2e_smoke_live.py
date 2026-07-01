@@ -40,6 +40,15 @@ BASE_URL = os.environ.get(
     "https://aerotax-backend-443401186607.europe-west3.run.app",
 ).rstrip("/")
 
+# Diese Suite trifft das LIVE-Produktions-Backend über das Netz (Signups,
+# Wall-Posts, Rate-Limit-Probing). CI/lokale Läufe dürfen nicht von Prod-
+# Verfügbarkeit abhängen → opt-in via AEROX_LIVE_TESTS=1.
+if os.environ.get("AEROX_LIVE_TESTS") != "1":
+    pytest.skip(
+        "live production smoke — set AEROX_LIVE_TESTS=1 to run",
+        allow_module_level=True,
+    )
+
 DEFAULT_TIMEOUT = 10  # seconds
 PASSWORD = "Test12345!"  # passes _password_policy_ok: len>=8, has digit + letter
 

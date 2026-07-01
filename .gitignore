@@ -3,6 +3,9 @@ qa_data/
 jobs_state/
 sessions/
 audit_logs/
+_job_chunks_state/
+_user_history_state/
+marker_lexicon.json
 
 # Python
 __pycache__/

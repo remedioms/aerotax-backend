@@ -12,6 +12,7 @@ User-Erlebnis:
 """
 
 import pytest
+import conftest as _cft
 import app
 
 
@@ -201,7 +202,7 @@ def test_review_items_prioritized_by_money_effect():
 
 def test_no_generic_what_was_this_day_question():
     """Statik-Audit: app.py enthält keine generische 'Was war an dem Tag'-Frage."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py',
+    src = open(_cft.backend_path('app.py'),
                encoding='utf-8').read()
     forbidden = [
         'Was war an diesem Tag',
@@ -216,7 +217,7 @@ def test_no_generic_what_was_this_day_question():
 def test_no_cas_upload_prompt_when_cas_present():
     """Statik-Audit: Chat darf nicht pauschal „lade CAS hoch" sagen wenn CAS
     vorhanden ist — Frontend hat den missing_months_cas-Filter."""
-    html = open('/Users/miguelschumann/Desktop/site/index.html',
+    html = open(_cft.site_index_html(),
                 encoding='utf-8').read()
     # Muss Filter haben
     assert '_trulyMissingMonths' in html

@@ -10,9 +10,10 @@ Reproduziert den Live-Produktiv-Pfad offline (kein Sonnet):
   → calculate_allowances_from_normalized_tours, SE-Rows aus deterministischem
   SE-Parser. Diff gegen followme_golden_tibor_2025.json.
 
-Voraussetzung: CAS-PDFs unter /Users/miguelschumann/Desktop/Steuer 25/CAS/ und
-die SE-PDF. Fehlen sie (CI), wird der Test geskippt — er ist ein lokaler
-Genauigkeits-Guard, kein Unit-Test der reinen Logik.
+Voraussetzung: die privaten Tibor-CAS-PDFs + SE-PDF (Auflösung via
+conftest.private_doc, Override: env AEROTAX_PRIVATE_DOCS_ROOT). Fehlen sie
+(CI), wird der Test geskippt — er ist ein lokaler Genauigkeits-Guard, kein
+Unit-Test der reinen Logik.
 """
 import json
 import os
@@ -30,8 +31,12 @@ for p in (ROOT_DIR, TOOLS_DIR):
 
 os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
 
-CAS_DIR = '/Users/miguelschumann/Desktop/Tibor/2025/Dienstplan'  # FIX 2026-06-04: war fälschlich Miguels Steuer-25-CAS (Person 95775) — Golden/SE/Reader sind aber Tibor (99102); der falsche CAS-Overlay verfälschte die Validierung
-SE_PDF = '/Users/miguelschumann/Desktop/Tibor/2025/2025 Streckeneinsatzabrechnungen.pdf'
+import conftest as _cft  # noqa: E402
+
+# FIX 2026-06-04: war fälschlich Miguels Steuer-25-CAS (Person 95775) — Golden/SE/Reader
+# sind aber Tibor (99102); der falsche CAS-Overlay verfälschte die Validierung
+CAS_DIR = _cft.private_doc('Tibor', '2025', 'Dienstplan')
+SE_PDF = _cft.private_doc('Tibor', '2025', '2025 Streckeneinsatzabrechnungen.pdf')
 
 _have_inputs = os.path.isdir(CAS_DIR) and os.path.isfile(SE_PDF) and \
     os.path.isfile(os.path.join(FIXTURE_DIR, 'tibor_2025_cas_v2_from_dienstplan.json'))

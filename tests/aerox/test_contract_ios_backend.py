@@ -45,8 +45,32 @@ TIMEOUT = 30  # seconds — Cloud Run warm, most endpoints <2s
 
 # ---------- helpers ---------------------------------------------------------
 
-def _post(path, body, *, expect_status=None):
-    r = requests.post(f"{BASE}/{path.lstrip('/')}", json=body, timeout=TIMEOUT)
+# iOS-Client-Kontrakt (BUG-004 Token-Binding, ENFORCE-Modus): der echte
+# APIClient sendet auf JEDEM owner-scoped Request `Authorization: Bearer
+# <eigenes Token>`. Diese Suite nutzt EINEN Throwaway-Account, dessen Token in
+# jedem Pfad (bzw. `?token=`-Query) das EIGENE Token ist — der Bearer wird
+# daher zentral aus dem Request-Pfad abgeleitet. Ohne diesen Header lehnen
+# die gehärteten Endpunkte (token_binding_required, 401) korrekt ab.
+_PATH_TOKEN_RE = re.compile(r"(AT-[A-Za-z0-9_\-]+)")
+
+
+def _auth_headers(path, extra=None):
+    h = dict(extra or {})
+    m = _PATH_TOKEN_RE.search(path)
+    if m and "Authorization" not in h:
+        h["Authorization"] = f"Bearer {m.group(1)}"
+    return h
+
+
+def _post(path, body, *, expect_status=None, bearer=None):
+    # `bearer`: für Endpunkte, die das Token im BODY tragen (kein AT-Segment im
+    # Pfad — z.B. /api/push/register-apns, /api/user/location). Die gehärteten
+    # Handler binden das Body-Token per _request_bearer_matches an den Caller.
+    headers = _auth_headers(path)
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    r = requests.post(f"{BASE}/{path.lstrip('/')}", json=body, timeout=TIMEOUT,
+                      headers=headers)
     if expect_status is not None:
         assert r.status_code == expect_status, (
             f"POST {path} → {r.status_code} (expected {expect_status}); "
@@ -56,7 +80,8 @@ def _post(path, body, *, expect_status=None):
 
 
 def _get(path, *, expect_status=None):
-    r = requests.get(f"{BASE}/{path.lstrip('/')}", timeout=TIMEOUT)
+    r = requests.get(f"{BASE}/{path.lstrip('/')}", timeout=TIMEOUT,
+                     headers=_auth_headers(path))
     if expect_status is not None:
         assert r.status_code == expect_status, (
             f"GET {path} → {r.status_code} (expected {expect_status}); "
@@ -68,12 +93,13 @@ def _get(path, *, expect_status=None):
 def _put(path, body):
     return requests.put(
         f"{BASE}/{path.lstrip('/')}", json=body, timeout=TIMEOUT,
-        headers={"Content-Type": "application/json"},
+        headers=_auth_headers(path, {"Content-Type": "application/json"}),
     )
 
 
 def _delete(path):
-    return requests.delete(f"{BASE}/{path.lstrip('/')}", timeout=TIMEOUT)
+    return requests.delete(f"{BASE}/{path.lstrip('/')}", timeout=TIMEOUT,
+                           headers=_auth_headers(path))
 
 
 def _assert_keys(resp_json, expected_keys, *, endpoint, struct_name):
@@ -493,14 +519,25 @@ def test_notams_contract():
 # ---------- CREW CHAT -------------------------------------------------------
 
 def test_chat_messages_contract(account):
-    """GET /api/crew-chat/<token>/channel/<channel> — iOS ChatMessagesResp{channel, messages}"""
-    r = _get(f"api/crew-chat/{account['token']}/channel/general")
-    assert r.status_code in (200, 404), f"unexpected: {r.status_code}"
-    if r.status_code == 200:
-        body = r.json()
-        _assert_keys(body, ["channel", "messages"],
-                     endpoint="GET crew-chat channel", struct_name="ChatMessagesResp")
-        assert isinstance(body["messages"], list)
+    """GET /api/crew-chat/<token>/channel/<channel> — iOS ChatMessagesResp{channel, messages}
+
+    Der iOS-Client nutzt NUR `dm__a__b`- und `group__<gid>`-Channels; das
+    Membership-Gate (Isolation-Fix) lehnt alles andere — auch das Legacy-
+    'general' — mit 400 invalid_channel ab. Wir prüfen die Response-Shape
+    daher über den eigenen (leeren) DM-Self-Channel."""
+    tok = account["token"]
+    dm_self = f"dm__{tok}__{tok}"
+    r = _get(f"api/crew-chat/{tok}/channel/{dm_self}", expect_status=200)
+    body = r.json()
+    _assert_keys(body, ["channel", "messages"],
+                 endpoint="GET crew-chat channel", struct_name="ChatMessagesResp")
+    assert isinstance(body["messages"], list)
+
+    # Enforce-Coverage des Membership-Gates: unbekanntes Channel-Format → 400.
+    r = _get(f"api/crew-chat/{tok}/channel/general")
+    assert r.status_code == 400, (
+        f"legacy 'general' channel must be rejected (invalid_channel), got {r.status_code}"
+    )
 
 
 def test_dm_mark_read_contract(account):
@@ -633,7 +670,7 @@ def test_push_register_contract(account):
         "apns_token": "deadbeef" * 8,
         "platform": "ios",
         "bundle_id": "de.aerosteuer.aeris",
-    })
+    }, bearer=account["token"])
     assert r.status_code in (200, 400), f"unexpected: {r.status_code} {r.text[:200]}"
     if r.status_code == 200:
         body = r.json()
@@ -644,7 +681,8 @@ def test_push_register_contract(account):
 def test_user_location_contract(account):
     """POST /api/user/location — iOS EmptyResp{ok?}"""
     r = _post("api/user/location",
-              {"token": account["token"], "city": "Frankfurt"})
+              {"token": account["token"], "city": "Frankfurt"},
+              bearer=account["token"])
     assert r.status_code in (200, 400), f"unexpected: {r.status_code}"
     if r.status_code == 200:
         body = r.json()

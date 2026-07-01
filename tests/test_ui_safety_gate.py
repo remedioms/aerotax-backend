@@ -14,13 +14,14 @@ Diese Tests prüfen statisch:
 7. Verbotene User-Facing-Strings nicht im DOM
 """
 import os
+import conftest as _cft
 import re
 
-_FRONTEND = '/Users/miguelschumann/Desktop/site/index.html'
+_FRONTEND = _cft.SITE_INDEX_HTML
 
 
 def _read():
-    return open(_FRONTEND).read()
+    return open(_cft.site_index_html()).read()
 
 
 # ─── 1. canShowPdfDownload existiert + gates korrekt ─────────────────────────

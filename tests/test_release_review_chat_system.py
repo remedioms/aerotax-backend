@@ -1,11 +1,12 @@
 """Rel Phase 10 — Review/Chat System Tests."""
 import os
+import conftest as _cft
 import re
 import sys
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(THIS_DIR)
-SITE_HTML = '/Users/miguelschumann/Desktop/site/index.html'
+SITE_HTML = _cft.SITE_INDEX_HTML
 
 import pytest
 

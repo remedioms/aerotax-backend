@@ -14,6 +14,7 @@ Verifiziert:
 8. /api/session/<valid-token-from-supabase>: loads from Supabase when memory empty
 """
 import os
+import conftest as _cft
 import sys
 import time
 import threading
@@ -374,7 +375,7 @@ def test_valid_session_after_memory_empty_loads_from_supabase(client, fresh_app,
 def test_static_session_recall_does_not_use_old_lock_pattern():
     """Statisch: /api/session/<token>-Handler verwendet NICHT mehr
     `with _jobs_lock: ... _load_job_from_disk(...)`."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     # Find the session_recall function
     idx = src.find("def session_recall(token):")
     assert idx > 0
@@ -389,7 +390,7 @@ def test_static_session_recall_does_not_use_old_lock_pattern():
 
 
 def test_static_decorator_uses_get_or_load_job():
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     idx = src.find("def requires_session_token(fn):")
     assert idx > 0
     block = src[idx:idx + 2500]
@@ -399,7 +400,7 @@ def test_static_decorator_uses_get_or_load_job():
 
 
 def test_static_load_job_from_disk_uses_timeout_helper():
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     idx = src.find("def _load_job_from_disk(job_id):")
     assert idx > 0
     block = src[idx:idx + 2500]
@@ -407,7 +408,7 @@ def test_static_load_job_from_disk_uses_timeout_helper():
 
 
 def test_static_load_session_uses_timeout_helper():
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     idx = src.find("def _load_session_safe(token):")
     assert idx > 0
     block = src[idx:idx + 2500]
@@ -415,7 +416,7 @@ def test_static_load_session_uses_timeout_helper():
 
 
 def test_static_supabase_timeout_error_code_exists():
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py').read()
+    src = open(_cft.backend_path('app.py')).read()
     assert "'SUPABASE_TIMEOUT':" in src
     assert "'fetch_error'" in src
 

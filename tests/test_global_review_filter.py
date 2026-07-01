@@ -12,6 +12,7 @@ kann was gefiltert wurde (Transparenz ohne User-Belästigung).
 """
 
 import pytest
+import conftest as _cft
 import app
 
 
@@ -218,7 +219,7 @@ def test_unknown_marker_money_scales_with_affected_days():
 
 def test_no_generic_review_questions():
     """Statik: keine generischen 'Was war an dem Tag'-Fragen im Code."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py',
+    src = open(_cft.backend_path('app.py'),
                encoding='utf-8').read()
     forbidden = ['Was war an diesem Tag', 'Was war an dem Tag',
                  'Bitte erkläre den Tag', 'Bitte beschreibe den Tag']
@@ -228,7 +229,7 @@ def test_no_generic_review_questions():
 
 def test_no_missing_document_prompt_when_document_present():
     """Statik: Frontend chat prüft missing_months_cas BEVOR es CAS-Upload sagt."""
-    html = open('/Users/miguelschumann/Desktop/site/index.html',
+    html = open(_cft.site_index_html(),
                 encoding='utf-8').read()
     assert '_trulyMissingMonths' in html
     assert 'Dienstplan/CAS bereits vorliegen' in html
@@ -439,7 +440,7 @@ def test_unknown_marker_alone_not_counter_evidence():
     """Unbekannter Marker allein erzeugt KEIN counter_evidence_score.
     Statik-Check: code setzt counter_evidence_score nicht aus
     unknown_marker_candidates."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py',
+    src = open(_cft.backend_path('app.py'),
                encoding='utf-8').read()
     # In _build_review_items darf bei unknown_marker-Item kein counter_evidence
     # gesetzt sein (default 0). Statik-Audit:
@@ -495,7 +496,7 @@ def test_reader_issue_alone_not_counter_evidence():
 def test_ai_auto_resolve_cannot_create_tax_amount():
     """KI darf KEINE Beträge setzen. Statik-Check: KI-Resolver-Output enthält
     keine 'eur' oder 'amount'-Schlüssel die direkt in result_data fließen."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py',
+    src = open(_cft.backend_path('app.py'),
                encoding='utf-8').read()
     # _resolve_uncertain_fact_with_ai darf nur 'value', 'confidence', 'reason'
     # liefern — keine 'eur', 'amount', 'betrag' DIREKT in tage_detail
@@ -511,7 +512,7 @@ def test_ai_auto_resolve_cannot_create_tax_amount():
 def test_ai_auto_resolve_context_only():
     """KI-Resolver-Output muss strukturierte 'value' liefern (Kontext),
     nicht direkten Steuerbetrag."""
-    src = open('/Users/miguelschumann/Desktop/aerotax-backend/app.py',
+    src = open(_cft.backend_path('app.py'),
                encoding='utf-8').read()
     # Suche nach KI-resolved-Pattern
     assert "ai_value.get('semantics')" in src or \
