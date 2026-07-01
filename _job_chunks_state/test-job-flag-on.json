@@ -1,1 +1,0 @@
-[{"id": "0f423378-7a8e-43a3-9f8c-65b35c053ada", "job_id": "test-job-flag-on", "document_type": "cas", "chunk_index": 0, "page_from": null, "page_to": null, "file_hash": "abc", "parser_version": "v11.0.0", "status": "pending", "result_json": null, "error_code": null, "error_message": null, "created_at": "2026-06-04T15:46:06.685448Z", "updated_at": "2026-06-04T15:46:06.685453Z"}]

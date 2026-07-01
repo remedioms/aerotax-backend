@@ -389,6 +389,19 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/crew-chat/',      # alle DM/Inbox/Channel-Reads
     '/api/moderation/',     # block/mute-Listen
     '/api/lufthansa/status/',
+    # ── Security-Audit 2026-07-01: weitere owner-scoped PII-GETs ──
+    '/api/family-share/',   # /<crew_token>/list → Grants (Family-Namen/Avatare).
+                            #   Pfad-Token ist das EIGENE Crew-Token; Family-
+                            #   Clients nutzen /api/family-roster + /api/family-
+                            #   watch (AT-FAM hat ohnehin Pass-through im Gate).
+    '/api/crew-graph/',     # /<token>/match|edges|common → Crew-Kontakte-PII
+    '/api/license-wallet/', # /<token>/list → Lizenzen/Medical (sensibel)
+    '/api/trade/',          # /<token>/my-posts|my-offers|incoming-interests;
+                            #   /api/trade/board hat kein AT-Token im Pfad und
+                            #   bleibt public (Gate greift nur bei Token im Pfad).
+    '/api/user/friend-groups/',       # Gruppen-Namen + Member-Tokens
+    '/api/user/crew-at-destination/', # wer ist mit mir am Ziel (Friends-PII)
+    '/api/station/',        # /<token>/<iata>/activity → Friends-Aktivität
 )
 
 
@@ -609,11 +622,24 @@ def _bug004_token_auth_gate():
                     except Exception:
                         pass
     except Exception as e:
-        # Auth-Gate-Bugs dürfen die App nicht killen — log + pass-through
+        # UNERWARTETER Gate-Fehler (Bug im Gate selbst, NICHT der bewusst
+        # fail-open gehaltene auth_users-Cache-Reload — der lebt in
+        # _validate_token_exists und wirft nicht, siehe Fix 2026-07-01
+        # „App loggt mich immer wieder aus").
         try:
-            app.logger.warning(f'[bug004-gate] error {type(e).__name__}: {str(e)[:120]}')
+            app.logger.error(
+                f'[bug004-gate] UNEXPECTED gate error {type(e).__name__}: '
+                f'{str(e)[:300]} path={request.path!r} method={request.method}',
+                exc_info=True)
         except Exception:
             pass
+        if _BUG004_REQUIRE_TOKEN_BINDING:
+            # ENFORCE-Modus: fail-CLOSED, aber als 503 (nicht 401 — die iOS-App
+            # wertet explizite Session-Invalid-Codes als Logout; 503 ist ein
+            # transienter Serverfehler und triggert keinen Logout).
+            return jsonify({'error': 'auth_gate_error'}), 503
+        # LEGACY-Modus (Enforcement aus): pass-through wie bisher — wir dürfen
+        # keinen Ausfall verursachen bevor Enforcement überhaupt an ist.
         return None
 
 
@@ -681,6 +707,33 @@ def _public_cache_headers(response):
             cc = 'public, max-age=20'                           # live, aber CDN-coalesce
         if cc:
             response.headers['Cache-Control'] = cc
+    except Exception:
+        pass
+    return response
+
+
+@app.after_request
+def _security_headers(response):
+    """Security-Header (Audit 2026-07-01). setdefault-Semantik: setzt NUR wenn
+    nicht schon von der Route/flask-cors gesetzt — clobbert weder CORS-Header
+    (Access-Control-* wird hier nicht angefasst) noch Cache-Control
+    (_public_cache_headers). Flask führt ALLE after_request-Hooks aus."""
+    try:
+        h = response.headers
+        # Auf allen Responses: MIME-Sniffing aus.
+        h.setdefault('X-Content-Type-Options', 'nosniff')
+        # Cloud Run ist HTTPS-only → HSTS ist risikofrei.
+        h.setdefault('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+        # Nur auf HTML (Admin-Panel): Clickjacking + minimale CSP. JSON-API-
+        # Responses bekommen bewusst KEINE CSP (nutzlos + Header-Bloat).
+        ct = (h.get('Content-Type') or '').lower()
+        if ct.startswith('text/html'):
+            h.setdefault('X-Frame-Options', 'DENY')
+            h.setdefault('Content-Security-Policy',
+                         "default-src 'self'; img-src 'self' data: https:; "
+                         "style-src 'self' 'unsafe-inline'; "
+                         "script-src 'self' 'unsafe-inline'; "
+                         "frame-ancestors 'none'")
     except Exception:
         pass
     return response
@@ -897,7 +950,9 @@ def allowance_exact_rate(token):
 
 @app.route('/api/create-checkout', methods=['POST'])
 def create_checkout():
-    data = request.get_json() or {}
+    # silent=True: kaputtes/fehlendes JSON → None (kein 400-BadRequest-Raise),
+    # der `or {}`-Guard fängt das ab — konsistent mit den Auth-Routen.
+    data = request.get_json(silent=True) or {}
     ref  = str(uuid.uuid4())
 
     # Formulardaten temporär speichern
@@ -942,7 +997,8 @@ def create_payment_intent():
     """Creates a Stripe PaymentIntent for Stripe Elements (no redirect).
     Reused ein Pre-Upload-ref wenn vom Frontend mitgegeben (so überleben Files den Reload)."""
     try:
-        data = request.get_json() or {}
+        # silent=True: kaputtes JSON → None statt BadRequest-Raise; `or {}` guarded.
+        data = request.get_json(silent=True) or {}
         # SECURITY (Bug-Hunt CRITICAL): Betrag NIE vom Client übernehmen — sonst
         # zahlt jeder 1 Cent für eine volle Auswertung. Preis ist serverseitig fix.
         amount = EXPECTED_PRICE_CENTS
@@ -977,7 +1033,8 @@ def create_payment_intent():
             'ref': ref
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f'[create_payment_intent] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'error': 'internal_error'}), 500
 
 
 # v11: CAS (Dienstplan/Roster) ist ab v11 das 3. Pflicht-Dokument
@@ -1432,6 +1489,70 @@ def _client_ip():
         return xff.split(',')[0].strip()
     return request.remote_addr or ''
 
+
+# ── Durable Auth-Rate-Limits (Audit 2026-07-01) ─────────────────────────────
+# _ip_rate_limited/_token_rate_limited sind PER-INSTANZ (Cloud Run skaliert →
+# jeder Container zählt für sich; Restart = Reset). Für die Auth-Routen
+# (Brute-Force/Enumeration/Mail-Bombing) wird ZUSÄTZLICH das Supabase-durable
+# Sliding-Window aus rate_limits/ benutzt. Eigenschaften:
+#   - FAIL-OPEN: Supabase down/Tabelle fehlt → _sb_get_bucket liefert (now, 0)
+#     → nie ein Login wegen des Limiter-Stores blockiert.
+#   - EIN blockierender Supabase-Roundtrip pro Auth-Versuch (der GET); das
+#     Increment läuft fire-and-forget über _SB_TIMEOUT_EXECUTOR.
+#   - Identifier werden gehasht (kein E-Mail-/IP-Klartext in der Tabelle).
+# rate_limits/config.py liest SUPABASE_KEY/SUPABASE_SERVICE_ROLE_KEY — dieses
+# Backend setzt aber SUPABASE_SERVICE_KEY. Alias mappen (nur wenn unbelegt),
+# sonst fällt das Package still auf seinen In-Memory-Fallback zurück.
+if os.environ.get('SUPABASE_SERVICE_KEY') and not (
+        os.environ.get('SUPABASE_KEY') or os.environ.get('SUPABASE_SERVICE_ROLE_KEY')):
+    os.environ['SUPABASE_KEY'] = os.environ['SUPABASE_SERVICE_KEY']
+try:
+    from rate_limits import config as _rl_durable
+except Exception as _rl_imp_err:  # Package kaputt → Feature aus, Auth läuft weiter
+    print(f'[auth-rl] rate_limits import failed — durable limits OFF: {_rl_imp_err}')
+    _rl_durable = None
+
+# Limits gespiegelt an den bestehenden In-Memory-Checks (gleiche Größenordnung,
+# leicht großzügiger, damit der durable Layer nie STRENGER ist als das heutige
+# Verhalten auf einer Single-Instanz).
+_DURABLE_AUTH_SCOPES = {
+    'auth_login_ip':    {'limit': 30, 'window_sec': 600},
+    'auth_signup_ip':   {'limit': 15, 'window_sec': 3600},
+    'auth_forgot_email': {'limit': 5, 'window_sec': 600},
+}
+
+
+def _durable_auth_rate_limited(identifier, scope):
+    """True wenn das Supabase-durable Fenster für (identifier, scope) voll ist.
+    Fail-open bei JEDEM Fehler (Import fehlt, SB down, Tabelle fehlt)."""
+    if _rl_durable is None or not identifier:
+        return False
+    cfg = _DURABLE_AUTH_SCOPES.get(scope)
+    if not cfg:
+        return False
+    try:
+        import hashlib as _hl
+        key = 'rl-' + _hl.sha256(f'{scope}:{identifier}'.encode('utf-8')).hexdigest()[:32]
+        now = int(time.time())
+        window_sec = cfg['window_sec']
+        # 1 blockierender Roundtrip: GET (1.5s Timeout, fail-open in rate_limits)
+        ws, count = _rl_durable._sb_get_bucket(key, scope, window_sec, now)
+        if now - ws >= window_sec:
+            ws, count = now, 0
+        # Increment asynchron — kein zweiter blockierender Roundtrip im Request.
+        try:
+            _SB_TIMEOUT_EXECUTOR.submit(
+                _rl_durable._sb_upsert_bucket, key, scope, window_sec, ws, count + 1)
+        except Exception:
+            pass
+        if count >= cfg['limit']:
+            print(f'[auth-rl] durable limit hit scope={scope} count={count}')
+            return True
+    except Exception as e:
+        # NIE Logins blockieren weil der Limiter-Store zickt.
+        print(f'[auth-rl] durable check error (fail-open): {type(e).__name__}: {e}')
+    return False
+
 @app.route('/api/stripe-webhook', methods=['POST'])
 def stripe_webhook():
     """Markiert _store[ref].paid=True. Auswertung selbst läuft NICHT hier — der
@@ -1446,7 +1567,8 @@ def stripe_webhook():
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        print(f'[stripe_webhook] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'error': 'webhook_signature_verification_failed'}), 400
 
     # Idempotenz: gleicher Webhook-Event nur 1x verarbeiten
     eid = event.get('id', '')
@@ -3162,7 +3284,7 @@ def process_real():
     except Exception as e:
         print(f'Process error: {e}')
         import traceback; traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'internal_error'}), 500
 
 
 @app.route('/api/internal/process-job', methods=['POST'])
@@ -6088,9 +6210,9 @@ def post_finalize_pdf(job_id):
         if not rec:
             return _pdf_lock_response('CALCULATION_INVARIANT_FAILED', http_status=500)
     except Exception as e:
-        print(f'[finalize-pdf] recalc fail: {e}')
+        print(f'[finalize-pdf] recalc fail: {type(e).__name__}: {str(e)[:300]}')
         return _pdf_lock_response('CALCULATION_INVARIANT_FAILED', http_status=500, extra={
-            'detail': str(e)[:120],
+            'detail': 'internal_error',
         })
 
     # Result-Dict mit neuen Totals patchen (PDF-Generator nutzt die Felder direkt)
@@ -6138,8 +6260,8 @@ def post_finalize_pdf(job_id):
     try:
         pdf_bytes = erstelle_pdf(final_data).getvalue()
     except Exception as e:
-        print(f'[finalize-pdf] erstelle_pdf fail: {e}')
-        return _pdf_lock_response('PDF_RENDER_FAILED', http_status=500, extra={'detail': str(e)[:120]})
+        print(f'[finalize-pdf] erstelle_pdf fail: {type(e).__name__}: {str(e)[:300]}')
+        return _pdf_lock_response('PDF_RENDER_FAILED', http_status=500, extra={'detail': 'internal_error'})
 
     # PDF unter Token speichern (überschreibt das alte)
     download_url = data.get('download_url') or ''
@@ -6158,9 +6280,9 @@ def post_finalize_pdf(job_id):
     try:
         _save_pdf(token, pdf_bytes, filename)
     except Exception as e:
-        print(f'[finalize-pdf] save_pdf fail: {e}')
+        print(f'[finalize-pdf] save_pdf fail: {type(e).__name__}: {str(e)[:300]}')
         return _pdf_lock_response('PDF_RENDER_FAILED', http_status=500, extra={
-            'user_message': 'PDF-Speicherung fehlgeschlagen.', 'detail': str(e)[:120],
+            'user_message': 'PDF-Speicherung fehlgeschlagen.', 'detail': 'internal_error',
         })
 
     # Job-State aktualisieren
@@ -7576,7 +7698,7 @@ Verboten: allgemeine Steuertipps, andere Jahre, Lebensberatung, Karriere, Invest
         })
     except Exception as e:
         print(f"[chat] failed: {e}")
-        return jsonify({'error': f'Chat-Anfrage fehlgeschlagen: {str(e)[:200]}'}), 500
+        return jsonify({'error': 'Chat-Anfrage fehlgeschlagen.'}), 500
 
 
 @app.route('/api/session/<token>/delete', methods=['POST'])
@@ -9492,7 +9614,8 @@ def storekit_promo_offer():
         sig = pkey.sign(payload.encode('utf-8'), ec.ECDSA(hashes.SHA256()))
         sig_b64 = base64.b64encode(sig).decode('ascii')
     except Exception as e:
-        return jsonify({'ok': False, 'error': 'sign_failed', 'message': str(e)[:120]}), 500
+        print(f'[storekit_promo_offer] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'sign_failed', 'message': 'internal_error'}), 500
     return jsonify({'ok': True, 'offer_id': offer_id, 'key_id': key_id,
                     'nonce': nonce, 'timestamp': ts, 'signature_b64': sig_b64})
 
@@ -9532,7 +9655,8 @@ def get_user_profile(token):
             return jsonify(full)
         return jsonify(_public_profile_projection(token))
     except Exception as e:
-        return jsonify({'error': str(e)[:200]}), 500
+        print(f'[get_user_profile] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'error': 'internal_error'}), 500
 
 
 @app.route('/api/user/profile/<token>', methods=['PUT'])
@@ -11400,7 +11524,8 @@ def get_flight_ops(token):
     except FileNotFoundError:
         data = {}
     except Exception as e:
-        return jsonify({'error': str(e)[:200]}), 500
+        print(f'[get_flight_ops] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'error': 'internal_error'}), 500
     datum = request.args.get('datum')
     if datum:
         return jsonify({'datum': datum, 'ops': data.get(datum, {})})
@@ -11434,7 +11559,8 @@ def put_flight_ops(token, datum):
         with open(p, 'w') as f:
             json.dump(data, f, ensure_ascii=False)
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[put_flight_ops] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True, 'datum': datum})
 
 
@@ -11454,7 +11580,8 @@ def delete_flight_ops(token, datum):
     except FileNotFoundError:
         pass
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[delete_flight_ops] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True})
 
 
@@ -11516,7 +11643,8 @@ def get_metar(icao):
         _aviation_cache_set(f'metar:{icao}', result, 600)
         return jsonify(result)
     except Exception as e:
-        return jsonify({'icao': icao, 'reports': [], 'error': str(e)[:200]}), 502
+        print(f'[get_metar] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'icao': icao, 'reports': [], 'error': 'upstream_error'}), 502
 
 
 @app.route('/api/aviation/taf/<icao>', methods=['GET'])
@@ -11539,7 +11667,8 @@ def get_taf(icao):
         _aviation_cache_set(f'taf:{icao}', result, 1800)
         return jsonify(result)
     except Exception as e:
-        return jsonify({'icao': icao, 'forecasts': [], 'error': str(e)[:200]}), 502
+        print(f'[get_taf] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'icao': icao, 'forecasts': [], 'error': 'upstream_error'}), 502
 
 
 @app.route('/api/aviation/currency', methods=['GET'])
@@ -11562,7 +11691,8 @@ def get_currency_rates():
         _aviation_cache_set(cache_key, result, 3600 * 12)
         return jsonify(result)
     except Exception as e:
-        return jsonify({'base': base, 'rates': {}, 'error': str(e)[:200]}), 502
+        print(f'[get_currency_rates] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'base': base, 'rates': {}, 'error': 'upstream_error'}), 502
 
 
 @app.route('/api/aviation/aircraft/<icao24>', methods=['GET'])
@@ -11605,7 +11735,8 @@ def get_aircraft_by_icao24(icao24):
         _aviation_cache_set(f'os:{icao24}', result, 60)
         return jsonify(result)
     except Exception as e:
-        return jsonify({'icao24': icao24, 'state': None, 'error': str(e)[:200]}), 502
+        print(f'[get_aircraft_by_icao24] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'icao24': icao24, 'state': None, 'error': 'upstream_error'}), 502
 
 
 @app.route('/api/aviation/notams/<icao>', methods=['GET'])
@@ -11816,9 +11947,10 @@ def get_metar_by_iata(iata):
             raw = json.loads(r.read().decode('utf-8'))
     except Exception as e:
         # Silent return None mit Status — iOS zeigt dann kein Wetter, ohne crash.
+        print(f'[airport-weather] fetch fail {icao}: {type(e).__name__}: {str(e)[:200]}')
         return jsonify({'iata': iata_clean, 'icao': icao,
                         'status': 'fetch_failed',
-                        'error': str(e)[:120]}), 502
+                        'error': 'upstream_error'}), 502
 
     if not raw:
         result = {'iata': iata_clean, 'icao': icao, 'status': 'no_data',
@@ -12428,7 +12560,8 @@ def get_news_article():
             resp.encoding = resp.apparent_encoding or 'utf-8'
         html = resp.text
     except Exception as e:
-        return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': str(e)[:200]}), 502
+        print(f'[get_news_article] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': 'upstream_error'}), 502
 
     # Extract via mehrere Strategien, längstes valides Ergebnis gewinnt.
     # (_news_extract_best_fulltext entfernt bereits Boilerplate + Spenden-Appelle.)
@@ -13486,7 +13619,8 @@ def get_briefings(token):
     try:
         data = dict(_manual_briefings_load(token) or {})
     except Exception as e:
-        return jsonify({'error': str(e)[:200]}), 500
+        print(f'[get_briefings] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'error': 'internal_error'}), 500
     try:
         ical_data = _ical_briefings_load(token) or {}
         for k, v in (ical_data or {}).items():
@@ -13537,7 +13671,8 @@ def put_briefing(token, datum):
         data[datum] = body
         _manual_briefings_save(token, data)
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[put_briefing] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True, 'datum': datum})
 
 
@@ -13904,6 +14039,85 @@ def _compute_roster_diff(old_tage, new_tage):
     return changes
 
 
+@app.route('/api/admin/wipe-calendar', methods=['POST'])
+def admin_wipe_calendar():
+    """Einmaliger, secret-gegateter Kalender-Wipe für GENAU EINEN User (per E-Mail).
+    Löscht ALLE kalenderbezogenen Daten STRIKT token-scoped: user_ical_briefings,
+    user_manual_briefings, roster_snapshots (Key 'token'), briefings + ical_events
+    (Key 'user_token') sowie den gespeicherten calendar_feed im Profil. Alles andere
+    (Freunde/Avatare/Chats/Steuer/Licenses) bleibt unberührt — gleiche Token-Scoping-
+    Logik wie der DSGVO-Account-Delete-Cascade.
+    Auth: Header `X-Wipe-Secret` == env `WIPE_ADMIN_SECRET`. Ist die Env-Var nicht
+    gesetzt, antwortet der Endpoint IMMER 403 (inert by default). Nach Gebrauch die
+    Env-Var wieder entfernen → Endpoint dauerhaft inert.
+    """
+    import hmac as _hmac
+    secret_env = (os.environ.get('WIPE_ADMIN_SECRET') or '').strip()
+    got = (request.headers.get('X-Wipe-Secret') or '').strip()
+    if not secret_env or not _hmac.compare_digest(got, secret_env):
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    body = request.get_json(silent=True) or {}
+    email = (body.get('email') or '').strip().lower()
+    if not email:
+        return jsonify({'ok': False, 'error': 'email_required'}), 400
+    if not (SB_AVAILABLE and sb is not None):
+        return jsonify({'ok': False, 'error': 'supabase_unavailable'}), 503
+    # 1) Token per E-Mail auflösen (auth_users) — limit(1), striktes Match.
+    try:
+        r = sb.table('auth_users').select('*').eq('email', email).limit(1).execute()
+        rows = getattr(r, 'data', None) or []
+        if not rows:
+            return jsonify({'ok': False, 'error': 'user_not_found'}), 404
+        token = (rows[0].get('token') or '').strip()
+        if not token:
+            return jsonify({'ok': False, 'error': 'no_token_for_user'}), 404
+    except Exception as e:
+        return jsonify({'ok': False, 'error': 'auth_lookup_failed',
+                        'detail': str(e)[:120]}), 500
+    # 2) Kalender-Tabellen token-scoped leeren (best-effort je Tabelle).
+    deleted = {}
+    cal_tables = [
+        ('user_ical_briefings', 'token'),
+        ('user_manual_briefings', 'token'),
+        ('roster_snapshots', 'token'),
+        ('briefings', 'user_token'),
+        ('ical_events', 'user_token'),
+    ]
+    for tbl, col in cal_tables:
+        try:
+            _r = sb.table(tbl).delete().eq(col, token).execute()
+            deleted[tbl] = len((_r and getattr(_r, 'data', None)) or [])
+        except Exception as e:
+            deleted[tbl] = f'error:{type(e).__name__}'
+            app.logger.warning(f'[wipe-cal] {tbl}_fail: {str(e)[:120]}')
+    # 3) Gespeicherten calendar_feed im Profil entfernen (sonst re-importiert der
+    #    Client evtl. den alten Feed). profile-jsonb + top-level backwards-compat.
+    try:
+        disk_full = dict(_profile_load_from_disk(token) or {})
+        disk_full['token'] = token
+        profile = dict(disk_full.get('profile') or {})
+        profile.pop('calendar_feed', None)
+        disk_full.pop('calendar_feed', None)
+        disk_full['profile'] = profile
+        disk_full['_updated_at'] = datetime.now().isoformat()
+        _profile_save(token, profile, full_disk_payload=disk_full)
+        deleted['profile.calendar_feed'] = 'cleared'
+    except Exception as e:
+        deleted['profile.calendar_feed'] = f'error:{type(e).__name__}'
+        app.logger.warning(f'[wipe-cal] profile_feed_fail: {str(e)[:120]}')
+    # 4) Ephemere Disk-Fallback-Dateien sicherheitshalber löschen.
+    try:
+        for _p in (_ical_briefings_path(token), _briefing_path(token),
+                   _roster_snapshot_path(token)):
+            if _p and os.path.exists(_p):
+                os.remove(_p)
+    except Exception:
+        pass
+    app.logger.info(f'[wipe-cal] done email={email} token={token[:6]}… deleted={deleted}')
+    return jsonify({'ok': True, 'email': email, 'token_prefix': token[:6],
+                    'deleted': deleted})
+
+
 @app.route('/api/user/roster-snapshot/<token>', methods=['POST'])
 def take_roster_snapshot(token):
     """Speichert aktuellen tage_detail-Stand als Snapshot. Vergleicht mit vorigem Snapshot
@@ -13955,7 +14169,8 @@ def take_roster_snapshot(token):
         existing['pending'] = pending
         with open(cp, 'w') as f: json.dump(existing, f, ensure_ascii=False)
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[take_roster_snapshot] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     if diff:
         try:
             n = len(diff)
@@ -14014,7 +14229,8 @@ def decide_roster_change(token):
         try:
             with open(cp, 'w') as f: json.dump(data, f, ensure_ascii=False)
         except Exception as e:
-            return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+            print(f'[decide_roster_change] error: {type(e).__name__}: {str(e)[:300]}')
+            return jsonify({'ok': False, 'error': 'internal_error'}), 500
         return jsonify({'ok': True, 'decided': len(pending), 'pending_remaining': 0})
     matched = next((c for c in pending if c.get('datum') == datum), None)
     if not matched:
@@ -14029,7 +14245,8 @@ def decide_roster_change(token):
     try:
         with open(cp, 'w') as f: json.dump(data, f, ensure_ascii=False)
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[decide_roster_change] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     # Snapshot-Baseline aktualisieren — sonst würde der nächste Snapshot den
     # gleichen Diff erneut als "pending" detektieren. Bei 'accept' nehmen wir
     # den neuen Wert in den Baseline-Snapshot auf; bei 'reject' wird der alte
@@ -14088,7 +14305,8 @@ def post_crash_report():
         with open(os.path.join(crash_dir, fname), 'w') as f:
             json.dump(body, f, ensure_ascii=False)
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[post_crash_report] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True})
 
 
@@ -14119,7 +14337,8 @@ def upload_voice_note(token, datum):
     try:
         with open(p, 'wb') as f: f.write(data)
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[upload_voice_note] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True, 'datum': datum, 'size_kb': len(data) // 1024})
 
 
@@ -14144,7 +14363,8 @@ def delete_voice_note(token, datum):
     try:
         if os.path.exists(p): os.remove(p)
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[delete_voice_note] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True})
 
 
@@ -14201,7 +14421,8 @@ def list_flight_notes(token):
             notes = {}
         return jsonify({'notes': notes, 'count': len(notes)})
     except Exception as e:
-        return jsonify({'error': str(e)[:200]}), 500
+        print(f'[list_flight_notes] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'error': 'internal_error'}), 500
 
 
 @app.route('/api/user/flight-notes/<token>/<datum>', methods=['PUT'])
@@ -14246,7 +14467,7 @@ def put_flight_note(token, datum):
                         'note': note, 'len': len(note)})
     except Exception as e:
         app.logger.exception('[flight-notes] put_failed')
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
 
 
 @app.route('/api/user/flight-notes/<token>/<datum>', methods=['GET'])
@@ -14264,7 +14485,8 @@ def get_flight_note(token, datum):
             notes = {}
         return jsonify({'datum': datum, 'note': notes.get(datum, '')})
     except Exception as e:
-        return jsonify({'error': str(e)[:200]}), 500
+        print(f'[get_flight_note] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'error': 'internal_error'}), 500
 
 
 # ─── Crew Chat Messages (HTTP-Polling-Fallback; WebSocket optional) ─────────
@@ -14693,7 +14915,8 @@ def send_chat_message(token, channel_id):
         msgs.append(msg)
         _dm_save_messages(channel_id, msgs[-500:])
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[send_chat_message] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True, 'message': msg})
 
 
@@ -14732,7 +14955,8 @@ def _soft_delete_chat_message(token, channel_id, message_id):
         found['text'] = ''
         _dm_save_messages(channel_id, msgs[-500:])
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[_soft_delete_chat_message] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True, 'deleted': message_id})
 
 
@@ -14873,7 +15097,8 @@ def dm_mark_read(token):
         with open(last_seen_p, 'w') as f: json.dump(data, f)
     except Exception as e:
         if not sb_ok:
-            return jsonify({'ok': False, 'error': str(e)[:120]}), 500
+            print(f'[dm_mark_read] error: {type(e).__name__}: {str(e)[:300]}')
+            return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True})
 
 
@@ -15556,7 +15781,8 @@ def upload_wall_image(token):
             with open(os.path.join(img_dir, fname), 'wb') as f:
                 f.write(data)
         except Exception as e:
-            return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+            print(f'[upload_wall_image] error: {type(e).__name__}: {str(e)[:300]}')
+            return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True, 'url': f'/api/wall/image/{dir_key}/{fname}'})
 
 
@@ -15752,7 +15978,8 @@ def upload_user_avatar(token):
             with open(os.path.join(img_dir, fname), 'wb') as fp:
                 fp.write(data)
         except Exception as e:
-            return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+            print(f'[upload_user_avatar] error: {type(e).__name__}: {str(e)[:300]}')
+            return jsonify({'ok': False, 'error': 'internal_error'}), 500
     # avatar_url IMMER der Backend-Serve-Pfad (nicht die rohe r2.dev-URL: deren
     # Public-Domain ist deaktiviert → 403). serve_user_avatar streamt aus R2.
     avatar_url = f'/api/user/avatar/{dir_key}/{fname}'
@@ -17676,7 +17903,8 @@ def upload_layover_image(token):
         with open(os.path.join(img_dir, fname), 'wb') as f:
             f.write(data)
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[upload_layover_image] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True, 'url': f'/api/layover-recs/image/{safe}/{fname}'})
 
 
@@ -19731,7 +19959,8 @@ def clear_user_history(token):
             os.remove(p)
         return jsonify({'ok': True})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        print(f'[clear_user_history] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
 
 
 # ── Auth-System (email/password optional auf Token-Flow) ──────────────
@@ -20223,6 +20452,9 @@ def auth_signup():
     _ip = (request.headers.get('X-Forwarded-For', '') or request.remote_addr or '').split(',')[0].strip()
     if _ip and _ip_rate_limited(_ip, 'signup', limit=15, window_sec=3600):
         return jsonify({'ok': False, 'error': 'too_many_signups'}), 429
+    # ZUSÄTZLICH durable (Supabase, instanz-übergreifend, fail-open).
+    if _ip and _durable_auth_rate_limited(_ip, 'auth_signup_ip'):
+        return jsonify({'ok': False, 'error': 'too_many_signups'}), 429
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip().lower()
     pw = body.get('password') or ''
@@ -20267,6 +20499,11 @@ def auth_login():
                         'message': 'Zu viele Login-Versuche. Bitte in einigen Minuten erneut.'}), 429
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
     if client_ip and _ip_rate_limited(client_ip, endpoint='auth_login', limit=30, window_sec=600):
+        return jsonify({'ok': False, 'error': 'too_many_attempts',
+                        'message': 'Zu viele Login-Versuche. Bitte in einigen Minuten erneut.'}), 429
+    # ZUSÄTZLICH durable (instanz-übergreifend, überlebt Container-Restarts).
+    # Fail-open — blockiert NIE wegen Supabase-Problemen (siehe Helper).
+    if client_ip and _durable_auth_rate_limited(client_ip, 'auth_login_ip'):
         return jsonify({'ok': False, 'error': 'too_many_attempts',
                         'message': 'Zu viele Login-Versuche. Bitte in einigen Minuten erneut.'}), 429
     # SCALE-FIX: indizierter Single-Row-Read statt Full-Table-Load.
@@ -20499,6 +20736,11 @@ def auth_forgot():
         return jsonify({'ok': True, 'sent': True}), 200  # silent, kein Enumeration
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
     if client_ip and _ip_rate_limited(client_ip, endpoint='auth_forgot', limit=10, window_sec=600):
+        return jsonify({'ok': True, 'sent': True}), 200
+    # ZUSÄTZLICH durable per-Email (Supabase, instanz-übergreifend, fail-open):
+    # Mail-Bombing eines Opfers von VIELEN IPs/Instanzen wird sonst nicht gefangen.
+    # Antwort bleibt neutral-200 (kein Enumeration-Leak).
+    if email and _durable_auth_rate_limited(email, 'auth_forgot_email'):
         return jsonify({'ok': True, 'sent': True}), 200
     # SCALE-FIX: Single-Row-Read/Upsert statt Full-Table-Load/Save.
     # Antwortet immer 200 ohne Detail (kein E-Mail-Enumeration).
@@ -22814,7 +23056,7 @@ def ax_flight_route(callsign):
         return _public_cache_headers(jsonify(out))
     except Exception as e:
         app.logger.warning(f'[ax_flight_route] {cs} {str(e)[:120]}')
-        return jsonify({'ok': False, 'error': str(e)[:160]}), 200
+        return jsonify({'ok': False, 'error': 'internal_error'}), 200
 
 
 # Fernverkehr-Linien-Präfixe (für Post-Filter, falls products-Keys nicht greifen)
@@ -23430,7 +23672,7 @@ def ax_transit():
         return jsonify(out)
     except Exception as e:
         app.logger.warning(f'[ax_transit] fail {type(e).__name__}: {str(e)[:400]}')
-        return jsonify({'ok': False, 'error': f'{type(e).__name__}: {str(e)[:300]}'}), 200
+        return jsonify({'ok': False, 'error': 'internal_error'}), 200
 
 
 @app.route('/api/airport/<token>/board', methods=['GET'])
@@ -26773,7 +27015,8 @@ def import_calendar_feed(token):
                 return jsonify({'ok': False, 'error': 'response_too_large'}), 413
             text = raw.decode('utf-8', errors='replace')
     except Exception as e:
-        return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': str(e)[:200]}), 502
+        print(f'[import_calendar_feed] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': 'upstream_error'}), 502
     # RFC-5545-konformer ICS-Parser via module-level pure functions —
     # siehe _parse_ics_to_events oberhalb. Erlaubt isolierte Test-Coverage
     # (tests/test_ical_parser.py) ohne Flask-Context.
@@ -26938,8 +27181,8 @@ def upload_calendar_events(token):
         _attach_sectors(briefings, adapted)
         _ical_briefings_save(token, briefings)
     except Exception as e:
-        _reconcile_dbg = {'error': str(e)[:120]}
-        app.logger.warning(f'[ical-briefings] ekevent-persist-fail: {str(e)[:200]}')
+        _reconcile_dbg = {'error': 'internal_error'}
+        app.logger.warning(f'[ical-briefings] ekevent-persist-fail: {type(e).__name__}: {str(e)[:200]}')
     return jsonify({'ok': True, 'events_count': len(events),
                     'briefings_imported': imported_briefings,
                     'reconcile': _reconcile_dbg})
@@ -27067,7 +27310,8 @@ def lufthansa_save_credentials(token):
     try:
         from lufthansa_crewlink import encrypt_credentials
     except Exception as e:
-        return jsonify({'ok': False, 'error': 'crewlink_module_unavailable', 'detail': str(e)[:200]}), 500
+        print(f'[lufthansa_save_credentials] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'crewlink_module_unavailable', 'detail': 'internal_error'}), 500
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip()
     pw = body.get('password') or ''
@@ -27079,7 +27323,8 @@ def lufthansa_save_credentials(token):
     try:
         blob = encrypt_credentials(email, pw)
     except Exception as e:
-        return jsonify({'ok': False, 'error': 'encrypt_failed', 'detail': str(e)[:200]}), 500
+        print(f'[lufthansa_save_credentials] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'encrypt_failed', 'detail': 'internal_error'}), 500
     # W18-Followup (2026-06-10): via _profile_save nach SB spiegeln (vorher
     # disk-only → gespeicherte Credentials nach Cloud-Run-Redeploy weg).
     # Blob ist verschlüsselt (encrypt_credentials), kein Klartext in SB.
@@ -27106,7 +27351,8 @@ def lufthansa_sync(token):
     try:
         from lufthansa_crewlink import decrypt_credentials, scrape_roster
     except Exception as e:
-        return jsonify({'ok': False, 'error': 'module_unavailable', 'detail': str(e)[:200]}), 500
+        print(f'[lufthansa_sync] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'module_unavailable', 'detail': 'internal_error'}), 500
     # W18-Followup (2026-06-10): Credentials SB-first lesen (vorher disk-only
     # → nach Cloud-Run-Redeploy "no_credentials_saved" trotz Speicherung).
     blob = _profile_sidekey_get(token, 'lufthansa_credentials')
@@ -27152,7 +27398,8 @@ def lufthansa_sync_with_cookies(token):
     try:
         from lufthansa_crewlink import scrape_roster_with_cookies
     except Exception as e:
-        return jsonify({'ok': False, 'error': 'module_unavailable', 'detail': str(e)[:200]}), 500
+        print(f'[lufthansa_sync_with_cookies] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'module_unavailable', 'detail': 'internal_error'}), 500
     body = request.get_json(silent=True) or {}
     cookies = body.get('cookies') or {}
     if not cookies or not isinstance(cookies, dict):
