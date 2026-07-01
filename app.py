@@ -11251,6 +11251,11 @@ def get_friend_roster(token, friend_token):
             'layover_ort': rf.get('layover_ort'),
             'start_time': rf.get('start_time'),
             'end_time': rf.get('end_time'),
+            # Pro-Leg-Sektoren durchreichen (User 2026-07-01: „wer Zugriff auf den
+            # Kalender hat, soll GENAU dasselbe sehen wie der Besitzer"). Ohne das zeigte
+            # das Freunde-Sheet nur eine Route-Zeile/Tag statt der echten Legs. Familie
+            # nutzt dieselbe Quelle (simplified/volle Namen im Client).
+            'ical_sectors': day.get('ical_sectors'),
         })
     # FALLBACK (User 2026-06-30: „der Plan ist gespeichert, muss nur verlinkt
     # werden"): hat der Friend KEINEN gepushten Roster-Snapshot (z.B. er hat den
@@ -11299,6 +11304,9 @@ def get_friend_roster(token, friend_token):
                     'layover_ort': row.get('ical_layover_ort'),
                     'start_time': _hhmm(row.get('ical_start_iso') or row.get('ical_start')),
                     'end_time': _hhmm(row.get('ical_end_iso') or row.get('ical_end')),
+                    # Pro-Leg-Sektoren aus den Briefings durchreichen (s.o.) → Freunde-/
+                    # Familie-Sheet zeigt die echten Legs wie beim Besitzer.
+                    'ical_sectors': row.get('ical_sectors'),
                 })
             out.sort(key=lambda d: d.get('datum') or '')
         except Exception:
