@@ -11540,12 +11540,6 @@ def get_friend_roster(token, friend_token):
     if friend_token not in (me.get('friends') or []):
         return jsonify({'ok': False, 'shared': False,
                         'error': 'not_friends', 'days': []}), 403
-    # Share-Roster-Default-Allow: User-Anweisung — Reziprozität, default an.
-    # Nur explizit auf False gesetzt heißt Opt-Out. Missing field = teilt.
-    try:
-        friend_profile = (_profile_load(friend_token) or {}).get('profile', {}) or {}
-    except Exception:
-        friend_profile = {}
     # KEIN share_roster-Opt-Out mehr (Produkt-Entscheidung 2026-06-25): eine
     # ANGENOMMENE Freundschaft IST die Zustimmung, den Plan zu teilen. Es gibt
     # keinen Aus-Schalter mehr (im Client entfernt) — wer dich als Freund:in
@@ -14416,7 +14410,8 @@ def take_roster_snapshot(token):
                 body = 'Eine Änderung im Dienstplan erkannt — bitte prüfen.'
             else:
                 body = f'{n} Änderungen im Dienstplan erkannt — bitte prüfen.'
-            _send_push_notification(token, 'Dienstplan-Änderung', body)
+            _push_notify_async(token, 'Dienstplan-Änderung', body,
+                               data={'type': 'roster_change'})
         except Exception:
             pass
     return jsonify({'ok': True, 'changes_count': len(diff), 'changes': diff})
@@ -15130,6 +15125,14 @@ def send_chat_message(token, channel_id):
     except Exception as e:
         print(f'[send_chat_message] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
+    # Push an die Empfänger (DM: Gegenseite, Group: Mitglieder) — fire-and-
+    # forget im Executor, blockiert den Send-Response nicht. HEADLINE-Fix
+    # 2026-07-02: dieser generische Send-Pfad (den die iOS-App für Gruppen
+    # nutzt und über den auch /dm/send läuft) hatte vorher KEINEN Push.
+    try:
+        _chat_push_fanout_async(token, channel_id, text)
+    except Exception:
+        pass
     return jsonify({'ok': True, 'message': msg})
 
 
@@ -15362,21 +15365,11 @@ def send_dm(token, friend_token):
     if _token_rate_limited(token, 'dm_send', limit=30, window_sec=60):
         return jsonify({'ok': False, 'error': 'rate_limited',
                         'message': 'Bitte langsamer.'}), 429
-    resp = send_chat_message(token, ch)
-    # Push an den Empfänger (nicht-blocking, best-effort)
-    try:
-        # Sender-Name aus Profile
-        sender_name = 'Crew'
-        try:
-            with open(_user_profile_path(token)) as f:
-                sender_name = (json.load(f) or {}).get('profile', {}).get('name') or 'Crew'
-        except Exception:
-            pass
-        body = (request.get_json(silent=True) or {}).get('text', '')[:120]
-        _send_push_notification(friend_token, sender_name, body)
-    except Exception:
-        pass
-    return resp
+    # Push macht send_chat_message selbst (via _chat_push_fanout_async) —
+    # der alte Inline-Push hier war (a) BLOCKING im Request-Pfad und (b) las
+    # den Sender-Namen von der ephemeren Cloud-Run-Disk (fast immer leer →
+    # Push hieß 'Crew'). Doppel-Push vermeiden: hier NICHT mehr senden.
+    return send_chat_message(token, ch)
 
 
 @app.route('/api/crew-chat/<token>/dm/<friend_token>/message/<message_id>',
@@ -16876,9 +16869,10 @@ def add_comment(token, post_id):
         post_author = (_tp or {}).get('author_token')
         if post_author and post_author != token:
             commenter_name = name or 'Crew'
-            _send_push_notification(post_author,
-                                    f'{commenter_name} hat kommentiert',
-                                    (text or '')[:120])
+            _push_notify_async(post_author,
+                               f'{commenter_name} hat kommentiert',
+                               (text or '')[:120],
+                               data={'type': 'wall_comment', 'post_id': post_id})
     except Exception:
         pass
     return jsonify({'ok': True, 'comment': response_c})
@@ -18024,14 +18018,16 @@ def forum_create_reply(token, thread_id):
         author_name = reply.get('author_name') or 'Crew'
         thread_author_token = target.get('author_token')
         if thread_author_token and thread_author_token != token:
-            _send_push_notification(thread_author_token,
-                                    f'{author_name} hat geantwortet',
-                                    (text or '')[:120])
+            _push_notify_async(thread_author_token,
+                               f'{author_name} hat geantwortet',
+                               (text or '')[:120],
+                               data={'type': 'forum_reply'})
         # Mentioned-User extra benachrichtigen (nicht doppelt wenn = thread-author)
         if mentioned_token and mentioned_token != token and mentioned_token != thread_author_token:
-            _send_push_notification(mentioned_token,
-                                    f'{author_name} hat dich erwähnt',
-                                    (text or '')[:120])
+            _push_notify_async(mentioned_token,
+                               f'{author_name} hat dich erwähnt',
+                               (text or '')[:120],
+                               data={'type': 'forum_mention'})
     except Exception:
         pass
     return jsonify({'ok': True, 'reply': response_reply})
@@ -19065,9 +19061,10 @@ def layover_rec_add_comment(token, rec_id):
             parent_token = parent.get('author_token') if parent else None
             if parent_token and parent_token != token:
                 commenter = name or 'Crew'
-                _send_push_notification(parent_token,
-                                        f'{commenter} hat dir geantwortet',
-                                        (text or '')[:120])
+                _push_notify_async(parent_token,
+                                   f'{commenter} hat dir geantwortet',
+                                   (text or '')[:120],
+                                   data={'type': 'wall_comment_reply'})
     except Exception:
         pass
     return jsonify({'ok': True, 'comment': response_c})
@@ -20576,25 +20573,40 @@ def _apns_get_jwt():
         return None
 
 
-def _send_apns(apns_token, title, body, data=None, topic=None):
-    """Sendet eine Push-Notification via APNs HTTP/2. Returns True bei 200.
+def _send_apns(apns_token, title, body, data=None, topic=None,
+               thread_id=None, badge=None):
+    """Sendet eine Push-Notification via APNs HTTP/2.
+    Returns (ok: bool, reason: str|None). `reason` = APNs-Fehler-reason
+    (z.B. 'BadDeviceToken', 'Unregistered') — der Caller nutzt sie für
+    Token-Hygiene (tote Device-Tokens aus der Registry löschen).
 
     Braucht `httpx[http2]` im Environment (HTTP/2 ist Pflicht — Apple lehnt
-    HTTP/1.1 ab). Wenn httpx/h2 fehlt → return False mit warning.
+    HTTP/1.1 ab). Wenn httpx/h2 fehlt → return (False, …) mit warning.
 
     `topic` = APNs-Topic (= Bundle-ID des Ziel-Geräts). Caller übergibt die pro
     Gerät gespeicherte bundle_id; Fallback auf APNS_TOPIC-env, dann die korrekte
     App-Bundle-ID. (Vorher war der Default 'de.aerosteuer.aeris' — die App nutzt
     aber 'aerotax.AeroTax', sodass Apple JEDEN Push mit 400 BadTopic ablehnte.)
+
+    `thread_id` gruppiert Pushes in Notification-Center (z.B. pro Chat-Channel),
+    `badge` setzt die App-Icon-Zahl (None = unverändert lassen).
     """
     import os
     jwt = _apns_get_jwt()
     if not jwt:
-        return False  # caller handles fallback / skip
+        return False, 'no_jwt'  # caller handles fallback / skip
     topic = (topic or os.environ.get('APNS_TOPIC') or 'aerotax.AeroTax').strip()
     use_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
     host = 'api.sandbox.push.apple.com' if use_sandbox else 'api.push.apple.com'
-    payload = {'aps': {'alert': {'title': title, 'body': body}, 'sound': 'default'}}
+    aps = {'alert': {'title': title, 'body': body}, 'sound': 'default'}
+    if thread_id:
+        aps['thread-id'] = str(thread_id)[:128]
+    if badge is not None:
+        try:
+            aps['badge'] = int(badge)
+        except (TypeError, ValueError):
+            pass
+    payload = {'aps': aps}
     if data and isinstance(data, dict):
         for k, v in data.items():
             if k != 'aps':
@@ -20603,7 +20615,7 @@ def _send_apns(apns_token, title, body, data=None, topic=None):
         import httpx
     except ImportError:
         print("[APNS] httpx not installed — add 'httpx[http2]' to requirements.txt")
-        return False
+        return False, 'no_httpx'
     try:
         with httpx.Client(http2=True, timeout=10.0) as client:
             resp = client.post(
@@ -20617,23 +20629,33 @@ def _send_apns(apns_token, title, body, data=None, topic=None):
                 content=json.dumps(payload).encode('utf-8'),
             )
             if resp.status_code == 200:
-                return True
-            # 410 = device-token invalid/unregistered → caller könnte token löschen,
-            # aber für jetzt nur loggen.
+                return True, None
+            reason = None
+            try:
+                reason = (resp.json() or {}).get('reason')
+            except Exception:
+                pass
+            # 410 Unregistered / 400 BadDeviceToken → Caller löscht den Token.
             print(f"[APNS] send failed status={resp.status_code} body={resp.text[:200]}")
-            return False
+            return False, reason or f'http_{resp.status_code}'
     except Exception as e:
         print(f"[APNS] transport error: {e}")
-        return False
+        return False, 'transport_error'
 
 
-def _send_push_notification(token, title, body, data=None):
+def _send_push_notification(token, title, body, data=None,
+                            thread_id=None, badge=None):
     """Push-Send mit APNs-Bevorzugung + Expo-Fallback (best effort).
 
     1. Lade Push-Registry für `token`.
     2. Wenn `apns_token` gesetzt UND APNS_AUTH_KEY konfiguriert → APNs HTTP/2.
     3. Sonst Expo (legacy, für Web-Clients ohne native App).
     4. Wenn weder noch → silent return False.
+
+    Token-Hygiene (2026-07-02): APNs 410 Unregistered / 400 BadDeviceToken
+    heißt "dieses Device-Token ist tot" (App deinstalliert, Token rotiert) →
+    apns_token wird aus user_push_tokens gelöscht, damit wir nicht ewig gegen
+    tote Tokens senden.
     """
     import os
     if not token:
@@ -20645,8 +20667,19 @@ def _send_push_notification(token, title, body, data=None):
     expo_token = (reg.get('push_token') or '').strip()
     apns_topic = (reg.get('bundle_id') or '').strip() or None
     if apns_token and os.environ.get('APNS_AUTH_KEY', '').strip():
-        if _send_apns(apns_token, title, body, data=data, topic=apns_topic):
+        ok, reason = _send_apns(apns_token, title, body, data=data,
+                                topic=apns_topic, thread_id=thread_id,
+                                badge=badge)
+        if ok:
             return True
+        if reason in ('Unregistered', 'BadDeviceToken', 'ExpiredToken'):
+            # Totes Device-Token → Registry bereinigen (wie unregister-apns).
+            try:
+                cleared = {**reg, 'apns_token': ''}
+                _push_save(token, cleared)
+                print(f"[PUSH] pruned dead apns token for user {token[:8]} reason={reason}")
+            except Exception as e:
+                print(f"[PUSH] prune failed for user {token[:8]}: {e}")
         # APNs schlug fehl — falls Expo verfügbar, weiterversuchen.
     elif apns_token and not os.environ.get('APNS_AUTH_KEY', '').strip():
         print(f"[PUSH] APNS_AUTH_KEY not set — skipping APNs for user {token[:8]}")
@@ -20668,6 +20701,131 @@ def _send_push_notification(token, title, body, data=None):
         return True
     except Exception:
         return False
+
+
+# ── Fire-and-forget Push (2026-07-02) ────────────────────────────────────
+# _send_push_notification macht Netz-I/O (SB-Registry-Load + APNs HTTP/2, bis
+# ~10s Timeout) — INLINE im Request-Pfad blockierte das jeden Send-Endpoint.
+# Alle Event-Pushes laufen jetzt über diesen Executor: der Request antwortet
+# sofort, der Push passiert im Hintergrund, Fehler werden gelogged statt den
+# Response zu kippen.
+_PUSH_EXECUTOR = None
+
+
+def _push_executor():
+    global _PUSH_EXECUTOR
+    if _PUSH_EXECUTOR is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _PUSH_EXECUTOR = ThreadPoolExecutor(max_workers=4,
+                                            thread_name_prefix='push')
+    return _PUSH_EXECUTOR
+
+
+def _push_notify_async(token, title, body, data=None, thread_id=None,
+                       badge=None):
+    """Nicht-blockierender Wrapper um _send_push_notification. Best-effort:
+    Submit-Fehler (Interpreter-Shutdown o.ä.) werden geschluckt+gelogged."""
+    def _job():
+        try:
+            _send_push_notification(token, title, body, data=data,
+                                    thread_id=thread_id, badge=badge)
+        except Exception as e:
+            print(f"[PUSH] async send failed for {str(token)[:8]}: "
+                  f"{type(e).__name__}: {str(e)[:200]}")
+    try:
+        _push_executor().submit(_job)
+    except Exception as e:
+        print(f"[PUSH] executor submit failed: {e}")
+
+
+def _chat_push_fanout_async(author_token, channel_id, text):
+    """Push-Fanout für Chat-Messages (DM- UND Group-Channels) — der HEADLINE-
+    Fix für 'keine Push bei neuer Nachricht' (2026-07-02): der generische
+    Send-Endpoint /api/crew-chat/<t>/channel/<id>/send hatte NIE einen
+    Push-Pfad; nur der /dm-Wrapper pushte (blocking + Name von der ephemeren
+    Disk). Jetzt EINE Fanout-Stelle für beide Entry-Points.
+
+    - DM (`dm__a__b`): Empfänger = der andere Teilnehmer.
+    - Group (`group__gid`/`grp__gid`): Owner + members aus user_friend_groups
+      (best-effort — per-Code-Beigetretene ohne Members-Eintrag sind nicht
+      adressierbar, Capability-Modell hat keine vollständige Mitgliederliste).
+    - NIE an den Autor selbst; Block-/Mute-Listen des Empfängers respektiert.
+    - Läuft KOMPLETT im Push-Executor (Profil-Load + SB-Lookups = Netz-I/O).
+    """
+    def _job():
+        try:
+            recipients = []
+            group_name = None
+            cid = channel_id or ''
+            if cid.startswith('dm__'):
+                parts = cid[len('dm__'):].split('__')
+                recipients = [p for p in parts if p and p != author_token]
+            else:
+                gid = _group_id_from_channel(cid)
+                if gid and SB_AVAILABLE:
+                    try:
+                        r = (sb.table('user_friend_groups')
+                             .select('owner_token,name,members')
+                             .eq('id', gid).limit(1).execute())
+                        rows = r.data or []
+                        if rows:
+                            row = rows[0]
+                            group_name = (row.get('name') or '').strip() or None
+                            mem = row.get('members')
+                            cand = [row.get('owner_token')] + \
+                                   (mem if isinstance(mem, list) else [])
+                            seen = set()
+                            for m in cand:
+                                if (isinstance(m, str) and m
+                                        and m != author_token
+                                        and m not in seen):
+                                    seen.add(m)
+                                    recipients.append(m)
+                            recipients = recipients[:25]  # Fanout-Cap
+                    except Exception as e:
+                        print(f"[PUSH] group lookup failed gid={str(gid)[:12]}: "
+                              f"{type(e).__name__}: {str(e)[:120]}")
+            if not recipients:
+                return
+            sender_name = ''
+            try:
+                sender_name = ((_profile_load(author_token) or {})
+                               .get('profile', {}) or {}).get('name') or ''
+            except Exception:
+                pass
+            sender_name = sender_name.strip() or 'Crew'
+            preview = (text or '').strip()[:140]
+            is_group = not cid.startswith('dm__')
+            for rcpt in recipients:
+                try:
+                    # Empfänger hat den Autor stummgeschaltet/geblockt → kein Push.
+                    if author_token in _muted_by(rcpt) or \
+                       author_token in _blocked_by(rcpt):
+                        continue
+                except Exception:
+                    pass
+                if is_group:
+                    title = f"{sender_name} · {group_name}" if group_name else sender_name
+                    payload_type = 'group_message'
+                else:
+                    title = sender_name
+                    payload_type = 'dm'
+                try:
+                    _send_push_notification(
+                        rcpt, title, preview,
+                        data={'type': payload_type, 'channel_id': cid,
+                              'from': author_token},
+                        thread_id=cid, badge=1)
+                except Exception as e:
+                    print(f"[PUSH] chat fanout send failed rcpt={str(rcpt)[:8]}: "
+                          f"{type(e).__name__}: {str(e)[:200]}")
+        except Exception as e:
+            print(f"[PUSH] chat fanout failed ch={str(channel_id)[:24]}: "
+                  f"{type(e).__name__}: {str(e)[:200]}")
+    try:
+        _push_executor().submit(_job)
+    except Exception as e:
+        print(f"[PUSH] executor submit failed: {e}")
 
 
 @app.route('/api/user/history/<token>/clear', methods=['POST'])
@@ -20781,8 +20939,15 @@ def _auth_load():
     Redeploy = Wipe). Bei leerer SB + Disk-Daten: einmalige Migration."""
     sb_data = _auth_load_from_supabase()
     if sb_data is None:
-        # SB-Ausfall — Disk-Fallback
-        return _auth_load_from_disk()
+        # SB-Ausfall — Disk-Fallback. Auf Cloud Run ist die Disk nach jedem
+        # Deploy/Scale-Event LEER: ein leerer Disk-Cache heißt dann NICHT
+        # „0 User", sondern „keine Daten verfügbar" → None als Fehlersignal,
+        # damit _refresh_token_cache den bisherigen Cache BEHÄLT statt ihn
+        # mit einer leeren Map zu überschreiben. (Root cause der Logout-
+        # Wellen 2026-07-01: sb_load_fail → leere tmap „erfolgreich" gecacht
+        # → Gate 401 unauthorized → App-Logout.)
+        disk_data = _auth_load_from_disk()
+        return disk_data if disk_data else None
     if sb_data:
         return sb_data
     # SB erreichbar aber leer — prüfen ob Disk Legacy-Daten hat, einmalig migrieren
@@ -21021,10 +21186,13 @@ def _validate_token_exists(token):
     if hit is None and not cache_stale:
         # Token nicht im Cache, aber Cache ist nicht stale. Möglich: neuer
         # Signup seit letztem Refresh. Einmal force-refresh, dann erneut checken.
-        cached = _refresh_token_cache(now, force=True)
-        if cached is None:
-            return None
-        hit = cached.get(token)
+        fresh = _refresh_token_cache(now, force=True)
+        if fresh is None:
+            # Force-Refresh fehlgeschlagen (DB-Hickup): NICHT 401 — das Token
+            # könnte ein frischer Signup sein. Fail-open-Sentinel wie oben;
+            # das Forged-Token-Risiko besteht nur während eines DB-Ausfalls.
+            return '__auth_cache_unavailable__'
+        hit = fresh.get(token)
     return hit
 
 
@@ -21035,12 +21203,25 @@ def _refresh_token_cache(now=None, force=False):
     if now is None:
         now = _t.time()
     try:
-        users = _auth_load() or {}
+        users = _auth_load()
+        if users is None:
+            # Auth-Store nicht verfügbar (SB-Hickup + leere Cloud-Run-Disk):
+            # KEIN „erfolgreicher" Refresh mit leerer Map — bisherigen Cache
+            # behalten, Caller nutzt den Stale-Fail-Safe.
+            app.logger.warning('[token-auth] cache_refresh_fail: auth store unavailable — keeping previous cache')
+            return None
         tmap = {}
         for email, rec in (users or {}).items():
             tok = (rec or {}).get('token')
             if tok:
                 tmap[tok] = email
+        prev = _TOKEN_VALIDATE_CACHE['tokens']
+        if not tmap and prev:
+            # Shrink-Guard: eine nicht-leere Token-Map wird NIE durch eine
+            # leere ersetzt (leere auth_users in Prod = Datenfehler, nicht
+            # „alle User gelöscht").
+            app.logger.warning('[token-auth] refresh returned EMPTY map — keeping previous non-empty cache')
+            return None
         _TOKEN_VALIDATE_CACHE['tokens'] = tmap
         _TOKEN_VALIDATE_CACHE['expires'] = now + _TOKEN_VALIDATE_CACHE_TTL
         return tmap
@@ -26566,9 +26747,9 @@ def _send_friend_request_core(token, target):
     try:
         my_name = ((_profile_load(token) or {}).get('profile', {}) or {}).get('name') or ''
         who = my_name.strip() or 'Jemand'
-        _send_push_notification(target, 'Neue Folge-Anfrage',
-                                f'{who} möchte dir folgen.',
-                                data={'type': 'friend_request', 'from': token})
+        _push_notify_async(target, 'Neue Folge-Anfrage',
+                           f'{who} möchte dir folgen.',
+                           data={'type': 'friend_request', 'from': token})
     except Exception:
         pass
     return jsonify({'ok': True})
@@ -26700,8 +26881,9 @@ def accept_friend_request(token):
         # es nicht gibt → Push hieß immer 'Jemand'.
         my_name = ((_profile_load(token) or {}).get('profile', {}) or {}).get('name') or ''
         who = my_name.strip() or 'Jemand'
-        _send_push_notification(from_token, 'Neue Crew-Verbindung',
-                                f'{who} hat deine Anfrage angenommen.')
+        _push_notify_async(from_token, 'Neue Crew-Verbindung',
+                           f'{who} hat deine Anfrage angenommen.',
+                           data={'type': 'friend_accept', 'from': token})
     except Exception:
         pass
     return jsonify({'ok': True})
@@ -26774,8 +26956,8 @@ def friend_remind(token):
     if friend_token not in (_friends_load(token).get('friends') or []):
         return jsonify({'ok': False, 'error': 'not_friends'}), 403
     try:
-        _send_push_notification(friend_token, 'Erinnerung',
-                                'Ein Crew-Buddy bittet dich, deinen Dienstplan zu importieren.')
+        _push_notify_async(friend_token, 'Erinnerung',
+                           'Ein Crew-Buddy bittet dich, deinen Dienstplan zu importieren.')
     except Exception:
         pass
     return jsonify({'ok': True})
@@ -27709,6 +27891,14 @@ def import_calendar_feed(token):
     """
     body = request.get_json(silent=True) or {}
     url = (body.get('url') or '').strip()
+    # webcal:// = der iOS/macOS-Link aus myTime „Roster Share" — gleiche Feed-URL,
+    # anderes Scheme. Ältere App-Builds normalisieren client-seitig noch nicht →
+    # hier server-seitig auf https heben (User-Test 2026-07-01: Verbinden blieb grau).
+    low = url.lower()
+    if low.startswith('webcal://'):
+        url = 'https://' + url[len('webcal://'):]
+    elif low.startswith('webcals://'):
+        url = 'https://' + url[len('webcals://'):]
     # HTTP raus · nur HTTPS akzeptieren (sonst Klartext-Cookies leakable)
     if not url.startswith('https://'):
         return jsonify({'ok': False, 'error': 'https_required'}), 400
