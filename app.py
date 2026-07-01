@@ -20057,9 +20057,22 @@ def _validate_token_exists(token):
     cached = _TOKEN_VALIDATE_CACHE['tokens']
     cache_stale = cached is None or _TOKEN_VALIDATE_CACHE['expires'] < now
     if cache_stale:
-        cached = _refresh_token_cache(now)
-        if cached is None:
-            return None
+        refreshed = _refresh_token_cache(now)
+        if refreshed is not None:
+            cached = refreshed
+        elif cached is not None:
+            # FAIL-SAFE (User 2026-07-01 „App loggt mich IMMER WIEDER aus"): der Reload
+            # (auth_users aus Supabase) schlug TRANSIENT fehl (Cold-Start/DB-Hickup/Timeout)
+            # → vorher wurde JEDES gültige Token als „unbekannt" gewertet → Gate 401
+            # unauthorized → Client-Logout. Jetzt: den STALE (aber echten) Cache weiter
+            # nutzen — gültige Tokens finden sich, geforgte bleiben abgewiesen.
+            pass
+        else:
+            # Gar kein Cache jemals geladen UND Reload fehlgeschlagen → NICHT alle
+            # aussperren. Fail-open-Sentinel (non-None) → Gate lässt durch. Das
+            # Forged-Token-Risiko während eines DB-Ausfalls ist kleiner als ein
+            # flächendeckender Zwangs-Logout.
+            return '__auth_cache_unavailable__'
     hit = cached.get(token)
     if hit is None and not cache_stale:
         # Token nicht im Cache, aber Cache ist nicht stale. Möglich: neuer
