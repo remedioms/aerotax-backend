@@ -95,8 +95,10 @@ def parse_se_pdf(pdf_path):
 
 
 if __name__ == '__main__':
-    path = sys.argv[1] if len(sys.argv) > 1 else \
-        '/Users/miguelschumann/Desktop/Tibor/2025/2025 Streckeneinsatzabrechnungen.pdf'
+    import os as _os
+    path = sys.argv[1] if len(sys.argv) > 1 else _os.path.join(
+        _os.environ.get('AEROTAX_PRIVATE_DOCS_ROOT') or _os.path.expanduser('~/Desktop/Downloads'),
+        'Tibor', '2025', '2025 Streckeneinsatzabrechnungen.pdf')
     rows = parse_se_pdf(path)
     active = [r for r in rows if not r['storno']]
     foreign = [r for r in active if r['stfrei_inland'] is False]

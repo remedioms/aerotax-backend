@@ -5,7 +5,7 @@ Aufruf:
     ANTHROPIC_API_KEY=sk-ant-... python3 scripts/r15_live_validation.py
 
 Optional:
-    --tibor-dir /pfad/zu/Tibor/2025/        (default: /Users/miguelschumann/Desktop/Tibor/2025)
+    --tibor-dir /pfad/zu/Tibor/2025/        (default: $AEROTAX_PRIVATE_DOCS_ROOT/Tibor/2025, sonst ~/Desktop/Downloads/Tibor/2025)
     --homebase FRA
     --skip-v1                               (nur V2 messen, V1-Baseline aus Datei laden)
     --skip-v2                               (nur V1 messen)
@@ -40,7 +40,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-DEFAULT_TIBOR_DIR = Path('/Users/miguelschumann/Desktop/Tibor/2025')
+# Private Original-PDFs (nicht im Repo) — Override: env AEROTAX_PRIVATE_DOCS_ROOT
+DEFAULT_TIBOR_DIR = Path(
+    os.environ.get('AEROTAX_PRIVATE_DOCS_ROOT') or Path.home() / 'Desktop' / 'Downloads'
+) / 'Tibor' / '2025'
 
 
 def _load_pdf(path: Path) -> bytes:

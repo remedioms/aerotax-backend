@@ -27,7 +27,11 @@ os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
 import app as app_module
 import normalized_tours as nt
 
-CAS_DIR = '/Users/miguelschumann/Desktop/Tibor/2025/Dienstplan'  # FIX 2026-06-04: war fälschlich Miguels Steuer-25-CAS (Person 95775) — Golden/SE/Reader sind aber Tibor (99102); der falsche CAS-Overlay verfälschte die Validierung
+# Private Original-PDFs (nicht im Repo) — Override: env AEROTAX_PRIVATE_DOCS_ROOT
+_PRIVATE_ROOT = os.environ.get('AEROTAX_PRIVATE_DOCS_ROOT') or os.path.expanduser('~/Desktop/Downloads')
+# FIX 2026-06-04: war fälschlich Miguels Steuer-25-CAS (Person 95775) — Golden/SE/Reader
+# sind aber Tibor (99102); der falsche CAS-Overlay verfälschte die Validierung
+CAS_DIR = os.path.join(_PRIVATE_ROOT, 'Tibor', '2025', 'Dienstplan')
 
 
 def _load_cas_pdf_bytes():
@@ -58,7 +62,7 @@ def _build_bmf_table(year):
     return table
 
 
-SE_PDF = '/Users/miguelschumann/Desktop/Tibor/2025/2025 Streckeneinsatzabrechnungen.pdf'
+SE_PDF = os.path.join(_PRIVATE_ROOT, 'Tibor', '2025', '2025 Streckeneinsatzabrechnungen.pdf')
 
 
 def _real_se_rows():

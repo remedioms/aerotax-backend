@@ -581,26 +581,61 @@ def _news_img_mem_set(key, content_type, data):
 
 def _news_fetch_remote_image(url):
     """Zieht ein Remote-Bild. (bytes, content_type) oder (None, None).
-    Erzwingt content-type=image/*, hartes Größen-Cap und kurzes Timeout."""
-    try:
-        parsed = urllib.parse.urlsplit(url)
+    Erzwingt content-type=image/*, hartes Größen-Cap und kurzes Timeout.
+
+    SSRF-Härtung (Audit 2026-07-01): Redirects werden MANUELL verfolgt
+    (max. 3 Hops) und JEDER Hop erneut gegen _news_host_is_safe geprüft —
+    vorher konnte ein externer 302 auf eine interne/Metadata-Adresse
+    umleiten (allow_redirects=True validierte nur den ersten Host)."""
+    _MAX_REDIRECT_HOPS = 3
+    current_url = url
+    resp = None
+    for _hop in range(_MAX_REDIRECT_HOPS + 1):
+        try:
+            parsed = urllib.parse.urlsplit(current_url)
+        except Exception:
+            return None, None
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            _log_warn(f'[news/image] bad-scheme-on-hop url={current_url[:120]}')
+            return None, None
+        if not _news_host_is_safe(parsed.hostname):
+            _log_warn(f'[news/image] blocked-host-on-hop url={current_url[:120]}')
+            return None, None
         referer = f'{parsed.scheme}://{parsed.netloc}/'
-        resp = requests.get(
-            url,
-            timeout=_NEWS_IMG_FETCH_TIMEOUT,
-            headers={
-                'User-Agent': _NEWS_IMG_UA,
-                'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-                'Accept-Language': 'de-DE,de;q=0.9,en;q=0.7',
-                # Referer = Origin des Bildes selbst → umgeht die meisten
-                # Hotlink-Schutz-Checks (die nur „fremde" Referer blocken).
-                'Referer': referer,
-            },
-            allow_redirects=True,
-            stream=True,
-        )
-    except requests.RequestException as exc:
-        _log_warn(f'[news/image] fetch-error: {exc!r}')
+        try:
+            resp = requests.get(
+                current_url,
+                timeout=_NEWS_IMG_FETCH_TIMEOUT,
+                headers={
+                    'User-Agent': _NEWS_IMG_UA,
+                    'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                    'Accept-Language': 'de-DE,de;q=0.9,en;q=0.7',
+                    # Referer = Origin des Bildes selbst → umgeht die meisten
+                    # Hotlink-Schutz-Checks (die nur „fremde" Referer blocken).
+                    'Referer': referer,
+                },
+                allow_redirects=False,
+                stream=True,
+            )
+        except requests.RequestException as exc:
+            _log_warn(f'[news/image] fetch-error: {exc!r}')
+            return None, None
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get('Location') or ''
+            try:
+                resp.close()
+            except Exception:
+                pass
+            resp = None
+            if not location:
+                return None, None
+            # Relative Location gegen die aktuelle URL auflösen; der neue Host
+            # wird am Schleifenkopf erneut gegen _news_host_is_safe geprüft.
+            current_url = urllib.parse.urljoin(current_url, location)
+            continue
+        break
+    if resp is None:
+        _log_warn(f'[news/image] too-many-redirects url={url[:120]}')
         return None, None
     try:
         if resp.status_code != 200:
@@ -641,7 +676,6 @@ def _news_img_response(data, content_type):
 def get_news_image():
     """Backend-Image-Proxy für den News-Feed (siehe Section-Header).
     Query: u=<absolute http(s)-Bild-URL> (urlencoded)."""
-    from flask import redirect
     raw = (request.args.get('u') or '').strip()
     if not raw:
         return jsonify({'ok': False, 'error': 'missing_url'}), 400
@@ -680,9 +714,11 @@ def get_news_image():
     # 3) Remote ziehen.
     data, ct = _news_fetch_remote_image(raw)
     if not data:
-        # Best-effort: 302 auf die Originalquelle, damit die App es selbst
-        # versuchen kann (statt eines harten 404 = leeres Bild).
-        return redirect(raw, code=302)
+        # SSRF/Open-Redirect-Härtung (Audit 2026-07-01): KEIN 302 mehr auf die
+        # unvalidierte Roh-URL (der Fetch kann auch WEGEN blocked_host scheitern
+        # — der Redirect hätte den Client dann genau dorthin geschickt).
+        # 404 = die App zeigt ihren Platzhalter.
+        return jsonify({'ok': False, 'error': 'image_unavailable'}), 404
 
     _news_img_mem_set(key_hash, ct, data)
     if r2_enabled:

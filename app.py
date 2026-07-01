@@ -6826,6 +6826,26 @@ def _cleanup_loop():
             if cycle % 15 != 0:
                 continue
             _cleanup_expired_sessions()
+            # In-Memory _store: abgelaufene Einträge evicten (2026-07-01).
+            # Das `expires`-Feld wurde in-process nie durchgesetzt — Sessions
+            # mit File-Bytes (upload-files) akkumulierten bis zum Restart.
+            try:
+                _now_dt = datetime.utcnow()
+                for _sk in list(_store.keys()):
+                    _entry = _store.get(_sk)
+                    if not isinstance(_entry, dict):
+                        continue
+                    _exp = _entry.get('expires')
+                    if isinstance(_exp, str):
+                        try:
+                            _exp = datetime.fromisoformat(_exp.replace('Z', ''))
+                        except Exception:
+                            _exp = None
+                    if isinstance(_exp, datetime) and _exp < _now_dt:
+                        _store.pop(_sk, None)
+                        print(f"[cleanup] _store expired entry evicted: {str(_sk)[:24]}")
+            except Exception as _e:
+                print(f"[cleanup] _store evict fail: {_e}")
             # Auch alte Job-State-Files
             cutoff = datetime.utcnow() - timedelta(hours=48)
             for fn in os.listdir(_JOBS_DIR):
@@ -8956,8 +8976,10 @@ def admin_qa_seed():
             _save_pdf(pdf_token, pdf_bytes, 'AeroTax_QA_Seed_2025.pdf', hours=24)
             download_url = f'/api/download/{pdf_token}'
         except Exception as e:
-            print(f"[qa-seed] PDF generation failed: {e}")
-            return jsonify({'error': f'pdf generation failed: {e}'}), 500
+            # Fehlerdetail NUR server-side loggen — keine Exception-Interna
+            # (Pfade/Klassennamen/Stack-Hinweise) im Response-Body (Audit 2026-07-01).
+            print(f"[qa-seed] PDF generation failed: {type(e).__name__}: {e}")
+            return jsonify({'error': 'pdf_generation_failed'}), 500
 
     token = _make_session_token(job_id)
 
@@ -9322,6 +9344,64 @@ def _profile_load_from_supabase(token):
         return None
 
 
+# ── SQL-RPC-Wrapper (Data-Layer-Refactor 2026-07-01) ────────────────────────
+# Atomare server-seitige Mutationen (Counter-Bumps, metadata-Merge) via RPC
+# statt read-modify-write in Python (Lost-Updates über mehrere Cloud-Run-
+# Instanzen). Die RPCs kommen aus supabase_migrations/20260701_data_layer.sql
+# und werden vom User MANUELL im SQL-Editor applied — der Code MUSS ohne sie
+# funktionieren: fehlt eine RPC (PGRST202), wird sie für diesen Prozess
+# deaktiviert (einmal geloggt) und der Caller nutzt seinen degradierten
+# best-effort-Fallback (per-Row read-modify-write).
+_SOCIAL_RPC_DISABLED = set()
+
+
+def _social_rpc_call(fn_name, params):
+    """Ruft eine Postgres-RPC. Returns (ok, data). ok=False ⇒ Caller-Fallback."""
+    if not SB_AVAILABLE or fn_name in _SOCIAL_RPC_DISABLED:
+        return False, None
+    try:
+        r = sb.rpc(fn_name, params).execute()
+        return True, r.data
+    except Exception as e:
+        msg = str(e)
+        if 'PGRST202' in msg or 'Could not find the function' in msg \
+                or 'does not exist' in msg:
+            if fn_name not in _SOCIAL_RPC_DISABLED:
+                _SOCIAL_RPC_DISABLED.add(fn_name)
+                app.logger.warning(
+                    f'[rpc] {fn_name} fehlt in Supabase — Migration '
+                    f'supabase_migrations/20260701_data_layer.sql anwenden. '
+                    f'Degradierter read-modify-write-Fallback aktiv.')
+        else:
+            app.logger.warning(
+                f'[rpc] {fn_name} failed: {type(e).__name__}: {msg[:120]}')
+        return False, None
+
+
+def _profile_metadata_merge_sb(token, patch):
+    """Atomarer metadata-Merge (coalesce(metadata,'{}') || patch) via RPC.
+    Returns True wenn der Merge server-seitig eine EXISTIERENDE Row traf
+    (oder nichts zu mergen war); False ⇒ Caller nutzt den alten
+    read-merge-upsert-Pfad (legt auch die Row neu an, best-effort)."""
+    if not patch:
+        return True
+    ok, data = _social_rpc_call('profile_metadata_merge',
+                                {'p_token': token, 'p_patch': patch})
+    if not ok:
+        return False
+    # RPC returnt die Zahl der upgedateten Rows (int, ggf. als 1-Element-Liste
+    # gewrappt). Alles andere (0, None, unerwartete Shape) ⇒ Fallback.
+    if isinstance(data, list) and data:
+        data = (next(iter(data[0].values()), None)
+                if isinstance(data[0], dict) else data[0])
+    if not isinstance(data, (int, float, str)) or isinstance(data, bool):
+        return False
+    try:
+        return int(data) >= 1
+    except (TypeError, ValueError):
+        return False
+
+
 def _profile_save_to_supabase(token, profile):
     """Upsert einer Profile-Row. True/False für Erfolg."""
     if not SB_AVAILABLE or not token:
@@ -9334,14 +9414,25 @@ def _profile_save_to_supabase(token, profile):
             row[k] = v
         else:
             meta[k] = v
-    # DURABILITY-FIX (2026-06-29): metadata-jsonb NICHT clobbern. Mehrere Caller
-    # (post_user_location stuendlich, weitere *_save-Pfade) laden das Profil von
-    # der EPHEMEREN Cloud-Run-Disk — nach einem Restart ist die leer, und ein
-    # voller Overwrite der metadata-Spalte loeschte avatar_url/location_source/
-    # current_city/share_location fuer JEDEN aktiven User (das war DER Avatar-
-    # Verschwinde-Bug: Foto in R2 vorhanden, aber der Pointer in metadata weg).
-    # Loesung: bestehende SB-metadata lesen und nur die uebergebenen Keys mergen.
-    # Explizit loeschen bleibt moeglich via key=None (wird als None geschrieben).
+    # DURABILITY (2026-06-29 → atomar seit 2026-07-01): metadata-jsonb NICHT
+    # clobbern. Ein voller Overwrite der metadata-Spalte loeschte avatar_url/
+    # location_source/current_city/share_location fuer JEDEN aktiven User (DER
+    # Avatar-Verschwinde-Bug: Foto in R2 vorhanden, Pointer in metadata weg).
+    # Primärpfad jetzt ATOMAR: RPC profile_metadata_merge (server-seitiges
+    # `||`, trifft nur existierende Rows) + Known-Cols-Upsert OHNE
+    # metadata-Key (Spalte bleibt unberührt) — kein read-modify-write-Fenster
+    # mehr zwischen zwei Instanzen.
+    if _profile_metadata_merge_sb(token, meta):
+        try:
+            sb.table('user_profiles').upsert(row, on_conflict='token').execute()
+            return True
+        except Exception as e:
+            app.logger.error(
+                f'[profile] sb_save_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:200]}'
+            )
+            return False
+    # Fallback (RPC fehlt/failt ODER Row existiert noch nicht): bisheriger
+    # best-effort read-merge-upsert — legt die Row inkl. metadata an.
     try:
         prev = sb.table('user_profiles').select('metadata') \
                  .eq('token', token).limit(1).execute().data or []
@@ -9402,6 +9493,96 @@ def _profile_load(token):
         app.logger.info(f'[profile] lazy-migrate tok={token[:8]} disk→supabase')
         _profile_save_to_supabase(token, disk_prof)
     return disk_full
+
+
+# Schlanke metadata-Keys die Friend-/Social-Listen brauchen. Bewusst OHNE
+# avatar_b64 & Co. — metadata kann ~270KB Bild-Bytes pro User tragen, ein
+# `select metadata` über 50 Friends wäre >13MB Response für eine Namensliste.
+_PROFILE_BULK_META_KEYS = (
+    'avatar_url', 'share_location', 'current_city', 'location_source',
+    'role', 'account_type',
+)
+
+
+def _profiles_load_bulk(tokens, include_metadata=False):
+    """Batch-Load von Profil-Dicts für viele Tokens in EINEM SB-Query statt
+    N× _profile_load (N+1-Killer für Friend-Listen). Returns {token: profile}
+    — profile hat dieselbe Shape wie _profile_load(token)['profile'] (Known-
+    Cols + zurückgefaltete metadata-Keys), aber default NUR die schlanken
+    _PROFILE_BULK_META_KEYS (via PostgREST `alias:metadata->>key`).
+    include_metadata=True lädt die volle metadata-jsonb; avatar_b64/
+    avatar_bytes werden trotzdem sofort gestrippt (Bloat-Schutz).
+    Tokens ohne SB-Row fallen auf die Disk-Kopie zurück (best-effort, kein
+    Lazy-Migrate hier — das macht weiterhin _profile_load auf Einzelpfaden).
+    Bei SB-down: kompletter Disk-Fallback pro Token."""
+    out = {}
+    toks = [t for t in dict.fromkeys(tokens or []) if t]
+    if not toks:
+        return out
+    sb_ok = False
+    if SB_AVAILABLE:
+        if include_metadata:
+            cols = 'token,updated_at,metadata,' + ','.join(sorted(_PROFILE_KNOWN_COLS))
+        else:
+            cols = ('token,updated_at,' + ','.join(sorted(_PROFILE_KNOWN_COLS)) + ','
+                    + ','.join(f'{k}:metadata->>{k}' for k in _PROFILE_BULK_META_KEYS))
+        try:
+            for i in range(0, len(toks), 200):
+                r = (sb.table('user_profiles').select(cols)
+                     .in_('token', toks[i:i + 200]).execute())
+                for row in (r.data or []):
+                    tok = row.get('token')
+                    if not tok:
+                        continue
+                    prof = {}
+                    for k in _PROFILE_KNOWN_COLS:
+                        v = row.get(k)
+                        if v is not None:
+                            prof[k] = v
+                    if prof.get('employers') is None:
+                        prof['employers'] = []
+                    if include_metadata:
+                        md = row.get('metadata') or {}
+                        if isinstance(md, dict):
+                            for k, v in md.items():
+                                if k in ('avatar_b64', 'avatar_bytes'):
+                                    continue
+                                if k not in prof:
+                                    prof[k] = v
+                    else:
+                        for k in _PROFILE_BULK_META_KEYS:
+                            v = row.get(k)
+                            if v is not None and k not in prof:
+                                # ->> liefert IMMER text — bool/int-Keys
+                                # (share_location) zurück-typisieren, damit
+                                # `is False`-Gates weiter funktionieren.
+                                if v == 'true':
+                                    v = True
+                                elif v == 'false':
+                                    v = False
+                                elif isinstance(v, str) and v.isdigit() \
+                                        and k in ('share_location',):
+                                    v = int(v)  # legacy int-0/1-Werte
+                                prof[k] = v
+                    if row.get('updated_at') is not None:
+                        prof['_updated_at'] = row.get('updated_at')
+                    out[tok] = prof
+            sb_ok = True
+        except Exception as e:
+            app.logger.warning(
+                f'[profile] bulk_load_fail n={len(toks)} err={type(e).__name__}: {str(e)[:120]}')
+    # Disk-Fallback für fehlende Tokens (SB-down oder Row fehlt) — hält das
+    # alte Verhalten der per-Token-_profile_load-Schleifen (Disk als Backup).
+    for t in toks:
+        if t in out:
+            continue
+        try:
+            dp = (_profile_load_from_disk(t) or {}).get('profile') or {}
+        except Exception:
+            dp = {}
+        if dp or not sb_ok:
+            out[t] = dp
+    return out
 
 
 def _profile_save(token, profile, full_disk_payload=None):
@@ -10583,13 +10764,13 @@ def get_user_friends(token):
     """Listet alle Friends eines Users mit deren Profile-Daten."""
     data = _friends_load(token)
     enriched = []
+    # N+1-Fix (2026-07-01): EIN Bulk-Query über alle Friend-Profile statt
+    # _profile_load pro Friend (SB-first-Verhalten von #29B bleibt erhalten;
+    # metadata wird NICHT wholesale geladen — nur schlanke Keys, kein
+    # avatar_b64-Bloat).
+    _bulk_profs = _profiles_load_bulk(data.get('friends', []))
     for friend_token in data.get('friends', []):
-        # #29B: SB-primary statt Disk-only. Auf Cloud Run ist die Disk ephemer/
-        # per-Instanz — `open(_user_profile_path(...))` traf die Profil-Datei der
-        # Freunde meist NICHT (andere Instanz / nach Redeploy weg) → prof={} →
-        # Client zeigte den rohen Token-Prefix als Namen ("falscher Name") und
-        # Chat sagte "keine Freunde". `_profile_load` liest SB-first.
-        prof = (_profile_load(friend_token) or {}).get('profile', {}) or {}
+        prof = _bulk_profs.get(friend_token) or {}
         # Interne Avatar-Storage-Keys NICHT mit ausliefern: die base64-Bytes
         # (~270 KB/Friend) würden die Friends-Antwort enorm aufblähen und die
         # rohen Bild-Bytes leaken. Der Client braucht nur `avatar_url` (CrewAvatar
@@ -10683,6 +10864,11 @@ def get_friends_overlap(token):
                 out[t.get('datum')] = place
         return out
 
+    # _store ist in-memory/per-Instanz — Fallback auf den persistenten
+    # roster_snapshot (Muster wie get_friend_roster), sonst war der Overlap
+    # nach Container-Restart/anderer Instanz immer leer (2026-07-01).
+    if not my_tage:
+        my_tage = (_roster_snapshot_read(token) or {}).get('tage') or []
     my_layovers = _extract_layover_set(my_tage)
     if not my_layovers:
         return jsonify({'token': token, 'overlaps': [], 'reason': 'no_layovers_in_my_data'})
@@ -10698,10 +10884,16 @@ def get_friends_overlap(token):
 
     my_tage_by_date = {t.get('datum'): t for t in my_tage if isinstance(t, dict)}
     friends = (_friends_load(token).get('friends') or [])
+    # N+1-Fix (2026-07-01): Friend-Namen in EINEM Bulk-Query statt
+    # _profile_load pro gematchtem Friend.
+    _bulk_profs = _profiles_load_bulk(friends)
     overlaps = []
     for friend_token in friends:
         friend_session = _store.get(friend_token) or {}
         friend_tage = (friend_session.get('result_data') or {}).get('_tage_detail') or []
+        if not friend_tage:
+            # Persistenter Snapshot-Fallback (Muster wie get_friend_roster).
+            friend_tage = (_roster_snapshot_read(friend_token) or {}).get('tage') or []
         friend_layovers = _extract_layover_set(friend_tage)
         friend_tage_by_date = {t.get('datum'): t for t in friend_tage if isinstance(t, dict)}
         shared = []
@@ -10718,9 +10910,8 @@ def get_friends_overlap(token):
                     'briefing_diff_min': briefing_diff,
                 })
         if shared:
-            # BUG-035-Fix: Friend-Name SB-primary lesen (wie get_user_friends),
-            # nicht disk-only — auf einer frischen Instanz ist das Disk-Profil leer.
-            prof = (_profile_load(friend_token) or {}).get('profile', {}) or {}
+            # BUG-035-Fix: Friend-Name SB-primary (bulk-geladen, s.o.).
+            prof = _bulk_profs.get(friend_token) or {}
             overlaps.append({
                 'friend_token': friend_token,
                 'friend_name': prof.get('name', friend_token[:8] + '…'),
@@ -10892,10 +11083,12 @@ def get_crew_at_destination(token):
     for myl in my_layovers:
         by_iata[myl['iata']]['my_dates'].add(myl['datum'])
 
+    # N+1-Fix (2026-07-01): Friend-Profile in EINEM Bulk-Query.
+    _bulk_profs = _profiles_load_bulk(friends)
     for fr in friends:
         if not _layover_visibility_get(fr):
             continue
-        prof = (_profile_load(fr) or {}).get('profile', {}) or {}
+        prof = _bulk_profs.get(fr) or {}
         if prof.get('share_roster') is False:
             continue
         for fl in _user_future_layovers(fr):
@@ -10960,9 +11153,14 @@ def get_crew_at_destination(token):
         public_iatas.add(cur_iata)
     pins_out = []
     seen = set()
-    for p in (_manual_pins_load(token)
-              + _manual_pins_for_friends(token, friend_set)
-              + _public_pins_at_iatas(public_iatas)):
+    _all_pins = (_manual_pins_load(token)
+                 + _manual_pins_for_friends(token, friend_set)
+                 + _public_pins_at_iatas(public_iatas))
+    # N+1-Fix (2026-07-01): Owner-Namen in EINEM Bulk-Query statt pro Pin.
+    _owner_profs = _profiles_load_bulk(
+        [p.get('user_token') for p in _all_pins
+         if p.get('user_token') and p.get('user_token') != token])
+    for p in _all_pins:
         pid = p.get('id')
         if not pid or pid in seen:
             continue
@@ -10972,7 +11170,7 @@ def get_crew_at_destination(token):
         is_public_meetup = (p.get('iata_code') or '').upper() in public_iatas
         if not mine and owner not in friend_set and not is_public_meetup:
             continue  # Privacy: nur mutual ODER öffentlicher Pin an meinem Ziel
-        oprof = {} if mine else ((_profile_load(owner) or {}).get('profile', {}) or {})
+        oprof = {} if mine else (_owner_profs.get(owner) or {})
         pins_out.append({
             'id': pid,
             'iata': p.get('iata_code'),
@@ -11034,14 +11232,19 @@ def list_hangouts(token):
     """
     friend_set = set(_friends_load(token).get('friends') or [])
     out = []
-    for p in _hangouts_load_all_active():
+    _pins = _hangouts_load_all_active()
+    # N+1-Fix (2026-07-01): Owner-Namen in EINEM Bulk-Query statt pro Hangout.
+    _owner_profs = _profiles_load_bulk(
+        [p.get('user_token') for p in _pins
+         if p.get('user_token') and p.get('user_token') != token])
+    for p in _pins:
         pid = p.get('id')
         if not pid:
             continue
         owner = p.get('user_token') or ''
         mine = owner == token
         is_friend = owner in friend_set
-        oprof = {} if mine else ((_profile_load(owner) or {}).get('profile', {}) or {})
+        oprof = {} if mine else (_owner_profs.get(owner) or {})
         out.append({
             'id': pid,
             'iata': p.get('iata_code'),
@@ -11127,9 +11330,11 @@ def get_destination_leaderboard(iata, token):
                         'my_rank': None, 'my_count': 0, 'total_crew': 0})
 
     # Pro Token EINMAL gezählt (datum-dedupe oben). Namen + opt-in joinen.
+    # N+1-Fix (2026-07-01): alle Ranking-Profile in EINEM Bulk-Query.
+    _bulk_profs = _profiles_load_bulk(list(counts.keys()))
     ranked = []
     for tk, cnt in counts.items():
-        prof = (_profile_load(tk) or {}).get('profile', {}) or {}
+        prof = _bulk_profs.get(tk) or {}
         if prof.get('share_roster') is False:
             continue
         # Eigene Homebase ist kein "Besuch" — raus aus dem Ranking.
@@ -11301,13 +11506,12 @@ def get_friends_homebases(token):
     data = _friends_load(token)
     friends = data.get('friends') or []
     grouped = defaultdict(list)
+    # N+1-/Durability-Fix (2026-07-01): Bulk-SB-Query statt Disk-Datei pro
+    # Friend — die Disk ist auf Cloud Run ephemer/per-Instanz, die Gruppierung
+    # war dort fast immer '???' weil die Profil-Dateien fehlten.
+    _bulk_profs = _profiles_load_bulk(friends)
     for fr in friends:
-        ppath = _user_profile_path(fr)
-        try:
-            with open(ppath) as f:
-                pr = json.load(f).get('profile', {})
-        except Exception:
-            pr = {}
+        pr = _bulk_profs.get(fr) or {}
         hb = (pr.get('homebase') or '').upper().strip()
         if not hb or len(hb) != 3: hb = '???'
         grouped[hb].append({
@@ -11450,16 +11654,21 @@ def get_friends_today(token):
     data = _friends_load(token)
     friends = data.get('friends') or []
     out = []
+    # N+1-Fix (2026-07-01): Friend-Profile in EINEM Bulk-Query (SB-primary
+    # wie get_user_friends; Disk-Datei ist auf Cloud Run ephemer).
+    _bulk_profs = _profiles_load_bulk(friends)
     for fr in friends:
         sess = _store.get(fr) or {}
         rd = sess.get('result_data') or {}
         tage = rd.get('_tage_detail') or []
+        if not tage:
+            # _store ist in-memory/per-Instanz — persistenter Snapshot-Fallback
+            # (Muster wie get_friend_roster ~11430), sonst war „Friends heute"
+            # nach Container-Restart/anderer Instanz immer leer (2026-07-01).
+            tage = (_roster_snapshot_read(fr) or {}).get('tage') or []
         day = next((t for t in tage if isinstance(t, dict) and t.get('datum') == datum), None)
         if not day: continue
-        ppath = _user_profile_path(fr)
-        # SB-primary (wie get_user_friends): Disk-Datei ist auf Cloud Run ephemer.
-        # Verhindert auch stale-0-Bug: int 0 ist not False → True → city-leak.
-        pr = (_profile_load(fr) or {}).get('profile', {}) or {}
+        pr = _bulk_profs.get(fr) or {}
         # PRIVACY-FIX (Bug-Hunt): Friend mit share_roster=False NICHT zeigen —
         # vorher wurde sein voller Tagesplan (Marker/Routing/Layover/Zeiten/Flug-
         # nummern) trotz Opt-out durchgereicht. Spiegelt get_friend_roster.
@@ -11603,6 +11812,24 @@ def _aviation_cache_set(key, value, ttl_sec):
         oldest = sorted(_AVIATION_CACHE.items(), key=lambda x: x[1][0])[:200]
         for k, _ in oldest:
             _AVIATION_CACHE.pop(k, None)
+
+
+def _cache_soft_cap(cache, max_items=500, drop=200):
+    """Generischer Soft-Cap für unbounded In-Memory-Caches (gleiches Muster
+    wie _aviation_cache_set): über max_items → älteste ~drop Einträge raus.
+    Erwartet Values als (ts, ...)-Tupel; sonst Insertion-Order als Näherung."""
+    try:
+        if len(cache) <= max_items:
+            return
+        def _age(item):
+            v = item[1]
+            if isinstance(v, tuple) and v and isinstance(v[0], (int, float)):
+                return v[0]
+            return 0
+        for k, _ in sorted(cache.items(), key=_age)[:drop]:
+            cache.pop(k, None)
+    except Exception:
+        pass
 
 
 @app.route('/api/aviation/metar/<icao>', methods=['GET'])
@@ -13164,6 +13391,10 @@ def _build_logbook_html(token, standard='EASA'):
     sess = _store.get(token) or {}
     rd = sess.get('result_data') or {}
     tage = rd.get('_tage_detail') or []
+    if not tage:
+        # _store ist in-memory/per-Instanz → persistenter Snapshot-Fallback
+        # (2026-07-01, Muster wie get_friend_roster).
+        tage = (_roster_snapshot_read(token) or {}).get('tage') or []
     ops_by_date = _flight_ops_load(token)
     profile = {}
     try:
@@ -14072,8 +14303,14 @@ def admin_wipe_calendar():
         if not token:
             return jsonify({'ok': False, 'error': 'no_token_for_user'}), 404
     except Exception as e:
-        return jsonify({'ok': False, 'error': 'auth_lookup_failed',
-                        'detail': str(e)[:120]}), 500
+        # Detail nur server-side (Audit 2026-07-01) — auch secret-gated Endpoints
+        # geben keine Exception-Interna an den Client zurück.
+        try:
+            app.logger.error(f'[admin-wipe] auth lookup failed: '
+                             f'{type(e).__name__}: {str(e)[:300]}')
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': 'auth_lookup_failed'}), 500
     # 2) Kalender-Tabellen token-scoped leeren (best-effort je Tabelle).
     deleted = {}
     cal_tables = [
@@ -14708,6 +14945,19 @@ def _dm_save_messages(channel_id, messages):
             app.logger.error('[dm] CRITICAL: weder SB noch Disk gesichert!')
 
 
+def _dm_save_messages_disk(channel_id, messages):
+    """NUR den Disk-Read-Cache schreiben (Data-Layer-Refactor 2026-07-01):
+    für Mutationen, die ihre SB-Änderung bereits per-Row upserted haben —
+    _dm_save_messages würde sonst alle ≤500 Messages erneut bulk-upserten."""
+    p = _chat_path(channel_id)
+    if not p:
+        return
+    try:
+        _atomic_write_json(p, {'messages': (messages or [])[-500:]})
+    except Exception as e:
+        app.logger.warning(f'[dm] disk_save_fail (ok wenn SB lief) ch={(channel_id or "")[:16]}: {e}')
+
+
 def _dm_channel(token_a, token_b):
     import re
     a = re.sub(r'[^A-Za-z0-9_-]', '', token_a or '')[:64]
@@ -14755,47 +15005,6 @@ def _group_id_from_channel(channel_id):
             gid = cid[len(prefix):]
             return gid or None
     return None
-
-
-def _is_group_member(token, gid):
-    """True wenn `token` Mitglied (oder Owner) der friend-group `gid` ist.
-
-    Membership-Quelle: user_friend_groups (owner_token + members-jsonb). Groups
-    sind owner-scoped, daher per gid global nachschlagen (id ist PK). Owner zählt
-    immer als Mitglied, alle Tokens in members[] ebenfalls.
-    Bei SB-down: Disk-Fallback über die friends_<token>.json des Callers (nur dort
-    sehen wir, ob der Caller Owner einer Group mit dieser gid ist) — kann
-    Mitglieder fremder Owner-Gruppen nicht verifizieren und liefert dann False
-    (fail-closed, kein Isolation-Leak)."""
-    if not token or not gid:
-        return False
-    if SB_AVAILABLE and sb is not None:
-        try:
-            r = (sb.table('user_friend_groups')
-                 .select('owner_token,members').eq('id', gid).limit(1).execute())
-            if r.data:
-                row = r.data[0]
-                if row.get('owner_token') == token:
-                    return True
-                mem = row.get('members')
-                if isinstance(mem, list) and token in mem:
-                    return True
-            return False
-        except Exception as e:
-            app.logger.warning(
-                f'[crew-chat] group_member_check_fail gid={gid[:8]} '
-                f'err={type(e).__name__}: {str(e)[:120]}')
-            # SB-Fehler → fail-closed weiter unten via Disk-Fallback.
-    # Disk-Fallback: nur die eigenen (Owner-)Gruppen des Callers sind hier
-    # sichtbar. Genügt für Owner-Self-Access; fremde Mitgliedschaften → False.
-    try:
-        disk = _friends_load_from_disk(token)
-        for g in (disk.get('groups') or []):
-            if isinstance(g, dict) and g.get('id') == gid:
-                return True
-    except Exception:
-        pass
-    return False
 
 
 def _channel_access_error(token, channel_id):
@@ -14903,7 +15112,6 @@ def send_chat_message(token, channel_id):
         return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     import uuid, time
     try:
-        msgs = _dm_load_messages(channel_id) or []
         msg = {
             'id': str(uuid.uuid4())[:12],
             'channel_id': channel_id,
@@ -14912,8 +15120,13 @@ def send_chat_message(token, channel_id):
             'ts': time.time(),
             'iso': datetime.now().isoformat(),
         }
-        msgs.append(msg)
-        _dm_save_messages(channel_id, msgs[-500:])
+        # Per-Row-Insert (2026-07-01): nur die NEUE Message nach SB upserten
+        # statt load-ALL (bis 2000) → append → save-ALL (bis 500 Rows) pro
+        # Send. Disk-Cache lokal anhängen (SB-down-Fallback bleibt intakt).
+        _dm_messages_save_to_supabase(channel_id, [msg])
+        disk_msgs = _dm_load_messages_from_disk(channel_id) or []
+        disk_msgs.append(msg)
+        _dm_save_messages_disk(channel_id, disk_msgs)
     except Exception as e:
         print(f'[send_chat_message] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
@@ -14953,7 +15166,10 @@ def _soft_delete_chat_message(token, channel_id, message_id):
         # Text nicht mehr ausliefern: falls ein alter Client doch mal eine
         # deleted-Message bekaeme, ist der Inhalt trotzdem fort.
         found['text'] = ''
-        _dm_save_messages(channel_id, msgs[-500:])
+        # Per-Row-Update (2026-07-01): nur DIESE Message nach SB upserten
+        # (deleted-Flag landet in metadata-jsonb) statt alle ≤500 Messages.
+        _dm_messages_save_to_supabase(channel_id, [found])
+        _dm_save_messages_disk(channel_id, msgs[-500:])
     except Exception as e:
         print(f'[_soft_delete_chat_message] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
@@ -15613,10 +15829,14 @@ def _wall_load_posts():
         if existing is None:
             merged[pid] = p
         else:
-            # Bei Konflikt: höheres ts (frischere Version) gewinnt.
+            # Bei Konflikt: höheres ts (frischere Version) gewinnt. Bei GLEICHEM
+            # ts gewinnt SB: seit dem Per-Row-Refactor (2026-07-01) mutieren
+            # Counter (like/comment) NUR die SB-Row — das ts bleibt gleich, die
+            # Disk-Kopie ist stale. Vorher (`>=`) hätte die Disk-Kopie die
+            # frischen SB-Counter geclobbert.
             new_ts = float(p.get('ts') or 0)
             old_ts = float(existing.get('ts') or 0)
-            if new_ts >= old_ts:
+            if new_ts > old_ts:
                 merged[pid] = p
     # Lazy-migrate disk → SB wenn SB leer + Disk-Daten vorhanden + SB up
     if not sb_data and disk_data and SB_AVAILABLE:
@@ -15649,6 +15869,172 @@ def _wall_save_posts(posts):
         if not sb_ok:
             app.logger.error('[wall] CRITICAL: weder SB noch Disk gesichert!')
     return bool(sb_ok or disk_ok)
+
+
+# ── Wall per-Row-Operations (Data-Layer-Refactor 2026-07-01) ────────────────
+# Vorher: JEDE Mutation lief als load-ALL (bis 5000 Posts, select *) →
+# mutate-in-Python → save-ALL (10 Bulk-Upsert-Batches). Kosten/Latenz/Races
+# (Lost-Updates über mehrere Cloud-Run-Instanzen trotz Prozess-Lock).
+# Jetzt: 1 Insert pro Create, atomarer Counter-RPC pro Like/Comment, bounded
+# SELECT für den Feed. Disk bleibt best-effort Read-Cache für SB-down.
+
+def _wall_post_from_row(row):
+    """SB-Row → Post-Dict (gleiche Re-Hydration wie _wall_posts_load_from_supabase)."""
+    post = {}
+    for k in _WALL_POST_KNOWN_COLS:
+        v = row.get(k)
+        if v is not None:
+            post[k] = v
+    if row.get('body') is not None:
+        post['text'] = row.get('body')
+    md = row.get('metadata') or {}
+    if isinstance(md, dict):
+        for k, v in md.items():
+            if k not in post:
+                post[k] = v
+    return post
+
+
+_WALL_POST_SELECT_COLS = ('id,author_token,ts,body,layover_iata,image_url,'
+                          'hashtags,like_count,comment_count,deleted,'
+                          'is_anonymous,anon_handle,metadata')
+
+
+def _wall_posts_load_recent(limit, before_ts=0, author_in=None):
+    """Bounded Feed-Read: neueste `limit` Posts (ts desc), optional Cursor +
+    Author-Filter (friends-mode). None bei SB-down → Caller nutzt Disk."""
+    if not SB_AVAILABLE:
+        return None
+    try:
+        q = (sb.table('wall_posts').select(_WALL_POST_SELECT_COLS)
+             .eq('deleted', False))
+        if before_ts and before_ts > 0:
+            q = q.lt('ts', before_ts)
+        if author_in is not None:
+            q = q.in_('author_token', list(author_in)[:300])
+        r = q.order('ts', desc=True).limit(int(limit)).execute()
+        return [_wall_post_from_row(row) for row in (r.data or [])]
+    except Exception as e:
+        app.logger.warning(f'[wall] recent_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _wall_post_sb_get(post_id):
+    """Einzelner Post aus SB (per-Row statt load-ALL). None bei miss/SB-down."""
+    if not SB_AVAILABLE or not post_id:
+        return None
+    try:
+        r = (sb.table('wall_posts').select(_WALL_POST_SELECT_COLS)
+             .eq('id', post_id).limit(1).execute())
+        rows = r.data or []
+        return _wall_post_from_row(rows[0]) if rows else None
+    except Exception as e:
+        app.logger.warning(f'[wall] sb_get_fail id={(post_id or "")[:8]}: {str(e)[:120]}')
+        return None
+
+
+def _wall_disk_posts_mutate(fn):
+    """Wendet fn(list)->list|None auf den Disk-Read-Cache an (lokal, kein SB).
+    fn returnt None ⇒ nichts geändert, kein Rewrite."""
+    try:
+        posts = _wall_load_posts_from_disk() or []
+        new_posts = fn(posts)
+        if new_posts is None:
+            return
+        _atomic_write_json(_wall_posts_path(), (new_posts or [])[-5000:],
+                           max_items=5000)
+    except Exception as e:
+        app.logger.warning(f'[wall] disk_mutate_fail (ok wenn SB läuft): {e}')
+
+
+def _wall_disk_append_post(post):
+    _wall_disk_posts_mutate(lambda posts: posts + [post])
+
+
+def _wall_disk_remove_post(post_id):
+    def _rm(posts):
+        new = [p for p in posts if p.get('id') != post_id]
+        return new if len(new) != len(posts) else None
+    _wall_disk_posts_mutate(_rm)
+
+
+def _wall_disk_counter_bump(post_id, like_delta=0, dislike_delta=0,
+                            comment_delta=0):
+    """Per-Row-Counter-Bump im Disk-Cache. Returns dict der neuen Counts
+    ({} wenn Post nicht auf Disk) — SB-down-Fallback für die Like-Routes."""
+    out = {}
+
+    def _bump(posts):
+        for p in posts:
+            if p.get('id') == post_id:
+                if like_delta:
+                    p['like_count'] = max(0, (p.get('like_count') or 0) + like_delta)
+                if dislike_delta:
+                    p['dislike_count'] = max(0, (p.get('dislike_count') or 0) + dislike_delta)
+                if comment_delta:
+                    p['comment_count'] = max(0, (p.get('comment_count') or 0) + comment_delta)
+                out.update({'like_count': p.get('like_count') or 0,
+                            'dislike_count': p.get('dislike_count') or 0,
+                            'comment_count': p.get('comment_count') or 0})
+                return posts
+        return None
+    _wall_disk_posts_mutate(_bump)
+    return out
+
+
+def _wall_post_apply_counters(post_id, like_delta=0, dislike_delta=0,
+                              comment_delta=0):
+    """Atomarer server-seitiger Counter-Bump (RPC wall_post_counters_apply,
+    Migration 20260701_data_layer.sql). Fallback ohne RPC: best-effort
+    read-modify-write auf EINER Row (immer noch kein load-ALL/save-ALL).
+    Returns {'like_count','dislike_count','comment_count'} oder None wenn SB
+    down / Post nicht in SB (Caller degradiert auf Disk-Bump)."""
+    if not SB_AVAILABLE or not post_id:
+        return None
+    ok, data = _social_rpc_call('wall_post_counters_apply', {
+        'p_post_id': post_id, 'p_like': int(like_delta),
+        'p_dislike': int(dislike_delta), 'p_comment': int(comment_delta)})
+    result = None
+    if ok and isinstance(data, list) and data and isinstance(data[0], dict):
+        row = data[0]
+        result = {'like_count': int(row.get('like_count') or 0),
+                  'dislike_count': int(row.get('dislike_count') or 0),
+                  'comment_count': int(row.get('comment_count') or 0)}
+    if result is None:
+        # Degradierter Fallback (RPC fehlt): EINE Row lesen, mutieren, schreiben.
+        try:
+            r = (sb.table('wall_posts')
+                 .select('like_count,comment_count,metadata')
+                 .eq('id', post_id).limit(1).execute())
+            rows = r.data or []
+            if not rows:
+                return None
+            row = rows[0]
+            md = row.get('metadata') if isinstance(row.get('metadata'), dict) else {}
+            new_like = max(0, int(row.get('like_count') or 0) + int(like_delta))
+            new_comment = max(0, int(row.get('comment_count') or 0) + int(comment_delta))
+            try:
+                cur_dis = int(md.get('dislike_count') or 0)
+            except (TypeError, ValueError):
+                cur_dis = 0
+            new_dis = max(0, cur_dis + int(dislike_delta))
+            upd = {'like_count': new_like, 'comment_count': new_comment}
+            if dislike_delta:
+                md = dict(md)
+                md['dislike_count'] = new_dis
+                upd['metadata'] = md
+            sb.table('wall_posts').update(upd).eq('id', post_id).execute()
+            result = {'like_count': new_like, 'dislike_count': new_dis,
+                      'comment_count': new_comment}
+        except Exception as e:
+            app.logger.warning(f'[wall] counter_fallback_fail id={(post_id or "")[:8]}: {str(e)[:120]}')
+            return None
+    # Disk-Read-Cache per-Row nachziehen (sonst servierte der SB-down-Fallback
+    # später stale Counts).
+    _wall_disk_counter_bump(post_id, like_delta=like_delta,
+                            dislike_delta=dislike_delta,
+                            comment_delta=comment_delta)
+    return result
 
 
 def _sanitize_user_text(text, max_len=None):
@@ -15719,6 +16105,7 @@ def _wall_img_legacy_dir(key):
         for name in os.listdir(base):
             if name.startswith('AT-') and os.path.isdir(os.path.join(base, name)):
                 _WALL_IMG_KEY_DIRS[_wall_img_key(name)] = name
+        _cache_soft_cap(_WALL_IMG_KEY_DIRS, max_items=5000, drop=1000)
     except Exception:
         pass
     return _WALL_IMG_KEY_DIRS.get(key)
@@ -15884,20 +16271,6 @@ def _r2_put_bytes(key, data, content_type):
     return f'{R2_PUBLIC_BASE}/{key}'
 def _r2_put_avatar(dir_key, fname, data, content_type):
     return _r2_put_bytes(f'av/{dir_key}/{fname}', data, content_type)
-def _r2_object_exists(key):
-    cli = _r2_client()
-    if cli is None:
-        return False
-    try:
-        cli.head_object(Bucket=R2_AVATARS_BUCKET, Key=key)
-        return True
-    except Exception:
-        return False
-def _r2_redirect(key):
-    from flask import redirect
-    resp = redirect(f'{R2_PUBLIC_BASE}/{key}', code=302)
-    resp.headers['Cache-Control'] = 'public, max-age=86400'   # Redirect 1 Tag cachen
-    return resp
 def _r2_get_bytes(key):
     """Bytes aus R2 ziehen (mit Credentials). (data, content_type) oder (None,None).
     Wird zum DURCHREICHEN genutzt statt 302→r2.dev: die r2.dev-Public-Domain ist
@@ -16181,9 +16554,11 @@ def create_wall_post(token):
             post['author_avatar'] = pr.get('avatar_url')
         except Exception:
             pass
-    posts = _wall_load_posts()
-    posts.append(post)
-    _wall_save_posts(posts)
+    # Per-Row-Insert (Data-Layer-Refactor 2026-07-01): vorher load-ALL →
+    # append → save-ALL (10 Bulk-Batches für EINEN Post). Disk-Append bleibt
+    # als Read-Cache/SB-down-Fallback (Feed merged Disk-only-Posts ein).
+    _wall_posts_save_to_supabase([post])
+    _wall_disk_append_post(post)
     # author_token aus der Create-Response strippen (Privacy-Leak-Fix 2026-06-08):
     # im Feed/Listing wird er bereits entfernt, nur die unmittelbare POST-Response
     # echote ihn noch zurück. Nur opake/Short-Author-Felder bleiben.
@@ -16234,7 +16609,27 @@ def get_wall_feed(token):
     friends.add(token)
     blocked = _blocked_by(token)
     muted = _muted_by(token)
-    posts = _wall_load_posts()
+    # Bounded Feed-Read (Data-Layer-Refactor 2026-07-01): statt load-ALL
+    # (bis 5000 Posts, select *) nur ein Fenster der neuesten Posts holen —
+    # überfetcht (×3, max 300) weil blocked/muted/hidden client-des-Tokens
+    # unten noch rausfiltern. friends-mode filtert server-seitig via .in_().
+    # Disk-only-Posts (SB war beim Erstellen down) werden dazugemischt; stale
+    # Disk-Kopien bereits geladener IDs NICHT (SB-Counter sind frischer).
+    _fetch_n = min(max(limit * 3, 60), 300)
+    posts = _wall_posts_load_recent(
+        _fetch_n, before_ts=before_ts,
+        author_in=(friends if mode == 'friends' else None))
+    if posts is None:
+        # SB down → Disk-Fallback (altes Verhalten)
+        posts = _wall_load_posts_from_disk() or []
+    else:
+        try:
+            _have = {p.get('id') for p in posts}
+            for p in (_wall_load_posts_from_disk() or []):
+                if p.get('id') and p.get('id') not in _have:
+                    posts.append(p)
+        except Exception:
+            pass
     # Auto-versteckte Posts (≥N Reports) raus — außer für den Author selbst.
     def _visible(p):
         if p.get('author_token') in blocked or p.get('author_token') in muted:
@@ -16361,14 +16756,12 @@ def toggle_like(token, post_id):
             try:
                 with open(likes_p, 'w') as f: json.dump(list(liked), f)
             except Exception: pass
-        posts = _wall_load_posts()
-        new_count = 0
-        for p in posts:
-            if p.get('id') == post_id:
-                p['like_count'] = max(0, (p.get('like_count') or 0) + delta)
-                new_count = p['like_count']
-                break
-        _wall_save_posts(posts)
+        # Atomarer Per-Row-Counter (RPC / Single-Row-Fallback) statt
+        # load-ALL → bump → save-ALL. SB-down ⇒ Disk-Cache-Bump.
+        counters = _wall_post_apply_counters(post_id, like_delta=delta)
+        if counters is None:
+            counters = _wall_disk_counter_bump(post_id, like_delta=delta)
+        new_count = int(counters.get('like_count') or 0) if counters else 0
     return jsonify({'ok': True, 'like_count': new_count, 'liked_by_me': liked_by_me})
 
 
@@ -16405,16 +16798,15 @@ def toggle_dislike(token, post_id):
             try:
                 with open(dp, 'w') as f: json.dump(list(disliked), f)
             except Exception: pass
-        posts = _wall_load_posts()
-        new_dislike = 0; new_like = 0
-        for p in posts:
-            if p.get('id') == post_id:
-                p['dislike_count'] = max(0, (p.get('dislike_count') or 0) + d_delta)
-                if like_delta:
-                    p['like_count'] = max(0, (p.get('like_count') or 0) + like_delta)
-                new_dislike = p['dislike_count']; new_like = p.get('like_count') or 0
-                break
-        _wall_save_posts(posts)
+        # Atomarer Per-Row-Counter (RPC / Single-Row-Fallback) statt
+        # load-ALL → bump → save-ALL. SB-down ⇒ Disk-Cache-Bump.
+        counters = _wall_post_apply_counters(post_id, like_delta=like_delta,
+                                             dislike_delta=d_delta)
+        if counters is None:
+            counters = _wall_disk_counter_bump(post_id, like_delta=like_delta,
+                                               dislike_delta=d_delta)
+        new_dislike = int(counters.get('dislike_count') or 0) if counters else 0
+        new_like = int(counters.get('like_count') or 0) if counters else 0
     return jsonify({'ok': True, 'dislike_count': new_dislike, 'like_count': new_like,
                     'disliked_by_me': disliked_by_me, 'liked_by_me': post_id in liked})
 
@@ -16462,19 +16854,26 @@ def add_comment(token, post_id):
         'created_at': datetime.now().isoformat(),
     }
     comments.append(c)
-    _wall_comments_save(post_id, comments[-200:])
-    # Bump comment_count on post
-    posts = _wall_load_posts()
-    for p in posts:
-        if p.get('id') == post_id:
-            p['comment_count'] = (p.get('comment_count') or 0) + 1
-            break
-    _wall_save_posts(posts)
+    # Per-Row-Insert (Data-Layer-Refactor 2026-07-01): nur den NEUEN Kommentar
+    # nach SB upserten statt den ganzen Stream; Disk-Cache lokal anhängen.
+    _wall_comments_save_to_supabase(post_id, [c])
+    if cp:
+        try:
+            _atomic_write_json(cp, comments[-200:], max_items=200)
+        except Exception as e:
+            app.logger.warning(f'[wall-comments] disk_save_fail (ok wenn SB lief): {e}')
+    # Bump comment_count on post — atomar per-Row statt load-ALL/save-ALL.
+    if _wall_post_apply_counters(post_id, comment_delta=1) is None:
+        _wall_disk_counter_bump(post_id, comment_delta=1)
     response_c = dict(c)
     response_c.pop('author_token', None)
     # Push an Post-Author (wenn nicht self-comment)
     try:
-        post_author = next((p.get('author_token') for p in posts if p.get('id') == post_id), None)
+        _tp = _wall_post_sb_get(post_id)
+        if _tp is None:
+            _tp = next((p for p in (_wall_load_posts_from_disk() or [])
+                        if p.get('id') == post_id), None)
+        post_author = (_tp or {}).get('author_token')
         if post_author and post_author != token:
             commenter_name = name or 'Crew'
             _send_push_notification(post_author,
@@ -16537,17 +16936,16 @@ def delete_wall_post(token, post_id):
     - Comments-File des Posts
     - das image-File falls der Post ein Bild hatte (Storage-Leak verhindern)
     """
-    posts = _wall_load_posts()
-    target_post = next((p for p in posts
-                        if p.get('id') == post_id and p.get('author_token') == token), None)
+    # Per-Row-Lookup (Data-Layer-Refactor 2026-07-01): Ownership-Check über
+    # EINE Row statt load-ALL; Disk-Cache gezielt bereinigen statt save-ALL.
+    target_post = _wall_post_sb_get(post_id)
     if target_post is None:
+        target_post = next((p for p in (_wall_load_posts_from_disk() or [])
+                            if p.get('id') == post_id), None)
+    if target_post is None or target_post.get('author_token') != token:
         return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
-    new_posts = [p for p in posts if p is not target_post]
-    _wall_save_posts(new_posts)
-    # Post-Row aus SB + Comments + Likes entfernen.
-    # _wall_save_posts macht nur ein UPSERT (on_conflict='id') — das entfernt die
-    # gelöschte Row NICHT, der SB-primary Loader liefert sie sonst wieder zurück.
-    # Darum hier ein expliziter Row-Delete.
+    _wall_disk_remove_post(post_id)
+    # Post-Row aus SB + Comments + Likes entfernen (expliziter Row-Delete).
     if SB_AVAILABLE:
         try:
             sb.table('wall_posts').delete().eq('id', post_id).execute()
@@ -16885,6 +17283,201 @@ def _forum_save_replies(thread_id, replies):
             app.logger.error('[forum-replies] CRITICAL: weder SB noch Disk gesichert!')
 
 
+# ── Forum per-Row-Operations (Data-Layer-Refactor 2026-07-01) ───────────────
+# Gleiches Muster wie Wall: 1 Insert pro Create, atomare Counter-RPCs
+# (forum_thread_counters_apply / forum_reply_like_apply, Migration
+# 20260701_data_layer.sql), Row-Lookups statt load-ALL + Linear-Scan.
+
+def _forum_thread_from_row(row):
+    """SB-Row → Thread-Dict (gleiche Re-Hydration wie der Bulk-Loader)."""
+    t = {}
+    for k in _FORUM_THREAD_KNOWN_COLS:
+        v = row.get(k)
+        if v is not None:
+            t[k] = v
+    if 'ts' in t:
+        t.setdefault('created_ts', t['ts'])
+    if row.get('body') is not None:
+        t['body'] = row.get('body')
+    md = row.get('metadata') or {}
+    if isinstance(md, dict):
+        for k, v in md.items():
+            if k not in t:
+                t[k] = v
+    return t
+
+
+_FORUM_THREAD_SELECT_COLS = ('id,category_id,author_token,title,body,ts,'
+                             'hashtags,like_count,reply_count,deleted,metadata')
+_FORUM_REPLY_SELECT_COLS = ('id,thread_id,author_token,body,ts,parent_reply_id,'
+                            'mentioned_token,image_url,like_count,metadata')
+
+
+def _forum_threads_load_recent(limit=500):
+    """Bounded Thread-Read (ts desc, aufsteigend zurückgegeben wie der
+    Bulk-Loader). None bei SB-down → Caller nutzt Disk."""
+    if not SB_AVAILABLE:
+        return None
+    try:
+        r = (sb.table('forum_threads').select(_FORUM_THREAD_SELECT_COLS)
+             .eq('deleted', False)
+             .order('ts', desc=True).limit(int(limit)).execute())
+        out = [_forum_thread_from_row(row) for row in (r.data or [])]
+        out.reverse()
+        return out
+    except Exception as e:
+        app.logger.warning(f'[forum-threads] recent_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _forum_thread_sb_get(thread_id):
+    """Einzelner Thread aus SB. None bei miss/SB-down."""
+    if not SB_AVAILABLE or not thread_id:
+        return None
+    try:
+        r = (sb.table('forum_threads').select(_FORUM_THREAD_SELECT_COLS)
+             .eq('id', thread_id).eq('deleted', False).limit(1).execute())
+        rows = r.data or []
+        return _forum_thread_from_row(rows[0]) if rows else None
+    except Exception as e:
+        app.logger.warning(f'[forum-threads] sb_get_fail id={(thread_id or "")[:8]}: {str(e)[:120]}')
+        return None
+
+
+def _forum_reply_sb_get(reply_id):
+    """Einzelner Reply aus SB (inkl. thread_id — ersetzt den Linear-Scan über
+    ALLE Threads × Replies). None bei miss/SB-down."""
+    if not SB_AVAILABLE or not reply_id:
+        return None
+    try:
+        r = (sb.table('forum_replies').select(_FORUM_REPLY_SELECT_COLS)
+             .eq('id', reply_id).limit(1).execute())
+        rows = r.data or []
+        if not rows:
+            return None
+        row = rows[0]
+        rep = {}
+        for k in _FORUM_REPLY_KNOWN_COLS:
+            v = row.get(k)
+            if v is not None:
+                rep[k] = v
+        if 'ts' in rep:
+            rep.setdefault('created_ts', rep['ts'])
+        if row.get('body') is not None:
+            rep['body'] = row.get('body')
+        md = row.get('metadata') or {}
+        if isinstance(md, dict):
+            for k, v in md.items():
+                if k not in rep:
+                    rep[k] = v
+        return rep
+    except Exception as e:
+        app.logger.warning(f'[forum-replies] sb_get_fail id={(reply_id or "")[:8]}: {str(e)[:120]}')
+        return None
+
+
+def _forum_disk_threads_mutate(fn):
+    """fn(list)->list|None auf den Disk-Thread-Cache (lokal, kein SB)."""
+    try:
+        threads = _forum_threads_load_from_disk() or []
+        new_threads = fn(threads)
+        if new_threads is None:
+            return
+        _atomic_write_json(_forum_threads_path(), (new_threads or [])[-10000:],
+                           max_items=10000)
+    except Exception as e:
+        app.logger.warning(f'[forum-threads] disk_mutate_fail (ok wenn SB läuft): {e}')
+
+
+def _forum_disk_replies_mutate(thread_id, fn):
+    """fn(list)->list|None auf den Disk-Reply-Cache eines Threads."""
+    p = _forum_replies_path(thread_id)
+    if not p:
+        return
+    try:
+        replies = _forum_replies_load_from_disk(thread_id) or []
+        new_replies = fn(replies)
+        if new_replies is None:
+            return
+        _atomic_write_json(p, (new_replies or [])[-2000:], max_items=2000)
+    except Exception as e:
+        app.logger.warning(f'[forum-replies] disk_mutate_fail (ok wenn SB läuft): {e}')
+
+
+def _forum_thread_apply_counters(thread_id, like_delta=0, reply_delta=0,
+                                 last_reply_ts=None):
+    """Atomarer Thread-Counter-Bump (RPC forum_thread_counters_apply).
+    Fallback ohne RPC: read-modify-write auf EINER Row. Returns
+    {'like_count','reply_count'} oder None (SB down / Thread nicht in SB)."""
+    if not SB_AVAILABLE or not thread_id:
+        return None
+    ok, data = _social_rpc_call('forum_thread_counters_apply', {
+        'p_thread_id': thread_id, 'p_like': int(like_delta),
+        'p_reply': int(reply_delta), 'p_last_reply_ts': last_reply_ts})
+    result = None
+    if ok and isinstance(data, list) and data and isinstance(data[0], dict):
+        row = data[0]
+        result = {'like_count': int(row.get('like_count') or 0),
+                  'reply_count': int(row.get('reply_count') or 0)}
+    if result is None:
+        try:
+            r = (sb.table('forum_threads')
+                 .select('like_count,reply_count,metadata')
+                 .eq('id', thread_id).limit(1).execute())
+            rows = r.data or []
+            if not rows:
+                return None
+            row = rows[0]
+            new_like = max(0, int(row.get('like_count') or 0) + int(like_delta))
+            new_reply = max(0, int(row.get('reply_count') or 0) + int(reply_delta))
+            upd = {'like_count': new_like, 'reply_count': new_reply}
+            if last_reply_ts is not None:
+                md = row.get('metadata') if isinstance(row.get('metadata'), dict) else {}
+                md = dict(md)
+                md['last_reply_ts'] = last_reply_ts
+                upd['metadata'] = md
+            sb.table('forum_threads').update(upd).eq('id', thread_id).execute()
+            result = {'like_count': new_like, 'reply_count': new_reply}
+        except Exception as e:
+            app.logger.warning(f'[forum-threads] counter_fallback_fail id={(thread_id or "")[:8]}: {str(e)[:120]}')
+            return None
+    # Disk-Cache nachziehen (per-Row)
+    def _bump(threads):
+        for t in threads:
+            if t.get('id') == thread_id:
+                t['like_count'] = result['like_count']
+                t['reply_count'] = result['reply_count']
+                if last_reply_ts is not None:
+                    t['last_reply_ts'] = last_reply_ts
+                return threads
+        return None
+    _forum_disk_threads_mutate(_bump)
+    return result
+
+
+def _forum_reply_apply_like(reply_id, delta):
+    """Atomarer Reply-Like-Bump (RPC forum_reply_like_apply). Fallback:
+    read-modify-write auf EINER Row. Returns like_count (int) oder None."""
+    if not SB_AVAILABLE or not reply_id:
+        return None
+    ok, data = _social_rpc_call('forum_reply_like_apply',
+                                {'p_reply_id': reply_id, 'p_delta': int(delta)})
+    if ok and isinstance(data, list) and data and isinstance(data[0], dict):
+        return int(data[0].get('like_count') or 0)
+    try:
+        r = (sb.table('forum_replies').select('like_count')
+             .eq('id', reply_id).limit(1).execute())
+        rows = r.data or []
+        if not rows:
+            return None
+        new_like = max(0, int(rows[0].get('like_count') or 0) + int(delta))
+        sb.table('forum_replies').update({'like_count': new_like}).eq('id', reply_id).execute()
+        return new_like
+    except Exception as e:
+        app.logger.warning(f'[forum-replies] like_fallback_fail id={(reply_id or "")[:8]}: {str(e)[:120]}')
+        return None
+
+
 def _forum_likes_load_from_supabase(token):
     """{'threads': set, 'replies': set} aller liked-IDs für user_token. None bei SB-down."""
     if not SB_AVAILABLE or not token:
@@ -17070,7 +17663,17 @@ def forum_list_threads(token):
     limit = min(int(request.args.get('limit') or 50), 200)
 
     import time
-    threads = _forum_load_threads()
+    # Bounded Read (Data-Layer-Refactor 2026-07-01): neueste 500 Threads statt
+    # unbounded load-ALL. Disk-only-Threads (SB-down beim Erstellen) mischen
+    # wir dazu; stale Disk-Kopien bekannter IDs nicht (SB-Counter frischer).
+    threads = _forum_threads_load_recent(500)
+    if threads is None:
+        threads = _forum_threads_load_from_disk() or []
+    else:
+        _have = {t.get('id') for t in threads}
+        for t in (_forum_threads_load_from_disk() or []):
+            if t.get('id') and t.get('id') not in _have:
+                threads.append(t)
     # BUG-3: Crew-Feed-Posts mit Forum-Kategorie-Hashtag im Forum mit-einblenden.
     # Dedup gegen evtl. doppelte IDs (sollte durch 'wall:'-Prefix nicht passieren).
     existing_ids = {t.get('id') for t in threads}
@@ -17223,9 +17826,9 @@ def forum_create_thread(token):
     }
     thread.update(_forum_author_snapshot(token))
 
-    threads = _forum_load_threads()
-    threads.append(thread)
-    _forum_save_threads(threads)
+    # Per-Row-Insert statt load-ALL → append → save-ALL (2026-07-01).
+    _forum_threads_save_to_supabase([thread])
+    _forum_disk_threads_mutate(lambda ts: ts + [thread])
 
     # Return without author_token
     response_thread = dict(thread)
@@ -17236,15 +17839,19 @@ def forum_create_thread(token):
 
 @app.route('/api/forum/<token>/threads/<thread_id>', methods=['DELETE'])
 def forum_delete_thread(token, thread_id):
-    threads = _forum_load_threads()
-    new_threads = [t for t in threads if not (t.get('id') == thread_id and t.get('author_token') == token)]
-    if len(new_threads) == len(threads):
+    # Per-Row-Lookup + gezielter Disk-Filter (2026-07-01) statt load-ALL/save-ALL.
+    target = _forum_thread_sb_get(thread_id)
+    if target is None:
+        target = next((t for t in (_forum_threads_load_from_disk() or [])
+                       if t.get('id') == thread_id), None)
+    if target is None or target.get('author_token') != token:
         return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
-    _forum_save_threads(new_threads)
-    # Thread-Row + zugehörige Replies aus SB entfernen.
-    # _forum_save_threads/_forum_save_replies machen nur UPSERT (on_conflict='id') —
-    # ohne expliziten Row-Delete liefert der SB-primary Loader die gelöschte Row
-    # wieder zurück. Best-effort, guarded.
+
+    def _rm(threads):
+        new = [t for t in threads if t.get('id') != thread_id]
+        return new if len(new) != len(threads) else None
+    _forum_disk_threads_mutate(_rm)
+    # Thread-Row + zugehörige Replies aus SB entfernen (expliziter Row-Delete).
     if SB_AVAILABLE:
         try:
             sb.table('forum_threads').delete().eq('id', thread_id).execute()
@@ -17270,21 +17877,37 @@ def forum_toggle_thread_like(token, thread_id):
     if token.startswith('AT-GUEST-'):
         return jsonify({'ok': False, 'error': 'demo_mode_cannot_post'}), 403
     likes = _forum_load_likes(token)
-    threads = _forum_load_threads()
-    target = next((t for t in threads if t.get('id') == thread_id), None)
+    # Per-Row-Lookup statt load-ALL (2026-07-01).
+    target = _forum_thread_sb_get(thread_id)
+    if target is None:
+        target = next((t for t in (_forum_threads_load_from_disk() or [])
+                       if t.get('id') == thread_id), None)
     if not target:
         return jsonify({'ok': False, 'error': 'not_found'}), 404
     if thread_id in likes['threads']:
         likes['threads'].discard(thread_id)
-        target['like_count'] = max(0, (target.get('like_count') or 0) - 1)
+        delta = -1
         liked_by_me = False
     else:
         likes['threads'].add(thread_id)
-        target['like_count'] = (target.get('like_count') or 0) + 1
+        delta = +1
         liked_by_me = True
     _forum_save_likes(token, likes)
-    _forum_save_threads(threads)
-    return jsonify({'ok': True, 'like_count': target['like_count'], 'liked_by_me': liked_by_me})
+    # Atomarer Counter (RPC / Single-Row-Fallback); SB-down ⇒ Disk-Bump.
+    counters = _forum_thread_apply_counters(thread_id, like_delta=delta)
+    if counters is not None:
+        new_count = counters['like_count']
+    else:
+        new_count = max(0, (target.get('like_count') or 0) + delta)
+
+        def _bump(threads):
+            for t in threads:
+                if t.get('id') == thread_id:
+                    t['like_count'] = new_count
+                    return threads
+            return None
+        _forum_disk_threads_mutate(_bump)
+    return jsonify({'ok': True, 'like_count': new_count, 'liked_by_me': liked_by_me})
 
 
 @app.route('/api/forum/<token>/threads/<thread_id>/replies', methods=['GET'])
@@ -17345,8 +17968,11 @@ def forum_create_reply(token, thread_id):
         return jsonify({'ok': False, 'error': 'too_long'}), 413
     text = _sanitize_user_text(raw_text, max_len=3000)
 
-    threads = _forum_load_threads()
-    target = next((t for t in threads if t.get('id') == thread_id), None)
+    # Per-Row-Lookup statt load-ALL (2026-07-01).
+    target = _forum_thread_sb_get(thread_id)
+    if target is None:
+        target = next((t for t in (_forum_threads_load_from_disk() or [])
+                       if t.get('id') == thread_id), None)
     if not target:
         return jsonify({'ok': False, 'error': 'thread_not_found'}), 404
 
@@ -17374,14 +18000,21 @@ def forum_create_reply(token, thread_id):
         except Exception:
             reply['mentioned_name'] = ''
 
-    replies = _forum_load_replies(thread_id)
-    replies.append(reply)
-    _forum_save_replies(thread_id, replies)
+    # Per-Row-Insert (nur der NEUE Reply nach SB) + lokaler Disk-Append.
+    _forum_replies_save_to_supabase(thread_id, [reply])
+    _forum_disk_replies_mutate(thread_id, lambda reps: reps + [reply])
 
-    # Bump reply_count + last_reply_ts on thread
-    target['reply_count'] = (target.get('reply_count') or 0) + 1
-    target['last_reply_ts'] = reply['created_ts']
-    _forum_save_threads(threads)
+    # Bump reply_count + last_reply_ts — atomar per-Row statt save-ALL.
+    if _forum_thread_apply_counters(thread_id, reply_delta=1,
+                                    last_reply_ts=reply['created_ts']) is None:
+        def _bump(threads):
+            for t in threads:
+                if t.get('id') == thread_id:
+                    t['reply_count'] = (t.get('reply_count') or 0) + 1
+                    t['last_reply_ts'] = reply['created_ts']
+                    return threads
+            return None
+        _forum_disk_threads_mutate(_bump)
 
     response_reply = dict(reply)
     response_reply.pop('author_token', None)
@@ -17406,82 +18039,112 @@ def forum_create_reply(token, thread_id):
 
 @app.route('/api/forum/<token>/replies/<reply_id>', methods=['DELETE'])
 def forum_delete_reply(token, reply_id):
-    """Linear search across alle Threads. SB primary (P0 2026-06-01) statt
-    blind über disk replies_<id>.json — sonst miss-ten wir nach Migration die
-    SB-only Replies."""
-    threads = _forum_load_threads()
-    deleted = False
+    """Per-Row-Lookup über die Reply-ID (2026-07-01) statt Linear-Scan über
+    ALLE Threads × Replies (das waren N+1 SB-Queries pro Delete). SB-down:
+    Disk-Scan als degradierter Fallback."""
     parent_thread_id = None
-    for t in threads:
-        tid = t.get('id')
-        if not tid:
-            continue
-        replies = _forum_load_replies(tid)
-        new_replies = [r for r in replies
-                       if not (r.get('id') == reply_id
-                               and r.get('author_token') == token)]
-        if len(new_replies) != len(replies):
-            deleted = True
-            parent_thread_id = tid
-            _forum_save_replies(tid, new_replies)
-            # Reply-Row explizit aus SB löschen. _forum_save_replies macht nur
-            # UPSERT (on_conflict='id') — die gelöschte Row bliebe sonst in SB
-            # und der SB-primary Loader würde sie wieder zurückliefern.
-            if SB_AVAILABLE:
-                try:
-                    sb.table('forum_replies').delete().eq('id', reply_id).execute()
-                except Exception as e:
-                    app.logger.warning(f'[forum-delete] sb reply row delete failed: {e}')
-            break
-    if not deleted:
-        return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
+    rep = _forum_reply_sb_get(reply_id)
+    if rep is not None:
+        if rep.get('author_token') != token:
+            return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
+        parent_thread_id = rep.get('thread_id')
+        try:
+            sb.table('forum_replies').delete().eq('id', reply_id).execute()
+        except Exception as e:
+            app.logger.warning(f'[forum-delete] sb reply row delete failed: {e}')
+        if parent_thread_id:
+            def _rm(reps):
+                new = [r for r in reps if r.get('id') != reply_id]
+                return new if len(new) != len(reps) else None
+            _forum_disk_replies_mutate(parent_thread_id, _rm)
+    else:
+        # SB down / Reply nur auf Disk → lokaler Scan (alte Semantik).
+        for t in (_forum_threads_load_from_disk() or []):
+            tid = t.get('id')
+            if not tid:
+                continue
+            replies = _forum_replies_load_from_disk(tid)
+            new_replies = [r for r in replies
+                           if not (r.get('id') == reply_id
+                                   and r.get('author_token') == token)]
+            if len(new_replies) != len(replies):
+                parent_thread_id = tid
+
+                def _rm(reps):
+                    return [r for r in reps
+                            if not (r.get('id') == reply_id
+                                    and r.get('author_token') == token)]
+                _forum_disk_replies_mutate(tid, _rm)
+                if SB_AVAILABLE:
+                    try:
+                        sb.table('forum_replies').delete().eq('id', reply_id).execute()
+                    except Exception as e:
+                        app.logger.warning(f'[forum-delete] sb reply row delete failed: {e}')
+                break
+        if parent_thread_id is None:
+            return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
 
     if parent_thread_id:
-        for t in threads:
-            if t.get('id') == parent_thread_id:
-                t['reply_count'] = max(0, (t.get('reply_count') or 0) - 1)
-                break
-        _forum_save_threads(threads)
+        # reply_count dekrementieren — atomar per-Row; SB-down ⇒ Disk-Bump.
+        if _forum_thread_apply_counters(parent_thread_id, reply_delta=-1) is None:
+            def _dec(threads):
+                for t in threads:
+                    if t.get('id') == parent_thread_id:
+                        t['reply_count'] = max(0, (t.get('reply_count') or 0) - 1)
+                        return threads
+                return None
+            _forum_disk_threads_mutate(_dec)
     return jsonify({'ok': True})
 
 
 @app.route('/api/forum/<token>/replies/<reply_id>/like', methods=['POST'])
 def forum_toggle_reply_like(token, reply_id):
-    """Linear search across alle Threads (SB primary)."""
+    """Per-Row-Lookup über die Reply-ID (2026-07-01) statt Linear-Scan über
+    alle Threads. SB-down: lokaler Disk-Scan als Fallback."""
     if token.startswith('AT-GUEST-'):
         return jsonify({'ok': False, 'error': 'demo_mode_cannot_post'}), 403
-    threads = _forum_load_threads()
     target_thread_id = None
-    target_reply = None
-    target_replies = None
-    for t in threads:
-        tid = t.get('id')
-        if not tid:
-            continue
-        replies = _forum_load_replies(tid)
-        for r in replies:
-            if r.get('id') == reply_id:
-                target_thread_id = tid
-                target_reply = r
-                target_replies = replies
+    target_reply = _forum_reply_sb_get(reply_id)
+    if target_reply is not None:
+        target_thread_id = target_reply.get('thread_id')
+    else:
+        for t in (_forum_threads_load_from_disk() or []):
+            tid = t.get('id')
+            if not tid:
+                continue
+            for r in _forum_replies_load_from_disk(tid):
+                if r.get('id') == reply_id:
+                    target_thread_id = tid
+                    target_reply = r
+                    break
+            if target_reply:
                 break
-        if target_reply:
-            break
     if not target_reply:
         return jsonify({'ok': False, 'error': 'not_found'}), 404
 
     likes = _forum_load_likes(token)
     if reply_id in likes['replies']:
         likes['replies'].discard(reply_id)
-        target_reply['like_count'] = max(0, (target_reply.get('like_count') or 0) - 1)
+        delta = -1
         liked_by_me = False
     else:
         likes['replies'].add(reply_id)
-        target_reply['like_count'] = (target_reply.get('like_count') or 0) + 1
+        delta = +1
         liked_by_me = True
     _forum_save_likes(token, likes)
-    _forum_save_replies(target_thread_id, target_replies)
-    return jsonify({'ok': True, 'like_count': target_reply['like_count'], 'liked_by_me': liked_by_me})
+    # Atomarer Counter (RPC / Single-Row-Fallback); SB-down ⇒ Disk-Bump.
+    new_count = _forum_reply_apply_like(reply_id, delta)
+    if new_count is None:
+        new_count = max(0, (target_reply.get('like_count') or 0) + delta)
+        if target_thread_id:
+            def _bump(reps):
+                for r in reps:
+                    if r.get('id') == reply_id:
+                        r['like_count'] = new_count
+                        return reps
+                return None
+            _forum_disk_replies_mutate(target_thread_id, _bump)
+    return jsonify({'ok': True, 'like_count': new_count, 'liked_by_me': liked_by_me})
 
 
 @app.route('/api/forum/<token>/trending', methods=['GET'])
@@ -17489,7 +18152,10 @@ def forum_trending_hashtags(token):
     """Top hashtags in threads created in last 7 days."""
     import time
     from collections import Counter
-    threads = _forum_load_threads()
+    # Bounded Read (2026-07-01): 7-Tage-Fenster braucht kein load-ALL.
+    threads = _forum_threads_load_recent(500)
+    if threads is None:
+        threads = _forum_threads_load_from_disk() or []
     cutoff = time.time() - 7 * 86400
     counter = Counter()
     for t in threads:
@@ -17814,6 +18480,32 @@ def _recs_save(iata, recs):
     return sb_ok
 
 
+def _recs_save_disk(iata, recs):
+    """NUR den Disk-Read-Cache schreiben (Data-Layer-Refactor 2026-07-01):
+    für Mutationen, die ihre SB-Änderung bereits per-Row geschrieben haben —
+    _recs_save würde sonst ALLE Recs des Airports erneut bulk-upserten."""
+    rp = _recs_path(iata)
+    if not rp:
+        return
+    try:
+        with open(rp, 'w') as f:
+            json.dump((recs or [])[-500:], f, ensure_ascii=False)
+    except Exception as e:
+        app.logger.warning(f'[layover-recs] disk_save_fail (ok wenn SB lief): {e}')
+
+
+def _layover_rec_sb_update(rec_id, fields):
+    """Per-Row-Update einzelner Spalten (z.B. vote_score/vote_count)."""
+    if not SB_AVAILABLE or not rec_id or not fields:
+        return False
+    try:
+        sb.table('layover_recs').update(fields).eq('id', rec_id).execute()
+        return True
+    except Exception as e:
+        app.logger.warning(f'[layover-recs] sb_update_fail id={(rec_id or "")[:8]}: {str(e)[:120]}')
+        return False
+
+
 def _votes_load_from_disk(token):
     vp = _votes_path(token)
     if not vp:
@@ -17992,9 +18684,10 @@ def add_layover_rec(token):
         rec['author_airline'] = pr.get('airline')
     except Exception:
         pass
-    recs = _recs_load(iata)
-    recs.append(rec)
-    _recs_save(iata, recs)
+    # Per-Row-Insert (2026-07-01): nur den NEUEN Rec nach SB upserten statt
+    # alle Recs des Airports; Disk-Cache lokal anhängen.
+    _layover_recs_save_to_supabase([rec])
+    _recs_save_disk(iata, _recs_load_from_disk(iata) + [rec])
     # Auto-record author's +1 vote
     votes = _votes_load(token)
     votes[rec['id']] = 1
@@ -18047,7 +18740,11 @@ def vote_layover_rec(token, rec_id):
             1 if prev == 0 and direction != 0
             else (-1 if direction == 0 and prev != 0 else 0)))
     new_score = target['vote_score']
-    _recs_save(iata, recs)
+    # Per-Row-Update (2026-07-01): nur vote_score/vote_count DIESES Recs nach
+    # SB schreiben statt alle Recs des Airports bulk-upserten; Disk-Cache lokal.
+    _layover_rec_sb_update(rec_id, {'vote_score': target['vote_score'],
+                                    'vote_count': target['vote_count']})
+    _recs_save_disk(iata, recs)
     return jsonify({'ok': True, 'vote_score': new_score, 'my_vote': direction})
 
 
@@ -18060,10 +18757,10 @@ def delete_layover_rec(token, rec_id):
         new_recs = [r for r in recs
                     if not (r.get('id') == rec_id and r.get('author_short') == token[:8])]
         if len(new_recs) != len(recs):
-            # SB: soft-delete (deleted=true) damit Bulk-Upsert die Row nicht
-            # re-inserted; Disk-Cache überschreiben.
+            # SB: soft-delete (deleted=true) per-Row; Disk-Cache lokal
+            # überschreiben (2026-07-01: kein Bulk-Re-Upsert aller Recs mehr).
             _layover_recs_delete_from_supabase(rec_id)
-            _recs_save(iata, new_recs)
+            _recs_save_disk(iata, new_recs)
             return jsonify({'ok': True})
     return jsonify({'ok': False, 'error':'not_found_or_not_author'}), 404
 
@@ -18303,10 +19000,16 @@ def _layover_save_comments(rec_id, comments):
     """SB primary + Disk Read-Cache."""
     comments = comments[-500:]
     _layover_comments_save_to_supabase(rec_id, comments)
+    _layover_save_comments_disk(rec_id, comments)
+
+
+def _layover_save_comments_disk(rec_id, comments):
+    """NUR Disk-Cache (2026-07-01) — für Mutationen deren SB-Änderung bereits
+    per-Row geschrieben wurde (Insert/Row-Delete)."""
     p = _layover_comments_path(rec_id)
     if not p: return
     try:
-        with open(p, 'w') as f: json.dump(comments, f, ensure_ascii=False)
+        with open(p, 'w') as f: json.dump((comments or [])[-500:], f, ensure_ascii=False)
     except Exception as e:
         app.logger.warning(f'[layover-comments] disk_save_fail: {e}')
 
@@ -18350,7 +19053,9 @@ def layover_rec_add_comment(token, rec_id):
     }
     comments = _layover_load_comments(rec_id)
     comments.append(comment)
-    _layover_save_comments(rec_id, comments)
+    # Per-Row-Insert (2026-07-01): nur den NEUEN Kommentar nach SB.
+    _layover_comments_save_to_supabase(rec_id, [comment])
+    _layover_save_comments_disk(rec_id, comments)
     response_c = dict(comment)
     response_c.pop('author_token', None)
     # Push an Parent-Comment-Author (Reply-to-User)
@@ -18374,10 +19079,9 @@ def layover_rec_delete_comment(token, rec_id, comment_id):
     new_comments = [c for c in comments if not (c.get('id') == comment_id and c.get('author_token') == token)]
     if len(new_comments) == len(comments):
         return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
-    _layover_save_comments(rec_id, new_comments)
-    # Comment-Row explizit aus SB löschen. _layover_save_comments macht nur
-    # UPSERT (on_conflict='id') — ohne Row-Delete liefert der SB-primary Loader
-    # den gelöschten Kommentar wieder zurück. Best-effort, guarded.
+    # Disk-Cache lokal (2026-07-01: kein Bulk-Re-Upsert der übrigen Kommentare).
+    _layover_save_comments_disk(rec_id, new_comments)
+    # Comment-Row explizit aus SB löschen (per-Row). Best-effort, guarded.
     if SB_AVAILABLE:
         try:
             sb.table('layover_rec_comments').delete().eq('id', comment_id).execute()
@@ -18392,6 +19096,9 @@ def discover_layover_recs(token):
     sess = _store.get(token) or {}
     rd = sess.get('result_data') or {}
     tage = rd.get('_tage_detail') or []
+    if not tage:
+        # _store ist in-memory/per-Instanz → persistenter Snapshot-Fallback.
+        tage = (_roster_snapshot_read(token) or {}).get('tage') or []
     from datetime import date as _date, timedelta as _td
     today = _date.today()
     horizon = today + _td(days=28)
@@ -18429,6 +19136,9 @@ def get_user_stats(token):
     session = _store.get(token) or {}
     rd = session.get('result_data') or {}
     tage = rd.get('_tage_detail') or []
+    if not tage:
+        # _store ist in-memory/per-Instanz → persistenter Snapshot-Fallback.
+        tage = (_roster_snapshot_read(token) or {}).get('tage') or []
     # Aggregate
     from collections import Counter
     klass_ct = Counter()
@@ -18644,6 +19354,9 @@ def _trip_stats_compute(token):
     session = _store.get(token) or {}
     rd = session.get('result_data') or {}
     tage = rd.get('_tage_detail') or []
+    if not tage:
+        # _store ist in-memory/per-Instanz → persistenter Snapshot-Fallback.
+        tage = (_roster_snapshot_read(token) or {}).get('tage') or []
 
     fops = {}
     p = _flight_ops_path(token)
@@ -18940,6 +19653,7 @@ def get_trip_stats(token):
         return jsonify(cached[1])
     payload = _trip_stats_compute(token)
     _TRIP_STATS_CACHE[token] = (now + 300, payload)
+    _cache_soft_cap(_TRIP_STATS_CACHE)
     # #111: anonymisierte YTD-Kernmetriken ins Community-Aggregat (best-effort).
     if payload.get('has_data'):
         _community_upsert_stats(token, payload.get('ytd') or {})
@@ -19283,6 +19997,9 @@ def friend_compare(token, friend_token):
         sess = _store.get(tok) or {}
         rd = sess.get('result_data') or {}
         tage = rd.get('_tage_detail') or []
+        if not tage:
+            # _store ist in-memory/per-Instanz → persistenter Snapshot-Fallback.
+            tage = (_roster_snapshot_read(tok) or {}).get('tage') or []
         from collections import Counter
         klass_ct = Counter()
         layover_ct = Counter()
@@ -19332,6 +20049,9 @@ def get_user_ical(token):
     session = _store.get(token) or {}
     rd = session.get('result_data') or {}
     tage = rd.get('_tage_detail') or []
+    if not tage:
+        # _store ist in-memory/per-Instanz → persistenter Snapshot-Fallback.
+        tage = (_roster_snapshot_read(token) or {}).get('tage') or []
     # Group into tours
     lines = [
         'BEGIN:VCALENDAR',
@@ -19382,6 +20102,9 @@ def get_user_logbook_pdf(token):
     session = _store.get(token) or {}
     rd = session.get('result_data') or {}
     tage = rd.get('_tage_detail') or []
+    if not tage:
+        # _store ist in-memory/per-Instanz → persistenter Snapshot-Fallback.
+        tage = (_roster_snapshot_read(token) or {}).get('tage') or []
     pname = ''
     ppath = _user_profile_path(token)
     try:
@@ -20251,14 +20974,6 @@ def _auth_upsert_user(email, rec):
     if not (sb_ok or disk_ok):
         app.logger.error('[auth] CRITICAL: single-row weder SB noch Disk gesichert — Daten verloren!')
     return sb_ok or disk_ok
-
-
-def _auth_hash(pw):
-    """LEGACY: sha256 unsalted. Bleibt für Backward-Verify alter Hashes.
-    Neue Hashes via _password_hash(). Beim Login-Erfolg wird alter Hash
-    auf den neuen Format migriert (on-the-fly Re-Hash)."""
-    import hashlib
-    return hashlib.sha256((pw or '').encode('utf-8')).hexdigest()
 
 
 # ── Wave-1 BUG-004 (2026-06-02): Token-Auth Helper ──────────────────
@@ -22554,6 +23269,7 @@ def _native_board_cached(iata, flight_type):
     # transienter Quellen-Ausfall 12 Min „kleben").
     if result[0] is not None:
         _NATIVE_BOARD_CACHE[ckey] = (_t.time(), result)
+        _cache_soft_cap(_NATIVE_BOARD_CACHE)
     return result
 
 
@@ -23925,6 +24641,7 @@ def airport_board(token):
             import time as _t_lgs
             _BOARD_LAST_GOOD[(out_airport, ftype, airline)] = (
                 _t_lgs.time(), list(flights), list(departed))
+            _cache_soft_cap(_BOARD_LAST_GOOD)
     except Exception:
         pass
     return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
@@ -25052,6 +25769,7 @@ def _aerodatabox_punctuality(iata, airline):
         result = {'total': 0, 'on_time': 0, 'delayed': 0, 'cancelled': 0,
                   'on_time_pct': None, 'avg_delay_min': 0}
         _AERODATABOX_CACHE[ckey] = (_t.time(), result)
+        _cache_soft_cap(_AERODATABOX_CACHE)
         return result
 
     def _airline_iata(f):
@@ -25146,6 +25864,7 @@ def _aerodatabox_punctuality(iata, airline):
     result = {'total': total, 'on_time': on_time, 'delayed': delayed,
               'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay}
     _AERODATABOX_CACHE[ckey] = (_t.time(), result)
+    _cache_soft_cap(_AERODATABOX_CACHE)
     return result
 
 
@@ -25779,11 +26498,10 @@ def list_friend_requests(token):
     # pro Token (ein hängender Lookup ließ die Anfrage-Karte WEISS/leer rendern).
     # Alte Clients lesen weiter `incoming` (Token-Liste); neue `incoming_profiles`.
     incoming_profiles = []
+    # N+1-Fix (2026-07-01): Sender-Profile in EINEM Bulk-Query.
+    _bulk_profs = _profiles_load_bulk(incoming)
     for rt in incoming:
-        try:
-            pr = (_profile_load(rt) or {}).get('profile') or {}
-        except Exception:
-            pr = {}
+        pr = _bulk_profs.get(rt) or {}
         incoming_profiles.append({
             'token': rt,
             'name': pr.get('name'),
@@ -27968,39 +28686,6 @@ def _claude_with_retry(client, model, max_tokens, content, max_retries=3,
     if last_err: raise last_err
 
 
-def _claude_stream_with_retry(client, model, max_tokens, content, max_retries=3, label='claude-stream', prefill=None):
-    """Wie _claude_with_retry, aber für Streaming-Calls. Liefert kompletten Text zurück.
-    prefill (optional): String der als Anfang der Assistant-Antwort vorgegeben wird.
-    Damit zwingt man Claude zu strukturierter Ausgabe (z.B. JSON) ohne Vorgeplänkel."""
-    import time as _t
-    last_err = None
-    for attempt in range(max_retries):
-        try:
-            full_text = ''
-            messages = [{'role': 'user', 'content': content}]
-            if prefill:
-                messages.append({'role': 'assistant', 'content': prefill})
-            with client.messages.stream(model=model, max_tokens=max_tokens,
-                                        messages=messages) as stream:
-                for text in stream.text_stream:
-                    full_text += text
-            # Bei prefill: Antwort beginnt OHNE den prefill-String, also vorhängen
-            if prefill:
-                full_text = prefill + full_text
-            return full_text.strip()
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            should_retry = any(s in err_str.lower() for s in ['429', '500', '502', '503', '504', 'timeout', 'connection', 'rate'])
-            if not should_retry or attempt == max_retries - 1:
-                print(f"[{label}] failed (attempt {attempt+1}/{max_retries}): {err_str[:200]}")
-                raise
-            wait = 2 ** attempt + 1
-            print(f"[{label}] retry attempt {attempt+1}/{max_retries} in {wait}s — {err_str[:120]}")
-            _t.sleep(wait)
-    if last_err: raise last_err
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # Phase 2: KI-Resolver-Infrastruktur
 # ════════════════════════════════════════════════════════════════════════════
@@ -29366,17 +30051,6 @@ def _parse_se_lines_deterministic(all_se_text):
         'z76_eur':  round(z76_eur, 2),
         'unklare_zeilen': unklare,
     }
-
-
-def lh_abwesenheitsgeld(days: int, hours: int, region: str = 'de_eu') -> float:
-    """LH-Tarif Abwesenheitsgeld (Stand 01.01.2023).
-    region: 'de_eu' (Deutschland+Europa, 4.20€/h) oder 'ausland' (4.80€/h).
-    Formel: (days * 12 + hours) * rate — linear pro Stunde, max 15 Tage × 12h Tabelle.
-    hours wird auf [0, 12] geclampt — laut Tarif max 12 Stunden pro Einheit."""
-    rate = 4.80 if region == 'ausland' else 4.20
-    hours = max(0, min(12, int(hours)))
-    days = max(0, int(days))
-    return round((days * 12 + hours) * rate, 2)
 
 
 def parse_streckeneinsatz_mit_ki(pdf_bytes_list, year=2025):
@@ -35486,99 +36160,6 @@ def _cas_reader_v2_mock_dispatch(day_excerpt, prev_day=None, next_day=None,
     }
 
 
-def _load_reader_v2_facts():
-    """Lade Reader-V2-Output-Fixture für Gap-Tage (falls vorhanden).
-    Returns dict[datum → reader_v2_output] oder {}.
-
-    [DEPRECATED v11 Clean-Release 2026-05-20]
-    Die `tibor_cas_reader_v2_gap_days.json`-Fixture wurde aus
-    `Flugstundenübersichten.pdf` re-read generiert. Per Master-Auftrag
-    ist Flugstundenübersicht KEINE Quelle mehr. Diese V2-Merge ist
-    Legacy-Pollution — Phantom-Touren in Tour-First-Layer durch
-    Reader-V2-Halluzinationen aus Flugstunden-Re-Read.
-
-    Aktiv-Status:
-      - Production: gibt {} zurueck (keine Merge).
-      - Forensik: AEROTAX_LEGACY_R5_V2_MERGE=1 → Merge aktiv (nur fuer Audit).
-    """
-    import os as _os
-    if _os.environ.get('AEROTAX_LEGACY_R5_V2_MERGE', '0') != '1':
-        return {}
-    import json as _j
-    v2_file = _os.path.join(
-        _os.path.dirname(_os.path.abspath(__file__)),
-        'tests', 'fixtures', 'tibor_cas_reader_v2_gap_days.json'
-    )
-    if not _os.path.exists(v2_file):
-        return {}
-    try:
-        data = _j.load(open(v2_file, encoding='utf-8'))
-    except Exception:
-        return {}
-    out = {}
-    for d in (data.get('days') or []):
-        dt = d.get('datum')
-        v2 = d.get('reader_v2_output')
-        if dt and v2:
-            out[dt] = v2
-    return out
-
-
-def _merge_v2_into_v1_dp(v1_dp, v2_output):
-    """R5-Merge-Regeln (generalisierbar):
-      - V1 ist Hauptquelle. V2 ergänzt nur wenn V1 leer/inkomplet.
-      - V2-confidence ≥ 0.85 + V1-routing leer → V2-routing übernehmen
-      - V2-layover_ort wenn V1-layover leer
-      - V2-overnight_after_day wenn V1-overnight=False + V2-Tour-Context
-      - V2-has_fl wenn V1-has_fl=False + V2-Tour-Context
-      - NIEMALS V1-routing/layover überschreiben wenn V1 explicit Werte hat
-      - V2-low-confidence (<0.85) → V2 ignorieren
-      - V2-tour_context='homebase_free' bei foreign-Tour-Verdacht: KEINE Override
-        (Reader-V2 hat CAS gelesen, CAS sagt Frei → Tour-First bleibt non_tour)
-    """
-    if not isinstance(v2_output, dict):
-        return v1_dp
-    conf = float(v2_output.get('reader_confidence') or 0)
-    if conf < 0.85:
-        return v1_dp   # zu unsicher, kein Merge
-
-    v2_ctx = v2_output.get('tour_context', '')
-    # V2 zeigt homebase_free/homebase_standby/office → V1 behalten (kein Tour-Hint)
-    if v2_ctx in ('homebase_free', 'homebase_standby', 'office', 'unknown'):
-        return v1_dp
-
-    merged = dict(v1_dp)
-    # routing
-    if not v1_dp.get('routing') and v2_output.get('routing'):
-        merged['routing'] = list(v2_output.get('routing') or [])
-    # layover_ort
-    if not v1_dp.get('layover_ort') and v2_output.get('layover_ort'):
-        merged['layover_ort'] = v2_output.get('layover_ort')
-    # overnight_after_day
-    if (not v1_dp.get('overnight_after_day')
-            and v2_output.get('overnight_after_day')):
-        merged['overnight_after_day'] = True
-    # has_fl
-    if (not v1_dp.get('has_fl')
-            and v2_output.get('has_fl')):
-        merged['has_fl'] = True
-    # start_time / end_time
-    if not v1_dp.get('start_time') and v2_output.get('start_time'):
-        merged['start_time'] = v2_output.get('start_time')
-    if not v1_dp.get('end_time') and v2_output.get('end_time'):
-        merged['end_time'] = v2_output.get('end_time')
-    # starts_at_homebase / ends_at_homebase aus routing ableitbar
-    hb = 'FRA'
-    if merged.get('routing'):
-        merged['starts_at_homebase'] = merged['routing'][0] == hb
-        merged['ends_at_homebase'] = merged['routing'][-1] == hb
-    # Audit-Marker: V2-merge angewendet
-    merged.setdefault('_v2_merged', True)
-    merged.setdefault('_v2_confidence', conf)
-    merged.setdefault('_v2_tour_context', v2_ctx)
-    return merged
-
-
 def _build_matched_from_raw(raw_days):
     """Konvertiert raw tage_detail (Fixture-Format) → matched_days schema
     {datum, dp, se}-Liste für `_normalize_tours_from_raw_facts`.
@@ -35651,14 +36232,6 @@ def _build_matched_from_raw(raw_days):
                 'count':         0,
             }
         matched.append({'datum': datum, 'dp': dp, 'se': se})
-
-    # Phase R5 — V2-Merge: für Gap-Tage Reader-V2-Facts ergänzen wenn vorhanden
-    v2_facts = _load_reader_v2_facts()
-    if v2_facts:
-        for m in matched:
-            v2 = v2_facts.get(m['datum'])
-            if v2:
-                m['dp'] = _merge_v2_into_v1_dp(m['dp'], v2)
 
     return matched
 
@@ -41883,320 +42456,6 @@ Liefere via Tool das strukturierte Ergebnis."""
         return None
 
 
-def _opus_classify_days_v2(dp_bytes, einsatz_bytes, se_bytes, year=2025, homebase='FRA', feedback=None):
-    """Opus 4.7: liest Dienstplan + Einsatzplan + SE parallel, klassifiziert Tag für Tag.
-    Liefert: arbeitstage, fahrtage, hotel_naechte, z72/73/74_tage und EUR, z76_eur,
-    plus monatlichen Nachweis. Konservative branchenüblicher Steuerberater-Methode.
-
-    feedback: Optional dict {'prev_classification': cls, 'issues': [str]} — bei
-    Self-Reflection-Pass wird Opus mit konkreten Hinweisen zur Korrektur erneut aufgerufen."""
-    if not ANTHROPIC_KEY:
-        return None
-    dp_bytes = _bytes_list(dp_bytes) if dp_bytes else []
-    einsatz_bytes = _bytes_list(einsatz_bytes) if einsatz_bytes else []
-    se_bytes = _bytes_list(se_bytes) if se_bytes else []
-    if not dp_bytes:
-        return None  # ohne Dienstplan nicht möglich
-
-    # Alle PDFs als Document-Content
-    content = []
-    pdf_count = 0
-    for label, blist in [('Dienstplan', dp_bytes), ('Einsatzplan', einsatz_bytes), ('Streckeneinsatz', se_bytes)]:
-        for pdf_bytes in blist[:14]:
-            try:
-                content.append({
-                    'type': 'document',
-                    'source': {'type': 'base64', 'media_type': 'application/pdf',
-                               'data': base64.b64encode(pdf_bytes).decode()}
-                })
-                pdf_count += 1
-            except: pass
-    print(f"[Opus-Klassifikation] {pdf_count} PDFs an Opus übergeben")
-
-    # Tool für strukturierte Antwort
-    classify_tool = {
-        'name': 'submit_tag_klassifikation',
-        'description': 'Liefere die Tag-für-Tag-Auswertung der LH-Dokumente',
-        'input_schema': {
-            'type': 'object',
-            'required': ['arbeitstage', 'fahr_tage', 'hotel_naechte',
-                         'z72_tage', 'z73_tage', 'z74_tage', 'z76_eur', 'nachweis'],
-            'properties': {
-                'arbeitstage':   {'type': 'integer', 'description': 'Alle Tage mit Dienst (Tour/Office/Standby/Schulung), ohne Frei/Urlaub/Krank'},
-                'fahr_tage':     {'type': 'integer', 'description': 'Tage an denen User zum Flughafen fahren musste (Tour-Start + Office-Day). Eine Tour = 1 Fahrtag total, egal wie lang.'},
-                'hotel_naechte': {'type': 'integer', 'description': 'Σ ALLER Übernachtungen außerhalb Homebase (FL-Marker oder anderer Hotel-Indikator) — INLAND UND AUSLAND. Auch Inland-Schulungs-Hotels und Inland-Tour-Layovers zählen. NICHT nur Auslands-Übernachtungen!'},
-                'z72_tage':      {'type': 'integer', 'description': 'Tagestrips Inland >8h (mit Briefingzeit-Berechnung) ohne Übernachtung'},
-                'z72_eur':       {'type': 'number',  'description': 'z72_tage × 14€ (BMF Inland Tagestrip)'},
-                'z73_tage':      {'type': 'integer', 'description': 'An-/Abreisetage Inland (mit Inland-Übernachtung). Auch Auslandstour-Anreise mit FRA-stfrei zählt hier (branchenüblicher Steuerberater-Methode konservativ).'},
-                'z73_eur':       {'type': 'number',  'description': 'z73_tage × 14€'},
-                'z74_tage':      {'type': 'integer', 'description': 'Inland 24h ohne Ab/An-Zeiten (selten)'},
-                'z74_eur':       {'type': 'number',  'description': 'z74_tage × 28€'},
-                'z76_eur':       {'type': 'number',  'description': 'Σ aller stfrei-Werte aus SE wo stfrei-Ort Ausland ist (Z76 VMA Ausland)'},
-                'nachweis':      {'type': 'string',  'description': 'Monatlicher Nachweis. Pro Monat 1-3 Sätze: was waren die Touren, wie viele Arbeitstage/Fahrtage/Hotel.'},
-                'unklare_tage':  {'type': 'array', 'items': {'type': 'string'}, 'description': 'Tage die nicht eindeutig klassifizierbar waren (mit Begründung)'},
-                'tage_detail':   {
-                    'type': 'array',
-                    'description': 'Tag-für-Tag-Klassifikation NUR für Tour-/Office-/Standby-Tage (NICHT für FREI/Urlaub/Krank). Pro Tour: nur den ANREISE-Tag eintragen (mit dauer-Hinweis). Bei Same-Day: 1 Eintrag. So bleibt die Liste kompakt (~50-80 Einträge/Jahr).',
-                    'items': {
-                        'type': 'object',
-                        'required': ['datum', 'marker', 'klass', 'begruendung'],
-                        'properties': {
-                            'datum':       {'type': 'string', 'description': 'YYYY-MM-DD'},
-                            'marker':      {'type': 'string', 'description': 'DP-Marker am Tag (FL/SBY/RES/EM/EH/D4/...)'},
-                            'routing':     {'type': 'string', 'description': 'Routing-Codes z.B. "FRA-CPH-FRA" oder "FRA-BLR" (bei Übernachtung) — wenn unklar leer'},
-                            'klass':       {'type': 'string', 'enum': ['Z72', 'Z73', 'Z74', 'Z76', 'Office', 'Standby', 'Sonstiges'], 'description': 'Klassifikation für VMA-Berechnung'},
-                            'tour_dauer':  {'type': 'integer', 'description': 'Anzahl Tage der Tour (1=Same-Day, 2-5=mehrtägig). Bei Office/Standby = 1.'},
-                            'begruendung': {'type': 'string', 'description': 'Kurz: warum diese Klassifikation? z.B. "Same-Day CPH+Rückflug → Z72" oder "BLR Indien 3 Tage → Z76 Auslandstour" oder "DUS Übernachtung → Z73 Inland-ÜN"'},
-                        }
-                    }
-                },
-            }
-        }
-    }
-
-    # Wissens-Buch laden — Single Source of Truth.
-    # NUR referenz_faelle.txt laden (konsolidiert: §9 EStG, §3 Nr. 16, EASA-FTL,
-    # BMF-Pauschalen, LH-Marker-Katalog, branchenüblicher Standard, Reference-Cases,
-    # Häufige Fehler). Die alte referenz_easa.txt wird NICHT mehr geladen weil sie
-    # widersprüchliche VMA-Klassifikations-Logik enthält.
-    wissensbuch = ''
-    try:
-        ref_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'referenz_faelle.txt')
-        if os.path.exists(ref_path):
-            with open(ref_path, encoding='utf-8') as f:
-                wissensbuch = f.read()
-    except Exception as e:
-        print(f"[Opus-Klassifikation] Wissens-Buch laden fail: {e}")
-
-    prompt = f"""Du bist erfahrener Werbungskosten-Klassifikator spezialisiert auf Lufthansa-Kabinenpersonal (branchenübliche Steuer-Praxis).
-Mandant: LH-Cabin-Crew, Homebase {homebase}, Steuerjahr {year}.
-
-═══════════════════════════════════════════════════════════════════════════
-█ TEIL 1: VERPFLICHTENDES WISSEN — LIES UND VERINNERLICHE
-═══════════════════════════════════════════════════════════════════════════
-
-{wissensbuch}
-
-═══════════════════════════════════════════════════════════════════════════
-█ TEIL 2: DEIN ANALYSE-AUFTRAG
-═══════════════════════════════════════════════════════════════════════════
-
-Du bekommst {pdf_count} PDFs in dieser Reihenfolge:
-- Dienstplan / Flugstunden-Übersichten (Tag-für-Tag-Marker)
-- Einsatzplan / CAS-PUB-Liste (detaillierter mit Briefingzeiten, Routings)
-- Streckeneinsatz-Abrechnungen (was LH stfrei gezahlt hat)
-
-═══ STEP 1 — Datenbasis aufbauen ═══
-
-Lies ALLE PDFs durch. Erstelle innerlich einen Tag-Kalender 1.1.{year}-31.12.{year}.
-Pro Tag erfasse:
-- Welcher Marker im Dienstplan? (FREI/U/K/A/E/FL/SBY/RES/EK/EM/D4/DD/BRIEFING/...)
-- Welche Routing-Info im Einsatzplan? (Tour-Code, Briefingzeit, Block-Time)
-- Welche stfrei-Werte in der SE? (mit stfrei-Ort: FRA/MUC/HAM = Inland, sonst Ausland)
-
-═══ STEP 2 — Tag-Klassifikation ═══
-
-Wende das DENK-SCHEMA aus Teil 1, Abschnitt 1 an:
-
-Pro Tag:
-1. FREI/U/K → kein Arbeitstag, fertig.
-2. SBY/RES/Online-Schulung → Arbeitstag, kein Fahrtag, kein Hotel, fertig.
-3. EK/EM/D4/DD/BRIEFING (Office-Day in {homebase}) → Arbeitstag + Fahrtag (täglich!).
-4. Tour (A/E/FL):
-   a. Same-Day-Heimkehr (A + E gleicher Tag, egal ob Inland oder EU-Ausland):
-      → Z72 mit 14€ Inland-Tagestrip-Pauschale (LH/branchenüblicher Konvention)
-      → 1 Fahrtag, 0 Hotelnacht
-   b. Mehrtägig mit Hotel im INLAND (z.B. Schulung MUC mit Übernachtung):
-      → Anreise-Tag = Z73 (14€), Volltage = nur Arbeitstag, Abreise-Tag = Z73 (14€)
-      → 1 Fahrtag pro Tour, n Hotelnächte
-   c. Mehrtägig mit Hotel im AUSLAND:
-      → ALLE Tage = Z76, BMF-Auslands-Anreise-Pauschale für Tag 1 + letzten Tag,
-        BMF-Auslands-24h-Pauschale für Volltage zwischen
-      → 1 Fahrtag pro Tour, n Hotelnächte (FL-Marker)
-
-═══ STEP 3 — Aggregation ═══
-
-Zähle:
-- arbeitstage = Σ aller Tage außer Frei/Urlaub/Krank
-- fahr_tage = Σ Tour-Starts + Σ Office-Days
-  (Eine Tour = 1 Fahrtag insgesamt, AUCH bei mehreren Etappen!)
-- hotel_naechte = Σ FL-Marker (≥10h Bodenzeit)
-- z72_tage = Σ Same-Day-Tagestrips mit ≥8h Abwesenheit
-- z73_tage = Σ Inland-Mehrtages-Tour Anreise- + Abreise-Tage (NUR echte Inland-Touren!)
-- z74_tage = Σ Inland 24h-Tage (sehr selten, typisch 0-2/Jahr)
-- z76_eur = Σ BMF-Auslands-Pauschalen pro Auslandstour-Tag
-  (Anreise-Satz für Tag 1+letzten, 24h-Satz für Volltage)
-
-═══ STEP 4 — Self-Check VOR Liefern ═══
-
-PFLICHT vor dem Tool-Aufruf — gehe diese Checks durch:
-
-✓ Z76_EUR > Z77? Das ist ein starkes Audit-Warnsignal, aber kein automatischer
-  Rechts-/Rechenfehler. Prüfe dann SE-Vollständigkeit, Auslands-/Inland-
-  Klassifikation, Storno-Zeilen, Zwölftel/Kürzungen und gestellte Mahlzeiten.
-  Z76 NICHT pauschal auf Z77 deckeln.
-
-✓ hotel_naechte ≤ arbeitstage (logisch zwingend)
-
-✓ fahr_tage ≤ arbeitstage (logisch zwingend)
-
-✓ z73_tage typisch 5-15 (NUR echte Inland-Touren mit Hotel — z.B. Schulungen).
-  Wenn dein Z73 > 20: hast du Auslandstouren als Z73 reklassifiziert? FALSCH!
-
-✓ Plausi-Bandbreite Vollzeit: arbeitstage 120-160, fahrtage 50-80, hotel 50-80.
-  Wenn deutlich darüber/unter: prüfe ob du SBY/RES korrekt gezählt hast oder
-  Office-Days als Fahrtag erkannt hast.
-
-Wenn ein Check fehlschlägt: zurück zu STEP 2 und nachschärfen.
-
-═══ STEP 5 — Nachweis schreiben ═══
-
-Im 'nachweis'-Feld: Monat für Monat 2-3 Sätze. Format-Beispiel:
-"JAN: 5 Touren — BLR-Tour 03-06.01 (Z76 Indien), 2× CPH-Tagestrip (Z72), HKG-Tour
-17-21.01 (Z76 China), 1× DD-Schulung Tag 28 (Office). 12 AT, 6 FT, 5 Hotel."
-
-Bei unklaren Tagen: in 'unklare_tage' mit Begründung listen. NIE raten.
-
-═══ ANTI-MUSTER (NICHT MACHEN) ═══
-
-❌ Auslandstour-Anreise-Tag mit FRA-Stempel als Z73 zählen (= Klassifikations-FEHLER #13)
-❌ Same-Day-Tagestrip nach CPH als Z76 zählen (= Klassifikations-FEHLER #13)
-❌ Inland-Schulung mit Hotel als Auslandstour klassifizieren (= FEHLER #14)
-❌ DD/EK/EM nur 1 Fahrtag zählen statt täglich (= FEHLER #4 + #16)
-❌ Plausi-Bandbreiten als Schätzung verwenden — IMMER zählen aus Dienstplan
-❌ Werte ohne Tag-Beleg im Nachweis erfinden — bei Unsicherheit unklar markieren
-
-LIEFERE jetzt via Tool die strukturierten Werte + monatlichen Nachweis."""
-
-    # Self-Reflection-Pass: wenn vorheriger Klass-Output Math-Invarianten verletzt,
-    # bekommt Opus die konkreten Issues als RE-KLASSIFIKATIONS-Auftrag mit.
-    # WICHTIG: Recheck darf NICHT auf "Z76 runter" optimieren — sondern auf KORREKTE
-    # Tour-Klassifikation. Z76 zu hoch heißt: zu viele Tage als Auslandstour ODER
-    # zu wenige als Inland-Übernachtung, NICHT "alle in Z72 schieben".
-    if feedback and feedback.get('issues'):
-        prev = feedback.get('prev_classification', {}) or {}
-        issues_list = feedback.get('issues', [])
-        prompt += "\n\n═══════════════════════════════════════════════════════════════════════════"
-        prompt += "\n█ RE-KLASSIFIKATIONS-AUFTRAG: deine vorherige Klassifikation hatte Probleme"
-        prompt += "\n═══════════════════════════════════════════════════════════════════════════\n"
-        prompt += f"\nDeine erste Klassifikation lieferte:"
-        prompt += f"\n  arbeitstage={prev.get('arbeitstage')}, fahr_tage={prev.get('fahr_tage')}, "
-        prompt += f"hotel={prev.get('hotel_naechte')}"
-        prompt += f"\n  Z72={prev.get('z72_tage')}T, Z73={prev.get('z73_tage')}T, "
-        prompt += f"Z74={prev.get('z74_tage')}T, Z76={prev.get('z76_eur'):.2f}€" if prev.get('z76_eur') is not None else ""
-        prompt += "\n\nProbleme die das Backend identifiziert hat:\n"
-        for i, iss in enumerate(issues_list, 1):
-            prompt += f"  {i}. {iss}\n"
-        prompt += "\n█ RECHECK-PRINZIP (KRITISCH — vermeide häufigen Reflex-Fehler!) ███████████\n"
-        prompt += "\nZiel ist NICHT 'Z76 reduzieren um jeden Preis'. Ziel ist KORREKTE Tour-\n"
-        prompt += "Klassifikation. Wenn dein erster Pass z.B. Z76>Z77 ergeben hat, ist die\n"
-        prompt += "Lösung NICHT 'mehr Tage als Z72 markieren', sondern systematisch prüfen:\n\n"
-        prompt += "  1. MULTI-STOP-TOUREN TAG-FÜR-TAG klassifizieren!\n"
-        prompt += "     Eine Tour darf NIEMALS pauschal komplett als Z76 abgerechnet werden,\n"
-        prompt += "     nur weil irgendwo im Verlauf ein Auslands-Layover vorkommt. Pro Kalender-\n"
-        prompt += "     tag entscheidet der TATSÄCHLICHE Übernachtungsort:\n"
-        prompt += "     • Inland-Layover (z.B. BER, MUC, DUS) → Z73 für An/Abreisetag dieser\n"
-        prompt += "       Inland-Übernachtung. NICHT Z76 nur weil andere Tage der Tour Ausland sind.\n"
-        prompt += "     • Ausland-Layover → Z76 für diesen Tag.\n"
-        prompt += "     • Same-Day-Turnaround → Z72 (nur wenn Hard-Gate-Bedingungen alle erfüllt).\n"
-        prompt += "     Bei Multi-Stop FRA→BER→ZAG→ARN→FRA: Tag 1 (BER-Übernachtung) ist Z73,\n"
-        prompt += "     erst danach beginnt die Z76-Phase mit dem Übergang ins Ausland.\n\n"
-        prompt += "  2. Sind ALLE als Z72 klassifizierten Tage echte Same-Day-Tagestrips?\n"
-        prompt += "     Z72 IST NUR ZULÄSSIG wenn ALLE Bedingungen erfüllt:\n"
-        prompt += "     • A-Marker UND E-Marker am SELBEN Kalendertag\n"
-        prompt += "     • KEIN FL-Marker (Layover) am Tag oder Folgetag\n"
-        prompt += "     • KEINE Heimkehr aus einer mehrtägigen Tour am selben Tag\n"
-        prompt += "     • KEIN vorheriger oder folgender Tag gehört zur gleichen Tour\n"
-        prompt += "     • KEIN Hotel-/Layover-Indiz im Einsatzplan\n"
-        prompt += "     • Gesamtabwesenheit >8h\n"
-        prompt += "     Wenn EINE Bedingung fehlt → NICHT Z72 → prüfe Z73 oder Z76.\n"
-        prompt += "     Tag mit Heimkehr aus mehrtägiger Tour + neuer Same-Day = MISCHFALL: NIEMALS\n"
-        prompt += "     pauschal nur Z72. Tour-Abschluss separat (Z76- oder Z73-Abreise) klassifizieren.\n\n"
-        prompt += "  3. Wurden Inland-Übernachtungen (Z73) fälschlich als Z72, Z76 oder Office\n"
-        prompt += "     klassifiziert? Prüfe besonders:\n"
-        prompt += "     • Mehrtages-Schulungen (D4/DD/EM/EH): 2+ aufeinanderfolgende Schulungstage\n"
-        prompt += "       OHNE FREI dazwischen + auswärtiger Schulungsort = Z73 für An/Abreise.\n"
-        prompt += "     • Inland-Layovers in MUC/HAM/BER/DUS/STR/CGN/HAJ/NUE/LEJ/BRE als Teil\n"
-        prompt += "       von Multi-Stop-Touren — diese Tage sind Z73, nicht Z76 nur weil später\n"
-        prompt += "       Auslandstage folgen.\n\n"
-        prompt += "  4. PASSEN die Hotelnächte zur Touren-Anzahl?\n"
-        prompt += "     Hotelnächte sollten ≈ Σ(Auslands-Layovers + Inland-Schulungs-Übernachtungen).\n"
-        prompt += "     Wenn Hotelnächte deutlich niedriger als FL-Marker im DP → Inland-\n"
-        prompt += "     Übernachtungen übersehen oder Mehrtages-Schulung als Office gezählt.\n\n"
-        prompt += "  5. Z76 ≤ Z77 ist KEIN Selbstzweck — wenn Z76 nach korrekter Re-Klassifikation\n"
-        prompt += "     immer noch leicht über Z77 liegt, ist das OK (Audit-Hinweis im Backend).\n"
-        prompt += "     LIEBER fachlich richtig + Hinweis als pauschal Z76 zerschnitten.\n\n"
-        prompt += "█ REFLEX-FEHLER DEN DU NICHT MACHEN DARFST ████████████████████████████████\n"
-        prompt += "\n❌ Multi-Stop-Tour pauschal komplett als Z76 abrechnen, weil Ausland vorkommt = FALSCH\n"
-        prompt += "❌ Z76 war zu hoch → 'verschiebe Auslandstour-Tage einfach nach Z72' = FALSCH\n"
-        prompt += "❌ Hotelnächte reduzieren um Z76 zu senken = FALSCH (verstößt gegen FL-Marker)\n"
-        prompt += "❌ Z73 = 0 lassen 'weil sicherer' = FALSCH bei vorhandenen Inland-Layovers\n"
-        prompt += "❌ Heimkehr-Tag aus mehrtägiger Tour + Same-Day pauschal nur als Z72 = FALSCH\n\n"
-        prompt += "Im 'tage_detail' dokumentiere für JEDEN als Z72 markierten Tag explizit:\n"
-        prompt += "'Same-Day-Heimkehr nachgewiesen durch A+E am Tag X, kein FL, keine Tour-Fortsetzung'.\n"
-        prompt += "Im 'tage_detail' für Z73-Tage: 'Inland-Layover XYZ am Tag X mit Hotel'.\n"
-        prompt += "Im 'tage_detail' für Z76-Tage: 'Auslandstour LAND, Hotel im Ausland'.\n"
-        prompt += "Bei Mischfällen (Heimkehr + Same-Day): beide Komponenten getrennt aufführen.\n\n"
-        prompt += "Liefere das fachlich KORREKT re-klassifizierte Ergebnis via Tool."
-
-    content.append({'type': 'text', 'text': prompt})
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=300.0)
-    import time as _t
-    start = _t.time()
-    try:
-        resp = None
-        for attempt in range(2):
-            try:
-                resp = client.messages.create(
-                    model='claude-opus-4-7', max_tokens=12000,
-                    tools=[classify_tool],
-                    tool_choice={'type': 'tool', 'name': 'submit_tag_klassifikation'},
-                    messages=[{'role': 'user', 'content': content}]
-                )
-                break
-            except Exception as e:
-                if attempt == 1: raise
-                print(f"[Opus-Klassifikation] retry: {str(e)[:100]}")
-                _t.sleep(5)
-        elapsed = _t.time() - start
-        tool_input = None
-        for block in resp.content:
-            if getattr(block, 'type', None) == 'tool_use':
-                tool_input = block.input
-                break
-        if not tool_input:
-            print(f"[Opus-Klassifikation] kein tool_input — content blocks: {[getattr(b,'type',None) for b in resp.content]}")
-            return None
-        result = {
-            'arbeitstage':   int(tool_input.get('arbeitstage', 0) or 0),
-            'fahr_tage':     int(tool_input.get('fahr_tage', 0) or 0),
-            'hotel_naechte': int(tool_input.get('hotel_naechte', 0) or 0),
-            'z72_tage':      int(tool_input.get('z72_tage', 0) or 0),
-            'z73_tage':      int(tool_input.get('z73_tage', 0) or 0),
-            'z74_tage':      int(tool_input.get('z74_tage', 0) or 0),
-            'z76_eur':       float(tool_input.get('z76_eur', 0) or 0),
-            'nachweis':      str(tool_input.get('nachweis', '') or ''),
-            'unklare_tage':  list(tool_input.get('unklare_tage', []) or []),
-            'tage_detail':   list(tool_input.get('tage_detail', []) or []),
-        }
-        # EUR aus Tagen × BMF-Pauschale (vereinheitlicht)
-        bmf = BMF_INLAND_BY_YEAR.get(year, BMF_INLAND_BY_YEAR[2025])
-        result['z72_eur'] = round(result['z72_tage'] * bmf['tagestrip_8h'], 2)
-        result['z73_eur'] = round(result['z73_tage'] * bmf['an_abreise'], 2)
-        result['z74_eur'] = round(result['z74_tage'] * bmf['voll_24h'], 2)
-        result['z76_eur'] = round(result['z76_eur'], 2)
-        pass_label = '[Opus-Klassifikation-RECHECK]' if feedback else '[Opus-Klassifikation]'
-        print(f"{pass_label} {elapsed:.1f}s: arbeit={result['arbeitstage']}T fahr={result['fahr_tage']}T "
-              f"hotel={result['hotel_naechte']}T  Z72={result['z72_tage']}T/{result['z72_eur']:.2f}€  "
-              f"Z73={result['z73_tage']}T/{result['z73_eur']:.2f}€  Z74={result['z74_tage']}T/{result['z74_eur']:.2f}€  "
-              f"Z76={result['z76_eur']:.2f}€  unklar={len(result['unklare_tage'])}")
-        return result
-    except Exception as e:
-        print(f"[Opus-Klassifikation] fail: {e}")
-        return None
-
-
 def _detect_classification_issues(cls, se_summary):
     """Prüft harte logische Invarianten und Audit-Plausibilitätschecks.
     Liefert konkrete Issue-Strings für den Self-Reflection-Pass.
@@ -45590,14 +45849,6 @@ def berechne(form, files, job_id=None):
         '_confidence':     confidence,
         '_anomalies':      anomalies,
     }
-
-
-def _fallback_streck():
-    """Kein Fallback mehr — echte PDFs werden benötigt."""
-    raise ValueError(
-        "Streckeneinsatz-Abrechnungen konnten nicht ausgelesen werden. "
-        "Bitte stelle sicher dass alle 12 Monate hochgeladen sind."
-    )
 
 
 # ══════════════════════════════════════════════════════════════════
