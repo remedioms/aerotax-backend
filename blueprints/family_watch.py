@@ -1226,6 +1226,9 @@ def _load_crew_roster_days(crew_token, days_limit):
             'layover_ort': rf.get('layover_ort'),
             'start_time': rf.get('start_time'),
             'end_time': rf.get('end_time'),
+            # Pro-Leg-Sektoren durchreichen → Family-Sheet zeigt die echten Legs
+            # (volle Namen/keine Briefing-Zeiten macht der Client). Ohne das nur 1 Route/Tag.
+            'ical_sectors': day.get('ical_sectors'),
         })
 
     # FALLBACK (User: „bin bei Family drin und kann den Kalender nicht sehen"):
