@@ -9378,6 +9378,30 @@ def _social_rpc_call(fn_name, params):
         return False, None
 
 
+# ── Fehlende-Tabelle-Degradierung (Migrations werden manuell applied) ───────
+# Neue Durability-Tabellen (user_flight_ops, user_voice_notes aus
+# supabase_migrations/20260702_durability.sql) legt der User MANUELL im
+# SQL-Editor an. Bis dahin wirft PostgREST PGRST205 ("Could not find the table
+# ... in the schema cache"). Der Code MUSS ohne die Tabelle laufen und auf Disk
+# degradieren — exakt wie die RPC-Fallbacks oben. Pro Tabelle einmal loggen.
+_SB_TABLE_MISSING = set()
+
+
+def _sb_table_is_missing(tbl, err):
+    """True wenn `err` ein 'Tabelle fehlt'-Fehler ist. Loggt einmal pro Tabelle."""
+    msg = str(err)
+    if 'PGRST205' in msg or 'Could not find the table' in msg \
+            or ('schema cache' in msg and 'table' in msg.lower()):
+        if tbl not in _SB_TABLE_MISSING:
+            _SB_TABLE_MISSING.add(tbl)
+            app.logger.warning(
+                f'[sb] Tabelle {tbl} fehlt in Supabase — Migration '
+                f'supabase_migrations/20260702_durability.sql anwenden. '
+                f'Disk-Fallback aktiv.')
+        return True
+    return False
+
+
 def _profile_metadata_merge_sb(token, patch):
     """Atomarer metadata-Merge (coalesce(metadata,'{}') || patch) via RPC.
     Returns True wenn der Merge server-seitig eine EXISTIERENDE Row traf
@@ -11713,19 +11737,113 @@ def _flight_ops_path(token):
     return os.path.join(_USER_HISTORY_DIR, f'flightops_{safe}.json')
 
 
+# ── Flight-Ops SB persistence (P1 durability, 2026-07-02) ──
+# Per-Flight-Operational-Details (Catering/Pax/Fuel/SSR/Endorsement) — vom User
+# GETIPPT, speisen Logbuch + Trip-Stats. Lagen NUR auf ephemeral Disk
+# (flightops_<token>.json) → jeder Cloud-Run-Redeploy wipte sie. Pattern exakt
+# wie user_manual_briefings: SB-primary, Disk-Fallback, Lazy-Migrate beim ersten
+# SB-leeren Read. Tabelle user_flight_ops(token, datum, ops jsonb) PK(token,datum).
+
+def _flight_ops_load_from_supabase(token):
+    """dict[datum_str → ops_dict] | None bei SB-down/Tabelle-fehlt."""
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = (sb.table('user_flight_ops').select('datum,ops')
+             .eq('token', token).execute())
+        out = {}
+        for row in (r.data or []):
+            datum = row.get('datum')
+            ops = row.get('ops')
+            if datum and isinstance(ops, dict):
+                out[str(datum)] = ops
+        return out
+    except Exception as e:
+        if _sb_table_is_missing('user_flight_ops', e):
+            return None
+        app.logger.warning(
+            f'[flight-ops] sb_load_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _flight_ops_save_to_supabase(token, ops_by_date):
+    """Bulk-upsert aller Flight-Ops. True bei Erfolg/leer, False bei Fehler."""
+    if not SB_AVAILABLE or not token or ops_by_date is None:
+        return False
+    rows = []
+    for datum, ops in (ops_by_date or {}).items():
+        if not isinstance(ops, dict):
+            continue
+        if not isinstance(datum, str) or len(datum) < 10:
+            continue
+        rows.append({'token': token, 'datum': datum[:10], 'ops': ops})
+    if not rows:
+        return True
+    try:
+        for i in range(0, len(rows), 500):
+            sb.table('user_flight_ops').upsert(
+                rows[i:i+500], on_conflict='token,datum').execute()
+        return True
+    except Exception as e:
+        if _sb_table_is_missing('user_flight_ops', e):
+            return False
+        app.logger.error(
+            f'[flight-ops] sb_save_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _flight_ops_upsert_datum_to_supabase(token, datum, ops):
+    """Single-Datum-Upsert (für put_flight_ops). True bei Erfolg."""
+    if not SB_AVAILABLE or not token or not datum or not isinstance(ops, dict):
+        return False
+    try:
+        sb.table('user_flight_ops').upsert(
+            {'token': token, 'datum': datum[:10], 'ops': ops},
+            on_conflict='token,datum').execute()
+        return True
+    except Exception as e:
+        if _sb_table_is_missing('user_flight_ops', e):
+            return False
+        app.logger.error(
+            f'[flight-ops] sb_upsert_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:200]}')
+        return False
+
+
+def _flight_ops_delete_datum_from_supabase(token, datum):
+    if not SB_AVAILABLE or not token or not datum:
+        return False
+    try:
+        sb.table('user_flight_ops').delete().eq('token', token).eq('datum', datum[:10]).execute()
+        return True
+    except Exception as e:
+        if not _sb_table_is_missing('user_flight_ops', e):
+            app.logger.warning(f'[flight-ops] sb_delete_fail tok={token[:8]}: {str(e)[:120]}')
+        return False
+
+
+def _flight_ops_load_from_disk(token):
+    p = _flight_ops_path(token)
+    if not p:
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
 @app.route('/api/user/flight-ops/<token>', methods=['GET'])
 def get_flight_ops(token):
     """Liefert alle Per-Flight-Operational-Details (Catering/Pax/Fuel/SSR/Endorsement) zurück.
     Optional: ?datum=YYYY-MM-DD für einzelnen Tag.
     """
-    p = _flight_ops_path(token)
-    if not p:
+    if not _flight_ops_path(token):
         return jsonify({'error': 'invalid token'}), 400
     try:
-        with open(p) as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        data = {}
+        # SB-primary (Disk-Fallback + Lazy-Migrate steckt in _flight_ops_load).
+        data = _flight_ops_load(token)
     except Exception as e:
         print(f'[get_flight_ops] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'error': 'internal_error'}), 500
@@ -11752,17 +11870,18 @@ def put_flight_ops(token, datum):
     # Strip oversize payloads (DOS protection)
     if len(json.dumps(body)) > 16_000:
         return jsonify({'ok': False, 'error': 'payload_too_large'}), 413
+    # SB-primary: einzelnes Datum upserten. Disk-Mirror best-effort.
+    sb_ok = _flight_ops_upsert_datum_to_supabase(token, datum, body)
+    disk_ok = False
     try:
-        try:
-            with open(p) as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            data = {}
+        data = _flight_ops_load_from_disk(token)
         data[datum] = body
         with open(p, 'w') as f:
             json.dump(data, f, ensure_ascii=False)
+        disk_ok = True
     except Exception as e:
-        print(f'[put_flight_ops] error: {type(e).__name__}: {str(e)[:300]}')
+        print(f'[put_flight_ops] disk_save_fail (ok wenn SB lief): {type(e).__name__}: {str(e)[:300]}')
+    if not (sb_ok or disk_ok):
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True, 'datum': datum})
 
@@ -11773,6 +11892,8 @@ def delete_flight_ops(token, datum):
     p = _flight_ops_path(token)
     if not p:
         return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    # SB-primary löschen, dann Disk-Mirror.
+    _flight_ops_delete_datum_from_supabase(token, datum)
     try:
         with open(p) as f:
             data = json.load(f)
@@ -13367,15 +13488,22 @@ def _extract_article_text(html):
 # ─── Logbook HTML-Export (EASA AMC1 FCL.050 + FAA FAR 61.51) ────────────────
 
 def _flight_ops_load(token):
-    p = _flight_ops_path(token)
-    if not p: return {}
-    try:
-        with open(p) as f:
-            return json.load(f) or {}
-    except FileNotFoundError:
+    """SB primary, Disk fallback, Lazy-Migrate (analog _manual_briefings_load)."""
+    if not token:
         return {}
-    except Exception:
-        return {}
+    sb_data = _flight_ops_load_from_supabase(token)
+    if sb_data is None:
+        return _flight_ops_load_from_disk(token)
+    if sb_data:
+        return sb_data
+    # SB ok aber leer → Disk-Reste lazy-migraten
+    disk_data = _flight_ops_load_from_disk(token)
+    if disk_data and SB_AVAILABLE:
+        app.logger.info(
+            f'[flight-ops] lazy-migrate tok={token[:8]} {len(disk_data)} disk → supabase')
+        _flight_ops_save_to_supabase(token, disk_data)
+        return disk_data
+    return {}
 
 
 def _build_logbook_html(token, standard='EASA'):
@@ -14756,9 +14884,84 @@ def _voice_note_path(token, datum):
     return os.path.join(voice_dir, f'{safe_d}.m4a')
 
 
+# ── Voice-Notes durable storage (P1, 2026-07-02) ──
+# Die .m4a-Aufnahmen lagen NUR auf ephemeral Disk (voice_notes/<token>/<datum>.m4a)
+# → jeder Cloud-Run-Redeploy wipte sie. Wie Avatare: Bytes nach R2 (Zero-Egress,
+# durabel), Metadata (r2_key/mime/size) in Supabase-Tabelle user_voice_notes.
+# Read: SB-Metadata → R2-Bytes, sonst deterministischer Key → R2, sonst Disk.
+# Der R2-Key ist deterministisch (voice/<token>/<datum>.m4a), damit die Bytes
+# auch ohne SB-Metadata (Tabelle noch nicht angelegt) auffindbar bleiben.
+
+def _voice_note_r2_key(token, datum):
+    import re
+    safe_t = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    safe_d = re.sub(r'[^0-9-]', '', datum or '')[:10]
+    if not safe_t or not safe_d:
+        return None
+    return f'voice/{safe_t}/{safe_d}.m4a'
+
+
+def _voice_note_meta_upsert(token, datum, r2_key, mime, size_bytes):
+    if not SB_AVAILABLE or not token or not datum:
+        return False
+    try:
+        sb.table('user_voice_notes').upsert({
+            'token': token, 'day_key': datum[:10], 'r2_key': r2_key,
+            'mime': mime or 'audio/mp4', 'size_bytes': int(size_bytes or 0),
+        }, on_conflict='token,day_key').execute()
+        return True
+    except Exception as e:
+        if _sb_table_is_missing('user_voice_notes', e):
+            return False
+        app.logger.error(f'[voice-note] sb_meta_fail tok={token[:8]}: {str(e)[:160]}')
+        return False
+
+
+def _voice_note_meta_get(token, datum):
+    if not SB_AVAILABLE or not token or not datum:
+        return None
+    try:
+        r = (sb.table('user_voice_notes').select('*')
+             .eq('token', token).eq('day_key', datum[:10]).limit(1).execute())
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        if not _sb_table_is_missing('user_voice_notes', e):
+            app.logger.warning(f'[voice-note] sb_meta_get_fail: {str(e)[:120]}')
+        return None
+
+
+def _voice_note_meta_list(token):
+    """Liste der Tage mit Voice-Note (SB). None bei SB-down/Tabelle-fehlt."""
+    if not SB_AVAILABLE or not token:
+        return None
+    try:
+        r = (sb.table('user_voice_notes').select('day_key')
+             .eq('token', token).execute())
+        return sorted({str(row.get('day_key')) for row in (r.data or [])
+                       if row.get('day_key')})
+    except Exception as e:
+        if not _sb_table_is_missing('user_voice_notes', e):
+            app.logger.warning(f'[voice-note] sb_meta_list_fail: {str(e)[:120]}')
+        return None
+
+
+def _voice_note_meta_delete(token, datum):
+    if not SB_AVAILABLE or not token or not datum:
+        return False
+    try:
+        sb.table('user_voice_notes').delete().eq('token', token).eq('day_key', datum[:10]).execute()
+        return True
+    except Exception as e:
+        if not _sb_table_is_missing('user_voice_notes', e):
+            app.logger.warning(f'[voice-note] sb_meta_del_fail: {str(e)[:120]}')
+        return False
+
+
 @app.route('/api/user/voice-note/<token>/<datum>', methods=['POST'])
 def upload_voice_note(token, datum):
-    """Upload M4A Voice-Note für einen Flugtag. Max 60s / 2 MB."""
+    """Upload M4A Voice-Note für einen Flugtag. Max 60s / 2 MB.
+    Durabel: Bytes → R2, Metadata → SB (user_voice_notes). Disk-Mirror best-effort."""
     p = _voice_note_path(token, datum)
     if not p: return jsonify({'ok': False, 'error': 'invalid_path'}), 400
     audio = request.files.get('audio')
@@ -14767,34 +14970,62 @@ def upload_voice_note(token, datum):
     data = audio.read()
     if len(data) > 2 * 1024 * 1024:
         return jsonify({'ok': False, 'error': 'audio_too_large'}), 413
+    mime = getattr(audio, 'mimetype', None) or 'audio/mp4'
+    # 1) Bytes durabel nach R2 (wie Avatare).
+    r2_key = _voice_note_r2_key(token, datum)
+    r2_ok = False
+    if R2_AVATARS_ENABLED and r2_key:
+        try:
+            _r2_put_bytes(r2_key, data, mime)
+            r2_ok = True
+        except Exception as e:
+            app.logger.warning(f'[voice-note] r2_put_fail: {str(e)[:120]}')
+    # 2) Metadata nach SB (nur wenn Bytes sicher in R2 liegen).
+    if r2_ok:
+        _voice_note_meta_upsert(token, datum, r2_key, mime, len(data))
+    # 3) Disk-Mirror/Fallback (best-effort; einzige Sicherung wenn R2 aus).
+    disk_ok = False
     try:
         with open(p, 'wb') as f: f.write(data)
+        disk_ok = True
     except Exception as e:
-        print(f'[upload_voice_note] error: {type(e).__name__}: {str(e)[:300]}')
+        print(f'[upload_voice_note] disk_save_fail (ok wenn R2 lief): {type(e).__name__}: {str(e)[:300]}')
+    if not (r2_ok or disk_ok):
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
     return jsonify({'ok': True, 'datum': datum, 'size_kb': len(data) // 1024})
 
 
 @app.route('/api/user/voice-note/<token>/<datum>', methods=['GET'])
 def get_voice_note(token, datum):
-    p = _voice_note_path(token, datum)
-    if not p: return jsonify({'error':'invalid_path'}), 400
     import os
-    if not os.path.exists(p):
-        return jsonify({'error': 'not_found'}), 404
-    from flask import send_file
-    # M4A-Container mit AAC-Audio — korrekter MIME ist audio/mp4 für QuickTime/MP4-Container
-    # mit AAC. iOS spielt beides ab, aber audio/mp4 ist semantisch korrekter.
-    return send_file(p, mimetype='audio/mp4', conditional=True)
+    # 1) SB-Metadata → R2-Key (bevorzugt), sonst deterministischer Key → R2-Bytes.
+    meta = _voice_note_meta_get(token, datum)
+    r2_key = (meta or {}).get('r2_key') or _voice_note_r2_key(token, datum)
+    mime = (meta or {}).get('mime') or 'audio/mp4'
+    if R2_AVATARS_ENABLED and r2_key:
+        raw, ct = _r2_get_bytes(r2_key)
+        if raw:
+            from flask import Response
+            return Response(raw, mimetype=ct or mime)
+    # 2) Disk-Fallback (M4A-Container mit AAC → audio/mp4 ist semantisch korrekt).
+    p = _voice_note_path(token, datum)
+    if p and os.path.exists(p):
+        from flask import send_file
+        return send_file(p, mimetype='audio/mp4', conditional=True)
+    return jsonify({'error': 'not_found'}), 404
 
 
 @app.route('/api/user/voice-note/<token>/<datum>', methods=['DELETE'])
 def delete_voice_note(token, datum):
-    p = _voice_note_path(token, datum)
-    if not p: return jsonify({'ok': False, 'error':'invalid_path'}), 400
     import os
+    # R2-Bytes + SB-Metadata + Disk-Mirror löschen (alle best-effort).
+    r2_key = _voice_note_r2_key(token, datum)
+    if R2_AVATARS_ENABLED and r2_key:
+        _r2_delete_key(r2_key)
+    _voice_note_meta_delete(token, datum)
+    p = _voice_note_path(token, datum)
     try:
-        if os.path.exists(p): os.remove(p)
+        if p and os.path.exists(p): os.remove(p)
     except Exception as e:
         print(f'[delete_voice_note] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
@@ -14803,14 +15034,17 @@ def delete_voice_note(token, datum):
 
 @app.route('/api/user/voice-note/<token>', methods=['GET'])
 def list_voice_notes(token):
-    """Liste aller voice-note-Tage für User."""
+    """Liste aller voice-note-Tage für User. SB-primary + Disk-Merge."""
     import os, re
     safe_t = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
     if not safe_t: return jsonify({'error':'invalid token'}), 400
+    sb_dates = _voice_note_meta_list(token)  # None wenn SB-down/Tabelle-fehlt
+    disk_dates = []
     voice_dir = os.path.join(_USER_HISTORY_DIR, 'voice_notes', safe_t)
-    if not os.path.isdir(voice_dir):
-        return jsonify({'dates': []})
-    dates = sorted([f.replace('.m4a','') for f in os.listdir(voice_dir) if f.endswith('.m4a')])
+    if os.path.isdir(voice_dir):
+        disk_dates = [f.replace('.m4a', '') for f in os.listdir(voice_dir)
+                      if f.endswith('.m4a')]
+    dates = sorted(set((sb_dates or []) + disk_dates))
     return jsonify({'dates': dates, 'count': len(dates)})
 
 
@@ -16478,6 +16712,16 @@ def _r2_get_bytes(key):
         return obj['Body'].read(), obj.get('ContentType') or 'image/jpeg'
     except Exception:
         return None, None
+def _r2_delete_key(key):
+    """Löscht ein einzelnes R2-Objekt. True/False best-effort."""
+    cli = _r2_client()
+    if cli is None or not key:
+        return False
+    try:
+        cli.delete_object(Bucket=R2_AVATARS_BUCKET, Key=key)
+        return True
+    except Exception:
+        return False
 
 
 @app.route('/api/user/avatar/<token>', methods=['POST'])
@@ -22046,6 +22290,17 @@ def auth_delete_account():
         except Exception as _e:
             app.logger.warning(f'[delete] sb_manual_briefings_fail: {str(_e)[:120]}')
 
+    # 3b2. Voice-Notes: R2-Bytes löschen (SB-Metadata-Rows kommen in der Cascade
+    # unten via user_voice_notes). Keys aus der SB-Metadata ableiten.
+    if token:
+        try:
+            for _d in (_voice_note_meta_list(token) or []):
+                _vk = _voice_note_r2_key(token, _d)
+                if R2_AVATARS_ENABLED and _vk:
+                    _r2_delete_key(_vk)
+        except Exception as _e:
+            app.logger.warning(f'[delete] voice_r2_fail: {str(_e)[:120]}')
+
     # 3c. DSGVO Art. 17 — vollständige Supabase-Cascade. Vorher überlebten die
     # sensibelsten User-Daten (Steuer-Sessions, Profile, Wall/Forum/DM, Friends,
     # Licenses, Push-Tokens, Family-Shares, Crew-Reports) den Account-Delete in
@@ -22078,6 +22333,8 @@ def auth_delete_account():
             ('aircraft_health_reports', 'reported_by_token'),  # row['reported_by_token']
             ('hotel_room_reports',      'reported_by_token'),  # row['reported_by_token']
             ('trade_posts',             'author_token'),       # .eq('author_token', token)
+            ('user_flight_ops',         'token'),              # upsert on_conflict='token,datum'
+            ('user_voice_notes',        'token'),              # upsert on_conflict='token,day_key'
         ]
         for _tbl, _col in _cascade:
             try:
@@ -22319,6 +22576,14 @@ def auth_export_data():
                     pass
     except Exception as e:
         export['_voice_notes_error'] = str(e)[:200]
+
+    # ── Flight-Ops (Per-Flight-Operational-Details, SB-primary) ─────────
+    # Vom User getippte Catering/Pax/Fuel/SSR/Endorsement-Daten. Fehlte bisher
+    # im DSGVO-Export (Audit-Fund) — jetzt aus _flight_ops_load (SB→Disk).
+    try:
+        export['flight_ops'] = _flight_ops_load(token) or {}
+    except Exception as e:
+        export['_flight_ops_error'] = str(e)[:200]
 
     # ── Supabase-Quellen (DSGVO Art. 15: vollständig, SB-primary) ───────
     # Vorher kam der Export grösstenteils von der ephemeren Disk (auf Cloud Run
