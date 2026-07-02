@@ -21,6 +21,7 @@ Ziel: den Großteil der App-Lookups OHNE bezahlte API bedienen. Nur unbekannte
 Hexes und echte Live-Routen lösen genau einen externen Call aus, danach Cache.
 """
 import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -872,24 +873,108 @@ def ax_suggest():
 # Schnitt (n=1), jede weitere verfeinert ihn. Speist die Hotel-Ankunft-Schätzung
 # im Feed mit echten Crowd-Daten statt der statischen Tabelle.
 #
-# Storage: In-Memory (sofort nutzbar) + best-effort Supabase (`ax_crewbus`,
-# key=iata, payload={minutes:[...]}). Ohne Tabelle no-op't der SB-Write (durable
-# sobald die Tabelle angelegt ist) — die App funktioniert trotzdem.
-_CREWBUS_MEM = {}
-_CREWBUS_CAP = 50          # je IATA die letzten 50 Eingaben mitteln (Drift-Schutz)
+# Storage: DURABEL in Supabase `ax_crewbus_obs` (APPEND-ONLY, eine Zeile je
+# Eingabe = Source of Truth). Der Schnitt wird aus ALLEN Zeilen einer Station
+# gemittelt, sodass der Pool Cloud-Run-Restarts überlebt und über alle Instanzen
+# aggregiert. Der In-Memory-Cache ist nur noch ein KURZLEBIGER Read-Through-
+# Accelerator (kein Storage mehr). Ist Supabase mal weg, wird die Eingabe
+# trotzdem angenommen und nur im Memory-Fallback gehalten — NIE ein 500.
+_CREWBUS_MIN, _CREWBUS_MAX = 1, 240   # sane Range (Minuten)
+_CREWBUS_CAP = 200         # je IATA die letzten 200 Eingaben mitteln (Drift-Schutz)
+_CREWBUS_TTL = 60          # Read-Through-Cache: 60 s frisch, dann re-fetch aus SB
+_CREWBUS_CACHE = {}        # iata -> (fetched_at, [minutes])  (nur Accelerator)
+_CREWBUS_MEM = {}          # iata -> [minutes]  (Fallback, wenn SB nicht erreichbar)
+_CREWBUS_LOCK = threading.Lock()
 
 
-def _crewbus_get(iata):
-    cached = _cache_get('ax_crewbus', 'iata', iata)
-    if isinstance(cached, dict) and isinstance(cached.get('minutes'), list):
-        return [int(x) for x in cached['minutes'] if isinstance(x, (int, float))]
-    return list(_CREWBUS_MEM.get(iata) or [])
+def _crewbus_anon_id():
+    """Stabile, NICHT-umkehrbare Pseudo-ID aus dem Bearer-Token (Light-Dedup +
+    Herkunfts-Signal, ohne Klartext-Identität zu speichern). None ohne Token."""
+    from flask import request
+    try:
+        auth = request.headers.get('Authorization') or ''
+        parts = auth.split()
+        tok = parts[1] if len(parts) == 2 and parts[0].lower() == 'bearer' else ''
+        if not tok:
+            return None
+        return hashlib.sha256(tok.encode('utf-8')).hexdigest()[:24]
+    except Exception:
+        return None
 
 
-def _crewbus_put(iata, minutes):
-    minutes = minutes[-_CREWBUS_CAP:]
-    _CREWBUS_MEM[iata] = minutes
-    _cache_put('ax_crewbus', {'iata': iata, 'payload': {'minutes': minutes}})
+def _crewbus_sb_recent(iata):
+    """Alle (bis _CREWBUS_CAP jüngste) gemeldeten Minuten einer Station aus dem
+    durablen Store. None → SB nicht erreichbar/Tabelle fehlt (Caller fällt auf
+    Memory zurück). []/Liste → autoritativer Pool (auch leer)."""
+    sb = _sb()
+    if sb is None:
+        return None
+    try:
+        res = (sb.table('ax_crewbus_obs')
+                 .select('minutes')
+                 .eq('iata', iata)
+                 .order('created_at', desc=True)
+                 .limit(_CREWBUS_CAP)
+                 .execute())
+        rows = getattr(res, 'data', None) or []
+        return [int(r['minutes']) for r in rows
+                if isinstance(r.get('minutes'), (int, float))]
+    except Exception:
+        return None            # Tabelle nicht angelegt / SB down → graceful degrade
+
+
+def _crewbus_recent(iata):
+    """Read-Through: Memory-Cache (frisch < TTL) → Supabase → Memory-Fallback."""
+    now = time.time()
+    with _CREWBUS_LOCK:
+        hit = _CREWBUS_CACHE.get(iata)
+        if hit and (now - hit[0]) < _CREWBUS_TTL:
+            return list(hit[1])
+    mins = _crewbus_sb_recent(iata)
+    if mins is None:
+        # SB nicht verfügbar → best-effort Memory-Fallback (per-Instance).
+        return list(_CREWBUS_MEM.get(iata) or [])
+    with _CREWBUS_LOCK:
+        _CREWBUS_CACHE[iata] = (now, list(mins))
+    return mins
+
+
+def _crewbus_is_dup(iata, minutes, anon_id):
+    """Light-Dedup: derselbe Nutzer meldet für dieselbe Station denselben Wert
+    innerhalb 24 h → als Doppel werten (kein neuer Insert, aber Stats zurück)."""
+    if not anon_id:
+        return False
+    sb = _sb()
+    if sb is None:
+        return False
+    try:
+        import datetime
+        since = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(hours=24)).isoformat()
+        res = (sb.table('ax_crewbus_obs')
+                 .select('minutes')
+                 .eq('iata', iata).eq('anon_id', anon_id).eq('minutes', minutes)
+                 .gte('created_at', since)
+                 .limit(1).execute())
+        return bool(getattr(res, 'data', None))
+    except Exception:
+        return False
+
+
+def _crewbus_insert(iata, minutes, anon_id):
+    """Durabler PRIMARY-Write: eine Zeile je Eingabe in ax_crewbus_obs.
+    True bei Erfolg. False → SB weg/Tabelle fehlt (Caller nutzt Memory-Fallback)."""
+    sb = _sb()
+    if sb is None:
+        return False
+    try:
+        sb.table('ax_crewbus_obs').insert({
+            'iata': iata, 'minutes': int(minutes),
+            'direction': 'transfer', 'anon_id': anon_id,
+        }).execute()
+        return True
+    except Exception:
+        return False
 
 
 def _crewbus_avg(minutes):
@@ -901,7 +986,7 @@ def ax_crewbus_get(iata):
     iata = (iata or '').upper().strip()[:4]
     if not iata:
         return jsonify({'ok': False, 'error': 'bad_iata'}), 400
-    mins = _crewbus_get(iata)
+    mins = _crewbus_recent(iata)
     return jsonify({'ok': True, 'iata': iata,
                     'avg': _crewbus_avg(mins), 'count': len(mins)})
 
@@ -917,12 +1002,25 @@ def ax_crewbus_post(iata):
         m = int(round(float(body.get('minutes'))))
     except Exception:
         return jsonify({'ok': False, 'error': 'bad_minutes'}), 400
-    if not (1 <= m <= 240):
+    if not (_CREWBUS_MIN <= m <= _CREWBUS_MAX):
         return jsonify({'ok': False, 'error': 'out_of_range',
                         'message': 'Minuten müssen zwischen 1 und 240 liegen.'}), 400
-    mins = _crewbus_get(iata)
-    mins.append(m)
-    _crewbus_put(iata, mins)
-    mins = _crewbus_get(iata)
+
+    anon = _crewbus_anon_id()
+    # Light-Dedup: identische Wiederholung desselben Nutzers zählt nicht doppelt.
+    if not _crewbus_is_dup(iata, m, anon):
+        if not _crewbus_insert(iata, m, anon):
+            # SB nicht erreichbar → Eingabe NICHT verlieren: Memory-Fallback.
+            with _CREWBUS_LOCK:
+                lst = _CREWBUS_MEM.setdefault(iata, [])
+                lst.append(m)
+                del lst[:-_CREWBUS_CAP]
+    # Read-Through-Cache invalidieren, damit der neue Wert sofort im Schnitt ist.
+    with _CREWBUS_LOCK:
+        _CREWBUS_CACHE.pop(iata, None)
+
+    mins = _crewbus_recent(iata)
+    if not mins:                       # SB-Insert lief, Read noch nicht sichtbar
+        mins = [m]
     return jsonify({'ok': True, 'iata': iata,
                     'avg': _crewbus_avg(mins), 'count': len(mins), 'your_minutes': m})

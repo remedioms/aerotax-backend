@@ -3717,6 +3717,13 @@ def _run_process_async(job_id, form, files):
                     # Crews-on-Flight: Flugnummer-Assignments ingesten
                     # (best-effort). Speist /api/crew/flight-Lookup.
                     _crew_flight_ingest(session_token, _tage)
+                    # Crew-Graph: Same-Flight-Overlap-Kanten neu ableiten
+                    # (best-effort, idempotent). Nach _crew_flight_ingest.
+                    try:
+                        from blueprints.crew_graph_blueprint import rebuild_overlap_edges
+                        rebuild_overlap_edges(session_token, _tage)
+                    except Exception as _cg_e:
+                        app.logger.warning(f'[crew-graph] autosave_rebuild_fail {type(_cg_e).__name__}: {str(_cg_e)[:120]}')
             except Exception as _e:
                 app.logger.warning(f'[share-roster-auto-save] {_e}')
 
@@ -14513,6 +14520,15 @@ def take_roster_snapshot(token):
     # Crews-on-Flight: Flugnummer-Assignments aus dem neuen Snapshot ingesten
     # (best-effort, wirft nie). Speist /api/crew/flight-Lookup.
     _crew_flight_ingest(token, new_tage)
+    # Crew-Graph: aus dem frisch geschriebenen crew_flight_assignments-Index die
+    # Same-Flight-Overlap-Kanten neu berechnen (best-effort, wirft nie,
+    # idempotenter SET-Upsert). Erst NACH _crew_flight_ingest, damit die eigenen
+    # Assignments schon sichtbar sind.
+    try:
+        from blueprints.crew_graph_blueprint import rebuild_overlap_edges
+        rebuild_overlap_edges(token, new_tage)
+    except Exception as _cg_e:
+        app.logger.warning(f'[crew-graph] snapshot_rebuild_fail {type(_cg_e).__name__}: {str(_cg_e)[:120]}')
     # Append diff to changes log
     cp = _roster_changes_path(token)
     try:

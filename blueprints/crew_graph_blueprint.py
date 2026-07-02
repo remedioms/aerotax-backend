@@ -516,6 +516,195 @@ def _disk_upsert_increment(token, other_id, other_token, display_name,
 
 
 # ════════════════════════════════════════════════════════════════
+#   Derived crew-graph: Same-Flight-Overlap → crew_edges
+# ────────────────────────────────────────────────────────────────
+#   REALITÄT (2026-07): LH-myTime-iCal-Roster listen KEINE Mitflieger.
+#   Es gibt also KEINE echte "wer-war-als-Crew-mit-mir"-Quelle aus dem
+#   Roster-Import — der /ingest-Endpoint (crew_list) hätte nie einen
+#   Speiser bekommen, darum blieb crew_edges leer (0 Rows in prod).
+#
+#   Ableitbare Quelle, die die Daten DOCH hergeben: zwei AeroX-User mit
+#   DERSELBEN Flugnummer am DEMSELBEN Datum sind denselben Flug geflogen.
+#   Die Cross-User-Tabelle crew_flight_assignments (gespeist beim Roster-
+#   Snapshot) hat genau diesen Index. Wir aggregieren daraus symmetrische
+#   crew_edges. Semantik ehrlich: "denselben Flug geflogen", NICHT
+#   "als Crew zusammen eingeteilt".
+#
+#   Idempotenz: tour_count wird auf den ABSOLUTEN Wert (# gemeinsamer Flüge)
+#   GESETZT — nicht inkrementiert. Mehrfaches Re-Ingest desselben Rosters
+#   (BackgroundSync pusht regelmäßig) ändert die Kante nicht. Deterministisch:
+#   gleicher Snapshot-Stand → gleiche Kanten. Self-direction only — jeder User
+#   baut beim EIGENEN Push seinen eigenen Graph (kein Schreiben in fremde Rows).
+# ════════════════════════════════════════════════════════════════
+
+def _upsert_edge_absolute(self_token, other_id, other_token, display_name,
+                          position, tour_count, last_flown_date, layovers, routes):
+    """Idempotenter SET-Upsert einer Edge (kein +1-Increment). Schreibt SB
+    (primary) + Disk-Mirror (best-effort). Returns True bei mind. einem Write."""
+    now_iso = datetime.utcnow().isoformat() + 'Z'
+    row = {
+        'self_token': self_token,
+        'other_id': other_id,
+        'other_token': other_token,
+        'other_display_name': display_name,
+        'other_position': position or '',
+        'tour_count': int(tour_count),
+        'last_flown_date': last_flown_date,
+        'shared_layovers': layovers or [],
+        'shared_routes': routes or [],
+        'updated_at': now_iso,
+    }
+    wrote = False
+    sb, ok = _sb_client()
+    if ok:
+        try:
+            sb.table('crew_edges').upsert(
+                row, on_conflict='self_token,other_id'
+            ).execute()
+            wrote = True
+        except Exception as e:
+            current_app.logger.warning(
+                f'[crew-graph] overlap_upsert_fail tok={self_token[:8]} '
+                f'err={type(e).__name__}: {str(e)[:120]}'
+            )
+    # Disk-Mirror (SET, nicht increment) — hält same-worker-Reads konsistent.
+    try:
+        lk = _lock_for(f'disk::{self_token}::{other_id}')
+        with lk:
+            d = _disk_load(self_token)
+            prev = d.get(other_id) or {}
+            drow = dict(row)
+            drow['created_at'] = prev.get('created_at') or now_iso
+            d[other_id] = drow
+            if _disk_save(self_token, d):
+                wrote = True
+    except Exception:
+        pass
+    return wrote
+
+
+def rebuild_overlap_edges(self_token, tage):
+    """Leitet crew_edges für `self_token` aus Same-Flight-Overlap ab.
+
+    tage: roster-snapshot tage_detail (jeder Tag mit reader_facts.flight_numbers
+    + optional reader_facts.layover_ort + routing). Best-effort, wirft NIE.
+    Returns Anzahl geschriebener Kanten (0 wenn keine Co-Flieger / SB-down).
+    """
+    try:
+        safe = _safe_token_fragment(self_token)
+        if not safe or not tage:
+            return 0
+        sb, ok = _sb_client()
+        if not ok:
+            # Cross-User-Overlap braucht die SB-Tabelle crew_flight_assignments —
+            # ohne SB gibt es keine fremden Roster zum Matchen.
+            return 0
+
+        # 1) Eigene (flugnr, datum) + Layover/Route-Kontext einsammeln.
+        my_flights = {}   # (fn, date) -> {'layover': str|None, 'route': str|None}
+        for t in tage:
+            if not isinstance(t, dict):
+                continue
+            datum = (t.get('datum') or '')[:10]
+            if not re.match(r'^\d{4}-\d{2}-\d{2}$', datum):
+                continue
+            rf = t.get('reader_facts') or {}
+            lay = (rf.get('layover_ort') or '').upper().strip() or None
+            rt = t.get('routing')
+            rt = rt.strip().upper() if isinstance(rt, str) and rt.strip() else None
+            for fn in (rf.get('flight_numbers') or []):
+                fn_norm = re.sub(r'[^A-Za-z0-9]', '', str(fn or '').upper())[:12]
+                if not fn_norm:
+                    continue
+                my_flights[(fn_norm, datum)] = {'layover': lay, 'route': rt or fn_norm}
+        if not my_flights:
+            return 0
+
+        my_fns = sorted({fn for (fn, _d) in my_flights})
+
+        # 2) Co-Flieger aus crew_flight_assignments (Index auf flight_number),
+        #    gechunkt. Nur opt_in. Match strikt auf (flight_number, flight_date)
+        #    gegen die eigenen Flüge.
+        others = {}   # other_token -> aggregate
+        for i in range(0, len(my_fns), 100):
+            chunk = my_fns[i:i + 100]
+            try:
+                r = (sb.table('crew_flight_assignments')
+                     .select('self_token,flight_number,flight_date,'
+                             'display_name,base,position,opt_in')
+                     .in_('flight_number', chunk)
+                     .eq('opt_in', True)
+                     .execute())
+            except Exception as e:
+                current_app.logger.warning(
+                    f'[crew-graph] overlap_query_fail tok={safe[:8]} '
+                    f'err={type(e).__name__}: {str(e)[:120]}'
+                )
+                return 0
+            for row in (r.data or []):
+                ot = row.get('self_token')
+                if not ot or ot == self_token:
+                    continue
+                fn = row.get('flight_number')
+                fd = (row.get('flight_date') or '')[:10]
+                ctx = my_flights.get((fn, fd))
+                if not ctx:
+                    continue   # nicht derselbe Flug am selben Tag
+                agg = others.get(ot)
+                if agg is None:
+                    agg = {'count': 0, 'layovers': set(), 'routes': set(),
+                           'last': None, 'name': row.get('display_name'),
+                           'pos': row.get('position')}
+                    others[ot] = agg
+                agg['count'] += 1
+                if ctx['layover']:
+                    agg['layovers'].add(ctx['layover'])
+                if ctx['route']:
+                    agg['routes'].add(ctx['route'])
+                if agg['last'] is None or (fd and fd > agg['last']):
+                    agg['last'] = fd
+                if not agg['name'] and row.get('display_name'):
+                    agg['name'] = row.get('display_name')
+                if not agg['pos'] and row.get('position'):
+                    agg['pos'] = row.get('position')
+
+        if not others:
+            return 0
+
+        written = 0
+        for ot, agg in others.items():
+            display = _normalize_display_name(agg['name'])
+            pos = _normalize_position(agg['pos'])
+            ok_w = _upsert_edge_absolute(
+                self_token=safe,
+                other_id=ot,
+                other_token=ot,
+                display_name=display,
+                position=pos,
+                tour_count=agg['count'],
+                last_flown_date=agg['last'],
+                layovers=sorted(agg['layovers'])[:SHARED_LAYOVERS_MAX],
+                routes=sorted(agg['routes'])[:SHARED_ROUTES_MAX],
+            )
+            if ok_w:
+                written += 1
+
+        current_app.logger.info(
+            f'[crew-graph] overlap_rebuild tok={safe[:8]} '
+            f'flights={len(my_flights)} peers={len(others)} written={written}'
+        )
+        return written
+    except Exception as e:
+        try:
+            current_app.logger.warning(
+                f'[crew-graph] overlap_rebuild_fail err={type(e).__name__}: {str(e)[:120]}'
+            )
+        except Exception:
+            pass
+        return 0
+
+
+# ════════════════════════════════════════════════════════════════
 #                          E N D P O I N T S
 # ════════════════════════════════════════════════════════════════
 
