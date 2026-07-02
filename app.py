@@ -24304,10 +24304,27 @@ def ax_flight_info(flightno):
                 }
         except Exception as e:
             app.logger.warning(f'[flight-info] obs_fail {str(e)[:120]}')
-    # LIVE-ENRICH: kein Tail aus der Historie (oder gar kein Treffer) → Live-Board
-    # des Abflug-Flughafens scannen. So bekommt ein HEUTE/künftig abfliegender Flug
-    # seinen bereits zugeteilten Tail, den die (nur-abgeflogen-)Historie nie hätte.
-    if out is None or not out.get('reg'):
+    # FRISCHE-CHECK (Bug-Fix Flight-Check-up 2026-07-02): die Board-Historie ist pro
+    # Flugnummer keyed und liefert die JÜNGSTE Beobachtung — auch wenn ihr Tag ALT ist.
+    # Operative "heute"-Felder (Status/Erwartet/Gate/Delay/Tail) eines VERGANGENEN
+    # Betriebstags dürfen NICHT als "heute live" durchgereicht werden. Beobachtet:
+    #   • LH327 zeigte gestern's ERWARTET 16:00 < Plan 16:10 (verspätet, aber früher!)
+    #   • LH326 hing 3 Tage auf Status "Boarding" (ADS-B war längst wieder am Boden)
+    #   • Muster/Tail vom falschen Tag (DAISC/A321 statt heutigem DAIZD/A320)
+    # Bei explizitem ?date= (Kalender fragt genau diesen Tag) gilt die Frische-Regel NICHT.
+    obs_date = (out.get('date') if (out and str(out.get('source') or '').startswith('aerox_obs'))
+                else None)
+    try:
+        today_local = _airport_local_now((out or {}).get('origin') or board_ap).strftime('%Y-%m-%d')
+    except Exception:
+        today_local = None
+    stale = bool(obs_date and today_local and obs_date != today_local and not date_param)
+
+    # LIVE-ENRICH: kein Tail aus der Historie (oder gar kein Treffer) ODER die Historie
+    # ist von einem alten Tag (stale) → Live-Board des Abflug-Flughafens scannen. So
+    # bekommt ein HEUTE/künftig abfliegender Flug seinen bereits zugeteilten Tail +
+    # frische Zeiten/Status, die die (nur-abgeflogen-)Historie nie hätte.
+    if out is None or not out.get('reg') or stale:
         try:
             bf = _flight_from_live_board(board_ap, fn)
         except Exception:
@@ -24334,6 +24351,24 @@ def ax_flight_info(flightno):
                                       'date': (bf.get('sched') or '')[:10]}] if b_reg else []),
                     'observations': 0,
                 }
+                stale = False
+            elif stale:
+                # Historie war von einem alten Tag, aber das Live-Board hat den
+                # HEUTIGEN Umlauf → das Board ist die Wahrheit für alle operativen
+                # Felder. Strecke/recent_regs (Identität/Historie) bleiben erhalten.
+                out['date'] = (bf.get('sched') or '')[:10] or out.get('date')
+                out['sched'] = bf.get('sched') or out.get('sched')
+                out['esti'] = bf.get('esti')
+                out['status'] = bf.get('status')
+                out['delay_min'] = bf.get('delay_min')
+                out['cancelled'] = bf.get('cancelled')
+                out['gate'] = bf.get('gate') or None
+                out['terminal'] = bf.get('terminal') or None
+                if b_reg:
+                    out['reg'] = b_reg
+                    out['type'] = b_type or out.get('type')
+                out['source'] = 'aerox_obs+live'
+                stale = False
             else:
                 # Historie hatte Strecke/Gate, aber keinen Tail → nur Tail/Typ + frische
                 # Live-Zeiten ergänzen, Quelle markieren.
@@ -24349,6 +24384,19 @@ def ax_flight_info(flightno):
                     out['gate'] = bf.get('gate')
                 if bf.get('esti'):
                     out['esti'] = bf.get('esti')
+
+    # Immer noch stale (Live-Board hatte den heutigen Umlauf nicht — z.B. Flug ist
+    # heute schon abgeflogen und aus dem now→+27h-Fenster raus): die operativen
+    # "heute"-Felder eines vergangenen Tages NICHT als live ausgeben. Strecke +
+    # recent_regs (mit Datum) bleiben als ehrliche Identität/Historie erhalten.
+    if out is not None and stale:
+        out['stale'] = True
+        out['obs_date'] = obs_date
+        for _k in ('status', 'esti', 'delay_min', 'cancelled', 'gate', 'terminal', 'sched'):
+            out[_k] = None
+        out['reg'] = None
+        out['type'] = None
+
     if out is not None:
         return _public_cache_headers(jsonify(out))
     # Weder Historie noch Live-Feed → Client fällt auf AeroDataBox zurück.
