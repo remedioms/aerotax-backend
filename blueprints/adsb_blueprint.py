@@ -1952,6 +1952,7 @@ def adsb_poll():
     calls_made = 0
     credits_remaining = None
     polled_boxes = []
+    all_states = []          # ALLE bbox-Rows (nicht nur gewatchte) → Self-Compute
     today_key = 'budget:' + datetime.now(timezone.utc).strftime('%Y%m%d')
 
     # Budget-Governor mit dem zuletzt gesehenen Rest-Credit aus poll_state seeden,
@@ -2002,6 +2003,7 @@ def adsb_poll():
             if shex in watched_hexes:
                 _persist_state_row_as_keyframe(srow)
                 matched += 1
+        all_states.extend(states)   # ALLE Rows der Box → Self-Compute-Engine
 
         _poll_state_put('bbox:' + box_name, {
             'last_polled_at': time.time(),
@@ -2010,6 +2012,18 @@ def adsb_poll():
         })
         polled_boxes.append({"box": box_name, "tier": tier, "ok": True,
                              "matched": matched, "in_box_watched": len(watched_hexes)})
+
+    # 5b) SELF-COMPUTED ROUTES (frei): jede Maschine, die wir eh schon aus den
+    #     bbox-Calls haben (NICHT nur die gewatchten), in die Route-Engine geben →
+    #     Ab-/Anflug-Erkennung füllt ax_route_cache weltweit gratis.
+    legs_recorded = 0
+    if all_states:
+        try:
+            from blueprints.aerox_data_blueprint import observe_adsb_positions
+            obs_rows = [r for r in (_normalize_opensky_state(s) for s in all_states) if r]
+            legs_recorded = observe_adsb_positions(obs_rows)
+        except Exception:
+            legs_recorded = 0
 
     # 6) sparsam: /flights/aircraft pro neu-gewatchtem Hex (Inbound-Origin).
     #    Rate-limit per flights_fetched_at (≥ _FLIGHTS_REFRESH_SECONDS her).
@@ -2058,6 +2072,7 @@ def adsb_poll():
         "ok": True,
         "polled_boxes": polled_boxes,
         "calls_made": calls_made,
+        "legs_recorded": legs_recorded,
         "flights_fetched": flights_fetched,
         "credits_remaining": credits_remaining,
         "budget_stretched": stretched,
@@ -2403,6 +2418,14 @@ def get_adsb_area():
         return jsonify({"ok": False, "error": "all_upstreams_failed",
                         "lat": lat, "lon": lon, "radius_nm": radius,
                         "tried": tried}), 502
+
+    # SELF-COMPUTED ROUTES (frei): frische Live-Rows (Cache-Miss) in die Route-
+    # Engine geben → jeder Karten-Pan eines Users füllt die eigene Routen-DB.
+    try:
+        from blueprints.aerox_data_blueprint import observe_adsb_positions
+        observe_adsb_positions(aircraft)
+    except Exception:
+        pass
 
     payload = {
         "ok": True,

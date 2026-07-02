@@ -236,6 +236,9 @@ def _aviationstack_route(callsign):
     key = os.environ.get('AVIATIONSTACK_KEY', '')
     if not key:
         return None
+    # BEZAHLT + quota-limitiert → harter Tages-Budget-Guard (free-first-Constraint).
+    if not _paid_budget_ok():
+        return None
     month = time.strftime('%Y-%m', time.gmtime())
     remaining, used = _budget_remaining(month)
     floor = int(os.environ.get('AVIATIONSTACK_ROUTE_FLOOR', '25'))
@@ -243,6 +246,7 @@ def _aviationstack_route(callsign):
         return None
     url = (f'http://api.aviationstack.com/v1/flights?access_key={urllib.parse.quote(key)}'
            f'&flight_icao={urllib.parse.quote(callsign)}&limit=1')
+    _paid_budget_inc()              # zählt gegen das Tages-Paid-Budget
     d = _http_json(url, timeout=12)
     if not isinstance(d, dict):
         return None
@@ -263,6 +267,558 @@ def _aviationstack_route(callsign):
         'callsign': callsign, 'source': 'aviationstack',
         'status': r0.get('flight_status'),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LIVE-ROUTE RESOLVER  —  FREE-FIRST cascade (owner's hard constraint)
+#
+#  ZIEL: „so viel wie möglich mit dem eigenen Backend, gratis, über die Zeit
+#  richtig gut." Bezahlte APIs (AeroDataBox BASIC, AviationStack) sind quota-
+#  limitiert + fast erschöpft → sie kommen NUR als allerletzter Ausweg und hinter
+#  einem harten Tages-Budget-Guard. Jeder aufgelöste Treffer (egal welche Quelle)
+#  wird datums-/reg-gekeyt in die eigene Warehouse (ax_route_cache) geschrieben →
+#  derselbe Tap ist morgen GRATIS und die eigene Routen-DB wächst weltweit.
+#
+#  Priorität (siehe _resolve_live_route) — FREI VOR BEZAHLT:
+#    1. Eigene Warehouse    — date-/reg-gekeyter ax_route_cache + Airport-Tafel
+#       (frei, EIGEN)         (_route_from_obs). ENTHÄLT auch die selbst-berechneten
+#                             Routen aus dem eigenen ADS-B-Poll (observe_adsb_
+#                             positions schreibt fertige Legs hierher). → gratis.
+#    2. Selbst berechnet    — aus dem EIGENEN gepollten ADS-B (adsb.lol/OpenSky):
+#       (frei, EIGEN, das     Ab-/Anflug-Erkennung am nächsten Flughafen. Landet
+#        Langzeit-Asset)      via Schritt 1 im Cache. DIE Quelle, die das Backend
+#                             über die Zeit selbst füllt (kostenlos, weltweit).
+#    3. OpenSky             — echter beobachteter ADS-B-Track (dep/arr aus dem
+#       (FREI mit Account)    Flug). Env-guarded (OPENSKY_CLIENT_ID/SECRET oder
+#                             OPENSKY_USERNAME/PASSWORD); ohne Creds fail-open None.
+#    4. adsbdb / adsb.lol / hexdb — generischer Callsign→Route-Lookup. Alle FREI/
+#       (frei)                öffentlich → mittlerer Fallback. confidence=estimated.
+#    5. AeroDataBox / AviationStack — BEZAHLT, quota-limitiert. NUR wenn nichts
+#       (BEZAHLT, LETZTES)    Freies auflöste UND der Tages-Budget-Guard
+#                             (_paid_budget_ok, AX_PAID_DAILY_CAP=50) es erlaubt.
+#                             NIE im Poller / nie in Bulk. confidence=confirmed.
+#
+#  confidence-Werte im Response:  'confirmed'  (echte heutige Strecke)
+#                                 'estimated'  (generischer Flugplan / mehrdeutig)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _today_utc():
+    return time.strftime('%Y-%m-%d', time.gmtime())
+
+
+def _iso_now():
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def _callsign_to_iata_flightno(cs):
+    """ICAO-Callsign (DLH506) → IATA-Flugnummer (LH506) via Airline-Referenz.
+    None, wenn Präfix unbekannt ODER der Suffix nicht rein numerisch ist
+    (z.B. DLH5EF hat keine kommerzielle IATA-Nummer → nur reg-Weg sinnvoll)."""
+    import re as _re
+    cs = (cs or '').upper().strip()
+    m = _re.match(r'^([A-Z]{3})(\d{1,4}[A-Z]?)$', cs) or _re.match(r'^([A-Z]{2})(\d{1,4}[A-Z]?)$', cs)
+    if not m:
+        return None
+    prefix, suffix = m.group(1), m.group(2)
+    if not suffix[:1].isdigit():
+        return None
+    al = _airline_row(prefix)
+    if not al or not al.get('iata'):
+        return None
+    return f"{al['iata']}{suffix}"
+
+
+def _bearing_deg(lat1, lon1, lat2, lon2):
+    """Großkreis-Anfangskurs dep→arr in Grad (0..360). None bei fehlenden Coords."""
+    import math
+    try:
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        dl = math.radians(lon2 - lon1)
+        y = math.sin(dl) * math.cos(p2)
+        x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+        return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+    except Exception:
+        return None
+
+
+def _adb_flight_to_route(f, cs):
+    """AeroDataBox-Flight-Objekt → route-Dict (src/dst IATA+ICAO). None bei Müll."""
+    dep = ((f.get('departure') or {}).get('airport') or {})
+    arr = ((f.get('arrival') or {}).get('airport') or {})
+    src = (dep.get('iata') or '').upper() or None
+    dst = (arr.get('iata') or '').upper() or None
+    if not src or not dst:
+        return None
+    return {
+        'src': src, 'src_icao': (dep.get('icao') or '').upper() or None,
+        'dst': dst, 'dst_icao': (arr.get('icao') or '').upper() or None,
+        'callsign': cs, 'status': f.get('status'),
+        'reg': ((f.get('aircraft') or {}).get('reg') or '').upper() or None,
+    }
+
+
+def _adb_pick_active_leg(flights, cs, reg, track):
+    """Aus mehreren AeroDataBox-Flügen (gleiche Nummer/Reg, mehrere Legs am Tag)
+    das AKTUELLE Leg wählen: 1) exakter reg-Match, 2) Status enroute/departed/
+    active, 3) Kurs-Match (dep→arr-Bearing ~ track ±70°), sonst der erste.
+    Rückgabe (route_dict, ambiguous_bool)."""
+    routes = [(f, _adb_flight_to_route(f, cs)) for f in flights]
+    routes = [(f, r) for f, r in routes if r]
+    if not routes:
+        return None, False
+    if len(routes) == 1:
+        return routes[0][1], False
+    reg_u = (reg or '').upper()
+    if reg_u:
+        for f, r in routes:
+            if r.get('reg') == reg_u:
+                return r, False
+    live = [(f, r) for f, r in routes
+            if str(f.get('status') or '').lower() in
+            ('enroute', 'en-route', 'departed', 'active', 'boarding', 'expected')]
+    pool = live or routes
+    if track is not None and len(pool) > 1:
+        best, bestd = None, 999
+        for f, r in pool:
+            a = _airport_row(r.get('src')); b = _airport_row(r.get('dst'))
+            if not (a and b and a.get('lat') is not None and b.get('lat') is not None):
+                continue
+            brg = _bearing_deg(a['lat'], a['lon'], b['lat'], b['lon'])
+            if brg is None:
+                continue
+            d = abs((brg - track + 180) % 360 - 180)
+            if d < bestd:
+                best, bestd = r, d
+        if best is not None and bestd <= 70:
+            return best, False
+    return pool[0][1], len(pool) > 1
+
+
+def _aerodatabox_route(cs, reg=None, lat=None, lon=None, track=None, date=None):
+    """AeroDataBox (RapidAPI, AERODATABOX_KEY) — die GENAUE Route eines Live-Fluges.
+    Reg-gekeyt bevorzugt (an die physische Maschine gebunden → immun gegen
+    Flugnummer-Recycling), sonst nummern-gekeyt mit Leg-Disambiguierung.
+    Wirft NIE; None bei fehlendem Key, Quota (429) oder keinem Treffer."""
+    key = os.environ.get('AERODATABOX_KEY', '')
+    if not key:
+        return None
+    # BEZAHLT + quota-limitiert → harter Tages-Budget-Guard (free-first-Constraint).
+    if not _paid_budget_ok():
+        return None
+    date = date or _today_utc()
+    host = 'aerodatabox.p.rapidapi.com'
+    hdr = {'x-rapidapi-key': key, 'x-rapidapi-host': host,
+           'User-Agent': 'AeroX-DataEngine/1.0'}
+
+    def _get(path):
+        _paid_budget_inc()      # jeder Request zählt gegen das Tages-Budget
+        try:
+            req = urllib.request.Request(f'https://{host}{path}', headers=hdr)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read().decode('utf-8', 'replace'))
+                return d if isinstance(d, list) else []
+        except Exception:
+            return None      # 429/quota/Netz → still degradieren
+
+    # 1) reg-gekeyt (autoritativ für die physische Maschine)
+    if reg:
+        flights = _get(f'/flights/reg/{urllib.parse.quote(reg.upper())}/{date}')
+        if flights:
+            route, amb = _adb_pick_active_leg(flights, cs, reg, track)
+            if route:
+                route['source'] = 'aerodatabox'
+                route['confidence'] = 'estimated' if amb else 'confirmed'
+                return route
+    # 2) nummern-gekeyt (IATA-Flugnummer aus dem Callsign)
+    fn = _callsign_to_iata_flightno(cs)
+    if fn:
+        flights = _get(f'/flights/number/{urllib.parse.quote(fn)}/{date}')
+        if flights:
+            route, amb = _adb_pick_active_leg(flights, cs, reg, track)
+            if route:
+                route['source'] = 'aerodatabox'
+                route['confidence'] = 'estimated' if amb else 'confirmed'
+                return route
+    return None
+
+
+def _opensky_route(hexid):
+    """OpenSky /flights/aircraft — echte beobachtete Ab-/Ankunft aus dem ADS-B-
+    Track dieser Maschine (letzte 36h). Braucht OpenSky-Creds (OPENSKY_CLIENT_ID/
+    SECRET oder OPENSKY_USERNAME/PASSWORD); anonym = 403 → None (fail-open).
+    Wirft NIE. ICAO→IATA über die eigene Airport-Referenz angereichert."""
+    if not hexid:
+        return None
+    try:
+        from blueprints.adsb_blueprint import fetch_recent_flight
+    except Exception:
+        return None
+    rec = None
+    try:
+        rec = fetch_recent_flight(hexid, lookback_hours=36)
+    except Exception:
+        rec = None
+    if not rec:
+        return None
+    dep_icao = (rec.get('est_departure_icao') or '').upper() or None
+    arr_icao = (rec.get('est_arrival_icao') or '').upper() or None
+    if not dep_icao and not arr_icao:
+        return None
+
+    def _iata(icao):
+        if not icao:
+            return None
+        ap = _airport_row(icao)
+        return (ap.get('iata') if ap else None) or None
+    route = {
+        'src': _iata(dep_icao), 'src_icao': dep_icao,
+        'dst': _iata(arr_icao), 'dst_icao': arr_icao,
+        'callsign': (rec.get('callsign') or '').strip() or None,
+        'source': 'opensky',
+        # Beide Enden beobachtet → confirmed. Nur ein Ende (Flug evtl. noch in der
+        # Luft, Ziel noch nicht getrackt) → estimated.
+        'confidence': 'confirmed' if (dep_icao and arr_icao) else 'estimated',
+    }
+    if not route['src'] and not route['dst']:
+        return None
+    return route
+
+
+def _record_resolved_route(cs, reg, route, date=None):
+    """Aufgelöste Route in die eigene Warehouse (ax_route_cache) zurückschreiben —
+    datums-gekeyt (`CS@YYYYMMDD`, exakte heutige Strecke), reg-gekeyt
+    (`REG:<reg>@YYYYMMDD`) UND unter dem nackten Callsign (Rückwärts-Kompat für
+    /api/ax/flight + Harvest). So ist derselbe Tap heute gratis, und die eigene
+    Routen-DB wächst korrekt aus dem echten Verkehr. Schreibt NICHTS bei
+    generischen/leeren Treffern ohne Strecke. Wirft NIE."""
+    if not route or not (route.get('src') or route.get('src_icao')):
+        return
+    date = date or _today_utc()
+    dk = date.replace('-', '')
+    payload = dict(route)
+    payload['resolved_date'] = date
+    payload.setdefault('callsign', cs)
+    now = _iso_now()
+    rows = [
+        {'flight': f'{cs}@{dk}', 'payload': payload, 'updated_at': now},
+        {'flight': cs, 'payload': payload, 'updated_at': now},
+    ]
+    if reg:
+        rows.append({'flight': f'REG:{reg.upper()}@{dk}',
+                     'payload': payload, 'updated_at': now})
+    for row in rows:
+        _cache_put('ax_route_cache', row)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PAID-API DAILY BUDGET GUARD  (AeroDataBox + AviationStack)
+#  Harter Tages-Deckel (AX_PAID_DAILY_CAP, Default 50). Persistiert in
+#  ax_api_budget (key='paid:YYYYMMDD') + In-Memory-Safety-Net. Wird NUR aus dem
+#  On-Demand-Tap-Pfad angefasst — nie aus dem Poller/Bulk.
+# ─────────────────────────────────────────────────────────────────────────────
+def _paid_daily_key():
+    return 'paid:' + time.strftime('%Y%m%d', time.gmtime())
+
+
+def _paid_daily_used():
+    key = _paid_daily_key()
+    used = _MEM_BUDGET.get(key, 0)
+    sb = _sb()
+    if sb is not None:
+        try:
+            res = sb.table('ax_api_budget').select('n').eq('month', key).limit(1).execute()
+            rows = getattr(res, 'data', None) or []
+            if rows:
+                used = max(used, int(rows[0].get('n') or 0))
+        except Exception:
+            pass
+    return used
+
+
+def _paid_budget_ok():
+    """True solange heute noch bezahlte Calls frei sind. Über dem Deckel → False
+    (blockt AeroDataBox + AviationStack hart)."""
+    cap = int(os.environ.get('AX_PAID_DAILY_CAP', '50'))
+    return _paid_daily_used() < cap
+
+
+def _paid_budget_inc():
+    key = _paid_daily_key()
+    used = _MEM_BUDGET.get(key, 0) + 1
+    _MEM_BUDGET[key] = used          # In-Memory IMMER zählen (Safety-Net)
+    sb = _sb()
+    if sb is None:
+        return
+    try:
+        sb.table('ax_api_budget').upsert(
+            {'month': key, 'n': max(used, _paid_daily_used()),
+             'updated_at': _iso_now()}).execute()
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SELF-COMPUTED ROUTES FROM OWN POLLED ADS-B  —  the long-term FREE data engine
+#
+#  Wir pollen ohnehin Live-Positionen (adsb.lol via /api/adsb/area, OpenSky-bbox
+#  im /api/adsb/poll). observe_adsb_positions() bekommt diese Rows und baut daraus
+#  GRATIS echte Ab-/Anflug-Legs: pro Hex eine kleine State-Machine —
+#    · am Boden am Flughafen X   → merken (phase=ground, airport=X)
+#    · danach abgehoben          → Abflug erkannt: dep=X (phase=air)
+#    · später am Boden am Fh. Y  → Ankunft erkannt → Leg X→Y in ax_route_cache
+#  Der nächste Flughafen wird über die gebackene Airports-DB (85k) per Bounding-
+#  Box + Haversine (≤ ~6 km) bestimmt. So füllt sich die eigene Routen-DB weltweit
+#  aus Verkehr, den wir eh schon geladen haben. Best-effort, wirft NIE.
+# ─────────────────────────────────────────────────────────────────────────────
+_TRACK_STATE = {}                 # hex → {phase, airport, airport_icao, dep, dep_icao, callsign, reg, ts}
+_TRACK_LOCK = threading.Lock()
+_TRACK_MAX = 5000                 # Cap der In-Memory-Tracks (evict-oldest)
+_SELFCOMPUTE_LOW_ALT_FT = 8000    # nur Boden-/Tiefflieger auf Flughäfen snappen
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    import math
+    try:
+        r = 6371.0
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        dp = math.radians(lat2 - lat1)
+        dl = math.radians(lon2 - lon1)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+    except Exception:
+        return 9e9
+
+
+def _nearest_airport(lat, lon, max_km=6.0):
+    """Nächster IATA-Flughafen zu (lat,lon) innerhalb max_km — Bounding-Box-Query
+    auf der gebackenen Airports-DB + Haversine-Feinauswahl. None wenn keiner in
+    Reichweite."""
+    if lat is None or lon is None:
+        return None
+    import math
+    dlat = max_km / 111.0
+    dlon = max_km / (111.0 * max(0.15, math.cos(math.radians(lat))))
+    rows = _q("SELECT iata, icao, lat, lon, name FROM airports "
+              "WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? "
+              "AND iata IS NOT NULL AND iata != '' "
+              "AND lat IS NOT NULL AND lon IS NOT NULL",
+              (lat - dlat, lat + dlat, lon - dlon, lon + dlon))
+    best, bestd = None, max_km
+    for r in rows:
+        d = _haversine_km(lat, lon, r['lat'], r['lon'])
+        if d < bestd:
+            best, bestd = r, d
+    return best
+
+
+def _obs_is_grounded(row):
+    """Heuristik: am Boden? on_ground-Flag zuerst; sonst sehr tief + langsam."""
+    if row.get('on_ground') is True:
+        return True
+    alt = row.get('alt')
+    spd = row.get('speed')
+    if alt is not None and alt <= 200 and (spd is None or spd < 60):
+        return True
+    return False
+
+
+def _maybe_evict_tracks():
+    if len(_TRACK_STATE) <= _TRACK_MAX:
+        return
+    try:
+        with _TRACK_LOCK:
+            items = sorted(_TRACK_STATE.items(), key=lambda kv: kv[1].get('ts', 0))
+            for k, _v in items[:max(1, len(items) // 5)]:
+                _TRACK_STATE.pop(k, None)
+    except Exception:
+        pass
+
+
+def observe_adsb_positions(rows, max_process=400):
+    """Self-computed-route-Engine. Rows = normalisierte Live-Positionen (hex,
+    callsign/flight, reg, lat, lon, alt, speed, on_ground). Erkennt Ab-/Anflug
+    per Hex-State-Machine und schreibt fertige Legs GRATIS in ax_route_cache
+    (source='aerox_adsb', confidence='confirmed'). Gibt die Anzahl neuer Legs
+    zurück. Never raises."""
+    if not rows:
+        return 0
+    to_record = []
+    processed = 0
+    for row in rows:
+        if processed >= max_process:
+            break
+        try:
+            hexid = (row.get('hex') or '').strip().lower()
+            if not hexid:
+                continue
+            lat, lon = row.get('lat'), row.get('lon')
+            if lat is None or lon is None:
+                continue
+            alt = row.get('alt')
+            grounded = _obs_is_grounded(row)
+            cs = (row.get('callsign') or row.get('flight') or '').strip().upper() or None
+            reg = (row.get('reg') or '').strip().upper() or None
+            # Nur für Boden-/Tiefflieger die Airports-DB anfassen (Cruise = billig skip).
+            near = None
+            if grounded or (alt is not None and alt <= _SELFCOMPUTE_LOW_ALT_FT):
+                processed += 1
+                near = _nearest_airport(lat, lon)
+            with _TRACK_LOCK:
+                prev = _TRACK_STATE.get(hexid)
+                if grounded and near:
+                    ap = (near.get('iata') or '').upper() or None
+                    # Ankunft: war in der Luft mit bekanntem Abflug ≠ hier → Leg fertig.
+                    if ap and prev and prev.get('phase') == 'air' \
+                            and prev.get('dep') and prev['dep'] != ap:
+                        to_record.append({
+                            'route': {
+                                'src': prev['dep'], 'src_icao': prev.get('dep_icao'),
+                                'dst': ap, 'dst_icao': (near.get('icao') or '').upper() or None,
+                                'callsign': prev.get('callsign') or cs,
+                                'source': 'aerox_adsb', 'confidence': 'confirmed',
+                            },
+                            'cs': prev.get('callsign') or cs,
+                            'reg': prev.get('reg') or reg,
+                        })
+                    _TRACK_STATE[hexid] = {
+                        'phase': 'ground', 'airport': ap,
+                        'airport_icao': (near.get('icao') or '').upper() or None,
+                        'callsign': cs, 'reg': reg, 'ts': time.time()}
+                elif not grounded:
+                    # Abflug-Kante: war am Boden an bekanntem Flughafen → jetzt dep.
+                    if prev and prev.get('phase') == 'ground' and prev.get('airport'):
+                        _TRACK_STATE[hexid] = {
+                            'phase': 'air', 'dep': prev['airport'],
+                            'dep_icao': prev.get('airport_icao'),
+                            'callsign': prev.get('callsign') or cs,
+                            'reg': prev.get('reg') or reg, 'ts': time.time()}
+                    elif prev and prev.get('phase') == 'air':
+                        if cs and not prev.get('callsign'):
+                            prev['callsign'] = cs
+                        if reg and not prev.get('reg'):
+                            prev['reg'] = reg
+                        prev['ts'] = time.time()
+                    else:
+                        # Erste Sichtung in der Luft — Abflug unbekannt, minimal merken.
+                        _TRACK_STATE[hexid] = {
+                            'phase': 'air', 'dep': None,
+                            'callsign': cs, 'reg': reg, 'ts': time.time()}
+                # grounded ohne bekannten Flughafen → NICHT resetten (guten dep halten).
+        except Exception:
+            continue
+    recorded = 0
+    for item in to_record:
+        try:
+            if item['cs'] and item['route'].get('src') and item['route'].get('dst'):
+                _record_resolved_route(item['cs'], item['reg'], item['route'])
+                recorded += 1
+        except Exception:
+            pass
+    _maybe_evict_tracks()
+    return recorded
+
+
+def _free_generic_route(cs, lat=None, lon=None):
+    """Freie, generische Callsign→Route-Fallbacks: adsbdb → adsb.lol routeset →
+    hexdb. Alle frei/öffentlich. Route-Dict (confidence='estimated') oder None."""
+    try:
+        ad = _adsbdb_route(cs)
+    except Exception:
+        ad = None
+    if ad and (ad.get('src') or ad.get('src_icao')):
+        ad['source'] = 'adsbdb'
+        ad['confidence'] = 'estimated'
+        return ad
+    # adsb.lol routeset + hexdb liegen im adsb_blueprint (frei, community).
+    try:
+        from blueprints.adsb_blueprint import _resolve_route_adsb_lol, _resolve_route_hexdb
+    except Exception:
+        return None
+    for fn, name in ((_resolve_route_adsb_lol, 'adsb.lol'), (_resolve_route_hexdb, 'hexdb')):
+        try:
+            o, d = (fn(cs, lat, lon) if name == 'adsb.lol' else fn(cs))
+        except Exception:
+            o, d = None, None
+        if o and d and (o.get('iata') or o.get('icao')) and (d.get('iata') or d.get('icao')):
+            return {
+                'src': o.get('iata'), 'src_icao': o.get('icao'),
+                'dst': d.get('iata'), 'dst_icao': d.get('icao'),
+                'callsign': cs, 'source': name, 'confidence': 'estimated',
+            }
+    return None
+
+
+def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None, track=None):
+    """OWN-DATA-FIRST Kaskade → genaue heutige Route eines Live-Fliegers.
+    Rückgabe: route-Dict mit src/dst(+_icao), source, confidence(+optional
+    status/gate/terminal/reg) — oder None. Siehe Header-Block für die Priorität.
+    Jeder externe Treffer wird via _record_resolved_route in die Warehouse
+    geschrieben (fills our own DB)."""
+    cs = (callsign or '').strip().upper().replace(' ', '')
+    if not cs:
+        return None
+    reg = (reg or '').strip().upper() or None
+    hexid = (hexid or '').strip().lower() or None
+    date = _today_utc()
+    dk = date.replace('-', '')
+
+    # ── 1. Eigene Warehouse: date-gekeyter Cache (exakt heute) ──────────────
+    cached = _cache_get('ax_route_cache', 'flight', f'{cs}@{dk}')
+    if cached and (cached.get('src') or cached.get('src_icao')):
+        cached.setdefault('confidence', 'confirmed')
+        cached['_from'] = 'cache_date'
+        return cached
+    # 1b. reg-gekeyter Cache (physische Maschine, heute)
+    if reg:
+        rc = _cache_get('ax_route_cache', 'flight', f'REG:{reg}@{dk}')
+        if rc and (rc.get('src') or rc.get('src_icao')):
+            rc.setdefault('confidence', 'confirmed')
+            rc['_from'] = 'cache_reg'
+            return rc
+    # 1c. Eigene Airport-Tafel (autoritativ, flughafen-eigene Daten)
+    try:
+        obs = _route_from_obs(cs)
+    except Exception:
+        obs = None
+    if obs and (obs.get('src') or obs.get('dst')):
+        obs['source'] = 'aerox_board'
+        obs['confidence'] = 'confirmed'
+        _record_resolved_route(cs, reg, obs, date)
+        return obs
+
+    # ── 2. Selbst berechnet aus eigenem ADS-B ───────────────────────────────
+    #  Fertige Legs landen via observe_adsb_positions() bereits in ax_route_cache
+    #  → Schritt 1 (cache_date/cache_reg) serviert sie GRATIS. Kein separater
+    #  Netz-Call hier; die Engine füllt den Cache im Poller/Area-Consumer.
+
+    # ── 3. OpenSky (FREI mit Account; env-guarded, ohne Creds → None) ───────
+    osky = _opensky_route(hexid)
+    if osky and (osky.get('src') or osky.get('dst')):
+        _record_resolved_route(cs, reg, osky, date)
+        return osky
+
+    # ── 4. Freie generische Lookups (adsbdb / adsb.lol / hexdb) ─────────────
+    gen = _free_generic_route(cs, lat, lon)
+    if gen and (gen.get('src') or gen.get('src_icao')):
+        _record_resolved_route(cs, reg, gen, date)
+        return gen
+
+    # ── 5. BEZAHLT (LETZTER Ausweg) — nur mit Tages-Budget, nur getippter Flieger
+    if _paid_budget_ok():
+        adb = _aerodatabox_route(cs, reg=reg, lat=lat, lon=lon, track=track, date=date)
+        if adb:
+            _record_resolved_route(cs, adb.get('reg') or reg, adb, date)
+            return adb
+        try:
+            avs = _aviationstack_route(cs)
+        except Exception:
+            avs = None
+        if avs and (avs.get('src') or avs.get('dst')):
+            st = str(avs.get('status') or '').lower()
+            avs['confidence'] = 'confirmed' if st in ('active', 'en-route', 'landed') else 'estimated'
+            _record_resolved_route(cs, reg, avs, date)
+            return avs
+    return None
 
 
 # ---------------------------------------------------------------- helpers
@@ -317,7 +873,7 @@ def ax_stats():
             'aircraft_types': int(meta.get('count_aircraft_types', 0)),
             'routes_seed': int(meta.get('count_routes', 0)),
         },
-        'self_growing': 'adsbdb/hexdb hits cached to Supabase (ax_*_cache)',
+        'self_growing': 'free-first: own ADS-B self-computed legs + adsbdb/hexdb/OpenSky, cached to Supabase (ax_*_cache)',
     })
 
 
@@ -566,29 +1122,50 @@ def ax_photo_reg(reg):
 
 @aerox_data_bp.route('/api/ax/callsign/<callsign>', methods=['GET'])
 def ax_callsign(callsign):
-    """ICAO-Callsign (z.B. DLH506) → Route. Das Radar fragt für jeden
-    angetippten Flieger hier an → Treffer werden in ax_route_cache zurück-
-    geschrieben, d.h. die Routen-DB wächst aus dem realen Verkehr, den die
-    Crew sieht (cache → adsbdb → cache, höchstens ein externer Call je Callsign)."""
+    """ICAO-Callsign (z.B. DLH506) → GENAUE heutige Route. Das Radar fragt für
+    jeden angetippten Flieger hier an. Die FREE-FIRST-Kaskade (_resolve_live_route)
+    bevorzugt EIGENE + FREIE Quellen (Warehouse/Tafel + selbst-berechnetes ADS-B →
+    OpenSky → adsbdb/adsb.lol/hexdb) und ruft BEZAHLTE APIs (AeroDataBox/
+    AviationStack) nur als letzten Ausweg hinter einem Tages-Budget-Guard.
+    Jeder Treffer wird datums-/reg-gekeyt in ax_route_cache zurückgeschrieben →
+    derselbe Tap ist morgen gratis und die eigene Routen-DB wächst weltweit.
+
+    Optionale Query-Params (schalten höhere Genauigkeit frei, alle abwärts-
+    kompatibel — ohne sie funktioniert der Call wie bisher):
+      hex=<icao24>  reg=<D-AIZJ>  lat= lon=/lng=  track=<heading°>
+
+    Response (abwärtskompatibel + NEU):
+      ok, callsign, source, origin{}, destination{}, [gate, terminal, status]
+      NEU: confidence ∈ {'confirmed','estimated'}  → Client zeigt „bestätigt"
+           vs. „geschätzt". reg (falls aufgelöst).
+    """
+    from flask import request
     cs = (callsign or '').strip().upper().replace(' ', '')
     if not cs:
         return jsonify({'ok': False, 'error': 'empty'}), 400
-    out = {'ok': True, 'callsign': cs, 'source': 'cache'}
-    route = _cache_get('ax_route_cache', 'flight', cs)
-    if route:
-        out['source'] = route.get('source', 'cache')
-    else:
-        # ECHTE Airport-Tafel ZUERST (flughafen-eigene Daten, woher/wohin/Gate),
-        # dann AviationStack (budget-gated), dann statische adsbdb-DB als Fallback.
-        route = _route_from_obs(cs) or _aviationstack_route(cs) or _adsbdb_route(cs)
-        if route:
-            out['source'] = route.get('source', 'adsbdb')
-            out['status'] = route.get('status')
-            _cache_put('ax_route_cache',
-                       {'flight': cs, 'payload': route,
-                        'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+    hexid = (request.args.get('hex') or '').strip() or None
+    reg = (request.args.get('reg') or '').strip() or None
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    lat = _f(request.args.get('lat'))
+    lon = _f(request.args.get('lon') or request.args.get('lng'))
+    track = _f(request.args.get('track') or request.args.get('heading'))
+
+    route = _resolve_live_route(cs, hexid=hexid, reg=reg, lat=lat, lon=lon, track=track)
     if not route:
         return jsonify({'ok': False, 'callsign': cs}), 404
+
+    out = {'ok': True, 'callsign': cs,
+           'source': route.get('source', 'cache'),
+           'confidence': route.get('confidence', 'estimated')}
+    if route.get('status'):
+        out['status'] = route.get('status')
+    if route.get('reg'):
+        out['reg'] = route.get('reg')
 
     def enrich(code):
         ap = _airport_row(code)
