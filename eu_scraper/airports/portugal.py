@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 from .. import scraper as S
+from .. import airports_ref as REF
 
 HOST = "https://www.lisbonairport.pt"
 PROXY = HOST + "/en/flights_proxy"
@@ -63,8 +64,11 @@ def _row(rec: dict, iata: str, tz: str, arr: bool) -> dict | None:
     r["airline"] = al
     r["airline_name"] = (rec.get("airline") or "").strip().title()
     r["flight"] = flight
-    r["dest_iata"] = ""  # ANA gives only a city name, no IATA
+    # ANA gives only a city/airport NAME (no IATA field). Resolve it → IATA so the
+    # row is route-usable (origin for arrivals, destination for departures). Fail-safe:
+    # unresolved → "" (never a wrong code).
     r["dest_name"] = (rec.get("destination") or "").strip()
+    r["dest_iata"] = REF.resolve(r["dest_name"]) or ""
     r["sched"] = S.local_iso(date_ddmmyyyy=(rec.get("day") or "").replace(".", "/"),
                              hhmmss=(rec.get("time") or "") + ":00")
     st = rec.get("state") or {}

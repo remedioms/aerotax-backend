@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from .. import scraper as S
+from .. import airports_ref as REF
 
 API = "https://api.dublinairport.com/dap/flight-listing"
 WARMUP = "https://www.dublinairport.com/flight-information/live-arrivals"
@@ -35,8 +36,12 @@ def _row(rec: dict, arr: bool) -> dict | None:
     r["airline"] = al or fid[:2]
     r["airline_name"] = (rec.get("carrierName") or "").strip()
     r["flight"] = S.norm_flight(fid, "")
-    r["dest_iata"] = (rec.get("airportCode") or "").strip().upper()
+    # `airportCode` is the OTHER airport's IATA (origin on arrivals) and is populated
+    # on ~100% of rows. Keep it as primary; only fall back to a name-resolve if a rare
+    # row omits it. Fail-safe: unresolved → "".
+    code = (rec.get("airportCode") or "").strip().upper()
     r["dest_name"] = ((rec.get("originAirportName") if arr else rec.get("destinationAirportName")) or "").strip()
+    r["dest_iata"] = code or (REF.resolve(r["dest_name"]) or "")
     r["sched"] = S.utc_to_local_iso(rec.get("scheduledDateTime"), TZ)
     esti = S.utc_to_local_iso(rec.get("estimatedDateTime"), TZ)
     if esti and esti != r["sched"]:

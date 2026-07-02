@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 from .. import scraper as S
+from .. import airports_ref as REF
 
 API = "https://api.prg.aero/en"
 WARMUP = "https://www.prg.aero/en/flight-information/"
@@ -45,8 +46,13 @@ def _row(rec: dict, arr: bool) -> dict | None:
     r["airline"] = fn[:2].upper()
     r["airline_name"] = (rec.get("company") or "").strip()
     r["flight"] = S.norm_flight(fn, "")
-    r["dest_iata"] = (rec.get("destination-id") or "").strip().upper()
+    # `destination-id` is the OTHER airport's IATA (origin on arrivals), populated on
+    # ~100% of rows; the `destination` string also carries the code in parens
+    # ("Las Palmas (LPA)"). Keep the id as primary; resolve the full string only if
+    # the id is missing. Fail-safe: unresolved → "".
+    did = (rec.get("destination-id") or "").strip().upper()
     dest = (rec.get("destination") or "").strip()
+    r["dest_iata"] = did or (REF.resolve(dest) or "")
     r["dest_name"] = re.sub(r"\s*\([A-Z]{3}\)\s*$", "", dest)  # drop trailing (IATA)
     r["sched"] = _utc(rec.get("time"))
     esti = _utc(rec.get("time-new"))

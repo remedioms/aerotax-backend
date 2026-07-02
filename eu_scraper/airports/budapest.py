@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 from .. import scraper as S
+from .. import airports_ref as REF
 
 BASE = "https://www.bud.hu/ajax/flight-search"
 WARMUP = "https://www.bud.hu/en/passengers/flight-information/departures"
@@ -47,7 +48,12 @@ def _row(rec: dict, arr: bool) -> dict | None:
     airline = rec.get("airline") or {}
     r["airline_name"] = (airline.get("name") or "").strip()
     r["flight"] = flight
+    # BUD gives only a NAME ("London LHR", "Lisbon", "Reykjavik KEF") — no IATA.
+    # Resolve → IATA (origin for arrivals, destination for departures). Many names
+    # embed the code (e.g. "London LHR") which the resolver extracts directly.
+    # Fail-safe: unresolved → "" (never a wrong code).
     r["dest_name"] = (rec.get("destination") or rec.get("city") or "").strip()
+    r["dest_iata"] = REF.resolve(r["dest_name"]) or ""
     date = (rec.get("date") or "").replace(".", "/").strip("/")  # dd.mm.yyyy → dd/mm/yyyy
     r["sched"] = S.local_iso(date_ddmmyyyy=date, hhmmss=(rec.get("planned") or "") + ":00")
     exp = (rec.get("expected") or "").strip()

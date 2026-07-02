@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from .. import scraper as S
+from .. import airports_ref as REF
 
 GQL = "https://nihwye5mfbajrg54x3fjcy4q5e.appsync-api.eu-west-1.amazonaws.com/graphql"
 APIKEY = "da2-wr4hf6b2frdfdisv7ugsvdmo3a"
@@ -49,8 +50,12 @@ def _row(rec: dict, arr: bool) -> dict | None:
     r["airline_name"] = (al.get("name") or "").strip().title()
     r["flight"] = S.norm_flight(fn, "")
     other = (rec.get("departureAirport") if arr else rec.get("arrivalAirport")) or {}
-    r["dest_iata"] = (other.get("code") or "").strip().upper()
+    # The feed's `code` is already an IATA on virtually every row; resolve() trusts a
+    # valid IATA as-is, converts an ICAO, and falls back to the cityName otherwise —
+    # so a rare missing/odd code still gets an origin IATA when we can be sure.
+    code = (other.get("code") or "").strip().upper()
     r["dest_name"] = (other.get("cityName") or "").strip().title()
+    r["dest_iata"] = REF.resolve(other.get("cityName") or "", code=code) or ""
     if arr:
         sched = rec.get("scheduledArrivalDateTime")
         est = rec.get("actualArrivalDateTime") or rec.get("estimatedArrivalDateTime")
