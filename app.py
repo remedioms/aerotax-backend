@@ -23250,15 +23250,27 @@ def _muc_board(flight_type='departure'):
     except Exception:
         return None
     out = []
+    seen = {}   # data-flight-id → Index in out (Dedup gegen die Mobile-Variantzeile).
+    # WICHTIG: munich-airport.com rendert JEDEN Flug ZWEIMAL als tr.fp-flight-item:
+    #   (1) Desktop-Tabellenzeile  → Spalte .fp-flight-time-muc trägt „Geplant | Erwartet".
+    #   (2) Responsive Mobile-Zeile → td.fp-flight-details + verschachtelte Tabelle
+    #       .fp-flight-schedule (Label/Wert: Status/Geplant/Erwartet/Ankunft/Bereich).
+    # Der alte Parser kannte nur .fp-flight-time-muc → die Mobile-Zeile wurde als
+    # PHANTOM ohne Zeit übernommen (sched=null). Diese null-sched-Phantome dominierten
+    # die Tafel (die echten Desktop-Zeilen sind vormittägliche, schon abgeflogene Flüge,
+    # die der _is_past-Filter entfernt) → iOS wirft Zeilen ohne Soll- UND Ist-Zeit raus
+    # → MUC-Tafel praktisch leer. Jetzt: Zeit aus BEIDEN Varianten lesen (Mobile via
+    # Schedule-Tabelle) und über data-flight-id deduppen (Variante mit Soll-Zeit gewinnt).
     for tr in soup.select('tr.fp-flight-item'):
         try:
             row = _empty_board_row()
-            # Airline-Name aus dem Tooltip / aria-label.
+            fid = (tr.get('data-flight-id') or '').strip()
+            # Airline-Name aus dem Tooltip / aria-label (nur Desktop-Variante trägt ihn).
             al = tr.select_one('.fp-flight-airline .info-content') \
                 or tr.select_one('.fp-flight-airline [aria-label]')
             if al:
                 row['airline_name'] = (al.get('aria-label') or al.get_text(strip=True) or '').strip()
-            # Ziel/Herkunft: 'Varna (VAR)'.
+            # Ziel/Herkunft: 'Varna (VAR)' — in beiden Varianten unter .fp-flight-airport.
             ap = tr.select_one('.fp-flight-airport')
             if ap:
                 txt = ap.get_text(' ', strip=True)
@@ -23276,26 +23288,59 @@ def _muc_board(flight_type='departure'):
                 row['airline'] = code or row['airline']
                 row['flight'] = flight
                 row['aircraft'] = ac
-            # Status (deutsch: 'gestartet', 'gelandet', 'annulliert', …).
-            st = tr.select_one('.fp-flight-status')
-            if st:
-                row['status'] = st.get_text(' ', strip=True)
-            # Zeit-Zelle 'HH:MM | HH:MM' = Geplant | Erwartet.
+            # ── Zeiten + Status: Desktop-Zelle bevorzugt, sonst Mobile-Schedule-Tabelle.
             tcell = tr.select_one('.fp-flight-time-muc')
             if tcell:
+                # Desktop-Variante: Status-Spalte + Zeit-Zelle 'HH:MM | HH:MM'.
+                st = tr.select_one('.fp-flight-status')
+                if st:
+                    row['status'] = st.get_text(' ', strip=True)
                 ttxt = tcell.get_text(' ', strip=True)
                 tm = _re.findall(r'(\d{2}:\d{2})', ttxt)
                 if tm and day:
                     row['sched'] = day + 'T' + tm[0] + ':00'
                     if len(tm) > 1 and tm[1] != tm[0]:
                         row['esti'] = day + 'T' + tm[1] + ':00'
-            area = tr.select_one('.fp-flight-area')
-            if area:
-                row['terminal'] = area.get_text(' ', strip=True)
+                area = tr.select_one('.fp-flight-area')
+                if area:
+                    row['terminal'] = area.get_text(' ', strip=True)
+            else:
+                # Mobile-Variante: Label/Wert-Tabelle (Status/Geplant/Erwartet/Bereich).
+                labels = {}
+                sched_tbl = tr.select_one('.fp-flight-schedule')
+                if sched_tbl:
+                    for r2 in sched_tbl.select('tr'):
+                        tds = r2.find_all('td')
+                        if len(tds) >= 2:
+                            labels[tds[0].get_text(strip=True).lower()] = tds[1].get_text(' ', strip=True)
+                row['status'] = labels.get('status', '')
+                if day:
+                    gm = _re.search(r'(\d{2}:\d{2})', labels.get('geplant', ''))
+                    em = _re.search(r'(\d{2}:\d{2})', labels.get('erwartet', ''))
+                    if gm:
+                        row['sched'] = day + 'T' + gm.group(1) + ':00'
+                    if em and (not gm or em.group(1) != gm.group(1)):
+                        row['esti'] = day + 'T' + em.group(1) + ':00'
+                row['terminal'] = labels.get('bereich', '')
             row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
             row['delayed'] = row['delay_min'] >= _DELAY_THRESHOLD_MIN
-            if row['flight'] or row['dest_iata']:
-                out.append(row)
+            if not (row['flight'] or row['dest_iata']):
+                continue
+            # Dedup über data-flight-id: die Variante mit Soll-Zeit (Desktop) gewinnt;
+            # fehlt ihr der Airline-Name, aus der anderen Variante nachziehen.
+            if fid and fid in seen:
+                idx = seen[fid]
+                if not out[idx].get('sched') and row.get('sched'):
+                    kept_name = out[idx].get('airline_name')
+                    out[idx] = row
+                    if not out[idx].get('airline_name') and kept_name:
+                        out[idx]['airline_name'] = kept_name
+                elif not out[idx].get('airline_name') and row.get('airline_name'):
+                    out[idx]['airline_name'] = row['airline_name']
+                continue
+            if fid:
+                seen[fid] = len(out)
+            out.append(row)
         except Exception:
             continue
     return out
@@ -23811,6 +23856,14 @@ _NATIVE_BOARD_SCRAPERS = {
     'BER': lambda ft: _ber_board(ft),
 }
 
+# Airports, deren native Quelle KEIN echtes „now"-Fenster liefern kann und darum
+# unbrauchbar für die anstehende Tafel ist → AeroDataBox BEVORZUGEN (now→+24h mit
+# Soll-Zeit), nativer Scraper nur als Fallback (kein Key / Quelle down).
+#   MUC: munich-airport.com/flightsearch liefert nur die ersten ~20 Abflüge des Tages
+#        ab 00:00 (keine Pagination, kein Zeit-Parameter) → nachmittags ist alles davon
+#        längst abgeflogen und die anstehende Tafel wäre leer.
+_BOARD_PREFER_AERODATABOX = {'MUC'}
+
 
 def _aerodatabox_board(iata, flight_type='departure'):
     """Board (Abflug/Ankunft) eines beliebigen IATA-Airports via AeroDataBox
@@ -23946,14 +23999,24 @@ def _native_board_cached(iata, flight_type):
         return cached[1]
     result = (None, None)
     scraper = _NATIVE_BOARD_SCRAPERS.get(iata)
-    if scraper:
+    prefer_adb = iata in _BOARD_PREFER_AERODATABOX
+    # MUC-Sonderfall: AeroDataBox ZUERST (echtes now→+24h-Fenster mit Soll-Zeit).
+    # Ohne Key/Quelle down → None → fällt auf den (reparierten) nativen Scraper zurück.
+    if prefer_adb:
+        try:
+            rows = _aerodatabox_board(iata, ft)
+        except Exception:
+            rows = None
+        if rows:
+            result = (rows, 'aerodatabox')
+    if result[0] is None and scraper:
         try:
             rows = scraper(ft)
         except Exception:
             rows = None
         if rows:   # nur cachen/zurückgeben wenn nicht-leer
             result = (rows, iata.lower() + '_native')
-    if result[0] is None:
+    if result[0] is None and not prefer_adb:
         try:
             rows = _aerodatabox_board(iata, ft)
         except Exception:
