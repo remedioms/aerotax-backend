@@ -24339,6 +24339,33 @@ def _flight_from_live_board(iata, fn):
     return None
 
 
+def _arrival_gate_terminal(dest_iata, fn):
+    """Ankunfts-Gate/-Terminal des ZIEL-Flughafens für eine Flugnummer — aus dem
+    ANKUNFTS-Board des Ziels (gratis, gecacht). Der Abflug-Board-Scan liefert nur
+    Abflug-Gate/-Terminal; das Ankunfts-Gate steht auf der Ankunftstafel des Ziels
+    (`mv` = arrival-movement → row['gate']/['terminal'] sind dort das Ankunfts-
+    Gate/-Terminal). Liefert (gate, terminal) als (str|None, str|None). Niemals
+    raise — reiner Best-Effort-Enrich (Ziel unbekannt/Quelle down → (None, None))."""
+    dest = (dest_iata or '').upper().strip()
+    dest = _DE_ICAO_TO_IATA.get(dest, dest)
+    if len(dest) != 3:
+        return (None, None)
+    fn = (fn or '').replace(' ', '').upper()
+    try:
+        if dest in ('FRA', 'EDDF'):
+            rows = _fra_board_cached('arrival')
+        else:
+            rows, _src = (_native_board_cached(dest, 'arrival') or (None, None))
+    except Exception:
+        rows = None
+    for bf in (rows or []):
+        if (bf.get('flight') or '').replace(' ', '').upper() == fn:
+            g = (bf.get('gate') or '').strip() or None
+            t = (bf.get('terminal') or '').strip() or None
+            return (g, t)
+    return (None, None)
+
+
 @app.route('/api/ax/flight-info/<flightno>', methods=['GET'])
 def ax_flight_info(flightno):
     """Flugnummer → Strecke/Gate/Terminal/Status/TAIL — ZUERST GRATIS aus der self-
@@ -24491,6 +24518,20 @@ def ax_flight_info(flightno):
             out[_k] = None
         out['reg'] = None
         out['type'] = None
+
+    # ANKUNFTS-GATE/-TERMINAL (Flight-Check-up 2026-07-02, User: „kein Ankunfts-Gate"):
+    # der Abflug-Board-Scan liefert nur Abflug-Gate/-Terminal. Das Ankunfts-Gate steht
+    # auf der ANKUNFTSTAFEL des Ziels → dort nachschlagen und als NEUE Felder ergänzen
+    # (arr_gate/arr_terminal), rückwärtskompatibel (alte Clients ignorieren sie). Nur
+    # für frische (nicht-stale) Ergebnisse mit bekanntem Ziel — ein alter Betriebstag
+    # bekäme sonst das heutige Ankunfts-Gate eines fremden Umlaufs.
+    if out is not None and not stale and out.get('dest'):
+        try:
+            arr_g, arr_t = _arrival_gate_terminal(out.get('dest'), fn)
+        except Exception:
+            arr_g, arr_t = (None, None)
+        out['arr_gate'] = arr_g
+        out['arr_terminal'] = arr_t
 
     if out is not None:
         return _public_cache_headers(jsonify(out))
