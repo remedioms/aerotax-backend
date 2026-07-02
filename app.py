@@ -23856,6 +23856,169 @@ def _ber_board(flight_type='departure'):
     return out if out else None
 
 
+def _avinor_board(iata, flight_type='departure', tz='Europe/Oslo'):
+    """AVINOR-Gruppe (ALLE norwegischen Airports: OSL/BGO/TRD/SVG/TOS/BOO/AES/KRS…).
+
+    EINE freie XML-Quelle für die ganze Gruppe (LIVE verifiziert 2026-07-02):
+      GET https://asrv.avinor.no/XmlFeed/v1.0
+          ?TimeFrom=1&TimeTo=16&airport=<IATA>&direction={D|A}
+    → <airport><flights><flight>…: airline (IATA-2L), flight_id ('BA783'),
+      dom_int (D/S/I), schedule_time (ISO **UTC**), airport (Ziel/Herkunft-IATA),
+      via_airport, check_in ('1-3'), gate ('F16'), belt (Ankunft-Gepäckband),
+      status code+time, delayed ('Y').
+
+    Status-Codes (Avinor XmlFeed-Doku): N=neue Info, E=neue (verspätete) Zeit,
+    D=abgeflogen, A=gelandet, C=annulliert. status.time = erwartete/tatsächliche
+    Zeit → esti. UTC → Flughafen-Ortszeit (Europe/Oslo) wie HAM (naive
+    'YYYY-MM-DDTHH:MM:00'-Form). GROSSER GRUPPEN-HEBEL: eine Quelle, viele Airports.
+    """
+    try:
+        import requests
+        import xml.etree.ElementTree as ET
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo
+            _z = ZoneInfo(tz)
+        except Exception:
+            _z = None
+    except Exception:
+        return None
+    arr = (flight_type == 'arrival')
+    direction = 'A' if arr else 'D'
+    try:
+        r = requests.get('https://asrv.avinor.no/XmlFeed/v1.0',
+                         params={'TimeFrom': 1, 'TimeTo': 16, 'airport': iata,
+                                 'direction': direction},
+                         headers={'User-Agent': _BOARD_UA,
+                                  'Accept': 'application/xml,text/xml,*/*'},
+                         timeout=12)
+        if r.status_code != 200 or not r.content:
+            return None
+        root = ET.fromstring(r.content)
+    except Exception:
+        return None
+
+    def _to_local(iso):
+        if not iso:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+            if _z is not None:
+                dt = dt.astimezone(_z)
+            return dt.strftime('%Y-%m-%dT%H:%M:00')
+        except Exception:
+            return None
+
+    _statmap = {'E': 'Delayed', 'D': 'Departed', 'A': 'Arrived',
+                'C': 'Cancelled', 'N': 'New info'}
+    out = []
+    for f in root.iter('flight'):
+        try:
+            row = _empty_board_row()
+            fid = (f.findtext('flight_id') or '').strip().upper()
+            row['flight'] = fid
+            row['airline'] = (f.findtext('airline') or (fid[:2] if fid else '')).strip().upper()
+            other = (f.findtext('airport') or '').strip().upper()   # Ziel (D) / Herkunft (A)
+            row['dest_iata'] = other
+            row['dest_name'] = _clean_city_name('', other)
+            sched = _to_local(f.findtext('schedule_time'))
+            row['sched'] = sched
+            st = f.find('status')
+            code = ''
+            if st is not None:
+                code = (st.get('code') or '').strip().upper()
+                stime = _to_local(st.get('time'))
+                if code in ('E', 'D', 'A') and stime and stime != sched:
+                    row['esti'] = stime
+            if arr:
+                row['gate'] = (f.findtext('belt') or '').strip()      # Gepäckband
+            else:
+                row['gate'] = (f.findtext('gate') or '').strip()
+                row['hall'] = (f.findtext('check_in') or '').strip()  # Check-in-Schalter
+            row['status'] = _statmap.get(code, '')
+            row['cancelled'] = (code == 'C')
+            row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
+            row['delayed'] = ((str(f.findtext('delayed') or '').strip().upper() == 'Y')
+                              or row['delay_min'] >= _DELAY_THRESHOLD_MIN)
+            if row['cancelled']:
+                row['delayed'] = False
+            if row['flight'] or row['dest_iata']:
+                out.append(row)
+        except Exception:
+            continue
+    return out if out else None
+
+
+def _waw_board(flight_type='departure'):
+    """WAW — Warschau-Chopin (lotnisko-chopina.pl). Server-rendert die LIVE-Tafel
+    (CodeRed/Wagtail-CMS) direkt ins HTML: div.flight-row mit .column-time,
+    .column-expected, .column-origin-destination ('Pisa (PSA)'), .column-flight-no
+    ('FR 6146'), .column-airline img[alt] (Airline-Name), .column-terminal ('Exit 1'),
+    .column-belt ('Tape 7'), .column-status ('Landed').
+
+    WICHTIG: Die Seite /en/arrivals-and-departures/ rendert server-seitig NUR die
+    ANKUNFTS-Tafel (Abflüge lädt sie client-seitig per JS nach — kein sauber
+    scrapebarer Endpunkt gefunden). Darum liefert diese Funktion nur ANKÜNFTE und
+    gibt für 'departure' None zurück (ehrlich → Poller meldet no_flights, kein
+    fälschlich als Abflug etikettiertes Ankunfts-Datum)."""
+    if flight_type != 'arrival':
+        return None
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        import re as _re
+    except Exception:
+        return None
+    try:
+        r = requests.get('https://www.lotnisko-chopina.pl/en/arrivals-and-departures/',
+                         headers={'User-Agent': _BOARD_UA, 'Accept': 'text/html'},
+                         timeout=12)
+        if r.status_code != 200 or not r.text:
+            return None
+        soup = BeautifulSoup(r.text, 'html.parser')
+        day = _fra_local_now().strftime('%Y-%m-%d')
+    except Exception:
+        return None
+    out = []
+    for it in soup.select('.flight-row'):
+        try:
+            row = _empty_board_row()
+
+            def g(c):
+                e = it.select_one('.' + c)
+                return e.get_text(' ', strip=True) if e else ''
+            tm = _re.search(r'(\d{1,2}:\d{2})', g('column-time'))
+            if tm:
+                row['sched'] = day + 'T' + tm.group(1).zfill(5) + ':00'
+            em = _re.search(r'(\d{1,2}:\d{2})', g('column-expected'))
+            if em and (not tm or em.group(1) != tm.group(1)):
+                row['esti'] = day + 'T' + em.group(1).zfill(5) + ':00'
+            dest = g('column-origin-destination')
+            m = _re.search(r'\(([A-Z]{3})\)\s*$', dest)
+            if m:
+                row['dest_iata'] = m.group(1)
+                dest = _re.sub(r'\s*\([A-Z]{3}\)\s*$', '', dest).strip()
+            row['dest_name'] = _clean_city_name(dest, row['dest_iata'])
+            code, flight, ac = _split_flightno(g('column-flight-no'))
+            row['airline'] = code
+            row['flight'] = flight
+            al = it.select_one('.column-airline img')
+            if al:
+                row['airline_name'] = (al.get('alt') or '').strip()
+            row['terminal'] = g('column-terminal')          # 'Exit 1'
+            row['gate'] = g('column-belt')                   # Gepäckband 'Tape 7'
+            row['status'] = g('column-status')
+            sl = row['status'].lower()
+            row['cancelled'] = 'cancel' in sl or 'odwoł' in sl
+            row['delay_min'] = _board_delay_min(row['sched'], row['esti'])
+            row['delayed'] = (row['delay_min'] >= _DELAY_THRESHOLD_MIN) and not row['cancelled']
+            if row['flight'] or row['dest_iata']:
+                out.append(row)
+        except Exception:
+            continue
+    return out if out else None
+
+
 # Registry: IATA → (native-Scraper-Callable, ICAO-für-OpenSky-Fallback).
 _NATIVE_BOARD_SCRAPERS = {
     'MUC': lambda ft: _muc_board(ft),
@@ -23871,6 +24034,17 @@ _NATIVE_BOARD_SCRAPERS = {
     'SCN': lambda ft: _mdfag_board('saarbrucken-airport', 'SCN', ft),
     'HAM': lambda ft: _ham_board(ft),
     'BER': lambda ft: _ber_board(ft),
+    # Avinor-Gruppe (Norwegen) — EINE freie XML-Quelle, alle Airports, Europe/Oslo.
+    'OSL': lambda ft: _avinor_board('OSL', ft),
+    'BGO': lambda ft: _avinor_board('BGO', ft),
+    'TRD': lambda ft: _avinor_board('TRD', ft),
+    'SVG': lambda ft: _avinor_board('SVG', ft),
+    'TOS': lambda ft: _avinor_board('TOS', ft),
+    'BOO': lambda ft: _avinor_board('BOO', ft),
+    'AES': lambda ft: _avinor_board('AES', ft),
+    'KRS': lambda ft: _avinor_board('KRS', ft),
+    # Warschau-Chopin — server-gerenderte Ankunfts-Tafel (nur ARR, siehe Doc).
+    'WAW': lambda ft: _waw_board(ft),
 }
 
 # Airports, deren native Quelle KEIN echtes „now"-Fenster liefern kann und darum
@@ -26835,7 +27009,12 @@ _EU_IATA_TO_ICAO = {iata: icao for (iata, icao) in _EU_AIRPORTS}
 # Definition weiter unten) — deckungsgleich mit _FREE_BOARD_CODES gehalten.
 _EU_FILL_EXCLUDE = frozenset({'FRA', 'EDDF', 'MUC', 'EDDM', 'DUS', 'EDDL',
                               'HAM', 'EDDH', 'BER', 'EDDB', 'HAJ', 'EDDV',
-                              'FMO', 'EDDG', 'LEJ', 'EDDP'})
+                              'FMO', 'EDDG', 'LEJ', 'EDDP',
+                              # Jetzt nativ gescrapt (Avinor-Gruppe + Warschau) →
+                              # OpenSky-Fill überspringt sie (nativ ist reicher).
+                              'OSL', 'ENGM', 'BGO', 'ENBR', 'TRD', 'ENVA',
+                              'SVG', 'ENZV', 'TOS', 'ENTC', 'BOO', 'ENBO',
+                              'AES', 'ENAL', 'KRS', 'ENCN', 'WAW', 'EPWA'})
 _EU_FILL_ICAOS = tuple(icao for (iata, icao) in _EU_AIRPORTS
                        if iata not in _EU_FILL_EXCLUDE and icao not in _EU_FILL_EXCLUDE)
 
@@ -27118,12 +27297,18 @@ def _eu_fill_once(icaos=None):
 # Budget degradieren sie still. Für Nicht-Deutsche pollt der Poller nur Abflüge
 # (halbiert die Calls — Abflug trägt Route+Gate, die wir brauchen).
 _POLL_BOARDS_DEFAULT = ('FRA', 'MUC', 'BER', 'DUS', 'HAM', 'HAJ',
+                        # Avinor-Gruppe (freier Native-Scraper, Gates+Zeiten):
+                        'OSL', 'BGO', 'TRD', 'SVG', 'TOS', 'BOO', 'AES', 'KRS',
+                        # Warschau (freier Native-Scraper, nur ARR):
+                        'WAW',
                         # Größte EU-Hubs (AeroDataBox, best-effort):
                         'LHR', 'CDG', 'AMS', 'MAD', 'BCN', 'FCO', 'ZRH',
-                        'VIE', 'CPH', 'OSL', 'ARN', 'LIS', 'DUB', 'BRU')
+                        'VIE', 'CPH', 'ARN', 'LIS', 'DUB', 'BRU')
 # Welche Codes haben einen FREIEN Native-/Fraport-Scraper (beide Richtungen ok)?
 _FREE_BOARD_CODES = frozenset({'FRA', 'EDDF', 'MUC', 'DUS', 'HAJ', 'FMO',
-                               'LEJ', 'DRS', 'ERF', 'DTM', 'RLG', 'KSF', 'SCN', 'HAM', 'BER'})
+                               'LEJ', 'DRS', 'ERF', 'DTM', 'RLG', 'KSF', 'SCN', 'HAM', 'BER',
+                               # Avinor-Gruppe (Norwegen) + Warschau-Chopin (nur ARR).
+                               'OSL', 'BGO', 'TRD', 'SVG', 'TOS', 'BOO', 'AES', 'KRS', 'WAW'})
 
 
 def _poll_boards_airports():
@@ -27266,7 +27451,9 @@ def internal_eu_fill():
 # zwei FRA-Aliasse. So scrapt /scrape-boards NUR kostenlose Boards mit echten
 # Verspätungs-Daten und fasst KEINE AeroDataBox-Budget-Calls an.
 _SCRAPE_BOARDS_FREE_DEFAULT = ('FRA', 'MUC', 'DUS', 'HAM', 'BER', 'HAJ', 'FMO',
-                               'LEJ', 'DRS', 'ERF', 'DTM', 'RLG', 'KSF', 'SCN')
+                               'LEJ', 'DRS', 'ERF', 'DTM', 'RLG', 'KSF', 'SCN',
+                               # Avinor-Gruppe (Norwegen) + Warschau-Chopin (nur ARR).
+                               'OSL', 'BGO', 'TRD', 'SVG', 'TOS', 'BOO', 'AES', 'KRS', 'WAW')
 
 
 def _scrape_boards_airports():
