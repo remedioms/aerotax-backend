@@ -298,12 +298,16 @@ def _aviationstack_route(callsign):
 #                             (_paid_budget_ok, AX_PAID_DAILY_CAP=50) es erlaubt.
 #                             NIE im Poller / nie in Bulk. confidence=confirmed.
 #
-#  confidence im Response (CONFIRMED-ONLY, Owner „keine Vielleichts"):
+#  confidence im Response (Owner „scraped/eigene Infos sind #1 — nicht prüfen"):
 #    'confirmed' — echte heutige Strecke: eigene Tafel / selbst-berechnetes ADS-B /
-#                  OpenSky-Track ODER ein generischer Kandidat, den die LIVE-Geometrie
-#                  bestätigt hat (Flieger fliegt wirklich Richtung Ziel → source+geo).
-#    Generische, NICHT geometrisch bestätigte Kandidaten werden VERWORFEN (kein
-#    'estimated' mehr im Response) → 404/keine Route. Lieber nichts als ein Vielleicht.
+#                  OpenSky-Track ODER autoritativer bezahlter Treffer. NIE geometrie-
+#                  geprüft — eigene/gescrapte Daten gelten immer.
+#    'estimated' — generischer Kandidat (adsbdb/hexdb/adsb.lol). Wird GEZEIGT (Route
+#                  sichtbar), ES SEI DENN die Live-Geometrie WIDERSPRICHT KLAR: der
+#                  Flieger fliegt eindeutig in die falsche Richtung (>115° weg vom
+#                  Ziel, fern beider Endpunkte) → nur DANN verworfen. Anflug/Holding/
+#                  gerade gestartet/Kurs-Rauschen → Route wird GEZEIGT. Der Client
+#                  zeichnet 'estimated' ohne „bestätigt"-Siegel und ohne Angst-Label.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _today_utc():
@@ -740,78 +744,69 @@ def _confirmed_origin_from_tracking(hexid):
     return None
 
 
-def _corroborate_route_with_geometry(candidate, lat, lon, track, gs=None, on_ground=False):
-    """GEOMETRISCHE KORROBORATION — macht aus einer GENERISCHEN Routen-VERMUTUNG
-    (adsbdb/hexdb/adsb.lol/AviationStack) einen FAKT oder NICHTS. Owner-Regel:
-    „keine Schätzungen, gute Daten — keine Vielleichts."
+def _geometry_allows_route(candidate, lat, lon, track, gs=None, on_ground=False):
+    """GEOMETRIE-GATE (REJECT-ONLY) — Owner-Regel: „scraped/eigene Infos sind #1,
+    müssen NICHT geprüft werden." Generische Kandidaten (adsbdb/hexdb/adsb.lol/
+    AviationStack) werden GEZEIGT, ES SEI DENN die Live-Geometrie WIDERSPRICHT
+    KLAR. Wir verwerfen NUR den eklatanten Fall: Flieger ist in der Luft, fliegt
+    eindeutig WEG vom behaupteten Ziel (Kurs vs. Peilung > ~115°) UND ist nicht
+    in Endpunkt-Nähe (Anflug/Abflug/Holding, wo Kurs bedeutungslos ist).
 
-    Idee: Wir kennen die LIVE-Position (lat,lon), den Kurs (track), grob die
-    Geschwindigkeit (gs) und ob der Flieger am Boden ist. Für einen Kandidaten
-    Abflug→Ziel prüfen wir, ob der Flieger TATSÄCHLICH Richtung des behaupteten
-    Ziels fliegt.
+    Damit fangen wir weiter die groben Verwechslungen ab (Flieger fliegt in die
+    komplett falsche Richtung), hören aber auf, die 90 % plausiblen Routen zu
+    verstecken (Anflug-Kurven, gerade gestartet, Holding, Kurs-Rauschen).
 
-    Rückgabe: True  → korroboriert (Aufrufer darf 'confirmed' setzen)
-              False → widerlegt / nicht bestätigbar (Aufrufer MUSS die Route
-                      verwerfen; lieber nichts als ein Vielleicht). Wirft NIE.
+    Rückgabe: True  → ZEIGEN (Default; kein klarer Widerspruch)
+              False → NUR bei KLAREM Widerspruch verwerfen. Wirft NIE → im
+                      Zweifel zeigen.
     """
     try:
         if not candidate:
-            return False
-        # Ziel mit Koordinaten nötig — ohne Ziel-Geometrie keine Prüfung möglich.
+            return True                      # nichts zu prüfen → nicht blockieren
+        # Ziel mit Koordinaten nötig — ohne Ziel-Geometrie NICHTS widerlegbar → zeigen.
         dst = candidate.get('dst') or candidate.get('dst_icao')
         dap = _airport_row(dst)
         if not dap or dap.get('lat') is None or dap.get('lon') is None:
-            return False
+            return True
         if lat is None or lon is None:
-            return False
+            return True                      # keine Live-Position → nicht widerlegbar
         dlat, dlon = float(dap['lat']), float(dap['lon'])
         dist_dest = _haversine_km(lat, lon, dlat, dlon)
 
-        # (1) Steht der Flieger praktisch AM Ziel (< ~12 km, geparkt/rollt dort) →
-        #     der Flug hat dieses Ziel angesteuert → confirmed, egal welcher Kurs.
-        if dist_dest <= 12.0:
+        # Endpunkt-Nähe (Anflug/Holding/gerade gelandet): Kurs sagt nichts über die
+        # Strecke → NIE widerlegen. Großzügig (60 km), weil ATC-Vektoren/Gegenanflug
+        # den Kurs weit weg vom geraden Peilkurs biegen.
+        if dist_dest <= 60.0:
             return True
 
-        # Am Boden weit weg vom Ziel → Roll-Kurs ist bedeutungslos und der Flug ist
-        # noch nicht geflogen → nicht korroborierbar → verwerfen.
+        # Am Boden weit weg vom Ziel → Roll-Kurs bedeutungslos → nicht widerlegbar → zeigen.
         if on_ground:
-            return False
+            return True
 
-        # Ohne Kurs lässt sich ein fliegender Kandidat nicht bestätigen.
-        if track is None:
-            return False
-        brg = _bearing_deg(lat, lon, dlat, dlon)
-        if brg is None:
-            return False
-        diff = abs((brg - track + 180.0) % 360.0 - 180.0)
-
-        # Toleranz: normal ±35°. Im Reiseflug (schnell) ist der Kurs stabil und
-        # zeigt die Strecke entlang → etwas weiter. Im Nahbereich (< 80 km zum
-        # Ziel) biegen ATC-Vektoren/Gegenanflug den Kurs weg vom geraden Peil-
-        # kurs → deutlich weiter.
-        tol = 35.0
-        if gs is not None and gs >= 350:
-            tol = 45.0
-        if dist_dest <= 80.0:
-            tol = max(tol, 60.0)
-
-        if diff > tol:
-            return False   # Kurs zeigt WEG vom behaupteten Ziel → Widerspruch → weg.
-
-        # (2) Korridor-Plausi: der Flieger sollte grob zwischen Abflug und Ziel
-        #     liegen — nicht weiter vom Ziel weg als die Strecke lang ist (+Slack).
-        #     Ein Flieger viel weiter draußen als die Streckenlänge fliegt dieses
-        #     Leg nicht.
+        # Nahe am Abflug (gerade gestartet, dreht noch ein) → Kurs bedeutungslos → zeigen.
         src = candidate.get('src') or candidate.get('src_icao')
         sap = _airport_row(src)
         if sap and sap.get('lat') is not None and sap.get('lon') is not None:
-            route_len = _haversine_km(float(sap['lat']), float(sap['lon']), dlat, dlon)
-            if route_len > 30.0 and dist_dest > route_len * 1.25 + 60.0:
-                return False
+            if _haversine_km(lat, lon, float(sap['lat']), float(sap['lon'])) <= 60.0:
+                return True
+
+        # Ohne Kurs kein Widerspruch feststellbar → zeigen.
+        if track is None:
+            return True
+        brg = _bearing_deg(lat, lon, dlat, dlon)
+        if brg is None:
+            return True
+        diff = abs((brg - track + 180.0) % 360.0 - 180.0)
+
+        # KLARER Widerspruch: Flieger fliegt >115° WEG vom behaupteten Ziel, in
+        # Reiseflug-Distanz von beiden Endpunkten. Das ist der eklatante „fliegt in
+        # die komplett falsche Richtung"-Fall → verwerfen. Alles darunter → zeigen.
+        if diff > 115.0:
+            return False
 
         return True
     except Exception:
-        return False
+        return True                          # im Zweifel: zeigen, nicht verstecken
 
 
 def _free_generic_route(cs, lat=None, lon=None):
@@ -895,28 +890,29 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
         return osky
 
     # ── 4. Freie generische Lookups (adsbdb / adsb.lol / hexdb) ─────────────
-    #  Das sind GENERISCHE Flugplan-Kandidaten (kein Live-Beweis). Owner-Regel:
-    #  „keine Schätzungen." Wir zeigen sie NUR, wenn die Live-Geometrie sie
-    #  BESTÄTIGT (Flieger fliegt wirklich Richtung des behaupteten Ziels). Sonst
-    #  fällt der Aufruf durch zum bezahlten, autoritativen Pfad (echte Live-Daten)
-    #  statt eine Schätzung zu zeigen.
+    #  Das sind GENERISCHE Flugplan-Kandidaten. Owner-Regel: „scraped/eigene Infos
+    #  sind #1 — müssen nicht geprüft werden; generische ZEIGEN, außer die Geometrie
+    #  widerspricht KLAR." Wir zeigen die Route also DEFAULT, und verwerfen sie NUR,
+    #  wenn der Flieger eindeutig in die falsche Richtung fliegt (>115° weg, fern
+    #  beider Endpunkte). Alles andere (Anflug/Holding/gerade gestartet/Rauschen)
+    #  → Route wird gezeigt.
     gen = _free_generic_route(cs, lat, lon)
     if gen and (gen.get('src') or gen.get('src_icao')):
-        if _corroborate_route_with_geometry(gen, lat, lon, track, gs, on_ground):
+        if _geometry_allows_route(gen, lat, lon, track, gs, on_ground):
             # Eigenen bestätigten Abflug (aus unserem Tracking) bevorzugen → dann
-            # ist die ganze Route eigen-bestätigt (Abflug beobachtet + Ziel-Kurs
-            # geometrisch bestätigt).
+            # ist der Abflug eigen-beobachtet (unsere #1-Quelle).
             own = _confirmed_origin_from_tracking(hexid)
             if own and own[0]:
                 gen['src'], gen['src_icao'] = own[0], own[1]
-                gen['source'] = (gen.get('source') or 'generic') + '+own_origin+geo'
-            else:
-                gen['source'] = (gen.get('source') or 'generic') + '+geo'
-            gen['confidence'] = 'confirmed'
+                gen['source'] = (gen.get('source') or 'generic') + '+own_origin'
+            # confidence bleibt 'estimated' (interner Wert): Client zeichnet die
+            # Route OHNE „bestätigt"-Siegel und ohne „geschätzt"-Label — nur die
+            # Strecke selbst (Owner: Routen sichtbar, kein Angst-Label).
             _record_resolved_route(cs, reg, gen, date)
             return gen
-        # Geometrie widerspricht / nicht bestätigbar → KEINE geschätzte Route
-        # emittieren (kein return: der bezahlte Pfad hat evtl. echte Live-Daten).
+        # Geometrie WIDERSPRICHT KLAR (Flieger fliegt in die falsche Richtung) →
+        # diese Route nicht zeigen (kein return: der bezahlte Pfad hat evtl. echte
+        # Live-Daten für die richtige Strecke).
 
     # ── 5. BEZAHLT (LETZTER Ausweg) — nur mit Tages-Budget, nur getippter Flieger
     if _paid_budget_ok():
@@ -926,7 +922,7 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
             # bereits 'confirmed'. Nur ein MEHRDEUTIGES ('estimated') Leg muss die
             # Geometrie noch bestätigen, sonst verwerfen (keine Schätzung zeigen).
             if adb.get('confidence') == 'confirmed' or \
-                    _corroborate_route_with_geometry(adb, lat, lon, track, gs, on_ground):
+                    _geometry_allows_route(adb, lat, lon, track, gs, on_ground):
                 adb['confidence'] = 'confirmed'
                 _record_resolved_route(cs, adb.get('reg') or reg, adb, date)
                 return adb
@@ -937,7 +933,7 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
         if avs and (avs.get('src') or avs.get('dst')):
             st = str(avs.get('status') or '').lower()
             if st in ('active', 'en-route', 'landed') or \
-                    _corroborate_route_with_geometry(avs, lat, lon, track, gs, on_ground):
+                    _geometry_allows_route(avs, lat, lon, track, gs, on_ground):
                 avs['confidence'] = 'confirmed'
                 _record_resolved_route(cs, reg, avs, date)
                 return avs
@@ -1259,11 +1255,12 @@ def ax_callsign(callsign):
       gs=<groundspeed_kt>  on_ground=<0|1>   (schalten die Geometrie-Bestätigung
                                               generischer Kandidaten frei)
 
-    Response (CONFIRMED-ONLY — Owner „keine Vielleichts"):
+    Response (Owner „scraped/eigene Infos sind #1 — zeigen, nicht verstecken"):
       ok, callsign, source, origin{}, destination{}, [gate, terminal, status]
-      confidence == 'confirmed'  (der einzige gezeigte Wert). Generische Kandidaten
-      werden NUR zurückgegeben, wenn die Live-Geometrie (lat/lon/track) sie
-      bestätigt; sonst 404 (keine Route) statt einer Schätzung.
+      confidence == 'confirmed' (eigene/gescrapte/bezahlte Daten) oder 'estimated'
+      (generischer Kandidat, GEZEIGT). Nur wenn wir GAR keine Strecke haben ODER
+      die Live-Geometrie KLAR widerspricht (Flieger fliegt in die falsche Richtung)
+      → 404 (keine Route). Sonst wird die Route zurückgegeben.
     """
     from flask import request
     cs = (callsign or '').strip().upper().replace(' ', '')
@@ -1286,12 +1283,12 @@ def ax_callsign(callsign):
 
     route = _resolve_live_route(cs, hexid=hexid, reg=reg, lat=lat, lon=lon,
                                 track=track, gs=gs, on_ground=on_ground)
-    # CONFIRMED-ONLY-Contract (Owner: „keine Vielleichts"): der Resolver liefert
-    # generische/mehrdeutige Kandidaten nur noch geometrisch bestätigt zurück.
-    # Sollte doch etwas Nicht-Bestätigtes durchrutschen, hier hart ausblenden.
-    if not route or route.get('confidence') not in ('confirmed', None):
-        if route and route.get('confidence') not in ('confirmed', None):
-            return jsonify({'ok': False, 'callsign': cs, 'confidence': 'none'}), 404
+    # SHOW-Contract (Owner: „scraped/eigene Infos sind #1"): der Resolver hat den
+    # Reject-Only-Geometrie-Filter bereits angewandt (nur der eklatante „fliegt in
+    # die falsche Richtung"-Fall wird verworfen). Was hier ankommt, WIRD gezeigt —
+    # sobald es eine Strecke hat. Nur wenn wir GAR NICHTS haben → 404.
+    if not route or not (route.get('src') or route.get('src_icao')
+                         or route.get('dst') or route.get('dst_icao')):
         return jsonify({'ok': False, 'callsign': cs}), 404
 
     out = {'ok': True, 'callsign': cs,
