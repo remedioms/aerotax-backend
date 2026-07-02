@@ -247,6 +247,42 @@ class Driver:
             time.sleep(1.0 + attempt)
         return None
 
+    def get_json_inpage(self, url: str, retries: int = 2, headers: dict | None = None):
+        """Fetch JSON by running `fetch()` INSIDE the warmed page's JS context. This
+        shares the page's cookie jar AND executes as real in-browser JS, so it slips
+        past Cloudflare/WAF setups that 403 a raw `context.request` sub-request (many
+        Middle-East / South-Asia airport APIs behave this way). Call `warm()`/`render()`
+        first so a page is loaded on the API's origin. `headers` merges/overrides the
+        default request headers (e.g. a static Basic-auth token the site hardcodes).
+        Returns decoded JSON or None."""
+        js = (
+            "async ([u, h]) => {"
+            "  try {"
+            # Keep the default a CORS "simple request" (only Accept) so cross-origin
+            # airport gateways (e.g. BLR gateway.* vs www.*) don't reject a preflight.
+            # Callers add X-Requested-With / auth via `headers` only when same-origin.
+            "    const base = {'Accept': 'application/json, text/plain, */*'};"
+            "    const r = await fetch(u, {headers: Object.assign(base, h||{}), credentials: 'include'});"
+            "    if (!r.ok) return {__err: r.status};"
+            "    const t = await r.text();"
+            "    return {__ok: t};"
+            "  } catch (e) { return {__err: String(e)}; }"
+            "}"
+        )
+        import json as _j
+        for attempt in range(retries + 1):
+            try:
+                res = self._page.evaluate(js, [url, headers or {}])
+                if isinstance(res, dict) and "__ok" in res:
+                    try:
+                        return _j.loads(res["__ok"])
+                    except Exception:
+                        return None
+            except Exception:
+                pass
+            time.sleep(0.8 + attempt)
+        return None
+
     def get_text(self, url: str, referer: str | None = None):
         headers = {"Accept": "*/*"}
         if referer:
