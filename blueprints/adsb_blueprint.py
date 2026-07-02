@@ -1925,7 +1925,23 @@ def adsb_poll():
         return jsonify({"error": "rate_limited"}), 429
 
     now = time.time()
-    # Globaler OpenSky-Backoff aktiv? (429 zuvor) → diesen Tick aussetzen.
+
+    # Immer-an Europa-Sweep (adsb.lol, FREI, kein OpenSky-Credit): läuft JEDEN Tick,
+    # auch ohne aktive Nutzer und auch während OpenSky-Backoff. Füttert die
+    # self-computed Route-Engine breit → ax_route_cache wächst gratis weltweit.
+    sweep_legs = 0
+    sweep_points = 0
+    try:
+        sweep_rows = _european_sweep_rows(now)
+        sweep_points = len(sweep_rows)
+        if sweep_rows:
+            from blueprints.aerox_data_blueprint import observe_adsb_positions
+            sweep_legs = observe_adsb_positions(sweep_rows)
+    except Exception:
+        sweep_legs = 0
+
+    # Globaler OpenSky-Backoff aktiv? (429 zuvor) → OpenSky-Teil aussetzen (der
+    # freie Sweep oben ist schon gelaufen).
     with _BACKOFF["lock"]:
         backoff_until = _BACKOFF["until"]
     if now < backoff_until:
@@ -1934,6 +1950,7 @@ def adsb_poll():
             "backoff_remaining": int(backoff_until - now),
             "polled_boxes": [], "calls_made": 0,
             "credits_remaining": None, "watch_size": 0,
+            "sweep_aircraft": sweep_points, "sweep_legs": sweep_legs,
         }), 200
 
     # 1) aktives Watch-Set laden + Keyframes anhängen.
@@ -2073,6 +2090,8 @@ def adsb_poll():
         "polled_boxes": polled_boxes,
         "calls_made": calls_made,
         "legs_recorded": legs_recorded,
+        "sweep_aircraft": sweep_points,
+        "sweep_legs": sweep_legs,
         "flights_fetched": flights_fetched,
         "credits_remaining": credits_remaining,
         "budget_stretched": stretched,
@@ -2312,6 +2331,57 @@ def _fetch_adsb_lol_point(lat, lon, radius_nm):
         if row is not None:
             out.append(row)
     return out
+
+
+# ─── Always-on Europa-Sweep (adsb.lol, FREI) ────────────────────────────────
+#  Problem: der /poll-Cycle bildet seine bbox-Calls NUR aus dem Watch-Set aktiver
+#  Nutzer. Ohne aktive Nutzer → keine Box → keine Beobachtung → die self-computed
+#  Route-Engine bekommt gar nichts und ax_route_cache wächst nicht. Fix: ein
+#  immer-an Europa-Sweep über adsb.lol (kostenlos, KEIN OpenSky-Credit). Wir
+#  rotieren pro Tick durch Hub-Cluster (250-nm-Radien decken die Terminalräume
+#  ab, wo Flieger tief/am Boden sind = genau was die Ab-/Anflug-Erkennung
+#  braucht). Zeit-rotiert → stateless (serverless-freundlich).
+_EU_SWEEP_POINTS = [
+    (51.47,   0.45),   # London / Amsterdam / Brüssel
+    (49.50,   8.57),   # Frankfurt / Zürich / Luxemburg
+    (48.35,  11.79),   # München / Wien / Prag
+    (48.86,   2.55),   # Paris / Lille
+    (45.63,   9.28),   # Mailand / Turin / Genf
+    (41.80,  12.25),   # Rom / Neapel
+    (40.47,  -3.57),   # Madrid / Lissabon-Ost
+    (41.30,   2.08),   # Barcelona / Palma / Valencia
+    (52.55,  13.29),   # Berlin / Warschau-West / Kopenhagen
+    (55.62,  12.65),   # Kopenhagen / Malmö / Hamburg
+    (59.65,  17.92),   # Stockholm / Oslo-Ost
+    (53.42,  -6.27),   # Dublin / Manchester / Glasgow-Süd
+    (40.98,  28.82),   # Istanbul / Athen-Nord
+    (37.94,  23.94),   # Athen / Ägäis
+    (47.44,  19.26),   # Budapest / Belgrad / Bukarest-West
+]
+_EU_SWEEP_RADIUS_NM = 250
+
+
+def _european_sweep_rows(now_ts):
+    """Immer-an, freie Europa-Abdeckung via adsb.lol. Rotiert zeit-basiert durch
+    _EU_SWEEP_POINTS (kein persistenter State nötig) und liefert normalisierte
+    Rows für observe_adsb_positions. AX_EU_SWEEP_POINTS_PER_TICK Punkte je Tick
+    (Default 2). Env AX_EU_SWEEP=0 schaltet den Sweep ab. Wirft NIE."""
+    if os.environ.get('AX_EU_SWEEP', '1').strip() in ('0', 'false', 'off'):
+        return []
+    try:
+        n = max(1, min(len(_EU_SWEEP_POINTS),
+                       int(os.environ.get('AX_EU_SWEEP_POINTS_PER_TICK', '2'))))
+    except (TypeError, ValueError):
+        n = 2
+    base = int(now_ts // 60) * n            # jede Minute n neue Punkte, rundlaufend
+    rows = []
+    for k in range(n):
+        lat, lon = _EU_SWEEP_POINTS[(base + k) % len(_EU_SWEEP_POINTS)]
+        try:
+            rows.extend(_fetch_adsb_lol_point(lat, lon, _EU_SWEEP_RADIUS_NM))
+        except Exception:
+            continue
+    return rows
 
 
 def _bbox_from_point(lat, lon, radius_nm):

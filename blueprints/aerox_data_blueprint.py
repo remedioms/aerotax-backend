@@ -583,6 +583,150 @@ _TRACK_LOCK = threading.Lock()
 _TRACK_MAX = 5000                 # Cap der In-Memory-Tracks (evict-oldest)
 _SELFCOMPUTE_LOW_ALT_FT = 8000    # nur Boden-/Tiefflieger auf Flughäfen snappen
 
+# ── DURABLE OPEN-LEG STORE (übersteht Cloud-Run-Instanz-Recycling) ───────────
+#  Das In-Memory _TRACK_STATE geht bei jedem Container-Restart verloren → ein vor
+#  dem Restart gestarteter (v.a. Langstrecken-)Flug verliert seinen Abflug und die
+#  Landung wird nie zu einem Leg. Deshalb ist der OFFENE Leg (hex hat „von X
+#  abgehoben, fliegt noch") in Supabase `ax_open_legs` gespiegelt = Source of Truth.
+#  _TRACK_STATE bleibt ein schneller LRU-Front-Cache davor. Degradiert sauber:
+#  fehlt die Tabelle (PGRST205) → In-Memory-Fallback + genau EINE Warnung, exakt
+#  wie die anderen Fallbacks. Best-effort, wirft NIE.
+_OPEN_LEGS_TABLE = 'ax_open_legs'
+_OPEN_LEGS_SB_OK = None            # None=ungetestet · True=Tabelle da · False=fehlt→mem-only
+_OPEN_LEGS_WARNED = False
+_OPEN_LEG_STALE_S = 20 * 3600      # dep_ts älter → Flug verloren/nie gelandet → evicten
+_LAST_OPEN_LEG_SWEEP = 0.0         # letzte Stale-Eviction (höchstens 1×/h)
+
+
+def _iso_from_ts(ts):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts))
+
+
+def _parse_ts(s):
+    """ISO-ish Timestamp → epoch seconds. Best-effort; now() bei Müll."""
+    if not s:
+        return time.time()
+    try:
+        import calendar
+        s2 = str(s).replace('Z', '').split('.')[0].split('+')[0].strip().replace('T', ' ')
+        return calendar.timegm(time.strptime(s2, '%Y-%m-%d %H:%M:%S'))
+    except Exception:
+        return time.time()
+
+
+def _open_legs_note_error(e):
+    """Fehlt die Tabelle → auf In-Memory umschalten + genau EINMAL warnen (wie die
+    anderen PGRST205-Fallbacks). Andere Fehler still schlucken (best-effort)."""
+    global _OPEN_LEGS_SB_OK, _OPEN_LEGS_WARNED
+    msg = str(e)
+    if 'PGRST205' in msg or 'schema cache' in msg or 'Could not find the table' in msg:
+        _OPEN_LEGS_SB_OK = False
+        if not _OPEN_LEGS_WARNED:
+            _OPEN_LEGS_WARNED = True
+            try:
+                print('[aerox_data] ax_open_legs missing → in-memory open-leg fallback '
+                      '(apply supabase_migrations/20260702_open_legs.sql for '
+                      'restart-durable self-computed legs)', flush=True)
+            except Exception:
+                pass
+
+
+def _open_leg_get(hexid):
+    """Offener Leg für hex: erst Front-Cache (_TRACK_STATE, phase=air+dep), sonst
+    Supabase (Source of Truth → übersteht Restarts). None wenn keiner offen."""
+    global _OPEN_LEGS_SB_OK
+    st = _TRACK_STATE.get(hexid)
+    if st and st.get('phase') == 'air' and st.get('dep'):
+        return st
+    if _OPEN_LEGS_SB_OK is False:
+        return None
+    sb = _sb()
+    if sb is None:
+        return None
+    try:
+        res = sb.table(_OPEN_LEGS_TABLE).select('*').eq('hex', hexid).limit(1).execute()
+        rows = getattr(res, 'data', None) or []
+    except Exception as e:
+        _open_legs_note_error(e)
+        return None
+    _OPEN_LEGS_SB_OK = True
+    if not rows:
+        return None
+    r = rows[0]
+    if not r.get('origin_iata'):
+        return None
+    leg = {'phase': 'air', 'dep': r.get('origin_iata'),
+           'dep_icao': r.get('origin_icao'),
+           'callsign': r.get('callsign'), 'reg': r.get('reg'),
+           'dep_ts': _parse_ts(r.get('dep_ts')), 'ts': time.time()}
+    _TRACK_STATE[hexid] = leg          # Front-Cache wärmen
+    return leg
+
+
+def _open_leg_put(hexid, origin_iata, origin_icao, cs, reg, lat, lon, alt, dep_ts=None):
+    """Abflug erkannt → offenen Leg upserten (Cache + Supabase). Idempotent (PK=hex).
+    Genau EIN kleiner Upsert pro erkanntem Abflug — nie für Reiseflug."""
+    global _OPEN_LEGS_SB_OK
+    dep_ts = dep_ts or time.time()
+    _TRACK_STATE[hexid] = {'phase': 'air', 'dep': origin_iata, 'dep_icao': origin_icao,
+                           'callsign': cs, 'reg': reg, 'dep_ts': dep_ts, 'ts': time.time()}
+    if _OPEN_LEGS_SB_OK is False:
+        return
+    sb = _sb()
+    if sb is None:
+        return
+    try:
+        sb.table(_OPEN_LEGS_TABLE).upsert({
+            'hex': hexid, 'origin_iata': origin_iata, 'origin_icao': origin_icao,
+            'dep_ts': _iso_from_ts(dep_ts), 'last_lat': lat, 'last_lon': lon,
+            'last_alt': alt, 'last_seen': _iso_now(), 'callsign': cs, 'reg': reg,
+        }, on_conflict='hex').execute()
+        _OPEN_LEGS_SB_OK = True
+    except Exception as e:
+        _open_legs_note_error(e)
+
+
+def _open_leg_delete(hexid):
+    """Landung verbucht → offenen Leg schliessen (Cache + Supabase). Wirft NIE."""
+    _TRACK_STATE.pop(hexid, None)
+    if _OPEN_LEGS_SB_OK is False:
+        return
+    sb = _sb()
+    if sb is None:
+        return
+    try:
+        sb.table(_OPEN_LEGS_TABLE).delete().eq('hex', hexid).execute()
+    except Exception as e:
+        _open_legs_note_error(e)
+
+
+def _open_legs_evict_stale():
+    """Verwaiste offene Legs (dep_ts > ~20h alt = Flug verloren/nie in Sicht
+    gelandet) räumen. Höchstens 1×/h, im Cache UND in Supabase. Wirft NIE."""
+    global _LAST_OPEN_LEG_SWEEP
+    now = time.time()
+    if now - _LAST_OPEN_LEG_SWEEP < 3600:
+        return
+    _LAST_OPEN_LEG_SWEEP = now
+    cutoff = now - _OPEN_LEG_STALE_S
+    try:
+        with _TRACK_LOCK:
+            for k, v in list(_TRACK_STATE.items()):
+                if v.get('phase') == 'air' and \
+                        (v.get('dep_ts') or v.get('ts') or now) < cutoff:
+                    _TRACK_STATE.pop(k, None)
+    except Exception:
+        pass
+    if _OPEN_LEGS_SB_OK is False:
+        return
+    sb = _sb()
+    if sb is None:
+        return
+    try:
+        sb.table(_OPEN_LEGS_TABLE).delete().lt('dep_ts', _iso_from_ts(cutoff)).execute()
+    except Exception as e:
+        _open_legs_note_error(e)
+
 
 def _haversine_km(lat1, lon1, lat2, lon2):
     import math
@@ -652,6 +796,7 @@ def observe_adsb_positions(rows, max_process=400):
         return 0
     to_record = []
     processed = 0
+    now = time.time()
     for row in rows:
         if processed >= max_process:
             break
@@ -664,54 +809,82 @@ def observe_adsb_positions(rows, max_process=400):
                 continue
             alt = row.get('alt')
             grounded = _obs_is_grounded(row)
+            low = (alt is not None and alt <= _SELFCOMPUTE_LOW_ALT_FT)
             cs = (row.get('callsign') or row.get('flight') or '').strip().upper() or None
             reg = (row.get('reg') or '').strip().upper() or None
-            # Nur für Boden-/Tiefflieger die Airports-DB anfassen (Cruise = billig skip).
-            near = None
-            if grounded or (alt is not None and alt <= _SELFCOMPUTE_LOW_ALT_FT):
-                processed += 1
-                near = _nearest_airport(lat, lon)
-            with _TRACK_LOCK:
-                prev = _TRACK_STATE.get(hexid)
-                if grounded and near:
-                    ap = (near.get('iata') or '').upper() or None
-                    # Ankunft: war in der Luft mit bekanntem Abflug ≠ hier → Leg fertig.
-                    if ap and prev and prev.get('phase') == 'air' \
-                            and prev.get('dep') and prev['dep'] != ap:
-                        to_record.append({
-                            'route': {
-                                'src': prev['dep'], 'src_icao': prev.get('dep_icao'),
-                                'dst': ap, 'dst_icao': (near.get('icao') or '').upper() or None,
-                                'callsign': prev.get('callsign') or cs,
-                                'source': 'aerox_adsb', 'confidence': 'confirmed',
-                            },
-                            'cs': prev.get('callsign') or cs,
-                            'reg': prev.get('reg') or reg,
-                        })
-                    _TRACK_STATE[hexid] = {
-                        'phase': 'ground', 'airport': ap,
-                        'airport_icao': (near.get('icao') or '').upper() or None,
-                        'callsign': cs, 'reg': reg, 'ts': time.time()}
-                elif not grounded:
-                    # Abflug-Kante: war am Boden an bekanntem Flughafen → jetzt dep.
-                    if prev and prev.get('phase') == 'ground' and prev.get('airport'):
-                        _TRACK_STATE[hexid] = {
-                            'phase': 'air', 'dep': prev['airport'],
-                            'dep_icao': prev.get('airport_icao'),
-                            'callsign': prev.get('callsign') or cs,
-                            'reg': prev.get('reg') or reg, 'ts': time.time()}
-                    elif prev and prev.get('phase') == 'air':
-                        if cs and not prev.get('callsign'):
-                            prev['callsign'] = cs
-                        if reg and not prev.get('reg'):
-                            prev['reg'] = reg
-                        prev['ts'] = time.time()
-                    else:
-                        # Erste Sichtung in der Luft — Abflug unbekannt, minimal merken.
-                        _TRACK_STATE[hexid] = {
-                            'phase': 'air', 'dep': None,
-                            'callsign': cs, 'reg': reg, 'ts': time.time()}
-                # grounded ohne bekannten Flughafen → NICHT resetten (guten dep halten).
+
+            # Reiseflug (hoch, nicht am Boden) → billiger Skip: keine Airports-DB,
+            # keine Supabase. Ein offener Leg für diesen hex bleibt unangetastet in
+            # ax_open_legs liegen (wird erst bei der Landung geschlossen). GENAU das
+            # macht die Engine restart-fest: der offene Leg lebt NICHT im RAM.
+            if not grounded and not low:
+                continue
+
+            # Nur Boden-/Tiefflieger die Airports-DB anfassen lassen.
+            processed += 1
+            near = _nearest_airport(lat, lon)
+
+            if grounded:
+                if not near:
+                    continue    # am Boden fern jedes Flughafens → Zustand halten
+                ap = (near.get('iata') or '').upper() or None
+                ap_icao = (near.get('icao') or '').upper() or None
+                mem = _TRACK_STATE.get(hexid)
+                # Schon als „am Boden hier" bekannt → nichts tun (KEIN Supabase-Read
+                # pro Tick für parkende Flieger). Nur Zeitstempel frisch halten.
+                if mem and mem.get('phase') == 'ground' and mem.get('airport') == ap:
+                    mem['ts'] = now
+                    continue
+                # Frische Landung ODER erste Sichtung am Boden nach Restart → GENAU
+                # EIN Open-Leg-Read (Cache→Supabase). Offener Leg mit dep ≠ hier → Leg.
+                leg = _open_leg_get(hexid)
+                if leg and leg.get('dep') and leg['dep'] != ap:
+                    to_record.append({
+                        'route': {
+                            'src': leg['dep'], 'src_icao': leg.get('dep_icao'),
+                            'dst': ap, 'dst_icao': ap_icao,
+                            'callsign': leg.get('callsign') or cs,
+                            'source': 'aerox_adsb', 'confidence': 'confirmed',
+                        },
+                        'cs': leg.get('callsign') or cs,
+                        'reg': leg.get('reg') or reg,
+                        'hex': hexid,
+                    })
+                elif leg:
+                    # Offener Leg, aber dep==hier oder unbekannt → verwerfen (kein Leg).
+                    _open_leg_delete(hexid)
+                # Am Boden hier gemerkt (In-Memory reicht; Ground-Phase ist kurzlebig).
+                _TRACK_STATE[hexid] = {
+                    'phase': 'ground', 'airport': ap, 'airport_icao': ap_icao,
+                    'callsign': cs, 'reg': reg, 'ts': now}
+            else:
+                # In der Luft & tief (An-/Abflughöhe).
+                mem = _TRACK_STATE.get(hexid)
+                if mem and mem.get('phase') == 'ground' and mem.get('airport') and near:
+                    # Abflug-Kante (ground→air): offenen Leg von diesem Flughafen öffnen.
+                    _open_leg_put(hexid, mem['airport'], mem.get('airport_icao'),
+                                  mem.get('callsign') or cs, mem.get('reg') or reg,
+                                  lat, lon, alt)
+                elif mem and mem.get('phase') == 'air' and mem.get('dep'):
+                    # Bereits offener Leg (im Cache) → nur Metadaten füllen, KEIN Write.
+                    if cs and not mem.get('callsign'):
+                        mem['callsign'] = cs
+                    if reg and not mem.get('reg'):
+                        mem['reg'] = reg
+                    mem['ts'] = now
+                elif near:
+                    # Kein Cache-Zustand (Erst-Sichtung / nach Restart) & tief am
+                    # Flughafen. Existiert in Supabase noch ein offener Leg? → wärmen.
+                    # Sonst: „first-seen already-climbing low near X" → Abflug X öffnen
+                    # (restart-fest). Fehlgriff bei einem Anflug ist selbstheilend:
+                    # origin=X, landet an X → dep==dst → kein Leg (oben verworfen).
+                    leg = _open_leg_get(hexid)
+                    if not (leg and leg.get('dep')):
+                        ap = (near.get('iata') or '').upper() or None
+                        if ap:
+                            _open_leg_put(hexid, ap, (near.get('icao') or '').upper() or None,
+                                          cs, reg, lat, lon, alt)
+                # tief, aber kein Flughafen in der Nähe & kein Zustand → ignorieren.
         except Exception:
             continue
     recorded = 0
@@ -719,10 +892,12 @@ def observe_adsb_positions(rows, max_process=400):
         try:
             if item['cs'] and item['route'].get('src') and item['route'].get('dst'):
                 _record_resolved_route(item['cs'], item['reg'], item['route'])
+                _open_leg_delete(item['hex'])     # Leg geschlossen → offenen Zustand löschen
                 recorded += 1
         except Exception:
             pass
     _maybe_evict_tracks()
+    _open_legs_evict_stale()
     return recorded
 
 
@@ -735,8 +910,9 @@ def _confirmed_origin_from_tracking(hexid):
     if not hexid:
         return None
     try:
-        with _TRACK_LOCK:
-            st = _TRACK_STATE.get(str(hexid).strip().lower())
+        # Erst Front-Cache, dann durabler Open-Leg-Store (übersteht Restarts) →
+        # ein vor dem Container-Recycle beobachteter Abflug bleibt bekannt.
+        st = _open_leg_get(str(hexid).strip().lower())
         if st and st.get('phase') == 'air' and st.get('dep'):
             return (st.get('dep'), st.get('dep_icao'))
     except Exception:
