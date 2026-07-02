@@ -21199,6 +21199,38 @@ def _push_notify_async(token, title, body, data=None, thread_id=None,
         print(f"[PUSH] executor submit failed: {e}")
 
 
+def _chat_push_preview(text):
+    """Menschlich lesbare Push-Vorschau aus dem rohen Chat-`text`. Rich-Message-
+    Marker (Foto/Meetup/Standort/Voice + Reply-Header, siehe ChatRichMessage.swift)
+    dürfen NICHT roh in der Notification landen (User-Bug 2026-07-02: Push zeigte
+    „[aerox:photo]/api/wall/image/…jpg" statt „📷 Foto")."""
+    s = (text or '').strip()
+    if not s:
+        return ''
+    # Reply-Header vorne abtrennen ("[aerox:re]{json}\n<payload>").
+    if s.startswith('[aerox:re]'):
+        nl = s.find('\n')
+        s = s[nl + 1:].strip() if nl != -1 else ''
+    low = s.lower()
+    if '[aerox:photo]' in low:
+        # optionale Caption steht hinter dem -Trenner NACH der URL
+        after = s[low.index('[aerox:photo]') + len('[aerox:photo]'):]
+        cap = ''
+        if '\x1f' in after:
+            cap = after.split('\x1f', 1)[1].strip()
+        return f'📷 Foto — {cap[:120]}' if cap else '📷 Foto'
+    if '[aerox:voice]' in low:
+        return '🎤 Sprachnachricht'
+    if '[aerox:meetup]' in low:
+        return '📅 Treffen vorgeschlagen'
+    if '[aerox:loc]' in low:
+        return '📍 Standort geteilt'
+    if '[aerox:' in low:
+        # unbekannter Marker → generisch, nie roh
+        return 'Neue Nachricht'
+    return s[:140]
+
+
 def _chat_push_fanout_async(author_token, channel_id, text):
     """Push-Fanout für Chat-Messages (DM- UND Group-Channels) — der HEADLINE-
     Fix für 'keine Push bei neuer Nachricht' (2026-07-02): der generische
@@ -21255,7 +21287,7 @@ def _chat_push_fanout_async(author_token, channel_id, text):
             except Exception:
                 pass
             sender_name = sender_name.strip() or 'Crew'
-            preview = (text or '').strip()[:140]
+            preview = _chat_push_preview(text)
             is_group = not cid.startswith('dm__')
             for rcpt in recipients:
                 try:

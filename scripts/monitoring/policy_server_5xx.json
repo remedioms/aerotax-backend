@@ -1,5 +1,5 @@
 {
-  "displayName": "AeroX: HTTP 5xx wave (>10 in 5min)",
+  "displayName": "AeroX: HTTP 5xx wave (>25 in 5min)",
   "documentation": {
     "content": "More than 10 HTTP 5xx responses from aerotax-backend in 5 minutes. Occasional 502/503 during revision restarts are normal; a wave means the service is unhealthy. Check `gcloud run services logs read aerotax-backend --region europe-west3 --limit 100`.",
     "mimeType": "text/markdown"
@@ -7,7 +7,7 @@
   "combiner": "OR",
   "conditions": [
     {
-      "displayName": "log metric server_5xx > 10 / 5min",
+      "displayName": "log metric server_5xx > 25 / 5min",
       "conditionThreshold": {
         "filter": "resource.type = \"cloud_run_revision\" AND metric.type = \"logging.googleapis.com/user/server_5xx\"",
         "aggregations": [
@@ -18,8 +18,8 @@
           }
         ],
         "comparison": "COMPARISON_GT",
-        "thresholdValue": 10,
-        "duration": "0s",
+        "thresholdValue": 25,
+        "duration": "300s",
         "trigger": { "count": 1 }
       }
     }
