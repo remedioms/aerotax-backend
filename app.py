@@ -23095,6 +23095,19 @@ def _fra_delay_min(sched, esti):
         return 0
 
 
+def _opensky_headers():
+    """Auth-Header für OpenSky-Flights-Calls. Nutzt den zentralen Header-Helfer aus
+    dem ADS-B-Blueprint (OAuth2-Bearer bevorzugt, sonst HTTP-Basic aus
+    OPENSKY_USERNAME/PASSWORD, sonst anonym). Wirft NIE — {} bei Import-Problem.
+    Authentifiziert liefert OpenSky deutlich mehr Credits + verlässlichere Flights-
+    Endpunkte (departure/arrival je Airport), die Basis der EU-Warehouse-Befüllung."""
+    try:
+        from blueprints.adsb_blueprint import _opensky_auth_header
+        return _opensky_auth_header() or {}
+    except Exception:
+        return {}
+
+
 def _fetch_opensky_board(icao, flight_type='departure'):
     """Per-Airport-Board via OpenSky (GRATIS, jeder ICAO). Liefert die ZULETZT
     tatsächlich abgeflogenen/angekommenen Flüge (~letzte 2h) — KEINE Gates/
@@ -23113,7 +23126,11 @@ def _fetch_opensky_board(icao, flight_type='departure'):
     ep = 'arrival' if flight_type == 'arrival' else 'departure'
     try:
         r = requests.get('https://opensky-network.org/api/flights/' + ep,
-                         params={'airport': icao, 'begin': begin, 'end': now}, timeout=10)
+                         params={'airport': icao, 'begin': begin, 'end': now},
+                         headers=_opensky_headers(), timeout=10)
+        # 404 = OpenSky-Konvention „keine Flüge im Fenster" (kein Fehler) → [].
+        if r.status_code == 404:
+            return []
         if r.status_code != 200:
             return None
         rows = r.json() or []
@@ -26029,7 +26046,7 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
     # Spalte in einer alten Tabelle, degradiert der Write still (Exception unten).
     meta = meta or {}
     for col in ('dest_iata', 'dest_name', 'gate', 'terminal', 'airline', 'esti',
-                'reg', 'type_code'):
+                'reg', 'type_code', 'source'):
         v = (meta.get(col) or '')
         if isinstance(v, str):
             v = v.strip()
@@ -26057,7 +26074,7 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
         # trägt — so reichert ein späterer reicher Board-Poll eine frühere Row an,
         # ohne sie bei einem ärmeren Poll wieder zu leeren.
         for col in ('reg', 'type_code', 'dest_iata', 'dest_name', 'airline',
-                    'gate', 'terminal', 'esti'):
+                    'gate', 'terminal', 'esti', 'source'):
             if payload.get(col):
                 upd_fields[col] = payload[col]
         try:
@@ -26076,12 +26093,17 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
             # Migration läuft, greift der reiche Pfad automatisch.
             msg = str(inner).lower()
             if ("type_code" in msg or "'reg'" in msg or '"reg"' in msg
+                    or 'source' in msg
                     or 'pgrst204' in msg or '42703' in msg
                     or 'column' in msg):
+                # Optionale (evtl. noch nicht migrierte) Spalten wegwerfen und den
+                # Write wiederholen — die Route/Tail-/Delay-Daten dürfen nicht wegen
+                # einer fehlenden Provenance-Spalte verloren gehen.
+                _slim_drop = ('reg', 'type_code', 'source')
                 slim_payload = {k: v for k, v in payload.items()
-                                if k not in ('reg', 'type_code')}
+                                if k not in _slim_drop}
                 slim_upd = {k: v for k, v in upd_fields.items()
-                            if k not in ('reg', 'type_code')}
+                            if k not in _slim_drop}
                 upd = (sb.table('airport_delay_obs')
                        .update(slim_upd)
                        .eq('date', date_str).eq('airport', payload['airport'])
@@ -26766,6 +26788,328 @@ def poll_punctuality_accumulate():
     return jsonify({'ok': True, 'accumulated': results})
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  EUROPÄISCHE WAREHOUSE-EXPANSION  —  OpenSky-Bulk-Fill (gratis, weltweit)
+# ══════════════════════════════════════════════════════════════════════════
+#  Owner-Vision: „wir scrapen alle großen deutschen Flughäfen (Tail, Zeiten,
+#  Gates) → Feed/Kalender/Radar. Das will ich für JEDEN großen EU-Flughafen."
+#
+#  Die deutschen Hubs haben freie NATIVE Board-Scraper (Fraport/munich-airport/…)
+#  mit Gate+Terminal+Ist-Zeiten → bleiben die reiche Quelle (siehe
+#  _NATIVE_BOARD_SCRAPERS). Für den REST Europas gibt es keine sauber-freie
+#  Board-JSON (LHR=JS-SPA, ZRH=302/Sitecore, VIE=301, AMS=403 key-required,
+#  Stand 2026-07) → wir nutzen die AUTHENTIFIZIERTE OpenSky-Flights-API als
+#  skalierbare, kostenlose Engine: /flights/departure + /flights/arrival je
+#  ICAO liefern JEDEN Flug rein/raus (icao24=Tail-Hex, callsign, dep/arr-Airport,
+#  first/lastSeen-Zeiten) — für die GANZE Welt, ohne Per-Airport-Scraper.
+#
+#  Wir schreiben diese Beobachtungen im GLEICHEN Contract wie die deutschen
+#  Scraper nach airport_delay_obs (+ ax_route_cache) → route-history,
+#  aircraft-history, flight-info und der Radar-Route-Resolver leuchten damit für
+#  europäische Flüge auf. EHRLICH: KEINE Gates (nicht in ADS-B) und KEINE
+#  Verspätung (OpenSky kennt keine SOLL-Zeit) → Gate/Delay bleiben leer, die
+#  Zeile trägt Tail + echte Strecke + Ist-Zeit. Provenance-Spalte source=
+#  'opensky' hält das getrennt von den Scheduled-Quellen (kein Fake-„pünktlich").
+#
+#  (IATA, ICAO) — die großen EU-Hubs (grob nach Verkehr). Die deutschen sind
+#  bewusst dabei (Vollständigkeit), werden aber im Fill übersprungen, weil sie
+#  ihren reichen nativen Scraper haben (_EU_FILL_ICAOS filtert sie raus).
+_EU_AIRPORTS = (
+    ('LHR', 'EGLL'), ('CDG', 'LFPG'), ('AMS', 'EHAM'), ('MAD', 'LEMD'),
+    ('BCN', 'LEBL'), ('FCO', 'LIRF'), ('MUC', 'EDDM'), ('LGW', 'EGKK'),
+    ('ORY', 'LFPO'), ('MXP', 'LIMC'), ('DUB', 'EIDW'), ('ZRH', 'LSZH'),
+    ('CPH', 'EKCH'), ('VIE', 'LOWW'), ('OSL', 'ENGM'), ('ARN', 'ESSA'),
+    ('LIS', 'LPPT'), ('MAN', 'EGCC'), ('BRU', 'EBBR'), ('DUS', 'EDDL'),
+    ('PMI', 'LEPA'), ('AGP', 'LEMG'), ('HEL', 'EFHK'), ('ATH', 'LGAV'),
+    ('WAW', 'EPWA'), ('LYS', 'LFLL'), ('NCE', 'LFMN'), ('GVA', 'LSGG'),
+    ('HAM', 'EDDH'), ('PRG', 'LKPR'), ('BUD', 'LHBP'), ('OPO', 'LPPR'),
+    ('LIN', 'LIML'), ('VCE', 'LIPZ'), ('NAP', 'LIRN'), ('EDI', 'EGPH'),
+    ('LCY', 'EGLC'), ('KEF', 'BIKF'), ('IST', 'LTFM'), ('SAW', 'LTFJ'),
+    ('BER', 'EDDB'), ('FRA', 'EDDF'),
+)
+_EU_ICAO_TO_IATA = {icao: iata for (iata, icao) in _EU_AIRPORTS}
+_EU_IATA_TO_ICAO = {iata: icao for (iata, icao) in _EU_AIRPORTS}
+# Die Airports, die der OpenSky-Fill tatsächlich anfasst = EU-Hubs OHNE freien
+# nativen Scraper (die deutschen Hubs füttern airport_delay_obs schon reicher).
+# Die native-scraped Codes hier INLINE (Modul-Load-Zeit vor der _FREE_BOARD_CODES-
+# Definition weiter unten) — deckungsgleich mit _FREE_BOARD_CODES gehalten.
+_EU_FILL_EXCLUDE = frozenset({'FRA', 'EDDF', 'MUC', 'EDDM', 'DUS', 'EDDL',
+                              'HAM', 'EDDH', 'BER', 'EDDB', 'HAJ', 'EDDV',
+                              'FMO', 'EDDG', 'LEJ', 'EDDP'})
+_EU_FILL_ICAOS = tuple(icao for (iata, icao) in _EU_AIRPORTS
+                       if iata not in _EU_FILL_EXCLUDE and icao not in _EU_FILL_EXCLUDE)
+
+# Prozess-lokaler ICAO→IATA-Cache (Referenz-DB-Treffer + Misses), damit der Fill
+# nicht pro Flug dieselbe ICAO gegen die gebackene Airports-DB schlägt.
+_WH_ICAO_IATA_CACHE = {}
+# In-Memory OpenSky-Fill-Tages-Budget (Safety-Net gegen Rate-Limits).
+_OPENSKY_FILL_BUDGET = {'day': '', 'calls': 0}
+
+
+def _wh_icao_to_iata(icao):
+    """ICAO-Airport-Code → IATA, best-effort. Reihenfolge: EU-Universum → deutsche
+    Map → gebackene Referenz-DB (85k Airports) → None. Gecacht (inkl. Misses)."""
+    c = (icao or '').upper().strip()
+    if len(c) != 4:
+        # Schon IATA? Dann unverändert zurück (defensiv).
+        return c if len(c) == 3 else None
+    if c in _EU_ICAO_TO_IATA:
+        return _EU_ICAO_TO_IATA[c]
+    if c in _DE_ICAO_TO_IATA:
+        return _DE_ICAO_TO_IATA[c]
+    if c in _WH_ICAO_IATA_CACHE:
+        return _WH_ICAO_IATA_CACHE[c]
+    iata = None
+    try:
+        from blueprints.aerox_data_blueprint import _airport_row
+        row = _airport_row(c) or {}
+        iata = (row.get('iata') or '').upper().strip() or None
+    except Exception:
+        iata = None
+    _WH_ICAO_IATA_CACHE[c] = iata
+    return iata
+
+
+def _wh_hex_to_reg(hexid):
+    """ICAO24-Hex → Tail-Registrierung aus der gebackenen Aircraft-DB (520k). None
+    wenn unbekannt/DB fehlt. Wirft NIE."""
+    h = (hexid or '').lower().strip()
+    if not h:
+        return None
+    try:
+        from blueprints.aerox_data_blueprint import _q1
+        r = _q1('SELECT reg FROM aircraft WHERE hex=? LIMIT 1', (h,)) or {}
+        return (r.get('reg') or '').upper().strip() or None
+    except Exception:
+        return None
+
+
+def _wh_callsign_to_iata_flightno(cs):
+    """ICAO-Callsign (DLH441) → IATA-Flugnummer (LH441) via Airline-Referenz.
+    None wenn nicht auflösbar (Caller behält dann den Callsign)."""
+    try:
+        from blueprints.aerox_data_blueprint import _callsign_to_iata_flightno
+        return _callsign_to_iata_flightno(cs)
+    except Exception:
+        return None
+
+
+def _unix_to_airport_local(ts, iata):
+    """Unix-Sekunden → naive Flughafen-LOKALZEIT (gleiche Basis wie die sched-
+    Strings der Scraper). Fällt auf UTC zurück, wenn keine TZ bekannt ist."""
+    from datetime import datetime, timezone
+    try:
+        ts = int(ts)
+    except Exception:
+        return None
+    tzname = None
+    try:
+        tzname = airport_tz((iata or '').upper()) if iata else None
+    except Exception:
+        tzname = None
+    try:
+        if tzname:
+            from zoneinfo import ZoneInfo
+            return datetime.fromtimestamp(ts, ZoneInfo(tzname)).replace(tzinfo=None)
+    except Exception:
+        pass
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _opensky_fill_budget_ok(inc=0):
+    """Tages-Budget-Guard für OpenSky-Fill-Calls (env OPENSKY_FILL_DAILY_CAP,
+    Default 1500 — weit unter dem authentifizierten OpenSky-Tageslimit ~4000).
+    Mit inc>0 werden Calls gezählt. True solange noch Budget frei ist."""
+    import os as _os, time as _t
+    day = _t.strftime('%Y%m%d', _t.gmtime())
+    if _OPENSKY_FILL_BUDGET['day'] != day:
+        _OPENSKY_FILL_BUDGET['day'] = day
+        _OPENSKY_FILL_BUDGET['calls'] = 0
+    try:
+        cap = int(_os.environ.get('OPENSKY_FILL_DAILY_CAP') or '1500')
+    except Exception:
+        cap = 1500
+    if inc:
+        _OPENSKY_FILL_BUDGET['calls'] += inc
+    return _OPENSKY_FILL_BUDGET['calls'] < cap
+
+
+def _opensky_fetch_flights(icao, ep, begin, end):
+    """Roh-Flights von OpenSky (/flights/departure|arrival) für EINEN ICAO im
+    Zeitfenster [begin,end] (Unix-Sek). Authentifiziert (mehr Credits). Gibt die
+    Liste roher Flight-Dicts, [] bei „keine Flüge" (404) oder None bei Fehler/
+    Budget-Erschöpfung. Wirft NIE."""
+    try:
+        import requests
+    except Exception:
+        return None
+    if not _opensky_fill_budget_ok(inc=1):
+        return None
+    path = 'arrival' if ep == 'arrival' else 'departure'
+    try:
+        r = requests.get('https://opensky-network.org/api/flights/' + path,
+                         params={'airport': icao, 'begin': int(begin), 'end': int(end)},
+                         headers=_opensky_headers(), timeout=15)
+        if r.status_code == 404:
+            return []          # OpenSky: keine Flüge im Fenster (kein Fehler)
+        if r.status_code != 200:
+            return None
+        return r.json() or []
+    except Exception:
+        return None
+
+
+def _opensky_fill_airport(icao, hours=None, write=True):
+    """Befüllt das Warehouse für EINEN Flughafen aus OpenSky: holt Ab- UND Anflüge
+    des letzten `hours`-Fensters, baut Board-Zeilen (Tail-Reg via Hex, IATA-
+    Flugnummer via Airline-Referenz, ICAO→IATA-Ziel) und schreibt sie im GLEICHEN
+    Contract wie die deutschen Scraper nach airport_delay_obs (source='opensky').
+    Voll aufgelöste Legs (dep+arr bekannt) landen zusätzlich in ax_route_cache →
+    der Radar-Route-Resolver leuchtet gratis auf. Gate/Delay bleiben leer (ehrlich).
+
+    Rückgabe: Diagnose-Dict {icao, iata, dep, arr, routes, sample:[…]} — niemals
+    raise, jede Zeile degradiert einzeln."""
+    import os as _os, time as _t
+    icao = (icao or '').upper().strip()
+    iata_self = _wh_icao_to_iata(icao) or icao
+    try:
+        hours = int(hours if hours is not None else (_os.environ.get('EU_FILL_WINDOW_H') or '12'))
+    except Exception:
+        hours = 12
+    hours = max(1, min(hours, 24))
+    now = int(_t.time())
+    begin = now - hours * 3600
+    out = {'icao': icao, 'iata': iata_self, 'dep': 0, 'arr': 0,
+           'routes': 0, 'sample': []}
+    try:
+        from blueprints.aerox_data_blueprint import _record_resolved_route
+    except Exception:
+        _record_resolved_route = None
+
+    for ep in ('departure', 'arrival'):
+        rows = _opensky_fetch_flights(icao, ep, begin, now)
+        if not rows:
+            continue
+        for f in rows:
+            try:
+                cs = (f.get('callsign') or '').strip().upper()
+                hexid = (f.get('icao24') or '').strip().lower()
+                if not cs and not hexid:
+                    continue
+                is_dep = (ep == 'departure')
+                # Das ANDERE Ende + der Zeitstempel dieses Airports.
+                other_icao = (f.get('estArrivalAirport') if is_dep
+                              else f.get('estDepartureAirport')) or ''
+                other_icao = other_icao.strip().upper()
+                ts = f.get('firstSeen') if is_dep else f.get('lastSeen')
+                # Zeit in Flughafen-LOKALZEIT dieses Airports (sched-Basis).
+                dt = _unix_to_airport_local(ts, iata_self)
+                if dt is None:
+                    continue
+                date_str = dt.strftime('%Y-%m-%d')
+                hhmm = dt.strftime('%H:%M')
+                # Flugnummer: IATA bevorzugt (damit /flight-info sie findet), sonst
+                # der ICAO-Callsign (der Radar-Resolver mappt selbst zurück).
+                fn = _wh_callsign_to_iata_flightno(cs) or cs
+                if not fn:
+                    continue
+                airline = fn[:2].upper() if (fn and fn[:2].isalpha()) else (cs[:3] if cs else '')
+                reg = _wh_hex_to_reg(hexid) or ''
+                other_iata = _wh_icao_to_iata(other_icao) or ''
+                # Store-Key: Abflüge unter nacktem IATA, Ankünfte unter '<IATA>#ARR'.
+                store_ap = iata_self if is_dep else (iata_self + '#ARR')
+                meta = {
+                    'dest_iata': other_iata,
+                    'dest_name': '',
+                    'airline': airline,
+                    'reg': reg,
+                    'type_code': '',
+                    'source': 'opensky',
+                }
+                if write:
+                    # DIREKT nach airport_delay_obs (NICHT über _merge_into_delay_store)
+                    # → OpenSky-Ist-Beobachtungen kontaminieren die Live-Pünktlichkeits-
+                    # Stichprobe (_delay_store) NICHT (keine SOLL-Zeit → kein Fake-0-Delay).
+                    # status='' + max_delay=0 (unbekannt) + source='opensky' (Provenance).
+                    _delay_obs_write_through(
+                        date_str, fn.replace(' ', '').upper(), hhmm, 0, False,
+                        store_ap, '', meta)
+                out['dep' if is_dep else 'arr'] += 1
+                # Voll aufgelöste Route in die eigene Routen-DB (gratis, wächst).
+                if _record_resolved_route is not None and other_iata:
+                    dep_iata = iata_self if is_dep else other_iata
+                    arr_iata = other_iata if is_dep else iata_self
+                    dep_icao = icao if is_dep else other_icao
+                    arr_icao = other_icao if is_dep else icao
+                    route = {'src': dep_iata, 'dst': arr_iata,
+                             'src_icao': dep_icao or None, 'dst_icao': arr_icao or None,
+                             'callsign': cs, 'source': 'aerox_opensky'}
+                    if write and cs:
+                        try:
+                            _record_resolved_route(cs, reg or None, route, date_str)
+                            out['routes'] += 1
+                        except Exception:
+                            pass
+                if len(out['sample']) < 4:
+                    out['sample'].append({'flight': fn, 'reg': reg, 'cs': cs,
+                                          'from': (iata_self if is_dep else other_iata),
+                                          'to': (other_iata if is_dep else iata_self),
+                                          'at': date_str + 'T' + hhmm})
+            except Exception:
+                continue
+    return out
+
+
+def _eu_fill_icaos_for_tick():
+    """Round-Robin-Auswahl der EU-Airports für DIESEN Scheduler-Tick. Statt alle
+    ~34 Nicht-DE-Hubs pro Tick zu hämmern (Rate-Limit), rotiert die Auswahl über
+    Zeit-Buckets: EU_FILL_PER_TICK Airports pro Tick, ein Bucket pro EU_FILL_TICK_
+    SECONDS → nach ~ceil(N/per) Ticks sind alle einmal durch. Env-tunebar."""
+    import os as _os, time as _t, math as _m
+    ids = list(_EU_FILL_ICAOS)
+    if not ids:
+        return []
+    try:
+        per = int(_os.environ.get('EU_FILL_PER_TICK') or '5')
+    except Exception:
+        per = 5
+    try:
+        tick_s = int(_os.environ.get('EU_FILL_TICK_SECONDS') or '600')
+    except Exception:
+        tick_s = 600
+    if per <= 0:
+        return []
+    per = min(per, len(ids))
+    nbuckets = max(1, _m.ceil(len(ids) / per))
+    bucket = int(_t.time() // max(60, tick_s)) % nbuckets
+    return ids[bucket * per:(bucket + 1) * per]
+
+
+def _eu_fill_once(icaos=None):
+    """Ein Fill-Durchlauf über die (rotierte) EU-Airport-Auswahl. Env EU_FILL_ENABLED
+    ('0' → aus). Budget-Guard + Per-Airport-try/except → niemals 500. Liefert
+    {icao: {dep,arr,routes}} für die Scheduler-Antwort."""
+    import os as _os
+    if (_os.environ.get('EU_FILL_ENABLED') or '1').strip() in ('0', 'false', 'no'):
+        return {'disabled': True}
+    picks = list(icaos) if icaos else _eu_fill_icaos_for_tick()
+    summary = {}
+    for ic in picks:
+        if not _opensky_fill_budget_ok():
+            summary[ic] = 'budget_exhausted'
+            continue
+        try:
+            r = _opensky_fill_airport(ic)
+            summary[ic] = {'dep': r.get('dep'), 'arr': r.get('arr'),
+                           'routes': r.get('routes')}
+        except Exception as e:
+            summary[ic] = 'err:' + type(e).__name__
+    return summary
+
+
 # Standard-Airport-Set für den server-seitigen Poller. FRA + MUC sind Pflicht
 # (User-Brief), die großen DE-Bases sind sinnvolle Defaults. Über die Env-Variable
 # POLL_BOARDS_AIRPORTS (Komma-Liste, z.B. "FRA,MUC,BER,JFK") überschreibbar.
@@ -26876,7 +27220,45 @@ def internal_poll_boards():
         return jsonify({'ok': False, 'error': 'forbidden_no_secret'}), 403
     airports = _poll_boards_airports()
     results = _poll_boards_once(airports)
-    return jsonify({'ok': True, 'airports': airports, 'persisted': results})
+    # EUROPÄISCHE WAREHOUSE-EXPANSION: pro Tick eine ROTIERTE Teilmenge der großen
+    # EU-Hubs (ohne freien Nativ-Scraper) via OpenSky bulk-fill (Tail+Route+Zeiten,
+    # gratis) nach airport_delay_obs + ax_route_cache. Round-Robin + Tages-Budget-
+    # Guard schützen das OpenSky-Rate-Limit; jeder Airport degradiert einzeln.
+    try:
+        eu = _eu_fill_once()
+    except Exception as e:
+        eu = {'error': type(e).__name__}
+    return jsonify({'ok': True, 'airports': airports, 'persisted': results,
+                    'eu_fill': eu})
+
+
+@app.route('/api/internal/eu-fill', methods=['POST'])
+def internal_eu_fill():
+    """Manueller OpenSky-Warehouse-Fill für die großen EU-Hubs (Backfill/Test).
+    Ohne Parameter: die rotierte Tick-Auswahl. Mit ?icaos=EGLL,LFPG,EHAM: genau
+    diese ICAOs (Komma-Liste) — nützlich für gezielten Backfill/Verifikation.
+    Schreibt Tail+Route+Ist-Zeiten nach airport_delay_obs + ax_route_cache.
+
+    AUTH: gleicher shared-secret Header `X-Poll-Secret` == ADSB_POLL_SECRET wie
+    /poll-boards; ohne gesetztes Secret nur localhost. Niemals 500 (Per-Airport-
+    try/except), Tages-Budget-Guard schützt das OpenSky-Rate-Limit."""
+    import os as _os, hmac as _hmac
+    secret = _os.environ.get('ADSB_POLL_SECRET', '').strip()
+    if secret:
+        provided = (request.headers.get('X-Poll-Secret')
+                    or request.args.get('token') or '').strip()
+        if not provided or not _hmac.compare_digest(provided, secret):
+            return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    elif (request.remote_addr or '') not in ('127.0.0.1', '::1'):
+        return jsonify({'ok': False, 'error': 'forbidden_no_secret'}), 403
+    raw = (request.args.get('icaos') or '').strip()
+    icaos = None
+    if raw:
+        icaos = [a.strip().upper() for a in raw.replace(';', ',').split(',') if a.strip()]
+    summary = _eu_fill_once(icaos)
+    return jsonify({'ok': True, 'universe': list(_EU_FILL_ICAOS),
+                    'budget_calls': _OPENSKY_FILL_BUDGET.get('calls'),
+                    'filled': summary})
 
 
 # Welche Airports haben einen FREIEN nativen Echtzeit-Scraper (estimated/actual
