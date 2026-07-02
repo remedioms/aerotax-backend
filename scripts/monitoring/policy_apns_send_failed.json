@@ -1,0 +1,33 @@
+{
+  "displayName": "AeroX: APNs send failed (>0 in 5min)",
+  "documentation": {
+    "content": "One or more `[APNS] send failed` log lines from aerotax-backend in the last 5 minutes. Check key/env (BadEnvironmentKeyToken = wrong key/env pairing) and run scripts/canary.sh step 3 to verify APNs key auth.",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "log metric apns_send_failed > 0 / 5min",
+      "conditionThreshold": {
+        "filter": "resource.type = \"cloud_run_revision\" AND metric.type = \"logging.googleapis.com/user/apns_send_failed\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "300s",
+            "perSeriesAligner": "ALIGN_SUM",
+            "crossSeriesReducer": "REDUCE_SUM"
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "trigger": { "count": 1 }
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "1800s"
+  },
+  "notificationChannels": [
+    "projects/aerotax-prod/notificationChannels/18344722479875947413"
+  ]
+}

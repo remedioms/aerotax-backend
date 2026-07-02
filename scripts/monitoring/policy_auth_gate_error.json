@@ -1,0 +1,33 @@
+{
+  "displayName": "AeroX: auth gate error (>0 in 5min)",
+  "documentation": {
+    "content": "One or more `auth_gate_error` / `UNEXPECTED gate error` log lines from aerotax-backend in the last 5 minutes. The auth gate should never throw — every occurrence is a real bug (risk: spurious 401s logging users out).",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "log metric auth_gate_error > 0 / 5min",
+      "conditionThreshold": {
+        "filter": "resource.type = \"cloud_run_revision\" AND metric.type = \"logging.googleapis.com/user/auth_gate_error\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "300s",
+            "perSeriesAligner": "ALIGN_SUM",
+            "crossSeriesReducer": "REDUCE_SUM"
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "trigger": { "count": 1 }
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "1800s"
+  },
+  "notificationChannels": [
+    "projects/aerotax-prod/notificationChannels/18344722479875947413"
+  ]
+}

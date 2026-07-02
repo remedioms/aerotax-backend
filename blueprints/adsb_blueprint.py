@@ -2150,6 +2150,59 @@ def _area_cache_put(key, payload):
                 _AREA_CACHE.pop(k, None)
 
 
+# ── Tile-Micro-Cache (gröber, kürzer) ────────────────────────────────────────
+# Zweite Cache-Ebene für /api/adsb/area: der feine Cache oben keyed auf 0.1°
+# (~6nm) — zwei User, die 10nm auseinander aufs Radar schauen, verfehlen ihn.
+# Diese Ebene quantisiert auf 0.5°-Kacheln (~30nm) mit nur 10s TTL: bei
+# typischen Radien (80-250nm) ist der Flieger-Set praktisch identisch, und
+# 10s alt ist für ADS-B frisch genug (Poll-Intervall der App ist 25s).
+# Ergebnis: Cache-Hit → Antwort in <10ms statt 1-3s Upstream-Roundtrip.
+_AREA_TILE_CACHE = {}                # key -> {"at": float, "payload": dict}
+_AREA_TILE_CACHE_LOCK = threading.Lock()
+_AREA_TILE_TTL_SECONDS = 10
+_AREA_TILE_CACHE_CAP = 200
+
+
+def _area_tile_key(lat, lon, radius):
+    # 0.5°-Kachel (round auf halbe Grade) + Radius-Bucket wie beim feinen Key.
+    return f"tile:{round(lat * 2) / 2}:{round(lon * 2) / 2}:{int(round(radius / 10) * 10)}"
+
+
+def _area_tile_cache_get(key):
+    now = time.time()
+    with _AREA_TILE_CACHE_LOCK:
+        e = _AREA_TILE_CACHE.get(key)
+        if e is None:
+            return None
+        if now - e["at"] > _AREA_TILE_TTL_SECONDS:
+            return None
+        return e["payload"]
+
+
+def _area_tile_cache_put(key, payload):
+    # Soft-Cap + evict-oldest, gleiches Muster wie _area_cache_put oben.
+    with _AREA_TILE_CACHE_LOCK:
+        _AREA_TILE_CACHE[key] = {"at": time.time(), "payload": payload}
+        if len(_AREA_TILE_CACHE) > _AREA_TILE_CACHE_CAP:
+            items = sorted(_AREA_TILE_CACHE.items(), key=lambda kv: kv[1]["at"])
+            for k, _ in items[:50]:
+                _AREA_TILE_CACHE.pop(k, None)
+
+
+def _area_response(payload):
+    """200-Response für /api/adsb/area mit Edge-Cache-Header.
+
+    Der Endpoint ist token-frei (Query = nur lat/lon/radius, Antwort für alle
+    Caller identisch) und läuft clientseitig über die CDN-Domain →
+    `Cache-Control: public, max-age=8` lässt Cloudflare-Edge + URLCache kurz
+    mitcachen (unter dem 10s-Tile-TTL, deutlich unter dem 25s-App-Poll).
+    `public` ist nötig, weil die App einen Authorization-Header mitschickt —
+    ohne `public` würden Shared-Caches solche Antworten nicht speichern."""
+    resp = jsonify(payload)
+    resp.headers['Cache-Control'] = 'public, max-age=8'
+    return resp, 200
+
+
 def _normalize_adsb_lol_ac(ac):
     """adsb.lol-Aircraft-Dict → flache normalisierte Row.
     {hex, flight, lat, lon, alt, speed, heading, squawk, reg, type}.
@@ -2295,7 +2348,17 @@ def get_adsb_area():
     if cached is not None:
         out = dict(cached)
         out["cached"] = True
-        return jsonify(out), 200
+        return _area_response(out)
+
+    # Zweite Ebene: 0.5°-Tile-Micro-Cache (10s TTL) — fängt Requests ab, deren
+    # Zentrum den feinen 0.1°-Key knapp verfehlt (z.B. leicht gepannte Karte
+    # oder zwei User wenige nm auseinander). Instant statt Upstream-Roundtrip.
+    tk = _area_tile_key(lat, lon, radius)
+    tile_cached = _area_tile_cache_get(tk)
+    if tile_cached is not None:
+        out = dict(tile_cached)
+        out["cached"] = True
+        return _area_response(out)
 
     tried = []
     aircraft = None
@@ -2351,7 +2414,8 @@ def get_adsb_area():
         "tried": tried,
     }
     _area_cache_put(ck, payload)
-    return jsonify(payload), 200
+    _area_tile_cache_put(tk, payload)
+    return _area_response(payload)
 
 
 @adsb_bp.route('/api/adsb/alerts', methods=['GET'])

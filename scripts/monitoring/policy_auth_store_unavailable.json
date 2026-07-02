@@ -1,0 +1,33 @@
+{
+  "displayName": "AeroX: auth store unavailable wave (>5 in 5min)",
+  "documentation": {
+    "content": "More than 5 `sb_load_fail` / `auth store unavailable` log lines from aerotax-backend in 5 minutes. Transient singles are absorbed by the auth fail-safe; a wave means Supabase auth-store loading is genuinely degraded.",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "log metric auth_store_unavailable > 5 / 5min",
+      "conditionThreshold": {
+        "filter": "resource.type = \"cloud_run_revision\" AND metric.type = \"logging.googleapis.com/user/auth_store_unavailable\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "300s",
+            "perSeriesAligner": "ALIGN_SUM",
+            "crossSeriesReducer": "REDUCE_SUM"
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 5,
+        "duration": "0s",
+        "trigger": { "count": 1 }
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "1800s"
+  },
+  "notificationChannels": [
+    "projects/aerotax-prod/notificationChannels/18344722479875947413"
+  ]
+}

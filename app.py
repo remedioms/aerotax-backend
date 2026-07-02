@@ -14542,6 +14542,207 @@ def post_crash_report():
     return jsonify({'ok': True})
 
 
+# ─── MetricKit-Diagnostik-Intake (Crash/Hang-Telemetrie, iOS) ────────────────
+#
+# Empfängt MXCrashDiagnostic/MXHangDiagnostic-Reports vom iOS-Client
+# (Storage/CrashTelemetry.swift). Motivation: ein Tester-Freeze wurde nur per
+# Mundpropaganda bekannt — MetricKit sieht Watchdog-Kills + Hangs, die der
+# In-Process-CrashHandler (/api/crash-report oben) nicht abfangen kann.
+#
+# Auth: KEIN Token-Binding — Crashes können vor/ohne Login passieren. Das
+# BUG-004-Gate greift hier nicht (kein AT-…-Segment im PFAD; das optionale
+# Bearer-Token im Header inspiziert das Gate nicht) → kein Whitelist-Eintrag
+# nötig. Größen-Cap 512 KB ist der Anti-Abuse-Layer.
+#
+# Persistenz: Supabase `ax_crash_reports` (Migration
+# supabase_migrations/20260702_crash_reports.sql — manuell im SQL-Editor
+# ausführen). Fehlt die Tabelle / ist SB down → degradiert zu Logging-only
+# (kompakte Zeile in stdout), Request gilt trotzdem als ok (Pattern wie
+# _sb_roster_snapshot_upsert).
+
+_MK_MAX_BODY_BYTES = 512 * 1024
+
+# Alert-Throttle: max. 1 Mail pro Stunde pro (kind, app build) — in-process
+# TTL-Dict (Pattern wie _ip_rate_buckets; per-Instanz reicht: Cloud Run läuft
+# hier praktisch single-instance, und im Worst Case kommen ein paar Mails mehr,
+# nie ein Sturm pro Instanz).
+_MK_ALERT_LAST_SENT = {}     # (kind, build) -> unix ts
+_MK_ALERT_TTL_SEC = 3600
+
+
+def _mk_top_frames(call_stack, limit=5):
+    """Zieht die obersten Frames aus einem MetricKit-callStackTree-JSON.
+
+    Struktur: {"callStacks": [{"callStackRootFrames": [{"binaryName": …,
+    "offsetIntoBinaryTextSegment": …, "subFrames": […]}]}]} — wir laufen die
+    erste Root-Kette entlang. Bei truncated Stacks (String statt Objekt) → [].
+    """
+    frames = []
+    try:
+        if not isinstance(call_stack, dict):
+            return frames
+        stacks = call_stack.get('callStacks') or []
+        if not stacks:
+            return frames
+        node_list = stacks[0].get('callStackRootFrames') or []
+        while node_list and len(frames) < limit:
+            node = node_list[0]
+            binary = node.get('binaryName') or '?'
+            offset = node.get('offsetIntoBinaryTextSegment')
+            frames.append(f'{binary} +{offset}' if offset is not None else binary)
+            node_list = node.get('subFrames') or []
+    except Exception:
+        pass
+    return frames
+
+
+def _mk_send_alert_email(row, top_frames):
+    """Alert-Mail an SUPPORT_NOTIFY_EMAIL via Resend (Pattern wie
+    _send_support_email_notification). Failures nur loggen."""
+    api_key = os.environ.get('RESEND_API_KEY', '').strip()
+    to_email = os.environ.get('SUPPORT_NOTIFY_EMAIL', 'miguel.schumann@icloud.com').strip()
+    if not api_key:
+        print('[mk-alert] RESEND_API_KEY nicht gesetzt — überspringe Alert-Mail')
+        return
+    try:
+        import urllib.request
+        import html as _html
+        kind = row.get('kind', '?')
+        ver = f"{row.get('app_version', '?')} ({row.get('build', '?')})"
+        payload_obj = row.get('payload') or {}
+        detail_bits = []
+        if kind == 'crash':
+            for k in ('exception_type', 'exception_code', 'signal'):
+                v = payload_obj.get(k)
+                if v is not None:
+                    detail_bits.append(f'{k}={v}')
+            if payload_obj.get('termination_reason'):
+                detail_bits.append(str(payload_obj['termination_reason'])[:200])
+        else:
+            dur = payload_obj.get('hang_duration_s')
+            if dur is not None:
+                detail_bits.append(f'hang {round(float(dur), 1)}s')
+        e = _html.escape
+        frames_html = ''.join(f'<li><code>{e(f)}</code></li>' for f in top_frames) or '<li>—</li>'
+        subject = f"[AeroX {kind.upper()}] {ver} · {row.get('os', '?')}"
+        # Subject header-safe halten (kein CRLF aus payload-Strings).
+        subject = subject.replace('\r', ' ').replace('\n', ' ')[:200]
+        html_body = (
+            f"<h2 style='font-family:sans-serif'>AeroX {e(kind)} report</h2>"
+            f"<p style='font-family:sans-serif;color:#444'>"
+            f"<b>App:</b> {e(ver)}<br>"
+            f"<b>OS:</b> {e(str(row.get('os', '?')))} · <b>Device:</b> {e(str(row.get('device', '?')))}<br>"
+            f"<b>User:</b> {e(str(row.get('user_token') or 'anonym'))}<br>"
+            f"<b>Detail:</b> {e(' · '.join(detail_bits) or '—')}"
+            f"</p>"
+            f"<p style='font-family:sans-serif'><b>Top-Frames:</b></p>"
+            f"<ol style='font-family:monospace;font-size:13px'>{frames_html}</ol>"
+            f"<p style='font-family:sans-serif;font-size:12px;color:#888'>"
+            f"Voller Report in Supabase <code>ax_crash_reports</code> "
+            f"(throttled: max. 1 Mail/h pro Kind+Build).</p>"
+        )
+        payload = json.dumps({
+            'from': 'AeroX Crash <support@aerosteuer.de>',
+            'to': [to_email],
+            'subject': subject,
+            'html': html_body,
+        }).encode()
+        req = urllib.request.Request(
+            'https://api.resend.com/emails',
+            data=payload,
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json',
+                     'User-Agent': 'AeroX-Backend/1.0'},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                print(f'[mk-alert] {kind} alert sent to {to_email}')
+            else:
+                print(f'[mk-alert] unexpected status {resp.status}')
+    except Exception as e:
+        print(f'[mk-alert] send fail: {e}')
+
+
+@app.route('/api/telemetry/diagnostics', methods=['POST'])
+def post_telemetry_diagnostics():
+    """MetricKit-Diagnostik vom iOS-Client (1 Report pro POST).
+
+    Body (JSON, vom Client auf ~256 KB gecappt):
+      kind ('crash'|'hang'), app_version, build, os, device, platform_arch,
+      ts_begin/ts_end, call_stack (callStackTree-JSON, ggf. als truncated
+      String + call_stack_truncated), crash: exception_type/-code, signal,
+      termination_reason, vm_region_info · hang: hang_duration_s.
+    Optionales Bearer-Token im Authorization-Header (kein Binding/Validierung
+    — nur zur Zuordnung gespeichert).
+    """
+    # Größen-Cap ZUERST (Content-Length wenn gesetzt, sonst gelesene Bytes) —
+    # vor jedem JSON-Parse, damit ein 50-MB-Body nicht erst geparsed wird.
+    if (request.content_length or 0) > _MK_MAX_BODY_BYTES:
+        return jsonify({'ok': False, 'error': 'payload_too_large'}), 413
+    raw = request.get_data(cache=True) or b''
+    if len(raw) > _MK_MAX_BODY_BYTES:
+        return jsonify({'ok': False, 'error': 'payload_too_large'}), 413
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({'ok': False, 'error': 'body_must_be_object'}), 400
+    kind = str(body.get('kind') or '').strip().lower()
+    if kind not in ('crash', 'hang'):
+        return jsonify({'ok': False, 'error': 'kind_must_be_crash_or_hang'}), 400
+
+    # Optionales Bearer-Token — NICHT validiert (Crash kann vor Login passieren),
+    # nur format-geprüft gespeichert, damit kein Müll in die Spalte läuft.
+    user_token = None
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer '):
+        cand = auth[7:].strip()
+        if cand.startswith('AT-') and len(cand) <= 256:
+            user_token = cand
+
+    row = {
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        'user_token': user_token,
+        'app_version': str(body.get('app_version') or '')[:64],
+        'build': str(body.get('build') or '')[:64],
+        'os': str(body.get('os') or '')[:64],
+        'device': str(body.get('device') or '')[:64],
+        'kind': kind,
+        'payload': body,
+    }
+
+    # Persistenz best-effort: Supabase-Insert; Tabelle fehlt / SB down →
+    # Logging-only-Fallback (Report ist dann wenigstens in Cloud-Run-Logs).
+    stored = False
+    if SB_AVAILABLE:
+        try:
+            def _do():
+                return sb.table('ax_crash_reports').insert(row).execute()
+            res, failed = _supabase_execute_with_timeout('mk_diag_insert', _do)
+            stored = not failed
+        except Exception as e:
+            print(f'[mk-diag] sb insert fail ({type(e).__name__}: {str(e)[:200]}) — logging only')
+    if not stored:
+        try:
+            print(f'[mk-diag] FALLBACK-LOG {json.dumps(row, ensure_ascii=False)[:4000]}')
+        except Exception:
+            print(f'[mk-diag] FALLBACK-LOG kind={kind} version={row["app_version"]} build={row["build"]}')
+
+    # Alert-Mail — throttled auf 1/h pro (kind, build).
+    top_frames = _mk_top_frames(body.get('call_stack'))
+    throttle_key = (kind, row['build'])
+    now_ts = datetime.utcnow().timestamp()
+    last = _MK_ALERT_LAST_SENT.get(throttle_key, 0)
+    if now_ts - last >= _MK_ALERT_TTL_SEC:
+        _MK_ALERT_LAST_SENT[throttle_key] = now_ts
+        if len(_MK_ALERT_LAST_SENT) > 500:   # Dict klein halten
+            _MK_ALERT_LAST_SENT.clear()
+            _MK_ALERT_LAST_SENT[throttle_key] = now_ts
+        _mk_send_alert_email(row, top_frames)
+    else:
+        print(f'[mk-diag] alert throttled (kind={kind} build={row["build"]}, '
+              f'next in {int(_MK_ALERT_TTL_SEC - (now_ts - last))}s)')
+
+    return jsonify({'ok': True, 'stored': stored})
+
+
 # ─── Voice-Notes Storage (Per-Day Audio) ────────────────────────────────────
 
 def _voice_note_path(token, datum):
