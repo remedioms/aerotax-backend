@@ -27986,6 +27986,11 @@ def _parse_ics_to_events(text):
             v = value.strip()
             if k == 'SUMMARY':
                 current['summary'] = v[:120]
+            elif k == 'DESCRIPTION':
+                # SWISS trägt hier die EXPLIZITE Report-/Dep-/Arr-Zeit
+                # ("Reporting time: 11:15 (09:15Z)…"). RFC-5545-Zeilenfaltung ist
+                # via _ics_unfold_lines schon entfernt; literale \n bleiben drin.
+                current['description'] = v[:400]
             elif k == 'LOCATION':
                 current['location'] = v[:80]
             elif k == 'STATUS':
@@ -28182,6 +28187,44 @@ def _ics_parse_flight_leg_summary(summary):
     return flight, frm, to
 
 
+# ── SWISS-Roster-Format ──────────────────────────────────────────────────────
+# SWISS (schedule.swiss.com) nutzt ein ANDERES iCal-Format als LH-myTime:
+#   SUMMARY:LX1270 ZRH 1236 CPH 1413 32B [MC]
+#     = <flightno> <depIATA> <depHHMM> <arrIATA> <arrHHMM> <acType> [<crewpos>]
+#   (lokale HHMM, KEIN Bindestrich; ein „+1" am Ankunfts-HHMM = Folgetag).
+#   DESCRIPTION:Reporting time: 11:15 (09:15Z)\nDeparture time: …  (explizit!)
+#   CATEGORIES:SWISS DUTY SCHEDULE
+# Diese Helfer laufen PARALLEL zum LH-Pfad — der LH-Code bleibt unberührt.
+_SWISS_FLIGHT_RE = re.compile(
+    r'^\s*(LX\d+)\s+([A-Z]{3})\s+(\d{4})\s+([A-Z]{3})\s+(\d{4})(\+\d+)?', re.I)
+
+
+def _ics_is_swiss_flight(summary):
+    """True wenn `summary` das SWISS-Flug-Muster hat (LX + zwei IATA/HHMM-Paare)."""
+    return bool(summary and _SWISS_FLIGHT_RE.match(summary.strip()))
+
+
+def _ics_parse_swiss_flight(summary):
+    """SWISS-Flug-SUMMARY → (flight, from_iata, to_iata) oder (None,None,None).
+    Erkennt „LX1270 ZRH 1236 CPH 1413 32B [MC]" (space-separiert, kein „-")."""
+    m = _SWISS_FLIGHT_RE.match((summary or '').strip())
+    if not m:
+        return None, None, None
+    return m.group(1).upper(), m.group(2).upper(), m.group(4).upper()
+
+
+def _ics_swiss_report_local(description):
+    """Liest die explizite SWISS-Report-Zeit („Reporting time: 11:15 (…)") aus
+    der DESCRIPTION → „HH:MM" (lokal) oder None. Fortsetzungszeilen/literale \\n
+    stören nicht, solange die „Reporting time: HH:MM"-Sequenz intakt ist."""
+    if not description:
+        return None
+    m = re.search(r'Reporting time:\s*(\d{1,2}):(\d{2})', description, re.I)
+    if not m:
+        return None
+    return '%02d:%02d' % (int(m.group(1)), int(m.group(2)))
+
+
 def _ics_events_to_briefings(events, existing=None):
     """Konsumiert Event-Liste → dict[datum_str → briefing_dict]. F2 expandiert
     Multi-Day-Events auf alle Tage, F5 merged Same-Day-Events.
@@ -28334,6 +28377,18 @@ def _ics_events_to_briefings(events, existing=None):
             existing_b['ical_start_iso'] = merged_start
             existing_b['ical_end_iso'] = merged_end
             existing_b['ical_imported_at'] = datetime.now().isoformat()
+            # SWISS: die EXPLIZITE Report-Zeit aus der DESCRIPTION („Reporting
+            # time: 11:15") als LH-Stil-Briefing-Token dem SUMMARY voranstellen —
+            # so liest der iOS-Client (briefingTimeFromSummary/reportTime) die echte
+            # Report-Zeit statt der −45/−60-Heuristik (SWISS-DTSTART = Abflug, NICHT
+            # Report). NUR einmal/Tag (nur das erste Leg trägt die Reporting-Zeit);
+            # bewusst NICHT in `day_summary` (sonst bräche _ev_is_flight_leg → Block).
+            if _ics_is_swiss_flight(summary):
+                _rep = _ics_swiss_report_local(ev.get('description'))
+                _cur = existing_b.get('ical_summary') or ''
+                if _rep and 'Briefing' not in _cur:
+                    _dep = _ics_parse_swiss_flight(summary)[1] or ''
+                    existing_b['ical_summary'] = (f"{_rep} LT Briefing {_dep} · {_cur}")[:200]
             # EASA-Block-Minuten: NUR echte Flug-Legs (Gate-to-Gate DTSTART→DTEND),
             # summiert über Same-Day-Merges. Kein Deadhead/Briefing/Layover/
             # Standby. iOS nutzt block_minutes statt der Duty-Spanne als Block.
@@ -28421,14 +28476,19 @@ def _build_ical_sectors(events):
             continue
         summ = (ev.get('summary') or '').upper()
         loc = (ev.get('location') or '').upper()
-        m = re.search(r'([A-Z]{2,3}\s*\d{1,4})\s*:?\s*([A-Z]{3})\s*-\s*([A-Z]{3})', summ)
-        if m:
-            flight = re.sub(r'\s+', '', m.group(1)); frm = m.group(2); to = m.group(3)
+        # SWISS-Format zuerst (space-separiert, kein „-"): „LX1270 ZRH 1236 CPH …".
+        sw_flt, sw_frm, sw_to = _ics_parse_swiss_flight(summ)
+        if sw_frm and sw_to:
+            flight = sw_flt; frm = sw_frm; to = sw_to
         else:
-            ml = re.search(r'\b([A-Z]{3})\s*-\s*([A-Z]{3})\b', loc)
-            if not ml:
-                continue
-            flight = None; frm = ml.group(1); to = ml.group(2)
+            m = re.search(r'([A-Z]{2,3}\s*\d{1,4})\s*:?\s*([A-Z]{3})\s*-\s*([A-Z]{3})', summ)
+            if m:
+                flight = re.sub(r'\s+', '', m.group(1)); frm = m.group(2); to = m.group(3)
+            else:
+                ml = re.search(r'\b([A-Z]{3})\s*-\s*([A-Z]{3})\b', loc)
+                if not ml:
+                    continue
+                flight = None; frm = ml.group(1); to = ml.group(2)
         sec_by_day.setdefault(d, []).append({
             'flight': flight, 'from': frm, 'to': to,
             'dep_iso': (ev.get('start_iso') or ''), 'arr_iso': (ev.get('end_iso') or ''),
