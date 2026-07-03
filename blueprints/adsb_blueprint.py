@@ -602,7 +602,9 @@ ADSB_LOL_URL = "https://api.adsb.lol/v2/icao"
 OPENSKY_TIMEOUT = 3
 OPENSKY_FLIGHTS_TIMEOUT = 6
 ADSB_LOL_TIMEOUT = 5
-OPENSKY_TOKEN_TIMEOUT = 6
+OPENSKY_TOKEN_TIMEOUT = 15  # Token 25min gecacht → einmaliger Fetch darf länger
+                            # dauern; 6s war zu knapp für den Keycloak-TLS-
+                            # Handshake (oauth_token_fetch_FAIL: timed out).
 USER_AGENT = "AeroTax-Backend/1.1 (ADS-B-Proxy; mailto:ops@aerotax.de)"
 
 # In-Process OAuth2-Token-Cache (zusätzlich zum persistenten poll_state-Cache).
