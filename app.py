@@ -14625,7 +14625,11 @@ def _sb_roster_snapshot_load(token):
         def _do():
             return sb.table('roster_snapshots').select('payload').eq(
                 'token', token).limit(1).execute()
-        r = _supabase_execute_with_timeout('roster_snapshot_load', _do)
+        # _supabase_execute_with_timeout liefert (result, timed_out) — das Tupel
+        # MUSS entpackt werden. Vorher: getattr(tuple,'data') == None → der SB-
+        # Snapshot-Read lieferte IMMER None → friends-today/friend-roster sahen
+        # nie einen Roster-Tag (Symptom: Friend im Layover als „Basis <Homebase>").
+        r, _timed_out = _supabase_execute_with_timeout('roster_snapshot_load', _do)
         rows = getattr(r, 'data', None) or []
         if rows:
             return rows[0].get('payload')
