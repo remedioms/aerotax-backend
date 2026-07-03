@@ -6569,6 +6569,13 @@ def full_health_check():
         'delay_obs_write_fail_count': _delay_obs_write_fail_count,
         'delay_obs_load_fail_count':  _delay_obs_load_fail_count,
         'delay_obs_last_error':       (_delay_obs_last_error or None),
+        # Requeue-Puffer (endgültig gescheiterte Writes, warten auf Flush beim
+        # nächsten Persist-Durchlauf). pending > 0 ⇒ SB war/ist down, Rows sind
+        # NICHT verloren solange die Instanz lebt.
+        'delay_obs_pending':          len(_delay_obs_pending),
+        'delay_obs_requeued_total':   _delay_obs_requeue_count,
+        'delay_obs_flushed_total':    _delay_obs_flush_ok_count,
+        'delay_obs_pending_dropped':  _delay_obs_pending_dropped,
         'aircraft': _aircraft_persist,
     }
     overall = 'ok' if all(v == 'ok' for k, v in health.items() if k not in ('timestamp', 'server', 'heif', 'persistence')) else 'degraded'
@@ -25226,6 +25233,14 @@ def _departed_rows_from_store(airport):
             al, _num = _split_flightno(fn)
         except Exception:
             al = (fn[:2] if fn else '')
+        # „Unbekannt ≠ Pünktlich" (LH400-Bug): delay_min nur ausgeben, wenn der
+        # Delay WIRKLICH beobachtet wurde (Meta-Flag aus dem Merge ODER Signal-
+        # Rekonstruktion esti/IST-Status/delay>0/cancelled) — sonst null, damit
+        # iOS ehrlich „keine Daten" zeigt statt „Pünktlich".
+        md_i = int(max_delay or 0)
+        known = _obs_delay_known(md_i, cancelled, meta.get('esti'),
+                                 meta.get('status'), is_arr,
+                                 flag=meta.get('delay_known'))
         # VOLLE Felder aus dem Meta-Store (dest/gate/terminal/esti) — so zeigt die
         # „Früher heute"-Ansicht von→nach + Gate, nicht nur die nackte Flugnummer.
         rows.append({
@@ -25233,8 +25248,9 @@ def _departed_rows_from_store(airport):
             'dest_iata': (meta.get('dest_iata') or ''),
             'dest_name': (meta.get('dest_name') or ''),
             'sched': today + 'T' + sc + ':00', 'esti': (meta.get('esti') or None),
-            'delay_min': int(max_delay or 0),
-            'delayed': int(max_delay or 0) >= _PUNCTUALITY_DELAY_THRESHOLD_MIN,
+            'delay_min': (md_i if known else None),
+            'delay_known': known,
+            'delayed': bool(known and md_i >= _PUNCTUALITY_DELAY_THRESHOLD_MIN),
             'cancelled': cancelled,
             'gate': (meta.get('gate') or ''),
             'terminal': (meta.get('terminal') or ''), 'hall': '',
@@ -25281,9 +25297,9 @@ def ax_route_history(frm, to):
     base = _airport_local_now(store_key)
     if base is None:
         return jsonify({'ok': True, 'origin': board_ap, 'dest': to, 'days': ndays,
-                        'on_time_pct': None, 'total': 0, 'recent_days': [],
-                        'source': 'airport_delay_obs'})
-    on_time = late = cancelled_cnt = total = 0
+                        'on_time_pct': None, 'total': 0, 'unknown': 0,
+                        'recent_days': [], 'source': 'airport_delay_obs'})
+    on_time = late = cancelled_cnt = total = unknown_cnt = 0
     days_out = []
     for i in range(ndays):
         d = (base - _td(days=i)).strftime('%Y-%m-%d')
@@ -25314,6 +25330,14 @@ def ax_route_history(frm, to):
                 if (r.get('dest_iata') or '').upper() != match:
                     continue
                 fn_key = (r.get('flight') or '').replace(' ', '').upper()
+                # „Unbekannt ≠ Pünktlich" (LH400): die Row-Builder liefern
+                # delay_min bereits als None + delay_known=False, wenn der Delay
+                # NIE wirklich beobachtet wurde (nur vor Abflug gesehen, kein
+                # esti/IST-Status). So eine Zeile wird 'unknown' — sie zählt
+                # NICHT als pünktlich und fliegt aus dem Quoten-Nenner (total
+                # bleibt als Info erhalten).
+                known = bool(r.get('delay_known',
+                                   r.get('delay_min') is not None))
                 delay = int(r.get('delay_min') or 0)
                 canc = bool(r.get('cancelled'))
                 prev = by_fn.get(fn_key) if fn_key else None
@@ -25321,17 +25345,20 @@ def ax_route_history(frm, to):
                     if prev is not None:
                         continue   # doppelte Row derselben Seite → wie bisher skip
                     status = ('cancelled' if canc else
+                              'unknown' if not known else
                               'ontime' if delay <= 15 else
                               'minor' if delay <= 45 else 'late')
                     entry = {'flight': r.get('flight'),
                              'airline': r.get('airline'),
-                             'sched': r.get('sched'), 'delay_min': delay,
+                             'sched': r.get('sched'),
+                             'delay_min': (delay if known else None),
+                             'delay_known': known,
                              'cancelled': canc, 'status': status,
                              'obs': side}
                     if side == 'dep':
-                        entry['dep_delay_min'] = delay
+                        entry['dep_delay_min'] = (delay if known else None)
                     else:
-                        entry['arr_delay_min'] = delay
+                        entry['arr_delay_min'] = (delay if known else None)
                         entry['sched_arr'] = r.get('sched')
                     if fn_key:
                         by_fn[fn_key] = entry
@@ -25340,21 +25367,32 @@ def ax_route_history(frm, to):
                     if prev.get('obs') != 'dep':
                         continue   # zweite arr-Row derselben Flugnummer → skip
                     # arr-Row zu bestehendem dep-Eintrag → MERGEN statt droppen.
-                    prev['arr_delay_min'] = delay
+                    prev['arr_delay_min'] = (delay if known else None)
                     prev['sched_arr'] = r.get('sched')
                     prev['cancelled'] = bool(prev.get('cancelled')) or canc
-                    prev['delay_min'] = delay          # arr = beste Zahl
-                    prev['status'] = ('cancelled' if prev['cancelled'] else
-                                      'ontime' if delay <= 15 else
-                                      'minor' if delay <= 45 else 'late')
                     prev['obs'] = 'both'
-        # Quote NACH dem Merge zählen (ein Flug = eine Stimme, arr-Delay gewinnt
-        # bei 'both' — vorher wurde beim Append gezählt und der Merge hätte
-        # doppelt/falsch gezählt).
+                    # arr = beste Zahl — aber NUR wenn die arr-Seite den Delay
+                    # KENNT: arr known schlägt dep unknown (LH400: dep 0-ohne-
+                    # Wissen, arr +86 → 86 gewinnt) UND dep known bleibt gegen
+                    # eine arr-Seite ohne Wissen stehen.
+                    if known:
+                        prev['delay_min'] = delay
+                        prev['delay_known'] = True
+                    if prev['cancelled']:
+                        prev['status'] = 'cancelled'
+                    elif not prev.get('delay_known'):
+                        prev['status'] = 'unknown'
+                    elif known:
+                        prev['status'] = ('ontime' if delay <= 15 else
+                                          'minor' if delay <= 45 else 'late')
+        # Quote NACH dem Merge zählen (ein Flug = eine Stimme; nur Flüge mit
+        # echtem Urteil in den Nenner — 'unknown' ist Info, keine Pünktlichkeit).
         for e in flights:
             total += 1
             if e.get('cancelled'):
                 cancelled_cnt += 1
+            elif not e.get('delay_known'):
+                unknown_cnt += 1
             elif int(e.get('delay_min') or 0) <= 15:
                 on_time += 1
             else:
@@ -25364,10 +25402,14 @@ def ax_route_history(frm, to):
             # Sortierung bleibt chronologisch-genug fürs Tages-Listing.
             flights.sort(key=lambda f: (f.get('sched') or ''))
             days_out.append({'date': d, 'count': len(flights), 'flights': flights})
-    pct = round(100 * on_time / total) if total else None
+    # Nenner = nur Flüge mit echtem Urteil (on_time/late/cancelled) — 'unknown'
+    # fliegt raus, sonst drückten nie-bestätigte 0-Rows die Quote künstlich hoch.
+    judged = on_time + late + cancelled_cnt
+    pct = round(100 * on_time / judged) if judged else None
     return jsonify({'ok': True, 'origin': board_ap, 'dest': to, 'days': ndays,
                     'on_time_pct': pct, 'total': total, 'on_time': on_time,
                     'late': late, 'cancelled': cancelled_cnt,
+                    'unknown': unknown_cnt,
                     'recent_days': days_out, 'source': 'airport_delay_obs'})
 
 
@@ -25660,12 +25702,25 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
     arr_delay = _d(arr_row)
     dep_cxl = bool((dep_row or {}).get('cancelled'))
     arr_cxl = bool((arr_row or {}).get('cancelled'))
+    # „Unbekannt ≠ Pünktlich" (LH400): weiß die jeweilige Seite ihren Delay
+    # WIRKLICH? Obs-Rows tragen das Flag ('delay_known' aus den Row-Buildern),
+    # Live-Rows werden aus esti/IST-Status beurteilt (+ Kriterium (c): noch im
+    # Live-Feed nach sched+Puffer sichtbar = bestätigt pünktlich).
+    dep_known = _row_delay_known(dep_row, False, src=dep_src, ap=dep)
+    arr_known = _row_delay_known(arr_row, True, src=arr_src, ap=arr)
     # Beste Ein-Zahl für Konsumenten, die nur eine zeigen: der Ankunfts-Delay ist
-    # die ehrlichere Metrik (D15-OTP), wenn die arr-Seite beobachtet wurde.
-    if arr_row is not None:
+    # die ehrlichere Metrik (D15-OTP) — aber nur eine Seite mit BEKANNTEM Delay
+    # darf sie liefern: arr known schlägt dep unknown (LH400: dep-Row 0-ohne-
+    # Wissen, arr-Row +86 → 86) UND dep known schlägt arr unknown. Wissen beide
+    # nichts → delay_min None (iOS zeigt neutral statt „Pünktlich").
+    if arr_row is not None and arr_known:
         best_delay, delay_side = arr_delay, 'arr'
-    else:
+    elif dep_row is not None and dep_known:
         best_delay, delay_side = dep_delay, 'dep'
+    elif arr_row is not None:
+        best_delay, delay_side = None, 'arr'
+    else:
+        best_delay, delay_side = None, 'dep'
     rec = {
         'ok': True, 'flight': fn,
         'date': (date_q or (_s(dep_row, 'sched') or _s(arr_row, 'sched') or '')[:10] or None),
@@ -25675,18 +25730,23 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         'origin_name': _s(arr_row, 'dest_name'),    # arr-Row.dest_name = Herkunft
         # dep-Seite (Zeiten in Ortszeit des Abflug-Flughafens, wie die Boards).
         'sched_dep': _s(dep_row, 'sched'), 'esti_dep': _s(dep_row, 'esti'),
-        'dep_delay_min': (dep_delay if dep_row is not None else None),
+        # dep-/arr_delay_min: null wenn die Seite fehlt ODER ihren Delay nicht
+        # wirklich kennt (nur-vor-Abflug-0 ist KEIN „pünktlich").
+        'dep_delay_min': (dep_delay if (dep_row is not None and dep_known)
+                          else None),
         'gate_dep': _s(dep_row, 'gate'), 'terminal_dep': _s(dep_row, 'terminal'),
         'status_dep': _s(dep_row, 'status'), 'dep_cancelled': dep_cxl,
         # arr-Seite (Zeiten in Ortszeit des Ziel-Flughafens).
         'sched_arr': _s(arr_row, 'sched'), 'esti_arr': _s(arr_row, 'esti'),
-        'arr_delay_min': (arr_delay if arr_row is not None else None),
+        'arr_delay_min': (arr_delay if (arr_row is not None and arr_known)
+                          else None),
         'gate_arr': _s(arr_row, 'gate'), 'terminal_arr': _s(arr_row, 'terminal'),
         'status_arr': _s(arr_row, 'status'), 'arr_cancelled': arr_cxl,
         # Merged-Sicht.
         'status': _s(arr_row, 'status') or _s(dep_row, 'status'),
         'cancelled': (dep_cxl or arr_cxl),
         'delay_min': best_delay, 'delay_side': delay_side,
+        'delay_known': bool(dep_known or arr_known),
         'reg': _s(dep_row, 'reg') or _s(arr_row, 'reg'),
         'aircraft': _s(dep_row, 'aircraft') or _s(arr_row, 'aircraft'),
         'sides': {'dep': dep_src, 'arr': arr_src},
@@ -25800,6 +25860,13 @@ def ax_flight_info(flightno):
             if rows:
                 o = dep or rows[0]
                 o = dict(o)
+                # „Unbekannt ≠ Pünktlich" (LH400): max_delay_min 0 ohne jedes
+                # Signal (kein esti, kein IST-Status) heißt NICHT pünktlich —
+                # dann delay_min: null, iOS zeigt neutral statt „Pünktlich".
+                obs_is_arr = '#' in (o.get('airport') or '')
+                obs_known = _obs_delay_known(
+                    o.get('max_delay_min'), o.get('cancelled'),
+                    o.get('esti'), o.get('status'), obs_is_arr)
                 o['airport'] = (o.get('airport') or '').split('#', 1)[0]   # Store-Key säubern
                 # Letzte beobachtete Maschine: jüngster Record mit reg/type.
                 ac_row = next((x for x in rows if (x.get('reg') or x.get('type_code'))), None)
@@ -25817,7 +25884,9 @@ def ax_flight_info(flightno):
                     'dest_name': o.get('dest_name'), 'airline': o.get('airline'),
                     'gate': o.get('gate'), 'terminal': o.get('terminal'),
                     'status': o.get('status'), 'sched': o.get('sched'),
-                    'esti': o.get('esti'), 'delay_min': o.get('max_delay_min'),
+                    'esti': o.get('esti'),
+                    'delay_min': (o.get('max_delay_min') if obs_known else None),
+                    'delay_known': obs_known,
                     'cancelled': o.get('cancelled'), 'date': o.get('date'),
                     'reg': (ac_row or {}).get('reg'),
                     'type': (ac_row or {}).get('type_code'),
@@ -27510,6 +27579,96 @@ def _flight_sched_passed(f, now_local):
     return sdt <= now_local
 
 
+# ── Daten-Ehrlichkeit: „Unbekannt ≠ Pünktlich" (2026-07-03, LH400-Bug) ───────
+# airport_delay_obs hält max_delay_min als int — 0 heißt dort aber ZWEIERLEI:
+# „nachweislich pünktlich" ODER „nie ein Delay-Signal gesehen". Flüge stehen im
+# +27h-Feed schon VOR Abflug (delay 0 mangels esti); geht das finale Update
+# (esti/departed) in einer Poll-Lücke/SB-Flake verloren, blieb fälschlich 0 =
+# App sagte „Pünktlich" ohne jedes Wissen (LH400 FRA→JFK 2026-07-02: real +86,
+# dep-Row sagte 0). Diese Helfer entscheiden, ob eine Beobachtung ihren Delay
+# WIRKLICH kennt:
+#   (a) es gab ein Delay-Signal (esti gesetzt ODER max_delay > 0),
+#   (b) die Row wurde mit IST-Status beobachtet (departed/landed/„Pünktlich"),
+#   (c) der Flug war bis sched+_DELAY_KNOWN_CONFIRM_MIN noch im LIVE-Feed
+#       sichtbar ohne esti → echtes „pünktlich" (nur zur Beobachtungszeit
+#       feststellbar — siehe _merge_into_delay_store bzw. src=='live' in
+#       _row_delay_known; aus alten SB-Rows NICHT rekonstruierbar).
+# Cancelled zählt immer als bekannt. Alles andere = UNBEKANNT → die Read-Seite
+# liefert delay_min: null statt 0 (iOS zeigt „keine Daten" statt „Pünktlich").
+_DELAY_KNOWN_CONFIRM_MIN = 20   # Min. nach sched: „noch sichtbar ohne esti" = bestätigt pünktlich
+
+# IST-Status-Marker (substring, lowercase) — Abflug- vs. Ankunfts-Kontext ist
+# KRITISCH: bei einer ANKUNFTS-Row heißt „departed/unterwegs" nur, dass der
+# Flieger seinen HERKUNFTS-Airport verlassen hat — der ANKUNFTS-Delay (die
+# Metrik dieser Row) ist damit noch unbekannt. Deutsch UND Englisch, weil die
+# Quellen gemischt normalisieren (Fraport→DE, native/EU-Scraper teils EN).
+_DELAY_KNOWN_STATUS_DEP = ('abgeflogen', 'gestartet', 'departed', 'airborne',
+                           'lifted', 'pünktlich', 'punktlich', 'on time',
+                           'ontime')
+_DELAY_KNOWN_STATUS_ARR = ('gelandet', 'landed', 'arrived', 'on position',
+                           'on blocks', 'at gate', 'pünktlich', 'punktlich',
+                           'on time', 'ontime')
+
+
+def _obs_status_actual(status, is_arr):
+    """True wenn der Status ein IST-/Abschluss-Status der jeweiligen Seite ist
+    (Kriterium (b)). 'Verspätet' OHNE esti zählt bewusst NICHT — dann wissen wir
+    zwar „spät", aber nicht WIE spät (Wert bleibt unbekannt, ehrlich)."""
+    s = (status or '').strip().lower()
+    if not s:
+        return False
+    markers = _DELAY_KNOWN_STATUS_ARR if is_arr else _DELAY_KNOWN_STATUS_DEP
+    return any(m in s for m in markers)
+
+
+def _obs_delay_known(max_delay, cancelled, esti, status, is_arr, flag=None):
+    """True = der Delay dieser Beobachtung ist WIRKLICH bekannt (Regeln oben).
+    `flag` = explizites delay_known aus dem Meta-Store; nur True zählt — ein
+    fehlendes/False-Flag fällt auf die Signal-Rekonstruktion zurück, damit
+    SB-geladene Alt-Rows (ohne Flag, das Flag ist nicht persistierbar — die
+    Tabelle hat keine jsonb-Spalte, kein DDL) mit esti/IST-Status weiterhin
+    als bekannt gelten."""
+    if flag:
+        return True
+    if cancelled:
+        return True
+    try:
+        if int(max_delay or 0) > 0:
+            return True
+    except Exception:
+        pass
+    if isinstance(esti, str) and esti.strip():
+        return True
+    return _obs_status_actual(status, is_arr)
+
+
+def _row_delay_known(row, is_arr, src=None, ap=None):
+    """delay_known einer ZEILE im Row-Builder-/Board-Format. Obs-Zeilen tragen
+    das Flag bereits ('delay_known' aus _departed_rows_from_store /
+    _board_rows_from_obs_for_date); Live-Zeilen werden aus ihren Signalen
+    beurteilt + Kriterium (c): noch im Live-Feed sichtbar nach sched+Puffer
+    ohne esti = bestätigt pünktlich (NUR src=='live' — für Warehouse-Rows wäre
+    „jetzt > sched" trivialerweise immer wahr und damit gelogen)."""
+    if row is None:
+        return False
+    flag = row.get('delay_known')
+    if flag is not None:
+        return bool(flag)
+    if _obs_delay_known(row.get('delay_min'), row.get('cancelled'),
+                        row.get('esti'), row.get('status'), is_arr):
+        return True
+    if src == 'live':
+        try:
+            from datetime import timedelta as _tdk
+            sdt = _parse_local_iso(row.get('sched'))
+            nl = _airport_local_now(ap) if ap else None
+            if sdt is not None and nl is not None:
+                return nl >= sdt + _tdk(minutes=_DELAY_KNOWN_CONFIRM_MIN)
+        except Exception:
+            pass
+    return False
+
+
 # Tages-keyed Verspätungs-Store: (date_str, flight_no, sched_hhmm) → max beobachtete Verspätung (min).
 # Wird bei jedem Board-Rebuild gemergt (nur max, nie zurückgesetzt bis 05:00 Rollover).
 _delay_store: dict = {}
@@ -27535,6 +27694,177 @@ _delay_obs_write_ok_count: int = 0
 _delay_obs_load_fail_count: int = 0
 _delay_obs_last_error: str = ''
 
+# ── Requeue-Puffer für endgültig gescheiterte Warehouse-Writes (2026-07-03) ──
+# Root-Cause-Nachwehe des RemoteProtocolError-Vorfalls: scheitert ein Row-Upsert
+# TROTZ der Transport-Retries (längerer SB-Ausfall), war die Beobachtung bisher
+# STILL weg — der In-Memory-Store stirbt mit der Instanz (Deploys!), FRA hatte
+# dadurch 08:00–10:00 lokal keine Flüge im Warehouse. Jetzt landet jede endgültig
+# gescheiterte Row in dieser begrenzten FIFO-Deque und wird beim nächsten
+# Persist-Durchlauf (Scheduler-Poll /api/internal/scrape-boards, jeder
+# _merge_into_delay_store, EU-Fill) ZUERST erneut geschrieben. Der Upsert ist
+# idempotent (UPDATE-dann-INSERT auf den Key date/airport/flight/sched), ein
+# Doppel-Write konvergiert also.
+#
+# EHRLICHE GRENZE: der Puffer ist in-process/in-memory — ein Instanz-Neustart
+# oder Deploy während eines SB-Ausfalls verliert ihn. Das ist bewusst so (kein
+# Disk-Spool auf Cloud-Run-ephemeral); der Puffer überbrückt den häufigen Fall
+# "SB minutenlang down, Instanz lebt weiter".
+import collections as _dobs_collections
+_DELAY_OBS_PENDING_CAP = 2000          # FIFO-Cap: Ältestes fliegt (mit Log)
+_DELAY_OBS_PENDING_MAX_AGE_S = 24 * 3600  # älter als 24h → Drop (mit Log)
+_delay_obs_pending: _dobs_collections.deque = _dobs_collections.deque()
+# Deque-Ops sind GIL-atomar, aber Drain+Re-Add im Flush braucht einen Lock
+# (Poller-Thread vs. Request-Threads schreiben beide). Zweiter Lock als
+# Flush-Guard, damit zwei parallele Poll-Durchläufe nicht denselben Batch
+# doppelt abarbeiten (non-blocking acquire → einer flusht, der andere skippt).
+_delay_obs_pending_lock = _req_threading.Lock()
+_delay_obs_flush_guard = _req_threading.Lock()
+_delay_obs_requeue_count: int = 0      # Diagnose (kumulativ eingereiht)
+_delay_obs_flush_ok_count: int = 0     # Diagnose (kumulativ nachgeholt)
+_delay_obs_pending_dropped: int = 0    # Diagnose (Cap-/Alters-Drops)
+
+# ── Finalizer: die delay_known=False-Liste aktiv leerräumen (2026-07-03) ──────
+# OWNER-DIREKTIVE „Es muss einfach funktionieren, dann ist es immer richtig":
+# delay_known ist ab jetzt die ARBEITSLISTE eines Finalizers, KEIN User-Label.
+# Jeder Flug, der real längst ab/gelandet ist, aber ohne bestätigten Delay-Wert
+# im Store hängt, wird VOR dem User aktiv aufgelöst — zuerst gratis (Gegenseite/
+# gecachte Boards/OpenSky-ADS-B), und wenn nach sched+GIVEUP_H trotzdem keine
+# Quelle etwas meldet, konservativ als pünktlich (delay_min=0) GESCHLOSSEN statt
+# ewig unbekannt zu bleiben. Läuft am Ende jedes /scrape-boards-Ticks (~15 min).
+_DELAY_FINALIZE_AFTER_MIN = 45         # sched + 45min lokal → Flug ist real durch
+_DELAY_STALE_GIVEUP_H = 6              # sched + 6h ohne Quelle → als pünktlich (0) schließen
+# Obergrenze fürs Scannen: Rows, die älter als _DELAY_FINALIZE_MAX_AGE_H nach sched
+# sind, werden GAR NICHT mehr als Kandidat aufgenommen. Grund: sie sind längst durch,
+# ein Delay-Wert kommt garantiert nicht mehr, und ein gaveup=0-Abschluss ist nach
+# Instanz-Restart NICHT als „bekannt" rekonstruierbar (airport_delay_obs hat keine
+# delay_known-jsonb-Spalte; _obs_delay_known liest delay_min=0 wieder als „unbekannt").
+# Ohne diese Grenze re-gaveupt jeder Restart alle heutigen offenen Rows erneut
+# (1 WARNING + 1 SB-Write pro Row pro Restart). Es gehen KEINE echten Delays verloren:
+# Rows mit echtem Delay>0 / cancelled / esti / actual-status sind bereits delay_known
+# und werden VOR dem Alters-Gate aussortiert — nur signal-lose Rows erreichen es, und
+# die werden ohnehin als pünktlich (0) geschlossen.
+_DELAY_FINALIZE_MAX_AGE_H = 12         # sched + 12h → nicht mehr scannen (durch, kein Re-Gaveup)
+_DELAY_FINALIZE_OPENSKY_CAP = 40       # max OpenSky-Airport/Richtungs-Fetches pro Durchlauf
+# Hartes Tages-Sub-Cap: der Finalizer zieht aus DEMSELBEN OPENSKY_FILL_DAILY_CAP-Topf
+# (1500/Tag) wie die EU-Warehouse-Fill (_opensky_fill_airport). Über ~96 Läufe/Tag
+# könnte er den Topf sonst leerfressen und die EU-Fill aushungern. Darum darf der
+# Finalizer HÖCHSTENS _DELAY_FINALIZE_OPENSKY_DAILY OpenSky-Fetches/Tag machen —
+# geprüft VOR dem Fetch. Bei 400 bleiben garantiert ≥ 1100 des Topfes für die
+# EU-Fill übrig, egal in welcher Reihenfolge die beiden laufen. Die gratis
+# Crossside-/Boards-Auflösung ist davon NICHT betroffen (kein Spend).
+_DELAY_FINALIZE_OPENSKY_DAILY = 400    # max OpenSky-Fetches/Tag (Reserve für EU-Fill)
+_DELAY_FINALIZE_OS_BUDGET = {'day': '', 'calls': 0}  # prozess-lokaler Tageszähler
+_DELAY_FINALIZE_MAX_ROWS = 300         # Soft-Cap verarbeiteter Unknowns pro Durchlauf (FIFO)
+_delay_finalize_ok_count: int = 0      # Diagnose (kumulativ aufgelöst)
+_delay_finalize_gaveup_count: int = 0  # Diagnose (kumulativ als pünktlich geschlossen)
+# Non-blocking Guard wie beim Flush: zwei parallele Poll-Durchläufe sollen den
+# Finalizer nicht doppelt fahren; Netz-Calls laufen außerhalb jedes Store-Locks.
+_delay_finalize_guard = _req_threading.Lock()
+
+
+def _delay_finalize_opensky_budget_ok(inc=0):
+    """Tages-Sub-Budget-Guard für die OpenSky-Fetches des Finalizers. Zählt die
+    Fetches des Finalizers separat (prozess-lokal, UTC-Tag) und deckelt sie hart
+    auf _DELAY_FINALIZE_OPENSKY_DAILY — VOR dem Fetch geprüft. So kann der
+    Finalizer höchstens diesen Anteil des gemeinsamen OPENSKY_FILL_DAILY_CAP-Topfes
+    verbrauchen; der Rest bleibt garantiert der EU-Warehouse-Fill. Mit inc>0 wird
+    gezählt. True solange noch Finalizer-Sub-Budget frei ist."""
+    import time as _t
+    day = _t.strftime('%Y%m%d', _t.gmtime())
+    if _DELAY_FINALIZE_OS_BUDGET['day'] != day:
+        _DELAY_FINALIZE_OS_BUDGET['day'] = day
+        _DELAY_FINALIZE_OS_BUDGET['calls'] = 0
+    if inc:
+        _DELAY_FINALIZE_OS_BUDGET['calls'] += inc
+    return _DELAY_FINALIZE_OS_BUDGET['calls'] < _DELAY_FINALIZE_OPENSKY_DAILY
+
+
+def _delay_obs_requeue(date_str, fn, hhmm, max_delay, cancelled, airport,
+                       status, meta):
+    """Reiht eine endgültig gescheiterte Delay-Beobachtung in den Pending-Puffer
+    ein (FIFO, Cap → ältester Eintrag fliegt LAUT raus). Läuft nur aus dem
+    except-Pfad von _delay_obs_write_through — nie aus dem Flush selbst."""
+    global _delay_obs_requeue_count, _delay_obs_pending_dropped
+    dropped = 0
+    with _delay_obs_pending_lock:
+        while len(_delay_obs_pending) >= _DELAY_OBS_PENDING_CAP:
+            _delay_obs_pending.popleft()
+            dropped += 1
+        _delay_obs_pending.append({
+            'ts': time.time(),
+            'date_str': date_str, 'fn': fn, 'hhmm': hhmm,
+            'max_delay': max_delay, 'cancelled': cancelled,
+            'airport': airport, 'status': status,
+            'meta': dict(meta or {}),
+        })
+        pending_n = len(_delay_obs_pending)
+    _delay_obs_requeue_count += 1
+    if dropped:
+        _delay_obs_pending_dropped += dropped
+        app.logger.warning(
+            f'[delay-obs] pending buffer FULL (cap={_DELAY_OBS_PENDING_CAP}) — '
+            f'dropped {dropped} oldest rows')
+    app.logger.warning(
+        f'[delay-obs] requeued 1 rows (pending={pending_n}) '
+        f'date={date_str} airport={airport} flight={fn} sched={hhmm}')
+
+
+def _delay_obs_flush_pending():
+    """Flusht den Pending-Puffer nach airport_delay_obs — wird zu Beginn JEDES
+    Persist-Durchlaufs gerufen (_merge_into_delay_store, _scrape_boards_once,
+    _opensky_fill_airport), also spätestens beim nächsten Scheduler-Poll.
+    Erfolgreich geschriebene Einträge verlassen den Puffer; erneut gescheiterte
+    bleiben (FIFO-Reihenfolge erhalten); älter als 24h → Drop mit Log.
+    Idempotent (Upsert per Key) → ein doppelter Flush konvergiert. No-op wenn
+    der Puffer leer ist (der Normalfall — nur ein len-Check)."""
+    global _delay_obs_flush_ok_count, _delay_obs_pending_dropped
+    if not _delay_obs_pending:
+        return
+    if not SB_AVAILABLE or sb is None:
+        return  # kein SB → Einträge bleiben liegen, nächster Durchlauf probiert
+    if not _delay_obs_flush_guard.acquire(blocking=False):
+        return  # ein anderer Thread flusht gerade — nicht doppelt abarbeiten
+    try:
+        with _delay_obs_pending_lock:
+            batch = list(_delay_obs_pending)
+            _delay_obs_pending.clear()
+        if not batch:
+            return
+        now = time.time()
+        ok = 0
+        aged = 0
+        kept = []
+        for e in batch:
+            try:
+                if now - float(e.get('ts') or 0) > _DELAY_OBS_PENDING_MAX_AGE_S:
+                    aged += 1
+                    continue
+                if _delay_obs_write_through(
+                        e['date_str'], e['fn'], e['hhmm'], e['max_delay'],
+                        e['cancelled'], e['airport'], e['status'],
+                        e.get('meta'), requeue_on_fail=False):
+                    ok += 1
+                else:
+                    kept.append(e)  # bleibt im Puffer, nächster Durchlauf
+            except Exception:
+                kept.append(e)  # defensiv: unerwarteter Fehler → behalten
+        if kept:
+            # Vorne wieder einreihen (FIFO bleibt: kept ist ältest-zuerst,
+            # extendleft dreht die Reihenfolge → vorher umkehren). Neue Fails,
+            # die WÄHREND des Flushs eingereiht wurden, hängen dahinter.
+            with _delay_obs_pending_lock:
+                _delay_obs_pending.extendleft(reversed(kept))
+        _delay_obs_flush_ok_count += ok
+        if aged:
+            _delay_obs_pending_dropped += aged
+            app.logger.warning(
+                f'[delay-obs] dropped {aged} pending rows older than 24h')
+        app.logger.warning(
+            f'[delay-obs] flushed {ok}/{len(batch)} pending '
+            f'(kept={len(kept)}, dropped_age={aged})')
+    finally:
+        _delay_obs_flush_guard.release()
+
 # VOLLE Flug-Felder pro Beobachtung (dest/gate/terminal/airline/esti). Der
 # _delay_store hält nur das max_delay (int) pro Key — die reichen Felder kommen
 # vom Live-Board und werden hier parallel gehalten, damit die Historie (vergangene
@@ -27545,7 +27875,7 @@ _delay_store_meta: dict = {}
 
 
 def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
-                             status, meta=None):
+                             status, meta=None, requeue_on_fail=True):
     """Best-effort Write-Through einer Delay-Beobachtung nach airport_delay_obs.
     Mirror des wall-posts/disk-Patterns: SB-down/Tabelle-fehlt → still degrade,
     der In-Memory-Store bleibt die Wahrheit. Nur max-Wert (upsert überschreibt,
@@ -27553,10 +27883,16 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
 
     Fehler werden LAUT (logger.warning) geloggt + in einem Fail-Counter gehalten,
     damit ein dauerhaft scheiternder Write (Schema-Mismatch, RLS, SB down) im
-    /api/health/full sichtbar wird statt still die Tages-Stichprobe zu verlieren."""
+    /api/health/full sichtbar wird statt still die Tages-Stichprobe zu verlieren.
+
+    Scheitert der Write endgültig (nach den Transport-Retries), wandert die Row
+    zusätzlich in den Pending-Puffer (_delay_obs_requeue) und wird beim nächsten
+    Persist-Durchlauf nachgeholt — außer requeue_on_fail=False (der Flush-Pfad
+    selbst, der gescheiterte Einträge ohnehin behält). Rückgabe: True = in SB
+    persistiert, False = nicht (SB fehlt / Fehler)."""
     global _delay_obs_write_fail_count, _delay_obs_write_ok_count, _delay_obs_last_error
     if not SB_AVAILABLE or sb is None:
-        return
+        return False
     payload = {
         'date': date_str,
         'airport': airport or 'FRA',
@@ -27642,6 +27978,7 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
             else:
                 raise
         _delay_obs_write_ok_count += 1
+        return True
     except Exception as e:
         # Tabelle fehlt / SB down / Schema-Mismatch → ehrlich nur in-memory
         # weiter, kein Crash. ABER laut loggen + zählen, damit es nicht still
@@ -27651,6 +27988,17 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
         app.logger.warning(
             f'[delay-obs] sb_write_FAIL date={date_str} airport={airport} '
             f'flight={fn} sched={hhmm} {type(e).__name__}: {str(e)[:160]}')
+        # Endgültig gescheitert (Transport-Retries sind bereits durch) → Row in
+        # den Pending-Puffer, der nächste Persist-Durchlauf holt sie nach. Die
+        # RemoteProtocolError-Stunden heute Morgen wären damit NICHT verloren
+        # gegangen (solange die Instanz weiterlebte).
+        if requeue_on_fail:
+            try:
+                _delay_obs_requeue(date_str, fn, hhmm, max_delay, cancelled,
+                                   airport, status, meta)
+            except Exception:
+                pass  # Puffer darf den Write-Pfad nie crashen
+        return False
 
 
 def _delay_store_load_from_sb(date_str, airport='FRA'):
@@ -27754,6 +28102,9 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
     global _delay_store, _delay_store_date, _delay_store_cancelled
     global _delay_store_sb_loaded_date, _delay_store_meta
     airport = (airport or 'FRA').upper()
+    # ZUERST liegen gebliebene Beobachtungen nachholen (Requeue-Puffer aus
+    # endgültig gescheiterten Writes) — no-op wenn leer (der Normalfall).
+    _delay_obs_flush_pending()
     if _delay_store_date != date_str:
         _delay_store.clear()
         _delay_store_cancelled.clear()
@@ -27816,6 +28167,28 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
                 merged_meta[mk] = mv
                 meta_changed = True
         if merged_meta:
+            _delay_store_meta[key] = merged_meta
+        # DATEN-EHRLICHKEIT (LH400-Bug): wissen wir den Delay WIRKLICH? (a) Delay-
+        # Signal (esti/delay>0), (b) IST-Status (departed/landed/Pünktlich), (c)
+        # noch im Live-Feed sichtbar nach sched+Puffer ohne esti → bestätigt
+        # pünktlich. Nur-vor-Abflug-gesehen ohne Signal = UNBEKANNT. Das Flag lebt
+        # im Meta-Store (kein DDL — airport_delay_obs hat keine jsonb-Spalte) und
+        # fließt über das meta-Dict auch durch den Requeue-Puffer; SB-persistierte
+        # Rows werden read-seitig aus esti/status/delay/cancelled rekonstruiert.
+        # Kriterium (c) ist dort ehrlich NICHT rekonstruierbar → nach einem
+        # Restart degradiert so eine Row konservativ auf „unbekannt" (nie
+        # fälschlich „bekannt"). Sticky: einmal True, nie wieder False.
+        if not merged_meta.get('delay_known'):
+            dk = _obs_delay_known(delay, cancelled, merged_meta.get('esti'),
+                                  merged_meta.get('status'),
+                                  airport.endswith('#ARR'))
+            if not dk and now_local is not None:
+                sdt_k = _parse_local_iso(sched)
+                if sdt_k is not None:
+                    from datetime import timedelta as _tdk
+                    dk = now_local >= sdt_k + _tdk(
+                        minutes=_DELAY_KNOWN_CONFIRM_MIN)
+            merged_meta['delay_known'] = bool(dk)
             _delay_store_meta[key] = merged_meta
         # Nur bereits abgeflogene Flüge sind echte Tages-Beobachtungen. Zukunft NICHT
         # persistieren — sonst zählte ein leeres Live-Board sie später fälschlich als
@@ -28032,6 +28405,14 @@ def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None):
             continue
         cancelled = bool(row.get('cancelled'))
         md = int(row.get('max_delay_min') or 0)
+        # „Unbekannt ≠ Pünktlich" (LH400-Bug): max_delay_min == 0 heißt in Alt-
+        # Rows auch „nie ein Delay-Signal gesehen" (nur vor Abflug beobachtet,
+        # finales Update verloren). Nur wenn die Row ein echtes Signal trägt
+        # (esti / IST-Status / delay>0 / cancelled) geben wir delay_min aus —
+        # sonst null (Status-Rekonstruktion; das delay_known-Flag selbst ist
+        # nicht persistierbar, die Tabelle hat keine jsonb-Spalte).
+        known = _obs_delay_known(md, cancelled, row.get('esti'),
+                                 row.get('status'), is_arr)
         # VOLLE Felder direkt aus der persistierten Row (von→nach + Gate/Terminal).
         # Alte Rows (vor 2026-06-14) haben diese Spalten nicht → fallen auf '' zurück.
         out.append({
@@ -28039,8 +28420,9 @@ def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None):
             'dest_iata': (row.get('dest_iata') or ''),
             'dest_name': (row.get('dest_name') or ''),
             'sched': date_str + 'T' + sc + ':00', 'esti': (row.get('esti') or None),
-            'delay_min': md,
-            'delayed': md >= _PUNCTUALITY_DELAY_THRESHOLD_MIN,
+            'delay_min': (md if known else None),
+            'delay_known': known,
+            'delayed': bool(known and md >= _PUNCTUALITY_DELAY_THRESHOLD_MIN),
             'cancelled': cancelled,
             'gate': (row.get('gate') or ''),
             'terminal': (row.get('terminal') or ''), 'hall': '',
@@ -28521,6 +28903,12 @@ def _opensky_fill_airport(icao, hours=None, write=True):
     begin = now - hours * 3600
     out = {'icao': icao, 'iata': iata_self, 'dep': 0, 'arr': 0,
            'routes': 0, 'sample': []}
+    if write:
+        # Persist-Durchlauf → liegen gebliebene Beobachtungen zuerst nachholen.
+        try:
+            _delay_obs_flush_pending()
+        except Exception:
+            pass
     try:
         from blueprints.aerox_data_blueprint import _record_resolved_route
     except Exception:
@@ -28843,6 +29231,267 @@ def _scrape_boards_airports():
     return free
 
 
+def _finalize_pending_delays(deadline_ts=None):
+    """Räumt die delay_known=False-Arbeitsliste aktiv leer (Owner-Direktive).
+
+    Scannt den In-Memory-Store nach Flügen, die real längst ab/gelandet sind
+    (sched + _DELAY_FINALIZE_AFTER_MIN < jetzt in der Airport-TZ der Row), aber
+    noch keinen bestätigten Delay-Wert tragen, und löst jeden — FIFO, ältester
+    zuerst — in dieser Reihenfolge auf (STOP beim ersten Treffer, alles GRATIS):
+      a) Gegenseite via _flight_obs_merged(free_only=True) — die andere Board-
+         Seite kennt den Delay evtl. schon (LH400: JFK-Ankunft wusste +86).
+      b) gecachte native Boards der eigenen Seite (_cached_board_rows, kein Fetch).
+      c) OpenSky-ADS-B: _opensky_fetch_flights holt die IST-Ab-/Anflüge des
+         Airports; wir matchen die Flugnummer und rechnen delay = actual - sched.
+         Pro Airport+Richtung nur EIN Fetch/Durchlauf (run-Cache), gecappt auf
+         _DELAY_FINALIZE_OPENSKY_CAP Fetches.
+      d) nach sched + _DELAY_STALE_GIVEUP_H immer noch nichts → konservativ als
+         delay_known=True + delay_min=0 SCHLIESSEN (lieber geschlossen als offen).
+
+    Gefundene Werte gehen durch den bestehenden Write-Pfad (_delay_obs_write_
+    through → Requeue-Puffer, idempotent) UND aktualisieren den In-Memory-Store
+    sticky. Netz-Calls laufen ohne Store-Lock; ein non-blocking Guard verhindert
+    Doppel-Läufe. Respektiert deadline_ts (Scrape-Zeitbudget). Wirft NIE."""
+    global _delay_finalize_ok_count, _delay_finalize_gaveup_count
+    if not _delay_finalize_guard.acquire(blocking=False):
+        return  # ein anderer Durchlauf finalisiert gerade — nicht doppelt
+    import time as _t
+    from datetime import timedelta as _td
+    try:
+        # Snapshot der Arbeitsliste (GIL-atomar) — Netz-Calls danach lock-frei.
+        try:
+            meta_items = list(_delay_store_meta.items())
+        except Exception:
+            meta_items = []
+        if not meta_items:
+            return
+        now_unix = _t.time()
+        # Kandidaten: delay_known noch False UND sched+AFTER_MIN in der Airport-TZ
+        # bereits vorbei. (sched_dt, age_min, key, meta) sammeln.
+        cands = []
+        _now_local_cache = {}
+        for key, meta in meta_items:
+            try:
+                if (meta or {}).get('delay_known'):
+                    continue
+                date_s, airport, fn, hhmm = key
+                if not fn or not hhmm or len(hhmm) < 4:
+                    continue
+                sched_dt = _parse_local_iso(str(date_s) + 'T' + str(hhmm))
+                if sched_dt is None:
+                    continue
+                nl = _now_local_cache.get(airport)
+                if nl is None:
+                    nl = _airport_local_now(airport)
+                    _now_local_cache[airport] = nl
+                if nl is None:
+                    continue
+                age_min = (nl - sched_dt).total_seconds() / 60.0
+                if age_min < _DELAY_FINALIZE_AFTER_MIN:
+                    continue
+                if age_min >= _DELAY_FINALIZE_MAX_AGE_H * 60:
+                    continue  # durch, Wert kommt nicht mehr → kein Re-Gaveup nach Restart
+                cands.append((sched_dt, age_min, key, dict(meta or {})))
+            except Exception:
+                continue
+        if not cands:
+            return
+        # FIFO: ältester sched zuerst → über mehrere Zyklen wird alles abgearbeitet.
+        cands.sort(key=lambda c: c[0])
+        cands = cands[:_DELAY_FINALIZE_MAX_ROWS]
+
+        opensky_fetches = 0
+        os_run_cache = {}   # (icao, ep) -> rows | None  (ein Fetch/Airport-Richtung)
+        n_cross = n_boards = n_os = n_gaveup = 0
+        attempted = 0
+
+        for sched_dt, age_min, key, meta in cands:
+            if deadline_ts is not None and _t.time() >= deadline_ts:
+                break
+            attempted += 1
+            date_s, airport, fn, hhmm = key
+            base = _store_key_base(airport)
+            is_arr = airport.upper().endswith('#ARR')
+            ftype = 'arrival' if is_arr else 'departure'
+            resolved = None      # int Delay-Minuten
+            resolved_cxl = False
+            source = None
+
+            # a) Gegenseite / Dual-Side-Resolver (gratis, nur freie/gecachte Boards).
+            try:
+                m = _flight_obs_merged(
+                    fn, date=date_s,
+                    dep_iata=(None if is_arr else base),
+                    arr_iata=(base if is_arr else None),
+                    live=True, free_only=True)
+            except Exception:
+                m = None
+            if m is not None:
+                if m.get('cancelled'):
+                    resolved, resolved_cxl, source = 0, True, 'crossside'
+                elif m.get('delay_known') and m.get('delay_min') is not None:
+                    try:
+                        resolved = int(m.get('delay_min') or 0)
+                    except Exception:
+                        resolved = None
+                    if resolved is not None:
+                        source = 'crossside'
+
+            # b) Gecachte native Boards der eigenen Seite (kein Fetch, kein Spend).
+            if resolved is None:
+                try:
+                    rows = _cached_board_rows(base, ftype) or []
+                except Exception:
+                    rows = []
+                for r in rows:
+                    if (r.get('flight') or '').replace(' ', '').upper() != fn:
+                        continue
+                    if r.get('cancelled'):
+                        resolved, resolved_cxl, source = 0, True, 'boards'
+                        break
+                    if _row_delay_known(r, is_arr, src='live', ap=base):
+                        try:
+                            resolved = int(r.get('delay_min') or 0)
+                        except Exception:
+                            resolved = 0
+                        source = 'boards'
+                        break
+
+            # c) OpenSky-ADS-B: IST-Zeiten des Airports holen, Flugnummer matchen.
+            if resolved is None:
+                icao = _iata_to_icao(base) or _icao_for_iata_fallback(base)
+                if icao:
+                    ck = (icao, ftype)
+                    rows_os = os_run_cache.get(ck, '__miss__')
+                    if rows_os == '__miss__':
+                        if opensky_fetches >= _DELAY_FINALIZE_OPENSKY_CAP:
+                            rows_os = None   # Per-Run-Cap erreicht — kein Fetch
+                        elif not _delay_finalize_opensky_budget_ok():
+                            # Tages-Sub-Budget erschöpft → OpenSky diese Runde NICHT
+                            # anfassen, damit die EU-Fill garantiert Topf-Rest behält.
+                            # Der Give-up-Pfad (d) schließt alte Rows trotzdem.
+                            rows_os = None
+                        else:
+                            # Weites Fenster (deckt 45min..GIVEUP_H+2 ab) → alle
+                            # Kandidaten dieses Airports teilen sich EINEN Fetch.
+                            begin = int(now_unix - (_DELAY_STALE_GIVEUP_H + 2) * 3600)
+                            try:
+                                rows_os = _opensky_fetch_flights(
+                                    icao, ftype, begin, int(now_unix))
+                            except Exception:
+                                rows_os = None
+                            opensky_fetches += 1
+                            _delay_finalize_opensky_budget_ok(inc=1)  # Tages-Sub-Budget zählen
+                            os_run_cache[ck] = rows_os
+                    if rows_os:
+                        best = None   # (abs_diff_min, delay_min)
+                        for f in rows_os:
+                            cs = (f.get('callsign') or '').strip().upper()
+                            if not cs:
+                                continue
+                            cand_fn = (_wh_callsign_to_iata_flightno(cs)
+                                       or cs).replace(' ', '').upper()
+                            if cand_fn != fn:
+                                continue
+                            ts = f.get('lastSeen') if is_arr else f.get('firstSeen')
+                            actual = _unix_to_airport_local(ts, base)
+                            if actual is None:
+                                continue
+                            dmin = (actual - sched_dt).total_seconds() / 60.0
+                            if dmin < -180 or dmin > 1440:
+                                continue   # unplausibel (falscher Leg/Tag)
+                            diff = abs(dmin)
+                            if best is None or diff < best[0]:
+                                best = (diff, dmin)
+                        if best is not None:
+                            resolved = max(0, int(round(best[1])))
+                            source = 'opensky'
+
+            # d) Give-up: nach sched+GIVEUP_H immer noch nichts → als pünktlich
+            #    schließen (Owner: „lieber geschlossen als offen"). Rein alters-
+            #    basiert: ein 6h-alter Flug ist definitiv durch; ob OpenSky diese
+            #    Runde am Cap übersprungen wurde, ändert daran nichts (der Cap wird
+            #    bei den wenigen gescrapten Airports real ohnehin kaum je erreicht).
+            #    Jede Schließung wird geloggt.
+            if resolved is None and age_min >= _DELAY_STALE_GIVEUP_H * 60:
+                resolved, resolved_cxl, source = 0, False, 'gaveup'
+                app.logger.warning(
+                    f'[finalize] GAVE UP → closing as on-time (delay=0) '
+                    f'date={date_s} airport={airport} flight={fn} sched={hhmm} '
+                    f'age={age_min/60:.1f}h (no free/crossside/board/opensky signal)')
+
+            if resolved is None:
+                continue   # noch nicht stale genug / OpenSky-Cap → nächster Zyklus
+
+            # ── Zurückschreiben: In-Memory sticky + Write-Through (Requeue) ──────
+            merged_meta = dict(meta)
+            merged_meta['delay_known'] = True
+            try:
+                if resolved_cxl:
+                    _delay_store[(date_s, airport, fn, hhmm + '_cancelled')] = 1
+                    _delay_store_cancelled[key] = True
+                elif resolved > 0:
+                    _delay_store[key] = max(int(_delay_store.get(key, 0) or 0), resolved)
+                else:
+                    _delay_store.setdefault(key, 0)
+                _delay_store_meta[key] = merged_meta
+            except Exception:
+                pass
+            try:
+                _delay_obs_write_through(
+                    date_s, fn, hhmm, resolved, resolved_cxl, airport,
+                    (merged_meta.get('status') or None), merged_meta)
+            except Exception:
+                pass
+
+            if source == 'crossside':
+                n_cross += 1
+            elif source == 'boards':
+                n_boards += 1
+            elif source == 'opensky':
+                n_os += 1
+            elif source == 'gaveup':
+                n_gaveup += 1
+
+        resolved_total = n_cross + n_boards + n_os + n_gaveup
+        _delay_finalize_ok_count += resolved_total
+        _delay_finalize_gaveup_count += n_gaveup
+        if attempted or resolved_total:
+            app.logger.warning(
+                f'[finalize] resolved {resolved_total}/{attempted} unknown '
+                f'(opensky={n_os}, crossside={n_cross}, boards={n_boards}, '
+                f'gaveup={n_gaveup}); candidates={len(cands)} '
+                f'opensky_fetches={opensky_fetches}')
+    except Exception as e:
+        app.logger.warning(
+            f'[finalize] aborted {type(e).__name__}: {str(e)[:160]}')
+    finally:
+        _delay_finalize_guard.release()
+
+
+def _icao_for_iata_fallback(iata):
+    """IATA → ICAO über die gebackene Referenz-DB, wenn die statische _iata_to_icao-
+    Map (_IATA_TO_ICAO) den Code nicht kennt. Gecacht (inkl. Misses). None wenn
+    unauffindbar. Wirft NIE — reiner Best-Effort fürs OpenSky-Airport-Argument."""
+    c = (iata or '').upper().strip()
+    if len(c) != 3:
+        return c if len(c) == 4 else None
+    if c in _WH_IATA_ICAO_CACHE:
+        return _WH_IATA_ICAO_CACHE[c]
+    icao = None
+    try:
+        from blueprints.aerox_data_blueprint import _airport_row
+        row = _airport_row(c) or {}
+        icao = (row.get('icao') or '').upper().strip() or None
+    except Exception:
+        icao = None
+    _WH_IATA_ICAO_CACHE[c] = icao
+    return icao
+
+
+_WH_IATA_ICAO_CACHE = {}
+
+
 def _scrape_boards_once(airports, deadline_ts=None):
     """Holt + persistiert DEP und ARR jeder freien Tafel und liefert die vom Brief
     geforderte Zusammenfassung {airport: {dep: n, arr: n}} (n = persistierte
@@ -28851,6 +29500,13 @@ def _scrape_boards_once(airports, deadline_ts=None):
     → _delay_obs_write_through nach airport_delay_obs). Per-Airport-/Richtungs-
     try/except, optional zeit-begrenzt (deadline_ts), niemals raise."""
     import time as _t
+    # Pending-Puffer ZUERST flushen (Rows, deren Upsert trotz Transport-Retries
+    # scheiterte) — der Scheduler-Poll ist der garantierte Retry-Takt, auch wenn
+    # kein User-Traffic _merge_into_delay_store triggert.
+    try:
+        _delay_obs_flush_pending()
+    except Exception:
+        pass
     summary = {}
     for ap in airports:
         ap = (ap or '').upper().strip()
@@ -28877,6 +29533,13 @@ def _scrape_boards_once(airports, deadline_ts=None):
             except Exception as e:
                 ap_out[key] = 'err:' + type(e).__name__
         summary[ap] = ap_out
+    # Nach dem Scrape (und dem Requeue-Flush zu Beginn) die delay_known=False-
+    # Arbeitsliste aktiv leerräumen — Gegenseite/gecachte Boards/OpenSky, sonst
+    # nach GIVEUP_H als pünktlich schließen. Restbudget respektieren, nie crashen.
+    try:
+        _finalize_pending_delays(deadline_ts=deadline_ts)
+    except Exception:
+        pass
     return summary
 
 
