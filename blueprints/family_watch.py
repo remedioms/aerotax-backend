@@ -270,6 +270,16 @@ def _requests_save(reqs):
     return bool(sb_ok or disk_ok)
 
 
+# Last-known-good In-Process-Cache (2026-07-03): Ein transienter SB-Flake
+# (RemoteProtocolError auf stale Keep-Alive) darf den Family-Feed NICHT auf
+# den ephemeren (auf Cloud Run meist leeren) Disk-Fallback stürzen lassen —
+# das war der "keine aktuelle Info"-Bug. Wir behalten den letzten
+# erfolgreichen SB-Stand im Prozess (TTL-begrenzt, damit Revokes nicht ewig
+# nachhallen) und servieren den bei SB-Fail statt einer leeren Liste.
+_SB_LAST_GOOD_TTL_S = 15 * 60
+_shares_last_good = {'data': None, 'at': 0.0}
+
+
 def _shares_load_from_sb():
     sb_avail, sb = _get_sb()
     if not sb_avail or sb is None:
@@ -294,9 +304,15 @@ def _shares_load_from_sb():
             if len(rows) < page:
                 break
             offset += page
+        _shares_last_good['data'] = [dict(s) for s in out]
+        _shares_last_good['at'] = time.time()
         return out
     except Exception as e:
         _log().warning(f'[family-share] sb_load_fail {type(e).__name__}: {str(e)[:120]}')
+        lg = _shares_last_good.get('data')
+        if lg is not None and (time.time() - _shares_last_good.get('at', 0)) < _SB_LAST_GOOD_TTL_S:
+            _log().info(f'[family-share] serving last-good snapshot ({len(lg)} shares)')
+            return [dict(s) for s in lg]
         return None
 
 
@@ -391,12 +407,77 @@ def _parse_iso(s):
         return None
 
 
+# Last-known-good Status-Cache pro (crew_token, granted-fields) — Privacy:
+# der Fieldset ist Teil des Keys, damit ein Family-Member mit weniger Grants
+# nie den volleren Status eines anderen Members serviert bekommt. Einträge
+# tragen ihr eigenes as_of (Zeitpunkt des erfolgreichen Reads) → die App kann
+# ehrlich "Stand von HH:MM" zeigen statt "Status unbekannt".
+_crew_status_last_good = {}   # (crew_token, frozenset(fields)) → status-dict (inkl. as_of)
+_CREW_STATUS_CACHE_MAX = 500
+
+
+def _status_has_signal(status):
+    """True wenn der Status irgendeine echte Info trägt (nicht der All-None-
+    'Status unbekannt'-Fall)."""
+    if not isinstance(status, dict):
+        return False
+    if status.get('flying_now') is True or status.get('home_now') is True:
+        return True
+    for k in ('layover_place', 'layover_place_city', 'current_city', 'landed',
+              'next_flight_dep_iata', 'today_dep_iata', 'today_route_label',
+              'last_seen_iso'):
+        if status.get(k) is not None:
+            return True
+    return False
+
+
+def _fallback_next_tour_from_disk(status, crew_token, allowed_fields):
+    """Aller-letzter Fallback ('es gibt immer eine Info'): SB unlesbar UND kein
+    Cache → nächste Tour aus dem Disk-Mirror der iCal-Briefings (app.py
+    schreibt bei jedem Import nach SB UND Disk; im lebenden Container liegt
+    da der letzte Stand). Respektiert die Privacy-Gates: nur wenn die Crew
+    'next_flight' gegranted hat. True wenn etwas gefüllt wurde."""
+    if 'next_flight' not in allowed_fields:
+        return False
+    loader = _app_attr('_ical_briefings_load_from_disk')
+    if not callable(loader):
+        return False
+    try:
+        events = loader(crew_token) or {}
+    except Exception:
+        return False
+    today = _dt.datetime.now().date().isoformat()
+    for datum in sorted(k for k in events if isinstance(k, str) and k[:10] >= today):
+        ev = events.get(datum) or {}
+        if not isinstance(ev, dict):
+            continue
+        summ = str(ev.get('ical_summary') or '')
+        loc = str(ev.get('ical_location') or '')
+        legs = re.findall(r'\b([A-Z]{3})-([A-Z]{3})\b', summ)
+        if not legs:
+            legs = re.findall(r'\b([A-Z]{3})-([A-Z]{3})\b', loc)
+        if not legs:
+            continue
+        chain = [legs[0][0]] + [b for _, b in legs]
+        status['next_flight_dep_iata'] = legs[0][0]
+        status['next_flight_arr_iata'] = legs[0][1]
+        status['next_flight_dep_city'] = _iata_city_name(legs[0][0])
+        status['next_flight_arr_city'] = _iata_city_name(legs[0][1])
+        status['today_route_label'] = _route_label_cities('-'.join(chain))
+        st = ev.get('ical_start_iso')
+        if st:
+            status['next_flight_etd_iso'] = str(st)[:25]
+        return True
+    return False
+
+
 def _load_crew_status_for_family(crew_token, allowed_fields):
     """Liest aus dem Crew-Profile + briefing-state nur die erlaubten Felder.
     Returns dict mit den status-feldern fuer die WatchedCrew.CrewStatus
     iOS struct (alle felder Optional)."""
     if not crew_token:
         return {}
+    src_fail = False   # mind. eine SB-/Profil-Quelle war trotz Retry unlesbar
     status = {
         'layover_place': None,
         'layover_place_city': None,   # "San Francisco" statt "SFO" (2026-07-03)
@@ -429,6 +510,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         # statt eines falschen Layovers (User 2026-06-25).
         'home_now': None,
     }
+    prof = {}   # vor-initialisiert: wirft der try-Block, darf Z. „hb = prof.get“ nicht NameError-n
     try:
         # SB-primary statt Disk: auf Cloud Run ist die Profil-Disk-Datei ephemer/
         # leer → die Family-Watcher sahen weder current_city noch last_seen
@@ -458,6 +540,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                 full = _pl(crew_token) or {}
                 status['last_seen_iso'] = full.get('_updated_at')
     except Exception as e:
+        src_fail = True
         _log().info(f'[family-watch] profile_read_skip {type(e).__name__}')
     # next_flight: nur wenn 'next_flight' in allowed_fields. Best-effort read aus
     # briefings/roster state via SB. Wenn nicht ladbar → bleibt None.
@@ -498,6 +581,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                     status['next_flight_etd_iso'] = str(st)[:25]
                 break
         except Exception as e:
+            src_fail = True
             _log().info(f'[family-watch] briefing_read_skip {type(e).__name__}')
     # Roster-derived Layover-Stadt + Reconcile von current_city.
     #
@@ -574,8 +658,11 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                         roster_today_home = True
                     elif first != hb:
                         roster_layover = first
-        except Exception:
-            pass
+        except Exception as e:
+            # Vorher stumm (bare pass) — DER Zweig produzierte bei SB-Flakes
+            # den All-None-„Status unbekannt" ohne jede Log-Spur.
+            src_fail = True
+            _log().info(f'[family-watch] roster_read_skip {type(e).__name__}')
     if 'next_flight' in allowed_fields:
         status['flying_now'] = flying_now
         status['today_dep_iata'] = today_dep
@@ -657,6 +744,31 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         status['photo_count_today'] = None
     if not (allowed_fields & {'current_city', 'last_seen', 'landed_status', 'next_flight'}):
         status['last_seen_iso'] = None
+    # ── „Es gibt immer eine Info" (2026-07-03, SB-RemoteProtocolError-Flakes) ──
+    # as_of = ehrliches Frische-Feld: Zeitpunkt, zu dem dieser Status berechnet
+    # wurde. Bei einem Cache-Hit unten trägt der Status das ÄLTERE as_of seines
+    # erfolgreichen Reads — die App kann „Stand von HH:MM" zeigen.
+    status['as_of'] = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds')
+    cache_key = (crew_token, frozenset(allowed_fields))
+    if not src_fail:
+        # Voll erfolgreicher Read → als last-known-good merken (auch ein
+        # legitimer Leer-Status, z.B. keine Grants — der ist dann die Wahrheit).
+        if len(_crew_status_last_good) >= _CREW_STATUS_CACHE_MAX:
+            _crew_status_last_good.clear()   # simpler Cap, kein LRU nötig
+        _crew_status_last_good[cache_key] = dict(status)
+        return status
+    if _status_has_signal(status):
+        # Teilweise gelesen (z.B. Profil ok, Roster-Flake): live-Stand servieren,
+        # aber NICHT als last-good cachen (würde vollen Stand verwässern).
+        return status
+    # Quelle trotz Retry unlesbar UND kein Signal → letzter bekannter Stand.
+    cached = _crew_status_last_good.get(cache_key)
+    if cached and _status_has_signal(cached):
+        _log().info(f'[family-watch] status src_fail → last-good (as_of={cached.get("as_of")})')
+        return dict(cached)
+    # GAR nichts da → wenigstens die nächste Tour aus dem Disk-Roster-Mirror.
+    if _fallback_next_tour_from_disk(status, crew_token, allowed_fields):
+        _log().info('[family-watch] status src_fail → disk-roster next-tour fallback')
     return status
 
 
@@ -740,6 +852,9 @@ def _scoped_tokens_disk_path():
 # (User hat PASTE_ME_IN_SUPABASE.sql noch nicht ausgeführt), werfen die SB-Calls
 # → None/False → es bleibt beim bisherigen Disk-Verhalten (keine Regression).
 # `data` ist ein jsonb-Blob (der komplette Record), Key ist code bzw. family_token.
+_kv_last_good = {}  # table → {'data': dict, 'at': epoch} (siehe _shares_last_good)
+
+
 def _kv_load_from_sb(table, key_col):
     sb_avail, sb = _get_sb()
     if not sb_avail or sb is None:
@@ -751,9 +866,14 @@ def _kv_load_from_sb(table, key_col):
             k = row.get(key_col)
             if k:
                 out[k] = row.get('data') or {}
+        _kv_last_good[table] = {'data': dict(out), 'at': time.time()}
         return out
     except Exception as e:
         _log().warning(f'[family-kv] {table} sb_load_fail {type(e).__name__}: {str(e)[:120]}')
+        lg = _kv_last_good.get(table)
+        if lg and (time.time() - lg.get('at', 0)) < _SB_LAST_GOOD_TTL_S:
+            _log().info(f'[family-kv] {table} serving last-good snapshot ({len(lg["data"])} keys)')
+            return dict(lg['data'])
         return None
 
 

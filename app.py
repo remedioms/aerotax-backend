@@ -284,6 +284,90 @@ def _sb_retry(label, fn, retries=2, backoff=0.35):
     if last:
         raise last
 
+
+# ── Zentrale SB-Retry-Schicht (2026-07-03) ────────────────────────────────────
+# Root-Cause der [friends]/[fgroups]/[ical-briefings] sb_load_fail-Flakes:
+# das globale `sb` (Zeile ~42) ist EIN geteilter supabase-py-Client mit EINEM
+# httpx-Connection-Pool. Supabase/PostgREST schließt Keep-Alive-Connections
+# nach Idle; der nächste Request auf der stale Connection stirbt mit
+# "RemoteProtocolError: Server disconnected". `_sb_retry` (oben) fing das nur
+# an 2 Call-Sites. Statt jede der ~60 sb.table(...)-Stellen zu wrappen, hängen
+# wir den Retry direkt vor den httpx-Transport des PostgREST-Session-Clients:
+# JEDER Read und jeder IDEMPOTENTE Write bekommt bei transienten Fehlern
+# automatisch 1–2 frische Versuche.
+#
+# Idempotenz-Regel (Retry nur wenn ein Doppel-Ausführen konvergiert):
+#   · GET/HEAD/OPTIONS           → immer (Reads)
+#   · DELETE/PUT/PATCH           → ja (PostgREST filter-basierte Writes)
+#   · POST mit Prefer: resolution=merge-duplicates|ignore-duplicates → ja (Upsert)
+#   · POST ohne Upsert-Prefer (plain INSERT, RPC) → NEIN (könnte doppeln)
+import httpx as _sb_httpx
+
+
+class _SBRetryTransport(_sb_httpx.BaseTransport):
+    def __init__(self, inner, retries=2, backoff=0.35):
+        self._inner = inner
+        self._retries = retries
+        self._backoff = backoff
+
+    @staticmethod
+    def _idempotent(request):
+        m = (request.method or '').upper()
+        if m in ('GET', 'HEAD', 'OPTIONS', 'DELETE', 'PUT', 'PATCH'):
+            return True
+        if m == 'POST':
+            prefer = request.headers.get('prefer', '') or ''
+            return ('resolution=merge-duplicates' in prefer
+                    or 'resolution=ignore-duplicates' in prefer)
+        return False
+
+    def handle_request(self, request):
+        attempt = 0
+        while True:
+            try:
+                return self._inner.handle_request(request)
+            except Exception as e:
+                name = type(e).__name__
+                if (name not in _SB_TRANSIENT_ERRORS
+                        or attempt >= self._retries
+                        or not self._idempotent(request)):
+                    raise
+                attempt += 1
+                print(f'[sb-retry] transport {request.method} '
+                      f'{request.url.path}: {name} — retry {attempt}/{self._retries}')
+                try:
+                    time.sleep(self._backoff * attempt)
+                except Exception:
+                    pass
+
+    def close(self):
+        self._inner.close()
+
+
+def _install_sb_retry_transport():
+    """Best-effort: wickelt den httpx-Transport des PostgREST-Clients in
+    _SBRetryTransport. `sb.postgrest.session` (httpx.Client) und dessen
+    `_transport` sind über postgrest-py 0.16…1.x stabil; falls sich das je
+    ändert, loggen wir und alles verhält sich wie bisher (per-Call-Site
+    try/except + Disk-Fallbacks bleiben unangetastet)."""
+    if not SB_AVAILABLE or sb is None:
+        return
+    try:
+        session = getattr(getattr(sb, 'postgrest', None), 'session', None)
+        transport = getattr(session, '_transport', None)
+        if transport is None:
+            print('[sb-retry] transport install skipped: session/_transport nicht gefunden')
+            return
+        if isinstance(transport, _SBRetryTransport):
+            return
+        session._transport = _SBRetryTransport(transport)
+        print('[sb-retry] transport installed (alle Reads + idempotente Writes)')
+    except Exception as e:
+        print(f'[sb-retry] transport install failed: {type(e).__name__}: {e}')
+
+
+_install_sb_retry_transport()
+
 _REQ_LOG_PREFIX = '[req]'
 # Pfade die NICHT instrumentiert werden (zu noisy oder uninteressant):
 #   /api/progress (SSE-Endpoint, langer Open)
@@ -25123,6 +25207,16 @@ def ax_route_history(frm, to):
     except Exception:
         ndays = 7
     store_key = _store_key_for(board_ap, 'departure')
+    # ZWEITE QUELLE (2026-07-03, User-Idee): Flüge von nicht gescrapten Abflug-
+    # Flughäfen stehen trotzdem als ANKÜNFTE am (gescrapten) Ziel im Warehouse —
+    # Route frm→to = dep-Obs@frm ∪ arr-Obs@to mit Herkunft==frm. Arrival-Rows
+    # tragen die HERKUNFT im Feld dest_iata (Board-Konvention). Der Delay ist
+    # dort der Ankunfts-Delay — für Strecken-Pünktlichkeit die ehrlichere Metrik.
+    arr_key = None
+    try:
+        arr_key = _store_key_for(to, 'arrival')
+    except Exception:
+        arr_key = None
     from datetime import timedelta as _td
     base = _airport_local_now(store_key)
     if base is None:
@@ -25135,32 +25229,52 @@ def ax_route_history(frm, to):
         d = (base - _td(days=i)).strftime('%Y-%m-%d')
         rows = (_departed_rows_from_store(store_key) if i == 0
                 else _board_rows_from_obs_for_date(d, store_key, None))
+        arr_rows = []
+        if arr_key:
+            try:
+                arr_rows = (_departed_rows_from_store(arr_key) if i == 0
+                            else _board_rows_from_obs_for_date(d, arr_key, None))
+            except Exception:
+                arr_rows = []
         flights = []
-        for r in rows:
-            if (r.get('dest_iata') or '').upper() != to:
-                continue
-            # BUGFIX (2026-07-03 „alle Flieger pünktlich"): Die Row-Builder
-            # (_departed_rows_from_store / _board_rows_from_obs_for_date) mappen
-            # die SB-Spalte max_delay_min bereits auf den Ausgabe-Key
-            # 'delay_min'. Der Read hier griff auf 'max_delay_min' zu → immer 0
-            # → jeder Flug „ontime". Die SB-Daten selbst sind korrekt (verifiziert
-            # 2026-07-02 FRA: 22/195 Flüge ≥15 min, max 350 min).
-            delay = int(r.get('delay_min') or 0)
-            canc = bool(r.get('cancelled'))
-            status = ('cancelled' if canc else
-                      'ontime' if delay <= 15 else
-                      'minor' if delay <= 45 else 'late')
-            flights.append({'flight': r.get('flight'), 'airline': r.get('airline'),
-                            'sched': r.get('sched'), 'delay_min': delay,
-                            'cancelled': canc, 'status': status})
-            total += 1
-            if canc:
-                cancelled_cnt += 1
-            elif delay <= 15:
-                on_time += 1
-            else:
-                late += 1
+        seen_fn = set()
+        # dep-Seite zuerst → gewinnt bei Dubletten (Abflug-Delay der Route).
+        for side, rws, match in (('dep', rows or [], to),
+                                 ('arr', arr_rows or [], frm)):
+            for r in rws:
+                if (r.get('dest_iata') or '').upper() != match:
+                    continue
+                fn_key = (r.get('flight') or '').replace(' ', '').upper()
+                if fn_key and fn_key in seen_fn:
+                    continue
+                if fn_key:
+                    seen_fn.add(fn_key)
+                # BUGFIX (2026-07-03 „alle Flieger pünktlich"): Die Row-Builder
+                # (_departed_rows_from_store / _board_rows_from_obs_for_date)
+                # mappen die SB-Spalte max_delay_min bereits auf den Ausgabe-Key
+                # 'delay_min'. Der Read hier griff auf 'max_delay_min' zu →
+                # immer 0 → jeder Flug „ontime". Die SB-Daten selbst sind korrekt
+                # (verifiziert 2026-07-02 FRA: 22/195 Flüge ≥15 min, max 350).
+                delay = int(r.get('delay_min') or 0)
+                canc = bool(r.get('cancelled'))
+                status = ('cancelled' if canc else
+                          'ontime' if delay <= 15 else
+                          'minor' if delay <= 45 else 'late')
+                flights.append({'flight': r.get('flight'),
+                                'airline': r.get('airline'),
+                                'sched': r.get('sched'), 'delay_min': delay,
+                                'cancelled': canc, 'status': status,
+                                'obs': side})
+                total += 1
+                if canc:
+                    cancelled_cnt += 1
+                elif delay <= 15:
+                    on_time += 1
+                else:
+                    late += 1
         if flights:
+            # Hinweis: arr-Zeilen tragen die ANKUNFTS-Zeit als sched — die
+            # Sortierung bleibt chronologisch-genug fürs Tages-Listing.
             flights.sort(key=lambda f: (f.get('sched') or ''))
             days_out.append({'date': d, 'count': len(flights), 'flights': flights})
     pct = round(100 * on_time / total) if total else None
