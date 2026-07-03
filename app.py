@@ -11824,6 +11824,44 @@ def get_friends_today(token):
         # Privacy-Gate: share_location=False (bool) oder =0 (legacy int) → kein city.
         share_loc_val = pr.get('share_location', True)
         share_loc = share_loc_val is not False and share_loc_val != 0
+        # LIVE-ANREICHERUNG (Owner 2026-07-03 „alle Live-Sachen anbinden"): pro
+        # Tages-Leg Delay/Status/Cancelled aus dem zentralen Dual-Side-Resolver
+        # (Board+Warehouse BEIDER Seiten). free_only=True — Fan-out über viele
+        # Friends darf keinen AeroDataBox-Spend auslösen; Resolver ist memoisiert
+        # (gleiche Flüge über mehrere Reader = ein Lookup). Nur wenn sich die
+        # Flugnummern sauber den Routing-Legs zuordnen lassen (ehrlich, kein
+        # Raten). Leere Liste = keine Live-Daten, iOS zeigt wie bisher.
+        # NUR für den HEUTIGEN Betriebstag (Guard 2026-07-03): für ein
+        # Vergangenheits-datum ist „live" sinnlos und jeder Resolver-Miss
+        # löste ungecachte airport_delay_obs-SB-Reads aus — bei bis zu
+        # 4 Legs × 2 Seiten × N Friends pro Request.
+        flights_live = []
+        try:
+            fns = [str(f).replace(' ', '').upper()
+                   for f in (rf.get('flight_numbers') or []) if str(f or '').strip()]
+            chain = [c for c in (day.get('routing') or '').upper().split('-')
+                     if len(c) == 3 and c.isalpha()]
+            if (datum == _date.today().isoformat()
+                    and fns and len(chain) >= 2 and len(fns) == len(chain) - 1):
+                for idx, fno in enumerate(fns[:4]):
+                    m = _flight_obs_merged(fno, date=datum,
+                                           dep_iata=chain[idx],
+                                           arr_iata=chain[idx + 1],
+                                           free_only=True)
+                    if m:
+                        flights_live.append({
+                            'flight': fno,
+                            'dep_iata': chain[idx], 'arr_iata': chain[idx + 1],
+                            'dep_delay_min': m.get('dep_delay_min'),
+                            'arr_delay_min': m.get('arr_delay_min'),
+                            'delay_min': m.get('delay_min'),
+                            'delay_side': m.get('delay_side'),
+                            'status': m.get('status'),
+                            'cancelled': m.get('cancelled'),
+                            'sides': m.get('sides'),
+                        })
+        except Exception:
+            flights_live = []
         out.append({
             'token': fr[:16] + '…',
             # Stabile match_id (Hash) statt vollem Token — iOS matcht Friend↔
@@ -11857,6 +11895,10 @@ def get_friends_today(token):
             # Privacy-Stufe: gleiche Sichtbarkeit wie routing (Mutual-Friend-Gate
             # gilt bereits über _friends_load). Leere Liste wenn nichts gelesen.
             'flight_numbers': list(rf.get('flight_numbers') or []),
+            # ADDITIV (2026-07-03): Live-Delay/Status pro Leg aus dem Dual-Side-
+            # Resolver — iOS kann „fliegt gerade, +25 min" direkt anzeigen statt
+            # nur den ADS-B-Callsign abzuleiten. Leer = keine Beobachtung.
+            'flights_live': flights_live,
         })
     return jsonify({'datum': datum, 'count': len(out), 'friends_today': out})
 
@@ -24922,10 +24964,17 @@ def _aerodatabox_board(iata, flight_type='departure'):
     return out
 
 
-def _native_board_cached(iata, flight_type):
+def _native_board_cached(iata, flight_type, allow_paid=True):
     """Gecachtes Native-Board (12 Min TTL). Reihenfolge: nativer Scraper →
-    AeroDataBox-Board → None. Gibt (rows, source) zurück; None-rows = alle Quellen
-    down/leer/kein-Key → Caller degradiert ehrlich. Niemals raise."""
+    AeroDataBox-Board → None. Gibt (rows, source) zurück; None-rows = alle
+    (erlaubten) Quellen down/leer/kein-Key → Caller degradiert ehrlich.
+    Niemals raise.
+
+    allow_paid=False (free_only-Fan-out, Friends/Family/Radar): BEIDE
+    AeroDataBox-Zweige (prefer-ADB UND Scraper-None-Fallback) werden
+    STRUKTURELL übersprungen — liefert der (gratis) native Scraper nichts,
+    kommt schlicht (None, None) zurück statt bezahlter Spend. Der bezahlte
+    Pfad (Default) bleibt unverändert."""
     import time as _t
     iata = (iata or '').upper().strip()
     ft = 'arrival' if flight_type == 'arrival' else 'departure'
@@ -24933,12 +24982,23 @@ def _native_board_cached(iata, flight_type):
     cached = _NATIVE_BOARD_CACHE.get(ckey)
     if cached and (_t.time() - cached[0]) < _NATIVE_BOARD_TTL:
         return cached[1]
+    prefer_adb = iata in _BOARD_PREFER_AERODATABOX
+    if not allow_paid and prefer_adb:
+        # Free-Pfad eines PREFER-ADB-Airports (MUC): EIGENER Cache-Slot. Die
+        # (degradierten) nativen Rows dürfen den geteilten Slot nicht 12 Min
+        # „vergiften" — sonst servierte der bezahlte Pfad statt des bevorzugten
+        # ADB-Boards die kaputte native Tafel. Der geteilte Slot oben wird
+        # trotzdem zuerst gelesen (bereits bezahlte Daten lesen kostet nichts).
+        ckey = (iata, ft, 'free')
+        cached = _NATIVE_BOARD_CACHE.get(ckey)
+        if cached and (_t.time() - cached[0]) < _NATIVE_BOARD_TTL:
+            return cached[1]
     result = (None, None)
     scraper = _NATIVE_BOARD_SCRAPERS.get(iata)
-    prefer_adb = iata in _BOARD_PREFER_AERODATABOX
     # MUC-Sonderfall: AeroDataBox ZUERST (echtes now→+24h-Fenster mit Soll-Zeit).
-    # Ohne Key/Quelle down → None → fällt auf den (reparierten) nativen Scraper zurück.
-    if prefer_adb:
+    # Ohne Key/Quelle down → None → fällt auf den (reparierten) nativen Scraper
+    # zurück. NUR wenn bezahlter Spend erlaubt ist.
+    if prefer_adb and allow_paid:
         try:
             rows = _aerodatabox_board(iata, ft)
         except Exception:
@@ -24952,7 +25012,7 @@ def _native_board_cached(iata, flight_type):
             rows = None
         if rows:   # nur cachen/zurückgeben wenn nicht-leer
             result = (rows, iata.lower() + '_native')
-    if result[0] is None and not prefer_adb:
+    if result[0] is None and allow_paid and not prefer_adb:
         try:
             rows = _aerodatabox_board(iata, ft)
         except Exception:
@@ -25237,41 +25297,68 @@ def ax_route_history(frm, to):
             except Exception:
                 arr_rows = []
         flights = []
-        seen_fn = set()
-        # dep-Seite zuerst → gewinnt bei Dubletten (Abflug-Delay der Route).
+        by_fn = {}
+        # DUAL-SIDE-MERGE (Owner-Direktive 2026-07-03): haben BEIDE Seiten
+        # denselben Flug beobachtet, wird NICHT mehr gedroppt (vorher: dep
+        # gewinnt, arr-Beobachtung weg), sondern EIN Eintrag mit dep_delay_min
+        # UND arr_delay_min gebaut — 'obs': 'both'. Status/delay_min kommen dann
+        # von der arr-Seite (Ankunfts-Delay = die ehrlichere Strecken-Metrik,
+        # D15-OTP). 'sched' bleibt die Abflug-Zeit der dep-Row (iOS-kompatibel),
+        # die Ankunfts-Zeit kommt additiv als 'sched_arr'.
+        # BUGFIX-HISTORIE (2026-07-03 „alle Flieger pünktlich"): Row-Builder
+        # mappen die SB-Spalte max_delay_min auf den Ausgabe-Key 'delay_min' —
+        # hier IMMER 'delay_min' lesen, nie 'max_delay_min'.
         for side, rws, match in (('dep', rows or [], to),
                                  ('arr', arr_rows or [], frm)):
             for r in rws:
                 if (r.get('dest_iata') or '').upper() != match:
                     continue
                 fn_key = (r.get('flight') or '').replace(' ', '').upper()
-                if fn_key and fn_key in seen_fn:
-                    continue
-                if fn_key:
-                    seen_fn.add(fn_key)
-                # BUGFIX (2026-07-03 „alle Flieger pünktlich"): Die Row-Builder
-                # (_departed_rows_from_store / _board_rows_from_obs_for_date)
-                # mappen die SB-Spalte max_delay_min bereits auf den Ausgabe-Key
-                # 'delay_min'. Der Read hier griff auf 'max_delay_min' zu →
-                # immer 0 → jeder Flug „ontime". Die SB-Daten selbst sind korrekt
-                # (verifiziert 2026-07-02 FRA: 22/195 Flüge ≥15 min, max 350).
                 delay = int(r.get('delay_min') or 0)
                 canc = bool(r.get('cancelled'))
-                status = ('cancelled' if canc else
-                          'ontime' if delay <= 15 else
-                          'minor' if delay <= 45 else 'late')
-                flights.append({'flight': r.get('flight'),
-                                'airline': r.get('airline'),
-                                'sched': r.get('sched'), 'delay_min': delay,
-                                'cancelled': canc, 'status': status,
-                                'obs': side})
-                total += 1
-                if canc:
-                    cancelled_cnt += 1
-                elif delay <= 15:
-                    on_time += 1
+                prev = by_fn.get(fn_key) if fn_key else None
+                if side == 'dep' or prev is None:
+                    if prev is not None:
+                        continue   # doppelte Row derselben Seite → wie bisher skip
+                    status = ('cancelled' if canc else
+                              'ontime' if delay <= 15 else
+                              'minor' if delay <= 45 else 'late')
+                    entry = {'flight': r.get('flight'),
+                             'airline': r.get('airline'),
+                             'sched': r.get('sched'), 'delay_min': delay,
+                             'cancelled': canc, 'status': status,
+                             'obs': side}
+                    if side == 'dep':
+                        entry['dep_delay_min'] = delay
+                    else:
+                        entry['arr_delay_min'] = delay
+                        entry['sched_arr'] = r.get('sched')
+                    if fn_key:
+                        by_fn[fn_key] = entry
+                    flights.append(entry)
                 else:
-                    late += 1
+                    if prev.get('obs') != 'dep':
+                        continue   # zweite arr-Row derselben Flugnummer → skip
+                    # arr-Row zu bestehendem dep-Eintrag → MERGEN statt droppen.
+                    prev['arr_delay_min'] = delay
+                    prev['sched_arr'] = r.get('sched')
+                    prev['cancelled'] = bool(prev.get('cancelled')) or canc
+                    prev['delay_min'] = delay          # arr = beste Zahl
+                    prev['status'] = ('cancelled' if prev['cancelled'] else
+                                      'ontime' if delay <= 15 else
+                                      'minor' if delay <= 45 else 'late')
+                    prev['obs'] = 'both'
+        # Quote NACH dem Merge zählen (ein Flug = eine Stimme, arr-Delay gewinnt
+        # bei 'both' — vorher wurde beim Append gezählt und der Merge hätte
+        # doppelt/falsch gezählt).
+        for e in flights:
+            total += 1
+            if e.get('cancelled'):
+                cancelled_cnt += 1
+            elif int(e.get('delay_min') or 0) <= 15:
+                on_time += 1
+            else:
+                late += 1
         if flights:
             # Hinweis: arr-Zeilen tragen die ANKUNFTS-Zeit als sched — die
             # Sortierung bleibt chronologisch-genug fürs Tages-Listing.
@@ -25311,6 +25398,47 @@ def _flight_from_live_board(iata, fn):
     return None
 
 
+def _flight_from_free_board(iata, fn):
+    """Wie `_flight_from_live_board`, aber STRUKTURELL ohne bezahlten Spend —
+    der Pflicht-Pfad für free_only-Fan-outs (Friends/Family/Radar):
+      (1) Null-Fetch-Scan über die BEREITS GECACHTEN Boards beider Richtungen
+          (`_cached_board_rows` — rein Dict+TTL; auch ein früher von einem
+          bezahlten Request/Poller gecachtes ADB-Board darf gelesen werden,
+          Cache lesen kostet nichts).
+      (2) Echter Fetch NUR für gratis Quellen: FRA (Fraport-Feed,
+          `_fra_day_board_cached`/`_fra_board_cached`) und Airports mit
+          nativem Scraper via `_native_board_cached(…, allow_paid=False)`,
+          das beide AeroDataBox-Zweige überspringt.
+    Airports ohne freie Quelle und ohne warmen Cache → None (ehrlich, KEIN
+    AeroDataBox-Call — `_aerodatabox_board` ist von hier aus unerreichbar).
+    Niemals raise."""
+    iata = (iata or '').upper().strip()
+    iata = _DE_ICAO_TO_IATA.get(iata, iata)
+    fn = (fn or '').replace(' ', '').upper()
+    if len(iata) != 3 or not fn:
+        return None
+    for ftype in ('departure', 'arrival'):
+        try:
+            rows = _cached_board_rows(iata, ftype)   # Null-Fetch (Dict+TTL)
+        except Exception:
+            rows = None
+        if rows is None:
+            try:
+                if iata in ('FRA', 'EDDF'):
+                    rows = (_fra_day_board_cached(ftype) if ftype == 'departure'
+                            else _fra_board_cached(ftype))
+                elif iata in _NATIVE_BOARD_SCRAPERS:
+                    rows, _src = (_native_board_cached(iata, ftype,
+                                                       allow_paid=False)
+                                  or (None, None))
+            except Exception:
+                rows = None
+        for bf in (rows or []):
+            if (bf.get('flight') or '').replace(' ', '').upper() == fn:
+                return dict(bf, _arr=(ftype == 'arrival'))
+    return None
+
+
 def _arrival_gate_terminal(dest_iata, fn):
     """Ankunfts-Gate/-Terminal des ZIEL-Flughafens für eine Flugnummer — aus dem
     ANKUNFTS-Board des Ziels (gratis, gecacht). Der Abflug-Board-Scan liefert nur
@@ -25336,6 +25464,305 @@ def _arrival_gate_terminal(dest_iata, fn):
             t = (bf.get('terminal') or '').strip() or None
             return (g, t)
     return (None, None)
+
+
+# ── ZENTRALER DUAL-SIDE-RESOLVER (Owner-Direktive 2026-07-03) ────────────────
+# „Immer Abflug UND Ankunft einbeziehen, damit es wirklich genau ist — und wenn
+# nur eins existiert, das eine benutzen." Ein Flug hat ZWEI Beobachtungsseiten:
+# das Abflug-Board/-Warehouse am Origin (dep-Delay, Abflug-Gate) und das
+# Ankunfts-Board/-Warehouse am Ziel (arr-Delay, Ankunfts-Gate, Herkunft im Feld
+# dest_iata — Board-Konvention). Alle Live-Konsumenten (Flight-Info, Radar/
+# Inbound, Friends/Family-Live-Status, Tafel-Enrich, Route-History) laufen durch
+# DIESEN einen Resolver statt jeweils nur eine Seite zu sehen.
+
+# Prozess-Memo pro (flight, date, dep, arr, live, free_only) — Feed-Renders rufen
+# denselben Flug mehrfach pro Request auf (mehrere Karten/Konsumenten); der Memo
+# verhindert wiederholte Board-Scans/Store-Reads. Kurzer TTL, damit frische
+# Board-Polls (2–12 Min TTL) zeitnah durchschlagen. Auch None wird gecacht
+# (negative-cache — sonst zahlt jeder Fan-out-Miss erneut).
+_FLIGHT_MERGE_CACHE: dict = {}
+_FLIGHT_MERGE_TTL = 90
+
+
+def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
+                       live=True, free_only=False):
+    """EIN gemergter Record für einen Flug aus ALLEN verfügbaren Beobachtungen
+    beider Seiten:
+      • dep-Seite: Live-Board + Warehouse (airport_delay_obs) am ABFLUG-Flughafen
+      • arr-Seite: Live-Board + Warehouse ('<AP>#ARR') am ZIEL — Arrival-Rows
+        tragen die HERKUNFT in dest_iata, der Delay dort ist der ANKUNFTS-Delay.
+    Live-Boards (via `_flight_from_live_board`, das dep+arr scannt) nur für den
+    HEUTIGEN Betriebstag des jeweiligen Flughafens; Warehouse für heute (In-
+    Memory-Store, SB-hydriert) und vergangene Tage (`?date=`).
+
+    Args:
+      date:      'YYYY-MM-DD' oder None (= heute am jeweiligen Flughafen).
+      dep_iata / arr_iata: bekannte Seiten; fehlt eine, wird sie best-effort aus
+                 der gefundenen Gegenseite abgeleitet (Board-Row dest_iata).
+      live:      False = nur Warehouse (kein Board-Scan).
+      free_only: True = Live-Scan nur für gratis erreichbare/bereits gecachte
+                 Boards (kein AeroDataBox-Spend) — Pflicht für Fan-out-Pfade.
+
+    Ergebnis (dict) mit getrennten Feldern beider Seiten oder None (keine Seite
+    hat Daten — EHRLICH, nichts erfunden):
+      flight, date, dep_iata, arr_iata, airline, dest_name, origin_name,
+      sched_dep/esti_dep/dep_delay_min/gate_dep/terminal_dep/status_dep/dep_cancelled,
+      sched_arr/esti_arr/arr_delay_min/gate_arr/terminal_arr/status_arr/arr_cancelled,
+      status (arr gewinnt), cancelled (OR beider Seiten),
+      delay_min (beste Zahl: arr wenn vorhanden, sonst dep), delay_side ('arr'|'dep'),
+      reg/aircraft (von der Seite, die es hat — NUE-Arrivals liefern Tails),
+      sides {'dep': 'live'|'obs'|None, 'arr': …}, has_dep, has_arr.
+    Niemals raise — reiner Best-Effort-Merge, gecacht (TTL s.o.)."""
+    import time as _t
+    fn = (flight_no or '').replace(' ', '').upper().strip()
+    if len(fn) < 3:
+        return None
+
+    def _norm_ap(x):
+        x = (x or '').upper().strip()
+        x = _DE_ICAO_TO_IATA.get(x, x)
+        return x if (len(x) == 3 and x.isalpha()) else None
+
+    dep = _norm_ap(dep_iata)
+    arr = _norm_ap(arr_iata)
+    date_q = (date or '').strip()[:10] or None
+    ckey = (fn, date_q or '', dep or '', arr or '', bool(live), bool(free_only))
+    hit = _FLIGHT_MERGE_CACHE.get(ckey)
+    if hit and (_t.time() - hit[0]) < _FLIGHT_MERGE_TTL:
+        return dict(hit[1]) if hit[1] is not None else None
+
+    def _is_today_at(ap):
+        """date_q ist None oder der heutige Betriebstag am Flughafen ap."""
+        if date_q is None:
+            return True
+        try:
+            return _airport_local_now(ap).strftime('%Y-%m-%d') == date_q
+        except Exception:
+            return False
+
+    dep_row = arr_row = None
+    dep_src = arr_src = None    # 'live' | 'obs'
+
+    def _live_scan(ap):
+        """Board-Scan (dep+arr) EINES Flughafens; klassifiziert den Treffer als
+        dep-/arr-Seite über das _arr-Flag. Best-effort, nie raise.
+        free_only=True → NUR `_flight_from_free_board` (gecachte Boards +
+        gratis Quellen FRA/native, allow_paid=False) — `_flight_from_live_board`
+        und damit jeder AeroDataBox-Zweig sind auf diesem Pfad unerreichbar."""
+        nonlocal dep_row, arr_row, dep_src, arr_src
+        if not ap or not _is_today_at(ap):
+            return
+        try:
+            bf = (_flight_from_free_board(ap, fn) if free_only
+                  else _flight_from_live_board(ap, fn))
+        except Exception:
+            bf = None
+        if not bf:
+            return
+        if bf.get('_arr'):
+            if arr_row is None:
+                arr_row, arr_src = dict(bf), 'live'
+                arr_row.pop('_arr', None)
+        else:
+            if dep_row is None:
+                dep_row, dep_src = dict(bf), 'live'
+                dep_row.pop('_arr', None)
+
+    if live:
+        _live_scan(dep)
+        if arr and arr != dep:
+            _live_scan(arr)
+
+    # Fehlende Seite aus der gefundenen ableiten: dep-Row.dest_iata = Ziel,
+    # arr-Row.dest_iata = HERKUNFT (Board-Konvention) — dann EINEN Nachzieh-Scan.
+    if dep is None and arr_row is not None:
+        dep = _norm_ap(arr_row.get('dest_iata'))
+        if live and dep and dep_row is None:
+            _live_scan(dep)
+    if arr is None and dep_row is not None:
+        arr = _norm_ap(dep_row.get('dest_iata'))
+        if live and arr and arr_row is None:
+            _live_scan(arr)
+
+    def _obs_lookup(ap, ftype, want_other):
+        """Warehouse-Row (heute: In-Memory-Store; sonst: SB-Read des Tages) für
+        fn am Store-Key ap+ftype. Bevorzugt die Row, deren dest_iata zur
+        bekannten Gegenseite passt (Mehrfach-Legs gleicher Flugnummer)."""
+        if not ap:
+            return None
+        key = _store_key_for(ap, ftype)
+        try:
+            if _is_today_at(ap):
+                rows = _departed_rows_from_store(key)
+            else:
+                # ZUKUNFTS-Guard: für ein künftiges Datum kann es keine
+                # Beobachtung geben — den SB-Read gar nicht erst machen (Fan-out-
+                # Konsumenten fragen auch künftige Roster-Tage an).
+                try:
+                    if date_q > _airport_local_now(ap).strftime('%Y-%m-%d'):
+                        return None
+                except Exception:
+                    pass
+                rows = _board_rows_from_obs_for_date(date_q, key, None)
+        except Exception:
+            rows = []
+        cands = [r for r in (rows or [])
+                 if (r.get('flight') or '').replace(' ', '').upper() == fn]
+        if not cands:
+            return None
+        if want_other:
+            for r in cands:
+                if (r.get('dest_iata') or '').upper() == want_other:
+                    return r
+        return cands[0]
+
+    if dep_row is None:
+        o = _obs_lookup(dep, 'departure', arr)
+        if o is not None:
+            dep_row, dep_src = dict(o), 'obs'
+    if arr_row is None:
+        o = _obs_lookup(arr, 'arrival', dep)
+        if o is not None:
+            arr_row, arr_src = dict(o), 'obs'
+    # Zweite Ableitungs-Chance: Airports erst durch die obs-Row bekannt geworden.
+    if dep is None and arr_row is not None:
+        dep = _norm_ap(arr_row.get('dest_iata'))
+        if dep and dep_row is None:
+            o = _obs_lookup(dep, 'departure', arr)
+            if o is not None:
+                dep_row, dep_src = dict(o), 'obs'
+    if arr is None and dep_row is not None:
+        arr = _norm_ap(dep_row.get('dest_iata'))
+        if arr and arr_row is None:
+            o = _obs_lookup(arr, 'arrival', dep)
+            if o is not None:
+                arr_row, arr_src = dict(o), 'obs'
+
+    if dep_row is None and arr_row is None:
+        _FLIGHT_MERGE_CACHE[ckey] = (_t.time(), None)
+        _cache_soft_cap(_FLIGHT_MERGE_CACHE)
+        return None
+
+    def _s(row, k):
+        v = (row or {}).get(k)
+        v = (v.strip() if isinstance(v, str) else v)
+        return v or None
+
+    def _d(row):
+        if row is None:
+            return None
+        try:
+            return int(row.get('delay_min') or 0)
+        except Exception:
+            return 0
+
+    dep_delay = _d(dep_row)
+    arr_delay = _d(arr_row)
+    dep_cxl = bool((dep_row or {}).get('cancelled'))
+    arr_cxl = bool((arr_row or {}).get('cancelled'))
+    # Beste Ein-Zahl für Konsumenten, die nur eine zeigen: der Ankunfts-Delay ist
+    # die ehrlichere Metrik (D15-OTP), wenn die arr-Seite beobachtet wurde.
+    if arr_row is not None:
+        best_delay, delay_side = arr_delay, 'arr'
+    else:
+        best_delay, delay_side = dep_delay, 'dep'
+    rec = {
+        'ok': True, 'flight': fn,
+        'date': (date_q or (_s(dep_row, 'sched') or _s(arr_row, 'sched') or '')[:10] or None),
+        'dep_iata': dep, 'arr_iata': arr,
+        'airline': _s(dep_row, 'airline') or _s(arr_row, 'airline'),
+        'dest_name': _s(dep_row, 'dest_name'),      # Ziel-Name (nur dep-Row korrekt)
+        'origin_name': _s(arr_row, 'dest_name'),    # arr-Row.dest_name = Herkunft
+        # dep-Seite (Zeiten in Ortszeit des Abflug-Flughafens, wie die Boards).
+        'sched_dep': _s(dep_row, 'sched'), 'esti_dep': _s(dep_row, 'esti'),
+        'dep_delay_min': (dep_delay if dep_row is not None else None),
+        'gate_dep': _s(dep_row, 'gate'), 'terminal_dep': _s(dep_row, 'terminal'),
+        'status_dep': _s(dep_row, 'status'), 'dep_cancelled': dep_cxl,
+        # arr-Seite (Zeiten in Ortszeit des Ziel-Flughafens).
+        'sched_arr': _s(arr_row, 'sched'), 'esti_arr': _s(arr_row, 'esti'),
+        'arr_delay_min': (arr_delay if arr_row is not None else None),
+        'gate_arr': _s(arr_row, 'gate'), 'terminal_arr': _s(arr_row, 'terminal'),
+        'status_arr': _s(arr_row, 'status'), 'arr_cancelled': arr_cxl,
+        # Merged-Sicht.
+        'status': _s(arr_row, 'status') or _s(dep_row, 'status'),
+        'cancelled': (dep_cxl or arr_cxl),
+        'delay_min': best_delay, 'delay_side': delay_side,
+        'reg': _s(dep_row, 'reg') or _s(arr_row, 'reg'),
+        'aircraft': _s(dep_row, 'aircraft') or _s(arr_row, 'aircraft'),
+        'sides': {'dep': dep_src, 'arr': arr_src},
+        'has_dep': dep_row is not None, 'has_arr': arr_row is not None,
+    }
+    _FLIGHT_MERGE_CACHE[ckey] = (_t.time(), dict(rec))
+    _cache_soft_cap(_FLIGHT_MERGE_CACHE)
+    return rec
+
+
+def _cached_board_rows(iata, ftype):
+    """Board-Zeilen NUR aus dem bereits gefüllten In-Memory-Cache — löst KEINEN
+    Fetch aus (Null-Kosten-Lookup fürs Cross-Side-Tafel-Enrich). None wenn für
+    diesen Flughafen (noch) nichts Frisches gecacht ist."""
+    import time as _t
+    ap = (iata or '').upper().strip()
+    ap = _DE_ICAO_TO_IATA.get(ap, ap)
+    if ap in ('FRA', 'EDDF'):
+        c = _AIRPORT_BOARD_CACHE.get('FRA_' + ('arr' if ftype == 'arrival' else 'dep'))
+        if c and (_t.time() - c[0]) < _AIRPORT_BOARD_TTL:
+            return c[1]
+        c = _AIRPORT_DAY_CACHE.get('FRA_DAY_' + ('arr' if ftype == 'arrival' else 'dep'))
+        if c and (_t.time() - c[0]) < _AIRPORT_DAY_TTL:
+            return c[1]
+        return None
+    c = _NATIVE_BOARD_CACHE.get((ap, 'arrival' if ftype == 'arrival' else 'departure'))
+    if c and (_t.time() - c[0]) < _NATIVE_BOARD_TTL:
+        return (c[1] or (None, None))[0]
+    return None
+
+
+def _board_cross_side_enrich(rows, ftype):
+    """Tafel-Zeilen mit der GEGENSEITE anreichern (Owner-Direktive 2026-07-03) —
+    ausschließlich aus BEREITS GECACHTEN Boards (kein Fetch, kein Spend, der
+    Poller hält die deutschen Boards ohnehin warm): eine Abflug-Zeile bekommt
+    Ankunfts-Delay/-Status/-Esti/-Gate ihres Ziels (arr_*-Felder), eine
+    Ankunfts-Zeile den Abflug-Delay ihres Origins (dep_*-Felder). Tail/Typ
+    werden GEFÜLLT, wenn nur die Gegenseite sie kennt (NUE-Arrivals tragen
+    Tails); cancelled wird ge-OR-t. Gibt KOPIEN zurück (Cache-Zeilen bleiben
+    unangetastet). Additiv & ehrlich: Felder fehlen einfach, wenn die
+    Gegenseite gerade nicht gecacht ist."""
+    other_ft = 'departure' if ftype == 'arrival' else 'arrival'
+    prefix = 'dep_' if ftype == 'arrival' else 'arr_'
+    idx_cache = {}
+    out = []
+    for f in (rows or []):
+        f = dict(f)
+        out.append(f)
+        other_ap = (f.get('dest_iata') or '').upper().strip()
+        fn = (f.get('flight') or '').replace(' ', '').upper()
+        if len(other_ap) != 3 or not fn:
+            continue
+        if other_ap not in idx_cache:
+            idx = {}
+            for r in (_cached_board_rows(other_ap, other_ft) or []):
+                k = (r.get('flight') or '').replace(' ', '').upper()
+                if k and k not in idx:
+                    idx[k] = r
+            idx_cache[other_ap] = idx
+        o = idx_cache[other_ap].get(fn)
+        if not o:
+            continue
+        try:
+            f[prefix + 'delay_min'] = int(o.get('delay_min') or 0)
+        except Exception:
+            f[prefix + 'delay_min'] = 0
+        f[prefix + 'status'] = (o.get('status') or '') or None
+        f[prefix + 'esti'] = o.get('esti') or None
+        f[prefix + 'gate'] = (o.get('gate') or '').strip() or None
+        if o.get('cancelled') and not f.get('cancelled'):
+            f['cancelled'] = True
+        if not f.get('reg') and o.get('reg'):
+            f['reg'] = o.get('reg')
+            if not f.get('aircraft') and o.get('aircraft'):
+                f['aircraft'] = o.get('aircraft')
+    return out
 
 
 @app.route('/api/ax/flight-info/<flightno>', methods=['GET'])
@@ -25504,6 +25931,44 @@ def ax_flight_info(flightno):
             arr_g, arr_t = (None, None)
         out['arr_gate'] = arr_g
         out['arr_terminal'] = arr_t
+
+    # DUAL-SIDE (Owner-Direktive 2026-07-03): beide Seiten über den zentralen
+    # Resolver einbeziehen — die arr-Seite (Ankunfts-Board/-Warehouse am Ziel)
+    # liefert den ANKUNFTS-Delay, Ankunfts-Status/-Zeiten und ggf. den Tail, den
+    # das dep-Board nicht kennt (NUE-Arrivals tragen Tails). Rein ADDITIVE Felder
+    # (dep_delay_min/arr_delay_min/sched_arr/esti_arr/arr_status/arr_cancelled/
+    # obs_sides/delay_side) — bestehende Felder bleiben für iOS unverändert; nur
+    # leere reg/arr_gate/cancelled werden mit ehrlicheren Werten GEFÜLLT.
+    if out is not None and not out.get('stale'):
+        try:
+            merged = _flight_obs_merged(fn, date=(date_param or None),
+                                        dep_iata=(out.get('origin') or board_ap),
+                                        arr_iata=out.get('dest'))
+        except Exception:
+            merged = None
+        if merged:
+            out['dep_delay_min'] = merged.get('dep_delay_min')
+            out['arr_delay_min'] = merged.get('arr_delay_min')
+            out['sched_arr'] = merged.get('sched_arr')
+            out['esti_arr'] = merged.get('esti_arr')
+            out['arr_status'] = merged.get('status_arr')
+            out['arr_cancelled'] = merged.get('arr_cancelled')
+            out['delay_side'] = merged.get('delay_side')
+            out['obs_sides'] = merged.get('sides')
+            # Cancelled = OR beider Seiten (nur eine Seite meldet die Streichung).
+            if merged.get('cancelled') and not out.get('cancelled'):
+                out['cancelled'] = True
+            # Tail/Typ von der Seite, die ihn hat (nur FÜLLEN, nie überschreiben).
+            if not out.get('reg') and merged.get('reg'):
+                out['reg'] = merged.get('reg')
+                if not out.get('type') and merged.get('aircraft'):
+                    out['type'] = merged.get('aircraft')
+            if not out.get('arr_gate') and merged.get('gate_arr'):
+                out['arr_gate'] = merged.get('gate_arr')
+            if not out.get('arr_terminal') and merged.get('terminal_arr'):
+                out['arr_terminal'] = merged.get('terminal_arr')
+            if out.get('delay_min') is None and merged.get('dep_delay_min') is not None:
+                out['delay_min'] = merged.get('dep_delay_min')
 
     if out is not None:
         return _public_cache_headers(jsonify(out))
@@ -26463,9 +26928,18 @@ def airport_board(token):
             _cache_soft_cap(_BOARD_LAST_GOOD)
     except Exception:
         pass
+    # Cross-Side-Enrich (Owner 2026-07-03): Abflug-Zeilen bekommen den Ankunfts-
+    # Delay/-Status/-Gate ihres Ziels, Ankunfts-Zeilen den Abflug-Delay ihres
+    # Origins — NUR aus bereits gecachten Boards (kein Fetch), rein additiv.
+    try:
+        flights_out = _board_cross_side_enrich(flights[:limit], ftype)
+        departed_out = _board_cross_side_enrich(departed[:120], ftype)
+    except Exception:
+        flights_out = flights[:limit]
+        departed_out = departed[:120]
     return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
-                    'count': len(flights[:limit]), 'flights': flights[:limit],
-                    'departed_today': departed[:120],
+                    'count': len(flights_out), 'flights': flights_out,
+                    'departed_today': departed_out,
                     'source': src,
                     'cached_ttl': (_AIRPORT_BOARD_TTL if src == 'fraport'
                                    else _NATIVE_BOARD_TTL)})
@@ -26675,11 +27149,77 @@ def flight_status(token):
     if len(number) < 3:
         return jsonify({'ok': False, 'error': 'bad_number',
                         'message': 'Keine gültige Flugnummer.'}), 200
+
+    def _merged_status_fallback():
+        """GRATIS-Fallback über den zentralen Dual-Side-Resolver (Owner-Direktive
+        2026-07-03): Strecke aus der eigenen Beobachtungs-DB (airport_delay_obs)
+        lernen, dann Boards/Warehouse BEIDER Seiten mergen. Liefert ein Flight-
+        Dict im selben Schema wie der AeroDataBox-Pfad (nur ehrlich befüllte
+        Felder; Zeiten sind Flughafen-ORTSZEIT wie auf den Tafeln) oder None."""
+        dep = arr = None
+        if SB_AVAILABLE and sb is not None:
+            try:
+                q = sb.table('airport_delay_obs').select(
+                    'airport,dest_iata,date').eq('flight', number)
+                if date_iso:
+                    q = q.eq('date', date_iso)
+                r = q.order('date', desc=True).limit(20).execute()
+                rows = r.data or []
+                dep_rec = next((x for x in rows
+                                if '#' not in (x.get('airport') or '')), None)
+                arr_rec = next((x for x in rows
+                                if '#' in (x.get('airport') or '')), None)
+                if dep_rec:
+                    dep = (dep_rec.get('airport') or '').split('#')[0] or None
+                    arr = (dep_rec.get('dest_iata') or '').upper() or None
+                elif arr_rec:
+                    arr = (arr_rec.get('airport') or '').split('#')[0] or None
+                    dep = (arr_rec.get('dest_iata') or '').upper() or None
+            except Exception:
+                pass
+        try:
+            m = _flight_obs_merged(number, date=date_iso,
+                                   dep_iata=dep, arr_iata=arr)
+        except Exception:
+            m = None
+        if not m:
+            return None
+        raw_status = m.get('status') or ''
+        return {
+            'flight': number,
+            'airline': m.get('airline') or '', 'airline_name': '',
+            'dep_iata': m.get('dep_iata') or '', 'dep_name': m.get('origin_name') or '',
+            'arr_iata': m.get('arr_iata') or '', 'arr_name': m.get('dest_name') or '',
+            'sched_dep': m.get('sched_dep'), 'sched_arr': m.get('sched_arr'),
+            'est_dep': m.get('esti_dep'), 'est_arr': m.get('esti_arr'),
+            'dep_gate': m.get('gate_dep') or '', 'dep_terminal': m.get('terminal_dep') or '',
+            'arr_gate': m.get('gate_arr') or '', 'arr_terminal': m.get('terminal_arr') or '',
+            'arr_baggage': '',
+            'status': ('cancelled' if m.get('cancelled') else raw_status),
+            'status_category': ('cancelled' if m.get('cancelled')
+                                else _flight_status_category(raw_status)),
+            'aircraft': m.get('aircraft') or '', 'reg': m.get('reg') or '',
+            'dep_delay_min': m.get('dep_delay_min'),
+            'arr_delay_min': m.get('arr_delay_min'),
+            'delay_min': m.get('delay_min'), 'delay_side': m.get('delay_side'),
+            'obs_sides': m.get('sides'),
+        }
+
     if not _os.environ.get('AERODATABOX_KEY'):
+        merged = _merged_status_fallback()
+        if merged:
+            return jsonify({'ok': True, 'number': number, 'flight': merged,
+                            'source': 'aerox_obs_merged'})
         return jsonify({'ok': False, 'error': 'source_unavailable', 'number': number,
                         'message': 'Flugplan-Quelle aktuell nicht verfügbar.'}), 200
     flight = _aerodatabox_flight_by_number(number, date_iso)
     if not flight:
+        # ADB kennt den Flug nicht (oder Quota) → eigene Beobachtungs-DB +
+        # Live-Boards beider Seiten sind oft trotzdem voll da (gratis).
+        merged = _merged_status_fallback()
+        if merged:
+            return jsonify({'ok': True, 'number': number, 'flight': merged,
+                            'source': 'aerox_obs_merged'})
         return jsonify({'ok': False, 'error': 'not_found', 'number': number,
                         'message': ('Für ' + number + ' liegt aktuell kein '
                                     'Flugplan vor.')}), 200
@@ -26798,6 +27338,7 @@ def aircraft_by_reg(token):
             if fl and fl.get('est_departure_icao'):
                 out['inbound_from_icao'] = fl['est_departure_icao']
             out['flight'] = _by_reg_legacy_flight(out, fl)
+            _by_reg_board_enrich(out, fl)   # Dual-Side-Board additiv (out['board'])
             return jsonify(out), 200
 
     # ── Tier 2: Letzter/aktueller Flug (historisch, keine ETA) ──
@@ -26825,6 +27366,7 @@ def aircraft_by_reg(token):
         if last_seen is not None:
             out['last_seen_unix'] = last_seen
         out['flight'] = _by_reg_legacy_flight(out, fl)
+        _by_reg_board_enrich(out, fl)       # Dual-Side-Board additiv (out['board'])
         return jsonify(out), 200
 
     # ── Tier 3: Letzte bekannte Position aus aircraft_positions (mit Alter) ──
@@ -26907,6 +27449,33 @@ def _by_reg_legacy_flight(out, fl):
     }
 
 
+def _by_reg_board_enrich(out, fl):
+    """Dual-Side-Board/Warehouse-Anreicherung des by-reg-Live-Fliegers (Owner-
+    Direktive 2026-07-03: „Live-Flieger, Inbound-Flieger — alle anbinden"):
+    OpenSky liefert nur Callsign + Herkunft/Ziel-ICAO, KEINE Zeiten/Delays. Der
+    zentrale Resolver holt dazu die Board-/Warehouse-Sicht BEIDER Seiten (Soll/
+    Erwartet, dep-/arr-Delay, Gates, Status, Cancelled) — rein gratis
+    (free_only=True, kein AeroDataBox-Spend auf dem heißen Radar-Pfad). Additives
+    Feld out['board'] (None-frei nur bei Treffer); die bestehenden Felder
+    (state/position/flight) bleiben unangetastet. Wirft nie."""
+    try:
+        cs = ((fl or {}).get('callsign') or '').strip().upper()
+        if len(cs) < 3:
+            return
+        fn = _wh_callsign_to_iata_flightno(cs) or cs
+        def _ap3(icao):
+            x = _icao_to_iata_best(icao) if icao else None
+            return x if (x and len(x) == 3 and x.isalpha()) else None
+        dep = _ap3((fl or {}).get('est_departure_icao'))
+        arr = _ap3((fl or {}).get('est_arrival_icao'))
+        merged = _flight_obs_merged(fn, dep_iata=dep, arr_iata=arr,
+                                    free_only=True)
+        if merged:
+            out['board'] = merged
+    except Exception:
+        pass
+
+
 # Fraport-Status-Strings, die "annulliert/gestrichen" bedeuten.
 _FRA_CANCEL_MARKERS = ('annull', 'cancel', 'gestrich')
 
@@ -26948,9 +27517,14 @@ _delay_store_date: str = ''  # YYYY-MM-DD des aktuellen Betriebstages
 # Cancelled-Flüge separat (key (date_str, fn, hhmm) → True), damit der SB-Write-
 # Through pro Flug genau eine Row (max_delay_min + cancelled-Flag) schreiben kann.
 _delay_store_cancelled: dict = {}
-# Marker: für welchen Betriebstag wurde bereits aus airport_delay_obs (SB) geladen.
-# Verhindert, dass jeder Punctuality-Call die SB-Tabelle erneut voll liest.
-_delay_store_sb_loaded_date: str = ''
+# Marker: welche (Betriebstag|Airport)-Kombis bereits aus airport_delay_obs (SB)
+# geladen wurden. Verhindert, dass jeder Punctuality-/Resolver-Call die SB-Tabelle
+# erneut voll liest. WAR ein einzelner String (nur die LETZTE Kombi gemerkt) —
+# sobald zwei Store-Keys alternierend lasen (Route-History dep+arr, Dual-Side-
+# Resolver), las JEDER Call die volle Tages-Tabelle neu (SB-Roundtrip-Thrash).
+# Jetzt ein Set, exakt wie der Docstring es immer meinte („einmal pro Betriebstag
+# UND Airport"). Tagesrollover leert das Set (siehe _merge_into_delay_store).
+_delay_store_sb_loaded_date: set = set()
 
 # Persistenz-Diagnose (vom /api/health/full exponiert). Ein still
 # fehlschlagender Write-Through war die Wurzel des "Pünktlichkeit verschwindet"-
@@ -27096,7 +27670,7 @@ def _delay_store_load_from_sb(date_str, airport='FRA'):
         return
     airport = (airport or 'FRA').upper()
     load_marker = date_str + '|' + airport
-    if _delay_store_sb_loaded_date == load_marker:
+    if load_marker in _delay_store_sb_loaded_date:
         return  # heute+airport schon geladen
     try:
         offset = 0
@@ -27143,7 +27717,10 @@ def _delay_store_load_from_sb(date_str, airport='FRA'):
             if len(rows) < page:
                 break
             offset += page
-        _delay_store_sb_loaded_date = load_marker
+        _delay_store_sb_loaded_date.add(load_marker)
+        if len(_delay_store_sb_loaded_date) > 400:   # Soft-Cap (viele Airports/Tage)
+            _delay_store_sb_loaded_date.clear()
+            _delay_store_sb_loaded_date.add(load_marker)
     except Exception as e:
         # Load-on-Read gebrochen → Tages-Stichprobe übersteht keinen Restart.
         # Laut loggen + zählen statt still schlucken.
@@ -27184,7 +27761,7 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
         _delay_store_date = date_str
         # Tagesrollover → SB-Load-Marker zurücksetzen, damit der neue Tag seine
         # (ggf. von anderen Instanzen bereits geschriebenen) Beobachtungen lädt.
-        _delay_store_sb_loaded_date = ''
+        _delay_store_sb_loaded_date = set()
     # Beim ersten Merge eines neuen Tages+Airports: vorhandene SB-Beobachtungen
     # zurückladen (cross-instance Akkumulation), bevor wir die neuen mergen.
     _delay_store_load_from_sb(date_str, airport)

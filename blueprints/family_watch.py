@@ -681,6 +681,56 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
             status['today_route_label'] = _iata_city_name(roster_layover)
         status['today_dep_iso'] = today_dep_iso
         status['today_arr_iso'] = today_arr_iso
+        # LIVE-DELAY der heutigen Legs (Owner-Direktive 2026-07-03: „alle
+        # Live-Sachen anbinden") — zentraler Dual-Side-Resolver in app.py
+        # (Board+Warehouse am Abflugs- UND Ankunftsort, free_only = kein
+        # bezahlter API-Spend im Family-Feed-Fan-out, memoisiert). Flugnummern
+        # kommen aus dem Roster-Snapshot (reader_facts.flight_numbers, gleiche
+        # Quelle wie /friends-today) und werden nur genutzt, wenn sie sich
+        # sauber den Legs der heutigen Kette zuordnen lassen (ehrlich, kein
+        # Raten). Rein ADDITIV: today_flights_live (Liste) + today_delay_min
+        # (letztes Leg mit Daten = „kommt sie/er pünktlich an?"). None = keine
+        # Beobachtung → iOS zeigt wie bisher.
+        status['today_flights_live'] = None
+        status['today_delay_min'] = None
+        try:
+            resolver = _app_attr('_flight_obs_merged')
+            snap_read = _app_attr('_roster_snapshot_read')
+            if (callable(resolver) and callable(snap_read)
+                    and today_chain and len(today_chain) >= 2):
+                today_s = _dt.datetime.now().date().isoformat()
+                tage = (snap_read(crew_token) or {}).get('tage') or []
+                dday = next((t for t in tage if isinstance(t, dict)
+                             and t.get('datum') == today_s), {})
+                fns = [str(f).replace(' ', '').upper()
+                       for f in ((dday.get('reader_facts') or {})
+                                 .get('flight_numbers') or [])
+                       if str(f or '').strip()]
+                if fns and len(fns) == len(today_chain) - 1:
+                    legs_live = []
+                    for idx, fno in enumerate(fns[:4]):
+                        m = resolver(fno, date=today_s,
+                                     dep_iata=today_chain[idx],
+                                     arr_iata=today_chain[idx + 1],
+                                     free_only=True)
+                        if m:
+                            legs_live.append({
+                                'flight': fno,
+                                'dep_iata': today_chain[idx],
+                                'arr_iata': today_chain[idx + 1],
+                                'dep_delay_min': m.get('dep_delay_min'),
+                                'arr_delay_min': m.get('arr_delay_min'),
+                                'delay_min': m.get('delay_min'),
+                                'delay_side': m.get('delay_side'),
+                                'status': m.get('status'),
+                                'cancelled': m.get('cancelled'),
+                                'sides': m.get('sides'),
+                            })
+                    if legs_live:
+                        status['today_flights_live'] = legs_live
+                        status['today_delay_min'] = legs_live[-1].get('delay_min')
+        except Exception as e:
+            _log().info(f'[family-watch] live_enrich_skip {type(e).__name__}')
     if 'layover_place' in allowed_fields:
         status['layover_place'] = roster_layover
         status['layover_place_city'] = (_iata_city_name(roster_layover)
