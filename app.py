@@ -87,6 +87,7 @@ for _bp_path, _bp_name in [
     ('blueprints.family_watch',              'family_watch_bp'),  # Wave-1 BUG-002
     ('blueprints.layover_group_blueprint',   'layover_group_bp'),  # geteilter Layover-Plan + Polls
     ('blueprints.pexels_blueprint',          'pexels_bp'),  # Pexels-Proxy (Key server-seitig)
+    ('blueprints.pixabay_blueprint',         'pixabay_bp'),  # Pixabay-Proxy (2. Quelle, gleiche Shape, 24h-Cache)
     ('blueprints.feed_status_blueprint',     'feed_status_bp'),  # 24h verschwindende Feed-Updates
     ('blueprints.flight_profile_blueprint',  'flight_profile_bp'),  # selbst-bauende Flug-DB + Crew-Ebene
     ('blueprints.aerox_data_blueprint',      'aerox_data_bp'),  # self-hosted Luftfahrt-DB (/api/ax/*)
