@@ -486,6 +486,11 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/friend-groups/',       # Gruppen-Namen + Member-Tokens
     '/api/user/crew-at-destination/', # wer ist mit mir am Ziel (Friends-PII)
     '/api/station/',        # /<token>/<iata>/activity → Friends-Aktivität
+    # ── Flug-Lebenszyklus (Owner 2026-07-03): owner-scoped, token-gebunden ──
+    '/api/ax/flight-inbound-chain/',  # /<token> → Tail-Verkettung + Delay-Prognose
+    '/api/ax/flight-live/',           # /<token> → Live-Track der eigenen Maschine
+    '/api/ax/turnaround/',            # /<token> → nächster Sektor / Bodenzeit
+    '/api/ax/flight-recap/',          # /<token> → Post-Flight-Wahrheit
 )
 
 
@@ -27731,7 +27736,18 @@ _delay_obs_pending_dropped: int = 0    # Diagnose (Cap-/Alters-Drops)
 # gecachte Boards/OpenSky-ADS-B), und wenn nach sched+GIVEUP_H trotzdem keine
 # Quelle etwas meldet, konservativ als pünktlich (delay_min=0) GESCHLOSSEN statt
 # ewig unbekannt zu bleiben. Läuft am Ende jedes /scrape-boards-Ticks (~15 min).
-_DELAY_FINALIZE_AFTER_MIN = 45         # sched + 45min lokal → Flug ist real durch
+_DELAY_FINALIZE_AFTER_MIN = 30         # sched + 30min lokal → Flug ist real durch
+# 2026-07-03: 45 → 30. Verkürzt die „unbekannt"-Lücke frisch abgeflogener Flüge um
+# 15 Min OHNE Risiko einer Fehl-Schließung: AFTER_MIN steuert NUR, ab wann der
+# Finalizer eine Row ÜBERHAUPT aufzulösen VERSUCHT (Gegenseite/gecachte Boards/
+# ADS-B). Der einzige Pfad, der eine Row als pünktlich SCHLIESST ohne Signal, ist
+# der Give-up-Zweig (d) — und der bleibt hart an _DELAY_STALE_GIVEUP_H (6h) gekoppelt.
+# Ein noch nicht abgeflogener (verspäteter) Flug matcht in ADS-B/Boards nicht →
+# resolved bleibt None → er wird NICHT geschlossen, sondern im nächsten Zyklus erneut
+# probiert. Die delay_known-Invariante (nur echte Signale setzen delay_known früh)
+# bleibt damit unberührt. Crossside/gecachte-Boards sind sofort frisch; der OpenSky-
+# Zweig greift erst, wenn OpenSky den Flug verarbeitet hat (Latenz) — ein früherer
+# Versuch schadet nie, er trifft nur früher, sobald das Signal da ist.
 _DELAY_STALE_GIVEUP_H = 6              # sched + 6h ohne Quelle → als pünktlich (0) schließen
 # Obergrenze fürs Scannen: Rows, die älter als _DELAY_FINALIZE_MAX_AGE_H nach sched
 # sind, werden GAR NICHT mehr als Kandidat aufgenommen. Grund: sie sind längst durch,
@@ -28741,8 +28757,47 @@ _EU_AIRPORTS = (
     ('LCY', 'EGLC'), ('KEF', 'BIKF'), ('IST', 'LTFM'), ('SAW', 'LTFJ'),
     ('BER', 'EDDB'), ('FRA', 'EDDF'),
 )
-_EU_ICAO_TO_IATA = {icao: iata for (iata, icao) in _EU_AIRPORTS}
-_EU_IATA_TO_ICAO = {iata: icao for (iata, icao) in _EU_AIRPORTS}
+
+# ── WELTWEITE ADS-B-FILL-ERWEITERUNG (2026-07-03) — Crew-Relevanz LH-Group ──────
+#  Owner-Direktive „so viel wie möglich gratis, ‚unbekannt' soll praktisch nie
+#  auftreten": ADS-B/OpenSky-Flights ist die UNIVERSELLE Delay-Wahrheit auch dort,
+#  wo es KEIN Board gibt. OpenSky /flights/departure|arrival funktioniert für JEDEN
+#  ICAO weltweit (nicht nur EU) → wir nehmen die grossen LH-Group-Langstreckenziele
+#  + Hubs auf, die WEDER einen nativen Scraper NOCH ein eu_scraper-Playwright-Modul
+#  haben (sonst Doppel-Rows mit abweichender sched → PK-Kollision). Diese Liste MUSS
+#  disjunkt zur eu_scraper-Registry bleiben (JFK/EWR/LGA/DEN/SFO/BOS/IAD/PHX/YVR/YYC/
+#  DFW/CLT/MCO/LAS/DXB/DOH/KWI/BLR/HYD/SIN/HKG/SYD/AKL/NRT/GRU/SCL/BOG/EZE/JNB/CPT/
+#  MAN/ZRH/VIE/BUD/DUB/PRG/STR + AENA-ES + ANA-PT sind dort bereits abgedeckt).
+#  Reine DATEN-Erweiterung: der Round-Robin (_eu_fill_icaos_for_tick) verteilt das
+#  gleiche Tages-Budget auf mehr Airports (jeder seltener besucht) — KEIN Mehr-Spend,
+#  nur breitere Abdeckung. Budget/Frequenz per Env (EU_FILL_PER_TICK, OPENSKY_FILL_
+#  DAILY_CAP) hochziehen, wenn frischere Revisits gewünscht (OpenSky gratis mit
+#  Account, nur rate-limited → siehe Report-Budgetrechnung).
+_WORLD_FILL_AIRPORTS = (
+    # Nordamerika (board-lose LH-Group-Ziele; JFK/EWR/BOS/IAD/SFO/DEN/DFW/CLT/MCO/
+    # LAS/PHX/YVR/YYC laufen bereits über eu_scraper → hier NICHT):
+    ('ORD', 'KORD'), ('ATL', 'KATL'), ('LAX', 'KLAX'), ('SEA', 'KSEA'),
+    ('MIA', 'KMIA'), ('IAH', 'KIAH'), ('DTW', 'KDTW'), ('MSP', 'KMSP'),
+    ('PHL', 'KPHL'), ('SAN', 'KSAN'), ('YYZ', 'CYYZ'), ('YUL', 'CYUL'),
+    ('MEX', 'MMMX'),
+    # Ost-/Südostasien + Südasien:
+    ('ICN', 'RKSI'), ('PVG', 'ZSPD'), ('PEK', 'ZBAA'), ('PKX', 'ZBAD'),
+    ('HND', 'RJTT'), ('KIX', 'RJBB'), ('TPE', 'RCTP'), ('BKK', 'VTBS'),
+    ('KUL', 'WMKK'), ('DEL', 'VIDP'), ('BOM', 'VABB'), ('CGK', 'WIII'),
+    ('MNL', 'RPLL'), ('HAN', 'VVNB'), ('SGN', 'VVTS'), ('CAN', 'ZGGG'),
+    # Naher Osten:
+    ('AUH', 'OMAA'), ('RUH', 'OERK'), ('JED', 'OEJN'), ('TLV', 'LLBG'),
+    ('AMM', 'OJAI'), ('BAH', 'OBBI'), ('MCT', 'OOMS'),
+    # Afrika:
+    ('LOS', 'DNMM'), ('NBO', 'HKJK'), ('ADD', 'HAAB'), ('ACC', 'DGAA'),
+    ('CMN', 'GMMN'),
+    # Lateinamerika (GRU/SCL/BOG/EZE via eu_scraper → hier NICHT):
+    ('GIG', 'SBGL'), ('LIM', 'SPIM'), ('PTY', 'MPTO'), ('UIO', 'SEQM'),
+    ('MVD', 'SUMU'),
+)
+# ICAO/IATA-Maps + Fill-Universum umfassen jetzt EU + Welt.
+_EU_ICAO_TO_IATA = {icao: iata for (iata, icao) in (_EU_AIRPORTS + _WORLD_FILL_AIRPORTS)}
+_EU_IATA_TO_ICAO = {iata: icao for (iata, icao) in (_EU_AIRPORTS + _WORLD_FILL_AIRPORTS)}
 # Die Airports, die der OpenSky-Fill tatsächlich anfasst = EU-Hubs OHNE freien
 # nativen Scraper (die deutschen Hubs füttern airport_delay_obs schon reicher).
 # Die native-scraped Codes hier INLINE (Modul-Load-Zeit vor der _FREE_BOARD_CODES-
@@ -28755,7 +28810,7 @@ _EU_FILL_EXCLUDE = frozenset({'FRA', 'EDDF', 'MUC', 'EDDM', 'DUS', 'EDDL',
                               'OSL', 'ENGM', 'BGO', 'ENBR', 'TRD', 'ENVA',
                               'SVG', 'ENZV', 'TOS', 'ENTC', 'BOO', 'ENBO',
                               'AES', 'ENAL', 'KRS', 'ENCN', 'WAW', 'EPWA'})
-_EU_FILL_ICAOS = tuple(icao for (iata, icao) in _EU_AIRPORTS
+_EU_FILL_ICAOS = tuple(icao for (iata, icao) in (_EU_AIRPORTS + _WORLD_FILL_AIRPORTS)
                        if iata not in _EU_FILL_EXCLUDE and icao not in _EU_FILL_EXCLUDE)
 
 # Prozess-lokaler ICAO→IATA-Cache (Referenz-DB-Treffer + Misses), damit der Fill

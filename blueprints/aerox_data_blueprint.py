@@ -203,6 +203,16 @@ def _route_from_obs(callsign):
     if not m:
         return None
     prefix, suffix = m.group(1), m.group(2)
+    # FRESHNESS-GATE (Wrong-Flight): die Tafel-Historie enthält denselben Callsign
+    # auch von GESTERN/vorletzter Woche. Für einen LIVE-Flug jetzt darf nur ein
+    # frischer Abflug-Record (heute, oder gestern für Red-Eyes über Mitternacht UTC)
+    # als aktive Route gelten — sonst zeigen wir die Strecke von gestern. Konservativ.
+    yest = time.strftime('%Y-%m-%d', time.gmtime(time.time() - 86400))
+    # +morgen-UTC: an Airports mit UTC+8…+14 (ICN/HND/PVG/SYD/BKK/SIN…) ist das
+    # Flughafen-LOKALE Beobachtungs-Datum aus UTC-Sicht oft schon „morgen" — sonst
+    # würden genau die neu abgedeckten Asien/Ozeanien-Flüge hier verworfen.
+    tmrw = time.strftime('%Y-%m-%d', time.gmtime(time.time() + 86400))
+    fresh_dates = {_today_utc(), yest, tmrw}
     cands = []
     al = _airline_row(prefix)
     if al and al.get('iata'):
@@ -211,13 +221,16 @@ def _route_from_obs(callsign):
     for fn in cands:
         try:
             r = (sb.table('airport_delay_obs')
-                 .select('airport,dest_iata,gate,terminal')
-                 .eq('flight', fn)
+                 .select('date,airport,dest_iata,gate,terminal')
+                 .eq('flight', fn).gte('date', yest)
                  .order('date', desc=True).order('updated_at', desc=True)
                  .limit(6).execute())
             rows = r.data or []
             # Abflug-Record (airport=Origin); Ankunfts-Keys ('<AP>#ARR') überspringen.
-            dep = next((x for x in rows if '#' not in (x.get('airport') or '')), None)
+            # Nur frische Records (heute/gestern) — ältere gleiche Flugnummer verwerfen.
+            dep = next((x for x in rows
+                        if '#' not in (x.get('airport') or '')
+                        and (x.get('date') in fresh_dates)), None)
             if dep and dep.get('dest_iata'):
                 return {'src': (dep.get('airport') or '').split('#', 1)[0],
                         'dst': dep.get('dest_iata'),
@@ -311,6 +324,12 @@ def _aviationstack_route(callsign):
 #                  gerade gestartet/Kurs-Rauschen → Route wird GEZEIGT. Der Client
 #                  zeichnet 'estimated' ohne „bestätigt"-Siegel und ohne Angst-Label.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Wrong-Flight-Freshness: ein OpenSky-„recent flight" (36-h-Fenster), dessen
+# letzter Kontakt älter als das ist, gilt für eine JETZT airborne Maschine als
+# abgeschlossener Vor-Flug → nicht als aktiver Leg akzeptieren.
+_LIVE_ROUTE_STALE_S = 3 * 3600
+
 
 def _today_utc():
     return time.strftime('%Y-%m-%d', time.gmtime())
@@ -488,6 +507,10 @@ def _opensky_route(hexid):
         # Beide Enden beobachtet → confirmed. Nur ein Ende (Flug evtl. noch in der
         # Luft, Ziel noch nicht getrackt) → estimated.
         'confidence': 'confirmed' if (dep_icao and arr_icao) else 'estimated',
+        # Freshness (Wrong-Flight-Gate): /flights/aircraft schaut 36 h zurück und
+        # liefert oft den GERADE ABGESCHLOSSENEN Vor-Flug. last_seen durchreichen,
+        # damit der Resolver einen veralteten Kontakt gegen die Live-Zeit prüfen kann.
+        '_last_seen': rec.get('last_seen_unix'),
     }
     if not route['src'] and not route['dst']:
         return None
@@ -851,6 +874,10 @@ def observe_adsb_positions(rows, max_process=400):
                         'cs': leg.get('callsign') or cs,
                         'reg': leg.get('reg') or reg,
                         'hex': hexid,
+                        # AUFGABE-2: volle Leg-Zeiten für die IST-Zeit-Warehouse-Rows.
+                        'dep': leg['dep'], 'dep_icao': leg.get('dep_icao'),
+                        'arr': ap, 'arr_icao': ap_icao,
+                        'dep_ts': leg.get('dep_ts'), 'arr_ts': now,
                     })
                 elif leg:
                     # Offener Leg, aber dep==hier oder unbekannt → verwerfen (kein Leg).
@@ -896,11 +923,94 @@ def observe_adsb_positions(rows, max_process=400):
                 _record_resolved_route(item['cs'], item['reg'], item['route'])
                 _open_leg_delete(item['hex'])     # Leg geschlossen → offenen Zustand löschen
                 recorded += 1
+                # AUFGABE-2: selbst-beobachtete Ist-Zeiten (Ab-/Anflug) zusätzlich
+                # nach airport_delay_obs — delay UNBEKANNT (kein Fake-„pünktlich").
+                try:
+                    _warehouse_write_leg_obs(
+                        item.get('dep'), item.get('dep_icao'),
+                        item.get('arr'), item.get('arr_icao'),
+                        item['cs'], item['reg'],
+                        item.get('dep_ts'), item.get('arr_ts'))
+                except Exception:
+                    pass
         except Exception:
             pass
     _maybe_evict_tracks()
     _open_legs_evict_stale()
     return recorded
+
+
+def _warehouse_write_leg_obs(dep, dep_icao, arr, arr_icao, cs, reg, dep_ts, arr_ts):
+    """AUFGABE-2: bei einer SELBST-beobachteten Ab-/Anflug-Kante (adsb.lol-Sweep)
+    zwei IST-ZEIT-Rows nach airport_delay_obs schreiben — analog zum OpenSky-Fill,
+    über den bestehenden idempotenten Write-Pfad app._delay_obs_write_through.
+
+    EHRLICH: adsb.lol liefert IST-Zeiten, KEINE SOLL-Zeiten → das Delay bleibt
+    UNBEKANNT (max_delay=0, status='', cancelled=False → delay_known bleibt false).
+    KEIN erfundenes „pünktlich". Der Finalizer/Resolver zeigt damit Ist-Ab-/Ankunft
+    + Tail + Herkunft/Ziel, aber nie eine fabrizierte Verspätung.
+      · DEP-Row: airport=<dep>,      dest_iata=<arr> (ZIEL),      sched=IST-Abflug.
+      · ARR-Row: airport=<arr>#ARR,  dest_iata=<dep> (HERKUNFT),  sched=IST-Ankunft.
+    Zeiten in Flughafen-LOKALZEIT (gleiche Basis wie die Scraper). Schema-safe: die
+    `source`-Spalte fehlt evtl. in Prod → der Write-Pfad droppt sie im Fallback.
+    Best-effort, wirft NIE."""
+    wt = _life_app('_delay_obs_write_through')
+    if wt is None:
+        return
+    # #3-FIX (Review): an board-gedeckten Airports (FRA/MUC/… native Boards mit
+    # SOLL-Zeiten) NICHT zusätzlich adsb.lol-IST-Rows schreiben — sonst steht der
+    # Flug in route-history doppelt (andere sched) und verwässert die Pünktlich-
+    # keits-Quote. adsb.lol füllt so nur board-LOSE Hubs; wo ein Board existiert,
+    # bleibt die SOLL-Row die einzige Quelle. (Follow-up: eu_scraper-Airports.)
+    _free = _life_app('_FREE_BOARD_CODES') or frozenset()
+    dep_covered = bool(dep) and dep.upper() in _free
+    arr_covered = bool(arr) and arr.upper() in _free
+    to_local = _life_app('_unix_to_airport_local')
+    cs_to_fn = _life_app('_wh_callsign_to_iata_flightno')
+    cs_u = (cs or '').strip().upper()
+    fn = None
+    if cs_to_fn is not None:
+        try:
+            fn = cs_to_fn(cs_u)
+        except Exception:
+            fn = None
+    fn = (fn or cs_u).replace(' ', '').upper()
+    if not fn:
+        return
+    airline = fn[:2].upper() if fn[:2].isalpha() else (cs_u[:3] if cs_u else '')
+    reg_u = (reg or '').strip().upper() or ''
+
+    def _local(ts, iata):
+        if to_local is None or ts is None or not iata:
+            return None
+        try:
+            dt = to_local(ts, iata)
+        except Exception:
+            return None
+        if dt is None:
+            return None
+        return dt.strftime('%Y-%m-%d'), dt.strftime('%H:%M')
+
+    # DEP-Row (Herkunftsflughafen, dest=Ziel, IST-Abflugzeit).
+    if dep and dep_ts is not None and not dep_covered:
+        dl = _local(dep_ts, dep)
+        if dl:
+            try:
+                wt(dl[0], fn, dl[1], 0, False, dep.upper(), '',
+                   {'dest_iata': (arr or '').upper(), 'airline': airline,
+                    'reg': reg_u, 'source': 'adsb_lol'})
+            except Exception:
+                pass
+    # ARR-Row (Zielflughafen '<AP>#ARR', dest=Herkunft, IST-Ankunftszeit).
+    if arr and arr_ts is not None and not arr_covered:
+        al = _local(arr_ts, arr)
+        if al:
+            try:
+                wt(al[0], fn, al[1], 0, False, (arr.upper() + '#ARR'), '',
+                   {'dest_iata': (dep or '').upper(), 'airline': airline,
+                    'reg': reg_u, 'source': 'adsb_lol'})
+            except Exception:
+                pass
 
 
 def _confirmed_origin_from_tracking(hexid):
@@ -1062,10 +1172,27 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
     #  Netz-Call hier; die Engine füllt den Cache im Poller/Area-Consumer.
 
     # ── 3. OpenSky (FREI mit Account; env-guarded, ohne Creds → None) ───────
+    #  WRONG-FLIGHT-GATE: /flights/aircraft schaut 36 h zurück → oft der gerade
+    #  abgeschlossene Vor-Flug (gleiche Maschine, gestrige/frühere Strecke). Wenn
+    #  die Maschine JETZT airborne ist, muss der OpenSky-Treffer (a) frisch sein
+    #  (last_seen nicht älter als _LIVE_ROUTE_STALE_S) UND (b) die Live-Geometrie
+    #  darf nicht klar widersprechen. Sonst: lieber nichts als die falsche Strecke.
     osky = _opensky_route(hexid)
     if osky and (osky.get('src') or osky.get('dst')):
-        _record_resolved_route(cs, reg, osky, date)
-        return osky
+        last_seen = osky.pop('_last_seen', None)
+        ok = True
+        if not on_ground:
+            try:
+                if last_seen is not None and \
+                        (time.time() - float(last_seen)) > _LIVE_ROUTE_STALE_S:
+                    ok = False            # veralteter Kontakt (Vor-Flug) → verwerfen
+            except (TypeError, ValueError):
+                pass
+            if ok and not _geometry_allows_route(osky, lat, lon, track, gs, on_ground):
+                ok = False                # Geometrie widerspricht klar → verwerfen
+        if ok:
+            _record_resolved_route(cs, reg, osky, date)
+            return osky
 
     # ── 4. Freie generische Lookups (adsbdb / adsb.lol / hexdb) ─────────────
     #  Das sind GENERISCHE Flugplan-Kandidaten. Owner-Regel: „scraped/eigene Infos
@@ -2069,3 +2196,667 @@ def ax_crewbus_post(iata):
         mins = [m]
     return jsonify({'ok': True, 'iata': iata,
                     'avg': _crewbus_avg(mins), 'count': len(mins), 'your_minutes': m})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FLUG-LEBENSZYKLUS  (Owner-Direktive 2026-07-03: „voller Flug-Lebenszyklus,
+# sehr smart mit vorhandenen Daten, NUR gratis")
+# ---------------------------------------------------------------------------
+# Baut AUSSCHLIESSLICH auf bestehenden gratis Bausteinen auf, NICHTS dupliziert:
+#   app.py     _flight_obs_merged (Dual-Side reg/type/gate/dep+arr-delay/known),
+#              _airport_local_now, _parse_local_iso, _DELAY_THRESHOLD_MIN,
+#              _icao_to_iata_best
+#   adsb bp    resolve_reg_to_hex / fetch_live_state / fetch_recent_flight
+#              (OpenSky→adsb.lol, permanent gratis, kein bezahlter Provider)
+#   dieses bp  _resolve_live_route (free-first-Kaskade), _iata_city_name,
+#              _iata_latlon, _gc_km, _callsign_to_iata_flightno, _airport_row,
+#              aircraft_specs.specs_for_type
+# Ehrlichkeits-Regel durchgezogen: ein Feld ist `null`, wenn es (noch) nicht
+# bestimmbar ist — NIE „pünktlich"/erfundene Zeiten. Alles gecacht: die
+# darunterliegenden Board/Track/Route-Caches PLUS ein kurzer Prozess-Memo pro
+# Endpoint-Key (iOS pollt ~30–60 s). free_only=True auf JEDEM Merge → strukturell
+# spend-frei (kein AeroDataBox auf diesen Pfaden).
+# ═══════════════════════════════════════════════════════════════════════════
+
+_LIFECYCLE_MEMO = {}        # key-tuple → (ts, payload dict)
+_LIFECYCLE_TTL = 45         # s — deckt einen 30–60 s-Poll-Zyklus ab
+_LIFECYCLE_MEMO_MAX = 400
+
+
+def _life_app(name, default=None):
+    """app.py-Attribut zur Request-Zeit auflösen (app ist beim Import evtl. noch
+    nicht fertig geladen — Muster wie family_watch._app_attr)."""
+    try:
+        import app as _app_mod
+        return getattr(_app_mod, name, default)
+    except Exception:
+        return default
+
+
+def _memo_get(key):
+    hit = _LIFECYCLE_MEMO.get(key)
+    if hit and (time.time() - hit[0]) < _LIFECYCLE_TTL:
+        return dict(hit[1])
+    return None
+
+
+def _memo_put(key, payload):
+    _LIFECYCLE_MEMO[key] = (time.time(), dict(payload))
+    if len(_LIFECYCLE_MEMO) > _LIFECYCLE_MEMO_MAX:
+        try:
+            items = sorted(_LIFECYCLE_MEMO.items(), key=lambda kv: kv[1][0])
+            for k, _v in items[:len(items) // 4 or 1]:
+                _LIFECYCLE_MEMO.pop(k, None)
+        except Exception:
+            _LIFECYCLE_MEMO.clear()
+    return payload
+
+
+def _parse_local_iso(s):
+    """Naiver Lokalzeit-Parser (Board-`sched`/`esti`-Strings) — delegiert an
+    app._parse_local_iso; robuster Eigen-Fallback, falls app noch nicht geladen."""
+    f = _life_app('_parse_local_iso')
+    if f is not None and f is not _parse_local_iso:
+        return f(s)
+    if not s:
+        return None
+    from datetime import datetime
+    try:
+        dt = datetime.fromisoformat(str(s))
+        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+    except Exception:
+        try:
+            return datetime.strptime(str(s)[:19], '%Y-%m-%dT%H:%M:%S')
+        except Exception:
+            return None
+
+
+def _norm_iata(x):
+    """→ gültiger IATA(3)-Code (ICAO(4) wird via DB/DE-Map aufgelöst) oder None."""
+    c = (x or '').strip().upper()
+    if len(c) == 3 and c.isalpha():
+        return c
+    if len(c) == 4 and c.isalpha():
+        return _icao_to_iata(c)
+    return None
+
+
+def _icao_to_iata(code):
+    """ICAO(4) → IATA(3) über die gebackene Airports-DB (weltweit), Fallback auf
+    die DE-Map aus app.py. Gibt bei 3-stelligem Input diesen zurück; None-safe."""
+    c = (code or '').strip().upper()
+    if len(c) == 3 and c.isalpha():
+        return c
+    if len(c) != 4:
+        return None
+    try:
+        row = _airport_row(c)
+        if row and (row.get('iata') or '').strip():
+            return row['iata'].strip().upper()
+    except Exception:
+        pass
+    f = _life_app('_icao_to_iata_best')
+    r = (f(c) if f else None) or c
+    return r if (len(r) == 3 and r.isalpha()) else None
+
+
+def _airport_brief(iata):
+    """{'iata','city'} für einen Code — None wenn kein gültiger IATA-Code."""
+    ia = _norm_iata(iata)
+    if not ia:
+        return None
+    return {'iata': ia, 'city': _iata_city_name(ia)}
+
+
+def _turnaround_min_for_type(aircraft_type):
+    """Konservative Mindest-Bodenzeit (Min.) nach Rumpf — Owner-Vorgabe:
+    Narrowbody 35, Widebody 60, unbekannt 45. `aircraft_type` darf ICAO-Typecode
+    (A320/B77W) ODER Freitext ('Airbus A320-200') sein."""
+    t = (aircraft_type or '').strip().upper()
+    body = None
+    if t:
+        try:
+            from blueprints.aircraft_specs import specs_for_type
+        except Exception:
+            specs_for_type = None
+        if specs_for_type is not None:
+            sp = specs_for_type(t) or specs_for_type(re.split(r'[\s/\-]+', t)[0])
+            if sp:
+                body = sp.get('body')
+        if body is None:
+            wide = ('A330', 'A340', 'A350', 'A380', 'B747', 'B767', 'B777',
+                    'B787', '747', '767', '777', '787', 'A33', 'A34', 'A35', 'A38')
+            narrow = ('A318', 'A319', 'A320', 'A321', 'A220', 'B737', 'B738',
+                      'B739', 'B73', '737', 'CRJ', 'E170', 'E175', 'E190', 'E195',
+                      'EMB', 'ATR', 'DH8')
+            if any(w in t for w in wide):
+                body = 'wide'
+            elif any(w in t for w in narrow):
+                body = 'narrow'
+    if body == 'wide':
+        return 60
+    if body == 'narrow':
+        return 35
+    return 45
+
+
+def _reg_candidates(reg):
+    """Kandidaten-Schreibweisen einer Registration — Board-Quellen liefern sie mal
+    MIT ('D-AIFF'), mal OHNE Bindestrich ('DAIFF'); die gebackene aircraft-Tabelle
+    hält die ICAO-Form MIT Strich. Wir probieren raw, strichlos und Strich nach
+    Pos 1/2 (deckt D-/G-/F- sowie OE-/HB-/OK-/US-N-Regs ab)."""
+    r = (reg or '').strip().upper()
+    if not r:
+        return []
+    bare = re.sub(r'[^A-Z0-9]', '', r)
+    out = [r, bare]
+    if '-' not in r and len(bare) >= 3:
+        out.append(bare[:1] + '-' + bare[1:])
+        out.append(bare[:2] + '-' + bare[2:])
+    seen, uniq = set(), []
+    for c in out:
+        if c and c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+
+def _reg_hex_typecode_free(reg):
+    """Reg → (hex, typecode) NUR aus gratis/eigenen Quellen: erst der ADS-B-Reg→Hex-
+    Resolver (In-Proc-Cache → Supabase tail_hex → hartkodierte Map), dann als
+    Fallback die gebackene 520k-aircraft-Referenz-DB (offline, kostenlos), die
+    zugleich den ICAO-Typecode liefert. (None, None) wenn nirgends bekannt."""
+    r2h, _fls, _frf, _tw = _adsb_helpers()
+    hexid = None
+    if r2h is not None:
+        try:
+            hexid = r2h(reg)
+        except Exception:
+            hexid = None
+    typecode = None
+    cands = _reg_candidates(reg)
+    if cands and (hexid is None or typecode is None):
+        try:
+            ph = ','.join('?' * len(cands))
+            row = _q1(f'SELECT hex, typecode FROM aircraft WHERE reg IN ({ph}) LIMIT 1',
+                      tuple(cands))
+            if row:
+                hexid = hexid or ((row.get('hex') or '').strip().lower() or None)
+                typecode = (row.get('typecode') or '').strip().upper() or None
+        except Exception:
+            pass
+    return hexid, typecode
+
+
+def _adsb_helpers():
+    """(resolve_reg_to_hex, fetch_live_state, fetch_recent_flight, _touch_watch)
+    aus dem ADS-B-Blueprint — alle gratis (OpenSky/adsb.lol). (None,…) wenn das
+    Blueprint nicht geladen ist (ehrlich degradieren, nie werfen)."""
+    try:
+        from blueprints.adsb_blueprint import (
+            resolve_reg_to_hex, fetch_live_state, fetch_recent_flight, _touch_watch)
+        return resolve_reg_to_hex, fetch_live_state, fetch_recent_flight, _touch_watch
+    except Exception:
+        return None, None, None, None
+
+
+def _live_pos_from_state(row):
+    """OpenSky-State-Row → {lat,lon,alt,gs,track,on_ground} (Einheiten: ft/kt/°)
+    oder None. Layout siehe fetch_live_state/_fetch_adsb_lol."""
+    if not (row and isinstance(row, (list, tuple)) and len(row) > 6):
+        return None
+    lat, lon = row[6], row[5]
+    if lat is None or lon is None:
+        return None
+    on_ground = bool(row[8]) if (len(row) > 8 and row[8] is not None) else False
+
+    def _num(i, conv):
+        try:
+            v = row[i] if len(row) > i else None
+            return conv(v) if v is not None else None
+        except Exception:
+            return None
+    return {
+        'lat': lat, 'lon': lon,
+        'alt': _num(7, lambda v: round(float(v) / 0.3048)),          # m → ft
+        'gs': _num(9, lambda v: round(float(v) / 0.514444, 1)),      # m/s → kt
+        'track': _num(10, lambda v: round(float(v), 1)),
+        'on_ground': on_ground,
+    }
+
+
+def _machine_live(reg, want_route=True):
+    """Für EINE Registration → (hex, callsign, pos_dict, route_dict). Rein gratis
+    (Reg→Hex via Resolver+gebackene DB → OpenSky/adsb.lol-Live-State + free-first-
+    Routen-Kaskade). Alle Rückgaben None-safe; wirft nie."""
+    _r2h, fls, frf, touch = _adsb_helpers()
+    reg = (reg or '').strip().upper() or None
+    if not reg:
+        return None, None, None, None
+    hexid, _typecode = _reg_hex_typecode_free(reg)
+    if not hexid:
+        return None, None, None, None
+    if touch is not None:
+        try:
+            touch(hexid, registration=reg, priority=1)
+        except Exception:
+            pass
+    row = None
+    try:
+        row = fls(hexid)
+    except Exception:
+        row = None
+    pos = _live_pos_from_state(row)
+    cs = None
+    if row and len(row) > 1 and row[1]:
+        cs = str(row[1]).strip().upper() or None
+    if not cs and frf is not None:
+        try:
+            fl = frf(hexid)
+            if fl and fl.get('callsign'):
+                cs = str(fl['callsign']).strip().upper() or None
+        except Exception:
+            pass
+    route = None
+    if want_route and cs:
+        try:
+            route = _resolve_live_route(
+                cs, hexid=hexid, reg=reg,
+                lat=(pos or {}).get('lat'), lon=(pos or {}).get('lon'),
+                track=(pos or {}).get('track'), gs=(pos or {}).get('gs'),
+                on_ground=bool((pos or {}).get('on_ground')))
+        except Exception:
+            route = None
+    return hexid, cs, pos, route
+
+
+def _inbound_arr_row_by_reg(dep_iata, reg):
+    """Ankunfts-Board-Zeile an dep_iata, deren Reg == reg (bindestrich-tolerant)
+    und die noch nicht gelandet ist → der physische Zubringer mitsamt echter
+    IATA-Flugnummer/Herkunft/Soll+Ist-Ankunft. GRATIS: nur der bereits gefüllte
+    In-Memory-Board-Cache (kein Fetch, kein Spend — der Poller hält die Basis-
+    Boards warm). None-safe."""
+    cached = _life_app('_cached_board_rows')
+    if cached is None or not dep_iata or not reg:
+        return None
+    try:
+        rows = cached(dep_iata, 'arrival') or []
+    except Exception:
+        rows = []
+    target = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
+    if not target:
+        return None
+    landed = ('gelandet', 'landed', 'arrived', 'gepäck', 'baggage', 'on blocks',
+              'at gate')
+    for r in rows:
+        rr = re.sub(r'[^A-Z0-9]', '', (r.get('reg') or '').upper())
+        if rr and rr == target:
+            st = (r.get('status') or '').lower()
+            if any(m in st for m in landed):
+                return None      # schon da → kein „kommender" Zubringer mehr
+            return r
+    return None
+
+
+def _route_endpoints(route):
+    """route-Dict → (src_iata, dst_iata) best-effort (IATA bevorzugt, sonst ICAO
+    aufgelöst). (None,None) bei fehlender Route."""
+    if not route:
+        return None, None
+    src = _norm_iata(route.get('src')) or _icao_to_iata(route.get('src_icao'))
+    dst = _norm_iata(route.get('dst')) or _icao_to_iata(route.get('dst_icao'))
+    return src, dst
+
+
+def _progress_along_route(dep_iata, dst_iata, pos):
+    """Großkreis-Fortschritt 0..1 der Live-Position zwischen dep und dst. None
+    wenn Koordinaten fehlen. Geklemmt (Anflug-Overshoot/Rauschen → 0..1)."""
+    if not pos or pos.get('lat') is None or pos.get('lon') is None:
+        return None
+    o = _iata_latlon((dep_iata or '').upper())
+    d = _iata_latlon((dst_iata or '').upper())
+    if not o or not d:
+        return None
+    total = _gc_km(o[0], o[1], d[0], d[1])
+    if total < 1.0:
+        return None
+    done = _gc_km(o[0], o[1], pos['lat'], pos['lon'])
+    return round(max(0.0, min(1.0, done / total)), 3)
+
+
+def _build_inbound_chain(flight_no, date, dep_iata):
+    """KERN-Trick (#1): (a) welche Maschine ist meinem Abflug zugeteilt (Reg aus
+    Warehouse/Live-Board des Abflugs, gratis); (b) wo ist dieselbe Reg GERADE —
+    ist ihre aktuelle Live-Route → dep_iata, ist das der Zubringer; (c) dessen
+    Zeiten/Delay aus der Ankunfts-Seite an dep_iata. PLUS Abflug-Delay-Prognose
+    (#2). Gibt (chain, forecast, my_merged). Ehrlich: null statt erfunden."""
+    from datetime import timedelta
+    merged_fn = _life_app('_flight_obs_merged')
+    dep = _norm_iata(dep_iata)
+    chain = {
+        'inbound_flight_no': None, 'inbound_origin': None,
+        'inbound_sched_arr': None, 'inbound_est_arr': None,
+        'inbound_delay_min': None, 'inbound_live': None,
+        'reg': None, 'aircraft_type': None,
+    }
+    forecast = {
+        'forecast_dep_delay_min': None, 'confidence': 'keine',
+        'reason': 'Zubringer-Maschine noch nicht bestimmbar.',
+        'sched_dep': None, 'min_turnaround_min': None,
+    }
+    my = (merged_fn(flight_no, date=date, dep_iata=dep, free_only=True)
+          if merged_fn else None)
+    reg = (my or {}).get('reg') or None
+    ac_type = (my or {}).get('aircraft') or None
+    sched_dep = (my or {}).get('sched_dep')
+    if reg and not ac_type:
+        # Typecode gratis aus der gebackenen aircraft-DB (für den Turnaround-Puffer).
+        _hx, tc = _reg_hex_typecode_free(reg)
+        ac_type = tc or ac_type
+    chain['reg'] = reg
+    chain['aircraft_type'] = ac_type
+    forecast['sched_dep'] = sched_dep
+    if not reg or not dep:
+        return chain, forecast, my
+
+    # (b) Der physische Zubringer = die Ankunfts-Board-Zeile an dep_iata mit
+    # DERSELBEN Reg (das Board hat die Maschine dem Inbound bereits zugeteilt) —
+    # autoritativer als die ADS-B-Callsign-Ableitung und liefert die echte
+    # IATA-Flugnummer + Herkunft + Soll/Ist-Ankunft. Gratis (cache-only, der
+    # Poller hält die Basis-Boards warm). Live-Position/-Route dienen als
+    # Bestätigung + In-der-Luft-Marker.
+    _hex, cs, pos, route = _machine_live(reg)
+    arr_row = _inbound_arr_row_by_reg(dep, reg)
+    inbound_fn = inbound_origin = None
+    row_sched = row_esti = row_delay = None
+    if arr_row:
+        inbound_fn = (arr_row.get('flight') or '').replace(' ', '').upper() or None
+        inbound_origin = _norm_iata(arr_row.get('dest_iata'))  # arr-Board: dest=Herkunft
+        row_sched = arr_row.get('sched') or None
+        row_esti = arr_row.get('esti') or None
+        if not ac_type and (arr_row.get('aircraft') or '').strip():
+            ac_type = arr_row['aircraft'].strip()
+            chain['aircraft_type'] = ac_type
+    if not inbound_origin:
+        # Fallback: ADS-B-Live-Route dieser Reg → Ziel == mein Abflughafen?
+        src, dst = _route_endpoints(route)
+        if dst and dst == dep:
+            inbound_origin = src
+            if cs:
+                inbound_fn = _callsign_to_iata_flightno(cs) or cs
+    if not inbound_origin:
+        # Zubringer (noch) nicht eindeutig bestimmbar → ehrlich null lassen.
+        return chain, forecast, my
+
+    chain['inbound_flight_no'] = inbound_fn
+    chain['inbound_origin'] = _airport_brief(inbound_origin)
+    if pos and not pos.get('on_ground'):
+        chain['inbound_live'] = pos      # nur wenn wirklich in der Luft
+
+    # (c) Ankunfts-Seite des Zubringers AN meinem Abflughafen: bevorzugt der
+    # zentrale Dual-Side-Resolver (ehrliche delay_known-Semantik), sonst direkt
+    # aus der Board-Zeile (Soll/Ist), Delay aus esti−sched (esti gesetzt = bekannt).
+    merged_in = (merged_fn(inbound_fn, dep_iata=inbound_origin, arr_iata=dep,
+                           free_only=True)
+                 if (merged_fn and inbound_fn) else None)
+    if merged_in:
+        chain['inbound_sched_arr'] = merged_in.get('sched_arr') or row_sched
+        chain['inbound_est_arr'] = merged_in.get('esti_arr') or row_esti
+        if merged_in.get('delay_known'):
+            chain['inbound_delay_min'] = merged_in.get('arr_delay_min')
+        if not ac_type and merged_in.get('aircraft'):
+            ac_type = merged_in.get('aircraft')
+            chain['aircraft_type'] = ac_type
+    else:
+        chain['inbound_sched_arr'] = row_sched
+        chain['inbound_est_arr'] = row_esti
+    if chain['inbound_delay_min'] is None and chain['inbound_sched_arr'] and chain['inbound_est_arr']:
+        _sa = _parse_local_iso(chain['inbound_sched_arr'])
+        _ea = _parse_local_iso(chain['inbound_est_arr'])
+        if _sa is not None and _ea is not None:
+            # esti gesetzt → Delay ist bekannt (auch wenn 0/negativ = pünktlich/früh).
+            chain['inbound_delay_min'] = int(round((_ea - _sa).total_seconds() / 60.0))
+
+    # ── #2 Abflug-Delay-Prognose ──────────────────────────────────────────────
+    sd = _parse_local_iso(sched_dep)
+    eta = _parse_local_iso(chain['inbound_est_arr']) if chain['inbound_est_arr'] else None
+    if eta is None and chain['inbound_sched_arr'] and chain['inbound_delay_min'] is not None:
+        base = _parse_local_iso(chain['inbound_sched_arr'])
+        if base is not None:
+            eta = base + timedelta(minutes=int(chain['inbound_delay_min']))
+    city = (chain['inbound_origin'] or {}).get('city') or inbound_origin
+    if sd is not None and eta is not None:
+        # sched_dep UND Ankunft am selben Flughafen (dep_iata) → identische TZ,
+        # naiver Vergleich ist korrekt (keine Zeitzonen-Mathematik nötig).
+        turn = _turnaround_min_for_type(ac_type)
+        earliest = max(sd, eta + timedelta(minutes=turn))
+        forecast['forecast_dep_delay_min'] = max(0, int(round(
+            (earliest - sd).total_seconds() / 60.0)))
+        forecast['min_turnaround_min'] = turn
+        airborne = bool(chain['inbound_live'])
+        forecast['confidence'] = 'hoch' if (chain['inbound_est_arr'] and airborne) else 'mittel'
+        d = chain['inbound_delay_min']
+        if d is not None and d > 0:
+            forecast['reason'] = f'Maschine kommt +{d} aus {city}.'
+        elif d is not None:
+            forecast['reason'] = f'Maschine kommt pünktlich aus {city}.'
+        else:
+            forecast['reason'] = f'Maschine kommt aus {city}.'
+    else:
+        # Zubringer identifiziert, aber keine belastbare Ankunftszeit → KEINE
+        # Prognose (niemals „pünktlich" behaupten), Herkunft trotzdem nennen.
+        forecast['reason'] = f'Zubringer aus {city} — Ankunftszeit noch offen.'
+    return chain, forecast, my
+
+
+@aerox_data_bp.route('/api/ax/flight-inbound-chain/<token>', methods=['GET'])
+def ax_flight_inbound_chain(token):
+    """#1 Tail-Verkettung + #2 Abflug-Delay-Prognose in EINEM Payload.
+    Query: flight_no, date=YYYY-MM-DD, dep_iata. Gratis (Warehouse/Board-Enrich +
+    OpenSky-Live). iOS zeigt „Deine Maschine kommt +40 aus Madrid, Abflug vsl.
+    +15" auf der Vorflug-Karte; pollt ~60 s."""
+    from flask import request
+    flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    date = (request.args.get('date') or '').strip()[:10] or None
+    dep_iata = _norm_iata(request.args.get('dep_iata'))
+    if len(flight_no) < 3 or not dep_iata:
+        return jsonify({'ok': False, 'error': 'need_flight_no_and_dep_iata'}), 400
+    mkey = ('chain', flight_no, date or '', dep_iata)
+    memo = _memo_get(mkey)
+    if memo is not None:
+        return jsonify(memo)
+    chain, forecast, _my = _build_inbound_chain(flight_no, date, dep_iata)
+    payload = {
+        'ok': True, 'flight': flight_no, 'date': date, 'dep_iata': dep_iata,
+        **chain, 'dep_delay_forecast': forecast,
+    }
+    return jsonify(_memo_put(mkey, payload))
+
+
+@aerox_data_bp.route('/api/ax/flight-live/<token>', methods=['GET'])
+def ax_flight_live(token):
+    """#3 Live-Track der EIGENEN Maschine für die In-Flight-Karte. Query:
+    flight_no, date, reg (optional). Reg→Hex→OpenSky-Position + free-first-Route,
+    dazu dep/dest (IATA+Stadt), sched/est-Ankunft, Ankunfts-Delay, Ziel-Gate und
+    Großkreis-Fortschritt 0..1. Gratis, cachebar, iOS pollt ~30–60 s."""
+    from flask import request
+    flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    date = (request.args.get('date') or '').strip()[:10] or None
+    reg = (request.args.get('reg') or '').strip().upper() or None
+    if len(flight_no) < 3:
+        return jsonify({'ok': False, 'error': 'need_flight_no'}), 400
+    mkey = ('live', flight_no, date or '', reg or '')
+    memo = _memo_get(mkey)
+    if memo is not None:
+        return jsonify(memo)
+    merged_fn = _life_app('_flight_obs_merged')
+    my = merged_fn(flight_no, date=date, free_only=True) if merged_fn else None
+    if not reg:
+        reg = (my or {}).get('reg') or None
+    hexid, cs, pos, route = _machine_live(reg) if reg else (None, None, None, None)
+    src, dst = _route_endpoints(route)
+    dep = src or _norm_iata((my or {}).get('dep_iata'))
+    dest = dst or _norm_iata((my or {}).get('arr_iata'))
+    # Ankunfts-Seite (Zeiten/Delay/Gate) frisch für die konkrete Strecke.
+    merged = (merged_fn(flight_no, date=date, dep_iata=dep, arr_iata=dest,
+                        free_only=True) if merged_fn else None) or my or {}
+    in_flight = bool(pos and not pos.get('on_ground'))
+    payload = {
+        'ok': True, 'flight': flight_no, 'date': date,
+        'reg': reg, 'hex': hexid, 'callsign': cs,
+        'dep': _airport_brief(dep), 'dest': _airport_brief(dest),
+        'sched_arr': merged.get('sched_arr'),
+        'est_arr': merged.get('esti_arr'),
+        'arr_delay_min': (merged.get('arr_delay_min')
+                          if merged.get('delay_known') else None),
+        'dest_gate': merged.get('gate_arr'),
+        'live': pos,
+        'in_flight': in_flight,
+        'progress': (_progress_along_route(dep, dest, pos) if in_flight else None),
+        'source': (route.get('source') if route else None),
+    }
+    return jsonify(_memo_put(mkey, payload))
+
+
+@aerox_data_bp.route('/api/ax/turnaround/<token>', methods=['GET'])
+def ax_turnaround(token):
+    """#4 Turnaround → nächster Sektor. Query: flight_no, dep, arr (=Wende-
+    Flughafen), date, next_flight_no, next_arr. Gleiche Reg → same_aircraft:true +
+    Bodenzeit + next_gate; neue Maschine → deren Inbound-Chain (#1) + Prognose
+    (#2). Ehrlich: same_aircraft:null wenn eine Reg-Seite unbekannt ist."""
+    from flask import request
+    cur_fn = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    cur_dep = _norm_iata(request.args.get('dep'))
+    turn = _norm_iata(request.args.get('arr'))          # Wende-Flughafen
+    date = (request.args.get('date') or '').strip()[:10] or None
+    next_fn = (request.args.get('next_flight_no') or '').replace(' ', '').upper().strip()
+    next_arr = _norm_iata(request.args.get('next_arr'))
+    if len(cur_fn) < 3 or not turn or len(next_fn) < 3:
+        return jsonify({'ok': False, 'error': 'need_current_and_next_sector'}), 400
+    mkey = ('turn', cur_fn, date or '', turn, next_fn)
+    memo = _memo_get(mkey)
+    if memo is not None:
+        return jsonify(memo)
+    from datetime import timedelta
+    merged_fn = _life_app('_flight_obs_merged')
+    # Reg der ANKOMMENDEN (aktuellen) Maschine + Soll-Ankunft am Wende-Flughafen.
+    cur = (merged_fn(cur_fn, date=date, dep_iata=cur_dep, arr_iata=turn,
+                     free_only=True) if merged_fn else None) or {}
+    reg_cur = cur.get('reg') or None
+    cur_sched_arr = cur.get('sched_arr')
+    cur_est_arr = cur.get('esti_arr')
+    # Nächster Sektor: Inbound-Chain (löst zugleich reg_next am Wende-Flughafen auf).
+    chain, forecast, next_my = _build_inbound_chain(next_fn, date, turn)
+    reg_next = chain.get('reg') or (next_my or {}).get('reg')
+    next_sched_dep = (next_my or {}).get('sched_dep')
+    next_gate = (next_my or {}).get('gate_dep')
+    # Bodenzeit (Soll) — Ankunft & Abflug am selben Flughafen → gleiche TZ.
+    ground_min = None
+    a = _parse_local_iso(cur_est_arr or cur_sched_arr)
+    dpt = _parse_local_iso(next_sched_dep)
+    if a is not None and dpt is not None:
+        gm = int(round((dpt - a).total_seconds() / 60.0))
+        if -180 <= gm <= 24 * 60:
+            ground_min = gm
+    if reg_cur and reg_next:
+        same = (reg_cur == reg_next)
+    else:
+        same = None                       # eine Seite unbekannt → ehrlich offen
+    payload = {
+        'ok': True, 'turnaround_airport': _airport_brief(turn), 'date': date,
+        'current_flight': cur_fn, 'next_flight': next_fn,
+        'next_dest': _airport_brief(next_arr),
+        'same_aircraft': same,
+        'reg': reg_cur or reg_next,
+        'ground_time_min': ground_min,
+        'next_gate': next_gate,
+        'next_sched_dep': next_sched_dep,
+        'current_sched_arr': cur_sched_arr,
+        'current_est_arr': cur_est_arr,
+    }
+    if same is not True:
+        # Neue (oder unbestimmte) Maschine → welcher Zubringer bringt sie?
+        payload['inbound_chain'] = chain
+        payload['dep_delay_forecast'] = forecast
+    return jsonify(_memo_put(mkey, payload))
+
+
+def _local_to_utc(s, iata):
+    """Naiver Lokalzeit-String am Flughafen `iata` → aware UTC-datetime (via
+    airport_tz + zoneinfo). None bei Unparsbar/unbekannter TZ."""
+    from datetime import timezone
+    dt = _parse_local_iso(s)
+    if dt is None:
+        return None
+    try:
+        from airport_tz import airport_tz
+        from zoneinfo import ZoneInfo
+        tzn = airport_tz((iata or '').upper()) or 'UTC'
+        return dt.replace(tzinfo=ZoneInfo(tzn)).astimezone(timezone.utc)
+    except Exception:
+        try:
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+
+@aerox_data_bp.route('/api/ax/flight-recap/<token>', methods=['GET'])
+def ax_flight_recap(token):
+    """#5 Post-Flight-Recap. Query: flight_no, date, dep_iata, arr_iata (die
+    beiden Airports gibt der Roster-Leg mit — nötig, damit der Dual-Side-Resolver
+    die richtige Board/Warehouse-Zeile findet). Finalizer-Wahrheit (on_time/late/
+    cancelled, delay_known), Block-/Flugzeit wenn aus Obs ableitbar, tatsächliche
+    Ab-/Ankunftszeiten. Gratis. Solange nichts Bekanntes vorliegt: status='pending'
+    + „wird noch ermittelt" (NIE „pünktlich" behaupten)."""
+    from flask import request
+    flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    date = (request.args.get('date') or '').strip()[:10] or None
+    q_dep = _norm_iata(request.args.get('dep_iata'))
+    q_arr = _norm_iata(request.args.get('arr_iata'))
+    if len(flight_no) < 3:
+        return jsonify({'ok': False, 'error': 'need_flight_no'}), 400
+    mkey = ('recap', flight_no, date or '', q_dep or '', q_arr or '')
+    memo = _memo_get(mkey)
+    if memo is not None:
+        return jsonify(memo)
+    merged_fn = _life_app('_flight_obs_merged')
+    m = (merged_fn(flight_no, date=date, dep_iata=q_dep, arr_iata=q_arr,
+                   free_only=True) if merged_fn else None)
+    thr = _life_app('_DELAY_THRESHOLD_MIN', 15)
+    if not m:
+        payload = {'ok': True, 'flight': flight_no, 'date': date,
+                   'status': 'pending', 'delay_known': False,
+                   'message': 'wird noch ermittelt'}
+        return jsonify(_memo_put(mkey, payload))
+    dep = _norm_iata(m.get('dep_iata'))
+    dest = _norm_iata(m.get('arr_iata'))
+    cancelled = bool(m.get('cancelled'))
+    known = bool(m.get('delay_known'))
+    best = m.get('delay_min')
+    if cancelled:
+        status = 'cancelled'
+    elif known:
+        status = 'on_time' if (best is not None and best < int(thr)) else 'late'
+    else:
+        status = 'pending'
+    # Block-/Flugzeit nur wenn tatsächliche (IST) Zeiten beider Seiten vorliegen.
+    actual_dep = m.get('esti_dep')
+    actual_arr = m.get('esti_arr')
+    block_min = None
+    du = _local_to_utc(actual_dep, dep) if (actual_dep and dep) else None
+    au = _local_to_utc(actual_arr, dest) if (actual_arr and dest) else None
+    if du is not None and au is not None:
+        bm = int(round((au - du).total_seconds() / 60.0))
+        if 0 < bm <= 20 * 60:
+            block_min = bm
+    payload = {
+        'ok': True, 'flight': flight_no, 'date': date,
+        'dep': _airport_brief(dep), 'dest': _airport_brief(dest),
+        'status': status, 'delay_known': known, 'cancelled': cancelled,
+        'delay_min': (best if known else None),
+        'sched_dep': m.get('sched_dep'), 'sched_arr': m.get('sched_arr'),
+        'actual_dep': actual_dep, 'actual_arr': actual_arr,
+        'block_time_min': block_min,
+        'message': ('wird noch ermittelt' if status == 'pending' else None),
+    }
+    return jsonify(_memo_put(mkey, payload))

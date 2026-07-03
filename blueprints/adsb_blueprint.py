@@ -1502,6 +1502,25 @@ def fetch_recent_flight(hex_id, lookback_hours=36):
     }
 
 
+def _lol_on_ground(alt_baro_raw, alt_ft, gs_kts):
+    """on_ground aus adsb.lol-Feldern. WICHTIG (Rollfeld-Zwilling, Korrektheit):
+    adsb.lol sendet den String "ground" NUR wenn der Receiver das Ground-Bit
+    bekommt — eine rollende/gerade gelandete Maschine meldet oft stattdessen eine
+    kleine numerische Höhe (10–50 ft) bei niedriger Geschwindigkeit und würde sonst
+    fälschlich als airborne gelten. Wir vereinheitlichen die Boden-Erkennung über
+    aerox_data_blueprint._obs_is_grounded (single source of truth: alt ≤ ~200 ft
+    UND gs < ~60 kt). Wirft NIE."""
+    if alt_baro_raw == "ground":
+        return True
+    try:
+        from blueprints.aerox_data_blueprint import _obs_is_grounded
+        return _obs_is_grounded({'on_ground': False, 'alt': alt_ft, 'speed': gs_kts})
+    except Exception:
+        # Fallback (Import-Reihenfolge/Zirkular): dieselbe Schwelle inline.
+        return (alt_ft is not None and alt_ft <= 200
+                and (gs_kts is None or gs_kts < 60))
+
+
 def _fetch_adsb_lol(hex_id):
     """
     Fallback-Upstream: adsb.lol `/v2/icao/<hex24>`.
@@ -1567,11 +1586,14 @@ def _fetch_adsb_lol(hex_id):
             return None
 
     alt_baro_raw = ac.get("alt_baro")
-    on_ground = alt_baro_raw == "ground"
-    alt_baro_ft = _f(alt_baro_raw) if not on_ground else None
+    string_ground = alt_baro_raw == "ground"
+    alt_baro_ft = _f(alt_baro_raw) if not string_ground else None
     alt_geom_ft = _f(ac.get("alt_geom"))
     gs_kts = _f(ac.get("gs"))
     baro_rate_fpm = _f(ac.get("baro_rate"))
+    # Rollfeld-Zwilling: String "ground" ODER tief&langsam (rollende Maschine mit
+    # kleiner numerischer Höhe) → am Boden. Sonst gilt sie fälschlich als airborne.
+    on_ground = _lol_on_ground(alt_baro_raw, alt_baro_ft, gs_kts)
 
     # ft → m für altitude (1 ft = 0.3048 m)
     alt_baro_m = alt_baro_ft * 0.3048 if alt_baro_ft is not None else None
@@ -1933,6 +1955,11 @@ def adsb_poll():
     sweep_points = 0
     try:
         sweep_rows = _european_sweep_rows(now)
+        # Weltweiter Crew-Hub-Ring (env-gated, EIGENE Rotation → EU-Frequenz bleibt
+        # unangetastet). Board-lose Übersee-Hubs gratis & auth-frei (kein OpenSky).
+        world_rows = _world_sweep_rows(now)
+        if world_rows:
+            sweep_rows = sweep_rows + world_rows
         sweep_points = len(sweep_rows)
         if sweep_rows:
             from blueprints.aerox_data_blueprint import observe_adsb_positions
@@ -2250,8 +2277,13 @@ def _normalize_adsb_lol_ac(ac):
     if lat is None or lon is None:
         return None
     alt_raw = ac.get("alt_baro")
-    on_ground = (alt_raw == "ground")
-    alt = 0 if on_ground else _coerce_float(alt_raw)
+    string_ground = (alt_raw == "ground")
+    alt_num = None if string_ground else _coerce_float(alt_raw)
+    gs_kts = _coerce_float(ac.get("gs"))
+    # Rollfeld-Zwilling: String "ground" ODER tief&langsam → am Boden (sonst gilt
+    # eine rollende Maschine mit kleiner numerischer Höhe fälschlich als airborne).
+    on_ground = _lol_on_ground(alt_raw, alt_num, gs_kts)
+    alt = 0 if string_ground else alt_num
     flight = (ac.get("flight") or "").strip() or None
     reg = (ac.get("r") or "").strip() or None
     return {
@@ -2260,8 +2292,8 @@ def _normalize_adsb_lol_ac(ac):
         "callsign": flight,           # Alias — manche Clients erwarten `callsign`
         "lat": lat,
         "lon": lon,
-        "alt": alt,                   # ft (baro), 0 wenn am Boden
-        "speed": _coerce_float(ac.get("gs")),      # ground speed kts
+        "alt": alt,                   # ft (baro), 0 wenn am Boden (String-ground)
+        "speed": gs_kts,              # ground speed kts
         "heading": _coerce_float(ac.get("track")),  # track deg
         "squawk": (ac.get("squawk") or None),
         "reg": reg,
@@ -2360,6 +2392,45 @@ _EU_SWEEP_POINTS = [
 ]
 _EU_SWEEP_RADIUS_NM = 250
 
+# ─── Weltweiter Crew-Hub-Sweep (adsb.lol, FREI, EIGENE Rotation) ─────────────
+#  Owner-Problem: board-lose Übersee-Hubs (ORD/ICN/BKK/GRU/…) haben KEINE freie
+#  Board-JSON und der OpenSky-Fill ist in Prod tot (Basic-Auth 2025 abgeschaltet,
+#  keine OAuth2-Creds). adsb.lol ist gratis, ohne Cap, ohne Auth und verifiziert
+#  (ORD/ICN/BKK/GRU) → wir decken diese Hubs mit einem EIGENEN, separat rotierenden
+#  Ring ab. GETRENNT vom Europa-Sweep, damit die EU-Abdeckung/Frequenz NICHT
+#  verwässert (eigenes Env + eigener Rotations-Cursor). Default AUS — der Owner
+#  aktiviert per AX_WORLD_SWEEP=1. Jeder Treffer läuft durch observe_adsb_positions
+#  → self-computed Leg + (neu) IST-Zeit-Row nach airport_delay_obs, gratis & auth-frei.
+_WORLD_SWEEP_POINTS = [
+    (41.98,  -87.90),  # ORD Chicago (verifiziert)
+    (40.70,  -73.90),  # JFK/EWR/LGA New York
+    (33.94, -118.41),  # LAX Los Angeles
+    (37.62, -122.38),  # SFO San Francisco
+    (33.64,  -84.43),  # ATL Atlanta
+    (25.79,  -80.29),  # MIA Miami
+    (43.68,  -79.63),  # YYZ Toronto
+    (19.44,  -99.07),  # MEX Mexico City
+    (-23.43, -46.47),  # GRU São Paulo (verifiziert)
+    (-34.82, -58.54),  # EZE Buenos Aires
+    (4.70,   -74.15),  # BOG Bogotá
+    (30.11,   31.40),  # CAI Kairo
+    (-26.14,  28.25),  # JNB Johannesburg
+    (25.25,   55.36),  # DXB Dubai
+    (24.44,   54.65),  # AUH Abu Dhabi
+    (25.27,   51.61),  # DOH Doha
+    (28.56,   77.10),  # DEL Delhi
+    (19.09,   72.87),  # BOM Mumbai
+    (13.69,  100.75),  # BKK Bangkok (verifiziert)
+    (1.36,   103.99),  # SIN Singapur
+    (22.31,  113.91),  # HKG Hongkong
+    (37.46,  126.44),  # ICN Seoul (verifiziert)
+    (35.68,  139.90),  # NRT/HND Tokyo
+    (31.15,  121.80),  # PVG Shanghai
+    (40.08,  116.60),  # PEK Peking
+    (-33.95, 151.18),  # SYD Sydney
+]
+_WORLD_SWEEP_RADIUS_NM = 250
+
 
 def _european_sweep_rows(now_ts):
     """Immer-an, freie Europa-Abdeckung via adsb.lol. Rotiert zeit-basiert durch
@@ -2381,6 +2452,32 @@ def _european_sweep_rows(now_ts):
             rows.extend(_fetch_adsb_lol_point(lat, lon, _EU_SWEEP_RADIUS_NM))
         except Exception:
             continue
+    return rows
+
+
+def _world_sweep_rows(now_ts):
+    """Freier weltweiter Crew-Hub-Sweep via adsb.lol — EIGENE, separat rotierende
+    Abdeckung board-loser Übersee-Hubs (ORD/ICN/BKK/GRU/…). Getrennt vom Europa-
+    Sweep, damit dessen Frequenz nicht verwässert. Env AX_WORLD_SWEEP=1 schaltet ihn
+    EIN (Default AUS). AX_WORLD_SWEEP_POINTS_PER_TICK Punkte je Tick (Default 1).
+    Rotiert zeit-basiert (stateless, serverless-freundlich). 429/Netz → still
+    tolerieren (kein Cap bei adsb.lol, aber weiche IP-Limits respektieren). Wirft NIE."""
+    if os.environ.get('AX_WORLD_SWEEP', '0').strip() not in ('1', 'true', 'on'):
+        return []
+    try:
+        n = max(1, min(len(_WORLD_SWEEP_POINTS),
+                       int(os.environ.get('AX_WORLD_SWEEP_POINTS_PER_TICK', '1'))))
+    except (TypeError, ValueError):
+        n = 1
+    # Eigener Cursor (60-s-Takt × n) → unabhängig vom EU-Sweep-Cursor.
+    base = int(now_ts // 60) * n
+    rows = []
+    for k in range(n):
+        lat, lon = _WORLD_SWEEP_POINTS[(base + k) % len(_WORLD_SWEEP_POINTS)]
+        try:
+            rows.extend(_fetch_adsb_lol_point(lat, lon, _WORLD_SWEEP_RADIUS_NM))
+        except Exception:
+            continue      # 429/Timeout/Netz → weicher Skip, nächster Tick rotiert weiter
     return rows
 
 
