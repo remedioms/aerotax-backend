@@ -241,6 +241,54 @@ def _route_from_obs(callsign):
     return None
 
 
+def _route_from_warehouse(hexid=None, reg=None):
+    """BOARD-verifizierte Route aus dem Flight-Warehouse (`flights`-Tabelle,
+    gleiche Supabase): dessen Matcher hat Board-Tail → ICAO-Hex aufgelöst
+    (tail-first, hyphen-tolerant). Der Lookup läuft über HEX (bzw. Tail) —
+    deckt damit insbesondere ALPHANUMERISCHE Callsigns (LH441 fliegt als
+    DLH4CK) ab, an denen jedes Flugnummern-Matching prinzipiell scheitert.
+    Nur Flüge im Live-Fenster (Abflug −3 h … +4 h). None bei Miss/SB-down."""
+    sb = _sb()
+    if sb is None or not (hexid or reg):
+        return None
+    try:
+        q = (sb.table('flights')
+             .select('op_flight_no,origin,destination,gate,terminal,status,'
+                     'tail,hex,sched_dep,est_dep')
+             .gte('service_date',
+                  time.strftime('%Y-%m-%d', time.gmtime(time.time() - 86400))))
+        if hexid:
+            q = q.eq('hex', (hexid or '').lower())
+        else:
+            raw = (reg or '').replace('-', '').upper()
+            variants = {reg, raw}
+            if len(raw) >= 3:
+                variants.add(raw[:1] + '-' + raw[1:])
+                variants.add(raw[:2] + '-' + raw[2:])
+            q = q.in_('tail', sorted(v for v in variants if v))
+        rows = (q.order('updated_at', desc=True).limit(4).execute()).data or []
+        now = time.time()
+        from datetime import datetime as _dt
+        for f in rows:
+            dep_iso = f.get('est_dep') or f.get('sched_dep')
+            if not dep_iso:
+                continue
+            try:
+                dep_ts = _dt.fromisoformat(
+                    str(dep_iso).replace('Z', '+00:00')).timestamp()
+            except (TypeError, ValueError):
+                continue
+            if now - 3 * 3600 <= dep_ts <= now + 4 * 3600:
+                return {'src': f.get('origin'), 'dst': f.get('destination'),
+                        'gate': f.get('gate'), 'terminal': f.get('terminal'),
+                        'status': f.get('status'), 'reg': f.get('tail'),
+                        'flight_no': f.get('op_flight_no'),
+                        'source': 'warehouse_board'}
+    except Exception:
+        return None
+    return None
+
+
 def _aviationstack_route(callsign):
     """AUTORITATIVE Live-Route per ICAO-Callsign (AviationStack /flights). Anders
     als die STATISCHE adsbdb-Tabelle kennt das die TATSÄCHLICHE Strecke des Fluges
@@ -1190,6 +1238,14 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
         obs['confidence'] = 'confirmed'
         _record_resolved_route(cs, reg, obs, date)
         return obs
+    # 1d. Flight-Warehouse: BOARD-Tail↔Hex-Match (Rule 1) — hex-basiert, greift
+    #     genau dort, wo 1c scheitert: alphanumerische Callsigns (DLH4CK), deren
+    #     Flugnummer sich nicht aus dem Callsign ableiten lässt.
+    wh = _route_from_warehouse(hexid, reg)
+    if wh and (wh.get('src') or wh.get('dst')):
+        wh['confidence'] = 'confirmed'
+        _record_resolved_route(cs, reg, wh, date)
+        return wh
 
     # ── 2. Selbst berechnet aus eigenem ADS-B ───────────────────────────────
     #  Fertige Legs landen via observe_adsb_positions() bereits in ax_route_cache
@@ -1324,13 +1380,182 @@ _IATA_LATLON_CACHE = {}
 _COMPACT_CITY_CACHE = None
 _COMPACT_CITY_LOCK = threading.Lock()
 
-# Wenige bewusste Overrides wo die DB-Municipality fürs Label unschön ist
-# ("Frankfurt am Main" → "Frankfurt"; IAD/DCA-Municipality ist "Dulles"/
-# "Arlington" statt der Stadt, für die der Airport steht).
+# Kuratierte Anzeige-Städte (2026-07-04: vollständige Übernahme der iOS-
+# `germanCityOverrides` + Audit-Fixes). Vorher zeigte das Backend Municipality-
+# Dörfer („Greven", „Spata-Artemida") und englische Exonyme, während iOS längst
+# kuratierte — EINE Wahrheit: Quelle ist die iOS-Map (AirportDB.swift), hierher
+# portiert; OVD→Asturias etc. per Audit verifiziert (Owner-Bug 2026-07-04).
 _IATA_CITY_OVERRIDES = {
-    'FRA': 'Frankfurt',
-    'IAD': 'Washington',
+    'ACE': 'Lanzarote',
+    'ADB': 'Izmir',
+    'ADD': 'Addis Abeba',
+    'AGA': 'Agadir',
+    'ALG': 'Algier',
+    'ANR': 'Antwerpen',
+    'ATH': 'Athen',
+    'BEG': 'Belgrad',
+    'BGW': 'Bagdad',
+    'BGY': 'Bergamo',
+    'BHX': 'Birmingham',
+    'BJL': 'Banjul',
+    'BOG': 'Bogotá',
+    'BRU': 'Brüssel',
+    'BSL': 'Basel',
+    'CAI': 'Kairo',
+    'CAN': 'Guangzhou',
+    'CCU': 'Kalkutta',
+    'CDG': 'Paris',
+    'CFU': 'Korfu',
+    'CGN': 'Köln',
+    'CHQ': 'Chania',
+    'CIA': 'Rom',
+    'CPH': 'Kopenhagen',
+    'CPT': 'Kapstadt',
+    'CTU': 'Chengdu',
     'DCA': 'Washington',
+    'DEL': 'Delhi',
+    'DFW': 'Dallas',
+    'DJE': 'Djerba',
+    'DME': 'Moskau',
+    'DMM': 'Dammam',
+    'DPS': 'Denpasar',
+    'EAS': 'San Sebastián',
+    'EBL': 'Erbil',
+    'EFL': 'Kefalonia',
+    'ESB': 'Ankara',
+    'EVN': 'Eriwan',
+    'EZE': 'Buenos Aires',
+    'FCO': 'Rom',
+    'FKB': 'Karlsruhe/Baden-Baden',
+    'FLR': 'Florenz',
+    'FMO': 'Münster',
+    'FNA': 'Freetown',
+    'FRA': 'Frankfurt',
+    'FUE': 'Fuerteventura',
+    'GDN': 'Danzig',
+    'GIG': 'Rio de Janeiro',
+    'GOA': 'Genua',
+    'GOI': 'Goa',
+    'GRZ': 'Graz',
+    'GUA': 'Guatemala-Stadt',
+    'GVA': 'Genf',
+    'HAN': 'Hanoi',
+    'HAV': 'Havanna',
+    'HEL': 'Helsinki',
+    'HHN': 'Hahn',
+    'HKG': 'Hongkong',
+    'HND': 'Tokio',
+    'HNL': 'Honolulu',
+    'IAD': 'Washington',
+    'IBZ': 'Ibiza',
+    'IEV': 'Kiew',
+    'IKA': 'Teheran',
+    'ISB': 'Islamabad',
+    'IZM': 'Izmir',
+    'JED': 'Dschidda',
+    'JTR': 'Santorin',
+    'KBP': 'Kiew',
+    'KEF': 'Reykjavik',
+    'KGS': 'Kos',
+    'KIX': 'Osaka',
+    'KLU': 'Klagenfurt',
+    'KRK': 'Krakau',
+    'KRS': 'Kristiansand',
+    'KSF': 'Kassel',
+    'KUL': 'Kuala Lumpur',
+    'KUT': 'Kutaissi',
+    'KWI': 'Kuwait-Stadt',
+    'KZN': 'Kasan',
+    'LBA': 'Leeds',
+    'LCA': 'Larnaka',
+    'LCG': 'A Coruña',
+    'LED': 'St. Petersburg',
+    'LEJ': 'Leipzig',
+    'LGG': 'Lüttich',
+    'LIL': 'Lille',
+    'LIN': 'Mailand',
+    'LIS': 'Lissabon',
+    'LJU': 'Ljubljana',
+    'LPA': 'Gran Canaria',
+    'LTN': 'London',
+    'LUX': 'Luxemburg',
+    'LWO': 'Lwiw',
+    'LYS': 'Lyon',
+    'MAH': 'Menorca',
+    'MAN': 'Manchester',
+    'MCT': 'Maskat',
+    'MEX': 'Mexiko-Stadt',
+    'MLA': 'Malta',
+    'MNL': 'Manila',
+    'MPL': 'Montpellier',
+    'MRS': 'Marseille',
+    'MRU': 'Mauritius',
+    'MUC': 'München',
+    'MXP': 'Mailand',
+    'NAP': 'Neapel',
+    'NCE': 'Nizza',
+    'NCL': 'Newcastle',
+    'NGO': 'Nagoya',
+    'NRT': 'Tokio',
+    'NUE': 'Nürnberg',
+    'ODS': 'Odessa',
+    'OLB': 'Olbia',
+    'ORY': 'Paris',
+    'OSL': 'Oslo',
+    'OTP': 'Bukarest',
+    'OVD': 'Asturias',
+    'PAD': 'Paderborn',
+    'PEK': 'Peking',
+    'PFO': 'Paphos',
+    'PKX': 'Peking',
+    'PNH': 'Phnom Penh',
+    'PRG': 'Prag',
+    'PRN': 'Pristina',
+    'PSA': 'Pisa',
+    'PTY': 'Panama-Stadt',
+    'PVG': 'Shanghai',
+    'RAK': 'Marrakesch',
+    'RHO': 'Rhodos',
+    'RUH': 'Riad',
+    'RZE': 'Rzeszów',
+    'SAL': 'San Salvador',
+    'SAW': 'Istanbul',
+    'SCL': 'Santiago de Chile',
+    'SGN': 'Ho-Chi-Minh-Stadt',
+    'SHA': 'Shanghai',
+    'SIN': 'Singapur',
+    'SJD': 'Los Cabos',
+    'SJO': 'San José',
+    'SKP': 'Skopje',
+    'STN': 'London',
+    'SUF': 'Lamezia Terme',
+    'SVO': 'Moskau',
+    'SVQ': 'Sevilla',
+    'SYD': 'Sydney',
+    'TAO': 'Qingdao',
+    'TAS': 'Taschkent',
+    'TBS': 'Tiflis',
+    'TFN': 'Teneriffa',
+    'TFS': 'Teneriffa',
+    'THR': 'Teheran',
+    'TIA': 'Tirana',
+    'TLS': 'Toulouse',
+    'TPE': 'Taipeh',
+    'TRN': 'Turin',
+    'TRS': 'Triest',
+    'TSA': 'Taipeh',
+    'USM': 'Ko Samui',
+    'VCE': 'Venedig',
+    'VIE': 'Wien',
+    'VKO': 'Moskau',
+    'VRA': 'Varadero',
+    'VRN': 'Verona',
+    'WAW': 'Warschau',
+    'WRO': 'Breslau',
+    'WUH': 'Wuhan',
+    'ZAG': 'Zagreb',
+    'ZRH': 'Zürich',
+    'ZTH': 'Zakynthos',
 }
 
 
