@@ -1226,14 +1226,17 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
     #  wenn der Flieger eindeutig in die falsche Richtung fliegt (>115° weg, fern
     #  beider Endpunkte). Alles andere (Anflug/Holding/gerade gestartet/Rauschen)
     #  → Route wird gezeigt.
-    # AM BODEN KEIN SCHÄTZEN (Owner 2026-07-03: „will die Infos aus den Tafeln,
-    # nicht aus dem Schätzen — es ist alles da"). Generische Callsign→Route-Pläne
-    # (adsbdb/adsb.lol/hexdb) sind für einen stehenden Flieger die Haupt-Quelle
-    # falscher Routen: der Callsign gehört zur letzten/nächsten Rotation, der
-    # Flieger parkt aber woanders (D-AIOB/SXS… in FRA → „ADB-MAN"). Am Boden
-    # zählt daher NUR die eigene Tafel/Warehouse (Schritt 1c oben); findet die
-    # nichts, zeigen wir KEINE geratene Enroute-Route.
-    gen = None if on_ground else _free_generic_route(cs, lat, lon)
+    # ROUTEN-LOGIK am Boden (Owner 2026-07-03: erst „nicht schätzen" → dann „fast
+    # keine Route mehr"). Balance über die GEOMETRIE statt pauschalem Abschalten:
+    #   • Generische Callsign→Route (adsbdb/adsb.lol/hexdb) wird auch am Boden
+    #     zugelassen — ABER `_geometry_allows_route(..., on_ground)` verwirft sie,
+    #     wenn der Flieger auf einem Flughafen steht, der WEDER Start NOCH Ziel der
+    #     Route ist (stale Rotation: D-AIOB/SXS… parkt in FRA, Route sagt ADB-MAN
+    #     → FRA ∉ {ADB,MAN} → raus).
+    #   • Steht der Flieger dagegen an seinem ABFLUG-Flughafen (FRA, Route FRA→JFK
+    #     → FRA == Start), ist die Route der bevorstehende Flug → ZEIGEN. So haben
+    #     die meisten Boden-Flieger wieder eine (korrekte) Route.
+    gen = _free_generic_route(cs, lat, lon)
     if gen and (gen.get('src') or gen.get('src_icao')):
         if _geometry_allows_route(gen, lat, lon, track, gs, on_ground):
             # Eigenen bestätigten Abflug (aus unserem Tracking) bevorzugen → dann
