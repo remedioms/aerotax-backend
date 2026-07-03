@@ -12,6 +12,7 @@
 # ═══════════════════════════════════════════════════════════════
 
 import os, io, uuid, json, re, tempfile, gc, hmac
+import hashlib
 import hashlib as _hashlib
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, send_file, abort, make_response
