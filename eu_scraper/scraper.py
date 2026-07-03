@@ -186,7 +186,19 @@ class Driver:
             locale=self.locale,
             viewport={"width": 1366, "height": 900},
             timezone_id="Europe/Berlin",
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9,de;q=0.7,es;q=0.6"},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9,de;q=0.7,es;q=0.6",
+                # Client-Hints matching DEFAULT_UA (Chrome 126). Headless
+                # Chromium ships no/"HeadlessChrome" sec-ch-ua brands — Akamai
+                # scores that as a bot tell. Stuttgart (STR) 403'd headless on
+                # exactly this; with real-Chrome brands the SAME headless
+                # context passes (verified 2026-07-03). Genuine Chrome values,
+                # so existing airports only get a MORE consistent fingerprint.
+                "sec-ch-ua": '"Not/A)Brand";v="8", "Chromium";v="126", '
+                             '"Google Chrome";v="126"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"macOS"',
+            },
         )
         # Hide the automation tell that some bot-walls sniff.
         self._ctx.add_init_script(

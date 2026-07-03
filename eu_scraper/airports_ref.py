@@ -27,9 +27,19 @@ import os
 import re
 import unicodedata
 
-_DATA_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "airports_compact.json"
+# Dataset candidates: repo-root copy (running inside the main backend repo /
+# main-backend Docker image, which COPYs the whole repo) AND the package-local
+# copy (the eu_scraper Cloud-Run image builds with context=eu_scraper/ only —
+# `--source ./eu_scraper` — so the repo-root file NEVER ships there; without
+# the local copy the resolver silently degraded to curated-map-only in prod).
+_DATA_CANDIDATES = (
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "airports_compact.json"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "airports_compact.json"),
 )
+_DATA_PATH = next((p for p in _DATA_CANDIDATES if os.path.exists(p)),
+                  _DATA_CANDIDATES[0])
 
 # Filler tokens dropped before matching an airport/city name.
 _FILLER = {
@@ -92,6 +102,20 @@ _CURATED = {
     # Morocco / MENA / Africa crew routes
     "marrakech": "RAK", "marrakesh": "RAK", "tanger": "TNG", "tangier": "TNG",
     "oujda": "OUD", "monastir": "MIR", "hurghada": "HRG", "luanda": "LAD",
+    # ─── German exonyms + German-board spellings (NRN/FDH/FKB boards label the
+    #     other side in GERMAN: "Belgrad", "Marrakesch", "Palma d.M.", …) ───
+    "belgrad": "BEG", "mailand": "MXP", "rom": "FCO", "wien": "VIE",
+    "kopenhagen": "CPH", "warschau": "WAW", "lissabon": "LIS", "athen": "ATH",
+    "moskau": "SVO", "brussel": "BRU", "venedig": "VCE", "neapel": "NAP",
+    "nizza": "NCE", "genf": "GVA", "kattowitz": "KTW", "krakau": "KRK",
+    "danzig": "GDN", "breslau": "WRO", "bukarest": "OTP", "prag": "PRG",
+    "teneriffa": "TFS", "rhodos": "RHO", "korfu": "CFU", "marrakesch": "RAK",
+    "palma d m": "PMI", "palma dm": "PMI",
+    # cities the compact dataset misses / labels ambiguously (seen live on
+    # NRN/FKB boards 2026-07-03)
+    "girona": "GRO", "barcelona girona": "GRO", "castellon": "CDT",
+    "fes": "FEZ", "fez": "FEZ", "kos": "KGS", "nador": "NDR",
+    "pristina": "PRN", "tirana": "TIA", "trapani": "TPS", "zagreb": "ZAG",
     # islands / Portugal domestic that the dataset labels oddly or duplicates
     "madeira": "FNC", "funchal": "FNC", "porto santo": "PXO",
     "tenerife": "TFS", "tenerife sur": "TFS", "tenerife norte": "TFN",

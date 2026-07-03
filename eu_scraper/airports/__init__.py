@@ -6,6 +6,7 @@ operator into scraper.REGISTRY. Keys are lowercase group/airport ids used by the
 from .. import scraper as S
 # Europe
 from . import aena, zurich, vienna, portugal, budapest, dublin, prague, mag
+from . import stuttgart
 # North America
 from . import usfids, panynj, fruition, sfo, bos, iad, phx, yvr, yyc
 # Middle East + South Asia
@@ -54,6 +55,7 @@ S.register("bud", budapest.scrape)
 S.register("dub", dublin.scrape)
 S.register("prg", prague.scrape)
 S.register("mag", _reg_mag)         # MAG group: MAN/STN/EMA
+S.register("str", stuttgart.scrape)  # Stuttgart (Akamai; server-rendered board)
 # North America
 S.register("usfids", _reg_usfids)   # group: DFW/CLT/MCO/LAS (tail reg)
 S.register("panynj", _reg_panynj)   # group: JFK/EWR/LGA
@@ -86,7 +88,7 @@ S.register("bog", bogota.scrape)
 
 # ---- IATA -> key map (caller convenience; group lists expanded) ----
 IATA_TO_KEY = {
-    "ZRH": "zrh", "VIE": "vie", "BUD": "bud", "DUB": "dub", "PRG": "prg",
+    "ZRH": "zrh", "VIE": "vie", "BUD": "bud", "DUB": "dub", "PRG": "prg", "STR": "str",
     "SFO": "sfo", "BOS": "bos", "IAD": "iad", "PHX": "phx", "YVR": "yvr", "YYC": "yyc",
     "DXB": "dxb", "DOH": "doh", "BLR": "blr", "KWI": "kwi", "HYD": "hyd",
     "SIN": "sin", "HKG": "hkg", "SYD": "syd", "AKL": "akl", "NRT": "nrt",
