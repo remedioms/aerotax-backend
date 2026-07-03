@@ -11806,6 +11806,30 @@ def get_friend_roster(token, friend_token):
                     'source': 'snapshot' if tage else 'ical_briefings'})
 
 
+def _active_sector_flight_numbers(day):
+    """Flugnummer des GERADE laufenden Sektors aus day['ical_sectors'] (UTC-
+    Zeiten), Fenster dep−15 min … arr+10 min. Leere Liste wenn kein Leg aktiv
+    — iOS zeigt „fliegt" dann NICHT (ehrlich: am Boden/Layover). Wirft nie."""
+    try:
+        secs = (day or {}).get('ical_sectors') or []
+        now_utc = datetime.now(timezone.utc)
+        out = []
+        for s in secs:
+            if not isinstance(s, dict):
+                continue
+            fno = str(s.get('flight') or '').replace(' ', '').upper()
+            dep_raw, arr_raw = s.get('dep_iso'), s.get('arr_iso')
+            if not (fno and dep_raw and arr_raw):
+                continue
+            dep = datetime.fromisoformat(str(dep_raw).replace('Z', '+00:00'))
+            arr = datetime.fromisoformat(str(arr_raw).replace('Z', '+00:00'))
+            if (dep - timedelta(minutes=15)) <= now_utc <= (arr + timedelta(minutes=10)):
+                out.append(fno)
+        return out
+    except Exception:
+        return []
+
+
 @app.route('/api/user/friends-today/<token>', methods=['GET'])
 def get_friends_today(token):
     """OffBlock-Pattern: Was machen meine Friends HEUTE (oder an gegebenem Datum).
@@ -11938,7 +11962,14 @@ def get_friends_today(token):
             # Friend gerade fliegt (klass=Z72). Nur durchgereicht, keine neue
             # Privacy-Stufe: gleiche Sichtbarkeit wie routing (Mutual-Friend-Gate
             # gilt bereits über _friends_load). Leere Liste wenn nichts gelesen.
-            'flight_numbers': list(rf.get('flight_numbers') or []),
+            # iCAL-FALLBACK (2026-07-04): Reine-iCal-Freunde (Kalender-Feed, kein
+            # Tax-Job) haben KEINE reader_facts.flight_numbers → die „fliegt
+            # gerade"-Live-Karte erschien für sie nie. Fallback: die Nummer des
+            # Sektors, der JETZT läuft (dep−15 min … arr+10 min, UTC aus
+            # ical_sectors) — dadurch gilt „fliegt" exakt während des Legs statt
+            # den ganzen Tag (iOS wertet nicht-leere Liste als „fliegt jetzt").
+            'flight_numbers': (list(rf.get('flight_numbers') or [])
+                               or _active_sector_flight_numbers(day)),
             # ADDITIV (2026-07-03): Live-Delay/Status pro Leg aus dem Dual-Side-
             # Resolver — iOS kann „fliegt gerade, +25 min" direkt anzeigen statt
             # nur den ADS-B-Callsign abzuleiten. Leer = keine Beobachtung.
