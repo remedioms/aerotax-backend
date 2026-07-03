@@ -11835,6 +11835,30 @@ def get_friends_today(token):
         if pr.get('share_roster') is False:
             continue
         rf = day.get('reader_facts') or {}
+        # WO IST DIE CREW JETZT (2026-07-04): rf['layover_ort'] ist der Über-
+        # nachtungsort NACH dem heutigen Dienst. Morgens VOR dem ersten Abflug
+        # steht die Crew aber noch am GESTRIGEN Übernachtungsort — das ist der
+        # Abflughafen des ersten heutigen Sektors (ical_sectors[0].from, UTC-
+        # Zeiten aus dem Snapshot). Sonst zeigte der Feed z.B. „Tirana", während
+        # der Freund noch in Billund frühstückt. Nur fürs heutige Datum, nur mit
+        # klarer dep_iso, und nur wenn der erste Abflug NICHT die Homebase ist
+        # (an der Basis bleibt die bisherige Basis-Anzeige korrekt).
+        lay_eff = rf.get('layover_ort')
+        try:
+            if datum == _date.today().isoformat():
+                secs = day.get('ical_sectors') or []
+                first_sec = next((s for s in secs
+                                  if isinstance(s, dict) and s.get('dep_iso')), None)
+                if first_sec:
+                    dep = datetime.fromisoformat(
+                        str(first_sec['dep_iso']).replace('Z', '+00:00'))
+                    frm = str(first_sec.get('from') or '').strip().upper()
+                    hb = str(pr.get('homebase') or '').strip().upper()
+                    if (datetime.now(timezone.utc) < dep
+                            and len(frm) == 3 and frm.isalpha() and frm != hb):
+                        lay_eff = frm
+        except Exception:
+            lay_eff = rf.get('layover_ort')
         # Privacy-Gate: share_location=False (bool) oder =0 (legacy int) → kein city.
         share_loc_val = pr.get('share_location', True)
         share_loc = share_loc_val is not False and share_loc_val != 0
@@ -11890,17 +11914,18 @@ def get_friends_today(token):
             # wird die GPS-current_city verworfen und stattdessen der heutige
             # Roster-Layover-Ort serviert, damit Freunde NICHT sehen, dass die Crew
             # während eines Layovers woanders hingeflogen ist (User 2026-06-29).
-            'current_city': (_friend_facing_city(pr, rf.get('layover_ort'))
+            'current_city': (_friend_facing_city(pr, lay_eff)
                              if share_loc else None),
             'klass': day.get('klass'),
             'marker': day.get('marker'),
             'routing': day.get('routing'),
-            'layover': rf.get('layover_ort'),
+            'layover': lay_eff,
             # Städtenamen-Label (2026-07-03): nie rohe IATA-Ketten anzeigen.
+            # route_label bewusst mit dem TOUR-Layover (rf), nicht lay_eff —
+            # es beschreibt die heutige Route, nicht den aktuellen Aufenthalt.
             'route_label': _route_label_cities(day.get('routing'),
                                                rf.get('layover_ort')),
-            'layover_city': (_iata_city_name(rf.get('layover_ort'))
-                             if rf.get('layover_ort') else None),
+            'layover_city': (_iata_city_name(lay_eff) if lay_eff else None),
             'start': rf.get('start_time'),
             'end': rf.get('end_time'),
             # Flugnummer(n) des Tages (z.B. "LH400") — iOS leitet daraus den
