@@ -1226,17 +1226,15 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
     #  wenn der Flieger eindeutig in die falsche Richtung fliegt (>115° weg, fern
     #  beider Endpunkte). Alles andere (Anflug/Holding/gerade gestartet/Rauschen)
     #  → Route wird gezeigt.
-    # ROUTEN-LOGIK am Boden (Owner 2026-07-03: erst „nicht schätzen" → dann „fast
-    # keine Route mehr"). Balance über die GEOMETRIE statt pauschalem Abschalten:
-    #   • Generische Callsign→Route (adsbdb/adsb.lol/hexdb) wird auch am Boden
-    #     zugelassen — ABER `_geometry_allows_route(..., on_ground)` verwirft sie,
-    #     wenn der Flieger auf einem Flughafen steht, der WEDER Start NOCH Ziel der
-    #     Route ist (stale Rotation: D-AIOB/SXS… parkt in FRA, Route sagt ADB-MAN
-    #     → FRA ∉ {ADB,MAN} → raus).
-    #   • Steht der Flieger dagegen an seinem ABFLUG-Flughafen (FRA, Route FRA→JFK
-    #     → FRA == Start), ist die Route der bevorstehende Flug → ZEIGEN. So haben
-    #     die meisten Boden-Flieger wieder eine (korrekte) Route.
-    gen = _free_generic_route(cs, lat, lon)
+    # GENERISCHE CALLSIGN→ROUTE ABGESCHALTET (Owner 2026-07-03: „adsbdb/adsb.lol/
+    # hexdb ist doch eh immer falsch — das ist gut für Tail und Live-Flieger, keine
+    # Infos [sonst]"). Diese Quellen liefern Flugplan-Routen, die zur falschen
+    # Rotation gehören → wir zeigen LIEBER GAR KEINE Route als eine falsche.
+    # Route kommt NUR aus eigener Tafel/Warehouse (Schritt 1) + OpenSky-Flugrecord
+    # (Schritt 3, gated) + bezahlt (Schritt 5). Tail (Kennzeichen) und die
+    # Live-Position laufen über SEPARATE Calls (ADS-B hex→reg/pos) — davon
+    # unberührt. Kein Route-Treffer → None → Client zeigt keine Strecke.
+    gen = None
     if gen and (gen.get('src') or gen.get('src_icao')):
         if _geometry_allows_route(gen, lat, lon, track, gs, on_ground):
             # Eigenen bestätigten Abflug (aus unserem Tracking) bevorzugen → dann
