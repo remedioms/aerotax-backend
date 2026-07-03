@@ -39,6 +39,11 @@ import logging
 import datetime as _dt
 from flask import Blueprint, request, jsonify, current_app
 
+# Städtenamen-Labels (2026-07-03): Family sieht IMMER "Frankfurt – San
+# Francisco" statt roher IATA-Ketten. Kein Zirkel: aerox_data_blueprint
+# importiert app nur lazy in Funktionen.
+from blueprints.aerox_data_blueprint import _route_label_cities, _iata_city_name
+
 family_watch_bp = Blueprint('family_watch', __name__)
 
 # Late-binding helper: greift bei jedem call frisch auf app-module-Attribute zu.
@@ -394,11 +399,14 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         return {}
     status = {
         'layover_place': None,
+        'layover_place_city': None,   # "San Francisco" statt "SFO" (2026-07-03)
         'current_city': None,
         'landed': None,
         'next_flight_no': None,
         'next_flight_dep_iata': None,
         'next_flight_arr_iata': None,
+        'next_flight_dep_city': None,
+        'next_flight_arr_city': None,
         'next_flight_etd_iso': None,
         'photo_count_today': None,
         'last_seen_iso': None,
@@ -408,6 +416,12 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         'flying_now': None,
         'today_dep_iata': None,
         'today_arr_iata': None,
+        'today_dep_city': None,
+        'today_arr_city': None,
+        # Fertiges Tour-Label des heutigen Tages mit Städtenamen
+        # ("Frankfurt – San Francisco") — iOS soll NIE selbst aus rohen
+        # IATA-Ketten einen Label bauen (2026-07-03).
+        'today_route_label': None,
         'today_dep_iso': None,
         'today_arr_iso': None,
         # Zuhause/Feierabend: heute an der Homebase (reiner Heimtag) ODER nach
@@ -456,23 +470,33 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     if 'next_flight' in allowed_fields and sb_avail and sb is not None:
         try:
             today = _dt.datetime.now().date().isoformat()
+            # FIX „FRA-HND obwohl die Crew auf SFO-Tour ist" (2026-07-03):
+            # vorher limit(1) → wenn der NÄCHSTGELEGENE Roster-Tag KEIN Leg-Paar
+            # im Summary hat (Layover-Ruhetag „LAYOVER SFO", OFF) blieb
+            # next_flight leer — und wenn der heutige Tag GANZ fehlte, gewann
+            # der erste ZUKÜNFTIGE Tag, gerne der Start der NÄCHSTEN Tour
+            # (FRA-HND), obwohl der Rückflug SFO-FRA der Wahrheit entspricht.
+            # Jetzt: die nächsten Tage scannen und das ERSTE echte Leg-Paar
+            # nehmen (datum-aufsteigend → der Rückflug schlägt die nächste Tour).
             r = (sb.table('user_ical_briefings')
                  .select('datum,ical_summary,ical_location,ical_start')
                  .eq('token', crew_token)
                  .gte('datum', today)
                  .order('datum', desc=False)
-                 .limit(1).execute())
-            rows = r.data or []
-            if rows:
-                br = rows[0]
+                 .limit(10).execute())
+            for br in (r.data or []):
                 summ = br.get('ical_summary') or ''
                 mleg = re.search(r'\b([A-Z]{3})-([A-Z]{3})\b', summ)
-                if mleg:
-                    status['next_flight_dep_iata'] = mleg.group(1)
-                    status['next_flight_arr_iata'] = mleg.group(2)
+                if not mleg:
+                    continue
+                status['next_flight_dep_iata'] = mleg.group(1)
+                status['next_flight_arr_iata'] = mleg.group(2)
+                status['next_flight_dep_city'] = _iata_city_name(mleg.group(1))
+                status['next_flight_arr_city'] = _iata_city_name(mleg.group(2))
                 st = br.get('ical_start')
                 if st:
                     status['next_flight_etd_iso'] = str(st)[:25]
+                break
         except Exception as e:
             _log().info(f'[family-watch] briefing_read_skip {type(e).__name__}')
     # Roster-derived Layover-Stadt + Reconcile von current_city.
@@ -493,6 +517,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     flying_now = False          # NOW im heutigen Dienst-Zeitfenster → „Fliegt gerade"
     today_dep = today_arr = None
     today_dep_iso = today_arr_iso = None
+    today_chain = None          # volle heutige IATA-Kette (für das Städte-Label)
     if sb_avail and sb is not None:
         # ical_location-Format: „JFK, FRA-JFK-FRA". Erstes Token = Aufenthaltsort
         # des Tages. An einem HOMEBASE-Tag (Tag-Trip FRA-LUX-FRA → erstes Token =
@@ -521,6 +546,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                         chain = mchain.group(1).split('-')
                 is_flight_today = bool(chain) and len(chain) >= 2
                 if is_flight_today:
+                    today_chain = list(chain)
                     today_dep, today_arr = chain[0], chain[-1]
                     today_dep_iso = _iso_or_none(row.get('ical_start'))
                     today_arr_iso = _iso_or_none(row.get('ical_end'))
@@ -554,10 +580,24 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         status['flying_now'] = flying_now
         status['today_dep_iata'] = today_dep
         status['today_arr_iata'] = today_arr
+        status['today_dep_city'] = _iata_city_name(today_dep) if today_dep else None
+        status['today_arr_city'] = _iata_city_name(today_arr) if today_arr else None
+        # Fertiges Städte-Label der heutigen Tour: aus der VOLLEN Kette
+        # (FRA-SFO-FRA → "Frankfurt – San Francisco", Ziel = Layover/entfern-
+        # tester Punkt), nicht aus dep/arr (die wären bei Rundreisen FRA/FRA).
+        if today_chain:
+            status['today_route_label'] = _route_label_cities(
+                '-'.join(today_chain), roster_layover)
+        elif roster_layover and 'layover_place' in allowed_fields:
+            # Layover-Stadt nur, wenn der layover_place-Grant sie erlaubt —
+            # sonst leakt der next_flight-Grant die Stadt am Ruhetag.
+            status['today_route_label'] = _iata_city_name(roster_layover)
         status['today_dep_iso'] = today_dep_iso
         status['today_arr_iso'] = today_arr_iso
     if 'layover_place' in allowed_fields:
         status['layover_place'] = roster_layover
+        status['layover_place_city'] = (_iata_city_name(roster_layover)
+                                        if roster_layover else None)
         # Feierabend/Zuhause: heute an der Homebase und NICHT gerade in der Luft.
         status['home_now'] = bool(roster_today_home) and not flying_now
     # Reconcile current_city gegen den Roster: wenn der heutige Plan POSITIV an
@@ -602,9 +642,15 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         status['next_flight_no'] = None
         status['next_flight_dep_iata'] = None
         status['next_flight_arr_iata'] = None
+        status['next_flight_dep_city'] = None
+        status['next_flight_arr_city'] = None
         status['next_flight_etd_iso'] = None
+        status['today_dep_city'] = None
+        status['today_arr_city'] = None
+        status['today_route_label'] = None
     if 'layover_place' not in allowed_fields:
         status['layover_place'] = None
+        status['layover_place_city'] = None
     if 'landed_status' not in allowed_fields:
         status['landed'] = None
     if 'photos' not in allowed_fields:
@@ -1224,6 +1270,13 @@ def _load_crew_roster_days(crew_token, days_limit):
             'routing': day.get('routing'),
             # bewusst KEIN 'eur' — Family sieht keine Geld-Daten
             'layover_ort': rf.get('layover_ort'),
+            # Hübsches Tour-Label mit Städtenamen ("Frankfurt – San Francisco")
+            # statt roher Token-Ketten (2026-07-03). IATA bleibt in routing/
+            # layover_ort für Clients, die beides zeigen wollen.
+            'route_label': _route_label_cities(day.get('routing'),
+                                               rf.get('layover_ort')),
+            'layover_city': (_iata_city_name(rf.get('layover_ort'))
+                             if rf.get('layover_ort') else None),
             'start_time': rf.get('start_time'),
             'end_time': rf.get('end_time'),
             # Pro-Leg-Sektoren durchreichen → Family-Sheet zeigt die echten Legs
@@ -1272,6 +1325,8 @@ def _load_crew_roster_days(crew_token, days_limit):
                         'marker': summ,
                         'routing': routing,
                         'layover_ort': None,
+                        'route_label': _route_label_cities(routing),
+                        'layover_city': None,
                         'start_time': _hhmm(row.get('ical_start')),
                         'end_time': _hhmm(row.get('ical_end')),
                     })

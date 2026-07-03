@@ -10350,6 +10350,30 @@ def _user_push_path(token):
 
 _PUSH_KNOWN_COLS = {'expo_token', 'apns_token', 'device_id', 'platform'}
 
+# ── Push-Preference-Filter (2026-07-03) ─────────────────────────────
+# User-steuerbare Push-Kategorien (POST /api/push/prefs). Persistiert als
+# registry['prefs'] → landet in der metadata-jsonb-Column (kein DDL nötig).
+# _send_push_notification unterdrückt nur bei EXPLIZITEM False (fail-open).
+_PUSH_PREF_KEYS = ('dm', 'group_message', 'friend_request',
+                   'friend_accepted', 'roster_change', 'community')
+
+# data['type'] (Call-Sites) → Pref-Key. Nicht gemappte Typen → immer senden.
+_PUSH_TYPE_TO_PREF = {
+    'dm': 'dm',
+    'group_message': 'group_message',
+    'friend_request': 'friend_request',
+    'buddy_request': 'friend_request',
+    'friend_accept': 'friend_accepted',
+    'friend_accepted': 'friend_accepted',
+    'buddy_accepted': 'friend_accepted',
+    'roster_change': 'roster_change',
+    'duty_change': 'roster_change',
+    'wall_comment': 'community',
+    'wall_comment_reply': 'community',
+    'forum_reply': 'community',
+    'forum_mention': 'community',
+}
+
 
 def _push_load_from_supabase(token):
     """Returns dict in legacy-shape ({token, push_token, apns_token, …}) oder
@@ -11565,6 +11589,7 @@ def get_friend_roster(token, friend_token):
     Query: ?days=30 (default 30, max 90)
     """
     from datetime import date as _date, timedelta as _td
+    from blueprints.aerox_data_blueprint import _route_label_cities, _iata_city_name
     days_limit = min(int(request.args.get('days') or 30), 90)
     # Friend-Check
     me = _friends_load(token)
@@ -11602,6 +11627,13 @@ def get_friend_roster(token, friend_token):
             'routing': day.get('routing'),
             'eur': day.get('eur'),
             'layover_ort': rf.get('layover_ort'),
+            # Hübsches Tour-Label mit Städtenamen (2026-07-03: Family/Friends
+            # sollen NIE rohe Token-Ketten wie "FRA-SFO-FRA" sehen). IATA-Codes
+            # bleiben in routing/layover_ort verfügbar.
+            'route_label': _route_label_cities(day.get('routing'),
+                                               rf.get('layover_ort')),
+            'layover_city': (_iata_city_name(rf.get('layover_ort'))
+                             if rf.get('layover_ort') else None),
             'start_time': rf.get('start_time'),
             'end_time': rf.get('end_time'),
             # Pro-Leg-Sektoren durchreichen (User 2026-07-01: „wer Zugriff auf den
@@ -11655,6 +11687,10 @@ def get_friend_roster(token, friend_token):
                     'routing': routing,
                     'eur': None,
                     'layover_ort': row.get('ical_layover_ort'),
+                    'route_label': _route_label_cities(routing,
+                                                       row.get('ical_layover_ort')),
+                    'layover_city': (_iata_city_name(row.get('ical_layover_ort'))
+                                     if row.get('ical_layover_ort') else None),
                     'start_time': _hhmm(row.get('ical_start_iso') or row.get('ical_start')),
                     'end_time': _hhmm(row.get('ical_end_iso') or row.get('ical_end')),
                     # Pro-Leg-Sektoren aus den Briefings durchreichen (s.o.) → Freunde-/
@@ -11675,6 +11711,7 @@ def get_friends_today(token):
     Query: ?datum=YYYY-MM-DD (default today)
     """
     from datetime import date as _date
+    from blueprints.aerox_data_blueprint import _route_label_cities, _iata_city_name
     datum = request.args.get('datum') or _date.today().isoformat()
     data = _friends_load(token)
     friends = data.get('friends') or []
@@ -11723,6 +11760,11 @@ def get_friends_today(token):
             'marker': day.get('marker'),
             'routing': day.get('routing'),
             'layover': rf.get('layover_ort'),
+            # Städtenamen-Label (2026-07-03): nie rohe IATA-Ketten anzeigen.
+            'route_label': _route_label_cities(day.get('routing'),
+                                               rf.get('layover_ort')),
+            'layover_city': (_iata_city_name(rf.get('layover_ort'))
+                             if rf.get('layover_ort') else None),
             'start': rf.get('start_time'),
             'end': rf.get('end_time'),
             # Flugnummer(n) des Tages (z.B. "LH400") — iOS leitet daraus den
@@ -13892,8 +13934,13 @@ def _manual_briefings_save(token, briefings_dict):
                 app.logger.error('[manual-briefings] CRITICAL: weder SB noch Disk gesichert!')
 
 
-_BRIEFING_TIME_RE = re.compile(r'(\d{1,2}:\d{2})\s*(?:LT|UTC|Z|L)?\s*Briefing',
+_BRIEFING_TIME_RE = re.compile(r'(\d{1,2}:\d{2})\s*(LT|UTC|Z|L)?\s*Briefing',
                                re.IGNORECASE)
+
+# Station direkt hinter „Briefing" im Summary (LH-/SWISS-Stil:
+# „12:15 LT Briefing FRA · …") — die präziseste Quelle für die Frage, WO das
+# Briefing stattfindet (= in welcher lokalen Zeitzone „LT" zu lesen ist).
+_BRIEFING_STATION_RE = re.compile(r'Briefing\s+([A-Z]{3})\b')
 
 # Der bedeutungslose DTSTART-Default der LH/CRA-Roster-Pipeline ist 06:30 UTC
 # (→ 08:30 LT Sommerzeit / 07:30 LT Winterzeit). Diese UTC-Uhrzeit ist KEINE
@@ -13914,13 +13961,76 @@ def _briefing_start_is_bare_default(current_start_iso):
     return m.group(1) in _BRIEFING_MEANINGLESS_DTSTART_UTC
 
 
+def _briefing_lt_station(summary, day_briefing=None, prev_day_briefing=None):
+    """IATA-Station, an der eine „HH:MM LT"-Angabe dieses Tages zu lesen ist —
+    „LT" heißt LOKALZEIT AN DER STATION DES DIENSTES, nicht Berlin. Ein Pickup/
+    Briefing auf SFO-Layover ist Pacific Time; Berlin-Ankerung machte den
+    gespeicherten ISO um Stunden falsch (TZ-Bug 2026-07-03).
+
+    Auflösungs-Reihenfolge (präziseste Quelle zuerst):
+      1. Explizite Station hinter „Briefing" im Summary („12:15 LT Briefing FRA").
+      2. Erste Abflug-Station des Tages-Routings (legs[0].from bzw. erstes
+         „XXX - YYY" im Summary) — vor dem ersten Abflug steht die Crew
+         physisch an genau diesem Flughafen. Deckt beides ab: Tag 1 einer Tour
+         (Briefing an der Homebase = erste Abflug-Station) UND Pickup mitten
+         in der Tour (erste Abflug-Station = Layover-Station).
+      3. Letzte Ankunfts-Station des VORTAGES (legs[-1].to bzw. Layover-Ort in
+         ical_location) — Tag ohne eigene Legs (z.B. reiner Layover-/Pickup-Tag).
+    Liefert nur Stationen, deren TZ in airport_tz bekannt ist, sonst None
+    (Caller fällt auf Homebase → Berlin zurück)."""
+    s = summary or ''
+    m = _BRIEFING_STATION_RE.search(s)
+    if m and airport_tz(m.group(1)):
+        return m.group(1)
+    db = day_briefing if isinstance(day_briefing, dict) else {}
+    legs = db.get('legs')
+    if isinstance(legs, list):
+        for lg in legs:
+            frm = str((lg or {}).get('from') or '').strip().upper()
+            if frm and airport_tz(frm):
+                return frm
+    m2 = re.search(r'\b([A-Z]{3})\s*-\s*[A-Z]{3}\b', s)
+    if m2 and airport_tz(m2.group(1)):
+        return m2.group(1)
+    pb = prev_day_briefing if isinstance(prev_day_briefing, dict) else {}
+    plegs = pb.get('legs')
+    if isinstance(plegs, list):
+        for lg in reversed(plegs):
+            to = str((lg or {}).get('to') or '').strip().upper()
+            if to and airport_tz(to):
+                return to
+    # Vortages-Location kann gemerged sein („FRA, FRA - MIA") — der LETZTE
+    # bekannte IATA-Token ist der Ort, an dem der Vortag endete (Layover-Ort).
+    loc = str(pb.get('ical_location') or '').strip().upper()
+    if loc:
+        for tok in reversed(re.findall(r'\b[A-Z]{3}\b', loc)):
+            if airport_tz(tok):
+                return tok
+    return None
+
+
+# Homebase-TZ pro Token gememot (10 min), damit get_briefings nicht pro
+# Roster-Tag einen Supabase-Roundtrip macht, wenn keine Station auflösbar ist.
+_BRIEFING_HB_TZ_CACHE = {}
+
+
 def _corrected_briefing_start_iso(date_str, summary, current_start_iso,
-                                  current_end_iso=None):
+                                  current_end_iso=None, day_briefing=None,
+                                  prev_day_briefing=None, token=None):
     """Root-Cause-Fix „Dienstbeginn 08:30": Der DTSTART aus der Roster-Pipeline ist
     bei LH/CRA oft ein bedeutungsloser Default (06:30 UTC → 08:30 LT) und NICHT die
     echte Report-/Briefing-Zeit. Wenn das Summary eine explizite Report-Zeit nennt
     (z.B. „12:15 LT Briefing FRA · …"), ist DIE die maßgebliche Dienstbeginn-Zeit —
-    wir übernehmen sie 1:1 (Europe/Berlin → UTC) in `ical_start_iso`.
+    wir übernehmen sie in `ical_start_iso`.
+
+    LT-TZ-FIX (2026-07-03): „LT" war hart als Europe/Berlin geankert — falsch
+    für jeden Dienst außerhalb der Berlin-TZ (Pickup auf SFO-Layover „08:30 LT"
+    = 08:30 America/Los_Angeles, nicht 08:30 Berlin → gespeicherter ISO war 9h
+    daneben und vergiftete das Pickup-Timing im Ausland). Jetzt: Station des
+    Tages via _briefing_lt_station (Summary-Station → Tages-Routing → Vortages-
+    Ankunft) → deren IANA-TZ; Fallback User-Homebase-TZ (Profil, lazy geladen);
+    letzter Fallback Europe/Berlin. Ein „UTC"/„Z"-Designator im Summary wird
+    direkt als UTC gelesen (vorher ebenfalls fälschlich Berlin).
 
     HONESTY-FIX (2026-06-07): Liegt KEINE explizite Briefing-Zeit im Summary vor
     UND ist `current_start_iso` nur der bedeutungslose 06:30-UTC-Default, geben
@@ -13956,7 +14066,31 @@ def _corrected_briefing_start_iso(date_str, summary, current_start_iso,
             return current_start_iso
         from zoneinfo import ZoneInfo as _ZI
         Y, M, D = (int(x) for x in date_str.split('-'))
-        local = datetime(Y, M, D, hh, mm, tzinfo=_ZI('Europe/Berlin'))
+        designator = (m.group(2) or '').strip().upper()
+        if designator in ('UTC', 'Z'):
+            # Explizit UTC deklarierte Zeit → keine TZ-Rätselei.
+            utc_dt = datetime(Y, M, D, hh, mm, tzinfo=_ZI('UTC'))
+            return utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        # „LT" (oder kein Designator) = Lokalzeit an der STATION des Dienstes.
+        tzname = None
+        station = _briefing_lt_station(s, day_briefing, prev_day_briefing)
+        if station:
+            tzname = airport_tz(station)
+        if not tzname and token:
+            # Fallback: Homebase-TZ aus dem Profil (lazy — nur wenn die
+            # Station des Tages nicht bestimmbar war). Pro Token gecacht.
+            cached = _BRIEFING_HB_TZ_CACHE.get(token)
+            if cached is not None and (time.time() - cached[1]) < 600:
+                tzname = cached[0]
+            else:
+                try:
+                    pr = (_profile_load(token) or {}).get('profile', {}) or {}
+                    hb = str(pr.get('homebase') or '').strip().upper()
+                    tzname = airport_tz(hb) if hb else None
+                except Exception:
+                    tzname = None
+                _BRIEFING_HB_TZ_CACHE[token] = (tzname, time.time())
+        local = datetime(Y, M, D, hh, mm, tzinfo=_ZI(tzname or 'Europe/Berlin'))
         return local.astimezone(_ZI('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
     except Exception:
         return current_start_iso
@@ -13998,9 +14132,21 @@ def get_briefings(token):
                 merged.setdefault(fk, fv)
             # Root-Cause-Fix „Dienstbeginn 08:30": echte Briefing-Zeit aus dem
             # Summary schlägt den bedeutungslosen DTSTART-Default (06:30 UTC).
+            # LT-TZ-FIX (2026-07-03): Tages-Kontext mitgeben, damit „HH:MM LT"
+            # in der TZ der DIENST-Station gelesen wird (Pickup auf SFO-Layover
+            # = Pacific Time, nicht Berlin). Vortag für Tage ohne eigene Legs.
+            prev_day = None
+            try:
+                from datetime import timedelta as _btd
+                _pk = (datetime.strptime(k, '%Y-%m-%d')
+                       - _btd(days=1)).strftime('%Y-%m-%d')
+                prev_day = ical_data.get(_pk) or data.get(_pk)
+            except Exception:
+                prev_day = None
             merged['ical_start_iso'] = _corrected_briefing_start_iso(
                 k, merged.get('ical_summary'), merged.get('ical_start_iso'),
-                merged.get('ical_end_iso'))
+                merged.get('ical_end_iso'), day_briefing=merged,
+                prev_day_briefing=prev_day, token=token)
             data[k] = merged
     except Exception:
         # Defensiv: iCal-Read-Fehler darf User-PUT-Daten nicht blocken
@@ -20915,6 +21061,14 @@ def register_push_token(token):
         'device_id': body.get('device_id') or existing.get('device_id') or '',
         'registered_at': datetime.now().isoformat(),
     }
+    # Prefs + gelerntes apns_env überleben die Re-Registrierung (Save ersetzt
+    # die metadata-jsonb komplett). apns_env nur bei UNVERÄNDERTEM Device-Token
+    # behalten — neues Token = evtl. anderer Build/Umgebung → neu lernen.
+    if isinstance(existing.get('prefs'), dict):
+        merged['prefs'] = existing.get('prefs')
+    if merged['apns_token'] and merged['apns_token'] == (existing.get('apns_token') or '') \
+            and existing.get('apns_env'):
+        merged['apns_env'] = existing.get('apns_env')
     if _push_save(token, merged):
         return jsonify({'ok': True})
     return jsonify({'ok': False, 'error': 'persist_failed'}), 500
@@ -20948,6 +21102,16 @@ def register_push_apns():
         'device_id': body.get('device_id') or existing.get('device_id') or '',
         'registered_at': datetime.now().isoformat(),
     }
+    # Preference-Filter (2026-07-03): User-Prefs überleben eine Re-Registrierung
+    # (der Save überschreibt die metadata-jsonb komplett — ohne Carry-over wären
+    # die Einstellungen nach jedem App-Start weg).
+    if isinstance(existing.get('prefs'), dict):
+        merged['prefs'] = existing.get('prefs')
+    # Gelerntes apns_env nur behalten, wenn das Device-Token UNVERÄNDERT ist —
+    # ein NEUES Token (anderer Build/Reinstall) kann die Umgebung gewechselt
+    # haben (Debug=sandbox ↔ TestFlight/AppStore=prod) → neu lernen lassen.
+    if (existing.get('apns_token') or '') == apns_token and existing.get('apns_env'):
+        merged['apns_env'] = existing.get('apns_env')
     if _push_save(user_token, merged):
         return jsonify({'ok': True})
     return jsonify({'ok': False, 'error': 'persist_failed'}), 500
@@ -20975,6 +21139,40 @@ def unregister_push_apns():
                'unregistered_at': datetime.now().isoformat()}
     if _push_save(user_token, cleared):
         return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+
+
+@app.route('/api/push/prefs', methods=['POST'])
+def set_push_prefs():
+    """Server-seitige Push-Preferences. Body: {token, prefs: {dm: bool, …}}.
+
+    Erlaubte Keys: dm, group_message, friend_request, friend_accepted,
+    roster_change, community (_PUSH_PREF_KEYS) — unbekannte Keys werden
+    ignoriert, Werte zu bool gecoerct. _send_push_notification unterdrückt
+    Kategorien mit pref==False; fehlende prefs/keys → normal senden (fail-open).
+    """
+    body = request.get_json(silent=True) or {}
+    user_token = (body.get('token') or '').strip()
+    prefs_in = body.get('prefs')
+    if not user_token or not isinstance(prefs_in, dict):
+        return jsonify({'ok': False, 'error': 'missing token or prefs'}), 400
+    # SECURITY (IDOR): wie register-apns — Body-Token umgeht das Pfad-Binding-
+    # Gate → expliziter Bearer-Match. Sonst könnte ein Angreifer fremde
+    # Push-Kategorien stummschalten (Notification-DoS) oder reaktivieren.
+    if not _request_bearer_matches(user_token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
+    existing = _push_load(user_token) or {}
+    old_prefs = existing.get('prefs')
+    merged_prefs = dict(old_prefs) if isinstance(old_prefs, dict) else {}
+    for k, v in prefs_in.items():
+        if k in _PUSH_PREF_KEYS:
+            merged_prefs[k] = bool(v)
+    # WICHTIG: bestehende Registry-Felder (apns_token, push_token, bundle_id, …)
+    # mitnehmen — _push_save persistiert das GANZE dict inkl. metadata-jsonb
+    # (Metadata-Clobber-Gotcha, siehe Avatar-Persist-Bug).
+    merged = {**existing, 'token': user_token, 'prefs': merged_prefs}
+    if _push_save(user_token, merged):
+        return jsonify({'ok': True, 'prefs': merged_prefs})
     return jsonify({'ok': False, 'error': 'persist_failed'}), 500
 
 
@@ -21035,7 +21233,7 @@ def _apns_get_jwt():
 
 
 def _send_apns(apns_token, title, body, data=None, topic=None,
-               thread_id=None, badge=None):
+               thread_id=None, badge=None, use_sandbox=None):
     """Sendet eine Push-Notification via APNs HTTP/2.
     Returns (ok: bool, reason: str|None). `reason` = APNs-Fehler-reason
     (z.B. 'BadDeviceToken', 'Unregistered') — der Caller nutzt sie für
@@ -21057,7 +21255,10 @@ def _send_apns(apns_token, title, body, data=None, topic=None,
     if not jwt:
         return False, 'no_jwt'  # caller handles fallback / skip
     topic = (topic or os.environ.get('APNS_TOPIC') or 'aerotax.AeroTax').strip()
-    use_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
+    # use_sandbox=None → env-Default; explizit True/False = per-Gerät-Override
+    # (Debug-Builds haben SANDBOX-Tokens, TestFlight/App Store PROD-Tokens).
+    if use_sandbox is None:
+        use_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
     host = 'api.sandbox.push.apple.com' if use_sandbox else 'api.push.apple.com'
     aps = {'alert': {'title': title, 'body': body}, 'sound': 'default'}
     if thread_id:
@@ -21097,7 +21298,8 @@ def _send_apns(apns_token, title, body, data=None, topic=None,
             except Exception:
                 pass
             # 410 Unregistered / 400 BadDeviceToken → Caller löscht den Token.
-            print(f"[APNS] send failed status={resp.status_code} body={resp.text[:200]}")
+            print(f"[APNS] send failed status={resp.status_code} "
+                  f"env={'sandbox' if use_sandbox else 'prod'} body={resp.text[:200]}")
             return False, reason or f'http_{resp.status_code}'
     except Exception as e:
         print(f"[APNS] transport error: {e}")
@@ -21124,17 +21326,62 @@ def _send_push_notification(token, title, body, data=None,
     reg = _push_load(token) or {}
     if not reg:
         return False
+    # Preference-Filter (2026-07-03): User-Prefs aus /api/push/prefs.
+    # Fail-open: nur bei EXPLIZITEM False unterdrücken — fehlender type,
+    # nicht gemappter type oder fehlende prefs → normal senden.
+    prefs = reg.get('prefs')
+    push_type = (data or {}).get('type')
+    if isinstance(prefs, dict) and push_type:
+        pref_key = _PUSH_TYPE_TO_PREF.get(push_type)
+        if pref_key is not None and prefs.get(pref_key) is False:
+            print(f"[PUSH] suppressed by pref user={token[:8]} "
+                  f"type={push_type} pref={pref_key}")
+            return False
     apns_token = (reg.get('apns_token') or '').strip()
     expo_token = (reg.get('push_token') or '').strip()
     apns_topic = (reg.get('bundle_id') or '').strip() or None
     if apns_token and os.environ.get('APNS_AUTH_KEY', '').strip():
+        # Umgebungs-Wahl pro Gerät (Root-Cause 2026-07-03: Owner-Device lief
+        # auf einem Xcode-DEBUG-Build → das Device-Token ist ein SANDBOX-Token,
+        # prod-APNs antwortet 400 BadDeviceToken → Token wurde gepruned → ALLE
+        # weiteren Pushes wurden lautlos verworfen). Jetzt: gemerkte Umgebung
+        # (reg['apns_env'] in metadata-jsonb) zuerst; bei BadDeviceToken/
+        # Unregistered die GEGEN-Umgebung probieren und bei Erfolg lernen.
+        # Gepruned wird nur noch, wenn BEIDE Umgebungen das Token ablehnen.
+        env_pref = (reg.get('apns_env') or '').strip().lower()
+        if env_pref in ('sandbox', 'prod'):
+            first_sandbox = env_pref == 'sandbox'
+        else:
+            first_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
         ok, reason = _send_apns(apns_token, title, body, data=data,
                                 topic=apns_topic, thread_id=thread_id,
-                                badge=badge)
+                                badge=badge, use_sandbox=first_sandbox)
+        used_env = 'sandbox' if first_sandbox else 'prod'
+        if not ok and reason in ('Unregistered', 'BadDeviceToken', 'ExpiredToken'):
+            alt_sandbox = not first_sandbox
+            ok2, reason2 = _send_apns(apns_token, title, body, data=data,
+                                      topic=apns_topic, thread_id=thread_id,
+                                      badge=badge, use_sandbox=alt_sandbox)
+            if ok2:
+                ok, reason = True, None
+                used_env = 'sandbox' if alt_sandbox else 'prod'
+                if env_pref != used_env:
+                    try:
+                        _push_save(token, {**reg, 'apns_env': used_env})
+                        print(f"[PUSH] apns env learned user={token[:8]} env={used_env}")
+                    except Exception as e:
+                        print(f"[PUSH] apns env persist failed for {token[:8]}: {e}")
+            else:
+                reason = reason2 or reason
         if ok:
+            # Erfolgs-Log (2026-07-03): vorher war ein erfolgreicher Send
+            # UNSICHTBAR in den Logs → „kommt kein Push an" war nicht von
+            # „wird gar nicht versucht" unterscheidbar.
+            print(f"[PUSH] apns ok user={token[:8]} env={used_env}")
             return True
         if reason in ('Unregistered', 'BadDeviceToken', 'ExpiredToken'):
-            # Totes Device-Token → Registry bereinigen (wie unregister-apns).
+            # BEIDE Umgebungen lehnen ab → Device-Token ist wirklich tot →
+            # Registry bereinigen (wie unregister-apns).
             try:
                 cleared = {**reg, 'apns_token': ''}
                 _push_save(token, cleared)
@@ -24478,7 +24725,13 @@ def ax_route_history(frm, to):
         for r in rows:
             if (r.get('dest_iata') or '').upper() != to:
                 continue
-            delay = int(r.get('max_delay_min') or 0)
+            # BUGFIX (2026-07-03 „alle Flieger pünktlich"): Die Row-Builder
+            # (_departed_rows_from_store / _board_rows_from_obs_for_date) mappen
+            # die SB-Spalte max_delay_min bereits auf den Ausgabe-Key
+            # 'delay_min'. Der Read hier griff auf 'max_delay_min' zu → immer 0
+            # → jeder Flug „ontime". Die SB-Daten selbst sind korrekt (verifiziert
+            # 2026-07-02 FRA: 22/195 Flüge ≥15 min, max 350 min).
+            delay = int(r.get('delay_min') or 0)
             canc = bool(r.get('cancelled'))
             status = ('cancelled' if canc else
                       'ontime' if delay <= 15 else

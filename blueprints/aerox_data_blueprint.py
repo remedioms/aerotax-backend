@@ -23,7 +23,9 @@ Hexes und echte Live-Routen lösen genau einen externen Call aus, danach Cache.
 import gzip
 import hashlib
 import json
+import math
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -1149,6 +1151,164 @@ def _airline_logo(iata):
     """Freies Logo-CDN (avs.io) — externe URL, KEIN eigener Storage."""
     iata = (iata or '').strip().upper()
     return f'https://pics.avs.io/120/120/{iata}.png' if len(iata) == 2 else None
+
+
+# ---------------------------------------------------------------- city names
+# IATA → hübscher Städtename für User-facing Labels (Family-/Friend-Roster,
+# 2026-07-03: "immer Frankfurt – San Francisco, nie FRA-SFO-FRA").
+# Quelle: gebackene Referenz-DB (airports.city = OurAirports-municipality,
+# ~85k Airports weltweit); Fallback airports_compact.json (city/name), dann
+# der Airport-`name`, zuletzt der IATA-Code selbst. In-Process-Cache.
+_IATA_CITY_CACHE = {}
+_IATA_LATLON_CACHE = {}
+_COMPACT_CITY_CACHE = None
+_COMPACT_CITY_LOCK = threading.Lock()
+
+# Wenige bewusste Overrides wo die DB-Municipality fürs Label unschön ist
+# ("Frankfurt am Main" → "Frankfurt"; IAD/DCA-Municipality ist "Dulles"/
+# "Arlington" statt der Stadt, für die der Airport steht).
+_IATA_CITY_OVERRIDES = {
+    'FRA': 'Frankfurt',
+    'IAD': 'Washington',
+    'DCA': 'Washington',
+}
+
+
+def _compact_city(code):
+    """Fallback-Quelle: airports_compact.json (fields iata/name/city …)."""
+    global _COMPACT_CITY_CACHE
+    if _COMPACT_CITY_CACHE is None:
+        with _COMPACT_CITY_LOCK:
+            if _COMPACT_CITY_CACHE is None:
+                out = {}
+                try:
+                    with open(os.path.join(_REPO, 'airports_compact.json'),
+                              encoding='utf-8') as f:
+                        data = json.load(f)
+                    fields = data.get('fields') or []
+                    i_iata = fields.index('iata')
+                    i_name = fields.index('name')
+                    i_city = fields.index('city')
+                    for r in (data.get('rows') or []):
+                        try:
+                            ia = (r[i_iata] or '').strip().upper()
+                            if len(ia) == 3:
+                                out[ia] = ((r[i_city] or r[i_name]) or '').strip()
+                        except (TypeError, IndexError):
+                            continue
+                except Exception:
+                    out = {}
+                _COMPACT_CITY_CACHE = out
+    return _COMPACT_CITY_CACHE.get(code, '')
+
+
+def _iata_city_name(iata):
+    """IATA → Städtename ("FRA" → "Frankfurt", "SFO" → "San Francisco",
+    "HND" → "Tokyo"). Fällt auf den Airport-Namen und zuletzt auf den Code
+    selbst zurück — gibt für einen echten Code NIE leer/None zurück."""
+    code = (iata or '').strip().upper()
+    if len(code) != 3 or not code.isalpha():
+        return (iata or '').strip()
+    hit = _IATA_CITY_CACHE.get(code)
+    if hit is not None:
+        return hit
+    city = _IATA_CITY_OVERRIDES.get(code) or ''
+    if not city:
+        try:
+            row = _q1(
+                "SELECT city, name FROM airports WHERE iata=? "
+                "ORDER BY CASE type WHEN 'large_airport' THEN 0 "
+                "WHEN 'medium_airport' THEN 1 ELSE 2 END LIMIT 1",
+                (code,))
+        except Exception:
+            row = None
+        if row:
+            city = ((row.get('city') or '').strip()
+                    or (row.get('name') or '').strip())
+    if not city:
+        city = _compact_city(code)
+    if city:
+        # "Paris (Roissy-en-France, Val-d'Oise)" → "Paris"; Namens-Fallback
+        # "… International Airport" → Ort ohne Airport-Suffix.
+        city = re.sub(r'\s*\([^)]*\)', '', city).strip()
+        city = re.sub(r'\s+(International|Intl\.?|Municipal|Regional)?\s*Airport$',
+                      '', city, flags=re.IGNORECASE).strip()
+    out = city or code
+    _IATA_CITY_CACHE[code] = out
+    return out
+
+
+def _iata_latlon(code):
+    """IATA → (lat, lon) aus der Referenz-DB, None wenn unbekannt. Cached."""
+    if code in _IATA_LATLON_CACHE:
+        return _IATA_LATLON_CACHE[code]
+    row = None
+    try:
+        row = _q1(
+            "SELECT lat, lon FROM airports WHERE iata=? "
+            "ORDER BY CASE type WHEN 'large_airport' THEN 0 "
+            "WHEN 'medium_airport' THEN 1 ELSE 2 END LIMIT 1",
+            (code,))
+    except Exception:
+        row = None
+    out = None
+    if row and row.get('lat') is not None and row.get('lon') is not None:
+        out = (float(row['lat']), float(row['lon']))
+    _IATA_LATLON_CACHE[code] = out
+    return out
+
+
+def _gc_km(lat1, lon1, lat2, lon2):
+    """Great-Circle-Distanz (Haversine) in km."""
+    rl1, rl2 = math.radians(lat1), math.radians(lat2)
+    dlat = rl2 - rl1
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(rl1) * math.cos(rl2) * math.sin(dlon / 2) ** 2
+    return 2 * 6371.0 * math.asin(math.sqrt(a))
+
+
+def _route_label_cities(routing, layover_ort=None):
+    """Tour-Label mit Städtenamen aus einer rohen Routing-Kette.
+
+    "FRA-SFO-FRA" (+ layover_ort "SFO") → "Frankfurt – San Francisco".
+    Ziel-Auswahl:
+      1. layover_ort, wenn er in der Kette vorkommt (der echte Übernachtungs-/
+         Wendepunkt der Tour),
+      2. Rundreise (Start == Ende) → der vom Start ENTFERNTESTE Zwischenstopp
+         (Great-Circle über die Referenz-DB; ohne Koordinaten: mittlerer Stop),
+      3. sonst die letzte Station der Kette.
+    Ein-Ort-Fälle (nur layover_ort, z.B. Layover-Ruhetag) → nur der Städtename.
+    Returns None wenn gar nichts baubar ist. NIE die rohe Token-Kette."""
+    chain = [t for t in re.split(r'[^A-Z]+', (routing or '').upper())
+             if len(t) == 3]
+    lov = (layover_ort or '').strip().upper()
+    if not re.fullmatch(r'[A-Z]{3}', lov):
+        lov = ''
+    if len(chain) < 2:
+        place = chain[0] if chain else lov
+        return _iata_city_name(place) if place else None
+    origin, dest = chain[0], None
+    if lov and lov in chain[1:]:
+        dest = lov
+    elif origin == chain[-1]:
+        # Rundreise FRA-…-FRA: Tour-Ziel = entferntester Punkt vom Start.
+        o = _iata_latlon(origin)
+        best_d = -1.0
+        if o:
+            for c in dict.fromkeys(chain[1:-1]):
+                p = _iata_latlon(c)
+                if not p:
+                    continue
+                d = _gc_km(o[0], o[1], p[0], p[1])
+                if d > best_d:
+                    best_d, dest = d, c
+        if not dest and len(chain) >= 3:
+            dest = chain[len(chain) // 2]
+    else:
+        dest = chain[-1]
+    if not dest or dest == origin:
+        return _iata_city_name(origin)
+    return f"{_iata_city_name(origin)} – {_iata_city_name(dest)}"
 
 
 # ---------------------------------------------------------------- endpoints
