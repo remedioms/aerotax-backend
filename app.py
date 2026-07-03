@@ -14293,11 +14293,17 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
             if now_ts - _feed_refresh_last_attempt.get(token, 0) < _FEED_REFRESH_RETRY_GAP_S:
                 return
             _feed_refresh_last_attempt[token] = now_ts
-        prof = _profile_load(token) or {}
-        feed = prof.get('calendar_feed')
-        if not isinstance(feed, dict):
-            feed = (prof.get('metadata') or {}).get('calendar_feed') \
-                if isinstance(prof.get('metadata'), dict) else None
+        # _profile_load liefert einen WRAPPER {'token':…, 'profile': {…}} —
+        # calendar_feed liegt IM inneren profile-Dict (metadata wird dort
+        # bereits top-level gefaltet). Beide Ebenen prüfen (defensiv).
+        wrapper = _profile_load(token) or {}
+        inner = wrapper.get('profile') if isinstance(wrapper.get('profile'), dict) else {}
+        feed = None
+        for source in (inner, wrapper):
+            cand = source.get('calendar_feed')
+            if isinstance(cand, dict):
+                feed = cand
+                break
         if not isinstance(feed, dict):
             return
         url = (feed.get('url') or '').strip()
