@@ -11698,6 +11698,9 @@ def get_friend_roster(token, friend_token):
     # ANGENOMMENE Freundschaft IST die Zustimmung, den Plan zu teilen. Es gibt
     # keinen Aus-Schalter mehr (im Client entfernt) — wer dich als Freund:in
     # bestätigt, sieht deinen Plan, reziprok.
+    # Auch der FREUND-Roster soll frisch sein (Pickup-Events kommen erst ~1 Tag
+    # vorher in den Feed) — gedrosselter Re-Sync seines calendar_feed.
+    _maybe_refresh_calendar_feed(friend_token)
     # Friend roster: 1) aus _store (in-memory, frisch wenn Friend gerade aktiv),
     # 2) Fallback auf persistenten roster_snapshot — überlebt Container-Restart.
     # Vorher: nur _store → bei Render-Sleep waren alle Friend-Rosters leer.
@@ -11818,6 +11821,8 @@ def get_friends_today(token):
     # wie get_user_friends; Disk-Datei ist auf Cloud Run ephemer).
     _bulk_profs = _profiles_load_bulk(friends)
     for fr in friends:
+        # Freund-Feeds gedrosselt frisch halten (Pickup-Events, Roster-Änderungen).
+        _maybe_refresh_calendar_feed(fr)
         sess = _store.get(fr) or {}
         rd = sess.get('result_data') or {}
         tage = rd.get('_tage_detail') or []
@@ -14261,6 +14266,81 @@ def _corrected_briefing_start_iso(date_str, summary, current_start_iso,
         return current_start_iso
 
 
+# ── Kalender-Feed-Auto-Refresh (Root-Cause-Fix „Pickup-Zeiten fehlen") ──────
+# LH published Pickup-Events (Hotel-Bus, „13:35 LT Pickup BLL") erst ~1 Tag vor
+# dem Layover in den myTime-Feed — der gespeicherte Roster blieb aber auf dem
+# Stand des Verbindungs-Tags, weil NICHTS den calendar_feed re-synct hat
+# (Bug 2026-07-04: Tibors Briefings waren vom 26.06., Pickup fehlte → App
+# zeigte Heuristik- statt Kalender-Zeiten). Beim Roster-Read wird der Feed
+# daher — pro Token gedrosselt — über den BESTEHENDEN Import-Endpoint frisch
+# gezogen (voller Reuse: SSRF-Checks, Parser, Reconcile, Sektoren). Self-Call
+# mit Bearer=Token erfüllt das Token-Binding. Fire-and-forget: der laufende
+# Request serviert noch den alten Stand, der nächste liest frisch.
+_FEED_REFRESH_MIN_AGE_S = 6 * 3600       # Feed älter als 6 h → neu ziehen
+_FEED_REFRESH_RETRY_GAP_S = 45 * 60      # Prozess-Drossel zwischen Versuchen
+_feed_refresh_last_attempt = {}
+_feed_refresh_lock = _req_threading.Lock()
+
+
+def _maybe_refresh_calendar_feed(token, base_url=None):
+    """Stößt (gedrosselt, im Daemon-Thread) einen Re-Import des gespeicherten
+    calendar_feed an, wenn der letzte Import älter als 6 h ist. Wirft nie."""
+    try:
+        if not token:
+            return
+        now_ts = time.time()
+        with _feed_refresh_lock:
+            if now_ts - _feed_refresh_last_attempt.get(token, 0) < _FEED_REFRESH_RETRY_GAP_S:
+                return
+            _feed_refresh_last_attempt[token] = now_ts
+        prof = _profile_load(token) or {}
+        feed = prof.get('calendar_feed')
+        if not isinstance(feed, dict):
+            feed = (prof.get('metadata') or {}).get('calendar_feed') \
+                if isinstance(prof.get('metadata'), dict) else None
+        if not isinstance(feed, dict):
+            return
+        url = (feed.get('url') or '').strip()
+        if not url.startswith(('https://', 'webcal://', 'webcals://')):
+            return
+        imported_at = (feed.get('imported_at') or '').strip()
+        if imported_at:
+            try:
+                age = (datetime.now() - datetime.fromisoformat(imported_at)).total_seconds()
+                if age < _FEED_REFRESH_MIN_AGE_S:
+                    return
+            except Exception:
+                pass  # unparsebares Datum → lieber refreshen
+        # Hinter dem Cloud-Run-Proxy kann url_root „http://" melden — Self-Call
+        # IMMER über https auf den echten Host.
+        host = (base_url or request.headers.get('X-Forwarded-Host')
+                or request.host or '').strip().rstrip('/')
+        if not host:
+            return
+        base = host if host.startswith('https://') else f'https://{host}'
+
+        def _do_refresh():
+            try:
+                import urllib.request as _ur
+                req = _ur.Request(
+                    f'{base}/api/user/calendar-feed/{token}/import',
+                    data=json.dumps({'url': url}).encode('utf-8'),
+                    headers={'Content-Type': 'application/json',
+                             'Authorization': f'Bearer {token}',
+                             'User-Agent': 'AeroTax-FeedRefresh/1.0'},
+                    method='POST')
+                with _ur.urlopen(req, timeout=30) as r:
+                    app.logger.info(
+                        f'[feed-refresh] tok={token[:8]} status={r.status}')
+            except Exception as e:
+                app.logger.warning(
+                    f'[feed-refresh] tok={token[:8]} fail {type(e).__name__}: {str(e)[:120]}')
+
+        _req_threading.Thread(target=_do_refresh, daemon=True).start()
+    except Exception:
+        pass
+
+
 @app.route('/api/user/briefing/<token>', methods=['GET'])
 def get_briefings(token):
     """Alle Briefing-Items (key: Datum) für User.
@@ -14275,6 +14355,9 @@ def get_briefings(token):
     import re as _re
     if not token or not _re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]:
         return jsonify({'error': 'invalid token'}), 400
+    # Eigener Roster wird gelesen → ggf. den myTime-Feed frisch ziehen
+    # (Pickup-Events erscheinen erst ~1 Tag vorher, siehe Helper-Doku).
+    _maybe_refresh_calendar_feed(token)
     try:
         data = dict(_manual_briefings_load(token) or {})
     except Exception as e:
