@@ -11924,7 +11924,12 @@ def get_friends_today(token):
                         str(first_sec['dep_iso']).replace('Z', '+00:00'))
                     frm = str(first_sec.get('from') or '').strip().upper()
                     hb = str(pr.get('homebase') or '').strip().upper()
-                    if (datetime.now(timezone.utc) < dep
+                    # Verspätungs-Toleranz (Owner 2026-07-04, Tibor: Flug spät →
+                    # er steht real noch am Abflughafen [BLL], die App zeigte ihn
+                    # aber schon weiter, weil die PLAN-Abflugzeit vorbei war).
+                    # Bis 4h nach Plan-Abflug gilt er noch als am Abflughafen —
+                    # deckt reale Verspätungen ohne teuren Live-Lookup pro Crew.
+                    if (datetime.now(timezone.utc) < dep + timedelta(hours=4)
                             and len(frm) == 3 and frm.isalpha() and frm != hb):
                         lay_eff = frm
         except Exception:
