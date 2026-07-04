@@ -2037,6 +2037,52 @@ def ax_callsign(callsign):
     return jsonify(out)
 
 
+@aerox_data_bp.route('/api/ax/radar-enrich', methods=['POST'])
+def ax_radar_enrich():
+    """Batch-Anreicherung ALLER sichtbaren Radar-Flieger (Owner 2026-07-04:
+    „diese Rechnung direkt für alle Flieger in Sicht machen — dann sind sie
+    beim Antippen sofort da"). Body {"hexes":[…]} (≤80). EIN Warehouse-Query
+    (BOARD-verifizierte Tail↔Hex-Matches, Live-Fenster dep −3h…+4h), kein
+    Paid-Spend, keine Einzel-Lookups. iOS füllt damit beim Area-Poll den
+    Route-Cache → der Tap zeigt Strecke/Gate ohne Wartezeit."""
+    from flask import request
+    body = request.get_json(silent=True) or {}
+    hexes = [str(h).lower().strip() for h in (body.get('hexes') or []) if h][:80]
+    if not hexes:
+        return jsonify({'ok': False, 'error': 'no_hexes'}), 400
+    sb = _sb()
+    out = {}
+    if sb is not None:
+        try:
+            from datetime import datetime as _dt
+            yday = time.strftime('%Y-%m-%d', time.gmtime(time.time() - 86400))
+            r = (sb.table('flights')
+                 .select('hex,op_flight_no,origin,destination,gate,status,tail,sched_dep,est_dep')
+                 .in_('hex', hexes).gte('service_date', yday)
+                 .order('updated_at', desc=True).limit(200).execute())
+            now = time.time()
+            for f in (r.data or []):
+                hx = (f.get('hex') or '').lower()
+                if not hx or hx in out:
+                    continue
+                dep_iso = f.get('est_dep') or f.get('sched_dep')
+                try:
+                    dep_ts = _dt.fromisoformat(
+                        str(dep_iso).replace('Z', '+00:00')).timestamp()
+                except (TypeError, ValueError):
+                    continue
+                if now - 3 * 3600 <= dep_ts <= now + 4 * 3600:
+                    out[hx] = {'flight_no': f.get('op_flight_no'),
+                               'src': f.get('origin'), 'dst': f.get('destination'),
+                               'gate': f.get('gate'), 'status': f.get('status'),
+                               'tail': f.get('tail'),
+                               'source': 'warehouse_board',
+                               'confidence': 'confirmed'}
+        except Exception:
+            pass
+    return jsonify({'ok': True, 'count': len(out), 'routes': out})
+
+
 @aerox_data_bp.route('/api/ax/harvest-routes', methods=['POST'])
 def ax_harvest_routes():
     """Route-Harvester (User-Wunsch: „die restlichen Flugnummern suchen + von wo
