@@ -11923,15 +11923,50 @@ def get_friends_today(token):
                     dep = datetime.fromisoformat(
                         str(first_sec['dep_iso']).replace('Z', '+00:00'))
                     frm = str(first_sec.get('from') or '').strip().upper()
+                    to = str(first_sec.get('to') or '').strip().upper()
                     hb = str(pr.get('homebase') or '').strip().upper()
-                    # Verspätungs-Toleranz (Owner 2026-07-04, Tibor: Flug spät →
-                    # er steht real noch am Abflughafen [BLL], die App zeigte ihn
-                    # aber schon weiter, weil die PLAN-Abflugzeit vorbei war).
-                    # Bis 4h nach Plan-Abflug gilt er noch als am Abflughafen —
-                    # deckt reale Verspätungen ohne teuren Live-Lookup pro Crew.
-                    if (datetime.now(timezone.utc) < dep + timedelta(hours=4)
-                            and len(frm) == 3 and frm.isalpha() and frm != hb):
-                        lay_eff = frm
+                    if len(frm) == 3 and frm.isalpha() and frm != hb:
+                        # ECHTER-STATUS-KASKADE (Owner 2026-07-04, Tibor: Flug
+                        # spät → er steht real noch am Abflughafen [BLL], die App
+                        # zeigte ihn schon weiter, nur weil die PLAN-Abflugzeit
+                        # vorbei war). Signal-getrieben statt Uhr-getrieben:
+                        #   • noch NICHT abgeflogen (grounded / kein Signal &
+                        #     innerhalb 4h nach Plan) → Crew ist am Abflughafen,
+                        #   • AIRBORNE → unterwegs, geplanten Layover BEHALTEN
+                        #     (NICHT an frm pinnen),
+                        #   • LANDED → weiter zum Ziel des ersten Legs.
+                        # 4h-Grace bleibt reiner Fallback OHNE Live-Signal.
+                        merged = None
+                        try:
+                            fno = _fn_norm(first_sec.get('flight'))
+                            if fno and len(fno) >= 3:
+                                merged = _flight_obs_merged(
+                                    fno, date=datum, dep_iata=frm,
+                                    arr_iata=(to if (len(to) == 3 and to.isalpha())
+                                              else None),
+                                    free_only=True)
+                        except Exception:
+                            merged = None
+                        bucket = (_flight_status_bucket(merged.get('status'))
+                                  if merged else None)
+                        if merged and bucket == 'landed':
+                            # Erster Leg gelandet → Crew hat den Abflughafen
+                            # verlassen. Weiter zum Ziel (sonst geplanter Layover).
+                            if len(to) == 3 and to.isalpha():
+                                lay_eff = to
+                        elif merged and bucket == 'airborne':
+                            # Unterwegs → geplanten Layover behalten (Default).
+                            pass
+                        elif merged and bucket == 'grounded':
+                            # Echtes Signal „noch nicht abgeflogen" (delayed/
+                            # boarding) → Crew ist am Abflughafen, UNABHÄNGIG von
+                            # der Uhr (auch bei starker Verspätung > 4h).
+                            lay_eff = frm
+                        else:
+                            # Kein echtes Signal → 4h-Grace-Fallback: Crew gilt
+                            # bis 4h nach Plan-Abflug noch als am Abflughafen.
+                            if datetime.now(timezone.utc) < dep + timedelta(hours=4):
+                                lay_eff = frm
         except Exception:
             lay_eff = rf.get('layover_ort')
         # Privacy-Gate: share_location=False (bool) oder =0 (legacy int) → kein city.
@@ -14481,6 +14516,22 @@ def get_briefings(token):
             data[k] = merged
     except Exception:
         # Defensiv: iCal-Read-Fehler darf User-PUT-Daten nicht blocken
+        pass
+    # LIVE-DELAY-ANREICHERUNG (Owner 2026-07-04) — SERVE-TIME, nicht Import-Time:
+    # pro Leg des HEUTIGEN und MORGIGEN Tages Delay/Status/Cancelled/Ist-Zeiten
+    # aus dem Dual-Side-Resolver anhängen (ical_sectors[]). NUR today/today+1 →
+    # der ganze Monat würde sonst pro Request Boards scannen. free_only=True +
+    # ~90 s-Memo halten den Fan-out kostenlos; die Zahlen bleiben pro Request
+    # frisch statt beim letzten iCal-Sync eingefroren. Rein additiv, defensiv.
+    try:
+        from datetime import date as _bd, timedelta as _btd2
+        _today = _bd.today()
+        _live_days = {_today.isoformat(), (_today + _btd2(days=1)).isoformat()}
+        for _k in list(_live_days):
+            _day = data.get(_k)
+            if isinstance(_day, dict) and isinstance(_day.get('ical_sectors'), list):
+                _enrich_leg_delays(_day['ical_sectors'], _k)
+    except Exception:
         pass
     datum = request.args.get('datum')
     if datum:
@@ -26150,6 +26201,146 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
     _FLIGHT_MERGE_CACHE[ckey] = (_t.time(), dict(rec))
     _cache_soft_cap(_FLIGHT_MERGE_CACHE)
     return rec
+
+
+# ─── Board-Status-Buckets (Owner 2026-07-04 „echter Status statt Uhr") ───────
+# Normalisierte, kleingeschriebene Signalwörter. Board-Provider liefern DE + EN
+# gemischt (Poller: „Gelandet 14:23", AeroDataBox: „Landed"). Substring-Match,
+# damit Zeit-Suffixe/Umlaute nicht stören. Wiederverwendet von lay_eff (Crew-
+# Standort), Inbound-Kette und dem iOS-Status-Passthrough. Reihenfolge im
+# Bucket-Resolver: landed vor airborne vor grounded (arrived ist definitiv).
+_FLIGHT_AIRBORNE_STATES = {
+    'departed', 'airborne', 'en-route', 'enroute', 'en route', 'in air',
+    'in-air', 'inair', 'abgeflogen', 'gestartet', 'im flug', 'unterwegs',
+}
+_FLIGHT_LANDED_STATES = {
+    'landed', 'arrived', 'at gate', 'on ground', 'on blocks', 'on-blocks',
+    'gelandet', 'angekommen', 'baggage', 'gepäck', 'gepaeck',
+}
+_FLIGHT_GROUNDED_STATES = {
+    'scheduled', 'boarding', 'gate open', 'gate-open', 'delayed', 'estimated',
+    'planmäßig', 'planmaessig', 'erwartet', 'verspätet', 'verspaetet',
+    'boarding gate', 'go to gate', 'final call',
+}
+
+
+def _flight_status_bucket(status):
+    """Board-Status-String → 'landed' | 'airborne' | 'grounded' | None.
+    None = kein/unbekanntes Signal (Aufrufer fällt auf Uhr/Grace zurück)."""
+    s = (status or '').strip().lower()
+    if not s:
+        return None
+    for t in _FLIGHT_LANDED_STATES:
+        if t in s:
+            return 'landed'
+    for t in _FLIGHT_AIRBORNE_STATES:
+        if t in s:
+            return 'airborne'
+    for t in _FLIGHT_GROUNDED_STATES:
+        if t in s:
+            return 'grounded'
+    return None
+
+
+def _enrich_leg_delays(sectors, date, free_only=True):
+    """Reichert die Pro-Leg-Sektoren EINES Roster-Tages (ical_sectors[]) IN PLACE
+    um Live-/Warehouse-Delay-Felder an (Owner 2026-07-04 „alle Live-Sachen an-
+    binden", Serve-Time-Enrichment — NICHT im iCal-Sync eingefroren).
+
+    Pro Sektor-dict (braucht flight/from/to):
+      (a) Flugnummer via `_fn_norm` normalisieren (LH839 == LH0839),
+      (b) Codeshare→Operating falten (`_ax_codeshare_map`), damit EIN physischer
+          Flug EIN Delay-Verdikt bekommt (Marketing-Nr additiv als `also_as`),
+      (c) `_flight_obs_merged(fn, date, dep_iata=from, arr_iata=to,
+          free_only=…)` — gecacht (~90 s), Fan-out über N Crew = O(1) je
+          (fn,date,dep,arr), free_only=True → KEIN AeroDataBox-Spend,
+      (d) neue OPTIONALE Keys anhängen: delay_min, delay_known, delay_side,
+          dep_delay_min, arr_delay_min, status, cancelled, est_dep_iso,
+          est_arr_iso, reg, obs_sides.
+
+    HARTE GUARDS:
+      • Zeitfenster: nur anreichern, wenn der Leg-Abflug (dep_iso, sonst `date`)
+        im Fenster [jetzt−30 h .. jetzt+27 h] liegt — reine Zukunfts-/Tief-
+        Vergangenheits-Legs überspringen (spart Board-Scans, ehrt die
+        >27h-Zukunfts-Regel).
+      • merged is None → GAR NICHTS schreiben (Legacy/kein Signal = Feld fehlt).
+      • merged.delay_known False → delay_known=False, delay_min=None (NIEMALS
+        eine erfundene 0). Echte Beobachtungen (status/est/reg) dürfen dennoch
+        durchgereicht werden — sie sind gemessen, nicht erfunden.
+
+    Gibt dieselbe Liste zurück (in-place mutiert). Wirft nie."""
+    if not sectors or not isinstance(sectors, list):
+        return sectors
+    now = datetime.now(timezone.utc)
+    cs_map = None
+    for s in sectors:
+        if not isinstance(s, dict):
+            continue
+        raw_fn = str(s.get('flight') or '').strip()
+        frm = str(s.get('from') or '').strip().upper()
+        to = str(s.get('to') or '').strip().upper()
+        if len(raw_fn) < 3 or len(frm) != 3 or not frm.isalpha() \
+                or len(to) != 3 or not to.isalpha():
+            continue
+        # ── Zeitfenster-Guard ────────────────────────────────────────────────
+        dep_dt = None
+        try:
+            dr = s.get('dep_iso')
+            if dr:
+                dep_dt = datetime.fromisoformat(str(dr).replace('Z', '+00:00'))
+                if dep_dt.tzinfo is None:
+                    dep_dt = dep_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            dep_dt = None
+        if dep_dt is not None:
+            if dep_dt > now + timedelta(hours=27):
+                continue        # tiefe Zukunft: kein Board-Scan
+            if dep_dt < now - timedelta(hours=30):
+                continue        # tiefe Vergangenheit: kein SB-Read
+        # ── Flugnummer normalisieren + Codeshare→Operating ───────────────────
+        fn = _fn_norm(raw_fn)
+        if len(fn) < 3:
+            continue
+        if cs_map is None:
+            try:
+                cs_map = _ax_codeshare_map() or {}
+            except Exception:
+                cs_map = {}
+        op_fn = cs_map.get(fn, fn)
+        # Datum: bevorzugt der ECHTE Abflugtag des Legs (dep_iso, korrekt an der
+        # Tag-Grenze / in West-Zeitzonen), sonst der Tages-Key.
+        leg_date = None
+        if dep_dt is not None:
+            try:
+                leg_date = dep_dt.strftime('%Y-%m-%d')
+            except Exception:
+                leg_date = None
+        leg_date = leg_date or (str(date or '')[:10] or None)
+        try:
+            m = _flight_obs_merged(op_fn, date=leg_date, dep_iata=frm,
+                                   arr_iata=to, live=True, free_only=free_only)
+        except Exception:
+            m = None
+        if m is None:
+            continue        # kein Signal → Legacy (Felder bleiben abwesend)
+        known = bool(m.get('delay_known'))
+        s['delay_known'] = known
+        s['delay_min'] = (m.get('delay_min') if known else None)
+        s['delay_side'] = m.get('delay_side')
+        s['dep_delay_min'] = m.get('dep_delay_min')
+        s['arr_delay_min'] = m.get('arr_delay_min')
+        s['status'] = m.get('status')
+        s['cancelled'] = bool(m.get('cancelled'))
+        # est_*: der beste Ist/Erwartet-Zeitstempel des Resolvers (Board-Zeit).
+        # iOS wandelt zur Anzeige station-lokal um; delay_min bleibt die
+        # autoritative Zahl.
+        s['est_dep_iso'] = m.get('esti_dep')
+        s['est_arr_iso'] = m.get('esti_arr')
+        s['reg'] = m.get('reg')
+        s['obs_sides'] = m.get('sides')
+        if op_fn != fn and 'also_as' not in s:
+            s['also_as'] = raw_fn        # gefaltete Marketing-Nummer bewahren
+    return sectors
 
 
 def _cached_board_rows(iata, ftype):
