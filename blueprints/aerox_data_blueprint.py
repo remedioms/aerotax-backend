@@ -310,7 +310,7 @@ def _aviationstack_route(callsign):
     url = (f'http://api.aviationstack.com/v1/flights?access_key={urllib.parse.quote(key)}'
            f'&flight_icao={urllib.parse.quote(callsign)}&limit=1')
     _paid_budget_inc(units=2)       # AviationStack ~gleichwertig gewichtet
-    d = _http_json(url, timeout=12)
+    d = _http_json(url, timeout=7)  # interaktiv gestrafft (war 12s) — Radar-Tap wartet
     if not isinstance(d, dict):
         return None
     _budget_inc(month, used)        # Call verbraucht (auch bei 0 Treffern)
@@ -471,7 +471,7 @@ def _adb_pick_active_leg(flights, cs, reg, track):
     return pool[0][1], len(pool) > 1
 
 
-def _aerodatabox_route(cs, reg=None, lat=None, lon=None, track=None, date=None):
+def _aerodatabox_route(cs, reg=None, lat=None, lon=None, track=None, date=None, timeout=7):
     """AeroDataBox (RapidAPI, AERODATABOX_KEY) — die GENAUE Route eines Live-Fluges.
     Reg-gekeyt bevorzugt (an die physische Maschine gebunden → immun gegen
     Flugnummer-Recycling), sonst nummern-gekeyt mit Leg-Disambiguierung.
@@ -500,7 +500,11 @@ def _aerodatabox_route(cs, reg=None, lat=None, lon=None, track=None, date=None):
         _paid_budget_inc(units=2)   # Flight-Endpoints = Tier 2 (2 Units)
         try:
             req = urllib.request.Request(f'{base}{path}', headers=hdr)
-            with urllib.request.urlopen(req, timeout=10) as r:
+            # INTERAKTIV-Timeout (Owner 2026-07-04 „29 sek für die Route"): der
+            # Radar-Tap hängt an dieser Kette. Per `timeout`-Param übergeben (Fast-
+            # Path: ~3s); ein wirklich langsamer Anbieter wird gratis vom Warehouse/
+            # Crowdsource-Nachtrag beim nächsten Tap gedeckt.
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 d = json.loads(r.read().decode('utf-8', 'replace'))
                 return d if isinstance(d, list) else []
         except Exception:
@@ -1212,7 +1216,7 @@ def _free_generic_route(cs, lat=None, lon=None):
 
 
 def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
-                        track=None, gs=None, on_ground=False):
+                        track=None, gs=None, on_ground=False, fast=False):
     """OWN-DATA-FIRST Kaskade → genaue heutige Route eines Live-Fliegers.
     Rückgabe: route-Dict mit src/dst(+_icao), source, confidence(+optional
     status/gate/terminal/reg) — oder None. Siehe Header-Block für die Priorität.
@@ -1258,6 +1262,28 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
         _record_resolved_route(cs, reg, wh, date)
         return wh
 
+    # ── FAST-PATH (interaktiver Radar-Tap, Owner 2026-07-04 „auf 2 sek bringen") ──
+    #  Der User starrt auf einen Spinner. OpenSky (Token bis 15s + Flights 6s)
+    #  liefert für einen NOVEL Auslandsflug (nicht in unserem Warehouse) meist NICHTS
+    #  und kostet ~20s umsonst, BEVOR der eigentliche Treffer — AeroDataBox, reg-gekeyt
+    #  autoritativ — drankommt. Im Fast-Modus daher GLEICH den bezahlten reg-gekeyten
+    #  Call mit knappem Timeout (~3s → Treffer in 1-3s), OpenSky übersprungen. Alles,
+    #  was wir selbst haben, ist oben (Schritt 1, Cache/Tafel/Warehouse) längst GRATIS
+    #  raus → bezahlt trifft nur genuine Unbekannte (die man ohnehin bezahlen müsste)
+    #  und der Treffer wird sofort gecacht/crowdsourced → der nächste Tap ist gratis.
+    #  Miss (Quota/kein Treffer) → normale free-first-Kaskade unten als Fallback (ohne
+    #  AeroDataBox doppelt zu ziehen). Ohne Budget: gar kein Fast-Call → Fallback frei.
+    adb_tried = False
+    if fast and _paid_budget_ok():
+        adb_tried = True
+        adb_fast = _aerodatabox_route(cs, reg=reg, lat=lat, lon=lon, track=track,
+                                      date=date, timeout=3)
+        if adb_fast and (adb_fast.get('confidence') == 'confirmed'
+                         or _geometry_allows_route(adb_fast, lat, lon, track, gs, on_ground)):
+            adb_fast['confidence'] = 'confirmed'
+            _record_resolved_route(cs, adb_fast.get('reg') or reg, adb_fast, date)
+            return adb_fast
+
     # ── 2. Selbst berechnet aus eigenem ADS-B ───────────────────────────────
     #  Fertige Legs landen via observe_adsb_positions() bereits in ax_route_cache
     #  → Schritt 1 (cache_date/cache_reg) serviert sie GRATIS. Kein separater
@@ -1269,7 +1295,10 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
     #  die Maschine JETZT airborne ist, muss der OpenSky-Treffer (a) frisch sein
     #  (last_seen nicht älter als _LIVE_ROUTE_STALE_S) UND (b) die Live-Geometrie
     #  darf nicht klar widersprechen. Sonst: lieber nichts als die falsche Strecke.
-    osky = _opensky_route(hexid)
+    # Fast-Modus + bezahlt schon versucht → OpenSky überspringen (Token+Flights bis
+    # 21s würden die 2-s-Zielzeit sprengen). Nur wenn KEIN Budget da war (adb_tried
+    # False) läuft OpenSky als freier Fallback.
+    osky = None if (fast and adb_tried) else _opensky_route(hexid)
     if osky and (osky.get('src') or osky.get('dst')):
         last_seen = osky.pop('_last_seen', None)
         ok = True
@@ -1321,7 +1350,10 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
 
     # ── 5. BEZAHLT (LETZTER Ausweg) — nur mit Tages-Budget, nur getippter Flieger
     if _paid_budget_ok():
-        adb = _aerodatabox_route(cs, reg=reg, lat=lat, lon=lon, track=track, date=date)
+        # adb_tried: der Fast-Path hat AeroDataBox oben bereits (erfolglos) gezogen →
+        # NICHT erneut (kein Doppel-Budget). Dann direkt AviationStack als Fallback.
+        adb = None if adb_tried else _aerodatabox_route(cs, reg=reg, lat=lat,
+                                                        lon=lon, track=track, date=date)
         if adb:
             # AeroDataBox ist reg-gekeyt autoritativ; ein eindeutiges Leg ist
             # bereits 'confirmed'. Nur ein MEHRDEUTIGES ('estimated') Leg muss die
@@ -2013,8 +2045,11 @@ def ax_callsign(callsign):
     og = (request.args.get('on_ground') or request.args.get('ground') or '').strip().lower()
     on_ground = og in ('1', 'true', 'yes', 'y')
 
+    # fast=True: interaktiver Radar-Tap → paid-first mit knappem Timeout, OpenSky
+    # übersprungen (Ziel ~2s statt ~29s). Der Background-Poller nutzt weiter die
+    # volle free-first-Kaskade (fast=False) und füllt das Warehouse.
     route = _resolve_live_route(cs, hexid=hexid, reg=reg, lat=lat, lon=lon,
-                                track=track, gs=gs, on_ground=on_ground)
+                                track=track, gs=gs, on_ground=on_ground, fast=True)
     # SHOW-Contract (Owner: „scraped/eigene Infos sind #1"): der Resolver hat den
     # Reject-Only-Geometrie-Filter bereits angewandt (nur der eklatante „fliegt in
     # die falsche Richtung"-Fall wird verworfen). Was hier ankommt, WIRD gezeigt —
