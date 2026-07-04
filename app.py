@@ -11118,6 +11118,24 @@ def _layover_visibility_set(token, enabled):
         app.logger.warning(f'[crew-dest] vis_save_fail err={type(e).__name__}: {str(e)[:120]}')
         return False
 
+def _pin_not_expired(row):
+    """Meetup-Pins verfallen nach ihrem Event-Tag (Owner 2026-07-04: 'Devil
+    wears prada ist doch schon vorbei und noch zu sehen?'). pin_date < heute
+    → raus. Ohne pin_date: 48h ab created_at als Frist. Wirft nie."""
+    try:
+        today = datetime.now(timezone.utc).date().isoformat()
+        pd = (row.get('pin_date') or '')[:10]
+        if pd:
+            return pd >= today
+        ca = row.get('created_at') or ''
+        if ca:
+            created = datetime.fromisoformat(str(ca).replace('Z', '+00:00'))
+            return (datetime.now(timezone.utc) - created).total_seconds() < 48 * 3600
+    except Exception:
+        pass
+    return True
+
+
 def _manual_pins_load(token):
     """Eigene Pins (zur Verwaltung). Liste von Row-Dicts."""
     if not token or not SB_AVAILABLE:
@@ -11125,7 +11143,7 @@ def _manual_pins_load(token):
     try:
         r = (sb.table('manual_pins').select('*')
              .eq('user_token', token).order('pin_date').limit(500).execute())
-        return r.data or []
+        return [x for x in (r.data or []) if _pin_not_expired(x)]
     except Exception as e:
         app.logger.warning(f'[crew-dest] pins_load_fail err={type(e).__name__}: {str(e)[:120]}')
         return []
@@ -11138,7 +11156,7 @@ def _manual_pins_for_friends(token, friend_tokens):
     try:
         r = (sb.table('manual_pins').select('*')
              .in_('user_token', list(friend_tokens)[:500]).limit(2000).execute())
-        return r.data or []
+        return [x for x in (r.data or []) if _pin_not_expired(x)]
     except Exception as e:
         app.logger.warning(f'[crew-dest] friend_pins_fail err={type(e).__name__}: {str(e)[:120]}')
         return []
@@ -11156,7 +11174,7 @@ def _public_pins_at_iatas(iatas):
     try:
         r = (sb.table('manual_pins').select('*')
              .in_('iata_code', list(set(iatas))[:60]).limit(2000).execute())
-        return r.data or []
+        return [x for x in (r.data or []) if _pin_not_expired(x)]
     except Exception as e:
         app.logger.warning(f'[crew-dest] public_pins_fail err={type(e).__name__}: {str(e)[:120]}')
         return []
