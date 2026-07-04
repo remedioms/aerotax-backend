@@ -493,6 +493,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/ax/flight-live/',           # /<token> → Live-Track der eigenen Maschine
     '/api/ax/turnaround/',            # /<token> → nächster Sektor / Bodenzeit
     '/api/ax/flight-recap/',          # /<token> → Post-Flight-Wahrheit
+    '/api/ax/my-flight-status/',      # /<token> → eigener Tail + Pünktlich-Verdikt
 )
 
 
@@ -12011,6 +12012,13 @@ def get_friends_today(token):
                                            arr_iata=chain[idx + 1],
                                            free_only=True)
                     if m:
+                        # est_*/sched_*: Board-Zeiten stehen in STATIONS-Ortszeit
+                        # (dep mit airport_tz(from), arr mit airport_tz(to)) → hier
+                        # genau EINMAL nach echt-UTC (…Z) wandeln, damit iOS sie wie
+                        # dep_iso durch den station-lokalen Formatter schickt OHNE
+                        # Doppelverschiebung. None wenn keine Zeit / TZ unbekannt —
+                        # nie ein naiver String. Aus diesen effDep/effArr baut iOS
+                        # die Großkreis-Progress-Interpolation der fliegenden Crew.
                         flights_live.append({
                             'flight': fno,
                             'dep_iata': chain[idx], 'arr_iata': chain[idx + 1],
@@ -12018,8 +12026,17 @@ def get_friends_today(token):
                             'arr_delay_min': m.get('arr_delay_min'),
                             'delay_min': m.get('delay_min'),
                             'delay_side': m.get('delay_side'),
+                            'delay_known': bool(m.get('delay_known')),
                             'status': m.get('status'),
                             'cancelled': m.get('cancelled'),
+                            'sched_dep_iso': _board_local_to_utc_iso(
+                                m.get('sched_dep'), chain[idx]),
+                            'est_dep_iso': _board_local_to_utc_iso(
+                                m.get('esti_dep'), chain[idx]),
+                            'sched_arr_iso': _board_local_to_utc_iso(
+                                m.get('sched_arr'), chain[idx + 1]),
+                            'est_arr_iso': _board_local_to_utc_iso(
+                                m.get('esti_arr'), chain[idx + 1]),
                             'sides': m.get('sides'),
                         })
         except Exception:

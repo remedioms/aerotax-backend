@@ -3091,6 +3091,77 @@ def ax_flight_live(token):
     return jsonify(_memo_put(mkey, payload))
 
 
+def _derive_on_time(delay_known, delay_min, cancelled):
+    """PÜNKTLICH-Verdikt aus echten Board-Daten — NIE erfunden.
+      • cancelled → False (annulliert schlägt jeden Delay-Wert).
+      • delay_known False → None (neutral: „Status wird ermittelt", kein +0,
+        kein „PÜNKTLICH"-Claim — unbekannt ≠ pünktlich).
+      • delay_known True → D15-Schwelle: <15 min = pünktlich, sonst verspätet.
+    """
+    if cancelled:
+        return False
+    if not delay_known:
+        return None
+    try:
+        return int(delay_min or 0) < 15
+    except Exception:
+        return None
+
+
+@aerox_data_bp.route('/api/ax/my-flight-status/<token>', methods=['GET'])
+def ax_my_flight_status(token):
+    """Dünner Wrapper um _flight_obs_merged für die „Wo ist mein Flieger"-Karte:
+    Tail (reg) + Pünktlich-Verdikt des EIGENEN abgehenden Legs. Query: flight_no,
+    date=YYYY-MM-DD, dep_iata. free_only=True (kein AeroDataBox-Spend), memoisiert
+    (~90 s). Nur echte Board/Warehouse-Daten — nie Position/Delay erfunden:
+    delay_known=False → on_time=None (neutral), cancelled → on_time=False.
+    est_dep_iso/est_arr_iso stehen als echt-UTC (…Z), station-lokal erst beim
+    iOS-Rendern — kein Doppel-Shift."""
+    from flask import request
+    flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    date = (request.args.get('date') or '').strip()[:10] or None
+    dep_iata = _norm_iata(request.args.get('dep_iata'))
+    if len(flight_no) < 3 or not dep_iata:
+        return jsonify({'ok': False, 'error': 'need_flight_no_and_dep_iata'}), 400
+    mkey = ('mystatus', flight_no, date or '', dep_iata)
+    memo = _memo_get(mkey)
+    if memo is not None:
+        return jsonify(memo)
+    merged_fn = _life_app('_flight_obs_merged')
+    to_utc = _life_app('_board_local_to_utc_iso')
+    m = (merged_fn(flight_no, date=date, dep_iata=dep_iata, free_only=True)
+         if merged_fn else None)
+    if not m:
+        # Kein Signal → EHRLICH: kein Tail, kein Verdikt (iOS versteckt/Route-only).
+        payload = {
+            'ok': True, 'flight': flight_no, 'date': date, 'dep_iata': dep_iata,
+            'reg': None, 'delay_known': False, 'status': None, 'cancelled': False,
+            'delay_min': None, 'est_dep_iso': None, 'est_arr_iso': None,
+            'on_time': None,
+        }
+        return jsonify(_memo_put(mkey, payload))
+    delay_known = bool(m.get('delay_known'))
+    cancelled = bool(m.get('cancelled'))
+    delay_min = m.get('delay_min') if delay_known else None
+    arr_iata = _norm_iata(m.get('arr_iata'))
+    payload = {
+        'ok': True, 'flight': flight_no, 'date': date, 'dep_iata': dep_iata,
+        'arr_iata': arr_iata,
+        'reg': m.get('reg'),          # NUR echt aus Board/Warehouse, nie geraten
+        'aircraft': m.get('aircraft'),
+        'delay_known': delay_known,
+        'status': m.get('status'),
+        'cancelled': cancelled,
+        'delay_min': delay_min,
+        'delay_side': m.get('delay_side'),
+        'est_dep_iso': (to_utc(m.get('esti_dep'), dep_iata) if to_utc else None),
+        'est_arr_iso': (to_utc(m.get('esti_arr'), arr_iata) if (to_utc and arr_iata)
+                        else None),
+        'on_time': _derive_on_time(delay_known, delay_min, cancelled),
+    }
+    return jsonify(_memo_put(mkey, payload))
+
+
 @aerox_data_bp.route('/api/ax/turnaround/<token>', methods=['GET'])
 def ax_turnaround(token):
     """#4 Turnaround → nächster Sektor. Query: flight_no, dep, arr (=Wende-
