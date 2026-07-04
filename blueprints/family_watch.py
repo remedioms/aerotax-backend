@@ -1502,6 +1502,20 @@ def _load_crew_roster_days(crew_token, days_limit):
                     })
             except Exception as e:
                 _log().info(f'[family-roster] ical_fallback_skip {type(e).__name__}')
+    # TAIL-ANREICHERUNG (Owner 2026-07-04: „Tails auf jedem Leg im Kalender bei
+    # Crew UND Freunde"). Family-Sektoren laufen nicht durch die Delay-Anreicherung
+    # → pro sichtbarem Leg das echte Board/Warehouse-Kennzeichen additiv anhängen.
+    # Nur today ±1 (Guard in _enrich_leg_tails), free_only + Memo → billiger Fan-out.
+    # Rein additiv, defensiv; ändert NICHTS an der Sichtbarkeits-/Privacy-Logik.
+    enrich_tails = _app_attr('_enrich_leg_tails')
+    if callable(enrich_tails):
+        for _e in out:
+            try:
+                _secs = _e.get('ical_sectors')
+                if isinstance(_secs, list) and _secs:
+                    enrich_tails(_secs, _e.get('datum'))
+            except Exception:
+                pass
     return out
 
 

@@ -11843,6 +11843,18 @@ def get_friend_roster(token, friend_token):
             out.sort(key=lambda d: d.get('datum') or '')
         except Exception:
             pass
+    # TAIL-ANREICHERUNG (Owner 2026-07-04: „Tails auf jedem Leg im Kalender bei
+    # Crew UND Freunde"). Die Freunde-Sektoren laufen NICHT durch die Delay-
+    # Anreicherung → hier pro sichtbarem Leg das echte Board/Warehouse-Kennzeichen
+    # additiv anhängen. Nur today ±1 (Guard in _enrich_leg_tails), free_only + Memo
+    # halten den Fan-out billig. Rein additiv, defensiv (nie 500en, nichts erfinden).
+    for _e in out:
+        try:
+            _secs = _e.get('ical_sectors')
+            if isinstance(_secs, list) and _secs:
+                _enrich_leg_tails(_secs, _e.get('datum'))
+        except Exception:
+            pass
     return jsonify({'ok': True, 'shared': True, 'count': len(out),
                     'days': out,
                     'source': 'snapshot' if tage else 'ical_briefings'})
@@ -26431,9 +26443,122 @@ def _enrich_leg_delays(sectors, date, free_only=True):
         s['est_dep_iso'] = _board_local_to_utc_iso(m.get('esti_dep'), frm)
         s['est_arr_iso'] = _board_local_to_utc_iso(m.get('esti_arr'), to)
         s['reg'] = m.get('reg')
+        # `tail` = Flugzeug-Kennzeichen fürs Kalender-Leg (Owner 2026-07-04:
+        # „Tails auf jedem Leg im Kalender bei Crew UND Freunde"). Reines Alias auf
+        # das GEMESSENE `reg` — NUR bei echtem Board/Warehouse-Treffer setzen, nie
+        # erfunden; kein reg → Feld bleibt abwesend (additiv, abwärtskompatibel).
+        _tail = m.get('reg')
+        if isinstance(_tail, str):
+            _tail = _tail.strip()
+        if _tail:
+            s['tail'] = _tail
         s['obs_sides'] = m.get('sides')
         if op_fn != fn and 'also_as' not in s:
             s['also_as'] = raw_fn        # gefaltete Marketing-Nummer bewahren
+    return sectors
+
+
+def _leg_tail(flight_no, date=None, dep_iata=None, arr_iata=None):
+    """Flugzeug-Kennzeichen (`reg`/Tail) EINES Legs — NUR aus echten Board-/
+    Warehouse-Beobachtungen, sonst None.
+
+    DOMÄNENREGEL (hart): NIE einen Tail raten. Keine Flugnummer↔Callsign-
+    Zahlengleichheit, kein Fallback-Kennzeichen, kein „ähnlicher" Tail. Ohne
+    echten Treffer → None, und der Aufrufer lässt das Feld weg.
+
+    Nutzt `_flight_obs_merged(..., free_only=True)` — denselben ~90 s-Memo wie
+    die übrigen Board-Reads, also KEIN AeroDataBox-Spend; der Fan-out über viele
+    Legs/Freunde bleibt billig (O(1) je (fn,date,dep,arr)). Flugnummer via
+    `_fn_norm` normalisiert (LH0839 == LH839) und — wo bekannt — Codeshare→
+    Operating gefaltet, damit der PHYSISCHE Flug (der den Tail trägt) matcht.
+    Wirft nie."""
+    try:
+        fn = _fn_norm(flight_no)
+    except Exception:
+        fn = None
+    if not fn or len(fn) < 3:
+        return None
+    try:
+        cs_map = _ax_codeshare_map() or {}
+    except Exception:
+        cs_map = {}
+    op_fn = cs_map.get(fn, fn)
+    frm = (str(dep_iata or '').strip().upper() or None)
+    to = (str(arr_iata or '').strip().upper() or None)
+    d = (str(date or '')[:10] or None)
+    try:
+        m = _flight_obs_merged(op_fn, date=d, dep_iata=frm, arr_iata=to,
+                               live=True, free_only=True)
+    except Exception:
+        m = None
+    if not m:
+        return None
+    reg = m.get('reg')
+    if isinstance(reg, str):
+        reg = reg.strip()
+    return reg or None
+
+
+def _enrich_leg_tails(sectors, date=None):
+    """Ergänzt pro Leg (ical_sectors[]) ein optionales `tail` (Flugzeug-
+    Kennzeichen) NUR bei echtem Board/Warehouse-Treffer — additiv, nie erfunden,
+    nie werfen.
+
+    Für die FREUNDE-/FAMILIEN-Roster-Sheets, die NICHT durch `_enrich_leg_delays`
+    laufen (im eigenen Roster setzt die Delay-Anreicherung `tail` bereits mit —
+    dort wird `_enrich_leg_tails` NICHT gebraucht). Respektiert einen schon
+    gesetzten Tail (kein Doppel-Fetch). Gleicher grober Zeitfenster-Guard wie
+    `_enrich_leg_delays` (dep_iso −30h..+27h, sonst Datum today ±1), damit tiefe
+    Zukunfts-/Vergangenheits-Legs KEINE Board-Scans auslösen. Gibt dieselbe Liste
+    zurück (in-place mutiert). Wirft nie."""
+    if not sectors or not isinstance(sectors, list):
+        return sectors
+    now = datetime.now(timezone.utc)
+    for s in sectors:
+        if not isinstance(s, dict) or s.get('tail'):
+            continue
+        raw_fn = str(s.get('flight') or '').strip()
+        frm = str(s.get('from') or '').strip().upper()
+        to = str(s.get('to') or '').strip().upper()
+        if len(raw_fn) < 3 or len(frm) != 3 or not frm.isalpha() \
+                or len(to) != 3 or not to.isalpha():
+            continue
+        # ── Zeitfenster-Guard (spiegelt _enrich_leg_delays) ──────────────────
+        dep_dt = None
+        try:
+            dr = s.get('dep_iso')
+            if dr:
+                dep_dt = datetime.fromisoformat(str(dr).replace('Z', '+00:00'))
+                if dep_dt.tzinfo is None:
+                    dep_dt = dep_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            dep_dt = None
+        leg_date = None
+        if dep_dt is not None:
+            if dep_dt > now + timedelta(hours=27):
+                continue        # tiefe Zukunft: kein Board-Scan
+            if dep_dt < now - timedelta(hours=30):
+                continue        # tiefe Vergangenheit: kein SB-Read
+            try:
+                leg_date = dep_dt.strftime('%Y-%m-%d')
+            except Exception:
+                leg_date = None
+        else:
+            try:
+                from datetime import date as _dt_date
+                _draw = str(s.get('date') or date or '')[:10]
+                d0 = _dt_date.fromisoformat(_draw)
+                today = now.date()
+                if d0 > today + timedelta(days=1):
+                    continue        # tiefe Zukunft (grob)
+                if d0 < today - timedelta(days=1):
+                    continue        # tiefe Vergangenheit (grob)
+            except Exception:
+                pass        # kein parsbares Datum → wie bisher weiter (nie werfen)
+        leg_date = leg_date or (str(s.get('date') or date or '')[:10] or None)
+        tail = _leg_tail(raw_fn, date=leg_date, dep_iata=frm, arr_iata=to)
+        if tail:
+            s['tail'] = tail
     return sectors
 
 
