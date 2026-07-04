@@ -309,7 +309,7 @@ def _aviationstack_route(callsign):
         return None
     url = (f'http://api.aviationstack.com/v1/flights?access_key={urllib.parse.quote(key)}'
            f'&flight_icao={urllib.parse.quote(callsign)}&limit=1')
-    _paid_budget_inc()              # zählt gegen das Tages-Paid-Budget
+    _paid_budget_inc(units=2)       # AviationStack ~gleichwertig gewichtet
     d = _http_json(url, timeout=12)
     if not isinstance(d, dict):
         return None
@@ -497,7 +497,7 @@ def _aerodatabox_route(cs, reg=None, lat=None, lon=None, track=None, date=None):
                'User-Agent': 'AeroX-DataEngine/1.0'}
 
     def _get(path):
-        _paid_budget_inc()      # jeder Request zählt gegen das Tages-Budget
+        _paid_budget_inc(units=2)   # Flight-Endpoints = Tier 2 (2 Units)
         try:
             req = urllib.request.Request(f'{base}{path}', headers=hdr)
             with urllib.request.urlopen(req, timeout=10) as r:
@@ -626,15 +626,17 @@ def _paid_daily_used():
 
 
 def _paid_budget_ok():
-    """True solange heute noch bezahlte Calls frei sind. Über dem Deckel → False
-    (blockt AeroDataBox + AviationStack hart)."""
-    cap = int(os.environ.get('AX_PAID_DAILY_CAP', '50'))
+    """True solange heute noch bezahltes Kontingent frei ist. Der Deckel zählt
+    seit 2026-07-04 in API-UNITS (AeroDataBox-Tier-Preise: Tier2=2, Tier3=6,
+    Tier4=300), nicht mehr in Requests — vorher konnte ein teurer Call blind
+    das Monats-HARD-Limit leeren. Default 760 Units/Tag ≈ 95% des 24k-Plans."""
+    cap = int(os.environ.get('AX_PAID_DAILY_CAP', '760'))
     return _paid_daily_used() < cap
 
 
-def _paid_budget_inc():
+def _paid_budget_inc(units=1):
     key = _paid_daily_key()
-    used = _MEM_BUDGET.get(key, 0) + 1
+    used = _MEM_BUDGET.get(key, 0) + max(1, int(units))
     _MEM_BUDGET[key] = used          # In-Memory IMMER zählen (Safety-Net)
     sb = _sb()
     if sb is None:
