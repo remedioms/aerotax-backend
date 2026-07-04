@@ -483,14 +483,23 @@ def _aerodatabox_route(cs, reg=None, lat=None, lon=None, track=None, date=None):
     if not _paid_budget_ok():
         return None
     date = date or _today_utc()
-    host = 'aerodatabox.p.rapidapi.com'
-    hdr = {'x-rapidapi-key': key, 'x-rapidapi-host': host,
-           'User-Agent': 'AeroX-DataEngine/1.0'}
+    # ZWEI Vertriebskanäle, gleicher Dienst (2026-07-04, Owner-Abo): das
+    # api.market-DIREKTPORTAL nutzt kurze cuid-Keys + `x-magicapi-key` und
+    # einen anderen Basis-Pfad; RapidAPI die langen Keys + `x-rapidapi-key`.
+    # Kanal am Key-Format erkennen — Pfade sind identisch (live verifiziert).
+    if len(key) <= 32:
+        base = 'https://prod.api.market/api/v1/aedbx/aerodatabox'
+        hdr = {'x-magicapi-key': key, 'User-Agent': 'AeroX-DataEngine/1.0'}
+    else:
+        host = 'aerodatabox.p.rapidapi.com'
+        base = f'https://{host}'
+        hdr = {'x-rapidapi-key': key, 'x-rapidapi-host': host,
+               'User-Agent': 'AeroX-DataEngine/1.0'}
 
     def _get(path):
         _paid_budget_inc()      # jeder Request zählt gegen das Tages-Budget
         try:
-            req = urllib.request.Request(f'https://{host}{path}', headers=hdr)
+            req = urllib.request.Request(f'{base}{path}', headers=hdr)
             with urllib.request.urlopen(req, timeout=10) as r:
                 d = json.loads(r.read().decode('utf-8', 'replace'))
                 return d if isinstance(d, list) else []
