@@ -379,3 +379,84 @@ def test_friend_roster_not_friends_403_no_tail_call(client, monkeypatch):
         r = client.get('/api/user/friend-roster/MYTOKEN/STRANGER')
     assert r.status_code == 403
     assert r.get_json()['shared'] is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _carry_forward_turnaround_tails  (Owner 2026-07-04: nur Outstation-Return,
+# NIE am Homebase-Hub — dort liefert das Abflugtafel-Scraping den echten Tail)
+# ══════════════════════════════════════════════════════════════════════════════
+def _leg(flight, frm, to, tail=None, dep=None, arr=None):
+    s = {'flight': flight, 'from': frm, 'to': to}
+    if tail is not None:
+        s['tail'] = tail
+    if dep is not None:
+        s['dep_iso'] = dep
+    if arr is not None:
+        s['arr_iso'] = arr
+    return s
+
+
+def test_carry_forward_outstation_return_inherits_tail():
+    # FRA→TIA (Tail beobachtet), Turnaround in TIA (Outstation), TIA→FRA zurück.
+    secs = [
+        _leg('LH1380', 'FRA', 'TIA', tail='D-AIMM',
+             dep='2026-07-04T06:00:00Z', arr='2026-07-04T08:00:00Z'),
+        _leg('LH1381', 'TIA', 'FRA', tail=None,
+             dep='2026-07-04T09:00:00Z', arr='2026-07-04T11:00:00Z'),
+    ]
+    A._carry_forward_turnaround_tails(secs)
+    assert secs[1].get('tail') == 'D-AIMM'
+    assert secs[1].get('tail_inferred') is True
+
+
+def test_carry_forward_skips_homebase_turnaround():
+    # X→FRA (Tail beobachtet), dann FRA→X: Turnaround AN der Homebase (FRA=Duty-
+    # Origin-Proxy). Selbst kurze Bodenzeit → Flieger kann wechseln → NICHT erben.
+    secs = [
+        _leg('LH11', 'FRA', 'MUC', tail='D-AAAA',
+             dep='2026-07-04T06:00:00Z', arr='2026-07-04T07:00:00Z'),
+        _leg('LH12', 'MUC', 'FRA', tail='D-BBBB',
+             dep='2026-07-04T08:00:00Z', arr='2026-07-04T09:00:00Z'),
+        _leg('LH13', 'FRA', 'MUC', tail=None,   # Turnaround an FRA (Homebase)
+             dep='2026-07-04T11:00:00Z', arr='2026-07-04T12:00:00Z'),
+    ]
+    A._carry_forward_turnaround_tails(secs)
+    assert 'tail' not in secs[2], "Homebase-Turnaround darf NICHT erben"
+
+
+def test_carry_forward_explicit_homebase_param_wins_over_proxy():
+    # Duty-Origin ist MUC, aber echte Homebase per Param = MUC → MUC-Turnaround skip.
+    secs = [
+        _leg('LH20', 'MUC', 'HAM', tail='D-CCCC',
+             dep='2026-07-04T06:00:00Z', arr='2026-07-04T07:00:00Z'),
+        _leg('LH21', 'HAM', 'MUC', tail=None,   # zurück nach MUC = Homebase
+             dep='2026-07-04T08:00:00Z', arr='2026-07-04T09:00:00Z'),
+    ]
+    # Return endet an der Homebase MUC, Turnaround-Airport ist aber HAM (≠MUC) →
+    # das ist ein echter Outstation-Return → erbt trotzdem.
+    A._carry_forward_turnaround_tails(secs, homebase='MUC')
+    assert secs[1].get('tail') == 'D-CCCC'
+
+
+def test_carry_forward_skips_hub_onward_flight():
+    # FRA→TIA, TIA→SKP (kein Raus-&-Zurück, Weiterflug) → kein sicherer Turnaround.
+    secs = [
+        _leg('LH1380', 'FRA', 'TIA', tail='D-AIMM',
+             dep='2026-07-04T06:00:00Z', arr='2026-07-04T08:00:00Z'),
+        _leg('LH1500', 'TIA', 'SKP', tail=None,
+             dep='2026-07-04T09:00:00Z', arr='2026-07-04T10:00:00Z'),
+    ]
+    A._carry_forward_turnaround_tails(secs)
+    assert 'tail' not in secs[1]
+
+
+def test_carry_forward_skips_overnight_layover():
+    # Outstation-Return, aber >4h Bodenzeit (Übernacht) → Flieger wechselt → skip.
+    secs = [
+        _leg('LH1380', 'FRA', 'TIA', tail='D-AIMM',
+             dep='2026-07-03T18:00:00Z', arr='2026-07-03T20:00:00Z'),
+        _leg('LH1381', 'TIA', 'FRA', tail=None,
+             dep='2026-07-04T08:00:00Z', arr='2026-07-04T10:00:00Z'),
+    ]
+    A._carry_forward_turnaround_tails(secs)
+    assert 'tail' not in secs[1]

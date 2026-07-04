@@ -26570,16 +26570,36 @@ def _enrich_leg_tails(sectors, date=None):
     return sectors
 
 
-def _carry_forward_turnaround_tails(sectors):
-    """Turnaround-Weitergabe (Owner: „Tails auf jedem Leg"). Ein Rückflug eines
-    TURNAROUNDS (Vorleg-Ankunft = dieser-Abflug, kurze Bodenzeit) ist PHYSISCH
-    dieselbe Maschine → den beobachteten Tail des Vorlegs weiterreichen. KEIN
-    Raten: nur bei belegtem Vor-Tail, gleichem Umsteige-Airport UND kurzer
-    Bodenzeit (< 4h; Übernacht-Layover/Aircraft-Swap bricht die Kette → der
-    Rückflug bleibt tail-los = ehrlich). In-place; wirft nie."""
+def _carry_forward_turnaround_tails(sectors, homebase=None):
+    """Turnaround-Weitergabe (Owner: „Tails auf jedem Leg", präzisiert 2026-07-04).
+
+    Der „PHYSISCH dieselbe Maschine"-Schluss gilt NUR beim echten OUTSTATION-
+    Turnaround — dem Rückflug ZUR Homebase (Owner: „gleiche Maschine geht nur auf
+    dem return zur homebase … bei 3h turnaround IN der homebase kann man sehr wohl
+    Flieger wechseln"). Am Homebase-Hub rotieren die Maschinen durch; selbst 3-4h
+    Bodenzeit reichen für einen Fliegerwechsel → dort NIE weitergeben.
+
+    Ein Rückleg erbt den beobachteten Tail des Vorlegs also nur, wenn ALLE gelten:
+      • Vorleg hat belegten Tail, dieses Leg hat (noch) keinen
+      • kontinuierlich: `cur.from == prev.to` (Umsteige-Airport identisch)
+      • RAUS-&-ZURÜCK: `cur.to == prev.from` (echtes Return-Leg, kein Hub-Weiterflug)
+      • Turnaround-Airport `cur.from` ist NICHT die Homebase
+        (Homebase = übergeben, sonst Duty-Origin `sectors[0].from` als Proxy)
+      • Bodenzeit 0…4h (Übernacht-Layover / Aircraft-Swap bricht die Kette)
+    Sonst bleibt das Leg tail-los = ehrlich. In-place; wirft nie."""
     try:
         if not sectors or not isinstance(sectors, list):
             return sectors
+        # Homebase: expliziter Wert oder Duty-Origin (erstes Leg) als Proxy.
+        hb = str(homebase or '').strip().upper()
+        if len(hb) != 3:
+            hb = ''
+            for s0 in sectors:
+                if isinstance(s0, dict):
+                    f0 = str(s0.get('from') or '').strip().upper()
+                    if len(f0) == 3 and f0.isalpha():
+                        hb = f0
+                        break
         for i in range(1, len(sectors)):
             cur, prev = sectors[i], sectors[i - 1]
             if not isinstance(cur, dict) or not isinstance(prev, dict):
@@ -26587,9 +26607,15 @@ def _carry_forward_turnaround_tails(sectors):
             if cur.get('tail') or not prev.get('tail'):
                 continue
             prev_to = str(prev.get('to') or '').strip().upper()
+            prev_from = str(prev.get('from') or '').strip().upper()
             cur_from = str(cur.get('from') or '').strip().upper()
+            cur_to = str(cur.get('to') or '').strip().upper()
             if len(cur_from) != 3 or prev_to != cur_from:
                 continue                      # nicht kontinuierlich → keine Weitergabe
+            if len(cur_to) != 3 or cur_to != prev_from:
+                continue                      # kein Raus-&-Zurück → kein sicherer Turnaround
+            if hb and cur_from == hb:
+                continue                      # Turnaround AN der Homebase → Hub-Rotation, Flieger wechselt
             pa, cd = prev.get('arr_iso'), cur.get('dep_iso')
             if not pa or not cd:
                 continue                      # ohne Zeiten kein sicherer Turnaround
@@ -26602,7 +26628,7 @@ def _carry_forward_turnaround_tails(sectors):
             if gap_h < 0 or gap_h > 4:
                 continue                      # Übernacht/lang → nicht dieselbe Maschine
             cur['tail'] = prev['tail']
-            cur['tail_inferred'] = True       # aus Turnaround abgeleitet (nicht direkt beobachtet)
+            cur['tail_inferred'] = True       # aus Outstation-Turnaround abgeleitet (nicht direkt beobachtet)
     except Exception:
         pass
     return sectors
