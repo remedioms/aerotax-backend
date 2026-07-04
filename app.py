@@ -11949,22 +11949,36 @@ def get_friends_today(token):
                             merged = None
                         bucket = (_flight_status_bucket(merged.get('status'))
                                   if merged else None)
-                        if merged and bucket == 'landed':
-                            # Erster Leg gelandet → Crew hat den Abflughafen
+                        # Bekannter Abflug-Delay OHNE bucketbaren Status
+                        # (status=None, sehr HÄUFIG) — Tibor BLL→FRA: verspätet,
+                        # aber noch nicht abgeflogen. Ohne diese Kopplung fiel der
+                        # Fall in den 4h-Uhr-Zweig → Crew fälschlich am Layover.
+                        delay_pin = bool(
+                            merged and merged.get('delay_known')
+                            and int(merged.get('dep_delay_min') or 0) > 0)
+                        if merged and merged.get('cancelled'):
+                            # (1) Annulliert schlägt ALLES: Crew ist nie
+                            # losgeflogen → bleibt am Abflughafen, Leg bleibt im
+                            # Umlauf (nie als „geflogen" behandelt).
+                            lay_eff = frm
+                        elif merged and bucket == 'landed':
+                            # (2) Erster Leg gelandet → Crew hat den Abflughafen
                             # verlassen. Weiter zum Ziel (sonst geplanter Layover).
                             if len(to) == 3 and to.isalpha():
                                 lay_eff = to
                         elif merged and bucket == 'airborne':
-                            # Unterwegs → geplanten Layover behalten (Default).
+                            # (3) Unterwegs → geplanten Layover behalten (Default).
                             pass
-                        elif merged and bucket == 'grounded':
-                            # Echtes Signal „noch nicht abgeflogen" (delayed/
-                            # boarding) → Crew ist am Abflughafen, UNABHÄNGIG von
-                            # der Uhr (auch bei starker Verspätung > 4h).
+                        elif (merged and bucket == 'grounded') or delay_pin:
+                            # (4) Echtes Signal „noch nicht abgeflogen" (delayed/
+                            # boarding) ODER bekannter Abflug-Delay ohne Status →
+                            # Crew ist am Abflughafen, UNABHÄNGIG von der Uhr
+                            # (auch bei starker Verspätung > 4h).
                             lay_eff = frm
                         else:
-                            # Kein echtes Signal → 4h-Grace-Fallback: Crew gilt
-                            # bis 4h nach Plan-Abflug noch als am Abflughafen.
+                            # (5) Gar kein Signal → 4h-Grace als LETZTER Fallback:
+                            # Crew gilt bis 4h nach Plan-Abflug noch als am
+                            # Abflughafen.
                             if datetime.now(timezone.utc) < dep + timedelta(hours=4):
                                 lay_eff = frm
         except Exception:
@@ -26242,6 +26256,50 @@ def _flight_status_bucket(status):
     return None
 
 
+def _board_local_to_utc_iso(esti, iata):
+    """Board-lokalen Esti-Zeitstempel (Station-Ortszeit, evtl. OHNE Offset) →
+    absoluter UTC-ISO 'YYYY-MM-DDTHH:MM:SSZ'. None wenn esti leer, die Stations-TZ
+    unbekannt oder unparsbar ist — NIE ein naiver/unkonvertierter String.
+
+    WARUM (TZ-Fix 2026-07-04, Tibor-Doppelverschiebung): est_dep_iso/est_arr_iso
+    reihen sich auf iOS in EXAKT denselben isoInstant()->stationLocalHHMM()-Pfad
+    wie dep_iso ein. dep_iso ist echt-UTC; ein naiver Board-String OHNE 'Z' wird
+    von iOS entweder gar nicht geparst (keine Zeit) oder als UTC gelesen UND danach
+    nochmal um die Station-TZ verschoben = doppelt falsche Ist-Zeit. Wir wandeln
+    darum genau EINMAL board-lokal→UTC — dort, wo die airport_tz-Kenntnis lebt
+    (gleiches Muster wie _airport_local_now/_parse_local_iso) — sodass iOS den Wert
+    ohne jede Parser-Änderung wie dep_iso behandeln kann. delay_min bleibt die
+    autoritative Delta-Zahl; est_* ist reine Anzeige.
+
+    dep-Seite wird mit airport_tz(from), arr-Seite mit airport_tz(to) konvertiert
+    (jedes Board-Esti steht in SEINER eigenen Stations-Ortszeit)."""
+    if not esti:
+        return None
+    try:
+        from datetime import datetime, timezone
+        # 'Z' → '+00:00' (Python <3.11 parst 'Z' nicht; gleiches Muster wie dep_iso).
+        dt = datetime.fromisoformat(str(esti).strip().replace('Z', '+00:00'))
+        if dt.tzinfo is not None:
+            # Board lieferte bereits einen Offset (z.B. …Z) → direkt normalisieren.
+            return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        # Naiver Board-String = Station-Ortszeit. TZ der Station bestimmen:
+        # FRA/EDDF (airport_tz liefert dort None) → Europe/Berlin, sonst airport_tz.
+        ap = (iata or '').upper().strip().split('#', 1)[0]
+        ap = _DE_ICAO_TO_IATA.get(ap, ap)
+        if ap in ('FRA', 'EDDF'):
+            tzname = 'Europe/Berlin'
+        else:
+            tzname = airport_tz(ap)
+        if not tzname:
+            return None        # TZ unbekannt → lieber None als naiver String
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tzname)
+        return dt.replace(tzinfo=tz).astimezone(timezone.utc) \
+                 .strftime('%Y-%m-%dT%H:%M:%SZ')
+    except Exception:
+        return None
+
+
 def _enrich_leg_delays(sectors, date, free_only=True):
     """Reichert die Pro-Leg-Sektoren EINES Roster-Tages (ical_sectors[]) IN PLACE
     um Live-/Warehouse-Delay-Felder an (Owner 2026-07-04 „alle Live-Sachen an-
@@ -26297,6 +26355,22 @@ def _enrich_leg_delays(sectors, date, free_only=True):
                 continue        # tiefe Zukunft: kein Board-Scan
             if dep_dt < now - timedelta(hours=30):
                 continue        # tiefe Vergangenheit: kein SB-Read
+        else:
+            # OHNE präzises dep_iso greift der Stunden-Guard nicht → grobe
+            # DATUMS-Guard (Fix 2026-07-04: Legs ohne dep_iso umgingen das
+            # Fenster ganz). Nur Tag-von / ±1 Tag anreichern; alles Tiefere
+            # überspringen (ehrt die >27h-Zukunfts-Regel grob).
+            try:
+                from datetime import date as _dt_date
+                _draw = str(s.get('date') or date or '')[:10]
+                d = _dt_date.fromisoformat(_draw)
+                today = now.date()
+                if d > today + timedelta(days=1):
+                    continue        # tiefe Zukunft (grob)
+                if d < today - timedelta(days=1):
+                    continue        # tiefe Vergangenheit (grob)
+            except Exception:
+                pass        # kein parsbares Datum → wie bisher weiter (nie werfen)
         # ── Flugnummer normalisieren + Codeshare→Operating ───────────────────
         fn = _fn_norm(raw_fn)
         if len(fn) < 3:
@@ -26331,11 +26405,14 @@ def _enrich_leg_delays(sectors, date, free_only=True):
         s['arr_delay_min'] = m.get('arr_delay_min')
         s['status'] = m.get('status')
         s['cancelled'] = bool(m.get('cancelled'))
-        # est_*: der beste Ist/Erwartet-Zeitstempel des Resolvers (Board-Zeit).
-        # iOS wandelt zur Anzeige station-lokal um; delay_min bleibt die
-        # autoritative Zahl.
-        s['est_dep_iso'] = m.get('esti_dep')
-        s['est_arr_iso'] = m.get('esti_arr')
+        # est_*: bester Ist/Erwartet-Zeitstempel des Resolvers. Board-Esti steht in
+        # STATIONS-Ortszeit (evtl. ohne Offset) → hier genau EINMAL nach echt-UTC
+        # wandeln (dep mit airport_tz(from), arr mit airport_tz(to)), damit iOS den
+        # Wert wie dep_iso durch den station-lokalen Formatter schicken kann OHNE
+        # Doppelverschiebung. None wenn keine Esti / TZ unbekannt / unparsbar —
+        # nie ein naiver String. delay_min bleibt die autoritative Zahl.
+        s['est_dep_iso'] = _board_local_to_utc_iso(m.get('esti_dep'), frm)
+        s['est_arr_iso'] = _board_local_to_utc_iso(m.get('esti_arr'), to)
         s['reg'] = m.get('reg')
         s['obs_sides'] = m.get('sides')
         if op_fn != fn and 'also_as' not in s:

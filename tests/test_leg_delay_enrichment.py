@@ -325,6 +325,119 @@ def test_enrich_west_tz_est_arr_stays_utc():
     assert secs[0]['est_arr_iso'] == '2026-07-04T22:10:00Z'
 
 
+def test_enrich_west_tz_naive_board_converted_to_utc():
+    # REALES naives Board-Format (KEIN 'Z') an einer West-TZ: JFK 14:23 local
+    # (America/New_York, im Juli EDT = UTC-4) → 18:23Z. GENAU EINE Verschiebung,
+    # keine Doppelverschiebung. arr-Seite nutzt die TZ des ANDEREN Flughafens.
+    dep = _now() + timedelta(hours=1)
+    secs = [_sector(frm='JFK', to='LHR', dep_iso=_iso(dep))]
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=True, delay_min=20,
+                                           delay_side='dep',
+                                           esti_dep='2026-07-04T14:23:00',
+                                           esti_arr='2026-07-05T02:10:00')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    # dep mit airport_tz('JFK'): 14:23 EDT → 18:23Z.
+    assert secs[0]['est_dep_iso'] == '2026-07-04T18:23:00Z'
+    # arr mit airport_tz('LHR'): 02:10 BST (UTC+1 im Juli) → 01:10Z.
+    assert secs[0]['est_arr_iso'] == '2026-07-05T01:10:00Z'
+
+
+def test_enrich_naive_board_unknown_tz_is_none_not_naive():
+    # Unbekannte Stations-TZ → est_*_iso ist None, NIE ein naiver String durchgereicht.
+    dep = _now() + timedelta(hours=1)
+    secs = [_sector(frm='ZZZ', to='QQQ', dep_iso=_iso(dep))]
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=True, delay_min=5,
+                                           delay_side='dep',
+                                           esti_dep='2026-07-04T14:23:00',
+                                           esti_arr='2026-07-04T16:00:00')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    assert secs[0]['est_dep_iso'] is None
+    assert secs[0]['est_arr_iso'] is None
+
+
+def test_enrich_naive_board_fra_uses_berlin():
+    # FRA (airport_tz liefert dort None) → Europe/Berlin. 08:00 CEST (Juli, +2) → 06:00Z.
+    dep = _now() + timedelta(hours=1)
+    secs = [_sector(frm='FRA', to='MUC', dep_iso=_iso(dep))]
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=True, delay_min=0,
+                                           delay_side='dep',
+                                           esti_dep='2026-07-04T08:00:00')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    assert secs[0]['est_dep_iso'] == '2026-07-04T06:00:00Z'
+
+
+def test_enrich_offset_carrying_esti_normalized_to_utc():
+    # Board mit Offset (+02:00) → nach UTC normalisiert, station-TZ ignoriert.
+    dep = _now() + timedelta(hours=1)
+    secs = [_sector(frm='JFK', to='LHR', dep_iso=_iso(dep))]
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=True, delay_min=0,
+                                           delay_side='dep',
+                                           esti_dep='2026-07-04T10:35:00+02:00')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    assert secs[0]['est_dep_iso'] == '2026-07-04T08:35:00Z'
+
+
+def test_enrich_no_dep_iso_deep_future_date_skipped():
+    # Leg OHNE dep_iso, date = +3 Tage → grober Datums-Guard überspringt (kein Scan).
+    far = (_date.today() + timedelta(days=3)).isoformat()
+    secs = [{'flight': 'LH400', 'from': 'FRA', 'to': 'MUC', 'date': far}]
+    with patch.object(A, '_flight_obs_merged',
+                      side_effect=AssertionError('should not scan deep future')):
+        A._enrich_leg_delays(secs, far)
+    assert 'delay_known' not in secs[0]
+
+
+def test_enrich_no_dep_iso_deep_past_date_skipped():
+    past = (_date.today() - timedelta(days=3)).isoformat()
+    secs = [{'flight': 'LH400', 'from': 'FRA', 'to': 'MUC', 'date': past}]
+    with patch.object(A, '_flight_obs_merged',
+                      side_effect=AssertionError('should not scan deep past')):
+        A._enrich_leg_delays(secs, past)
+    assert 'delay_known' not in secs[0]
+
+
+def test_enrich_no_dep_iso_today_date_enriched():
+    # Leg OHNE dep_iso, aber date = heute → angereichert (Tag-von wird bedient).
+    today = _date.today().isoformat()
+    secs = [{'flight': 'LH400', 'from': 'FRA', 'to': 'MUC', 'date': today}]
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=True, delay_min=12,
+                                           delay_side='dep')):
+        A._enrich_leg_delays(secs, today)
+    assert secs[0]['delay_known'] is True
+    assert secs[0]['delay_min'] == 12
+
+
+def test_enrich_no_dep_iso_uses_daykey_when_no_sector_date():
+    # Kein sector['date'], aber Tages-Key = heute → angereichert (Fallback auf date-Param).
+    today = _date.today().isoformat()
+    secs = [{'flight': 'LH400', 'from': 'FRA', 'to': 'MUC'}]
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=True, delay_min=7,
+                                           delay_side='dep')):
+        A._enrich_leg_delays(secs, today)
+    assert secs[0]['delay_min'] == 7
+
+
+def test_enrich_cancelled_still_emits_est_or_none():
+    # cancelled=True: est_* wird trotzdem gemäß Regel emittiert (hier naiv-JFK→UTC),
+    # aber KEINE positive Delay-Behauptung.
+    dep = _now() + timedelta(hours=1)
+    secs = [_sector(frm='JFK', to='LHR', dep_iso=_iso(dep))]
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=True, status='cancelled',
+                                           cancelled=True,
+                                           esti_dep='2026-07-04T14:23:00')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    assert secs[0]['cancelled'] is True
+    assert secs[0]['est_dep_iso'] == '2026-07-04T18:23:00Z'
+    assert secs[0]['delay_min'] is None
+
+
 def test_enrich_multi_leg_independent_status():
     secs = [_sector(flight='LH1', frm='FRA', to='MUC'),
             _sector(flight='LH2', frm='MUC', to='VIE'),
@@ -654,6 +767,55 @@ def test_layeff_grounded_pins_to_departure_even_past_grace(client, monkeypatch):
                                                 status='delayed', delay_min=90,
                                                 delay_side='dep'))
     assert _friend_layover(client, tok) == 'BLL'      # echtes Signal schlägt Uhr
+
+
+def test_layeff_status_none_known_dep_delay_pins_departure(client, monkeypatch):
+    # TIBOR-KERNFALL: status=None (kein bucketbarer Board-Status, sehr häufig),
+    # ABER bekannter Abflug-Delay (delay_known=True, dep_delay_min>0). Plan-Abflug
+    # ist längst vorbei (−5h, jenseits der 4h-Grace) → früher fiel er in den
+    # Uhr-Zweig und die Crew erschien fälschlich am Layover. Jetzt: am Abflughafen.
+    tok = _setup_friend(monkeypatch, first_dep_offset_h=-5.0, layover_ort='XXX',
+                        routing='BLL-FRA', frm='BLL', to='FRA')
+    monkeypatch.setattr(A, '_flight_obs_merged',
+                        lambda *a, **k: _merged(delay_known=True, status=None,
+                                                delay_min=75, dep_delay_min=75,
+                                                delay_side='dep'))
+    assert _friend_layover(client, tok) == 'BLL'      # bekannter Delay pinnt an frm
+
+
+def test_layeff_status_none_zero_delay_falls_to_grace(client, monkeypatch):
+    # status=None + delay_known aber dep_delay_min=0 → KEIN Delay-Pin; jenseits der
+    # 4h-Grace → geplanter Layover (kein Signal, dass er noch am Abflughafen steht).
+    tok = _setup_friend(monkeypatch, first_dep_offset_h=-5.0, layover_ort='XXX')
+    monkeypatch.setattr(A, '_flight_obs_merged',
+                        lambda *a, **k: _merged(delay_known=True, status=None,
+                                                delay_min=0, dep_delay_min=0,
+                                                delay_side='dep'))
+    assert _friend_layover(client, tok) == 'XXX'
+
+
+def test_layeff_cancelled_pins_to_departure(client, monkeypatch):
+    # cancelled=True: Flug annulliert → Crew nie losgeflogen, bleibt am
+    # Abflughafen (BLL), egal ob ein delay_min vorhanden ist. cancelled schlägt
+    # jeden Status-Bucket.
+    tok = _setup_friend(monkeypatch, first_dep_offset_h=-5.0, layover_ort='XXX',
+                        routing='BLL-FRA', frm='BLL', to='FRA')
+    monkeypatch.setattr(A, '_flight_obs_merged',
+                        lambda *a, **k: _merged(delay_known=True,
+                                                status='cancelled', cancelled=True,
+                                                delay_min=None))
+    assert _friend_layover(client, tok) == 'BLL'
+
+
+def test_layeff_cancelled_beats_landed_status(client, monkeypatch):
+    # Selbst wenn ein Board fälschlich 'landed' meldet: cancelled hat strikten
+    # Vorrang → Crew bleibt am Abflughafen, NICHT ans Ziel vorgerückt.
+    tok = _setup_friend(monkeypatch, first_dep_offset_h=-5.0, layover_ort='XXX',
+                        routing='BLL-FRA', frm='BLL', to='FRA')
+    monkeypatch.setattr(A, '_flight_obs_merged',
+                        lambda *a, **k: _merged(delay_known=True,
+                                                status='landed', cancelled=True))
+    assert _friend_layover(client, tok) == 'BLL'
 
 
 def test_layeff_no_signal_within_grace_pins_departure(client, monkeypatch):
