@@ -681,3 +681,121 @@ def test_endpoint_leaderboard_truncates_friend_tokens():
     assert all('AT-FRIEND-RAW-9999' != t for t in toks)
     friend_row = next(row for row in body['leaderboard'] if not row['is_me'])
     assert friend_row['token'].startswith('tok:') and friend_row['token'].endswith('…')
+
+
+# ════════════════════════════════════════════════════════════════════
+# RESTFIX A — Name im lazy-Cache (nie null)
+# ════════════════════════════════════════════════════════════════════
+
+def test_persist_me_writes_name():
+    """_punct_persist_me schreibt den übergebenen Namen in den Cache-Block."""
+    res = _member_res('ok', 92, 0.92, 13, 5)
+    captured = {}
+    with patch.object(A, '_profile_metadata_merge_sb',
+                      side_effect=lambda t, p: captured.update(p) or True):
+        A._punct_persist_me('AT-ME', res, 2, 6, None, name='Miguel')
+    assert captured['punctuality']['name'] == 'Miguel'
+
+
+def test_persist_me_keeps_cached_name_when_none_given():
+    """Ohne name-Param wird ein bereits gecachter Name NICHT auf null geklobbert."""
+    res = _member_res('ok', 92, 0.92, 13, 5)
+    cached = {'month': '2026-05', 'name': 'Miguel', 'history': []}
+    captured = {}
+    with patch.object(A, '_profile_metadata_merge_sb',
+                      side_effect=lambda t, p: captured.update(p) or True):
+        A._punct_persist_me('AT-ME', res, 2, 6, cached)
+    assert captured['punctuality']['name'] == 'Miguel'
+
+
+def test_response_from_cache_carries_name():
+    """Cache-Antwort trägt den persistierten Namen in me + Leaderboard-Zeile."""
+    cached = _fresh_cache()
+    cached['name'] = 'Miguel'
+    out = A._punct_response_from_cache(cached, '2026-06', 3)
+    assert out['me']['name'] == 'Miguel'
+    assert out['leaderboard'][0]['name'] == 'Miguel'
+    assert out['leaderboard'][0]['is_me'] is True
+
+
+def test_endpoint_recompute_persists_name(monkeypatch):
+    """Voll-Compute persistiert den Member-Namen (nicht null) in den Cache."""
+    lb = {'ranked': [{'token': 'AT-ME', 'is_me': True, 'name': 'Miguel',
+                      'avatar_url': None, 'rank': 1,
+                      'res': _member_res('ok', 100, 1.0, 5, 0)}],
+          'insufficient': [], 'total_ranked': 1,
+          'members': [{'token': 'AT-ME', 'is_me': True, 'name': 'Miguel',
+                       'rank': 1, 'res': _member_res('ok', 100, 1.0, 5, 0)}]}
+    captured = {}
+    with patch.object(A, '_validate_token_exists', return_value='x@y.z'):
+        with patch.object(A, '_token_rate_limited', return_value=False):
+            with patch.object(A, 'SB_AVAILABLE', True):
+                with patch.object(A, '_profiles_load_bulk', return_value={'AT-ME': {}}):
+                    with patch.object(A, '_crew_punctuality_leaderboard', return_value=lb):
+                        with patch.object(
+                                A, '_profile_metadata_merge_sb',
+                                side_effect=lambda t, p: captured.update(p) or True):
+                            r = _client().get('/api/ax/punctuality/AT-ME?month=2026-06&refresh=1')
+    assert r.status_code == 200
+    assert captured['punctuality']['name'] == 'Miguel'
+
+
+# ════════════════════════════════════════════════════════════════════
+# RESTFIX C — Create-Fallback wenn 0 Rows gepatcht
+# ════════════════════════════════════════════════════════════════════
+
+def test_persist_me_create_fallback_when_merge_returns_false():
+    """Merge trifft keine Row (RPC fehlt / Row existiert nicht) → Create-Fallback
+    via _profile_save_to_supabase (legt Row inkl. metadata.punctuality an)."""
+    res = _member_res('ok', 92, 0.92, 13, 5)
+    saves = []
+    with patch.object(A, '_profile_metadata_merge_sb', return_value=False):
+        with patch.object(A, '_profile_save_to_supabase',
+                          side_effect=lambda t, p: saves.append((t, p)) or True):
+            A._punct_persist_me('AT-ME', res, 2, 6, None, name='Miguel')
+    assert len(saves) == 1
+    assert saves[0][0] == 'AT-ME'
+    assert set(saves[0][1].keys()) == {'punctuality'}
+    assert saves[0][1]['punctuality']['name'] == 'Miguel'
+
+
+def test_persist_me_no_fallback_when_merge_ok():
+    """Merge trifft die Row → KEIN zusätzlicher Save-Fallback."""
+    res = _member_res('ok', 92, 0.92, 13, 5)
+    saves = []
+    with patch.object(A, '_profile_metadata_merge_sb', return_value=True):
+        with patch.object(A, '_profile_save_to_supabase',
+                          side_effect=lambda t, p: saves.append(p) or True):
+            A._punct_persist_me('AT-ME', res, 2, 6, None, name='Miguel')
+    assert saves == []
+
+
+# ════════════════════════════════════════════════════════════════════
+# RESTFIX B — getProfile reicht metadata.punctuality durch
+# ════════════════════════════════════════════════════════════════════
+
+def test_getprofile_owner_passes_through_punctuality():
+    """Owner-Pfad von GET /api/user/profile/<token> liefert metadata.punctuality
+    (Top-Level + profile.punctuality), damit iOS Rang/Score liest."""
+    punct = {'month': '2026-06', 'name': 'Miguel', 'score': 92, 'rank': 2,
+             'sample': 13, 'history': []}
+    full = {'token': 'AT-ME', 'profile': {'name': 'Miguel', 'punctuality': punct}}
+    with patch.object(A, '_request_bearer_matches', return_value=True):
+        with patch.object(A, '_profile_load', return_value=full):
+            r = _client().get('/api/user/profile/AT-ME')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['punctuality']['rank'] == 2
+    assert body['punctuality']['score'] == 92
+    assert body['profile']['punctuality']['name'] == 'Miguel'
+
+
+def test_getprofile_public_path_omits_punctuality():
+    """Nicht-Owner (Friend-Discovery) bekommt KEINE Pünktlichkeits-Daten."""
+    with patch.object(A, '_request_bearer_matches', return_value=False):
+        with patch.object(A, '_public_profile_projection',
+                          return_value={'token': 'AT-ME', 'name': 'Miguel'}):
+            r = _client().get('/api/user/profile/AT-ME')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert 'punctuality' not in body

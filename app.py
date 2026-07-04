@@ -9963,6 +9963,12 @@ def get_user_profile(token):
             full['profile'] = prof
             for _k in ('avatar_b64', 'avatar_mime', 'avatar_dir_key'):
                 full.pop(_k, None)
+            # RESTFIX B: Crew-Pünktlichkeits-Cache (metadata.punctuality) explizit
+            # an die Top-Level-Antwort spiegeln, damit iOS gespeicherten Rang/
+            # Score/History ohne separaten /api/ax/punctuality-Call lesen kann.
+            # Additiv — profile.punctuality (via metadata-fold) bleibt erhalten.
+            if isinstance(prof.get('punctuality'), dict):
+                full['punctuality'] = prof['punctuality']
             return jsonify(full)
         return jsonify(_public_profile_projection(token))
     except Exception as e:
@@ -30951,12 +30957,16 @@ def _punct_is_stale(cached_p, max_age_h=6):
         return True
 
 
-def _punct_persist_me(token, res, rank, total_crew, cached_p):
+def _punct_persist_me(token, res, rank, total_crew, cached_p, name=None):
     """Schreibt den me-Block atomar in user_profiles.metadata.punctuality
     (_profile_metadata_merge_sb → NIE Voll-Overwrite, kein Avatar-Clobber).
     Nur bei status=='ok'. history: bestehende Liste (aus cached_p) lesen, Monat
     dedupen/ersetzen, auf 24 Einträge kappen. Return das persistierte dict (oder
-    None wenn nicht geschrieben)."""
+    None wenn nicht geschrieben).
+
+    `name` wird MITgeschrieben (RESTFIX A), damit der lazy-Cache-Pfad
+    (_punct_response_from_cache) einen echten Namen statt null liefert. Fehlt der
+    Parameter, bleibt ein bereits gecachter Name erhalten (kein Null-Clobber)."""
     if not res or res.get('status') != 'ok':
         return None
     month_str = res.get('month')
@@ -30969,8 +30979,13 @@ def _punct_persist_me(token, res, rank, total_crew, cached_p):
     prev_hist.append(hist_entry)
     prev_hist.sort(key=lambda h: str(h.get('month') or ''))
     prev_hist = prev_hist[-24:]
+    # Name-Persistenz: übergebener Name gewinnt, sonst bestehenden Cache-Namen
+    # behalten (nie mit None überschreiben).
+    persisted_name = name if name else (
+        cached_p.get('name') if isinstance(cached_p, dict) else None)
     punct = {
         'month': month_str,
+        'name': persisted_name,
         'score': res.get('score_pct'),
         'rank': rank,
         'sample': res.get('sample'),
@@ -30984,7 +30999,13 @@ def _punct_persist_me(token, res, rank, total_crew, cached_p):
         'history': prev_hist,
     }
     try:
-        _profile_metadata_merge_sb(token, {'punctuality': punct})
+        merged = _profile_metadata_merge_sb(token, {'punctuality': punct})
+        if not merged:
+            # RESTFIX C: RPC fehlt/failt ODER die Profil-Row existiert noch
+            # nicht (0 Rows gepatcht) → Create/Upsert-Fallback. _profile_save_
+            # to_supabase legt die Row via read-merge-upsert inkl. metadata.
+            # punctuality an (best-effort, kein Avatar-Clobber im Fallback).
+            _profile_save_to_supabase(token, {'punctuality': punct})
     except Exception as e:
         app.logger.warning(f'[punctuality] persist_fail tok={token[:8]}: {e}')
     return punct
@@ -31125,7 +31146,8 @@ def ax_crew_punctuality(token):
     me_member = next((m for m in lb['members'] if m['is_me']), None)
     if me_member is not None and me_member['res'].get('status') == 'ok':
         _punct_persist_me(token, me_member['res'], me_member.get('rank'),
-                          lb['total_ranked'], cached_p)
+                          lb['total_ranked'], cached_p,
+                          name=me_member.get('name'))
     return jsonify(_punct_response_from_leaderboard(lb, month_str, min_sample))
 
 
