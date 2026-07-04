@@ -21437,10 +21437,18 @@ def register_push_apns():
     # die Einstellungen nach jedem App-Start weg).
     if isinstance(existing.get('prefs'), dict):
         merged['prefs'] = existing.get('prefs')
-    # Gelerntes apns_env nur behalten, wenn das Device-Token UNVERÄNDERT ist —
-    # ein NEUES Token (anderer Build/Reinstall) kann die Umgebung gewechselt
-    # haben (Debug=sandbox ↔ TestFlight/AppStore=prod) → neu lernen lassen.
-    if (existing.get('apns_token') or '') == apns_token and existing.get('apns_env'):
+    # CLIENT-HINT gewinnt (2026-07-04, Tibor-Push-Ausfall): Die App WEISS ihre
+    # APNs-Umgebung (Debug-Build=sandbox, TestFlight/AppStore=prod) und darf sie
+    # mitschicken — zuverlässiger als jedes serverseitige Lernen, weil Sandbox-
+    # APNs fremde Tokens teils mit 200 annimmt ohne zuzustellen.
+    env_hint = (body.get('apns_env') or '').strip().lower()
+    if env_hint in ('sandbox', 'prod'):
+        merged['apns_env'] = env_hint
+        merged['apns_env_source'] = 'client'
+    # Sonst: gelerntes apns_env nur behalten, wenn das Device-Token UNVERÄNDERT
+    # ist — ein NEUES Token (anderer Build/Reinstall) kann die Umgebung
+    # gewechselt haben → neu lernen lassen.
+    elif (existing.get('apns_token') or '') == apns_token and existing.get('apns_env'):
         merged['apns_env'] = existing.get('apns_env')
     if _push_save(user_token, merged):
         return jsonify({'ok': True})
@@ -21695,7 +21703,13 @@ def _send_push_notification(token, title, body, data=None,
             if ok2:
                 ok, reason = True, None
                 used_env = 'sandbox' if alt_sandbox else 'prod'
-                if env_pref != used_env:
+                # Nur 'prod' darf GELERNT werden. Sandbox-APNs nimmt fremde
+                # (Prod-)Tokens teils mit 200 an, stellt aber nie zu — genau so
+                # wurde Tibors Device am 03.07 fälschlich auf 'sandbox' gelernt
+                # und alle Chat-Pushes verschwanden lautlos. Echte Debug-Geräte
+                # zahlen dafür einen Prod-Fehlversuch pro Push (verschmerzbar);
+                # sauber wird das erst per Client-Hint bei der Registrierung.
+                if env_pref != used_env and used_env == 'prod':
                     try:
                         _push_save(token, {**reg, 'apns_env': used_env})
                         print(f"[PUSH] apns env learned user={token[:8]} env={used_env}")
