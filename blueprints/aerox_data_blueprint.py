@@ -2094,6 +2094,64 @@ def ax_radar_enrich():
     return jsonify({'ok': True, 'count': len(out), 'routes': out})
 
 
+@aerox_data_bp.route('/api/ax/tail-history', methods=['GET'])
+def ax_tail_history():
+    """„Zuletzt geflogen" EINER Maschine: die letzten ~10 Legs by Tail/Reg aus
+    dem Flight-Warehouse (`flights`, board-verifiziert). Für die Kennzeichen-
+    Detailseite, wenn die Maschine gerade NICHT sendet — statt leerer Seite.
+
+    Query: reg=D-AIZB (bevorzugt, hyphen-tolerant) ODER hex=<icao24>.
+    Response: {ok, reg, count, legs:[{flight_no,src,dst,day,sched_dep,status}]}
+    KEIN Tail-Raten: nur exakte Tail-/Hex-Matches aus dem Warehouse; leer wenn
+    die Maschine dort nie beobachtet wurde."""
+    from flask import request
+    reg = (request.args.get('reg') or '').strip().upper()
+    hexid = (request.args.get('hex') or '').strip().lower()
+    if not reg and not hexid:
+        return jsonify({'ok': False, 'error': 'reg_or_hex_required'}), 400
+    sb = _sb()
+    legs = []
+    if sb is not None:
+        try:
+            q = (sb.table('flights')
+                 .select('op_flight_no,origin,destination,service_date,'
+                         'sched_dep,est_dep,status,tail,hex'))
+            if reg:
+                # Gleiche hyphen-tolerante Varianten wie _route_from_warehouse
+                # (Warehouse führt Tails teils mit, teils ohne Bindestrich).
+                raw = reg.replace('-', '')
+                variants = {reg, raw}
+                if len(raw) >= 3:
+                    variants.add(raw[:1] + '-' + raw[1:])
+                    variants.add(raw[:2] + '-' + raw[2:])
+                q = q.in_('tail', sorted(v for v in variants if v))
+            else:
+                q = q.eq('hex', hexid)
+            rows = (q.order('service_date', desc=True)
+                     .order('sched_dep', desc=True)
+                     .limit(40).execute()).data or []
+            seen = set()
+            for f in rows:
+                src, dst = f.get('origin'), f.get('destination')
+                if not (src and dst):
+                    continue
+                key = (f.get('service_date'), f.get('op_flight_no'), src, dst)
+                if key in seen:
+                    continue
+                seen.add(key)
+                legs.append({'flight_no': f.get('op_flight_no'),
+                             'src': src, 'dst': dst,
+                             'day': f.get('service_date'),
+                             'sched_dep': f.get('sched_dep'),
+                             'status': f.get('status')})
+                if len(legs) >= 10:
+                    break
+        except Exception:
+            pass
+    return jsonify({'ok': True, 'reg': reg or None, 'hex': hexid or None,
+                    'count': len(legs), 'legs': legs, 'source': 'warehouse'})
+
+
 @aerox_data_bp.route('/api/ax/harvest-routes', methods=['POST'])
 def ax_harvest_routes():
     """Route-Harvester (User-Wunsch: „die restlichen Flugnummern suchen + von wo
