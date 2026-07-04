@@ -20048,16 +20048,15 @@ def discover_layover_recs(token):
         lo = (rf.get('layover_ort') or '').upper().strip()
         if lo and len(lo) == 3:
             upcoming_iatas.add(lo)
-    import os
-    rdir = _recs_dir()
     out = []
     for iata in upcoming_iatas:
         rp = _recs_path(iata)
         if not rp: continue
-        try:
-            with open(rp) as f: recs = json.load(f) or []
-        except FileNotFoundError:
-            continue
+        # SB-primary wie ALLE anderen layover-recs-Routen (_recs_load): der rohe
+        # Disk-Read hier war der einzige Rest — nach jedem Cloud-Run-Restart war
+        # die ephemere Disk leer → discover lieferte KEINE User-Tipps mehr, der
+        # Feed (recsForRealIATA) sah frisch gepostete Tipps nicht (Tibor/BLL).
+        recs = _recs_load(iata)
         top = sorted(recs, key=lambda r: -(r.get('vote_score') or 0))[:3]
         if top:
             out.append({'iata': iata, 'top_recs': top})
