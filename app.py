@@ -26461,6 +26461,7 @@ def _enrich_leg_delays(sectors, date, free_only=True):
         s['obs_sides'] = m.get('sides')
         if op_fn != fn and 'also_as' not in s:
             s['also_as'] = raw_fn        # gefaltete Marketing-Nummer bewahren
+    _carry_forward_turnaround_tails(sectors)   # Rückflug-Turnaround erbt den Tail
     return sectors
 
 
@@ -26565,6 +26566,45 @@ def _enrich_leg_tails(sectors, date=None):
         tail = _leg_tail(raw_fn, date=leg_date, dep_iata=frm, arr_iata=to)
         if tail:
             s['tail'] = tail
+    _carry_forward_turnaround_tails(sectors)
+    return sectors
+
+
+def _carry_forward_turnaround_tails(sectors):
+    """Turnaround-Weitergabe (Owner: „Tails auf jedem Leg"). Ein Rückflug eines
+    TURNAROUNDS (Vorleg-Ankunft = dieser-Abflug, kurze Bodenzeit) ist PHYSISCH
+    dieselbe Maschine → den beobachteten Tail des Vorlegs weiterreichen. KEIN
+    Raten: nur bei belegtem Vor-Tail, gleichem Umsteige-Airport UND kurzer
+    Bodenzeit (< 4h; Übernacht-Layover/Aircraft-Swap bricht die Kette → der
+    Rückflug bleibt tail-los = ehrlich). In-place; wirft nie."""
+    try:
+        if not sectors or not isinstance(sectors, list):
+            return sectors
+        for i in range(1, len(sectors)):
+            cur, prev = sectors[i], sectors[i - 1]
+            if not isinstance(cur, dict) or not isinstance(prev, dict):
+                continue
+            if cur.get('tail') or not prev.get('tail'):
+                continue
+            prev_to = str(prev.get('to') or '').strip().upper()
+            cur_from = str(cur.get('from') or '').strip().upper()
+            if len(cur_from) != 3 or prev_to != cur_from:
+                continue                      # nicht kontinuierlich → keine Weitergabe
+            pa, cd = prev.get('arr_iso'), cur.get('dep_iso')
+            if not pa or not cd:
+                continue                      # ohne Zeiten kein sicherer Turnaround
+            try:
+                pad = datetime.fromisoformat(str(pa).replace('Z', '+00:00'))
+                cdd = datetime.fromisoformat(str(cd).replace('Z', '+00:00'))
+                gap_h = (cdd - pad).total_seconds() / 3600.0
+            except Exception:
+                continue
+            if gap_h < 0 or gap_h > 4:
+                continue                      # Übernacht/lang → nicht dieselbe Maschine
+            cur['tail'] = prev['tail']
+            cur['tail_inferred'] = True       # aus Turnaround abgeleitet (nicht direkt beobachtet)
+    except Exception:
+        pass
     return sectors
 
 
