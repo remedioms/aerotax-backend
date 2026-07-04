@@ -11793,12 +11793,35 @@ def get_friend_roster(token, friend_token):
                 summ = (row.get('ical_summary') or '')
                 up = summ.upper()
                 klass = 'OFF' if 'OFF DAY' in up else ('Z76' if 'LAYOVER' in up else None)
-                codes = re.findall(r'\b[A-Z]{3}\b', (row.get('ical_location') or '').upper())
-                dedup = []
-                for c in codes:
-                    if not dedup or dedup[-1] != c:
-                        dedup.append(c)
-                routing = '-'.join(dedup) if len(dedup) >= 2 else None
+                # F6: Routing PRIMÄR aus den Pro-Leg-Sektoren bauen (volle Kette
+                # ZRH-LIS-ZRH). Der LOCATION-Fallback sah bei SWISS nur die
+                # ABFLUG-Airports (LOCATION=Dep-Station je Leg) → verstümmelte
+                # Ketten wie „ZRH-BCN" ohne Rückflug-Ziel.
+                routing = None
+                _secs = row.get('ical_sectors') or []
+                if isinstance(_secs, list) and _secs:
+                    chain = []
+                    for s0 in _secs:
+                        if not isinstance(s0, dict):
+                            continue
+                        s_frm = str(s0.get('from') or '').strip().upper()
+                        s_to = str(s0.get('to') or '').strip().upper()
+                        if len(s_frm) != 3 or len(s_to) != 3:
+                            continue
+                        if not chain:
+                            chain.append(s_frm)
+                        elif chain[-1] != s_frm:
+                            chain.append(s_frm)
+                        chain.append(s_to)
+                    if len(chain) >= 2:
+                        routing = '-'.join(chain)
+                if not routing:
+                    codes = re.findall(r'\b[A-Z]{3}\b', (row.get('ical_location') or '').upper())
+                    dedup = []
+                    for c in codes:
+                        if not dedup or dedup[-1] != c:
+                            dedup.append(c)
+                    routing = '-'.join(dedup) if len(dedup) >= 2 else None
                 out.append({
                     'datum': datum,
                     'klass': klass,
@@ -30567,7 +30590,9 @@ def _ics_split_escaped(value):
 
 def _ics_parse_dt(value, params):
     """Parse DTSTART/DTEND-Value zu (utc_dt | None, local_date_str | None,
-    is_date_only). Bucket = LOKAL nach TZID (siehe F1). All-Day → utc_dt=None.
+    is_date_only, local_hhmm | None). Bucket = LOKAL nach TZID (siehe F1).
+    All-Day → utc_dt=None. `local_hhmm` = Wanduhr-Zeit im Bucket (für die
+    Mitternachts-Exklusiv-Erkennung, SWISS-F2) — None bei DATE-only.
 
     Akzeptiert: 20260315T140000Z (UTC) · 20260315T140000 (floating/TZID) ·
     20260315 (DATE-only).
@@ -30580,23 +30605,23 @@ def _ics_parse_dt(value, params):
         _zi_ok = False
     v = (value or '').strip()
     if not v:
-        return None, None, False
+        return None, None, False, None
     # DATE-only (all-day events): "20260315"
     if len(v) == 8 and v.isdigit():
-        return None, f'{v[0:4]}-{v[4:6]}-{v[6:8]}', True
+        return None, f'{v[0:4]}-{v[4:6]}-{v[6:8]}', True, None
     # DATETIME: 20260315T140000 (mit optionalem Z für UTC)
     m = re.match(r'^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$', v)
     if not m:
         # Fallback: erstes 8-stellige Datum aus dem String ziehen
         digits = re.sub(r'\D', '', v)[:8]
         if len(digits) == 8:
-            return None, f'{digits[0:4]}-{digits[4:6]}-{digits[6:8]}', True
-        return None, None, False
+            return None, f'{digits[0:4]}-{digits[4:6]}-{digits[6:8]}', True, None
+        return None, None, False, None
     Y, M, D, h, mi, s, z = m.groups()
     try:
         naive = datetime(int(Y), int(M), int(D), int(h), int(mi), int(s))
     except Exception:
-        return None, None, False
+        return None, None, False, None
     tzid = (params or {}).get('TZID')
     if z == 'Z':
         # Explicit UTC. Lokaler Bucket = User-TZ; LH-Crew nutzt typischerweise
@@ -30605,20 +30630,22 @@ def _ics_parse_dt(value, params):
             try:
                 utc_dt = naive.replace(tzinfo=_ZI('UTC'))
                 local = utc_dt.astimezone(_ZI('Europe/Berlin'))
-                return utc_dt, local.strftime('%Y-%m-%d'), False
+                return (utc_dt, local.strftime('%Y-%m-%d'), False,
+                        local.strftime('%H:%M'))
             except Exception:
                 pass
-        return naive, f'{Y}-{M}-{D}', False
+        return naive, f'{Y}-{M}-{D}', False, naive.strftime('%H:%M')
     if tzid and _zi_ok:
         try:
             aware = naive.replace(tzinfo=_ZI(tzid))
             utc_dt = aware.astimezone(_ZI('UTC'))
             # F1: bucket = LOKAL-Datum (aware), nicht UTC-Datum.
-            return utc_dt, aware.strftime('%Y-%m-%d'), False
+            return (utc_dt, aware.strftime('%Y-%m-%d'), False,
+                    aware.strftime('%H:%M'))
         except Exception:
-            return naive, f'{Y}-{M}-{D}', False
+            return naive, f'{Y}-{M}-{D}', False, naive.strftime('%H:%M')
     # Floating local time: bucket = wie geschrieben.
-    return naive, f'{Y}-{M}-{D}', False
+    return naive, f'{Y}-{M}-{D}', False, naive.strftime('%H:%M')
 
 
 def _ics_parse_rrule(value):
@@ -30755,8 +30782,11 @@ def _ics_multiday_dates(ev):
         return [start]
     # All-Day → DTEND ist exklusiv (RFC 5545 §3.8.2.2).
     # Timed → DTEND ist der Zeitpunkt, der Tag selbst zählt noch zur Tour.
+    # F2 (SWISS): TIMED-DTEND exakt auf lokal 00:00 = exklusive Schreibweise
+    # („bis 24:00") → der End-Bucket-Tag zählt NICHT (Krank/Ferien war sonst
+    # 1 Tag zu lang — steuerrelevant).
     inclusive_end = e_d
-    if ev.get('_is_date_only_end'):
+    if ev.get('_is_date_only_end') or ev.get('_end_local_midnight'):
         inclusive_end = e_d - _td(days=1)
     if inclusive_end < s_d:
         return [start]
@@ -30815,19 +30845,26 @@ def _parse_ics_to_events(text):
                 if v.upper() == 'CANCELLED':
                     current['_cancelled'] = True
             elif k == 'DTSTART':
-                utc_dt, bucket, is_date = _ics_parse_dt(v, params)
+                utc_dt, bucket, is_date, _hhmm = _ics_parse_dt(v, params)
                 if bucket:
                     current['start'] = bucket
                 if utc_dt is not None:
                     current['start_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
                 current['_is_date_only_start'] = is_date
             elif k == 'DTEND':
-                utc_dt, bucket, is_date = _ics_parse_dt(v, params)
+                utc_dt, bucket, is_date, _hhmm = _ics_parse_dt(v, params)
                 if bucket:
                     current['end'] = bucket
                 if utc_dt is not None:
                     current['end_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
                 current['_is_date_only_end'] = is_date
+                # F2 (SWISS Krank/Ferien): ein TIMED-DTEND, das lokal auf
+                # 00:00 fällt (SWISS schreibt „bis 24:00" als Folgetag-Mitter-
+                # nacht, z.B. KRANK DTEND 20260623T220000Z = 24.06 00:00 CEST),
+                # ist faktisch EXKLUSIV — der End-Bucket-Tag gehört NICHT mehr
+                # zum Event. _ics_multiday_dates zieht ihn dann ab.
+                current['_end_local_midnight'] = (not is_date
+                                                  and _hhmm == '00:00')
             elif k == 'CATEGORIES':
                 # RFC 5545 §3.8.1.2: CATEGORIES ist comma-separated. Escaped
                 # commas (\,) zählen als Literal. Werte werden lowercased +
@@ -30986,6 +31023,12 @@ def _ics_parse_flight_leg_summary(summary):
     s = (summary or '').strip()
     if not s:
         return None, None, None
+    # SWISS-Format zuerst (F3): „LX2084 ZRH 1306 LIS 1501 32Q [FA]" —
+    # space-separiert, KEIN Bindestrich. Ohne diesen Zweig blieb legs[] bei
+    # SWISS-Profilen immer leer (nur der Bindestrich-LH-Parser lief).
+    _sw_flt, _sw_frm, _sw_to = _ics_parse_swiss_flight(s)
+    if _sw_frm and _sw_to:
+        return _sw_flt, _sw_frm, _sw_to
     # Routing: erstes IATA-IATA-Paar (3 Buchstaben - 3 Buchstaben).
     m = re.search(r'\b([A-Za-z]{3})\s*-\s*([A-Za-z]{3})\b', s)
     if not m:
@@ -31041,6 +31084,124 @@ def _ics_swiss_report_local(description):
     if not m:
         return None
     return '%02d:%02d' % (int(m.group(1)), int(m.group(2)))
+
+
+def _ics_station_local_date(iso_utc, iata):
+    """UTC-ISO → LOKALES Datum (YYYY-MM-DD) an der Station `iata` (airport_tz).
+    Fallback Europe/Berlin; None bei Parse-Fehler."""
+    s = (iso_utc or '').strip()
+    if not s:
+        return None
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_ZI('UTC'))
+    except Exception:
+        return None
+    tzname = None
+    try:
+        tzname = airport_tz(iata) if iata else None
+    except Exception:
+        tzname = None
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        return dt.astimezone(_ZI(tzname or 'Europe/Berlin')).strftime('%Y-%m-%d')
+    except Exception:
+        return None
+
+
+def _swissify_roster_events(events, token=None):
+    """SWISS-Feed-Nachbearbeitung (in-place, LH-Pfad unberührt). Läuft in BEIDEN
+    Import-Pfaden direkt nach dem Parsen. No-op, wenn der Feed keine SWISS-Flüge
+    enthält. Wirft nie.
+
+    F1 (West-Zeitzonen-Tagesbucketing): der Tages-Bucket eines SWISS-Flugs wird
+    vom Europe/Berlin-Default auf das LOKALE Datum der Abflug- bzw. Ankunfts-
+    Station umgestellt (LX93 GRU 22:52Z = 19:52 Lokal am 27.06 — Berlin-Bucket
+    wäre der 28.06 → Phantom-Leertag + Flug am falschen Tag).
+
+    F5 (Layover-Synthese): SWISS liefert KEINE LAYOVER-VEVENTs (anders als LH-
+    myTime). Endet der letzte Flug NICHT an der Homebase und geht es dort ≥6 h
+    (und ≤96 h) später weiter, synthetisieren wir das fehlende LAYOVER-Event
+    (SUMMARY:LAYOVER, LOCATION=<IATA>, Spanne Ankunft→Weiterflug) — exakt das
+    Format, das der bestehende LH-Pfad (noon-span rule, ical_layover_ort,
+    Multi-Day-Tage) bereits versteht. Guard: enthält der Feed ECHTE
+    LAYOVER-VEVENTs (LH), wird NICHTS synthetisiert (kein Doppeln)."""
+    try:
+        swiss_flights = []
+        has_real_layover = False
+        for ev in (events or []):
+            summ = (ev.get('summary') or '')
+            if 'LAYOVER' in summ.upper():
+                has_real_layover = True
+            if _ics_is_swiss_flight(summ):
+                swiss_flights.append(ev)
+        if not swiss_flights:
+            return events
+        # ── F1: Buckets auf Stations-Lokaldatum umstellen ────────────────────
+        for ev in swiss_flights:
+            _flt, _frm, _to = _ics_parse_swiss_flight(ev.get('summary') or '')
+            sd = _ics_station_local_date(ev.get('start_iso'), _frm)
+            ed = _ics_station_local_date(ev.get('end_iso'), _to)
+            changed = False
+            if sd and ev.get('start') != sd:
+                ev['start'] = sd
+                changed = True
+            if ed and ev.get('end') != ed:
+                ev['end'] = ed
+                changed = True
+            if changed:
+                ev['_multiday_dates'] = _ics_multiday_dates(ev)
+        # ── F5: Layover-Events synthetisieren ────────────────────────────────
+        if has_real_layover:
+            return events
+        hb = ''
+        if token:
+            try:
+                pr = (_profile_load(token) or {}).get('profile') or {}
+                hb = str(pr.get('homebase') or '').strip().upper()
+            except Exception:
+                hb = ''
+        if len(hb) != 3 or not hb.isalpha():
+            # Fallback ohne Profil-Homebase: häufigste Abflug-Station des Feeds.
+            from collections import Counter as _Ctr
+            deps = [_ics_parse_swiss_flight(e.get('summary') or '')[1]
+                    for e in swiss_flights]
+            deps = [d for d in deps if d]
+            hb = _Ctr(deps).most_common(1)[0][0] if deps else ''
+        ordered = sorted(swiss_flights, key=lambda e: e.get('start_iso') or '')
+        synth = []
+        for a, b in zip(ordered, ordered[1:]):
+            a_to = _ics_parse_swiss_flight(a.get('summary') or '')[2]
+            b_frm = _ics_parse_swiss_flight(b.get('summary') or '')[1]
+            if not a_to or a_to != b_frm or a_to == hb:
+                continue
+            a_end = (a.get('end_iso') or '').strip()
+            b_start = (b.get('start_iso') or '').strip()
+            gap_min = _iso_minutes_between(a_end, b_start)
+            # <6 h = Transit (gleiches Gate wie die LH-noon-span-Regel),
+            # >96 h = kein plausibler Tour-Layover (eher Freiblock/Datenlücke).
+            if gap_min is None or not (6 * 60 <= gap_min <= 96 * 60):
+                continue
+            lay = {
+                'summary': 'LAYOVER', 'location': a_to,
+                'start_iso': a_end, 'end_iso': b_start,
+                'start': _ics_station_local_date(a_end, a_to) or a_end[:10],
+                'end': _ics_station_local_date(b_start, a_to) or b_start[:10],
+                '_is_date_only_start': False, '_is_date_only_end': False,
+                '_swiss_synth_layover': True,
+            }
+            lay['_multiday_dates'] = _ics_multiday_dates(lay)
+            synth.append(lay)
+        if synth:
+            events.extend(synth)
+    except Exception as e:
+        try:
+            app.logger.warning(f'[ics-swiss] swissify-fail: {type(e).__name__}: {str(e)[:160]}')
+        except Exception:
+            pass
+    return events
 
 
 def _ics_events_to_briefings(events, existing=None):
@@ -31201,7 +31362,11 @@ def _ics_events_to_briefings(events, existing=None):
             # Report-Zeit statt der −45/−60-Heuristik (SWISS-DTSTART = Abflug, NICHT
             # Report). NUR einmal/Tag (nur das erste Leg trägt die Reporting-Zeit);
             # bewusst NICHT in `day_summary` (sonst bräche _ev_is_flight_leg → Block).
-            if _ics_is_swiss_flight(summary):
+            # F4: NUR am Tag 1 (i == 0) — vorher stempelte ein Übernacht-Leg
+            # (Tag 2/2) die Tag-1-Report-Zeit auch auf den Folgetag, und
+            # _corrected_briefing_start_iso erfand daraus einen Dienstbeginn
+            # am Layover-/Ankunftstag.
+            if i == 0 and _ics_is_swiss_flight(summary):
                 _rep = _ics_swiss_report_local(ev.get('description'))
                 _cur = existing_b.get('ical_summary') or ''
                 if _rep and 'Briefing' not in _cur:
@@ -31290,10 +31455,19 @@ def _build_ical_sectors(events):
     sec_by_day = {}
     for ev in (events or []):
         d = (ev.get('start_iso') or '')[:10]
-        if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
-            continue
         summ = (ev.get('summary') or '').upper()
         loc = (ev.get('location') or '').upper()
+        # F1 (SWISS): Sektoren auf denselben Tag keyen wie die Briefings —
+        # den Stations-LOKALEN Bucket (`start`, via _swissify_roster_events),
+        # nicht das UTC-Datum. Sonst landet z.B. LX93 (GRU 19:52 Lokal,
+        # 22:52Z) als Sektor auf einem anderen Tag als sein Tagessatz.
+        # LH-Pfad bleibt beim bisherigen UTC-Keying (verifiziertes Verhalten).
+        if _ics_is_swiss_flight(ev.get('summary') or ''):
+            d_bucket = (ev.get('start') or '')[:10]
+            if re.match(r'^\d{4}-\d{2}-\d{2}$', d_bucket):
+                d = d_bucket
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
+            continue
         # SWISS-Format zuerst (space-separiert, kein „-"): „LX1270 ZRH 1236 CPH …".
         sw_flt, sw_frm, sw_to = _ics_parse_swiss_flight(summ)
         if sw_frm and sw_to:
@@ -31477,6 +31651,10 @@ def import_calendar_feed(token):
     except Exception as _exc:
         app.logger.warning(f'[ics] parse-fail: {type(_exc).__name__}: {str(_exc)[:200]}')
         events = []
+    # SWISS-Nachbearbeitung (F1 Stations-Lokal-Buckets + F5 Layover-Synthese) —
+    # no-op für LH-Feeds; wirft nie. VOR dem Persistieren, damit calendar_feed,
+    # Briefings, Reconcile und Sektoren dieselbe (korrigierte) Event-Liste sehen.
+    events = _swissify_roster_events(events, token=token)
     # Save Events — über _profile_save routen, damit calendar_feed in SB
     # (metadata-jsonb) landet und Cloud-Run-Redeploy überlebt.
     feed_obj = {'url': url, 'events': events[:300],
@@ -31618,6 +31796,8 @@ def upload_calendar_events(token):
             }
             adapted_ev['_multiday_dates'] = _ics_multiday_dates(adapted_ev)
             adapted.append(adapted_ev)
+        # SWISS-Nachbearbeitung (F1/F5) auch im EKEvent-Pfad — no-op für LH.
+        adapted = _swissify_roster_events(adapted, token=token)
         briefings, imported_briefings = _ics_events_to_briefings(
             adapted, existing=existing_briefings)
         # RECONCILE (FIX User C „Flüge im Kalender die ich nicht habe"): auch der
