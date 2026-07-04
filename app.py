@@ -30683,6 +30683,452 @@ def _dest_name_for(flights, iata):
     return iata
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# CREW-PÜNKTLICHKEITS-SCORE (D15-Monats-OTP pro Crew-Member)
+# ════════════════════════════════════════════════════════════════════════════
+# EHRLICHER On-Time-Arrival-Anteil eines Crew-Members für einen Kalendermonat:
+# Anteil der GEWERTETEN Flüge (arr_delay_min aus dem Warehouse BEKANNT) mit
+# Ankunfts-Delay ≤ _PUNCTUALITY_DELAY_THRESHOLD_MIN (15 min = D15).
+#
+# DOMÄNEN-INVARIANTEN (nie verletzen):
+#   • Delay wird NIE erfunden. Fehlt arr_delay_min (Ankunftsseite fehlt ODER
+#     delay_known der Arr-Seite False, siehe _flight_obs_merged:26136) → der Flug
+#     ist "no_signal" und fällt komplett aus Zähler UND Nenner der Quote.
+#   • cancelled ist KEIN Delay: separater Counter, nicht in on_time/delayed/sample.
+#   • Mindest-Stichprobe (min_sample, Default 3 gewertete Flüge) — darunter
+#     status='insufficient_sample', KEIN Score, KEIN Rang, KEINE Score-Persistenz.
+#   • Betriebstag/Monatszuordnung über dep_iso (UTC), damit Red-Eyes an der
+#     Monatsgrenze korrekt fallen — NICHT über day.datum.
+#   • Flugnummern via _fn_norm normalisieren (LH0839 == LH839) vor dem Match.
+# min_sample ist bewusst 3 (NICHT das globale _PUNCTUALITY_MIN_SAMPLE=15, das für
+# die airport-weite Tages-Tafel gilt) — ein einzelnes Crew-Roster hat weniger
+# gewertete Flüge, 15 wäre chronisch "insufficient".
+
+def _punct_median(vals):
+    """Median einer Liste ints/floats. None bei leerer Liste. Reine stdlib-Logik
+    (kein statistics-Import), damit deterministisch/testbar."""
+    s = sorted(v for v in vals if isinstance(v, (int, float)))
+    n = len(s)
+    if n == 0:
+        return None
+    mid = n // 2
+    if n % 2:
+        return float(s[mid])
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def _crew_flights_for_month(token, year, month):
+    """Liest den Roster-Snapshot (_roster_snapshot_read) und gibt ALLE Flug-
+    Sektoren im Monatsfenster [1. … Monatsende] zurück, Betriebstag = dep_iso[:10]
+    (UTC), Fallback day['datum']. Return [{fn, date, dep, arr}], nie raise.
+
+    ical_sectors-Keys sind 'flight'/'from'/'to'/'dep_iso' (siehe
+    _build_ical_sectors); 'flight_no' wird als Alt-Key toleriert."""
+    from datetime import date as _date
+    try:
+        year = int(year)
+        month = int(month)
+        month_start = _date(year, month, 1)
+        if month == 12:
+            month_end = _date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            month_end = _date(year, month + 1, 1) - timedelta(days=1)
+    except Exception:
+        return []
+    try:
+        payload = _roster_snapshot_read(token) or {}
+    except Exception:
+        payload = {}
+    tage = payload.get('tage') or []
+    if not isinstance(tage, list):
+        return []
+    flights = []
+    for day in tage:
+        if not isinstance(day, dict):
+            continue
+        secs = day.get('ical_sectors') or []
+        if not isinstance(secs, list):
+            continue
+        day_datum = str(day.get('datum') or '')[:10]
+        for s in secs:
+            if not isinstance(s, dict):
+                continue
+            fn = str(s.get('flight') or s.get('flight_no') or '').replace(' ', '').upper().strip()
+            frm = str(s.get('from') or '').strip().upper()
+            to = str(s.get('to') or '').strip().upper()
+            dep_iso = str(s.get('dep_iso') or '').strip()
+            # Betriebstag: dep_iso (UTC) hat Vorrang, damit ein Red-Eye
+            # 2026-06-30T23:50Z (Ankunft 07-01) korrekt zu JUNI zählt.
+            op_day = dep_iso[:10] if len(dep_iso) >= 10 else day_datum
+            if not re.match(r'^\d{4}-\d{2}-\d{2}$', op_day or ''):
+                continue
+            try:
+                op_date = _date.fromisoformat(op_day)
+            except Exception:
+                continue
+            if not (month_start <= op_date <= month_end):
+                continue
+            if len(fn) < 3:
+                continue
+            flights.append({'fn': fn, 'date': op_day,
+                            'dep': (frm if len(frm) == 3 and frm.isalpha() else None),
+                            'arr': (to if len(to) == 3 and to.isalpha() else None)})
+    return flights
+
+
+def _member_monthly_punctuality(token, year, month, min_sample=3):
+    """D15-Monats-Pünktlichkeit EINES Members. Matcht jeden Roster-Flug gegen das
+    Warehouse (_flight_obs_merged, live=False → nur airport_delay_obs, kein Board-
+    Spend) und klassifiziert ehrlich in cancelled / no_signal / rated.
+
+    Return dict:
+      status: 'ok' | 'insufficient_sample' | 'no_flights'
+      month, score_pct/score (int 0..100 oder None), score_raw (float oder None),
+      on_time, delayed, cancelled, sample (=gewertete Flüge), no_signal,
+      median_delay (Median der gewerteten Arr-Delays oder None),
+      delay_threshold_min, min_sample.
+    Nie raise."""
+    try:
+        year = int(year)
+        month = int(month)
+    except Exception:
+        year, month = 0, 0
+    month_str = f'{year:04d}-{month:02d}'
+    base = {
+        'status': 'no_flights', 'month': month_str,
+        'score_pct': None, 'score': None, 'score_raw': None,
+        'on_time': 0, 'delayed': 0, 'cancelled': 0, 'sample': 0, 'no_signal': 0,
+        'median_delay': None,
+        'delay_threshold_min': _PUNCTUALITY_DELAY_THRESHOLD_MIN,
+        'min_sample': min_sample,
+    }
+    flights = _crew_flights_for_month(token, year, month)
+    if not flights:
+        return base
+    on_time = delayed = cancelled = no_signal = 0
+    rated_delays = []
+    for f in flights:
+        try:
+            m = _flight_obs_merged(_fn_norm(f['fn']), date=f.get('date'),
+                                   dep_iata=f.get('dep'), arr_iata=f.get('arr'),
+                                   live=False)
+        except Exception:
+            m = None
+        # cancelled ZUERST prüfen (arr_delay_min ist bei Annullierung typ. None,
+        # der Flug soll aber in den cancelled-Counter, nicht in no_signal).
+        if m and (m.get('arr_cancelled') or m.get('cancelled')):
+            cancelled += 1
+            continue
+        arr = m.get('arr_delay_min') if m else None
+        # no_signal: kein Warehouse-Record ODER Ankunftsseite kennt ihren Delay
+        # nicht (arr_delay_min None). NIEMALS als 0/pünktlich werten.
+        if m is None or not isinstance(arr, int) or isinstance(arr, bool):
+            no_signal += 1
+            continue
+        rated_delays.append(arr)
+        # Grenze inklusiv: arr==15 → pünktlich; negativ (früh) → pünktlich.
+        if arr <= _PUNCTUALITY_DELAY_THRESHOLD_MIN:
+            on_time += 1
+        else:
+            delayed += 1
+    total_rated = len(rated_delays)
+    median_delay = _punct_median(rated_delays)
+    if total_rated < min_sample:
+        out = dict(base)
+        out.update({'status': 'insufficient_sample', 'on_time': on_time,
+                    'delayed': delayed, 'cancelled': cancelled,
+                    'no_signal': no_signal, 'sample': total_rated,
+                    'median_delay': median_delay})
+        return out
+    score_raw = on_time / total_rated
+    score_pct = int(round(100 * score_raw))
+    return {
+        'status': 'ok', 'month': month_str,
+        'score_pct': score_pct, 'score': score_pct, 'score_raw': score_raw,
+        'on_time': on_time, 'delayed': delayed, 'cancelled': cancelled,
+        'sample': total_rated, 'no_signal': no_signal, 'median_delay': median_delay,
+        'delay_threshold_min': _PUNCTUALITY_DELAY_THRESHOLD_MIN,
+        'min_sample': min_sample,
+    }
+
+
+def _punct_rank_entries(entries):
+    """Deterministische Competition-Rangvergabe (1,1,3). entries: list dict mit
+    score(int), optional score_raw(float), sample(int), median_delay(float|None),
+    name, token. Sortiert absteigend nach score_raw, dann sample desc, dann
+    median_delay asc, dann name, dann token (voll-deterministisch). Ties GLEICHEN
+    integer-Scores → gleicher Rang, nächster Rang wird übersprungen.
+    Mutiert die dicts (setzt 'rank') und gibt die geordnete Liste zurück."""
+    def _sk(e):
+        raw = e.get('score_raw')
+        if raw is None:
+            raw = (e.get('score') or 0) / 100.0
+        md = e.get('median_delay')
+        return (-raw, -(e.get('sample') or 0),
+                md if md is not None else float('inf'),
+                (e.get('name') or '').lower(), e.get('token') or '')
+    ordered = sorted(entries, key=_sk)
+    prev_score = None
+    prev_rank = 0
+    for i, e in enumerate(ordered):
+        sc = e.get('score')
+        if sc == prev_score:
+            e['rank'] = prev_rank
+        else:
+            e['rank'] = i + 1
+            prev_rank = i + 1
+            prev_score = sc
+    return ordered
+
+
+def _crew_punctuality_leaderboard(token, year, month, min_sample=3):
+    """Berechnet die Monats-Pünktlichkeit für den User + jeden akzeptierten Friend
+    (share_roster != False) und rankt sie. Ruft _member_monthly_punctuality (also
+    _flight_obs_merged) pro Member — nur Warehouse (live=False), 90s-memoized.
+
+    Return {'ranked': [member...], 'insufficient': [member...], 'total_ranked',
+    'members': [member...]}. member = {token, is_me, name, avatar_url, res, rank?}.
+    Nie raise."""
+    try:
+        friends_data = _friends_load(token) or {}
+    except Exception:
+        friends_data = {}
+    friend_toks = [t for t in (friends_data.get('friends') or [])
+                   if isinstance(t, str) and t and t != token]
+    all_toks = [token] + friend_toks
+    try:
+        profs = _profiles_load_bulk(all_toks) or {}
+    except Exception:
+        profs = {}
+    members = []
+    for tok in all_toks:
+        is_me = (tok == token)
+        prof = profs.get(tok) or {}
+        # Privacy: Friend mit share_roster=False NICHT ins Ranking (kein Zugriff
+        # auf dessen Roster-Pünktlichkeit). Der User selbst ist immer dabei.
+        if not is_me and prof.get('share_roster') is False:
+            continue
+        res = _member_monthly_punctuality(tok, year, month, min_sample=min_sample)
+        name = prof.get('name') or ('Ich' if is_me else 'Crew')
+        members.append({
+            'token': tok, 'is_me': is_me, 'name': name,
+            'avatar_url': prof.get('avatar_url'),
+            'score': res.get('score_pct'), 'score_raw': res.get('score_raw'),
+            'sample': res.get('sample'), 'median_delay': res.get('median_delay'),
+            'res': res,
+        })
+    ranked = [m for m in members if m['res']['status'] == 'ok']
+    insufficient = [m for m in members if m['res']['status'] == 'insufficient_sample']
+    ranked = _punct_rank_entries(ranked)   # sortiert + setzt rank
+    return {
+        'ranked': ranked, 'insufficient': insufficient,
+        'total_ranked': len(ranked), 'members': members,
+    }
+
+
+def _punct_trunc_token(tok, is_me):
+    """Privacy: rohe Friend-Tokens NIE ausliefern. 'self' für den Aufrufer,
+    'tok:<10>…' (truncated) für alle anderen."""
+    if is_me:
+        return 'self'
+    return 'tok:' + (str(tok or '')[:10]) + '…'
+
+
+def _punct_is_stale(cached_p, max_age_h=6):
+    """True wenn der metadata.punctuality-Cache älter als max_age_h ist / kein
+    verwertbares updated_at hat → lazy-recompute nötig."""
+    if not isinstance(cached_p, dict):
+        return True
+    ts = cached_p.get('updated_at')
+    if not ts:
+        return True
+    try:
+        dt = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt) > timedelta(hours=max_age_h)
+    except Exception:
+        return True
+
+
+def _punct_persist_me(token, res, rank, total_crew, cached_p):
+    """Schreibt den me-Block atomar in user_profiles.metadata.punctuality
+    (_profile_metadata_merge_sb → NIE Voll-Overwrite, kein Avatar-Clobber).
+    Nur bei status=='ok'. history: bestehende Liste (aus cached_p) lesen, Monat
+    dedupen/ersetzen, auf 24 Einträge kappen. Return das persistierte dict (oder
+    None wenn nicht geschrieben)."""
+    if not res or res.get('status') != 'ok':
+        return None
+    month_str = res.get('month')
+    hist_entry = {'month': month_str, 'score': res.get('score_pct'),
+                  'rank': rank, 'sample': res.get('sample')}
+    prev_hist = []
+    if isinstance(cached_p, dict) and isinstance(cached_p.get('history'), list):
+        prev_hist = [h for h in cached_p['history']
+                     if isinstance(h, dict) and h.get('month') != month_str]
+    prev_hist.append(hist_entry)
+    prev_hist.sort(key=lambda h: str(h.get('month') or ''))
+    prev_hist = prev_hist[-24:]
+    punct = {
+        'month': month_str,
+        'score': res.get('score_pct'),
+        'rank': rank,
+        'sample': res.get('sample'),
+        'total_crew': total_crew,
+        'on_time': res.get('on_time'),
+        'delayed': res.get('delayed'),
+        'cancelled': res.get('cancelled'),
+        'no_signal': res.get('no_signal'),
+        'delay_threshold_min': res.get('delay_threshold_min'),
+        'updated_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'history': prev_hist,
+    }
+    try:
+        _profile_metadata_merge_sb(token, {'punctuality': punct})
+    except Exception as e:
+        app.logger.warning(f'[punctuality] persist_fail tok={token[:8]}: {e}')
+    return punct
+
+
+def _punct_response_from_leaderboard(lb, month_str, min_sample):
+    """Baut die Endpoint-JSON aus einem frisch berechneten Leaderboard."""
+    leaderboard = []
+    for m in lb['ranked']:
+        leaderboard.append({
+            'token': _punct_trunc_token(m['token'], m['is_me']),
+            'name': m['name'], 'avatar_url': m.get('avatar_url'),
+            'score': m['res'].get('score_pct'), 'rank': m.get('rank'),
+            'sample': m['res'].get('sample'), 'is_me': m['is_me'],
+        })
+    insufficient = []
+    for m in lb['insufficient']:
+        insufficient.append({
+            'token': _punct_trunc_token(m['token'], m['is_me']),
+            'name': m['name'], 'sample': m['res'].get('sample'),
+            'is_me': m['is_me'],
+        })
+    me_member = next((m for m in lb['members'] if m['is_me']), None)
+    if me_member is not None:
+        res = me_member['res']
+        me = {
+            'token': 'self', 'name': me_member['name'],
+            'status': res.get('status'), 'score': res.get('score_pct'),
+            'rank': me_member.get('rank'), 'sample': res.get('sample'),
+            'on_time': res.get('on_time'), 'delayed': res.get('delayed'),
+            'cancelled': res.get('cancelled'), 'no_signal': res.get('no_signal'),
+            'total_crew_ranked': lb['total_ranked'],
+        }
+    else:
+        me = {'token': 'self', 'status': 'no_flights', 'score': None,
+              'rank': None, 'sample': 0, 'on_time': 0, 'delayed': 0,
+              'cancelled': 0, 'no_signal': 0, 'total_crew_ranked': lb['total_ranked']}
+    return {
+        'ok': True, 'month': month_str,
+        'delay_threshold_min': _PUNCTUALITY_DELAY_THRESHOLD_MIN,
+        'min_sample': min_sample,
+        'me': me, 'leaderboard': leaderboard, 'insufficient': insufficient,
+    }
+
+
+def _punct_response_from_cache(cached_p, month_str, min_sample, stale=False):
+    """Board-scan-freie Antwort aus dem persistierten metadata.punctuality-Cache
+    (lazy-Pfad: gleicher Monat + frisch). Leaderboard hat nur die eigene Zeile —
+    Crew-Vergleich wird beim nächsten Recompute (refresh/stale) neu aufgebaut."""
+    score = cached_p.get('score')
+    me = {
+        'token': 'self', 'name': cached_p.get('name'),
+        'status': 'ok', 'score': score, 'rank': cached_p.get('rank'),
+        'sample': cached_p.get('sample'),
+        'on_time': cached_p.get('on_time'), 'delayed': cached_p.get('delayed'),
+        'cancelled': cached_p.get('cancelled'), 'no_signal': cached_p.get('no_signal'),
+        'total_crew_ranked': cached_p.get('total_crew'),
+    }
+    leaderboard = [{
+        'token': 'self', 'name': cached_p.get('name'), 'avatar_url': None,
+        'score': score, 'rank': cached_p.get('rank'),
+        'sample': cached_p.get('sample'), 'is_me': True,
+    }] if score is not None else []
+    out = {
+        'ok': True, 'month': month_str,
+        'delay_threshold_min': cached_p.get('delay_threshold_min')
+        or _PUNCTUALITY_DELAY_THRESHOLD_MIN,
+        'min_sample': min_sample, 'cached': True,
+        'me': me, 'leaderboard': leaderboard, 'insufficient': [],
+    }
+    if stale:
+        out['stale'] = True
+    return out
+
+
+@app.route('/api/ax/punctuality/<token>', methods=['GET'])
+def ax_crew_punctuality(token):
+    """Crew-Pünktlichkeits-Leaderboard (D15-Monats-OTP) für den User + akzeptierte
+    Friends. Query: ?month=YYYY-MM (Default laufender UTC-Monat), ?refresh=1.
+
+    Lazy-Recompute: ist der metadata.punctuality-Cache für den Zielmonat frisch
+    (<6h) und kein refresh → Cache zurück (keine Board-Scans). Sonst Voll-Compute
+    (_crew_punctuality_leaderboard) + atomarer metadata-Merge des me-Blocks.
+    Auth: _validate_token_exists (404) + _token_rate_limited (429)."""
+    if not token or not _validate_token_exists(token):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 404
+    if _token_rate_limited(token, 'ax_punctuality', limit=60, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+
+    now = datetime.now(timezone.utc)
+    mp = (request.args.get('month') or '').strip()
+    if mp:
+        m2 = re.match(r'^(\d{4})-(\d{2})$', mp)
+        if not m2:
+            return jsonify({'ok': False, 'error': 'invalid_month'}), 400
+        year, month = int(m2.group(1)), int(m2.group(2))
+        if month < 1 or month > 12:
+            return jsonify({'ok': False, 'error': 'invalid_month'}), 400
+    else:
+        year, month = now.year, now.month
+    month_str = f'{year:04d}-{month:02d}'
+    refresh = (request.args.get('refresh') or '').strip().lower() in ('1', 'true', 'yes')
+    min_sample = 3
+
+    # Self-Cache (metadata.punctuality) laden — für Lazy-Gate + SB-down-Fallback.
+    cached_p = None
+    try:
+        self_prof = (_profiles_load_bulk([token], include_metadata=True) or {}).get(token) or {}
+        cp = self_prof.get('punctuality')
+        cached_p = cp if isinstance(cp, dict) else None
+    except Exception:
+        pass
+
+    # SB nicht verfügbar → wenn Cache da, den (stale) zurückgeben, sonst 503.
+    if not SB_AVAILABLE:
+        if cached_p and cached_p.get('month') == month_str:
+            return jsonify(_punct_response_from_cache(cached_p, month_str, min_sample,
+                                                      stale=True))
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+
+    # Lazy-Gate: frischer Cache für den Zielmonat → keine Board-Scans.
+    fresh_cache = (cached_p and cached_p.get('month') == month_str
+                   and cached_p.get('score') is not None
+                   and not _punct_is_stale(cached_p))
+    if fresh_cache and not refresh:
+        return jsonify(_punct_response_from_cache(cached_p, month_str, min_sample))
+
+    # Voll-Compute (Warehouse-Scans, memoized) + Persistenz des me-Blocks.
+    try:
+        lb = _crew_punctuality_leaderboard(token, year, month, min_sample=min_sample)
+    except Exception as e:
+        app.logger.warning(f'[punctuality] compute_fail tok={token[:8]}: {e}')
+        if cached_p and cached_p.get('month') == month_str:
+            return jsonify(_punct_response_from_cache(cached_p, month_str, min_sample,
+                                                      stale=True))
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+
+    me_member = next((m for m in lb['members'] if m['is_me']), None)
+    if me_member is not None and me_member['res'].get('status') == 'ok':
+        _punct_persist_me(token, me_member['res'], me_member.get('rank'),
+                          lb['total_ranked'], cached_p)
+    return jsonify(_punct_response_from_leaderboard(lb, month_str, min_sample))
+
+
 @app.route('/api/moderation/<token>/report', methods=['POST'])
 def moderation_report(token):
     """Inhalts-Meldung. Body: {kind: 'wall_post'|'wall_comment'|'forum_thread'|
