@@ -26992,13 +26992,39 @@ def ax_flight_route(callsign):
                     'country': x.get('country_name'),
                     'lat': x.get('latitude'), 'lon': x.get('longitude')}
         air = fr.get('airline') or {}
+        origin, destination = _ap(fr.get('origin')), _ap(fr.get('destination'))
         out = {
             'ok': True, 'found': True, 'callsign': fr.get('callsign') or cs,
             'flight_iata': fr.get('callsign_iata'), 'flight_icao': fr.get('callsign_icao'),
             'airline': air.get('name'), 'airline_iata': air.get('iata'),
             'airline_icao': air.get('icao'),
-            'origin': _ap(fr.get('origin')), 'destination': _ap(fr.get('destination')),
+            'origin': origin, 'destination': destination,
         }
+        # CROWDSOURCE / CREW-WACHSTUM (Owner 2026-07-04): schickt der Client den LIVE
+        # beobachteten Tail mit (`?reg=D-AIXG` — z.B. Freund/Crew fliegt gerade, Reg
+        # aus dem GRATIS ADS-B-Feed), spiegeln wir „Flug X = Reg X auf Route A→B heute"
+        # ins Warehouse. So wächst die DB aus echten Live-Crew-Daten OHNE bezahlten
+        # Call — der Tail steht anderen dann gratis zur Verfügung. Nur der Tail wird
+        # als Fakt gespeichert; Pünktlichkeit bleibt hier ehrlich UNBEKANNT (keine
+        # Zeiten aus der Route). NIE geraten: ohne echte Reg passiert nichts.
+        try:
+            live_reg = (request.args.get('reg') or '').strip().upper()
+            fn_iata = (out.get('flight_iata') or '').strip().upper()
+            dep_iata = (origin.get('iata') or '').strip().upper() if origin else ''
+            if live_reg and fn_iata and len(dep_iata) == 3:
+                obs_date = (request.args.get('date') or '').strip()[:10]
+                if not obs_date:
+                    obs_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                _crowdsource_flight_obs({
+                    'flight': fn_iata, 'reg': live_reg,
+                    'dep_iata': dep_iata,
+                    'arr_iata': (destination.get('iata') or '') if destination else '',
+                    'arr_name': (destination.get('name') or '') if destination else '',
+                    'airline': out.get('airline_iata') or '',
+                    'sched_dep': None, 'status': None, 'dep_delay_min': None,
+                }, obs_date, source='live_adsb')
+        except Exception:
+            pass
         return _public_cache_headers(jsonify(out))
     except Exception as e:
         app.logger.warning(f'[ax_flight_route] {cs} {str(e)[:120]}')
@@ -28254,6 +28280,13 @@ def flight_status(token):
         return jsonify({'ok': False, 'error': 'not_found', 'number': number,
                         'message': ('Für ' + number + ' liegt aktuell kein '
                                     'Flugplan vor.')}), 200
+    # CROWDSOURCE / API-SPAREN (Owner 2026-07-04): den TEUER aufgelösten Flug (Route
+    # + Tail) ins eigene Warehouse spiegeln → derselbe Flug/Tag kommt beim nächsten
+    # Lookup GRATIS aus `airport_delay_obs`, ohne AeroDataBox erneut zu treffen.
+    try:
+        _crowdsource_flight_obs(flight, date_iso, source='aerodatabox')
+    except Exception:
+        pass
     return jsonify({'ok': True, 'number': number, 'flight': flight,
                     'source': 'aerodatabox'})
 
@@ -28971,6 +29004,64 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
                                    airport, status, meta)
             except Exception:
                 pass  # Puffer darf den Write-Pfad nie crashen
+        return False
+
+
+def _crowdsource_flight_obs(flight, date_iso=None, source='aerodatabox'):
+    """Eine KOMPLETTE, echte Flug-Beobachtung (Route + Tail) zurück ins Warehouse
+    (`airport_delay_obs`) schreiben, damit derselbe Flug beim NÄCHSTEN Mal GRATIS
+    aus unseren eigenen Daten kommt — statt den bezahlten Dienst (AeroDataBox) noch
+    einmal zu treffen (Owner 2026-07-04: „damit man sich APIs spart … bevor wir
+    falsche oder keine info rausgeben"). Das ist das Crowdsource-/Self-Growing-
+    Prinzip: eine bezahlte ODER live beobachtete Auflösung füttert die geteilte DB,
+    von der alle Crew/Freunde profitieren.
+
+    DOMÄNENREGEL (hart, wie überall): NUR echte Beobachtungen. `reg` MUSS vorhanden
+    sein (kein Tail → nichts zu crowdsourcen); nie geraten, nie ein per Turnaround
+    ABGELEITETER (`tail_inferred`) Tail — der bleibt lokal. Best-effort, wirft nie.
+    `flight` ist ein Karten-Dict im `_aerodatabox_parse_flight`-Schema (reg, dep_iata,
+    arr_iata, sched_dep, aircraft, status, dep_delay_min). Rückgabe: True bei SB-Write.
+    """
+    try:
+        if not isinstance(flight, dict):
+            return False
+        reg = (flight.get('reg') or '').strip()
+        if not reg:
+            return False                       # ohne echten Tail nichts zu speichern
+        try:
+            fn = _fn_norm(flight.get('flight') or '')
+        except Exception:
+            fn = None
+        dep = (flight.get('dep_iata') or '').strip().upper()
+        arr = (flight.get('arr_iata') or '').strip().upper()
+        if not fn or len(fn) < 3 or len(dep) != 3 or not dep.isalpha():
+            return False                       # ohne Flugnr+Abflug-Airport kein Key
+        sched_dep = (flight.get('sched_dep') or '').strip()
+        # date + hhmm aus sched_dep ableiten (ISO, evtl. lokal mit TZ), sonst date_iso.
+        d = (str(date_iso or '')[:10]
+             or (sched_dep[:10] if len(sched_dep) >= 10 else ''))
+        hhmm = ''
+        if 'T' in sched_dep:
+            tp = sched_dep.split('T', 1)[1]
+            if len(tp) >= 5 and tp[2] == ':':
+                hhmm = tp[:5].replace(':', '')
+        if not d:
+            return False                       # ohne Datum kein sicherer Warehouse-Key
+        cancelled = ((flight.get('status_category') or '') == 'cancelled'
+                     or (flight.get('status') or '').strip().lower() == 'cancelled')
+        meta = {
+            'reg': reg,
+            'type_code': (flight.get('aircraft') or '').strip() or None,
+            'dest_iata': arr or None,
+            'dest_name': (flight.get('arr_name') or '').strip() or None,
+            'airline': (flight.get('airline') or '').strip() or None,
+            'esti': (flight.get('est_dep') or '').strip() or None,
+            'source': source,
+        }
+        return _delay_obs_write_through(
+            d, fn, hhmm, int(flight.get('dep_delay_min') or 0), cancelled,
+            dep, (flight.get('status') or None), meta=meta, requeue_on_fail=False)
+    except Exception:
         return False
 
 

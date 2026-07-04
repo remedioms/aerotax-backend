@@ -460,3 +460,64 @@ def test_carry_forward_skips_overnight_layover():
     ]
     A._carry_forward_turnaround_tails(secs)
     assert 'tail' not in secs[1]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _crowdsource_flight_obs  (Owner 2026-07-04: echte Route+Tail zurück ins
+# Warehouse → nächster Lookup gratis; NUR echte reg, Pünktlichkeit ehrlich)
+# ══════════════════════════════════════════════════════════════════════════════
+def test_crowdsource_writes_paid_flight_with_reg():
+    captured = {}
+    def _fake_wt(date_str, fn, hhmm, max_delay, cancelled, airport,
+                 status, meta=None, requeue_on_fail=True):
+        captured.update(date=date_str, fn=fn, hhmm=hhmm, airport=airport,
+                        meta=meta or {})
+        return True
+    flight = {'flight': 'LH400', 'reg': 'D-AIMM', 'dep_iata': 'FRA',
+              'arr_iata': 'JFK', 'arr_name': 'New York', 'airline': 'LH',
+              'sched_dep': '2026-07-04T10:25:00+02:00', 'status': 'Departed',
+              'est_dep': '2026-07-04T10:40:00+02:00', 'dep_delay_min': 15,
+              'aircraft': 'A350'}
+    with patch.object(A, '_delay_obs_write_through', side_effect=_fake_wt):
+        ok = A._crowdsource_flight_obs(flight, '2026-07-04', source='aerodatabox')
+    assert ok is True
+    assert captured['fn'] == 'LH400'
+    assert captured['airport'] == 'FRA'
+    assert captured['hhmm'] == '1025'
+    assert captured['date'] == '2026-07-04'
+    assert captured['meta']['reg'] == 'D-AIMM'
+    assert captured['meta']['source'] == 'aerodatabox'
+    assert captured['meta']['dest_iata'] == 'JFK'
+
+
+def test_crowdsource_skips_without_reg():
+    flight = {'flight': 'LH400', 'reg': '', 'dep_iata': 'FRA', 'arr_iata': 'JFK',
+              'sched_dep': '2026-07-04T10:25:00+02:00'}
+    with patch.object(A, '_delay_obs_write_through',
+                      side_effect=AssertionError('must not write without reg')):
+        assert A._crowdsource_flight_obs(flight, '2026-07-04') is False
+
+
+def test_crowdsource_live_reg_only_is_delay_unknown():
+    # Live-ADS-B Fall: nur Reg, keine Zeiten → write_through mit max_delay=0,
+    # status=None; die Read-Seite (_obs_delay_known) darf das NICHT als pünktlich zählen.
+    captured = {}
+    def _fake_wt(date_str, fn, hhmm, max_delay, cancelled, airport,
+                 status, meta=None, requeue_on_fail=True):
+        captured.update(max_delay=max_delay, status=status, meta=meta or {})
+        return True
+    flight = {'flight': 'LH400', 'reg': 'D-AIMM', 'dep_iata': 'FRA',
+              'arr_iata': 'JFK', 'sched_dep': None, 'status': None,
+              'dep_delay_min': None}
+    with patch.object(A, '_delay_obs_write_through', side_effect=_fake_wt):
+        A._crowdsource_flight_obs(flight, '2026-07-04', source='live_adsb')
+    assert captured['max_delay'] == 0
+    assert captured['status'] is None
+    # honest: this row must read as delay-UNKNOWN, not on-time
+    assert A._obs_delay_known(captured['max_delay'], False, None, None, False) is False
+
+
+def test_crowdsource_bad_input_never_raises():
+    assert A._crowdsource_flight_obs(None) is False
+    assert A._crowdsource_flight_obs({}) is False
+    assert A._crowdsource_flight_obs({'reg': 'D-AIMM'}) is False  # no flight/dep
