@@ -25462,6 +25462,172 @@ def _departed_rows_from_store(airport):
     return rows
 
 
+def _fn_norm(fn):
+    """Flugnummern-Normalisierung fürs Gruppieren: Leerzeichen raus, führende
+    Nullen der Nummer strippen ('SQ 026' == 'SQ026' == 'SQ26' → 'SQ26').
+    Owner-Bug 2026-07-04: SQ026 und SQ26 standen als ZWEI Zeilen in der
+    Strecken-Historie. Carrier-Prefix: IATA 2-stellig (auch '4Y'/'X3') oder
+    ICAO 3-stellig. Unparsebares kommt unverändert (nur upper/space) zurück."""
+    s = str(fn or '').replace(' ', '').upper()
+    m = re.match(r'^([A-Z]{2}|[A-Z]\d|\d[A-Z]|[A-Z]{3})0*(\d{1,4})([A-Z]?)$', s)
+    if not m:
+        return s
+    return f'{m.group(1)}{int(m.group(2))}{m.group(3)}'
+
+
+# Warehouse-codeshares (mkt_carrier/mkt_flight_no → flights.op_flight_no) als
+# Prozess-Cache. Die Tabelle ist klein (~430 Zeilen, wachsend) → EIN Read alle
+# 6 h reicht; bei SB-Fehlschlag bleibt die alte Map und der nächste Versuch
+# ist in ~10 min (kein Hammering).
+_AX_CODESHARE_CACHE = {'ts': 0.0, 'map': {}}
+_AX_CODESHARE_TTL_S = 6 * 3600
+
+
+def _ax_codeshare_map():
+    """dict: Marketing-Flugnummer (norm) → Operating-Flugnummer (norm), aus der
+    Flight-Warehouse-Tabelle `codeshares` (embedded read auf flights.op_flight_no).
+    Leere Map wenn SB down/Tabelle leer — Aufrufer fällt dann auf die
+    sched±3min-Heuristik zurück. Wirft nie."""
+    now = time.time()
+    if _AX_CODESHARE_CACHE['map'] and now - _AX_CODESHARE_CACHE['ts'] < _AX_CODESHARE_TTL_S:
+        return _AX_CODESHARE_CACHE['map']
+    if not SB_AVAILABLE or sb is None:
+        return _AX_CODESHARE_CACHE['map']
+    def _do():
+        return (sb.table('codeshares')
+                .select('mkt_carrier,mkt_flight_no,flights(op_flight_no)')
+                .limit(8000).execute())
+    res, failed = _supabase_execute_with_timeout('ax_codeshares', _do, timeout_s=5)
+    rows = (getattr(res, 'data', None) or []) if res is not None else []
+    if rows and not failed:
+        mp = {}
+        for r in rows:
+            fl = r.get('flights')
+            op = (fl.get('op_flight_no') or '') if isinstance(fl, dict) else ''
+            # mkt_flight_no trägt im Warehouse bereits den Carrier-Prefix
+            # ('AM6820', verifiziert 2026-07-04 an 1000 Rows) — Carrier nur
+            # voranstellen, wenn die Nummer nackt-numerisch wäre (defensiv).
+            mk = (r.get('mkt_flight_no') or '').strip()
+            if mk.isdigit():
+                mk = f"{(r.get('mkt_carrier') or '').strip()}{mk}"
+            op_n, mk_n = _fn_norm(op), _fn_norm(mk)
+            if op_n and mk_n and op_n != mk_n:
+                mp[mk_n] = op_n
+        _AX_CODESHARE_CACHE['map'] = mp
+        _AX_CODESHARE_CACHE['ts'] = now
+    else:
+        # Fehlschlag/leer: alte Map behalten, Retry in ~10 min statt 6 h.
+        _AX_CODESHARE_CACHE['ts'] = now - _AX_CODESHARE_TTL_S + 600
+    return _AX_CODESHARE_CACHE['map']
+
+
+def _fold_codeshare_flights(flights, cs_map):
+    """Faltet Codeshare-Duplikate EINES Tages der Strecken-Historie zu einer
+    Zeile (Owner-Screenshot 2026-07-04: TG7722/UA8841/ET1610/SN7230/NZ4226/
+    LH400 alle 13:35 = derselbe physische Flug, 6 Zeilen + 6-fach in der
+    Pünktlichkeits-Quote).
+
+    Zwei Stufen: (1) Warehouse-Mapping `cs_map` (Marketing→Operating, norm),
+    (2) Heuristik: Gruppen mit gleicher sched ±3 min (gleiche Strecke ist hier
+    durch den Endpoint gegeben) werden zusammengelegt — ausser BEIDE Nummern
+    sind als Operating bekannt (zwei echte Flüge knapp hintereinander).
+    Repräsentant = Operating-Nummer (bzw. der Eintrag mit den besten Daten);
+    Marketing-Nummern additiv als `also_as`, Zähl-Basis = EINE Stimme.
+    Liefert eine NEUE Liste (sched-sortiert); Original-Einträge unverändert."""
+    if not flights or len(flights) < 2:
+        return flights
+    def _sched_minutes(e):
+        m = re.search(r'(\d{1,2}):(\d{2})', str(e.get('sched') or ''))
+        return int(m.group(1)) * 60 + int(m.group(2)) if m else None
+    known_ops = set(cs_map.values())
+    def _op_rank(key):
+        # kleiner = eher der Operating Carrier: als Operating im Warehouse
+        # bekannt < wenige Ziffern (LH400) < hohe 4-stellige Marketing-Nummer.
+        digits = re.sub(r'\D', '', key or '')
+        return (0 if key in known_ops else 1, len(digits),
+                int(digits) if digits else 9999, key or '')
+    groups, order = {}, []
+    for e in flights:
+        n = _fn_norm(e.get('flight'))
+        op = cs_map.get(n, n)
+        if op not in groups:
+            groups[op] = []
+            order.append(op)
+        groups[op].append((e, n))
+    def _grp_sched(k):
+        vals = [_sched_minutes(e) for e, _ in groups[k]]
+        vals = [v for v in vals if v is not None]
+        return min(vals) if vals else None
+    # Heuristik-Merge (sched±3min) — iterativ bis stabil.
+    changed = True
+    while changed:
+        changed = False
+        keys = [k for k in order if k in groups]
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                a, b = keys[i], keys[j]
+                if a in known_ops and b in known_ops:
+                    continue      # zwei ECHTE Operating-Flüge → nie falten
+                sa, sb2 = _grp_sched(a), _grp_sched(b)
+                if sa is None or sb2 is None or abs(sa - sb2) > 3:
+                    continue
+                win, lose = (a, b) if _op_rank(a) <= _op_rank(b) else (b, a)
+                groups[win].extend(groups.pop(lose))
+                changed = True
+                break
+            if changed:
+                break
+    out = []
+    for k in order:
+        members = groups.get(k)
+        if not members:
+            continue
+        if len(members) == 1:
+            out.append(members[0][0])
+            continue
+        def _data_rank(e):
+            return (0 if e.get('obs') == 'both' else 1,
+                    0 if e.get('delay_known') else 1)
+        # Repräsentant: der Eintrag, dessen Nummer die Operating-Nummer der
+        # Gruppe ist; sonst der plausibelste (Operating-Rang) Eintrag.
+        rep_src = next((e for e, n in members if n == k), None)
+        if rep_src is None:
+            rep_src = min((e for e, _ in members),
+                          key=lambda e: _op_rank(_fn_norm(e.get('flight'))))
+        rep = dict(rep_src)
+        # Bester Daten-Spender (both > delay_known) füllt fehlende Urteile auf.
+        donor = min((e for e, _ in members), key=_data_rank)
+        if donor is not rep_src and _data_rank(donor) < _data_rank(rep_src):
+            for kk in ('delay_min', 'delay_known', 'status', 'dep_delay_min',
+                       'arr_delay_min', 'sched_arr', 'obs'):
+                if donor.get(kk) is not None:
+                    rep[kk] = donor[kk]
+        if any(bool(e.get('cancelled')) for e, _ in members):
+            rep['cancelled'] = True
+            rep['status'] = 'cancelled'
+        rep_norm = _fn_norm(rep.get('flight'))
+        if rep_src is None and k in known_ops and k != rep_norm:
+            # Kein Member trägt die Operating-Nummer selbst (nur Marketing-
+            # Rows beobachtet) → Zeile auf die Warehouse-bekannte Operating-
+            # Nummer umlabeln; die beobachteten Marketing-Nummern landen unten
+            # in also_as. Das IST der physische Flug — kein Erfinden.
+            rep['flight'] = k
+            rep['airline'] = k[:2]
+            rep_norm = k
+        also, seen_norm = [], {rep_norm}
+        for e, n in members:
+            if n in seen_norm:
+                continue
+            seen_norm.add(n)
+            also.append(e.get('flight'))
+        if also:
+            rep['also_as'] = also          # additiv — iOS 1.6(1) ignoriert es
+        rep['codeshares_folded'] = len(members) - 1
+        out.append(rep)
+    out.sort(key=lambda f: (f.get('sched') or ''))
+    return out
+
+
 @app.route('/api/ax/route-history/<frm>/<to>', methods=['GET'])
 def ax_route_history(frm, to):
     """Strecken-Historie (Pünktlichkeit pro Tag) für ein Städtepaar — aus den
@@ -25498,6 +25664,8 @@ def ax_route_history(frm, to):
                         'recent_days': [], 'source': 'airport_delay_obs'})
     on_time = late = cancelled_cnt = total = unknown_cnt = 0
     days_out = []
+    # Codeshare-Mapping EINMAL pro Request (Prozess-Cache, 6 h TTL).
+    cs_map = _ax_codeshare_map()
     for i in range(ndays):
         d = (base - _td(days=i)).strftime('%Y-%m-%d')
         rows = (_departed_rows_from_store(store_key) if i == 0
@@ -25526,7 +25694,9 @@ def ax_route_history(frm, to):
             for r in rws:
                 if (r.get('dest_iata') or '').upper() != match:
                     continue
-                fn_key = (r.get('flight') or '').replace(' ', '').upper()
+                # Normalisiert (SQ026==SQ26), damit auch der dep/arr-Dual-Side-
+                # Merge Schreibweisen-Varianten derselben Nummer trifft.
+                fn_key = _fn_norm(r.get('flight'))
                 # „Unbekannt ≠ Pünktlich" (LH400): die Row-Builder liefern
                 # delay_min bereits als None + delay_known=False, wenn der Delay
                 # NIE wirklich beobachtet wurde (nur vor Abflug gesehen, kein
@@ -25545,7 +25715,9 @@ def ax_route_history(frm, to):
                               'unknown' if not known else
                               'ontime' if delay <= 15 else
                               'minor' if delay <= 45 else 'late')
-                    entry = {'flight': r.get('flight'),
+                    # Anzeige-Label normalisiert (SQ026→SQ26): sonst gruppiert
+                    # der Client dieselbe Nummer über Tage hinweg als zwei Flüge.
+                    entry = {'flight': (fn_key or r.get('flight')),
                              'airline': r.get('airline'),
                              'sched': r.get('sched'),
                              'delay_min': (delay if known else None),
@@ -25582,6 +25754,14 @@ def ax_route_history(frm, to):
                     elif known:
                         prev['status'] = ('ontime' if delay <= 15 else
                                           'minor' if delay <= 45 else 'late')
+        # CODESHARE-FALTUNG (Owner 2026-07-04): derselbe physische Flug unter
+        # mehreren Marketing-Nummern → EINE Zeile (operating gewinnt, Rest als
+        # `also_as`) — VOR dem Zählen, sonst stimmt die Quote N-fach ab.
+        if flights:
+            try:
+                flights = _fold_codeshare_flights(flights, cs_map)
+            except Exception as _fe:
+                app.logger.warning(f'[route-history] fold-fail: {str(_fe)[:120]}')
         # Quote NACH dem Merge zählen (ein Flug = eine Stimme; nur Flüge mit
         # echtem Urteil in den Nenner — 'unknown' ist Info, keine Pünktlichkeit).
         for e in flights:
