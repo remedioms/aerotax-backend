@@ -2932,7 +2932,7 @@ def _progress_along_route(dep_iata, dst_iata, pos):
     return round(max(0.0, min(1.0, done / total)), 3)
 
 
-def _build_inbound_chain(flight_no, date, dep_iata):
+def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None):
     """KERN-Trick (#1): (a) welche Maschine ist meinem Abflug zugeteilt (Reg aus
     Warehouse/Live-Board des Abflugs, gratis); (b) wo ist dieselbe Reg GERADE —
     ist ihre aktuelle Live-Route → dep_iata, ist das der Zubringer; (c) dessen
@@ -2954,7 +2954,12 @@ def _build_inbound_chain(flight_no, date, dep_iata):
     }
     my = (merged_fn(flight_no, date=date, dep_iata=dep, free_only=True)
           if merged_fn else None)
-    reg = (my or {}).get('reg') or None
+    # Warehouse-Reg bevorzugt; fehlt sie (Flug noch nicht gescrapt), den vom Client
+    # mitgegebenen ECHTEN Roster-Tail als Hint nutzen (Owner 2026-07-05: „die maschine
+    # ist live warum wird sie nicht angezeigt" — ohne Reg-Match blieb die Karte leer,
+    # obwohl der Flieger via ADS-B live auffindbar ist). Nie geraten: nur ein echter,
+    # vom Roster/Board bekannter Tail.
+    reg = (my or {}).get('reg') or (str(reg_hint or '').strip().upper() or None)
     ac_type = (my or {}).get('aircraft') or None
     sched_dep = (my or {}).get('sched_dep')
     if reg and not ac_type:
@@ -3067,13 +3072,14 @@ def ax_flight_inbound_chain(token):
     flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
     date = (request.args.get('date') or '').strip()[:10] or None
     dep_iata = _norm_iata(request.args.get('dep_iata'))
+    reg_hint = (request.args.get('reg') or '').strip().upper() or None
     if len(flight_no) < 3 or not dep_iata:
         return jsonify({'ok': False, 'error': 'need_flight_no_and_dep_iata'}), 400
-    mkey = ('chain', flight_no, date or '', dep_iata)
+    mkey = ('chain', flight_no, date or '', dep_iata, reg_hint or '')
     memo = _memo_get(mkey)
     if memo is not None:
         return jsonify(memo)
-    chain, forecast, _my = _build_inbound_chain(flight_no, date, dep_iata)
+    chain, forecast, _my = _build_inbound_chain(flight_no, date, dep_iata, reg_hint)
     payload = {
         'ok': True, 'flight': flight_no, 'date': date, 'dep_iata': dep_iata,
         **chain, 'dep_delay_forecast': forecast,
