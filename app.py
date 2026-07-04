@@ -26576,6 +26576,30 @@ def ax_transit():
             except Exception:
                 return None
 
+        def _thin_path(coords, max_pts=200):
+            """Per-Leg-Routen-GEOMETRIE [[lat,lon],…] kompakt machen: auf
+            ≤max_pts ausdünnen (gleichmäßig, erster+letzter Punkt bleiben) und
+            auf 5 Nachkommastellen (~1 m) runden. iOS zeichnet damit die Linie
+            ENTLANG DER GLEISE statt Stopp-zu-Stopp-Luftlinie (Owner 2026-07-04:
+            „öpnv hat die linie nicht wie die bahn fährt"). None wenn keine
+            brauchbare Geometrie (<2 Punkte) — das `path`-Feld entfällt dann."""
+            try:
+                pts = []
+                for c in (coords or []):
+                    if isinstance(c, (list, tuple)) and len(c) >= 2:
+                        la, lo = float(c[0]), float(c[1])
+                        if -90.0 <= la <= 90.0 and -180.0 <= lo <= 180.0:
+                            pts.append([round(la, 5), round(lo, 5)])
+                if len(pts) < 2:
+                    return None
+                if len(pts) > max_pts:
+                    step = (len(pts) - 1) / float(max_pts - 1)
+                    pts = [pts[min(int(round(i * step)), len(pts) - 1)]
+                           for i in range(max_pts)]
+                return pts
+            except Exception:
+                return None
+
         # bahn.de hängt hinter Akamai-Bot-Protection → braucht Browser-ähnliche Header
         # (echte SPA-Header), sonst 403. Origin/Referer = die echte Fahrplan-Suche.
         _BAHN_HEADERS = {
@@ -26686,7 +26710,7 @@ def ax_transit():
                     # `platformName` (Langtext). Kurzform bevorzugen, sonst Langtext.
                     _plat = o.get('platform') or o.get('platformName')
                     dep_platform = (str(_plat).strip() or None) if _plat not in (None, '') else None
-                    legs.append({
+                    _leg_out = {
                         'mode': 'walk' if is_walk else 'transit',
                         'line': None if is_walk else name, 'product': str(cls),
                         'fern': _leg_is_fern(name),
@@ -26700,7 +26724,15 @@ def ax_transit():
                         'delay_min': (None if is_walk or not dep_rt
                                       else _delay_min(dep_plan, dep_rt)),
                         'platform': None if is_walk else dep_platform,
-                    })
+                    }
+                    # EFA liefert die Leg-Geometrie direkt als `coords`
+                    # [[lat,lon],…] (S8: ~460 Punkte, verifiziert) → als
+                    # kompaktes `path` durchreichen (additiv; fehlt bei
+                    # Providern ohne Geometrie).
+                    _pp = _thin_path(leg.get('coords'))
+                    if _pp:
+                        _leg_out['path'] = _pp
+                    legs.append(_leg_out)
                 if legs:
                     out.append(legs)
             return out
@@ -26754,7 +26786,7 @@ def ax_transit():
                     # (Echtzeit). Echtzeit bevorzugen, sonst Plan, sonst None.
                     _trk = o.get('rtTrack') or o.get('track')
                     dep_platform = (str(_trk).strip() or None) if _trk not in (None, '') else None
-                    legs.append({
+                    _leg_out = {
                         'mode': 'walk' if is_walk else 'transit',
                         'line': None if is_walk else (name or '').strip(), 'product': cat,
                         'fern': is_fern,
@@ -26767,7 +26799,57 @@ def ax_transit():
                         'delay_min': (None if is_walk or not dep_rt
                                       else _delay_min(dep_plan, dep_rt)),
                         'platform': None if is_walk else dep_platform,
-                    })
+                    }
+                    # Leg-Geometrie via poly=1: RMV liefert sie als
+                    # `PolylineGroup.polylineDesc[].crd` (flache lon,lat-Float-
+                    # Liste, delta:false, dim:2 — live verifiziert 2026-07-04);
+                    # klassisches HAFAS-REST kennt auch `Polyline.crd` (ggf.
+                    # delta-kodiert = Differenzen zur vorigen Koordinate).
+                    # Defensiv: Achsen-Reihenfolge wird gegen die Origin-
+                    # Koordinate verprobt, µ°-Werte (>181) /1e6 skaliert. Bei
+                    # Zweifel KEIN path → iOS zeichnet die ehrliche Stopp-Gerade.
+                    try:
+                        _descs = []
+                        _pg = leg.get('PolylineGroup') or {}
+                        for _pd in (_pg.get('polylineDesc') or []):
+                            if isinstance(_pd, dict):
+                                _descs.append(_pd)
+                        _pl = leg.get('Polyline') or leg.get('polyline')
+                        if isinstance(_pl, dict):
+                            _descs.append(_pl)
+                        _pts = []
+                        for _pd in _descs:
+                            _crd = _pd.get('crd') or []
+                            _dim = int(_pd.get('dim') or 2)
+                            if _dim < 2 or len(_crd) < 2 * _dim:
+                                continue
+                            _vals = [float(x) for x in _crd]
+                            _pairs = list(zip(_vals[0::_dim], _vals[1::_dim]))
+                            if _pd.get('delta'):
+                                _acc, _x, _y = [], 0.0, 0.0
+                                for _dx, _dy in _pairs:
+                                    _x += _dx; _y += _dy
+                                    _acc.append((_x, _y))
+                                _pairs = _acc
+                            if _pairs and any(abs(v) > 181 for v in _pairs[0]):
+                                _pairs = [(px / 1e6, py / 1e6) for px, py in _pairs]
+                            # HAFAS-Konvention: (x=lon, y=lat) → [lat, lon].
+                            _pts.extend([py, px] for px, py in _pairs)
+                        if _pts:
+                            try:
+                                _ola, _olo = float(o.get('lat')), float(o.get('lon'))
+                                _p0 = _pts[0]
+                                if (abs(_p0[0] - _ola) + abs(_p0[1] - _olo)
+                                        > abs(_p0[1] - _ola) + abs(_p0[0] - _olo)):
+                                    _pts = [[b, a] for a, b in _pts]
+                            except (TypeError, ValueError):
+                                pass
+                            _pp = _thin_path(_pts)
+                            if _pp:
+                                _leg_out['path'] = _pp
+                    except Exception:
+                        pass
+                    legs.append(_leg_out)
                 if legs:
                     out.append(legs)
             return out
@@ -26974,6 +27056,9 @@ def ax_transit():
                     'originCoordLat': flat, 'originCoordLong': flon,
                     'date': _ar.strftime('%Y-%m-%d'), 'time': _ar.strftime('%H:%M'),
                     'searchForArrival': 1, 'numB': 0, 'numF': 4, 'rtMode': 'REALTIME',
+                    # Leg-Geometrie (Polyline.crd) mitliefern → iOS zeichnet die
+                    # Linie entlang der Gleise statt Luftlinie (s. _norm_rmv).
+                    'poly': 1,
                 }
                 if rmv_dest_ext:
                     rmv_params['destExtId'] = rmv_dest_ext
