@@ -227,7 +227,7 @@ def _requests_save_to_sb(reqs):
             'relation': r.get('relation') or 'family',
             'requester_name': r.get('requester_name'),
             'requester_avatar': r.get('requester_avatar'),
-            'created_at': r.get('created_at') or _dt.datetime.now().isoformat(),
+            'created_at': r.get('created_at') or _now_utc_z(),
         } for r in want.values()]
         for i in range(0, len(rows), 500):
             sb.table('family_requests').upsert(
@@ -334,7 +334,7 @@ def _shares_save_to_sb(shares):
                 'family_token': ft,
                 'relation': s.get('relation') or '',
                 'fields': s.get('fields') or [],
-                'created_at': s.get('created_at') or _dt.datetime.now().isoformat(),
+                'created_at': s.get('created_at') or _now_utc_z(),
                 'deleted': False,
             })
         if not rows:
@@ -407,6 +407,29 @@ def _parse_iso(s):
         return None
 
 
+def _iso_utc_z(v):
+    """Roher Zeitwert → kanonischer API-Zeitstempel 'YYYY-MM-DDTHH:MM:SSZ'
+    (UTC, ohne Mikrosekunden). DER eine Ausgabe-Weg für alle Status-Zeiten
+    (Audit 2026-07-05): vorher gingen SB-Werte roh per 25-Zeichen-Chop raus —
+    bei Mikrosekunden ('…T10:30:00.123456+00:00') schnitt das den Offset ab
+    und ließ verstümmelte Bruchteile stehen, iOS-Parser scheiterten.
+    Unparsebares wird UNGEKÜRZT durchgereicht (nie mitten im String choppen),
+    None bleibt None."""
+    if v is None:
+        return None
+    d = _parse_iso(v)
+    if d is not None:
+        return d.strftime('%Y-%m-%dT%H:%M:%SZ')
+    return _iso_or_none(v)
+
+
+def _now_utc_z():
+    """Jetzt als kanonischer API-Zeitstempel (UTC-Z, sekundengenau) — statt
+    datetime.now().isoformat() (naiv-lokal + Mikrosekunden, Format hing vom
+    Container-TZ ab)."""
+    return _dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
 # Last-known-good Status-Cache pro (crew_token, granted-fields) — Privacy:
 # der Fieldset ist Teil des Keys, damit ein Family-Member mit weniger Grants
 # nie den volleren Status eines anderen Members serviert bekommt. Einträge
@@ -466,7 +489,7 @@ def _fallback_next_tour_from_disk(status, crew_token, allowed_fields):
         status['today_route_label'] = _route_label_cities('-'.join(chain))
         st = ev.get('ical_start_iso')
         if st:
-            status['next_flight_etd_iso'] = str(st)[:25]
+            status['next_flight_etd_iso'] = _iso_utc_z(st)
         return True
     return False
 
@@ -538,7 +561,10 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
             _pl = _app_attr('_profile_load')
             if callable(_pl):
                 full = _pl(crew_token) or {}
-                status['last_seen_iso'] = full.get('_updated_at')
+                # _updated_at kommt je nach Pfad als SB-timestamptz (Mikro-
+                # sekunden + Offset) oder Disk-isoformat (naiv) → kanonisch
+                # UTC-Z ausgeben, iOS soll nie Format-Raten müssen.
+                status['last_seen_iso'] = _iso_utc_z(full.get('_updated_at'))
     except Exception as e:
         src_fail = True
         _log().info(f'[family-watch] profile_read_skip {type(e).__name__}')
@@ -578,7 +604,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                 status['next_flight_arr_city'] = _iata_city_name(mleg.group(2))
                 st = br.get('ical_start')
                 if st:
-                    status['next_flight_etd_iso'] = str(st)[:25]
+                    status['next_flight_etd_iso'] = _iso_utc_z(st)
                 break
         except Exception as e:
             src_fail = True
@@ -632,8 +658,8 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                 if is_flight_today:
                     today_chain = list(chain)
                     today_dep, today_arr = chain[0], chain[-1]
-                    today_dep_iso = _iso_or_none(row.get('ical_start'))
-                    today_arr_iso = _iso_or_none(row.get('ical_end'))
+                    today_dep_iso = _iso_utc_z(row.get('ical_start'))
+                    today_arr_iso = _iso_utc_z(row.get('ical_end'))
                     # In-Flight-Fenster: NOW zwischen Dienst-Start und -Ende. Beide ISO
                     # mit Zone (Upload speichert Europe/Berlin→UTC). Fehlt das Ende →
                     # grobes Fenster Start … Start+10h (Langstrecke abgedeckt).
@@ -798,7 +824,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     # as_of = ehrliches Frische-Feld: Zeitpunkt, zu dem dieser Status berechnet
     # wurde. Bei einem Cache-Hit unten trägt der Status das ÄLTERE as_of seines
     # erfolgreichen Reads — die App kann „Stand von HH:MM" zeigen.
-    status['as_of'] = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds')
+    status['as_of'] = _dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     cache_key = (crew_token, frozenset(allowed_fields))
     if not src_fail:
         # Voll erfolgreicher Read → als last-known-good merken (auch ein
@@ -1180,7 +1206,7 @@ def family_share_list(token):
             'family_relation': s.get('relation'),
             'avatar_url': prof.get('avatar_url'),
             'fields': [f for f in (s.get('fields') or []) if f in ALLOWED_FIELDS],
-            'created_at': s.get('created_at'),
+            'created_at': _iso_utc_z(s.get('created_at')),
         })
     return jsonify({'grants': grants, 'count': len(grants)})
 
@@ -1216,7 +1242,7 @@ def family_share_grant(token):
         if s.get('crew_token') == token and s.get('family_token') == family_token:
             s['fields'] = fields
             s['relation'] = relation
-            s['updated_at'] = _dt.datetime.now().isoformat()
+            s['updated_at'] = _now_utc_z()
             found = True
             break
     if not found:
@@ -1225,7 +1251,7 @@ def family_share_grant(token):
             'family_token': family_token,
             'relation': relation,
             'fields': fields,
-            'created_at': _dt.datetime.now().isoformat(),
+            'created_at': _now_utc_z(),
         })
     if not _shares_save(shares):
         return jsonify({'ok': False, 'error': 'persist_failed'}), 500
@@ -1254,7 +1280,7 @@ def family_request_create(family_token):
         'crew_token': crew_token, 'family_token': family_token, 'relation': relation,
         'requester_name': (fam_prof.get('name') or 'Familie'),
         'requester_avatar': fam_prof.get('avatar_url'),
-        'created_at': _dt.datetime.now().isoformat(),
+        'created_at': _now_utc_z(),
     })
     _requests_save(reqs)
     return jsonify({'ok': True})
@@ -1271,7 +1297,7 @@ def family_request_pending(crew_token):
         'requester_name': r.get('requester_name') or 'Familie',
         'requester_avatar': r.get('requester_avatar'),
         'relation': r.get('relation') or 'family',
-        'created_at': r.get('created_at'),
+        'created_at': _iso_utc_z(r.get('created_at')),
     } for r in reqs if r.get('crew_token') == crew_token]
     return jsonify({'ok': True, 'requests': out})
 
@@ -1304,7 +1330,7 @@ def family_request_approve(crew_token):
             # Anzeigename der Familien-Person mitnehmen (sonst zeigte die „Familie"-
             # Verwaltung nur ein Token-Fragment, User #48 „hat keinen Namen").
             'requester_name': match.get('requester_name'),
-            'created_at': _dt.datetime.now().isoformat(),
+            'created_at': _now_utc_z(),
         })
         _shares_save(shares)
     # Genuine Delete: die genehmigte Anfrage gezielt aus SB entfernen (#7).

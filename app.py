@@ -9729,7 +9729,11 @@ def _profile_save(token, profile, full_disk_payload=None):
     if p:
         payload = full_disk_payload if full_disk_payload is not None else {
             'token': token, 'profile': profile,
-            '_updated_at': datetime.now().isoformat(),
+            # UTC-Z sekundengenau (Audit 2026-07-05): _updated_at wird als
+            # last_seen_iso an die Family-Watch ausgeliefert — vorher naiv-
+            # lokales isoformat() mit Mikrosekunden, das iOS-seitig ein
+            # nicht-toleranter ISO-Parser nicht verstand.
+            '_updated_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         }
         try:
             _atomic_write_json(p, payload)
