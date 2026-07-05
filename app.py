@@ -23649,6 +23649,15 @@ _FRA_STATUS_DE = {
     '已降落': 'Gelandet', '降落': 'Gelandet', '抵达': 'Gelandet',
     '取消': 'Annulliert', '已取消': 'Annulliert', '延误': 'Verspätet',
     '准时': 'Pünktlich', '预计': 'Erwartet', '计划': 'Geplant',
+    # Live verifiziert 2026-07-05 (Vergangenheits-Seiten + Arrivals-Filter-Feed
+    # liefern weitere CJK-Varianten — vorher fielen sie auf '' und die Zeile
+    # verlor ihren IST-Status → delay_known blieb fälschlich unbekannt):
+    '已着陆': 'Gelandet',           # gelandet (Varianten-Schreibweise)
+    '至机位': 'Gelandet',           # on position / at gate
+    '托运行李领取': 'Gelandet',      # baggage claim → definitiv angekommen
+    '在飞行中': 'Unterwegs',        # in flight (Ankunfts-Kontext)
+    '延誤的航班': 'Verspätet',       # verspäteter Flug (traditionell)
+    '延误的航班': 'Verspätet',       # verspäteter Flug (vereinfacht)
 }
 # Fraport liefert ZUSÄTZLICH englische Status-Strings (approaching/landed/departed
 # /boarding…). KONTEXT IST KRITISCH: bei einer ANKUNFT heißt `departed`, dass der
@@ -23669,6 +23678,10 @@ _EN_STATUS_ARR = {   # Ankunfts-Kontext
 }
 _EN_STATUS_DEP = {   # Abflugs-Kontext
     'departed': 'Abgeflogen', 'lifted off': 'Abgeflogen', 'airborne': 'Abgeflogen',
+    # Fraport-DE „Position verlassen" = off-blocks/Pushback → der Flug ist weg
+    # (Vergangenheits-Seiten tragen den Status; ohne Mapping stünde er als
+    # „anstehend" auf der Tafel und ohne IST-Signal im Warehouse).
+    'position verlassen': 'Abgeflogen',
 }
 def _de_flight_status(raw, is_arr=False):
     """Fraport-Status → sauberes Deutsch, ANKUNFTS-/ABFLUGS-bewusst. Bekannte CJK-
@@ -23706,7 +23719,21 @@ def _departed_status(stored, cancelled, is_arr):
     return s
 
 
-def _fetch_fra_flights(flight_type='departure', max_pages=3):
+# Wie viele VERGANGENHEITS-Seiten (page=-1, -2, …) der Fraport-Feed mitliest.
+# WAREHOUSE-ROOT-CAUSE-FIX 2026-07-05 („LH918/LH919/LH1455 landen NIE in
+# airport_delay_obs"): der Fraport-Feed ist NOW-relativ — Seite 1 beginnt bei
+# „jetzt", gelandete/abgeflogene Flüge wandern BINNEN MINUTEN auf negative
+# Seiten (live verifiziert: `minpage:-60`, page=-1 trägt die Flüge der letzten
+# ~15-25 min inkl. finalem Status/esti/Reg). Der bisherige Scrape (nur Seiten
+# 1..N) sah Vergangenheit also NIE; persistiert wurde nur, was in der
+# Minuten-Lücke „sched gerade passiert, aber noch auf Seite 1" von einem
+# 10-min-Poll zufällig erwischt wurde → Ankünfte fehlten fast komplett,
+# Abflüge lückenhaft. 6 Seiten ≈ 150 Flüge ≈ ~2 h Vergangenheit — deckt jede
+# Poll-Lücke sicher ab (In-Memory-Store + SB akkumulieren den Rest des Tages).
+_FRA_PAST_PAGES = 6
+
+
+def _fetch_fra_flights(flight_type='departure', max_pages=3, past_pages=0):
     # `requests` ist in app.py NICHT module-level importiert → lokaler Import.
     # flight_type='arrival' → Fraport-Filter-Endpoint; `iata`/`apname` ist dann
     # der HERKUNFTS-Flughafen (iOS labelt "von X" via `type`).
@@ -23714,7 +23741,6 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
         import requests
     except Exception:
         return None
-    out = []
     base = 'https://www.frankfurt-airport.com/de/_jcr_content.flights.json'
     if flight_type == 'arrival':
         base = base + '/filter'
@@ -23723,56 +23749,85 @@ def _fetch_fra_flights(flight_type='departure', max_pages=3):
                       'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148',
         'Accept': 'application/json',
     }
+
+    def _fetch_page(page):
+        """(normalisierte Rows, Roh-Anzahl) einer Feed-Seite oder None bei
+        HTTP-Fehler. page=1 ohne Param (wie die echte Webseite), sonst ?page=N —
+        auch NEGATIV (Vergangenheit); page=0 existiert nicht (Fraport coerct auf 1)."""
+        params = {}
+        if flight_type == 'arrival':
+            # FIX 2026-06-25: Fraport-Filter-Param ist `flighttype=arrivals`
+            # (so ruft die echte Ankunfts-Seite ankuenfte.html den /filter-
+            # Endpoint auf). Der bisherige `type=arrival` wurde von Fraport
+            # IGNORIERT → der Endpoint lieferte ABFLÜGE, die wir fälschlich als
+            # Ankünfte zeigten (FRA-Ankunftstafel = Abflüge mit Zielen/„Boarding").
+            params['flighttype'] = 'arrivals'
+        if page != 1:
+            params['page'] = page
+        r = requests.get(base, params=params, headers=headers, timeout=8)
+        if r.status_code != 200:
+            return None
+        data = (r.json() or {}).get('data') or []
+        rows = []
+        for f in data:
+            # Bahn/Bus (LH Express Rail / AIRail ICE) raus — nur Flieger.
+            # Roh-Dict prüfen (ac/iata/apname/reg) BEVOR normalisiert wird.
+            if _is_rail_or_bus(f):
+                continue
+            rows.append({
+                'airline': (f.get('al') or '').strip(),
+                'airline_name': (f.get('alname') or '').strip(),
+                'flight': (f.get('fnr') or '').replace(' ', ''),
+                # bei Ankunft = Herkunft, bei Abflug = Ziel.
+                'dest_iata': (f.get('iata') or '').strip(),
+                # CJK/nicht-lateinische Stadtnamen → IATA-Code-Fallback
+                # (harte iOS-Anforderung, kein '多特蒙德' auf der Tafel).
+                'dest_name': _clean_city_name(f.get('apname'), f.get('iata')),
+                'sched': f.get('sched'),
+                # `esti` = geschätzte Zeit → ECHTE Verspätung (esti vs sched).
+                # `s` (Fraport-Delay-Flag) ist bei Vorab-Flügen immer False,
+                # daher unbrauchbar → wir rechnen aus esti. Auf VERGANGENHEITS-
+                # Seiten ist esti die IST-Zeit (tatsächlich gelandet/abgeflogen).
+                'esti': f.get('esti'),
+                'delay_min': _fra_delay_min(f.get('sched'), f.get('esti')),
+                'gate': (f.get('gate') or '').strip(),
+                'terminal': (f.get('terminal') or '').strip(),
+                'hall': (f.get('halle') or '').strip(),
+                'status': _de_flight_status(f.get('status'), is_arr=(flight_type == 'arrival')),
+                'delayed': (_fra_delay_min(f.get('sched'), f.get('esti'))
+                            >= _PUNCTUALITY_DELAY_THRESHOLD_MIN),
+                'reg': (f.get('reg') or '').strip(),
+                'aircraft': (f.get('ac') or '').strip(),
+            })
+        return rows, len(data)
+
+    out = []
+    # VERGANGENHEIT zuerst (Seiten -past_pages..-1, chronologisch aufsteigend
+    # zusammengesetzt): NUR so sieht der Poller gelandete Ankünfte/abgeflogene
+    # Abflüge mit finalem Status/esti/Reg — die Basis der Warehouse-Persistenz
+    # (`_merge_into_delay_store` persistiert nur `passed`-Flüge).
+    past_blocks = []
+    for page in range(-1, -int(past_pages or 0) - 1, -1):
+        try:
+            got = _fetch_page(page)
+        except Exception:
+            got = None
+        if not got or not got[1]:
+            break
+        past_blocks.append(got[0])
+        if got[1] < 25:
+            break                       # Feed-Anfang erreicht
+    for block in reversed(past_blocks):
+        out.extend(block)
     for page in range(1, max_pages + 1):
         try:
-            params = {}
-            if flight_type == 'arrival':
-                # FIX 2026-06-25: Fraport-Filter-Param ist `flighttype=arrivals`
-                # (so ruft die echte Ankunfts-Seite ankuenfte.html den /filter-
-                # Endpoint auf). Der bisherige `type=arrival` wurde von Fraport
-                # IGNORIERT → der Endpoint lieferte ABFLÜGE, die wir fälschlich als
-                # Ankünfte zeigten (FRA-Ankunftstafel = Abflüge mit Zielen/„Boarding").
-                params['flighttype'] = 'arrivals'
-            if page > 1:
-                params['page'] = page
-            r = requests.get(base, params=params, headers=headers, timeout=8)
-            if r.status_code != 200:
-                break
-            data = (r.json() or {}).get('data') or []
-            if not data:
-                break
-            for f in data:
-                # Bahn/Bus (LH Express Rail / AIRail ICE) raus — nur Flieger.
-                # Roh-Dict prüfen (ac/iata/apname/reg) BEVOR normalisiert wird.
-                if _is_rail_or_bus(f):
-                    continue
-                out.append({
-                    'airline': (f.get('al') or '').strip(),
-                    'airline_name': (f.get('alname') or '').strip(),
-                    'flight': (f.get('fnr') or '').replace(' ', ''),
-                    # bei Ankunft = Herkunft, bei Abflug = Ziel.
-                    'dest_iata': (f.get('iata') or '').strip(),
-                    # CJK/nicht-lateinische Stadtnamen → IATA-Code-Fallback
-                    # (harte iOS-Anforderung, kein '多特蒙德' auf der Tafel).
-                    'dest_name': _clean_city_name(f.get('apname'), f.get('iata')),
-                    'sched': f.get('sched'),
-                    # `esti` = geschätzte Zeit → ECHTE Verspätung (esti vs sched).
-                    # `s` (Fraport-Delay-Flag) ist bei Vorab-Flügen immer False,
-                    # daher unbrauchbar → wir rechnen aus esti.
-                    'esti': f.get('esti'),
-                    'delay_min': _fra_delay_min(f.get('sched'), f.get('esti')),
-                    'gate': (f.get('gate') or '').strip(),
-                    'terminal': (f.get('terminal') or '').strip(),
-                    'hall': (f.get('halle') or '').strip(),
-                    'status': _de_flight_status(f.get('status'), is_arr=(flight_type == 'arrival')),
-                    'delayed': (_fra_delay_min(f.get('sched'), f.get('esti'))
-                                >= _PUNCTUALITY_DELAY_THRESHOLD_MIN),
-                    'reg': (f.get('reg') or '').strip(),
-                    'aircraft': (f.get('ac') or '').strip(),
-                })
-            if len(data) < 25:
-                break
+            got = _fetch_page(page)
         except Exception:
+            break
+        if got is None or not got[1]:
+            break
+        out.extend(got[0])
+        if got[1] < 25:
             break
     return out
 
@@ -25362,7 +25417,13 @@ def _fra_board_cached(flight_type):
     # Langstrecken), aus dem Fenster — nach dem "Nur LH"-Filter fehlten sie ganz.
     # Gleiche Tiefe wie die Tages-Tafel (`_fra_day_board_cached`), damit ALLE
     # echten Flüge des Tages sichtbar sind. KEINE Erfindung — nur nicht mehr droppen.
-    flights = _fetch_fra_flights(flight_type, max_pages=20)
+    # + VERGANGENHEITS-Seiten (siehe _FRA_PAST_PAGES): gelandete/abgeflogene Flüge
+    # wandern binnen Minuten auf negative Feed-Seiten — ohne sie sah der Poller
+    # Ankünfte praktisch nie und die Warehouse-Historie blieb löchrig. Die
+    # Display-Seite filtert Vergangenes ohnehin (raus aus „anstehend", rein in
+    # „Früher heute") — hier geht es um die Persistenz.
+    flights = _fetch_fra_flights(flight_type, max_pages=20,
+                                 past_pages=_FRA_PAST_PAGES)
     if flights is None:
         return None
     _AIRPORT_BOARD_CACHE[ckey] = (_t.time(), flights)
@@ -25455,8 +25516,11 @@ def _fra_day_board_cached(flight_type='departure'):
     cached = _AIRPORT_DAY_CACHE.get(ckey)
     if cached and (_t.time() - cached[0]) < _AIRPORT_DAY_TTL:
         return cached[1]
-    # Viele Seiten → so viel vom Tag wie Fraport ausliefert.
-    flights = _fetch_fra_flights(flight_type, max_pages=20)
+    # Viele Seiten → so viel vom Tag wie Fraport ausliefert — inkl. der
+    # VERGANGENHEITS-Seiten (negative Pages), sonst besteht die „Tages"-Tafel
+    # nur aus Zukunft und die Pünktlichkeits-Stichprobe hängt am Poll-Zufall.
+    flights = _fetch_fra_flights(flight_type, max_pages=20,
+                                 past_pages=_FRA_PAST_PAGES)
     if flights is None:
         return None
     # Betriebstag-Start = heute 05:00 Ortszeit (Europe/Berlin).
@@ -26745,6 +26809,18 @@ def ax_flight_info(flightno):
                     o.get('max_delay_min'), o.get('cancelled'),
                     o.get('esti'), o.get('status'), obs_is_arr)
                 o['airport'] = (o.get('airport') or '').split('#', 1)[0]   # Store-Key säubern
+                if obs_is_arr:
+                    # RICHTUNGS-FIX 2026-07-05 (LH1455/LH919): gibt es NUR eine
+                    # Ankunfts-Row ('<AP>#ARR'), ist `airport` das ZIEL und
+                    # `dest_iata` die HERKUNFT — ohne Entspiegelung stünde
+                    # origin/dest vertauscht (LH1455 TIA→FRA wurde als „FRA→TIA"
+                    # serviert und der Dual-Side-Resolver suchte an den falschen
+                    # Flughäfen). dest_name der ARR-Row ist der HERKUNFTS-Name →
+                    # nicht als Ziel-Name ausgeben (ehrlich None statt falsch).
+                    _arr_ap = o.get('airport')
+                    o['airport'] = (o.get('dest_iata') or '').strip() or None
+                    o['dest_iata'] = _arr_ap
+                    o['dest_name'] = None
                 # Letzte beobachtete Maschine: jüngster Record mit reg/type.
                 ac_row = next((x for x in rows if (x.get('reg') or x.get('type_code'))), None)
                 # Tail-Historie über die letzten Tage (dedupe nach reg, jüngste zuerst).
@@ -27928,7 +28004,7 @@ def airport_board(token):
         _now_utc = _dtp.now(_tzp.utc)
         _stale_cut = _now_utc - _tdp(minutes=90)
         _gone = {'geschlossen', 'gestartet', 'abgeflogen', 'departed', 'gelandet',
-                 'landed', 'closed', 'left', 'ges.'}
+                 'landed', 'closed', 'left', 'ges.', 'position verlassen'}
         def _is_past(f):
             st = (f.get('status') or '').strip().lower()
             bt = _board_dt(f.get('esti')) or _board_dt(f.get('sched'))

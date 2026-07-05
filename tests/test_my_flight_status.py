@@ -24,6 +24,16 @@ import blueprints.aerox_data_blueprint as BP
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
+    # SYS.MODULES-PIN (Order-Kontamination, 2026-07-05): test_calculation.py
+    # tauscht sys.modules['app'] per Reimport-Trick aus. Die Blueprints lösen
+    # `_life_app('_flight_obs_merged')` aber zur CALL-Zeit über sys.modules['app']
+    # auf — unsere patch.object(A, …)-Mocks (A = Import zur Collection-Zeit)
+    # liefen danach ins Leere (mock.call_args == None; 8 Fails NUR im Full-Run,
+    # isoliert alles grün). Für die Dauer jedes Tests dieses Files das eigene
+    # A-Modul pinnen, danach den vorherigen Zustand wiederherstellen.
+    import sys
+    _prev_app_mod = sys.modules.get('app')
+    sys.modules['app'] = A
     A._FLIGHT_MERGE_CACHE.clear()
     try:
         BP._LIFECYCLE_MEMO.clear()
@@ -31,6 +41,8 @@ def _clear_caches():
         pass
     yield
     A._FLIGHT_MERGE_CACHE.clear()
+    if _prev_app_mod is not None:
+        sys.modules['app'] = _prev_app_mod
 
 
 @pytest.fixture

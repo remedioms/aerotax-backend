@@ -2932,6 +2932,49 @@ def _progress_along_route(dep_iata, dst_iata, pos):
     return round(max(0.0, min(1.0, done / total)), 3)
 
 
+def _sb_day_reg(flight_no, date):
+    """Tail/Typ/Route eines Fluges für EXAKT einen Flugtag DIREKT aus den
+    SB-Tages-Rows (`airport_delay_obs`, flight+date, airport-agnostisch) — der
+    gleiche Lookup, den /api/ax/flight-info macht. Der Dual-Side-Resolver
+    (`_flight_obs_merged`) braucht dep/arr-IATA als Store-Keys und findet ohne
+    sie NICHTS; hier reicht die Flugnummer. NUR echte Beobachtungen des
+    angefragten Tages — nie ein Tail eines anderen Datums (stale Reg wäre eine
+    fremde Maschine). → (reg, type_code, dep_iata, arr_iata) — alles None-safe.
+
+    ARR-Rows ('<AP>#ARR') sind gespiegelt: airport=ZIEL, dest_iata=HERKUNFT —
+    wird hier entspiegelt. Dep-Row-Reg gewinnt (dort tail-gefüllt am
+    verlässlichsten), sonst die erste Row mit Reg."""
+    fn = (flight_no or '').replace(' ', '').upper().strip()
+    d = (date or '').strip()[:10]
+    sb = _life_app('sb')
+    if sb is None or len(fn) < 3 or not d:
+        return None, None, None, None
+    try:
+        r = (sb.table('airport_delay_obs').select('*')
+             .eq('flight', fn).eq('date', d)
+             .order('updated_at', desc=True).limit(20).execute())
+        rows = r.data or []
+    except Exception:
+        rows = []
+    reg = tc = dep = arr = None
+    reg_from_dep = False
+    for row in rows:
+        ap = (row.get('airport') or '').upper().strip()
+        is_arr = '#' in ap
+        ap_clean = ap.split('#', 1)[0] or None
+        other = ((row.get('dest_iata') or '').upper().strip() or None)
+        r_dep = other if is_arr else ap_clean
+        r_arr = ap_clean if is_arr else other
+        dep = dep or r_dep
+        arr = arr or r_arr
+        rg = ((row.get('reg') or '').strip().upper() or None)
+        if rg and (reg is None or (not reg_from_dep and not is_arr)):
+            reg = rg
+            reg_from_dep = not is_arr
+            tc = ((row.get('type_code') or '').strip().upper() or tc)
+    return reg, tc, dep, arr
+
+
 def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None):
     """KERN-Trick (#1): (a) welche Maschine ist meinem Abflug zugeteilt (Reg aus
     Warehouse/Live-Board des Abflugs, gratis); (b) wo ist dieselbe Reg GERADE —
@@ -2954,13 +2997,21 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None):
     }
     my = (merged_fn(flight_no, date=date, dep_iata=dep, free_only=True)
           if merged_fn else None)
-    # Warehouse-Reg bevorzugt; fehlt sie (Flug noch nicht gescrapt), den vom Client
-    # mitgegebenen ECHTEN Roster-Tail als Hint nutzen (Owner 2026-07-05: „die maschine
-    # ist live warum wird sie nicht angezeigt" — ohne Reg-Match blieb die Karte leer,
-    # obwohl der Flieger via ADS-B live auffindbar ist). Nie geraten: nur ein echter,
-    # vom Roster/Board bekannter Tail.
-    reg = (my or {}).get('reg') or (str(reg_hint or '').strip().upper() or None)
+    # Reg-Kaskade — NIE geraten, nur echte Quellen, in dieser Reihenfolge:
+    #   1) Dual-Side-Merge (Live-Board + Store des heutigen Tages),
+    #   2) SB-Tages-Rows des EXAKTEN Datums (wie /flight-info — der Merge braucht
+    #      Store-Keys/Airports und sieht airport-agnostische SB-Rows nicht),
+    #   3) vom Client mitgegebener ECHTER Roster-Tail (Owner 2026-07-05: „die
+    #      maschine ist live warum wird sie nicht angezeigt" — ohne Reg-Match
+    #      blieb die Karte leer, obwohl der Flieger via ADS-B auffindbar ist).
+    reg = (my or {}).get('reg') or None
     ac_type = (my or {}).get('aircraft') or None
+    if not reg:
+        _sb_reg, _sb_tc, _sb_dep, _sb_arr = _sb_day_reg(flight_no, date)
+        reg = _sb_reg
+        ac_type = ac_type or _sb_tc
+    if not reg:
+        reg = (str(reg_hint or '').strip().upper() or None)
     sched_dep = (my or {}).get('sched_dep')
     if reg and not ac_type:
         # Typecode gratis aus der gebackenen aircraft-DB (für den Turnaround-Puffer).
@@ -3090,27 +3141,42 @@ def ax_flight_inbound_chain(token):
 @aerox_data_bp.route('/api/ax/flight-live/<token>', methods=['GET'])
 def ax_flight_live(token):
     """#3 Live-Track der EIGENEN Maschine für die In-Flight-Karte. Query:
-    flight_no, date, reg (optional). Reg→Hex→OpenSky-Position + free-first-Route,
+    flight_no, date, reg (optional, echter Roster-Tail — Owner-Algorithmus
+    „Plan sagt D-ABYO → Reg→Hex→ADS-B findet ihn, wo auch immer er ist"),
+    dep_iata/arr_iata (optional, Leg-Airports fürs Board-/Store-Keying).
+    Reg→Hex→OpenSky-Position + free-first-Route,
     dazu dep/dest (IATA+Stadt), sched/est-Ankunft, Ankunfts-Delay, Ziel-Gate und
     Großkreis-Fortschritt 0..1. Gratis, cachebar, iOS pollt ~30–60 s."""
     from flask import request
     flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
     date = (request.args.get('date') or '').strip()[:10] or None
     reg = (request.args.get('reg') or '').strip().upper() or None
+    # Optionale Leg-Airports vom Client (Roster kennt sie) — damit kann der
+    # Dual-Side-Merge die richtigen Boards/Store-Keys scannen. Ohne sie sah
+    # `_flight_obs_merged` früher NICHTS (keine Airports = keine Store-Keys)
+    # und die Kette starb an reg=null, obwohl das Warehouse den Tag kannte.
+    q_dep = _norm_iata(request.args.get('dep_iata'))
+    q_arr = _norm_iata(request.args.get('arr_iata'))
     if len(flight_no) < 3:
         return jsonify({'ok': False, 'error': 'need_flight_no'}), 400
-    mkey = ('live', flight_no, date or '', reg or '')
+    mkey = ('live', flight_no, date or '', reg or '', q_dep or '', q_arr or '')
     memo = _memo_get(mkey)
     if memo is not None:
         return jsonify(memo)
     merged_fn = _life_app('_flight_obs_merged')
-    my = merged_fn(flight_no, date=date, free_only=True) if merged_fn else None
+    my = (merged_fn(flight_no, date=date, dep_iata=q_dep, arr_iata=q_arr,
+                    free_only=True) if merged_fn else None)
+    # Reg-Kaskade (nie geraten): expliziter ?reg= (echter Roster-Tail) →
+    # Dual-Side-Merge → SB-Tages-Rows des EXAKTEN Datums (wie /flight-info).
+    sb_dep = sb_arr = None
     if not reg:
         reg = (my or {}).get('reg') or None
+    if not reg:
+        reg, _sb_tc, sb_dep, sb_arr = _sb_day_reg(flight_no, date)
     hexid, cs, pos, route = _machine_live(reg) if reg else (None, None, None, None)
     src, dst = _route_endpoints(route)
-    dep = src or _norm_iata((my or {}).get('dep_iata'))
-    dest = dst or _norm_iata((my or {}).get('arr_iata'))
+    dep = src or _norm_iata((my or {}).get('dep_iata')) or q_dep or _norm_iata(sb_dep)
+    dest = dst or _norm_iata((my or {}).get('arr_iata')) or q_arr or _norm_iata(sb_arr)
     # Ankunfts-Seite (Zeiten/Delay/Gate) frisch für die konkrete Strecke.
     merged = (merged_fn(flight_no, date=date, dep_iata=dep, arr_iata=dest,
                         free_only=True) if merged_fn else None) or my or {}
