@@ -798,19 +798,30 @@ def get_adsb_state():
     _touch_watch(hex_param, registration=reg_param or None)
 
     # Cold-Start-Backfill: nach einem Cloud-Run-Restart ist der In-Memory-_CACHE
-    # leer — bevor wir externe APIs anfassen, holen wir die zuletzt persistierte
-    # Position (< 24h) aus aircraft_positions zurück in den Cache. So verschwinden
-    # Flieger NICHT mehr nach jedem Instanz-Wechsel. Best-effort: SB-down/Miss
-    # → wir fallen sauber weiter in die Live-Fetch-Kaskade.
+    # leer — die zuletzt persistierte Position (< 24h) aus aircraft_positions
+    # zurückholen. ABER (Root-Cause „Wo ist mein Flieger zeigt nichts", Owner
+    # 2026-07-05): dieser Early-Return servierte nach JEDEM Deploy/Restart eine
+    # Stunden-alte Position als „aktuell" und übersprang die Live-Kaskade komplett
+    # — während adsb.lol die Maschine LÄNGST live hatte (D-ABYO als DLH511 über
+    # Frankreich; Backfill zeigte den 2,3h-alten Atlantik-Punkt). Early-Return
+    # daher NUR noch, wenn der Backfill wirklich FRISCH ist (< 90s ≈ Live-Cache-
+    # TTL). Ältere Backfills werden als LETZTER Fallback hinter der Live-Kaskade
+    # benutzt (Ozean-/Coverage-Lücken überbrücken, ehrlich als stale markiert) —
+    # Live gewinnt immer.
     backfilled = _backfill_cache_from_sb(hex_param)
     if backfilled is not None:
-        return jsonify({
-            "hex": hex_param,
-            "position": backfilled["row"],
-            "fetched_at": backfilled["fetched_at"],
-            "cached": True,
-            "source": backfilled.get("source", "supabase-backfill"),
-        }), 200
+        try:
+            backfill_age = time.time() - float(backfilled.get("fetched_at") or 0)
+        except (TypeError, ValueError):
+            backfill_age = 1e9
+        if backfill_age < 90:
+            return jsonify({
+                "hex": hex_param,
+                "position": backfilled["row"],
+                "fetched_at": backfilled["fetched_at"],
+                "cached": True,
+                "source": backfilled.get("source", "supabase-backfill"),
+            }), 200
 
     # Backoff-Status für OpenSky tracken — wenn aktiv, OpenSky-Step
     # überspringen aber adsb.lol weiter probieren.
@@ -843,13 +854,12 @@ def get_adsb_state():
                       "reason": f"backoff_active({int(backoff_until - now)}s)"})
 
     # ─── Step 2: adsb.lol (wenn OpenSky nichts brauchbares lieferte) ───
-    # `row is None` heißt entweder Upstream-Fehler oder "kein Signal".
-    # Wir unterscheiden: bei Upstream-Fehler tried[-1].ok == False, dann
-    # macht adsb.lol Sinn. Bei "kein Signal" (ok=True, row=None) NICHT
-    # nochmal probieren — der Client soll "Maschine ist gerade nicht in
-    # der Luft" sehen, nicht eine zweite leere Antwort von einer anderen
-    # Quelle.
-    if row is None and tried and not tried[-1].get("ok"):
+    # AUCH bei OpenSky „ok, aber kein Signal" adsb.lol fragen (Änderung 2026-07-05):
+    # die Community-Coverage von adsb.lol ist real oft BESSER als OpenSky —
+    # Live-Fall D-ABYO/DLH511: adsb.lol sah die Maschine über Frankreich, während
+    # OpenSky leer war → der frühere Skip lieferte „kein Signal", obwohl der
+    # Flieger flog. Erst wenn BEIDE leer sind, ist „nicht in der Luft" ehrlich.
+    if row is None:
         try:
             row = _fetch_adsb_lol(hex_param)
             if row is not None:
@@ -890,6 +900,22 @@ def get_adsb_state():
             "stale_due_to_upstream_outage": True,
             "stale_age_seconds": int(time.time() - last_known["fetched_at"]),
             "source": last_known.get("source", "cache"),
+            "tried": tried,
+        }), 200
+
+    # ─── Step 3b: alter Supabase-Backfill als LETZTER Fallback (ehrlich stale
+    # markiert) — überbrückt Ozean-/Coverage-Lücken, in denen kein Upstream die
+    # Maschine sieht, ohne je frische Live-Daten zu verdrängen (die Kaskade oben
+    # hat Vorrang und lief bereits). ───
+    if backfilled is not None:
+        return jsonify({
+            "hex": hex_param,
+            "position": backfilled["row"],
+            "fetched_at": backfilled["fetched_at"],
+            "cached": True,
+            "stale_due_to_upstream_outage": True,
+            "stale_age_seconds": int(time.time() - float(backfilled.get("fetched_at") or time.time())),
+            "source": backfilled.get("source", "supabase-backfill"),
             "tried": tried,
         }), 200
 
