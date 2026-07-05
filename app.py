@@ -21572,6 +21572,13 @@ def unregister_push_apns():
     user_token = (body.get('token') or '').strip()
     if not user_token:
         return jsonify({'ok': False, 'error': 'missing token'}), 400
+    # SECURITY (Audit 2026-07-05): wie register-apns/prefs — Body-Token umgeht das
+    # Pfad-Binding-Gate → expliziter Bearer-Match VOR jedem Registry-Zugriff.
+    # Sonst könnte ein Angreifer mit beliebigem fremden user_token dessen
+    # APNs-/Expo-Registrierung leeren (Push-Abschalt-DoS: Opfer bekommt still
+    # keine DM-/Roster-Pushes mehr, bis die App sich neu registriert).
+    if not _request_bearer_matches(user_token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
     existing = _push_load(user_token) or {}
     if not existing:
         return jsonify({'ok': True, 'noop': True})
@@ -27202,6 +27209,32 @@ def ax_transit():
             except Exception:
                 return None
 
+        def _dec_hafas_poly(enc, prec=1e5):
+            """HAFAS-mgate-Leg-Geometrie `crdEncYX` = Google-Encoded-Polyline
+            (delta-kodiert, Reihenfolge lat,lon = „YX", Präzision 1e5 — live
+            gegen RMV verifiziert 2026-07-05: erster/letzter Punkt == Frankfurt
+            Hbf/Flughafen Regionalbahnhof). → [[lat,lon],…]; [] bei Müll."""
+            try:
+                pts, idx, la, lo = [], 0, 0, 0
+                while idx < len(enc):
+                    vals = []
+                    for _ in (0, 1):
+                        shift = result = 0
+                        while True:
+                            b = ord(enc[idx]) - 63
+                            idx += 1
+                            result |= (b & 0x1f) << shift
+                            shift += 5
+                            if b < 0x20:
+                                break
+                        vals.append(~(result >> 1) if (result & 1) else (result >> 1))
+                    la += vals[0]
+                    lo += vals[1]
+                    pts.append([la / prec, lo / prec])
+                return pts
+            except Exception:
+                return []
+
         # bahn.de hängt hinter Akamai-Bot-Protection → braucht Browser-ähnliche Header
         # (echte SPA-Header), sonst 403. Origin/Referer = die echte Fahrplan-Suche.
         _BAHN_HEADERS = {
@@ -27456,6 +27489,122 @@ def ax_transit():
                     out.append(legs)
             return out
 
+        def _mgate_iso(date_s, time_s):
+            """HAFAS-mgate-Zeiten: `HHMMSS` bzw. `DDHHMMSS` (Tages-Offset-Präfix
+            bei Über-Mitternacht), LOKAL Europe/Berlin; Basisdatum = con.date
+            (`YYYYMMDD`). → ISO mit Offset, None wenn unparsebar (NIE raten)."""
+            if not date_s or not time_s:
+                return None
+            try:
+                from zoneinfo import ZoneInfo as _Z
+                from datetime import datetime as _dt, timedelta as _td
+                t = str(time_s)
+                days = 0
+                if len(t) > 6:
+                    days, t = int(t[:-6]), t[-6:]
+                naive = _dt.strptime(f'{date_s}{t}', '%Y%m%d%H%M%S') + _td(days=days)
+                return naive.replace(tzinfo=_Z('Europe/Berlin')).isoformat()
+            except Exception:
+                return None
+
+        def _norm_rmv_mgate(data):
+            """RMV-EFA/HAFAS-mgate (www.rmv.de/auskunft/bin/jp/mgate.exe,
+            TripSearch) → normalisierte Leg-Listen, GLEICHE Form wie _norm_efa
+            (MVV). RECHERCHE 2026-07-05: einen öffentlichen EFA-Stil-Endpunkt
+            (XML_TRIP_REQUEST2) hat RMV NICHT (alle Kandidaten-Pfade 404/503,
+            /hapi braucht accessId-Key) — die eigene Web-Auskunft
+            (/auskunft/rmv/app) spricht mgate; deren AID ist öffentlich im
+            transport-apis-Repo dokumentiert. Live verifiziert (Frankfurt
+            Innenstadt → FRA Regionalbf: S8, Gleis 21, arrive-by, Polyline).
+            secL: type JNY = Fahrt, alles andere (WALK/TRSF/DEVI) = Fußweg/
+            Umstieg. Referenzen: dep/arr.locX → common.locL (crd x=lon·1e6,
+            y=lat·1e6), jny.prodX → common.prodL, jny.polyG.polyXL →
+            common.polyL[].crdEncYX. Zeiten: *TimeS=Plan, *TimeR=Echtzeit;
+            Gleis: dPlatfR vor dPlatfS (neuere Kerne: dPltf{R,S}.txt)."""
+            svc = ((data or {}).get('svcResL') or [{}])[0] or {}
+            err = svc.get('err')
+            if err not in (None, 'OK'):
+                # HAFAS-Kernel-Fehler (z.B. H9220 „keine Station nahe Ziel")
+                # sichtbar machen → Provider-Chain loggt ihn und geht weiter.
+                raise RuntimeError(f'mgate {err}: {str(svc.get("errTxt") or "")[:80]}')
+            res = svc.get('res') or {}
+            common = res.get('common') or {}
+            locL = common.get('locL') or []
+            prodL = common.get('prodL') or []
+            polyL = common.get('polyL') or []
+
+            def _loc(stop):
+                lx = (stop or {}).get('locX')
+                if isinstance(lx, int) and 0 <= lx < len(locL):
+                    return locL[lx] or {}
+                return {}
+
+            out = []
+            for con in res.get('outConL') or []:
+                base_date = con.get('date')
+                legs = []
+                for sec in con.get('secL') or []:
+                    typ = (sec.get('type') or '').upper()
+                    is_walk = typ != 'JNY'
+                    jny = sec.get('jny') or {}
+                    prod = {}
+                    px = jny.get('prodX')
+                    if isinstance(px, int) and 0 <= px < len(prodL):
+                        prod = prodL[px] or {}
+                    name = (prod.get('name') or prod.get('nameS') or '').strip() or None
+                    cls = prod.get('cls')
+                    # RMV-Produkt-Bitmaske: 1=ICE, 2=EC/IC → Fernverkehr.
+                    is_fern = (isinstance(cls, int) and bool(cls & 3)) or _leg_is_fern(name)
+                    dep = sec.get('dep') or {}
+                    arr = sec.get('arr') or {}
+                    o = _loc(dep)
+                    d = _loc(arr)
+                    ocrd = o.get('crd') or {}
+                    dep_plan = _mgate_iso(base_date, dep.get('dTimeS'))
+                    arr_plan = _mgate_iso(base_date, arr.get('aTimeS'))
+                    dep_rt = _mgate_iso(base_date, dep.get('dTimeR')) if dep.get('dTimeR') else None
+                    arr_rt = _mgate_iso(base_date, arr.get('aTimeR')) if arr.get('aTimeR') else None
+                    _plat = dep.get('dPlatfR') or dep.get('dPlatfS')
+                    if not _plat:
+                        _pl = dep.get('dPltfR') or dep.get('dPltfS')
+                        if isinstance(_pl, dict):
+                            _plat = _pl.get('txt')
+                    dep_platform = (str(_plat).strip() or None) if _plat not in (None, '') else None
+                    _leg_out = {
+                        'mode': 'walk' if is_walk else 'transit',
+                        'line': None if is_walk else name,
+                        'product': str(cls) if cls is not None else typ.lower(),
+                        'fern': is_fern,
+                        'from': o.get('name'), 'to': d.get('name'),
+                        'from_lat': (ocrd.get('y') / 1e6) if isinstance(ocrd.get('y'), (int, float)) else None,
+                        'from_lon': (ocrd.get('x') / 1e6) if isinstance(ocrd.get('x'), (int, float)) else None,
+                        'dep': dep_rt or dep_plan,
+                        'arr': arr_rt or arr_plan,
+                        'dep_planned': dep_plan,
+                        'arr_planned': arr_plan,
+                        'delay_min': (None if is_walk or not dep_rt
+                                      else _delay_min(dep_plan, dep_rt)),
+                        'platform': None if is_walk else dep_platform,
+                    }
+                    # Leg-Geometrie (getPolyline=1) → kompaktes `path` wie beim
+                    # MVV-EFA; bei Zweifel KEIN path (ehrliche Stopp-Gerade).
+                    try:
+                        _pts = []
+                        for _pix in ((jny.get('polyG') or {}).get('polyXL') or []):
+                            if isinstance(_pix, int) and 0 <= _pix < len(polyL):
+                                _enc = (polyL[_pix] or {}).get('crdEncYX')
+                                if _enc:
+                                    _pts.extend(_dec_hafas_poly(_enc))
+                        _pp = _thin_path(_pts)
+                        if _pp:
+                            _leg_out['path'] = _pp
+                    except Exception:
+                        pass
+                    legs.append(_leg_out)
+                if legs:
+                    out.append(legs)
+            return out
+
         def _norm_dbrest(data):
             """db-rest-Journeys → normalisierte Leg-Listen."""
             out = []
@@ -27670,6 +27819,56 @@ def ax_transit():
             except Exception:
                 rmv_params = None
 
+        # RMV-mgate (Rhein-Main, KEIN Key): die eigene Web-Auskunft des RMV
+        # (www.rmv.de/auskunft/rmv/app) spricht HAFAS-mgate auf www.rmv.de —
+        # öffentlich erreichbar, AID im transport-apis-Repo dokumentiert
+        # (public-transport/transport-apis, data/de/rmv-hafas-mgate.json).
+        # Deckt Frankfurt/Mainz/Wiesbaden/Darmstadt authoritativ ab, wo ohne
+        # RMV_ACCESS_ID-Key bisher GAR KEIN Provider ging (App fiel auf Apple-
+        # ETA ohne Legs zurück). Region-Gate wie MVV: nur Rhein-Main-Bbox
+        # (RMV-Verbundgebiet grob lat 49.3–50.95 / lon 7.6–9.8). Arrive-by =
+        # outFrwd:false; Fern (ICE/IC, Bits 1+2) schon per jnyFltrL raus,
+        # Post-Filter greift zusätzlich. Live verifiziert 2026-07-05.
+        in_rhein_main = (49.3 <= flat <= 50.95) and (7.6 <= flon <= 9.8)
+        rmv_mgate_body = None
+        efa_dbg['in_rhein_main'] = in_rhein_main
+        if in_rhein_main:
+            try:
+                from zoneinfo import ZoneInfo as _ZM
+                _tzm = _ZM('Europe/Berlin')
+                if arrival_s:
+                    _am = datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+                    _am = _am.astimezone(_tzm) if _am.tzinfo else _am.replace(tzinfo=_tzm)
+                else:
+                    _am = datetime.now(_tzm)
+                # Ziel auf den Flughafen-BAHNHOF snappen (FRA-Terminal-Zentrum =
+                # Vorfeld ohne Haltestelle → HAFAS H9220, live reproduziert).
+                _mlat, _mlon = tlat, tlon
+                _msnap = _snap_to_airport_rail(tlat, tlon)
+                if _msnap:
+                    _mlat, _mlon = _msnap[0], _msnap[1]
+                    efa_dbg['airport_rail_snap'] = _msnap[2]
+                # Produkt-Bitmaske (RMV): 1 ICE + 2 EC/IC = Fern; Rest (4 RE/RB,
+                # 8 S, 16 U, 32 Tram, 64/128 Bus, 256 Schiff, 512 AST,
+                # 1024 Seilbahn) = 2044.
+                rmv_mgate_body = {
+                    'ver': '1.18', 'lang': 'deu', 'ext': 'RMV.1',
+                    'auth': {'type': 'AID', 'aid': 'x0k4ZR33ICN9CWmj'},
+                    'client': {'id': 'RMV', 'type': 'WEB', 'name': 'webapp'},
+                    'svcReqL': [{'meth': 'TripSearch', 'req': {
+                        'depLocL': [{'lid': f'A=2@O=Zuhause@X={int(round(flon * 1e6))}@Y={int(round(flat * 1e6))}@'}],
+                        'arrLocL': [{'lid': f'A=2@O=Flughafen@X={int(round(_mlon * 1e6))}@Y={int(round(_mlat * 1e6))}@'}],
+                        'outDate': _am.strftime('%Y%m%d'), 'outTime': _am.strftime('%H%M%S'),
+                        'outFrwd': not bool(arrival_s),   # False = arrive-by
+                        'numF': 5, 'getPolyline': True, 'getPasslist': False,
+                        'jnyFltrL': [{'type': 'PROD', 'mode': 'INC',
+                                      'value': 2047 if want_fern else 2044}],
+                    }}],
+                }
+            except Exception as me:
+                rmv_mgate_body = None
+                efa_dbg['rmv_mgate_build_err'] = f'{type(me).__name__}: {str(me)[:140]}'
+
         # SCHLANKE Kette (User: „besser einfach RMV nutzen"): RMV deckt als
         # bundesweite DELFI-HAFAS GANZ DE ab → wird primäre Quelle. MVV-EFA bleibt
         # als verifiziertes München-Sicherheitsnetz davor (falls RMV mal lokale
@@ -27684,6 +27883,12 @@ def ax_transit():
         if rmv_params is not None:
             providers.append(('rmv', lambda: _norm_rmv(
                 _get_json('https://www.rmv.de/hapi/trip', rmv_params, 12))))
+        # Keyless RMV-mgate NACH dem keyed HAPI: mit Key bleibt alles wie
+        # bisher (HAPI zuerst), OHNE Key ist mgate der einzige Rhein-Main-
+        # Provider (Frankfurt bekam bisher gar keine Legs → Apple-Fallback).
+        if rmv_mgate_body is not None:
+            providers.append(('rmv_mgate', lambda: _norm_rmv_mgate(
+                _post_json('https://www.rmv.de/auskunft/bin/jp/mgate.exe', rmv_mgate_body, 12))))
 
         dbg = {'providers': [], 'efa': efa_dbg}
         journeys = None

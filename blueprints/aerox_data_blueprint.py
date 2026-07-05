@@ -221,7 +221,7 @@ def _route_from_obs(callsign):
     for fn in cands:
         try:
             r = (sb.table('airport_delay_obs')
-                 .select('date,airport,dest_iata,gate,terminal')
+                 .select('date,airport,dest_iata,gate,terminal,sched,esti')
                  .eq('flight', fn).gte('date', yest)
                  .order('date', desc=True).order('updated_at', desc=True)
                  .limit(6).execute())
@@ -232,10 +232,17 @@ def _route_from_obs(callsign):
                         if '#' not in (x.get('airport') or '')
                         and (x.get('date') in fresh_dates)), None)
             if dep and dep.get('dest_iata'):
-                return {'src': (dep.get('airport') or '').split('#', 1)[0],
-                        'dst': dep.get('dest_iata'),
-                        'gate': dep.get('gate'), 'terminal': dep.get('terminal'),
-                        'source': 'aerox_board', 'callsign': cs}
+                out = {'src': (dep.get('airport') or '').split('#', 1)[0],
+                       'dst': dep.get('dest_iata'),
+                       'gate': dep.get('gate'), 'terminal': dep.get('terminal'),
+                       'source': 'aerox_board', 'callsign': cs}
+                # Echte Tafel-Zeiten (station-lokal am Abflug-Airport) durchreichen
+                # — nur was die Tafel WIRKLICH kennt, nichts erfinden.
+                if dep.get('sched'):
+                    out['sched_dep'] = dep['sched']
+                if dep.get('esti'):
+                    out['est_dep'] = dep['esti']
+                return out
         except Exception:
             pass
     return None
@@ -418,26 +425,116 @@ def _bearing_deg(lat1, lon1, lat2, lon2):
         return None
 
 
+# AeroDataBox-Movement-Zeitfelder nach Verlässlichkeit. `actual`/`runway` sind
+# BEOBACHTETE Zeiten, `revised`/`predicted`/`estimated` sind die aktuelle
+# Erwartung, `scheduled` der Plan. Für die est-Sicht zählt actual mit (eine
+# beobachtete Zeit ist die beste „Schätzung"). NIE raten: fehlt das Feld im
+# Payload, bleibt es None.
+_ADB_ACTUAL_KEYS = ('actualTime', 'runwayTime')
+_ADB_EST_KEYS = ('actualTime', 'runwayTime', 'revisedTime', 'predictedTime',
+                 'estimatedTime')
+_ADB_SCHED_KEYS = ('scheduledTime',)
+
+
+def _adb_movement_val(mv, keys, which):
+    """AeroDataBox departure/arrival-Objekt → Zeit-String (`which` ∈ 'utc'|
+    'local'), erstes vorhandenes Feld aus `keys`. Beide Payload-Formen:
+    verschachtelte {'utc','local'}-Dicts UND flache '<key>Utc'/'<key>Local'-
+    Strings. None wenn nicht im Payload."""
+    for k in keys:
+        v = (mv or {}).get(k)
+        if isinstance(v, dict) and v.get(which):
+            return str(v[which]).strip()
+        flat = (mv or {}).get(k + ('Utc' if which == 'utc' else 'Local'))
+        if flat:
+            return str(flat).strip()
+    return None
+
+
+def _adb_ts(s):
+    """AeroDataBox-UTC-Zeitstring ('2026-07-04 09:35Z' oder ISO) → Unix-Epoche.
+    None bei fehlendem/unparsbarem Wert — nie raten."""
+    if not s:
+        return None
+    from datetime import datetime, timezone
+    t = str(s).strip().replace(' ', 'T').replace('Z', '+00:00')
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _adb_local_str(mv, keys):
+    """Station-LOKALE Payload-Zeit als ISO-String ('2026-07-04T09:35+01:00')
+    oder None. Für die Radar-UI (Owner: Abflug/Ankunft in Ortszeit)."""
+    s = _adb_movement_val(mv, keys, 'local')
+    return s.replace(' ', 'T') if s else None
+
+
+def _adb_leg_times(f):
+    """Zeit-Prioritäts-Sicht EINES AeroDataBox-Legs (Unix-Epoche, UTC):
+    dep/arr je actual > revised/predicted > scheduled. None = im Payload nicht
+    vorhanden (Unbekannt bleibt unbekannt)."""
+    dep = (f or {}).get('departure') or {}
+    arr = (f or {}).get('arrival') or {}
+    return {
+        'dep_actual': _adb_ts(_adb_movement_val(dep, _ADB_ACTUAL_KEYS, 'utc')),
+        'dep_est':    _adb_ts(_adb_movement_val(dep, _ADB_EST_KEYS, 'utc')),
+        'dep_sched':  _adb_ts(_adb_movement_val(dep, _ADB_SCHED_KEYS, 'utc')),
+        'arr_actual': _adb_ts(_adb_movement_val(arr, _ADB_ACTUAL_KEYS, 'utc')),
+        'arr_est':    _adb_ts(_adb_movement_val(arr, _ADB_EST_KEYS, 'utc')),
+        'arr_sched':  _adb_ts(_adb_movement_val(arr, _ADB_SCHED_KEYS, 'utc')),
+    }
+
+
 def _adb_flight_to_route(f, cs):
-    """AeroDataBox-Flight-Objekt → route-Dict (src/dst IATA+ICAO). None bei Müll."""
-    dep = ((f.get('departure') or {}).get('airport') or {})
-    arr = ((f.get('arrival') or {}).get('airport') or {})
+    """AeroDataBox-Flight-Objekt → route-Dict (src/dst IATA+ICAO). None bei Müll.
+    Reicht zusätzlich die ECHTEN Payload-Zeiten station-lokal durch (sched_dep/
+    sched_arr aus scheduledTime.local, est_dep/est_arr aus actual > revised >
+    predicted). Fehlt eine Zeit im Payload, fehlt das Feld — nie erfunden."""
+    dep_mv = (f.get('departure') or {})
+    arr_mv = (f.get('arrival') or {})
+    dep = (dep_mv.get('airport') or {})
+    arr = (arr_mv.get('airport') or {})
     src = (dep.get('iata') or '').upper() or None
     dst = (arr.get('iata') or '').upper() or None
     if not src or not dst:
         return None
-    return {
+    r = {
         'src': src, 'src_icao': (dep.get('icao') or '').upper() or None,
         'dst': dst, 'dst_icao': (arr.get('icao') or '').upper() or None,
         'callsign': cs, 'status': f.get('status'),
         'reg': ((f.get('aircraft') or {}).get('reg') or '').upper() or None,
     }
+    for key, mv, kinds in (('sched_dep', dep_mv, _ADB_SCHED_KEYS),
+                           ('est_dep', dep_mv, _ADB_EST_KEYS),
+                           ('sched_arr', arr_mv, _ADB_SCHED_KEYS),
+                           ('est_arr', arr_mv, _ADB_EST_KEYS)):
+        v = _adb_local_str(mv, kinds)
+        if v:
+            r[key] = v
+    return r
 
 
-def _adb_pick_active_leg(flights, cs, reg, track):
+def _adb_pick_active_leg(flights, cs, reg, track, now=None):
     """Aus mehreren AeroDataBox-Flügen (gleiche Nummer/Reg, mehrere Legs am Tag)
-    das AKTUELLE Leg wählen: 1) exakter reg-Match, 2) Status enroute/departed/
-    active, 3) Kurs-Match (dep→arr-Bearing ~ track ±70°), sonst der erste.
+    das AKTIVE Leg wählen — Owner-Beweisfoto EZY29CT (flog LGW→SKG, wir zeigten
+    das frühere LGW→ACE „bestätigt"): entscheidend ist die ZEIT-PRIORITÄT
+    actual > revised/predicted > scheduled AUS DEM BEZAHLTEN PAYLOAD, nicht
+    Listen-Reihenfolge oder Status-Strings:
+      1. Legs mit actual-Ankunft in der Vergangenheit sind ABGESCHLOSSEN.
+      2. Ein Leg OHNE actual-Ankunft bleibt aktiv — auch wenn sched_arr vorbei
+         ist (Owner: „nach soll zeit wenn verspätung oder irreg nicht das es
+         aus der soll zeit wegfällt").
+      3. Haben mehrere offene Legs lt. eigener actual/est-Zeit schon abgehoben,
+         gewinnt das SPÄTESTE (das spätere Leg ist der aktuelle Flug).
+      4. Ist keins nachweislich abgehoben: das zuletzt fällig gewordene Leg
+         (effektive Abflugzeit ≤ jetzt), sonst das nächste bevorstehende.
+    Nur wenn der Payload GAR KEINE Zeiten trägt: alter Fallback über Status →
+    Kurs-Match (dep→arr-Bearing ~ track ±70°) → erstes Leg (ambiguous).
     Rückgabe (route_dict, ambiguous_bool)."""
     routes = [(f, _adb_flight_to_route(f, cs)) for f in flights]
     routes = [(f, r) for f, r in routes if r]
@@ -447,9 +544,47 @@ def _adb_pick_active_leg(flights, cs, reg, track):
         return routes[0][1], False
     reg_u = (reg or '').upper()
     if reg_u:
-        for f, r in routes:
-            if r.get('reg') == reg_u:
-                return r, False
+        rm = [(f, r) for f, r in routes if r.get('reg') == reg_u]
+        if len(rm) == 1:
+            return rm[0][1], False
+        if rm:
+            # Mehrere Legs DERSELBEN Maschine (Normalfall bei Kurzstrecken-
+            # Rotationen) → NICHT das erste nehmen, die Zeit entscheidet.
+            routes = rm
+    now = time.time() if now is None else float(now)
+    legs = []
+    for f, r in routes:
+        t = _adb_leg_times(f)
+        dep_eff = (t['dep_actual'] if t['dep_actual'] is not None
+                   else t['dep_est'] if t['dep_est'] is not None
+                   else t['dep_sched'])
+        legs.append((f, r, t, dep_eff))
+    timed = [x for x in legs if any(v is not None for v in x[2].values())]
+    if timed:
+        open_legs = [x for x in timed
+                     if not (x[2]['arr_actual'] is not None
+                             and x[2]['arr_actual'] <= now)]
+        if not open_legs:
+            # Alle Legs lt. actual-Ankunft abgeschlossen → das zuletzt gelandete
+            # (ehrlichster Kandidat; das Geometrie-Gate im Resolver prüft weiter).
+            done = max(timed, key=lambda x: x[2]['arr_actual'])
+            return done[1], False
+
+        def _dep_ref(x):
+            return (x[2]['dep_actual'] if x[2]['dep_actual'] is not None
+                    else x[2]['dep_est'])
+        airborne = [x for x in open_legs
+                    if _dep_ref(x) is not None and _dep_ref(x) <= now]
+        if airborne:
+            return max(airborne, key=_dep_ref)[1], False
+        due = [x for x in open_legs if x[3] is not None and x[3] <= now]
+        if due:
+            return max(due, key=lambda x: x[3])[1], False
+        upcoming = [x for x in open_legs if x[3] is not None]
+        if upcoming:
+            return min(upcoming, key=lambda x: x[3])[1], False
+        # Offene Legs ganz ohne Abflugzeit → Status/Kurs-Fallback nur über sie.
+        routes = [(f, r) for f, r, _t, _d in open_legs]
     live = [(f, r) for f, r in routes
             if str(f.get('status') or '').lower() in
             ('enroute', 'en-route', 'departed', 'active', 'boarding', 'expected')]
@@ -1230,19 +1365,29 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
     date = _today_utc()
     dk = date.replace('-', '')
 
+    # GEOMETRIE-REJECT-GATE AUCH FÜR confirmed (Owner-Beweisfoto EZY29CT: flog
+    # LGW→SKG, wir zeigten das frühere Tages-Leg LGW→ACE als „bestätigt"):
+    # Cache/Tafel/Warehouse können bei Mehr-Leg-Tagen das VORIGE Leg tragen.
+    # Geometrie ist NIE Quelle — sie verwirft NUR den klaren Widerspruch
+    # (Flieger fliegt eindeutig in die falsche Richtung / steht woanders).
+    # Verworfen → Kaskade läuft weiter; passt am Ende KEIN Leg → None (404),
+    # nie eine falsche Route.
+
     # ── 1. Eigene Warehouse: date-gekeyter Cache (exakt heute) ──────────────
     cached = _cache_get('ax_route_cache', 'flight', f'{cs}@{dk}')
     if cached and (cached.get('src') or cached.get('src_icao')):
         cached.setdefault('confidence', 'confirmed')
         cached['_from'] = 'cache_date'
-        return cached
+        if _geometry_allows_route(cached, lat, lon, track, gs, on_ground):
+            return cached
     # 1b. reg-gekeyter Cache (physische Maschine, heute)
     if reg:
         rc = _cache_get('ax_route_cache', 'flight', f'REG:{reg}@{dk}')
         if rc and (rc.get('src') or rc.get('src_icao')):
             rc.setdefault('confidence', 'confirmed')
             rc['_from'] = 'cache_reg'
-            return rc
+            if _geometry_allows_route(rc, lat, lon, track, gs, on_ground):
+                return rc
     # 1c. Eigene Airport-Tafel (autoritativ, flughafen-eigene Daten)
     try:
         obs = _route_from_obs(cs)
@@ -1251,16 +1396,18 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
     if obs and (obs.get('src') or obs.get('dst')):
         obs['source'] = 'aerox_board'
         obs['confidence'] = 'confirmed'
-        _record_resolved_route(cs, reg, obs, date)
-        return obs
+        if _geometry_allows_route(obs, lat, lon, track, gs, on_ground):
+            _record_resolved_route(cs, reg, obs, date)
+            return obs
     # 1d. Flight-Warehouse: BOARD-Tail↔Hex-Match (Rule 1) — hex-basiert, greift
     #     genau dort, wo 1c scheitert: alphanumerische Callsigns (DLH4CK), deren
     #     Flugnummer sich nicht aus dem Callsign ableiten lässt.
     wh = _route_from_warehouse(hexid, reg)
     if wh and (wh.get('src') or wh.get('dst')):
         wh['confidence'] = 'confirmed'
-        _record_resolved_route(cs, reg, wh, date)
-        return wh
+        if _geometry_allows_route(wh, lat, lon, track, gs, on_ground):
+            _record_resolved_route(cs, reg, wh, date)
+            return wh
 
     # ── FAST-PATH (interaktiver Radar-Tap, Owner 2026-07-04 „auf 2 sek bringen") ──
     #  Der User starrt auf einen Spinner. OpenSky (Token bis 15s + Flights 6s)
@@ -1278,8 +1425,9 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
         adb_tried = True
         adb_fast = _aerodatabox_route(cs, reg=reg, lat=lat, lon=lon, track=track,
                                       date=date, timeout=3)
-        if adb_fast and (adb_fast.get('confidence') == 'confirmed'
-                         or _geometry_allows_route(adb_fast, lat, lon, track, gs, on_ground)):
+        # Reject-Gate auch für confirmed (EZY29CT): nur klarer Widerspruch
+        # verwirft — dann lieber KEINE Route als die falsche.
+        if adb_fast and _geometry_allows_route(adb_fast, lat, lon, track, gs, on_ground):
             adb_fast['confidence'] = 'confirmed'
             _record_resolved_route(cs, adb_fast.get('reg') or reg, adb_fast, date)
             return adb_fast
@@ -1355,11 +1503,10 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
         adb = None if adb_tried else _aerodatabox_route(cs, reg=reg, lat=lat,
                                                         lon=lon, track=track, date=date)
         if adb:
-            # AeroDataBox ist reg-gekeyt autoritativ; ein eindeutiges Leg ist
-            # bereits 'confirmed'. Nur ein MEHRDEUTIGES ('estimated') Leg muss die
-            # Geometrie noch bestätigen, sonst verwerfen (keine Schätzung zeigen).
-            if adb.get('confidence') == 'confirmed' or \
-                    _geometry_allows_route(adb, lat, lon, track, gs, on_ground):
+            # Reject-Gate AUCH für 'confirmed' (EZY29CT-Beweisfoto): der bezahlte
+            # Payload kann bei Mehr-Leg-Tagen/Datenlücken das falsche Leg liefern.
+            # Nur klarer Widerspruch verwirft; dann lieber keine Route als falsch.
+            if _geometry_allows_route(adb, lat, lon, track, gs, on_ground):
                 adb['confidence'] = 'confirmed'
                 _record_resolved_route(cs, adb.get('reg') or reg, adb, date)
                 return adb
@@ -1368,9 +1515,9 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
         except Exception:
             avs = None
         if avs and (avs.get('src') or avs.get('dst')):
-            st = str(avs.get('status') or '').lower()
-            if st in ('active', 'en-route', 'landed') or \
-                    _geometry_allows_route(avs, lat, lon, track, gs, on_ground):
+            # Reject-Gate auch hier — ein Status-String hebelt die Geometrie
+            # nicht aus (Owner: passt kein Leg → keine Route, nie eine falsche).
+            if _geometry_allows_route(avs, lat, lon, track, gs, on_ground):
                 avs['confidence'] = 'confirmed'
                 _record_resolved_route(cs, reg, avs, date)
                 return avs
@@ -2003,6 +2150,48 @@ def ax_photo_reg(reg):
     return jsonify({'ok': True, 'reg': rg, 'source': 'planespotters', **photo})
 
 
+def _ax_rate_limited(endpoint, limit, window_sec):
+    """Per-IP-Rate-Limit (Best-Effort) über das adsb_blueprint-Muster
+    (_rate_limited → app._ip_rate_limited). Großzügig dimensioniert fürs
+    normale App-Polling — gedacht gegen anonyme Budget-Drains, nicht gegen
+    User. Fail-open: sind Helper/Request-Kontext nicht verfügbar, NIE blocken."""
+    try:
+        from flask import request
+        from blueprints.adsb_blueprint import _rate_limited, _req_ip
+        return _rate_limited(ip=_req_ip(request), endpoint=endpoint,
+                             limit=limit, window_sec=window_sec)
+    except Exception:
+        return False
+
+
+# Zeit-Felder im /api/ax/callsign-Response (Owner 2026-07-05: „warum steht
+# nicht abflug und ankunft uhrzeit im radar"). Merged-Board-Key → Response-Key.
+_CS_TIME_KEYS = (('sched_dep', 'sched_dep'), ('esti_dep', 'est_dep'),
+                 ('sched_arr', 'sched_arr'), ('esti_arr', 'est_arr'))
+
+
+def _merged_times_for(fn, dep_iata, arr_iata):
+    """sched/est-Zeiten (station-lokal, wie die Boards sie führen) aus dem
+    EIGENEN Dual-Side-Merge (app._flight_obs_merged, free_only → strukturell
+    spend-frei). NUR echte Board-Werte; unbekannte Felder fehlen. Wirft nie."""
+    if not fn:
+        return {}
+    merged_fn = _life_app('_flight_obs_merged')
+    if merged_fn is None:
+        return {}
+    try:
+        rec = merged_fn(fn, dep_iata=dep_iata, arr_iata=arr_iata,
+                        free_only=True) or {}
+    except Exception:
+        return {}
+    out = {}
+    for src_k, dst_k in _CS_TIME_KEYS:
+        v = rec.get(src_k)
+        if v:
+            out[dst_k] = v
+    return out
+
+
 @aerox_data_bp.route('/api/ax/callsign/<callsign>', methods=['GET'])
 def ax_callsign(callsign):
     """ICAO-Callsign (z.B. DLH506) → GENAUE heutige Route. Das Radar fragt für
@@ -2027,6 +2216,10 @@ def ax_callsign(callsign):
       → 404 (keine Route). Sonst wird die Route zurückgegeben.
     """
     from flask import request
+    # Per-IP-Limit (Audit: anonymer Endpoint kann bezahlte Provider ziehen).
+    # 120/min deckt jedes legitime Radar-Tippen; drüber = Drain-Verdacht.
+    if _ax_rate_limited('ax_callsign', limit=120, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     cs = (callsign or '').strip().upper().replace(' ', '')
     if not cs:
         return jsonify({'ok': False, 'error': 'empty'}), 400
@@ -2080,6 +2273,20 @@ def ax_callsign(callsign):
         out['gate'] = route.get('gate')
     if route.get('terminal'):
         out['terminal'] = route.get('terminal')
+    # Abflug-/Ankunfts-Zeiten (Owner: „warum steht nicht abflug und ankunft
+    # uhrzeit im radar"): station-lokal, NUR echte Werte. Quelle 1: das auf-
+    # gelöste Leg selbst (AeroDataBox-Payload / Tafel-Record trägt sched/est
+    # bereits). Quelle 2: eigener Dual-Side-Board-Merge (_flight_obs_merged,
+    # free_only). Unbekannte Felder fehlen — Unbekannt ist nicht pünktlich.
+    times = {k: route.get(k)
+             for k in ('sched_dep', 'est_dep', 'sched_arr', 'est_arr')
+             if route.get(k)}
+    if len(times) < 4:
+        fn = (route.get('flight_no') or _callsign_to_iata_flightno(cs) or cs)
+        for k, v in _merged_times_for(fn, route.get('src'),
+                                      route.get('dst')).items():
+            times.setdefault(k, v)
+    out.update(times)
     return jsonify(out)
 
 
@@ -2092,6 +2299,10 @@ def ax_radar_enrich():
     Paid-Spend, keine Einzel-Lookups. iOS füllt damit beim Area-Poll den
     Route-Cache → der Tap zeigt Strecke/Gate ohne Wartezeit."""
     from flask import request
+    # Per-IP-Limit (Audit): Batch-Endpoint = 1 Call pro Area-Poll (~15–30 s).
+    # 60/min ist großzügig fürs App-Polling, stoppt anonyme Bulk-Drains.
+    if _ax_rate_limited('ax_radar_enrich', limit=60, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     body = request.get_json(silent=True) or {}
     hexes = [str(h).lower().strip() for h in (body.get('hexes') or []) if h][:80]
     if not hexes:
