@@ -11854,11 +11854,14 @@ def get_friend_roster(token, friend_token):
     # Anreicherung → hier pro sichtbarem Leg das echte Board/Warehouse-Kennzeichen
     # additiv anhängen. Nur today ±1 (Guard in _enrich_leg_tails), free_only + Memo
     # halten den Fan-out billig. Rein additiv, defensiv (nie 500en, nichts erfinden).
+    _hb = None   # echte Homebase des FREUNDES (lazy, 10-min-Memo) — Audit 2026-07-05
     for _e in out:
         try:
             _secs = _e.get('ical_sectors')
             if isinstance(_secs, list) and _secs:
-                _enrich_leg_tails(_secs, _e.get('datum'))
+                if _hb is None:
+                    _hb = _profile_homebase_cached(friend_token) or ''
+                _enrich_leg_tails(_secs, _e.get('datum'), homebase=(_hb or None))
         except Exception:
             pass
     return jsonify({'ok': True, 'shared': True, 'count': len(out),
@@ -14576,10 +14579,17 @@ def get_briefings(token):
         from datetime import date as _bd, timedelta as _btd2
         _today = _bd.today()
         _live_days = {_today.isoformat(), (_today + _btd2(days=1)).isoformat()}
+        _hb = None   # lazy: nur laden, wenn wirklich Sektoren angereichert werden
         for _k in list(_live_days):
             _day = data.get(_k)
             if isinstance(_day, dict) and isinstance(_day.get('ical_sectors'), list):
-                _enrich_leg_delays(_day['ical_sectors'], _k)
+                # Echte Profil-Homebase für die Tail-Turnaround-Weitergabe
+                # (Audit 2026-07-05) — der Duty-Origin-Proxy versagt am
+                # Rückreisetag. Einmal pro Request, 10-min-Memo dahinter.
+                if _hb is None:
+                    _hb = _profile_homebase_cached(token) or ''
+                _enrich_leg_delays(_day['ical_sectors'], _k,
+                                   homebase=(_hb or None))
     except Exception:
         pass
     datum = request.args.get('datum')
@@ -25645,6 +25655,9 @@ def _departed_rows_from_store(airport):
             # gehören auch auf die „Früher heute"-Zeilen, nicht nur auf die Live-Flüge
             # — sie liegen seit dem Aircraft-Meta-Merge ohnehin im Store).
             'reg': (meta.get('reg') or ''), 'aircraft': (meta.get('type_code') or ''),
+            # Give-up-Marker (Audit 2026-07-05): ohne Signal als 0 geschlossen —
+            # route-history nimmt solche Rows aus dem Quoten-Nenner (Anzeige bleibt).
+            'gaveup': bool(meta.get('gaveup')),
             'departed': True,
         })
     rows.sort(key=lambda f: f.get('sched') or '')
@@ -25896,6 +25909,11 @@ def ax_route_history(frm, to):
                                    r.get('delay_min') is not None))
                 delay = int(r.get('delay_min') or 0)
                 canc = bool(r.get('cancelled'))
+                # Give-up-Rows (Finalizer schloss ohne Signal als 0, Audit
+                # 2026-07-05): Anzeige bleibt „pünktlich", aber die Quote unten
+                # zählt sie als unknown — und sie überschreiben im Dual-Side-
+                # Merge nie eine echt beobachtete Gegenseite.
+                gaveup = bool(r.get('gaveup'))
                 prev = by_fn.get(fn_key) if fn_key else None
                 if side == 'dep' or prev is None:
                     if prev is not None:
@@ -25913,6 +25931,8 @@ def ax_route_history(frm, to):
                              'delay_known': known,
                              'cancelled': canc, 'status': status,
                              'obs': side}
+                    if gaveup:
+                        entry['gaveup'] = True
                     if side == 'dep':
                         entry['dep_delay_min'] = (delay if known else None)
                     else:
@@ -25932,15 +25952,21 @@ def ax_route_history(frm, to):
                     # arr = beste Zahl — aber NUR wenn die arr-Seite den Delay
                     # KENNT: arr known schlägt dep unknown (LH400: dep 0-ohne-
                     # Wissen, arr +86 → 86 gewinnt) UND dep known bleibt gegen
-                    # eine arr-Seite ohne Wissen stehen.
-                    if known:
+                    # eine arr-Seite ohne Wissen stehen. Eine gaveup-arr-Row
+                    # (known nur per Finalizer-Flag, ohne Signal) zählt hier
+                    # NICHT als Wissen — sonst klemmt ihre 0 einen echt
+                    # beobachteten dep-Delay weg (Audit 2026-07-05).
+                    if known and not gaveup:
                         prev['delay_min'] = delay
                         prev['delay_known'] = True
+                        prev.pop('gaveup', None)   # echtes Signal ersetzt Give-up
                     if prev['cancelled']:
                         prev['status'] = 'cancelled'
                     elif not prev.get('delay_known'):
                         prev['status'] = 'unknown'
-                    elif known:
+                    elif known and not gaveup:
+                        # gaveup-arr aktualisiert auch den STATUS nicht — der
+                        # gehört zur (nicht übernommenen) 0 der Give-up-Row.
                         prev['status'] = ('ontime' if delay <= 15 else
                                           'minor' if delay <= 45 else 'late')
         # CODESHARE-FALTUNG (Owner 2026-07-04): derselbe physische Flug unter
@@ -25957,7 +25983,10 @@ def ax_route_history(frm, to):
             total += 1
             if e.get('cancelled'):
                 cancelled_cnt += 1
-            elif not e.get('delay_known'):
+            elif not e.get('delay_known') or e.get('gaveup'):
+                # gaveup = Finalizer schloss ohne Signal als 0 (Audit 2026-07-05):
+                # fürs Listing „pünktlich", für die QUOTE unknown — sonst drücken
+                # signal-lose Give-up-Rows die Strecken-Quote künstlich hoch.
                 unknown_cnt += 1
             elif int(e.get('delay_min') or 0) <= 15:
                 on_time += 1
@@ -26406,10 +26435,49 @@ def _board_local_to_utc_iso(esti, iata):
         return None
 
 
-def _enrich_leg_delays(sectors, date, free_only=True):
+_PROFILE_HB_MEMO = {}              # token → (expires_ts, 'FRA' | '')
+_PROFILE_HB_MEMO_TTL = 600.0       # 10 min — Homebase ändert sich praktisch nie
+
+
+def _profile_homebase_cached(token):
+    """Echte Profil-Homebase (3-Letter-IATA) eines Users — für die Tail-
+    Turnaround-Weitergabe (Audit 2026-07-05): der Duty-Origin-Proxy in
+    _carry_forward_turnaround_tails (sectors[0].from) versagt am RÜCKREISETAG
+    (erster Abflug = Outstation) → ein Leg erbte den Tail über einen Homebase-
+    Hub-Turnaround, was der Owner explizit verboten hat („bei 3h turnaround IN
+    der homebase kann man sehr wohl Flieger wechseln").
+    10-min-Memo pro Token (höchstens EIN Profil-Read pro Request-Burst).
+    None wenn unbekannt — der Caller fällt auf den Proxy zurück. Wirft nie."""
+    tok = (token or '').strip()
+    if not tok:
+        return None
+    import time as _t
+    now = _t.time()
+    hit = _PROFILE_HB_MEMO.get(tok)
+    if hit and hit[0] > now:
+        return hit[1] or None
+    hb = ''
+    try:
+        prof = (_profile_load(tok) or {}).get('profile') or {}
+        hb = str(prof.get('homebase') or '').strip().upper()
+        if len(hb) != 3 or not hb.isalpha():
+            hb = ''
+    except Exception:
+        hb = ''
+    if len(_PROFILE_HB_MEMO) > 5000:   # Memo-Cap (gleiche Klasse wie ADSBLol-OOM)
+        _PROFILE_HB_MEMO.clear()
+    _PROFILE_HB_MEMO[tok] = (now + _PROFILE_HB_MEMO_TTL, hb)
+    return hb or None
+
+
+def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
     """Reichert die Pro-Leg-Sektoren EINES Roster-Tages (ical_sectors[]) IN PLACE
     um Live-/Warehouse-Delay-Felder an (Owner 2026-07-04 „alle Live-Sachen an-
     binden", Serve-Time-Enrichment — NICHT im iCal-Sync eingefroren).
+
+    `homebase` (optional, Audit 2026-07-05): echte Profil-Homebase für die
+    Tail-Turnaround-Weitergabe — der Duty-Origin-Proxy versagt am Rückreisetag
+    (sectors[0].from = Outstation), s. _carry_forward_turnaround_tails.
 
     Pro Sektor-dict (braucht flight/from/to):
       (a) Flugnummer via `_fn_norm` normalisieren (LH839 == LH0839),
@@ -26532,7 +26600,10 @@ def _enrich_leg_delays(sectors, date, free_only=True):
         s['obs_sides'] = m.get('sides')
         if op_fn != fn and 'also_as' not in s:
             s['also_as'] = raw_fn        # gefaltete Marketing-Nummer bewahren
-    _carry_forward_turnaround_tails(sectors)   # Rückflug-Turnaround erbt den Tail
+    # Rückflug-Turnaround erbt den Tail — mit ECHTER Homebase, wo der Caller sie
+    # kennt (Audit 2026-07-05: Proxy allein ließ am Rückreisetag einen Homebase-
+    # Hub-Turnaround durch, vom Owner explizit verboten).
+    _carry_forward_turnaround_tails(sectors, homebase=homebase)
     return sectors
 
 
@@ -26577,10 +26648,11 @@ def _leg_tail(flight_no, date=None, dep_iata=None, arr_iata=None):
     return reg or None
 
 
-def _enrich_leg_tails(sectors, date=None):
+def _enrich_leg_tails(sectors, date=None, homebase=None):
     """Ergänzt pro Leg (ical_sectors[]) ein optionales `tail` (Flugzeug-
     Kennzeichen) NUR bei echtem Board/Warehouse-Treffer — additiv, nie erfunden,
-    nie werfen.
+    nie werfen. `homebase` = echte Profil-Homebase des ROSTER-BESITZERS für die
+    Turnaround-Weitergabe (Audit 2026-07-05, s. _carry_forward_turnaround_tails).
 
     Für die FREUNDE-/FAMILIEN-Roster-Sheets, die NICHT durch `_enrich_leg_delays`
     laufen (im eigenen Roster setzt die Delay-Anreicherung `tail` bereits mit —
@@ -26637,7 +26709,7 @@ def _enrich_leg_tails(sectors, date=None):
         tail = _leg_tail(raw_fn, date=leg_date, dep_iata=frm, arr_iata=to)
         if tail:
             s['tail'] = tail
-    _carry_forward_turnaround_tails(sectors)
+    _carry_forward_turnaround_tails(sectors, homebase=homebase)
     return sectors
 
 
@@ -27143,6 +27215,17 @@ def ax_transit():
     [Fuß/U4/S8 mit dep/arr]. ALLES in try/except → kann den Live-Service nie
     crashen; die App fällt zur Not auf Apple-Transit-ETA zurück.
     Query: from_lat,from_lon,to_lat,to_lon,arrival(ISO mit TZ),fern(0/1),debug(0/1)."""
+    # Abuse-Guard (Audit 2026-07-05): offener Endpoint ohne Auth — ein per-IP-
+    # Limit schützt die fremden Gratis-Quotas (MVV-EFA/RMV/Transitous/db-rest)
+    # vor anonymem Drain. Großzügig fürs echte Nutzungsmuster (App fragt pro
+    # Pickup-Berechnung EINMAL); Muster wie ax_callsign/_ax_rate_limited.
+    try:
+        _tip = _client_ip()
+        if _tip and _ip_rate_limited(_tip, endpoint='ax_transit',
+                                     limit=30, window_sec=60):
+            return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    except Exception:
+        pass
     try:
         flat = float(request.args.get('from_lat'))
         flon = float(request.args.get('from_lon'))
@@ -30810,6 +30893,13 @@ def _finalize_pending_delays(deadline_ts=None):
             # ── Zurückschreiben: In-Memory sticky + Write-Through (Requeue) ──────
             merged_meta = dict(meta)
             merged_meta['delay_known'] = True
+            # Give-up-Rows MARKIEREN (Audit 2026-07-05): sie werden ohne echtes
+            # Signal als pünktlich (0) geschlossen — fürs ANZEIGEN ok (Owner:
+            # „lieber geschlossen als offen"), aber sie dürfen die historische
+            # Pünktlichkeits-QUOTE nicht als bestätigt-pünktlich hochdrücken.
+            # route-history zählt gaveup-Rows deshalb als 'unknown' im Nenner.
+            if source == 'gaveup':
+                merged_meta['gaveup'] = True
             try:
                 if resolved_cxl:
                     _delay_store[(date_s, airport, fn, hhmm + '_cancelled')] = 1

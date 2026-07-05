@@ -365,7 +365,8 @@ def _aviationstack_route(callsign):
 #       (frei)                öffentlich → mittlerer Fallback. confidence=estimated.
 #    5. AeroDataBox / AviationStack — BEZAHLT, quota-limitiert. NUR wenn nichts
 #       (BEZAHLT, LETZTES)    Freies auflöste UND der Tages-Budget-Guard
-#                             (_paid_budget_ok, AX_PAID_DAILY_CAP=50) es erlaubt.
+#                             (_paid_budget_ok, AX_PAID_DAILY_CAP, Default 760
+#                             API-Units, Tier-gewichtet) es erlaubt.
 #                             NIE im Poller / nie in Bulk. confidence=confirmed.
 #
 #  confidence im Response (Owner „scraped/eigene Infos sind #1 — nicht prüfen"):
@@ -741,7 +742,8 @@ def _record_resolved_route(cs, reg, route, date=None):
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PAID-API DAILY BUDGET GUARD  (AeroDataBox + AviationStack)
-#  Harter Tages-Deckel (AX_PAID_DAILY_CAP, Default 50). Persistiert in
+#  Harter Tages-Deckel (AX_PAID_DAILY_CAP, Default 760 API-Units — Tier-
+#  gewichtet, s. _paid_budget_ok; NICHT Requests). Persistiert in
 #  ax_api_budget (key='paid:YYYYMMDD') + In-Memory-Safety-Net. Wird NUR aus dem
 #  On-Demand-Tap-Pfad angefasst — nie aus dem Poller/Bulk.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -773,12 +775,56 @@ def _paid_budget_ok():
     return _paid_daily_used() < cap
 
 
+_BUDGET_RPC_DISABLED = False   # Migration 20260705_budget_increment.sql fehlt → Fallback
+
+
+def _budget_rpc_add(key, units):
+    """ATOMARER Budget-Increment via Postgres-RPC `ax_budget_increment`
+    (INSERT … ON CONFLICT … SET n = n + units in EINEM Statement).
+
+    Audit 2026-07-05: das alte read-modify-write (select n → upsert n+units)
+    verlor bei parallelen Requests / mehreren Cloud-Run-Instanzen Zählungen —
+    AviationStack-Free-Tier (100/Monat) und der AeroDataBox-Tages-Cap konnten
+    dadurch real überlaufen. Returns neuer Stand (int) oder None → Caller fällt
+    auf den alten Upsert zurück (graceful degrade, solange die Migration noch
+    nicht applied ist — gleiches Muster wie ax_open_legs). Wirft nie."""
+    global _BUDGET_RPC_DISABLED
+    sb = _sb()
+    if sb is None or _BUDGET_RPC_DISABLED:
+        return None
+    try:
+        r = sb.rpc('ax_budget_increment',
+                   {'p_key': key, 'p_units': max(1, int(units))}).execute()
+        d = getattr(r, 'data', None)
+        if isinstance(d, list):
+            d = d[0] if d else None
+        return int(d) if d is not None else None
+    except Exception as e:
+        msg = str(e)
+        if 'PGRST202' in msg or 'Could not find the function' in msg \
+                or 'does not exist' in msg:
+            _BUDGET_RPC_DISABLED = True
+            try:
+                print('[aerox_data] ax_budget_increment RPC missing → non-atomic '
+                      'upsert fallback (apply supabase_migrations/'
+                      '20260705_budget_increment.sql for atomic counters)', flush=True)
+            except Exception:
+                pass
+        return None
+
+
 def _paid_budget_inc(units=1):
     key = _paid_daily_key()
     used = _MEM_BUDGET.get(key, 0) + max(1, int(units))
     _MEM_BUDGET[key] = used          # In-Memory IMMER zählen (Safety-Net)
     sb = _sb()
     if sb is None:
+        return
+    # Bevorzugt ATOMAR (Audit 2026-07-05, s. _budget_rpc_add) — der RPC-Stand
+    # ist die instanzübergreifende Wahrheit und synct den Memory-Zähler mit.
+    n = _budget_rpc_add(key, units)
+    if n is not None:
+        _MEM_BUDGET[key] = max(used, n)
         return
     try:
         sb.table('ax_api_budget').upsert(
@@ -1211,25 +1257,6 @@ def _warehouse_write_leg_obs(dep, dep_icao, arr, arr_icao, cs, reg, dep_ts, arr_
                 pass
 
 
-def _confirmed_origin_from_tracking(hexid):
-    """Wenn unsere EIGENE ADS-B-State-Machine (observe_adsb_positions) diese Maschine
-    aus einem Flughafen hat abheben sehen, KENNEN wir ihren Abflug — selbst
-    beobachtet, also CONFIRMED. Gibt (iata, icao) zurück oder None. Wirft NIE.
-    Damit lässt sich ein eigener bestätigter Abflug mit einer geometrisch
-    bestätigten Ziel-Richtung zu einer voll-eigenen confirmed-Route kombinieren."""
-    if not hexid:
-        return None
-    try:
-        # Erst Front-Cache, dann durabler Open-Leg-Store (übersteht Restarts) →
-        # ein vor dem Container-Recycle beobachteter Abflug bleibt bekannt.
-        st = _open_leg_get(str(hexid).strip().lower())
-        if st and st.get('phase') == 'air' and st.get('dep'):
-            return (st.get('dep'), st.get('dep_icao'))
-    except Exception:
-        pass
-    return None
-
-
 def _geometry_allows_route(candidate, lat, lon, track, gs=None, on_ground=False):
     """GEOMETRIE-GATE (REJECT-ONLY) — Owner-Regel: „scraped/eigene Infos sind #1,
     müssen NICHT geprüft werden." Generische Kandidaten (adsbdb/hexdb/adsb.lol/
@@ -1478,23 +1505,8 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
     # (Schritt 3, gated) + bezahlt (Schritt 5). Tail (Kennzeichen) und die
     # Live-Position laufen über SEPARATE Calls (ADS-B hex→reg/pos) — davon
     # unberührt. Kein Route-Treffer → None → Client zeigt keine Strecke.
-    gen = None
-    if gen and (gen.get('src') or gen.get('src_icao')):
-        if _geometry_allows_route(gen, lat, lon, track, gs, on_ground):
-            # Eigenen bestätigten Abflug (aus unserem Tracking) bevorzugen → dann
-            # ist der Abflug eigen-beobachtet (unsere #1-Quelle).
-            own = _confirmed_origin_from_tracking(hexid)
-            if own and own[0]:
-                gen['src'], gen['src_icao'] = own[0], own[1]
-                gen['source'] = (gen.get('source') or 'generic') + '+own_origin'
-            # confidence bleibt 'estimated' (interner Wert): Client zeichnet die
-            # Route OHNE „bestätigt"-Siegel und ohne „geschätzt"-Label — nur die
-            # Strecke selbst (Owner: Routen sichtbar, kein Angst-Label).
-            _record_resolved_route(cs, reg, gen, date)
-            return gen
-        # Geometrie WIDERSPRICHT KLAR (Flieger fliegt in die falsche Richtung) →
-        # diese Route nicht zeigen (kein return: der bezahlte Pfad hat evtl. echte
-        # Live-Daten für die richtige Strecke).
+    # (Audit 2026-07-05: der frühere `gen = None`-Stub + unerreichbarer
+    # Render-Block wurde entfernt — der Kommentar oben IST die Entscheidung.)
 
     # ── 5. BEZAHLT (LETZTER Ausweg) — nur mit Tages-Budget, nur getippter Flieger
     if _paid_budget_ok():
@@ -2524,6 +2536,11 @@ def _budget_inc(month, used):
     sb = _sb()
     if sb is None:
         return
+    # Bevorzugt ATOMAR (Audit 2026-07-05, s. _budget_rpc_add): der alte Upsert
+    # mit `used+1` (used = vorher gelesener Stand) konnte parallele Calls/
+    # Instanzen gegenseitig überschreiben → Free-Tier-Zähler lief real über.
+    if _budget_rpc_add(month, 1) is not None:
+        return
     try:
         sb.table('ax_api_budget').upsert(
             {'month': month, 'n': used + 1,
@@ -2769,7 +2786,16 @@ def _crewbus_insert(iata, minutes, anon_id):
 
 
 def _crewbus_avg(minutes):
-    return round(sum(minutes) / len(minutes)) if minutes else None
+    """Robuster Schnitt = MEDIAN (Audit 2026-07-05): beim arithmetischen Mittel
+    konnten wenige Ausreißer-/Bot-Eingaben den Wert einer Station kippen; der
+    Median braucht >50% manipulierte Eingaben. JSON-Key bleibt 'avg' (iOS liest
+    ihn bereits, keine Client-Änderung nötig)."""
+    if not minutes:
+        return None
+    s = sorted(minutes)
+    n = len(s)
+    mid = n // 2
+    return int(round(s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0))
 
 
 @aerox_data_bp.route('/api/ax/crewbus/<iata>', methods=['GET'])
@@ -2788,6 +2814,18 @@ def ax_crewbus_post(iata):
     iata = (iata or '').upper().strip()[:4]
     if not iata:
         return jsonify({'ok': False, 'error': 'bad_iata'}), 400
+    # HÄRTUNG (Audit 2026-07-05): der Crowd-Write war komplett offen — ohne
+    # Bearer griff auch der Dup-Check nicht (anon=None), und ein anonymer Bot
+    # konnte mit ein paar hundert Posts den Wert einer Station kippen.
+    # (a) Bearer-Pflicht: die App sendet ihn auf JEDEM Request (APIClient) →
+    #     kein legitimer Client verliert etwas; anon_id ist damit immer gesetzt.
+    # (b) per-IP-Limit (Muster wie ax_callsign): Crew meldet EINEN Wert pro
+    #     Ankunft — 10/min ist großzügig, stoppt aber Flutungs-Skripte.
+    anon = _crewbus_anon_id()
+    if not anon:
+        return jsonify({'ok': False, 'error': 'auth_required'}), 401
+    if _ax_rate_limited('ax_crewbus_post', limit=10, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     body = request.get_json(silent=True) or {}
     try:
         m = int(round(float(body.get('minutes'))))
@@ -2797,7 +2835,6 @@ def ax_crewbus_post(iata):
         return jsonify({'ok': False, 'error': 'out_of_range',
                         'message': 'Minuten müssen zwischen 1 und 240 liegen.'}), 400
 
-    anon = _crewbus_anon_id()
     # Light-Dedup: identische Wiederholung desselben Nutzers zählt nicht doppelt.
     if not _crewbus_is_dup(iata, m, anon):
         if not _crewbus_insert(iata, m, anon):
