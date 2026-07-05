@@ -874,6 +874,28 @@ def get_adsb_state():
 
     # ─── Erfolg: cachen + ausgeben ───
     if source is not None:
+        # OZEAN-/COVERAGE-BRÜCKE: beide Upstreams sagen sauber „kein Signal",
+        # aber wir halten eine <45min-alte persistierte Position → die Maschine
+        # ist sehr wahrscheinlich nur außerhalb der Feeder-Coverage (Atlantik),
+        # nicht gelandet. Dann die letzte Position ehrlich stale-markiert liefern
+        # statt „nicht in der Luft" (Flieger verschwindet sonst mitten im Flug).
+        # NICHT in den Fresh-Cache seeden — der nächste Poll versucht wieder live.
+        if row is None and backfilled is not None:
+            try:
+                _b_age = time.time() - float(backfilled.get("fetched_at") or 0)
+            except (TypeError, ValueError):
+                _b_age = 1e9
+            if _b_age < 2700:
+                return jsonify({
+                    "hex": hex_param,
+                    "position": backfilled["row"],
+                    "fetched_at": backfilled["fetched_at"],
+                    "cached": True,
+                    "stale_due_to_upstream_outage": True,
+                    "stale_age_seconds": int(_b_age),
+                    "source": backfilled.get("source", "supabase-backfill"),
+                    "tried": tried,
+                }), 200
         _cache_put(hex_param, row, source)
         # Best-effort warm-keep der Supabase-Fallback-Tabelle — niemals die
         # Live-Response brechen (alles in try/except, row kann None sein wenn
@@ -1334,11 +1356,31 @@ def _backfill_cache_from_sb(hex_id):
     if row is None:
         _PERSIST_STATS['backfill_miss_count'] += 1
         return None
-    # In den _CACHE seeden, markiert als 'supabase-backfill' damit Clients sehen
-    # dass das eine persistierte letzte Position ist, kein frischer Live-Ping.
-    _cache_put(hex_l, row, source='supabase-backfill')
+    # ECHTEN Beobachtungs-Zeitstempel des Records bestimmen (Root-Cause-Fix
+    # 2026-07-05, Teil 2): `_cache_put` stempelt fetched_at=JETZT — dadurch sah
+    # ein 2,3h alter Atlantik-Punkt für den Freshness-Check im Handler wie
+    # „29s frisch" aus und verdrängte weiter die Live-Kaskade. Wir geben daher
+    # den WAHREN Record-Zeitstempel zurück und seeden NUR wirklich frische
+    # Positionen in den 60s-Fresh-Cache (sonst vergiftet der Seed jeden
+    # Folge-Request für 60s mit der stalen Position).
+    rec_ts = None
+    try:
+        _dt = datetime.fromisoformat(str(rec.get('fetched_at')).replace('Z', '+00:00'))
+        if _dt.tzinfo is None:
+            _dt = _dt.replace(tzinfo=timezone.utc)
+        rec_ts = _dt.timestamp()
+    except (ValueError, TypeError):
+        rec_ts = None
     _PERSIST_STATS['backfill_ok_count'] += 1
-    return _cache_get(hex_l)
+    age = (time.time() - rec_ts) if rec_ts is not None else 1e9
+    if age < 90:
+        _cache_put(hex_l, row, source='supabase-backfill')
+        return _cache_get(hex_l)
+    return {
+        'row': row,
+        'fetched_at': rec_ts if rec_ts is not None else time.time() - 1e9,
+        'source': 'supabase-backfill',
+    }
 
 
 # ─── OpenSky Fetch ──────────────────────────────────────────
