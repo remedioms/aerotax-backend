@@ -431,9 +431,32 @@ def resolve_reg_to_hex(reg):
         return val or _BACKEND_REG_HEX.get(reg_u)
 
     hx = _sb_lookup_tail_hex(reg_u)
-    _reg_hex_cache_put(reg_u, hx)
     if hx:
+        _reg_hex_cache_put(reg_u, hx)
         return hx
+
+    # GEBACKENE 520k-Referenz-DB (offline, gratis) — hält die echten icao24 der
+    # ganzen LH/Airline-Flotte (z.B. D-ABYO → 3c4b2f), die Supabase `tail_hex`
+    # oft (noch) NICHT kennt. Ohne diese Quelle scheiterte Reg→Hex komplett und
+    # ADS-B (das per HEX abfragt, NICHT per Tail) fand den Flieger nie → die
+    # „Wo ist mein Flieger"-Karte blieb leer (Owner 2026-07-05: „er sucht nach
+    # tail und adsb funktioniert so nicht"). Lazy-Import vermeidet den Blueprint-
+    # Zirkel (aerox_data ruft umgekehrt resolve_reg_to_hex).
+    try:
+        from blueprints.aerox_data_blueprint import _q1, _reg_candidates
+        cands = _reg_candidates(reg_u)
+        if cands:
+            ph = ','.join('?' * len(cands))
+            row = _q1(f'SELECT hex FROM aircraft WHERE reg IN ({ph}) LIMIT 1',
+                      tuple(cands))
+            baked = ((row or {}).get('hex') or '').strip().lower() or None
+            if baked:
+                _reg_hex_cache_put(reg_u, baked)
+                return baked
+    except Exception:
+        pass
+
+    _reg_hex_cache_put(reg_u, hx)   # negativ cachen (kurz), damit Miss nicht spammt
     return _BACKEND_REG_HEX.get(reg_u)
 
 
