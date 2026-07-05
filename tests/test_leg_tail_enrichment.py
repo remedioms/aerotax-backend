@@ -28,11 +28,22 @@ import app as A
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
+    # SYS.MODULES-PIN (gleiche Order-Kontamination wie test_my_flight_status,
+    # 2026-07-05): test_calculation.py tauscht sys.modules['app'] per Reimport aus;
+    # Blueprints (family-watch _load_crew_roster_days u.a.) lösen app-Funktionen
+    # zur CALL-Zeit über sys.modules['app'] auf → patch.object(A, …) lief nach
+    # test_calculation ins Leere (isoliert grün, Full-Run rot). Pro Test unser
+    # A-Modul pinnen, danach vorherigen Zustand wiederherstellen.
+    import sys
+    _prev_app_mod = sys.modules.get('app')
+    sys.modules['app'] = A
     A._FLIGHT_MERGE_CACHE.clear()
     A._AX_CODESHARE_CACHE['ts'] = 0.0
     A._AX_CODESHARE_CACHE['map'] = {}
     yield
     A._FLIGHT_MERGE_CACHE.clear()
+    if _prev_app_mod is not None:
+        sys.modules['app'] = _prev_app_mod
 
 
 def _iso(dt):
