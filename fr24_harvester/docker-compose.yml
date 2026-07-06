@@ -1,43 +1,71 @@
-# FR24-Harvester auf der Synology-NAS (deutsche Residential-IP, 24/7).
-# Eine Node reicht: sie pollt alle 8 Kacheln round-robin und schreibt
-# durchgehend nach Supabase fr24_live. Residential-IP = am wenigsten blockbar.
+# fr24-ingest — ressourcen-gedeckelter, gehärteter FR24-Harvester für die NAS.
+# docker compose v2 (DSM 7.2 Container Manager). Robustes Netzwerk-Herz aus dem
+# Blueprint (Token-Bucket, 429/403-Freeze, dekorrelierter Jitter) → FR24-sicher.
 #
-# Start (SSH auf die NAS, im Ordner mit dieser Datei + harvester.py + Dockerfile):
-#   SUPABASE_KEY='<service-role-key>' docker compose up -d --build
-# Logs:   docker compose logs -f
-# Stop:   docker compose down
+# Start:  SUPABASE_KEY='<service-role-key>' docker compose up -d --build
 services:
   fr24-harvester:
     build: .
+    image: fr24-ingest:local
     container_name: fr24-harvester
     restart: unless-stopped
-    # ── ALLES IN RAM, NULL HDD-Writes → Platten schlafen, NAS ist still ──
-    read_only: true          # Container-FS nur lesbar (keine versehentl. Disk-Writes)
+
+    # PID 1 = docker-init (tini): leitet SIGTERM an Python (add_signal_handler)
+    # und reapt Zombies → sauberes Herunterfahren.
+    init: true
+    stop_grace_period: 30s
+
+    user: "1000:1000"
+
+    # Härtung: read-only Root-FS; nur /tmp (Heartbeat, RAM) schreibbar.
+    # Kein /data-Volume: wir brauchen keinen lokalen SQLite-Cache — unser Store
+    # IST Supabase fr24_live (Bulk-Kacheln, kein Per-Airframe-Lookup).
+    read_only: true
     tmpfs:
-      - /tmp                 # Scratch komplett in RAM
-    # QUIET=1 → nur ~1 Zeile/30min (Heartbeat) + Fehler. Mit winziger Rotation
-    # sind das ~vernachlässigbare Disk-Writes (Platten schlafen ~29/30min), ABER
-    # wir BEHALTEN Observability (`docker logs`) — logging:none war zu undurchsichtig
-    # zum Betreiben (man sah Blocks/Backoffs nicht). Für absolut 0 Writes: driver "none".
+      - /tmp:size=16m
+
+    environment:
+      PYTHONUNBUFFERED: "1"
+      MALLOC_ARENA_MAX: "2"     # glibc-Arena-Fragmentierung dämpfen (RSS-Creep)
+
+      SUPABASE_URL: "https://jyrbijvmwacuivssbxlg.supabase.co"
+      SUPABASE_KEY: "${SUPABASE_KEY:?SUPABASE_KEY env fehlt}"
+      TILES: "all"              # eine Node = alle 15 Kacheln round-robin
+      POLL_INTERVAL_S: "90"     # LANGSAM: ~22min/Zyklus, unauffällig
+      RATE_LIMIT_RPS: "0.02"    # Dauerrate ~1 Req/50s — weit unter FR24s Flag-Schwelle
+      RATE_LIMIT_BURST: "2"
+      BACKOFF_CAP_S: "1800"     # bei anhaltendem Block bis 30min ruhig
+      LOG_LEVEL: "INFO"         # per-Poll nur DEBUG → Platten schlafen (Summary alle 30min)
+
+    # Memory-Cap (cgroup): 256M — ein etwaiges Leck OOM-killt NUR diesen Container,
+    # restart bringt ihn frisch. CPU-Quota (cpus) weggelassen: Synology-DSM-Kernel
+    # mountet den CFS-Scheduler nicht ("NanoCPUs can not be set") — Memory reicht
+    # als Leak-Containment; der Token-Bucket kappt die Last ohnehin.
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Unrotierte json-Logs = klassischer stiller NAS-Volume-Killer → gedeckelt.
     logging:
       driver: json-file
       options:
-        max-size: "256k"
-        max-file: "1"
-    environment:
-      SUPABASE_URL: "https://jyrbijvmwacuivssbxlg.supabase.co"
-      SUPABASE_KEY: "${SUPABASE_KEY:?SUPABASE_KEY env fehlt}"
-      TILES: "all"           # eine Node = alle 8 Kacheln round-robin
-      POLL_SECONDS: "90"     # pro Kachel also ~alle 160s → sehr höflich
-      QUIET: "1"             # keine Erfolgs-Logzeilen (nur Fehler/Blocks + 30min-Heartbeat)
-    # Der Harvester macht NUR Netz-Traffic (POST an Supabase) — kein lokaler Disk-I/O.
-    # Mit logging:none + read_only + tmpfs berührt der laufende Container die HDDs
-    # nach dem Start GAR NICHT mehr → Synology-HDD-Hibernation greift, NAS bleibt leise.
-    #
-    # HEALTH-CHECK ohne Container-Logs (da logging:none): einfach fragen, ob
-    # fr24_live frisch ist —
-    #   select count(*) from fr24_live where updated_at > now() - interval '3 minutes';
-    # (kann Claude jederzeit aus dem Backend/Supabase prüfen.)
-    #
-    # Falls du DOCH Logs sehen willst: logging:"none" → json-file und QUIET:"0"
-    # ODER QUIET:"1" lassen (dann nur 1 Zeile / 30min = Platten schlafen ~29min/30).
+        max-size: "5m"
+        max-file: "2"
+
+    # Liveness = „Poll-Loop läuft" (Heartbeat pro Zyklus, in RAM). NICHT Upstream-
+    # Health — Neustart würde eine FR24-Drosselung nicht beheben.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/heartbeat')<300 else 1)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
