@@ -16,11 +16,19 @@ create table if not exists public.fr24_live (
     callsign   text,
     lat        double precision,
     lon        double precision,
+    origin     text,                       -- IATA Start (Route-Enrichment fürs Warehouse)
+    dest       text,                       -- IATA Ziel
+    flight     text,                       -- IATA-Flugnummer
     row        jsonb       not null,
     tile       text,                       -- welche Kachel/Harvester (Debug)
     updated_at timestamptz not null default now(),
     constraint fr24_live_pkey primary key (hex)
 );
+
+-- Nachrüstung, falls die Tabelle schon ohne Route-Spalten existierte.
+alter table public.fr24_live add column if not exists origin text;
+alter table public.fr24_live add column if not exists dest   text;
+alter table public.fr24_live add column if not exists flight text;
 
 -- Warmer-Read-Index: „alle Flieger frischer als 6 min".
 create index if not exists idx_fr24_live_updated_at

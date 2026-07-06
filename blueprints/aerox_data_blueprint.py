@@ -296,6 +296,34 @@ def _route_from_warehouse(hexid=None, reg=None):
     return None
 
 
+def _route_from_fr24(callsign=None, hexid=None):
+    """GRATIS-Route aus dem verteilten FR24-Store (`fr24_live`, gleiche Supabase;
+    gefüllt vom NAS-Harvester). feed.js trägt Start/Ziel (IATA) pro Flieger →
+    deckt Routen, die weder Board noch Warehouse kennen, OHNE AeroDataBox zu
+    zahlen. Der Harvester speichert Start/Ziel als eigene Spalten `origin`/`dest`
+    (die normalisierte `row` enthält sie nicht). Lookup per hex (PK) bevorzugt,
+    sonst Callsign. Nur frische Rows (< 6 min). None bei Miss/SB-down."""
+    sb = _sb()
+    if sb is None or not (hexid or callsign):
+        return None
+    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 360))
+    try:
+        q = sb.table('fr24_live').select('origin,dest').gt('updated_at', cutoff)
+        q = q.eq('hex', (hexid or '').lower()) if hexid \
+            else q.eq('callsign', (callsign or '').upper())
+        rows = (q.limit(1).execute()).data or []
+        if not rows:
+            return None
+        src = (rows[0].get('origin') or '').strip().upper()
+        dst = (rows[0].get('dest') or '').strip().upper()
+        if src and dst and len(src) == 3 and len(dst) == 3 and src != dst:
+            return {'src': src, 'dst': dst, 'source': 'fr24',
+                    'confidence': 'estimated'}
+    except Exception:
+        return None
+    return None
+
+
 def _aviationstack_route(callsign):
     """AUTORITATIVE Live-Route per ICAO-Callsign (AviationStack /flights). Anders
     als die STATISCHE adsbdb-Tabelle kennt das die TATSÄCHLICHE Strecke des Fluges
@@ -1477,6 +1505,17 @@ def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
         if _geometry_allows_route(wh, lat, lon, track, gs, on_ground):
             _record_resolved_route(cs, reg, wh, date)
             return wh
+
+    # 1e. FR24-Store (GRATIS, verteilt via NAS-Harvester): Start/Ziel für nahezu
+    #     jeden Flieger — schließt Routen, die Board/Warehouse nicht kennen, OHNE
+    #     AeroDataBox zu zahlen. VOR dem bezahlten Fast-Path. Geometrie-Gate wie
+    #     die anderen (nur klarer Widerspruch verwirft). Treffer wird gecacht →
+    #     wächst in unsere autoritative Routen-DB und spart künftige Paid-Calls.
+    fr = _route_from_fr24(cs, hexid)
+    if fr and (fr.get('src') or fr.get('dst')):
+        if _geometry_allows_route(fr, lat, lon, track, gs, on_ground):
+            _record_resolved_route(cs, reg, fr, date)
+            return fr
 
     # ── FAST-PATH (interaktiver Radar-Tap, Owner 2026-07-04 „auf 2 sek bringen") ──
     #  Der User starrt auf einen Spinner. OpenSky (Token bis 15s + Flights 6s)

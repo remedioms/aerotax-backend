@@ -128,25 +128,31 @@ def fetch_tile(session, tile):
     # 200 mit full_count>0 aber KEINE ac-Zeilen = Soft-Block (IP gedrosselt).
     if obj.get("full_count") and not any(isinstance(v, list) for v in obj.values()):
         raise _Blocked("empty_ac (soft-block)")
-    rows = []
+    out = []
     for k, v in obj.items():
         if not isinstance(v, list):
             continue
         row = _row_to_opensky(v)
         if row is not None and row[0] is not None:
-            rows.append(row)
-    return rows
+            # Route (IATA) aus den FR24-ROHfeldern [11]/[12] — die normalisierte
+            # OpenSky-Row trägt sie NICHT; separat fürs Warehouse-Enrichment.
+            origin = (str(v[11]).strip().upper() or None) if len(v) > 11 and v[11] else None
+            dest = (str(v[12]).strip().upper() or None) if len(v) > 12 and v[12] else None
+            flight = (str(v[13]).strip().upper() or None) if len(v) > 13 and v[13] else None
+            out.append({"row": row, "origin": origin, "dest": dest, "flight": flight})
+    return out
 
 
-def upsert(session, sb_url, sb_key, rows, tile_idx):
-    if not rows:
+def upsert(session, sb_url, sb_key, items, tile_idx):
+    if not items:
         return 0
     now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     payload = [{
-        "hex": row[0], "callsign": row[1],
-        "lat": row[6], "lon": row[5],
-        "row": row, "tile": str(tile_idx), "updated_at": now_iso,
-    } for row in rows]
+        "hex": it["row"][0], "callsign": it["row"][1],
+        "lat": it["row"][6], "lon": it["row"][5],
+        "origin": it["origin"], "dest": it["dest"], "flight": it["flight"],
+        "row": it["row"], "tile": str(tile_idx), "updated_at": now_iso,
+    } for it in items]
     ep = sb_url.rstrip('/') + "/rest/v1/fr24_live?on_conflict=hex"
     r = session.post(ep, headers={
         "apikey": sb_key, "Authorization": f"Bearer {sb_key}",
