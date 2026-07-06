@@ -71,10 +71,34 @@ journalctl -u fr24-harvester -f      # Live-Logs: "tile0 rows=1191 upserted=1191
   sollte je nach aktiver Luftfahrt einige Tausend sein.
 - Backend-Logs: `[fr24] store_warm rows=… index=…` → Backend liest die Flotte.
 
+## Ban-Resilienz (wie sicher ist das?)
+Eingebaut gegen Blocks:
+- **Kein Login** → es gibt kein Konto zu bannen, nur IP-Blocks (die man durch
+  IP-Wechsel heilt). Das ist der wichtigste Schutz.
+- **Niedrige Rate** (~1 Call/40 s pro IP) + **±30 % Jitter** → kein maschinelles Muster.
+- **UA-Rotation** (Pool aus 4 aktuellen Desktop-Browsern) pro Fetch.
+- **Block-Backoff**: 403/429 ODER 200-mit-leerem-`ac` (Soft-Block) → exponentiell
+  60 s→2 m→4 m…→15 m Deckel, erholt sich bei Erfolg. Kein Hämmern gegen eine
+  gedrosselte IP.
+- **Redundanz**: eine geblockte IP ≠ Ausfall — die anderen VMs + der Backend-
+  Selbst-Harvest-Fallback tragen weiter.
+
+Ehrliche Grenzen:
+- Mehr Regionen bringen **Ausfallsicherheit, nicht mehr Daten** — FR24s Feed ist
+  global, egal von wo man fragt. Nutzen von „mehr IPs" = Redundanz + weniger Last/IP.
+- **Oracle = Datacenter-IPs.** FR24 *kann* ganze DC-ASN-Bereiche flaggen.
+  Sicherer sind **residential IPs**: der Heim-**Raspberry-Pi** (eigene Node),
+  oder ein `HARVESTER_PROXY` mit Residential-Proxy. Für maximale Robustheit die
+  Flotte über **verschiedene Anbieter/ASNs** streuen (Oracle + fly.io + Pi …),
+  nicht nur Oracle-Regionen.
+
+### Optionaler Proxy (ohne Code-Änderung)
+```bash
+export HARVESTER_PROXY='http://user:pass@proxy-host:port'   # oder Standard HTTPS_PROXY
+```
+
 ## Hinweise
 - FR24-ToS untersagt Scraping → **non-commercial-Grauzone**. Deshalb verteilt,
-  höflich (1 Call/40 s pro IP) und nur als Coverage-Loch-Fallback.
+  höflich und nur als Coverage-Loch-Fallback.
 - `POLL_SECONDS` nicht unter ~15 s drücken — sonst riskiert eine IP doch einen Block.
-- Block-Symptom: `tile ERROR` / leere Antworten. Der Harvester wartet dann 30 s;
-  hält es an, IP wechseln (andere Oracle-Region) oder Kachel auf andere VM ziehen.
 - `SUPABASE_KEY` = Service-Role-Key. Nie ins Repo committen — nur als VM-Env/Secret.

@@ -22,15 +22,24 @@ Deps: requests. Deploy siehe README.md.
 """
 import json
 import os
+import random
 import sys
 import time
-import urllib.parse
 
 import requests
 
 FR24_FEED_URL = "https://data-cloud.flightradar24.com/zones/fcgi/feed.js"
-FR24_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-           "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+# UA-Pool: pro Fetch rotiert (jede IP sieht nicht immer denselben UA → weniger
+# Fingerprint-Signal). Alle aktuelle Desktop-Browser.
+FR24_UAS = [
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+     "(KHTML, like Gecko) Version/17.0 Safari/605.1.15"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+]
 
 # IDENTISCH zu blueprints/adsb_blueprint.py FR24_TILES (lat_n,lat_s,lon_w,lon_e).
 FR24_TILES = [
@@ -82,18 +91,28 @@ def _row_to_opensky(v):
         return None
 
 
+class _Blocked(Exception):
+    """FR24 hat gedrosselt/geblockt (429/403 ODER 200 mit leerem ac trotz Luft-
+    verkehr in der Kachel) → Aufrufer macht Exponential-Backoff."""
+
+
 def fetch_tile(session, tile):
     n, s, w, e = tile
     url = (f"{FR24_FEED_URL}?bounds={n},{s},{w},{e}"
            "&faa=1&mlat=1&flarm=1&adsb=1&gnd=0&air=1&vehicles=0"
            f"&estimated=1&maxage={os.environ.get('MAXAGE', '14400')}&gliders=0&stats=0")
     r = session.get(url, headers={
-        "User-Agent": FR24_UA, "Accept": "application/json",
+        "User-Agent": random.choice(FR24_UAS), "Accept": "application/json",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.flightradar24.com/",
     }, timeout=15)
+    if r.status_code in (403, 429):
+        raise _Blocked(f"http {r.status_code}")
     r.raise_for_status()
     obj = r.json()
+    # 200 mit full_count>0 aber KEINE ac-Zeilen = Soft-Block (IP gedrosselt).
+    if obj.get("full_count") and not any(isinstance(v, list) for v in obj.values()):
+        raise _Blocked("empty_ac (soft-block)")
     rows = []
     for k, v in obj.items():
         if not isinstance(v, list):
@@ -139,10 +158,18 @@ def main():
         print("FATAL: keine gültigen TILES", file=sys.stderr)
         sys.exit(2)
     poll = float(os.environ.get("POLL_SECONDS", "20"))
-    print(f"[fr24-harvester] tiles={my_tiles} poll={poll}s -> {sb_url}", flush=True)
-
+    # Optionaler Proxy (später ohne Code-Änderung reinsteckbar): HTTPS_PROXY /
+    # HARVESTER_PROXY. requests liest HTTPS_PROXY automatisch; HARVESTER_PROXY
+    # setzt ihn explizit auf die Session.
     session = requests.Session()
+    prox = os.environ.get("HARVESTER_PROXY", "").strip()
+    if prox:
+        session.proxies.update({"http": prox, "https": prox})
+    print(f"[fr24-harvester] tiles={my_tiles} poll={poll}s proxy={'yes' if prox else 'no'} "
+          f"-> {sb_url}", flush=True)
+
     i = 0
+    backoff = 0.0          # wächst bei Blocks, sinkt bei Erfolg
     while True:
         idx = my_tiles[i % len(my_tiles)]
         i += 1
@@ -150,11 +177,19 @@ def main():
             rows = fetch_tile(session, FR24_TILES[idx])
             n = upsert(session, sb_url, sb_key, rows, idx)
             print(f"[fr24-harvester] tile{idx} rows={len(rows)} upserted={n}", flush=True)
+            backoff = max(0.0, backoff - 30.0)      # erholt sich schrittweise
+        except _Blocked as e:
+            backoff = min(900.0, (backoff * 2) or 60.0)   # 60s→2m→4m…→15m Deckel
+            print(f"[fr24-harvester] tile{idx} BLOCKED {e} -> backoff {backoff:.0f}s "
+                  f"(IP evtl. gedrosselt; ggf. Region/Proxy wechseln)",
+                  file=sys.stderr, flush=True)
+            time.sleep(backoff)
         except Exception as e:
             print(f"[fr24-harvester] tile{idx} ERROR {type(e).__name__}: "
                   f"{str(e)[:100]}", file=sys.stderr, flush=True)
-            time.sleep(30)   # Block/Fehler → länger warten
-        time.sleep(poll)
+            time.sleep(30)
+        # Jitter ±30% auf das Poll-Intervall → kein maschinell-regelmäßiges Muster.
+        time.sleep(max(5.0, poll * random.uniform(0.7, 1.3)))
 
 
 if __name__ == "__main__":
