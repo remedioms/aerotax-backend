@@ -41,9 +41,17 @@ FR24_UAS = [
      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
 ]
 
-# IDENTISCH zu blueprints/adsb_blueprint.py FR24_TILES (lat_n,lat_s,lon_w,lon_e).
+# Kacheln (lat_n,lat_s,lon_w,lon_e). 0-7 = COVERAGE-LÖCHER (kritisch: dort liefern
+# die freien ADS-B-Netze nichts → FR24 ist die einzige Positionsquelle). 8-14 =
+# EUROPA-ENRICHMENT: FR24 liefert dort Route+Tail für jeden Flieger gratis →
+# füttert das Warehouse (Routen-Cache) und spart AeroDataBox-Routen-Spend.
+# Europa ist dicht → Kacheln clippen ggf. bei 1500/Call (fürs Enrichment egal:
+# 1500 Routen/Tails geschenkt; für POSITIONEN in EU nutzen wir eh die freien Netze).
+# Round-Robin über ALLE → gleiche höfliche Rate, nur längerer Zyklus.
+# (Backend-Selbst-Harvest-Fallback nutzt NUR 0-7, damit die kritischen Löcher
+#  auch ohne NAS schnell frisch bleiben.)
 FR24_TILES = [
-    (55, 20, 55, 110),    # 0 Zentralasien/West-China
+    (55, 20, 55, 110),    # 0 Zentralasien/West-China        ── Löcher ──
     (72, 45, 55, 140),    # 1 Trans-Sibirien
     (55, 20, 110, 145),   # 2 Ost-China/Korea/Japan-Anflug
     (45, 8, 30, 65),      # 3 Naher Osten / Kaspisch
@@ -51,6 +59,13 @@ FR24_TILES = [
     (72, 35, -60, -10),   # 5 Nordatlantik
     (60, 15, 140, 180),   # 6 Nordpazifik-West
     (40, -40, -25, 55),   # 7 Afrika / Südatlantik
+    (60, 48, -11, 3),     # 8  UK/Irland/Benelux-NW           ── Europa-Enrichment ──
+    (52, 42, -3, 10),     # 9  Frankreich/Benelux/W-DE/Schweiz
+    (56, 45, 9, 20),      # 10 Mittel-EU (DE-Ost/PL/CZ/AT)
+    (72, 55, 4, 32),      # 11 Skandinavien/Baltikum
+    (45, 35, -10, 5),     # 12 Iberien
+    (47, 35, 6, 30),      # 13 Italien/Adria/Balkan/Griechenland
+    (52, 44, 20, 40),     # 14 Ost-EU/Ukraine/Türkei-Nord
 ]
 
 
