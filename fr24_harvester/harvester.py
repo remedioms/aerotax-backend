@@ -217,7 +217,7 @@ def main():
             if n == 0:
                 consec_empty += 1
                 if consec_empty >= 5:
-                    backoff = min(900.0, (backoff * 2) or 90.0)
+                    backoff = min(1800.0, (backoff * 2) or 120.0)
                     print(f"[fr24-harvester] THROTTLE vermutet ({consec_empty} leere "
                           f"Kacheln in Folge) -> backoff {backoff:.0f}s", file=sys.stderr, flush=True)
                     consec_empty = 0
@@ -234,7 +234,7 @@ def main():
                 win_rows = 0
                 last_hb = time.time()
         except _Blocked as e:
-            backoff = min(900.0, (backoff * 2) or 60.0)   # 60s→2m→4m…→15m Deckel
+            backoff = min(1800.0, (backoff * 2) or 90.0)   # 60s→2m→4m…→15m Deckel
             print(f"[fr24-harvester] tile{idx} BLOCKED {e} -> backoff {backoff:.0f}s "
                   f"(IP evtl. gedrosselt; ggf. Region/Proxy wechseln)",
                   file=sys.stderr, flush=True)

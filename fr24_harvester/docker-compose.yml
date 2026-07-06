@@ -28,7 +28,7 @@ services:
       SUPABASE_URL: "https://jyrbijvmwacuivssbxlg.supabase.co"
       SUPABASE_KEY: "${SUPABASE_KEY:?SUPABASE_KEY env fehlt}"
       TILES: "all"           # eine Node = alle 8 Kacheln round-robin
-      POLL_SECONDS: "20"     # pro Kachel also ~alle 160s → sehr höflich
+      POLL_SECONDS: "30"     # pro Kachel also ~alle 160s → sehr höflich
       QUIET: "1"             # keine Erfolgs-Logzeilen (nur Fehler/Blocks + 30min-Heartbeat)
     # Der Harvester macht NUR Netz-Traffic (POST an Supabase) — kein lokaler Disk-I/O.
     # Mit logging:none + read_only + tmpfs berührt der laufende Container die HDDs
