@@ -549,6 +549,23 @@ def _flight_window_state(day, legs_live, now):
     return flying, en_eff, landed_obs
 
 
+def _canonical_flight_phase(legs_live):
+    """Kanonische Flug-Phase (fliegt/gelandet/rollt/am Gate) für die Family-/
+    Freunde-Karte — aus der Board-Beobachtung des letzten (Ankunfts-)Legs via
+    warehouse_reader._status_phase_of. EINE Wahrheit, SEITEN-BEWUSST (side='arr':
+    'at gate'/'on ground' am ZIEL = gelandet, nicht die grobe Substring-Erkennung).
+    Nutzt die legs_live, die family_watch ohnehin schon geholt hat — kein neuer
+    Netz-/SB-Call. None wenn kein/unklares Signal (Karte bleibt bei flying_now)."""
+    if not legs_live:
+        return None
+    try:
+        from blueprints.warehouse_reader import _status_phase_of
+        stx = str((legs_live[-1] or {}).get('status') or '')
+        return _status_phase_of(stx, 'arr')
+    except Exception:
+        return None
+
+
 # ── Live-Positions-Fix für die „Fliegt gerade"-Karte (Owner 2026-07-06) ──────
 #
 # „die familie/freunde sind wichtiger als ich — ich sehe meinen flug kaum, da
@@ -732,6 +749,10 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         # Family sieht ein Radar-Widget mit interpoliertem Flieger statt „In <Abflug>".
         # iOS rechnet Position/Animation selbst aus dep/arr-IATA + den Zeiten.
         'flying_now': None,
+        # Kanonische Flug-Phase aus DER Status-Quelle (status_for_flight-Logik):
+        # 'airborne'|'landed'|'grounded'|'cancelled'|None → iOS zeigt „Fliegt
+        # gerade / Gelandet / Am Gate / rollt" statt selbst zu raten.
+        'flight_phase': None,
         'today_dep_iata': None,
         'today_arr_iata': None,
         'today_dep_city': None,
@@ -853,6 +874,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     today_arr_est_iso = None    # Dienst-Ende + beobachtete Verspätung (nur echte Obs)
     today_chain = None          # volle IATA-Kette des aktiven Tags (Städte-Label)
     legs_live_cached = None     # Board-/Warehouse-Beobachtungen je Leg (einmal geholt)
+    flight_phase = None         # kanonische Phase (fliegt/gelandet/rollt/am Gate)
     active_datum = None         # datum des AKTIVEN Flugtags (Red-Eye: ggf. gestern)
     day_fns = {}                # datum → 1:1 gemappte Flugnummern (aus _live_legs_for)
 
@@ -1000,8 +1022,13 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
             # den All-None-„Status unbekannt" ohne jede Log-Spur.
             src_fail = True
             _log().info(f'[family-watch] roster_read_skip {type(e).__name__}')
+    # Kanonische Phase aus der Board-Beobachtung (Owner: „Family/Freunde sollen
+    # gelandet/rollt/am Gate aus DER Quelle zeigen, nicht selbst raten") — dieselbe
+    # status_for_flight-Logik wie überall, seiten-bewusst. Nur wenn Obs vorliegt.
+    flight_phase = _canonical_flight_phase(legs_live_cached)
     if 'next_flight' in allowed_fields:
         status['flying_now'] = flying_now
+        status['flight_phase'] = flight_phase   # 'airborne'|'landed'|'grounded'|'cancelled'|None
         status['today_dep_iata'] = today_dep
         status['today_arr_iata'] = today_arr
         status['today_dep_city'] = _iata_city_name(today_dep) if today_dep else None
