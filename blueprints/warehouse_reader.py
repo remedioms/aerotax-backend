@@ -474,6 +474,26 @@ def route_for_flight(callsign=None, hex=None, reg=None, lat=None, lon=None,
             D._record_resolved_route(cs, reg_u, wh, date)
             return wh
 
+    # ── 3.5) FR24 gRPC — per-flight Route-Autorität (nur Live-Pfad) ────────────
+    #     Verifiziert 2026-07-07: die Route kommt aus live_feed.extra_info.route DES
+    #     AKTUELLEN Flugs (per-flight), nicht aus einer statischen Callsign->Route-
+    #     Tabelle → 10/10 korrekt inkl. Ozean + reused-Callsigns (adsbdb 37,5%
+    #     falsch, bleibt tot). Anonym/gratis über gRPC (AWS-ELB, kein CF-Block).
+    #     Nur wenn eine Live-Position vorliegt (kein Suchpfad, braucht die BBox).
+    if not for_search and lat is not None and lon is not None:
+        try:
+            from blueprints import fr24_grpc
+            g = fr24_grpc.resolve_route_live(callsign=cs, hex=hex_l, reg=reg_u,
+                                             lat=lat, lon=lon)
+        except Exception:
+            g = None
+        if g and (g.get('src') or g.get('dst')):
+            g['source'] = 'fr24_grpc'
+            g['confidence'] = 'confirmed'
+            if _accept(g):
+                D._record_resolved_route(cs, g.get('reg') or reg_u, g, date)
+                return g
+
     # ── 4) fr24_live (GRATIS, verteilter Harvester-Store) — estimated ──────────
     fr = D._route_from_fr24(cs, hex_l)
     if fr and (fr.get('src') or fr.get('dst')):
