@@ -113,6 +113,34 @@ def test_refresh_is_rate_limited(monkeypatch):
     assert fetch.call_count == 1
 
 
+def test_warm_from_distributed_store(monkeypatch):
+    # Harvester-Flotte hat fr24_live gefüllt → Backend liest warm, harvestet
+    # NICHT selbst und findet den Flieger.
+    r = ADSB._fr24_row_to_opensky(FR24_ROW)
+    fake_sb = MagicMock()
+    (fake_sb.table.return_value.select.return_value.gt.return_value
+     .limit.return_value.execute.return_value) = MagicMock(
+        data=[{"hex": "4d0113", "callsign": "CLX4327", "row": r}])
+    monkeypatch.setattr(ADSB, "_sb_client", lambda: (fake_sb, True))
+    self_harvest = MagicMock()
+    monkeypatch.setattr(ADSB, "_fr24_refresh_one_tile", self_harvest)
+    ADSB._FR24["store_at"] = 0.0
+    row = ADSB._fetch_fr24("4d0113")
+    assert row is not None and row[2] == "LX-VCJ"
+    self_harvest.assert_not_called()       # Store frisch → kein Selbst-Fetch
+
+
+def test_self_harvest_when_store_cold(monkeypatch):
+    # Kein Supabase (keine VMs deployed) → Backend springt selbst ein.
+    monkeypatch.setattr(ADSB, "_sb_client", lambda: (None, False))
+    self_harvest = MagicMock()
+    monkeypatch.setattr(ADSB, "_fr24_refresh_one_tile", self_harvest)
+    ADSB._FR24["store_at"] = 0.0
+    ADSB._FR24["store_fresh_at"] = 0.0
+    ADSB._fetch_fr24("4d0113")
+    self_harvest.assert_called_once()
+
+
 def test_entry_ttl_eviction(monkeypatch):
     fetch = MagicMock(return_value=[ADSB._fr24_row_to_opensky(FR24_ROW)])
     monkeypatch.setattr(ADSB, "_fr24_fetch_tile", fetch)

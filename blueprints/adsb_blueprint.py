@@ -980,8 +980,13 @@ FR24_TILES = [
     (40, -40, -25, 55),   # Afrika / Südatlantik-Anflug
 ]
 # entries: hex → (row, inserted_ts). by_cs: callsign → hex. Merge über alle Kacheln.
+# store_fresh_at: wann der verteilte Harvester-Store (Supabase fr24_live) zuletzt
+# frische Daten lieferte — ist er warm, harvestet das Backend NICHT selbst.
+FR24_STORE_READ_MIN = 30        # s — frühestens so oft den Supabase-Store nachladen
+FR24_STORE_FRESH = 120          # s — solange Store-Daten frisch sind, kein Selbst-Fetch
 _FR24 = {"lock": threading.Lock(), "last_at": 0.0, "tile_idx": 0,
-         "entries": {}, "by_cs": {}, "cooldown_until": 0.0}
+         "entries": {}, "by_cs": {}, "cooldown_until": 0.0,
+         "store_at": 0.0, "store_fresh_at": 0.0}
 
 
 def _fr24_row_to_opensky(v):
@@ -1089,14 +1094,67 @@ def _fr24_refresh_one_tile():
         f"[fr24] tile{idx} {tile} rows={len(rows)} index={len(_FR24['entries'])}")
 
 
+def _fr24_warm_from_store():
+    """Liest die verteilte Harvester-Flotte (Supabase fr24_live) warm in den
+    In-Memory-Index. Das ist der PRIMÄRE Pfad: mehrere IPs pollen FR24 und
+    schreiben hierher; das Backend fasst FR24 dann selbst NICHT an. Throttled
+    (FR24_STORE_READ_MIN). Setzt store_fresh_at, wenn frische Rows kamen. Wirft NIE."""
+    now = time.time()
+    with _FR24["lock"]:
+        if now - _FR24["store_at"] < FR24_STORE_READ_MIN:
+            return
+        _FR24["store_at"] = now
+    sb, ok = _sb_client()
+    if not ok or sb is None:
+        return
+    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                           time.gmtime(now - FR24_ENTRY_TTL))
+    try:
+        res = (sb.table('fr24_live')
+               .select('hex,callsign,row')
+               .gt('updated_at', cutoff)
+               .limit(8000).execute())
+        data = res.data or []
+    except Exception as e:
+        logging.getLogger('aerotax.adsb').info(
+            f"[fr24] store_read_skip {type(e).__name__}: {str(e)[:60]}")
+        return
+    if not data:
+        return
+    ins = time.time()
+    with _FR24["lock"]:
+        ent = _FR24["entries"]
+        for d in data:
+            row = d.get('row')
+            if not isinstance(row, list) or not row or not row[0]:
+                continue
+            hx = str(row[0]).strip().lower()
+            ent[hx] = (row, ins)
+            cs = d.get('callsign') or (row[1] if len(row) > 1 else None)
+            if cs:
+                _FR24["by_cs"][str(cs).upper()] = hx
+        cutoff_ts = ins - FR24_ENTRY_TTL
+        for h in [h for h, (_, t) in ent.items() if t < cutoff_ts]:
+            ent.pop(h, None)
+        _FR24["store_fresh_at"] = ins
+    logging.getLogger('aerotax.adsb').info(
+        f"[fr24] store_warm rows={len(data)} index={len(_FR24['entries'])}")
+
+
 def _fetch_fr24(hex_id, callsign=None):
     """FR24-Grauzonen-Lookup aus dem gemergten Korridor-Index: erst per hex,
-    sonst per Callsign. Triggert vorher einen (rate-begrenzten) Kachel-Refresh.
+    sonst per Callsign. Primär aus der verteilten Harvester-Flotte (Supabase);
+    nur falls die kalt ist (keine VMs/alle tot), selbst EINE Kachel harvesten.
     Row (frisch genug) oder None. Wirft NIE."""
     if not hex_id and not callsign:
         return None
     try:
-        _fr24_refresh_one_tile()
+        _fr24_warm_from_store()
+        with _FR24["lock"]:
+            store_live = (time.time() - _FR24["store_fresh_at"]) < FR24_STORE_FRESH
+        if not store_live:
+            # Harvester-Flotte kalt → Backend springt selbst ein (degradiert sauber).
+            _fr24_refresh_one_tile()
     except Exception:
         pass
     now = time.time()
