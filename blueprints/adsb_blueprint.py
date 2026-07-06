@@ -3256,6 +3256,46 @@ def _area_from_fr24_live(lat, lon, radius):
     return out or None
 
 
+def _area_from_fr24_grpc(lat, lon, radius):
+    """Satelliten-Fallback für die Live-Map: FR24 gRPC area() über eine bbox —
+    füllt Ozean/China/Sibirien (Aireon-Satellit + Partner-Feeds), wo adsb.lol/fi/
+    OpenSky PHYSISCH leer sind (kein Bodenempfänger). Rückgabe: normalisierte
+    Dicts (identisches Schema wie _normalize_adsb_lol_ac → downstream unverändert),
+    oder None. FR24 liefert alt in ft + speed in kts = dieselben Einheiten."""
+    try:
+        from blueprints import fr24_grpc
+    except Exception:
+        return None
+    if not fr24_grpc.available():
+        return None
+    lamin, lomin, lamax, lomax = _bbox_from_point(lat, lon, radius)
+    try:
+        positions = fr24_grpc.area(north=lamax, south=lamin, west=lomin, east=lomax,
+                                   limit=1500)
+    except Exception:
+        return None
+    out = []
+    for p in (positions or []):
+        if p.get('lat') is None or p.get('lon') is None:
+            continue
+        out.append({
+            'hex': None,                       # FR24-Row trägt kein hex → callsign-Key
+            'flight': p.get('callsign'),
+            'callsign': p.get('callsign'),
+            'lat': p.get('lat'), 'lon': p.get('lon'),
+            'alt': p.get('alt'),               # ft
+            'speed': p.get('speed'),           # kts
+            'heading': p.get('track'),
+            'squawk': None,
+            'reg': p.get('reg'),
+            'type': p.get('ac_type'),
+            'on_ground': False,
+            'route_from': p.get('route_from'), # Bonus: Route inline (Tap sofort da)
+            'route_to': p.get('route_to'),
+        })
+    return out or None
+
+
 @adsb_bp.route('/api/adsb/area', methods=['GET'])
 def get_adsb_area():
     """Live-Aircraft in einem Radius um einen Punkt.
@@ -3362,6 +3402,22 @@ def get_adsb_area():
                               "reason": f"rate_limited({e.retry_after}s)"})
             except _OpenSkyError as e:
                 tried.append({"upstream": "opensky", "ok": False, "reason": str(e)[:80]})
+
+    # ─── Satelliten-Fallback (Ozean/China/remote) ───
+    # adsb.lol/OpenSky sind über Ozean/China leer (kein Bodenempfänger) → sie geben
+    # eine LEERE Liste zurück (kein Fehler). FR24 gRPC füllt genau diese Löcher via
+    # Aireon-Satellit/Partner-Feeds. Nur beim Rauszoomen (Übersicht) und nur wenn
+    # bisher NICHTS da ist (None ODER leer) — normaler Land-Traffic bleibt adsb.lol.
+    if (not aircraft) and radius >= _AREA_FR24_MIN_RADIUS_NM:
+        try:
+            g_ac = _area_from_fr24_grpc(lat, lon, radius)
+        except Exception as e:
+            g_ac = None
+            tried.append({"upstream": "fr24_grpc", "ok": False, "reason": str(e)[:80]})
+        if g_ac:
+            aircraft = g_ac
+            source = "fr24_grpc"
+            tried.append({"upstream": "fr24_grpc", "ok": True, "count": len(g_ac)})
 
     if aircraft is None:
         return jsonify({"ok": False, "error": "all_upstreams_failed",
