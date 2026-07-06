@@ -131,7 +131,11 @@ def test_warm_from_distributed_store(monkeypatch):
 
 
 def test_self_harvest_when_store_cold(monkeypatch):
-    # Kein Supabase (keine VMs deployed) → Backend springt selbst ein.
+    # Kill-Switch ON: Selbst-Harvest ist per Default AUS (der verteilte
+    # Harvester füllt fr24_live); nur mit explizitem FR24_BACKEND_SELFHARVEST=1
+    # springt das Backend bei kaltem Store selbst ein (Notbetrieb, keine VM).
+    # Den Default-AUS-Fall deckt test_fr24_selfharvest_off_by_default_store_read_works.
+    monkeypatch.setenv("FR24_BACKEND_SELFHARVEST", "1")
     monkeypatch.setattr(ADSB, "_sb_client", lambda: (None, False))
     self_harvest = MagicMock()
     monkeypatch.setattr(ADSB, "_fr24_refresh_one_tile", self_harvest)

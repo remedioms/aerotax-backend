@@ -619,10 +619,13 @@ def _reg_for_leg(leg_obs, flight_no, datum):
 
 
 def _live_fix_for_reg(reg, datum):
-    """Memoisierter Positions-Fix pro (reg, datum) — FAMILY = NUR FREIE QUELLEN
+    """Memoisierter Positions-Fix pro (reg, datum) — FAMILY = NUR TABELLEN
     (Owner 2026-07-06: „familie könnte sogar kostenlos bleiben, er muss halt
-    nur richtig sein mit abflug und ankunft"): Cache + OpenSky/adsb.lol, NIE
-    ein bezahlter Ping (allow_paid=False). Korrekt bleibt die Karte trotzdem,
+    nur richtig sein mit abflug und ankunft"): geht über denselben Resolver wie
+    Freunde/eigen (resolve_position_for_watch → position_for_flight), aber mit
+    allow_paid=False ⇒ targeted=False ⇒ liest NUR die Tabellen (fr24_live +
+    aircraft_positions, frischeste echte Position gewinnt), NIE ein bezahlter
+    Ping und keine externen Mirror-Fetches. Korrekt bleibt die Karte trotzdem,
     weil Abflug/Ankunft delay-korrigiert aus den Gratis-Board-Beobachtungen
     kommen; im Coverage-Loch zeigt sie die verankerte Interpolation. Der
     bezahlte purpose=watch-Tier bleibt den FREUNDE-Karten vorbehalten.
@@ -651,7 +654,8 @@ def _live_fix_for_reg(reg, datum):
             lon = row[5]
             if lat is not None and lon is not None:
                 # ECHTER Beobachtungszeitpunkt: time_position → last_contact →
-                # Fetch-Zeit (Tier 3 trägt reportedAtUtc bereits in [3]/[4]).
+                # Resolver-obs_ts (row[3]=echter Fix-Zeitstempel aus fr24_live/
+                # aircraft_positions; NIE „jetzt" für einen alten Fix).
                 ts = None
                 for cand in (row[3], row[4], fetch_ts):
                     try:
@@ -746,7 +750,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         'live_track': None,
         'live_speed_kt': None,
         'live_ts_iso': None,      # ECHTER Beobachtungszeitpunkt (UTC-Z)
-        'live_source': None,      # 'opensky' | 'adsb.lol' | 'adb' | …
+        'live_source': None,      # 'fr24' | 'aircraft_positions' (Family: nur Tabellen)
         # Zuhause/Feierabend: heute an der Homebase (reiner Heimtag) ODER nach
         # Landung an der Homebase (Dienst vorbei) — die Card zeigt „Feierabend"
         # statt eines falschen Layovers (User 2026-06-25).

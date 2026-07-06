@@ -139,9 +139,12 @@ def test_own_flag_free_empty_adb_position_delivered(client, monkeypatch):
     assert entry is not None and entry['source'] == 'adb'
     assert abs(entry['fetched_at'] - b['fetched_at']) < 1e-6
 
-    # tried dokumentiert die volle Kaskade in Reihenfolge.
-    assert [t['upstream'] for t in b['tried']] == ['opensky', 'adsb.lol',
-                                                   'fr24', 'aerodatabox']
+    # tried dokumentiert die volle Kaskade in NEUER Reihenfolge: die vom
+    # Harvester/Poller gefüllten Tabellen zuerst (fr24_live → aircraft_positions),
+    # dann der freie Mirror, zuletzt der bezahlte Notnagel. OpenSky ist aus dem
+    # synchronen User-Pfad raus.
+    assert [t['upstream'] for t in b['tried']] == ['fr24', 'aircraft_positions',
+                                                   'adsb.lol', 'aerodatabox']
 
 
 def test_purpose_inbound_also_enables_tier3(client, monkeypatch):
@@ -248,13 +251,15 @@ def test_free_source_hit_never_calls_adb_even_with_own(client, monkeypatch):
     live_row = ['3c64a8', 'DLH716', None, time.time(), time.time(),
                 91.55, 47.31, 11000.0, False, 250.0, 64.0,
                 None, None, None, None, False, 0]
-    monkeypatch.setattr(ADSB, '_fetch_opensky', lambda h: live_row)
+    # Tabellen leer (Fixture) → bei targeted (own=1) trifft der freie ADS-B-Mirror
+    # (Tier 3, gratis). Er liefert die Position, der bezahlte Tier bleibt zu.
+    monkeypatch.setattr(ADSB, '_fetch_adsb_lol', lambda h: live_row)
     http = MagicMock(return_value=_adb_payload())
     monkeypatch.setattr(ADSB, '_adb_position_http', http)
 
     r = client.get('/api/adsb/state?hex=3c64a8&reg=D-AIPA&own=1')
     b = r.get_json()
-    assert b['source'] == 'opensky'
+    assert b['source'] == 'adsb.lol'
     http.assert_not_called()
     BPD._budget_key_inc.assert_not_called()
 

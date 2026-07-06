@@ -3163,10 +3163,14 @@ def _live_pos_from_state(row):
 
 
 def _machine_live(reg, want_route=True):
-    """Für EINE Registration → (hex, callsign, pos_dict, route_dict). Rein gratis
-    (Reg→Hex via Resolver+gebackene DB → OpenSky/adsb.lol-Live-State + free-first-
-    Routen-Kaskade). Alle Rückgaben None-safe; wirft nie."""
-    _r2h, fls, frf, touch = _adsb_helpers()
+    """Für EINE Registration → (hex, callsign, pos_dict, route_dict). REIN GRATIS:
+    die Position kommt aus dem EINEN Resolver (position_for_flight), aber NUR aus
+    den vom Harvester/Poller gefüllten Tabellen (targeted=False, allow_paid=False)
+    — KEIN bezahlter AeroDataBox-Ping und KEIN ungedeckelter Extern-Call im
+    User-Request (Kern-Regel 5000 User). „Wo ist mein/nächster Flieger" darf keine
+    API-Kosten pro Aufruf erzeugen; der Hintergrund-Poller hält aircraft_positions
+    frisch, die Harvester-Flotte fr24_live. Alle Rückgaben None-safe; wirft nie."""
+    _r2h, _fls, frf, touch = _adsb_helpers()  # _fls/frf: im gratis-Pfad NICHT genutzt
     reg = (reg or '').strip().upper() or None
     if not reg:
         return None, None, None, None
@@ -3180,14 +3184,21 @@ def _machine_live(reg, want_route=True):
             pass
     row = None
     try:
-        row = fls(hexid)
+        from blueprints.warehouse_reader import position_for_flight
+        # targeted=False → NUR Tabellen (Tier 1+2), nie extern/bezahlt.
+        row, _src, _obs_ts, _tried = position_for_flight(
+            hex=hexid, reg=reg, targeted=False, allow_paid=False)
     except Exception:
         row = None
     pos = _live_pos_from_state(row)
     cs = None
     if row and len(row) > 1 and row[1]:
         cs = str(row[1]).strip().upper() or None
-    if not cs and frf is not None:
+    # Callsign-Fallback via OpenSky (fetch_recent_flight) ist ein UNGEDECKELTER
+    # Extern-Call — im User-Request AUS (Kosten/Bot-Risiko). Nur mit explizitem
+    # Env-Guard (Notbetrieb/Debug), NIE im 5000-User-Default.
+    if (not cs and frf is not None
+            and os.environ.get('AEROX_MACHINE_LIVE_OPENSKY', '0') == '1'):
         try:
             fl = frf(hexid)
             if fl and fl.get('callsign'):

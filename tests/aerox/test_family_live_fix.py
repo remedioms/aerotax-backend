@@ -119,7 +119,12 @@ def _isolated(monkeypatch):
 # (a) flying + Reg + freier Fix → Felder gesetzt, KEIN Paid-Call
 # ══════════════════════════════════════════════════════════════════════════════
 def test_free_fix_no_paid_call(monkeypatch):
-    monkeypatch.setattr(ADSB, '_fetch_opensky', lambda h: _os_row(age_s=120))
+    # Family ist targeted=False (allow_paid=False) → NUR Tabellen (Tier 1
+    # fr24_live + Tier 2 aircraft_positions), kein externer Mirror. Die frei
+    # gelieferte Position kommt aus der fr24_live-Tabelle (_fetch_fr24), nicht
+    # mehr aus einem synchronen OpenSky-Ping (der ist aus dem User-Pfad raus).
+    monkeypatch.setattr(ADSB, '_fetch_fr24',
+                        lambda h, callsign=None: _os_row(age_s=120))
     monkeypatch.setattr(BPD, '_sb_day_reg',
                         lambda fn, d: ('D-AIXP', 'A359', 'FRA', 'HND'))
     http = MagicMock(return_value=_adb_payload())
@@ -130,7 +135,7 @@ def test_free_fix_no_paid_call(monkeypatch):
     assert fix['lat'] == 47.31 and fix['lon'] == 91.55
     assert fix['track'] == 64.0
     assert abs(fix['speed_kt'] - 250.0 / 0.514444) < 0.2
-    assert fix['source'] == 'opensky'
+    assert fix['source'] == 'fr24'
     # ECHTER Beobachtungszeitpunkt (time_position der Row), nicht „jetzt".
     assert abs(fix['ts'] - (time.time() - 120)) < 5
 
@@ -148,15 +153,17 @@ def test_family_free_only_no_adb_even_when_free_empty(monkeypatch):
     # Karte bleibt Plan-Interpolation (Zeiten sind delay-korrigiert, gratis).
     monkeypatch.setattr(BPD, '_sb_day_reg',
                         lambda fn, d: ('D-AIXP', 'A359', 'FRA', 'HND'))
-    opensky = MagicMock(return_value=None)
-    monkeypatch.setattr(ADSB, '_fetch_opensky', opensky)
+    # Family liest NUR die Tabellen (targeted=False): Tier 1 = fr24_live-Store.
+    # Leer → kein Fix; der bezahlte Tier wird NIE angefasst.
+    fr24 = MagicMock(return_value=None)
+    monkeypatch.setattr(ADSB, '_fetch_fr24', fr24)
     http = MagicMock(return_value=_adb_payload(reg='D-AIXP', age_s=60))
     monkeypatch.setattr(ADSB, '_adb_position_http', http)
 
     fix1 = FW._flying_live_fix(['FRA', 'HND'], TODAY, ['LH716'], None)
     assert fix1 is None
-    assert opensky.call_count == 1          # freie Kaskade lief …
-    http.assert_not_called()                # … Tier 3 für Family NIE
+    assert fr24.call_count == 1             # freie Tabellen-Kaskade lief …
+    http.assert_not_called()                # … Tier 4 (bezahlt) für Family NIE
     BPD._budget_key_inc.assert_not_called()
     BPD._paid_budget_inc.assert_not_called()
 
@@ -164,7 +171,7 @@ def test_family_free_only_no_adb_even_when_free_empty(monkeypatch):
     # innerhalb 10 min löst keinen weiteren Kaskaden-Lauf aus.
     fix2 = FW._flying_live_fix(['FRA', 'HND'], TODAY, ['LH716'], None)
     assert fix2 is None
-    assert opensky.call_count == 1
+    assert fr24.call_count == 1
     http.assert_not_called()
 
 
@@ -226,7 +233,8 @@ def test_multileg_ambiguous_no_ping(monkeypatch):
 
 
 def test_multileg_unambiguous_uses_observed_leg_times(monkeypatch):
-    monkeypatch.setattr(ADSB, '_fetch_opensky', lambda h: _os_row(age_s=60))
+    monkeypatch.setattr(ADSB, '_fetch_fr24',
+                        lambda h, callsign=None: _os_row(age_s=60))
     sb_day_reg = MagicMock(return_value=(None, None, None, None))
     monkeypatch.setattr(BPD, '_sb_day_reg', sb_day_reg)
     seen_regs = []
@@ -249,7 +257,7 @@ def test_multileg_unambiguous_uses_observed_leg_times(monkeypatch):
     ]
     fix = FW._flying_live_fix(['FRA', 'MUC', 'HND'], TODAY,
                               ['LH100', 'LH717'], legs)
-    assert fix is not None and fix['source'] == 'opensky'
+    assert fix is not None and fix['source'] == 'fr24'
     assert seen_regs == ['D-AIXQ']       # Reg des EINDEUTIG aktiven Legs
     sb_day_reg.assert_not_called()       # Reg kam aus der Leg-Beobachtung
 
@@ -326,14 +334,15 @@ def _loader_env(monkeypatch):
 
 def test_loader_sets_live_fields_under_next_flight_grant(monkeypatch):
     _loader_env(monkeypatch)
-    monkeypatch.setattr(ADSB, '_fetch_opensky', lambda h: _os_row(age_s=90))
+    monkeypatch.setattr(ADSB, '_fetch_fr24',
+                        lambda h, callsign=None: _os_row(age_s=90))
 
     st = FW._load_crew_status_for_family('tok-live-fix-a', {'next_flight'})
     assert st['flying_now'] is True
     assert st['live_lat'] == 47.31 and st['live_lon'] == 91.55
     assert st['live_track'] == 64.0
     assert abs(st['live_speed_kt'] - 250.0 / 0.514444) < 0.2
-    assert st['live_source'] == 'opensky'
+    assert st['live_source'] == 'fr24'
     # Kanonischer echter Beobachtungszeitpunkt (UTC-Z, ~90 s alt).
     ts = FW._parse_iso(st['live_ts_iso'])
     age = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds()

@@ -311,6 +311,12 @@ _CACHE_TTL_SECONDS = 60
 # Time-Window — länger wäre irreführend (Maschine könnte längst gelandet
 # sein), kürzer würde Cold-Start-Recoverys nicht überbrücken.
 _LAST_KNOWN_TTL_SECONDS = 1800
+# Frische-Floor: eine aus den Warehouse-Tabellen (fr24_live/aircraft_positions/
+# adsb.lol) gewählte Position darf nur dann als LIVE (cached:false) ausgeliefert
+# werden, wenn ihre ECHTE Beobachtung jünger als das ist. Ältere echte Fixe
+# werden ehrlich `stale_due_to_upstream_outage` markiert statt als „jetzt
+# aktuell" — verhindert den 2026-07-05-Bug (2,3h-alter Atlantik-Punkt als live).
+_LIVE_TABLE_FLOOR_S = 900
 _CACHE_LOCK = threading.Lock()
 
 # Rate-Limit-Tracking: wenn OpenSky uns 429't, blocken wir global für die
@@ -1009,6 +1015,14 @@ def _fr24_row_to_opensky(v):
         ts = _n(v[10]) or time.time()
         cs = (str(v[16]).strip() or None) if v[16] else None
         reg = (str(v[9]).strip().upper() or None) if v[9] else None
+        # Der Feed wird mit &estimated=1 geholt (MLAT/extrapolierte Rows möglich).
+        # v[7] = radar/Receiver-Code: bei einem echten ADS-B-Fix steht ein
+        # Receiver-String drin; MLAT/estimated haben KEINEN direkten Receiver
+        # (leer/None). position_source folgt OpenSky: 0=ADS-B (echt), 2=MLAT/
+        # estimated. So kann der Resolver einen geschätzten Fix down-ranken, statt
+        # ihn nur über Frische einen echten überranken zu lassen.
+        _radar = str(v[7]).strip() if (len(v) > 7 and v[7] not in (None, '')) else ''
+        position_source = 0 if _radar and _radar.upper() != 'MLAT' else 2
         return [
             (str(v[0]).strip().lower() or None),                 # 0 hex
             cs,                                                   # 1 callsign
@@ -1026,7 +1040,7 @@ def _fr24_row_to_opensky(v):
             (alt_ft * 0.3048) if alt_ft is not None else None,   # 13 geo_alt_m
             (str(v[6]).strip() or None) if v[6] else None,       # 14 squawk
             False,                                                # 15 spi
-            0,                                                    # 16 position_source
+            position_source,                                      # 16 position_source
         ]
     except Exception:
         return None
@@ -1094,6 +1108,26 @@ def _fr24_refresh_one_tile():
         f"[fr24] tile{idx} {tile} rows={len(rows)} index={len(_FR24['entries'])}")
 
 
+def _parse_iso_to_epoch(val):
+    """ISO-8601-String (z.B. Supabase updated_at '2026-07-06T12:34:56Z') oder
+    bereits numerischer Unix-Wert → Unix-Epoch (float). None wenn unparsebar —
+    der Caller behandelt das dann ehrlich als „kein Zeitstempel"."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+    try:
+        dt = datetime.fromisoformat(str(val).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 def _fr24_warm_from_store():
     """Liest die verteilte Harvester-Flotte (Supabase fr24_live) warm in den
     In-Memory-Index. Das ist der PRIMÄRE Pfad: mehrere IPs pollen FR24 und
@@ -1111,7 +1145,7 @@ def _fr24_warm_from_store():
                            time.gmtime(now - FR24_ENTRY_TTL))
     try:
         res = (sb.table('fr24_live')
-               .select('hex,callsign,row')
+               .select('hex,callsign,row,updated_at')
                .gt('updated_at', cutoff)
                .limit(8000).execute())
         data = res.data or []
@@ -1129,6 +1163,18 @@ def _fr24_warm_from_store():
             if not isinstance(row, list) or not row or not row[0]:
                 continue
             hx = str(row[0]).strip().lower()
+            # ECHTE Beobachtungszeit sicherstellen: fehlt row[3] (time_position),
+            # den WAHREN Store-Zeitstempel (fr24_live.updated_at) einsetzen — NIE
+            # „jetzt" fabrizieren. Ist auch updated_at nicht parsebar, bleibt row[3]
+            # None → der Resolver behandelt die Row dann als ältest (nie fake-fresh).
+            while len(row) <= 3:
+                row.append(None)
+            if row[3] in (None, ''):
+                row[3] = _parse_iso_to_epoch(d.get('updated_at'))
+                if row[3] is not None and (len(row) <= 4 or row[4] in (None, '')):
+                    while len(row) <= 4:
+                        row.append(None)
+                    row[4] = row[3]
             ent[hx] = (row, ins)
             cs = d.get('callsign') or (row[1] if len(row) > 1 else None)
             if cs:
@@ -1152,8 +1198,12 @@ def _fetch_fr24(hex_id, callsign=None):
         _fr24_warm_from_store()
         with _FR24["lock"]:
             store_live = (time.time() - _FR24["store_fresh_at"]) < FR24_STORE_FRESH
-        if not store_live:
-            # Harvester-Flotte kalt → Backend springt selbst ein (degradiert sauber).
+        # KILL-SWITCH (Owner 2026-07-06, BAN-BLOCKER): der FR24-Selbst-Harvest im
+        # synchronen User-Pfad ist AUS. Der verteilte NAS/VM-Harvester füllt
+        # fr24_live; das Backend liest hier NUR den Store. Nur mit explizitem
+        # FR24_BACKEND_SELFHARVEST=1 springt das Backend bei kaltem Store selbst
+        # ein (Notbetrieb, wenn keine Harvester-VM läuft).
+        if not store_live and os.environ.get('FR24_BACKEND_SELFHARVEST', '0') == '1':
             _fr24_refresh_one_tile()
     except Exception:
         pass
@@ -1175,103 +1225,44 @@ def _fetch_fr24(hex_id, callsign=None):
 
 
 def _live_position_cascade(hex_param, reg_param='', targeted=False, callsign=''):
-    """Die Live-Kaskade OHNE Flask-Kontext: Step 1 OpenSky (mit globalem
-    Backoff) → Step 2 adsb.lol → Step 2c FR24-Grauzonen-Snapshot (frei,
-    Coverage-Loch) → Step 2b Tier 3 AeroDataBox (nur targeted=True, budget-bewacht). Wird von der Route get_adsb_state UND
-    intern vom Family-Watch-Fan-out benutzt (resolve_position_for_watch) —
-    KEIN HTTP-Self-Call nötig.
+    """Dünner Adapter auf die EINE Positions-Quelle (warehouse_reader.
+    position_for_flight). Signatur & Rückgabe UNVERÄNDERT, damit alle
+    bestehenden Caller (Route get_adsb_state + Family-Watch-Fan-out
+    resolve_position_for_watch) weiterlaufen.
+
+    Die Kaskaden-Logik selbst (Tier 1 fr24_live → Tier 2 aircraft_positions →
+    Tier 3 adsb.lol[targeted&miss] → Tier 4 AeroDataBox[targeted&paid], Auswahl
+    nach max echtem obs_ts) lebt jetzt zentral in warehouse_reader — genutzt von
+    ALLEN „wo ist der Flieger"-Pfaden (eigene Position, nächster Flieger,
+    Family-„fliegt gerade", Freunde/Crew-Radar), damit sie nie mehr
+    widersprechen.
+
+    OpenSky ist bewusst NICHT mehr im synchronen User-Pfad: der Hintergrund-
+    ADS-B-Poller hält aircraft_positions frisch; der User-Request liest Tabellen
+    (Bulk) bzw. fasst extern nur als budget-gedeckelten targeted-Notnagel an
+    (KERN-REGEL 5000 User).
 
     Returns (row, source, obs_ts, tried):
-        row/source — Semantik wie bisher in der Route: source kann 'opensky'
-                     mit row=None sein (= Upstream ok, sauber „kein Signal");
-                     'adsb.lol' wird nur bei echter Row gesetzt.
-        obs_ts     — NUR bei source='adb' gesetzt: ECHTER reportedAtUtc-
-                     Beobachtungszeitpunkt (unix). Freie Quellen: None
-                     (Fetch-Zeit = jetzt, Row trägt time_position selbst).
-        tried      — Diagnose-Liste, identisch zum bisherigen Routen-Verhalten.
+        row     — OpenSky-State-Array oder None.
+        source  — 'fr24' | 'aircraft_positions' | 'adsb.lol' | 'adb' bei Treffer;
+                  'none' (non-None) wenn nichts gefunden (Route fährt dann ihren
+                  ehrlichen Stale-Fallback). Der 'adb'-Zweig der Route bleibt
+                  unverändert scharf.
+        obs_ts  — ECHTER Beobachtungs-Zeitstempel (unix) der Row (= row[3]); nie
+                  „jetzt" für alte Fixe. None bei Miss.
+        tried   — Diagnose-Liste (pro Tier + finaler selected/confirmed-Eintrag).
     """
-    now = time.time()
-    with _BACKOFF["lock"]:
-        backoff_until = _BACKOFF["until"]
-    opensky_skipped = now < backoff_until
-
-    tried = []
-    row = None
-    source = None
-
-    # ─── Step 1: OpenSky (außer wenn im Backoff) ───
-    if not opensky_skipped:
-        try:
-            row = _fetch_opensky(hex_param)
-            source = "opensky"
-            tried.append({"upstream": "opensky", "ok": True})
-        except _OpenSkyRateLimit as e:
-            # 429 → globaler Backoff setzen, dann adsb.lol versuchen.
-            with _BACKOFF["lock"]:
-                _BACKOFF["until"] = time.time() + e.retry_after
-            tried.append({"upstream": "opensky", "ok": False,
-                          "reason": f"rate_limited(retry={e.retry_after}s)"})
-        except _OpenSkyError as e:
-            tried.append({"upstream": "opensky", "ok": False,
-                          "reason": str(e)[:80]})
-    else:
-        tried.append({"upstream": "opensky", "ok": False,
-                      "reason": f"backoff_active({int(backoff_until - now)}s)"})
-
-    # ─── Step 2: adsb.lol (wenn OpenSky nichts brauchbares lieferte) ───
-    # AUCH bei OpenSky „ok, aber kein Signal" adsb.lol fragen (Änderung 2026-07-05):
-    # die Community-Coverage von adsb.lol ist real oft BESSER als OpenSky —
-    # Live-Fall D-ABYO/DLH511: adsb.lol sah die Maschine über Frankreich, während
-    # OpenSky leer war → der frühere Skip lieferte „kein Signal", obwohl der
-    # Flieger flog. Erst wenn BEIDE leer sind, ist „nicht in der Luft" ehrlich.
-    if row is None:
-        try:
-            lol_row = _fetch_adsb_lol(hex_param)
-            if lol_row is not None:
-                row = lol_row
-                source = "adsb.lol"
-                tried.append({"upstream": "adsb.lol", "ok": True})
-            else:
-                tried.append({"upstream": "adsb.lol", "ok": True,
-                              "reason": "no_signal"})
-        except _UpstreamError as e:
-            tried.append({"upstream": "adsb.lol", "ok": False,
-                          "reason": str(e)[:80]})
-
-    # ─── Step 2c (FREI, Grauzone): FR24-Welt-Snapshot ───
-    # Schließt GENAU das Coverage-Loch, das der bezahlte Tier unten adressiert —
-    # nur gratis. FR24 aggregiert MLAT + Partner-Feeds über China/Russland/Ozean,
-    # wo die ADS-B-Community-Netze keine Feeder haben. Ein gecachter Welt-Snapshot
-    # (~1 Call/45s) bedient alle Watches. Läuft VOR AeroDataBox → spart Budget,
-    # wenn FR24 die Lücke schon füllt. Nicht auf targeted gegatet (frei), aber der
-    # Callsign-Fallback hilft besonders bei beobachteten Flügen.
-    if row is None:
-        try:
-            fr_row = _fetch_fr24(hex_param, callsign)
-            if fr_row is not None:
-                row = fr_row
-                source = "fr24"
-                tried.append({"upstream": "fr24", "ok": True})
-            else:
-                tried.append({"upstream": "fr24", "ok": True, "reason": "no_signal"})
-        except Exception as e:
-            tried.append({"upstream": "fr24", "ok": False, "reason": str(e)[:80]})
-
-    # ─── Step 2b (Tier 3, BEZAHLT): AeroDataBox-Position — NUR gezielt ───
-    # Coverage-Lücken der freien Quellen. Läuft NUR wenn (a) die Abfrage als
-    # eigener Flug/Inbound/Family-Watch markiert ist, (b) die freien Quellen UND
-    # FR24 keine Position lieferten und (c) das Tages-Budget ('adb_position',
-    # Default 200/Tag + globaler Paid-Guard) frei ist. VOR dem stale/ocean-
-    # bridge-Fallback, damit eine echte Live-Position gewinnt.
-    if row is None and targeted:
-        adb_row, adb_ts, adb_skip = _adb_position_attempt(hex_param, reg_param)
-        if adb_row is not None:
-            tried.append({"upstream": "aerodatabox", "ok": True})
-            return adb_row, "adb", adb_ts, tried
-        tried.append({"upstream": "aerodatabox", "ok": False,
-                      "reason": adb_skip})
-
-    return row, source, None, tried
+    from blueprints.warehouse_reader import position_for_flight
+    # allow_paid folgt targeted: der bezahlte Tier 4 darf nur feuern, wenn die
+    # Abfrage überhaupt gezielt ist (resolve_position_for_watch mappt
+    # allow_paid→targeted; Family kommt so mit targeted=False = kein Paid).
+    return position_for_flight(
+        hex=(hex_param or '').strip().lower() or None,
+        reg=(reg_param or '').strip().upper() or None,
+        callsign=(callsign or '').strip().upper() or None,
+        targeted=bool(targeted),
+        allow_paid=bool(targeted),
+    )
 
 
 def resolve_position_for_watch(reg=None, hex_id=None, allow_paid=True, callsign=None):
@@ -1310,9 +1301,12 @@ def resolve_position_for_watch(reg=None, hex_id=None, allow_paid=True, callsign=
         callsign=(callsign or '').strip().upper())
     if row is None:
         return None, None, None
-    # In den normalen Cache + Warm-Persist — mit dem ECHTEN Beobachtungs-
-    # Zeitstempel bei Tier 3 (obs_ts), sonst „jetzt" (freie Quellen).
-    _cache_put(hexp, row, source, fetched_at=obs_ts)
+    # PERF-Fix: Anzeige-Zeit (fetched_at=ECHTER obs_ts, für den Client) von der
+    # Cache-Frische (cached_at=jetzt, 60s-TTL) TRENNEN. Sonst hebelt ein
+    # minutenalter echter obs_ts den 60s-Cache aus (now-obs_ts>60 → Cache-Miss) und
+    # JEDER Watcher-Request re-kaskadiert. So bleibt der Eintrag 60s gültig, zeigt
+    # aber die ehrliche Beobachtungszeit.
+    _cache_put(hexp, row, source, fetched_at=obs_ts, cached_at=time.time())
     try:
         _warm_persist_from_opensky_row(hexp, row, source)
     except Exception:
@@ -1400,86 +1394,89 @@ def get_adsb_state():
     # Erst NACH dem Fresh-Cache-Hit, damit Cache-Hits keine DB-Writes auslösen.
     _touch_watch(hex_param, registration=reg_param or None)
 
-    # Cold-Start-Backfill: nach einem Cloud-Run-Restart ist der In-Memory-_CACHE
-    # leer — die zuletzt persistierte Position (< 24h) aus aircraft_positions
-    # zurückholen. ABER (Root-Cause „Wo ist mein Flieger zeigt nichts", Owner
-    # 2026-07-05): dieser Early-Return servierte nach JEDEM Deploy/Restart eine
-    # Stunden-alte Position als „aktuell" und übersprang die Live-Kaskade komplett
-    # — während adsb.lol die Maschine LÄNGST live hatte (D-ABYO als DLH511 über
-    # Frankreich; Backfill zeigte den 2,3h-alten Atlantik-Punkt). Early-Return
-    # daher NUR noch, wenn der Backfill wirklich FRISCH ist (< 90s ≈ Live-Cache-
-    # TTL). Ältere Backfills werden als LETZTER Fallback hinter der Live-Kaskade
-    # benutzt (Ozean-/Coverage-Lücken überbrücken, ehrlich als stale markiert) —
-    # Live gewinnt immer.
+    # Cold-Start-Backfill (aircraft_positions, < 24h) wird NUR noch als Datenquelle
+    # für den ehrlichen Stale-/Ozean-Fallback WEITER UNTEN vorgeladen — KEIN
+    # eigener <90s-Early-Return mehr. Ein solcher Early-Return war eine „eigene
+    # abweichende Quellen-Reihenfolge": er lieferte eine leicht-frische
+    # aircraft_positions-Position (Tier 2) und übersprang Tier 1 (fr24_live, das
+    # der Owner PRIMÄR haben will) komplett — genau die „widersprüchlichen
+    # Anzeigen", die hier vereinheitlicht werden. Die Frische-Auswahl über ALLE
+    # Tiers (fr24 vor aircraft_positions, max echtem obs_ts) trifft jetzt
+    # ausschließlich der einheitliche Resolver (_live_position_cascade →
+    # position_for_flight); der Cold-Start-Fall ist dort als Tier 2
+    # (aircraft_positions) mit abgedeckt, kann also nicht mehr verloren gehen, und
+    # der 2026-07-05-Root-Cause („2,3h-alter Atlantik-Punkt als aktuell") bleibt
+    # ausgeschlossen, weil der Resolver stale Tabellen-Fixe gar nicht erst wählt.
     backfilled = _backfill_cache_from_sb(hex_param)
-    if backfilled is not None:
-        try:
-            backfill_age = time.time() - float(backfilled.get("fetched_at") or 0)
-        except (TypeError, ValueError):
-            backfill_age = 1e9
-        if backfill_age < 90:
-            return jsonify({
-                "hex": hex_param,
-                "position": backfilled["row"],
-                "fetched_at": backfilled["fetched_at"],
-                "cached": True,
-                "source": backfilled.get("source", "supabase-backfill"),
-            }), 200
 
-    # ─── Steps 1 / 2 / 2b: Live-Kaskade (extrahiert in _live_position_cascade,
-    # damit der Family-Watch-Fan-out sie OHNE HTTP-Self-Call nutzen kann;
-    # Verhalten identisch zum früheren Inline-Code) ───
-    row, source, adb_obs_ts, tried = _live_position_cascade(
+    # ─── Steps 1 / 2 / 2b: EINE Positions-Quelle für alle „wo ist der Flieger"-
+    # Pfade (fr24_live → aircraft_positions → [targeted] adsb.lol → [targeted+paid]
+    # AeroDataBox, Auswahl nach max echtem obs_ts). Der Resolver ist der EINZIGE
+    # Weg nach extern (targeted-Notnagel); dieser Route-Handler geht selbst nie
+    # direkt upstream. ───
+    row, source, obs_ts, tried = _live_position_cascade(
         hex_param, reg_param, targeted=targeted)
 
+    # BREAK A-Fix: der Resolver liefert bei Total-Miss den STRING 'none' (row=None),
+    # nie mehr Python-None. Hier auf None zurückmappen, sonst ist der `source is not
+    # None`-Gate immer wahr und die ehrlichen Fallbacks unten (30-min-Bridge,
+    # <24h-Backfill, no_signal, 502) wären toter Code.
+    if source == "none":
+        source = None
+
     if source == "adb":
-        # Tier-3-Treffer: in den normalen Cache — mit dem ECHTEN Beobachtungs-
-        # Zeitstempel (reportedAtUtc), NICHT als „jetzt" gefälscht.
-        _cache_put(hex_param, row, "adb", fetched_at=adb_obs_ts)
+        # Tier-4-Treffer: in den normalen Cache — mit dem ECHTEN Beobachtungs-
+        # Zeitstempel (reportedAtUtc) als Anzeige-Zeit, Fetch-Zeit=jetzt für die TTL.
+        _cache_put(hex_param, row, "adb", fetched_at=obs_ts, cached_at=time.time())
         _warm_persist_from_opensky_row(hex_param, row, "adb")
         return jsonify({
             "hex": hex_param,
             "position": row,
-            "fetched_at": adb_obs_ts,
+            "fetched_at": obs_ts,
             "cached": False,
             "source": "adb",
             "tried": tried,
         }), 200
 
     # ─── Erfolg: cachen + ausgeben ───
-    if source is not None:
-        # OZEAN-/COVERAGE-BRÜCKE: beide Upstreams sagen sauber „kein Signal",
-        # aber wir halten eine <45min-alte persistierte Position → die Maschine
-        # ist sehr wahrscheinlich nur außerhalb der Feeder-Coverage (Atlantik),
-        # nicht gelandet. Dann die letzte Position ehrlich stale-markiert liefern
-        # statt „nicht in der Luft" (Flieger verschwindet sonst mitten im Flug).
-        # NICHT in den Fresh-Cache seeden — der nächste Poll versucht wieder live.
-        if row is None and backfilled is not None:
-            try:
-                _b_age = time.time() - float(backfilled.get("fetched_at") or 0)
-            except (TypeError, ValueError):
-                _b_age = 1e9
-            if _b_age < 2700:
-                return jsonify({
-                    "hex": hex_param,
-                    "position": backfilled["row"],
-                    "fetched_at": backfilled["fetched_at"],
-                    "cached": True,
-                    "stale_due_to_upstream_outage": True,
-                    "stale_age_seconds": int(_b_age),
-                    "source": backfilled.get("source", "supabase-backfill"),
-                    "tried": tried,
-                }), 200
-        _cache_put(hex_param, row, source)
-        # Best-effort warm-keep der Supabase-Fallback-Tabelle — niemals die
-        # Live-Response brechen (alles in try/except, row kann None sein wenn
-        # "kein Signal").
-        if row is not None:
-            _warm_persist_from_opensky_row(hex_param, row, source)
+    # HINWEIS: der Resolver gibt eine non-None source NUR mit row != None zurück
+    # (Treffer). Ein „ok, aber kein Signal" existiert im Resolver nicht mehr — das
+    # fällt als source=None (oben gemappt) durch auf die Bridge-/no_signal-Zweige.
+    if source is not None and row is not None:
+        # BREAK B-Fix: den ECHTEN obs_ts der Tabellen-Row als fetched_at liefern UND
+        # cachen (fetched_at=obs_ts), NICHT time.time() — sonst ist „stale-as-fresh"
+        # (2026-07-05-Bug) zurück. Fetch-Zeit=jetzt (cached_at) trägt die 60s-TTL.
+        try:
+            _row_age = time.time() - float(obs_ts) if obs_ts is not None else 1e9
+        except (TypeError, ValueError):
+            _row_age = 1e9
+        # Best-effort warm-keep der Supabase-Fallback-Tabelle — bricht die
+        # Live-Response nie.
+        _warm_persist_from_opensky_row(hex_param, row, source)
+        # Frische-Floor: eine Tabellen-Row darf nur als LIVE (cached:false)
+        # serviert werden, wenn sie jung genug ist. Ältere echte Beobachtungen
+        # werden ehrlich stale-markiert ausgeliefert statt als „jetzt aktuell" —
+        # und NICHT in den 60s-Fresh-Cache geseedet (sonst pinnt die stale Position
+        # 60s lang jeden Folge-Request und blockt die Live-Recovery). Sie bleibt
+        # aber via _warm_persist als Last-Resort-Backfill erhalten.
+        if _row_age > _LIVE_TABLE_FLOOR_S:
+            return jsonify({
+                "hex": hex_param,
+                "position": row,
+                "fetched_at": obs_ts,
+                "cached": True,
+                "stale_due_to_upstream_outage": True,
+                "stale_age_seconds": int(max(0, _row_age)),
+                "source": source,
+                "tried": tried,
+            }), 200
+        # Frische Tabellen-Row → in den 60s-Fresh-Cache: fetched_at=ECHTER obs_ts
+        # (Anzeige/BREAK-B), cached_at=jetzt (TTL). Kein Re-Kaskadieren für 60s.
+        _cache_put(hex_param, row, source, fetched_at=obs_ts, cached_at=time.time())
         return jsonify({
             "hex": hex_param,
             "position": row,
-            "fetched_at": time.time(),
+            "fetched_at": obs_ts,
             "cached": False,
             "source": source,
             "tried": tried,
@@ -1764,7 +1761,7 @@ def get_health():
     now = time.time()
     with _CACHE_LOCK:
         cache_size = len(_CACHE)
-        fresh = sum(1 for v in _CACHE.values() if now - v["fetched_at"] < _CACHE_TTL_SECONDS)
+        fresh = sum(1 for v in _CACHE.values() if now - _cache_ttl_ts(v) < _CACHE_TTL_SECONDS)
     with _BACKOFF["lock"]:
         backoff_until = _BACKOFF["until"]
     return jsonify({
@@ -1780,6 +1777,15 @@ def get_health():
 
 # ─── Cache Helpers ──────────────────────────────────────────
 
+def _cache_ttl_ts(entry):
+    """Zeitbasis für die 60s-Cache-TTL = FETCH-Zeit (wann wir die Position
+    besorgt haben), NICHT die (oft ältere) Beobachtungs-/Anzeige-Zeit
+    `fetched_at`. Sonst hebelt eine minutenalte echte Beobachtung den Cache aus
+    und jeder Request re-kaskadiert (PERF-Bug). Backward-compat: alte Einträge
+    ohne `cached_at` fallen auf `fetched_at` zurück."""
+    return entry.get("cached_at", entry.get("fetched_at", 0.0))
+
+
 def _cache_get(hex_id):
     """Gibt eine frische Cache-Row (innerhalb _CACHE_TTL_SECONDS) zurück."""
     now = time.time()
@@ -1787,7 +1793,7 @@ def _cache_get(hex_id):
         entry = _CACHE.get(hex_id)
         if entry is None:
             return None
-        if now - entry["fetched_at"] > _CACHE_TTL_SECONDS:
+        if now - _cache_ttl_ts(entry) > _CACHE_TTL_SECONDS:
             return None
         return entry
 
@@ -1804,25 +1810,32 @@ def _last_known_get(hex_id):
             return None
         if entry.get("row") is None:
             return None
-        if now - entry["fetched_at"] > _LAST_KNOWN_TTL_SECONDS:
+        if now - _cache_ttl_ts(entry) > _LAST_KNOWN_TTL_SECONDS:
             return None
         return entry
 
 
-def _cache_put(hex_id, row, source="opensky", fetched_at=None):
-    """`fetched_at` erlaubt es, den ECHTEN Beobachtungs-Zeitstempel zu setzen
-    (Tier-3 AeroDataBox: reportedAtUtc der Position) statt „jetzt" — eine ältere
-    Beobachtung darf sich im Cache nicht als frisch ausgeben."""
+def _cache_put(hex_id, row, source="opensky", fetched_at=None, cached_at=None):
+    """Zwei getrennte Zeitachsen:
+      `fetched_at` = ECHTE Beobachtungs-/Anzeige-Zeit (row[3] bzw. reportedAtUtc);
+                     wird dem Client als fetched_at ausgeliefert — eine ältere
+                     Beobachtung darf sich NICHT als frisch ausgeben.
+      `cached_at`  = FETCH-Zeit (wann wir sie besorgt haben); Basis der 60s-TTL.
+                     Default = jetzt. So bleibt ein Cache-Eintrag 60s gültig, auch
+                     wenn seine Beobachtung minutenalt ist (kein Re-Kaskadieren
+                     pro Request), zeigt dem Client aber die ehrliche Beobachtungszeit."""
+    now = time.time()
     with _CACHE_LOCK:
         _CACHE[hex_id] = {
-            "fetched_at": fetched_at if fetched_at is not None else time.time(),
+            "fetched_at": fetched_at if fetched_at is not None else now,
+            "cached_at": cached_at if cached_at is not None else now,
             "row": row,
             "source": source,
         }
         # Cache-Cap: halte max 200 Einträge. Bei Überlauf evicte die
-        # ältesten 50 — kein LRU-Overhead, einfach Bulk-Cleanup.
+        # ältesten 50 (nach Fetch-Zeit) — kein LRU-Overhead, einfach Bulk-Cleanup.
         if len(_CACHE) > 200:
-            items = sorted(_CACHE.items(), key=lambda kv: kv[1]["fetched_at"])
+            items = sorted(_CACHE.items(), key=lambda kv: _cache_ttl_ts(kv[1]))
             for k, _ in items[:50]:
                 _CACHE.pop(k, None)
 
