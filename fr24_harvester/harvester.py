@@ -200,6 +200,7 @@ def main():
     backoff = 0.0          # wächst bei Blocks, sinkt bei Erfolg
     win_rows = 0           # aufsummierte Rows seit letztem Heartbeat
     last_hb = time.time()
+    consec_empty = 0       # aufeinanderfolgende LEERE Kacheln (verschiedene!)
     while True:
         idx = my_tiles[i % len(my_tiles)]
         i += 1
@@ -207,6 +208,23 @@ def main():
             rows = fetch_tile(session, FR24_TILES[idx])
             n = upsert(session, sb_url, sb_key, rows, idx)
             win_rows += n
+            # SELBSTHEILENDE THROTTLE-ERKENNUNG: eine einzelne leere Kachel ist
+            # legitim (Ozean/Nacht). Aber wenn VIELE verschiedene Kacheln in Folge
+            # 0 Rows liefern, ist die IP gedrosselt (FR24 gibt dann 200 mit 32-Byte-
+            # Leerantwort für ALLES) → Backoff, damit die Drosselung sich löst.
+            # Dichte Kacheln (China/Europa) sind nie legitim leer → Schwelle 5 ist sicher.
+            if n == 0:
+                consec_empty += 1
+                if consec_empty >= 5:
+                    backoff = min(900.0, (backoff * 2) or 90.0)
+                    print(f"[fr24-harvester] THROTTLE vermutet ({consec_empty} leere "
+                          f"Kacheln in Folge) -> backoff {backoff:.0f}s", file=sys.stderr, flush=True)
+                    consec_empty = 0
+                    time.sleep(backoff)
+                    continue
+            else:
+                consec_empty = 0
+                backoff = max(0.0, backoff - 30.0)      # erholt sich schrittweise
             if not quiet:
                 print(f"[fr24-harvester] tile{idx} rows={len(rows)} upserted={n}", flush=True)
             elif time.time() - last_hb >= heartbeat_min * 60:
@@ -214,7 +232,6 @@ def main():
                       f"letzten {heartbeat_min:.0f}min", flush=True)
                 win_rows = 0
                 last_hb = time.time()
-            backoff = max(0.0, backoff - 30.0)      # erholt sich schrittweise
         except _Blocked as e:
             backoff = min(900.0, (backoff * 2) or 60.0)   # 60s→2m→4m…→15m Deckel
             print(f"[fr24-harvester] tile{idx} BLOCKED {e} -> backoff {backoff:.0f}s "
