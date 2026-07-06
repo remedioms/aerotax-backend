@@ -20896,9 +20896,8 @@ def flight_times(flightno):
     AeroDataBox (RapidAPI). Key NUR server-seitig (Cloud-Run-Env AERODATABOX_KEY),
     Antwort 10 min gecacht → ein Key, geteilt, bleibt im Free-Limit (10k User)."""
     import time
+    from blueprints.aerox_data_blueprint import _paid_budget_ok, _paid_budget_inc
     key = os.environ.get('AERODATABOX_KEY', '')
-    if not key:
-        return jsonify({'ok': False, 'error': 'not_configured'})
     fn = (flightno or '').strip().upper().replace(' ', '')
     date = request.args.get('date') or datetime.utcnow().strftime('%Y-%m-%d')
     ckey = f"{fn}|{date}"
@@ -20913,10 +20912,45 @@ def flight_times(flightno):
                 _FLIGHT_TIMES_CACHE.pop(k, None)
         return jsonify(out)
 
+    # ── FREE-FIRST (Increment 2, Owner 2026-07-06): dieselbe EINE Quelle wie
+    #    Status/Suche — der zentrale Dual-Side-Merge (eigene Beobachtungs-DB
+    #    airport_delay_obs + freie Live-Boards, free_only=True). KEIN AeroDataBox-
+    #    Spend pro User-Request; ADB unten nur als budget-gedeckelter Notnagel.
+    #    Gleiche JSON-Shape (departure/arrival), nur die Quelle wechselt. ──
+    try:
+        m = _flight_obs_merged(fn, date=date, free_only=True)
+    except Exception:
+        m = None
+    if m and (m.get('dep_iata') or m.get('arr_iata')):
+        def _side(iata_k, name_k, sched_k, est_k, term_k, gate_k):
+            return {'iata': m.get(iata_k), 'name': m.get(name_k), 'city': None,
+                    'scheduled': m.get(sched_k), 'revised': m.get(est_k),
+                    'terminal': m.get(term_k), 'gate': m.get(gate_k)}
+        out = {'ok': True, 'flight': fn,
+               'airline': m.get('airline'), 'aircraft': m.get('aircraft'),
+               'reg': m.get('reg'),
+               'status': ('cancelled' if m.get('cancelled') else m.get('status')),
+               'departure': _side('dep_iata', 'origin_name', 'sched_dep',
+                                  'esti_dep', 'terminal_dep', 'gate_dep'),
+               'arrival': _side('arr_iata', 'dest_name', 'sched_arr',
+                                'esti_arr', 'terminal_arr', 'gate_arr'),
+               'source': 'aerox_obs_merged'}
+        return _cache(out, 300)
+
+    # ── BEZAHLT (letzter Notnagel): AeroDataBox NUR mit Key UND Tages-Budget. ──
+    if not key:
+        return _cache({'ok': False, 'error': 'not_configured'}, 120)
+    if not _paid_budget_ok():
+        return _cache({'ok': False, 'error': 'budget_exhausted'}, 120)
+
     url = f"https://aerodatabox.p.rapidapi.com/flights/number/{fn}/{date}"
     try:
         r = _requests.get(url, headers={'x-rapidapi-key': key,
                                         'x-rapidapi-host': 'aerodatabox.p.rapidapi.com'}, timeout=8)
+        try:
+            _paid_budget_inc(units=2)   # AeroDataBox flights/number = Tier 2 (2 Units)
+        except Exception:
+            pass
         if r.status_code != 200:
             return _cache({'ok': False, 'error': f'http_{r.status_code}'}, 300)
         flights = r.json() if isinstance(r.json(), list) else []
@@ -28074,35 +28108,50 @@ def ax_aircraft_history(reg):
 
 @app.route('/api/ax/flight-route/<callsign>', methods=['GET'])
 def ax_flight_route(callsign):
-    """Globaler Flug-Route-Lookup (Airline + Origin→Destination) via adsbdb (GRATIS,
-    kein Key) — auch für Nicht-LH-Carrier (z.B. LATAM „TAM8071") und wenn der Flieger
-    NICHT live ist. So zeigt die Suche etwas Sinnvolles (Airline + Strecke) statt
-    „keine Ergebnisse". `found:false` nur, wenn adsbdb die Route nicht kennt."""
+    """Globaler Flug-Route-Lookup (Airline + Origin→Destination) — auch für Nicht-
+    LH-Carrier (z.B. LATAM „TAM8071") und wenn der Flieger NICHT live ist. So zeigt
+    die Suche etwas Sinnvolles (Airline + Strecke) statt „keine Ergebnisse".
+
+    Increment 2 (2026-07-06, Owner „alles aus EINER Quelle"): zieht jetzt aus der
+    kanonischen EINEN Route-Kaskade `warehouse_reader.route_for_flight` (free-first:
+    eigener Cache → airport_delay_obs → Warehouse → fr24 → freie Generik adsbdb/
+    adsb.lol/hexdb; bezahlt NUR budget-gedeckelt, hier via allow_paid=False ganz
+    aus). Die eigene adsbdb-Generik entfällt — dieselbe Antwort wie Live-Tap/Status.
+    Airport-Details (Name/Stadt/Land/Koordinaten) + Airline kommen aus der gebackenen
+    Referenz-DB (frei, offline). `found:false` nur, wenn KEINE Quelle die Route kennt.
+    Suche ohne Live-Position → for_search=True (Leg-Zeitfenster-Gate)."""
     cs = (callsign or '').upper().replace(' ', '').strip()[:12]
     if len(cs) < 3:
         return jsonify({'ok': False, 'error': 'bad_callsign'}), 400
+    reg_q = (request.args.get('reg') or '').strip().upper() or None
+    date_q = (request.args.get('date') or '').strip()[:10] or None
     try:
-        import requests
-        r = requests.get(f'https://api.adsbdb.com/v0/callsign/{cs}', timeout=8,
-                         headers={'User-Agent': 'AeroX/1.0 (+https://aerosteuer.de)'})
-        if r.status_code == 404:
-            return _public_cache_headers(jsonify({'ok': True, 'found': False, 'callsign': cs}))
-        r.raise_for_status()
-        fr = ((r.json() or {}).get('response') or {}).get('flightroute') or {}
-        if not fr:
-            return jsonify({'ok': True, 'found': False, 'callsign': cs})
+        from blueprints.warehouse_reader import route_for_flight
+        from blueprints.aerox_data_blueprint import (
+            _airport_row, _airline_row, _callsign_to_iata_flightno)
+        route = route_for_flight(callsign=cs, reg=reg_q, for_search=True,
+                                 allow_paid=False, date=date_q)
+        if not route or not (route.get('src') or route.get('src_icao')
+                             or route.get('dst') or route.get('dst_icao')):
+            return _public_cache_headers(
+                jsonify({'ok': True, 'found': False, 'callsign': cs}))
 
-        def _ap(x):
-            x = x or {}
-            return {'iata': x.get('iata_code'), 'icao': x.get('icao_code'),
-                    'name': x.get('name'), 'city': x.get('municipality'),
-                    'country': x.get('country_name'),
-                    'lat': x.get('latitude'), 'lon': x.get('longitude')}
-        air = fr.get('airline') or {}
-        origin, destination = _ap(fr.get('origin')), _ap(fr.get('destination'))
+        def _ap(iata, icao):
+            r = _airport_row(iata or icao) or {}
+            return {'iata': r.get('iata') or iata, 'icao': r.get('icao') or icao,
+                    'name': r.get('name'), 'city': r.get('city'),
+                    'country': r.get('country'),
+                    'lat': r.get('lat'), 'lon': r.get('lon')}
+        origin = _ap(route.get('src'), route.get('src_icao'))
+        destination = _ap(route.get('dst'), route.get('dst_icao'))
+        try:
+            fn_iata = _callsign_to_iata_flightno(cs)
+        except Exception:
+            fn_iata = None
+        air = _airline_row(cs[:3]) or _airline_row(cs[:2]) or {}
         out = {
-            'ok': True, 'found': True, 'callsign': fr.get('callsign') or cs,
-            'flight_iata': fr.get('callsign_iata'), 'flight_icao': fr.get('callsign_icao'),
+            'ok': True, 'found': True, 'callsign': cs,
+            'flight_iata': fn_iata, 'flight_icao': cs,
             'airline': air.get('name'), 'airline_iata': air.get('iata'),
             'airline_icao': air.get('icao'),
             'origin': origin, 'destination': destination,
@@ -29158,7 +29207,12 @@ def airport_board(token):
     else:
         out_airport = iata
         # 1) Native-Scraper (für die großen Bases) bzw. AeroDataBox-Board.
-        rows, board_src = _native_board_cached(iata, ftype)
+        # FREE-FIRST (Increment 2, Owner 2026-07-06): der User-Board-Request fasst
+        # KEIN bezahltes AeroDataBox-Board an (allow_paid=False) — nur der gratis
+        # native Scraper/FRA-Feed. Airports ohne freie Quelle degradieren ehrlich
+        # (source_unavailable) statt pro Aufruf zu zahlen; die Hintergrund-Poller
+        # (die die Tabellen füllen) behalten ihren bezahlten Default unverändert.
+        rows, board_src = _native_board_cached(iata, ftype, allow_paid=False)
         if rows is not None:
             flights = rows
             src = board_src
@@ -29551,8 +29605,10 @@ def flight_status(token):
             except Exception:
                 pass
         try:
+            # free_only=True (Increment 2): KEIN AeroDataBox-Spend im Merge —
+            # dieser Fallback ist jetzt der PRIMÄRE (freie) Status-Pfad.
             m = _flight_obs_merged(number, date=date_iso,
-                                   dep_iata=dep, arr_iata=arr)
+                                   dep_iata=dep, arr_iata=arr, free_only=True)
         except Exception:
             m = None
         if not m:
@@ -29578,33 +29634,33 @@ def flight_status(token):
             'obs_sides': m.get('sides'),
         }
 
-    if not _os.environ.get('AERODATABOX_KEY'):
-        merged = _merged_status_fallback()
-        if merged:
-            return jsonify({'ok': True, 'number': number, 'flight': merged,
-                            'source': 'aerox_obs_merged'})
-        return jsonify({'ok': False, 'error': 'source_unavailable', 'number': number,
-                        'message': 'Flugplan-Quelle aktuell nicht verfügbar.'}), 200
-    flight = _aerodatabox_flight_by_number(number, date_iso)
-    if not flight:
-        # ADB kennt den Flug nicht (oder Quota) → eigene Beobachtungs-DB +
-        # Live-Boards beider Seiten sind oft trotzdem voll da (gratis).
-        merged = _merged_status_fallback()
-        if merged:
-            return jsonify({'ok': True, 'number': number, 'flight': merged,
-                            'source': 'aerox_obs_merged'})
-        return jsonify({'ok': False, 'error': 'not_found', 'number': number,
-                        'message': ('Für ' + number + ' liegt aktuell kein '
-                                    'Flugplan vor.')}), 200
-    # CROWDSOURCE / API-SPAREN (Owner 2026-07-04): den TEUER aufgelösten Flug (Route
-    # + Tail) ins eigene Warehouse spiegeln → derselbe Flug/Tag kommt beim nächsten
-    # Lookup GRATIS aus `airport_delay_obs`, ohne AeroDataBox erneut zu treffen.
-    try:
-        _crowdsource_flight_obs(flight, date_iso, source='aerodatabox')
-    except Exception:
-        pass
-    return jsonify({'ok': True, 'number': number, 'flight': flight,
-                    'source': 'aerodatabox'})
+    # ── FREE-FIRST (Increment 2, Owner 2026-07-06): der zentrale Dual-Side-Merge
+    #    (eigene Beobachtungs-DB airport_delay_obs + freie Live-Boards, free_only)
+    #    ist jetzt PRIMÄR — kein AeroDataBox-Spend pro User-Request. ──
+    merged = _merged_status_fallback()
+    if merged:
+        return jsonify({'ok': True, 'number': number, 'flight': merged,
+                        'source': 'aerox_obs_merged'})
+    # ── BEZAHLT (letzter Notnagel): AeroDataBox NUR mit Key UND Tages-Budget.
+    #    Den teuer aufgelösten Flug (Route+Tail) spiegeln wir ins Warehouse →
+    #    derselbe Flug/Tag kommt beim nächsten Lookup GRATIS aus airport_delay_obs. ──
+    from blueprints.aerox_data_blueprint import _paid_budget_ok, _paid_budget_inc
+    if _os.environ.get('AERODATABOX_KEY') and _paid_budget_ok():
+        flight = _aerodatabox_flight_by_number(number, date_iso)
+        try:
+            _paid_budget_inc(units=2)   # AeroDataBox flight endpoint = Tier 2 (2 Units)
+        except Exception:
+            pass
+        if flight:
+            try:
+                _crowdsource_flight_obs(flight, date_iso, source='aerodatabox')
+            except Exception:
+                pass
+            return jsonify({'ok': True, 'number': number, 'flight': flight,
+                            'source': 'aerodatabox'})
+    return jsonify({'ok': False, 'error': 'not_found', 'number': number,
+                    'message': ('Für ' + number + ' liegt aktuell kein '
+                                'Flugplan vor.')}), 200
 
 
 def _icao_to_iata_best(code):

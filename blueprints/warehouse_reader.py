@@ -274,3 +274,471 @@ def position_for_flight(hex=None, reg=None, callsign=None,
     # „Quelle erreicht, kein Signal" (→ ehrlicher Stale-Fallback) von „gar nichts
     # versucht". Kein Treffer → kein obs_ts (nie „jetzt" erfinden).
     return None, "none", None, tried
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Increment 2 — EINE Quelle für ROUTE und STATUS eines Fluges (LH506-Frage)
+#
+#  Owner-Ziel (2026-07-06): „Wenn ich LH506 anschaue — woher kommen die Daten?
+#  Alles muss aus EINER Quelle, konsistent." Route/Status/Suche zogen bisher aus
+#  verschiedenen Quellen, teils BEZAHLT pro User-Request (AeroDataBox/Aviation-
+#  Stack) → teuer + widersprüchlich. NEU: free-first aus UNSEREN Tabellen; bezahlt
+#  nur als letzter, budget-gedeckelter Notnagel.
+#
+#  KERN-REGEL: kein User-Request fasst extern/bezahlt an, außer dem budget-
+#  gedeckelten Notnagel in route_for_flight (allow_paid). status_for_flight ist im
+#  Default STRUKTURELL spend-frei (free_only-Merge). Hintergrund-Poller füllen die
+#  Tabellen; wir lesen sie.
+#
+#  Alle Helfer werden LAZY importiert (aerox_data_blueprint = D, app = _life_app),
+#  um Blueprint-Zirkel/Import-Reihenfolge-Fallen zu vermeiden.
+# ═══════════════════════════════════════════════════════════════
+
+
+def _leg_time_epoch(val, iata):
+    """Station-lokalen Route-Zeit-String (`sched_dep`/`est_arr` …) → Unix-Epoche
+    (UTC). None wenn leer ODER nicht verlässlich absolut bestimmbar. Nutzt lazy
+    app._board_local_to_utc_iso (dort lebt das Stations-TZ-Wissen); ein naiver
+    String OHNE ableitbare TZ bleibt None (nie geraten)."""
+    if not val:
+        return None
+    from datetime import datetime
+    try:
+        from blueprints.aerox_data_blueprint import _life_app
+        conv = _life_app('_board_local_to_utc_iso')
+    except Exception:
+        conv = None
+    iso = None
+    if conv is not None:
+        try:
+            iso = conv(val, iata)
+        except Exception:
+            iso = None
+    s = iso or str(val)
+    try:
+        dt = datetime.fromisoformat(s.strip().replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        return None                 # naiv + keine TZ-Konversion → nicht absolut
+    return dt.timestamp()
+
+
+def _leg_window_allows(route, date=None, arr_epoch=None):
+    """SUCHE-Gate (keine Live-lat/lon): akzeptiere eine Cache/Route-Row NUR, wenn
+    ihr dep/arr-Zeitfenster den JETZT-Zeitpunkt (großzügig gepolstert) einschließt
+    — statt des Positions-Gates, das ohne Live-Position nicht greifen kann. Fehlen
+    die Zeiten (fr24/generisch tragen keine), kann NICHTS widerlegt werden → im
+    Zweifel ZEIGEN (gleiche Ehrlichkeits-Regel wie das Geometrie-Gate). Verwirft
+    nur den KLAREN Widerspruch: Leg noch weit in der Zukunft ODER längst gelandet.
+
+    `arr_epoch` (optional, Unix-Sek.): eine EXTERN nachgezogene Ankunftszeit (aus
+    _flight_obs_merged), wenn die Route selbst KEINE arr trägt — genau der Fall bei
+    den freien Quellen (fr24/Board-Route tragen oft nur est_dep). So kann ein
+    bereits gelandetes voriges Leg (arr < now) auch dann verworfen werden, wenn die
+    Route-Row keine eigene Ankunftszeit hat."""
+    now = time.time()
+    src = route.get('src') or route.get('src_icao') or ''
+    dst = route.get('dst') or route.get('dst_icao') or ''
+    dep = _leg_time_epoch(route.get('est_dep') or route.get('sched_dep'), src)
+    arr = _leg_time_epoch(route.get('est_arr') or route.get('sched_arr'), dst)
+    if arr is None and arr_epoch is not None:
+        arr = arr_epoch             # Board-Ankunft nachgezogen (freie Shape ohne arr)
+    PAD = 3 * 3600.0
+    if dep is not None and now < dep - PAD:
+        return False                # Abflug klar in der Zukunft → nicht „jetzt"
+    if arr is not None and now > arr + PAD:
+        return False                # längst gelandet → veraltetes Leg
+    if dep is not None and arr is None and now > dep + 18 * 3600.0:
+        return False                # kein arr bekannt, Abflug > 18 h her → veraltet
+    return True                     # im Zweifel: zeigen, nicht verstecken
+
+
+def _board_arr_epoch(cs, route, date, D):
+    """SUCHE-Hilfe: zieht die ECHTE Ankunftszeit eines Legs aus _flight_obs_merged
+    (free_only) nach, wenn die aufgelöste Route selbst keine arr trägt (freie
+    fr24/Board-Route-Shape = oft nur est_dep). Board-Keys sind IATA-Flugnr + dep/
+    arr-IATA; die nehmen wir aus dem Route-Kandidaten. Rückgabe: Unix-Epoche der
+    (esti_arr bevorzugt, sonst sched_arr) ODER None (nichts nachziehbar → Gate
+    bleibt im Zweifel großzügig)."""
+    dst = route.get('dst') or route.get('dst_icao') or ''
+    src = route.get('src') or route.get('src_icao') or ''
+    try:
+        from blueprints.aerox_data_blueprint import _life_app
+        merged_fn = _life_app('_flight_obs_merged')
+    except Exception:
+        merged_fn = None
+    if merged_fn is None:
+        return None
+    try:
+        fn = D._callsign_to_iata_flightno(cs) or cs
+    except Exception:
+        fn = cs
+    if not fn:
+        return None
+    try:
+        m = merged_fn(fn, date=date, dep_iata=(src or None),
+                      arr_iata=(dst or None), free_only=True)
+    except Exception:
+        m = None
+    if not m:
+        return None
+    return _leg_time_epoch(m.get('esti_arr') or m.get('sched_arr'),
+                           dst or (m.get('arr_iata') or ''))
+
+
+def route_for_flight(callsign=None, hex=None, reg=None, lat=None, lon=None,
+                     track=None, gs=None, on_ground=False, for_search=False,
+                     allow_paid=True, date=None):
+    """Die EINE Route-Kaskade (Callsign/Flug → Start/Ziel), free-first, konsistent.
+
+    REIHENFOLGE (frei VOR bezahlt):
+      1) ax_route_cache  — date-gekeyt `CS@YYYYMMDD`, dann `REG:<reg>@YYYYMMDD`.
+                           Der NACKTE-CS-Key wird NIE genutzt (mehrdeutig über
+                           Tage/Legs).
+      2) airport_delay_obs / eigene Airport-Tafel (_route_from_obs) — beobachtet.
+      3) flights / Flight-Warehouse (_route_from_warehouse) — board-verifiziert.
+      4) fr24_live (_route_from_fr24) — gratis verteilter Harvester-Store.
+      5) AeroDataBox/AviationStack — BEZAHLT, nur `allow_paid` UND Budget, zuletzt.
+
+    BEWUSST NICHT in der Kaskade: die freie Generik (adsbdb/adsb.lol/hexdb via
+    D._free_generic_route). Der Owner hat sie am 2026-07-03 deaktiviert
+    („adsbdb/adsb.lol/hexdb ist eh immer falsch") — statische, richtungs-
+    unsichere Tabellen liefern regelmäßig das FALSCHE Leg. Nicht wiederbeleben.
+
+    Gate je Kandidat:
+      • for_search=False (Live-Tap, Live-lat/lon vorhanden): Positions-/Geometrie-
+        Gate (_geometry_allows_route) — verwirft nur den klaren Widerspruch.
+      • for_search=True  (Suche, KEINE Live-Position): LEG-ZEITFENSTER-Gate
+        (_leg_window_allows) statt Positions-Gate.
+
+    Rückgabe: route-Dict (src/dst[+_icao], source, confidence, ggf. gate/terminal/
+    status/reg/sched_*/est_*) oder None. EIN 'confidence'-Feld: 'confirmed' nur bei
+    beobachteter/autoritativer Quelle (Cache-confirmed / Tafel / Warehouse / bezahlt
+    autoritativ), 'estimated' bei generischem/fr24-Kandidat. Jeder externe/aufgelöste
+    Treffer wird via _record_resolved_route in die eigene Warehouse geschrieben."""
+    from blueprints import aerox_data_blueprint as D
+
+    cs = (callsign or '').strip().upper().replace(' ', '')
+    if not cs:
+        return None
+    reg_u = (reg or '').strip().upper() or None
+    hex_l = (hex or '').strip().lower() or None
+    date = date or D._today_utc()
+    dk = date.replace('-', '')
+
+    def _accept(route):
+        """for_search → Leg-Zeitfenster-Gate; sonst → Positions/Geometrie-Gate.
+        Im Suchpfad wird — wenn die Route selbst keine Ankunftszeit trägt (freie
+        Shape) — die echte Board-Ankunft aus _flight_obs_merged nachgezogen und
+        ins Gate gegeben, damit ein bereits gelandetes voriges Leg fällt."""
+        if for_search:
+            arr_epoch = None
+            if not (route.get('est_arr') or route.get('sched_arr')):
+                arr_epoch = _board_arr_epoch(cs, route, date, D)
+            return _leg_window_allows(route, date, arr_epoch=arr_epoch)
+        return D._geometry_allows_route(route, lat, lon, track, gs, on_ground)
+
+    # ── 1) Eigene Warehouse: date-gekeyter Cache (nackter-CS-Key NIE) ──────────
+    cached = D._cache_get('ax_route_cache', 'flight', f'{cs}@{dk}')
+    if cached and (cached.get('src') or cached.get('src_icao')):
+        cached.setdefault('confidence', 'confirmed')
+        cached['_from'] = 'cache_date'
+        if _accept(cached):
+            return cached
+    if reg_u:
+        rc = D._cache_get('ax_route_cache', 'flight', f'REG:{reg_u}@{dk}')
+        if rc and (rc.get('src') or rc.get('src_icao')):
+            rc.setdefault('confidence', 'confirmed')
+            rc['_from'] = 'cache_reg'
+            if _accept(rc):
+                return rc
+
+    # ── 2) Eigene Airport-Tafel (airport_delay_obs) — beobachtet, autoritativ ──
+    try:
+        obs = D._route_from_obs(cs)
+    except Exception:
+        obs = None
+    if obs and (obs.get('src') or obs.get('dst')):
+        obs['source'] = 'aerox_board'
+        obs['confidence'] = 'confirmed'
+        if _accept(obs):
+            D._record_resolved_route(cs, reg_u, obs, date)
+            return obs
+
+    # ── 3) Flight-Warehouse (flights): Board-Tail↔Hex-Match — board-verifiziert ─
+    wh = D._route_from_warehouse(hex_l, reg_u)
+    if wh and (wh.get('src') or wh.get('dst')):
+        wh['confidence'] = 'confirmed'
+        if _accept(wh):
+            D._record_resolved_route(cs, reg_u, wh, date)
+            return wh
+
+    # ── 4) fr24_live (GRATIS, verteilter Harvester-Store) — estimated ──────────
+    fr = D._route_from_fr24(cs, hex_l)
+    if fr and (fr.get('src') or fr.get('dst')):
+        fr.setdefault('confidence', 'estimated')
+        if _accept(fr):
+            D._record_resolved_route(cs, reg_u, fr, date)
+            return fr
+
+    # ── (5 übersprungen) Freie Generik (adsbdb/adsb.lol/hexdb) BEWUSST DEAKTIVIERT.
+    #     Owner-Entscheid 2026-07-03: statisch/richtungs-unsicher → liefert das
+    #     falsche Leg. NICHT wiederbeleben (siehe Docstring). ─────────────────────
+
+    # ── 5) BEZAHLT (LETZTER Notnagel) — nur allow_paid UND Tages-Budget ────────
+    if allow_paid and D._paid_budget_ok():
+        try:
+            adb = D._aerodatabox_route(cs, reg=reg_u, lat=lat, lon=lon,
+                                       track=track, date=date)
+        except Exception:
+            adb = None
+        if adb and (adb.get('src') or adb.get('dst')):
+            adb['confidence'] = 'confirmed'
+            if _accept(adb):
+                D._record_resolved_route(cs, adb.get('reg') or reg_u, adb, date)
+                return adb
+        try:
+            avs = D._aviationstack_route(cs)
+        except Exception:
+            avs = None
+        if avs and (avs.get('src') or avs.get('dst')):
+            avs['confidence'] = 'confirmed'
+            if _accept(avs):
+                D._record_resolved_route(cs, reg_u, avs, date)
+                return avs
+
+    return None
+
+
+# ─── STATUS: tokenisierter, seiten-bewusster Board-Status ──────────────────────
+# TOKENISIERT statt Substring (Owner-Regel): „at gate" am ORIGIN ≠ gelandet.
+# Board-Provider liefern DE+EN gemischt („Gelandet 14:23" / „Landed" / „At Gate").
+_STATUS_LANDED = {'landed', 'arrived', 'gelandet', 'angekommen', 'baggage',
+                  'gepaeck', 'gepack'}
+_STATUS_AIRBORNE = {'departed', 'airborne', 'enroute', 'abgeflogen', 'gestartet',
+                    'unterwegs'}
+_STATUS_GROUNDED = {'scheduled', 'boarding', 'delayed', 'estimated', 'erwartet',
+                    'planmaessig', 'planmassig', 'verspaetet', 'verspatet',
+                    'expected', 'calling', 'wait', 'warten'}
+_STATUS_CANCELLED = {'cancelled', 'canceled', 'annulliert', 'gestrichen',
+                     'storniert'}
+
+
+def _tokenize_status(status):
+    """Board-Status-String → Liste kleingeschriebener Wort-Tokens (Umlaute
+    entfaltet, Nicht-Alphanumerik als Trenner, Zeit-Suffixe fallen als eigene
+    numerische Tokens weg). Leere Liste bei None/leer."""
+    import re as _re
+    s = (status or '').strip().lower()
+    if not s:
+        return []
+    s = (s.replace('ä', 'ae').replace('ö', 'oe').replace('ü', 'ue')
+         .replace('ß', 'ss'))
+    return [t for t in _re.split(r'[^a-z0-9]+', s) if t and not t.isdigit()]
+
+
+def _status_phase_of(status, side):
+    """EINE Board-Status-Zeile → 'landed'|'airborne'|'grounded'|'cancelled'|None,
+    TOKENISIERT und SEITEN-BEWUSST (side ∈ 'dep'|'arr'). None = kein/unbekanntes
+    Signal (Aufrufer fällt auf ADS-B/on_ground zurück).
+
+    Kern: 'at gate'/'on ground'/'on blocks' am ZIEL (side='arr') = gelandet; am
+    START (side='dep') = am Boden wartend (grounded), NICHT gelandet."""
+    toks = _tokenize_status(status)
+    if not toks:
+        return None
+    ts = set(toks)
+
+    def phrase(a, b):
+        return any(toks[i] == a and toks[i + 1] == b
+                   for i in range(len(toks) - 1))
+
+    if ts & _STATUS_CANCELLED:
+        return 'cancelled'
+    if ts & _STATUS_LANDED or phrase('on', 'blocks') or phrase('on', 'block'):
+        return 'landed'
+    # Seiten-abhängig: 'at gate' / 'on ground'
+    if phrase('at', 'gate') or phrase('on', 'ground') or phrase('on', 'stand'):
+        return 'landed' if side == 'arr' else 'grounded'
+    if (ts & _STATUS_AIRBORNE or phrase('en', 'route') or phrase('in', 'air')
+            or phrase('im', 'flug')):
+        return 'airborne'
+    if (ts & _STATUS_GROUNDED or phrase('gate', 'open') or phrase('final', 'call')
+            or phrase('go', 'gate')):
+        return 'grounded'
+    return None
+
+
+def _status_is_hard(status):
+    """True wenn der Board-Status eine HARTE, autoritative Beobachtung trägt
+    (gelandet/abgeflogen/annulliert ODER on-ground/at-gate/on-blocks/en-route) —
+    im Gegensatz zu WEICHEN pre-departure-Schätzungen (scheduled/estimated/
+    boarding/delayed …). Owner-Regel: nur harte Stati dürfen eine FRISCHE ADS-B-
+    airborne-Beobachtung überstimmen; ein STALE nur-scheduled/estimated/boarding
+    Board-Status darf einen frischen airborne-Fix NICHT auf grounded zurückwerfen.
+    None/leer → False (kein Signal, nicht hart)."""
+    toks = _tokenize_status(status)
+    if not toks:
+        return False
+    ts = set(toks)
+
+    def phrase(a, b):
+        return any(toks[i] == a and toks[i + 1] == b
+                   for i in range(len(toks) - 1))
+
+    if ts & (_STATUS_LANDED | _STATUS_AIRBORNE | _STATUS_CANCELLED):
+        return True
+    return (phrase('on', 'blocks') or phrase('on', 'block')
+            or phrase('at', 'gate') or phrase('on', 'ground')
+            or phrase('on', 'stand') or phrase('en', 'route')
+            or phrase('in', 'air') or phrase('im', 'flug'))
+
+
+def status_for_flight(callsign=None, reg=None, date=None, origin=None, dest=None,
+                      on_ground=None, lat=None, lon=None, allow_paid=False):
+    """Die EINE Status-Kaskade eines Fluges — konsistent mit route_for_flight.
+
+    REIHENFOLGE (Board autoritativ, ADS-B nur zur Phasen-Ergänzung, Delay aus dem
+    Dual-Side-Merge):
+      1) BOARD (airport_delay_obs + freie Live-Boards via _flight_obs_merged,
+         free_only) — autoritativ für die Phase: departed/landed/at-gate/estimated,
+         TOKENISIERT + Origin/Dest-bewusst (_status_phase_of). Board-'airborne'
+         zeigt auch OHNE Position.
+      2) FR24/ADS-B on_ground + Origin/Dest-Kontext — nur wenn das Board KEINE
+         Phase liefert: on_ground am ZIEL = gelandet; am ORIGIN vor Abflug =
+         taxi-out (grounded), NICHT gelandet; nicht-on_ground = airborne.
+      3) DELAY immer aus _flight_obs_merged (EINZIGE Delay-Wahrheit; delay_known:
+         unbekannt ≠ pünktlich).
+
+    KEIN Paid im Default-Pfad (allow_paid=False → free_only-Merge). allow_paid=True
+    erlaubt zusätzlich die bezahlten Board-Zweige des Merges.
+
+    Rückgabe (dict): phase ∈ {'airborne','landed','grounded','cancelled','unknown'},
+    delay_min, delay_known, gate, terminal, sched, est, act, source
+    ('board'|'adsb'|'none'). Zeiten wie vom Board (station-lokal, wie sonst auch);
+    fehlt ein Feld → None (nie erfunden)."""
+    from blueprints import aerox_data_blueprint as D
+
+    cs = (callsign or '').strip().upper().replace(' ', '')
+    reg_u = (reg or '').strip().upper() or None
+    date = (date or '').strip()[:10] or None
+    origin = (origin or '').strip().upper() or None
+    dest = (dest or '').strip().upper() or None
+
+    out = {'phase': 'unknown', 'delay_min': None, 'delay_known': False,
+           'gate': None, 'terminal': None, 'sched': None, 'est': None,
+           'act': None, 'source': 'none'}
+
+    # ── Flugnummer für den Dual-Side-Merge (Board-Keys sind IATA-Flugnr) ──
+    fn = None
+    if cs:
+        try:
+            fn = D._callsign_to_iata_flightno(cs) or cs
+        except Exception:
+            fn = cs
+
+    m = None
+    if fn:
+        merged_fn = None
+        try:
+            from blueprints.aerox_data_blueprint import _life_app
+            merged_fn = _life_app('_flight_obs_merged')
+        except Exception:
+            merged_fn = None
+        if merged_fn is not None:
+            try:
+                # free_only = KEIN Paid; allow_paid=True hebt das Board-Spend-Gate.
+                m = merged_fn(fn, date=date, dep_iata=origin, arr_iata=dest,
+                              free_only=(not allow_paid))
+            except Exception:
+                m = None
+
+    # ── 3) DELAY (immer aus dem Merge — einzige Delay-Wahrheit) ──
+    if m is not None:
+        out['delay_known'] = bool(m.get('delay_known'))
+        out['delay_min'] = m.get('delay_min') if out['delay_known'] else None
+        # Origin/Dest ggf. aus dem Merge nachziehen (für den on_ground-Kontext).
+        origin = origin or ((m.get('dep_iata') or '').upper() or None)
+        dest = dest or ((m.get('arr_iata') or '').upper() or None)
+
+    # ── 1) BOARD autoritativ: tokenisierte, seiten-bewusste Phase ──
+    board_phase = None
+    if m is not None:
+        p_arr = _status_phase_of(m.get('status_arr'), 'arr')
+        p_dep = _status_phase_of(m.get('status_dep'), 'dep')
+        if m.get('cancelled') or p_arr == 'cancelled' or p_dep == 'cancelled':
+            board_phase = 'cancelled'
+        elif p_arr == 'landed' or p_dep == 'landed':
+            board_phase = 'landed'          # Ankunft ist definitiv
+        elif p_dep == 'airborne' or p_arr == 'airborne':
+            board_phase = 'airborne'
+        elif p_dep == 'grounded' or p_arr == 'grounded':
+            board_phase = 'grounded'
+            # Owner-Regel: ein STALE nur-scheduled/estimated/boarding Board-Status
+            # darf eine FRISCHE ADS-B-airborne-Beobachtung (on_ground=False) NICHT
+            # auf grounded zurückwerfen. Nur wenn KEINE Seite eine harte Boden-/
+            # Lande-/Abflug-Beobachtung trägt, weicht der weiche grounded dem
+            # frischen airborne-Fix (→ board_phase fällt weg, ADS-B übernimmt unten).
+            if (on_ground is False
+                    and not _status_is_hard(m.get('status_dep'))
+                    and not _status_is_hard(m.get('status_arr'))):
+                board_phase = None
+        if board_phase is not None:
+            out['phase'] = board_phase
+            out['source'] = 'board'
+            # Gate/Terminal + Zeiten je Phase: gelandet → Ankunftsseite, sonst
+            # Abflugseite. Nur echte Board-Werte, fehlt eins → None.
+            if board_phase == 'landed':
+                out['gate'] = m.get('gate_arr')
+                out['terminal'] = m.get('terminal_arr')
+                out['sched'] = m.get('sched_arr')
+                out['est'] = m.get('esti_arr')
+                out['act'] = m.get('esti_arr')   # Ist-Ankunft = beobachtetes esti
+            else:
+                out['gate'] = m.get('gate_dep')
+                out['terminal'] = m.get('terminal_dep')
+                out['sched'] = m.get('sched_dep')
+                out['est'] = m.get('esti_dep')
+                if board_phase == 'airborne':
+                    out['act'] = m.get('esti_dep')  # Ist-Abflug
+            return out
+
+    # ── 2) FR24/ADS-B on_ground + Origin/Dest-Kontext (Board gab keine Phase) ──
+    if on_ground is not None:
+        out['source'] = 'adsb'
+        if not on_ground:
+            out['phase'] = 'airborne'        # in der Luft → airborne (ohne Board)
+            return out
+        # on_ground: am ZIEL = gelandet; am ORIGIN vor Abflug = taxi-out (grounded).
+        at_origin = _near_airport(lat, lon, origin, D)
+        at_dest = _near_airport(lat, lon, dest, D)
+        if at_dest and not at_origin:
+            out['phase'] = 'landed'
+        elif at_origin and not at_dest:
+            out['phase'] = 'grounded'        # taxi-out / am Gate, NICHT gelandet
+        else:
+            # Weder eindeutig am Ziel noch am Start (unbekannte Position / gleiche
+            # Stadt) → am Boden, aber Phase nicht sicher „gelandet".
+            out['phase'] = 'grounded'
+        return out
+
+    # Kein Board, kein ADS-B-Signal → ehrlich unbekannt (Delay ggf. aus Merge da).
+    return out
+
+
+def _near_airport(lat, lon, iata, D, radius_km=8.0):
+    """True wenn (lat,lon) innerhalb radius_km um den Flughafen iata liegt.
+    False bei fehlender Position/Airport/Koordinaten (nie geraten)."""
+    if lat is None or lon is None or not iata:
+        return False
+    try:
+        ll = D._iata_latlon((iata or '').upper())
+    except Exception:
+        ll = None
+    if not ll:
+        return False
+    try:
+        return D._gc_km(float(lat), float(lon), ll[0], ll[1]) <= radius_km
+    except Exception:
+        return False

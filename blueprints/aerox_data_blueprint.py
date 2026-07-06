@@ -1448,173 +1448,33 @@ def _free_generic_route(cs, lat=None, lon=None):
 
 
 def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
-                        track=None, gs=None, on_ground=False, fast=False):
+                        track=None, gs=None, on_ground=False, fast=False,
+                        allow_paid=False, for_search=False, date=None):
     """OWN-DATA-FIRST Kaskade → genaue heutige Route eines Live-Fliegers.
     Rückgabe: route-Dict mit src/dst(+_icao), source, confidence(+optional
-    status/gate/terminal/reg) — oder None. Siehe Header-Block für die Priorität.
-    Jeder externe Treffer wird via _record_resolved_route in die Warehouse
-    geschrieben (fills our own DB)."""
-    cs = (callsign or '').strip().upper().replace(' ', '')
-    if not cs:
-        return None
-    reg = (reg or '').strip().upper() or None
-    hexid = (hexid or '').strip().lower() or None
-    date = _today_utc()
-    dk = date.replace('-', '')
+    status/gate/terminal/reg) — oder None.
 
-    # GEOMETRIE-REJECT-GATE AUCH FÜR confirmed (Owner-Beweisfoto EZY29CT: flog
-    # LGW→SKG, wir zeigten das frühere Tages-Leg LGW→ACE als „bestätigt"):
-    # Cache/Tafel/Warehouse können bei Mehr-Leg-Tagen das VORIGE Leg tragen.
-    # Geometrie ist NIE Quelle — sie verwirft NUR den klaren Widerspruch
-    # (Flieger fliegt eindeutig in die falsche Richtung / steht woanders).
-    # Verworfen → Kaskade läuft weiter; passt am Ende KEIN Leg → None (404),
-    # nie eine falsche Route.
+    Increment 2 (2026-07-06): DÜNNER ADAPTER auf die kanonische EINE Route-Quelle
+    `warehouse_reader.route_for_flight` (free-first, bezahlt nur budget-gedeckelt
+    zuletzt). Live-Aufruf → for_search=False (Positions-/Geometrie-Gate wie bisher).
 
-    # ── 1. Eigene Warehouse: date-gekeyter Cache (exakt heute) ──────────────
-    cached = _cache_get('ax_route_cache', 'flight', f'{cs}@{dk}')
-    if cached and (cached.get('src') or cached.get('src_icao')):
-        cached.setdefault('confidence', 'confirmed')
-        cached['_from'] = 'cache_date'
-        if _geometry_allows_route(cached, lat, lon, track, gs, on_ground):
-            return cached
-    # 1b. reg-gekeyter Cache (physische Maschine, heute)
-    if reg:
-        rc = _cache_get('ax_route_cache', 'flight', f'REG:{reg}@{dk}')
-        if rc and (rc.get('src') or rc.get('src_icao')):
-            rc.setdefault('confidence', 'confirmed')
-            rc['_from'] = 'cache_reg'
-            if _geometry_allows_route(rc, lat, lon, track, gs, on_ground):
-                return rc
-    # 1c. Eigene Airport-Tafel (autoritativ, flughafen-eigene Daten)
-    try:
-        obs = _route_from_obs(cs)
-    except Exception:
-        obs = None
-    if obs and (obs.get('src') or obs.get('dst')):
-        obs['source'] = 'aerox_board'
-        obs['confidence'] = 'confirmed'
-        if _geometry_allows_route(obs, lat, lon, track, gs, on_ground):
-            _record_resolved_route(cs, reg, obs, date)
-            return obs
-    # 1d. Flight-Warehouse: BOARD-Tail↔Hex-Match (Rule 1) — hex-basiert, greift
-    #     genau dort, wo 1c scheitert: alphanumerische Callsigns (DLH4CK), deren
-    #     Flugnummer sich nicht aus dem Callsign ableiten lässt.
-    wh = _route_from_warehouse(hexid, reg)
-    if wh and (wh.get('src') or wh.get('dst')):
-        wh['confidence'] = 'confirmed'
-        if _geometry_allows_route(wh, lat, lon, track, gs, on_ground):
-            _record_resolved_route(cs, reg, wh, date)
-            return wh
+    `allow_paid` gibt der AUFRUFER vor (Default False = FREE-ONLY): der bezahlte
+    Notnagel (AeroDataBox/AviationStack, Stufe 6) feuert NUR im eigenen/watch-Pfad
+    (mein/getappter EIGENER Flieger), NIE beim generischen Radar-Tap eines fremden
+    Fliegers und nie im gratis-Poller-Pfad (`_machine_live`). So entsteht kein
+    Paid-per-Radar-Tap; bezahlt bleibt der budget-gedeckelte letzte Ausweg.
 
-    # 1e. FR24-Store (GRATIS, verteilt via NAS-Harvester): Start/Ziel für nahezu
-    #     jeden Flieger — schließt Routen, die Board/Warehouse nicht kennen, OHNE
-    #     AeroDataBox zu zahlen. VOR dem bezahlten Fast-Path. Geometrie-Gate wie
-    #     die anderen (nur klarer Widerspruch verwirft). Treffer wird gecacht →
-    #     wächst in unsere autoritative Routen-DB und spart künftige Paid-Calls.
-    fr = _route_from_fr24(cs, hexid)
-    if fr and (fr.get('src') or fr.get('dst')):
-        if _geometry_allows_route(fr, lat, lon, track, gs, on_ground):
-            _record_resolved_route(cs, reg, fr, date)
-            return fr
-
-    # ── FAST-PATH (interaktiver Radar-Tap, Owner 2026-07-04 „auf 2 sek bringen") ──
-    #  Der User starrt auf einen Spinner. OpenSky (Token bis 15s + Flights 6s)
-    #  liefert für einen NOVEL Auslandsflug (nicht in unserem Warehouse) meist NICHTS
-    #  und kostet ~20s umsonst, BEVOR der eigentliche Treffer — AeroDataBox, reg-gekeyt
-    #  autoritativ — drankommt. Im Fast-Modus daher GLEICH den bezahlten reg-gekeyten
-    #  Call mit knappem Timeout (~3s → Treffer in 1-3s), OpenSky übersprungen. Alles,
-    #  was wir selbst haben, ist oben (Schritt 1, Cache/Tafel/Warehouse) längst GRATIS
-    #  raus → bezahlt trifft nur genuine Unbekannte (die man ohnehin bezahlen müsste)
-    #  und der Treffer wird sofort gecacht/crowdsourced → der nächste Tap ist gratis.
-    #  Miss (Quota/kein Treffer) → normale free-first-Kaskade unten als Fallback (ohne
-    #  AeroDataBox doppelt zu ziehen). Ohne Budget: gar kein Fast-Call → Fallback frei.
-    adb_tried = False
-    if fast and _paid_budget_ok():
-        adb_tried = True
-        adb_fast = _aerodatabox_route(cs, reg=reg, lat=lat, lon=lon, track=track,
-                                      date=date, timeout=3)
-        # Reject-Gate auch für confirmed (EZY29CT): nur klarer Widerspruch
-        # verwirft — dann lieber KEINE Route als die falsche.
-        if adb_fast and _geometry_allows_route(adb_fast, lat, lon, track, gs, on_ground):
-            adb_fast['confidence'] = 'confirmed'
-            _record_resolved_route(cs, adb_fast.get('reg') or reg, adb_fast, date)
-            return adb_fast
-
-    # ── 2. Selbst berechnet aus eigenem ADS-B ───────────────────────────────
-    #  Fertige Legs landen via observe_adsb_positions() bereits in ax_route_cache
-    #  → Schritt 1 (cache_date/cache_reg) serviert sie GRATIS. Kein separater
-    #  Netz-Call hier; die Engine füllt den Cache im Poller/Area-Consumer.
-
-    # ── 3. OpenSky (FREI mit Account; env-guarded, ohne Creds → None) ───────
-    #  WRONG-FLIGHT-GATE: /flights/aircraft schaut 36 h zurück → oft der gerade
-    #  abgeschlossene Vor-Flug (gleiche Maschine, gestrige/frühere Strecke). Wenn
-    #  die Maschine JETZT airborne ist, muss der OpenSky-Treffer (a) frisch sein
-    #  (last_seen nicht älter als _LIVE_ROUTE_STALE_S) UND (b) die Live-Geometrie
-    #  darf nicht klar widersprechen. Sonst: lieber nichts als die falsche Strecke.
-    # Fast-Modus + bezahlt schon versucht → OpenSky überspringen (Token+Flights bis
-    # 21s würden die 2-s-Zielzeit sprengen). Nur wenn KEIN Budget da war (adb_tried
-    # False) läuft OpenSky als freier Fallback.
-    osky = None if (fast and adb_tried) else _opensky_route(hexid)
-    if osky and (osky.get('src') or osky.get('dst')):
-        last_seen = osky.pop('_last_seen', None)
-        ok = True
-        if not on_ground:
-            try:
-                if last_seen is not None and \
-                        (time.time() - float(last_seen)) > _LIVE_ROUTE_STALE_S:
-                    ok = False            # veralteter Kontakt (Vor-Flug) → verwerfen
-            except (TypeError, ValueError):
-                pass
-            if ok and not _geometry_allows_route(osky, lat, lon, track, gs, on_ground):
-                ok = False                # Geometrie widerspricht klar → verwerfen
-        if ok:
-            _record_resolved_route(cs, reg, osky, date)
-            return osky
-
-    # ── 4. Freie generische Lookups (adsbdb / adsb.lol / hexdb) ─────────────
-    #  Das sind GENERISCHE Flugplan-Kandidaten. Owner-Regel: „scraped/eigene Infos
-    #  sind #1 — müssen nicht geprüft werden; generische ZEIGEN, außer die Geometrie
-    #  widerspricht KLAR." Wir zeigen die Route also DEFAULT, und verwerfen sie NUR,
-    #  wenn der Flieger eindeutig in die falsche Richtung fliegt (>115° weg, fern
-    #  beider Endpunkte). Alles andere (Anflug/Holding/gerade gestartet/Rauschen)
-    #  → Route wird gezeigt.
-    # GENERISCHE CALLSIGN→ROUTE ABGESCHALTET (Owner 2026-07-03: „adsbdb/adsb.lol/
-    # hexdb ist doch eh immer falsch — das ist gut für Tail und Live-Flieger, keine
-    # Infos [sonst]"). Diese Quellen liefern Flugplan-Routen, die zur falschen
-    # Rotation gehören → wir zeigen LIEBER GAR KEINE Route als eine falsche.
-    # Route kommt NUR aus eigener Tafel/Warehouse (Schritt 1) + OpenSky-Flugrecord
-    # (Schritt 3, gated) + bezahlt (Schritt 5). Tail (Kennzeichen) und die
-    # Live-Position laufen über SEPARATE Calls (ADS-B hex→reg/pos) — davon
-    # unberührt. Kein Route-Treffer → None → Client zeigt keine Strecke.
-    # (Audit 2026-07-05: der frühere `gen = None`-Stub + unerreichbarer
-    # Render-Block wurde entfernt — der Kommentar oben IST die Entscheidung.)
-
-    # ── 5. BEZAHLT (LETZTER Ausweg) — nur mit Tages-Budget, nur getippter Flieger
-    if _paid_budget_ok():
-        # adb_tried: der Fast-Path hat AeroDataBox oben bereits (erfolglos) gezogen →
-        # NICHT erneut (kein Doppel-Budget). Dann direkt AviationStack als Fallback.
-        adb = None if adb_tried else _aerodatabox_route(cs, reg=reg, lat=lat,
-                                                        lon=lon, track=track, date=date)
-        if adb:
-            # Reject-Gate AUCH für 'confirmed' (EZY29CT-Beweisfoto): der bezahlte
-            # Payload kann bei Mehr-Leg-Tagen/Datenlücken das falsche Leg liefern.
-            # Nur klarer Widerspruch verwirft; dann lieber keine Route als falsch.
-            if _geometry_allows_route(adb, lat, lon, track, gs, on_ground):
-                adb['confidence'] = 'confirmed'
-                _record_resolved_route(cs, adb.get('reg') or reg, adb, date)
-                return adb
-        try:
-            avs = _aviationstack_route(cs)
-        except Exception:
-            avs = None
-        if avs and (avs.get('src') or avs.get('dst')):
-            # Reject-Gate auch hier — ein Status-String hebelt die Geometrie
-            # nicht aus (Owner: passt kein Leg → keine Route, nie eine falsche).
-            if _geometry_allows_route(avs, lat, lon, track, gs, on_ground):
-                avs['confidence'] = 'confirmed'
-                _record_resolved_route(cs, reg, avs, date)
-                return avs
-    return None
+    Der frühere `fast`-Pfad (bezahltes AeroDataBox VORGEZOGEN mit 3-s-Timeout, um
+    langsames OpenSky zu überspringen) ist entfallen: OpenSky ist nicht mehr in der
+    Kaskade, alle freien Quellen sind schnelle Tabellen-Reads und Bezahlt läuft
+    ohnehin zuletzt — `fast` bleibt nur aus Signatur-Kompat erhalten (no-op).
+    Jeder Treffer wird von route_for_flight via _record_resolved_route in die
+    eigene Warehouse geschrieben."""
+    from blueprints.warehouse_reader import route_for_flight
+    return route_for_flight(callsign=callsign, hex=hexid, reg=reg,
+                            lat=lat, lon=lon, track=track, gs=gs,
+                            on_ground=on_ground, for_search=for_search,
+                            allow_paid=allow_paid, date=date)
 
 
 # ---------------------------------------------------------------- helpers
@@ -2290,16 +2150,21 @@ def ax_callsign(callsign):
     """ICAO-Callsign (z.B. DLH506) → GENAUE heutige Route. Das Radar fragt für
     jeden angetippten Flieger hier an. Die FREE-FIRST-Kaskade (_resolve_live_route)
     bevorzugt EIGENE + FREIE Quellen (Warehouse/Tafel + selbst-berechnetes ADS-B →
-    OpenSky → adsbdb/adsb.lol/hexdb) und ruft BEZAHLTE APIs (AeroDataBox/
-    AviationStack) nur als letzten Ausweg hinter einem Tages-Budget-Guard.
-    Jeder Treffer wird datums-/reg-gekeyt in ax_route_cache zurückgeschrieben →
-    derselbe Tap ist morgen gratis und die eigene Routen-DB wächst weltweit.
+    adsbdb/adsb.lol/hexdb). BEZAHLTE APIs (AeroDataBox/AviationStack) feuern hier
+    per DEFAULT NICHT — der generische Radar-Tap eines fremden Fliegers bleibt
+    FREE-ONLY (kein Paid-per-Radar-Tap). Nur der EIGENE/beobachtete Flieger
+    (?own=1 / ?watch=1) darf den budget-gedeckelten bezahlten Notnagel als letzten
+    Ausweg ziehen. Jeder Treffer wird datums-/reg-gekeyt in ax_route_cache
+    zurückgeschrieben → derselbe Tap ist morgen gratis und die eigene Routen-DB
+    wächst weltweit.
 
     Optionale Query-Params (schalten höhere Genauigkeit frei, alle abwärts-
     kompatibel — ohne sie funktioniert der Call wie bisher):
       hex=<icao24>  reg=<D-AIZJ>  lat= lon=/lng=  track=<heading°>
       gs=<groundspeed_kt>  on_ground=<0|1>   (schalten die Geometrie-Bestätigung
                                               generischer Kandidaten frei)
+      own=<0|1> / watch=<0|1>  (EIGENER/beobachteter Flieger → erlaubt den
+                                budget-gedeckelten bezahlten Notnagel)
 
     Response (Owner „scraped/eigene Infos sind #1 — zeigen, nicht verstecken"):
       ok, callsign, source, origin{}, destination{}, [gate, terminal, status]
@@ -2329,13 +2194,21 @@ def ax_callsign(callsign):
     track = _f(request.args.get('track') or request.args.get('heading'))
     gs = _f(request.args.get('gs') or request.args.get('speed') or request.args.get('gspeed'))
     og = (request.args.get('on_ground') or request.args.get('ground') or '').strip().lower()
+    on_ground_known = bool(og)
     on_ground = og in ('1', 'true', 'yes', 'y')
+    # EIGENER/beobachteter Flieger? (nur dann darf der budget-gedeckelte bezahlte
+    # Notnagel feuern — der generische Radar-Tap eines fremden Fliegers bleibt
+    # FREE-ONLY: kein Paid-per-Radar-Tap.)
+    _own = (request.args.get('own') or request.args.get('watch')
+            or request.args.get('mine') or '').strip().lower()
+    allow_paid = _own in ('1', 'true', 'yes', 'y')
 
-    # fast=True: interaktiver Radar-Tap → paid-first mit knappem Timeout, OpenSky
-    # übersprungen (Ziel ~2s statt ~29s). Der Background-Poller nutzt weiter die
-    # volle free-first-Kaskade (fast=False) und füllt das Warehouse.
+    # FREE-FIRST-Kaskade (eine Quelle: warehouse_reader.route_for_flight). Bezahlt
+    # nur wenn EIGENER/watch-Flieger UND Tages-Budget frei — sonst rein aus unseren
+    # Tabellen. Der Background-Poller füllt die Tabellen weiter free-first.
     route = _resolve_live_route(cs, hexid=hexid, reg=reg, lat=lat, lon=lon,
-                                track=track, gs=gs, on_ground=on_ground, fast=True)
+                                track=track, gs=gs, on_ground=on_ground,
+                                allow_paid=allow_paid)
     # SHOW-Contract (Owner: „scraped/eigene Infos sind #1"): der Resolver hat den
     # Reject-Only-Geometrie-Filter bereits angewandt (nur der eklatante „fliegt in
     # die falsche Richtung"-Fall wird verworfen). Was hier ankommt, WIRD gezeigt —
@@ -2366,6 +2239,34 @@ def ax_callsign(callsign):
         out['gate'] = route.get('gate')
     if route.get('terminal'):
         out['terminal'] = route.get('terminal')
+    # STATUS aus DERSELBEN einen Quelle wie die Route (warehouse_reader —
+    # Board autoritativ, ADS-B nur ergänzend, Delay aus dem Dual-Side-Merge).
+    # FREE-ONLY (allow_paid=False): Status kostet nie pro Tap. So sind Route UND
+    # Phase/Delay konsistent statt aus verschiedenen (teils bezahlten) Quellen.
+    origin_iata = route.get('src') or _icao_to_iata(route.get('src_icao'))
+    dest_iata = route.get('dst') or _icao_to_iata(route.get('dst_icao'))
+    try:
+        from blueprints.warehouse_reader import status_for_flight
+        st = status_for_flight(
+            callsign=cs, reg=(route.get('reg') or reg),
+            origin=origin_iata, dest=dest_iata,
+            on_ground=(on_ground if on_ground_known else None),
+            lat=lat, lon=lon, allow_paid=False)
+    except Exception:
+        st = None
+    if st:
+        if st.get('phase') and st['phase'] != 'unknown':
+            out['phase'] = st['phase']
+        # Delay nur wenn wirklich bekannt (unbekannt ≠ pünktlich).
+        out['delay_known'] = bool(st.get('delay_known'))
+        if st.get('delay_known'):
+            out['delay_min'] = st.get('delay_min')
+        # Gate/Terminal aus der Board-Status-Seite ergänzen, falls die Route
+        # sie nicht schon trug (echte Werte, nie erfunden).
+        if not out.get('gate') and st.get('gate'):
+            out['gate'] = st.get('gate')
+        if not out.get('terminal') and st.get('terminal'):
+            out['terminal'] = st.get('terminal')
     # Abflug-/Ankunfts-Zeiten (Owner: „warum steht nicht abflug und ankunft
     # uhrzeit im radar"): station-lokal, NUR echte Werte. Quelle 1: das auf-
     # gelöste Leg selbst (AeroDataBox-Payload / Tafel-Record trägt sched/est
@@ -3208,11 +3109,15 @@ def _machine_live(reg, want_route=True):
     route = None
     if want_route and cs:
         try:
+            # allow_paid=False explizit: „Wo ist mein/nächster Flieger" darf KEINE
+            # API-Kosten pro Aufruf erzeugen (Kern-Regel). Rein aus unseren Tabellen;
+            # der bezahlte Notnagel bleibt dem interaktiven ?own=1-Tap vorbehalten.
             route = _resolve_live_route(
                 cs, hexid=hexid, reg=reg,
                 lat=(pos or {}).get('lat'), lon=(pos or {}).get('lon'),
                 track=(pos or {}).get('track'), gs=(pos or {}).get('gs'),
-                on_ground=bool((pos or {}).get('on_ground')))
+                on_ground=bool((pos or {}).get('on_ground')),
+                allow_paid=False)
         except Exception:
             route = None
     return hexid, cs, pos, route
