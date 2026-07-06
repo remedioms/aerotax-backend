@@ -1,0 +1,24 @@
+# FR24-Harvester auf der Synology-NAS (deutsche Residential-IP, 24/7).
+# Eine Node reicht: sie pollt alle 8 Kacheln round-robin und schreibt
+# durchgehend nach Supabase fr24_live. Residential-IP = am wenigsten blockbar.
+#
+# Start (SSH auf die NAS, im Ordner mit dieser Datei + harvester.py + Dockerfile):
+#   SUPABASE_KEY='<service-role-key>' docker compose up -d --build
+# Logs:   docker compose logs -f
+# Stop:   docker compose down
+services:
+  fr24-harvester:
+    build: .
+    container_name: fr24-harvester
+    restart: unless-stopped
+    environment:
+      SUPABASE_URL: "https://jyrbijvmwacuivssbxlg.supabase.co"
+      SUPABASE_KEY: "${SUPABASE_KEY:?SUPABASE_KEY env fehlt}"
+      TILES: "all"          # eine Node = alle 8 Kacheln round-robin
+      POLL_SECONDS: "20"    # pro Kachel also ~alle 160s → sehr höflich
+    # Log-Rotation klein halten (NAS-Platten schonen — HDD-Hibernation-Gotcha):
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
