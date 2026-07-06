@@ -192,6 +192,52 @@ def tap_detail(callsign=None, hex=None, reg=None, lat=None, lon=None):
     return None
 
 
+def detail_card(callsign=None, hex=None, reg=None, lat=None, lon=None):
+    """Normalisierte REICHE Karte für den Live-Map-Tap (Increment #32): ETA,
+    Progress, Delay-Ampel (GREEN/YELLOW/RED), Muster-Langname, Airline, Foto,
+    sched/actual-Zeiten, Gate/Terminal. Nur echte Felder — None wird entfernt."""
+    td = tap_detail(callsign=callsign, hex=hex, reg=reg, lat=lat, lon=lon)
+    if not td:
+        return None
+    row = td.get("row") or {}
+    d = td.get("detail") or {}
+    xi = row.get("extra_info") or {}
+    route = xi.get("route") or {}
+    ai = d.get("aircraft_info") or {}
+    si = d.get("schedule_info") or {}
+    fp = d.get("flight_progress") or {}
+    photo = None
+    imgs = ai.get("images_list") or []
+    if imgs:
+        im = imgs[0]
+        photo = {"thumb": im.get("thumbnail"), "medium": im.get("medium"),
+                 "large": im.get("large"), "link": im.get("url"),
+                 "copyright": im.get("copyright")}
+        photo = {k: v for k, v in photo.items() if v}
+    card = {
+        "flight_number": (si.get("flight_number") or xi.get("flight") or "").strip() or None,
+        "reg": (ai.get("reg") or xi.get("reg") or "").strip().upper() or None,
+        "ac_type": (ai.get("type") or xi.get("type") or "").strip().upper() or None,
+        "ac_description": ai.get("full_description") or None,
+        "airline": ai.get("registered_owners") or None,
+        "route_from": (route.get("from") or "").strip().upper() or None,
+        "route_to": (route.get("to") or "").strip().upper() or None,
+        "sched_dep": si.get("scheduled_departure") or None,
+        "actual_dep": si.get("actual_departure") or None,
+        "sched_arr": si.get("scheduled_arrival") or None,
+        "eta": fp.get("eta") or None,
+        "progress_pct": fp.get("progress_pct"),
+        "delay_status": fp.get("delay_status") or None,
+        "flight_stage": fp.get("flight_stage") or None,
+        "arr_gate": si.get("arr_gate") or None,
+        "arr_terminal": si.get("arr_terminal") or None,
+        "baggage_belt": si.get("baggage_belt") or None,
+        "photo": photo,
+        "source": "fr24_grpc",
+    }
+    return {k: v for k, v in card.items() if v is not None}
+
+
 # ── Area-Positionen für die Live-Map (Satelliten/Ozean-Füllung, Increment #29) ─
 def _row_to_pos(row):
     """live_feed-Row → normalisierte Positions-Zeile für Map/Store."""

@@ -2281,6 +2281,23 @@ def ax_callsign(callsign):
                                       route.get('dst')).items():
             times.setdefault(k, v)
     out.update(times)
+
+    # Reiche FR24-Live-Detail (opt-in via ?rich=1) für die Tap-Karte: ETA/Progress/
+    # Delay-Ampel/Muster-Langname/Airline/Foto. NUR beim expliziten Detail-Tap (nicht
+    # im Radar-Batch) — je ein extra gRPC-Call, Timeout-geschützt. Fehlt still, wenn
+    # FR24 nichts hat; Route/Status oben bleiben board-autoritativ (nicht überschrieben).
+    if (request.args.get('rich') or '').strip() in ('1', 'true', 'yes') \
+            and lat is not None and lon is not None:
+        try:
+            from blueprints import fr24_grpc
+            card = fr24_grpc.detail_card(callsign=cs, hex=hexid,
+                                         reg=((route or {}).get('reg') or reg),
+                                         lat=lat, lon=lon)
+        except Exception:
+            card = None
+        if card:
+            out['live'] = card
+
     return jsonify(out)
 
 
