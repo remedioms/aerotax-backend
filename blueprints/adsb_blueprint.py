@@ -1942,9 +1942,66 @@ def _lol_on_ground(alt_baro_raw, alt_ft, gs_kts):
                 and (gs_kts is None or gs_kts < 60))
 
 
+# ─── Gratis ADSBX-v2-Mirror-Netz (Deep-Research 2026-07-06, live-verifiziert) ──
+#  adsb.fi und airplanes.live sind ADSBExchange-v2-kompatible Gratis-APIs mit
+#  IDENTISCHEM ac-Schema wie adsb.lol (Curl-Beweis: gleicher Hex, beide 200 mit
+#  ac[0].lat). Coverage der drei Community-Netze unterscheidet sich (verschiedene
+#  Feeder) → ein Miss bei adsb.lol ist oft ein Hit bei adsb.fi/airplanes.live.
+#  Limits: ~1 req/s pro Host, non-commercial-Grauzone → NUR als Fallback in
+#  Reihenfolge, NIE parallel; 429/5xx setzt einen per-Host-Cooldown.
+#  (adsb.one ist tot — Repo archiviert, Cloudflare 403; NICHT aufnehmen.)
+_ADSB_MIRROR_COOLDOWN = {}   # host → unix-ts, bis wann der Host pausiert
+
+
+def _adsb_v2_try_hosts(urls, timeout, what):
+    """Versucht die (host, url)-Liste sequentiell. Erste Antwort mit nicht-leerem
+    `ac` gewinnt → (obj, host). Alle erreichbar aber leer → (None, None) — das
+    ist eine ECHTE „nirgends gesehen"-Aussage. ALLE Hosts down/Fehler → wirft
+    _AdsbLolError (Kaskade behandelt das als Quell-Ausfall, nicht als Miss)."""
+    now = time.time()
+    last_err = None
+    any_answered = False
+    for host, url in urls:
+        if _ADSB_MIRROR_COOLDOWN.get(host, 0) > now:
+            continue
+        req = urllib.request.Request(url, headers={
+            "User-Agent": USER_AGENT, "Accept": "application/json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 503):
+                try:
+                    ra = float(e.headers.get('Retry-After') or 60)
+                except (TypeError, ValueError):
+                    ra = 60.0
+                _ADSB_MIRROR_COOLDOWN[host] = now + min(max(ra, 10.0), 300.0)
+            last_err = _AdsbLolError(f"{host} {what} http {e.code}")
+            continue
+        except urllib.error.URLError as e:
+            last_err = _AdsbLolError(f"{host} {what} network: {e.reason}")
+            continue
+        except Exception as e:
+            last_err = _AdsbLolError(f"{host} {what} transport: {type(e).__name__}")
+            continue
+        try:
+            obj = json.loads(data)
+        except (ValueError, json.JSONDecodeError):
+            last_err = _AdsbLolError(f"{host} {what} invalid json")
+            continue
+        any_answered = True
+        if obj.get("ac"):
+            return obj, host
+    if any_answered:
+        return None, None
+    raise (last_err or _AdsbLolError(f"{what}: keine Mirror-Hosts verfügbar"))
+
+
 def _fetch_adsb_lol(hex_id):
     """
-    Fallback-Upstream: adsb.lol `/v2/icao/<hex24>`.
+    Fallback-Upstream: freies ADSBX-v2-Mirror-Netz, `/v2/icao|hex/<hex24>`
+    (adsb.lol → adsb.fi → airplanes.live, sequentiell; siehe _adsb_v2_try_hosts).
 
     adsb.lol antwortet `{"ac": [{ ...aircraft-fields... }], "msg": "...", ...}`.
     Wir normalisieren das in das OpenSky-State-Row-Layout (siehe
@@ -1971,26 +2028,13 @@ def _fetch_adsb_lol(hex_id):
     Raises: _AdsbLolError bei HTTP-/Parse-/Timeout-Fehler.
     """
     safe_hex = urllib.parse.quote(hex_id, safe='')
-    url = f"{ADSB_LOL_URL}/{safe_hex}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=ADSB_LOL_TIMEOUT) as resp:
-            data = resp.read()
-    except urllib.error.HTTPError as e:
-        raise _AdsbLolError(f"adsb.lol http {e.code}") from e
-    except urllib.error.URLError as e:
-        raise _AdsbLolError(f"adsb.lol network: {e.reason}") from e
-    except Exception as e:
-        raise _AdsbLolError(f"adsb.lol transport: {type(e).__name__}") from e
-
-    try:
-        obj = json.loads(data)
-    except (ValueError, json.JSONDecodeError) as e:
-        raise _AdsbLolError("adsb.lol invalid json") from e
-
+    obj, _host = _adsb_v2_try_hosts([
+        ('adsb.lol', f"{ADSB_LOL_URL}/{safe_hex}"),
+        ('adsb.fi', f"https://opendata.adsb.fi/api/v2/hex/{safe_hex}"),
+        ('airplanes.live', f"https://api.airplanes.live/v2/hex/{safe_hex}"),
+    ], ADSB_LOL_TIMEOUT, "hex")
+    if obj is None:
+        return None
     ac_list = obj.get("ac") or []
     if not ac_list:
         return None
@@ -2759,25 +2803,21 @@ def _normalize_opensky_state(s):
 
 
 def _fetch_adsb_lol_point(lat, lon, radius_nm):
-    """adsb.lol /v2/point/{lat}/{lon}/{radius} → Liste normalisierter Rows.
-    Raises _AdsbLolError bei HTTP/Parse/Timeout. Leere Antwort → []."""
-    url = f"{ADSB_LOL_BASE}/v2/point/{lat}/{lon}/{int(radius_nm)}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT, "Accept": "application/json",
-    })
+    """Punkt-Sweep übers Mirror-Netz (adsb.lol → adsb.fi → airplanes.live) →
+    Liste normalisierter Rows. adsb.fi hat ein eigenes Pfad-Schema
+    (/lat/{}/lon/{}/dist/{}; live-verifiziert). Leere Antwort überall → [].
+    Raises _AdsbLolError nur wenn ALLE Hosts down sind."""
+    r = int(radius_nm)
     try:
-        with urllib.request.urlopen(req, timeout=ADSB_LOL_AREA_TIMEOUT) as resp:
-            data = resp.read()
-    except urllib.error.HTTPError as e:
-        raise _AdsbLolError(f"adsb.lol point http {e.code}") from e
-    except urllib.error.URLError as e:
-        raise _AdsbLolError(f"adsb.lol point network: {e.reason}") from e
-    except Exception as e:
-        raise _AdsbLolError(f"adsb.lol point transport: {type(e).__name__}") from e
-    try:
-        obj = json.loads(data)
-    except (ValueError, json.JSONDecodeError) as e:
-        raise _AdsbLolError("adsb.lol point invalid json") from e
+        obj, _host = _adsb_v2_try_hosts([
+            ('adsb.lol', f"{ADSB_LOL_BASE}/v2/point/{lat}/{lon}/{r}"),
+            ('adsb.fi', f"https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{r}"),
+            ('airplanes.live', f"https://api.airplanes.live/v2/point/{lat}/{lon}/{r}"),
+        ], ADSB_LOL_AREA_TIMEOUT, "point")
+    except _AdsbLolError:
+        raise
+    if obj is None:
+        return []
     out = []
     for ac in (obj.get("ac") or []):
         row = _normalize_adsb_lol_ac(ac)
