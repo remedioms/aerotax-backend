@@ -15,8 +15,15 @@ services:
     read_only: true          # Container-FS nur lesbar (keine versehentl. Disk-Writes)
     tmpfs:
       - /tmp                 # Scratch komplett in RAM
+    # QUIET=1 → nur ~1 Zeile/30min (Heartbeat) + Fehler. Mit winziger Rotation
+    # sind das ~vernachlässigbare Disk-Writes (Platten schlafen ~29/30min), ABER
+    # wir BEHALTEN Observability (`docker logs`) — logging:none war zu undurchsichtig
+    # zum Betreiben (man sah Blocks/Backoffs nicht). Für absolut 0 Writes: driver "none".
     logging:
-      driver: "none"         # KEINE Container-Logs auf die HDD (der Killer für Hibernation)
+      driver: json-file
+      options:
+        max-size: "256k"
+        max-file: "1"
     environment:
       SUPABASE_URL: "https://jyrbijvmwacuivssbxlg.supabase.co"
       SUPABASE_KEY: "${SUPABASE_KEY:?SUPABASE_KEY env fehlt}"
