@@ -168,15 +168,30 @@ def main():
     print(f"[fr24-harvester] tiles={my_tiles} poll={poll}s proxy={'yes' if prox else 'no'} "
           f"-> {sb_url}", flush=True)
 
+    # QUIET (Default AN auf der NAS): unterdrückt die Erfolgs-Logzeile pro Fetch,
+    # damit die Docker-json-Logs NICHT alle 20 s auf die HDDs schreiben und die
+    # Platten in den Ruhezustand gehen können (Synology-HDD-Hibernation). Fehler/
+    # Blocks werden weiter geloggt; alle HEARTBEAT_MIN Minuten eine Sammelzeile.
+    quiet = os.environ.get("QUIET", "0").strip() not in ("0", "", "false", "no")
+    heartbeat_min = float(os.environ.get("HEARTBEAT_MIN", "30"))
     i = 0
     backoff = 0.0          # wächst bei Blocks, sinkt bei Erfolg
+    win_rows = 0           # aufsummierte Rows seit letztem Heartbeat
+    last_hb = time.time()
     while True:
         idx = my_tiles[i % len(my_tiles)]
         i += 1
         try:
             rows = fetch_tile(session, FR24_TILES[idx])
             n = upsert(session, sb_url, sb_key, rows, idx)
-            print(f"[fr24-harvester] tile{idx} rows={len(rows)} upserted={n}", flush=True)
+            win_rows += n
+            if not quiet:
+                print(f"[fr24-harvester] tile{idx} rows={len(rows)} upserted={n}", flush=True)
+            elif time.time() - last_hb >= heartbeat_min * 60:
+                print(f"[fr24-harvester] heartbeat: {win_rows} rows upserted in "
+                      f"letzten {heartbeat_min:.0f}min", flush=True)
+                win_rows = 0
+                last_hb = time.time()
             backoff = max(0.0, backoff - 30.0)      # erholt sich schrittweise
         except _Blocked as e:
             backoff = min(900.0, (backoff * 2) or 60.0)   # 60s→2m→4m…→15m Deckel

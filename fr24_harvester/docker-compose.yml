@@ -11,14 +11,26 @@ services:
     build: .
     container_name: fr24-harvester
     restart: unless-stopped
+    # ── ALLES IN RAM, NULL HDD-Writes → Platten schlafen, NAS ist still ──
+    read_only: true          # Container-FS nur lesbar (keine versehentl. Disk-Writes)
+    tmpfs:
+      - /tmp                 # Scratch komplett in RAM
+    logging:
+      driver: "none"         # KEINE Container-Logs auf die HDD (der Killer für Hibernation)
     environment:
       SUPABASE_URL: "https://jyrbijvmwacuivssbxlg.supabase.co"
       SUPABASE_KEY: "${SUPABASE_KEY:?SUPABASE_KEY env fehlt}"
-      TILES: "all"          # eine Node = alle 8 Kacheln round-robin
-      POLL_SECONDS: "20"    # pro Kachel also ~alle 160s → sehr höflich
-    # Log-Rotation klein halten (NAS-Platten schonen — HDD-Hibernation-Gotcha):
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "2"
+      TILES: "all"           # eine Node = alle 8 Kacheln round-robin
+      POLL_SECONDS: "20"     # pro Kachel also ~alle 160s → sehr höflich
+      QUIET: "1"             # keine Erfolgs-Logzeilen (nur Fehler/Blocks + 30min-Heartbeat)
+    # Der Harvester macht NUR Netz-Traffic (POST an Supabase) — kein lokaler Disk-I/O.
+    # Mit logging:none + read_only + tmpfs berührt der laufende Container die HDDs
+    # nach dem Start GAR NICHT mehr → Synology-HDD-Hibernation greift, NAS bleibt leise.
+    #
+    # HEALTH-CHECK ohne Container-Logs (da logging:none): einfach fragen, ob
+    # fr24_live frisch ist —
+    #   select count(*) from fr24_live where updated_at > now() - interval '3 minutes';
+    # (kann Claude jederzeit aus dem Backend/Supabase prüfen.)
+    #
+    # Falls du DOCH Logs sehen willst: logging:"none" → json-file und QUIET:"0"
+    # ODER QUIET:"1" lassen (dann nur 1 Zeile / 30min = Platten schlafen ~29min/30).
