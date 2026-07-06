@@ -3218,6 +3218,44 @@ def _bbox_from_point(lat, lon, radius_nm):
     return lamin, lomin, lamax, lomax
 
 
+# Ab diesem Radius (nm) liest der Radar-Viewport aus fr24_live (Übersicht,
+# instant, Welt-Tabelle) statt extern. Darunter (Zoom-in) bleibt adsb.lol real-time.
+_AREA_FR24_MIN_RADIUS_NM = 90.0
+# Store-Rows älter als das gelten fürs Radar als tot (Übersicht toleriert Minuten).
+_AREA_FR24_MAX_AGE_S = 600.0
+
+
+def _area_from_fr24_live(lat, lon, radius):
+    """Flieger einer bbox aus fr24_live (unsere Welt-Tabelle) — INSTANT, kein
+    Extern-Call. Rückgabe: Liste OpenSky-State-Rows (identisch zu adsb.lol/point,
+    weil fr24_live.row genau dieses Layout speichert) oder None (SB-down/leer).
+    Dateline-Wrap (lomin>lomax) wird als zwei Fälle behandelt."""
+    sb, ok = _sb_client()
+    if not ok or sb is None:
+        return None
+    lamin, lomin, lamax, lomax = _bbox_from_point(lat, lon, radius)
+    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                           time.gmtime(time.time() - _AREA_FR24_MAX_AGE_S))
+    try:
+        q = (sb.table('fr24_live').select('row')
+             .gte('lat', lamin).lte('lat', lamax)
+             .gt('updated_at', cutoff))
+        if lomin <= lomax:
+            q = q.gte('lon', lomin).lte('lon', lomax)
+        else:
+            # Dateline-Übergang: lon >= lomin ODER lon <= lomax
+            q = q.or_(f'lon.gte.{lomin},lon.lte.{lomax}')
+        rows = (q.limit(3000).execute()).data or []
+    except Exception:
+        return None
+    out = []
+    for d in rows:
+        r = d.get('row')
+        if isinstance(r, list) and len(r) > 6 and r[5] is not None and r[6] is not None:
+            out.append(r)
+    return out or None
+
+
 @adsb_bp.route('/api/adsb/area', methods=['GET'])
 def get_adsb_area():
     """Live-Aircraft in einem Radius um einen Punkt.
@@ -3269,13 +3307,34 @@ def get_adsb_area():
     aircraft = None
     source = None
 
-    # ─── Primär: adsb.lol point-radius ───
-    try:
-        aircraft = _fetch_adsb_lol_point(lat, lon, radius)
-        source = "adsb.lol"
-        tried.append({"upstream": "adsb.lol", "ok": True})
-    except _AdsbLolError as e:
-        tried.append({"upstream": "adsb.lol", "ok": False, "reason": str(e)[:80]})
+    # ─── Primär beim RAUSZOOMEN (großes Fenster): fr24_live-Geo-Read ───
+    # Der Owner-Schmerz „Radar lädt beim Pannen/Zoom-out lange": adsb.lol
+    # point-radius ist ein EXTERNER Roundtrip pro Fenster (1-3s) und bei 250nm
+    # gecappt — jenseits davon leer. fr24_live (unsere Welt-Tabelle, vom Harvester
+    # gefüllt) liest die Flieger einer bbox INSTANT aus Supabase, ohne Extern-Call,
+    # ohne Radius-Cap, über die ganze abgedeckte Welt. Nur ab ~90nm (Übersicht),
+    # weil die Store-Frische ~Minuten ist — beim Zoom-IN (kleiner Radius, Flieger
+    # verfolgen) bleibt adsb.lol real-time. Store leer/kalt (unabgedeckte Region)
+    # → normaler adsb.lol/OpenSky-Fallback unten.
+    if radius >= _AREA_FR24_MIN_RADIUS_NM:
+        try:
+            fr_ac = _area_from_fr24_live(lat, lon, radius)
+        except Exception as e:
+            fr_ac = None
+            tried.append({"upstream": "fr24_live", "ok": False, "reason": str(e)[:80]})
+        if fr_ac:
+            aircraft = fr_ac
+            source = "fr24_live"
+            tried.append({"upstream": "fr24_live", "ok": True, "count": len(fr_ac)})
+
+    # ─── Primär (Zoom-in) / Fallback: adsb.lol point-radius ───
+    if aircraft is None:
+        try:
+            aircraft = _fetch_adsb_lol_point(lat, lon, radius)
+            source = "adsb.lol"
+            tried.append({"upstream": "adsb.lol", "ok": True})
+        except _AdsbLolError as e:
+            tried.append({"upstream": "adsb.lol", "ok": False, "reason": str(e)[:80]})
 
     # ─── Fallback: OpenSky bbox (außer im Backoff) ───
     if aircraft is None:
