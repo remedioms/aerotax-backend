@@ -412,6 +412,19 @@ async def sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
         await asyncio.wait_for(stop.wait(), timeout=seconds)
 
 
+async def heartbeat_loop(stop: asyncio.Event, path: str, interval: float = 60.0) -> None:
+    """Heartbeat UNABHÄNGIG vom Poll-Loop ticken. Während eines langen Bucket-
+    Freezes (z.B. 30 min bei anhaltender FR24-Drosselung) hängt poll_once im
+    acquire() — der Prozess LEBT, wartet nur höflich. Ein separater Ticker hält
+    das Healthcheck grün, statt den Container fälschlich als „unhealthy" zu
+    markieren (Neustart würde die Drosselung eh nicht beheben)."""
+    p = Path(path)
+    while not stop.is_set():
+        with contextlib.suppress(Exception):
+            p.touch()
+        await sleep_or_stop(stop, interval)
+
+
 async def main() -> None:
     settings = Settings()
     logging.basicConfig(
@@ -444,9 +457,13 @@ async def main() -> None:
     log.info("fr24-ingest start: %d Kacheln, poll=%.0fs, rate=%.3f rps (burst %.0f) -> %s",
              len(settings.tiles), settings.poll_interval, settings.rate_rps,
              settings.rate_burst, settings.supabase_url)
+    hb = asyncio.create_task(heartbeat_loop(stop, settings.heartbeat_file))
     try:
         await ingestor.run(stop)
     finally:
+        hb.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb
         await api.aclose()
         await sb.aclose()
         log.info("shutdown complete")
