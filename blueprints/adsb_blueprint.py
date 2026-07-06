@@ -34,6 +34,7 @@ import json
 import math
 import os
 import time
+import logging
 import threading
 import urllib.parse
 import urllib.request
@@ -190,7 +191,7 @@ def _warm_persist_from_opensky_row(hex_id, opensky_row, source):
         # ausschließlich über die Hex-Map auf.
         reg = None
         src = (source or '').lower()
-        if (('adsb.lol' in src or src == 'adb')
+        if (('adsb.lol' in src or src == 'adb' or src == 'fr24')
                 and len(opensky_row) > 2 and isinstance(opensky_row[2], str)):
             cand = opensky_row[2].strip().upper()
             # Heuristik: Reg enthält keine Leerzeichen und ist <=12 Zeichen.
@@ -944,10 +945,181 @@ def _adb_position_attempt(hex_id, reg_hint):
 
 # ─── Live-Kaskade als aufrufbare Funktion (Route + interner Fan-out) ─────────
 
-def _live_position_cascade(hex_param, reg_param='', targeted=False):
+# ─── FR24-Grauzonen-Snapshot: schließt das China/Russland/Ozean-Coverage-Loch ──
+#  Die freien ADS-B-Netze (OpenSky/adsb.lol/adsb.fi/airplanes.live) haben dort
+#  KEINE Feeder → Langstrecke (FRA-HND) verschwindet. FR24 aggregiert zusätzlich
+#  MLAT + terrestrische Partner-Feeds in genau diesen Regionen (Owner-Beweis LH716
+#  über China: FR24 sah den Flieger, wir nicht). data-cloud.flightradar24.com/
+#  zones/fcgi/feed.js ist ein Bounding-Box-BULK-Feed: EIN Call liefert alle Flieger
+#  einer Box mit hex/reg/typ/callsign/route/pos. Wir holen einen WELT-Snapshot und
+#  cachen ihn ~45s → egal wie viele Crew wir beobachten, FR24 sieht nur ~1 Call/45s
+#  (rate-freundlich + höflich). GRAUZONE: FR24-ToS untersagt Scraping; NUR als
+#  Lücken-Fallback hinter den freien Netzen, browser-UA nötig (generischer UA → 32B
+#  leer). Datacenter-IP-Risiko (Cloud Run) → bei Block still degradieren, nie Crash.
+FR24_FEED_URL = "https://data-cloud.flightradar24.com/zones/fcgi/feed.js"
+FR24_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+           "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+FR24_TIMEOUT = 8
+FR24_REFRESH_MIN = 40           # s — frühestens so oft EINE Kachel nachladen (~1 Call/40s)
+FR24_ENTRY_TTL = 360            # s — Einträge älter als 6 min aus dem Merge-Index werfen
+# Korridor-Kacheln (lat_n,lat_s,lon_w,lon_e) NUR über den Coverage-Löchern, wo die
+# freien ADS-B-Netze (OpenSky/adsb.lol/adsb.fi) keine Feeder haben — Europa/USA
+# fehlen bewusst (dort ist frei besser + FR24 würde clippen). FR24 cappt bei 1500
+# Rows/Call; diese Loch-Kacheln sind sparsam (Ozean/Sibirien/Zentralasien) → kein
+# Clipping-Verlust unseres Ziel-Fliegers. Round-Robin: 1 Kachel pro Refresh, damit
+# EINE IP nur ~1 Call/40s macht (FR24-ToS-Grauzone → höflich bleiben; die verteilte
+# Multi-IP-Harvester-Variante liest denselben Merge-Index aus Supabase).
+FR24_TILES = [
+    (55, 20, 55, 110),    # Zentralasien/West-China (LH716-FRA-HND-Fall)
+    (72, 45, 55, 140),    # Trans-Sibirien
+    (55, 20, 110, 145),   # Ost-China/Korea/Japan-Anflug
+    (45, 8, 30, 65),      # Naher Osten / Kaspisch
+    (35, -10, 60, 100),   # Indien / Indischer Ozean
+    (72, 35, -60, -10),   # Nordatlantik (ozeanisch)
+    (60, 15, 140, 180),   # Nordpazifik-West (Dateline)
+    (40, -40, -25, 55),   # Afrika / Südatlantik-Anflug
+]
+# entries: hex → (row, inserted_ts). by_cs: callsign → hex. Merge über alle Kacheln.
+_FR24 = {"lock": threading.Lock(), "last_at": 0.0, "tile_idx": 0,
+         "entries": {}, "by_cs": {}, "cooldown_until": 0.0}
+
+
+def _fr24_row_to_opensky(v):
+    """FR24-feed.js-Zeile → OpenSky-State-Row (identisch zu _normalize_adsb_lol_ac).
+    FR24-Layout: [0]hex [1]lat [2]lon [3]track [4]alt_ft [5]gs_kt [6]squawk
+    [7]radar [8]type [9]reg [10]ts [11]orig [12]dest [13]flight_iata [14]on_gnd
+    [15]vspeed_fpm [16]callsign [17]? [18]airline_icao. Ohne lat/lon → None."""
+    try:
+        if not isinstance(v, list) or len(v) < 17:
+            return None
+        lat, lon = v[1], v[2]
+        if lat in (None, 0) and lon in (None, 0):
+            return None
+        def _n(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+        alt_ft = _n(v[4]); gs_kt = _n(v[5]); vs_fpm = _n(v[15])
+        ts = _n(v[10]) or time.time()
+        cs = (str(v[16]).strip() or None) if v[16] else None
+        reg = (str(v[9]).strip().upper() or None) if v[9] else None
+        return [
+            (str(v[0]).strip().lower() or None),                 # 0 hex
+            cs,                                                   # 1 callsign
+            reg,                                                  # 2 reg (whitelist fr24)
+            ts,                                                   # 3 time_position
+            ts,                                                   # 4 last_contact
+            _n(lon),                                              # 5 lon
+            _n(lat),                                              # 6 lat
+            (alt_ft * 0.3048) if alt_ft is not None else None,   # 7 baro_alt_m
+            bool(v[14]),                                          # 8 on_ground
+            (gs_kt * 0.514444) if gs_kt is not None else None,   # 9 velocity_m_s
+            _n(v[3]),                                             # 10 true_track
+            (vs_fpm * 0.00508) if vs_fpm is not None else None,  # 11 vertical_rate
+            None,                                                 # 12 sensors
+            (alt_ft * 0.3048) if alt_ft is not None else None,   # 13 geo_alt_m
+            (str(v[6]).strip() or None) if v[6] else None,       # 14 squawk
+            False,                                                # 15 spi
+            0,                                                    # 16 position_source
+        ]
+    except Exception:
+        return None
+
+
+def _fr24_fetch_tile(tile):
+    """Holt EINE FR24-Kachel → Liste normalisierter Rows. Wirft NIE (bei
+    Block/Fehler: []). Grauzone → höflicher Browser-UA + Referer."""
+    n, s, w, e = tile
+    url = (f"{FR24_FEED_URL}?bounds={n},{s},{w},{e}"
+           "&faa=1&mlat=1&flarm=1&adsb=1&gnd=0&air=1&vehicles=0"
+           "&estimated=1&maxage=14400&gliders=0&stats=0")
+    req = urllib.request.Request(url, headers={
+        "User-Agent": FR24_UA, "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.flightradar24.com/",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=FR24_TIMEOUT) as resp:
+            obj = json.loads(resp.read())
+    except Exception as e:
+        raise _AdsbLolError(f"fr24 tile {type(e).__name__}: {str(e)[:60]}")
+    out = []
+    for k, v in obj.items():
+        if not isinstance(v, list):
+            continue                       # full_count/version/stats-Metakeys
+        row = _fr24_row_to_opensky(v)
+        if row is not None and row[0] is not None:
+            out.append(row)
+    return out
+
+
+def _fr24_refresh_one_tile():
+    """Round-Robin: lädt die NÄCHSTE Korridor-Kachel und merged sie in den
+    Index (Einträge mit Insert-Zeit; alte >TTL werden geräumt). Frühestens alle
+    FR24_REFRESH_MIN Sekunden → EINE IP macht ~1 Call/40s. Bei Block: Cooldown."""
+    now = time.time()
+    with _FR24["lock"]:
+        if now - _FR24["last_at"] < FR24_REFRESH_MIN or now < _FR24["cooldown_until"]:
+            return
+        idx = _FR24["tile_idx"]
+        _FR24["tile_idx"] = (idx + 1) % len(FR24_TILES)
+        _FR24["last_at"] = now
+    tile = FR24_TILES[idx]
+    try:
+        rows = _fr24_fetch_tile(tile)
+    except _AdsbLolError as ex:
+        with _FR24["lock"]:
+            _FR24["cooldown_until"] = time.time() + 120.0
+        logging.getLogger('aerotax.adsb').info(f"[fr24] tile{idx}_skip {str(ex)[:80]}")
+        return
+    ins = time.time()
+    with _FR24["lock"]:
+        ent = _FR24["entries"]
+        for row in rows:
+            ent[row[0]] = (row, ins)
+            if row[1]:
+                _FR24["by_cs"][row[1].upper()] = row[0]
+        # TTL-Räumung (Einträge, die keine Kachel mehr auffrischt)
+        cutoff = ins - FR24_ENTRY_TTL
+        stale = [h for h, (_, t) in ent.items() if t < cutoff]
+        for h in stale:
+            ent.pop(h, None)
+    logging.getLogger('aerotax.adsb').info(
+        f"[fr24] tile{idx} {tile} rows={len(rows)} index={len(_FR24['entries'])}")
+
+
+def _fetch_fr24(hex_id, callsign=None):
+    """FR24-Grauzonen-Lookup aus dem gemergten Korridor-Index: erst per hex,
+    sonst per Callsign. Triggert vorher einen (rate-begrenzten) Kachel-Refresh.
+    Row (frisch genug) oder None. Wirft NIE."""
+    if not hex_id and not callsign:
+        return None
+    try:
+        _fr24_refresh_one_tile()
+    except Exception:
+        pass
+    now = time.time()
+    with _FR24["lock"]:
+        ent = _FR24["entries"]
+        hx = str(hex_id).strip().lower() if hex_id else None
+        if hx and hx in ent:
+            row, t = ent[hx]
+            if now - t < FR24_ENTRY_TTL:
+                return row
+        if callsign:
+            hx2 = _FR24["by_cs"].get(str(callsign).strip().upper())
+            if hx2 and hx2 in ent:
+                row, t = ent[hx2]
+                if now - t < FR24_ENTRY_TTL:
+                    return row
+    return None
+
+
+def _live_position_cascade(hex_param, reg_param='', targeted=False, callsign=''):
     """Die Live-Kaskade OHNE Flask-Kontext: Step 1 OpenSky (mit globalem
-    Backoff) → Step 2 adsb.lol → Step 2b Tier 3 AeroDataBox (nur
-    targeted=True, budget-bewacht). Wird von der Route get_adsb_state UND
+    Backoff) → Step 2 adsb.lol → Step 2c FR24-Grauzonen-Snapshot (frei,
+    Coverage-Loch) → Step 2b Tier 3 AeroDataBox (nur targeted=True, budget-bewacht). Wird von der Route get_adsb_state UND
     intern vom Family-Watch-Fan-out benutzt (resolve_position_for_watch) —
     KEIN HTTP-Self-Call nötig.
 
@@ -1008,11 +1180,29 @@ def _live_position_cascade(hex_param, reg_param='', targeted=False):
             tried.append({"upstream": "adsb.lol", "ok": False,
                           "reason": str(e)[:80]})
 
+    # ─── Step 2c (FREI, Grauzone): FR24-Welt-Snapshot ───
+    # Schließt GENAU das Coverage-Loch, das der bezahlte Tier unten adressiert —
+    # nur gratis. FR24 aggregiert MLAT + Partner-Feeds über China/Russland/Ozean,
+    # wo die ADS-B-Community-Netze keine Feeder haben. Ein gecachter Welt-Snapshot
+    # (~1 Call/45s) bedient alle Watches. Läuft VOR AeroDataBox → spart Budget,
+    # wenn FR24 die Lücke schon füllt. Nicht auf targeted gegatet (frei), aber der
+    # Callsign-Fallback hilft besonders bei beobachteten Flügen.
+    if row is None:
+        try:
+            fr_row = _fetch_fr24(hex_param, callsign)
+            if fr_row is not None:
+                row = fr_row
+                source = "fr24"
+                tried.append({"upstream": "fr24", "ok": True})
+            else:
+                tried.append({"upstream": "fr24", "ok": True, "reason": "no_signal"})
+        except Exception as e:
+            tried.append({"upstream": "fr24", "ok": False, "reason": str(e)[:80]})
+
     # ─── Step 2b (Tier 3, BEZAHLT): AeroDataBox-Position — NUR gezielt ───
-    # Coverage-Lücken der freien Quellen (Owner-Fall LH716 über China: FR24
-    # zeigte den Flieger, wir nicht). Läuft NUR wenn (a) die Abfrage als
-    # eigener Flug/Inbound/Family-Watch markiert ist, (b) die freien Quellen
-    # keine Position lieferten und (c) das Tages-Budget ('adb_position',
+    # Coverage-Lücken der freien Quellen. Läuft NUR wenn (a) die Abfrage als
+    # eigener Flug/Inbound/Family-Watch markiert ist, (b) die freien Quellen UND
+    # FR24 keine Position lieferten und (c) das Tages-Budget ('adb_position',
     # Default 200/Tag + globaler Paid-Guard) frei ist. VOR dem stale/ocean-
     # bridge-Fallback, damit eine echte Live-Position gewinnt.
     if row is None and targeted:
@@ -1026,7 +1216,7 @@ def _live_position_cascade(hex_param, reg_param='', targeted=False):
     return row, source, None, tried
 
 
-def resolve_position_for_watch(reg=None, hex_id=None, allow_paid=True):
+def resolve_position_for_watch(reg=None, hex_id=None, allow_paid=True, callsign=None):
     """Interner Positions-Lookup für beobachtete Flüge (Family/Freunde) ohne
     Flask/HTTP-Self-Call: Cache → freie Kaskade → optional Tier 3.
 
@@ -1058,7 +1248,8 @@ def resolve_position_for_watch(reg=None, hex_id=None, allow_paid=True):
             ts = time.time()
         return cached["row"], cached.get("source", "cache"), ts
     row, source, obs_ts, _tried = _live_position_cascade(
-        hexp, reg_n or '', targeted=bool(allow_paid))
+        hexp, reg_n or '', targeted=bool(allow_paid),
+        callsign=(callsign or '').strip().upper())
     if row is None:
         return None, None, None
     # In den normalen Cache + Warm-Persist — mit dem ECHTEN Beobachtungs-

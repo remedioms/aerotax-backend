@@ -43,8 +43,11 @@ def _isolated(monkeypatch):
     monkeypatch.setattr(ADSB, '_touch_watch', lambda *a, **k: None)
 
     # Freie Quellen: sauberes „kein Signal" (Coverage-Lücke) als Default.
+    # FR24-Grauzonen-Tier ebenfalls inert (sonst echter Netz-Call im Test) —
+    # die Tier3-Tests prüfen genau den Fall, wo AUCH FR24 die Lücke nicht füllt.
     monkeypatch.setattr(ADSB, '_fetch_opensky', lambda h: None)
     monkeypatch.setattr(ADSB, '_fetch_adsb_lol', lambda h: None)
+    monkeypatch.setattr(ADSB, '_fetch_fr24', lambda h, callsign=None: None)
 
     # ADB-Key vorhanden (langer Key = RapidAPI-Kanal); HTTP wird eh gemockt.
     monkeypatch.setenv('AERODATABOX_KEY', 'x' * 40)
@@ -138,7 +141,7 @@ def test_own_flag_free_empty_adb_position_delivered(client, monkeypatch):
 
     # tried dokumentiert die volle Kaskade in Reihenfolge.
     assert [t['upstream'] for t in b['tried']] == ['opensky', 'adsb.lol',
-                                                   'aerodatabox']
+                                                   'fr24', 'aerodatabox']
 
 
 def test_purpose_inbound_also_enables_tier3(client, monkeypatch):
