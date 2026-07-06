@@ -125,9 +125,10 @@ def fetch_tile(session, tile):
         raise _Blocked(f"http {r.status_code}")
     r.raise_for_status()
     obj = r.json()
-    # 200 mit full_count>0 aber KEINE ac-Zeilen = Soft-Block (IP gedrosselt).
-    if obj.get("full_count") and not any(isinstance(v, list) for v in obj.values()):
-        raise _Blocked("empty_ac (soft-block)")
+    # KEINE Soft-Block-Heuristik auf leere ac-Liste: full_count ist der GLOBALE
+    # Zähler (immer >0), eine legitim leere Kachel (Ozean/Nacht, 0 Flieger) sähe
+    # sonst wie ein Block aus → falscher Backoff, Kachel verstummt. Nur echte
+    # 403/429 gelten als Block; leere Kachel = einfach 0 Rows.
     out = []
     for k, v in obj.items():
         if not isinstance(v, list):
