@@ -182,14 +182,16 @@ def _warm_persist_from_opensky_row(hex_id, opensky_row, source):
         lon = _coerce_float(opensky_row[5]) if len(opensky_row) > 5 else None
         if lat is None or lon is None:
             return  # keine Position → nicht persistieren
-        # Reg-Auflösung: NUR adsb.lol legt die Registration in [2]. OpenSky-
-        # State-Vektoren haben dort origin_country (Ländername, z.B. "Germany")
-        # — der ist KEINE Registration und darf NICHT als PK landen. Wir trauen
-        # [2] daher ausschließlich bei adsb.lol-Quellen; bei OpenSky (inkl.
-        # 'opensky-poll') lösen wir die Reg ausschließlich über die Hex-Map auf.
+        # Reg-Auflösung: NUR adsb.lol und Tier-3 AeroDataBox ('adb') legen die
+        # Registration in [2]. OpenSky-State-Vektoren haben dort origin_country
+        # (Ländername, z.B. "Germany") — der ist KEINE Registration und darf
+        # NICHT als PK landen. Wir trauen [2] daher ausschließlich bei diesen
+        # Quellen; bei OpenSky (inkl. 'opensky-poll') lösen wir die Reg
+        # ausschließlich über die Hex-Map auf.
         reg = None
         src = (source or '').lower()
-        if 'adsb.lol' in src and len(opensky_row) > 2 and isinstance(opensky_row[2], str):
+        if (('adsb.lol' in src or src == 'adb')
+                and len(opensky_row) > 2 and isinstance(opensky_row[2], str)):
             cand = opensky_row[2].strip().upper()
             # Heuristik: Reg enthält keine Leerzeichen und ist <=12 Zeichen.
             if cand and ' ' not in cand and 2 <= len(cand) <= 12:
@@ -737,6 +739,338 @@ def _opensky_auth_header():
     return {"Authorization": f"Basic {basic}"}
 
 
+# ─── Tier 3 (BEZAHLT): AeroDataBox-Live-Position ─────────────────────────────
+#
+# Owner-Fall 2026-07-05: LH716 FRA→HND über China — FR24 zeigte den Flieger,
+# wir nicht. adsb.lol/OpenSky haben dort echte Coverage-Lücken (keine Feeder).
+# Der BEZAHLTE Dienst AeroDataBox liefert im Flight-Status-Payload eine echte
+# Live-Position (`location`: lat/lon + reportedAtUtc + optional altitude/
+# groundSpeed/trueTrack — gespeist u.a. aus satellitengestütztem ADS-B).
+#
+# Regeln (streng, damit Radar-Browsing das Budget NIE leerzieht):
+#   · Läuft NUR wenn der Request gezielt markiert ist (?own=1 oder
+#     ?purpose=own|inbound|watch) — eigener Flug / Inbound-Maschine des Users /
+#     von Familie oder Freunden beobachteter Flug (Family-„Fliegt gerade").
+#   · NUR wenn die freien Quellen (OpenSky + adsb.lol) keine Position lieferten.
+#   · Eigener Tages-Budget-Key 'adb_position:YYYYMMDD' (ADB_POSITION_DAILY_CAP,
+#     Default 200 Calls/Tag) + der globale Paid-Guard aus aerox_data_blueprint
+#     (_paid_budget_ok) müssen BEIDE frei sein. Zählung atomar via
+#     ax_budget_increment-RPC (_budget_key_inc / _paid_budget_inc — importiert,
+#     nicht dupliziert).
+#   · EHRLICH: Position ohne reportedAtUtc-Zeitstempel oder älter als
+#     _ADB_POS_MAX_AGE_S (~10 min) wird NICHT als live geliefert → Kaskade
+#     läuft normal weiter (stale/ocean-bridge-Fallback). Nichts erfinden.
+
+ADB_POSITION_TIMEOUT = 6
+_ADB_POS_MAX_AGE_S = 600          # Position älter als ~10 min gilt nicht als live
+
+
+def _adb_position_daily_cap():
+    try:
+        return int(os.environ.get('ADB_POSITION_DAILY_CAP', '200'))
+    except (TypeError, ValueError):
+        return 200
+
+
+def _adb_position_budget_key():
+    return 'adb_position:' + time.strftime('%Y%m%d', time.gmtime())
+
+
+def _adb_position_budget_ok():
+    """True solange das eigene Tages-Kontingent (adb_position:YYYYMMDD) frei ist
+    UND der globale Paid-Deckel (aerox_data._paid_budget_ok) nicht erschöpft ist.
+    Fail-CLOSED bei Import-/Helper-Problemen — ein bezahlter Call ohne
+    funktionierenden Zähler wäre unbudgetierter Spend."""
+    try:
+        from blueprints.aerox_data_blueprint import _budget_key_used, _paid_budget_ok
+        if not _paid_budget_ok():
+            return False
+        return _budget_key_used(_adb_position_budget_key()) < _adb_position_daily_cap()
+    except Exception:
+        return False
+
+
+def _adb_position_budget_inc():
+    """Zählt EINEN ADB-Positions-Call: eigener Tages-Key (atomar via
+    ax_budget_increment-RPC) + globales Paid-Unit-Konto (Flight-Endpoint =
+    Tier 2 = 2 Units, identisch zu _aerodatabox_route). Wirft NIE."""
+    try:
+        from blueprints.aerox_data_blueprint import _budget_key_inc, _paid_budget_inc
+        _budget_key_inc(_adb_position_budget_key(), 1)
+        _paid_budget_inc(units=2)
+    except Exception:
+        pass
+
+
+def _adb_num(v, *keys):
+    """AeroDataBox-Mengenfeld → float. Der Payload liefert Mengen wahlweise als
+    nackte Zahl ODER als Einheiten-Dict ({'meter':…,'feet':…} / {'kt':…} /
+    {'deg':…}) — erstes vorhandenes `keys`-Feld gewinnt. None wenn nicht
+    vorhanden/unparsebar — nie raten."""
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        for k in keys:
+            if v.get(k) is not None:
+                return _coerce_float(v[k])
+        return None
+    return _coerce_float(v)
+
+
+def _adb_position_http(reg, date):
+    """GET /flights/reg/{reg}/{date}?withLocation=true → Liste der Flight-
+    Objekte oder None bei Fehler/Quota/Netz (still degradieren). Kanal-
+    Erkennung identisch zu _aerodatabox_route (aerox_data_blueprint):
+    kurzer cuid-Key = api.market-Direktportal, langer Key = RapidAPI."""
+    key = os.environ.get('AERODATABOX_KEY', '')
+    if not key:
+        return None
+    if len(key) <= 32:
+        base = 'https://prod.api.market/api/v1/aedbx/aerodatabox'
+        hdr = {'x-magicapi-key': key, 'User-Agent': USER_AGENT}
+    else:
+        host = 'aerodatabox.p.rapidapi.com'
+        base = f'https://{host}'
+        hdr = {'x-rapidapi-key': key, 'x-rapidapi-host': host,
+               'User-Agent': USER_AGENT}
+    url = (f'{base}/flights/reg/{urllib.parse.quote(reg)}/{date}'
+           f'?withAircraftImage=false&withLocation=true')
+    try:
+        req = urllib.request.Request(url, headers=hdr)
+        with urllib.request.urlopen(req, timeout=ADB_POSITION_TIMEOUT) as r:
+            d = json.loads(r.read().decode('utf-8', 'replace'))
+            return d if isinstance(d, list) else None
+    except Exception:
+        return None      # 429/quota/Netz → still degradieren (Kaskade läuft weiter)
+
+
+def _adb_position_attempt(hex_id, reg_hint):
+    """Tier-3-Versuch: AeroDataBox-Live-Position für die Maschine.
+
+    Returns:
+        (row, obs_ts, None)          — Erfolg: OpenSky-Layout-Row (siehe
+                                       _fetch_adsb_lol) + ECHTER Beobachtungs-
+                                       Zeitstempel (unix) aus reportedAtUtc.
+        (None, None, skip_reason)    — kein Versuch / kein brauchbares Ergebnis;
+                                       Caller läuft die alte Kaskade weiter.
+
+    Budget wird VOR dem HTTP-Call geprüft und (nur) bei tatsächlichem Call
+    inkrementiert. Positionen ohne Zeitstempel oder älter als
+    _ADB_POS_MAX_AGE_S werden verworfen (nichts erfinden)."""
+    if not os.environ.get('AERODATABOX_KEY', ''):
+        return None, None, 'no_key'
+    reg = (_normalize_registration(reg_hint)
+           or _hex_to_reg(hex_id) or _hex_to_reg_sb(hex_id))
+    if not reg:
+        return None, None, 'no_registration'
+    if not _adb_position_budget_ok():
+        return None, None, 'budget_exhausted'
+    _adb_position_budget_inc()
+    date = time.strftime('%Y-%m-%d', time.gmtime())
+    flights = _adb_position_http(reg, date)
+    if not flights:
+        return None, None, 'no_data'
+
+    try:
+        from blueprints.aerox_data_blueprint import _adb_ts
+    except Exception:
+        return None, None, 'helper_unavailable'
+
+    # Jüngste brauchbare location über alle Legs des Tages; Legs mit fremder
+    # Reg (sollte beim reg-gekeyten Endpoint nicht vorkommen) werden übersprungen.
+    best = None     # (obs_ts, lat, lon, location_dict, flight_dict)
+    for f in flights:
+        if not isinstance(f, dict):
+            continue
+        f_reg = (((f.get('aircraft') or {}).get('reg')) or '').strip().upper()
+        if f_reg and f_reg != reg:
+            continue
+        loc = f.get('location')
+        if not isinstance(loc, dict):
+            continue
+        lat = _coerce_float(loc.get('lat'))
+        lon = _coerce_float(loc.get('lon'))
+        obs_ts = _adb_ts(loc.get('reportedAtUtc'))
+        # Ohne Zeitstempel keine Freshness-Garantie → Position NICHT verwenden.
+        if lat is None or lon is None or obs_ts is None:
+            continue
+        if best is None or obs_ts > best[0]:
+            best = (obs_ts, lat, lon, loc, f)
+
+    if best is None:
+        return None, None, 'no_location'
+    obs_ts, lat, lon, loc, f = best
+    age = time.time() - obs_ts
+    if age > _ADB_POS_MAX_AGE_S:
+        return None, None, f'stale_position({int(age)}s)'
+
+    alt_m = _adb_num(loc.get('altitude'), 'meter')
+    if alt_m is None:
+        alt_m = _adb_num(loc.get('pressureAltitude'), 'meter')
+        if alt_m is None:
+            alt_ft = _adb_num(loc.get('pressureAltitude'), 'feet')
+            alt_m = alt_ft * 0.3048 if alt_ft is not None else None
+    gs_kt = _adb_num(loc.get('groundSpeed'), 'kt')
+    vel_ms = gs_kt * 0.514444 if gs_kt is not None else None
+    track = _adb_num(loc.get('trueTrack'), 'deg')
+    callsign = ((f.get('callSign') or f.get('number') or '')
+                .replace(' ', '').strip().upper() or None)
+    # on_ground nur ableiten wenn belegbar (Höhe klar über Boden), sonst None.
+    on_ground = False if (alt_m is not None and alt_m > 100) else None
+
+    # OpenSky-State-Row-Layout (identisch zu _fetch_adsb_lol) — Clients brauchen
+    # KEINE Quellen-bedingte Parser-Variante:
+    row = [
+        (hex_id or '').lower() or None,   # 0 icao24
+        callsign,                          # 1 callsign
+        reg,                               # 2 reg (best-effort, wie adsb.lol)
+        obs_ts,                            # 3 time_position (ECHTER Obs-Zeitpunkt)
+        obs_ts,                            # 4 last_contact
+        lon,                               # 5 lon
+        lat,                               # 6 lat
+        alt_m,                             # 7 baro_altitude_m
+        on_ground,                         # 8 on_ground
+        vel_ms,                            # 9 velocity_m_s
+        track,                             # 10 true_track
+        None,                              # 11 vertical_rate
+        None,                              # 12 sensors
+        None,                              # 13 geo_altitude_m
+        None,                              # 14 squawk (liefert ADB nicht)
+        False,                             # 15 spi
+        0,                                 # 16 position_source
+    ]
+    return row, obs_ts, None
+
+
+# ─── Live-Kaskade als aufrufbare Funktion (Route + interner Fan-out) ─────────
+
+def _live_position_cascade(hex_param, reg_param='', targeted=False):
+    """Die Live-Kaskade OHNE Flask-Kontext: Step 1 OpenSky (mit globalem
+    Backoff) → Step 2 adsb.lol → Step 2b Tier 3 AeroDataBox (nur
+    targeted=True, budget-bewacht). Wird von der Route get_adsb_state UND
+    intern vom Family-Watch-Fan-out benutzt (resolve_position_for_watch) —
+    KEIN HTTP-Self-Call nötig.
+
+    Returns (row, source, obs_ts, tried):
+        row/source — Semantik wie bisher in der Route: source kann 'opensky'
+                     mit row=None sein (= Upstream ok, sauber „kein Signal");
+                     'adsb.lol' wird nur bei echter Row gesetzt.
+        obs_ts     — NUR bei source='adb' gesetzt: ECHTER reportedAtUtc-
+                     Beobachtungszeitpunkt (unix). Freie Quellen: None
+                     (Fetch-Zeit = jetzt, Row trägt time_position selbst).
+        tried      — Diagnose-Liste, identisch zum bisherigen Routen-Verhalten.
+    """
+    now = time.time()
+    with _BACKOFF["lock"]:
+        backoff_until = _BACKOFF["until"]
+    opensky_skipped = now < backoff_until
+
+    tried = []
+    row = None
+    source = None
+
+    # ─── Step 1: OpenSky (außer wenn im Backoff) ───
+    if not opensky_skipped:
+        try:
+            row = _fetch_opensky(hex_param)
+            source = "opensky"
+            tried.append({"upstream": "opensky", "ok": True})
+        except _OpenSkyRateLimit as e:
+            # 429 → globaler Backoff setzen, dann adsb.lol versuchen.
+            with _BACKOFF["lock"]:
+                _BACKOFF["until"] = time.time() + e.retry_after
+            tried.append({"upstream": "opensky", "ok": False,
+                          "reason": f"rate_limited(retry={e.retry_after}s)"})
+        except _OpenSkyError as e:
+            tried.append({"upstream": "opensky", "ok": False,
+                          "reason": str(e)[:80]})
+    else:
+        tried.append({"upstream": "opensky", "ok": False,
+                      "reason": f"backoff_active({int(backoff_until - now)}s)"})
+
+    # ─── Step 2: adsb.lol (wenn OpenSky nichts brauchbares lieferte) ───
+    # AUCH bei OpenSky „ok, aber kein Signal" adsb.lol fragen (Änderung 2026-07-05):
+    # die Community-Coverage von adsb.lol ist real oft BESSER als OpenSky —
+    # Live-Fall D-ABYO/DLH511: adsb.lol sah die Maschine über Frankreich, während
+    # OpenSky leer war → der frühere Skip lieferte „kein Signal", obwohl der
+    # Flieger flog. Erst wenn BEIDE leer sind, ist „nicht in der Luft" ehrlich.
+    if row is None:
+        try:
+            lol_row = _fetch_adsb_lol(hex_param)
+            if lol_row is not None:
+                row = lol_row
+                source = "adsb.lol"
+                tried.append({"upstream": "adsb.lol", "ok": True})
+            else:
+                tried.append({"upstream": "adsb.lol", "ok": True,
+                              "reason": "no_signal"})
+        except _UpstreamError as e:
+            tried.append({"upstream": "adsb.lol", "ok": False,
+                          "reason": str(e)[:80]})
+
+    # ─── Step 2b (Tier 3, BEZAHLT): AeroDataBox-Position — NUR gezielt ───
+    # Coverage-Lücken der freien Quellen (Owner-Fall LH716 über China: FR24
+    # zeigte den Flieger, wir nicht). Läuft NUR wenn (a) die Abfrage als
+    # eigener Flug/Inbound/Family-Watch markiert ist, (b) die freien Quellen
+    # keine Position lieferten und (c) das Tages-Budget ('adb_position',
+    # Default 200/Tag + globaler Paid-Guard) frei ist. VOR dem stale/ocean-
+    # bridge-Fallback, damit eine echte Live-Position gewinnt.
+    if row is None and targeted:
+        adb_row, adb_ts, adb_skip = _adb_position_attempt(hex_param, reg_param)
+        if adb_row is not None:
+            tried.append({"upstream": "aerodatabox", "ok": True})
+            return adb_row, "adb", adb_ts, tried
+        tried.append({"upstream": "aerodatabox", "ok": False,
+                      "reason": adb_skip})
+
+    return row, source, None, tried
+
+
+def resolve_position_for_watch(reg=None, hex_id=None, allow_paid=True):
+    """Interner Positions-Lookup für beobachtete Flüge (Family/Freunde) ohne
+    Flask/HTTP-Self-Call: Cache → freie Kaskade → optional Tier 3.
+
+    OWNER-DIREKTIVE 2026-07-06 (zweistufig): „familie könnte sogar kostenlos
+    bleiben … aber freunde kann man mal pingen, sehr überwacht" →
+    - FAMILY ruft mit allow_paid=False: NUR Cache + freie Quellen, NIE ein
+      bezahlter Ping. Korrekt ist die Family-Karte trotzdem, weil Abflug/
+      Ankunft delay-korrigiert aus den (gratis) Board-Beobachtungen kommen.
+    - FREUNDE (purpose=watch) dürfen mit allow_paid=True den budget-bewachten
+      Tier 3 nutzen (eigener Tages-Cap + globaler Paid-Deckel).
+    Gleiche Seiteneffekte wie die Route (Fresh-Cache + Warm-Persist). Der
+    Caller memoisiert zusätzlich pro (reg, datum), damit N Watcher nicht
+    N-fach kaskadieren/zahlen.
+
+    → (row, source, obs_ts) oder (None, None, None). obs_ts = bester bekannter
+    Beobachtungs-/Fetch-Zeitpunkt (unix); die Row selbst trägt in [3]/[4] den
+    upstream-eigenen Beobachtungszeitstempel."""
+    reg_n = _normalize_registration(reg) if reg else None
+    hexp = (hex_id or '').strip().lower()
+    if not hexp and reg_n:
+        hexp = resolve_reg_to_hex(reg_n) or ''
+    if not hexp:
+        return None, None, None
+    cached = _cache_get(hexp)
+    if cached is not None and cached.get("row") is not None:
+        try:
+            ts = float(cached.get("fetched_at") or 0) or time.time()
+        except (TypeError, ValueError):
+            ts = time.time()
+        return cached["row"], cached.get("source", "cache"), ts
+    row, source, obs_ts, _tried = _live_position_cascade(
+        hexp, reg_n or '', targeted=bool(allow_paid))
+    if row is None:
+        return None, None, None
+    # In den normalen Cache + Warm-Persist — mit dem ECHTEN Beobachtungs-
+    # Zeitstempel bei Tier 3 (obs_ts), sonst „jetzt" (freie Quellen).
+    _cache_put(hexp, row, source, fetched_at=obs_ts)
+    try:
+        _warm_persist_from_opensky_row(hexp, row, source)
+    except Exception:
+        pass
+    return row, source, (obs_ts if obs_ts is not None else time.time())
+
+
 # ─── /api/adsb/state ─────────────────────────────────────────
 
 @adsb_bp.route('/api/adsb/state', methods=['GET'])
@@ -747,6 +1081,17 @@ def get_adsb_state():
     Query:
         hex=<icao24>    — direkter Hex-Lookup (bevorzugt, Client weiß was er will)
         reg=<reg>       — Reg→Hex Mapping (Fallback für Web-Clients)
+        own=1           — GEZIELTE Abfrage (eigener Flug / Inbound-Maschine des
+                          Users). Schaltet Tier 3 frei: liefern die freien
+                          Quellen (OpenSky/adsb.lol) keine Position, wird EIN
+                          budget-bewachter AeroDataBox-Call versucht
+                          (source='adb'). Radar-Sweeps/fremde Flieger setzen
+                          den Parameter NICHT → nie Paid-Spend.
+        purpose=own|inbound|watch — Alternative zu own=1 (gleiche Semantik).
+                          'watch' = von Familie/Freunden BEOBACHTETER Flug
+                          (Owner 2026-07-06: „die familie/freunde sind
+                          wichtiger als ich — wenn es sein muss kann man mal
+                          1 pingen"), gleiche Budget-Mechanik.
 
     Antwort 200:
         {"hex": "<hex>", "position": <openSky-row> | null, "fetched_at": <unix>, "cached": <bool>}
@@ -763,6 +1108,15 @@ def get_adsb_state():
 
     hex_param = (request.args.get('hex') or '').strip().lower()
     reg_param = (request.args.get('reg') or '').strip().upper()
+
+    # Tier-3-Freigabe (BEZAHLTE Quelle, s. _adb_position_attempt): NUR gezielte
+    # Abfragen des eigenen Fluges / der Inbound-Maschine / des von Familie
+    # oder Freunden beobachteten Fluges. iOS setzt ?own=1 (oder
+    # ?purpose=own|inbound|watch); Radar-Sweeps setzen nichts.
+    own_raw = (request.args.get('own') or '').strip().lower()
+    purpose = (request.args.get('purpose') or '').strip().lower()
+    targeted = (own_raw in ('1', 'true', 'yes')
+                or purpose in ('own', 'inbound', 'watch'))
 
     if not hex_param and not reg_param:
         return jsonify({"error": "missing hex or reg parameter"}), 400
@@ -823,54 +1177,25 @@ def get_adsb_state():
                 "source": backfilled.get("source", "supabase-backfill"),
             }), 200
 
-    # Backoff-Status für OpenSky tracken — wenn aktiv, OpenSky-Step
-    # überspringen aber adsb.lol weiter probieren.
-    now = time.time()
-    with _BACKOFF["lock"]:
-        backoff_until = _BACKOFF["until"]
-    opensky_skipped = now < backoff_until
+    # ─── Steps 1 / 2 / 2b: Live-Kaskade (extrahiert in _live_position_cascade,
+    # damit der Family-Watch-Fan-out sie OHNE HTTP-Self-Call nutzen kann;
+    # Verhalten identisch zum früheren Inline-Code) ───
+    row, source, adb_obs_ts, tried = _live_position_cascade(
+        hex_param, reg_param, targeted=targeted)
 
-    tried = []
-    row = None
-    source = None
-
-    # ─── Step 1: OpenSky (außer wenn im Backoff) ───
-    if not opensky_skipped:
-        try:
-            row = _fetch_opensky(hex_param)
-            source = "opensky"
-            tried.append({"upstream": "opensky", "ok": True})
-        except _OpenSkyRateLimit as e:
-            # 429 → globaler Backoff setzen, dann adsb.lol versuchen.
-            with _BACKOFF["lock"]:
-                _BACKOFF["until"] = time.time() + e.retry_after
-            tried.append({"upstream": "opensky", "ok": False,
-                          "reason": f"rate_limited(retry={e.retry_after}s)"})
-        except _OpenSkyError as e:
-            tried.append({"upstream": "opensky", "ok": False,
-                          "reason": str(e)[:80]})
-    else:
-        tried.append({"upstream": "opensky", "ok": False,
-                      "reason": f"backoff_active({int(backoff_until - now)}s)"})
-
-    # ─── Step 2: adsb.lol (wenn OpenSky nichts brauchbares lieferte) ───
-    # AUCH bei OpenSky „ok, aber kein Signal" adsb.lol fragen (Änderung 2026-07-05):
-    # die Community-Coverage von adsb.lol ist real oft BESSER als OpenSky —
-    # Live-Fall D-ABYO/DLH511: adsb.lol sah die Maschine über Frankreich, während
-    # OpenSky leer war → der frühere Skip lieferte „kein Signal", obwohl der
-    # Flieger flog. Erst wenn BEIDE leer sind, ist „nicht in der Luft" ehrlich.
-    if row is None:
-        try:
-            row = _fetch_adsb_lol(hex_param)
-            if row is not None:
-                source = "adsb.lol"
-                tried.append({"upstream": "adsb.lol", "ok": True})
-            else:
-                tried.append({"upstream": "adsb.lol", "ok": True,
-                              "reason": "no_signal"})
-        except _UpstreamError as e:
-            tried.append({"upstream": "adsb.lol", "ok": False,
-                          "reason": str(e)[:80]})
+    if source == "adb":
+        # Tier-3-Treffer: in den normalen Cache — mit dem ECHTEN Beobachtungs-
+        # Zeitstempel (reportedAtUtc), NICHT als „jetzt" gefälscht.
+        _cache_put(hex_param, row, "adb", fetched_at=adb_obs_ts)
+        _warm_persist_from_opensky_row(hex_param, row, "adb")
+        return jsonify({
+            "hex": hex_param,
+            "position": row,
+            "fetched_at": adb_obs_ts,
+            "cached": False,
+            "source": "adb",
+            "tried": tried,
+        }), 200
 
     # ─── Erfolg: cachen + ausgeben ───
     if source is not None:
@@ -1235,10 +1560,13 @@ def _last_known_get(hex_id):
         return entry
 
 
-def _cache_put(hex_id, row, source="opensky"):
+def _cache_put(hex_id, row, source="opensky", fetched_at=None):
+    """`fetched_at` erlaubt es, den ECHTEN Beobachtungs-Zeitstempel zu setzen
+    (Tier-3 AeroDataBox: reportedAtUtc der Position) statt „jetzt" — eine ältere
+    Beobachtung darf sich im Cache nicht als frisch ausgeben."""
     with _CACHE_LOCK:
         _CACHE[hex_id] = {
-            "fetched_at": time.time(),
+            "fetched_at": fetched_at if fetched_at is not None else time.time(),
             "row": row,
             "source": source,
         }

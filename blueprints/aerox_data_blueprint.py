@@ -834,6 +834,48 @@ def _paid_budget_inc(units=1):
         pass
 
 
+# ── Generische Budget-Key-Helper (für andere Blueprints, z.B. adsb_blueprint
+#    Tier-3 'adb_position'). GLEICHER Mechanismus wie der Paid-Guard oben
+#    (In-Memory-Safety-Net + ax_api_budget + atomarer ax_budget_increment-RPC),
+#    nur key-parametrisiert — KEIN Umbau der bestehenden Paid-Pfade. ──────────
+def _budget_key_used(key):
+    """Aktueller Stand eines beliebigen Budget-Keys (max aus In-Memory und
+    ax_api_budget). Wirft NIE; SB down → In-Memory-Stand dieser Instanz."""
+    used = _MEM_BUDGET.get(key, 0)
+    sb = _sb()
+    if sb is not None:
+        try:
+            res = sb.table('ax_api_budget').select('n').eq('month', key).limit(1).execute()
+            rows = getattr(res, 'data', None) or []
+            if rows:
+                used = max(used, int(rows[0].get('n') or 0))
+        except Exception:
+            pass
+    return used
+
+
+def _budget_key_inc(key, units=1):
+    """Increment eines beliebigen Budget-Keys — bevorzugt ATOMAR via
+    ax_budget_increment-RPC (s. _budget_rpc_add), sonst Upsert-Fallback.
+    Identische Semantik wie _paid_budget_inc, nur key-parametrisiert.
+    Wirft NIE."""
+    used = _MEM_BUDGET.get(key, 0) + max(1, int(units))
+    _MEM_BUDGET[key] = used          # In-Memory IMMER zählen (Safety-Net)
+    sb = _sb()
+    if sb is None:
+        return
+    n = _budget_rpc_add(key, units)
+    if n is not None:
+        _MEM_BUDGET[key] = max(used, n)
+        return
+    try:
+        sb.table('ax_api_budget').upsert(
+            {'month': key, 'n': max(used, _budget_key_used(key)),
+             'updated_at': _iso_now()}).execute()
+    except Exception:
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  SELF-COMPUTED ROUTES FROM OWN POLLED ADS-B  —  the long-term FREE data engine
 #

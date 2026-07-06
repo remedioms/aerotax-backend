@@ -44,6 +44,13 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+# Dynamischer "heute"-Tag (UTC): _enrich_leg_delays hat seit 2026-07-04 einen
+# Datums-Guard (nur today ±1 ohne dep_iso) — ein hart kodierter Tag driftet aus
+# dem Fenster und ließ die Suite ab 2026-07-06 rot werden. Semantik unverändert:
+# der Tag ist nur der Roster-Tages-Key.
+TODAY = _now().strftime('%Y-%m-%d')
+
+
 def _sector(flight='LH400', frm='FRA', to='MUC', dep_iso=None, arr_iso=None):
     s = {'flight': flight, 'from': frm, 'to': to}
     if dep_iso is not None:
@@ -116,7 +123,7 @@ def test_enrich_on_time_leg():
     with patch.object(A, '_flight_obs_merged',
                       return_value=_merged(delay_min=0, delay_known=True,
                                            delay_side='dep', dep_delay_min=0)):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     s = secs[0]
     assert s['delay_known'] is True
     assert s['delay_min'] == 0
@@ -128,7 +135,7 @@ def test_enrich_dep_delayed_no_arr():
     with patch.object(A, '_flight_obs_merged',
                       return_value=_merged(delay_min=35, delay_known=True,
                                            delay_side='dep', dep_delay_min=35)):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert secs[0]['delay_min'] == 35
     assert secs[0]['delay_side'] == 'dep'
     assert secs[0]['dep_delay_min'] == 35
@@ -140,7 +147,7 @@ def test_enrich_arr_delay_wins():
                       return_value=_merged(delay_min=40, delay_known=True,
                                            delay_side='arr', dep_delay_min=10,
                                            arr_delay_min=40)):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert secs[0]['delay_min'] == 40
     assert secs[0]['delay_side'] == 'arr'
     assert secs[0]['arr_delay_min'] == 40
@@ -153,7 +160,7 @@ def test_enrich_arr_known_dep_unknown():
                       return_value=_merged(delay_min=40, delay_known=True,
                                            delay_side='arr', dep_delay_min=None,
                                            arr_delay_min=40)):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert secs[0]['delay_side'] == 'arr'
     assert secs[0]['delay_min'] == 40
     assert secs[0]['dep_delay_min'] is None
@@ -163,7 +170,7 @@ def test_enrich_unknown_no_fabricated_zero():
     secs = [_sector()]
     with patch.object(A, '_flight_obs_merged',
                       return_value=_merged(delay_min=None, delay_known=False)):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert secs[0]['delay_known'] is False
     assert secs[0]['delay_min'] is None
     assert secs[0]['dep_delay_min'] is None
@@ -173,7 +180,7 @@ def test_enrich_unknown_no_fabricated_zero():
 def test_enrich_none_merged_writes_nothing():
     secs = [_sector()]
     with patch.object(A, '_flight_obs_merged', return_value=None):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     # Legacy/kein Signal → gar keine neuen Keys (abwärtskompatibel).
     assert 'delay_known' not in secs[0]
     assert 'delay_min' not in secs[0]
@@ -185,7 +192,7 @@ def test_enrich_cancelled_leg():
     with patch.object(A, '_flight_obs_merged',
                       return_value=_merged(delay_min=None, delay_known=True,
                                            status='cancelled', cancelled=True)):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert secs[0]['cancelled'] is True
     assert secs[0]['delay_known'] is True
     # keine positive Delay-Behauptung.
@@ -199,7 +206,7 @@ def test_enrich_passes_est_and_reg_and_sides():
                 esti_arr='2026-07-04T10:10:00Z', reg='D-AIXY',
                 sides={'dep': 'live', 'arr': 'obs'})
     with patch.object(A, '_flight_obs_merged', return_value=m):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert secs[0]['est_dep_iso'] == '2026-07-04T08:35:00Z'
     assert secs[0]['est_arr_iso'] == '2026-07-04T10:10:00Z'
     assert secs[0]['reg'] == 'D-AIXY'
@@ -213,7 +220,7 @@ def test_enrich_fn_norm_equivalence():
     mock = MagicMock(return_value=_merged(delay_min=5, delay_known=True,
                                           delay_side='dep'))
     with patch.object(A, '_flight_obs_merged', mock):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     called_fn = mock.call_args.args[0] if mock.call_args.args else \
         mock.call_args.kwargs.get('flight_no')
     # erstes Positional-Arg ist die Flugnummer
@@ -226,7 +233,7 @@ def test_enrich_codeshare_folds_to_operating():
                                           delay_side='dep'))
     with patch.object(A, '_ax_codeshare_map', return_value={'UA8841': 'LH400'}), \
             patch.object(A, '_flight_obs_merged', mock):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     # Nachschlag über die OPERATING-Nummer.
     assert mock.call_args.args[0] == 'LH400'
     # Marketing-Nummer bleibt additiv erhalten.
@@ -239,7 +246,7 @@ def test_enrich_codeshare_runs_once_per_leg():
                                           delay_side='dep'))
     with patch.object(A, '_ax_codeshare_map', return_value={'UA8841': 'LH400'}), \
             patch.object(A, '_flight_obs_merged', mock):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert mock.call_count == 1
 
 
@@ -252,7 +259,7 @@ def test_enrich_missing_flight_number_skipped_gracefully():
         calls.append(fn)
         return _merged(delay_min=3, delay_known=True, delay_side='dep')
     with patch.object(A, '_flight_obs_merged', side_effect=_fake):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert 'delay_known' not in secs[0]      # skip, keine Exception
     assert secs[1]['delay_known'] is True     # anderer Leg dennoch angereichert
     assert calls == ['LH400']
@@ -262,7 +269,7 @@ def test_enrich_short_flight_number_skipped():
     secs = [_sector(flight='LH')]
     with patch.object(A, '_flight_obs_merged',
                       side_effect=AssertionError('should not be called')):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert 'delay_known' not in secs[0]
 
 
@@ -270,7 +277,7 @@ def test_enrich_bad_iata_skipped():
     secs = [_sector(frm='FRANKFURT', to='MUC')]
     with patch.object(A, '_flight_obs_merged',
                       side_effect=AssertionError('should not be called')):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert 'delay_known' not in secs[0]
 
 
@@ -452,7 +459,7 @@ def test_enrich_multi_leg_independent_status():
             'LH3': _merged(delay_known=False, status='scheduled'),
         }[fn]
     with patch.object(A, '_flight_obs_merged', side_effect=_fake):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert secs[0]['status'] == 'landed'
     assert secs[1]['status'] == 'airborne' and secs[1]['delay_min'] == 20
     assert secs[2]['status'] == 'scheduled' and secs[2]['delay_min'] is None
@@ -462,14 +469,14 @@ def test_enrich_free_only_flag_forwarded():
     secs = [_sector()]
     mock = MagicMock(return_value=_merged(delay_known=False))
     with patch.object(A, '_flight_obs_merged', mock):
-        A._enrich_leg_delays(secs, '2026-07-04', free_only=True)
+        A._enrich_leg_delays(secs, TODAY, free_only=True)
     assert mock.call_args.kwargs.get('free_only') is True
 
 
 def test_enrich_empty_and_non_list_safe():
-    assert A._enrich_leg_delays([], '2026-07-04') == []
-    assert A._enrich_leg_delays(None, '2026-07-04') is None
-    assert A._enrich_leg_delays('nope', '2026-07-04') == 'nope'
+    assert A._enrich_leg_delays([], TODAY) == []
+    assert A._enrich_leg_delays(None, TODAY) is None
+    assert A._enrich_leg_delays('nope', TODAY) == 'nope'
 
 
 def test_enrich_non_dict_element_safe():
@@ -477,7 +484,7 @@ def test_enrich_non_dict_element_safe():
     with patch.object(A, '_flight_obs_merged',
                       return_value=_merged(delay_known=True, delay_min=1,
                                            delay_side='dep')):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert secs[1]['delay_known'] is True
 
 
@@ -486,7 +493,7 @@ def test_enrich_returns_same_list_in_place():
     with patch.object(A, '_flight_obs_merged',
                       return_value=_merged(delay_known=True, delay_min=0,
                                            delay_side='dep')):
-        out = A._enrich_leg_delays(secs, '2026-07-04')
+        out = A._enrich_leg_delays(secs, TODAY)
     assert out is secs
 
 
@@ -496,7 +503,7 @@ def test_enrich_null_vs_false_distinction_preserved():
     secs = [_sector()]
     with patch.object(A, '_flight_obs_merged',
                       return_value=_merged(delay_known=False)):
-        A._enrich_leg_delays(secs, '2026-07-04')
+        A._enrich_leg_delays(secs, TODAY)
     assert secs[0].get('delay_known') is False   # gesetzt, nicht None/abwesend
 
 

@@ -494,6 +494,216 @@ def _fallback_next_tour_from_disk(status, crew_token, allowed_fields):
     return False
 
 
+def _parse_roster_day(row):
+    """Ein user_ical_briefings-Row → strukturierte Tages-Fakten (PUR, testbar).
+    Kette bevorzugt aus dem Summary („FRA-MUC-BIO 14:30-…"), sonst aus der
+    Routing-Kette in ical_location („BCN-BIO-MUC").
+
+    WICHTIG (Root-Fix 2026-07-06): ical_location trägt die TOUR-Kette auch an
+    reinen LAYOVER-TagEN („HND, FRA-HND" am Ruhetag in Tokio). Eine Kette
+    allein macht den Tag also NICHT zum Flugtag — ein Ganztags-Fenster (≥20h)
+    ist ein Layover-/Ruhetag, kein Dienst."""
+    loc = (row.get('ical_location') or '').strip()
+    summ = row.get('ical_summary') or ''
+    legs = re.findall(r'\b([A-Z]{3})-([A-Z]{3})\b', summ)
+    chain = None
+    if legs:
+        chain = [legs[0][0]] + [b for _, b in legs]
+    else:
+        mchain = re.search(r'\b([A-Z]{3}(?:-[A-Z]{3})+)\b', loc)
+        if mchain:
+            chain = mchain.group(1).split('-')
+    st_iso = _iso_utc_z(row.get('ical_start'))
+    en_iso = _iso_utc_z(row.get('ical_end'))
+    st = _parse_iso(st_iso)
+    en = _parse_iso(en_iso)
+    is_flight = bool(chain) and len(chain) >= 2
+    if is_flight and st and en and (en - st).total_seconds() >= 20 * 3600:
+        is_flight = False
+    return {'datum': row.get('datum'), 'chain': chain,
+            'first': loc.split(',')[0].strip().upper(),
+            'st': st, 'en': en, 'st_iso': st_iso, 'en_iso': en_iso,
+            'is_flight': is_flight}
+
+
+def _flight_window_state(day, legs_live, now):
+    """(fliegt_jetzt, effektives_ende, landung_beobachtet) für einen Flugtag
+    (PUR, testbar): Dienst-Fenster aus dem Plan, korrigiert durch ECHTE
+    Beobachtungen — eine beobachtete Verspätung verlängert das Fenster, eine
+    beobachtete Landung beendet es. Ohne Beobachtung gilt der Plan (kein Raten)."""
+    st, en = day['st'], day['en']
+    # Fehlt das Ende → grobes Fenster Start … Start+10h (Langstrecke abgedeckt).
+    if st and not en:
+        en = st + _dt.timedelta(hours=10)
+    en_eff = en
+    landed_obs = False
+    if legs_live:
+        last = legs_live[-1]
+        d = last.get('delay_min')
+        if en_eff is not None and isinstance(d, (int, float)):
+            en_eff = en_eff + _dt.timedelta(minutes=float(d))
+        stx = str(last.get('status') or '').lower()
+        if any(k in stx for k in ('landed', 'gelandet', 'arrived', 'angekommen')):
+            landed_obs = True
+    flying = bool(st and en_eff and st <= now <= en_eff and not landed_obs)
+    return flying, en_eff, landed_obs
+
+
+# ── Live-Positions-Fix für die „Fliegt gerade"-Karte (Owner 2026-07-06) ──────
+#
+# „die familie/freunde sind wichtiger als ich — ich sehe meinen flug kaum, da
+# ich arbeite. aber wenn es sein muss kann man mal 1 pingen um dann zu
+# berechnen und route korrigieren." — Der Hauptfall für den bezahlten Tier-3-
+# Ping ist der VON FAMILIE/FREUNDEN BEOBACHTETE Flug. Wenn flying_now, holen
+# wir EINEN echten Positions-Fix (freie ADS-B-Kaskade zuerst, bei Coverage-
+# Lücke Tier 3 AeroDataBox purpose=watch, budget-bewacht) und liefern ihn als
+# live_*-Felder — iOS korrigiert damit die Großkreis-Interpolation.
+#
+# Der Family-Feed ist ein FAN-OUT (N Watcher × Refresh) → ohne Memo würde
+# jeder Refresh die Kaskade (und im Lücken-Fall den BEZAHLTEN Ping) erneut
+# zahlen. In-Process-Memo pro (reg, datum): max. 1 Kaskaden-Lauf / 10 min,
+# egal wie viele Familien-Mitglieder schauen (auch Fehlschläge werden
+# memoisiert). Ehrlichkeits-Gates:
+#   · Registration NUR aus echten Beobachtungen (Board-/Warehouse-Merge des
+#     Legs bzw. SB-Tages-Rows via _sb_day_reg) — keine Reg → kein Fix.
+#   · Aktiver Leg nur bei EINDEUTIGKEIT (genau ein Leg, oder beobachtete
+#     Leg-Zeiten schließen genau einen ein) — sonst kein Paid-Ping und keine
+#     Fix-Felder (die Karte bleibt rein interpoliert, kein Raten).
+#   · Beobachtung ≥ 45 min alt → keine Fix-Felder.
+#   · Privacy: die live_*-Felder hängen am 'next_flight'-Grant (wie flying_now).
+
+_LIVE_FIX_MEMO = {}            # (reg, datum) → (attempt_unix, fix_dict | None)
+_LIVE_FIX_MEMO_TTL = 600       # 10 min — N Watcher = max. 1 Kaskaden-Lauf/Ping
+_LIVE_FIX_MEMO_MAX = 512       # simpler Cap (wie _crew_status_last_good)
+_LIVE_FIX_MAX_AGE_S = 45 * 60  # ältere Beobachtung → nicht ausliefern
+_KT_PER_MS = 1.0 / 0.514444    # m/s → Knoten
+
+
+def _pick_active_leg(chain, legs_live, now):
+    """Aktiven Leg-Index EINDEUTIG bestimmen — sonst None (kein Raten):
+      · genau ein Leg → Index 0 (trivial eindeutig).
+      · Mehr-Leg-Tag → nur wenn beobachtete Leg-Zeiten (esti/sched aus den
+        Board-/Warehouse-Beobachtungen, ISO-parsebar) GENAU EINEN Leg
+        einschließen, dessen Fenster `now` enthält.
+    Unklare/fehlende/unparsebare Zeiten → None → kein Paid-Ping."""
+    if not chain or len(chain) < 2:
+        return None
+    if len(chain) - 1 == 1:
+        return 0
+    cands = []
+    for leg in (legs_live or []):
+        st = _parse_iso(leg.get('esti_dep') or leg.get('sched_dep'))
+        en = _parse_iso(leg.get('esti_arr') or leg.get('sched_arr'))
+        idx = leg.get('leg_index')
+        if st and en and isinstance(idx, int) and st <= now <= en:
+            cands.append(idx)
+    return cands[0] if len(cands) == 1 else None
+
+
+def _reg_for_leg(leg_obs, flight_no, datum):
+    """Registration NUR aus echten Beobachtungen: erst die Board-/Warehouse-
+    Beobachtung des Legs selbst (reg im Dual-Side-Merge), sonst die SB-Tages-
+    Rows des EXAKTEN Datums (airport_delay_obs via _sb_day_reg — der gleiche
+    Lookup wie /api/ax/flight-info). None = ehrlich keine → kein Fix."""
+    reg = str((leg_obs or {}).get('reg') or '').strip().upper() or None
+    if reg:
+        return reg
+    if not flight_no:
+        return None
+    try:
+        from blueprints.aerox_data_blueprint import _sb_day_reg
+        sb_reg, _tc, _dep, _arr = _sb_day_reg(flight_no, datum)
+        return str(sb_reg or '').strip().upper() or None
+    except Exception:
+        return None
+
+
+def _live_fix_for_reg(reg, datum):
+    """Memoisierter Positions-Fix pro (reg, datum) — FAMILY = NUR FREIE QUELLEN
+    (Owner 2026-07-06: „familie könnte sogar kostenlos bleiben, er muss halt
+    nur richtig sein mit abflug und ankunft"): Cache + OpenSky/adsb.lol, NIE
+    ein bezahlter Ping (allow_paid=False). Korrekt bleibt die Karte trotzdem,
+    weil Abflug/Ankunft delay-korrigiert aus den Gratis-Board-Beobachtungen
+    kommen; im Coverage-Loch zeigt sie die verankerte Interpolation. Der
+    bezahlte purpose=watch-Tier bleibt den FREUNDE-Karten vorbehalten.
+    EIN Kaskaden-Lauf alle 10 Minuten, egal wie viele Watcher anfragen. Auch
+    Fehlschläge werden memoisiert (sonst würde jeder Feed-Refresh erneut
+    kaskadieren).
+    Der Slot wird VOR dem Lauf reserviert — parallele Watcher sehen für diesen
+    Refresh None statt einen zweiten Ping auszulösen.
+    → {'lat','lon','track','speed_kt','ts','source'} | None. Das 45-min-
+    Frische-Gate macht der Caller (_flying_live_fix) zur Serve-Zeit."""
+    key = (str(reg).upper(), str(datum))
+    now = time.time()
+    hit = _LIVE_FIX_MEMO.get(key)
+    if hit and (now - hit[0]) < _LIVE_FIX_MEMO_TTL:
+        return hit[1]
+    if len(_LIVE_FIX_MEMO) >= _LIVE_FIX_MEMO_MAX:
+        _LIVE_FIX_MEMO.clear()
+    _LIVE_FIX_MEMO[key] = (now, None)   # Slot reservieren (Fan-out-Race)
+    fix = None
+    try:
+        from blueprints.adsb_blueprint import resolve_position_for_watch
+        row, source, fetch_ts = resolve_position_for_watch(reg=key[0],
+                                                           allow_paid=False)
+        if row is not None and len(row) >= 11:
+            lat = row[6]
+            lon = row[5]
+            if lat is not None and lon is not None:
+                # ECHTER Beobachtungszeitpunkt: time_position → last_contact →
+                # Fetch-Zeit (Tier 3 trägt reportedAtUtc bereits in [3]/[4]).
+                ts = None
+                for cand in (row[3], row[4], fetch_ts):
+                    try:
+                        ts = float(cand)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+                fix = {
+                    'lat': float(lat),
+                    'lon': float(lon),
+                    'track': (float(row[10]) if row[10] is not None else None),
+                    'speed_kt': (round(float(row[9]) * _KT_PER_MS, 1)
+                                 if row[9] is not None else None),
+                    'ts': ts,
+                    'source': source,
+                }
+    except Exception as e:
+        _log().info(f'[family-watch] live_fix_skip {type(e).__name__}')
+        fix = None
+    _LIVE_FIX_MEMO[key] = (now, fix)
+    return fix
+
+
+def _flying_live_fix(chain, datum, fns, legs_live, now=None):
+    """Orchestrierung für die Status-Felder: aktiven Leg eindeutig wählen →
+    Reg aus echten Beobachtungen → memoisierten Fix holen → Frische-Gate.
+    None bei JEDEM Zweifel — die Karte funktioniert dann rein interpoliert
+    weiter, nichts wird geraten und nichts bezahlt."""
+    try:
+        if not (chain and len(chain) >= 2 and datum
+                and fns and len(fns) == len(chain) - 1):
+            return None
+        now_dt = now if now is not None else _dt.datetime.now(_dt.timezone.utc)
+        idx = _pick_active_leg(chain, legs_live, now_dt)
+        if idx is None or not (0 <= idx < len(fns)):
+            return None
+        leg_obs = next((l for l in (legs_live or [])
+                        if l.get('leg_index') == idx), None)
+        reg = _reg_for_leg(leg_obs, fns[idx], datum)
+        if not reg:
+            return None
+        fix = _live_fix_for_reg(reg, datum)
+        if not fix or not isinstance(fix.get('ts'), (int, float)):
+            return None
+        if (time.time() - fix['ts']) > _LIVE_FIX_MAX_AGE_S:
+            return None   # Beobachtung zu alt — ehrlich keine Live-Position
+        return fix
+    except Exception as e:
+        _log().info(f'[family-watch] live_fix_skip {type(e).__name__}')
+        return None
+
+
 def _load_crew_status_for_family(crew_token, allowed_fields):
     """Liest aus dem Crew-Profile + briefing-state nur die erlaubten Felder.
     Returns dict mit den status-feldern fuer die WatchedCrew.CrewStatus
@@ -528,6 +738,15 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         'today_route_label': None,
         'today_dep_iso': None,
         'today_arr_iso': None,
+        # ECHTER Positions-Fix während flying_now (Owner 2026-07-06, „wenn es
+        # sein muss kann man mal 1 pingen"): korrigiert die iOS-Interpolation.
+        # None = kein Fix verfügbar → Karte bleibt rein interpoliert.
+        'live_lat': None,
+        'live_lon': None,
+        'live_track': None,
+        'live_speed_kt': None,
+        'live_ts_iso': None,      # ECHTER Beobachtungszeitpunkt (UTC-Z)
+        'live_source': None,      # 'opensky' | 'adsb.lol' | 'adb' | …
         # Zuhause/Feierabend: heute an der Homebase (reiner Heimtag) ODER nach
         # Landung an der Homebase (Dienst vorbei) — die Card zeigt „Feierabend"
         # statt eines falschen Layovers (User 2026-06-25).
@@ -624,66 +843,154 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     hb = (prof.get('homebase') or prof.get('home_base') or '').strip().upper()
     roster_layover = None   # IATA des heutigen Layover-Orts (≠ Homebase), wenn ermittelbar
     roster_today_home = False  # heutiger Roster-Tag liegt POSITIV an der Homebase
-    flying_now = False          # NOW im heutigen Dienst-Zeitfenster → „Fliegt gerade"
+    flying_now = False          # NOW im aktiven Flug-/Dienst-Fenster → „Fliegt gerade"
     today_dep = today_arr = None
     today_dep_iso = today_arr_iso = None
-    today_chain = None          # volle heutige IATA-Kette (für das Städte-Label)
+    today_arr_est_iso = None    # Dienst-Ende + beobachtete Verspätung (nur echte Obs)
+    today_chain = None          # volle IATA-Kette des aktiven Tags (Städte-Label)
+    legs_live_cached = None     # Board-/Warehouse-Beobachtungen je Leg (einmal geholt)
+    active_datum = None         # datum des AKTIVEN Flugtags (Red-Eye: ggf. gestern)
+    day_fns = {}                # datum → 1:1 gemappte Flugnummern (aus _live_legs_for)
+
+    # ROOT-FIX 2026-07-06 (Owner: „Family hat weder die Verspätung noch die
+    # Landung bemerkt") — der alte Block hatte drei strukturelle Fehler:
+    #  1) ical_location trägt die TOUR-Kette auch an reinen LAYOVER-Tagen
+    #     („HND, FRA-HND" am Ruhetag in Tokio) → der GANZE Tag (00:00–23:5x)
+    #     galt als Flug-Fenster → „Fliegt gerade" den kompletten Layover-Tag,
+    #     „Ankunft 23:58" war schlicht das Tagesende. Ein Ganztags-Fenster
+    #     (≥20h) ist jetzt KEIN Dienst-Fenster mehr.
+    #  2) Das Fenster war das starre Dienst-Fenster ohne Verspätungs-Wissen —
+    #     jetzt verlängert eine ECHT BEOBACHTETE Verspätung (Board/Warehouse,
+    #     free-only) das Fenster, und eine beobachtete Landung beendet es.
+    #     Kein Raten: ohne Beobachtung gilt weiter der Plan.
+    #  3) Red-Eye über UTC-Mitternacht: um 00:00 UTC wurde „heute" der
+    #     Folgetag und der noch LAUFENDE Flug von gestern unsichtbar → der
+    #     Vortag wird mitgelesen und gewinnt, solange sein Fenster läuft.
+    def _live_legs_for(chain, datum_s):
+        """Echte Beobachtungen je Leg (Dual-Side-Resolver, free-only, memoisiert).
+        Flugnummern aus dem Roster-Snapshot; nur bei sauberer 1:1-Zuordnung zur
+        Kette (ehrlich, kein Raten). None = keine Beobachtung."""
+        try:
+            resolver = _app_attr('_flight_obs_merged')
+            snap_read = _app_attr('_roster_snapshot_read')
+            if not (callable(resolver) and callable(snap_read)
+                    and chain and len(chain) >= 2):
+                return None
+            tage = (snap_read(crew_token) or {}).get('tage') or []
+            dday = next((t for t in tage if isinstance(t, dict)
+                         and t.get('datum') == datum_s), {})
+            fns = [str(f).replace(' ', '').upper()
+                   for f in ((dday.get('reader_facts') or {})
+                             .get('flight_numbers') or [])
+                   if str(f or '').strip()]
+            if not fns or len(fns) != len(chain) - 1:
+                return None
+            day_fns[datum_s] = fns   # für den Live-Positions-Fix (Reg-Lookup)
+            out = []
+            for idx, fno in enumerate(fns[:4]):
+                m = resolver(fno, date=datum_s, dep_iata=chain[idx],
+                             arr_iata=chain[idx + 1], free_only=True)
+                if m:
+                    out.append({
+                        'flight': fno,
+                        # leg_index/reg/Zeiten (ADDITIV 2026-07-06): eindeutige
+                        # Aktiv-Leg-Wahl + Reg-Auflösung für den Positions-Fix.
+                        'leg_index': idx,
+                        'dep_iata': chain[idx],
+                        'arr_iata': chain[idx + 1],
+                        'dep_delay_min': m.get('dep_delay_min'),
+                        'arr_delay_min': m.get('arr_delay_min'),
+                        'delay_min': m.get('delay_min'),
+                        'delay_side': m.get('delay_side'),
+                        'status': m.get('status'),
+                        'cancelled': m.get('cancelled'),
+                        'sides': m.get('sides'),
+                        'reg': m.get('reg'),
+                        'sched_dep': m.get('sched_dep'),
+                        'esti_dep': m.get('esti_dep'),
+                        'sched_arr': m.get('sched_arr'),
+                        'esti_arr': m.get('esti_arr'),
+                    })
+            return out or None
+        except Exception as e:
+            _log().info(f'[family-watch] live_enrich_skip {type(e).__name__}')
+            return None
+
+    def _window_state(day, now):
+        """(fliegt_jetzt, effektives_ende, legs_live, landung_beobachtet) —
+        holt die Beobachtungen und wertet das Fenster pur aus."""
+        legs_live = _live_legs_for(day['chain'], day['datum'])
+        flying, en_eff, landed_obs = _flight_window_state(day, legs_live, now)
+        return flying, en_eff, legs_live, landed_obs
+
     if sb_avail and sb is not None:
         # ical_location-Format: „JFK, FRA-JFK-FRA". Erstes Token = Aufenthaltsort
         # des Tages. An einem HOMEBASE-Tag (Tag-Trip FRA-LUX-FRA → erstes Token =
         # FRA) ist man NICHT im Layover, sondern zuhause → nicht als Layover werten.
         try:
-            today = _dt.datetime.now().date().isoformat()
+            now = _dt.datetime.now(_dt.timezone.utc)
+            today_d = _dt.datetime.now().date()
+            days = [today_d.isoformat(),
+                    (today_d - _dt.timedelta(days=1)).isoformat()]
             r = (sb.table('user_ical_briefings')
-                 .select('ical_location,ical_summary,ical_start,ical_end')
-                 .eq('token', crew_token).eq('datum', today).limit(1).execute())
-            rows = r.data or []
-            if rows:
-                row = rows[0]
-                loc = (row.get('ical_location') or '').strip()
-                first = loc.split(',')[0].strip().upper()
-                summ = row.get('ical_summary') or ''
-                # Heutige Flug-Legs: erste DEP, letzte ARR. Bevorzugt aus dem Summary
-                # („FRA-MUC-BIO 14:30-…" / mehrere „XXX-YYY"), sonst die Routing-Kette
-                # aus ical_location (Teil nach dem Komma, z.B. „BCN-BIO-MUC").
-                legs = re.findall(r'\b([A-Z]{3})-([A-Z]{3})\b', summ)
-                chain = None
-                if legs:
-                    chain = [legs[0][0]] + [b for _, b in legs]
-                else:
-                    mchain = re.search(r'\b([A-Z]{3}(?:-[A-Z]{3})+)\b', loc)
-                    if mchain:
-                        chain = mchain.group(1).split('-')
-                is_flight_today = bool(chain) and len(chain) >= 2
-                if is_flight_today:
-                    today_chain = list(chain)
-                    today_dep, today_arr = chain[0], chain[-1]
-                    today_dep_iso = _iso_utc_z(row.get('ical_start'))
-                    today_arr_iso = _iso_utc_z(row.get('ical_end'))
-                    # In-Flight-Fenster: NOW zwischen Dienst-Start und -Ende. Beide ISO
-                    # mit Zone (Upload speichert Europe/Berlin→UTC). Fehlt das Ende →
-                    # grobes Fenster Start … Start+10h (Langstrecke abgedeckt).
-                    st = _parse_iso(today_dep_iso)
-                    en = _parse_iso(today_arr_iso)
-                    now = _dt.datetime.now(_dt.timezone.utc)
-                    if st and not en:
-                        en = st + _dt.timedelta(hours=10)
-                    if st and en and st <= now <= en:
-                        flying_now = True
-                    # Nach der Landung (now > Ende) ist die Crew am ZIEL → das ist der
-                    # echte Layover-Ort, nicht der Abflug. Vor/während Flug KEIN
-                    # „In <Abflug>"-Layover (der Bug). Homebase-Ziel = zuhause.
-                    if en and now > en and today_arr:
-                        if today_arr == hb and hb:
-                            roster_today_home = True
-                        else:
-                            roster_layover = today_arr
-                elif len(first) == 3 and first.isalpha():
-                    # Kein Flugtag → erstes Token ist der echte Aufenthaltsort.
-                    if first == hb and hb:
+                 .select('datum,ical_location,ical_summary,ical_start,ical_end')
+                 .eq('token', crew_token).in_('datum', days).execute())
+            by_date = {rw.get('datum'): rw for rw in (r.data or [])}
+            prim = _parse_roster_day(by_date[days[0]]) if by_date.get(days[0]) else None
+            prev = _parse_roster_day(by_date[days[1]]) if by_date.get(days[1]) else None
+
+            # Aktives Flug-Fenster: heutiger Flugtag zuerst, sonst der gestrige
+            # (Red-Eye über UTC-Mitternacht, Fix 3). Zustände nur je Bedarf rechnen.
+            prim_state = _window_state(prim, now) if (prim and prim['is_flight']) else None
+            active_day, active_state = None, None
+            if prim_state and prim_state[0]:
+                active_day, active_state = prim, prim_state
+            elif prev and prev['is_flight'] and not (prim_state and prim_state[0]):
+                pst = _window_state(prev, now)
+                if pst[0]:
+                    active_day, active_state = prev, pst
+
+            if active_day is not None:
+                flying_now = True
+                _, en_eff, legs_live_cached, _ = active_state
+                active_datum = active_day['datum']
+                today_chain = list(active_day['chain'])
+                today_dep, today_arr = today_chain[0], today_chain[-1]
+                today_dep_iso = active_day['st_iso']
+                today_arr_iso = active_day['en_iso']
+                # Effektive Ankunft (Plan + beobachtete Verspätung) nur wenn sie
+                # vom Plan abweicht — iOS zeigt dann „Ankunft ~HH:mm · +N min".
+                if en_eff and active_day['en'] and en_eff != active_day['en']:
+                    today_arr_est_iso = en_eff.isoformat().replace('+00:00', 'Z')
+            elif prim and prim['is_flight']:
+                # Heutiger Flugtag, aber Fenster läuft (noch) nicht: Felder für
+                # die Vorschau setzen; nach dem (ggf. verspäteten/beobachteten)
+                # Ende ist die Crew am ZIEL — Homebase-Ziel = zuhause (Fix 2).
+                _, en_eff, legs_live_cached, landed_obs = prim_state
+                today_chain = list(prim['chain'])
+                today_dep, today_arr = today_chain[0], today_chain[-1]
+                today_dep_iso = prim['st_iso']
+                today_arr_iso = prim['en_iso']
+                ended = (en_eff and now > en_eff) or landed_obs
+                if ended and today_arr:
+                    if today_arr == hb and hb:
                         roster_today_home = True
-                    elif first != hb:
-                        roster_layover = first
+                    else:
+                        roster_layover = today_arr
+            elif prim and len(prim['first']) == 3 and prim['first'].isalpha():
+                # Kein Flugtag → erstes Token ist der echte Aufenthaltsort.
+                if prim['first'] == hb and hb:
+                    roster_today_home = True
+                elif prim['first'] != hb:
+                    roster_layover = prim['first']
+            elif prim is None and prev and prev['is_flight'] and prev['chain']:
+                # Kein heutiger Roster-Eintrag, gestriger Flug ist vorbei →
+                # die Crew ist am gestrigen Ziel (Red-Eye-Ankunft ohne Folge-Row).
+                dest = prev['chain'][-1]
+                if dest == hb and hb:
+                    roster_today_home = True
+                elif dest:
+                    roster_layover = dest
         except Exception as e:
             # Vorher stumm (bare pass) — DER Zweig produzierte bei SB-Flakes
             # den All-None-„Status unbekannt" ohne jede Log-Spur.
@@ -717,46 +1024,32 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         # Raten). Rein ADDITIV: today_flights_live (Liste) + today_delay_min
         # (letztes Leg mit Daten = „kommt sie/er pünktlich an?"). None = keine
         # Beobachtung → iOS zeigt wie bisher.
-        status['today_flights_live'] = None
-        status['today_delay_min'] = None
-        try:
-            resolver = _app_attr('_flight_obs_merged')
-            snap_read = _app_attr('_roster_snapshot_read')
-            if (callable(resolver) and callable(snap_read)
-                    and today_chain and len(today_chain) >= 2):
-                today_s = _dt.datetime.now().date().isoformat()
-                tage = (snap_read(crew_token) or {}).get('tage') or []
-                dday = next((t for t in tage if isinstance(t, dict)
-                             and t.get('datum') == today_s), {})
-                fns = [str(f).replace(' ', '').upper()
-                       for f in ((dday.get('reader_facts') or {})
-                                 .get('flight_numbers') or [])
-                       if str(f or '').strip()]
-                if fns and len(fns) == len(today_chain) - 1:
-                    legs_live = []
-                    for idx, fno in enumerate(fns[:4]):
-                        m = resolver(fno, date=today_s,
-                                     dep_iata=today_chain[idx],
-                                     arr_iata=today_chain[idx + 1],
-                                     free_only=True)
-                        if m:
-                            legs_live.append({
-                                'flight': fno,
-                                'dep_iata': today_chain[idx],
-                                'arr_iata': today_chain[idx + 1],
-                                'dep_delay_min': m.get('dep_delay_min'),
-                                'arr_delay_min': m.get('arr_delay_min'),
-                                'delay_min': m.get('delay_min'),
-                                'delay_side': m.get('delay_side'),
-                                'status': m.get('status'),
-                                'cancelled': m.get('cancelled'),
-                                'sides': m.get('sides'),
-                            })
-                    if legs_live:
-                        status['today_flights_live'] = legs_live
-                        status['today_delay_min'] = legs_live[-1].get('delay_min')
-        except Exception as e:
-            _log().info(f'[family-watch] live_enrich_skip {type(e).__name__}')
+        # Die Beobachtungen wurden bereits OBEN für das Flug-Fenster geholt
+        # (_window_state → _live_legs_for) — hier nur noch durchreichen, kein
+        # zweiter Resolver-Lauf.
+        status['today_flights_live'] = legs_live_cached or None
+        status['today_delay_min'] = (legs_live_cached[-1].get('delay_min')
+                                     if legs_live_cached else None)
+        # Plan-Ende + beobachtete Verspätung (None wenn keine Abweichung) —
+        # iOS zeigt damit die korrigierte Ankunft statt der Plan-Zeit.
+        status['today_arr_est_iso'] = today_arr_est_iso
+        # ECHTER Positions-Fix (Owner 2026-07-06): nur während flying_now, nur
+        # unter dem next_flight-Grant (wie flying_now selbst). Ehrlichkeits-
+        # Gates + (reg, datum)-Memo (10 min, Fan-out-sicher) + freie Kaskade
+        # vor Tier-3-purpose=watch: siehe _flying_live_fix. Bei None bleibt
+        # die Karte rein interpoliert — kein Raten, keine Felder.
+        if flying_now and today_chain and active_datum:
+            _fix = _flying_live_fix(today_chain, active_datum,
+                                    day_fns.get(active_datum),
+                                    legs_live_cached)
+            if _fix:
+                status['live_lat'] = _fix['lat']
+                status['live_lon'] = _fix['lon']
+                status['live_track'] = _fix['track']
+                status['live_speed_kt'] = _fix['speed_kt']
+                status['live_ts_iso'] = _iso_utc_z(_dt.datetime.fromtimestamp(
+                    _fix['ts'], _dt.timezone.utc))
+                status['live_source'] = _fix['source']
     if 'layover_place' in allowed_fields:
         status['layover_place'] = roster_layover
         status['layover_place_city'] = (_iata_city_name(roster_layover)
@@ -811,6 +1104,14 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         status['today_dep_city'] = None
         status['today_arr_city'] = None
         status['today_route_label'] = None
+        # Live-Positions-Fix hängt am next_flight-Grant (Defense-in-Depth —
+        # gesetzt wird er ohnehin nur im Grant-Block oben).
+        status['live_lat'] = None
+        status['live_lon'] = None
+        status['live_track'] = None
+        status['live_speed_kt'] = None
+        status['live_ts_iso'] = None
+        status['live_source'] = None
     if 'layover_place' not in allowed_fields:
         status['layover_place'] = None
         status['layover_place_city'] = None

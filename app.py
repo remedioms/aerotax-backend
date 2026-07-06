@@ -11024,7 +11024,7 @@ def get_friends_overlap(token):
             klass = (t.get('klass') or '').upper()
             rf = t.get('reader_facts') or {}
             place = (rf.get('layover_ort') or '').upper().strip()
-            if klass in ('Z76',) and place and len(place) == 3:
+            if klass in _CREW_DEST_LAYOVER_KLASSEN and place and len(place) == 3:
                 out[t.get('datum')] = place
         return out
 
@@ -11099,7 +11099,11 @@ def get_friends_overlap(token):
 #   (Bearer == path-token).
 # ═══════════════════════════════════════════════════════════════════════════
 
-_CREW_DEST_LAYOVER_KLASSEN = ('Z76',)  # wie _extract_layover_set/overlap: Layover-Tag
+# Audit-Fix 2026-07-06: Z73 (Inland-Übernachtung) und Z74 (Ausland-
+# Übernachtung) sind genauso echte Hotel-Nächte wie Z76 (vgl. CLAUDE.md
+# „Hotel-Nächte: nur Z73/Z74/Z76 mit overnight=True") — der Z76-only-Filter
+# machte Friends-Overlap/Hangouts für Inlands-Übernachtungen blind.
+_CREW_DEST_LAYOVER_KLASSEN = ('Z73', 'Z74', 'Z76')
 
 def _layover_visibility_get(token):
     """True = meine Layover dürfen als Match erscheinen. Opt-in DEFAULT-ON:
@@ -21310,6 +21314,17 @@ def get_user_calendar_pdf(token):
     except Exception:
         _briefings_for_pdf = {}
 
+    # Audit-Fix 2026-07-06: Homebase war hier als 'FRA' HARDCODIERT — für
+    # MUC/BER-Crews wurde FRA als „Ziel" gedruckt bzw. die eigene Homebase
+    # als Routing (CLAUDE.md: „FRA wird nicht hardcoded"). Jetzt Profil-Homebase.
+    try:
+        _pdf_hb = str(((_profile_load(token) or {}).get('profile') or {})
+                      .get('homebase') or '').strip().upper()
+    except Exception:
+        _pdf_hb = ''
+    if len(_pdf_hb) != 3:
+        _pdf_hb = 'FRA'
+
     def _briefing_to_klass_routing(bv):
         """Leitet (klass_label, routing_kuerzel) aus einem Briefing-Item ab.
         Heuristik auf `ical_summary` + `legs` — KEINE Steuerklassifikation, nur
@@ -21323,14 +21338,14 @@ def get_user_calendar_pdf(token):
             if not isinstance(lg, dict):
                 continue
             to = (lg.get('to') or '').strip().upper()
-            if len(to) == 3 and to != 'FRA':
+            if len(to) == 3 and to != _pdf_hb:
                 routing = to
                 break
         if not routing:
             import re as _re2
-            # Summary-Form „FRA-BUD" / „BUD-FRA" → erstes 3-Letter ≠ FRA
+            # Summary-Form „FRA-BUD" / „BUD-FRA" → erstes 3-Letter ≠ Homebase
             for tok in _re2.findall(r'\b([A-Z]{3})\b', summary):
-                if tok != 'FRA':
+                if tok != _pdf_hb:
                     routing = tok
                     break
         # Label-Mapping (Anzeigeklassen, decken sich grob mit KLASS_BG-Keys).
@@ -21696,7 +21711,8 @@ def _apns_get_jwt():
 
 
 def _send_apns(apns_token, title, body, data=None, topic=None,
-               thread_id=None, badge=None, use_sandbox=None):
+               thread_id=None, badge=None, use_sandbox=None,
+               retry_env_planned=False):
     """Sendet eine Push-Notification via APNs HTTP/2.
     Returns (ok: bool, reason: str|None). `reason` = APNs-Fehler-reason
     (z.B. 'BadDeviceToken', 'Unregistered') — der Caller nutzt sie für
@@ -21761,8 +21777,23 @@ def _send_apns(apns_token, title, body, data=None, topic=None,
             except Exception:
                 pass
             # 410 Unregistered / 400 BadDeviceToken → Caller löscht den Token.
-            print(f"[APNS] send failed status={resp.status_code} "
-                  f"env={'sandbox' if use_sandbox else 'prod'} body={resp.text[:200]}")
+            # Alert-Hygiene (2026-07-06): Der Log-Metric-Alert `apns_send_failed`
+            # matcht "[APNS] send failed". Ein Erstversuch in der falschen
+            # Umgebung (Debug-Build = Sandbox-Token, prod antwortet
+            # BadDeviceToken; sandbox darf per Design nie GELERNT werden, also
+            # zahlt so ein Gerät den prod-Fehlversuch bei JEDEM Push) ist
+            # ERWARTET und wird vom Caller sofort per Gegen-Umgebung geheilt →
+            # der darf den Alert nicht triggern. Nur finale/echte Fehler
+            # (beide Umgebungen tot, TooManyRequests, BadTopic, Cert/JWT …)
+            # loggen weiterhin "send failed".
+            if retry_env_planned and reason in (
+                    'Unregistered', 'BadDeviceToken', 'ExpiredToken'):
+                print(f"[APNS] env probe rejected status={resp.status_code} "
+                      f"env={'sandbox' if use_sandbox else 'prod'} "
+                      f"reason={reason} (retrying other env)")
+            else:
+                print(f"[APNS] send failed status={resp.status_code} "
+                      f"env={'sandbox' if use_sandbox else 'prod'} body={resp.text[:200]}")
             return False, reason or f'http_{resp.status_code}'
     except Exception as e:
         print(f"[APNS] transport error: {e}")
@@ -21818,7 +21849,8 @@ def _send_push_notification(token, title, body, data=None,
             first_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
         ok, reason = _send_apns(apns_token, title, body, data=data,
                                 topic=apns_topic, thread_id=thread_id,
-                                badge=badge, use_sandbox=first_sandbox)
+                                badge=badge, use_sandbox=first_sandbox,
+                                retry_env_planned=True)
         used_env = 'sandbox' if first_sandbox else 'prod'
         if not ok and reason in ('Unregistered', 'BadDeviceToken', 'ExpiredToken'):
             alt_sandbox = not first_sandbox
