@@ -200,6 +200,7 @@ def main():
     backoff = 0.0          # wächst bei Blocks, sinkt bei Erfolg
     win_rows = 0           # aufsummierte Rows seit letztem Heartbeat
     last_hb = time.time()
+    last_prune = 0.0       # letzter Aufräum-Lauf (alte Rows löschen)
     consec_empty = 0       # aufeinanderfolgende LEERE Kacheln (verschiedene!)
     while True:
         idx = my_tiles[i % len(my_tiles)]
@@ -242,6 +243,22 @@ def main():
             print(f"[fr24-harvester] tile{idx} ERROR {type(e).__name__}: "
                   f"{str(e)[:100]}", file=sys.stderr, flush=True)
             time.sleep(30)
+        # Aufräumen: alle ~15 min tote Rows (Flieger gelandet/aus, updated_at alt)
+        # löschen → fr24_live bleibt bei ~Live-Größe (nur fliegende Flieger),
+        # Geo-Index/Reads bleiben schnell, Speicher wächst nicht. Die Reads
+        # filtern ohnehin nach Frische; das hier hält nur die Tabelle schlank.
+        if time.time() - last_prune > 900:
+            last_prune = time.time()
+            try:
+                cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                       time.gmtime(time.time() - 1800))  # >30 min tot
+                session.delete(
+                    sb_url.rstrip('/') + "/rest/v1/fr24_live?updated_at=lt." + cutoff,
+                    headers={"apikey": sb_key, "Authorization": f"Bearer {sb_key}",
+                             "Prefer": "return=minimal"}, timeout=20)
+            except Exception as e:
+                print(f"[fr24-harvester] prune ERROR {type(e).__name__}: {str(e)[:80]}",
+                      file=sys.stderr, flush=True)
         # Jitter ±30% auf das Poll-Intervall → kein maschinell-regelmäßiges Muster.
         time.sleep(max(5.0, poll * random.uniform(0.7, 1.3)))
 
