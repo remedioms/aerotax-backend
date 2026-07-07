@@ -29723,6 +29723,12 @@ def aircraft_by_reg(token):
     now_unix = time.time()
     base = {'ok': True, 'registration': reg, 'hex': None, 'state': 'unknown',
             'source': 'unknown', 'fetched_at': now_unix}
+    # WAREHOUSE-FIRST (Owner 2026-07-07): der aktuelle Flug DIESES Tails (Richtung
+    # egal, Hin ODER Rück) aus den gescrapten Board-Obs — trägt das ECHTE Ziel
+    # („auf dem Weg nach GRU"), das OpenSky fast nie kennt. Immer mitliefern, auch
+    # ohne Hex/Live-Position; die iOS-Karte baut daraus „Dein Flieger ist auf dem
+    # Weg nach <Stadt>". fr24 bleibt nur Backup (route_for_flight-Kaskade).
+    base['current_flight'] = _warehouse_latest_flight_for_reg(reg)
 
     if resolve_reg_to_hex is None:
         return jsonify(base), 200
@@ -29919,6 +29925,63 @@ def _by_reg_board_enrich(out, fl):
             out['board'] = merged
     except Exception:
         pass
+
+
+def _warehouse_latest_flight_for_reg(reg):
+    """Owner 2026-07-07 („der Scraping-Backend zeigt Hin- UND Rückflug, nutz das,
+    fr24 nur Backup"): findet aus den GESCRAPTEN Board-Beobachtungen
+    (airport_delay_obs) den aktuellen/jüngsten Flug DIESES Tails — Richtung egal.
+    Eine ABFLUG-Beobachtung trägt airport=Start + dest_iata=Ziel + reg → daraus
+    baut die App „Dein Flieger ist auf dem Weg nach <Stadt>". Funktioniert auch
+    dann, wenn OpenSky den Tail gar nicht kennt (kein Hex nötig). Rein Warehouse,
+    kein bezahlter Provider. Returns dict | None.
+    """
+    reg_u = (reg or '').strip().upper()
+    if len(reg_u) < 3 or not (SB_AVAILABLE and sb is not None):
+        return None
+    try:
+        import datetime as _dt2
+        today = _dt2.date.today()
+        dates = [today.isoformat(), (today - _dt2.timedelta(days=1)).isoformat()]
+        # Reg steht je nach Board mit/ohne Bindestrich (D-AIMA vs DAIMA) — beide.
+        reg_variants = list({reg_u, reg_u.replace('-', '')})
+        r = (sb.table('airport_delay_obs')
+             .select('date,airport,flight,sched,esti,dest_iata,dest_name,'
+                     'status,max_delay_min,cancelled,updated_at')
+             .in_('reg', reg_variants)
+             .in_('date', dates)
+             .order('updated_at', desc=True)
+             .limit(30).execute())
+        rows = r.data or []
+        # NUR Abflug-Beobachtungen tragen ein Ziel → sie belegen die Richtung.
+        deps = [x for x in rows if (x.get('dest_iata') or '').strip()]
+        if not deps:
+            return None
+        x = deps[0]   # frischeste (updated_at desc)
+        dest = (x.get('dest_iata') or '').strip().upper()
+        dep = (x.get('airport') or '').strip().upper()
+        _city = None
+        if dest and not (x.get('dest_name') or '').strip():
+            try:
+                from blueprints.aerox_data_blueprint import _iata_city_name
+                _city = _iata_city_name(dest)
+            except Exception:
+                _city = None
+        return {
+            'dep_iata': dep or None,
+            'dest_iata': dest or None,
+            'dest_name': (x.get('dest_name') or '').strip() or _city,
+            'flight': (x.get('flight') or '').strip().upper() or None,
+            'sched': x.get('sched'),
+            'esti': x.get('esti'),
+            'status': (x.get('status') or '').strip() or None,
+            'delay_min': x.get('max_delay_min'),
+            'cancelled': bool(x.get('cancelled')),
+            'date': x.get('date'),
+            'source': 'warehouse',
+        }
+    except Exception:
+        return None
 
 
 # Fraport-Status-Strings, die "annulliert/gestrichen" bedeuten.
