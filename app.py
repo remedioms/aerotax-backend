@@ -11997,6 +11997,22 @@ def get_friends_today(token):
                     delay_pin = bool(
                         merged and merged.get('delay_known')
                         and int(merged.get('dep_delay_min') or 0) > 0)
+                    # STALE-KAPPE (Sebastian LH890, 2026-07-07): eine reine
+                    # Delay-Beobachtung OHNE Board-Status („minor", dep_delay 30)
+                    # bekommt oft NIE einen Terminal-Status — der Pin gälte sonst
+                    # EWIG und die Crew klebte nach dem längst erfolgten Abflug
+                    # am Boden. Nach der delay-korrigierten Ist-Abflugzeit
+                    # (Plan + bekannter Delay) + 45 min Puffer ist das Signal
+                    # stale → Pin fällt, der Uhr-Zweig (5) entscheidet. Ein ECHT
+                    # noch wartender Flug bekommt laufend neue Obs (Delay wächst
+                    # → eff_dep wandert mit). Ein ECHTES `grounded`-Board-Signal
+                    # bleibt dagegen Ewig-Pin (Owner 2026-07-04: „unabhängig von
+                    # der Uhr, auch bei starker Verspätung").
+                    if delay_pin:
+                        eff_dep = dep + timedelta(
+                            minutes=max(0, int(merged.get('dep_delay_min') or 0)))
+                        if datetime.now(timezone.utc) >= eff_dep + timedelta(minutes=45):
+                            delay_pin = False
                     if merged and merged.get('cancelled'):
                         # (1) Annulliert schlägt ALLES: Crew ist nie
                         # losgeflogen → bleibt am Abflughafen.

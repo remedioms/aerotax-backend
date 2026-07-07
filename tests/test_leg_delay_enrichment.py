@@ -779,9 +779,12 @@ def test_layeff_grounded_pins_to_departure_even_past_grace(client, monkeypatch):
 def test_layeff_status_none_known_dep_delay_pins_departure(client, monkeypatch):
     # TIBOR-KERNFALL: status=None (kein bucketbarer Board-Status, sehr häufig),
     # ABER bekannter Abflug-Delay (delay_known=True, dep_delay_min>0). Plan-Abflug
-    # ist längst vorbei (−5h, jenseits der 4h-Grace) → früher fiel er in den
-    # Uhr-Zweig und die Crew erschien fälschlich am Layover. Jetzt: am Abflughafen.
-    tok = _setup_friend(monkeypatch, first_dep_offset_h=-5.0, layover_ort='XXX',
+    # ist vorbei, die delay-korrigierte Ist-Abflugzeit (Plan −1h + 75 min) liegt
+    # aber noch in der Zukunft → die Crew ist ehrlich noch am Abflughafen.
+    # (VERFEINERT 2026-07-07 / Sebastian LH890: der Pin läuft 45 min nach der
+    # delay-korrigierten Abflugzeit AB — sonst klebte die Crew nach einem längst
+    # erfolgten verspäteten Abflug ewig am Boden, s. test_layeff_stale_delay_pin….)
+    tok = _setup_friend(monkeypatch, first_dep_offset_h=-1.0, layover_ort='XXX',
                         routing='BLL-FRA', frm='BLL', to='FRA')
     monkeypatch.setattr(A, '_flight_obs_merged',
                         lambda *a, **k: _merged(delay_known=True, status=None,
@@ -915,6 +918,32 @@ def test_layeff_multisector_waits_at_intermediate_before_next_leg(client, monkey
         return _merged(delay_known=True, status='landed') if fno == 'LH867' else None
     monkeypatch.setattr(A, '_flight_obs_merged', lambda fno, **k: obs(fno, **k))
     assert _friend_layover(client, tok) == 'FRA'
+
+
+def test_layeff_stale_delay_pin_expires_after_effective_departure(client, monkeypatch):
+    # SEBASTIAN LH890 (2026-07-07): dep-Obs „minor, +30" ohne je einen
+    # Terminal-Status → der Delay-Pin galt EWIG und die Crew klebte nach dem
+    # längst erfolgten Abflug am Abflughafen. Nach eff. Abflug (+Delay) + 45min
+    # ist das Boden-Signal stale → Uhr-Zweig: Grace (Plan+4h) auch vorbei →
+    # als geflogen gewertet → geplanter Layover.
+    tok = _setup_friend(monkeypatch, first_dep_offset_h=-6.0, layover_ort='XXX')
+    monkeypatch.setattr(A, '_flight_obs_merged',
+                        lambda *a, **k: _merged(delay_known=True,
+                                                status='minor', delay_min=30,
+                                                dep_delay_min=30,
+                                                delay_side='dep'))
+    assert _friend_layover(client, tok) == 'XXX'
+
+
+def test_layeff_fresh_delay_pin_still_holds(client, monkeypatch):
+    # Gegenprobe (Tibor-Regel bleibt): Abflug war vor 1h geplant, +90 bekannt →
+    # eff. Abflug liegt in der Zukunft → Crew ehrlich noch am Abflughafen.
+    tok = _setup_friend(monkeypatch, first_dep_offset_h=-1.0, layover_ort='XXX')
+    monkeypatch.setattr(A, '_flight_obs_merged',
+                        lambda *a, **k: _merged(delay_known=True,
+                                                status='delayed', delay_min=90,
+                                                delay_side='dep'))
+    assert _friend_layover(client, tok) == 'BLL'
 
 
 def test_layeff_share_roster_false_hidden(client, monkeypatch):
