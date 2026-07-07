@@ -838,14 +838,83 @@ def test_layeff_no_signal_past_grace_uses_planned(client, monkeypatch):
 
 
 def test_layeff_homebase_dep_never_overridden(client, monkeypatch):
-    # Erster Abflug ab Homebase (FRA) → nie überschrieben.
+    # OWNER-SPEC 2026-07-07 (Sebastian „Dienstplan sagt FRA, Wo-ist sagt
+    # Oslo"): der frühere Basis-Guard war FALSCH — auch bei Abflug von der
+    # eigenen Basis gilt die Signal-Kaskade. Verspätet & noch nicht
+    # abgeflogen ⇒ die Crew steht real an der Basis (FRA), nicht am
+    # geplanten Layover.
     tok = _setup_friend(monkeypatch, first_dep_offset_h=-1.0, layover_ort='XXX',
                         frm='FRA', to='CPH', routing='FRA-CPH')
     monkeypatch.setattr(A, '_flight_obs_merged',
                         lambda *a, **k: _merged(delay_known=True,
                                                 status='delayed', delay_min=90,
                                                 delay_side='dep'))
-    assert _friend_layover(client, tok) == 'XXX'      # Basis-Guard: planned bleibt
+    assert _friend_layover(client, tok) == 'FRA'      # Delay-Pin an der Basis
+
+
+def test_layeff_multisector_advances_past_intermediate_stop(client, monkeypatch):
+    # SEBASTIAN-BUG 2026-07-07 (OSL-FRA-RIX): die Kaskade stoppte nach dem
+    # ERSTEN Sektor — „Leg 1 gelandet ⇒ Crew in FRA" und der längst gelandete
+    # Folge-Leg FRA→RIX wurde nie angesehen. Der Feed zeigte ihn den ganzen
+    # Nachmittag „an der Basis" statt im RIX-Layover. Jetzt läuft die Kaskade
+    # alle heutigen Sektoren ab.
+    tok = 'FRIENDTOKEN'
+    today = _date.today().isoformat()
+    d1 = _now() + timedelta(hours=-8)
+    d2 = _now() + timedelta(hours=-5)
+    day = {
+        'datum': today,
+        'klass': 'Z72',
+        'routing': 'OSL-FRA-RIX',
+        'reader_facts': {'layover_ort': 'RIX',
+                         'flight_numbers': ['LH867', 'LH890']},
+        'ical_sectors': [
+            _sector(flight='LH867', frm='OSL', to='FRA', dep_iso=_iso(d1)),
+            _sector(flight='LH890', frm='FRA', to='RIX', dep_iso=_iso(d2)),
+        ],
+    }
+    A._store[tok] = {'result_data': {'_tage_detail': [day]}}
+    monkeypatch.setattr(A, '_friends_load', lambda t: {'friends': [tok]})
+    monkeypatch.setattr(A, '_profiles_load_bulk', lambda toks: {
+        tok: {'name': 'Sebastian', 'homebase': 'FRA', 'share_roster': True,
+              'share_location': True, 'location_source': 'roster'}})
+    monkeypatch.setattr(A, '_maybe_refresh_calendar_feed', lambda *a, **k: None)
+    # Beide Legs board-beobachtet gelandet.
+    monkeypatch.setattr(A, '_flight_obs_merged',
+                        lambda *a, **k: _merged(delay_known=True,
+                                                status='landed'))
+    assert _friend_layover(client, tok) == 'RIX'
+
+
+def test_layeff_multisector_waits_at_intermediate_before_next_leg(client, monkeypatch):
+    # Leg 1 gelandet, Leg 2 ohne Signal und Plan-Abflug erst in 1h → die Crew
+    # ist ehrlich am Zwischenstopp (FRA), nicht schon am Tagesziel.
+    tok = 'FRIENDTOKEN'
+    today = _date.today().isoformat()
+    d1 = _now() + timedelta(hours=-4)
+    d2 = _now() + timedelta(hours=1)
+    day = {
+        'datum': today,
+        'klass': 'Z72',
+        'routing': 'OSL-FRA-RIX',
+        'reader_facts': {'layover_ort': 'RIX',
+                         'flight_numbers': ['LH867', 'LH890']},
+        'ical_sectors': [
+            _sector(flight='LH867', frm='OSL', to='FRA', dep_iso=_iso(d1)),
+            _sector(flight='LH890', frm='FRA', to='RIX', dep_iso=_iso(d2)),
+        ],
+    }
+    A._store[tok] = {'result_data': {'_tage_detail': [day]}}
+    monkeypatch.setattr(A, '_friends_load', lambda t: {'friends': [tok]})
+    monkeypatch.setattr(A, '_profiles_load_bulk', lambda toks: {
+        tok: {'name': 'Sebastian', 'homebase': 'FRA', 'share_roster': True,
+              'share_location': True, 'location_source': 'roster'}})
+    monkeypatch.setattr(A, '_maybe_refresh_calendar_feed', lambda *a, **k: None)
+    # Nur Leg 1 hat eine Beobachtung (gelandet); Leg 2 ohne Signal.
+    def obs(fno, **k):
+        return _merged(delay_known=True, status='landed') if fno == 'LH867' else None
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda fno, **k: obs(fno, **k))
+    assert _friend_layover(client, tok) == 'FRA'
 
 
 def test_layeff_share_roster_false_hidden(client, monkeypatch):

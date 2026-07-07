@@ -11946,80 +11946,102 @@ def get_friends_today(token):
         lay_eff = rf.get('layover_ort')
         try:
             if datum == _date.today().isoformat():
-                secs = day.get('ical_sectors') or []
-                first_sec = next((s for s in secs
-                                  if isinstance(s, dict) and s.get('dep_iso')), None)
-                if first_sec:
+                secs = [s for s in (day.get('ical_sectors') or [])
+                        if isinstance(s, dict) and s.get('dep_iso')]
+                # HOMEBASE-FALL (Owner 2026-07-07, Sebastian „Dienstplan
+                # sagt FRA, Wo-ist sagt Oslo, WARUM kein Live-Flieger?"):
+                # dieselbe Signal-Kaskade gilt auch für Homebase-Abflüge.
+                # ECHTER-STATUS-KASKADE (Owner 2026-07-04, Tibor: Flug
+                # spät → er steht real noch am Abflughafen [BLL], die App
+                # zeigte ihn schon weiter, nur weil die PLAN-Abflugzeit
+                # vorbei war). Signal-getrieben statt Uhr-getrieben:
+                #   • noch NICHT abgeflogen (grounded/cancelled/Delay-Pin
+                #     ODER kein Signal & innerhalb 4h nach Plan) → Crew ist
+                #     am Abflughafen dieses Legs,
+                #   • AIRBORNE → unterwegs, geplanten Layover BEHALTEN,
+                #   • LANDED → weiter zum Ziel DIESES Legs — und dann den
+                #     NÄCHSTEN Sektor prüfen.
+                # MULTI-SEKTOR-FIX (Owner 2026-07-07, Sebastian OSL-FRA-RIX:
+                # Feed zeigte ihn den ganzen Nachmittag in FRA statt im
+                # RIX-Layover): vorher stoppte die Kaskade nach dem ERSTEN
+                # Sektor — „Leg 1 gelandet ⇒ lay_eff = FRA" und die
+                # Folge-Legs (FRA→RIX, längst gelandet) wurden nie
+                # angesehen. Jetzt läuft die Kaskade die heutigen Sektoren
+                # der Reihe nach ab, bis ein Leg NICHT als geflogen gilt.
+                pos = None
+                observed_end = False   # letztes „geflogen" war ECHTE Board-Obs?
+                for sec in secs:
                     dep = datetime.fromisoformat(
-                        str(first_sec['dep_iso']).replace('Z', '+00:00'))
-                    frm = str(first_sec.get('from') or '').strip().upper()
-                    to = str(first_sec.get('to') or '').strip().upper()
-                    hb = str(pr.get('homebase') or '').strip().upper()
-                    if len(frm) == 3 and frm.isalpha():
-                        # HOMEBASE-FALL (Owner 2026-07-07, Sebastian „Dienstplan
-                        # sagt FRA, Wo-ist sagt Oslo, WARUM kein Live-Flieger?"):
-                        # der `frm != hb`-Guard war FALSCH — bei Abflug von der
-                        # eigenen Basis (FRA→OSL) blieb `lay_eff` auf dem GEPLANTEN
-                        # Layover (Oslo), obwohl der Freund real noch in FRA am
-                        # Boden steht. Dieselbe Signal-Kaskade gilt jetzt auch für
-                        # Homebase-Abflüge: vor Abflug → FRA, airborne → „unterwegs
-                        # nach Oslo" (Live-Flieger via flight_numbers), gelandet →
-                        # Ziel. Kein Widerspruch mehr Roster↔Wo-ist.
-                        # ECHTER-STATUS-KASKADE (Owner 2026-07-04, Tibor: Flug
-                        # spät → er steht real noch am Abflughafen [BLL], die App
-                        # zeigte ihn schon weiter, nur weil die PLAN-Abflugzeit
-                        # vorbei war). Signal-getrieben statt Uhr-getrieben:
-                        #   • noch NICHT abgeflogen (grounded / kein Signal &
-                        #     innerhalb 4h nach Plan) → Crew ist am Abflughafen,
-                        #   • AIRBORNE → unterwegs, geplanten Layover BEHALTEN
-                        #     (NICHT an frm pinnen),
-                        #   • LANDED → weiter zum Ziel des ersten Legs.
-                        # 4h-Grace bleibt reiner Fallback OHNE Live-Signal.
+                        str(sec['dep_iso']).replace('Z', '+00:00'))
+                    frm = str(sec.get('from') or '').strip().upper()
+                    to = str(sec.get('to') or '').strip().upper()
+                    if not (len(frm) == 3 and frm.isalpha()):
+                        break
+                    merged = None
+                    try:
+                        fno = _fn_norm(sec.get('flight'))
+                        if fno and len(fno) >= 3:
+                            merged = _flight_obs_merged(
+                                fno, date=datum, dep_iata=frm,
+                                arr_iata=(to if (len(to) == 3 and to.isalpha())
+                                          else None),
+                                free_only=True)
+                    except Exception:
                         merged = None
-                        try:
-                            fno = _fn_norm(first_sec.get('flight'))
-                            if fno and len(fno) >= 3:
-                                merged = _flight_obs_merged(
-                                    fno, date=datum, dep_iata=frm,
-                                    arr_iata=(to if (len(to) == 3 and to.isalpha())
-                                              else None),
-                                    free_only=True)
-                        except Exception:
-                            merged = None
-                        bucket = (_flight_status_bucket(merged.get('status'))
-                                  if merged else None)
-                        # Bekannter Abflug-Delay OHNE bucketbaren Status
-                        # (status=None, sehr HÄUFIG) — Tibor BLL→FRA: verspätet,
-                        # aber noch nicht abgeflogen. Ohne diese Kopplung fiel der
-                        # Fall in den 4h-Uhr-Zweig → Crew fälschlich am Layover.
-                        delay_pin = bool(
-                            merged and merged.get('delay_known')
-                            and int(merged.get('dep_delay_min') or 0) > 0)
-                        if merged and merged.get('cancelled'):
-                            # (1) Annulliert schlägt ALLES: Crew ist nie
-                            # losgeflogen → bleibt am Abflughafen, Leg bleibt im
-                            # Umlauf (nie als „geflogen" behandelt).
-                            lay_eff = frm
-                        elif merged and bucket == 'landed':
-                            # (2) Erster Leg gelandet → Crew hat den Abflughafen
-                            # verlassen. Weiter zum Ziel (sonst geplanter Layover).
-                            if len(to) == 3 and to.isalpha():
-                                lay_eff = to
-                        elif merged and bucket == 'airborne':
-                            # (3) Unterwegs → geplanten Layover behalten (Default).
-                            pass
-                        elif (merged and bucket == 'grounded') or delay_pin:
-                            # (4) Echtes Signal „noch nicht abgeflogen" (delayed/
-                            # boarding) ODER bekannter Abflug-Delay ohne Status →
-                            # Crew ist am Abflughafen, UNABHÄNGIG von der Uhr
-                            # (auch bei starker Verspätung > 4h).
-                            lay_eff = frm
-                        else:
-                            # (5) Gar kein Signal → 4h-Grace als LETZTER Fallback:
-                            # Crew gilt bis 4h nach Plan-Abflug noch als am
-                            # Abflughafen.
-                            if datetime.now(timezone.utc) < dep + timedelta(hours=4):
-                                lay_eff = frm
+                    bucket = (_flight_status_bucket(merged.get('status'))
+                              if merged else None)
+                    # Bekannter Abflug-Delay OHNE bucketbaren Status
+                    # (status=None, sehr HÄUFIG) — Tibor BLL→FRA: verspätet,
+                    # aber noch nicht abgeflogen. Ohne diese Kopplung fiel der
+                    # Fall in den 4h-Uhr-Zweig → Crew fälschlich am Layover.
+                    delay_pin = bool(
+                        merged and merged.get('delay_known')
+                        and int(merged.get('dep_delay_min') or 0) > 0)
+                    if merged and merged.get('cancelled'):
+                        # (1) Annulliert schlägt ALLES: Crew ist nie
+                        # losgeflogen → bleibt am Abflughafen.
+                        pos = frm
+                        break
+                    elif merged and bucket == 'landed':
+                        # (2) Leg gelandet → Crew ist (mindestens) am Ziel
+                        # dieses Legs. Nächsten Sektor prüfen.
+                        if len(to) == 3 and to.isalpha():
+                            pos = to
+                        observed_end = True
+                        continue
+                    elif merged and bucket == 'airborne':
+                        # (3) Unterwegs → geplanten Layover behalten (der
+                        # Feed zeigt „unterwegs nach X" via flight_numbers).
+                        pos = None
+                        break
+                    elif (merged and bucket == 'grounded') or delay_pin:
+                        # (4) Echtes Signal „noch nicht abgeflogen" → Crew
+                        # ist am Abflughafen dieses Legs, egal wie spät.
+                        pos = frm
+                        break
+                    else:
+                        # (5) Kein Signal → 4h-Grace: bis 4h nach Plan-
+                        # Abflug gilt die Crew als (noch) am Abflughafen;
+                        # danach Plan-Annahme „geflogen" → weiter zum Ziel
+                        # und den nächsten Sektor prüfen (sonst bliebe ein
+                        # obs-loser Zwischenstopp für immer kleben).
+                        if datetime.now(timezone.utc) < dep + timedelta(hours=4):
+                            pos = frm
+                            break
+                        if len(to) == 3 and to.isalpha():
+                            pos = to
+                        observed_end = False
+                        continue
+                else:
+                    # Kein break: alle heutigen Legs gelten als geflogen.
+                    # Endete der Tag mit einer ECHTEN Landungs-Beobachtung,
+                    # zählt deren Ziel (Board schlägt Plan). Ohne Obs (reine
+                    # Plan-Annahme nach Grace) zählt der GEPLANTE Über-
+                    # nachtungsort (rf.layover_ort) — kein erfundener Ort.
+                    if not observed_end and rf.get('layover_ort'):
+                        pos = None
+                if pos:
+                    lay_eff = pos
         except Exception:
             lay_eff = rf.get('layover_ort')
         # Privacy-Gate: share_location=False (bool) oder =0 (legacy int) → kein city.
