@@ -3416,12 +3416,60 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
     else:
         chain['inbound_sched_arr'] = row_sched
         chain['inbound_est_arr'] = row_esti
+    # FR24-gRPC-Nachschlag (Owner 2026-07-07 „haben doch ein fr24 scraping"):
+    # an einer ungepollten Außenstation (Layover HND) gibt es KEIN Ankunfts-
+    # Board → sched/est-Ankunft des Zubringers blieben null („Ankunftszeit noch
+    # offen"). Sobald der Zubringer AIRBORNE ist, kennt FR24s flight_details
+    # sched_arr/eta (Epoch-Sekunden UTC) — echte Werte, kein Raten. EIN gRPC-
+    # Call (detail_card ist available()/-Rate-Limit-gegated, Timeout 8 s),
+    # still bei Fehlschlag. Übernahme NUR bei Reg-Match (die Karte muss DIESEN
+    # Flieger beschreiben, nicht irgendeinen Callsign-Nachbarn im Suchfenster).
+    # Stale Position ⇒ FR24-Box enthält den Flieger nicht ⇒ kein Match ⇒ null
+    # bleibt null (ehrlich degradiert).
+    if (chain['inbound_est_arr'] is None and pos
+            and not pos.get('on_ground')
+            and pos.get('lat') is not None and pos.get('lon') is not None):
+        try:
+            from blueprints import fr24_grpc
+            card = fr24_grpc.detail_card(callsign=cs, reg=reg,
+                                         lat=pos.get('lat'), lon=pos.get('lon'))
+        except Exception:
+            card = None
+        _creg = re.sub(r'[^A-Z0-9]', '', ((card or {}).get('reg') or '').upper())
+        _treg = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
+        if card and _creg and _creg == _treg:
+            def _epoch_iso(v):
+                try:
+                    v = int(v)
+                    if v <= 0:
+                        return None
+                    from datetime import datetime as _dt2, timezone as _tz2
+                    return _dt2.fromtimestamp(v, tz=_tz2.utc).isoformat()
+                except Exception:
+                    return None
+            _fr_eta = _epoch_iso(card.get('eta'))
+            _fr_sa = _epoch_iso(card.get('sched_arr'))
+            if _fr_eta:
+                chain['inbound_est_arr'] = _fr_eta
+                # sched IMMER aus derselben Quelle/Uhr wie est (UTC) — ein
+                # Board-sched (station-lokale Wanduhr) neben einem FR24-est
+                # (UTC-Wanduhr) würde die Delay-Differenz um den TZ-Offset
+                # verfälschen. Fehlt FR24-sched ⇒ sched ehrlich null (iOS
+                # zeigt ohnehin nur EINE Zeit: est bevorzugt).
+                chain['inbound_sched_arr'] = _fr_sa
+
     if chain['inbound_delay_min'] is None and chain['inbound_sched_arr'] and chain['inbound_est_arr']:
-        _sa = _parse_local_iso(chain['inbound_sched_arr'])
-        _ea = _parse_local_iso(chain['inbound_est_arr'])
-        if _sa is not None and _ea is not None:
-            # esti gesetzt → Delay ist bekannt (auch wenn 0/negativ = pünktlich/früh).
-            chain['inbound_delay_min'] = int(round((_ea - _sa).total_seconds() / 60.0))
+        # Delay nur aus GLEICHARTIGEN Zeitstempeln (beide naiv-lokal ODER beide
+        # mit Offset) — _parse_local_iso strippt tzinfo, ein Mix wäre ±TZ falsch.
+        def _has_off(s):
+            s = str(s)
+            return s.endswith('Z') or ('+' in s[10:]) or ('-' in s[19:])
+        if _has_off(chain['inbound_sched_arr']) == _has_off(chain['inbound_est_arr']):
+            _sa = _parse_local_iso(chain['inbound_sched_arr'])
+            _ea = _parse_local_iso(chain['inbound_est_arr'])
+            if _sa is not None and _ea is not None:
+                # esti gesetzt → Delay ist bekannt (auch wenn 0/negativ = pünktlich/früh).
+                chain['inbound_delay_min'] = int(round((_ea - _sa).total_seconds() / 60.0))
 
     # ── #2 Abflug-Delay-Prognose ──────────────────────────────────────────────
     sd = _parse_local_iso(sched_dep)
