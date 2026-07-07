@@ -11955,7 +11955,16 @@ def get_friends_today(token):
                     frm = str(first_sec.get('from') or '').strip().upper()
                     to = str(first_sec.get('to') or '').strip().upper()
                     hb = str(pr.get('homebase') or '').strip().upper()
-                    if len(frm) == 3 and frm.isalpha() and frm != hb:
+                    if len(frm) == 3 and frm.isalpha():
+                        # HOMEBASE-FALL (Owner 2026-07-07, Sebastian „Dienstplan
+                        # sagt FRA, Wo-ist sagt Oslo, WARUM kein Live-Flieger?"):
+                        # der `frm != hb`-Guard war FALSCH — bei Abflug von der
+                        # eigenen Basis (FRA→OSL) blieb `lay_eff` auf dem GEPLANTEN
+                        # Layover (Oslo), obwohl der Freund real noch in FRA am
+                        # Boden steht. Dieselbe Signal-Kaskade gilt jetzt auch für
+                        # Homebase-Abflüge: vor Abflug → FRA, airborne → „unterwegs
+                        # nach Oslo" (Live-Flieger via flight_numbers), gelandet →
+                        # Ziel. Kein Widerspruch mehr Roster↔Wo-ist.
                         # ECHTER-STATUS-KASKADE (Owner 2026-07-04, Tibor: Flug
                         # spät → er steht real noch am Abflughafen [BLL], die App
                         # zeigte ihn schon weiter, nur weil die PLAN-Abflugzeit
