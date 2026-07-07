@@ -3403,8 +3403,18 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
 
     chain['inbound_flight_no'] = inbound_fn
     chain['inbound_origin'] = _airport_brief(inbound_origin)
-    if pos and not pos.get('on_ground'):
-        chain['inbound_live'] = pos      # nur wenn wirklich in der Luft
+    # Live-Position NUR als Zubringer übernehmen, wenn die LIVE-Route DIESER
+    # Maschine auch WIRKLICH an meinem Abflughafen landet (dst == dep). Sonst
+    # fliegt der Tail gerade einen ANDEREN Leg — reg-only-ADS-B findet ihn
+    # irgendwo (Owner-Screenshot 2026-07-08 „stimmt nicht": D-ABYM real über
+    # Miami, während die Karte FRA→HND behauptet). Off-route ⇒ Position verwerfen;
+    # der Korridor-Resolver unten sucht den Flieger auf der ECHTEN Route (FRA→HND)
+    # und lässt inbound_live ehrlich null, wenn der Tail dort gar nicht fliegt.
+    _live_src, _live_dst = _route_endpoints(route)
+    pos_on_route = (bool(pos) and not pos.get('on_ground')
+                    and bool(_live_dst) and _live_dst == dep)
+    if pos_on_route:
+        chain['inbound_live'] = pos      # nur wenn wirklich in der Luft & on-route
 
     # (c) Ankunfts-Seite des Zubringers AN meinem Abflughafen: bevorzugt der
     # zentrale Dual-Side-Resolver (ehrliche delay_known-Semantik), sonst direkt
@@ -3433,8 +3443,7 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
     # Flieger beschreiben, nicht irgendeinen Callsign-Nachbarn im Suchfenster).
     # Stale Position ⇒ FR24-Box enthält den Flieger nicht ⇒ kein Match ⇒ null
     # bleibt null (ehrlich degradiert).
-    if (chain['inbound_est_arr'] is None and pos
-            and not pos.get('on_ground')
+    if (chain['inbound_est_arr'] is None and pos_on_route
             and pos.get('lat') is not None and pos.get('lon') is not None):
         try:
             from blueprints import fr24_grpc
@@ -3507,10 +3516,12 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
                 if (not chain['inbound_live']
                         and corr.get('lat') is not None and corr.get('lon') is not None
                         and (corr.get('flight_stage') or '').upper() == 'AIRBORNE'):
+                    # Keys 1:1 wie der übrige inbound_live-Pfad (iOS AXLifecycleLive
+                    # decodiert lat/lon/alt/gs/track/on_ground — `gs`, nicht `speed`).
                     chain['inbound_live'] = {
                         'lat': corr.get('lat'), 'lon': corr.get('lon'),
                         'track': corr.get('track'), 'alt': corr.get('alt'),
-                        'speed': corr.get('speed'), 'on_ground': False,
+                        'gs': corr.get('speed'), 'on_ground': False,
                         'source': 'fr24_grpc_corridor',
                     }
                 if not ac_type and corr.get('route_from'):
