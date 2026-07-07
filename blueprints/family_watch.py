@@ -737,6 +737,21 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     iOS struct (alle felder Optional)."""
     if not crew_token:
         return {}
+    # LOCATION-WIE-FREUNDE (Owner 2026-07-07: „funktioniert doch wie Freunde bei
+    # der Location?"): bei Freunden hängt die Standort-Freigabe an EINEM Profil-
+    # Flag (`share_location`, Default AN) — es gibt keinen separaten Feld-Grant.
+    # Bei Family lief bisher ALLES über den per-Feld-Grant, sodass die Family den
+    # Ort NUR sah, wenn der Crew `current_city`/`layover_place` explizit gegranted
+    # hatte → „Papa weiß nie wo ich bin", obwohl Freunde denselben Ort sehen.
+    # Angleichung: die ORTS-Felder gelten als freigegeben, sobald der Crew
+    # `share_location` nicht explizit ausgeschaltet hat — genau wie bei Freunden.
+    # Sensible Felder (Fotos/Voice/Reg) bleiben weiter am expliziten Family-Grant.
+    allowed_fields = set(allowed_fields)
+    try:
+        if (_load_crew_profile(crew_token) or {}).get('share_location') is not False:
+            allowed_fields |= {'current_city', 'layover_place'}
+    except Exception:
+        pass
     src_fail = False   # mind. eine SB-/Profil-Quelle war trotz Retry unlesbar
     status = {
         'layover_place': None,
