@@ -3588,9 +3588,14 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
     # des Großkreis-Korridors findet die Maschine per Reg AUCH über Russland — plus
     # flight_details (echte sched_arr/eta). EIN gRPC-Call (available()/Rate-Limit-
     # gegated, Timeout je 8 s), still bei Fehlschlag. Übernahme NUR bei Reg-Match.
-    # Greift wenn (a) keine Ankunftszeit ODER (b) keine Live-Position bekannt ist.
-    if reg and inbound_origin and (chain['inbound_est_arr'] is None
-                                   or not chain['inbound_live']):
+    # LATENZ (Owner 2026-07-08 „findet LH716 nicht"): der Korridor-Call ist teuer
+    # (~25 s: live_feed über Groß-Box + flight_details) und blockiert die ganze
+    # Antwort → App-Timeout = Flieger erscheint gar nicht. Deshalb NUR noch als
+    # POSITIONS-Beschaffer laufen lassen, wenn weder Snapshot noch freies ADS-B
+    # eine Position lieferten. Hat der Snapshot die Position schon (Normalfall über
+    # Russland), überspringen wir den Korridor → Antwort ~2 s, Flieger zeigt sofort.
+    # (Die echte ETA über ungepollten Außenstationen ist ein separater Follow-up.)
+    if reg and inbound_origin and not chain['inbound_live']:
         _oll = _iata_latlon((inbound_origin or '').upper())
         _dll = _iata_latlon((dep or '').upper())
         if _oll and _dll and None not in _oll and None not in _dll:
