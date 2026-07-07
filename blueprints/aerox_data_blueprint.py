@@ -296,46 +296,68 @@ def _route_from_warehouse(hexid=None, reg=None):
     return None
 
 
-def _aircraft_live_pos_for_reg(reg, dep=None, max_age_min=25):
+def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=25):
     """Positions-Snapshot aus dem NAS-Harvester-Store (Supabase `aircraft_live`,
-    reg-keyed, gefüllt via FR24-**gRPC** — sieht AUCH über Russland/Ozean, wo
-    freies ADS-B blind ist). Owner-Idee 2026-07-08: „geht ein Flug offline,
-    simulieren wir aus dem letzten gespeicherten Snapshot". BILLIGER Supabase-Read
-    → als Positions-Tier VOR dem on-demand-FR24-Korridor (ein gRPC-Call).
+    gefüllt via FR24-**gRPC** — sieht AUCH über Russland/Ozean, wo freies ADS-B
+    blind ist). Owner-Idee 2026-07-08: „geht ein Flug offline, simulieren wir aus
+    dem letzten Snapshot". BILLIGER Supabase-Read → Positions-Tier VOR dem
+    on-demand-FR24-Korridor.
 
-    reg wird normalisiert (ohne Bindestrich). Route-konsistent: gibt es `dep`, muss
-    der gespeicherte Ziel-Airport == dep sein (sonst fliegt der Tail einen anderen
-    Leg → Position verwerfen, wie im on-demand-Pfad). Nur frische Snapshots
-    (< max_age_min). Rückgabe: (pos, (src,dst)) | (None, None). pos hat dieselben
-    Keys wie iOS AXLifecycleLive erwartet (lat/lon/track/gs/alt/on_ground)."""
+    Match-Reihenfolge: reg (Roster-Tail, korrekt für echte Crews) → flight-Nr →
+    callsign. Der Flug-/Callsign-Match FÄNGT den Fall, dass der Roster-Tail
+    VERALTET ist (Aircraft-Swap): er findet die Maschine, die die Flugnummer
+    GERADE fliegt (Owner 2026-07-08: LH716 heute = D-ABYN, Roster sagte D-ABYM →
+    reg-Match verfehlte, Flug-Match trifft). Route-konsistent (dst == dep). Nur
+    frische Snapshots (< max_age_min).
+
+    Rückgabe: (pos, (src,dst), reg_display, ac_type) | (None, None, None, None).
+    pos-Keys wie iOS AXLifecycleLive (lat/lon/track/gs/alt/on_ground)."""
     sb = _sb()
-    rn = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
-    if sb is None or not rn:
-        return None, None
+    if sb is None:
+        return None, None, None, None
     cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
                            time.gmtime(time.time() - max_age_min * 60))
-    try:
-        rows = (sb.table('aircraft_live')
-                  .select('lat,lon,track,gs_kt,alt_ft,origin,dest,on_ground,seen_ts')
-                  .eq('reg', rn).gt('updated_at', cutoff).limit(1).execute()).data or []
-    except Exception:
-        return None, None
+    rn = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
+    fn = (flight or '').strip().upper() or None
+    cs = (callsign or '').strip().upper() or None
+    sel = 'reg,reg_display,callsign,flight,lat,lon,track,gs_kt,alt_ft,origin,dest,ac_type,on_ground,seen_ts'
+    dep_n = _norm_iata(dep) if dep else None
+
+    def _query(col, val):
+        try:
+            q = (sb.table('aircraft_live').select(sel)
+                   .eq(col, val).gt('updated_at', cutoff))
+            if dep_n:
+                q = q.eq('dest', dep_n)          # Route-Konsistenz serverseitig
+            return (q.limit(1).execute()).data or []
+        except Exception:
+            return []
+
+    rows = []
+    if rn:
+        rows = _query('reg', rn)
+    if not rows and fn:
+        rows = _query('flight', fn)
+    if not rows and cs:
+        rows = _query('callsign', cs)
     if not rows:
-        return None, None
+        return None, None, None, None
     r = rows[0]
     if r.get('lat') is None or r.get('lon') is None:
-        return None, None
+        return None, None, None, None
     src = (r.get('origin') or '').strip().upper() or None
     dst = (r.get('dest') or '').strip().upper() or None
-    if dep and dst and dst != _norm_iata(dep):
-        return None, None                       # anderer Leg → verwerfen
+    if dep_n and dst and dst != dep_n:
+        return None, None, None, None            # anderer Leg → verwerfen
     pos = {
         'lat': r.get('lat'), 'lon': r.get('lon'),
         'track': r.get('track'), 'gs': r.get('gs_kt'), 'alt': r.get('alt_ft'),
         'on_ground': bool(r.get('on_ground')),
         'source': 'aircraft_live', 'seen_ts': r.get('seen_ts'),
     }
-    return pos, (src, dst)
+    reg_disp = (r.get('reg_display') or r.get('reg') or '').strip().upper() or None
+    ac_type = (r.get('ac_type') or '').strip().upper() or None
+    return pos, (src, dst), reg_disp, ac_type
 
 
 def _route_from_fr24(callsign=None, hexid=None):
@@ -3522,10 +3544,23 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
     # Live-Position, BEVOR wir einen on-demand-gRPC-Korridor-Call machen. Der
     # Korridor unten greift dann nur noch, wenn der Snapshot alt/leer ist ODER die
     # Ankunftszeit noch fehlt.
-    if reg and inbound_origin and not chain['inbound_live']:
-        _snap_pos, _snap_route = _aircraft_live_pos_for_reg(reg, dep=dep)
+    if inbound_origin and not chain['inbound_live'] and (reg or inbound_fn or cs):
+        _snap_pos, _snap_route, _snap_reg, _snap_type = _aircraft_live_pos(
+            reg=reg, flight=inbound_fn, callsign=cs, dep=dep)
         if _snap_pos and not _snap_pos.get('on_ground'):
             chain['inbound_live'] = _snap_pos
+            # Wurde die Maschine per FLUGNUMMER gefunden und trägt einen ANDEREN
+            # Tail als der (veraltete Roster-)Reg → DIESER ist der echte Zubringer
+            # (Aircraft-Swap). Reg/Typ auf die Live-Wahrheit ziehen, damit Label
+            # und Position zusammenpassen (Owner „stimmt nicht"-Konsistenz).
+            _snap_rn = re.sub(r'[^A-Z0-9]', '', (_snap_reg or '').upper())
+            _cur_rn = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
+            if _snap_rn and _snap_rn != _cur_rn:
+                reg = _snap_reg
+                chain['reg'] = _snap_reg
+                if _snap_type:
+                    ac_type = ac_type or _snap_type
+                    chain['aircraft_type'] = chain.get('aircraft_type') or _snap_type
 
     # FR24-gRPC KORRIDOR-Nachschlag (Owner-Durchbruch 2026-07-08 „haben doch eine
     # website die über Russland/Ozean liefert"): über Sibirien/Ozean ist FREIES
