@@ -3080,14 +3080,18 @@ def _live_pos_from_state(row):
     }
 
 
-def _machine_live(reg, want_route=True):
+def _machine_live(reg, want_route=True, targeted=False):
     """Für EINE Registration → (hex, callsign, pos_dict, route_dict). REIN GRATIS:
-    die Position kommt aus dem EINEN Resolver (position_for_flight), aber NUR aus
-    den vom Harvester/Poller gefüllten Tabellen (targeted=False, allow_paid=False)
-    — KEIN bezahlter AeroDataBox-Ping und KEIN ungedeckelter Extern-Call im
-    User-Request (Kern-Regel 5000 User). „Wo ist mein/nächster Flieger" darf keine
-    API-Kosten pro Aufruf erzeugen; der Hintergrund-Poller hält aircraft_positions
-    frisch, die Harvester-Flotte fr24_live. Alle Rückgaben None-safe; wirft nie."""
+    die Position kommt aus dem EINEN Resolver (position_for_flight), Default NUR
+    aus den vom Harvester/Poller gefüllten Tabellen (targeted=False) — KEIN
+    bezahlter AeroDataBox-Ping (allow_paid=False IMMER) und kein ungedeckelter
+    Extern-Call im Bulk-Pfad (Kern-Regel 5000 User). `targeted=True` ist für die
+    EIGENE Maschine (Inbound-Kette / flight-live, per-User-gepollter, memoized
+    Endpoint) und schaltet den GRATIS-Extern-Tier 3 (adsb.lol-Mirrors) frei —
+    exakt die im Resolver-Docstring benannte Inbound-/Watch-Klasse; sonst hängt
+    „wo ist mein Flieger" daran, ob der Poller den Tail zufällig schon trackt
+    (Owner-Fall D-ABYN: airborne laut adsb.lol, Tabellen leer). Alle Rückgaben
+    None-safe; wirft nie."""
     _r2h, _fls, frf, touch = _adsb_helpers()  # _fls/frf: im gratis-Pfad NICHT genutzt
     reg = (reg or '').strip().upper() or None
     if not reg:
@@ -3103,9 +3107,10 @@ def _machine_live(reg, want_route=True):
     row = None
     try:
         from blueprints.warehouse_reader import position_for_flight
-        # targeted=False → NUR Tabellen (Tier 1+2), nie extern/bezahlt.
+        # targeted=False → NUR Tabellen (Tier 1+2); targeted=True (eigene
+        # Maschine) zusätzlich GRATIS-Tier 3 (adsb.lol). Bezahlt NIE.
         row, _src, _obs_ts, _tried = position_for_flight(
-            hex=hexid, reg=reg, targeted=False, allow_paid=False)
+            hex=hexid, reg=reg, targeted=targeted, allow_paid=False)
     except Exception:
         row = None
     pos = _live_pos_from_state(row)
@@ -3361,7 +3366,9 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
     # IATA-Flugnummer + Herkunft + Soll/Ist-Ankunft. Gratis (cache-only, der
     # Poller hält die Basis-Boards warm). Live-Position/-Route dienen als
     # Bestätigung + In-der-Luft-Marker.
-    _hex, cs, pos, route = _machine_live(reg)
+    # targeted=True: die EIGENE Maschine (Inbound-Klasse laut Resolver) —
+    # gratis adsb.lol-Tier erlaubt, memoized + per-User-gepollt (kein Bulk).
+    _hex, cs, pos, route = _machine_live(reg, targeted=True)
     arr_row = _inbound_arr_row_by_reg(dep, reg)
     inbound_fn = inbound_origin = None
     row_sched = row_esti = row_delay = None
@@ -3582,7 +3589,8 @@ def ax_flight_live(token):
         reg = (my or {}).get('reg') or None
     if not reg:
         reg, _sb_tc, sb_dep, sb_arr = _sb_day_reg(flight_no, date)
-    hexid, cs, pos, route = _machine_live(reg) if reg else (None, None, None, None)
+    hexid, cs, pos, route = (_machine_live(reg, targeted=True)
+                             if reg else (None, None, None, None))
     src, dst = _route_endpoints(route)
     dep = src or _norm_iata((my or {}).get('dep_iata')) or q_dep or _norm_iata(sb_dep)
     dest = dst or _norm_iata((my or {}).get('arr_iata')) or q_arr or _norm_iata(sb_arr)
