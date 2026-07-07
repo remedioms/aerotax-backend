@@ -3404,11 +3404,17 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
     #      Roster ohne Tail → die Gegenroute der Homebase kennt die Maschine
     #      (heutige LH716 FRA→HND = mein LH717-Flieger morgen). Nur mit
     #      arr_iata (neuer Client schickt es mit) — sonst wie bisher.
+    # Rotations-Row IMMER holen, wenn arr_iata bekannt ist (nicht nur bei fehlender
+    # Reg): sie IDENTIFIZIERT den Zubringer (die Gegenroute LH716 FRA→HND) für
+    # inbound_origin/inbound_fn — auch wenn schon eine Reg für MEINEN Flug (LH717)
+    # aufgelöst wurde. Vorher (`if not reg`) blieb bei vorhandener Reg der Zubringer
+    # unbestimmt → inbound_origin null → Positions-Tier übersprungen → „LH716 wird
+    # nicht gefunden" (Owner 2026-07-08). Reg/Typ NUR übernehmen, wenn noch keine da.
     rot_row = None
-    if not reg and arr_iata:
+    if arr_iata:
         rot_row = _rotation_positioning_row(flight_no, date, dep, arr_iata,
                                             my_dep_utc=my_dep_utc)
-        if rot_row is not None:
+        if rot_row is not None and not reg:
             reg = ((rot_row.get('reg') or '').strip().upper() or None)
             if not ac_type:
                 ac_type = ((rot_row.get('type_code') or '').strip().upper()
@@ -3461,6 +3467,18 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
         # Dual-Side-Resolver unten liefert die Ankunft, wenn er sie kennt).
         inbound_fn = (rot_row.get('flight') or '').replace(' ', '').upper() or None
         inbound_origin = _norm_iata(arr_iata)
+        # Die Gegenroute-Row IST der Zubringer — ihr Tail ist der einlaufende
+        # Flieger (die zuvor aufgelöste Reg gehört zu MEINEM Flug, kann abweichen).
+        # Auf die Zubringer-Reg/-Typ ziehen, damit Snapshot/Korridor (die per Reg
+        # filtern) den RICHTIGEN Flieger finden, nicht meinen.
+        _rot_reg = (rot_row.get('reg') or '').strip().upper() or None
+        if _rot_reg:
+            reg = _rot_reg
+            chain['reg'] = _rot_reg
+            _rot_tc = (rot_row.get('type_code') or '').strip().upper() or None
+            if _rot_tc:
+                ac_type = _rot_tc
+                chain['aircraft_type'] = _rot_tc
     if not inbound_origin:
         # Zubringer (noch) nicht eindeutig bestimmbar → ehrlich null lassen.
         return chain, forecast, my
