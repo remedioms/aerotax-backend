@@ -131,6 +131,90 @@ def _norm_cs(s):
     return (s or "").strip().upper().replace(" ", "")
 
 
+async def _corridor_detail_async(provider, s, n, w, e, cs, rg):
+    """live_feed über einer KORRIDOR-Box (Großkreis from→to) + flight_details des
+    Treffers. Findet den Flieger AUCH über Russland/Ozean OHNE Vorab-Position."""
+    from fr24 import FR24, BoundingBox  # noqa: F811
+    box = BoundingBox(north=n, south=s, west=w, east=e)
+    async with _client_for(provider) as f:
+        res = await asyncio.wait_for(f.live_feed.fetch(box, limit=1500), timeout=_TIMEOUT_S)
+        rows = res.to_dict().get("flights_list") or []
+        match = None
+        if cs:
+            for r in rows:
+                if _norm_cs(r.get("callsign")) == cs:
+                    match = r
+                    break
+        if match is None and rg:
+            for r in rows:
+                xi = r.get("extra_info") or {}
+                if (xi.get("reg") or "").strip().upper().replace("-", "") == rg:
+                    match = r
+                    break
+        if match is None:
+            return None
+        detail = None
+        try:
+            det = await asyncio.wait_for(
+                f.flight_details.fetch(flight_id=match.get("flightid")), timeout=_TIMEOUT_S)
+            detail = det.to_dict()
+        except Exception:
+            detail = None
+        return {"row": match, "detail": detail}
+
+
+def inbound_by_route(from_lat, from_lon, to_lat, to_lon, callsign=None, reg=None,
+                     margin=6.0):
+    """Owner-Durchbruch 2026-07-08 („wir haben doch fr24, das über Russland
+    liefert"): die Maschine liegt auf dem Großkreis from→to. Wir kennen die Route
+    (z.B. FRA→HND), fragen fr24 mit einer Box ENTLANG des Korridors (+margin) und
+    filtern per callsign/reg — findet den Flieger AUCH über Russland/Ozean OHNE
+    Vorab-Position, PLUS flight_details (echte sched_arr/eta). Rückgabe:
+    {lat,lon,track,alt,speed,route_from,route_to,sched_dep,sched_arr,eta,
+    flight_stage,reg,callsign,flight_id} | None."""
+    if not available() or None in (from_lat, from_lon, to_lat, to_lon):
+        return None
+    if not _allow_call():
+        return None
+    cs = _norm_cs(callsign)
+    rg = (reg or "").strip().upper().replace("-", "") or None
+    s = min(from_lat, to_lat) - margin
+    n = max(from_lat, to_lat) + margin
+    w = min(from_lon, to_lon) - margin
+    e = max(from_lon, to_lon) + margin
+    for provider in _providers():
+        try:
+            td = _run(_corridor_detail_async(provider, s, n, w, e, cs, rg))
+        except Exception as ex:
+            log.warning("fr24 corridor provider=%s: %s", provider, ex)
+            td = None
+        if td and td.get("row"):
+            row = td["row"]
+            xi = row.get("extra_info") or {}
+            route = xi.get("route") or {}
+            d = td.get("detail") or {}
+            si = d.get("schedule_info") or {}
+            fp = d.get("flight_progress") or {}
+            _note_result(True)
+            return {
+                "lat": row.get("lat"), "lon": row.get("lon"),
+                "track": row.get("track"), "alt": row.get("alt"),
+                "speed": row.get("speed"),
+                "route_from": (route.get("from") or "").strip().upper() or None,
+                "route_to": (route.get("to") or "").strip().upper() or None,
+                "sched_dep": si.get("scheduled_departure"),
+                "sched_arr": si.get("scheduled_arrival"),
+                "eta": fp.get("eta"),
+                "flight_stage": fp.get("flight_stage"),
+                "reg": (xi.get("reg") or "").strip().upper() or None,
+                "callsign": _norm_cs(row.get("callsign")) or None,
+                "flight_id": row.get("flightid"),
+                "source": "fr24_grpc_corridor",
+            }
+    _note_result(False)
+    return None
+
+
 async def _livefeed_row_async(provider, callsign, reg, lat, lon):
     """Ein live_feed-Row DES gesuchten Fluges (Match per callsign, sonst reg)."""
     from fr24 import FR24, BoundingBox  # noqa: F811

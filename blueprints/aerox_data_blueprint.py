@@ -3465,6 +3465,57 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
                 # zeigt ohnehin nur EINE Zeit: est bevorzugt).
                 chain['inbound_sched_arr'] = _fr_sa
 
+    # FR24-gRPC KORRIDOR-Nachschlag (Owner-Durchbruch 2026-07-08 „haben doch eine
+    # website die über Russland/Ozean liefert"): über Sibirien/Ozean ist FREIES
+    # ADS-B blind → `pos` bleibt None → der pos-gegatete Block oben greift NICHT,
+    # Ankunftszeit + Live-Position blieben null. ABER: wir kennen die Route
+    # (inbound_origin=FRA → dep=HND). Ein live_feed über einer BoundingBox ENTLANG
+    # des Großkreis-Korridors findet die Maschine per Reg AUCH über Russland — plus
+    # flight_details (echte sched_arr/eta). EIN gRPC-Call (available()/Rate-Limit-
+    # gegated, Timeout je 8 s), still bei Fehlschlag. Übernahme NUR bei Reg-Match.
+    # Greift wenn (a) keine Ankunftszeit ODER (b) keine Live-Position bekannt ist.
+    if reg and inbound_origin and (chain['inbound_est_arr'] is None
+                                   or not chain['inbound_live']):
+        _oll = _iata_latlon((inbound_origin or '').upper())
+        _dll = _iata_latlon((dep or '').upper())
+        if _oll and _dll and None not in _oll and None not in _dll:
+            try:
+                from blueprints import fr24_grpc
+                corr = fr24_grpc.inbound_by_route(
+                    _oll[0], _oll[1], _dll[0], _dll[1], callsign=cs, reg=reg)
+            except Exception:
+                corr = None
+            _creg = re.sub(r'[^A-Z0-9]', '', ((corr or {}).get('reg') or '').upper())
+            _treg = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
+            if corr and _creg and _creg == _treg:
+                def _epoch_iso2(v):
+                    try:
+                        v = int(v)
+                        if v <= 0:
+                            return None
+                        from datetime import datetime as _d3, timezone as _t3
+                        return _d3.fromtimestamp(v, tz=_t3.utc).isoformat()
+                    except Exception:
+                        return None
+                if chain['inbound_est_arr'] is None:
+                    _ce = _epoch_iso2(corr.get('eta'))
+                    _cs2 = _epoch_iso2(corr.get('sched_arr'))
+                    if _ce:
+                        chain['inbound_est_arr'] = _ce
+                        chain['inbound_sched_arr'] = _cs2
+                # Live-Position über Russland/Ozean → Karte zeigt den echten Flieger.
+                if (not chain['inbound_live']
+                        and corr.get('lat') is not None and corr.get('lon') is not None
+                        and (corr.get('flight_stage') or '').upper() == 'AIRBORNE'):
+                    chain['inbound_live'] = {
+                        'lat': corr.get('lat'), 'lon': corr.get('lon'),
+                        'track': corr.get('track'), 'alt': corr.get('alt'),
+                        'speed': corr.get('speed'), 'on_ground': False,
+                        'source': 'fr24_grpc_corridor',
+                    }
+                if not ac_type and corr.get('route_from'):
+                    pass  # Typ kommt nicht aus dem Korridor-Feed; nichts erfinden.
+
     if chain['inbound_delay_min'] is None and chain['inbound_sched_arr'] and chain['inbound_est_arr']:
         # Delay nur aus GLEICHARTIGEN Zeitstempeln (beide naiv-lokal ODER beide
         # mit Offset) — _parse_local_iso strippt tzinfo, ein Mix wäre ±TZ falsch.
