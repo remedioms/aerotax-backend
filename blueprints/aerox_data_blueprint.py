@@ -3237,7 +3237,64 @@ def _sb_day_reg(flight_no, date):
     return reg, tc, dep, arr
 
 
-def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None):
+def _rotation_positioning_row(flight_no, date, dep_iata, arr_iata, my_dep_utc=None):
+    """Außenstations-Rotation (Owner 2026-07-07, Layover-Fall „LH717 ab HND"):
+    der eigene Abflughafen wird nicht gepollt → die Reg-Kaskade bleibt leer und
+    die Kette starb, obwohl die Maschine längst bekannt ist. Bei Out-and-back-
+    Rotationen positioniert die GEGENROUTE den Flieger ein: gleiche Airline,
+    arr_iata→dep_iata (LH716 FRA→HND bringt die Maschine für LH717 HND→FRA) —
+    und die Homebase-Seite (arr_iata, DE/EU) IST gepollt. Kandidaten: Abflug-
+    Rows an arr_iata (kein '#ARR') mit dest_iata==dep_iata, Carrier-Prefix
+    identisch, Flugtag D-1/D, Reg gesetzt, nicht annulliert. Auswahl: die
+    JÜNGSTE Row, deren Abflug (UTC) noch VOR dem eigenen Abflug liegt — sonst
+    wäre es die Rotation NACH meinem Flug (heutige LH716 kann nicht die
+    Maschine der heutigen LH717 sein). Ohne my_dep_utc: jüngste Row (Long-haul-
+    Layover-Fall, dort ist sie immer richtig). Ehrlich: None statt geraten."""
+    fn = (flight_no or '').replace(' ', '').upper().strip()
+    dep = _norm_iata(dep_iata)
+    arr = _norm_iata(arr_iata)
+    d = (date or '').strip()[:10]
+    sb = _life_app('sb')
+    if sb is None or not dep or not arr or len(fn) < 3 or not d:
+        return None
+    carrier = fn[:2]
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        d0 = _dt.strptime(d, '%Y-%m-%d')
+        days = [(d0 - _td(days=1)).strftime('%Y-%m-%d'), d]
+    except Exception:
+        days = [d]
+    try:
+        r = (sb.table('airport_delay_obs').select('*')
+             .eq('airport', arr).eq('dest_iata', dep)
+             .in_('date', days)
+             .order('date', desc=True).order('sched', desc=True)
+             .limit(40).execute())
+        rows = r.data or []
+    except Exception:
+        rows = []
+    for row in rows:
+        rfn = (row.get('flight') or '').replace(' ', '').upper()
+        if not rfn.startswith(carrier) or rfn == fn:
+            continue
+        if not (row.get('reg') or '').strip():
+            continue
+        if row.get('cancelled') is True:
+            continue
+        if my_dep_utc is not None:
+            # Abflug der Rotation (station-lokal an arr_iata) → UTC; muss VOR
+            # meinem eigenen Abflug liegen. Unparsbar ⇒ Kandidat überspringen
+            # (lieber nichts behaupten als die falsche Maschine).
+            rot_dep = _local_to_utc(
+                f"{row.get('date')}T{(row.get('sched') or '')}:00", arr)
+            if rot_dep is None or rot_dep >= my_dep_utc:
+                continue
+        return row
+    return None
+
+
+def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
+                         arr_iata=None, my_dep_utc=None):
     """KERN-Trick (#1): (a) welche Maschine ist meinem Abflug zugeteilt (Reg aus
     Warehouse/Live-Board des Abflugs, gratis); (b) wo ist dieselbe Reg GERADE —
     ist ihre aktuelle Live-Route → dep_iata, ist das der Zubringer; (c) dessen
@@ -3274,6 +3331,19 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None):
         ac_type = ac_type or _sb_tc
     if not reg:
         reg = (str(reg_hint or '').strip().upper() or None)
+    #   4) Außenstations-Rotation (Owner 2026-07-07): Abflughafen ungepollt +
+    #      Roster ohne Tail → die Gegenroute der Homebase kennt die Maschine
+    #      (heutige LH716 FRA→HND = mein LH717-Flieger morgen). Nur mit
+    #      arr_iata (neuer Client schickt es mit) — sonst wie bisher.
+    rot_row = None
+    if not reg and arr_iata:
+        rot_row = _rotation_positioning_row(flight_no, date, dep, arr_iata,
+                                            my_dep_utc=my_dep_utc)
+        if rot_row is not None:
+            reg = ((rot_row.get('reg') or '').strip().upper() or None)
+            if not ac_type:
+                ac_type = ((rot_row.get('type_code') or '').strip().upper()
+                           or None)
     sched_dep = (my or {}).get('sched_dep')
     if reg and not ac_type:
         # Typecode gratis aus der gebackenen aircraft-DB (für den Turnaround-Puffer).
@@ -3310,6 +3380,16 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None):
             inbound_origin = src
             if cs:
                 inbound_fn = _callsign_to_iata_flightno(cs) or cs
+    if not inbound_origin and rot_row is not None:
+        # Rotations-Fallback (Owner 2026-07-07): weder Ankunfts-Board (Außen-
+        # station ungepollt) noch Live-Route (Maschine steht noch an der
+        # Homebase) kennen den Zubringer — aber die Gegenroute-Row IST er:
+        # sie startet an arr_iata (Homebase) und landet an meinem Abflughafen.
+        # Herkunft = Homebase; Zeiten NICHT aus der Row (sched/esti dort sind
+        # ABFLUG-Zeiten, keine Ankunft an dep — nichts erfinden, der
+        # Dual-Side-Resolver unten liefert die Ankunft, wenn er sie kennt).
+        inbound_fn = (rot_row.get('flight') or '').replace(' ', '').upper() or None
+        inbound_origin = _norm_iata(arr_iata)
     if not inbound_origin:
         # Zubringer (noch) nicht eindeutig bestimmbar → ehrlich null lassen.
         return chain, forecast, my
@@ -3386,13 +3466,32 @@ def ax_flight_inbound_chain(token):
     date = (request.args.get('date') or '').strip()[:10] or None
     dep_iata = _norm_iata(request.args.get('dep_iata'))
     reg_hint = (request.args.get('reg') or '').strip().upper() or None
+    # Optional (neuer Client, Owner 2026-07-07): eigenes Ziel + eigener Roster-
+    # Abflug (UTC-ISO aus ical_sectors) → schaltet den Außenstations-Rotations-
+    # Tier frei (Gegenroute arr_iata→dep_iata) und wählt dort die Maschine,
+    # die VOR dem eigenen Abflug Richtung Außenstation startet.
+    arr_iata = _norm_iata(request.args.get('arr_iata'))
+    my_dep_utc = None
+    dep_iso = (request.args.get('dep_iso') or '').strip()
+    if dep_iso:
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            my_dep_utc = _dt.fromisoformat(dep_iso.replace('Z', '+00:00'))
+            if my_dep_utc.tzinfo is None:
+                my_dep_utc = my_dep_utc.replace(tzinfo=_tz.utc)
+            my_dep_utc = my_dep_utc.astimezone(_tz.utc)
+        except Exception:
+            my_dep_utc = None
     if len(flight_no) < 3 or not dep_iata:
         return jsonify({'ok': False, 'error': 'need_flight_no_and_dep_iata'}), 400
-    mkey = ('chain', flight_no, date or '', dep_iata, reg_hint or '')
+    mkey = ('chain', flight_no, date or '', dep_iata, reg_hint or '',
+            arr_iata or '', dep_iso)
     memo = _memo_get(mkey)
     if memo is not None:
         return jsonify(memo)
-    chain, forecast, _my = _build_inbound_chain(flight_no, date, dep_iata, reg_hint)
+    chain, forecast, _my = _build_inbound_chain(
+        flight_no, date, dep_iata, reg_hint,
+        arr_iata=arr_iata, my_dep_utc=my_dep_utc)
     payload = {
         'ok': True, 'flight': flight_no, 'date': date, 'dep_iata': dep_iata,
         **chain, 'dep_delay_forecast': forecast,
