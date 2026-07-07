@@ -719,6 +719,12 @@ def _flying_live_fix(chain, datum, fns, legs_live, now=None):
             return None
         if (time.time() - fix['ts']) > _LIVE_FIX_MAX_AGE_S:
             return None   # Beobachtung zu alt — ehrlich keine Live-Position
+        # Aktives Leg (Callsign + dep/arr) anhängen → erlaubt dem Aufrufer den
+        # fr24_grpc-Routen-Confirm DIESES Legs mit der Live-Position.
+        fix = dict(fix)
+        fix['callsign'] = fns[idx]
+        fix['leg_dep'] = chain[idx]
+        fix['leg_arr'] = chain[idx + 1]
         return fix
     except Exception as e:
         _log().info(f'[family-watch] live_fix_skip {type(e).__name__}')
@@ -1081,6 +1087,24 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                 status['live_ts_iso'] = _iso_utc_z(_dt.datetime.fromtimestamp(
                     _fix['ts'], _dt.timezone.utc))
                 status['live_source'] = _fix['source']
+                # LIVE-BESTÄTIGTES aktuelles Leg (fr24_grpc per-flight, free-only):
+                # überschreibt today_dep/arr mit der WIRKLICH gerade geflogenen
+                # Strecke (diversion-fest, 10/10 verifiziert), Tour-Label bleibt.
+                # Nur mit Position + aktivem Callsign → fr24_grpc-Tier greift.
+                _cs = _fix.get('callsign')
+                if _cs:
+                    try:
+                        from blueprints.warehouse_reader import route_for_flight
+                        _lr = route_for_flight(callsign=_cs, lat=_fix.get('lat'),
+                                               lon=_fix.get('lon'), track=_fix.get('track'),
+                                               gs=_fix.get('speed_kt'), allow_paid=False)
+                    except Exception:
+                        _lr = None
+                    if _lr and _lr.get('source') == 'fr24_grpc' and _lr.get('src') and _lr.get('dst'):
+                        status['today_dep_iata'] = _lr['src']
+                        status['today_arr_iata'] = _lr['dst']
+                        status['today_dep_city'] = _iata_city_name(_lr['src'])
+                        status['today_arr_city'] = _iata_city_name(_lr['dst'])
     if 'layover_place' in allowed_fields:
         status['layover_place'] = roster_layover
         status['layover_place_city'] = (_iata_city_name(roster_layover)

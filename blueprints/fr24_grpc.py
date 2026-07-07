@@ -53,6 +53,57 @@ def available():
     return _lib_ok
 
 
+# ── Skalierungs-Schutz: Token-Bucket + Circuit-Breaker (pro Prozess) ──────────
+# Kappt den FR24-gRPC-Fußabdruck UNSERER EINEN IP unabhängig von der Nutzerzahl
+# („mehr User ⇒ höheres Flag-Risiko"): max N Calls/Min; nach K aufeinanderfolgenden
+# Leer-Antworten (Soft-Block-Verdacht) Freeze → Resolver fällt sauber auf ADS-B/
+# Cache zurück, keine Salve gegen FR24. Pro gunicorn-Worker (Prozess) — Gesamt-Cap
+# = Worker × Limit, weiterhin beschränkt und far unter jeder Flag-Schwelle.
+import threading
+_RATE_LOCK = threading.Lock()
+_MAX_PER_MIN = int(os.environ.get("FR24_GRPC_MAX_PER_MIN", "90"))
+_FREEZE_S = float(os.environ.get("FR24_GRPC_FREEZE_S", "300"))
+_EMPTY_TRIP = int(os.environ.get("FR24_GRPC_EMPTY_TRIP", "8"))
+_rate = None  # lazy init (kein time.time() bei Import)
+
+
+def _allow_call():
+    """False → Aufrufer überspringt fr24_grpc (Fallback ADS-B/Cache)."""
+    import time as _t
+    global _rate
+    now = _t.time()
+    with _RATE_LOCK:
+        if _rate is None:
+            _rate = {"tokens": float(_MAX_PER_MIN), "last": now,
+                     "frozen_until": 0.0, "empties": 0}
+        if now < _rate["frozen_until"]:
+            return False
+        _rate["tokens"] = min(_MAX_PER_MIN,
+                              _rate["tokens"] + (now - _rate["last"]) * (_MAX_PER_MIN / 60.0))
+        _rate["last"] = now
+        if _rate["tokens"] < 1.0:
+            return False
+        _rate["tokens"] -= 1.0
+        return True
+
+
+def _note_result(got_data):
+    """Circuit-Breaker: K Leer-Antworten in Folge ⇒ Freeze (Soft-Block-Schutz)."""
+    import time as _t
+    with _RATE_LOCK:
+        if _rate is None:
+            return
+        if got_data:
+            _rate["empties"] = 0
+        else:
+            _rate["empties"] += 1
+            if _rate["empties"] >= _EMPTY_TRIP:
+                _rate["frozen_until"] = _t.time() + _FREEZE_S
+                _rate["empties"] = 0
+                log.warning("fr24_grpc circuit-breaker: %s Leer-Antworten → Freeze %ss",
+                            _EMPTY_TRIP, _FREEZE_S)
+
+
 # ── Provider-Registry (Egress-Diversität) ─────────────────────────────────────
 # v1: nur 'direct' (eigene Prozess-IP = Cloud-Run-DC, verifiziert). Weitere
 # Provider (cloudflare/nas/oracle) hängen sich als custom httpx-Transport hier
@@ -148,6 +199,8 @@ def resolve_route_live(callsign=None, hex=None, reg=None, lat=None, lon=None):
     None. Failover über alle konfigurierten Provider."""
     if not available() or lat is None or lon is None:
         return None
+    if not _allow_call():
+        return None
     for provider in _providers():
         try:
             row = _run(_livefeed_row_async(provider, callsign, reg, lat, lon))
@@ -156,7 +209,9 @@ def resolve_route_live(callsign=None, hex=None, reg=None, lat=None, lon=None):
             row = None
         route = _row_to_route(row)
         if route:
+            _note_result(True)
             return route
+    _note_result(False)
     return None
 
 
@@ -181,6 +236,8 @@ def tap_detail(callsign=None, hex=None, reg=None, lat=None, lon=None):
     """Rohdaten für die reiche Karte: {row, detail}. Normalisierung → #32."""
     if not available() or lat is None or lon is None:
         return None
+    if not _allow_call():
+        return None
     for provider in _providers():
         try:
             out = _run(_tap_detail_async(provider, callsign, reg, lat, lon))
@@ -188,7 +245,9 @@ def tap_detail(callsign=None, hex=None, reg=None, lat=None, lon=None):
             log.warning("fr24_grpc detail provider=%s fehlgeschlagen: %s", provider, e)
             out = None
         if out:
+            _note_result(True)
             return out
+    _note_result(False)
     return None
 
 
@@ -279,6 +338,8 @@ def area(north, south, west, east, limit=1500):
     limit=1500 → sonst gröber tilen). Ozean-Boxen sind dünn → eine reicht."""
     if not available():
         return []
+    if not _allow_call():
+        return []
     for provider in _providers():
         try:
             rows = _run(_area_async(provider, north, south, west, east, limit))
@@ -288,5 +349,7 @@ def area(north, south, west, east, limit=1500):
         if rows:
             out = [p for p in (_row_to_pos(r) for r in rows) if p]
             if out:
+                _note_result(True)
                 return out
+    _note_result(False)
     return []
