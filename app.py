@@ -29828,6 +29828,13 @@ def aircraft_by_reg(token):
                 out['inbound_from_icao'] = fl['est_departure_icao']
             out['flight'] = _by_reg_legacy_flight(out, fl)
             _by_reg_board_enrich(out, fl)   # Dual-Side-Board additiv (out['board'])
+            # fr24-BACKUP für das ECHTE Ziel: kennt das Warehouse den aktuellen Flug
+            # nicht (Out-of-Network / Reg nicht gescrapt), holt fr24 ihn über die
+            # gerade aufgelöste Live-Position — „Dein Flieger ist auf dem Weg nach X".
+            if not out.get('current_flight') and not on_ground:
+                cs_live = (str(row[1]).strip() if len(row) > 1 and row[1] else None)
+                out['current_flight'] = _fr24_current_flight_for_reg(
+                    reg, hex_id, cs_live, lat, lon)
             return jsonify(out), 200
 
     # ── Tier 2: Letzter/aktueller Flug (historisch, keine ETA) ──
@@ -30020,6 +30027,44 @@ def _warehouse_latest_flight_for_reg(reg):
         }
     except Exception:
         return None
+
+
+def _fr24_current_flight_for_reg(reg, hex_id, callsign, lat, lon):
+    """fr24-BACKUP (Owner 2026-07-07 „fr24 nur als Backup"): kennt das Warehouse den
+    aktuellen Flug DIESES Tails NICHT (Out-of-Network-Leg wie HND→GRU, Reg nicht
+    gescrapt), holt fr24 über die bereits aufgelöste LIVE-POSITION (lat/lon aus
+    OpenSky) die ECHTE Route (dep→dest) — auch über Russland/Ozean/Asien. Nur mit
+    Position (fr24-Live-Feed ist area-basiert). Returns dict | None.
+    """
+    if lat is None or lon is None:
+        return None
+    try:
+        from blueprints import fr24_grpc
+        g = fr24_grpc.resolve_route_live(callsign=callsign, hex=hex_id, reg=reg,
+                                         lat=lat, lon=lon)
+    except Exception:
+        g = None
+    if not g:
+        return None
+    dep = (g.get('src') or '').strip().upper() or None
+    dest = (g.get('dst') or '').strip().upper() or None
+    if not dest:
+        return None
+    dest_name = None
+    try:
+        from blueprints.aerox_data_blueprint import _iata_city_name
+        dest_name = _iata_city_name(dest)
+    except Exception:
+        dest_name = None
+    return {
+        'dep_iata': dep,
+        'dest_iata': dest,
+        'dest_name': dest_name,
+        'flight': (g.get('flight_number') or callsign or '').strip().upper() or None,
+        'sched': None, 'esti': None, 'status': None,
+        'delay_min': None, 'cancelled': False, 'date': None,
+        'source': 'fr24',
+    }
 
 
 # Fraport-Status-Strings, die "annulliert/gestrichen" bedeuten.
