@@ -303,6 +303,23 @@ def incoming_statuses(crew_token):
     return jsonify({'ok': True, 'statuses': out, 'count': len(out)})
 
 
+def _notify_family_of_reaction(family_token, emoji):
+    """Best-effort Push an die Familie, dass die Crew reagiert hat. No-op wenn
+    kein Family-Push registriert ist (die Reaktion steckt ohnehin in der Family-
+    Status-Response → beim nächsten Öffnen sichtbar)."""
+    if not family_token:
+        return
+    try:
+        from app import _send_push_notification
+        _send_push_notification(
+            family_token,
+            title='Antwort von der Crew',
+            body=f'{emoji} auf deine Nachricht',
+            data={'type': 'family_reaction', 'emoji': emoji})
+    except Exception as e:
+        _log().info(f'[feed-status] react_push_skip {type(e).__name__}')
+
+
 @feed_status_bp.route('/api/feed-status/<crew_token>/react', methods=['POST'])
 def react_to_status(crew_token):
     """Crew schickt eine Reaktion (z. B. ❤️) auf eine Family-Nachricht zurück.
@@ -322,6 +339,15 @@ def react_to_status(crew_token):
             if created_at:
                 q = q.eq('created_at', created_at)
             q.execute()
+            # Family-Token server-seitig ermitteln (NICHT an die Crew geleakt) → Push.
+            try:
+                sel = sb.table('feed_statuses').select('family_token').eq('crew_token', crew_token)
+                if created_at:
+                    sel = sel.eq('created_at', created_at)
+                _rows = (sel.limit(1).execute()).data or []
+                _notify_family_of_reaction(_rows[0].get('family_token') if _rows else None, emoji)
+            except Exception:
+                pass
             return jsonify({'ok': True, 'reaction': emoji})
         except Exception as e:
             _log().info(f'[feed-status] react_skip {type(e).__name__}')
@@ -344,6 +370,7 @@ def react_to_status(crew_token):
             rec['reaction'] = emoji
             rec['reacted_at'] = now
             _atomic_write_json(p, rec)
+            _notify_family_of_reaction(rec.get('family_token'), emoji)
     except Exception:
         pass
     return jsonify({'ok': True, 'reaction': emoji})
