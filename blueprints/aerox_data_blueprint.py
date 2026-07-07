@@ -296,7 +296,7 @@ def _route_from_warehouse(hexid=None, reg=None):
     return None
 
 
-def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=25):
+def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=35):
     """Positions-Snapshot aus dem NAS-Harvester-Store (Supabase `aircraft_live`,
     gefüllt via FR24-**gRPC** — sieht AUCH über Russland/Ozean, wo freies ADS-B
     blind ist). Owner-Idee 2026-07-08: „geht ein Flug offline, simulieren wir aus
