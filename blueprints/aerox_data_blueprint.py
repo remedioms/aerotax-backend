@@ -296,6 +296,48 @@ def _route_from_warehouse(hexid=None, reg=None):
     return None
 
 
+def _aircraft_live_pos_for_reg(reg, dep=None, max_age_min=25):
+    """Positions-Snapshot aus dem NAS-Harvester-Store (Supabase `aircraft_live`,
+    reg-keyed, gefüllt via FR24-**gRPC** — sieht AUCH über Russland/Ozean, wo
+    freies ADS-B blind ist). Owner-Idee 2026-07-08: „geht ein Flug offline,
+    simulieren wir aus dem letzten gespeicherten Snapshot". BILLIGER Supabase-Read
+    → als Positions-Tier VOR dem on-demand-FR24-Korridor (ein gRPC-Call).
+
+    reg wird normalisiert (ohne Bindestrich). Route-konsistent: gibt es `dep`, muss
+    der gespeicherte Ziel-Airport == dep sein (sonst fliegt der Tail einen anderen
+    Leg → Position verwerfen, wie im on-demand-Pfad). Nur frische Snapshots
+    (< max_age_min). Rückgabe: (pos, (src,dst)) | (None, None). pos hat dieselben
+    Keys wie iOS AXLifecycleLive erwartet (lat/lon/track/gs/alt/on_ground)."""
+    sb = _sb()
+    rn = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
+    if sb is None or not rn:
+        return None, None
+    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                           time.gmtime(time.time() - max_age_min * 60))
+    try:
+        rows = (sb.table('aircraft_live')
+                  .select('lat,lon,track,gs_kt,alt_ft,origin,dest,on_ground,seen_ts')
+                  .eq('reg', rn).gt('updated_at', cutoff).limit(1).execute()).data or []
+    except Exception:
+        return None, None
+    if not rows:
+        return None, None
+    r = rows[0]
+    if r.get('lat') is None or r.get('lon') is None:
+        return None, None
+    src = (r.get('origin') or '').strip().upper() or None
+    dst = (r.get('dest') or '').strip().upper() or None
+    if dep and dst and dst != _norm_iata(dep):
+        return None, None                       # anderer Leg → verwerfen
+    pos = {
+        'lat': r.get('lat'), 'lon': r.get('lon'),
+        'track': r.get('track'), 'gs': r.get('gs_kt'), 'alt': r.get('alt_ft'),
+        'on_ground': bool(r.get('on_ground')),
+        'source': 'aircraft_live', 'seen_ts': r.get('seen_ts'),
+    }
+    return pos, (src, dst)
+
+
 def _route_from_fr24(callsign=None, hexid=None):
     """GRATIS-Route aus dem verteilten FR24-Store (`fr24_live`, gleiche Supabase;
     gefüllt vom NAS-Harvester). feed.js trägt Start/Ziel (IATA) pro Flieger →
@@ -3473,6 +3515,17 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
                 # verfälschen. Fehlt FR24-sched ⇒ sched ehrlich null (iOS
                 # zeigt ohnehin nur EINE Zeit: est bevorzugt).
                 chain['inbound_sched_arr'] = _fr_sa
+
+    # NAS-Harvester-Snapshot-Tier (Owner-Idee 2026-07-08 „Supabase-Speicher der
+    # Live-Map"): freshester FR24-gRPC-Snapshot dieses Tails aus `aircraft_live` —
+    # BILLIGER Supabase-Read, sieht über Russland/Ozean, route-konsistent. Füllt die
+    # Live-Position, BEVOR wir einen on-demand-gRPC-Korridor-Call machen. Der
+    # Korridor unten greift dann nur noch, wenn der Snapshot alt/leer ist ODER die
+    # Ankunftszeit noch fehlt.
+    if reg and inbound_origin and not chain['inbound_live']:
+        _snap_pos, _snap_route = _aircraft_live_pos_for_reg(reg, dep=dep)
+        if _snap_pos and not _snap_pos.get('on_ground'):
+            chain['inbound_live'] = _snap_pos
 
     # FR24-gRPC KORRIDOR-Nachschlag (Owner-Durchbruch 2026-07-08 „haben doch eine
     # website die über Russland/Ozean liefert"): über Sibirien/Ozean ist FREIES

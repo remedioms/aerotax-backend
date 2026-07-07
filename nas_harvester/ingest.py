@@ -1,0 +1,305 @@
+"""
+fr24-ingest v2 — FR24-**gRPC**-Positions-Harvester für die Synology-NAS.
+
+WARUM NEU (Owner 2026-07-08): die v1 nutzte den feed.js-HTTP-Endpoint — der wird
+von FR24 auf der NAS-Residential-IP SOFT-GEBLOCKT (200 mit nur full_count, 0 ac →
+Dauer-Freeze, 24 h lang 0 Zeilen). Der gRPC-LiveFeed (AWS-ELB) umgeht genau diesen
+Block (derselbe Durchbruch wie im Backend, blueprints/fr24_grpc.py) und liefert
+Position + Route + Reg + Typ pro Flug in einem Bulk-Call pro Kachel.
+
+Aufgabe: round-robin über Korridor-Kacheln (Russland/Ozean-Löcher + Europa),
+FR24-gRPC live_feed je Kachel, filter auf LH-Group + deutsche Carrier (Callsign-
+Prefix), upsert last-known Position/Route pro Airframe → Supabase `aircraft_live`
+(reg-keyed). RAM-only (tmpfs /tmp Heartbeat) — kein NAS-Disk-Write (HDDs schlafen);
+der durable Store IST Supabase. Das Backend liest den freshesten Snapshot, wenn
+freies ADS-B blind ist (über Russland/Ozean) → iOS simuliert von dort vorwärts.
+
+Abhängigkeiten: fr24 (gRPC-Client) + httpx (Supabase-PostgREST). Alles via Env.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import random
+import signal
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import httpx
+
+log = logging.getLogger("fr24-ingest")
+
+
+# --------------------------------------------------------------------------- #
+# Konfiguration
+# --------------------------------------------------------------------------- #
+# Korridor-Kacheln (lat_n, lat_s, lon_w, lon_e). 0-7 = ADS-B-Coverage-Löcher
+# (Russland/Sibirien/Ozeane/Naher Osten — dort ist freies ADS-B blind, FR24 die
+# EINZIGE Quelle). 8-14 = Europa (dichter LH-Group-Verkehr, Route/Tail-Anreicherung).
+_DEFAULT_TILES = [
+    (55, 20, 55, 110), (72, 45, 55, 140), (55, 20, 110, 145), (45, 8, 30, 65),
+    (35, -10, 60, 100), (72, 35, -60, -10), (60, 15, 140, 180), (40, -40, -25, 55),
+    (60, 48, -11, 3), (52, 42, -3, 10), (56, 45, 9, 20), (72, 55, 4, 32),
+    (45, 35, -10, 5), (47, 35, 6, 30), (52, 44, 20, 40),
+]
+
+# LH Group + deutsche Carrier (ICAO-3-Letter-Callsign-Prefix). Owner-Scope
+# 2026-07-08 „+ Deutsche Carrier". Erweiterbar via CARRIER_PREFIXES-Env.
+_DEFAULT_PREFIXES = {
+    "DLH",  # Lufthansa
+    "CLH",  # Lufthansa CityLine
+    "GEC",  # Lufthansa Cargo
+    "EWG",  # Eurowings
+    "EWE",  # Eurowings Europe
+    "OCN",  # Discover Airlines (ex Ocean)
+    "AUA",  # Austrian
+    "SWR",  # Swiss
+    "EDW",  # Edelweiss
+    "BEL",  # Brussels Airlines
+    "DLA",  # Air Dolomiti
+    "SXS",  # SunExpress (LH JV)
+    "BOX",  # AeroLogic (LH/DHL)
+    "CFG",  # Condor
+    "TUI",  # TUIfly
+    "TFL",  # (TUIfly hist.)
+}
+
+
+def _parse_tiles(raw: str) -> list[tuple]:
+    raw = (raw or "all").strip().lower()
+    if raw in ("all", "*", ""):
+        return list(_DEFAULT_TILES)
+    idxs = [int(x) for x in raw.replace(";", ",").split(",")
+            if x.strip().isdigit() and 0 <= int(x) < len(_DEFAULT_TILES)]
+    return [_DEFAULT_TILES[i] for i in idxs] or list(_DEFAULT_TILES)
+
+
+def _parse_prefixes(raw: str) -> set:
+    raw = (raw or "").strip().upper()
+    if not raw:
+        return set(_DEFAULT_PREFIXES)
+    if raw in ("ALL", "*"):
+        return set()   # leer = kein Filter (ALLE Carrier)
+    return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip()}
+
+
+@dataclass(frozen=True)
+class Settings:
+    supabase_url: str = os.getenv("SUPABASE_URL", "https://jyrbijvmwacuivssbxlg.supabase.co")
+    supabase_key: str = os.getenv("SUPABASE_KEY", "")
+    table: str = os.getenv("TABLE", "aircraft_live")
+
+    tiles: list = field(default_factory=lambda: _parse_tiles(os.getenv("TILES", "all")))
+    prefixes: set = field(default_factory=lambda: _parse_prefixes(os.getenv("CARRIER_PREFIXES", "")))
+
+    # Kadenz: eine Kachel pro poll_interval. 60s × 15 ≈ 11 min/Voll-Sweep — der
+    # gRPC-Endpoint ist NICHT geblockt, aber wir bleiben höflich/unauffällig.
+    poll_interval: float = float(os.getenv("POLL_INTERVAL_S", "60"))
+    fetch_limit: int = int(os.getenv("FETCH_LIMIT", "1500"))
+    fetch_timeout: float = float(os.getenv("FETCH_TIMEOUT_S", "12"))
+
+    # Prune: Snapshots älter als prune_age fliegen raus (der Flug ist längst gelandet).
+    prune_interval: float = float(os.getenv("PRUNE_INTERVAL_S", "1800"))
+    prune_age: float = float(os.getenv("PRUNE_AGE_S", "10800"))     # 3 h
+
+    backoff_base: float = float(os.getenv("BACKOFF_BASE_S", "30"))
+    backoff_cap: float = float(os.getenv("BACKOFF_CAP_S", "900"))
+
+    heartbeat_file: str = os.getenv("HEARTBEAT_FILE", "/tmp/heartbeat")
+    summary_interval: float = float(os.getenv("SUMMARY_INTERVAL_S", "1800"))
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _n(v):
+    try:
+        f = float(v)
+        return f if f == f else None   # NaN raus
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_reg(reg) -> str | None:
+    r = (str(reg or "").strip().upper().replace("-", "").replace(" ", ""))
+    return r or None
+
+
+def decorrelated_jitter(prev: float, base: float, cap: float) -> float:
+    return min(cap, random.uniform(base, max(base, prev * 3)))
+
+
+# --------------------------------------------------------------------------- #
+# FR24-gRPC-Tile-Fetch → normalisierte Snapshot-Zeilen
+# --------------------------------------------------------------------------- #
+async def _fetch_tile(fr24, tile: tuple, s: Settings) -> list[dict]:
+    """Ein gRPC live_feed-Call über einer Kachel → Liste roher Flug-Dicts."""
+    from fr24 import BoundingBox
+    n, so, w, e = tile
+    box = BoundingBox(north=float(n), south=float(so), west=float(w), east=float(e))
+    res = await asyncio.wait_for(
+        fr24.live_feed.fetch(box, limit=s.fetch_limit), timeout=s.fetch_timeout)
+    d = res.to_dict()
+    return d.get("flights_list") or d.get("flights") or []
+
+
+def _flight_to_snapshot(fl: dict, prefixes: set) -> dict | None:
+    """FR24-gRPC-Flug → aircraft_live-Zeile. None wenn kein Reg / kein Carrier-Match."""
+    xi = fl.get("extra_info") or {}
+    reg = _norm_reg(xi.get("reg"))
+    if not reg:
+        return None
+    cs = (str(fl.get("callsign") or "").strip().upper()) or None
+    # Carrier-Filter: leerer prefixes-Set = alle. Sonst Callsign-Prefix (3 Buchst.).
+    if prefixes and (not cs or cs[:3] not in prefixes):
+        return None
+    route = xi.get("route") or {}
+    lat, lon = _n(fl.get("lat")), _n(fl.get("lon"))
+    if lat is None or lon is None:
+        return None
+    alt_ft = _n(fl.get("alt"))
+    ts = _n(fl.get("timestamp"))
+    seen_iso = (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts)) if ts else None)
+    return {
+        "reg": reg,
+        "reg_display": (str(xi.get("reg") or "").strip().upper() or None),
+        "callsign": cs,
+        "flight": (str(xi.get("flight") or "").strip().upper() or None),
+        "lat": lat, "lon": lon,
+        "track": _n(fl.get("track")),
+        "gs_kt": _n(fl.get("speed")),
+        "alt_ft": alt_ft,
+        "origin": (str(route.get("from") or "").strip().upper() or None),
+        "dest": (str(route.get("to") or "").strip().upper() or None),
+        "ac_type": (str(xi.get("type") or "").strip().upper() or None),
+        "flightid": (int(fl["flightid"]) if str(fl.get("flightid") or "").isdigit() else None),
+        "on_ground": bool(alt_ft is not None and alt_ft < 50),
+        "source": "fr24_grpc",
+        "seen_ts": seen_iso,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Service
+# --------------------------------------------------------------------------- #
+class Ingest:
+    def __init__(self, s: Settings) -> None:
+        self._s = s
+        self._tile_idx = 0
+        self._stop = asyncio.Event()
+        self._win_rows = 0
+        self._win_start = time.monotonic()
+        self._last_prune = 0.0
+        self._sb = httpx.AsyncClient(
+            base_url=s.supabase_url,
+            headers={"apikey": s.supabase_key,
+                     "Authorization": f"Bearer {s.supabase_key}"},
+            timeout=httpx.Timeout(15.0, connect=6.0),
+            limits=httpx.Limits(max_connections=4, keepalive_expiry=120))
+
+    async def close(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._sb.aclose()
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    async def _upsert(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        for r in rows:
+            r["updated_at"] = now_iso
+        r = await self._sb.post(
+            f"/rest/v1/{self._s.table}?on_conflict=reg",
+            content=json.dumps(rows),
+            headers={"Content-Type": "application/json",
+                     "Prefer": "resolution=merge-duplicates,return=minimal"})
+        r.raise_for_status()
+        return len(rows)
+
+    async def _prune(self) -> None:
+        cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                               time.gmtime(time.time() - self._s.prune_age))
+        with contextlib.suppress(Exception):
+            await self._sb.delete(f"/rest/v1/{self._s.table}?updated_at=lt.{cutoff}",
+                                  headers={"Prefer": "return=minimal"})
+
+    async def _poll_once(self, fr24) -> None:
+        idx = self._tile_idx
+        self._tile_idx = (idx + 1) % len(self._s.tiles)
+        tile = self._s.tiles[idx]
+        flights = await _fetch_tile(fr24, tile, self._s)
+        rows, seen = [], set()
+        for fl in flights:
+            snap = _flight_to_snapshot(fl, self._s.prefixes)
+            if snap and snap["reg"] not in seen:
+                seen.add(snap["reg"])
+                rows.append(snap)
+        n_up = await self._upsert(rows)
+        self._win_rows += n_up
+        log.debug("tile%d flights=%d matched=%d upserted=%d", idx, len(flights), len(rows), n_up)
+
+    async def run(self) -> None:
+        from fr24 import FR24
+        Path(self._s.heartbeat_file).touch()
+        backoff = self._s.backoff_base
+        log.info("fr24-ingest v2 (gRPC) gestartet — %d Kacheln, %d Carrier-Prefixe, poll=%.0fs",
+                 len(self._s.tiles), len(self._s.prefixes) or 0, self._s.poll_interval)
+        # EIN FR24-gRPC-Client über die ganze Container-Lebensdauer (TCP/TLS-Reuse).
+        async with FR24() as fr24:
+            while not self._stop.is_set():
+                try:
+                    await self._poll_once(fr24)
+                    backoff = self._s.backoff_base          # Erfolg → Backoff-Reset
+                    Path(self._s.heartbeat_file).touch()
+                    if time.monotonic() - self._last_prune > self._s.prune_interval:
+                        await self._prune()
+                        self._last_prune = time.monotonic()
+                    if time.monotonic() - self._win_start > self._s.summary_interval:
+                        log.info("summary: %d Zeilen upserted in letzten %.0fmin",
+                                 self._win_rows, self._s.summary_interval / 60)
+                        self._win_rows = 0
+                        self._win_start = time.monotonic()
+                    sleep_s = self._s.poll_interval
+                except asyncio.TimeoutError:
+                    log.warning("tile-fetch timeout → backoff %.0fs", backoff)
+                    sleep_s = backoff
+                    backoff = decorrelated_jitter(backoff, self._s.backoff_base, self._s.backoff_cap)
+                except Exception as ex:
+                    log.warning("poll-Fehler: %s → backoff %.0fs", ex, backoff)
+                    sleep_s = backoff
+                    backoff = decorrelated_jitter(backoff, self._s.backoff_base, self._s.backoff_cap)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._stop.wait(),
+                                           timeout=sleep_s + random.uniform(0, 2))
+
+
+async def _amain() -> None:
+    s = Settings()
+    logging.basicConfig(level=getattr(logging, s.log_level.upper(), logging.INFO),
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx-Request-Logs auf WARNING (sonst pro Poll INFO → NAS-Platten wach).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    if not s.supabase_key:
+        raise SystemExit("SUPABASE_KEY env fehlt")
+
+    ing = Ingest(s)
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, ing.request_stop)
+    try:
+        await ing.run()
+    finally:
+        await ing.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(_amain())
