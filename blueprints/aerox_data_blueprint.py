@@ -3579,6 +3579,23 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
                 if _snap_type:
                     ac_type = ac_type or _snap_type
                     chain['aircraft_type'] = chain.get('aircraft_type') or _snap_type
+            # SCHNELLE ETA aus dem Snapshot (gs + Großkreis-Reststrecke zum Ziel) —
+            # Owner 2026-07-08 „mach das so": ersetzt den teuren Korridor-ETA-Call
+            # über ungepollten Außenstationen. NUR wenn keine echte Board-ETA da ist
+            # (die gewinnt). Cruise-Extrapolation ohne Sink-/Wind-Modell → grob,
+            # daher KEINE Pünktlichkeits-Aussage (inbound_delay_min bleibt null,
+            # weil kein sched_arr). Besser eine Richtzeit als „Ankunftszeit offen".
+            if chain['inbound_est_arr'] is None and _snap_pos.get('gs'):
+                _dl = _iata_latlon((dep or '').upper())
+                if (_dl and None not in _dl
+                        and _snap_pos.get('lat') is not None and _snap_pos.get('lon') is not None):
+                    _rem_km = _gc_km(_snap_pos['lat'], _snap_pos['lon'], _dl[0], _dl[1])
+                    _gs = _snap_pos['gs']
+                    if _rem_km and _gs and _gs > 80:
+                        from datetime import datetime as _de, timedelta as _tde, timezone as _tze
+                        _eta = _de.now(_tze.utc) + _tde(hours=(_rem_km / 1.852) / _gs)
+                        chain['inbound_est_arr'] = _eta.isoformat()
+                        chain['inbound_est_estimated'] = True   # transparent: Richtzeit
 
     # FR24-gRPC KORRIDOR-Nachschlag (Owner-Durchbruch 2026-07-08 „haben doch eine
     # website die über Russland/Ozean liefert"): über Sibirien/Ozean ist FREIES
