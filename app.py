@@ -30038,18 +30038,35 @@ def _fr24_current_flight_for_reg(reg, hex_id, callsign, lat, lon):
     """
     if lat is None or lon is None:
         return None
+    # detail_card statt nur resolve_route_live: bringt neben der Route auch die
+    # echten Zeiten (Abflug + ANKUNFT/ETA + Status) → „Deine Maschine ist FRA→HND
+    # unterwegs, landet 08:30". Genau das simple Tail-Folgen, das der Owner will.
     try:
         from blueprints import fr24_grpc
-        g = fr24_grpc.resolve_route_live(callsign=callsign, hex=hex_id, reg=reg,
-                                         lat=lat, lon=lon)
+        c = fr24_grpc.detail_card(callsign=callsign, hex=hex_id, reg=reg,
+                                  lat=lat, lon=lon)
     except Exception:
-        g = None
-    if not g:
+        c = None
+    if not c:
         return None
-    dep = (g.get('src') or '').strip().upper() or None
-    dest = (g.get('dst') or '').strip().upper() or None
+    dep = (c.get('route_from') or '').strip().upper() or None
+    dest = (c.get('route_to') or '').strip().upper() or None
     if not dest:
         return None
+
+    def _time_iso(v):
+        """fr24-Zeit → UTC-ISO-Z. Zahl = Unix-Epoch → ISO; String = durchreichen."""
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            try:
+                import datetime as _d
+                return _d.datetime.utcfromtimestamp(int(v)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            except (ValueError, OSError, OverflowError):
+                return None
+        s = str(v).strip()
+        return s or None
+
     dest_name = None
     try:
         from blueprints.aerox_data_blueprint import _iata_city_name
@@ -30060,10 +30077,19 @@ def _fr24_current_flight_for_reg(reg, hex_id, callsign, lat, lon):
         'dep_iata': dep,
         'dest_iata': dest,
         'dest_name': dest_name,
-        'flight': (g.get('flight_number') or callsign or '').strip().upper() or None,
-        'sched': None, 'esti': None, 'status': None,
-        'delay_min': None, 'cancelled': False, 'date': None,
+        'flight': (c.get('flight_number') or callsign or '').strip().upper() or None,
+        # Abflug + ANKUNFT (echte fr24 schedule_info) → „landet HH:MM".
+        'dep_iso': _time_iso(c.get('actual_dep') or c.get('sched_dep')),
+        'arr_iso': _time_iso(c.get('eta') or c.get('sched_arr')),
+        'sched_arr_iso': _time_iso(c.get('sched_arr')),
+        'status': (c.get('flight_stage') or c.get('delay_status') or None),
+        'progress_pct': c.get('progress_pct'),
+        'ac_type': c.get('ac_type'),
+        'cancelled': False,
+        'date': None,
         'source': 'fr24',
+        # Warehouse-Schema-Kompat (dep-Zeiten liegen dort in sched/esti).
+        'sched': None, 'esti': None, 'delay_min': None,
     }
 
 
