@@ -11912,7 +11912,8 @@ def get_friends_today(token):
     """
     from datetime import date as _date
     import time as _time
-    from blueprints.aerox_data_blueprint import _route_label_cities, _iata_city_name
+    from blueprints.aerox_data_blueprint import (_route_label_cities, _iata_city_name,
+                                                 _aircraft_live_pos)
     datum = request.args.get('datum') or _date.today().isoformat()
     # TTL-Cache (Owner 2026-07-09 „warum dauert Wo-ist-Crew immer so lange"): die
     # Sektor-Kaskade unten macht pro Freund × Sektor sequenzielle _flight_obs_merged-
@@ -12101,6 +12102,21 @@ def get_friends_today(token):
                                            arr_iata=chain[idx + 1],
                                            free_only=True)
                     if m:
+                        # ECHTE Live-Position dieses Legs aus dem NAS-Harvester-Store
+                        # (aircraft_live/FR24-gRPC) — reale Süd-Route (LH meidet
+                        # Russland!). Owner 2026-07-09: Crew wurde sonst per Großkreis
+                        # ÜBER RUSSLAND simuliert (Basti/Miguel falsch). None ⇒ iOS
+                        # simuliert wie bisher. Endpoint ist gecacht → 1 Read/90s/Leg.
+                        _clp = None
+                        try:
+                            _cp, _cr, _crg, _cty = _aircraft_live_pos(
+                                flight=fno, dep=chain[idx + 1])
+                            if _cp and not _cp.get('on_ground'):
+                                _clp = {'lat': _cp.get('lat'), 'lon': _cp.get('lon'),
+                                        'track': _cp.get('track'), 'gs': _cp.get('gs'),
+                                        'alt': _cp.get('alt'), 'on_ground': False}
+                        except Exception:
+                            _clp = None
                         # est_*/sched_*: Board-Zeiten stehen in STATIONS-Ortszeit
                         # (dep mit airport_tz(from), arr mit airport_tz(to)) → hier
                         # genau EINMAL nach echt-UTC (…Z) wandeln, damit iOS sie wie
@@ -12127,6 +12143,7 @@ def get_friends_today(token):
                             'est_arr_iso': _board_local_to_utc_iso(
                                 m.get('esti_arr'), chain[idx + 1]),
                             'sides': m.get('sides'),
+                            'live': _clp,   # echte FR24-Position (Süd-Route) | None
                         })
         except Exception:
             flights_live = []
