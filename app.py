@@ -11901,14 +11901,27 @@ def _active_sector_flight_numbers(day):
         return []
 
 
+_FRIENDS_TODAY_MEMO = {}          # "token|datum" → (expires_monotonic, resp)
+_FRIENDS_TODAY_TTL = 90.0         # 90 s: Feed lädt sonst pro Aufruf N×M sequ. Board-Lookups
+
+
 @app.route('/api/user/friends-today/<token>', methods=['GET'])
 def get_friends_today(token):
     """OffBlock-Pattern: Was machen meine Friends HEUTE (oder an gegebenem Datum).
     Query: ?datum=YYYY-MM-DD (default today)
     """
     from datetime import date as _date
+    import time as _time
     from blueprints.aerox_data_blueprint import _route_label_cities, _iata_city_name
     datum = request.args.get('datum') or _date.today().isoformat()
+    # TTL-Cache (Owner 2026-07-09 „warum dauert Wo-ist-Crew immer so lange"): die
+    # Sektor-Kaskade unten macht pro Freund × Sektor sequenzielle _flight_obs_merged-
+    # Board-Lookups + Kalender-Refresh — jedes Feed-Laden neu = langsam. 90 s cachen.
+    _ck = f"{token}|{datum}"
+    _now_m = _time.monotonic()
+    _hit = _FRIENDS_TODAY_MEMO.get(_ck)
+    if _hit and _hit[0] > _now_m:
+        return jsonify(_hit[1])
     data = _friends_load(token)
     friends = data.get('friends') or []
     out = []
@@ -12163,7 +12176,11 @@ def get_friends_today(token):
             # nur den ADS-B-Callsign abzuleiten. Leer = keine Beobachtung.
             'flights_live': flights_live,
         })
-    return jsonify({'datum': datum, 'count': len(out), 'friends_today': out})
+    _resp = {'datum': datum, 'count': len(out), 'friends_today': out}
+    if len(_FRIENDS_TODAY_MEMO) > 5000:
+        _FRIENDS_TODAY_MEMO.clear()
+    _FRIENDS_TODAY_MEMO[_ck] = (_now_m + _FRIENDS_TODAY_TTL, _resp)
+    return jsonify(_resp)
 
 
 def _flight_ops_path(token):
