@@ -3833,6 +3833,21 @@ def ax_flight_live(token):
     src, dst = _route_endpoints(route)
     dep = src or _norm_iata((my or {}).get('dep_iata')) or q_dep or _norm_iata(sb_dep)
     dest = dst or _norm_iata((my or {}).get('arr_iata')) or q_arr or _norm_iata(sb_arr)
+    # Freies ADS-B ist über der SÜDROUTE (LH meidet russischen Luftraum!) und über
+    # Ozean oft blind → pos=None → die iOS-Karte hängt in „Dein Flug live wird
+    # geladen" und simuliert notfalls einen Großkreis ÜBER RUSSLAND (falsch, Owner
+    # 2026-07-09 „wir dürfen nicht mal über Russland fliegen"). Fallback: die ECHTE
+    # Position aus dem NAS-Harvester-Store (aircraft_live, FR24-gRPC) — sie liegt
+    # real auf der Südroute und kommt schnell (kein on-demand-gRPC-Call).
+    if pos is None or pos.get('on_ground'):
+        _snap, _srt, _sreg, _stype = _aircraft_live_pos(
+            reg=reg, flight=flight_no, dep=dest)
+        if _snap and not _snap.get('on_ground'):
+            pos = _snap
+            if _srt and _srt[0] and not src:
+                src2, dst2 = _srt
+                dep = dep or src2
+                dest = dest or dst2
     # Ankunfts-Seite (Zeiten/Delay/Gate) frisch für die konkrete Strecke.
     merged = (merged_fn(flight_no, date=date, dep_iata=dep, arr_iata=dest,
                         free_only=True) if merged_fn else None) or my or {}
