@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import random
+import re
 import signal
 import time
 from dataclasses import dataclass, field
@@ -92,6 +93,10 @@ class Settings:
     supabase_url: str = os.getenv("SUPABASE_URL", "https://jyrbijvmwacuivssbxlg.supabase.co")
     supabase_key: str = os.getenv("SUPABASE_KEY", "")
     table: str = os.getenv("TABLE", "aircraft_live")
+    # WRITE_SUPABASE=0 → RAM-only (Backend liest via HTTP-Tunnel, keine SB-Writes).
+    write_supabase: bool = os.getenv("WRITE_SUPABASE", "1") not in ("0", "false", "no", "")
+    http_port: int = int(os.getenv("HTTP_PORT", "8787"))
+    api_token: str = os.getenv("NAS_API_TOKEN", "")   # Bearer-Schutz des /pos-Endpoints
 
     tiles: list = field(default_factory=lambda: _parse_tiles(os.getenv("TILES", "all")))
     prefixes: set = field(default_factory=lambda: _parse_prefixes(os.getenv("CARRIER_PREFIXES", "")))
@@ -201,10 +206,19 @@ class Ingest:
                      "Authorization": f"Bearer {s.supabase_key}"},
             timeout=httpx.Timeout(15.0, connect=6.0),
             limits=httpx.Limits(max_connections=4, keepalive_expiry=120))
+        # RAM-Store (Owner 2026-07-08 „NAS only RAM, HDDs still"): letzter Snapshot
+        # pro Reg IM SPEICHER — kein NAS-Disk. Wird über einen winzigen HTTP-Endpoint
+        # serviert (via bestehenden cloudflared-Tunnel), damit das Backend von hier
+        # liest statt Supabase → spart Supabase-Disk-IO/Kosten. reg → (snap, mono_ts).
+        self._latest: dict[str, tuple] = {}
+        self._runner = None
 
     async def close(self) -> None:
         with contextlib.suppress(Exception):
             await self._sb.aclose()
+        if self._runner is not None:
+            with contextlib.suppress(Exception):
+                await self._runner.cleanup()
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -215,6 +229,8 @@ class Ingest:
         now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         for r in rows:
             r["updated_at"] = now_iso
+        if not self._s.write_supabase:
+            return 0                      # RAM-only-Modus: keine Supabase-Writes
         r = await self._sb.post(
             f"/rest/v1/{self._s.table}?on_conflict=reg",
             content=json.dumps(rows),
@@ -230,20 +246,87 @@ class Ingest:
             await self._sb.delete(f"/rest/v1/{self._s.table}?updated_at=lt.{cutoff}",
                                   headers={"Prefer": "return=minimal"})
 
+    # ── In-RAM HTTP-API (vom Backend via cloudflared-Tunnel gelesen) ──────────
+    def _match(self, reg, flight, cs, dep, max_age):
+        now = time.monotonic()
+        def fresh(t): return (now - t) <= max_age
+        m = None
+        if reg:
+            it = self._latest.get(reg)
+            if it and fresh(it[1]):
+                m = it[0]
+        if m is None and flight:
+            for snap, t in self._latest.values():
+                if fresh(t) and (snap.get("flight") or "") == flight:
+                    m = snap; break
+        if m is None and cs:
+            for snap, t in self._latest.values():
+                if fresh(t) and (snap.get("callsign") or "") == cs:
+                    m = snap; break
+        if m is None:
+            return None
+        if dep and m.get("dest") and m["dest"] != dep:
+            return None                       # Route-Konsistenz (anderer Leg)
+        return m
+
+    async def _http_pos(self, request):
+        from aiohttp import web
+        if self._s.api_token:
+            if request.headers.get("Authorization", "") != f"Bearer {self._s.api_token}":
+                return web.json_response({"error": "unauthorized"}, status=401)
+        q = request.rel_url.query
+        reg = re.sub(r"[^A-Z0-9]", "", (q.get("reg") or "").upper())
+        flight = (q.get("flight") or "").strip().upper()
+        cs = (q.get("callsign") or "").strip().upper()
+        dep = (q.get("dep") or "").strip().upper()
+        try:
+            max_age = float(q.get("max_age") or 2100)
+        except ValueError:
+            max_age = 2100
+        m = self._match(reg, flight, cs, dep, max_age)
+        if m is None:
+            return web.json_response({"found": False}, status=404)
+        return web.json_response({"found": True, "pos": m})
+
+    async def _http_health(self, request):
+        from aiohttp import web
+        return web.json_response({"ok": True, "ram": len(self._latest),
+                                  "write_supabase": self._s.write_supabase})
+
+    async def _start_http(self):
+        from aiohttp import web
+        app = web.Application()
+        app.router.add_get("/pos", self._http_pos)
+        app.router.add_get("/health", self._http_health)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, "0.0.0.0", self._s.http_port)
+        await site.start()
+        log.info("HTTP-API auf :%d (RAM-Store, write_supabase=%s)",
+                 self._s.http_port, self._s.write_supabase)
+
     async def _poll_once(self, fr24) -> None:
         idx = self._tile_idx
         self._tile_idx = (idx + 1) % len(self._s.tiles)
         tile = self._s.tiles[idx]
         flights = await _fetch_tile(fr24, tile, self._s)
         rows, seen = [], set()
+        mono = time.monotonic()
         for fl in flights:
             snap = _flight_to_snapshot(fl, self._s.prefixes)
             if snap and snap["reg"] not in seen:
                 seen.add(snap["reg"])
                 rows.append(snap)
+                self._latest[snap["reg"]] = (snap, mono)   # RAM-Store aktuell halten
+        # RAM-Prune: alte Einträge raus (der Flug ist gelandet / aus der Kachel).
+        cut = mono - self._s.prune_age
+        stale = [k for k, (_, t) in self._latest.items() if t < cut]
+        for k in stale:
+            self._latest.pop(k, None)
         n_up = await self._upsert(rows)
         self._win_rows += n_up
-        log.debug("tile%d flights=%d matched=%d upserted=%d", idx, len(flights), len(rows), n_up)
+        log.debug("tile%d flights=%d matched=%d ram=%d upserted=%d",
+                  idx, len(flights), len(rows), len(self._latest), n_up)
 
     async def run(self) -> None:
         from fr24 import FR24
@@ -251,6 +334,7 @@ class Ingest:
         backoff = self._s.backoff_base
         log.info("fr24-ingest v2 (gRPC) gestartet — %d Kacheln, %d Carrier-Prefixe, poll=%.0fs",
                  len(self._s.tiles), len(self._s.prefixes) or 0, self._s.poll_interval)
+        await self._start_http()
         # EIN FR24-gRPC-Client über die ganze Container-Lebensdauer (TCP/TLS-Reuse).
         async with FR24() as fr24:
             while not self._stop.is_set():

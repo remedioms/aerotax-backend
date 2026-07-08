@@ -296,6 +296,49 @@ def _route_from_warehouse(hexid=None, reg=None):
     return None
 
 
+def _nas_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_s=2100):
+    """Positions-Snapshot DIREKT aus dem NAS-RAM-Store (via cloudflared-Tunnel,
+    `NAS_LIVE_URL`). Owner 2026-07-08 „NAS only RAM": der Harvester hält die
+    Positionen im NAS-RAM und serviert sie über einen winzigen HTTP-Endpoint —
+    das Backend liest von hier statt aus Supabase → spart Supabase-Disk-IO/Kosten.
+    Rückgabe: (pos,(src,dst),reg_display,ac_type) | None (nicht konfiguriert /
+    Miss / Fehler → Aufrufer nutzt Supabase-Fallback)."""
+    base = os.environ.get('NAS_LIVE_URL', '').strip()
+    if not base:
+        return None
+    q = {'max_age': str(int(max_age_s))}
+    if reg:
+        q['reg'] = reg
+    if flight:
+        q['flight'] = flight
+    if callsign:
+        q['callsign'] = callsign
+    if dep:
+        q['dep'] = _norm_iata(dep) or dep
+    url = base.rstrip('/') + '/pos?' + urllib.parse.urlencode(q)
+    req = urllib.request.Request(url)
+    tok = os.environ.get('NAS_LIVE_TOKEN', '')
+    if tok:
+        req.add_header('Authorization', 'Bearer ' + tok)
+    try:
+        with urllib.request.urlopen(req, timeout=4) as r:
+            d = json.loads(r.read().decode())
+    except Exception:
+        return None
+    p = (d or {}).get('pos')
+    if not d.get('found') or not p or p.get('lat') is None or p.get('lon') is None:
+        return None
+    src = (p.get('origin') or '').strip().upper() or None
+    dst = (p.get('dest') or '').strip().upper() or None
+    pos = {'lat': p.get('lat'), 'lon': p.get('lon'),
+           'track': p.get('track'), 'gs': p.get('gs_kt'), 'alt': p.get('alt_ft'),
+           'on_ground': bool(p.get('on_ground')),
+           'source': 'aircraft_live_nas', 'seen_ts': p.get('seen_ts')}
+    reg_disp = (p.get('reg_display') or p.get('reg') or '').strip().upper() or None
+    ac_type = (p.get('ac_type') or '').strip().upper() or None
+    return pos, (src, dst), reg_disp, ac_type
+
+
 def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=35):
     """Positions-Snapshot aus dem NAS-Harvester-Store (Supabase `aircraft_live`,
     gefüllt via FR24-**gRPC** — sieht AUCH über Russland/Ozean, wo freies ADS-B
@@ -312,6 +355,12 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
 
     Rückgabe: (pos, (src,dst), reg_display, ac_type) | (None, None, None, None).
     pos-Keys wie iOS AXLifecycleLive (lat/lon/track/gs/alt/on_ground)."""
+    # NAS-RAM-Store zuerst (via Tunnel, spart Supabase-Disk-IO). NAS_LIVE_URL
+    # gesetzt ⇒ NAS-first; Miss/Timeout/aus ⇒ Supabase-Fallback unten.
+    _nas = _nas_live_pos(reg=reg, flight=flight, callsign=callsign, dep=dep,
+                         max_age_s=int(max_age_min * 60))
+    if _nas is not None:
+        return _nas
     sb = _sb()
     if sb is None:
         return None, None, None, None
