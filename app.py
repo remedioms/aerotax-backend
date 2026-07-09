@@ -12108,6 +12108,7 @@ def get_friends_today(token):
                         # ÜBER RUSSLAND simuliert (Basti/Miguel falsch). None ⇒ iOS
                         # simuliert wie bisher. Endpoint ist gecacht → 1 Read/90s/Leg.
                         _clp = None
+                        _cp = _cr = _crg = _cty = None
                         try:
                             _cp, _cr, _crg, _cty = _aircraft_live_pos(
                                 flight=fno, dep=chain[idx + 1])
@@ -12145,6 +12146,35 @@ def get_friends_today(token):
                             'sides': m.get('sides'),
                             'live': _clp,   # echte FR24-Position (Süd-Route) | None
                         })
+                        # SHADOW-MODE (FLIGHTSTATE_SHADOW): den vereinheitlichten
+                        # Engine-Zustand aus DENSELBEN schon geholten Daten rechnen
+                        # und Abweichungen loggen — KEINE Verhaltensänderung. Reuse
+                        # von m + _cp (kein Extra-Read). Best-effort, nie werfend.
+                        try:
+                            from blueprints.flight_state_shadow import shadow_enabled
+                            if shadow_enabled():
+                                from blueprints.flight_state_collectors import (
+                                    build_keys as _fs_bk,
+                                    obs_from_board_merged as _fs_obm,
+                                    obs_from_aircraft_live as _fs_oal)
+                                from blueprints.flight_state_shadow import shadow_record as _fs_shadow
+                                from blueprints.aerox_data_blueprint import _iata_latlon
+                                _fs_keys = _fs_bk(
+                                    fno, datum, chain[idx], chain[idx + 1],
+                                    roster_tail=m.get('reg'),
+                                    sched_dep_iso=_board_local_to_utc_iso(
+                                        m.get('sched_dep'), chain[idx]),
+                                    sched_arr_iso=_board_local_to_utc_iso(
+                                        m.get('sched_arr'), chain[idx + 1]),
+                                    dep_ll=_iata_latlon(chain[idx]),
+                                    arr_ll=_iata_latlon(chain[idx + 1]))
+                                _fs_obs = _fs_obm(m, _fs_keys,
+                                                  board_to_iso=_board_local_to_utc_iso)
+                                _fs_obs += _fs_oal(_cp, _cr, _crg, _cty)
+                                _fs_shadow('friends_flights_live', _fs_keys,
+                                           _fs_obs, flights_live[-1])
+                        except Exception:
+                            pass
         except Exception:
             flights_live = []
         out.append({
