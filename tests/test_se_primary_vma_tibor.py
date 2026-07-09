@@ -31,19 +31,50 @@ for p in (ROOT_DIR, TOOLS_DIR):
 
 os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
 
-import conftest as _cft  # noqa: E402
-
 # FIX 2026-06-04: war fälschlich Miguels Steuer-25-CAS (Person 95775) — Golden/SE/Reader
-# sind aber Tibor (99102); der falsche CAS-Overlay verfälschte die Validierung
-CAS_DIR = _cft.private_doc('Tibor', '2025', 'Dienstplan')
-SE_PDF = _cft.private_doc('Tibor', '2025', '2025 Streckeneinsatzabrechnungen.pdf')
+# sind aber Tibor (99102); der falsche CAS-Overlay verfälschte die Validierung.
+# FIX 2026-07-09: iCloud-Desktop evicted PDFs zu dataless-Platzhaltern (stat-Größe
+# > 0, aber 0 lesbare Bytes → pdfminer 'No /Root object'). tibor_diff liest
+# AEROTAX_PRIVATE_DOCS_ROOT beim Import — wir wählen hier den ersten Kandidaten-
+# Root, dessen SE/CAS-PDFs WIRKLICH materialisiert sind, und reichen ihn per Env
+# an tibor_diff durch; ist keiner brauchbar, skippt das Modul sauber.
 
-_have_inputs = os.path.isdir(CAS_DIR) and os.path.isfile(SE_PDF) and \
+
+def _pdf_materialized(path) -> bool:
+    """True nur wenn die Datei echte PDF-Bytes liefert (kein iCloud-Platzhalter)."""
+    try:
+        with open(path, 'rb') as f:
+            return f.read(5).startswith(b'%PDF')
+    except OSError:
+        return False
+
+
+def _root_ok(root) -> bool:
+    se = os.path.join(root, 'Tibor', '2025', '2025 Streckeneinsatzabrechnungen.pdf')
+    cas = os.path.join(root, 'Tibor', '2025', 'Dienstplan')
+    if not (os.path.isfile(se) and os.path.isdir(cas)):
+        return False
+    pdfs = [os.path.join(cas, fn) for fn in os.listdir(cas)
+            if fn.lower().endswith('.pdf')]
+    return bool(pdfs) and _pdf_materialized(se) and all(map(_pdf_materialized, pdfs))
+
+
+_env_root = os.environ.get('AEROTAX_PRIVATE_DOCS_ROOT')
+_candidates = [_env_root] if _env_root else [
+    os.path.expanduser('~/Desktop/Downloads'),
+    os.path.expanduser('~/Downloads'),
+]
+_docs_root = next((r for r in _candidates if _root_ok(r)), None)
+if _docs_root and not _env_root:
+    os.environ['AEROTAX_PRIVATE_DOCS_ROOT'] = _docs_root
+
+_have_inputs = _docs_root is not None and \
     os.path.isfile(os.path.join(FIXTURE_DIR, 'tibor_2025_cas_v2_from_dienstplan.json'))
 
 pytestmark = pytest.mark.skipif(
     not _have_inputs,
-    reason='Lokale Tibor-CAS/SE-PDFs nicht vorhanden (lokaler Genauigkeits-Guard)',
+    reason='Lokale Tibor-CAS/SE-PDFs nicht vorhanden oder unparsebar '
+           '(iCloud-dataless) — lokaler Genauigkeits-Guard',
 )
 
 

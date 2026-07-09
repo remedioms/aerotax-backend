@@ -10,7 +10,7 @@ PY := python3
 
 .PHONY: verify compile test
 compile:
-	$(PY) -m py_compile app.py blueprints/*.py nas_harvester/*.py
+	$(PY) -m py_compile app.py blueprints/*.py nas_harvester/*.py eu_scraper/*.py
 
 # Der Unit-/Logik-Suite (schnell, offline). Die LIVE-E2E-Contract-Tests
 # (tests/aerox/test_contract_ios_backend.py) sind AUSGENOMMEN: sie signieren gegen

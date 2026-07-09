@@ -24,6 +24,29 @@ import pytest
 os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
 
 
+# Memoisierte Modul-Globals, die zwischen Tests geleert werden müssen.
+# Wert = optionaler Struktur-Seed, der nach clear() wieder eingesetzt wird
+# (Caches mit Pflicht-Keys wie _AX_CODESHARE_CACHE['ts']/['map'] dürfen nicht
+# leer zurückbleiben). Heimat-Module (nur Doku — geleert wird via sys.modules-
+# Scan, s.u.):
+#   app: _FRIENDS_TODAY_MEMO, _PROFILE_HB_MEMO, _TRIP_STATS_CACHE,
+#        _FLIGHT_MERGE_CACHE, _AIRPORT_BOARD_CACHE, _AIRPORT_DAY_CACHE,
+#        _NATIVE_BOARD_CACHE, _AX_CODESHARE_CACHE
+#   blueprints.aerox_data_blueprint: _UFLIGHT_MEMO, _LIFECYCLE_MEMO
+_MEMO_GLOBALS = {
+    '_FRIENDS_TODAY_MEMO': None,
+    '_PROFILE_HB_MEMO': None,
+    '_TRIP_STATS_CACHE': None,
+    '_FLIGHT_MERGE_CACHE': None,
+    '_AIRPORT_BOARD_CACHE': None,
+    '_AIRPORT_DAY_CACHE': None,
+    '_NATIVE_BOARD_CACHE': None,
+    '_AX_CODESHARE_CACHE': {'ts': 0.0, 'map': {}},
+    '_UFLIGHT_MEMO': None,
+    '_LIFECYCLE_MEMO': None,
+}
+
+
 @pytest.fixture(autouse=True)
 def _reset_module_caches():
     """Modul-globale TTL-Caches vor JEDEM Test leeren (Test-Isolation).
@@ -34,13 +57,18 @@ def _reset_module_caches():
     Token/Datum fälschlich mit stale Daten beantworten. Produkt-Code bleibt
     unverändert; nur die geteilte Modul-State wird zwischen Tests zurückgesetzt."""
     # Robust ggü. dem sys.modules['app']-Swap (test_calculation.py reimportet app):
-    # den Cache auf JEDEM Modul leeren, das ihn trägt (Original UND Reimport).
+    # die Caches auf JEDEM Modul leeren, das sie trägt (Original UND Reimport).
+    # Existenz defensiv (getattr + isinstance) — fehlende Attribute sind ok.
+    import copy
     import sys
-    with contextlib.suppress(Exception):
-        for _mod in list(sys.modules.values()):
-            _c = getattr(_mod, '_FRIENDS_TODAY_MEMO', None)
-            if isinstance(_c, dict):
-                _c.clear()
+    for _mod in list(sys.modules.values()):
+        for _name, _seed in _MEMO_GLOBALS.items():
+            with contextlib.suppress(Exception):
+                _c = getattr(_mod, _name, None)
+                if isinstance(_c, dict):
+                    _c.clear()
+                    if _seed:
+                        _c.update(copy.deepcopy(_seed))
     yield
 
 # ─── Backend-Root (dieses Repo) ──────────────────────────────────────────────
