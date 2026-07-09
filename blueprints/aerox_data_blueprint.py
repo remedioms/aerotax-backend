@@ -3137,6 +3137,20 @@ def ax_flown_track():
             points = [{'lat': la, 'lon': lo, 'alt': None, 'gs': None, 'trk': None, 'ts': None}
                       for la, lo in _great_circle_points(a[0], a[1], b[0], b[1], 40)]
 
+    # Anschluss an die Flughäfen (Owner „durchgezogen"): bei ECHTER Spur die
+    # Endpunkte an dep/arr anbinden, damit die Linie die ganze Strecke überspannt —
+    # die Breadcrumbs starten/enden oft mitten im Flug (erster/letzter Poll). Nur
+    # anhängen, wenn der Track dort nicht ohnehin schon anliegt (>~0.15°).
+    if source in ('aircraft_track', 'fr24_trail') and len(points) >= 2:
+        if dep:
+            a = _iata_latlon(dep)
+            if a and (abs(a[0] - points[0]['lat']) > 0.15 or abs(a[1] - points[0]['lon']) > 0.15):
+                points.insert(0, {'lat': a[0], 'lon': a[1], 'alt': None, 'gs': None, 'trk': None, 'ts': None})
+        if arr:
+            b = _iata_latlon(arr)
+            if b and (abs(b[0] - points[-1]['lat']) > 0.15 or abs(b[1] - points[-1]['lon']) > 0.15):
+                points.append({'lat': b[0], 'lon': b[1], 'alt': None, 'gs': None, 'trk': None, 'ts': None})
+
     out = {'ok': True, 'reg': reg or None, 'flight': flight_no, 'date': date,
            'dep': dep, 'arr': arr, 'source': source,
            'count': len(points), 'points': points}
