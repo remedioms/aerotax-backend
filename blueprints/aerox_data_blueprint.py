@@ -2966,15 +2966,76 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
              .order('updated_at', desc=True).limit(20).execute())
     except Exception:
         return {}
-    dep_row = arr_row = None
+    dep_cands, arr_cands = [], []
     for r in (q.data or []):
         ap = (r.get('airport') or '').upper()
         if ap.endswith('#ARR'):
-            if arr_row is None and (arr is None or ap == arr + '#ARR'):
-                arr_row = r
-        elif dep_row is None and (dep is None or ap == dep):
-            dep_row = r
-    return _obs_rows_to_facts(dep_row, arr_row)
+            if arr is None or ap == arr + '#ARR':
+                arr_cands.append(r)
+        elif dep is None or ap == dep:
+            dep_cands.append(r)
+
+    def _best(cands):
+        # Nicht einfach die jüngste Row nehmen (die kann gate/sched-los sein): die
+        # inhaltsreichste bevorzugen — erst mit Gate, dann mit Soll-Zeit, sonst erste.
+        if not cands:
+            return None
+        for r in cands:
+            if (r.get('gate') or '').strip():
+                return r
+        for r in cands:
+            if (r.get('sched') or '').strip():
+                return r
+        return cands[0]
+
+    return _obs_rows_to_facts(_best(dep_cands), _best(arr_cands))
+
+
+def _enrich_flight_status_with_obs(flight, date=None):
+    """P4-Verdrahtung: füllt fehlende Zeit-/Gate-/Status-Felder eines
+    FlightStatusInfo-Dicts (resolve-flight/-callsign → iOS `schedule.info`) aus den
+    geteilten Board-Fakten. So zeigt auch der Detail-Screen Soll/Ist-Ankunft + Gate,
+    wenn aircraft_live/board keine Zeiten trug. Nur LEERE Felder (FR24-Wahrheit nie
+    überschrieben). Die EINE Merge-Quelle (_flight_facts_from_obs) — kein neuer Pfad."""
+    if not isinstance(flight, dict):
+        return flight
+    fn = (flight.get('flight') or '').replace(' ', '').upper()
+    if not fn:
+        return flight
+    d = ((date or '')[:10]) or time.strftime('%Y-%m-%d', time.gmtime())
+    # NUR per Flugnummer matchen (nicht per dep/arr constrainen): ein bezahlter
+    # FR24-Treffer kann eine andere Leg-Route liefern → würde die Obs-Row sonst
+    # verfehlen. _flight_facts_from_obs nimmt eh die jüngste DEP/ARR-Row des Flugs.
+    facts = _flight_facts_from_obs(fn, d)
+    if not facts:
+        return flight
+
+    def _fill(k, v):
+        if v is not None and not flight.get(k):
+            flight[k] = v
+    _fill('sched_dep', facts.get('sched_dep'))
+    _fill('est_dep', facts.get('est_dep'))
+    _fill('sched_arr', facts.get('sched_arr'))
+    _fill('est_arr', facts.get('est_arr'))
+    _fill('dep_gate', facts.get('gate'))
+    _fill('dep_terminal', facts.get('terminal'))
+    _fill('arr_gate', facts.get('arr_gate'))
+    _fill('arr_terminal', facts.get('arr_terminal'))
+    _fill('status', facts.get('dep_status'))
+    if flight.get('dep_delay_min') is None and facts.get('dep_delay_min') is not None:
+        flight['dep_delay_min'] = facts['dep_delay_min']
+    if flight.get('arr_delay_min') is None and facts.get('arr_delay_min') is not None:
+        flight['arr_delay_min'] = facts['arr_delay_min']
+    if not flight.get('status_category'):
+        _as = (facts.get('arr_status') or '').lower()
+        _ds = (facts.get('dep_status') or '').lower()
+        if any(w in _as for w in ('land', 'arriv', 'gelandet', 'angekomm')):
+            flight['status_category'] = 'arrived'
+        elif facts.get('cancelled'):
+            flight['status_category'] = 'cancelled'
+        elif any(w in _ds for w in ('abgeflog', 'departed', 'airborne', 'started')):
+            flight['status_category'] = 'enroute'
+    return flight
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3551,6 +3612,7 @@ def ax_resolve_callsign(callsign):
                     cs_fn(flight, None, source='fr24')
                 except Exception:
                     pass
+        flight = _enrich_flight_status_with_obs(flight)   # P4: Soll/Ist-Zeiten+Gate
         return jsonify({'ok': True, 'callsign': cs, 'flight': flight,
                         'source': src})
     return jsonify({'ok': False, 'callsign': cs, 'error': 'not_found'}), 200
@@ -3582,6 +3644,7 @@ def ax_resolve_flight(flightno):
                     cs_fn(flight, None, source='fr24')
                 except Exception:
                     pass
+        flight = _enrich_flight_status_with_obs(flight)   # P4: Soll/Ist-Zeiten+Gate
         return jsonify({'ok': True, 'number': fn, 'flight': flight, 'source': src})
     return jsonify({'ok': False, 'number': fn, 'error': 'not_found'}), 200
 
