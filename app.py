@@ -28265,6 +28265,27 @@ def ax_flight_info(flightno):
             if out.get('delay_min') is None and merged.get('dep_delay_min') is not None:
                 out['delay_min'] = merged.get('dep_delay_min')
 
+    # UNIFIED FLIGHT-INFO (P5): die ANKUNFTSZEIT aus der geteilten Obs-Quelle
+    # (`<Ziel>#ARR`-Row) nachziehen, falls oben nicht gesetzt — so trägt der
+    # Dienstplan (axFlightInfo) UND das Detail-Aggregat (info) die echte Landezeit
+    # (sched_arr/esti_arr), nicht nur die Abflugseite. Dieselbe Merge-Funktion wie
+    # Radar/Detail (_flight_facts_from_obs) → EINE Quelle. Nur füllen, nie überschreiben.
+    if out is not None and out.get('found'):
+        try:
+            from blueprints.aerox_data_blueprint import _flight_facts_from_obs
+            _ff = _flight_facts_from_obs(fn, out.get('date') or date_param)
+            if _ff:
+                if not out.get('sched_arr') and _ff.get('sched_arr'):
+                    out['sched_arr'] = _ff['sched_arr']
+                if not out.get('esti_arr') and _ff.get('est_arr'):
+                    out['esti_arr'] = _ff['est_arr']
+                if not out.get('arr_status') and _ff.get('arr_status'):
+                    out['arr_status'] = _ff['arr_status']
+                if out.get('arr_delay_min') is None and _ff.get('arr_delay_min') is not None:
+                    out['arr_delay_min'] = _ff['arr_delay_min']
+        except Exception:
+            pass
+
     if out is not None:
         return _public_cache_headers(jsonify(out))
     # Weder Historie noch Live-Feed → Client fällt auf AeroDataBox zurück.
