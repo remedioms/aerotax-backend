@@ -1238,33 +1238,49 @@ def _fr24_flight_by_number(flight_no, date=None):
     return out
 
 
-def _fr24_flights_by_airline(icao, days=2, limit=2000):
+def _fr24_flights_by_airline(icao, days=2, chunk_hours=2, max_chunks=40):
     """ALLE Flüge EINER Airline (operating_as=ICAO) über flight-summary — für den
     Warehouse-Prewarm (Owner „alle von Discover ins Buch speichern"): einmal
-    bezahlt holen, permanent speichern, danach gratis nachschlagbar. Budget-gated,
-    Credits PRO Ergebnis. Liefert crowdsourcebare Leg-Dicts (nur mit echter Reg).
-    KEIN Cache hier (bewusst — der Prewarm SOLL frisch holen)."""
+    bezahlt holen, permanent speichern, danach gratis nachschlagbar.
+
+    FR24 flight-summary/light gibt PRO Abruf max. ~20 Treffer (kein Pagination-
+    Cursor). Darum blättern wir über kleine Zeitfenster (chunk_hours) und
+    deduplizieren per fr24_id → so kommen wirklich ALLE Flüge rein. Budget-gated
+    (pro Chunk geprüft, Abbruch bei Deckel), Credits PRO Ergebnis. Nur Legs mit
+    echter Reg (crowdsourcebar). Kein Cache (Prewarm soll frisch holen)."""
     if not (_fr24_available() and _fr24_budget_ok()):
         return []
     ic = (icao or '').strip().upper()
     if len(ic) < 2:
         return []
     now = time.time()
-    j = _fr24_get('/flight-summary/light', {
-        'operating_as': ic,
-        'flight_datetime_from': time.strftime('%Y-%m-%dT%H:%M:%S',
-                                              time.gmtime(now - days * 86400)),
-        'flight_datetime_to': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now)),
-    })
-    data = (j or {}).get('data') or []
-    _budget_key_inc(_fr24_budget_key(), max(_FR24_SUMMARY_CREDITS, len(data)))
-    legs = []
-    for f in data:
-        leg = _fr24_summary_to_leg(f)
-        if (leg and leg.get('flight_no') and leg.get('src')
-                and leg.get('dst') and leg.get('reg')):
-            legs.append(leg)
-    return legs[:limit]
+    t = now - days * 86400
+    step = max(1, int(chunk_hours)) * 3600
+    seen, out, chunks = set(), [], 0
+    while t < now and chunks < max_chunks:
+        if not _fr24_budget_ok():
+            break
+        t_to = min(t + step, now)
+        j = _fr24_get('/flight-summary/light', {
+            'operating_as': ic,
+            'flight_datetime_from': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t)),
+            'flight_datetime_to': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t_to)),
+        })
+        data = (j or {}).get('data') or []
+        _budget_key_inc(_fr24_budget_key(), max(_FR24_SUMMARY_CREDITS, len(data)))
+        for f in data:
+            fid = (f.get('fr24_id')
+                   or (str(f.get('flight')) + '|' + str(f.get('datetime_takeoff'))))
+            if fid in seen:
+                continue
+            seen.add(fid)
+            leg = _fr24_summary_to_leg(f)
+            if (leg and leg.get('flight_no') and leg.get('src')
+                    and leg.get('dst') and leg.get('reg')):
+                out.append(leg)
+        t = t_to
+        chunks += 1
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

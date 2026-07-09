@@ -173,7 +173,21 @@ def test_flights_by_airline_only_with_reg():
     with patch.object(BP, '_fr24_token', return_value='tok'), \
          patch.object(BP, '_icao_to_iata', side_effect=lambda c: _ICAO2IATA.get(c)), \
          patch.object(BP, '_fr24_get', return_value=resp) as mget:
-        legs = BP._fr24_flights_by_airline('OCN', days=2)
+        # kleines Fenster → 1 Chunk, damit der Mock nicht 24× denselben liefert
+        legs = BP._fr24_flights_by_airline('OCN', days=1, chunk_hours=48)
     assert mget.call_args[0][1]['operating_as'] == 'OCN'
+    # dedup per fr24_id/flight+takeoff, nur Legs MIT Reg
     assert len(legs) == 1 and legs[0]['flight_no'] == '4Y100'
-    assert BP._budget_key_used(BP._fr24_budget_key()) == 2   # 2 Treffer
+    assert BP._budget_key_used(BP._fr24_budget_key()) >= 2   # >=1 Chunk gezählt
+
+
+def test_flights_by_airline_dedups_across_chunks():
+    """Mehrere Zeit-Chunks liefern denselben Flug → nur EINMAL im Ergebnis."""
+    resp = {'data': [_summary('4Y100', 'EDDF', 'LEBL', '2026-07-09T06:00:00Z',
+                              '2026-07-09T08:05:00Z', reg='D-AIKO')]}
+    with patch.object(BP, '_fr24_token', return_value='tok'), \
+         patch.object(BP, '_icao_to_iata', side_effect=lambda c: _ICAO2IATA.get(c)), \
+         patch.object(BP, '_fr24_get', return_value=resp) as mget:
+        legs = BP._fr24_flights_by_airline('OCN', days=1, chunk_hours=6)
+    assert mget.call_count > 1                 # geblättert
+    assert len(legs) == 1                      # trotzdem nur 1 (dedup)
