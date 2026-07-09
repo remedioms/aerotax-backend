@@ -3051,6 +3051,24 @@ def ax_flown_track():
     if cached is not None:
         return jsonify(cached)
 
+    # Reg auflösen, wenn nur Flugnummer da: aircraft_track.flight ist der CALLSIGN
+    # (DLH174), die Suche/Roster gibt aber IATA (LH174) → ohne Reg verfehlt der
+    # Flight-Match von Tier 1 und alles fiele auf Großkreis. Der Warehouse (flights,
+    # op_flight_no+Tag → tail) liefert die echte Maschine → Track dann reg-gekeyt.
+    if not reg and flight_no:
+        try:
+            sb = _sb()
+            if sb is not None:
+                q = sb.table('flights').select('tail').eq('op_flight_no', flight_no)
+                if date:
+                    q = q.eq('service_date', date)
+                fr = (q.order('service_date', desc=True).limit(3).execute()).data or []
+                tail = next((r.get('tail') for r in fr if r.get('tail')), None)
+                if tail:
+                    reg = re.sub(r'[^A-Z0-9]', '', tail.upper())
+        except Exception:
+            pass
+
     # Zeitfenster: ganzer UTC-Tag (date) oder die letzten 20 h (laufender Flug).
     import datetime as _dt
     if date:
