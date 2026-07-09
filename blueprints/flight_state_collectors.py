@@ -25,11 +25,15 @@ from blueprints.flight_state import (
 
 # ── board status classification (side-aware, keyword-based, pure) ──────────
 _LANDED_KW = ("landed", "gelandet", "arrived", "angekommen", "at gate", "am gate",
-              "on block", "on-block", "aufgesetzt", "baggage", "gepäck")
+              "on block", "on-block", "aufgesetzt", "baggage", "gepäck", "deboard",
+              "ausstieg", "arrival")
+# taxi/off-block tokens — side decides meaning (dep = TAXI_OUT, arr = LANDED/taxiing in).
+_TAXI_KW = ("taxi", "rollt", "rolling", "off block", "off-block", "pushback", "push back")
 _DEPARTED_KW = ("departed", "abgeflogen", "en route", "en-route", "im flug",
-                "airborne", "gestartet", "in air")
+                "airborne", "gestartet", "in air", "dep", "started", "lifted")
 _BOARDING_KW = ("boarding", "gate open", "final call", "letzter aufruf",
-                "gate closed", "gate closing", "go to gate", "boarding complete")
+                "gate closed", "gate closing", "go to gate", "boarding complete",
+                "now boarding", "einsteigen", "last call")
 _CANCELLED_KW = ("cancel", "annull", "gestrichen")
 _ENROUTE_KW = ("en route", "en-route", "im flug", "airborne", "in air")   # truly flying
 
@@ -43,20 +47,26 @@ def classify_board_status(status, side: str):
 
     side='dep' | 'arr'. Returns (None, False, False) when the status carries no
     phase signal (e.g. 'scheduled', 'estimated 12:40'). This is the SINGLE place
-    the 'Abgeflogen = off-block, not airborne' rule is encoded."""
+    the 'Abgeflogen = off-block, not airborne' rule is encoded. Verified against a
+    live board-status sample (Abgeflogen/gestartet/DEP/taxiing/End of Boarding/
+    Gate Closed/Airborne/Gelandet/baggage delivery finished/Expected HH:MM …)."""
     s = _norm(status)
     if not s:
         return None, False, False
     if any(k in s for k in _CANCELLED_KW):
         return CANCELLED, True, False
+    # explicit en-route/airborne wins on either side (board KNOWS it's flying)
+    if any(k in s for k in _ENROUTE_KW):
+        return AIRBORNE, True, True
     if any(k in s for k in _LANDED_KW):
         # arr-side landed is authoritative; dep-side 'landed' is nonsensical -> ignore
         return (LANDED, True, False) if side == "arr" else (None, False, False)
+    # taxi / off-block: dep side -> TAXI_OUT, arr side -> taxiing in after landing.
+    if any(k in s for k in _TAXI_KW):
+        return (TAXI_OUT, True, False) if side == "dep" else (LANDED, True, False)
     if any(k in s for k in _DEPARTED_KW):
-        proven = any(k in s for k in _ENROUTE_KW)   # only true en-route counts as airborne
         if side == "dep":
-            # off-block: TAXI_OUT unless the board explicitly says en-route/in-flight
-            return (AIRBORNE if proven else TAXI_OUT), True, proven
+            return TAXI_OUT, True, False            # off-block, not proven airborne
         return None, False, False                    # 'departed' on the arr board = noise
     if any(k in s for k in _BOARDING_KW):
         return BOARDING, False, False
