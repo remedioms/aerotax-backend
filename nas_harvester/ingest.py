@@ -168,8 +168,18 @@ def _flight_to_snapshot(fl: dict, prefixes: set) -> dict | None:
     if lat is None or lon is None:
         return None
     alt_ft = _n(fl.get("alt"))
+    gs_kt = _n(fl.get("speed"))
     ts = _n(fl.get("timestamp"))
     seen_iso = (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts)) if ts else None)
+    # on_ground ehrlich (Owner 2026-07-09 „Tibor FRA→GVA an ~13:05", stand am
+    # FRA-Rollweg): FR24 liefert beim Pushback/Taxi KEINE Baro-Höhe (alt=None) →
+    # die alte Regel `alt<50` verfehlte das und markierte den rollenden Flieger als
+    # fliegend. Ohne Höhe entscheidet die Geschwindigkeit: gs < 80 kt = am Boden
+    # (nichts cruised so langsam; selbst Steigflug ist >150). Mit Höhe zählt <50 ft.
+    _on_ground = bool(
+        (alt_ft is not None and alt_ft < 50)
+        or (alt_ft is None and (gs_kt is None or gs_kt < 80))
+    )
     return {
         "reg": reg,
         "reg_display": (str(xi.get("reg") or "").strip().upper() or None),
@@ -177,13 +187,13 @@ def _flight_to_snapshot(fl: dict, prefixes: set) -> dict | None:
         "flight": (str(xi.get("flight") or "").strip().upper() or None),
         "lat": lat, "lon": lon,
         "track": _n(fl.get("track")),
-        "gs_kt": _n(fl.get("speed")),
+        "gs_kt": gs_kt,
         "alt_ft": alt_ft,
         "origin": (str(route.get("from") or "").strip().upper() or None),
         "dest": (str(route.get("to") or "").strip().upper() or None),
         "ac_type": (str(xi.get("type") or "").strip().upper() or None),
         "flightid": (int(fl["flightid"]) if str(fl.get("flightid") or "").isdigit() else None),
-        "on_ground": bool(alt_ft is not None and alt_ft < 50),
+        "on_ground": _on_ground,
         "source": "fr24_grpc",
         "seen_ts": seen_iso,
     }

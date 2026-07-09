@@ -398,10 +398,22 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
     dst = (r.get('dest') or '').strip().upper() or None
     if dep_n and dst and dst != dep_n:
         return None, None, None, None            # anderer Leg → verwerfen
+    # TAXI-GATE (Owner 2026-07-09 „Tibor FRA→GVA an ~13:05", Flieger optisch bei
+    # Mannheim): FR24 meldet beim Pushback/Rollen `on_ground=false`, obwohl die
+    # Maschine praktisch STEHT (gs ~15 kt, keine Baro-Höhe). So ein Snapshot ist
+    # KEINE Live-Flugposition — die App extrapoliert sonst aus dem Taxi-Seed einen
+    # kriechenden Geister-Flieger samt Unsinns-Ankunft. Nur als airborne werten,
+    # wenn plausibel in der Luft: nennenswerte Höhe ODER Reise-nahe gs (nichts
+    # cruised unter ~80 kt; selbst Steigflug ist >150). Sonst → on_ground=True,
+    # dann verwerfen alle Consumer die Position sauber (ehrlicher Fallback).
+    _gs = r.get('gs_kt')
+    _alt = r.get('alt_ft')
+    _airborne = ((isinstance(_alt, (int, float)) and _alt > 1000)
+                 or (isinstance(_gs, (int, float)) and _gs >= 80))
     pos = {
         'lat': r.get('lat'), 'lon': r.get('lon'),
-        'track': r.get('track'), 'gs': r.get('gs_kt'), 'alt': r.get('alt_ft'),
-        'on_ground': bool(r.get('on_ground')),
+        'track': r.get('track'), 'gs': _gs, 'alt': _alt,
+        'on_ground': bool(r.get('on_ground')) or not _airborne,
         'source': 'aircraft_live', 'seen_ts': r.get('seen_ts'),
     }
     reg_disp = (r.get('reg_display') or r.get('reg') or '').strip().upper() or None
