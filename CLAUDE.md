@@ -1,5 +1,20 @@
 # AeroTax Backend — Arbeitsweise
 
+## Safety-Net: `make verify` (PFLICHT nach jeder Änderung)
+
+**Keine Aufgabe gilt als erledigt, bevor `make verify` grün ist.** Ein Befehl:
+`make verify` = `py_compile` aller Module (app.py, blueprints/, nas_harvester/) +
+volle **pytest**-Suite (~3360 Tests). Schnell-Check: `make compile`; nur Tests:
+`make test`.
+
+**Regressions-Check nach jeder Änderung** (nicht nur `make verify` laufen lassen):
+grep die Namen der geänderten Funktionen/Endpoints → jede Aufrufstelle prüfen
+(geänderte Signatur/Return-Shape/Defaults?); bei geteilten Flächen (Blueprints,
+Supabase-Reads, Endpoints) jeden Consumer prüfen. Test-Mocks müssen die ECHTE
+Signatur spiegeln (z.B. `_machine_live(reg, want_route=True, targeted=False)`) —
+ein veralteter Mock ist ein Test-Infra-Bug, kein Produkt-Bug. Findet ein Test
+einen ECHTEN Produkt-Bug: dem Owner melden, nicht still „grün machen".
+
 ## v8.23 Release-Stubs (offene Lücken — nicht produktionsreif)
 
 Diese Stubs sind absichtlich **nicht voll implementiert**. User-facing wird das ehrlich kommuniziert; release-blocking entscheidet der Produkt-Eigentümer:

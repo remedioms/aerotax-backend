@@ -319,7 +319,7 @@ def test_flight_live_pulls_reg_from_sb_day_rows(client, monkeypatch):
     _patch_life_app(monkeypatch, _fake_sb(sb_rows),
                     extra={'_flight_obs_merged': lambda *a, **k: None})
     monkeypatch.setattr(BP, '_machine_live',
-                        lambda reg, want_route=True:
+                        lambda reg, want_route=True, targeted=False:
                         ('3c4b2f', 'DLH716', _live_pos(),
                          {'src': 'FRA', 'dst': 'HND', 'source': 'warehouse'}))
     r = client.get('/api/ax/flight-live/TESTTOKEN'
@@ -337,7 +337,7 @@ def test_flight_live_explicit_reg_hint_wins(client, monkeypatch):
     D-ABYO → Reg→Hex→ADS-B findet ihn, wo auch immer er ist"."""
     seen = {}
 
-    def fake_machine_live(reg, want_route=True):
+    def fake_machine_live(reg, want_route=True, targeted=False):
         seen['reg'] = reg
         return ('3c4b2f', 'DLH511', _live_pos(), None)
 
@@ -358,7 +358,7 @@ def test_flight_live_explicit_reg_hint_wins(client, monkeypatch):
 
 def test_flight_live_no_sources_stays_honest(client, monkeypatch):
     monkeypatch.setattr(BP, '_machine_live',
-                        lambda reg, want_route=True: (None, None, None, None))
+                        lambda reg, want_route=True, targeted=False: (None, None, None, None))
     _patch_life_app(monkeypatch, _fake_sb([]),
                     extra={'_flight_obs_merged': lambda *a, **k: None})
     r = client.get('/api/ax/flight-live/TESTTOKEN'
@@ -373,7 +373,7 @@ def test_flight_live_no_sources_stays_honest(client, monkeypatch):
 # ══════════════════════════════════════════════════════════════════════════════
 def _patch_chain_deps(monkeypatch):
     monkeypatch.setattr(BP, '_machine_live',
-                        lambda reg, want_route=True: (None, None, None, None))
+                        lambda reg, want_route=True, targeted=False: (None, None, None, None))
     monkeypatch.setattr(BP, '_inbound_arr_row_by_reg', lambda dep, reg: None)
     monkeypatch.setattr(BP, '_reg_hex_typecode_free', lambda reg: (None, None))
 
