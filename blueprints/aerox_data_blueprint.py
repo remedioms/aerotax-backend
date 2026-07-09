@@ -2881,6 +2881,87 @@ def ax_radar_enrich():
     return jsonify({'ok': True, 'count': len(out), 'routes': out})
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  UNIFIED FLIGHT-INFO — P0: die EINE geteilte Board-Fakten-Quelle
+#  (Ultraplan docs/unified-flight-info-ultraplan-v2.md). Statt drei Merge-Patches
+#  pro Screen liest künftig alles hier: Soll/Ist Ab+Ankunft, Gate, Terminal, Delay,
+#  Status, Reg/Typ, cancelled — aus airport_delay_obs (DEP-Row <dep> + ARR-Row
+#  <arr>#ARR). Gratis (eigener Scrape), nur echte Werte, nie erfunden. FR24 (erst
+#  gratis-gRPC, dann paid) ist NICHT hier — das ist der on-demand-Fallback (P1/P3),
+#  der NUR feuert wenn dieser Gratis-Merge eine Lücke lässt UND der Flug gebraucht wird.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _obs_rows_to_facts(dep_row, arr_row):
+    """Reiner Mapper (kein DB-Zugriff → trivial testbar): DEP-/ARR-Obs-Row →
+    normalisiertes Fakten-Dict. Delay kommt direkt aus `max_delay_min` (kein
+    Rechnen über formatgemischte Zeiten). Leere/None-Werte werden weggelassen."""
+    def _s(v):
+        v = v.strip() if isinstance(v, str) else v
+        return v or None
+    facts = {}
+    if dep_row:
+        for out_k, in_k in (('sched_dep', 'sched'), ('est_dep', 'esti'),
+                            ('gate', 'gate'), ('terminal', 'terminal'),
+                            ('dep_status', 'status'), ('reg', 'reg'),
+                            ('type', 'type_code')):
+            v = _s(dep_row.get(in_k))
+            if v is not None:
+                facts[out_k] = v
+        if dep_row.get('max_delay_min') is not None:
+            facts['dep_delay_min'] = dep_row.get('max_delay_min')
+        if dep_row.get('cancelled'):
+            facts['cancelled'] = True
+    if arr_row:
+        for out_k, in_k in (('sched_arr', 'sched'), ('est_arr', 'esti'),
+                            ('arr_gate', 'gate'), ('arr_terminal', 'terminal'),
+                            ('arr_status', 'status')):
+            v = _s(arr_row.get(in_k))
+            if v is not None:
+                facts[out_k] = v
+        if arr_row.get('max_delay_min') is not None:
+            facts['arr_delay_min'] = arr_row.get('max_delay_min')
+        if arr_row.get('cancelled'):
+            facts['cancelled'] = True
+    return facts
+
+
+def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
+    """Board-Fakten EINES Flugs aus airport_delay_obs (DEP + <arr>#ARR gemergt).
+    Timeout-sicher (eigener try, Fehler → {}), indizierte Filter (date+flight)."""
+    fn = (flight_no or '').replace(' ', '').upper().strip()
+    d = (date or '').strip()[:10]
+    if not fn or not d:
+        return {}
+    sb = _sb()
+    if sb is None:
+        return {}
+    dep = (dep_iata or '').upper().strip() or None
+    arr = (arr_iata or '').upper().strip() or None
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        yday = (_dt.strptime(d, '%Y-%m-%d') - _td(days=1)).strftime('%Y-%m-%d')
+    except Exception:
+        yday = None
+    dates = [d] + ([yday] if yday else [])
+    try:
+        q = (sb.table('airport_delay_obs')
+             .select('airport,flight,dest_iata,sched,esti,gate,terminal,'
+                     'status,max_delay_min,cancelled,reg,type_code')
+             .in_('date', dates).eq('flight', fn)
+             .order('updated_at', desc=True).limit(20).execute())
+    except Exception:
+        return {}
+    dep_row = arr_row = None
+    for r in (q.data or []):
+        ap = (r.get('airport') or '').upper()
+        if ap.endswith('#ARR'):
+            if arr_row is None and (arr is None or ap == arr + '#ARR'):
+                arr_row = r
+        elif dep_row is None and (dep is None or ap == dep):
+            dep_row = r
+    return _obs_rows_to_facts(dep_row, arr_row)
+
+
 @aerox_data_bp.route('/api/ax/tail-history', methods=['GET'])
 def ax_tail_history():
     """„Zuletzt geflogen" EINER Maschine: die letzten ~10 Legs by Tail/Reg aus
