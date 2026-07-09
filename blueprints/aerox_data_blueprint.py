@@ -2961,7 +2961,7 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     try:
         q = (sb.table('airport_delay_obs')
              .select('airport,flight,dest_iata,sched,esti,gate,terminal,'
-                     'status,max_delay_min,cancelled,reg,type_code')
+                     'status,max_delay_min,cancelled,reg,type_code,date')
              .in_('date', dates).eq('flight', fn)
              .order('updated_at', desc=True).limit(20).execute())
     except Exception:
@@ -2976,17 +2976,20 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
             dep_cands.append(r)
 
     def _best(cands):
-        # Nicht einfach die jüngste Row nehmen (die kann gate/sched-los sein): die
-        # inhaltsreichste bevorzugen — erst mit Gate, dann mit Soll-Zeit, sonst erste.
+        # (1) ANGEFRAGTES Datum bevorzugen — sonst kann eine Vortags-Beobachtung
+        #     desselben täglichen Flugs eine falsche (gestrige) Ist-Zeit liefern.
+        # (2) dann die inhaltsreichste Row (Gate, dann Soll) — nicht blind die jüngste.
         if not cands:
             return None
-        for r in cands:
+        same_day = [r for r in cands if (r.get('date') or '')[:10] == d]
+        pool = same_day or cands
+        for r in pool:
             if (r.get('gate') or '').strip():
                 return r
-        for r in cands:
+        for r in pool:
             if (r.get('sched') or '').strip():
                 return r
-        return cands[0]
+        return pool[0]
 
     return _obs_rows_to_facts(_best(dep_cands), _best(arr_cands))
 
