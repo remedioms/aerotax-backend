@@ -219,17 +219,80 @@ def test_tibor_2025_01_11_CPH_known_reader_limit():
     assert False  # xfail expected
 
 
-@pytest.mark.xfail(reason=(
-    '09-11 BER: Komplex — BER ist Inland-Stopp einer Auslandstour (Ziel MAD). '
-    'Aktuell als Z73 An/Ab (Inland) klassifiziert. Highest-defensible wäre '
-    'Z76 Spanien (Ziel-Land), aber das braucht eine "Tour-Goal-Country"-'
-    'Detection die noch nicht existiert. Stützt sich auf next_day.layover_ort '
-    'foreign — separater Fix HD-C nötig (nicht in dieser Iteration). '
-    'Siehe Pattern D.'
-))
-def test_tibor_2025_09_11_BER_needs_hd_c():
-    """Inland-Stop einer Auslandstour — separate Fix-Iteration."""
-    assert False  # xfail until HD-C implemented
+def test_tibor_2025_09_11_BER_via_hd_c():
+    """HD-C (2026-07-09): Inland-Stopp einer Auslandstour → Ziel-Land Z76.
+
+    Tibor 2025-09-11 (Doku Pattern D): BER-Anreisetag einer Nordmazedonien-Tour.
+    AT klassifizierte bislang Z73 BER 14€ (Inland-Stempel), FM Z76 Nordmazedonien
+    18€. HD-C erkennt den Inland-Stopp über den Auslands-Layover des Folgetags
+    (SKP) + kontinuierliche Tour und hebt highest-defensible auf Z76 Ziel-Land
+    An/Ab (18€) an. (Vormals xfail — 'needs HD-C'; jetzt implementiert.)"""
+    import app
+    matched = [
+        _make_day_for_classifier('2025-09-11', marker='X', activity_type='tour',
+                                  layover_ort='BER', routing=['FRA', 'BER'],
+                                  overnight=True, starts_at_homebase=True,
+                                  ends_at_homebase=False, duty_min=400,
+                                  se_count=1, se_stfrei_ort='BER',
+                                  se_stfrei_inland=True, se_stfrei_betrag=14.0),
+        _make_day_for_classifier('2025-09-12', marker='31591', activity_type='tour',
+                                  layover_ort='SKP', routing=['BER', 'SKP'],
+                                  overnight=True, starts_at_homebase=False,
+                                  ends_at_homebase=False, duty_min=400,
+                                  se_count=1, se_stfrei_ort='SKP',
+                                  se_stfrei_inland=False, se_stfrei_betrag=27.0),
+        _make_day_for_classifier('2025-09-13', activity_type='same_day',
+                                  routing=['SKP', 'FRA'], overnight=False,
+                                  starts_at_homebase=False, ends_at_homebase=True,
+                                  se_count=0),
+    ]
+    result = app._deterministic_classify_v7(matched, year=2025, homebase='FRA')
+    d = next(t for t in result['tage_detail'] if t['datum'] == '2025-09-11')
+    cr = d.get('classifier_result') or {}
+    assert d['klass'] == 'Z76', f"BER-Inland-Stopp → Z76 Ziel-Land, war {d['klass']}"
+    assert 'Nordmazedonien' in (cr.get('bmf_land') or ''), \
+        f"Ziel-Land via Folgetag-Layover SKP → Nordmazedonien, war '{cr.get('bmf_land')}'"
+    assert abs(float(d['eur']) - 18.0) < 0.01, \
+        f"Nordmazedonien An/Ab-Satz 18€, war {d['eur']}"
+
+
+def test_pattern_d_hd_c_rescue_block_exists():
+    """HD-C 2026-07-09: Inland-Stopp einer Auslandstour → Ziel-Land Z76 (statisch)."""
+    src = _read_app()
+    assert 'HD-C 2026-07-09' in src
+    assert 'def _hd_c_inland_stop_of_foreign_tour' in src
+    assert 'hd_c_inland_stop_of_foreign_tour' in src  # rescue_type
+    # Kern-Signal: Ziel-Land über den Auslands-Layover des FOLGETAGS
+    assert 'next_lay' in src
+
+
+def test_hd_c_does_not_fire_without_foreign_next():
+    """HD-C feuert NICHT, wenn der Folgetag KEIN Auslands-Layover hat — ein
+    normaler Inland-An/Ab-Tag bleibt Inland (Schutz vor false-positives)."""
+    import app
+    matched = [
+        _make_day_for_classifier('2025-09-11', marker='X', activity_type='tour',
+                                  layover_ort='BER', routing=['FRA', 'BER'],
+                                  overnight=True, starts_at_homebase=True,
+                                  ends_at_homebase=False, duty_min=400,
+                                  se_count=1, se_stfrei_ort='BER',
+                                  se_stfrei_inland=True, se_stfrei_betrag=14.0),
+        # Folgetag: INLAND-Layover (HAM) → HD-C darf NICHT feuern
+        _make_day_for_classifier('2025-09-12', marker='31591', activity_type='tour',
+                                  layover_ort='HAM', routing=['BER', 'HAM'],
+                                  overnight=True, starts_at_homebase=False,
+                                  ends_at_homebase=False, duty_min=400,
+                                  se_count=1, se_stfrei_ort='HAM',
+                                  se_stfrei_inland=True, se_stfrei_betrag=14.0),
+        _make_day_for_classifier('2025-09-13', activity_type='same_day',
+                                  routing=['HAM', 'FRA'], overnight=False,
+                                  starts_at_homebase=False, ends_at_homebase=True,
+                                  se_count=0),
+    ]
+    result = app._deterministic_classify_v7(matched, year=2025, homebase='FRA')
+    d = next(t for t in result['tage_detail'] if t['datum'] == '2025-09-11')
+    assert d['klass'] != 'Z76', \
+        f"HD-C darf ohne Auslands-Folgetag nicht feuern, war {d['klass']}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

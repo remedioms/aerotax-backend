@@ -46559,6 +46559,123 @@ FEATURE_ACTIVE_FOREIGN_SE_ISSUE_RESCUE_TO_Z76 = True
 FEATURE_TRAINING_SEQUENCE_COMMUTE_COLLAPSE = True
 FEATURE_HOTEL_COUNTER_STRICT_MODE = True
 FEATURE_DYNAMIC_HOMEBASE_MODE = True
+FEATURE_HD_C_INLAND_STOP_OF_FOREIGN_TOUR = True
+
+
+def _hd_c_inland_stop_of_foreign_tour(tage_detail, sorted_days, year, homebase='FRA'):
+    """HD-C 2026-07-09 (Highest-Defensible) — Inland-Stopp einer Auslandstour.
+
+    Ein An-/Abreisetag, den AT als Inland-Z73 (14 €) klassifiziert, weil der
+    SE-Stempel / CAS-Layover HEUTE ein deutscher Flughafen ist (z. B. BER), ist in
+    Wahrheit der Auslands-ANREISETAG, wenn die Crew NICHT nach Hause geht, sondern
+    im Inland übernachtet und am FOLGETAG in ein Auslands-Layover weiterfliegt.
+    Dann ist highest-defensible Z76 mit dem Ziel-Land (An/Ab-Satz), nicht Z73
+    Inland — genau die „Tour-Goal-Country"-Detection aus Pattern D (Doku
+    FOLLOWME_AEROTAX_TIBOR_2025_DAY_DIFF.md, Tibor 2025-09-11 BER→SKP: FM = Z76
+    Nordmazedonien 18 €, AT bislang Z73 BER 14 €).
+
+    Signal: `next_day.layover_ort` ist foreign + kontinuierliche Tour. Post-Pass
+    VOR der Counter-Aggregation (Counter lesen `tage_detail.klass`); mutiert
+    `tage_detail` in-place, gibt die Rescue-Liste zurück. KONSERVATIV — feuert nur,
+    wenn ALLE Anker halten; nie erfunden, nie werfen.
+
+    Guards (alle nötig):
+      A1 heute Auslands-Anreise aus Homebase (starts_at_homebase), Crew bleibt
+         unterwegs (overnight_after_day, NICHT ends_at_homebase)
+      A2 heute (noch) KEIN Auslands-Layover — sonst greifen die Ausland-Regeln
+         (heute leer/Inland/Homebase)
+      A3 FOLGETAG hat ein Auslands-Layover (= Ziel-Land der Tour)
+      A4 Folgetag ist echter Tour-Tag (Übernachtung ODER foreign-SE-Stempel)
+      A5 Ziel-Land hat einen BMF-An/Ab-Satz und ist echtes Ausland (≠ Deutschland)
+    """
+    rescues = []
+    if not FEATURE_HD_C_INLAND_STOP_OF_FOREIGN_TOUR:
+        return rescues
+    try:
+        if not tage_detail or not sorted_days:
+            return rescues
+        hb = (homebase or 'FRA').upper().strip()
+        pos = {}
+        for k, m in enumerate(sorted_days):
+            dt = (m.get('datum') or '')
+            if dt and dt not in pos:
+                pos[dt] = k
+        for t in tage_detail:
+            if not isinstance(t, dict) or t.get('klass') != 'Z73':
+                continue
+            datum = t.get('datum')
+            k = pos.get(datum)
+            if k is None or k + 1 >= len(sorted_days):
+                continue
+            dp_today = sorted_days[k].get('dp') or {}
+            dp_next = sorted_days[k + 1].get('dp') or {}
+            se_next = sorted_days[k + 1].get('se') or {}
+            # A1 — heute Auslands-Anreise aus Homebase, Crew bleibt unterwegs
+            if not dp_today.get('starts_at_homebase'):
+                continue
+            if not dp_today.get('overnight_after_day'):
+                continue
+            if dp_today.get('ends_at_homebase'):
+                continue
+            # A2 — heute (noch) KEIN Auslands-Layover
+            today_lay = (dp_today.get('layover_ort') or '').upper().strip()
+            if today_lay and not _is_inland_code(today_lay) and today_lay != hb:
+                continue
+            # A3 — Folgetag Auslands-Layover (= Ziel-Land)
+            next_lay = (dp_next.get('layover_ort') or '').upper().strip()
+            if not next_lay or _is_inland_code(next_lay) or next_lay == hb:
+                continue
+            # A4 — Folgetag echter Tour-Tag
+            next_se_foreign = bool(
+                se_next.get('count', 0) > 0
+                and se_next.get('stfrei_inland') is False
+                and se_next.get('stfrei_ort')
+            )
+            if not (dp_next.get('overnight_after_day') or next_se_foreign):
+                continue
+            # A5 — Ziel-Land-Satz (An/Ab, Grenz-Tag) + echtes Ausland
+            goal = _get_bmf_for_iata(next_lay, year)
+            if not isinstance(goal, dict) or not goal.get('an_abreise'):
+                continue
+            goal_eur = float(goal.get('an_abreise') or 0)
+            goal_land = IATA_TO_BMF.get(next_lay) or ''
+            if not goal_land or goal_land == 'Deutschland':
+                continue
+            # ── Reclassify Z73 (Inland) → Z76 (Ziel-Land, An/Ab) ──
+            old_eur = t.get('eur')
+            t['klass'] = 'Z76'
+            t['eur'] = round(goal_eur, 2)
+            t['begruendung'] = (
+                f'Inland-Stopp einer Auslandstour ({today_lay or "DE"}) — Ziel-Land '
+                f'{goal_land} via Folgetag-Layover {next_lay} → Z76 An/Ab '
+                f'(HD-C highest-defensible, BMF §9 Abs. 4a)'
+            )
+            cr = t.get('classifier_result')
+            if isinstance(cr, dict):
+                cr['klass'] = 'Z76'
+                cr['bmf_land'] = goal_land
+                cr['bmf_key'] = next_lay
+                cr['bmf_tagtyp'] = 'an_abreise'
+                cr['amount'] = round(goal_eur, 2)
+                cr['audit_note'] = (
+                    f'{datum}: HD-C Inland-Stopp→Ziel-Land — Folgetag-Layover '
+                    f'{next_lay} ({goal_land}) → Z76 An/Ab ({goal_eur:.0f}€, '
+                    f'war Z73 {old_eur}€)'
+                )
+            rescues.append({
+                'datum': datum,
+                'rescue_type': 'hd_c_inland_stop_of_foreign_tour',
+                'rescue_reason': (
+                    f'today inland An/Ab ({today_lay or "DE"}) + next.layover '
+                    f'{next_lay} foreign ({goal_land}) → Ziel-Land Z76'
+                ),
+                'eur': round(goal_eur, 2),
+            })
+            print(f"[hd-c-rescue] datum={datum} inland={today_lay or 'DE'} "
+                  f"next_layover={next_lay} land={goal_land} eur={goal_eur}")
+    except Exception:
+        pass
+    return rescues
 
 
 def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_minutes=0):
@@ -48450,6 +48567,18 @@ def _deterministic_classify_v7(matched_days, year=2025, homebase='FRA', commute_
             'sources':           sources,
             'diagnostics':       diagnostics,
         })
+
+    # ── HD-C 2026-07-09: Inland-Stopp einer Auslandstour → Ziel-Land Z76 ──
+    # Post-Pass VOR der Aggregation (Counter lesen tage_detail.klass); konservativ,
+    # feuert nur mit allen Ankern (starts_at_homebase + overnight + Folgetag-
+    # Auslands-Layover). Mutiert tage_detail in-place; nie werfen.
+    try:
+        _hd_c_rescues = _hd_c_inland_stop_of_foreign_tour(
+            tage_detail, sorted_days, year, homebase)
+        if _hd_c_rescues:
+            rescues.extend(_hd_c_rescues)
+    except Exception:
+        pass
 
     # ── Counter aus klass aggregieren ──
     z72_tage = sum(1 for t in tage_detail if t['klass'] == 'Z72')
