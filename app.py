@@ -12146,17 +12146,24 @@ def get_friends_today(token):
                             'sides': m.get('sides'),
                             'live': _clp,   # echte FR24-Position (Süd-Route) | None
                         })
-                        # SHADOW-MODE (FLIGHTSTATE_SHADOW): den vereinheitlichten
-                        # Engine-Zustand aus DENSELBEN schon geholten Daten rechnen
-                        # und Abweichungen loggen — KEINE Verhaltensänderung. Reuse
-                        # von m + _cp (kein Extra-Read). Best-effort, nie werfend.
+                        # FLIGHTSTATE-Engine: Shadow (loggen) und/oder Flip (die
+                        # Engine entscheidet `live` + liefert die Phase). Reuse von
+                        # m + _cp (kein Extra-Read). Best-effort, nie werfend.
+                        #   FLIGHTSTATE_SHADOW=1       → nur Diffs loggen
+                        #   FLIGHTSTATE_LIVE_FRIENDS=1 → Engine steuert live/phase
+                        #                                (Kill-Switch: Var entfernen)
                         try:
                             from blueprints.flight_state_shadow import shadow_enabled
-                            if shadow_enabled():
+                            _fs_flip = os.environ.get(
+                                'FLIGHTSTATE_LIVE_FRIENDS', '') in ('1', 'true', 'yes')
+                            if shadow_enabled() or _fs_flip:
                                 from blueprints.flight_state_collectors import (
                                     build_keys as _fs_bk,
                                     obs_from_board_merged as _fs_obm,
                                     obs_from_aircraft_live as _fs_oal)
+                                from blueprints.flight_state import (
+                                    resolve_flight_state as _fs_resolve,
+                                    project_friend_leg as _fs_proj)
                                 from blueprints.flight_state_shadow import shadow_record as _fs_shadow
                                 from blueprints.aerox_data_blueprint import _iata_latlon
                                 _fs_keys = _fs_bk(
@@ -12171,8 +12178,18 @@ def get_friends_today(token):
                                 _fs_obs = _fs_obm(m, _fs_keys,
                                                   board_to_iso=_board_local_to_utc_iso)
                                 _fs_obs += _fs_oal(_cp, _cr, _crg, _cty)
-                                _fs_shadow('friends_flights_live', _fs_keys,
-                                           _fs_obs, flights_live[-1])
+                                if shadow_enabled():
+                                    _fs_shadow('friends_flights_live', _fs_keys,
+                                               _fs_obs, flights_live[-1])
+                                if _fs_flip:
+                                    _fs = _fs_resolve(_fs_keys, _fs_obs)
+                                    _leg = _fs_proj(_fs)
+                                    # Engine-gegatete Position (Taxi ⇒ None ⇒ kein Geist)
+                                    flights_live[-1]['live'] = _leg['live']
+                                    flights_live[-1]['phase'] = _fs['phase']
+                                    flights_live[-1]['phase_conf'] = _fs['phase_conf']
+                                    flights_live[-1]['eta_iso'] = _fs['times']['eta_iso']
+                                    flights_live[-1]['eta_conf'] = _fs['times']['eta_conf']
                         except Exception:
                             pass
         except Exception:
