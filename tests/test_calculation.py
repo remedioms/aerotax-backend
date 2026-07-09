@@ -940,14 +940,14 @@ def test_v75_z72_not_in_inland_cluster():
     assert result['z74_tage'] >= 1
 
 
-@pytest.mark.xfail(reason='Veraltetes V7-Verhalten: DP=unknown + SE-only → Z73. '
-                          'R34 (2026-05) hat das absichtlich geändert: SE-Override '
-                          'darf clear-unknown-DP nicht überstimmen, weil SE ohne '
-                          'CAS-Tour-Marker Buchungs-Artefakt sein kann (Stornos, '
-                          'Hin/Rück-Doppelbuchungen). Aktuelles Verhalten: Frei.',
-                   strict=True)
-def test_v75_active_se_inland_without_cluster_z73():
-    """Aktive Inland-SE-Zeile bei DP=unknown (ohne Cluster) → Z73 (nicht Sonstiges)."""
+def test_v75_active_se_inland_without_cluster_stays_frei():
+    """DP=unknown + aktive Inland-SE-Zeile OHNE Cluster → Frei (nicht Z73).
+
+    R34 (2026-05, weiterhin gültig): eine SE-Override darf einen klaren unknown-DP
+    NICHT zu einem Arbeitstag hochstufen — eine SE-Zeile ohne CAS-Tour-Marker kann
+    ein Buchungs-Artefakt sein (Storno, Hin/Rück-Doppelbuchung) → konservativ Frei.
+    (Früheres V7-Verhalten war Z73; die positive Assertion hier ist zugleich der
+    Regressions-Schutz gegen einen Rückfall auf das alte Z73.)"""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': '2025-04-10', 'activity_type': 'unknown', 'overnight_after_day': False},
@@ -958,10 +958,8 @@ def test_v75_active_se_inland_without_cluster_z73():
     matched = _match_dp_se_per_day(structured, se)
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
     detail = [d for d in result['tage_detail'] if d['datum'] == '2025-04-10']
-    assert detail and detail[0]['klass'] == 'Z73', \
-        f"DP=unknown + aktive Inland-SE → Z73, ist {detail[0]['klass'] if detail else 'fehlt'}"
-    # Audit-Note dokumentiert die Reklassifikation
-    assert any('2025-04-10' in n for n in result.get('audit_notes', []))
+    assert detail and detail[0]['klass'] == 'Frei', \
+        f"DP=unknown + aktive Inland-SE ohne Cluster → Frei, ist {detail[0]['klass'] if detail else 'fehlt'}"
 
 
 # ── v8 Tests: Reader-Versions, Health-Check, Plausi-Hard-Fails, Issue-Klass ──
@@ -4145,15 +4143,15 @@ def test_v8190_bmf_land_homecoming_uses_prev_layover():
         f"Heimkehrtag bmf_land sollte Vortag-GRU=Brasilien sein, ist '{cr.get('bmf_land')}'"
 
 
-@pytest.mark.xfail(reason='Veraltetes V7-Verhalten: FRA-Stempel + ICN-Routing → '
-                          'bmf_land=Korea. V14 conservative-Z73 (2026-05) klassifiziert '
-                          'das jetzt als Z73 mit leerem bmf_land — Anreisetag mit '
-                          'SE.stfrei_ort=FRA wird konservativ als Inland behandelt, '
-                          'weil routing-tail nicht garantiert das Zielland ist '
-                          '(SOF→OTP-Transit etc.). FollowMe macht das ähnlich.',
-                   strict=True)
-def test_v8190_bmf_land_fra_stempel_uses_routing_tail():
-    """FRA-Stempel-Anreisetag auf Auslandstour → bmf_land aus routing-tail."""
+def test_v8190_bmf_land_fra_stempel_conservative_z73_no_guessed_land():
+    """FRA-Stempel-Anreisetag (Ziel unbekannt) → konservativ Z73, KEIN geratenes bmf_land.
+
+    V14 conservative-Z73 (2026-05, weiterhin gültig): ein Anreisetag mit
+    SE.stfrei_ort=Homebase (FRA) wird als Inland-Z73 mit leerem bmf_land behandelt,
+    weil der routing-tail (ICN) nicht garantiert das Zielland ist (SOF→OTP-Transit
+    etc.) — kein Korea-Rateschluss aus dem Routing (FollowMe macht das ähnlich).
+    (Früheres V7-Verhalten leitete Korea ab; die Assertion hier schützt gegen einen
+    Rückfall darauf.)"""
     from app import _deterministic_classify_v7, _match_dp_se_per_day
     structured = {'days': [
         {'datum': '2025-01-03', 'activity_type': 'tour', 'overnight_after_day': True,
@@ -4169,9 +4167,10 @@ def test_v8190_bmf_land_fra_stempel_uses_routing_tail():
     result = _deterministic_classify_v7(matched, 2025, 'FRA')
     t = result['tage_detail'][0]
     cr = t['classifier_result']
-    # Korea via routing-tail
-    assert 'Korea' in (cr.get('bmf_land') or ''), \
-        f"FRA-Stempel + ICN-Routing → Korea expected, got '{cr.get('bmf_land')}'"
+    assert t['klass'] == 'Z73', \
+        f"FRA-Stempel + unklares Ziel → konservativ Z73, got {t['klass']}"
+    assert not (cr.get('bmf_land') or ''), \
+        f"Ziel unbekannt → kein geratenes bmf_land, got '{cr.get('bmf_land')}'"
 
 
 def test_v8190_bmf_land_normal_layover_unchanged():
