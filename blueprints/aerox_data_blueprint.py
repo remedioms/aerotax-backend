@@ -3196,8 +3196,19 @@ def ax_flown_track():
                 if 2.0 < d1 < SNAP_KM:
                     points.append({'lat': b[0], 'lon': b[1], 'alt': None, 'gs': None, 'trk': None, 'ts': None})
 
+    # „Noch in der Luft?" = echte Spur, heutiges Datum, letzter Fix WEIT vom Ziel
+    # (also nicht ans arr angebunden). Dann endet die Linie an der aktuellen
+    # Position → iOS setzt dort einen Flugzeug-Marker (Owner: „end with airplane").
+    in_flight = False
+    if source in ('aircraft_track', 'fr24_trail') and points:
+        today = time.strftime('%Y-%m-%d', time.gmtime())
+        if (not date) or date >= today:
+            bb = _iata_latlon(arr) if arr else None
+            if bb:
+                in_flight = _haversine_km(bb[0], bb[1], points[-1]['lat'], points[-1]['lon']) > 150.0
+
     out = {'ok': True, 'reg': reg or None, 'flight': flight_no, 'date': date,
-           'dep': dep, 'arr': arr, 'source': source,
+           'dep': dep, 'arr': arr, 'source': source, 'in_flight': in_flight,
            'count': len(points), 'points': points}
     _memo_put(memo_key, out)
     resp = jsonify(out)
@@ -4839,7 +4850,18 @@ def ax_flight_live(token):
     payload = {
         'ok': True, 'flight': flight_no, 'date': date,
         'reg': reg, 'hex': hexid, 'callsign': cs,
+        # Flugzeugtyp aus dem Board/Warehouse (nie geraten) — für die „Flieger"-
+        # Zeile der In-Flight-Karte (reg · Muster).
+        'aircraft_type': (merged.get('aircraft') or None),
         'dep': _airport_brief(dep), 'dest': _airport_brief(dest),
+        # ABFLUG Soll/Ist (station-lokal, wie die Ankunfts-Seite) — Owner-Wunsch
+        # „Abflug Soll und Ist fehlt". Die Werte liegen schon im Dual-Side-Merge,
+        # wurden nur nicht durchgereicht. dep_delay_min nur bei bekanntem Delay.
+        'sched_dep': merged.get('sched_dep'),
+        'est_dep': merged.get('esti_dep'),
+        'dep_delay_min': (merged.get('dep_delay_min')
+                          if merged.get('delay_known') else None),
+        'dep_gate': merged.get('gate_dep'),
         'sched_arr': merged.get('sched_arr'),
         'est_arr': merged.get('esti_arr'),
         'arr_delay_min': (merged.get('arr_delay_min')
