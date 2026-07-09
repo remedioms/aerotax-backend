@@ -1127,6 +1127,10 @@ def _fr24_summary_to_leg(f):
                     and f.get('dest_icao_actual') != f.get('dest_icao'))
     return {
         'flight_no': f.get('flight'), 'flight': f.get('flight'),
+        # ECHTER Funkname (LH fliegt LH1412 als „DLH8UA", nicht „DLH1412") — den
+        # braucht iOS für die Live-Position (adsb.lol nach Callsign) und die
+        # korrekte Identität.
+        'callsign': (f.get('callsign') or '').upper() or None,
         'src': src, 'dst': dst, 'dep_iata': src, 'arr_iata': dst,
         'day': (tko or '')[:10] or None,
         'sched_dep': tko, 'sched_arr': ldg, 'duration_min': dur,
@@ -1221,7 +1225,8 @@ def _fr24_flight_by_number(flight_no, date=None):
     if legs:
         l = legs[0]
         out = {
-            'flight': l['flight_no'], 'airline': '', 'airline_name': '',
+            'flight': l['flight_no'], 'callsign': l.get('callsign'),
+            'airline': '', 'airline_name': '',
             'dep_iata': l['src'], 'dep_name': '', 'arr_iata': l['dst'], 'arr_name': '',
             'sched_dep': l['sched_dep'], 'sched_arr': l['sched_arr'],
             'est_dep': None, 'est_arr': None, 'duration_min': l['duration_min'],
@@ -2954,6 +2959,29 @@ def ax_resolve_callsign(callsign):
         return jsonify({'ok': True, 'callsign': cs, 'flight': flight,
                         'source': 'fr24'})
     return jsonify({'ok': False, 'callsign': cs, 'error': 'not_found'}), 200
+
+
+@aerox_data_bp.route('/api/ax/resolve-flight/<flightno>', methods=['GET'])
+def ax_resolve_flight(flightno):
+    """Flugnummer (z.B. LH1412) → tatsächlicher Flug via FR24 by-number: echte
+    Route + Reg + **echter Funkname** (Owner 2026-07-09: LH1412 fliegt als „DLH8UA",
+    NICHT „DLH1412" → freie Callsign-Ableitung ergab falsche Route FRA→SPU statt
+    FRA→BEG und keine Live-Position). iOS nimmt Route/Reg als Top-Wahrheit und den
+    echten Callsign für die adsb.lol-Live-Position. Permanent gespiegelt, gecacht.
+    {ok, number, flight, source}."""
+    fn = (flightno or '').strip().upper().replace(' ', '')
+    if len(fn) < 3:
+        return jsonify({'ok': False, 'error': 'bad_flight'}), 400
+    flight = _fr24_flight_by_number(fn)
+    if flight:
+        cs_fn = _life_app('_crowdsource_flight_obs')
+        if cs_fn:
+            try:
+                cs_fn(flight, None, source='fr24')
+            except Exception:
+                pass
+        return jsonify({'ok': True, 'number': fn, 'flight': flight, 'source': 'fr24'})
+    return jsonify({'ok': False, 'number': fn, 'error': 'not_found'}), 200
 
 
 @aerox_data_bp.route('/api/ax/harvest-routes', methods=['POST'])

@@ -460,3 +460,21 @@ def test_resolve_callsign_not_found(client):
         r = client.get('/api/ax/resolve-callsign/OCN999')
     assert r.status_code == 200
     assert r.get_json()['ok'] is False
+
+
+def test_resolve_flight_returns_truth_with_real_callsign(client):
+    """GET /api/ax/resolve-flight/LH1412 → echte Route + ECHTER Funkname (DLH8UA,
+    nicht DLH1412) via FR24, permanent."""
+    import blueprints.aerox_data_blueprint as BP
+    fr = {'flight': 'LH1412', 'callsign': 'DLH8UA', 'dep_iata': 'FRA',
+          'arr_iata': 'BEG', 'reg': 'DAINY', 'aircraft': 'A20N',
+          'sched_dep': '2026-07-09T12:00:00Z', 'sched_arr': None,
+          'duration_min': None, 'status': ''}
+    with patch.object(BP, '_fr24_flight_by_number', return_value=fr), \
+         patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
+        r = client.get('/api/ax/resolve-flight/LH1412')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['ok'] and body['flight']['arr_iata'] == 'BEG'
+    assert body['flight']['callsign'] == 'DLH8UA'
+    assert mcs.called

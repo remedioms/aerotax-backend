@@ -153,6 +153,7 @@ def test_flight_by_number_returns_status_schema():
     assert f['dep_iata'] == 'FRA' and f['arr_iata'] == 'JFK'
     assert f['duration_min'] == 480
     assert f['reg'] == 'DAIHW' and f['aircraft'] == 'A346'
+    assert f['callsign'] == 'DLH'          # echter Funkname für Live-Position
 
 
 def test_flight_by_number_none_when_no_data():
