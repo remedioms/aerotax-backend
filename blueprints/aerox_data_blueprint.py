@@ -3070,19 +3070,33 @@ def ax_flown_track():
     reg = reg or (reg_used or '')
 
     # Tier 2: zu wenig eigene Spur → FR24-Trail on-demand (+ Rückschreibung).
+    # Position bevorzugt aus mitgegebenen Radar-Koordinaten (lat/lon/hex) → so
+    # klappt der Trail für JEDE Airline (Radar-Tap eines fremden Fliegers), nicht
+    # nur für die LH-Group-Fleet in aircraft_live. Sonst Fallback auf aircraft_live.
     is_today = (not date) or (date == time.strftime('%Y-%m-%d', time.gmtime()))
     if len(points) < 3 and is_today:
-        try:
-            pos, route, reg_disp, _ac = _aircraft_live_pos(
-                reg=reg or None, flight=flight_no, max_age_min=60)
-        except Exception:
-            pos, route = None, None
-        if pos and pos.get('lat') is not None:
+        def _f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        q_lat, q_lon = _f(request.args.get('lat')), _f(request.args.get('lon'))
+        q_hex = (request.args.get('hex') or '').strip().lower() or None
+        reg_disp = None
+        if q_lat is None or q_lon is None:
+            try:
+                pos, _route, reg_disp, _ac = _aircraft_live_pos(
+                    reg=reg or None, flight=flight_no, max_age_min=60)
+            except Exception:
+                pos = None
+            if pos and pos.get('lat') is not None:
+                q_lat, q_lon = pos.get('lat'), pos.get('lon')
+        if q_lat is not None and q_lon is not None:
             try:
                 from blueprints import fr24_grpc
                 trail = fr24_grpc.flown_trail(
-                    reg=reg or (reg_disp or None), flight=flight_no,
-                    lat=pos.get('lat'), lon=pos.get('lon'))
+                    reg=reg or (reg_disp or None), hex=q_hex,
+                    flight=flight_no, lat=q_lat, lon=q_lon)
             except Exception:
                 trail = None
             if trail and trail.get('points'):
