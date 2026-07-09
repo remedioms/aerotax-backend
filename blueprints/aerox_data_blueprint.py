@@ -2506,7 +2506,7 @@ def ax_tail_history():
         try:
             q = (sb.table('flights')
                  .select('op_flight_no,origin,destination,service_date,'
-                         'sched_dep,est_dep,status,tail,hex'))
+                         'sched_dep,est_dep,sched_arr,est_arr,status,tail,hex'))
             if reg:
                 # Gleiche hyphen-tolerante Varianten wie _route_from_warehouse
                 # (Warehouse führt Tails teils mit, teils ohne Bindestrich).
@@ -2530,10 +2530,25 @@ def ax_tail_history():
                 if key in seen:
                     continue
                 seen.add(key)
+                # Ankunftszeit + planmäßige Flugdauer GRATIS: die flights-Row trägt
+                # sched_arr (absolut-UTC, +00:00) → _sched_block_min ist robust
+                # (absolute Strings werden nicht nochmal TZ-verschoben). None wenn
+                # arr fehlt oder unplausibel — nie erfunden.
+                _sa = f.get('sched_arr')
+                _dur = None
+                if _sa:
+                    _sbm = _life_app('_sched_block_min')
+                    if _sbm:
+                        try:
+                            _dur = _sbm(f.get('sched_dep'), src, _sa, dst)
+                        except Exception:
+                            _dur = None
                 legs.append({'flight_no': f.get('op_flight_no'),
                              'src': src, 'dst': dst,
                              'day': f.get('service_date'),
                              'sched_dep': f.get('sched_dep'),
+                             'sched_arr': _sa,
+                             'duration_min': _dur,
                              'status': f.get('status')})
                 if len(legs) >= 10:
                     break

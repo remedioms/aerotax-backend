@@ -218,3 +218,55 @@ def test_route_history_no_duration_for_arr_only(client):
     if days:
         for f in days[0]['flights']:
             assert 'duration_min' not in f or f['duration_min'] is None
+
+
+# ─────────────────────── tail-history endpoint wiring ───────────────────────
+
+def _fake_flights_sb(rows):
+    """Chainbares Fake-Supabase für den flights-Query der tail-history
+    (table→select→in_→order→order→limit→execute)."""
+    from unittest.mock import MagicMock
+    from types import SimpleNamespace
+    q = MagicMock()
+    for m in ('table', 'select', 'in_', 'eq', 'order', 'limit', 'gte'):
+        getattr(q, m).return_value = q
+    q.execute.return_value = SimpleNamespace(data=rows)
+    return q
+
+
+def test_tail_history_includes_duration(client):
+    """tail-history-Leg trägt sched_arr + duration_min — flights.sched_arr ist
+    absolut-UTC (+00:00), _sched_block_min bleibt korrekt (kein Doppel-Shift)."""
+    import blueprints.aerox_data_blueprint as BP
+    rows = [{
+        'op_flight_no': 'LH1128', 'origin': 'FRA', 'destination': 'BCN',
+        'service_date': '2026-07-08',
+        'sched_dep': '2026-07-08T12:45:00+00:00',
+        'sched_arr': '2026-07-08T14:50:00+00:00',   # 125 min
+        'est_dep': None, 'est_arr': None,
+        'status': 'landed', 'tail': 'DAINV', 'hex': '3c6789',
+    }]
+    with patch.object(BP, '_sb', return_value=_fake_flights_sb(rows)):
+        r = client.get('/api/ax/tail-history?reg=D-AINV')
+    assert r.status_code == 200
+    legs = r.get_json()['legs']
+    assert legs and legs[0]['flight_no'] == 'LH1128'
+    assert legs[0]['sched_arr'] == '2026-07-08T14:50:00+00:00'
+    assert legs[0]['duration_min'] == 125
+
+
+def test_tail_history_no_arr_no_duration(client):
+    """Leg ohne sched_arr → duration_min None (nichts erfunden)."""
+    import blueprints.aerox_data_blueprint as BP
+    rows = [{
+        'op_flight_no': 'LH1128', 'origin': 'FRA', 'destination': 'BCN',
+        'service_date': '2026-07-08', 'sched_dep': '2026-07-08T12:45:00+00:00',
+        'sched_arr': None, 'est_dep': None, 'est_arr': None,
+        'status': 'landed', 'tail': 'DAINV', 'hex': '3c6789',
+    }]
+    with patch.object(BP, '_sb', return_value=_fake_flights_sb(rows)):
+        r = client.get('/api/ax/tail-history?reg=D-AINV')
+    assert r.status_code == 200
+    legs = r.get_json()['legs']
+    assert legs and legs[0]['sched_arr'] is None
+    assert legs[0]['duration_min'] is None
