@@ -389,7 +389,9 @@ def _board_arr_epoch(cs, route, date, D):
 
 def route_for_flight(callsign=None, hex=None, reg=None, lat=None, lon=None,
                      track=None, gs=None, on_ground=False, for_search=False,
-                     allow_paid=True, date=None):
+                     allow_paid=False, date=None):   # Default FALSE (Ultraplan-Fix #3:
+                     # war True = Footgun; alle 3 Aufrufer setzen es eh explizit,
+                     # aber ein neuer Aufrufer soll NICHT versehentlich Paid ziehen)
     """Die EINE Route-Kaskade (Callsign/Flug → Start/Ziel), free-first, konsistent.
 
     REIHENFOLGE (frei VOR bezahlt):
@@ -438,6 +440,24 @@ def route_for_flight(callsign=None, hex=None, reg=None, lat=None, lon=None,
                 arr_epoch = _board_arr_epoch(cs, route, date, D)
             return _leg_window_allows(route, date, arr_epoch=arr_epoch)
         return D._geometry_allows_route(route, lat, lon, track, gs, on_ground)
+
+    # ── 0) aircraft_live (NAS-gRPC-Harvester, ~800 aktive Flieger, 60s frisch,
+    #    echter Funkname + origin/dest) — für den AKTIVEN Flug die FRISCHESTE
+    #    Identitäts+Route-Wahrheit. Owner 2026-07-09: LH1412 fliegt als „DLH8UA",
+    #    der Radar-Tap zeigte FRA→SPU statt FRA→BEG, WEIL aircraft_live gar nicht in
+    #    der Kaskade war (Ultraplan Phase 1). Callsign-Match (der Blip trägt den
+    #    echten Funknamen); nur mit Geometrie-Gate akzeptiert wie jede Live-Quelle.
+    try:
+        alf = D._aircraft_live_flight(callsign=cs)
+    except Exception:
+        alf = None
+    if alf and alf.get('dep_iata') and alf.get('arr_iata'):
+        _al_route = {'src': alf['dep_iata'], 'dst': alf['arr_iata'],
+                     'source': 'aircraft_live', 'confidence': 'confirmed',
+                     'reg': alf.get('reg')}
+        if _accept(_al_route):
+            D._record_resolved_route(cs, reg_u, _al_route, date)
+            return _al_route
 
     # ── 1) Eigene Warehouse: date-gekeyter Cache (nackter-CS-Key NIE) ──────────
     cached = D._cache_get('ax_route_cache', 'flight', f'{cs}@{dk}')

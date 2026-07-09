@@ -118,6 +118,10 @@ class Settings:
     track_enabled: bool = os.getenv("TRACK_ENABLED", "1") not in ("0", "false", "no", "")
     track_table: str = os.getenv("TRACK_TABLE", "aircraft_track")
     track_min_nm: float = float(os.getenv("TRACK_MIN_NM", "1.0"))
+    # Track ALLE Airlines (Owner 2026-07-09 „jeden Flug speichern") — nicht nur die
+    # LH-Group-Prefixe. Der Kachel-Zyklus (~15 min/Airframe) hält das Volumen grob;
+    # Retention deckelt bei 10 Tagen. aircraft_live (Snapshot) bleibt LH-Group-only.
+    track_all_carriers: bool = os.getenv("TRACK_ALL_CARRIERS", "1") not in ("0", "false", "no", "")
 
     backoff_base: float = float(os.getenv("BACKOFF_BASE_S", "30"))
     backoff_cap: float = float(os.getenv("BACKOFF_CAP_S", "900"))
@@ -396,6 +400,7 @@ class Ingest:
         tile = self._s.tiles[idx]
         flights = await _fetch_tile(fr24, tile, self._s)
         rows, seen = [], set()
+        track_rows, track_seen = [], set()
         mono = time.monotonic()
         for fl in flights:
             snap = _flight_to_snapshot(fl, self._s.prefixes)
@@ -403,13 +408,19 @@ class Ingest:
                 seen.add(snap["reg"])
                 rows.append(snap)
                 self._latest[snap["reg"]] = (snap, mono)   # RAM-Store aktuell halten
+            # Track: ALLE Airlines → eigener, filterloser Snapshot (set() = kein Filter).
+            if self._s.track_all_carriers:
+                tsnap = _flight_to_snapshot(fl, set())
+                if tsnap and tsnap["reg"] not in track_seen:
+                    track_seen.add(tsnap["reg"])
+                    track_rows.append(tsnap)
         # RAM-Prune: alte Einträge raus (der Flug ist gelandet / aus der Kachel).
         cut = mono - self._s.prune_age
         stale = [k for k, (_, t) in self._latest.items() if t < cut]
         for k in stale:
             self._latest.pop(k, None)
         n_up = await self._upsert(rows)
-        n_tr = await self._append_track(rows)
+        n_tr = await self._append_track(track_rows if self._s.track_all_carriers else rows)
         self._win_rows += n_up
         log.debug("tile%d flights=%d matched=%d ram=%d upserted=%d track+=%d",
                   idx, len(flights), len(rows), len(self._latest), n_up, n_tr)

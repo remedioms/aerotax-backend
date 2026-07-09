@@ -54,6 +54,8 @@ def _isolated(monkeypatch):
     monkeypatch.setattr(D, '_route_from_warehouse', lambda *a, **k: None)
     monkeypatch.setattr(D, '_route_from_fr24', lambda *a, **k: None)
     monkeypatch.setattr(D, '_free_generic_route', lambda *a, **k: None)
+    # Tier-0 aircraft_live (Ultraplan Phase 1) — default sauberer Miss.
+    monkeypatch.setattr(D, '_aircraft_live_flight', lambda *a, **k: None)
     # Gate für den Nicht-Suche-Pfad: standardmäßig „widerspricht nicht" → True.
     monkeypatch.setattr(D, '_geometry_allows_route', lambda *a, **k: True)
     # Persistenz-Write ist ein No-op im Test (kein SB).
@@ -96,6 +98,26 @@ def _iso(dt):
 # ═══════════════════════════════════════════════════════════════
 #  (a) ROUTE: frei VOR bezahlt
 # ═══════════════════════════════════════════════════════════════
+
+def test_aircraft_live_route_is_tier0_beats_board_and_warehouse(monkeypatch):
+    """aircraft_live (echter Funkname + frische origin/dest, Ultraplan Phase 1) ist
+    Tier 0: schlägt Board UND Warehouse — löst LH1412=DLH8UA-Falschroute an der
+    Wurzel (Radar-Tap hatte aircraft_live gar nicht in der Kaskade)."""
+    monkeypatch.setattr(D, '_aircraft_live_flight',
+                        lambda *a, **k: {'dep_iata': 'FRA', 'arr_iata': 'BEG',
+                                         'reg': 'DAINY'})
+    # Board + Warehouse würden eine ANDERE (falsche) Route liefern — dürfen aber
+    # gar nicht erst gefragt werden, weil Tier 0 vorher trifft.
+    board = MagicMock(return_value={'src': 'FRA', 'dst': 'SPU'})
+    wh = MagicMock(return_value={'src': 'FRA', 'dst': 'SPU'})
+    monkeypatch.setattr(D, '_route_from_obs', board)
+    monkeypatch.setattr(D, '_route_from_warehouse', wh)
+    route = WR.route_for_flight(callsign='DLH8UA', reg='DAINY')
+    assert route['src'] == 'FRA' and route['dst'] == 'BEG'   # nicht SPU
+    assert route['source'] == 'aircraft_live'
+    board.assert_not_called()
+    wh.assert_not_called()
+
 
 def test_board_route_beats_paid_and_never_queries_bare_cs(monkeypatch):
     """Ein Board-Treffer (airport_delay_obs) wird geliefert und die BEZAHLTEN

@@ -3133,13 +3133,13 @@ def ax_flown_track():
 
 @aerox_data_bp.route('/api/internal/track-prune', methods=['POST'])
 def ax_track_prune():
-    """Retention: aircraft_track-Breadcrumbs älter als TRACK_RETENTION_DAYS (60)
+    """Retention: aircraft_track-Breadcrumbs älter als TRACK_RETENTION_DAYS (10)
     löschen. Geschützt per X-Poll-Secret (== ADSB_POLL_SECRET), Cron-getriggert."""
     from flask import request
     secret = os.environ.get('ADSB_POLL_SECRET', '').strip()
     if secret and (request.headers.get('X-Poll-Secret') or '').strip() != secret:
         return jsonify({'ok': False, 'error': 'unauthorized'}), 401
-    days = int(os.environ.get('TRACK_RETENTION_DAYS', '60'))
+    days = int(os.environ.get('TRACK_RETENTION_DAYS', '10'))
     cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - days * 86400))
     sb = _sb()
     if sb is None:
@@ -3250,6 +3250,156 @@ def ax_resolve_flight(flightno):
                     pass
         return jsonify({'ok': True, 'number': fn, 'flight': flight, 'source': src})
     return jsonify({'ok': False, 'number': fn, 'error': 'not_found'}), 200
+
+
+def _detail_subcall(app_obj, path, view_fn, *view_args):
+    """Ruft eine bestehende /api/ax/*-View intern auf (eigener Request-Kontext, damit
+    ihre `request.args` + `_public_cache_headers(request.path)` funktionieren) und gibt
+    ihr JSON-Dict zurück. So bündelt das Aggregat die Einzel-Endpoints OHNE Netz-
+    Roundtrip und OHNE ihre Logik zu duplizieren (Zero-Double-Spend: dieselben Calls,
+    dieselben Caches). Fehler/None → None; ein Ausfall darf das Bündel nie kippen.
+
+    `app_obj` MUSS das konkrete App-Objekt sein (nicht `current_app`): die Fan-out-
+    Calls laufen in ThreadPool-Workern OHNE gepushten App-Kontext — `test_request_
+    context` auf dem echten App-Objekt pusht App- UND Request-Kontext im Worker selbst."""
+    if not view_fn or app_obj is None:
+        return None
+    try:
+        with app_obj.test_request_context(path):
+            resp = view_fn(*view_args)
+            if isinstance(resp, tuple):          # (jsonify(...), status) — z.B. 404
+                resp = resp[0]
+            if hasattr(resp, 'get_json'):
+                return resp.get_json(silent=True)
+    except Exception:
+        return None
+    return None
+
+
+@aerox_data_bp.route('/api/ax/flight-detail/<query>', methods=['GET'])
+def ax_flight_detail(query):
+    """EIN-Call-Aggregat für die Flug-Detailseite (Owner 2026-07-09: „Detailseite lädt
+    gestückelt und langsam"). Bündelt die bisher SECHS Einzel-Endpoints — resolve-
+    flight/-callsign + flight-info + flight-route + route-history + photo-reg — server-
+    seitig in EINE Antwort. Statt sechs Handy→Backend-Roundtrips nur noch einer, und die
+    Karten erscheinen zusammen statt einzeln einzufaden. Backend↔Quelle ist co-located
+    (Supabase-Pooler/Warehouse), also viel schneller als das Gerät ×6.
+
+    Die teure Live-Position (adsb.lol/FR24-gRPC) bleibt BEWUSST draussen — iOS lädt sie
+    getrennt/non-blocking, damit der Screen nicht auf den langsamsten Anbieter wartet.
+    Alles free-first (identisch zu den Einzel-Views, kein neuer Spend), 45s-memoisiert.
+    Query = IATA-Flugnummer (LH1412) oder — mit ?callsign=1 — roher ICAO-Funkname
+    (DLH7AV). Sub-Objekte spiegeln 1:1 die bestehenden Endpoint-Shapes."""
+    from flask import request
+    q = (query or '').strip().upper().replace(' ', '')
+    if len(q) < 3:
+        return jsonify({'ok': False, 'error': 'bad_query'}), 400
+    if _ax_rate_limited('flight_detail', limit=90, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    is_cs = str(request.args.get('callsign', '')).lower() in ('1', 'true', 'yes')
+    date_q = (request.args.get('date') or '').strip() or None
+    fresh = str(request.args.get('fresh', '')).lower() in ('1', 'true', 'yes')
+
+    memo_key = ('flight_detail', q, '1' if is_cs else '0', date_q or '')
+    if not fresh:
+        cached = _memo_get(memo_key)
+        if cached is not None:
+            return jsonify(cached)
+
+    def _qs(**kw):
+        parts = ["%s=%s" % (k, urllib.parse.quote(str(v))) for k, v in kw.items() if v]
+        return ("?" + "&".join(parts)) if parts else ""
+
+    def _pick(*vals):
+        for v in vals:
+            if v:
+                s = str(v).strip().upper()
+                if s:
+                    return s
+        return None
+
+    out = {'ok': True, 'query': q, 'callsign_query': is_cs, 'date': date_q}
+
+    from flask import current_app
+    _app = current_app._get_current_object()   # konkretes App-Objekt für die Worker-Threads
+
+    # Die Quellen als abgeschlossene Callables (jede isoliert via _detail_subcall).
+    def _resolve_call():
+        if is_cs:
+            return _detail_subcall(_app, '/api/ax/resolve-callsign/%s' % urllib.parse.quote(q),
+                                   ax_resolve_callsign, q)
+        return _detail_subcall(_app, '/api/ax/resolve-flight/%s' % urllib.parse.quote(q),
+                               ax_resolve_flight, q)
+
+    def _info_call(fn):
+        i = _detail_subcall(_app, '/api/ax/flight-info/%s%s' % (urllib.parse.quote(fn), _qs(date=date_q)),
+                            _life_app('ax_flight_info'), fn)
+        return i if (i or {}).get('found') else None
+
+    def _route_call(cs):
+        r = _detail_subcall(_app, '/api/ax/flight-route/%s%s' % (urllib.parse.quote(cs), _qs(date=date_q)),
+                            _life_app('ax_flight_route'), cs)
+        return r if (r or {}).get('found') else None
+
+    def _history_call(o, d):
+        h = _detail_subcall(_app, '/api/ax/route-history/%s/%s?days=7' % (urllib.parse.quote(o),
+                                                                          urllib.parse.quote(d)),
+                            _life_app('ax_route_history'), o, d)
+        return h if (h or {}).get('ok') else None
+
+    def _photo_call(rg):
+        p = _detail_subcall(_app, '/api/ax/photo-reg/%s' % urllib.parse.quote(rg), ax_photo_reg, rg)
+        return p if (p or {}).get('ok') else None
+
+    # PARALLEL FAN-OUT — die einzige echte Abhängigkeit ist der ECHTE Funkname aus
+    # `resolve` (treibt flight-route). Alles andere überlappt. Wall-Clock ≈ der lange
+    # Pol (resolve/FR24-Fallback bei nicht-fliegenden Flügen), nicht die Summe — sonst
+    # wäre das Aggregat langsamer als die 6 parallelen Handy-Calls von vorher. Flask-
+    # Kontexte sind thread-local; jeder _detail_subcall pusht seinen eigenen.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        # Phase A: resolve + (flight-info schon jetzt, wenn die IATA-Nummer feststeht —
+        # bei Flugnummer-Suche = die Query selbst; bei Funkname-Suche erst nach resolve).
+        f_resolve = ex.submit(_resolve_call)
+        f_info = ex.submit(_info_call, q) if not is_cs else None
+        resolve = f_resolve.result()
+        resolve_flight = (resolve or {}).get('flight') if (resolve or {}).get('ok') else None
+
+        fn_iata = ((resolve_flight or {}).get('flight') or '').upper().replace(' ', '') or None
+        real_cs = ((resolve_flight or {}).get('callsign') or '').upper().replace(' ', '') or None
+        if not fn_iata and not is_cs:
+            fn_iata = q
+        if not real_cs and is_cs:
+            real_cs = q
+        cs_for_route = real_cs or (q if is_cs else None)
+
+        # Phase B: route + history + photo (+ info für den Funkname-Fall) — alle parallel.
+        # Origin/Dest kommen aus resolve/info (NICHT aus route) → history wartet nicht
+        # auf flight-route.
+        if f_info is None and fn_iata:
+            f_info = ex.submit(_info_call, fn_iata)
+        info = f_info.result() if f_info else None
+
+        origin = _pick((resolve_flight or {}).get('dep_iata'), (info or {}).get('origin'))
+        dest = _pick((resolve_flight or {}).get('arr_iata'), (info or {}).get('dest'))
+        reg = _pick((resolve_flight or {}).get('reg'), (info or {}).get('reg'))
+
+        f_route = ex.submit(_route_call, cs_for_route) if cs_for_route else None
+        f_hist = ex.submit(_history_call, origin, dest) if (origin and dest) else None
+        f_photo = ex.submit(_photo_call, reg) if reg else None
+        route = f_route.result() if f_route else None
+        history = f_hist.result() if f_hist else None
+        photo = f_photo.result() if f_photo else None
+
+    out['resolve'] = resolve_flight
+    out['callsign'] = real_cs
+    out['flight_iata'] = fn_iata
+    out['route'] = route
+    out['info'] = info
+    out['history'] = history
+    out['photo'] = photo
+
+    return jsonify(_memo_put(memo_key, out))
 
 
 @aerox_data_bp.route('/api/ax/harvest-routes', methods=['POST'])
