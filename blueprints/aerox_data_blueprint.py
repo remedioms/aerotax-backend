@@ -421,6 +421,52 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
     return pos, (src, dst), reg_disp, ac_type
 
 
+def _aircraft_live_flight(flight=None, callsign=None, max_age_min=40):
+    """Aktiven Flug aus dem GRATIS `aircraft_live`-Warehouse (FR24-gRPC-Scraper,
+    kein Credit) — echter Funkname + Reg + Route + Typ. Löst genau das Problem
+    „Airline-Funkname ≠ Flugnummer" (LH1412 = DLH8UA) OHNE FR24, solange der Flug
+    aktiv/geharvestet ist (LH-Group + dt. Carrier). Liefert ein Dict im flight_
+    status-Schema oder None. Match by flight-Nr ODER callsign."""
+    fn = (flight or '').replace(' ', '').upper() or None
+    cs = (callsign or '').replace(' ', '').upper() or None
+    if not (fn or cs):
+        return None
+    sb = _sb()
+    if sb is None:
+        return None
+    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                           time.gmtime(time.time() - max_age_min * 60))
+    sel = 'flight,callsign,reg,reg_display,ac_type,origin,dest,on_ground,seen_ts'
+    try:
+        q = sb.table('aircraft_live').select(sel).gt('updated_at', cutoff)
+        q = q.eq('flight', fn) if fn else q.eq('callsign', cs)
+        rows = (q.order('updated_at', desc=True).limit(1).execute()).data or []
+    except Exception:
+        return None
+    if not rows:
+        return None
+    a = rows[0]
+    src = (a.get('origin') or '').strip().upper() or None
+    dst = (a.get('dest') or '').strip().upper() or None
+    if not (src and dst):
+        return None
+    reg = re.sub(r'[^A-Z0-9]', '', (a.get('reg_display') or a.get('reg') or '').upper()) or None
+    typ = (a.get('ac_type') or '').strip().upper() or None
+    return {
+        'flight': fn or (a.get('flight') or '').upper(),
+        'callsign': (a.get('callsign') or '').upper() or None,
+        'airline': '', 'airline_name': '',
+        'dep_iata': src, 'dep_name': '', 'arr_iata': dst, 'arr_name': '',
+        'sched_dep': None, 'sched_arr': None, 'est_dep': None, 'est_arr': None,
+        'duration_min': None, 'dep_gate': '', 'dep_terminal': '',
+        'arr_gate': '', 'arr_terminal': '', 'arr_baggage': '',
+        'status': ('on_ground' if a.get('on_ground') else 'enroute'),
+        'status_category': '', 'aircraft': typ, 'reg': reg,
+        'dep_delay_min': None, 'arr_delay_min': None,
+        'delay_min': None, 'delay_side': None, 'source': 'aircraft_live',
+    }
+
+
 def _route_from_fr24(callsign=None, hexid=None):
     """GRATIS-Route aus dem verteilten FR24-Store (`fr24_live`, gleiche Supabase;
     gefüllt vom NAS-Harvester). feed.js trägt Start/Ziel (IATA) pro Flieger →
@@ -2948,16 +2994,22 @@ def ax_resolve_callsign(callsign):
     cs = (callsign or '').strip().upper()
     if len(cs) < 3:
         return jsonify({'ok': False, 'error': 'bad_callsign'}), 400
-    flight = _fr24_flight_by_callsign(cs)
+    # FREE-FIRST: aktiver Flug gratis im aircraft_live (by callsign) → kein FR24.
+    flight = _aircraft_live_flight(callsign=cs)
+    src = 'aircraft_live'
+    if not flight:
+        flight = _fr24_flight_by_callsign(cs)
+        src = 'fr24'
     if flight:
-        cs_fn = _life_app('_crowdsource_flight_obs')
-        if cs_fn:
-            try:
-                cs_fn(flight, None, source='fr24')
-            except Exception:
-                pass
+        if src == 'fr24':
+            cs_fn = _life_app('_crowdsource_flight_obs')
+            if cs_fn:
+                try:
+                    cs_fn(flight, None, source='fr24')
+                except Exception:
+                    pass
         return jsonify({'ok': True, 'callsign': cs, 'flight': flight,
-                        'source': 'fr24'})
+                        'source': src})
     return jsonify({'ok': False, 'callsign': cs, 'error': 'not_found'}), 200
 
 
@@ -2972,15 +3024,22 @@ def ax_resolve_flight(flightno):
     fn = (flightno or '').strip().upper().replace(' ', '')
     if len(fn) < 3:
         return jsonify({'ok': False, 'error': 'bad_flight'}), 400
-    flight = _fr24_flight_by_number(fn)
+    # FREE-FIRST: aktiver Flug steht mit echtem Funknamen gratis im aircraft_live
+    # (gRPC-Scraper) → kein FR24-Credit. FR24 nur wenn nicht aktiv/geharvestet.
+    flight = _aircraft_live_flight(flight=fn)
+    src = 'aircraft_live'
+    if not flight:
+        flight = _fr24_flight_by_number(fn)
+        src = 'fr24'
     if flight:
-        cs_fn = _life_app('_crowdsource_flight_obs')
-        if cs_fn:
-            try:
-                cs_fn(flight, None, source='fr24')
-            except Exception:
-                pass
-        return jsonify({'ok': True, 'number': fn, 'flight': flight, 'source': 'fr24'})
+        if src == 'fr24':          # nur bezahlte Auflösung permanent spiegeln
+            cs_fn = _life_app('_crowdsource_flight_obs')
+            if cs_fn:
+                try:
+                    cs_fn(flight, None, source='fr24')
+                except Exception:
+                    pass
+        return jsonify({'ok': True, 'number': fn, 'flight': flight, 'source': src})
     return jsonify({'ok': False, 'number': fn, 'error': 'not_found'}), 200
 
 

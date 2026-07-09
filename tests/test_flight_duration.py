@@ -228,7 +228,7 @@ def _fake_flights_sb(rows):
     from unittest.mock import MagicMock
     from types import SimpleNamespace
     q = MagicMock()
-    for m in ('table', 'select', 'in_', 'eq', 'order', 'limit', 'gte'):
+    for m in ('table', 'select', 'in_', 'eq', 'order', 'limit', 'gte', 'gt'):
         getattr(q, m).return_value = q
     q.execute.return_value = SimpleNamespace(data=rows)
     return q
@@ -443,7 +443,8 @@ def test_resolve_callsign_returns_true_flight(client):
           'arr_iata': 'RSW', 'reg': 'DAIKO', 'aircraft': 'A333',
           'sched_dep': '2026-07-09T12:00:00Z', 'sched_arr': None,
           'duration_min': None, 'status': ''}
-    with patch.object(BP, '_fr24_flight_by_callsign', return_value=fr), \
+    with patch.object(BP, '_aircraft_live_flight', return_value=None), \
+         patch.object(BP, '_fr24_flight_by_callsign', return_value=fr), \
          patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
         r = client.get('/api/ax/resolve-callsign/OCN601')
     assert r.status_code == 200
@@ -462,6 +463,36 @@ def test_resolve_callsign_not_found(client):
     assert r.get_json()['ok'] is False
 
 
+def test_aircraft_live_flight_free_callsign():
+    """aircraft_live (gratis) liefert echten Funknamen + Route + Reg für aktiven Flug."""
+    import blueprints.aerox_data_blueprint as BP
+    row = {'flight': 'LH1412', 'callsign': 'DLH8UA', 'reg': 'DAINY',
+           'reg_display': 'D-AINY', 'ac_type': 'A20N', 'origin': 'FRA',
+           'dest': 'BEG', 'on_ground': False, 'seen_ts': '2026-07-09T12:50:00Z'}
+    with patch.object(BP, '_sb', return_value=_fake_flights_sb([row])):
+        f = BP._aircraft_live_flight(flight='LH1412')
+    assert f is not None
+    assert f['callsign'] == 'DLH8UA' and f['dep_iata'] == 'FRA' and f['arr_iata'] == 'BEG'
+    assert f['reg'] == 'DAINY' and f['aircraft'] == 'A20N'
+    assert f['source'] == 'aircraft_live'
+
+
+def test_resolve_flight_free_first_no_fr24_credit(client):
+    """resolve-flight nimmt ZUERST das gratis aircraft_live → KEIN FR24-Credit."""
+    import blueprints.aerox_data_blueprint as BP
+    live = {'flight': 'LH1412', 'callsign': 'DLH8UA', 'dep_iata': 'FRA',
+            'arr_iata': 'BEG', 'reg': 'DAINY', 'aircraft': 'A20N',
+            'source': 'aircraft_live'}
+    with patch.object(BP, '_aircraft_live_flight', return_value=live), \
+         patch.object(BP, '_fr24_flight_by_number') as mfr:
+        r = client.get('/api/ax/resolve-flight/LH1412')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['ok'] and body['source'] == 'aircraft_live'
+    assert body['flight']['callsign'] == 'DLH8UA'
+    mfr.assert_not_called()          # gratis, kein FR24
+
+
 def test_resolve_flight_returns_truth_with_real_callsign(client):
     """GET /api/ax/resolve-flight/LH1412 → echte Route + ECHTER Funkname (DLH8UA,
     nicht DLH1412) via FR24, permanent."""
@@ -470,11 +501,13 @@ def test_resolve_flight_returns_truth_with_real_callsign(client):
           'arr_iata': 'BEG', 'reg': 'DAINY', 'aircraft': 'A20N',
           'sched_dep': '2026-07-09T12:00:00Z', 'sched_arr': None,
           'duration_min': None, 'status': ''}
-    with patch.object(BP, '_fr24_flight_by_number', return_value=fr), \
+    with patch.object(BP, '_aircraft_live_flight', return_value=None), \
+         patch.object(BP, '_fr24_flight_by_number', return_value=fr), \
          patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
         r = client.get('/api/ax/resolve-flight/LH1412')
     assert r.status_code == 200
     body = r.get_json()
-    assert body['ok'] and body['flight']['arr_iata'] == 'BEG'
+    assert body['ok'] and body['source'] == 'fr24'
+    assert body['flight']['arr_iata'] == 'BEG'
     assert body['flight']['callsign'] == 'DLH8UA'
     assert mcs.called
