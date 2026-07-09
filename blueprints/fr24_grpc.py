@@ -108,9 +108,24 @@ def _note_result(got_data):
 # v1: nur 'direct' (eigene Prozess-IP = Cloud-Run-DC, verifiziert). Weitere
 # Provider (cloudflare/nas/oracle) hängen sich als custom httpx-Transport hier
 # ein und re-routen dieselben gRPC-Bytes. Reihenfolge = Failover-Reihenfolge.
+# Provider, die schon einen ECHTEN eigenen Transport haben. Alles andere ist
+# Stub → _client_for liefert einen identischen direct-Client.
+_WIRED_PROVIDERS = frozenset({"direct"})
+
+
 def _providers():
     raw = os.environ.get("FR24_GRPC_PROVIDERS", "direct")
-    return [p.strip() for p in raw.split(",") if p.strip()]
+    # Dedupe auf EFFEKTIVEN Client: solange Nicht-direct-Provider Stubs sind
+    # (identische FR24()-Instanz), würde der Failover sinnlos denselben Egress
+    # mehrfach abfragen — und dabei Token/Timeout-Budget verbrennen.
+    seen, out = set(), []
+    for p in (x.strip() for x in raw.split(",") if x.strip()):
+        eff = p if p in _WIRED_PROVIDERS else "direct"
+        if eff in seen:
+            continue
+        seen.add(eff)
+        out.append(p)
+    return out
 
 
 def _client_for(provider):
@@ -131,26 +146,116 @@ def _norm_cs(s):
     return (s or "").strip().upper().replace(" ", "")
 
 
-async def _corridor_detail_async(provider, s, n, w, e, cs, rg):
-    """live_feed über einer KORRIDOR-Box (Großkreis from→to) + flight_details des
-    Treffers. Findet den Flieger AUCH über Russland/Ozean OHNE Vorab-Position."""
+def _gc_sample(lat1, lon1, lat2, lon2, count=16):
+    """`count` Punkte auf dem Großkreis (slerp, inkl. Endpunkte) als [(lat,lon)].
+    Mathe wie adsb_blueprint._great_circle_points — dort nicht importierbar, ohne
+    den ganzen Blueprint (Flask/app-Abhängigkeiten) zu laden."""
+    import math
+    r_lat1, r_lon1 = math.radians(lat1), math.radians(lon1)
+    r_lat2, r_lon2 = math.radians(lat2), math.radians(lon2)
+    d = 2 * math.asin(math.sqrt(
+        math.sin((r_lat1 - r_lat2) / 2) ** 2 +
+        math.cos(r_lat1) * math.cos(r_lat2) *
+        math.sin((r_lon1 - r_lon2) / 2) ** 2))
+    if d < 1e-9:
+        return [(lat1, lon1), (lat2, lon2)]
+    out = []
+    for i in range(count):
+        f = i / (count - 1)
+        a = math.sin((1 - f) * d) / math.sin(d)
+        b = math.sin(f * d) / math.sin(d)
+        x = a * math.cos(r_lat1) * math.cos(r_lon1) + b * math.cos(r_lat2) * math.cos(r_lon2)
+        y = a * math.cos(r_lat1) * math.sin(r_lon1) + b * math.cos(r_lat2) * math.sin(r_lon2)
+        z = a * math.sin(r_lat1) + b * math.sin(r_lat2)
+        out.append((math.degrees(math.atan2(z, math.sqrt(x * x + y * y))),
+                    math.degrees(math.atan2(y, x))))
+    return out
+
+
+def _split_antimeridian(s, n, w, e):
+    """w/e nach [-180,180] normalisieren; schneidet die Box die Datumsgrenze,
+    zweiteilen (BoundingBox erwartet west<=east)."""
+    def _norm(x):
+        while x > 180.0:
+            x -= 360.0
+        while x < -180.0:
+            x += 360.0
+        return x
+    if e - w >= 360.0:  # defensiv: Voll-Umrundung
+        return [(s, n, -180.0, 180.0)]
+    w2, e2 = _norm(w), _norm(e)
+    if w2 <= e2:
+        return [(s, n, w2, e2)]
+    return [(s, n, w2, 180.0), (s, n, -180.0, e2)]
+
+
+def _corridor_boxes(from_lat, from_lon, to_lat, to_lon, margin, max_boxes=3):
+    """Suchboxen ENTLANG des Großkreises from→to als [(s,n,w,e)].
+
+    Das alte Endpunkt-Rechteck (min/max der beiden Endpunkte + margin) verlor
+    Großkreis-Routen: FRA→HND fliegt die Nordroute über Sibirien und kulminiert
+    bei ~66°N — weit über max(from_lat,to_lat)+margin. Deshalb: Großkreis
+    sampeln und die Box aus min/max ALLER Sample-Punkte bauen. Sehr breite
+    Korridore (>60° Lon) werden in 2-3 Teil-Boxen entlang der Route gesplittet
+    — das entschärft zugleich die fetch-limit-1500-Trunkierung über dichten
+    Regionen. Lons werden relativ zum Start entrollt (kein ±180-Sprung), Boxen
+    über der Datumsgrenze zweigeteilt."""
+    pts = _gc_sample(from_lat, from_lon, to_lat, to_lon, count=16)
+    unwrapped, prev = [], None
+    for la, lo in pts:
+        if prev is not None:
+            while lo - prev > 180.0:
+                lo -= 360.0
+            while lo - prev < -180.0:
+                lo += 360.0
+        unwrapped.append((la, lo))
+        prev = lo
+    span = max(lo for _, lo in unwrapped) - min(lo for _, lo in unwrapped)
+    n_seg = 1 if span <= 60.0 else min(max_boxes, 2 if span <= 120.0 else 3)
+    boxes = []
+    per = (len(unwrapped) - 1) / n_seg
+    for i in range(n_seg):
+        # Zusammenhängende Stücke mit 1 Punkt Überlappung — kein margin-loses
+        # Loch an den Nahtstellen.
+        seg = unwrapped[int(round(i * per)):int(round((i + 1) * per)) + 1]
+        s = max(-89.9, min(la for la, _ in seg) - margin)
+        n = min(89.9, max(la for la, _ in seg) + margin)
+        w = min(lo for _, lo in seg) - margin
+        e = max(lo for _, lo in seg) + margin
+        boxes.extend(_split_antimeridian(s, n, w, e))
+    return boxes
+
+
+def _match_in_rows(rows, cs, rg):
+    """Ziel-Flug in live_feed-Rows: erst callsign, dann reg."""
+    if cs:
+        for r in rows:
+            if _norm_cs(r.get("callsign")) == cs:
+                return r
+    if rg:
+        for r in rows:
+            xi = r.get("extra_info") or {}
+            if (xi.get("reg") or "").strip().upper().replace("-", "") == rg:
+                return r
+    return None
+
+
+async def _corridor_detail_async(provider, boxes, cs, rg):
+    """live_feed über Teil-Boxen ENTLANG des Großkreises from→to + flight_details
+    des Treffers. Findet den Flieger AUCH über Russland/Ozean OHNE Vorab-Position.
+    Die erste Box ist über das _allow_call des Aufrufers bezahlt; jede weitere
+    zieht ein eigenes Token (kein Salven-Bypass am Bucket vorbei)."""
     from fr24 import FR24, BoundingBox  # noqa: F811
-    box = BoundingBox(north=n, south=s, west=w, east=e)
     async with _client_for(provider) as f:
-        res = await asyncio.wait_for(f.live_feed.fetch(box, limit=1500), timeout=_TIMEOUT_S)
-        rows = res.to_dict().get("flights_list") or []
         match = None
-        if cs:
-            for r in rows:
-                if _norm_cs(r.get("callsign")) == cs:
-                    match = r
-                    break
-        if match is None and rg:
-            for r in rows:
-                xi = r.get("extra_info") or {}
-                if (xi.get("reg") or "").strip().upper().replace("-", "") == rg:
-                    match = r
-                    break
+        for idx, (s, n, w, e) in enumerate(boxes):
+            if idx > 0 and not _allow_call():
+                break
+            box = BoundingBox(north=n, south=s, west=w, east=e)
+            res = await asyncio.wait_for(f.live_feed.fetch(box, limit=1500), timeout=_TIMEOUT_S)
+            match = _match_in_rows(res.to_dict().get("flights_list") or [], cs, rg)
+            if match is not None:
+                break
         if match is None:
             return None
         detail = None
@@ -167,7 +272,7 @@ def inbound_by_route(from_lat, from_lon, to_lat, to_lon, callsign=None, reg=None
                      margin=6.0):
     """Owner-Durchbruch 2026-07-08 („wir haben doch fr24, das über Russland
     liefert"): die Maschine liegt auf dem Großkreis from→to. Wir kennen die Route
-    (z.B. FRA→HND), fragen fr24 mit einer Box ENTLANG des Korridors (+margin) und
+    (z.B. FRA→HND), fragen fr24 mit 1-3 Boxen ENTLANG des Großkreises (+margin) und
     filtern per callsign/reg — findet den Flieger AUCH über Russland/Ozean OHNE
     Vorab-Position, PLUS flight_details (echte sched_arr/eta). Rückgabe:
     {lat,lon,track,alt,speed,route_from,route_to,sched_dep,sched_arr,eta,
@@ -178,13 +283,12 @@ def inbound_by_route(from_lat, from_lon, to_lat, to_lon, callsign=None, reg=None
         return None
     cs = _norm_cs(callsign)
     rg = (reg or "").strip().upper().replace("-", "") or None
-    s = min(from_lat, to_lat) - margin
-    n = max(from_lat, to_lat) + margin
-    w = min(from_lon, to_lon) - margin
-    e = max(from_lon, to_lon) + margin
+    # P2-12: Boxen ENTLANG des Großkreises statt Endpunkt-Rechteck — sonst liegt
+    # die Nordroute (FRA→HND kulminiert ~66°N) AUSSERHALB der Suchbox.
+    boxes = _corridor_boxes(from_lat, from_lon, to_lat, to_lon, margin)
     for provider in _providers():
         try:
-            td = _run(_corridor_detail_async(provider, s, n, w, e, cs, rg))
+            td = _run(_corridor_detail_async(provider, boxes, cs, rg))
         except Exception as ex:
             log.warning("fr24 corridor provider=%s: %s", provider, ex)
             td = None
