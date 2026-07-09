@@ -33,10 +33,12 @@ def _reset_module_caches():
     der gecachte Response eines vorigen Tests einen späteren Test mit demselben
     Token/Datum fälschlich mit stale Daten beantworten. Produkt-Code bleibt
     unverändert; nur die geteilte Modul-State wird zwischen Tests zurückgesetzt."""
+    # Robust ggü. dem sys.modules['app']-Swap (test_calculation.py reimportet app):
+    # den Cache auf JEDEM Modul leeren, das ihn trägt (Original UND Reimport).
+    import sys
     with contextlib.suppress(Exception):
-        import app
-        for _name in ('_FRIENDS_TODAY_MEMO',):
-            _c = getattr(app, _name, None)
+        for _mod in list(sys.modules.values()):
+            _c = getattr(_mod, '_FRIENDS_TODAY_MEMO', None)
             if isinstance(_c, dict):
                 _c.clear()
     yield

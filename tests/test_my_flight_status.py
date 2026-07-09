@@ -35,6 +35,7 @@ def _clear_caches():
     _prev_app_mod = sys.modules.get('app')
     sys.modules['app'] = A
     A._FLIGHT_MERGE_CACHE.clear()
+    A._FRIENDS_TODAY_MEMO.clear()   # 90s-Crew-Cache am ECHTEN Modul A leeren
     try:
         BP._LIFECYCLE_MEMO.clear()
     except Exception:

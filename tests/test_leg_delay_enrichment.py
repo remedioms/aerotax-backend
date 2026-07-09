@@ -30,6 +30,7 @@ def _clear_caches():
     """Merge-/Codeshare-Cache vor jedem Test leeren (date=None keyt sonst über
     Tests hinweg auf denselben Eintrag)."""
     A._FLIGHT_MERGE_CACHE.clear()
+    A._FRIENDS_TODAY_MEMO.clear()   # 90s-Crew-Cache am ECHTEN Modul A leeren
     A._AX_CODESHARE_CACHE['ts'] = 0.0
     A._AX_CODESHARE_CACHE['map'] = {}
     yield
