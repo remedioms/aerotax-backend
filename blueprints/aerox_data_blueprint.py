@@ -2911,6 +2911,13 @@ def _obs_rows_to_facts(dep_row, arr_row):
             facts['dep_delay_min'] = dep_row.get('max_delay_min')
         if dep_row.get('cancelled'):
             facts['cancelled'] = True
+        # Route steckt in der DEP-Row: airport=Start, dest_iata=Ziel.
+        _o = _s(dep_row.get('airport'))
+        if _o:
+            facts['dep_iata'] = _o.split('#', 1)[0]
+        _d = _s(dep_row.get('dest_iata'))
+        if _d:
+            facts['arr_iata'] = _d
     if arr_row:
         for out_k, in_k in (('sched_arr', 'sched'), ('est_arr', 'esti'),
                             ('arr_gate', 'gate'), ('arr_terminal', 'terminal'),
@@ -2922,6 +2929,14 @@ def _obs_rows_to_facts(dep_row, arr_row):
             facts['arr_delay_min'] = arr_row.get('max_delay_min')
         if arr_row.get('cancelled'):
             facts['cancelled'] = True
+        # Route auch aus der ARR-Row ableitbar (falls keine DEP-Row): airport=Ziel+#ARR,
+        # dest_iata=Herkunft. Nur setzen, wenn die DEP-Row sie nicht schon lieferte.
+        _a = _s(arr_row.get('airport'))
+        if _a and not facts.get('arr_iata'):
+            facts['arr_iata'] = _a.split('#', 1)[0]
+        _oa = _s(arr_row.get('dest_iata'))
+        if _oa and not facts.get('dep_iata'):
+            facts['dep_iata'] = _oa
     return facts
 
 
@@ -2960,6 +2975,156 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
         elif dep_row is None and (dep is None or ap == dep):
             dep_row = r
     return _obs_rows_to_facts(dep_row, arr_row)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  UNIFIED FLIGHT-INFO — P1: der EINE Resolver (Ultraplan v2)
+#  Free-First-Kaskade, per Feldgruppe der beste Treffer → EIN UnifiedFlight-Dict
+#  mit allem (Identität, Route, Soll/Ist-Zeiten, Status/Gate/Delay, Flugzeug) +
+#  Herkunft. Consumer (Detail/Radar/Dienstplan/MyPlane/Suche) sollen künftig NUR
+#  das hier lesen. FR24 (erst gratis-gRPC, dann paid) ist der on-demand-Fallback
+#  (P3) — feuert NUR bei Lücke UND wenn gebraucht.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_UFLIGHT_MEMO = {}
+_UFLIGHT_MEMO_TTL = 60  # s — kurz, damit Ist-Zeiten/Delay frisch bleiben
+
+
+def resolve_unified_flight(query, date=None, callsign_query=False,
+                           lat=None, lon=None, allow_paid=False):
+    """Read-Through (P2): 60s In-Process-Memo vor dem Free-First-Zusammenbau. Der
+    BEZAHLTE Teil (FR24 in der Route-Kaskade) wird zusätzlich von route_for_flight
+    persistent hart gecached (_record_resolved_route) → zero double-spend übersteht
+    auch Worker-Restarts. Reine Gratis-Reads sind billig → In-Process reicht."""
+    q = (query or '').replace(' ', '').upper().strip()
+    if not q:
+        return {'ok': False, 'error': 'no_query'}
+    date = ((date or '')[:10]) or time.strftime('%Y-%m-%d', time.gmtime())
+    key = (q, date, bool(callsign_query), bool(allow_paid))
+    now = time.time()
+    hit = _UFLIGHT_MEMO.get(key)
+    if hit is not None and (now - hit[1]) < _UFLIGHT_MEMO_TTL:
+        return hit[0]
+    res = _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid)
+    _UFLIGHT_MEMO[key] = (res, now)
+    if len(_UFLIGHT_MEMO) > 500:
+        for k in list(_UFLIGHT_MEMO.keys())[:250]:
+            _UFLIGHT_MEMO.pop(k, None)
+    return res
+
+
+def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid):
+    """Der eigentliche Free-First-Zusammenbau (q/date bereits normalisiert):
+    aircraft_live (Route/Reg/Typ/Funkname) → route_for_flight (Lücken, inkl. FR24
+    gratis→paid, hart gecached) → _flight_facts_from_obs (Soll/Ist-Zeiten, Gate,
+    Delay, Status; trägt auch die Route aus den Obs). Nur echte Werte."""
+
+    # 1) aircraft_live: echter Funkname + Route + Reg + Typ (gratis, wenn aktiv)
+    try:
+        alf = (_aircraft_live_flight(callsign=q) if callsign_query
+               else _aircraft_live_flight(flight=q))
+        if alf is None:
+            alf = _aircraft_live_flight(callsign=q) or _aircraft_live_flight(flight=q)
+    except Exception:
+        alf = None
+    alf = alf or {}
+    callsign = alf.get('callsign') or (q if callsign_query else None)
+    flight_no = alf.get('flight') or (None if callsign_query else q)
+    reg = alf.get('reg')
+    origin = alf.get('dep_iata')
+    dest = alf.get('arr_iata')
+    ac_type = alf.get('aircraft')
+    route_src = 'aircraft_live' if (origin and dest) else None
+    route_conf = 'confirmed' if route_src else None
+
+    # 2) Route-Kaskade füllt Lücken (aircraft_live inaktiv → Board/Warehouse/
+    #    FR24-gRPC gratis → FR24-paid nur bei allow_paid). route_for_flight cached
+    #    JEDEN Treffer hart (auch den bezahlten) → „nur wenn man es braucht" + kein
+    #    Doppel-Verbrauch. Funkname aus Flugnummer ableiten, damit die Kaskade
+    #    (die einen Callsign braucht) auch bei reiner Flugnummer FR24 erreichen kann.
+    if not (origin and dest):
+        if not callsign and flight_no:
+            _i = 0
+            while _i < len(flight_no) and not flight_no[_i].isdigit():
+                _i += 1
+            _pfx, _num = flight_no[:_i], flight_no[_i:]
+            _al = _airline_row(_pfx) or {}
+            if _al.get('icao') and _num:
+                callsign = _al['icao'] + _num
+        try:
+            from blueprints.warehouse_reader import route_for_flight
+            rt = route_for_flight(callsign=callsign or (q if callsign_query else None),
+                                  reg=reg, lat=lat, lon=lon,
+                                  allow_paid=allow_paid, date=date) or {}
+        except Exception:
+            rt = {}
+        if rt.get('src') and rt.get('dst'):
+            origin, dest = rt['src'], rt['dst']
+            route_src = rt.get('source')
+            route_conf = rt.get('confidence')
+            reg = reg or rt.get('reg')
+
+    # 3) Board-Fakten (Soll/Ist Ab+Ankunft, Gate, Delay, Status) — die eine Quelle
+    facts = {}
+    if flight_no:
+        facts = _flight_facts_from_obs(flight_no, date, dep_iata=origin, arr_iata=dest)
+    reg = reg or facts.get('reg')
+    ac_type = ac_type or facts.get('type')
+    # Route aus den Board-Fakten, wenn aircraft_live + Kaskade nichts hatten (die
+    # Obs kennen Start/Ziel: DEP-Row airport→dest_iata). Board = confirmed.
+    if not (origin and dest) and facts.get('dep_iata') and facts.get('arr_iata'):
+        origin, dest = facts['dep_iata'], facts['arr_iata']
+        route_src = route_src or 'airport_delay_obs'
+        route_conf = route_conf or 'confirmed'
+
+    if not (origin and dest) and not facts:
+        return {'ok': True, 'found': False, 'query': q, 'date': date}
+
+    def _ap(code):
+        r = (_airport_row(code) or {}) if code else {}
+        return {'iata': (r.get('iata') or code), 'icao': r.get('icao'),
+                'city': r.get('city'), 'name': r.get('name'),
+                'lat': r.get('lat'), 'lon': r.get('lon')}
+
+    return {
+        'ok': True, 'found': True, 'query': q, 'date': date,
+        'identity': {'callsign': callsign, 'flight_no': flight_no, 'reg': reg},
+        'route': ({'origin': _ap(origin), 'destination': _ap(dest)}
+                  if (origin and dest) else None),
+        'times': {k: facts.get(k) for k in
+                  ('sched_dep', 'est_dep', 'sched_arr', 'est_arr')},
+        'status': {
+            'gate': facts.get('gate'), 'terminal': facts.get('terminal'),
+            'arr_gate': facts.get('arr_gate'), 'arr_terminal': facts.get('arr_terminal'),
+            'dep_status': facts.get('dep_status'), 'arr_status': facts.get('arr_status'),
+            'dep_delay_min': facts.get('dep_delay_min'),
+            'arr_delay_min': facts.get('arr_delay_min'),
+            'cancelled': facts.get('cancelled'),
+        },
+        'aircraft': {'reg': reg, 'type': ac_type},
+        'meta': {'route_source': route_src, 'route_confidence': route_conf,
+                 'facts_source': 'airport_delay_obs' if facts else None},
+    }
+
+
+@aerox_data_bp.route('/api/ax/uflight/<query>', methods=['GET'])
+def ax_unified_flight(query):
+    """DER eine Unified-Read (Ultraplan v2): alles zu einem Flug an einem Ort.
+    Eigener Pfad `/api/ax/uflight/` — der alte `/api/ax/flight/<flightno>` (nur
+    Airline+Route via adsbdb) bleibt unangetastet; Consumer wandern in P4 hierher.
+    ?date=YYYY-MM-DD ?callsign=1 (Query ist Funkname) ?lat=&lon= (Geometrie-Hint)
+    ?paid=1 (erlaubt die Route-Kaskade bezahlt zu ziehen; Default gratis)."""
+    from flask import request
+    if _ax_rate_limited('ax_unified_flight', limit=120, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    date = request.args.get('date')
+    callsign_query = (request.args.get('callsign') or '') in ('1', 'true', 'yes')
+    lat = request.args.get('lat', type=float)
+    lon = request.args.get('lon', type=float)
+    allow_paid = (request.args.get('paid') or '') in ('1', 'true', 'yes')
+    return jsonify(resolve_unified_flight(
+        query, date=date, callsign_query=callsign_query,
+        lat=lat, lon=lon, allow_paid=allow_paid))
 
 
 @aerox_data_bp.route('/api/ax/tail-history', methods=['GET'])

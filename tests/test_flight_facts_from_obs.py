@@ -28,6 +28,19 @@ def test_dep_and_arr_rows_merge_full_facts():
     assert f['sched_arr'] == '17:35'
     assert f['est_arr'] == '2026-07-09T18:20:00'
     assert f['arr_delay_min'] == 45
+    # Route steckt auch in den Obs (DEP-Row airport→dest_iata)
+    assert f['dep_iata'] == 'FRA'
+    assert f['arr_iata'] == 'NUE'
+
+
+def test_route_from_arr_row_only():
+    # Nur ARR-Row (NUE#ARR, dest_iata=FRA=Herkunft) → Route trotzdem ableitbar.
+    arr = {'airport': 'NUE#ARR', 'flight': 'LH146', 'dest_iata': 'FRA',
+           'sched': '17:35', 'esti': '2026-07-09T18:20:00'}
+    f = _obs_rows_to_facts(None, arr)
+    assert f['arr_iata'] == 'NUE'
+    assert f['dep_iata'] == 'FRA'
+    assert f['sched_arr'] == '17:35'
 
 
 def test_dep_only_no_arr_row():
