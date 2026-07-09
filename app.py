@@ -27617,6 +27617,13 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
     Gibt dieselbe Liste zurück (in-place mutiert). Wirft nie."""
     if not sectors or not isinstance(sectors, list):
         return sectors
+    # „BOARD SCHLÄGT INFERENZ" (Owner 2026-07-09): einen zuvor per Turnaround
+    # ABGELEITETEN Tail (`tail_inferred`) vor der Neu-Anreicherung verwerfen. So
+    # überschreibt eine ECHTE Board-/Warehouse-Beobachtung den geratenen Tail und
+    # ein veralteter inferierter Tail (Maschine wurde inzwischen getauscht) bleibt
+    # NIE kleben. Direkt gemessene Tails (ohne `tail_inferred`) sind belastbar und
+    # bleiben unangetastet; die Turnaround-Weitergabe unten setzt Inferenzen frisch.
+    _strip_inferred_tails(sectors)
     now = datetime.now(timezone.utc)
     cs_map = None
     for s in sectors:
@@ -27777,6 +27784,11 @@ def _enrich_leg_tails(sectors, date=None, homebase=None):
     zurück (in-place mutiert). Wirft nie."""
     if not sectors or not isinstance(sectors, list):
         return sectors
+    # „BOARD SCHLÄGT INFERENZ" (Owner 2026-07-09): abgeleitete (`tail_inferred`)
+    # Tails vor der Neu-Anreicherung wegwerfen, damit ein echter Board-Treffer sie
+    # überschreibt und der Skip-auf-vorhandenen-Tail unten NUR direkt gemessene
+    # Tails schont — nie eine veraltete Inferenz. Carry-Forward setzt sie frisch.
+    _strip_inferred_tails(sectors)
     now = datetime.now(timezone.utc)
     for s in sectors:
         if not isinstance(s, dict) or s.get('tail'):
@@ -27824,6 +27836,23 @@ def _enrich_leg_tails(sectors, date=None, homebase=None):
         if tail:
             s['tail'] = tail
     _carry_forward_turnaround_tails(sectors, homebase=homebase)
+    return sectors
+
+
+def _strip_inferred_tails(sectors):
+    """Verwirft pro-Leg NUR die per Turnaround ABGELEITETEN Tails (`tail_inferred`),
+    damit die Neu-Anreicherung eine echte Board-Beobachtung darüber setzen kann und
+    keine veraltete Inferenz kleben bleibt (Owner 2026-07-09: „wenn falsch, überstimmt
+    das Board"). Direkt gemessene Tails bleiben. In-place; wirft nie."""
+    try:
+        if not sectors or not isinstance(sectors, list):
+            return sectors
+        for s in sectors:
+            if isinstance(s, dict) and s.get('tail_inferred'):
+                s.pop('tail', None)
+                s.pop('tail_inferred', None)
+    except Exception:
+        pass
     return sectors
 
 

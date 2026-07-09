@@ -182,6 +182,43 @@ def test_enrich_tails_respects_preset_tail_no_refetch():
     assert secs[0]['tail'] == 'D-EXIST'
 
 
+def test_enrich_tails_board_overrules_stale_inferred():
+    # „Board schlägt Inferenz": ein ABGELEITETER Tail (tail_inferred) wird von einer
+    # echten Board-Beobachtung überschrieben — und verliert den Inferenz-Marker.
+    secs = [_sector(date=_date.today().isoformat(),
+                    tail='D-OLD', tail_inferred=True)]
+    with patch.object(A, '_leg_tail', return_value='D-NEW'):
+        A._enrich_leg_tails(secs, _date.today().isoformat())
+    assert secs[0]['tail'] == 'D-NEW'
+    assert 'tail_inferred' not in secs[0]
+
+
+def test_enrich_tails_stale_inferred_cleared_when_no_board():
+    # Kein Board-Signal mehr + kein Nachbar zum Vererben → die veraltete Inferenz
+    # bleibt NICHT kleben (ehrlich tail-los statt falsch).
+    secs = [_sector(date=_date.today().isoformat(),
+                    tail='D-OLD', tail_inferred=True)]
+    with patch.object(A, '_leg_tail', return_value=None):
+        A._enrich_leg_tails(secs, _date.today().isoformat())
+    assert 'tail' not in secs[0]
+    assert 'tail_inferred' not in secs[0]
+
+
+def test_strip_inferred_tails_keeps_measured_tail():
+    # Direkt gemessene Tails (ohne tail_inferred) sind belastbar → bleiben.
+    secs = [_sector(tail='D-REAL'),
+            _sector(tail='D-GUESS', tail_inferred=True)]
+    A._strip_inferred_tails(secs)
+    assert secs[0]['tail'] == 'D-REAL'
+    assert 'tail' not in secs[1] and 'tail_inferred' not in secs[1]
+
+
+def test_strip_inferred_tails_safe_on_bad_input():
+    assert A._strip_inferred_tails([]) == []
+    assert A._strip_inferred_tails(None) is None
+    assert A._strip_inferred_tails('nope') == 'nope'
+
+
 def test_enrich_tails_future_leg_skipped():
     far = (_date.today() + timedelta(days=3)).isoformat()
     secs = [_sector(date=far)]
