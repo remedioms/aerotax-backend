@@ -15,10 +15,31 @@ absoluten Pfade mehr enthalten — stattdessen:
     site_index_html() skippt den aufrufenden Test (bzw. das Modul bei
     module-level Aufruf), wenn das site-Repo nicht auf der Platte liegt.
 """
+import contextlib
 import os
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
+
+
+@pytest.fixture(autouse=True)
+def _reset_module_caches():
+    """Modul-globale TTL-Caches vor JEDEM Test leeren (Test-Isolation).
+
+    In Produktion sind diese Caches korrekt (per Token/Datum, kurze TTL) — ein
+    Feed-Aufruf pro 90 s soll denselben Stand wiederverwenden. Im Test aber würde
+    der gecachte Response eines vorigen Tests einen späteren Test mit demselben
+    Token/Datum fälschlich mit stale Daten beantworten. Produkt-Code bleibt
+    unverändert; nur die geteilte Modul-State wird zwischen Tests zurückgesetzt."""
+    with contextlib.suppress(Exception):
+        import app
+        for _name in ('_FRIENDS_TODAY_MEMO',):
+            _c = getattr(app, _name, None)
+            if isinstance(_c, dict):
+                _c.clear()
+    yield
 
 # ─── Backend-Root (dieses Repo) ──────────────────────────────────────────────
 BACKEND_ROOT = Path(
