@@ -1575,10 +1575,16 @@ def _ip_rate_limited(ip, endpoint='process', limit=20, window_sec=3600):
 
 
 def _client_ip():
-    """Extrahiert Client-IP, respektiert X-Forwarded-For (Cloudflare/Render-Proxies)."""
+    """Extrahiert Client-IP hinter Cloudflare. CF-Connecting-IP ist der vom Proxy
+    gesetzte, vertrauenswürdige Header. In X-Forwarded-For hängt der Proxy die
+    echte IP hinten AN — das ERSTE Element ist Client-kontrolliert (Spoof-Prefix
+    würde das Rate-Limit umgehen) → LETZTES Element nehmen."""
+    cf = (request.headers.get('CF-Connecting-IP', '') or '').strip()
+    if cf:
+        return cf
     xff = request.headers.get('X-Forwarded-For', '')
     if xff:
-        return xff.split(',')[0].strip()
+        return xff.split(',')[-1].strip()
     return request.remote_addr or ''
 
 
@@ -12163,9 +12169,12 @@ def get_friends_today(token):
                                     obs_from_aircraft_live as _fs_oal)
                                 from blueprints.flight_state import (
                                     resolve_flight_state as _fs_resolve,
-                                    project_friend_leg as _fs_proj)
+                                    project_friend_leg as _fs_proj,
+                                    prior_state as _fs_prior,
+                                    remember_state as _fs_remember)
                                 from blueprints.flight_state_shadow import shadow_record as _fs_shadow
-                                from blueprints.aerox_data_blueprint import _iata_latlon
+                                from blueprints.aerox_data_blueprint import (
+                                    _iata_latlon, _iata_elev_ft)
                                 _fs_keys = _fs_bk(
                                     fno, datum, chain[idx], chain[idx + 1],
                                     roster_tail=m.get('reg'),
@@ -12174,18 +12183,29 @@ def get_friends_today(token):
                                     sched_arr_iso=_board_local_to_utc_iso(
                                         m.get('sched_arr'), chain[idx + 1]),
                                     dep_ll=_iata_latlon(chain[idx]),
-                                    arr_ll=_iata_latlon(chain[idx + 1]))
+                                    arr_ll=_iata_latlon(chain[idx + 1]),
+                                    dep_elev_ft=_iata_elev_ft(chain[idx]))
                                 _fs_obs = _fs_obm(m, _fs_keys,
                                                   board_to_iso=_board_local_to_utc_iso)
                                 _fs_obs += _fs_oal(_cp, _cr, _crg, _cty)
-                                if shadow_enabled():
-                                    _fs_shadow('friends_flights_live', _fs_keys,
-                                               _fs_obs, flights_live[-1])
+                                _fs = None
                                 if _fs_flip:
-                                    _fs = _fs_resolve(_fs_keys, _fs_obs)
+                                    # prior → Monotonie/Sticky-Airborne wirken
+                                    _fs = _fs_resolve(_fs_keys, _fs_obs,
+                                                      prior=_fs_prior(fno, datum))
+                                    _fs_remember(_fs)
+                                if shadow_enabled():
+                                    # fs= reicht das Flip-Resultat weiter — kein
+                                    # Doppel-Resolve pro Leg (Shadow+Flip = 1x)
+                                    _fs_shadow('friends_flights_live', _fs_keys,
+                                               _fs_obs, flights_live[-1], fs=_fs)
+                                if _fs_flip:
                                     _leg = _fs_proj(_fs)
                                     # Engine-gegatete Position (Taxi ⇒ None ⇒ kein Geist)
                                     flights_live[-1]['live'] = _leg['live']
+                                    # additiv: 'lost' ⇒ iOS kann die Vorwärts-
+                                    # Simulation ehrlich stoppen (P1-4c)
+                                    flights_live[-1]['live_status'] = _leg['live_status']
                                     flights_live[-1]['phase'] = _fs['phase']
                                     flights_live[-1]['phase_conf'] = _fs['phase_conf']
                                     flights_live[-1]['eta_iso'] = _fs['times']['eta_iso']
@@ -27368,6 +27388,11 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         cands = [r for r in (rows or [])
                  if (r.get('flight') or '').replace(' ', '').upper() == fn]
         if not cands:
+            # Führende-Null-Toleranz (SQ026 vs SQ26): nur als FALLBACK, damit
+            # exakte Treffer unverändert bleiben — gleiche Norm wie route-history.
+            _fnn = _fn_norm(fn)
+            cands = [r for r in (rows or []) if _fn_norm(r.get('flight')) == _fnn]
+        if not cands:
             return None
         if want_other:
             for r in cands:
@@ -27710,7 +27735,11 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
                 from datetime import date as _dt_date
                 _draw = str(s.get('date') or date or '')[:10]
                 d = _dt_date.fromisoformat(_draw)
-                today = now.date()
+                # LOKALE Uhr, nicht UTC: die Tages-Keys der Caller (get_briefings
+                # `_live_days` etc.) kommen aus `date.today()` — mit `now.date()`
+                # (UTC) fiele „morgen" zwischen lokaler Mitternacht und UTC-
+                # Mitternacht fälschlich in die tiefe Zukunft (+2 UTC-Tage).
+                today = _dt_date.today()
                 if d > today + timedelta(days=1):
                     continue        # tiefe Zukunft (grob)
                 if d < today - timedelta(days=1):
@@ -28270,11 +28299,15 @@ def ax_flight_info(flightno):
     # Dienstplan (axFlightInfo) UND das Detail-Aggregat (info) die echte Landezeit
     # (sched_arr/esti_arr), nicht nur die Abflugseite. Dieselbe Merge-Funktion wie
     # Radar/Detail (_flight_facts_from_obs) → EINE Quelle. Nur füllen, nie überschreiben.
-    if out is not None and out.get('found'):
+    # NICHT bei stale-gescrubbten Antworten (gleiches Gate wie der Dual-Side-Merge
+    # oben) — sonst käme die Geister-Ankunft durch die Hintertür zurück.
+    if out is not None and out.get('found') and not out.get('stale'):
         try:
             from blueprints.aerox_data_blueprint import _flight_facts_from_obs
             _ff = _flight_facts_from_obs(fn, out.get('date') or date_param)
-            if _ff:
+            # facts['stale'] = Vortags-Fallback der Obs-Quelle → gestrige Geister-
+            # Ankunft NICHT durch die Hintertür füllen (gleiches Gate wie oben).
+            if _ff and not _ff.get('stale'):
                 if not out.get('sched_arr') and _ff.get('sched_arr'):
                     out['sched_arr'] = _ff['sched_arr']
                 if not out.get('esti_arr') and _ff.get('est_arr'):
@@ -30184,8 +30217,11 @@ def _warehouse_latest_flight_for_reg(reg):
              .order('updated_at', desc=True)
              .limit(30).execute())
         rows = r.data or []
-        # NUR Abflug-Beobachtungen tragen ein Ziel → sie belegen die Richtung.
-        deps = [x for x in rows if (x.get('dest_iata') or '').strip()]
+        # NUR echte Abflug-Rows belegen die Richtung: gespiegelte '<AP>#ARR'-Rows
+        # tragen dest_iata=HERKUNFT (Board-Konvention) → sonst Richtung invertiert.
+        deps = [x for x in rows
+                if (x.get('dest_iata') or '').strip()
+                and '#' not in (x.get('airport') or '')]
         if not deps:
             return None
         x = deps[0]   # frischeste (updated_at desc)

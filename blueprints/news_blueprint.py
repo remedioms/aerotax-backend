@@ -910,12 +910,15 @@ def _entry_to_article(entry, src):
 
 
 def _entry_unix_ts(entry):
-    """Parsed published/updated parsed-time aus feedparser; fallback now."""
+    """Parsed published/updated parsed-time aus feedparser; fallback now.
+    feedparser liefert *_parsed als UTC-struct_time → calendar.timegm
+    (time.mktime würde Localtime annehmen = TZ-Shift)."""
+    import calendar as _cal
     for key in ('published_parsed', 'updated_parsed', 'created_parsed'):
         struct_t = entry.get(key)
         if struct_t:
             try:
-                return int(time.mktime(struct_t))
+                return int(_cal.timegm(struct_t))
             except Exception:
                 continue
     return int(time.time())

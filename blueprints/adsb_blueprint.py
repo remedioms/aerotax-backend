@@ -97,10 +97,16 @@ def _rate_limited(*, ip=None, token=None, endpoint='adsb', limit=60, window_sec=
 
 
 def _req_ip(req):
-    """Client-IP aus X-Forwarded-For (Cloudflare/Render-Proxies), sonst remote_addr."""
+    """Client-IP hinter Cloudflare. CF-Connecting-IP ist der vom Proxy gesetzte,
+    vertrauenswürdige Header. In X-Forwarded-For hängt der Proxy die echte IP
+    hinten AN — das ERSTE Element ist Client-kontrolliert (Spoof-Prefix würde
+    das Rate-Limit umgehen) → LETZTES Element nehmen."""
+    cf = (req.headers.get('CF-Connecting-IP', '') or '').strip()
+    if cf:
+        return cf
     xff = req.headers.get('X-Forwarded-For', '')
     if xff:
-        return xff.split(',')[0].strip()
+        return xff.split(',')[-1].strip()
     return req.remote_addr or ''
 
 
