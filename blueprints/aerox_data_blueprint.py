@@ -2839,6 +2839,43 @@ def ax_radar_enrich():
                         if f.get(k):
                             entry[k] = f.get(k)
                     out[hx] = entry
+            # ANKUNFT-VERDRAHTUNG (Owner „steht die Ankunft nicht im Scraping?" —
+            # DOCH): die geplante/erwartete Ankunft steht im Airport-Scrape als
+            # '<Ziel>#ARR'-Row (airport=Ziel+#ARR, sched/esti = Ankunftszeit). Die
+            # flights-Warehouse-Row trägt nur die Abflugseite → sched_arr/est_arr
+            # blieben leer. EIN Batch-Query auf die ARR-Obs füllt die Lücke, sodass
+            # der Radar-Callout „HH:MM → HH:MM" zeigt statt nur Abflug (kein Paid,
+            # nur eigener Scrape). Timeout-sicher: eigener try, Fehler → einfach ohne.
+            try:
+                today = time.strftime('%Y-%m-%d', time.gmtime())
+                missing = [(e.get('flight_no'), e.get('dst'), hx)
+                           for hx, e in out.items()
+                           if e.get('flight_no') and e.get('dst')
+                           and not e.get('sched_arr') and not e.get('est_arr')]
+                if missing:
+                    arr_keys = sorted({(d or '').upper() + '#ARR'
+                                       for _, d, _ in missing if d})
+                    fns = sorted({(fn or '').upper() for fn, _, _ in missing if fn})
+                    ao = (sb.table('airport_delay_obs')
+                          .select('airport,flight,sched,esti')
+                          .in_('date', [yday, today])
+                          .in_('airport', arr_keys)
+                          .in_('flight', fns)
+                          .limit(300).execute())
+                    aidx = {((a.get('flight') or '').upper(),
+                             (a.get('airport') or '').upper()): a
+                            for a in (ao.data or [])}
+                    for fn, dst, hx in missing:
+                        a = aidx.get(((fn or '').upper(),
+                                      (dst or '').upper() + '#ARR'))
+                        if not a:
+                            continue
+                        if a.get('sched'):
+                            out[hx]['sched_arr'] = a['sched']
+                        if a.get('esti'):
+                            out[hx]['est_arr'] = a['esti']
+            except Exception:
+                pass
         except Exception:
             pass
     return jsonify({'ok': True, 'count': len(out), 'routes': out})
@@ -3137,19 +3174,27 @@ def ax_flown_track():
             points = [{'lat': la, 'lon': lo, 'alt': None, 'gs': None, 'trk': None, 'ts': None}
                       for la, lo in _great_circle_points(a[0], a[1], b[0], b[1], 40)]
 
-    # Anschluss an die Flughäfen (Owner „durchgezogen"): bei ECHTER Spur die
-    # Endpunkte an dep/arr anbinden, damit die Linie die ganze Strecke überspannt —
-    # die Breadcrumbs starten/enden oft mitten im Flug (erster/letzter Poll). Nur
-    # anhängen, wenn der Track dort nicht ohnehin schon anliegt (>~0.15°).
+    # Endpunkte an dep/arr anbinden — NUR wenn der Track-Endpunkt schon NAH am
+    # Flughafen liegt (An-/Abflugphase), damit die Linie sauber am Airport
+    # beginnt/endet. NIEMALS anbinden, wenn der letzte Punkt weit weg ist: ein
+    # Flug, der noch unterwegs ist, endet an seiner AKTUELLEN Position — wir
+    # erfinden NICHT die Rest-Strecke bis zum Ziel (Owner: „für einen Flug, der
+    # seit 1 h los ist, hast du nicht die volle Map"). So bleibt die Spur ehrlich:
+    # gelandet → bis zum Zielflughafen; noch fliegend → bis zum letzten Fix.
+    SNAP_KM = 150.0   # ~80 nm; darüber gilt der Endpunkt als „unterwegs"
     if source in ('aircraft_track', 'fr24_trail') and len(points) >= 2:
         if dep:
             a = _iata_latlon(dep)
-            if a and (abs(a[0] - points[0]['lat']) > 0.15 or abs(a[1] - points[0]['lon']) > 0.15):
-                points.insert(0, {'lat': a[0], 'lon': a[1], 'alt': None, 'gs': None, 'trk': None, 'ts': None})
+            if a:
+                d0 = _haversine_km(a[0], a[1], points[0]['lat'], points[0]['lon'])
+                if 2.0 < d0 < SNAP_KM:
+                    points.insert(0, {'lat': a[0], 'lon': a[1], 'alt': None, 'gs': None, 'trk': None, 'ts': None})
         if arr:
             b = _iata_latlon(arr)
-            if b and (abs(b[0] - points[-1]['lat']) > 0.15 or abs(b[1] - points[-1]['lon']) > 0.15):
-                points.append({'lat': b[0], 'lon': b[1], 'alt': None, 'gs': None, 'trk': None, 'ts': None})
+            if b:
+                d1 = _haversine_km(b[0], b[1], points[-1]['lat'], points[-1]['lon'])
+                if 2.0 < d1 < SNAP_KM:
+                    points.append({'lat': b[0], 'lon': b[1], 'alt': None, 'gs': None, 'trk': None, 'ts': None})
 
     out = {'ok': True, 'reg': reg or None, 'flight': flight_no, 'date': date,
            'dep': dep, 'arr': arr, 'source': source,
