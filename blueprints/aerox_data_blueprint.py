@@ -23,6 +23,7 @@ Hexes und echte Live-Routen lösen genau einen externen Call aus, danach Cache.
 import gzip
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -36,6 +37,7 @@ import urllib.request
 from flask import Blueprint, jsonify
 
 aerox_data_bp = Blueprint('aerox_data', __name__)
+_log = logging.getLogger('aerox.data')
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
@@ -1100,14 +1102,46 @@ def _fr24_budget_key():
     return 'fr24:' + time.strftime('%Y%m%d', time.gmtime())
 
 
+def _fr24_month_budget_key():
+    return 'fr24m:' + time.strftime('%Y%m', time.gmtime())
+
+
+def _fr24_budget_inc(units):
+    """FR24-Credits buchen: Tages- UND Monats-Zähler (Zweitschlüssel) — der
+    Monatsdeckel (FR24_MONTHLY_CREDIT_CAP) schützt gegen viele „fast volle" Tage."""
+    _budget_key_inc(_fr24_budget_key(), units)
+    _budget_key_inc(_fr24_month_budget_key(), units)
+
+
+_FR24_CAP_WARNED = {}   # 'YYYYMMDD' → True — Cap-Hit-Warnung einmalig pro Tag
+
+
 def _fr24_budget_ok():
-    """True solange heute noch FR24-Credit-Kontingent frei ist (Default 8000/Tag
-    ≈ 240k/Monat, unter dem Essential-333k-Plan)."""
+    """True solange heute (Tages-Cap, Default 8000 ≈ 240k/Monat) UND im laufenden
+    Monat (FR24_MONTHLY_CREDIT_CAP, Default 200000 < Essential-333k) noch
+    FR24-Credit-Kontingent frei ist. Beim ERSTEN Cap-Hit des Tages einmalig
+    logger.warning — der Deckel griff bisher lautlos."""
     try:
         cap = int(os.environ.get('FR24_DAILY_CREDIT_CAP', '8000'))
     except Exception:
         cap = 8000
-    return _budget_key_used(_fr24_budget_key()) < cap
+    try:
+        mcap = int(os.environ.get('FR24_MONTHLY_CREDIT_CAP', '200000'))
+    except Exception:
+        mcap = 200000
+    day_used = _budget_key_used(_fr24_budget_key())
+    month_used = _budget_key_used(_fr24_month_budget_key())
+    ok = day_used < cap and month_used < mcap
+    if not ok:
+        today = time.strftime('%Y%m%d', time.gmtime())
+        if not _FR24_CAP_WARNED.get(today):
+            _FR24_CAP_WARNED.clear()          # alte Tage raus, Flag bleibt winzig
+            _FR24_CAP_WARNED[today] = True
+            _log.warning(
+                'FR24-Budget-Deckel erreicht: heute %s/%s Credits, Monat %s/%s '
+                '— bezahlte FR24-Fallbacks pausieren bis zum Reset.',
+                day_used, cap, month_used, mcap)
+    return ok
 
 
 def _fr24_get(path, params):
@@ -1190,6 +1224,19 @@ _FR24_REG_CACHE = {}               # reg → (ts, legs) — Zero-Double-Spend-Sc
 _FR24_REG_TTL = 6 * 3600.0         # Tail-Historie ändert sich langsam → 6 h
 
 
+def _fr24_cache_evict():
+    """LRU-artig: älteste 25 % raus statt clear() (Muster _memo_put) — ein voller
+    Flush hätte alle Hard-Cache-Treffer verworfen = erneutes Credit-Spending."""
+    if len(_FR24_REG_CACHE) <= 500:
+        return
+    try:
+        items = sorted(_FR24_REG_CACHE.items(), key=lambda kv: kv[1][0])
+        for k, _v in items[:len(items) // 4 or 1]:
+            _FR24_REG_CACHE.pop(k, None)
+    except Exception:
+        _FR24_REG_CACHE.clear()
+
+
 def _fr24_flights_by_reg(reg, days=7, limit=12):
     """Letzte Legs EINER Maschine über die FR24-flight-summary (by registration).
     Bezahlter LETZTER Fallback für die Kennzeichen-Historie, wenn das Warehouse
@@ -1218,7 +1265,7 @@ def _fr24_flights_by_reg(reg, days=7, limit=12):
     data = (j or {}).get('data') or []
     # FR24 zählt Credits PRO Ergebnis (nicht pauschal) → nach Trefferzahl buchen
     # (mind. Basis auch bei leer, weil der Call trotzdem kostet).
-    _budget_key_inc(_fr24_budget_key(), max(_FR24_SUMMARY_CREDITS, len(data)))
+    _fr24_budget_inc(max(_FR24_SUMMARY_CREDITS, len(data)))
     legs = []
     for f in data:
         leg = _fr24_summary_to_leg(f)
@@ -1229,8 +1276,7 @@ def _fr24_flights_by_reg(reg, days=7, limit=12):
     # Negativ-Cache inklusive: auch ein leeres Ergebnis wird gecacht (der Call
     # kostete trotzdem) → keine Wiederholung für dieselbe Maschine.
     _FR24_REG_CACHE[ck] = (time.time(), list(out))
-    if len(_FR24_REG_CACHE) > 500:
-        _FR24_REG_CACHE.clear()
+    _fr24_cache_evict()
     return out
 
 
@@ -1244,7 +1290,11 @@ def _fr24_flight_by_number(flight_no, date=None):
     fn = (flight_no or '').replace(' ', '').upper()
     if len(fn) < 3:
         return None
-    ck = 'FN|' + fn + '|' + (date or '')
+    # Cache-Key IMMER mit Datum (date=None → heutiger UTC-Tag): flight_status
+    # (mit Datum) und resolve-flight (ohne) treffen so denselben Key — vorher
+    # divergierten die Keys und derselbe Flug kostete zweimal Credits.
+    ck = 'FN|' + fn + '|' + ((date or '')[:10]
+                             or time.strftime('%Y-%m-%d', time.gmtime()))
     hit = _FR24_REG_CACHE.get(ck)
     if hit and (time.time() - hit[0]) < _FR24_REG_TTL:
         return hit[1]
@@ -1260,7 +1310,7 @@ def _fr24_flight_by_number(flight_no, date=None):
                   {'flights': fn, 'flight_datetime_from': dt_from,
                    'flight_datetime_to': dt_to})
     _data = (j or {}).get('data') or []
-    _budget_key_inc(_fr24_budget_key(), max(_FR24_SUMMARY_CREDITS, len(_data)))
+    _fr24_budget_inc(max(_FR24_SUMMARY_CREDITS, len(_data)))
     legs = []
     for f in _data:
         leg = _fr24_summary_to_leg(f)
@@ -1284,8 +1334,7 @@ def _fr24_flight_by_number(flight_no, date=None):
             'delay_min': None, 'delay_side': None, 'diverted': l.get('diverted'),
         }
     _FR24_REG_CACHE[ck] = (time.time(), out)
-    if len(_FR24_REG_CACHE) > 500:
-        _FR24_REG_CACHE.clear()
+    _fr24_cache_evict()
     return out
 
 
@@ -1299,7 +1348,10 @@ def _fr24_flight_by_callsign(callsign, date=None):
     cs = (callsign or '').replace(' ', '').upper()
     if len(cs) < 3:
         return None
-    ck = 'CS|' + cs + '|' + (date or '')
+    # Datums-normalisierter Key wie bei _fr24_flight_by_number (kein Key-Split
+    # zwischen mit-/ohne-Datum-Callern desselben Tages).
+    ck = 'CS|' + cs + '|' + ((date or '')[:10]
+                             or time.strftime('%Y-%m-%d', time.gmtime()))
     hit = _FR24_REG_CACHE.get(ck)
     if hit and (time.time() - hit[0]) < _FR24_REG_TTL:
         return hit[1]
@@ -1315,7 +1367,7 @@ def _fr24_flight_by_callsign(callsign, date=None):
                   {'callsigns': cs, 'flight_datetime_from': dt_from,
                    'flight_datetime_to': dt_to})
     _data = (j or {}).get('data') or []
-    _budget_key_inc(_fr24_budget_key(), max(_FR24_SUMMARY_CREDITS, len(_data)))
+    _fr24_budget_inc(max(_FR24_SUMMARY_CREDITS, len(_data)))
     legs = []
     for f in _data:
         leg = _fr24_summary_to_leg(f)
@@ -1338,12 +1390,12 @@ def _fr24_flight_by_callsign(callsign, date=None):
             'delay_min': None, 'delay_side': None, 'diverted': l.get('diverted'),
         }
     _FR24_REG_CACHE[ck] = (time.time(), out)
-    if len(_FR24_REG_CACHE) > 500:
-        _FR24_REG_CACHE.clear()
+    _fr24_cache_evict()
     return out
 
 
-def _fr24_flights_by_airline(icao, days=2, chunk_hours=2, max_chunks=40):
+def _fr24_flights_by_airline(icao, days=2, chunk_hours=2, max_chunks=40,
+                             t_from=None, cover_out=None):
     """ALLE Flüge EINER Airline (operating_as=ICAO) über flight-summary — für den
     Warehouse-Prewarm (Owner „alle von Discover ins Buch speichern"): einmal
     bezahlt holen, permanent speichern, danach gratis nachschlagbar.
@@ -1352,7 +1404,13 @@ def _fr24_flights_by_airline(icao, days=2, chunk_hours=2, max_chunks=40):
     Cursor). Darum blättern wir über kleine Zeitfenster (chunk_hours) und
     deduplizieren per fr24_id → so kommen wirklich ALLE Flüge rein. Budget-gated
     (pro Chunk geprüft, Abbruch bei Deckel), Credits PRO Ergebnis. Nur Legs mit
-    echter Reg (crowdsourcebar). Kein Cache (Prewarm soll frisch holen)."""
+    echter Reg (crowdsourcebar). Kein Cache (Prewarm soll frisch holen).
+
+    t_from: Fenster-Start (Epoch) — der Prewarm-Endpoint reicht hier seine
+    persistierte Watermark rein, damit wiederholte Cron-Läufe schon bezahlte
+    Zeitfenster NICHT nochmal holen (zero-double-spend). cover_out (dict):
+    trägt nach dem Lauf 'to' = letzte VOLLSTÄNDIG abgedeckte Fenstergrenze
+    (Epoch) — auch bei Budget-Abbruch mittendrin korrekt resumierbar."""
     if not (_fr24_available() and _fr24_budget_ok()):
         return []
     ic = (icao or '').strip().upper()
@@ -1360,6 +1418,8 @@ def _fr24_flights_by_airline(icao, days=2, chunk_hours=2, max_chunks=40):
         return []
     now = time.time()
     t = now - days * 86400
+    if t_from:
+        t = max(t, float(t_from))
     step = max(1, int(chunk_hours)) * 3600
     seen, out, chunks = set(), [], 0
     while t < now and chunks < max_chunks:
@@ -1372,7 +1432,7 @@ def _fr24_flights_by_airline(icao, days=2, chunk_hours=2, max_chunks=40):
             'flight_datetime_to': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t_to)),
         })
         data = (j or {}).get('data') or []
-        _budget_key_inc(_fr24_budget_key(), max(_FR24_SUMMARY_CREDITS, len(data)))
+        _fr24_budget_inc(max(_FR24_SUMMARY_CREDITS, len(data)))
         for f in data:
             fid = (f.get('fr24_id')
                    or (str(f.get('flight')) + '|' + str(f.get('datetime_takeoff'))))
@@ -1385,6 +1445,8 @@ def _fr24_flights_by_airline(icao, days=2, chunk_hours=2, max_chunks=40):
                 out.append(leg)
         t = t_to
         chunks += 1
+        if isinstance(cover_out, dict):
+            cover_out['to'] = t
     return out
 
 
@@ -1901,34 +1963,9 @@ def _geometry_allows_route(candidate, lat, lon, track, gs=None, on_ground=False)
         return True                          # im Zweifel: zeigen, nicht verstecken
 
 
-def _free_generic_route(cs, lat=None, lon=None):
-    """Freie, generische Callsign→Route-Fallbacks: adsbdb → adsb.lol routeset →
-    hexdb. Alle frei/öffentlich. Route-Dict (confidence='estimated') oder None."""
-    try:
-        ad = _adsbdb_route(cs)
-    except Exception:
-        ad = None
-    if ad and (ad.get('src') or ad.get('src_icao')):
-        ad['source'] = 'adsbdb'
-        ad['confidence'] = 'estimated'
-        return ad
-    # adsb.lol routeset + hexdb liegen im adsb_blueprint (frei, community).
-    try:
-        from blueprints.adsb_blueprint import _resolve_route_adsb_lol, _resolve_route_hexdb
-    except Exception:
-        return None
-    for fn, name in ((_resolve_route_adsb_lol, 'adsb.lol'), (_resolve_route_hexdb, 'hexdb')):
-        try:
-            o, d = (fn(cs, lat, lon) if name == 'adsb.lol' else fn(cs))
-        except Exception:
-            o, d = None, None
-        if o and d and (o.get('iata') or o.get('icao')) and (d.get('iata') or d.get('icao')):
-            return {
-                'src': o.get('iata'), 'src_icao': o.get('icao'),
-                'dst': d.get('iata'), 'dst_icao': d.get('icao'),
-                'callsign': cs, 'source': name, 'confidence': 'estimated',
-            }
-    return None
+# _free_generic_route (adsbdb/adsb.lol/hexdb-Generik) GELÖSCHT (Kosten-Review
+# 2026-07-09): 0 Aufrufer — der Owner hatte die Quelle schon am 2026-07-03 aus
+# der Kaskade genommen („eh immer falsch"), warehouse_reader dokumentiert das.
 
 
 def _resolve_live_route(callsign, hexid=None, reg=None, lat=None, lon=None,
@@ -2511,17 +2548,12 @@ def ax_flight(flightno):
                           'name': airline.get('name'), 'callsign': airline.get('callsign'),
                           'logo': _airline_logo(airline.get('iata'))}
 
-    # Route: Cache → adsbdb-Callsign (ICAO-Präfix + Nummer) → zurückschreiben.
+    # Route: NUR noch der eigene Cache (adsbdb-Live-Nachschlag entfernt,
+    # Kosten-Review 2026-07-09: Quelle unzuverlässig + anonymer Endpoint zog
+    # externen Traffic; Consumer wandern eh auf /api/ax/uflight).
     route = _cache_get('ax_route_cache', 'flight', raw)
     if route:
         out['source'] = 'cache'
-    elif airline and airline.get('icao') and number:
-        callsign = f"{airline['icao']}{number}"
-        live = _adsbdb_route(callsign)
-        if live:
-            route = live; out['source'] = 'adsbdb'
-            _cache_put('ax_route_cache',
-                       {'flight': raw, 'payload': live, 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
 
     if route:
         def enrich(code):
@@ -2944,8 +2976,8 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     """Board-Fakten EINES Flugs aus airport_delay_obs (DEP + <arr>#ARR gemergt).
     Timeout-sicher (eigener try, Fehler → {}), indizierte Filter (date+flight)."""
     fn = (flight_no or '').replace(' ', '').upper().strip()
-    d = (date or '').strip()[:10]
-    if not fn or not d:
+    d = ((date or '').strip()[:10]) or time.strftime('%Y-%m-%d', time.gmtime())
+    if not fn:
         return {}
     sb = _sb()
     if sb is None:
@@ -2994,6 +3026,125 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     return _obs_rows_to_facts(_best(dep_cands), _best(arr_cands))
 
 
+_FREE_TIMES_MEMO = {}          # (flight,date) -> (times_dict_or_None, at)
+_FREE_TIMES_TTL = 300          # s — Drossel: max 1 gRPC/paid pro Flug/Tag alle 5min
+
+
+def _epoch_to_local_iso(epoch, iata):
+    """UNIX-Epoch (UTC) → naiver Stationszeit-ISO am Flughafen `iata` (Format wie die
+    Board-Obs: '2026-07-09T17:35:00'). None bei ungültig/unbekannter TZ."""
+    try:
+        e = int(epoch)
+    except (TypeError, ValueError):
+        return None
+    if e <= 0:
+        return None
+    try:
+        from airport_tz import airport_tz
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt2, timezone as _tz2
+        tzn = airport_tz((iata or '').upper()) or 'UTC'
+        loc = _dt2.fromtimestamp(e, tz=_tz2.utc).astimezone(ZoneInfo(tzn))
+        return loc.strftime('%Y-%m-%dT%H:%M:%S')
+    except Exception:
+        return None
+
+
+def _grpc_times_free(callsign, origin, dest):
+    """GRATIS sched_dep/sched_arr/eta (Epoch) via FR24-gRPC-Korridor entlang
+    origin→dest — KEIN Credit. Airborne + kurze/mittlere Route nötig (Langstrecke =
+    Riesenkorridor → Miss, dann Paid-Backup). None wenn nicht gefunden."""
+    cs = (callsign or '').strip().upper()
+    if not cs or not origin or not dest:
+        return None
+    o = _airport_row(origin) or {}
+    d = _airport_row(dest) or {}
+    if None in (o.get('lat'), o.get('lon'), d.get('lat'), d.get('lon')):
+        return None
+    # Korridor funktioniert nur kurz/mittel — Langstrecke = Riesenbox → immer Miss.
+    # Dann gar nicht erst gRPC (spart ~1s), direkt Paid-Backup. Grenze ~3500 km.
+    try:
+        from math import radians, sin, cos, asin, sqrt
+        dlat = radians(d['lat'] - o['lat'])
+        dlon = radians(d['lon'] - o['lon'])
+        a = (sin(dlat / 2) ** 2 + cos(radians(o['lat'])) * cos(radians(d['lat']))
+             * sin(dlon / 2) ** 2)
+        if 2 * 6371 * asin(sqrt(a)) > 3500:
+            return None
+    except Exception:
+        pass
+    try:
+        from blueprints import fr24_grpc
+        return fr24_grpc.inbound_by_route(o['lat'], o['lon'], d['lat'], d['lon'],
+                                          callsign=cs)
+    except Exception:
+        return None
+
+
+def _flight_times_free_first(flight_no, date, origin, dest,
+                             callsign=None, allow_paid=False):
+    """DIE zentrale Zeiten-Auflösung (Owner: free FR24 zuerst, paid nur Backup, an
+    EINER Stelle). Free gRPC (gratis, Epoch→stationslokal normalisiert) → paid
+    flight-summary NUR wenn free leer UND allow_paid. In-Process-Drossel 5min/Flug
+    (kein Hämmern, geteilt über alle Screens). Returns {sched_dep,est_dep,sched_arr,
+    est_arr} stationslokal — oder {}."""
+    fn = (flight_no or '').replace(' ', '').upper()
+    d = ((date or '')[:10]) or time.strftime('%Y-%m-%d', time.gmtime())
+    if not fn:
+        return {}
+    key = (fn, d)
+    now = time.time()
+    hit = _FREE_TIMES_MEMO.get(key)
+    if hit is not None and (now - hit[1]) < _FREE_TIMES_TTL:
+        return hit[0] or {}
+    cs = (callsign or '').strip().upper()
+    if not cs:
+        i = 0
+        while i < len(fn) and not fn[i].isdigit():
+            i += 1
+        al = _airline_row(fn[:i]) or {}
+        if al.get('icao') and fn[i:]:
+            cs = al['icao'] + fn[i:]
+    out = {}
+    # 1) FREE gRPC (gratis) — Korridor braucht Route + Funkname
+    g = _grpc_times_free(cs, origin, dest) if (cs and origin and dest) else None
+    if g:
+        sd = _epoch_to_local_iso(g.get('sched_dep'), origin)
+        sa = _epoch_to_local_iso(g.get('sched_arr'), dest)
+        ea = _epoch_to_local_iso(g.get('eta'), dest)
+        if sd:
+            out['sched_dep'] = sd
+        if sa:
+            out['sched_arr'] = sa
+        if ea:
+            out['est_arr'] = ea
+    # 2) PAID-Backup wenn free das Paar NICHT komplett hatte (Langstrecke/gelandet).
+    #    Paid liefert ISO-Z (UTC) → auf Stationszeit normalisieren (wie die Obs).
+    if allow_paid and not (out.get('sched_dep') and out.get('sched_arr')):
+        try:
+            p = _fr24_flight_by_number(fn, date=d) or {}
+        except Exception:
+            p = {}
+
+        def _norm(v, iata):
+            try:
+                from datetime import datetime as _dt3
+                dt = _dt3.fromisoformat(str(v).replace('Z', '+00:00'))
+                if dt.tzinfo is None:
+                    return v
+                return _epoch_to_local_iso(dt.timestamp(), iata) or v
+            except Exception:
+                return v
+        for k in ('sched_dep', 'est_dep', 'sched_arr', 'est_arr'):
+            if p.get(k) and not out.get(k):
+                out[k] = _norm(p[k], origin if 'dep' in k else dest)
+    _FREE_TIMES_MEMO[key] = (out or None, now)
+    if len(_FREE_TIMES_MEMO) > 800:
+        for k in list(_FREE_TIMES_MEMO.keys())[:400]:
+            _FREE_TIMES_MEMO.pop(k, None)
+    return out
+
+
 def _enrich_flight_status_with_obs(flight, date=None):
     """P4-Verdrahtung: füllt fehlende Zeit-/Gate-/Status-Felder eines
     FlightStatusInfo-Dicts (resolve-flight/-callsign → iOS `schedule.info`) aus den
@@ -3009,9 +3160,7 @@ def _enrich_flight_status_with_obs(flight, date=None):
     # NUR per Flugnummer matchen (nicht per dep/arr constrainen): ein bezahlter
     # FR24-Treffer kann eine andere Leg-Route liefern → würde die Obs-Row sonst
     # verfehlen. _flight_facts_from_obs nimmt eh die jüngste DEP/ARR-Row des Flugs.
-    facts = _flight_facts_from_obs(fn, d)
-    if not facts:
-        return flight
+    facts = _flight_facts_from_obs(fn, d) or {}
 
     def _fill(k, v):
         if v is not None and not flight.get(k):
@@ -3038,6 +3187,17 @@ def _enrich_flight_status_with_obs(flight, date=None):
             flight['status_category'] = 'cancelled'
         elif any(w in _ds for w in ('abgeflog', 'departed', 'airborne', 'started')):
             flight['status_category'] = 'enroute'
+    # FREE-FIRST-ZEITEN (Owner: free FR24 zuerst, paid Backup, EINE Stelle): fehlen
+    # nach den Board-Obs die Soll-Zeiten (typisch Auslandsflug — Abflughafen nicht
+    # gescraped), hol sie ZUERST gratis via FR24-gRPC-Korridor, paid nur wenn das
+    # leer bleibt. Stationslokal normalisiert. Gedrosselt/gecached (kein Hämmern).
+    if not flight.get('sched_dep') and not flight.get('sched_arr'):
+        _t = _flight_times_free_first(fn, d, flight.get('dep_iata'),
+                                      flight.get('arr_iata'),
+                                      callsign=flight.get('callsign'), allow_paid=True)
+        for k in ('sched_dep', 'est_dep', 'sched_arr', 'est_arr'):
+            if _t.get(k) and not flight.get(k):
+                flight[k] = _t[k]
     return flight
 
 
@@ -3052,6 +3212,8 @@ def _enrich_flight_status_with_obs(flight, date=None):
 
 _UFLIGHT_MEMO = {}
 _UFLIGHT_MEMO_TTL = 60  # s — kurz, damit Ist-Zeiten/Delay frisch bleiben
+_UFLIGHT_PAID_MISS = {}             # (q,date,cs?) → ts — Paid-Versuch blieb leer
+_UFLIGHT_PAID_MISS_TTL = 12 * 3600  # 12 h: unauflösbarer Query re-spendet nicht
 
 
 def resolve_unified_flight(query, date=None, callsign_query=False,
@@ -3059,17 +3221,29 @@ def resolve_unified_flight(query, date=None, callsign_query=False,
     """Read-Through (P2): 60s In-Process-Memo vor dem Free-First-Zusammenbau. Der
     BEZAHLTE Teil (FR24 in der Route-Kaskade) wird zusätzlich von route_for_flight
     persistent hart gecached (_record_resolved_route) → zero double-spend übersteht
-    auch Worker-Restarts. Reine Gratis-Reads sind billig → In-Process reicht."""
+    auch Worker-Restarts. Reine Gratis-Reads sind billig → In-Process reicht.
+    Paid-MISSES werden 12 h negativ gecacht: ein unauflösbarer Query darf nicht
+    nach jedem 60s-Memo-Ablauf erneut Credits ziehen (der Free-Teil läuft weiter)."""
     q = (query or '').replace(' ', '').upper().strip()
     if not q:
         return {'ok': False, 'error': 'no_query'}
     date = ((date or '')[:10]) or time.strftime('%Y-%m-%d', time.gmtime())
-    key = (q, date, bool(callsign_query), bool(allow_paid))
     now = time.time()
+    miss_key = (q, date, bool(callsign_query))
+    if allow_paid:
+        mt = _UFLIGHT_PAID_MISS.get(miss_key)
+        if mt and (now - mt) < _UFLIGHT_PAID_MISS_TTL:
+            allow_paid = False          # Negativ-Cache: paid war schon erfolglos
+    key = (q, date, bool(callsign_query), bool(allow_paid))
     hit = _UFLIGHT_MEMO.get(key)
     if hit is not None and (now - hit[1]) < _UFLIGHT_MEMO_TTL:
         return hit[0]
     res = _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid)
+    if allow_paid and isinstance(res, dict) and not res.get('found'):
+        _UFLIGHT_PAID_MISS[miss_key] = now
+        if len(_UFLIGHT_PAID_MISS) > 500:
+            for k in list(_UFLIGHT_PAID_MISS.keys())[:250]:
+                _UFLIGHT_PAID_MISS.pop(k, None)
     _UFLIGHT_MEMO[key] = (res, now)
     if len(_UFLIGHT_MEMO) > 500:
         for k in list(_UFLIGHT_MEMO.keys())[:250]:
@@ -3177,7 +3351,8 @@ def ax_unified_flight(query):
     Eigener Pfad `/api/ax/uflight/` — der alte `/api/ax/flight/<flightno>` (nur
     Airline+Route via adsbdb) bleibt unangetastet; Consumer wandern in P4 hierher.
     ?date=YYYY-MM-DD ?callsign=1 (Query ist Funkname) ?lat=&lon= (Geometrie-Hint)
-    ?paid=1 (erlaubt die Route-Kaskade bezahlt zu ziehen; Default gratis)."""
+    ?paid=1 (erlaubt die Route-Kaskade bezahlt zu ziehen; Default gratis —
+    zählt NUR mit Authorization-Bearer-Header: anonym darf nie Credits schalten)."""
     from flask import request
     if _ax_rate_limited('ax_unified_flight', limit=120, window_sec=60):
         return jsonify({'ok': False, 'error': 'rate_limited'}), 429
@@ -3185,7 +3360,11 @@ def ax_unified_flight(query):
     callsign_query = (request.args.get('callsign') or '') in ('1', 'true', 'yes')
     lat = request.args.get('lat', type=float)
     lon = request.args.get('lon', type=float)
-    allow_paid = (request.args.get('paid') or '') in ('1', 'true', 'yes')
+    # paid nur für App-Clients (Bearer-Header vorhanden). Kein voller Token-
+    # Check nötig — es geht darum, dass ein anonymer Scan ?paid=1 nicht zieht.
+    _authed = (request.headers.get('Authorization') or '').strip().lower() \
+        .startswith('bearer ')
+    allow_paid = _authed and (request.args.get('paid') or '') in ('1', 'true', 'yes')
     return jsonify(resolve_unified_flight(
         query, date=date, callsign_query=callsign_query,
         lat=lat, lon=lon, allow_paid=allow_paid))
@@ -3200,12 +3379,23 @@ def ax_tail_history():
     Query: reg=D-AIZB (bevorzugt, hyphen-tolerant) ODER hex=<icao24>.
     Response: {ok, reg, count, legs:[{flight_no,src,dst,day,sched_dep,status}]}
     KEIN Tail-Raten: nur exakte Tail-/Hex-Matches aus dem Warehouse; leer wenn
-    die Maschine dort nie beobachtet wurde."""
+    die Maschine dort nie beobachtet wurde.
+
+    own=1/watch=1 (wie ax_callsign): NUR dann darf der bezahlte FR24-Fallback
+    feuern — der anonyme Tap auf eine fremde Maschine bleibt Warehouse-only
+    (kein Paid-per-Tap). iOS sendet own=1 für die eigene Maschine."""
     from flask import request
+    # Per-IP-Limit (Kosten-Review 2026-07-09: Endpoint war ungedeckelt und
+    # konnte pro Miss einen Paid-Call ziehen).
+    if _ax_rate_limited('tail_history', limit=30, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     reg = (request.args.get('reg') or '').strip().upper()
     hexid = (request.args.get('hex') or '').strip().lower()
     if not reg and not hexid:
         return jsonify({'ok': False, 'error': 'reg_or_hex_required'}), 400
+    _own = (request.args.get('own') or request.args.get('watch')
+            or request.args.get('mine') or '').strip().lower()
+    allow_paid = _own in ('1', 'true', 'yes', 'y')
     sb = _sb()
     legs = []
     if sb is not None:
@@ -3263,10 +3453,11 @@ def ax_tail_history():
     source = 'warehouse'
     # ── LETZTER Fallback (bezahlt, budget-gated, hart gecacht): kennt das
     #    Warehouse die Maschine NICHT (z.B. D-AIXS nie getafelt), die FR24-API
-    #    by-registration fragen. Die Treffer werden PERMANENT ins Warehouse
-    #    geschrieben (_crowdsource_flight_obs) → derselbe Flug kommt für alle
-    #    anderen Endpoints (flight_status/route-history) nächstes Mal GRATIS. ──
-    if not legs and reg and _fr24_available() and _fr24_budget_ok():
+    #    by-registration fragen — NUR für die eigene/beobachtete Maschine
+    #    (own=1/watch=1), nie pro anonymem Tap. Die Treffer werden PERMANENT ins
+    #    Warehouse geschrieben (_crowdsource_flight_obs) → derselbe Flug kommt
+    #    für alle anderen Endpoints (flight_status/route-history) GRATIS. ──
+    if not legs and reg and allow_paid and _fr24_available() and _fr24_budget_ok():
         try:
             fr = _fr24_flights_by_reg(reg, days=10, limit=10)
         except Exception:
@@ -3532,21 +3723,83 @@ def ax_flown_track():
 @aerox_data_bp.route('/api/internal/track-prune', methods=['POST'])
 def ax_track_prune():
     """Retention: aircraft_track-Breadcrumbs älter als TRACK_RETENTION_DAYS (10)
-    löschen. Geschützt per X-Poll-Secret (== ADSB_POLL_SECRET), Cron-getriggert."""
+    löschen. Geschützt per X-Poll-Secret (== ADSB_POLL_SECRET), Cron-getriggert.
+    Ohne konfiguriertes Secret 403 (kein fail-open Lösch-Endpoint). Der Delete
+    läuft in 6h-Zeitscheiben (je eigener PostgREST-Call, max. 20) statt als
+    Mega-DELETE — ein Riesen-Statement hielt Locks/Timeouts auf der Tabelle."""
     from flask import request
     secret = os.environ.get('ADSB_POLL_SECRET', '').strip()
-    if secret and (request.headers.get('X-Poll-Secret') or '').strip() != secret:
+    if not secret:
+        return jsonify({'ok': False, 'error': 'secret_not_configured'}), 403
+    if (request.headers.get('X-Poll-Secret') or '').strip() != secret:
         return jsonify({'ok': False, 'error': 'unauthorized'}), 401
     days = int(os.environ.get('TRACK_RETENTION_DAYS', '10'))
-    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - days * 86400))
+    cutoff_epoch = time.time() - days * 86400
+    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(cutoff_epoch))
     sb = _sb()
     if sb is None:
         return jsonify({'ok': False, 'error': 'no_db'}), 503
+    batches = deleted = 0
     try:
-        sb.table('aircraft_track').delete().lt('seen_ts', cutoff).execute()
-        return jsonify({'ok': True, 'pruned_before': cutoff, 'days': days})
+        for _ in range(20):
+            # Älteste Row unterhalb des Cutoffs finden → 6h-Scheibe ab dort löschen.
+            rows = (sb.table('aircraft_track').select('seen_ts')
+                    .order('seen_ts').limit(1).execute()).data or []
+            if not rows:
+                break
+            oldest = _iso_to_epoch(rows[0].get('seen_ts'))
+            if oldest is None or oldest >= cutoff_epoch:
+                break
+            hi = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                               time.gmtime(min(oldest + 6 * 3600, cutoff_epoch)))
+            try:
+                # return=minimal: die gelöschten Rows NICHT als Payload zurück-
+                # schaufeln (eine 6h-Scheibe können zehntausende Breadcrumbs sein).
+                res = (sb.table('aircraft_track')
+                       .delete(count='exact', returning='minimal')
+                       .lt('seen_ts', hi).execute())
+            except TypeError:      # ältere postgrest-py ohne die Kwargs
+                res = sb.table('aircraft_track').delete().lt('seen_ts', hi).execute()
+            batches += 1
+            try:
+                n = getattr(res, 'count', None)
+                deleted += (int(n) if n is not None
+                            else len(getattr(res, 'data', None) or []))
+            except Exception:
+                pass
+        return jsonify({'ok': True, 'pruned_before': cutoff, 'days': days,
+                        'batches': batches, 'deleted': deleted})
     except Exception as e:
-        return jsonify({'ok': False, 'error': type(e).__name__}), 500
+        return jsonify({'ok': False, 'error': type(e).__name__,
+                        'batches': batches, 'deleted': deleted}), 500
+
+
+def _fr24_prewarm_mark_get(icao):
+    """Prewarm-Watermark (Epoch der letzten abgedeckten Fenstergrenze) pro
+    Airline-ICAO — persistiert im ax_api_budget-KV (key='fr24pw:<ICAO>', n=Epoch,
+    gleiche Tabelle wie die Budget-Keys → KEINE neue Tabelle). 0 wenn unbekannt."""
+    return _budget_key_used('fr24pw:' + (icao or '').strip().upper())
+
+
+def _fr24_prewarm_mark_set(icao, epoch):
+    """Watermark auf max(bestehend, epoch) heben. Direkter Upsert statt
+    ax_budget_increment-RPC: der RPC zählt nur hoch — eine Watermark ist aber
+    ein monotoner Absolutwert. max() macht den Upsert race-tolerant."""
+    key = 'fr24pw:' + (icao or '').strip().upper()
+    try:
+        e = int(epoch)
+    except (TypeError, ValueError):
+        return
+    _MEM_BUDGET[key] = max(int(_MEM_BUDGET.get(key, 0)), e)
+    sb = _sb()
+    if sb is None:
+        return
+    try:
+        sb.table('ax_api_budget').upsert(
+            {'month': key, 'n': max(e, _budget_key_used(key)),
+             'updated_at': _iso_now()}).execute()
+    except Exception:
+        pass
 
 
 @aerox_data_bp.route('/api/ax/fr24-prewarm', methods=['POST'])
@@ -3574,8 +3827,20 @@ def ax_fr24_prewarm():
         days = max(1, min(int(request.args.get('days') or 2), 3))
     except Exception:
         days = 2
+    # Watermark (persistiert): bereits bezahlte Zeitfenster nicht nochmal holen —
+    # wiederholte Cron-Läufe re-spendeten sonst denselben Zeitraum. from_override=1
+    # ignoriert die Watermark bewusst (voller days-Rückblick, z.B. nach Datenloch).
+    force = ((request.args.get('from_override') or request.args.get('force') or '')
+             .strip().lower() in ('1', 'true', 'yes'))
+    t_from = None
+    if not force:
+        wm = _fr24_prewarm_mark_get(icao)
+        if wm:
+            t_from = float(wm)
     before = _budget_key_used(_fr24_budget_key())
-    legs = _fr24_flights_by_airline(icao, days=days)
+    cover = {}
+    legs = _fr24_flights_by_airline(icao, days=days, t_from=t_from,
+                                    cover_out=cover)
     cs = _life_app('_crowdsource_flight_obs')
     imported = 0
     if cs:
@@ -3585,9 +3850,26 @@ def ax_fr24_prewarm():
                     imported += 1
             except Exception:
                 pass
-    return jsonify({'ok': True, 'icao': icao, 'days': days,
-                    'fetched': len(legs), 'imported': imported,
-                    'credits_used': _budget_key_used(_fr24_budget_key()) - before})
+    out = {'ok': True, 'icao': icao, 'days': days,
+           'fetched': len(legs), 'imported': imported,
+           'credits_used': _budget_key_used(_fr24_budget_key()) - before}
+    if cover.get('to'):
+        _fr24_prewarm_mark_set(icao, cover['to'])
+        out['covered_to'] = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                          time.gmtime(cover['to']))
+    return jsonify(out)
+
+
+def _paid_prefix_plausible(q):
+    """Plausi-Gate vor dem Paid-Zweig der resolve-Endpoints: das Airline-Präfix
+    (ICAO 3 / IATA 2) des Queries muss in der airlines-Referenz existieren —
+    Fantasie-/Scan-Queries erreichen FR24 so gar nicht erst (jeder Miss kostete
+    trotzdem Credits)."""
+    s = (q or '').strip().upper()
+    for n in (3, 2):
+        if len(s) > n and _airline_row(s[:n]):
+            return True
+    return False
 
 
 @aerox_data_bp.route('/api/ax/resolve-callsign/<callsign>', methods=['GET'])
@@ -3598,14 +3880,21 @@ def ax_resolve_callsign(callsign):
     „4Y601" ≠ Callsign „OCN601"). Löst zugleich „Suche DLH7AV → keine Treffer".
     Ergebnis wird permanent ins Warehouse gespiegelt. Hart gecacht (Zero-Double-
     Spend). {ok, callsign, flight, source}."""
+    if _ax_rate_limited('resolve_callsign', limit=30, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     cs = (callsign or '').strip().upper()
     if len(cs) < 3:
         return jsonify({'ok': False, 'error': 'bad_callsign'}), 400
     # FREE-FIRST: aktiver Flug gratis im aircraft_live (by callsign) → kein FR24.
+    # BEWUSST kein Obs-Vorab-Check per abgeleiteter IATA-Nummer: die naive
+    # Präfix+Suffix-Ableitung (OCN601→„4Y601") ist genau die Verwechslung, die
+    # dieser Endpoint fixt (echte IATA wäre 4Y60) — lieber paid-Wahrheit als
+    # gratis-falsch (kein Geister-Flieger).
     flight = _aircraft_live_flight(callsign=cs)
     src = 'aircraft_live'
     if not flight:
-        flight = _fr24_flight_by_callsign(cs)
+        # Paid nur hinter dem Plausi-Gate (Airline-Präfix muss existieren).
+        flight = _fr24_flight_by_callsign(cs) if _paid_prefix_plausible(cs) else None
         src = 'fr24'
     if flight:
         if src == 'fr24':
@@ -3629,6 +3918,8 @@ def ax_resolve_flight(flightno):
     FRA→BEG und keine Live-Position). iOS nimmt Route/Reg als Top-Wahrheit und den
     echten Callsign für die adsb.lol-Live-Position. Permanent gespiegelt, gecacht.
     {ok, number, flight, source}."""
+    if _ax_rate_limited('resolve_flight', limit=30, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     fn = (flightno or '').strip().upper().replace(' ', '')
     if len(fn) < 3:
         return jsonify({'ok': False, 'error': 'bad_flight'}), 400
@@ -3637,8 +3928,22 @@ def ax_resolve_flight(flightno):
     flight = _aircraft_live_flight(flight=fn)
     src = 'aircraft_live'
     if not flight:
-        flight = _fr24_flight_by_number(fn)
-        src = 'fr24'
+        # FREE zuerst (Owner „free FR24 mit Backup paid"): kennt der Board-Scrape die
+        # Route (Obs), bauen wir ein Minimal-Dict → der Enrich holt die Zeiten gratis
+        # via FR24-gRPC. Paid erst, wenn nicht mal die Route frei bekannt ist.
+        _ff = _flight_facts_from_obs(fn, None)
+        if _ff.get('dep_iata') and _ff.get('arr_iata'):
+            flight = {'ok': True, 'found': True, 'flight': fn,
+                      'dep_iata': _ff['dep_iata'], 'arr_iata': _ff['arr_iata'],
+                      'reg': _ff.get('reg'), 'aircraft': _ff.get('type'),
+                      'status': _ff.get('dep_status') or '', 'status_category': ''}
+            src = 'aerox_obs'
+        else:
+            # Paid nur hinter dem Plausi-Gate (Airline-Präfix muss existieren —
+            # Fantasie-/Scan-Queries erreichen FR24 nicht, jeder Miss kostete).
+            flight = (_fr24_flight_by_number(fn)
+                      if _paid_prefix_plausible(fn) else None)
+            src = 'fr24'
     if flight:
         if src == 'fr24':          # nur bezahlte Auflösung permanent spiegeln
             cs_fn = _life_app('_crowdsource_flight_obs')
@@ -3831,41 +4136,17 @@ def ax_flight_detail(query):
 
 @aerox_data_bp.route('/api/ax/harvest-routes', methods=['POST'])
 def ax_harvest_routes():
-    """Route-Harvester (User-Wunsch: „die restlichen Flugnummern suchen + von wo
-    wohin speichern", öffentlich verfügbar). Die App schickt die Callsigns, die sie
-    ohnehin vom Radar-Area-Poll hat; wir speichern für jeden NOCH NICHT gecachten
-    die Strecke dauerhaft in `ax_route_cache` — Quelle ausschließlich `adsbdb`
-    (frei + öffentlich, KEIN AviationStack-Budget). Pro Request hart gedeckelt
-    (Rate-Schutz für adsbdb), der Rest kommt beim nächsten Poll dran → die Routen-
-    DB wächst über echten Verkehr auf ganz Europa, ohne Bulk-/Budget-Limit."""
+    """DEAKTIVIERT (adsbdb-Kappung, Kosten-Review 2026-07-09): der Harvester zog
+    pro App-Poll bis zu 12 adsbdb-Calls — die Quelle ist unzuverlässig (Owner
+    2026-07-03: „eh immer falsch") und die Routen-DB wächst längst über die
+    eigenen Poller/Boards. Der Endpoint BLEIBT (alte Builds rufen ihn weiter)
+    und antwortet ok — aber als No-op OHNE externe Calls und ohne DB-Reads."""
     from flask import request
     body = request.get_json(silent=True) or {}
     csigns = body.get('callsigns') or []
     if not isinstance(csigns, list):
         return jsonify({'ok': False, 'error': 'bad_body'}), 400
-    MAX_NEW = 12               # höchstens 12 neue adsbdb-Calls pro Request
-    harvested = cached = checked = 0
-    seen = set()
-    for raw in csigns[:300]:
-        cs = (str(raw) or '').strip().upper().replace(' ', '')
-        if not cs or len(cs) < 4 or cs in seen:
-            continue
-        seen.add(cs)
-        checked += 1
-        if _cache_get('ax_route_cache', 'flight', cs):
-            cached += 1
-            continue
-        if harvested >= MAX_NEW:
-            continue           # Rest beim nächsten Poll
-        route = _adsbdb_route(cs)
-        if route and (route.get('src') or route.get('src_icao')) \
-           and (route.get('dst') or route.get('dst_icao')):
-            _cache_put('ax_route_cache',
-                       {'flight': cs, 'payload': route,
-                        'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
-            harvested += 1
-    return jsonify({'ok': True, 'checked': checked,
-                    'cached': cached, 'harvested': harvested})
+    return jsonify({'ok': True, 'checked': 0, 'cached': 0, 'harvested': 0})
 
 
 def _airport_full(code):
