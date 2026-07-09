@@ -27397,6 +27397,20 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
             if o is not None:
                 arr_row, arr_src = dict(o), 'obs'
 
+    # DAY-BOUNDARY-GUARD (Owner 2026-07-09 „LH752 steht Gelandet, hebt aber erst
+    # ab"): ein Nachtflug (Abflug heute, Ankunft morgen früh) darf NICHT die
+    # ANKUNFT VON GESTERN an den heutigen Abflug kleben. Ein reales Flug-Exemplar
+    # landet IMMER nach seinem Abflug — ist die (nach UTC gerechnete) Ankunft VOR
+    # dem Abflug, gehört die arr-Row zu einem FRÜHEREN Betriebstag → verwerfen,
+    # damit der heutige Flug nicht fälschlich „Arrived/Gelandet" zeigt.
+    if dep_row is not None and arr_row is not None:
+        _dsched = (dep_row.get('sched') or '').strip() or None
+        _asched = (arr_row.get('sched') or '').strip() or None
+        _du = _board_local_to_utc_iso(_dsched, dep) if _dsched else None
+        _au = _board_local_to_utc_iso(_asched, arr) if _asched else None
+        if _du and _au and _au < _du:
+            arr_row, arr_src = None, None
+
     if dep_row is None and arr_row is None:
         _FLIGHT_MERGE_CACHE[ckey] = (_t.time(), None)
         _cache_soft_cap(_FLIGHT_MERGE_CACHE)

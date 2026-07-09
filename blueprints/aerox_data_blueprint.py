@@ -1165,9 +1165,10 @@ def _fr24_flights_by_reg(reg, days=7, limit=12):
                                               time.gmtime(now - days * 86400)),
         'flight_datetime_to': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now)),
     })
-    _fr24_budget_inc = _budget_key_inc     # lokaler Alias
-    _fr24_budget_inc(_fr24_budget_key(), _FR24_SUMMARY_CREDITS)
     data = (j or {}).get('data') or []
+    # FR24 zählt Credits PRO Ergebnis (nicht pauschal) → nach Trefferzahl buchen
+    # (mind. Basis auch bei leer, weil der Call trotzdem kostet).
+    _budget_key_inc(_fr24_budget_key(), max(_FR24_SUMMARY_CREDITS, len(data)))
     legs = []
     for f in data:
         leg = _fr24_summary_to_leg(f)
@@ -1208,9 +1209,10 @@ def _fr24_flight_by_number(flight_no, date=None):
     j = _fr24_get('/flight-summary/light',
                   {'flights': fn, 'flight_datetime_from': dt_from,
                    'flight_datetime_to': dt_to})
-    _budget_key_inc(_fr24_budget_key(), _FR24_SUMMARY_CREDITS)
+    _data = (j or {}).get('data') or []
+    _budget_key_inc(_fr24_budget_key(), max(_FR24_SUMMARY_CREDITS, len(_data)))
     legs = []
-    for f in ((j or {}).get('data') or []):
+    for f in _data:
         leg = _fr24_summary_to_leg(f)
         if leg and leg.get('src') and leg.get('dst'):
             legs.append(leg)
@@ -1234,6 +1236,35 @@ def _fr24_flight_by_number(flight_no, date=None):
     if len(_FR24_REG_CACHE) > 500:
         _FR24_REG_CACHE.clear()
     return out
+
+
+def _fr24_flights_by_airline(icao, days=2, limit=2000):
+    """ALLE Flüge EINER Airline (operating_as=ICAO) über flight-summary — für den
+    Warehouse-Prewarm (Owner „alle von Discover ins Buch speichern"): einmal
+    bezahlt holen, permanent speichern, danach gratis nachschlagbar. Budget-gated,
+    Credits PRO Ergebnis. Liefert crowdsourcebare Leg-Dicts (nur mit echter Reg).
+    KEIN Cache hier (bewusst — der Prewarm SOLL frisch holen)."""
+    if not (_fr24_available() and _fr24_budget_ok()):
+        return []
+    ic = (icao or '').strip().upper()
+    if len(ic) < 2:
+        return []
+    now = time.time()
+    j = _fr24_get('/flight-summary/light', {
+        'operating_as': ic,
+        'flight_datetime_from': time.strftime('%Y-%m-%dT%H:%M:%S',
+                                              time.gmtime(now - days * 86400)),
+        'flight_datetime_to': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now)),
+    })
+    data = (j or {}).get('data') or []
+    _budget_key_inc(_fr24_budget_key(), max(_FR24_SUMMARY_CREDITS, len(data)))
+    legs = []
+    for f in data:
+        leg = _fr24_summary_to_leg(f)
+        if (leg and leg.get('flight_no') and leg.get('src')
+                and leg.get('dst') and leg.get('reg')):
+            legs.append(leg)
+    return legs[:limit]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2788,6 +2819,47 @@ def ax_tail_history():
                         pass
     return jsonify({'ok': True, 'reg': reg or None, 'hex': hexid or None,
                     'count': len(legs), 'legs': legs, 'source': source})
+
+
+@aerox_data_bp.route('/api/ax/fr24-prewarm', methods=['POST'])
+def ax_fr24_prewarm():
+    """INTERNER Warehouse-Prewarm (Owner „alle von Discover ins Buch"): holt ALLE
+    Flüge einer Airline (operating_as=ICAO) EINMAL bezahlt von FR24 und schreibt
+    sie permanent ins Warehouse (_crowdsource_flight_obs) → danach gratis
+    nachschlagbar für alle. Geschützt wie die Poller (X-Poll-Secret == ADSB_POLL_
+    SECRET; ohne gesetztes Secret nur localhost). Query: ?icao=OCN&days=2.
+    Antwort: {ok, icao, fetched, imported, credits_used}."""
+    import os as _os
+    from flask import request
+    secret = (_os.environ.get('ADSB_POLL_SECRET') or '').strip()
+    if secret:
+        if (request.headers.get('X-Poll-Secret') or '').strip() != secret:
+            return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    else:
+        ra = (request.remote_addr or '')
+        if ra not in ('127.0.0.1', '::1', 'localhost'):
+            return jsonify({'ok': False, 'error': 'localhost_only'}), 403
+    icao = (request.args.get('icao') or '').strip().upper()
+    if len(icao) < 2:
+        return jsonify({'ok': False, 'error': 'icao_required'}), 400
+    try:
+        days = max(1, min(int(request.args.get('days') or 2), 3))
+    except Exception:
+        days = 2
+    before = _budget_key_used(_fr24_budget_key())
+    legs = _fr24_flights_by_airline(icao, days=days)
+    cs = _life_app('_crowdsource_flight_obs')
+    imported = 0
+    if cs:
+        for l in legs:
+            try:
+                if cs(l, l.get('day'), source='fr24'):
+                    imported += 1
+            except Exception:
+                pass
+    return jsonify({'ok': True, 'icao': icao, 'days': days,
+                    'fetched': len(legs), 'imported': imported,
+                    'credits_used': _budget_key_used(_fr24_budget_key()) - before})
 
 
 @aerox_data_bp.route('/api/ax/harvest-routes', methods=['POST'])

@@ -351,3 +351,84 @@ def test_flight_status_no_fr24_when_free_has_data(client):
     assert r.status_code == 200
     assert r.get_json().get('source') == 'aerox_obs_merged'
     mfr.assert_not_called()
+
+
+# ─────────────────── FR24 airline prewarm endpoint ───────────────────
+
+def test_fr24_prewarm_imports_to_warehouse(client):
+    """Prewarm (localhost, kein Secret gesetzt) holt Airline-Flüge + schreibt sie
+    permanent (_crowdsource_flight_obs)."""
+    import os as _os
+    import blueprints.aerox_data_blueprint as BP
+    legs = [{'flight_no': '4Y100', 'src': 'FRA', 'dst': 'BCN',
+             'day': '2026-07-09', 'sched_dep': '2026-07-09T06:00:00Z',
+             'sched_arr': '2026-07-09T08:05:00Z', 'duration_min': 125,
+             'status': 'landed', 'reg': 'DAIKO', 'type': 'A333',
+             'dep_iata': 'FRA', 'arr_iata': 'BCN', 'aircraft': 'A333'}]
+    _prev = _os.environ.pop('ADSB_POLL_SECRET', None)
+    try:
+        with patch.object(BP, '_fr24_flights_by_airline', return_value=legs), \
+             patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
+            r = client.post('/api/ax/fr24-prewarm?icao=OCN&days=2')
+    finally:
+        if _prev is not None:
+            _os.environ['ADSB_POLL_SECRET'] = _prev
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['ok'] and body['icao'] == 'OCN'
+    assert body['fetched'] == 1 and body['imported'] == 1
+    assert mcs.called
+
+
+def test_fr24_prewarm_wrong_secret_401(client):
+    import os as _os
+    import blueprints.aerox_data_blueprint as BP
+    with patch.dict(_os.environ, {'ADSB_POLL_SECRET': 'sekret'}), \
+         patch.object(BP, '_fr24_flights_by_airline') as mfa:
+        r = client.post('/api/ax/fr24-prewarm?icao=OCN',
+                        headers={'X-Poll-Secret': 'falsch'})
+    assert r.status_code == 401
+    mfa.assert_not_called()
+
+
+# ─────────── LH752 mixed-day guard (dep heute + arr von gestern) ───────────
+
+def test_merged_drops_stale_prior_day_arrival():
+    """Nachtflug LH752: heutiger Abflug 13:00 FRA + Ankunfts-Obs 00:46 HYD (=
+    gestriges Exemplar, UTC vor dem Abflug) → arr verworfen, NICHT fälschlich
+    'Arrived'."""
+    dep_row = {'flight': 'LH752', 'sched': '2026-07-09T13:00:00',
+               'dest_iata': 'HYD', 'delay_min': 15, 'delay_known': True,
+               'status': 'Departed', 'cancelled': False}
+    arr_row = {'flight': 'LH752', 'sched': '2026-07-09T00:46:00',
+               'dest_iata': 'FRA', 'delay_min': 0, 'delay_known': True,
+               'status': 'Arrived', 'cancelled': False}
+
+    def fake_dep(key):
+        return [arr_row] if str(key).endswith('#ARR') else [dep_row]
+
+    with patch.object(A, '_departed_rows_from_store', side_effect=fake_dep):
+        m = A._flight_obs_merged('LH752', date=None, dep_iata='FRA',
+                                 arr_iata='HYD', live=False, free_only=True)
+    assert m is not None
+    assert m['has_dep'] is True
+    assert m['has_arr'] is False          # gestrige Ankunft verworfen
+    assert m['status'] != 'Arrived'       # heutiger Flug nicht „gelandet"
+
+
+def test_merged_keeps_valid_same_instance_arrival():
+    """Gegenprobe: normale Ankunft NACH dem Abflug bleibt erhalten."""
+    dep_row = {'flight': 'LH1128', 'sched': '2026-07-09T11:00:00',
+               'dest_iata': 'BCN', 'delay_min': 0, 'delay_known': True,
+               'status': 'Departed', 'cancelled': False}
+    arr_row = {'flight': 'LH1128', 'sched': '2026-07-09T13:05:00',
+               'dest_iata': 'FRA', 'delay_min': 0, 'delay_known': True,
+               'status': 'Arrived', 'cancelled': False}
+
+    def fake_dep(key):
+        return [arr_row] if str(key).endswith('#ARR') else [dep_row]
+
+    with patch.object(A, '_departed_rows_from_store', side_effect=fake_dep):
+        m = A._flight_obs_merged('LH1128', date=None, dep_iata='FRA',
+                                 arr_iata='BCN', live=False, free_only=True)
+    assert m is not None and m['has_arr'] is True

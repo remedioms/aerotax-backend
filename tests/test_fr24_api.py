@@ -92,8 +92,8 @@ def test_flights_by_reg_normalizes_sorts_limits():
     assert mget.call_args[0][1]['registrations'] == 'D-AIHW'
     # … Ergebnis neueste-zuerst + Limit 2
     assert [l['flight_no'] for l in legs] == ['LH401', 'LH400']
-    # Credits gezählt (2 pro Call)
-    assert BP._budget_key_used(BP._fr24_budget_key()) == 2
+    # Credits PRO Ergebnis gezählt (3 Treffer → 3), nicht pauschal.
+    assert BP._budget_key_used(BP._fr24_budget_key()) == 3
 
 
 def test_no_token_returns_empty_no_call():
@@ -159,3 +159,21 @@ def test_flight_by_number_none_when_no_data():
     with patch.object(BP, '_fr24_token', return_value='tok'), \
          patch.object(BP, '_fr24_get', return_value={'data': []}):
         assert BP._fr24_flight_by_number('LH999', '2026-07-08') is None
+
+
+def test_flights_by_airline_only_with_reg():
+    """Airline-Bulk: nur Legs MIT echter Reg (crowdsourcebar), operating_as-Filter,
+    Credits pro Ergebnis."""
+    resp = {'data': [
+        _summary('4Y100', 'EDDF', 'LEBL', '2026-07-09T06:00:00Z',
+                 '2026-07-09T08:05:00Z', reg='D-AIKO'),
+        _summary('4Y101', 'LEBL', 'EDDF', '2026-07-09T09:00:00Z',
+                 '2026-07-09T11:05:00Z', reg=''),          # keine Reg → raus
+    ]}
+    with patch.object(BP, '_fr24_token', return_value='tok'), \
+         patch.object(BP, '_icao_to_iata', side_effect=lambda c: _ICAO2IATA.get(c)), \
+         patch.object(BP, '_fr24_get', return_value=resp) as mget:
+        legs = BP._fr24_flights_by_airline('OCN', days=2)
+    assert mget.call_args[0][1]['operating_as'] == 'OCN'
+    assert len(legs) == 1 and legs[0]['flight_no'] == '4Y100'
+    assert BP._budget_key_used(BP._fr24_budget_key()) == 2   # 2 Treffer
