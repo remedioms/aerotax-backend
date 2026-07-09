@@ -323,9 +323,26 @@ def test_simulate_forward_only_when_lost():
     # position was flown FORWARD along track 90 (east) -> lon increased past the last fix
     assert fs["live"]["lon"] > SIBERIA[1]
     assert fs["live"]["stale_since"] is not None
+    assert fs["live_status"] == "simulated"
     # a time-to-landing estimate exists, flagged simulated
     assert fs["times"]["eta_iso"] is not None
     assert fs["times"]["eta_conf"] == SIMULATED
+
+
+def test_lost_when_unsure_shows_honest_not_ghost():
+    """Coverage lost near the destination / in descent -> we don't know if it's
+    still flying or already landed -> honest live_status='lost' (FR24-style
+    'gelandet oder außer Reichweite'), NO simulated dot."""
+    last = {"lat": 36.0, "lon": 139.2, "track": 200, "gs_kt": 250,
+            "alt_ft": 8000, "position_source": 3}   # low + near HND = descending to land
+    fs = resolve_flight_state(
+        keys={"flight": "LH716", "date": "2026-07-09", "dep_iata": "FRA", "arr_iata": "HND",
+              "dep_ll": FRA, "arr_ll": HND, "sched_dep_ts": NOW - 12 * 3600},
+        observations=[
+            Observation("position", last, "aircraft_live", NOW - 2400),  # stale, near dest, low
+        ], now=NOW)
+    assert fs["live"] is None
+    assert fs["live_status"] == "lost"
 
 
 def test_too_long_gone_no_ghost_dot():

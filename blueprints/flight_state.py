@@ -563,9 +563,15 @@ def resolve_flight_state(keys: dict, observations: list, *, now: Optional[float]
     times, delay = _pick_times_delay(observations, keys, now)
     eta_iso, eta_conf = _resolve_eta(observations, keys, raw_pos, phase, now)
 
-    # 6. POSITION output gate + forward-sim (COVERAGE never-lose, bounded)
+    # 6. POSITION output gate + forward-sim (COVERAGE never-lose, bounded).
+    # live_status: 'live' = real fresh fix · 'simulated' = flown forward (we're
+    # confident it's still airborne) · 'lost' = coverage gone AND we are NOT sure
+    # it's still flying (near destination / descending / ETA reached) -> honest
+    # "gelandet oder außer Reichweite", never a guessed dot (FR24-style) · None =
+    # not a position-rendering phase.
     live = None
     progress = None
+    live_status = None
     pos_fresh = raw_pos is not None and pos_ts is not None and \
         (now - pos_ts) <= MAX_AGE.get(pos_src, 600)
     airborne_ok = raw_pos is not None and is_airborne_kinematic(raw_pos, near_origin)
@@ -577,24 +583,36 @@ def resolve_flight_state(keys: dict, observations: list, *, now: Optional[float]
             live = _mk_live(raw_pos, pos_src, OBSERVED if pos_src == "adsb" else
                             (OBSERVED if (now - pos_ts) < 300 else ESTIMATED),
                             pos_ts, None)
+            live_status = "live"
         elif raw_pos and airborne_ok and not pos_fresh:
-            # We can no longer FIND the flight live (fell off ADS-B / snapshot went
-            # stale). ONLY NOW simulate: fly the last fix forward along its own
-            # track and estimate time-to-landing. Bounded to SIM_MAX_AGE_S; next
-            # request re-queries and a fresh real fix instantly overrides this.
+            # Live coverage lost. Simulate forward ONLY IF we are confident the
+            # plane is still airborne: it was in cruise, mid-route, and the ETA is
+            # not near. If it was descending / near the destination / past ETA, we
+            # genuinely don't know whether it's still flying OR already landed —
+            # so be HONEST (live_status='lost') instead of drawing a ghost dot.
             age = now - pos_ts
-            if age <= SIM_MAX_AGE_S:
+            _alt = _num(raw_pos.get("alt_ft"))
+            _prog = _progress(keys.get("dep_ll"), keys.get("arr_ll"), raw_pos)
+            _eta_ts = _iso_to_ts(eta_iso) if eta_iso else None
+            confident_airborne = (
+                age <= SIM_MAX_AGE_S
+                and not (_prog is not None and _prog >= 0.90)            # near destination
+                and not (_alt is not None and _alt < 18000)              # descending / low
+                and not (_eta_ts is not None and now >= _eta_ts - 300)   # ETA basically reached
+            )
+            if confident_airborne:
                 sim = _simulate_forward(raw_pos, pos_ts, keys.get("arr_ll"), now)
                 if sim:
                     render_pos, sim_eta = sim
                     live = _mk_live(render_pos, pos_src, SIMULATED, pos_ts, stale_since=pos_ts)
-                    # landing estimate from the simulation, unless a real board/ADB
-                    # ETA already exists (that wins — observed/estimated > simulated).
                     if sim_eta and eta_conf in (None, SIMULATED):
                         eta_iso, eta_conf = sim_eta, SIMULATED
                 else:
                     live = _mk_live(raw_pos, pos_src, SIMULATED, pos_ts, stale_since=pos_ts)
-            # else: too long gone -> no live dot (honest "Position offline")
+                live_status = "simulated"
+            else:
+                live = None                     # honest: landed or out of coverage
+                live_status = "lost"
         # a fix that fails the airborne gate is NEVER rendered (invariant #2)
 
         if live:
@@ -635,6 +653,7 @@ def resolve_flight_state(keys: dict, observations: list, *, now: Optional[float]
         "times": {**times, "eta_iso": eta_iso, "eta_conf": eta_conf},
         "delay": delay,
         "live": live,
+        "live_status": live_status,   # live | simulated | lost | None
         "progress": progress,
         "sticky_airborne": bool(sticky),
         "obs_ts": ph.get("obs_ts"),
@@ -734,6 +753,7 @@ def project_flight_live(fs):
     return {"ok": True, "reg": fs["reg"], "hex": fs["hex"], "callsign": fs["callsign"],
             "dep": fs["route"]["dep"], "dest": fs["route"]["dst"],
             "live": fs["live"], "in_flight": fs["in_flight"], "progress": fs["progress"],
+            "live_status": fs.get("live_status"),
             "source": fs["route"]["source"], "phase": fs["phase"], "phase_conf": fs["phase_conf"],
             "sched_arr": fs["times"]["sched_arr_iso"], "est_arr": fs["times"]["est_arr_iso"],
             "eta_iso": fs["times"]["eta_iso"], "eta_conf": fs["times"]["eta_conf"],
