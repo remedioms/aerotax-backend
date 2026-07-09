@@ -347,7 +347,11 @@ def test_lost_when_unsure_shows_honest_not_ghost():
 
 def test_too_long_gone_no_ghost_dot():
     """Gone longer than the sim horizon (>45 min) -> no live dot (honest offline),
-    never an indefinite phantom."""
+    never an indefinite phantom. Scharfgezogen (P3): war der Flug airborne
+    (sticky prior) und die Phase rendert Position, muss live_status='lost'
+    kommen (nicht None) — iOS kann seine Vorwärts-Simulation dann stoppen."""
+    prior = {"phase": AIRBORNE, "conf": OBSERVED, "obs_ts": NOW - 3000,
+             "sticky_airborne": True}
     fs = resolve_flight_state(
         keys={"flight": "LH716", "date": "2026-07-09", "dep_iata": "FRA", "arr_iata": "HND",
               "dep_ll": FRA, "arr_ll": HND, "sched_dep_ts": NOW - 6 * 3600},
@@ -355,8 +359,116 @@ def test_too_long_gone_no_ghost_dot():
             Observation("position", {"lat": SIBERIA[0], "lon": SIBERIA[1], "track": 90,
                                      "gs_kt": 470, "alt_ft": 37000, "position_source": 3},
                         "aircraft_live", NOW - 3000),  # 50 min > SIM horizon
-        ], now=NOW)
+        ], now=NOW, prior=prior)
     assert fs["live"] is None
+    assert fs["live_status"] == "lost"     # ehrliches lost, kein stilles None
+
+
+def test_render_pos_phase_without_candidate_is_lost():
+    """Board says proven airborne but NO position candidate exists at all ->
+    live=None AND live_status='lost' (RENDER_POS phase must never be a silent
+    None — clients would keep simulating a ghost)."""
+    fs = resolve_flight_state(
+        keys={"flight": "LH717", "date": "2026-07-09", "dep_iata": "FRA", "arr_iata": "HND",
+              "dep_ll": FRA, "arr_ll": HND, "sched_dep_ts": NOW - 2 * 3600},
+        observations=[
+            Observation("phase_hard", AIRBORNE, "board", NOW - 120,
+                        meta={"side": "dep", "proven_airborne": True}),
+        ], now=NOW)
+    assert fs["phase"] == AIRBORNE
+    assert fs["live"] is None
+    assert fs["live_status"] == "lost"
+
+
+def test_taxi_phase_live_status_stays_none():
+    """Nicht-RENDER_POS-Phasen bleiben live_status=None (kein falsches 'lost')."""
+    fs = _s1_taxi()
+    assert fs["phase"] == TAXI_OUT
+    assert fs["live_status"] is None
+
+
+# ─────────────────────────── ON-TIME (Owner-Regel D15) ─────────────────────
+
+def _fs_with_delay(arr_delay_min, cancelled=False):
+    obs = [Observation("delay", {"delay_known": True, "arr_delay_min": arr_delay_min,
+                                 "dep_delay_min": arr_delay_min}, "board", NOW - 60)]
+    if cancelled:
+        obs.append(Observation("phase_hard", CANCELLED, "board", NOW - 60,
+                               meta={"side": "dep", "cancelled": True}))
+    return resolve_flight_state(
+        keys={"flight": "LHT", "date": "2026-07-09", "dep_iata": "FRA", "arr_iata": "GVA",
+              "dep_ll": FRA, "arr_ll": GVA, "sched_dep_ts": NOW - 600},
+        observations=obs, now=NOW)
+
+
+def test_on_time_d15_threshold():
+    """Owner-Regel D15: delay < 15 = pünktlich (nicht <=5), >=15 = verspätet."""
+    assert _fs_with_delay(12)["on_time"] is True
+    assert _fs_with_delay(14)["on_time"] is True
+    assert _fs_with_delay(15)["on_time"] is False
+    assert _fs_with_delay(40)["on_time"] is False
+
+
+def test_cancelled_is_never_on_time():
+    """annulliert schlägt jeden Delay-Wert — auch delay 0 ist nicht 'pünktlich'."""
+    fs = _fs_with_delay(0, cancelled=True)
+    assert fs["phase"] == CANCELLED
+    assert fs["on_time"] is False
+
+
+# ─────────────────────────── PRIOR-MEMO ────────────────────────────────────
+
+def test_prior_memo_roundtrip_and_ttl():
+    E._PRIOR_STORE.clear()
+    fs = _s4_cruise()
+    E.remember_state(fs, now=NOW)
+    p = E.prior_state("LH1000", "2026-07-09", now=NOW + 60)
+    assert p is not None
+    assert p["phase"] == AIRBORNE
+    assert p["sticky_airborne"] is True
+    # abgelaufen (> TTL) → None
+    assert E.prior_state("LH1000", "2026-07-09", now=NOW + E._PRIOR_TTL_S + 1) is None
+    E._PRIOR_STORE.clear()
+
+
+def test_prior_memo_feeds_monotonicity():
+    """remember_state → prior_state → resolve: ein terminal LANDED prior hält
+    gegen ein stales Soft-Signal (der Memo-Weg, nicht nur das prior=-Argument)."""
+    E._PRIOR_STORE.clear()
+    landed = resolve_flight_state(
+        keys={"flight": "LH881", "date": "2026-07-09", "dep_iata": "FRA",
+              "arr_iata": "LHR", "dep_ll": FRA, "arr_ll": LHR,
+              "sched_dep_ts": NOW - 4000},
+        observations=[
+            Observation("phase_hard", LANDED, "board", NOW - 300, meta={"side": "arr"}),
+        ], now=NOW)
+    assert landed["phase"] == LANDED
+    E.remember_state(landed, now=NOW)
+    fs2 = resolve_flight_state(
+        keys={"flight": "LH881", "date": "2026-07-09", "dep_iata": "FRA",
+              "arr_iata": "LHR", "dep_ll": FRA, "arr_ll": LHR,
+              "sched_dep_ts": NOW - 4000},
+        observations=[
+            Observation("phase_soft", BOARDING, "board", NOW - 3000, meta={"side": "dep"}),
+        ], now=NOW + 120, prior=E.prior_state("LH881", "2026-07-09", now=NOW + 120))
+    assert fs2["phase"] == LANDED          # kein Rückfall auf stale BOARDING
+    E._PRIOR_STORE.clear()
+
+
+# ─────────────────────────── HOCHLAND-ALT-GATE ─────────────────────────────
+
+def test_high_elevation_airport_parked_plane_not_airborne():
+    """alt_ft ist MSL: ein GEPARKTER Flieger in MEX (7316 ft) darf das
+    alt>1000-Gate nicht bestehen — weder mit Elevation (relativ) noch ohne
+    (konservativ: alt-only verlangt gs>=50, sofern gs gemeldet)."""
+    parked_mex = {"alt_ft": 7400, "gs_kt": 3}
+    assert is_airborne_kinematic(parked_mex, dep_elev_ft=7316) is False
+    assert is_airborne_kinematic(parked_mex) is False          # konservativ
+    # wirklich über MEX (Feld + >1000 ft) → airborne
+    assert is_airborne_kinematic({"alt_ft": 9000, "gs_kt": 210},
+                                 dep_elev_ft=7316) is True
+    # alt-only-Fix OHNE gs bleibt airborne (echte Cruise-Fixe nicht un-fliegen)
+    assert is_airborne_kinematic({"alt_ft": 35000, "gs_kt": None}) is True
 
 
 # ─────────────────────────── PROJECTIONS CONSISTENCY ───────────────────────

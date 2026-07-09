@@ -680,9 +680,16 @@ def _live_fix_for_reg(reg, datum):
                         break
                     except (TypeError, ValueError):
                         continue
+                # Höhe für das Kinematik-Gate: Row-Layout [7]=baro_altitude_m,
+                # [13]=geo_altitude_m (Meter!) → alt_ft. Ohne sie verwarf das
+                # Gate jeden Fix, dessen Quelle keine Ground-Speed trägt.
+                alt_m = row[7] if row[7] is not None else (
+                    row[13] if len(row) > 13 else None)
                 fix = {
                     'lat': float(lat),
                     'lon': float(lon),
+                    'alt_ft': (round(float(alt_m) / 0.3048)
+                               if alt_m is not None else None),
                     'track': (float(row[10]) if row[10] is not None else None),
                     'speed_kt': (round(float(row[9]) * _KT_PER_MS, 1)
                                  if row[9] is not None else None),
@@ -719,10 +726,14 @@ def _flying_live_fix(chain, datum, fns, legs_live, now=None):
             return None
         if (time.time() - fix['ts']) > _LIVE_FIX_MAX_AGE_S:
             return None   # Beobachtung zu alt — ehrlich keine Live-Position
-        # Aktives Leg (Callsign + dep/arr) anhängen → erlaubt dem Aufrufer den
-        # fr24_grpc-Routen-Confirm DIESES Legs mit der Live-Position.
+        # Aktives Leg (Callsign + Reg + dep/arr) anhängen → erlaubt dem Aufrufer
+        # den Live-Routen-Confirm DIESES Legs mit der Live-Position. Die Reg ist
+        # wichtig: der Roster trägt die IATA-Flugnummer (LH716), route_for_flight
+        # matcht Cache/Warehouse/aircraft_live aber über ATC-Funknamen (DLH716)
+        # ODER die Reg — ohne Reg wäre der Confirm praktisch immer ein Miss.
         fix = dict(fix)
         fix['callsign'] = fns[idx]
+        fix['reg'] = reg
         fix['leg_dep'] = chain[idx]
         fix['leg_arr'] = chain[idx + 1]
         return fix
@@ -1094,17 +1105,58 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
             _fix = _flying_live_fix(today_chain, active_datum,
                                     day_fns.get(active_datum),
                                     legs_live_cached)
-            # FLIGHTSTATE-Gate (Kill-Switch FLIGHTSTATE_LIVE_FAMILY=1): nur eine
-            # WIRKLICH fliegende Position an die Family — Taxi/Boden ⇒ kein
-            # Geister-Dot. Zweite Sicherung auf Projektions-Ebene, konsistent mit
-            # der Engine (is_airborne_kinematic: alt>1000 ODER gs>=80).
+            # FLIGHTSTATE-Gate (Kill-Switch FLIGHTSTATE_LIVE_FAMILY=1): der Fix
+            # läuft durch die ENGINE (statt nur durchs rohe Kinematik-Gate) —
+            # nur eine WIRKLICH fliegende Position an die Family (Taxi/Boden ⇒
+            # kein Geister-Dot), die PHASE kommt aus der Engine (P1-4e) und ein
+            # ehrliches live_status='lost' (P1-4c, additiv) erlaubt iOS, die
+            # Großkreis-Simulation zu stoppen. Flag bleibt default AUS.
             if _fix and os.environ.get('FLIGHTSTATE_LIVE_FAMILY', '') in ('1', 'true', 'yes'):
                 try:
-                    from blueprints.flight_state import is_airborne_kinematic as _fs_air
-                    if not _fs_air({'gs_kt': _fix.get('speed_kt'), 'alt_ft': _fix.get('alt')}):
-                        _fix = None
+                    from blueprints.flight_state_collectors import (
+                        build_keys as _fs_bk, obs_from_pos as _fs_op)
+                    from blueprints.flight_state import resolve_flight_state as _fs_resolve
+                    try:
+                        from blueprints.aerox_data_blueprint import _iata_latlon as _fs_ll
+                    except Exception:
+                        def _fs_ll(_c):
+                            return None
+                    _fs_keys = _fs_bk(
+                        _fix.get('callsign'), active_datum,
+                        _fix.get('leg_dep'), _fix.get('leg_arr'),
+                        roster_tail=_fix.get('reg'),
+                        dep_ll=_fs_ll(_fix.get('leg_dep') or ''),
+                        arr_ll=_fs_ll(_fix.get('leg_arr') or ''))
+                    _fs = _fs_resolve(_fs_keys, _fs_op({
+                        'lat': _fix.get('lat'), 'lon': _fix.get('lon'),
+                        'track': _fix.get('track'), 'gs': _fix.get('speed_kt'),
+                        'alt': _fix.get('alt_ft'), 'seen_ts': _fix.get('ts'),
+                    }, (_fix.get('source') or 'adsb')))
+                    # additiv: 'lost' = Coverage weg und Fliegen nicht mehr
+                    # beweisbar → iOS KANN die Simulation ehrlich beenden.
+                    status['live_status'] = _fs.get('live_status')
+                    # Engine-Phase → Family-Vokabular (Kontrakt: 'airborne'|
+                    # 'landed'|'grounded'|'cancelled'|None); None ⇒ die Board-
+                    # basierte _canonical_flight_phase bleibt stehen.
+                    _eng_ph = {'AIRBORNE': 'airborne', 'APPROACH': 'airborne',
+                               'DIVERTED': 'airborne', 'LANDED': 'landed',
+                               'ARRIVED': 'landed', 'TAXI_OUT': 'grounded',
+                               'BOARDING': 'grounded',
+                               'CANCELLED': 'cancelled'}.get(_fs.get('phase'))
+                    if _eng_ph is not None:
+                        status['flight_phase'] = _eng_ph
+                    if _fs.get('live') is None:
+                        _fix = None      # Engine-gegatet: Taxi/Boden/lost ⇒ kein Dot
                 except Exception:
-                    pass
+                    # Fallback = altes rohes Kinematik-Gate (nie schlechter als
+                    # vorher: kein Geister-Dot, auch wenn die Engine wirft).
+                    try:
+                        from blueprints.flight_state import is_airborne_kinematic as _fs_air
+                        if not _fs_air({'gs_kt': _fix.get('speed_kt'),
+                                        'alt_ft': _fix.get('alt_ft')}):
+                            _fix = None
+                    except Exception:
+                        pass
             if _fix:
                 status['live_lat'] = _fix['lat']
                 status['live_lon'] = _fix['lon']
@@ -1113,20 +1165,26 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                 status['live_ts_iso'] = _iso_utc_z(_dt.datetime.fromtimestamp(
                     _fix['ts'], _dt.timezone.utc))
                 status['live_source'] = _fix['source']
-                # LIVE-BESTÄTIGTES aktuelles Leg (fr24_grpc per-flight, free-only):
+                # LIVE-BESTÄTIGTES aktuelles Leg (free-only, geometrie-gegated):
                 # überschreibt today_dep/arr mit der WIRKLICH gerade geflogenen
-                # Strecke (diversion-fest, 10/10 verifiziert), Tour-Label bleibt.
-                # Nur mit Position + aktivem Callsign → fr24_grpc-Tier greift.
+                # Strecke (diversion-fest), Tour-Label bleibt. Reg mitgeben —
+                # die Roster-IATA-Flugnummer (LH716) matcht die ATC-Callsign-
+                # Keys (DLH716) sonst nie. Übernommen wird JEDE live-bestätigte
+                # Quelle (confidence='confirmed': aircraft_live/Board/Warehouse/
+                # fr24_grpc — alle gratis, allow_paid=False bleibt), nicht nur
+                # exakt fr24_grpc; 'estimated' (fr24_live) bleibt draußen.
                 _cs = _fix.get('callsign')
                 if _cs:
                     try:
                         from blueprints.warehouse_reader import route_for_flight
-                        _lr = route_for_flight(callsign=_cs, lat=_fix.get('lat'),
+                        _lr = route_for_flight(callsign=_cs, reg=_fix.get('reg'),
+                                               lat=_fix.get('lat'),
                                                lon=_fix.get('lon'), track=_fix.get('track'),
                                                gs=_fix.get('speed_kt'), allow_paid=False)
                     except Exception:
                         _lr = None
-                    if _lr and _lr.get('source') == 'fr24_grpc' and _lr.get('src') and _lr.get('dst'):
+                    if (_lr and _lr.get('confidence') == 'confirmed'
+                            and _lr.get('src') and _lr.get('dst')):
                         status['today_dep_iata'] = _lr['src']
                         status['today_arr_iata'] = _lr['dst']
                         status['today_dep_city'] = _iata_city_name(_lr['src'])

@@ -136,6 +136,10 @@ def test_free_fix_no_paid_call(monkeypatch):
     assert fix['track'] == 64.0
     assert abs(fix['speed_kt'] - 250.0 / 0.514444) < 0.2
     assert fix['source'] == 'fr24'
+    # Höhe (row[7]=baro_alt METER → Fuß) + Reg des aktiven Legs im Fix — das
+    # Kinematik-Gate braucht alt_ft, der Live-Routen-Confirm die Reg.
+    assert fix['alt_ft'] == round(11000.0 / 0.3048)
+    assert fix['reg'] == 'D-AIXP'
     # ECHTER Beobachtungszeitpunkt (time_position der Row), nicht „jetzt".
     assert abs(fix['ts'] - (time.time() - 120)) < 5
 
@@ -348,6 +352,76 @@ def test_loader_sets_live_fields_under_next_flight_grant(monkeypatch):
     age = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds()
     assert 60 < age < 180
     BPD._budget_key_inc.assert_not_called()
+
+
+def test_kinematic_gate_alt_only_fix_survives(monkeypatch):
+    # P3-Fix: _live_fix_for_reg baute den Fix ohne Höhe → das FLIGHTSTATE-Gate
+    # las _fix['alt'] (nie gesetzt) und verwarf JEDEN Fix ohne Ground-Speed.
+    # Jetzt: speed_kt=None + alt 11000 m (~36k ft) → airborne, Fix wird serviert.
+    _loader_env(monkeypatch)
+    monkeypatch.setenv('FLIGHTSTATE_LIVE_FAMILY', '1')
+    monkeypatch.setattr(ADSB, '_fetch_fr24',
+                        lambda h, callsign=None: _os_row(age_s=90, vel_ms=None))
+    import blueprints.warehouse_reader as WR
+    monkeypatch.setattr(WR, 'route_for_flight', lambda **k: None)
+
+    st = FW._load_crew_status_for_family('tok-live-fix-alt', {'next_flight'})
+    assert st['live_lat'] == 47.31 and st['live_lon'] == 91.55
+    assert st['live_speed_kt'] is None
+
+
+def test_kinematic_gate_still_drops_grounded_fix(monkeypatch):
+    # Gegenprobe (kein Geister-Flieger): speed_kt=None + alt 30 m → nicht
+    # „verdient airborne" → Gate verwirft, Karte bleibt Interpolation.
+    _loader_env(monkeypatch)
+    monkeypatch.setenv('FLIGHTSTATE_LIVE_FAMILY', '1')
+    row = _os_row(age_s=90, vel_ms=None)
+    row[7] = 30.0
+    monkeypatch.setattr(ADSB, '_fetch_fr24', lambda h, callsign=None: row)
+
+    st = FW._load_crew_status_for_family('tok-live-fix-gnd', {'next_flight'})
+    assert st['live_lat'] is None and st['live_lon'] is None
+
+
+def test_live_confirmed_route_overrides_with_reg_free_only(monkeypatch):
+    # P2-13: der Live-Routen-Confirm bekam nur die IATA-Flugnummer (LH716) —
+    # route_for_flight matcht aber ATC-Funknamen (DLH716) → praktisch immer
+    # Miss; zudem verlangte das Gate exakt source=='fr24_grpc'. Jetzt: Reg des
+    # aktiven Legs wird durchgereicht und JEDE live-bestätigte Quelle
+    # (confidence='confirmed', z.B. aircraft_live) übernimmt — allow_paid
+    # bleibt HART False (Family = kostenlos).
+    _loader_env(monkeypatch)
+    monkeypatch.setattr(ADSB, '_fetch_fr24',
+                        lambda h, callsign=None: _os_row(age_s=90))
+    import blueprints.warehouse_reader as WR
+    seen = {}
+
+    def _route(**kw):
+        seen.update(kw)
+        return {'src': 'FRA', 'dst': 'NGO', 'source': 'aircraft_live',
+                'confidence': 'confirmed'}
+
+    monkeypatch.setattr(WR, 'route_for_flight', _route)
+    st = FW._load_crew_status_for_family('tok-live-fix-rt', {'next_flight'})
+    assert st['today_dep_iata'] == 'FRA' and st['today_arr_iata'] == 'NGO'
+    assert seen['callsign'] == 'LH716'
+    assert seen['reg'] == 'D-AIXP'          # Reg aus der Leg-Beobachtung
+    assert seen['allow_paid'] is False      # Family zahlt NIE
+    BPD._budget_key_inc.assert_not_called()
+
+
+def test_estimated_route_never_overrides(monkeypatch):
+    # 'estimated' (fr24_live-Tabelle) ist KEIN Live-Confirm → Roster-Route bleibt.
+    _loader_env(monkeypatch)
+    monkeypatch.setattr(ADSB, '_fetch_fr24',
+                        lambda h, callsign=None: _os_row(age_s=90))
+    import blueprints.warehouse_reader as WR
+    monkeypatch.setattr(WR, 'route_for_flight',
+                        lambda **k: {'src': 'FRA', 'dst': 'NGO',
+                                     'source': 'fr24',
+                                     'confidence': 'estimated'})
+    st = FW._load_crew_status_for_family('tok-live-fix-est', {'next_flight'})
+    assert st['today_arr_iata'] == 'HND'    # Roster-Leg unangetastet
 
 
 def test_loader_without_grant_never_fixes_nor_pings(monkeypatch):

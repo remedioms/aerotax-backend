@@ -139,14 +139,27 @@ def _num(x):
         return None
 
 
-def is_airborne_kinematic(pos: dict, near_origin: bool = False) -> bool:
-    """THE one true airborne test. Ignores the raw on_ground bit by design."""
+def is_airborne_kinematic(pos: dict, near_origin: bool = False,
+                          dep_elev_ft=None) -> bool:
+    """THE one true airborne test. Ignores the raw on_ground bit by design.
+
+    alt_ft ist MSL — an Hochland-Airports (MEX 7316 ft, NBO, ADD) besteht ein
+    GEPARKTER Flieger sonst das alt>1000-Gate. dep_elev_ft (Referenz-DB) gatet
+    die Höhe relativ zur Abflug-Elevation; ohne Elevation konservativ: die
+    alt-only-Schiene verlangt zusätzlich gs>=50, sofern gs ÜBERHAUPT gemeldet
+    ist (ein alt-only-Fix ohne gs bleibt airborne — kein Un-Fliegen echter
+    Cruise-Fixe, ein geparkter Flieger meldet gs≈0, nicht None)."""
     if not pos:
         return False
     alt = _num(pos.get("alt_ft"))
     gs = _num(pos.get("gs_kt"))
-    if alt is not None and alt > 1000:
-        return True
+    elev = _num(dep_elev_ft)
+    if alt is not None:
+        if elev is not None:
+            if alt > elev + 1000:
+                return True
+        elif alt > 1000 and (gs is None or gs >= 50):
+            return True
     if gs is not None and gs >= 80:
         # gs-only branch: a fast, alt-less fix sitting on the departure field is
         # a high-speed taxi / rejected take-off, NOT cruise. Suppress it.
@@ -380,11 +393,15 @@ def _pick_times_delay(observations, keys, now):
     return times, delay
 
 
-def _derive_on_time(delay):
+def _derive_on_time(delay, cancelled=False):
+    """Owner-Regel D15 (wie aerox_data_blueprint._derive_on_time): annulliert ⇒
+    nie pünktlich; unbekannt ⇒ None (unknown != on-time); delay < 15 = on_time."""
+    if cancelled:
+        return False
     if not delay.get("known"):
         return None
     m = delay.get("min")
-    return None if m is None else (m <= 5)
+    return None if m is None else (m < 15)
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +424,9 @@ def _event(observations, kind):
 
 def _phase_machine(observations, keys, raw_pos, near_origin, prior, now):
     """Returns dict(phase, conf, source, obs_ts, sticky_airborne)."""
-    airborne_kin = is_airborne_kinematic(raw_pos, near_origin=near_origin) if raw_pos else False
+    airborne_kin = is_airborne_kinematic(
+        raw_pos, near_origin=near_origin,
+        dep_elev_ft=keys.get("dep_elev_ft")) if raw_pos else False
 
     def R(phase, conf, source, ts):
         return {"phase": phase, "conf": conf, "source": source, "obs_ts": ts,
@@ -574,7 +593,8 @@ def resolve_flight_state(keys: dict, observations: list, *, now: Optional[float]
     live_status = None
     pos_fresh = raw_pos is not None and pos_ts is not None and \
         (now - pos_ts) <= MAX_AGE.get(pos_src, 600)
-    airborne_ok = raw_pos is not None and is_airborne_kinematic(raw_pos, near_origin)
+    airborne_ok = raw_pos is not None and is_airborne_kinematic(
+        raw_pos, near_origin, dep_elev_ft=keys.get("dep_elev_ft"))
 
     render_pos = raw_pos                       # the position we actually render
     if phase in RENDER_POS:
@@ -615,6 +635,12 @@ def resolve_flight_state(keys: dict, observations: list, *, now: Optional[float]
                 live_status = "lost"
         # a fix that fails the airborne gate is NEVER rendered (invariant #2)
 
+        if live is None and live_status is None:
+            # EHRLICHES lost (P3): Phase sagt „rendert Position", aber es gibt
+            # keinen (renderbaren) Kandidaten — 'lost' statt None, damit die
+            # Clients ihre Vorwärts-Simulation stoppen KÖNNEN (kein Geister-Dot).
+            live_status = "lost"
+
         if live:
             progress = _progress(keys.get("dep_ll"), keys.get("arr_ll"), render_pos)
 
@@ -622,12 +648,14 @@ def resolve_flight_state(keys: dict, observations: list, *, now: Optional[float]
     if phase in IN_AIR and live and live["conf"] == SIMULATED:
         if eta_iso and _iso_to_ts(eta_iso) and (now - _iso_to_ts(eta_iso)) > ETA_OVERRUN_S:
             phase, phase_conf, live, progress = UNKNOWN, OBSERVED, None, None
+            live_status = "lost"
         elif keys.get("sched_flight_min") and \
                 (now - (keys.get("sched_dep_ts") or now)) > (keys["sched_flight_min"] + 45) * 60 \
                 and pos_ts and (now - pos_ts) > SIM_MAX_AGE_S:
             phase, phase_conf, live, progress = UNKNOWN, OBSERVED, None, None
+            live_status = "lost"
 
-    on_time = _derive_on_time(delay)
+    on_time = _derive_on_time(delay, cancelled=(phase == CANCELLED))
 
     fs = {
         "ok": True,
@@ -699,6 +727,54 @@ def _mk_live(pos, source, conf, obs_ts, stale_since):
         "obs_ts": _ts_to_iso(obs_ts), "stale_since": _ts_to_iso(stale_since) if stale_since else None,
         "position_source": pos.get("position_source", 3),
     }
+
+
+# ---------------------------------------------------------------------------
+# 6b. PRIOR-MEMO — in-process (flight, date) → letztes Engine-Resultat
+# ---------------------------------------------------------------------------
+# Monotonie (LANDED regressiert nie auf stale Signale) und Sticky-Airborne
+# wirken nur MIT prior — die Flips reichen ihn hierüber durch. Best-effort
+# In-Process-Memo (wie die Endpoint-Memos): TTL + Größen-Kappung, nie werfend.
+
+_PRIOR_TTL_S = 30 * 60
+_PRIOR_MAX = 4096
+_PRIOR_STORE: dict = {}      # (FLIGHT, date) → (stored_unix, prior_dict)
+
+
+def _prior_key(flight, date):
+    return ((flight or "").replace(" ", "").upper(), date or "")
+
+
+def prior_state(flight, date, *, now: Optional[float] = None) -> Optional[dict]:
+    """Letztes gemerktes Engine-Resultat für (flight, date) als prior=-Dict für
+    resolve_flight_state, None wenn unbekannt/abgelaufen."""
+    now = now or time.time()
+    v = _PRIOR_STORE.get(_prior_key(flight, date))
+    if not v or (now - v[0]) > _PRIOR_TTL_S:
+        return None
+    return dict(v[1])
+
+
+def remember_state(fs: dict, *, now: Optional[float] = None) -> None:
+    """FlightState-Resultat fürs nächste Resolve merken (unter operating- UND
+    marketing-Flugnummer — Codeshare-Folds dürfen den prior nicht verlieren)."""
+    try:
+        now = now or time.time()
+        k = fs.get("keys") or {}
+        prior = {"phase": fs.get("phase"), "conf": fs.get("phase_conf"),
+                 "source": fs.get("phase_source"), "obs_ts": fs.get("obs_ts"),
+                 "sticky_airborne": bool(fs.get("sticky_airborne"))}
+        if len(_PRIOR_STORE) > _PRIOR_MAX:
+            cutoff = now - _PRIOR_TTL_S
+            for kk in [kk for kk, vv in _PRIOR_STORE.items() if vv[0] < cutoff]:
+                _PRIOR_STORE.pop(kk, None)
+            if len(_PRIOR_STORE) > _PRIOR_MAX:
+                _PRIOR_STORE.clear()          # harte Kappung, memo ist best-effort
+        for fl in {k.get("flight"), k.get("mkt_flight")}:
+            if fl:
+                _PRIOR_STORE[_prior_key(fl, k.get("date"))] = (now, prior)
+    except Exception:
+        pass                                  # Memo darf nie den Request brechen
 
 
 # ---------------------------------------------------------------------------
@@ -776,6 +852,9 @@ def project_friend_leg(fs):
     live = fs["live"]
     return {"flight": fs["keys"]["flight"], "dep_iata": fs["keys"]["dep_iata"],
             "arr_iata": fs["keys"]["arr_iata"], "status": fs["phase"],
+            # additiv (P1-4c): phase + live_status ('lost' ⇒ iOS KANN die
+            # Großkreis-Simulation stoppen statt einen Geist weiterzufliegen)
+            "phase": fs["phase"], "live_status": fs.get("live_status"),
             "phase_conf": fs["phase_conf"], "cancelled": fs["cancelled"],
             "dep_delay_min": d["dep_delay_min"], "arr_delay_min": d["arr_delay_min"],
             "delay_min": d["min"], "delay_side": d["side"], "delay_known": d["known"],

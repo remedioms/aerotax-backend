@@ -32,14 +32,19 @@ def _legacy_in_air(legacy: dict) -> bool:
     return any(k in st for k in ("airborne", "en route", "en-route", "im flug"))
 
 
-def shadow_record(endpoint: str, keys: dict, observations: list, legacy: dict) -> None:
+def shadow_record(endpoint: str, keys: dict, observations: list, legacy: dict,
+                  fs: dict = None) -> None:
     """Compute the engine state from the same observations the endpoint used and
-    log a structured disagreement vs the legacy output. Never raises."""
+    log a structured disagreement vs the legacy output. Never raises.
+
+    fs: bereits berechnetes Engine-Resultat (aktiver Flip) — wird wiederver-
+    wendet statt doppelt zu resolven (Shadow+Flip = EIN resolve)."""
     if not shadow_enabled():
         return
     try:
-        from blueprints.flight_state import resolve_flight_state
-        fs = resolve_flight_state(keys, observations)
+        if fs is None:
+            from blueprints.flight_state import resolve_flight_state
+            fs = resolve_flight_state(keys, observations)
 
         eng_in_air = fs["phase"] in _PHASE_TO_LEGACY_INAIR
         eng_live = fs["live"] is not None

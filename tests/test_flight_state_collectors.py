@@ -10,7 +10,7 @@ from blueprints.flight_state import (
 )
 from blueprints.flight_state_collectors import (
     classify_board_status, obs_from_board_merged, obs_from_aircraft_live,
-    obs_from_adsb, build_keys,
+    obs_from_adsb, obs_from_pos, build_keys, engine_source, _iso_or_epoch,
 )
 
 NOW = 1_783_584_000
@@ -34,6 +34,23 @@ def test_classify_sides_and_specials():
     assert classify_board_status("Annulliert", "dep") == (CANCELLED, True, False)
     assert classify_board_status("Estimated 12:40", "dep")[0] is None
     assert classify_board_status("", "dep")[0] is None
+
+
+def test_classify_tokenized_no_substring_false_positives():
+    """P2-Fix: Wort-Tokenisierung statt Substring-Match. 'departure delayed'
+    feuerte über das Teilwort 'dep' als TAXI_OUT, 'arrival expected' über
+    'arrival' als LANDED — beides sind KEINE Phasen-Signale."""
+    assert classify_board_status("Departure delayed", "dep") == (None, False, False)
+    assert classify_board_status("Arrival expected", "arr") == (None, False, False)
+    assert classify_board_status("Expected 13:05", "arr") == (None, False, False)
+    # Das exakte Board-Kürzel 'DEP' bleibt off-block (echtes Token)
+    assert classify_board_status("DEP 12:41", "dep") == (TAXI_OUT, True, False)
+    # Phrasen/Umlaute weiter erkannt
+    assert classify_board_status("Pushback", "dep") == (TAXI_OUT, True, False)
+    assert classify_board_status("off-block", "dep") == (TAXI_OUT, True, False)
+    assert classify_board_status("Gate closed", "dep") == (BOARDING, False, False)
+    assert classify_board_status("baggage delivery finished", "arr") == (LANDED, True, False)
+    assert classify_board_status("im Flug", "dep") == (AIRBORNE, True, True)
 
 
 def test_daibv_taxi_ghost_fixed_end_to_end():
@@ -112,3 +129,92 @@ def test_adsb_fix_wins_position():
     fs = resolve_flight_state(keys, obs, now=NOW)
     assert fs["phase"] == AIRBORNE
     assert fs["live"]["source"] == "adsb"
+
+
+# ── obs_ts-Laundering (P1-4b): unparsebare Zeitstempel VERWERFEN ────────────
+
+def test_unparseable_seen_ts_discards_position_candidate():
+    """Ein VORHANDENER aber unparsebarer seen_ts darf die Position nicht als
+    'jetzt' laundern — die Observation wird verworfen (kein Kandidat), die
+    Engine rendert dann ehrlich nichts statt eines frischen Geists."""
+    pos = {"lat": 61.7, "lon": 90.2, "track": 61, "gs": 476, "alt": 37000,
+           "on_ground": False, "source": "aircraft_live", "seen_ts": "kaputt!!"}
+    obs = obs_from_aircraft_live(pos, ("FRA", "HND"), "D-AIXA", "A359", now=NOW)
+    assert not [o for o in obs if o.kind == "position"]
+    assert obs_from_pos({**pos, "seen_ts": "not-a-ts"}, "aircraft_live", now=NOW) == []
+    assert obs_from_adsb({"lat": 47.9, "lon": 7.4, "gs": 431, "alt": 34000,
+                          "ts": "garbage"}, now=NOW) == []
+    # Engine-Ende-zu-Ende: kein Kandidat -> kein live
+    keys = build_keys("LH716", "2026-07-09", "FRA", "HND", dep_ll=FRA,
+                      arr_ll=(35.55, 139.78), sched_dep_ts=NOW - 3600)
+    fs = resolve_flight_state(keys, obs, now=NOW)
+    assert fs["live"] is None
+
+
+def test_missing_seen_ts_still_counts_as_fresh_fetch():
+    """KEIN ts geliefert (frisch geholter Live-Read) ist kein Parse-Fehler —
+    die Position bleibt Kandidat mit obs_ts=now."""
+    obs = obs_from_pos({"lat": 47.9, "lon": 7.4, "gs": 431, "alt": 34000}, "adsb", now=NOW)
+    assert len(obs) == 1 and obs[0].obs_ts == NOW
+
+
+def test_iso_or_epoch_variants():
+    import time as _t
+    base = _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime(NOW))
+    plus2 = _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime(NOW + 7200)) + "+02:00"
+    assert _iso_or_epoch(NOW) == float(NOW)
+    assert _iso_or_epoch(str(NOW)) == float(NOW)                # Epoch-String
+    assert _iso_or_epoch(NOW * 1000) == float(NOW)              # ms-Epoch
+    assert _iso_or_epoch(base + "Z") == float(NOW)
+    assert _iso_or_epoch(base.replace("T", " ")) == float(NOW)  # Space-Separator
+    assert _iso_or_epoch(plus2) == float(NOW)                   # Offset-ISO
+    assert _iso_or_epoch(base) == float(NOW)                    # naiv = UTC
+    assert _iso_or_epoch("nonsense") is None
+    assert _iso_or_epoch("") is None
+    assert _iso_or_epoch(None) is None
+
+
+def test_board_obs_stamped_with_record_updated_at():
+    """Trägt der Merged-Record einen echten Zeitstempel, stempeln die Board-
+    Observations DEN (nicht now)."""
+    import time as _t
+    upd = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(NOW - 300))
+    keys = build_keys("LHX", "2026-07-09", "FRA", "GVA", dep_ll=FRA, arr_ll=GVA)
+    obs = obs_from_board_merged(
+        {"status_arr": "Gelandet", "delay_known": True, "arr_delay_min": 2,
+         "updated_at": upd}, keys, now=NOW)
+    assert obs and all(o.obs_ts == float(NOW - 300) for o in obs)
+
+
+# ── Resolver-Provenienz → Engine-Source-Alphabet ────────────────────────────
+
+def test_engine_source_mapping():
+    assert engine_source("fr24") == "fr24_bulk"
+    assert engine_source("aircraft_positions") == "adsb"
+    assert engine_source("adsb.lol") == "adsb"
+    assert engine_source("adb") == "paid_adb"
+    assert engine_source("aircraft_live") == "aircraft_live"    # 1:1 durch
+    assert engine_source(None) == "adsb"                        # konservativ
+    obs = obs_from_pos({"lat": 47.9, "lon": 7.4, "gs": 431, "alt": 34000,
+                        "seen_ts": NOW - 30}, "fr24", now=NOW)
+    assert obs[0].source == "fr24_bulk"
+    # 'aircraft_positions' = echter ADS-B-Poller → position_source 0 (real)
+    obs2 = obs_from_pos({"lat": 47.9, "lon": 7.4, "gs": 431, "alt": 34000,
+                         "seen_ts": NOW - 30}, "aircraft_positions", now=NOW)
+    assert obs2[0].source == "adsb" and obs2[0].value["position_source"] == 0
+
+
+# ── build_keys: sched_dep_ts aus sched_dep_iso (P1-4d) ─────────────────────
+
+def test_build_keys_derives_sched_dep_ts():
+    import time as _t
+    dep_iso = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(NOW + 600))
+    k = build_keys("LH2557", "2026-07-09", "FRA", "GVA", sched_dep_iso=dep_iso)
+    assert k["sched_dep_ts"] == float(NOW + 600)
+    # T6 SCHEDULED lebt damit vor Abflug (statt UNKNOWN)
+    fs = resolve_flight_state(k, [], now=NOW)
+    assert fs["phase"] == "SCHEDULED"
+    # expliziter Wert gewinnt
+    k2 = build_keys("LH2557", "2026-07-09", "FRA", "GVA",
+                    sched_dep_iso=dep_iso, sched_dep_ts=123.0)
+    assert k2["sched_dep_ts"] == 123.0
