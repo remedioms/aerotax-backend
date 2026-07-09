@@ -27095,6 +27095,14 @@ def ax_route_history(frm, to):
         # echtem Urteil in den Nenner — 'unknown' ist Info, keine Pünktlichkeit).
         for e in flights:
             total += 1
+            # Flugdauer GRATIS aus Soll-Ab/-An ableiten — nur wenn die dep-Seite
+            # beobachtet ist (obs 'dep'/'both'): dann ist e['sched'] die echte
+            # Abflug-Zeit @frm und e['sched_arr'] die Ankunft @to. Bei reinen arr-
+            # Rows ist sched==sched_arr (beides Ankunft) → keine Dauer erfinden.
+            if e.get('sched_arr') and e.get('obs') in ('dep', 'both'):
+                dm = _sched_block_min(e.get('sched'), frm, e.get('sched_arr'), to)
+                if dm is not None:
+                    e['duration_min'] = dm
             if e.get('cancelled'):
                 cancelled_cnt += 1
             elif not e.get('delay_known') or e.get('gaveup'):
@@ -27547,6 +27555,35 @@ def _board_local_to_utc_iso(esti, iata):
                  .strftime('%Y-%m-%dT%H:%M:%SZ')
     except Exception:
         return None
+
+
+def _sched_block_min(dep_local, dep_iata, arr_local, arr_iata):
+    """Planmäßige Blockzeit (Flugdauer) in MINUTEN aus lokalen Soll-Ab-/Ankunfts-
+    zeiten. WICHTIG: dep und arr stehen jeweils in IHRER eigenen Stations-Ortszeit
+    (FRA-Abflug in Europe/Berlin, JFK-Ankunft in America/New_York) — eine simple
+    String-Subtraktion wäre bei zeitzonenübergreifenden Strecken grob falsch.
+    Darum beide Seiten erst via `_board_local_to_utc_iso` (dieselbe TZ-Kenntnis wie
+    die Board-Zeiten) nach UTC, dann Differenz.
+
+    Liefert einen int nur wenn plausibel (0 < min <= 20 h) — sonst None (fehlende/
+    unparsbare Eingabe, unbekannte Stations-TZ, negativ, oder unrealistisch lang).
+    NIE eine erfundene oder negative Dauer. Frei, kein Drittanbieter — reine
+    Ableitung aus bereits vorhandenen Soll-Zeiten. Overnight-Flüge korrekt, weil die
+    Board-Soll-Strings ihr Datum tragen."""
+    if not (dep_local and arr_local and dep_iata and arr_iata):
+        return None
+    du = _board_local_to_utc_iso(dep_local, dep_iata)
+    au = _board_local_to_utc_iso(arr_local, arr_iata)
+    if not (du and au):
+        return None
+    try:
+        from datetime import datetime
+        d = datetime.fromisoformat(du.replace('Z', '+00:00'))
+        a = datetime.fromisoformat(au.replace('Z', '+00:00'))
+        m = int(round((a - d).total_seconds() / 60.0))
+    except Exception:
+        return None
+    return m if 0 < m <= 20 * 60 else None
 
 
 _PROFILE_HB_MEMO = {}              # token → (expires_ts, 'FRA' | '')
@@ -29778,6 +29815,10 @@ def flight_status(token):
             'arr_iata': m.get('arr_iata') or '', 'arr_name': m.get('dest_name') or '',
             'sched_dep': m.get('sched_dep'), 'sched_arr': m.get('sched_arr'),
             'est_dep': m.get('esti_dep'), 'est_arr': m.get('esti_arr'),
+            # Planmäßige Flugdauer (Minuten) — GRATIS aus Soll-Ab/-An abgeleitet,
+            # sobald beide Seiten beobachtet sind (arr-Board am Ziel). TZ-korrekt.
+            'duration_min': _sched_block_min(m.get('sched_dep'), m.get('dep_iata'),
+                                             m.get('sched_arr'), m.get('arr_iata')),
             'dep_gate': m.get('gate_dep') or '', 'dep_terminal': m.get('terminal_dep') or '',
             'arr_gate': m.get('gate_arr') or '', 'arr_terminal': m.get('terminal_arr') or '',
             'arr_baggage': '',
