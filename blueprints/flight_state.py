@@ -633,10 +633,13 @@ def _ts_to_iso(ts):
 
 
 def _iso_to_ts(iso):
+    """UTC ISO ('...Z') -> UTC epoch via calendar.timegm (treats struct as UTC).
+    NOT time.mktime, which assumes local time and shifts by the local offset+DST."""
     if not iso:
         return None
+    import calendar
     try:
-        return time.mktime(time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        return float(calendar.timegm(time.strptime(str(iso)[:19], "%Y-%m-%dT%H:%M:%S")))
     except (ValueError, TypeError):
         return None
 

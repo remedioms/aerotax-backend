@@ -208,11 +208,15 @@ def build_keys(flight, date, dep_iata, arr_iata, *, roster_tail=None,
 
 
 def _iso_or_epoch(v):
+    """Parse a UTC ISO string ('...Z') or epoch to a UTC epoch. Uses calendar.timegm
+    (treats the parsed struct as UTC) — NOT time.mktime, which assumes local time and
+    would shift a UTC seen_ts by the local offset+DST, wrongly aging fresh fixes."""
     if v is None:
         return None
     if isinstance(v, (int, float)):
         return float(v)
+    import calendar
     try:
-        return time.mktime(time.strptime(str(v)[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+        return float(calendar.timegm(time.strptime(str(v)[:19], "%Y-%m-%dT%H:%M:%S")))
     except (ValueError, TypeError):
         return None

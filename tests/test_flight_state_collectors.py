@@ -87,6 +87,21 @@ def test_board_delay_only_when_known():
     assert fs2["delay"]["known"] is False and fs2["on_time"] is None
 
 
+def test_utc_seen_ts_not_wrongly_aged():
+    """Regression: a UTC seen_ts ('...Z') 60s old must be treated as FRESH, not
+    shifted by the local tz+DST and dropped as stale (the bug the 115-flight FR24
+    validation caught — it was un-flying real cruising planes)."""
+    import time as _t
+    seen_iso = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(NOW - 60))
+    keys = build_keys("LH9", "2026-07-09", "FRA", "GVA", dep_ll=FRA, arr_ll=GVA)
+    pos = {"lat": 47.9, "lon": 7.4, "track": 205, "gs": 431, "alt": 34000,
+           "on_ground": False, "source": "aircraft_live", "seen_ts": seen_iso}
+    obs = obs_from_aircraft_live(pos, ("FRA", "GVA"), "D-X", "A320", now=NOW)
+    fs = resolve_flight_state(keys, obs, now=NOW)
+    assert fs["phase"] == AIRBORNE       # fresh fix, not dropped
+    assert fs["live"] is not None
+
+
 def test_adsb_fix_wins_position():
     keys = build_keys("LH1", "2026-07-09", "FRA", "GVA", dep_ll=FRA, arr_ll=GVA,
                       sched_dep_ts=NOW - 1800)
