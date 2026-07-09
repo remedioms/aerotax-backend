@@ -118,6 +118,10 @@ class Settings:
     track_enabled: bool = os.getenv("TRACK_ENABLED", "1") not in ("0", "false", "no", "")
     track_table: str = os.getenv("TRACK_TABLE", "aircraft_track")
     track_min_nm: float = float(os.getenv("TRACK_MIN_NM", "1.0"))
+    # Zusätzliches Zeit-Gate: das 1-nm-Gate drosselt im Cruise (8 nm/min) nichts →
+    # Punkt nur wenn seit dem letzten geschriebenen Punkt AUCH >= track_min_sec
+    # vergangen sind (senkt die ~1 Mio Rows/Tag, Kurven bleiben bei ~2-min-Raster).
+    track_min_sec: float = float(os.getenv("TRACK_MIN_SEC", "120"))
     # Track ALLE Airlines (Owner 2026-07-09 „jeden Flug speichern") — nicht nur die
     # LH-Group-Prefixe. Der Kachel-Zyklus (~15 min/Airframe) hält das Volumen grob;
     # Retention deckelt bei 10 Tagen. aircraft_live (Snapshot) bleibt LH-Group-only.
@@ -248,8 +252,9 @@ class Ingest:
         # serviert (via bestehenden cloudflared-Tunnel), damit das Backend von hier
         # liest statt Supabase → spart Supabase-Disk-IO/Kosten. reg → (snap, mono_ts).
         self._latest: dict[str, tuple] = {}
-        # Letzter GESPEICHERTER Track-Punkt pro Reg (lat, lon) — Bewegungs-Gate,
-        # damit stehende/kaum-bewegte Airframes keine redundanten Punkte anhängen.
+        # Letzter GESPEICHERTER Track-Punkt pro Reg (lat, lon, mono_ts) — Zeit- und
+        # Bewegungs-Gate, damit stehende/kaum-bewegte Airframes keine redundanten
+        # Punkte anhängen. Wird erst NACH erfolgreichem Write aktualisiert.
         self._last_track: dict[str, tuple] = {}
         self._runner = None
 
@@ -286,7 +291,9 @@ class Ingest:
         if not (self._s.track_enabled and self._s.write_supabase):
             return 0
         now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        now_mono = time.monotonic()
         pts = []
+        pending: dict[str, tuple] = {}         # reg → (lat, lon, mono) NACH Write-Erfolg übernehmen
         for r in rows:
             if r.get("on_ground"):
                 continue                       # nur Flug, keine Boden-/Parkpunkte
@@ -294,8 +301,13 @@ class Ingest:
             if lat is None or lon is None or not reg:
                 continue
             prev = self._last_track.get(reg)
-            if prev is not None and _dist_nm(prev[0], prev[1], lat, lon) < self._s.track_min_nm:
-                continue                       # zu nah am letzten Punkt → drosseln
+            # Zeit-UND-Distanz-Gate: Punkt nur wenn >= track_min_sec vergangen UND
+            # >= track_min_nm bewegt — Distanz allein drosselte im Cruise (8 nm/min)
+            # nichts; das Zeit-Gate senkt die Schreiblast, Kurven bleiben erhalten.
+            if prev is not None and (
+                    (now_mono - prev[2]) < self._s.track_min_sec
+                    or _dist_nm(prev[0], prev[1], lat, lon) < self._s.track_min_nm):
+                continue                       # zu früh / zu nah am letzten Punkt → drosseln
             pts.append({
                 "reg": reg,
                 "seen_ts": r.get("seen_ts") or now_iso,
@@ -309,7 +321,7 @@ class Ingest:
                 "on_ground": False,
                 "source": "fr24_grpc",
             })
-            self._last_track[reg] = (lat, lon)
+            pending[reg] = (lat, lon, now_mono)
         if not pts:
             return 0
         try:
@@ -319,9 +331,13 @@ class Ingest:
                 headers={"Content-Type": "application/json",
                          "Prefer": "resolution=ignore-duplicates,return=minimal"})
             resp.raise_for_status()
+            # Gate erst NACH Write-Erfolg fortschreiben — bei Fehler bleibt der alte
+            # Stand, damit der nächste Poll den verlorenen Breadcrumb nachholen kann.
+            self._last_track.update(pending)
             return len(pts)
         except Exception as ex:
-            log.debug("track-append fehlgeschlagen: %s", ex)
+            log.warning("track-append fehlgeschlagen (%d Punkte verworfen, Gate unverändert): %s",
+                        len(pts), ex)
             return 0
 
     async def _prune(self) -> None:
@@ -339,24 +355,23 @@ class Ingest:
     def _match(self, reg, flight, cs, dep, max_age):
         now = time.monotonic()
         def fresh(t): return (now - t) <= max_age
-        m = None
+        # Route-Konsistenz PRO Tier (wie im Supabase-Pfad, aerox_data_blueprint):
+        # ein Reg-Hit mit falschem dest (Swap-Maschine, anderer Leg) wird verworfen
+        # und die flight-/callsign-Stufe darf noch matchen — nicht terminal abbrechen.
+        def route_ok(snap): return not (dep and snap.get("dest") and snap["dest"] != dep)
         if reg:
             it = self._latest.get(reg)
-            if it and fresh(it[1]):
-                m = it[0]
-        if m is None and flight:
+            if it and fresh(it[1]) and route_ok(it[0]):
+                return it[0]
+        if flight:
             for snap, t in self._latest.values():
-                if fresh(t) and (snap.get("flight") or "") == flight:
-                    m = snap; break
-        if m is None and cs:
+                if fresh(t) and (snap.get("flight") or "") == flight and route_ok(snap):
+                    return snap
+        if cs:
             for snap, t in self._latest.values():
-                if fresh(t) and (snap.get("callsign") or "") == cs:
-                    m = snap; break
-        if m is None:
-            return None
-        if dep and m.get("dest") and m["dest"] != dep:
-            return None                       # Route-Konsistenz (anderer Leg)
-        return m
+                if fresh(t) and (snap.get("callsign") or "") == cs and route_ok(snap):
+                    return snap
+        return None
 
     async def _http_pos(self, request):
         from aiohttp import web
