@@ -107,6 +107,28 @@ Tabelle `(flight, date)` → volles `UnifiedFlight`-JSON + `fetched_at` + `tier`
 - **Materialized vs read-through:** Start mit Read-Through (einfacher), Warmer (P2b)
   nur wenn Cache-Hit-Rate zu niedrig.
 
+## 5b. UMSETZUNG (autonom, 2026-07-09) — P0–P4 LIVE
+
+- **P0 ✓** `_obs_rows_to_facts` (reiner Mapper, 4 Tests) + `_flight_facts_from_obs`
+  (ein Flug, DEP+`#ARR` gemergt, wählt die inhaltsreichste Row). commit.
+- **P1 ✓** `resolve_unified_flight` + `GET /api/ax/uflight/<q>` — EIN Dict mit
+  Identität/Route/Soll+Ist-Zeiten/Status/Gate/Flugzeug + Herkunft. Route auch aus
+  den Obs ableitbar. Live: LH146 FRA→NUE + arr 18:19 + Gate A58; EDW200E ZRH→LPA.
+- **P2 ✓** 60s In-Process-Memo; der bezahlte Teil (FR24) wird von
+  `route_for_flight` persistent hart gecached → zero double-spend über Restarts.
+- **P3 ✓** FR24 on-demand: Funkname aus Flugnummer abgeleitet → Route-Kaskade
+  erreicht FR24 gratis-gRPC → paid nur bei Lücke, gecached („nur wenn gebraucht").
+- **P4 ✓** Detail-Pfad verdrahtet: `resolve-flight`/`-callsign` (→ iOS
+  `schedule.info`) reichern jetzt via `_enrich_flight_status_with_obs` an → der
+  **Detail-Screen zeigt Ankunft+Gate+Status OHNE iOS-Change** (Backend-Deploy wirkt
+  sofort). Radar (Enrich-ARR-Merge) + Dienstplan (landedText-Fallback) schon früher.
+- **P5 (iOS-Konsolidierung) ZURÜCKGESTELLT:** ein iOS-`UnifiedFlight`-Modell, das
+  ALLE Screens direkt auf `/api/ax/uflight` umstellt + die Alt-Resolver abschaltet,
+  ist ein tiefer Multi-Screen-Refactor mit Geräte-Verifikation. WERT ist aber
+  großteils schon geliefert: die Screens zeigen die Unified-Daten JETZT (Backend
+  reichert die bestehenden iOS-Felder an) — kein App-Update nötig. P5 = Aufräumen/
+  Vereinheitlichen, kein neuer User-Wert → bewusst mit Owner am Schirm später.
+
 ## 6. Was der Owner am Ende sieht
 
 Jeder Screen (Radar, Detail, Dienstplan, MyPlane, Suche) zeigt für denselben Flug
