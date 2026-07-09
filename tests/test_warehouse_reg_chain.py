@@ -404,3 +404,104 @@ def test_inbound_chain_no_sources_no_reg(monkeypatch):
     chain, forecast, my = BP._build_inbound_chain('LH716', '2026-07-05', 'FRA')
     assert chain['reg'] is None
     assert forecast['confidence'] == 'keine'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FR24-gRPC-Korridor — Routen-Gate (Reg-Match + route_to)
+# ══════════════════════════════════════════════════════════════════════════════
+def _patch_corridor_deps(monkeypatch, corr):
+    """Kette bis zum Korridor-Block: kein freies ADS-B, kein Snapshot, aber ein
+    Ankunfts-Board kennt den Zubringer (inbound_origin=HND) — der Korridor ist
+    der einzige Positions-Beschaffer. `corr` = gemockte FR24-Antwort."""
+    _patch_life_app(monkeypatch, _fake_sb([]))
+    monkeypatch.setattr(BP, '_machine_live',
+                        lambda reg, want_route=True, targeted=False: (None, None, None, None))
+    monkeypatch.setattr(BP, '_inbound_arr_row_by_reg',
+                        lambda dep, reg: {'flight': 'LH717', 'dest_iata': 'HND',
+                                          'sched': None, 'esti': None})
+    monkeypatch.setattr(BP, '_reg_hex_typecode_free', lambda reg: (None, None))
+    monkeypatch.setattr(BP, '_aircraft_live_pos',
+                        lambda **kw: (None, None, None, None))
+    monkeypatch.setattr(BP, '_iata_latlon',
+                        lambda code: {'FRA': (50.03, 8.57),
+                                      'HND': (35.55, 139.78)}.get(code))
+    import blueprints.fr24_grpc as G
+    monkeypatch.setattr(G, 'inbound_by_route', lambda *a, **k: corr)
+
+
+def _corr_hit(**kw):
+    base = {'reg': 'D-ABYO', 'lat': 55.0, 'lon': 60.0, 'track': 90,
+            'alt': 38000, 'speed': 480, 'flight_stage': 'AIRBORNE',
+            'eta': 1783000000, 'sched_arr': 1782998000, 'route_to': None}
+    base.update(kw)
+    return base
+
+
+def test_corridor_reg_match_without_route_keeps_position(monkeypatch):
+    """FR24 liefert manchmal KEINE Route mit (route_to=None) — der per Reg
+    VERIFIZIERTE Treffer darf dann nicht verworfen werden, sonst verliert der
+    Russland/Ozean-Zubringer still Position+ETA (Review-Regression 2026-07-09)."""
+    _patch_corridor_deps(monkeypatch, _corr_hit(route_to=None))
+    chain, forecast, my = BP._build_inbound_chain(
+        'LH716', '2026-07-05', 'FRA', reg_hint='D-ABYO')
+    assert chain['inbound_live'] is not None
+    assert chain['inbound_live']['source'] == 'fr24_grpc_corridor'
+    assert chain['inbound_est_arr'] is not None
+
+
+def test_corridor_route_mismatch_rejects_position(monkeypatch):
+    """Echter Routen-MISMATCH (Tail fliegt gerade einen anderen Leg im
+    Korridor) → verwerfen: kein Geister-Zubringer."""
+    _patch_corridor_deps(monkeypatch, _corr_hit(route_to='MUC'))
+    chain, forecast, my = BP._build_inbound_chain(
+        'LH716', '2026-07-05', 'FRA', reg_hint='D-ABYO')
+    assert chain['inbound_live'] is None
+    assert chain['inbound_est_arr'] is None
+
+
+def test_corridor_route_match_still_accepts(monkeypatch):
+    """route_to == mein Abflughafen → wie bisher übernehmen."""
+    _patch_corridor_deps(monkeypatch, _corr_hit(route_to='FRA'))
+    chain, forecast, my = BP._build_inbound_chain(
+        'LH716', '2026-07-05', 'FRA', reg_hint='D-ABYO')
+    assert chain['inbound_live'] is not None
+
+
+def test_flight_info_p5_fill_skips_stale_facts(client):
+    """P5-Merge-Fill: fällt _flight_facts_from_obs auf den VORTAG zurück
+    (facts['stale']=True), darf die gestrige Geister-Ankunft NICHT in
+    flight-info landen — auch wenn `out` selbst frisch ist."""
+    rows = [_obs_row('TIA', 'FRA', dest_name='Frankfurt')]
+    stale_ff = {'sched_arr': '2026-06-30T18:05:00+02:00',
+                'est_arr': '2026-06-30T18:20:00+02:00',
+                'arr_status': 'Gelandet', 'arr_delay_min': 15,
+                'stale': True, 'obs_date': '2026-06-30'}
+    with patch.object(A, 'sb', _fake_sb(rows)), \
+         patch.object(A, 'SB_AVAILABLE', True), \
+         patch.object(A, '_flight_from_live_board', return_value=None), \
+         patch.object(A, '_arrival_gate_terminal', return_value=(None, None)), \
+         patch.object(A, '_flight_obs_merged', return_value=None), \
+         patch.object(BP, '_flight_facts_from_obs', return_value=stale_ff):
+        r = _flight_info(client)
+    b = r.get_json()
+    assert b['found'] is True
+    assert not b.get('esti_arr')
+    assert not b.get('arr_status')
+
+
+def test_flight_info_p5_fill_uses_fresh_facts(client):
+    """Frische (nicht-stale) Obs-Fakten füllen die Ankunftsseite wie gedacht."""
+    rows = [_obs_row('TIA', 'FRA', dest_name='Frankfurt')]
+    fresh_ff = {'sched_arr': '2026-07-01T18:05:00+02:00',
+                'est_arr': '2026-07-01T18:20:00+02:00',
+                'arr_status': 'Gelandet', 'arr_delay_min': 15}
+    with patch.object(A, 'sb', _fake_sb(rows)), \
+         patch.object(A, 'SB_AVAILABLE', True), \
+         patch.object(A, '_flight_from_live_board', return_value=None), \
+         patch.object(A, '_arrival_gate_terminal', return_value=(None, None)), \
+         patch.object(A, '_flight_obs_merged', return_value=None), \
+         patch.object(BP, '_flight_facts_from_obs', return_value=fresh_ff):
+        r = _flight_info(client)
+    b = r.get_json()
+    assert b.get('esti_arr') == '2026-07-01T18:20:00+02:00'
+    assert b.get('arr_status') == 'Gelandet'

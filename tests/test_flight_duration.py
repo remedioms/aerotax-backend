@@ -273,8 +273,9 @@ def test_tail_history_no_arr_no_duration(client):
 
 
 def test_tail_history_fr24_fallback_when_warehouse_empty(client):
-    """Warehouse leer (D-AIXS nie getafelt) → FR24-by-registration Fallback,
-    Ergebnis mit source='fr24' UND permanent gespeichert (_crowdsource_flight_obs)."""
+    """Warehouse leer (D-AIXS nie getafelt) + own=1 (EIGENE Maschine) →
+    FR24-by-registration Fallback, Ergebnis mit source='fr24' UND permanent
+    gespeichert (_crowdsource_flight_obs)."""
     import blueprints.aerox_data_blueprint as BP
     fr_legs = [{
         'flight_no': 'LH416', 'src': 'FRA', 'dst': 'IAD', 'day': '2026-07-06',
@@ -287,13 +288,28 @@ def test_tail_history_fr24_fallback_when_warehouse_empty(client):
          patch.object(BP, '_fr24_budget_ok', return_value=True), \
          patch.object(BP, '_fr24_flights_by_reg', return_value=fr_legs), \
          patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
-        r = client.get('/api/ax/tail-history?reg=D-AIXS')
+        r = client.get('/api/ax/tail-history?reg=D-AIXS&own=1')
     assert r.status_code == 200
     body = r.get_json()
     assert body['source'] == 'fr24'
     assert body['legs'][0]['flight_no'] == 'LH416'
     assert body['legs'][0]['duration_min'] == 480
     assert mcs.called            # permanent ins Warehouse geschrieben
+
+
+def test_tail_history_anonymous_no_paid(client):
+    """OHNE own/watch bleibt der Endpoint Warehouse-only: kein Paid-per-Tap —
+    auch bei Warehouse-Miss wird FR24 NICHT angefasst (Kosten-Review 2026-07-09)."""
+    import blueprints.aerox_data_blueprint as BP
+    with patch.object(BP, '_sb', return_value=_fake_flights_sb([])), \
+         patch.object(BP, '_fr24_available', return_value=True), \
+         patch.object(BP, '_fr24_budget_ok', return_value=True), \
+         patch.object(BP, '_fr24_flights_by_reg') as mfr:
+        r = client.get('/api/ax/tail-history?reg=D-AIXS')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['source'] == 'warehouse' and body['legs'] == []
+    mfr.assert_not_called()
 
 
 def test_tail_history_no_fr24_when_warehouse_has_data(client):
@@ -478,12 +494,16 @@ def test_aircraft_live_flight_free_callsign():
 
 
 def test_resolve_flight_free_first_no_fr24_credit(client):
-    """resolve-flight nimmt ZUERST das gratis aircraft_live → KEIN FR24-Credit."""
+    """resolve-flight nimmt ZUERST das gratis aircraft_live → KEIN FR24-Credit.
+    (_flight_times_free_first isoliert gemockt: der Zeiten-Enrich hat einen
+    eigenen free→paid-Pfad samt echtem gRPC-Call — hier geht es NUR um die
+    Identitäts-/Routen-Auflösung, kein Netz im Unit-Test.)"""
     import blueprints.aerox_data_blueprint as BP
     live = {'flight': 'LH1412', 'callsign': 'DLH8UA', 'dep_iata': 'FRA',
             'arr_iata': 'BEG', 'reg': 'DAINY', 'aircraft': 'A20N',
             'source': 'aircraft_live'}
     with patch.object(BP, '_aircraft_live_flight', return_value=live), \
+         patch.object(BP, '_flight_times_free_first', return_value={}), \
          patch.object(BP, '_fr24_flight_by_number') as mfr:
         r = client.get('/api/ax/resolve-flight/LH1412')
     assert r.status_code == 200
@@ -502,6 +522,7 @@ def test_resolve_flight_returns_truth_with_real_callsign(client):
           'sched_dep': '2026-07-09T12:00:00Z', 'sched_arr': None,
           'duration_min': None, 'status': ''}
     with patch.object(BP, '_aircraft_live_flight', return_value=None), \
+         patch.object(BP, '_flight_times_free_first', return_value={}), \
          patch.object(BP, '_fr24_flight_by_number', return_value=fr), \
          patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
         r = client.get('/api/ax/resolve-flight/LH1412')
@@ -511,3 +532,62 @@ def test_resolve_flight_returns_truth_with_real_callsign(client):
     assert body['flight']['arr_iata'] == 'BEG'
     assert body['flight']['callsign'] == 'DLH8UA'
     assert mcs.called
+
+
+def test_resolve_flight_implausible_prefix_no_paid(client):
+    """Plausi-Gate (Kosten-Review 2026-07-09): Fantasie-Präfix ('9Z' ist keine
+    Airline in der Referenz) erreicht den Paid-Zweig NIE — jeder FR24-Miss
+    kostete sonst trotzdem Credits."""
+    import blueprints.aerox_data_blueprint as BP
+    with patch.object(BP, '_aircraft_live_flight', return_value=None), \
+         patch.object(BP, '_fr24_flight_by_number') as mfr:
+        r = client.get('/api/ax/resolve-flight/9Z999')
+    assert r.status_code == 200
+    assert r.get_json()['ok'] is False
+    mfr.assert_not_called()
+
+
+def test_resolve_flight_obs_facts_before_paid(client):
+    """P1-2: kennt die permanente Obs-Quelle die Route, wird der Request GRATIS
+    beantwortet — FR24 wird NICHT angefasst."""
+    import blueprints.aerox_data_blueprint as BP
+    facts = {'dep_iata': 'FRA', 'arr_iata': 'BCN',
+             'sched_dep': '2026-07-09T11:00:00', 'sched_arr': '2026-07-09T13:05:00',
+             'reg': 'DAINV', 'type': 'A21N', 'dep_status': 'Departed'}
+    with patch.object(BP, '_aircraft_live_flight', return_value=None), \
+         patch.object(BP, '_flight_facts_from_obs', return_value=facts), \
+         patch.object(BP, '_fr24_flight_by_number') as mfr:
+        r = client.get('/api/ax/resolve-flight/LH1128')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['ok'] and body['source'] == 'aerox_obs'
+    assert body['flight']['dep_iata'] == 'FRA'
+    assert body['flight']['arr_iata'] == 'BCN'
+    mfr.assert_not_called()
+
+
+def test_harvest_routes_noop_no_external_calls(client):
+    """adsbdb-Kappung: der Endpoint bleibt (alte Builds rufen ihn), macht aber
+    weder adsbdb- noch Cache-Zugriffe mehr — reiner ok-No-op."""
+    import blueprints.aerox_data_blueprint as BP
+    with patch.object(BP, '_adsbdb_route') as mad, \
+         patch.object(BP, '_cache_get') as mcg:
+        r = client.post('/api/ax/harvest-routes',
+                        json={'callsigns': ['DLH123', 'RYR55']})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['ok'] and body['harvested'] == 0
+    mad.assert_not_called()
+    mcg.assert_not_called()
+
+
+def test_track_prune_403_without_secret(client):
+    """Leeres ADSB_POLL_SECRET → 403 statt fail-open (Lösch-Endpoint)."""
+    import os as _os
+    _prev = _os.environ.pop('ADSB_POLL_SECRET', None)
+    try:
+        r = client.post('/api/internal/track-prune')
+    finally:
+        if _prev is not None:
+            _os.environ['ADSB_POLL_SECRET'] = _prev
+    assert r.status_code == 403

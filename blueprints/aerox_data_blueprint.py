@@ -298,15 +298,22 @@ def _route_from_warehouse(hexid=None, reg=None):
     return None
 
 
+_NAS_DOWN_UNTIL = [0.0]   # Epoch: bis dahin gilt der NAS-Tunnel als down (60s)
+
+
 def _nas_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_s=2100):
     """Positions-Snapshot DIREKT aus dem NAS-RAM-Store (via cloudflared-Tunnel,
     `NAS_LIVE_URL`). Owner 2026-07-08 „NAS only RAM": der Harvester hält die
     Positionen im NAS-RAM und serviert sie über einen winzigen HTTP-Endpoint —
     das Backend liest von hier statt aus Supabase → spart Supabase-Disk-IO/Kosten.
     Rückgabe: (pos,(src,dst),reg_display,ac_type) | None (nicht konfiguriert /
-    Miss / Fehler → Aufrufer nutzt Supabase-Fallback)."""
+    Miss / Fehler → Aufrufer nutzt Supabase-Fallback). Kurzer Timeout (1.5s) +
+    prozessweites 60s-„NAS down"-Negativ-Memo: der friends-Fan-out darf bei
+    totem Tunnel nicht pro Call den vollen Timeout zahlen."""
     base = os.environ.get('NAS_LIVE_URL', '').strip()
     if not base:
+        return None
+    if time.time() < _NAS_DOWN_UNTIL[0]:
         return None
     q = {'max_age': str(int(max_age_s))}
     if reg:
@@ -323,9 +330,10 @@ def _nas_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_s=2100
     if tok:
         req.add_header('Authorization', 'Bearer ' + tok)
     try:
-        with urllib.request.urlopen(req, timeout=4) as r:
+        with urllib.request.urlopen(req, timeout=1.5) as r:
             d = json.loads(r.read().decode())
     except Exception:
+        _NAS_DOWN_UNTIL[0] = time.time() + 60
         return None
     p = (d or {}).get('pos')
     if not d.get('found') or not p or p.get('lat') is None or p.get('lon') is None:
@@ -339,6 +347,25 @@ def _nas_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_s=2100
     reg_disp = (p.get('reg_display') or p.get('reg') or '').strip().upper() or None
     ac_type = (p.get('ac_type') or '').strip().upper() or None
     return pos, (src, dst), reg_disp, ac_type
+
+
+def _apply_taxi_gate(pos):
+    """TAXI-GATE (Owner 2026-07-09 „Tibor FRA→GVA an ~13:05", Flieger optisch bei
+    Mannheim): FR24 meldet beim Pushback/Rollen `on_ground=false`, obwohl die
+    Maschine praktisch STEHT (gs ~15 kt, keine Baro-Höhe). So ein Snapshot ist
+    KEINE Live-Flugposition — die App extrapoliert sonst aus dem Taxi-Seed einen
+    kriechenden Geister-Flieger samt Unsinns-Ankunft. Nur als airborne werten,
+    wenn plausibel in der Luft: nennenswerte Höhe ODER Reise-nahe gs (nichts
+    cruised unter ~80 kt; selbst Steigflug ist >150). Sonst → on_ground=True,
+    dann verwerfen alle Consumer die Position sauber (ehrlicher Fallback).
+    EINE gemeinsame Stelle für NAS- UND Supabase-Pfad."""
+    if not pos:
+        return pos
+    _gs, _alt = pos.get('gs'), pos.get('alt')
+    _airborne = ((isinstance(_alt, (int, float)) and _alt > 1000)
+                 or (isinstance(_gs, (int, float)) and _gs >= 80))
+    pos['on_ground'] = bool(pos.get('on_ground')) or not _airborne
+    return pos
 
 
 def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=35):
@@ -362,6 +389,9 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
     _nas = _nas_live_pos(reg=reg, flight=flight, callsign=callsign, dep=dep,
                          max_age_s=int(max_age_min * 60))
     if _nas is not None:
+        # Taxi-Gate auch für den NAS-Pfad (gemeinsame Stelle) — vorher rutschte
+        # ein Pushback-Snapshot als „airborne" durch, nur der SB-Pfad gatete.
+        _apply_taxi_gate(_nas[0])
         return _nas
     sb = _sb()
     if sb is None:
@@ -400,24 +430,12 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
     dst = (r.get('dest') or '').strip().upper() or None
     if dep_n and dst and dst != dep_n:
         return None, None, None, None            # anderer Leg → verwerfen
-    # TAXI-GATE (Owner 2026-07-09 „Tibor FRA→GVA an ~13:05", Flieger optisch bei
-    # Mannheim): FR24 meldet beim Pushback/Rollen `on_ground=false`, obwohl die
-    # Maschine praktisch STEHT (gs ~15 kt, keine Baro-Höhe). So ein Snapshot ist
-    # KEINE Live-Flugposition — die App extrapoliert sonst aus dem Taxi-Seed einen
-    # kriechenden Geister-Flieger samt Unsinns-Ankunft. Nur als airborne werten,
-    # wenn plausibel in der Luft: nennenswerte Höhe ODER Reise-nahe gs (nichts
-    # cruised unter ~80 kt; selbst Steigflug ist >150). Sonst → on_ground=True,
-    # dann verwerfen alle Consumer die Position sauber (ehrlicher Fallback).
-    _gs = r.get('gs_kt')
-    _alt = r.get('alt_ft')
-    _airborne = ((isinstance(_alt, (int, float)) and _alt > 1000)
-                 or (isinstance(_gs, (int, float)) and _gs >= 80))
-    pos = {
+    pos = _apply_taxi_gate({
         'lat': r.get('lat'), 'lon': r.get('lon'),
-        'track': r.get('track'), 'gs': _gs, 'alt': _alt,
-        'on_ground': bool(r.get('on_ground')) or not _airborne,
+        'track': r.get('track'), 'gs': r.get('gs_kt'), 'alt': r.get('alt_ft'),
+        'on_ground': bool(r.get('on_ground')),
         'source': 'aircraft_live', 'seen_ts': r.get('seen_ts'),
-    }
+    })
     reg_disp = (r.get('reg_display') or r.get('reg') or '').strip().upper() or None
     ac_type = (r.get('ac_type') or '').strip().upper() or None
     return pos, (src, dst), reg_disp, ac_type
@@ -2307,6 +2325,34 @@ def _iata_latlon(code):
     return out
 
 
+_IATA_ELEV_CACHE = {}
+
+
+def _iata_elev_ft(code):
+    """IATA → Airport-Elevation (ft MSL) aus der Referenz-DB, None wenn
+    unbekannt. Cached. Fürs FlightState-alt-Gate an Hochland-Airports
+    (MEX/NBO/ADD: alt>1000 MSL allein beweist dort kein Fliegen)."""
+    if code in _IATA_ELEV_CACHE:
+        return _IATA_ELEV_CACHE[code]
+    row = None
+    try:
+        row = _q1(
+            "SELECT elev_ft FROM airports WHERE iata=? "
+            "ORDER BY CASE type WHEN 'large_airport' THEN 0 "
+            "WHEN 'medium_airport' THEN 1 ELSE 2 END LIMIT 1",
+            (code,))
+    except Exception:
+        row = None
+    out = None
+    if row and row.get('elev_ft') is not None:
+        try:
+            out = int(row['elev_ft'])
+        except (TypeError, ValueError):
+            out = None
+    _IATA_ELEV_CACHE[code] = out
+    return out
+
+
 def _gc_km(lat1, lon1, lat2, lon2):
     """Great-Circle-Distanz (Haversine) in km."""
     rl1, rl2 = math.radians(lat1), math.radians(lat2)
@@ -2863,7 +2909,8 @@ def ax_radar_enrich():
                              'tail': f.get('tail'),
                              'source': 'warehouse_board',
                              'confidence': 'confirmed'}
-                    # Abflug-/Ankunftszeiten (station-lokal, Board-Fahrplan) mitgeben,
+                    # Abflug-/Ankunftszeiten mitgeben (UTC-ISO — die flights-
+                    # Warehouse-Zeiten sind UTC mit Z/Offset, NICHT station-lokal),
                     # damit der Tap SOFORT „ab HH:MM · an HH:MM" + Header-Zeit „HH:MM →
                     # HH:MM" + Delay zeigt — ohne einen Einzel-Call. iOS leitet das Delay
                     # aus est_arr − sched_arr ab. Nur echte Werte (nie erfunden).
@@ -2889,23 +2936,30 @@ def ax_radar_enrich():
                                        for _, d, _ in missing if d})
                     fns = sorted({(fn or '').upper() for fn, _, _ in missing if fn})
                     ao = (sb.table('airport_delay_obs')
-                          .select('airport,flight,sched,esti')
+                          .select('airport,flight,sched,esti,date')
                           .in_('date', [yday, today])
                           .in_('airport', arr_keys)
                           .in_('flight', fns)
                           .limit(300).execute())
-                    aidx = {((a.get('flight') or '').upper(),
-                             (a.get('airport') or '').upper()): a
-                            for a in (ao.data or [])}
+                    aidx = {}
+                    for a in (ao.data or []):
+                        k = ((a.get('flight') or '').upper(),
+                             (a.get('airport') or '').upper())
+                        # HEUTIGE Row gewinnt (nie eine gestrige über die heutige).
+                        if k not in aidx or (a.get('date') or '') > (aidx[k].get('date') or ''):
+                            aidx[k] = a
                     for fn, dst, hx in missing:
                         a = aidx.get(((fn or '').upper(),
                                       (dst or '').upper() + '#ARR'))
                         if not a:
                             continue
-                        if a.get('sched'):
-                            out[hx]['sched_arr'] = a['sched']
-                        if a.get('esti'):
-                            out[hx]['est_arr'] = a['esti']
+                        # Über den geteilten Mapper (P0): normalisiert die Board-
+                        # Zeiten auf ISO mit Station-Offset statt Roh-Durchreiche.
+                        _fa = _obs_rows_to_facts(None, a)
+                        if _fa.get('sched_arr'):
+                            out[hx]['sched_arr'] = _fa['sched_arr']
+                        if _fa.get('est_arr'):
+                            out[hx]['est_arr'] = _fa['est_arr']
             except Exception:
                 pass
         except Exception:
@@ -2923,17 +2977,85 @@ def ax_radar_enrich():
 #  der NUR feuert wenn dieser Gratis-Merge eine Lücke lässt UND der Flug gebraucht wird.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _obs_station_dt(v, iata, service_date):
+    """Board-Zeitwert (bare 'HH:MM' | naive Lokal-ISO | Offset-ISO) → (aware
+    datetime in Station-TZ von `iata`, hatte_eigenes_Datum). Bare Zeiten bekommen
+    das Servicedatum der Row. (None, False) bei unparsbar/unbekannter TZ — der
+    Aufrufer behält dann den Rohwert (nichts erfinden)."""
+    from datetime import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo
+        from airport_tz import airport_tz as _atz
+        tzn = _atz((iata or '').upper().strip())
+        tz = ZoneInfo(tzn) if tzn else None
+    except Exception:
+        tz = None
+    if tz is None or not v:
+        return None, False
+    s = str(v).strip()
+    m = re.match(r'^(\d{1,2}):(\d{2})$', s)
+    if m:
+        d = (service_date or '')[:10]
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
+            return None, False
+        try:
+            dt = _dt.fromisoformat('%sT%02d:%02d:00'
+                                   % (d, int(m.group(1)), int(m.group(2))))
+        except ValueError:
+            return None, False
+        return dt.replace(tzinfo=tz), False
+    try:
+        dt = _dt.fromisoformat(s.replace('Z', '+00:00'))
+    except ValueError:
+        try:      # '+0200' ohne Doppelpunkt (fromisoformat erst ab 3.11)
+            dt = _dt.strptime(s, '%Y-%m-%dT%H:%M:%S%z')
+        except ValueError:
+            return None, False
+    return (dt.replace(tzinfo=tz) if dt.tzinfo is None
+            else dt.astimezone(tz)), True
+
+
 def _obs_rows_to_facts(dep_row, arr_row):
     """Reiner Mapper (kein DB-Zugriff → trivial testbar): DEP-/ARR-Obs-Row →
     normalisiertes Fakten-Dict. Delay kommt direkt aus `max_delay_min` (kein
-    Rechnen über formatgemischte Zeiten). Leere/None-Werte werden weggelassen."""
+    Rechnen über formatgemischte Zeiten). Leere/None-Werte werden weggelassen.
+    ZEIT-NORMALISIERUNG (Ultraplan-P0): sched/esti kommen roh gemischt (bare
+    '16:50' station-lokal, naive Lokal-ISO, Offset-ISO) → hier zentral auf ISO
+    MIT Station-Offset ('…T16:50:00+02:00'; Wanduhr bleibt Station-lokal lesbar,
+    der Offset macht sie eindeutig). Station-TZ = Airport der jeweiligen Seite
+    (dep-Row → deren airport, arr-Row → Ziel), Datum = Servicedatum der Row,
+    Mitternachts-Wrap est<sched−4h → +1 Tag. Unnormalisierbares bleibt roh."""
     def _s(v):
         v = v.strip() if isinstance(v, str) else v
         return v or None
+
+    def _time_pair(row, iata):
+        # (sched, esti) der Row → normalisierte ISO-Strings (oder Rohwert).
+        from datetime import timedelta as _td
+        svc = (row.get('date') or '')[:10]
+        sv, ev = _s(row.get('sched')), _s(row.get('esti'))
+        out_s = out_e = None
+        s_dt = None
+        if sv is not None:
+            s_dt, _ = _obs_station_dt(sv, iata, svc)
+            out_s = s_dt.isoformat() if s_dt is not None else sv
+        if ev is not None:
+            e_dt, e_had_date = _obs_station_dt(ev, iata, svc)
+            if (e_dt is not None and s_dt is not None and not e_had_date
+                    and (s_dt - e_dt).total_seconds() > 4 * 3600):
+                e_dt += _td(days=1)          # Mitternachts-Wrap (est nach 00:00)
+            out_e = e_dt.isoformat() if e_dt is not None else ev
+        return out_s, out_e
+
     facts = {}
     if dep_row:
-        for out_k, in_k in (('sched_dep', 'sched'), ('est_dep', 'esti'),
-                            ('gate', 'gate'), ('terminal', 'terminal'),
+        _dep_ap = (_s(dep_row.get('airport')) or '').split('#', 1)[0] or None
+        sd, ed = _time_pair(dep_row, _dep_ap)
+        if sd is not None:
+            facts['sched_dep'] = sd
+        if ed is not None:
+            facts['est_dep'] = ed
+        for out_k, in_k in (('gate', 'gate'), ('terminal', 'terminal'),
                             ('dep_status', 'status'), ('reg', 'reg'),
                             ('type', 'type_code')):
             v = _s(dep_row.get(in_k))
@@ -2951,8 +3073,14 @@ def _obs_rows_to_facts(dep_row, arr_row):
         if _d:
             facts['arr_iata'] = _d
     if arr_row:
-        for out_k, in_k in (('sched_arr', 'sched'), ('est_arr', 'esti'),
-                            ('arr_gate', 'gate'), ('arr_terminal', 'terminal'),
+        # ARR-Row: airport='<Ziel>#ARR' → Station-TZ der Ankunftsseite = Ziel.
+        _arr_ap = (_s(arr_row.get('airport')) or '').split('#', 1)[0] or None
+        sa, ea = _time_pair(arr_row, _arr_ap)
+        if sa is not None:
+            facts['sched_arr'] = sa
+        if ea is not None:
+            facts['est_arr'] = ea
+        for out_k, in_k in (('arr_gate', 'gate'), ('arr_terminal', 'terminal'),
                             ('arr_status', 'status')):
             v = _s(arr_row.get(in_k))
             if v is not None:
@@ -3023,7 +3151,19 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
                 return r
         return pool[0]
 
-    return _obs_rows_to_facts(_best(dep_cands), _best(arr_cands))
+    best_dep, best_arr = _best(dep_cands), _best(arr_cands)
+    facts = _obs_rows_to_facts(best_dep, best_arr)
+    # Transparenz: stammen die gewählten Rows NICHT vom angefragten Datum
+    # (Overnight-Fallback auf yday), das ehrlich markieren — Consumer können
+    # gestrige Ist-Zeiten dann als potenziell veraltet behandeln.
+    if facts:
+        _dates = [(r.get('date') or '')[:10] for r in (best_dep, best_arr)
+                  if r is not None and (r.get('date') or '')[:10]]
+        _off = [x for x in _dates if x != d]
+        if _off and not any(x == d for x in _dates):
+            facts['stale'] = True
+            facts['obs_date'] = min(_off)
+    return facts
 
 
 _FREE_TIMES_MEMO = {}          # (flight,date) -> (times_dict_or_None, at)
@@ -3161,6 +3301,11 @@ def _enrich_flight_status_with_obs(flight, date=None):
     # FR24-Treffer kann eine andere Leg-Route liefern → würde die Obs-Row sonst
     # verfehlen. _flight_facts_from_obs nimmt eh die jüngste DEP/ARR-Row des Flugs.
     facts = _flight_facts_from_obs(fn, d) or {}
+    if facts.get('stale'):
+        # Vortags-Fallback der Obs-Quelle → gestrige Ist-Zeiten/Status wären
+        # Geister-Daten für den angefragten Tag. Lieber leer (free-first-Zeiten
+        # unten greifen dann) als falsch.
+        facts = {}
 
     def _fill(k, v):
         if v is not None and not flight.get(k):
@@ -3227,18 +3372,42 @@ def resolve_unified_flight(query, date=None, callsign_query=False,
     q = (query or '').replace(' ', '').upper().strip()
     if not q:
         return {'ok': False, 'error': 'no_query'}
-    date = ((date or '')[:10]) or time.strftime('%Y-%m-%d', time.gmtime())
+    # REG-Query (D-ABYN / N123AB): das ist KEINE Flugnummer — ehrlich found:false
+    # mit identity.reg statt Fantasie-flight_no (kein Geister-Flug aus einer Reg).
+    if not callsign_query and re.match(
+            r'^(?:[A-Z]{1,2}-[A-Z]{2,4}|N\d{1,5}[A-Z]{0,2})$', q):
+        return {'ok': True, 'found': False, 'query': q,
+                'date': ((date or '')[:10]) or None,
+                'identity': {'callsign': None, 'flight_no': None, 'reg': q}}
+    # Default-Datum STATION-LOKAL statt UTC (nachts nach 00 UTC zeigte gmtime
+    # schon „morgen" für EU-Flüge): Heimat-Default Europe/Berlin; kennt der Core
+    # den Origin, verfeinert er auf dessen TZ (date_auto).
+    date_auto = not ((date or '')[:10])
+    if date_auto:
+        try:
+            from zoneinfo import ZoneInfo
+            from datetime import datetime as _dtz
+            date = _dtz.now(ZoneInfo('Europe/Berlin')).strftime('%Y-%m-%d')
+        except Exception:
+            date = time.strftime('%Y-%m-%d', time.gmtime())
+    else:
+        date = (date or '')[:10]
     now = time.time()
     miss_key = (q, date, bool(callsign_query))
     if allow_paid:
         mt = _UFLIGHT_PAID_MISS.get(miss_key)
         if mt and (now - mt) < _UFLIGHT_PAID_MISS_TTL:
             allow_paid = False          # Negativ-Cache: paid war schon erfolglos
-    key = (q, date, bool(callsign_query), bool(allow_paid))
+    # lat/lon (auf 1° gerundet) gehören in den Key: der Geometrie-Hint fließt in
+    # die Route-Kaskade ein — ein Memo-Hit einer ANDEREN Position wäre falsch.
+    _latk = round(lat) if isinstance(lat, (int, float)) else None
+    _lonk = round(lon) if isinstance(lon, (int, float)) else None
+    key = (q, date, bool(callsign_query), bool(allow_paid), _latk, _lonk)
     hit = _UFLIGHT_MEMO.get(key)
     if hit is not None and (now - hit[1]) < _UFLIGHT_MEMO_TTL:
         return hit[0]
-    res = _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid)
+    res = _resolve_unified_flight_core(q, date, callsign_query, lat, lon,
+                                       allow_paid, date_auto=date_auto)
     if allow_paid and isinstance(res, dict) and not res.get('found'):
         _UFLIGHT_PAID_MISS[miss_key] = now
         if len(_UFLIGHT_PAID_MISS) > 500:
@@ -3251,11 +3420,14 @@ def resolve_unified_flight(query, date=None, callsign_query=False,
     return res
 
 
-def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid):
+def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
+                                 date_auto=False):
     """Der eigentliche Free-First-Zusammenbau (q/date bereits normalisiert):
     aircraft_live (Route/Reg/Typ/Funkname) → route_for_flight (Lücken, inkl. FR24
     gratis→paid, hart gecached) → _flight_facts_from_obs (Soll/Ist-Zeiten, Gate,
-    Delay, Status; trägt auch die Route aus den Obs). Nur echte Werte."""
+    Delay, Status; trägt auch die Route aus den Obs). Nur echte Werte.
+    date_auto=True: Datum war nicht angefragt → sobald der Origin bekannt ist,
+    auf dessen station-lokales Heute verfeinern."""
 
     # 1) aircraft_live: echter Funkname + Route + Reg + Typ (gratis, wenn aktiv)
     try:
@@ -3280,6 +3452,7 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid):
     #    JEDEN Treffer hart (auch den bezahlten) → „nur wenn man es braucht" + kein
     #    Doppel-Verbrauch. Funkname aus Flugnummer ableiten, damit die Kaskade
     #    (die einen Callsign braucht) auch bei reiner Flugnummer FR24 erreichen kann.
+    callsign_derived = False
     if not (origin and dest):
         if not callsign and flight_no:
             _i = 0
@@ -3288,12 +3461,17 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid):
             _pfx, _num = flight_no[:_i], flight_no[_i:]
             _al = _airline_row(_pfx) or {}
             if _al.get('icao') and _num:
+                # ABGELEITET (ICAO+Nummer) — kann falsch sein (LH1412=DLH8UA):
+                # als derived markieren und den PAID-Tier dafür sperren (kein
+                # Credit-Spend auf einen geratenen Funknamen).
                 callsign = _al['icao'] + _num
+                callsign_derived = True
         try:
             from blueprints.warehouse_reader import route_for_flight
             rt = route_for_flight(callsign=callsign or (q if callsign_query else None),
                                   reg=reg, lat=lat, lon=lon,
-                                  allow_paid=allow_paid, date=date) or {}
+                                  allow_paid=(allow_paid and not callsign_derived),
+                                  date=date) or {}
         except Exception:
             rt = {}
         if rt.get('src') and rt.get('dst'):
@@ -3301,6 +3479,20 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid):
             route_src = rt.get('source')
             route_conf = rt.get('confidence')
             reg = reg or rt.get('reg')
+
+    # Datum war nicht angefragt (date_auto): jetzt, wo der Origin bekannt sein
+    # kann, auf DESSEN station-lokales Heute verfeinern (Berlin war nur Heimat-
+    # Default) — sonst matcht ?date=heute nachts das falsche Servicedatum.
+    if date_auto and origin:
+        try:
+            from zoneinfo import ZoneInfo
+            from airport_tz import airport_tz as _atz
+            from datetime import datetime as _dtz
+            _tzn = _atz((origin or '').upper())
+            if _tzn:
+                date = _dtz.now(ZoneInfo(_tzn)).strftime('%Y-%m-%d')
+        except Exception:
+            pass
 
     # 3) Board-Fakten (Soll/Ist Ab+Ankunft, Gate, Delay, Status) — die eine Quelle
     facts = {}
@@ -3324,9 +3516,10 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid):
                 'city': r.get('city'), 'name': r.get('name'),
                 'lat': r.get('lat'), 'lon': r.get('lon')}
 
-    return {
+    out = {
         'ok': True, 'found': True, 'query': q, 'date': date,
-        'identity': {'callsign': callsign, 'flight_no': flight_no, 'reg': reg},
+        'identity': {'callsign': callsign, 'flight_no': flight_no, 'reg': reg,
+                     'callsign_derived': callsign_derived or None},
         'route': ({'origin': _ap(origin), 'destination': _ap(dest)}
                   if (origin and dest) else None),
         'times': {k: facts.get(k) for k in
@@ -3343,6 +3536,11 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid):
         'meta': {'route_source': route_src, 'route_confidence': route_conf,
                  'facts_source': 'airport_delay_obs' if facts else None},
     }
+    # Facts stammen vom Vortag (Overnight-Fallback) → transparent markieren.
+    if facts.get('stale'):
+        out['stale'] = True
+        out['obs_date'] = facts.get('obs_date')
+    return out
 
 
 @aerox_data_bp.route('/api/ax/uflight/<query>', methods=['GET'])
@@ -3500,19 +3698,24 @@ def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso):
     sb = _sb()
     if sb is None:
         return [], reg, dep, arr
-    try:
-        q = sb.table('aircraft_track').select(
-            'reg,lat,lon,alt_ft,gs_kt,track_deg,seen_ts,origin,dest,flight')
-        if reg:
-            q = q.eq('reg', reg)
-        elif flight_no:
-            q = q.eq('flight', flight_no)
-        else:
-            return [], reg, dep, arr
-        rows = (q.gte('seen_ts', lo_iso).lt('seen_ts', hi_iso)
-                 .order('seen_ts').limit(4000).execute()).data or []
-    except Exception:
+    if not reg and not flight_no:
         return [], reg, dep, arr
+
+    def _fetch(col, val):
+        try:
+            q = (sb.table('aircraft_track').select(
+                 'reg,lat,lon,alt_ft,gs_kt,track_deg,seen_ts,origin,dest,flight')
+                 .eq(col, val))
+            return (q.gte('seen_ts', lo_iso).lt('seen_ts', hi_iso)
+                     .order('seen_ts').limit(4000).execute()).data or []
+        except Exception:
+            return []
+
+    rows = _fetch('reg', reg) if reg else []
+    if not rows and flight_no:
+        # Reg-Query leer (Tail-Auflösung war falsch/Track flight-gekeyt) →
+        # Fallback auf den Flight-Match statt sofort Großkreis.
+        rows = _fetch('flight', flight_no)
     if not rows:
         return [], reg, dep, arr
     # Leg isolieren: explizit dep/arr, sonst das jüngste beobachtete Leg.
@@ -3525,6 +3728,22 @@ def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso):
         lo_, ld_ = last.get('origin'), last.get('dest')
         rows = [r for r in rows if r.get('origin') == lo_ and r.get('dest') == ld_]
         dep, arr = lo_, ld_
+    # LEG-ISOLIERUNG II: dieselbe Strecke kann im Fenster mehrfach geflogen sein
+    # (Kurzstrecken-Rotation) — origin/dest-Filter allein mischt dann zwei Spuren.
+    # An Zeitlücken >45 min splitten und das jüngste (zur Anfrage passende)
+    # Segment nehmen.
+    if rows:
+        segs, cur, prev = [], [], None
+        for r in rows:
+            ts = _iso_to_epoch(r.get('seen_ts'))
+            if cur and prev is not None and ts is not None and ts - prev > 45 * 60:
+                segs.append(cur)
+                cur = []
+            cur.append(r)
+            if ts is not None:
+                prev = ts
+        segs.append(cur)
+        rows = segs[-1]
     reg_used = (rows[0].get('reg') if rows else None) or reg
     pts = [{'lat': r['lat'], 'lon': r['lon'], 'alt': r.get('alt_ft'),
             'gs': r.get('gs_kt'), 'trk': r.get('track_deg'),
@@ -3589,18 +3808,22 @@ def ax_flown_track():
     if cached is not None:
         return jsonify(cached)
 
-    # Reg auflösen, wenn nur Flugnummer da: aircraft_track.flight ist der CALLSIGN
-    # (DLH174), die Suche/Roster gibt aber IATA (LH174) → ohne Reg verfehlt der
-    # Flight-Match von Tier 1 und alles fiele auf Großkreis. Der Warehouse (flights,
-    # op_flight_no+Tag → tail) liefert die echte Maschine → Track dann reg-gekeyt.
+    # Reg auflösen, wenn nur Flugnummer da: aircraft_track.flight ist in den
+    # Prod-Daten die IATA-Nummer (LH174) — der Reg-Key ist trotzdem verlässlicher
+    # (Breadcrumbs sind reg-gekeyt, flight kann fehlen). Der Warehouse (flights,
+    # op_flight_no+Tag → tail) liefert die echte Maschine. Ohne ?date IMMER das
+    # heutige Servicedatum erzwingen — sonst gewinnt irgendein alter Tag und der
+    # Track zeigt die Spur einer fremden Rotation.
     if not reg and flight_no:
         try:
             sb = _sb()
             if sb is not None:
-                q = sb.table('flights').select('tail').eq('op_flight_no', flight_no)
-                if date:
-                    q = q.eq('service_date', date)
-                fr = (q.order('service_date', desc=True).limit(3).execute()).data or []
+                fr = (sb.table('flights').select('tail')
+                      .eq('op_flight_no', flight_no)
+                      .eq('service_date',
+                          date or time.strftime('%Y-%m-%d', time.gmtime()))
+                      .order('service_date', desc=True).limit(3).execute()
+                      ).data or []
                 tail = next((r.get('tail') for r in fr if r.get('tail')), None)
                 if tail:
                     reg = re.sub(r'[^A-Z0-9]', '', tail.upper())
@@ -3707,6 +3930,13 @@ def ax_flown_track():
             bb = _iata_latlon(arr) if arr else None
             if bb:
                 in_flight = _haversine_km(bb[0], bb[1], points[-1]['lat'], points[-1]['lon']) > 150.0
+            # Nur „in der Luft", wenn der letzte echte Fix frisch ist (<30 min) —
+            # eine Stunden-alte Spur weit vom Ziel ist ein abgerissener Track,
+            # kein fliegender Flieger (kein Geister-Marker).
+            if in_flight:
+                _lts = next((p.get('ts') for p in reversed(points) if p.get('ts')),
+                            None)
+                in_flight = bool(_lts) and (time.time() - _lts) < 30 * 60
 
     out = {'ok': True, 'reg': reg or None, 'flight': flight_no, 'date': date,
            'dep': dep, 'arr': arr, 'source': source, 'in_flight': in_flight,
@@ -3880,11 +4110,13 @@ def ax_resolve_callsign(callsign):
     „4Y601" ≠ Callsign „OCN601"). Löst zugleich „Suche DLH7AV → keine Treffer".
     Ergebnis wird permanent ins Warehouse gespiegelt. Hart gecacht (Zero-Double-
     Spend). {ok, callsign, flight, source}."""
+    from flask import request
     if _ax_rate_limited('resolve_callsign', limit=30, window_sec=60):
         return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     cs = (callsign or '').strip().upper()
     if len(cs) < 3:
         return jsonify({'ok': False, 'error': 'bad_callsign'}), 400
+    date_q = (request.args.get('date') or '').strip()[:10] or None
     # FREE-FIRST: aktiver Flug gratis im aircraft_live (by callsign) → kein FR24.
     # BEWUSST kein Obs-Vorab-Check per abgeleiteter IATA-Nummer: die naive
     # Präfix+Suffix-Ableitung (OCN601→„4Y601") ist genau die Verwechslung, die
@@ -3904,7 +4136,8 @@ def ax_resolve_callsign(callsign):
                     cs_fn(flight, None, source='fr24')
                 except Exception:
                     pass
-        flight = _enrich_flight_status_with_obs(flight)   # P4: Soll/Ist-Zeiten+Gate
+        # P4: Soll/Ist-Zeiten+Gate — ?date= (z.B. vom Detail-Aggregat) durchreichen
+        flight = _enrich_flight_status_with_obs(flight, date=date_q)
         return jsonify({'ok': True, 'callsign': cs, 'flight': flight,
                         'source': src})
     return jsonify({'ok': False, 'callsign': cs, 'error': 'not_found'}), 200
@@ -3918,11 +4151,13 @@ def ax_resolve_flight(flightno):
     FRA→BEG und keine Live-Position). iOS nimmt Route/Reg als Top-Wahrheit und den
     echten Callsign für die adsb.lol-Live-Position. Permanent gespiegelt, gecacht.
     {ok, number, flight, source}."""
+    from flask import request
     if _ax_rate_limited('resolve_flight', limit=30, window_sec=60):
         return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     fn = (flightno or '').strip().upper().replace(' ', '')
     if len(fn) < 3:
         return jsonify({'ok': False, 'error': 'bad_flight'}), 400
+    date_q = (request.args.get('date') or '').strip()[:10] or None
     # FREE-FIRST: aktiver Flug steht mit echtem Funknamen gratis im aircraft_live
     # (gRPC-Scraper) → kein FR24-Credit. FR24 nur wenn nicht aktiv/geharvestet.
     flight = _aircraft_live_flight(flight=fn)
@@ -3931,7 +4166,7 @@ def ax_resolve_flight(flightno):
         # FREE zuerst (Owner „free FR24 mit Backup paid"): kennt der Board-Scrape die
         # Route (Obs), bauen wir ein Minimal-Dict → der Enrich holt die Zeiten gratis
         # via FR24-gRPC. Paid erst, wenn nicht mal die Route frei bekannt ist.
-        _ff = _flight_facts_from_obs(fn, None)
+        _ff = _flight_facts_from_obs(fn, date_q)
         if _ff.get('dep_iata') and _ff.get('arr_iata'):
             flight = {'ok': True, 'found': True, 'flight': fn,
                       'dep_iata': _ff['dep_iata'], 'arr_iata': _ff['arr_iata'],
@@ -3952,7 +4187,8 @@ def ax_resolve_flight(flightno):
                     cs_fn(flight, None, source='fr24')
                 except Exception:
                     pass
-        flight = _enrich_flight_status_with_obs(flight)   # P4: Soll/Ist-Zeiten+Gate
+        # P4: Soll/Ist-Zeiten+Gate — ?date= (z.B. vom Detail-Aggregat) durchreichen
+        flight = _enrich_flight_status_with_obs(flight, date=date_q)
         return jsonify({'ok': True, 'number': fn, 'flight': flight, 'source': src})
     return jsonify({'ok': False, 'number': fn, 'error': 'not_found'}), 200
 
@@ -4030,10 +4266,14 @@ def ax_flight_detail(query):
 
     # Die Quellen als abgeschlossene Callables (jede isoliert via _detail_subcall).
     def _resolve_call():
+        # ?date= mitgeben: der resolve-Enrich (_flight_facts_from_obs) matcht
+        # sonst immer nur „heute", auch wenn das Aggregat einen Tag anfragt.
         if is_cs:
-            return _detail_subcall(_app, '/api/ax/resolve-callsign/%s' % urllib.parse.quote(q),
+            return _detail_subcall(_app, '/api/ax/resolve-callsign/%s%s'
+                                   % (urllib.parse.quote(q), _qs(date=date_q)),
                                    ax_resolve_callsign, q)
-        return _detail_subcall(_app, '/api/ax/resolve-flight/%s' % urllib.parse.quote(q),
+        return _detail_subcall(_app, '/api/ax/resolve-flight/%s%s'
+                               % (urllib.parse.quote(q), _qs(date=date_q)),
                                ax_resolve_flight, q)
 
     def _info_call(fn):
@@ -4066,12 +4306,26 @@ def ax_flight_detail(query):
     # wäre das Aggregat langsamer als die 6 parallelen Handy-Calls von vorher. Flask-
     # Kontexte sind thread-local; jeder _detail_subcall pusht seinen eigenen.
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=4) as ex:
+
+    def _res(f, timeout=10):
+        # Timeout pro Subcall (hängender Provider darf das Bündel nicht halten);
+        # Fehler wie bisher pro Subcall isolieren → None.
+        if f is None:
+            return None
+        try:
+            return f.result(timeout=timeout)
+        except Exception:
+            return None
+
+    # Kein `with` (= shutdown(wait=True) würde auf den hängenden Worker warten
+    # und den result-Timeout entwerten) — Worker laufen ggf. im Hintergrund aus.
+    ex = ThreadPoolExecutor(max_workers=4)
+    try:
         # Phase A: resolve + (flight-info schon jetzt, wenn die IATA-Nummer feststeht —
         # bei Flugnummer-Suche = die Query selbst; bei Funkname-Suche erst nach resolve).
         f_resolve = ex.submit(_resolve_call)
         f_info = ex.submit(_info_call, q) if not is_cs else None
-        resolve = f_resolve.result()
+        resolve = _res(f_resolve)
         resolve_flight = (resolve or {}).get('flight') if (resolve or {}).get('ok') else None
 
         fn_iata = ((resolve_flight or {}).get('flight') or '').upper().replace(' ', '') or None
@@ -4087,7 +4341,7 @@ def ax_flight_detail(query):
         # auf flight-route.
         if f_info is None and fn_iata:
             f_info = ex.submit(_info_call, fn_iata)
-        info = f_info.result() if f_info else None
+        info = _res(f_info)
 
         origin = _pick((resolve_flight or {}).get('dep_iata'), (info or {}).get('origin'))
         dest = _pick((resolve_flight or {}).get('arr_iata'), (info or {}).get('dest'))
@@ -4119,9 +4373,11 @@ def ax_flight_detail(query):
         f_hist = ex.submit(_history_call, origin, dest) if (origin and dest) else None
         f_photo = ex.submit(_photo_call, reg) if reg else None
         if f_route is not None:
-            route = f_route.result()
-        history = f_hist.result() if f_hist else None
-        photo = f_photo.result() if f_photo else None
+            route = _res(f_route)
+        history = _res(f_hist)
+        photo = _res(f_photo)
+    finally:
+        ex.shutdown(wait=False)
 
     out['resolve'] = resolve_flight
     out['callsign'] = real_cs
@@ -4131,7 +4387,11 @@ def ax_flight_detail(query):
     out['history'] = history
     out['photo'] = photo
 
-    return jsonify(_memo_put(memo_key, out))
+    # LEERES Ergebnis (weder resolve noch info) NICHT 45s memoisieren — sonst
+    # klebt ein transienter Ausfall/Timeout als Negativ-Antwort im Cache.
+    if resolve_flight or info:
+        _memo_put(memo_key, out)
+    return jsonify(out)
 
 
 @aerox_data_bp.route('/api/ax/harvest-routes', methods=['POST'])
@@ -4806,6 +5066,7 @@ def _machine_live(reg, want_route=True, targeted=False):
         except Exception:
             pass
     row = None
+    _src = _obs_ts = None
     try:
         from blueprints.warehouse_reader import position_for_flight
         # targeted=False → NUR Tabellen (Tier 1+2); targeted=True (eigene
@@ -4814,7 +5075,15 @@ def _machine_live(reg, want_route=True, targeted=False):
             hex=hexid, reg=reg, targeted=targeted, allow_paid=False)
     except Exception:
         row = None
+        _src = _obs_ts = None
     pos = _live_pos_from_state(row)
+    if pos is not None:
+        # ECHTEN Beobachtungs-Zeitstempel + Provenienz durchreichen (P1-4b):
+        # position_for_flight liefert beide, sie gingen hier bisher verloren —
+        # die FlightState-Collectors stempelten dann fälschlich „jetzt".
+        # Additiv (Konsumenten lesen nur lat/lon/alt/gs/track/on_ground).
+        pos['seen_ts'] = _obs_ts
+        pos['source'] = _src
     cs = None
     if row and len(row) > 1 and row[1]:
         cs = str(row[1]).strip().upper() or None
@@ -5214,8 +5483,10 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
                 reg = _snap_reg
                 chain['reg'] = _snap_reg
                 if _snap_type:
-                    ac_type = ac_type or _snap_type
-                    chain['aircraft_type'] = chain.get('aircraft_type') or _snap_type
+                    # Tail-Swap: der alte ac_type gehört zur ALTEN Maschine —
+                    # der Snapshot-Typ des echten Tails gewinnt.
+                    ac_type = _snap_type
+                    chain['aircraft_type'] = _snap_type
             # SCHNELLE ETA aus dem Snapshot (gs + Großkreis-Reststrecke zum Ziel) —
             # Owner 2026-07-08 „mach das so": ersetzt den teuren Korridor-ETA-Call
             # über ungepollten Außenstationen. NUR wenn keine echte Board-ETA da ist
@@ -5228,9 +5499,21 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
                         and _snap_pos.get('lat') is not None and _snap_pos.get('lon') is not None):
                     _rem_km = _gc_km(_snap_pos['lat'], _snap_pos['lon'], _dl[0], _dl[1])
                     _gs = _snap_pos['gs']
-                    if _rem_km and _gs and _gs > 80:
+                    # Anker = seen_ts des Snapshots (nicht „jetzt": die Position ist
+                    # bis 35 min alt, ab dort wurde die Reststrecke geflogen). Ohne
+                    # seen_ts oder älter → NICHT schätzen (ehrlich offen lassen).
+                    _seen = _snap_pos.get('seen_ts')
+                    _seen_ep = None
+                    if _seen is not None:
+                        try:
+                            _seen_ep = float(_seen)
+                        except (TypeError, ValueError):
+                            _seen_ep = _iso_to_epoch(_seen)
+                    if (_rem_km and _gs and _gs > 80 and _seen_ep
+                            and (time.time() - _seen_ep) <= 35 * 60):
                         from datetime import datetime as _de, timedelta as _tde, timezone as _tze
-                        _eta = _de.now(_tze.utc) + _tde(hours=(_rem_km / 1.852) / _gs)
+                        _eta = (_de.fromtimestamp(_seen_ep, tz=_tze.utc)
+                                + _tde(hours=(_rem_km / 1.852) / _gs))
                         chain['inbound_est_arr'] = _eta.isoformat()
                         chain['inbound_est_estimated'] = True   # transparent: Richtzeit
 
@@ -5261,7 +5544,14 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
                 corr = None
             _creg = re.sub(r'[^A-Z0-9]', '', ((corr or {}).get('reg') or '').upper())
             _treg = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
-            if corr and _creg and _creg == _treg:
+            # Zusätzlich zum Reg-Match: die FR24-Route des Treffers muss WIRKLICH
+            # an meinem Abflughafen enden (route_to==dep) — sonst fliegt der Tail
+            # gerade einen anderen Leg im Korridor (kein Geister-Zubringer).
+            # Fehlt die Route bei FR24 komplett (_cto is None), ist das KEIN
+            # Mismatch: der Reg-Match bleibt gültig — sonst verlöre der Owner-
+            # kritische Russland/Ozean-Zubringer still Position+ETA.
+            _cto = _norm_iata((corr or {}).get('route_to'))
+            if corr and _creg and _creg == _treg and (_cto is None or _cto == dep):
                 def _epoch_iso2(v):
                     try:
                         v = int(v)
@@ -5289,8 +5579,6 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
                         'gs': corr.get('speed'), 'on_ground': False,
                         'source': 'fr24_grpc_corridor',
                     }
-                if not ac_type and corr.get('route_from'):
-                    pass  # Typ kommt nicht aus dem Korridor-Feed; nichts erfinden.
 
     if chain['inbound_delay_min'] is None and chain['inbound_sched_arr'] and chain['inbound_est_arr']:
         # Delay nur aus GLEICHARTIGEN Zeitstempeln (beide naiv-lokal ODER beide
@@ -5306,10 +5594,36 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
                 chain['inbound_delay_min'] = int(round((_ea - _sa).total_seconds() / 60.0))
 
     # ── #2 Abflug-Delay-Prognose ──────────────────────────────────────────────
-    sd = _parse_local_iso(sched_dep)
-    eta = _parse_local_iso(chain['inbound_est_arr']) if chain['inbound_est_arr'] else None
+    # Beide Zeiten in STATIONSZEIT an `dep` vergleichen: sched_dep ist Board-
+    # Wanduhr (naiv-lokal), die ETA kann aber aus FR24/Snapshot als UTC-Offset-ISO
+    # kommen — _parse_local_iso strippt tzinfo, der Mix wäre um den TZ-Offset
+    # falsch. Wandeln (statt Guard) hält die Prognose gerade im FR24-Fall am Leben.
+    def _dep_local(s):
+        if not s:
+            return None
+        from datetime import datetime as _dtx
+        try:
+            dt = _dtx.fromisoformat(str(s).replace('Z', '+00:00'))
+        except (TypeError, ValueError):
+            dt = _parse_local_iso(s)
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt                     # schon Station-Wanduhr (Board)
+        try:
+            from airport_tz import airport_tz as _atz
+            from zoneinfo import ZoneInfo
+            _tzn = _atz((dep or '').upper())
+            if _tzn:
+                return dt.astimezone(ZoneInfo(_tzn)).replace(tzinfo=None)
+        except Exception:
+            pass
+        return None   # Offset-Zeit ohne bekannte Station-TZ → keine Prognose
+
+    sd = _dep_local(sched_dep)
+    eta = _dep_local(chain['inbound_est_arr']) if chain['inbound_est_arr'] else None
     if eta is None and chain['inbound_sched_arr'] and chain['inbound_delay_min'] is not None:
-        base = _parse_local_iso(chain['inbound_sched_arr'])
+        base = _dep_local(chain['inbound_sched_arr'])
         if base is not None:
             eta = base + timedelta(minutes=int(chain['inbound_delay_min']))
     city = (chain['inbound_origin'] or {}).get('city') or inbound_origin
@@ -5428,8 +5742,11 @@ def ax_flight_live(token):
     # Position aus dem NAS-Harvester-Store (aircraft_live, FR24-gRPC) — sie liegt
     # real auf der Südroute und kommt schnell (kein on-demand-gRPC-Call).
     if pos is None or pos.get('on_ground'):
+        # Ohne bekanntes Ziel (dest=None) ist der reg-Match NICHT route-konsistent
+        # prüfbar → der Tail könnte gerade einen fremden Leg fliegen. Dann nur den
+        # flight-Match zulassen (die Flugnummer identifiziert den Leg selbst).
         _snap, _srt, _sreg, _stype = _aircraft_live_pos(
-            reg=reg, flight=flight_no, dep=dest)
+            reg=(reg if dest else None), flight=flight_no, dep=dest)
         if _snap and not _snap.get('on_ground'):
             pos = _snap
             if _srt and _srt[0] and not src:
@@ -5474,23 +5791,33 @@ def ax_flight_live(token):
                 build_keys as _fs_bk, obs_from_board_merged as _fs_obm,
                 obs_from_pos as _fs_op)
             from blueprints.flight_state import (
-                resolve_flight_state as _fs_resolve, project_flight_live as _fs_proj)
+                resolve_flight_state as _fs_resolve, project_flight_live as _fs_proj,
+                prior_state as _fs_prior, remember_state as _fs_remember)
             _to_utc = _life_app('_board_local_to_utc_iso')
             _fs_keys = _fs_bk(
                 flight_no, date, dep, dest, roster_tail=reg, callsign=cs,
                 sched_dep_iso=(_to_utc(merged.get('sched_dep'), dep) if _to_utc else None),
                 sched_arr_iso=(_to_utc(merged.get('sched_arr'), dest) if (_to_utc and dest) else None),
-                dep_ll=_iata_latlon(dep or ''), arr_ll=_iata_latlon(dest or ''))
+                dep_ll=_iata_latlon(dep or ''), arr_ll=_iata_latlon(dest or ''),
+                dep_elev_ft=_iata_elev_ft(dep or ''))
             _fs_obs = _fs_obm(merged, _fs_keys, board_to_iso=_to_utc)
             if pos:
+                # pos trägt seen_ts+source aus position_for_flight bzw.
+                # _aircraft_live_pos (P1-4b) — obs_from_pos mappt die
+                # Resolver-Tags (fr24/aircraft_positions/…) selbst.
                 _fs_obs += _fs_op(pos, (pos.get('source') or 'adsb'))
-            _fs = _fs_resolve(_fs_keys, _fs_obs)
+            # prior = letztes Resultat dieses Flug-Tages → Monotonie/Sticky wirken
+            _fs = _fs_resolve(_fs_keys, _fs_obs,
+                              prior=_fs_prior(flight_no, date))
+            _fs_remember(_fs)
             _pl = _fs_proj(_fs)
             payload['live'] = _pl['live']
             payload['in_flight'] = _pl['in_flight']
             payload['progress'] = _fs['progress']
             payload['phase'] = _fs['phase']
             payload['phase_conf'] = _fs['phase_conf']
+            # additiv: 'lost' ⇒ iOS kann die Vorwärts-Simulation ehrlich stoppen
+            payload['live_status'] = _fs.get('live_status')
             payload['eta_iso'] = _fs['times']['eta_iso']
             payload['eta_conf'] = _fs['times']['eta_conf']
     except Exception:
@@ -5572,13 +5899,19 @@ def ax_my_flight_status(token):
         if os.environ.get('FLIGHTSTATE_LIVE_MYSTATUS', '') in ('1', 'true', 'yes'):
             from blueprints.flight_state_collectors import (
                 build_keys as _fs_bk, obs_from_board_merged as _fs_obm)
-            from blueprints.flight_state import resolve_flight_state as _fs_resolve
+            from blueprints.flight_state import (
+                resolve_flight_state as _fs_resolve,
+                prior_state as _fs_prior, remember_state as _fs_remember)
             _fs_keys = _fs_bk(
                 flight_no, date, dep_iata, arr_iata, roster_tail=m.get('reg'),
                 sched_dep_iso=(to_utc(m.get('sched_dep'), dep_iata) if to_utc else None),
                 sched_arr_iso=(to_utc(m.get('sched_arr'), arr_iata) if (to_utc and arr_iata) else None),
-                dep_ll=_iata_latlon(dep_iata or ''), arr_ll=_iata_latlon(arr_iata or ''))
-            _fs = _fs_resolve(_fs_keys, _fs_obm(m, _fs_keys, board_to_iso=to_utc))
+                dep_ll=_iata_latlon(dep_iata or ''), arr_ll=_iata_latlon(arr_iata or ''),
+                dep_elev_ft=_iata_elev_ft(dep_iata or ''))
+            # prior → Monotonie/Sticky-Airborne über Requests hinweg
+            _fs = _fs_resolve(_fs_keys, _fs_obm(m, _fs_keys, board_to_iso=to_utc),
+                              prior=_fs_prior(flight_no, date))
+            _fs_remember(_fs)
             payload['phase'] = _fs['phase']
             payload['phase_conf'] = _fs['phase_conf']
             payload['eta_iso'] = _fs['times']['eta_iso']

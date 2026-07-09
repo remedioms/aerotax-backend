@@ -212,3 +212,85 @@ def test_flights_by_airline_dedups_across_chunks():
         legs = BP._fr24_flights_by_airline('OCN', days=1, chunk_hours=6)
     assert mget.call_count > 1                 # geblättert
     assert len(legs) == 1                      # trotzdem nur 1 (dedup)
+
+
+def test_flight_by_number_date_none_normalized_to_today_key():
+    """Cache-Key-Divergenz-Fix: date=None wird auf den heutigen UTC-Tag
+    normalisiert → flight_status (mit Datum) und resolve-flight (ohne) treffen
+    denselben Hard-Cache-Eintrag = nur EIN bezahlter Call."""
+    import time as _t
+    resp = {'data': [_summary('LH400', 'EDDF', 'KJFK',
+                              '2026-07-08T09:00:00Z', '2026-07-08T17:00:00Z')]}
+    with patch.object(BP, '_fr24_token', return_value='tok'), \
+         patch.object(BP, '_icao_to_iata', side_effect=lambda c: _ICAO2IATA.get(c)), \
+         patch.object(BP, '_fr24_get', return_value=resp) as mget:
+        a = BP._fr24_flight_by_number('LH400')                       # ohne Datum
+        b = BP._fr24_flight_by_number(
+            'LH400', _t.strftime('%Y-%m-%d', _t.gmtime()))           # heutiges Datum
+    assert a == b and a is not None
+    assert mget.call_count == 1
+
+
+def test_monthly_cap_blocks_budget():
+    """Monats-Zweitschlüssel: FR24_MONTHLY_CREDIT_CAP deckelt auch dann, wenn
+    der Tages-Cap noch frei ist."""
+    with patch.dict(os.environ, {'FR24_MONTHLY_CREDIT_CAP': '2'}):
+        BP._budget_key_inc(BP._fr24_month_budget_key(), 2)
+        assert BP._fr24_budget_ok() is False
+
+
+def test_budget_inc_counts_day_and_month():
+    BP._fr24_budget_inc(3)
+    assert BP._budget_key_used(BP._fr24_budget_key()) == 3
+    assert BP._budget_key_used(BP._fr24_month_budget_key()) == 3
+
+
+def test_uflight_paid_miss_negative_cached():
+    """?paid=1-Miss wird 12 h negativ gecacht: derselbe unauflösbare Query
+    schaltet paid beim nächsten Resolve NICHT wieder scharf (kein Re-Spend)."""
+    BP._UFLIGHT_MEMO.clear()
+    BP._UFLIGHT_PAID_MISS.clear()
+    calls = []
+
+    def fake_core(q, date, csq, lat, lon, allow_paid, date_auto=False):
+        calls.append(allow_paid)
+        return {'ok': True, 'found': False, 'query': q, 'date': date}
+
+    with patch.object(BP, '_resolve_unified_flight_core', side_effect=fake_core):
+        BP.resolve_unified_flight('XX9NEG', date='2026-07-09', allow_paid=True)
+        BP.resolve_unified_flight('XX9NEG', date='2026-07-09', allow_paid=True)
+    assert calls == [True, False]
+    BP._UFLIGHT_MEMO.clear()
+    BP._UFLIGHT_PAID_MISS.clear()
+
+
+def test_flights_by_airline_respects_watermark_and_reports_cover():
+    """Prewarm-Resume: t_from (Watermark) verkürzt das Fenster; cover_out['to']
+    trägt die letzte abgedeckte Grenze für die nächste Persistierung."""
+    import time as _t
+    resp = {'data': [_summary('4Y100', 'EDDF', 'LEBL',
+                              '2026-07-09T06:00:00Z', '2026-07-09T08:05:00Z')]}
+    now = _t.time()
+    cover = {}
+    with patch.object(BP, '_fr24_token', return_value='tok'), \
+         patch.object(BP, '_icao_to_iata', side_effect=lambda c: _ICAO2IATA.get(c)), \
+         patch.object(BP, '_fr24_get', return_value=resp) as mget:
+        BP._fr24_flights_by_airline('OCN', days=2, chunk_hours=2,
+                                    t_from=now - 3600, cover_out=cover)
+    # Watermark 1 h zurück + 2h-Chunks → genau EIN Chunk statt 24
+    assert mget.call_count == 1
+    assert cover.get('to') and abs(cover['to'] - now) < 5
+
+
+def test_fr24_cache_evicts_oldest_quarter_not_all():
+    """LRU-Eviction statt clear(): die jüngsten Einträge (und damit die teuer
+    bezahlten frischen Treffer) überleben."""
+    BP._FR24_REG_CACHE.clear()
+    import time as _t
+    base = _t.time()
+    for i in range(501):
+        BP._FR24_REG_CACHE['k%d' % i] = (base + i, None)
+    BP._fr24_cache_evict()
+    assert 300 < len(BP._FR24_REG_CACHE) < 501
+    assert 'k500' in BP._FR24_REG_CACHE      # jüngster Eintrag bleibt
+    assert 'k0' not in BP._FR24_REG_CACHE    # ältester Eintrag flog raus

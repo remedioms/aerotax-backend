@@ -53,7 +53,8 @@ def _isolated(monkeypatch):
     monkeypatch.setattr(D, '_route_from_obs', lambda cs: None)
     monkeypatch.setattr(D, '_route_from_warehouse', lambda *a, **k: None)
     monkeypatch.setattr(D, '_route_from_fr24', lambda *a, **k: None)
-    monkeypatch.setattr(D, '_free_generic_route', lambda *a, **k: None)
+    # (_free_generic_route wurde 2026-07-09 gelöscht — 0 Aufrufer, Owner hatte
+    #  die adsbdb/adsb.lol/hexdb-Generik schon 2026-07-03 deaktiviert.)
     # Tier-0 aircraft_live (Ultraplan Phase 1) — default sauberer Miss.
     monkeypatch.setattr(D, '_aircraft_live_flight', lambda *a, **k: None)
     # Gate für den Nicht-Suche-Pfad: standardmäßig „widerspricht nicht" → True.
