@@ -2942,6 +2942,201 @@ def ax_tail_history():
                     'count': len(legs), 'legs': legs, 'source': source})
 
 
+def _iso_to_epoch(s):
+    """ISO-8601 (mit +00:00 oder Z) → Epoch-Sekunden (int) | None."""
+    if not s:
+        return None
+    try:
+        from datetime import datetime, timezone
+        return int(datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+                   .astimezone(timezone.utc).timestamp())
+    except Exception:
+        return None
+
+
+def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso):
+    """Tier 1: die ECHTE geflogene Spur aus der eigenen aircraft_track-Tabelle
+    (Breadcrumbs vom Harvester + FR24-Rückschreibungen). Isoliert EIN Leg:
+    dep/arr-Filter falls gegeben, sonst das jüngste Leg (== origin/dest des
+    letzten Punkts). Liefert (points, reg_used, dep_used, arr_used)."""
+    sb = _sb()
+    if sb is None:
+        return [], reg, dep, arr
+    try:
+        q = sb.table('aircraft_track').select(
+            'reg,lat,lon,alt_ft,gs_kt,track_deg,seen_ts,origin,dest,flight')
+        if reg:
+            q = q.eq('reg', reg)
+        elif flight_no:
+            q = q.eq('flight', flight_no)
+        else:
+            return [], reg, dep, arr
+        rows = (q.gte('seen_ts', lo_iso).lt('seen_ts', hi_iso)
+                 .order('seen_ts').limit(4000).execute()).data or []
+    except Exception:
+        return [], reg, dep, arr
+    if not rows:
+        return [], reg, dep, arr
+    # Leg isolieren: explizit dep/arr, sonst das jüngste beobachtete Leg.
+    if dep or arr:
+        rows = [r for r in rows
+                if (not dep or (r.get('origin') or '') == dep)
+                and (not arr or (r.get('dest') or '') == arr)]
+    else:
+        last = rows[-1]
+        lo_, ld_ = last.get('origin'), last.get('dest')
+        rows = [r for r in rows if r.get('origin') == lo_ and r.get('dest') == ld_]
+        dep, arr = lo_, ld_
+    reg_used = (rows[0].get('reg') if rows else None) or reg
+    pts = [{'lat': r['lat'], 'lon': r['lon'], 'alt': r.get('alt_ft'),
+            'gs': r.get('gs_kt'), 'trk': r.get('track_deg'),
+            'ts': _iso_to_epoch(r.get('seen_ts'))}
+           for r in rows if r.get('lat') is not None and r.get('lon') is not None]
+    return pts, reg_used, dep, arr
+
+
+def _flown_track_writeback(reg, trail):
+    """FR24-Trail (Tier 2) dauerhaft in aircraft_track zurückschreiben → wächst.
+    Idempotent via PK (reg, seen_ts). Best-effort, nie werfen."""
+    sb = _sb()
+    if sb is None or not reg or not trail.get('points'):
+        return
+    rows = []
+    for p in trail['points']:
+        ts = p.get('ts')
+        if not ts:
+            continue
+        rows.append({
+            'reg': reg,
+            'seen_ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(int(ts))),
+            'flight': trail.get('flight'),
+            'origin': trail.get('origin'), 'dest': trail.get('dest'),
+            'lat': p['lat'], 'lon': p['lon'],
+            'alt_ft': p.get('alt_ft'), 'gs_kt': p.get('gs_kt'),
+            'track_deg': p.get('track_deg'),
+            'on_ground': False, 'source': 'fr24_trail',
+        })
+    if not rows:
+        return
+    try:
+        sb.table('aircraft_track').upsert(
+            rows, on_conflict='reg,seen_ts', ignore_duplicates=True).execute()
+    except Exception:
+        pass
+
+
+@aerox_data_bp.route('/api/ax/flown-track', methods=['GET'])
+def ax_flown_track():
+    """Die ECHTE geflogene Route eines Legs als Polyline. Kaskade (billig-zuerst):
+      Tier 1  aircraft_track  — eigene Breadcrumbs (auch historisch, gratis)
+      Tier 2  FR24-flight_trail_list on-demand (jede Airline) + Rückschreibung
+      Tier 3  Großkreis dep→arr  (source='great_circle', „approx")
+    Query: reg (bevorzugt) UND/ODER flight_no + date (+ optional dep,arr zur
+    Leg-Disambiguierung). Public + per-IP rate-limited (Positionsdaten, nicht
+    sensibel — wie /api/ax/tail-history)."""
+    from flask import request
+    from blueprints.adsb_blueprint import _rate_limited, _req_ip, _great_circle_points
+    if _rate_limited(ip=_req_ip(request), endpoint='flown_track', limit=60, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    reg = re.sub(r'[^A-Z0-9]', '', (request.args.get('reg') or '').upper())
+    flight_no = (request.args.get('flight_no') or request.args.get('flight') or '').strip().upper() or None
+    date = (request.args.get('date') or '').strip() or None      # YYYY-MM-DD (UTC)
+    dep = _norm_iata(request.args.get('dep')) if request.args.get('dep') else None
+    arr = _norm_iata(request.args.get('arr')) if request.args.get('arr') else None
+    if not reg and not flight_no:
+        return jsonify({'ok': False, 'error': 'reg_or_flight_required'}), 400
+
+    memo_key = ('flown_track', reg, flight_no or '', date or '', dep or '', arr or '')
+    cached = _memo_get(memo_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    # Zeitfenster: ganzer UTC-Tag (date) oder die letzten 20 h (laufender Flug).
+    import datetime as _dt
+    if date:
+        try:
+            d0 = _dt.datetime.strptime(date, '%Y-%m-%d').replace(tzinfo=_dt.timezone.utc)
+            lo_iso = d0.strftime('%Y-%m-%dT00:00:00Z')
+            hi_iso = (d0 + _dt.timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
+        except Exception:
+            date = None
+    if not date:
+        now = time.time()
+        lo_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now - 20 * 3600))
+        hi_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now + 3600))
+
+    source = 'aircraft_track'
+    points, reg_used, dep, arr = _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso)
+    reg = reg or (reg_used or '')
+
+    # Tier 2: zu wenig eigene Spur → FR24-Trail on-demand (+ Rückschreibung).
+    is_today = (not date) or (date == time.strftime('%Y-%m-%d', time.gmtime()))
+    if len(points) < 3 and is_today:
+        try:
+            pos, route, reg_disp, _ac = _aircraft_live_pos(
+                reg=reg or None, flight=flight_no, max_age_min=60)
+        except Exception:
+            pos, route = None, None
+        if pos and pos.get('lat') is not None:
+            try:
+                from blueprints import fr24_grpc
+                trail = fr24_grpc.flown_trail(
+                    reg=reg or (reg_disp or None), flight=flight_no,
+                    lat=pos.get('lat'), lon=pos.get('lon'))
+            except Exception:
+                trail = None
+            if trail and trail.get('points'):
+                tw_reg = re.sub(r'[^A-Z0-9]', '', (trail.get('reg') or reg or '').upper())
+                _flown_track_writeback(tw_reg, trail)
+                if len(trail['points']) >= len(points):
+                    source = 'fr24_trail'
+                    reg = reg or tw_reg
+                    dep = dep or trail.get('origin')
+                    arr = arr or trail.get('dest')
+                    points = [{'lat': p['lat'], 'lon': p['lon'], 'alt': p.get('alt_ft'),
+                               'gs': p.get('gs_kt'), 'trk': p.get('track_deg'),
+                               'ts': p.get('ts')} for p in trail['points']]
+
+    # Tier 3: keine echte Spur → Großkreis dep→arr (ehrlich als „approx").
+    if len(points) < 2 and dep and arr:
+        a, b = _iata_latlon(dep), _iata_latlon(arr)
+        if a and b:
+            source = 'great_circle'
+            points = [{'lat': la, 'lon': lo, 'alt': None, 'gs': None, 'trk': None, 'ts': None}
+                      for la, lo in _great_circle_points(a[0], a[1], b[0], b[1], 40)]
+
+    out = {'ok': True, 'reg': reg or None, 'flight': flight_no, 'date': date,
+           'dep': dep, 'arr': arr, 'source': source,
+           'count': len(points), 'points': points}
+    _memo_put(memo_key, out)
+    resp = jsonify(out)
+    # Historische, echte Spur ist unveränderlich → lange Edge-TTL; laufend/approx kurz.
+    past = bool(date) and date < time.strftime('%Y-%m-%d', time.gmtime())
+    ttl = 86400 if (past and source in ('aircraft_track', 'fr24_trail')) else 45
+    resp.headers['Cache-Control'] = 'public, max-age=%d' % ttl
+    return resp
+
+
+@aerox_data_bp.route('/api/internal/track-prune', methods=['POST'])
+def ax_track_prune():
+    """Retention: aircraft_track-Breadcrumbs älter als TRACK_RETENTION_DAYS (60)
+    löschen. Geschützt per X-Poll-Secret (== ADSB_POLL_SECRET), Cron-getriggert."""
+    from flask import request
+    secret = os.environ.get('ADSB_POLL_SECRET', '').strip()
+    if secret and (request.headers.get('X-Poll-Secret') or '').strip() != secret:
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    days = int(os.environ.get('TRACK_RETENTION_DAYS', '60'))
+    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - days * 86400))
+    sb = _sb()
+    if sb is None:
+        return jsonify({'ok': False, 'error': 'no_db'}), 503
+    try:
+        sb.table('aircraft_track').delete().lt('seen_ts', cutoff).execute()
+        return jsonify({'ok': True, 'pruned_before': cutoff, 'days': days})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': type(e).__name__}), 500
+
+
 @aerox_data_bp.route('/api/ax/fr24-prewarm', methods=['POST'])
 def ax_fr24_prewarm():
     """INTERNER Warehouse-Prewarm (Owner „alle von Discover ins Buch"): holt ALLE

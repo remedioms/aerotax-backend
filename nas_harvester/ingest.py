@@ -111,6 +111,14 @@ class Settings:
     prune_interval: float = float(os.getenv("PRUNE_INTERVAL_S", "1800"))
     prune_age: float = float(os.getenv("PRUNE_AGE_S", "10800"))     # 3 h
 
+    # Track-Breadcrumbs (Owner 2026-07-09): pro Poll je airborne, BEWEGtem Airframe
+    # einen Punkt in aircraft_track anhängen → die ECHTE geflogene Route wächst
+    # dauerhaft. Nur airborne + > track_min_nm seit letztem gespeicherten Punkt
+    # (drosselt Volumen). aircraft_live (Snapshot) bleibt unberührt.
+    track_enabled: bool = os.getenv("TRACK_ENABLED", "1") not in ("0", "false", "no", "")
+    track_table: str = os.getenv("TRACK_TABLE", "aircraft_track")
+    track_min_nm: float = float(os.getenv("TRACK_MIN_NM", "1.0"))
+
     backoff_base: float = float(os.getenv("BACKOFF_BASE_S", "30"))
     backoff_cap: float = float(os.getenv("BACKOFF_CAP_S", "900"))
 
@@ -133,6 +141,21 @@ def _n(v):
 def _norm_reg(reg) -> str | None:
     r = (str(reg or "").strip().upper().replace("-", "").replace(" ", ""))
     return r or None
+
+
+def _dist_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Großkreis-Distanz in NM (Haversine) — für das Track-Bewegungs-Gate."""
+    from math import radians, sin, cos, asin, sqrt
+    rla1, rlo1, rla2, rlo2 = map(radians, (lat1, lon1, lat2, lon2))
+    h = sin((rla2 - rla1) / 2) ** 2 + cos(rla1) * cos(rla2) * sin((rlo2 - rlo1) / 2) ** 2
+    return 2 * 3440.065 * asin(min(1.0, sqrt(h)))   # Erdradius in NM
+
+
+def _to_int(v):
+    try:
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return None
 
 
 def decorrelated_jitter(prev: float, base: float, cap: float) -> float:
@@ -221,6 +244,9 @@ class Ingest:
         # serviert (via bestehenden cloudflared-Tunnel), damit das Backend von hier
         # liest statt Supabase → spart Supabase-Disk-IO/Kosten. reg → (snap, mono_ts).
         self._latest: dict[str, tuple] = {}
+        # Letzter GESPEICHERTER Track-Punkt pro Reg (lat, lon) — Bewegungs-Gate,
+        # damit stehende/kaum-bewegte Airframes keine redundanten Punkte anhängen.
+        self._last_track: dict[str, tuple] = {}
         self._runner = None
 
     async def close(self) -> None:
@@ -249,12 +275,61 @@ class Ingest:
         r.raise_for_status()
         return len(rows)
 
+    async def _append_track(self, rows: list[dict]) -> int:
+        """Hängt pro airborne, BEWEGtem Airframe einen Breadcrumb an aircraft_track
+        an (echte geflogene Route, append-only). Idempotent via PK (reg, seen_ts).
+        Kein Write im RAM-only-Modus oder wenn track deaktiviert."""
+        if not (self._s.track_enabled and self._s.write_supabase):
+            return 0
+        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        pts = []
+        for r in rows:
+            if r.get("on_ground"):
+                continue                       # nur Flug, keine Boden-/Parkpunkte
+            lat, lon, reg = r.get("lat"), r.get("lon"), r.get("reg")
+            if lat is None or lon is None or not reg:
+                continue
+            prev = self._last_track.get(reg)
+            if prev is not None and _dist_nm(prev[0], prev[1], lat, lon) < self._s.track_min_nm:
+                continue                       # zu nah am letzten Punkt → drosseln
+            pts.append({
+                "reg": reg,
+                "seen_ts": r.get("seen_ts") or now_iso,
+                "flight": r.get("flight"),
+                "origin": r.get("origin"),
+                "dest": r.get("dest"),
+                "lat": lat, "lon": lon,
+                "alt_ft": _to_int(r.get("alt_ft")),
+                "gs_kt": _to_int(r.get("gs_kt")),
+                "track_deg": _to_int(r.get("track")),
+                "on_ground": False,
+                "source": "fr24_grpc",
+            })
+            self._last_track[reg] = (lat, lon)
+        if not pts:
+            return 0
+        try:
+            resp = await self._sb.post(
+                f"/rest/v1/{self._s.track_table}?on_conflict=reg,seen_ts",
+                content=json.dumps(pts),
+                headers={"Content-Type": "application/json",
+                         "Prefer": "resolution=ignore-duplicates,return=minimal"})
+            resp.raise_for_status()
+            return len(pts)
+        except Exception as ex:
+            log.debug("track-append fehlgeschlagen: %s", ex)
+            return 0
+
     async def _prune(self) -> None:
         cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
                                time.gmtime(time.time() - self._s.prune_age))
         with contextlib.suppress(Exception):
             await self._sb.delete(f"/rest/v1/{self._s.table}?updated_at=lt.{cutoff}",
                                   headers={"Prefer": "return=minimal"})
+        # RAM-Gate der Track-Bewegung mitprunen (verhindert unbegrenztes Wachstum
+        # des Dicts über die Container-Laufzeit).
+        for k in [k for k in self._last_track if k not in self._latest]:
+            self._last_track.pop(k, None)
 
     # ── In-RAM HTTP-API (vom Backend via cloudflared-Tunnel gelesen) ──────────
     def _match(self, reg, flight, cs, dep, max_age):
@@ -334,9 +409,10 @@ class Ingest:
         for k in stale:
             self._latest.pop(k, None)
         n_up = await self._upsert(rows)
+        n_tr = await self._append_track(rows)
         self._win_rows += n_up
-        log.debug("tile%d flights=%d matched=%d ram=%d upserted=%d",
-                  idx, len(flights), len(rows), len(self._latest), n_up)
+        log.debug("tile%d flights=%d matched=%d ram=%d upserted=%d track+=%d",
+                  idx, len(flights), len(rows), len(self._latest), n_up, n_tr)
 
     async def run(self) -> None:
         from fr24 import FR24

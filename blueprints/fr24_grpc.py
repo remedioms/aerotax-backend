@@ -381,6 +381,53 @@ def detail_card(callsign=None, hex=None, reg=None, lat=None, lon=None):
     return {k: v for k, v in card.items() if v is not None}
 
 
+def flown_trail(callsign=None, hex=None, reg=None, lat=None, lon=None):
+    """Die ECHTE jüngste geflogene Spur eines Flugs aus FR24-`flight_details`
+    (`flight_trail_list`) — Punkte lat/lon/alt/gs/track/ts. Für /api/ax/flown-track
+    Tier 2 (jede Airline, on-demand) + Rückschreibung in aircraft_track. Gratis/
+    anonym (gleicher gRPC-Pfad wie tap_detail). None wenn keine Spur.
+
+    Rückgabe: {reg, flight, origin, dest, points:[{lat,lon,alt_ft,gs_kt,track_deg,ts}]}."""
+    td = tap_detail(callsign=callsign, hex=hex, reg=reg, lat=lat, lon=lon)
+    if not td:
+        return None
+    d = td.get("detail") or {}
+    trail = d.get("flight_trail_list") or []
+    if not trail:
+        return None
+    row = td.get("row") or {}
+    xi = row.get("extra_info") or {}
+    route = xi.get("route") or {}
+
+    def _i(v):
+        try:
+            return int(round(float(v)))
+        except (TypeError, ValueError):
+            return None
+
+    pts = []
+    for tp in trail:
+        la, lo = tp.get("latitude"), tp.get("longitude")
+        if la is None or lo is None:
+            continue
+        pts.append({
+            "lat": la, "lon": lo,
+            "alt_ft": _i(tp.get("altitude")),
+            "gs_kt": _i(tp.get("ground_speed")),
+            "track_deg": _i(tp.get("track")),
+            "ts": tp.get("timestamp"),
+        })
+    if not pts:
+        return None
+    return {
+        "reg": (str(xi.get("reg") or reg or "").strip().upper()) or None,
+        "flight": (str(xi.get("flight") or "").strip().upper()) or None,
+        "origin": (str(route.get("from") or "").strip().upper()) or None,
+        "dest": (str(route.get("to") or "").strip().upper()) or None,
+        "points": pts,
+    }
+
+
 # ── Area-Positionen für die Live-Map (Satelliten/Ozean-Füllung, Increment #29) ─
 def _row_to_pos(row):
     """live_feed-Row → normalisierte Positions-Zeile für Map/Store."""
