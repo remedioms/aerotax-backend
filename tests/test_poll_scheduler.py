@@ -19,6 +19,8 @@ def _reset_scheduler_memos():
     """Modul-Memos pro Test leeren (gleiche Isolation wie conftest für andere)."""
     ps._LAST_POLL.clear()
     ps._OBS_HASH_MEMO.clear()
+    ps._QUIET_MEMO.clear()
+    ps._QUIET_SKIP_SINCE.clear()
     ps._DEMAND_MEMO.update({'ts': 0.0,
                             'demanded': frozenset(ps.ALWAYS_DEMAND),
                             'events': {}})
@@ -31,6 +33,11 @@ def test_takt_matrix():
     # Event-Fenster → 3 min, schlägt alles (auch Nacht: Red-Eye eines Users).
     assert ps.poll_interval_min(True, True, 14) == 3
     assert ps.poll_interval_min(False, True, 3) == 3
+    # Hub (FRA/MUC) im Event-Fenster → 1 min (jeder Cron-Tick), auch nachts.
+    assert ps.poll_interval_min(True, True, 14, is_hub=True) == 1
+    assert ps.poll_interval_min(False, True, 3, is_hub=True) == 1
+    # Hub OHNE Event-Fenster → kein Sondertakt (normal 5, da nachgefragt).
+    assert ps.poll_interval_min(True, False, 14, is_hub=True) == 5
     # Nacht (0–5 lokal) übersteuert Demand UND Default → 30 min.
     assert ps.poll_interval_min(True, False, 0) == 30
     assert ps.poll_interval_min(False, False, 4) == 30
@@ -126,15 +133,43 @@ def test_airports_due_night_30min():
     assert ps.airports_due(['OSL'], NOW, set(), {}, last, hour_night) == ['OSL']
 
 
+def test_hub_1min_event_every_tick_no_double_poll():
+    # FRA (Hub) UND BER im Event-Fenster: nur FRA hat den 1-min-Takt.
+    events = {'FRA': [NOW], 'BER': [NOW]}
+    last = {'FRA': NOW.timestamp() - 60, 'BER': NOW.timestamp() - 60}
+    # Regulärer Minuten-Tick (60 s her): FRA fällig, BER (3 min) nicht.
+    assert ps.airports_due(['FRA', 'BER'], NOW, set(), events,
+                           last, _hour_noon) == ['FRA']
+    # Cron-Jitter (nur 55 s her): FRA trotzdem fällig — JEDER Tick pollt.
+    last = {'FRA': NOW.timestamp() - 55}
+    assert ps.airports_due(['FRA'], NOW, set(), events, last, _hour_noon) == ['FRA']
+    # Zweiter Aufruf in DERSELBEN Minute (10 s her): kein Doppel-Poll.
+    last = {'FRA': NOW.timestamp() - 10}
+    assert ps.airports_due(['FRA'], NOW, set(), events, last, _hour_noon) == []
+
+
+def test_hub_1min_needs_event_window():
+    # FRA OHNE Event-Fenster: normaler 5-min-Demand-Takt, kein Minuten-Poll.
+    last = {'FRA': NOW.timestamp() - 60}
+    assert ps.airports_due(['FRA'], NOW, set(), {}, last, _hour_noon) == []
+
+
+def _local_noon(_ap):
+    # naive Airport-Lokalzeit (volle datetime — wie _airport_local_now).
+    return datetime(2026, 7, 9, 14, 0)
+
+
 def test_select_due_marks_last_poll_and_no_sb():
-    # sb=None (SB down) → läuft trotzdem: FRA/MUC nachgefragt, Rest Default.
+    # sb=None (SB down) → läuft trotzdem: FRA/MUC nachgefragt, Rest Default,
+    # Quiet-Gate skippt OHNE Datenquelle nie.
     due, diag = ps.select_due_airports(['FRA', 'MUC', 'BER'], None,
-                                       _hour_noon, now_utc=NOW)
+                                       _local_noon, now_utc=NOW)
     assert due == ['FRA', 'MUC', 'BER']
     assert set(diag['demanded']) >= {'FRA', 'MUC'}
+    assert diag['quiet'] == []
     # Direkt danach: nichts mehr fällig (last-poll wurde gestempelt).
     due2, _ = ps.select_due_airports(['FRA', 'MUC', 'BER'], None,
-                                     _hour_noon, now_utc=NOW)
+                                     _local_noon, now_utc=NOW)
     assert due2 == []
 
 
@@ -175,6 +210,101 @@ def test_get_demand_reads_raw_event_sectors_and_memoizes():
     # Memo: zweiter Aufruf innerhalb der TTL macht KEINEN weiteren Query.
     ps.get_demand(fake, NOW)
     assert fake.calls == 1
+
+
+# ── Quiet-Gate: keine geplante Bewegung → Skip ───────────────────────────────
+
+class _FakeGateSB:
+    """Fake für die Quiet-Gate-Probes: gte() markiert die Fenster-Query,
+    execute() liefert je nach Query-Art window_hit bzw. has_rows_today."""
+    def __init__(self, window_hit=False, has_rows_today=True):
+        self.window_hit = window_hit
+        self.has_rows_today = has_rows_today
+        self.calls = 0
+        self._is_window = False
+
+    def table(self, _n): return self
+    def select(self, _c): return self
+    def in_(self, _c, _v): return self
+    def eq(self, _c, _v): return self
+    def lte(self, _c, _v): return self
+    def limit(self, _n): return self
+
+    def gte(self, _c, _v):
+        self._is_window = True
+        return self
+
+    def execute(self):
+        self.calls += 1
+        hit = self.window_hit if self._is_window else self.has_rows_today
+        self._is_window = False
+        from types import SimpleNamespace
+        return SimpleNamespace(data=[{'sched': '12:30'}] if hit else [])
+
+
+def test_movement_window_segments():
+    # Tags: EIN Segment [13:00, 16:00] am selben Datum.
+    segs = ps.movement_window_segments(datetime(2026, 7, 9, 14, 0))
+    assert segs == [('2026-07-09', '13:00', '16:00')]
+    # Mitternachts-Überlauf: zwei Segmente (HH:MM sortiert lexikographisch).
+    segs = ps.movement_window_segments(datetime(2026, 7, 9, 23, 30))
+    assert segs == [('2026-07-09', '22:30', '23:59'),
+                    ('2026-07-10', '00:00', '01:30')]
+
+
+def test_quiet_gate_skips_airport_without_movement():
+    fake = _FakeGateSB(window_hit=False, has_rows_today=True)
+    quiet = ps.get_quiet_airports(fake, ['WAW'], _local_noon)
+    assert quiet == {'WAW'}
+    # airports_due: quiet → KOMPLETT geskippt, obwohl 10 min (Default) um sind.
+    last = {'WAW': NOW.timestamp() - 600}
+    assert ps.airports_due(['WAW'], NOW, set(), {}, last, _hour_noon,
+                           quiet=quiet) == []
+    # Memo: zweiter Tick innerhalb der 15-min-TTL probed NICHT erneut.
+    calls = fake.calls
+    assert ps.get_quiet_airports(fake, ['WAW'], _local_noon) == {'WAW'}
+    assert fake.calls == calls
+
+
+def test_quiet_gate_allows_with_movement_in_window():
+    fake = _FakeGateSB(window_hit=True)
+    assert ps.get_quiet_airports(fake, ['WAW'], _local_noon) == set()
+
+
+def test_quiet_gate_cold_airport_never_starved():
+    # Henne-Ei: GAR keine obs-Rows heute → kalt → normal pollen, nie skippen.
+    fake = _FakeGateSB(window_hit=False, has_rows_today=False)
+    assert ps.get_quiet_airports(fake, ['XYZ'], _local_noon) == set()
+
+
+def test_quiet_gate_event_override():
+    # Event-/Roster-aktive Airports (exclude) werden gar nicht erst geprobed.
+    fake = _FakeGateSB(window_hit=False, has_rows_today=True)
+    quiet = ps.get_quiet_airports(fake, ['WAW'], _local_noon, exclude={'WAW'})
+    assert quiet == set() and fake.calls == 0
+    # Belt&Braces in airports_due: selbst ein quiet-markierter Airport wird
+    # im Event-Fenster gepollt (Event schlägt Gate).
+    events = {'WAW': [NOW]}
+    assert ps.airports_due(['WAW'], NOW, set(), events, {}, _hour_noon,
+                           quiet={'WAW'}) == ['WAW']
+
+
+def test_quiet_gate_60min_safety_net():
+    fake = _FakeGateSB(window_hit=False, has_rows_today=True)
+    assert ps.get_quiet_airports(fake, ['WAW'], _local_noon) == {'WAW'}
+    # 61 min durchgehend geskippt → EIN Poll erlaubt (Fahrplan-Lücken-Netz) …
+    ps._QUIET_SKIP_SINCE['WAW'] -= 61 * 60
+    assert ps.get_quiet_airports(fake, ['WAW'], _local_noon) == set()
+    # … danach greift das Gate wieder (Zähler neu gestartet).
+    assert ps.get_quiet_airports(fake, ['WAW'], _local_noon) == {'WAW'}
+
+
+def test_roster_active_airports_window():
+    # Event in +90 min liegt im Fenster [−1h, +2h] → aktiv; +3h nicht.
+    events = {'SKP': [NOW + timedelta(minutes=90)],
+              'CAI': [NOW + timedelta(hours=3)],
+              'LIS': [NOW - timedelta(minutes=59)]}
+    assert ps.roster_active_airports(events, NOW) == {'SKP', 'LIS'}
 
 
 # ── Write-on-change Hash-Memo ────────────────────────────────────────────────

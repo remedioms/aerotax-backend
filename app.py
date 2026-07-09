@@ -31988,8 +31988,10 @@ def internal_poll_boards():
 
     ?tier=auto (2026-07-09, Hetzner-Cron JEDE Minute): adaptiver Per-Airport-
     Takt via blueprints/poll_scheduler (Demand aus Roster-Legs ±3h, Event-
-    Fenster ±45 min → 3 min, nachgefragt → 5 min, Default → 10 min, Nacht
-    lokal 0–5 Uhr → 30 min). Ohne den Parameter: Verhalten wie immer.
+    Fenster ±45 min → 3 min bzw. FRA/MUC → 1 min, nachgefragt → 5 min,
+    Default → 10 min, Nacht lokal 0–5 Uhr → 30 min; Quiet-Gate: keine
+    geplante Bewegung in [now−1h, now+2h] → Skip, Re-Check ≤60 min).
+    Ohne den Parameter: Verhalten wie immer.
 
     WIRING (manuell, einmalig) — Cloud Scheduler alle 10 Minuten:
       gcloud scheduler jobs create http aerotax-poll-boards \
@@ -32014,8 +32016,9 @@ def internal_poll_boards():
     airports = _poll_boards_airports()
     # ADAPTIVER TAKT (2026-07-09): mit ?tier=auto feuert der Hetzner-Cron JEDE
     # Minute und der Scheduler (blueprints/poll_scheduler) entscheidet pro
-    # Airport, ob er diesen Tick dran ist (Event-Fenster 3 min / nachgefragt
-    # 5 min / Default 10 min / Nacht lokal 0–5 Uhr 30 min). OHNE ?tier=auto:
+    # Airport, ob er diesen Tick dran ist (Hub-Event FRA/MUC 1 min / Event-
+    # Fenster 3 min / nachgefragt 5 min / Default 10 min / Nacht lokal 0–5 Uhr
+    # 30 min / Quiet-Gate: keine geplante Bewegung → Skip). OHNE ?tier=auto:
     # EXAKT das bisherige Verhalten (alle Airports jeden Aufruf) — der alte
     # 10-min-Cron funktioniert unverändert weiter.
     tier = (request.args.get('tier') or '').strip().lower()
@@ -32023,7 +32026,7 @@ def internal_poll_boards():
         from blueprints import poll_scheduler as _psched
         due, sched_diag = _psched.select_due_airports(
             airports, sb if (SB_AVAILABLE and sb is not None) else None,
-            lambda ap: _airport_local_now(ap).hour)
+            lambda ap: _airport_local_now(ap))
         results = _poll_boards_once(due)
         # EU-Fill NICHT mit-beschleunigen: bleibt im heutigen 10-min-Raster
         # (OpenSky-Rate-Limit/Tages-Budget), unabhängig vom Board-Takt.
@@ -32476,8 +32479,31 @@ def internal_scrape_boards():
         budget_s = 90.0
     start = _t.time()
     airports = _scrape_boards_airports()
+    # QUIET-GATE (2026-07-09): Airports ohne GEPLANTE Bewegung in [now−1h,
+    # now+2h] (eigene airport_delay_obs-Scheds, ~15-min-Memo im Scheduler)
+    # komplett skippen — viele Boards sind nachts stundenlang leer. Kalte
+    # Airports (noch keine Rows heute) und Event-/Roster-aktive Airports
+    # werden NIE geskippt; Sicherheitsnetz: spätestens alle 60 min ein Poll.
+    # HINWEIS: die Playwright-Airport-Auswahl des SEPARATEN eu_scraper-
+    # Services liegt NICHT hier (eigene Registry, /scrape?airports=…) —
+    # dort bewusst unangetastet; dieses Gate greift nur für die backend-
+    # nativen Scraper dieses Endpoints. Gate defekt → normal alles scrapen.
+    quiet_skipped = []
+    try:
+        from blueprints import poll_scheduler as _psched
+        _sb = sb if (SB_AVAILABLE and sb is not None) else None
+        _now = datetime.now(timezone.utc)
+        _, _events = _psched.get_demand(_sb, _now)
+        _quiet = _psched.get_quiet_airports(
+            _sb, airports, lambda ap: _airport_local_now(ap),
+            exclude=_psched.roster_active_airports(_events, _now))
+        quiet_skipped = sorted(_quiet)
+        airports = [a for a in airports if a not in _quiet]
+    except Exception:
+        quiet_skipped = []
     summary = _scrape_boards_once(airports, deadline_ts=start + budget_s)
-    return jsonify({'ok': True, 'airports': airports, 'summary': summary,
+    return jsonify({'ok': True, 'airports': airports,
+                    'quiet_skipped': quiet_skipped, 'summary': summary,
                     'elapsed_s': round(_t.time() - start, 2)})
 
 

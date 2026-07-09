@@ -6,6 +6,8 @@
 #  DIESER Scheduler entscheidet pro Airport, ob er im aktuellen Tick dran ist.
 #
 #  Takt-Matrix (Minuten zwischen zwei Polls desselben Airports):
+#    · 1   Hub-Event: FRA/MUC im Event-Fenster (s.u.) — der Cron feuert eh
+#          minütlich, die Hubs bekommen dann JEDEN Tick
 #    · 3   Event-Fenster: ±45 min um sched_dep/sched_arr eines NACHGEFRAGTEN
 #          Flugs an diesem Airport (Roster-Leg eines Users)
 #    · 5   nachgefragt: Airport ist dep/arr eines Roster-Legs in now±3h,
@@ -13,6 +15,12 @@
 #    · 10  Default — entspricht exakt dem heutigen 10-min-Cron
 #    · 30  Nacht (0–5 Uhr Airport-LOKALZEIT) — übersteuert 5/10, aber NICHT
 #          das Event-Fenster (Red-Eye eines Users braucht trotzdem Daten)
+#    · SKIP Quiet-Gate: KEINE geplante Bewegung in [now−1h, now+2h] (eigene
+#          airport_delay_obs-Scheds des Tages, ~15-min-Memo) → Airport wird
+#          komplett geskippt; Re-Check spätestens nach 60 min (Sicherheits-
+#          netz). Event-Fenster/Roster-Events übersteuern IMMER; kalte
+#          Airports (noch keine Rows heute) werden NIE geskippt (Henne-Ei).
+#          FRA-Nachtflugverbot 23–5 → stundenlanger Skip ist dort GEWOLLT.
 #
 #  Demand-Quelle = user_ical_briefings.raw_event->ical_sectors über ALLE User
 #  (EIN Supabase-Query pro ~10 min, siehe get_demand) — bewusst NICHT
@@ -36,6 +44,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 # ── Takt-Matrix (Minuten) ─────────────────────────────────────────────────────
+TICK_HUB_EVENT_MIN = 1
 TICK_EVENT_MIN = 3
 TICK_DEMAND_MIN = 5
 TICK_DEFAULT_MIN = 10
@@ -47,10 +56,20 @@ NIGHT_START_H, NIGHT_END_H = 0, 5   # [0, 5) Uhr Airport-Lokalzeit
 
 # FRA + MUC sind IMMER nachgefragt (Brief) — unabhängig vom Roster-Stand.
 ALWAYS_DEMAND = frozenset({'FRA', 'MUC'})
+# … und bekommen im Event-Fenster den 1-min-Takt (jeder Cron-Tick).
+HUB_1MIN = frozenset({'FRA', 'MUC'})
+
+# Quiet-Gate: Bewegungs-Fenster [now−back, now+fwd] Airport-LOKALZEIT.
+QUIET_BACK_MIN = 60
+QUIET_FWD_MIN = 120
+QUIET_RECHECK_MIN = 60       # Sicherheitsnetz: spätestens dann trotz quiet pollen
 
 # Cron-Jitter-Toleranz: der Cron feuert minütlich, aber nie sekundengenau.
 # Ohne Toleranz würde ein 3-min-Intervall bei 179.x s Abstand auf 4 min
-# rutschen — 30 s Toleranz hält die Matrix-Takte stabil.
+# rutschen — 30 s Toleranz hält die Matrix-Takte stabil. Für den 1-min-Takt
+# ist die Schwelle damit 60−30 = 30 s: jeder Minuten-Tick pollt (auch bei
+# 55-s-Jitter), aber zwei Aufrufe in derselben Minute (<30 s) doppel-pollen
+# NICHT.
 _JITTER_TOLERANCE_S = 30
 
 
@@ -71,12 +90,13 @@ def parse_iso_utc(s):
 
 # ── PURE Takt-Regeln ──────────────────────────────────────────────────────────
 
-def poll_interval_min(demanded, in_event_window, local_hour):
+def poll_interval_min(demanded, in_event_window, local_hour, is_hub=False):
     """PURE: Minuten-Intervall für einen Airport in diesem Tick.
     Präzedenz: Event-Fenster schlägt ALLES (auch Nacht — der nachgefragte Flug
-    findet ja gerade statt); Nacht übersteuert danach Demand/Default auf 30."""
+    findet ja gerade statt), Hubs (FRA/MUC) dann mit 1 min = jeder Cron-Tick;
+    Nacht übersteuert danach Demand/Default auf 30."""
     if in_event_window:
-        return TICK_EVENT_MIN
+        return TICK_HUB_EVENT_MIN if is_hub else TICK_EVENT_MIN
     if NIGHT_START_H <= local_hour < NIGHT_END_H:
         return TICK_NIGHT_MIN
     if demanded:
@@ -123,22 +143,31 @@ def demand_from_sectors(sectors, now_utc, horizon_min=DEMAND_HORIZON_MIN):
     return demanded, events
 
 
-def airports_due(airports, now_utc, demanded, events, last_poll, local_hour_of):
+def airports_due(airports, now_utc, demanded, events, last_poll, local_hour_of,
+                 quiet=frozenset()):
     """PURE (bis auf das injizierte `local_hour_of(iata) → 0..23`): welche
     Airports sind DIESEN Tick fällig? `last_poll` = dict[IATA → unix-ts des
-    letzten tatsächlichen Polls]; fehlender Eintrag (Restart) → sofort fällig."""
+    letzten tatsächlichen Polls]; fehlender Eintrag (Restart) → sofort fällig.
+    `quiet` = Airports ohne geplante Bewegung (Quiet-Gate) → komplett skippen;
+    Event-Fenster übersteuert das immer (Belt&Braces — Event-Airports landen
+    via exclude normalerweise gar nicht erst im quiet-Set)."""
     now_ts = now_utc.timestamp()
     due = []
     for ap in airports:
+        in_ev = in_event_window(now_utc, events.get(ap))
+        if ap in quiet and not in_ev:
+            continue
         is_demanded = ap in demanded or ap in ALWAYS_DEMAND
         try:
             lh = int(local_hour_of(ap))
         except Exception:
             lh = 12  # unbekannte TZ → konservativ „Tag" (nie fälschlich 30 min)
-        iv = poll_interval_min(is_demanded,
-                               in_event_window(now_utc, events.get(ap)), lh)
+        iv = poll_interval_min(is_demanded, in_ev, lh, is_hub=ap in HUB_1MIN)
         lp = last_poll.get(ap)
-        if lp is None or (now_ts - lp) >= iv * 60 - _JITTER_TOLERANCE_S:
+        # Floor auf die Jitter-Toleranz hält den 1-min-Takt robust: jeder
+        # ~60-s-Cron-Tick pollt, gleiche-Minute-Doppelaufrufe (<30 s) nicht.
+        threshold_s = max(iv * 60 - _JITTER_TOLERANCE_S, _JITTER_TOLERANCE_S)
+        if lp is None or (now_ts - lp) >= threshold_s:
             due.append(ap)
     return due
 
@@ -190,24 +219,121 @@ def get_demand(sb, now_utc):
     return _DEMAND_MEMO['demanded'], _DEMAND_MEMO['events']
 
 
+# ── Quiet-Gate: keine geplante Bewegung → Airport komplett skippen ────────────
+# Owner: „viele Airports machen zu — stundenlang muss nichts gescrapped werden."
+# Billigster Pfad: die EIGENEN airport_delay_obs-Scheds des Tages (dep-Seite +
+# '#ARR'-Seite) per limit(1)-Existenz-Query, gecacht im ~15-min-Memo pro
+# Airport — das Gate selbst erzeugt so praktisch keine Query-Last.
+
+_QUIET_TTL_S = 900        # ~15-min-Memo pro Airport (Probe-Ergebnis)
+_QUIET_MEMO = {}          # IATA → {'ts': unix, 'quiet': bool}
+_QUIET_SKIP_SINCE = {}    # IATA → unix-ts, seit wann das Gate durchgehend skippt
+
+
+def movement_window_segments(local_now, back_min=QUIET_BACK_MIN,
+                             fwd_min=QUIET_FWD_MIN):
+    """PURE: Bewegungs-Fenster [now−back, now+fwd] (naive Airport-LOKALZEIT,
+    gleiche Basis wie die sched-Strings der Boards) als (datum, von, bis)-
+    Segmente in 'HH:MM' — lexikographisch = chronologisch, also direkt als
+    gte/lte-Filter nutzbar. Kreuzt das Fenster Mitternacht → zwei Segmente."""
+    lo = local_now - timedelta(minutes=back_min)
+    hi = local_now + timedelta(minutes=fwd_min)
+    if lo.date() == hi.date():
+        return [(lo.date().isoformat(), lo.strftime('%H:%M'),
+                 hi.strftime('%H:%M'))]
+    return [(lo.date().isoformat(), lo.strftime('%H:%M'), '23:59'),
+            (hi.date().isoformat(), '00:00', hi.strftime('%H:%M'))]
+
+
+def roster_active_airports(events, now_utc, back_min=QUIET_BACK_MIN,
+                           fwd_min=QUIET_FWD_MIN):
+    """PURE: Airports mit Roster-Event (sched_dep/arr eines NACHGEFRAGTEN Flugs)
+    im Bewegungs-Fenster — die übersteuern das Quiet-Gate IMMER (Owner-Regel b)
+    und decken auch Flüge ab, die noch auf keinem Board stehen (Outstation)."""
+    back = timedelta(minutes=back_min)
+    fwd = timedelta(minutes=fwd_min)
+    return {ap for ap, ts in (events or {}).items()
+            if any(t is not None and (now_utc - back) <= t <= (now_utc + fwd)
+                   for t in ts)}
+
+
+def _probe_quiet(sb, ap, local_now):
+    """IMPURE: 1–3 winzige limit(1)-Queries gegen airport_delay_obs (dep- und
+    '#ARR'-Seite). True = quiet: es EXISTIEREN Rows des Tages (Airport ist
+    „warm"), aber KEINE sched im Bewegungs-Fenster. Kalt (gar keine Rows
+    heute) → False, sonst würde ein nie gescrapter Airport verhungern
+    (Henne-Ei: erst der Poll erzeugt die Rows, die das Gate liest)."""
+    keys = [ap, ap + '#ARR']
+    for d, lo, hi in movement_window_segments(local_now):
+        r = (sb.table('airport_delay_obs').select('sched')
+             .in_('airport', keys).eq('date', d)
+             .gte('sched', lo).lte('sched', hi).limit(1).execute())
+        if r.data:
+            return False  # geplante Bewegung im Fenster → nicht quiet
+    r = (sb.table('airport_delay_obs').select('sched')
+         .in_('airport', keys).eq('date', local_now.date().isoformat())
+         .limit(1).execute())
+    return bool(r.data)
+
+
+def get_quiet_airports(sb, airports, local_now_of, exclude=frozenset()):
+    """Quiet-Set dieses Ticks mit ~15-min-Memo pro Airport. sb=None → leeres
+    Set (ohne Datenquelle NIE skippen). `exclude` (Event-/Roster-aktive
+    Airports) wird gar nicht erst geprobed. Sicherheitsnetz gegen Fahrplan-
+    Lücken: nach 60 min durchgehendem Skip wird EIN Poll erlaubt (der
+    refresht die obs-Rows, die das Gate liest); rückt die nächste bekannte
+    Bewegung <2h heran, öffnet der 15-min-Re-Probe das Gate ohnehin früher."""
+    if sb is None:
+        return set()
+    quiet = set()
+    now_mono = time.time()
+    for ap in airports:
+        if ap in exclude:
+            _QUIET_SKIP_SINCE.pop(ap, None)
+            continue
+        memo = _QUIET_MEMO.get(ap)
+        if memo is None or now_mono - memo['ts'] >= _QUIET_TTL_S:
+            try:
+                q = _probe_quiet(sb, ap, local_now_of(ap))
+            except Exception:
+                q = False  # SB-Zicken/TZ-Fehler → nie fälschlich aushungern
+            memo = {'ts': now_mono, 'quiet': q}
+            _QUIET_MEMO[ap] = memo
+        if not memo['quiet']:
+            _QUIET_SKIP_SINCE.pop(ap, None)
+            continue
+        since = _QUIET_SKIP_SINCE.setdefault(ap, now_mono)
+        if now_mono - since >= QUIET_RECHECK_MIN * 60:
+            _QUIET_SKIP_SINCE[ap] = now_mono  # EIN Poll erlaubt, Zähler neu
+            continue
+        quiet.add(ap)
+    return quiet
+
+
 # ── Per-Airport last-poll (In-Process, ein Poll-Container — s. Kopfkommentar) ─
 
 _LAST_POLL = {}  # IATA → unix-ts des letzten Polls DIESES Prozesses
 
 
-def select_due_airports(airports, sb, local_hour_of, now_utc=None):
+def select_due_airports(airports, sb, local_now_of, now_utc=None):
     """Haupteinstieg für den Endpoint: fällige Airports dieses Ticks bestimmen
-    UND als gepollt markieren. Rückgabe (due, diag) — diag fürs Response-JSON."""
+    UND als gepollt markieren. `local_now_of(iata)` → naive Airport-Lokalzeit
+    als VOLLE datetime (Stunde für die Nacht-Regel, Datum+Zeit fürs Quiet-
+    Gate). Rückgabe (due, diag) — diag fürs Response-JSON."""
     now_utc = now_utc or datetime.now(timezone.utc)
     demanded, events = get_demand(sb, now_utc)
+    # Quiet-Gate: Event-/Roster-aktive Airports gar nicht erst proben.
+    active = roster_active_airports(events, now_utc)
+    quiet = get_quiet_airports(sb, airports, local_now_of, exclude=active)
     due = airports_due(airports, now_utc, demanded, events, _LAST_POLL,
-                       local_hour_of)
+                       lambda ap: local_now_of(ap).hour, quiet=quiet)
     ts = now_utc.timestamp()
     for ap in due:
         _LAST_POLL[ap] = ts
     diag = {
         'demanded': sorted(demanded),
         'event_airports': sorted(events.keys()),
+        'quiet': sorted(quiet),
         'due_count': len(due),
         'skipped_count': len(airports) - len(due),
     }
