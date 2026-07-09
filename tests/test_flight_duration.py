@@ -432,3 +432,31 @@ def test_merged_keeps_valid_same_instance_arrival():
         m = A._flight_obs_merged('LH1128', date=None, dep_iata='FRA',
                                  arr_iata='BCN', live=False, free_only=True)
     assert m is not None and m['has_arr'] is True
+
+
+# ─────────────────── resolve-callsign endpoint ───────────────────
+
+def test_resolve_callsign_returns_true_flight(client):
+    """GET /api/ax/resolve-callsign/OCN601 → echter Flug via FR24, permanent."""
+    import blueprints.aerox_data_blueprint as BP
+    fr = {'flight': '4Y60', 'callsign': 'OCN601', 'dep_iata': 'FRA',
+          'arr_iata': 'RSW', 'reg': 'DAIKO', 'aircraft': 'A333',
+          'sched_dep': '2026-07-09T12:00:00Z', 'sched_arr': None,
+          'duration_min': None, 'status': ''}
+    with patch.object(BP, '_fr24_flight_by_callsign', return_value=fr), \
+         patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
+        r = client.get('/api/ax/resolve-callsign/OCN601')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['ok'] and body['source'] == 'fr24'
+    assert body['flight']['flight'] == '4Y60'
+    assert body['flight']['arr_iata'] == 'RSW'
+    assert mcs.called
+
+
+def test_resolve_callsign_not_found(client):
+    import blueprints.aerox_data_blueprint as BP
+    with patch.object(BP, '_fr24_flight_by_callsign', return_value=None):
+        r = client.get('/api/ax/resolve-callsign/OCN999')
+    assert r.status_code == 200
+    assert r.get_json()['ok'] is False

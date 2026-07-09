@@ -28,7 +28,7 @@ def _reset_budget():
 
 
 _ICAO2IATA = {'EDDF': 'FRA', 'KJFK': 'JFK', 'KIAD': 'IAD', 'LEBL': 'BCN',
-              'EPWA': 'WAW', 'EKCH': 'CPH'}
+              'EPWA': 'WAW', 'EKCH': 'CPH', 'KRSW': 'RSW', 'EDDM': 'MUC'}
 
 
 def _summary(flight, orig, dest, tko, ldg, reg='D-AIHW', typ='A346',
@@ -179,6 +179,26 @@ def test_flights_by_airline_only_with_reg():
     # dedup per fr24_id/flight+takeoff, nur Legs MIT Reg
     assert len(legs) == 1 and legs[0]['flight_no'] == '4Y100'
     assert BP._budget_key_used(BP._fr24_budget_key()) >= 2   # >=1 Chunk gezählt
+
+
+def test_flight_by_callsign_resolves_true_flight():
+    """Funkname OCN601 → echter Flug 4Y60 FRA→RSW A333 D-AIKO (nicht das falsche
+    4Y601). callsigns-Filter, callsign im Ergebnis."""
+    resp = {'data': [_summary('4Y60', 'EDDF', 'KRSW', '2026-07-09T12:00:00Z',
+                              None, reg='D-AIKO', typ='A333', ended=False)]}
+    with patch.object(BP, '_fr24_token', return_value='tok'), \
+         patch.object(BP, '_icao_to_iata', side_effect=lambda c: _ICAO2IATA.get(c)), \
+         patch.object(BP, '_fr24_get', return_value=resp) as mget:
+        f = BP._fr24_flight_by_callsign('OCN601')
+    assert mget.call_args[0][1]['callsigns'] == 'OCN601'
+    assert f['flight'] == '4Y60' and f['dep_iata'] == 'FRA' and f['arr_iata'] == 'RSW'
+    assert f['reg'] == 'DAIKO' and f['aircraft'] == 'A333' and f['callsign'] == 'OCN601'
+
+
+def test_flight_by_callsign_none_when_no_data():
+    with patch.object(BP, '_fr24_token', return_value='tok'), \
+         patch.object(BP, '_fr24_get', return_value={'data': []}):
+        assert BP._fr24_flight_by_callsign('OCN999') is None
 
 
 def test_flights_by_airline_dedups_across_chunks():

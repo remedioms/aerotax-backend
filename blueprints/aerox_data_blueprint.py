@@ -1238,6 +1238,60 @@ def _fr24_flight_by_number(flight_no, date=None):
     return out
 
 
+def _fr24_flight_by_callsign(callsign, date=None):
+    """EIN Flug über FR24-flight-summary by CALLSIGN (ICAO, z.B. OCN601/DLH7AV) —
+    die WAHRHEIT für die tatsächlich fliegende Maschine (Owner 2026-07-09: bei
+    Discover ist die Callsign-Nummer ≠ IATA-Nummer, „4Y601" ≠ Callsign „OCN601"/
+    IATA „4Y60"; die App verwechselte den Flug). Der Funkname ist der eindeutige
+    Identifikator → hier holen wir Route/Reg/Typ/echte Flugnummer dazu. Gleiches
+    flight_status-Schema + Hard-Cache wie _fr24_flight_by_number."""
+    cs = (callsign or '').replace(' ', '').upper()
+    if len(cs) < 3:
+        return None
+    ck = 'CS|' + cs + '|' + (date or '')
+    hit = _FR24_REG_CACHE.get(ck)
+    if hit and (time.time() - hit[0]) < _FR24_REG_TTL:
+        return hit[1]
+    if not (_fr24_available() and _fr24_budget_ok()):
+        return None
+    if date:
+        dt_from, dt_to = date + 'T00:00:00', date + 'T23:59:59'
+    else:
+        now = time.time()
+        dt_from = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now - 36 * 3600))
+        dt_to = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now))
+    j = _fr24_get('/flight-summary/light',
+                  {'callsigns': cs, 'flight_datetime_from': dt_from,
+                   'flight_datetime_to': dt_to})
+    _data = (j or {}).get('data') or []
+    _budget_key_inc(_fr24_budget_key(), max(_FR24_SUMMARY_CREDITS, len(_data)))
+    legs = []
+    for f in _data:
+        leg = _fr24_summary_to_leg(f)
+        if leg and leg.get('src') and leg.get('dst'):
+            legs.append(leg)
+    legs.sort(key=lambda l: l.get('sched_dep') or '', reverse=True)
+    out = None
+    if legs:
+        l = legs[0]
+        out = {
+            'flight': l['flight_no'], 'callsign': cs, 'airline': '', 'airline_name': '',
+            'dep_iata': l['src'], 'dep_name': '', 'arr_iata': l['dst'], 'arr_name': '',
+            'sched_dep': l['sched_dep'], 'sched_arr': l['sched_arr'],
+            'est_dep': None, 'est_arr': None, 'duration_min': l['duration_min'],
+            'dep_gate': '', 'dep_terminal': '', 'arr_gate': '', 'arr_terminal': '',
+            'arr_baggage': '', 'status': l['status'] or '',
+            'status_category': (l['status'] or ''),
+            'aircraft': l['type'], 'reg': l['reg'],
+            'dep_delay_min': None, 'arr_delay_min': None,
+            'delay_min': None, 'delay_side': None, 'diverted': l.get('diverted'),
+        }
+    _FR24_REG_CACHE[ck] = (time.time(), out)
+    if len(_FR24_REG_CACHE) > 500:
+        _FR24_REG_CACHE.clear()
+    return out
+
+
 def _fr24_flights_by_airline(icao, days=2, chunk_hours=2, max_chunks=40):
     """ALLE Flüge EINER Airline (operating_as=ICAO) über flight-summary — für den
     Warehouse-Prewarm (Owner „alle von Discover ins Buch speichern"): einmal
@@ -2876,6 +2930,30 @@ def ax_fr24_prewarm():
     return jsonify({'ok': True, 'icao': icao, 'days': days,
                     'fetched': len(legs), 'imported': imported,
                     'credits_used': _budget_key_used(_fr24_budget_key()) - before})
+
+
+@aerox_data_bp.route('/api/ax/resolve-callsign/<callsign>', methods=['GET'])
+def ax_resolve_callsign(callsign):
+    """Funkname (ICAO-Callsign wie OCN601/DLH7AV) → TATSÄCHLICHER Flug (Route/Reg/
+    Typ/echte IATA-Nummer) über FR24 by-callsign — die eindeutige Wahrheit, wenn
+    die freie IATA-Nummer-Zuordnung unsicher/verwechselbar ist (Owner 2026-07-09:
+    „4Y601" ≠ Callsign „OCN601"). Löst zugleich „Suche DLH7AV → keine Treffer".
+    Ergebnis wird permanent ins Warehouse gespiegelt. Hart gecacht (Zero-Double-
+    Spend). {ok, callsign, flight, source}."""
+    cs = (callsign or '').strip().upper()
+    if len(cs) < 3:
+        return jsonify({'ok': False, 'error': 'bad_callsign'}), 400
+    flight = _fr24_flight_by_callsign(cs)
+    if flight:
+        cs_fn = _life_app('_crowdsource_flight_obs')
+        if cs_fn:
+            try:
+                cs_fn(flight, None, source='fr24')
+            except Exception:
+                pass
+        return jsonify({'ok': True, 'callsign': cs, 'flight': flight,
+                        'source': 'fr24'})
+    return jsonify({'ok': False, 'callsign': cs, 'error': 'not_found'}), 200
 
 
 @aerox_data_bp.route('/api/ax/harvest-routes', methods=['POST'])
