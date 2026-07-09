@@ -1094,6 +1094,17 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
             _fix = _flying_live_fix(today_chain, active_datum,
                                     day_fns.get(active_datum),
                                     legs_live_cached)
+            # FLIGHTSTATE-Gate (Kill-Switch FLIGHTSTATE_LIVE_FAMILY=1): nur eine
+            # WIRKLICH fliegende Position an die Family — Taxi/Boden ⇒ kein
+            # Geister-Dot. Zweite Sicherung auf Projektions-Ebene, konsistent mit
+            # der Engine (is_airborne_kinematic: alt>1000 ODER gs>=80).
+            if _fix and os.environ.get('FLIGHTSTATE_LIVE_FAMILY', '') in ('1', 'true', 'yes'):
+                try:
+                    from blueprints.flight_state import is_airborne_kinematic as _fs_air
+                    if not _fs_air({'gs_kt': _fix.get('speed_kt'), 'alt_ft': _fix.get('alt')}):
+                        _fix = None
+                except Exception:
+                    pass
             if _fix:
                 status['live_lat'] = _fix['lat']
                 status['live_lon'] = _fix['lon']

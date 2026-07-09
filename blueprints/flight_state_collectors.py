@@ -177,6 +177,25 @@ def obs_from_adsb(live: dict, route=None, now: Optional[float] = None) -> list:
     return out
 
 
+def obs_from_pos(pos: dict, source: str, now: Optional[float] = None,
+                 position_source: Optional[int] = None) -> list:
+    """Map a generic position dict (lat/lon/track/gs/alt/on_ground/seen_ts, as
+    returned by _machine_live or _aircraft_live_pos) into a position Observation.
+    `source` is the engine source tag ('adsb' | 'aircraft_live' | 'fr24_bulk').
+    position_source defaults to 0 for adsb (real ADS-B) else 3."""
+    if not pos:
+        return []
+    now = now or time.time()
+    ts = _iso_or_epoch(pos.get("seen_ts") or pos.get("obs_ts")) or now
+    psrc = position_source if position_source is not None else (0 if source == "adsb" else 3)
+    return [Observation("position", {
+        "lat": pos.get("lat"), "lon": pos.get("lon"), "track": pos.get("track"),
+        "gs_kt": pos.get("gs") if pos.get("gs") is not None else pos.get("gs_kt"),
+        "alt_ft": pos.get("alt") if pos.get("alt") is not None else pos.get("alt_ft"),
+        "on_ground_raw": pos.get("on_ground"), "position_source": psrc,
+    }, source, ts)]
+
+
 def obs_absent(source: str, kind: str = "position") -> Observation:
     """The collector ran and there is genuinely nothing (e.g. ADS-B over Siberia).
     A legitimate miss — lets precedence fall through, unlike `unavailable`."""

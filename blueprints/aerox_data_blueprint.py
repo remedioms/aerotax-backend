@@ -3878,6 +3878,36 @@ def ax_flight_live(token):
         'progress': (_progress_along_route(dep, dest, pos) if in_flight else None),
         'source': (route.get('source') if route else None),
     }
+    # FLIGHTSTATE-Engine (Kill-Switch FLIGHTSTATE_LIVE_FLIGHT=1): die Engine
+    # entscheidet live/in_flight/progress (Taxi ⇒ live=None ⇒ kein Geist) und
+    # liefert die ehrliche Phase. Reuse von merged + pos (kein Extra-Read).
+    try:
+        if os.environ.get('FLIGHTSTATE_LIVE_FLIGHT', '') in ('1', 'true', 'yes'):
+            from blueprints.flight_state_collectors import (
+                build_keys as _fs_bk, obs_from_board_merged as _fs_obm,
+                obs_from_pos as _fs_op)
+            from blueprints.flight_state import (
+                resolve_flight_state as _fs_resolve, project_flight_live as _fs_proj)
+            _to_utc = _life_app('_board_local_to_utc_iso')
+            _fs_keys = _fs_bk(
+                flight_no, date, dep, dest, roster_tail=reg, callsign=cs,
+                sched_dep_iso=(_to_utc(merged.get('sched_dep'), dep) if _to_utc else None),
+                sched_arr_iso=(_to_utc(merged.get('sched_arr'), dest) if (_to_utc and dest) else None),
+                dep_ll=_iata_latlon(dep or ''), arr_ll=_iata_latlon(dest or ''))
+            _fs_obs = _fs_obm(merged, _fs_keys, board_to_iso=_to_utc)
+            if pos:
+                _fs_obs += _fs_op(pos, (pos.get('source') or 'adsb'))
+            _fs = _fs_resolve(_fs_keys, _fs_obs)
+            _pl = _fs_proj(_fs)
+            payload['live'] = _pl['live']
+            payload['in_flight'] = _pl['in_flight']
+            payload['progress'] = _fs['progress']
+            payload['phase'] = _fs['phase']
+            payload['phase_conf'] = _fs['phase_conf']
+            payload['eta_iso'] = _fs['times']['eta_iso']
+            payload['eta_conf'] = _fs['times']['eta_conf']
+    except Exception:
+        pass
     return jsonify(_memo_put(mkey, payload))
 
 
@@ -3949,6 +3979,25 @@ def ax_my_flight_status(token):
                         else None),
         'on_time': _derive_on_time(delay_known, delay_min, cancelled),
     }
+    # FLIGHTSTATE-Engine (Kill-Switch FLIGHTSTATE_LIVE_MYSTATUS=1): ehrliche Phase
+    # aus dem Board (kein Positions-Feed hier) — additiv, Legacy-Felder unberührt.
+    try:
+        if os.environ.get('FLIGHTSTATE_LIVE_MYSTATUS', '') in ('1', 'true', 'yes'):
+            from blueprints.flight_state_collectors import (
+                build_keys as _fs_bk, obs_from_board_merged as _fs_obm)
+            from blueprints.flight_state import resolve_flight_state as _fs_resolve
+            _fs_keys = _fs_bk(
+                flight_no, date, dep_iata, arr_iata, roster_tail=m.get('reg'),
+                sched_dep_iso=(to_utc(m.get('sched_dep'), dep_iata) if to_utc else None),
+                sched_arr_iso=(to_utc(m.get('sched_arr'), arr_iata) if (to_utc and arr_iata) else None),
+                dep_ll=_iata_latlon(dep_iata or ''), arr_ll=_iata_latlon(arr_iata or ''))
+            _fs = _fs_resolve(_fs_keys, _fs_obm(m, _fs_keys, board_to_iso=to_utc))
+            payload['phase'] = _fs['phase']
+            payload['phase_conf'] = _fs['phase_conf']
+            payload['eta_iso'] = _fs['times']['eta_iso']
+            payload['eta_conf'] = _fs['times']['eta_conf']
+    except Exception:
+        pass
     return jsonify(_memo_put(mkey, payload))
 
 
