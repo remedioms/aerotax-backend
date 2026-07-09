@@ -3384,10 +3384,33 @@ def ax_flight_detail(query):
         dest = _pick((resolve_flight or {}).get('arr_iata'), (info or {}).get('dest'))
         reg = _pick((resolve_flight or {}).get('reg'), (info or {}).get('reg'))
 
-        f_route = ex.submit(_route_call, cs_for_route) if cs_for_route else None
+        # ROUTE lokal anreichern statt erneut auflösen (Owner 2026-07-09 „Detail 13s":
+        # resolve/aircraft_live trägt die Strecke SCHON — flight-route re-resolvte sie
+        # via FR24-gRPC nochmal = 5s, wenn der Callsign aus aircraft_live gefallen ist.
+        # Airport-Details kommen aus der lokalen Referenz-DB (0ms). flight-route bleibt
+        # NUR Fallback, falls resolve/info gar keine Strecke lieferte.
+        route = None
+        if origin and dest:
+            def _ap(code):
+                r = _airport_row(code) or {}
+                return {'iata': r.get('iata') or code, 'icao': r.get('icao'),
+                        'name': r.get('name'), 'city': r.get('city'),
+                        'country': r.get('country'),
+                        'lat': r.get('lat'), 'lon': r.get('lon')}
+            _air = (_airline_row((real_cs or cs_for_route or '')[:3])
+                    or _airline_row((real_cs or fn_iata or '')[:2]) or {})
+            route = {'ok': True, 'found': True, 'callsign': real_cs,
+                     'flight_iata': fn_iata, 'flight_icao': real_cs,
+                     'airline': _air.get('name'), 'airline_iata': _air.get('iata'),
+                     'airline_icao': _air.get('icao'),
+                     'origin': _ap(origin), 'destination': _ap(dest)}
+
+        f_route = (ex.submit(_route_call, cs_for_route)
+                   if (route is None and cs_for_route) else None)
         f_hist = ex.submit(_history_call, origin, dest) if (origin and dest) else None
         f_photo = ex.submit(_photo_call, reg) if reg else None
-        route = f_route.result() if f_route else None
+        if f_route is not None:
+            route = f_route.result()
         history = f_hist.result() if f_hist else None
         photo = f_photo.result() if f_photo else None
 
