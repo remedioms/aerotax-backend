@@ -1030,6 +1030,213 @@ def _budget_key_inc(key, units=1):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  FR24 OFFICIAL API (bezahlt) — LETZTER Fallback hinter Warehouse/Boards/gRPC.
+#  Owner-Direktive 2026-07-09: freies Scraping bleibt Hauptquelle; die bezahlte
+#  API NUR für Lücken, und JEDER Credit wird permanent gespeichert (via
+#  _crowdsource_flight_obs ins Warehouse → derselbe Flug kommt nächstes Mal GRATIS).
+#  Kosten (gemessen): flight-summary/light = günstig (~2 Credits); live/flight-
+#  positions = TEUER (~120 pro Box) → wird hier NICHT für die Karte benutzt.
+#  Harter Tages-Credit-Deckel FR24_DAILY_CREDIT_CAP schützt vor Ausreißern.
+# ─────────────────────────────────────────────────────────────────────────────
+_FR24_BASE = 'https://fr24api.flightradar24.com/api'
+_FR24_SUMMARY_CREDITS = 2          # flight-summary/light Basiskosten pro Call
+
+
+def _fr24_token():
+    return (os.environ.get('FR24_API_TOKEN') or '').strip()
+
+
+def _fr24_available():
+    return bool(_fr24_token())
+
+
+def _fr24_budget_key():
+    return 'fr24:' + time.strftime('%Y%m%d', time.gmtime())
+
+
+def _fr24_budget_ok():
+    """True solange heute noch FR24-Credit-Kontingent frei ist (Default 8000/Tag
+    ≈ 240k/Monat, unter dem Essential-333k-Plan)."""
+    try:
+        cap = int(os.environ.get('FR24_DAILY_CREDIT_CAP', '8000'))
+    except Exception:
+        cap = 8000
+    return _budget_key_used(_fr24_budget_key()) < cap
+
+
+def _fr24_get(path, params):
+    """Ein GET gegen die FR24-API (Bearer-Token, Accept-Version v1). None bei
+    fehlendem Token / non-200 / Fehler — Caller degradiert ehrlich. Wirft nie."""
+    tok = _fr24_token()
+    if not tok:
+        return None
+    try:
+        import requests
+    except Exception:
+        return None
+    try:
+        r = requests.get(_FR24_BASE + path, params=params,
+                         headers={'Authorization': 'Bearer ' + tok,
+                                  'Accept': 'application/json',
+                                  'Accept-Version': 'v1'},
+                         timeout=12)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def _fr24_hyphenate_reg(reg):
+    """Warehouse-Tail (evtl. ohne Bindestrich, z.B. 'DAINV') → FR24-Schreibweise
+    'D-AINV'. Hat der Input schon einen Bindestrich, unverändert lassen. Best-
+    effort: Einzelbuchstaben-Präfix (D/G/F/…) bekommt den Bindestrich nach dem 1.
+    Zeichen; 2-Buchstaben-Länder (HB-, 9H-) sind selten in der LH-Group-Crew-
+    Nutzung und fallen sonst auf den Roh-String zurück."""
+    r = (reg or '').strip().upper()
+    if not r:
+        return None
+    if '-' in r:
+        return r
+    if len(r) >= 3 and r[0].isalpha():
+        return r[0] + '-' + r[1:]
+    return r
+
+
+def _fr24_summary_to_leg(f):
+    """FR24 flight-summary/light-Record → Leg-/Karten-Dict im Warehouse-Schema
+    (kompatibel mit tail-history-Legs UND _crowdsource_flight_obs). ICAO→IATA;
+    Ist-Ab/-Ankunft (datetime_takeoff/landed, absolut-UTC) als sched_dep/sched_arr;
+    Dauer via _sched_block_min. dest_icao_actual = echtes (evtl. umgeleitetes) Ziel."""
+    if not isinstance(f, dict):
+        return None
+    src = _icao_to_iata((f.get('orig_icao') or '').upper())
+    dst_icao = (f.get('dest_icao_actual') or f.get('dest_icao') or '').upper()
+    dst = _icao_to_iata(dst_icao)
+    tko = f.get('datetime_takeoff') or None
+    ldg = f.get('datetime_landed') or None
+    sbm = _life_app('_sched_block_min')
+    dur = None
+    if sbm and tko and ldg and src and dst:
+        try:
+            dur = sbm(tko, src, ldg, dst)
+        except Exception:
+            dur = None
+    reg = re.sub(r'[^A-Z0-9]', '', (f.get('reg') or '').upper()) or None
+    diverted = bool(f.get('dest_icao_actual')
+                    and f.get('dest_icao_actual') != f.get('dest_icao'))
+    return {
+        'flight_no': f.get('flight'), 'flight': f.get('flight'),
+        'src': src, 'dst': dst, 'dep_iata': src, 'arr_iata': dst,
+        'day': (tko or '')[:10] or None,
+        'sched_dep': tko, 'sched_arr': ldg, 'duration_min': dur,
+        'status': ('landed' if f.get('flight_ended') in (True, 'true') else None),
+        'reg': reg, 'type': f.get('type'), 'aircraft': f.get('type'),
+        'diverted': diverted, 'source': 'fr24',
+    }
+
+
+_FR24_REG_CACHE = {}               # reg → (ts, legs) — Zero-Double-Spend-Schutz
+_FR24_REG_TTL = 6 * 3600.0         # Tail-Historie ändert sich langsam → 6 h
+
+
+def _fr24_flights_by_reg(reg, days=7, limit=12):
+    """Letzte Legs EINER Maschine über die FR24-flight-summary (by registration).
+    Bezahlter LETZTER Fallback für die Kennzeichen-Historie, wenn das Warehouse
+    die Maschine nie gesehen hat (z.B. D-AIXS). Budget-gated; leere Liste bei
+    kein-Token/Budget-aus/kein-Treffer. Credits werden nach dem Call gezählt.
+
+    HARD-CACHE (Owner „alles was ein Credit kostet, hart speichern"): dasselbe
+    Kennzeichen kostet innerhalb von 6 h nur EINMAL Credits — jeder weitere
+    Lookup (auch von anderen Usern) kommt aus dem Cache."""
+    reg_q = _fr24_hyphenate_reg(reg)
+    if not reg_q or len(reg_q.replace('-', '')) < 3:
+        return []
+    ck = reg_q + '|' + str(days) + '|' + str(limit)
+    hit = _FR24_REG_CACHE.get(ck)
+    if hit and (time.time() - hit[0]) < _FR24_REG_TTL:
+        return list(hit[1])
+    if not (_fr24_available() and _fr24_budget_ok()):
+        return []
+    now = time.time()
+    j = _fr24_get('/flight-summary/light', {
+        'registrations': reg_q,
+        'flight_datetime_from': time.strftime('%Y-%m-%dT%H:%M:%S',
+                                              time.gmtime(now - days * 86400)),
+        'flight_datetime_to': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now)),
+    })
+    _fr24_budget_inc = _budget_key_inc     # lokaler Alias
+    _fr24_budget_inc(_fr24_budget_key(), _FR24_SUMMARY_CREDITS)
+    data = (j or {}).get('data') or []
+    legs = []
+    for f in data:
+        leg = _fr24_summary_to_leg(f)
+        if leg and leg.get('flight_no') and leg.get('src') and leg.get('dst'):
+            legs.append(leg)
+    legs.sort(key=lambda l: l.get('sched_dep') or '', reverse=True)
+    out = legs[:limit]
+    # Negativ-Cache inklusive: auch ein leeres Ergebnis wird gecacht (der Call
+    # kostete trotzdem) → keine Wiederholung für dieselbe Maschine.
+    _FR24_REG_CACHE[ck] = (time.time(), list(out))
+    if len(_FR24_REG_CACHE) > 500:
+        _FR24_REG_CACHE.clear()
+    return out
+
+
+def _fr24_flight_by_number(flight_no, date=None):
+    """EIN Flug (Route/Typ/Reg/Ist-Zeiten) über FR24-flight-summary by number —
+    bezahlter Fallback für flight_status, wenn frei (Warehouse/Boards/gRPC) nichts
+    hat. Nimmt den jüngsten Treffer im Fenster (heute bzw. ±36 h). Liefert ein
+    Dict im flight_status-Schema oder None. Hart gecacht (Zero-Double-Spend);
+    Credits nach dem Call gezählt. KEIN Gate/Sollzeit (die kennt flight-summary
+    nicht — dafür bleiben Board/Warehouse zuständig)."""
+    fn = (flight_no or '').replace(' ', '').upper()
+    if len(fn) < 3:
+        return None
+    ck = 'FN|' + fn + '|' + (date or '')
+    hit = _FR24_REG_CACHE.get(ck)
+    if hit and (time.time() - hit[0]) < _FR24_REG_TTL:
+        return hit[1]
+    if not (_fr24_available() and _fr24_budget_ok()):
+        return None
+    if date:
+        dt_from, dt_to = date + 'T00:00:00', date + 'T23:59:59'
+    else:
+        now = time.time()
+        dt_from = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now - 36 * 3600))
+        dt_to = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now))
+    j = _fr24_get('/flight-summary/light',
+                  {'flights': fn, 'flight_datetime_from': dt_from,
+                   'flight_datetime_to': dt_to})
+    _budget_key_inc(_fr24_budget_key(), _FR24_SUMMARY_CREDITS)
+    legs = []
+    for f in ((j or {}).get('data') or []):
+        leg = _fr24_summary_to_leg(f)
+        if leg and leg.get('src') and leg.get('dst'):
+            legs.append(leg)
+    legs.sort(key=lambda l: l.get('sched_dep') or '', reverse=True)
+    out = None
+    if legs:
+        l = legs[0]
+        out = {
+            'flight': l['flight_no'], 'airline': '', 'airline_name': '',
+            'dep_iata': l['src'], 'dep_name': '', 'arr_iata': l['dst'], 'arr_name': '',
+            'sched_dep': l['sched_dep'], 'sched_arr': l['sched_arr'],
+            'est_dep': None, 'est_arr': None, 'duration_min': l['duration_min'],
+            'dep_gate': '', 'dep_terminal': '', 'arr_gate': '', 'arr_terminal': '',
+            'arr_baggage': '', 'status': l['status'] or '',
+            'status_category': (l['status'] or ''),
+            'aircraft': l['type'], 'reg': l['reg'],
+            'dep_delay_min': None, 'arr_delay_min': None,
+            'delay_min': None, 'delay_side': None, 'diverted': l.get('diverted'),
+        }
+    _FR24_REG_CACHE[ck] = (time.time(), out)
+    if len(_FR24_REG_CACHE) > 500:
+        _FR24_REG_CACHE.clear()
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  SELF-COMPUTED ROUTES FROM OWN POLLED ADS-B  —  the long-term FREE data engine
 #
 #  Wir pollen ohnehin Live-Positionen (adsb.lol via /api/adsb/area, OpenSky-bbox
@@ -2554,8 +2761,33 @@ def ax_tail_history():
                     break
         except Exception:
             pass
+    source = 'warehouse'
+    # ── LETZTER Fallback (bezahlt, budget-gated, hart gecacht): kennt das
+    #    Warehouse die Maschine NICHT (z.B. D-AIXS nie getafelt), die FR24-API
+    #    by-registration fragen. Die Treffer werden PERMANENT ins Warehouse
+    #    geschrieben (_crowdsource_flight_obs) → derselbe Flug kommt für alle
+    #    anderen Endpoints (flight_status/route-history) nächstes Mal GRATIS. ──
+    if not legs and reg and _fr24_available() and _fr24_budget_ok():
+        try:
+            fr = _fr24_flights_by_reg(reg, days=10, limit=10)
+        except Exception:
+            fr = []
+        if fr:
+            legs = [{'flight_no': l.get('flight_no'), 'src': l.get('src'),
+                     'dst': l.get('dst'), 'day': l.get('day'),
+                     'sched_dep': l.get('sched_dep'), 'sched_arr': l.get('sched_arr'),
+                     'duration_min': l.get('duration_min'), 'status': l.get('status')}
+                    for l in fr]
+            source = 'fr24'
+            cs = _life_app('_crowdsource_flight_obs')
+            if cs:
+                for l in fr:
+                    try:
+                        cs(l, l.get('day'), source='fr24')
+                    except Exception:
+                        pass
     return jsonify({'ok': True, 'reg': reg or None, 'hex': hexid or None,
-                    'count': len(legs), 'legs': legs, 'source': 'warehouse'})
+                    'count': len(legs), 'legs': legs, 'source': source})
 
 
 @aerox_data_bp.route('/api/ax/harvest-routes', methods=['POST'])

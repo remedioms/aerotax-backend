@@ -29839,23 +29839,23 @@ def flight_status(token):
     if merged:
         return jsonify({'ok': True, 'number': number, 'flight': merged,
                         'source': 'aerox_obs_merged'})
-    # ── BEZAHLT (letzter Notnagel): AeroDataBox NUR mit Key UND Tages-Budget.
-    #    Den teuer aufgelösten Flug (Route+Tail) spiegeln wir ins Warehouse →
-    #    derselbe Flug/Tag kommt beim nächsten Lookup GRATIS aus airport_delay_obs. ──
-    from blueprints.aerox_data_blueprint import _paid_budget_ok, _paid_budget_inc
-    if _os.environ.get('AERODATABOX_KEY') and _paid_budget_ok():
-        flight = _aerodatabox_flight_by_number(number, date_iso)
-        try:
-            _paid_budget_inc(units=2)   # AeroDataBox flight endpoint = Tier 2 (2 Units)
-        except Exception:
-            pass
+    # ── BEZAHLT (letzter Notnagel): FR24 flight-summary NUR mit Token UND Budget.
+    #    AeroDataBox gestrichen (Owner 2026-07-09 „forget aerodatabox" — der Key
+    #    war eh 403 tot). Den aufgelösten Flug (Route+Tail+Typ+Ist-Zeiten) spiegeln
+    #    wir ins Warehouse → derselbe Flug kommt beim nächsten Lookup GRATIS.
+    #    FR24 flight-summary ≈ 2 Credits, hart gecacht (Zero-Double-Spend). Gate/
+    #    Soll-Zeiten kennt flight-summary nicht — dafür bleiben Board/Warehouse. ──
+    from blueprints.aerox_data_blueprint import (_fr24_available,
+                                                 _fr24_flight_by_number)
+    if _fr24_available():
+        flight = _fr24_flight_by_number(number, date_iso)
         if flight:
             try:
-                _crowdsource_flight_obs(flight, date_iso, source='aerodatabox')
+                _crowdsource_flight_obs(flight, date_iso, source='fr24')
             except Exception:
                 pass
             return jsonify({'ok': True, 'number': number, 'flight': flight,
-                            'source': 'aerodatabox'})
+                            'source': 'fr24'})
     return jsonify({'ok': False, 'error': 'not_found', 'number': number,
                     'message': ('Für ' + number + ' liegt aktuell kein '
                                 'Flugplan vor.')}), 200

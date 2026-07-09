@@ -270,3 +270,84 @@ def test_tail_history_no_arr_no_duration(client):
     legs = r.get_json()['legs']
     assert legs and legs[0]['sched_arr'] is None
     assert legs[0]['duration_min'] is None
+
+
+def test_tail_history_fr24_fallback_when_warehouse_empty(client):
+    """Warehouse leer (D-AIXS nie getafelt) → FR24-by-registration Fallback,
+    Ergebnis mit source='fr24' UND permanent gespeichert (_crowdsource_flight_obs)."""
+    import blueprints.aerox_data_blueprint as BP
+    fr_legs = [{
+        'flight_no': 'LH416', 'src': 'FRA', 'dst': 'IAD', 'day': '2026-07-06',
+        'sched_dep': '2026-07-06T09:30:00Z', 'sched_arr': '2026-07-06T17:30:00Z',
+        'duration_min': 480, 'status': 'landed', 'reg': 'DAIHW', 'type': 'A346',
+        'dep_iata': 'FRA', 'arr_iata': 'IAD', 'aircraft': 'A346',
+    }]
+    with patch.object(BP, '_sb', return_value=_fake_flights_sb([])), \
+         patch.object(BP, '_fr24_available', return_value=True), \
+         patch.object(BP, '_fr24_budget_ok', return_value=True), \
+         patch.object(BP, '_fr24_flights_by_reg', return_value=fr_legs), \
+         patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
+        r = client.get('/api/ax/tail-history?reg=D-AIXS')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['source'] == 'fr24'
+    assert body['legs'][0]['flight_no'] == 'LH416'
+    assert body['legs'][0]['duration_min'] == 480
+    assert mcs.called            # permanent ins Warehouse geschrieben
+
+
+def test_tail_history_no_fr24_when_warehouse_has_data(client):
+    """Hat das Warehouse Legs, wird FR24 NICHT angefasst (free-first)."""
+    import blueprints.aerox_data_blueprint as BP
+    rows = [{'op_flight_no': 'LH1128', 'origin': 'FRA', 'destination': 'BCN',
+             'service_date': '2026-07-08', 'sched_dep': '2026-07-08T12:45:00+00:00',
+             'sched_arr': '2026-07-08T14:50:00+00:00', 'est_dep': None,
+             'est_arr': None, 'status': 'landed', 'tail': 'DAINV', 'hex': 'x'}]
+    with patch.object(BP, '_sb', return_value=_fake_flights_sb(rows)), \
+         patch.object(BP, '_fr24_flights_by_reg') as mfr:
+        r = client.get('/api/ax/tail-history?reg=D-AINV')
+    assert r.status_code == 200
+    assert r.get_json()['source'] == 'warehouse'
+    mfr.assert_not_called()
+
+
+# ─────────────────── flight_status FR24 paid fallback ───────────────────
+
+def test_flight_status_fr24_fallback_when_free_empty(client):
+    """Freie Quellen leer (LH714 nicht getafelt) → FR24 flight-summary Fallback,
+    source='fr24', Ergebnis permanent gespeichert."""
+    import blueprints.aerox_data_blueprint as BP
+    fr = {
+        'flight': 'LH714', 'airline': '', 'airline_name': '',
+        'dep_iata': 'MUC', 'dep_name': '', 'arr_iata': 'HND', 'arr_name': '',
+        'sched_dep': '2026-07-09T14:00:00Z', 'sched_arr': '2026-07-10T09:00:00Z',
+        'est_dep': None, 'est_arr': None, 'duration_min': 600,
+        'dep_gate': '', 'dep_terminal': '', 'arr_gate': '', 'arr_terminal': '',
+        'arr_baggage': '', 'status': 'landed', 'status_category': 'landed',
+        'aircraft': 'A359', 'reg': 'DAIXS', 'dep_delay_min': None,
+        'arr_delay_min': None, 'delay_min': None, 'delay_side': None,
+    }
+    with patch.object(A, '_validate_token_exists', return_value='u1'), \
+         patch.object(A, '_flight_obs_merged', return_value=None), \
+         patch.object(BP, '_fr24_available', return_value=True), \
+         patch.object(BP, '_fr24_flight_by_number', return_value=fr), \
+         patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
+        r = client.get('/api/flight/AT-FR24/status?number=LH714')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body.get('source') == 'fr24'
+    assert body['flight']['arr_iata'] == 'HND'
+    assert body['flight']['duration_min'] == 600
+    assert mcs.called
+
+
+def test_flight_status_no_fr24_when_free_has_data(client):
+    """Freie Merge liefert etwas → FR24 wird NICHT angefasst (free-first)."""
+    import blueprints.aerox_data_blueprint as BP
+    with patch.object(A, '_validate_token_exists', return_value='u1'), \
+         patch.object(A, '_flight_obs_merged', return_value=_merged_record()), \
+         patch.object(BP, '_fr24_flight_by_number') as mfr:
+        r = client.get('/api/flight/AT-FR24/status?number=LH1128')
+    assert r.status_code == 200
+    assert r.get_json().get('source') == 'aerox_obs_merged'
+    mfr.assert_not_called()
