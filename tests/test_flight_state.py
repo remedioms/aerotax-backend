@@ -286,6 +286,62 @@ def test_stale_landed_not_reflown_by_soft_signal():
     assert fs["phase"] == ARRIVED  # stays terminal
 
 
+# ─────────────────────────── FIND vs SIMULATE ──────────────────────────────
+
+def test_prefers_real_fresh_fix_over_stale_snapshot():
+    """When the flight IS findable live, show the REAL fresh fix — never simulate."""
+    fs = resolve_flight_state(
+        keys={"flight": "LH716", "date": "2026-07-09", "dep_iata": "FRA", "arr_iata": "HND",
+              "dep_ll": FRA, "arr_ll": HND, "sched_dep_ts": NOW - 5 * 3600},
+        observations=[
+            Observation("position", {"lat": 50.5, "lon": 12.0, "track": 90, "gs_kt": 470,
+                                     "alt_ft": 36000, "position_source": 0}, "adsb", NOW - 30),
+            Observation("position", {"lat": SIBERIA[0], "lon": SIBERIA[1], "track": 90,
+                                     "gs_kt": 470, "alt_ft": 37000, "position_source": 3},
+                        "aircraft_live", NOW - 2400),  # stale snapshot
+        ], now=NOW)
+    assert fs["phase"] == AIRBORNE
+    assert fs["live"]["source"] == "adsb"
+    assert fs["live"]["conf"] == OBSERVED           # real, not simulated
+    assert fs["live"]["lat"] == 50.5                # the real fix, not the stale one
+
+
+def test_simulate_forward_only_when_lost():
+    """Flight fell off live coverage (only a stale snapshot): fly it FORWARD along
+    its own track + estimate time-to-landing, flagged simulated."""
+    last = {"lat": SIBERIA[0], "lon": SIBERIA[1], "track": 90, "gs_kt": 470,
+            "alt_ft": 37000, "position_source": 3}
+    fs = resolve_flight_state(
+        keys={"flight": "LH716", "date": "2026-07-09", "dep_iata": "FRA", "arr_iata": "HND",
+              "dep_ll": FRA, "arr_ll": HND, "sched_dep_ts": NOW - 5 * 3600},
+        observations=[
+            Observation("position", last, "aircraft_live", NOW - 2400),  # stale (>35min, <45min)
+        ], now=NOW)
+    assert fs["phase"] == AIRBORNE
+    assert fs["live"] is not None
+    assert fs["live"]["conf"] == SIMULATED
+    # position was flown FORWARD along track 90 (east) -> lon increased past the last fix
+    assert fs["live"]["lon"] > SIBERIA[1]
+    assert fs["live"]["stale_since"] is not None
+    # a time-to-landing estimate exists, flagged simulated
+    assert fs["times"]["eta_iso"] is not None
+    assert fs["times"]["eta_conf"] == SIMULATED
+
+
+def test_too_long_gone_no_ghost_dot():
+    """Gone longer than the sim horizon (>45 min) -> no live dot (honest offline),
+    never an indefinite phantom."""
+    fs = resolve_flight_state(
+        keys={"flight": "LH716", "date": "2026-07-09", "dep_iata": "FRA", "arr_iata": "HND",
+              "dep_ll": FRA, "arr_ll": HND, "sched_dep_ts": NOW - 6 * 3600},
+        observations=[
+            Observation("position", {"lat": SIBERIA[0], "lon": SIBERIA[1], "track": 90,
+                                     "gs_kt": 470, "alt_ft": 37000, "position_source": 3},
+                        "aircraft_live", NOW - 3000),  # 50 min > SIM horizon
+        ], now=NOW)
+    assert fs["live"] is None
+
+
 # ─────────────────────────── PROJECTIONS CONSISTENCY ───────────────────────
 
 def test_projections_agree_on_shared_truth():

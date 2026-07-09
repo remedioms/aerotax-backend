@@ -173,6 +173,47 @@ def _gc_km(a_lat, a_lon, b_lat, b_lon):
     return 2 * r * math.asin(math.sqrt(h))
 
 
+def _advance_along_track(lat, lon, track_deg, dist_km):
+    """Move a point dist_km along a constant heading (great-circle step). We follow
+    the aircraft's OWN last track — not a fresh great-circle to the destination —
+    so the simulation continues the real trajectory (e.g. the southern route around
+    Russia) instead of snapping onto a forbidden-airspace shortcut."""
+    R = 6371.0
+    brng = math.radians(track_deg)
+    d = dist_km / R
+    lat1, lon1 = math.radians(lat), math.radians(lon)
+    lat2 = math.asin(math.sin(lat1) * math.cos(d)
+                     + math.cos(lat1) * math.sin(d) * math.cos(brng))
+    lon2 = lon1 + math.atan2(math.sin(brng) * math.sin(d) * math.cos(lat1),
+                             math.cos(d) - math.sin(lat1) * math.sin(lat2))
+    return math.degrees(lat2), math.degrees(lon2)
+
+
+def _simulate_forward(pos, last_ts, arr_ll, now):
+    """Flight fell off live coverage: fly its LAST known fix forward along its own
+    track by gs x elapsed, and estimate time-to-landing. Returns (projected_pos,
+    eta_iso) or None if we can't (no gs/track). Never overshoots the destination.
+    This is the ONLY place the engine invents a position — and only when the real
+    flight can no longer be found (the caller gates on staleness)."""
+    gs = _num(pos.get("gs_kt"))
+    track = _num(pos.get("track"))
+    if not (gs and gs > 80 and track is not None
+            and pos.get("lat") is not None and pos.get("lon") is not None):
+        return None
+    elapsed_h = max(0.0, (now - (last_ts or now)) / 3600.0)
+    dist_km = gs * 1.852 * elapsed_h
+    if arr_ll and None not in arr_ll:
+        dist_km = min(dist_km, _gc_km(pos["lat"], pos["lon"], arr_ll[0], arr_ll[1]))
+    nlat, nlon = _advance_along_track(pos["lat"], pos["lon"], track, dist_km)
+    eta_iso = None
+    if arr_ll and None not in arr_ll and gs > 80:
+        rem_km = _gc_km(nlat, nlon, arr_ll[0], arr_ll[1])
+        eta_iso = _ts_to_iso(now + (rem_km / (gs * 1.852)) * 3600)
+    proj = dict(pos)
+    proj["lat"], proj["lon"] = nlat, nlon
+    return proj, eta_iso
+
+
 def _progress(dep_ll, dst_ll, pos):
     if not (dep_ll and dst_ll and pos and pos.get("lat") is not None):
         return None
@@ -217,9 +258,15 @@ REG_RANK = ["board", "warehouse_flight", "aircraft_live", "fr24_bulk",
 
 
 def _pick_position(observations, now):
-    """Precedence + freshness. Returns (pos_value, source, obs_ts) of the best
-    RAW candidate (airborne gating happens after phase)."""
-    cands = [o for o in _by(observations, kind="position") if _fresh(o, now)]
+    """Precedence. Returns (pos_value, source, obs_ts) of the best RAW candidate.
+
+    Includes fixes up to the SIM horizon (not just the per-source freshness gate)
+    so a flight that fell off live coverage still has a last-known fix to fly
+    forward from (the caller decides observed-vs-simulated by freshness). A FRESH
+    real ADS-B fix always outranks a stale snapshot — so when the flight IS
+    findable we show the real one and never simulate."""
+    cands = [o for o in _by(observations, kind="position")
+             if o.obs_ts is not None and (now - o.obs_ts) <= SIM_MAX_AGE_S]
     if not cands:
         return None, None, None
 
@@ -228,9 +275,9 @@ def _pick_position(observations, now):
             rank = POSITION_RANK.index(o.source)
         except ValueError:
             rank = len(POSITION_RANK)
-        # prefer real ADS-B (position_source==0) then freshness then authority
+        fresh = 0 if _fresh(o, now) else 1          # fresh beats stale outright
         real = 0 if o.value.get("position_source", 3) == 0 else 1
-        return (real, rank, -(o.obs_ts or 0))
+        return (fresh, real, rank, -(o.obs_ts or 0))
 
     best = sorted(cands, key=key)[0]
     return best.value, best.source, best.obs_ts
@@ -523,22 +570,35 @@ def resolve_flight_state(keys: dict, observations: list, *, now: Optional[float]
         (now - pos_ts) <= MAX_AGE.get(pos_src, 600)
     airborne_ok = raw_pos is not None and is_airborne_kinematic(raw_pos, near_origin)
 
+    render_pos = raw_pos                       # the position we actually render
     if phase in RENDER_POS:
         if raw_pos and airborne_ok and pos_fresh:
+            # REAL, fresh fix — always preferred. We found the flight; show it.
             live = _mk_live(raw_pos, pos_src, OBSERVED if pos_src == "adsb" else
                             (OBSERVED if (now - pos_ts) < 300 else ESTIMATED),
                             pos_ts, None)
         elif raw_pos and airborne_ok and not pos_fresh:
-            # snapshot older than gate but plane is still flying -> simulated,
-            # bounded to SIM_MAX_AGE_S, along the STORED route (not over Russia).
+            # We can no longer FIND the flight live (fell off ADS-B / snapshot went
+            # stale). ONLY NOW simulate: fly the last fix forward along its own
+            # track and estimate time-to-landing. Bounded to SIM_MAX_AGE_S; next
+            # request re-queries and a fresh real fix instantly overrides this.
             age = now - pos_ts
             if age <= SIM_MAX_AGE_S:
-                live = _mk_live(raw_pos, pos_src, SIMULATED, pos_ts, stale_since=pos_ts)
-            # else: no live dot (static "last known" marker handled by iOS)
+                sim = _simulate_forward(raw_pos, pos_ts, keys.get("arr_ll"), now)
+                if sim:
+                    render_pos, sim_eta = sim
+                    live = _mk_live(render_pos, pos_src, SIMULATED, pos_ts, stale_since=pos_ts)
+                    # landing estimate from the simulation, unless a real board/ADB
+                    # ETA already exists (that wins — observed/estimated > simulated).
+                    if sim_eta and eta_conf in (None, SIMULATED):
+                        eta_iso, eta_conf = sim_eta, SIMULATED
+                else:
+                    live = _mk_live(raw_pos, pos_src, SIMULATED, pos_ts, stale_since=pos_ts)
+            # else: too long gone -> no live dot (honest "Position offline")
         # a fix that fails the airborne gate is NEVER rendered (invariant #2)
 
         if live:
-            progress = _progress(keys.get("dep_ll"), keys.get("arr_ll"), raw_pos)
+            progress = _progress(keys.get("dep_ll"), keys.get("arr_ll"), render_pos)
 
     # hard cap: sim running too long past ETA with no arrival -> UNKNOWN
     if phase in IN_AIR and live and live["conf"] == SIMULATED:
