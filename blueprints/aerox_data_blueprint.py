@@ -3342,7 +3342,11 @@ def ax_flight_detail(query):
         return r if (r or {}).get('found') else None
 
     def _history_call(o, d):
-        h = _detail_subcall(_app, '/api/ax/route-history/%s/%s?days=7' % (urllib.parse.quote(o),
+        # days=3 statt 7 (Owner 2026-07-09 „Detail 13s"): route-history ist der
+        # Latenz-Pol (FRA/JFK 7d=4.4s vs 3d~1.1s — Dual-Side-Board-Merge × Tage). Die
+        # „STRECKE ZULETZT"-Liste zeigt ohnehin nur die letzten ~3 Tage. Volle
+        # Historie bleibt über den Einzel-Endpoint /route-history verfügbar.
+        h = _detail_subcall(_app, '/api/ax/route-history/%s/%s?days=3' % (urllib.parse.quote(o),
                                                                           urllib.parse.quote(d)),
                             _life_app('ax_route_history'), o, d)
         return h if (h or {}).get('ok') else None
