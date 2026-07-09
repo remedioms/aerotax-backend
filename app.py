@@ -30640,6 +30640,20 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
             v = v.strip()
         if v:
             payload[col] = v
+    # WRITE-ON-CHANGE (adaptiver Poll-Takt 2026-07-09): der bis-zu-3-min-Board-
+    # Takt darf die SB-Writes nicht linear multiplizieren. Content-Hash der
+    # OPERATIVEN Felder pro Row-Key im In-Process-Memo (poll_scheduler) —
+    # unverändert seit dem letzten ERFOLGREICHEN Write → skippen; True ist
+    # ehrlich („steht exakt so in SB"). Leeres Memo (Restart) → normal
+    # schreiben; der Hash wird erst NACH Erfolg gemerkt (Fehler → Retry/Requeue
+    # bleiben unangetastet). Import defensiv: fehlt das Modul, wird immer
+    # geschrieben (Verhalten von vorher).
+    try:
+        from blueprints import poll_scheduler as _psched_woc
+    except Exception:
+        _psched_woc = None
+    if _psched_woc is not None and not _psched_woc.obs_write_needed(payload):
+        return True
     try:
         # BUGFIX 2026-06-13 (ROOT CAUSE „Tafel/Pünktlichkeit speichert nicht"):
         # `upsert(on_conflict='date,airport,flight,sched')` schlug in PROD bei JEDEM
@@ -30701,6 +30715,8 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
             else:
                 raise
         _delay_obs_write_ok_count += 1
+        if _psched_woc is not None:
+            _psched_woc.obs_mark_written(payload)
         return True
     except Exception as e:
         # Tabelle fehlt / SB down / Schema-Mismatch → ehrlich nur in-memory
@@ -31970,6 +31986,11 @@ def internal_poll_boards():
     Muster wie /api/airport/poll-punctuality). Ist kein Secret gesetzt, sind nur
     localhost-Aufrufe erlaubt (Fail-closed in PROD, wo das Secret gesetzt sein muss).
 
+    ?tier=auto (2026-07-09, Hetzner-Cron JEDE Minute): adaptiver Per-Airport-
+    Takt via blueprints/poll_scheduler (Demand aus Roster-Legs ±3h, Event-
+    Fenster ±45 min → 3 min, nachgefragt → 5 min, Default → 10 min, Nacht
+    lokal 0–5 Uhr → 30 min). Ohne den Parameter: Verhalten wie immer.
+
     WIRING (manuell, einmalig) — Cloud Scheduler alle 10 Minuten:
       gcloud scheduler jobs create http aerotax-poll-boards \
         --location=europe-west3 \
@@ -31991,6 +32012,30 @@ def internal_poll_boards():
     elif (request.remote_addr or '') not in ('127.0.0.1', '::1'):
         return jsonify({'ok': False, 'error': 'forbidden_no_secret'}), 403
     airports = _poll_boards_airports()
+    # ADAPTIVER TAKT (2026-07-09): mit ?tier=auto feuert der Hetzner-Cron JEDE
+    # Minute und der Scheduler (blueprints/poll_scheduler) entscheidet pro
+    # Airport, ob er diesen Tick dran ist (Event-Fenster 3 min / nachgefragt
+    # 5 min / Default 10 min / Nacht lokal 0–5 Uhr 30 min). OHNE ?tier=auto:
+    # EXAKT das bisherige Verhalten (alle Airports jeden Aufruf) — der alte
+    # 10-min-Cron funktioniert unverändert weiter.
+    tier = (request.args.get('tier') or '').strip().lower()
+    if tier == 'auto':
+        from blueprints import poll_scheduler as _psched
+        due, sched_diag = _psched.select_due_airports(
+            airports, sb if (SB_AVAILABLE and sb is not None) else None,
+            lambda ap: _airport_local_now(ap).hour)
+        results = _poll_boards_once(due)
+        # EU-Fill NICHT mit-beschleunigen: bleibt im heutigen 10-min-Raster
+        # (OpenSky-Rate-Limit/Tages-Budget), unabhängig vom Board-Takt.
+        eu = None
+        if datetime.now(timezone.utc).minute % 10 == 0:
+            try:
+                eu = _eu_fill_once()
+            except Exception as e:
+                eu = {'error': type(e).__name__}
+        return jsonify({'ok': True, 'tier': 'auto', 'airports': due,
+                        'persisted': results, 'scheduler': sched_diag,
+                        'eu_fill': eu})
     results = _poll_boards_once(airports)
     # EUROPÄISCHE WAREHOUSE-EXPANSION: pro Tick eine ROTIERTE Teilmenge der großen
     # EU-Hubs (ohne freien Nativ-Scraper) via OpenSky bulk-fill (Tail+Route+Zeiten,
