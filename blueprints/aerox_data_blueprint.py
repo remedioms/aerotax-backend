@@ -2450,7 +2450,8 @@ def ax_radar_enrich():
             from datetime import datetime as _dt
             yday = time.strftime('%Y-%m-%d', time.gmtime(time.time() - 86400))
             r = (sb.table('flights')
-                 .select('hex,op_flight_no,origin,destination,gate,status,tail,sched_dep,est_dep')
+                 .select('hex,op_flight_no,origin,destination,gate,status,tail,'
+                         'sched_dep,est_dep,sched_arr,est_arr')
                  .in_('hex', hexes).gte('service_date', yday)
                  .order('updated_at', desc=True).limit(200).execute())
             now = time.time()
@@ -2465,12 +2466,20 @@ def ax_radar_enrich():
                 except (TypeError, ValueError):
                     continue
                 if now - 3 * 3600 <= dep_ts <= now + 4 * 3600:
-                    out[hx] = {'flight_no': f.get('op_flight_no'),
-                               'src': f.get('origin'), 'dst': f.get('destination'),
-                               'gate': f.get('gate'), 'status': f.get('status'),
-                               'tail': f.get('tail'),
-                               'source': 'warehouse_board',
-                               'confidence': 'confirmed'}
+                    entry = {'flight_no': f.get('op_flight_no'),
+                             'src': f.get('origin'), 'dst': f.get('destination'),
+                             'gate': f.get('gate'), 'status': f.get('status'),
+                             'tail': f.get('tail'),
+                             'source': 'warehouse_board',
+                             'confidence': 'confirmed'}
+                    # Abflug-/Ankunftszeiten (station-lokal, Board-Fahrplan) mitgeben,
+                    # damit der Tap SOFORT „ab HH:MM · an HH:MM" + Header-Zeit „HH:MM →
+                    # HH:MM" + Delay zeigt — ohne einen Einzel-Call. iOS leitet das Delay
+                    # aus est_arr − sched_arr ab. Nur echte Werte (nie erfunden).
+                    for k in ('sched_dep', 'est_dep', 'sched_arr', 'est_arr'):
+                        if f.get(k):
+                            entry[k] = f.get(k)
+                    out[hx] = entry
         except Exception:
             pass
     return jsonify({'ok': True, 'count': len(out), 'routes': out})
