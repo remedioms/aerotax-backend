@@ -5753,6 +5753,10 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
         'inbound_flight_no': None, 'inbound_origin': None,
         'inbound_sched_arr': None, 'inbound_est_arr': None,
         'inbound_delay_min': None, 'inbound_live': None,
+        # Abflug-Seite des Zubringers (Owner 2026-07-10 „Wo ist mein Flieger" füllen:
+        # Soll/Ist-Departure). Kommt aus demselben merged-Facts-Merge wie die Ankunft.
+        'inbound_sched_dep': None, 'inbound_est_dep': None,
+        'inbound_dep_delay_min': None,
         'reg': None, 'aircraft_type': None,
     }
     forecast = {
@@ -5886,6 +5890,12 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
         chain['inbound_est_arr'] = merged_in.get('esti_arr') or row_esti
         if merged_in.get('delay_known'):
             chain['inbound_delay_min'] = merged_in.get('arr_delay_min')
+        # Abflug-Seite (Soll/Ist + Delay) aus demselben Merge — dieselbe ehrliche
+        # Semantik wie die Ankunft (esti gesetzt = bekannt); iOS zeigt „Abflug
+        # Soll→Ist" in der „Wo ist mein Flieger"-Karte.
+        chain['inbound_sched_dep'] = merged_in.get('sched_dep')
+        chain['inbound_est_dep'] = merged_in.get('esti_dep')
+        chain['inbound_dep_delay_min'] = merged_in.get('dep_delay_min')
         if not ac_type and merged_in.get('aircraft'):
             ac_type = merged_in.get('aircraft')
             chain['aircraft_type'] = ac_type
