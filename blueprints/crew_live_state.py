@@ -384,6 +384,12 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
     leg = legs[idx]
 
     if kind == 'flying':
+        # Position IMMER nachziehen: der Board-airborne-Zweig pickt 'flying',
+        # ohne _live(leg) je gerufen zu haben — _position(leg) war dann leer
+        # und iOS fiel auf die (verbotene) Grosskreis-Simulation zurueck,
+        # obwohl die ECHTE Position im aircraft_live-Store lag (Tibor-LH803:
+        # real ueber Schweden, Karte malte Strasbourg).
+        _live(leg)
         o = leg.get('obs') or {}
         arr_delay = _num(o.get('arr_delay_min'))
         if arr_delay is None:
