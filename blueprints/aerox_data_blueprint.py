@@ -3906,6 +3906,110 @@ def _flown_track_writeback(reg, trail):
         pass
 
 
+def _observed_track_clean(points):
+    """Roh-Punkte (App-Beobachtung) → zeitlich sortierte, plausible Fix-Tupel
+    (ts, lat, lon, alt, gs, track). Verwirft ungültige/nicht-numerische Werte,
+    unmögliche Koordinaten, exakte Timestamp-Duplikate (PK-Kollision) und
+    Teleport-Ausreißer (>40 km zwischen konsekutiven Fixes — ein geglitchter
+    oder fremder ADS-B-Fix; kein Airliner legt das in Sekunden zurück)."""
+    import math
+
+    def _f(v):
+        try:
+            x = float(v)
+            return x if math.isfinite(x) else None
+        except (TypeError, ValueError):
+            return None
+
+    clean = []
+    for p in points:
+        if not isinstance(p, dict):
+            continue
+        lat, lon = _f(p.get('lat')), _f(p.get('lon'))
+        try:
+            ts = int(float(p.get('ts')))
+        except (TypeError, ValueError):
+            ts = None
+        if lat is None or lon is None or ts is None:
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        clean.append((ts, lat, lon, _f(p.get('alt')),
+                      _f(p.get('gs')), _f(p.get('track'))))
+    clean.sort(key=lambda r: r[0])
+    out = []
+    for r in clean:
+        if out:
+            if r[0] == out[-1][0]:
+                continue                       # gleicher Timestamp → Duplikat
+            plat, plon = out[-1][1], out[-1][2]
+            dlat = math.radians(r[1] - plat)
+            dlon = math.radians(r[2] - plon)
+            a = (math.sin(dlat / 2) ** 2
+                 + math.cos(math.radians(plat)) * math.cos(math.radians(r[1]))
+                 * math.sin(dlon / 2) ** 2)
+            km = 6371.0 * 2 * math.asin(min(1.0, math.sqrt(a)))
+            if km > 40:
+                continue                       # Teleport-Sprung → verwerfen
+        out.append(r)
+    return out
+
+
+@aerox_data_bp.route('/api/ax/observed-track', methods=['POST'])
+def ax_observed_track():
+    """App-beobachtete Live-Spur eines Fliegers dauerhaft in aircraft_track
+    persistieren (Owner 2026-07-10: „wenn wir eh schon mitgucken, direkt
+    speichern"). Der Harvester sieht jeden Flieger nur ~alle 11 min (Kachel-
+    Round-Robin) → enge Anflug-Turns fehlen. Die App pollt den ausgewählten
+    Flieger dicht (adsb.lol) und lädt die gesammelte Spur beim Abwählen/Landen
+    hoch — so hat die geflogene Route den Turn dauerhaft, auch für spätere
+    Betrachter. Idempotent via PK (reg, seen_ts) → doppelte Uploads schaden nie.
+    Body: {reg, flight?, origin?, dest?, points:[{lat,lon,alt?,gs?,track?,ts}]}.
+    Public + per-IP rate-limited (Positionsdaten, nicht sensibel — wie
+    /api/ax/flown-track)."""
+    from flask import request
+    if _ax_rate_limited('ax_observed_track', limit=60, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    body = request.get_json(silent=True) or {}
+    reg = re.sub(r'[^A-Z0-9]', '', str(body.get('reg') or '').upper())
+    if not reg:
+        return jsonify({'ok': False, 'error': 'reg_required'}), 400
+    raw = body.get('points')
+    if not isinstance(raw, list) or not raw:
+        return jsonify({'ok': False, 'error': 'no_points'}), 400
+    pts = _observed_track_clean(raw[:1000])
+    if not pts:
+        return jsonify({'ok': True, 'written': 0})
+    sb = _sb()
+    if sb is None:
+        return jsonify({'ok': False, 'error': 'no_db'}), 503
+
+    flight = (str(body.get('flight') or '').strip().upper() or None)
+    origin = _norm_iata(body.get('origin')) if body.get('origin') else None
+    dest = _norm_iata(body.get('dest')) if body.get('dest') else None
+
+    def _i(v):
+        try:
+            return int(round(float(v)))
+        except (TypeError, ValueError):
+            return None
+
+    rows = [{
+        'reg': reg,
+        'seen_ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts)),
+        'flight': flight, 'origin': origin, 'dest': dest,
+        'lat': lat, 'lon': lon,
+        'alt_ft': _i(alt), 'gs_kt': _i(gs), 'track_deg': _i(trk),
+        'on_ground': False, 'source': 'app_observed',
+    } for (ts, lat, lon, alt, gs, trk) in pts]
+    try:
+        sb.table('aircraft_track').upsert(
+            rows, on_conflict='reg,seen_ts', ignore_duplicates=True).execute()
+    except Exception:
+        return jsonify({'ok': False, 'error': 'write_failed'}), 502
+    return jsonify({'ok': True, 'written': len(rows)})
+
+
 @aerox_data_bp.route('/api/ax/flown-track', methods=['GET'])
 def ax_flown_track():
     """Die ECHTE geflogene Route eines Legs als Polyline. Kaskade (billig-zuerst):
