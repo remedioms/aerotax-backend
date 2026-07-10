@@ -145,6 +145,18 @@ def _num(v):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def _fmt_reg(r):
+    """Kanonische Reg-Schreibweise: Boards liefern 'DAIWA', Radar/adsb suchen
+    'D-AIWA' — deutsche Regs bekommen den Bindestrich zurueck (Owner-Fund:
+    Crew-Tap -> Radar sagte 'aktuell nicht im Radar' wegen Schreibweise)."""
+    r = (r or '').strip().upper()
+    if not r:
+        return None
+    if '-' not in r and len(r) == 5 and r[0] == 'D' and r[1:].isalpha():
+        return 'D-' + r[1:]
+    return r
+
+
 def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                             homebase=None, layover_iata=None, duty=None,
                             city_lookup=None, local_hhmm=None,
@@ -220,7 +232,8 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             'flight_no': leg['flight'],
             'dep_iso': _iso_z(leg['dep']),
             'arr_iso': None if leg['arr_synth'] else _iso_z(leg['arr']),
-            'reg': (str(o.get('reg') or '').strip().upper() or leg.get('tail')),
+            'reg': _fmt_reg(str(o.get('reg') or '').strip().upper()
+                            or leg.get('tail')),
         }
 
     def _position(leg):
