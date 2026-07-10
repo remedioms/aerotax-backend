@@ -4706,12 +4706,35 @@ def ax_flight_detail(query):
                    if (route is None and cs_for_route) else None)
         f_hist = ex.submit(_history_call, origin, dest) if (origin and dest) else None
         f_photo = ex.submit(_photo_call, reg) if reg else None
+        # FREIE Live-Position (Owner 2026-07-11 „warum keine live position?"): aus dem
+        # aircraft_live-Warehouse (FR24-gRPC-Harvester — sieht AUCH über Ozean/Russland,
+        # wo iOS-adsb.lol blind ist). EIN billiger Supabase-Read, KEIN paid/kein adsb.lol
+        # → bleibt free-first + schnell. Match reg → Flugnummer → Funkname. Das FLIGHT
+        # DECK nutzt sie statt (nur) des ozean-blinden iOS-Resolvers.
+        f_live = ex.submit(lambda: _aircraft_live_pos(
+            reg=reg, flight=fn_iata, callsign=real_cs))
         if f_route is not None:
             route = _res(f_route)
         history = _res(f_hist)
         photo = _res(f_photo)
+        live_res = _res(f_live, timeout=5)
     finally:
         ex.shutdown(wait=False)
+
+    # Live-Position → schlankes Objekt (nur echte Werte; airborne = Pos + nicht am Boden).
+    live = None
+    try:
+        _pos, _od, _rd, _act = live_res or (None, None, None, None)
+        if _pos and _pos.get('lat') is not None and _pos.get('lon') is not None:
+            live = {
+                'lat': _pos.get('lat'), 'lon': _pos.get('lon'),
+                'track': _pos.get('track'), 'gs': _pos.get('gs'),
+                'alt': _pos.get('alt'), 'on_ground': bool(_pos.get('on_ground')),
+                'source': _pos.get('source'), 'seen_ts': _pos.get('seen_ts'),
+                'reg': _rd or reg, 'callsign': real_cs,
+            }
+    except Exception:
+        live = None
 
     out['resolve'] = resolve_flight
     out['callsign'] = real_cs
@@ -4720,6 +4743,7 @@ def ax_flight_detail(query):
     out['info'] = info
     out['history'] = history
     out['photo'] = photo
+    out['live'] = live
 
     # LEERES Ergebnis (weder resolve noch info) NICHT 45s memoisieren — sonst
     # klebt ein transienter Ausfall/Timeout als Negativ-Antwort im Cache.
