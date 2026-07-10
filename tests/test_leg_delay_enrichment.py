@@ -947,6 +947,172 @@ def test_layeff_fresh_delay_pin_still_holds(client, monkeypatch):
     assert _friend_layover(client, tok) == 'BLL'
 
 
+# ── TIBOR-LIVEFALL 2026-07-10 (~09:30 LT): BCN→FRA→ARN→FRA ────────────────────
+# Sein Plan: LH1139 BCN→FRA 06:40–08:55 (um 09:30 GELANDET), LH802 FRA→ARN
+# 10:25 (nächster Leg). Der Feed zeigte „unterwegs nach Barcelona" — die
+# Kaskade pinnte an BCN, weil sie NUR dep_iso kannte (dep+4h-Grace lief bis
+# 10:40) bzw. eine stale grounded-Row (gestriges AENA-„Boarding") ewig pinnte.
+# Zeiten hier relativ zu now: Leg1 dep −2h50, PLAN-ARR −35min; Leg2 dep +55min.
+def _setup_tibor_bcn_fra_arn(monkeypatch):
+    tok = 'FRIENDTOKEN'
+    today = _date.today().isoformat()
+    d1, a1 = _now() - timedelta(minutes=170), _now() - timedelta(minutes=35)
+    d2, a2 = _now() + timedelta(minutes=55), _now() + timedelta(minutes=205)
+    d3, a3 = _now() + timedelta(minutes=250), _now() + timedelta(minutes=400)
+    day = {
+        'datum': today,
+        'klass': 'Z72',
+        'routing': 'BCN-FRA-ARN-FRA',
+        'reader_facts': {'layover_ort': None,
+                         'flight_numbers': ['LH1139', 'LH802', 'LH803']},
+        'ical_sectors': [
+            _sector(flight='LH1139', frm='BCN', to='FRA',
+                    dep_iso=_iso(d1), arr_iso=_iso(a1)),
+            _sector(flight='LH802', frm='FRA', to='ARN',
+                    dep_iso=_iso(d2), arr_iso=_iso(a2)),
+            _sector(flight='LH803', frm='ARN', to='FRA',
+                    dep_iso=_iso(d3), arr_iso=_iso(a3)),
+        ],
+    }
+    A._store[tok] = {'result_data': {'_tage_detail': [day]}}
+    monkeypatch.setattr(A, '_friends_load', lambda t: {'friends': [tok]})
+    monkeypatch.setattr(A, '_profiles_load_bulk', lambda toks: {
+        tok: {'name': 'Tibor', 'homebase': 'FRA', 'share_roster': True,
+              'share_location': True, 'location_source': 'roster'}})
+    monkeypatch.setattr(A, '_maybe_refresh_calendar_feed', lambda *a, **k: None)
+    # flights_live-Nebenpfad offline halten (kein aircraft_live-Netz-Read).
+    import blueprints.aerox_data_blueprint as ADB
+    monkeypatch.setattr(ADB, '_aircraft_live_pos',
+                        lambda **k: (None, None, None, None))
+    return tok
+
+
+def test_layeff_tibor_no_signal_plan_landed_leg_advances(client, monkeypatch):
+    # Kein Signal auf allen Legs: Leg 1 ist PLAN-gelandet (arr vor 35 min >
+    # 30-min-Puffer) → als geflogen werten, NICHT bis dep+4h an BCN pinnen.
+    # Leg 2 (dep erst in +55 min) pinnt die Crew ehrlich an FRA.
+    tok = _setup_tibor_bcn_fra_arn(monkeypatch)
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda *a, **k: None)
+    assert _friend_layover(client, tok) == 'FRA'      # vorher: 'BCN' (Barcelona!)
+
+
+def test_layeff_tibor_stale_grounded_leg1_advances(client, monkeypatch):
+    # Stale grounded-Row auf Leg 1 (gestriges AENA-„Boarding" derselben Flug-
+    # nummer — live verifizierter Root-Cause: est_dep vom VORTAG) + Plan-
+    # Ankunft ≥30 min vorbei → die Obs ist über ihren EIGENEN Zeitstempel
+    # beweisbar stale, Leg gilt als geflogen. Leg 2 grounded (echt, Abflug in
+    # Zukunft) → FRA.
+    tok = _setup_tibor_bcn_fra_arn(monkeypatch)
+    stale_est = _iso(_now() - timedelta(days=1, minutes=170))
+    monkeypatch.setattr(
+        A, '_flight_obs_merged',
+        lambda fno, **k: _merged(status='Boarding', delay_known=False,
+                                 esti_dep=stale_est))
+    assert _friend_layover(client, tok) == 'FRA'      # vorher: 'BCN' (Ewig-Pin)
+
+
+def test_layeff_tibor_grounded_current_row_without_delay_keeps_pin(client,
+                                                                   monkeypatch):
+    # NACHFIX 2026-07-10 (Stale-Kappe v2): ein AKTUELLES grounded-Signal OHNE
+    # quantifizierten Delay (Boards flippen oft nur „delayed"/„Boarding" ohne
+    # est-Zeiten) darf NICHT ab arr+30min verworfen werden — der Flieger steht
+    # nachweislich noch am Gate (est_dep von HEUTE, vor 20 min). Unbeweisbar
+    # stale ⇒ Ewig-Pin bleibt (Owner-Regel „unabhängig von der Uhr").
+    tok = _setup_tibor_bcn_fra_arn(monkeypatch)
+    current_est = _iso(_now() - timedelta(minutes=20))
+
+    def obs(fno, **k):
+        if fno == 'LH1139':
+            return _merged(status='delayed', delay_known=False,
+                           esti_dep=current_est)
+        return None
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda fno, **k: obs(fno, **k))
+    assert _friend_layover(client, tok) == 'BCN'      # v1 hätte teleportiert
+
+
+def test_layeff_tibor_no_obs_aircraft_live_airborne_stays_underway(client,
+                                                                   monkeypatch):
+    # NACHFIX 2026-07-10 (ARR-DECKEL-Geister-Schutz): Leg 1 OHNE Board-Obs
+    # (Outstation-Abflug, nur DE/EU-Hubs geharvestet), real >30 min verspätet
+    # → Plan-Ankunft +35 min vorbei, aber der GRATIS aircraft_live-Store sieht
+    # die Maschine NOCH IN DER LUFT → Crew bleibt ehrlich „unterwegs"
+    # (geplanter Layover), wird NICHT nach Frankfurt teleportiert.
+    tok = _setup_tibor_bcn_fra_arn(monkeypatch)
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda *a, **k: None)
+    import blueprints.aerox_data_blueprint as ADB
+
+    def _live(**k):
+        if (k.get('flight') or '').upper() == 'LH1139':
+            return ({'lat': 44.2, 'lon': 5.1, 'track': 25.0, 'gs': 431,
+                     'alt': 36000, 'on_ground': False},
+                    ('BCN', 'FRA'), 'DAIXX', 'A21N')
+        return (None, None, None, None)
+    monkeypatch.setattr(ADB, '_aircraft_live_pos', _live)
+    assert _friend_layover(client, tok) is None       # vorher: 'FRA' (Geist)
+
+
+def test_layeff_tibor_no_obs_aircraft_live_at_gate_keeps_pin(client,
+                                                             monkeypatch):
+    # NACHFIX 2026-07-10: wie oben, aber die Maschine steht laut aircraft_live
+    # noch AM BODEN nahe BCN (Beispiel aus dem Audit: real dep 09:00 ohne
+    # Board-Row → 09:25 zeigte „in Frankfurt" beim Boarding in BCN) → Pin an
+    # den Abflughafen bleibt.
+    tok = _setup_tibor_bcn_fra_arn(monkeypatch)
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda *a, **k: None)
+    import blueprints.aerox_data_blueprint as ADB
+
+    def _live(**k):
+        if (k.get('flight') or '').upper() == 'LH1139':
+            return ({'lat': 41.2971, 'lon': 2.07846, 'track': None, 'gs': 3,
+                     'alt': 0, 'on_ground': True},
+                    ('BCN', 'FRA'), 'DAIXX', 'A21N')
+        return (None, None, None, None)
+    monkeypatch.setattr(ADB, '_aircraft_live_pos', _live)
+    assert _friend_layover(client, tok) == 'BCN'      # vorher: 'FRA' (Geist)
+
+
+def test_layeff_corrupt_arr_before_dep_ignored(client, monkeypatch):
+    # NACHFIX 2026-07-10 (Plausi-Guard): korruptes/Red-Eye-arr_iso ≤ dep_iso
+    # (Roster-Reader-Macke) machte _grace_end < dep — der Leg galt als
+    # geflogen, BEVOR er abgeflogen war. Jetzt: unplausibles Ende verworfen →
+    # altes dep+4h-Verhalten, Crew bleibt (ohne Signal, 1 h nach Plan-Abflug)
+    # am Abflughafen.
+    tok = _setup_friend(monkeypatch, first_dep_offset_h=-1.0, layover_ort='XXX')
+    day = A._store[tok]['result_data']['_tage_detail'][0]
+    day['ical_sectors'][0]['arr_iso'] = _iso(_now() - timedelta(hours=24))
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda *a, **k: None)
+    assert _friend_layover(client, tok) == 'BLL'      # vorher: 'CPH' (vor Abflug!)
+
+
+def test_layeff_tibor_grounded_with_known_delay_still_pins(client, monkeypatch):
+    # Gegenprobe (Owner-Regel 2026-07-04 bleibt): grounded MIT bekanntem
+    # positivem Delay ist ein glaubwürdiges „wartet noch"-Signal → Pin an BCN
+    # bleibt, auch jenseits der Plan-Ankunft (delay-korrigierter Abflug liegt
+    # in der Zukunft: dep −2h50 + 240 min Delay → eff_dep +1h10).
+    tok = _setup_tibor_bcn_fra_arn(monkeypatch)
+
+    def obs(fno, **k):
+        if fno == 'LH1139':
+            return _merged(delay_known=True, status='delayed',
+                           delay_min=240, dep_delay_min=240, delay_side='dep')
+        return None
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda fno, **k: obs(fno, **k))
+    assert _friend_layover(client, tok) == 'BCN'
+
+
+def test_layeff_tibor_landed_obs_then_waiting_at_fra(client, monkeypatch):
+    # Echte Board-Landung auf Leg 1 („gelandet ⇒ Status gelandet, nicht
+    # unterwegs"), Leg 2 ohne Signal & Abflug in Zukunft → Crew wartet in FRA.
+    tok = _setup_tibor_bcn_fra_arn(monkeypatch)
+
+    def obs(fno, **k):
+        if fno == 'LH1139':
+            return _merged(delay_known=True, status='Gelandet 08:35')
+        return None
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda fno, **k: obs(fno, **k))
+    assert _friend_layover(client, tok) == 'FRA'
+
+
 def test_layeff_share_roster_false_hidden(client, monkeypatch):
     tok = _setup_friend(monkeypatch, first_dep_offset_h=-1.0)
     monkeypatch.setattr(A, '_profiles_load_bulk', lambda toks: {

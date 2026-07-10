@@ -36,7 +36,7 @@ import time
 import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from flask import Blueprint, current_app, jsonify, request
@@ -393,6 +393,22 @@ def get_news_feed():
                 art['image_url'] = proxied
                 art['image_url_original'] = orig_img
         enriched.append(art)
+
+    # Persistenter Volltext-Layer (Owner: „Text soll gespeichert sein und direkt
+    # voll da sein"): (a) für Artikel OHNE RSS-Volltext den gespeicherten
+    # Scrape-Volltext aus Supabase anhängen (EIN chunked Roundtrip, nur auf dem
+    # Cache-Miss-Pfad ≤1×/15min; Serve-TTL + Deny-Hosts, s. Copyright-
+    # Leitplanken am Volltext-Layer) und (b) fehlende Volltexte im Hintergrund
+    # höflich nachernten (nur NEUE Artikel, robots.txt-Gate, gedrosselt,
+    # Fehler ⇒ Teaser-Fallback bleibt).
+    try:
+        _attach_stored_fulltexts(enriched)
+    except Exception as exc:
+        _log_warn(f'[news/fulltext] attach failed: {exc!r}')
+    try:
+        _kickoff_fulltext_harvest(enriched)
+    except Exception as exc:
+        _log_warn(f'[news/fulltext] harvest kickoff failed: {exc!r}')
 
     # Nur Category ist ein echter FILTER. Airline ist KEIN Filter mehr — sie
     # BOOSTET (airline-relevante Artikel zuerst, allgemeine News danach), damit
@@ -870,7 +886,9 @@ def _entry_to_article(entry, src):
             content_raw = cont[0].get('value') or ''
     except Exception:
         content_raw = ''
-    fulltext = _strip_html(content_raw).strip()
+    # Absatz-erhaltend (\n\n zwischen <p>-Blöcken) statt _strip_html — sonst
+    # rendert die Detail-View einen einzigen Riesen-Absatz (iOS splittet auf \n\n).
+    fulltext = _html_to_paragraph_text(content_raw).strip()
     # Spenden-/Förder-Appelle aus dem RSS-Volltext entfernen, bevor er als
     # in-app-lesbar gilt oder ausgeliefert wird.
     try:
@@ -1299,6 +1317,37 @@ def _strip_html(s):
     return _WS_RE.sub(' ', unescaped).strip()
 
 
+_SCRIPT_STYLE_RE = re.compile(r'<(script|style)\b[^>]*>.*?</\1>', re.IGNORECASE | re.DOTALL)
+_BR_RE = re.compile(r'<br\s*/?>', re.IGNORECASE)
+_BLOCK_CLOSE_RE = re.compile(r'</(p|div|h[1-6]|li|blockquote|figcaption|tr)\s*>', re.IGNORECASE)
+_HSPACE_RE = re.compile(r'[ \t\xa0]+')
+
+
+def _html_to_paragraph_text(s):
+    """HTML-Fragment → Plain-Text MIT erhaltener Absatz-Struktur.
+
+    Im Gegensatz zu `_strip_html` (kollabiert ALLES auf eine Zeile) werden
+    Block-Enden (</p>, </div>, </h*>, </li>, …) zu Absatz-Trennern (\\n\\n)
+    und <br> zu \\n — die iOS-Detail-View rendert Absätze via split("\\n\\n").
+    Pure Funktion, wirft nie.
+    """
+    if not s:
+        return ''
+    txt = _SCRIPT_STYLE_RE.sub(' ', s)
+    txt = _BR_RE.sub('\n', txt)
+    txt = _BLOCK_CLOSE_RE.sub('\n\n', txt)
+    txt = _TAG_RE.sub(' ', txt)
+    try:
+        txt = html_lib.unescape(txt)
+    except Exception:
+        pass
+    # Zeilenweise horizontal normalisieren, vertikale Struktur behalten.
+    lines = [_HSPACE_RE.sub(' ', ln).strip() for ln in txt.replace('\r', '\n').split('\n')]
+    joined = '\n'.join(lines)
+    joined = re.sub(r'\n{3,}', '\n\n', joined)
+    return joined.strip()
+
+
 # Spenden-/Solicitation-Marker (case-insensitive). "strong" = an sich schon ein
 # Aufruf; "weak" = braucht zusätzlich ein Call-to-Action-Verb im selben Satz.
 # Bewusst konservativ: nur der anstößige Satz fliegt, nie der ganze Artikel.
@@ -1364,6 +1413,538 @@ def _log_warn(msg):
         current_app.logger.warning(msg)
     except Exception:
         _logger.warning(msg)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Permanenter Volltext-Layer  (Harvest + Feed-Anreicherung)
+#
+#  Owner-Wunsch 2026-07-10: „Nachrichten-Text ist nicht gespeichert/
+#  gescrapt im Backend — damit es schneller lädt und der Text direkt
+#  voll da ist." Vorher wurde der Volltext erst beim ERSTEN Öffnen
+#  eines Artikels pro User via /api/news/article (app.py) gescraped
+#  (langsam, konnte scheitern → nur Teaser + Link).
+#
+#  Jetzt:
+#    1. Beim Feed-Aggregat (Cache-Miss, ≤1×/15min) hängt
+#       `_attach_stored_fulltexts` den gespeicherten Volltext
+#       aus Supabase `news_article_cache` an jeden Artikel OHNE
+#       RSS-content:encoded — der Text ist damit DIREKT im Feed-Payload
+#       (Serve-TTL + Deny-Hosts, s. Copyright-Leitplanken unten).
+#    2. `_kickoff_fulltext_harvest` erntet fehlende Volltexte im
+#       Hintergrund-Thread nach: NUR neue Artikel (Store-Check zuerst),
+#       höflich (identifizierender UA mit Kontakt, 1s Delay, harter
+#       Fetch-Cap pro Lauf), Fehler ⇒ Teaser-Fallback bleibt.
+#    3. RSS-Volltexte werden ebenfalls persistiert (0 Extra-Scrapes) —
+#       so überlebt der Text das Rausrotieren aus dem RSS-Feed und
+#       /api/news/article (L2-Cache = dieselbe Tabelle) hat ihn warm.
+#
+#  Die Tabelle ist DIESELBE wie der L2-Cache von /api/news/article
+#  (app.py) — dieser Layer schreibt zusätzlich `harvested_at`
+#  (Migration 20260710_news_fulltext.sql).
+#
+#  COPYRIGHT-LEITPLANKEN (Nachfix 2026-07-10 — „Quellenangabe+Link"
+#  lizenziert KEINE Volltext-Übernahme):
+#    • Reuters/AvHerald sind vom Volltext-Layer ausgenommen
+#      (_FULLTEXT_DENY_HOSTS): deren Terms verbieten Scraping/
+#      Republikation explizit → dort bleibt es beim Teaser +
+#      On-Demand-Reader-Link.
+#    • Der Scrape-Harvester respektiert robots.txt (_robots_allows).
+#    • KEIN Ewig-Serve: die Feed-Auslieferung liest den Store mit
+#      Serve-TTL (_FULLTEXT_SERVE_TTL_DAYS) — depublizierte Artikel
+#      fallen so nach Ablauf wieder auf den Teaser zurück (nur was
+#      die Quelle weiterhin öffentlich hält, wird beim Re-Harvest
+#      erneut lieferbar). §87f UrhG: jenseits von Snippets greift
+#      das Presseverleger-Leistungsschutzrecht.
+#    • Quellen-Link bleibt immer am Artikel.
+# ══════════════════════════════════════════════════════════════════
+
+_FULLTEXT_TABLE = 'news_article_cache'
+# Höflicher, identifizierender UA mit Kontaktadresse (Muster Planespotters-Fix).
+_FULLTEXT_HARVEST_UA = (
+    'AeroX/1.0 (news-fulltext-harvester; +https://aerosteuer.de; '
+    'contact: aerox@aerosteuer.de)'
+)
+_FULLTEXT_FETCH_TIMEOUT = 10          # Sekunden pro Quell-Fetch
+_FULLTEXT_STORE_MIN_CHARS = 80        # gleiches Gate wie /api/news/article
+_FULLTEXT_READABLE_MIN_CHARS = 400    # ab hier gilt „in-app lesbar" (wie RSS-Pfad)
+_FULLTEXT_FEED_CAP = 8000             # Payload-Cap, identisch zum RSS-Pfad
+_FULLTEXT_HARVEST_MAX_FETCHES = 10    # max. NEUE Quell-Fetches pro Harvest-Lauf
+_FULLTEXT_HARVEST_MAX_RSS_PUTS = 60   # max. RSS-Volltext-Upserts pro Lauf
+_FULLTEXT_HARVEST_DELAY_S = 1.0       # Pause zwischen zwei Quell-Fetches
+_FULLTEXT_HARVEST_MIN_GAP_S = 10 * 60  # min. Abstand zwischen zwei Läufen
+_FULLTEXT_HARVEST_STATE = {'last_run': 0.0, 'running': False}
+_FULLTEXT_HARVEST_LOCK = threading.Lock()
+# Serve-TTL für den Feed-Attach (Copyright: KEIN Ewig-Serve nach Depublikation
+# — nach Ablauf wird nur erneut lieferbar, was die Quelle noch öffentlich hält
+# und der Re-Harvest frisch zieht; Feed-Artikel rotieren ohnehin binnen Tagen).
+_FULLTEXT_SERVE_TTL_DAYS = 14
+# Volltext-HARTE Ausnahmen (Nachfix 2026-07-10): Terms verbieten Scraping/
+# Republikation explizit (Reuters ToS, AvHerald) — weder ernten noch aus dem
+# Store an den Feed hängen. Diese Quellen bleiben Teaser + Quell-Link.
+# Bewusst UNABHÄNGIG von app.NEWS_ARTICLE_ALLOWED_HOSTS (On-Demand-Reader),
+# damit ein Whitelist-Update den Harvest nicht wieder öffnet.
+_FULLTEXT_DENY_HOSTS = frozenset({
+    'reuters.com', 'www.reuters.com',
+    'avherald.com', 'www.avherald.com',
+})
+
+# Fallback-Whitelist falls app.py nicht ladbar (isolierte Blueprint-Tests).
+# Produktiv gewinnt app.NEWS_ARTICLE_ALLOWED_HOSTS (Single Source of Truth).
+_FULLTEXT_ALLOWED_HOSTS_FALLBACK = frozenset({
+    'aero.de', 'www.aero.de',
+    'aerotelegraph.com', 'www.aerotelegraph.com',
+    'aerobuzz.de', 'www.aerobuzz.de',
+    'aviation.direct', 'www.aviation.direct',
+    'austrianwings.info', 'www.austrianwings.info',
+    'reuters.com', 'www.reuters.com',
+    'avherald.com', 'www.avherald.com',
+    'simpleflying.com', 'www.simpleflying.com',
+    'theaircurrent.com', 'www.theaircurrent.com',
+    'flightradar24.com', 'www.flightradar24.com',
+})
+
+
+def _fulltext_allowed_hosts():
+    m = _debrief_get_app_module()
+    hosts = getattr(m, 'NEWS_ARTICLE_ALLOWED_HOSTS', None) if m else None
+    return hosts or _FULLTEXT_ALLOWED_HOSTS_FALLBACK
+
+
+def _fulltext_url_key(url):
+    """MUSS identisch zu app._news_article_url_key bleiben (geteilte Tabelle):
+    sha256(url) hex, erste 32 Zeichen."""
+    return hashlib.sha256((url or '').encode('utf-8', errors='replace')).hexdigest()[:32]
+
+
+def _fulltext_host(url):
+    try:
+        return (urllib.parse.urlsplit(url).netloc or '').lower().split(':')[0]
+    except Exception:
+        return ''
+
+
+def _fulltext_sb_execute(label, fn, timeout_s=5):
+    """Supabase-Call mit Timeout-Wrapper aus app.py wenn verfügbar (blockiert
+    den Feed-Request nicht bei SB-Hängern), sonst direkter Call. None bei Fehler."""
+    m = _debrief_get_app_module()
+    wrapper = getattr(m, '_supabase_execute_with_timeout', None) if m else None
+    if callable(wrapper):
+        res, timed_out = wrapper(label, fn, timeout_s=timeout_s)
+        return None if timed_out else res
+    return fn()
+
+
+def _fulltext_store_get_many(urls):
+    """Liest gespeicherte Volltexte für viele Artikel-URLs (chunked .in_()).
+
+    SERVE-TTL statt Ewig-Serve (Copyright-Nachfix 2026-07-10): Rows älter als
+    _FULLTEXT_SERVE_TTL_DAYS (fetched_at) werden NICHT mehr geliefert — ein
+    depublizierter Artikel fällt so wieder auf den Teaser zurück; nur was die
+    Quelle weiterhin öffentlich hält, zieht der Re-Harvest erneut frisch.
+    Deny-Hosts (Reuters/AvHerald) werden nie geliefert, auch nicht aus
+    Alt-Beständen. Return: {article_url: fulltext}. Leeres dict bei
+    SB-down/Fehler (wirft nie).
+    """
+    sb, available = _debrief_get_sb()
+    if not available or sb is None or not urls:
+        return {}
+    key_to_url = {}
+    for u in urls:
+        if u and _fulltext_host(u) not in _FULLTEXT_DENY_HOSTS:
+            key_to_url[_fulltext_url_key(u)] = u
+    out = {}
+    keys = list(key_to_url)
+    serve_cutoff = (datetime.now(timezone.utc)
+                    - timedelta(days=_FULLTEXT_SERVE_TTL_DAYS))
+    for i in range(0, len(keys), 100):
+        chunk = keys[i:i + 100]
+        try:
+            def _do(_chunk=chunk):
+                return (sb.table(_FULLTEXT_TABLE)
+                          .select('url_key, fulltext, fetched_at')
+                          .in_('url_key', _chunk)
+                          .execute())
+            res = _fulltext_sb_execute('news_fulltext_get', _do, timeout_s=5)
+            if res is None:
+                # Timeout/SB-Hänger → Store als down behandeln, KEINE weiteren
+                # Chunks stapeln (der Feed-Request soll nicht 3×5s warten).
+                break
+            for row in (getattr(res, 'data', None) or []):
+                ft = row.get('fulltext')
+                url = key_to_url.get(row.get('url_key'))
+                if not (url and ft and len(ft) >= _FULLTEXT_STORE_MIN_CHARS):
+                    continue
+                # Serve-TTL: unparsebares/fehlendes fetched_at zählt als
+                # abgelaufen (konservativ — lieber Teaser als Alt-Bestand).
+                try:
+                    fa = datetime.fromisoformat(
+                        str(row.get('fetched_at') or '').replace('Z', '+00:00'))
+                    if fa.tzinfo is None:
+                        fa = fa.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if fa < serve_cutoff:
+                    continue
+                out[url] = ft
+        except Exception as exc:
+            _log_warn(f'[news/fulltext] store_get chunk failed: {exc!r}')
+            break
+    return out
+
+
+def _fulltext_store_put(url, fulltext, title=None, source=None,
+                        image_url=None, published_at=None):
+    """Persistiert einen Artikel-Volltext (Upsert auf url_key). Best-effort.
+
+    Schreibt `harvested_at` (Migration 20260710_news_fulltext.sql); wenn die
+    Spalte noch fehlt (Migration nicht applied), Retry ohne sie — die Tabelle
+    selbst existiert bereits als L2-Cache von /api/news/article.
+    """
+    sb, available = _debrief_get_sb()
+    if not available or sb is None or not url or not fulltext:
+        return False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    record = {
+        'url_key': _fulltext_url_key(url),
+        'url': url,
+        'fulltext': fulltext,
+        'title': title,
+        'source': source or _fulltext_host(url),
+        'image_url': image_url,
+        'published_at': published_at,
+        'fetched_at': now_iso,
+        'harvested_at': now_iso,
+    }
+    last_exc = None
+    for attempt in (record, {k: v for k, v in record.items() if k != 'harvested_at'}):
+        try:
+            sb.table(_FULLTEXT_TABLE).upsert(attempt, on_conflict='url_key').execute()
+            return True
+        except Exception as exc:
+            last_exc = exc
+    _log_warn(f'[news/fulltext] store_put failed url={url[:100]} err={last_exc!r}')
+    return False
+
+
+# ── Extraktion ──────────────────────────────────────────────────────
+
+_FULLTEXT_CONTENT_SELECTORS = (
+    'article',
+    'main article',
+    'div.article-content', 'div.article-body', 'div.article__body',
+    'div[itemprop="articleBody"]',
+    'div.entry-content',            # WordPress (aerobuzz, aviation.direct, …)
+    'div.post-content',
+    'div.news-text',
+    'div.story-body', 'div.story-content',
+    'main',
+)
+
+_ARTICLE_TAG_RE = re.compile(r'<article\b[^>]*>(.*?)</article>', re.IGNORECASE | re.DOTALL)
+
+
+def _extract_fulltext_pure(html_doc):
+    """Pure Readability-Heuristik: größter <article>/<p>-Cluster → Plain-Text.
+
+    Keine neuen Dependencies — bs4 ist bereits Pflicht-Dep des Backends; ohne
+    bs4 degradiert es auf einen <article>-Regex-Fallback. Absätze werden mit
+    \\n\\n getrennt (iOS-Absatz-Rendering), Spenden-Appelle entfernt.
+    Deterministisch, wirft nie; '' wenn kein substanzieller Text (<200 Zeichen).
+    """
+    if not html_doc:
+        return ''
+    if BeautifulSoup is None:
+        m = _ARTICLE_TAG_RE.search(html_doc)
+        if not m:
+            return ''
+        text = _html_to_paragraph_text(m.group(1))
+        return _strip_donation_appeals(text) if len(text) >= 200 else ''
+
+    try:
+        soup = BeautifulSoup(html_doc, 'html.parser')
+    except Exception:
+        return ''
+    for junk in soup(['script', 'style', 'nav', 'header', 'footer', 'aside',
+                      'form', 'noscript', 'iframe']):
+        junk.decompose()
+
+    def _paragraphs_of(el, min_len=30):
+        paras = []
+        for node in el.find_all(['p', 'h2', 'h3', 'li', 'blockquote']):
+            t = node.get_text(' ', strip=True)
+            if t and len(t) >= min_len:
+                paras.append(_WS_RE.sub(' ', t))
+        return paras
+
+    # Kandidaten sammeln; es gewinnt der Container mit dem GRÖSSTEN
+    # <p>-Cluster (nicht der erste Treffer — Sidebars/Teaser-Listen haben
+    # zwar <article>-Tags, aber wenig Absatz-Text).
+    candidates = []
+    for sel in _FULLTEXT_CONTENT_SELECTORS:
+        try:
+            for el in soup.select(sel)[:4]:
+                candidates.append(el)
+        except Exception:
+            continue
+
+    best_paras, best_len = [], 0
+    for el in candidates:
+        paras = _paragraphs_of(el)
+        total = sum(len(p) for p in paras)
+        if total > best_len:
+            best_paras, best_len = paras, total
+
+    # <body> nur als FALLBACK wenn kein Selektor-Kandidat substanziell war —
+    # als regulärer Kandidat würde er als Superset (inkl. Sidebar/Teaser)
+    # jeden echten Content-Container "überstimmen".
+    if best_len < 200 and soup.body is not None:
+        paras = _paragraphs_of(soup.body)
+        total = sum(len(p) for p in paras)
+        if total > best_len:
+            best_paras, best_len = paras, total
+
+    text = '\n\n'.join(best_paras).strip()
+    if len(text) < 200:
+        return ''
+    try:
+        text = _strip_donation_appeals(text)
+    except Exception:
+        pass
+    if len(text) > 20000:
+        text = text[:20000].rsplit('\n\n', 1)[0]
+    return text
+
+
+def _extract_fulltext_for_harvest(html_doc, source_host=''):
+    """Produktions-Extraktion: bevorzugt die kampferprobte Multi-Strategie aus
+    app.py (`_news_extract_best_fulltext` + `_tidy_article_text`, inkl.
+    Boilerplate-Strip), Fallback = `_extract_fulltext_pure`."""
+    m = _debrief_get_app_module()
+    if m is not None:
+        best_fn = getattr(m, '_news_extract_best_fulltext', None)
+        if callable(best_fn):
+            try:
+                ft = best_fn(html_doc, source_host=source_host) or ''
+                tidy_fn = getattr(m, '_tidy_article_text', None)
+                if ft and callable(tidy_fn):
+                    tidied = tidy_fn(ft)
+                    if tidied and len(tidied) >= _FULLTEXT_STORE_MIN_CHARS:
+                        ft = tidied
+                if ft and len(ft) >= _FULLTEXT_STORE_MIN_CHARS:
+                    return ft
+            except Exception as exc:
+                _log_warn(f'[news/fulltext] app-extract failed: {exc!r}')
+    return _extract_fulltext_pure(html_doc)
+
+
+# robots.txt-Gate (Copyright/Politeness-Nachfix 2026-07-10): der proaktive
+# Harvester ist ein Crawler und MUSS robots.txt respektieren — der bisherige
+# On-Demand-Reader (1 User klickt 1 Artikel) war kein systematischer Crawl,
+# der Hintergrund-Harvest ist es. Per-Host gecacht; Fehler/5xx ⇒ konservativ
+# NICHT scrapen (kurze TTL, nächster Lauf probiert neu); 404 ⇒ erlaubt.
+_ROBOTS_CACHE = {}                 # host → (expires_unix, True|False|RobotFileParser)
+_ROBOTS_TTL_OK_S = 12 * 3600
+_ROBOTS_TTL_ERR_S = 30 * 60
+
+
+def _robots_allows(url):
+    """Darf der Harvester diese URL laut robots.txt der Quelle ziehen?
+    Best-effort, wirft nie; unklare Lage ⇒ False (höflich aussetzen)."""
+    import urllib.robotparser
+    host = _fulltext_host(url)
+    if not host:
+        return False
+    now = time.time()
+    hit = _ROBOTS_CACHE.get(host)
+    if hit and hit[0] > now:
+        verdict = hit[1]
+    else:
+        verdict, ttl = False, _ROBOTS_TTL_ERR_S
+        try:
+            scheme = urllib.parse.urlsplit(url).scheme or 'https'
+            resp = requests.get(
+                f'{scheme}://{host}/robots.txt', timeout=6,
+                headers={'User-Agent': _FULLTEXT_HARVEST_UA})
+            if resp.status_code == 200:
+                rp = urllib.robotparser.RobotFileParser()
+                rp.parse((resp.text or '').splitlines())
+                verdict, ttl = rp, _ROBOTS_TTL_OK_S
+            elif resp.status_code in (401, 403):
+                verdict, ttl = False, _ROBOTS_TTL_OK_S   # explizit zu
+            elif 400 <= resp.status_code < 500:
+                verdict, ttl = True, _ROBOTS_TTL_OK_S    # kein robots.txt
+        except Exception:
+            pass
+        _ROBOTS_CACHE[host] = (now + ttl, verdict)
+    if verdict is True or verdict is False:
+        return verdict
+    try:
+        return bool(verdict.can_fetch(_FULLTEXT_HARVEST_UA, url))
+    except Exception:
+        return False
+
+
+def _harvest_fetch_article_html(url):
+    """Zieht das Quell-HTML eines Artikels (höflich, mit Timeout). None bei Fehler."""
+    try:
+        resp = requests.get(
+            url,
+            timeout=_FULLTEXT_FETCH_TIMEOUT,
+            headers={
+                'User-Agent': _FULLTEXT_HARVEST_UA,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.7,en;q=0.5',
+            },
+            allow_redirects=True,
+        )
+    except requests.RequestException as exc:
+        _log_warn(f'[news/fulltext] fetch failed url={url[:100]} err={exc!r}')
+        return None
+    if resp.status_code != 200:
+        _log_warn(f'[news/fulltext] status={resp.status_code} url={url[:100]}')
+        return None
+    if not resp.encoding or resp.encoding.lower() == 'iso-8859-1':
+        resp.encoding = resp.apparent_encoding or 'utf-8'
+    return resp.text
+
+
+def _published_iso(art):
+    """published_at (unix int im Feed-Schema) → ISO-String für die Tabelle."""
+    try:
+        ts = art.get('published_at')
+        if ts:
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+    except Exception:
+        pass
+    return None
+
+
+def _harvest_run(articles):
+    """Thread-Body: Volltexte für neue Artikel permanent sichern.
+
+    Zwei Wellen: (1) RSS-Volltexte upserten (0 Scrapes), (2) für Artikel ohne
+    Volltext die Quellseite höflich scrapen (Whitelist, Cap, Delay). Ein
+    Fehler pro Artikel bricht nie den Lauf; der Feed-Teaser bleibt Fallback.
+    """
+    try:
+        allowed = _fulltext_allowed_hosts()
+        by_url = {}
+        for art in articles:
+            url = (art.get('article_url') or '').strip()
+            if not url or url in by_url:
+                continue
+            host = _fulltext_host(url)
+            # Deny-Hosts KOMPLETT raus (weder scrapen noch RSS-persistieren):
+            # Reuters/AvHerald-Terms verbieten Scraping/Republikation.
+            if host not in allowed or host in _FULLTEXT_DENY_HOSTS:
+                continue
+            by_url[url] = art
+
+        existing = _fulltext_store_get_many(list(by_url))
+        todo_rss, todo_fetch = [], []
+        for url, art in by_url.items():
+            if url in existing:
+                continue
+            ft = art.get('fulltext')
+            if ft and len(ft) >= _FULLTEXT_STORE_MIN_CHARS:
+                todo_rss.append((url, art))
+            else:
+                todo_fetch.append((url, art))
+
+        stored_rss = 0
+        for url, art in todo_rss[:_FULLTEXT_HARVEST_MAX_RSS_PUTS]:
+            if _fulltext_store_put(
+                url, art.get('fulltext'),
+                title=art.get('title'),
+                image_url=art.get('image_url_original') or art.get('image_url'),
+                published_at=_published_iso(art),
+            ):
+                stored_rss += 1
+
+        # Neueste zuerst ernten — die tauchen im UI oben auf.
+        todo_fetch.sort(key=lambda kv: kv[1].get('published_at') or 0, reverse=True)
+        stored_scrape = 0
+        fetched = 0
+        for url, art in todo_fetch:
+            if fetched >= _FULLTEXT_HARVEST_MAX_FETCHES:
+                break
+            # robots.txt der Quelle respektieren (per-Host gecacht; unklare
+            # Lage ⇒ auslassen, Teaser + On-Demand-Reader bleiben).
+            if not _robots_allows(url):
+                continue
+            fetched += 1
+            html_doc = _harvest_fetch_article_html(url)
+            if html_doc:
+                ft = _extract_fulltext_for_harvest(html_doc, source_host=_fulltext_host(url))
+                if ft and len(ft) >= _FULLTEXT_STORE_MIN_CHARS:
+                    if _fulltext_store_put(
+                        url, ft,
+                        title=art.get('title'),
+                        image_url=art.get('image_url_original') or art.get('image_url'),
+                        published_at=_published_iso(art),
+                    ):
+                        stored_scrape += 1
+            time.sleep(_FULLTEXT_HARVEST_DELAY_S)
+
+        if stored_rss or stored_scrape or fetched:
+            _logger.info(
+                '[news/fulltext] harvest done rss_stored=%d scraped_stored=%d '
+                'fetches=%d pending=%d', stored_rss, stored_scrape, fetched,
+                max(0, len(todo_fetch) - fetched))
+    except Exception as exc:
+        _logger.warning('[news/fulltext] harvest run failed: %r', exc)
+    finally:
+        with _FULLTEXT_HARVEST_LOCK:
+            _FULLTEXT_HARVEST_STATE['running'] = False
+
+
+def _kickoff_fulltext_harvest(articles):
+    """Startet den Harvest-Thread (non-blocking). Max. 1 Lauf gleichzeitig,
+    min. 10min Abstand, Kill-Switch NEWS_FULLTEXT_HARVEST=0, no-op ohne SB."""
+    if (os.environ.get('NEWS_FULLTEXT_HARVEST') or '1').strip() == '0':
+        return
+    sb, available = _debrief_get_sb()
+    if not available or sb is None:
+        return
+    now = time.time()
+    with _FULLTEXT_HARVEST_LOCK:
+        st = _FULLTEXT_HARVEST_STATE
+        if st['running'] or (now - st['last_run']) < _FULLTEXT_HARVEST_MIN_GAP_S:
+            return
+        st['running'] = True
+        st['last_run'] = now
+    # Shallow-Kopien — der Request-Thread mutiert die Artikel danach weiter
+    # (relevance/is_own_airline), der Harvester liest nur seine Kopien.
+    snapshot = [dict(a) for a in articles if isinstance(a, dict)]
+    threading.Thread(
+        target=_harvest_run, args=(snapshot,),
+        daemon=True, name='news-fulltext-harvest',
+    ).start()
+
+
+def _attach_stored_fulltexts(articles):
+    """Hängt gespeicherte Volltexte an Feed-Artikel OHNE RSS-Volltext
+    (Serve-TTL + Deny-Hosts erzwingt `_fulltext_store_get_many`).
+
+    EIN chunked Supabase-Roundtrip pro Feed-Rebuild (Cache-Miss-Pfad, ≤1×/15min).
+    Mutiert die Artikel in-place: fulltext (gecappt wie der RSS-Pfad) +
+    in_app_readable, damit ?readable_only=1 die Artikel nicht mehr aussiebt.
+    Wirft nie — SB-down ⇒ Feed unverändert (Teaser + On-Demand-Reader bleiben).
+    """
+    need = [a for a in articles
+            if not a.get('fulltext') and (a.get('article_url') or '').strip()]
+    if not need:
+        return
+    found = _fulltext_store_get_many([a['article_url'] for a in need])
+    if not found:
+        return
+    for art in need:
+        ft = found.get(art.get('article_url'))
+        if not ft:
+            continue
+        art['fulltext'] = ft[:_FULLTEXT_FEED_CAP]
+        if len(ft) >= _FULLTEXT_READABLE_MIN_CHARS:
+            art['in_app_readable'] = True
 
 
 # ══════════════════════════════════════════════════════════════════

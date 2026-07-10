@@ -520,10 +520,18 @@ def _parse_roster_day(row):
     is_flight = bool(chain) and len(chain) >= 2
     if is_flight and st and en and (en - st).total_seconds() >= 20 * 3600:
         is_flight = False
+    # Pro-Leg-Sektoren (Root-Fix 2026-07-10): SB legt ical_sectors im
+    # raw_event-jsonb ab (_ical_briefings_save_to_supabase whitelistet nur die
+    # Spalten); Disk-/Snapshot-Rows tragen den Key flach. Beides tolerieren.
+    raw = row.get('raw_event')
+    secs = raw.get('ical_sectors') if isinstance(raw, dict) else None
+    if not (isinstance(secs, list) and secs):
+        secs = row.get('ical_sectors')
+        secs = secs if isinstance(secs, list) and secs else None
     return {'datum': row.get('datum'), 'chain': chain,
             'first': loc.split(',')[0].strip().upper(),
             'st': st, 'en': en, 'st_iso': st_iso, 'en_iso': en_iso,
-            'is_flight': is_flight}
+            'is_flight': is_flight, 'sectors': secs}
 
 
 def _flight_window_state(day, legs_live, now):
@@ -617,6 +625,99 @@ def _pick_active_leg(chain, legs_live, now):
     return cands[0] if len(cands) == 1 else None
 
 
+_LEG_ARR_BUFFER_MIN = 40   # Verspätungs-Puffer ohne Beobachtung (Leg-Fenster)
+
+
+def _day_sectors_aligned(chain, sectors):
+    """Pro-Leg-Sektoren (ical_sectors[]) gegen die Tages-Kette AUSRICHTEN (PUR,
+    testbar): nur wenn Anzahl UND from/to exakt zur Kette passen und jede
+    dep_iso/arr_iso parsebar ist (echt-UTC, siehe _build_ical_sectors in app.py),
+    liefern wir [(dep_dt, arr_dt)] (aware UTC). Sonst None → der Aufrufer bleibt
+    beim alten Tages-Fenster-Verhalten (kein Raten, kein halber Datensatz)."""
+    if not (chain and len(chain) >= 2 and isinstance(sectors, list)
+            and len(sectors) == len(chain) - 1):
+        return None
+    out = []
+    for idx, s in enumerate(sectors):
+        if not isinstance(s, dict):
+            return None
+        frm = str(s.get('from') or '').strip().upper()
+        to = str(s.get('to') or '').strip().upper()
+        if frm != str(chain[idx]).upper() or to != str(chain[idx + 1]).upper():
+            return None
+        dep = _parse_iso(s.get('dep_iso'))
+        arr = _parse_iso(s.get('arr_iso'))
+        if not (dep and arr and dep < arr):
+            return None
+        out.append((dep, arr))
+    return out
+
+
+def _pick_current_sector(sector_times, legs_live, now,
+                         buffer_min=_LEG_ARR_BUFFER_MIN):
+    """EINEN kohärenten aktuellen Sektor zeitbasiert wählen (PUR, testbar) —
+    Root-Fix 2026-07-10 (Tibor-iPad: „Fliegt gerade BCN→FRA · Ankunft 15:20"
+    war die ROUTE des ersten Legs mit der ANKUNFT des letzten; der zeitlich
+    aktuelle Leg FRA→ARN fehlte komplett).
+      · 'inflight' idx: dep ≤ now < arr_eff — arr_eff bevorzugt die BEOBACHTETE
+        Verspätung (arr_delay_min/delay_min des Legs), sonst Plan; ohne
+        Beobachtung toleriert ein 2. Pass +buffer_min (Delay-Puffer). Eine
+        beobachtete LANDUNG beendet den Leg sofort (Board schlägt Uhr).
+      · 'pre' idx: vor dem nächsten kommenden Leg (wartet/boarding).
+      · 'done' idx: alle Legs (+Puffer) vorbei → gelandet am Tagesziel.
+    Alle Zeiten aware-UTC (dep_iso/arr_iso sind echt-UTC, now = UTC).
+    → (state, idx, dep_dt, arr_dt, arr_est_dt|None) | None."""
+    if not sector_times:
+        return None
+    obs_by_idx = {}
+    for l in (legs_live or []):
+        if isinstance(l, dict) and isinstance(l.get('leg_index'), int):
+            obs_by_idx[l['leg_index']] = l
+    legs = []
+    for idx, (dep, arr) in enumerate(sector_times):
+        o = obs_by_idx.get(idx) or {}
+        d = o.get('arr_delay_min')
+        if not isinstance(d, (int, float)):
+            d = o.get('delay_min')
+        arr_est = (arr + _dt.timedelta(minutes=float(d))
+                   if isinstance(d, (int, float)) and d > 0 else None)
+        stx = str(o.get('status') or '').lower()
+        landed = any(k in stx for k in ('landed', 'gelandet',
+                                        'arrived', 'angekommen'))
+        legs.append((dep, arr, arr_est, landed))
+    buf = _dt.timedelta(minutes=float(buffer_min))
+    # Pass 1: hartes Fenster (est bevorzugt), beobachtete Landung beendet sofort.
+    for idx, (dep, arr, arr_est, landed) in enumerate(legs):
+        if not landed and dep <= now < (arr_est or arr):
+            return ('inflight', idx, dep, arr, arr_est)
+    # Pass 2: Verspätungs-Puffer NUR ohne beobachtete Landung.
+    for idx, (dep, arr, arr_est, landed) in enumerate(legs):
+        if not landed and dep <= now < (arr_est or arr) + buf:
+            return ('inflight', idx, dep, arr, arr_est)
+    # Kein Leg aktiv → der nächste kommende („wartet"), sonst alles geflogen.
+    for idx, (dep, arr, arr_est, _landed) in enumerate(legs):
+        if now < dep:
+            return ('pre', idx, dep, arr, arr_est)
+    dep, arr, arr_est, _landed = legs[-1]
+    return ('done', len(legs) - 1, dep, arr, arr_est)
+
+
+def _snapshot_day_sectors(crew_token, datum_s):
+    """ical_sectors[] des Tages aus dem Roster-Snapshot (gleiche Quelle wie
+    _live_legs_for die Flugnummern zieht). None = ehrlich keine."""
+    try:
+        snap_read = _app_attr('_roster_snapshot_read')
+        if not callable(snap_read):
+            return None
+        tage = (snap_read(crew_token) or {}).get('tage') or []
+        dday = next((t for t in tage if isinstance(t, dict)
+                     and t.get('datum') == datum_s), {})
+        secs = dday.get('ical_sectors')
+        return secs if isinstance(secs, list) and secs else None
+    except Exception:
+        return None
+
+
 def _reg_for_leg(leg_obs, flight_no, datum):
     """Registration NUR aus echten Beobachtungen: erst die Board-/Warehouse-
     Beobachtung des Legs selbst (reg im Dual-Side-Merge), sonst die SB-Tages-
@@ -703,17 +804,21 @@ def _live_fix_for_reg(reg, datum):
     return fix
 
 
-def _flying_live_fix(chain, datum, fns, legs_live, now=None):
+def _flying_live_fix(chain, datum, fns, legs_live, now=None, forced_idx=None):
     """Orchestrierung für die Status-Felder: aktiven Leg eindeutig wählen →
     Reg aus echten Beobachtungen → memoisierten Fix holen → Frische-Gate.
     None bei JEDEM Zweifel — die Karte funktioniert dann rein interpoliert
-    weiter, nichts wird geraten und nichts bezahlt."""
+    weiter, nichts wird geraten und nichts bezahlt.
+    forced_idx (2026-07-10): hat der Loader den aktuellen Leg bereits kohärent
+    aus den Roster-Sektoren gewählt, gilt GENAU dieser — Fix-Route und
+    Karten-Route stammen dann garantiert aus demselben Leg."""
     try:
         if not (chain and len(chain) >= 2 and datum
                 and fns and len(fns) == len(chain) - 1):
             return None
         now_dt = now if now is not None else _dt.datetime.now(_dt.timezone.utc)
-        idx = _pick_active_leg(chain, legs_live, now_dt)
+        idx = (forced_idx if isinstance(forced_idx, int)
+               else _pick_active_leg(chain, legs_live, now_dt))
         if idx is None or not (0 <= idx < len(fns)):
             return None
         leg_obs = next((l for l in (legs_live or [])
@@ -909,6 +1014,9 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     flight_phase = None         # kanonische Phase (fliegt/gelandet/rollt/am Gate)
     active_datum = None         # datum des AKTIVEN Flugtags (Red-Eye: ggf. gestern)
     day_fns = {}                # datum → 1:1 gemappte Flugnummern (aus _live_legs_for)
+    leg_picked = False          # EIN kohärenter aktueller Leg gewählt (2026-07-10)
+    active_leg_idx = None       # dessen Index — NUR wenn er JETZT fliegt (Live-Fix)
+    current_leg_obs = None      # Board-/Warehouse-Beobachtung DIESES Legs
 
     # ROOT-FIX 2026-07-06 (Owner: „Family hat weder die Verspätung noch die
     # Landung bemerkt") — der alte Block hatte drei strukturelle Fehler:
@@ -981,6 +1089,29 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         flying, en_eff, landed_obs = _flight_window_state(day, legs_live, now)
         return flying, en_eff, legs_live, landed_obs
 
+    def _current_leg_overlay(day, legs_live, now):
+        """EIN kohärenter aktueller Leg des Tages (Root-Fix 2026-07-10):
+        Sektoren aus dem Roster (SB raw_event, sonst Snapshot) gegen die Kette
+        ausrichten und zeitbasiert wählen. None → alter Tages-Fenster-Pfad.
+        → (state, idx, dep_iso_z, arr_iso_z, arr_est_iso_z|None, leg_obs|None)"""
+        secs = day.get('sectors') or _snapshot_day_sectors(crew_token,
+                                                           day.get('datum'))
+        times = _day_sectors_aligned(day.get('chain'), secs)
+        if not times:
+            return None
+        cur = _pick_current_sector(times, legs_live, now)
+        if not cur:
+            return None
+        state, idx, dep_dt, arr_dt, arr_est_dt = cur
+
+        def _z(d):
+            return d.strftime('%Y-%m-%dT%H:%M:%SZ') if d else None
+
+        leg_obs = next((l for l in (legs_live or [])
+                        if isinstance(l, dict) and l.get('leg_index') == idx),
+                       None)
+        return state, idx, _z(dep_dt), _z(arr_dt), _z(arr_est_dt), leg_obs
+
     if sb_avail and sb is not None:
         # ical_location-Format: „JFK, FRA-JFK-FRA". Erstes Token = Aufenthaltsort
         # des Tages. An einem HOMEBASE-Tag (Tag-Trip FRA-LUX-FRA → erstes Token =
@@ -990,8 +1121,11 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
             today_d = _dt.datetime.now().date()
             days = [today_d.isoformat(),
                     (today_d - _dt.timedelta(days=1)).isoformat()]
+            # raw_event trägt die Pro-Leg-Sektoren (ical_sectors, echt-UTC-
+            # Zeiten je Leg) — Grundlage der kohärenten Aktuell-Leg-Wahl.
             r = (sb.table('user_ical_briefings')
-                 .select('datum,ical_location,ical_summary,ical_start,ical_end')
+                 .select('datum,ical_location,ical_summary,ical_start,ical_end,'
+                         'raw_event')
                  .eq('token', crew_token).in_('datum', days).execute())
             by_date = {rw.get('datum'): rw for rw in (r.data or [])}
             prim = _parse_roster_day(by_date[days[0]]) if by_date.get(days[0]) else None
@@ -1020,6 +1154,34 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                 # vom Plan abweicht — iOS zeigt dann „Ankunft ~HH:mm · +N min".
                 if en_eff and active_day['en'] and en_eff != active_day['en']:
                     today_arr_est_iso = en_eff.isoformat().replace('+00:00', 'Z')
+                # ROOT-FIX 2026-07-10 (Tibor-iPad „Fliegt gerade BCN→FRA ·
+                # Ankunft 15:20" bei BCN-FRA-ARN-FRA): oben ist ein FELD-MIX aus
+                # zwei Legs — Route = Ketten-Enden (erster Abflug/letzte
+                # Station), Ankunft = DIENST-Ende (= Ankunft des LETZTEN Legs);
+                # der zeitlich AKTUELLE Leg (FRA→ARN) fehlte komplett. Mit
+                # Pro-Leg-Sektoren kommen Route, Zeiten UND Live-Fix jetzt alle
+                # aus EINEM zeitbasiert gewählten Leg; zwischen den Legs ist die
+                # Crew ehrlich am Boden („wartet" auf den nächsten Leg), nach
+                # dem letzten Leg gelandet. Ohne Sektoren: altes Verhalten.
+                ov = _current_leg_overlay(active_day, legs_live_cached, now)
+                if ov:
+                    lstate, lidx, dep_z, arr_z, arr_est_z, current_leg_obs = ov
+                    leg_picked = True
+                    today_dep = today_chain[lidx]
+                    today_arr = today_chain[lidx + 1]
+                    today_dep_iso, today_arr_iso = dep_z, arr_z
+                    today_arr_est_iso = arr_est_z
+                    if lstate == 'inflight':
+                        active_leg_idx = lidx
+                    else:
+                        flying_now = False
+                        if lstate == 'done' and today_arr:
+                            # Alle Legs (+Puffer) geflogen → am Tagesziel, auch
+                            # wenn das Dienst-Fenster (Debriefing) noch läuft.
+                            if today_arr == hb and hb:
+                                roster_today_home = True
+                            else:
+                                roster_layover = today_arr
             elif prim and prim['is_flight']:
                 # Heutiger Flugtag, aber Fenster läuft (noch) nicht: Felder für
                 # die Vorschau setzen; nach dem (ggf. verspäteten/beobachteten)
@@ -1029,12 +1191,24 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                 today_dep, today_arr = today_chain[0], today_chain[-1]
                 today_dep_iso = prim['st_iso']
                 today_arr_iso = prim['en_iso']
+                # Kohärenter Leg auch für die Vorschau/Nachlauf-Karte (sonst
+                # zeigt „wartet auf den ersten Leg" die Ankunft des LETZTEN).
+                ov = _current_leg_overlay(prim, legs_live_cached, now)
+                if ov:
+                    _lstate, lidx, dep_z, arr_z, arr_est_z, current_leg_obs = ov
+                    leg_picked = True
+                    today_dep = today_chain[lidx]
+                    today_arr = today_chain[lidx + 1]
+                    today_dep_iso, today_arr_iso = dep_z, arr_z
+                    today_arr_est_iso = arr_est_z
                 ended = (en_eff and now > en_eff) or landed_obs
-                if ended and today_arr:
-                    if today_arr == hb and hb:
+                if ended and today_chain[-1]:
+                    # Tagesziel = letzte Station der KETTE (nicht der ggf. auf
+                    # einen Zwischen-Leg gestellte today_arr).
+                    if today_chain[-1] == hb and hb:
                         roster_today_home = True
                     else:
-                        roster_layover = today_arr
+                        roster_layover = today_chain[-1]
             elif prim and len(prim['first']) == 3 and prim['first'].isalpha():
                 # Kein Flugtag → erstes Token ist der echte Aufenthaltsort.
                 if prim['first'] == hb and hb:
@@ -1057,7 +1231,15 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     # Kanonische Phase aus der Board-Beobachtung (Owner: „Family/Freunde sollen
     # gelandet/rollt/am Gate aus DER Quelle zeigen, nicht selbst raten") — dieselbe
     # status_for_flight-Logik wie überall, seiten-bewusst. Nur wenn Obs vorliegt.
-    flight_phase = _canonical_flight_phase(legs_live_cached)
+    # Kohärenz-Fix 2026-07-10: ist EIN aktueller Leg gewählt, kommt die Phase
+    # aus DESSEN Beobachtung — nicht (wie vorher) aus dem LETZTEN Leg des Tages
+    # (der bei Mehr-Leg-Tagen noch gar nicht geflogen ist). Ohne Obs des
+    # gewählten Legs ehrlich None statt Fremd-Leg-Phase.
+    if leg_picked:
+        flight_phase = (_canonical_flight_phase([current_leg_obs])
+                        if current_leg_obs else None)
+    else:
+        flight_phase = _canonical_flight_phase(legs_live_cached)
     if 'next_flight' in allowed_fields:
         status['flying_now'] = flying_now
         status['flight_phase'] = flight_phase   # 'airborne'|'landed'|'grounded'|'cancelled'|None
@@ -1091,8 +1273,14 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         # (_window_state → _live_legs_for) — hier nur noch durchreichen, kein
         # zweiter Resolver-Lauf.
         status['today_flights_live'] = legs_live_cached or None
-        status['today_delay_min'] = (legs_live_cached[-1].get('delay_min')
-                                     if legs_live_cached else None)
+        # Delay-Anzeige gehört zum GEWÄHLTEN Leg (Kohärenz 2026-07-10) — sonst
+        # trägt die FRA→ARN-Karte die Verspätung des ARN→FRA-Rückflugs.
+        if leg_picked:
+            status['today_delay_min'] = ((current_leg_obs or {}).get('delay_min')
+                                         if current_leg_obs else None)
+        else:
+            status['today_delay_min'] = (legs_live_cached[-1].get('delay_min')
+                                         if legs_live_cached else None)
         # Plan-Ende + beobachtete Verspätung (None wenn keine Abweichung) —
         # iOS zeigt damit die korrigierte Ankunft statt der Plan-Zeit.
         status['today_arr_est_iso'] = today_arr_est_iso
@@ -1102,9 +1290,13 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         # vor Tier-3-purpose=watch: siehe _flying_live_fix. Bei None bleibt
         # die Karte rein interpoliert — kein Raten, keine Felder.
         if flying_now and today_chain and active_datum:
+            # forced_idx (2026-07-10): der Live-Fix nutzt DENSELBEN zeitbasiert
+            # gewählten Leg wie die Karten-Felder — kein Feld-Mix zwischen
+            # Fix-Route und angezeigter Route.
             _fix = _flying_live_fix(today_chain, active_datum,
                                     day_fns.get(active_datum),
-                                    legs_live_cached)
+                                    legs_live_cached,
+                                    forced_idx=active_leg_idx)
             # FLIGHTSTATE-Gate (Kill-Switch FLIGHTSTATE_LIVE_FAMILY=1): der Fix
             # läuft durch die ENGINE (statt nur durchs rohe Kinematik-Gate) —
             # nur eine WIRKLICH fliegende Position an die Family (Taxi/Boden ⇒

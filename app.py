@@ -11934,6 +11934,70 @@ def _active_sector_flight_numbers(day):
         return []
 
 
+def _friends_live_leg_check(fno, frm, to):
+    """GRATIS-Gegencheck gegen den aircraft_live-Store (NAS-Harvester/FR24-gRPC)
+    für die lay_eff-Kaskade: fliegt die Maschine dieser Flugnummer GERADE
+    (route-konsistent, dest == to)?
+      'airborne' — nachweislich in der Luft,
+      'at_dep'   — am Boden nahe (≤8 km) dem ABFLUG-Flughafen (wartet noch),
+      'at_arr'   — am Boden nahe dem ZIEL (echt angekommen),
+      None       — kein frischer Snapshot / Position keinem Ende zuordenbar.
+    Reiner Supabase/NAS-Read (kein Paid-Spend), wirft nie. Existiert, weil die
+    reine Plan-Uhr (ARR-DECKEL arr+30min) einen real verspäteten, obs-losen Leg
+    sonst ans Ziel teleportiert, während die Maschine noch fliegt oder gar noch
+    am Abflug-Gate steht (Nachfix 2026-07-10)."""
+    try:
+        from blueprints.aerox_data_blueprint import _aircraft_live_pos, _iata_latlon
+        pos, _rt, _rg, _ty = _aircraft_live_pos(flight=fno, dep=to)
+        if not pos or pos.get('lat') is None or pos.get('lon') is None:
+            return None
+        if not pos.get('on_ground'):
+            return 'airborne'
+        for ap, label in ((frm, 'at_dep'), (to, 'at_arr')):
+            try:
+                ll = _iata_latlon(ap)
+                if ll and _haversine_km(float(pos['lat']), float(pos['lon']),
+                                        ll[0], ll[1]) <= 8.0:
+                    return label
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def _friends_obs_provably_stale(merged, frm, to, dep):
+    """Beweist eine Board-Obs als VERALTET (Row eines FRÜHEREN Betriebstags)
+    über ihre EIGENEN Zeitstempel — statt „kein Delay = stale" als Proxy
+    (Boards flippen häufig nur den Status auf delayed/Boarding OHNE est-Zeiten;
+    ein echt wartender Flug trägt also NICHT zwingend einen Delay).
+    Live verifizierter Root-Cause (Tibor LH1139): die BCN-dep-Row trug ein
+    est_dep vom VORTAG. Regel: mindestens ein datierbarer Stempel liegt ≥6 h
+    VOR dem Roster-Plan-Abflug (heutige Rows liegen nie so früh — Delays
+    schieben nach HINTEN) und KEIN Stempel sieht aktuell aus. Zeit-lose Rows
+    (nur „HH:MM"/kein Stempel) sind NICHT beweisbar stale → Pin bleibt (die
+    sichere Fehlerrichtung: Crew am Abflughafen). Wirft nie."""
+    if not merged or dep is None:
+        return False
+    saw_old = saw_current = False
+    for val, ap in ((merged.get('esti_dep'), frm), (merged.get('sched_dep'), frm),
+                    (merged.get('esti_arr'), to), (merged.get('sched_arr'), to)):
+        if not val:
+            continue
+        try:
+            iso = _board_local_to_utc_iso(val, ap)
+            if not iso:
+                continue
+            ts = datetime.fromisoformat(iso.replace('Z', '+00:00'))
+        except Exception:
+            continue
+        if ts <= dep - timedelta(hours=6):
+            saw_old = True
+        else:
+            saw_current = True
+    return saw_old and not saw_current
+
+
 _FRIENDS_TODAY_MEMO = {}          # "token|datum" → (expires_monotonic, resp)
 _FRIENDS_TODAY_TTL = 90.0         # 90 s: Feed lädt sonst pro Aufruf N×M sequ. Board-Lookups
 
@@ -12027,6 +12091,28 @@ def get_friends_today(token):
                 for sec in secs:
                     dep = datetime.fromisoformat(
                         str(sec['dep_iso']).replace('Z', '+00:00'))
+                    # PLAN-ANKUNFT dieses Sektors (TIBOR-LIVEFALL 2026-07-10,
+                    # LH1139 BCN→FRA 06:40–08:55): die Kaskade kannte bisher
+                    # NUR dep_iso — der zeitlich AKTUELLE Leg braucht aber
+                    # beide Enden (dep_iso ≤ now < arr_iso+Puffer). arr_iso
+                    # fehlt bei manchen Roster-Quellen → None = altes
+                    # Verhalten, kein erfundenes Ende.
+                    arr_dt = None
+                    try:
+                        if sec.get('arr_iso'):
+                            arr_dt = datetime.fromisoformat(
+                                str(sec['arr_iso']).replace('Z', '+00:00'))
+                    except Exception:
+                        arr_dt = None
+                    # PLAUSI-GUARD (Nachfix 2026-07-10): korruptes/Red-Eye-
+                    # arr_iso ≤ dep_iso (Roster-Reader-Macke: Red-Eye-Ankunft
+                    # ohne end_iso fällt auf den Abflugtag) machte _grace_end
+                    # < dep — der Leg galt als GEFLOGEN, bevor er überhaupt
+                    # abgeflogen war, und entschärfte zusätzlich den Branch-4-
+                    # Pin. Ein Flug landet IMMER nach seinem Abflug →
+                    # unplausibles Ende verwerfen (= altes dep+4h-Verhalten).
+                    if arr_dt is not None and arr_dt <= dep:
+                        arr_dt = None
                     frm = str(sec.get('from') or '').strip().upper()
                     to = str(sec.get('to') or '').strip().upper()
                     if not (len(frm) == 3 and frm.isalpha()):
@@ -12087,6 +12173,44 @@ def get_friends_today(token):
                     elif (merged and bucket == 'grounded') or delay_pin:
                         # (4) Echtes Signal „noch nicht abgeflogen" → Crew
                         # ist am Abflughafen dieses Legs, egal wie spät.
+                        # STALE-GROUNDED-KAPPE v2 (Tibor LH1139 BCN→FRA,
+                        # 2026-07-10 ~09:30: Feed klebte auf „unterwegs nach
+                        # Barcelona", obwohl der Leg 08:55 gelandet war —
+                        # gestrige AENA-„Boarding"-Row derselben Flugnummer,
+                        # live verifiziert: die BCN-dep-Row trug est_dep vom
+                        # VORTAG). v1 nahm „kein quantifizierter Delay" als
+                        # Stale-Beweis — Boards flippen aber häufig NUR den
+                        # Status (delayed/Boarding) OHNE est-Zeiten: ein ECHT
+                        # noch wartender Flug wäre ab arr+30min ans Ziel
+                        # teleportiert worden. Jetzt entscheidet (a) der
+                        # GRATIS aircraft_live-Gegencheck und (b) die
+                        # Staleness der Obs SELBST (est/sched-Stempel eines
+                        # FRÜHEREN Betriebstags). Unbeweisbar stale ⇒ der
+                        # Ewig-Pin (Owner 2026-07-04 „unabhängig von der
+                        # Uhr") bleibt — die sichere Fehlerrichtung.
+                        if (arr_dt is not None and not delay_pin
+                                and datetime.now(timezone.utc)
+                                >= arr_dt + timedelta(minutes=30)):
+                            _lv = _friends_live_leg_check(fno, frm, to)
+                            if _lv == 'airborne':
+                                # Maschine fliegt NACHWEISLICH → Board-Row
+                                # stale; wie Zweig (3): unterwegs, geplanten
+                                # Layover behalten.
+                                pos = None
+                                break
+                            if _lv == 'at_arr':
+                                # Echt am Ziel gelandet (Live-Beobachtung).
+                                if len(to) == 3 and to.isalpha():
+                                    pos = to
+                                observed_end = True
+                                continue
+                            if (_lv != 'at_dep'
+                                    and _friends_obs_provably_stale(
+                                        merged, frm, to, dep)):
+                                if len(to) == 3 and to.isalpha():
+                                    pos = to
+                                observed_end = False
+                                continue
                         pos = frm
                         break
                     else:
@@ -12095,9 +12219,41 @@ def get_friends_today(token):
                         # danach Plan-Annahme „geflogen" → weiter zum Ziel
                         # und den nächsten Sektor prüfen (sonst bliebe ein
                         # obs-loser Zwischenstopp für immer kleben).
-                        if datetime.now(timezone.utc) < dep + timedelta(hours=4):
+                        # ARR-DECKEL (Tibor LH1139 BCN→FRA 2026-07-10): die
+                        # reine dep+4h-Grace pinnte die Crew bei Kurzstrecken
+                        # noch STUNDEN nach der Plan-Landung an den Abflug-
+                        # hafen (BCN dep 06:40 → Grace bis 10:40, obwohl arr
+                        # 08:55 — um 09:30 stand „unterwegs nach Barcelona"
+                        # statt „in Frankfurt"). Der zeitlich aktuelle Leg
+                        # endet an SEINER Plan-Ankunft: ohne Gegenteils-
+                        # Signal gilt er ab arr+30min als geflogen.
+                        _grace_end = dep + timedelta(hours=4)
+                        if arr_dt is not None:
+                            _grace_end = min(_grace_end,
+                                             arr_dt + timedelta(minutes=30))
+                        if datetime.now(timezone.utc) < _grace_end:
                             pos = frm
                             break
+                        # GEISTER-SCHUTZ (Nachfix 2026-07-10): der ARR-DECKEL
+                        # kippte einen obs-losen Leg (typisch Outstation-
+                        # Abflug: nur DE/EU-Hubs geharvestet → kein Board)
+                        # ab arr+30min BLIND auf „geflogen" — bei realem,
+                        # unbeobachtetem Delay >30min zeigte der Feed die
+                        # Crew am Ziel, während die Maschine noch flog oder
+                        # noch am Abflug-Gate stand. Vor dem Plan-Flip den
+                        # GRATIS aircraft_live-Store fragen (existiert genau
+                        # dafür): airborne → ehrlich „unterwegs" (geplanten
+                        # Layover behalten, wie Zweig 3); am Boden nahe dem
+                        # ABFLUG-Flughafen → Pin bleibt. Nur ohne Gegenbeweis
+                        # gilt die Plan-Annahme (kein erfundener Ort).
+                        if arr_dt is not None:
+                            _lv = _friends_live_leg_check(fno, frm, to)
+                            if _lv == 'airborne':
+                                pos = None
+                                break
+                            if _lv == 'at_dep':
+                                pos = frm
+                                break
                         if len(to) == 3 and to.isalpha():
                             pos = to
                         observed_end = False
@@ -27084,6 +27240,30 @@ def _fold_codeshare_flights(flights, cs_map):
     return out
 
 
+def _route_track_flight_set(frm, to, day, lo_iso, hi_iso):
+    """Set der (auf `_fn_norm` normalisierten) Flugnummern, für die auf der
+    Strecke frm→to am UTC-Tag `day` eine ECHTE geflogene Spur in aircraft_track
+    existiert (Breadcrumbs vom Harvester + FR24-Rückschreibung) — dieselbe
+    Wahrheit wie Tier 1 (`_flown_track_db`) des /api/ax/flown-track-Endpoints,
+    nur als billiger Existenz-Check. EINE gebündelte Query pro Tag (origin/dest
+    scoped bereits eng, plus seen_ts-Fenster), NICHT N Abfragen pro Flug. Der
+    aircraft_track.flight-Wert ist die rohe FR24-Nummer (LH174) → hier wie in der
+    Historie mit `_fn_norm` normalisiert, damit der Vergleich mit dem
+    normalisierten entry['flight'] (SQ026→SQ26) trifft. Best-effort: bei
+    fehlendem SB/Fehler leeres Set (has_track fällt auf False, nie Exception)."""
+    if sb is None or not frm or not to:
+        return set()
+    try:
+        rows = (sb.table('aircraft_track')
+                .select('flight')
+                .eq('origin', frm).eq('dest', to)
+                .gte('seen_ts', lo_iso).lt('seen_ts', hi_iso)
+                .limit(4000).execute()).data or []
+    except Exception:
+        return set()
+    return {_fn_norm(r.get('flight')) for r in rows if r.get('flight')}
+
+
 @app.route('/api/ax/route-history/<frm>/<to>', methods=['GET'])
 def ax_route_history(frm, to):
     """Strecken-Historie (Pünktlichkeit pro Tag) für ein Städtepaar — aus den
@@ -27255,6 +27435,22 @@ def ax_route_history(frm, to):
             else:
                 late += 1
         if flights:
+            # has_track (2026-07-10): pro Flug UPFRONT markieren, ob eine ECHTE
+            # geflogene Spur in aircraft_track liegt (Tier-1-Wahrheit des
+            # /api/ax/flown-track). EINE gebündelte Query je Tag (origin/dest +
+            # UTC-Tagesfenster wie der flown-track-Endpoint) statt N pro Flug.
+            # Additiv — fehlt/False bricht keinen bestehenden Consumer.
+            try:
+                # UTC-Tagesfenster exakt wie flown-track: [d 00:00Z, d+1 00:00Z).
+                from datetime import datetime as _dtc, timezone as _tzc
+                _d0 = _dtc.strptime(d, '%Y-%m-%d').replace(tzinfo=_tzc.utc)
+                lo_iso_d = _d0.strftime('%Y-%m-%dT00:00:00Z')
+                hi_iso_d = (_d0 + _td(days=1)).strftime('%Y-%m-%dT00:00:00Z')
+                trk_set = _route_track_flight_set(frm, to, d, lo_iso_d, hi_iso_d)
+            except Exception:
+                trk_set = set()
+            for e in flights:
+                e['has_track'] = bool(_fn_norm(e.get('flight')) in trk_set)
             # Hinweis: arr-Zeilen tragen die ANKUNFTS-Zeit als sched — die
             # Sortierung bleibt chronologisch-genug fürs Tages-Listing.
             flights.sort(key=lambda f: (f.get('sched') or ''))
