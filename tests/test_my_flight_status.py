@@ -277,8 +277,11 @@ def test_flights_live_batch_single_call_per_leg(client, monkeypatch):
     client.get(f'/api/user/friends-today/{tok}')
     # 1× für lay_eff-Kaskade ist HIER 0 (homebase=MUC, dep=FRA≠MUC → lay_eff-Zweig
     # ruft AUCH _flight_obs_merged). Wir prüfen darum: kein Fan-out über Freunde,
-    # Aufrufzahl bleibt klein & konstant (≤2: lay_eff + flights_live).
-    assert mock.call_count <= 2
+    # Aufrufzahl bleibt klein & konstant (≤3: lay_eff + flights_live +
+    # crew_state-Resolver 2026-07-10 — in Prod dedupliziert der
+    # _FLIGHT_MERGE_CACHE identische Args auf EINEN echten Lookup, der Mock
+    # hier zählt die rohen Aufrufe).
+    assert mock.call_count <= 3
     assert all(c.kwargs.get('free_only') is True for c in mock.call_args_list)
 
 

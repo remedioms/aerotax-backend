@@ -913,6 +913,10 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         # Landung an der Homebase (Dienst vorbei) — die Card zeigt „Feierabend"
         # statt eines falschen Layovers (User 2026-06-25).
         'home_now': None,
+        # ADDITIV (Neubau 2026-07-10): EINE Wahrheit — expliziter Live-Zustand
+        # inkl. SERVERSEITIGEM Text aus blueprints/crew_live_state (gleicher
+        # Resolver wie friends-today). iOS zeigt crew_state.text 1:1.
+        'crew_state': None,
     }
     prof = {}   # vor-initialisiert: wirft der try-Block, darf Z. „hb = prof.get“ nicht NameError-n
     try:
@@ -1381,6 +1385,46 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                         status['today_arr_iata'] = _lr['dst']
                         status['today_dep_city'] = _iata_city_name(_lr['src'])
                         status['today_arr_city'] = _iata_city_name(_lr['dst'])
+    # ── EINE Wahrheit (Neubau 2026-07-10): crew_state aus dem zentralen
+    # Resolver blueprints/crew_live_state — DERSELBE wie in friends-today.
+    # Expliziter Zustand (home|standby|pre_flight|flying|landed|layover) +
+    # SERVERSEITIGER Text („Fliegt gerade" / „Gelandet in …" / „Wartet auf
+    # LH… · HH:MM" / „Layover …" / „Basis …" nur ohne Dienst) — iOS zeigt ihn
+    # 1:1. ADDITIV: alle Altfelder oben bleiben für alte Builds unverändert.
+    # Grant-Gate wie flying_now/today_* (next_flight). Best-effort, wirft nie.
+    if 'next_flight' in allowed_fields:
+        try:
+            from blueprints.crew_live_state import (resolve_crew_live_state,
+                                                    build_obs_lookup,
+                                                    build_live_lookup,
+                                                    build_local_hhmm)
+            _cs_day = None
+            try:
+                # Aktiver Flugtag zuerst (Red-Eye: ggf. der gestrige), sonst
+                # der heutige Flugtag (Vorschau/Nachlauf). Kein Flugtag →
+                # Leg-loser Resolver-Pfad (Layover-Ruhetag/Basis).
+                _cs_day = active_day if active_day is not None else (
+                    prim if (prim and prim.get('is_flight')) else None)
+            except NameError:
+                _cs_day = None   # SB-Zweig übersprungen/abgebrochen
+            _cs_secs, _cs_datum = [], None
+            if _cs_day is not None:
+                _cs_datum = _cs_day.get('datum')
+                _cs_secs = (_cs_day.get('sectors')
+                            or _snapshot_day_sectors(crew_token, _cs_datum)
+                            or [])
+            status['crew_state'] = resolve_crew_live_state(
+                _cs_secs,
+                build_obs_lookup(_app_attr('_flight_obs_merged'), _cs_datum),
+                build_live_lookup(),
+                _dt.datetime.now(_dt.timezone.utc),
+                homebase=hb or None,
+                layover_iata=roster_layover,
+                city_lookup=_iata_city_name,
+                local_hhmm=build_local_hhmm(_app_attr('airport_tz')),
+                status_bucket=_app_attr('_flight_status_bucket'))
+        except Exception as e:
+            _log().info(f'[family-watch] crew_state_skip {type(e).__name__}')
     if 'layover_place' in allowed_fields:
         status['layover_place'] = roster_layover
         status['layover_place_city'] = (_iata_city_name(roster_layover)
@@ -1443,6 +1487,9 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         status['live_speed_kt'] = None
         status['live_ts_iso'] = None
         status['live_source'] = None
+        # crew_state hängt am selben Grant (Defense-in-Depth — gesetzt wird
+        # es ohnehin nur im Grant-Block oben).
+        status['crew_state'] = None
     if 'layover_place' not in allowed_fields:
         status['layover_place'] = None
         status['layover_place_city'] = None

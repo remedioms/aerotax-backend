@@ -12002,6 +12002,71 @@ _FRIENDS_TODAY_MEMO = {}          # "token|datum" → (expires_monotonic, resp)
 _FRIENDS_TODAY_TTL = 90.0         # 90 s: Feed lädt sonst pro Aufruf N×M sequ. Board-Lookups
 
 
+def _friend_briefing_day_sectors(fr, datum):
+    """(ical_sectors, imported_at) des Tages DIREKT aus user_ical_briefings
+    (1 gefilterter SB-Read). Der serverseitige Kalender-Refresh
+    (_maybe_refresh_calendar_feed) hält diese Tabelle frisch — der push-basierte
+    roster_snapshot kann dahinter STALE sein (Diagnose 2026-07-10: iCal-Freunde
+    froren auf dem letzten App-Push ein). None,None wenn nichts da / SB down."""
+    try:
+        if not (SB_AVAILABLE and sb is not None and fr and datum):
+            return None, None
+        r = (sb.table('user_ical_briefings')
+             .select('datum,updated_at,raw_event')
+             .eq('token', fr).eq('datum', datum).limit(1).execute())
+        rows = getattr(r, 'data', None) or []
+        if not rows:
+            return None, None
+        row = rows[0]
+        ts = str(row.get('updated_at') or '') or None
+        raw = row.get('raw_event') or {}
+        secs = raw.get('ical_sectors') if isinstance(raw, dict) else None
+        if not (isinstance(secs, list) and secs):
+            return None, ts
+        return secs, ts
+    except Exception:
+        return None, None
+
+
+def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None):
+    """Additives `crew_state`-Feld für friends-today — EINE Wahrheit über den
+    Neubau-Resolver blueprints/crew_live_state (Owner 2026-07-10: „baue es
+    komplett neu auf damit es funktioniert, auch Text"). iOS zeigt text.title/
+    subtitle 1:1, kein lokales Raten mehr. Frisches Briefing SCHLÄGT stalen
+    Snapshot (pick_fresher_sectors). free-first: Board-Obs free_only=True,
+    Live-Gegencheck = reiner aircraft_live-Read. None bei jedem Fehler —
+    Altfelder bleiben unverändert stehen."""
+    try:
+        from blueprints.crew_live_state import (resolve_crew_live_state,
+                                                pick_fresher_sectors,
+                                                build_obs_lookup,
+                                                build_live_lookup,
+                                                build_local_hhmm)
+        from blueprints.aerox_data_blueprint import _iata_city_name
+        day = day or {}
+        snap_secs = [s for s in (day.get('ical_sectors') or [])
+                     if isinstance(s, dict)]
+        b_secs, b_ts = _friend_briefing_day_sectors(fr, datum)
+        secs, _src = pick_fresher_sectors(snap_secs, snap_ts, b_secs, b_ts)
+        rf = day.get('reader_facts') or {}
+        duty = ('standby'
+                if 'SBY' in str(day.get('marker') or '').upper() else None)
+        return resolve_crew_live_state(
+            secs or [],
+            build_obs_lookup(_flight_obs_merged, datum),
+            build_live_lookup(),
+            datetime.now(timezone.utc),
+            homebase=homebase,
+            layover_iata=rf.get('layover_ort'),
+            duty=duty,
+            city_lookup=_iata_city_name,
+            local_hhmm=build_local_hhmm(airport_tz),
+            status_bucket=_flight_status_bucket)
+    except Exception as e:
+        app.logger.info(f'[friends-today] crew_state_skip {type(e).__name__}')
+        return None
+
+
 @app.route('/api/user/friends-today/<token>', methods=['GET'])
 def get_friends_today(token):
     """OffBlock-Pattern: Was machen meine Friends HEUTE (oder an gegebenem Datum).
@@ -12039,11 +12104,25 @@ def get_friends_today(token):
         sess = _store.get(fr) or {}
         rd = sess.get('result_data') or {}
         tage = rd.get('_tage_detail') or []
+        _snap_ts = None   # taken_at des Snapshots (Frische-Vergleich crew_state)
         if not tage:
             # _store ist in-memory/per-Instanz — persistenter Snapshot-Fallback
             # (Muster wie get_friend_roster ~11430), sonst war „Friends heute"
             # nach Container-Restart/anderer Instanz immer leer (2026-07-01).
-            tage = (_roster_snapshot_read(fr) or {}).get('tage') or []
+            _snap = _roster_snapshot_read(fr) or {}
+            tage = _snap.get('tage') or []
+            _snap_ts = _snap.get('taken_at')
+        else:
+            # Nachfix 2026-07-10: auch der In-Memory-Pfad braucht einen Frische-
+            # Timestamp. Mit snap_ts=None ließ pick_fresher_sectors JEDES
+            # Briefing gewinnen (updated_at ist NOT NULL → b_ts nie None) —
+            # auch ein wochenaltes (kaputte Feed-URL im Backoff) gegen frisch
+            # gepushte In-Memory-Daten. taken_at des persistenten Snapshots ist
+            # der beste verfügbare Proxy: er wird von derselben Auswertung
+            # (app.py ~3837) bzw. jedem Roster-Push (take_roster_snapshot)
+            # mitgeschrieben. Fehlt der Snapshot ganz, bleibt None →
+            # Briefing-Vorrang wie dokumentiert.
+            _snap_ts = (_roster_snapshot_read(fr) or {}).get('taken_at')
         day = next((t for t in tage if isinstance(t, dict) and t.get('datum') == datum), None)
         if not day: continue
         pr = _bulk_profs.get(fr) or {}
@@ -12290,12 +12369,26 @@ def get_friends_today(token):
                    for f in (rf.get('flight_numbers') or []) if str(f or '').strip()]
             chain = [c for c in (day.get('routing') or '').upper().split('-')
                      if len(c) == 3 and c.isalpha()]
-            if (datum == _date.today().isoformat()
-                    and fns and len(chain) >= 2 and len(fns) == len(chain) - 1):
-                for idx, fno in enumerate(fns[:4]):
+            # Leg-Liste (fno, from, to): primaer reader_facts+chain (Tax-Pfad),
+            # sonst DIREKT aus ical_sectors — reine iCal-Freunde (Tibor!) hatten
+            # fns=None -> flights_live blieb strukturell IMMER leer und iOS fiel
+            # trotz airborne Leg auf "Basis" zurueck (Diagnose 2026-07-10).
+            _legs_fl = []
+            if fns and len(chain) >= 2 and len(fns) == len(chain) - 1:
+                _legs_fl = [(fno, chain[i], chain[i + 1])
+                            for i, fno in enumerate(fns[:4])]
+            else:
+                for _sec in (day.get('ical_sectors') or [])[:4]:
+                    _fn = (_sec.get('flight') or _sec.get('flight_no') or '').strip()
+                    _fr = (_sec.get('from') or _sec.get('dep') or '').strip().upper()
+                    _to = (_sec.get('to') or _sec.get('arr') or '').strip().upper()
+                    if _fn and len(_fr) == 3 and len(_to) == 3:
+                        _legs_fl.append((_fn, _fr, _to))
+            if datum == _date.today().isoformat() and _legs_fl:
+                for idx, (fno, _dep_ia, _arr_ia) in enumerate(_legs_fl):
                     m = _flight_obs_merged(fno, date=datum,
-                                           dep_iata=chain[idx],
-                                           arr_iata=chain[idx + 1],
+                                           dep_iata=_dep_ia,
+                                           arr_iata=_arr_ia,
                                            free_only=True)
                     if m:
                         # ECHTE Live-Position dieses Legs aus dem NAS-Harvester-Store
@@ -12307,7 +12400,7 @@ def get_friends_today(token):
                         _cp = _cr = _crg = _cty = None
                         try:
                             _cp, _cr, _crg, _cty = _aircraft_live_pos(
-                                flight=fno, dep=chain[idx + 1])
+                                flight=fno, dep=_arr_ia)
                             if _cp and not _cp.get('on_ground'):
                                 _clp = {'lat': _cp.get('lat'), 'lon': _cp.get('lon'),
                                         'track': _cp.get('track'), 'gs': _cp.get('gs'),
@@ -12323,7 +12416,7 @@ def get_friends_today(token):
                         # die Großkreis-Progress-Interpolation der fliegenden Crew.
                         flights_live.append({
                             'flight': fno,
-                            'dep_iata': chain[idx], 'arr_iata': chain[idx + 1],
+                            'dep_iata': _dep_ia, 'arr_iata': _arr_ia,
                             'dep_delay_min': m.get('dep_delay_min'),
                             'arr_delay_min': m.get('arr_delay_min'),
                             'delay_min': m.get('delay_min'),
@@ -12332,13 +12425,13 @@ def get_friends_today(token):
                             'status': m.get('status'),
                             'cancelled': m.get('cancelled'),
                             'sched_dep_iso': _board_local_to_utc_iso(
-                                m.get('sched_dep'), chain[idx]),
+                                m.get('sched_dep'), _dep_ia),
                             'est_dep_iso': _board_local_to_utc_iso(
-                                m.get('esti_dep'), chain[idx]),
+                                m.get('esti_dep'), _dep_ia),
                             'sched_arr_iso': _board_local_to_utc_iso(
-                                m.get('sched_arr'), chain[idx + 1]),
+                                m.get('sched_arr'), _arr_ia),
                             'est_arr_iso': _board_local_to_utc_iso(
-                                m.get('esti_arr'), chain[idx + 1]),
+                                m.get('esti_arr'), _arr_ia),
                             'sides': m.get('sides'),
                             'live': _clp,   # echte FR24-Position (Süd-Route) | None
                         })
@@ -12366,15 +12459,15 @@ def get_friends_today(token):
                                 from blueprints.aerox_data_blueprint import (
                                     _iata_latlon, _iata_elev_ft)
                                 _fs_keys = _fs_bk(
-                                    fno, datum, chain[idx], chain[idx + 1],
+                                    fno, datum, _dep_ia, _arr_ia,
                                     roster_tail=m.get('reg'),
                                     sched_dep_iso=_board_local_to_utc_iso(
-                                        m.get('sched_dep'), chain[idx]),
+                                        m.get('sched_dep'), _dep_ia),
                                     sched_arr_iso=_board_local_to_utc_iso(
-                                        m.get('sched_arr'), chain[idx + 1]),
-                                    dep_ll=_iata_latlon(chain[idx]),
-                                    arr_ll=_iata_latlon(chain[idx + 1]),
-                                    dep_elev_ft=_iata_elev_ft(chain[idx]))
+                                        m.get('sched_arr'), _arr_ia),
+                                    dep_ll=_iata_latlon(_dep_ia),
+                                    arr_ll=_iata_latlon(_arr_ia),
+                                    dep_elev_ft=_iata_elev_ft(_dep_ia))
                                 _fs_obs = _fs_obm(m, _fs_keys,
                                                   board_to_iso=_board_local_to_utc_iso)
                                 _fs_obs += _fs_oal(_cp, _cr, _crg, _cty)
@@ -12404,6 +12497,20 @@ def get_friends_today(token):
                             pass
         except Exception:
             flights_live = []
+        # ── EINE Wahrheit (Neubau 2026-07-10): crew_state aus dem zentralen
+        # Resolver blueprints/crew_live_state — Zustand + SERVERSEITIGER Text
+        # („Fliegt gerade" / „Gelandet in …" / „Wartet auf LH… · HH:MM" /
+        # „Layover …" / „Basis …"). ADDITIV: alle Altfelder unten bleiben für
+        # alte Builds unverändert. Nur für den heutigen Betriebstag (für
+        # Vergangenheit/Zukunft ist ein LIVE-Zustand sinnlos). Fixt die
+        # iCal-Freunde-Lücke: der Resolver arbeitet auf ical_sectors und
+        # braucht KEINE reader_facts.flight_numbers (Tibor-Diagnose).
+        crew_state = None
+        if datum == _date.today().isoformat():
+            crew_state = _crew_state_for_day(
+                fr, day, datum,
+                homebase=(pr.get('homebase') or '').strip().upper() or None,
+                snap_ts=_snap_ts)
         out.append({
             'token': fr[:16] + '…',
             # Stabile match_id (Hash) statt vollem Token — iOS matcht Friend↔
@@ -12449,6 +12556,10 @@ def get_friends_today(token):
             # Resolver — iOS kann „fliegt gerade, +25 min" direkt anzeigen statt
             # nur den ADS-B-Callsign abzuleiten. Leer = keine Beobachtung.
             'flights_live': flights_live,
+            # ADDITIV (Neubau 2026-07-10): EIN expliziter Live-Zustand inkl.
+            # serverseitigem Text — iOS zeigt crew_state.text 1:1 (kein
+            # lastRouteIATA-Raten mehr). None = Resolver übersprungen/Fehler.
+            'crew_state': crew_state,
         })
     _resp = {'datum': datum, 'count': len(out), 'friends_today': out}
     if len(_FRIENDS_TODAY_MEMO) > 5000:
@@ -14429,12 +14540,21 @@ def _ical_briefings_save_to_supabase(token, events_dict):
     if not SB_AVAILABLE or not token or events_dict is None:
         return False
     rows = []
+    # Nachfix 2026-07-10: updated_at EXPLIZIT mitschreiben. Die Spalte hat nur
+    # `default now()` beim INSERT (20260601_briefings.sql, kein UPDATE-Trigger)
+    # und PostgREST-Upsert (ON CONFLICT DO UPDATE) setzt nur Payload-Spalten —
+    # ohne das fror updated_at für existierende (token,datum)-Rows auf der
+    # ERST-Import-Zeit ein, obwohl raw_event.ical_sectors bei jedem Re-Sync
+    # frisch geschrieben wird. _friend_briefing_day_sectors/pick_fresher_sectors
+    # lesen updated_at als Frische-Signal → der Briefing-schlägt-stalen-Snapshot-
+    # Fix war für vorbestehende Tages-Rows sonst wirkungslos.
+    _now_iso = datetime.now(timezone.utc).isoformat()
     for datum, ev in (events_dict or {}).items():
         if not isinstance(ev, dict):
             continue
         if not isinstance(datum, str) or len(datum) < 10:
             continue
-        row = {'token': token, 'datum': datum[:10]}
+        row = {'token': token, 'datum': datum[:10], 'updated_at': _now_iso}
         if ev.get('ical_summary') is not None:
             row['ical_summary'] = str(ev.get('ical_summary'))[:200]
         if ev.get('ical_location') is not None:
