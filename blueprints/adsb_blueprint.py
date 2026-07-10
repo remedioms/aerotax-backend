@@ -29,6 +29,7 @@
 # ═══════════════════════════════════════════════════════════════
 
 import base64
+import concurrent.futures
 import hmac
 import json
 import math
@@ -3094,6 +3095,102 @@ def _fetch_adsb_lol_point(lat, lon, radius_nm):
     return out
 
 
+# ─── Merged Punkt-Sweep über ALLE freien Mirrors (Radar „so voll wie möglich") ─
+#  adsb.lol, adsb.fi und airplanes.live speisen sich aus TEILWEISE DISJUNKTEN
+#  Feeder-Netzen → dieselbe bbox liefert bei jedem Host andere Flieger. Der
+#  first-wins-Pfad (_fetch_adsb_lol_point) erreichte adsb.fi/airplanes.live in der
+#  Praxis nie, weil adsb.lol über Land fast immer zuerst antwortete. Für die
+#  interaktive Radar-Ansicht fragen wir daher ALLE drei parallel ab und mergen
+#  per Hex — mehr Flieger im selben Ausschnitt, v.a. an den Abdeckungsrändern.
+#  (Die Hintergrund-Sweeps nutzen weiter das billigere first-wins _fetch_adsb_lol_point.)
+_ADSB_POINT_MIRRORS = (
+    ('adsb.lol',
+     lambda lat, lon, r: f"{ADSB_LOL_BASE}/v2/point/{lat}/{lon}/{r}"),
+    ('adsb.fi',
+     lambda lat, lon, r: f"https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{r}"),
+    ('airplanes.live',
+     lambda lat, lon, r: f"https://api.airplanes.live/v2/point/{lat}/{lon}/{r}"),
+)
+
+
+def _row_richness(row):
+    """Grobe Vollständigkeits-Punktzahl für den Dedup-Tiebreak: bei zwei Mirrors,
+    die denselben Hex melden, gewinnt die Row mit mehr Detail (Reg/Typ/Squawk)."""
+    return ((1 if row.get("reg") else 0)
+            + (1 if row.get("type") else 0)
+            + (1 if row.get("squawk") else 0))
+
+
+def _adsb_point_fetch_one(host, url, timeout):
+    """EIN Mirror-Host, Punkt-Sweep → obj-dict oder None (leer/Cooldown/Fehler).
+    Honoriert + setzt den geteilten _ADSB_MIRROR_COOLDOWN (429/503). Wirft NIE —
+    der Merge-Aufrufer sammelt Teilergebnisse und toleriert einzelne Ausfälle."""
+    now = time.time()
+    if _ADSB_MIRROR_COOLDOWN.get(host, 0) > now:
+        return None
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT, "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code in (429, 503):
+            try:
+                ra = float(e.headers.get('Retry-After') or 60)
+            except (TypeError, ValueError):
+                ra = 60.0
+            _ADSB_MIRROR_COOLDOWN[host] = now + min(max(ra, 10.0), 300.0)
+        return None
+    except Exception:
+        return None
+    try:
+        return json.loads(data)
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+
+def _fetch_adsb_point_merged(lat, lon, radius_nm):
+    """Union-Sweep über ALLE freien ADSBX-v2-Mirrors (parallel, 3 Threads),
+    dedupliziert per Hex → maximal volle Fliegerliste für die Radar-Ansicht.
+    Rows ohne Hex behalten wir einzeln (kein Dedup-Key). Bei Hex-Kollision gewinnt
+    die detailreichere Row (_row_richness). Mind. ein Host antwortete (auch leer)
+    → normale Liste (ggf. []). ALLE Hosts down/Cooldown → _AdsbLolError, damit der
+    Area-Endpoint sauber auf OpenSky/FR24 zurückfällt (statt fälschlich „leer")."""
+    r = int(radius_nm)
+    merged = {}
+    hexless = []
+    answered = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {
+            ex.submit(_adsb_point_fetch_one, host, build(lat, lon, r),
+                      ADSB_LOL_AREA_TIMEOUT): host
+            for host, build in _ADSB_POINT_MIRRORS
+        }
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                obj = fut.result()
+            except Exception:
+                obj = None
+            if obj is None:
+                continue
+            answered += 1
+            for ac in (obj.get("ac") or []):
+                row = _normalize_adsb_lol_ac(ac)
+                if row is None:
+                    continue
+                hx = row.get("hex")
+                if not hx:
+                    hexless.append(row)
+                    continue
+                prev = merged.get(hx)
+                if prev is None or _row_richness(row) > _row_richness(prev):
+                    merged[hx] = row
+    if answered == 0:
+        raise _AdsbLolError("point-merge: alle Mirror-Hosts down/cooldown")
+    return list(merged.values()) + hexless
+
+
 # ─── Always-on Europa-Sweep (adsb.lol, FREI) ────────────────────────────────
 #  Problem: der /poll-Cycle bildet seine bbox-Calls NUR aus dem Watch-Set aktiver
 #  Nutzer. Ohne aktive Nutzer → keine Box → keine Beobachtung → die self-computed
@@ -3373,14 +3470,18 @@ def get_adsb_area():
             source = "fr24_live"
             tried.append({"upstream": "fr24_live", "ok": True, "count": len(fr_ac)})
 
-    # ─── Primär (Zoom-in) / Fallback: adsb.lol point-radius ───
+    # ─── Primär (Zoom-in) / Fallback: freie Mirrors GEMERGED (voller Radar) ───
+    #  Union aus adsb.lol + adsb.fi + airplanes.live (parallel, dedup per Hex) statt
+    #  first-wins — verschiedene Feeder-Netze sehen verschiedene Flieger.
     if aircraft is None:
         try:
-            aircraft = _fetch_adsb_lol_point(lat, lon, radius)
-            source = "adsb.lol"
-            tried.append({"upstream": "adsb.lol", "ok": True})
+            aircraft = _fetch_adsb_point_merged(lat, lon, radius)
+            source = "adsb-merged"
+            tried.append({"upstream": "adsb-merged", "ok": True,
+                          "count": len(aircraft)})
         except _AdsbLolError as e:
-            tried.append({"upstream": "adsb.lol", "ok": False, "reason": str(e)[:80]})
+            tried.append({"upstream": "adsb-merged", "ok": False,
+                          "reason": str(e)[:80]})
 
     # ─── Fallback: OpenSky bbox (außer im Backoff) ───
     if aircraft is None:
