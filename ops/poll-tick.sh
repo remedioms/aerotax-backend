@@ -44,4 +44,22 @@ firep "/api/internal/poll-boards?tier=auto"             # NEU: jede Minute, Endp
 (( M % 10 == 0 )) && firep /api/airport/poll-punctuality        # unverändert
 (( (M-5) % 15 == 0 && M>=5 )) && fires /api/internal/scrape-boards  # unverändert
 
+# ── NEU (Permanenz-Plan (c)): Track-Verdichtung VOR dem Prune ────────────────
+#  In der ECHTEN Hetzner-crontab (NICHT in tick.sh — eigene Tages-Cron-Zeilen):
+#
+#    # 03:40 UTC: Breadcrumbs älter als RETENTION−2 Tage per Douglas-Peucker
+#    #            (≤80 Punkte/Leg) dauerhaft nach flight_tracks_archive
+#    #            verdichten. Idempotent; hebt die Watermark 'trackarch:until'.
+#    40 3 * * *  curl -fsS -m 300 -X POST -H "X-Poll-Secret: ${SECRET}" -H "User-Agent: aerox-poll-tick" "${BACKEND%/api}/api/internal/track-compact" >/dev/null 2>&1
+#
+#    # 04:17 UTC: bestehender track-prune (Zeile UNVERÄNDERT lassen) — löscht
+#    #            seit dem Compact-Deploy nur noch, was archiviert ist ODER
+#    #            älter als Retention+2 Tage (Sicherheitsnetz). Reihenfolge
+#    #            wichtig: compact (03:40) VOR prune (04:17).
+#    17 4 * * *  curl -fsS -m 300 -X POST -H "X-Poll-Secret: ${SECRET}" -H "User-Agent: aerox-poll-tick" "${BACKEND%/api}/api/internal/track-prune" >/dev/null 2>&1
+#
+#  Einmaliger Backfill (M4, vor dem Scharfschalten): den compact-Aufruf mit
+#  ?max_legs=5000 wiederholt ausführen, bis 'days_done' 0 bleibt — dann sind
+#  alle vorhandenen ~10 Retention-Tage archiviert.
+
 exit 0

@@ -793,6 +793,18 @@ def _public_cache_headers(response):
         elif (path.startswith('/api/ax/callsign/') or path.startswith('/api/ax/aircraft/')
               or path.startswith('/api/ax/photo/') or path.startswith('/api/ax/route/')):
             cc = 'public, max-age=21600'                        # Route/Foto stabil (6h)
+            # Sweep-P3 2026-07-10: own=1/watch=1-Callsign-Antworten (eigener
+            # Flieger, darf paid-anreichern) NICHT in den Edge-Cache — der
+            # aerox-cdn-Worker cached jede public,max-age-Antwort per URL und
+            # würde die (Bearer-gegateten) Paid-Daten anonym ausliefern bzw.
+            # den free-Pfad mit abweichenden own-Antworten vergiften. `private`
+            # ist der dokumentierte Worker-Opt-out (Regex no-store|private);
+            # der Client selbst darf weiter 6h cachen.
+            if path.startswith('/api/ax/callsign/') and any(
+                    (request.args.get(k) or '').strip().lower()
+                    in ('1', 'true', 'yes', 'y')
+                    for k in ('own', 'watch', 'mine')):
+                cc = 'private, max-age=21600'
         elif path.startswith('/api/ax/schedule/'):
             cc = 'public, max-age=1800'                         # Fahrplan (30 min)
         elif path.startswith('/api/adsb/area'):
@@ -1578,10 +1590,25 @@ def _client_ip():
     """Extrahiert Client-IP hinter Cloudflare. CF-Connecting-IP ist der vom Proxy
     gesetzte, vertrauenswürdige Header. In X-Forwarded-For hängt der Proxy die
     echte IP hinten AN — das ERSTE Element ist Client-kontrolliert (Spoof-Prefix
-    würde das Rate-Limit umgehen) → LETZTES Element nehmen."""
+    würde das Rate-Limit umgehen) → LETZTES Element nehmen.
+
+    Hetzner-Tunnel-Kette (Sweep-P3 2026-07-10, per Worker-Code verifiziert):
+    Client → CF-Edge (aerox-cdn-Worker) → fetch hetzner-api-Tunnel → cloudflared
+    → gunicorn. Der Worker baut Subrequests mit `headers: request.headers`,
+    reicht CF-Connecting-IP also 1:1 weiter — der Normalfall trifft Zweig 1.
+    Dokumentierte Fallback-Kette, falls ein Hop den Header doch verschluckt
+    (z.B. künftige Worker-Änderung / Direkt-Zugriff am Tunnel):
+      1. CF-Connecting-IP  (CF-gesetzt bzw. vom Worker durchgereicht)
+      2. X-Real-IP         (Reverse-Proxy-Konvention, z.B. nginx/cloudflared)
+      3. X-Forwarded-For   LETZTES Element (nur das hat der letzte vertrauens-
+                           würdige Hop angehängt; erstes Element = spoofbar)
+      4. remote_addr       (Direktverbindung)"""
     cf = (request.headers.get('CF-Connecting-IP', '') or '').strip()
     if cf:
         return cf
+    xri = (request.headers.get('X-Real-IP', '') or '').strip()
+    if xri:
+        return xri
     xff = request.headers.get('X-Forwarded-For', '')
     if xff:
         return xff.split(',')[-1].strip()
@@ -12639,8 +12666,12 @@ def get_notams(icao):
         return jsonify({'error': 'invalid icao'}), 400
     cached = _aviation_cache_get(f'notam:{icao}', 1800)
     if cached is not None:
-        # Negativ-Treffer behält seinen 502-Status (Contract bleibt stabil).
-        return jsonify(cached), (502 if cached.get('error') else 200)
+        # Sweep-P3 2026-07-10: gecachte Negativ-Treffer als 200 + leeres Array
+        # ausliefern (Alt-Build-Kompat — ältere iOS-Builds werten 502 als
+        # harten Fehler und retryen sofort, der Negativ-Cache lief damit ins
+        # Leere). Nur der FRISCHE Upstream-Fehler unten bleibt 502; das
+        # 'error'-Feld bleibt im Body, damit neue Clients es erkennen.
+        return jsonify(cached), 200
     try:
         import urllib.request as ur
         url = f'https://external-api.faa.gov/notamapi/v1/notams?icaoLocation={icao}&pageSize=20'
@@ -14655,6 +14686,26 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
                     return
             except Exception:
                 pass  # unparsebares Datum → lieber refreshen
+        # Exponentielles Backoff für dauerhaft kaputte Feed-URLs (Sweep-P3
+        # 2026-07-10): scheitert der Import (z.B. abgelaufener myTime-Link),
+        # bleibt imported_at alt → vorher wurde alle 45 min (Prozess-Drossel)
+        # ERNEUT probiert, für immer. Jetzt wächst die Pause mit dem
+        # Fehlerzähler im feed_obj (gepflegt von import_calendar_feed, Erfolg
+        # räumt ihn): 45min → 90 → 3h → 6h (Cap ab 3 Fehlversuchen).
+        try:
+            _fails = int(feed.get('refresh_fail_count') or 0)
+        except Exception:
+            _fails = 0
+        if _fails > 0:
+            _gap = min(_FEED_REFRESH_RETRY_GAP_S * (2 ** min(_fails, 3)),
+                       _FEED_REFRESH_MIN_AGE_S)
+            try:
+                _fail_age = (datetime.now() - datetime.fromisoformat(
+                    (feed.get('last_refresh_fail_at') or '').strip())).total_seconds()
+                if _fail_age < _gap:
+                    return
+            except Exception:
+                pass  # kein/unparsebares Fehl-Datum → normaler Pfad
         # Hinter dem Cloud-Run-Proxy kann url_root „http://" melden — Self-Call
         # IMMER über https auf den echten Host.
         host = (base_url or request.headers.get('X-Forwarded-Host')
@@ -34849,6 +34900,41 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
     return dbg
 
 
+def _calendar_feed_note_refresh_failure(token, url):
+    """Merkt einen fehlgeschlagenen Feed-Import im calendar_feed-Objekt
+    (Fehlerzähler fürs exponentielle Backoff in _maybe_refresh_calendar_feed,
+    Sweep-P3 2026-07-10). NUR wenn die scheiternde URL die GESPEICHERTE ist —
+    eine frisch eingetippte Falsch-URL darf den funktionierenden Feed nicht
+    ausbremsen. Erfolgreicher Import räumt die Felder wieder. Wirft nie."""
+    try:
+        prev_full = _profile_load(token) or {}
+        feed_obj = {}
+        for src in ((prev_full.get('profile') or {}), prev_full):
+            cand = src.get('calendar_feed')
+            if isinstance(cand, dict):
+                feed_obj = dict(cand)
+                break
+        stored = (feed_obj.get('url') or '').strip()
+        if not stored or stored != url:
+            return
+        try:
+            fails = int(feed_obj.get('refresh_fail_count') or 0)
+        except Exception:
+            fails = 0
+        feed_obj['refresh_fail_count'] = fails + 1
+        feed_obj['last_refresh_fail_at'] = datetime.now().isoformat()
+        disk_full = dict(_profile_load_from_disk(token) or {})
+        disk_full['token'] = token
+        profile = dict(disk_full.get('profile') or {})
+        profile['calendar_feed'] = feed_obj
+        disk_full['profile'] = profile
+        disk_full['calendar_feed'] = feed_obj
+        disk_full['_updated_at'] = datetime.now().isoformat()
+        _profile_save(token, profile, full_disk_payload=disk_full)
+    except Exception:
+        pass
+
+
 @app.route('/api/user/calendar-feed/<token>/import', methods=['POST'])
 def import_calendar_feed(token):
     """Lädt ein ICS-File von einer URL und speichert die Events als Roster-Hints.
@@ -34889,6 +34975,9 @@ def import_calendar_feed(token):
             text = raw.decode('utf-8', errors='replace')
     except Exception as e:
         print(f'[import_calendar_feed] error: {type(e).__name__}: {str(e)[:300]}')
+        # Fehlerzähler fürs Refresh-Backoff (Sweep-P3): dauerhaft kaputte
+        # gespeicherte URL sonst alle 45 min erneut probiert.
+        _calendar_feed_note_refresh_failure(token, url)
         return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': 'upstream_error'}), 502
     # RFC-5545-konformer ICS-Parser via module-level pure functions —
     # siehe _parse_ics_to_events oberhalb. Erlaubt isolierte Test-Coverage
@@ -34900,6 +34989,7 @@ def import_calendar_feed(token):
         # J5-Fix (Sweep 2026-07-10): Parse-Fail NICHT als Erfolg maskieren —
         # vorher wurde events=[] MIT frischem imported_at gespeichert (ok:true)
         # und der 6h-Refresh-Throttle blockte jeden Retry → Roster fror still ein.
+        _calendar_feed_note_refresh_failure(token, url)   # Backoff-Zähler (P3)
         return jsonify({'ok': False, 'error': 'ics_parse_failed'}), 502
     # SWISS-Nachbearbeitung (F1 Stations-Lokal-Buckets + F5 Layover-Synthese) —
     # no-op für LH-Feeds; wirft nie. VOR dem Persistieren, damit calendar_feed,
@@ -34924,6 +35014,16 @@ def import_calendar_feed(token):
         feed_obj = {}
     feed_obj.update({'url': url, 'events': events[:300],
                      'imported_at': datetime.now().isoformat()})
+    # Sweep-P3 2026-07-10: EK-Reste räumen — 'source'/'ek_imported_at' stammen
+    # vom EKEventStore-Upload; die 'events' sind ab hier aber URL-Import. Die
+    # Marker wurden vom Merge nur kosmetisch mitgeschleppt und suggerierten
+    # die falsche Quelle. (Die Merge-Logik selbst bleibt unangetastet.)
+    feed_obj.pop('source', None)
+    feed_obj.pop('ek_imported_at', None)
+    # Erfolg räumt den Refresh-Backoff-Zähler (siehe
+    # _calendar_feed_note_refresh_failure / _maybe_refresh_calendar_feed).
+    feed_obj.pop('refresh_fail_count', None)
+    feed_obj.pop('last_refresh_fail_at', None)
     try:
         disk_full = dict(_profile_load_from_disk(token) or {})
         disk_full['token'] = token

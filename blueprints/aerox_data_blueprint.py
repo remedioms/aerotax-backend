@@ -3810,6 +3810,72 @@ def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso):
     return pts, reg_used, dep, arr
 
 
+def _flown_track_archive(reg, flight_no, date, dep, arr):
+    """Tier 1b (Permanenz-Plan (c) M5): verdichtetes Leg aus
+    flight_tracks_archive — ältere Flüge außerhalb der aircraft_track-Retention
+    behalten ihre echte geflogene Route für immer (Douglas-Peucker ≤80 Punkte,
+    geschrieben von /api/internal/track-compact). points-Format
+    [[epoch,lat,lon,alt_ft,gs_kt]] → Punkt-Dicts wie Tier 1.
+    Liefert (points, reg_used, dep_used, arr_used)."""
+    sb = _sb()
+    if sb is None or not date or (not reg and not flight_no):
+        return [], reg, dep, arr
+
+    def _fetch(col, val):
+        try:
+            return (sb.table('flight_tracks_archive')
+                    .select('reg,flight,dep,arr,points,pt_count')
+                    .eq('service_date', date).eq(col, val)
+                    .limit(20).execute()).data or []
+        except Exception:
+            return []
+
+    rows = _fetch('reg', reg) if reg else []
+    if not rows and flight_no:
+        rows = _fetch('flight', flight_no)
+    # Leg disambiguieren — exakt die Tier-1-Semantik: explizite dep/arr
+    # filtern strikt, eine mitgegebene Flugnummer bevorzugt ihr Leg.
+    if rows and flight_no:
+        pref = [r for r in rows if (r.get('flight') or '').upper() == flight_no]
+        rows = pref or rows
+    if dep:
+        rows = [r for r in rows if (r.get('dep') or '') == dep]
+    if arr:
+        rows = [r for r in rows if (r.get('arr') or '') == arr]
+    if not rows:
+        return [], reg, dep, arr
+
+    def _first_ts(r):
+        p = r.get('points')
+        try:
+            return int((p[0] or [0])[0] or 0) if isinstance(p, list) and p else 0
+        except (TypeError, ValueError, IndexError):
+            return 0
+
+    best = max(rows, key=_first_ts)      # jüngstes Leg des Tages (wie Tier 1)
+    raw = best.get('points')
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = []
+    pts = []
+    for p in (raw if isinstance(raw, list) else []):
+        if not isinstance(p, (list, tuple)) or len(p) < 3:
+            continue
+        ts, la, lo = p[0], p[1], p[2]
+        if la is None or lo is None:
+            continue
+        pts.append({'lat': la, 'lon': lo,
+                    'alt': p[3] if len(p) > 3 else None,
+                    'gs': p[4] if len(p) > 4 else None,
+                    'trk': None, 'ts': ts})
+    if not pts:
+        return [], reg, dep, arr
+    return (pts, best.get('reg') or reg,
+            dep or best.get('dep'), arr or best.get('arr'))
+
+
 def _flown_track_writeback(reg, trail):
     """FR24-Trail (Tier 2) dauerhaft in aircraft_track zurückschreiben → wächst.
     Idempotent via PK (reg, seen_ts). Best-effort, nie werfen."""
@@ -3906,6 +3972,18 @@ def ax_flown_track():
     points, reg_used, dep, arr = _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso)
     reg = reg or (reg_used or '')
 
+    # Tier 1b (Permanenz): vergangenes Leg außerhalb der Roh-Retention →
+    # verdichtete Polyline aus flight_tracks_archive (permanente geflogene
+    # Route, gratis). Nur für Vergangenheits-Daten — heute liefern Tier 1/2
+    # die volle Spur; FR24 (paid) bleibt dahinter unangetastet.
+    if len(points) < 3 and date and date < time.strftime('%Y-%m-%d', time.gmtime()):
+        a_pts, a_reg, a_dep, a_arr = _flown_track_archive(reg or None, flight_no, date, dep, arr)
+        if a_pts:
+            source = 'track_archive'
+            points = a_pts
+            reg = reg or re.sub(r'[^A-Z0-9]', '', (a_reg or '').upper())
+            dep, arr = a_dep, a_arr
+
     # Tier 2: zu wenig eigene Spur → FR24-Trail on-demand (+ Rückschreibung).
     # Position bevorzugt aus mitgegebenen Radar-Koordinaten (lat/lon/hex) → so
     # klappt der Trail für JEDE Airline (Radar-Tap eines fremden Fliegers), nicht
@@ -3964,7 +4042,7 @@ def ax_flown_track():
     # seit 1 h los ist, hast du nicht die volle Map"). So bleibt die Spur ehrlich:
     # gelandet → bis zum Zielflughafen; noch fliegend → bis zum letzten Fix.
     SNAP_KM = 150.0   # ~80 nm; darüber gilt der Endpunkt als „unterwegs"
-    if source in ('aircraft_track', 'fr24_trail') and len(points) >= 2:
+    if source in ('aircraft_track', 'track_archive', 'fr24_trail') and len(points) >= 2:
         if dep:
             a = _iata_latlon(dep)
             if a:
@@ -4003,9 +4081,73 @@ def ax_flown_track():
     resp = jsonify(out)
     # Historische, echte Spur ist unveränderlich → lange Edge-TTL; laufend/approx kurz.
     past = bool(date) and date < time.strftime('%Y-%m-%d', time.gmtime())
-    ttl = 86400 if (past and source in ('aircraft_track', 'fr24_trail')) else 45
+    ttl = 86400 if (past and source in ('aircraft_track', 'track_archive',
+                                        'fr24_trail')) else 45
     resp.headers['Cache-Control'] = 'public, max-age=%d' % ttl
     return resp
+
+
+def _track_arch_mark_get():
+    """Archiv-Watermark: Epoch, bis zu dem aircraft_track VOLLSTÄNDIG nach
+    flight_tracks_archive verdichtet ist ('trackarch:until' im ax_api_budget-KV
+    — gleiches Muster wie _fr24_prewarm_mark_get). 0 wenn nie gelaufen."""
+    return _budget_key_used('trackarch:until')
+
+
+def _track_arch_mark_set(epoch):
+    """Watermark monoton auf max(bestehend, epoch) heben (race-tolerant,
+    gleiches Muster wie _fr24_prewarm_mark_set). Wirft nie."""
+    key = 'trackarch:until'
+    try:
+        e = int(epoch)
+    except (TypeError, ValueError):
+        return
+    _MEM_BUDGET[key] = max(int(_MEM_BUDGET.get(key, 0)), e)
+    sb = _sb()
+    if sb is None:
+        return
+    try:
+        sb.table('ax_api_budget').upsert(
+            {'month': key, 'n': max(e, _budget_key_used(key)),
+             'updated_at': _iso_now()}).execute()
+    except Exception:
+        pass
+
+
+@aerox_data_bp.route('/api/internal/track-compact', methods=['POST'])
+def ax_track_compact():
+    """Permanenz (Plan (c) M2): aircraft_track-Breadcrumbs, die älter als
+    RETENTION−2 Tage sind, VOR dem Prune pro (reg, service_date, Leg) zu
+    dauerhaften Polylines verdichten (Douglas-Peucker ≤80 Punkte, Gap-Split
+    45 min wie der flown-track-Endpoint) → Upsert flight_tracks_archive.
+    Die geflogene Route geht damit nie mehr verloren; track-prune löscht nur
+    noch, was hier archiviert ist (Watermark 'trackarch:until').
+    Geschützt per X-Poll-Secret (== ADSB_POLL_SECRET), Cron: täglich 03:40,
+    VOR dem Prune (04:17). Batch-weise, Default max ~200 Legs pro Lauf
+    (?max_legs= bis 5000 für den einmaligen Backfill M4). Idempotent."""
+    from flask import request
+    secret = os.environ.get('ADSB_POLL_SECRET', '').strip()
+    if not secret:
+        return jsonify({'ok': False, 'error': 'secret_not_configured'}), 403
+    if (request.headers.get('X-Poll-Secret') or '').strip() != secret:
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    sb = _sb()
+    if sb is None:
+        return jsonify({'ok': False, 'error': 'no_db'}), 503
+    try:
+        max_legs = max(1, min(int(request.args.get('max_legs') or 4000), 8000))
+    except (TypeError, ValueError):
+        max_legs = 4000
+    days = int(os.environ.get('TRACK_RETENTION_DAYS', '10'))
+    from blueprints import track_archive
+    try:
+        stats = track_archive.run_compact(
+            sb, mark_get=_track_arch_mark_get, mark_set=_track_arch_mark_set,
+            retention_days=days, max_legs=max_legs)
+        return jsonify({'ok': True, 'retention_days': days,
+                        'max_legs': max_legs, **stats})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': type(e).__name__}), 500
 
 
 @aerox_data_bp.route('/api/internal/track-prune', methods=['POST'])
@@ -4023,6 +4165,19 @@ def ax_track_prune():
         return jsonify({'ok': False, 'error': 'unauthorized'}), 401
     days = int(os.environ.get('TRACK_RETENTION_DAYS', '10'))
     cutoff_epoch = time.time() - days * 86400
+    # Permanenz-Kopplung (Plan (c) Schritt 5): nur löschen, was track-compact
+    # schon nach flight_tracks_archive verdichtet hat (Watermark
+    # 'trackarch:until') — ODER, als Sicherheitsnetz gegen unbegrenztes
+    # Roh-Wachstum bei kaputtem Archiv-Lauf, was älter als Retention+2 Tage ist.
+    # Permanenz gewinnt (Owner: eigene dauerhafte DB): NIE Unarchiviertes
+    # loeschen. Haengt das Archiv (Watermark stagniert), waechst die Roh-
+    # Tabelle, statt Daten endgueltig zu verlieren — Alarmierung liefert der
+    # compact-Response (complete=false/days=0) im Cron-Log.
+    archived_until = float(_track_arch_mark_get() or 0)
+    if archived_until <= 0:
+        return jsonify({'ok': True, 'deleted': 0,
+                        'skipped': 'no_archive_watermark'})
+    cutoff_epoch = min(cutoff_epoch, archived_until)
     cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(cutoff_epoch))
     sb = _sb()
     if sb is None:
@@ -4608,12 +4763,27 @@ def _schedule_neg_put(route):
             _SCHEDULE_NEG.clear()
 
 
+# Memo für _schedule_fallback_flights (Sweep-P3 2026-07-10): der route-history-
+# Subcall kostet ~4s und lief bei JEDEM Cache-/Budget-/Fehler-Hit erneut.
+# Key = (origin, dest, UTC-Tag), TTL 10 min — Board-Beobachtungen ändern sich
+# nicht schneller, und der Tages-Key verhindert Übernacht-Stale.
+_SCHED_FB_MEMO = {}
+_SCHED_FB_TTL = 10 * 60
+_SCHED_FB_MAX = 256
+
+
 def _schedule_fallback_flights(a, b):
     """FREE-Fallback für ax_schedule (Sweep 2026-07-10): scheitert/fehlt
     AviationStack, die EIGENEN Warehouse-Beobachtungen (route-history-Dual-
     Side-Merge) als Schedule-Liste im gewohnten Shape ausliefern statt leerer
     Seite — die Daten SIND da (FRA/JFK trägt dort z.B. 55 Flüge). Dedupe per
-    Flugnummer, jüngster Tag gewinnt. 0 Spend, wirft nie."""
+    Flugnummer, jüngster Tag gewinnt. 0 Spend, wirft nie.
+    Memoisiert (origin, dest, Tag) für 10 min — der ~4s-Subcall lief sonst
+    bei jedem Wiederhol-Hit desselben Paars komplett neu."""
+    memo_key = (a, b, time.strftime('%Y-%m-%d', time.gmtime()))
+    hit = _SCHED_FB_MEMO.get(memo_key)
+    if hit is not None and (time.time() - hit[0]) < _SCHED_FB_TTL:
+        return hit[1]
     view = _life_app('ax_route_history')
     if view is None:
         return []
@@ -4626,6 +4796,9 @@ def _schedule_fallback_flights(a, b):
                         % (urllib.parse.quote(a), urllib.parse.quote(b)),
                         view, a, b)
     if not (h or {}).get('ok'):
+        # Auch Fehl-/Leer-Antworten memoisieren — der teure Subcall LIEF;
+        # nach 10 min wird ohnehin frisch probiert.
+        _sched_fb_memo_put(memo_key, [])
         return []
     seen, out = set(), []
     for day in (h.get('recent_days') or []):        # Tag 0 = heute, dann älter
@@ -4652,7 +4825,20 @@ def _schedule_fallback_flights(a, b):
                 'arr_delay': f.get('arr_delay_min'),
                 'status': 'cancelled' if f.get('cancelled') else None,
             })
+    _sched_fb_memo_put(memo_key, out)
     return out
+
+
+def _sched_fb_memo_put(memo_key, value):
+    """Memo-Write mit Größen-Cap (älteste Viertel raus). Wirft nie."""
+    _SCHED_FB_MEMO[memo_key] = (time.time(), value)
+    if len(_SCHED_FB_MEMO) > _SCHED_FB_MAX:
+        try:
+            for k, _ in sorted(_SCHED_FB_MEMO.items(),
+                               key=lambda kv: kv[1][0])[:_SCHED_FB_MAX // 4]:
+                _SCHED_FB_MEMO.pop(k, None)
+        except Exception:
+            _SCHED_FB_MEMO.clear()
 
 
 @aerox_data_bp.route('/api/ax/schedule/<frm>/<to>', methods=['GET'])
