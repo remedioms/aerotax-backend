@@ -1,6 +1,20 @@
 # ═══════════════════════════════════════════════════════════════
-#  Aircraft-Info Blueprint
+#  Aircraft-Info Blueprint — ⚠️ DEPRECATED (Sweep 2026-07-10)
 #
+#  Die OpenSky-Metadata-API ist 410 Gone (live verifiziert: /api/metadata/
+#  aircraft/registration/<reg> UND …/icao/<hex> → 410) — der Upstream-Pfad
+#  dieses Blueprints ist damit dauerhaft tot; es liefert nur noch SB-Cache-
+#  und Static-Fleet-Treffer. Kanonischer Ersatz ist die eigene Referenz-DB
+#  unter /api/ax/aircraft (aerox_data_blueprint, 520k-baked-SQLite:
+#  reg/type/built — live ok); iOS-Konsument ist Tracking/AircraftInfoCard
+#  (Alt-Welt, kanonisch ist AircraftDetailView).
+#
+#  Der Endpoint BLEIBT registriert (Alt-Builds rufen ihn weiter), wird aber
+#  NICHT mehr gepflegt: keine neuen Quellen, keine Fleet-Updates. Toter
+#  Static-Fleet-/OpenSky-Code bewusst NICHT ausgebaut (Alt-Build-Kompat,
+#  nur markiert). Neue Features gehen ausschließlich auf /api/ax/aircraft.
+#
+#  Ursprüngliche Beschreibung:
 #  Liefert Metadaten (Manufacturer, Model, Build-Year, Seats, Operator,
 #  Country) zu einer Aircraft-Registration. Im Gegensatz zum Live-State-
 #  Blueprint (`adsb_blueprint.py`) ändert sich diese Information selten —
@@ -82,6 +96,11 @@ REG_PATTERN = re.compile(r'^[A-Z0-9]{1,3}-[A-Z0-9]{1,5}$')
 
 # ── Static Fleet-DB (Last-Line-of-Defense) ──────────────────────
 #
+# ⚠️ DEPRECATED/eingefroren (Sweep 2026-07-10): wird NICHT mehr gepflegt —
+# seit OpenSky 410 Gone ist das faktisch die einzige Upstream-„Quelle" dieses
+# Blueprints. Bewusst NICHT ausgebaut (Alt-Builds), aber keine neuen Regs
+# hier eintragen; die Referenz-DB /api/ax/aircraft kennt sie ohnehin.
+#
 # Identisch zur iOS-Side `AircraftRegistryLookup.swift`-Tabelle — wenn beide
 # auseinanderdriften, gewinnt was im Backend ist (wegen TTL-Cache landet
 # Backend-Wert eh nach ~30 Tagen im Client). Stand 2026-05.
@@ -150,6 +169,9 @@ _STATIC_FLEET = {
 @aircraft_info_bp.route('/api/aircraft-info/<reg>', methods=['GET'])
 def get_aircraft_info(reg):
     """
+    ⚠️ DEPRECATED (Sweep 2026-07-10, s. Header): bleibt nur für Alt-Builds
+    online — OpenSky-Upstream ist 410 Gone, Neues geht auf /api/ax/aircraft.
+
     Liefert Metadaten zu einer Aircraft-Registration.
 
     Returns:
@@ -315,6 +337,9 @@ def _sb_cache_put(reg, info):
 
 def _fetch_opensky_metadata(reg, hex24):
     """
+    ⚠️ TOTER PFAD (2026-07-10): beide OpenSky-Metadata-URLs antworten 410 Gone —
+    liefert praktisch immer None. Bewusst nicht ausgebaut (deprecated Blueprint).
+
     Holt Metadaten von OpenSky. Bevorzugt `/api/metadata/aircraft/icao/<hex>`
     wenn hex24 bekannt — sonst Fallback auf `/api/metadata/aircraft/registration/<reg>`.
 

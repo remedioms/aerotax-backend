@@ -23,8 +23,17 @@ import requests
 
 BASE_URL = os.environ.get(
     "AEROX_BASE_URL",
-    "https://aerotax-backend-443401186607.europe-west3.run.app",
+    "https://api.aerosteuer.de",
 ).rstrip("/")
+
+# Live-Tests gegen das Produktions-Backend (echte POST/PUT/DELETE über das
+# Netz). CI/lokale Läufe dürfen nicht von Prod-Verfügbarkeit abhängen →
+# opt-in wie in test_e2e_smoke_live.py via AEROX_LIVE_TESTS=1.
+if os.environ.get("AEROX_LIVE_TESTS") != "1":
+    pytest.skip(
+        "live production auth-gate tests — set AEROX_LIVE_TESTS=1 to run",
+        allow_module_level=True,
+    )
 
 TIMEOUT = 10
 FAKE = "AT-FAKE-NEVER-CREATED-XYZ"

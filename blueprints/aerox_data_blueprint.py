@@ -93,16 +93,36 @@ def _sb():
         return None
 
 
-def _cache_get(table, key_col, key):
+def _cache_get(table, key_col, key, max_age_days=90):
+    """Supabase-Cache-Read MIT Staleness-Gate (Sweep 2026-07-10, Klasse B:
+    Einträge galten „für immer", obwohl Flugnummern saisonal umgeroutet und
+    Maschinen umregistriert werden — LH1412-„Cache von Juni"-Symptom).
+    Default 90 Tage via updated_at; Payloads mit confidence != 'confirmed'
+    (geratene/estimated Routen) nur 14 Tage. Abgelaufen ⇒ Miss: die Free-
+    Kaskade läuft neu, _cache_put (upsert) überschreibt den Eintrag beim
+    nächsten Treffer. max_age_days=None = alte Semantik (für Caller mit
+    EIGENER Alterslogik, z.B. ax_schedule_cache/_fetched)."""
     sb = _sb()
     if sb is None:
         return None
     try:
-        res = sb.table(table).select('payload').eq(key_col, key).limit(1).execute()
+        res = (sb.table(table).select('payload,updated_at')
+               .eq(key_col, key).limit(1).execute())
         rows = getattr(res, 'data', None) or []
         if rows and rows[0].get('payload'):
             p = rows[0]['payload']
-            return p if isinstance(p, dict) else json.loads(p)
+            p = p if isinstance(p, dict) else json.loads(p)
+            if max_age_days is not None and isinstance(p, dict):
+                eff_days = max_age_days
+                conf = p.get('confidence')
+                if conf and conf != 'confirmed':
+                    eff_days = min(eff_days, 14)
+                ts = _iso_to_epoch(rows[0].get('updated_at'))
+                # Legacy-Rows ohne parsebares updated_at bleiben gültig
+                # (kein Massen-Miss auf Altbestand).
+                if ts is not None and (time.time() - ts) > eff_days * 86400:
+                    return None
+            return p
     except Exception:
         pass
     return None
@@ -121,7 +141,11 @@ def _cache_put(table, row):
 # ---------------------------------------------------------------- external (free)
 def _http_json(url, timeout=8):
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'AeroX-DataEngine/1.0'})
+        # UA im Kontakt-Format (Sweep 2026-07-10 J2-P1): planespotters blockt
+        # UAs ohne Kontakt-URL/Mail mit 403 → Flugzeug-Fotos waren app-weit tot
+        # für neue Flieger. Gilt bewusst auch für adsbdb/hexdb (höflicher Client).
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'AeroX/1.0 (+https://aerosteuer.de; aerox@aerosteuer.de)'})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode('utf-8', errors='replace'))
     except Exception:
@@ -2512,6 +2536,20 @@ def ax_aircraft(hexid):
                 _cache_put('ax_aircraft_cache',
                            {'hex': hexid, 'payload': live,
                             'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+            elif (stale := _cache_get('ax_aircraft_cache', 'hex', hexid,
+                                      max_age_days=None)):
+                # Stale-if-error (Review 2026-07-10): Refetch-Kette tot (adsbdb
+                # lt. Audit down, hexdb wackelig) → den abgelaufenen >90d-Payload
+                # ausliefern statt funktionierende Stammdaten sichtbar zu
+                # verwerfen. Re-put mit frischem updated_at = Negativ-Cache:
+                # sonst rennt JEDER Request erneut in 2 tote 8s-Upstream-Calls
+                # (Free-Kaskaden-Mehrlast); Retry dann erst nach dem nächsten
+                # Ablauf-Fenster.
+                out.update({k: v for k, v in stale.items() if v})
+                out['source'] = 'cache-stale'
+                _cache_put('ax_aircraft_cache',
+                           {'hex': hexid, 'payload': stale,
+                            'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
             else:
                 # Keine Stammdaten — ABER Land/Flagge aus der ICAO-Hex-Allokation
                 # geht immer (offline). So zeigt das Radar selbst für unbekannte
@@ -2763,7 +2801,13 @@ def ax_callsign(callsign):
     # FREE-ONLY: kein Paid-per-Radar-Tap.)
     _own = (request.args.get('own') or request.args.get('watch')
             or request.args.get('mine') or '').strip().lower()
-    allow_paid = _own in ('1', 'true', 'yes', 'y')
+    # ZUSÄTZLICH Bearer-Pflicht (Sweep 2026-07-10, Klasse A: own=1 war ein
+    # reiner Client-Query-Param — anonymes curl konnte Credits schalten).
+    # Muster wie ax_unified_flight: kein voller Token-Check, es geht nur darum,
+    # dass ein anonymer Scan nie Paid zieht. Die App sendet den Header immer.
+    _authed = (request.headers.get('Authorization') or '').strip().lower() \
+        .startswith('bearer ')
+    allow_paid = _authed and _own in ('1', 'true', 'yes', 'y')
 
     # FREE-FIRST-Kaskade (eine Quelle: warehouse_reader.route_for_flight). Bezahlt
     # nur wenn EIGENER/watch-Flieger UND Tages-Budget frei — sonst rein aus unseren
@@ -3593,7 +3637,12 @@ def ax_tail_history():
         return jsonify({'ok': False, 'error': 'reg_or_hex_required'}), 400
     _own = (request.args.get('own') or request.args.get('watch')
             or request.args.get('mine') or '').strip().lower()
-    allow_paid = _own in ('1', 'true', 'yes', 'y')
+    # Bearer-Pflicht fürs Paid-Gate (Sweep 2026-07-10, Klasse A) — Muster wie
+    # ax_unified_flight: anonym darf nie Credits schalten, own=1 allein reicht
+    # nicht mehr. Warehouse-Teil bleibt für alle (auch Alt-Builds) unverändert.
+    _authed = (request.headers.get('Authorization') or '').strip().lower() \
+        .startswith('bearer ')
+    allow_paid = _authed and _own in ('1', 'true', 'yes', 'y')
     sb = _sb()
     legs = []
     if sb is not None:
@@ -3656,10 +3705,19 @@ def ax_tail_history():
     #    Warehouse geschrieben (_crowdsource_flight_obs) → derselbe Flug kommt
     #    für alle anderen Endpoints (flight_status/route-history) GRATIS. ──
     if not legs and reg and allow_paid and _fr24_available() and _fr24_budget_ok():
-        try:
-            fr = _fr24_flights_by_reg(reg, days=10, limit=10)
-        except Exception:
-            fr = []
+        # Fenster dynamisch 3→7→14 Tage (Sweep 2026-07-10): FR24 zählt Credits
+        # PRO Ergebnis — das kleine Fenster ist für aktive Maschinen deutlich
+        # billiger (Kurzstrecke: 3d ≈ 15 Legs statt 10d ≈ 50), nur wirklich
+        # stille Tails eskalieren. Jede (reg,days)-Stufe ist in
+        # _fr24_flights_by_reg 6h (auch negativ) gecacht → zero-double-spend.
+        fr = []
+        for _days in (3, 7, 14):
+            try:
+                fr = _fr24_flights_by_reg(reg, days=_days, limit=10)
+            except Exception:
+                fr = []
+            if fr:
+                break
         if fr:
             legs = [{'flight_no': l.get('flight_no'), 'src': l.get('src'),
                      'dst': l.get('dst'), 'day': l.get('day'),
@@ -4217,6 +4275,26 @@ def _detail_subcall(app_obj, path, view_fn, *view_args):
     return None
 
 
+def _route_history_windowed(app_obj, origin, dest):
+    """route-history mit DYNAMISCHEM Fenster (Sweep 2026-07-10): days=3 ist der
+    Latenz-Sweet-Spot, aber dünne Strecken (FRA-NBJ, 2×/Woche) haben in 3 Tagen
+    oft 0 Beobachtungen → bei 0 Treffern automatisch auf 7 Tage weiten. Mehr
+    kappt der Endpoint selbst (app.ax_route_history clamped ?days auf 7 — ein
+    14er-Call wäre nur ein identischer Doppel-Call). Weiterhin ausschließlich
+    eigene Beobachtungen, 0 Spend. None wenn auch das weite Fenster nichts hat
+    UND der Call scheiterte (ok-aber-leer wird durchgereicht, ehrlich)."""
+    view = _life_app('ax_route_history')
+    h = None
+    for nd in (3, 7):
+        h = _detail_subcall(app_obj, '/api/ax/route-history/%s/%s?days=%d'
+                            % (urllib.parse.quote(origin),
+                               urllib.parse.quote(dest), nd),
+                            view, origin, dest)
+        if (h or {}).get('ok') and (h.get('total') or 0) > 0:
+            return h
+    return h if (h or {}).get('ok') else None
+
+
 @aerox_data_bp.route('/api/ax/flight-detail/<query>', methods=['GET'])
 def ax_flight_detail(query):
     """EIN-Call-Aggregat für die Flug-Detailseite (Owner 2026-07-09: „Detailseite lädt
@@ -4288,13 +4366,10 @@ def ax_flight_detail(query):
 
     def _history_call(o, d):
         # days=3 statt 7 (Owner 2026-07-09 „Detail 13s"): route-history ist der
-        # Latenz-Pol (FRA/JFK 7d=4.4s vs 3d~1.1s — Dual-Side-Board-Merge × Tage). Die
-        # „STRECKE ZULETZT"-Liste zeigt ohnehin nur die letzten ~3 Tage. Volle
-        # Historie bleibt über den Einzel-Endpoint /route-history verfügbar.
-        h = _detail_subcall(_app, '/api/ax/route-history/%s/%s?days=3' % (urllib.parse.quote(o),
-                                                                          urllib.parse.quote(d)),
-                            _life_app('ax_route_history'), o, d)
-        return h if (h or {}).get('ok') else None
+        # Latenz-Pol (FRA/JFK 7d=4.4s vs 3d~1.1s — Dual-Side-Board-Merge × Tage).
+        # Bei 0 Treffern weitet _route_history_windowed das Fenster automatisch
+        # (dünne Strecken wie FRA-NBJ bekämen sonst NIE Flugzeit/Landung).
+        return _route_history_windowed(_app, o, d)
 
     def _photo_call(rg):
         p = _detail_subcall(_app, '/api/ax/photo-reg/%s' % urllib.parse.quote(rg), ax_photo_reg, rg)
@@ -4509,17 +4584,95 @@ def _budget_inc(month, used):
         pass
 
 
+# ax_schedule: Fehl-Antworten (AviationStack error/timeout) kurz negativ cachen —
+# sonst rennt JEDE Suche desselben Paars erneut in den toten Call (Sweep
+# 2026-07-10; live: TRD/BOJ → source:error bei jedem Request).
+_SCHEDULE_NEG = {}                    # route → ts des letzten Fehlversuchs
+_SCHEDULE_NEG_TTL = 45 * 60           # 30-60min-Fenster → Mitte
+_SCHEDULE_NEG_MAX = 512
+
+
+def _schedule_neg_hit(route):
+    ts = _SCHEDULE_NEG.get(route)
+    return bool(ts and (time.time() - ts) < _SCHEDULE_NEG_TTL)
+
+
+def _schedule_neg_put(route):
+    _SCHEDULE_NEG[route] = time.time()
+    if len(_SCHEDULE_NEG) > _SCHEDULE_NEG_MAX:
+        try:
+            for k, _ in sorted(_SCHEDULE_NEG.items(),
+                               key=lambda kv: kv[1])[:_SCHEDULE_NEG_MAX // 4]:
+                _SCHEDULE_NEG.pop(k, None)
+        except Exception:
+            _SCHEDULE_NEG.clear()
+
+
+def _schedule_fallback_flights(a, b):
+    """FREE-Fallback für ax_schedule (Sweep 2026-07-10): scheitert/fehlt
+    AviationStack, die EIGENEN Warehouse-Beobachtungen (route-history-Dual-
+    Side-Merge) als Schedule-Liste im gewohnten Shape ausliefern statt leerer
+    Seite — die Daten SIND da (FRA/JFK trägt dort z.B. 55 Flüge). Dedupe per
+    Flugnummer, jüngster Tag gewinnt. 0 Spend, wirft nie."""
+    view = _life_app('ax_route_history')
+    if view is None:
+        return []
+    try:
+        from flask import current_app
+        _app = current_app._get_current_object()
+    except Exception:
+        return []
+    h = _detail_subcall(_app, '/api/ax/route-history/%s/%s?days=7'
+                        % (urllib.parse.quote(a), urllib.parse.quote(b)),
+                        view, a, b)
+    if not (h or {}).get('ok'):
+        return []
+    seen, out = set(), []
+    for day in (h.get('recent_days') or []):        # Tag 0 = heute, dann älter
+        for f in (day.get('flights') or []):
+            no = (f.get('flight') or '').upper()
+            if not no or no in seen:
+                continue
+            seen.add(no)
+            # Reine arr-Rows tragen die ANKUNFTS-Zeit als 'sched' — nie als
+            # Abflugzeit ausgeben (confirmed-or-hidden).
+            obs = f.get('obs')
+            dep_sched = f.get('sched') if obs in ('dep', 'both') else None
+            arr_sched = (f.get('sched_arr')
+                         or (f.get('sched') if obs == 'arr' else None))
+            out.append({
+                'flight': no,
+                'airline': f.get('airline'),
+                'airline_iata': no[:2],
+                'dep_scheduled': dep_sched,
+                'arr_scheduled': arr_sched,
+                'dep_estimated': None, 'dep_actual': None,
+                'dep_delay': f.get('dep_delay_min'),
+                'arr_estimated': None, 'arr_actual': None,
+                'arr_delay': f.get('arr_delay_min'),
+                'status': 'cancelled' if f.get('cancelled') else None,
+            })
+    return out
+
+
 @aerox_data_bp.route('/api/ax/schedule/<frm>/<to>', methods=['GET'])
 def ax_schedule(frm, to):
     """Echte Flugnummern + geplante Zeiten auf einem Städtepaar (AviationStack).
     Architektur: Supabase-Cache FÜR IMMER (Schedules ändern sich kaum) → nur bei
     Cache-Miss UND solange das Monats-Budget reicht ein einziger externer Call,
     Ergebnis wird gecacht. So bleibt AeroX im Free-Tier (100/Monat) und ALLE
-    Nutzer ziehen danach aus unserem Backend."""
+    Nutzer ziehen danach aus unserem Backend. Scheitert der externe Call oder
+    ist er leer/ohne Budget → FREE-Fallback aus den eigenen route-history-
+    Beobachtungen statt leerer Seite (Sweep 2026-07-10)."""
     a = (frm or '').strip().upper()
     b = (to or '').strip().upper()
     if len(a) < 3 or len(b) < 3:
         return jsonify({'ok': False, 'error': 'need IATA'}), 400
+    # Per-IP-Limit (Sweep 2026-07-10, Klasse A: EINZIGER Paid-Verbraucher OHNE
+    # Drossel — die 100er-Monatsquote war anonym in Minuten drainbar). 30/min
+    # deckt jedes legitime Suchen; Cache-Hits sind davon praktisch unberührt.
+    if _ax_rate_limited('ax_schedule', limit=30, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     route = f'{a}-{b}'
     # Cache-Key mit Schema-Version: '#cs3' = Codeshares gefiltert + estimated/actual
     # Zeiten ergänzt. Schema-Bump umgeht alte Cache-Einträge (Duplikate / ohne
@@ -4529,7 +4682,10 @@ def ax_schedule(frm, to):
     month = time.strftime('%Y-%m', time.gmtime())
     remaining, used = _budget_remaining(month)
 
-    cached = _cache_get('ax_schedule_cache', 'route', cache_key)
+    # max_age_days=None: ax_schedule_cache hat die EIGENE _fetched-Alterslogik
+    # unten — das generische 90d-Gate würde alte Einträge sonst trotz leeren
+    # Budgets wegwerfen (Cache ist hier besser als nichts).
+    cached = _cache_get('ax_schedule_cache', 'route', cache_key, max_age_days=None)
     if cached is not None:
         # Schedules driften saisonal: nur wenn der Cache SEHR alt ist (>180 Tage)
         # UND noch reichlich Budget frei ist (>=30), einmal neu ziehen. Sonst
@@ -4538,12 +4694,25 @@ def ax_schedule(frm, to):
         fetched = cached.get('_fetched', 0)
         age_days = (time.time() - fetched) / 86400.0 if fetched else 0
         if not (key and remaining >= 30 and age_days > stale_days):
+            if not cached.get('flights'):
+                # Gecachter Leer-Treffer → Warehouse kennt die Strecke evtl.
+                # trotzdem (Cache bleibt stehen, kein neuer Paid-Call).
+                fb = _schedule_fallback_flights(a, b)
+                if fb:
+                    return jsonify({'ok': True, 'route': route,
+                                    'source': 'route-history',
+                                    'flights': fb, 'count': len(fb)})
             return jsonify({'ok': True, 'route': route, 'source': 'cache', **cached})
         # sonst: durchfallen und einmal auffrischen
-    if not key or remaining <= 0:
-        # Kein Budget/Key → ehrlich leer (App zeigt dann nur die Airlines-Liste).
-        return jsonify({'ok': True, 'route': route, 'source': 'budget-exhausted',
-                        'flights': [], 'budget_remaining': remaining})
+    if not key or remaining <= 0 or _schedule_neg_hit(route):
+        # Kein Budget/Key bzw. frischer Fehlversuch → NICHT leer: erst die
+        # eigenen Beobachtungen probieren (free-first).
+        fb = _schedule_fallback_flights(a, b)
+        src = ('route-history' if fb else
+               'error-cached' if _schedule_neg_hit(route) else 'budget-exhausted')
+        return jsonify({'ok': True, 'route': route, 'source': src,
+                        'flights': fb, 'count': len(fb),
+                        'budget_remaining': remaining})
 
     # Free-Tier = HTTP (kein HTTPS). dep_iata + arr_iata Filter.
     url = (f'http://api.aviationstack.com/v1/flights?access_key={urllib.parse.quote(key)}'
@@ -4551,8 +4720,12 @@ def ax_schedule(frm, to):
     d = _http_json(url, timeout=12)
     rows = (d or {}).get('data') if isinstance(d, dict) else None
     if rows is None:
-        return jsonify({'ok': True, 'route': route, 'source': 'error',
-                        'flights': [], 'budget_remaining': remaining})
+        _schedule_neg_put(route)   # 45min nicht erneut in den toten Call rennen
+        fb = _schedule_fallback_flights(a, b)
+        return jsonify({'ok': True, 'route': route,
+                        'source': 'route-history' if fb else 'error',
+                        'flights': fb, 'count': len(fb),
+                        'budget_remaining': remaining})
     _budget_inc(month, used)   # Call gezählt (auch bei 0 Treffern — er wurde verbraucht)
 
     seen, flights = set(), []
@@ -4592,6 +4765,14 @@ def ax_schedule(frm, to):
     _cache_put('ax_schedule_cache',
                {'route': cache_key, 'payload': payload,
                 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+    if not flights:
+        # AviationStack kennt das Paar nicht (Leer-Treffer wurde trotzdem
+        # gecacht/gezählt) → eigene Beobachtungen statt leerer Seite.
+        fb = _schedule_fallback_flights(a, b)
+        if fb:
+            return jsonify({'ok': True, 'route': route, 'source': 'route-history',
+                            'flights': fb, 'count': len(fb),
+                            'budget_remaining': remaining - 1})
     return jsonify({'ok': True, 'route': route, 'source': 'aviationstack',
                     'budget_remaining': remaining - 1, **payload})
 

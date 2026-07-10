@@ -220,6 +220,36 @@ def test_route_history_no_duration_for_arr_only(client):
             assert 'duration_min' not in f or f['duration_min'] is None
 
 
+def test_route_history_windowed_escalates_on_zero_hits():
+    """Dünne Strecke (FRA-NBJ): days=3 hat 0 Beobachtungen → das Aggregat
+    weitet automatisch auf 7 Tage (Sweep 2026-07-10) statt ohne Flugzeit/
+    Landung zu bleiben. Bei Treffern im 3d-Fenster KEIN zweiter Call."""
+    import blueprints.aerox_data_blueprint as BP
+    calls = []
+
+    def fake_subcall(app_obj, path, view, *args):
+        calls.append(path)
+        if 'days=3' in path:
+            return {'ok': True, 'total': 0, 'recent_days': []}
+        return {'ok': True, 'total': 2,
+                'recent_days': [{'date': '2026-07-08', 'count': 2, 'flights': []}]}
+
+    with patch.object(BP, '_detail_subcall', side_effect=fake_subcall):
+        h = BP._route_history_windowed(A.app, 'FRA', 'NBJ')
+    assert h is not None and h['total'] == 2
+    assert calls == ['/api/ax/route-history/FRA/NBJ?days=3',
+                     '/api/ax/route-history/FRA/NBJ?days=7']
+
+    # Treffer schon im 3d-Fenster → genau EIN Call (Latenz-Sweet-Spot bleibt).
+    calls.clear()
+    with patch.object(BP, '_detail_subcall',
+                      side_effect=lambda *a: (calls.append(a[1]) or
+                                              {'ok': True, 'total': 5,
+                                               'recent_days': []})):
+        h2 = BP._route_history_windowed(A.app, 'FRA', 'JFK')
+    assert h2['total'] == 5 and calls == ['/api/ax/route-history/FRA/JFK?days=3']
+
+
 # ─────────────────────── tail-history endpoint wiring ───────────────────────
 
 def _fake_flights_sb(rows):
@@ -273,9 +303,9 @@ def test_tail_history_no_arr_no_duration(client):
 
 
 def test_tail_history_fr24_fallback_when_warehouse_empty(client):
-    """Warehouse leer (D-AIXS nie getafelt) + own=1 (EIGENE Maschine) →
-    FR24-by-registration Fallback, Ergebnis mit source='fr24' UND permanent
-    gespeichert (_crowdsource_flight_obs)."""
+    """Warehouse leer (D-AIXS nie getafelt) + own=1 (EIGENE Maschine, mit
+    Bearer — App sendet ihn immer) → FR24-by-registration Fallback, Ergebnis
+    mit source='fr24' UND permanent gespeichert (_crowdsource_flight_obs)."""
     import blueprints.aerox_data_blueprint as BP
     fr_legs = [{
         'flight_no': 'LH416', 'src': 'FRA', 'dst': 'IAD', 'day': '2026-07-06',
@@ -288,13 +318,59 @@ def test_tail_history_fr24_fallback_when_warehouse_empty(client):
          patch.object(BP, '_fr24_budget_ok', return_value=True), \
          patch.object(BP, '_fr24_flights_by_reg', return_value=fr_legs), \
          patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
-        r = client.get('/api/ax/tail-history?reg=D-AIXS&own=1')
+        r = client.get('/api/ax/tail-history?reg=D-AIXS&own=1',
+                       headers={'Authorization': 'Bearer AT-TEST'})
     assert r.status_code == 200
     body = r.get_json()
     assert body['source'] == 'fr24'
     assert body['legs'][0]['flight_no'] == 'LH416'
     assert body['legs'][0]['duration_min'] == 480
     assert mcs.called            # permanent ins Warehouse geschrieben
+
+
+def test_tail_history_own_without_bearer_stays_free(client):
+    """own=1 OHNE Authorization-Bearer schaltet KEIN Paid mehr (Sweep
+    2026-07-10, Klasse A: own war ein reiner Client-Query-Param — anonymes
+    curl konnte Credits ziehen). Warehouse-Teil antwortet normal."""
+    import blueprints.aerox_data_blueprint as BP
+    with patch.object(BP, '_sb', return_value=_fake_flights_sb([])), \
+         patch.object(BP, '_fr24_available', return_value=True), \
+         patch.object(BP, '_fr24_budget_ok', return_value=True), \
+         patch.object(BP, '_fr24_flights_by_reg') as mfr:
+        r = client.get('/api/ax/tail-history?reg=D-AIXS&own=1')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['source'] == 'warehouse' and body['legs'] == []
+    mfr.assert_not_called()
+
+
+def test_tail_history_fr24_window_escalates_3_7_14(client):
+    """Fenster dynamisch (Sweep 2026-07-10): leere FR24-Stufen eskalieren
+    3→7→14 Tage — selten fliegende Maschine (Leg vor 12 Tagen) wird noch
+    gefunden, aktive Maschinen bleiben beim billigen 3d-Fenster."""
+    import blueprints.aerox_data_blueprint as BP
+    fr_legs = [{'flight_no': 'LH590', 'src': 'FRA', 'dst': 'NBO',
+                'day': '2026-06-28', 'sched_dep': '2026-06-28T20:00:00Z',
+                'sched_arr': '2026-06-29T04:35:00Z', 'duration_min': 515,
+                'status': 'landed'}]
+    seen_days = []
+
+    def fake_by_reg(reg, days=7, limit=12):
+        seen_days.append(days)
+        return fr_legs if days == 14 else []
+
+    with patch.object(BP, '_sb', return_value=_fake_flights_sb([])), \
+         patch.object(BP, '_fr24_available', return_value=True), \
+         patch.object(BP, '_fr24_budget_ok', return_value=True), \
+         patch.object(BP, '_fr24_flights_by_reg', side_effect=fake_by_reg), \
+         patch.object(A, '_crowdsource_flight_obs', return_value=True):
+        r = client.get('/api/ax/tail-history?reg=D-AIXS&own=1',
+                       headers={'Authorization': 'Bearer AT-TEST'})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert seen_days == [3, 7, 14]
+    assert body['source'] == 'fr24'
+    assert body['legs'][0]['flight_no'] == 'LH590'
 
 
 def test_tail_history_anonymous_no_paid(client):

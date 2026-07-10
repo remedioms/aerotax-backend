@@ -11920,7 +11920,14 @@ def get_friends_today(token):
     import time as _time
     from blueprints.aerox_data_blueprint import (_route_label_cities, _iata_city_name,
                                                  _aircraft_live_pos)
-    datum = request.args.get('datum') or _date.today().isoformat()
+    # TZ-Fix (Sweep J7 2026-07-10): Default-„heute" = Berliner Betriebstag
+    # (die Roster-`datum`-Keys sind Homebase-Tage), NICHT Server-UTC — zwischen
+    # 00:00–02:00 CEST zeigte der UTC-Default sonst den Vortag und der 90s-Memo
+    # zementierte ihn. Kein iOS-Callsite schickt datum mit.
+    try:
+        datum = request.args.get('datum') or _airport_local_now('FRA').strftime('%Y-%m-%d')
+    except Exception:
+        datum = request.args.get('datum') or _date.today().isoformat()
     # TTL-Cache (Owner 2026-07-09 „warum dauert Wo-ist-Crew immer so lange"): die
     # Sektor-Kaskade unten macht pro Freund × Sektor sequenzielle _flight_obs_merged-
     # Board-Lookups + Kalender-Refresh — jedes Feed-Laden neu = langsam. 90 s cachen.
@@ -12632,7 +12639,8 @@ def get_notams(icao):
         return jsonify({'error': 'invalid icao'}), 400
     cached = _aviation_cache_get(f'notam:{icao}', 1800)
     if cached is not None:
-        return jsonify(cached)
+        # Negativ-Treffer behält seinen 502-Status (Contract bleibt stabil).
+        return jsonify(cached), (502 if cached.get('error') else 200)
     try:
         import urllib.request as ur
         url = f'https://external-api.faa.gov/notamapi/v1/notams?icaoLocation={icao}&pageSize=20'
@@ -12651,7 +12659,12 @@ def get_notams(icao):
         _aviation_cache_set(f'notam:{icao}', result, 1800)
         return jsonify(result)
     except Exception as e:
-        return jsonify({'icao': icao, 'notams': [], 'error': 'notam_unavailable'}), 502
+        # Negativ-Cache 30 min (Sweep J2 2026-07-10): die FAA-API verlangt
+        # inzwischen einen API-Key (anonym 401) — ohne Cache lief JEDER Request
+        # erneut in den 10s-Upstream-Call.
+        result = {'icao': icao, 'notams': [], 'error': 'notam_unavailable'}
+        _aviation_cache_set(f'notam:{icao}', result, 1800)
+        return jsonify(result), 502
 
 
 # ─── IATA → ICAO Mapping für METAR-Lookup ───────────────────────────────────
@@ -14300,9 +14313,11 @@ def _ical_briefings_load(token):
 
 
 def _ical_briefings_save(token, events_dict):
-    """SB primary + Disk best-effort. Cap auf 1000 Events (rolling window)."""
+    """SB primary + Disk best-effort. Cap auf 1000 Events (rolling window).
+    Returns True wenn mind. ein Pfad gehalten hat (J5-Fix 2026-07-10: die
+    Import-Endpoints melden Persist-Fehler jetzt ehrlich statt ok:true)."""
     if not isinstance(events_dict, dict):
-        return
+        return False
     # Cap: behalte die jüngsten 4000 Tage (~11 Jahre) — User-Wunsch: Roster-Historie
     # NICHT löschen, mind. 10 Jahre aufbewahren (vorher 1000 ≈ 2,7 Jahre → ältere
     # Monate fielen raus). 4000 deckt 10+ Jahre tägliche Einträge ab.
@@ -14311,14 +14326,17 @@ def _ical_briefings_save(token, events_dict):
         keep = keys[-4000:]
         events_dict = {k: events_dict[k] for k in keep}
     sb_ok = _ical_briefings_save_to_supabase(token, events_dict)
+    disk_ok = False
     p = _ical_briefings_path(token)
     if p:
         try:
             _atomic_write_json(p, events_dict)
+            disk_ok = True
         except Exception as e:
             app.logger.warning(f'[ical-briefings] disk_save_fail (ok wenn SB lief): {e}')
             if not sb_ok:
                 app.logger.error('[ical-briefings] CRITICAL: weder SB noch Disk gesichert!')
+    return bool(sb_ok or disk_ok)
 
 
 def _manual_briefings_load_from_supabase(token):
@@ -16316,7 +16334,12 @@ def send_chat_message(token, channel_id):
         # Per-Row-Insert (2026-07-01): nur die NEUE Message nach SB upserten
         # statt load-ALL (bis 2000) → append → save-ALL (bis 500 Rows) pro
         # Send. Disk-Cache lokal anhängen (SB-down-Fallback bleibt intakt).
-        _dm_messages_save_to_supabase(channel_id, [msg])
+        # J5-P1 (Sweep 2026-07-10): SB-Fail NICHT als „gesendet" maskieren —
+        # Reads sind SB-or-Disk (Disk-only-Message unsichtbar sobald der Channel
+        # SB-Rows hat) und die Disk ist ephemer. 503 → iOS-SyncQueue retryt.
+        sb_ok = _dm_messages_save_to_supabase(channel_id, [msg])
+        if not sb_ok and SB_AVAILABLE:
+            return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
         disk_msgs = _dm_load_messages_from_disk(channel_id) or []
         disk_msgs.append(msg)
         _dm_save_messages_disk(channel_id, disk_msgs)
@@ -16369,7 +16392,11 @@ def _soft_delete_chat_message(token, channel_id, message_id):
         found['text'] = ''
         # Per-Row-Update (2026-07-01): nur DIESE Message nach SB upserten
         # (deleted-Flag landet in metadata-jsonb) statt alle ≤500 Messages.
-        _dm_messages_save_to_supabase(channel_id, [found])
+        # J5-Muster wie send: SB-Fail ehrlich melden — sonst resurrectet die
+        # „gelöschte" Message beim nächsten SB-Read (Client kann retryen).
+        sb_ok = _dm_messages_save_to_supabase(channel_id, [found])
+        if not sb_ok and SB_AVAILABLE:
+            return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
         _dm_save_messages_disk(channel_id, msgs[-500:])
     except Exception as e:
         print(f'[_soft_delete_chat_message] error: {type(e).__name__}: {str(e)[:300]}')
@@ -17573,6 +17600,7 @@ def upload_user_avatar(token):
     # Disk-Cache), kein neues Schema. ~200 KB JPEG → ~270 KB base64, passt in JSONB.
     # Alle vier Keys in EINEM Load+Save schreiben (statt 4× _profile_sidekey_set
     # mit je einem SB-Roundtrip) — gleiche SB-primary+Disk-Persistenz, 1 Upsert.
+    _persist_ok = False
     try:
         full = _profile_load(token) or {}
         profile = dict(full.get('profile') or {})
@@ -17589,9 +17617,14 @@ def upload_user_avatar(token):
         disk_full['profile'] = profile
         disk_full['avatar_url'] = avatar_url
         disk_full['_updated_at'] = datetime.now().isoformat()
-        _profile_save(token, profile, full_disk_payload=disk_full)
+        _persist_ok = bool(_profile_save(token, profile, full_disk_payload=disk_full))
     except Exception as e:
         app.logger.warning(f'[avatar] profile_set_fail tok={token[:8]}: {e}')
+    # J5-Fix (Sweep 2026-07-10): landet avatar_url NICHT auf der Profile-Row,
+    # sehen alle ANDEREN weiter den Platzhalter (der Uploader sein lokales Foto)
+    # — Fehler ehrlich als 503 melden statt ok:true, iOS kann retryen.
+    if not _persist_ok:
+        return jsonify({'ok': False, 'error': 'profile_persist_failed'}), 503
     return jsonify({'ok': True, 'avatar_url': avatar_url})
 
 
@@ -19771,6 +19804,12 @@ def get_layover_recs(iata):
     return jsonify({'iata': iata.upper(), 'count': len(recs), 'recs': recs})
 
 
+def _layover_img_key(token):
+    """Opaker, deterministischer Verzeichnis-Key — Token nie in public URL
+    (gleiches Muster wie _wall_img_key/_avatar_img_key, eigener Salt)."""
+    return _hashlib.sha256(('layover:' + (token or '')).encode()).hexdigest()[:32]
+
+
 @app.route('/api/layover-recs/<token>/upload-image', methods=['POST'])
 def upload_layover_image(token):
     """Photo-Upload für Layover-Rec oder Comment. Returns {url} zum Einbetten."""
@@ -19792,16 +19831,29 @@ def upload_layover_image(token):
     safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
     if not safe:
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
-    img_dir = os.path.join(_USER_HISTORY_DIR, 'layover_images', safe)
-    os.makedirs(img_dir, exist_ok=True)
+    # Wall/R2-Muster (Tipps-Fotos 2026-07-10): Disk ist EPHEMER → Bilder ver-
+    # schwanden bei jedem Redeploy (gleiche Klasse wie Wall-User #43). R2 primär
+    # (durabel, Zero-Egress), Disk nur Fallback; serve_layover_image streamt aus
+    # R2. Opaker dir_key statt Token als public URL-Segment (Token-Leak-Fix).
+    dir_key = _layover_img_key(token)
     fname = f'{uuid.uuid4().hex[:12]}{detected_ext}'
-    try:
-        with open(os.path.join(img_dir, fname), 'wb') as f:
-            f.write(data)
-    except Exception as e:
-        print(f'[upload_layover_image] error: {type(e).__name__}: {str(e)[:300]}')
-        return jsonify({'ok': False, 'error': 'internal_error'}), 500
-    return jsonify({'ok': True, 'url': f'/api/layover-recs/image/{safe}/{fname}'})
+    r2_ok = False
+    if R2_AVATARS_ENABLED:
+        try:
+            _r2_put_bytes(f'layover/{dir_key}/{fname}', data, detected_type)
+            r2_ok = True
+        except Exception as e:
+            app.logger.warning(f'[layover-img] r2_put_fail: {str(e)[:120]}')
+    if not r2_ok:
+        try:
+            img_dir = os.path.join(_USER_HISTORY_DIR, 'layover_images', dir_key)
+            os.makedirs(img_dir, exist_ok=True)
+            with open(os.path.join(img_dir, fname), 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            print(f'[upload_layover_image] error: {type(e).__name__}: {str(e)[:300]}')
+            return jsonify({'ok': False, 'error': 'internal_error'}), 500
+    return jsonify({'ok': True, 'url': f'/api/layover-recs/image/{dir_key}/{fname}'})
 
 
 @app.route('/api/layover-recs/image/<token_safe>/<fname>', methods=['GET'])
@@ -19814,6 +19866,14 @@ def serve_layover_image(token_safe, fname):
         return jsonify({'error': 'invalid'}), 400
     path = os.path.join(_USER_HISTORY_DIR, 'layover_images', safe_t, safe)
     if not os.path.exists(path):
+        # DURABILITY: neue Uploads liegen in R2 (Disk nur Fallback/Legacy) →
+        # aus R2 streamen, gleiches Muster wie serve_wall_image.
+        if R2_AVATARS_ENABLED:
+            r2_data, r2_ctype = _r2_get_bytes(f'layover/{safe_t}/{safe}')
+            if r2_data:
+                from flask import Response
+                return Response(r2_data, mimetype=r2_ctype or 'image/jpeg',
+                                headers={'Cache-Control': 'public, max-age=31536000, immutable'})
         return jsonify({'error': 'not_found'}), 404
     from flask import send_file
     mime = 'image/jpeg'
@@ -19825,7 +19885,7 @@ def serve_layover_image(token_safe, fname):
 
 @app.route('/api/layover-recs/<token>/add', methods=['POST'])
 def add_layover_rec(token):
-    """Body: {iata, category, title, description, rating, price_band, location_hint?, lat?, lon?}"""
+    """Body: {iata, category, title, description, rating, price_band, location_hint?, lat?, lon?, image_url?}"""
     body = request.get_json(silent=True) or {}
     iata = (body.get('iata') or '').strip().upper()
     cat = (body.get('category') or 'other').lower()
@@ -19834,6 +19894,14 @@ def add_layover_rec(token):
     rating = body.get('rating')
     price = (body.get('price_band') or '').strip()
     location_hint = (body.get('location_hint') or '').strip()[:200]
+    # Optionales Ort-Foto (Vertrag mit iOS 2026-07-10): NUR eigene Serve-Pfade
+    # aus upload_layover_image akzeptieren — keine fremden/absoluten URLs
+    # (gleiche Schutz-Idee wie _wall_img_sanitize_urls). Ungültig → still None.
+    image_url = (body.get('image_url') or '').strip() or None
+    if image_url and not re.match(
+            r'^/api/layover-recs/image/[A-Za-z0-9_-]{1,64}/[A-Za-z0-9_.-]{1,80}$',
+            image_url):
+        image_url = None
     # Optionale, vom Autor gepickte Pin-Koordinate (Karten-Picker im Composer).
     # Backward-compatible: fehlt/ungültig → None (Rec wird per Titel/Katalog gemappt).
     def _parse_coord(v, lo, hi):
@@ -19875,6 +19943,7 @@ def add_layover_rec(token):
         'location_hint': location_hint,
         'lat': lat,
         'lon': lon,
+        'image_url': image_url,
         'author_short': token[:8],
         'created_at': datetime.now().isoformat(),
         'ts': time.time(),
@@ -27780,6 +27849,11 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
         s['arr_delay_min'] = m.get('arr_delay_min')
         s['status'] = m.get('status')
         s['cancelled'] = bool(m.get('cancelled'))
+        # status_observed_at = ENRICH-Zeitpunkt (UTC), NICHT die Board-Zeit: die
+        # Quelle (_flight_obs_merged) trägt keinen eigenen Beobachtungs-Zeitstempel,
+        # ihr Memo ist ≤~90 s alt → ehrlich „Stand jetzt"; iOS muss die Frische
+        # der Status-Felder damit nicht mehr raten.
+        s['status_observed_at'] = now.strftime('%Y-%m-%dT%H:%M:%SZ')
         # est_*: bester Ist/Erwartet-Zeitstempel des Resolvers. Board-Esti steht in
         # STATIONS-Ortszeit (evtl. ohne Offset) → hier genau EINMAL nach echt-UTC
         # wandeln (dep mit airport_tz(from), arr mit airport_tz(to)), damit iOS den
@@ -34823,15 +34897,33 @@ def import_calendar_feed(token):
         events = _parse_ics_to_events(text)
     except Exception as _exc:
         app.logger.warning(f'[ics] parse-fail: {type(_exc).__name__}: {str(_exc)[:200]}')
-        events = []
+        # J5-Fix (Sweep 2026-07-10): Parse-Fail NICHT als Erfolg maskieren —
+        # vorher wurde events=[] MIT frischem imported_at gespeichert (ok:true)
+        # und der 6h-Refresh-Throttle blockte jeden Retry → Roster fror still ein.
+        return jsonify({'ok': False, 'error': 'ics_parse_failed'}), 502
     # SWISS-Nachbearbeitung (F1 Stations-Lokal-Buckets + F5 Layover-Synthese) —
     # no-op für LH-Feeds; wirft nie. VOR dem Persistieren, damit calendar_feed,
     # Briefings, Reconcile und Sektoren dieselbe (korrigierte) Event-Liste sehen.
     events = _swissify_roster_events(events, token=token)
     # Save Events — über _profile_save routen, damit calendar_feed in SB
     # (metadata-jsonb) landet und Cloud-Run-Redeploy überlebt.
-    feed_obj = {'url': url, 'events': events[:300],
-                'imported_at': datetime.now().isoformat()}
+    # MERGE statt ERSETZEN (ical-Clobber-Audit 2026-07-10): zwei Sync-Pfade
+    # (ICS-URL hier, EKEvent-Upload) teilen sich EINEN calendar_feed-Slot —
+    # vorher löschte jeder Writer die Felder des anderen (source bzw. url),
+    # DIE Wurzel des eingefrorenen Rosters. SB-first laden (Disk ist ephemer),
+    # eigene Felder gewinnen, fremde bleiben stehen.
+    feed_obj = {}
+    try:
+        _prev_full = _profile_load(token) or {}
+        for _src in ((_prev_full.get('profile') or {}), _prev_full):
+            _cand = _src.get('calendar_feed')
+            if isinstance(_cand, dict):
+                feed_obj = dict(_cand)
+                break
+    except Exception:
+        feed_obj = {}
+    feed_obj.update({'url': url, 'events': events[:300],
+                     'imported_at': datetime.now().isoformat()})
     try:
         disk_full = dict(_profile_load_from_disk(token) or {})
         disk_full['token'] = token
@@ -34856,6 +34948,7 @@ def import_calendar_feed(token):
     # wenn ein hartnäckiger Phantom-Tag auch außerhalb des laufenden Monats klebt.
     _full_clean = (str(request.args.get('full') or '').strip() in ('1', 'true', 'yes')
                    or bool((request.get_json(silent=True) or {}).get('full_clean')))
+    _persist_err = None
     try:
         existing = dict(_ical_briefings_load(token) or {})
         # Cap auf 200 Events (Performance) — entspricht ~6 Monate LH-Crew-Plan.
@@ -34868,9 +34961,15 @@ def import_calendar_feed(token):
             token, briefings, events[:200], full_clean=_full_clean)
         # Pro-Leg-Sektoren auch im ICS-URL-Pfad bewahren (gleich wie EKEvent-Upload).
         _attach_sectors(briefings, events[:200])
-        _ical_briefings_save(token, briefings)
+        if not _ical_briefings_save(token, briefings):
+            _persist_err = 'briefings_persist_failed'
     except Exception as e:
         app.logger.warning(f'[ical-briefings] import-persist-fail: {str(e)[:200]}')
+        _persist_err = 'internal_error'
+    # J5-Fix (Sweep 2026-07-10): Persist-Fehler ehrlich als 503 statt
+    # „ok:true + N importiert" ohne gespeicherte Daten (iOS zeigt .failed/retryt).
+    if _persist_err:
+        return jsonify({'ok': False, 'error': _persist_err}), 503
 
     # Kumulative Stats — der iCal-Feed liefert nur ein rollendes Fenster
     # (z.B. -30 / +60 Tage), aber wir behalten alle früher importierten Tage
@@ -34919,15 +35018,47 @@ def upload_calendar_events(token):
         })
     # Profil-Notiz
     p = _user_profile_path(token)
+    # Lebt der ICS-URL-Zyklus? (für den Reconcile-Skip weiter unten)
+    _url_feed_fresh = False
     try:
         existing = {}
         try:
             with open(p) as f: existing = json.load(f) or {}
         except Exception: pass
-        feed_obj_ios = {
+        # MERGE statt ERSETZEN (ical-Clobber-Audit 2026-07-10): der EK-Push
+        # löschte vorher die `url` des ICS-Feed-Pfads aus dem geteilten Slot →
+        # der Server-Refresh (_maybe_refresh_calendar_feed) war tot und der
+        # Roster fror auf dem letzten manuellen Sync ein. SB-first laden
+        # (Disk ist ephemer), fremde Felder (url, …) bewahren.
+        feed_obj_ios = {}
+        try:
+            _prev_full = _profile_load(token) or {}
+            for _src in ((_prev_full.get('profile') or {}), _prev_full):
+                _cand = _src.get('calendar_feed')
+                if isinstance(_cand, dict):
+                    feed_obj_ios = dict(_cand)
+                    break
+        except Exception:
+            feed_obj_ios = {}
+        # ICS-URL-Feed aktiv UND frischer Import (<24h ≈ lebender 6h-Zyklus)?
+        # Dann ist die URL-Seite die Autorität fürs Räumen (siehe Reconcile unten).
+        try:
+            if (feed_obj_ios.get('url') or '').strip() and (feed_obj_ios.get('imported_at') or '').strip():
+                _imp_age_s = (datetime.now() - datetime.fromisoformat(
+                    feed_obj_ios['imported_at'])).total_seconds()
+                _url_feed_fresh = _imp_age_s < 4 * _FEED_REFRESH_MIN_AGE_S
+        except Exception:
+            pass
+        _stamp = datetime.now().isoformat()
+        feed_obj_ios.update({
             'source': 'ios_ekeventstore', 'events': events[:300],
-            'imported_at': datetime.now().isoformat(),
-        }
+            'ek_imported_at': _stamp,
+        })
+        # imported_at gehört dem ICS-URL-Zyklus (6h-Throttle des Server-
+        # Refresh): nur setzen wenn KEIN URL-Feed aktiv ist — sonst würde
+        # jeder EK-Push den serverseitigen ICS-Refresh dauerhaft verschieben.
+        if not (feed_obj_ios.get('url') or '').strip():
+            feed_obj_ios['imported_at'] = _stamp
         existing['calendar_feed'] = feed_obj_ios
         # Persist über _profile_save (SB metadata + disk) — siehe import_calendar_feed.
         try:
@@ -34980,14 +35111,33 @@ def upload_calendar_events(token):
         # über den iOS-Push überlebten dauerhaft. ?full=1 → ganzes Feed-Fenster.
         _full_clean = (str(request.args.get('full') or '').strip() in ('1', 'true', 'yes')
                        or bool(body.get('full_clean')))
-        _reconcile_dbg = _reconcile_month_briefings(
-            token, briefings, adapted, full_clean=_full_clean)
+        # Doppel-Import-Wettlauf-Fix (Review 2026-07-10): hängt der Geräte-
+        # Kalender dem LH-Feed hinterher (Pickup ~1 Tag vorher nachgetragen,
+        # EK-Subscription lahmt) oder deckt er ein schmaleres Fenster ab, würde
+        # der EK-Push hier frisch importierte ICS-Tage räumen (inkl. SB-Delete),
+        # die der nächste 6h-ICS-Refresh wieder anlegt → Roster-Flattern /
+        # transiente Löcher. Läuft ein URL-Feed mit frischem imported_at, merged
+        # EK nur ADDITIV; das Reconcile gehört dann allein dem ICS-URL-Pfad.
+        # Explizites ?full=1 bleibt als bewusster Force-Clean-Override wirksam.
+        if _url_feed_fresh and not _full_clean:
+            _reconcile_dbg = {'feed_dates': 0, 'cleared': 0, 'window': None,
+                              'skipped': 'url_feed_fresher'}
+        else:
+            _reconcile_dbg = _reconcile_month_briefings(
+                token, briefings, adapted, full_clean=_full_clean)
         # Pro-Leg-Sektoren bewahren (geteilte Logik mit dem ICS-URL-Pfad).
         _attach_sectors(briefings, adapted)
-        _ical_briefings_save(token, briefings)
+        _persist_err = (None if _ical_briefings_save(token, briefings)
+                        else 'briefings_persist_failed')
     except Exception as e:
         _reconcile_dbg = {'error': 'internal_error'}
         app.logger.warning(f'[ical-briefings] ekevent-persist-fail: {type(e).__name__}: {str(e)[:200]}')
+        _persist_err = 'internal_error'
+    # J5-Fix (Sweep 2026-07-10): Persist-Fehler NICHT mehr als „ok:true + N
+    # Briefings importiert" maskieren — iOS (CalendarSyncView) zeigt sonst
+    # „Synchronisiert ✓" obwohl nichts gespeichert wurde. 503 → .failed-State.
+    if _persist_err:
+        return jsonify({'ok': False, 'error': _persist_err}), 503
     return jsonify({'ok': True, 'events_count': len(events),
                     'briefings_imported': imported_briefings,
                     'reconcile': _reconcile_dbg})

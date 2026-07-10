@@ -13,13 +13,15 @@ Was simuliert wird:
 - DOM-Mutation-Sequence (welche Elements werden display:block/none gesetzt)
 - Lock-Indicator-Visibility tracking
 """
+import os
 import urllib.request
 import json
 import re
 import sys
 
 
-BACKEND_URL = 'https://aerotax-backend-443401186607.europe-west3.run.app'
+# Prod-Backend (Hetzner via api.aerosteuer.de); Override für lokale Läufe.
+BACKEND_URL = os.environ.get('AEROX_BASE_URL', 'https://api.aerosteuer.de')
 
 
 def _resolve_site_html():

@@ -1,6 +1,6 @@
 """
-Layer-1 Contract Tests · iOS APIClient ↔ Live Cloud-Run Backend
-================================================================
+Layer-1 Contract Tests · iOS APIClient ↔ Live Prod-Backend
+===========================================================
 
 Verifies that every endpoint the iOS `APIClient.swift` consumes returns JSON
 whose top-level keys + value types match the iOS `Codable` struct expectations.
@@ -11,12 +11,11 @@ Run:
     pytest tests/aerox/test_contract_ios_backend.py -v
 
 The suite hits production:
-    BASE = https://aerotax-backend-443401186607.europe-west3.run.app
+    BASE = https://api.aerosteuer.de (Hetzner via Cloudflare-Worker)
 
-Cost: ~50 live HTTP calls. Cloud-Run has `min-instances=1` (warm). Run once
-per iteration. Tests are intentionally serial — one shared throwaway account
-is signed up, all reads/writes use that token, account is wiped in fixture
-teardown.
+Cost: ~50 live HTTP calls. Run once per iteration. Tests are intentionally
+serial — one shared throwaway account is signed up, all reads/writes use
+that token, account is wiped in fixture teardown.
 
 If a test fails: the assertion message contains BOTH the iOS-expected
 field-name AND the actual response keys, so the diff is immediately visible.
@@ -34,8 +33,17 @@ import requests
 
 BASE = os.environ.get(
     "AEROX_BACKEND_URL",
-    "https://aerotax-backend-443401186607.europe-west3.run.app",
+    "https://api.aerosteuer.de",
 )
+
+# Live-Suite gegen das Produktions-Backend (Signup/Writes über das Netz).
+# CI/lokale Läufe dürfen nicht von Prod-Verfügbarkeit abhängen → opt-in wie
+# in test_e2e_smoke_live.py via AEROX_LIVE_TESTS=1.
+if os.environ.get("AEROX_LIVE_TESTS") != "1":
+    pytest.skip(
+        "live production contract suite — set AEROX_LIVE_TESTS=1 to run",
+        allow_module_level=True,
+    )
 
 # iOS Token-Regex aus AuthStore (mirror): ^AT-[A-Za-z0-9_\-]+$
 IOS_TOKEN_REGEX = re.compile(r"^AT-[A-Za-z0-9_\-]+$")

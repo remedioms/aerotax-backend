@@ -392,3 +392,210 @@ def test_rate_limit_wired_through_adsb_pattern(client, monkeypatch):
 
 def test_ax_rate_limited_fails_open_without_request_context():
     assert axd._ax_rate_limited('ax_callsign', 120, 60) is False
+
+
+# ─────────────────────────────────────────────────────────────────
+# 4. own=1-Paid-Gate braucht Bearer (Sweep 2026-07-10, Klasse A)
+# ─────────────────────────────────────────────────────────────────
+
+def _capture_allow_paid(monkeypatch):
+    seen = {}
+
+    def fake_resolve(cs, **kw):
+        seen['allow_paid'] = kw.get('allow_paid')
+        return {'src': 'LGW', 'dst': 'SKG', 'callsign': cs,
+                'source': 'aerox_board', 'confidence': 'confirmed',
+                'sched_dep': '2026-07-05T18:35+01:00',
+                'sched_arr': '2026-07-06T00:20+03:00'}
+    monkeypatch.setattr(axd, '_ax_rate_limited', lambda *a, **k: False)
+    monkeypatch.setattr(axd, '_airport_row', _fake_airport_row)
+    monkeypatch.setattr(axd, '_resolve_live_route', fake_resolve)
+    monkeypatch.setattr(axd, '_life_app', lambda name, default=None: default)
+    return seen
+
+
+def test_ax_callsign_own_without_bearer_is_free(client, monkeypatch):
+    """own=1 allein schaltet kein Paid mehr — anonymes curl darf nie Credits
+    ziehen (Muster vom uflight-Gate)."""
+    seen = _capture_allow_paid(monkeypatch)
+    r = client.get('/api/ax/callsign/EZY29CT?own=1')
+    assert r.status_code == 200
+    assert seen['allow_paid'] is False
+
+
+def test_ax_callsign_own_with_bearer_allows_paid(client, monkeypatch):
+    """Mit Bearer-Header (App-Client) bleibt own=1 der bezahlte Notnagel."""
+    seen = _capture_allow_paid(monkeypatch)
+    r = client.get('/api/ax/callsign/EZY29CT?own=1',
+                   headers={'Authorization': 'Bearer AT-TEST'})
+    assert r.status_code == 200
+    assert seen['allow_paid'] is True
+
+
+# ─────────────────────────────────────────────────────────────────
+# 5. ax_schedule: Rate-Limit + Negativ-Cache + route-history-Fallback
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _clear_schedule_neg():
+    axd._SCHEDULE_NEG.clear()
+    yield
+    axd._SCHEDULE_NEG.clear()
+
+
+def test_ax_schedule_rate_limited_429(client, monkeypatch):
+    monkeypatch.setattr(axd, '_ax_rate_limited', lambda *a, **k: True)
+    r = client.get('/api/ax/schedule/FRA/LIS')
+    assert r.status_code == 429
+    assert r.get_json()['error'] == 'rate_limited'
+
+
+def _schedule_env(monkeypatch, http_result):
+    """AviationStack-Key da, Budget frei, SB-Cache leer, _http_json gestubbt."""
+    calls = {'http': 0}
+    monkeypatch.setattr(axd, '_ax_rate_limited', lambda *a, **k: False)
+    monkeypatch.setenv('AVIATIONSTACK_KEY', 'k-test')
+    monkeypatch.setattr(axd, '_budget_remaining', lambda m: (80, 10))
+    monkeypatch.setattr(axd, '_budget_inc', lambda m, u: None)
+    monkeypatch.setattr(axd, '_cache_get', lambda *a, **k: None)
+    monkeypatch.setattr(axd, '_cache_put', lambda *a, **k: None)
+
+    def fake_http(url, timeout=8):
+        calls['http'] += 1
+        return http_result
+    monkeypatch.setattr(axd, '_http_json', fake_http)
+    return calls
+
+
+def _hist_payload():
+    return {'ok': True, 'total': 2, 'recent_days': [
+        {'date': '2026-07-09', 'count': 2, 'flights': [
+            {'flight': 'LH400', 'airline': 'Lufthansa',
+             'sched': '2026-07-09T10:05:00', 'sched_arr': '2026-07-09T12:55:00',
+             'obs': 'both', 'dep_delay_min': 5, 'arr_delay_min': 12,
+             'cancelled': False, 'status': 'ontime'},
+            # reine arr-Row: 'sched' ist die ANKUNFTS-Zeit → darf nie als
+            # Abflugzeit im Fallback landen.
+            {'flight': 'UA961', 'airline': 'United',
+             'sched': '2026-07-09T13:10:00', 'obs': 'arr',
+             'arr_delay_min': None, 'cancelled': False, 'status': 'unknown'},
+        ]}]}
+
+
+def test_ax_schedule_error_falls_back_and_neg_caches(client, monkeypatch):
+    """AviationStack-Fehler → route-history-Fallback statt leer, UND der tote
+    Call wird 45 min negativ gecacht (zweiter Request rennt NICHT erneut rein)."""
+    calls = _schedule_env(monkeypatch, None)          # _http_json → error
+    monkeypatch.setattr(axd, '_life_app',
+                        lambda name, default=None:
+                        (lambda *a, **k: None) if name == 'ax_route_history'
+                        else default)
+    monkeypatch.setattr(axd, '_detail_subcall',
+                        lambda app_obj, path, view, *a: _hist_payload())
+
+    r = client.get('/api/ax/schedule/FRA/JFK')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['source'] == 'route-history'
+    assert calls['http'] == 1
+    lh = next(f for f in body['flights'] if f['flight'] == 'LH400')
+    assert lh['dep_scheduled'] == '2026-07-09T10:05:00'
+    assert lh['arr_scheduled'] == '2026-07-09T12:55:00'
+    assert lh['dep_delay'] == 5 and lh['arr_delay'] == 12
+    ua = next(f for f in body['flights'] if f['flight'] == 'UA961')
+    assert ua['dep_scheduled'] is None                # arr-Row ≠ Abflugzeit
+    assert ua['arr_scheduled'] == '2026-07-09T13:10:00'
+
+    # Zweiter Request: Negativ-Cache greift → KEIN weiterer externer Call.
+    r2 = client.get('/api/ax/schedule/FRA/JFK')
+    assert r2.status_code == 200
+    assert r2.get_json()['source'] == 'route-history'
+    assert calls['http'] == 1
+
+
+def test_ax_schedule_no_budget_falls_back_to_route_history(client, monkeypatch):
+    """Kein Key/Budget → statt 'budget-exhausted'+leer kommen die eigenen
+    Warehouse-Beobachtungen (free-first)."""
+    monkeypatch.setattr(axd, '_ax_rate_limited', lambda *a, **k: False)
+    monkeypatch.delenv('AVIATIONSTACK_KEY', raising=False)
+    monkeypatch.setattr(axd, '_budget_remaining', lambda m: (0, 90))
+    monkeypatch.setattr(axd, '_cache_get', lambda *a, **k: None)
+    monkeypatch.setattr(axd, '_life_app',
+                        lambda name, default=None:
+                        (lambda *a, **k: None) if name == 'ax_route_history'
+                        else default)
+    monkeypatch.setattr(axd, '_detail_subcall',
+                        lambda app_obj, path, view, *a: _hist_payload())
+    body = client.get('/api/ax/schedule/FRA/JFK').get_json()
+    assert body['source'] == 'route-history'
+    assert body['count'] == 2
+
+    # Fallback auch leer → ehrlich 'budget-exhausted' mit leerer Liste.
+    monkeypatch.setattr(axd, '_detail_subcall',
+                        lambda app_obj, path, view, *a: {'ok': True,
+                                                         'recent_days': []})
+    body2 = client.get('/api/ax/schedule/FRA/LIS').get_json()
+    assert body2['source'] == 'budget-exhausted' and body2['flights'] == []
+
+
+# ─────────────────────────────────────────────────────────────────
+# 6. _cache_get: Staleness-Gate (Sweep 2026-07-10, Klasse B)
+# ─────────────────────────────────────────────────────────────────
+
+def _fake_sb_row(payload, updated_at):
+    class _Q:
+        def select(self, *a, **k): return self
+        def eq(self, *a): return self
+        def limit(self, n): return self
+        def execute(self):
+            return types.SimpleNamespace(
+                data=[{'payload': payload, 'updated_at': updated_at}])
+
+    class _SB:
+        def table(self, name): return _Q()
+    return _SB()
+
+
+def _iso_days_ago(days):
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) - timedelta(days=days)) \
+        .strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def test_cache_get_fresh_entry_hits(monkeypatch):
+    p = {'src': 'FRA', 'dst': 'SPU', 'confidence': 'confirmed'}
+    monkeypatch.setattr(axd, '_sb',
+                        lambda: _fake_sb_row(p, _iso_days_ago(30)))
+    assert axd._cache_get('ax_route_cache', 'flight', 'LH1412') == p
+
+
+def test_cache_get_expired_confirmed_is_miss(monkeypatch):
+    """>90 Tage alte Route = Miss (Flugnummern werden saisonal umgeroutet —
+    LH1412-Vorfall): Free-Kaskade läuft neu, upsert überschreibt."""
+    p = {'src': 'FRA', 'dst': 'SPU', 'confidence': 'confirmed'}
+    monkeypatch.setattr(axd, '_sb',
+                        lambda: _fake_sb_row(p, _iso_days_ago(120)))
+    assert axd._cache_get('ax_route_cache', 'flight', 'LH1412') is None
+
+
+def test_cache_get_estimated_expires_after_14_days(monkeypatch):
+    """Geratene Routen (confidence != confirmed) verfallen schon nach 14 Tagen."""
+    p = {'src': 'FRA', 'dst': 'SPU', 'confidence': 'estimated'}
+    monkeypatch.setattr(axd, '_sb',
+                        lambda: _fake_sb_row(p, _iso_days_ago(20)))
+    assert axd._cache_get('ax_route_cache', 'flight', 'LH1412') is None
+    monkeypatch.setattr(axd, '_sb',
+                        lambda: _fake_sb_row(p, _iso_days_ago(5)))
+    assert axd._cache_get('ax_route_cache', 'flight', 'LH1412') == p
+
+
+def test_cache_get_max_age_none_keeps_old_semantics(monkeypatch):
+    """max_age_days=None (ax_schedule_cache mit eigener _fetched-Logik) und
+    Legacy-Rows ohne updated_at bleiben gültig — kein Massen-Miss."""
+    p = {'flights': [], 'count': 0, '_fetched': 1}
+    monkeypatch.setattr(axd, '_sb',
+                        lambda: _fake_sb_row(p, _iso_days_ago(400)))
+    assert axd._cache_get('ax_schedule_cache', 'route', 'FRA-LIS#cs3',
+                          max_age_days=None) == p
+    monkeypatch.setattr(axd, '_sb', lambda: _fake_sb_row(p, None))
+    assert axd._cache_get('ax_route_cache', 'flight', 'LH1412') == p

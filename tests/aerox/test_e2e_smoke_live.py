@@ -2,14 +2,14 @@
 LAYER 2 — E2E Live Smoke against Production Backend.
 
 Runs the real iOS APIClient.swift contracts (auth, profile, friends, wall, family-watch,
-error-path) against the live Cloud Run backend. NO MOCKS — every assertion exercises
-the actual production wire contract.
+error-path) against the live production backend (api.aerosteuer.de). NO MOCKS — every
+assertion exercises the actual production wire contract.
 
 Usage:
     pytest tests/aerox/test_e2e_smoke_live.py -v --tb=short
 
 Optional env-vars:
-    AEROX_BASE_URL — override backend (default Production Cloud Run)
+    AEROX_BASE_URL — override backend (default Production api.aerosteuer.de)
     AEROX_E2E_SKIP_RATE_LIMIT=1 — skip Journey 3 rate-limit subtest (slow, server-state)
 
 Test users are auto-created via /api/auth/signup with `e2e+<timestamp>@aerox.test`
@@ -37,7 +37,7 @@ import requests
 
 BASE_URL = os.environ.get(
     "AEROX_BASE_URL",
-    "https://aerotax-backend-443401186607.europe-west3.run.app",
+    "https://api.aerosteuer.de",
 ).rstrip("/")
 
 # Diese Suite trifft das LIVE-Produktions-Backend über das Netz (Signups,
