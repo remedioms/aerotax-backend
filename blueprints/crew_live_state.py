@@ -286,6 +286,16 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             last_flown_observed = True
             continue
         if b == 'airborne':
+            # Dep-seitiges „Abgeflogen"/airborne beweist den ABFLUG — nicht
+            # ewiges Fliegen. Outstations ohne Ankunfts-Board (ARN!) melden nie
+            # 'landed' → ohne Zeit-Deckel klebte der Status auf diesem Leg,
+            # obwohl die Maschine laengst den NAECHSTEN Sektor fliegt
+            # (Tibor LH802 „Ankunft 12:30" um 13:39). Ab Plan-Ankunft+Puffer
+            # gilt der Leg als geflogen und der naechste wird geprueft.
+            if now >= eff_arr + _dt.timedelta(minutes=_STALE_GROUNDED_MIN):
+                leg['flown'] = True
+                last_flown_observed = True
+                continue
             picked = ('flying', idx, CONF_OBSERVED)
             break
         if b == 'grounded':

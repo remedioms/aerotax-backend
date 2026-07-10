@@ -492,3 +492,36 @@ def test_friends_today_instore_frischeres_briefing_gewinnt_weiter():
     cs = data['friends_today'][0].get('crew_state')
     assert cs is not None
     assert cs['current_leg']['flight_no'] == 'LH777'
+
+
+def test_airborne_obs_ohne_ankunftsboard_kippt_zum_naechsten_leg():
+    """Tibor-Livefall 13:39: LH802 dep-seitig 'Abgeflogen' (ARN hat kein
+    Ankunfts-Board -> nie 'landed'), Plan-Ankunft 10:30Z lange vorbei,
+    LH803 laeuft laengst -> der Resolver muss auf Leg 3 weiterruecken."""
+    import datetime as dt
+    from blueprints.crew_live_state import resolve_crew_live_state
+    tz = dt.timezone.utc
+    day = dt.date(2026, 7, 10)
+
+    def iso(h, m):
+        return dt.datetime(day.year, day.month, day.day, h, m, tzinfo=tz).isoformat()
+
+    sectors = [
+        {'flight': 'LH1139', 'from': 'BCN', 'to': 'FRA', 'dep_iso': iso(4, 40), 'arr_iso': iso(6, 55)},
+        {'flight': 'LH802', 'from': 'FRA', 'to': 'ARN', 'dep_iso': iso(8, 25), 'arr_iso': iso(10, 30)},
+        {'flight': 'LH803', 'from': 'ARN', 'to': 'FRA', 'dep_iso': iso(11, 10), 'arr_iso': iso(13, 20)},
+    ]
+    obs = {
+        'LH1139': {'status': 'baggage delivery finished'},
+        'LH802': {'status': 'Abgeflogen'},          # dep-seitig, ewig ohne arr-Board
+        'LH803': {'status': 'gestartet'},
+    }
+    now = dt.datetime(2026, 7, 10, 11, 39, tzinfo=tz)   # 13:39 CEST
+    res = resolve_crew_live_state(
+        sectors,
+        obs_lookup=lambda fn, d, a: obs.get(fn),
+        live_lookup=lambda fn, d, a: None,
+        now=now)
+    assert res['state'] == 'flying'
+    assert res['current_leg']['flight_no'] == 'LH803'
+    assert res['current_leg']['dep'] == 'ARN' and res['current_leg']['arr'] == 'FRA'
