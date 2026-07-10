@@ -1288,6 +1288,24 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         # Plan-Ende + beobachtete Verspätung (None wenn keine Abweichung) —
         # iOS zeigt damit die korrigierte Ankunft statt der Plan-Zeit.
         status['today_arr_est_iso'] = today_arr_est_iso
+        # TATSÄCHLICHER Abflug (Owner 2026-07-10: „family simuliert mit ECHTEN
+        # abflug- und ankunftszeiten aus dem backend"): Plan-Abflug + beobachtete
+        # Abflug-Verspätung des AKTUELLEN Legs → die Family-Simulation startet den
+        # Flieger zur echten Off-Zeit statt zur Plan-Zeit (symmetrisch zu
+        # today_arr_est_iso). Nur echte Board-/Warehouse-Obs (free-only, dep_delay_min);
+        # ohne Delay = Plan. iOS nutzt today_dep_est_iso ?? today_dep_iso.
+        _dep_obs = (current_leg_obs if leg_picked
+                    else (legs_live_cached[0] if legs_live_cached else None))
+        _dep_delay = (_dep_obs or {}).get('dep_delay_min')
+        _dep_est_iso = today_dep_iso
+        try:
+            if today_dep_iso and _dep_delay:
+                _dep_est_iso = _iso_utc_z(
+                    _dt.datetime.fromisoformat(today_dep_iso.replace('Z', '+00:00'))
+                    + _dt.timedelta(minutes=int(_dep_delay)))
+        except Exception:
+            _dep_est_iso = today_dep_iso
+        status['today_dep_est_iso'] = _dep_est_iso
         # ECHTER Positions-Fix (Owner 2026-07-06): nur während flying_now, nur
         # unter dem next_flight-Grant (wie flying_now selbst). Ehrlichkeits-
         # Gates + (reg, datum)-Memo (10 min, Fan-out-sicher) + freie Kaskade
