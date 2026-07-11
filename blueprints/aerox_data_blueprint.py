@@ -3837,32 +3837,46 @@ def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso):
         rows = _fetch('flight', flight_no)
     if not rows:
         return [], reg, dep, arr
-    # Leg isolieren: explizit dep/arr, sonst das jüngste beobachtete Leg.
-    if dep or arr:
-        rows = [r for r in rows
-                if (not dep or (r.get('origin') or '') == dep)
-                and (not arr or (r.get('dest') or '') == arr)]
-    else:
-        last = rows[-1]
-        lo_, ld_ = last.get('origin'), last.get('dest')
-        rows = [r for r in rows if r.get('origin') == lo_ and r.get('dest') == ld_]
-        dep, arr = lo_, ld_
-    # LEG-ISOLIERUNG II: dieselbe Strecke kann im Fenster mehrfach geflogen sein
-    # (Kurzstrecken-Rotation) — origin/dest-Filter allein mischt dann zwei Spuren.
-    # An Zeitlücken >45 min splitten und das jüngste (zur Anfrage passende)
-    # Segment nehmen.
-    if rows:
-        segs, cur, prev = [], [], None
-        for r in rows:
-            ts = _iso_to_epoch(r.get('seen_ts'))
-            if cur and prev is not None and ts is not None and ts - prev > 45 * 60:
-                segs.append(cur)
-                cur = []
-            cur.append(r)
-            if ts is not None:
-                prev = ts
+    # LEG-ISOLIERUNG (Owner 2026-07-11 FIX): ZUERST an Zeitlücken >45 min in
+    # Segmente (= einzelne Legs) splitten, DANN das passende Segment wählen. Der
+    # frühere origin/dest-Filter LIEF VOR dem Split und warf die dichten adsb.lol-
+    # Airport-Crumbs raus, weil die aus dem C1-Sweep origin/dest=None haben →
+    # Breadcrumbs kamen nie in der App an. Jetzt bleiben route-lose Crumbs im
+    # zeitlich zugehörigen Leg (Taxi/Anflug-Kurven inklusive).
+    segs, cur, prev = [], [], None
+    for r in rows:
+        ts = _iso_to_epoch(r.get('seen_ts'))
+        if cur and prev is not None and ts is not None and ts - prev > 45 * 60:
+            segs.append(cur); cur = []
+        cur.append(r)
+        if ts is not None:
+            prev = ts
+    if cur:
         segs.append(cur)
-        rows = segs[-1]
+
+    def _seg_route(seg):
+        # Route eines Segments = origin/dest des jüngsten GEROUTETEN Crumbs darin
+        # (route-lose adsb.lol-Crumbs übergehen, aber im Segment behalten).
+        for r in reversed(seg):
+            o, d = r.get('origin'), r.get('dest')
+            if o or d:
+                return o, d
+        return None, None
+
+    chosen = None
+    if dep or arr:
+        # Jüngstes Segment nehmen, dessen gerouteter Anteil zu dep/arr passt.
+        for seg in reversed(segs):
+            o, d = _seg_route(seg)
+            if (not dep or o == dep) and (not arr or d == arr):
+                chosen = seg
+                break
+        if chosen is None:
+            return [], reg, dep, arr        # kein Routen-Match → nicht blind zuordnen
+    else:
+        chosen = segs[-1] if segs else []
+        dep, arr = _seg_route(chosen)
+    rows = chosen
     reg_used = (rows[0].get('reg') if rows else None) or reg
     pts = [{'lat': r['lat'], 'lon': r['lon'], 'alt': r.get('alt_ft'),
             'gs': r.get('gs_kt'), 'trk': r.get('track_deg'),
