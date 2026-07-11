@@ -2970,6 +2970,9 @@ _AREA_RADIUS_CAP_NM = 250
 # der Radius groß sein, damit ALLE geharvesteten Flieger im Fenster erscheinen
 # (Owner: „mein Backend scrappt doch alles, also kann die App alles anzeigen").
 _AREA_OVERVIEW_MAX_NM = 1500
+# Freshness (s) fuer den aircraft_live-Overview-Read. Der FR24-gRPC-Harvester
+# schreibt ~minuetlich; 900 s toleriert eine kurze Harvester-Delle, ohne Geister.
+_AREA_LIVE_MAX_AGE_S = 900.0
 
 
 def _area_cache_get(key, ttl):
@@ -3406,6 +3409,64 @@ def _area_from_fr24_live(lat, lon, radius):
     return out or None
 
 
+def _area_from_aircraft_live(lat, lon, radius):
+    """Flieger einer bbox aus aircraft_live (unser FR24-gRPC-Warehouse, global vom
+    NAS-Harvester gefuellt, ~817 Maschinen weltweit, frisch). Fuer den Rauszoom-
+    Overview: adsb.lol cappt bei 250 NM -> jenseits davon waeren die Raender leer,
+    obwohl wir die Flieger laengst gespeichert haben (Owner: „Backend scrappt alles").
+    Rueckgabe: normalisierte Dicts (identisches Schema wie _normalize_adsb_lol_ac,
+    damit die Response + der iOS-Parser unveraendert bleiben) oder None (leer/SB-down).
+
+    aircraft_live ist REG-keyed (kein ICAO-Hex) -> `hex` wird stabil aus der Reg
+    abgeleitet, damit iOS die Annotationen/Auswahl weiter ueber `hex` keyen kann."""
+    sb, ok = _sb_client()
+    if not ok or sb is None:
+        return None
+    lamin, lomin, lamax, lomax = _bbox_from_point(lat, lon, radius)
+    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                           time.gmtime(time.time() - _AREA_LIVE_MAX_AGE_S))
+    try:
+        q = (sb.table('aircraft_live')
+             .select('reg,reg_display,callsign,flight,lat,lon,track,gs_kt,'
+                     'alt_ft,ac_type,on_ground,origin,dest')
+             .gte('lat', lamin).lte('lat', lamax)
+             .gt('updated_at', cutoff))
+        if lomin <= lomax:
+            q = q.gte('lon', lomin).lte('lon', lomax)
+        else:
+            q = q.or_(f'lon.gte.{lomin},lon.lte.{lomax}')
+        rows = (q.limit(3000).execute()).data or []
+    except Exception:
+        return None
+    out = []
+    for d in rows:
+        la = _coerce_float(d.get('lat'))
+        lo = _coerce_float(d.get('lon'))
+        if la is None or lo is None:
+            continue
+        hexkey = ((d.get('reg') or d.get('callsign') or d.get('flight') or '')
+                  .strip().lower().replace('-', '')) or None
+        if hexkey is None:
+            continue
+        flight = (d.get('flight') or d.get('callsign') or '').strip() or None
+        out.append({
+            "hex": hexkey,
+            "flight": flight,
+            "callsign": (d.get('callsign') or flight),
+            "lat": la, "lon": lo,
+            "alt": _coerce_float(d.get('alt_ft')) or 0,
+            "speed": _coerce_float(d.get('gs_kt')),
+            "heading": _coerce_float(d.get('track')),
+            "squawk": None,
+            "reg": (d.get('reg_display') or d.get('reg') or '').strip() or None,
+            "type": (d.get('ac_type') or None),
+            "on_ground": bool(d.get('on_ground')),
+            "origin": (d.get('origin') or None),
+            "dest": (d.get('dest') or None),
+        })
+    return out or None
+
+
 def _area_from_fr24_grpc(lat, lon, radius):
     """Satelliten-Fallback für die Live-Map: FR24 gRPC area() über eine bbox —
     füllt Ozean/China/Sibirien (Aireon-Satellit + Partner-Feeds), wo adsb.lol/fi/
@@ -3500,25 +3561,26 @@ def get_adsb_area():
     aircraft = None
     source = None
 
-    # ─── Primär beim RAUSZOOMEN (großes Fenster): fr24_live-Geo-Read ───
-    # Der Owner-Schmerz „Radar lädt beim Pannen/Zoom-out lange": adsb.lol
-    # point-radius ist ein EXTERNER Roundtrip pro Fenster (1-3s) und bei 250nm
-    # gecappt — jenseits davon leer. fr24_live (unsere Welt-Tabelle, vom Harvester
-    # gefüllt) liest die Flieger einer bbox INSTANT aus Supabase, ohne Extern-Call,
-    # ohne Radius-Cap, über die ganze abgedeckte Welt. Nur ab ~90nm (Übersicht),
-    # weil die Store-Frische ~Minuten ist — beim Zoom-IN (kleiner Radius, Flieger
-    # verfolgen) bleibt adsb.lol real-time. Store leer/kalt (unabgedeckte Region)
-    # → normaler adsb.lol/OpenSky-Fallback unten.
-    if radius >= _AREA_FR24_MIN_RADIUS_NM:
+    # ─── Primär beim RAUSZOOMEN (> 250 NM): aircraft_live-Geo-Read ───
+    # Der Owner-Schmerz „ganz rausgezoomt = leere Ränder, nur ein Flieger-Block":
+    # adsb.lol point-radius ist bei 250 NM gecappt — jenseits davon leer, obwohl der
+    # FR24-gRPC-Harvester die Flieger (global, ~800 Maschinen) längst in aircraft_live
+    # speichert. Der bbox-Read liest sie INSTANT aus Supabase, ohne Extern-Call, ohne
+    # 250-Cap. NUR beim echten Overview (> 250 NM): bei moderatem Zoom (<= 250) bleibt
+    # der dichte adsb.lol-Echtzeit-Merge unten (mehr Verkehr als unsere 800er-Flotte).
+    # aircraft_live leer/kalt (unabgedeckte Region) → adsb.lol/OpenSky-Fallback unten.
+    # (fr24_live ist derzeit leer — der verteilte Harvester läuft nicht; aircraft_live
+    # ist die real gefüllte Welt-Tabelle, s. _area_from_aircraft_live.)
+    if radius > _AREA_RADIUS_CAP_NM:
         try:
-            fr_ac = _area_from_fr24_live(lat, lon, radius)
+            fr_ac = _area_from_aircraft_live(lat, lon, radius)
         except Exception as e:
             fr_ac = None
-            tried.append({"upstream": "fr24_live", "ok": False, "reason": str(e)[:80]})
+            tried.append({"upstream": "aircraft_live", "ok": False, "reason": str(e)[:80]})
         if fr_ac:
             aircraft = fr_ac
-            source = "fr24_live"
-            tried.append({"upstream": "fr24_live", "ok": True, "count": len(fr_ac)})
+            source = "aircraft_live"
+            tried.append({"upstream": "aircraft_live", "ok": True, "count": len(fr_ac)})
 
     # ─── Primär (Zoom-in) / Fallback: freie Mirrors GEMERGED (voller Radar) ───
     #  Union aus adsb.lol + adsb.fi + airplanes.live (parallel, dedup per Hex) statt
