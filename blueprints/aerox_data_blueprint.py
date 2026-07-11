@@ -3809,11 +3809,13 @@ def _iso_to_epoch(s):
         return None
 
 
-def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso):
+def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso, fresh_max_s=None):
     """Tier 1: die ECHTE geflogene Spur aus der eigenen aircraft_track-Tabelle
     (Breadcrumbs vom Harvester + FR24-Rückschreibungen). Isoliert EIN Leg:
     dep/arr-Filter falls gegeben, sonst das jüngste Leg (== origin/dest des
-    letzten Punkts). Liefert (points, reg_used, dep_used, arr_used)."""
+    letzten Punkts). Liefert (points, reg_used, dep_used, arr_used).
+    `fresh_max_s`: bei LIVE-Abfragen (kein Vergangenheits-Datum) das gewählte
+    Segment verwerfen, wenn sein jüngster Crumb älter als fresh_max_s ist."""
     sb = _sb()
     if sb is None:
         return [], reg, dep, arr
@@ -3878,6 +3880,17 @@ def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso):
         dep, arr = _seg_route(chosen)
     rows = chosen
     reg_used = (rows[0].get('reg') if rows else None) or reg
+    # FRISCHE-GATE (Owner 2026-07-11, KLM53T/CFG2RZ/TUI58V-Bug): fliegt eine Reg
+    # zweimal dieselbe Route am Tag (Vor-Rotation 19:53 LGW→FRA + aktuell 21:49
+    # LGW→FRA), matcht der dep/arr-Filter das ältere Segment — die Breadcrumbs des
+    # aktuellen Anflugs sind noch nicht geharvestet. Ergebnis: die App zeigt die
+    # STALE 2h-alte Landung, der Joint brückt sie an den Live-Flieger („orange ganz
+    # falsch"). Ist der jüngste Crumb zu alt → Segment verwerfen, damit Tier 2
+    # (FR24-Trail) die ECHTE aktuelle Spur liefert.
+    if fresh_max_s is not None and rows:
+        newest = max((_iso_to_epoch(r.get('seen_ts')) or 0) for r in rows)
+        if newest and (time.time() - newest) > fresh_max_s:
+            return [], reg_used, dep, arr
     pts = [{'lat': r['lat'], 'lon': r['lon'], 'alt': r.get('alt_ft'),
             'gs': r.get('gs_kt'), 'trk': r.get('track_deg'),
             'ts': _iso_to_epoch(r.get('seen_ts'))}
@@ -4148,7 +4161,12 @@ def ax_flown_track():
         hi_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now + 3600))
 
     source = 'aircraft_track'
-    points, reg_used, dep, arr = _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso)
+    # Live-Abfrage (heute/kein Datum): stale Segmente verwerfen, damit FR24 den
+    # aktuellen Anflug liefert (s. Frische-Gate). Vergangenheit: Staleness ist ok.
+    _live = (not date) or (date == time.strftime('%Y-%m-%d', time.gmtime()))
+    points, reg_used, dep, arr = _flown_track_db(
+        reg, flight_no, dep, arr, lo_iso, hi_iso,
+        fresh_max_s=(30 * 60 if _live else None))
     reg = reg or (reg_used or '')
 
     # Tier 1b (Permanenz): vergangenes Leg außerhalb der Roh-Retention →
