@@ -4203,7 +4203,12 @@ def ax_flown_track():
                 pos = None
             if pos and pos.get('lat') is not None:
                 q_lat, q_lon = pos.get('lat'), pos.get('lon')
-        if q_lat is not None and q_lon is not None:
+        # FR24-Detail matcht in der Praxis nur zuverlässig über den HEX (reg ohne
+        # Bindestrich / IATA-Callsign matchen die FR24-Feed-Rows oft NICHT → leer).
+        # No-Match-Empties triggern zudem den Freeze-on-Empties-Limiter und legen FR24
+        # kurz ganz lahm. Darum Tier 2 NUR mit hex aufrufen (Radar-Tap liefert ihn
+        # immer); ohne hex sauber auf great_circle (LH-Group hat eh Tier-1-Crumbs).
+        if q_hex and q_lat is not None and q_lon is not None:
             try:
                 from blueprints import fr24_grpc
                 # FIX (Owner 2026-07-12): hiess `flight=flight_no` — flown_trail hat
