@@ -2962,8 +2962,14 @@ def _parse_hub_points(raw):
 _ADSB_HUB_POINTS = _parse_hub_points(os.environ.get("ADSB_HUB_POINTS", ""))
 HEXDB_TIMEOUT = 5
 # adsb.lol point-radius cap (nm). Über ~250nm wird die Antwort riesig und die
-# community-API unfair belastet → hart deckeln.
+# community-API unfair belastet → hart deckeln. Gilt NUR für die externen Mirror-
+# /OpenSky-Pfade (die die API real cappt), NICHT für den fr24_live-Overview.
 _AREA_RADIUS_CAP_NM = 250
+# Overview-Cap (nm) für den fr24_live-Geo-Read: unsere Welt-Tabelle hat KEIN
+# 250nm-Limit (Supabase-bbox, limit(3000)) → beim Rauszoomen auf ganz Europa darf
+# der Radius groß sein, damit ALLE geharvesteten Flieger im Fenster erscheinen
+# (Owner: „mein Backend scrappt doch alles, also kann die App alles anzeigen").
+_AREA_OVERVIEW_MAX_NM = 1500
 
 
 def _area_cache_get(key, ttl):
@@ -3466,7 +3472,10 @@ def get_adsb_area():
     radius = _coerce_float(request.args.get('radius'))
     if radius is None or radius <= 0:
         radius = 100.0
-    radius = min(_AREA_RADIUS_CAP_NM, max(1.0, radius))
+    # Overview-Cap: der fr24_live-Pfad (>= _AREA_FR24_MIN_RADIUS_NM) darf groß sein
+    # (kein Extern-Limit). Die externen Mirror-/OpenSky-Fallbacks unten klemmen
+    # zusätzlich lokal auf _AREA_RADIUS_CAP_NM.
+    radius = min(_AREA_OVERVIEW_MAX_NM, max(1.0, radius))
 
     # Cache-Key auf ~0.1° (≈6nm) gerundet, damit leicht abweichende GPS-Punkte
     # denselben Cache-Eintrag treffen (N Clients → 1 Upstream-Call/Fenster).
@@ -3516,7 +3525,9 @@ def get_adsb_area():
     #  first-wins — verschiedene Feeder-Netze sehen verschiedene Flieger.
     if aircraft is None:
         try:
-            aircraft = _fetch_adsb_point_merged(lat, lon, radius)
+            # Externe Mirror cappen real bei 250nm → lokal klemmen (kein Riesen-URL).
+            aircraft = _fetch_adsb_point_merged(
+                lat, lon, min(radius, _AREA_RADIUS_CAP_NM))
             source = "adsb-merged"
             tried.append({"upstream": "adsb-merged", "ok": True,
                           "count": len(aircraft)})
@@ -3533,7 +3544,8 @@ def get_adsb_area():
             tried.append({"upstream": "opensky", "ok": False,
                           "reason": f"backoff_active({int(backoff_until - now)}s)"})
         else:
-            lamin, lomin, lamax, lomax = _bbox_from_point(lat, lon, radius)
+            lamin, lomin, lamax, lomax = _bbox_from_point(
+                lat, lon, min(radius, _AREA_RADIUS_CAP_NM))
             try:
                 states, _rem = _fetch_opensky_bbox(lamin, lomin, lamax, lomax)
                 aircraft = []
