@@ -4206,9 +4206,13 @@ def ax_flown_track():
         if q_lat is not None and q_lon is not None:
             try:
                 from blueprints import fr24_grpc
+                # FIX (Owner 2026-07-12): hiess `flight=flight_no` — flown_trail hat
+                # aber KEIN flight-Argument (nur callsign=) → jeder Call warf TypeError,
+                # vom except verschluckt → FR24-Backfill war KOMPLETT tot (jeder Flug
+                # ohne DE-Crumbs fiel auf great_circle, „LHR keine Crumbs"). callsign=.
                 trail = fr24_grpc.flown_trail(
                     reg=reg or (reg_disp or None), hex=q_hex,
-                    flight=flight_no, lat=q_lat, lon=q_lon)
+                    callsign=flight_no, lat=q_lat, lon=q_lon)
             except Exception:
                 trail = None
             if trail and trail.get('points'):
