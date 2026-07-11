@@ -1713,6 +1713,67 @@ def _maybe_evict_tracks():
         pass
 
 
+def observe_adsb_breadcrumbs(rows, source='adsb_lol_sweep', max_km=75.0, max_process=600):
+    """Schreibt adsb.lol-Sweep-Positionen als Breadcrumbs in aircraft_track — der
+    Sweep holt sie eh, verwarf sie aber bisher nach der Leg-Erkennung. NUR in
+    Flughafen-Nähe (Abflug/Anflug/Taxi = wo die Kurven sind), damit der weltweite
+    Enroute-Baseline (FR24-Harvester) unberührt bleibt und das Schreibvolumen
+    begrenzt ist. on_ground-Punkte nur bei Bewegung (gs>3 = Taxi, kein Park-Spam).
+    Idempotent via PK (reg, seen_ts) — dedupt über Ticks + Worker. Gibt die Anzahl
+    geschriebener Crumbs zurück. Never raises. (Unified-Track-Layer C1, 2026-07-11:
+    hybrid-Merge adsb.lol[Europa/Airports/Taxi] neben FR24[weltweit] in EINEN Store.)"""
+    sb = _sb()
+    if sb is None or not rows:
+        return 0
+
+    def _i(v):
+        try:
+            return int(round(float(v)))
+        except (TypeError, ValueError):
+            return None
+
+    now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    out, seen, processed = [], set(), 0
+    for row in rows:
+        if processed >= max_process:
+            break
+        try:
+            reg = (row.get('reg') or '').strip().upper()
+            lat, lon = row.get('lat'), row.get('lon')
+            if not reg or lat is None or lon is None or reg in seen:
+                continue
+            grounded = _obs_is_grounded(row)
+            gs = row.get('speed')
+            if grounded and (gs is None or gs <= 3):
+                continue                       # geparkt → kein Crumb
+            processed += 1
+            if _nearest_airport(lat, lon, max_km=max_km) is None:
+                continue                       # nicht flughafennah → enroute bleibt FR24
+            seen.add(reg)
+            out.append({
+                'reg': reg,
+                'seen_ts': now_iso,
+                'flight': (row.get('flight') or row.get('callsign') or None),
+                'origin': None, 'dest': None,
+                'lat': lat, 'lon': lon,
+                'alt_ft': _i(row.get('alt')),
+                'gs_kt': _i(gs),
+                'track_deg': _i(row.get('heading')),
+                'on_ground': bool(grounded),
+                'source': source,
+            })
+        except Exception:
+            continue
+    if not out:
+        return 0
+    try:
+        sb.table('aircraft_track').upsert(
+            out, on_conflict='reg,seen_ts', ignore_duplicates=True).execute()
+        return len(out)
+    except Exception:
+        return 0
+
+
 def observe_adsb_positions(rows, max_process=400):
     """Self-computed-route-Engine. Rows = normalisierte Live-Positionen (hex,
     callsign/flight, reg, lat, lon, alt, speed, on_ground). Erkennt Ab-/Anflug

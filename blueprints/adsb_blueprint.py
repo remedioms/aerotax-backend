@@ -2701,6 +2701,24 @@ def adsb_poll():
     except Exception:
         sweep_legs = 0
 
+    # Unified-Track-Layer C1 (2026-07-11): dieselben adsb.lol-Sweep-Punkte ALSO als
+    # Flughafen-Breadcrumbs (Taxi/Kurven) in aircraft_track schreiben — vorher nach
+    # der Leg-Erkennung verworfen. PLUS dedizierte DICHTE FRA/MUC-Abfrage jeden Tick
+    # (~60 s Raster statt ~7,5-min-Rotation). adsb.lol = gratis, kein Drossel-Risiko,
+    # gleiche Quelle wie die Karte. Weltweiter FR24-Baseline bleibt unberührt.
+    try:
+        from blueprints.aerox_data_blueprint import observe_adsb_breadcrumbs
+        crumb_rows = list(sweep_rows) if sweep_rows else []
+        for _hlat, _hlon in _ADSB_HUB_POINTS:
+            try:
+                crumb_rows.extend(_fetch_adsb_lol_point(_hlat, _hlon, 40))
+            except Exception:
+                continue
+        if crumb_rows:
+            observe_adsb_breadcrumbs(crumb_rows)
+    except Exception:
+        pass
+
     # Globaler OpenSky-Backoff aktiv? (429 zuvor) → OpenSky-Teil aussetzen (der
     # freie Sweep oben ist schon gelaufen).
     with _BACKOFF["lock"]:
@@ -2919,6 +2937,29 @@ _ROUTEINFO_TTL_SECONDS = 6 * 3600  # Routen sind statisch genug für lange TTL
 
 ADSB_LOL_BASE = "https://api.adsb.lol"
 ADSB_LOL_AREA_TIMEOUT = 8
+
+
+def _parse_hub_points(raw):
+    """"lat,lon; lat,lon" → [(lat,lon)]. Leer → Default FRA+MUC."""
+    default = [(50.033, 8.570), (48.353, 11.786)]      # FRA, MUC
+    raw = (raw or "").strip()
+    if not raw:
+        return default
+    out = []
+    for grp in raw.split(";"):
+        parts = grp.replace(",", " ").split()
+        if len(parts) >= 2:
+            try:
+                out.append((float(parts[0]), float(parts[1])))
+            except ValueError:
+                continue
+    return out or default
+
+
+# Dedizierte DICHTE adsb.lol-Airport-Abfrage jeden Poll-Tick (Unified-Track C1) —
+# 40 nm um FRA/MUC → ~60-s-Breadcrumbs inkl. Taxi in aircraft_track. Env
+# ADSB_HUB_POINTS="lat,lon; …" erweiterbar (adsb.lol-Boden-Coverage = Europa/US).
+_ADSB_HUB_POINTS = _parse_hub_points(os.environ.get("ADSB_HUB_POINTS", ""))
 HEXDB_TIMEOUT = 5
 # adsb.lol point-radius cap (nm). Über ~250nm wird die Antwort riesig und die
 # community-API unfair belastet → hart deckeln.
