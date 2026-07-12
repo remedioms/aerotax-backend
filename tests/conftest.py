@@ -42,6 +42,8 @@ _MEMO_GLOBALS = {
     '_AIRPORT_DAY_CACHE': None,
     '_NATIVE_BOARD_CACHE': None,
     '_AX_CODESHARE_CACHE': {'ts': 0.0, 'map': {}},
+    '_PASSPORT_STATS_CACHE': None,
+    '_PASSPORT_ROUTE_DUR_CACHE': None,
     '_UFLIGHT_MEMO': None,
     '_LIFECYCLE_MEMO': None,
 }

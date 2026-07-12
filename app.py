@@ -457,6 +457,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/ical/',
     '/api/user/stats/',
     '/api/user/trip-stats/',
+    '/api/user/passport-stats/',  # Crew-Passport = komplette Roster-Historie (PII)
     '/api/user/marker-mapping/',
     '/api/user/subscription/',
     '/api/user/sponsored/',
@@ -16015,8 +16016,19 @@ def take_roster_snapshot(token):
                 body = 'Eine Änderung im Dienstplan erkannt — bitte prüfen.'
             else:
                 body = f'{n} Änderungen im Dienstplan erkannt — bitte prüfen.'
+            # Lockscreen-Buttons (Annehmen/Ablehnen): category='DUTY_CHANGE'
+            # matcht EXAKT die in iOS registrierte UNNotificationCategory
+            # (PushService.registerActionCategories). roster_change_id = stabile
+            # Änderungs-ID im iOS-Handler-Contract (respondRosterChange:
+            # changeId == datum des Changes; '*' = alle pending — beides findet
+            # /api/user/roster-changes/<token>/decide wieder). Die Buttons
+            # bestätigen NUR Kenntnisnahme (pending → history + Baseline),
+            # sie mutieren NIE den Dienstplan selbst.
+            change_id = (diff[0].get('datum') or '*') if n == 1 else '*'
             _push_notify_async(token, 'Dienstplan-Änderung', body,
-                               data={'type': 'roster_change'})
+                               data={'type': 'roster_change',
+                                     'roster_change_id': str(change_id)},
+                               category='DUTY_CHANGE')
         except Exception:
             pass
     return jsonify({'ok': True, 'changes_count': len(diff), 'changes': diff})
@@ -21743,6 +21755,242 @@ def _community_metrics_from_ical(token):
     }
 
 
+# ── CREW-PASSPORT (Feature A, 2026-07-12) ─────────────────────────────────
+# Profil-Statistik im Flighty-„Passport"-Stil: Aggregation über ALLE
+# gespeicherten Roster-Sektoren des Users (dieselbe Quelle wie get_briefings:
+# ical_sectors der manual- + iCal-Briefings, Merge-Semantik identisch —
+# manual gewinnt bei vorhandenen Sektoren, sonst iCal). KEINE neue
+# Datenquelle, kein Paid-Spend — nur ehrliche Aggregation des Vorhandenen.
+_PASSPORT_STATS_CACHE = {}      # (token, range) -> (expires_ts, payload)
+_PASSPORT_ROUTE_DUR_CACHE = {}  # 'FRA-JFK' -> (expires_ts, minutes|None)
+
+
+def _passport_briefings_merged(token):
+    """Alle Tagessätze des Users (manual + iCal gemerged) — NUR fürs Lesen der
+    ical_sectors. Gleiche Prioritäts-Semantik wie get_briefings (setdefault:
+    manual-Sektoren gewinnen, iCal füllt Lücken), aber OHNE die teuren
+    Serve-Time-Anreicherungen (Kalender-Refresh, Live-Delays) — der Passport
+    braucht nur die historischen Legs, keine Live-Zahlen."""
+    try:
+        data = dict(_manual_briefings_load(token) or {})
+    except Exception:
+        data = {}
+    try:
+        for k, v in (_ical_briefings_load(token) or {}).items():
+            if not isinstance(v, dict):
+                continue
+            cur = data.get(k)
+            if not isinstance(cur, dict):
+                data[k] = v
+                continue
+            has_cur = isinstance(cur.get('ical_sectors'), list) and cur.get('ical_sectors')
+            has_new = isinstance(v.get('ical_sectors'), list) and v.get('ical_sectors')
+            if not has_cur and has_new:
+                cur = dict(cur)
+                cur['ical_sectors'] = v['ical_sectors']
+                data[k] = cur
+    except Exception:
+        pass
+    return data
+
+
+def _passport_route_duration_min(frm, to, budget):
+    """Typische Block-Minuten einer Strecke aus der route-history (Median der
+    duration_min der letzten 7 Tage) — Fallback für Sektoren OHNE arr_iso.
+    Prozess-Cache 6 h (auch Negativ-Treffer, sonst scannt jeder Passport-
+    Compute dieselbe tote Strecke erneut). `budget` ist ein mutierbarer
+    Zähler ({'n': int}) und deckelt die teuren Board-Scans pro Compute —
+    ist er aufgebraucht, wird ehrlich None geliefert (Leg fällt aus der
+    Flugzeit-Summe, NICHTS wird erfunden). Wirft nie."""
+    key = f'{frm}-{to}'
+    now = time.time()
+    ent = _PASSPORT_ROUTE_DUR_CACHE.get(key)
+    if ent and ent[0] > now:
+        return ent[1]
+    if not isinstance(budget, dict) or budget.get('n', 0) <= 0:
+        return None
+    budget['n'] = budget.get('n', 0) - 1
+    dur = None
+    try:
+        # Interner View-Reuse (Muster flight-detail-Aggregat): route-history
+        # in einem test_request_context aufrufen statt HTTP-Roundtrip.
+        with app.test_request_context(f'/api/ax/route-history/{frm}/{to}?days=7'):
+            resp = ax_route_history(frm, to)
+        body = resp[0] if isinstance(resp, tuple) else resp
+        payload = body.get_json(silent=True) or {}
+        vals = []
+        for d in payload.get('recent_days') or []:
+            for f in (d or {}).get('flights') or []:
+                dm = f.get('duration_min')
+                if isinstance(dm, (int, float)) and 0 < dm < 20 * 60:
+                    vals.append(float(dm))
+        if vals:
+            vals.sort()
+            dur = int(vals[len(vals) // 2])
+    except Exception:
+        dur = None
+    _PASSPORT_ROUTE_DUR_CACHE[key] = (now + 6 * 3600, dur)
+    _cache_soft_cap(_PASSPORT_ROUTE_DUR_CACHE)
+    return dur
+
+
+def _passport_range_match(datum, rng):
+    """True wenn ein YYYY-MM-DD-Datum in den Range fällt (all | YYYY | YYYY-MM)."""
+    if rng == 'all':
+        return True
+    if len(rng) == 4:
+        return datum[:4] == rng
+    return datum[:7] == rng
+
+
+def _passport_stats_compute(token, rng):
+    """Crew-Passport-Aggregat für einen Range:
+      flights / distance_km (Großkreis) / minutes_flown (arr−dep, Fallback
+      route-history-Median, sonst Leg ehrlich AUS der Zeit-Summe raus) /
+      Airports- / Airlines- (Flugnummern-Präfix) / Länder-Sets (ISO-2 aus der
+      Referenz-DB) + deduplizierte Routen-Liste mit Koordinaten (max 80,
+      häufigste zuerst). `years` trägt IMMER alle Jahre mit Flug-Daten
+      (unabhängig vom Range) — daraus baut der Client seine Zeitraum-Pills."""
+    from collections import Counter
+    days = _passport_briefings_merged(token)
+    ap_lookup = _airports_compact_lookup()
+
+    flights = 0
+    distance_km = 0.0
+    minutes = 0.0
+    legs_without_duration = 0
+    airports = set()
+    airlines = set()
+    countries = set()
+    routes = Counter()
+    years = set()
+    first_date = None
+    last_date = None
+    dur_budget = {'n': 5}   # max teure route-history-Lookups pro Compute
+
+    def _parse_iso(s):
+        if not s or not isinstance(s, str):
+            return None
+        try:
+            return datetime.fromisoformat(s.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+
+    for datum in sorted(days.keys()):
+        day = days.get(datum)
+        if not isinstance(day, dict) or not isinstance(datum, str):
+            continue
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', datum):
+            continue
+        secs = day.get('ical_sectors') or []
+        day_counted = False
+        for s in secs:
+            if not isinstance(s, dict):
+                continue
+            frm = (s.get('from') or '').strip().upper()
+            to = (s.get('to') or '').strip().upper()
+            if len(frm) != 3 or len(to) != 3 or frm == to:
+                continue
+            years.add(datum[:4])
+            if not _passport_range_match(datum, rng):
+                continue
+            flights += 1
+            day_counted = True
+            airports.add(frm)
+            airports.add(to)
+            routes[(frm, to)] += 1
+            fn = (s.get('flight') or s.get('flight_no') or '').replace(' ', '').upper()
+            m = re.match(r'^([A-Z]{2,3})\d', fn)
+            if m:
+                airlines.add(m.group(1))
+            ca = ap_lookup.get(frm)
+            cb = ap_lookup.get(to)
+            if ca and cb:
+                distance_km += _haversine_km(ca[0], ca[1], cb[0], cb[1])
+            for ent in (ca, cb):
+                if ent and ent[2]:
+                    countries.add(ent[2])
+            # Flugzeit: arr−dep wenn beide da und plausibel; sonst der
+            # route-history-Median; sonst fällt das Leg aus der Zeit-Summe.
+            dep = _parse_iso(s.get('dep_iso'))
+            arr = _parse_iso(s.get('arr_iso'))
+            mins = None
+            if dep and arr:
+                delta = (arr - dep).total_seconds() / 60.0
+                if delta < 0:
+                    delta += 24 * 60   # Mitternachts-Wrap (naive iCal-Zeiten)
+                if 0 < delta < 20 * 60:
+                    mins = delta
+            if mins is None:
+                mins = _passport_route_duration_min(frm, to, dur_budget)
+            if mins is not None:
+                minutes += float(mins)
+            else:
+                legs_without_duration += 1
+        if day_counted:
+            if first_date is None:
+                first_date = datum
+            last_date = datum
+
+    routes_out = []
+    for (frm, to), n in routes.most_common(80):
+        ca = ap_lookup.get(frm)
+        cb = ap_lookup.get(to)
+        if not (ca and cb):
+            continue   # ohne Koordinaten kein Bogen — ehrlich weglassen
+        routes_out.append({'from': frm, 'to': to, 'n': n,
+                           'lat1': round(ca[0], 3), 'lon1': round(ca[1], 3),
+                           'lat2': round(cb[0], 3), 'lon2': round(cb[1], 3)})
+
+    return {
+        'ok': True,
+        'has_data': flights > 0,
+        'range': rng,
+        'flights': flights,
+        'distance_km': round(distance_km),
+        'minutes_flown': int(round(minutes)),
+        'legs_without_duration': legs_without_duration,
+        'airports': sorted(airports),
+        'airports_count': len(airports),
+        'airlines': sorted(airlines),
+        'airlines_count': len(airlines),
+        'countries': sorted(countries),
+        'countries_count': len(countries),
+        'routes': routes_out,
+        'first_date': first_date,
+        'last_date': last_date,
+        'years': sorted(years, reverse=True),
+    }
+
+
+@app.route('/api/user/passport-stats/<token>', methods=['GET'])
+def get_passport_stats(token):
+    """Crew-Passport (Profil-Statistik) — GET /api/user/passport-stats/<token>
+    ?range=all|YYYY|YYYY-MM. Owner-Route mit Bearer-PFLICHT (der Passport
+    aggregiert die komplette Roster-Historie = PII; zusätzlich zum bug004-
+    Prefix-Gate hier hart gebunden). 60-s-Memo pro (token, range)."""
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    if not _request_bearer_matches(token):
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    rng = (request.args.get('range') or 'all').strip()
+    if not re.match(r'^(all|\d{4}|\d{4}-\d{2})$', rng):
+        return jsonify({'ok': False, 'error': 'bad_range'}), 400
+    now = time.time()
+    key = (token, rng)
+    cached = _PASSPORT_STATS_CACHE.get(key)
+    if cached and cached[0] > now:
+        return jsonify(cached[1])
+    try:
+        payload = _passport_stats_compute(token, rng)
+    except Exception as e:
+        print(f'[passport-stats] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
+    _PASSPORT_STATS_CACHE[key] = (now + 60, payload)
+    _cache_soft_cap(_PASSPORT_STATS_CACHE)
+    return jsonify(payload)
+
+
 @app.route('/api/community/benchmark/<token>', methods=['GET'])
 def community_benchmark(token):
     """AeroX-weiter Vergleich (#111): die YTD-Kernmetriken des Users gegen den
@@ -22659,7 +22907,7 @@ def _apns_get_jwt():
 
 def _send_apns(apns_token, title, body, data=None, topic=None,
                thread_id=None, badge=None, use_sandbox=None,
-               retry_env_planned=False):
+               retry_env_planned=False, category=None):
     """Sendet eine Push-Notification via APNs HTTP/2.
     Returns (ok: bool, reason: str|None). `reason` = APNs-Fehler-reason
     (z.B. 'BadDeviceToken', 'Unregistered') — der Caller nutzt sie für
@@ -22675,6 +22923,10 @@ def _send_apns(apns_token, title, body, data=None, topic=None,
 
     `thread_id` gruppiert Pushes in Notification-Center (z.B. pro Chat-Channel),
     `badge` setzt die App-Icon-Zahl (None = unverändert lassen).
+    `category` = aps.category (Notification-Action-Buttons): muss EXAKT einer in
+    der App registrierten UNNotificationCategory entsprechen (iOS PushService.
+    registerActionCategories, aktuell 'DUTY_CHANGE' → Annehmen/Ablehnen auf dem
+    Lockscreen). None = keine Buttons (wie bisher).
     """
     import os
     jwt = _apns_get_jwt()
@@ -22687,6 +22939,8 @@ def _send_apns(apns_token, title, body, data=None, topic=None,
         use_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
     host = 'api.sandbox.push.apple.com' if use_sandbox else 'api.push.apple.com'
     aps = {'alert': {'title': title, 'body': body}, 'sound': 'default'}
+    if category:
+        aps['category'] = str(category)[:64]
     if thread_id:
         aps['thread-id'] = str(thread_id)[:128]
     if badge is not None:
@@ -22748,7 +23002,7 @@ def _send_apns(apns_token, title, body, data=None, topic=None,
 
 
 def _send_push_notification(token, title, body, data=None,
-                            thread_id=None, badge=None):
+                            thread_id=None, badge=None, category=None):
     """Push-Send mit APNs-Bevorzugung + Expo-Fallback (best effort).
 
     1. Lade Push-Registry für `token`.
@@ -22797,13 +23051,14 @@ def _send_push_notification(token, title, body, data=None,
         ok, reason = _send_apns(apns_token, title, body, data=data,
                                 topic=apns_topic, thread_id=thread_id,
                                 badge=badge, use_sandbox=first_sandbox,
-                                retry_env_planned=True)
+                                retry_env_planned=True, category=category)
         used_env = 'sandbox' if first_sandbox else 'prod'
         if not ok and reason in ('Unregistered', 'BadDeviceToken', 'ExpiredToken'):
             alt_sandbox = not first_sandbox
             ok2, reason2 = _send_apns(apns_token, title, body, data=data,
                                       topic=apns_topic, thread_id=thread_id,
-                                      badge=badge, use_sandbox=alt_sandbox)
+                                      badge=badge, use_sandbox=alt_sandbox,
+                                      category=category)
             if ok2:
                 ok, reason = True, None
                 used_env = 'sandbox' if alt_sandbox else 'prod'
@@ -22878,13 +23133,14 @@ def _push_executor():
 
 
 def _push_notify_async(token, title, body, data=None, thread_id=None,
-                       badge=None):
+                       badge=None, category=None):
     """Nicht-blockierender Wrapper um _send_push_notification. Best-effort:
     Submit-Fehler (Interpreter-Shutdown o.ä.) werden geschluckt+gelogged."""
     def _job():
         try:
             _send_push_notification(token, title, body, data=data,
-                                    thread_id=thread_id, badge=badge)
+                                    thread_id=thread_id, badge=badge,
+                                    category=category)
         except Exception as e:
             print(f"[PUSH] async send failed for {str(token)[:8]}: "
                   f"{type(e).__name__}: {str(e)[:200]}")
@@ -28614,14 +28870,21 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
         # nie ein naiver String. delay_min bleibt die autoritative Zahl.
         s['est_dep_iso'] = _board_local_to_utc_iso(m.get('esti_dep'), frm)
         s['est_arr_iso'] = _board_local_to_utc_iso(m.get('esti_arr'), to)
-        s['reg'] = m.get('reg')
         # `tail` = Flugzeug-Kennzeichen fürs Kalender-Leg (Owner 2026-07-04:
         # „Tails auf jedem Leg im Kalender bei Crew UND Freunde"). Reines Alias auf
         # das GEMESSENE `reg` — NUR bei echtem Board/Warehouse-Treffer setzen, nie
         # erfunden; kein reg → Feld bleibt abwesend (additiv, abwärtskompatibel).
+        # AUSGEMUSTERTE-TAILS-WÄCHTER (Owner 2026-07-12, LH780→D-ABVU): manche
+        # Board-Quellen (Fraport-Feed) tragen für Langstrecken-Flugnummern
+        # Museums-Regs. reg/tail nur durchreichen, wenn die Reg in den letzten
+        # 60 Tagen wirklich fliegend gesehen wurde (aircraft_live/aircraft_track,
+        # 24 h-Memo) — sonst beide Felder ehrlich weglassen.
         _tail = m.get('reg')
         if isinstance(_tail, str):
             _tail = _tail.strip()
+        if _tail and not _tail_recently_active(_tail):
+            _tail = None
+        s['reg'] = _tail or None
         if _tail:
             s['tail'] = _tail
         s['obs_sides'] = m.get('sides')
@@ -28632,6 +28895,58 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
     # Hub-Turnaround durch, vom Owner explizit verboten).
     _carry_forward_turnaround_tails(sectors, homebase=homebase)
     return sectors
+
+
+# ── Ausgemusterte-Tails-Wächter (Owner-Screenshot 2026-07-12 17:43) ──────────
+# Root-Cause: der Fraport-Feed (und damit airport_delay_obs/`flights`) liefert
+# für manche Langstrecken-Flugnummern MUSEUMS-Regs (LH780→D-ABVU, LH781→D-ABTL,
+# beides seit Jahren ausgemusterte 747-400) — die Board-Quelle selbst ist die
+# Altlast, nicht unser Merge. Ein Tail wird darum NUR noch attached/ausgeliefert,
+# wenn die Reg in den letzten 60 Tagen WIRKLICH FLIEGEND gesehen wurde
+# (aircraft_live ODER aircraft_track, beide reg-normalisiert A-Z0-9). Sonst
+# ehrlich KEIN Tail statt Museums-Flieger.
+_TAIL_ACTIVE_CACHE = {}          # reg_norm -> (expires_ts, bool)
+_TAIL_ACTIVE_TTL = 24 * 3600     # definitive Antwort: 24 h pro Reg
+_TAIL_ACTIVE_ERR_TTL = 300       # Query-Fehler: 5 min nicht erneut hämmern
+_TAIL_ACTIVE_WINDOW_DAYS = 60
+
+
+def _tail_recently_active(reg):
+    """True, wenn die Reg in den letzten 60 Tagen in `aircraft_live` ODER
+    `aircraft_track` gesehen wurde (billige EXISTS-Query, in-process 24 h
+    gecacht pro Reg).
+
+    FAIL-OPEN bei Nicht-Verifizierbarkeit (SB down/Tabelle fehlt/Query-Fehler):
+    dann True zurückgeben, damit ein Infrastruktur-Schluckauf nicht ALLE Tails
+    app-weit wegräumt — der Wächter richtet sich gegen die systematische
+    Altquelle, nicht gegen transiente DB-Fehler. Leere Reg → False. Wirft nie."""
+    import time as _t
+    rn = str(reg or '').replace('-', '').replace(' ', '').upper().strip()
+    if not rn or not rn.isalnum():
+        return False
+    now = _t.time()
+    hit = _TAIL_ACTIVE_CACHE.get(rn)
+    if hit and now < hit[0]:
+        return hit[1]
+    if not SB_AVAILABLE or sb is None:
+        return True                     # nicht verifizierbar → fail-open (nicht cachen)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_TAIL_ACTIVE_WINDOW_DAYS)
+    cutoff_iso = cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        r = (sb.table('aircraft_live').select('reg')
+             .eq('reg', rn).gt('updated_at', cutoff_iso).limit(1).execute())
+        ok = bool(getattr(r, 'data', None))
+        if not ok:
+            r = (sb.table('aircraft_track').select('reg')
+                 .eq('reg', rn).gte('seen_ts', cutoff_iso).limit(1).execute())
+            ok = bool(getattr(r, 'data', None))
+        _TAIL_ACTIVE_CACHE[rn] = (now + _TAIL_ACTIVE_TTL, ok)
+        _cache_soft_cap(_TAIL_ACTIVE_CACHE, max_items=2000, drop=500)
+        return ok
+    except Exception:
+        # Fehler kurz negativ-TTL'en (nur gegen Hämmern), Antwort fail-open.
+        _TAIL_ACTIVE_CACHE[rn] = (now + _TAIL_ACTIVE_ERR_TTL, True)
+        return True
 
 
 def _leg_tail(flight_no, date=None, dep_iata=None, arr_iata=None):
@@ -28672,7 +28987,14 @@ def _leg_tail(flight_no, date=None, dep_iata=None, arr_iata=None):
     reg = m.get('reg')
     if isinstance(reg, str):
         reg = reg.strip()
-    return reg or None
+    if not reg:
+        return None
+    # Ausgemusterte-Tails-Wächter: Board-Quellen (Fraport) liefern für manche
+    # Flugnummern historische Regs (LH780→D-ABVU, retired 744). Nur ausliefern,
+    # wenn die Reg in den letzten 60 Tagen wirklich fliegend gesehen wurde.
+    if not _tail_recently_active(reg):
+        return None
+    return reg
 
 
 def _enrich_leg_tails(sectors, date=None, homebase=None):
