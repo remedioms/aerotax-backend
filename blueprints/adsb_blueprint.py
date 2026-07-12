@@ -2745,12 +2745,20 @@ def adsb_poll():
     # gleiche Quelle wie die Karte. Weltweiter FR24-Baseline bleibt unberührt.
     try:
         from blueprints.aerox_data_blueprint import observe_adsb_breadcrumbs
-        crumb_rows = list(sweep_rows) if sweep_rows else []
+        # HUB-ZEILEN ZUERST (Owner 2026-07-12 „Taxi wird nicht gespeichert"):
+        # der Europa-Sweep liefert oft >600 airborne Zeilen — stehen die dichten
+        # FRA/MUC-Punkte HINTEN, frisst der max_process-Cap in
+        # observe_adsb_breadcrumbs das Budget, BEVOR eine einzige Taxi-Zeile
+        # dran ist (live bewiesen: D-AIXF rollte 20 min ohne einen Crumb).
+        # Die Hubs sind der Sinn des Features → sie kommen zuerst.
+        crumb_rows = []
         for _hlat, _hlon in _ADSB_HUB_POINTS:
             try:
                 crumb_rows.extend(_fetch_adsb_lol_point(_hlat, _hlon, 40))
             except Exception:
                 continue
+        if sweep_rows:
+            crumb_rows.extend(sweep_rows)
         if crumb_rows:
             observe_adsb_breadcrumbs(crumb_rows)
     except Exception:

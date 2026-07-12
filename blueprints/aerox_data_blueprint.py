@@ -1713,7 +1713,7 @@ def _maybe_evict_tracks():
         pass
 
 
-def observe_adsb_breadcrumbs(rows, source='adsb_lol_sweep', max_km=75.0, max_process=600):
+def observe_adsb_breadcrumbs(rows, source='adsb_lol_sweep', max_km=75.0, max_process=900):
     """Schreibt adsb.lol-Sweep-Positionen als Breadcrumbs in aircraft_track — der
     Sweep holt sie eh, verwarf sie aber bisher nach der Leg-Erkennung. NUR in
     Flughafen-Nähe (Abflug/Anflug/Taxi = wo die Kurven sind), damit der weltweite
