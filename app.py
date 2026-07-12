@@ -12371,7 +12371,7 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
             duty = 'free'
         else:
             duty = None
-        return resolve_crew_live_state(
+        cs = resolve_crew_live_state(
             secs or [],
             build_obs_lookup(_flight_obs_merged, datum),
             build_live_lookup(),
@@ -12384,6 +12384,18 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
             status_bucket=_flight_status_bucket,
             pre_ctx=_crew_pre_flight_ctx(day, secs, b_summary, b_start_iso,
                                          commute_minutes))
+        # Museums-Wächter (2026-07-12, Jennifer/LH781): Board-obs liefern
+        # ausgemusterte Regs (Fraport, D-ABTL) — der Resolver hängt o['reg']
+        # ungeprüft an current_leg. Eine tote Reg vergiftet iOS-Reg-Lookups
+        # (Crew-Tap-Radar-Fokus, Live-Karten-Upgrade) → Karte stirbt still.
+        # Gleiche Regel wie überall: lieber reg=None als eine Museums-Reg.
+        try:
+            _leg = (cs or {}).get('current_leg') or {}
+            if _leg.get('reg') and not _tail_recently_active(_leg['reg']):
+                _leg['reg'] = None
+        except Exception:
+            pass
+        return cs
     except Exception as e:
         app.logger.info(f'[friends-today] crew_state_skip {type(e).__name__}')
         return None
