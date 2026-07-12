@@ -442,13 +442,19 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
         except Exception:
             return []
 
+    # FLUGNUMMER ZUERST (Owner 2026-07-12, LH781 „Flight Deck nicht live"):
+    # der Tail kann aus einer Museums-/Swap-Board-Row stammen — der Flug-/
+    # Callsign-Match identifiziert den Leg selbst und findet die Maschine, die
+    # die Nummer GERADE fliegt. Die Reg bleibt Zusatzschlüssel (Fallback), z.B.
+    # für Ferry-Flüge ohne Flugnummer. Route-Konsistenz (dest==dep) gilt
+    # unverändert pro Tier.
     rows = []
-    if rn:
-        rows = _query('reg', rn)
-    if not rows and fn:
+    if fn:
         rows = _query('flight', fn)
     if not rows and cs:
         rows = _query('callsign', cs)
+    if not rows and rn:
+        rows = _query('reg', rn)
     if not rows:
         return None, None, None, None
     r = rows[0]
@@ -3220,9 +3226,27 @@ def _obs_rows_to_facts(dep_row, arr_row):
     return facts
 
 
+def _tail_active_guard(reg):
+    """Museums-Tail-Wächter für Blueprint-Ausgaben (Owner 2026-07-12, LH781 →
+    D-ABTL): delegiert an `app._tail_recently_active` (60-Tage-Fenster gegen
+    aircraft_live/aircraft_track, 24 h-Memo pro Reg). Lazy-Import wie die
+    übrigen app-Reads des Blueprints; FAIL-OPEN (True) bei Import-/Laufzeit-
+    Fehlern — der Wächter richtet sich gegen die systematische Board-Altlast,
+    nicht gegen Infrastruktur-Schluckauf. Leere Reg → False. Wirft nie."""
+    if not reg:
+        return False
+    try:
+        from app import _tail_recently_active
+        return bool(_tail_recently_active(reg))
+    except Exception:
+        return True
+
+
 def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     """Board-Fakten EINES Flugs aus airport_delay_obs (DEP + <arr>#ARR gemergt).
-    Timeout-sicher (eigener try, Fehler → {}), indizierte Filter (date+flight)."""
+    Timeout-sicher (eigener try, Fehler → {}), indizierte Filter (date+flight).
+    Museums-Regs (Board-Altlast) werden am Ausgang gescrubbt — reg/type nur,
+    wenn die Reg in den letzten 60 Tagen wirklich fliegend gesehen wurde."""
     fn = (flight_no or '').replace(' ', '').upper().strip()
     d = ((date or '').strip()[:10]) or time.strftime('%Y-%m-%d', time.gmtime())
     if not fn:
@@ -3273,6 +3297,13 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
 
     best_dep, best_arr = _best(dep_cands), _best(arr_cands)
     facts = _obs_rows_to_facts(best_dep, best_arr)
+    # Museums-Tail-Wächter (Owner 2026-07-12): das Board (Fraport-Feed) trägt
+    # für manche Langstrecken-Flugnummern ausgemusterte Regs (LH781→D-ABTL).
+    # reg + den nur mit ihr beobachteten Typ dann ehrlich weglassen — alle
+    # Consumer (resolve-flight, uflight, flight-detail) erben den Scrub.
+    if facts.get('reg') and not _tail_active_guard(facts.get('reg')):
+        facts['reg'] = None
+        facts['type'] = None
     # Transparenz: stammen die gewählten Rows NICHT vom angefragten Datum
     # (Overnight-Fallback auf yday), das ehrlich markieren — Consumer können
     # gestrige Ist-Zeiten dann als potenziell veraltet behandeln.
@@ -3694,6 +3725,15 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
         facts = _flight_facts_from_obs(flight_no, date, dep_iata=origin, arr_iata=dest)
     reg = reg or facts.get('reg')
     ac_type = ac_type or facts.get('type')
+    # Museums-Tail-Wächter (Owner 2026-07-12, LH781→D-ABTL): auch die Reg aus
+    # der Routen-Kaskade (Warehouse-`flights`.tail) kann die Board-Altlast
+    # tragen — identity.reg/aircraft.reg nur mit kürzlich fliegend gesehener
+    # Reg ausliefern. Der Typ fällt mit, wenn er nicht aus aircraft_live
+    # (echter aktiver Flug) stammt — er gehört sonst zur Museums-Row.
+    if reg and not _tail_active_guard(reg):
+        reg = None
+        if not alf.get('aircraft'):
+            ac_type = None
     # Route aus den Board-Fakten, wenn aircraft_live + Kaskade nichts hatten (die
     # Obs kennen Start/Ziel: DEP-Row airport→dest_iata). Board = confirmed.
     if not (origin and dest) and facts.get('dep_iata') and facts.get('arr_iata'):
@@ -5039,8 +5079,26 @@ def ax_flight_detail(query):
         # zwangsläufig ein fremder Leg.
         _live_past = bool(date_q and date_q[:10] < time.strftime('%Y-%m-%d',
                                                                  time.gmtime()))
+        # FLUGNUMMER-ZUERST-Lookup (Owner 2026-07-12, LH781 „Flight Deck nicht
+        # live obwohl live"): _aircraft_live_pos matcht jetzt flight→callsign→reg
+        # — der (ggf. falsche Museums-/Swap-)Tail ist nur noch Zusatzschlüssel.
+        # Fehlt der echte Funkname aus resolve, wird er bei REIN NUMERISCHEM
+        # Suffix abgeleitet (LH781→DLH781; alphanumerische Suffixe wie DLH8UA
+        # sind nicht ableitbar) — nur als QUERY-Schlüssel, nie als Ausgabe.
+        # Ein falscher Kandidat schadet nicht: Flug-Nr matcht zuerst, das
+        # Route-Gate (dest==dep) filtert Fremd-Legs.
+        _live_cs = real_cs
+        if not _live_cs and fn_iata:
+            _i0 = 0
+            while _i0 < len(fn_iata) and not fn_iata[_i0].isdigit():
+                _i0 += 1
+            _pfx, _num = fn_iata[:_i0], fn_iata[_i0:]
+            if _num.isdigit():
+                _al = _airline_row(_pfx) or {}
+                if _al.get('icao'):
+                    _live_cs = _al['icao'] + _num.lstrip('0')
         f_live = None if _live_past else ex.submit(lambda: _aircraft_live_pos(
-            reg=(reg if dest else None), flight=fn_iata, callsign=real_cs,
+            reg=(reg if dest else None), flight=fn_iata, callsign=_live_cs,
             dep=dest))
         if f_route is not None:
             route = _res(f_route)
@@ -6527,6 +6585,304 @@ def ax_flight_inbound_chain(token):
         **chain, 'dep_delay_forecast': forecast,
     }
     return jsonify(_memo_put(mkey, payload))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Rotations-Karte „Wo ist mein Flieger" (Feature B, Plan-Doc
+#  PLAN-Crew-Passport-und-MyPlane-Rotation.md Abschnitt B, 2026-07-12):
+#  die volle TAGES-Rotation der Maschine, die den angefragten Flug fliegt —
+#  Soll/Ist/Delay je Leg aus den VORHANDENEN Board-Merges (flights-Warehouse +
+#  airport_delay_obs, 0 Fremd-Spend) + deterministische Abflug-Folgerechnung
+#  (effektive Zubringer-Ankunft + Typ-Turnaround-Minimum). Die Rechenkette
+#  steht als Text im Payload („Zubringer +52 min → Abflug frühestens 18:05") —
+#  das Wort „geschätzt" ist im Flug-Kontext verboten (Owner-Domänenregel).
+#  LH-Taufname: die gebackene Referenz-DB (aircraft: hex/reg/typecode/…)
+#  trägt KEINEN Taufnamen → wird bewusst weggelassen (nichts erfinden).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hhmm_station_local(iso_utc, iata):
+    """UTC-/Offset-ISO → „HH:MM" in der Stations-Ortszeit von `iata`.
+    None bei unparsebar/unbekannter TZ — nie eine falsche Wanduhr behaupten."""
+    if not iso_utc:
+        return None
+    try:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+        from airport_tz import airport_tz as _atz
+        dt = _dt.fromisoformat(str(iso_utc).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            return None
+        tzn = _atz((iata or '').upper())
+        if not tzn:
+            return None
+        return dt.astimezone(ZoneInfo(tzn)).strftime('%H:%M')
+    except Exception:
+        return None
+
+
+def _iso_utc_dt(iso):
+    """Offset-/Z-ISO → aware UTC-datetime; None bei naiv/unparsebar."""
+    if not iso:
+        return None
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        dt = _dt.fromisoformat(str(iso).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            return None
+        return dt.astimezone(_tz.utc)
+    except Exception:
+        return None
+
+
+def _build_plane_rotation(flight_no, date, dep=None, arr=None, reg_hint=None):
+    """Payload der Rotations-Karte. Free-only, wirft nie.
+
+    Reg-Kaskade wie die Inbound-Chain (Dual-Side-Merge → SB-Tages-Rows →
+    Roster-Hint), inkl. MUSEUMS-TAIL-WÄCHTER: eine Reg, die seit 60 Tagen
+    nicht fliegend gesehen wurde (Fraport-Altlast, LH781→D-ABTL), wird NICHT
+    als Rotations-Anker benutzt — ehrlich found:false statt Museums-Umlauf."""
+    # Flugnummern-Normalisierung aus app (SQ026==SQ26); Fallback nur Format-Putz.
+    _fnn = _life_app('_fn_norm') or (
+        lambda s: str(s or '').replace(' ', '').upper().strip())
+    fn = _fnn(flight_no)
+    out = {'ok': True, 'found': False, 'flight_no': fn, 'date': date,
+           'reg': None, 'aircraft_type': None, 'legs': [], 'forecast': None}
+    merged_fn = _life_app('_flight_obs_merged')
+    my = None
+    try:
+        my = (merged_fn(fn, date=date, dep_iata=dep, arr_iata=arr,
+                        free_only=True) if merged_fn else None)
+    except Exception:
+        my = None
+    reg = (my or {}).get('reg') or None
+    ac_type = (my or {}).get('aircraft') or None
+    if not reg:
+        try:
+            _sb_reg, _sb_tc, _d, _a = _sb_day_reg(fn, date)
+            reg = _sb_reg
+            ac_type = ac_type or _sb_tc
+        except Exception:
+            pass
+    if not reg:
+        reg = (str(reg_hint or '').strip().upper() or None)
+    if reg and not _tail_active_guard(reg):
+        reg = None                    # Museums-Reg → kein Rotations-Anker
+    if not reg:
+        out['reason'] = 'Maschine noch nicht zugeteilt oder beobachtet.'
+        return out
+    if not ac_type:
+        try:
+            _hx, tc = _reg_hex_typecode_free(reg)
+            ac_type = tc
+        except Exception:
+            ac_type = None
+    out['reg'] = reg
+    out['aircraft_type'] = ac_type
+
+    sb = _sb()
+    if sb is None:
+        out['reason'] = 'Warehouse nicht erreichbar.'
+        return out
+    variants = _reg_candidates(reg)
+    bare = re.sub(r'[^A-Z0-9]', '', reg)
+
+    # 1) Warehouse-Legs des Tages (Board-verifizierte Tail↔Flug-Matches;
+    #    Zeiten dort sind UTC-ISO mit Offset/Z).
+    legs = {}                         # fn_norm -> leg-dict
+    order = []
+    try:
+        r = (sb.table('flights')
+             .select('op_flight_no,origin,destination,sched_dep,est_dep,'
+                     'sched_arr,est_arr,status')
+             .in_('tail', variants).eq('service_date', date)
+             .order('sched_dep').limit(16).execute())
+        for f in (r.data or []):
+            k = _fnn(f.get('op_flight_no'))
+            if not k or k in legs:
+                continue
+            legs[k] = {
+                'flight_no': k,
+                'origin': _norm_iata(f.get('origin')),
+                'destination': _norm_iata(f.get('destination')),
+                'sched_dep': f.get('sched_dep'), 'est_dep': f.get('est_dep'),
+                'sched_arr': f.get('sched_arr'), 'est_arr': f.get('est_arr'),
+                'status': f.get('status'),
+                'dep_delay_min': None, 'arr_delay_min': None,
+                'cancelled': None,
+            }
+            order.append(k)
+    except Exception:
+        pass
+
+    # 2) Board-Obs desselben Tages/Tails: Delays + Legs, die das Warehouse
+    #    (noch) nicht hat. EIN indizierter Query (reg+date), keine Fan-outs.
+    to_utc = _life_app('_board_local_to_utc_iso')
+    known_fn = _life_app('_obs_delay_known')
+    try:
+        ro = (sb.table('airport_delay_obs')
+              .select('airport,flight,dest_iata,sched,esti,status,'
+                      'max_delay_min,cancelled,type_code')
+              .in_('reg', sorted({v for v in variants + [bare] if v}))
+              .eq('date', date)
+              .order('updated_at', desc=True).limit(40).execute())
+        obs_rows = ro.data or []
+    except Exception:
+        obs_rows = []
+    for o in obs_rows:
+        k = _fnn(o.get('flight'))
+        if not k:
+            continue
+        ap = (o.get('airport') or '').upper()
+        is_arr = ap.endswith('#ARR')
+        station = ap.split('#', 1)[0]
+        md = o.get('max_delay_min')
+        canc = bool(o.get('cancelled'))
+        try:
+            known = bool(known_fn(md, canc, o.get('esti'), o.get('status'),
+                                  is_arr)) if known_fn else (md is not None)
+        except Exception:
+            known = md is not None
+        leg = legs.get(k)
+        if leg is None:
+            # Obs-only-Leg (Warehouse-Matcher hat ihn nicht): Richtung je
+            # Board-Seite (ARR-Row: airport=Ziel, dest_iata=Herkunft).
+            leg = {
+                'flight_no': k,
+                'origin': _norm_iata(o.get('dest_iata') if is_arr else station),
+                'destination': _norm_iata(station if is_arr else o.get('dest_iata')),
+                'sched_dep': None, 'est_dep': None,
+                'sched_arr': None, 'est_arr': None,
+                'status': None,
+                'dep_delay_min': None, 'arr_delay_min': None,
+                'cancelled': None,
+            }
+            legs[k] = leg
+            order.append(k)
+        side_ap = station                 # Wanduhr-Station der Row
+        if is_arr:
+            if leg['arr_delay_min'] is None and known and not canc:
+                leg['arr_delay_min'] = int(md or 0)
+            if not leg.get('sched_arr') and o.get('sched') and to_utc:
+                leg['sched_arr'] = to_utc(o.get('sched'), side_ap)
+            if not leg.get('est_arr') and o.get('esti') and to_utc:
+                leg['est_arr'] = to_utc(o.get('esti'), side_ap)
+        else:
+            if leg['dep_delay_min'] is None and known and not canc:
+                leg['dep_delay_min'] = int(md or 0)
+            if not leg.get('sched_dep') and o.get('sched') and to_utc:
+                leg['sched_dep'] = to_utc(o.get('sched'), side_ap)
+            if not leg.get('est_dep') and o.get('esti') and to_utc:
+                leg['est_dep'] = to_utc(o.get('esti'), side_ap)
+            if not leg.get('status') and o.get('status'):
+                leg['status'] = o.get('status')
+        if canc:
+            leg['cancelled'] = True
+        if not out['aircraft_type'] and (o.get('type_code') or '').strip():
+            out['aircraft_type'] = o['type_code'].strip()
+
+    # Chronologisch nach Soll-Abflug (Legs ohne Zeit ans Ende, stabile Ordnung).
+    def _leg_sort_key(k):
+        sd = legs[k].get('sched_dep') or ''
+        return (0 if sd else 1, sd, order.index(k))
+    ordered = sorted(legs.keys(), key=_leg_sort_key)[:8]
+
+    my_leg = None
+    for k in ordered:
+        leg = legs[k]
+        leg['is_mine'] = (k == fn and (not dep or leg.get('origin') == _norm_iata(dep)))
+        if leg['is_mine'] and my_leg is None:
+            my_leg = leg
+    out['legs'] = [legs[k] for k in ordered]
+    out['found'] = True
+
+    # 3) Deterministische Abflug-Folgerechnung: effektive Zubringer-Ankunft
+    #    (est vor sched) + Typ-Turnaround-Minimum vs. eigener Soll-Abflug.
+    #    NUR echte Zeiten — fehlt eine Seite, gibt es KEINE Folgerechnung.
+    my_sched = _iso_utc_dt((my_leg or {}).get('sched_dep'))
+    my_origin = (my_leg or {}).get('origin') or _norm_iata(dep)
+    inbound = None
+    if my_sched and my_origin:
+        for k in ordered:
+            leg = legs[k]
+            if leg.get('is_mine'):
+                continue
+            if leg.get('destination') != my_origin:
+                continue
+            l_dep = _iso_utc_dt(leg.get('sched_dep'))
+            if l_dep is not None and l_dep >= my_sched:
+                continue              # startet erst nach meinem Abflug → kein Zubringer
+            eff = _iso_utc_dt(leg.get('est_arr')) or _iso_utc_dt(leg.get('sched_arr'))
+            if eff is None:
+                continue
+            if inbound is None or eff > inbound[1]:
+                inbound = (leg, eff)
+    if inbound is not None:
+        from datetime import timedelta as _td
+        leg, eff = inbound
+        turn = _turnaround_min_for_type(out['aircraft_type'])
+        earliest = max(my_sched, eff + _td(minutes=turn))
+        fdelay = max(0, int(round((earliest - my_sched).total_seconds() / 60.0)))
+        e_hhmm = _hhmm_station_local(earliest.isoformat(), my_origin)
+        # Rechenkette als Text — echte Zahlen, kein „geschätzt".
+        d = leg.get('arr_delay_min')
+        if d is not None and d > 0:
+            head = f'Zubringer +{int(d)} min'
+        elif d is not None:
+            head = 'Zubringer pünktlich'
+        else:
+            a_hhmm = _hhmm_station_local(eff.isoformat(), my_origin)
+            head = (f'Zubringer landet {a_hhmm}' if a_hhmm else 'Zubringer')
+        if e_hhmm:
+            tail_txt = (f' → Abflug frühestens {e_hhmm}' if fdelay > 0
+                        else f' → Abflug planmäßig {e_hhmm}')
+        else:
+            tail_txt = ''
+        out['forecast'] = {
+            'dep_delay_min': fdelay,
+            'earliest_dep': earliest.isoformat(),
+            'earliest_dep_hhmm': e_hhmm,
+            'turnaround_min': turn,
+            'inbound_flight_no': leg.get('flight_no'),
+            'inbound_eff_arr': eff.isoformat(),
+            'text': head + tail_txt,
+        }
+    return out
+
+
+@aerox_data_bp.route('/api/ax/plane-rotation/<flight>', methods=['GET'])
+def ax_plane_rotation(flight):
+    """Tages-Rotation der Maschine hinter `flight` (Feature B RotationCard).
+    Query: date=YYYY-MM-DD (Default: Berlin-heute), dep/arr (eigene Leg-IATA,
+    optional — schärfen den Merge), reg (Roster-Tail-Hint, optional).
+    Gratis (eigene Tabellen), 45 s memoisiert, Rate-Limit gegen Scans."""
+    from flask import request
+    if _ax_rate_limited('plane_rotation', limit=30, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    fn = (flight or '').replace(' ', '').upper().strip()
+    if len(fn) < 3:
+        return jsonify({'ok': False, 'error': 'bad_flight'}), 400
+    date = (request.args.get('date') or '').strip()[:10]
+    if not date:
+        try:
+            from zoneinfo import ZoneInfo
+            from datetime import datetime as _dtz
+            date = _dtz.now(ZoneInfo('Europe/Berlin')).strftime('%Y-%m-%d')
+        except Exception:
+            date = time.strftime('%Y-%m-%d', time.gmtime())
+    dep = _norm_iata(request.args.get('dep'))
+    arr = _norm_iata(request.args.get('arr'))
+    reg_hint = (request.args.get('reg') or '').strip().upper() or None
+    mkey = ('plane_rotation', fn, date, dep or '', arr or '', reg_hint or '')
+    memo = _memo_get(mkey)
+    if memo is not None:
+        return jsonify(memo)
+    payload = _build_plane_rotation(fn, date, dep=dep, arr=arr,
+                                    reg_hint=reg_hint)
+    # Leere/Fehl-Antworten NICHT memoisieren (Muster flight-detail): ein
+    # transienter Ausfall darf nicht 45 s als „keine Rotation" kleben.
+    if payload.get('found'):
+        _memo_put(mkey, payload)
+    return jsonify(payload)
 
 
 @aerox_data_bp.route('/api/ax/flight-live/<token>', methods=['GET'])

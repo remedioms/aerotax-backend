@@ -28063,6 +28063,30 @@ def ax_route_history(frm, to):
     days_out = []
     # Codeshare-Mapping EINMAL pro Request (Prozess-Cache, 6 h TTL).
     cs_map = _ax_codeshare_map()
+    # HISTORIE = VERGANGENHEIT (Owner-Screenshot 2026-07-12, LH781 SIN→FRA:
+    # „MORGEN · 06:40 → 06:40 · pünktlich"): der Tag-0-Bucket trägt das Datum
+    # des ORIGIN-lokalen Heute (SIN = schon der 13.), die Live-Store-Rows beider
+    # Seiten aber je den Betriebstag IHRER Station (FRA-Ankünfte = noch der 12.).
+    # Ohne Datums-Gate landeten heutige FRA-Ankünfte im MORGEN-Bucket (und
+    # doppelt: dieselbe Row nochmal im richtigen Tag aus der DB). Dazu das
+    # Zukunfts-Gate: ein Flug, dessen sched-Wandzeit an seiner Station noch in
+    # der Zukunft liegt, ist NICHT geflogen — er gehört nicht in „zuletzt"
+    # (Board-Prognosen sind keine Historie). Rein für die Tag-0-Store-Rows;
+    # die DB-Tage (i>0) sind date-gekeyt und vergangen.
+    def _row_in_day_and_flown(r, day, station_iata):
+        sc = str(r.get('sched') or '')
+        if len(sc) >= 10 and sc[:10] != day:
+            return False
+        try:
+            now_st = _airport_local_now(station_iata)
+            if now_st is not None and len(sc) >= 16:
+                sched_dt = datetime.strptime(sc[:16], '%Y-%m-%dT%H:%M')
+                if sched_dt > now_st.replace(tzinfo=None):
+                    return False
+        except Exception:
+            pass          # unparsebar → nicht filtern (kein Datenverlust)
+        return True
+
     for i in range(ndays):
         d = (base - _td(days=i)).strftime('%Y-%m-%d')
         rows = (_departed_rows_from_store(store_key) if i == 0
@@ -28074,6 +28098,11 @@ def ax_route_history(frm, to):
                             else _board_rows_from_obs_for_date(d, arr_key, None))
             except Exception:
                 arr_rows = []
+        if i == 0:
+            rows = [r for r in (rows or [])
+                    if _row_in_day_and_flown(r, d, board_ap)]
+            arr_rows = [r for r in (arr_rows or [])
+                        if _row_in_day_and_flown(r, d, to)]
         flights = []
         by_fn = {}
         # DUAL-SIDE-MERGE (Owner-Direktive 2026-07-03): haben BEIDE Seiten
@@ -29467,7 +29496,25 @@ def ax_flight_info(flightno):
         except Exception:
             pass
 
+    # AUSGEMUSTERTE-TAILS-WÄCHTER auch auf der DETAIL-Ausgabe (Owner-Screenshot
+    # 2026-07-12 LH781: „MASCHINE DABTL · Boeing 747-400" — die Board-Quelle
+    # trägt Museums-Regs, siehe _tail_recently_active). reg/type UND die
+    # recent_regs-Historie nur mit Regs ausliefern, die in den letzten 60 Tagen
+    # wirklich fliegend gesehen wurden — sonst Feld ehrlich weglassen. Wirft nie
+    # (der Wächter selbst ist fail-open bei Infrastruktur-Fehlern).
     if out is not None:
+        try:
+            if out.get('reg') and not _tail_recently_active(out['reg']):
+                out['reg'] = None
+                out['type'] = None
+            rr = out.get('recent_regs')
+            if isinstance(rr, list) and rr:
+                out['recent_regs'] = [
+                    x for x in rr
+                    if isinstance(x, dict)
+                    and _tail_recently_active(x.get('reg'))]
+        except Exception:
+            pass
         return _public_cache_headers(jsonify(out))
     # Weder Historie noch Live-Feed → Client fällt auf AeroDataBox zurück.
     return jsonify({'ok': True, 'found': False, 'flight': fn, 'source': 'none'})
@@ -31041,7 +31088,12 @@ def flight_status(token):
             'status': ('cancelled' if m.get('cancelled') else raw_status),
             'status_category': ('cancelled' if m.get('cancelled')
                                 else _flight_status_category(raw_status)),
-            'aircraft': m.get('aircraft') or '', 'reg': m.get('reg') or '',
+            # Museums-Tail-Wächter (Owner 2026-07-12, LH781→D-ABTL): reg nur,
+            # wenn die Reg kürzlich wirklich fliegend gesehen wurde — sonst
+            # leer (iOS lässt die MASCHINE-Zeile dann ehrlich weg).
+            'aircraft': m.get('aircraft') or '',
+            'reg': ((m.get('reg') or '')
+                    if _tail_recently_active(m.get('reg')) else ''),
             'dep_delay_min': m.get('dep_delay_min'),
             'arr_delay_min': m.get('arr_delay_min'),
             'delay_min': m.get('delay_min'), 'delay_side': m.get('delay_side'),

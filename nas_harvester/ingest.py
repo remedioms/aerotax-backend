@@ -406,11 +406,10 @@ class Ingest:
         # Route-Konsistenz PRO Tier (wie im Supabase-Pfad, aerox_data_blueprint):
         # ein Reg-Hit mit falschem dest (Swap-Maschine, anderer Leg) wird verworfen
         # und die flight-/callsign-Stufe darf noch matchen — nicht terminal abbrechen.
+        # FLUGNUMMER ZUERST (Owner 2026-07-12, wie _aircraft_live_pos im
+        # Backend): der Tail kann aus einer Museums-/Swap-Board-Row stammen —
+        # Flug/Callsign identifizieren den Leg selbst; Reg bleibt Zusatzschlüssel.
         def route_ok(snap): return not (dep and snap.get("dest") and snap["dest"] != dep)
-        if reg:
-            it = self._latest.get(reg)
-            if it and fresh(it[1]) and route_ok(it[0]):
-                return it[0]
         if flight:
             for snap, t in self._latest.values():
                 if fresh(t) and (snap.get("flight") or "") == flight and route_ok(snap):
@@ -419,6 +418,10 @@ class Ingest:
             for snap, t in self._latest.values():
                 if fresh(t) and (snap.get("callsign") or "") == cs and route_ok(snap):
                     return snap
+        if reg:
+            it = self._latest.get(reg)
+            if it and fresh(it[1]) and route_ok(it[0]):
+                return it[0]
         return None
 
     async def _http_pos(self, request):

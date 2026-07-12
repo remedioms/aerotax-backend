@@ -73,6 +73,12 @@ class _FakeQuery:
     def gte(self, *a, **k):
         return self
 
+    def in_(self, *a, **k):
+        return self
+
+    def order(self, *a, **k):
+        return self
+
     def limit(self, *a, **k):
         return self
 
@@ -204,3 +210,109 @@ def test_enrich_delays_keeps_active_tail():
         A._enrich_leg_delays([s], None)
     assert s.get('tail') == 'D-AIXY'
     assert s.get('reg') == 'D-AIXY'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ax_flight_info: Detail-Ausgabe scrubbt Museums-Reg (Owner-Screenshot LH781,
+# „MASCHINE DABTL · Boeing 747-400" auf der Detailseite trotz Roster-Wächter)
+# ══════════════════════════════════════════════════════════════════════════════
+def _flight_info_json(active):
+    """ax_flight_info hermetisch aufrufen — Board-Row trägt die Museums-Reg."""
+    import blueprints.aerox_data_blueprint as BP
+    today = A._airport_local_now('FRA').strftime('%Y-%m-%d')
+    obs_row = {'airport': 'FRA', 'flight': 'LH781', 'dest_iata': 'SIN',
+               'dest_name': 'Singapore', 'airline': 'LH', 'gate': 'F58',
+               'terminal': '2', 'status': 'Departed', 'sched': '23:40',
+               'esti': None, 'max_delay_min': 0, 'cancelled': False,
+               'reg': 'DABTL', 'type_code': 'B744', 'date': today}
+    p1, p2, _ = _with_sb({'airport_delay_obs': [obs_row]})
+    with p1, p2, \
+            patch.object(A, '_tail_recently_active', return_value=active), \
+            patch.object(A, '_flight_from_live_board', return_value=None), \
+            patch.object(A, '_flight_obs_merged', return_value=None), \
+            patch.object(A, '_arrival_gate_terminal',
+                         return_value=(None, None)), \
+            patch.object(BP, '_flight_facts_from_obs', return_value={}):
+        with A.app.test_request_context('/api/ax/flight-info/LH781'):
+            resp = A.ax_flight_info('LH781')
+    if isinstance(resp, tuple):
+        resp = resp[0]
+    return resp.get_json()
+
+
+def test_flight_info_scrubs_museum_reg_and_recent_regs():
+    d = _flight_info_json(active=False)
+    assert d['found'] is True
+    assert d['reg'] is None
+    assert d['type'] is None
+    assert d['recent_regs'] == []
+    # Identität/Strecke bleiben — nur die Maschine wird weggelassen.
+    assert d['origin'] == 'FRA' and d['dest'] == 'SIN'
+
+
+def test_flight_info_keeps_active_reg():
+    d = _flight_info_json(active=True)
+    assert d['reg'] == 'DABTL'
+    assert d['type'] == 'B744'
+    assert d['recent_regs'] and d['recent_regs'][0]['reg'] == 'DABTL'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Blueprint: _flight_facts_from_obs scrubbt reg/type am Ausgang
+# (Consumer: resolve-flight, uflight, flight-detail — alle erben den Scrub)
+# ══════════════════════════════════════════════════════════════════════════════
+def _facts_with_reg(active):
+    import blueprints.aerox_data_blueprint as BP
+    dep_row = {'airport': 'SIN', 'flight': 'LH781', 'dest_iata': 'FRA',
+               'sched': '2026-07-12T23:40:00', 'esti': None, 'gate': 'F58',
+               'terminal': '2', 'status': 'Departed', 'max_delay_min': 0,
+               'cancelled': False, 'reg': 'DABTL', 'type_code': 'B744',
+               'date': '2026-07-12'}
+    fake = _FakeSB({'airport_delay_obs': [dep_row]})
+    with patch.object(BP, '_sb', return_value=fake), \
+            patch.object(A, '_tail_recently_active', return_value=active):
+        return BP._flight_facts_from_obs('LH781', '2026-07-12')
+
+
+def test_facts_from_obs_scrubs_museum_reg():
+    facts = _facts_with_reg(active=False)
+    assert facts.get('reg') is None
+    assert facts.get('type') is None
+    # Die übrigen Board-Fakten bleiben (Zeit-Wissen ≠ Tail-Wissen).
+    assert facts.get('dep_iata') == 'SIN'
+
+
+def test_facts_from_obs_keeps_active_reg():
+    facts = _facts_with_reg(active=True)
+    assert facts.get('reg') == 'DABTL'
+    assert facts.get('type') == 'B744'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Unified-Resolver: identity.reg/aircraft.reg aus der Routen-Kaskade
+# (Warehouse-`flights`.tail) fällt ebenfalls unter den Wächter
+# ══════════════════════════════════════════════════════════════════════════════
+def _unified_with_warehouse_reg(active):
+    import blueprints.aerox_data_blueprint as BP
+    import blueprints.warehouse_reader as WR
+    rt = {'src': 'SIN', 'dst': 'FRA', 'source': 'warehouse_board',
+          'confidence': 'confirmed', 'reg': 'D-ABTL', 'flight_no': 'LH781'}
+    with patch.object(BP, '_aircraft_live_flight', return_value=None), \
+            patch.object(WR, 'route_for_flight', return_value=rt), \
+            patch.object(BP, '_flight_facts_from_obs', return_value={}), \
+            patch.object(BP, '_tail_active_guard', return_value=active):
+        return BP._resolve_unified_flight_core(
+            'LH781', '2026-07-12', False, None, None, False)
+
+
+def test_unified_resolver_scrubs_museum_reg():
+    res = _unified_with_warehouse_reg(active=False)
+    assert res['found'] is True
+    assert res['identity']['reg'] is None
+    assert res['aircraft']['reg'] is None
+
+
+def test_unified_resolver_keeps_active_reg():
+    res = _unified_with_warehouse_reg(active=True)
+    assert res['identity']['reg'] == 'D-ABTL'
+    assert res['aircraft']['reg'] == 'D-ABTL'
