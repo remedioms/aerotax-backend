@@ -10514,6 +10514,12 @@ _PUSH_TYPE_TO_PREF = {
     'wall_comment_reply': 'community',
     'forum_reply': 'community',
     'forum_mention': 'community',
+    # Audit 2026-07-12: bisher ungemappte Typen → jetzt filterbar (fail-open
+    # bleibt: kein gesetzter Pref = senden).
+    'friend_remind': 'community',
+    'family_reaction': 'community',
+    'trade_interest': 'community',
+    'trade_closed': 'community',
 }
 
 
@@ -34276,7 +34282,10 @@ def friend_remind(token):
         return jsonify({'ok': False, 'error': 'not_friends'}), 403
     try:
         _push_notify_async(friend_token, 'Erinnerung',
-                           'Ein Crew-Buddy bittet dich, deinen Dienstplan zu importieren.')
+                           'Ein Crew-Buddy bittet dich, deinen Dienstplan zu importieren.',
+                           # Audit 2026-07-12: ohne data.type war der Push
+                           # unfilterbar (verstiess gegen die eigene Checkliste).
+                           data={'type': 'friend_remind'})
     except Exception:
         pass
     return jsonify({'ok': True})

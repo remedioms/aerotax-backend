@@ -310,11 +310,13 @@ def _notify_family_of_reaction(family_token, emoji):
     if not family_token:
         return
     try:
-        from app import _send_push_notification
-        _send_push_notification(
+        # ASYNC (Audit 2026-07-12): der synchrone Send konnte den React-Request
+        # bis in den APNs-Timeout blockieren — Checklisten-Regel ist push_notify_ASYNC.
+        from app import _push_notify_async
+        _push_notify_async(
             family_token,
-            title='Antwort von der Crew',
-            body=f'{emoji} auf deine Nachricht',
+            'Antwort von der Crew',
+            f'{emoji} auf deine Nachricht',
             data={'type': 'family_reaction', 'emoji': emoji})
     except Exception as e:
         _log().info(f'[feed-status] react_push_skip {type(e).__name__}')

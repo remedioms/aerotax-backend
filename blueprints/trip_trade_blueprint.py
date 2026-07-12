@@ -129,11 +129,21 @@ def _push(token, title, body, data=None):
     m = _get_app_module()
     if m is None:
         return False
-    fn = getattr(m, '_send_push_notification', None)
+    # ASYNC (Audit 2026-07-12): synchroner Send blockierte den Request-Pfad
+    # bis zu APNs-Timeouts — jetzt fire-and-forget wie überall (_push_notify_async).
+    fn = getattr(m, '_push_notify_async', None) \
+        or getattr(m, '_send_push_notification', None)
     if not callable(fn):
         return False
     try:
-        return bool(fn(token, title, body, data))
+        fn(token, title, body, data)
+        return True
+    except TypeError:
+        try:
+            fn(token, title, body, data=data)
+            return True
+        except Exception:
+            return False
     except Exception:
         return False
 
