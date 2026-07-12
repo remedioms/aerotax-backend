@@ -184,7 +184,13 @@ def compact_leg(reg, rows, max_points=MAX_POINTS):
     if not flight:
         # PK-Spalte darf nicht leer kollidieren: Stadt-Paar als Fallback-Key,
         # damit zwei route-bekannte Legs ohne Flugnummer nicht verschmelzen.
-        flight = ('%s-%s' % (dep, arr)) if (dep and arr) else ''
+        # Audit B11: flight='' kollidierte für ALLE route-losen Legs derselben
+        # Reg am selben Tag (nur der letzte Leg überlebte den Upsert) →
+        # Zeitfenster in den Key: '@<HH>' = UTC-Stunde des ersten Punkts
+        # (stabil/idempotent bei Re-Runs, kollisionsarm — zwei route-lose Legs
+        # derselben Maschine starten praktisch nie in derselben Stunde).
+        flight = (('%s-%s' % (dep, arr)) if (dep and arr)
+                  else '@%s' % time.strftime('%H', time.gmtime(int(pts[0]['ts']))))
 
     def _i(v):
         try:

@@ -1294,10 +1294,16 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         # Flieger zur echten Off-Zeit statt zur Plan-Zeit (symmetrisch zu
         # today_arr_est_iso). Nur echte Board-/Warehouse-Obs (free-only, dep_delay_min);
         # ohne Delay = Plan. iOS nutzt today_dep_est_iso ?? today_dep_iso.
+        # Audit B7: legs_live_cached enthält NUR Legs MIT Beobachtung — [0]
+        # war also nicht zwingend Leg 0, und der Tages-Abflug bekam ggf. die
+        # dep-Verspätung eines SPÄTEREN Sektors. Explizit Leg 0 suchen; ohne
+        # Leg-0-Beobachtung kein today_dep_est_iso (iOS fällt via
+        # `today_dep_est_iso ?? today_dep_iso` auf die Plan-Zeit zurück).
         _dep_obs = (current_leg_obs if leg_picked
-                    else (legs_live_cached[0] if legs_live_cached else None))
+                    else next((l for l in (legs_live_cached or [])
+                               if l.get('leg_index') == 0), None))
         _dep_delay = (_dep_obs or {}).get('dep_delay_min')
-        _dep_est_iso = today_dep_iso
+        _dep_est_iso = today_dep_iso if _dep_obs is not None else None
         try:
             if today_dep_iso and _dep_delay:
                 _dep_est_iso = _iso_utc_z(

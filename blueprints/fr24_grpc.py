@@ -319,11 +319,29 @@ def inbound_by_route(from_lat, from_lon, to_lat, to_lon, callsign=None, reg=None
     return None
 
 
-async def _livefeed_row_async(provider, callsign, reg, lat, lon):
-    """Ein live_feed-Row DES gesuchten Fluges (Match per callsign, sonst reg)."""
+def _hex_to_int(h):
+    """ICAO24-hex (String „3c6675"/„0x3C6675" oder int) → int, sonst None."""
+    if h is None:
+        return None
+    if isinstance(h, int):
+        return h if h > 0 else None
+    try:
+        v = int(str(h).strip().lower().removeprefix("0x"), 16)
+        return v if v > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+async def _livefeed_row_async(provider, callsign, reg, lat, lon, hex=None):
+    """Ein live_feed-Row DES gesuchten Fluges (Match per hex, sonst callsign,
+    sonst reg). Hinweis: das Proto-Feld extra_info.icao_address existiert zwar,
+    steht aber NICHT in unserer field_mask (flight/reg/route/type — anonym max.
+    4 Felder) — der hex-Match greift daher nur, falls FR24 das Feld dennoch
+    mitliefert; praktisch trägt callsign/reg den Match (Audit 2026-07-12)."""
     from fr24 import FR24, BoundingBox  # noqa: F811
     cs = _norm_cs(callsign)
     rg = (reg or "").strip().upper() or None
+    hx = _hex_to_int(hex)
     if lat is None or lon is None:
         return None
     box = BoundingBox(north=lat + _BOX_HALF, south=lat - _BOX_HALF,
@@ -332,10 +350,19 @@ async def _livefeed_row_async(provider, callsign, reg, lat, lon):
         res = await asyncio.wait_for(f.live_feed.fetch(box, limit=1500), timeout=_TIMEOUT_S)
         rows = res.to_dict().get("flights_list") or []
     match = None
-    for r in rows:
-        if cs and _norm_cs(r.get("callsign")) == cs:
-            match = r
-            break
+    if hx:
+        # ICAO24 ist die härteste Identität (überlebt Callsign-Tippfehler und
+        # Reg-Divergenzen) — deshalb ERSTE Match-Stufe, wenn das Feld da ist.
+        for r in rows:
+            xi = r.get("extra_info") or {}
+            if _hex_to_int(xi.get("icao_address")) == hx:
+                match = r
+                break
+    if match is None:
+        for r in rows:
+            if cs and _norm_cs(r.get("callsign")) == cs:
+                match = r
+                break
     if match is None and rg:
         # Bindestrich-agnostisch vergleichen: FR24 liefert „D-AIMC", die Caller
         # (ax_flown_track u. a.) übergeben die gestrippte Form „DAIMC" — der
@@ -395,7 +422,7 @@ def resolve_route_live(callsign=None, hex=None, reg=None, lat=None, lon=None):
         return None
     for provider in _providers():
         try:
-            row = _run(_livefeed_row_async(provider, callsign, reg, lat, lon))
+            row = _run(_livefeed_row_async(provider, callsign, reg, lat, lon, hex=hex))
         except Exception as e:
             log.warning("fr24_grpc route provider=%s fehlgeschlagen: %s", provider, e)
             row = None
@@ -408,9 +435,9 @@ def resolve_route_live(callsign=None, hex=None, reg=None, lat=None, lon=None):
 
 
 # ── Reiche Tap-Detail (für Increment #32) ─────────────────────────────────────
-async def _tap_detail_async(provider, callsign, reg, lat, lon):
+async def _tap_detail_async(provider, callsign, reg, lat, lon, hex=None):
     from fr24 import FR24  # noqa: F811
-    row = await _livefeed_row_async(provider, callsign, reg, lat, lon)
+    row = await _livefeed_row_async(provider, callsign, reg, lat, lon, hex=hex)
     if not row:
         return None
     fid = row.get("flightid")
@@ -432,7 +459,7 @@ def tap_detail(callsign=None, hex=None, reg=None, lat=None, lon=None):
         return None
     for provider in _providers():
         try:
-            out = _run(_tap_detail_async(provider, callsign, reg, lat, lon))
+            out = _run(_tap_detail_async(provider, callsign, reg, lat, lon, hex=hex))
         except Exception as e:
             log.warning("fr24_grpc detail provider=%s fehlgeschlagen: %s", provider, e)
             out = None

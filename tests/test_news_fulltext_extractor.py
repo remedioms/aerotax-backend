@@ -159,7 +159,10 @@ def test_attach_stored_fulltexts_sets_fulltext_and_readable(monkeypatch):
         nb, '_fulltext_store_get_many',
         lambda urls: {'https://www.aero.de/news-1': long_text})
     nb._attach_stored_fulltexts(arts)
-    assert arts[0]['fulltext'] == long_text[:nb._FULLTEXT_FEED_CAP]
+    # .rstrip(): gespeicherter Text läuft durch _strip_feed_cruft, das am Ende
+    # bewusst `out.strip()` macht — der Test-String endet auf ein Leerzeichen,
+    # das der Cruft-Putz korrekt wegtrimmt (kein Inhaltsverlust).
+    assert arts[0]['fulltext'] == long_text[:nb._FULLTEXT_FEED_CAP].rstrip()
     assert arts[0]['in_app_readable'] is True
     # Artikel mit vorhandenem RSS-Volltext bleibt unangetastet.
     assert arts[1]['fulltext'] == 'schon da'

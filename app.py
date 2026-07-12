@@ -12080,10 +12080,16 @@ def get_friends_today(token):
     # (die Roster-`datum`-Keys sind Homebase-Tage), NICHT Server-UTC — zwischen
     # 00:00–02:00 CEST zeigte der UTC-Default sonst den Vortag und der 90s-Memo
     # zementierte ihn. Kein iOS-Callsite schickt datum mit.
+    # Der Berliner „heute"-Anker wird auch für die Live-Gates unten gebraucht
+    # (Audit B3 2026-07-12): die verglichen bisher gegen _date.today() (Server-
+    # UTC) — zwischen 00:00–02:00 CEST war datum (Berlin) schon der neue Tag,
+    # die Gates aber noch auf dem UTC-Vortag → keine Live-Beobachtungen/kein
+    # crew_state. EINE Quelle für Default UND Vergleich.
     try:
-        datum = request.args.get('datum') or _airport_local_now('FRA').strftime('%Y-%m-%d')
+        _heute_berlin = _airport_local_now('FRA').strftime('%Y-%m-%d')
     except Exception:
-        datum = request.args.get('datum') or _date.today().isoformat()
+        _heute_berlin = _date.today().isoformat()
+    datum = request.args.get('datum') or _heute_berlin
     # TTL-Cache (Owner 2026-07-09 „warum dauert Wo-ist-Crew immer so lange"): die
     # Sektor-Kaskade unten macht pro Freund × Sektor sequenzielle _flight_obs_merged-
     # Board-Lookups + Kalender-Refresh — jedes Feed-Laden neu = langsam. 90 s cachen.
@@ -12142,7 +12148,7 @@ def get_friends_today(token):
         # (an der Basis bleibt die bisherige Basis-Anzeige korrekt).
         lay_eff = rf.get('layover_ort')
         try:
-            if datum == _date.today().isoformat():
+            if datum == _heute_berlin:
                 secs = [s for s in (day.get('ical_sectors') or [])
                         if isinstance(s, dict) and s.get('dep_iso')]
                 # HOMEBASE-FALL (Owner 2026-07-07, Sebastian „Dienstplan
@@ -12384,7 +12390,7 @@ def get_friends_today(token):
                     _to = (_sec.get('to') or _sec.get('arr') or '').strip().upper()
                     if _fn and len(_fr) == 3 and len(_to) == 3:
                         _legs_fl.append((_fn, _fr, _to))
-            if datum == _date.today().isoformat() and _legs_fl:
+            if datum == _heute_berlin and _legs_fl:
                 for idx, (fno, _dep_ia, _arr_ia) in enumerate(_legs_fl):
                     m = _flight_obs_merged(fno, date=datum,
                                            dep_iata=_dep_ia,
@@ -12506,7 +12512,7 @@ def get_friends_today(token):
         # iCal-Freunde-Lücke: der Resolver arbeitet auf ical_sectors und
         # braucht KEINE reader_facts.flight_numbers (Tibor-Diagnose).
         crew_state = None
-        if datum == _date.today().isoformat():
+        if datum == _heute_berlin:
             crew_state = _crew_state_for_day(
                 fr, day, datum,
                 homebase=(pr.get('homebase') or '').strip().upper() or None,
@@ -13566,6 +13572,20 @@ def _news_sb_cache_get(url):
         fulltext = row.get('fulltext')
         if not fulltext or len(fulltext) < 80:
             return None
+        # Auch gecachten Text (evtl. vor dem Cruft-/Boilerplate-Fix gespeichert) am
+        # Ausgang putzen — Boilerplate (Abo-Promo/Autoren-Bio) + Header-/Footer-Cruft
+        # raus, sonst liefert der alte Cache den Müll zurück (Owner 2026-07-11).
+        try:
+            _cl = _news_strip_boilerplate(fulltext, source_host=row.get('source') or '')
+            _tidied = _tidy_article_text(_cl or fulltext)
+            # 30%-Notanker wie im Scrape-Pfad (Kandidaten-Putz in
+            # _news_extract_fulltext): frisst der Putz fast alles weg
+            # (überaggressiv/unerwartetes Layout), lieber das gecachte
+            # Original liefern als einen Artikel-Torso (Audit B4).
+            if _tidied and len(_tidied) >= max(80, int(len(fulltext) * 0.30)):
+                fulltext = _tidied
+        except Exception:
+            pass
         # TTL-Prüfung gegen fetched_at.
         import time as _t
         from datetime import datetime as _dt
@@ -13671,7 +13691,61 @@ def _tidy_article_text(text):
     joined = '\n'.join(out_lines)
     # Mehr als eine Leerzeile am Stück → genau eine (= ein Absatz-Abstand).
     joined = _re.sub(r'\n{3,}', '\n\n', joined)
-    return joined.strip()
+    joined = joined.strip()
+
+    # HEADER-/FOOTER-CRUFT (Owner 2026-07-10: „Backend scrapt+putzt, App zeigt nur"):
+    # vorne ALLE kurzen Header-Zeilen VOR dem ersten echten Absatz (Quell-Label wie
+    # „aeroTELEGRAPH", Ticker-Slug „ticker-condor-grun", fremde Schlagzeilen) — „kurz"
+    # = < 60 Zeichen UND kein Satzzeichen-Ende; nur wenn ein echter Absatz (≥100) folgt
+    # (köpft nie einen kurzen echten Artikel). Hinten Datum-/Flug-Fußzeile. Greift für
+    # Reader-Proxy UND Harvest, da beide durch _tidy_article_text laufen.
+    _trail_date = _re.compile(
+        r'^(?:[A-Za-zÄÖÜäöü]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\.\s*[A-Za-zÄÖÜäöü]+\.?\s+\d{4})$')
+    _trail_flight = _re.compile(r'^(?:flug|flight)\s+[A-Z0-9]{2,8},?$', _re.IGNORECASE)
+    clines = joined.split('\n')
+    ci, cdrop = 0, 0
+    while ci < len(clines) and cdrop < 6:
+        s = clines[ci].strip()
+        if not s:
+            ci += 1
+            continue
+        if len(s) >= 60 or s.endswith(('.', '!', '?')):
+            break
+        if not any(len(l.strip()) >= 100 for l in clines[ci + 1:ci + 11]):
+            break
+        ci += 1
+        cdrop += 1
+    clines = clines[ci:]
+    while clines:
+        s = clines[-1].strip()
+        if not s:
+            clines.pop()
+            continue
+        if _trail_date.match(s) or _trail_flight.match(s):
+            clines.pop()
+            continue
+        break
+
+    # TRAILING „Verwandte Artikel"-Liste kappen (Owner 2026-07-11): austrian_wings/
+    # simpleflying hängen NACH dem Artikel eine Liste aus Headlines + Datums-Zeilen
+    # bzw. Teaser („5 Questions", Feedback-Footer) an. Ansatz: letzten ECHTEN Absatz
+    # finden; enthält der Schwanz danach ein Related-Signal (reine DD.MM.YYYY-Zeile,
+    # „5 Questions", „Found an error"), alles NACH dem letzten echten Absatz kappen.
+    _relb_date = _re.compile(r'^\d{1,2}\.\d{1,2}\.\d{4}$')
+    last_real = -1
+    for _k, _l in enumerate(clines):
+        _s = _l.strip()
+        if len(_s) >= 150 and _s[-1:] in '.!?"”':
+            last_real = _k
+    if last_real >= 0:
+        _tail = clines[last_real + 1:]
+        _sig = any(_relb_date.match(t.strip())
+                   or t.strip().lower() in ('5 questions',)
+                   or 'found an error' in t.lower()
+                   for t in _tail)
+        if _sig:
+            clines = clines[:last_real + 1]
+    return '\n'.join(clines).strip()
 
 
 @app.route('/api/news/article', methods=['GET'])
@@ -13709,9 +13783,16 @@ def get_news_article():
             'allowed_hosts': sorted(NEWS_ARTICLE_ALLOWED_HOSTS),
         }), 403
 
+    # Ein Cache-Treffer gilt nur als „gut", wenn er SUBSTANZIELL ist. Kurze
+    # Einträge (< 500 Zeichen) sind meist ein alter RSS-Teaser (vom Harvest), der
+    # den vollen gescrapten Artikel verdrängt hat → NICHT ausliefern, stattdessen
+    # frisch scrapen (self-heal, Owner 2026-07-10: „sieht nach RSS-Feed aus").
+    def _cache_is_full(c):
+        return c is not None and len((c.get('fulltext') or '')) >= 500
+
     # Cache hit? (L1: In-Memory pro Worker)
     cached = _news_article_cache_get(raw_url)
-    if cached is not None:
+    if _cache_is_full(cached):
         return jsonify({**cached, 'cache_hit': True})
 
     # L2: Persistenter Supabase-Cache (geteilt über Worker/Restarts hinweg).
@@ -13719,7 +13800,7 @@ def get_news_article():
     # pro User, Server-IP wird nicht geflaggt. Defensiv: jeder Cache-Fehler fällt
     # still auf den Live-Scrape unten zurück.
     sb_cached = _news_sb_cache_get(raw_url)
-    if sb_cached is not None:
+    if _cache_is_full(sb_cached):
         result = {**sb_cached, 'cache_hit': True}
         # In den schnellen In-Memory-Cache hochziehen für Folge-Requests.
         try:
@@ -13799,6 +13880,23 @@ def _news_extract_best_fulltext(html, source_host=''):
     roh-längste, weil "viel Text" oft "viel Boilerplate" bedeutet.
     """
     candidates = []
+
+    # PRE-CLEAN: Autoren-Bio / Artikel-Header-Meta / Excerpt-Boxen aus dem HTML
+    # entfernen, BEVOR readability/bs4/legacy laufen (Owner 2026-07-11: simpleflying-
+    # Bios wie „Experienced ICAO … Instructor …" landeten oben im Text, weil
+    # readability sie mitzieht). Best-effort; bei Fehler bleibt das Roh-HTML.
+    try:
+        from bs4 import BeautifulSoup as _BS
+        _s = _BS(html, 'html.parser')
+        for _j in _s.select(
+            '.article-header-data, .w-article-header-comp, '
+            '[class*="author-bio"], [class*="author_bio"], [class*="authorBio"], '
+            '.byline, [class*="contributor-bio"], '
+            '.article-excerpt, .entry-excerpt, .post-excerpt'):
+            _j.decompose()
+        html = str(_s)
+    except Exception:
+        pass
 
     # Strategie 1: readability-lxml (Mozilla-Algorithmus)
     try:
@@ -13956,6 +14054,36 @@ _NEWS_BOILERPLATE_SUBSTR = (
     # Kommentar-Bereich
     'kommentar schreiben', 'leave a comment', 'comments', 'kommentare',
     'jetzt kommentieren',
+    # Marketing/Abo-Promo-Blöcke, die Scraper mitziehen (Owner 2026-07-11):
+    # theaircurrent-Footer & Co. — bewusst LANGE, eindeutige Phrasen (kein
+    # False-Positive auf echten Artikeltext wie „the award-winning A350").
+    'award-winning aerospace reporting', 'exclusive reporting and analysis on the strategy',
+    'full access to our archive', 'we respect your time', 'earns your attention',
+    'made accessible without a subscription', 'for full access to our scoops',
+    'in-depth reporting and industry analysis', 'reporting is made accessible',
+    'sophisticated industry audience',
+    'archive of industry intelligence', 'highest standards of journalism',
+    # Footer/Feedback-Zeilen (Simple Flying): „Found an error? Send it info@…".
+    'found an error', 'so it can be corrected', 'send it info@', '@simpleflying.com',
+)
+
+# Bio-/Kontext-Phrasen (Audit B4 2026-07-12): zu GENERISCH für den Ganz-Artikel-
+# Match — „20 years of experience" steht in Unfall-Berichten, „flight simulator
+# and"/„vatsim" in Flugsim-Artikeln. Diese Liste löscht darum NUR in der
+# Header-Zone (vor dem ersten echten Absatz ≥100 Zeichen: Autoren-Byline/-Bio)
+# und in der Footer-Zone (nach dem letzten echten Absatz ≥150 Zeichen, analog
+# zur Related-Kappung in `_tidy_article_text`: Autoren-Kasten am Artikelende).
+_NEWS_BOILERPLATE_BIO_SUBSTR = (
+    # Autoren-Bio (Simple Flying u.a.) — „X is a freelance …" / Ex-Militär-Bio /
+    # „X's passion for aviation started …", Flugsim/VATSIM-Bio, „Growing up, he was …".
+    'is a freelance', 'freelance writer', 'freelance journalist',
+    'freelance military writer', 'former naval flight officer',
+    'is an aviation journalist', 'staff writer at', 'is a contributor to',
+    'passion for aviation', 'vatsim', 'flight simulator and',
+    'growing up, he was', 'growing up, she was', 'growing up, they were',
+    'proficiency instructor', 'conference interpreter', 'for pilots and atcos',
+    'is passionate about', 'passionate about facilitating', 'years of experience',
+    'as a public service',
 )
 
 # Eigenständige (exakte, getrimmte) Müll-Zeilen.
@@ -13987,6 +14115,22 @@ def _news_strip_boilerplate(text, source_host=''):
         return ''
 
     raw_lines = text.split('\n')
+    # Zonen für die Bio-/Kontext-Phrasen (Audit B4): Header = alles VOR dem
+    # ersten echten Absatz (≥100 Zeichen), Footer = alles NACH dem letzten
+    # echten Absatz (≥150 Zeichen mit Satzende, analog `_tidy_article_text`).
+    # Dazwischen (= Artikel-Korpus) löschen die generischen Phrasen NICHT.
+    # Bewusster Trade-off: ein LANGER Bio-Satz (≥100 Zeichen) kann sich als
+    # „Artikelstart" selbst schützen und stehen bleiben — kosmetisch, aber
+    # sicher. Die Alternative (Bio-Zeilen als Anker ausschließen) würde bei
+    # Artikeln, deren ECHTE Absätze die Phrase tragen (Unfall-Bericht
+    # „20 years of experience"), wieder Redaktionstext fressen.
+    _first_real = next((i for i, l in enumerate(raw_lines)
+                        if len(l.strip()) >= 100), len(raw_lines))
+    _last_real = -1
+    for _i, _l in enumerate(raw_lines):
+        _s = _l.strip()
+        if len(_s) >= 150 and _s[-1:] in '.!?"”':
+            _last_real = _i
     out = []
     seen_nonempty = set()
     # "Header-Zone": alles vor dem ersten echten Artikel-Absatz. Hier ist
@@ -14000,7 +14144,7 @@ def _news_strip_boilerplate(text, source_host=''):
     def _looks_like_article_para(txt):
         return len(txt) >= 120 and _re.search(r'[.!?]["”’)]?\s', txt + ' ')
 
-    for ln in raw_lines:
+    for _idx, ln in enumerate(raw_lines):
         s = ln.strip()
 
         # Leerzeile → Absatztrenner (mehrfach collapsen wir später).
@@ -14041,6 +14185,11 @@ def _news_strip_boilerplate(text, source_host=''):
         if low in _NEWS_BOILERPLATE_EXACT:
             continue
         if any(kw in low for kw in _NEWS_BOILERPLATE_SUBSTR):
+            continue
+        # Bio-/Kontext-Phrasen NUR in Header-/Footer-Zone (Audit B4) — im
+        # Artikel-Korpus wären sie False-Positives auf echtem Redaktionstext.
+        if (_idx < _first_real or (0 <= _last_real < _idx)) and \
+                any(kw in low for kw in _NEWS_BOILERPLATE_BIO_SUBSTR):
             continue
 
         # --- Header-Zone-spezifische Filter (nur solange Artikel nicht gestartet) ---
@@ -14103,16 +14252,30 @@ def _news_bs4_extract(html):
     for junk in soup(['script', 'style', 'nav', 'header', 'footer', 'aside',
                       'form', 'noscript', 'iframe']):
         junk.decompose()
-    # Kandidaten-Selektoren in Reihenfolge der Spezifizität.
+    # Autoren-Bio / Artikel-Header-Meta / Excerpt strukturell entfernen (Owner
+    # 2026-07-11: „Brandon's passion for aviation …"-Bios) — simpleflying steckt die
+    # Bio in `.article-header-data`/`.w-article-header-comp`; generisch auch Byline/
+    # Author-Bio/Excerpt-Boxen. Best-effort, kein Fehler bricht die Extraktion.
+    try:
+        for junk in soup.select(
+            '.article-header-data, .w-article-header-comp, '
+            '[class*="author-bio"], [class*="author_bio"], [class*="authorBio"], '
+            '.byline, [class*="contributor-bio"], '
+            '.article-excerpt, .entry-excerpt, .post-excerpt'):
+            junk.decompose()
+    except Exception:
+        pass
+    # Kandidaten-Selektoren: den EIGENTLICHEN Body ZUERST (ohne Header/Bio), erst
+    # danach das ganze `article`-Element (das Header/Bio mitbringen kann).
     selectors = [
-        'article',
-        'main article',
-        'div.article-content', 'div.article-body', 'div.article__body',
         'div[itemprop="articleBody"]',
+        'div.article-body', 'div.article__body', 'div.article-content',
         'div.entry-content',           # WordPress (theaircurrent, simpleflying)
         'div.post-content',
         'div.news-text',
         'div.story-body', 'div.story-content',  # Reuters-ish
+        'article',
+        'main article',
         'main',
         'div#article-content',
         'div.article',

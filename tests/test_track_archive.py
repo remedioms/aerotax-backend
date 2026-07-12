@@ -169,8 +169,12 @@ def test_compact_leg_flight_fallback_citypair():
     rows = _leg_rows(flight=None)
     row = compact_leg('DAIXS', rows)
     assert row['flight'] == 'FRA-LIS'                # PK-Fallback statt ''
+    # Audit B11: komplett route-lose Legs kriegen '@<HH>' (UTC-Stunde des
+    # ersten Punkts) statt '' — sonst kollidierten ALLE route-losen Legs
+    # derselben Reg am selben Tag im PK und nur der letzte überlebte.
     row2 = compact_leg('DAIXS', _leg_rows(flight=None, origin=None, dest=None))
-    assert row2['flight'] == ''
+    import time as _t
+    assert row2['flight'] == '@%s' % _t.strftime('%H', _t.gmtime(T0))
 
 
 def test_compact_leg_too_short_returns_none():

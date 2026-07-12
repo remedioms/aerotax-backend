@@ -895,6 +895,12 @@ def _entry_to_article(entry, src):
         fulltext = _strip_donation_appeals(fulltext)
     except Exception:
         pass
+    # Quell-Cruft (fremde Schlagzeilen / Ticker-Label / Datum+Flug-Fußzeile) aus
+    # den DE-Feeds entfernen (Owner 2026-07-10) — konservativ, saubere Feeds bleiben.
+    try:
+        fulltext = _strip_feed_cruft(fulltext, source_name=src.get('name'))
+    except Exception:
+        pass
     # „In-App lesbar" = es gibt einen ECHTEN Volltext im RSS (content:encoded).
     # NICHT mehr „lange Zusammenfassung reicht" — der frühere Summary-Fallback ließ
     # Teaser durch, die in der App nur „Volltext nicht verfügbar / Im Browser öffnen"
@@ -1407,6 +1413,64 @@ def _strip_donation_appeals(text):
     return joined.strip()
 
 
+# Datum-only-Zeilen am Text-Ende (Quell-Metadaten): „July 10, 2026" / „10. Juli 2026".
+_TRAIL_DATE_RE = re.compile(
+    r'^(?:[A-Za-zÄÖÜäöü]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\.\s*[A-Za-zÄÖÜäöü]+\.?\s+\d{4})$')
+# „Flug AC774," / „Flight AC774" — Quell-Fußzeile.
+_TRAIL_FLIGHT_RE = re.compile(r'^(?:flug|flight)\s+[A-Z0-9]{2,8},?$', re.IGNORECASE)
+
+
+def _strip_feed_cruft(text, source_name=''):
+    """Entfernt Quell-Cruft, den DE-Feeds im RSS-<content:encoded> VOR und NACH
+    dem eigentlichen Artikel mitschicken (Owner 2026-07-10: „aero.de-Text zeigt
+    fremde Schlagzeilen + Datum/Flug-Zeilen"):
+      • VORNE: den Quell-Namen selbst (aeroTELEGRAPH/aero.de), Ticker-/Slug-Label
+        („ticker electra aero") und einen BLOCK aus ≥2 kurzen Überschriften-Zeilen
+        (verwandte Artikel) — aber NUR wenn danach ein substanzieller Absatz folgt,
+        damit nie eine echte kurze Einstiegszeile geopfert wird.
+      • HINTEN: reine Datums-Zeile + „Flug XX,"-Fußzeile.
+    Konservativ, wirft nie; lässt saubere Feeds (simple_flying etc.) unangetastet,
+    weil dort weder Label- noch Überschriften-Block-Muster greifen."""
+    if not text:
+        return text
+    lines = text.split('\n')
+
+    # ── VORNE strippen ────────────────────────────────────────────────
+    # ALLE Header-Cruft-Zeilen VOR dem ersten echten Absatz weg — egal ob Quell-Label
+    # („aeroTELEGRAPH"), Ticker-Slug („ticker-condor-grun") oder fremde Schlagzeile.
+    # „Cruft" = KURZ (< 60 Zeichen) UND endet NICHT mit Satzzeichen. Stopp am ersten
+    # echten Text; nur strippen, wenn danach ein substanzieller Absatz (≥100 Zeichen)
+    # folgt → köpft nie einen echten kurzen Artikel. Max 6 Zeilen als Sicherheitsnetz.
+    i, dropped = 0, 0
+    while i < len(lines) and dropped < 6:
+        s = lines[i].strip()
+        if not s:
+            i += 1
+            continue
+        if len(s) >= 60 or s.endswith(('.', '!', '?')):
+            break
+        if not any(len(l.strip()) >= 100 for l in lines[i + 1:i + 11]):
+            break
+        i += 1
+        dropped += 1
+    lines = lines[i:]
+
+    # ── HINTEN strippen ───────────────────────────────────────────────
+    while lines:
+        s = lines[-1].strip()
+        if not s:
+            lines.pop()
+            continue
+        if _TRAIL_DATE_RE.match(s) or _TRAIL_FLIGHT_RE.match(s):
+            lines.pop()
+            continue
+        break
+
+    out = '\n'.join(lines)
+    out = re.sub(r'\n{3,}', '\n\n', out)
+    return out.strip()
+
+
 def _log_warn(msg):
     """Logging über current_app wenn im Request-Context, sonst logger."""
     try:
@@ -1466,6 +1530,10 @@ _FULLTEXT_HARVEST_UA = (
 )
 _FULLTEXT_FETCH_TIMEOUT = 10          # Sekunden pro Quell-Fetch
 _FULLTEXT_STORE_MIN_CHARS = 80        # gleiches Gate wie /api/news/article
+# Ab hier gilt ein RSS-Volltext als ECHTER Volltext (nicht Teaser) → darf direkt
+# gecacht werden. Darunter (kurzer Teaser wie simpleflying ~300–400) wird die volle
+# Quellseite gescrapt, sonst sähe der Artikel in der App wie ein RSS-Feed aus.
+_FULLTEXT_RSS_PUT_MIN = 1200
 _FULLTEXT_READABLE_MIN_CHARS = 400    # ab hier gilt „in-app lesbar" (wie RSS-Pfad)
 _FULLTEXT_FEED_CAP = 8000             # Payload-Cap, identisch zum RSS-Pfad
 _FULLTEXT_HARVEST_MAX_FETCHES = 10    # max. NEUE Quell-Fetches pro Harvest-Lauf
@@ -1846,7 +1914,12 @@ def _harvest_run(articles):
             if url in existing:
                 continue
             ft = art.get('fulltext')
-            if ft and len(ft) >= _FULLTEXT_STORE_MIN_CHARS:
+            # RSS-Volltext nur DIREKT speichern, wenn er SUBSTANZIELL ist (echter
+            # Volltext-Feed wie theaircurrent/austrianwings). Kurze RSS-Teaser
+            # (simpleflying ~300–400, aero.de-Teaser) NICHT als „Volltext" cachen —
+            # sonst sieht der Artikel in der App wie ein RSS-Feed aus (Owner 2026-07-10).
+            # Stattdessen die volle Quellseite SCRAPEN (todo_fetch).
+            if ft and len(ft) >= _FULLTEXT_RSS_PUT_MIN:
                 todo_rss.append((url, art))
             else:
                 todo_fetch.append((url, art))
@@ -1942,6 +2015,12 @@ def _attach_stored_fulltexts(articles):
         ft = found.get(art.get('article_url'))
         if not ft:
             continue
+        # AUCH gespeicherten (evtl. vor dem Cruft-Fix gecachten) Text putzen —
+        # sonst überschreibt alter Cruft-Cache den frisch gestrippten RSS-Text.
+        try:
+            ft = _strip_feed_cruft(ft, source_name=art.get('source_name'))
+        except Exception:
+            pass
         art['fulltext'] = ft[:_FULLTEXT_FEED_CAP]
         if len(ft) >= _FULLTEXT_READABLE_MIN_CHARS:
             art['in_app_readable'] = True

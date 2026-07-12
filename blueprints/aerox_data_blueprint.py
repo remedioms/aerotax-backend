@@ -3484,8 +3484,15 @@ def resolve_unified_flight(query, date=None, callsign_query=False,
         return {'ok': False, 'error': 'no_query'}
     # REG-Query (D-ABYN / N123AB): das ist KEINE Flugnummer — ehrlich found:false
     # mit identity.reg statt Fantasie-flight_no (kein Geister-Flug aus einer Reg).
+    # Audit B8: US-N-Numbers haben KEINE führende 0 (FAA: N1–N99999) —
+    # `N[1-9]…` statt `N\d…`, sonst fraß der Reg-Zweig echte Norse-Flugnummern
+    # (N0301). TODO N4 (Nordwind): N4123 matcht weiterhin als N-Number —
+    # ein Airline-Lookup-Vorrang (via _airline_row('N4')) scheidet aus, weil
+    # die gebackene airlines-Tabelle für praktisch JEDES N#-Präfix einen
+    # (teils Junk-)Treffer hat (N1→„N1", N2→Dagestan, N4→Mountain Air) und
+    # damit echte US-Regs wie N1234 zu Flügen umdeuten würde.
     if not callsign_query and re.match(
-            r'^(?:[A-Z]{1,2}-[A-Z]{2,4}|N\d{1,5}[A-Z]{0,2})$', q):
+            r'^(?:[A-Z]{1,2}-[A-Z]{2,4}|N[1-9]\d{0,4}[A-Z]{0,2})$', q):
         return {'ok': True, 'found': False, 'query': q,
                 'date': ((date or '')[:10]) or None,
                 'identity': {'callsign': None, 'flight_no': None, 'reg': q}}
@@ -4019,8 +4026,8 @@ def _observed_track_clean(points):
     """Roh-Punkte (App-Beobachtung) → zeitlich sortierte, plausible Fix-Tupel
     (ts, lat, lon, alt, gs, track). Verwirft ungültige/nicht-numerische Werte,
     unmögliche Koordinaten, exakte Timestamp-Duplikate (PK-Kollision) und
-    Teleport-Ausreißer (>40 km zwischen konsekutiven Fixes — ein geglitchter
-    oder fremder ADS-B-Fix; kein Airliner legt das in Sekunden zurück)."""
+    Teleport-Ausreißer (implizite Geschwindigkeit > 0,35 km/s ≈ Mach 1+ —
+    ein geglitchter oder fremder ADS-B-Fix; kein Airliner fliegt so schnell)."""
     import math
 
     def _f(v):
@@ -4058,7 +4065,14 @@ def _observed_track_clean(points):
                  + math.cos(math.radians(plat)) * math.cos(math.radians(r[1]))
                  * math.sin(dlon / 2) ** 2)
             km = 6371.0 * 2 * math.asin(min(1.0, math.sqrt(a)))
-            if km > 40:
+            # Audit B9: die alte 40-km-Regel hatte KEINEN Zeitbezug — nach
+            # jeder Beobachtungs-Lücke >~3 min Cruise (>40 km) wurde der REST
+            # der Spur verworfen. Teleport jetzt über die implizite
+            # Geschwindigkeit: >0,35 km/s (~Mach 1+) ist kein Airliner.
+            # ts ist hier immer vorhanden (Punkte ohne ts flogen oben raus),
+            # dt >= 1 s dank Duplikat-Filter — max() nur als Div-0-Schutz.
+            dt_s = r[0] - out[-1][0]
+            if km / max(dt_s, 1) > 0.35:
                 continue                       # Teleport-Sprung → verwerfen
         out.append(r)
     return out
@@ -4145,6 +4159,11 @@ def ax_flown_track():
     # kriegen inkonsistente Antworten). lat/lon dienen als Live-Plausi-Anker
     # für den Stale-Fallback.
     q_hex = (request.args.get('hex') or '').strip().lower() or None
+    # Nur ECHTE ICAO24-Hexe akzeptieren (Audit B2b): Fake-Keys (z.B. die
+    # kleingeschriebene Reg aus dem Rauszoom-Overview) dürfen Frische-Gate/
+    # Tier-2-Gate nicht öffnen — alles andere zählt als „kein hex".
+    if q_hex and not re.fullmatch(r'[0-9a-f]{6}', q_hex):
+        q_hex = None
 
     def _qf(v):
         try:
@@ -4887,8 +4906,18 @@ def ax_flight_detail(query):
         # wo iOS-adsb.lol blind ist). EIN billiger Supabase-Read, KEIN paid/kein adsb.lol
         # → bleibt free-first + schnell. Match reg → Flugnummer → Funkname. Das FLIGHT
         # DECK nutzt sie statt (nur) des ozean-blinden iOS-Resolvers.
-        f_live = ex.submit(lambda: _aircraft_live_pos(
-            reg=reg, flight=fn_iata, callsign=real_cs))
+        # Richtungs-/Datums-Gate (Audit B5): (1) dep=dest erzwingt Route-
+        # Konsistenz — nach der Landung fliegt DIESELBE Maschine den Rückflug,
+        # ohne Gate zeigte das Hinflug-Detail dessen Live-Position. reg-Match
+        # nur bei bekanntem dest (sonst identifiziert nur flight/callsign den
+        # Leg selbst — Muster wie ax_flight_live). (2) Vergangenheits-Abfragen
+        # (?date= < heute UTC) kriegen KEIN live — jeder frische Snapshot wäre
+        # zwangsläufig ein fremder Leg.
+        _live_past = bool(date_q and date_q[:10] < time.strftime('%Y-%m-%d',
+                                                                 time.gmtime()))
+        f_live = None if _live_past else ex.submit(lambda: _aircraft_live_pos(
+            reg=(reg if dest else None), flight=fn_iata, callsign=real_cs,
+            dep=dest))
         if f_route is not None:
             route = _res(f_route)
         history = _res(f_hist)

@@ -476,6 +476,43 @@ def resolve_reg_to_hex(reg):
     return _BACKEND_REG_HEX.get(reg_u)
 
 
+# ── Reg→Hex NUR aus billigen In-Process-Quellen (für Bulk-Pfade) ─────────────
+# Eigener Cache statt _REG_HEX_CACHE: ein baked-Miss darf den Supabase-tail_hex-
+# Lookup in resolve_reg_to_hex NICHT 10 min unterdrücken. Die gebackene DB ist
+# statisch → kein TTL nötig.
+_BAKED_REG_HEX_CACHE = {}           # reg(upper) -> hex(lower)|None
+_BAKED_REG_HEX_LOCK = threading.Lock()
+
+
+def _baked_hex_for_reg(reg):
+    """Reg → echter ICAO24-Hex, NUR aus In-Process-Quellen (Cache, gebackene
+    520k-Referenz-SQLite, hartkodierte Map) — bewusst OHNE Supabase-Roundtrip:
+    der Rauszoom-Overview (_area_from_aircraft_live) ruft das für bis zu ~3000
+    Rows pro Request. Rückgabe lowercase Hex oder None. Wirft NIE."""
+    reg_u = (reg or '').strip().upper()
+    if not reg_u:
+        return None
+    with _BAKED_REG_HEX_LOCK:
+        if reg_u in _BAKED_REG_HEX_CACHE:
+            return _BAKED_REG_HEX_CACHE[reg_u] or _BACKEND_REG_HEX.get(reg_u)
+    hx = None
+    try:
+        from blueprints.aerox_data_blueprint import _q1, _reg_candidates
+        cands = _reg_candidates(reg_u)
+        if cands:
+            ph = ','.join('?' * len(cands))
+            row = _q1(f'SELECT hex FROM aircraft WHERE reg IN ({ph}) LIMIT 1',
+                      tuple(cands))
+            hx = ((row or {}).get('hex') or '').strip().lower() or None
+    except Exception:
+        hx = None
+    with _BAKED_REG_HEX_LOCK:
+        _BAKED_REG_HEX_CACHE[reg_u] = hx
+        if len(_BAKED_REG_HEX_CACHE) > 20000:
+            _BAKED_REG_HEX_CACHE.clear()
+    return hx or _BACKEND_REG_HEX.get(reg_u)
+
+
 # ─── Watch-Set + Poll-State (Cloud-Run-safe, alles in Supabase) ──────────────
 #
 # adsb_watch  = nutzer-getriebenes Set "welche Maschinen pollen wir aktiv".
@@ -3360,14 +3397,26 @@ def _world_sweep_rows(now_ts):
 def _bbox_from_point(lat, lon, radius_nm):
     """Grobe Bounding-Box (lamin, lomin, lamax, lomax) um einen Punkt für den
     OpenSky-Area-Fallback. 1 nm Breitengrad ≈ 1/60°; Längengrad mit cos(lat)
-    korrigiert. Gedeckelt auf gültige Wertebereiche."""
+    korrigiert. Breite gedeckelt; Länge wird am Antimeridian GEWRAPPT statt
+    geklemmt (Audit B10): lomin > lomax signalisiert den Dateline-Übergang,
+    den die Nutzer (_area_from_aircraft_live/_area_from_fr24_live) mit ihrem
+    or_-Zweig abfragen — vorher war der toter Code und dem Welt-Overview nahe
+    ±180° fehlte die andere Seite."""
     dlat = radius_nm / 60.0
     cos_lat = max(0.01, math.cos(math.radians(lat)))
     dlon = radius_nm / (60.0 * cos_lat)
     lamin = max(-90.0, lat - dlat)
     lamax = min(90.0, lat + dlat)
-    lomin = max(-180.0, lon - dlon)
-    lomax = min(180.0, lon + dlon)
+    if dlon >= 180.0:
+        # Box umspannt (z.B. polnah) den ganzen Längenkreis → voller Bereich.
+        lomin, lomax = -180.0, 180.0
+    else:
+        lomin = lon - dlon
+        lomax = lon + dlon
+        if lomin < -180.0:
+            lomin += 360.0        # Überlauf nach Westen → wrappen (lomin > lomax)
+        if lomax > 180.0:
+            lomax -= 360.0        # Überlauf nach Osten → wrappen (lomin > lomax)
     return lamin, lomin, lamax, lomax
 
 
@@ -3417,8 +3466,10 @@ def _area_from_aircraft_live(lat, lon, radius):
     Rueckgabe: normalisierte Dicts (identisches Schema wie _normalize_adsb_lol_ac,
     damit die Response + der iOS-Parser unveraendert bleiben) oder None (leer/SB-down).
 
-    aircraft_live ist REG-keyed (kein ICAO-Hex) -> `hex` wird stabil aus der Reg
-    abgeleitet, damit iOS die Annotationen/Auswahl weiter ueber `hex` keyen kann."""
+    aircraft_live ist REG-keyed (kein ICAO-Hex) -> `hex` wird per gebackener
+    Referenz-DB (reg -> icao24) aufgeloest; nur wenn das scheitert, faellt der
+    Key auf die kleingeschriebene Reg zurueck (stabil fuer iOS-Annotationen,
+    kein Row-Drop — aber kein Fake-Hex mehr, wo ein echter existiert)."""
     sb, ok = _sb_client()
     if not ok or sb is None:
         return None
@@ -3444,8 +3495,14 @@ def _area_from_aircraft_live(lat, lon, radius):
         lo = _coerce_float(d.get('lon'))
         if la is None or lo is None:
             continue
-        hexkey = ((d.get('reg') or d.get('callsign') or d.get('flight') or '')
-                  .strip().lower().replace('-', '')) or None
+        # Echter ICAO24-Hex aus der gebackenen Referenz-DB (Audit B2a) — der
+        # frühere Fake-„hex" (kleingeschriebene Reg ohne Bindestrich) konnte
+        # downstream Hex-Gates mit einem 6-Zeichen-Lookalike öffnen.
+        hexkey = _baked_hex_for_reg(d.get('reg') or d.get('reg_display'))
+        if hexkey is None:
+            # Fallback wie bisher: stabiler Annotation-Key, kein Row-Drop.
+            hexkey = ((d.get('reg') or d.get('callsign') or d.get('flight') or '')
+                      .strip().lower().replace('-', '')) or None
         if hexkey is None:
             continue
         flight = (d.get('flight') or d.get('callsign') or '').strip() or None
@@ -3481,8 +3538,16 @@ def _area_from_fr24_grpc(lat, lon, radius):
         return None
     lamin, lomin, lamax, lomax = _bbox_from_point(lat, lon, radius)
     try:
-        positions = fr24_grpc.area(north=lamax, south=lamin, west=lomin, east=lomax,
-                                   limit=1500)
+        if lomin > lomax:
+            # Dateline-Wrap (B10): die FR24-BoundingBox kann west>east nicht →
+            # zwei Boxen (…→180 und -180→…) abfragen und mergen.
+            positions = ((fr24_grpc.area(north=lamax, south=lamin,
+                                         west=lomin, east=180.0, limit=1500) or [])
+                         + (fr24_grpc.area(north=lamax, south=lamin,
+                                           west=-180.0, east=lomax, limit=1500) or []))
+        else:
+            positions = fr24_grpc.area(north=lamax, south=lamin, west=lomin, east=lomax,
+                                       limit=1500)
     except Exception:
         return None
     out = []
@@ -3608,6 +3673,13 @@ def get_adsb_area():
         else:
             lamin, lomin, lamax, lomax = _bbox_from_point(
                 lat, lon, min(radius, _AREA_RADIUS_CAP_NM))
+            # OpenSky kann keinen Dateline-Wrap (lomin>lomax) — auf die alte,
+            # am ±180° geklemmte Box zurückfallen (Seite mit dem Zentrum; B10).
+            if lomin > lomax:
+                if lomax < lon:
+                    lomax = 180.0
+                if lomin > lon:
+                    lomin = -180.0
             try:
                 states, _rem = _fetch_opensky_bbox(lamin, lomin, lamax, lomax)
                 aircraft = []

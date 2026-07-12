@@ -48,6 +48,38 @@ _DEFAULT_TILES = [
     (45, 35, -10, 5), (47, 35, 6, 30), (52, 44, 20, 40),
 ]
 
+# Airport-Hot-Tiles (north, south, west, east) — kleine Boxen (~40 nm) um Dreh-/
+# Taxi-Hubs, ZUSÄTZLICH jeden Tick gepollt (stehlen der Welt-Rotation KEINE Ticks),
+# dichtes Gate + on_ground (Taxi!). Welt-Sweep + Retention bleiben exakt wie vorher.
+# Owner 2026-07-11 + Unified-Track-Design: NUR ÜBERSEE-HUBS hier — Europa (FRA/MUC)
+# deckt der gratis Hetzner-adsb.lol-Sweep dichter+billiger ab (kein Doppel-Write).
+# FR24-gRPC verdient sich hier, wo adsb.lol keinen Boden-Feed hat (JFK/GRU/BKK/ICN).
+# Erweiterbar via AIRPORT_TILES="n s w e; n s w e; …".
+_DEFAULT_AIRPORT_TILES = [
+    (40.95, 40.35, -74.15, -73.40),   # JFK (New York)
+    (-23.15, -23.75, -46.80, -46.15), # GRU (São Paulo)
+    (14.00, 13.40, 100.40, 101.10),   # BKK (Bangkok)
+    (37.75, 37.15, 126.10, 126.80),   # ICN (Seoul)
+]
+
+
+def _parse_airport_tiles(raw: str) -> list[tuple]:
+    """"n s w e; n s w e" → Liste von (n,s,w,e)-Tupeln. Leer → Default
+    (Übersee-Hubs JFK/GRU/BKK/ICN, s. _DEFAULT_AIRPORT_TILES — Europa deckt
+    der Hetzner-adsb.lol-Sweep ab)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return list(_DEFAULT_AIRPORT_TILES)
+    out = []
+    for grp in raw.replace(",", " ").split(";"):
+        parts = grp.split()
+        if len(parts) == 4:
+            try:
+                out.append(tuple(float(x) for x in parts))
+            except ValueError:
+                continue
+    return out or list(_DEFAULT_AIRPORT_TILES)
+
 # LH Group + deutsche Carrier (ICAO-3-Letter-Callsign-Prefix). Owner-Scope
 # 2026-07-08 „+ Deutsche Carrier". Erweiterbar via CARRIER_PREFIXES-Env.
 _DEFAULT_PREFIXES = {
@@ -100,6 +132,14 @@ class Settings:
 
     tiles: list = field(default_factory=lambda: _parse_tiles(os.getenv("TILES", "all")))
     prefixes: set = field(default_factory=lambda: _parse_prefixes(os.getenv("CARRIER_PREFIXES", "")))
+
+    # Airport-Hot-Tiles: zusätzlich jeden Tick pollen → dichte Crumbs inkl. Taxi
+    # (on_ground) an den Hubs, für ALLE Airlines. AIRPORT_DENSE=0 schaltet ab.
+    # Dichtes Gate (default 30 s / 0.15 nm) statt Cruise-Gate (120 s / 1 nm).
+    airport_dense: bool = os.getenv("AIRPORT_DENSE", "1") not in ("0", "false", "no", "")
+    airport_tiles: list = field(default_factory=lambda: _parse_airport_tiles(os.getenv("AIRPORT_TILES", "")))
+    airport_min_sec: float = float(os.getenv("AIRPORT_MIN_SEC", "30"))
+    airport_min_nm: float = float(os.getenv("AIRPORT_MIN_NM", "0.15"))
 
     # Kadenz: eine Kachel pro poll_interval. 60s × 15 ≈ 11 min/Voll-Sweep — der
     # gRPC-Endpoint ist NICHT geblockt, aber wir bleiben höflich/unauffällig.
@@ -284,29 +324,37 @@ class Ingest:
         r.raise_for_status()
         return len(rows)
 
-    async def _append_track(self, rows: list[dict]) -> int:
-        """Hängt pro airborne, BEWEGtem Airframe einen Breadcrumb an aircraft_track
-        an (echte geflogene Route, append-only). Idempotent via PK (reg, seen_ts).
-        Kein Write im RAM-only-Modus oder wenn track deaktiviert."""
+    async def _append_track(self, rows: list[dict], *, min_sec: float | None = None,
+                            min_nm: float | None = None, allow_ground: bool = False,
+                            source: str = "fr24_grpc") -> int:
+        """Hängt pro BEWEGtem Airframe einen Breadcrumb an aircraft_track an (echte
+        geflogene Route, append-only). Idempotent via PK (reg, seen_ts). Kein Write
+        im RAM-only-Modus oder wenn track deaktiviert.
+        Gate-Werte überschreibbar (Airport-Hot-Tiles nutzen ein dichteres Gate);
+        allow_ground=True lässt Taxi/Boden-Punkte zu (nur an Airports gewollt)."""
         if not (self._s.track_enabled and self._s.write_supabase):
             return 0
+        min_sec = self._s.track_min_sec if min_sec is None else min_sec
+        min_nm = self._s.track_min_nm if min_nm is None else min_nm
         now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         now_mono = time.monotonic()
         pts = []
         pending: dict[str, tuple] = {}         # reg → (lat, lon, mono) NACH Write-Erfolg übernehmen
         for r in rows:
-            if r.get("on_ground"):
-                continue                       # nur Flug, keine Boden-/Parkpunkte
+            grounded = bool(r.get("on_ground"))
+            if grounded and not allow_ground:
+                continue                       # Welt-Sweep: nur Flug, keine Boden-/Parkpunkte
             lat, lon, reg = r.get("lat"), r.get("lon"), r.get("reg")
             if lat is None or lon is None or not reg:
                 continue
             prev = self._last_track.get(reg)
-            # Zeit-UND-Distanz-Gate: Punkt nur wenn >= track_min_sec vergangen UND
-            # >= track_min_nm bewegt — Distanz allein drosselte im Cruise (8 nm/min)
+            # Zeit-UND-Distanz-Gate: Punkt nur wenn >= min_sec vergangen UND
+            # >= min_nm bewegt — Distanz allein drosselte im Cruise (8 nm/min)
             # nichts; das Zeit-Gate senkt die Schreiblast, Kurven bleiben erhalten.
+            # Parkende Flieger (0 Bewegung) fallen durchs min_nm-Gate → kein Spam.
             if prev is not None and (
-                    (now_mono - prev[2]) < self._s.track_min_sec
-                    or _dist_nm(prev[0], prev[1], lat, lon) < self._s.track_min_nm):
+                    (now_mono - prev[2]) < min_sec
+                    or _dist_nm(prev[0], prev[1], lat, lon) < min_nm):
                 continue                       # zu früh / zu nah am letzten Punkt → drosseln
             pts.append({
                 "reg": reg,
@@ -318,8 +366,8 @@ class Ingest:
                 "alt_ft": _to_int(r.get("alt_ft")),
                 "gs_kt": _to_int(r.get("gs_kt")),
                 "track_deg": _to_int(r.get("track")),
-                "on_ground": False,
-                "source": "fr24_grpc",
+                "on_ground": grounded,
+                "source": source,
             })
             pending[reg] = (lat, lon, now_mono)
         if not pts:
@@ -439,13 +487,56 @@ class Ingest:
         self._win_rows += n_up
         log.debug("tile%d flights=%d matched=%d ram=%d upserted=%d track+=%d",
                   idx, len(flights), len(rows), len(self._latest), n_up, n_tr)
+        # ZUSÄTZLICH (additiv, stiehlt der Welt-Rotation KEINE Ticks): Airport-Hot-
+        # Tiles dicht + inkl. Taxi. Welt-Sweep oben bleibt exakt wie vorher.
+        if self._s.airport_dense and self._s.airport_tiles:
+            try:
+                await self._poll_airport_tiles(fr24)
+            except Exception as ex:
+                log.debug("airport-tiles übersprungen: %s", ex)
+
+    async def _poll_airport_tiles(self, fr24) -> None:
+        """Kleine Übersee-Hub-Boxen (Default JFK/GRU/BKK/ICN) jeden Tick pollen
+        und mit DICHTEM Gate + on_ground (Taxi) an aircraft_track schreiben — für
+        ALLE Airlines. So bekommen die Airports viele Crumbs (Drehen/Taxi),
+        während der weltweite Welt-Sweep (jeder Flieger, grobes Raster,
+        Retention) unverändert bleibt. Die Fetches laufen PARALLEL
+        (asyncio.gather; Timeout pro Fetch bleibt in _fetch_tile) — sequenziell
+        kosteten 4 Kacheln sonst 4× Latenz pro Tick (Audit B12). Fehler pro
+        Kachel werden geschluckt (leere Liste, Rest läuft weiter)."""
+
+        async def _one_tile(atile):
+            try:
+                return await _fetch_tile(fr24, atile, self._s)
+            except Exception:
+                return []
+
+        results = await asyncio.gather(
+            *(_one_tile(t) for t in self._s.airport_tiles))
+        n_apt = 0
+        for flights in results:
+            arows, aseen = [], set()
+            for fl in flights:
+                snap = _flight_to_snapshot(fl, set())     # alle Airlines, kein Filter
+                if snap and snap["reg"] not in aseen:
+                    aseen.add(snap["reg"])
+                    arows.append(snap)
+            if arows:
+                n_apt += await self._append_track(
+                    arows, min_sec=self._s.airport_min_sec, min_nm=self._s.airport_min_nm,
+                    allow_ground=True, source="fr24_grpc_apt")
+        if n_apt:
+            log.debug("airport-tiles: %d Kacheln, track+=%d (dicht+taxi)",
+                      len(self._s.airport_tiles), n_apt)
 
     async def run(self) -> None:
         from fr24 import FR24
         Path(self._s.heartbeat_file).touch()
         backoff = self._s.backoff_base
-        log.info("fr24-ingest v2 (gRPC) gestartet — %d Kacheln, %d Carrier-Prefixe, poll=%.0fs",
-                 len(self._s.tiles), len(self._s.prefixes) or 0, self._s.poll_interval)
+        log.info("fr24-ingest v2 (gRPC) gestartet — %d Kacheln, %d Carrier-Prefixe, poll=%.0fs, "
+                 "airport-hot-tiles=%s (%d)",
+                 len(self._s.tiles), len(self._s.prefixes) or 0, self._s.poll_interval,
+                 self._s.airport_dense, len(self._s.airport_tiles))
         await self._start_http()
         # EIN FR24-gRPC-Client über die ganze Container-Lebensdauer (TCP/TLS-Reuse).
         async with FR24() as fr24:

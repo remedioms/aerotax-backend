@@ -305,7 +305,14 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             # obwohl die Maschine laengst den NAECHSTEN Sektor fliegt
             # (Tibor LH802 „Ankunft 12:30" um 13:39). Ab Plan-Ankunft+Puffer
             # gilt der Leg als geflogen und der naechste wird geprueft.
-            if now >= eff_arr + _dt.timedelta(minutes=_STALE_GROUNDED_MIN):
+            # Audit B6: dep-seitige „Abgeflogen"-Rows tragen meist NUR
+            # dep_delay (kein arr_delay) — eff_arr allein unterschaetzt dann
+            # die echte Ankunft um die Start-Verspaetung: >30 min verspaetete
+            # Starts kippten ab Plan-Ankunft+Puffer faelschlich auf 'flown'.
+            # Deckel = spaeteste plausible Ankunft: eff_arr ODER
+            # eff_dep + Plan-Flugzeit (arr - dep), je nachdem was spaeter ist.
+            cap_arr = max(eff_arr, eff_dep + (leg['arr'] - leg['dep']))
+            if now >= cap_arr + _dt.timedelta(minutes=_STALE_GROUNDED_MIN):
                 leg['flown'] = True
                 last_flown_observed = True
                 continue
