@@ -452,9 +452,12 @@ def route_for_flight(callsign=None, hex=None, reg=None, lat=None, lon=None,
     except Exception:
         alf = None
     if alf and alf.get('dep_iata') and alf.get('arr_iata'):
+        # flight_no additiv (Owner 2026-07-12): der Harvester kennt die ECHTE
+        # IATA-Nummer des aktiven Flugs (DLH54N → LH1138) — der Callout-Header
+        # zeigt sie groß statt nur des Funknamens. Beobachtet, nie abgeleitet.
         _al_route = {'src': alf['dep_iata'], 'dst': alf['arr_iata'],
                      'source': 'aircraft_live', 'confidence': 'confirmed',
-                     'reg': alf.get('reg')}
+                     'reg': alf.get('reg'), 'flight_no': alf.get('flight')}
         if _accept(_al_route):
             D._record_resolved_route(cs, reg_u, _al_route, date)
             return _al_route

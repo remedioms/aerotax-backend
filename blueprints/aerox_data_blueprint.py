@@ -258,10 +258,14 @@ def _route_from_obs(callsign):
                         if '#' not in (x.get('airport') or '')
                         and (x.get('date') in fresh_dates)), None)
             if dep and dep.get('dest_iata'):
+                # flight_no = der Kandidat, der die Tafel WIRKLICH getroffen
+                # hat (beobachtete IATA-Nummer, keine Ableitung) — Callout-
+                # Header zeigt sie groß (Owner 2026-07-12).
                 out = {'src': (dep.get('airport') or '').split('#', 1)[0],
                        'dst': dep.get('dest_iata'),
                        'gate': dep.get('gate'), 'terminal': dep.get('terminal'),
-                       'source': 'aerox_board', 'callsign': cs}
+                       'source': 'aerox_board', 'callsign': cs,
+                       'flight_no': fn}
                 # Echte Tafel-Zeiten (station-lokal am Abflug-Airport) durchreichen
                 # — nur was die Tafel WIRKLICH kennt, nichts erfinden.
                 if dep.get('sched'):
@@ -2896,6 +2900,12 @@ def ax_callsign(callsign):
         out['status'] = route.get('status')
     if route.get('reg'):
         out['reg'] = route.get('reg')
+    # ECHTE IATA-Flugnummer additiv durchreichen (Owner 2026-07-12, Callout
+    # DLH54N zeigte nur den Funknamen): NUR beobachtete Nummern aus der Quelle
+    # (aircraft_live/Warehouse-Board) — KEINE naive Präfix-Ableitung, die macht
+    # aus „DLH54N" das Fantasie-„LH54N" (alphanumerischer LH-Suffix ≠ Nummer).
+    if route.get('flight_no'):
+        out['flight_no'] = route.get('flight_no')
 
     def enrich(code):
         ap = _airport_row(code)
@@ -3537,6 +3547,67 @@ def resolve_unified_flight(query, date=None, callsign_query=False,
     return res
 
 
+def _plan_leg_from_warehouse(flight_no, max_age_days=45):
+    """PLAN-Fallback-Quelle (Owner 2026-07-12, „LH545 → leere Suchseite"): das
+    JÜNGSTE board-verifizierte Leg EINER Flugnummer aus dem Flight-Warehouse
+    (`flights`, op_flight_no) — OHNE Datums-Constraint. Greift, wenn der Flug
+    für den angefragten Tag (noch) nirgends beobachtet ist: Abend-Flug noch
+    nicht am Board, Abflughafen nicht gescraped, oder Flug verkehrt an anderen
+    Wochentagen. GRATIS (eigene Tabelle, ein indizierter Query), kein Paid.
+    Legs älter als `max_age_days` werden verworfen (Saison-Drift: ein Monate
+    alter Fahrplan wäre keine ehrliche Plan-Aussage mehr). None bei Miss."""
+    fn = (flight_no or '').replace(' ', '').upper().strip()
+    if not fn:
+        return None
+    sb = _sb()
+    if sb is None:
+        return None
+    try:
+        r = (sb.table('flights')
+             .select('op_flight_no,origin,destination,service_date,'
+                     'sched_dep,sched_arr')
+             .eq('op_flight_no', fn)
+             .order('service_date', desc=True).limit(5).execute())
+    except Exception:
+        return None
+    from datetime import datetime as _dt
+    for f in (r.data or []):
+        if not (f.get('origin') and f.get('destination')
+                and f.get('service_date')):
+            continue
+        try:
+            leg_day = _dt.strptime(str(f['service_date'])[:10], '%Y-%m-%d')
+        except (TypeError, ValueError):
+            continue
+        if (time.time() - leg_day.timestamp()) > max_age_days * 86400:
+            continue
+        return f
+    return None
+
+
+def _plan_times_for_date(leg, date):
+    """Soll-Zeiten des historischen Legs auf den ANGEFRAGTEN Tag legen (Uhrzeit
+    bleibt, nur der Tag verschiebt sich — Tagesflüge haben stabile Slots; ein
+    Overnight-Offset des Legs bleibt dabei erhalten). Die flights-Warehouse-
+    Zeiten sind ISO mit Zone (UTC/Offset) → Verschiebung um ganze Tage ist
+    zonen-neutral. Ehrlich NUR sched (est wäre erfunden). {} wenn unparsbar."""
+    out = {}
+    try:
+        from datetime import datetime as _dt
+        base_day = _dt.strptime(str(leg.get('service_date'))[:10], '%Y-%m-%d')
+        req_day = _dt.strptime((date or '')[:10], '%Y-%m-%d')
+        shift = req_day - base_day
+        for k in ('sched_dep', 'sched_arr'):
+            v = leg.get(k)
+            if not v:
+                continue
+            dt = _dt.fromisoformat(str(v).replace('Z', '+00:00'))
+            out[k] = (dt + shift).isoformat()
+    except Exception:
+        return {}
+    return out
+
+
 def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
                                  date_auto=False):
     """Der eigentliche Free-First-Zusammenbau (q/date bereits normalisiert):
@@ -3596,6 +3667,12 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
             route_src = rt.get('source')
             route_conf = rt.get('confidence')
             reg = reg or rt.get('reg')
+            # ECHTE IATA-Nummer aus der Kaskade (Warehouse-Board/aircraft_live)
+            # übernehmen (Owner 2026-07-12): bei Funknamen-Queries (DLH54N)
+            # blieb flight_no sonst leer → Callout ohne Flugnummer UND die
+            # Board-Fakten unten wurden nie gefunden. Nur beobachtete Werte.
+            if not flight_no and rt.get('flight_no'):
+                flight_no = rt.get('flight_no')
 
     # Datum war nicht angefragt (date_auto): jetzt, wo der Origin bekannt sein
     # kann, auf DESSEN station-lokales Heute verfeinern (Berlin war nur Heimat-
@@ -3623,6 +3700,23 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
         origin, dest = facts['dep_iata'], facts['arr_iata']
         route_src = route_src or 'airport_delay_obs'
         route_conf = route_conf or 'confirmed'
+
+    # PLAN-TIER (Owner 2026-07-12, „Suche LH545 liefert leere Seite"): der Flug
+    # ist für den angefragten Tag NIRGENDS beobachtet (Live/Board/Warehouse-
+    # Kaskade leer — Abend-Flug noch nicht am Board, Abflughafen nicht
+    # gescraped, oder verkehrt an anderen Wochentagen). Statt found:false das
+    # jüngste board-verifizierte Leg derselben Flugnummer als PLAN-Antwort:
+    # Route + Soll-Zeiten (Slot des letzten Legs auf den Tag gelegt), EHRLICH
+    # markiert (top-level plan:true, meta.plan, route_confidence='plan').
+    # Free-first: eigene flights-Tabelle, NULL Paid-Spend. Reg/Typ bewusst
+    # NICHT übernommen — die Maschine wechselt täglich (nichts erfinden).
+    plan_times = None
+    if not (origin and dest) and not facts and flight_no and not callsign_query:
+        _leg = _plan_leg_from_warehouse(flight_no)
+        if _leg:
+            origin, dest = _leg['origin'], _leg['destination']
+            route_src, route_conf = 'warehouse_plan', 'plan'
+            plan_times = _plan_times_for_date(_leg, date)
 
     if not (origin and dest) and not facts:
         return {'ok': True, 'found': False, 'query': q, 'date': date}
@@ -3653,6 +3747,15 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
         'meta': {'route_source': route_src, 'route_confidence': route_conf,
                  'facts_source': 'airport_delay_obs' if facts else None},
     }
+    # PLAN-Antwort transparent machen: Zeiten sind der letzte bekannte Fahrplan
+    # (kein Ist), Consumer dürfen sie nur als „geplant" rendern.
+    if plan_times is not None:
+        out['times'] = {'sched_dep': plan_times.get('sched_dep'),
+                        'est_dep': None,
+                        'sched_arr': plan_times.get('sched_arr'),
+                        'est_arr': None}
+        out['plan'] = True
+        out['meta']['plan'] = True
     # Facts stammen vom Vortag (Overnight-Fallback) → transparent markieren.
     if facts.get('stale'):
         out['stale'] = True

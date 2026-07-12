@@ -9664,6 +9664,10 @@ def _profile_load(token):
 _PROFILE_BULK_META_KEYS = (
     'avatar_url', 'share_location', 'current_city', 'location_source',
     'role', 'account_type',
+    # PRE-FLIGHT-TIMELINE (2026-07-12): selbst angegebene Fahrzeit
+    # Wohnung→Flughafen (Minuten) — friends-today reicht sie in die
+    # „Fahrt zum Flughafen"-Phase des crew_state-Resolvers.
+    'commute_minutes',
 )
 
 
@@ -9724,8 +9728,9 @@ def _profiles_load_bulk(tokens, include_metadata=False):
                                 elif v == 'false':
                                     v = False
                                 elif isinstance(v, str) and v.isdigit() \
-                                        and k in ('share_location',):
-                                    v = int(v)  # legacy int-0/1-Werte
+                                        and k in ('share_location',
+                                                  'commute_minutes'):
+                                    v = int(v)  # legacy int-0/1 + Minuten
                                 prof[k] = v
                     if row.get('updated_at') is not None:
                         prof['_updated_at'] = row.get('updated_at')
@@ -10125,6 +10130,24 @@ def put_user_profile(token):
             profile.pop('home_transport_mode', None)
     if 'home_geocoded' in body:
         profile['home_geocoded'] = bool(body.get('home_geocoded'))
+    # PRE-FLIGHT-TIMELINE (ADDITIV 2026-07-12): selbst angegebene Fahrzeit
+    # Wohnung→Flughafen in Minuten (ÖPNV/Auto) — speist serverseitig die
+    # „Fahrt zum Flughafen"-Phase der Crew-Bordkarten (crew_state.pre_phase).
+    # Landet in metadata-jsonb (kein Schema-Change). Der Wert existiert
+    # clientseitig bereits als SmartPickup-Fahrzeit — TODO iOS: beim
+    # Profil-Sync mitsenden (Client-Seite bewusst noch nicht gebaut).
+    # None/0/'' löscht; Unplausibles (>6 h) wird still verworfen.
+    if 'commute_minutes' in body:
+        _cmv = body.get('commute_minutes')
+        if _cmv in (None, '', 0, '0'):
+            profile.pop('commute_minutes', None)
+        else:
+            try:
+                _cmi = int(_cmv)
+                if 0 < _cmi <= 360:
+                    profile['commute_minutes'] = _cmi
+            except (TypeError, ValueError):
+                pass  # ungültiger Wert → still überspringen (kein 500)
     # Disk-Payload erhält Side-Keys (subscription, crew_aircraft, …) die NICHT
     # in SB sind — lesen, profile-Subkey ersetzen, zurückschreiben. Sonst würde
     # ein PUT alles andere im disk-File zerstören.
@@ -12009,39 +12032,100 @@ _FRIENDS_TODAY_TTL = 90.0         # 90 s: Feed lädt sonst pro Aufruf N×M sequ.
 
 
 def _friend_briefing_day_sectors(fr, datum):
-    """(ical_sectors, imported_at) des Tages DIREKT aus user_ical_briefings
-    (1 gefilterter SB-Read). Der serverseitige Kalender-Refresh
-    (_maybe_refresh_calendar_feed) hält diese Tabelle frisch — der push-basierte
-    roster_snapshot kann dahinter STALE sein (Diagnose 2026-07-10: iCal-Freunde
-    froren auf dem letzten App-Push ein). None,None wenn nichts da / SB down."""
+    """(ical_sectors, imported_at, ical_summary, ical_start_iso) des Tages
+    DIREKT aus user_ical_briefings (1 gefilterter SB-Read). Der serverseitige
+    Kalender-Refresh (_maybe_refresh_calendar_feed) hält diese Tabelle frisch —
+    der push-basierte roster_snapshot kann dahinter STALE sein (Diagnose
+    2026-07-10: iCal-Freunde froren auf dem letzten App-Push ein).
+    summary/start (ADDITIV 2026-07-12) speisen die PRE-FLIGHT-TIMELINE:
+    Summary trägt den Pickup-Token, ical_start den (beim Import via
+    _corrected_briefing_start_iso schon LT→UTC-gelösten) Report-Start.
+    (None, None, None, None) wenn nichts da / SB down."""
     try:
         if not (SB_AVAILABLE and sb is not None and fr and datum):
-            return None, None
+            return None, None, None, None
         r = (sb.table('user_ical_briefings')
-             .select('datum,updated_at,raw_event')
+             .select('datum,updated_at,raw_event,ical_summary,ical_start')
              .eq('token', fr).eq('datum', datum).limit(1).execute())
         rows = getattr(r, 'data', None) or []
         if not rows:
-            return None, None
+            return None, None, None, None
         row = rows[0]
         ts = str(row.get('updated_at') or '') or None
+        summary = str(row.get('ical_summary') or '') or None
+        start_iso = str(row.get('ical_start') or '') or None
         raw = row.get('raw_event') or {}
         secs = raw.get('ical_sectors') if isinstance(raw, dict) else None
         if not (isinstance(secs, list) and secs):
-            return None, ts
-        return secs, ts
+            return None, ts, summary, start_iso
+        return secs, ts, summary, start_iso
     except Exception:
-        return None, None
+        return None, None, None, None
 
 
-def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None):
+def _crew_pre_flight_ctx(day, secs, brief_summary, brief_start_iso,
+                         commute_minutes):
+    """PRE-FLIGHT-TIMELINE-Bausteine (Owner 2026-07-12) für den Resolver —
+    NUR echte Quellen, fehlt ein Baustein bleibt sein Feld None und der
+    Resolver überspringt die Phase (nie geratene Zeiten):
+      pickup:  aus dem Roh-iCal-Summary geparst (crew_live_state.
+               parse_pickup_hhmm = Server-Nachbau der iOS-Referenz-Regexe
+               RosterLabels.pickupTimeFromSummary); die HH:MM ist Ortszeit an
+               der Station des ERSTEN Abflugs (dort steht das Hotel) → UTC via
+               airport_tz (FRA/EDDF-Fallback Europe/Berlin wie überall).
+      report:  Briefing-/Report-Start des Tages — user_ical_briefings.
+               ical_start (beim Import via _corrected_briefing_start_iso
+               schon LT→UTC + Default-genullt) bzw. Snapshot ical_start_iso.
+      commute_minutes: vom Crew-Mitglied SELBST angegebene Fahrzeit
+               Wohnung→Flughafen (Profil-Feld, s. put_user_profile).
+    Wirft nie; None wenn gar kein Baustein da ist."""
+    try:
+        from blueprints.crew_live_state import (parse_pickup_hhmm,
+                                                pickup_utc_for_leg)
+        day = day or {}
+        first = None
+        for s in (secs or []):
+            if isinstance(s, dict) and s.get('dep_iso'):
+                if first is None or str(s.get('dep_iso')) < str(first.get('dep_iso')):
+                    first = s
+        pickup = None
+        if first is not None:
+            for src in (brief_summary, day.get('marker'),
+                        day.get('ical_summary')):
+                hm = parse_pickup_hhmm(src)
+                if not hm:
+                    continue
+                st = str(first.get('from') or '').strip().upper()
+                tzname = airport_tz(st) or (
+                    'Europe/Berlin' if st in ('FRA', 'EDDF') else None)
+                pickup = pickup_utc_for_leg(hm, first.get('dep_iso'), tzname)
+                break
+        report = brief_start_iso or day.get('ical_start_iso') or None
+        cm = None
+        try:
+            cm = int(commute_minutes)
+            if not (0 < cm <= 360):
+                cm = None
+        except (TypeError, ValueError):
+            cm = None
+        if pickup is None and not report and cm is None:
+            return None
+        return {'pickup': pickup, 'report': report, 'commute_minutes': cm}
+    except Exception:
+        return None
+
+
+def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
+                        commute_minutes=None):
     """Additives `crew_state`-Feld für friends-today — EINE Wahrheit über den
     Neubau-Resolver blueprints/crew_live_state (Owner 2026-07-10: „baue es
     komplett neu auf damit es funktioniert, auch Text"). iOS zeigt text.title/
     subtitle 1:1, kein lokales Raten mehr. Frisches Briefing SCHLÄGT stalen
     Snapshot (pick_fresher_sectors). free-first: Board-Obs free_only=True,
     Live-Gegencheck = reiner aircraft_live-Read. None bei jedem Fehler —
-    Altfelder bleiben unverändert stehen."""
+    Altfelder bleiben unverändert stehen.
+    commute_minutes (ADDITIV 2026-07-12): selbst angegebene Fahrzeit des
+    Freundes (Profil) → PRE-FLIGHT-TIMELINE-Phase „Fahrt zum Flughafen"."""
     try:
         from blueprints.crew_live_state import (resolve_crew_live_state,
                                                 pick_fresher_sectors,
@@ -12052,7 +12136,8 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None):
         day = day or {}
         snap_secs = [s for s in (day.get('ical_sectors') or [])
                      if isinstance(s, dict)]
-        b_secs, b_ts = _friend_briefing_day_sectors(fr, datum)
+        b_secs, b_ts, b_summary, b_start_iso = \
+            _friend_briefing_day_sectors(fr, datum)
         secs, _src = pick_fresher_sectors(snap_secs, snap_ts, b_secs, b_ts)
         rf = day.get('reader_facts') or {}
         duty = ('standby'
@@ -12067,7 +12152,9 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None):
             duty=duty,
             city_lookup=_iata_city_name,
             local_hhmm=build_local_hhmm(airport_tz),
-            status_bucket=_flight_status_bucket)
+            status_bucket=_flight_status_bucket,
+            pre_ctx=_crew_pre_flight_ctx(day, secs, b_summary, b_start_iso,
+                                         commute_minutes))
     except Exception as e:
         app.logger.info(f'[friends-today] crew_state_skip {type(e).__name__}')
         return None
@@ -12521,8 +12608,10 @@ def get_friends_today(token):
         crew_state_next = None
         if datum == _heute_berlin:
             _hb_arg = (pr.get('homebase') or '').strip().upper() or None
+            _cm_arg = pr.get('commute_minutes')
             crew_state = _crew_state_for_day(
-                fr, day, datum, homebase=_hb_arg, snap_ts=_snap_ts)
+                fr, day, datum, homebase=_hb_arg, snap_ts=_snap_ts,
+                commute_minutes=_cm_arg)
             # 24-H-FENSTER ÜBER MITTERNACHT (Owner 2026-07-12, Tibor-Fall,
             # Crew-Feed-Härtung #1): friends-today liefert nur den heutigen
             # Berliner Tag → das „Check-in ab 24 h vorher"-Fenster der
@@ -12543,7 +12632,7 @@ def get_friends_today(token):
                     if day2:
                         cs2 = _crew_state_for_day(
                             fr, day2, _morgen, homebase=_hb_arg,
-                            snap_ts=_snap_ts)
+                            snap_ts=_snap_ts, commute_minutes=_cm_arg)
                         _leg2 = (cs2 or {}).get('current_leg') or {}
                         _dep_iso2 = _leg2.get('dep_iso')
                         if (cs2 or {}).get('state') == 'pre_flight' and _dep_iso2:
@@ -13645,7 +13734,10 @@ def _news_sb_cache_get(url):
             'source': row.get('source'),
             'fulltext': fulltext,
             'title': row.get('title'),
-            'image_url': row.get('image_url'),
+            # Self-Heal am Ausgang (Owner 2026-07-12): Alt-Einträge können noch
+            # relative/http-/Pixel-URLs tragen → normalisieren statt roh liefern.
+            'image_url': _news_normalize_image_url(row.get('image_url'),
+                                                   base_url=row.get('url') or url),
             'published_at': row.get('published_at'),
             'cache_ttl_seconds': NEWS_ARTICLE_SB_CACHE_TTL_SECONDS,
         }
@@ -13891,8 +13983,8 @@ def get_news_article():
     except Exception:
         pass
 
-    # Metadata aus <meta og:*>/<title>/<time>
-    meta = _news_extract_metadata(html)
+    # Metadata aus <meta og:*>/<title>/<time> — base_url für relative Bilder.
+    meta = _news_extract_metadata(html, base_url=raw_url)
 
     result = {
         'ok': True,
@@ -14377,9 +14469,52 @@ def _news_normalize_text(text):
     return '\n'.join(lines).strip()
 
 
-def _news_extract_metadata(html):
+def _news_normalize_image_url(u, base_url=None):
+    """Artikel-Bild-URL putzen (Owner 2026-07-12, „Websites haben doch Bilder"):
+    relative URLs gegen die Artikel-URL auflösen, http→https heben, Tracking-
+    Pixel/Zähl-Bildchen per URL-Heuristik verwerfen. None wenn unbrauchbar —
+    lieber kein Bild als ein 1×1-Pixel oder eine kaputte relative URL."""
+    import urllib.parse as _up
+    s = (u or '').strip()
+    if not s or s.lower().startswith(('data:', 'javascript:')):
+        return None
+    try:
+        import html as _html_lib
+        s = _html_lib.unescape(s)
+    except Exception:
+        pass
+    # Relative / protokoll-relative URLs gegen die Artikel-URL auflösen.
+    if base_url and not s.lower().startswith(('http://', 'https://')):
+        try:
+            s = _up.urljoin(base_url, s)
+        except Exception:
+            return None
+    if s.lower().startswith('http://'):
+        s = 'https://' + s[7:]
+    if not s.lower().startswith('https://'):
+        return None
+    low = s.lower()
+    # Tracking-Pixel/Zähler (Mindestgröße per URL-Heuristik): 1×1-Muster,
+    # bekannte Analytics-Hosts, width=1/height=1-Query. Konservative Liste.
+    junk_markers = ('1x1', 'pixel.', '/pixel', 'spacer', 'blank.gif',
+                    'doubleclick.', 'facebook.com/tr', 'google-analytics.',
+                    'stats.wp.com', '/counter', 'feedburner.com/~r/')
+    if any(m in low for m in junk_markers):
+        return None
+    try:
+        q = _up.parse_qs(_up.urlsplit(s).query)
+        if q.get('width', ['']) == ['1'] or q.get('height', ['']) == ['1'] \
+                or q.get('w', ['']) == ['1'] or q.get('h', ['']) == ['1']:
+            return None
+    except Exception:
+        pass
+    return s
+
+
+def _news_extract_metadata(html, base_url=None):
     """Extrahiert Title, Image-URL und Published-At aus <meta og:*> / <title> / <time>.
-    Bestes-Effort, alle Felder optional."""
+    Bestes-Effort, alle Felder optional. `base_url` (additiv, Owner 2026-07-12)
+    löst relative Bild-URLs auf und schaltet die Bild-Normalisierung scharf."""
     import re as _re
     out = {'title': None, 'image_url': None, 'published_at': None}
     if not html:
@@ -14412,9 +14547,39 @@ def _news_extract_metadata(html):
                 title = m.group(1).strip()
     out['title'] = title
 
-    out['image_url'] = (_meta('og:image')
-                       or _meta('twitter:image', 'name')
-                       or _meta('twitter:image:src', 'name'))
+    # Bild-Kaskade (Owner 2026-07-12, „News-Bilder fehlen oft"): og:image →
+    # og:image:secure_url → twitter:image(:src) → <link rel="image_src"> →
+    # erstes <img> im Artikel-Bereich. Jeder Kandidat wird normalisiert
+    # (relative URL auflösen, http→https, Tracking-Pixel verwerfen) — der
+    # erste BRAUCHBARE gewinnt, nicht blind der erste Treffer.
+    img_candidates = [
+        _meta('og:image'),
+        _meta('og:image:secure_url'),
+        _meta('twitter:image', 'name'),
+        _meta('twitter:image:src', 'name'),
+    ]
+    m_link = _re.search(r'<link\b[^>]*rel\s*=\s*["\']image_src["\'][^>]*'
+                        r'\bhref\s*=\s*["\']([^"\']+)["\']',
+                        html, flags=_re.IGNORECASE)
+    if m_link:
+        img_candidates.append(m_link.group(1).strip())
+    # Erstes Artikel-Bild als letzter Fallback: NUR innerhalb von <article>…
+    # (bzw. der ersten figure) suchen — ein Logo/Icon aus dem Header wäre Müll.
+    m_art = _re.search(r'<article\b[^>]*>(.{0,20000}?)</article>', html,
+                       flags=_re.IGNORECASE | _re.DOTALL)
+    scope = m_art.group(1) if m_art else None
+    if not scope:
+        m_fig = _re.search(r'<figure\b[^>]*>(.{0,4000}?)</figure>', html,
+                           flags=_re.IGNORECASE | _re.DOTALL)
+        scope = m_fig.group(1) if m_fig else None
+    if scope:
+        m_img = _re.search(r'<img\b[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']',
+                           scope, flags=_re.IGNORECASE)
+        if m_img:
+            img_candidates.append(m_img.group(1).strip())
+    out['image_url'] = next(
+        (n for n in (_news_normalize_image_url(c, base_url=base_url)
+                     for c in img_candidates) if n), None)
 
     out['published_at'] = (_meta('article:published_time')
                           or _meta('og:article:published_time')

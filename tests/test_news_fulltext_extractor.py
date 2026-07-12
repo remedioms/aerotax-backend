@@ -157,7 +157,9 @@ def test_attach_stored_fulltexts_sets_fulltext_and_readable(monkeypatch):
     ]
     monkeypatch.setattr(
         nb, '_fulltext_store_get_many',
-        lambda urls: {'https://www.aero.de/news-1': long_text})
+        # Neue Store-Shape (2026-07-12): {url: {'fulltext':…, 'image_url':…}}
+        lambda urls: {'https://www.aero.de/news-1':
+                      {'fulltext': long_text, 'image_url': None}})
     nb._attach_stored_fulltexts(arts)
     # .rstrip(): gespeicherter Text läuft durch _strip_feed_cruft, das am Ende
     # bewusst `out.strip()` macht — der Test-String endet auf ein Leerzeichen,
@@ -166,6 +168,36 @@ def test_attach_stored_fulltexts_sets_fulltext_and_readable(monkeypatch):
     assert arts[0]['in_app_readable'] is True
     # Artikel mit vorhandenem RSS-Volltext bleibt unangetastet.
     assert arts[1]['fulltext'] == 'schon da'
+
+
+def test_attach_stored_fulltexts_fills_missing_image(monkeypatch):
+    """Owner 2026-07-12 („News-Bilder fehlen oft"): ein Feed-Artikel OHNE
+    RSS-Bild erbt das beim Scrape extrahierte Artikel-Bild aus dem Store —
+    auch wenn er seinen Volltext schon aus dem RSS hat. Ein vorhandenes
+    Bild wird NIE überschrieben."""
+    arts = [
+        {'article_url': 'https://www.aero.de/news-1', 'fulltext': 'x' * 500,
+         'in_app_readable': True, 'image_url': None},
+        {'article_url': 'https://www.aero.de/news-2', 'fulltext': 'y' * 500,
+         'in_app_readable': True, 'image_url': 'https://cdn.aero.de/alt.jpg'},
+    ]
+    monkeypatch.setattr(
+        nb, '_fulltext_store_get_many',
+        lambda urls: {
+            'https://www.aero.de/news-1':
+                {'fulltext': 'z' * 500,
+                 'image_url': 'https://cdn.aero.de/scraped.jpg'},
+            'https://www.aero.de/news-2':
+                {'fulltext': 'z' * 500,
+                 'image_url': 'https://cdn.aero.de/other.jpg'},
+        })
+    nb._attach_stored_fulltexts(arts)
+    # Ohne Request-Context gibt es keinen Proxy-Base → Original-URL direkt.
+    assert arts[0]['image_url'] == 'https://cdn.aero.de/scraped.jpg'
+    assert arts[0]['image_url_original'] == 'https://cdn.aero.de/scraped.jpg'
+    # RSS-Volltext bleibt unangetastet (Bild-Nachtrag putzt keinen Text weg).
+    assert arts[0]['fulltext'] == 'x' * 500
+    assert arts[1]['image_url'] == 'https://cdn.aero.de/alt.jpg'
 
 
 def test_attach_stored_fulltexts_store_down_is_noop(monkeypatch):
@@ -215,3 +247,47 @@ def test_robots_allows_conservative_on_error_permissive_on_404(monkeypatch):
     monkeypatch.setattr(nb.requests, 'get', _boom)
     assert nb._robots_allows('https://example.org/a') is False
     nb._ROBOTS_CACHE.clear()
+
+
+# ── Bild-Normalisierung + Meta-Bild-Kaskade (app.py, Owner 2026-07-12) ─────
+
+def test_news_normalize_image_url_rules():
+    import app as A
+    base = 'https://www.aero.de/news-12345/artikel.html'
+    # Relativ → absolut, http → https.
+    assert A._news_normalize_image_url('/img/a.jpg', base) == \
+        'https://www.aero.de/img/a.jpg'
+    assert A._news_normalize_image_url('http://cdn.aero.de/a.jpg', base) == \
+        'https://cdn.aero.de/a.jpg'
+    # Tracking-Pixel/Zähler → None.
+    assert A._news_normalize_image_url(
+        'https://x.de/tracker-1x1.gif', base) is None
+    assert A._news_normalize_image_url(
+        'https://cdn.x.de/foto.jpg?width=1&height=1', base) is None
+    # data:/leer → None; ohne base bleibt relativ unbrauchbar → None.
+    assert A._news_normalize_image_url('data:image/gif;base64,xx', base) is None
+    assert A._news_normalize_image_url('', base) is None
+    assert A._news_normalize_image_url('/img/a.jpg', None) is None
+
+
+def test_news_extract_metadata_image_cascade_and_relative():
+    import app as A
+    base = 'https://www.aero.de/news-1/a.html'
+    # og:image fehlt → erstes Artikel-<img> gewinnt, relativ aufgelöst.
+    html = ('<html><head><title>T</title></head><body>'
+            '<article><p>Text</p><img src="/bilder/lh.jpg"></article>'
+            '</body></html>')
+    meta = A._news_extract_metadata(html, base_url=base)
+    assert meta['image_url'] == 'https://www.aero.de/bilder/lh.jpg'
+    # og:image vorhanden → gewinnt vor dem Artikel-<img>; http → https.
+    html2 = ('<head><meta property="og:image" '
+             'content="http://cdn.aero.de/og.jpg"></head>'
+             '<article><img src="/bilder/x.jpg"></article>')
+    meta2 = A._news_extract_metadata(html2, base_url=base)
+    assert meta2['image_url'] == 'https://cdn.aero.de/og.jpg'
+    # og:image ist ein Pixel → Kaskade fällt aufs Artikel-Bild durch.
+    html3 = ('<head><meta property="og:image" '
+             'content="https://t.co/pixel.gif"></head>'
+             '<article><img src="https://cdn.aero.de/real.jpg"></article>')
+    meta3 = A._news_extract_metadata(html3, base_url=base)
+    assert meta3['image_url'] == 'https://cdn.aero.de/real.jpg'

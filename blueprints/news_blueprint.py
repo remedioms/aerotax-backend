@@ -1610,7 +1610,9 @@ def _fulltext_store_get_many(urls):
     depublizierter Artikel fällt so wieder auf den Teaser zurück; nur was die
     Quelle weiterhin öffentlich hält, zieht der Re-Harvest erneut frisch.
     Deny-Hosts (Reuters/AvHerald) werden nie geliefert, auch nicht aus
-    Alt-Beständen. Return: {article_url: fulltext}. Leeres dict bei
+    Alt-Beständen. Return: {article_url: {'fulltext': …, 'image_url': …}}
+    (image_url seit 2026-07-12 mitgeliefert — Feed-Artikel ohne RSS-Bild
+    erben das beim Scrape extrahierte Artikel-Bild). Leeres dict bei
     SB-down/Fehler (wirft nie).
     """
     sb, available = _debrief_get_sb()
@@ -1629,7 +1631,7 @@ def _fulltext_store_get_many(urls):
         try:
             def _do(_chunk=chunk):
                 return (sb.table(_FULLTEXT_TABLE)
-                          .select('url_key, fulltext, fetched_at')
+                          .select('url_key, fulltext, image_url, fetched_at')
                           .in_('url_key', _chunk)
                           .execute())
             res = _fulltext_sb_execute('news_fulltext_get', _do, timeout_s=5)
@@ -1653,7 +1655,7 @@ def _fulltext_store_get_many(urls):
                     continue
                 if fa < serve_cutoff:
                     continue
-                out[url] = ft
+                out[url] = {'fulltext': ft, 'image_url': row.get('image_url')}
         except Exception as exc:
             _log_warn(f'[news/fulltext] store_get chunk failed: {exc!r}')
             break
@@ -1876,6 +1878,29 @@ def _harvest_fetch_article_html(url):
     return resp.text
 
 
+def _harvest_article_image(html_doc, url):
+    """Artikel-Bild aus dem bereits geladenen Quell-HTML (Owner 2026-07-12):
+    geteilte app.py-Extraktion (`_news_extract_metadata` — og:image/
+    twitter:image/erstes Artikel-<img>, inkl. Normalisierung https/relativ/
+    Tracking-Pixel). Kein zusätzlicher Netz-Fetch. None-safe, wirft nie."""
+    if not html_doc:
+        return None
+    m = _debrief_get_app_module()
+    fn = getattr(m, '_news_extract_metadata', None) if m is not None else None
+    if not callable(fn):
+        return None
+    try:
+        return (fn(html_doc, base_url=url) or {}).get('image_url')
+    except TypeError:
+        # Älterer app.py-Stand ohne base_url-Parameter (Deploy-Skew).
+        try:
+            return (fn(html_doc) or {}).get('image_url')
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
 def _published_iso(art):
     """published_at (unix int im Feed-Schema) → ISO-String für die Tabelle."""
     try:
@@ -1950,10 +1975,16 @@ def _harvest_run(articles):
             if html_doc:
                 ft = _extract_fulltext_for_harvest(html_doc, source_host=_fulltext_host(url))
                 if ft and len(ft) >= _FULLTEXT_STORE_MIN_CHARS:
+                    # Bild MITSCHREIBEN (Owner 2026-07-12, „Websites haben doch
+                    # Bilder"): trägt das RSS keins, aus dem eh schon geladenen
+                    # HTML og:image/twitter:image/erstes Artikel-Bild ziehen —
+                    # kein zusätzlicher Fetch, normalisiert (https/relativ/Pixel).
                     if _fulltext_store_put(
                         url, ft,
                         title=art.get('title'),
-                        image_url=art.get('image_url_original') or art.get('image_url'),
+                        image_url=(art.get('image_url_original')
+                                   or art.get('image_url')
+                                   or _harvest_article_image(html_doc, url)),
                         published_at=_published_iso(art),
                     ):
                         stored_scrape += 1
@@ -2004,26 +2035,45 @@ def _attach_stored_fulltexts(articles):
     in_app_readable, damit ?readable_only=1 die Artikel nicht mehr aussiebt.
     Wirft nie — SB-down ⇒ Feed unverändert (Teaser + On-Demand-Reader bleiben).
     """
+    # Bild-Lücken zählen mit (Owner 2026-07-12, „News-Bilder fehlen oft"): auch
+    # Artikel MIT RSS-Volltext aber OHNE Bild profitieren vom beim Scrape
+    # extrahierten Artikel-Bild im Store.
     need = [a for a in articles
-            if not a.get('fulltext') and (a.get('article_url') or '').strip()]
+            if (not a.get('fulltext') or not a.get('image_url'))
+            and (a.get('article_url') or '').strip()]
     if not need:
         return
     found = _fulltext_store_get_many([a['article_url'] for a in need])
     if not found:
         return
+    # Für nachgetragene Bilder denselben Proxy-Weg wie der RSS-Pfad nehmen
+    # (Hotlink-Block/ablaufende URLs) — läuft im Request-Context des Feeds.
+    try:
+        proxy_base = _news_external_base()
+    except Exception:
+        proxy_base = ''
     for art in need:
-        ft = found.get(art.get('article_url'))
-        if not ft:
+        row = found.get(art.get('article_url'))
+        if not row:
             continue
-        # AUCH gespeicherten (evtl. vor dem Cruft-Fix gecachten) Text putzen —
-        # sonst überschreibt alter Cruft-Cache den frisch gestrippten RSS-Text.
-        try:
-            ft = _strip_feed_cruft(ft, source_name=art.get('source_name'))
-        except Exception:
-            pass
-        art['fulltext'] = ft[:_FULLTEXT_FEED_CAP]
-        if len(ft) >= _FULLTEXT_READABLE_MIN_CHARS:
-            art['in_app_readable'] = True
+        ft = row.get('fulltext')
+        if ft and not art.get('fulltext'):
+            # AUCH gespeicherten (evtl. vor dem Cruft-Fix gecachten) Text putzen —
+            # sonst überschreibt alter Cruft-Cache den frisch gestrippten RSS-Text.
+            try:
+                ft = _strip_feed_cruft(ft, source_name=art.get('source_name'))
+            except Exception:
+                pass
+            art['fulltext'] = ft[:_FULLTEXT_FEED_CAP]
+            if len(ft) >= _FULLTEXT_READABLE_MIN_CHARS:
+                art['in_app_readable'] = True
+        # Gespeichertes Artikel-Bild an Feed-Artikel ohne RSS-Bild hängen
+        # (proxied wie alle Feed-Bilder; Original als Debug-Fallback).
+        img = (row.get('image_url') or '').strip()
+        if img and not art.get('image_url'):
+            proxied = _news_proxy_url(img, proxy_base) if proxy_base else None
+            art['image_url'] = proxied or img
+            art['image_url_original'] = img
 
 
 # ══════════════════════════════════════════════════════════════════

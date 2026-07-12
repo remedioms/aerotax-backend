@@ -294,3 +294,75 @@ def test_fr24_cache_evicts_oldest_quarter_not_all():
     assert 300 < len(BP._FR24_REG_CACHE) < 501
     assert 'k500' in BP._FR24_REG_CACHE      # jüngster Eintrag bleibt
     assert 'k0' not in BP._FR24_REG_CACHE    # ältester Eintrag flog raus
+
+
+# ── PLAN-Tier (Owner 2026-07-12: „Suche LH545 → leere Seite") ────────────────
+#
+# resolve_unified_flight lieferte found:false, wenn ein Flug für den Tag
+# nirgends beobachtet war (Abend-Flug noch nicht am Board / Abflughafen nicht
+# gescraped). Der Plan-Tier antwortet dann mit dem jüngsten board-verifizierten
+# Leg derselben Flugnummer aus `flights` — ehrlich als Plan markiert.
+
+_PLAN_AIRPORTS = {
+    'FRA': {'iata': 'FRA', 'icao': 'EDDF', 'city': 'Frankfurt am Main',
+            'name': 'Frankfurt Main Airport', 'lat': 50.03, 'lon': 8.56},
+    'BOG': {'iata': 'BOG', 'icao': 'SKBO', 'city': 'Bogota',
+            'name': 'El Dorado International Airport', 'lat': 4.7, 'lon': -74.1},
+}
+
+
+def _plan_core_env(monkeypatch, leg):
+    """Kaskade leer mocken (kein Live, keine Route, keine Board-Fakten) und
+    NUR den Plan-Tier mit `leg` füttern."""
+    import blueprints.warehouse_reader as WR
+    monkeypatch.setattr(BP, '_aircraft_live_flight', lambda **kw: None)
+    monkeypatch.setattr(WR, 'route_for_flight', lambda **kw: {})
+    monkeypatch.setattr(BP, '_flight_facts_from_obs',
+                        lambda *a, **kw: {})
+    monkeypatch.setattr(BP, '_plan_leg_from_warehouse',
+                        lambda fn, max_age_days=45: leg)
+    monkeypatch.setattr(BP, '_airport_row',
+                        lambda c: _PLAN_AIRPORTS.get((c or '').upper()))
+
+
+def test_uflight_plan_tier_returns_plan_route_and_times(monkeypatch):
+    leg = {'op_flight_no': 'LH545', 'origin': 'FRA', 'destination': 'BOG',
+           'service_date': '2026-07-05',
+           'sched_dep': '2026-07-05T20:05:00+00:00',
+           'sched_arr': '2026-07-06T04:15:00+00:00'}
+    _plan_core_env(monkeypatch, leg)
+    res = BP._resolve_unified_flight_core('LH545', '2026-07-12', False,
+                                          None, None, False)
+    assert res['found'] is True
+    assert res['plan'] is True and res['meta']['plan'] is True
+    assert res['meta']['route_source'] == 'warehouse_plan'
+    assert res['meta']['route_confidence'] == 'plan'
+    assert res['route']['origin']['iata'] == 'FRA'
+    assert res['route']['destination']['iata'] == 'BOG'
+    # Slot des letzten Legs auf den angefragten Tag gelegt; Overnight-Offset
+    # (+1 Tag) der Ankunft bleibt erhalten. NUR sched, nie est (nichts Ist-iges).
+    assert res['times']['sched_dep'].startswith('2026-07-12T20:05')
+    assert res['times']['sched_arr'].startswith('2026-07-13T04:15')
+    assert res['times']['est_dep'] is None and res['times']['est_arr'] is None
+    # Keine erfundene Maschine: die Reg des historischen Legs wird NICHT behauptet.
+    assert res['aircraft']['reg'] is None
+
+
+def test_uflight_plan_tier_not_for_callsign_queries(monkeypatch):
+    """Funknamen-Queries (Radar) bleiben ehrlich found:false — der Plan-Tier
+    ist eine Flugnummern-Antwort (Suche), kein Radar-Kandidat."""
+    leg = {'op_flight_no': 'LH545', 'origin': 'FRA', 'destination': 'BOG',
+           'service_date': '2026-07-05',
+           'sched_dep': '2026-07-05T20:05:00+00:00',
+           'sched_arr': '2026-07-06T04:15:00+00:00'}
+    _plan_core_env(monkeypatch, leg)
+    res = BP._resolve_unified_flight_core('DLH545', '2026-07-12', True,
+                                          None, None, False)
+    assert res['found'] is False
+
+
+def test_plan_times_for_date_unparsable_is_empty():
+    assert BP._plan_times_for_date({'service_date': 'kaputt'}, '2026-07-12') == {}
+    assert BP._plan_times_for_date(
+        {'service_date': '2026-07-05', 'sched_dep': None, 'sched_arr': None},
+        '2026-07-12') == {}

@@ -38,8 +38,20 @@ build_live_lookup = reiner aircraft_live-Read) geben keinen Cent aus.
 Consumers: app.py get_friends_today (Feld `crew_state` pro Freund) und
 blueprints/family_watch._load_crew_status_for_family (Feld `crew_state` im
 Status) — beide ADDITIV, alle Altfelder bleiben für alte Builds unverändert.
+
+PRE-FLIGHT-TIMELINE (Owner 2026-07-12, ADDITIV): im Zustand `pre_flight`
+trägt das Ergebnis zusätzlich `pre_phase` + `pre_phase_label` — die
+feingranulare Vor-Abflug-Phase, SERVERSEITIG berechnet (iOS zeigt nur an):
+  OUTSTATION  checkin_open → crewbus (ab iCal-Pickup) → security (ab Pickup +
+              Crewbus-Fahrtzeit-Default) → prep → boarding (nur BEOBACHTET)
+  HOMEBASE    checkin_open → commute (ab Report − selbst angegebene Fahrzeit)
+              → briefing (ab Report/ical_start) → prep → boarding (beobachtet)
+Fehlt ein Baustein (kein Pickup im iCal, keine commute_minutes, kein
+Boarding-Signal) wird seine Phase EHRLICH übersprungen — nie geratene Zeiten.
+Details/Quellen: siehe Kommentarblock über den PRE_*-Konstanten.
 """
 import datetime as _dt
+import re as _re
 
 # ── Zustände (Kontrakt mit iOS) ──────────────────────────────────────────────
 STATE_HOME = 'home'            # kein Dienst / Feierabend an der Homebase
@@ -56,6 +68,205 @@ _ARR_BUFFER_MIN = 40           # Verspätungs-Puffer ohne jede Beobachtung
 _LANDED_RECENT_MIN = 90        # „Gelandet in X" statt „Layover X" nach Landung
 _STALE_GROUNDED_MIN = 30       # grounded-Obs nach Plan-Ankunft+30' → Live-Check
 _NEAR_AIRPORT_KM = 8.0         # „am Boden nahe Flughafen"-Radius (Gegencheck)
+
+# ── PRE-FLIGHT-TIMELINE (Owner 2026-07-12) ──────────────────────────────────
+# Feingranulare Phase VOR dem Abflug (nur state == pre_flight; zwischen zwei
+# Legs höchstens prep/boarding). Kontrakt mit iOS (ADDITIV — alte Builds
+# ignorieren die Felder, iOS-Fallback = exakt bisheriges Verhalten):
+#   pre_phase ∈ checkin_open | commute | briefing | crewbus | security |
+#               prep | boarding   (None außerhalb von pre_flight)
+#   pre_phase_label = fertiger deutscher Anzeige-Text (iOS zeigt 1:1).
+# Quellen je Baustein — NICHTS wird erfunden, fehlt ein Baustein wird seine
+# Phase übersprungen und die nächste Grenze gilt:
+#   • Pickup            echte Hotel-Bus-Zeit aus dem Roh-iCal-Summary
+#                       („13:35 LT Pickup BLL" / „Pickup 1430") — Server-
+#                       Nachbau der iOS-Referenz-Regexe
+#                       RosterLabels.pickupTimeFromSummary (parse_pickup_hhmm),
+#                       als aware-UTC via pre_ctx['pickup'] injiziert.
+#   • Crewbus-Fahrtzeit KEIN echtes Signal verfügbar → dokumentierte
+#                       Default-Konstante _CREWBUS_RIDE_MIN.
+#   • Fahrt z. Flughafen pre_ctx['commute_minutes'] — vom Crew-Mitglied SELBST
+#                       angegebene Fahrzeit (Profil-Feld commute_minutes,
+#                       ÖPNV/Auto). Fehlt sie → Phase wird übersprungen.
+#   • Briefing/Report   pre_ctx['report'] (korrigierter ical_start des Tages,
+#                       app._corrected_briefing_start_iso hat LT→UTC schon
+#                       beim Import gelöst). Nur an der HOMEBASE — am Layover
+#                       gibt es kein Briefing (iOS-Outstation-Gate-Parität).
+#   • Boarding          NUR BEOBACHTET (Board-Status enthält Boarding/Last
+#                       Call/…). „Board schlägt Uhr" in BEIDE Richtungen:
+#                       frühes Boarding kippt sofort auf boarding; OHNE Signal
+#                       bleibt es bei prep — die Uhr allein macht nie ein
+#                       Boarding (nichts erfinden).
+PRE_CHECKIN = 'checkin_open'   # ab Beginn des pre_flight-Fensters (= das
+                               # bestehende Bordkarten-/Check-in-Fenster:
+                               # heutiger Betriebstag bzw. crew_state_next
+                               # binnen 24 h vor Abflug — KEIN eigenes Gate)
+PRE_COMMUTE = 'commute'        # HOMEBASE: ab Report − commute_minutes
+PRE_BRIEFING = 'briefing'      # HOMEBASE: ab Report-/Briefing-Zeit
+PRE_CREWBUS = 'crewbus'        # OUTSTATION: ab iCal-Pickup-Zeit
+PRE_SECURITY = 'security'      # OUTSTATION: ab Pickup + _CREWBUS_RIDE_MIN
+PRE_PREP = 'prep'              # ab eff. Abflug − _PREP_BEFORE_DEP_MIN
+PRE_BOARDING = 'boarding'      # nur bei beobachtetem Boarding-Board-Status
+
+PRE_PHASE_LABEL = {
+    PRE_CHECKIN: 'Check-in offen',
+    PRE_COMMUTE: 'Fahrt zum Flughafen',
+    PRE_BRIEFING: 'Briefing',
+    PRE_CREWBUS: 'Im Crewbus',
+    PRE_SECURITY: 'Durch die Security',
+    PRE_PREP: 'Flugvorbereitung',
+    PRE_BOARDING: 'Boarding',
+}
+
+_CREWBUS_RIDE_MIN = 25         # Default Hotel→Terminal-Fahrtzeit (Minuten) —
+                               # bewusst Konstante: es gibt keine echte Quelle
+                               # pro Hotel; 25' ist der LH-übliche Richtwert.
+_PREP_BEFORE_DEP_MIN = 40      # „Flugvorbereitung" ab eff. Abflug − 40 min
+                               # (Zeit-Heuristik NUR fürs Label, s.o.)
+_PRE_LEAD_MAX_MIN = 6 * 60     # Plausibilitäts-Fenster wie iOS
+                               # RosterLabels.maxLeadWindowMinutes: eine Marke
+                               # >6 h vor dem Plan-Abflug ist inkonsistent →
+                               # verwerfen statt raten
+_REPORT_MIN_LEAD_MIN = 15      # Report <15 min vor Abflug = implausibel
+
+# Boarding-Beobachtung: Board-Status-Tokens, die „Boarding läuft" belegen
+# (Vokabular der Board-Normalisierer in app.py: Boarding/Last Call/Gate zu/
+# 登机→Boarding). NICHT dabei: gate open/go to gate (Gate offen ≠ Boarding
+# gestartet). Deboarding/Ausstieg (Ankunftsseite) wird explizit ausgeschlossen.
+_BOARDING_WORDS = ('boarding', 'einsteigen', 'last call', 'final call',
+                   'gate closed', 'gate zu', 'letzter aufruf')
+
+
+def _status_is_boarding(status):
+    """True, wenn der Board-Status-String beobachtetes Boarding belegt."""
+    s = str(status or '').strip().lower()
+    if not s or 'deboard' in s or 'ausstieg' in s:
+        return False
+    return any(t in s for t in _BOARDING_WORDS)
+
+
+# Pickup-Regexe — SERVER-NACHBAU der iOS-Referenz (RosterLabels.swift
+# pickupTimeFromSummary, dort mit Testabdeckung ReportTimeTests): LH schreibt
+# Pickup-VEVENTs uneinheitlich, beide Reihenfolgen UND beide Zeitformate
+# kommen real vor: „09:30 LT Pickup HND" und „Pickup 1430".
+_PICKUP_TIME_PAT = r'(\d{1,2}:\d{2}|\d{3,4})'
+_PICKUP_RES = (
+    _re.compile(_PICKUP_TIME_PAT + r'\s*(?:LT|UTC|Z|L)?\s*[-–]?\s*Pickup',
+                _re.IGNORECASE),
+    _re.compile(r'Pickup\s*(?:um|at|:)?\s*' + _PICKUP_TIME_PAT,
+                _re.IGNORECASE),
+)
+
+
+def parse_pickup_hhmm(summary):
+    """Explizite Pickup-/Hotel-Bus-Zeit aus einem Roster-Summary → (hh, mm)
+    oder None. Akzeptiert „HH:MM" und 3–4-stellige Militärzeit („1430"),
+    verwirft Unplausibles (h≥24/m≥60, z. B. „Pickup 2599") — nie raten."""
+    s = str(summary or '').strip()
+    if not s or 'pickup' not in s.lower():
+        return None
+    for rx in _PICKUP_RES:
+        m = rx.search(s)
+        if not m:
+            continue
+        t = m.group(1)
+        if ':' in t:
+            hh, mm = t.split(':', 1)
+        else:
+            hh, mm = t[:-2], t[-2:]
+        try:
+            hh, mm = int(hh), int(mm)
+        except ValueError:
+            continue
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return (hh, mm)
+    return None
+
+
+def pickup_utc_for_leg(hhmm, dep_iso, tzname):
+    """Lokale Pickup-„HH:MM" (Ortszeit an der ABFLUG-Station des ersten Legs —
+    dort steht das Hotel) → aware-UTC-Zeitpunkt, verankert am lokalen
+    Kalendertag des Abflugs; liegt das Ergebnis NACH dem Abflug
+    (Mitternachts-Wrap: Pickup 23:00, Abflug 00:30), wird ein Tag abgezogen.
+    Plausibilität wie iOS (maxLeadWindow): Pickup muss binnen 6 h VOR dem
+    Plan-Abflug liegen, sonst None (nie geratene Zeiten). Wirft nie."""
+    try:
+        dep = _parse_iso(dep_iso)
+        if dep is None or not tzname or not hhmm:
+            return None
+        from zoneinfo import ZoneInfo
+        dep_local = dep.astimezone(ZoneInfo(str(tzname)))
+        p = dep_local.replace(hour=int(hhmm[0]), minute=int(hhmm[1]),
+                              second=0, microsecond=0)
+        if p > dep_local:
+            p -= _dt.timedelta(days=1)
+        lead_min = (dep_local - p).total_seconds() / 60.0
+        if not (0 <= lead_min <= _PRE_LEAD_MAX_MIN):
+            return None
+        return p.astimezone(_dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def _resolve_pre_phase(leg, now, eff_dep, pre_ctx, hb, first_leg):
+    """Feingranulare Vor-Abflug-Phase (siehe PRE_*-Block). Reine
+    Zeitvergleiche: alle bekannten Phasen-Startmarken sammeln, die SPÄTESTE
+    Marke ≤ now gewinnt. Unbekannte Marken fehlen einfach in der Liste →
+    die Phase wird übersprungen, die nächste Grenze gilt (nichts erfinden).
+    Boarding ist KEINE Zeitmarke, sondern nur beobachtet (Board schlägt Uhr
+    in beide Richtungen). Zwischen zwei Legs (first_leg=False, Turnaround am
+    Flugzeug) gibt es keine Checkin-/Anfahrts-Phasen — nur prep/boarding."""
+    o = leg.get('obs') or {}
+    if _status_is_boarding(o.get('status')):
+        return PRE_BOARDING
+    prep_start = eff_dep - _dt.timedelta(minutes=_PREP_BEFORE_DEP_MIN)
+    if not first_leg:
+        return PRE_PREP if now >= prep_start else None
+    # (start | None=-inf, rank, phase) — rank bricht Zeit-Gleichstand
+    # zugunsten der späteren Timeline-Stufe.
+    marks = [(None, 0, PRE_CHECKIN), (prep_start, 5, PRE_PREP)]
+    ctx = pre_ctx if isinstance(pre_ctx, dict) else {}
+    plan_dep = leg['dep']
+
+    def _lead_ok(mark, min_lead=0):
+        lead = (plan_dep - mark).total_seconds() / 60.0
+        return min_lead <= lead <= _PRE_LEAD_MAX_MIN
+
+    pickup = _parse_iso(ctx.get('pickup'))
+    if pickup is not None and not _lead_ok(pickup):
+        pickup = None
+    if hb and leg['dep_ap'] == hb:
+        # HOMEBASE-Kette: commute → briefing (Report-Zeit nötig; Pickup-Guard:
+        # ein Report, der exakt der Pickup-Zeit entspricht, ist der Hotel-Bus-
+        # DTSTART, kein Briefing — iOS-Paritaet).
+        report = _parse_iso(ctx.get('report'))
+        if report is not None and (not _lead_ok(report, _REPORT_MIN_LEAD_MIN)
+                                   or (pickup is not None and report == pickup)):
+            report = None
+        if report is not None:
+            marks.append((report, 3, PRE_BRIEFING))
+            cm = ctx.get('commute_minutes')
+            if isinstance(cm, (int, float)) and not isinstance(cm, bool) \
+                    and 0 < cm <= _PRE_LEAD_MAX_MIN:
+                marks.append((report - _dt.timedelta(minutes=int(cm)),
+                              2, PRE_COMMUTE))
+    elif pickup is not None:
+        # OUTSTATION-Kette (Abflug nicht an der Homebase — oder Homebase
+        # unbekannt, aber ein Hotel-Pickup existiert nur am Layover):
+        # crewbus → security.
+        marks.append((pickup, 3, PRE_CREWBUS))
+        marks.append((pickup + _dt.timedelta(minutes=_CREWBUS_RIDE_MIN),
+                      4, PRE_SECURITY))
+    best = None
+    floor = _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+    for t, rank, phase in marks:
+        if t is not None and t > now:
+            continue
+        key = (t or floor, rank)
+        if best is None or key >= best[0]:
+            best = (key, phase)
+    return best[1] if best else None
+
 
 # Default-Status-Buckets — Consumers reichen app._flight_status_bucket rein
 # (DIE eine Wahrheit); diese Listen sind nur der abgespeckte Offline-Fallback.
@@ -160,7 +371,7 @@ def _fmt_reg(r):
 def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                             homebase=None, layover_iata=None, duty=None,
                             city_lookup=None, local_hhmm=None,
-                            status_bucket=None):
+                            status_bucket=None, pre_ctx=None):
     """DER Crew-Live-State-Resolver (pur, wirft nie — siehe Modul-Docstring).
 
     Args:
@@ -180,11 +391,17 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                    (Fallback: UTC).
       status_bucket: callable(status_str) → 'landed'|'airborne'|'grounded'|None
                    (Consumers reichen app._flight_status_bucket — EINE Wahrheit).
+      pre_ctx:     optionale PRE-FLIGHT-TIMELINE-Bausteine (siehe PRE_*-Block):
+                   {'pickup': aware-UTC/ISO|None (iCal-Hotel-Bus),
+                    'report': aware-UTC/ISO|None (korrigierter Briefing-Start),
+                    'commute_minutes': int|None (selbst angegebene Fahrzeit)}.
+                   None/leer = Phasen ehrlich reduziert (checkin/prep/boarding).
 
     Returns dict:
       {state, leg_index, current_leg: {dep,arr,flight_no,dep_iso,arr_iso,reg}
        | None, position: {lat,lon,ts,source} | None,
-       text: {title, subtitle}, confidence: 'observed'|'plan'}
+       text: {title, subtitle}, confidence: 'observed'|'plan',
+       pre_phase: PRE_*|None, pre_phase_label: str|None  (ADDITIV 2026-07-12)}
     """
     now = _parse_iso(now) or _dt.datetime.now(_dt.timezone.utc)
     bucket_of = status_bucket if callable(status_bucket) else _default_bucket
@@ -274,7 +491,7 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                 'source': lv.get('source') or 'aircraft_live'}
 
     def _result(state, leg=None, idx=None, position=None, title=None,
-                subtitle=None, confidence=CONF_PLAN):
+                subtitle=None, confidence=CONF_PLAN, pre_phase=None):
         return {
             'state': state,
             'leg_index': idx,
@@ -282,6 +499,10 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             'position': position,
             'text': {'title': title, 'subtitle': subtitle},
             'confidence': confidence,
+            # PRE-FLIGHT-TIMELINE (ADDITIV 2026-07-12): Phase + fertiger
+            # Anzeigetext; None außerhalb von pre_flight/Turnaround-prep.
+            'pre_phase': pre_phase,
+            'pre_phase_label': PRE_PHASE_LABEL.get(pre_phase),
         }
 
     # ── Leg-loser Tag: standby / Layover-Ruhetag / wirklich kein Dienst ─────
@@ -463,14 +684,22 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
     t = hhmm(eff_dep, leg['dep_ap'])
     wait_txt = (f"Wartet auf {leg['flight']} · {t}" if leg['flight'] and t
                 else (f'Wartet auf den Abflug · {t}' if t else 'Wartet auf den Abflug'))
+    # PRE-FLIGHT-TIMELINE (Owner 2026-07-12): feingranulare Phase aus reinen
+    # Zeitvergleichen (now vs. berechnete Marken) + Boarding-Beobachtung.
+    pre = _resolve_pre_phase(leg, now, eff_dep, pre_ctx, hb,
+                             first_leg=(idx == 0))
     if idx == 0:
+        route = f"{leg['dep_ap']} → {leg['arr_ap'] or '?'}"
+        # Fertiger Text in der Subtitle (Owner-Spez): alte Builds zeigen die
+        # angereicherte Prosa, neue lesen zusätzlich pre_phase(_label).
+        sub = f'{route} · {PRE_PHASE_LABEL[pre]}' if pre else route
         return _result(STATE_PRE_FLIGHT, leg=leg, idx=idx, title=wait_txt,
-                       subtitle=f"{leg['dep_ap']} → {leg['arr_ap'] or '?'}",
-                       confidence=conf)
+                       subtitle=sub, confidence=conf, pre_phase=pre)
     # Zwischen zwei Legs: gelandet am Abflughafen des kommenden Legs.
+    # pre ist hier höchstens prep/boarding (Turnaround am Flugzeug).
     return _result(STATE_LANDED, leg=leg, idx=idx,
                    title=f"Gelandet in {city(leg['dep_ap'])}",
-                   subtitle=wait_txt, confidence=conf)
+                   subtitle=wait_txt, confidence=conf, pre_phase=pre)
 
 
 # ── Frische-Wahl: Briefing schlägt stalen Snapshot ───────────────────────────

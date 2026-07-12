@@ -208,7 +208,10 @@ def test_boden_nahe_dep_schlaegt_plan_fenster():
     assert r['leg_index'] == 0
     assert r['confidence'] == CONF_OBSERVED
     assert r['text']['title'] == 'Wartet auf LH1139 · 06:40'
-    assert r['text']['subtitle'] == 'BCN → FRA'
+    # PRE-FLIGHT-TIMELINE (2026-07-12): 07:30 ≥ eff_dep−40 → „Flugvorbereitung"
+    # hängt an der Route (fertiger Text in der Subtitle, Owner-Spez).
+    assert r['text']['subtitle'] == 'BCN → FRA · Flugvorbereitung'
+    assert r['pre_phase'] == 'prep'
     assert r['position'] is None   # am Boden = keine Live-Flug-Position
 
 
@@ -335,7 +338,7 @@ def test_friends_today_payload_traegt_crew_state():
          patch.object(A, '_roster_snapshot_read',
                       return_value={'taken_at': _iso_z(now), 'tage': [day]}), \
          patch.object(A, '_friend_briefing_day_sectors',
-                      return_value=(None, None)), \
+                      return_value=(None, None, None, None)), \
          patch.object(A, '_flight_obs_merged', return_value=None), \
          patch('blueprints.aerox_data_blueprint._aircraft_live_pos',
                return_value=(None, None, None, None)), \
@@ -438,7 +441,7 @@ def _instore_friends_today(fr, store_sectors, snap_taken_at,
          patch.object(A, '_roster_snapshot_read',
                       return_value={'taken_at': snap_taken_at, 'tage': []}), \
          patch.object(A, '_friend_briefing_day_sectors',
-                      return_value=(brief_sectors, brief_ts)), \
+                      return_value=(brief_sectors, brief_ts, None, None)), \
          patch.object(A, '_flight_obs_merged', return_value=None), \
          patch('blueprints.aerox_data_blueprint._aircraft_live_pos',
                return_value=(None, None, None, None)), \
@@ -525,3 +528,189 @@ def test_airborne_obs_ohne_ankunftsboard_kippt_zum_naechsten_leg():
     assert res['state'] == 'flying'
     assert res['current_leg']['flight_no'] == 'LH803'
     assert res['current_leg']['dep'] == 'ARN' and res['current_leg']['arr'] == 'FRA'
+
+
+# ── PRE-FLIGHT-TIMELINE (Owner 2026-07-12) ───────────────────────────────────
+# Feingranulare Vor-Abflug-Phase: OUTSTATION checkin→crewbus(Pickup)→security
+# (Pickup+25')→prep→boarding(beobachtet) · HOMEBASE checkin→commute(Report−
+# eigene Fahrzeit)→briefing(Report)→prep→boarding. Fehlende Bausteine werden
+# EHRLICH übersprungen; Boarding kommt NIE von der Uhr, nur vom Board.
+
+from datetime import timedelta as _td                     # noqa: E402
+from blueprints.crew_live_state import (                  # noqa: E402
+    parse_pickup_hhmm, pickup_utc_for_leg,
+    PRE_CHECKIN, PRE_COMMUTE, PRE_BRIEFING, PRE_CREWBUS, PRE_SECURITY,
+    PRE_PREP, PRE_BOARDING,
+)
+
+# Leg 1 (BCN→FRA, dep 06:40Z) startet an der OUTSTATION (hb=FRA):
+# Pickup 04:30Z → Crewbus 04:30–04:55, Security 04:55–06:00, Prep ab 06:00.
+_PICKUP_UTC = _utc(4, 30)
+_OUT_CTX = {'pickup': _PICKUP_UTC, 'report': None, 'commute_minutes': None}
+
+# HOMEBASE-Tag: erster Leg FRA→ARN (dep 10:10Z), Report 08:35Z, Fahrzeit 45' →
+# Commute 07:50–08:35, Briefing 08:35–09:30, Prep ab 09:30.
+_HB_SECTORS = [SECTORS[1]]
+_HB_CTX = {'pickup': None, 'report': '2026-07-09T08:35:00Z',
+           'commute_minutes': 45}
+
+
+def test_pre_outstation_checkin_vor_pickup():
+    r = _resolve(_utc(3, 0), pre_ctx=_OUT_CTX)
+    assert r['state'] == STATE_PRE_FLIGHT
+    assert r['pre_phase'] == PRE_CHECKIN
+    assert r['pre_phase_label'] == 'Check-in offen'
+    assert r['text']['subtitle'] == 'BCN → FRA · Check-in offen'
+
+
+def test_pre_outstation_crewbus_ab_pickup():
+    r = _resolve(_utc(4, 35), pre_ctx=_OUT_CTX)
+    assert r['pre_phase'] == PRE_CREWBUS
+    assert r['pre_phase_label'] == 'Im Crewbus'
+    assert r['text']['subtitle'] == 'BCN → FRA · Im Crewbus'
+
+
+def test_pre_outstation_security_nach_crewbusfahrt():
+    # Pickup + 25-min-Default-Fahrtzeit = 04:55 → ab da „Durch die Security".
+    r = _resolve(_utc(5, 10), pre_ctx=_OUT_CTX)
+    assert r['pre_phase'] == PRE_SECURITY
+    assert r['pre_phase_label'] == 'Durch die Security'
+
+
+def test_pre_outstation_ohne_pickup_ueberspringt_phasen():
+    # Kein Pickup im iCal → crewbus/security werden EHRLICH übersprungen:
+    # bis prep (06:00) bleibt es „Check-in offen", nie geratene Zeiten.
+    r = _resolve(_utc(5, 10))
+    assert r['pre_phase'] == PRE_CHECKIN
+    r2 = _resolve(_utc(6, 5))
+    assert r2['pre_phase'] == PRE_PREP
+
+
+def test_pre_prep_ab_abflug_minus_40():
+    r = _resolve(_utc(6, 5), pre_ctx=_OUT_CTX)
+    assert r['pre_phase'] == PRE_PREP
+    assert r['text']['subtitle'] == 'BCN → FRA · Flugvorbereitung'
+
+
+def test_pre_boarding_beobachtet_schlaegt_uhr_frueh():
+    # Board meldet Boarding schon um 05:10 (Uhr sagt „Security") →
+    # Beobachtung schlägt die Uhr SOFORT.
+    r = _resolve(_utc(5, 10), obs={'LH1139': {'status': 'Boarding'}},
+                 pre_ctx=_OUT_CTX)
+    assert r['state'] == STATE_PRE_FLIGHT
+    assert r['pre_phase'] == PRE_BOARDING
+    assert r['text']['subtitle'] == 'BCN → FRA · Boarding'
+
+
+def test_pre_ohne_boarding_signal_bleibt_prep():
+    # Abflug − 20 min OHNE Board-Signal → bleibt „Flugvorbereitung"
+    # (die Uhr allein macht nie ein Boarding).
+    r = _resolve(_utc(6, 20), pre_ctx=_OUT_CTX)
+    assert r['pre_phase'] == PRE_PREP
+
+
+def test_pre_deboarding_ist_kein_boarding():
+    r = _resolve(_utc(6, 20), obs={'LH1139': {'status': 'Deboarding'}},
+                 pre_ctx=_OUT_CTX)
+    assert r['pre_phase'] == PRE_PREP
+
+
+def test_pre_homebase_checkin_vor_commute():
+    r = _resolve(_utc(7, 0), sectors=_HB_SECTORS, pre_ctx=_HB_CTX)
+    assert r['state'] == STATE_PRE_FLIGHT
+    assert r['pre_phase'] == PRE_CHECKIN
+
+
+def test_pre_homebase_commute_ab_report_minus_fahrzeit():
+    r = _resolve(_utc(8, 0), sectors=_HB_SECTORS, pre_ctx=_HB_CTX)
+    assert r['pre_phase'] == PRE_COMMUTE
+    assert r['pre_phase_label'] == 'Fahrt zum Flughafen'
+    assert r['text']['subtitle'] == 'FRA → ARN · Fahrt zum Flughafen'
+
+
+def test_pre_homebase_briefing_ab_report():
+    r = _resolve(_utc(8, 40), sectors=_HB_SECTORS, pre_ctx=_HB_CTX)
+    assert r['pre_phase'] == PRE_BRIEFING
+    assert r['text']['subtitle'] == 'FRA → ARN · Briefing'
+
+
+def test_pre_homebase_prep_ab_dep_minus_40():
+    r = _resolve(_utc(9, 35), sectors=_HB_SECTORS, pre_ctx=_HB_CTX)
+    assert r['pre_phase'] == PRE_PREP
+
+
+def test_pre_homebase_ohne_commute_ueberspringt_fahrt():
+    # Crew-Mitglied hat keine Fahrzeit angegeben → „Fahrt zum Flughafen"
+    # entfällt, bis zum Briefing gilt „Check-in offen".
+    ctx = {'pickup': None, 'report': '2026-07-09T08:35:00Z',
+           'commute_minutes': None}
+    r = _resolve(_utc(8, 0), sectors=_HB_SECTORS, pre_ctx=ctx)
+    assert r['pre_phase'] == PRE_CHECKIN
+    r2 = _resolve(_utc(8, 40), sectors=_HB_SECTORS, pre_ctx=ctx)
+    assert r2['pre_phase'] == PRE_BRIEFING
+
+
+def test_pre_homebase_ohne_report_ueberspringt_briefing():
+    # Ohne Report-Zeit gibt es weder commute noch briefing (commute hängt am
+    # Report-Anker) → Check-in bis prep.
+    ctx = {'pickup': None, 'report': None, 'commute_minutes': 45}
+    r = _resolve(_utc(8, 40), sectors=_HB_SECTORS, pre_ctx=ctx)
+    assert r['pre_phase'] == PRE_CHECKIN
+
+
+def test_pre_flying_und_cancelled_ohne_pre_phase():
+    r = _resolve(_utc(7, 0), obs={'LH1139': {'status': 'airborne'}})
+    assert r['state'] == STATE_FLYING
+    assert r['pre_phase'] is None and r['pre_phase_label'] is None
+    r2 = _resolve(_utc(5, 0), obs={'LH1139': {'cancelled': True}})
+    assert r2['pre_phase'] is None
+
+
+def test_pre_turnaround_zwischen_legs_nur_prep():
+    # Leg 1 gelandet, Crew wartet auf Leg 2 (dep 10:10): am Turnaround gibt es
+    # keine Checkin-/Anfahrts-Prosa — erst ab dep−40 „Flugvorbereitung".
+    obs = {'LH1139': {'status': 'Gelandet'}}
+    r = _resolve(_utc(9, 0), obs=obs)
+    assert r['state'] == STATE_LANDED
+    assert r['pre_phase'] is None
+    r2 = _resolve(_utc(9, 45), obs=obs)
+    assert r2['state'] == STATE_LANDED
+    assert r2['pre_phase'] == PRE_PREP
+    assert r2['text']['subtitle'] == 'Wartet auf LH802 · 10:10'   # unverändert
+
+
+# ── Pickup-Parser (Server-Nachbau der iOS-Referenz-Regexe) ──────────────────
+
+def test_parse_pickup_beide_schreibweisen():
+    assert parse_pickup_hhmm('13:35 LT Pickup BLL') == (13, 35)
+    assert parse_pickup_hhmm('Pickup 1430') == (14, 30)
+    assert parse_pickup_hhmm('LAYOVER · Pickup 0930 HND · LH 717: HND-FRA') == (9, 30)
+    assert parse_pickup_hhmm('Pickup: 14:30') == (14, 30)
+    assert parse_pickup_hhmm('Pickup um 07:05') == (7, 5)
+    assert parse_pickup_hhmm('09:30 LT - Pickup HND') == (9, 30)
+
+
+def test_parse_pickup_nichts_erfinden():
+    assert parse_pickup_hhmm('LAYOVER (Tag 3/3) · LH 717: HND-FRA') is None
+    assert parse_pickup_hhmm('Pickup 2599') is None      # unplausible Zeit
+    assert parse_pickup_hhmm(None) is None
+    assert parse_pickup_hhmm('') is None
+
+
+def test_pickup_utc_ortszeit_der_station():
+    # Abflug 06:40Z = 08:40 Europe/Madrid → Pickup „06:30" lokal = 04:30Z.
+    p = pickup_utc_for_leg((6, 30), '2026-07-09T06:40:00Z', 'Europe/Madrid')
+    assert p == _utc(4, 30)
+
+
+def test_pickup_utc_mitternachts_wrap():
+    # Abflug 00:30Z (02:30 lokal Madrid), Pickup „23:45" → VORTAG 21:45Z.
+    p = pickup_utc_for_leg((23, 45), '2026-07-09T00:30:00Z', 'Europe/Madrid')
+    assert p == datetime(2026, 7, 8, 21, 45, tzinfo=timezone.utc)
+
+
+def test_pickup_utc_unplausibel_verworfen():
+    # > 6 h vor dem Abflug (Fenster wie iOS maxLeadWindow) → None.
+    assert pickup_utc_for_leg((1, 0), '2026-07-09T06:40:00Z',
+                              'Europe/Madrid') is None
+    assert pickup_utc_for_leg((6, 30), '2026-07-09T06:40:00Z', None) is None
