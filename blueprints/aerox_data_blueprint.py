@@ -4118,8 +4118,14 @@ def ax_flown_track():
     arr = _norm_iata(request.args.get('arr')) if request.args.get('arr') else None
     if not reg and not flight_no:
         return jsonify({'ok': False, 'error': 'reg_or_flight_required'}), 400
+    # hex früh parsen: er entscheidet unten über Frische-Gate (Tier 1) und
+    # Tier-2-Verfügbarkeit → muss darum auch in den Memo-Key (sonst teilen sich
+    # Radar-Tap mit hex und MyPlane ohne hex denselben Cache-Eintrag und kriegen
+    # inkonsistente Antworten).
+    q_hex = (request.args.get('hex') or '').strip().lower() or None
 
-    memo_key = ('flown_track', reg, flight_no or '', date or '', dep or '', arr or '')
+    memo_key = ('flown_track', reg, flight_no or '', date or '', dep or '', arr or '',
+                q_hex or '')
     cached = _memo_get(memo_key)
     if cached is not None:
         return jsonify(cached)
@@ -4164,9 +4170,14 @@ def ax_flown_track():
     # Live-Abfrage (heute/kein Datum): stale Segmente verwerfen, damit FR24 den
     # aktuellen Anflug liefert (s. Frische-Gate). Vergangenheit: Staleness ist ok.
     _live = (not date) or (date == time.strftime('%Y-%m-%d', time.gmtime()))
+    # Frische-Gate NUR wenn Tier 2 das stale Segment ersetzen KANN (= hex dabei,
+    # Radar-Tap). Hex-lose Aufrufer (MyPlane/FlightInfoView/Crew-Karten) haben
+    # kein Tier 2 mehr (s.u.) — für die ist eine 35-min-alte ECHTE Spur besser
+    # als der Großkreis, auf den sie sonst degradieren (Owner 2026-07-12,
+    # „gespeicherte Route funktioniert nicht mehr zuverlässig").
     points, reg_used, dep, arr = _flown_track_db(
         reg, flight_no, dep, arr, lo_iso, hi_iso,
-        fresh_max_s=(30 * 60 if _live else None))
+        fresh_max_s=(30 * 60 if (_live and q_hex) else None))
     reg = reg or (reg_used or '')
 
     # Tier 1b (Permanenz): vergangenes Leg außerhalb der Roh-Retention →
@@ -4193,7 +4204,6 @@ def ax_flown_track():
             except (TypeError, ValueError):
                 return None
         q_lat, q_lon = _f(request.args.get('lat')), _f(request.args.get('lon'))
-        q_hex = (request.args.get('hex') or '').strip().lower() or None
         reg_disp = None
         if q_lat is None or q_lon is None:
             try:
@@ -4259,7 +4269,17 @@ def ax_flown_track():
             b = _iata_latlon(arr)
             if b:
                 d1 = _haversine_km(b[0], b[1], points[-1]['lat'], points[-1]['lon'])
-                if 2.0 < d1 < SNAP_KM:
+                # NIE anhängen, solange der Flieger vermutlich noch FLIEGT (Live-
+                # Abfrage + jüngster echter Fix < 20 min alt): der angehängte
+                # Airport-Punkt erzeugte in der App den Zickzack „Spur → Airport →
+                # joint zurück zum Flieger" (Owner 2026-07-12, live bewiesen an
+                # D-AIUN im FRA-Anflug: letzter Fix 100 km raus → FRA-Zentrum als
+                # Endpunkt, obwohl der Flieger erst bei 65 km war). Gelandete Flüge:
+                # die Crumbs enden mit der Landung → nach 20 min verbindet die
+                # Linie wie gehabt sauber zum Zielflughafen.
+                _lts = next((p.get('ts') for p in reversed(points) if p.get('ts')), None)
+                _still_flying = _live and bool(_lts) and (time.time() - _lts) < 20 * 60
+                if 2.0 < d1 < SNAP_KM and not _still_flying:
                     points.append({'lat': b[0], 'lon': b[1], 'alt': None, 'gs': None, 'trk': None, 'ts': None})
 
     # „Noch in der Luft?" = echte Spur, heutiges Datum, letzter Fix WEIT vom Ziel
@@ -4269,16 +4289,23 @@ def ax_flown_track():
     if source in ('aircraft_track', 'fr24_trail') and points:
         today = time.strftime('%Y-%m-%d', time.gmtime())
         if (not date) or date >= today:
-            bb = _iata_latlon(arr) if arr else None
-            if bb:
-                in_flight = _haversine_km(bb[0], bb[1], points[-1]['lat'], points[-1]['lon']) > 150.0
-            # Nur „in der Luft", wenn der letzte echte Fix frisch ist (<30 min) —
-            # eine Stunden-alte Spur weit vom Ziel ist ein abgerissener Track,
-            # kein fliegender Flieger (kein Geister-Marker).
-            if in_flight:
-                _lts = next((p.get('ts') for p in reversed(points) if p.get('ts')),
-                            None)
-                in_flight = bool(_lts) and (time.time() - _lts) < 30 * 60
+            # Auf dem letzten ECHTEN Fix rechnen (Punkt mit ts) — nie auf einem
+            # evtl. angehängten Airport-Punkt (der lag am Ziel → in_flight war für
+            # jeden Anflug fälschlich False, der ✈️-Marker fehlte genau dann).
+            _lp = next((p for p in reversed(points) if p.get('ts')), None)
+            if _lp:
+                fresh = (time.time() - _lp['ts']) < 30 * 60
+                # Boden-Heuristik: Taxi-Crumbs (Airport-Sweep, allow_ground) sind
+                # frisch, aber kein Flug — niedrig UND langsam = am Boden.
+                grounded = (_lp.get('alt') or 0) < 300 and (_lp.get('gs') or 0) < 80
+                bb = _iata_latlon(arr) if arr else None
+                d_arr = (_haversine_km(bb[0], bb[1], _lp['lat'], _lp['lon'])
+                         if bb else None)
+                # In der Luft = frischer, nicht-gegroundeter Fix, der noch nicht am
+                # Ziel angekommen ist (> 8 km ≈ kurz vorm Aufsetzen). Vorher galt
+                # erst > 150 km als „in flight" → im gesamten Anflug fehlte der
+                # Marker (live bestätigt: D-AIUN sinkend, in_flight=False).
+                in_flight = fresh and not grounded and (d_arr is None or d_arr > 8.0)
 
     out = {'ok': True, 'reg': reg or None, 'flight': flight_no, 'date': date,
            'dep': dep, 'arr': arr, 'source': source, 'in_flight': in_flight,
