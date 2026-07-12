@@ -22795,8 +22795,24 @@ def _chat_push_fanout_async(author_token, channel_id, text):
                             row = rows[0]
                             group_name = (row.get('name') or '').strip() or None
                             mem = row.get('members')
-                            cand = [row.get('owner_token')] + \
-                                   (mem if isinstance(mem, list) else [])
+                            mem_list = mem if isinstance(mem, list) else []
+                            # FANOUT-LÜCKE (Audit 2026-07-12): per Invite-Code
+                            # Beigetretene stehen nicht in members → bekamen NIE
+                            # Gruppen-Pushes. Selbst-heilend: wer POSTET, wird
+                            # hier best-effort in members nachgetragen (Cap 40).
+                            # Owner-Group-Saves können das überschreiben — der
+                            # nächste Post des Joiners repariert es wieder.
+                            try:
+                                if (author_token
+                                        and author_token != row.get('owner_token')
+                                        and author_token not in mem_list
+                                        and len(mem_list) < 40):
+                                    sb.table('user_friend_groups') \
+                                      .update({'members': mem_list + [author_token]}) \
+                                      .eq('id', gid).execute()
+                            except Exception:
+                                pass
+                            cand = [row.get('owner_token')] + mem_list
                             seen = set()
                             for m in cand:
                                 if (isinstance(m, str) and m
