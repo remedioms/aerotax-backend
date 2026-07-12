@@ -12512,11 +12512,45 @@ def get_friends_today(token):
         # iCal-Freunde-Lücke: der Resolver arbeitet auf ical_sectors und
         # braucht KEINE reader_facts.flight_numbers (Tibor-Diagnose).
         crew_state = None
+        crew_state_next = None
         if datum == _heute_berlin:
+            _hb_arg = (pr.get('homebase') or '').strip().upper() or None
             crew_state = _crew_state_for_day(
-                fr, day, datum,
-                homebase=(pr.get('homebase') or '').strip().upper() or None,
-                snap_ts=_snap_ts)
+                fr, day, datum, homebase=_hb_arg, snap_ts=_snap_ts)
+            # 24-H-FENSTER ÜBER MITTERNACHT (Owner 2026-07-12, Tibor-Fall,
+            # Crew-Feed-Härtung #1): friends-today liefert nur den heutigen
+            # Berliner Tag → das „Check-in ab 24 h vorher"-Fenster der
+            # Bordkarten konnte NIE über Mitternacht schauen (Frühflug am
+            # Vorabend unsichtbar). Zusätzlich (ADDITIV, altes Feld bleibt):
+            # ist HEUTE kein aktiver Zustand (kein pre_flight/flying) und der
+            # ERSTE Abflug von MORGEN liegt binnen 24 h → dessen crew_state
+            # als `crew_state_next` mitgeben. iOS (≥ Build 95) rendert daraus
+            # die Vorabend-Bordkarte; „Wo ist deine Crew"/Live bleiben auf
+            # dem HEUTE-Zustand (Layover-Text geht nicht verloren).
+            try:
+                if (crew_state or {}).get('state') not in ('pre_flight', 'flying'):
+                    import datetime as _cs_dt
+                    _morgen = (_cs_dt.date.fromisoformat(datum)
+                               + _cs_dt.timedelta(days=1)).isoformat()
+                    day2 = next((t for t in tage if isinstance(t, dict)
+                                 and t.get('datum') == _morgen), None)
+                    if day2:
+                        cs2 = _crew_state_for_day(
+                            fr, day2, _morgen, homebase=_hb_arg,
+                            snap_ts=_snap_ts)
+                        _leg2 = (cs2 or {}).get('current_leg') or {}
+                        _dep_iso2 = _leg2.get('dep_iso')
+                        if (cs2 or {}).get('state') == 'pre_flight' and _dep_iso2:
+                            _dep_dt2 = _cs_dt.datetime.strptime(
+                                _dep_iso2, '%Y-%m-%dT%H:%M:%SZ').replace(
+                                tzinfo=_cs_dt.timezone.utc)
+                            _rest_s = (_dep_dt2
+                                       - _cs_dt.datetime.now(_cs_dt.timezone.utc)
+                                       ).total_seconds()
+                            if 0 < _rest_s <= 24 * 3600:
+                                crew_state_next = cs2
+            except Exception:
+                crew_state_next = None
         out.append({
             'token': fr[:16] + '…',
             # Stabile match_id (Hash) statt vollem Token — iOS matcht Friend↔
@@ -12566,6 +12600,7 @@ def get_friends_today(token):
             # serverseitigem Text — iOS zeigt crew_state.text 1:1 (kein
             # lastRouteIATA-Raten mehr). None = Resolver übersprungen/Fehler.
             'crew_state': crew_state,
+            'crew_state_next': crew_state_next,
         })
     _resp = {'datum': datum, 'count': len(out), 'friends_today': out}
     if len(_FRIENDS_TODAY_MEMO) > 5000:

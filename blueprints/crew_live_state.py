@@ -227,6 +227,22 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
 
     def _current_leg(leg):
         o = leg.get('obs') or {}
+        # ANREICHERUNG (Owner 2026-07-12, Crew-Feed-Härtung #2): Ist-Zeiten/
+        # Delay/Status/Annulliert aus den SCHON GELADENEN Board-obs mitgeben —
+        # Key-Namen EXAKT wie flights_live, damit der iOS-FlightLiveEntry-
+        # Decoder sie direkt liest. Vorher war der Leg mager (nur Soll) und
+        # VERSCHATTETE die reichere Tafel-Quelle: Bordkarten zeigten nie
+        # „+X min", ein annullierter Flug wirkte als „Check-in offen".
+        # KEIN neuer Lookup hier (leg.get('obs') only) — Kosten-Gates bleiben.
+        dep_delay = _num(o.get('dep_delay_min'))
+        arr_delay = _num(o.get('arr_delay_min'))
+        if arr_delay is None:
+            arr_delay = _num(o.get('delay_min'))
+        est_dep = (leg['dep'] + _dt.timedelta(minutes=dep_delay)
+                   if dep_delay is not None else None)
+        est_arr = (leg['arr'] + _dt.timedelta(minutes=arr_delay)
+                   if (arr_delay is not None and not leg['arr_synth']) else None)
+        delay = arr_delay if arr_delay is not None else dep_delay
         return {
             'dep': leg['dep_ap'], 'arr': leg['arr_ap'],
             'flight_no': leg['flight'],
@@ -234,6 +250,15 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             'arr_iso': None if leg['arr_synth'] else _iso_z(leg['arr']),
             'reg': _fmt_reg(str(o.get('reg') or '').strip().upper()
                             or leg.get('tail')),
+            'est_dep_iso': _iso_z(est_dep) if est_dep else None,
+            'est_arr_iso': _iso_z(est_arr) if est_arr else None,
+            'delay_min': int(round(delay)) if delay is not None else None,
+            'delay_side': ('arr' if arr_delay is not None
+                           else ('dep' if dep_delay is not None else None)),
+            'delay_known': (arr_delay is not None or dep_delay is not None),
+            'status': (str(o.get('status')).strip() or None)
+                      if o.get('status') else None,
+            'cancelled': True if o.get('cancelled') else None,
         }
 
     def _position(leg):
