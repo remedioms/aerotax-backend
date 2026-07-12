@@ -4341,7 +4341,16 @@ def ax_flown_track():
             a = _iata_latlon(dep)
             if a:
                 d0 = _haversine_km(a[0], a[1], points[0]['lat'], points[0]['lon'])
-                if 2.0 < d0 < SNAP_KM:
+                # Bei LIVE-Flügen mit FRISCHEM Spur-Anfang (< 20 min = eben
+                # gestartet) NICHT ans Airport-ZENTRUM anbinden — die Gerade
+                # vom Terminal-Zentrum zum Steigflug sah aus wie „random Linie,
+                # nicht mal von der Startbahn" (Owner 2026-07-12, DLH446/CFG402).
+                # Die Linie beginnt dann ehrlich am ersten echten Punkt; mit den
+                # jetzt erfassten Taxi-Crumbs beginnt sie am Gate/Rollweg.
+                # Historische Flüge behalten das Andocken (Karte spannt die Strecke).
+                _fts = next((p2.get('ts') for p2 in points if p2.get('ts')), None)
+                _fresh_start = _live and bool(_fts) and (time.time() - _fts) < 20 * 60
+                if 2.0 < d0 < SNAP_KM and not _fresh_start:
                     points.insert(0, {'lat': a[0], 'lon': a[1], 'alt': None, 'gs': None, 'trk': None, 'ts': None})
         if arr:
             b = _iata_latlon(arr)
