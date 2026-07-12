@@ -1,0 +1,250 @@
+{
+  "count": 4,
+  "datum": "2026-07-09",
+  "friends_today": [
+    {
+      "avatar_url": "/api/avatar/kai.png",
+      "crew_state": {
+        "confidence": "observed",
+        "current_leg": {
+          "arr": "JFK",
+          "arr_iso": "2026-07-09T16:30:00Z",
+          "cancelled": null,
+          "delay_known": true,
+          "delay_min": 9,
+          "delay_side": "arr",
+          "dep": "FRA",
+          "dep_iso": "2026-07-09T08:00:00Z",
+          "est_arr_iso": "2026-07-09T16:39:00Z",
+          "est_dep_iso": "2026-07-09T08:12:00Z",
+          "flight_no": "LH400",
+          "reg": "D-AIXK",
+          "status": "airborne"
+        },
+        "leg_index": 0,
+        "position": {
+          "gs": 462.0,
+          "lat": 50.03,
+          "lon": -20.5,
+          "on_ground": false,
+          "source": "aircraft_live",
+          "track": 285.0,
+          "ts": "2026-07-09T09:58:20Z"
+        },
+        "pre_phase": null,
+        "pre_phase_label": null,
+        "state": "flying",
+        "text": {
+          "subtitle": "FRA → JFK · Ankunft 12:39",
+          "title": "Fliegt gerade"
+        }
+      },
+      "crew_state_next": null,
+      "current_city": "JFK",
+      "end": "17:05",
+      "flight_numbers": [
+        "LH400"
+      ],
+      "flights_live": [
+        {
+          "arr_delay_min": 9,
+          "arr_iata": "JFK",
+          "cancelled": false,
+          "delay_known": true,
+          "delay_min": 9,
+          "delay_side": "arr",
+          "dep_delay_min": 12,
+          "dep_iata": "FRA",
+          "est_arr_iso": "2026-07-09T16:39:00Z",
+          "est_dep_iso": "2026-07-09T08:12:00Z",
+          "flight": "LH400",
+          "live": {
+            "alt": 36000,
+            "gs": 462.0,
+            "lat": 50.03,
+            "lon": -20.5,
+            "on_ground": false,
+            "track": 285.0
+          },
+          "sched_arr_iso": "2026-07-09T16:30:00Z",
+          "sched_dep_iso": "2026-07-09T08:00:00Z",
+          "sides": [
+            "dep",
+            "arr"
+          ],
+          "status": "airborne"
+        }
+      ],
+      "homebase": "FRA",
+      "klass": "Z72",
+      "layover": "JFK",
+      "layover_city": "New York",
+      "marker": "FLUG",
+      "match_id": "0dab67731deb028a",
+      "name": "Kai Winter",
+      "route_label": "Frankfurt – New York",
+      "routing": "FRA-JFK",
+      "start": "06:55",
+      "token": "AT-GOLDEN-KAI-FL…"
+    },
+    {
+      "avatar_url": null,
+      "crew_state": {
+        "confidence": "observed",
+        "current_leg": {
+          "arr": "FRA",
+          "arr_iso": "2026-07-09T14:05:00Z",
+          "cancelled": null,
+          "delay_known": true,
+          "delay_min": 15,
+          "delay_side": "dep",
+          "dep": "BCN",
+          "dep_iso": "2026-07-09T12:10:00Z",
+          "est_arr_iso": null,
+          "est_dep_iso": "2026-07-09T12:25:00Z",
+          "flight_no": "LH1137",
+          "reg": "D-AIMD",
+          "status": "delayed"
+        },
+        "leg_index": 0,
+        "position": null,
+        "pre_phase": "crewbus",
+        "pre_phase_label": "Im Crewbus",
+        "state": "pre_flight",
+        "text": {
+          "subtitle": "BCN → FRA · Im Crewbus",
+          "title": "Wartet auf LH1137 · 14:25"
+        }
+      },
+      "crew_state_next": null,
+      "current_city": "BCN",
+      "end": "14:35",
+      "flight_numbers": [
+        "LH1137"
+      ],
+      "flights_live": [
+        {
+          "arr_delay_min": null,
+          "arr_iata": "FRA",
+          "cancelled": false,
+          "delay_known": true,
+          "delay_min": null,
+          "delay_side": "dep",
+          "dep_delay_min": 15,
+          "dep_iata": "BCN",
+          "est_arr_iso": null,
+          "est_dep_iso": "2026-07-09T12:25:00Z",
+          "flight": "LH1137",
+          "live": null,
+          "sched_arr_iso": "2026-07-09T14:05:00Z",
+          "sched_dep_iso": "2026-07-09T12:10:00Z",
+          "sides": [
+            "dep"
+          ],
+          "status": "delayed"
+        }
+      ],
+      "homebase": "FRA",
+      "klass": "Z72",
+      "layover": "BCN",
+      "layover_city": "Barcelona",
+      "marker": "FLUG",
+      "match_id": "d6f4e688b6865561",
+      "name": "Pia Sommer",
+      "route_label": "Barcelona – Frankfurt",
+      "routing": "BCN-FRA",
+      "start": "11:45",
+      "token": "AT-GOLDEN-PIA-PR…"
+    },
+    {
+      "avatar_url": null,
+      "crew_state": {
+        "confidence": "plan",
+        "current_leg": null,
+        "leg_index": null,
+        "position": null,
+        "pre_phase": null,
+        "pre_phase_label": null,
+        "state": "home",
+        "text": {
+          "subtitle": null,
+          "title": "Heute frei"
+        }
+      },
+      "crew_state_next": {
+        "confidence": "plan",
+        "current_leg": {
+          "arr": "MUC",
+          "arr_iso": "2026-07-10T07:45:00Z",
+          "cancelled": null,
+          "delay_known": false,
+          "delay_min": null,
+          "delay_side": null,
+          "dep": "HAM",
+          "dep_iso": "2026-07-10T06:30:00Z",
+          "est_arr_iso": null,
+          "est_dep_iso": null,
+          "flight_no": "LH2071",
+          "reg": null,
+          "status": null
+        },
+        "leg_index": 0,
+        "position": null,
+        "pre_phase": "checkin_open",
+        "pre_phase_label": "Check-in offen",
+        "state": "pre_flight",
+        "text": {
+          "subtitle": "HAM → MUC · Check-in offen",
+          "title": "Wartet auf LH2071 · 08:30"
+        }
+      },
+      "current_city": null,
+      "end": null,
+      "flight_numbers": [],
+      "flights_live": [],
+      "homebase": "HAM",
+      "klass": "FREI",
+      "layover": null,
+      "layover_city": null,
+      "marker": "OFF DAY",
+      "match_id": "a8ce00681d818245",
+      "name": "Ole Nord",
+      "route_label": null,
+      "routing": null,
+      "start": null,
+      "token": "AT-GOLDEN-OLE-FR…"
+    },
+    {
+      "avatar_url": null,
+      "crew_state": {
+        "confidence": "plan",
+        "current_leg": null,
+        "leg_index": null,
+        "position": null,
+        "pre_phase": null,
+        "pre_phase_label": null,
+        "state": "layover",
+        "text": {
+          "subtitle": null,
+          "title": "Layover San Francisco"
+        }
+      },
+      "crew_state_next": null,
+      "current_city": "SFO",
+      "end": null,
+      "flight_numbers": [],
+      "flights_live": [],
+      "homebase": "MUC",
+      "klass": "Z73",
+      "layover": "SFO",
+      "layover_city": "San Francisco",
+      "marker": "LAYOVER SFO",
+      "match_id": "72e4db6f27c8419b",
+      "name": "Mia Berg",
+      "route_label": "San Francisco",
+      "routing": null,
+      "start": null,
+      "token": "AT-GOLDEN-MIA-LA…"
+    }
+  ]
+}

@@ -2745,22 +2745,26 @@ def adsb_poll():
     # gleiche Quelle wie die Karte. Weltweiter FR24-Baseline bleibt unberührt.
     try:
         from blueprints.aerox_data_blueprint import observe_adsb_breadcrumbs
-        # HUB-ZEILEN ZUERST (Owner 2026-07-12 „Taxi wird nicht gespeichert"):
-        # der Europa-Sweep liefert oft >600 airborne Zeilen — stehen die dichten
-        # FRA/MUC-Punkte HINTEN, frisst der max_process-Cap in
-        # observe_adsb_breadcrumbs das Budget, BEVOR eine einzige Taxi-Zeile
-        # dran ist (live bewiesen: D-AIXF rollte 20 min ohne einen Crumb).
-        # Die Hubs sind der Sinn des Features → sie kommen zuerst.
-        crumb_rows = []
+        # HUB-ZEILEN MIT EIGENEM BUDGET (Owner 2026-07-12 „Taxi wird nicht
+        # gespeichert" + Regressions-Sweep #12): der Europa-Sweep liefert oft
+        # >600 airborne Zeilen — standen die dichten Hub-Punkte HINTEN, fraß
+        # der max_process-Cap das Budget, bevor eine Taxi-Zeile dran war
+        # (live bewiesen: D-AIXF rollte 20 min ohne einen Crumb). Der
+        # Erst-Fix (Hubs einfach VORNE in einen gemeinsamen 900er-Cap,
+        # 04482af — kalibriert für 2 Hubs) kippte nach der Hub-Erweiterung
+        # 2→6 (8375998) in die Gegenrichtung: ~400-600 Hub-Zeilen tagsüber
+        # verhungerten den Sweep-Anteil (Anflug-/Taxi-Crumbs an HAM/STR/VIE/
+        # allen Nicht-Hub-EU-Airports). Jetzt ZWEISTUFIG: priority_rows =
+        # Hubs mit eigenem Cap, sweep_rows mit GARANTIERTEM eigenen Budget
+        # (s. observe_adsb_breadcrumbs).
+        hub_rows = []
         for _hlat, _hlon in _ADSB_HUB_POINTS:
             try:
-                crumb_rows.extend(_fetch_adsb_lol_point(_hlat, _hlon, 40))
+                hub_rows.extend(_fetch_adsb_lol_point(_hlat, _hlon, 40))
             except Exception:
                 continue
-        if sweep_rows:
-            crumb_rows.extend(sweep_rows)
-        if crumb_rows:
-            observe_adsb_breadcrumbs(crumb_rows)
+        if hub_rows or sweep_rows:
+            observe_adsb_breadcrumbs(sweep_rows or [], priority_rows=hub_rows)
     except Exception:
         pass
 

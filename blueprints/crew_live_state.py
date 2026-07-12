@@ -750,19 +750,119 @@ def yesterday_leg_reaches_into_today(sectors, now,
         return False
 
 
-def spillover_wins(today_state, yesterday_state):
+def _plan_only_future_pre_flight(today_state, now):
+    """PUR: ist der heutige Zustand ein REINER Plan-pre_flight, dessen Abflug
+    noch in der Zukunft liegt? Das ist KEIN aktiver Beweis-Zustand — nur die
+    Plan-Uhr des heutigen Roster-Tags (CONF_PLAN, kein Board-/Live-Signal).
+    Nacht-Turnaround (Regressions-Sweep 2026-07-12 #6): dep gestern 22:00 →
+    arr heute 00:30, Rückleg heute 01:15 — zwischen Berliner Mitternacht und
+    Landung resolved der heutige Tag pre_flight fürs Rückleg („Wartet auf
+    LHxxx · 01:15" + checkin_open), während die Crew laut gestrigen Sektoren
+    nachweislich noch FLIEGT. Wirft nie."""
+    try:
+        if not isinstance(today_state, dict):
+            return False
+        if today_state.get('state') != STATE_PRE_FLIGHT:
+            return False
+        if today_state.get('confidence') != CONF_PLAN:
+            return False
+        dep = _parse_iso((today_state.get('current_leg') or {}).get('dep_iso'))
+        now = _parse_iso(now)
+        return bool(dep is not None and now is not None and dep > now)
+    except Exception:
+        return False
+
+
+def today_blocks_spillover(today_state, now=None):
+    """PUR: blockiert der HEUTIGE Zustand den Über-Nacht-Rückblick komplett?
+    Aktive Zustände (pre_flight/flying/landed) blockieren — AUSSER der
+    pre_flight ist reine Plan-Uhr mit Abflug in der Zukunft (s.
+    _plan_only_future_pre_flight): dann darf der Rückblick LAUFEN und
+    spillover_wins entscheidet. EINE geteilte Prüfung für das app.py-Vorab-
+    Gate UND spillover_wins, damit Gate und Gewinner-Regel nie divergieren
+    (Regressions-Sweep 2026-07-12 #6)."""
+    t = ((today_state or {}).get('state') if isinstance(today_state, dict)
+         else today_state)
+    if t not in (STATE_PRE_FLIGHT, STATE_FLYING, STATE_LANDED):
+        return False
+    return not _plan_only_future_pre_flight(today_state, now)
+
+
+def spillover_wins(today_state, yesterday_state, now=None,
+                   extra_min=_ARR_BUFFER_MIN + _LANDED_RECENT_MIN):
     """PUR: darf der GESTRIGE Über-Nacht-Zustand den heutigen ersetzen?
-    Nur wenn heute nichts AKTIVES läuft (kein pre_flight/flying/landed des
-    heutigen Tages) UND gestern nachweislich noch geflogen/frisch gelandet
-    wird. So gewinnt nie ein staler Gestern-Layover über einen echten
-    Heute-Zustand."""
+    Grundregel: nur wenn heute nichts AKTIVES läuft (kein pre_flight/flying/
+    landed des heutigen Tages) UND gestern nachweislich noch geflogen/frisch
+    gelandet wird. So gewinnt nie ein staler Gestern-Layover über einen
+    echten Heute-Zustand.
+
+    ZWEI Verfeinerungen (Regressions-Sweep 2026-07-12 #6, `now` optional —
+    ohne now exakt das alte Verhalten):
+      A) Nacht-Turnaround: ein heutiger PLAN-ONLY-pre_flight mit Abflug in
+         der ZUKUNFT ist kein Beweis-Zustand — ein gestriges FLYING gewinnt
+         (nur flying: nach der Landung ist „Wartet auf …" des Rücklegs der
+         bessere Text, gestriges landed übernimmt dann nicht).
+      B) Verspäteter Über-Nacht-Abflug: gestriges pre_flight mit
+         BEOBACHTETEM Pin (Board grounded/delay/cancelled → CONF_OBSERVED)
+         gewinnt über einen leg-losen Heute-Tag („Basis Frankfurt"), solange
+         das gestrige Leg-Fenster (Plan-dep ≤ now < arr + Puffer) noch bis
+         heute reicht — die Crew wartet real am Outstation-Gate."""
     t = ((today_state or {}).get('state') if isinstance(today_state, dict)
          else today_state)
     y = ((yesterday_state or {}).get('state') if isinstance(yesterday_state, dict)
          else yesterday_state)
     if t in (STATE_PRE_FLIGHT, STATE_FLYING, STATE_LANDED):
-        return False
-    return y in (STATE_FLYING, STATE_LANDED)
+        if not _plan_only_future_pre_flight(today_state, now):
+            return False
+        return y == STATE_FLYING                       # Verfeinerung A
+    if y in (STATE_FLYING, STATE_LANDED):
+        return True
+    # Verfeinerung B: gestern beobachtet am Boden gepinnt (verspäteter/
+    # annullierter Über-Nacht-Abflug), heute leglos → gestern gewinnt,
+    # solange das Leg-Fenster noch bis heute reicht.
+    if y == STATE_PRE_FLIGHT and isinstance(yesterday_state, dict) \
+            and yesterday_state.get('confidence') == CONF_OBSERVED:
+        try:
+            nw = _parse_iso(now)
+            leg = yesterday_state.get('current_leg') or {}
+            dep = _parse_iso(leg.get('dep_iso'))
+            if nw is None or dep is None or dep > nw:
+                return False
+            end = (_parse_iso(leg.get('est_arr_iso'))
+                   or _parse_iso(leg.get('arr_iso'))
+                   or dep + _dt.timedelta(hours=3))     # wie _norm_legs-Synth
+            return nw < end + _dt.timedelta(minutes=extra_min)
+        except Exception:
+            return False
+    return False
+
+
+# ── duty-Ableitung für Leg-lose Tage (B2-Nachfix, Regressions-Sweep #7) ──────
+
+def duty_from_roster_day(klass=None, marker=None):
+    """PUR: duty ('standby'|'vacation'|'free'|None) aus klass/marker des
+    Roster-Tages ableiten — Standby > Urlaub > Frei (B2 Tibor 2026-07-12).
+
+    GETEILT zwischen den beiden Resolver-Consumers (app._crew_state_for_day
+    für friends-today UND family_watch._load_crew_status_for_family): der
+    B2-Fix war zunächst NUR in friends-today verdrahtet — Family zeigte für
+    DIESELBE Person am selben Tag weiter „Basis Frankfurt", während der
+    Crew-Feed „Heute frei"/„Im Urlaub" sagte (Regressions-Sweep 2026-07-12
+    #7, exakt die Bug-Klasse, die B2 fixen sollte). EINE Funktion, damit die
+    Ableitung nicht erneut divergiert.
+
+    marker deckt auch reine iCal-Summaries ab ('OFF DAY …', 'SBY …',
+    '… URLAUB …') — family_watch liest user_ical_briefings und hat KEIN
+    klass-Feld. Wirft nie."""
+    marker_up = str(marker or '').upper()
+    klass_up = str(klass or '').strip().upper()
+    if 'SBY' in marker_up:
+        return 'standby'
+    if klass_up in ('URLAUB', 'VAC', 'VACATION') or 'URLAUB' in marker_up:
+        return 'vacation'
+    if klass_up in ('FREI', 'OFF', 'X', 'REST') or 'OFF DAY' in marker_up:
+        return 'free'
+    return None
 
 
 # ── Frische-Wahl: Briefing schlägt stalen Snapshot ───────────────────────────

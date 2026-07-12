@@ -1419,6 +1419,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     if 'next_flight' in allowed_fields:
         try:
             from blueprints.crew_live_state import (resolve_crew_live_state,
+                                                    duty_from_roster_day,
                                                     build_obs_lookup,
                                                     build_live_lookup,
                                                     build_local_hhmm)
@@ -1437,6 +1438,22 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                 _cs_secs = (_cs_day.get('sectors')
                             or _snapshot_day_sectors(crew_token, _cs_datum)
                             or [])
+            # duty für Leg-lose Tage (Regressions-Sweep 2026-07-12 #7): der
+            # B2-Fix (Server-Text „Heute frei"/„Im Urlaub"/„Standby") war nur
+            # in friends-today verdrahtet — Family zeigte für DIESELBE Person
+            # „Basis Frankfurt". Jetzt DIESELBE geteilte Ableitung
+            # (duty_from_roster_day) aus dem heutigen Briefing-Summary
+            # (user_ical_briefings hat kein klass-Feld — die Summary trägt
+            # die Tokens 'OFF DAY'/'SBY'/'URLAUB').
+            _cs_duty = None
+            try:
+                _row_t = (by_date.get(days[0])
+                          if isinstance(by_date, dict) else None)
+                if _row_t:
+                    _cs_duty = duty_from_roster_day(
+                        marker=_row_t.get('ical_summary'))
+            except NameError:
+                _cs_duty = None  # SB-Zweig übersprungen/abgebrochen
             status['crew_state'] = resolve_crew_live_state(
                 _cs_secs,
                 build_obs_lookup(_app_attr('_flight_obs_merged'), _cs_datum),
@@ -1444,6 +1461,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                 _dt.datetime.now(_dt.timezone.utc),
                 homebase=hb or None,
                 layover_iata=roster_layover,
+                duty=_cs_duty,
                 city_lookup=_iata_city_name,
                 local_hhmm=build_local_hhmm(_app_attr('airport_tz')),
                 status_bucket=_app_attr('_flight_status_bucket'))

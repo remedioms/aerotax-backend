@@ -1723,7 +1723,9 @@ def _maybe_evict_tracks():
         pass
 
 
-def observe_adsb_breadcrumbs(rows, source='adsb_lol_sweep', max_km=75.0, max_process=900):
+def observe_adsb_breadcrumbs(rows, source='adsb_lol_sweep', max_km=75.0,
+                             max_process=900, priority_rows=None,
+                             priority_max_process=600):
     """Schreibt adsb.lol-Sweep-Positionen als Breadcrumbs in aircraft_track — der
     Sweep holt sie eh, verwarf sie aber bisher nach der Leg-Erkennung. NUR in
     Flughafen-Nähe (Abflug/Anflug/Taxi = wo die Kurven sind), damit der weltweite
@@ -1731,9 +1733,19 @@ def observe_adsb_breadcrumbs(rows, source='adsb_lol_sweep', max_km=75.0, max_pro
     begrenzt ist. on_ground-Punkte nur bei Bewegung (gs>3 = Taxi, kein Park-Spam).
     Idempotent via PK (reg, seen_ts) — dedupt über Ticks + Worker. Gibt die Anzahl
     geschriebener Crumbs zurück. Never raises. (Unified-Track-Layer C1, 2026-07-11:
-    hybrid-Merge adsb.lol[Europa/Airports/Taxi] neben FR24[weltweit] in EINEN Store.)"""
+    hybrid-Merge adsb.lol[Europa/Airports/Taxi] neben FR24[weltweit] in EINEN Store.)
+
+    ZWEISTUFIGES BUDGET (Regressions-Sweep 2026-07-12 #12): `priority_rows`
+    (die dichten Hub-Punkte, s. adsb_blueprint._ADSB_HUB_POINTS) bekommen einen
+    EIGENEN Cap (priority_max_process), `rows` (Europa-Sweep) danach ihr
+    GARANTIERTES max_process-Budget. Vorher teilten sich beide einen blinden
+    Gesamt-Cap von 900 mit den Hubs vorne (04482af, kalibriert für 2 Hubs) —
+    nach der Hub-Erweiterung auf 6 (8375998) verbrauchten die ~400-600
+    Hub-Zeilen tagsüber das Budget, BEVOR der Sweep-Anteil (Anflug-/Taxi-
+    Crumbs an HAM/STR/VIE/allen Nicht-Hub-EU-Airports) dran war — exakt die
+    Verhungerungs-Klasse, die 04482af fixte, nur eine Ebene höher."""
     sb = _sb()
-    if sb is None or not rows:
+    if sb is None or not (rows or priority_rows):
         return 0
 
     def _i(v):
@@ -1743,42 +1755,50 @@ def observe_adsb_breadcrumbs(rows, source='adsb_lol_sweep', max_km=75.0, max_pro
             return None
 
     now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    out, seen, processed = [], set(), 0
-    for row in rows:
-        if processed >= max_process:
-            break
-        try:
-            # Reg NORMALISIERT (ohne Bindestrich) schreiben — adsb.lol liefert
-            # „D-AIMC", aber Harvester/observed-track/Reader (_flown_track_db
-            # .eq('reg','DAIMC')) nutzen alle die gestrippte Form. Mit Bindestrich
-            # geschrieben waren die dichten FRA/MUC-Sweep-Crumbs für den Reader
-            # UNSICHTBAR (Audit 2026-07-12, P1).
-            reg = re.sub(r'[^A-Z0-9]', '', (row.get('reg') or '').upper())
-            lat, lon = row.get('lat'), row.get('lon')
-            if not reg or lat is None or lon is None or reg in seen:
+    out, seen = [], set()
+
+    def _consume(rws, budget):
+        """Ein Row-Batch mit EIGENEM Budget verarbeiten (out/seen geteilt —
+        ein Flieger nahe einem Hub wird im Sweep nicht doppelt geschrieben)."""
+        processed = 0
+        for row in (rws or []):
+            if processed >= budget:
+                break
+            try:
+                # Reg NORMALISIERT (ohne Bindestrich) schreiben — adsb.lol liefert
+                # „D-AIMC", aber Harvester/observed-track/Reader (_flown_track_db
+                # .eq('reg','DAIMC')) nutzen alle die gestrippte Form. Mit Bindestrich
+                # geschrieben waren die dichten FRA/MUC-Sweep-Crumbs für den Reader
+                # UNSICHTBAR (Audit 2026-07-12, P1).
+                reg = re.sub(r'[^A-Z0-9]', '', (row.get('reg') or '').upper())
+                lat, lon = row.get('lat'), row.get('lon')
+                if not reg or lat is None or lon is None or reg in seen:
+                    continue
+                grounded = _obs_is_grounded(row)
+                gs = row.get('speed')
+                if grounded and (gs is None or gs <= 3):
+                    continue                   # geparkt → kein Crumb
+                processed += 1
+                if _nearest_airport(lat, lon, max_km=max_km) is None:
+                    continue                   # nicht flughafennah → enroute bleibt FR24
+                seen.add(reg)
+                out.append({
+                    'reg': reg,
+                    'seen_ts': now_iso,
+                    'flight': (row.get('flight') or row.get('callsign') or None),
+                    'origin': None, 'dest': None,
+                    'lat': lat, 'lon': lon,
+                    'alt_ft': _i(row.get('alt')),
+                    'gs_kt': _i(gs),
+                    'track_deg': _i(row.get('heading')),
+                    'on_ground': bool(grounded),
+                    'source': source,
+                })
+            except Exception:
                 continue
-            grounded = _obs_is_grounded(row)
-            gs = row.get('speed')
-            if grounded and (gs is None or gs <= 3):
-                continue                       # geparkt → kein Crumb
-            processed += 1
-            if _nearest_airport(lat, lon, max_km=max_km) is None:
-                continue                       # nicht flughafennah → enroute bleibt FR24
-            seen.add(reg)
-            out.append({
-                'reg': reg,
-                'seen_ts': now_iso,
-                'flight': (row.get('flight') or row.get('callsign') or None),
-                'origin': None, 'dest': None,
-                'lat': lat, 'lon': lon,
-                'alt_ft': _i(row.get('alt')),
-                'gs_kt': _i(gs),
-                'track_deg': _i(row.get('heading')),
-                'on_ground': bool(grounded),
-                'source': source,
-            })
-        except Exception:
-            continue
+
+    _consume(priority_rows, priority_max_process)
+    _consume(rows, max_process)
     if not out:
         return 0
     try:
@@ -4500,15 +4520,30 @@ def ax_flown_track():
             if b:
                 d1 = _haversine_km(b[0], b[1], points[-1]['lat'], points[-1]['lon'])
                 # NIE anhängen, solange der Flieger vermutlich noch FLIEGT (Live-
-                # Abfrage + jüngster echter Fix < 20 min alt): der angehängte
+                # Abfrage + jüngster echter Fix frisch): der angehängte
                 # Airport-Punkt erzeugte in der App den Zickzack „Spur → Airport →
                 # joint zurück zum Flieger" (Owner 2026-07-12, live bewiesen an
                 # D-AIUN im FRA-Anflug: letzter Fix 100 km raus → FRA-Zentrum als
                 # Endpunkt, obwohl der Flieger erst bei 65 km war). Gelandete Flüge:
-                # die Crumbs enden mit der Landung → nach 20 min verbindet die
-                # Linie wie gehabt sauber zum Zielflughafen.
-                _lts = next((p.get('ts') for p in reversed(points) if p.get('ts')), None)
-                _still_flying = _live and bool(_lts) and (time.time() - _lts) < 20 * 60
+                # die Crumbs enden mit der Landung → die Linie verbindet wie
+                # gehabt sauber zum Zielflughafen.
+                # SCHWELLEN-ANGLEICH (Regressions-Sweep 2026-07-12 #1): das Gate
+                # stand auf < 20 min, in_flight (unten) auf < 30 min — im
+                # 20–30-min-Crumb-Alter-Fenster enthielt DIESELBE Antwort einen
+                # ts:null-Airport-Endpunkt UND in_flight=true → iOS setzte den
+                # ✈-Marker auf den Airport-Punkt und der Radar-Joint zeichnete
+                # den Zickzack zurück zum Live-Flieger. Jetzt EXAKT dieselbe
+                # Formel wie in_flight (frisch < 30 min, nicht grounded, > 8 km
+                # vorm Ziel) → arr-Append und in_flight=True schließen sich
+                # gegenseitig aus.
+                _lpa = next((p for p in reversed(points) if p.get('ts')), None)
+                _still_flying = False
+                if _live and _lpa and (time.time() - _lpa['ts']) < 30 * 60:
+                    _grounded_a = ((_lpa.get('alt') or 0) < 300
+                                   and (_lpa.get('gs') or 0) < 80)
+                    _d_arr_a = _haversine_km(b[0], b[1],
+                                             _lpa['lat'], _lpa['lon'])
+                    _still_flying = (not _grounded_a) and _d_arr_a > 8.0
                 if 2.0 < d1 < SNAP_KM and not _still_flying:
                     points.append({'lat': b[0], 'lon': b[1], 'alt': None, 'gs': None, 'trk': None, 'ts': None})
 
@@ -6212,6 +6247,16 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
                 ac_type = ((rot_row.get('type_code') or '').strip().upper()
                            or None)
     sched_dep = (my or {}).get('sched_dep')
+    # Museums-Tail-Wächter (Regressions-Sweep 2026-07-12 #11): die Reg-Kaskade
+    # oben liest dieselben Board-Quellen (_flight_obs_merged/_sb_day_reg) wie
+    # flight-info — aber OHNE den f06e288-Wächter. iOS MyPlaneCard zeigt
+    # chain.reg im Karten-Header → die Detailseite scrubbte D-ABTL, die
+    # „Wo ist mein Flieger"-Karte zeigte den Museums-Tail weiter. Der Typ
+    # fällt mit (er stammt aus derselben Museums-Row); ohne Reg endet die
+    # Kette unten ehrlich leer statt mit einem toten Zubringer-Anker.
+    if reg and not _tail_active_guard(reg):
+        reg = None
+        ac_type = None
     if reg and not ac_type:
         # Typecode gratis aus der gebackenen aircraft-DB (für den Turnaround-Puffer).
         _hx, tc = _reg_hex_typecode_free(reg)
@@ -6263,7 +6308,11 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
         # Flieger (die zuvor aufgelöste Reg gehört zu MEINEM Flug, kann abweichen).
         # Auf die Zubringer-Reg/-Typ ziehen, damit Snapshot/Korridor (die per Reg
         # filtern) den RICHTIGEN Flieger finden, nicht meinen.
+        # Museums-Wächter auch HIER (Sweep #11): die Rotations-Row stammt aus
+        # demselben Board-Warehouse — sie darf den Scrub oben nicht umgehen.
         _rot_reg = (rot_row.get('reg') or '').strip().upper() or None
+        if _rot_reg and not _tail_active_guard(_rot_reg):
+            _rot_reg = None
         if _rot_reg:
             reg = _rot_reg
             chain['reg'] = _rot_reg
@@ -7068,11 +7117,20 @@ def ax_my_flight_status(token):
     cancelled = bool(m.get('cancelled'))
     delay_min = m.get('delay_min') if delay_known else None
     arr_iata = _norm_iata(m.get('arr_iata'))
+    # Museums-Tail-Wächter (Regressions-Sweep 2026-07-12 #11): my-flight-status
+    # ist der reg-Fallback der iOS-MyPlaneCard (Header „D-ABTL · 747-400") —
+    # ohne Wächter zeigte die Karte den Museums-Tail, den flight-info/detail
+    # längst scrubbten. Typ fällt mit (stammt aus derselben Board-Row).
+    _reg_out = m.get('reg')
+    _type_out = m.get('aircraft')
+    if _reg_out and not _tail_active_guard(_reg_out):
+        _reg_out = None
+        _type_out = None
     payload = {
         'ok': True, 'flight': flight_no, 'date': date, 'dep_iata': dep_iata,
         'arr_iata': arr_iata,
-        'reg': m.get('reg'),          # NUR echt aus Board/Warehouse, nie geraten
-        'aircraft': m.get('aircraft'),
+        'reg': _reg_out,              # NUR echt aus Board/Warehouse, nie geraten
+        'aircraft': _type_out,
         'delay_known': delay_known,
         'status': m.get('status'),
         'cancelled': cancelled,

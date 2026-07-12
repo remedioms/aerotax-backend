@@ -51,10 +51,13 @@ _DEFAULT_TILES = [
 # Airport-Hot-Tiles (north, south, west, east) — kleine Boxen (~40 nm) um Dreh-/
 # Taxi-Hubs, ZUSÄTZLICH jeden Tick gepollt (stehlen der Welt-Rotation KEINE Ticks),
 # dichtes Gate + on_ground (Taxi!). Welt-Sweep + Retention bleiben exakt wie vorher.
-# Owner 2026-07-11 + Unified-Track-Design: NUR ÜBERSEE-HUBS hier — Europa (FRA/MUC)
-# deckt der gratis Hetzner-adsb.lol-Sweep dichter+billiger ab (kein Doppel-Write).
-# FR24-gRPC verdient sich hier, wo adsb.lol keinen Boden-Feed hat (JFK/GRU/BKK/ICN).
+# REPO-DEFAULT (Owner 2026-07-11 + Unified-Track-Design): NUR ÜBERSEE-HUBS hier —
+# FR24-gRPC verdient sich, wo adsb.lol keinen Boden-Feed hat (JFK/GRU/BKK/ICN).
 # Erweiterbar via AIRPORT_TILES="n s w e; n s w e; …".
+# PRODUKTION (Stand 2026-07-12, NAS-Compose-Env out-of-band): AIRPORT_TILES ist
+# auf 10 Kacheln erweitert (FRA/MUC/ZRH/BER/CGN/DUS + die 4 Übersee-Hubs) mit
+# AIRPORT_FAST_N=3 / AIRPORT_SLOW_EVERY=4 — Owner-Entscheidung; die genaue
+# Belegung + Timing steht als Kommentar in _poll_airport_tiles.
 _DEFAULT_AIRPORT_TILES = [
     (40.95, 40.35, -74.15, -73.40),   # JFK (New York)
     (-23.15, -23.75, -46.80, -46.15), # GRU (São Paulo)
@@ -515,10 +518,24 @@ class Ingest:
                 return []
 
         # FAST/SLOW-Split (Owner 2026-07-12 „für die anderen Airports mehr
-        # Sekunden einplanen"): die ersten AIRPORT_FAST_N Kacheln (FRA/MUC)
-        # laufen jeden Tick (60 s), alle weiteren (ZRH/BER/CGN/DUS + Übersee)
-        # nur jede 2. Runde (~120 s) — halbiert den FR24-Fußabdruck der
-        # Neben-Hubs, Taxi bleibt mit 5-10 Punkten gut abgedeckt.
+        # Sekunden einplanen"): die ersten AIRPORT_FAST_N Kacheln laufen jeden
+        # Tick, alle weiteren nur jede AIRPORT_SLOW_EVERY-te Runde — senkt den
+        # FR24-Fußabdruck der Neben-Hubs, Taxi bleibt gut abgedeckt.
+        #
+        # PRODUKTIONS-BELEGUNG (NAS-Compose-Env, out-of-band gesetzt — Kopie
+        # hier dokumentiert, Regressions-Sweep 2026-07-12 #13; das Repo-
+        # compose in fr24_harvester/ setzt KEINE dieser Variablen):
+        #   AIRPORT_TILES     = 10 Kacheln: FRA, MUC, ZRH, BER, CGN, DUS,
+        #                       JFK, GRU, BKK, ICN
+        #   AIRPORT_FAST_N    = 3   → FRA/MUC/ZRH jeden Tick (60 s)
+        #   AIRPORT_SLOW_EVERY= 4   → Rest (BER/CGN/DUS + Übersee-Hubs
+        #                       JFK/GRU/BKK/ICN) alle 4 Ticks = 240 s
+        #   POLL_INTERVAL_S   = 60
+        # Die Übersee-Hubs im 240-s-Slow-Bucket sind BEABSICHTIGT
+        # (Owner-Entscheidung 2026-07-12 abends) — NICHT auf 60 s
+        # „zurückfixen". Mit Repo-DEFAULTS (AIRPORT_FAST_N=2,
+        # AIRPORT_SLOW_EVERY=2, nur Übersee-Tiles) wären fast=JFK/GRU und
+        # slow=BKK/ICN (~120 s) — die Defaults laufen in Prod nicht.
         self._apt_tick = getattr(self, "_apt_tick", 0) + 1
         fast_n = int(os.getenv("AIRPORT_FAST_N", "2"))
         slow_every = max(2, int(os.getenv("AIRPORT_SLOW_EVERY", "2")))

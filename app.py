@@ -12346,6 +12346,7 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
     try:
         from blueprints.crew_live_state import (resolve_crew_live_state,
                                                 pick_fresher_sectors,
+                                                duty_from_roster_day,
                                                 build_obs_lookup,
                                                 build_live_lookup,
                                                 build_local_hhmm)
@@ -12360,17 +12361,11 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
         # duty für Leg-lose Tage: Standby > Urlaub > Frei (B2 2026-07-12 —
         # der Resolver soll den SERVER-Text „Heute frei"/„Im Urlaub" liefern,
         # exakt die klass-Tokens, die iOS bisher LOKAL erkannte; sonst zeigte
-        # jede Fläche einen anderen Text für dieselbe Person).
-        marker_up = str(day.get('marker') or '').upper()
-        klass_up = str(day.get('klass') or '').strip().upper()
-        if 'SBY' in marker_up:
-            duty = 'standby'
-        elif klass_up in ('URLAUB', 'VAC', 'VACATION') or 'URLAUB' in marker_up:
-            duty = 'vacation'
-        elif klass_up in ('FREI', 'OFF', 'X', 'REST'):
-            duty = 'free'
-        else:
-            duty = None
+        # jede Fläche einen anderen Text für dieselbe Person). Ableitung als
+        # GETEILTE Funktion neben dem Resolver (Regressions-Sweep 2026-07-12
+        # #7): family_watch nutzt dieselbe — vorher divergierte Family
+        # („Basis X") vom Crew-Feed („Heute frei") für dieselbe Person.
+        duty = duty_from_roster_day(day.get('klass'), day.get('marker'))
         cs = resolve_crew_live_state(
             secs or [],
             build_obs_lookup(_flight_obs_merged, datum),
@@ -12863,28 +12858,43 @@ def get_friends_today(token):
             # der Feed jetzt EINEN Tag zurück: meldet HEUTE nichts Aktives
             # und reicht ein gestriger Leg (Plan-Fenster + Verspätungs-Puffer
             # + „frisch gelandet") bis in den heutigen Tag, entscheidet der
-            # Resolver-Lauf über die GESTRIGEN Sektoren (nur flying/landed
-            # gewinnt — spillover_wins, rein + getestet in
-            # blueprints/crew_live_state / tests/test_crew_live_state.py).
+            # Resolver-Lauf über die GESTRIGEN Sektoren (spillover_wins, rein
+            # + getestet in blueprints/crew_live_state /
+            # tests/test_overnight_spillover.py).
+            # Regressions-Sweep 2026-07-12 #6+#8: (a) das Vorab-Gate blockte
+            # bei JEDEM heutigen pre_flight — ein reiner Plan-pre_flight mit
+            # Abflug in der Zukunft (Nacht-Turnaround-Rückleg) ist aber kein
+            # Beweis-Zustand → today_blocks_spillover/spillover_wins kennen
+            # jetzt genau diese Ausnahme (geteilte Prüfung, kein Drift).
+            # (b) das Gate las die gestrigen Sektoren NUR aus dem Roster-
+            # Snapshot, der Resolver-Lauf aber via pick_fresher_sectors aus
+            # der frischeren Briefing-Quelle — iCal-Freunde mit stalem
+            # Snapshot (exakt die Population, für die pick_fresher_sectors
+            # gebaut wurde) verloren den Spillover. Jetzt wählt das Gate
+            # DIESELBE Quelle wie der Resolver; day_y=None (Snapshot beginnt
+            # erst heute) bricht nicht mehr ab.
             try:
                 from blueprints.crew_live_state import (
-                    yesterday_leg_reaches_into_today, spillover_wins)
-                if (crew_state or {}).get('state') not in (
-                        'pre_flight', 'flying', 'landed'):
-                    import datetime as _cs_dt
+                    yesterday_leg_reaches_into_today, spillover_wins,
+                    today_blocks_spillover, pick_fresher_sectors)
+                import datetime as _cs_dt
+                _cs_now = _cs_dt.datetime.now(_cs_dt.timezone.utc)
+                if not today_blocks_spillover(crew_state, _cs_now):
                     _gestern = (_cs_dt.date.fromisoformat(datum)
                                 - _cs_dt.timedelta(days=1)).isoformat()
                     day_y = next((t for t in tage if isinstance(t, dict)
                                   and t.get('datum') == _gestern), None)
-                    y_secs = [s for s in ((day_y or {}).get('ical_sectors') or [])
-                              if isinstance(s, dict)]
-                    if day_y and yesterday_leg_reaches_into_today(
-                            y_secs,
-                            _cs_dt.datetime.now(_cs_dt.timezone.utc)):
+                    _y_snap = [s for s in ((day_y or {}).get('ical_sectors') or [])
+                               if isinstance(s, dict)]
+                    _yb_secs, _yb_ts, _yb_sum, _yb_start = \
+                        _friend_briefing_day_sectors(fr, _gestern)
+                    y_secs, _y_src = pick_fresher_sectors(
+                        _y_snap, _snap_ts, _yb_secs, _yb_ts)
+                    if yesterday_leg_reaches_into_today(y_secs or [], _cs_now):
                         cs_y = _crew_state_for_day(
                             fr, day_y, _gestern, homebase=_hb_arg,
                             snap_ts=_snap_ts, commute_minutes=_cm_arg)
-                        if spillover_wins(crew_state, cs_y):
+                        if spillover_wins(crew_state, cs_y, now=_cs_now):
                             crew_state = cs_y
             except Exception:
                 pass
@@ -22409,9 +22419,17 @@ def flight_times(flightno):
             return {'iata': m.get(iata_k), 'name': m.get(name_k), 'city': None,
                     'scheduled': m.get(sched_k), 'revised': m.get(est_k),
                     'terminal': m.get(term_k), 'gate': m.get(gate_k)}
+        # Museums-Tail-Wächter (Regressions-Sweep 2026-07-12 #11): auch dieser
+        # Board-Ausgang lieferte die Fraport-Altlast (LH781→D-ABTL) ungefiltert.
+        # Typ fällt mit — er stammt aus derselben Museums-Row.
+        _reg_ft = m.get('reg')
+        _type_ft = m.get('aircraft')
+        if _reg_ft and not _tail_recently_active(_reg_ft):
+            _reg_ft = None
+            _type_ft = None
         out = {'ok': True, 'flight': fn,
-               'airline': m.get('airline'), 'aircraft': m.get('aircraft'),
-               'reg': m.get('reg'),
+               'airline': m.get('airline'), 'aircraft': _type_ft,
+               'reg': _reg_ft,
                'status': ('cancelled' if m.get('cancelled') else m.get('status')),
                'departure': _side('dep_iata', 'origin_name', 'sched_dep',
                                   'esti_dep', 'terminal_dep', 'gate_dep'),
@@ -29257,15 +29275,24 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
 # (aircraft_live ODER aircraft_track, beide reg-normalisiert A-Z0-9). Sonst
 # ehrlich KEIN Tail statt Museums-Flieger.
 _TAIL_ACTIVE_CACHE = {}          # reg_norm -> (expires_ts, bool)
-_TAIL_ACTIVE_TTL = 24 * 3600     # definitive Antwort: 24 h pro Reg
+_TAIL_ACTIVE_TTL = 24 * 3600     # POSITIVES Verdikt: 24 h pro Reg
+# NEGATIVE Verdikte nur KURZ cachen (Regressions-Sweep 2026-07-12 #14): kein
+# Schreibpfad (NAS-Harvester, observe_adsb_breadcrumbs, observed-track)
+# invalidiert diesen Cache — eine Reg, die nach >60 Tagen Pause WIEDER fliegt
+# (C-Check-Rückkehr, Neuauslieferung, Wet-Lease), blieb sonst bis zu 24 h
+# app-weit unterdrückt, obwohl sie längst in aircraft_live steht (Radar
+# zeigte sie, Detail/Kalender versteckten sie). 30 min → das legitime
+# Nein→Ja heilt binnen einer halben Stunde; echte Museums-Regs kosten
+# weiterhin nur eine billige EXISTS-Query pro halber Stunde.
+_TAIL_ACTIVE_NEG_TTL = 1800
 _TAIL_ACTIVE_ERR_TTL = 300       # Query-Fehler: 5 min nicht erneut hämmern
 _TAIL_ACTIVE_WINDOW_DAYS = 60
 
 
 def _tail_recently_active(reg):
     """True, wenn die Reg in den letzten 60 Tagen in `aircraft_live` ODER
-    `aircraft_track` gesehen wurde (billige EXISTS-Query, in-process 24 h
-    gecacht pro Reg).
+    `aircraft_track` gesehen wurde (billige EXISTS-Query, in-process gecacht
+    pro Reg: True 24 h, False nur 30 min — s. _TAIL_ACTIVE_NEG_TTL).
 
     FAIL-OPEN bei Nicht-Verifizierbarkeit (SB down/Tabelle fehlt/Query-Fehler):
     dann True zurückgeben, damit ein Infrastruktur-Schluckauf nicht ALLE Tails
@@ -29291,7 +29318,8 @@ def _tail_recently_active(reg):
             r = (sb.table('aircraft_track').select('reg')
                  .eq('reg', rn).gte('seen_ts', cutoff_iso).limit(1).execute())
             ok = bool(getattr(r, 'data', None))
-        _TAIL_ACTIVE_CACHE[rn] = (now + _TAIL_ACTIVE_TTL, ok)
+        _TAIL_ACTIVE_CACHE[rn] = (
+            now + (_TAIL_ACTIVE_TTL if ok else _TAIL_ACTIVE_NEG_TTL), ok)
         _cache_soft_cap(_TAIL_ACTIVE_CACHE, max_items=2000, drop=500)
         return ok
     except Exception:

@@ -739,3 +739,93 @@ def test_pickup_utc_unplausibel_verworfen():
     assert pickup_utc_for_leg((1, 0), '2026-07-09T06:40:00Z',
                               'Europe/Madrid') is None
     assert pickup_utc_for_leg((6, 30), '2026-07-09T06:40:00Z', None) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Regressions-Sweep 2026-07-12 #7: duty-Ableitung als GETEILTE Funktion —
+# der B2-Fix (Server-Text „Heute frei"/„Im Urlaub"/„Standby") war nur in
+# friends-today verdrahtet, Family zeigte für dieselbe Person „Basis X".
+# ══════════════════════════════════════════════════════════════════════════════
+from blueprints.crew_live_state import duty_from_roster_day   # noqa: E402
+
+
+def test_duty_from_roster_day_klass_und_marker():
+    # Exakt die friends-today-Semantik (Standby > Urlaub > Frei).
+    assert duty_from_roster_day(None, 'SBY FRA 06:00') == 'standby'
+    assert duty_from_roster_day('URLAUB', None) == 'vacation'
+    assert duty_from_roster_day(None, 'JAHRESURLAUB') == 'vacation'
+    assert duty_from_roster_day('FREI', None) == 'free'
+    assert duty_from_roster_day('OFF', None) == 'free'
+    assert duty_from_roster_day('X', None) == 'free'
+    assert duty_from_roster_day('REST', None) == 'free'
+    # iCal-Summary-Token (family_watch hat kein klass-Feld).
+    assert duty_from_roster_day(None, 'OFF DAY') == 'free'
+    # Kein Signal → None (Flugtag/unbekannt — Resolver entscheidet über Legs).
+    assert duty_from_roster_day('Z72', 'FLUG') is None
+    assert duty_from_roster_day(None, None) is None
+    # Prio: SBY schlägt alles.
+    assert duty_from_roster_day('FREI', 'SBY 10:00') == 'standby'
+
+
+class _FamQuery:
+    """Chainbare Supabase-Query-Attrappe für den family_watch-Roster-Zweig."""
+
+    def __init__(self, rows_by_table, table):
+        self._rows = rows_by_table.get(table)
+
+    def __getattr__(self, name):
+        # select/eq/in_/gte/lte/order/limit → chainen.
+        return lambda *a, **k: self
+
+    def execute(self):
+        from unittest.mock import MagicMock
+        return MagicMock(data=self._rows if self._rows is not None else [])
+
+
+class _FamSB:
+    def __init__(self, rows_by_table):
+        self.rows_by_table = rows_by_table
+
+    def table(self, name):
+        return _FamQuery(self.rows_by_table, name)
+
+
+def test_family_status_freier_tag_zeigt_heute_frei():
+    """Family-Parität (Sweep #7): OFF-DAY-Briefing → crew_state 'Heute frei'
+    (vor dem Fix: duty=None → „Basis Frankfurt", während der Crew-Feed
+    derselben Person „Heute frei" zeigte)."""
+    today = datetime.now().date().isoformat()
+    row = {'datum': today, 'ical_summary': 'OFF DAY', 'ical_location': '',
+           'ical_start': None, 'ical_end': None, 'raw_event': None}
+    fake = _FamSB({'user_ical_briefings': [row]})
+    with patch.object(FW, '_get_sb', return_value=(True, fake)), \
+         patch.object(FW, '_load_crew_profile',
+                      return_value={'homebase': 'FRA'}), \
+         patch.object(A, '_profile_load', return_value={}), \
+         patch.object(A, '_flight_obs_merged', return_value=None):
+        status = FW._load_crew_status_for_family('AT-CREWSTATE-TEST-4',
+                                                 {'next_flight'})
+    cs = status.get('crew_state')
+    assert cs is not None
+    assert cs['state'] == STATE_HOME
+    assert cs['text']['title'] == 'Heute frei', \
+        'Family muss denselben Server-Text zeigen wie der Crew-Feed (B2)'
+
+
+def test_family_status_standby_tag_zeigt_standby():
+    today = datetime.now().date().isoformat()
+    row = {'datum': today, 'ical_summary': 'SBY FRA 06:00-14:00',
+           'ical_location': 'FRA', 'ical_start': None, 'ical_end': None,
+           'raw_event': None}
+    fake = _FamSB({'user_ical_briefings': [row]})
+    with patch.object(FW, '_get_sb', return_value=(True, fake)), \
+         patch.object(FW, '_load_crew_profile',
+                      return_value={'homebase': 'FRA'}), \
+         patch.object(A, '_profile_load', return_value={}), \
+         patch.object(A, '_flight_obs_merged', return_value=None):
+        status = FW._load_crew_status_for_family('AT-CREWSTATE-TEST-5',
+                                                 {'next_flight'})
+    cs = status.get('crew_state')
+    assert cs is not None
+    assert cs['state'] == STATE_STANDBY
+    assert cs['text']['title'] == 'Standby'

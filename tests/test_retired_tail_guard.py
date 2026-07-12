@@ -316,3 +316,143 @@ def test_unified_resolver_keeps_active_reg():
     res = _unified_with_warehouse_reg(active=True)
     assert res['identity']['reg'] == 'D-ABTL'
     assert res['aircraft']['reg'] == 'D-ABTL'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Regressions-Sweep 2026-07-12 #11: die drei UNGESCHÜTZTEN Ausgänge, aus denen
+# die iOS-MyPlaneCard den Tail ANZEIGT — inbound-chain (chain.reg),
+# my-flight-status (reg-Fallback) und /api/flight-times. Vor dem Fix zeigte
+# die „Wo ist mein Flieger"-Karte den Museums-Tail, den die Detailseite
+# längst scrubbte (Pfad-Widerspruch).
+# ══════════════════════════════════════════════════════════════════════════════
+def _inbound_chain(active):
+    import blueprints.aerox_data_blueprint as BP
+    m = _merged(reg='DABTL')
+    m['aircraft'] = 'B744'
+    m['sched_dep'] = '23:40'
+    with patch.object(A, '_flight_obs_merged', return_value=m), \
+            patch.object(BP, '_tail_active_guard', return_value=active), \
+            patch.object(BP, '_reg_hex_typecode_free',
+                         return_value=(None, None)), \
+            patch.object(BP, '_machine_live',
+                         return_value=(None, None, None, None)), \
+            patch.object(BP, '_inbound_arr_row_by_reg', return_value=None):
+        chain, forecast, _my = BP._build_inbound_chain(
+            'LH781', '2026-07-12', 'FRA')
+    return chain
+
+
+def test_inbound_chain_scrubs_museum_reg():
+    chain = _inbound_chain(active=False)
+    assert chain['reg'] is None
+    # Der Typ stammt aus derselben Museums-Row → fällt mit.
+    assert chain['aircraft_type'] is None
+
+
+def test_inbound_chain_keeps_active_reg():
+    chain = _inbound_chain(active=True)
+    assert chain['reg'] == 'DABTL'
+    assert chain['aircraft_type'] == 'B744'
+
+
+def _mystatus_json(active, flight='LH781'):
+    import blueprints.aerox_data_blueprint as BP
+    m = _merged(reg='DABTL', delay_known=True)
+    m['aircraft'] = 'B744'
+    m['dep_iata'] = 'FRA'
+    m['arr_iata'] = 'SIN'
+    with patch.object(A, '_flight_obs_merged', return_value=m), \
+            patch.object(BP, '_tail_active_guard', return_value=active):
+        with A.app.test_request_context(
+                f'/api/ax/my-flight-status/T?flight_no={flight}&dep_iata=FRA'
+                f'&date=2026-07-1{2 if active else 3}'):
+            resp = BP.ax_my_flight_status('T')
+    if isinstance(resp, tuple):
+        resp = resp[0]
+    return resp.get_json()
+
+
+def test_my_flight_status_scrubs_museum_reg():
+    d = _mystatus_json(active=False)
+    assert d['ok'] is True
+    assert d['reg'] is None
+    assert d['aircraft'] is None
+    # Delay-Wissen bleibt — nur die Maschine wird weggelassen.
+    assert d['delay_known'] is True
+
+
+def test_my_flight_status_keeps_active_reg():
+    d = _mystatus_json(active=True, flight='LH782')
+    assert d['reg'] == 'DABTL'
+    assert d['aircraft'] == 'B744'
+
+
+def _flight_times_json(active, flight='LH781'):
+    m = _merged(reg='DABTL', delay_known=True)
+    m['aircraft'] = 'B744'
+    m['dep_iata'] = 'FRA'
+    m['arr_iata'] = 'SIN'
+    A._FLIGHT_TIMES_CACHE.clear()
+    try:
+        with patch.object(A, '_flight_obs_merged', return_value=m), \
+                patch.object(A, '_tail_recently_active', return_value=active):
+            with A.app.test_request_context(
+                    f'/api/flight-times/{flight}?date=2026-07-12'):
+                resp = A.flight_times(flight)
+    finally:
+        A._FLIGHT_TIMES_CACHE.clear()
+    if isinstance(resp, tuple):
+        resp = resp[0]
+    return resp.get_json()
+
+
+def test_flight_times_scrubs_museum_reg():
+    d = _flight_times_json(active=False)
+    assert d['ok'] is True
+    assert d['reg'] is None
+    assert d['aircraft'] is None
+    assert d['departure']['iata'] == 'FRA'   # Strecke bleibt
+
+
+def test_flight_times_keeps_active_reg():
+    d = _flight_times_json(active=True)
+    assert d['reg'] == 'DABTL'
+    assert d['aircraft'] == 'B744'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Regressions-Sweep 2026-07-12 #14: NEGATIVE Verdikte heilen binnen 30 min —
+# eine Reg, die nach >60 Tagen Pause WIEDER fliegt (C-Check/Neuauslieferung/
+# Wet-Lease), blieb vorher bis zu 24 h app-weit unterdrückt (kein Schreibpfad
+# invalidiert den Cache). D-ABTL selbst ist KEIN Museums-Tail (fliegt real) —
+# der Wächter ist aktivitätsbasiert, hier zählt nur das Nein→Ja-Timing.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_negative_verdict_heals_within_30_minutes():
+    t0 = 1_800_000_000.0
+    p1, p2, fake = _with_sb({'aircraft_live': [], 'aircraft_track': []})
+    with p1, p2:
+        with patch('time.time', return_value=t0):
+            assert A._tail_recently_active('D-XNEW') is False
+        # Die Reg wird real aktiv (Harvester schreibt aircraft_live) …
+        fake.rows_by_table['aircraft_live'] = [{'reg': 'DXNEW'}]
+        # … 20 min später: noch aus dem Negativ-Memo (kein Query-Hammer) …
+        with patch('time.time', return_value=t0 + 1200):
+            assert A._tail_recently_active('D-XNEW') is False
+        # … 31 min später: Negativ-TTL abgelaufen → ehrliches JA.
+        # (Vor dem Fix: 24-h-TTL → hier immer noch False.)
+        with patch('time.time', return_value=t0 + 1860):
+            assert A._tail_recently_active('D-XNEW') is True
+
+
+def test_positive_verdict_keeps_24h_ttl():
+    t0 = 1_800_000_000.0
+    p1, p2, fake = _with_sb({'aircraft_live': [{'reg': 'DAIXQ'}],
+                             'aircraft_track': []})
+    with p1, p2:
+        with patch('time.time', return_value=t0):
+            assert A._tail_recently_active('D-AIXQ') is True
+        # Tabelle leert sich (Retention) — das positive Memo hält 24 h.
+        fake.rows_by_table['aircraft_live'] = []
+        with patch('time.time', return_value=t0 + 12 * 3600):
+            assert A._tail_recently_active('D-AIXQ') is True
+    assert fake.calls.count('aircraft_live') == 1
