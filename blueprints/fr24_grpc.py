@@ -337,9 +337,13 @@ async def _livefeed_row_async(provider, callsign, reg, lat, lon):
             match = r
             break
     if match is None and rg:
+        # Bindestrich-agnostisch vergleichen: FR24 liefert „D-AIMC", die Caller
+        # (ax_flown_track u. a.) übergeben die gestrippte Form „DAIMC" — der
+        # exakte Vergleich war für alle Bindestrich-Regs tot (Audit 2026-07-12).
+        rg_n = rg.replace("-", "").strip().upper()
         for r in rows:
             xi = r.get("extra_info") or {}
-            if (xi.get("reg") or "").strip().upper() == rg:
+            if (xi.get("reg") or "").replace("-", "").strip().upper() == rg_n:
                 match = r
                 break
     return match

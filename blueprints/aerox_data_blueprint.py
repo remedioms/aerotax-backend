@@ -1738,7 +1738,12 @@ def observe_adsb_breadcrumbs(rows, source='adsb_lol_sweep', max_km=75.0, max_pro
         if processed >= max_process:
             break
         try:
-            reg = (row.get('reg') or '').strip().upper()
+            # Reg NORMALISIERT (ohne Bindestrich) schreiben — adsb.lol liefert
+            # „D-AIMC", aber Harvester/observed-track/Reader (_flown_track_db
+            # .eq('reg','DAIMC')) nutzen alle die gestrippte Form. Mit Bindestrich
+            # geschrieben waren die dichten FRA/MUC-Sweep-Crumbs für den Reader
+            # UNSICHTBAR (Audit 2026-07-12, P1).
+            reg = re.sub(r'[^A-Z0-9]', '', (row.get('reg') or '').upper())
             lat, lon = row.get('lat'), row.get('lon')
             if not reg or lat is None or lon is None or reg in seen:
                 continue
@@ -3813,19 +3818,22 @@ def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso, fresh_max_s=None):
     """Tier 1: die ECHTE geflogene Spur aus der eigenen aircraft_track-Tabelle
     (Breadcrumbs vom Harvester + FR24-Rückschreibungen). Isoliert EIN Leg:
     dep/arr-Filter falls gegeben, sonst das jüngste Leg (== origin/dest des
-    letzten Punkts). Liefert (points, reg_used, dep_used, arr_used).
+    letzten Punkts). Liefert (points, reg_used, dep_used, arr_used, stale).
     `fresh_max_s`: bei LIVE-Abfragen (kein Vergangenheits-Datum) das gewählte
-    Segment verwerfen, wenn sein jüngster Crumb älter als fresh_max_s ist."""
+    Segment als STALE markieren (nicht verwerfen!), wenn sein jüngster Crumb
+    älter als fresh_max_s ist — der Endpoint ersetzt es dann nur, wenn Tier 2
+    wirklich liefert (Audit 2026-07-12: hartes Verwerfen degradierte auch
+    gelandete Heute-Flüge auf Großkreis, obwohl die echte Spur in der DB lag)."""
     sb = _sb()
     if sb is None:
-        return [], reg, dep, arr
+        return [], reg, dep, arr, False
     if not reg and not flight_no:
-        return [], reg, dep, arr
+        return [], reg, dep, arr, False
 
     def _fetch(col, val):
         try:
             q = (sb.table('aircraft_track').select(
-                 'reg,lat,lon,alt_ft,gs_kt,track_deg,seen_ts,origin,dest,flight')
+                 'reg,lat,lon,alt_ft,gs_kt,track_deg,seen_ts,origin,dest,flight,on_ground')
                  .eq(col, val))
             return (q.gte('seen_ts', lo_iso).lt('seen_ts', hi_iso)
                      .order('seen_ts').limit(4000).execute()).data or []
@@ -3838,21 +3846,33 @@ def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso, fresh_max_s=None):
         # Fallback auf den Flight-Match statt sofort Großkreis.
         rows = _fetch('flight', flight_no)
     if not rows:
-        return [], reg, dep, arr
+        return [], reg, dep, arr, False
     # LEG-ISOLIERUNG (Owner 2026-07-11 FIX): ZUERST an Zeitlücken >45 min in
     # Segmente (= einzelne Legs) splitten, DANN das passende Segment wählen. Der
     # frühere origin/dest-Filter LIEF VOR dem Split und warf die dichten adsb.lol-
     # Airport-Crumbs raus, weil die aus dem C1-Sweep origin/dest=None haben →
     # Breadcrumbs kamen nie in der App an. Jetzt bleiben route-lose Crumbs im
     # zeitlich zugehörigen Leg (Taxi/Anflug-Kurven inklusive).
-    segs, cur, prev = [], [], None
+    # TURNAROUND-SPLIT (Audit 2026-07-12, P1): seit die Airport-Sweeps auch
+    # Taxi-Crumbs (on_ground) schreiben, schließt ein kurzer Turnaround (<45 min
+    # Gate-Zeit) die Zeitlücke zwischen Anflug und nächstem Abflug — beide Legs
+    # verschmolzen zu EINER Polyline. Geparkt schreibt keine Crumbs (min_nm-Gate)
+    # → zwischen Taxi-in-Ende und Taxi-out-Start liegt IMMER eine Boden-Lücke.
+    # Darum: Split auch bei >10 min zwischen zwei BODEN-Punkten. Taxi-Kurven
+    # selbst bleiben erhalten (kein Wegwerfen wie in track_archive.split_legs —
+    # die Anzeige SOLL das Rollen zeigen).
+    segs, cur, prev, prev_ground = [], [], None, False
     for r in rows:
         ts = _iso_to_epoch(r.get('seen_ts'))
-        if cur and prev is not None and ts is not None and ts - prev > 45 * 60:
-            segs.append(cur); cur = []
+        grounded = bool(r.get('on_ground'))
+        if cur and prev is not None and ts is not None:
+            gap = ts - prev
+            if gap > 45 * 60 or (grounded and prev_ground and gap > 10 * 60):
+                segs.append(cur); cur = []
         cur.append(r)
         if ts is not None:
             prev = ts
+            prev_ground = grounded
     if cur:
         segs.append(cur)
 
@@ -3874,7 +3894,7 @@ def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso, fresh_max_s=None):
                 chosen = seg
                 break
         if chosen is None:
-            return [], reg, dep, arr        # kein Routen-Match → nicht blind zuordnen
+            return [], reg, dep, arr, False  # kein Routen-Match → nicht blind zuordnen
     else:
         chosen = segs[-1] if segs else []
         dep, arr = _seg_route(chosen)
@@ -3885,17 +3905,18 @@ def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso, fresh_max_s=None):
     # LGW→FRA), matcht der dep/arr-Filter das ältere Segment — die Breadcrumbs des
     # aktuellen Anflugs sind noch nicht geharvestet. Ergebnis: die App zeigt die
     # STALE 2h-alte Landung, der Joint brückt sie an den Live-Flieger („orange ganz
-    # falsch"). Ist der jüngste Crumb zu alt → Segment verwerfen, damit Tier 2
-    # (FR24-Trail) die ECHTE aktuelle Spur liefert.
+    # falsch"). Ist der jüngste Crumb zu alt → als STALE markieren; der Endpoint
+    # ersetzt die Spur dann durch den FR24-Trail (Tier 2), WENN der liefert —
+    # sonst bleibt die echte (ältere) Spur der ehrliche Fallback statt Großkreis.
+    stale = False
     if fresh_max_s is not None and rows:
         newest = max((_iso_to_epoch(r.get('seen_ts')) or 0) for r in rows)
-        if newest and (time.time() - newest) > fresh_max_s:
-            return [], reg_used, dep, arr
+        stale = bool(newest) and (time.time() - newest) > fresh_max_s
     pts = [{'lat': r['lat'], 'lon': r['lon'], 'alt': r.get('alt_ft'),
             'gs': r.get('gs_kt'), 'trk': r.get('track_deg'),
             'ts': _iso_to_epoch(r.get('seen_ts'))}
            for r in rows if r.get('lat') is not None and r.get('lon') is not None]
-    return pts, reg_used, dep, arr
+    return pts, reg_used, dep, arr, stale
 
 
 def _flown_track_archive(reg, flight_no, date, dep, arr):
@@ -4118,11 +4139,19 @@ def ax_flown_track():
     arr = _norm_iata(request.args.get('arr')) if request.args.get('arr') else None
     if not reg and not flight_no:
         return jsonify({'ok': False, 'error': 'reg_or_flight_required'}), 400
-    # hex früh parsen: er entscheidet unten über Frische-Gate (Tier 1) und
-    # Tier-2-Verfügbarkeit → muss darum auch in den Memo-Key (sonst teilen sich
-    # Radar-Tap mit hex und MyPlane ohne hex denselben Cache-Eintrag und kriegen
-    # inkonsistente Antworten).
+    # hex/lat/lon früh parsen: hex entscheidet unten über Frische-Gate (Tier 1)
+    # und Tier-2-Verfügbarkeit → muss darum auch in den Memo-Key (sonst teilen
+    # sich Radar-Tap mit hex und MyPlane ohne hex denselben Cache-Eintrag und
+    # kriegen inkonsistente Antworten). lat/lon dienen als Live-Plausi-Anker
+    # für den Stale-Fallback.
     q_hex = (request.args.get('hex') or '').strip().lower() or None
+
+    def _qf(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    q_lat, q_lon = _qf(request.args.get('lat')), _qf(request.args.get('lon'))
 
     memo_key = ('flown_track', reg, flight_no or '', date or '', dep or '', arr or '',
                 q_hex or '')
@@ -4175,7 +4204,8 @@ def ax_flown_track():
     # kein Tier 2 mehr (s.u.) — für die ist eine 35-min-alte ECHTE Spur besser
     # als der Großkreis, auf den sie sonst degradieren (Owner 2026-07-12,
     # „gespeicherte Route funktioniert nicht mehr zuverlässig").
-    points, reg_used, dep, arr = _flown_track_db(
+    req_dep, req_arr = dep, arr        # explizit angefragte Route (vor Segment-Ableitung)
+    points, reg_used, dep, arr, tier1_stale = _flown_track_db(
         reg, flight_no, dep, arr, lo_iso, hi_iso,
         fresh_max_s=(30 * 60 if (_live and q_hex) else None))
     reg = reg or (reg_used or '')
@@ -4197,28 +4227,23 @@ def ax_flown_track():
     # klappt der Trail für JEDE Airline (Radar-Tap eines fremden Fliegers), nicht
     # nur für die LH-Group-Fleet in aircraft_live. Sonst Fallback auf aircraft_live.
     is_today = (not date) or (date == time.strftime('%Y-%m-%d', time.gmtime()))
-    if len(points) < 3 and is_today:
-        def _f(v):
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return None
-        q_lat, q_lon = _f(request.args.get('lat')), _f(request.args.get('lon'))
+    if (len(points) < 3 or tier1_stale) and is_today:
         reg_disp = None
-        if q_lat is None or q_lon is None:
+        t_lat, t_lon = q_lat, q_lon
+        if t_lat is None or t_lon is None:
             try:
                 pos, _route, reg_disp, _ac = _aircraft_live_pos(
                     reg=reg or None, flight=flight_no, max_age_min=60)
             except Exception:
                 pos = None
             if pos and pos.get('lat') is not None:
-                q_lat, q_lon = pos.get('lat'), pos.get('lon')
+                t_lat, t_lon = pos.get('lat'), pos.get('lon')
         # FR24-Detail matcht in der Praxis nur zuverlässig über den HEX (reg ohne
         # Bindestrich / IATA-Callsign matchen die FR24-Feed-Rows oft NICHT → leer).
         # No-Match-Empties triggern zudem den Freeze-on-Empties-Limiter und legen FR24
         # kurz ganz lahm. Darum Tier 2 NUR mit hex aufrufen (Radar-Tap liefert ihn
         # immer); ohne hex sauber auf great_circle (LH-Group hat eh Tier-1-Crumbs).
-        if q_hex and q_lat is not None and q_lon is not None:
+        if q_hex and t_lat is not None and t_lon is not None:
             try:
                 from blueprints import fr24_grpc
                 # FIX (Owner 2026-07-12): hiess `flight=flight_no` — flown_trail hat
@@ -4227,20 +4252,42 @@ def ax_flown_track():
                 # ohne DE-Crumbs fiel auf great_circle, „LHR keine Crumbs"). callsign=.
                 trail = fr24_grpc.flown_trail(
                     reg=reg or (reg_disp or None), hex=q_hex,
-                    callsign=flight_no, lat=q_lat, lon=q_lon)
+                    callsign=flight_no, lat=t_lat, lon=t_lon)
             except Exception:
                 trail = None
             if trail and trail.get('points'):
                 tw_reg = re.sub(r'[^A-Z0-9]', '', (trail.get('reg') or reg or '').upper())
                 _flown_track_writeback(tw_reg, trail)
-                if len(trail['points']) >= len(points):
+                # Ersetzen, wenn der Trail mindestens gleich gut ist — oder die
+                # eigene Spur STALE war (dann ist der frische Trail immer die
+                # bessere Wahrheit, auch wenn er kürzer ist).
+                if len(trail['points']) >= len(points) \
+                        or (tier1_stale and len(trail['points']) >= 2):
                     source = 'fr24_trail'
                     reg = reg or tw_reg
-                    dep = dep or trail.get('origin')
-                    arr = arr or trail.get('dest')
+                    if tier1_stale:
+                        # Route der STALE-Spur nicht durchreichen — explizite
+                        # Request-Route > Trail-Route > Segment-Ableitung.
+                        dep = req_dep or trail.get('origin') or dep
+                        arr = req_arr or trail.get('dest') or arr
+                    else:
+                        dep = dep or trail.get('origin')
+                        arr = arr or trail.get('dest')
                     points = [{'lat': p['lat'], 'lon': p['lon'], 'alt': p.get('alt_ft'),
                                'gs': p.get('gs_kt'), 'trk': p.get('track_deg'),
                                'ts': p.get('ts')} for p in trail['points']]
+                    tier1_stale = False
+
+    # Stale-Fallback-Plausibilität: konnte Tier 2 die veraltete Spur NICHT
+    # ersetzen, behalten wir sie nur, wenn sie zur mitgegebenen Live-Position
+    # passt. Endet die alte Spur > 60 km vom echten Flieger, ist es die
+    # Vor-Rotation (KLM53T „orange ganz falsch") → dann lieber ehrlicher
+    # Großkreis als die falsche alte Landung.
+    if tier1_stale and source == 'aircraft_track' and points \
+            and q_lat is not None and q_lon is not None:
+        _dl = _haversine_km(q_lat, q_lon, points[-1]['lat'], points[-1]['lon'])
+        if _dl > 60.0:
+            points = []
 
     # Tier 3: keine echte Spur → Großkreis dep→arr (ehrlich als „approx").
     if len(points) < 2 and dep and arr:
