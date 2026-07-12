@@ -3900,6 +3900,18 @@ def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso, fresh_max_s=None):
             if (not dep or o == dep) and (not arr or d == arr):
                 chosen = seg
                 break
+        # TAXI-OUT-FALLBACK (Owner 2026-07-12 „Taxi wird wieder nicht gezeigt"):
+        # das Rollen VOR dem Abflug besteht nur aus ROUTE-LOSEN Sweep-Crumbs
+        # (origin/dest=None) — der strikte Routen-Match warf genau dieses
+        # Segment weg, sobald die App leg-genau (dep/arr des NÄCHSTEN Legs)
+        # nachlädt. Ist das jüngste Segment route-los UND frisch (< 30 min),
+        # gehört es zum anstehenden Leg → nehmen statt leer zurückzugeben.
+        if chosen is None and segs:
+            _cand = segs[-1]
+            if _seg_route(_cand) == (None, None):
+                _newest = max((_iso_to_epoch(r.get('seen_ts')) or 0) for r in _cand)
+                if _newest and (time.time() - _newest) < 30 * 60:
+                    chosen = _cand
         if chosen is None:
             return [], reg, dep, arr, False  # kein Routen-Match → nicht blind zuordnen
     else:
