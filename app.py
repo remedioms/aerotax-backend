@@ -458,6 +458,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/stats/',
     '/api/user/trip-stats/',
     '/api/user/passport-stats/',  # Crew-Passport = komplette Roster-Historie (PII)
+    '/api/user/friend-passport/', # Passport eines Freundes (Roster-Aggregat = PII)
     '/api/user/marker-mapping/',
     '/api/user/subscription/',
     '/api/user/sponsored/',
@@ -10378,6 +10379,221 @@ def user_search():
     return jsonify({'count': len(results), 'users': results, 'source': used_source})
 
 
+# ── Kontakte-Matching (B1 Tibor 2026-07-12) ─────────────────────────────────
+# Warum: der iOS-Kontakte-Tab matchte bisher clientseitig 60 ZUFÄLLIGE von N
+# Kontakt-Namen (Set-Order!) einzeln gegen /api/user/search — bei 265 Kontakten
+# wurden ~77% nie geprüft („Von 265 Kontakten ist niemand bei AeroX", obwohl
+# Miguel+Jennifer drin waren). Dieser Endpoint macht das Matching SERVERSEITIG
+# in EINEM Request über ALLE Kontakte, mit zwei Basen:
+#   1. E-Mail-HASHES (SHA-256 der lowercased/trimmed Adresse) gegen die
+#      Registrierungs-E-Mails (auth_users) — E-Mails existieren für JEDEN
+#      Account. Privacy: der Client lädt NIE Roh-Adressen hoch, nur Hashes;
+#      die Response enthält NUR public-Profil-Felder (wie /api/user/search).
+#   2. Namen (Klartext, wie bisher bei der Namens-Suche) gegen user_profiles.
+#      Match-Regel bewusst KONSERVATIVER als die Substring-Suche: Token-Set-
+#      Gleichheit ODER Profilname (≥2 Wörter) vollständig im Kontakt-Namen
+#      enthalten („Dr. Miguel Schumann ✈️" findet „Miguel Schumann").
+
+_CONTACTS_HASH_RE = re.compile(r'^[0-9a-f]{64}$')
+
+
+def _contacts_name_tokens(s):
+    """Anzeigename → normalisierte Vergleichs-Tokens (casefold, NFKC,
+    Satzzeichen/Emojis → Space). 'Dr. Miguel Schumann ✈️' → ['dr','miguel',
+    'schumann']. Leere Liste wenn nichts Alphanumerisches übrig bleibt."""
+    import unicodedata
+    s = unicodedata.normalize('NFKC', str(s or ''))
+    cleaned = ''.join(ch if (ch.isalnum() or ch.isspace() or ch in "-'")
+                      else ' ' for ch in s)
+    # Bindestrich/Apostroph zusätzlich splitten ("Anna-Lena" ≙ "Anna Lena")
+    cleaned = cleaned.replace('-', ' ').replace("'", ' ')
+    return [t for t in cleaned.casefold().split() if t]
+
+
+def _contacts_name_match(profile_name, contact_token_sets):
+    """True wenn der AeroX-Profilname zu EINEM Kontakt passt.
+    Regeln (konservativ, kein Substring-Raten):
+      • Token-Set-Gleichheit (auch „Schumann, Miguel" umgedreht), ODER
+      • Profilname hat ≥2 Tokens und ALLE stecken im Kontakt-Namen
+        (Titel/Emojis/Zusätze im Kontakt stören nicht).
+    Ein-Wort-Profilnamen matchen NUR exakt (sonst matcht „Miguel" jeden
+    Kontakt, der das Wort irgendwo trägt)."""
+    ps = set(_contacts_name_tokens(profile_name))
+    if not ps:
+        return False
+    for cs in contact_token_sets:
+        if ps == cs:
+            return True
+        if len(ps) >= 2 and ps <= cs:
+            return True
+    return False
+
+
+def _contacts_email_hash(email):
+    """Kanonischer E-Mail-Hash: SHA-256 über strip().lower() — MUSS mit der
+    iOS-Seite (CrewConnectSearchView.emailHash) identisch bleiben."""
+    return hashlib.sha256(
+        str(email or '').strip().lower().encode('utf-8')).hexdigest()
+
+
+def _contacts_match_auth_rows():
+    """[(email, token)] aller Accounts — SB primary (paginiert), Disk-Fallback.
+    NUR intern fürs Hash-Matching; E-Mails verlassen den Server nie."""
+    rows = []
+    if SB_AVAILABLE and sb is not None:
+        try:
+            offset, page = 0, 1000
+            while offset < 20000:
+                r = (sb.table('auth_users').select('email,token')
+                     .range(offset, offset + page - 1).execute())
+                chunk = r.data or []
+                rows.extend((row.get('email'), row.get('token'))
+                            for row in chunk)
+                if len(chunk) < page:
+                    break
+                offset += page
+            return rows
+        except Exception as e:
+            app.logger.warning(
+                f'[contacts-match] sb_auth_fail {type(e).__name__}: '
+                f'{str(e)[:120]} → disk')
+    for em, rec in (_auth_load_from_disk() or {}).items():
+        rows.append((em, (rec or {}).get('token')))
+    return rows
+
+
+def _contacts_match_profile_rows():
+    """[(token, name)] aller Profile — SB primary (paginiert), Disk-Fallback."""
+    rows = []
+    if SB_AVAILABLE and sb is not None:
+        try:
+            offset, page = 0, 1000
+            while offset < 20000:
+                r = (sb.table('user_profiles').select('token,name')
+                     .range(offset, offset + page - 1).execute())
+                chunk = r.data or []
+                rows.extend((row.get('token'), row.get('name'))
+                            for row in chunk)
+                if len(chunk) < page:
+                    break
+                offset += page
+            return rows
+        except Exception as e:
+            app.logger.warning(
+                f'[contacts-match] sb_prof_fail {type(e).__name__}: '
+                f'{str(e)[:120]} → disk')
+    try:
+        for fn in os.listdir(_USER_HISTORY_DIR):
+            if not fn.startswith('profile_') or not fn.endswith('.json'):
+                continue
+            try:
+                with open(os.path.join(_USER_HISTORY_DIR, fn)) as f:
+                    data = json.load(f) or {}
+            except Exception:
+                continue
+            pr = data.get('profile') or {}
+            rows.append((data.get('token'), pr.get('name')))
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+@app.route('/api/user/contacts-match', methods=['POST'])
+def user_contacts_match():
+    """Adressbuch-Abgleich in EINEM Request (siehe Block-Kommentar oben).
+
+    Body: {token: <own>, email_hashes: [sha256-hex…], names: [Anzeigename…],
+           exclude_family: bool}
+    Antwort: {ok, count, users: [wie /api/user/search + matched_by
+              ('email'|'name')], checked: {names, email_hashes}}
+    Privacy-Audit: Response NUR public-Profil-Felder — NIEMALS email/apple_sub.
+    Rate-Limit: 12/h pro Token (der Scan ist eine bewusste User-Aktion).
+    """
+    data = request.get_json(silent=True) or {}
+    own = str(data.get('token') or '').strip()
+    if not own or not _validate_token_exists(own):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 401
+    if _token_rate_limited(own, 'contacts_match', limit=12, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    exclude_family = bool(data.get('exclude_family'))
+
+    hashes = set()
+    for h in (data.get('email_hashes') or [])[:1000]:
+        h = str(h or '').strip().lower()
+        if _CONTACTS_HASH_RE.match(h):
+            hashes.add(h)
+    contact_sets = []
+    for n in (data.get('names') or [])[:500]:
+        toks = _contacts_name_tokens(n)
+        if toks:
+            contact_sets.append(set(toks))
+    if not hashes and not contact_sets:
+        return jsonify({'ok': True, 'count': 0, 'users': [],
+                        'checked': {'names': 0, 'email_hashes': 0}})
+
+    matched = {}   # token -> 'email' | 'name' (email gewinnt als stärkere Basis)
+    if hashes:
+        for em, tok in _contacts_match_auth_rows():
+            if tok and em and _contacts_email_hash(em) in hashes:
+                matched[tok] = 'email'
+    if contact_sets:
+        for tok, name in _contacts_match_profile_rows():
+            if tok and tok not in matched and \
+                    _contacts_name_match(name, contact_sets):
+                matched[tok] = 'name'
+
+    blocked = _blocked_by(own)
+    toks = [t for t in matched if t != own and t not in blocked][:100]
+
+    # Public-Profil-Felder der Treffer (eine IN-Query statt N Lookups)
+    profs = {}
+    if SB_AVAILABLE and sb is not None and toks:
+        try:
+            r = (sb.table('user_profiles')
+                 .select('token,name,homebase,airline,"position",metadata')
+                 .in_('token', toks).execute())
+            for row in (r.data or []):
+                profs[row.get('token')] = row
+        except Exception as e:
+            app.logger.warning(
+                f'[contacts-match] sb_pub_fail {type(e).__name__}: '
+                f'{str(e)[:120]} → per-token disk')
+    users = []
+    for t in toks:
+        row = profs.get(t)
+        if row is None:
+            pr = (_profile_load(t) or {}).get('profile') or {}
+            row = {'token': t, 'name': pr.get('name'),
+                   'homebase': pr.get('homebase'),
+                   'airline': pr.get('airline'),
+                   'position': pr.get('position'),
+                   'metadata': {'avatar_url': pr.get('avatar_url'),
+                                'account_type': pr.get('account_type')}}
+        name = (row.get('name') or '').strip()
+        if not name:
+            continue   # ohne Namen nicht anzeigbar (wie /api/user/search)
+        md = row.get('metadata') or {}
+        if not isinstance(md, dict):
+            md = {}
+        acct = (md.get('account_type') or '').strip().lower()
+        if exclude_family and acct == 'family':
+            continue
+        users.append({
+            'token': t,
+            'name': name,
+            'airline': row.get('airline'),
+            'homebase': row.get('homebase'),
+            'position': row.get('position'),
+            'avatar_url': md.get('avatar_url'),
+            'account_type': acct or 'crew',
+            'matched_by': matched.get(t),
+        })
+    users.sort(key=lambda u: (u.get('name') or '').lower())
+    return jsonify({'ok': True, 'count': len(users), 'users': users,
+                    'checked': {'names': len(contact_sets),
+                                'email_hashes': len(hashes)}})
+
+
 @app.route('/api/user/lookup-by-short/<short>', methods=['GET'])
 def user_lookup_by_short(short):
     """Resolve 8-char Token-Prefix → full Token + public profile fields.
@@ -12141,8 +12357,20 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
             _friend_briefing_day_sectors(fr, datum)
         secs, _src = pick_fresher_sectors(snap_secs, snap_ts, b_secs, b_ts)
         rf = day.get('reader_facts') or {}
-        duty = ('standby'
-                if 'SBY' in str(day.get('marker') or '').upper() else None)
+        # duty für Leg-lose Tage: Standby > Urlaub > Frei (B2 2026-07-12 —
+        # der Resolver soll den SERVER-Text „Heute frei"/„Im Urlaub" liefern,
+        # exakt die klass-Tokens, die iOS bisher LOKAL erkannte; sonst zeigte
+        # jede Fläche einen anderen Text für dieselbe Person).
+        marker_up = str(day.get('marker') or '').upper()
+        klass_up = str(day.get('klass') or '').strip().upper()
+        if 'SBY' in marker_up:
+            duty = 'standby'
+        elif klass_up in ('URLAUB', 'VAC', 'VACATION') or 'URLAUB' in marker_up:
+            duty = 'vacation'
+        elif klass_up in ('FREI', 'OFF', 'X', 'REST'):
+            duty = 'free'
+        else:
+            duty = None
         return resolve_crew_live_state(
             secs or [],
             build_obs_lookup(_flight_obs_merged, datum),
@@ -12613,6 +12841,41 @@ def get_friends_today(token):
             crew_state = _crew_state_for_day(
                 fr, day, datum, homebase=_hb_arg, snap_ts=_snap_ts,
                 commute_minutes=_cm_arg)
+            # ÜBER-MITTERNACHT-SPILLOVER RÜCKWÄRTS (Owner 2026-07-12,
+            # Jennifer-Fall): ein Über-Nacht-Leg (dep GESTERN 12.07 15:40Z
+            # SIN→FRA, arr am Folgetag) verschwand nach Berliner Mitternacht
+            # aus dem Resolver — der sieht nur den HEUTIGEN Roster-Tag, und
+            # der ist auf dem Ankunftstag leglos → „Basis Frankfurt"/falscher
+            # Ort mit falscher Richtung, während die Crew nachweislich noch
+            # flog. Symmetrisch zum crew_state_next-Fenster (vorwärts) schaut
+            # der Feed jetzt EINEN Tag zurück: meldet HEUTE nichts Aktives
+            # und reicht ein gestriger Leg (Plan-Fenster + Verspätungs-Puffer
+            # + „frisch gelandet") bis in den heutigen Tag, entscheidet der
+            # Resolver-Lauf über die GESTRIGEN Sektoren (nur flying/landed
+            # gewinnt — spillover_wins, rein + getestet in
+            # blueprints/crew_live_state / tests/test_crew_live_state.py).
+            try:
+                from blueprints.crew_live_state import (
+                    yesterday_leg_reaches_into_today, spillover_wins)
+                if (crew_state or {}).get('state') not in (
+                        'pre_flight', 'flying', 'landed'):
+                    import datetime as _cs_dt
+                    _gestern = (_cs_dt.date.fromisoformat(datum)
+                                - _cs_dt.timedelta(days=1)).isoformat()
+                    day_y = next((t for t in tage if isinstance(t, dict)
+                                  and t.get('datum') == _gestern), None)
+                    y_secs = [s for s in ((day_y or {}).get('ical_sectors') or [])
+                              if isinstance(s, dict)]
+                    if day_y and yesterday_leg_reaches_into_today(
+                            y_secs,
+                            _cs_dt.datetime.now(_cs_dt.timezone.utc)):
+                        cs_y = _crew_state_for_day(
+                            fr, day_y, _gestern, homebase=_hb_arg,
+                            snap_ts=_snap_ts, commute_minutes=_cm_arg)
+                        if spillover_wins(crew_state, cs_y):
+                            crew_state = cs_y
+            except Exception:
+                pass
             # 24-H-FENSTER ÜBER MITTERNACHT (Owner 2026-07-12, Tibor-Fall,
             # Crew-Feed-Härtung #1): friends-today liefert nur den heutigen
             # Berliner Tag → das „Check-in ab 24 h vorher"-Fenster der
@@ -21985,6 +22248,53 @@ def get_passport_stats(token):
         payload = _passport_stats_compute(token, rng)
     except Exception as e:
         print(f'[passport-stats] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
+    _PASSPORT_STATS_CACHE[key] = (now + 60, payload)
+    _cache_soft_cap(_PASSPORT_STATS_CACHE)
+    return jsonify(payload)
+
+
+@app.route('/api/user/friend-passport/<token>', methods=['GET'])
+def get_friend_passport(token):
+    """Crew-Passport eines FREUNDES (P3, Owner 2026-07-12: „Freunde sehen es
+    zusammen mit dem Kalender … Profil halt") —
+    GET /api/user/friend-passport/<token>?friend=<match|token>&range=all|YYYY|YYYY-MM.
+
+    Privacy = der friend-roster-Pfad: Bearer muss dem EIGENEN Pfad-Token
+    entsprechen (401), der Friend-Parameter wird via _resolve_friend_token
+    aufgelöst (PII-gekürzte Tokens aus friends-today), dann MUSS die
+    Freundschafts-Kante bestehen (sonst 403 not_friends) UND der Freund darf
+    share_roster nicht explizit abgeschaltet haben (sonst 403 not_shared —
+    spiegelt friends-today/Leaderboard, die Opt-out-Profile ebenfalls
+    ausblenden). Compute + 60-s-Memo sind EXAKT die des eigenen Passports
+    (_passport_stats_compute / _PASSPORT_STATS_CACHE, gekeyt auf den
+    FREUND-Token → owner- und friend-Reads teilen sich den Cache-Eintrag)."""
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    if not _request_bearer_matches(token):
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    friend_raw = (request.args.get('friend') or '').strip()
+    if not friend_raw:
+        return jsonify({'ok': False, 'error': 'missing_friend'}), 400
+    rng = (request.args.get('range') or 'all').strip()
+    if not re.match(r'^(all|\d{4}|\d{4}-\d{2})$', rng):
+        return jsonify({'ok': False, 'error': 'bad_range'}), 400
+    friend = _resolve_friend_token(token, friend_raw)
+    me = _friends_load(token)
+    if friend not in (me.get('friends') or []):
+        return jsonify({'ok': False, 'shared': False, 'error': 'not_friends'}), 403
+    prof = _profile_load(friend) or {}
+    if prof.get('share_roster') is False:
+        return jsonify({'ok': False, 'shared': False, 'error': 'not_shared'}), 403
+    now = time.time()
+    key = (friend, rng)
+    cached = _PASSPORT_STATS_CACHE.get(key)
+    if cached and cached[0] > now:
+        return jsonify(cached[1])
+    try:
+        payload = _passport_stats_compute(friend, rng)
+    except Exception as e:
+        print(f'[friend-passport] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
     _PASSPORT_STATS_CACHE[key] = (now + 60, payload)
     _cache_soft_cap(_PASSPORT_STATS_CACHE)
@@ -34579,10 +34889,13 @@ def list_friend_requests(token):
     })
 
 
-def _send_friend_request_core(token, target):
+def _send_friend_request_core(token, target, notify=True):
     """Gemeinsame Friend-Request-Logik — von /send (friend_token im Body) UND von
     /redeem-invite (Aussteller aus signiertem Invite rekonstruiert) genutzt.
-    <token> = authentifizierter Absender, target = Empfänger."""
+    <token> = authentifizierter Absender, target = Empfänger.
+    notify=False (Redeem-Pfad, T4 2026-07-12): der Aussteller bekommt statt der
+    „möchte dir folgen"-Anfrage direkt den „ist jetzt mit dir verbunden"-Push
+    aus redeem_friend_invite — sonst kämen zwei Pushes für einen Scan."""
     target = (target or '').strip()
     if not target or target == token:
         return jsonify({'ok': False, 'error': 'invalid_target'}), 400
@@ -34624,14 +34937,15 @@ def _send_friend_request_core(token, target):
     # pushte. Folge: "Freundschaftsanfragen kommen nicht an" (der Empfänger merkte
     # nichts, bis er zufällig die Anfragen-Liste öffnete). Jetzt benachrichtigen wir
     # ihn sofort. Best-effort: Push-Fehler darf den 200 nicht kippen.
-    try:
-        my_name = ((_profile_load(token) or {}).get('profile', {}) or {}).get('name') or ''
-        who = my_name.strip() or 'Jemand'
-        _push_notify_async(target, 'Neue Folge-Anfrage',
-                           f'{who} möchte dir folgen.',
-                           data={'type': 'friend_request', 'from': token})
-    except Exception:
-        pass
+    if notify:
+        try:
+            my_name = ((_profile_load(token) or {}).get('profile', {}) or {}).get('name') or ''
+            who = my_name.strip() or 'Jemand'
+            _push_notify_async(target, 'Neue Folge-Anfrage',
+                               f'{who} möchte dir folgen.',
+                               data={'type': 'friend_request', 'from': token})
+        except Exception:
+            pass
     return jsonify({'ok': True})
 
 
@@ -34702,16 +35016,67 @@ def mint_friend_invite(token):
 
 @app.route('/api/user/friend-requests/<token>/redeem-invite', methods=['POST'])
 def redeem_friend_invite(token):
-    """Scanner (authentifiziert als <token>) löst den gescannten Invite ein →
-    Friend-Request an den Aussteller. Das Aussteller-Token kommt aus der
-    Signatur, NICHT vom Client — ein rohes AT-Token wird hier nie akzeptiert."""
+    """Scanner (authentifiziert als <token>) löst den gescannten Invite ein.
+    Das Aussteller-Token kommt aus der Signatur, NICHT vom Client — ein rohes
+    AT-Token wird hier nie akzeptiert.
+
+    SOFORT-VERBINDUNG + PUSH (T4, Owner 2026-07-12): der signierte Invite IST
+    die Zustimmung des Ausstellers (er hat den QR aktiv gemintet und gezeigt,
+    TTL 15 min) — der Scan verbindet daher DIREKT (beide accepted-Kanten, wie
+    accept_friend_request), statt eine pending-Anfrage liegen zu lassen. Der
+    Einladende bekam vorher KEINEN eigenen Redeem-Push; jetzt geht genau EIN
+    Push an ihn: „X ist jetzt mit dir verbunden" (type friend_accept → Pref
+    friend_accepted; der friend_request-Push des Cores ist via notify=False
+    unterdrückt — kein Doppel-Push pro Scan). Tests:
+    tests/test_redeem_invite_push.py."""
     body = request.get_json(silent=True) or {}
     issuer = _verify_friend_invite((body.get('invite') or '').strip())
     if not issuer:
         return jsonify({'ok': False, 'error': 'invalid_or_expired_invite'}), 400
     if issuer == token:
         return jsonify({'ok': False, 'error': 'own_invite'}), 400
-    return _send_friend_request_core(token, issuer)
+    resp = _send_friend_request_core(token, issuer, notify=False)
+    status = resp[1] if isinstance(resp, tuple) else resp.status_code
+    if status != 200:
+        return resp   # rate_limited / invalid_target — 1:1 durchreichen
+    payload = ((resp[0] if isinstance(resp, tuple) else resp)
+               .get_json(silent=True) or {})
+    if payload.get('silenced') or payload.get('already_friends'):
+        # Block-Fall bleibt still; Bestands-Freundschaft ist keine NEUE
+        # Verbindung → kein Push (nichts behaupten, was nicht passiert ist).
+        return resp
+    # ── Auto-Accept (Muster accept_friend_request, atomare Edge-Upserts) ──
+    me = _friends_load(issuer)     # Aussteller
+    them = _friends_load(token)    # Scanner
+    sb_primary = SB_AVAILABLE and sb is not None
+    if sb_primary:
+        ok_a = _friends_edge_upsert(issuer, token, 'accepted')
+        ok_b = _friends_edge_upsert(token, issuer, 'accepted')
+        if not (ok_a and ok_b):
+            sb_primary = False
+    me['requests_in'] = [r for r in (me.get('requests_in') or []) if r != token]
+    them['requests_out'] = [r for r in (them.get('requests_out') or [])
+                            if r != issuer]
+    me.setdefault('friends', [])
+    them.setdefault('friends', [])
+    if token not in me['friends']: me['friends'].append(token)
+    if issuer not in them['friends']: them['friends'].append(issuer)
+    if sb_primary:
+        _friends_save_disk_only(issuer, me)
+        _friends_save_disk_only(token, them)
+    else:
+        _friends_save(issuer, me)
+        _friends_save(token, them)
+    # Push an den EINLADENDEN — best-effort, kippt den 200 nie.
+    try:
+        my_name = ((_profile_load(token) or {}).get('profile', {}) or {}).get('name') or ''
+        who = my_name.strip() or 'Jemand'
+        _push_notify_async(issuer, 'Neue Crew-Verbindung',
+                           f'{who} ist jetzt mit dir verbunden.',
+                           data={'type': 'friend_accept', 'from': token})
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'connected': True})
 
 
 @app.route('/api/user/friend-requests/<token>/accept', methods=['POST'])

@@ -179,6 +179,31 @@ def test_standby():
     assert r['text']['subtitle'] == 'Basis Frankfurt'
 
 
+def test_freier_tag_servertext_heute_frei():
+    # B2 (Tibor 2026-07-12): Roster-FREI-Tag → SERVER sagt „Heute frei"
+    # (vorher „Basis Frankfurt", während iOS lokal „heute frei" ableitete →
+    # zwei Texte für dieselbe Person). Kein Subtitle: wo jemand seinen freien
+    # Tag verbringt, wissen wir nicht.
+    r = _resolve(_utc(12, 0), sectors=[], duty='free')
+    assert r['state'] == STATE_HOME
+    assert r['text']['title'] == 'Heute frei'
+    assert r['text']['subtitle'] is None
+
+
+def test_urlaub_servertext_im_urlaub():
+    r = _resolve(_utc(12, 0), sectors=[], duty='vacation')
+    assert r['state'] == STATE_HOME
+    assert r['text']['title'] == 'Im Urlaub'
+
+
+def test_freier_ruhetag_am_layover_gewinnt_layover():
+    # FREI-Tag MIT Layover-Ort (Ruhetag auf Tour) → der Aufenthaltsort ist
+    # die wichtigere Wahrheit als „Heute frei".
+    r = _resolve(_utc(12, 0), sectors=[], duty='free', layover_iata='BCN')
+    assert r['state'] == STATE_LAYOVER
+    assert r['text']['title'] == 'Layover Barcelona'
+
+
 # ── aircraft_live-Beweis schlägt die Uhr — in BEIDE Richtungen ───────────────
 
 def test_airborne_beweis_schlaegt_uhr_nach_plan_ankunft():

@@ -212,3 +212,112 @@ def test_route_memo_60s(client, synth_days, monkeypatch):
 def test_pii_prefix_registered():
     """Der Passport trägt die komplette Roster-Historie → GET-PII-Gate."""
     assert "/api/user/passport-stats/" in A._BUG004_GET_PII_PREFIXES
+
+
+# ── Friend-Passport (P3, Owner 2026-07-12) ─────────────────────────────────
+
+FRIEND = "PASSPORT-FRIEND-TOKEN"
+
+
+@pytest.fixture
+def friend_setup(monkeypatch):
+    """Freundschafts-Kante TOKEN→FRIEND + Roster des FREUNDES (2 Legs CGN↔PMI).
+
+    Der EIGENE Roster bleibt leer — so beweist der OK-Test, dass wirklich die
+    Sektoren des FREUNDES aggregiert werden (flights==2, CGN/PMI), nicht die
+    eigenen. share_roster ist default an ({} = nicht explizit False)."""
+    friend_days = {
+        "2026-05-10": {"ical_sectors": [
+            _sector("EW910", "CGN", "PMI",
+                    "2026-05-10T06:00:00+00:00", "2026-05-10T08:20:00+00:00"),
+            _sector("EW911", "PMI", "CGN",
+                    "2026-05-10T09:10:00+00:00", "2026-05-10T11:30:00+00:00"),
+        ]},
+    }
+    monkeypatch.setattr(A, "_manual_briefings_load",
+                        lambda t: friend_days if t == FRIEND else {})
+    monkeypatch.setattr(A, "_ical_briefings_load", lambda t: {})
+    monkeypatch.setattr(A, "_passport_route_duration_min",
+                        lambda frm, to, budget: None)
+    monkeypatch.setattr(A, "_friends_load",
+                        lambda t: {"friends": [FRIEND]} if t == TOKEN
+                        else {"friends": []})
+    monkeypatch.setattr(A, "_profile_load", lambda t: {})
+    A._PASSPORT_STATS_CACHE.clear()
+    return friend_days
+
+
+def _friend_get(client, friend=FRIEND, rng="all", headers=None):
+    return client.get(f"/api/user/friend-passport/{TOKEN}",
+                      query_string={"friend": friend, "range": rng},
+                      headers=_auth() if headers is None else headers)
+
+
+def test_friend_route_requires_bearer(client, friend_setup):
+    r = _friend_get(client, headers={})
+    assert r.status_code == 401
+    r = _friend_get(client, headers={"Authorization": "Bearer WRONG-TOKEN"})
+    assert r.status_code == 401
+
+
+def test_friend_route_missing_friend_param(client, friend_setup):
+    r = client.get(f"/api/user/friend-passport/{TOKEN}", headers=_auth())
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "missing_friend"
+
+
+def test_friend_route_bad_range(client, friend_setup):
+    r = _friend_get(client, rng="letzte-woche")
+    assert r.status_code == 400
+
+
+def test_friend_route_not_friends(client, friend_setup):
+    r = _friend_get(client, friend="TOTALLY-UNKNOWN-TOKEN")
+    assert r.status_code == 403
+    body = r.get_json()
+    assert body["error"] == "not_friends" and body["shared"] is False
+
+
+def test_friend_route_not_shared(client, friend_setup, monkeypatch):
+    """share_roster EXPLIZIT False → 403 not_shared (Privacy-Pfad wie
+    friends-today/Leaderboard: Opt-out-Profile geben nichts preis)."""
+    monkeypatch.setattr(A, "_profile_load",
+                        lambda t: {"share_roster": False} if t == FRIEND else {})
+    r = _friend_get(client)
+    assert r.status_code == 403
+    body = r.get_json()
+    assert body["error"] == "not_shared" and body["shared"] is False
+
+
+def test_friend_route_ok_returns_friend_stats(client, friend_setup):
+    r = _friend_get(client, rng="all")
+    assert r.status_code == 200
+    body = r.get_json()
+    # Payload = 1:1 der passport-stats-Vertrag (iOS-PassportStats-Codable).
+    assert body["ok"] is True and body["has_data"] is True
+    assert body["flights"] == 2
+    assert body["airports"] == ["CGN", "PMI"]
+    assert body["airlines"] == ["EW"]
+    assert body["range"] == "all"
+    # Range-Filter greift auch für Freunde.
+    r2 = _friend_get(client, rng="2025")
+    assert r2.get_json()["flights"] == 0
+
+
+def test_friend_route_resolves_shortened_token(client, friend_setup):
+    """PII-gekürzte friends-today-Variante (full[:16] + '…') wird über die
+    eigene Freundschafts-Kante auf den vollen Token aufgelöst."""
+    r = _friend_get(client, friend=FRIEND[:16] + "…")
+    assert r.status_code == 200
+    assert r.get_json()["flights"] == 2
+
+
+def test_friend_route_shares_memo_with_owner_route(client, friend_setup):
+    """Cache-Key ist der FREUND-Token → Owner- und Friend-Read teilen sich den
+    60-s-Memo-Eintrag (kein Doppel-Compute)."""
+    assert _friend_get(client).status_code == 200
+    assert (FRIEND, "all") in A._PASSPORT_STATS_CACHE
+
+
+def test_friend_pii_prefix_registered():
+    assert "/api/user/friend-passport/" in A._BUG004_GET_PII_PREFIXES

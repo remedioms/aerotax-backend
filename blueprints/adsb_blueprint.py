@@ -2985,8 +2985,12 @@ ADSB_LOL_AREA_TIMEOUT = 8
 
 
 def _parse_hub_points(raw):
-    """"lat,lon; lat,lon" → [(lat,lon)]. Leer → Default FRA+MUC."""
-    default = [(50.033, 8.570), (48.353, 11.786)]      # FRA, MUC
+    """"lat,lon; lat,lon" → [(lat,lon)]. Leer → Default deutsche Crew-Hubs+ZRH."""
+    # Owner 2026-07-12: ZRH/BER/CGN/DUS zusätzlich — dort sind auch Crews
+    # stationiert; gleiche dichte Taxi-/Anflug-Erfassung wie FRA/MUC.
+    default = [(50.033, 8.570), (48.353, 11.786),      # FRA, MUC
+               (47.465, 8.549), (52.367, 13.503),      # ZRH, BER
+               (50.866, 7.143), (51.289, 6.767)]       # CGN, DUS
     raw = (raw or "").strip()
     if not raw:
         return default

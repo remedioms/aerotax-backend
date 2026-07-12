@@ -487,7 +487,14 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             ts = _iso_z(_dt.datetime.fromtimestamp(float(ts), _dt.timezone.utc))
         else:
             ts = _iso_z(_parse_iso(ts)) if ts else None
+        # track/gs MITGEBEN (Owner 2026-07-12, „Glyph schief"): der Store
+        # (build_live_lookup) hat Kurs+Speed längst — ohne sie stand das
+        # Flieger-Symbol der Crew-Live-Mini-Map in Ruhelage (nie in
+        # Flugrichtung gedreht) und das Dead-Reckoning der Karte lief leer.
+        # ADDITIV: iOS-Decoder (AXLifecycleLive) kennt die Keys bereits.
         return {'lat': lv['lat'], 'lon': lv['lon'], 'ts': ts,
+                'track': _num(lv.get('track')), 'gs': _num(lv.get('gs')),
+                'on_ground': False,
                 'source': lv.get('source') or 'aircraft_live'}
 
     def _result(state, leg=None, idx=None, position=None, title=None,
@@ -505,16 +512,29 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             'pre_phase_label': PRE_PHASE_LABEL.get(pre_phase),
         }
 
-    # ── Leg-loser Tag: standby / Layover-Ruhetag / wirklich kein Dienst ─────
+    # ── Leg-loser Tag: standby / Layover-Ruhetag / frei / kein Dienst ────────
     if not legs:
         lay = str(layover_iata or '').strip().upper() or None
         if lay and hb and lay == hb:
             lay = None            # „Layover an der Homebase" gibt es nicht
-        if str(duty or '').strip().lower() in ('standby', 'sby', 'reserve'):
+        d = str(duty or '').strip().lower()
+        if d in ('standby', 'sby', 'reserve'):
             sub = f'Basis {city(hb)}' if hb else None
             return _result(STATE_STANDBY, title='Standby', subtitle=sub)
         if lay:
             return _result(STATE_LAYOVER, title=f'Layover {city(lay)}')
+        # FREI/URLAUB (B2 Tibor 2026-07-12, „Wieso steht bei euch nicht das
+        # Gleiche"): der Resolver kannte nur Sektoren — ein Roster-FREI-Tag
+        # wurde „Basis Frankfurt", während iOS lokal „heute frei" ableitete →
+        # ZWEI Texte für dieselbe Person je nach Screen/Build. Jetzt liefert
+        # der SERVER den Frei-Text (duty='free'|'vacation' aus klass/marker,
+        # siehe app._crew_state_for_day) — EINE Textquelle. Bewusst OHNE
+        # „Basis X"-Subtitle: wo jemand seinen freien Tag verbringt, wissen
+        # wir nicht (nichts erfinden).
+        if d in ('vacation', 'urlaub', 'vac'):
+            return _result(STATE_HOME, title='Im Urlaub')
+        if d in ('free', 'frei', 'off'):
+            return _result(STATE_HOME, title='Heute frei')
         # „Basis Frankfurt" NUR wenn wirklich kein Dienst (Owner-Vorgabe).
         title = f'Basis {city(hb)}' if hb else 'Kein Dienst'
         return _result(STATE_HOME, title=title)
@@ -700,6 +720,49 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
     return _result(STATE_LANDED, leg=leg, idx=idx,
                    title=f"Gelandet in {city(leg['dep_ap'])}",
                    subtitle=wait_txt, confidence=conf, pre_phase=pre)
+
+
+# ── Über-Mitternacht-Spillover (Jennifer-Fall, Owner 2026-07-12) ─────────────
+
+def yesterday_leg_reaches_into_today(sectors, now,
+                                     extra_min=_ARR_BUFFER_MIN + _LANDED_RECENT_MIN):
+    """PURES Vorab-Gate: erreicht ein GESTRIGER Leg (dep gestern, arr am
+    Folgetag — Über-Nacht-Rückflug wie SIN→FRA dep 23:40 LT) den heutigen
+    Betriebstag? friends-today resolved den crew_state sonst NUR aus dem
+    heutigen Roster-Tag → nach Berliner Mitternacht war die noch FLIEGENDE
+    Crew plötzlich „Basis Frankfurt"/falscher Ort (Jennifer 2026-07-12/13:
+    dep 12.07 15:40Z SIN→FRA, arr 13.07 — ab 00:00 Berlin zeigte der Feed
+    das falsche Leg statt „Fliegt gerade SIN → FRA").
+
+    True, wenn irgendein Leg der (gestrigen) Sektoren bereits abgeflogen ist
+    (dep ≤ now) und sein Fenster inkl. Verspätungs-Puffer + „frisch
+    gelandet"-Fenster noch bis `now` reicht — nur dann lohnt der (teurere)
+    volle Resolver-Lauf über die gestrigen Sektoren. Wirft nie."""
+    try:
+        now = _parse_iso(now)
+        if now is None:
+            return False
+        for leg in _norm_legs(sectors):
+            if leg['dep'] <= now < leg['arr'] + _dt.timedelta(minutes=extra_min):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def spillover_wins(today_state, yesterday_state):
+    """PUR: darf der GESTRIGE Über-Nacht-Zustand den heutigen ersetzen?
+    Nur wenn heute nichts AKTIVES läuft (kein pre_flight/flying/landed des
+    heutigen Tages) UND gestern nachweislich noch geflogen/frisch gelandet
+    wird. So gewinnt nie ein staler Gestern-Layover über einen echten
+    Heute-Zustand."""
+    t = ((today_state or {}).get('state') if isinstance(today_state, dict)
+         else today_state)
+    y = ((yesterday_state or {}).get('state') if isinstance(yesterday_state, dict)
+         else yesterday_state)
+    if t in (STATE_PRE_FLIGHT, STATE_FLYING, STATE_LANDED):
+        return False
+    return y in (STATE_FLYING, STATE_LANDED)
 
 
 # ── Frische-Wahl: Briefing schlägt stalen Snapshot ───────────────────────────

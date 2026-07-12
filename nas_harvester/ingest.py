@@ -514,8 +514,18 @@ class Ingest:
             except Exception:
                 return []
 
-        results = await asyncio.gather(
-            *(_one_tile(t) for t in self._s.airport_tiles))
+        # FAST/SLOW-Split (Owner 2026-07-12 „für die anderen Airports mehr
+        # Sekunden einplanen"): die ersten AIRPORT_FAST_N Kacheln (FRA/MUC)
+        # laufen jeden Tick (60 s), alle weiteren (ZRH/BER/CGN/DUS + Übersee)
+        # nur jede 2. Runde (~120 s) — halbiert den FR24-Fußabdruck der
+        # Neben-Hubs, Taxi bleibt mit 5-10 Punkten gut abgedeckt.
+        self._apt_tick = getattr(self, "_apt_tick", 0) + 1
+        fast_n = int(os.getenv("AIRPORT_FAST_N", "2"))
+        slow_every = max(2, int(os.getenv("AIRPORT_SLOW_EVERY", "2")))
+        tiles = list(self._s.airport_tiles)
+        due = tiles[:fast_n] + (tiles[fast_n:]
+                                if self._apt_tick % slow_every == 0 else [])
+        results = await asyncio.gather(*(_one_tile(t) for t in due))
         n_apt = 0
         for flights in results:
             arows, aseen = [], set()
