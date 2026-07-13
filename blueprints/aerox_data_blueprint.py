@@ -2889,6 +2889,10 @@ def ax_callsign(callsign):
     lon = _f(request.args.get('lon') or request.args.get('lng'))
     track = _f(request.args.get('track') or request.args.get('heading'))
     gs = _f(request.args.get('gs') or request.args.get('speed') or request.args.get('gspeed'))
+    # Höhe (ft) additiv — die FlightState-Engine braucht sie fürs Airborne-Gate
+    # (alt>1000). Fehlt sie (alte Clients), fällt das Gate auf gs>=80 zurück.
+    alt = _f(request.args.get('alt') or request.args.get('altitude')
+             or request.args.get('alt_ft'))
     og = (request.args.get('on_ground') or request.args.get('ground') or '').strip().lower()
     on_ground_known = bool(og)
     on_ground = og in ('1', 'true', 'yes', 'y')
@@ -2959,7 +2963,10 @@ def ax_callsign(callsign):
             callsign=cs, reg=(route.get('reg') or reg),
             origin=origin_iata, dest=dest_iata,
             on_ground=(on_ground if on_ground_known else None),
-            lat=lat, lon=lon, allow_paid=False)
+            lat=lat, lon=lon, allow_paid=False,
+            # Kinematik durchreichen (additiv) — das Airborne-Gate der Engine
+            # (FLIGHTSTATE_LIVE_CALLSIGN) braucht gs/alt statt des rohen on_ground.
+            gs=gs, alt=alt, track=track)
     except Exception:
         st = None
     if st:
@@ -3469,6 +3476,107 @@ def _flight_times_free_first(flight_no, date, origin, dest,
     return out
 
 
+# status_category-Alphabet dieser Fläche (iOS `schedule.info.status_category`):
+# nur diese drei Legacy-Werte werden je gesetzt — Vorzustände (geplant/boarding/
+# rollt/unbekannt) bleiben leer, exakt wie die alte Substring-Ableitung. Das
+# Mapping übersetzt die kanonische FlightState-Phase in genau dieses Alphabet.
+_PHASE_TO_STATUS_CATEGORY = {
+    'ARRIVED': 'arrived', 'LANDED': 'arrived', 'DIVERTED': 'arrived',
+    'AIRBORNE': 'enroute', 'APPROACH': 'enroute',
+    'CANCELLED': 'cancelled',
+    # SCHEDULED/BOARDING/TAXI_OUT/UNKNOWN → kein Legacy-Wert (leer bleiben)
+}
+
+
+def _iso_offset_to_epoch(iso):
+    """Station-Offset-/Z-ISO (wie _obs_rows_to_facts sie liefert, z.B.
+    '2026-07-09T18:05:00+02:00') → UTC-Epoch, oder None. Naiv = als UTC gelesen."""
+    if not iso:
+        return None
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        s = str(iso).strip()
+        if s.endswith('Z') or s.endswith('z'):
+            s = s[:-1] + '+00:00'
+        dt = _dt.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _status_category_from_facts(flight, facts, now=None):
+    """FlightState-Engine-Ableitung von `status_category` aus den GETEILTEN
+    Board-Fakten (`facts` aus _flight_facts_from_obs) — reuse, KEIN neuer I/O.
+
+    Ersetzt die alte rohe Substring-Suche (arr_status 'gelandet' → arrived,
+    dep_status 'abgeflogen' → enroute), die keine Physik kannte:
+      • ein dep-seitiges „Abgeflogen" = OFF-BLOCK, nicht airborne → die Engine
+        macht daraus TAXI_OUT (kein Legacy-Wert), NICHT 'enroute' (Geister-
+        Airborne eines rollenden Fliegers).
+      • ein arr-seitiges „Gelandet", das physisch unmöglich früh kommt (11h-Flug
+        LH454→SFO, dessen Ankunftstafel um 13:03 fälschlich „Gelandet" trägt),
+        wird verworfen: PLAUSI-GATE — 'arrived' nur, wenn `now` frühestens
+        sched_arr−15min in Ziel-TZ erreicht hat.
+
+    Die Engine (obs_from_board_merged → resolve_flight_state) liefert dieselbe
+    Wahrheit wie crew_state/flights_live; prior_state/remember_state geben die
+    Landungs-Monotonie (einmal terminal → kein Rückfall auf enroute).
+    Konservativ: wirft nie → bei jeglichem Fehler None (Aufrufer lässt leer)."""
+    try:
+        now = now or time.time()
+        from blueprints.flight_state_collectors import (
+            build_keys as _fs_bk, obs_from_board_merged as _fs_obm)
+        from blueprints.flight_state import (
+            resolve_flight_state as _fs_resolve, LANDED as _FS_LANDED,
+            ARRIVED as _FS_ARRIVED,
+            prior_state as _fs_prior, remember_state as _fs_remember)
+        fn = (flight.get('flight') or '').replace(' ', '').upper()
+        dep = (flight.get('dep_iata') or facts.get('dep_iata') or '').upper() or None
+        arr = (flight.get('arr_iata') or facts.get('arr_iata') or '').upper() or None
+        date = ((facts.get('obs_date') or flight.get('date') or '')[:10]) or None
+        # facts → merged-Shape, den obs_from_board_merged liest. Die Zeiten sind
+        # bereits Station-Offset-ISO (nicht board-lokales HHMM) → board_to_iso=None,
+        # sie fließen 1:1 durch. delay_known aus vorhandenen Delay-Werten abgeleitet.
+        _delay_known = (facts.get('arr_delay_min') is not None
+                        or facts.get('dep_delay_min') is not None)
+        merged = {
+            'status_dep': facts.get('dep_status'),
+            'status_arr': facts.get('arr_status'),
+            'cancelled': bool(facts.get('cancelled')),
+            'sched_dep': facts.get('sched_dep'), 'esti_dep': facts.get('est_dep'),
+            'sched_arr': facts.get('sched_arr'), 'esti_arr': facts.get('est_arr'),
+            'delay_known': _delay_known,
+            'dep_delay_min': facts.get('dep_delay_min'),
+            'arr_delay_min': facts.get('arr_delay_min'),
+            'reg': facts.get('reg'), 'aircraft': facts.get('type'),
+        }
+        keys = _fs_bk(
+            fn, date, dep, arr, roster_tail=facts.get('reg'),
+            sched_dep_iso=facts.get('sched_dep'), sched_arr_iso=facts.get('sched_arr'),
+            callsign=flight.get('callsign'),
+            dep_ll=_iata_latlon(dep or ''), arr_ll=_iata_latlon(arr or ''),
+            dep_elev_ft=_iata_elev_ft(dep or ''))
+        obs = _fs_obm(merged, keys, now=now, board_to_iso=None)
+        fs = _fs_resolve(keys, obs, now=now, prior=_fs_prior(fn, date))
+        _fs_remember(fs, now=now)
+        phase = fs.get('phase')
+        cat = _PHASE_TO_STATUS_CATEGORY.get(phase)
+        # PLAUSI-GATE für die terminale Ankunft: eine physisch unmögliche Landung
+        # (Board „Gelandet", aber now weit vor der Soll-Ankunft) darf NICHT als
+        # 'arrived' ausgegeben werden. Nur greifen, wenn eine echte Soll-Ankunft
+        # bekannt ist — sonst der Engine-Wahrheit vertrauen (kein Ausschluss ins
+        # Blaue). DIVERTED (Landung woanders) ist ausgenommen — echtes Terminal.
+        if cat == 'arrived' and phase in (_FS_LANDED, _FS_ARRIVED):
+            sa_ep = _iso_offset_to_epoch(facts.get('sched_arr'))
+            if sa_ep is not None and now < (sa_ep - 15 * 60):
+                cat = None            # implausibel früh → keine Geister-Landung
+        return cat
+    except Exception:
+        return None
+
+
 def _enrich_flight_status_with_obs(flight, date=None):
     """P4-Verdrahtung: füllt fehlende Zeit-/Gate-/Status-Felder eines
     FlightStatusInfo-Dicts (resolve-flight/-callsign → iOS `schedule.info`) aus den
@@ -3508,14 +3616,15 @@ def _enrich_flight_status_with_obs(flight, date=None):
     if flight.get('arr_delay_min') is None and facts.get('arr_delay_min') is not None:
         flight['arr_delay_min'] = facts['arr_delay_min']
     if not flight.get('status_category'):
-        _as = (facts.get('arr_status') or '').lower()
-        _ds = (facts.get('dep_status') or '').lower()
-        if any(w in _as for w in ('land', 'arriv', 'gelandet', 'angekomm')):
-            flight['status_category'] = 'arrived'
-        elif facts.get('cancelled'):
-            flight['status_category'] = 'cancelled'
-        elif any(w in _ds for w in ('abgeflog', 'departed', 'airborne', 'started')):
-            flight['status_category'] = 'enroute'
+        # FLIGHTSTATE-Engine statt roher Substring-Ableitung (Owner 2026-07-13):
+        # dieselbe Wahrheit wie crew_state/flights_live — Taxi-„Abgeflogen" wird
+        # NICHT enroute (Geister-Airborne), physisch unmögliche Landung nicht
+        # arrived (Plausi-Gate). Reuse der schon geladenen `facts` (kein I/O).
+        # Fällt die Engine aus (None), bleibt status_category leer (ehrlich), statt
+        # auf die alte Physik-lose Substring-Heuristik zurückzufallen.
+        _cat = _status_category_from_facts(flight, facts)
+        if _cat:
+            flight['status_category'] = _cat
     # FREE-FIRST-ZEITEN (Owner: free FR24 zuerst, paid Backup, EINE Stelle): fehlen
     # nach den Board-Obs die Soll-Zeiten (typisch Auslandsflug — Abflughafen nicht
     # gescraped), hol sie ZUERST gratis via FR24-gRPC-Korridor, paid nur wenn das
@@ -6050,7 +6159,18 @@ def _inbound_arr_row_by_reg(dep_iata, reg):
     und die noch nicht gelandet ist → der physische Zubringer mitsamt echter
     IATA-Flugnummer/Herkunft/Soll+Ist-Ankunft. GRATIS: nur der bereits gefüllte
     In-Memory-Board-Cache (kein Fetch, kein Spend — der Poller hält die Basis-
-    Boards warm). None-safe."""
+    Boards warm). None-safe.
+
+    FlightState-Angleich (Owner 2026-07-13): die „schon gelandet?"-Erkennung des
+    Zubringers läuft jetzt über die EINE seiten-bewusste Board-Klassifikation der
+    Engine (`classify_board_status(status,'arr')` → LANDED == hart), NICHT über
+    einen rohen Substring. Ein arr-seitiges „arrival expected / erwartet" (enthält
+    das Substring „arriv…") oder „Expected 14:05" gilt so nicht mehr fälschlich
+    als gelandet und blendet den kommenden Zubringer nicht mehr aus. PLUS
+    Ankunfts-Zeit-Plausi: eine „gelandet"-Behauptung, deren Soll/Ist-Ankunft
+    noch klar in der ZUKUNFT liegt (> 5 min voraus, Board/Wanduhr → UTC), ist
+    physisch unmöglich (die Maschine kann nicht gelandet sein, bevor sie ankommt)
+    → verworfen, die Row bleibt als kommender Zubringer erhalten."""
     cached = _life_app('_cached_board_rows')
     if cached is None or not dep_iata or not reg:
         return None
@@ -6061,13 +6181,42 @@ def _inbound_arr_row_by_reg(dep_iata, reg):
     target = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
     if not target:
         return None
-    landed = ('gelandet', 'landed', 'arrived', 'gepäck', 'baggage', 'on blocks',
-              'at gate')
+    try:
+        from blueprints.flight_state_collectors import classify_board_status
+        from blueprints.flight_state import LANDED as _FS_LANDED
+    except Exception:
+        classify_board_status = None
+        _FS_LANDED = 'LANDED'
+    to_utc = _life_app('_board_local_to_utc_iso')
+    now_ep = time.time()
+
+    def _landed_impossible(r):
+        """True, wenn die „gelandet"-Behauptung durch eine noch in der Zukunft
+        liegende Ankunftszeit widerlegt ist (Board-Zeit → UTC; Ist bevorzugt,
+        sonst Soll). Ohne parsebare Zeit: keine Widerlegung (False)."""
+        if not to_utc:
+            return False
+        for hhmm in (r.get('esti'), r.get('sched')):
+            if not hhmm:
+                continue
+            iso = to_utc(hhmm, dep_iata)
+            ep = _iso_to_epoch(iso) if iso else None
+            if ep is not None:
+                return ep > (now_ep + 300)   # Ankunft > 5 min in der Zukunft
+        return False
+
     for r in rows:
         rr = re.sub(r'[^A-Z0-9]', '', (r.get('reg') or '').upper())
         if rr and rr == target:
-            st = (r.get('status') or '').lower()
-            if any(m in st for m in landed):
+            st = r.get('status') or ''
+            if classify_board_status is not None:
+                ph, hard, _ = classify_board_status(st, 'arr')
+                is_landed = (hard and ph == _FS_LANDED)
+            else:
+                is_landed = any(m in st.lower() for m in (
+                    'gelandet', 'landed', 'arrived', 'gepäck', 'baggage',
+                    'on blocks', 'at gate'))
+            if is_landed and not _landed_impossible(r):
                 return None      # schon da → kein „kommender" Zubringer mehr
             return r
     return None
@@ -6196,6 +6345,61 @@ def _rotation_positioning_row(flight_no, date, dep_iata, arr_iata, my_dep_utc=No
                 continue
         return row
     return None
+
+
+def _inbound_pos_airborne_via_engine(inbound_fn, inbound_origin, dep, pos,
+                                     merged_in, ac_type=None):
+    """Läuft den Zubringer-Leg (inbound_origin→dep) durch die REINE FlightState-
+    Engine (dieselbe wie crew_state/flights_live) und gibt True zurück, wenn die
+    Engine eine Live-Position rendert (phase ∈ {AIRBORNE,APPROACH,DIVERTED} und
+    das Airborne-Gate hat bestanden). Ersetzt das §1.2-Antipattern `not
+    pos.get('on_ground')` — ein rollender/pushback-Zubringer (on_ground=false,
+    alt=None) gilt so nicht mehr als „in der Luft".
+
+    KEIN neuer I/O: reuse des schon geladenen Live-Fix `pos` (obs_from_pos) und
+    des schon geladenen Board-Merge `merged_in` (obs_from_board_merged — Landung/
+    Phase seiten-bewusst, damit ein arr-seitiges „gelandet" die Position ehrlich
+    nicht mehr als fliegend rendert). Fällt bei Import-/Laufzeitfehler
+    KONSERVATIV auf das alte on_ground-Verhalten zurück (nie strenger als vorher
+    ohne Engine — additiv am Wire). None-safe."""
+    if not pos:
+        return False
+    try:
+        from blueprints.flight_state_collectors import (
+            build_keys as _bk, obs_from_board_merged as _obm,
+            obs_from_pos as _op)
+        from blueprints.flight_state import (
+            resolve_flight_state as _resolve, project_flight_live as _proj,
+            prior_state as _prior, remember_state as _remember)
+    except Exception:
+        # Engine nicht verfügbar → altes Verhalten (rohes on_ground-Bit).
+        return not pos.get('on_ground')
+    try:
+        to_utc = _life_app('_board_local_to_utc_iso')
+        m = merged_in if isinstance(merged_in, dict) else {}
+        keys = _bk(
+            inbound_fn, None, inbound_origin, dep,
+            roster_tail=(m.get('reg') or None),
+            sched_dep_iso=(to_utc(m.get('sched_dep'), inbound_origin)
+                           if (to_utc and m.get('sched_dep')) else None),
+            sched_arr_iso=(to_utc(m.get('sched_arr'), dep)
+                           if (to_utc and m.get('sched_arr')) else None),
+            dep_ll=_iata_latlon(inbound_origin or ''),
+            arr_ll=_iata_latlon(dep or ''),
+            dep_elev_ft=_iata_elev_ft(inbound_origin or ''))
+        obs = _obm(m, keys, board_to_iso=to_utc) if m else []
+        # Live-Fix als Positions-Observation (seen_ts/source aus dem Resolver).
+        obs += _op(pos, (pos.get('source') or 'adsb'))
+        prior = _prior(inbound_fn, None) if inbound_fn else None
+        fs = _resolve(keys, obs, prior=prior)
+        try:
+            _remember(fs)
+        except Exception:
+            pass
+        return _proj(fs).get('live') is not None
+    except Exception:
+        # Engine-Fehler → konservativ altes Verhalten (kein strengeres Gate).
+        return not pos.get('on_ground')
 
 
 def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
@@ -6339,25 +6543,43 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
 
     chain['inbound_flight_no'] = inbound_fn
     chain['inbound_origin'] = _airport_brief(inbound_origin)
-    # Live-Position NUR als Zubringer übernehmen, wenn die LIVE-Route DIESER
-    # Maschine auch WIRKLICH an meinem Abflughafen landet (dst == dep). Sonst
-    # fliegt der Tail gerade einen ANDEREN Leg — reg-only-ADS-B findet ihn
-    # irgendwo (Owner-Screenshot 2026-07-08 „stimmt nicht": D-ABYM real über
-    # Miami, während die Karte FRA→HND behauptet). Off-route ⇒ Position verwerfen;
-    # der Korridor-Resolver unten sucht den Flieger auf der ECHTEN Route (FRA→HND)
-    # und lässt inbound_live ehrlich null, wenn der Tail dort gar nicht fliegt.
-    _live_src, _live_dst = _route_endpoints(route)
-    pos_on_route = (bool(pos) and not pos.get('on_ground')
-                    and bool(_live_dst) and _live_dst == dep)
-    if pos_on_route:
-        chain['inbound_live'] = pos      # nur wenn wirklich in der Luft & on-route
 
     # (c) Ankunfts-Seite des Zubringers AN meinem Abflughafen: bevorzugt der
     # zentrale Dual-Side-Resolver (ehrliche delay_known-Semantik), sonst direkt
     # aus der Board-Zeile (Soll/Ist), Delay aus esti−sched (esti gesetzt = bekannt).
+    # HOCHGEZOGEN (Owner 2026-07-13): der merged-Record des Zubringers ist jetzt
+    # AUCH die Board-Quelle für die FlightState-Engine (Phase/Landung/Monotonie),
+    # deshalb vor dem Live-Gate berechnet.
     merged_in = (merged_fn(inbound_fn, dep_iata=inbound_origin, arr_iata=dep,
                            free_only=True)
                  if (merged_fn and inbound_fn) else None)
+
+    # Live-Position NUR als Zubringer übernehmen, wenn (1) die LIVE-Route DIESER
+    # Maschine auch WIRKLICH an meinem Abflughafen landet (dst == dep) — sonst
+    # fliegt der Tail gerade einen ANDEREN Leg (Owner-Screenshot 2026-07-08
+    # „stimmt nicht": D-ABYM real über Miami, während die Karte FRA→HND behauptet)
+    # UND (2) die FlightState-Engine den Zubringer-Leg als in-der-Luft projiziert.
+    #
+    # FlightState-Angleich (Owner 2026-07-13, §1.2-Antipattern-Fix): früher
+    # genügte `not pos.get('on_ground')` — ein rohes on_ground-Bit. FR24/adsb.lol
+    # lügen beim Pushback (on_ground=false, alt=None), ein rollender Zubringer galt
+    # so als „in der Luft & on-route" → inbound_live gesetzt → forecast.confidence
+    # „hoch" + „Maschine kommt aus …", obwohl sie noch am Vorfeld steht. Jetzt
+    # läuft der Zubringer-Leg (inbound_origin→dep) durch dieselbe reine Engine wie
+    # crew_state/flights_live: Board-Merge (Landung/Phase, side-aware) + der Live-
+    # Fix als Positions-Observation. inbound_live wird NUR gesetzt, wenn
+    # project_flight_live(...).live != None — d. h. das Airborne-Gate (alt/gs, nie
+    # das rohe Bit) hat bestanden und die Phase rendert eine Position (AIRBORNE/
+    # APPROACH/DIVERTED). Taxi ⇒ live=None ⇒ kein „kommt-schon"-Geist. Off-route-
+    # Positionen fallen weiterhin über den route-consistency-Vorfilter raus.
+    _live_src, _live_dst = _route_endpoints(route)
+    route_ok = bool(pos) and bool(_live_dst) and _live_dst == dep
+    pos_on_route = False
+    if route_ok:
+        pos_on_route = _inbound_pos_airborne_via_engine(
+            inbound_fn, inbound_origin, dep, pos, merged_in, ac_type)
+    if pos_on_route:
+        chain['inbound_live'] = pos      # nur wenn Engine sagt: in der Luft & on-route
     if merged_in:
         chain['inbound_sched_arr'] = merged_in.get('sched_arr') or row_sched
         chain['inbound_est_arr'] = merged_in.get('esti_arr') or row_esti
@@ -6425,7 +6647,12 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
     if inbound_origin and not chain['inbound_live'] and (reg or inbound_fn or cs):
         _snap_pos, _snap_route, _snap_reg, _snap_type = _aircraft_live_pos(
             reg=reg, flight=inbound_fn, callsign=cs, dep=dep)
-        if _snap_pos and not _snap_pos.get('on_ground'):
+        # FlightState-Gate (Owner 2026-07-13) auch hier: der NAS-Snapshot trägt
+        # ebenfalls ein rohes on_ground-Bit + kann alt=None/gs≈0 am Vorfeld sein.
+        # Dieselbe reine Engine (reuse Snapshot + Board-Merge, kein neuer I/O)
+        # entscheidet in-der-Luft — konservativer Fallback bei Engine-Fehler.
+        if _snap_pos and _inbound_pos_airborne_via_engine(
+                inbound_fn, inbound_origin, dep, _snap_pos, merged_in, ac_type):
             chain['inbound_live'] = _snap_pos
             # Wurde die Maschine per FLUGNUMMER gefunden und trägt einen ANDEREN
             # Tail als der (veraltete Roster-)Reg → DIESER ist der echte Zubringer
@@ -6589,6 +6816,10 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
         forecast['forecast_dep_delay_min'] = max(0, int(round(
             (earliest - sd).total_seconds() / 60.0)))
         forecast['min_turnaround_min'] = turn
+        # 'hoch' NUR wenn der Zubringer ECHT in der Luft ist. `inbound_live` ist
+        # jetzt engine-gegatet (Airborne-Gate + Phase rendert Position), also kein
+        # rollender/pushback-Zubringer mehr (früher rohes on_ground → falsches
+        # „hoch"). Steht die Maschine noch am Vorfeld ⇒ inbound_live=None ⇒ 'mittel'.
         airborne = bool(chain['inbound_live'])
         forecast['confidence'] = 'hoch' if (chain['inbound_est_arr'] and airborne) else 'mittel'
         d = chain['inbound_delay_min']

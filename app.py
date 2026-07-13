@@ -12843,7 +12843,8 @@ def get_friends_today(token):
                                     resolve_flight_state as _fs_resolve,
                                     project_friend_leg as _fs_proj,
                                     prior_state as _fs_prior,
-                                    remember_state as _fs_remember)
+                                    remember_state as _fs_remember,
+                                    LEGACY_STATUS as _fs_legacy_status)
                                 from blueprints.flight_state_shadow import shadow_record as _fs_shadow
                                 from blueprints.aerox_data_blueprint import (
                                     _iata_latlon, _iata_elev_ft)
@@ -12882,6 +12883,21 @@ def get_friends_today(token):
                                     flights_live[-1]['phase_conf'] = _fs['phase_conf']
                                     flights_live[-1]['eta_iso'] = _fs['times']['eta_iso']
                                     flights_live[-1]['eta_conf'] = _fs['times']['eta_conf']
+                                    # ROHSTATUS-LECK (Owner/Fable 2026-07-13): das
+                                    # Legacy-Feld 'status' blieb bislang der rohe
+                                    # Board-String (m.get('status')) — z. B. dep-side
+                                    # „Abgeflogen"/„airborne" für einen NUR rollenden
+                                    # Flieger (TAXI_OUT). Alte/andere iOS-Pfade, die
+                                    # flights_live[].status ungegatet durch
+                                    # DelayLogic.phase(...) schicken (CrewBoardingCards),
+                                    # sahen so „.airborne" für ein Taxi. Jetzt trägt
+                                    # das Feld die LEGACY_STATUS-Projektion der
+                                    # kanonischen Engine-Phase (TAXI_OUT→"GROUNDED",
+                                    # AIRBORNE→"AIRBORNE", LANDED/ARRIVED→"LANDED"…) —
+                                    # DIESELBE Wahrheit wie crew_state/phase, keine
+                                    # erfundenen Daten (rein Umbenennung der Phase).
+                                    flights_live[-1]['status'] = _fs_legacy_status.get(
+                                        _fs['phase'], flights_live[-1].get('status'))
                         except Exception:
                             pass
         except Exception:
@@ -29371,21 +29387,119 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
         s['delay_side'] = m.get('delay_side')
         s['dep_delay_min'] = m.get('dep_delay_min')
         s['arr_delay_min'] = m.get('arr_delay_min')
-        s['status'] = m.get('status')
         s['cancelled'] = bool(m.get('cancelled'))
-        # status_observed_at = ENRICH-Zeitpunkt (UTC), NICHT die Board-Zeit: die
-        # Quelle (_flight_obs_merged) trägt keinen eigenen Beobachtungs-Zeitstempel,
-        # ihr Memo ist ≤~90 s alt → ehrlich „Stand jetzt"; iOS muss die Frische
-        # der Status-Felder damit nicht mehr raten.
-        s['status_observed_at'] = now.strftime('%Y-%m-%dT%H:%M:%SZ')
         # est_*: bester Ist/Erwartet-Zeitstempel des Resolvers. Board-Esti steht in
         # STATIONS-Ortszeit (evtl. ohne Offset) → hier genau EINMAL nach echt-UTC
         # wandeln (dep mit airport_tz(from), arr mit airport_tz(to)), damit iOS den
         # Wert wie dep_iso durch den station-lokalen Formatter schicken kann OHNE
         # Doppelverschiebung. None wenn keine Esti / TZ unbekannt / unparsbar —
         # nie ein naiver String. delay_min bleibt die autoritative Zahl.
+        # (Vor dem Status-Gate berechnet: est_arr_iso ist eine Plausi-Schranke.)
         s['est_dep_iso'] = _board_local_to_utc_iso(m.get('esti_dep'), frm)
         s['est_arr_iso'] = _board_local_to_utc_iso(m.get('esti_arr'), to)
+        # ── STATUS PLAUSIBILITÄTS-/PHYSIK-GATE (Owner/Fable 2026-07-13, LH454→SFO)
+        # Bisher: der ROHE Board-Status floss ungegatet in dieses Feld und weiter
+        # in Kalender-Leg-Anzeige, Feed-Bordkarte und flights_live[].status. Manche
+        # Boards flippen für eine Flugnummer fälschlich früh auf „gelandet HH:MM";
+        # bei einem 11-h-Langstreckenflug ist das physikalisch unmöglich. Die
+        # FlightState-Engine verwirft eine solche Landung strukturell (Airborne-
+        # Gate/Monotonie/Physik) — diese Fläche fährt jetzt dieselbe Wahrheit: ein
+        # TERMINALER 'landed'-Status gilt nur, wenn die früheste physikalisch
+        # mögliche Ankunft (est_dep + Großkreis / v_max) ODER die Fahrplan-Ankunft
+        # (−15 min Slack) erreicht ist. Sonst wird der terminale Status verworfen
+        # (None) statt eine erfundene Landung zu behaupten. Nicht-terminale Status
+        # (airborne/delayed/boarding) laufen unverändert durch; fehlen die Belege
+        # → fail-open (Rohstatus bleibt). Rein additiv, konservativ, wirft nie.
+        _raw_status = m.get('status')
+        try:
+            from blueprints.leg_status_gate import gated_leg_status as _gate_status
+            # eff. Abflug (Epoch) für die physikalische Schranke: bester Ist-
+            # Zeitstempel (est_dep_iso, schon echt-UTC) vor dem Plan-dep_iso.
+            _dep_ts = None
+            for _dep_cand in (s.get('est_dep_iso'), s.get('dep_iso')):
+                if _dep_cand:
+                    try:
+                        _dts = datetime.fromisoformat(
+                            str(_dep_cand).replace('Z', '+00:00'))
+                        if _dts.tzinfo is None:
+                            _dts = _dts.replace(tzinfo=timezone.utc)
+                        _dep_ts = _dts.timestamp()
+                        break
+                    except Exception:
+                        pass
+            _dep_ll = _arr_ll = None
+            try:
+                from blueprints.aerox_data_blueprint import _iata_latlon as _ll
+                _dep_ll = _ll(frm)
+                _arr_ll = _ll(to)
+            except Exception:
+                pass
+            s['status'] = _gate_status(
+                _raw_status, now=now.timestamp(),
+                sched_arr_iso=_board_local_to_utc_iso(m.get('sched_arr'), to),
+                est_arr_iso=s.get('est_arr_iso'), dep_ts=_dep_ts,
+                dep_ll=_dep_ll, arr_ll=_arr_ll)
+        except Exception:
+            s['status'] = _raw_status        # Gate-Fehler → Rohstatus (nie brechen)
+        # status_observed_at = ENRICH-Zeitpunkt (UTC), NICHT die Board-Zeit: die
+        # Quelle (_flight_obs_merged) trägt keinen eigenen Beobachtungs-Zeitstempel,
+        # ihr Memo ist ≤~90 s alt → ehrlich „Stand jetzt"; iOS muss die Frische
+        # der Status-Felder damit nicht mehr raten.
+        s['status_observed_at'] = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+        # ── FLIGHTSTATE-ENGINE (additiv): kanonische Phase/Phase-Konfidenz an den
+        # Sektor hängen — DIESELBE Wahrheit wie crew_state/flights_live (r111–r114).
+        # Reuse des schon geladenen `m` (obs_from_board_merged) + optional der
+        # aircraft_live-Position → resolve_flight_state → phase/phase_conf. KEIN
+        # neuer I/O außer dem gratis, memoisierten aircraft_live-Read (wie
+        # flights_live). Shadow (FLIGHTSTATE_SHADOW=1) loggt Diffs; der Roh-`status`
+        # oben ist bereits physik-gegatet, die Engine-Phase kommt additiv dazu.
+        # Best-effort, nie werfend.
+        try:
+            from blueprints.flight_state_shadow import shadow_enabled as _fs_se
+            _fs_on = (_fs_se() or os.environ.get(
+                'FLIGHTSTATE_LIVE_FRIENDS', '') in ('1', 'true', 'yes'))
+            if _fs_on:
+                from blueprints.flight_state_collectors import (
+                    build_keys as _fs_bk, obs_from_board_merged as _fs_obm,
+                    obs_from_aircraft_live as _fs_oal)
+                from blueprints.flight_state import (
+                    resolve_flight_state as _fs_resolve, prior_state as _fs_prior,
+                    remember_state as _fs_remember)
+                from blueprints.flight_state_shadow import shadow_record as _fs_shadow
+                from blueprints.aerox_data_blueprint import (
+                    _iata_latlon as _fs_ll, _iata_elev_ft as _fs_elev)
+                _fs_keys = _fs_bk(
+                    op_fn, leg_date, frm, to, roster_tail=m.get('reg'),
+                    sched_dep_iso=s.get('est_dep_iso') or _board_local_to_utc_iso(
+                        m.get('sched_dep'), frm),
+                    sched_arr_iso=_board_local_to_utc_iso(m.get('sched_arr'), to),
+                    dep_ll=_fs_ll(frm), arr_ll=_fs_ll(to),
+                    dep_elev_ft=_fs_elev(frm))
+                _fs_obs = _fs_obm(m, _fs_keys, board_to_iso=_board_local_to_utc_iso)
+                # optional: gratis, memoisierter aircraft_live-Positions-Read
+                # (füllt das Airborne-/Taxi-Gate über Ozean/Russland — dieselbe
+                # Quelle wie flights_live). Best-effort, on_ground egal (die Engine
+                # entscheidet selbst per Kinematik).
+                _fs_cp = _fs_cr = _fs_crg = _fs_cty = None
+                try:
+                    from blueprints.aerox_data_blueprint import _aircraft_live_pos as _fs_alp
+                    _fs_cp, _fs_cr, _fs_crg, _fs_cty = _fs_alp(flight=op_fn, dep=to)
+                    _fs_obs += _fs_oal(_fs_cp, _fs_cr, _fs_crg, _fs_cty)
+                except Exception:
+                    pass
+                _fs = _fs_resolve(_fs_keys, _fs_obs, prior=_fs_prior(op_fn, leg_date))
+                _fs_remember(_fs)
+                if _fs_se():
+                    _fs_shadow('enrich_leg_delays', _fs_keys, _fs_obs,
+                               {'status': s.get('status'), 'cancelled': s.get('cancelled')},
+                               fs=_fs)
+                # additiv: kanonische Phase/Konfidenz (iOS ≥ Build 95 nutzt sie;
+                # alte Builds ignorieren die Extra-Keys). Roh-`status` bleibt für
+                # die deutsche Anzeige-Zeile.
+                s['phase'] = _fs['phase']
+                s['phase_conf'] = _fs['phase_conf']
+        except Exception:
+            pass
         # `tail` = Flugzeug-Kennzeichen fürs Kalender-Leg (Owner 2026-07-04:
         # „Tails auf jedem Leg im Kalender bei Crew UND Freunde"). Reines Alias auf
         # das GEMESSENE `reg` — NUR bei echtem Board/Warehouse-Treffer setzen, nie

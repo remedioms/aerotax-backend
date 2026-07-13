@@ -64,7 +64,7 @@ def _sector(flight='LH400', frm='FRA', to='MUC', dep_iso=None, arr_iso=None):
 def _merged(delay_min=None, delay_known=False, delay_side=None,
             dep_delay_min=None, arr_delay_min=None, status=None,
             cancelled=False, esti_dep=None, esti_arr=None, reg=None,
-            sides=None):
+            sides=None, sched_dep=None, sched_arr=None):
     """Ein _flight_obs_merged-artiges Dict."""
     return {
         'ok': True, 'delay_min': delay_min, 'delay_known': delay_known,
@@ -72,6 +72,7 @@ def _merged(delay_min=None, delay_known=False, delay_side=None,
         'arr_delay_min': arr_delay_min, 'status': status,
         'cancelled': cancelled, 'esti_dep': esti_dep, 'esti_arr': esti_arr,
         'reg': reg, 'sides': sides or {'dep': None, 'arr': None},
+        'sched_dep': sched_dep, 'sched_arr': sched_arr,
     }
 
 
@@ -464,6 +465,87 @@ def test_enrich_multi_leg_independent_status():
     assert secs[0]['status'] == 'landed'
     assert secs[1]['status'] == 'airborne' and secs[1]['delay_min'] == 20
     assert secs[2]['status'] == 'scheduled' and secs[2]['delay_min'] is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATUS PLAUSIBILITÄTS-/PHYSIK-GATE (Owner/Fable 2026-07-13, LH454→SFO)
+# Der ROHE Board-„gelandet" darf für einen gerade erst abgeflogenen Langstrecken-
+# flug NICHT durchgereicht werden — physikalisch unmöglich. Nicht-terminale und
+# plausible Landungen bleiben unangetastet.
+# ══════════════════════════════════════════════════════════════════════════════
+# Geo-Fixpunkte hart gemockt → das Gate hängt nicht an der Referenz-DB-
+# Verfügbarkeit (hermetisch, keine Cold-Import-Flakiness).
+_GEO = {'FRA': (50.03, 8.57), 'SFO': (37.62, -122.38), 'MUC': (48.35, 11.78)}
+
+
+def _patch_coords():
+    import blueprints.aerox_data_blueprint as ADB
+    return patch.object(ADB, '_iata_latlon', side_effect=lambda c: _GEO.get(c))
+
+
+def test_enrich_bogus_early_longhaul_landing_suppressed():
+    # LH454 FRA→SFO, gerade abgeflogen (dep vor 1 h), Board meldet fälschlich
+    # „Gelandet 13:03" → terminal, aber frühestens ~10 h später möglich →
+    # Status wird auf None gegatet (keine erfundene Landung).
+    dep = _now() - timedelta(hours=1)
+    secs = [_sector(flight='LH454', frm='FRA', to='SFO', dep_iso=_iso(dep))]
+    with _patch_coords(), patch.object(
+            A, '_flight_obs_merged',
+            return_value=_merged(delay_known=False, status='Gelandet 13:03')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    assert secs[0]['status'] is None          # unmögliche Landung verworfen
+    # Restliche Anreicherung bleibt intakt (Feld gesetzt, nicht abwesend).
+    assert 'status_observed_at' in secs[0]
+
+
+def test_enrich_plausible_longhaul_landing_passes():
+    # Derselbe Flug, aber Abflug vor 12 h → Landung längst physikalisch möglich
+    # → Rohstatus bleibt erhalten.
+    dep = _now() - timedelta(hours=12)
+    secs = [_sector(flight='LH455', frm='SFO', to='FRA', dep_iso=_iso(dep))]
+    with _patch_coords(), patch.object(
+            A, '_flight_obs_merged',
+            return_value=_merged(delay_known=True, status='Gelandet',
+                                 delay_min=0, delay_side='arr')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    assert secs[0]['status'] == 'Gelandet'
+
+
+def test_enrich_shorthaul_landing_not_over_gated():
+    # FRA→MUC Kurzstrecke, abgeflogen vor 1 h, „Landed" → physikalisch plausibel
+    # (~<1 h Flug) → Status bleibt. Schützt gegen Über-Gaten legitimer Landungen.
+    dep = _now() - timedelta(hours=1)
+    secs = [_sector(flight='LH100', frm='FRA', to='MUC', dep_iso=_iso(dep))]
+    with _patch_coords(), patch.object(
+            A, '_flight_obs_merged',
+            return_value=_merged(delay_known=True, status='Landed',
+                                 delay_min=0, delay_side='arr')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    assert secs[0]['status'] == 'Landed'
+
+
+def test_enrich_non_terminal_status_never_gated():
+    # 'airborne' auf einem gerade abgeflogenen Langstreckenflug → nie terminal →
+    # unverändert (Regression-Guard für die bestehende Feld-Semantik).
+    dep = _now() - timedelta(hours=1)
+    secs = [_sector(flight='LH454', frm='FRA', to='SFO', dep_iso=_iso(dep))]
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=True, status='airborne',
+                                           delay_min=10, delay_side='dep')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    assert secs[0]['status'] == 'airborne'
+
+
+def test_enrich_status_gate_fail_open_without_coords():
+    # Unbekannter Flughafen (keine Koordinaten) + kein sched_arr → keine Schranke
+    # beweisbar → fail-open: Rohstatus bleibt (Gate verwirft nur Unmögliches).
+    dep = _now() - timedelta(hours=1)
+    secs = [_sector(flight='LH454', frm='ZZZ', to='QQQ', dep_iso=_iso(dep))]
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=False,
+                                           status='Gelandet 13:03')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    assert secs[0]['status'] == 'Gelandet 13:03'
 
 
 def test_enrich_free_only_flag_forwarded():

@@ -639,7 +639,9 @@ def _status_is_hard(status):
 
 
 def status_for_flight(callsign=None, reg=None, date=None, origin=None, dest=None,
-                      on_ground=None, lat=None, lon=None, allow_paid=False):
+                      on_ground=None, lat=None, lon=None, allow_paid=False,
+                      gs=None, alt=None, track=None, vertical_rate=None,
+                      seen_ts=None):
     """Die EINE Status-Kaskade eines Fluges — konsistent mit route_for_flight.
 
     REIHENFOLGE (Board autoritativ, ADS-B nur zur Phasen-Ergänzung, Delay aus dem
@@ -659,8 +661,44 @@ def status_for_flight(callsign=None, reg=None, date=None, origin=None, dest=None
 
     Rückgabe (dict): phase ∈ {'airborne','landed','grounded','cancelled','unknown'},
     delay_min, delay_known, gate, terminal, sched, est, act, source
-    ('board'|'adsb'|'none'). Zeiten wie vom Board (station-lokal, wie sonst auch);
-    fehlt ein Feld → None (nie erfunden)."""
+    ('board'|'adsb'|'engine'|'none'). Zeiten wie vom Board (station-lokal, wie sonst
+    auch); fehlt ein Feld → None (nie erfunden).
+
+    ── FLIGHTSTATE-ENGINE (Layer-3-Flip, Kill-Switch FLIGHTSTATE_LIVE_CALLSIGN=1) ──
+    Ist der Kill-Switch gesetzt, übernimmt die PHASEN-AUTORITÄT die EINE Engine
+    (blueprints.flight_state.resolve_flight_state) — DIESE Fläche zeigt dann
+    DIESELBE Wahrheit wie crew_state/flights_live. status_for_flight ist damit ein
+    reiner Board-/ADS-B-COLLECTOR (DESIGN §5): die tokenisierte, seiten-bewusste
+    Board-Klassifikation + der schon geladene Positions-Fix werden zu Observations
+    geshaped, die Engine reduziert sie mit Airborne-Gate (rohes on_ground wird
+    ignoriert — FR24/adsb lügen bei Pushback), Landung-Plausi/Monotonie und
+    Sticky-Airborne. So kann ein Pushback-Flieger nie mehr 'airborne' zeigen und ein
+    stales Board un-landet keinen frischen Fix. KEIN neuer I/O — die Observations
+    kommen ausschliesslich aus dem bereits gemergten `m` + dem übergebenen Fix
+    (gs/alt/track/on_ground/seen_ts). Wirft die Engine, bleibt die (unveränderte)
+    Legacy-Phase stehen (Fallback = nie schlechter als vorher).
+
+    Zusätzlich (immer, auch ohne Flag): das Engine-PLAUSI-Gate `_landing_is_plausible`
+    verwirft eine physisch unmögliche/vor dem Abflug liegende 'landed'-Aussage.
+
+    gs/alt/track/vertical_rate/seen_ts (alle optional, additiv) speisen den
+    Positions-Fix der Engine — ohne sie bleibt der Call abwärtskompatibel."""
+    out = _legacy_status_for_flight(
+        callsign=callsign, reg=reg, date=date, origin=origin, dest=dest,
+        on_ground=on_ground, lat=lat, lon=lon, allow_paid=allow_paid)
+    _apply_flightstate_engine(
+        out, callsign=callsign, reg=reg, date=date, origin=origin, dest=dest,
+        on_ground=on_ground, lat=lat, lon=lon, allow_paid=allow_paid,
+        gs=gs, alt=alt, track=track, vertical_rate=vertical_rate, seen_ts=seen_ts)
+    return out
+
+
+def _legacy_status_for_flight(callsign=None, reg=None, date=None, origin=None,
+                              dest=None, on_ground=None, lat=None, lon=None,
+                              allow_paid=False):
+    """Die Board-/ADS-B-Kaskade (unverändertes Alt-Verhalten). Wird von
+    status_for_flight aufgerufen; die Phasen-Autorität kann die Engine übernehmen
+    (siehe status_for_flight-Docstring)."""
     from blueprints import aerox_data_blueprint as D
 
     cs = (callsign or '').strip().upper().replace(' ', '')
@@ -704,6 +742,13 @@ def status_for_flight(callsign=None, reg=None, date=None, origin=None, dest=None
         # Origin/Dest ggf. aus dem Merge nachziehen (für den on_ground-Kontext).
         origin = origin or ((m.get('dep_iata') or '').upper() or None)
         dest = dest or ((m.get('arr_iata') or '').upper() or None)
+
+    # Merged-Record + aufgelöste Strecke fürs Engine-Reuse durchreichen (KEIN
+    # zweiter Merge-Call). Private Keys — der Engine-Hook liest & entfernt sie.
+    out['_m'] = m
+    out['_origin'] = origin
+    out['_dest'] = dest
+    out['_fn'] = fn
 
     # ── 1) BOARD autoritativ: tokenisierte, seiten-bewusste Phase ──
     board_phase = None
@@ -768,6 +813,120 @@ def status_for_flight(callsign=None, reg=None, date=None, origin=None, dest=None
 
     # Kein Board, kein ADS-B-Signal → ehrlich unbekannt (Delay ggf. aus Merge da).
     return out
+
+
+# Kanonische Engine-Phase → Legacy-Status-Vokabular DIESER Fläche (identisch zum
+# app-weiten Mapping in family_watch: TAXI_OUT/BOARDING/SCHEDULED = am Boden vor
+# Abflug = 'grounded'; DIVERTED = irgendwo gelandet = 'landed'). UNKNOWN → 'unknown'.
+_ENGINE_PHASE_TO_LEGACY = {
+    'CANCELLED': 'cancelled',
+    'LANDED': 'landed', 'ARRIVED': 'landed', 'DIVERTED': 'landed',
+    'AIRBORNE': 'airborne', 'APPROACH': 'airborne',
+    'TAXI_OUT': 'grounded', 'BOARDING': 'grounded', 'SCHEDULED': 'grounded',
+    'UNKNOWN': 'unknown',
+}
+
+
+def _landing_is_plausible(out, m):
+    """PLAUSI-Gate (immer aktiv, auch ohne Kill-Switch): eine beobachtete 'landed'-
+    Aussage darf NICHT vor/gleich dem effektiven Abflug liegen — das wäre eine
+    physisch unmögliche Landung (stale/verwechselte Board-Row). Konservativ: nur
+    verwerfen, wenn BEIDE Zeiten sauber parsebar sind UND die Ankunft ≤ Abflug liegt;
+    im Zweifel (fehlende/unparsebare Zeit) NICHT verwerfen (keine erfundene Wahrheit).
+    Rückgabe True = 'landed' bleibt; False = physisch unmöglich, verwerfen."""
+    if not m:
+        return True
+    from blueprints.flight_state_collectors import _iso_or_epoch
+    dep_ts = _iso_or_epoch(m.get('esti_dep') or m.get('act_dep')
+                           or m.get('sched_dep'))
+    arr_ts = _iso_or_epoch(out.get('act') or m.get('esti_arr')
+                           or m.get('sched_arr'))
+    if dep_ts is None or arr_ts is None:
+        return True                       # nicht widerlegbar → zeigen
+    return arr_ts > dep_ts
+
+
+def _apply_flightstate_engine(out, callsign=None, reg=None, date=None, origin=None,
+                              dest=None, on_ground=None, lat=None, lon=None,
+                              allow_paid=False, gs=None, alt=None, track=None,
+                              vertical_rate=None, seen_ts=None):
+    """Phasen-Autorität an die EINE FlightState-Engine übergeben (Layer-3-Flip).
+
+    Reuse: der von _legacy_status_for_flight schon geladene Merge-Record + die
+    aufgelöste Strecke (private out['_m']/_origin/_dest/_fn) — KEIN neuer Merge-Call.
+    Der übergebene Positions-Fix (gs/alt/track/on_ground/seen_ts) wird zur Positions-
+    Observation; das Airborne-Gate der Engine ignoriert rohes on_ground.
+
+    Immer (auch ohne Flag): das PLAUSI-Gate verwirft eine physisch unmögliche
+    'landed'-Aussage. Nur mit FLIGHTSTATE_LIVE_CALLSIGN=1 übernimmt die Engine die
+    volle Phase (Monotonie/Sticky/Airborne-Gate) — sonst bleibt die Legacy-Phase.
+    Wirft nie: bei jedem Fehler bleibt out unverändert (Fallback nie schlechter)."""
+    m = out.pop('_m', None)
+    fn = out.pop('_fn', None)
+    origin = out.pop('_origin', None) or origin
+    dest = out.pop('_dest', None) or dest
+
+    # ── PLAUSI-Gate (immer): unmögliche 'landed' → auf 'grounded' zurücknehmen. ──
+    if out.get('phase') == 'landed' and out.get('source') == 'board':
+        try:
+            if not _landing_is_plausible(out, m):
+                out['phase'] = 'grounded'
+                out['act'] = None
+        except Exception:
+            pass
+
+    import os
+    if os.environ.get('FLIGHTSTATE_LIVE_CALLSIGN', '') not in ('1', 'true', 'yes'):
+        return
+    try:
+        from blueprints import aerox_data_blueprint as D
+        from blueprints.flight_state import (
+            resolve_flight_state, prior_state, remember_state)
+        from blueprints.flight_state_collectors import (
+            build_keys, obs_from_board_merged, Observation)
+
+        cs = (callsign or '').strip().upper().replace(' ', '') or None
+        fn = fn or cs
+
+        def _ll(code):
+            try:
+                return D._iata_latlon((code or '').upper())
+            except Exception:
+                return None
+
+        keys = build_keys(
+            fn, date, origin, dest, roster_tail=reg, callsign=cs,
+            dep_ll=_ll(origin), arr_ll=_ll(dest))
+
+        obs = obs_from_board_merged(m or {}, keys)
+        # Positions-Observation aus dem übergebenen Fix (kein Re-Fetch). Nur wenn
+        # es überhaupt ein Positions-Signal gibt (Koordinaten ODER on_ground/gs/alt).
+        if (lat is not None and lon is not None) or on_ground is not None \
+                or gs is not None or alt is not None:
+            from blueprints.flight_state_collectors import _obs_ts_or_none
+            import time as _t
+            _now = _t.time()
+            obs.append(Observation('position', {
+                'lat': lat, 'lon': lon, 'track': track,
+                'gs_kt': gs, 'alt_ft': alt, 'vertical_rate': vertical_rate,
+                'on_ground_raw': on_ground, 'position_source': 0,
+            }, 'adsb', _obs_ts_or_none(seen_ts, _now)))
+
+        fs = resolve_flight_state(keys, obs, prior=prior_state(fn, date))
+        try:
+            remember_state(fs)
+        except Exception:
+            pass
+        legacy_phase = _ENGINE_PHASE_TO_LEGACY.get(fs.get('phase'))
+        if legacy_phase is not None and legacy_phase != 'unknown':
+            out['phase'] = legacy_phase
+            out['source'] = 'engine'
+        elif legacy_phase == 'unknown' and out.get('phase') == 'unknown':
+            # Engine unsicher UND Legacy unsicher → source ehrlich lassen.
+            out['source'] = out.get('source') or 'none'
+    except Exception:
+        # Engine wirft → Legacy-Phase bleibt (Fallback nie schlechter als vorher).
+        pass
 
 
 def _near_airport(lat, lon, iata, D, radius_km=8.0):

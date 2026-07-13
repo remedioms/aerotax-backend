@@ -607,3 +607,189 @@ def test_status_allow_paid_lifts_free_only(_isolated):
                          allow_paid=True)
 
     assert _isolated.merged.call_args.kwargs.get('free_only') is False
+
+
+# ═══════════════════════════════════════════════════════════════
+#  (d) STATUS: FlightState-Engine als Phasen-Autorität (Layer-3-Flip)
+#
+#  status_for_flight ist die Radar-Callout-Phase (ax_callsign). Mit dem
+#  Kill-Switch FLIGHTSTATE_LIVE_CALLSIGN=1 kommt die PHASE aus DER Engine
+#  (blueprints.flight_state.resolve_flight_state) — DIESELBE Wahrheit wie
+#  crew_state/flights_live. Damit:
+#    • ein Pushback-Flieger (Board 'Departed' = off-block + rohes on_ground=False)
+#      zeigt NIE mehr 'airborne' — er ist 'grounded' (TAXI_OUT), kein Geist;
+#    • 'airborne' muss durch echte Kinematik (alt>1000 / gs>=80) ODER ein hartes
+#      Board-en-route VERDIENT sein;
+#    • ein Board-'landed' un-landet nicht durch einen frischen airborne-Fix.
+#  Ohne Flag bleibt die Legacy-Phase (die 30 Tests oben beweisen das unverändert).
+#  Das PLAUSI-Gate (physisch unmögliche 'landed') greift IMMER, auch ohne Flag.
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def _engine_on(monkeypatch):
+    """Kill-Switch an + Prior-Memo leeren (der Fixture-Mock mappt jeden Callsign
+    auf 'LH506' → sonst würde die Monotonie zwischen Tests lecken)."""
+    from blueprints import flight_state as FS
+    FS._PRIOR_STORE.clear()
+    monkeypatch.setenv('FLIGHTSTATE_LIVE_CALLSIGN', '1')
+    yield
+    FS._PRIOR_STORE.clear()
+
+
+def test_engine_pushback_departed_is_not_airborne(_isolated, _engine_on):
+    """DER Ghost-Fix: Board dep 'Departed' (= OFF-BLOCK) + rohes on_ground=False,
+    OHNE Kinematik (kein alt/gs) → Engine TAXI_OUT → phase 'grounded', NICHT
+    'airborne'. Das rohe on_ground-Bit wird ignoriert (Pushback-Lüge)."""
+    _isolated.merged.return_value = {
+        'status_dep': 'Departed', 'status_arr': None, 'cancelled': False,
+        'delay_known': True, 'delay_min': 5, 'gate_dep': 'A15',
+        'sched_dep': '13:00', 'esti_dep': '13:05',
+        'dep_iata': 'FRA', 'arr_iata': 'HND',
+    }
+
+    out = WR.status_for_flight(callsign='LH506', origin='FRA', dest='HND',
+                               on_ground=False, lat=50.03, lon=8.55)  # = FRA
+
+    assert out['phase'] == 'grounded'       # off-block, KEIN Geist
+    assert out['phase'] != 'airborne'
+    assert out['source'] == 'engine'
+    # Delay/Gate bleiben aus dem Board (Collector-Rolle unverändert).
+    assert out['delay_min'] == 5
+    assert out['gate'] == 'A15'
+
+
+def test_engine_airborne_must_be_earned_by_kinematics(_isolated, _engine_on):
+    """'airborne' ist VERDIENT: derselbe Board-'Departed' + ein ECHTER Reiseflug-
+    Fix (alt=35000) → Engine AIRBORNE → 'airborne'. Ohne den Fix (Test oben) wäre
+    es 'grounded' — die Höhe/Geschwindigkeit macht den Unterschied, nicht on_ground."""
+    _isolated.merged.return_value = {
+        'status_dep': 'Departed', 'status_arr': None, 'cancelled': False,
+        'delay_known': False, 'delay_min': None,
+        'dep_iata': 'FRA', 'arr_iata': 'HND',
+    }
+
+    out = WR.status_for_flight(callsign='LH506', origin='FRA', dest='HND',
+                               on_ground=False, lat=48.5, lon=10.0,
+                               gs=440, alt=35000, track=110)
+
+    assert out['phase'] == 'airborne'
+    assert out['source'] == 'engine'
+
+
+def test_engine_board_landed_survives_fresh_airborne_fix(_isolated, _engine_on):
+    """Board arr 'Landed' (HARD, terminal) darf durch einen frischen airborne-Fix
+    NICHT un-landet werden → 'landed'. (Sebastian-Fall: stale Schätzung kippt die
+    echte Ankunft nicht.)"""
+    _isolated.merged.return_value = {
+        'status_dep': 'Departed', 'status_arr': 'Landed 14:23',
+        'cancelled': False, 'delay_known': True, 'delay_min': 12,
+        'gate_arr': 'B23', 'terminal_arr': '1', 'sched_arr': '14:10',
+        'esti_arr': '14:23', 'dep_iata': 'MUC', 'arr_iata': 'FRA',
+    }
+
+    out = WR.status_for_flight(callsign='LH506', origin='MUC', dest='FRA',
+                               on_ground=False, lat=48.0, lon=10.0,
+                               gs=440, alt=35000)   # „fliegt" — darf nicht gewinnen
+
+    assert out['phase'] == 'landed'
+    assert out['source'] == 'engine'
+    # Gate/Terminal/Delay bleiben Board-Wahrheit (Collector-Rolle).
+    assert out['gate'] == 'B23'
+    assert out['delay_min'] == 12
+
+
+def test_engine_cancelled_maps_through(_isolated, _engine_on):
+    """cancelled-Flag → Engine CANCELLED → 'cancelled'."""
+    _isolated.merged.return_value = {
+        'status_dep': 'Cancelled', 'status_arr': None, 'cancelled': True,
+        'delay_known': False, 'delay_min': None,
+        'dep_iata': 'FRA', 'arr_iata': 'HND',
+    }
+
+    out = WR.status_for_flight(callsign='LH506', origin='FRA', dest='HND')
+
+    assert out['phase'] == 'cancelled'
+    assert out['source'] == 'engine'
+
+
+def test_engine_no_signal_stays_unknown(_isolated, _engine_on):
+    """Kein Board, kein Fix → Engine UNKNOWN → 'unknown', source bleibt ehrlich
+    (nicht 'engine' überschrieben — Unbekannt ist keine Engine-Aussage)."""
+    _isolated.merged.return_value = None
+
+    out = WR.status_for_flight(callsign='LH506', origin='FRA', dest='HND')
+
+    assert out['phase'] == 'unknown'
+    assert out['source'] != 'engine'
+
+
+def test_engine_off_keeps_legacy_departed_airborne(_isolated, monkeypatch):
+    """Gegenprobe: OHNE Kill-Switch bleibt das ALTE Verhalten (Board 'Departed' +
+    on_ground=None → 'airborne', source 'board') — die Engine ist opt-in, der Flip
+    reversibel."""
+    monkeypatch.delenv('FLIGHTSTATE_LIVE_CALLSIGN', raising=False)
+    _isolated.merged.return_value = {
+        'status_dep': 'Departed', 'status_arr': None, 'cancelled': False,
+        'delay_known': True, 'delay_min': 5, 'gate_dep': 'A15',
+        'sched_dep': '13:00', 'esti_dep': '13:05',
+        'dep_iata': 'FRA', 'arr_iata': 'HND',
+    }
+
+    out = WR.status_for_flight(callsign='LH506', origin='FRA', dest='HND',
+                               on_ground=None)
+
+    assert out['phase'] == 'airborne'       # Legacy (unverändert)
+    assert out['source'] == 'board'
+
+
+def test_plausi_gate_rejects_impossible_landed_without_flag(_isolated, monkeypatch):
+    """PLAUSI-Gate (IMMER aktiv, auch ohne Kill-Switch): eine Board-'landed'-Aussage,
+    deren Ankunft VOR dem Abflug liegt (physisch unmöglich — stale/verwechselte Row),
+    wird verworfen → 'grounded', act geleert. Volle ISO-Zeiten, arr < dep."""
+    monkeypatch.delenv('FLIGHTSTATE_LIVE_CALLSIGN', raising=False)
+    _isolated.merged.return_value = {
+        'status_dep': 'Departed', 'status_arr': 'Landed',
+        'cancelled': False, 'delay_known': False, 'delay_min': None,
+        # Abflug 14:00Z, „Landung" 13:00Z — unmöglich.
+        'sched_dep': '2026-07-06T14:00:00Z', 'esti_dep': '2026-07-06T14:00:00Z',
+        'sched_arr': '2026-07-06T13:00:00Z', 'esti_arr': '2026-07-06T13:00:00Z',
+        'dep_iata': 'FRA', 'arr_iata': 'HND',
+    }
+
+    out = WR.status_for_flight(callsign='LH506', origin='FRA', dest='HND')
+
+    assert out['phase'] == 'grounded'       # unmögliche Landung verworfen
+    assert out['phase'] != 'landed'
+    assert out['act'] is None
+
+
+def test_plausi_gate_keeps_valid_landed(_isolated, monkeypatch):
+    """Gegenprobe: eine PLAUSIBLE Landung (Ankunft nach Abflug) bleibt 'landed'."""
+    monkeypatch.delenv('FLIGHTSTATE_LIVE_CALLSIGN', raising=False)
+    _isolated.merged.return_value = {
+        'status_dep': 'Departed', 'status_arr': 'Landed',
+        'cancelled': False, 'delay_known': False, 'delay_min': None,
+        'sched_dep': '2026-07-06T13:00:00Z', 'esti_dep': '2026-07-06T13:05:00Z',
+        'sched_arr': '2026-07-06T14:10:00Z', 'esti_arr': '2026-07-06T14:23:00Z',
+        'dep_iata': 'FRA', 'arr_iata': 'HND',
+    }
+
+    out = WR.status_for_flight(callsign='LH506', origin='FRA', dest='HND')
+
+    assert out['phase'] == 'landed'
+    assert out['source'] == 'board'
+
+
+def test_engine_returned_shape_has_no_private_keys(_isolated, _engine_on):
+    """Die privaten Reuse-Keys (_m/_origin/_dest/_fn) dürfen NIE in der Antwort
+    landen — der Engine-Hook popt sie. Der Wire-Contract bleibt sauber."""
+    _isolated.merged.return_value = {
+        'status_dep': 'Departed', 'status_arr': None,
+        'dep_iata': 'FRA', 'arr_iata': 'HND',
+    }
+
+    out = WR.status_for_flight(callsign='LH506', origin='FRA', dest='HND',
+                               on_ground=False, lat=50.03, lon=8.55)
+
+    for k in ('_m', '_origin', '_dest', '_fn'):
+        assert k not in out

@@ -177,3 +177,65 @@ def test_enrich_fills_fresh_facts(monkeypatch):
         date='2026-07-09')
     assert out['sched_arr'] == '2026-07-09T18:05:00+02:00'
     assert out['status_category'] == 'arrived'
+
+
+# ── FlightState-Engine → status_category (Owner 2026-07-13) ───────────────────
+# _status_category_from_facts leitet status_category NICHT mehr per roher
+# Substring-Suche ab, sondern über die EINE FlightState-Engine (obs_from_board_
+# merged → resolve_flight_state). Dieselbe Wahrheit wie crew_state/flights_live.
+# NOW = 2026-07-09T04:00:00Z (fest, deterministisch).
+_NOW = 1783584000
+
+
+def test_status_category_taxi_offblock_not_enroute():
+    """Ghost-Fix: ein dep-seitiges „Abgeflogen" = OFF-BLOCK, nicht airborne. Die
+    Engine macht daraus TAXI_OUT → status_category bleibt LEER (kein Legacy-Wert).
+    Die alte Substring-Heuristik hätte fälschlich 'enroute' gesetzt (Geister-
+    Airborne eines noch rollenden Fliegers)."""
+    facts = {'dep_iata': 'FRA', 'arr_iata': 'GVA', 'dep_status': 'Abgeflogen',
+             'sched_dep': '2026-07-09T05:50:00+02:00',
+             'sched_arr': '2026-07-09T06:55:00+02:00'}
+    flight = {'flight': 'LH2557', 'dep_iata': 'FRA', 'arr_iata': 'GVA'}
+    assert axd._status_category_from_facts(flight, facts, now=_NOW) is None
+
+
+def test_status_category_bogus_early_landing_rejected():
+    """PLAUSI-GATE: ein 11h-Flug (LH454 FRA→SFO), dessen Ankunftstafel physisch
+    unmöglich früh „Gelandet" trägt (sched_arr Stunden VORAUS), darf NICHT
+    'arrived' werden. Die rohe Substring-Suche hätte sofort 'arrived' gesetzt."""
+    facts = {'dep_iata': 'FRA', 'arr_iata': 'SFO', 'dep_status': 'Abgeflogen',
+             'arr_status': 'Gelandet',
+             'sched_dep': '2026-07-09T10:30:00+02:00',
+             'sched_arr': '2026-07-09T13:35:00-07:00'}   # 20:35Z, weit nach NOW
+    flight = {'flight': 'LH454', 'dep_iata': 'FRA', 'arr_iata': 'SFO'}
+    assert axd._status_category_from_facts(flight, facts, now=_NOW) is None
+
+
+def test_status_category_plausible_landing_arrived():
+    """Gegenprobe: eine plausible Landung (Soll-Ankunft liegt VOR now, Board
+    „Gelandet") wird korrekt 'arrived'."""
+    facts = {'dep_iata': 'FRA', 'arr_iata': 'NUE', 'arr_status': 'Gelandet',
+             'sched_arr': '2026-07-09T02:00:00+02:00'}   # 00:00Z, vor NOW(04:00Z)
+    flight = {'flight': 'LH146', 'dep_iata': 'FRA', 'arr_iata': 'NUE'}
+    assert axd._status_category_from_facts(flight, facts, now=_NOW) == 'arrived'
+
+
+def test_status_category_cancelled():
+    """Board-Cancel → 'cancelled' (hart, schlägt alles)."""
+    facts = {'dep_iata': 'MUC', 'arr_iata': 'JFK', 'cancelled': True}
+    flight = {'flight': 'LH444', 'dep_iata': 'MUC', 'arr_iata': 'JFK'}
+    assert axd._status_category_from_facts(flight, facts, now=_NOW) == 'cancelled'
+
+
+def test_enrich_taxi_status_not_enroute(monkeypatch):
+    """End-to-end über _enrich_flight_status_with_obs: dep-seitiges „Abgeflogen"
+    ohne Ankunfts-Landung ⇒ status_category bleibt leer (nicht 'enroute')."""
+    facts = {'dep_iata': 'FRA', 'arr_iata': 'GVA', 'dep_status': 'Abgeflogen',
+             'sched_dep': '2099-01-01T12:00:00+01:00',
+             'sched_arr': '2099-01-01T13:00:00+01:00'}
+    monkeypatch.setattr(axd, '_flight_facts_from_obs', lambda *a, **k: dict(facts))
+    monkeypatch.setattr(axd, '_flight_times_free_first', lambda *a, **k: {})
+    out = axd._enrich_flight_status_with_obs(
+        {'flight': 'LH2557', 'dep_iata': 'FRA', 'arr_iata': 'GVA'},
+        date='2099-01-01')
+    assert not out.get('status_category')     # kein Geister-'enroute'

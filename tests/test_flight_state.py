@@ -17,10 +17,28 @@ from blueprints import flight_state as E
 from blueprints.flight_state import (
     Observation, resolve_flight_state, is_airborne_kinematic,
     project_my_flight_status, project_flight_live, project_crew_status,
-    project_friend_leg,
+    project_friend_leg, LEGACY_STATUS,
     SCHEDULED, BOARDING, TAXI_OUT, AIRBORNE, APPROACH, LANDED, ARRIVED,
     CANCELLED, DIVERTED, UNKNOWN, OBSERVED, ESTIMATED, SIMULATED,
 )
+
+# iOS DelayLogic.airborneStates (Theme/DelayLogic.swift): the lowercased tokens
+# that iOS treats as "in der Luft". flights_live[].status is fed RAW through
+# DelayLogic.phase(...) in CrewBoardingCards → any status in this set renders a
+# plane as .airborne. The friends-endpoint wire must NOT emit an airborne token
+# for a plane the engine says is only taxiing (the raw-status-leak this closes).
+_IOS_AIRBORNE_TOKENS = {
+    "departed", "airborne", "en-route", "enroute", "en route",
+    "in air", "in-air", "inair",
+}
+
+
+def _ios_phase_of(status):
+    """Mirror of iOS DelayLogic.phase(): normalize (trim+lowercase) then classify.
+    We only need the airborne verdict here (that is the leak)."""
+    if not status:
+        return "unknown"
+    return "airborne" if status.strip().lower() in _IOS_AIRBORNE_TOKENS else "not_airborne"
 
 NOW = 1_783_584_000  # fixed clock, 2026-07-09T04:00:00Z
 FRA = (50.03, 8.57)
@@ -613,3 +631,65 @@ def test_taxi_projections_never_leak_position():
     assert project_friend_leg(fs)["live"] is None
     assert project_crew_status(fs).get("live_lat") is None
     assert project_flight_live(fs)["in_flight"] is False
+
+
+# ───────────── friends flights_live[].status raw-leak closure ──────────────
+# Wire: app.py:get_friends_today. When FLIGHTSTATE_LIVE_FRIENDS=1 the endpoint
+# now sets flights_live[-1]['status'] = LEGACY_STATUS[fs['phase']] instead of
+# leaving m.get('status') (the raw scraped board string). These tests pin the
+# LEGACY_STATUS mapping the wire relies on so a taxiing plane can never surface
+# as iOS .airborne via the legacy status field, and so the legacy field stays
+# consistent with fs['phase'] on every surface.
+
+def test_friends_legacy_status_taxi_is_not_ios_airborne():
+    """THE leak: dep-side board 'Abgeflogen' (=off-block) + a 15kt ground fix is
+    TAXI_OUT. The raw board string would read as .airborne on iOS; the engine's
+    LEGACY_STATUS ('GROUNDED') must NOT — closing the flights_live[].status leak."""
+    fs = _s1_taxi()
+    assert fs["phase"] == TAXI_OUT
+    wire_status = LEGACY_STATUS[fs["phase"]]
+    assert wire_status == "GROUNDED"
+    # the whole point: the wire value is NOT airborne to iOS DelayLogic
+    assert _ios_phase_of(wire_status) == "not_airborne"
+    # and a raw board 'airborne'/'departed' string WOULD have leaked (contrast)
+    assert _ios_phase_of("Abgeflogen") == "not_airborne"  # german not in set…
+    assert _ios_phase_of("airborne") == "airborne"        # …but this raw one leaks
+
+
+def test_friends_legacy_status_cruise_is_ios_airborne():
+    """A genuinely cruising flight keeps an airborne legacy status (no over-scrub):
+    LEGACY_STATUS[AIRBORNE]='AIRBORNE' reads as .airborne on iOS."""
+    fs = _s4_cruise()
+    assert fs["phase"] == AIRBORNE
+    wire_status = LEGACY_STATUS[fs["phase"]]
+    assert wire_status == "AIRBORNE"
+    assert _ios_phase_of(wire_status) == "airborne"
+
+
+def test_friends_legacy_status_landed_is_not_airborne():
+    """After landing the legacy status must read 'LANDED' (not airborne), matching
+    the canonical phase — the terminal truth reaches the legacy field too."""
+    fs_landed = resolve_flight_state(
+        keys={"flight": "LH880", "date": "2026-07-09", "dep_iata": "FRA",
+              "arr_iata": "LHR", "dep_ll": FRA, "arr_ll": LHR, "roster_tail": "D-AITA",
+              "sched_dep": "2026-07-09T12:00:00Z", "sched_arr": "2026-07-09T12:55:00Z",
+              "sched_dep_ts": NOW - 3600},
+        observations=[
+            Observation("phase_hard", LANDED, "board", NOW - 120, 0.95,
+                        meta={"side": "arr"}),
+            Observation("route", {"dep": "FRA", "dst": "LHR", "confidence": "confirmed"},
+                        "board", NOW - 120, 0.9),
+        ], now=NOW)
+    assert fs_landed["phase"] in (LANDED, ARRIVED)
+    ws = LEGACY_STATUS[fs_landed["phase"]]
+    assert ws == "LANDED"
+    assert _ios_phase_of(ws) == "not_airborne"
+
+
+def test_friends_legacy_status_matches_friend_leg_phase():
+    """The legacy status wire value stays consistent with the phase every OTHER
+    surface exposes: LEGACY_STATUS[fs['phase']] == LEGACY_STATUS[project_friend_leg
+    ['phase']] for taxi AND cruise (no divergence between the fields)."""
+    for fs in (_s1_taxi(), _s4_cruise()):
+        leg = project_friend_leg(fs)
+        assert LEGACY_STATUS[fs["phase"]] == LEGACY_STATUS[leg["phase"]]

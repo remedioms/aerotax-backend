@@ -538,7 +538,15 @@ def _flight_window_state(day, legs_live, now):
     """(fliegt_jetzt, effektives_ende, landung_beobachtet) für einen Flugtag
     (PUR, testbar): Dienst-Fenster aus dem Plan, korrigiert durch ECHTE
     Beobachtungen — eine beobachtete Verspätung verlängert das Fenster, eine
-    beobachtete Landung beendet es. Ohne Beobachtung gilt der Plan (kein Raten)."""
+    beobachtete Landung beendet es. Ohne Beobachtung gilt der Plan (kein Raten).
+
+    PLAUSI/MONOTONIE-Gate (2026-07-13, FlightState-Engine-Invariante, DESIGN §1.4):
+    eine beobachtete „gelandet" darf physisch nicht VOR/GLEICH dem effektiven
+    Abflug des Legs liegen — eine solche Bogus-Landung (stale Board-Zeile eines
+    Vortags-/Folge-Umlaufs derselben Flugnummer) wird VERWORFEN, statt das Fenster
+    fälschlich zu beenden. So kann eine unmögliche Landung die „Fliegt gerade"-
+    Karte nicht vorzeitig auf „gelandet" werfen (Landung muss verdient sein), und
+    das Fenster bleibt terminal, sobald eine PLAUSIBLE Landung beobachtet wurde."""
     st, en = day['st'], day['en']
     # Fehlt das Ende → grobes Fenster Start … Start+10h (Langstrecke abgedeckt).
     if st and not en:
@@ -552,24 +560,117 @@ def _flight_window_state(day, legs_live, now):
             en_eff = en_eff + _dt.timedelta(minutes=float(d))
         stx = str(last.get('status') or '').lower()
         if any(k in stx for k in ('landed', 'gelandet', 'arrived', 'angekommen')):
-            landed_obs = True
+            # Engine-PLAUSI: eine Landung, die (angeblich) vor dem eff. Abflug des
+            # Legs liegt, ist physisch unmöglich → als Bogus-Landung verworfen.
+            # Der effektive Abflug ist der Plan-Start + beobachtete Abflug-Ver-
+            # spätung; fehlt eine echte Off-Zeit, gilt der Plan-Start. Ohne
+            # bekannten Start (kein Fenster) bleibt das alte Verhalten (kein Gate).
+            dep_delay = last.get('dep_delay_min')
+            st_eff = st
+            if st is not None and isinstance(dep_delay, (int, float)):
+                st_eff = st + _dt.timedelta(minutes=float(dep_delay))
+            landed_obs = (st_eff is None) or (now > st_eff)
     flying = bool(st and en_eff and st <= now <= en_eff and not landed_obs)
     return flying, en_eff, landed_obs
 
 
-def _canonical_flight_phase(legs_live):
-    """Kanonische Flug-Phase (fliegt/gelandet/rollt/am Gate) für die Family-/
-    Freunde-Karte — aus der Board-Beobachtung des letzten (Ankunfts-)Legs via
-    warehouse_reader._status_phase_of. EINE Wahrheit, SEITEN-BEWUSST (side='arr':
-    'at gate'/'on ground' am ZIEL = gelandet, nicht die grobe Substring-Erkennung).
-    Nutzt die legs_live, die family_watch ohnehin schon geholt hat — kein neuer
-    Netz-/SB-Call. None wenn kein/unklares Signal (Karte bleibt bei flying_now)."""
-    if not legs_live:
+# Engine-Phase → Family-Vokabular ('airborne'|'landed'|'grounded'|'cancelled').
+# Identisches Mapping wie im Live-Fix-Pfad (family_watch.py Consumer :1361) und
+# in crew_live_state._engine_leg_flight — EINE Wahrheit für alle Family-Felder.
+_ENGINE_PHASE_TO_FAMILY = {
+    'AIRBORNE': 'airborne', 'APPROACH': 'airborne', 'DIVERTED': 'airborne',
+    'LANDED': 'landed', 'ARRIVED': 'landed',
+    'TAXI_OUT': 'grounded', 'BOARDING': 'grounded',
+    'CANCELLED': 'cancelled',
+    # SCHEDULED/UNKNOWN → None (kein Phasen-Signal; Karte bleibt bei flying_now).
+}
+
+
+def _phase_from_engine_board_only(leg):
+    """Kanonische Flug-Phase EINES Legs aus der FlightState-Engine, BOARD-ONLY
+    (ohne Live-Fix) — reuse der schon geladenen Board-/Warehouse-Beobachtung
+    (`leg`, Shape aus _live_legs_for), KEIN neuer I/O. Wirft nie.
+
+    So sieht die Family-Karte DIESELBE Phasen-Wahrheit wie crew_state/flights_live
+    (dort läuft dieselbe Engine über obs_from_board_merged), auch im Funkloch/über
+    dem Ozean, wo es KEINEN Live-Fix gibt: die Engine gatet den EINEN Merge-Status
+    seiten-korrekt (arr-seitiges „gelandet" schlägt jede Schätzung; dep-seitiges
+    „Abgeflogen" = TAXI_OUT/grounded, NICHT airborne = kein Geister-„fliegt") und
+    wendet die Landung-Monotonie an.
+
+    → 'airborne'|'landed'|'grounded'|'cancelled' oder None (kein/unklares Signal
+    ODER Engine nicht verfügbar → der Aufrufer fällt auf _status_phase_of zurück)."""
+    if not isinstance(leg, dict):
         return None
     try:
+        from blueprints.flight_state import resolve_flight_state, LANDED
+        from blueprints.flight_state_collectors import (build_keys,
+                                                        obs_from_board_merged,
+                                                        classify_board_status)
+    except Exception:
+        return None
+    try:
+        dep = leg.get('dep_iata')
+        arr = leg.get('arr_iata')
+        keys = build_keys(leg.get('flight'), None, dep, arr,
+                          roster_tail=leg.get('reg'))
+        # Synthetischer Merge-Shape für obs_from_board_merged: der Family-Leg
+        # trägt nur den EINEN gemergten `status` (arr gewinnt bei _flight_obs_
+        # merged). Die Seite bestimmt die ENGINE-eigene, seiten-bewusste
+        # classify_board_status (DIE Autorität, DESIGN §1.3 „Abgeflogen = off-
+        # block, NICHT airborne"): trägt der Status als ARR-Signal ein terminales
+        # gelandet/at-gate → status_arr (Engine LANDED, terminal); sonst als
+        # DEP-Signal → status_dep (En Route → AIRBORNE proven; Abgeflogen/Departed/
+        # Taxi → TAXI_OUT = grounded, NIE ein Geister-„airborne"; Boarding →
+        # BOARDING = grounded). Kein Signal auf beiden Seiten → keine Phasen-Obs
+        # (Engine SCHEDULED → None). So bleibt das Ghost-Gate exakt erhalten.
+        m = {'cancelled': leg.get('cancelled'),
+             'sched_dep': leg.get('sched_dep'), 'esti_dep': leg.get('esti_dep'),
+             'sched_arr': leg.get('sched_arr'), 'esti_arr': leg.get('esti_arr'),
+             'reg': leg.get('reg'), 'aircraft': leg.get('aircraft')}
+        stx = str(leg.get('status') or '')
+        if stx:
+            ph_arr, _, _ = classify_board_status(stx, 'arr')
+            if ph_arr == LANDED or leg.get('cancelled'):
+                m['status_arr'] = stx           # terminales ARR-Signal (gelandet)
+            else:
+                m['status_dep'] = stx           # DEP-Signal (side-aware in Engine)
+        _dep_dl = leg.get('dep_delay_min')
+        _arr_dl = leg.get('arr_delay_min')
+        if _arr_dl is None:
+            _arr_dl = leg.get('delay_min')
+        if _dep_dl is not None or _arr_dl is not None:
+            m['delay_known'] = True
+            m['dep_delay_min'] = _dep_dl
+            m['arr_delay_min'] = _arr_dl
+        obs = obs_from_board_merged(m, keys)
+        fs = resolve_flight_state(keys, obs)
+        return _ENGINE_PHASE_TO_FAMILY.get(fs.get('phase'))
+    except Exception:
+        return None
+
+
+def _canonical_flight_phase(legs_live):
+    """Kanonische Flug-Phase (fliegt/gelandet/rollt/am Gate) für die Family-/
+    Freunde-Karte — aus der Board-Beobachtung des letzten (Ankunfts-)Legs.
+
+    PRIMÄR (2026-07-13): die FlightState-Engine board-only (`_phase_from_engine_
+    board_only`) — DIESELBE Wahrheit wie crew_state/flights_live, seiten-bewusst,
+    mit Landung-Monotonie, auch OHNE Live-Fix (Funkloch/Ozean). Liefert die Engine
+    kein/kein eindeutiges Signal (None), fällt es auf die frühere direkte
+    warehouse_reader._status_phase_of-Erkennung zurück (unverändert konservativ:
+    'at gate'/'on ground' am ZIEL = gelandet). Nutzt die legs_live, die
+    family_watch ohnehin schon geholt hat — kein neuer Netz-/SB-Call. None wenn
+    beide Wege kein Signal liefern (Karte bleibt bei flying_now)."""
+    if not legs_live:
+        return None
+    last = legs_live[-1] or {}
+    eng = _phase_from_engine_board_only(last)
+    if eng is not None:
+        return eng
+    try:
         from blueprints.warehouse_reader import _status_phase_of
-        stx = str((legs_live[-1] or {}).get('status') or '')
-        return _status_phase_of(stx, 'arr')
+        return _status_phase_of(str(last.get('status') or ''), 'arr')
     except Exception:
         return None
 

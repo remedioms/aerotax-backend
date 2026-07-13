@@ -467,6 +467,134 @@ def test_corridor_route_match_still_accepts(monkeypatch):
     assert chain['inbound_live'] is not None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FlightState-Engine-Gate für inbound_live (Owner 2026-07-13)
+#   Der Zubringer-Leg läuft durch die REINE Engine — inbound_live wird NUR
+#   gesetzt, wenn das Airborne-Gate bestanden hat. Ein rollender/pushback-
+#   Zubringer (on_ground=false, alt=None, gs klein am Vorfeld) ist KEIN
+#   „kommt-schon"-Signal mehr, obwohl die Live-Route on-route ist. Und die
+#   forecast.confidence darf dann nicht „hoch" sein.
+# ══════════════════════════════════════════════════════════════════════════════
+def _patch_engine_gate_deps(monkeypatch, pos, route_dst='FRA'):
+    """_machine_live liefert einen on-route Live-Fix (Route endet an dep=FRA),
+    kein Ankunfts-Board (arr_row=None), kein Snapshot, keine SB-Rows. So ist der
+    ADS-B-`pos`-Pfad + Engine-Gate der einzige Positions-Beschaffer."""
+    _patch_life_app(monkeypatch, _fake_sb([]))
+    _route = {'src': route_dst and 'HND', 'dst': route_dst}
+    monkeypatch.setattr(BP, '_machine_live',
+                        lambda reg, want_route=True, targeted=False:
+                        ('3C6DXX', 'DLH716', pos, _route))
+    monkeypatch.setattr(BP, '_inbound_arr_row_by_reg',
+                        lambda dep, reg: {'flight': 'LH716', 'dest_iata': 'HND',
+                                          'sched': None, 'esti': None})
+    monkeypatch.setattr(BP, '_reg_hex_typecode_free', lambda reg: (None, None))
+    monkeypatch.setattr(BP, '_aircraft_live_pos',
+                        lambda **kw: (None, None, None, None))
+    monkeypatch.setattr(BP, '_iata_latlon',
+                        lambda code: {'FRA': (50.03, 8.57),
+                                      'HND': (35.55, 139.78)}.get(code))
+    monkeypatch.setattr(BP, '_iata_elev_ft', lambda code: None)
+    # Kein FR24-Korridor (der würde sonst on-route greifen und die Position
+    # unabhängig vom Engine-Gate füllen).
+    import blueprints.fr24_grpc as G
+    monkeypatch.setattr(G, 'inbound_by_route', lambda *a, **k: None)
+
+
+def test_inbound_live_taxi_pushback_not_flying(monkeypatch):
+    """§1.2-Antipattern-Fix: on-route Live-Fix, aber on_ground=false + alt=None +
+    gs=15 am Vorfeld (Pushback/Taxi). Das rohe on_ground-Bit sagte früher „in der
+    Luft & on-route" → inbound_live gesetzt, forecast 'hoch'. Die Engine gatet das
+    weg: KEINE Live-Position, Prognose nicht 'hoch'."""
+    taxi = {'lat': 50.03, 'lon': 8.57, 'track': 200, 'gs': 15,
+            'alt': None, 'on_ground': False}
+    _patch_engine_gate_deps(monkeypatch, taxi, route_dst='FRA')
+    chain, forecast, my = BP._build_inbound_chain(
+        'LH717', '2026-07-05', 'FRA', reg_hint='D-ABYO')
+    assert chain['inbound_live'] is None          # Taxi ⇒ kein „kommt-schon"-Geist
+    assert forecast['confidence'] != 'hoch'
+
+
+def test_inbound_live_genuine_airborne_renders(monkeypatch):
+    """Echter Reiseflug on-route (alt=35000, gs=440) → Airborne-Gate besteht →
+    inbound_live wird gesetzt (kein Regress gegenüber vorher)."""
+    cruise = {'lat': 48.5, 'lon': 20.0, 'track': 280, 'gs': 440,
+              'alt': 35000, 'on_ground': False}
+    _patch_engine_gate_deps(monkeypatch, cruise, route_dst='FRA')
+    chain, forecast, my = BP._build_inbound_chain(
+        'LH717', '2026-07-05', 'FRA', reg_hint='D-ABYO')
+    assert chain['inbound_live'] is not None
+    assert chain['inbound_live']['alt'] == 35000
+
+
+def test_inbound_live_offroute_still_rejected(monkeypatch):
+    """Route-Consistency-Vorfilter bleibt: fliegt der Tail gerade einen ANDEREN
+    Leg (Live-Route endet nicht an dep) → Position verwerfen, selbst wenn echt
+    airborne (Owner „stimmt nicht": D-ABYM über Miami)."""
+    cruise = {'lat': 25.8, 'lon': -80.3, 'track': 90, 'gs': 450,
+              'alt': 36000, 'on_ground': False}
+    _patch_engine_gate_deps(monkeypatch, cruise, route_dst='MIA')  # dst != dep
+    chain, forecast, my = BP._build_inbound_chain(
+        'LH717', '2026-07-05', 'FRA', reg_hint='D-ABYO')
+    assert chain['inbound_live'] is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _inbound_arr_row_by_reg — Landung-Erkennung über die Engine-Klassifikation
+#   + Ankunfts-Zeit-Plausi (bogus „gelandet" mit Zukunfts-Ankunft verworfen)
+# ══════════════════════════════════════════════════════════════════════════════
+def _patch_board_rows(monkeypatch, rows, to_utc=None):
+    extra = {'_cached_board_rows': lambda ap, kind: rows}
+    if to_utc is not None:
+        extra['_board_local_to_utc_iso'] = to_utc
+    _patch_life_app(monkeypatch, _fake_sb([]), extra=extra)
+
+
+def test_inbound_arr_row_real_landed_hidden(monkeypatch):
+    """Echtes „Gelandet" (Engine LANDED, hart) → Row wird ausgeblendet
+    (schon da, kein kommender Zubringer)."""
+    rows = [{'reg': 'D-ABYO', 'flight': 'LH716', 'dest_iata': 'HND',
+             'sched': '10:00', 'esti': '10:05', 'status': 'Gelandet'}]
+    _patch_board_rows(monkeypatch, rows)
+    assert BP._inbound_arr_row_by_reg('FRA', 'D-ABYO') is None
+
+
+def test_inbound_arr_row_expected_not_landed(monkeypatch):
+    """„Arrival expected 14:05" enthält das Substring „arriv…" — der alte
+    Substring-Check hätte es fälschlich als gelandet gewertet und den Zubringer
+    ausgeblendet. Die Engine-Klassifikation liefert KEIN Landungssignal → Row
+    bleibt als kommender Zubringer erhalten."""
+    rows = [{'reg': 'D-ABYO', 'flight': 'LH716', 'dest_iata': 'HND',
+             'sched': '14:00', 'esti': '14:05', 'status': 'Arrival expected'}]
+    _patch_board_rows(monkeypatch, rows)
+    r = BP._inbound_arr_row_by_reg('FRA', 'D-ABYO')
+    assert r is not None and r['flight'] == 'LH716'
+
+
+def test_inbound_arr_row_bogus_landed_future_arrival(monkeypatch):
+    """Bogus-Landung: Status behauptet „Gelandet", die Ankunftszeit liegt aber
+    noch klar in der ZUKUNFT (Board-Wanduhr → UTC weit voraus) → physisch
+    unmöglich, „gelandet" verworfen → Row bleibt als Zubringer erhalten."""
+    from datetime import datetime, timezone, timedelta
+    # Ankunft ~2 h in der Zukunft, als UTC-ISO (das to_utc-Mock reicht sie durch).
+    future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    rows = [{'reg': 'D-ABYO', 'flight': 'LH716', 'dest_iata': 'HND',
+             'sched': '99:99', 'esti': '99:99', 'status': 'Gelandet'}]
+    _patch_board_rows(monkeypatch, rows, to_utc=lambda hhmm, iata: future)
+    r = BP._inbound_arr_row_by_reg('FRA', 'D-ABYO')
+    assert r is not None and r['flight'] == 'LH716'
+
+
+def test_inbound_arr_row_landed_past_arrival_hidden(monkeypatch):
+    """Gegencheck: „Gelandet" mit Ankunft in der VERGANGENHEIT ist plausibel →
+    Row wird korrekt ausgeblendet (die Plausi verwirft nur Zukunfts-Landungen)."""
+    from datetime import datetime, timezone, timedelta
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    rows = [{'reg': 'D-ABYO', 'flight': 'LH716', 'dest_iata': 'HND',
+             'sched': '08:00', 'esti': '08:05', 'status': 'Gelandet'}]
+    _patch_board_rows(monkeypatch, rows, to_utc=lambda hhmm, iata: past)
+    assert BP._inbound_arr_row_by_reg('FRA', 'D-ABYO') is None
+
+
 def test_flight_info_p5_fill_skips_stale_facts(client):
     """P5-Merge-Fill: fällt _flight_facts_from_obs auf den VORTAG zurück
     (facts['stale']=True), darf die gestrige Geister-Ankunft NICHT in
