@@ -20925,10 +20925,69 @@ def _votes_save_disk(token, votes):
             app.logger.warning(f'[layover-votes] disk_save_fail: {e}')
 
 
+# ── CREW-HOTEL-AUTORISIERUNG (Owner 2026-07-13, „als Fake-Eurowings-Crew sah ich
+#    die Lufthansa-Crewhotels" — Sicherheits-/Datenschutz-P0): Crew-Hotels sind
+#    AIRLINE-VERTRAULICH. Ein Crew-Hotel = Layover-Rec der Kategorie 'sleep' MIT
+#    gesetztem author_airline (von der Airline-Crew crowdsourced). Es wird NUR
+#    ausgeliefert, wenn BEIDE Bedingungen erfüllt sind (doppelt sicher):
+#      (1) das Profil des Betrachters trägt DIESELBE Airline, UND
+#      (2) am Profil hängt ein GÜLTIGER Kalender/Roster (echter iCal-Import).
+#    Keine Airline mischt mit einer anderen — Swiss-Crewhotels nur für Swiss-Crew
+#    mit Kalender, Condor nur für Condor, usw. Generische Tipps (food/sight/…) und
+#    'sleep'-Einträge OHNE author_airline bleiben crowdsourced sichtbar.
+_CREW_HOTEL_CATS = {'sleep'}
+
+
+def _viewer_airline_and_calendar(token):
+    """(AIRLINE_UPPER, has_valid_calendar) des anfragenden Tokens. ('', False) unbekannt.
+    Kalender-gültig = mindestens ein iCal-Briefing mit `ical_imported_at` (echter
+    Roster-Import, nicht bloß eine manuelle Notiz). Wirft nie."""
+    if not token:
+        return ('', False)
+    airline = ''
+    try:
+        airline = (((_profile_load(token) or {}).get('profile') or {}).get('airline') or '').strip().upper()
+    except Exception:
+        airline = ''
+    has_cal = False
+    try:
+        ic = _ical_briefings_load(token) or {}
+        has_cal = any(isinstance(v, dict) and v.get('ical_imported_at') for v in ic.values())
+    except Exception:
+        has_cal = False
+    return (airline, has_cal)
+
+
+def _filter_crew_hotels(recs, token):
+    """Entfernt airline-vertrauliche Crew-Hotels, die der Betrachter NICHT sehen darf.
+    Fail-CLOSED: ohne passende Airline + gültigen Kalender werden fremde/alle
+    airline-getaggten Crew-Hotels ausgeblendet (Sicherheit vor Vollständigkeit)."""
+    airline, has_cal = _viewer_airline_and_calendar(token)
+    def _ok(r):
+        if (r.get('category') or '').lower() not in _CREW_HOTEL_CATS:
+            return True  # kein Crew-Hotel → crowdsourced sichtbar
+        aa = (r.get('author_airline') or '').strip().upper()
+        if not aa:
+            return True  # generischer Schlaf-Tipp ohne Airline-Bezug → sichtbar
+        # Airline-vertrauliches Crew-Hotel: nur gleiche Airline MIT gültigem Kalender
+        return bool(airline and has_cal and aa == airline)
+    return [r for r in recs if _ok(r)]
+
+
+def _request_token():
+    """Token aus ?token= ODER Authorization: Bearer <t>."""
+    t = (request.args.get('token') or '').strip()
+    if t:
+        return t
+    auth = request.headers.get('Authorization', '')
+    return auth[7:].strip() if auth.startswith('Bearer ') else ''
+
+
 @app.route('/api/layover-recs/<iata>', methods=['GET'])
 def get_layover_recs(iata):
     """Liefert alle Recs für Airport, sortiert nach vote_score absteigend.
     Query: ?category=food → filter; ?token=… → markiert eigene Votes.
+    Crew-Hotels werden airline-vertraulich gegated (siehe _filter_crew_hotels).
     """
     rp = _recs_path(iata)
     if not rp: return jsonify({'error': 'invalid_iata'}), 400
@@ -20936,9 +20995,11 @@ def get_layover_recs(iata):
     cat = (request.args.get('category') or '').lower()
     if cat and cat in LAYOVER_CATEGORIES:
         recs = [r for r in recs if r.get('category') == cat]
+    token = _request_token()
+    # SICHERHEITS-GATE: fremde Airline-Crewhotels raus (Airline + gültiger Kalender).
+    recs = _filter_crew_hotels(recs, token)
     recs.sort(key=lambda r: -(r.get('vote_score') or 0))
     # Apply voted-by-me
-    token = request.args.get('token') or ''
     voted = _votes_load(token) if token else {}
     for r in recs:
         r['my_vote'] = voted.get(r.get('id'), 0)
@@ -21538,6 +21599,8 @@ def discover_layover_recs(token):
         # die ephemere Disk leer → discover lieferte KEINE User-Tipps mehr, der
         # Feed (recsForRealIATA) sah frisch gepostete Tipps nicht (Tibor/BLL).
         recs = _recs_load(iata)
+        # SICHERHEITS-GATE (wie get_layover_recs): fremde Airline-Crewhotels raus.
+        recs = _filter_crew_hotels(recs, token)
         top = sorted(recs, key=lambda r: -(r.get('vote_score') or 0))[:3]
         if top:
             out.append({'iata': iata, 'top_recs': top})
