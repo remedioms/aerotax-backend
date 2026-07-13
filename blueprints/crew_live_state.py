@@ -672,6 +672,16 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             dep_delay = _eff_dep_delay
         eff_arr = leg['arr'] + _dt.timedelta(minutes=max(0.0, arr_delay or 0.0))
         leg['eff_arr'] = eff_arr
+        # WIDERSPRUCH-GATE (Owner 2026-07-13, Tibor): ein „Abgeflogen"/airborne-
+        # Board-Status, der der EIGENEN (delay-korrigierten) est-Abflugzeit
+        # widerspricht — now < eff_dep, laut Board geht der Flug erst später —
+        # ist stale/inkonsistent (Board trug „Abgeflogen" aus einem alten Stand
+        # UND einen frischen +175-min-esti). NICHT als Abflug-Beweis werten,
+        # sonst „fliegt gerade" obwohl er noch nicht los ist. Die Zeit-/
+        # Verspätet-Logik unten übernimmt. landed/grounded bleiben unberührt
+        # (nur der Abflug-Beweis wird entwertet, nicht die Ankunft).
+        if b == 'airborne' and now < eff_dep:
+            b = None
 
         if o.get('cancelled'):
             # Annulliert schlägt alles: Crew ist nie losgeflogen.

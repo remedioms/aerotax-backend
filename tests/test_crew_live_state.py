@@ -1085,3 +1085,23 @@ def test_tibor_grosser_delay_zeigt_verspaetet_nicht_timeline():
     assert r['state'] == STATE_PRE_FLIGHT, r
     assert r.get('pre_phase') == 'delayed', r
     assert 'Verspätet' in (r['text'].get('subtitle') or ''), r
+
+
+def test_tibor_board_abgeflogen_widerspricht_est_dep_nicht_flying():
+    # Board „Abgeflogen" (airborne), ABER est_dep in der Zukunft (+175min) →
+    # widersprüchlich/stale → NICHT flying, sondern Verspätet.
+    obs = {'LH454': {'status': 'Abgeflogen', 'dep_delay_min': 175,
+                     'est_dep_iso': '2026-07-13T11:20:00Z'}}
+    r = _tibor_resolve(datetime(2026, 7, 13, 9, 38, tzinfo=timezone.utc), obs)
+    assert r['state'] != STATE_FLYING, r
+    assert r['state'] == STATE_PRE_FLIGHT, r
+    assert 'Verspätet' in (r['text'].get('subtitle') or ''), r
+
+
+def test_board_abgeflogen_nach_est_dep_bleibt_flying():
+    # Regressions-Schutz: „Abgeflogen" + est_dep in der VERGANGENHEIT (now danach)
+    # → weiter flying (Board schlägt Uhr, kein Widerspruch).
+    obs = {'LH454': {'status': 'Abgeflogen', 'dep_delay_min': 20,
+                     'est_dep_iso': '2026-07-13T08:45:00Z'}}
+    r = _tibor_resolve(datetime(2026, 7, 13, 9, 30, tzinfo=timezone.utc), obs)
+    assert r['state'] == STATE_FLYING, r
