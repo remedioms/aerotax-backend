@@ -29086,6 +29086,21 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         'sides': {'dep': dep_src, 'arr': arr_src},
         'has_dep': dep_row is not None, 'has_arr': arr_row is not None,
     }
+    # ABSOLUTE-UTC EST-ZEITEN (ADDITIV, Owner 2026-07-13 „Live-Karte 8:40, Radar
+    # paar Min später"): `esti_dep`/`esti_arr` sind ROH station-lokal (bare/naive,
+    # oft OHNE Offset) — wer sie naiv als UTC parst, verschiebt sie um die
+    # Stations-TZ (der bekannte Doppel-TZ-Fall). Der Radar zeigt aber die
+    # abgeleitete ABSOLUTE est_arr (flights.est_arr / <arr>#ARR über
+    # _board_local_to_utc_iso), während der Crew-State bisher nur `sched_arr +
+    # arr_delay_min` kannte und bei UNBEKANNTEM (aber existierendem esti) Delay
+    # auf die Plan-Zeit zurückfiel → Divergenz. Deshalb hier EINMAL zentral (dort,
+    # wo die airport_tz-Kenntnis lebt) die absolute UTC-Variante mitgeben; der
+    # Crew-Resolver liest sie 1:1 wie der Radar (EINE Wahrheit). Nur echte Werte,
+    # None wenn kein esti / TZ unbekannt (nie ein naiver String).
+    rec['est_dep_iso'] = _board_local_to_utc_iso(rec['esti_dep'], dep) if (
+        rec['esti_dep'] and dep) else None
+    rec['est_arr_iso'] = _board_local_to_utc_iso(rec['esti_arr'], arr) if (
+        rec['esti_arr'] and arr) else None
     _FLIGHT_MERGE_CACHE[ckey] = (_t.time(), dict(rec))
     _cache_soft_cap(_FLIGHT_MERGE_CACHE)
     return rec

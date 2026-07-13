@@ -398,6 +398,49 @@ def _num(v):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def _eff_arr(leg, o):
+    """Effektive (delay-korrigierte) Ankunft EINES Legs → (eff_dt, delay_min).
+
+    EINE Wahrheit mit dem Radar (Owner 2026-07-13 „Live-Karte 8:40, Radar paar
+    Min später"): der Radar zeigt die absolute est_arr aus dem Warehouse
+    (flights.est_arr / <arr>#ARR, via _board_local_to_utc_iso). Der Crew-State
+    kannte bisher nur `sched_arr + arr_delay_min` und fiel bei UNBEKANNTEM
+    (aber existierendem) Board-esti auf die Plan-Zeit zurück → Divergenz.
+    Deshalb: das absolute `est_arr_iso` aus den obs SCHLÄGT `sched + delay`
+    (gleiche Quelle wie der Radar). Fehlt es, exakt das alte Verhalten
+    (`arr_delay_min`/`delay_min` auf die Roster-Soll-Ankunft). Ein synthetisches
+    arr (arr_synth) hat keine echte Soll-Ankunft → keine eff-Ankunft.
+    Wirft nie. Returns (aware-UTC | None, int-min | None)."""
+    o = o or {}
+    arr_delay = _num(o.get('arr_delay_min'))
+    if arr_delay is None:
+        arr_delay = _num(o.get('delay_min'))
+    if leg.get('arr_synth'):
+        return None, (int(round(arr_delay)) if arr_delay is not None else None)
+    est_abs = _parse_iso(o.get('est_arr_iso'))
+    if est_abs is not None:
+        d = round((est_abs - leg['arr']).total_seconds() / 60.0)
+        return est_abs, int(d)
+    if arr_delay is not None:
+        return leg['arr'] + _dt.timedelta(minutes=arr_delay), int(round(arr_delay))
+    return None, None
+
+
+def _eff_dep(leg, o):
+    """Effektiver (delay-korrigierter) Abflug EINES Legs → (eff_dt, delay_min).
+    Symmetrisch zu _eff_arr: absolute `est_dep_iso` aus den obs schlägt
+    `sched_dep + dep_delay_min`. Wirft nie. Returns (aware-UTC, int-min|None)."""
+    o = o or {}
+    dep_delay = _num(o.get('dep_delay_min'))
+    est_abs = _parse_iso(o.get('est_dep_iso'))
+    if est_abs is not None:
+        d = round((est_abs - leg['dep']).total_seconds() / 60.0)
+        return est_abs, int(d)
+    if dep_delay is not None:
+        return leg['dep'] + _dt.timedelta(minutes=dep_delay), int(round(dep_delay))
+    return leg['dep'], None
+
+
 def _fmt_reg(r):
     """Kanonische Reg-Schreibweise: Boards liefern 'DAIWA', Radar/adsb suchen
     'D-AIWA' — deutsche Regs bekommen den Bindestrich zurueck (Owner-Fund:
@@ -497,10 +540,15 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         arr_delay = _num(o.get('arr_delay_min'))
         if arr_delay is None:
             arr_delay = _num(o.get('delay_min'))
-        est_dep = (leg['dep'] + _dt.timedelta(minutes=dep_delay)
-                   if dep_delay is not None else None)
-        est_arr = (leg['arr'] + _dt.timedelta(minutes=arr_delay)
-                   if (arr_delay is not None and not leg['arr_synth']) else None)
+        # est_dep/est_arr: absolute Warehouse-esti schlägt sched+delay (EINE
+        # Wahrheit mit dem Radar — s. _eff_arr/_eff_dep). Fehlt das absolute
+        # est, exakt das alte Verhalten (nur sched+delay). Das Anzeige-est darf
+        # frischer sein als der (evtl. noch unbekannte) explizite delay_min —
+        # deshalb hier über die Helfer, aber die delay_min/known-Metrik unten
+        # bleibt an den EXPLIZITEN obs-Delays hängen (Contract stabil).
+        _ed, _ = _eff_dep(leg, o)
+        est_dep = _ed if (o.get('est_dep_iso') or dep_delay is not None) else None
+        est_arr, _ = _eff_arr(leg, o)
         delay = arr_delay if arr_delay is not None else dep_delay
         return {
             'dep': leg['dep_ap'], 'arr': leg['arr_ap'],
@@ -719,10 +767,12 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         # real ueber Schweden, Karte malte Strasbourg).
         _live(leg)
         o = leg.get('obs') or {}
-        arr_delay = _num(o.get('arr_delay_min'))
-        if arr_delay is None:
-            arr_delay = _num(o.get('delay_min'))
-        eff_arr = leg['arr'] + _dt.timedelta(minutes=max(0.0, arr_delay or 0.0))
+        # Ankunftszeit im Text = die EFFEKTIVE Ankunft wie der Radar sie zeigt:
+        # absolute Warehouse-esti schlägt sched+delay (Owner 2026-07-13 „Live-
+        # Karte 8:40, Radar paar Min später"). Fehlt beides → Plan-Ankunft.
+        eff_arr, _ = _eff_arr(leg, o)
+        if eff_arr is None:
+            eff_arr = leg['arr']
         route = f"{leg['dep_ap']} → {leg['arr_ap'] or '?'}"
         sub = route
         if not leg['arr_synth']:
@@ -741,13 +791,19 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
 
     # kind == 'waiting': vor Leg idx — physisch am Abflughafen dieses Legs.
     o = leg.get('obs') or {}
-    dep_delay = _num(o.get('dep_delay_min'))
-    eff_dep = leg['dep'] + _dt.timedelta(minutes=max(0.0, dep_delay or 0.0))
+    # eff_dep = die EFFEKTIVE Abflugzeit wie der Radar sie zeigt: absolute
+    # Warehouse-esti schlägt sched+dep_delay (EINE Wahrheit, Owner 2026-07-13).
+    # dep_eff_min ist der abgeleitete Delay (aus dem absoluten esti ODER dem
+    # expliziten dep_delay_min) — kein Rückfall auf max(0,…), damit ein echter
+    # Delay auch aus einem reinen esti sichtbar wird.
+    eff_dep, dep_eff_min = _eff_dep(leg, o)
+    if eff_dep < leg['dep']:
+        eff_dep = leg['dep']          # nie VOR den Plan schieben (nur später)
     t = hhmm(eff_dep, leg['dep_ap'])
     # Delay ist BEKANNT nur, wenn er den Abflug wirklich nach hinten schiebt
     # (est_dep > sched_dep). Ein 0-/Negativ-Delay ist „pünktlich", kein Grund
     # für den „Verspätet"-Text (Owner 2026-07-13, Basti-Fall).
-    delay_known = dep_delay is not None and dep_delay > 0
+    delay_known = dep_eff_min is not None and dep_eff_min > 0
     wait_txt = (f"Wartet auf {leg['flight']} · {t}" if leg['flight'] and t
                 else (f'Wartet auf den Abflug · {t}' if t else 'Wartet auf den Abflug'))
     # PRE-FLIGHT-TIMELINE (Owner 2026-07-12): feingranulare Phase aus reinen

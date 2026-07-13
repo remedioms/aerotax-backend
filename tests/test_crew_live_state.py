@@ -900,3 +900,135 @@ def test_family_status_standby_tag_zeigt_standby():
     assert cs is not None
     assert cs['state'] == STATE_STANDBY
     assert cs['text']['title'] == 'Standby'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BUG A (Owner 2026-07-13 „Leute im Radar mit Pin in Frankfurt, obwohl im
+#  Dienst"): ein FLIEGENDER Freund ohne Live-Fix darf KEINE Boden-/Homebase-
+#  Koordinate als Karten-Position bekommen. crew_state.position MUSS None sein
+#  (iOS nutzt genau dieses Feld für den Radar-Pin der „Wer fliegt gerade"-Karte;
+#  current_city/layover bleiben reiner TEXT, sind aber NIE die Pin-Quelle eines
+#  Fliegenden). Wenn ein Fix da ist, kommt die ECHTE Position (kein Boden-Pin).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_bugA_flying_ohne_livefix_hat_keine_position():
+    """Board sagt airborne, aircraft_live liefert NICHTS → state=flying,
+    aber position IS None (kein FRA-/Homebase-Koordinaten-Pin)."""
+    now = _utc(11, 30)   # LH802 FRA→ARN unterwegs
+    obs = _obs({'LH802': {'status': 'Departed'}})
+    live = _live({})     # KEIN Live-Fix
+    r = resolve_crew_live_state(SECTORS, obs, live, now,
+                                homebase='FRA', layover_iata='ARN',
+                                city_lookup=CITY.get)
+    assert r['state'] == STATE_FLYING
+    assert r['position'] is None, \
+        'Fliegender ohne Live-Fix darf KEINEN Boden-/Homebase-Pin liefern'
+    # current_leg trägt nur Route-TEXT (dep/arr), keine lat/lon.
+    assert 'lat' not in (r['current_leg'] or {})
+    assert 'lon' not in (r['current_leg'] or {})
+
+
+def test_bugA_flying_am_boden_fix_wird_verworfen():
+    """aircraft_live meldet die Maschine AM BODEN (on_ground) → position None
+    (nie ein Boden-Punkt als Flug-Pin), Zustand bleibt flying solange die
+    Board-Wahrheit airborne sagt."""
+    now = _utc(11, 30)
+    obs = _obs({'LH802': {'status': 'Departed'}})
+    live = _live({'LH802': {'lat': 50.03, 'lon': 8.57, 'on_ground': True,
+                            'source': 'aircraft_live'}})
+    r = resolve_crew_live_state(SECTORS, obs, live, now,
+                                homebase='FRA', layover_iata='ARN')
+    assert r['state'] == STATE_FLYING
+    assert r['position'] is None
+
+
+def test_bugA_flying_mit_livefix_liefert_echte_position():
+    """Mit echtem airborne-Fix kommt die ECHTE Position (Kontrast zu oben)."""
+    now = _utc(11, 30)
+    obs = _obs({'LH802': {'status': 'Departed'}})
+    live = _live({'LH802': {'lat': 55.1, 'lon': 12.4, 'on_ground': False,
+                            'track': 30.0, 'gs': 450.0, 'source': 'aircraft_live'}})
+    r = resolve_crew_live_state(SECTORS, obs, live, now,
+                                homebase='FRA', layover_iata='ARN')
+    assert r['state'] == STATE_FLYING
+    assert r['position'] is not None
+    assert r['position']['lat'] == 55.1 and r['position']['lon'] == 12.4
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BUG B (Owner 2026-07-13 „bei Sebastian steht Landung 8:40 in der Live-Karte,
+#  aber im Radar landet der Flieger paar Min später"): der Crew-State zeigte die
+#  PLAN-Ankunft, wenn das Board eine konkrete revidierte esti trug, der Delay
+#  aber (noch) nicht als „known" quantifiziert war. Jetzt schlägt das absolute
+#  Warehouse-est_arr_iso (dieselbe Quelle wie der Radar) `sched + delay`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BUGB_SECTORS = [
+    {'flight': 'LH900', 'from': 'FRA', 'to': 'LHR',
+     'dep_iso': '2026-07-09T07:00:00Z', 'arr_iso': '2026-07-09T08:40:00Z'},
+]
+
+
+def test_bugB_flying_ankunft_folgt_absolutem_est_arr_wie_radar():
+    """est_arr_iso 08:47 (absolut, wie der Radar) bei UNBEKANNTEM Delay →
+    Text zeigt 08:47, nicht die Plan-08:40."""
+    now = _utc(8, 30)
+    obs = _obs({'LH900': {'status': 'Departed', 'dep_delay_min': 0,
+                          'arr_delay_min': None, 'delay_min': None,
+                          'delay_known': False,
+                          'est_arr_iso': '2026-07-09T08:47:00Z'}})
+    r = resolve_crew_live_state(_BUGB_SECTORS, obs, _live({}), now,
+                                homebase='FRA', layover_iata='LHR')
+    assert r['state'] == STATE_FLYING
+    assert r['text']['subtitle'] == 'FRA → LHR · Ankunft 08:47'
+    assert r['current_leg']['est_arr_iso'] == '2026-07-09T08:47:00Z'
+
+
+def test_bugB_ohne_est_arr_bleibt_planzeit():
+    """Kein absolutes est, kein Delay → exakt das alte Verhalten (Plan 08:40)."""
+    now = _utc(8, 30)
+    obs = _obs({'LH900': {'status': 'Departed', 'dep_delay_min': 0}})
+    r = resolve_crew_live_state(_BUGB_SECTORS, obs, _live({}), now,
+                                homebase='FRA', layover_iata='LHR')
+    assert r['state'] == STATE_FLYING
+    assert r['text']['subtitle'] == 'FRA → LHR · Ankunft 08:40'
+    assert r['current_leg']['est_arr_iso'] is None
+
+
+def test_bugB_expliziter_arr_delay_unveraendert():
+    """Expliziter arr_delay_min=7 ohne absolutes est → sched+7 = 08:47
+    (Rückwärtskompatibilität: delay_min bleibt die explizite Zahl)."""
+    now = _utc(8, 30)
+    obs = _obs({'LH900': {'status': 'Departed', 'arr_delay_min': 7,
+                          'delay_known': True}})
+    r = resolve_crew_live_state(_BUGB_SECTORS, obs, _live({}), now,
+                                homebase='FRA', layover_iata='LHR')
+    assert r['text']['subtitle'] == 'FRA → LHR · Ankunft 08:47'
+    assert r['current_leg']['delay_min'] == 7
+    assert r['current_leg']['est_arr_iso'] == '2026-07-09T08:47:00Z'
+
+
+def test_bugB_pre_flight_abflug_folgt_absolutem_est_dep():
+    """Symmetrie am Abflug: absolute est_dep_iso 07:25 bei unbekanntem Delay →
+    „Wartet auf LH900 · 07:25" + Verspätet-Phase (est_dep > sched_dep)."""
+    now = _utc(6, 50)   # vor Abflug
+    obs = _obs({'LH900': {'status': 'Delayed', 'dep_delay_min': None,
+                          'delay_known': False,
+                          'est_dep_iso': '2026-07-09T07:25:00Z'}})
+    r = resolve_crew_live_state(_BUGB_SECTORS, obs, _live({}), now,
+                                homebase='FRA', layover_iata='LHR')
+    assert r['state'] == STATE_PRE_FLIGHT
+    assert '07:25' in r['text']['title'], r['text']['title']
+
+
+def test_bugB_est_arr_vor_sched_wird_nicht_negativ_verdreht():
+    """Absurdes est_arr VOR sched (früher als Plan) → est_arr_iso trägt die
+    absolute Zeit, aber es entsteht kein sinnloser Zustand (nur Anzeige)."""
+    now = _utc(8, 30)
+    obs = _obs({'LH900': {'status': 'Departed',
+                          'est_arr_iso': '2026-07-09T08:30:00Z'}})
+    r = resolve_crew_live_state(_BUGB_SECTORS, obs, _live({}), now,
+                                homebase='FRA', layover_iata='LHR')
+    assert r['state'] == STATE_FLYING
+    # est schlägt Plan auch nach vorne (frühere Ankunft ist ein echtes Signal).
+    assert r['text']['subtitle'] == 'FRA → LHR · Ankunft 08:30'
