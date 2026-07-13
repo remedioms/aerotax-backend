@@ -107,6 +107,14 @@ PRE_CREWBUS = 'crewbus'        # OUTSTATION: ab iCal-Pickup-Zeit
 PRE_SECURITY = 'security'      # OUTSTATION: ab Pickup + _CREWBUS_RIDE_MIN
 PRE_PREP = 'prep'              # ab eff. Abflug − _PREP_BEFORE_DEP_MIN
 PRE_BOARDING = 'boarding'      # nur bei beobachtetem Boarding-Board-Status
+PRE_DELAYED = 'delayed'        # bekannte Start-Verspätung, Abflug NOCH nicht
+                               # bewiesen (Owner 2026-07-13, Basti-Fall): ehrlich
+                               # „Verspätet" statt einer ewig hängenden
+                               # „Flugvorbereitung". Ersetzt PRE_PREP, sobald der
+                               # Board-/Est-Delay einen späteren Abflug belegt —
+                               # gilt VOR und NACH Erreichen von est_dep, bis ein
+                               # echtes Abflug-/Fly-/Land-Signal es ablöst. Keine
+                               # erfundene Position/Glyph — nur der Text wird ehrlich.
 
 PRE_PHASE_LABEL = {
     PRE_CHECKIN: 'Check-in offen',
@@ -116,6 +124,7 @@ PRE_PHASE_LABEL = {
     PRE_SECURITY: 'Durch die Security',
     PRE_PREP: 'Flugvorbereitung',
     PRE_BOARDING: 'Boarding',
+    PRE_DELAYED: 'Verspätet',
 }
 
 _CREWBUS_RIDE_MIN = 25         # Default Hotel→Terminal-Fahrtzeit (Minuten) —
@@ -123,6 +132,12 @@ _CREWBUS_RIDE_MIN = 25         # Default Hotel→Terminal-Fahrtzeit (Minuten) �
                                # pro Hotel; 25' ist der LH-übliche Richtwert.
 _PREP_BEFORE_DEP_MIN = 40      # „Flugvorbereitung" ab eff. Abflug − 40 min
                                # (Zeit-Heuristik NUR fürs Label, s.o.)
+_PREP_CAP_GRACE_MIN = 5        # Gnadenspanne, um die die zeitbasierte Vor-Abflug-
+                               # Phase über den (delay-korrigierten) eff_dep
+                               # hinaus stehen bleibt (Uhr-/Board-Rundung), bevor
+                               # sie ohne Delay-Wissen gekappt wird (Owner
+                               # 2026-07-13, Basti-Fall). Klein gehalten: der
+                               # Abflug-Moment ist die ehrliche Obergrenze.
 _PRE_LEAD_MAX_MIN = 6 * 60     # Plausibilitäts-Fenster wie iOS
                                # RosterLabels.maxLeadWindowMinutes: eine Marke
                                # >6 h vor dem Plan-Abflug ist inkonsistent →
@@ -208,20 +223,47 @@ def pickup_utc_for_leg(hhmm, dep_iso, tzname):
         return None
 
 
-def _resolve_pre_phase(leg, now, eff_dep, pre_ctx, hb, first_leg):
+def _resolve_pre_phase(leg, now, eff_dep, pre_ctx, hb, first_leg,
+                       delay_known=False):
     """Feingranulare Vor-Abflug-Phase (siehe PRE_*-Block). Reine
     Zeitvergleiche: alle bekannten Phasen-Startmarken sammeln, die SPÄTESTE
     Marke ≤ now gewinnt. Unbekannte Marken fehlen einfach in der Liste →
     die Phase wird übersprungen, die nächste Grenze gilt (nichts erfinden).
     Boarding ist KEINE Zeitmarke, sondern nur beobachtet (Board schlägt Uhr
     in beide Richtungen). Zwischen zwei Legs (first_leg=False, Turnaround am
-    Flugzeug) gibt es keine Checkin-/Anfahrts-Phasen — nur prep/boarding."""
+    Flugzeug) gibt es keine Checkin-/Anfahrts-Phasen — nur prep/boarding.
+
+    KAPPUNG + Verspätung (Owner 2026-07-13, Basti-Fall LH900): die
+    zeitbasierte „Flugvorbereitung" (prep, ab eff_dep−40) hatte KEINEN oberen
+    Deckel — sie hing ewig, auch wenn der (schon delay-korrigierte) eff_dep
+    längst vorbei war und weder Board noch Live den Abflug bewiesen. eff_dep
+    ist der EHRLICHE Abflug-Moment (Soll + bekannter Delay); ab da ist eine
+    Vor-Abflug-Prosa irreführend. Deshalb:
+      • Ist der Delay BEKANNT (est_dep > sched_dep), gewinnt PRE_DELAYED
+        („Verspätet") über PRE_PREP — VOR und NACH Erreichen von eff_dep,
+        bis ein Abflug-/Fly-/Land-Signal den Zustand ohnehin ablöst. Der Text
+        zeigt dann die verspätete Abflugzeit (eff_dep) statt „Flugvorbereitung".
+      • Ohne bekannten Delay wird prep bei now ≥ eff_dep (kleine Gnadenspanne
+        _PREP_CAP_GRACE_MIN gegen Uhr-/Board-Rundung) gekappt → None
+        (neutraler Text, nichts erfunden). Boarding (beobachtet) bleibt
+        unberührt, es ist ein echtes Signal.
+    """
     o = leg.get('obs') or {}
     if _status_is_boarding(o.get('status')):
         return PRE_BOARDING
     prep_start = eff_dep - _dt.timedelta(minutes=_PREP_BEFORE_DEP_MIN)
+    # Deckel: Vor-Abflug-Phase endet am (delay-korrigierten) eff_dep. Kleine
+    # Gnadenspanne für Uhr-/Board-Rundung, damit die Phase nicht 1-2 min VOR
+    # dem realen Abheben verschwindet.
+    prep_cap = eff_dep + _dt.timedelta(minutes=_PREP_CAP_GRACE_MIN)
+    if now >= prep_start:
+        if delay_known:
+            return PRE_DELAYED         # ehrlich „Verspätet" statt „Flugvorbereitung"
+        if now < prep_cap:
+            return PRE_PREP
+        return None                    # gekappt: Abflug-Moment vorbei, kein Beweis
     if not first_leg:
-        return PRE_PREP if now >= prep_start else None
+        return None
     # (start | None=-inf, rank, phase) — rank bricht Zeit-Gleichstand
     # zugunsten der späteren Timeline-Stufe.
     marks = [(None, 0, PRE_CHECKIN), (prep_start, 5, PRE_PREP)]
@@ -702,21 +744,36 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
     dep_delay = _num(o.get('dep_delay_min'))
     eff_dep = leg['dep'] + _dt.timedelta(minutes=max(0.0, dep_delay or 0.0))
     t = hhmm(eff_dep, leg['dep_ap'])
+    # Delay ist BEKANNT nur, wenn er den Abflug wirklich nach hinten schiebt
+    # (est_dep > sched_dep). Ein 0-/Negativ-Delay ist „pünktlich", kein Grund
+    # für den „Verspätet"-Text (Owner 2026-07-13, Basti-Fall).
+    delay_known = dep_delay is not None and dep_delay > 0
     wait_txt = (f"Wartet auf {leg['flight']} · {t}" if leg['flight'] and t
                 else (f'Wartet auf den Abflug · {t}' if t else 'Wartet auf den Abflug'))
     # PRE-FLIGHT-TIMELINE (Owner 2026-07-12): feingranulare Phase aus reinen
     # Zeitvergleichen (now vs. berechnete Marken) + Boarding-Beobachtung.
+    # delay_known kappt/ersetzt die hängende „Flugvorbereitung" durch den
+    # ehrlichen „Verspätet"-Status (Owner 2026-07-13, Basti-Fall).
     pre = _resolve_pre_phase(leg, now, eff_dep, pre_ctx, hb,
-                             first_leg=(idx == 0))
+                             first_leg=(idx == 0), delay_known=delay_known)
     if idx == 0:
         route = f"{leg['dep_ap']} → {leg['arr_ap'] or '?'}"
         # Fertiger Text in der Subtitle (Owner-Spez): alte Builds zeigen die
         # angereicherte Prosa, neue lesen zusätzlich pre_phase(_label).
-        sub = f'{route} · {PRE_PHASE_LABEL[pre]}' if pre else route
+        # „Verspätet" trägt zusätzlich die NEUE (verspätete) Abflugzeit im Text
+        # („FRA → LHR · Verspätet 08:20") — der Owner-Wunsch „Status verspätet
+        # und neuer Abflug" (die verspätete Zeit steht auch im Titel via t).
+        if pre == PRE_DELAYED and t:
+            sub = f'{route} · Verspätet {t}'
+        elif pre:
+            sub = f'{route} · {PRE_PHASE_LABEL[pre]}'
+        else:
+            sub = route
         return _result(STATE_PRE_FLIGHT, leg=leg, idx=idx, title=wait_txt,
                        subtitle=sub, confidence=conf, pre_phase=pre)
     # Zwischen zwei Legs: gelandet am Abflughafen des kommenden Legs.
-    # pre ist hier höchstens prep/boarding (Turnaround am Flugzeug).
+    # pre ist hier höchstens prep/boarding/delayed (Turnaround am Flugzeug);
+    # wait_txt trägt bereits die (ggf. verspätete) Abflugzeit (eff_dep).
     return _result(STATE_LANDED, leg=leg, idx=idx,
                    title=f"Gelandet in {city(leg['dep_ap'])}",
                    subtitle=wait_txt, confidence=conf, pre_phase=pre)

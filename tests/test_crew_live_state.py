@@ -233,10 +233,14 @@ def test_boden_nahe_dep_schlaegt_plan_fenster():
     assert r['leg_index'] == 0
     assert r['confidence'] == CONF_OBSERVED
     assert r['text']['title'] == 'Wartet auf LH1139 · 06:40'
-    # PRE-FLIGHT-TIMELINE (2026-07-12): 07:30 ≥ eff_dep−40 → „Flugvorbereitung"
-    # hängt an der Route (fertiger Text in der Subtitle, Owner-Spez).
-    assert r['text']['subtitle'] == 'BCN → FRA · Flugvorbereitung'
-    assert r['pre_phase'] == 'prep'
+    # PRE-FLIGHT-KAPPUNG (Owner 2026-07-13, Basti-Fall): now 07:30 liegt 50 min
+    # NACH dem (unverspäteten) Plan-Abflug 06:40 — die Tafel kennt KEINEN Delay
+    # (dep_delay=None), der Live-Store zeigt nur „am Boden nahe dep". Ohne
+    # bekannten Delay darf die „Flugvorbereitung" nicht ewig über den
+    # Abflug-Moment hinaus hängen → sie wird gekappt (neutraler Text, nur die
+    # Route). Nichts erfunden, kein „Verspätet" ohne Delay-Beweis.
+    assert r['text']['subtitle'] == 'BCN → FRA'
+    assert r['pre_phase'] is None
     assert r['position'] is None   # am Boden = keine Live-Flug-Position
 
 
@@ -565,7 +569,7 @@ from datetime import timedelta as _td                     # noqa: E402
 from blueprints.crew_live_state import (                  # noqa: E402
     parse_pickup_hhmm, pickup_utc_for_leg,
     PRE_CHECKIN, PRE_COMMUTE, PRE_BRIEFING, PRE_CREWBUS, PRE_SECURITY,
-    PRE_PREP, PRE_BOARDING,
+    PRE_PREP, PRE_BOARDING, PRE_DELAYED,
 )
 
 # Leg 1 (BCN→FRA, dep 06:40Z) startet an der OUTSTATION (hb=FRA):
@@ -702,6 +706,73 @@ def test_pre_turnaround_zwischen_legs_nur_prep():
     assert r2['state'] == STATE_LANDED
     assert r2['pre_phase'] == PRE_PREP
     assert r2['text']['subtitle'] == 'Wartet auf LH802 · 10:10'   # unverändert
+
+
+# ── Basti-Fall (Owner 2026-07-13): bekannter Delay → „Verspätet", KEINE ─────
+# ewig hängende „Flugvorbereitung". LH900 FRA→LHR, Fahrplan-Abflug 08:00,
+# verspätet auf 08:20 (delay bekannt), jetzt 08:49 — auch der verspätete
+# Abflug ist 29 min vorbei, ohne Board-„abgeflogen"/Live-Beweis. Erwartet:
+# Status „Verspätet" + verspätete Abflugzeit, nicht „Flugvorbereitung".
+_LH900 = [{'flight': 'LH900', 'from': 'FRA', 'to': 'LHR',
+           'dep_iso': '2026-07-09T08:00:00Z', 'arr_iso': '2026-07-09T09:45:00Z'}]
+
+
+def test_basti_bekannter_delay_zeigt_verspaetet_nicht_prep():
+    # sched 08:00, est 08:20 (dep_delay 20), now 08:49 (29 min NACH est_dep),
+    # Board kennt die Verspätung (grounded-Status), kein Abflug-/Live-Beweis.
+    r = _resolve(_utc(8, 49), sectors=_LH900,
+                 obs={'LH900': {'status': 'Verspätet', 'dep_delay_min': 20}})
+    assert r['state'] == STATE_PRE_FLIGHT
+    assert r['pre_phase'] == PRE_DELAYED
+    assert r['pre_phase_label'] == 'Verspätet'
+    # Der Titel trägt die VERSPÄTETE Abflugzeit (08:20), nicht die Fahrplan-Zeit.
+    assert r['text']['title'] == 'Wartet auf LH900 · 08:20'
+    # Der Status-Text ist ehrlich „Verspätet" + verspätete Abflugzeit — NICHT
+    # „Flugvorbereitung".
+    assert r['text']['subtitle'] == 'FRA → LHR · Verspätet 08:20'
+    assert 'Flugvorbereitung' not in r['text']['subtitle']
+    assert r['position'] is None       # kein erfundener Live-Flug
+
+
+def test_basti_delay_vor_est_dep_timeline_noch_korrekt():
+    # now 08:10 — VOR dem verspäteten Abflug 08:20, aber schon in der
+    # prep-Fenster-Zone (est_dep−40 = 07:40). Auch hier: „Verspätet" (Owner:
+    # gilt VOR und NACH est_dep), nicht die generische „Flugvorbereitung".
+    r = _resolve(_utc(8, 10), sectors=_LH900,
+                 obs={'LH900': {'status': 'Verspätet', 'dep_delay_min': 20}})
+    assert r['state'] == STATE_PRE_FLIGHT
+    assert r['pre_phase'] == PRE_DELAYED
+    assert r['text']['subtitle'] == 'FRA → LHR · Verspätet 08:20'
+
+
+def test_basti_delay_frueh_vor_prep_zeigt_checkin_nicht_verspaetet():
+    # now 06:30 — weit VOR est_dep−40 (07:40): die frühe Timeline (Check-in
+    # offen) bleibt korrekt, „Verspätet" übernimmt erst ab dem prep-Fenster
+    # (kein alarmierender Dauer-„Verspätet" den ganzen Tag).
+    r = _resolve(_utc(6, 30), sectors=_LH900,
+                 obs={'LH900': {'status': 'Verspätet', 'dep_delay_min': 20}})
+    assert r['state'] == STATE_PRE_FLIGHT
+    assert r['pre_phase'] == PRE_CHECKIN
+
+
+def test_past_dep_ohne_delay_neutral_kein_prep_kein_verspaetet():
+    # now 08:49, KEIN bekannter Delay (Board grounded ohne dep_delay), Abflug
+    # 08:00 längst vorbei, kein Live-Beweis → neutraler Text (nur Route),
+    # weder „Flugvorbereitung" (gekappt) noch „Verspätet" (kein Delay-Beweis).
+    r = _resolve(_utc(8, 49), sectors=_LH900,
+                 obs={'LH900': {'status': 'on time'}})
+    assert r['state'] == STATE_PRE_FLIGHT
+    assert r['pre_phase'] is None
+    assert r['text']['subtitle'] == 'FRA → LHR'
+    assert 'Flugvorbereitung' not in (r['text']['subtitle'] or '')
+
+
+def test_basti_boarding_beobachtet_schlaegt_verspaetet():
+    # Trotz bekanntem Delay: ein echtes Boarding-Board-Signal gewinnt (Board
+    # schlägt Uhr) — Boarding ist ein echtes Signal, „Verspätet" nur der Text.
+    r = _resolve(_utc(8, 10), sectors=_LH900,
+                 obs={'LH900': {'status': 'Boarding', 'dep_delay_min': 20}})
+    assert r['pre_phase'] == PRE_BOARDING
 
 
 # ── Pickup-Parser (Server-Nachbau der iOS-Referenz-Regexe) ──────────────────
