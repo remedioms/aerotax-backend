@@ -11981,7 +11981,9 @@ def get_friends_homebases(token):
         if not hb or len(hb) != 3: hb = '???'
         grouped[hb].append({
             'token': fr[:16] + '…',  # truncate for privacy
-            'name': pr.get('name') or 'Friend',
+            # NAME-FIX (Owner 2026-07-13): kein erfundener 'Friend'-Platzhalter —
+            # leerer Name bleibt ehrlich '' (iOS lässt ihn dann weg).
+            'name': pr.get('name') or '',
             'avatar_url': pr.get('avatar_url'),
             'airline': pr.get('airline') or '',
             'position': pr.get('position') or '',
@@ -12333,7 +12335,8 @@ def _crew_pre_flight_ctx(day, secs, brief_summary, brief_start_iso,
 
 
 def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
-                        commute_minutes=None):
+                        commute_minutes=None, obs_lookup=None,
+                        live_lookup=None):
     """Additives `crew_state`-Feld für friends-today — EINE Wahrheit über den
     Neubau-Resolver blueprints/crew_live_state (Owner 2026-07-10: „baue es
     komplett neu auf damit es funktioniert, auch Text"). iOS zeigt text.title/
@@ -12342,7 +12345,13 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
     Live-Gegencheck = reiner aircraft_live-Read. None bei jedem Fehler —
     Altfelder bleiben unverändert stehen.
     commute_minutes (ADDITIV 2026-07-12): selbst angegebene Fahrzeit des
-    Freundes (Profil) → PRE-FLIGHT-TIMELINE-Phase „Fahrt zum Flughafen"."""
+    Freundes (Profil) → PRE-FLIGHT-TIMELINE-Phase „Fahrt zum Flughafen".
+    obs_lookup/live_lookup (ADDITIV 2026-07-13, Latenz-Hebel): die geteilten
+    Lookup-Closures pro Request EINMAL bauen und hier reinreichen, statt sie
+    bei jedem der bis zu 3 crew_state-Läufe pro Freund neu zu bauen. Beide
+    schließen NUR über gecachte/memoisierte Leaf-Reads (_flight_obs_merged /
+    _aircraft_live_pos) und sind zustandslos → thread-safe teilbar. None =
+    Rückfall auf frisch gebaute Lookups (Alt-Callsites/Tests)."""
     try:
         from blueprints.crew_live_state import (resolve_crew_live_state,
                                                 pick_fresher_sectors,
@@ -12366,10 +12375,16 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
         # #7): family_watch nutzt dieselbe — vorher divergierte Family
         # („Basis X") vom Crew-Feed („Heute frei") für dieselbe Person.
         duty = duty_from_roster_day(day.get('klass'), day.get('marker'))
+        # Geteilte Lookups (Latenz-Hebel 2026-07-13): obs_lookup ist an `datum`
+        # gebunden (Spillover/Next-Läufe reichen KEINE fremde weiter → dort
+        # None), live_lookup ist datums-unabhängig und wird pro Request EINMAL
+        # gebaut. None ⇒ frisch bauen (Alt-Callsites/Tests).
+        _obs_lk = obs_lookup or build_obs_lookup(_flight_obs_merged, datum)
+        _live_lk = live_lookup or build_live_lookup()
         cs = resolve_crew_live_state(
             secs or [],
-            build_obs_lookup(_flight_obs_merged, datum),
-            build_live_lookup(),
+            _obs_lk,
+            _live_lk,
             datetime.now(timezone.utc),
             homebase=homebase,
             layover_iata=rf.get('layover_ort'),
@@ -12433,9 +12448,48 @@ def get_friends_today(token):
     # N+1-Fix (2026-07-01): Friend-Profile in EINEM Bulk-Query (SB-primary
     # wie get_user_friends; Disk-Datei ist auf Cloud Run ephemer).
     _bulk_profs = _profiles_load_bulk(friends)
+
+    # LATENZ-HEBEL 1 PARALLELISIEREN (Owner 2026-07-13, „warum dauert
+    # friends-today kalt 5–9 s"): die Pro-Freund-Arbeit (crew_state ×3 +
+    # flights_live + Positions-Kaskade, alles serielle Supabase-Roundtrips)
+    # ist zwischen Freunden UNABHÄNGIG → über einen ThreadPoolExecutor
+    # gleichzeitig laufen lassen (Muster wie das flight-detail-Aggregat
+    # ax_flight_detail). Wall-Clock ≈ der langsamste Freund statt der SUMME.
+    #   • current_app existiert in Worker-Threads NICHT → das konkrete
+    #     App-Objekt reinreichen; jeder Worker pusht via test_request_context
+    #     seinen eigenen App-+Request-Kontext (Flask-Kontexte sind thread-local).
+    #   • Reihenfolge MUSS die ursprüngliche Friend-Reihenfolge bleiben (iOS
+    #     matcht über match_id, aber der Golden pinnt die Liste) → Ergebnisse
+    #     mit ihrem Index gesammelt und danach exakt so sortiert.
+    # HEBEL 2 GETEILTE LOOKUPS: live_lookup ist datums-unabhängig und wird
+    # hier EINMAL gebaut (statt bei jedem der bis zu 3 crew_state-Läufe pro
+    # Freund neu); der obs_lookup für HEUTE ebenso. Beide schließen nur über
+    # die 90-s-memoisierten Leaf-Reads (_flight_obs_merged / _aircraft_live_pos)
+    # → gleiche Flüge über mehrere Freunde = EIN Read, thread-safe geteilt.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from flask import current_app as _cur_app
+    _app_obj = _cur_app._get_current_object()
+    try:
+        from blueprints.crew_live_state import (build_obs_lookup as _bol,
+                                                build_live_lookup as _bll)
+        _shared_live_lk = _bll()
+        _shared_obs_lk_today = _bol(_flight_obs_merged, datum)
+    except Exception:
+        _shared_live_lk = None
+        _shared_obs_lk_today = None
+
+    # Kalender-Refresh bleibt im MAIN-Thread (liest request.host/-headers zum
+    # Bauen der Self-Call-URL — im synthetischen Worker-Request-Kontext wären
+    # die leer; die Funktion ist ohnehin ≥3h gedrosselt und spawnt den Fetch
+    # selbst als Daemon-Thread, kehrt also sofort zurück).
     for fr in friends:
-        # Freund-Feeds gedrosselt frisch halten (Pickup-Events, Roster-Änderungen).
         _maybe_refresh_calendar_feed(fr)
+
+    def _process_friend(_idx, fr):
+        """Die komplette Pro-Freund-Arbeit — läuft im Worker-Thread mit
+        gepushtem App-+Request-Kontext des ECHTEN App-Objekts. Gibt
+        (idx, entry|None) zurück; None = Freund fällt raus (kein Roster-Tag
+        / share_roster aus), exakt wie das frühere `continue`."""
         sess = _store.get(fr) or {}
         rd = sess.get('result_data') or {}
         tage = rd.get('_tage_detail') or []
@@ -12459,13 +12513,13 @@ def get_friends_today(token):
             # Briefing-Vorrang wie dokumentiert.
             _snap_ts = (_roster_snapshot_read(fr) or {}).get('taken_at')
         day = next((t for t in tage if isinstance(t, dict) and t.get('datum') == datum), None)
-        if not day: continue
+        if not day: return (_idx, None)
         pr = _bulk_profs.get(fr) or {}
         # PRIVACY-FIX (Bug-Hunt): Friend mit share_roster=False NICHT zeigen —
         # vorher wurde sein voller Tagesplan (Marker/Routing/Layover/Zeiten/Flug-
         # nummern) trotz Opt-out durchgereicht. Spiegelt get_friend_roster.
         if pr.get('share_roster') is False:
-            continue
+            return (_idx, None)
         rf = day.get('reader_facts') or {}
         # WO IST DIE CREW JETZT (2026-07-04): rf['layover_ort'] ist der Über-
         # nachtungsort NACH dem heutigen Dienst. Morgens VOR dem ersten Abflug
@@ -12847,7 +12901,8 @@ def get_friends_today(token):
             _cm_arg = pr.get('commute_minutes')
             crew_state = _crew_state_for_day(
                 fr, day, datum, homebase=_hb_arg, snap_ts=_snap_ts,
-                commute_minutes=_cm_arg)
+                commute_minutes=_cm_arg, obs_lookup=_shared_obs_lk_today,
+                live_lookup=_shared_live_lk)
             # ÜBER-MITTERNACHT-SPILLOVER RÜCKWÄRTS (Owner 2026-07-12,
             # Jennifer-Fall): ein Über-Nacht-Leg (dep GESTERN 12.07 15:40Z
             # SIN→FRA, arr am Folgetag) verschwand nach Berliner Mitternacht
@@ -12890,10 +12945,16 @@ def get_friends_today(token):
                         _friend_briefing_day_sectors(fr, _gestern)
                     y_secs, _y_src = pick_fresher_sectors(
                         _y_snap, _snap_ts, _yb_secs, _yb_ts)
+                    # HEBEL 3 (×3 NUR WO NÖTIG): der teure gestern-Compute läuft
+                    # erst, wenn das gestrige Leg per CHEAP Sektor-Check plausibel
+                    # über Mitternacht in HEUTE reicht (kein Extra-DB-Read — die
+                    # Sektoren sind schon geladen). obs_lookup NICHT geteilt
+                    # (anderes Datum), live_lookup schon (datums-unabhängig).
                     if yesterday_leg_reaches_into_today(y_secs or [], _cs_now):
                         cs_y = _crew_state_for_day(
                             fr, day_y, _gestern, homebase=_hb_arg,
-                            snap_ts=_snap_ts, commute_minutes=_cm_arg)
+                            snap_ts=_snap_ts, commute_minutes=_cm_arg,
+                            live_lookup=_shared_live_lk)
                         if spillover_wins(crew_state, cs_y, now=_cs_now):
                             crew_state = cs_y
             except Exception:
@@ -12915,10 +12976,39 @@ def get_friends_today(token):
                                + _cs_dt.timedelta(days=1)).isoformat()
                     day2 = next((t for t in tage if isinstance(t, dict)
                                  and t.get('datum') == _morgen), None)
-                    if day2:
+                    # HEBEL 3 (×3 NUR WO NÖTIG): den teuren morgen-Vorabend-
+                    # Compute nur laufen lassen, wenn MORGEN plausibel ein Flug
+                    # binnen ~24 h ansteht — billiger Vorab-Check aus den schon
+                    # geladenen Sektoren (KEIN Extra-DB-Read). KONSERVATIV: hat
+                    # ein Sektor keinen parsebaren dep_iso, wird trotzdem
+                    # gerechnet (im Zweifel rechnen → keine echte Vorabend-
+                    # Bordkarte, z.B. Ole morgen früh, geht verloren). Die
+                    # endgültige 24-h-/pre_flight-Entscheidung trifft weiter der
+                    # Resolver + das Fenster unten; dies ist nur ein Superset-Gate.
+                    def _day2_flight_within_24h(_d2):
+                        _secs2 = [s for s in ((_d2 or {}).get('ical_sectors')
+                                              or []) if isinstance(s, dict)]
+                        if not _secs2:
+                            return False
+                        _lim = (_cs_dt.datetime.now(_cs_dt.timezone.utc)
+                                + _cs_dt.timedelta(hours=24))
+                        for s in _secs2:
+                            _di = s.get('dep_iso') or s.get('dep_iso_z')
+                            if not _di:
+                                return True   # unbekannt → konservativ rechnen
+                            try:
+                                _dt = _cs_dt.datetime.fromisoformat(
+                                    str(_di).replace('Z', '+00:00'))
+                                if _dt <= _lim:
+                                    return True
+                            except Exception:
+                                return True   # unparsebar → konservativ rechnen
+                        return False
+                    if day2 and _day2_flight_within_24h(day2):
                         cs2 = _crew_state_for_day(
                             fr, day2, _morgen, homebase=_hb_arg,
-                            snap_ts=_snap_ts, commute_minutes=_cm_arg)
+                            snap_ts=_snap_ts, commute_minutes=_cm_arg,
+                            live_lookup=_shared_live_lk)
                         _leg2 = (cs2 or {}).get('current_leg') or {}
                         _dep_iso2 = _leg2.get('dep_iso')
                         if (cs2 or {}).get('state') == 'pre_flight' and _dep_iso2:
@@ -12932,13 +13022,18 @@ def get_friends_today(token):
                                 crew_state_next = cs2
             except Exception:
                 crew_state_next = None
-        out.append({
+        return (_idx, {
             'token': fr[:16] + '…',
             # Stabile match_id (Hash) statt vollem Token — iOS matcht Friend↔
             # FriendToday hierüber (vorher: truncated token != voller Token aus
             # /friends → CrewMap-Pins fanden ihr Profil nie). Kein Token-Leak.
             'match_id': hashlib.sha256(fr.encode()).hexdigest()[:16],
-            'name': pr.get('name') or 'Friend',
+            # NAME-FIX (Owner 2026-07-13 „Bordkarte sagt friend statt name"):
+            # KEIN erfundener englischer Platzhalter. Fehlt der Profilname,
+            # ehrlich '' (leer) → die iOS-Karte lässt den Namen weg statt
+            # 'Friend' anzuzeigen. (Golden-Fixture bleibt byte-gleich: dort
+            # tragen ALLE Profile einen Namen, der Fallback greift nie.)
+            'name': pr.get('name') or '',
             'avatar_url': pr.get('avatar_url'),
             'homebase': pr.get('homebase') or '',
             # Standort-Stadt — nur wenn share_location an ist UND (Dienstplan-Modus)
@@ -12983,6 +13078,43 @@ def get_friends_today(token):
             'crew_state': crew_state,
             'crew_state_next': crew_state_next,
         })
+
+    def _worker(_idx, fr):
+        # current_app fehlt im Worker → EIGENEN App-+Request-Kontext des
+        # ECHTEN App-Objekts pushen (Muster _detail_subcall). Der Pfad ist
+        # kosmetisch (kein Query-Read im Body — datum kommt aus der Closure);
+        # er dient nur dazu, dass request-context-gebundene Helfer (z.B.
+        # app.logger im crew_state-Skip) nicht werfen. Fehler pro Freund
+        # isoliert → (idx, None), genau wie das frühere `continue`.
+        try:
+            with _app_obj.test_request_context(
+                    f'/api/user/friends-today/{token}?datum={datum}'):
+                return _process_friend(_idx, fr)
+        except Exception:
+            return (_idx, None)
+
+    # Fan-out: max_workers gedeckelt (kleine Crews sind die Norm; ein sehr
+    # großer Freundeskreis soll keine Verbindungs-/Thread-Flut auslösen —
+    # dieselbe Größenordnung wie die anderen Aggregat-Pools). Ergebnisse mit
+    # Index sammeln und in ORIGINALER Friend-Reihenfolge sortieren (Golden +
+    # iOS-match_id-Kontrakt verlangen stabile Reihenfolge).
+    _results = {}
+    if friends:
+        _mw = max(1, min(8, len(friends)))
+        _ex = ThreadPoolExecutor(max_workers=_mw)
+        try:
+            _futs = [_ex.submit(_worker, i, fr) for i, fr in enumerate(friends)]
+            for _f in as_completed(_futs):
+                try:
+                    _i, _entry = _f.result()
+                except Exception:
+                    continue
+                if _entry is not None:
+                    _results[_i] = _entry
+        finally:
+            _ex.shutdown(wait=True)
+    out = [_results[i] for i in sorted(_results)]
+
     _resp = {'datum': datum, 'count': len(out), 'friends_today': out}
     if len(_FRIENDS_TODAY_MEMO) > 5000:
         _FRIENDS_TODAY_MEMO.clear()
