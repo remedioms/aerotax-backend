@@ -471,6 +471,153 @@ def _fmt_reg(r):
     return r
 
 
+# ── FLIGHTSTATE-ENGINE als FLUG-AUTORITÄT eines Legs ─────────────────────────
+# INTEGRATIONSPLAN (Owner 2026-07-13): die FLUG-Phase eines Kandidaten-Legs
+# (fliegt / gelandet / noch nicht abgeflogen) kommt aus der EINEN Engine
+# (blueprints/flight_state.resolve_flight_state) statt aus den crew-eigenen
+# Heuristiken (b-Buckets/eff_dep-airborne). Die Engine kennt DIE Regel „fliegen
+# muss verdient sein" (Airborne-Gate), die Landungs-MONOTONIE (Terminal-Phase
+# kippt nie zurück) und die side-aware Board-Klassifikation (dep-„Abgeflogen" =
+# TAXI_OUT/off-block, NICHT airborne). GENAU DAS löst den Sebastian-Fall: das
+# ARR-seitige „gelandet 12:27" ist ein HARD-Signal → LANDED (terminal) → Leg
+# geflogen, eine stale eff_arr-Schätzung (13:28) kann es NICHT „un-landen" und
+# zeigt nie „fliegt · 13:06".
+#
+# KEIN NEUER I/O: die Observations kommen AUSSCHLIESSLICH aus den schon
+# geladenen Leaf-Reads des Resolvers (leg['obs'] = der gemergte Board-Record,
+# leg['live'] = der aircraft_live-Fix). Der Bridge macht NIE einen Netz-/DB-Call
+# und wirft nie — bei jedem Fehler liefert er None und der Aufrufer fällt auf
+# die (unveränderte) Uhr-/Live-Kaskade zurück.
+#
+# Die Engine-Phase wird in eine crew-Leg-Entscheidung übersetzt:
+#   CANCELLED                     → 'cancelled'
+#   LANDED | ARRIVED              → 'flown'   (Leg beendet, nächsten prüfen)
+#   AIRBORNE | APPROACH           → 'flying'
+#   TAXI_OUT                      → 'departed' (off-block; crew: der Leg ist
+#                                   unterwegs — die Leg-Auswahl behandelt ihn wie
+#                                   'flying', ABER die Widerspruchs-/Stale-Gates
+#                                   des Aufrufers dürfen ihn noch entwerten)
+#   BOARDING | SCHEDULED | UNKNOWN → None    (kein hartes Flug-Signal → der
+#                                   Aufrufer entscheidet über Uhr + Live-Check)
+
+# Engine-Phase-Tokens (String-Konstanten, hier gespiegelt um einen harten
+# Import-Zwang im reinen Modul zu vermeiden — die Engine ist die Quelle).
+_ENG_CANCELLED = 'CANCELLED'
+_ENG_LANDED = 'LANDED'
+_ENG_ARRIVED = 'ARRIVED'
+_ENG_AIRBORNE = 'AIRBORNE'
+_ENG_APPROACH = 'APPROACH'
+_ENG_TAXI_OUT = 'TAXI_OUT'
+
+
+def _engine_leg_flight(leg, o, live, now, dep_ll=None, arr_ll=None,
+                       dep_elev_ft=None, prior=None, bucket_of=None):
+    """FLUG-Autorität EINES Legs aus der FlightState-Engine — reuse der schon
+    geladenen obs (`o`) + Live-Fix (`live`), KEIN neuer I/O. Wirft nie.
+
+    Returns (kind, phase, phase_conf, live_pos) oder None:
+      kind ∈ 'cancelled'|'flown'|'flying'|'departed'|None (siehe Mapping oben).
+      phase/phase_conf = die kanonische Engine-Phase (für Konfidenz/Debug).
+      live_pos = die Engine-gegatete Position (dict|None) — NUR gesetzt, wenn die
+                 Engine sie rendert (airborne-Gate bestanden); sonst None.
+
+    Die Observations werden aus dem gemergten Board-Record `o` gebaut:
+      • status_dep/status_arr (echter Merge-Shape) → side-aware Hard/Soft-Phasen
+        via obs_from_board_merged; das ARR-seitige „gelandet" ist hier der
+        Sebastian-Hebel (Board schlägt jede stale Schätzung).
+      • fehlen status_dep/status_arr (Test-/Alt-Shape mit nur `status`), wird der
+        EINE Merge-Status über die crew-Vokabular-Klassifikation (`bucket_of` =
+        app._flight_status_bucket, DIE eine Wahrheit) auf die richtige Seite
+        gelegt: 'landed' → status_arr (Engine LANDED, terminal), 'airborne' →
+        status_dep='airborne' (Engine AIRBORNE, dep-enroute-proven). 'grounded'/
+        None erzeugt KEINE Phasen-Observation (Engine → SCHEDULED/BOARDING) →
+        der Aufrufer entscheidet über Uhr/Live. So bleibt die crew-Vokabular-
+        Grenze (z. B. „Deboarding" = KEIN Landungssignal DIESES Legs) exakt
+        erhalten, während Landung-Monotonie + Airborne-Gate aus der Engine kommen.
+      • cancelled/est_dep_iso/est_arr_iso/dep_delay_min/arr_delay_min fließen als
+        Zeiten/Delay-Observations ein (die Engine braucht sie fürs ETA/Delay).
+      • der Live-Fix (`live`) wird zur Positions-Observation (aircraft_live).
+    """
+    try:
+        from blueprints.flight_state import (resolve_flight_state,
+                                             remember_state)
+        from blueprints.flight_state_collectors import (build_keys,
+                                                        obs_from_board_merged,
+                                                        Observation)
+    except Exception:
+        return None
+    try:
+        now_ts = now.timestamp() if isinstance(now, _dt.datetime) else None
+        keys = build_keys(
+            leg.get('flight'), None, leg['dep_ap'], leg['arr_ap'],
+            roster_tail=leg.get('tail'),
+            sched_dep_iso=_iso_z(leg['dep']),
+            sched_arr_iso=(None if leg.get('arr_synth') else _iso_z(leg['arr'])),
+            dep_ll=dep_ll, arr_ll=arr_ll, dep_elev_ft=dep_elev_ft)
+        o = o if isinstance(o, dict) else {}
+        bkt = bucket_of if callable(bucket_of) else _default_bucket
+        # Board-Observations: echter Merge-Shape (status_dep/status_arr) direkt an
+        # die Engine (die side-aware Klassifikation + der arr-seitige Landungs-
+        # Hebel = Sebastian). Fehlen die Seiten-Felder (nur `status`), wird der
+        # EINE Merge-Status über die CREW-Vokabular-Klassifikation seiten-korrekt
+        # synthetisiert — so bleibt die crew-Grenze (Deboarding ≠ Landung) exakt.
+        m = dict(o)
+        if not (o.get('status_dep') or o.get('status_arr')) and o.get('status'):
+            _cb = bkt(o['status'])
+            if _cb == 'landed':
+                m['status_arr'] = o['status']        # → Engine LANDED (terminal)
+            elif _cb == 'airborne':
+                m['status_dep'] = 'airborne'         # → Engine AIRBORNE (proven)
+            # 'grounded'/None: KEINE Phasen-Observation (Engine SCHEDULED) — die
+            # Uhr-/Live-Kaskade des Aufrufers entscheidet (crew-Semantik).
+        obs = obs_from_board_merged(m, keys, now=now_ts)
+        # Positions-Observation aus dem schon geladenen Live-Fix (aircraft_live).
+        # Nur wenn Koordinaten da sind; on_ground_raw wird von der Engine ignoriert
+        # (das Airborne-Gate entscheidet). seen_ts/track/gs/alt so weit vorhanden.
+        if isinstance(live, dict) and live.get('lat') is not None \
+                and live.get('lon') is not None:
+            obs.append(Observation('position', {
+                'lat': live.get('lat'), 'lon': live.get('lon'),
+                'track': live.get('track'), 'gs_kt': live.get('gs'),
+                'alt_ft': live.get('alt'),
+                'on_ground_raw': live.get('on_ground'),
+                'position_source': 3,
+            }, 'aircraft_live',
+                _iso_or_epoch_ts(live.get('ts')) or now_ts or 0.0))
+        fs = resolve_flight_state(keys, obs, now=now_ts, prior=prior)
+        try:
+            remember_state(fs, now=now_ts)
+        except Exception:
+            pass
+        phase = fs.get('phase')
+        conf = fs.get('phase_conf')
+        live_pos = fs.get('live')
+        if phase == _ENG_CANCELLED:
+            kind = 'cancelled'
+        elif phase in (_ENG_LANDED, _ENG_ARRIVED):
+            kind = 'flown'
+        elif phase in (_ENG_AIRBORNE, _ENG_APPROACH):
+            kind = 'flying'
+        elif phase == _ENG_TAXI_OUT:
+            kind = 'departed'
+        else:
+            kind = None
+        return kind, phase, conf, live_pos
+    except Exception:
+        return None
+
+
+def _iso_or_epoch_ts(v):
+    """Live-Fix-ts → UTC-Epoch (float) oder None. Akzeptiert Epoch (int/float)
+    und ISO-String; None bei unparsebar. Wirft nie."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    d = _parse_iso(v)
+    return d.timestamp() if isinstance(d, _dt.datetime) else None
+
+
 def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                             homebase=None, layover_iata=None, duty=None,
                             city_lookup=None, local_hhmm=None,
@@ -652,6 +799,11 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
     # aircraft_live-Beweis in beide Richtungen.)
     picked = None          # (kind, idx, confidence); kind ∈ flying|waiting|cancelled
     last_flown_observed = False
+    # Engine-prior pro (flight) INNERHALB dieses Laufs: die Landung-Monotonie
+    # (LANDED regressiert nie zurück) wirkt schon innerhalb EINES resolve, dieser
+    # Cache trägt sie zusätzlich über wiederholte Bewertungen desselben Fluges
+    # in einem Multi-Leg-Tag. Rein prozesslokal, wirft nie.
+    _eng_prior = {}
     for idx, leg in enumerate(legs):
         o = _obs(leg) or {}
         b = bucket_of(o.get('status')) if o else None
@@ -672,39 +824,72 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             dep_delay = _eff_dep_delay
         eff_arr = leg['arr'] + _dt.timedelta(minutes=max(0.0, arr_delay or 0.0))
         leg['eff_arr'] = eff_arr
-        # WIDERSPRUCH-GATE (Owner 2026-07-13, Tibor): ein „Abgeflogen"/airborne-
-        # Board-Status, der der EIGENEN (delay-korrigierten) est-Abflugzeit
+
+        # ── DIE FLUG-ENTSCHEIDUNG kommt aus der FlightState-Engine ───────────
+        # (Integrationsplan Owner 2026-07-13, siehe _engine_leg_flight): die
+        # Engine ist die Autorität für die HARTEN Signale — Landung (terminal,
+        # monoton), Airborne-Gate („fliegen muss verdient sein"), side-aware
+        # Board-Klassifikation (dep-„Abgeflogen" = off-block, NICHT airborne).
+        # Reuse der schon geladenen obs (`o`) + Live-Fix (`_live(leg)`) — KEIN
+        # neuer I/O. None ⇒ Engine sah kein hartes Flug-Signal → die crew-
+        # eigene grounded-/Uhr-/Live-Kaskade unten entscheidet (unverändert).
+        _eng = _engine_leg_flight(
+            leg, o, _live(leg), now, prior=_eng_prior.get(leg.get('flight')),
+            bucket_of=bucket_of)
+        eng_kind = eng_phase = None
+        eng_live = None
+        if _eng:
+            eng_kind, eng_phase, _eng_conf, eng_live = _eng
+            if leg.get('flight') and eng_phase:
+                _eng_prior[leg['flight']] = {
+                    'phase': eng_phase, 'conf': _eng_conf,
+                    'source': 'crew_leg', 'obs_ts': None,
+                    'sticky_airborne': eng_phase in (_ENG_AIRBORNE,
+                                                     _ENG_APPROACH)}
+        # Engine liefert die gerenderte Position mit (airborne-Gate bestanden);
+        # der 'flying'-Zweig unten nutzt sie, damit die crew-Live-Karte dieselbe
+        # gegatete Position zeigt wie die Engine (kein Geister-Dot).
+        leg['_eng_live'] = eng_live
+
+        # WIDERSPRUCH-GATE (Owner 2026-07-13, Tibor): ein „Abgeflogen"/airborne-/
+        # off-block-Signal, das der EIGENEN (delay-korrigierten) est-Abflugzeit
         # widerspricht — now < eff_dep, laut Board geht der Flug erst später —
         # ist stale/inkonsistent (Board trug „Abgeflogen" aus einem alten Stand
         # UND einen frischen +175-min-esti). NICHT als Abflug-Beweis werten,
-        # sonst „fliegt gerade" obwohl er noch nicht los ist. Die Zeit-/
-        # Verspätet-Logik unten übernimmt. landed/grounded bleiben unberührt
-        # (nur der Abflug-Beweis wird entwertet, nicht die Ankunft).
-        if b == 'airborne' and now < eff_dep:
+        # sonst „fliegt gerade" obwohl er noch nicht los ist. Die Engine kennt
+        # diesen crew-Zeit-Widerspruch nicht (sie sieht dep-Abgeflogen als
+        # TAXI_OUT, würde die Leg-Auswahl aber trotzdem „departed" nennen) →
+        # der Gate bleibt hier als crew-Leg-Auswahl-Regel. landed/grounded
+        # bleiben unberührt (nur der Abflug-Beweis wird entwertet).
+        if eng_kind in ('flying', 'departed') and now < eff_dep:
+            eng_kind = None
             b = None
+        else:
+            b = eng_kind      # ab hier steuert die Engine-Entscheidung die Zweige
 
-        if o.get('cancelled'):
+        if o.get('cancelled') or eng_kind == 'cancelled':
             # Annulliert schlägt alles: Crew ist nie losgeflogen.
             picked = ('cancelled', idx, CONF_OBSERVED)
             break
-        if b == 'landed':
-            # Board schlägt Uhr: Leg beendet → nächsten prüfen.
+        if b == 'flown':
+            # Engine LANDED/ARRIVED (arr-seitiges Hard-Landing, MONOTON — der
+            # Sebastian-Fall): Leg beendet → nächsten prüfen. Eine stale eff_arr-
+            # Schätzung kann das nicht „un-landen".
             leg['flown'] = True
             last_flown_observed = True
             continue
-        if b == 'airborne':
-            # Dep-seitiges „Abgeflogen"/airborne beweist den ABFLUG — nicht
-            # ewiges Fliegen. Outstations ohne Ankunfts-Board (ARN!) melden nie
-            # 'landed' → ohne Zeit-Deckel klebte der Status auf diesem Leg,
-            # obwohl die Maschine laengst den NAECHSTEN Sektor fliegt
-            # (Tibor LH802 „Ankunft 12:30" um 13:39). Ab Plan-Ankunft+Puffer
-            # gilt der Leg als geflogen und der naechste wird geprueft.
-            # Audit B6: dep-seitige „Abgeflogen"-Rows tragen meist NUR
-            # dep_delay (kein arr_delay) — eff_arr allein unterschaetzt dann
-            # die echte Ankunft um die Start-Verspaetung: >30 min verspaetete
-            # Starts kippten ab Plan-Ankunft+Puffer faelschlich auf 'flown'.
-            # Deckel = spaeteste plausible Ankunft: eff_arr ODER
-            # eff_dep + Plan-Flugzeit (arr - dep), je nachdem was spaeter ist.
+        if b in ('flying', 'departed'):
+            # Engine AIRBORNE/APPROACH (bewiesenes Fliegen) ODER TAXI_OUT
+            # (dep-seitiges „Abgeflogen"/off-block, Abflug bewiesen). Beides
+            # beweist den ABFLUG — nicht ewiges Fliegen. Outstations ohne
+            # Ankunfts-Board (ARN!) melden nie 'landed' → ohne Zeit-Deckel klebte
+            # der Status auf diesem Leg, obwohl die Maschine laengst den
+            # NAECHSTEN Sektor fliegt (Tibor LH802 „Ankunft 12:30" um 13:39).
+            # Ab Plan-Ankunft+Puffer gilt der Leg als geflogen und der naechste
+            # wird geprueft. Deckel = spaeteste plausible Ankunft: eff_arr ODER
+            # eff_dep + Plan-Flugzeit (arr - dep), je nachdem was spaeter ist
+            # (dep-seitige „Abgeflogen"-Rows tragen oft nur dep_delay — eff_arr
+            # allein unterschaetzt dann die echte Ankunft um die Start-Verspaetung).
             cap_arr = max(eff_arr, eff_dep + (leg['arr'] - leg['dep']))
             if now >= cap_arr + _dt.timedelta(minutes=_STALE_GROUNDED_MIN):
                 leg['flown'] = True
@@ -712,7 +897,11 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                 continue
             picked = ('flying', idx, CONF_OBSERVED)
             break
-        if b == 'grounded':
+        # Engine sah kein hartes Flug-Signal (BOARDING/SCHEDULED/UNKNOWN). Der
+        # crew-Bucket unterscheidet jetzt „grounded" (Board sagt aktiv „noch
+        # nicht abgeflogen": boarding/delayed/on-time) von „kein Board-Signal".
+        _b_raw = bucket_of(o.get('status')) if o else None
+        if _b_raw == 'grounded':
             # Echtes „noch nicht abgeflogen" — Ewig-Pin, AUSSER die Obs ist
             # nachweislich stale (Plan-Ankunft lange vorbei UND der GRATIS
             # aircraft_live-Store beweist das Gegenteil — Tibor-LH1139-Muster).

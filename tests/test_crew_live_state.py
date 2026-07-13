@@ -1105,3 +1105,71 @@ def test_board_abgeflogen_nach_est_dep_bleibt_flying():
                      'est_dep_iso': '2026-07-13T08:45:00Z'}}
     r = _tibor_resolve(datetime(2026, 7, 13, 9, 30, tzinfo=timezone.utc), obs)
     assert r['state'] == STATE_FLYING, r
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SEBASTIAN LH901 (Owner-Integrationsplan 2026-07-13): die FLUG-Entscheidung
+#  eines Legs kommt aus der FlightState-Engine — die Landung-MONOTONIE löst den
+#  Fall, in dem das Board ARR-seitig „gelandet 12:27" meldet, der crew_state
+#  aber eine STALE eff_arr-Schätzung (13:28) nutzte und fälschlich „fliegt ·
+#  13:06" statt „gelandet, wartet auf das nächste Leg" zeigte.
+#  Vor dem Umbau: dep-seitiges „Abgeflogen" (crew-Bucket=airborne) + hoher
+#  arr_delay hielt das Airborne-Fenster bis 13:28 offen → Leg klebte auf
+#  „Fliegt gerade · Ankunft 13:28". Jetzt: das ARR-seitige HARD-Landing der
+#  Engine ist terminal → Leg geflogen → nächstes Leg (Zukunft) = pre_flight/wartet.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SEBASTIAN_SECTORS = [
+    {'flight': 'LH901', 'from': 'MUC', 'to': 'FRA',
+     'dep_iso': '2026-07-13T10:30:00Z', 'arr_iso': '2026-07-13T11:40:00Z'},
+    {'flight': 'LH862', 'from': 'FRA', 'to': 'OSL',
+     'dep_iso': '2026-07-13T14:00:00Z', 'arr_iso': '2026-07-13T16:00:00Z'},
+]
+
+
+def _sebastian_resolve(now, obs):
+    return resolve_crew_live_state(
+        _SEBASTIAN_SECTORS, _obs(obs), _live({}), now, homebase='MUC',
+        city_lookup=lambda c: {'MUC': 'München', 'FRA': 'Frankfurt',
+                               'OSL': 'Oslo'}.get(c))
+
+
+def test_sebastian_arr_landed_terminal_trotz_staler_est_arr():
+    # Board ARR-seitig „gelandet" (12:27) UND ein staler +108-min-est_arr (13:28);
+    # dep-seitig „Abgeflogen". now 13:06. Vor dem Umbau: „Fliegt gerade · 13:28".
+    # Jetzt: die Engine-Landung (arr-hard, terminal) beendet Leg 1 → Leg 2 (Zukunft).
+    now = datetime(2026, 7, 13, 13, 6, tzinfo=timezone.utc)
+    obs = {'LH901': {'status_dep': 'Abgeflogen', 'status_arr': 'gelandet',
+                     'arr_delay_min': 108, 'delay_min': 108, 'delay_known': True,
+                     'est_arr_iso': '2026-07-13T13:28:00Z'}}
+    r = _sebastian_resolve(now, obs)
+    assert r['state'] != STATE_FLYING, r
+    assert r['state'] == STATE_LANDED, r
+    assert r['leg_index'] == 1, r
+    assert r['current_leg']['flight_no'] == 'LH862', r
+    assert r['text']['title'] == 'Gelandet in Frankfurt', r
+    assert '13:06' not in (r['text']['subtitle'] or ''), r
+
+
+def test_sebastian_landung_monotonie_kein_rueckwaerts_aus_stale_est():
+    # Selbst ohne dep-Board, nur ARR-seitiges „gelandet" + staler est_arr in der
+    # Zukunft → Landung ist terminal, keine „fliegt"-Regression.
+    now = datetime(2026, 7, 13, 13, 6, tzinfo=timezone.utc)
+    obs = {'LH901': {'status_arr': 'gelandet',
+                     'est_arr_iso': '2026-07-13T13:28:00Z'}}
+    r = _sebastian_resolve(now, obs)
+    assert r['state'] != STATE_FLYING, r
+    assert r['leg_index'] == 1, r
+
+
+def test_sebastian_ohne_landung_bleibt_flying():
+    # Regressions-Schutz: OHNE arr-seitiges Landungssignal (nur dep „Abgeflogen"),
+    # est_arr noch in der Zukunft, innerhalb des Fensters → weiter fliegend
+    # (die Engine „un-landet" nichts ohne Beweis, aber landet auch nicht ohne Signal).
+    now = datetime(2026, 7, 13, 12, 30, tzinfo=timezone.utc)
+    obs = {'LH901': {'status_dep': 'Abgeflogen', 'arr_delay_min': 108,
+                     'delay_min': 108, 'delay_known': True,
+                     'est_arr_iso': '2026-07-13T13:28:00Z'}}
+    r = _sebastian_resolve(now, obs)
+    assert r['state'] == STATE_FLYING, r
+    assert r['leg_index'] == 0, r
