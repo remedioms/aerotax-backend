@@ -1032,3 +1032,45 @@ def test_bugB_est_arr_vor_sched_wird_nicht_negativ_verdreht():
     assert r['state'] == STATE_FLYING
     # est schlägt Plan auch nach vorne (frühere Ankunft ist ein echtes Signal).
     assert r['text']['subtitle'] == 'FRA → LHR · Ankunft 08:30'
+
+
+# ── Tibor „zu früh live vor Abflug" (Owner 2026-07-13) ───────────────────────
+# Abflug verspätet via ABSOLUTER Board-esti (est_dep_iso), aber KEIN quantifi-
+# zierter dep_delay_min. Vorher rechnete die Flying-Entscheidung eff_dep=Soll →
+# now>Soll → fälschlich 'flying', obwohl der Flieger noch nicht los ist.
+_TIBOR_SFO_SECTORS = [
+    {'flight': 'LH454', 'from': 'FRA', 'to': 'SFO',
+     'dep_iso': '2026-07-13T08:25:00Z', 'arr_iso': '2026-07-13T19:40:00Z'},
+]
+
+
+def _tibor_resolve(now, obs):
+    return resolve_crew_live_state(
+        _TIBOR_SFO_SECTORS, _obs(obs), _live({}), now,
+        homebase='FRA', city_lookup=lambda c: {'FRA': 'Frankfurt',
+                                               'SFO': 'San Francisco'}.get(c))
+
+
+def test_tibor_est_dep_in_zukunft_ist_nicht_flying():
+    # Soll 08:25, esti 09:10, now 09:02 → noch NICHT abgeflogen → NICHT flying.
+    obs = {'LH454': {'est_dep_iso': '2026-07-13T09:10:00Z'}}
+    r = _tibor_resolve(datetime(2026, 7, 13, 9, 2, tzinfo=timezone.utc), obs)
+    assert r['state'] != STATE_FLYING, r
+    assert r['state'] == STATE_PRE_FLIGHT, r
+    # Abflug-Zeit in der Anzeige ist die verspätete 09:10, nicht die Soll 08:25.
+    assert '08:25' not in (r['text'].get('subtitle') or '')
+
+
+def test_tibor_nach_est_dep_bleibt_flying():
+    # Regressions-Schutz: now 09:20 > esti 09:10 → wieder fliegend, kein
+    # Hängenbleiben in 'waiting' (echter Flug ohne Board/Live-Coverage).
+    obs = {'LH454': {'est_dep_iso': '2026-07-13T09:10:00Z'}}
+    r = _tibor_resolve(datetime(2026, 7, 13, 9, 20, tzinfo=timezone.utc), obs)
+    assert r['state'] == STATE_FLYING, r
+
+
+def test_tibor_ohne_est_kein_regress_nach_soll_abflug():
+    # Ohne esti/Delay: now 08:40 > Soll 08:25, kein Live/Board → weiter 'flying'
+    # (CONF_PLAN) wie bisher — die Änderung darf das NICHT brechen.
+    r = _tibor_resolve(datetime(2026, 7, 13, 8, 40, tzinfo=timezone.utc), {})
+    assert r['state'] == STATE_FLYING, r

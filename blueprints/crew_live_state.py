@@ -641,7 +641,17 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         arr_delay = _num(o.get('arr_delay_min'))
         if arr_delay is None:
             arr_delay = _num(o.get('delay_min'))
-        eff_dep = leg['dep'] + _dt.timedelta(minutes=max(0.0, dep_delay or 0.0))
+        # ANZEIGE==ENTSCHEIDUNG (Owner 2026-07-13, Tibor „zu früh live vor
+        # Abflug"): die absolute revidierte Board-Abflugzeit (est_dep_iso)
+        # schlägt sched+dep_delay_min. Vorher blieb eff_dep bei der Soll-Zeit,
+        # weil dep_delay_min oft None ist, obwohl das Board eine konkrete
+        # esti trägt (z.B. FRA→SFO 08:25 → esti 09:10) → now>Soll → fälschlich
+        # 'flying', obwohl der Flieger noch gar nicht los ist. _eff_dep liefert
+        # dieselbe est-Zeit wie die Live-Karten-Anzeige (current_leg.est_dep).
+        _eff_dep_dt, _eff_dep_delay = _eff_dep(leg, o)
+        eff_dep = _eff_dep_dt
+        if _eff_dep_delay is not None:
+            dep_delay = _eff_dep_delay
         eff_arr = leg['arr'] + _dt.timedelta(minutes=max(0.0, arr_delay or 0.0))
         leg['eff_arr'] = eff_arr
 
