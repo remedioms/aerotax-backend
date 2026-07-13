@@ -149,20 +149,31 @@ def landed_status_plausible(status, *, now: Optional[float] = None,
         return True                       # kein terminaler Status → nichts zu gaten
     now = now if now is not None else time.time()
 
-    # Schranke 2: Fahrplan-/Ist-Ankunft (bereits echt-UTC vom Aufrufer).
-    sched_ts = _parse_iso_utc(est_arr_iso) or _parse_iso_utc(sched_arr_iso)
-
-    # Schranke 1: physikalische Mindest-Ankunft.
+    # Schranke 1 (HART, absolut): physikalische Mindest-Ankunft = eff. Abflug +
+    # Großkreis / v_max + Boden-Overhead. Kein Board-Zeitstempel kann sie
+    # unterbieten — ein Flug ist NIE vor ihr gelandet.
     phys_ts = earliest_possible_arrival_ts(dep_ts, dep_ll, arr_ll)
 
-    bounds = [b for b in (sched_ts, phys_ts) if b is not None]
-    if not bounds:
-        return True                       # keine Belege → fail-open (nie erfinden)
+    # Schranke 2 (PROXY): Fahrplan-/Ist-Ankunft (bereits echt-UTC vom Aufrufer),
+    # Ist (est_arr) vor Plan (sched_arr). Nur ein grober Sanity-Proxy für den Fall,
+    # dass die Physik fehlt (kein dep_ts / keine Koordinaten) — der Fahrplan ist
+    # keine echte untere Landeschranke (ein Flug kann vor Plan landen).
+    sched_ts = _parse_iso_utc(est_arr_iso) or _parse_iso_utc(sched_arr_iso)
 
-    # DIE UNTERE Schranke: „frühestens" = das kleinere der Belege. Ein Board darf
-    # zumindest bis dahin (minus Slack) NICHT „gelandet" behaupten.
-    earliest = min(bounds)
-    return now >= (earliest - _LANDED_SLACK_MIN * 60.0)
+    # Liegt der HARTE Physik-Boden vor, ist ER allein maßgeblich. Ein stale/
+    # vortägiger est_arr darf ihn NICHT unterlaufen (Owner 2026-07-13: LH454
+    # FRA→SFO stand +185 min verspätet noch in FRA, aber esti_arr trug die
+    # Ankunft von GESTERN, 2026-07-12T13:03−07:00 = längst < now). Früher nahm
+    # das Gate min(sched/est, phys) → dieser stale-frühe Wert zog die Schranke
+    # unter den Physik-Boden und die Geister-Landung „Arrived" schlüpfte durch.
+    if phys_ts is not None:
+        return now >= (phys_ts - _LANDED_SLACK_MIN * 60.0)
+
+    # Kein Physik-Boden (keine dep-Zeit/Koordinaten) → Proxy nutzen, sonst
+    # fail-open (nie eine Landung erfinden, nur nachweisbar Unmögliches fangen).
+    if sched_ts is None:
+        return True
+    return now >= (sched_ts - _LANDED_SLACK_MIN * 60.0)
 
 
 def gated_leg_status(status, *, now: Optional[float] = None,

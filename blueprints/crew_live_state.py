@@ -867,8 +867,27 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         # Reuse der schon geladenen obs (`o`) + Live-Fix (`_live(leg)`) — KEIN
         # neuer I/O. None ⇒ Engine sah kein hartes Flug-Signal → die crew-
         # eigene grounded-/Uhr-/Live-Kaskade unten entscheidet (unverändert).
+        # Airport-Koordinaten (+ dep-Elevation) an die Engine reichen. OHNE sie
+        # greift der Arrival-Physik-Boden (flight_state §1.5) NICHT — eine stale
+        # Vortags-Ankunft „Arrived" landet dann einen noch fliegenden Flieger und
+        # die Crew steht fälschlich am Ziel-Pin (Owner 2026-07-13, LH454→SFO:
+        # „sehe Tibor immer noch in SFO"). flights_live/flight-live reichten die
+        # Koordinaten schon durch — crew_state tat es nicht. Best-effort, wirft nie.
+        _dep_ll = _arr_ll = _dep_elev = None
+        try:
+            from blueprints.aerox_data_blueprint import _iata_latlon as _clL
+            _dep_ll = _clL(leg.get('dep_ap'))
+            _arr_ll = _clL(leg.get('arr_ap'))
+        except Exception:
+            pass
+        try:
+            from blueprints.aerox_data_blueprint import _iata_elev_ft as _clE
+            _dep_elev = _clE(leg.get('dep_ap'))
+        except Exception:
+            pass
         _eng = _engine_leg_flight(
-            leg, o, _live(leg), now, prior=_eng_prior.get(leg.get('flight')),
+            leg, o, _live(leg), now, dep_ll=_dep_ll, arr_ll=_arr_ll,
+            dep_elev_ft=_dep_elev, prior=_eng_prior.get(leg.get('flight')),
             bucket_of=bucket_of)
         eng_kind = eng_phase = None
         eng_live = None

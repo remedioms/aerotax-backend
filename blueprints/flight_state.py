@@ -94,6 +94,19 @@ NEAR_AIRPORT_KM = 8.0
 # can't see it. Bounded by expected arrival so it can never outlive the flight.
 TAXI_OUT_MAX_S = 25 * 60
 
+# Physik-Schranke gegen eine STALE Board-Landung (owner 2026-07-13, LH454
+# FRA->SFO: die Crew stand als "in San Francisco" auf der Live-Map, während der
+# +185 min verspätete Flieger noch über dem Atlantik war — die Ankunftsseite
+# trug eine Vortags-"Arrived"-Zeile). Eine board-arr "landed/arrived" gilt in T2
+# nur, wenn `now` die früheste physikalisch mögliche Ankunft erreicht hat:
+# eff. Abflug + Großkreis / v_max + Boden-Overhead − Slack. Bewusst großzügige
+# v_max (~950 km/h ≈ 513 kt Block-Schnitt, schneller als real) → fängt NUR den
+# krass-unmöglichen Fall, nie einen knappen Grenzfall. Dieselben Zahlen wie
+# blueprints/leg_status_gate (die Kalender-/axFlightInfo-Fläche).
+_ARR_MAX_EFF_KMH = 950.0
+_ARR_GROUND_OVERHEAD_S = 12 * 60
+_ARR_LANDED_SLACK_S = 15 * 60
+
 
 # ---------------------------------------------------------------------------
 # 1. OBSERVATION — the only thing the reducer ingests
@@ -474,6 +487,56 @@ def _expected_arr_ts(observations, keys):
     return base
 
 
+def _arr_landed_physically_possible(observations, keys, now):
+    """Darf eine board-arr "landed/arrived" (T2) als wahr gelten? NUR wenn `now`
+    die früheste physikalisch mögliche Ankunft erreicht hat (eff. Abflug +
+    Großkreis / v_max + Boden-Overhead − Slack). Fängt die STALE Vortags-Ankunft,
+    die eine noch fliegende Langstrecke fälschlich auf LANDED kippt (owner
+    2026-07-13, LH454 FRA->SFO: Crew stand auf der Live-Map schon in San
+    Francisco, während der +185 min verspätete Flieger noch über dem Atlantik
+    war). FAIL-OPEN (True), wenn Abflugzeit ODER eine Koordinate fehlt — wir
+    unterdrücken nur nachweisbar Unmögliches, erfinden nie eine Phase. Wirft nie.
+
+    Abflug-Schätzung: der BESTE (revidierte/verspätete) Off-Block-Zeitpunkt via
+    `_offblock_ts` (revised board est > sched+delay > sched) — so bekommt ein
+    verspäteter Flug die korrekt SPÄTERE Schranke, nicht die des Plan-Abflugs."""
+    dep_ll = keys.get("dep_ll")
+    arr_ll = keys.get("arr_ll")
+    if not (dep_ll and arr_ll and None not in dep_ll and None not in arr_ll):
+        return True
+    # NUR ein ECHTER Abflug-Zeitstempel taugt als Schranke: revidierte Board-Esti >
+    # sched_dep + beobachteter dep_delay > sched_dep(_ts). NIE der board-obs-Stempel
+    # (`_offblock_ts`-Fallback) — der ist vom Collector auf `now` gesetzt (der Merge
+    # trägt keinen Row-Zeitstempel) und würde die Schranke auf ~now legen → eine
+    # echte, gerade gelandete Kurzstrecke (MUC->FRA "Landed 14:23") fiele fälschlich
+    # raus. Fehlt eine echte Abflugzeit → fail-open (nichts beweisbar).
+    dep_ts = None
+    for o in _by(observations, kind="dep_time"):
+        est = o.value.get("est")
+        ts = _iso_to_ts(est) if est else None
+        if ts is not None:
+            dep_ts = ts
+            break
+    if dep_ts is None:
+        base = keys.get("sched_dep_ts")
+        if base is None and keys.get("sched_dep"):
+            base = _iso_to_ts(keys.get("sched_dep"))
+        if base is not None:
+            dep_ts = base
+            for o in _by(observations, kind="delay"):
+                if o.value.get("delay_known") and o.value.get("dep_delay_min") is not None:
+                    dep_ts = base + float(o.value["dep_delay_min"]) * 60.0
+                    break
+    if dep_ts is None:
+        return True
+    try:
+        dist_km = _gc_km(dep_ll[0], dep_ll[1], arr_ll[0], arr_ll[1])
+    except (TypeError, ValueError):
+        return True
+    earliest = dep_ts + (dist_km / _ARR_MAX_EFF_KMH) * 3600.0 + _ARR_GROUND_OVERHEAD_S
+    return now >= (earliest - _ARR_LANDED_SLACK_S)
+
+
 def _phase_machine(observations, keys, raw_pos, near_origin, prior, now):
     """Returns dict(phase, conf, source, obs_ts, sticky_airborne)."""
     airborne_kin = is_airborne_kinematic(
@@ -500,10 +563,20 @@ def _phase_machine(observations, keys, raw_pos, near_origin, prior, now):
     if ev_land:
         onblock = ev_land.meta.get("on_block")
         return R(ARRIVED if onblock else LANDED, OBSERVED, "warehouse_event", ev_land.obs_ts)
-    if board_arr and board_arr.value in (LANDED, ARRIVED):
+    # PHYSIK-GATE (owner 2026-07-13, LH454->SFO): eine board-arr "landed/arrived"
+    # gewinnt nur, wenn die Landung physikalisch schon möglich ist. Eine STALE
+    # Vortags-Ankunft (arr-Seite ohne heutige Obs) darf eine noch fliegende
+    # Langstrecke NICHT auf LANDED kippen — sonst steht die Crew auf der Live-Map
+    # am Ziel, während sie noch über dem Ozean ist. Unplausibel → NICHT hier
+    # terminieren, sondern zur Airborne-/Taxi-Erkennung (T3/T4) durchfallen.
+    # Ausgenommen bleibt das echte warehouse "landed"-EVENT oben (ev_land) —
+    # ein tatsächliches Landeereignis, kein flippiger Board-Status.
+    if board_arr and board_arr.value in (LANDED, ARRIVED) and \
+            _arr_landed_physically_possible(observations, keys, now):
         return R(board_arr.value, OBSERVED, "board", board_arr.obs_ts)
     for o in _by(observations, kind="arr_time"):
-        if o.value.get("actual"):
+        if o.value.get("actual") and \
+                _arr_landed_physically_possible(observations, keys, now):
             return R(ARRIVED, OBSERVED, o.source, o.obs_ts)
 
     # ---- T3 airborne: REQUIRES PROOF ----

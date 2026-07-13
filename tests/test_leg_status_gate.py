@@ -193,3 +193,22 @@ def test_gate_never_raises_on_garbage():
     # Robustheit: unparsebare Zeiten / kaputte Koordinaten → fail-open, kein Wurf.
     assert gated_leg_status('Landed', now=None, sched_arr_iso='not-a-date',
                             dep_ll=('x', 'y'), arr_ll=None) == 'Landed'
+
+
+def test_stale_prior_day_est_arr_does_not_undercut_physics():
+    # Owner-Screenshot 2026-07-13, LH454 FRA→SFO +185 min verspätet: der Flieger
+    # STAND noch in FRA, aber esti_arr trug die Ankunft von GESTERN
+    # (2026-07-12T13:03−07:00 = 2026-07-12T20:03Z, längst < now). Früher zog
+    # min(sched/est, phys) diesen stale-frühen Wert als Schranke → „Arrived"
+    # schlüpfte durch. Der HARTE Physik-Boden (verspäteter Abflug HEUTE 11:30Z +
+    # ~9.6 h Langstrecke) muss die Geister-Landung verwerfen.
+    dep = _ts('2026-07-13T11:30:00Z')          # verspäteter Abflug 13:30 CEST
+    now = _ts('2026-07-13T12:34:00Z')
+    assert gated_leg_status(
+        'Arrived', now=now, dep_ts=dep, dep_ll=FRA, arr_ll=SFO,
+        sched_arr_iso='2026-07-13T19:40:00Z',
+        est_arr_iso='2026-07-12T20:03:00Z') is None
+    # Gegenprobe: ohne Physik-Boden (keine Koordinaten) bleibt der Ist-Proxy aktiv
+    # (est_arr in der Zukunft verschiebt die Schranke nach hinten — Verspätung).
+    assert landed_status_plausible(
+        'Arrived', now=now, est_arr_iso='2026-07-13T21:20:00Z') is False

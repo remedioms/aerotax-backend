@@ -686,6 +686,34 @@ def test_friends_legacy_status_landed_is_not_airborne():
     assert _ios_phase_of(ws) == "not_airborne"
 
 
+HND_LL = HND  # FRA->HND ~9350 km Langstrecke (wie FRA->SFO)
+
+
+def test_stale_board_arr_landed_does_not_land_still_flying_longhaul():
+    """Owner 2026-07-13, LH454 FRA->SFO: die Crew stand auf der Live-Map schon in
+    San Francisco, während der +185 min verspätete Flieger noch über dem Ozean
+    war — die arr-Seite trug eine STALE Vortags-"Arrived"-Zeile. Früher gewann T2
+    (board-arr "landed" wins outright) sofort → LANDED → Crew am Ziel-Pin. Jetzt
+    verwirft die Physik-Schranke die unmögliche Landung (Abflug erst 1 h her auf
+    einer ~9350-km-Langstrecke) und die Engine fällt korrekt auf AIRBORNE durch
+    (Off-Block lange her, keine Live-Position über dem Ozean → Zeit-Elevation)."""
+    obs = [
+        Observation("phase_hard", LANDED, "board", NOW - 120, meta={"side": "arr"}),
+        Observation("phase_hard", TAXI_OUT, "board", NOW - 3600, meta={"side": "dep"}),
+    ]
+    keys = {"flight": "LH454", "date": "2026-07-09", "dep_iata": "FRA",
+            "arr_iata": "HND", "dep_ll": FRA, "arr_ll": HND_LL,
+            "sched_dep_ts": NOW - 3600}
+    fs = resolve_flight_state(keys=keys, observations=obs, now=NOW)
+    assert fs["phase"] != LANDED
+    assert fs["phase"] in (AIRBORNE, APPROACH, TAXI_OUT)
+
+    # Gegenprobe: sobald `now` die früheste mögliche Ankunft überschreitet, gilt
+    # dieselbe board-arr "landed" wieder — echte Landungen laufen unverändert durch.
+    fs2 = resolve_flight_state(keys=keys, observations=obs, now=NOW + 12 * 3600)
+    assert fs2["phase"] == LANDED
+
+
 def test_friends_legacy_status_matches_friend_leg_phase():
     """The legacy status wire value stays consistent with the phase every OTHER
     surface exposes: LEGACY_STATUS[fs['phase']] == LEGACY_STATUS[project_friend_leg

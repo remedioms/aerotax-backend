@@ -30155,6 +30155,62 @@ def ax_flight_info(flightno):
         except Exception:
             pass
 
+    # STATUS PLAUSIBILITÄTS-/PHYSIK-GATE auch auf der axFlightInfo/DETAIL-Ausgabe
+    # (Owner-Screenshot 2026-07-13, LH454 FRA→SFO „gelandet 13:03"): der iOS-
+    # Kalender (`TourTimeline.isLanded`) liest bevorzugt `arr_status` (Ankunfts-
+    # seite) — die floss hier UNGEGATET aus dem Dual-Side-Board-Merge (Zeile
+    # ~30114 `out['arr_status'] = merged['status_arr']`). r116 gatete nur den
+    # Kalender-SEKTOR-`status` (_enrich_leg_delays), NICHT diesen Endpoint → ein
+    # falscher/früher Ankunfts-Board-Flip „gelandet HH:MM" bei einem 11-h-Lang-
+    # streckenflug kam durch die Hintertür zurück. Dieselbe reine Physik-Schranke
+    # (gated_leg_status) wie im Sektor-Pfad: ein terminaler 'landed'-Status auf
+    # arr_status/status gilt nur, wenn `now` die früheste physikalisch mögliche
+    # Ankunft (est_dep + Großkreis / v_max) ODER die Fahrplan-Ankunft (−15 min
+    # Slack) erreicht hat; sonst wird er verworfen (None) statt eine erfundene
+    # Landung zu behaupten. Nicht-terminale Status laufen unverändert durch;
+    # fehlen die Belege → fail-open. Konservativ, additiv, wirft nie.
+    if out is not None and not out.get('stale'):
+        try:
+            from blueprints.leg_status_gate import gated_leg_status as _gate_st
+            _o_origin = out.get('origin')
+            _o_dest = out.get('dest')
+            # eff. Abflug (Epoch): bester Ist (esti) vor Plan (sched), board-lokal
+            # → echt-UTC (mit Origin-TZ), dann Epoch. None → sched_arr-Gate allein.
+            _o_dep_ts = None
+            for _o_dc in (out.get('esti'), out.get('sched')):
+                _o_iso = (_board_local_to_utc_iso(_o_dc, _o_origin)
+                          if _o_dc else None)
+                if _o_iso:
+                    try:
+                        _o_d = datetime.fromisoformat(
+                            str(_o_iso).replace('Z', '+00:00'))
+                        if _o_d.tzinfo is None:
+                            _o_d = _o_d.replace(tzinfo=timezone.utc)
+                        _o_dep_ts = _o_d.timestamp()
+                        break
+                    except Exception:
+                        pass
+            _o_dep_ll = _o_arr_ll = None
+            try:
+                from blueprints.aerox_data_blueprint import _iata_latlon as _o_ll
+                _o_dep_ll = _o_ll(_o_origin)
+                _o_arr_ll = _o_ll(_o_dest)
+            except Exception:
+                pass
+            _o_sa = (_board_local_to_utc_iso(out.get('sched_arr'), _o_dest)
+                     if out.get('sched_arr') else None)
+            _o_ea = (_board_local_to_utc_iso(out.get('esti_arr'), _o_dest)
+                     if out.get('esti_arr') else None)
+            _o_now = time.time()
+            for _o_k in ('arr_status', 'status'):
+                if out.get(_o_k):
+                    out[_o_k] = _gate_st(
+                        out[_o_k], now=_o_now, sched_arr_iso=_o_sa,
+                        est_arr_iso=_o_ea, dep_ts=_o_dep_ts,
+                        dep_ll=_o_dep_ll, arr_ll=_o_arr_ll)
+        except Exception:
+            pass        # Gate-Fehler → Rohstatus unangetastet (nie brechen)
+
     # AUSGEMUSTERTE-TAILS-WÄCHTER auch auf der DETAIL-Ausgabe (Owner-Screenshot
     # 2026-07-12 LH781: „MASCHINE DABTL · Boeing 747-400" — die Board-Quelle
     # trägt Museums-Regs, siehe _tail_recently_active). reg/type UND die
