@@ -508,6 +508,8 @@ _ENG_ARRIVED = 'ARRIVED'
 _ENG_AIRBORNE = 'AIRBORNE'
 _ENG_APPROACH = 'APPROACH'
 _ENG_TAXI_OUT = 'TAXI_OUT'
+_ENG_SCHEDULED = 'SCHEDULED'
+_ENG_BOARDING = 'BOARDING'
 # Die Grenze „off-block zu lange ⇒ airborne (Zeit-Evidenz, estimated)" lebt jetzt
 # AUSSCHLIESSLICH in der Engine (flight_state.TAXI_OUT_MAX_S) — crew_state
 # spiegelt die Engine-Phase 1:1: TAXI_OUT → „Startet gerade" (kein Live), sobald
@@ -944,8 +946,23 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             break
         # Engine sah kein hartes Flug-Signal (BOARDING/SCHEDULED/UNKNOWN). Der
         # crew-Bucket unterscheidet jetzt „grounded" (Board sagt aktiv „noch
-        # nicht abgeflogen": boarding/delayed/on-time) von „kein Board-Signal".
+        # nicht abgeflogen": boarding/delayed/on-time/gate/closed) von „kein
+        # Board-Signal".
         _b_raw = bucket_of(o.get('status')) if o else None
+        # BOARD-BELEGT „nicht abgeflogen": sagt das Board Gate-Aktivität (gate/
+        # closed/boarding) ODER die Engine SCHEDULED/BOARDING observed, ist der
+        # Flug nachweislich NOCH NICHT los → wie 'grounded' behandeln, damit die
+        # reine Plan-Uhr NICHT auf „fliegt" kippt (Owner 2026-07-13, Sebastian
+        # LH862 Gate „closed": das Board weiß es besser als das Plan-Fenster).
+        # Pure-Plan-SCHEDULED (kein solcher Board-String, conf=estimated) bleibt
+        # der Uhr überlassen — sonst würden Flüge ohne jede Board-Abdeckung im
+        # Plan-Fenster fälschlich „warten".
+        _st_low = str(o.get('status') or '').lower()
+        if (_b_raw != 'grounded'
+                and eng_phase in (_ENG_SCHEDULED, _ENG_BOARDING)
+                and ('clos' in _st_low or 'gate' in _st_low
+                     or 'boarding' in _st_low or _eng_conf == 'observed')):
+            _b_raw = 'grounded'
         if _b_raw == 'grounded':
             # Echtes „noch nicht abgeflogen" — Ewig-Pin, AUSSER die Obs ist
             # nachweislich stale (Plan-Ankunft lange vorbei UND der GRATIS
