@@ -85,6 +85,15 @@ SIM_MAX_AGE_S = 45 * 60           # cap forward-sim at 45 min of last real fix
 ETA_OVERRUN_S = 30 * 60           # >30 min past ETA with no arrival -> UNKNOWN
 NEAR_AIRPORT_KM = 8.0
 
+# Plausible taxi-out window (off-block -> take-off). If a flight has been
+# off-block LONGER than this, is still before its expected arrival, and there is
+# no landing signal AND no live position (nothing to fail the airborne gate on),
+# the engine promotes TAXI_OUT -> AIRBORNE with confidence=ESTIMATED. This is
+# TIME-EVIDENCE, not an invented position (live stays None): a plane that pushed
+# back 40 min ago on an 11h long-haul with no ADS-B is airborne even though we
+# can't see it. Bounded by expected arrival so it can never outlive the flight.
+TAXI_OUT_MAX_S = 25 * 60
+
 
 # ---------------------------------------------------------------------------
 # 1. OBSERVATION — the only thing the reducer ingests
@@ -422,6 +431,49 @@ def _event(observations, kind):
     return None
 
 
+def _offblock_ts(observations, keys, board_dep):
+    """Best estimate of the OFF-BLOCK unix time (when the plane pushed back).
+    Preference: revised board dep est > sched_dep + observed dep_delay >
+    sched_dep_ts > the board dep-side observation's own obs_ts. None if nothing.
+    Used only by the TAXI_OUT->AIRBORNE time-elevation (never invents a time)."""
+    # 1) revised board departure estimate
+    for o in _by(observations, kind="dep_time"):
+        est = o.value.get("est")
+        ts = _iso_to_ts(est) if est else None
+        if ts is not None:
+            return ts
+    # 2) sched_dep + observed dep_delay
+    base = keys.get("sched_dep_ts")
+    if base is None and keys.get("sched_dep"):
+        base = _iso_to_ts(keys.get("sched_dep"))
+    if base is not None:
+        for o in _by(observations, kind="delay"):
+            if o.value.get("delay_known") and o.value.get("dep_delay_min") is not None:
+                return base + float(o.value["dep_delay_min"]) * 60.0
+        return base
+    # 3) the off-block board observation timestamp itself
+    return board_dep.obs_ts if board_dep else None
+
+
+def _expected_arr_ts(observations, keys):
+    """Best estimate of the expected ARRIVAL unix time. Preference: revised board
+    arr est/actual > sched_arr + observed arr_delay > bare sched_arr. None if
+    unknown -> the arrival guard is then skipped (we don't block the elevation on
+    a missing arrival clock). The delay term matters for the crew obs shape, where
+    the board record carries an arr_delay but no revised est_arr string."""
+    for o in _by(observations, kind="arr_time"):
+        for k in ("est", "actual"):
+            ts = _iso_to_ts(o.value.get(k)) if o.value.get(k) else None
+            if ts is not None:
+                return ts
+    base = _iso_to_ts(keys.get("sched_arr")) if keys.get("sched_arr") else None
+    if base is not None:
+        for o in _by(observations, kind="delay"):
+            if o.value.get("delay_known") and o.value.get("arr_delay_min") is not None:
+                return base + float(o.value["arr_delay_min"]) * 60.0
+    return base
+
+
 def _phase_machine(observations, keys, raw_pos, near_origin, prior, now):
     """Returns dict(phase, conf, source, obs_ts, sticky_airborne)."""
     airborne_kin = is_airborne_kinematic(
@@ -495,6 +547,21 @@ def _phase_machine(observations, keys, raw_pos, near_origin, prior, now):
         or _event(observations, "offblock") is not None
     if (raw_pos and not airborne_kin and dep_offblock) or \
        (board_dep is not None and board_dep.value == TAXI_OUT):
+        # TIME-ELEVATION (owner 2026-07-13): a plane that has been off-block far
+        # longer than a plausible taxi window, is still before its expected
+        # arrival, and has NO live position we can see (over ocean / no ADS-B) is
+        # airborne even without a fix. We elevate to AIRBORNE with conf=ESTIMATED
+        # and NO position (live stays None -> no ghost dot). If there IS a live
+        # position it must fail the gate to reach here (visible on the ground) —
+        # then we do NOT elevate: the plane really is still taxiing (ghost-fix).
+        if raw_pos is None and dep_offblock:
+            offb = _offblock_ts(observations, keys, board_dep)
+            exp_arr = _expected_arr_ts(observations, keys)
+            long_offblock = offb is not None and (now - offb) > TAXI_OUT_MAX_S
+            before_arr = exp_arr is None or now < exp_arr
+            if long_offblock and before_arr:
+                return R(AIRBORNE, ESTIMATED, "offblock_time",
+                         (board_dep.obs_ts if board_dep else offb))
         return R(TAXI_OUT, OBSERVED, "board", (board_dep.obs_ts if board_dep else now))
 
     # ---- T5 BOARDING (soft) ----

@@ -387,6 +387,118 @@ def test_taxi_phase_live_status_stays_none():
     assert fs["live_status"] is None
 
 
+# ─── TAXI_OUT -> AIRBORNE time-elevation (owner 2026-07-13, ONE truth) ───────
+# A plane off-block far longer than a plausible taxi window, still before its
+# expected arrival, with NO live position (over ocean / no ADS-B) is airborne
+# even though we can't see it. conf=ESTIMATED, live stays None (no ghost dot).
+# This makes crew_state / flights_live / family / my-status agree on one phase.
+
+def _fs_offblock(now, *, sched_dep_ts=None, sched_dep=None, sched_arr=None,
+                 dep_delay_min=None, arr_delay_min=None, est_dep=None,
+                 est_arr=None, with_taxi_position=False):
+    obs = [Observation("phase_hard", TAXI_OUT, "board", now - 120,
+                       meta={"side": "dep"})]
+    dv = {}
+    if est_dep:
+        dv["est"] = est_dep
+    if sched_dep:
+        dv["sched"] = sched_dep
+    if dv:
+        obs.append(Observation("dep_time", dv, "board", now - 120))
+    av = {}
+    if est_arr:
+        av["est"] = est_arr
+    if sched_arr:
+        av["sched"] = sched_arr
+    if av:
+        obs.append(Observation("arr_time", av, "board", now - 120))
+    if dep_delay_min is not None or arr_delay_min is not None:
+        obs.append(Observation("delay", {"delay_known": True,
+                                         "dep_delay_min": dep_delay_min,
+                                         "arr_delay_min": arr_delay_min},
+                               "board", now - 120))
+    if with_taxi_position:
+        obs.append(Observation("position", {"lat": FRA[0], "lon": FRA[1],
+                                            "track": 100, "gs_kt": 12, "alt_ft": None,
+                                            "on_ground_raw": False, "position_source": 3},
+                               "aircraft_live", now - 30))
+    keys = {"flight": "LH123", "date": "2026-07-09", "dep_iata": "FRA",
+            "arr_iata": "HND", "dep_ll": FRA, "arr_ll": HND,
+            "sched_dep_ts": sched_dep_ts, "sched_dep": sched_dep, "sched_arr": sched_arr}
+    return resolve_flight_state(keys, obs, now=now)
+
+
+def test_taxi_long_offblock_elevates_to_airborne_estimated_no_dot():
+    """3h off-block on an 11h long-haul, before arrival, no ADS-B -> AIRBORNE
+    (estimated) but live=None (never an invented dot)."""
+    fs = _fs_offblock(NOW, sched_dep_ts=NOW - 3 * 3600,
+                      sched_dep="2026-07-09T01:00:00Z",
+                      sched_arr="2026-07-09T14:00:00Z")
+    assert fs["phase"] == AIRBORNE
+    assert fs["phase_conf"] == ESTIMATED
+    assert fs["phase_source"] == "offblock_time"
+    assert fs["in_flight"] is True
+    assert fs["live"] is None                      # keine erfundene Position
+    assert fs["live_status"] == "lost"
+
+
+def test_taxi_fresh_offblock_stays_taxi_out():
+    """3 min after the revised off-block time -> still TAXI_OUT (rollt)."""
+    fs = _fs_offblock(NOW, est_dep=E._ts_to_iso(NOW - 180),
+                      sched_dep="2026-07-09T03:00:00Z",
+                      sched_arr="2026-07-09T14:00:00Z")
+    assert fs["phase"] == TAXI_OUT
+    assert fs["in_flight"] is False
+
+
+def test_taxi_long_offblock_but_past_arrival_stays_taxi_out():
+    """Off-block long ago BUT now is past the expected arrival -> do NOT elevate
+    (bounded by arrival; a real landing/monotonicity handles the terminal end)."""
+    fs = _fs_offblock(NOW, sched_dep_ts=NOW - 6 * 3600,
+                      sched_dep="2026-07-08T22:00:00Z",
+                      sched_arr="2026-07-09T02:00:00Z")   # arr 2h in the past
+    assert fs["phase"] == TAXI_OUT
+
+
+def test_taxi_arrival_via_delay_shifts_the_bound():
+    """Expected arrival = sched_arr + observed arr_delay. A flight past sched_arr
+    but before sched_arr+delay is still elevated (crew obs shape carries the
+    delay, not a revised est_arr string)."""
+    # sched_arr 30 min in the past, but +90 min delay -> real arrival 60 min ahead
+    fs = _fs_offblock(NOW, sched_dep_ts=NOW - 3 * 3600,
+                      sched_dep="2026-07-09T01:00:00Z",
+                      sched_arr=E._ts_to_iso(NOW - 30 * 60),
+                      arr_delay_min=90)
+    assert fs["phase"] == AIRBORNE
+    assert fs["phase_conf"] == ESTIMATED
+
+
+def test_taxi_long_offblock_with_visible_ground_fix_stays_taxi_out():
+    """The ghost-fix boundary: if there IS a live position and it fails the
+    airborne gate (visibly on the ground), the time-rule must NOT elevate — the
+    plane really is still taxiing (a stuck departure), not airborne."""
+    fs = _fs_offblock(NOW, sched_dep_ts=NOW - 3 * 3600,
+                      sched_dep="2026-07-09T01:00:00Z",
+                      sched_arr="2026-07-09T14:00:00Z",
+                      with_taxi_position=True)
+    assert fs["phase"] == TAXI_OUT
+    assert fs["live"] is None                      # taxi fix never renders
+
+
+def test_taxi_elevation_projections_agree_on_airborne():
+    """The whole point: every surface projects the SAME airborne phase from the
+    elevated state (crew flying_now, friend/flight-live in_flight)."""
+    fs = _fs_offblock(NOW, sched_dep_ts=NOW - 3 * 3600,
+                      sched_dep="2026-07-09T01:00:00Z",
+                      sched_arr="2026-07-09T14:00:00Z")
+    assert project_flight_live(fs)["in_flight"] is True
+    assert project_flight_live(fs)["live"] is None
+    assert project_friend_leg(fs)["phase"] == AIRBORNE
+    assert project_crew_status(fs)["flying_now"] is True
+    assert project_crew_status(fs)["flight_phase"] == "fliegt"
+    assert project_my_flight_status(fs)["status"] == "AIRBORNE"
+
+
 # ─────────────────────────── ON-TIME (Owner-Regel D15) ─────────────────────
 
 def _fs_with_delay(arr_delay_min, cancelled=False):

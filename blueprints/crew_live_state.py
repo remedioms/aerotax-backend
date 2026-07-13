@@ -508,9 +508,11 @@ _ENG_ARRIVED = 'ARRIVED'
 _ENG_AIRBORNE = 'AIRBORNE'
 _ENG_APPROACH = 'APPROACH'
 _ENG_TAXI_OUT = 'TAXI_OUT'
-# Plausible Taxi-Zeit (off-block → Takeoff). Innerhalb → „Startet gerade"
-# (rollt, nicht airborne); danach gilt ein anhaltendes off-block als airborne.
-_TAXI_OUT_MAX_MIN = 25
+# Die Grenze „off-block zu lange ⇒ airborne (Zeit-Evidenz, estimated)" lebt jetzt
+# AUSSCHLIESSLICH in der Engine (flight_state.TAXI_OUT_MAX_S) — crew_state
+# spiegelt die Engine-Phase 1:1: TAXI_OUT → „Startet gerade" (kein Live), sobald
+# die Engine hebt kommt kind='flying'. So sind alle Projektionen konsistent.
+# (Der frühere crew-eigene 25-min-Deckel _TAXI_OUT_MAX_MIN ist entfernt.)
 
 
 def _engine_leg_flight(leg, o, live, now, dep_ll=None, arr_ll=None,
@@ -573,6 +575,30 @@ def _engine_leg_flight(leg, o, live, now, dep_ll=None, arr_ll=None,
                 m['status_dep'] = 'airborne'         # → Engine AIRBORNE (proven)
             # 'grounded'/None: KEINE Phasen-Observation (Engine SCHEDULED) — die
             # Uhr-/Live-Kaskade des Aufrufers entscheidet (crew-Semantik).
+        # SHAPE-ANGLEICH an flights_live (Owner 2026-07-13, Divergenz A): der crew
+        # obs_lookup trägt die REVIDIERTEN Board-Zeiten als absolute ISO-Strings
+        # (`est_dep_iso`/`est_arr_iso`) und die Delays als `dep_delay_min`/
+        # `arr_delay_min`/`delay_min` — die flights_live-Projektion füttert die
+        # Engine mit denselben Fakten über `esti_dep`/`esti_arr`+`delay_known`.
+        # obs_from_board_merged liest genau diese Merge-Keys. Ohne board_to_iso
+        # laufen die ISO-Strings 1:1 durch. NÖTIG fürs korrekte off-block-Anker
+        # (est_dep) + expected-arr (est_arr / sched+delay) der TAXI_OUT→AIRBORNE-
+        # Zeit-Regel — sonst ankert die Engine den Abflug an der reinen Soll-Zeit
+        # und hält einen frisch off-block-Flug fälschlich für „lange unterwegs".
+        if o.get('est_dep_iso') and not m.get('esti_dep'):
+            m['esti_dep'] = o['est_dep_iso']
+        if o.get('est_arr_iso') and not m.get('esti_arr'):
+            m['esti_arr'] = o['est_arr_iso']
+        _dep_dl = _num(o.get('dep_delay_min'))
+        _arr_dl = _num(o.get('arr_delay_min'))
+        if _arr_dl is None:
+            _arr_dl = _num(o.get('delay_min'))
+        if not m.get('delay_known') and (_dep_dl is not None or _arr_dl is not None):
+            m['delay_known'] = True
+            if m.get('dep_delay_min') is None:
+                m['dep_delay_min'] = _dep_dl
+            if m.get('arr_delay_min') is None:
+                m['arr_delay_min'] = _arr_dl
         obs = obs_from_board_merged(m, keys, now=now_ts)
         # Positions-Observation aus dem schon geladenen Live-Fix (aircraft_live).
         # Nur wenn Koordinaten da sind; on_ground_raw wird von der Engine ignoriert
@@ -898,16 +924,20 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                 leg['flown'] = True
                 last_flown_observed = True
                 continue
-            if b == 'departed' and now < eff_dep + _dt.timedelta(
-                    minutes=_TAXI_OUT_MAX_MIN):
-                # TAXI_OUT: Board „Abgeflogen"=off-block, FRISCH raus (bis
-                # eff_dep+~25min) → die Maschine ROLLT zur Startbahn, NICHT
-                # airborne. Darf NICHT als „Fliegt gerade"/LIVE erscheinen
-                # (Owner 2026-07-13: „auf live obwohl Flieger nicht live, kein
-                # Takeoff"). Eigener Taxi-Zustand, state=pre_flight → keine
-                # Live-Flieger-Karte, keine Position. Länger off-block als eine
-                # plausible Taxi-Zeit → er ist abgeflogen (airborne) → flying
-                # (auch ohne eigene Position — 1h off-block IST unterwegs).
+            if b == 'departed':
+                # TAXI_OUT (kind='departed'): Board „Abgeflogen"=off-block, aber
+                # die EINE Engine hat es NICHT auf AIRBORNE gehoben — d.h. entweder
+                # frisch raus (< plausible Taxi-Zeit) ODER eine Live-Position zeigt
+                # den Flieger sichtbar am Boden. In BEIDEN Fällen rollt die
+                # Maschine zur Startbahn, ist NICHT airborne (kein „Fliegt gerade",
+                # keine Live-Position). crew_state SPIEGELT die Engine-Phase 1:1 —
+                # der frühere 25-min-crew-Deckel ist RAUS, die Grenze „off-block zu
+                # lange ⇒ airborne" lebt jetzt AUSSCHLIESSLICH in der Engine
+                # (flight_state TAXI_OUT_MAX_S, Zeit-Evidenz = estimated, keine
+                # erfundene Position). So zeigen flights_live/crew/family/my-status
+                # für denselben Flug DIESELBE Phase. Ein langes off-block liefert
+                # die Engine schon als kind='flying' (AIRBORNE/estimated) → dieser
+                # Zweig wird dann gar nicht erreicht.
                 picked = ('taxiing', idx, CONF_OBSERVED)
                 break
             picked = ('flying', idx, CONF_OBSERVED)

@@ -1186,3 +1186,20 @@ def test_tibor_frisch_offblock_ist_taxi_nicht_flying():
     assert r['state'] == STATE_PRE_FLIGHT, r
     assert r['text']['title'] == 'Startet gerade', r
     assert r.get('position') is None, r
+
+
+def test_tibor_langes_offblock_ohne_landung_ist_flying():
+    # Konsistenz-Regel (Owner 2026-07-13): dasselbe „Abgeflogen"/off-block, aber
+    # jetzt LANGE her (est_dep 11:30, now 13:00 = 90 min off-block) und noch VOR
+    # der erwarteten Ankunft (SFO 19:40) → die EINE Engine hebt TAXI_OUT auf
+    # AIRBORNE (Zeit-Evidenz, estimated) → crew zeigt „Fliegt gerade" — dieselbe
+    # Phase wie flights_live/family/my-status. Der crew-eigene 25-min-Deckel ist
+    # RAUS; die Grenze lebt allein in der Engine.
+    obs = {'LH454': {'status_dep': 'Abgeflogen', 'status': 'Abgeflogen',
+                     'est_dep_iso': '2026-07-13T11:30:00Z', 'dep_delay_min': 185}}
+    r = _tibor_resolve(datetime(2026, 7, 13, 13, 0, tzinfo=timezone.utc), obs)
+    assert r['state'] == STATE_FLYING, r
+    assert r['text']['title'] == 'Fliegt gerade', r
+    # keine erfundene Position (kein ADS-B) — die Live-Karte zeigt ehrlich keinen
+    # Flieger, aber die Person ist konsistent „fliegend".
+    assert r.get('position') is None, r
