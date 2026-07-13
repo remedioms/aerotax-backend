@@ -1074,3 +1074,14 @@ def test_tibor_ohne_est_kein_regress_nach_soll_abflug():
     # (CONF_PLAN) wie bisher — die Änderung darf das NICHT brechen.
     r = _tibor_resolve(datetime(2026, 7, 13, 8, 40, tzinfo=timezone.utc), {})
     assert r['state'] == STATE_FLYING, r
+
+
+def test_tibor_grosser_delay_zeigt_verspaetet_nicht_timeline():
+    # Soll 08:25, esti 11:20 (~3h Delay), now 09:16 → 2h VOR dem verspäteten
+    # Abflug, AUSSERHALB des 40-min-prep-Fensters. Muss „Verspätet · Abflug HH:MM"
+    # zeigen, nicht eine gegen die Soll-Zeit gerechnete Timeline-Phase.
+    obs = {'LH454': {'est_dep_iso': '2026-07-13T11:20:00Z'}}
+    r = _tibor_resolve(datetime(2026, 7, 13, 9, 16, tzinfo=timezone.utc), obs)
+    assert r['state'] == STATE_PRE_FLIGHT, r
+    assert r.get('pre_phase') == 'delayed', r
+    assert 'Verspätet' in (r['text'].get('subtitle') or ''), r

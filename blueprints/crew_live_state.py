@@ -263,7 +263,9 @@ def _resolve_pre_phase(leg, now, eff_dep, pre_ctx, hb, first_leg,
             return PRE_PREP
         return None                    # gekappt: Abflug-Moment vorbei, kein Beweis
     if not first_leg:
-        return None
+        # Turnaround-Leg vor prep: „Verspätet" nur wenn der Soll-Abflug schon
+        # durch ist (überfällig) — sonst keine Phase.
+        return PRE_DELAYED if (delay_known and now >= leg['dep']) else None
     # (start | None=-inf, rank, phase) — rank bricht Zeit-Gleichstand
     # zugunsten der späteren Timeline-Stufe.
     marks = [(None, 0, PRE_CHECKIN), (prep_start, 5, PRE_PREP)]
@@ -307,7 +309,23 @@ def _resolve_pre_phase(leg, now, eff_dep, pre_ctx, hb, first_leg,
         key = (t or floor, rank)
         if best is None or key >= best[0]:
             best = (key, phase)
-    return best[1] if best else None
+    if best is None:
+        return None
+    # BEKANNTER DELAY schlägt die gegen die STALE Soll-Abflugzeit gerechneten
+    # Timeline-Phasen (Owner 2026-07-13, Tibor: 2 h VOR verspätetem Abflug
+    # stand „Briefing", weil die Marken relativ zur Soll-Zeit 08:25 liegen —
+    # obwohl der Flug erst 13:20 geht). „Verspätet · Abflug HH:MM" ist die
+    # ehrliche Schlagzeile. Aus einem ECHTEN iCal-Pickup abgeleitete Phasen
+    # (crewbus/security) bleiben — sie sind ein reales, nicht gegen die Soll-
+    # Zeit gerechnetes Signal; Boarding hat oben schon gewonnen.
+    # NUR wenn der SOLL-Abflug schon durch ist (now >= sched_dep) — der Flug ist
+    # „überfällig" und nachweislich verspätet. VOR dem Soll-Abflug bleibt die
+    # normale Timeline (checkin/briefing), kein alarmierender Dauer-„Verspätet"
+    # den ganzen Tag (Basti-Fall: kleiner Delay, früh morgens = checkin).
+    if (delay_known and now >= leg['dep']
+            and best[1] in (PRE_CHECKIN, PRE_COMMUTE, PRE_BRIEFING, PRE_PREP)):
+        return PRE_DELAYED
+    return best[1]
 
 
 # Default-Status-Buckets — Consumers reichen app._flight_status_bucket rein
