@@ -864,6 +864,41 @@ def _pull_rss(src):
     return items
 
 
+# ── Job-/Stellenanzeigen-Filter (Owner 2026-07-13, Screenshot: die „Artikel"-
+#    Liste war voll mit Stellenanzeigen statt News — „Kapitän Pilatus PC-12NGX
+#    (f/m/d)", „Job SPARFELL Luftfahrt GmbH … Vollzeit … Top jobs Österreich",
+#    „Systems Engineer - Electrical Focus", „Jetzt eigene Stellenanzeige schalten").
+#    Einige DE/AT-Aviation-Feeds mischen einen Job-/Karriere-Bereich in denselben
+#    RSS-Strom. Solche Einträge sind keine News → verwerfen (kein Volltext-Harvest,
+#    nicht im Cache, nicht in der Liste). Konservativ: nur bei klaren Job-Signalen —
+#    Job-URL-Pfad, Gender-Marker (f/m/d), oder Recruiting-Wortmarker.
+_JOB_URL_RE = re.compile(
+    r'(?:^|[./_-])(?:jobs?|stellen(?:markt|anzeige|angebote|angebot)?|'
+    r'stellenmarkt|karriere|career|vacanc)(?:[./_-]|$)', re.IGNORECASE)
+# (m/f), (f/m/d), (m/w/d), (w/m/d) … + das österreichische „(a)". KEIN bloßes „(m)".
+_JOB_GENDER_RE = re.compile(
+    r'\(\s*(?:[fmwd]\s*/\s*[fmwd](?:\s*/\s*[fmwd])?|a)\s*\)', re.IGNORECASE)
+_JOB_MARKER_RE = re.compile(
+    r'\b(?:voll-?\s?zeit|teil-?\s?zeit|fest(?:e)?\s*anstellung|festanstellung|'
+    r'stellenanzeige|stellenangebot|top[\s-]?jobs?|jetzt\s+bewerben|'
+    r'wir\s+suchen|bewerbung|zeitarbeit)\b', re.IGNORECASE)
+
+
+def _looks_like_job_ad(title, summary='', link=''):
+    """True, wenn der Eintrag eine Stellenanzeige/ein Job-Posting ist (keine News)."""
+    if link and _JOB_URL_RE.search(link):
+        return True
+    blob = f'{title or ""}\n{summary or ""}'
+    if _JOB_GENDER_RE.search(blob):
+        return True
+    if _JOB_MARKER_RE.search(blob):
+        return True
+    # Viele Einträge starten wörtlich mit „Job <Firma> …".
+    if re.match(r'\s*job\s+\S', title or '', re.IGNORECASE):
+        return True
+    return False
+
+
 def _entry_to_article(entry, src):
     """Konvertiert ein feedparser-Entry in unser Article-Schema."""
     link = (entry.get('link') or '').strip()
@@ -873,6 +908,9 @@ def _entry_to_article(entry, src):
 
     summary_raw = entry.get('summary') or entry.get('description') or ''
     summary = _strip_html(summary_raw).strip()
+    # Stellenanzeigen früh verwerfen — VOR dem teuren Volltext-Parsing.
+    if _looks_like_job_ad(title, summary, link):
+        return None
     full_summary_len = len(summary)
     if len(summary) > 300:
         summary = summary[:297].rstrip() + '...'
@@ -1269,6 +1307,12 @@ def _filter_articles(articles, airline_raw, category):
     `_airline_relevance`) — `airline_raw` bleibt aus Kompatibilität in der
     Signatur, wird aber nur noch genutzt wenn explizit gesetzt (Legacy)."""
     out = articles
+
+    # Stellenanzeigen auch beim Ausliefern raus — fängt bereits gecachte/persistierte
+    # Job-Einträge sofort ab (Owner 2026-07-13), nicht erst nach Cache-Ablauf.
+    out = [a for a in out
+           if not _looks_like_job_ad(a.get('title', ''), a.get('summary', ''),
+                                     a.get('article_url', ''))]
 
     if category:
         out = [a for a in out if a.get('category') == category]
