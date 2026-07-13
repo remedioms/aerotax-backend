@@ -3082,7 +3082,8 @@ def ax_radar_enrich():
                                        for _, d, _ in missing if d})
                     fns = sorted({(fn or '').upper() for fn, _, _ in missing if fn})
                     ao = (sb.table('airport_delay_obs')
-                          .select('airport,flight,sched,esti,date')
+                          .select('airport,flight,sched,esti,'
+                                  'max_delay_min,date')
                           .in_('date', [yday, today])
                           .in_('airport', arr_keys)
                           .in_('flight', fns)
@@ -3106,6 +3107,18 @@ def ax_radar_enrich():
                             out[hx]['sched_arr'] = _fa['sched_arr']
                         if _fa.get('est_arr'):
                             out[hx]['est_arr'] = _fa['est_arr']
+                        # ANKUNFTS-DELAY DURCHREICHEN (Owner 2026-07-13, „Radar
+                        # zeigt Soll-Ankunft trotz Verspätung"): kennt die ARR-Obs
+                        # eine Verspätungs-ZAHL (max_delay_min), aber KEINE eigene
+                        # esti-Uhrzeit, blieb der Callout auf sched_arr → iOS rechnete
+                        # est_arr−sched_arr=0 und zeigte „pünktlich". Der crew_state-
+                        # Resolver (_eff_arr) fällt in genau diesem Fall auf
+                        # sched+arr_delay_min zurück (EINE Wahrheit). Deshalb hier
+                        # die Zahl additiv mitgeben, damit iOS dieselbe effektive
+                        # Ankunft ableiten kann. Nur bei echtem Wert, nie erfunden.
+                        if (_fa.get('arr_delay_min') is not None
+                                and out[hx].get('arr_delay_min') is None):
+                            out[hx]['arr_delay_min'] = _fa['arr_delay_min']
             except Exception:
                 pass
         except Exception:

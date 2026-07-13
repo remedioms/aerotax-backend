@@ -363,6 +363,51 @@ def test_ax_radar_enrich_passes_when_not_limited(client, monkeypatch):
     assert r.get_json()['ok'] is True
 
 
+def test_ax_radar_enrich_forwards_arr_delay_when_no_est(client, monkeypatch):
+    """EINE Wahrheit mit dem crew_state-Resolver (Owner 2026-07-13): kennt die
+    ARR-Obs eine Verspätungs-ZAHL, aber KEINE eigene esti-Uhrzeit, muss der
+    Radar-Callout `arr_delay_min` mitbekommen — sonst rechnet iOS
+    est_arr−sched_arr=0 und zeigt fälschlich „pünktlich". Genau der Fall, in
+    dem `_eff_arr` auf sched+arr_delay_min zurückfällt."""
+    monkeypatch.setattr(axd, '_ax_rate_limited', lambda *a, **k: False)
+    # flights-Row: Abflug im Live-Fenster, ABER ohne Ankunftszeiten
+    # (sched_arr/est_arr fehlen → ARR-Obs-Fallback greift).
+    _dep_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    flights_rows = [{'hex': '3c675a', 'op_flight_no': 'LH400',
+                     'origin': 'FRA', 'destination': 'SKG',
+                     'gate': 'A26', 'status': 'Departed', 'tail': None,
+                     'sched_dep': _dep_iso, 'est_dep': _dep_iso,
+                     'sched_arr': None, 'est_arr': None}]
+    # ARR-Obs: Verspätung bekannt (+45), aber KEINE esti-Uhrzeit.
+    arr_rows = [{'airport': 'SKG#ARR', 'flight': 'LH400', 'sched': '00:20',
+                 'esti': None, 'max_delay_min': 45,
+                 'date': axd._today_utc()}]
+
+    class _Q:
+        def __init__(self, data): self._data = data
+        def select(self, *a, **k): return self
+        def in_(self, *a, **k): return self
+        def gte(self, *a, **k): return self
+        def order(self, *a, **k): return self
+        def limit(self, n): return self
+        def execute(self):
+            return types.SimpleNamespace(data=self._data)
+
+    class _SB:
+        def table(self, name):
+            return _Q(flights_rows if name == 'flights' else arr_rows)
+
+    monkeypatch.setattr(axd, '_sb', lambda: _SB())
+    r = client.post('/api/ax/radar-enrich', json={'hexes': ['3c675a']})
+    assert r.status_code == 200
+    body = r.get_json()
+    entry = body['routes'].get('3c675a')
+    assert entry is not None
+    # Delay-Zahl durchgereicht (nicht erfunden), obwohl keine est_arr existiert.
+    assert entry.get('arr_delay_min') == 45
+    assert 'est_arr' not in entry            # ehrlich: keine erfundene Uhrzeit
+
+
 def test_rate_limit_wired_through_adsb_pattern(client, monkeypatch):
     """_ax_rate_limited delegiert an das adsb_blueprint-Muster (per-IP) mit dem
     richtigen Endpoint-Bucket — via Stub-Modul, ohne app.py zu booten."""
