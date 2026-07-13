@@ -3577,12 +3577,18 @@ def _status_category_from_facts(flight, facts, now=None):
         return None
 
 
-def _enrich_flight_status_with_obs(flight, date=None):
+def _enrich_flight_status_with_obs(flight, date=None, allow_paid=True):
     """P4-Verdrahtung: füllt fehlende Zeit-/Gate-/Status-Felder eines
     FlightStatusInfo-Dicts (resolve-flight/-callsign → iOS `schedule.info`) aus den
     geteilten Board-Fakten. So zeigt auch der Detail-Screen Soll/Ist-Ankunft + Gate,
     wenn aircraft_live/board keine Zeiten trug. Nur LEERE Felder (FR24-Wahrheit nie
-    überschrieben). Die EINE Merge-Quelle (_flight_facts_from_obs) — kein neuer Pfad."""
+    überschrieben). Die EINE Merge-Quelle (_flight_facts_from_obs) — kein neuer Pfad.
+
+    `allow_paid=False` (Aggregat-Pfad, Owner 2026-07-14 „Detail lädt ~7 s"): der
+    BLOCKIERENDE paid-FR24-by-number-Nachschlag der Zeiten-Lücke bleibt draussen —
+    er lag SYNCHRON auf dem kritischen resolve-Pfad VOR dem Fan-out (~5 s auf NAS/
+    gRPC). Der freie gRPC-Korridor läuft weiter; die paid-Zeiten holt der Standalone-
+    Endpoint (`?nofr24=1` NICHT gesetzt) bzw. iOS non-blocking. Free-first-Invariante 5."""
     if not isinstance(flight, dict):
         return flight
     fn = (flight.get('flight') or '').replace(' ', '').upper()
@@ -3632,7 +3638,8 @@ def _enrich_flight_status_with_obs(flight, date=None):
     if not flight.get('sched_dep') and not flight.get('sched_arr'):
         _t = _flight_times_free_first(fn, d, flight.get('dep_iata'),
                                       flight.get('arr_iata'),
-                                      callsign=flight.get('callsign'), allow_paid=True)
+                                      callsign=flight.get('callsign'),
+                                      allow_paid=allow_paid)
         for k in ('sched_dep', 'est_dep', 'sched_arr', 'est_arr'):
             if _t.get(k) and not flight.get(k):
                 flight[k] = _t[k]
@@ -4988,6 +4995,12 @@ def ax_resolve_callsign(callsign):
     if len(cs) < 3:
         return jsonify({'ok': False, 'error': 'bad_callsign'}), 400
     date_q = (request.args.get('date') or '').strip()[:10] or None
+    # nofr24=1 (nur der interne Detail-Aggregat-Subcall setzt das, Owner 2026-07-14):
+    # kein BLOCKIERENDER FR24-gRPC-Nachschlag auf dem kritischen resolve-Pfad —
+    # weder der direkte by-callsign-Call noch der paid-Zeiten-Backup im Enrich.
+    # Der Aggregat-Pfad ist free-first (die teuren Zeiten holt iOS non-blocking);
+    # der Standalone-Endpoint (Flag NICHT gesetzt) bleibt unverändert.
+    _nofr24 = str(request.args.get('nofr24', '')).lower() in ('1', 'true', 'yes')
     # FREE-FIRST: aktiver Flug gratis im aircraft_live (by callsign) → kein FR24.
     # BEWUSST kein Obs-Vorab-Check per abgeleiteter IATA-Nummer: die naive
     # Präfix+Suffix-Ableitung (OCN601→„4Y601") ist genau die Verwechslung, die
@@ -4995,7 +5008,7 @@ def ax_resolve_callsign(callsign):
     # gratis-falsch (kein Geister-Flieger).
     flight = _aircraft_live_flight(callsign=cs)
     src = 'aircraft_live'
-    if not flight:
+    if not flight and not _nofr24:
         # Paid nur hinter dem Plausi-Gate (Airline-Präfix muss existieren).
         flight = _fr24_flight_by_callsign(cs) if _paid_prefix_plausible(cs) else None
         src = 'fr24'
@@ -5008,7 +5021,8 @@ def ax_resolve_callsign(callsign):
                 except Exception:
                     pass
         # P4: Soll/Ist-Zeiten+Gate — ?date= (z.B. vom Detail-Aggregat) durchreichen
-        flight = _enrich_flight_status_with_obs(flight, date=date_q)
+        flight = _enrich_flight_status_with_obs(flight, date=date_q,
+                                                allow_paid=not _nofr24)
         return jsonify({'ok': True, 'callsign': cs, 'flight': flight,
                         'source': src})
     return jsonify({'ok': False, 'callsign': cs, 'error': 'not_found'}), 200
@@ -5029,6 +5043,12 @@ def ax_resolve_flight(flightno):
     if len(fn) < 3:
         return jsonify({'ok': False, 'error': 'bad_flight'}), 400
     date_q = (request.args.get('date') or '').strip()[:10] or None
+    # nofr24=1 (nur der interne Detail-Aggregat-Subcall setzt das, Owner 2026-07-14
+    # „Detail lädt ~7 s"): kein BLOCKIERENDER FR24-gRPC-Nachschlag auf dem kritischen
+    # resolve-Pfad — weder der direkte by-number-Call noch der paid-Zeiten-Backup im
+    # Enrich (lag SYNCHRON vor dem Fan-out ~5 s). Aggregat = free-first, Zeiten holt
+    # iOS non-blocking. Standalone-Endpoint (Flag NICHT gesetzt) bleibt unverändert.
+    _nofr24 = str(request.args.get('nofr24', '')).lower() in ('1', 'true', 'yes')
     # FREE-FIRST: aktiver Flug steht mit echtem Funknamen gratis im aircraft_live
     # (gRPC-Scraper) → kein FR24-Credit. FR24 nur wenn nicht aktiv/geharvestet.
     flight = _aircraft_live_flight(flight=fn)
@@ -5044,7 +5064,7 @@ def ax_resolve_flight(flightno):
                       'reg': _ff.get('reg'), 'aircraft': _ff.get('type'),
                       'status': _ff.get('dep_status') or '', 'status_category': ''}
             src = 'aerox_obs'
-        else:
+        elif not _nofr24:
             # Paid nur hinter dem Plausi-Gate (Airline-Präfix muss existieren —
             # Fantasie-/Scan-Queries erreichen FR24 nicht, jeder Miss kostete).
             flight = (_fr24_flight_by_number(fn)
@@ -5059,7 +5079,8 @@ def ax_resolve_flight(flightno):
                 except Exception:
                     pass
         # P4: Soll/Ist-Zeiten+Gate — ?date= (z.B. vom Detail-Aggregat) durchreichen
-        flight = _enrich_flight_status_with_obs(flight, date=date_q)
+        flight = _enrich_flight_status_with_obs(flight, date=date_q,
+                                                allow_paid=not _nofr24)
         return jsonify({'ok': True, 'number': fn, 'flight': flight, 'source': src})
     return jsonify({'ok': False, 'number': fn, 'error': 'not_found'}), 200
 
@@ -5159,12 +5180,19 @@ def ax_flight_detail(query):
     def _resolve_call():
         # ?date= mitgeben: der resolve-Enrich (_flight_facts_from_obs) matcht
         # sonst immer nur „heute", auch wenn das Aggregat einen Tag anfragt.
+        # nofr24=1 (Owner 2026-07-14 „Detail ~7 s"): der resolve-Subcall lag
+        # SYNCHRON auf dem kritischen Pfad VOR dem Fan-out und zog dort einen
+        # blockierenden paid-FR24-gRPC-Nachschlag (~5 s auf NAS) für die Zeiten-
+        # Lücke — obwohl das Aggregat free-first ist (kein Bearer/`?paid=`). Der
+        # freie gRPC-Korridor läuft weiter; die teuren Zeiten holt iOS non-blocking.
         if is_cs:
             return _detail_subcall(_app, '/api/ax/resolve-callsign/%s%s'
-                                   % (urllib.parse.quote(q), _qs(date=date_q)),
+                                   % (urllib.parse.quote(q),
+                                      _qs(date=date_q, nofr24=1)),
                                    ax_resolve_callsign, q)
         return _detail_subcall(_app, '/api/ax/resolve-flight/%s%s'
-                               % (urllib.parse.quote(q), _qs(date=date_q)),
+                               % (urllib.parse.quote(q),
+                                  _qs(date=date_q, nofr24=1)),
                                ax_resolve_flight, q)
 
     def _info_call(fn):
