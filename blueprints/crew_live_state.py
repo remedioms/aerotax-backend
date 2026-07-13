@@ -897,8 +897,14 @@ def build_obs_lookup(resolver, datum):
         if not (callable(resolver) and flight_no):
             return None
         try:
+            # live=False (Owner 2026-07-13, gemessen): der Feed-Fan-out darf
+            # NIE eine Flughafen-Tafel LIVE scrapen (_lhr_board ~6s, FRA ~3s pro
+            # friends-today-Aufruf) — die Board-Obs kommen aus dem Warehouse
+            # (Harvester hält FRA/LHR/… frisch). Nur so bleibt friends-today
+            # schnell; Paid war via free_only eh schon aus.
             return resolver(flight_no, date=datum, dep_iata=dep_iata,
-                            arr_iata=(arr_iata or None), free_only=True)
+                            arr_iata=(arr_iata or None),
+                            free_only=True, live=False)
         except Exception:
             return None
     return _lookup

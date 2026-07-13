@@ -12593,7 +12593,7 @@ def get_friends_today(token):
                                 fno, date=datum, dep_iata=frm,
                                 arr_iata=(to if (len(to) == 3 and to.isalpha())
                                           else None),
-                                free_only=True)
+                                free_only=True, live=False)
                     except Exception:
                         merged = None
                     bucket = (_flight_status_bucket(merged.get('status'))
@@ -12778,7 +12778,7 @@ def get_friends_today(token):
                     m = _flight_obs_merged(fno, date=datum,
                                            dep_iata=_dep_ia,
                                            arr_iata=_arr_ia,
-                                           free_only=True)
+                                           free_only=True, live=False)
                     if m:
                         # ECHTE Live-Position dieses Legs aus dem NAS-Harvester-Store
                         # (aircraft_live/FR24-gRPC) — reale Süd-Route (LH meidet
