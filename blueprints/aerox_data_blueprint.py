@@ -3909,6 +3909,44 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
                 'city': r.get('city'), 'name': r.get('name'),
                 'lat': r.get('lat'), 'lon': r.get('lon')}
 
+    # ARRIVAL-PHYSIK-GATE auf `arr_status` (Owner 2026-07-13, LH454-Klasse „Crew
+    # steht am Ziel-Pin, während der Flieger noch überm Ozean ist"): das
+    # `arr_status` kam UNGEGATET aus dem Dual-Side-Board-Merge (_flight_facts_from_obs)
+    # → eine STALE Vortags-„gelandet"-Ankunftszeile konnte einen noch fliegenden
+    # Langstreckenflug als „arrived" ausgeben. Dieselbe Hintertür wie auf
+    # ax_flight_info, dort schon geschlossen. Dieselbe reine Physik-Schranke
+    # (leg_status_gate.gated_leg_status): ein terminaler arr_status gilt nur, wenn
+    # `now` die früheste physikalisch mögliche Ankunft (eff. Abflug + Großkreis/v_max)
+    # ODER die Fahrplan-Ankunft (−15 min Slack) erreicht hat; sonst None. Fail-open
+    # bei fehlenden Belegen (Zeit/Koordinaten) — nie eine Landung erfinden. Wirft nie.
+    _gated_arr = facts.get('arr_status')
+    if _gated_arr:
+        try:
+            from blueprints.leg_status_gate import gated_leg_status as _gls
+            from app import _board_local_to_utc_iso as _bl2utc
+            from datetime import datetime as _dtp, timezone as _tzc
+            _dep_ll = _iata_latlon(origin)
+            _arr_ll = _iata_latlon(dest)
+            _dep_ts = None
+            for _dc in (facts.get('est_dep'), facts.get('sched_dep')):
+                _iso = _bl2utc(_dc, origin) if _dc else None
+                if _iso:
+                    try:
+                        _dd = _dtp.fromisoformat(str(_iso).replace('Z', '+00:00'))
+                        if _dd.tzinfo is None:
+                            _dd = _dd.replace(tzinfo=_tzc.utc)
+                        _dep_ts = _dd.timestamp()
+                        break
+                    except Exception:
+                        pass
+            _sa = _bl2utc(facts.get('sched_arr'), dest) if facts.get('sched_arr') else None
+            _ea = _bl2utc(facts.get('est_arr'), dest) if facts.get('est_arr') else None
+            _gated_arr = _gls(facts.get('arr_status'), now=time.time(),
+                              sched_arr_iso=_sa, est_arr_iso=_ea, dep_ts=_dep_ts,
+                              dep_ll=_dep_ll, arr_ll=_arr_ll)
+        except Exception:
+            _gated_arr = facts.get('arr_status')
+
     out = {
         'ok': True, 'found': True, 'query': q, 'date': date,
         'identity': {'callsign': callsign, 'flight_no': flight_no, 'reg': reg,
@@ -3920,7 +3958,7 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
         'status': {
             'gate': facts.get('gate'), 'terminal': facts.get('terminal'),
             'arr_gate': facts.get('arr_gate'), 'arr_terminal': facts.get('arr_terminal'),
-            'dep_status': facts.get('dep_status'), 'arr_status': facts.get('arr_status'),
+            'dep_status': facts.get('dep_status'), 'arr_status': _gated_arr,
             'dep_delay_min': facts.get('dep_delay_min'),
             'arr_delay_min': facts.get('arr_delay_min'),
             'cancelled': facts.get('cancelled'),
