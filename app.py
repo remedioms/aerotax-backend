@@ -29411,11 +29411,15 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
         # (airborne/delayed/boarding) laufen unverändert durch; fehlen die Belege
         # → fail-open (Rohstatus bleibt). Rein additiv, konservativ, wirft nie.
         _raw_status = m.get('status')
+        # Physik-Schranken-Inputs vorab binden (auch der Engine-Block unten liest
+        # sie): so bleibt der Feinschliff-1-Status-Gate auch dann definiert, wenn
+        # der Import unten scheitert (fail-open statt NameError).
+        _dep_ts = None
+        _dep_ll = _arr_ll = None
         try:
             from blueprints.leg_status_gate import gated_leg_status as _gate_status
             # eff. Abflug (Epoch) für die physikalische Schranke: bester Ist-
             # Zeitstempel (est_dep_iso, schon echt-UTC) vor dem Plan-dep_iso.
-            _dep_ts = None
             for _dep_cand in (s.get('est_dep_iso'), s.get('dep_iso')):
                 if _dep_cand:
                     try:
@@ -29494,10 +29498,54 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
                                {'status': s.get('status'), 'cancelled': s.get('cancelled')},
                                fs=_fs)
                 # additiv: kanonische Phase/Konfidenz (iOS ≥ Build 95 nutzt sie;
-                # alte Builds ignorieren die Extra-Keys). Roh-`status` bleibt für
-                # die deutsche Anzeige-Zeile.
+                # alte Builds ignorieren die Extra-Keys).
                 s['phase'] = _fs['phase']
                 s['phase_conf'] = _fs['phase_conf']
+                # 100%-GLEICHLAUT (Owner/Fable 2026-07-13, Feinschliff 1): der
+                # Kalender-Sektor-`status` zeigt jetzt die VOLLE Engine-Phase —
+                # DIESELBE Wahrheit wie crew_state/flights_live —, nicht mehr nur
+                # den physik-gegateten ROHEN Board-Status. Vorher konnte der Roh-
+                # Status „Boarding" durchlaufen, während dieselbe Engine über
+                # flights_live schon „fliegt/rollt" projizierte (Divergenz zwischen
+                # Kalender-Leg und Feed-Bordkarte). Wir leiten den Status kanonisch
+                # ab (`project_friend_leg().status` = die Engine-Phase) und
+                # übersetzen ihn in genau das Board-Vokabular, das iOS `DelayLogic.
+                # phase` schon versteht (airborne/landed/grounded/cancelled) —
+                # dasselbe Mapping wie warehouse_reader/family_watch/aerox_data.
+                #
+                # LANDUNG-PLAUSI BLEIBT GEWAHRT: die Engine gewährt einen arr-
+                # seitigen harten „gelandet" OHNE eigene Physik-Schranke (board_arr
+                # LANDED wins outright, flight_state.py T2). Ein terminaler Engine-
+                # Status wird darum durch DASSELBE Physik-Gate geschickt wie der
+                # Roh-Status oben (`gated_leg_status`) — ist die Landung physisch
+                # unmöglich (11h-Flug, gerade erst abgeflogen), wird sie verworfen
+                # und der bereits physik-gegatete Roh-`status` bleibt stehen (keine
+                # erfundene/bogus „gelandet 13:03"). Nicht-terminale Engine-Phasen
+                # (airborne/grounded/cancelled) laufen unverändert durch.
+                # Fail-open: keine kartierbare Phase (UNKNOWN) → Roh-Status bleibt.
+                try:
+                    from blueprints.flight_state import (
+                        project_friend_leg as _fs_proj)
+                    from blueprints.warehouse_reader import (
+                        _ENGINE_PHASE_TO_LEGACY as _fs_phase_vocab)
+                    from blueprints.leg_status_gate import (
+                        gated_leg_status as _gate_status2)
+                    _canon_phase = _fs_proj(_fs).get('status')
+                    _canon_status = _fs_phase_vocab.get(_canon_phase)
+                    if _canon_status and _canon_status != 'unknown':
+                        # terminale Engine-Landung DERSELBEN Physik-Prüfung wie der
+                        # Roh-Status unterziehen (gleiche Schranken wie _gate_status
+                        # oben); übersteht sie das Gate nicht → Roh-Status behalten.
+                        _gated_canon = _gate_status2(
+                            _canon_status, now=now.timestamp(),
+                            sched_arr_iso=_board_local_to_utc_iso(
+                                m.get('sched_arr'), to),
+                            est_arr_iso=s.get('est_arr_iso'), dep_ts=_dep_ts,
+                            dep_ll=_dep_ll, arr_ll=_arr_ll)
+                        if _gated_canon is not None:
+                            s['status'] = _gated_canon
+                except Exception:
+                    pass        # Projektion/Import-Fehler → Roh-Status bleiben lassen
         except Exception:
             pass
         # `tail` = Flugzeug-Kennzeichen fürs Kalender-Leg (Owner 2026-07-04:

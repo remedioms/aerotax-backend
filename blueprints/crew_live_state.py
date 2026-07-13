@@ -491,7 +491,9 @@ def _fmt_reg(r):
 #
 # Die Engine-Phase wird in eine crew-Leg-Entscheidung übersetzt:
 #   CANCELLED                     → 'cancelled'
-#   LANDED | ARRIVED              → 'flown'   (Leg beendet, nächsten prüfen)
+#   LANDED | ARRIVED | DIVERTED   → 'flown'   (Leg beendet, nächsten prüfen —
+#                                   DIVERTED = woanders gelandet, NICHT airborne;
+#                                   Feinschliff 2, 100%-Gleichlaut 2026-07-13)
 #   AIRBORNE | APPROACH           → 'flying'
 #   TAXI_OUT                      → 'departed' (off-block; crew: der Leg ist
 #                                   unterwegs — die Leg-Auswahl behandelt ihn wie
@@ -507,6 +509,7 @@ _ENG_LANDED = 'LANDED'
 _ENG_ARRIVED = 'ARRIVED'
 _ENG_AIRBORNE = 'AIRBORNE'
 _ENG_APPROACH = 'APPROACH'
+_ENG_DIVERTED = 'DIVERTED'
 _ENG_TAXI_OUT = 'TAXI_OUT'
 _ENG_SCHEDULED = 'SCHEDULED'
 _ENG_BOARDING = 'BOARDING'
@@ -625,8 +628,8 @@ def _engine_leg_flight(leg, o, live, now, dep_ll=None, arr_ll=None,
         live_pos = fs.get('live')
         if phase == _ENG_CANCELLED:
             kind = 'cancelled'
-        elif phase in (_ENG_LANDED, _ENG_ARRIVED):
-            kind = 'flown'
+        elif phase in (_ENG_LANDED, _ENG_ARRIVED, _ENG_DIVERTED):
+            kind = 'flown'          # DIVERTED = woanders gelandet, Leg beendet
         elif phase in (_ENG_AIRBORNE, _ENG_APPROACH):
             kind = 'flying'
         elif phase == _ENG_TAXI_OUT:

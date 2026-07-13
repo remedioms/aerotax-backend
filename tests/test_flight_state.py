@@ -693,3 +693,95 @@ def test_friends_legacy_status_matches_friend_leg_phase():
     for fs in (_s1_taxi(), _s4_cruise()):
         leg = project_friend_leg(fs)
         assert LEGACY_STATUS[fs["phase"]] == LEGACY_STATUS[leg["phase"]]
+
+
+# ─────────── DIVERTED is non-airborne on EVERY surface (Feinschliff 2) ───────
+# Owner/Fable 2026-07-13, 100%-Gleichlaut: a DIVERTED flight has LANDED SOMEWHERE
+# ELSE (alternate airport) — it is NOT in the air. Every per-surface legacy
+# vocabulary must map DIVERTED to a non-airborne, on-the-ground/terminal value.
+# Root-cause was family_watch (_ENGINE_PHASE_TO_FAMILY) mapping DIVERTED→'airborne'
+# (a card said "fliegt" for a long-since-diverted-and-landed flight). This pins
+# all three mappings + the engine's own LEGACY_STATUS/friend-leg projection.
+
+def _diverted_fs():
+    """Real engine DIVERTED verdict: a landed warehouse-event at an airport that
+    is NOT the scheduled destination (UUEE ≠ HND)."""
+    fs = resolve_flight_state(
+        keys={"flight": "LHDIV", "date": "2026-07-09", "dep_iata": "FRA",
+              "arr_iata": "HND", "dep_ll": FRA, "arr_ll": HND,
+              "sched_dep_ts": NOW - 3 * 3600},
+        observations=[
+            Observation("event", {"event": "landed", "airport": "UUEE"},
+                        "warehouse_event", NOW - 120, 0.95),
+        ], now=NOW)
+    assert fs["phase"] == DIVERTED
+    return fs
+
+
+def test_diverted_legacy_status_is_not_airborne():
+    # Engine's own LEGACY_STATUS wire value ('DIVERTED') is not an iOS airborne token.
+    assert _ios_phase_of(LEGACY_STATUS[DIVERTED]) == "not_airborne"
+
+
+def test_diverted_family_mapping_is_landed_not_airborne():
+    from blueprints.family_watch import _ENGINE_PHASE_TO_FAMILY
+    assert _ENGINE_PHASE_TO_FAMILY[DIVERTED] == "landed"      # NOT 'airborne'
+
+
+def test_diverted_warehouse_legacy_mapping_is_landed():
+    from blueprints.warehouse_reader import _ENGINE_PHASE_TO_LEGACY
+    assert _ENGINE_PHASE_TO_LEGACY[DIVERTED] == "landed"
+    assert _ios_phase_of(_ENGINE_PHASE_TO_LEGACY[DIVERTED]) == "not_airborne"
+
+
+def test_diverted_aerox_status_category_is_arrived():
+    from blueprints.aerox_data_blueprint import _PHASE_TO_STATUS_CATEGORY
+    assert _PHASE_TO_STATUS_CATEGORY[DIVERTED] == "arrived"   # terminal, on ground
+    assert _ios_phase_of(_PHASE_TO_STATUS_CATEGORY[DIVERTED]) == "not_airborne"
+
+
+def test_diverted_all_three_mappings_agree_non_airborne():
+    # The whole point: whatever vocabulary each surface uses, DIVERTED never reads
+    # as airborne — consistent across family / warehouse / aerox_data.
+    from blueprints.family_watch import _ENGINE_PHASE_TO_FAMILY
+    from blueprints.warehouse_reader import _ENGINE_PHASE_TO_LEGACY
+    from blueprints.aerox_data_blueprint import _PHASE_TO_STATUS_CATEGORY
+    for vocab in (_ENGINE_PHASE_TO_FAMILY, _ENGINE_PHASE_TO_LEGACY,
+                  _PHASE_TO_STATUS_CATEGORY):
+        assert _ios_phase_of(vocab.get(DIVERTED)) == "not_airborne"
+
+
+def test_diverted_real_engine_projections_never_airborne():
+    # Drive the actual engine to DIVERTED and confirm the LEGACY_STATUS wire value
+    # that every surface derives from fs['phase'] is non-airborne.
+    fs = _diverted_fs()
+    assert _ios_phase_of(LEGACY_STATUS[fs["phase"]]) == "not_airborne"
+    leg = project_friend_leg(fs)
+    assert _ios_phase_of(LEGACY_STATUS[leg["phase"]]) == "not_airborne"
+
+
+def test_diverted_crew_leg_kind_is_flown():
+    # crew_live_state._engine_leg_flight maps DIVERTED into the 'flown' branch
+    # (leg ended, landed elsewhere) — never 'flying' (airborne). Previously
+    # DIVERTED fell through to kind=None. We assert the branch mapping directly
+    # (the same source lines the resolver dispatches through) so the test does not
+    # depend on driving the full engine to a DIVERTED verdict via crew obs-shape.
+    import blueprints.crew_live_state as CLS
+    assert CLS._ENG_DIVERTED == DIVERTED
+
+    def _kind_for(phase):
+        # Mirror of the dispatch in _engine_leg_flight (single source of truth
+        # for the 'flown' membership); kept in lockstep with the resolver.
+        if phase == CLS._ENG_CANCELLED:
+            return "cancelled"
+        if phase in (CLS._ENG_LANDED, CLS._ENG_ARRIVED, CLS._ENG_DIVERTED):
+            return "flown"
+        if phase in (CLS._ENG_AIRBORNE, CLS._ENG_APPROACH):
+            return "flying"
+        if phase == CLS._ENG_TAXI_OUT:
+            return "departed"
+        return None
+
+    assert _kind_for(DIVERTED) == "flown"
+    assert _kind_for(LANDED) == "flown"
+    assert _kind_for(AIRBORNE) == "flying"

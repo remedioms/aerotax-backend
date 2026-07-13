@@ -577,9 +577,13 @@ def _flight_window_state(day, legs_live, now):
 # Engine-Phase → Family-Vokabular ('airborne'|'landed'|'grounded'|'cancelled').
 # Identisches Mapping wie im Live-Fix-Pfad (family_watch.py Consumer :1361) und
 # in crew_live_state._engine_leg_flight — EINE Wahrheit für alle Family-Felder.
+# DIVERTED = der Flieger ist WOANDERS GELANDET (Ausweichflughafen), NICHT mehr in
+# der Luft → 'landed' (Owner/Fable 2026-07-13, Feinschliff 2: vorher fälschlich
+# 'airborne' → die Family-Karte zeigte „fliegt" für einen längst umgeleitet
+# gelandeten Flug; jetzt app-weit nicht-airborne wie warehouse_reader/aerox_data).
 _ENGINE_PHASE_TO_FAMILY = {
-    'AIRBORNE': 'airborne', 'APPROACH': 'airborne', 'DIVERTED': 'airborne',
-    'LANDED': 'landed', 'ARRIVED': 'landed',
+    'AIRBORNE': 'airborne', 'APPROACH': 'airborne',
+    'LANDED': 'landed', 'ARRIVED': 'landed', 'DIVERTED': 'landed',
     'TAXI_OUT': 'grounded', 'BOARDING': 'grounded',
     'CANCELLED': 'cancelled',
     # SCHEDULED/UNKNOWN → None (kein Phasen-Signal; Karte bleibt bei flying_now).
@@ -1458,12 +1462,10 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                     status['live_status'] = _fs.get('live_status')
                     # Engine-Phase → Family-Vokabular (Kontrakt: 'airborne'|
                     # 'landed'|'grounded'|'cancelled'|None); None ⇒ die Board-
-                    # basierte _canonical_flight_phase bleibt stehen.
-                    _eng_ph = {'AIRBORNE': 'airborne', 'APPROACH': 'airborne',
-                               'DIVERTED': 'airborne', 'LANDED': 'landed',
-                               'ARRIVED': 'landed', 'TAXI_OUT': 'grounded',
-                               'BOARDING': 'grounded',
-                               'CANCELLED': 'cancelled'}.get(_fs.get('phase'))
+                    # basierte _canonical_flight_phase bleibt stehen. EINE Wahrheit
+                    # über das Modul-Mapping (DIVERTED='landed', nicht 'airborne' —
+                    # Feinschliff 2, s. _ENGINE_PHASE_TO_FAMILY).
+                    _eng_ph = _ENGINE_PHASE_TO_FAMILY.get(_fs.get('phase'))
                     if _eng_ph is not None:
                         status['flight_phase'] = _eng_ph
                     if _fs.get('live') is None:

@@ -556,6 +556,87 @@ def test_enrich_free_only_flag_forwarded():
     assert mock.call_args.kwargs.get('free_only') is True
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FEINSCHLIFF 1 (Owner/Fable 2026-07-13, 100%-Gleichlaut): der Kalender-Sektor-
+# `status` zeigt unter dem FlightState-Flag die VOLLE Engine-Phase (DIESELBE
+# Wahrheit wie crew_state/flights_live), nicht mehr nur den physik-gegateten
+# ROHEN Board-Status. Board sagt „Boarding", Engine (Position/Zeit) sagt „fliegt"
+# → der Sektor zeigt jetzt die Engine-Wahrheit. Bogus-Landung bleibt verworfen.
+# ══════════════════════════════════════════════════════════════════════════════
+def _merged_sided(status_dep=None, status_arr=None, **kw):
+    """Wie _merged, aber mit den seiten-getrennten Board-Status-Feldern, die der
+    ECHTE _flight_obs_merged setzt (status_dep/status_arr) — die die Engine über
+    obs_from_board_merged liest."""
+    m = _merged(**kw)
+    m['status_dep'] = status_dep
+    m['status_arr'] = status_arr
+    return m
+
+
+def test_enrich_status_is_engine_phase_when_flag_on(monkeypatch):
+    # Board meldet dep-seitig „Boarding" (grounded), aber ein frischer, plausibler
+    # aircraft_live-Cruise-Fix (hoch/schnell, weit von FRA) hebt die Engine auf
+    # AIRBORNE → der Sektor-Status wird 'airborne' (Engine-Wahrheit), NICHT das
+    # rohe 'Boarding'. Dieselbe Phase, die flights_live projiziert.
+    monkeypatch.setenv('FLIGHTSTATE_LIVE_FRIENDS', '1')
+    dep = _now() - timedelta(minutes=40)
+    secs = [_sector(flight='LH400', frm='FRA', to='MUC', dep_iso=_iso(dep))]
+    m = _merged_sided(status_dep='Boarding', delay_known=True, delay_min=10,
+                      delay_side='dep')
+    import blueprints.aerox_data_blueprint as ADB
+    # Live-Fix: mitten zwischen FRA und MUC, Reiseflug (kein Boden).
+    monkeypatch.setattr(ADB, '_aircraft_live_pos',
+                        lambda **k: ({'lat': 49.0, 'lon': 10.5, 'track': 130.0,
+                                      'gs': 430, 'alt': 34000, 'on_ground': False},
+                                     ('FRA', 'MUC'), 'DAIXX', 'A320'))
+    with _patch_coords(), patch.object(A, '_flight_obs_merged', return_value=m):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    # Engine-Phase kanonisch am Sektor …
+    assert secs[0].get('phase') == 'AIRBORNE'
+    # … und der Legacy-`status` spiegelt sie (iOS-Board-Vokabular), NICHT 'Boarding'.
+    assert secs[0]['status'] == 'airborne'
+
+
+def test_enrich_status_engine_bogus_landing_still_rejected(monkeypatch):
+    # 100%-Gleichlaut darf die Landung-Monotonie/Plausi NICHT aufweichen: ein
+    # gerade abgeflogener 11h-Langstreckenflug (FRA→SFO), dessen Board fälschlich
+    # arr-seitig „Gelandet 13:03" trägt, darf im NUTZER-SICHTBAREN `status` NICHT
+    # als gelandet erscheinen. Die Engine gewährt board_arr-LANDED zwar strukturell
+    # (fs['phase']=LANDED — dieselbe rohe Wahrheit wie flights_live), aber der
+    # abgeleitete Legacy-`status` läuft durch DASSELBE Physik-Gate wie der Roh-
+    # Status → die unmögliche Landung wird im `status` verworfen (wie aerox_data/
+    # flights_live ihre user-facing Kategorie physik-gaten).
+    monkeypatch.setenv('FLIGHTSTATE_LIVE_FRIENDS', '1')
+    dep = _now() - timedelta(hours=1)
+    secs = [_sector(flight='LH454', frm='FRA', to='SFO', dep_iso=_iso(dep))]
+    m = _merged_sided(status_arr='Gelandet 13:03', delay_known=False,
+                      sched_arr='2026-07-13T22:00:00Z')
+    import blueprints.aerox_data_blueprint as ADB
+    monkeypatch.setattr(ADB, '_aircraft_live_pos',
+                        lambda **k: (None, None, None, None))
+    with _patch_coords(), patch.object(A, '_flight_obs_merged', return_value=m):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    # Der user-sichtbare Legacy-Status behauptet KEINE (bogus) Landung.
+    assert secs[0].get('status') != 'landed'
+    # Positiv-Kontrolle: der Physik-gegatete Roh-Status ist ebenfalls unterdrückt
+    # (kein 'Gelandet 13:03' durchgereicht) — die Landung-Plausi greift durchgängig.
+    from blueprints.leg_status_gate import is_terminal_landed
+    assert not is_terminal_landed(secs[0].get('status'))
+
+
+def test_enrich_status_raw_gated_when_flag_off():
+    # GEGENPROBE: ohne das Flag bleibt das bisherige Verhalten — der (physik-
+    # gegatete) ROHE Board-Status wird durchgereicht, KEINE Engine-Phase. Sichert
+    # die Abwärtskompatibilität + die bestehende Suite.
+    secs = [_sector(flight='LH400', frm='FRA', to='MUC')]
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=True, status='boarding',
+                                           delay_min=5, delay_side='dep')):
+        A._enrich_leg_delays(secs, TODAY)
+    assert secs[0]['status'] == 'boarding'      # roh, unverändert
+    assert 'phase' not in secs[0]               # Engine-Block lief nicht
+
+
 def test_enrich_empty_and_non_list_safe():
     assert A._enrich_leg_delays([], TODAY) == []
     assert A._enrich_leg_delays(None, TODAY) is None
