@@ -1173,3 +1173,16 @@ def test_sebastian_ohne_landung_bleibt_flying():
     r = _sebastian_resolve(now, obs)
     assert r['state'] == STATE_FLYING, r
     assert r['leg_index'] == 0, r
+
+
+def test_tibor_frisch_offblock_ist_taxi_nicht_flying():
+    # Board „Abgeflogen" (off-block) FRISCH (now 3 min nach est_dep) → rollt zur
+    # Startbahn, NICHT „Fliegt gerade"/LIVE (Owner 2026-07-13: „auf live obwohl
+    # Flieger nicht live, kein Takeoff").
+    obs = {'LH454': {'status_dep': 'Abgeflogen', 'status': 'Abgeflogen',
+                     'est_dep_iso': '2026-07-13T11:30:00Z', 'dep_delay_min': 185}}
+    r = _tibor_resolve(datetime(2026, 7, 13, 11, 33, tzinfo=timezone.utc), obs)
+    assert r['state'] != STATE_FLYING, r
+    assert r['state'] == STATE_PRE_FLIGHT, r
+    assert r['text']['title'] == 'Startet gerade', r
+    assert r.get('position') is None, r

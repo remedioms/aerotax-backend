@@ -508,6 +508,9 @@ _ENG_ARRIVED = 'ARRIVED'
 _ENG_AIRBORNE = 'AIRBORNE'
 _ENG_APPROACH = 'APPROACH'
 _ENG_TAXI_OUT = 'TAXI_OUT'
+# Plausible Taxi-Zeit (off-block → Takeoff). Innerhalb → „Startet gerade"
+# (rollt, nicht airborne); danach gilt ein anhaltendes off-block als airborne.
+_TAXI_OUT_MAX_MIN = 25
 
 
 def _engine_leg_flight(leg, o, live, now, dep_ll=None, arr_ll=None,
@@ -895,6 +898,18 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                 leg['flown'] = True
                 last_flown_observed = True
                 continue
+            if b == 'departed' and now < eff_dep + _dt.timedelta(
+                    minutes=_TAXI_OUT_MAX_MIN):
+                # TAXI_OUT: Board „Abgeflogen"=off-block, FRISCH raus (bis
+                # eff_dep+~25min) → die Maschine ROLLT zur Startbahn, NICHT
+                # airborne. Darf NICHT als „Fliegt gerade"/LIVE erscheinen
+                # (Owner 2026-07-13: „auf live obwohl Flieger nicht live, kein
+                # Takeoff"). Eigener Taxi-Zustand, state=pre_flight → keine
+                # Live-Flieger-Karte, keine Position. Länger off-block als eine
+                # plausible Taxi-Zeit → er ist abgeflogen (airborne) → flying
+                # (auch ohne eigene Position — 1h off-block IST unterwegs).
+                picked = ('taxiing', idx, CONF_OBSERVED)
+                break
             picked = ('flying', idx, CONF_OBSERVED)
             break
         # Engine sah kein hartes Flug-Signal (BOARDING/SCHEDULED/UNKNOWN). Der
@@ -1009,6 +1024,14 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         return _result(STATE_FLYING, leg=leg, idx=idx,
                        position=_position(leg), title='Fliegt gerade',
                        subtitle=sub, confidence=conf)
+
+    if kind == 'taxiing':
+        # TAXI_OUT: off-block, rollt zur Startbahn — ehrlich, kein „Fliegt gerade",
+        # keine Live-Position (state=pre_flight → keine Live-Flieger-Karte).
+        route = f"{leg['dep_ap']} → {leg['arr_ap'] or '?'}"
+        return _result(STATE_PRE_FLIGHT, leg=leg, idx=idx,
+                       title='Startet gerade',
+                       subtitle=f'{route} · Rollt zum Start', confidence=conf)
 
     if kind == 'cancelled':
         here = leg['dep_ap']
