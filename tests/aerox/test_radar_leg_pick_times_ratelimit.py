@@ -408,6 +408,89 @@ def test_ax_radar_enrich_forwards_arr_delay_when_no_est(client, monkeypatch):
     assert 'est_arr' not in entry            # ehrlich: keine erfundene Uhrzeit
 
 
+def _enrich_sb(flights_rows, arr_rows=None):
+    class _Q:
+        def __init__(self, data): self._data = data
+        def select(self, *a, **k): return self
+        def in_(self, *a, **k): return self
+        def gte(self, *a, **k): return self
+        def order(self, *a, **k): return self
+        def limit(self, n): return self
+        def execute(self):
+            return types.SimpleNamespace(data=self._data)
+
+    class _SB:
+        def table(self, name):
+            return _Q(flights_rows if name == 'flights' else (arr_rows or []))
+    return _SB()
+
+
+def test_ax_radar_enrich_drops_stale_rotation_tail_hex_mismatch(client, monkeypatch):
+    """Stale-Rotations-Falle (2026-07-14, D-AIZD hex 3c6744): eine flights-Row
+    trägt den abgefragten hex, aber den Tail einer VORTAGES-Rotation (DAIZC,
+    dessen echter hex 3c6743 ist). Der Callout klebte so LH1212/GVA auf
+    D-AIZD statt LH1346/WAW. Löst der Row-Tail auf einen ANDEREN echten hex
+    auf → Row verwerfen (nicht anheften)."""
+    monkeypatch.setattr(axd, '_ax_rate_limited', lambda *a, **k: False)
+    _dep_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    flights_rows = [{'hex': '3c6744', 'op_flight_no': 'LH1212',
+                     'origin': 'FRA', 'destination': 'GVA',
+                     'gate': 'A32', 'status': 'Boarding', 'tail': 'DAIZC',
+                     'sched_dep': _dep_iso, 'est_dep': _dep_iso,
+                     'sched_arr': None, 'est_arr': None}]
+    monkeypatch.setattr(axd, '_sb', lambda: _enrich_sb(flights_rows))
+    # DAIZC → echter hex 3c6743 (≠ abgefragter 3c6744).
+    import blueprints.adsb_blueprint as _adsb
+    monkeypatch.setattr(_adsb, '_baked_hex_for_reg',
+                        lambda reg: '3c6743' if (reg or '').upper() == 'DAIZC' else None)
+    r = client.post('/api/ax/radar-enrich', json={'hexes': ['3c6744']})
+    assert r.status_code == 200
+    body = r.get_json()
+    # Kein LH1212/GVA-Eintrag auf D-AIZDs hex — der Tap-Resolver liefert
+    # danach das korrekte LH1346/WAW.
+    assert body['routes'].get('3c6744') is None
+    assert body['count'] == 0
+
+
+def test_ax_radar_enrich_keeps_matching_tail_hex(client, monkeypatch):
+    """Fail-CLOSED-Gegenprobe: stimmt der Tail-hex mit dem abgefragten hex
+    überein, bleibt die Row (der Normalfall darf NIE fallen)."""
+    monkeypatch.setattr(axd, '_ax_rate_limited', lambda *a, **k: False)
+    _dep_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    flights_rows = [{'hex': '3c6744', 'op_flight_no': 'LH1346',
+                     'origin': 'FRA', 'destination': 'WAW',
+                     'gate': 'A17', 'status': 'Boarding', 'tail': 'DAIZD',
+                     'sched_dep': _dep_iso, 'est_dep': _dep_iso,
+                     'sched_arr': _dep_iso, 'est_arr': _dep_iso}]
+    monkeypatch.setattr(axd, '_sb', lambda: _enrich_sb(flights_rows))
+    import blueprints.adsb_blueprint as _adsb
+    monkeypatch.setattr(_adsb, '_baked_hex_for_reg',
+                        lambda reg: '3c6744' if (reg or '').upper() == 'DAIZD' else None)
+    body = client.post('/api/ax/radar-enrich',
+                       json={'hexes': ['3c6744']}).get_json()
+    entry = body['routes'].get('3c6744')
+    assert entry is not None
+    assert entry['flight_no'] == 'LH1346' and entry['dst'] == 'WAW'
+
+
+def test_ax_radar_enrich_keeps_row_when_tail_hex_unknown(client, monkeypatch):
+    """Fail-OPEN: kennt die Referenz-DB den Tail-hex nicht (None), bleibt die
+    Row — eine Referenz-Lücke darf keine echte Route verlieren."""
+    monkeypatch.setattr(axd, '_ax_rate_limited', lambda *a, **k: False)
+    _dep_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    flights_rows = [{'hex': 'abc123', 'op_flight_no': 'XY99',
+                     'origin': 'FRA', 'destination': 'JFK',
+                     'gate': 'B12', 'status': 'Boarding', 'tail': 'N123ZZ',
+                     'sched_dep': _dep_iso, 'est_dep': _dep_iso,
+                     'sched_arr': _dep_iso, 'est_arr': _dep_iso}]
+    monkeypatch.setattr(axd, '_sb', lambda: _enrich_sb(flights_rows))
+    import blueprints.adsb_blueprint as _adsb
+    monkeypatch.setattr(_adsb, '_baked_hex_for_reg', lambda reg: None)
+    body = client.post('/api/ax/radar-enrich',
+                       json={'hexes': ['abc123']}).get_json()
+    assert body['routes'].get('abc123') is not None
+
+
 def test_rate_limit_wired_through_adsb_pattern(client, monkeypatch):
     """_ax_rate_limited delegiert an das adsb_blueprint-Muster (per-IP) mit dem
     richtigen Endpoint-Bucket — via Stub-Modul, ohne app.py zu booten."""

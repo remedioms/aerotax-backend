@@ -3056,6 +3056,31 @@ def ax_radar_enrich():
                 except (TypeError, ValueError):
                     continue
                 if now - 3 * 3600 <= dep_ts <= now + 4 * 3600:
+                    # STALE-ROTATION-GUARD (2026-07-14, D-AIZD/LH1346 vs
+                    # LH1212): eine `flights`-Row bindet ein Leg an
+                    # (hex, tail). Nach einem Aircraft-Swap kann eine gestrige
+                    # Row denselben hex mit dem Tail der VORTAGES-Rotation
+                    # tragen (D-AIZD/hex 3c6744 flog gestern LH1212 mit Tail
+                    # DAIZC → heute ist LH1212 = DAIZC, D-AIZD fliegt LH1346).
+                    # Der dep-Fenster-Filter fängt das nicht (die Soll-Zeit
+                    # liegt noch im Fenster) → der Callout klebte LH1212/GVA auf
+                    # D-AIZD statt LH1346/WAW (Radar ≠ Suche/callsign-Resolver).
+                    # Der Tail↔Hex-Bund ist über Referenz-DB physisch stabil:
+                    # löst der Row-Tail auf einen ANDEREN echten Hex auf als den
+                    # abgefragten, gehört das Leg NICHT zu dieser Maschine →
+                    # verwerfen. Fail-open: Tail leer / Hex unbekannt / gleicher
+                    # Hex → durchlassen (nie eine echte Row wegen Referenz-Lücke
+                    # verlieren). In-Process/kein Netz (_baked_hex_for_reg).
+                    _tail = re.sub(r'[^A-Z0-9]', '',
+                                   (f.get('tail') or '').upper()) or None
+                    if _tail:
+                        try:
+                            from blueprints.adsb_blueprint import _baked_hex_for_reg
+                            _tail_hex = _baked_hex_for_reg(_tail)
+                        except Exception:
+                            _tail_hex = None
+                        if _tail_hex and _tail_hex.lower() != hx:
+                            continue        # Vortages-Rotation → nicht anheften
                     entry = {'flight_no': f.get('op_flight_no'),
                              'src': f.get('origin'), 'dst': f.get('destination'),
                              'gate': f.get('gate'), 'status': f.get('status'),
