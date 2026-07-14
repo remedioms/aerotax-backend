@@ -179,6 +179,51 @@ def test_enrich_fills_fresh_facts(monkeypatch):
     assert out['status_category'] == 'arrived'
 
 
+# ─── Free/Paid-Zeiten-Memo: Kostenmodus ist Teil der Wahrheit ─────────────
+
+def test_free_only_miss_does_not_suppress_later_paid_lookup(monkeypatch):
+    """Ein free-only Miss des Detail-Aggregats darf den anschliessenden
+    Standalone-Aufruf mit allow_paid=True nicht fuenf Minuten lang blockieren."""
+    paid_calls = []
+    monkeypatch.setattr(axd, '_grpc_times_free', lambda *a, **k: None)
+
+    def _paid(*args, **kwargs):
+        paid_calls.append((args, kwargs))
+        return {'sched_dep': '2026-07-14T12:00:00',
+                'sched_arr': '2026-07-14T13:00:00'}
+
+    monkeypatch.setattr(axd, '_fr24_flight_by_number', _paid)
+
+    free = axd._flight_times_free_first(
+        'LH146', '2026-07-14', 'FRA', 'NUE', allow_paid=False)
+    paid = axd._flight_times_free_first(
+        'LH146', '2026-07-14', 'FRA', 'NUE', allow_paid=True)
+
+    assert free == {}
+    assert paid['sched_dep'] == '2026-07-14T12:00:00'
+    assert len(paid_calls) == 1
+    assert ('LH146', '2026-07-14', False) in axd._FREE_TIMES_MEMO
+    assert ('LH146', '2026-07-14', True) in axd._FREE_TIMES_MEMO
+
+
+def test_paid_memo_does_not_leak_into_free_only_lookup(monkeypatch):
+    """Der umgekehrte Aufruf bleibt ebenfalls getrennt: free-only gibt nicht
+    still Daten aus dem paid Memo zurueck."""
+    monkeypatch.setattr(axd, '_grpc_times_free', lambda *a, **k: None)
+    monkeypatch.setattr(
+        axd, '_fr24_flight_by_number',
+        lambda *a, **k: {'sched_dep': '2026-07-14T12:00:00',
+                         'sched_arr': '2026-07-14T13:00:00'})
+
+    paid = axd._flight_times_free_first(
+        'LH146', '2026-07-14', 'FRA', 'NUE', allow_paid=True)
+    free = axd._flight_times_free_first(
+        'LH146', '2026-07-14', 'FRA', 'NUE', allow_paid=False)
+
+    assert paid['sched_arr'] == '2026-07-14T13:00:00'
+    assert free == {}
+
+
 # ── FlightState-Engine → status_category (Owner 2026-07-13) ───────────────────
 # _status_category_from_facts leitet status_category NICHT mehr per roher
 # Substring-Suche ab, sondern über die EINE FlightState-Engine (obs_from_board_

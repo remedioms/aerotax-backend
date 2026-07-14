@@ -44,7 +44,11 @@ def _call_route_history(dep_store, arr_store, obs_by_date=None, days=2):
         k = (key or '').upper()
         return arr_store if k.endswith('#ARR') else dep_store
 
-    def fake_obs(date_str, airport, airline):
+    def fake_obs(date_str, airport, airline, dest_iata=None):
+        # Optimierungs-Contract: vergangene Route-History-Tage filtern bereits
+        # im Supabase-Query auf die bekannte Gegenseite (keine Hub-Vollseiten).
+        expected = 'SIN' if (airport or '').upper().endswith('#ARR') else 'FRA'
+        assert dest_iata == expected
         return obs_by_date.get(((airport or '').upper(), date_str), [])
 
     with patch.object(A, '_airport_local_now', side_effect=_fake_local_now), \

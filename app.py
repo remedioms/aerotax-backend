@@ -28649,12 +28649,14 @@ def ax_route_history(frm, to):
     def _fetch_day_rows(i):
         d_i = (base - _td(days=i)).strftime('%Y-%m-%d')
         r = (_departed_rows_from_store(store_key) if i == 0
-             else _board_rows_from_obs_for_date(d_i, store_key, None))
+             else _board_rows_from_obs_for_date(
+                 d_i, store_key, None, dest_iata=to))
         ar = []
         if arr_key:
             try:
                 ar = (_departed_rows_from_store(arr_key) if i == 0
-                      else _board_rows_from_obs_for_date(d_i, arr_key, None))
+                      else _board_rows_from_obs_for_date(
+                          d_i, arr_key, None, dest_iata=frm))
             except Exception:
                 ar = []
         return i, (r, ar)
@@ -33177,7 +33179,7 @@ def _punctuality_stats(flights, airport='FRA', airline=None):
             'scheduled_total': scheduled_total}
 
 
-def _delay_obs_rows_for_date(date_str, airport='FRA'):
+def _delay_obs_rows_for_date(date_str, airport='FRA', dest_iata=None):
     """Liest ALLE persistierten Delay-Beobachtungen eines BELIEBIGEN (auch
     vergangenen) Betriebstags direkt aus airport_delay_obs — OHNE den
     In-Memory-Store (_delay_store) zu beruehren. Der Store haelt nur den heutigen
@@ -33187,14 +33189,20 @@ def _delay_obs_rows_for_date(date_str, airport='FRA'):
     if not SB_AVAILABLE or sb is None or not date_str:
         return []
     airport = (airport or 'FRA').upper()
+    dest_iata = (dest_iata or '').upper().strip() or None
     out = []
     try:
         offset = 0
         page = 1000
         while True:
-            r = (sb.table('airport_delay_obs').select('*')
-                 .eq('date', date_str).eq('airport', airport)
-                 .range(offset, offset + page - 1).execute())
+            q = (sb.table('airport_delay_obs').select('*')
+                 .eq('date', date_str).eq('airport', airport))
+            # Route-History kennt die Gegenseite bereits. Serverseitig filtern,
+            # BEVOR paginiert wird, statt fuer grosse Hub-Tage alle 1000er-Seiten
+            # zu laden und danach fast alles lokal wegzuwerfen.
+            if dest_iata:
+                q = q.eq('dest_iata', dest_iata)
+            r = q.range(offset, offset + page - 1).execute()
             rows = r.data or []
             out.extend(rows)
             if len(rows) < page:
@@ -33208,7 +33216,8 @@ def _delay_obs_rows_for_date(date_str, airport='FRA'):
     return out
 
 
-def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None):
+def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None,
+                                  dest_iata=None):
     """Tafel-Zeilen eines BELIEBIGEN (auch vergangenen) Betriebstags aus den
     persistierten Beobachtungen (airport_delay_obs) rekonstruieren — für die
     iOS-Tafel „zurück in der Zeit" (#24: Tafeln pro Airport speichern → Historie).
@@ -33220,7 +33229,7 @@ def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None):
     seit 2026-06-13 AUCH die Ankunfts-Historie. Leere Liste bei SB-down/leer →
     Caller degradiert ehrlich."""
     is_arr = (airport or '').upper().endswith('#ARR')
-    rows = _delay_obs_rows_for_date(date_str, airport)
+    rows = _delay_obs_rows_for_date(date_str, airport, dest_iata=dest_iata)
     airline = (airline or '').upper().strip()
     out = []
     for row in rows:

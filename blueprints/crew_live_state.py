@@ -74,7 +74,7 @@ _NEAR_AIRPORT_KM = 8.0         # „am Boden nahe Flughafen"-Radius (Gegencheck)
 # Legs höchstens prep/boarding). Kontrakt mit iOS (ADDITIV — alte Builds
 # ignorieren die Felder, iOS-Fallback = exakt bisheriges Verhalten):
 #   pre_phase ∈ checkin_open | commute | briefing | crewbus | security |
-#               prep | boarding   (None außerhalb von pre_flight)
+#               prep | boarding | delayed   (None außerhalb von pre_flight)
 #   pre_phase_label = fertiger deutscher Anzeige-Text (iOS zeigt 1:1).
 # Quellen je Baustein — NICHTS wird erfunden, fehlt ein Baustein wird seine
 # Phase übersprungen und die nächste Grenze gilt:

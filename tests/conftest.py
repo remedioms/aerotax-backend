@@ -46,6 +46,7 @@ _MEMO_GLOBALS = {
     '_PASSPORT_ROUTE_DUR_CACHE': None,
     '_UFLIGHT_MEMO': None,
     '_LIFECYCLE_MEMO': None,
+    '_FREE_TIMES_MEMO': None,
 }
 
 

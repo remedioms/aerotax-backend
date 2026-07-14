@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import sys
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -489,6 +489,35 @@ def test_ax_radar_enrich_keeps_row_when_tail_hex_unknown(client, monkeypatch):
     body = client.post('/api/ax/radar-enrich',
                        json={'hexes': ['abc123']}).get_json()
     assert body['routes'].get('abc123') is not None
+
+
+def test_ax_radar_enrich_replaces_stale_previous_day_arrival(client, monkeypatch):
+    """Live-Regression (2026-07-14, D-AIZD/LH1346): Route/Tail und heutiger
+    Abflug waren korrekt, aber die flights-Row trug sched_arr vom Vortag. Die
+    unmögliche Ankunft muss fallen und aus der heutigen ARR-Obs ersetzt werden."""
+    monkeypatch.setattr(axd, '_ax_rate_limited', lambda *a, **k: False)
+    now = datetime.now(timezone.utc)
+    today = now.strftime('%Y-%m-%d')
+    yesterday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+    dep_iso = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    flights_rows = [{'hex': '3c6744', 'op_flight_no': 'LH1346',
+                     'origin': 'FRA', 'destination': 'WAW',
+                     'gate': 'A17', 'status': 'Gate open', 'tail': 'DAIZD',
+                     'sched_dep': dep_iso, 'est_dep': dep_iso,
+                     'sched_arr': yesterday + 'T09:00:00+02:00',
+                     'est_arr': None}]
+    arr_rows = [{'airport': 'WAW#ARR', 'flight': 'LH1346', 'sched': '09:00',
+                 'esti': None, 'max_delay_min': 0, 'date': today}]
+    monkeypatch.setattr(axd, '_sb', lambda: _enrich_sb(flights_rows, arr_rows))
+    import blueprints.adsb_blueprint as _adsb
+    monkeypatch.setattr(_adsb, '_baked_hex_for_reg', lambda reg: '3c6744')
+
+    body = client.post('/api/ax/radar-enrich',
+                       json={'hexes': ['3c6744']}).get_json()
+    entry = body['routes']['3c6744']
+    assert entry['flight_no'] == 'LH1346' and entry['dst'] == 'WAW'
+    assert entry['sched_arr'].startswith(today + 'T09:00:00')
+    assert yesterday not in entry['sched_arr']
 
 
 def test_rate_limit_wired_through_adsb_pattern(client, monkeypatch):

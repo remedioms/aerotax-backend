@@ -106,7 +106,9 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
 - Prompt-Tuning für Claude (Wording in `parse_*_mit_ki` Funktionen)
 - Variable-Renames, Tippfehler, Kommentar-Updates
 - Nach Code-Änderungen: `git add <file> && git commit -m "..." && git push` ohne zu fragen
-- Cloud-Run-Logs ziehen, Deploys triggern (`gcloud run deploy … --source .`), Env-Vars *hinzufügen* via `--update-env-vars` (z.B. `PYTHONUNBUFFERED`)
+- Hetzner-Container-Logs lesen und bereits gebaute Images über
+  `~/aerox-oracle-prep/deploy-hetzner.sh <image-ref>` ausrollen (Health-Check +
+  Auto-Rollback)
 - `python3 -m py_compile` als Sanity-Check
 
 ### Vorher fragen (große Änderungen)
@@ -115,7 +117,7 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
 - `requirements.txt` Versions-Bumps oder neue Dependencies
 - Frontend-Code spontan ändern oder von dir nicht angefragte Edits an `~/Desktop/site/`
   (wenn der Nutzer aber explizit eine Frontend-Änderung anfragt: ohne Rückfrage ändern + `wrangler pages deploy ~/Desktop/site --project-name aerosteuer --commit-dirty=true` ausführen)
-- Cloud-Run-Env-Vars *löschen* (`--remove-env-vars`) oder existierende Werte *überschreiben* (`--set-env-vars`)
+- Hetzner-Compose-/Env-Werte löschen oder existierende Werte überschreiben
 - Stripe-Webhook / Payment-Logik
 - Datenbankschema (falls hinzukommt)
 - Branch-Operationen außer `main` (rebase, force-push, branch-deletion)
@@ -129,11 +131,11 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
 
 ## Tech-Stack
 
-- **Backend:** Flask (`app.py`, ~2100 Zeilen Single-File), gehostet auf **Google Cloud Run**
-  - Service: `aerotax-backend`, Region: `europe-west3`
-  - Build: Dockerfile (gunicorn, bindet auf `$PORT`)
-  - GitHub-Repo: `https://github.com/remedioms/aerotax-backend` → Cloud Run Continuous Deployment ab `main`
-  - (Render-Hosting entfernt — Migration auf Cloud Run abgeschlossen, „Phase B")
+- **Backend:** Flask (`app.py` + `blueprints/`), produktiv auf **Hetzner CX23**
+  - Compose-Verzeichnis auf dem Host: `/opt/aerox`
+  - Images liegen weiter in Artifact Registry (`europe-west3-docker.pkg.dev`)
+  - Ingress: `api.aerosteuer.de`; Health: `/api/health`
+  - Cloud Run ist seit 2026-07-09 abgebaut. `git push` deployt NICHT.
 - **Frontend:** statisches `index.html` in `~/Desktop/site/` (kein Build-Step, kein Repo)
   - Cloudflare Pages Projekt: `aerosteuer`
   - Account-ID: `28a9e1f1409d83cc94ef2c12db769985`
@@ -151,26 +153,26 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
   - `infer_missing_data_with_ki` (Schätzung wenn was fehlt)
   - DEPRECATED: `parse_dienstplan_mit_ki` (Flugstundenübersicht) — hart deaktiviert, nur via Forensik-Override.
 
-## Deploy-Workflow (Google Cloud Run)
+## Deploy-Workflow (Hetzner — einzige Produktionswahrheit)
 
-1. Code-Änderung → `git push origin main`
-2. Cloud Run Continuous Deployment (GitHub-Trigger) baut die Dockerfile-Revision und deployt sie (Cloud Build ~3-5 Min).
-   - Alternativ direkt: `gcloud run deploy aerotax-backend --source . --region europe-west3`
-3. Env-Vars: NUR `--update-env-vars` / `--remove-env-vars` (siehe Warnung unten), nie `--set-env-vars`.
+1. `make verify` muss grün sein.
+2. Ein eindeutiges Artifact-Registry-Image bauen, z.B.
+   `gcloud builds submit --tag europe-west3-docker.pkg.dev/aerotax-prod/cloud-run-source-deploy/aerotax-backend:<tag> .`
+3. Genau dieses Image ausrollen:
+   `~/aerox-oracle-prep/deploy-hetzner.sh <vollständige-image-ref>`.
+   Das Script pullt auf Hetzner, aktualisiert `/opt/aerox/compose.yaml`, prüft
+   `/api/health` und rollt bei Fehler automatisch zurück.
+4. Erfolg am öffentlichen Ingress und am geänderten Endpoint messen. **NIE
+   `git push` oder `gcloud run deploy` als Produktions-Deploy behandeln.**
 
-## Cloud Run env-Vars — VORSICHT
+Hetzner-Compose-/Env-Änderungen sind produktive Konfigurationsänderungen und
+brauchen vorherige Zustimmung. Der alte Cloud-Run-Incident vom 2026-05-12
+(`--set-env-vars` löschte unbeabsichtigt andere Werte) bleibt als allgemeine
+Lehre: Env-Sätze nie blind wholesale ersetzen.
 
-**WICHTIG (BUG-005 self-inflicted lessons-learned, 2026-05-12):**
+## Logs-Zugriff (Hetzner)
 
-- `gcloud run services update --set-env-vars="K=V"` **ÜBERSCHREIBT ALLE env vars** (lässt nur das gegebene Set übrig). Niemals für inkrementelle Änderungen nutzen.
-- `gcloud run services update --update-env-vars="K=V"` **merged** in das existierende Set. Das ist der sichere Default für single-var updates.
-- `gcloud run services update --remove-env-vars="K"` löscht eine einzelne Variable, lässt alle anderen.
-
-Tat sich am 2026-05-12 ein P0-Incident weil ich `--set-env-vars="_BUG_002_REDEPLOY=…"` als Force-Restart-Trick nutzte — und dabei `AEROTAX_EXECUTION_MODE=cloud_tasks` plus alle anderen `AEROTAX_*`-Werte mitlöschte. Resultat: Backend fiel in thread-mode, der Worker-Thread lief wieder, Container-Restart-Loop kam zurück. Recovery brauchte ~10 Minuten + manuelle env-restoration aus alter revision.
-
-**Force-Restart ohne env-Risiko:** `gcloud run deploy aerotax-backend --source . --region europe-west3` triggert eine neue Source-Build-Revision, ohne env-Vars anzufassen.
-
-## Logs-Zugriff (Cloud Run)
-
-`gcloud run services logs read aerotax-backend --region europe-west3 --limit 100`
-(oder Cloud-Logging-Console). Ein Abruf zum Verifizieren genügt — keine Wiederholungs-Polls.
+Host-Zugangsdaten kommen aus `~/aerox-oracle-prep/hetzner.env`; SSH-Key und
+Known-Hosts-Datei entsprechen `deploy-hetzner.sh`. Auf dem Host die Compose-
+Logs unter `/opt/aerox` lesen (`docker compose logs --tail=...`). Keine Secrets
+oder vollständigen Tokens in lokale Ausgaben kopieren.

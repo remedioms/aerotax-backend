@@ -3095,6 +3095,31 @@ def ax_radar_enrich():
                     for k in ('sched_dep', 'est_dep', 'sched_arr', 'est_arr'):
                         if f.get(k):
                             entry[k] = f.get(k)
+                    # WAREHOUSE-DATE-GUARD (Live-Fund 2026-07-14, D-AIZD/
+                    # LH1346): die aktuelle Abflug-Row konnte noch sched_arr vom
+                    # VORTAG tragen (dep 14.07, arr 13.07). Route/Tail waren
+                    # korrekt, der Radar-Callout zeigte aber eine unmögliche
+                    # Ankunft. Nur eindeutig parsebare, physikalisch unmögliche
+                    # Arrival-Zeiten verwerfen; der ARR-Obs-Fallback unten füllt
+                    # danach den aktuellen Tag. Fail-open bei naiven/unparsebaren
+                    # Werten. 36 h deckt auch echte Langstrecken/Red-Eyes ab.
+                    def _aware_epoch(v):
+                        try:
+                            dt = _dt.fromisoformat(str(v).replace('Z', '+00:00'))
+                            return dt.timestamp() if dt.tzinfo is not None else None
+                        except (TypeError, ValueError):
+                            return None
+
+                    _sd = _aware_epoch(entry.get('sched_dep'))
+                    _sa = _aware_epoch(entry.get('sched_arr'))
+                    if (_sd is not None and _sa is not None
+                            and not (_sd - 30 * 60 <= _sa <= _sd + 36 * 3600)):
+                        entry.pop('sched_arr', None)
+                    _ed = _aware_epoch(entry.get('est_dep')) or _sd
+                    _ea = _aware_epoch(entry.get('est_arr'))
+                    if (_ed is not None and _ea is not None
+                            and not (_ed - 30 * 60 <= _ea <= _ed + 36 * 3600)):
+                        entry.pop('est_arr', None)
                     out[hx] = entry
             # ANKUNFT-VERDRAHTUNG (Owner „steht die Ankunft nicht im Scraping?" —
             # DOCH): die geplante/erwartete Ankunft steht im Airport-Scrape als
@@ -3108,7 +3133,7 @@ def ax_radar_enrich():
                 missing = [(e.get('flight_no'), e.get('dst'), hx)
                            for hx, e in out.items()
                            if e.get('flight_no') and e.get('dst')
-                           and not e.get('sched_arr') and not e.get('est_arr')]
+                           and not e.get('sched_arr')]
                 if missing:
                     arr_keys = sorted({(d or '').upper() + '#ARR'
                                        for _, d, _ in missing if d})
@@ -3382,7 +3407,7 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     return facts
 
 
-_FREE_TIMES_MEMO = {}          # (flight,date) -> (times_dict_or_None, at)
+_FREE_TIMES_MEMO = {}          # (flight,date,allow_paid) -> (times_dict_or_None, at)
 _FREE_TIMES_TTL = 300          # s — Drossel: max 1 gRPC/paid pro Flug/Tag alle 5min
 
 
@@ -3448,7 +3473,12 @@ def _flight_times_free_first(flight_no, date, origin, dest,
     d = ((date or '')[:10]) or time.strftime('%Y-%m-%d', time.gmtime())
     if not fn:
         return {}
-    key = (fn, d)
+    # Der Berechtigungs-/Kostenmodus gehoert in den Key. Sonst vergiftet ein
+    # free-only Miss aus dem flight-detail-Aggregat den spaeteren Standalone-
+    # Aufruf fuer 5 Minuten (paid Backup wird trotz allow_paid=True nie
+    # versucht). Umgekehrt duerfen bereits paid ermittelte Zeiten nicht als
+    # Ergebnis eines bewusst free-only Aufrufs erscheinen.
+    key = (fn, d, bool(allow_paid))
     now = time.time()
     hit = _FREE_TIMES_MEMO.get(key)
     if hit is not None and (now - hit[1]) < _FREE_TIMES_TTL:
