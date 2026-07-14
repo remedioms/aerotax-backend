@@ -49,6 +49,8 @@ def test_classify_tokenized_no_substring_false_positives():
     assert classify_board_status("Pushback", "dep") == (TAXI_OUT, True, False)
     assert classify_board_status("off-block", "dep") == (TAXI_OUT, True, False)
     assert classify_board_status("Gate closed", "dep") == (BOARDING, False, False)
+    assert classify_board_status("Geschlossen", "dep") == (BOARDING, False, False)
+    assert classify_board_status("Gate zu", "dep") == (BOARDING, False, False)
     assert classify_board_status("baggage delivery finished", "arr") == (LANDED, True, False)
     assert classify_board_status("im Flug", "dep") == (AIRBORNE, True, True)
 

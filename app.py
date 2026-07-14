@@ -12250,6 +12250,19 @@ _FRIENDS_TODAY_MEMO = {}          # "token|datum" → (expires_monotonic, resp)
 _FRIENDS_TODAY_TTL = 90.0         # 90 s: Feed lädt sonst pro Aufruf N×M sequ. Board-Lookups
 
 
+def _friends_today_response(payload):
+    """JSON-Antwort ohne HTTP-/URLCache.
+
+    Der 90-s-Memo oben ist die EINE kontrollierte Frischegrenze. Personalisierte
+    Crew-States dürfen nicht zusätzlich in CF-/URLSession-Caches hängen bleiben:
+    sonst liefert der 60-s-iOS-Refresh weiter `pre_flight`, obwohl der Server
+    schon `flying` kennt (Basti/LH890, 2026-07-14).
+    """
+    resp = jsonify(payload)
+    resp.headers['Cache-Control'] = 'private, no-store, max-age=0'
+    return resp
+
+
 def _friend_briefing_day_sectors(fr, datum):
     """(ical_sectors, imported_at, ical_summary, ical_start_iso) des Tages
     DIREKT aus user_ical_briefings (1 gefilterter SB-Read). Der serverseitige
@@ -12441,7 +12454,7 @@ def get_friends_today(token):
     _now_m = _time.monotonic()
     _hit = _FRIENDS_TODAY_MEMO.get(_ck)
     if _hit and _hit[0] > _now_m:
-        return jsonify(_hit[1])
+        return _friends_today_response(_hit[1])
     data = _friends_load(token)
     friends = data.get('friends') or []
     out = []
@@ -13135,7 +13148,7 @@ def get_friends_today(token):
     if len(_FRIENDS_TODAY_MEMO) > 5000:
         _FRIENDS_TODAY_MEMO.clear()
     _FRIENDS_TODAY_MEMO[_ck] = (_now_m + _FRIENDS_TODAY_TTL, _resp)
-    return jsonify(_resp)
+    return _friends_today_response(_resp)
 
 
 def _flight_ops_path(token):
@@ -29226,6 +29239,11 @@ _FLIGHT_GROUNDED_STATES = {
     'scheduled', 'boarding', 'gate open', 'gate-open', 'delayed', 'estimated',
     'planmäßig', 'planmaessig', 'erwartet', 'verspätet', 'verspaetet',
     'boarding gate', 'go to gate', 'final call',
+    # FRA liefert nach Ende des Boardings häufig nur das einzelne deutsche
+    # Wort „geschlossen" (ohne „Gate"). Das ist dasselbe Ground-Signal wie
+    # „Gate closed", kein Airborne-Beweis. Ohne diesen Token fiel der Status
+    # auf die Plan-Uhr zurück und machte LH890 nach STD fälschlich „flying".
+    'geschlossen', 'gate zu',
 }
 
 

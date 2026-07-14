@@ -3399,6 +3399,19 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
         return pool[0]
 
     best_dep, best_arr = _best(dep_cands), _best(arr_cands)
+    # SIDE-DATE-ISOLIERUNG (D-AIZD/LH1346): ist mindestens EINE Seite für den
+    # angefragten Betriebstag vorhanden, darf die jeweils andere Seite NICHT aus
+    # dem Vortag ergänzt werden. Sonst wird z.B. DEP 14.07 + ARR 13.07 zu einem
+    # scheinbar vollständigen heutigen Leg samt "Landed" gemergt; uflight/Radar
+    # sehen dann keine Lücke und starten den korrekten free→paid-Fallback nie.
+    # Sind BEIDE Seiten nur vom Vortag vorhanden, bleibt der bestehende transparente
+    # stale-Fallback unten erhalten (Overnight-Kompatibilität).
+    _best_rows = [r for r in (best_dep, best_arr) if r is not None]
+    if any((r.get('date') or '')[:10] == d for r in _best_rows):
+        if best_dep is not None and (best_dep.get('date') or '')[:10] != d:
+            best_dep = None
+        if best_arr is not None and (best_arr.get('date') or '')[:10] != d:
+            best_arr = None
     facts = _obs_rows_to_facts(best_dep, best_arr)
     # Museums-Tail-Wächter (Owner 2026-07-12): das Board (Fraport-Feed) trägt
     # für manche Langstrecken-Flugnummern ausgemusterte Regs (LH781→D-ABTL).
@@ -3699,11 +3712,13 @@ def _enrich_flight_status_with_obs(flight, date=None, allow_paid=True):
         _cat = _status_category_from_facts(flight, facts)
         if _cat:
             flight['status_category'] = _cat
-    # FREE-FIRST-ZEITEN (Owner: free FR24 zuerst, paid Backup, EINE Stelle): fehlen
-    # nach den Board-Obs die Soll-Zeiten (typisch Auslandsflug — Abflughafen nicht
-    # gescraped), hol sie ZUERST gratis via FR24-gRPC-Korridor, paid nur wenn das
-    # leer bleibt. Stationslokal normalisiert. Gedrosselt/gecached (kein Hämmern).
-    if not flight.get('sched_dep') and not flight.get('sched_arr'):
+    # FREE-FIRST-ZEITEN (Owner: free FR24 zuerst, paid Backup, EINE Stelle): fehlt
+    # nach den Board-Obs auch nur EINE Soll-Seite (typisch: Abflug vorhanden, aber
+    # stale Vortages-Ankunft oben verworfen), hol die Lücke ZUERST gratis via
+    # FR24-gRPC-Korridor, paid nur wenn das Paar danach weiter unvollständig ist.
+    # Vorhandene Werte werden unten nie überschrieben. Stationslokal normalisiert,
+    # gedrosselt/gecached (kein Hämmern).
+    if not flight.get('sched_dep') or not flight.get('sched_arr'):
         _t = _flight_times_free_first(fn, d, flight.get('dep_iata'),
                                       flight.get('arr_iata'),
                                       callsign=flight.get('callsign'),
@@ -5067,8 +5082,12 @@ def ax_resolve_callsign(callsign):
     # kein BLOCKIERENDER FR24-gRPC-Nachschlag auf dem kritischen resolve-Pfad —
     # weder der direkte by-callsign-Call noch der paid-Zeiten-Backup im Enrich.
     # Der Aggregat-Pfad ist free-first (die teuren Zeiten holt iOS non-blocking);
-    # der Standalone-Endpoint (Flag NICHT gesetzt) bleibt unverändert.
+    # der Standalone-App-Endpoint (Bearer vorhanden, Flag NICHT gesetzt) darf
+    # weiter paid nachziehen; anonym bleibt auch dort spend-frei.
     _nofr24 = str(request.args.get('nofr24', '')).lower() in ('1', 'true', 'yes')
+    _authed = (request.headers.get('Authorization') or '').strip().lower() \
+        .startswith('bearer ')
+    _allow_paid = _authed and not _nofr24
     # FREE-FIRST: aktiver Flug gratis im aircraft_live (by callsign) → kein FR24.
     # BEWUSST kein Obs-Vorab-Check per abgeleiteter IATA-Nummer: die naive
     # Präfix+Suffix-Ableitung (OCN601→„4Y601") ist genau die Verwechslung, die
@@ -5076,7 +5095,7 @@ def ax_resolve_callsign(callsign):
     # gratis-falsch (kein Geister-Flieger).
     flight = _aircraft_live_flight(callsign=cs)
     src = 'aircraft_live'
-    if not flight and not _nofr24:
+    if not flight and _allow_paid:
         # Paid nur hinter dem Plausi-Gate (Airline-Präfix muss existieren).
         flight = _fr24_flight_by_callsign(cs) if _paid_prefix_plausible(cs) else None
         src = 'fr24'
@@ -5090,7 +5109,7 @@ def ax_resolve_callsign(callsign):
                     pass
         # P4: Soll/Ist-Zeiten+Gate — ?date= (z.B. vom Detail-Aggregat) durchreichen
         flight = _enrich_flight_status_with_obs(flight, date=date_q,
-                                                allow_paid=not _nofr24)
+                                                allow_paid=_allow_paid)
         return jsonify({'ok': True, 'callsign': cs, 'flight': flight,
                         'source': src})
     return jsonify({'ok': False, 'callsign': cs, 'error': 'not_found'}), 200
@@ -5115,8 +5134,12 @@ def ax_resolve_flight(flightno):
     # „Detail lädt ~7 s"): kein BLOCKIERENDER FR24-gRPC-Nachschlag auf dem kritischen
     # resolve-Pfad — weder der direkte by-number-Call noch der paid-Zeiten-Backup im
     # Enrich (lag SYNCHRON vor dem Fan-out ~5 s). Aggregat = free-first, Zeiten holt
-    # iOS non-blocking. Standalone-Endpoint (Flag NICHT gesetzt) bleibt unverändert.
+    # iOS non-blocking. Standalone-App-Endpoint (Bearer vorhanden, Flag NICHT
+    # gesetzt) darf paid nachziehen; anonym bleibt auch dort spend-frei.
     _nofr24 = str(request.args.get('nofr24', '')).lower() in ('1', 'true', 'yes')
+    _authed = (request.headers.get('Authorization') or '').strip().lower() \
+        .startswith('bearer ')
+    _allow_paid = _authed and not _nofr24
     # FREE-FIRST: aktiver Flug steht mit echtem Funknamen gratis im aircraft_live
     # (gRPC-Scraper) → kein FR24-Credit. FR24 nur wenn nicht aktiv/geharvestet.
     flight = _aircraft_live_flight(flight=fn)
@@ -5132,7 +5155,7 @@ def ax_resolve_flight(flightno):
                       'reg': _ff.get('reg'), 'aircraft': _ff.get('type'),
                       'status': _ff.get('dep_status') or '', 'status_category': ''}
             src = 'aerox_obs'
-        elif not _nofr24:
+        elif _allow_paid:
             # Paid nur hinter dem Plausi-Gate (Airline-Präfix muss existieren —
             # Fantasie-/Scan-Queries erreichen FR24 nicht, jeder Miss kostete).
             flight = (_fr24_flight_by_number(fn)
@@ -5148,7 +5171,7 @@ def ax_resolve_flight(flightno):
                     pass
         # P4: Soll/Ist-Zeiten+Gate — ?date= (z.B. vom Detail-Aggregat) durchreichen
         flight = _enrich_flight_status_with_obs(flight, date=date_q,
-                                                allow_paid=not _nofr24)
+                                                allow_paid=_allow_paid)
         return jsonify({'ok': True, 'number': fn, 'flight': flight, 'source': src})
     return jsonify({'ok': False, 'number': fn, 'error': 'not_found'}), 200
 

@@ -149,7 +149,7 @@ _REPORT_MIN_LEAD_MIN = 15      # Report <15 min vor Abflug = implausibel
 # 登机→Boarding). NICHT dabei: gate open/go to gate (Gate offen ≠ Boarding
 # gestartet). Deboarding/Ausstieg (Ankunftsseite) wird explizit ausgeschlossen.
 _BOARDING_WORDS = ('boarding', 'einsteigen', 'last call', 'final call',
-                   'gate closed', 'gate zu', 'letzter aufruf')
+                   'gate closed', 'gate zu', 'geschlossen', 'letzter aufruf')
 
 
 def _status_is_boarding(status):
@@ -334,7 +334,8 @@ _LANDED_WORDS = ('landed', 'gelandet', 'arrived', 'angekommen')
 _AIRBORNE_WORDS = ('airborne', 'in flight', 'in-flight', 'enroute', 'en route',
                    'departed', 'abgeflogen', 'unterwegs')
 _GROUNDED_WORDS = ('boarding', 'gate', 'scheduled', 'delayed', 'verspätet',
-                   'check-in', 'checkin', 'on time', 'pünktlich', 'wait')
+                   'check-in', 'checkin', 'on time', 'pünktlich', 'wait',
+                   'closed', 'geschlossen', 'gate zu')
 
 
 def _parse_iso(s):
@@ -982,7 +983,8 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         _st_low = str(o.get('status') or '').lower()
         if (_b_raw != 'grounded'
                 and eng_phase in (_ENG_SCHEDULED, _ENG_BOARDING)
-                and ('clos' in _st_low or 'gate' in _st_low
+                and ('clos' in _st_low or 'geschloss' in _st_low
+                     or 'gate' in _st_low
                      or 'boarding' in _st_low or _eng_conf == 'observed')):
             _b_raw = 'grounded'
         if _b_raw == 'grounded':

@@ -191,7 +191,7 @@ def _pin_app_module():
         sys.modules['app'] = prev
 
 
-def _call_endpoint(token='AT-GOLDEN-VIEWER-000'):
+def _call_endpoint(token='AT-GOLDEN-VIEWER-000', raw_response=False):
     """Der ECHTE Endpoint mit komplett injizierten Daten + Frozen-Clock."""
     with patch.object(_dt_mod, 'datetime', _FrozenDatetime), \
          patch.object(A, 'datetime', _FrozenDatetime), \
@@ -212,7 +212,7 @@ def _call_endpoint(token='AT-GOLDEN-VIEWER-000'):
         with A.app.test_request_context(
                 f'/api/user/friends-today/{token}?datum={DATUM}'):
             resp = A.get_friends_today(token)
-    return resp.get_json()
+    return resp if raw_response else resp.get_json()
 
 
 def _golden():
@@ -241,6 +241,14 @@ def test_friends_today_is_deterministic_across_runs():
     a = _call_endpoint()
     b = _call_endpoint()
     assert a == b, 'friends-today ist nicht deterministisch (Fund melden!)'
+
+
+def test_friends_today_disables_http_cache():
+    """Live-/personalisierter Crew-State hat ausschließlich den kontrollierten
+    90-s-Servermemo; CF/URLSession dürfen keinen zweiten Stale-Layer bilden."""
+    resp = _call_endpoint(raw_response=True)
+    cc = resp.headers.get('Cache-Control', '')
+    assert 'private' in cc and 'no-store' in cc and 'max-age=0' in cc
 
 
 def test_golden_fixture_semantics_pinned():

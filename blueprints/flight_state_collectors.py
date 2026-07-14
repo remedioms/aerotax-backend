@@ -43,10 +43,10 @@ _TAXI_PH = (("off", "block"), ("off", "blocks"), ("push", "back"))
 # matcht es 'departure …' nicht mehr.
 _DEPARTED_TOK = frozenset(("departed", "abgeflogen", "gestartet", "started",
                            "lifted", "dep"))
-_BOARDING_TOK = frozenset(("boarding", "einsteigen"))
+_BOARDING_TOK = frozenset(("boarding", "einsteigen", "geschlossen"))
 _BOARDING_PH = (("gate", "open"), ("gate", "closed"), ("gate", "closing"),
-                ("final", "call"), ("letzter", "aufruf"), ("last", "call"),
-                ("go", "to", "gate"))
+                ("gate", "zu"), ("final", "call"), ("letzter", "aufruf"),
+                ("last", "call"), ("go", "to", "gate"))
 
 
 def _tokenize(s) -> list:

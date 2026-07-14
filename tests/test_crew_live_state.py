@@ -1203,3 +1203,32 @@ def test_tibor_langes_offblock_ohne_landung_ist_flying():
     # keine erfundene Position (kein ADS-B) — die Live-Karte zeigt ehrlich keinen
     # Flieger, aber die Person ist konsistent „fliegend".
     assert r.get('position') is None, r
+
+
+def test_basti_lh890_geschlossen_bleibt_am_boden():
+    """Live-Fall 2026-07-14: FRA meldet für LH890 nur „geschlossen".
+
+    Das FR24-Live-Detail sagte zeitgleich ON_GROUND/actual departure N/A.
+    Der deutsche Board-Token muss deshalb wie „Gate closed" die Plan-Uhr
+    blockieren: keine „Wer fliegt gerade"-Karte, bis ein echter Airborne-Beweis
+    (Position/FlightState) eintrifft.
+    """
+    sectors = [{
+        'flight': 'LH890', 'from': 'FRA', 'to': 'RIX',
+        'dep_iso': '2026-07-14T08:10:00Z',
+        'arr_iso': '2026-07-14T10:20:00Z',
+    }]
+    obs = {'LH890': {
+        'status': 'geschlossen', 'status_dep': 'geschlossen',
+        'sched_dep_iso': '2026-07-14T08:10:00Z',
+        'reg': 'D-AINJ',
+    }}
+    r = resolve_crew_live_state(
+        sectors, _obs(obs), _live({}),
+        datetime(2026, 7, 14, 8, 25, tzinfo=timezone.utc),
+        homebase='FRA',
+        local_hhmm=lambda d, _ap: f'{(d.hour + 2) % 24:02d}:{d.minute:02d}')
+    assert r['state'] == STATE_PRE_FLIGHT, r
+    assert r['state'] != STATE_FLYING, r
+    assert r['text']['title'] == 'Nächster Flug · LH890 · 10:10', r
+    assert r.get('pre_phase') == 'boarding', r

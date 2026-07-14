@@ -538,7 +538,8 @@ def test_resolve_callsign_returns_true_flight(client):
     with patch.object(BP, '_aircraft_live_flight', return_value=None), \
          patch.object(BP, '_fr24_flight_by_callsign', return_value=fr), \
          patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
-        r = client.get('/api/ax/resolve-callsign/OCN601')
+        r = client.get('/api/ax/resolve-callsign/OCN601',
+                       headers={'Authorization': 'Bearer AT-test'})
     assert r.status_code == 200
     body = r.get_json()
     assert body['ok'] and body['source'] == 'fr24'
@@ -581,7 +582,8 @@ def test_resolve_flight_free_first_no_fr24_credit(client):
     with patch.object(BP, '_aircraft_live_flight', return_value=live), \
          patch.object(BP, '_flight_times_free_first', return_value={}), \
          patch.object(BP, '_fr24_flight_by_number') as mfr:
-        r = client.get('/api/ax/resolve-flight/LH1412')
+        r = client.get('/api/ax/resolve-flight/LH1412',
+                       headers={'Authorization': 'Bearer AT-test'})
     assert r.status_code == 200
     body = r.get_json()
     assert body['ok'] and body['source'] == 'aircraft_live'
@@ -601,13 +603,26 @@ def test_resolve_flight_returns_truth_with_real_callsign(client):
          patch.object(BP, '_flight_times_free_first', return_value={}), \
          patch.object(BP, '_fr24_flight_by_number', return_value=fr), \
          patch.object(A, '_crowdsource_flight_obs', return_value=True) as mcs:
-        r = client.get('/api/ax/resolve-flight/LH1412')
+        r = client.get('/api/ax/resolve-flight/LH1412',
+                       headers={'Authorization': 'Bearer AT-test'})
     assert r.status_code == 200
     body = r.get_json()
     assert body['ok'] and body['source'] == 'fr24'
     assert body['flight']['arr_iata'] == 'BEG'
     assert body['flight']['callsign'] == 'DLH8UA'
     assert mcs.called
+
+
+def test_resolve_flight_anonymous_never_reaches_paid(client):
+    """Ein anonymer Scan darf weder den direkten paid-Resolver noch den paid
+    Zeiten-Backup schalten. Die App sendet ihren Bearer auf jedem Request."""
+    import blueprints.aerox_data_blueprint as BP
+    with patch.object(BP, '_aircraft_live_flight', return_value=None), \
+         patch.object(BP, '_flight_facts_from_obs', return_value={}), \
+         patch.object(BP, '_fr24_flight_by_number') as mfr:
+        r = client.get('/api/ax/resolve-flight/LH1412')
+    assert r.status_code == 200 and r.get_json()['ok'] is False
+    mfr.assert_not_called()
 
 
 def test_resolve_flight_implausible_prefix_no_paid(client):
