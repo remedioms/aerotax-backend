@@ -3038,6 +3038,14 @@ def ax_radar_enrich():
     if sb is not None:
         try:
             from datetime import datetime as _dt
+
+            def _aware_epoch(v):
+                try:
+                    dt = _dt.fromisoformat(str(v).replace('Z', '+00:00'))
+                    return dt.timestamp() if dt.tzinfo is not None else None
+                except (TypeError, ValueError):
+                    return None
+
             yday = time.strftime('%Y-%m-%d', time.gmtime(time.time() - 86400))
             r = (sb.table('flights')
                  .select('hex,op_flight_no,origin,destination,gate,status,tail,'
@@ -3103,13 +3111,6 @@ def ax_radar_enrich():
                     # Arrival-Zeiten verwerfen; der ARR-Obs-Fallback unten füllt
                     # danach den aktuellen Tag. Fail-open bei naiven/unparsebaren
                     # Werten. 36 h deckt auch echte Langstrecken/Red-Eyes ab.
-                    def _aware_epoch(v):
-                        try:
-                            dt = _dt.fromisoformat(str(v).replace('Z', '+00:00'))
-                            return dt.timestamp() if dt.tzinfo is not None else None
-                        except (TypeError, ValueError):
-                            return None
-
                     _sd = _aware_epoch(entry.get('sched_dep'))
                     _sa = _aware_epoch(entry.get('sched_arr'))
                     if (_sd is not None and _sa is not None
@@ -3160,6 +3161,18 @@ def ax_radar_enrich():
                         # Über den geteilten Mapper (P0): normalisiert die Board-
                         # Zeiten auf ISO mit Station-Offset statt Roh-Durchreiche.
                         _fa = _obs_rows_to_facts(None, a)
+                        # Derselbe Physik-Gate gilt AUCH fuer den Fallback. Gibt es
+                        # heute noch keine Ziel-ARR-Row, darf die Query auf
+                        # [gestern, heute] nicht genau die zuvor verworfene
+                        # Vortages-Ankunft wieder einsetzen (Live-Fund D-AIZD).
+                        _dep = _aware_epoch(out[hx].get('est_dep')) \
+                            or _aware_epoch(out[hx].get('sched_dep'))
+                        _arr = _aware_epoch(_fa.get('sched_arr')) \
+                            or _aware_epoch(_fa.get('est_arr'))
+                        if (_dep is not None and _arr is not None
+                                and not (_dep - 30 * 60
+                                         <= _arr <= _dep + 36 * 3600)):
+                            continue
                         if _fa.get('sched_arr'):
                             out[hx]['sched_arr'] = _fa['sched_arr']
                         if _fa.get('est_arr'):
