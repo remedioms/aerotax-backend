@@ -28638,17 +28638,38 @@ def ax_route_history(frm, to):
             pass          # unparsebar → nicht filtern (kein Datenverlust)
         return True
 
-    for i in range(ndays):
-        d = (base - _td(days=i)).strftime('%Y-%m-%d')
-        rows = (_departed_rows_from_store(store_key) if i == 0
-                else _board_rows_from_obs_for_date(d, store_key, None))
-        arr_rows = []
+    # PARALLEL-PREFETCH (2026-07-14, Owner „Detail-Kaltstart reduzieren"): die per-Tag-
+    # Board-Reads (dep + arr) waren der Kalt-Latenz-Pol — je Tag bis zu 2 sequentielle
+    # Supabase-Reads × ndays liefen SERIELL (~6 Round-Trips bei days=3, ~2–4,6 s). Die
+    # Tage sind voneinander UNABHÄNGIG (verschiedene Datums-Buckets) → I/O parallel
+    # vorziehen, Reihenfolge über den Index rekonstruiert. Die Fetch-Fns nutzen KEINEN
+    # Flask-Kontext (reine Supabase-Reads, thread-safe wie der Friend-Roster-Fan-out
+    # app.py:~12455) → kein app_context nötig. Die Merge-/Filter-/Quoten-Logik unten
+    # bleibt BYTE-IDENTISCH — nur das Laden wird nebenläufig.
+    def _fetch_day_rows(i):
+        d_i = (base - _td(days=i)).strftime('%Y-%m-%d')
+        r = (_departed_rows_from_store(store_key) if i == 0
+             else _board_rows_from_obs_for_date(d_i, store_key, None))
+        ar = []
         if arr_key:
             try:
-                arr_rows = (_departed_rows_from_store(arr_key) if i == 0
-                            else _board_rows_from_obs_for_date(d, arr_key, None))
+                ar = (_departed_rows_from_store(arr_key) if i == 0
+                      else _board_rows_from_obs_for_date(d_i, arr_key, None))
             except Exception:
-                arr_rows = []
+                ar = []
+        return i, (r, ar)
+    _day_rows = {}
+    if ndays > 1:
+        from concurrent.futures import ThreadPoolExecutor as _RH_TPE
+        with _RH_TPE(max_workers=min(ndays, 4)) as _rh_ex:
+            for _i, _pair in _rh_ex.map(_fetch_day_rows, range(ndays)):
+                _day_rows[_i] = _pair
+    else:
+        _day_rows[0] = _fetch_day_rows(0)[1]
+
+    for i in range(ndays):
+        d = (base - _td(days=i)).strftime('%Y-%m-%d')
+        rows, arr_rows = _day_rows[i]
         if i == 0:
             rows = [r for r in (rows or [])
                     if _row_in_day_and_flown(r, d, board_ap)]
