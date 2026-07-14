@@ -1123,8 +1123,12 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
     # (est_dep > sched_dep). Ein 0-/Negativ-Delay ist „pünktlich", kein Grund
     # für den „Verspätet"-Text (Owner 2026-07-13, Basti-Fall).
     delay_known = dep_eff_min is not None and dep_eff_min > 0
-    wait_txt = (f"Wartet auf {leg['flight']} · {t}" if leg['flight'] and t
-                else (f'Wartet auf den Abflug · {t}' if t else 'Wartet auf den Abflug'))
+    # WORDING (Owner 2026-07-14): „Wartet auf …" klang, als stünde der Abflug
+    # unmittelbar bevor — „Nächster Flug · …" ist neutraler für einen Flug, der
+    # erst Stunden später geht. Wire-Contract: friends_today_golden.json +
+    # test_crew_live_state/-contract + iOS-Fixtures wurden synchron nachgezogen.
+    wait_txt = (f"Nächster Flug · {leg['flight']} · {t}" if leg['flight'] and t
+                else (f'Nächster Flug · {t}' if t else 'Nächster Flug'))
     # PRE-FLIGHT-TIMELINE (Owner 2026-07-12): feingranulare Phase aus reinen
     # Zeitvergleichen (now vs. berechnete Marken) + Boarding-Beobachtung.
     # delay_known kappt/ersetzt die hängende „Flugvorbereitung" durch den

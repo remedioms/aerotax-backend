@@ -68,7 +68,7 @@ CONTRACT_PRE_JSON = '''{
   "position": null,
   "pre_phase": "crewbus",
   "pre_phase_label": "Im Crewbus",
-  "text": {"title": "Wartet auf LH1139 · 06:50", "subtitle": "BCN → FRA · Im Crewbus"}
+  "text": {"title": "Nächster Flug · LH1139 · 06:50", "subtitle": "BCN → FRA · Im Crewbus"}
 }'''
 
 SECTORS = [

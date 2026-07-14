@@ -94,7 +94,7 @@ def test_0930_gelandet_wartet_auf_leg2():
     assert r['state'] == STATE_LANDED
     assert r['leg_index'] == 1
     assert r['text']['title'] == 'Gelandet in Frankfurt'
-    assert r['text']['subtitle'] == 'Wartet auf LH802 · 10:10'
+    assert r['text']['subtitle'] == 'Nächster Flug · LH802 · 10:10'
     assert r['current_leg']['flight_no'] == 'LH802'
     assert r['confidence'] == CONF_OBSERVED
 
@@ -113,7 +113,7 @@ def test_1245_gelandet_arn_wartet_auf_leg3():
     assert r['state'] == STATE_LANDED
     assert r['leg_index'] == 2
     assert r['text']['title'] == 'Gelandet in Stockholm'
-    assert r['text']['subtitle'] == 'Wartet auf LH803 · 13:10'
+    assert r['text']['subtitle'] == 'Nächster Flug · LH803 · 13:10'
 
 
 def test_1400_fliegt_leg3():
@@ -232,7 +232,7 @@ def test_boden_nahe_dep_schlaegt_plan_fenster():
     assert r['state'] == STATE_PRE_FLIGHT
     assert r['leg_index'] == 0
     assert r['confidence'] == CONF_OBSERVED
-    assert r['text']['title'] == 'Wartet auf LH1139 · 06:40'
+    assert r['text']['title'] == 'Nächster Flug · LH1139 · 06:40'
     # PRE-FLIGHT-KAPPUNG (Owner 2026-07-13, Basti-Fall): now 07:30 liegt 50 min
     # NACH dem (unverspäteten) Plan-Abflug 06:40 — die Tafel kennt KEINEN Delay
     # (dep_delay=None), der Live-Store zeigt nur „am Boden nahe dep". Ohne
@@ -253,7 +253,7 @@ def test_boden_nahe_arr_im_fenster_frueher_gelandet():
     r = _resolve(_utc(8, 30), live=live)
     assert r['state'] == STATE_LANDED
     assert r['leg_index'] == 1
-    assert r['text']['subtitle'] == 'Wartet auf LH802 · 10:10'
+    assert r['text']['subtitle'] == 'Nächster Flug · LH802 · 10:10'
 
 
 # ── Board-Obs: Delay & Cancelled ─────────────────────────────────────────────
@@ -272,7 +272,7 @@ def test_beobachteter_dep_delay_haelt_am_boden():
     r = _resolve(_utc(6, 50), obs={'LH1139': {'dep_delay_min': 45}})
     assert r['state'] == STATE_PRE_FLIGHT
     assert r['confidence'] == CONF_OBSERVED
-    assert r['text']['title'] == 'Wartet auf LH1139 · 07:25'
+    assert r['text']['title'] == 'Nächster Flug · LH1139 · 07:25'
 
 
 def test_cancelled_pinnt_an_den_abflughafen():
@@ -705,7 +705,7 @@ def test_pre_turnaround_zwischen_legs_nur_prep():
     r2 = _resolve(_utc(9, 45), obs=obs)
     assert r2['state'] == STATE_LANDED
     assert r2['pre_phase'] == PRE_PREP
-    assert r2['text']['subtitle'] == 'Wartet auf LH802 · 10:10'   # unverändert
+    assert r2['text']['subtitle'] == 'Nächster Flug · LH802 · 10:10'   # unverändert
 
 
 # ── Basti-Fall (Owner 2026-07-13): bekannter Delay → „Verspätet", KEINE ─────
@@ -726,7 +726,7 @@ def test_basti_bekannter_delay_zeigt_verspaetet_nicht_prep():
     assert r['pre_phase'] == PRE_DELAYED
     assert r['pre_phase_label'] == 'Verspätet'
     # Der Titel trägt die VERSPÄTETE Abflugzeit (08:20), nicht die Fahrplan-Zeit.
-    assert r['text']['title'] == 'Wartet auf LH900 · 08:20'
+    assert r['text']['title'] == 'Nächster Flug · LH900 · 08:20'
     # Der Status-Text ist ehrlich „Verspätet" + verspätete Abflugzeit — NICHT
     # „Flugvorbereitung".
     assert r['text']['subtitle'] == 'FRA → LHR · Verspätet 08:20'
@@ -1010,7 +1010,7 @@ def test_bugB_expliziter_arr_delay_unveraendert():
 
 def test_bugB_pre_flight_abflug_folgt_absolutem_est_dep():
     """Symmetrie am Abflug: absolute est_dep_iso 07:25 bei unbekanntem Delay →
-    „Wartet auf LH900 · 07:25" + Verspätet-Phase (est_dep > sched_dep)."""
+    „Nächster Flug · LH900 · 07:25" + Verspätet-Phase (est_dep > sched_dep)."""
     now = _utc(6, 50)   # vor Abflug
     obs = _obs({'LH900': {'status': 'Delayed', 'dep_delay_min': None,
                           'delay_known': False,

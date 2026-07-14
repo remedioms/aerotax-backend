@@ -113,7 +113,7 @@
         "state": "pre_flight",
         "text": {
           "subtitle": "BCN → FRA · Im Crewbus",
-          "title": "Wartet auf LH1137 · 14:25"
+          "title": "Nächster Flug · LH1137 · 14:25"
         }
       },
       "crew_state_next": null,
@@ -195,7 +195,7 @@
         "state": "pre_flight",
         "text": {
           "subtitle": "HAM → MUC · Check-in offen",
-          "title": "Wartet auf LH2071 · 08:30"
+          "title": "Nächster Flug · LH2071 · 08:30"
         }
       },
       "current_city": null,
