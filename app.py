@@ -30519,9 +30519,19 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
     # Invariante schützt auch den Ein-Seiten-/ARR-only-Fall. Fail-open, wirft nie.
     try:
         from blueprints.aerox_data_blueprint import _scrub_wrong_day_esti as _scrub
+        # WRONG-DAY-SCHUTZ MIT AUFGELÖSTEM DATUM (Owner/Fable 2026-07-16, Fix 2b):
+        # NICHT das ROHE, bare `esti_arr`/`esti_dep` in den Probe geben — bare
+        # 'HH:MM' würde _scrub mit dem ABFLUGTAG (service_date) datieren, sodass
+        # eine legitime Übernacht-Ankunft (d+1) wie „vor dem Start gelandet" aussieht
+        # und fälschlich als Fremd-Instanz gescrubbt würde (Datenverlust). Stattdessen
+        # die eine Zeile weiter oben bereits korrekt d/d+1-aufgelösten absoluten UTC-
+        # ISO (est_arr_iso/est_dep_iso via _board_local_to_utc_iso) reichen — der
+        # Übernacht-Fall ist dort schon richtig auf den Folgetag gehoben.
         _probe = {
-            'sched_dep': rec.get('sched_dep'), 'est_dep': rec.get('esti_dep'),
-            'sched_arr': rec.get('sched_arr'), 'est_arr': rec.get('esti_arr'),
+            'sched_dep': rec.get('sched_dep'),
+            'est_dep': rec.get('est_dep_iso') or rec.get('esti_dep'),
+            'sched_arr': rec.get('sched_arr'),
+            'est_arr': rec.get('est_arr_iso') or rec.get('esti_arr'),
             'dep_iata': dep, 'arr_iata': arr,
             'arr_status': rec.get('status_arr'), 'dep_status': rec.get('status_dep'),
             'arr_delay_min': rec.get('arr_delay_min'),
@@ -30691,6 +30701,25 @@ def _flights_live_obs_wrong_day(m, leg_dep_iso, arr_iata):
         if not obs_arr_iso:
             return False
         obs_arr = _dt2.fromisoformat(obs_arr_iso.replace('Z', '+00:00'))
+        # ÜBERNACHT-HEBUNG (Owner/Fable 2026-07-16, LH423 BOS→FRA d+1): eine bare
+        # 'HH:MM'-Ist-Ankunft wird oben mit dem ABFLUGTAG (m['date']) datiert. Bei
+        # einem legitimen Übernacht-Leg (dep abends, arr am nächsten Morgen) landet
+        # die so datierte obs_arr fälschlich VOR dem Abflug → das Gate würde die
+        # echte airborne-Overnight-Obs aus flights_live droppen (Datenverlust). Ist
+        # die datierte Soll-Ankunft (sched_arr) selbst >= dep (also der Plan ist ein
+        # Übernachtflug), die obs_arr aber davor, dann gehört die obs auf den Folgetag
+        # → +1 Tag heben, DANN erst vergleichen. Echter Wrong-Day (est_arr ~1 Tag vor
+        # der eigenen Soll-Ankunft) bleibt danach weiterhin < dep und wird verworfen.
+        if obs_arr < dep - _td2(minutes=_FLIGHTS_LIVE_WRONG_DAY_MARGIN_MIN):
+            sched_arr_iso = _dated(m.get('sched_arr'))
+            if sched_arr_iso:
+                try:
+                    sched_arr = _dt2.fromisoformat(
+                        sched_arr_iso.replace('Z', '+00:00'))
+                    if sched_arr >= dep and (obs_arr + _td2(days=1)) >= dep:
+                        obs_arr = obs_arr + _td2(days=1)
+                except Exception:
+                    pass
         return obs_arr < dep - _td2(minutes=_FLIGHTS_LIVE_WRONG_DAY_MARGIN_MIN)
     except Exception:
         return False
@@ -31016,6 +31045,12 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         # ical_sectors, und wenn auch die fehlt, die dep-Zeit + Großkreis/v_max (die
         # FRÜHESTE physikalisch mögliche Ankunft — konservativ, unterschätzt nie den
         # Ist-Zeitpunkt) als Plan-Ankunfts-Proxy. Cancelled-Flüge sind NIE gelandet.
+        # `_stale_forced_landed` merkt sich, dass diese Physik-Staleness-Regel den
+        # Status auf 'landed' gehoben hat — damit der FlightState-Engine-Block unten
+        # (der ohne Ankunfts-Position nur „airborne" projiziert) die überfällige
+        # Landung NICHT wieder zurückdreht (Live-vs-Test-Diskrepanz LH890: die Regel
+        # feuerte im Test, wurde live aber vom Engine-Override überschrieben).
+        _stale_forced_landed = False
         try:
             _bucket = _flight_status_bucket(_raw_status)
             _has_est_arr = bool(s.get('est_arr_iso')
@@ -31078,11 +31113,13 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 # (A) Airborne-Leiche: airborne + keine Ankunfts-Obs + überfällig.
                 if _bucket == 'airborne' and not _has_arr_obs and _overdue:
                     _raw_status = 'landed'
+                    _stale_forced_landed = True
                 # (B) Geplant-Leiche: scheduled-Bucket (oder gar kein Status),
                 #     aber Ist-Ankunft vorhanden + überfällig → gelandet.
                 elif (_bucket in ('grounded', None) and _has_est_arr
                         and _overdue):
                     _raw_status = 'landed'
+                    _stale_forced_landed = True
         except Exception:
             pass
         # Physik-Schranken-Inputs vorab binden (auch der Engine-Block unten liest
@@ -31217,7 +31254,19 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                             est_arr_iso=s.get('est_arr_iso'), dep_ts=_dep_ts,
                             dep_ll=_dep_ll, arr_ll=_arr_ll)
                         if _gated_canon is not None:
-                            s['status'] = _gated_canon
+                            # STALE-LANDUNG NICHT ZURÜCKDREHEN (Owner/Fable 2026-07-16,
+                            # LH890 FRA→RIX): hat die Physik-Staleness-Regel oben schon
+                            # 'landed' erzwungen (airborne + keine Ankunfts-Obs + Plan-
+                            # Ankunft > 6 h vorbei bzw. Geplant-Leiche mit Ist-Ankunft),
+                            # darf die Engine-Projektion — die ohne Ankunfts-Position nur
+                            # „airborne/grounded" kennt — die überfällige Landung nicht
+                            # wieder auf einen nicht-terminalen Status senken. Nur ein
+                            # ebenfalls terminaler Engine-Status (landed) darf gewinnen.
+                            _canon_bucket = _flight_status_bucket(_gated_canon)
+                            if _stale_forced_landed and _canon_bucket != 'landed':
+                                pass        # Stale-'landed' behalten
+                            else:
+                                s['status'] = _gated_canon
                 except Exception:
                     pass        # Projektion/Import-Fehler → Roh-Status bleiben lassen
         except Exception:

@@ -342,3 +342,35 @@ def test_geplant_corpse_without_est_arr_not_forced_landed(monkeypatch):
         A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'),
                              past_horizon_h=24 * 35)
     assert secs[0]['status'] != 'landed'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX B — Stale-'landed' überlebt den FlightState-Engine-Override (LH890 LIVE)
+# Live-vs-Test-Diskrepanz: die Stale-Regel feuerte in den Unit-Tests (Shadow aus),
+# wurde live aber vom Engine-Block (Shadow/LIVE_FRIENDS an) mit 'airborne' wieder
+# überschrieben, weil die Engine ohne Ankunfts-Position nur „airborne" projiziert.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_stale_landed_survives_engine_override_lh890(monkeypatch):
+    # LH890 FRA→RIX: nur dep 'Abgeflogen', keine arr-Obs, Plan-Ankunft 33 h vorbei.
+    # Mit aktivem Engine-Block (FLIGHTSTATE_LIVE_FRIENDS=1) UND einer Engine-
+    # Projektion, die (z.B. wegen stale aircraft_live-Position) 'airborne' liefert,
+    # darf die überfällige Stale-Landung NICHT auf 'airborne' zurückgedreht werden.
+    dep = _now() - timedelta(hours=33)
+    arr = _now() - timedelta(hours=31)
+    secs = [_sector(flight='LH890', frm='FRA', to='RIX',
+                    dep_iso=_iso(dep), arr_iso=_iso(arr))]
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {})
+    monkeypatch.setenv('FLIGHTSTATE_LIVE_FRIENDS', '1')
+    # Engine-Projektion hart auf 'airborne' zwingen (repliziert die Live-Situation,
+    # in der eine stale Position die Engine noch „fliegt" projizieren lässt).
+    import blueprints.flight_state as FS
+    monkeypatch.setattr(FS, 'project_friend_leg',
+                        lambda fs: {'status': 'EN_ROUTE'})
+    import blueprints.warehouse_reader as WR
+    monkeypatch.setitem(WR._ENGINE_PHASE_TO_LEGACY, 'EN_ROUTE', 'airborne')
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=False, status='Abgeflogen')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    # Ohne den FIX-B-Guard würde 'airborne' die Stale-Landung überschreiben.
+    assert secs[0]['status'] == 'landed'

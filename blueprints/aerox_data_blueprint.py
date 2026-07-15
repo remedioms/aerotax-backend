@@ -3618,6 +3618,57 @@ def _obs_rows_to_facts(dep_row, arr_row):
 # VOR dem Soll-Abflug derselben Antwort liegt, gehört physikalisch zu einem anderen
 # Tag (ein Lauf landet nie lange vor seinem eigenen Abflug). Analog
 # app._FLIGHTS_LIVE_WRONG_DAY_MARGIN_MIN / crew_live_state._WRONG_DAY_MARGIN_MIN.
+# Soll-Zeit-Toleranz (min): zwei airport_delay_obs-Rows gehören zur SELBEN Tages-
+# Instanz eines Flugs nur, wenn ihre Soll-Zeit (`sched`) höchstens so weit
+# auseinanderliegt. Weicht die `sched` einer Row stärker ab, ist es eine FREMDE
+# Instanz (Folgetags-Repoll unter falschem Datum, andere Soll-Zeit) — sie darf die
+# Basis-/Zeit-Row NICHT verdrängen und ihren Status NICHT draufmergen (Owner/Fable
+# 2026-07-16, FIX A/C: LH867/LH1126 Folgetags-Row verunreinigte den Vortag).
+_OBS_SAME_INSTANCE_SCHED_TOL_MIN = 45
+
+# Ankunfts-plausible Status-Signalwörter (kleingeschrieben, Substring). NUR diese
+# dürfen von einer ARR-Row (‹Ziel›#ARR) als Merge-Status akzeptiert werden — ein
+# abflug-typischer Status ('Boarding'/'Gate…'/'Abgeflogen') auf einer ARR-Row ist
+# Scraper-Feld-Müll (LH1126 BCN#ARR trug 'Boarding') und wird ignoriert.
+_OBS_ARR_PLAUSIBLE_STATUS = (
+    'gelandet', 'landed', 'arrived', 'angekommen', 'at gate', 'on blocks',
+    'on-blocks', 'gepäck', 'gepaeck', 'baggage', 'diverted', 'umgeleitet',
+    'cancelled', 'canceled', 'annulliert', 'gestrichen', 'delayed', 'verspätet',
+    'verspaetet', 'estimated', 'erwartet', 'approach', 'anflug', 'final',
+)
+
+
+def _obs_sched_min(row):
+    """Soll-Zeit einer Obs-Row als Minuten-seit-Mitternacht (0..1439), oder None.
+    Reine bare-'HH:MM'/ISO-Toleranz-Hilfe — vergleicht nur die Wanduhr-Minute,
+    keine TZ (beide Rows stehen in derselben Stations-Ortszeit). Wirft nie."""
+    s = (row.get('sched') or '').strip() if isinstance(row, dict) else ''
+    if not s:
+        return None
+    import re as _re2
+    m = _re2.search(r'(\d{1,2}):(\d{2})', s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    except Exception:
+        return None
+
+
+def _obs_same_instance_sched(row, ref_row):
+    """True, wenn `row` zur SELBEN Tages-Instanz wie `ref_row` gehört (Soll-Zeit
+    innerhalb _OBS_SAME_INSTANCE_SCHED_TOL_MIN). Fehlt eine der Soll-Zeiten →
+    True (fail-open: nicht als fremd verwerfen, wenn wir es nicht sicher wissen).
+    Mitternachts-Wrap (23:55 vs 00:05) wird als klein behandelt."""
+    a = _obs_sched_min(row)
+    b = _obs_sched_min(ref_row)
+    if a is None or b is None:
+        return True
+    diff = abs(a - b)
+    diff = min(diff, 1440 - diff)      # zyklisch (Mitternacht)
+    return diff <= _OBS_SAME_INSTANCE_SCHED_TOL_MIN
+
+
 _TIMES_SELF_CONSISTENCY_DEP_MARGIN_MIN = 90
 # Wie weit darf eine Ist-Ankunft VOR ihrer eigenen Soll-Ankunft liegen, bevor sie als
 # Fremd-Instanz gilt. Eine reale Verfrühung ist klein; > 6 h davor kann nur eine
@@ -3685,6 +3736,23 @@ def _scrub_wrong_day_esti(facts, service_date=None):
             dep_anchor = _times_to_abs(_dv, dep_ia, svc)
             if dep_anchor is not None:
                 break
+        # ÜBERNACHT-HEBUNG (Owner/Fable 2026-07-16, LH423 BOS→FRA d+1): eine BARE
+        # 'HH:MM'-Ist-Ankunft (ohne eigenes Datum) wird von _obs_station_dt mit `svc`
+        # (dem ABFLUGTAG) datiert. Bei einem legitimen Übernacht-Leg (Start abends,
+        # Landung am nächsten Morgen) liegt sie so fälschlich VOR dem Abflug und würde
+        # als Fremd-Instanz gescrubbt (Datenverlust). NUR wenn die Ist-Ankunft KEIN
+        # eigenes Datum trug (bare) UND der PLAN selbst ein Übernachtflug ist (absolute
+        # Soll-Ankunft sched_arr >= Abflug-Anker), heben wir sie um +1 Tag, DANN erst
+        # der Fremd-Check. WICHTIG: eine Ist-Ankunft, die ihr EIGENES Datum trug (die
+        # echte Fremd-Rotation LH423 landete belegt am Vortag, est_arr dated 15.07),
+        # wird NIE gehoben → sie bleibt weit vor Soll-Abflug/-Ankunft und wird korrekt
+        # gescrubbt (test_scrub_lh423_wrong_day_esti_arr_before_own_dep bleibt Anker).
+        _ea_dt, _ea_had_date = _obs_station_dt(est_arr, arr_ia, svc)
+        if (dep_anchor is not None and not _ea_had_date and ea < dep_anchor):
+            _sa_abs = _times_to_abs(facts.get('sched_arr'), arr_ia, svc)
+            if (_sa_abs is not None and _sa_abs >= dep_anchor
+                    and (ea + _td(days=1)) >= dep_anchor):
+                ea = ea + _td(days=1)
         if dep_anchor is not None:
             if ea < dep_anchor - _td(minutes=_TIMES_SELF_CONSISTENCY_DEP_MARGIN_MIN):
                 foreign = True
@@ -3765,7 +3833,7 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
         elif dep is None or ap == dep:
             dep_cands.append(r)
 
-    def _best(cands):
+    def _best(cands, is_arr=False):
         # (1) ANGEFRAGTES Datum bevorzugen — sonst kann eine Vortags-Beobachtung
         #     desselben täglichen Flugs eine falsche (gestrige) Ist-Zeit liefern.
         # (2) dann die INFORMATIONSREICHSTE Row wählen — NICHT blind die jüngste.
@@ -3804,15 +3872,38 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
         # keine Zeit). Nur wenn er sich unterscheidet und die Basis-Row nicht selbst
         # die jüngste ist — sonst unverändert. Kopie, um die Roh-Rows nicht zu
         # mutieren (dieselben cands werden für die ARR-Paarung wiederverwendet).
+        #
+        # INSTANZ-GATE (FIX A/C, Owner/Fable 2026-07-16): den Status NUR aus Rows
+        # DERSELBEN Tages-Instanz mergen — eine spätere Row mit stark abweichender
+        # `sched` (> 45 min) ist der Folgetags-Repoll unter falschem Datum (andere
+        # Soll-Zeit) und darf ihren Status ('Geplant'/None) NICHT beisteuern
+        # (LH867/LH1126). Für ARR-Pools zusätzlich: nur ankunfts-plausible Stati
+        # akzeptieren — ein dep-typisches 'Boarding'/'Abgeflogen' auf einer ARR-Row
+        # ist Scraper-Feld-Müll (LH1126 BCN#ARR trug 'Boarding').
         newest_status = None
         for r in pool:
             st = (r.get('status') or '').strip()
-            if st:
-                newest_status = st
-                break
+            if not st:
+                continue
+            if not _obs_same_instance_sched(r, base):
+                continue        # Fremd-Instanz (abweichende Soll-Zeit)
+            if is_arr and st.lower() not in (
+                    _OBS_ARR_PLAUSIBLE_STATUS) and not any(
+                    _t in st.lower() for _t in _OBS_ARR_PLAUSIBLE_STATUS):
+                continue        # dep-typischer Müll auf einer ARR-Row
+            newest_status = st
+            break
         if newest_status and (base.get('status') or '').strip() != newest_status:
             base = dict(base)
             base['status'] = newest_status
+        elif is_arr and (base.get('status') or '').strip() and not any(
+                _t in (base.get('status') or '').lower()
+                for _t in _OBS_ARR_PLAUSIBLE_STATUS):
+            # Die Basis-Row selbst trägt einen abflug-typischen Müll-Status auf der
+            # ARR-Seite → ehrlich entfernen (keine erfundene Ankunft, aber auch kein
+            # 'Boarding' als Ankunfts-Status durchreichen).
+            base = dict(base)
+            base['status'] = None
         return base
 
     best_dep = _best(dep_cands)
@@ -3825,12 +3916,12 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
         sondern: Ankunft nach Abflug und innerhalb 36 h. d+1 ist erlaubt.
         """
         if not cands or dep_row is None:
-            return _best(cands), False
+            return _best(cands, is_arr=True), False
         dep_ap = ((dep_row.get('airport') or '').split('#', 1)[0] or None)
         dep_dt, _ = _obs_station_dt(dep_row.get('sched'), dep_ap,
                                     dep_row.get('date'))
         if dep_dt is None:
-            return _best(cands), False
+            return _best(cands, is_arr=True), False
         viable, parsed = [], 0
         for row in cands:
             arr_ap = ((row.get('airport') or '').split('#', 1)[0] or None)
@@ -3856,19 +3947,35 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
             # gepaarten ARR-Kandidaten auf die gewählte Row legen — die aktuellste
             # Status-Meldung ohne die Ist-Zeit der esti-Row zu verlieren. cands
             # steht updated_at-desc → erster nicht-leerer Status ist der jüngste.
+            # INSTANZ-/PLAUSI-GATE (FIX A/C): nur aus DERSELBEN Instanz (sched ≤
+            # 45 min von der gewählten Row) und nur ankunfts-plausible Stati — eine
+            # Folgetags-Repoll-Row (andere Soll-Zeit) bzw. dep-typischer Müll
+            # ('Boarding') auf der ARR-Seite steuert NICHTS bei (LH1126 BCN#ARR).
             _newest = None
             for _r in cands:
                 _st = (_r.get('status') or '').strip()
-                if _st:
-                    _newest = _st
-                    break
+                if not _st:
+                    continue
+                if not _obs_same_instance_sched(_r, chosen):
+                    continue
+                if _st.lower() not in _OBS_ARR_PLAUSIBLE_STATUS and not any(
+                        _t in _st.lower() for _t in _OBS_ARR_PLAUSIBLE_STATUS):
+                    continue
+                _newest = _st
+                break
             if _newest and (chosen.get('status') or '').strip() != _newest:
                 chosen = dict(chosen)
                 chosen['status'] = _newest
+            elif (chosen.get('status') or '').strip() and not any(
+                    _t in (chosen.get('status') or '').lower()
+                    for _t in _OBS_ARR_PLAUSIBLE_STATUS):
+                # gewählte ARR-Row trägt selbst dep-Müll-Status → ehrlich entfernen.
+                chosen = dict(chosen)
+                chosen['status'] = None
             return chosen, True
         # Parsebare, aber nur VOR dem Abflug liegende Rows gehoeren zur vorigen
         # Rotation. Nicht als Fallback durchreichen.
-        return (None, False) if parsed else (_best(cands), False)
+        return (None, False) if parsed else (_best(cands, is_arr=True), False)
 
     best_arr, arr_paired = _best_arr_for_dep(arr_cands, best_dep)
     # ABFLUGTAG-PHYSIK-GATE (Owner/Fable 2026-07-15, LH423 BOS→FRA): trägt der

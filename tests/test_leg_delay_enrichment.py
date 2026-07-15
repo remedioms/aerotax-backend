@@ -833,6 +833,30 @@ def test_merged_scrubs_wrong_day_esti_arr():
     assert m['sched_dep'] == '2026-07-15T17:45:00-04:00'
 
 
+def test_merged_keeps_bare_overnight_est_arr_no_scrub():
+    # FIX D#1/2b (Owner/Fable 2026-07-16): eine legitime Übernacht-Ankunft mit BARER
+    # 'HH:MM'-Ist (est_arr) darf NICHT gescrubbt werden, nur weil sie roh mit dem
+    # Abflugtag (date_q) datiert würde. Der crew_state-Probe nutzt jetzt die bereits
+    # d/d+1-korrekt aufgelöste Zeit bzw. die Scrub-Hebung. DEP heute abend, ARR-Plan
+    # morgen früh (sched_arr d+1), Ist bare '07:50' → bleibt erhalten.
+    today = _date.today()
+    tomorrow = today + timedelta(days=1)
+    store = {
+        'BOS': [_row(flight='LH423', dest_iata='FRA',
+                     sched=today.strftime('%Y-%m-%dT18:15:00-04:00'), esti=None,
+                     delay_known=True, delay_min=0)],
+        'FRA#ARR': [_row(flight='LH423', dest_iata='BOS',
+                         sched=tomorrow.strftime('%Y-%m-%dT07:50:00+02:00'),
+                         esti='07:50',            # BARE → würde sonst falsch datiert
+                         status='airborne', delay_known=False)],
+    }
+    m = _run_merged(store, fn='LH423', dep='BOS', arr='FRA')
+    assert m is not None
+    # NICHT gescrubbt — die legitime Übernacht-Ankunft bleibt stehen.
+    assert not m.get('esti_scrubbed')
+    assert m['esti_arr'] == '07:50'
+
+
 def test_merged_keeps_consistent_delay_no_scrub():
     # Gegentest: est_arr NACH sched_arr (echte Verspätung) → kein Scrub.
     store = {
@@ -1385,6 +1409,29 @@ def test_flights_live_wrong_day_gate_fail_open_without_dep_iso():
     m = {'esti_arr': '07:44', 'date': '2026-07-15'}
     assert A._flights_live_obs_wrong_day(m, None, 'FRA') is False
     assert A._flights_live_obs_wrong_day(m, '', 'FRA') is False
+
+
+def test_flights_live_wrong_day_gate_lifts_bare_overnight_arrival():
+    """FIX D#2 (Owner/Fable 2026-07-16, LH423-Morgen): eine bare 'HH:MM'-Ist-
+    Ankunft wird mit m['date'] (Abflugtag) datiert und läge damit VOR dem Abend-
+    Abflug. Ist die Soll-Ankunft aber selbst ein Übernachtplan (sched_arr am
+    Folgetag, >= dep), gehört die bare Ist auf d+1 → NICHT als Fremd-Tag droppen."""
+    # BOS 15.07 18:15 EDT = 2026-07-15T22:15Z; Soll-Ankunft FRA 16.07 07:50 CEST.
+    m = {'esti_arr': '07:50', 'sched_arr': '2026-07-16T07:50:00+02:00',
+         'status': 'airborne', 'date': '2026-07-15'}
+    assert A._flights_live_obs_wrong_day(
+        m, '2026-07-15T22:15:00Z', 'FRA') is False
+
+
+def test_flights_live_wrong_day_gate_real_wrong_day_still_dropped_with_overnight_sched():
+    """Gegenprobe: eine ECHTE Fremd-Rotation (Ist-Ankunft ~1 Tag vor der eigenen
+    Soll-Ankunft) bleibt Fremd-Tag, auch wenn der Plan ein Übernachtflug ist — die
+    Hebung um genau +1 Tag bringt sie NICHT bis an den Abflug heran."""
+    # Ist bare '07:44' dated 14.07 (nicht 15!) → 1 Tag vor dem Plan (16.07 06:50).
+    m = {'esti_arr': '2026-07-14T07:44:00+02:00',
+         'sched_arr': '2026-07-16T06:50:00+02:00', 'date': '2026-07-14'}
+    assert A._flights_live_obs_wrong_day(
+        m, '2026-07-15T21:45:00Z', 'FRA') is True
 
 
 def _teardown_store():

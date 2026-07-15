@@ -188,8 +188,12 @@ def test_bare_repoll_row_does_not_displace_esti_row(monkeypatch):
     assert f['est_arr'] == '2026-07-14T08:56:00+02:00'
     assert f['arr_delay_min'] == 26
     assert f['dep_delay_min'] == 12
-    # Der jüngste (nackte) Status wird draufgemergt — aber die Zeit blieb.
-    assert f['arr_status'] == 'Geplant'
+    # ARR-PLAUSI-GATE (FIX C, Owner/Fable 2026-07-16): der jüngste ARR-Status
+    # 'Geplant' ist NICHT ankunfts-plausibel (ein scheduled-Repoll darf eine
+    # belegte Landung nicht zurückdrehen) → die reale 'Gepäckausgabe beendet'
+    # bleibt stehen. Die Zeit war ohnehin schon geschützt.
+    assert f['arr_status'] == 'Gepäckausgabe beendet'
+    # dep-Seite: 'Delayed' ist ein plausibler DEP-Status und wird draufgemergt.
     assert f['dep_status'] == 'Delayed'
 
 
@@ -567,6 +571,37 @@ def test_scrub_keeps_legit_overnight_next_day_arrival():
     assert f['arr_status'] == 'Gelandet'
 
 
+def test_scrub_keeps_bare_overnight_est_arr_lifted(monkeypatch):
+    """FIX D#3 (Owner/Fable 2026-07-16, LH423-Morgen): eine BARE 'HH:MM'-Ist-
+    Ankunft ('07:50') wird mit dem ABFLUGTAG (svc=15.07) datiert und läge damit
+    fälschlich VOR dem Abend-Abflug (BOS 18:15). Der Plan ist ein Übernachtflug
+    (sched_arr 16.07 07:50) → die bare Ist wird auf d+1 gehoben und NICHT
+    gescrubbt (kein Datenverlust)."""
+    f = {'dep_iata': 'BOS', 'arr_iata': 'FRA',
+         'sched_dep': '2026-07-15T18:15:00-04:00',
+         'sched_arr': '2026-07-16T07:50:00+02:00',
+         'est_arr': '07:50',            # BARE → würde sonst auf svc=15 datiert
+         'arr_status': 'Gelandet'}
+    axd._scrub_wrong_day_esti(f, service_date='2026-07-15')
+    assert not f.get('esti_scrubbed')
+    assert f['est_arr'] == '07:50'
+    assert f['arr_status'] == 'Gelandet'
+
+
+def test_scrub_still_scrubs_dated_wrong_day_despite_overnight_plan():
+    """Gegenprobe zur Hebung: eine Ist-Ankunft mit EIGENEM Datum (15.07 07:44),
+    die zur Vortages-/Fremd-Rotation gehört, wird trotz Übernacht-Plan NICHT
+    gehoben (had_date=True) und bleibt korrekt gescrubbt (test_scrub_lh423-Anker)."""
+    f = {'dep_iata': 'BOS', 'arr_iata': 'FRA',
+         'sched_dep': '2026-07-15T17:45:00-04:00',
+         'sched_arr': '2026-07-16T06:50:00+02:00',
+         'est_arr': '2026-07-15T07:44:00+02:00',   # eigenes Datum 15 → Fremd
+         'arr_status': 'Gelandet', 'arr_delay_min': -1}
+    axd._scrub_wrong_day_esti(f, service_date='2026-07-15')
+    assert f.get('esti_scrubbed') is True
+    assert 'est_arr' not in f
+
+
 def test_scrub_arrival_only_query_uses_sched_arr_bound():
     """Gegentest 'reine Ankunfts-Query ohne Abflug-Anker': fehlt sched_dep UND
     est_dep, greift nur die 6-h-vor-sched_arr-Schranke. Eine plausibel geflogene
@@ -605,3 +640,72 @@ def test_flight_facts_from_obs_applies_self_consistency(monkeypatch):
     assert not f.get('est_arr')
     assert not f.get('arr_status')
     assert not f.get('arr_delay_min')
+
+
+# ── FIX A/C: Instanz-Gate (Soll-Zeit-Abweichung) + ARR-Status-Plausibilität ──
+# (Owner/Fable 2026-07-16, LH867/LH1126: Folgetags-/Müll-Rows verunreinigen den
+# Vortag). Der Status-Merge darf NUR aus derselben Tages-Instanz kommen und auf
+# einer ARR-Row nur ankunfts-plausible Stati akzeptieren.
+
+def test_foreign_sched_repoll_status_not_merged(monkeypatch):
+    """LH867 14.07 FRA#ARR: die ECHTE Row (sched 08:30, esti 08:56, 'Gepäckausgabe
+    beendet') + eine FREMDE Folgetags-Repoll-Row (sched 08:45, andere Soll-Zeit,
+    status='Geplant', keine esti). Die Fremd-Instanz (Soll-Zeit > 45 min-... hier
+    15 min? nein 15) — nimm eine klar abweichende Soll-Zeit, um FIX A zu testen."""
+    dep = {'airport': 'OSL', 'flight': 'LH867', 'dest_iata': 'FRA',
+           'date': '2026-07-14', 'sched': '06:45', 'esti': '06:57',
+           'status': 'Departed', 'max_delay_min': 12}
+    # Fremde Instanz: Soll-Ankunft 09:50 (> 45 min von 08:30) + nackter 'Geplant'.
+    arr_foreign = {'airport': 'FRA#ARR', 'flight': 'LH867', 'dest_iata': 'OSL',
+                   'date': '2026-07-14', 'sched': '09:50', 'esti': None,
+                   'status': 'Geplant', 'max_delay_min': None}
+    arr_real = {'airport': 'FRA#ARR', 'flight': 'LH867', 'dest_iata': 'OSL',
+                'date': '2026-07-14', 'sched': '08:30', 'esti': '08:56',
+                'gate': 'A22', 'status': 'Gepäckausgabe beendet',
+                'max_delay_min': 26}
+    # updated_at-desc: fremde Repoll-Row zuerst.
+    monkeypatch.setattr(axd, '_sb',
+                        lambda: _FakeSB([arr_foreign, dep, arr_real]))
+    monkeypatch.setattr(axd, '_tail_active_guard', lambda r: True)
+    f = _flight_facts_from_obs('LH867', '2026-07-14',
+                               dep_iata='OSL', arr_iata='FRA')
+    # Ist-Ankunft bleibt (LH867 liefert est_arr=08:56).
+    assert f['est_arr'] == '2026-07-14T08:56:00+02:00'
+    # Der 'Geplant'-Status der FREMDEN Instanz wird NICHT draufgemergt.
+    assert f['arr_status'] == 'Gepäckausgabe beendet'
+
+
+def test_arr_row_dep_typical_status_scrubbed(monkeypatch):
+    """LH1126 BCN#ARR: die ARR-Row trägt dep-typischen Feld-Müll 'Boarding' —
+    kein ankunfts-plausibler Status. Er darf NICHT als Ankunfts-Status durch. Die
+    Ist-Zeit (esti) bleibt, arr_status wird ehrlich entfernt."""
+    dep = {'airport': 'FRA', 'flight': 'LH1126', 'dest_iata': 'BCN',
+           'date': '2026-07-15', 'sched': '09:50', 'esti': '10:05',
+           'status': 'Abgeflogen', 'max_delay_min': 15}
+    arr = {'airport': 'BCN#ARR', 'flight': 'LH1126', 'dest_iata': 'FRA',
+           'date': '2026-07-15', 'sched': '11:55', 'esti': '12:13',
+           'status': 'Boarding', 'max_delay_min': 18}
+    monkeypatch.setattr(axd, '_sb', lambda: _FakeSB([dep, arr]))
+    monkeypatch.setattr(axd, '_tail_active_guard', lambda r: True)
+    f = _flight_facts_from_obs('LH1126', '2026-07-15',
+                               dep_iata='FRA', arr_iata='BCN')
+    # Ist-Ankunft bleibt erhalten.
+    assert f['est_arr'] == '2026-07-15T12:13:00+02:00'
+    # 'Boarding' auf der ARR-Seite = Müll → weg (kein erfundener Ankunfts-Status).
+    assert not f.get('arr_status')
+
+
+def test_arr_row_plausible_status_kept(monkeypatch):
+    """Gegenprobe: ein ankunfts-plausibler ARR-Status ('Gelandet') läuft normal
+    durch — die Plausi-Schranke darf echte Landungen nicht verwerfen."""
+    dep = {'airport': 'FRA', 'flight': 'LH1126', 'dest_iata': 'BCN',
+           'date': '2026-07-15', 'sched': '09:50', 'esti': '10:05'}
+    arr = {'airport': 'BCN#ARR', 'flight': 'LH1126', 'dest_iata': 'FRA',
+           'date': '2026-07-15', 'sched': '11:55', 'esti': '12:13',
+           'status': 'Gelandet', 'max_delay_min': 18}
+    monkeypatch.setattr(axd, '_sb', lambda: _FakeSB([dep, arr]))
+    monkeypatch.setattr(axd, '_tail_active_guard', lambda r: True)
+    f = _flight_facts_from_obs('LH1126', '2026-07-15',
+                               dep_iata='FRA', arr_iata='BCN')
+    assert f['arr_status'] == 'Gelandet'
+    assert f['est_arr'] == '2026-07-15T12:13:00+02:00'
