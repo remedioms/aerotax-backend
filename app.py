@@ -10007,17 +10007,47 @@ def storekit_promo_offer():
     nonce = str(_uuid.uuid4()).lower()
     ts = int(datetime.now().timestamp() * 1000)
     payload = '\u2063'.join([bundle_id, key_id, product_id, offer_id, '', nonce, str(ts)])
+    # Optionaler appAccountToken (StoreKit-2 K\u00e4ufer-Zuordnung). Nur additiv in die
+    # JWS-Payload aufgenommen \u2014 die Legacy-Signatur bleibt hiervon unber\u00fchrt.
+    app_account_token = (request.args.get('appAccountToken')
+                         or request.args.get('app_account_token') or '').strip()
     try:
         from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric import ec, utils as _asym_utils
         pkey = serialization.load_pem_private_key(key_pem.encode('utf-8'), password=None)
         sig = pkey.sign(payload.encode('utf-8'), ec.ECDSA(hashes.SHA256()))
         sig_b64 = base64.b64encode(sig).decode('ascii')
+        # --- Additive JWS (ES256) Signatur nach Apple-StoreKit-2-Spec ---
+        # Compact serialization: base64url(header).base64url(payload).base64url(sig),
+        # base64url OHNE Padding; Signatur als raw R||S (64 Bytes), NICHT DER.
+        def _b64url(raw: bytes) -> str:
+            return base64.urlsafe_b64encode(raw).rstrip(b'=').decode('ascii')
+        jws_header = {'alg': 'ES256', 'kid': key_id, 'typ': 'JWT'}
+        jws_payload = {
+            'appBundleId': bundle_id,
+            'productId': product_id,
+            'offerIdentifier': offer_id,
+            'nonce': nonce,
+            'timestamp': ts,
+        }
+        if app_account_token:
+            jws_payload['appAccountToken'] = app_account_token
+        # Kompakte, deterministische JSON-Serialisierung (kein Whitespace).
+        header_seg = _b64url(json.dumps(
+            jws_header, separators=(',', ':'), ensure_ascii=False).encode('utf-8'))
+        payload_seg = _b64url(json.dumps(
+            jws_payload, separators=(',', ':'), ensure_ascii=False).encode('utf-8'))
+        signing_input = f'{header_seg}.{payload_seg}'.encode('ascii')
+        der_sig = pkey.sign(signing_input, ec.ECDSA(hashes.SHA256()))
+        r, s = _asym_utils.decode_dss_signature(der_sig)
+        raw_sig = r.to_bytes(32, 'big') + s.to_bytes(32, 'big')
+        signature_jws = f'{signing_input.decode("ascii")}.{_b64url(raw_sig)}'
     except Exception as e:
         print(f'[storekit_promo_offer] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'ok': False, 'error': 'sign_failed', 'message': 'internal_error'}), 500
     return jsonify({'ok': True, 'offer_id': offer_id, 'key_id': key_id,
-                    'nonce': nonce, 'timestamp': ts, 'signature_b64': sig_b64})
+                    'nonce': nonce, 'timestamp': ts, 'signature_b64': sig_b64,
+                    'signature_jws': signature_jws})
 
 
 @app.route('/api/user/profile/<token>', methods=['GET'])
