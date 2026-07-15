@@ -9891,6 +9891,32 @@ _PUBLIC_PROFILE_FIELDS = (
 )
 
 
+def _is_family_account(profile_or_token):
+    """Robuster, geteilter Marker: ist dieser Account ein FAMILY-Konto?
+
+    Family-Konten (Family-Watch-Feature, für immer gratis, dünner Client, kein
+    Dienstplan) bleiben in der Crew-Suche/Discovery SICHTBAR (Owner-Entscheidung
+    2026-07-16 „lass sie doch da aber deutlich als familie"), werden aber als
+    role='family' markiert und sind NICHT per Crew-Follow verbindbar (das
+    Family-Pairing läuft über einen ANDEREN Pfad: family_scoped_tokens/Pair-Code
+    in blueprints/family_watch.py, nicht über friend-requests).
+
+    Wahrheitsquelle = `account_type == 'family'` — der einzige, konsistent an
+    ALLEN Stellen (entitlement, promo-offer, search, contacts-match) genutzte
+    Marker. FAIL-OPEN by design: nur der EINDEUTIGE Marker gilt als Family;
+    bei fehlendem/unbekanntem Wert wird der Account als CREW behandelt, damit
+    keine echte Crew fälschlich aus Suche/Follow verschwindet.
+
+    Akzeptiert entweder ein bereits geladenes Profil-Dict ODER einen Token
+    (dann wird das Profil nachgeladen)."""
+    prof = profile_or_token
+    if isinstance(prof, str):
+        prof = ((_profile_load(prof) or {}).get('profile') or {})
+    if not isinstance(prof, dict):
+        return False
+    return (prof.get('account_type') or '').strip().lower() == 'family'
+
+
 def _public_profile_projection(token):
     """Lädt das volle Profil und projiziert es auf die PUBLIC-Whitelist.
     Liefert {token, profile:{nur-whitelist-felder}} — gleiche Shape wie früher,
@@ -9903,6 +9929,10 @@ def _public_profile_projection(token):
         v = prof.get(k)
         if v is not None:
             public[k] = v
+    # role='family' ADDITIV mitgeben (byte-kompatibel für alle anderen): der
+    # nächste iOS-Build leitet daraus „Familie" statt „Crew-Mitglied" ab.
+    if _is_family_account(prof):
+        public['role'] = 'family'
     return {'token': token, 'profile': public}
 
 
@@ -10335,6 +10365,12 @@ def user_search():
     searcher_token = (request.args.get('token') or '').strip()
     # exclude_family=1 → Family-Accounts ausblenden (eine Family sucht ihre CREW,
     # nicht andere Familien). „Crew" = account_type None/'crew', nie 'family'.
+    # Owner-Entscheidung 2026-07-16: Family-Konten bleiben in der Crew-Suche
+    # SICHTBAR („lass sie doch da aber deutlich als familie"). Sie werden aber
+    # als role='family' markiert (der nächste iOS-Build zeigt „Familie" statt
+    # „Crew-Mitglied" und blendet den Folgen-Button aus). Das Follow-Gate im
+    # Friend-Request-Core lehnt zusätzlich serverseitig ab (auch für alte Builds).
+    # Der `exclude_family`-Opt-in bleibt unverändert erhalten.
     exclude_family = str(request.args.get('exclude_family') or '').strip() in ('1', 'true', 'yes')
     # Mindestens ein Filter muss gesetzt sein damit das nicht zu User-Listing wird
     if len(q) < 2 and not airline and not homebase:
@@ -10386,7 +10422,7 @@ def user_search():
                 acct = (md.get('account_type') or '').strip().lower()
                 if exclude_family and acct == 'family':
                     continue
-                results.append({
+                entry = {
                     'token': target_token,
                     'name': name,
                     'airline': row.get('airline'),
@@ -10394,7 +10430,13 @@ def user_search():
                     'position': row.get('position'),
                     'avatar_url': md.get('avatar_url'),
                     'account_type': acct or 'crew',
-                })
+                }
+                # role='family' ADDITIV (byte-kompatibel für Crew: Feld fehlt):
+                # der nächste iOS-Build zeigt daraus „Familie" statt „Crew-Mitglied"
+                # und blendet den Folgen-Button aus.
+                if acct == 'family':
+                    entry['role'] = 'family'
+                results.append(entry)
                 if len(results) >= limit:
                     break
             sb_done = True
@@ -10436,7 +10478,7 @@ def user_search():
                     continue
                 if exclude_family and acct == 'family':
                     continue
-                results.append({
+                entry = {
                     'token': target_token,
                     'name': name,
                     'airline': pr.get('airline'),
@@ -10444,7 +10486,11 @@ def user_search():
                     'position': pr.get('position'),
                     'avatar_url': pr.get('avatar_url'),
                     'account_type': acct or 'crew',
-                })
+                }
+                # role='family' ADDITIV (byte-kompatibel für Crew: Feld fehlt).
+                if acct == 'family':
+                    entry['role'] = 'family'
+                results.append(entry)
                 if len(results) >= limit:
                     break
         except FileNotFoundError:
@@ -37272,6 +37318,14 @@ def _send_friend_request_core(token, target, notify=True):
     target = (target or '').strip()
     if not target or target == token:
         return jsonify({'ok': False, 'error': 'invalid_target'}), 400
+    # Follow-Gate (Owner-Entscheidung 2026-07-16): ein Crew-Follow AN ein
+    # Family-Konto ist funktionslos — Family-Pairing läuft über einen anderen
+    # Pfad (family_scoped_tokens/Pair-Code). Alte iOS-Builds zeigen den
+    # Folgen-Button noch, deshalb serverseitig ablehnen. Das Family-Pairing
+    # selbst (blueprints/family_watch.py) berührt diesen Core NICHT.
+    if _is_family_account(target):
+        return jsonify({'ok': False, 'error': 'family_account_not_followable',
+                        'message': 'Familien-Konten können nicht gefolgt werden.'}), 400
     # Rate-Limit: max 30 Friend-Requests pro Stunde (verhindert Spam)
     if _token_rate_limited(token, 'friend_req_send', limit=30, window_sec=3600):
         return jsonify({'ok': False, 'error': 'rate_limited',
