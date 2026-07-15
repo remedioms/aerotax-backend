@@ -2303,20 +2303,23 @@ def _load_crew_roster_days(crew_token, days_limit):
         except Exception:
             continue
         rf = day.get('reader_facts') or {}
+        # Nightstop = letzte Tages-Ankunft aus ical_sectors (geteilte Ableitung
+        # mit friends-today/Crew-Vergleich; Fallback = rohes reader_facts.
+        # layover_ort, das bei Multi-Leg-Turnaround-Tagen einen Vortags-Wert trug).
+        _ns = _app_attr('_feed_nightstop_ort')
+        _lay = _ns(day) if callable(_ns) else rf.get('layover_ort')
         out.append({
             'datum': d,
             'klass': day.get('klass'),
             'marker': day.get('marker'),
             'routing': day.get('routing'),
             # bewusst KEIN 'eur' — Family sieht keine Geld-Daten
-            'layover_ort': rf.get('layover_ort'),
+            'layover_ort': _lay,
             # Hübsches Tour-Label mit Städtenamen ("Frankfurt – San Francisco")
             # statt roher Token-Ketten (2026-07-03). IATA bleibt in routing/
             # layover_ort für Clients, die beides zeigen wollen.
-            'route_label': _route_label_cities(day.get('routing'),
-                                               rf.get('layover_ort')),
-            'layover_city': (_iata_city_name(rf.get('layover_ort'))
-                             if rf.get('layover_ort') else None),
+            'route_label': _route_label_cities(day.get('routing'), _lay),
+            'layover_city': (_iata_city_name(_lay) if _lay else None),
             'start_time': rf.get('start_time'),
             'end_time': rf.get('end_time'),
             # Pro-Leg-Sektoren durchreichen → Family-Sheet zeigt die echten Legs

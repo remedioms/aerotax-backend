@@ -609,7 +609,15 @@ def rebuild_overlap_edges(self_token, tage):
             if not re.match(r'^\d{4}-\d{2}-\d{2}$', datum):
                 continue
             rf = t.get('reader_facts') or {}
-            lay = (rf.get('layover_ort') or '').upper().strip() or None
+            # Nightstop = letzte Tages-Ankunft (geteilte Ableitung mit
+            # friends-today/Family); reines reader_facts.layover_ort trug bei
+            # Multi-Leg-Turnaround-Tagen einen Vortags-/Kontext-Wert. Fallback
+            # auf das rohe Feld, falls app.py (noch) nicht bindbar ist.
+            try:
+                from app import _feed_nightstop_ort as _ns
+                lay = (_ns(t) or '').upper().strip() or None
+            except Exception:
+                lay = (rf.get('layover_ort') or '').upper().strip() or None
             rt = t.get('routing')
             rt = rt.strip().upper() if isinstance(rt, str) and rt.strip() else None
             for fn in (rf.get('flight_numbers') or []):

@@ -11556,8 +11556,9 @@ def get_friends_overlap(token):
         for t in tage:
             if not isinstance(t, dict): continue
             klass = (t.get('klass') or '').upper()
-            rf = t.get('reader_facts') or {}
-            place = (rf.get('layover_ort') or '').upper().strip()
+            # Nightstop = letzte Tages-Ankunft (nicht blind reader_facts.layover_ort,
+            # das bei Multi-Leg-Turnaround-Tagen einen Vortags-/Kontext-Wert trug).
+            place = (_feed_nightstop_ort(t) or '').upper().strip()
             if klass in _CREW_DEST_LAYOVER_KLASSEN and place and len(place) == 3:
                 out[t.get('datum')] = place
         return out
@@ -11745,7 +11746,8 @@ def _user_future_layovers(token, days_ahead=60):
             continue
         klass = (t.get('klass') or '').upper()
         rf = t.get('reader_facts') or {}
-        place = (rf.get('layover_ort') or '').upper().strip()
+        # Nightstop = letzte Tages-Ankunft aus ical_sectors (Fallback layover_ort).
+        place = (_feed_nightstop_ort(t) or '').upper().strip()
         if klass not in _CREW_DEST_LAYOVER_KLASSEN or len(place) != 3:
             continue
         d = t.get('datum')
@@ -11776,7 +11778,7 @@ def _user_current_iata(token):
     for t in tage:
         if not isinstance(t, dict) or (t.get('datum') or '')[:10] != today:
             continue
-        place = ((t.get('reader_facts') or {}).get('layover_ort') or '').upper().strip()
+        place = (_feed_nightstop_ort(t) or '').upper().strip()
         if len(place) == 3 and place.isalpha():
             return place
         return None
@@ -12248,6 +12250,110 @@ def get_friends_homebases(token):
     return jsonify({'token': token, 'homebases': homebases})
 
 
+def _station_local_date(iso_utc, iata):
+    """UTC-ISO → station-lokales Datum 'YYYY-MM-DD' (via airport_tz, Fallback
+    Europe/Berlin — dieselbe Operations-TZ wie die iCal-Tages-Buckets). None bei
+    Parse-Fehler. Wirft nie."""
+    s = (iso_utc or '').strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except Exception:
+        return None
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+    except Exception:
+        _ZI = None  # type: ignore
+    tzname = None
+    try:
+        tzname = airport_tz(iata) if iata else None
+    except Exception:
+        tzname = None
+    if _ZI is not None:
+        try:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_ZI('UTC'))
+            return dt.astimezone(_ZI(tzname or 'Europe/Berlin')).strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    try:
+        return dt.strftime('%Y-%m-%d')
+    except Exception:
+        return None
+
+
+def _feed_nightstop_ort(day, homebase=None):
+    """Der Übernachtungs-/Nightstop-Ort EINES Roster-Tages für die FEED-Flächen
+    (friends-today `lay_eff`, Crew-Vergleich/Overlap-Edges, Family, Layover-Rec-
+    Discover). Vereinheitlichte Ableitung — vorher las jede Fläche `reader_facts.
+    layover_ort` blind, was bei Multi-Leg-Turnaround-Tagen (Florian 2026-07-16:
+    MUC→FCO→MUC→FCO, letzte Ankunft 15:05 FCO) fälschlich einen Vortags-/Kontext-
+    Wert (BER) trug.
+
+    REGEL: Nightstop eines Tages = Ankunfts-IATA des LETZTEN Flug-Sektors, der am
+    SELBEN (stations-lokalen) Kalendertag ankommt. Ein Red-Eye (Ankunft am
+    Folgetag) zählt NICHT als Nightstop dieses Tages.
+
+    Ableitung nur wenn belastbare `ical_sectors` da sind:
+      • sortiere nach dep_iso, nimm die Sektoren, deren arr_iso stations-lokal auf
+        `day['datum']` fällt (Red-Eye/Folgetag fällt raus),
+      • Nightstop = `to` des letzten solchen Sektors.
+    Fehlen Sektoren/arr_iso/Ziel-IATAs (leg-loser Layover-Ruhetag wie eine reine
+    LAYOVER-Zeile, SWISS-Feeds ohne arr_iso), bleibt der bisherige `reader_facts.
+    layover_ort` die Wahrheit (byte-kompatibel).
+
+    homebase (optional): landet der Tag mit seiner letzten same-day-Ankunft an der
+    HOMEBASE, ist es ein Same-Day-Turnaround ZURÜCK nach Hause → KEIN Layover.
+    Dann fällt die Funktion auf den Reader-Fallback (typisch None/leer) zurück,
+    statt die Homebase als „Übernachtungsort" zu behaupten. Die statischen Feed-
+    Flächen rufen OHNE homebase auf (sie wollen den Ziel-Ort auch bei Heimkehr);
+    die friends-today-Live-Basis ruft MIT homebase auf (dort darf ein Turnaround
+    keinen Basis-Pin erzeugen, die Live-Kaskade zeigt „unterwegs"/Position).
+    Wirft nie."""
+    rf = (day.get('reader_facts') or {}) if isinstance(day, dict) else {}
+    fallback = rf.get('layover_ort')
+    if not isinstance(day, dict):
+        return fallback
+    datum = (day.get('datum') or '')[:10]
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', datum):
+        return fallback
+    secs = day.get('ical_sectors')
+    if not isinstance(secs, list) or not secs:
+        return fallback
+    hb = (homebase or '').strip().upper() or None
+    try:
+        # nach Abflug sortieren (die Sektor-Reihenfolge ist die Flug-Reihenfolge)
+        ordered = sorted(
+            [s for s in secs if isinstance(s, dict) and s.get('arr_iso')],
+            key=lambda s: str(s.get('dep_iso') or s.get('arr_iso') or ''))
+        last_same_day = None
+        for s in ordered:
+            to = str(s.get('to') or '').strip().upper()
+            if not (len(to) == 3 and to.isalpha()):
+                continue
+            arr_date = _station_local_date(s.get('arr_iso'), to)
+            if arr_date is None:
+                # Ohne station-lokales Ankunftsdatum keine belastbare Aussage —
+                # dieser Sektor darf den Fallback nicht überschreiben.
+                continue
+            if arr_date == datum:
+                last_same_day = to
+            # arr_date > datum (Red-Eye) ⇒ überspringen; arr_date < datum kommt
+            # bei sauber sortierten Tages-Sektoren praktisch nicht vor.
+        if last_same_day:
+            # Same-Day-Turnaround zurück zur Homebase = keine Übernachtung
+            # außerhalb → Reader-Fallback (typisch None), kein Basis-Pin.
+            if hb and last_same_day == hb:
+                return fallback
+            return last_same_day
+    except Exception:
+        return fallback
+    # Keine same-day-Ankunft ableitbar (nur Red-Eye / unbekannte Ziele) →
+    # bisherige Reader-Wahrheit behalten, kein erfundener Ort.
+    return fallback
+
+
 @app.route('/api/user/friend-roster/<token>/<friend_token>', methods=['GET'])
 def get_friend_roster(token, friend_token):
     """Liefert das Roster eines Friends (Tag-Detail-Liste) für Tour-Compare.
@@ -12290,20 +12396,21 @@ def get_friend_roster(token, friend_token):
         except Exception:
             continue
         rf = day.get('reader_facts') or {}
+        # Nightstop = letzte Tages-Ankunft aus ical_sectors (Fallback: das rohe
+        # reader_facts.layover_ort, das bei Turnaround-Tagen einen Vortags-Wert trug).
+        _lay = _feed_nightstop_ort(day)
         out.append({
             'datum': d,
             'klass': day.get('klass'),
             'marker': day.get('marker'),
             'routing': day.get('routing'),
             'eur': day.get('eur'),
-            'layover_ort': rf.get('layover_ort'),
+            'layover_ort': _lay,
             # Hübsches Tour-Label mit Städtenamen (2026-07-03: Family/Friends
             # sollen NIE rohe Token-Ketten wie "FRA-SFO-FRA" sehen). IATA-Codes
             # bleiben in routing/layover_ort verfügbar.
-            'route_label': _route_label_cities(day.get('routing'),
-                                               rf.get('layover_ort')),
-            'layover_city': (_iata_city_name(rf.get('layover_ort'))
-                             if rf.get('layover_ort') else None),
+            'route_label': _route_label_cities(day.get('routing'), _lay),
+            'layover_city': (_iata_city_name(_lay) if _lay else None),
             'start_time': rf.get('start_time'),
             'end_time': rf.get('end_time'),
             # Pro-Leg-Sektoren durchreichen (User 2026-07-01: „wer Zugriff auf den
@@ -12673,7 +12780,10 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
             _live_lk,
             datetime.now(timezone.utc),
             homebase=homebase,
-            layover_iata=rf.get('layover_ort'),
+            # Geplanter Nightstop = letzte Tages-Ankunft außerhalb der Homebase
+            # (nicht blind reader_facts.layover_ort → Turnaround-Tage trugen
+            # einen Vortags-Wert; Same-Day-Heimkehr = kein Layover).
+            layover_iata=_feed_nightstop_ort(day, homebase=homebase),
             duty=duty,
             city_lookup=_iata_city_name,
             local_hhmm=build_local_hhmm(airport_tz),
@@ -12816,7 +12926,15 @@ def get_friends_today(token):
         # der Freund noch in Billund frühstückt. Nur fürs heutige Datum, nur mit
         # klarer dep_iso, und nur wenn der erste Abflug NICHT die Homebase ist
         # (an der Basis bleibt die bisherige Basis-Anzeige korrekt).
-        lay_eff = rf.get('layover_ort')
+        # BASIS: der GEPLANTE Übernachtungsort. Bevorzugt die letzte Tages-
+        # Ankunft, die als echte Übernachtung außerhalb der Homebase gilt
+        # (_feed_nightstop_ort mit Homebase-Gate) — reines reader_facts.
+        # layover_ort trug bei Multi-Leg-Turnaround-Tagen einen Vortags-/
+        # Kontext-Wert (Florian 2026-07-16: BER statt FCO). Ein Same-Day-
+        # Turnaround ZURÜCK zur Homebase bleibt korrekt ohne Layover (None) →
+        # die Live-Kaskade unten pinnt „unterwegs"/Position, kein Basis-Ort.
+        _friend_hb = (pr.get('homebase') or '').strip().upper() or None
+        lay_eff = _feed_nightstop_ort(day, homebase=_friend_hb)
         try:
             if datum == _heute_berlin:
                 secs = [s for s in (day.get('ical_sectors') or [])
@@ -13018,13 +13136,13 @@ def get_friends_today(token):
                     # Endete der Tag mit einer ECHTEN Landungs-Beobachtung,
                     # zählt deren Ziel (Board schlägt Plan). Ohne Obs (reine
                     # Plan-Annahme nach Grace) zählt der GEPLANTE Über-
-                    # nachtungsort (rf.layover_ort) — kein erfundener Ort.
-                    if not observed_end and rf.get('layover_ort'):
+                    # nachtungsort (letzte Tages-Ankunft) — kein erfundener Ort.
+                    if not observed_end and lay_eff:
                         pos = None
                 if pos:
                     lay_eff = pos
         except Exception:
-            lay_eff = rf.get('layover_ort')
+            lay_eff = _feed_nightstop_ort(day, homebase=_friend_hb)
         # Privacy-Gate: share_location=False (bool) oder =0 (legacy int) → kein city.
         share_loc_val = pr.get('share_location', True)
         share_loc = share_loc_val is not False and share_loc_val != 0
@@ -22007,8 +22125,9 @@ def discover_layover_recs(token):
         except Exception:
             continue
         if not (today <= d <= horizon): continue
-        rf = t.get('reader_facts') or {}
-        lo = (rf.get('layover_ort') or '').upper().strip()
+        # Nightstop = letzte Tages-Ankunft (nicht blind reader_facts.layover_ort,
+        # das bei Multi-Leg-Turnaround-Tagen einen Vortags-/Kontext-Wert trug).
+        lo = (_feed_nightstop_ort(t) or '').upper().strip()
         if lo and len(lo) == 3:
             upcoming_iatas.add(lo)
     out = []
