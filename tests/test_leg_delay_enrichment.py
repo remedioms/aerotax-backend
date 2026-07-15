@@ -803,6 +803,55 @@ def test_merged_memoized_second_call_no_recompute():
     assert after_second == after_first     # 2. Aufruf = Cache-Hit, kein Store-Read
 
 
+# ── Selbstkonsistenz-Invariante am _flight_obs_merged-Ausgang (LH423, 2026-07-15) ──
+# Die geteilte Schranke (_scrub_wrong_day_esti) greift auch auf dem app-Merge, der
+# flight-info direkt speist: eine Fremd-Tages-ARR-Row (est_arr weit vor dem eigenen
+# Soll-Abflug) darf ihr est_arr/status/delay nicht neben die korrekte sched_arr
+# stellen. Der DAY-BOUNDARY-GUARD greift hier NICHT (sched_arr liegt korrekt NACH
+# sched_dep — nur das esti ist vom Vortag).
+def test_merged_scrubs_wrong_day_esti_arr():
+    # DEP BOS 15.07 17:45 (dated), ARR FRA sched 16.07 06:50 (korrekt), aber
+    # esti 15.07 07:44 (Vortages-Rotation) + max_delay/Gelandet.
+    store = {
+        'BOS': [_row(flight='LH423', dest_iata='FRA',
+                     sched='2026-07-15T17:45:00-04:00', esti=None,
+                     delay_known=True, delay_min=0)],
+        'FRA#ARR': [_row(flight='LH423', dest_iata='BOS',
+                         sched='2026-07-16T06:50:00+02:00',
+                         esti='2026-07-15T07:44:00+02:00',
+                         status='Gelandet', delay_known=True, delay_min=-1)],
+    }
+    m = _run_merged(store, fn='LH423', dep='BOS', arr='FRA')
+    assert m is not None
+    assert m.get('esti_scrubbed') is True
+    # Fremd-Tages-Ist-Ankunft verworfen …
+    assert m['esti_arr'] is None
+    assert m['est_arr_iso'] is None
+    assert m['status_arr'] is None
+    # … korrekte Soll-Ankunft bleibt.
+    assert m['sched_arr'] == '2026-07-16T06:50:00+02:00'
+    assert m['sched_dep'] == '2026-07-15T17:45:00-04:00'
+
+
+def test_merged_keeps_consistent_delay_no_scrub():
+    # Gegentest: est_arr NACH sched_arr (echte Verspätung) → kein Scrub.
+    store = {
+        'FRA': [_row(flight='LH146', dest_iata='NUE',
+                     sched='2026-07-09T16:50:00+02:00',
+                     esti='2026-07-09T17:20:00+02:00',
+                     delay_known=True, delay_min=30)],
+        'NUE#ARR': [_row(flight='LH146', dest_iata='FRA',
+                         sched='2026-07-09T17:35:00+02:00',
+                         esti='2026-07-09T18:20:00+02:00',
+                         status='delayed', delay_known=True, delay_min=45)],
+    }
+    m = _run_merged(store, fn='LH146', dep='FRA', arr='NUE')
+    assert m is not None
+    assert not m.get('esti_scrubbed')
+    assert m['esti_arr'] == '2026-07-09T18:20:00+02:00'
+    assert m['status_arr'] == 'delayed'
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # get_briefings — Serve-Time-Enrichment (nur today/today+1)
 # ══════════════════════════════════════════════════════════════════════════════

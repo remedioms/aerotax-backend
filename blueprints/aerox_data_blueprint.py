@@ -3612,6 +3612,100 @@ def _obs_rows_to_facts(dep_row, arr_row):
     return facts
 
 
+# Selbstkonsistenz-Marge (min): so weit darf eine ECHTE (verfrühte) Ist-Ankunft
+# ihren EIGENEN Soll-Abflug unterschreiten, bevor sie als Fremd-Tag-Instanz gilt.
+# Legitime Verfrühungen bewegen sich in Minuten; eine Ist-Ankunft, die > diese Marge
+# VOR dem Soll-Abflug derselben Antwort liegt, gehört physikalisch zu einem anderen
+# Tag (ein Lauf landet nie lange vor seinem eigenen Abflug). Analog
+# app._FLIGHTS_LIVE_WRONG_DAY_MARGIN_MIN / crew_live_state._WRONG_DAY_MARGIN_MIN.
+_TIMES_SELF_CONSISTENCY_DEP_MARGIN_MIN = 90
+# Wie weit darf eine Ist-Ankunft VOR ihrer eigenen Soll-Ankunft liegen, bevor sie als
+# Fremd-Instanz gilt. Eine reale Verfrühung ist klein; > 6 h davor kann nur eine
+# andere Tages-Rotation sein (die Soll-Ankunft ist die vertrauenswürdige Anker-Zeit).
+_TIMES_SELF_CONSISTENCY_ARR_MARGIN_H = 6
+
+
+def _times_to_abs(v, iata, service_date=None):
+    """Board-Zeitwert (Station-Offset-ISO | naive Lokal-ISO | bare 'HH:MM') →
+    aware datetime in UTC, oder None. Bare 'HH:MM' wird mit `service_date` datiert.
+    Reine Lesehilfe für die Selbstkonsistenz-Prüfung — wirft nie."""
+    dt, _ = _obs_station_dt(v, iata, service_date)
+    if dt is None:
+        return None
+    try:
+        from datetime import timezone as _tz
+        return dt.astimezone(_tz.utc)
+    except Exception:
+        return None
+
+
+def _scrub_wrong_day_esti(facts, service_date=None):
+    """SELBSTKONSISTENZ-INVARIANTE am Merge-Ausgang der Zeiten-Kette (Owner/Fable
+    2026-07-15, LH423 BOS→FRA): eine Antwort darf sich nicht selbst widersprechen.
+
+    Liegt die absolute Ist-Ankunft (`est_arr`) mehr als 90 min VOR dem absoluten
+    Soll-ABFLUG (`sched_dep`, ersatzweise `est_dep`) DERSELBEN Antwort — oder mehr
+    als 6 h VOR der Soll-Ankunft (`sched_arr`) — dann gehört sie zu einer FREMDEN
+    Tages-Instanz (ein realer Lauf landet nie lange vor seinem eigenen Abflug). Die
+    Ist-Felder (`est_arr`/`est_dep` + daraus abgeleitete arr_status/dep_status,
+    arr_delay_min/dep_delay_min) werden dann verworfen; die Soll-Felder
+    (`sched_dep`/`sched_arr`) bleiben stehen — ehrlich, nichts erfunden. Zusätzlich
+    `esti_scrubbed`-Marker.
+
+    Vorsicht (keine legitimen Fälle killen):
+      • Übernacht-Ankunft (est_arr NACH sched_dep) — nie betroffen.
+      • Verfrühung bis 90 min vor Soll-Abflug — bleibt (Marge).
+      • Ankunfts-Airport-Query ohne dep-Seite: fehlt jeder Abflug-Anker
+        (sched_dep UND est_dep), greift nur die sched_arr-Schranke.
+    Fail-open (facts unverändert) bei fehlenden/unparsbaren Zeiten. Mutiert `facts`
+    in-place und gibt es zurück. Wirft nie.
+
+    Erwartet die von _obs_rows_to_facts erzeugten Station-Offset-ISO-Strings; die
+    dep/arr-IATA kommen aus facts['dep_iata']/['arr_iata'] (bare 'HH:MM' bekommt so
+    die richtige TZ). EINE Stelle → alle Konsumenten (flight-info, uflight, detail,
+    crew_state) erben den Scrub."""
+    try:
+        if not isinstance(facts, dict):
+            return facts
+        est_arr = facts.get('est_arr')
+        if not est_arr:
+            return facts        # kein Ist-Ankunft-Feld → nichts zu prüfen
+        from datetime import timedelta as _td
+        svc = ((service_date or facts.get('obs_date') or '')[:10]) or None
+        dep_ia = (facts.get('dep_iata') or '').upper() or None
+        arr_ia = (facts.get('arr_iata') or '').upper() or None
+        ea = _times_to_abs(est_arr, arr_ia, svc)
+        if ea is None:
+            return facts        # unparsbar → fail-open
+        foreign = False
+        # (1) Ist-Ankunft > 90 min VOR dem Soll-Abflug (bester Anker: sched_dep,
+        #     sonst est_dep). Fehlt jeder Abflug-Anker (reine ARR-Query), Schritt (2).
+        dep_anchor = None
+        for _dv in (facts.get('sched_dep'), facts.get('est_dep')):
+            dep_anchor = _times_to_abs(_dv, dep_ia, svc)
+            if dep_anchor is not None:
+                break
+        if dep_anchor is not None:
+            if ea < dep_anchor - _td(minutes=_TIMES_SELF_CONSISTENCY_DEP_MARGIN_MIN):
+                foreign = True
+        # (2) Ist-Ankunft > 6 h VOR der Soll-Ankunft — nur eine Fremd-Rotation kann
+        #     so weit vor der eigenen Plan-Ankunft liegen.
+        if not foreign and facts.get('sched_arr'):
+            sa = _times_to_abs(facts.get('sched_arr'), arr_ia, svc)
+            if sa is not None and ea < sa - _td(hours=_TIMES_SELF_CONSISTENCY_ARR_MARGIN_H):
+                foreign = True
+        if not foreign:
+            return facts
+        # Fremd-Instanz: alle Ist-abgeleiteten Felder scrubben, Soll behalten.
+        facts['esti_scrubbed'] = True
+        for _k in ('est_arr', 'est_dep', 'arr_status', 'dep_status',
+                   'arr_delay_min', 'dep_delay_min'):
+            facts.pop(_k, None)
+        return facts
+    except Exception:
+        return facts
+
+
 def _tail_active_guard(reg):
     """Museums-Tail-Wächter für Blueprint-Ausgaben (Owner 2026-07-12, LH781 →
     D-ABTL): delegiert an `app._tail_recently_active` (60-Tage-Fenster gegen
@@ -3786,6 +3880,13 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
                     and (best_arr.get('date') or '')[:10] == nday):
                 best_arr = None
     facts = _obs_rows_to_facts(best_dep, best_arr)
+    # SELBSTKONSISTENZ-INVARIANTE (Owner/Fable 2026-07-15, LH423): eine Ist-Ankunft,
+    # die vor dem eigenen Soll-Abflug/weit vor der Soll-Ankunft liegt, gehört zu
+    # einer Fremd-Tages-Instanz → Ist-Felder scrubben, Soll behalten. `dep_iata`/
+    # `arr_iata` liefert der Mapper; `service_date` (für bare 'HH:MM') = angefragter
+    # Tag `d` (die Mapper-Zeiten tragen ohnehin schon Station-Offset+Datum).
+    if facts:
+        _scrub_wrong_day_esti(facts, service_date=d)
     # Museums-Tail-Wächter (Owner 2026-07-12): das Board (Fraport-Feed) trägt
     # für manche Langstrecken-Flugnummern ausgemusterte Regs (LH781→D-ABTL).
     # reg + den nur mit ihr beobachteten Typ dann ehrlich weglassen — alle

@@ -30350,6 +30350,45 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         rec['esti_dep'] and dep) else None
     rec['est_arr_iso'] = _board_local_to_utc_iso(rec['esti_arr'], arr) if (
         rec['esti_arr'] and arr) else None
+    # SELBSTKONSISTENZ-INVARIANTE (Owner/Fable 2026-07-15, LH423 BOS→FRA): dieselbe
+    # geteilte Schranke wie am blueprint-Merge-Ausgang (_flight_facts_from_obs). Der
+    # Dual-Side-Board-Merge kann eine Fremd-Tages-ARR-Row an die heutige DEP-Seite
+    # kleben (est_arr 07:44 HEUTE neben sched_arr 06:50 MORGEN, weit vor dem eigenen
+    # Soll-Abflug). Liegt die absolute Ist-Ankunft > 90 min vor dem Soll-Abflug (oder
+    # > 6 h vor der Soll-Ankunft) → est/status/delay der Ist-Seite verwerfen, Soll
+    # behalten. Das est_*_iso wird mitgescrubbt (es leitet sich aus esti_* ab).
+    # Der DAY-BOUNDARY-GUARD oben greift nur bei ZWEI vorhandenen Seiten; diese
+    # Invariante schützt auch den Ein-Seiten-/ARR-only-Fall. Fail-open, wirft nie.
+    try:
+        from blueprints.aerox_data_blueprint import _scrub_wrong_day_esti as _scrub
+        _probe = {
+            'sched_dep': rec.get('sched_dep'), 'est_dep': rec.get('esti_dep'),
+            'sched_arr': rec.get('sched_arr'), 'est_arr': rec.get('esti_arr'),
+            'dep_iata': dep, 'arr_iata': arr,
+            'arr_status': rec.get('status_arr'), 'dep_status': rec.get('status_dep'),
+            'arr_delay_min': rec.get('arr_delay_min'),
+            'dep_delay_min': rec.get('dep_delay_min'),
+        }
+        _scrub(_probe, service_date=date_q)
+        if _probe.get('esti_scrubbed'):
+            # est_arr/-dep + alle Ist-abgeleiteten Ankunfts-Felder der Fremd-Rotation
+            # verwerfen (Soll-Felder + Route/Reg unberührt).
+            rec['esti_arr'] = _probe.get('est_arr')      # None → gescrubbt
+            rec['esti_dep'] = _probe.get('est_dep')
+            rec['est_arr_iso'] = _board_local_to_utc_iso(rec['esti_arr'], arr) if (
+                rec['esti_arr'] and arr) else None
+            rec['est_dep_iso'] = _board_local_to_utc_iso(rec['esti_dep'], dep) if (
+                rec['esti_dep'] and dep) else None
+            rec['status_arr'] = _probe.get('arr_status')
+            rec['arr_delay_min'] = _probe.get('arr_delay_min')
+            # Merged-Sicht neu ableiten: status (arr gewinnt) + best_delay/-side.
+            rec['status'] = rec.get('status_arr') or rec.get('status_dep')
+            if rec.get('delay_side') == 'arr' and rec.get('arr_delay_min') is None:
+                rec['delay_min'] = (rec.get('dep_delay_min'))
+                rec['delay_side'] = 'dep' if rec.get('dep_delay_min') is not None else 'arr'
+            rec['esti_scrubbed'] = True
+    except Exception:
+        pass
     _FLIGHT_MERGE_CACHE[ckey] = (_t.time(), dict(rec))
     _cache_soft_cap(_FLIGHT_MERGE_CACHE)
     return rec
@@ -31466,6 +31505,22 @@ def ax_flight_info(flightno):
                 out['arr_terminal'] = merged.get('terminal_arr')
             if out.get('delay_min') is None and merged.get('dep_delay_min') is not None:
                 out['delay_min'] = merged.get('dep_delay_min')
+            # SELBSTKONSISTENZ (Owner/Fable 2026-07-15, LH423): hat der Merge eine
+            # Fremd-Tages-Instanz erkannt und ihre Ist-Ankunft verworfen
+            # (`esti_scrubbed`), dann stammen auch die im Top-Block gesetzten
+            # operativen Ist-Felder (esti/status/delay_min) aus derselben Fremd-Row
+            # (ARR-only-Query ohne DEP-Seite: `o` = ebendiese Ankunft) → ehrlich
+            # leeren, damit der esti/esti_arr-Widerspruch nicht ausgeliefert wird.
+            # Nur wenn KEINE eigene Abflug-Ist-Zeit existiert (sonst wäre esti die
+            # legitime DEP-Zeit und darf bleiben). Soll/Route/Reg unberührt.
+            if (merged.get('esti_scrubbed') and not merged.get('esti_dep')):
+                out['foreign_day_arr'] = True
+                for _k in ('esti', 'status', 'delay_min'):
+                    out[_k] = None
+                out['delay_known'] = False
+                out['esti_arr'] = None
+                out['arr_status'] = None
+                out['arr_delay_min'] = None
 
     # UNIFIED FLIGHT-INFO (P5): die ANKUNFTSZEIT aus der geteilten Obs-Quelle
     # (`<Ziel>#ARR`-Row) nachziehen, falls oben nicht gesetzt — so trägt der
@@ -38191,13 +38246,42 @@ def _calendar_feed_note_refresh_failure(token, url):
         pass
 
 
+# Zeichen die beim Copy&Paste unsichtbar in URLs wandern (Zero-Width, BiDi, BOM).
+_FEED_URL_INVISIBLE = (
+    '​‌‍‎‏'
+    '‪‫‬‭‮'
+    '⁠﻿'
+)
+
+
+def _sanitize_feed_url(raw):
+    """Entfernt ALLE Whitespace-/unsichtbaren Zeichen aus einer Feed-URL —
+    nicht nur an den Enden. Defensiv gespiegelt vom iOS-Client
+    (`CalendarFeedStore.sanitizeFeedURL`): Root-Cause Johanna (2026-07-15) war
+    ein aus der LH-myTime-App kopierter Link mit LEERZEICHEN mitten im Pfad+Query
+    (`webcal://…/ mytime/ …/ downloadRoster? api_key=…`). Alte Clients sanitizen
+    client-seitig noch nicht → hier server-seitig abfangen, damit der Abruf nicht
+    an einer nur wegen Paste-Artefakten kaputten URL scheitert. Eine bereits
+    saubere URL bleibt identisch."""
+    if not raw:
+        return ''
+    out = []
+    for ch in str(raw):
+        if ch.isspace():
+            continue
+        if ch in _FEED_URL_INVISIBLE:
+            continue
+        out.append(ch)
+    return ''.join(out)
+
+
 @app.route('/api/user/calendar-feed/<token>/import', methods=['POST'])
 def import_calendar_feed(token):
     """Lädt ein ICS-File von einer URL und speichert die Events als Roster-Hints.
     SSRF-geschützt: nur HTTPS, keine privaten IPs, max 1 MB Response.
     """
     body = request.get_json(silent=True) or {}
-    url = (body.get('url') or '').strip()
+    url = _sanitize_feed_url(body.get('url') or '')
     # webcal:// = der iOS/macOS-Link aus myTime „Roster Share" — gleiche Feed-URL,
     # anderes Scheme. Ältere App-Builds normalisieren client-seitig noch nicht →
     # hier server-seitig auf https heben (User-Test 2026-07-01: Verbinden blieb grau).
@@ -38206,20 +38290,23 @@ def import_calendar_feed(token):
         url = 'https://' + url[len('webcal://'):]
     elif low.startswith('webcals://'):
         url = 'https://' + url[len('webcals://'):]
-    # HTTP raus · nur HTTPS akzeptieren (sonst Klartext-Cookies leakable)
+    # HTTP raus · nur HTTPS akzeptieren (sonst Klartext-Cookies leakable).
+    # Leerer/unbrauchbarer Rest nach dem Sanitize = ungültige URL → bad_url,
+    # damit alte Clients (die client-seitig NICHT sanitizen) eine ehrliche
+    # „Link-unvollständig"-Meldung statt „fetch_failed" bekommen.
     if not url.startswith('https://'):
-        return jsonify({'ok': False, 'error': 'https_required'}), 400
+        return jsonify({'ok': False, 'error': 'bad_url'}), 400
     # SSRF-Block: Host darf nicht privat/loopback/link-local sein
     try:
         from urllib.parse import urlparse
         parsed = urlparse(url)
         host = parsed.hostname or ''
         if not host:
-            return jsonify({'ok': False, 'error': 'invalid_host'}), 400
+            return jsonify({'ok': False, 'error': 'bad_url'}), 400
         if _is_private_or_local_ip(host):
             return jsonify({'ok': False, 'error': 'internal_host_blocked'}), 400
     except Exception:
-        return jsonify({'ok': False, 'error': 'url_parse_failed'}), 400
+        return jsonify({'ok': False, 'error': 'bad_url'}), 400
     try:
         import urllib.request
         req = urllib.request.Request(url, headers={'User-Agent': 'AeroTax/1.0'})

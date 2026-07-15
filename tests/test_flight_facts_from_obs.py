@@ -446,3 +446,125 @@ def test_enrich_taxi_status_not_enroute(monkeypatch):
         {'flight': 'LH2557', 'dep_iata': 'FRA', 'arr_iata': 'GVA'},
         date='2099-01-01')
     assert not out.get('status_category')     # kein Geister-'enroute'
+
+
+# ── Selbstkonsistenz-Invariante _scrub_wrong_day_esti (Owner/Fable 2026-07-15) ──
+# Eine Antwort darf sich nicht selbst widersprechen: eine absolute Ist-Ankunft, die
+# > 90 min VOR dem Soll-Abflug (oder > 6 h vor der Soll-Ankunft) DERSELBEN Antwort
+# liegt, gehört zu einer Fremd-Tages-Instanz → Ist-Felder scrubben, Soll behalten.
+
+def test_scrub_lh423_wrong_day_esti_arr_before_own_dep():
+    """Exakt der Live-Payload LH423 BOS→FRA: sched_arr 16.07 06:50, aber
+    est_arr 15.07 07:44 (Vortages-Instanz) — ~23 h VOR der eigenen Soll-Ankunft
+    und VOR dem Soll-Abflug (17:45 BOS). Ist-Felder scrubben, Soll bleibt."""
+    f = {'dep_iata': 'BOS', 'arr_iata': 'FRA',
+         'sched_dep': '2026-07-15T17:45:00-04:00',
+         'sched_arr': '2026-07-16T06:50:00+02:00',
+         'est_arr': '2026-07-15T07:44:00+02:00',
+         'arr_status': 'Gelandet', 'arr_delay_min': -1}
+    axd._scrub_wrong_day_esti(f, service_date='2026-07-15')
+    assert f.get('esti_scrubbed') is True
+    assert 'est_arr' not in f
+    assert 'arr_status' not in f
+    assert 'arr_delay_min' not in f
+    # Soll-Felder ehrlich behalten (nichts erfunden).
+    assert f['sched_arr'] == '2026-07-16T06:50:00+02:00'
+    assert f['sched_dep'] == '2026-07-15T17:45:00-04:00'
+
+
+def test_scrub_self_contradictory_arr_row_via_mapper():
+    """End-to-end über den Mapper: eine ARR-Row trägt sched 06:50 (16.07-Ankunft),
+    aber ein dated esti 15.07 07:44 (Fremd-Rotation). Nach _obs_rows_to_facts +
+    Scrub ist die widersprüchliche Ist-Ankunft weg, sched_arr bleibt."""
+    dep = {'airport': 'BOS', 'flight': 'LH423', 'dest_iata': 'FRA',
+           'date': '2026-07-15', 'sched': '17:45', 'esti': None}
+    arr = {'airport': 'FRA#ARR', 'flight': 'LH423', 'dest_iata': 'BOS',
+           'date': '2026-07-16', 'sched': '06:50',
+           'esti': '2026-07-15T07:44:00+02:00', 'status': 'Gelandet',
+           'max_delay_min': -1}
+    f = axd._obs_rows_to_facts(dep, arr)
+    assert f['est_arr'] == '2026-07-15T07:44:00+02:00'   # vor dem Scrub da
+    axd._scrub_wrong_day_esti(f, service_date='2026-07-15')
+    assert f.get('esti_scrubbed') is True
+    assert 'est_arr' not in f
+    assert f['sched_arr'] == '2026-07-16T06:50:00+02:00'
+    assert f['sched_dep'] == '2026-07-15T17:45:00-04:00'
+
+
+def test_scrub_keeps_normal_delay():
+    """Gegentest: normale Verspätung (est_arr NACH sched_arr) — nicht scrubben."""
+    f = {'dep_iata': 'FRA', 'arr_iata': 'NUE',
+         'sched_dep': '2026-07-09T16:50:00+02:00',
+         'sched_arr': '2026-07-09T17:35:00+02:00',
+         'est_arr': '2026-07-09T18:20:00+02:00',
+         'arr_status': 'delayed', 'arr_delay_min': 45}
+    axd._scrub_wrong_day_esti(f, service_date='2026-07-09')
+    assert not f.get('esti_scrubbed')
+    assert f['est_arr'] == '2026-07-09T18:20:00+02:00'
+    assert f['arr_delay_min'] == 45
+
+
+def test_scrub_keeps_moderate_early_arrival():
+    """Gegentest: Verfrühung 30 min (est_arr vor sched_arr, aber weit nach dem
+    Soll-Abflug und innerhalb der 90-min-Marge/6-h-Grenze) — behalten."""
+    f = {'dep_iata': 'FRA', 'arr_iata': 'NUE',
+         'sched_dep': '2026-07-09T16:50:00+02:00',
+         'sched_arr': '2026-07-09T17:35:00+02:00',
+         'est_arr': '2026-07-09T17:05:00+02:00'}
+    axd._scrub_wrong_day_esti(f, service_date='2026-07-09')
+    assert not f.get('esti_scrubbed')
+    assert f['est_arr'] == '2026-07-09T17:05:00+02:00'
+
+
+def test_scrub_keeps_legit_overnight_next_day_arrival():
+    """Gegentest: legitime Übernacht-Ankunft — est_arr am Folgetag (16.07 07:10),
+    NACH dem Soll-Abflug (15.07 abends), ~20 min nach der Soll-Ankunft. Behalten."""
+    f = {'dep_iata': 'BOS', 'arr_iata': 'FRA',
+         'sched_dep': '2026-07-15T17:45:00-04:00',
+         'sched_arr': '2026-07-16T06:50:00+02:00',
+         'est_arr': '2026-07-16T07:10:00+02:00',
+         'arr_status': 'Gelandet', 'arr_delay_min': 20}
+    axd._scrub_wrong_day_esti(f, service_date='2026-07-15')
+    assert not f.get('esti_scrubbed')
+    assert f['est_arr'] == '2026-07-16T07:10:00+02:00'
+    assert f['arr_status'] == 'Gelandet'
+
+
+def test_scrub_arrival_only_query_uses_sched_arr_bound():
+    """Gegentest 'reine Ankunfts-Query ohne Abflug-Anker': fehlt sched_dep UND
+    est_dep, greift nur die 6-h-vor-sched_arr-Schranke. Eine plausibel geflogene
+    Ankunft (10:35 vs Soll 10:25) bleibt erhalten."""
+    f = {'arr_iata': 'FRA',
+         'sched_arr': '2026-07-15T10:25:00+02:00',
+         'est_arr': '2026-07-15T10:35:00+02:00',
+         'arr_status': 'Gelandet'}
+    axd._scrub_wrong_day_esti(f, service_date='2026-07-15')
+    assert not f.get('esti_scrubbed')
+    assert f['est_arr'] == '2026-07-15T10:35:00+02:00'
+
+
+def test_scrub_fail_open_on_unparsable():
+    """Fail-open: unparsbare/fehlende Zeiten → facts unverändert, kein Scrub."""
+    f = {'dep_iata': 'BOS', 'arr_iata': 'FRA', 'est_arr': 'nonsense'}
+    axd._scrub_wrong_day_esti(f, service_date='2026-07-15')
+    assert not f.get('esti_scrubbed')
+    assert f['est_arr'] == 'nonsense'
+
+
+def test_flight_facts_from_obs_applies_self_consistency(monkeypatch):
+    """Integration: _flight_facts_from_obs verdrahtet den Scrub am Merge-Ausgang.
+    Eine widersprüchliche ARR-Row (sched morgen, esti gestern) liefert KEINE
+    est_arr/arr_status mehr, aber die Soll-Ankunft bleibt."""
+    dep = {'airport': 'BOS', 'flight': 'LH423', 'dest_iata': 'FRA',
+           'date': '2026-07-15', 'sched': '17:45', 'esti': None}
+    arr = {'airport': 'FRA#ARR', 'flight': 'LH423', 'dest_iata': 'BOS',
+           'date': '2026-07-16', 'sched': '06:50',
+           'esti': '2026-07-15T07:44:00+02:00', 'status': 'Gelandet',
+           'max_delay_min': -1}
+    monkeypatch.setattr(axd, '_sb', lambda: _FakeSB([dep, arr]))
+    monkeypatch.setattr(axd, '_tail_active_guard', lambda r: True)
+    f = _flight_facts_from_obs('LH423', '2026-07-15', 'BOS', 'FRA')
+    assert f['sched_arr'] == '2026-07-16T06:50:00+02:00'
+    assert not f.get('est_arr')
+    assert not f.get('arr_status')
+    assert not f.get('arr_delay_min')
