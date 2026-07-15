@@ -236,19 +236,28 @@ def _cleanup_friend_store():
 
 def test_flights_live_carries_iso_and_delay_known(client, monkeypatch):
     tok = _setup_flying_friend(monkeypatch)
+    # Zeiten TAGES-KONSISTENT zum Leg-Abflug (_setup_flying_friend legt dep auf
+    # now−1h): der flights_live-Wrong-Day-Physik-Gate (Owner/Fable 2026-07-15)
+    # verwirft eine Obs, deren Ankunft VOR dem Soll-Abflug liegt. Ein hart
+    # kodiertes Vortags-/Fremd-Datum wäre ein stale Fixture — Ankunft muss NACH
+    # dem heutigen Abflug liegen (FRA→JFK ~8 h später).
+    _sd = (_now() - timedelta(hours=1, minutes=45)).replace(microsecond=0)
+    _ed = _sd + timedelta(minutes=15)
+    _sa = _sd + timedelta(hours=8, minutes=30)
+    _ea = _sa + timedelta(minutes=15)
     m = _merged(delay_known=True, delay_min=15, delay_side='dep', status='airborne',
-                sched_dep='2026-07-04T11:00:00Z', esti_dep='2026-07-04T11:15:00Z',
-                sched_arr='2026-07-04T19:30:00Z', esti_arr='2026-07-04T19:45:00Z')
+                sched_dep=_iso(_sd), esti_dep=_iso(_ed),
+                sched_arr=_iso(_sa), esti_arr=_iso(_ea))
     monkeypatch.setattr(A, '_flight_obs_merged', lambda *a, **k: m)
     r = client.get(f'/api/user/friends-today/{tok}')
     assert r.status_code == 200
     fl = r.get_json()['friends_today'][0]['flights_live']
     assert len(fl) == 1
     e = fl[0]
-    assert e['sched_dep_iso'] == '2026-07-04T11:00:00Z'
-    assert e['est_dep_iso'] == '2026-07-04T11:15:00Z'
-    assert e['sched_arr_iso'] == '2026-07-04T19:30:00Z'
-    assert e['est_arr_iso'] == '2026-07-04T19:45:00Z'
+    assert e['sched_dep_iso'] == _iso(_sd)
+    assert e['est_dep_iso'] == _iso(_ed)
+    assert e['sched_arr_iso'] == _iso(_sa)
+    assert e['est_arr_iso'] == _iso(_ea)
     assert e['delay_known'] is True
     assert e['status'] == 'airborne'
     assert e['dep_iata'] == 'FRA' and e['arr_iata'] == 'JFK'
@@ -287,14 +296,18 @@ def test_flights_live_batch_single_call_per_leg(client, monkeypatch):
 
 def test_flights_live_est_overrides_sched_present(client, monkeypatch):
     # est_dep vorhanden → wird eigenständig geliefert (iOS nimmt est ?? sched).
+    # Zeiten tages-konsistent (s. test_flights_live_carries_iso_and_delay_known):
+    # Ankunft NACH dem heutigen Abflug, sonst greift der Wrong-Day-Physik-Gate.
     tok = _setup_flying_friend(monkeypatch)
+    _sd = (_now() - timedelta(hours=1, minutes=45)).replace(microsecond=0)
+    _ed = _sd + timedelta(minutes=20)
+    _sa = _sd + timedelta(hours=8, minutes=30)
     m = _merged(delay_known=True, delay_min=20, delay_side='dep',
-                sched_dep='2026-07-04T11:00:00Z', esti_dep='2026-07-04T11:20:00Z',
-                sched_arr='2026-07-04T19:30:00Z')
+                sched_dep=_iso(_sd), esti_dep=_iso(_ed), sched_arr=_iso(_sa))
     monkeypatch.setattr(A, '_flight_obs_merged', lambda *a, **k: m)
     r = client.get(f'/api/user/friends-today/{tok}')
     e = r.get_json()['friends_today'][0]['flights_live'][0]
-    assert e['sched_dep_iso'] == '2026-07-04T11:00:00Z'
-    assert e['est_dep_iso'] == '2026-07-04T11:20:00Z'
-    assert e['sched_arr_iso'] == '2026-07-04T19:30:00Z'
+    assert e['sched_dep_iso'] == _iso(_sd)
+    assert e['est_dep_iso'] == _iso(_ed)
+    assert e['sched_arr_iso'] == _iso(_sa)
     assert e['est_arr_iso'] is None                    # keine Esti → None, nicht sched

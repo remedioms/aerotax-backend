@@ -3724,6 +3724,51 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
         return (None, False) if parsed else (_best(cands), False)
 
     best_arr, arr_paired = _best_arr_for_dep(arr_cands, best_dep)
+    # ABFLUGTAG-PHYSIK-GATE (Owner/Fable 2026-07-15, LH423 BOS→FRA): trägt der
+    # Query ein Datum + ABFLUG-Airport, existiert für DIESEN Tag aber KEINE DEP-
+    # Seite (BOS/Übersee ist nicht geharvestet) und NUR eine ARR-Row am gleichen
+    # Kalendertag `d`, dann kann diese Ankunft die GESTRIGE Rotation eines Über-
+    # Nacht-Legs sein: das heutige LH423 startet erst abends (17:45 BOS) und landet
+    # am 16., während die ARR-Row (FRA 07:44) zur Ankunft der VORTAGES-Abfahrt
+    # gehört. Ohne DEP-Row kann `_best_arr_for_dep` das nicht paaren. Physik-Regel
+    # (analog crew_live_state._obs_is_wrong_day, hier mit Tages-Untergrenze):
+    # ein Flug, der am Tag `d` von `dep` startet, kann sein Ziel FRÜHESTENS um
+    # (Tagesbeginn an `dep`) + Großkreis/v_max + Boden-Overhead erreichen. Liegt
+    # die beobachtete Ankunft davor, gehört die ARR-Row zur Fremd-Rotation →
+    # verwerfen. Fail-open ohne Koordinaten/TZ/parsebare Zeit.
+    if (best_dep is None and best_arr is not None and dep
+            and (best_arr.get('date') or '')[:10] == d):
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            from airport_tz import airport_tz as _atz2
+            from datetime import timezone as _tz3
+            _arr_ap = ((best_arr.get('airport') or '').split('#', 1)[0] or None)
+            _arr_dt, _ = _obs_station_dt(
+                best_arr.get('esti') or best_arr.get('sched'),
+                _arr_ap, best_arr.get('date'))
+            _dep_tzn = _atz2(dep)
+            if _arr_dt is not None and _dep_tzn:
+                # Tagesbeginn (00:00 Ortszeit) am Abflug-Airport für Tag d.
+                _day_start = _dt.strptime(d, '%Y-%m-%d').replace(
+                    tzinfo=_ZI(_dep_tzn))
+                _dep_ll = _iata_latlon(dep)
+                _arr_ll = _iata_latlon(_arr_ap)
+                _min_block_h = 0.0
+                if _dep_ll and _arr_ll:
+                    from math import radians as _rad, sin as _sin, cos as _cos, \
+                        asin as _asin, sqrt as _sqrt
+                    _dla = _rad(_arr_ll[0] - _dep_ll[0])
+                    _dlo = _rad(_arr_ll[1] - _dep_ll[1])
+                    _a = (_sin(_dla / 2) ** 2 + _cos(_rad(_dep_ll[0]))
+                          * _cos(_rad(_arr_ll[0])) * _sin(_dlo / 2) ** 2)
+                    _dist_km = 2 * 6371.0 * _asin(_sqrt(_a))
+                    _min_block_h = _dist_km / 950.0    # v_max großzügig (s. leg_status_gate)
+                _earliest = (_day_start.astimezone(_tz3.utc)
+                             + _td(hours=_min_block_h, minutes=12))
+                if _arr_dt.astimezone(_tz3.utc) < _earliest:
+                    best_arr, arr_paired = None, False
+        except Exception:
+            pass
     # SIDE-DATE-ISOLIERUNG (D-AIZD/LH1346): ist mindestens EINE Seite für den
     # angefragten Betriebstag vorhanden, darf die jeweils andere Seite NICHT aus
     # dem Vortag ergänzt werden. Sonst wird z.B. DEP 14.07 + ARR 13.07 zu einem

@@ -13049,9 +13049,26 @@ def get_friends_today(token):
             # sonst DIREKT aus ical_sectors — reine iCal-Freunde (Tibor!) hatten
             # fns=None -> flights_live blieb strukturell IMMER leer und iOS fiel
             # trotz airborne Leg auf "Basis" zurueck (Diagnose 2026-07-10).
+            # 4-Tupel (fno, from, to, dep_iso): dep_iso = Soll-Abflug DIESES Legs
+            # (echt-UTC, aus ical_sectors) → Wrong-Day-Physik-Gate unten. Aus dem
+            # Tax-Pfad (fns+chain, keine ical-Zeiten) bleibt dep_iso None (Gate
+            # fail-open, wie bisher).
             _legs_fl = []
             if fns and len(chain) >= 2 and len(fns) == len(chain) - 1:
-                _legs_fl = [(fno, chain[i], chain[i + 1])
+                # dep_iso je Leg best-effort aus den ical_sectors nach (fno,from,to)
+                # nachschlagen — der Tax-Pfad kennt die Zeiten sonst nicht.
+                _sec_dep_iso = {}
+                for _sec in (day.get('ical_sectors') or []):
+                    _sfn = (_sec.get('flight') or _sec.get('flight_no') or '') \
+                        .replace(' ', '').upper().strip()
+                    _sfr = (_sec.get('from') or _sec.get('dep') or '').strip().upper()
+                    _sto = (_sec.get('to') or _sec.get('arr') or '').strip().upper()
+                    _sdi = (_sec.get('dep_iso') or '').strip()
+                    if _sfn and _sfr and _sto and _sdi:
+                        _sec_dep_iso.setdefault((_sfn, _sfr, _sto), _sdi)
+                _legs_fl = [(fno, chain[i], chain[i + 1],
+                             _sec_dep_iso.get((fno.replace(' ', '').upper(),
+                                               chain[i], chain[i + 1])))
                             for i, fno in enumerate(fns[:4])]
             else:
                 for _sec in (day.get('ical_sectors') or [])[:4]:
@@ -13059,13 +13076,27 @@ def get_friends_today(token):
                     _fr = (_sec.get('from') or _sec.get('dep') or '').strip().upper()
                     _to = (_sec.get('to') or _sec.get('arr') or '').strip().upper()
                     if _fn and len(_fr) == 3 and len(_to) == 3:
-                        _legs_fl.append((_fn, _fr, _to))
+                        _legs_fl.append((_fn, _fr, _to, (_sec.get('dep_iso') or '').strip() or None))
             if datum == _heute_berlin and _legs_fl:
-                for idx, (fno, _dep_ia, _arr_ia) in enumerate(_legs_fl):
+                for idx, (fno, _dep_ia, _arr_ia, _leg_dep_iso) in enumerate(_legs_fl):
                     m = _flight_obs_merged(fno, date=datum,
                                            dep_iata=_dep_ia,
                                            arr_iata=_arr_ia,
                                            free_only=True, live=False)
+                    # WRONG-DAY-PHYSIK-GATE (Owner/Fable 2026-07-15, Rest-Leck der
+                    # crew_state-Klasse): _flight_obs_merged matcht täglich fliegende
+                    # Flugnummern (LH423 BOS→FRA) datums-agnostisch und liefert bei
+                    # einem Über-Nacht-Rückleg (dep HEUTE abends, arr MORGEN) die
+                    # GESTRIGE Tages-Instanz, die längst in FRA gelandet ist. Die trug
+                    # `status=LANDED` in flights_live[0] — für ALLE Freunde, obwohl der
+                    # crew_state korrekt pre_flight sagte (der Resolver gatet via
+                    # crew_live_state._obs_is_wrong_day, dieses parallele Array bislang
+                    # NICHT). Dieselbe physikalische Schranke: liegt die beobachtete
+                    # Ankunft VOR dem Soll-Abflug DIESES Legs (minus Marge), ist es ein
+                    # Fremd-Tag-Match → verwerfen (kein Eintrag, iOS fällt auf den
+                    # crew_state-Zustand zurück). Fail-open ohne dep_iso/ohne Ankunft.
+                    if m and _flights_live_obs_wrong_day(m, _leg_dep_iso, _arr_ia):
+                        m = None
                     if m:
                         # ECHTE Live-Position dieses Legs aus dem NAS-Harvester-Store
                         # (aircraft_live/FR24-gRPC) — reale Süd-Route (LH meidet
@@ -30413,6 +30444,61 @@ def _board_local_to_utc_iso(esti, iata):
         return None
 
 
+# Sicherheitsmarge (min), analog crew_live_state._WRONG_DAY_MARGIN_MIN: um sie darf
+# eine ECHTE (delay-korrigierte) Ankunft ihren EIGENEN Soll-Abflug unterschreiten,
+# bevor die Beobachtung als „falscher Tag" verworfen wird. Ein Flug landet NIE vor
+# seinem Abflug — nur ein Board-Record einer ANDEREN Tages-Instanz kann das.
+_FLIGHTS_LIVE_WRONG_DAY_MARGIN_MIN = 60
+
+
+def _flights_live_obs_wrong_day(m, leg_dep_iso, arr_iata):
+    """Gehört der (datums-agnostisch gematchte) `_flight_obs_merged`-Record `m`
+    zu einer ANDEREN Tages-Instanz als das iCal-Leg mit Soll-Abflug `leg_dep_iso`?
+
+    Vorbild: crew_live_state._obs_is_wrong_day — genau dieselbe physikalische
+    Schranke, hier für das PARALLELE flights_live-Array (friends-today), das die
+    Obs an der crew_state-Gate-Stelle VORBEI direkt aus `_flight_obs_merged` baut.
+    Ein täglich fliegender Flug (LH423 BOS→FRA) liefert am Rückflugtag längst die
+    GESTRIGE, in FRA gelandete Instanz („status=LANDED, est_arr heute früh"),
+    während das echte Leg der Crew erst abends abfliegt.
+
+    Signal (physikalisch, unmissverständlich): die beobachtete Ankunft liegt VOR
+    dem Soll-Abflug DIESES Legs — plus Marge. Ein korrekter Lauf landet NIE vor
+    seinem Abflug; nur ein Fremd-Tag-Match kann das. Fail-open (False) wenn der
+    Soll-Abflug fehlt (Tax-Pfad ohne ical-Zeiten) oder keine Ankunft parsebar ist.
+    Wirft nie."""
+    try:
+        if not isinstance(m, dict) or not leg_dep_iso:
+            return False
+        from datetime import datetime as _dt2, timedelta as _td2
+        dep = _dt2.fromisoformat(str(leg_dep_iso).strip().replace('Z', '+00:00'))
+        if dep.tzinfo is None:
+            return False
+        # Beobachtete Ankunft (UTC): esti_arr bevorzugt, sonst sched_arr — beide
+        # stehen board-lokal (Stations-Ortszeit am Ziel) und werden mit derselben
+        # TZ-Kenntnis wie die flights_live-Ausgabe nach UTC gewandelt. Bare 'HH:MM'
+        # (ohne eigenes Datum) mit dem Beobachtungstag der Obs (m['date']) datieren,
+        # sonst könnte _board_local_to_utc_iso sie nicht parsen und das Gate liefe leer.
+        def _dated(v):
+            v = (str(v).strip() if v else '')
+            if not v:
+                return None
+            if re.match(r'^\d{1,2}:\d{2}$', v):
+                _obsd = (str(m.get('date') or '').strip()[:10])
+                if not re.match(r'^\d{4}-\d{2}-\d{2}$', _obsd):
+                    return None
+                hh, mm = v.split(':')
+                v = '%sT%02d:%02d:00' % (_obsd, int(hh), int(mm))
+            return _board_local_to_utc_iso(v, arr_iata)
+        obs_arr_iso = _dated(m.get('esti_arr')) or _dated(m.get('sched_arr'))
+        if not obs_arr_iso:
+            return False
+        obs_arr = _dt2.fromisoformat(obs_arr_iso.replace('Z', '+00:00'))
+        return obs_arr < dep - _td2(minutes=_FLIGHTS_LIVE_WRONG_DAY_MARGIN_MIN)
+    except Exception:
+        return False
+
+
 def _sched_block_min(dep_local, dep_iata, arr_local, arr_iata):
     """Planmäßige Blockzeit (Flugdauer) in MINUTEN aus lokalen Soll-Ab-/Ankunfts-
     zeiten. WICHTIG: dep und arr stehen jeweils in IHRER eigenen Stations-Ortszeit
@@ -31191,6 +31277,49 @@ def ax_flight_info(flightno):
                     'type': (ac_row or {}).get('type_code'),
                     'recent_regs': regs[:8], 'observations': len(rows),
                 }
+                # WRONG-DAY-PHYSIK-GATE für die freie Zeiten-Kette (Owner/Fable
+                # 2026-07-15, LH423 BOS→FRA): fragt der Client EIN Datum + den
+                # ABFLUG-Flughafen (`?date=&airport=BOS`) und es existiert für
+                # diesen Tag NUR eine ARR-Seite (BOS ist nicht geharvestet → keine
+                # DEP-Row) desselben täglichen Fluges, dann ist diese Ankunft die
+                # in FRA gelandete GESTRIGE Rotation (Über-Nacht-Leg: das heutige
+                # LH423 startet erst abends und landet am 16.). Ihr `esti/status`
+                # (07:44 „Gelandet") als HEUTIGE Ist-Zeit auszuliefern ist derselbe
+                # Fremd-Tag-Fehler wie im crew_state. Physik-Prüfung über die EINE
+                # datums-disziplinierte Quelle _flight_facts_from_obs (dieselbe wie
+                # Radar/Detail): findet sie für DIESEN Abflugtag KEINE gültige, zum
+                # Abflug passende Ankunft, sind die operativen Ist-Felder foreign-day
+                # → scrubben (Strecke/Tail/recent_regs = ehrliche Identität bleiben),
+                # der Live-Board-/free-first-Pfad unten füllt die echte Abendabfahrt.
+                # NUR wenn der Abflug-Flughafen bewusst benannt wurde (nicht Default
+                # FRA) und die Query genau diesen Tag adressiert (kein Über-Scrub der
+                # gleichtägigen Innereuropa-Legs mit vorhandener DEP-Row).
+                if (date_param and obs_is_arr and dep is None
+                        and (request.args.get('airport') or '').strip()
+                        and (o.get('airport') or '').upper() == board_ap):
+                    try:
+                        from blueprints.aerox_data_blueprint import _flight_facts_from_obs as _ff_gate
+                        _gate_facts = _ff_gate(fn, date_param, board_ap,
+                                               o.get('dest_iata'))
+                    except Exception:
+                        _gate_facts = None
+                    # Keine physikalisch zum Abflug gepaarte Ankunft für DIESEN Tag
+                    # (leer, stale-Fallback, oder ohne Ist/Soll-Ankunft) ⇒ die im
+                    # Top-Block gewählte ARR-Row gehört zur Fremd-Rotation.
+                    if (not _gate_facts or _gate_facts.get('stale')
+                            or not (_gate_facts.get('est_arr')
+                                    or _gate_facts.get('sched_arr'))):
+                        # `date`/`obs_date` bleiben der ehrliche Beobachtungstag der
+                        # ARR-Row (= date_param, weil die Ankunft am Ziel nach dem
+                        # lokalen Ankunftstag archiviert wird). Der iOS-stale-Gate
+                        # (obs_date==date) hängt daran — nicht verfälschen. Wir
+                        # verwerfen nur die OPERATIVEN Ist-Felder der Fremd-Rotation
+                        # und markieren den Grund transparent.
+                        out['foreign_day_arr'] = True
+                        for _k in ('status', 'esti', 'sched', 'gate', 'terminal',
+                                   'delay_min', 'cancelled'):
+                            out[_k] = None
+                        out['delay_known'] = False
         except Exception as e:
             app.logger.warning(f'[flight-info] obs_fail {str(e)[:120]}')
     # FRISCHE-CHECK (Bug-Fix Flight-Check-up 2026-07-02): die Board-Historie ist pro

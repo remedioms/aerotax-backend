@@ -1302,6 +1302,42 @@ def test_layeff_privacy_gate_gps_vs_roster(client, monkeypatch):
     assert out['current_city'] == 'Reykjavik'        # gps-Modus: GPS-Stadt
 
 
+# ── flights_live[] Wrong-Day-Physik-Gate (Owner/Fable 2026-07-15) ──────────────
+# Das parallele flights_live-Array (friends-today) baut die Obs an der crew_state-
+# Gate-Stelle VORBEI direkt aus _flight_obs_merged. Bei einem täglich fliegenden
+# Über-Nacht-Rückleg (LH423 BOS→FRA, dep abends, arr morgen) lieferte der
+# datums-agnostische Merge die GESTRIGE, in FRA gelandete Instanz → status=LANDED
+# in flights_live[0] für ALLE Freunde, obwohl crew_state korrekt pre_flight sagte.
+# _flights_live_obs_wrong_day verwirft eine Obs, deren beobachtete Ankunft VOR dem
+# Soll-Abflug DIESES Legs liegt (dieselbe Physik wie crew_live_state._obs_is_wrong_day).
+
+def test_flights_live_wrong_day_gate_bare_time_arrival():
+    """Bare 'HH:MM'-Ankunft (mit m['date']) VOR dem Leg-Abflug ⇒ Fremd-Tag."""
+    m = {'esti_arr': '07:44', 'sched_arr': '07:20', 'status': 'LANDED',
+         'arr_delay_min': 24, 'date': '2026-07-15'}
+    # LH423-Rückleg: Soll-Abflug BOS 17:45 EDT = 2026-07-15T21:45Z.
+    assert A._flights_live_obs_wrong_day(m, '2026-07-15T21:45:00Z', 'FRA') is True
+
+
+def test_flights_live_wrong_day_gate_iso_arrival():
+    m = {'esti_arr': '2026-07-15T07:44:00', 'sched_arr': '2026-07-15T07:20:00',
+         'date': '2026-07-15'}
+    assert A._flights_live_obs_wrong_day(m, '2026-07-15T21:45:00Z', 'FRA') is True
+
+
+def test_flights_live_wrong_day_gate_keeps_real_next_day_arrival():
+    """Die ECHTE Ankunft des Legs (Folgetag früh) ist kein Fremd-Tag."""
+    m = {'esti_arr': '09:44', 'sched_arr': '09:20', 'date': '2026-07-16'}
+    assert A._flights_live_obs_wrong_day(m, '2026-07-15T21:45:00Z', 'FRA') is False
+
+
+def test_flights_live_wrong_day_gate_fail_open_without_dep_iso():
+    """Ohne Soll-Abflug (Tax-Pfad ohne ical-Zeiten) ⇒ fail-open (False)."""
+    m = {'esti_arr': '07:44', 'date': '2026-07-15'}
+    assert A._flights_live_obs_wrong_day(m, None, 'FRA') is False
+    assert A._flights_live_obs_wrong_day(m, '', 'FRA') is False
+
+
 def _teardown_store():
     A._store.pop('FRIENDTOKEN', None)
 

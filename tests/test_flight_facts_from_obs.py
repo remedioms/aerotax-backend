@@ -178,6 +178,59 @@ def test_today_departure_drops_yday_arrival_side(monkeypatch):
     assert not f.get('stale')
 
 
+def test_overnight_departure_query_drops_foreign_morning_arrival(monkeypatch):
+    """LH423 BOS→FRA (Owner/Fable 2026-07-15): das Über-Nacht-Rückleg startet am
+    15. abends in BOS und landet am 16. in FRA. Für den Abflug-Tag-Query
+    (date=2026-07-15, dep=BOS) existiert NUR eine ARR-Row am gleichen Kalendertag
+    — die FRA-Ankunft (07:44) der GESTRIGEN Rotation. Ohne DEP-Row (BOS nicht
+    geharvestet) darf diese physikalisch unmögliche Morgen-Ankunft NICHT als heutige
+    Ist-Zeit durchsickern: ein Flug, der am 15. von BOS startet, kann FRA frühestens
+    Stunden später erreichen. Die freie Zeiten-Kette lieferte sonst esti=07:44."""
+    foreign_arr = {'airport': 'FRA#ARR', 'flight': 'LH423', 'dest_iata': 'BOS',
+                   'date': '2026-07-15', 'sched': '07:20', 'esti': '07:44',
+                   'status': 'Gelandet', 'max_delay_min': 24}
+    monkeypatch.setattr(axd, '_sb', lambda: _FakeSB([foreign_arr]))
+    monkeypatch.setattr(axd, '_tail_active_guard', lambda r: True)
+
+    f = _flight_facts_from_obs('LH423', '2026-07-15', 'BOS', 'FRA')
+
+    for key in ('sched_arr', 'est_arr', 'arr_status', 'arr_delay_min'):
+        assert not f.get(key)
+
+
+def test_same_day_arrival_only_kept_when_physically_possible(monkeypatch):
+    """Gegentest (kein Über-Scrub): eine gleichtägige Innereuropa-Ankunft
+    (LH146 FRA→NUE, 17:35) ist für einen FRA-Abflug am selben Tag physikalisch
+    plausibel → die ARR-only-Row bleibt erhalten."""
+    arr = {'airport': 'NUE#ARR', 'flight': 'LH146', 'dest_iata': 'FRA',
+           'date': '2026-07-15', 'sched': '17:35', 'esti': '17:42',
+           'status': 'Landed'}
+    monkeypatch.setattr(axd, '_sb', lambda: _FakeSB([arr]))
+    monkeypatch.setattr(axd, '_tail_active_guard', lambda r: True)
+
+    f = _flight_facts_from_obs('LH146', '2026-07-15', 'FRA', 'NUE')
+
+    assert f['sched_arr'] == '2026-07-15T17:35:00+02:00'
+    assert f['est_arr'] == '2026-07-15T17:42:00+02:00'
+
+
+def test_arrival_airport_query_keeps_flown_arrival(monkeypatch):
+    """Gegentest 'gestern gestartet, heute gelandet' PER ANKUNFTS-Airport-Query:
+    LH455 SFO→FRA landet früh am 15. in FRA. Fragt der Client per Ankunftstag ohne
+    gebundenen Abflug-Airport, darf die geflogene Ankunft NICHT verworfen werden —
+    das Abflugtag-Gate feuert nur bei explizit gebundenem dep_iata."""
+    arr = {'airport': 'FRA#ARR', 'flight': 'LH455', 'dest_iata': 'SFO',
+           'date': '2026-07-15', 'sched': '10:25', 'esti': '10:35',
+           'status': 'Gelandet'}
+    monkeypatch.setattr(axd, '_sb', lambda: _FakeSB([arr]))
+    monkeypatch.setattr(axd, '_tail_active_guard', lambda r: True)
+
+    f = _flight_facts_from_obs('LH455', '2026-07-15')      # kein dep_iata
+
+    assert f['sched_arr'] == '2026-07-15T10:25:00+02:00'
+    assert f['est_arr'] == '2026-07-15T10:35:00+02:00'
+
+
 def test_yday_fallback_marks_stale(monkeypatch):
     """Overnight-Fall: das angefragte Datum ist leer → yday-Row als Fallback,
     aber transparent als stale/obs_date markiert."""
