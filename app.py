@@ -12514,8 +12514,17 @@ def get_friend_roster(token, friend_token):
             if isinstance(_secs, list) and _secs:
                 if _hb is None:
                     _hb = _profile_homebase_cached(friend_token) or ''
+                # VERGANGENHEITS-HORIZONT (Owner/Fable 2026-07-15): das Freunde-
+                # Roster-Sheet zeigt die 30-Tage-Tour-Retention. Der Enrich-
+                # Fenster-Guard bleibt für alle anderen Aufrufer bei 30 h, hier
+                # aber weit geöffnet, damit die für VORTAGE persistierten Ist-
+                # Zeiten (airport_delay_obs) je Leg gelesen werden — statt nackter
+                # „Gelandet/Abgeflogen". free_only=True bleibt hart; der Live-
+                # Board-Scan bleibt via _flight_obs_merged auf HEUTE begrenzt,
+                # nur der datums-gezielte Warehouse-Read erreicht die alten Tage.
                 _enrich_leg_delays(_secs, _e.get('datum'), free_only=True,
-                                   homebase=(_hb or None))
+                                   homebase=(_hb or None),
+                                   past_horizon_h=24 * 35)
         except Exception:
             pass
     return jsonify({'ok': True, 'shared': True, 'count': len(out),
@@ -30721,7 +30730,8 @@ def _profile_homebase_cached(token):
     return hb or None
 
 
-def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
+def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
+                       past_horizon_h=30):
     """Reichert die Pro-Leg-Sektoren EINES Roster-Tages (ical_sectors[]) IN PLACE
     um Live-/Warehouse-Delay-Felder an (Owner 2026-07-04 „alle Live-Sachen an-
     binden", Serve-Time-Enrichment — NICHT im iCal-Sync eingefroren).
@@ -30743,9 +30753,13 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
 
     HARTE GUARDS:
       • Zeitfenster: nur anreichern, wenn der Leg-Abflug (dep_iso, sonst `date`)
-        im Fenster [jetzt−30 h .. jetzt+27 h] liegt — reine Zukunfts-/Tief-
-        Vergangenheits-Legs überspringen (spart Board-Scans, ehrt die
-        >27h-Zukunfts-Regel).
+        im Fenster [jetzt−`past_horizon_h` h .. jetzt+27 h] liegt — reine
+        Zukunfts-/Tief-Vergangenheits-Legs überspringen (spart Board-Scans, ehrt
+        die >27h-Zukunfts-Regel). `past_horizon_h` (Default 30) öffnet NUR den
+        datums-gezielten Warehouse-Read weiter in die Vergangenheit (Friend-
+        Roster: 30-Tage-Tour). Der Live-Board-Scan bleibt via _flight_obs_merged
+        (`_is_today_at`) hart auf HEUTE begrenzt — nur der persistente SB-Read
+        bedient ältere Tage.
       • merged is None → GAR NICHTS schreiben (Legacy/kein Signal = Feld fehlt).
       • merged.delay_known False → delay_known=False, delay_min=None (NIEMALS
         eine erfundene 0). Echte Beobachtungen (status/est/reg) dürfen dennoch
@@ -30785,13 +30799,14 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
         if dep_dt is not None:
             if dep_dt > now + timedelta(hours=27):
                 continue        # tiefe Zukunft: kein Board-Scan
-            if dep_dt < now - timedelta(hours=30):
-                continue        # tiefe Vergangenheit: kein SB-Read
+            if dep_dt < now - timedelta(hours=past_horizon_h):
+                continue        # tiefe Vergangenheit: kein SB-Read (Horizont)
         else:
             # OHNE präzises dep_iso greift der Stunden-Guard nicht → grobe
             # DATUMS-Guard (Fix 2026-07-04: Legs ohne dep_iso umgingen das
             # Fenster ganz). Nur Tag-von / ±1 Tag anreichern; alles Tiefere
-            # überspringen (ehrt die >27h-Zukunfts-Regel grob).
+            # überspringen (ehrt die >27h-Zukunfts-Regel grob). Der Vergangenheits-
+            # Rand skaliert mit `past_horizon_h` (Friend-Roster: 30-Tage-Tour).
             try:
                 from datetime import date as _dt_date
                 _draw = str(s.get('date') or date or '')[:10]
@@ -30801,10 +30816,13 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
                 # (UTC) fiele „morgen" zwischen lokaler Mitternacht und UTC-
                 # Mitternacht fälschlich in die tiefe Zukunft (+2 UTC-Tage).
                 today = _dt_date.today()
+                # grober Vergangenheits-Rand in Tagen aus dem Stunden-Horizont
+                # (Default 30h → 1 Tag; weiter Horizont deckt die Tour-Retention).
+                _past_days = max(1, int((past_horizon_h + 23) // 24))
                 if d > today + timedelta(days=1):
                     continue        # tiefe Zukunft (grob)
-                if d < today - timedelta(days=1):
-                    continue        # tiefe Vergangenheit (grob)
+                if d < today - timedelta(days=_past_days):
+                    continue        # tiefe Vergangenheit (grob, Horizont)
             except Exception:
                 pass        # kein parsbares Datum → wie bisher weiter (nie werfen)
         # ── Flugnummer normalisieren + Codeshare→Operating ───────────────────
@@ -30831,8 +30849,64 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
                                    arr_iata=to, live=True, free_only=free_only)
         except Exception:
             m = None
+        # ── VERGANGENHEITS-FALLBACK auf die persistente Blueprint-Quelle
+        # (Owner/Fable 2026-07-15, LH893 RIX→FRA): der obs-Merge oben bevorzugt
+        # für Vortage teils eine spätere nackte „Geplant/Delayed"-Repoll-Row bzw.
+        # findet die reine ARR-Row nicht → das persistierte Ist (esti_arr in
+        # airport_delay_obs) fällt weg und das Freunde-Sheet zeigt nur nacktes
+        # „Gelandet/Abgeflogen". `_flight_facts_from_obs` liest genau dieses Ist
+        # korrekt (DEP+ARR-Merge, Station-Offset-ISO). Nur für VERGANGENE Legs und
+        # nur, wenn der Merge keine Ankunfts-Esti hat (m None ODER m ohne esti_arr)
+        # — Vorrang haben stets vorhandene m-Werte, Facts füllen NUR Lücken. Der
+        # Aufruf trifft dieselbe gratis SB-Tabelle (kein Paid-Spend). Wirft nie.
+        _facts = None
+        _is_past = False
+        try:
+            if dep_dt is not None:
+                _is_past = dep_dt < now
+            elif leg_date:
+                from datetime import date as _dt_date2
+                _is_past = _dt_date2.fromisoformat(leg_date) < _dt_date2.today()
+        except Exception:
+            _is_past = False
+        if _is_past and (m is None or not m.get('esti_arr')):
+            try:
+                from blueprints.aerox_data_blueprint import (
+                    _flight_facts_from_obs as _facts_from_obs)
+                _fc = _facts_from_obs(op_fn, leg_date, dep_iata=frm, arr_iata=to)
+                if isinstance(_fc, dict) and _fc:
+                    _facts = _fc
+            except Exception:
+                _facts = None
         if m is None:
-            continue        # kein Signal → Legacy (Felder bleiben abwesend)
+            # Kein Merge-Signal: nur weitermachen, wenn die persistente Quelle für
+            # dieses Vergangenheits-Leg wirklich Ist-Fakten liefert. Sonst wie
+            # bisher überspringen (Legacy-Form, keine erfundenen Felder). Aus den
+            # Facts einen minimalen Merge-artigen Datensatz bauen, damit der
+            # restliche Pfad (Status-Gate, Reg-Wächter …) uniform läuft.
+            if not _facts:
+                continue
+            _f_status = _facts.get('arr_status') or _facts.get('dep_status')
+            _f_delay = (_facts.get('arr_delay_min')
+                        if _facts.get('arr_delay_min') is not None
+                        else _facts.get('dep_delay_min'))
+            m = {
+                'delay_known': _f_delay is not None,
+                'delay_min': _f_delay,
+                'delay_side': ('arr' if _facts.get('arr_delay_min') is not None
+                               else ('dep' if _facts.get('dep_delay_min')
+                                     is not None else None)),
+                'dep_delay_min': _facts.get('dep_delay_min'),
+                'arr_delay_min': _facts.get('arr_delay_min'),
+                'status': _f_status,
+                'cancelled': bool(_facts.get('cancelled')),
+                # Facts liefern bereits Station-Offset-ISO (nicht das rohe Board-
+                # Format) → NICHT nochmal durch _board_local_to_utc_iso schicken;
+                # unten direkt in est_*_iso übernehmen (esti_dep/arr bleiben None).
+                'esti_dep': None, 'esti_arr': None,
+                'reg': _facts.get('reg'), 'sides': {'dep': None, 'arr': None},
+                'sched_dep': None, 'sched_arr': _facts.get('sched_arr'),
+            }
         known = bool(m.get('delay_known'))
         s['delay_known'] = known
         s['delay_min'] = (m.get('delay_min') if known else None)
@@ -30849,6 +30923,35 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
         # (Vor dem Status-Gate berechnet: est_arr_iso ist eine Plausi-Schranke.)
         s['est_dep_iso'] = _board_local_to_utc_iso(m.get('esti_dep'), frm)
         s['est_arr_iso'] = _board_local_to_utc_iso(m.get('esti_arr'), to)
+        # ── PERSISTENTE-FACTS-LÜCKENFÜLLUNG (Vergangenheits-Legs): fehlt nach dem
+        # Merge eine Ist-Zeit / ein Delay / ein Status / eine Reg, aber die
+        # persistente Blueprint-Quelle hat sie (est_dep/est_arr sind dort schon
+        # Station-Offset-ISO, unmissverständlich) → NUR die Lücken auffüllen,
+        # nie einen vorhandenen m-Wert überschreiben. delay_known wird ehrlich
+        # nachgezogen, wenn erst die Facts eine Delay-Zahl liefern.
+        if _facts:
+            if s.get('est_dep_iso') is None and _facts.get('est_dep'):
+                s['est_dep_iso'] = _facts.get('est_dep')
+            if s.get('est_arr_iso') is None and _facts.get('est_arr'):
+                s['est_arr_iso'] = _facts.get('est_arr')
+            if s.get('dep_delay_min') is None \
+                    and _facts.get('dep_delay_min') is not None:
+                s['dep_delay_min'] = _facts.get('dep_delay_min')
+            if s.get('arr_delay_min') is None \
+                    and _facts.get('arr_delay_min') is not None:
+                s['arr_delay_min'] = _facts.get('arr_delay_min')
+            if not known and s.get('delay_min') is None:
+                _fd = (s.get('arr_delay_min') if s.get('arr_delay_min') is not None
+                       else s.get('dep_delay_min'))
+                if _fd is not None:
+                    s['delay_known'] = True
+                    s['delay_min'] = _fd
+                    if not s.get('delay_side'):
+                        s['delay_side'] = ('arr'
+                                           if s.get('arr_delay_min') is not None
+                                           else 'dep')
+            if _facts.get('cancelled') and not s.get('cancelled'):
+                s['cancelled'] = True
         # ── STATUS PLAUSIBILITÄTS-/PHYSIK-GATE (Owner/Fable 2026-07-13, LH454→SFO)
         # Bisher: der ROHE Board-Status floss ungegatet in dieses Feld und weiter
         # in Kalender-Leg-Anzeige, Feed-Bordkarte und flights_live[].status. Manche
@@ -30863,6 +30966,56 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
         # (airborne/delayed/boarding) laufen unverändert durch; fehlen die Belege
         # → fail-open (Rohstatus bleibt). Rein additiv, konservativ, wirft nie.
         _raw_status = m.get('status')
+        # Persistente-Facts-Status-Lücke: hat der Merge KEINEN Status, die Blueprint-
+        # Quelle aber einen (arr gewinnt vor dep) → nachziehen (Facts füllen Lücken).
+        if not _raw_status and _facts:
+            _raw_status = _facts.get('arr_status') or _facts.get('dep_status') \
+                or _raw_status
+        # ── FIX 3: STALE „ABGEFLOGEN" EHRLICH (Owner/Fable 2026-07-15) ─────────
+        # Ein dep-seitig „abgeflogen/airborne/departed/gestartet" gemeldeter Flug,
+        # für den KEINE Ankunfts-Beobachtung existiert (weder Ist-Ankunft noch ein
+        # arr-seitiger Status) und dessen PLAN-Ankunft mehr als 6 h vor jetzt liegt,
+        # ist längst gelandet — der bloße „Abgeflogen"-Status ist veraltet. Dann den
+        # Status ehrlich als 'landed' durchreichen (KEINE erfundene Ist-Zeit dabei).
+        # Geteilte Stelle → alle Consumer (Freunde-/Familien-Roster, Kalender, Feed)
+        # erben es. Konservativ: nur bei echtem Airborne-Bucket + fehlender Ankunft
+        # + klar überfälliger Plan-Ankunft. Wirft nie.
+        try:
+            if _flight_status_bucket(_raw_status) == 'airborne':
+                _has_arr_obs = bool(
+                    s.get('est_arr_iso') or s.get('arr_delay_min') is not None
+                    or (_facts and (_facts.get('arr_status')
+                                    or _facts.get('est_arr'))))
+                if not _has_arr_obs:
+                    # PLAN-Ankunft: Sektor-arr_iso (echt-UTC) bevorzugt, sonst der
+                    # Board/Facts-Soll (station-lokal → UTC).
+                    _sched_arr_utc = None
+                    for _sa_cand, _sa_conv in (
+                            (s.get('arr_iso'), False),
+                            (m.get('sched_arr'), True),
+                            ((_facts or {}).get('sched_arr'), False)):
+                        if not _sa_cand:
+                            continue
+                        try:
+                            if _sa_conv:
+                                _sa_iso = _board_local_to_utc_iso(_sa_cand, to)
+                            else:
+                                _sa_iso = str(_sa_cand)
+                            if not _sa_iso:
+                                continue
+                            _sa_dt = datetime.fromisoformat(
+                                _sa_iso.replace('Z', '+00:00'))
+                            if _sa_dt.tzinfo is None:
+                                _sa_dt = _sa_dt.replace(tzinfo=timezone.utc)
+                            _sched_arr_utc = _sa_dt
+                            break
+                        except Exception:
+                            continue
+                    if (_sched_arr_utc is not None
+                            and _sched_arr_utc < now - timedelta(hours=6)):
+                        _raw_status = 'landed'
+        except Exception:
+            pass
         # Physik-Schranken-Inputs vorab binden (auch der Engine-Block unten liest
         # sie): so bleibt der Feinschliff-1-Status-Gate auch dann definiert, wenn
         # der Import unten scheitert (fail-open statt NameError).
@@ -31009,7 +31162,7 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None):
         # Museums-Regs. reg/tail nur durchreichen, wenn die Reg in den letzten
         # 60 Tagen wirklich fliegend gesehen wurde (aircraft_live/aircraft_track,
         # 24 h-Memo) — sonst beide Felder ehrlich weglassen.
-        _tail = m.get('reg')
+        _tail = m.get('reg') or (_facts.get('reg') if _facts else None)
         if isinstance(_tail, str):
             _tail = _tail.strip()
         if _tail and not _tail_recently_active(_tail):
