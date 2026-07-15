@@ -25997,6 +25997,24 @@ _EXPORT_SECRET_KEYS = {
     'refresh_token',
 }
 
+def _export_friend_entries(raw_friends):
+    """SECURITY (2026-07-15): Friends-Export ohne lebende Credentials.
+
+    Die Disk-Friends-Liste besteht aus NACKTEN Voll-Tokens (= Bearer-
+    Credentials der Freunde); `_redact_export_secrets` maskiert nur dict-Werte
+    per Key, blanke Listen-Strings liefen durch. Export deshalb ausschließlich
+    als pseudonyme, nicht zurückrechenbare Kennung (SHA-256-Stub; bewusst KEIN
+    [:8]-Klartext-Präfix — das dient anderswo als Legacy-Ownership-Schlüssel).
+    """
+    out = []
+    for t in (raw_friends or []):
+        out.append({
+            'friend_id': hashlib.sha256(str(t).encode('utf-8')).hexdigest()[:12],
+            'friend_token': '[redacted]',
+        })
+    return out
+
+
 def _redact_export_secrets(obj):
     """Maskiert rekursiv Auth-/Push-Tokens und die geheime iCal-Feed-URL im
     DSGVO-Export. Struktur und alle nicht-geheimen Inhalte bleiben unverändert;
@@ -26080,7 +26098,9 @@ def auth_export_data():
     # ── Friends ────────────────────────────────────────────────────────
     try:
         fr = _friends_load(token) or {}
-        export['friends'] = fr.get('friends') or []
+        # SECURITY (Rest-Leak-Fix 2026-07-15): nackte Friend-Tokens NIE
+        # exportieren — Details am Helper `_export_friend_entries`.
+        export['friends'] = _export_friend_entries(fr.get('friends'))
     except Exception as e:
         export['friends'] = []
         export['_friends_error'] = str(e)[:200]
@@ -29547,6 +29567,16 @@ def _fold_codeshare_flights(flights, cs_map):
     return out
 
 
+# RESPONSE-MEMO für /api/ax/route-history (Perf-Fund 174, Audit 2026-07-15):
+# der Endpoint kostete in Prod 21–23 s bei days=7 (iOS-Default) und rechnete
+# bei JEDEM Detail-Öffnen komplett neu. Historie ändert sich langsam, Tag-0
+# höchstens im Minutentakt → 120-s-Memo pro (Route, Fenster); identisches
+# Muster wie _FRIENDS_TODAY_MEMO (90 s). Wird in tests/conftest.py pro Test
+# geleert (Test-Isolation).
+_ROUTE_HISTORY_MEMO = {}              # (frm, to, ndays) → (monotonic_ts, payload)
+_ROUTE_HISTORY_MEMO_TTL_S = 120
+
+
 def _route_track_flight_set(frm, to, day, lo_iso, hi_iso):
     """Set der (auf `_fn_norm` normalisierten) Flugnummern, für die auf der
     Strecke frm→to am UTC-Tag `day` eine ECHTE geflogene Spur in aircraft_track
@@ -29588,6 +29618,17 @@ def ax_route_history(frm, to):
         ndays = max(1, min(int(request.args.get('days') or 7), 7))
     except Exception:
         ndays = 7
+    # 120-s-Response-Memo (Perf-Fund 174) — Doku am Modul-Global. Im
+    # Test-Modus KOMPLETT umgangen: die Suite mockt die Row-Quellen pro Test
+    # unterschiedlich, und der sys.modules['app']-Swap (test_calculation)
+    # kann das Original-Modul dem conftest-Cache-Reset entziehen — ein
+    # memoisiertes Ergebnis würde dann einen späteren Test vergiften.
+    _rh_memo_on = not app.testing
+    _rh_key = (frm, to, ndays)
+    if _rh_memo_on:
+        _rh_hit = _ROUTE_HISTORY_MEMO.get(_rh_key)
+        if _rh_hit and (time.monotonic() - _rh_hit[0]) < _ROUTE_HISTORY_MEMO_TTL_S:
+            return jsonify(_rh_hit[1])
     store_key = _store_key_for(board_ap, 'departure')
     # ZWEITE QUELLE (2026-07-03, User-Idee): Flüge von nicht gescrapten Abflug-
     # Flughäfen stehen trotzdem als ANKÜNFTE am (gescrapten) Ziel im Warehouse —
@@ -29655,7 +29696,20 @@ def ax_route_history(frm, to):
                               d_i, arr_key, None, dest_iata=frm))
                 except Exception:
                     ar = []
-            return i, (r, ar)
+            # has_track-Existenz-Set MIT in den Parallel-Prefetch (Perf-Fund
+            # 175, Audit 2026-07-15): vorher lief diese Query pro Tag SERIELL
+            # im Auswerte-Loop (~2,6 s Marginalkosten je Tag bei days=7).
+            trk = set()
+            try:
+                from datetime import datetime as _dtc, timezone as _tzc
+                _d0 = _dtc.strptime(d_i, '%Y-%m-%d').replace(tzinfo=_tzc.utc)
+                trk = _route_track_flight_set(
+                    frm, to, d_i,
+                    _d0.strftime('%Y-%m-%dT00:00:00Z'),
+                    (_d0 + _td(days=1)).strftime('%Y-%m-%dT00:00:00Z'))
+            except Exception:
+                trk = set()
+            return i, (r, ar, trk)
         finally:
             # _RH_TPE is per request, unlike _SB_TIMEOUT_EXECUTOR. Its threads
             # die after this map; release their thread-local Supabase pools.
@@ -29671,7 +29725,7 @@ def ax_route_history(frm, to):
 
     for i in range(ndays):
         d = (base - _td(days=i)).strftime('%Y-%m-%d')
-        rows, arr_rows = _day_rows[i]
+        rows, arr_rows, trk_prefetch = _day_rows[i]
         if i == 0:
             rows = [r for r in (rows or [])
                     if _row_in_day_and_flown(r, d, board_ap)]
@@ -29801,18 +29855,11 @@ def ax_route_history(frm, to):
         if flights:
             # has_track (2026-07-10): pro Flug UPFRONT markieren, ob eine ECHTE
             # geflogene Spur in aircraft_track liegt (Tier-1-Wahrheit des
-            # /api/ax/flown-track). EINE gebündelte Query je Tag (origin/dest +
-            # UTC-Tagesfenster wie der flown-track-Endpoint) statt N pro Flug.
-            # Additiv — fehlt/False bricht keinen bestehenden Consumer.
-            try:
-                # UTC-Tagesfenster exakt wie flown-track: [d 00:00Z, d+1 00:00Z).
-                from datetime import datetime as _dtc, timezone as _tzc
-                _d0 = _dtc.strptime(d, '%Y-%m-%d').replace(tzinfo=_tzc.utc)
-                lo_iso_d = _d0.strftime('%Y-%m-%dT00:00:00Z')
-                hi_iso_d = (_d0 + _td(days=1)).strftime('%Y-%m-%dT00:00:00Z')
-                trk_set = _route_track_flight_set(frm, to, d, lo_iso_d, hi_iso_d)
-            except Exception:
-                trk_set = set()
+            # /api/ax/flown-track). EINE gebündelte Query je Tag — seit
+            # 2026-07-15 im PARALLEL-PREFETCH (_fetch_day_rows) statt seriell
+            # hier im Loop (Perf-Fund 175). Additiv — fehlt/False bricht
+            # keinen bestehenden Consumer.
+            trk_set = trk_prefetch or set()
             for e in flights:
                 e['has_track'] = bool(_fn_norm(e.get('flight')) in trk_set)
             # Hinweis: arr-Zeilen tragen die ANKUNFTS-Zeit als sched — die
@@ -29823,11 +29870,17 @@ def ax_route_history(frm, to):
     # fliegt raus, sonst drückten nie-bestätigte 0-Rows die Quote künstlich hoch.
     judged = on_time + late + cancelled_cnt
     pct = round(100 * on_time / judged) if judged else None
-    return jsonify({'ok': True, 'origin': board_ap, 'dest': to, 'days': ndays,
-                    'on_time_pct': pct, 'total': total, 'on_time': on_time,
-                    'late': late, 'cancelled': cancelled_cnt,
-                    'unknown': unknown_cnt,
-                    'recent_days': days_out, 'source': 'airport_delay_obs'})
+    payload = {'ok': True, 'origin': board_ap, 'dest': to, 'days': ndays,
+               'on_time_pct': pct, 'total': total, 'on_time': on_time,
+               'late': late, 'cancelled': cancelled_cnt,
+               'unknown': unknown_cnt,
+               'recent_days': days_out, 'source': 'airport_delay_obs'}
+    if _rh_memo_on:
+        # Memo bounded halten (Cap ~256 Routen — ältester Eintrag kippt).
+        if len(_ROUTE_HISTORY_MEMO) > 256:
+            _ROUTE_HISTORY_MEMO.pop(next(iter(_ROUTE_HISTORY_MEMO)), None)
+        _ROUTE_HISTORY_MEMO[_rh_key] = (time.monotonic(), payload)
+    return jsonify(payload)
 
 
 def _flight_from_live_board(iata, fn):

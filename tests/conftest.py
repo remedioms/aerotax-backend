@@ -39,6 +39,7 @@ os.environ.setdefault('AEROX_REQUIRE_TOKEN_BINDING', '0')
 #   blueprints.aerox_data_blueprint: _UFLIGHT_MEMO, _LIFECYCLE_MEMO
 _MEMO_GLOBALS = {
     '_FRIENDS_TODAY_MEMO': None,
+    '_ROUTE_HISTORY_MEMO': None,
     '_PROFILE_HB_MEMO': None,
     '_TRIP_STATS_CACHE': None,
     '_FLIGHT_MERGE_CACHE': None,
