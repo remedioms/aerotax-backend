@@ -865,6 +865,35 @@ def test_dep_delayed_minutes_beweis_haelt_im_delay_fenster():
     assert r['state'] == STATE_PRE_FLIGHT
 
 
+def test_arrival_day_keyed_overnight_leg_wird_zurueckdatiert_und_fliegt():
+    # Julien LH423 2026-07-16: LH keyt das Über-Nacht-Leg am ANKUNFTS-Tag —
+    # der Sektor trägt dep „16.07 18:40 EDT" (= Vortags-Abflugzeit aufs
+    # heutige Datum gestempelt) und arr 16.07 06:50 CEST, also arr VOR dep.
+    # _norm_legs muss den dep um 1 Tag zurückdatieren; damit ist der Flug um
+    # 02:40Z längst unterwegs → flying, nicht „Nächster Flug 18:40".
+    secs = [{'flight': 'LH423', 'from': 'BOS', 'to': 'FRA',
+             'dep_iso': '2026-07-16T18:40:00-04:00',
+             'arr_iso': '2026-07-16T06:50:00+02:00', 'tail': 'D-ABYN'}]
+    r = _resolve(datetime(2026, 7, 16, 2, 40, tzinfo=timezone.utc),
+                 sectors=secs,
+                 obs={'LH423': {'status': 'Verspätet', 'delay_side': 'dep',
+                                'status_dep': 'Delayed 75 Minutes'}})
+    assert r['state'] == STATE_FLYING
+    assert (r['current_leg'] or {}).get('reg') == 'D-ABYN'
+
+
+def test_arrival_day_keyed_unplausible_dauer_bleibt_synthetisch():
+    # Gegenprobe: arr ≤ dep, aber die Rückdatierung ergäbe eine unplausible
+    # Dauer (> 20 h) → KEINE Identitäts-Erfindung, synthetisches Fenster wie
+    # gehabt (dep bleibt, arr = dep + 3 h).
+    from blueprints.crew_live_state import _norm_legs
+    legs = _norm_legs([{'flight': 'LH1', 'from': 'FRA', 'to': 'MUC',
+                        'dep_iso': '2026-07-16T10:00:00Z',
+                        'arr_iso': '2026-07-16T09:00:00Z'}])
+    assert legs and legs[0]['arr_synth'] is True
+    assert legs[0]['dep'].isoformat().startswith('2026-07-16T10:00')
+
+
 def test_norm_legs_reg_alias_fuellt_tail():
     # Tibor-Sektor keyt die Maschine als 'reg' statt 'tail' → das current_leg
     # muss die Reg trotzdem tragen (aircraft_live-Reg-Match).

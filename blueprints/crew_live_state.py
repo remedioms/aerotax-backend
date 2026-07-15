@@ -521,6 +521,19 @@ def _norm_legs(sectors):
             to = None
         arr = _parse_iso(s.get('arr_iso'))
         arr_synth = False
+        if arr is not None and arr <= dep:
+            # ARRIVAL-DAY-gekeyte iCal-Legs (Julien LH423 BOS→FRA 2026-07-16):
+            # LH keyt Über-Nacht-Legs am ANKUNFTS-Tag — Tages-Datum + lokale
+            # ABFLUG-Zeit des Vortags ergibt dep NACH arr (dep „16.07 18:40 EDT",
+            # arr 16.07 06:50 CEST). Der heutige Resolver-Lauf sah dadurch einen
+            # Zukunfts-Abflug („Nächster Flug 18:40") und blockte den Overnight-
+            # Carry. Physik-Reparatur: dep um 1 Tag zurück, wenn GENAU das eine
+            # plausible Leg-Dauer (0 < Dauer ≤ 20 h) ergibt — sonst wie gehabt
+            # das synthetische Fenster (keine erfundene Identität).
+            _cand = dep - _dt.timedelta(days=1)
+            _dur_h = (arr - _cand).total_seconds() / 3600.0
+            if 0 < _dur_h <= 20:
+                dep = _cand
         if arr is None or arr <= dep:
             arr = dep + _dt.timedelta(hours=3)
             arr_synth = True
