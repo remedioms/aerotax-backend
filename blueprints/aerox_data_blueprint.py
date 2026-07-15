@@ -4188,7 +4188,8 @@ def _status_category_from_facts(flight, facts, now=None):
         return None
 
 
-def _enrich_flight_status_with_obs(flight, date=None, allow_paid=True):
+def _enrich_flight_status_with_obs(flight, date=None, allow_paid=True,
+                                   nogrpc=False):
     """P4-Verdrahtung: füllt fehlende Zeit-/Gate-/Status-Felder eines
     FlightStatusInfo-Dicts (resolve-flight/-callsign → iOS `schedule.info`) aus den
     geteilten Board-Fakten. So zeigt auch der Detail-Screen Soll/Ist-Ankunft + Gate,
@@ -4199,7 +4200,15 @@ def _enrich_flight_status_with_obs(flight, date=None, allow_paid=True):
     BLOCKIERENDE paid-FR24-by-number-Nachschlag der Zeiten-Lücke bleibt draussen —
     er lag SYNCHRON auf dem kritischen resolve-Pfad VOR dem Fan-out (~5 s auf NAS/
     gRPC). Der freie gRPC-Korridor läuft weiter; die paid-Zeiten holt der Standalone-
-    Endpoint (`?nofr24=1` NICHT gesetzt) bzw. iOS non-blocking. Free-first-Invariante 5."""
+    Endpoint (`?nofr24=1` NICHT gesetzt) bzw. iOS non-blocking. Free-first-Invariante 5.
+
+    `nogrpc=True` (Owner 2026-07-15 „Detail-Kaltstart ~8 s"): NUR der Aggregat-
+    resolve-Subcall setzt das. Der GRATIS FR24-gRPC-Korridor (_flight_times_free_
+    first) für die Zeiten-Lücke lief bisher SYNCHRON hier drin auf dem kritischen
+    (blockierenden) resolve-Pfad VOR dem Fan-out — 1–8 s = der Kaltstart-Pol. Das
+    Aggregat holt dieselben Zeiten jetzt als EIGENEN parallelen Fan-out-Task MIT
+    HARTEM TIMEOUT (nur Latenz-Umbau, KEIN Mehr-Spend: identischer free-first-Call,
+    gemeinsames 5-Min-Memo). Board-/Obs-Fills darüber bleiben unverändert."""
     if not isinstance(flight, dict):
         return flight
     fn = (flight.get('flight') or '').replace(' ', '').upper()
@@ -4260,6 +4269,11 @@ def _enrich_flight_status_with_obs(flight, date=None, allow_paid=True):
         _past_service = False
     _need_ops = bool(allow_paid and (_operational or _past_service)
                      and not (flight.get('est_dep') or flight.get('est_arr')))
+    if nogrpc:
+        # Aggregat-Pfad: den blockierenden gRPC-/paid-Zeiten-Nachschlag NICHT
+        # hier ziehen (kritischer resolve-Pfad). Das Aggregat macht ihn parallel
+        # mit hartem Timeout + Memo-Nachwärmen. Board-/Obs-Zeiten oben bleiben.
+        return flight
     if (not flight.get('sched_dep') or not flight.get('sched_arr') or _need_ops):
         _t = _flight_times_free_first(fn, d, flight.get('dep_iata'),
                                       flight.get('arr_iata'),
@@ -5648,6 +5662,9 @@ def ax_resolve_callsign(callsign):
     # der Standalone-App-Endpoint (Bearer vorhanden, Flag NICHT gesetzt) darf
     # weiter paid nachziehen; anonym bleibt auch dort spend-frei.
     _nofr24 = str(request.args.get('nofr24', '')).lower() in ('1', 'true', 'yes')
+    # nogrpc=1 (nur der Aggregat-resolve-Subcall, Owner 2026-07-15): siehe
+    # ax_resolve_flight — freier gRPC-Zeiten-Korridor raus vom kritischen Pfad.
+    _nogrpc = str(request.args.get('nogrpc', '')).lower() in ('1', 'true', 'yes')
     _authed = (request.headers.get('Authorization') or '').strip().lower() \
         .startswith('bearer ')
     _allow_paid = _authed and not _nofr24
@@ -5672,7 +5689,8 @@ def ax_resolve_callsign(callsign):
                     pass
         # P4: Soll/Ist-Zeiten+Gate — ?date= (z.B. vom Detail-Aggregat) durchreichen
         flight = _enrich_flight_status_with_obs(flight, date=date_q,
-                                                allow_paid=_allow_paid)
+                                                allow_paid=_allow_paid,
+                                                nogrpc=_nogrpc)
         return jsonify({'ok': True, 'callsign': cs, 'flight': flight,
                         'source': src})
     return jsonify({'ok': False, 'callsign': cs, 'error': 'not_found'}), 200
@@ -5700,6 +5718,12 @@ def ax_resolve_flight(flightno):
     # iOS non-blocking. Standalone-App-Endpoint (Bearer vorhanden, Flag NICHT
     # gesetzt) darf paid nachziehen; anonym bleibt auch dort spend-frei.
     _nofr24 = str(request.args.get('nofr24', '')).lower() in ('1', 'true', 'yes')
+    # nogrpc=1 (nur der Aggregat-resolve-Subcall, Owner 2026-07-15): auch den
+    # GRATIS FR24-gRPC-Zeiten-Korridor im Enrich auslassen — er lag SYNCHRON auf
+    # dem blockierenden resolve-Pfad (Kaltstart-Pol 1–8 s). Das Aggregat holt die
+    # Zeiten parallel mit hartem Timeout + Memo-Nachwärmen. Standalone (Flag NICHT
+    # gesetzt) zieht den freien Korridor weiter direkt.
+    _nogrpc = str(request.args.get('nogrpc', '')).lower() in ('1', 'true', 'yes')
     _authed = (request.headers.get('Authorization') or '').strip().lower() \
         .startswith('bearer ')
     _allow_paid = _authed and not _nofr24
@@ -5734,7 +5758,8 @@ def ax_resolve_flight(flightno):
                     pass
         # P4: Soll/Ist-Zeiten+Gate — ?date= (z.B. vom Detail-Aggregat) durchreichen
         flight = _enrich_flight_status_with_obs(flight, date=date_q,
-                                                allow_paid=_allow_paid)
+                                                allow_paid=_allow_paid,
+                                                nogrpc=_nogrpc)
         return jsonify({'ok': True, 'number': fn, 'flight': flight, 'source': src})
     return jsonify({'ok': False, 'number': fn, 'error': 'not_found'}), 200
 
@@ -5856,14 +5881,17 @@ def ax_flight_detail(query):
         # blockierenden paid-FR24-gRPC-Nachschlag (~5 s auf NAS) für die Zeiten-
         # Lücke — obwohl das Aggregat free-first ist (kein Bearer/`?paid=`). Der
         # freie gRPC-Korridor läuft weiter; die teuren Zeiten holt iOS non-blocking.
+        # nogrpc=1 (Owner 2026-07-15): auch der FREIE gRPC-Zeiten-Korridor bleibt
+        # vom kritischen resolve-Pfad draussen (Kaltstart-Pol) — er läuft unten
+        # als eigener Fan-out-Task mit hartem Timeout + Memo-Nachwärmen.
         if is_cs:
             return _detail_subcall(_app, '/api/ax/resolve-callsign/%s%s'
                                    % (urllib.parse.quote(q),
-                                      _qs(date=date_q, nofr24=1)),
+                                      _qs(date=date_q, nofr24=1, nogrpc=1)),
                                    ax_resolve_callsign, q)
         return _detail_subcall(_app, '/api/ax/resolve-flight/%s%s'
                                % (urllib.parse.quote(q),
-                                  _qs(date=date_q, nofr24=1)),
+                                  _qs(date=date_q, nofr24=1, nogrpc=1)),
                                ax_resolve_flight, q)
 
     def _info_call(fn):
@@ -5906,7 +5934,7 @@ def ax_flight_detail(query):
 
     # Kein `with` (= shutdown(wait=True) würde auf den hängenden Worker warten
     # und den result-Timeout entwerten) — Worker laufen ggf. im Hintergrund aus.
-    ex = ThreadPoolExecutor(max_workers=4)
+    ex = ThreadPoolExecutor(max_workers=5)
     try:
         # Phase A: resolve + (flight-info schon jetzt, wenn die IATA-Nummer feststeht —
         # bei Flugnummer-Suche = die Query selbst; bei Funkname-Suche erst nach resolve).
@@ -5962,6 +5990,26 @@ def ax_flight_detail(query):
                   if (origin and dest) else None)
         f_photo = (ex.submit(_detail_executor_task, _photo_call, reg)
                    if reg else None)
+        # FREIE gRPC-ZEITEN als PARALLELER Fan-out-Task statt synchron im resolve
+        # (Owner 2026-07-15 „Detail-Kaltstart ~8 s"): der Zeiten-Korridor
+        # (_flight_times_free_first → FR24-gRPC live_feed+details) ist mit 1–8 s
+        # der Kaltstart-Pol und lag bisher BLOCKIEREND auf dem kritischen resolve-
+        # Pfad VOR dem Fan-out. Er läuft jetzt hier parallel (kein Mehr-Spend:
+        # identischer free-first-Call, gemeinsames 5-Min-Memo). Nur wenn resolve
+        # eine Soll-Seite offen ließ — sonst gar kein gRPC (spart den Call).
+        _need_times = bool(
+            fn_iata and origin and dest
+            and not (
+                (resolve_flight or {}).get('sched_dep')
+                and (resolve_flight or {}).get('sched_arr')))
+        def _grpc_times_call():
+            return _flight_times_free_first(
+                fn_iata, date_q, origin, dest,
+                callsign=real_cs, allow_paid=False)
+        f_times = (ex.submit(_detail_executor_task, _grpc_times_call)
+                   if _need_times else None)
+        _times_budget = 1.5          # s — hartes Zeitbudget AB Task-Start
+        _times_started = time.time()
         # FREIE Live-Position (Owner 2026-07-11 „warum keine live position?"): aus dem
         # aircraft_live-Warehouse (FR24-gRPC-Harvester — sieht AUCH über Ozean/Russland,
         # wo iOS-adsb.lol blind ist). EIN billiger Supabase-Read, KEIN paid/kein adsb.lol
@@ -6003,8 +6051,27 @@ def ax_flight_detail(query):
         if f_route is not None:
             route = _res(f_route)
         history = _res(f_hist)
-        photo = _res(f_photo)
+        # Foto = reines Nice-to-have (iOS lädt es ohnehin non-blocking separat):
+        # harter 2.5-s-Deckel, damit ein lahmes planespotters den ganzen Aggregat-
+        # Kaltstart nicht hält. Timeout → photo=null in DIESER Antwort; der warme
+        # Folge-Aufruf (Foto ist hart in ax_photo_cache gecacht) trägt es dann.
+        photo = _res(f_photo, timeout=2.5)
         live_res = _res(f_live, timeout=5)
+        # Freie gRPC-Zeiten mit HARTEM Timeout (1.5 s AB Task-Start): kommen sie
+        # rechtzeitig, in resolve_flight mergen (nur leere Felder); dauert der
+        # Korridor länger (Langstrecke/Miss → Riesenbox), NICHT blocken — die
+        # Felder bleiben beim Kaltstart null und das Memo wird unten im
+        # Hintergrund nachgewärmt. Das Budget läuft ab Task-Start (nicht ab dieser
+        # Zeile) — sonst addierte sich der schon parallel verstrichene Fan-out
+        # (photo/history) NOCH mal 1.5 s obendrauf.
+        _times_remaining = max(0.05, _times_budget - (time.time() - _times_started))
+        times_res = (_res(f_times, timeout=_times_remaining)
+                     if f_times is not None else None)
+        _times_timed_out = bool(f_times is not None and times_res is None)
+        if times_res and isinstance(resolve_flight, dict):
+            for _k in ('sched_dep', 'est_dep', 'sched_arr', 'est_arr'):
+                if times_res.get(_k) and not resolve_flight.get(_k):
+                    resolve_flight[_k] = times_res[_k]
     finally:
         ex.shutdown(wait=False)
 
@@ -6036,6 +6103,48 @@ def ax_flight_detail(query):
     # klebt ein transienter Ausfall/Timeout als Negativ-Antwort im Cache.
     if resolve_flight or info:
         _memo_put(memo_key, out)
+
+    # MEMO-NACHWÄRMEN (Owner 2026-07-15): lief der freie gRPC-Zeiten-Korridor
+    # ins 1.5-s-Timeout (Kaltstart), fehlen sched_arr/eta in DIESER Antwort. Ein
+    # Detached-Daemon holt sie fertig (der Task läuft eh im Hintergrund weiter;
+    # _flight_times_free_first teilt das 5-Min-Memo → KEIN Doppel-Spend) und
+    # patcht sie ins Detail-Memo, sodass der NÄCHSTE (warme) Aufruf die Zeiten
+    # trägt. Kein Feld geht dauerhaft verloren — nur der Kaltstart ist schneller.
+    if (_times_timed_out and isinstance(resolve_flight, dict)
+            and fn_iata and origin and dest):
+        def _warm_times(app_obj, mkey, base_out, rflight,
+                        _fn=fn_iata, _cs=real_cs, _o=origin, _d=dest,
+                        _dt=date_q):
+            try:
+                t = _flight_times_free_first(
+                    _fn, _dt, _o, _d, callsign=_cs, allow_paid=False) or {}
+                if not t:
+                    return
+                patched = False
+                for k in ('sched_dep', 'est_dep', 'sched_arr', 'est_arr'):
+                    if t.get(k) and not rflight.get(k):
+                        rflight[k] = t[k]
+                        patched = True
+                if not patched:
+                    return
+                merged = dict(base_out)
+                merged['resolve'] = rflight
+                _memo_put(mkey, merged)
+            except Exception:
+                pass
+            finally:
+                try:
+                    from app import _close_current_thread_supabase_client
+                    _close_current_thread_supabase_client()
+                except Exception:
+                    pass
+        try:
+            threading.Thread(
+                target=_warm_times,
+                args=(_app, memo_key, out, resolve_flight),
+                daemon=True).start()
+        except Exception:
+            pass
     return jsonify(out)
 
 
