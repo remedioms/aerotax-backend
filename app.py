@@ -29682,41 +29682,83 @@ def ax_route_history(frm, to):
     # Flask-Kontext (reine Supabase-Reads, thread-safe wie der Friend-Roster-Fan-out
     # app.py:~12455) → kein app_context nötig. Die Merge-/Filter-/Quoten-Logik unten
     # bleibt BYTE-IDENTISCH — nur das Laden wird nebenläufig.
-    def _fetch_day_rows(i):
+    # INTRA-TAG-PARALLELITÄT (Perf-Fund 173, Audit 2026-07-15): die DREI
+    # voneinander unabhängigen I/O-Reads eines Tages (dep-Board, arr-Board,
+    # has_track-Set) liefen bisher SERIELL innerhalb von `_fetch_day_rows`.
+    # Für Tag 0 ist das der Kalt-Latenz-Pol: `_departed_rows_from_store` zieht
+    # beim ersten Airport-Kontakt des Workers eine VOLLE Tages-Ladung des
+    # Delay-Stores aus Supabase (`_delay_store_load_from_sb`, ~3 s an einem
+    # Hub wie FRA), danach kommen arr-Store (~1 s) und Track-Query (~0,5 s) —
+    # in Summe ~4,7 s (days=1 misst live genau das). Die drei Reads berühren
+    # keinen Flask-Kontext (reine Supabase-Reads, thread-safe wie der Roster-
+    # Fan-out) → nebenläufig ziehen, Merge-/Filter-/Quoten-Logik bleibt BYTE-
+    # IDENTISCH (nur das Laden wird parallel). Erwartung: Tag 0 ≈ max(dep, arr,
+    # track) statt Summe.
+    def _fetch_dep(i, d_i):
+        return (_departed_rows_from_store(store_key) if i == 0
+                else _board_rows_from_obs_for_date(
+                    d_i, store_key, None, dest_iata=to))
+
+    def _fetch_arr(i, d_i):
+        if not arr_key:
+            return []
         try:
-            d_i = (base - _td(days=i)).strftime('%Y-%m-%d')
-            r = (_departed_rows_from_store(store_key) if i == 0
-                 else _board_rows_from_obs_for_date(
-                     d_i, store_key, None, dest_iata=to))
-            ar = []
-            if arr_key:
-                try:
-                    ar = (_departed_rows_from_store(arr_key) if i == 0
-                          else _board_rows_from_obs_for_date(
-                              d_i, arr_key, None, dest_iata=frm))
-                except Exception:
-                    ar = []
-            # has_track-Existenz-Set MIT in den Parallel-Prefetch (Perf-Fund
-            # 175, Audit 2026-07-15): vorher lief diese Query pro Tag SERIELL
-            # im Auswerte-Loop (~2,6 s Marginalkosten je Tag bei days=7).
-            trk = set()
+            return (_departed_rows_from_store(arr_key) if i == 0
+                    else _board_rows_from_obs_for_date(
+                        d_i, arr_key, None, dest_iata=frm))
+        except Exception:
+            return []
+
+    def _fetch_trk(d_i):
+        # has_track-Existenz-Set (Perf-Fund 175): eine gebündelte Query je Tag.
+        try:
+            from datetime import datetime as _dtc, timezone as _tzc
+            _d0 = _dtc.strptime(d_i, '%Y-%m-%d').replace(tzinfo=_tzc.utc)
+            return _route_track_flight_set(
+                frm, to, d_i,
+                _d0.strftime('%Y-%m-%dT00:00:00Z'),
+                (_d0 + _td(days=1)).strftime('%Y-%m-%dT00:00:00Z'))
+        except Exception:
+            return set()
+
+    def _fetch_day_rows(i):
+        from concurrent.futures import ThreadPoolExecutor as _RH_TPE
+        d_i = (base - _td(days=i)).strftime('%Y-%m-%d')
+        # Die drei Reads dieses Tages nebenläufig ziehen. Jeder Worker gibt
+        # danach seinen thread-lokalen Supabase-Pool frei (kurzlebige Threads,
+        # wie beim Tag-Fan-out) — sonst überleben tote HTTP/2-Pools den map().
+        def _dep_task():
             try:
-                from datetime import datetime as _dtc, timezone as _tzc
-                _d0 = _dtc.strptime(d_i, '%Y-%m-%d').replace(tzinfo=_tzc.utc)
-                trk = _route_track_flight_set(
-                    frm, to, d_i,
-                    _d0.strftime('%Y-%m-%dT00:00:00Z'),
-                    (_d0 + _td(days=1)).strftime('%Y-%m-%dT00:00:00Z'))
-            except Exception:
-                trk = set()
-            return i, (r, ar, trk)
-        finally:
-            # _RH_TPE is per request, unlike _SB_TIMEOUT_EXECUTOR. Its threads
-            # die after this map; release their thread-local Supabase pools.
-            _close_current_thread_supabase_client()
+                return _fetch_dep(i, d_i)
+            finally:
+                _close_current_thread_supabase_client()
+
+        def _arr_task():
+            try:
+                return _fetch_arr(i, d_i)
+            finally:
+                _close_current_thread_supabase_client()
+
+        def _trk_task():
+            try:
+                return _fetch_trk(d_i)
+            finally:
+                _close_current_thread_supabase_client()
+
+        with _RH_TPE(max_workers=3) as _sub_ex:
+            f_dep = _sub_ex.submit(_dep_task)
+            f_arr = _sub_ex.submit(_arr_task)
+            f_trk = _sub_ex.submit(_trk_task)
+            r = f_dep.result()
+            ar = f_arr.result()
+            trk = f_trk.result()
+        return i, (r, ar, trk)
     _day_rows = {}
     if ndays > 1:
         from concurrent.futures import ThreadPoolExecutor as _RH_TPE
+        # Tage parallel, und JEDER Tag intern seine 3 Reads parallel — der
+        # Worker-Cap bleibt an der Tages-Achse (min(ndays,4)); die Intra-Tag-
+        # Pools sind kurzlebig und je 3 Threads.
         with _RH_TPE(max_workers=min(ndays, 4)) as _rh_ex:
             for _i, _pair in _rh_ex.map(_fetch_day_rows, range(ndays)):
                 _day_rows[_i] = _pair
