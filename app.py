@@ -31652,6 +31652,27 @@ def ax_flight_info(flightno):
                     and _tail_recently_active(x.get('reg'))]
         except Exception:
             pass
+        # FINALER SELBSTKONSISTENZ-GUARD (Fable 2026-07-15, LH423-Livefall):
+        # die Merge-Schichten sehen bei arr-only-Rows z.T. nur HH:MM-Zeiten
+        # (kein absoluter Anker → deren Wrong-Day-Scrub fail-open). HIER, an
+        # der fertigen Antwort, liegen esti_arr UND sched_arr aber als volle
+        # ISO-Instants vor — eine est-Ankunft >6h VOR der eigenen Soll-Ankunft
+        # ist physikalisch die fremde Vortages-Instanz ⇒ Ist-Felder ehrlich
+        # leeren, Soll/Route/Reg bleiben. Fail-open bei Parse-Problemen.
+        try:
+            _ea, _sa = out.get('esti_arr'), out.get('sched_arr')
+            if isinstance(_ea, str) and isinstance(_sa, str)                     and len(_ea) >= 16 and len(_sa) >= 16:
+                _dea = datetime.fromisoformat(_ea.replace('Z', '+00:00'))
+                _dsa = datetime.fromisoformat(_sa.replace('Z', '+00:00'))
+                if _dea.tzinfo is not None and _dsa.tzinfo is not None                         and (_dsa - _dea).total_seconds() > 6 * 3600:
+                    out['foreign_day_arr'] = True
+                    for _k in ('esti', 'esti_arr', 'status', 'arr_status'):
+                        out[_k] = None
+                    out['delay_min'] = None
+                    out['arr_delay_min'] = None
+                    out['delay_known'] = False
+        except Exception:
+            pass
         return _public_cache_headers(jsonify(out))
     # Weder Historie noch Live-Feed → Client fällt auf AeroDataBox zurück.
     return jsonify({'ok': True, 'found': False, 'flight': fn, 'source': 'none'})
