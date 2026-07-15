@@ -68,6 +68,13 @@ _ARR_BUFFER_MIN = 40           # Verspätungs-Puffer ohne jede Beobachtung
 _LANDED_RECENT_MIN = 90        # „Gelandet in X" statt „Layover X" nach Landung
 _STALE_GROUNDED_MIN = 30       # grounded-Obs nach Plan-Ankunft+30' → Live-Check
 _NEAR_AIRPORT_KM = 8.0         # „am Boden nahe Flughafen"-Radius (Gegencheck)
+_DEP_LIFTOFF_GRACE_MIN = 15    # Zeit-Physik-Umschalter (Julien/Tibor 2026-07-16):
+                               # steht der Flug nach eff_dep + dieser Spanne immer
+                               # noch auf „grounded", OHNE echten Boden-Beweis am
+                               # ABFLUGORT, ist die grounded-Obs arr-seitig/stale →
+                               # die Uhr übernimmt (enroute), Position bleibt leer
+                               # bis aircraft_live liefert. Klein: der Abflug-Moment
+                               # ist die ehrliche Grenze zwischen Warten und Fliegen.
 
 # ── PRE-FLIGHT-TIMELINE (Owner 2026-07-12) ──────────────────────────────────
 # Feingranulare Phase VOR dem Abflug (nur state == pre_flight; zwischen zwei
@@ -376,6 +383,71 @@ def _default_bucket(status):
     return None
 
 
+# Board-Status-Tokens, die BODEN-Aktivität am ABFLUG-Flughafen belegen (der Flug
+# ist nachweislich noch nicht los): Boarding/Gate-Aktivität/Gate zu. NICHT dabei:
+# reines „Verspätet"/„Delayed" (kann von der ANKUNFTS-Tafel kommen — ein
+# verspäteter Flug fliegt längst) und „Scheduled"/„On time" (nur Plan-Echo).
+_DEP_GROUND_WORDS = ('boarding', 'einsteigen', 'last call', 'final call',
+                     'letzter aufruf', 'gate', 'closed', 'geschlossen',
+                     'check-in', 'checkin', 'go to gate', 'on time', 'ontime',
+                     'pünktlich', 'puenktlich', 'scheduled', 'planmäßig',
+                     'planmaessig')
+# Reine VERSPÄTUNGS-Wörter: mehrdeutig (Abflug- ODER Ankunfts-Tafel). Sie zählen
+# NUR als Boden-Beweis, wenn sie NACHWEISLICH abflugseitig sind (status_dep /
+# dep_delay_min / delay_side=='dep') — ein bloßes gemergtes „Verspätet" kommt bei
+# einem Über-Ozean-Flug von der Ankunfts-Tafel (Julien/Tibor 2026-07-16).
+_DELAY_ONLY_WORDS = ('delayed', 'verspätet', 'verspaetet', 'delay')
+
+
+def _dep_ground_proof(o, bucket_of=None):
+    """PUR: belegt der Board-Record ECHTEN Boden-Kontakt am ABFLUG-Flughafen?
+    (Julien/Tibor 2026-07-16). Der crew obs_lookup mergt beide Tafel-Seiten; der
+    gemergte `status` ist „arr gewinnt", also trägt er bei einem Über-Ozean-Flug
+    OHNE Abflug-Board die ANKUNFTS-Tafel-Meldung (FRA: „Verspätet") — das ist KEIN
+    Beweis, dass die Maschine noch am Boden steht (sie fliegt seit Stunden). Nur
+    diese Signale zählen als „noch nicht abgeflogen":
+      • ein DEP-seitiger Board-Status (`status_dep`) mit Gate-/Boarding-Wort, ODER
+      • ein ABFLUG-Delay (`dep_delay_min` gesetzt bzw. `delay_side == 'dep'`) —
+        das ABFLUG-Board meldet die Verspätung, der Flug steht noch am Gate
+        (Basti-Fall LH900: est_dep verschoben, aber noch nicht los), ODER
+      • ein beobachtetes Boarding (status_dep-Boarding-Wort).
+    Ein rein arr-seitiges „Verspätet"/„Delayed" (delay_side == 'arr' bzw. nur
+    `arr_delay_min`/`delay_min`, KEIN status_dep, KEIN dep_delay_min) ist KEIN
+    Boden-Beweis — das ist die ANKUNFTS-Tafel eines längst fliegenden Fluges
+    (Julien/Tibor-Über-Ozean-Fall). Wirft nie."""
+    try:
+        if not isinstance(o, dict):
+            return False
+        sd = str(o.get('status_dep') or '').strip().lower()
+        if sd and not ('deboard' in sd or 'ausstieg' in sd):
+            if any(t in sd for t in _DEP_GROUND_WORDS):
+                return True
+            bkt = bucket_of if callable(bucket_of) else _default_bucket
+            if bkt(o.get('status_dep')) == 'grounded':
+                return True
+        # ABFLUG-Delay → das Abflug-Board hat die Verspätung gemeldet, der Flug
+        # steht noch am Gate. Ein expliziter dep_delay_min ODER delay_side=='dep'
+        # zählt; ein rein arr-seitiger Delay (nur arr_delay_min/delay_min) NICHT.
+        if _num(o.get('dep_delay_min')) is not None:
+            return True
+        if str(o.get('delay_side') or '').strip().lower() == 'dep':
+            return True
+        # Gemergter `status` OHNE Seiten-Split: ein eindeutiges Boden-Aktivitäts-
+        # Wort (Boarding/Gate/on time/scheduled/…) belegt den Abflug-Boden — die
+        # DEP-Tafel meldet den Flug „am Gate/pünktlich" (Basti „on time"-Fall).
+        # Ein bloßes „Verspätet"/„Delayed" (mehrdeutig, oft ARR-Tafel) zählt hier
+        # NICHT — das ist genau der Julien/Tibor-Über-Ozean-Fall.
+        s = str(o.get('status') or '').strip().lower()
+        if s and not ('deboard' in s or 'ausstieg' in s):
+            if any(t in s for t in _DELAY_ONLY_WORDS):
+                return False
+            if any(t in s for t in _DEP_GROUND_WORDS):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _default_hhmm(d, _iata=None):
     """Fallback-Zeitformat: UTC HH:MM (Consumers injizieren die Station-lokale
     Variante via build_local_hhmm(airport_tz))."""
@@ -407,9 +479,21 @@ def _norm_legs(sectors):
             arr = dep + _dt.timedelta(hours=3)
             arr_synth = True
         fno = str(s.get('flight') or '').replace(' ', '').upper() or None
+        # TAIL/REG tolerant lesen (Julien/Tibor 2026-07-16): der iOS-Roster-Push
+        # keyt die Maschine je nach Reader-Pfad uneinheitlich — die iOS-Bordkarte
+        # zeigt die Reg (DABYT), das Feld liegt im Sektor-Datensatz aber mal als
+        # 'tail', mal als 'reg'/'ac_reg'/'registration'/'aircraft_reg'. Erste
+        # nicht-leere Variante gewinnt, damit der aircraft_live-Positions-Tier
+        # (Reg-Match) die Maschine auch findet, wenn nur EIN Alias gesetzt ist.
+        _tail = None
+        for _k in ('tail', 'reg', 'ac_reg', 'registration', 'aircraft_reg'):
+            _v = str(s.get(_k) or '').strip().upper()
+            if _v:
+                _tail = _v
+                break
         legs.append({'dep_ap': frm, 'arr_ap': to, 'flight': fno,
                      'dep': dep, 'arr': arr, 'arr_synth': arr_synth,
-                     'tail': (str(s.get('tail') or '').strip().upper() or None)})
+                     'tail': _tail})
     legs.sort(key=lambda l: l['dep'])
     return legs
 
@@ -769,7 +853,19 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             v = None
             try:
                 if callable(live_lookup) and leg['flight']:
+                    # Roster-Tail als REG mitgeben (Julien/Tibor 2026-07-16): der
+                    # aircraft_live-Store keyt die Reg OHNE Bindestrich (DABYN);
+                    # der Store-Read normalisiert 'D-ABYN' → 'DABYN' selbst und
+                    # kann so die Maschine per Reg finden, wenn der Welt-Harvester
+                    # den Korridor noch nicht per Flugnummer erfasst hat.
+                    v = live_lookup(leg['flight'], leg['dep_ap'], leg['arr_ap'],
+                                    leg.get('tail'))
+            except TypeError:
+                # Alt-Callsite/Test-Lookup ohne reg-Parameter → 3-arg-Fallback.
+                try:
                     v = live_lookup(leg['flight'], leg['dep_ap'], leg['arr_ap'])
+                except Exception:
+                    v = None
             except Exception:
                 v = None
             leg['live'] = v if isinstance(v, dict) else None
@@ -1047,6 +1143,44 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                      or 'boarding' in _st_low or _eng_conf == 'observed')):
             _b_raw = 'grounded'
         if _b_raw == 'grounded':
+            # ZEIT-PHYSIK-UMSCHALTER bei arr-seitiger Beobachtung (Julien/Tibor
+            # 2026-07-16, Über-Ozean-Nachtflug): der gemergte `status` ist „arr
+            # gewinnt" → ein Flug OHNE Abflug-Board (BOS/SFO) trägt die FRA-
+            # ANKUNFTS-Tafel „Verspätet" und wurde damit als „grounded" gelesen
+            # und ewig auf „Nächster Flug" gepinnt, obwohl er seit ~2 h fliegt.
+            # Ein rein arr-seitiges „Verspätet" ist KEIN Boden-Beweis am Abflug
+            # (_dep_ground_proof). Steht der Flug nach dem EFFEKTIVEN Abflug +
+            # Gnadenspanne immer noch nur wegen einer solchen arr-Obs auf grounded,
+            # übernimmt die Uhr: er ist „unterwegs" (der Uhr-Zweig unten kippt auf
+            # flying — CONF_PLAN, keine erfundene Position; aircraft_live liefert
+            # die echte Atlantik-Position sobald die Kachel die Maschine sieht).
+            # Ein echter Abflug-Boden-Beweis (dep-Board Boarding/Gate/Delay) oder
+            # ein annullierter Flug (oben schon gefangen) behält den Pin.
+            if (not _dep_ground_proof(o, bucket_of)
+                    and now >= eff_dep + _dt.timedelta(
+                        minutes=_DEP_LIFTOFF_GRACE_MIN)):
+                # Live-Beweis darf trotzdem in BEIDE Richtungen kippen: sichtbar
+                # am Boden nahe dep → wartet doch; nahe arr → schon gelandet.
+                lv = _live(leg)
+                if lv and lv.get('on_ground') and lv.get('near_dep'):
+                    picked = ('waiting', idx, CONF_OBSERVED)
+                    break
+                if lv and lv.get('on_ground') and lv.get('near_arr'):
+                    leg['flown'] = True
+                    last_flown_observed = True
+                    continue
+                if lv and not lv.get('on_ground'):
+                    picked = ('flying', idx, CONF_OBSERVED)
+                    break
+                # Nach Plan-Ankunft+Puffer: Leg gilt als geflogen (nächsten prüfen)
+                # — sonst klebte „unterwegs" ewig auf einem Outstation-Leg ohne
+                # Ankunfts-Board (gleiche Deckel-Logik wie der flying/departed-Zweig).
+                if now >= eff_arr + _dt.timedelta(minutes=_STALE_GROUNDED_MIN):
+                    leg['flown'] = True
+                    last_flown_observed = False
+                    continue
+                picked = ('flying', idx, CONF_PLAN)
+                break
             # Echtes „noch nicht abgeflogen" — Ewig-Pin, AUSSER die Obs ist
             # nachweislich stale (Plan-Ankunft lange vorbei UND der GRATIS
             # aircraft_live-Store beweist das Gegenteil — Tibor-LH1139-Muster).
@@ -1470,8 +1604,13 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 def build_live_lookup():
     """live_lookup-Adapter um den GRATIS aircraft_live-Store (NAS-Harvester/
     FR24-gRPC → Supabase; reiner Read, kein Paid-Ping). Route-konsistent
-    (dest == arr des Legs), on_ground-Nähe zu dep/arr via Referenz-DB. Wirft nie."""
-    def _lookup(flight_no, dep_iata, arr_iata):
+    (dest == arr des Legs), on_ground-Nähe zu dep/arr via Referenz-DB. Wirft nie.
+    Signatur (flight_no, dep_iata, arr_iata, reg=None): der optionale Roster-Tail
+    (reg) speist den Reg-Match des Stores (Julien/Tibor 2026-07-16), der die
+    Maschine auch über die bindestrich-lose Store-Reg findet, wenn der Harvester
+    den Korridor noch nicht per Flugnummer erfasst hat. Alt-Callsites/Tests dürfen
+    3-argig aufrufen (der Resolver fängt den TypeError)."""
+    def _lookup(flight_no, dep_iata, arr_iata, reg=None):
         try:
             from blueprints.aerox_data_blueprint import (_aircraft_live_pos,
                                                          _free_crew_live_pos,
@@ -1479,15 +1618,22 @@ def build_live_lookup():
         except Exception:
             return None
         try:
-            pos, _rt, reg, _ty = _aircraft_live_pos(flight=flight_no,
-                                                    dep=arr_iata)
+            # REG mitgeben (Julien/Tibor 2026-07-16): _aircraft_live_pos matcht
+            # Flugnummer ZUERST (fängt Aircraft-Swaps), fällt aber auf die Reg
+            # zurück, wenn der Welt-Harvester den Korridor per Flugnummer noch
+            # nicht erfasst hat. Der Store normalisiert 'D-ABYN' → 'DABYN' intern
+            # (re.sub[^A-Z0-9]) und findet so die bindestrich-lose Store-Row.
+            pos, _rt, live_reg, _ty = _aircraft_live_pos(reg=reg, flight=flight_no,
+                                                         dep=arr_iata)
+            reg = live_reg or reg
             if not pos:
                 # Der Welt-Harvester ist Round-robin und kann genau diesen
                 # Korridor kurz verpasst haben. Ein gezielter, kurz memoiserter
                 # GRATIS-gRPC-Fill sucht den Leg über Flug+Route; bei Ausfall
                 # liefert er höchstens den echten, zeitgestempelten LKG-Fix.
-                pos, _rt, reg, _ty = _free_crew_live_pos(
+                pos, _rt, _free_reg, _ty = _free_crew_live_pos(
                     flight_no, dep_iata, arr_iata)
+                reg = _free_reg or reg
             if not pos or pos.get('lat') is None or pos.get('lon') is None:
                 return None
             out = {'lat': float(pos['lat']), 'lon': float(pos['lon']),

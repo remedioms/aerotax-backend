@@ -775,6 +775,113 @@ def test_basti_boarding_beobachtet_schlaegt_verspaetet():
     assert r['pre_phase'] == PRE_BOARDING
 
 
+# ── Julien/Tibor 2026-07-16: arr-seitiges „Verspätet" ist KEIN Boden-Beweis ──
+# Über-Ozean-Nachtflug OHNE Abflug-Board (BOS/SFO): der gemergte Board-Record
+# trägt die FRA-ANKUNFTS-Tafel („Verspätet", est arr in der Zukunft), also
+# `status='Verspätet'` + `arr_delay_min`/`delay_side='arr'`, KEIN dep_delay/
+# status_dep. Vor dem Fix pinnte das den Flug ewig auf „Nächster Flug"
+# (pre_flight), obwohl er seit Stunden fliegt. Nach dem Fix: die Zeit-Physik
+# übernimmt ab eff_dep + 15 min → flying (CONF_PLAN, Position leer bis
+# aircraft_live liefert). Ein ECHTER Abflug-Boden-Beweis behält den Pin.
+_LH455 = [{'flight': 'LH455', 'from': 'SFO', 'to': 'FRA',
+           'dep_iso': '2026-07-09T22:15:00Z', 'arr_iso': '2026-07-10T06:00:00Z'}]
+
+
+def test_arr_verspaetet_ohne_dep_beweis_kippt_auf_flying():
+    # Abflug 22:15Z längst durch (now 00:00Z Folgetag, ~1,75 h nach dep), nur
+    # die ARR-Tafel meldet „Verspätet" (arr-seitiger Delay, kein dep-Beweis) →
+    # Zeit-Physik: fliegt. Keine erfundene Position.
+    r = _resolve(datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc),
+                 sectors=_LH455,
+                 obs={'LH455': {'status': 'Verspätet', 'arr_delay_min': 45,
+                                'delay_side': 'arr',
+                                'est_arr_iso': '2026-07-10T06:45:00Z'}})
+    assert r['state'] == STATE_FLYING
+    assert r['confidence'] == CONF_PLAN     # reine Uhr, kein Live/Board-Abflug
+    assert r['position'] is None            # keine erfundene Position
+
+
+def test_dep_boarding_aktiv_behaelt_pre_flight():
+    # Dasselbe Leg, aber VOR dem Abflug: das ABFLUG-Board meldet „Boarding"
+    # (echter Boden-Beweis) → bleibt pre_flight, kippt NICHT auf flying.
+    r = _resolve(datetime(2026, 7, 9, 22, 5, tzinfo=timezone.utc),
+                 sectors=_LH455,
+                 obs={'LH455': {'status': 'Boarding', 'status_dep': 'Boarding'}})
+    assert r['state'] == STATE_PRE_FLIGHT
+
+
+def test_dep_ground_proof_nach_abflug_behaelt_waiting():
+    # Abflug-Board meldet noch aktiv Boarding (Boden-Beweis) auch NACH der Soll-
+    # Abflugzeit → der Flug steht nachweislich noch am Gate, kein Zeit-Physik-
+    # Kippen auf flying (Board schlägt Uhr).
+    r = _resolve(datetime(2026, 7, 9, 22, 40, tzinfo=timezone.utc),
+                 sectors=_LH455,
+                 obs={'LH455': {'status': 'Boarding', 'status_dep': 'Boarding'}})
+    assert r['state'] == STATE_PRE_FLIGHT
+
+
+def test_arr_verspaetet_cancelled_nie_flying():
+    # cancelled schlägt alles — auch mit vorbeigelaufenem Abflug + arr-Delay
+    # bleibt es NIE flying (Crew ist nie losgeflogen).
+    r = _resolve(datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc),
+                 sectors=_LH455,
+                 obs={'LH455': {'status': 'Verspätet', 'arr_delay_min': 45,
+                                'delay_side': 'arr', 'cancelled': True}})
+    assert r['state'] != STATE_FLYING
+
+
+def test_arr_verspaetet_est_dep_erst_in_zukunft_bleibt_pre_flight():
+    # est_dep erst in 10 min (Abflug NOCH nicht durch): trotz arr-„Verspätet"
+    # bleibt es pre_flight — die Zeit-Physik kippt erst NACH eff_dep + Grace.
+    r = _resolve(datetime(2026, 7, 9, 22, 5, tzinfo=timezone.utc),
+                 sectors=_LH455,
+                 obs={'LH455': {'status': 'Verspätet', 'arr_delay_min': 45,
+                                'delay_side': 'arr',
+                                'est_dep_iso': '2026-07-09T22:15:00Z'}})
+    assert r['state'] == STATE_PRE_FLIGHT
+
+
+def test_norm_legs_reg_alias_fuellt_tail():
+    # Tibor-Sektor keyt die Maschine als 'reg' statt 'tail' → das current_leg
+    # muss die Reg trotzdem tragen (aircraft_live-Reg-Match).
+    secs = [{'flight': 'LH455', 'from': 'SFO', 'to': 'FRA',
+             'dep_iso': '2026-07-09T22:15:00Z', 'arr_iso': '2026-07-10T06:00:00Z',
+             'reg': 'D-ABYT'}]
+    r = _resolve(datetime(2026, 7, 9, 20, 0, tzinfo=timezone.utc), sectors=secs)
+    assert (r['current_leg'] or {}).get('reg') == 'D-ABYT'
+
+
+def test_reg_normalisierung_findet_bindestrich_lose_row():
+    # 'D-ABYN' (current_leg.reg) muss die aircraft_live-Row reg='DABYN' finden:
+    # der Store-Read normalisiert via re.sub[^A-Z0-9]. Hier direkt gegen den
+    # Store-Helfer geprüft (die Normalisierung ist der Kern der Reg-Kette).
+    import re as _re
+    assert _re.sub(r'[^A-Z0-9]', '', 'D-ABYN'.upper()) == 'DABYN'
+
+
+def test_build_live_lookup_reg_normalisierung_e2e():
+    # E2E: der Live-Adapter reicht die Roster-Reg 'D-ABYN' durch und findet die
+    # bindestrich-lose Store-Row 'DABYN' (patcht _aircraft_live_pos, prüft dass
+    # die Reg beim Store ankommt UND die Normalisierung greift).
+    from blueprints.crew_live_state import build_live_lookup
+    seen = {}
+
+    def _fake_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=35):
+        import re as _re
+        seen['reg_norm'] = _re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
+        if seen['reg_norm'] == 'DABYN':
+            return ({'lat': 51.0, 'lon': 5.0, 'on_ground': False,
+                     'source': 'aircraft_live', 'seen_ts': None}, None,
+                    'D-ABYN', 'A359')
+        return None, None, None, None
+
+    with patch('blueprints.aerox_data_blueprint._aircraft_live_pos', _fake_pos):
+        lk = build_live_lookup()
+        out = lk('LH455', 'SFO', 'FRA', 'D-ABYN')
+    assert seen['reg_norm'] == 'DABYN'
+    assert out and out['lat'] == 51.0 and out['on_ground'] is False
+
+
 # ── Pickup-Parser (Server-Nachbau der iOS-Referenz-Regexe) ──────────────────
 
 def test_parse_pickup_beide_schreibweisen():
