@@ -461,6 +461,53 @@ def _eff_dep(leg, o):
     return leg['dep'], None
 
 
+# Sicherheitsmarge, um die eine ECHTE (delay-korrigierte) Ankunft ihren eigenen
+# Abflug frühestens unterschreiten dürfte, bevor wir die Obs als „falscher Tag"
+# verwerfen. Ein Flug landet NIE vor seinem eigenen Abflug — nur ein Board-Record
+# einer ANDEREN Tagesbetriebs-Instanz derselben Flugnummer/Strecke kann das.
+_WRONG_DAY_MARGIN_MIN = 60
+
+
+def _obs_is_wrong_day(leg, o):
+    """PUR: gehört der (datums-agnostisch gematchte) Board-Record `o` zu einer
+    ANDEREN Tagesbetriebs-Instanz als dieses iCal-Leg?
+
+    Der crew obs_lookup matcht NUR über (flight_no, dep_iata, arr_iata) — ohne
+    Datum. Bei einem täglichen Flug (LH423 BOS→FRA) liefert er den ZULETZT
+    beobachteten Lauf, der am Rückflugtag längst gelandet ist, während das echte
+    Leg der Crew erst am Abend abfliegt. Diese Vortags-Landung („status=LANDED,
+    est_arr heute früh") markierte das noch nicht abgeflogene Leg als „flown" →
+    picked=None → „Gelandet in Frankfurt / Feierabend" (Tibor 2026-07-15,
+    Julien/Nico BOS-Layover).
+
+    Signal, unmissverständlich und physikalisch: die BEOBACHTETE Ankunft der Obs
+    liegt VOR dem eigenen (Soll-)Abflug des Legs — plus Sicherheitsmarge. Ein
+    korrekter Lauf kann NIE vor seinem Abflug landen; nur ein Fremd-Tag-Match
+    kann das. Wirft nie."""
+    try:
+        if not isinstance(o, dict):
+            return False
+        # Absolute beobachtete Ankunft bevorzugt; sonst sched+arr_delay.
+        obs_arr = _parse_iso(o.get('est_arr_iso'))
+        if obs_arr is None:
+            arr_delay = _num(o.get('arr_delay_min'))
+            if arr_delay is None:
+                arr_delay = _num(o.get('delay_min'))
+            sched_arr = _parse_iso(o.get('sched_arr_iso'))
+            if sched_arr is not None and arr_delay is not None:
+                obs_arr = sched_arr + _dt.timedelta(minutes=arr_delay)
+            elif sched_arr is not None:
+                obs_arr = sched_arr
+        if obs_arr is None:
+            return False
+        dep = leg.get('dep')
+        if not isinstance(dep, _dt.datetime):
+            return False
+        return obs_arr < dep - _dt.timedelta(minutes=_WRONG_DAY_MARGIN_MIN)
+    except Exception:
+        return False
+
+
 def _fmt_reg(r):
     """Kanonische Reg-Schreibweise: Boards liefern 'DAIWA', Radar/adsb suchen
     'D-AIWA' — deutsche Regs bekommen den Bindestrich zurueck (Owner-Fund:
@@ -842,6 +889,17 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
     _eng_prior = {}
     for idx, leg in enumerate(legs):
         o = _obs(leg) or {}
+        # FALSCHER-TAG-OBS-GATE (Tibor 2026-07-15, Julien/Nico BOS-Layover): der
+        # obs_lookup matcht datums-AGNOSTISCH über (flight_no, dep, arr). Bei einem
+        # täglichen Flug (LH423 BOS→FRA) hängt so die HEUTE-FRÜH gelandete Instanz
+        # am ABEND-Leg der Crew — deren Ankunft liegt vor dem eigenen Abflug. Diese
+        # Fremd-Tag-Landung markierte das noch nicht abgeflogene Leg als „flown"
+        # → picked=None → „Gelandet in Frankfurt / Feierabend" statt „pre_flight".
+        # Physikalisch unmöglich (nie Ankunft vor Abflug) → Obs verwerfen, damit
+        # Engine/Buckets/eff_arr nur die eigene iCal-Uhr des Legs sehen.
+        if o and _obs_is_wrong_day(leg, o):
+            leg['obs'] = None
+            o = {}
         b = bucket_of(o.get('status')) if o else None
         dep_delay = _num(o.get('dep_delay_min'))
         arr_delay = _num(o.get('arr_delay_min'))

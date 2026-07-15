@@ -1270,3 +1270,71 @@ def test_sebastian_lh1126_final_approach_beats_departure_taxi_out():
     assert r['current_leg']['status'] == 'Final approach', r
     assert r['text']['title'] == 'Fliegt gerade', r
     assert r.get('pre_phase') is None, r
+
+
+def test_layover_rueckflugtag_verwirft_fremd_tag_landung():
+    """Tibor 2026-07-15, Julien/Nico BOS-Layover: der Rückflug LH423 BOS→FRA
+    ist ein TÄGLICHER Flug. Der datums-agnostische obs_lookup liefert am
+    Rückflugtag die HEUTE-FRÜH gelandete LH423-Instanz (est_arr 05:44Z, LANDED)
+    für das ABEND-Leg der Crew (dep 21:45Z). Ohne Gate markierte das die noch
+    nicht abgeflogene Maschine als „flown" → picked=None → dest==FRA==hb →
+    „Gelandet in Frankfurt / Feierabend". Erwartet: der Fremd-Tag-Obs wird
+    verworfen, das Leg resolved aus seiner eigenen iCal-Uhr zu pre_flight.
+    """
+    from blueprints.crew_live_state import resolve_crew_live_state
+    sectors = [{
+        'flight': 'LH423', 'from': 'BOS', 'to': 'FRA',
+        'dep_iso': '2026-07-15T21:45:00Z',       # heute Abend BOS (17:45 lokal)
+        'arr_iso': '2026-07-16T04:50:00Z',        # morgen früh FRA
+    }]
+    # Der ZULETZT beobachtete LH423-Lauf ist die HEUTE FRÜH gelandete Instanz.
+    obs = {'LH423': {
+        'status': 'LANDED',
+        'status_arr': 'LANDED',
+        'sched_arr_iso': '2026-07-15T04:50:00Z',
+        'est_arr_iso': '2026-07-15T05:44:00Z',   # ~16 h VOR dem eigenen Abflug
+        'arr_delay_min': 54,
+        'delay_min': 54,
+        'delay_known': True,
+    }}
+    # 19:52 Berlin = 17:52 UTC — der echte Abflug (21:45Z) steht noch aus.
+    r = resolve_crew_live_state(
+        sectors, _obs(obs), _live({}),
+        datetime(2026, 7, 15, 17, 52, tzinfo=timezone.utc),
+        homebase='FRA',
+        city_lookup=lambda c: {'FRA': 'Frankfurt', 'BOS': 'Boston'}.get(c),
+    )
+    assert r['state'] == STATE_PRE_FLIGHT, r
+    assert r['current_leg']['flight_no'] == 'LH423', r
+    assert r['current_leg']['dep'] == 'BOS' and r['current_leg']['arr'] == 'FRA', r
+    assert 'Feierabend' not in (r['text'].get('title') or ''), r
+    assert 'Gelandet' not in (r['text'].get('title') or ''), r
+    assert r['text']['title'].startswith('Nächster Flug'), r
+
+
+def test_gleicher_tag_landung_bleibt_gueltig():
+    """Gegenprobe: eine LEGITIME Landung DIESES Tages (Ankunft NACH dem eigenen
+    Abflug) darf NICHT als Fremd-Tag verworfen werden — der Leg bleibt geflogen.
+    Schützt gegen einen zu gierigen Wrong-Day-Gate.
+    """
+    from blueprints.crew_live_state import resolve_crew_live_state
+    sectors = [{
+        'flight': 'LH1126', 'from': 'FRA', 'to': 'BCN',
+        'dep_iso': '2026-07-15T07:50:00Z',
+        'arr_iso': '2026-07-15T09:55:00Z',
+    }]
+    obs = {'LH1126': {
+        'status': 'Gelandet', 'status_arr': 'Gelandet',
+        'sched_arr_iso': '2026-07-15T09:55:00Z',
+        'est_arr_iso': '2026-07-15T10:08:00Z',   # NACH dem Abflug → gültig
+        'arr_delay_min': 13, 'delay_min': 13, 'delay_known': True,
+    }}
+    r = resolve_crew_live_state(
+        sectors, _obs(obs), _live({}),
+        datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
+        homebase='FRA',
+        city_lookup=lambda c: {'FRA': 'Frankfurt', 'BCN': 'Barcelona'}.get(c),
+    )
+    # Gelandet am Tagesziel BCN (≠ hb) → Layover/Landed Barcelona, NICHT verworfen.
+    assert r['state'] in (STATE_LANDED, STATE_LAYOVER), r
+    assert 'Barcelona' in (r['text'].get('title') or ''), r
