@@ -12768,7 +12768,8 @@ def _crew_pre_flight_ctx(day, secs, brief_summary, brief_start_iso,
 
 def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
                         commute_minutes=None, obs_lookup=None,
-                        live_lookup=None):
+                        live_lookup=None, carry_sectors=None,
+                        carry_datum=None):
     """Additives `crew_state`-Feld für friends-today — EINE Wahrheit über den
     Neubau-Resolver blueprints/crew_live_state (Owner 2026-07-10: „baue es
     komplett neu auf damit es funktioniert, auch Text"). iOS zeigt text.title/
@@ -12783,7 +12784,14 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
     bei jedem der bis zu 3 crew_state-Läufe pro Freund neu zu bauen. Beide
     schließen NUR über gecachte/memoisierte Leaf-Reads (_flight_obs_merged /
     _aircraft_live_pos) und sind zustandslos → thread-safe teilbar. None =
-    Rückfall auf frisch gebaute Lookups (Alt-Callsites/Tests)."""
+    Rückfall auf frisch gebaute Lookups (Alt-Callsites/Tests).
+    carry_sectors (ADDITIV 2026-07-16, Julien/Tibor-Overnight-Carry): schon
+    ausgewählte, noch aktive Legs des VORTAGS (crew_live_state.carry_over_legs)
+    — sie werden VOR die heutigen Sektoren in DENSELBEN Resolver gereicht, damit
+    ein Über-Nacht-Leg (dep gestern 22:15Z, arr heute 06:00Z, keyt auf dem
+    Abflugtag) nach Berliner Mitternacht nicht als `home`/„Basis" verschwindet,
+    sondern ganz normal durch Leg-Auswahl + Engine + Wrong-Day-Guards läuft
+    (enroute/landed je nach Obs/Zeit-Physik). None/leer = altes Verhalten."""
     try:
         from blueprints.crew_live_state import (resolve_crew_live_state,
                                                 pick_fresher_sectors,
@@ -12798,6 +12806,29 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
         b_secs, b_ts, b_summary, b_start_iso = \
             _friend_briefing_day_sectors(fr, datum)
         secs, _src = pick_fresher_sectors(snap_secs, snap_ts, b_secs, b_ts)
+        # OVERNIGHT-CARRY (Julien/Tibor 2026-07-16): die noch aktiven Vortags-
+        # Legs VOR die heutigen Sektoren mergen. Der Resolver sortiert intern
+        # nach dep (_norm_legs) → der Über-Nacht-Leg wird als aktuelles Leg
+        # gepickt und ganz normal bewertet (enroute/landed). Doppelte Flug-
+        # nummern (derselbe Leg auch heute gekeyt) werden entfernt — der heutige
+        # Eintrag ist frischer/maßgeblich. Wirft nie (Liste ist schon gefiltert).
+        _carry_fns = set()
+        if carry_sectors:
+            try:
+                _today = secs or []
+                _today_fns = {str(s.get('flight') or '').replace(' ', '').upper()
+                              for s in _today
+                              if isinstance(s, dict) and s.get('flight')}
+                _carry = [s for s in carry_sectors
+                          if isinstance(s, dict)
+                          and str(s.get('flight') or '').replace(' ', '').upper()
+                          not in _today_fns]
+                if _carry:
+                    secs = _carry + list(_today)
+                    _carry_fns = {str(s.get('flight') or '').replace(' ', '').upper()
+                                  for s in _carry if s.get('flight')}
+            except Exception:
+                _carry_fns = set()
         rf = day.get('reader_facts') or {}
         # duty für Leg-lose Tage: Standby > Urlaub > Frei (B2 2026-07-12 —
         # der Resolver soll den SERVER-Text „Heute frei"/„Im Urlaub" liefern,
@@ -12813,6 +12844,24 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
         # gebaut. None ⇒ frisch bauen (Alt-Callsites/Tests).
         _obs_lk = obs_lookup or build_obs_lookup(_flight_obs_merged, datum)
         _live_lk = live_lookup or build_live_lookup()
+        # DATUMS-DISPATCH für CARRY-Legs (Julien/Tibor 2026-07-16): der geteilte
+        # obs_lookup ist an HEUTE gebunden. Ein carried Vortags-Leg (LH423 auf
+        # dem 15.) darf NICHT die HEUTIGE Instanz derselben täglichen Flugnummer
+        # (16., Abflug erst am Abend, „Scheduled") sehen — die würde ihn erneut
+        # auf pre_flight pinnen (der Wrong-Day-Guard greift NICHT, weil deren arr
+        # nach dem carried dep liegt). Für carried Flugnummern deshalb einen
+        # eigenen, an das VORTAGS-Datum gebundenen Lookup nutzen; alles andere
+        # bleibt am heutigen Lookup. Ohne carry_datum/carry-Legs exakt _obs_lk.
+        if _carry_fns and carry_datum:
+            _carry_obs_lk = build_obs_lookup(_flight_obs_merged, carry_datum)
+
+            def _obs_dispatch(flight_no, dep_iata, arr_iata,
+                              _today_lk=_obs_lk, _y_lk=_carry_obs_lk,
+                              _cfns=_carry_fns):
+                _fn = str(flight_no or '').replace(' ', '').upper()
+                lk = _y_lk if _fn in _cfns else _today_lk
+                return lk(flight_no, dep_iata, arr_iata)
+            _obs_lk = _obs_dispatch
         cs = resolve_crew_live_state(
             secs or [],
             _obs_lk,
@@ -13394,6 +13443,54 @@ def get_friends_today(token):
                 fr, day, datum, homebase=_hb_arg, snap_ts=_snap_ts,
                 commute_minutes=_cm_arg, obs_lookup=_shared_obs_lk_today,
                 live_lookup=_shared_live_lk)
+            # OVERNIGHT-CARRY (Julien/Tibor 2026-07-16): meldet der HEUTIGE
+            # Roster-Tag NICHTS AKTIVES (kein pre_flight/flying/landed —
+            # today_blocks_spillover), aber ein Über-Nacht-Leg des VORTAGS ist
+            # nachweislich noch unterwegs/frisch gelandet (LH423 BOS→FRA dep
+            # 15.07 22:15Z / arr 16.07 06:00Z keyt auf dem Abflugtag → nach
+            # Berliner Mitternacht fand der Resolver am 16. kein Leg und fiel auf
+            # „home"/„Basis Frankfurt"), dann die noch aktiven Vortags-Legs VOR
+            # die heutigen Sektoren in DENSELBEN Resolver reichen. Robuster als
+            # der externe Sieger-Vergleich (spillover_wins unten): das Leg läuft
+            # GANZ NORMAL durch Leg-Auswahl + Engine + Wrong-Day-Guards
+            # (enroute/landed je nach Obs/Zeit-Physik) und trägt die Reg aus dem
+            # Sektor-tail (→ aircraft_live-Positions-Tier greift). NUR wenn heute
+            # inaktiv → ein echter Heute-Zustand wird nie überschrieben. Der
+            # carried Leg bekommt einen an das VORTAGS-Datum gebundenen obs_lookup
+            # (carry_datum), damit nicht die HEUTIGE Instanz derselben täglichen
+            # Flugnummer ihn erneut auf pre_flight pinnt.
+            try:
+                from blueprints.crew_live_state import (
+                    carry_over_legs as _col, pick_fresher_sectors as _pfs,
+                    today_blocks_spillover as _tbs)
+                import datetime as _cy_dt
+                _cy_now = _cy_dt.datetime.now(_cy_dt.timezone.utc)
+                if not _tbs(crew_state, _cy_now):
+                    _gestern0 = (_cy_dt.date.fromisoformat(datum)
+                                 - _cy_dt.timedelta(days=1)).isoformat()
+                    _dy0 = next((t for t in tage if isinstance(t, dict)
+                                 and t.get('datum') == _gestern0), None)
+                    _ysnap0 = [s for s in ((_dy0 or {}).get('ical_sectors') or [])
+                               if isinstance(s, dict)]
+                    _yb0, _yb0_ts, _, _ = _friend_briefing_day_sectors(
+                        fr, _gestern0)
+                    _ysecs0, _ = _pfs(_ysnap0, _snap_ts, _yb0, _yb0_ts)
+                    _carry_secs = _col(_ysecs0 or [], _cy_now) or None
+                    if _carry_secs:
+                        _cs_carry = _crew_state_for_day(
+                            fr, day, datum, homebase=_hb_arg, snap_ts=_snap_ts,
+                            commute_minutes=_cm_arg,
+                            obs_lookup=_shared_obs_lk_today,
+                            live_lookup=_shared_live_lk,
+                            carry_sectors=_carry_secs, carry_datum=_gestern0)
+                        # Nur übernehmen, wenn der Carry-Lauf tatsächlich einen
+                        # aktiven Zustand ergibt (der Über-Nacht-Leg wurde
+                        # gepickt) — sonst bleibt der ehrliche Heute-Zustand.
+                        if _cs_carry and _cs_carry.get('state') in (
+                                'pre_flight', 'flying', 'landed'):
+                            crew_state = _cs_carry
+            except Exception:
+                pass
             # ÜBER-MITTERNACHT-SPILLOVER RÜCKWÄRTS (Owner 2026-07-12,
             # Jennifer-Fall): ein Über-Nacht-Leg (dep GESTERN 12.07 15:40Z
             # SIN→FRA, arr am Folgetag) verschwand nach Berliner Mitternacht

@@ -402,3 +402,152 @@ def test_friends_today_spillover_aus_frischerem_briefing_ohne_snapshot_tag():
         'Briefing-only Über-Nacht-Leg muss das Gate öffnen (Quelle wie Resolver)'
     assert cs['current_leg']['dep'] == 'SIN'
     assert cs['current_leg']['arr'] == 'FRA'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OVERNIGHT-CARRY (Julien/Tibor 2026-07-16): der noch aktive Über-Nacht-Leg des
+# VORTAGS wird VOR die heutigen Sektoren in DENSELBEN Resolver gereicht
+# (carry_over_legs → _crew_state_for_day carry_sectors/carry_datum), statt extern
+# überstimmt zu werden. Fixt zwei Live-Bugs:
+#   • Julien LH423 BOS→FRA (dep 15.07 22:15Z / arr 16.07 06:00Z, keyt auf dem
+#     Abflugtag): nach Berliner Mitternacht fand der Resolver am 16. kein Leg und
+#     fiel auf `home`/„Basis Frankfurt" — obwohl er nachweislich noch flog.
+#   • Der carried Leg darf NICHT die HEUTIGE Instanz derselben täglichen
+#     Flugnummer (16., „Scheduled") sehen (carry_datum-Dispatch) — die würde ihn
+#     erneut auf pre_flight pinnen (Wrong-Day-Guard greift dort nicht).
+#   • Reg aus dem Sektor-tail landet im current_leg (aircraft_live-Positions-Tier).
+# ══════════════════════════════════════════════════════════════════════════════
+from blueprints.crew_live_state import carry_over_legs          # noqa: E402
+
+
+def test_carry_over_legs_fenster():
+    now = _utc(16, 0, 30)                       # 16.07 00:30Z ≈ 01:15/02:30 CEST
+    # LH423 dep 15.07 22:15Z / arr 16.07 06:00Z — noch unterwegs → getragen.
+    active = [{'flight': 'LH423', 'from': 'BOS', 'to': 'FRA', 'tail': 'D-AIXH',
+               'dep_iso': '2026-07-15T22:15:00Z', 'arr_iso': '2026-07-16T06:00:00Z'}]
+    assert len(carry_over_legs(active, now)) == 1
+    # arr 4 h vorbei → kein ewiges Gestern-Leg mehr (Fenster ≈3 h).
+    landed = [{'flight': 'LH100', 'from': 'JFK', 'to': 'FRA', 'tail': 'D-A',
+               'dep_iso': '2026-07-15T14:00:00Z', 'arr_iso': '2026-07-15T20:30:00Z'}]
+    assert carry_over_legs(landed, now) == []
+    # dep noch in der Zukunft → gehört nicht in den Rückblick.
+    future = [{'flight': 'LH200', 'from': 'FRA', 'to': 'JFK',
+               'dep_iso': '2026-07-16T08:00:00Z', 'arr_iso': '2026-07-16T16:00:00Z'}]
+    assert carry_over_legs(future, now) == []
+    assert carry_over_legs([], now) == []
+    assert carry_over_legs(None, now) == []
+
+
+def _julien_env(fr, day_y_secs, day_t_secs, obs_side_effect):
+    now = datetime.now(timezone.utc)
+    today = _date.today().isoformat()
+    gestern = (_date.today() - timedelta(days=1)).isoformat()
+    day_y = {'datum': gestern, 'klass': 'Z72', 'marker': 'FLUG',
+             'reader_facts': {}, 'ical_sectors': day_y_secs}
+    day_t = {'datum': today, 'klass': 'Z73', 'marker': '',
+             'reader_facts': {}, 'ical_sectors': day_t_secs}
+    with patch.object(A, '_friends_load', return_value={'friends': [fr]}), \
+         patch.object(A, '_profiles_load_bulk',
+                      return_value={fr: {'name': 'Julien', 'homebase': 'FRA'}}), \
+         patch.object(A, '_maybe_refresh_calendar_feed'), \
+         patch.object(A, '_roster_snapshot_read',
+                      return_value={'taken_at': _iso_z(now),
+                                    'tage': [day_y, day_t]}), \
+         patch.object(A, '_friend_briefing_day_sectors',
+                      return_value=(None, None, None, None)), \
+         patch.object(A, '_flight_obs_merged', side_effect=obs_side_effect), \
+         patch('blueprints.aerox_data_blueprint._aircraft_live_pos',
+               return_value=(None, None, None, None)), \
+         patch('blueprints.aerox_data_blueprint._free_crew_live_pos',
+               return_value=(None, None, None, None)), \
+         patch.dict(A._store, {}, clear=True):
+        with A.app.test_request_context(
+                f'/api/user/friends-today/{fr}?datum={today}'):
+            resp = A.get_friends_today(fr)
+    return resp.get_json()['friends_today'][0].get('crew_state')
+
+
+def test_julien_overnight_carry_flying_trotz_daily_flight_obs_leak():
+    """(a) Julien-Fall: LH423 keyt auf dem GESTRIGEN Abflugtag, fliegt JETZT noch,
+    heute leglos. Selbst wenn der datums-agnostische Board-Match die HEUTIGE
+    (Scheduled) Instanz derselben täglichen Flugnummer liefert, muss der carried
+    Leg als FLYING erscheinen (carry_datum-Dispatch hält die 16.-Instanz fern) —
+    nicht home/„Basis Frankfurt". Reg aus dem Sektor-tail durchgereicht."""
+    now = datetime.now(timezone.utc)
+    today = _date.today().isoformat()
+
+    def _obs_daily_leak(fno, date=None, dep_iata=None, arr_iata=None, **kw):
+        # Board hätte nur die HEUTIGE Instanz (Abflug erst am Abend, Scheduled);
+        # der carried Leg fragt mit dem VORTAGS-Datum → dort nichts.
+        if date == today:
+            return {'status': 'Scheduled',
+                    'sched_dep_iso': _iso_z(now + timedelta(hours=23)),
+                    'sched_arr_iso': _iso_z(now + timedelta(hours=30))}
+        return None
+
+    cs = _julien_env(
+        'AT-CARRY-JULIEN',
+        [{'flight': 'LH423', 'from': 'BOS', 'to': 'FRA', 'tail': 'D-AIXH',
+          'dep_iso': _iso_z(now - timedelta(hours=1)),
+          'arr_iso': _iso_z(now + timedelta(hours=6))}],
+        [], _obs_daily_leak)
+    assert cs is not None
+    assert cs['state'] == STATE_FLYING, \
+        'Über-Nacht-Leg vom Abflugtag muss den leglosen Heute-Tag ersetzen'
+    assert cs['current_leg']['flight_no'] == 'LH423'
+    assert cs['current_leg']['dep'] == 'BOS'
+    assert cs['current_leg']['reg'] == 'D-AIXH'
+
+
+def test_julien_carry_endet_nach_ankunft_kein_ewiges_gestern():
+    """(b) Nach arr+4 h kein Carry mehr — der Feed zeigt wieder den ehrlichen
+    Heute-Zustand (home/„Basis Frankfurt"), nicht ewig das Gestern-Leg."""
+    now = datetime.now(timezone.utc)
+    cs = _julien_env(
+        'AT-CARRY-LANDED',
+        [{'flight': 'LH423', 'from': 'BOS', 'to': 'FRA', 'tail': 'D-AIXH',
+          'dep_iso': _iso_z(now - timedelta(hours=10)),
+          'arr_iso': _iso_z(now - timedelta(hours=4))}],
+        [], lambda *a, **k: None)
+    assert cs is not None
+    assert cs['state'] == STATE_HOME
+    assert (cs.get('current_leg') or {}).get('flight_no') != 'LH423'
+
+
+def test_tibor_overnight_carry_enroute_ohne_obs_reg_aus_sektor():
+    """(c) Tibor-Fall: LH455 SFO→FRA keyt gestern, dep ~1 h vorbei, arr in der
+    Zukunft, SFO-Abflugboard NICHT geharvestet (keine Obs). Zeit-Physik ⇒
+    enroute-artig (flying, Vertrauen plan) statt pre_flight; Reg (D-ABYT) aus dem
+    ical-Sektor-tail durchgereicht, damit der aircraft_live-Positions-Tier greift."""
+    now = datetime.now(timezone.utc)
+    cs = _julien_env(
+        'AT-CARRY-TIBOR',
+        [{'flight': 'LH455', 'from': 'SFO', 'to': 'FRA', 'tail': 'D-ABYT',
+          'dep_iso': _iso_z(now - timedelta(hours=1)),
+          'arr_iso': _iso_z(now + timedelta(hours=10))}],
+        [], lambda *a, **k: None)
+    assert cs is not None
+    assert cs['state'] == STATE_FLYING
+    assert cs['confidence'] == CONF_PLAN
+    assert cs['current_leg']['flight_no'] == 'LH455'
+    assert cs['current_leg']['reg'] == 'D-ABYT'
+
+
+def test_carry_greift_nicht_wenn_heute_aktiv():
+    """Ein echter Heute-Zustand (pre_flight/flying) wird NIE vom Carry
+    überschrieben — der Carry ist reiner leg-loser Fallback."""
+    now = datetime.now(timezone.utc)
+    cs = _julien_env(
+        'AT-CARRY-TODAYACTIVE',
+        # gestern: noch fliegend (würde sonst getragen) …
+        [{'flight': 'LH999', 'from': 'JFK', 'to': 'FRA', 'tail': 'D-AOLD',
+          'dep_iso': _iso_z(now - timedelta(hours=1)),
+          'arr_iso': _iso_z(now + timedelta(hours=1))}],
+        # … aber heute läuft ein EIGENER aktiver Leg.
+        [{'flight': 'LH1138', 'from': 'FRA', 'to': 'BCN', 'tail': 'D-AINEW',
+          'dep_iso': _iso_z(now - timedelta(minutes=20)),
+          'arr_iso': _iso_z(now + timedelta(hours=2))}],
+        lambda *a, **k: None)
+    assert cs is not None
+    assert cs['current_leg']['flight_no'] == 'LH1138', \
+        'Heute-aktiver Leg darf nicht vom Gestern-Carry verdrängt werden'

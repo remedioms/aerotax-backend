@@ -1247,6 +1247,56 @@ def yesterday_leg_reaches_into_today(sectors, now,
         return False
 
 
+# ── Über-Mitternacht-CARRY (Julien/Tibor 2026-07-16) ─────────────────────────
+# Grenzen des CARRY-Fensters. Ein gestriger Leg wird in den heutigen Resolver-Lauf
+# GEREICHT (nicht als separater Sieger-Vergleich wie spillover_wins), solange er
+# physikalisch noch „aktiv" sein kann:
+#   • arr in der ZUKUNFT (Nacht-Rückflug noch unterwegs), ODER
+#   • arr < _CARRY_ARR_PAST_MIN vorbei (frisch gelandet — konsistent mit den
+#     bestehenden Post-Landing-Fenstern _LANDED_RECENT_MIN/_STALE_GROUNDED_MIN).
+# UND der Abflug muss schon durch sein (dep ≤ now) — ein Leg, dessen Abflug erst
+# in der Zukunft liegt, gehört NICHT in den Rückblick (das ist das MORGEN-
+# crew_state_next-Fenster). Alles auf UTC-Instants (nie Datums-Strings).
+_CARRY_ARR_PAST_MIN = 3 * 60      # ≈3 h Post-Landing-Gnade (Owner: X≈3)
+
+
+def carry_over_legs(prev_sectors, now, arr_past_min=_CARRY_ARR_PAST_MIN):
+    """PUR: die noch aktiven Legs der VORTAGS-Sektoren als Sektor-Dicts, die in
+    den HEUTIGEN Resolver-Lauf gereicht werden können (Julien 2026-07-16: LH423
+    BOS→FRA dep 15.07 22:15Z / arr 16.07 06:00Z keyt auf dem 15. — nach Berliner
+    Mitternacht ist „heute" der 16., der Resolver fand am 16. kein Leg und fiel
+    auf `home`/„Basis Frankfurt" zurück, obwohl die Crew nachweislich noch flog).
+    Statt den heutigen Zustand extern zu ÜBERSTIMMEN (spillover_wins) reichen wir
+    das gestrige Leg VOR den heutigen Sektoren in denselben Resolver — die
+    zeitbasierte Leg-Auswahl + Engine + Wrong-Day-Guards laufen dann ganz normal
+    darüber (enroute/landed/pre_flight je nach Obs/Zeit-Physik).
+
+    Übernommen wird jeder Leg mit dep ≤ now (schon abgeflogen) UND arr in der
+    Zukunft ODER < arr_past_min vorbei. Alle Vergleiche auf UTC-Instants der
+    ISO-Werte (_norm_legs → aware-UTC), nie auf Datums-Strings. Ein synthetisch
+    ersetztes arr (Red-Eye ohne end_iso) wird konservativ mitgezählt. Gibt die
+    ORIGINAL-Sektor-Dicts zurück (inkl. tail/reg fürs current_leg), damit der
+    Resolver dieselben Felder sieht wie bei den heutigen Sektoren. Wirft nie."""
+    try:
+        nw = _parse_iso(now)
+        if nw is None or not prev_sectors:
+            return []
+        floor = nw - _dt.timedelta(minutes=max(0, arr_past_min))
+        out = []
+        for s in prev_sectors:
+            if not isinstance(s, dict):
+                continue
+            legs = _norm_legs([s])
+            if not legs:
+                continue
+            leg = legs[0]
+            if leg['dep'] <= nw and leg['arr'] >= floor:
+                out.append(s)
+        return out
+    except Exception:
+        return []
+
+
 def _plan_only_future_pre_flight(today_state, now):
     """PUR: ist der heutige Zustand ein REINER Plan-pre_flight, dessen Abflug
     noch in der Zukunft liegt? Das ist KEIN aktiver Beweis-Zustand — nur die
