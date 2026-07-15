@@ -1914,6 +1914,26 @@ def _gen_scoped_family_token():
     return 'AT-FAM-' + secrets.token_urlsafe(18)
 
 
+def _authenticated_family_owner_token():
+    """Authenticated Family principal for a newly minted capability.
+
+    None keeps legacy anonymous redeem compatible. Push delivery may use only
+    this verified binding and never infer an account from a scoped token.
+    """
+    try:
+        bearer_fn = _app_attr('_request_bearer_token')
+        finder = _app_attr('_auth_find_user_by')
+        bearer = bearer_fn() if callable(bearer_fn) else None
+        found = finder('token', bearer) if bearer and callable(finder) else None
+        auth_rec = found[1] if isinstance(found, tuple) and len(found) > 1 else None
+        prof = _load_crew_profile(bearer) if auth_rec else {}
+        account_type = str((auth_rec or {}).get('account_type')
+                           or (prof or {}).get('account_type') or '').lower()
+        return bearer if account_type == 'family' else None
+    except Exception:
+        return None
+
+
 def _normalize_code(raw):
     """Uppercase, Whitespace/Bindestriche weg, dann tolerant gegen die typischen
     Tipp-Verwechsler mappen (0→O, 1→I, I→? ...). Da das Generator-Alphabet
@@ -2528,13 +2548,20 @@ def family_pair_code_redeem():
         codes[code] = consumed_rec
         _pair_codes_save(codes)
 
-    # Scoped, read-only Family-Token münzen und persistieren.
+    # Scoped, read-only Family-Token münzen und persistieren. Wenn Redeem aus
+    # einem angemeldeten Family-Konto kommt, binden wir die Capability an GENAU
+    # diesen Account. Das wird später ausschließlich für Push-Zustellung an den
+    # richtigen Family-Account verwendet; alte ungebundene Capabilities bleiben
+    # lesbar, erhalten aber bewusst keinen geratenen Push-Empfänger.
+    owner_token = _authenticated_family_owner_token()
+
     family_token = _gen_scoped_family_token()
     toks = _scoped_tokens_load()
     toks[family_token] = {
         'crew_token': crew_token,
         'scope': 'family_read',
         'family_name': family_name,
+        'owner_token': owner_token,
         'created_at': now,
     }
     _scoped_tokens_save(toks)

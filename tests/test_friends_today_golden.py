@@ -191,8 +191,10 @@ def _pin_app_module():
         sys.modules['app'] = prev
 
 
-def _call_endpoint(token='AT-GOLDEN-VIEWER-000', raw_response=False):
+def _call_endpoint(token='AT-GOLDEN-VIEWER-000', raw_response=False,
+                   snapshot_reader=None):
     """Der ECHTE Endpoint mit komplett injizierten Daten + Frozen-Clock."""
+    snapshot_reader = snapshot_reader or (lambda fr: SNAPSHOTS.get(fr))
     with patch.object(_dt_mod, 'datetime', _FrozenDatetime), \
          patch.object(A, 'datetime', _FrozenDatetime), \
          patch.dict(os.environ, {'FLIGHTSTATE_SHADOW': '',
@@ -201,7 +203,7 @@ def _call_endpoint(token='AT-GOLDEN-VIEWER-000', raw_response=False):
          patch.object(A, '_profiles_load_bulk', return_value=PROFILES), \
          patch.object(A, '_maybe_refresh_calendar_feed'), \
          patch.object(A, '_roster_snapshot_read',
-                      side_effect=lambda fr: SNAPSHOTS.get(fr)), \
+                      side_effect=snapshot_reader), \
          patch.object(A, '_friend_briefing_day_sectors',
                       return_value=(None, None, None, None)), \
          patch.object(A, '_flight_obs_merged', side_effect=_fake_obs_merged), \
@@ -249,6 +251,29 @@ def test_friends_today_disables_http_cache():
     resp = _call_endpoint(raw_response=True)
     cc = resp.headers.get('Cache-Control', '')
     assert 'private' in cc and 'no-store' in cc and 'max-age=0' in cc
+
+
+def test_worker_failure_marks_partial_and_is_never_memoized():
+    """Ein ausgefallener Freund-Worker ist kein bestätigtes Entfernen.
+
+    Die übrigen Rows dürfen als degradierte 200-Antwort weiterkommen, aber der
+    Payload muss dies additiv markieren und darf den Teilstand nicht 90 s als
+    vermeintliche Wahrheit cachen.
+    """
+    def snapshot_reader(fr):
+        if fr == KAI:
+            raise RuntimeError('simulated per-friend storage failure')
+        return SNAPSHOTS.get(fr)
+
+    got = _call_endpoint(snapshot_reader=snapshot_reader)
+
+    assert got['partial'] is True
+    assert got['complete'] is False
+    assert got['count'] == 3
+    assert {entry['name'] for entry in got['friends_today']} == {
+        'Pia Sommer', 'Ole Nord', 'Mia Berg'
+    }
+    assert A._FRIENDS_TODAY_MEMO == {}
 
 
 def test_golden_fixture_semantics_pinned():

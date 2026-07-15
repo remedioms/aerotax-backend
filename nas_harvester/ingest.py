@@ -43,7 +43,11 @@ log = logging.getLogger("fr24-ingest")
 # EINZIGE Quelle). 8-14 = Europa (dichter LH-Group-Verkehr, Route/Tail-Anreicherung).
 _DEFAULT_TILES = [
     (55, 20, 55, 110), (72, 45, 55, 140), (55, 20, 110, 145), (45, 8, 30, 65),
-    (35, -10, 60, 100), (72, 35, -60, -10), (60, 15, 140, 180), (40, -40, -25, 55),
+    (35, -10, 60, 100), (72, 35, -60, -10),
+    # Westlicher Nordatlantik / Nordost-USA: ohne diese Fortsetzung endeten
+    # FRA→BOS/JFK-Flüge bei 60°W im Sweep und froren mitten im Atlantik ein.
+    (72, 25, -100, -55),
+    (60, 15, 140, 180), (40, -40, -25, 55),
     (60, 48, -11, 3), (52, 42, -3, 10), (56, 45, 9, 20), (72, 55, 4, 32),
     (45, 35, -10, 5), (47, 35, 6, 30), (52, 44, 20, 40),
 ]

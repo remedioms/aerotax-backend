@@ -332,7 +332,8 @@ def _resolve_pre_phase(leg, now, eff_dep, pre_ctx, hb, first_leg,
 # (DIE eine Wahrheit); diese Listen sind nur der abgespeckte Offline-Fallback.
 _LANDED_WORDS = ('landed', 'gelandet', 'arrived', 'angekommen')
 _AIRBORNE_WORDS = ('airborne', 'in flight', 'in-flight', 'enroute', 'en route',
-                   'departed', 'abgeflogen', 'unterwegs')
+                   'departed', 'abgeflogen', 'unterwegs', 'approach',
+                   'approaching', 'final approach', 'on final', 'im anflug')
 _GROUNDED_WORDS = ('boarding', 'gate', 'scheduled', 'delayed', 'verspätet',
                    'check-in', 'checkin', 'on time', 'pünktlich', 'wait',
                    'closed', 'geschlossen', 'gate zu')
@@ -1365,12 +1366,20 @@ def build_live_lookup():
     def _lookup(flight_no, dep_iata, arr_iata):
         try:
             from blueprints.aerox_data_blueprint import (_aircraft_live_pos,
+                                                         _free_crew_live_pos,
                                                          _iata_latlon)
         except Exception:
             return None
         try:
             pos, _rt, reg, _ty = _aircraft_live_pos(flight=flight_no,
                                                     dep=arr_iata)
+            if not pos:
+                # Der Welt-Harvester ist Round-robin und kann genau diesen
+                # Korridor kurz verpasst haben. Ein gezielter, kurz memoiserter
+                # GRATIS-gRPC-Fill sucht den Leg über Flug+Route; bei Ausfall
+                # liefert er höchstens den echten, zeitgestempelten LKG-Fix.
+                pos, _rt, reg, _ty = _free_crew_live_pos(
+                    flight_no, dep_iata, arr_iata)
             if not pos or pos.get('lat') is None or pos.get('lon') is None:
                 return None
             out = {'lat': float(pos['lat']), 'lon': float(pos['lon']),

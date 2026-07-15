@@ -83,6 +83,28 @@ def test_midnight_wrap_est_after_zero():
     assert f['est_dep'] == '2026-07-10T00:30:00+02:00'
 
 
+def test_overnight_arrival_uses_next_local_day_not_previous_rotation(monkeypatch):
+    """LH455: DEP 14.07 SFO, passende ARR ist 15.07 FRA. Die ARR-Row vom
+    14.07 gehoert zur vorigen Tagesrotation und darf nicht gewinnen."""
+    dep = {'airport': 'SFO', 'flight': 'LH455', 'dest_iata': 'FRA',
+           'date': '2026-07-14', 'sched': '14:40', 'esti': '15:34'}
+    previous_arr = {'airport': 'FRA#ARR', 'flight': 'LH455',
+                    'dest_iata': 'SFO', 'date': '2026-07-14',
+                    'sched': '10:25', 'esti': '10:35'}
+    matching_arr = {'airport': 'FRA#ARR', 'flight': 'LH455',
+                    'dest_iata': 'SFO', 'date': '2026-07-15',
+                    'sched': '10:25', 'esti': '10:35'}
+    monkeypatch.setattr(axd, '_sb',
+                        lambda: _FakeSB([dep, previous_arr, matching_arr]))
+
+    f = _flight_facts_from_obs('LH455', '2026-07-14', 'SFO', 'FRA')
+
+    assert f['sched_dep'] == '2026-07-14T14:40:00-07:00'
+    assert f['sched_arr'] == '2026-07-15T10:25:00+02:00'
+    assert f['est_arr'] == '2026-07-15T10:35:00+02:00'
+    assert not f.get('stale')
+
+
 def test_cancelled_flag_from_either_side():
     assert _obs_rows_to_facts({'cancelled': True}, None).get('cancelled') is True
     assert _obs_rows_to_facts(None, {'cancelled': True}).get('cancelled') is True
@@ -270,8 +292,8 @@ def test_free_only_miss_does_not_suppress_later_paid_lookup(monkeypatch):
     assert free == {}
     assert paid['sched_dep'] == '2026-07-14T12:00:00'
     assert len(paid_calls) == 1
-    assert ('LH146', '2026-07-14', False) in axd._FREE_TIMES_MEMO
-    assert ('LH146', '2026-07-14', True) in axd._FREE_TIMES_MEMO
+    assert ('LH146', '2026-07-14', False, False) in axd._FREE_TIMES_MEMO
+    assert ('LH146', '2026-07-14', True, False) in axd._FREE_TIMES_MEMO
 
 
 def test_paid_memo_does_not_leak_into_free_only_lookup(monkeypatch):
@@ -290,6 +312,25 @@ def test_paid_memo_does_not_leak_into_free_only_lookup(monkeypatch):
 
     assert paid['sched_arr'] == '2026-07-14T13:00:00'
     assert free == {}
+
+
+def test_operational_detail_can_fill_estimates_when_schedule_is_complete(monkeypatch):
+    """LH422-Klasse: vorhandene Planzeiten duerfen den gezielten Paid-Backup
+    fuer fehlende Ist/Erwartet-Zeiten nicht sperren."""
+    monkeypatch.setattr(
+        axd, '_grpc_times_free',
+        lambda *a, **k: {'sched_dep': 1784035800, 'sched_arr': 1784043600})
+    monkeypatch.setattr(
+        axd, '_fr24_flight_by_number',
+        lambda *a, **k: {'est_dep': '2026-07-14T13:42:00Z',
+                         'est_arr': '2026-07-14T15:52:00Z'})
+
+    out = axd._flight_times_free_first(
+        'LH422', '2026-07-14', 'FRA', 'BOS', allow_paid=True,
+        require_operational=True)
+
+    assert out.get('est_dep')
+    assert out.get('est_arr')
 
 
 # ── FlightState-Engine → status_category (Owner 2026-07-13) ───────────────────

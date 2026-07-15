@@ -14,9 +14,14 @@
 import os, io, uuid, json, re, tempfile, gc, hmac
 import hashlib
 import hashlib as _hashlib
+from enum import Enum
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, send_file, abort, make_response
 from flask_cors import CORS
+from observability.redaction import (
+    install_logging_redaction as _install_logging_redaction,
+    redact_url as _redact_observability_url,
+)
 import stripe
 import anthropic
 import pdfplumber
@@ -35,14 +40,24 @@ except ImportError:
     HEIF_AVAILABLE = False
 
 # ── SUPABASE CLIENT (für persistente QA + Sessions) ──
+#
+# supabase-py hält pro Sync-Client einen HTTP/2-Transport.  Ein globaler Client
+# über alle gunicorn-gthread-Threads führte unter Parallelität zu gemeinsam
+# mutiertem h2-State (StreamIDTooLowError / ConnectionInputs.*).  Der Proxy
+# behält die bestehende ``sb.table(...)``-API, erstellt den echten Client aber
+# lazy und strikt pro Thread.
 try:
     from supabase import create_client as _create_sb_client
+    from supabase_threadlocal import ThreadLocalClientProxy as _ThreadLocalSB
     SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
     SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
     if SUPABASE_URL and SUPABASE_KEY:
-        sb = _create_sb_client(SUPABASE_URL, SUPABASE_KEY)
+        def _create_thread_supabase_client():
+            return _create_sb_client(SUPABASE_URL, SUPABASE_KEY)
+
+        sb = _ThreadLocalSB(_create_thread_supabase_client)
         SB_AVAILABLE = True
-        print(f"[supabase] connected to {SUPABASE_URL}")
+        print(f"[supabase] configured thread-local clients for {SUPABASE_URL}")
     else:
         sb = None
         SB_AVAILABLE = False
@@ -92,6 +107,7 @@ for _bp_path, _bp_name in [
     ('blueprints.feed_status_blueprint',     'feed_status_bp'),  # 24h verschwindende Feed-Updates
     ('blueprints.flight_profile_blueprint',  'flight_profile_bp'),  # selbst-bauende Flug-DB + Crew-Ebene
     ('blueprints.aerox_data_blueprint',      'aerox_data_bp'),  # self-hosted Luftfahrt-DB (/api/ax/*)
+    ('blueprints.legal_consent_blueprint',   'legal_consent_bp'),  # versioniertes accountgebundenes Consent-Ledger
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
@@ -120,6 +136,13 @@ app.logger.setLevel(_log_level)
 # vom propagierten gunicorn-handler trotzdem geschluckt.
 _aerox_logging.getLogger().setLevel(_log_level)
 _aerox_logging.getLogger('gunicorn.error').setLevel(_log_level)
+_install_logging_redaction(
+    app.logger,
+    _aerox_logging.getLogger(),
+    _aerox_logging.getLogger('werkzeug'),
+    _aerox_logging.getLogger('gunicorn.access'),
+    _aerox_logging.getLogger('gunicorn.error'),
+)
 
 
 # ── P0 #10 (P1 nach Triage): RECOVERY_SECRET Boot-Check ──────────────
@@ -335,8 +358,9 @@ class _SBRetryTransport(_sb_httpx.BaseTransport):
                         or not self._idempotent(request)):
                     raise
                 attempt += 1
+                safe_upstream_path = _redact_observability_url(request.url.path)
                 print(f'[sb-retry] transport {request.method} '
-                      f'{request.url.path}: {name} — retry {attempt}/{self._retries}')
+                      f'{safe_upstream_path}: {name} — retry {attempt}/{self._retries}')
                 try:
                     time.sleep(self._backoff * attempt)
                 except Exception:
@@ -346,16 +370,17 @@ class _SBRetryTransport(_sb_httpx.BaseTransport):
         self._inner.close()
 
 
-def _install_sb_retry_transport():
+def _install_sb_retry_transport(client=None):
     """Best-effort: wickelt den httpx-Transport des PostgREST-Clients in
     _SBRetryTransport. `sb.postgrest.session` (httpx.Client) und dessen
     `_transport` sind über postgrest-py 0.16…1.x stabil; falls sich das je
     ändert, loggen wir und alles verhält sich wie bisher (per-Call-Site
     try/except + Disk-Fallbacks bleiben unangetastet)."""
-    if not SB_AVAILABLE or sb is None:
+    target = client if client is not None else sb
+    if not SB_AVAILABLE or target is None:
         return
     try:
-        session = getattr(getattr(sb, 'postgrest', None), 'session', None)
+        session = getattr(getattr(target, 'postgrest', None), 'session', None)
         transport = getattr(session, '_transport', None)
         if transport is None:
             print('[sb-retry] transport install skipped: session/_transport nicht gefunden')
@@ -368,7 +393,31 @@ def _install_sb_retry_transport():
         print(f'[sb-retry] transport install failed: {type(e).__name__}: {e}')
 
 
-_install_sb_retry_transport()
+if SB_AVAILABLE and isinstance(sb, globals().get('_ThreadLocalSB', ())):
+    # Jeder neue Thread-Client bekommt seinen EIGENEN Retry-Wrapper.  Hier
+    # absichtlich keinen Client materialisieren: gunicorn darf vor dem Fork
+    # keine offenen DB-Sockets erzeugen.
+    sb.set_on_create(_install_sb_retry_transport)
+    import atexit as _sb_atexit
+    _sb_atexit.register(sb.close_all)
+else:
+    # Backward-compatible für Tests/Fallbacks, die einen direkten Fake-Client
+    # injizieren.
+    _install_sb_retry_transport()
+
+
+def _close_current_thread_supabase_client():
+    """Release a client owned by a short-lived executor thread.
+
+    Gunicorn and the module-level timeout/push executors keep stable threads and
+    intentionally retain one pool each. Per-request executors (friends-today,
+    route-history) destroy their threads after every response; without this
+    hook their clients remained strongly referenced by the proxy registry.
+    """
+    proxy_cls = globals().get('_ThreadLocalSB')
+    client_proxy = globals().get('sb')
+    if proxy_cls is not None and isinstance(client_proxy, proxy_cls):
+        client_proxy.close_current()
 
 _REQ_LOG_PREFIX = '[req]'
 # Pfade die NICHT instrumentiert werden (zu noisy oder uninteressant):
@@ -530,53 +579,38 @@ def _bug004_get_route_needs_auth(path):
 # Segment auftaucht ausser den beiden expliziten Discovery-GETs unten.
 #
 # Hinweis Wall/Forum: dort ist das Pfad-Token das EIGENE Token des Callers
-# (Author-Identität), also owner-scoped — der iOS-Client schickt dort aktuell
-# KEINEN Bearer; bei Flag=OFF greift "Bearer absent → nur warnen" und es
-# bricht nichts. Bei Flag=ON MUSS ein Bearer anliegen und passen.
+# (Author-Identität), also owner-scoped. Aktuelle iOS-Builds schicken überall
+# den Bearer; fehlend oder abweichend wird deshalb standardmäßig abgewiesen.
 #
 # ⚠️ FOLLOW-UP / RESTLAST (echte Security erst danach vollständig):
-#   1. iOS-Client muss den Authorization: Bearer <token> auf JEDER owner-
-#      scoped Route mitsenden (wird parallel ausgerollt). SOLANGE der Client
-#      das nicht tut, MUSS AEROX_REQUIRE_TOKEN_BINDING=OFF bleiben, sonst
-#      sperrt das Gate legitime Requests aus.
-#   2. Das Token muss langfristig AUS DER URL RAUS — nur noch im Header. Solange
+#   1. Das Token muss langfristig AUS DER URL RAUS — nur noch im Header. Solange
 #      es im Pfad steht (Access-Logs, Proxy-Logs, Referer, Browser-History,
 #      Sentry-Breadcrumbs) bleibt der URL-Leak-Vektor offen; Bearer-Binding
 #      schützt nur gegen das WIEDERVERWENDEN eines geleakten Tokens durch einen
 #      ANDEREN authentifizierten Aufrufer, NICHT gegen das Leak selbst.
 #      => Header-only-Token ist der eigentliche Fix, Bearer-Binding ist Stufe 1.
 #
-# Enforcement-Flag: AEROX_REQUIRE_TOKEN_BINDING == '1' schaltet die strikte
-# Bindung EIN (default AUS → altes Verhalten, deploy-sicher).
-_BUG004_REQUIRE_TOKEN_BINDING = (os.environ.get('AEROX_REQUIRE_TOKEN_BINDING') == '1')
+# Deny-by-default: aktuelle iOS-Builds senden Authorization auf allen Requests.
+# Nur der explizite Notfallwert `AEROX_REQUIRE_TOKEN_BINDING=0` deaktiviert die
+# Pflicht temporär; fehlend/1/sonstige Werte bleiben enforced.
+def _token_binding_enforced_from_env(value=None):
+    if value is None:
+        value = os.environ.get('AEROX_REQUIRE_TOKEN_BINDING')
+    return str(value or '').strip() != '0'
 
-_BUG004_CROSS_USER_PREFIXES = (
-    # Genuin cross-user: erstes AT-…-Segment ist das Token eines ANDEREN Users.
-    '/api/user/profile/',   # GET = Friend-Profil-Lookup (fremdes Token; Owner
-                            #       bekommt via _request_bearer_matches Vollprofil,
-                            #       Fremder die Public-Whitelist).
-                            #   ⚠ PUT /api/user/profile/<token> ist owner-scoped
-                            #     (eigenes Profil schreiben) und wird durch dieses
-                            #     PREFIX MIT-exempted → Binding greift dort NICHT.
-                            #     Folge: nur SCHWÄCHER (kein Binding), bricht nichts.
-                            #     TODO-REVIEW: PUT aus dem Cross-User-Exempt nehmen.
-    '/api/user/friends/',   # GET /api/user/friends/<token> = Friend-of-Friend-
-                            #     Discovery (fremdes Token).
-                            #   ⚠ Sub-Routen friends/<token>/add|remove|overlap und
-                            #     friend-groups/* sind owner-scoped (erstes Token =
-                            #     eigenes) und werden durch dieses PREFIX MIT-
-                            #     exempted → kein Binding. Nur schwächer, bricht
-                            #     nichts. TODO-REVIEW: präziser auf den reinen
-                            #     friends/<token>-GET einschränken.
-    # ── Folgende Prefixes sind NICHT genuin cross-user (erstes Token = eigenes),
-    #    bleiben aber konservativ exempt, damit Enforcement nichts bricht.
-    #    Sie SCHWÄCHEN die Bindung nur (kein 401), öffnen keine fremden Daten.
-    '/api/layover-recs/',   # discover/<token>, add, vote, comments: erstes Token
-                            #     ist das EIGENE → eigentlich owner-scoped.
-                            #     TODO-REVIEW: könnte enforced werden.
-    '/api/crews-on-flight/',  # Legacy-Prefix; die LIVE-Route ist /api/crew/flight/
-                              #   und owner-scoped. Dieser Prefix matcht keine
-                              #   aktive Route — harmlos, zur Sicherheit drin.
+
+_BUG004_REQUIRE_TOKEN_BINDING = _token_binding_enforced_from_env()
+
+# Cross-user Ausnahmen sind methoden- UND route-genau.  Prefix-Ausnahmen waren
+# gefährlich: der öffentliche GET `/profile/<other>` exemptete dadurch auch den
+# owner-scoped PUT; `/friends/<other>` exemptete `/add`, `/remove` und
+# `/overlap`.  Neue Routen sind jetzt deny-by-default owner-scoped und müssen
+# hier ausdrücklich als exakter Public-Discovery-Read eingetragen werden.
+_BUG004_CROSS_USER_ROUTE_RULES = (
+    (frozenset(('GET', 'HEAD')),
+     _bug004_re.compile(r'^/api/user/profile/AT-[A-Za-z0-9_-]+/?$')),
+    (frozenset(('GET', 'HEAD')),
+     _bug004_re.compile(r'^/api/user/friends/AT-[A-Za-z0-9_-]+/?$')),
 )
 
 # Unauthenticated-Routen: laufen BEVOR ein Token existiert (Signup/Login/
@@ -588,9 +622,12 @@ _BUG004_CROSS_USER_PREFIXES = (
 # werden, da sie noch kein AT-…-Token tragen.
 
 
-def _bug004_is_cross_user_path(path):
-    for prefix in _BUG004_CROSS_USER_PREFIXES:
-        if path.startswith(prefix):
+def _bug004_is_cross_user_route(method, path):
+    """True only for an explicitly public cross-user method+route pair."""
+    method = (method or '').upper()
+    path = path or ''
+    for methods, pattern in _BUG004_CROSS_USER_ROUTE_RULES:
+        if method in methods and pattern.fullmatch(path):
             return True
     return False
 
@@ -671,7 +708,10 @@ def _bug004_token_auth_gate():
                 pass
             return jsonify({'ok': False, 'error': 'unauthorized'}), 401
         # Bekanntes Token? — _validate_token_exists nutzt 60s-Cache
-        if _validate_token_exists(token) is None:
+        validation = _validate_token(token)
+        if validation.state is _TokenValidationState.UNAVAILABLE:
+            return _auth_store_unavailable_response()
+        if validation.state is _TokenValidationState.INVALID:
             return jsonify({'ok': False, 'error': 'unauthorized'}), 401
         # AUTH-BINDING (BUG-AUDIT 2026-06-07, gehärtet 2026-06-08): Das alte Gate
         # prüfte NUR ob das Pfad-Token in auth_users existiert — es band es NICHT
@@ -679,21 +719,22 @@ def _bug004_token_auth_gate():
         # (oder, ohne Bearer, mit Kenntnis eines fremden Pfad-Tokens) konnte fremde
         # owner-scoped Pfade ansprechen, solange das Pfad-Token existierte.
         #
-        # Zwei Modi, gesteuert über AEROX_REQUIRE_TOKEN_BINDING:
+        # Zwei Modi, gesteuert über AEROX_REQUIRE_TOKEN_BINDING (default enforce):
         #
-        #   ENFORCE  (Flag == '1'): Für jede owner-scoped Route (NICHT in
-        #     _BUG004_CROSS_USER_PREFIXES) MUSS ein Authorization: Bearer <t>
+        #   ENFORCE  (Default; jeder Wert ausser '0'): Für jede owner-scoped Route (nicht als
+        #     exakte Cross-User-Methode/-Route deklariert) MUSS ein
+        #     Authorization: Bearer <t>
         #     anliegen und constant-time gleich dem Pfad-Token sein.
         #       - Bearer fehlt        → 401 token_binding_required
         #       - Bearer ≠ Pfad-Token → 401 token_binding_mismatch
         #     Voraussetzung: der iOS-Client sendet den Bearer bereits (parallel
         #     ausgerollt). Solange das nicht flächendeckend ist → Flag AUS lassen.
         #
-        #   LEGACY   (Flag default AUS): altes Verhalten, deploy-sicher.
+        #   EMERGENCY LEGACY (nur explizit Flag == '0'): altes Verhalten.
         #       - Bearer anliegend & Mismatch → 401 token_binding_mismatch
         #       - Bearer fehlt                → nur warnen, NICHT blocken
         #         (aktueller iOS-Default für owner-Routen, App bricht sonst).
-        if not _bug004_is_cross_user_path(path):
+        if not _bug004_is_cross_user_route(method, path):
             bearer = _request_bearer_token()
             if _BUG004_REQUIRE_TOKEN_BINDING:
                 # ENFORCE: Bearer ist Pflicht und muss passen.
@@ -709,10 +750,8 @@ def _bug004_token_auth_gate():
                 else:
                     try:
                         app.logger.warning(
-                            f'[bug004-gate] owner-route ohne Authorization-Bearer '
-                            f'method={method} path-tok={token[:8]} — binding nicht '
-                            f'erzwingbar (client sendet keinen Bearer; '
-                            f'AEROX_REQUIRE_TOKEN_BINDING aus)')
+                            f'[bug004-gate] EMERGENCY opt-out owner-route ohne Bearer '
+                            f'method={method} user_ref={_push_token_ref(token)}')
                     except Exception:
                         pass
     except Exception as e:
@@ -723,7 +762,8 @@ def _bug004_token_auth_gate():
         try:
             app.logger.error(
                 f'[bug004-gate] UNEXPECTED gate error {type(e).__name__}: '
-                f'{str(e)[:300]} path={request.path!r} method={request.method}',
+                f'{str(e)[:300]} path={_redact_observability_url(request.path)!r} '
+                f'method={request.method}',
                 exc_info=True)
         except Exception:
             pass
@@ -749,7 +789,8 @@ def _bug005_before_request():
         _g._req_id = _req_uuid.uuid4().hex[:8]
         tid = _req_threading.get_ident()
         # PID muss bei jedem call frisch geholt werden (gthread teilt PID, threads variieren)
-        print(f"{_REQ_LOG_PREFIX} start id={_g._req_id} path={path} method={request.method} pid={os.getpid()} tid={tid}")
+        safe_path = _redact_observability_url(path)
+        print(f"{_REQ_LOG_PREFIX} start id={_g._req_id} path={safe_path} method={request.method} pid={os.getpid()} tid={tid}")
     except Exception as _e:
         # Instrumentation darf NIE die App stoppen
         pass
@@ -768,7 +809,8 @@ def _bug005_after_request(response):
             return response
         dur_ms = int((_req_time.time() - start) * 1000)
         tid = _req_threading.get_ident()
-        print(f"{_REQ_LOG_PREFIX} done  id={rid} path={path} status={response.status_code} duration_ms={dur_ms} pid={os.getpid()} tid={tid}")
+        safe_path = _redact_observability_url(path)
+        print(f"{_REQ_LOG_PREFIX} done  id={rid} path={safe_path} status={response.status_code} duration_ms={dur_ms} pid={os.getpid()} tid={tid}")
     except Exception:
         pass
     return response
@@ -858,7 +900,8 @@ def _bug005_teardown(exc):
         dur_ms = int((_req_time.time() - start) * 1000) if start else -1
         path = (request.path if request else '?') or '?'
         tid = _req_threading.get_ident()
-        print(f"{_REQ_LOG_PREFIX} error id={rid} path={path} exc={type(exc).__name__} duration_ms={dur_ms} pid={os.getpid()} tid={tid}")
+        safe_path = _redact_observability_url(path)
+        print(f"{_REQ_LOG_PREFIX} error id={rid} path={safe_path} exc={type(exc).__name__} duration_ms={dur_ms} pid={os.getpid()} tid={tid}")
     except Exception:
         pass
 
@@ -6543,6 +6586,8 @@ def quick_health():
         'ok': True,
         'service': 'aerotax-backend',
         'version': 'v8.40',
+        'token_binding_enforced': _BUG004_REQUIRE_TOKEN_BINDING,
+        'push_outbox': dict(globals().get('_PUSH_OUTBOX_METRICS') or {}),
     })
 
 
@@ -10737,7 +10782,8 @@ _PUSH_KNOWN_COLS = {'expo_token', 'apns_token', 'device_id', 'platform'}
 # registry['prefs'] → landet in der metadata-jsonb-Column (kein DDL nötig).
 # _send_push_notification unterdrückt nur bei EXPLIZITEM False (fail-open).
 _PUSH_PREF_KEYS = ('dm', 'group_message', 'friend_request',
-                   'friend_accepted', 'roster_change', 'community')
+                   'friend_accepted', 'roster_change', 'family_message',
+                   'community')
 
 # data['type'] (Call-Sites) → Pref-Key. Nicht gemappte Typen → immer senden.
 _PUSH_TYPE_TO_PREF = {
@@ -10757,7 +10803,9 @@ _PUSH_TYPE_TO_PREF = {
     # Audit 2026-07-12: bisher ungemappte Typen → jetzt filterbar (fail-open
     # bleibt: kein gesetzter Pref = senden).
     'friend_remind': 'community',
-    'family_reaction': 'community',
+    'family_message': 'family_message',
+    'family_reply': 'family_message',
+    'family_reaction': 'family_message',
     'trade_interest': 'community',
     'trade_closed': 'community',
 }
@@ -10883,6 +10931,213 @@ def _push_save(token, registry):
         )
         return False
     return True
+
+
+# ── Multi-device Push-Installations (additiv zum Legacy-Store) ──────────
+
+def _push_token_ref(token):
+    """PII-freie, nicht umkehrbare Korrelation für Push-Logs."""
+    return _hashlib.sha256(str(token or '').encode('utf-8')).hexdigest()[:10]
+
+
+def _push_normalized_environment(value):
+    value = (value or '').strip().lower()
+    return value if value in ('prod', 'sandbox') else 'unknown'
+
+
+def _push_installation_register(user_token, registry, unregister_token=None):
+    """Atomically bind one APNs installation to an account.
+
+    The database uniqueness boundary is `(apns_token,bundle_id,environment)`.
+    Re-registering the same device under another account therefore performs an
+    account switch instead of leaving the previous association active.
+    Returns installation UUID string, or None when the durable store/RPC is not
+    available. The caller decides whether a legacy route may degrade.
+    """
+    reg = registry or {}
+    apns_token = (reg.get('apns_token') or '').strip()
+    if not (SB_AVAILABLE and sb is not None and user_token and apns_token):
+        return None
+    params = {
+        'p_user_token': user_token,
+        'p_apns_token': apns_token,
+        'p_bundle_id': (reg.get('bundle_id') or 'aerotax.AeroTax').strip(),
+        'p_environment': _push_normalized_environment(reg.get('apns_env')),
+        'p_device_id': (reg.get('device_id') or '').strip() or None,
+        'p_platform': (reg.get('platform') or 'ios').strip(),
+        'p_metadata': {
+            'environment_source': reg.get('apns_env_source') or 'server',
+            'registered_via': reg.get('registered_via') or 'legacy',
+        },
+        'p_unregister_secret_hash': (
+            _hashlib.sha256(str(unregister_token).encode('utf-8')).hexdigest()
+            if unregister_token else None),
+    }
+    try:
+        result = sb.rpc('register_push_installation', params).execute()
+        data = result.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if isinstance(data, dict):
+            data = data.get('register_push_installation') or data.get('id')
+        return str(data) if data else None
+    except Exception as e:
+        app.logger.error(
+            f'[push-install] register_fail user_ref={_push_token_ref(user_token)} '
+            f'err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return None
+
+
+def _push_installations_for_user(user_token):
+    """Return active APNs installations; None means durable store unavailable."""
+    if not (SB_AVAILABLE and sb is not None and user_token):
+        return None
+    try:
+        result = (sb.table('push_installations').select(
+            'id,user_token,apns_token,bundle_id,environment,device_id,platform,'
+            'active,metadata')
+            .eq('user_token', user_token).eq('active', True).execute())
+        rows = []
+        for row in (result.data or []):
+            if not isinstance(row, dict) or not (row.get('apns_token') or '').strip():
+                continue
+            rows.append({
+                'installation_id': str(row.get('id') or ''),
+                'token': user_token,
+                'apns_token': row.get('apns_token') or '',
+                'bundle_id': row.get('bundle_id') or 'aerotax.AeroTax',
+                'apns_env': _push_normalized_environment(row.get('environment')),
+                'device_id': row.get('device_id') or '',
+                'platform': row.get('platform') or 'ios',
+            })
+        return rows
+    except Exception as e:
+        app.logger.warning(
+            f'[push-install] list_fail user_ref={_push_token_ref(user_token)} '
+            f'err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return None
+
+
+def _push_installation_tombstone(user_token, installation_id=None,
+                                 apns_token=None, bundle_id=None,
+                                 apns_env=None, reason='logout'):
+    """Durably disable one installation, or all for legacy logout callers."""
+    if not (SB_AVAILABLE and sb is not None and user_token):
+        return None
+    params = {
+        'p_user_token': user_token,
+        'p_installation_id': installation_id or None,
+        'p_apns_token': (apns_token or '').strip() or None,
+        'p_bundle_id': (bundle_id or '').strip() or None,
+        'p_environment': (_push_normalized_environment(apns_env)
+                          if apns_env else None),
+        'p_reason': reason,
+    }
+    try:
+        result = sb.rpc('tombstone_push_installations', params).execute()
+        data = result.data
+        if isinstance(data, list):
+            data = data[0] if data else 0
+        if isinstance(data, dict):
+            data = data.get('tombstone_push_installations', 0)
+        return int(data or 0)
+    except Exception as e:
+        app.logger.error(
+            f'[push-install] tombstone_fail user_ref={_push_token_ref(user_token)} '
+            f'err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return None
+
+
+def _push_installation_tombstone_by_capability(installation_id,
+                                               unregister_token):
+    """Tombstone after logout without retaining the account Bearer on-device."""
+    if not (SB_AVAILABLE and sb is not None and installation_id
+            and unregister_token):
+        return None
+    secret_hash = _hashlib.sha256(
+        str(unregister_token).encode('utf-8')).hexdigest()
+    try:
+        result = sb.rpc('tombstone_push_installation_by_secret', {
+            'p_installation_id': installation_id,
+            'p_unregister_secret_hash': secret_hash,
+            'p_reason': 'offline_logout_retry',
+        }).execute()
+        data = result.data
+        if isinstance(data, list):
+            data = data[0] if data else False
+        if isinstance(data, dict):
+            data = data.get('tombstone_push_installation_by_secret', False)
+        return bool(data)
+    except Exception as e:
+        app.logger.error(
+            f'[push-install] capability_tombstone_fail '
+            f'installation={str(installation_id)[:8]} '
+            f'err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return None
+
+
+def _push_installation_delivery_update(registry, success, reason=None):
+    """Update delivery health for one installation; never affects the request."""
+    installation_id = (registry or {}).get('installation_id')
+    if not (SB_AVAILABLE and sb is not None and installation_id):
+        return False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    patch = {'updated_at': now_iso}
+    if success:
+        patch.update({'last_success_at': now_iso, 'failure_count': 0})
+    else:
+        patch.update({'last_failure_at': now_iso})
+    try:
+        q = sb.table('push_installations').update(patch).eq('id', installation_id)
+        q.execute()
+        if not success:
+            # PostgREST has no portable atomic increment here; the durable
+            # outbox attempt counter remains authoritative for retry/dead-letter.
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _push_delivery_registrations(user_token):
+    """Multi-device candidates without resurrecting stale legacy bindings."""
+    legacy = _push_load(user_token) or {}
+    installations = _push_installations_for_user(user_token)
+    if installations is None:
+        # With Supabase configured, a failed durable registry read is not
+        # permission to use a possibly stale disk/legacy token: after a shared-
+        # device account switch that could disclose the previous account's push.
+        # Let the durable outbox retry instead. File-only local/dev keeps its
+        # historical compatibility behavior.
+        if SB_AVAILABLE and sb is not None:
+            safe_legacy = dict(legacy)
+            safe_legacy['_durable_registry_unavailable'] = True
+            safe_legacy['push_token'] = ''
+            safe_legacy['apns_token'] = ''
+            return [], safe_legacy
+        return ([legacy] if legacy else []), legacy
+    if installations:
+        return installations, legacy
+    # The release migration backfills legacy rows before this code deploys.
+    # Therefore an authoritative empty result means "no active installation"
+    # (including tombstoned/account-rebound devices), never "lazy rebind me".
+    # Lazy re-registration here would allow a stale legacy row to resurrect a
+    # logged-out or newly account-bound device.
+    if (legacy.get('apns_token') or '').strip():
+        # This row belongs to the APNs migration path, so an empty durable set
+        # means tombstoned/rebound. Suppress its Expo fallback too; it commonly
+        # points at the same physical app installation.
+        safe_legacy = dict(legacy)
+        safe_legacy['apns_token'] = ''
+        safe_legacy['push_token'] = ''
+        return [], safe_legacy
+    # Expo-only legacy clients have no native installation to migrate and keep
+    # their existing compatibility delivery path.
+    return [], legacy
 
 
 def _friends_load_from_supabase(token):
@@ -12138,11 +12393,13 @@ def get_friend_roster(token, friend_token):
             out.sort(key=lambda d: d.get('datum') or '')
         except Exception:
             pass
-    # TAIL-ANREICHERUNG (Owner 2026-07-04: „Tails auf jedem Leg im Kalender bei
-    # Crew UND Freunde"). Die Freunde-Sektoren laufen NICHT durch die Delay-
-    # Anreicherung → hier pro sichtbarem Leg das echte Board/Warehouse-Kennzeichen
-    # additiv anhängen. Nur today ±1 (Guard in _enrich_leg_tails), free_only + Memo
-    # halten den Fan-out billig. Rein additiv, defensiv (nie 500en, nichts erfinden).
+    # LIVE-/ACTUAL-TIME-ANREICHERUNG (Owner 2026-07-14, Basti-Kalender): Friend-
+    # Sektoren brauchen dieselben gemessenen Felder wie der eigene Kalender
+    # (status, est_dep/arr, delay, tail), nicht nur das Kennzeichen. Der bestehende
+    # Enricher bringt Zeitfenster-Guard, Codeshare-Faltung, Dual-Side-Memo und
+    # Tail-Guard bereits mit. `free_only=True` ist hier hart: dieser N-Crew-Fanout
+    # darf nie den bezahlten Board-Fallback öffnen. Genau EIN Enricher-Aufruf pro
+    # Tages-Sektorliste; kein anschließender `_enrich_leg_tails`-Doppel-Fetch.
     _hb = None   # echte Homebase des FREUNDES (lazy, 10-min-Memo) — Audit 2026-07-05
     for _e in out:
         try:
@@ -12150,7 +12407,8 @@ def get_friend_roster(token, friend_token):
             if isinstance(_secs, list) and _secs:
                 if _hb is None:
                     _hb = _profile_homebase_cached(friend_token) or ''
-                _enrich_leg_tails(_secs, _e.get('datum'), homebase=(_hb or None))
+                _enrich_leg_delays(_secs, _e.get('datum'), free_only=True,
+                                   homebase=(_hb or None))
         except Exception:
             pass
     return jsonify({'ok': True, 'shared': True, 'count': len(out),
@@ -12248,6 +12506,20 @@ def _friends_obs_provably_stale(merged, frm, to, dep):
 
 _FRIENDS_TODAY_MEMO = {}          # "token|datum" → (expires_monotonic, resp)
 _FRIENDS_TODAY_TTL = 90.0         # 90 s: Feed lädt sonst pro Aufruf N×M sequ. Board-Lookups
+_FRIENDS_TODAY_WORKER_HEALTH = _req_threading.local()
+
+
+def _friends_today_worker_health_begin():
+    _FRIENDS_TODAY_WORKER_HEALTH.failed = False
+
+
+def _friends_today_worker_health_fail():
+    """Mark the current friend resolver as degraded without leaking identity."""
+    _FRIENDS_TODAY_WORKER_HEALTH.failed = True
+
+
+def _friends_today_worker_health_failed():
+    return bool(getattr(_FRIENDS_TODAY_WORKER_HEALTH, 'failed', False))
 
 
 def _friends_today_response(payload):
@@ -12292,6 +12564,7 @@ def _friend_briefing_day_sectors(fr, datum):
             return None, ts, summary, start_iso
         return secs, ts, summary, start_iso
     except Exception:
+        _friends_today_worker_health_fail()
         return None, None, None, None
 
 
@@ -12420,6 +12693,7 @@ def _crew_state_for_day(fr, day, datum, homebase=None, snap_ts=None,
             pass
         return cs
     except Exception as e:
+        _friends_today_worker_health_fail()
         app.logger.info(f'[friends-today] crew_state_skip {type(e).__name__}')
         return None
 
@@ -13113,14 +13387,27 @@ def get_friends_today(token):
         # ECHTEN App-Objekts pushen (Muster _detail_subcall). Der Pfad ist
         # kosmetisch (kein Query-Read im Body — datum kommt aus der Closure);
         # er dient nur dazu, dass request-context-gebundene Helfer (z.B.
-        # app.logger im crew_state-Skip) nicht werfen. Fehler pro Freund
-        # isoliert → (idx, None), genau wie das frühere `continue`.
+        # app.logger im crew_state-Skip) nicht werfen. Ein echter Worker-Fehler
+        # wird separat markiert: er darf nicht wie ein legitimes `continue`
+        # (kein Roster-Tag / Privacy-Opt-out) aussehen und vor allem nicht als
+        # scheinbar vollständiger 200-Stand 90 s memoisiert werden.
         try:
+            _friends_today_worker_health_begin()
             with _app_obj.test_request_context(
                     f'/api/user/friends-today/{token}?datum={datum}'):
-                return _process_friend(_idx, fr)
-        except Exception:
-            return (_idx, None)
+                _i, _entry = _process_friend(_idx, fr)
+                return (_i, _entry, _friends_today_worker_health_failed())
+        except Exception as _e:
+            app.logger.warning(
+                f'[friends-today] worker_fail friend_ref='
+                f'{hashlib.sha256(fr.encode()).hexdigest()[:10]} '
+                f'err={type(_e).__name__}: {str(_e)[:120]}')
+            return (_idx, None, True)
+        finally:
+            # This ThreadPoolExecutor is created/destroyed per request. Close
+            # its per-thread HTTP/2 pool or the proxy registry would retain a
+            # dead-thread client after every friends-today refresh.
+            _close_current_thread_supabase_client()
 
     # Fan-out: max_workers gedeckelt (kleine Crews sind die Norm; ein sehr
     # großer Freundeskreis soll keine Verbindungs-/Thread-Flut auslösen —
@@ -13128,6 +13415,7 @@ def get_friends_today(token):
     # Index sammeln und in ORIGINALER Friend-Reihenfolge sortieren (Golden +
     # iOS-match_id-Kontrakt verlangen stabile Reihenfolge).
     _results = {}
+    _worker_failed = False
     if friends:
         _mw = max(1, min(8, len(friends)))
         _ex = ThreadPoolExecutor(max_workers=_mw)
@@ -13135,9 +13423,14 @@ def get_friends_today(token):
             _futs = [_ex.submit(_worker, i, fr) for i, fr in enumerate(friends)]
             for _f in as_completed(_futs):
                 try:
-                    _i, _entry = _f.result()
-                except Exception:
+                    _i, _entry, _failed = _f.result()
+                except Exception as _e:
+                    _worker_failed = True
+                    app.logger.warning(
+                        f'[friends-today] future_fail err={type(_e).__name__}: '
+                        f'{str(_e)[:120]}')
                     continue
+                _worker_failed = _worker_failed or _failed
                 if _entry is not None:
                     _results[_i] = _entry
         finally:
@@ -13145,9 +13438,17 @@ def get_friends_today(token):
     out = [_results[i] for i in sorted(_results)]
 
     _resp = {'datum': datum, 'count': len(out), 'friends_today': out}
-    if len(_FRIENDS_TODAY_MEMO) > 5000:
-        _FRIENDS_TODAY_MEMO.clear()
-    _FRIENDS_TODAY_MEMO[_ck] = (_now_m + _FRIENDS_TODAY_TTL, _resp)
+    if _worker_failed:
+        # Additiv/backward-compatible: bestehende Decoder ignorieren unbekannte
+        # Top-Level-Keys. Erfolgreiche Vollantworten bleiben byte-/golden-gleich.
+        # Der iOS-LKG-Pfad kann an diesen Markern erkennen, dass fehlende Rows
+        # KEIN bestätigter neuer Crew-Stand sind.
+        _resp['partial'] = True
+        _resp['complete'] = False
+    else:
+        if len(_FRIENDS_TODAY_MEMO) > 5000:
+            _FRIENDS_TODAY_MEMO.clear()
+        _FRIENDS_TODAY_MEMO[_ck] = (_now_m + _FRIENDS_TODAY_TTL, _resp)
     return _friends_today_response(_resp)
 
 
@@ -16249,10 +16550,15 @@ def _sb_roster_snapshot_load(token):
         # Snapshot-Read lieferte IMMER None → friends-today/friend-roster sahen
         # nie einen Roster-Tag (Symptom: Friend im Layover als „Basis <Homebase>").
         r, _timed_out = _supabase_execute_with_timeout('roster_snapshot_load', _do)
+        if _timed_out:
+            # friends-today must not interpret a transport failure as an
+            # authoritative "friend has no roster today" and cache the omission.
+            _friends_today_worker_health_fail()
         rows = getattr(r, 'data', None) or []
         if rows:
             return rows[0].get('payload')
     except Exception:
+        _friends_today_worker_health_fail()
         return None
     return None
 
@@ -16474,7 +16780,10 @@ def take_roster_snapshot(token):
             _push_notify_async(token, 'Dienstplan-Änderung', body,
                                data={'type': 'roster_change',
                                      'roster_change_id': str(change_id)},
-                               category='DUTY_CHANGE')
+                               category='DUTY_CHANGE',
+                               idempotency_key=(
+                                   f'roster-change:{token}:{change_id}:'
+                                   f'{_hashlib.sha256(body.encode()).hexdigest()[:12]}'))
         except Exception:
             pass
     return jsonify({'ok': True, 'changes_count': len(diff), 'changes': diff})
@@ -17505,7 +17814,7 @@ def send_chat_message(token, channel_id):
     # 2026-07-02: dieser generische Send-Pfad (den die iOS-App für Gruppen
     # nutzt und über den auch /dm/send läuft) hatte vorher KEINEN Push.
     try:
-        _chat_push_fanout_async(token, channel_id, text)
+        _chat_push_fanout_async(token, channel_id, text, message_id=msg.get('id'))
     except Exception:
         pass
     return jsonify({'ok': True, 'message': msg})
@@ -19267,7 +19576,8 @@ def add_comment(token, post_id):
             _push_notify_async(post_author,
                                f'{commenter_name} hat kommentiert',
                                (text or '')[:120],
-                               data={'type': 'wall_comment', 'post_id': post_id})
+                               data={'type': 'wall_comment', 'post_id': post_id},
+                               idempotency_key=f'wall-comment:{c.get("id")}:{post_author}')
     except Exception:
         pass
     return jsonify({'ok': True, 'comment': response_c})
@@ -20416,13 +20726,17 @@ def forum_create_reply(token, thread_id):
             _push_notify_async(thread_author_token,
                                f'{author_name} hat geantwortet',
                                (text or '')[:120],
-                               data={'type': 'forum_reply'})
+                               data={'type': 'forum_reply'},
+                               idempotency_key=(
+                                   f'forum-reply:{reply.get("id")}:{thread_author_token}'))
         # Mentioned-User extra benachrichtigen (nicht doppelt wenn = thread-author)
         if mentioned_token and mentioned_token != token and mentioned_token != thread_author_token:
             _push_notify_async(mentioned_token,
                                f'{author_name} hat dich erwähnt',
                                (text or '')[:120],
-                               data={'type': 'forum_mention'})
+                               data={'type': 'forum_mention'},
+                               idempotency_key=(
+                                   f'forum-mention:{reply.get("id")}:{mentioned_token}'))
     except Exception:
         pass
     return jsonify({'ok': True, 'reply': response_reply})
@@ -20877,12 +21191,14 @@ def _recs_save_disk(iata, recs):
     _recs_save würde sonst ALLE Recs des Airports erneut bulk-upserten."""
     rp = _recs_path(iata)
     if not rp:
-        return
+        return False
     try:
         with open(rp, 'w') as f:
             json.dump((recs or [])[-500:], f, ensure_ascii=False)
+        return True
     except Exception as e:
         app.logger.warning(f'[layover-recs] disk_save_fail (ok wenn SB lief): {e}')
+        return False
 
 
 def _layover_rec_sb_update(rec_id, fields):
@@ -20979,12 +21295,34 @@ def _filter_crew_hotels(recs, token):
     def _ok(r):
         if (r.get('category') or '').lower() not in _CREW_HOTEL_CATS:
             return True  # kein Crew-Hotel → crowdsourced sichtbar
+        # Der Autor darf den eigenen Eintrag immer sehen. Das ist kein Cross-
+        # Airline-Leak und verhindert, dass ein gerade geposteter Schlaf-Tipp
+        # wegen eines noch nicht synchronisierten Kalender-Nachweises sofort
+        # wieder aus seiner eigenen Liste verschwindet.
+        if token and r.get('author_token') == token:
+            return True
         aa = (r.get('author_airline') or '').strip().upper()
         if not aa:
             return True  # generischer Schlaf-Tipp ohne Airline-Bezug → sichtbar
         # Airline-vertrauliches Crew-Hotel: nur gleiche Airline MIT gültigem Kalender
         return bool(airline and has_cal and aa == airline)
     return [r for r in recs if _ok(r)]
+
+
+def _public_layover_rec(rec):
+    """Public API projection. The durable owner token is authorization data,
+    never social response data (including the author-facing add response)."""
+    out = {k: v for k, v in (rec or {}).items() if k != 'author_token'}
+    if out.get('is_anonymous'):
+        # author_airline remains stored internally because it is needed for the
+        # cross-airline crew-hotel gate; anonymity only removes its public face.
+        for key in ('author_short', 'author_name', 'author_airline'):
+            out.pop(key, None)
+    return out
+
+
+def _public_layover_recs(recs):
+    return [_public_layover_rec(r) for r in (recs or [])]
 
 
 def _request_token():
@@ -21004,9 +21342,13 @@ def get_layover_recs(iata):
     """
     rp = _recs_path(iata)
     if not rp: return jsonify({'error': 'invalid_iata'}), 400
-    recs = _recs_load(iata)
     cat = (request.args.get('category') or '').lower()
-    if cat and cat in LAYOVER_CATEGORIES:
+    if cat:
+        if cat not in LAYOVER_CATEGORIES:
+            return jsonify({'ok': False, 'error': 'invalid_category',
+                            'allowed_categories': sorted(LAYOVER_CATEGORIES)}), 400
+    recs = _recs_load(iata)
+    if cat:
         recs = [r for r in recs if r.get('category') == cat]
     token = _request_token()
     # SICHERHEITS-GATE: fremde Airline-Crewhotels raus (Airline + gültiger Kalender).
@@ -21016,7 +21358,8 @@ def get_layover_recs(iata):
     voted = _votes_load(token) if token else {}
     for r in recs:
         r['my_vote'] = voted.get(r.get('id'), 0)
-    return jsonify({'iata': iata.upper(), 'count': len(recs), 'recs': recs})
+    return jsonify({'iata': iata.upper(), 'count': len(recs),
+                    'recs': _public_layover_recs(recs)})
 
 
 def _layover_img_key(token):
@@ -21134,7 +21477,9 @@ def add_layover_rec(token):
         lat = lon = None
     if len(iata) != 3 or not iata.isalpha():
         return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
-    if cat not in LAYOVER_CATEGORIES: cat = 'other'
+    if cat not in LAYOVER_CATEGORIES:
+        return jsonify({'ok': False, 'error': 'invalid_category',
+                        'allowed_categories': sorted(LAYOVER_CATEGORIES)}), 400
     if not title or len(title) > 120: return jsonify({'ok': False, 'error': 'invalid_title'}), 400
     if len(desc) > 800: return jsonify({'ok': False, 'error': 'desc_too_long'}), 413
     try:
@@ -21159,29 +21504,53 @@ def add_layover_rec(token):
         'lat': lat,
         'lon': lon,
         'image_url': image_url,
-        'author_short': token[:8],
+        # Full token is stored only for exact owner authorization and is removed
+        # from every public response by _public_layover_rec().
+        'author_token': token,
         'created_at': datetime.now().isoformat(),
         'ts': time.time(),
         'vote_score': 1,  # Author auto-up-votes
         'vote_count': 1,
     }
+    is_anonymous = body.get('is_anonymous') is True
+    rec['is_anonymous'] = is_anonymous
+    if not is_anonymous:
+        rec['author_short'] = token[:8]
     # Author profile snapshot (SB-primary, Cloud-Run-ephemer-Disk sonst namenlos).
+    # Airline stays internal even for anonymous sleep posts so anonymity cannot
+    # accidentally bypass the cross-airline crew-hotel gate.
     try:
         pr = (_profile_load(token) or {}).get('profile', {}) or {}
-        rec['author_name'] = pr.get('name')
         rec['author_airline'] = pr.get('airline')
+        if not is_anonymous:
+            rec['author_name'] = pr.get('name')
     except Exception:
         pass
     # Per-Row-Insert (2026-07-01): nur den NEUEN Rec nach SB upserten statt
     # alle Recs des Airports; Disk-Cache lokal anhängen.
-    _layover_recs_save_to_supabase([rec])
-    _recs_save_disk(iata, _recs_load_from_disk(iata) + [rec])
+    sb_ok = _layover_recs_save_to_supabase([rec])
+    if SB_AVAILABLE:
+        # Supabase is the durable source in production. Never answer ok=true
+        # when its insert failed: the composer would dismiss although the next
+        # GET/discover (possibly on another instance) cannot see the new tip.
+        if not sb_ok:
+            return jsonify({'ok': False, 'error': 'persist_failed',
+                            'message': 'Tipp konnte nicht gespeichert werden.'}), 503
+        # Disk is only a read cache once durable persistence acknowledged.
+        _recs_save_disk(iata, _recs_load_from_disk(iata) + [rec])
+    else:
+        # Local/degraded mode has no Supabase. Disk is then the only persistence
+        # layer and must acknowledge before the API may claim success.
+        disk_ok = _recs_save_disk(iata, _recs_load_from_disk(iata) + [rec])
+        if not disk_ok:
+            return jsonify({'ok': False, 'error': 'persist_failed',
+                            'message': 'Tipp konnte nicht gespeichert werden.'}), 503
     # Auto-record author's +1 vote
     votes = _votes_load(token)
     votes[rec['id']] = 1
     _layover_vote_sb_set(token, rec['id'], 1)
     _votes_save_disk(token, votes)
-    return jsonify({'ok': True, 'rec': rec})
+    return jsonify({'ok': True, 'rec': _public_layover_rec(rec)})
 
 
 @app.route('/api/layover-recs/<token>/vote/<rec_id>', methods=['POST'])
@@ -21242,8 +21611,14 @@ def delete_layover_rec(token, rec_id):
     iata = _layover_find_rec_iata(rec_id)
     if iata:
         recs = _recs_load(iata)
-        new_recs = [r for r in recs
-                    if not (r.get('id') == rec_id and r.get('author_short') == token[:8])]
+        def _is_owned_target(r):
+            if r.get('id') != rec_id:
+                return False
+            # New rows use exact owner identity. author_short remains a legacy
+            # fallback for rows created before author_token was persisted.
+            owner = r.get('author_token')
+            return owner == token if owner else r.get('author_short') == token[:8]
+        new_recs = [r for r in recs if not _is_owned_target(r)]
         if len(new_recs) != len(recs):
             # SB: soft-delete (deleted=true) per-Row; Disk-Cache lokal
             # überschreiben (2026-07-01: kein Bulk-Re-Upsert aller Recs mehr).
@@ -21556,7 +21931,9 @@ def layover_rec_add_comment(token, rec_id):
                 _push_notify_async(parent_token,
                                    f'{commenter} hat dir geantwortet',
                                    (text or '')[:120],
-                                   data={'type': 'wall_comment_reply'})
+                                   data={'type': 'wall_comment_reply'},
+                                   idempotency_key=(
+                                       f'layover-comment:{comment.get("id")}:{parent_token}'))
     except Exception:
         pass
     return jsonify({'ok': True, 'comment': response_c})
@@ -21616,7 +21993,7 @@ def discover_layover_recs(token):
         recs = _filter_crew_hotels(recs, token)
         top = sorted(recs, key=lambda r: -(r.get('vote_score') or 0))[:3]
         if top:
-            out.append({'iata': iata, 'top_recs': top})
+            out.append({'iata': iata, 'top_recs': _public_layover_recs(top)})
     return jsonify({'upcoming_iatas': sorted(upcoming_iatas), 'recommendations': out})
 
 
@@ -22613,11 +22990,14 @@ def flight_times(flightno):
     AeroDataBox (RapidAPI). Key NUR server-seitig (Cloud-Run-Env AERODATABOX_KEY),
     Antwort 10 min gecacht → ein Key, geteilt, bleibt im Free-Limit (10k User)."""
     import time
+    import requests as _requests
     from blueprints.aerox_data_blueprint import _paid_budget_ok, _paid_budget_inc
     key = os.environ.get('AERODATABOX_KEY', '')
     fn = (flightno or '').strip().upper().replace(' ', '')
     date = request.args.get('date') or datetime.utcnow().strftime('%Y-%m-%d')
-    ckey = f"{fn}|{date}"
+    require_board = (request.args.get('require_board') or '').lower() in (
+        '1', 'true', 'yes')
+    ckey = f"{fn}|{date}|board:{int(require_board)}"
     now = time.time()
     if (hit := _FLIGHT_TIMES_CACHE.get(ckey)) and hit[0] > now:
         return jsonify(hit[1])
@@ -22634,6 +23014,7 @@ def flight_times(flightno):
     #    airport_delay_obs + freie Live-Boards, free_only=True). KEIN AeroDataBox-
     #    Spend pro User-Request; ADB unten nur als budget-gedeckelter Notnagel.
     #    Gleiche JSON-Shape (departure/arrival), nur die Quelle wechselt. ──
+    free_out = None
     try:
         m = _flight_obs_merged(fn, date=date, free_only=True)
     except Exception:
@@ -22660,13 +23041,21 @@ def flight_times(flightno):
                'arrival': _side('arr_iata', 'dest_name', 'sched_arr',
                                 'esti_arr', 'terminal_arr', 'gate_arr'),
                'source': 'aerox_obs_merged'}
-        return _cache(out, 300)
+        has_board = any((side or {}).get(k) for side in (
+            out.get('departure'), out.get('arrival')) for k in ('gate', 'terminal'))
+        if not require_board or has_board:
+            return _cache(out, 300)
+        # Route/Zeiten sind schon kostenlos vorhanden, aber Gate/Terminal fehlen.
+        # Nur der ausdrückliche Bordkarten-Aufruf darf deshalb bis zum
+        # budget-gegateten Detail-Fallback weiterlaufen. Bei dessen Ausfall bleibt
+        # diese kostenlose Teilantwort erhalten.
+        free_out = out
 
     # ── BEZAHLT (letzter Notnagel): AeroDataBox NUR mit Key UND Tages-Budget. ──
     if not key:
-        return _cache({'ok': False, 'error': 'not_configured'}, 120)
+        return _cache(free_out or {'ok': False, 'error': 'not_configured'}, 120)
     if not _paid_budget_ok():
-        return _cache({'ok': False, 'error': 'budget_exhausted'}, 120)
+        return _cache(free_out or {'ok': False, 'error': 'budget_exhausted'}, 120)
 
     url = f"https://aerodatabox.p.rapidapi.com/flights/number/{fn}/{date}"
     try:
@@ -22677,10 +23066,10 @@ def flight_times(flightno):
         except Exception:
             pass
         if r.status_code != 200:
-            return _cache({'ok': False, 'error': f'http_{r.status_code}'}, 300)
+            return _cache(free_out or {'ok': False, 'error': f'http_{r.status_code}'}, 300)
         flights = r.json() if isinstance(r.json(), list) else []
         if not flights:
-            return _cache({'ok': False, 'error': 'no_flight'}, 600)
+            return _cache(free_out or {'ok': False, 'error': 'no_flight'}, 600)
         f = flights[0]
         def ap(side):
             a = (f.get(side) or {}); air = (a.get('airport') or {})
@@ -22703,7 +23092,7 @@ def flight_times(flightno):
         return _cache(out, 600)
     except Exception as e:
         app.logger.warning(f'[flighttimes] {str(e)[:120]}')
-        return jsonify({'ok': False, 'error': 'exception'})
+        return _cache(free_out or {'ok': False, 'error': 'exception'}, 120)
 
 
 def _age_from_built_date(bd):
@@ -23280,8 +23669,12 @@ def register_push_token(token):
         'apns_token': apns_token or existing.get('apns_token') or '',
         'platform': body.get('platform') or existing.get('platform') or ('ios' if apns_token else 'expo'),
         'bundle_id': body.get('bundle_id') or existing.get('bundle_id') or 'aerotax.AeroTax',
-        'device_id': body.get('device_id') or existing.get('device_id') or '',
+        'device_id': (body.get('device_id')
+                      or (existing.get('device_id')
+                          if apns_token and apns_token == existing.get('apns_token')
+                          else '') or ''),
         'registered_at': datetime.now().isoformat(),
+        'registered_via': 'legacy_path',
     }
     # Prefs + gelerntes apns_env überleben die Re-Registrierung (Save ersetzt
     # die metadata-jsonb komplett). apns_env nur bei UNVERÄNDERTEM Device-Token
@@ -23291,9 +23684,27 @@ def register_push_token(token):
     if merged['apns_token'] and merged['apns_token'] == (existing.get('apns_token') or '') \
             and existing.get('apns_env'):
         merged['apns_env'] = existing.get('apns_env')
-    if _push_save(token, merged):
-        return jsonify({'ok': True})
-    return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+    # Security ordering matters during an account switch: first atomically
+    # rebind the globally unique APNs installation, then update the one-row
+    # legacy compatibility store. Saving legacy first could leave the old
+    # account's durable installation active when the RPC is briefly down.
+    unregister_token = _secrets.token_urlsafe(32)
+    installation_id = (_push_installation_register(
+        token, merged, unregister_token=unregister_token)
+                       if merged.get('apns_token') else None)
+    if (merged.get('apns_token') and SB_AVAILABLE and sb is not None
+            and not installation_id):
+        response = jsonify({'ok': False, 'error': 'push_registry_unavailable'})
+        response.status_code = 503
+        response.headers['Retry-After'] = '5'
+        return response
+    if not _push_save(token, merged):
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+    response = {'ok': True}
+    if installation_id:
+        response['installation_id'] = installation_id
+        response['unregister_token'] = unregister_token
+    return jsonify(response)
 
 
 @app.route('/api/push/register-apns', methods=['POST'])
@@ -23321,8 +23732,12 @@ def register_push_apns():
         'apns_token': apns_token,
         'platform': body.get('platform', 'ios'),
         'bundle_id': body.get('bundle_id') or existing.get('bundle_id') or 'aerotax.AeroTax',
-        'device_id': body.get('device_id') or existing.get('device_id') or '',
+        'device_id': (body.get('device_id')
+                      or (existing.get('device_id')
+                          if apns_token == existing.get('apns_token') else '')
+                      or ''),
         'registered_at': datetime.now().isoformat(),
+        'registered_via': 'native_apns',
     }
     # Preference-Filter (2026-07-03): User-Prefs überleben eine Re-Registrierung
     # (der Save überschreibt die metadata-jsonb komplett — ohne Carry-over wären
@@ -23342,9 +23757,27 @@ def register_push_apns():
     # gewechselt haben → neu lernen lassen.
     elif (existing.get('apns_token') or '') == apns_token and existing.get('apns_env'):
         merged['apns_env'] = existing.get('apns_env')
-    if _push_save(user_token, merged):
-        return jsonify({'ok': True})
-    return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+    # Rebind first. This prevents a failed registry RPC from leaving a newly
+    # saved legacy token alongside the previous account's active installation.
+    unregister_token = _secrets.token_urlsafe(32)
+    installation_id = _push_installation_register(
+        user_token, merged, unregister_token=unregister_token)
+    if SB_AVAILABLE and sb is not None and not installation_id:
+        # Do not claim durable registration when the installation RPC failed.
+        # Old legacy state remains as a delivery fallback; client retries this
+        # additive endpoint and account-switch binding is never silently lost.
+        response = jsonify({'ok': False, 'error': 'push_registry_unavailable'})
+        response.status_code = 503
+        response.headers['Retry-After'] = '5'
+        return response
+    legacy_ok = _push_save(user_token, merged)
+    if not legacy_ok:
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+    response = {'ok': True}
+    if installation_id:
+        response['installation_id'] = installation_id
+        response['unregister_token'] = unregister_token
+    return jsonify(response)
 
 
 @app.route('/api/push/unregister-apns', methods=['POST'])
@@ -23357,25 +23790,69 @@ def unregister_push_apns():
     auf geteilten Geräten). iOS ruft das beim Logout best-effort auf.
     """
     body = request.get_json(silent=True) or {}
-    user_token = (body.get('token') or '').strip()
+    raw_installation_id = body.get('installation_id')
+    raw_unregister_token = body.get('unregister_token')
+    installation_id = (raw_installation_id.strip()
+                       if isinstance(raw_installation_id, str) else None)
+    unregister_token = (raw_unregister_token.strip()
+                        if isinstance(raw_unregister_token, str) else None)
+    if installation_id and unregister_token:
+        try:
+            installation_id = str(uuid.UUID(installation_id))
+        except (ValueError, TypeError, AttributeError):
+            return jsonify({'ok': False,
+                            'error': 'invalid_installation_id'}), 400
+        capability_result = _push_installation_tombstone_by_capability(
+            installation_id, unregister_token)
+        if capability_result is None:
+            response = jsonify({'ok': False, 'error': 'push_registry_unavailable'})
+            response.status_code = 503
+            response.headers['Retry-After'] = '5'
+            return response
+        if capability_result:
+            return jsonify({'ok': True, 'tombstoned': 1,
+                            'via': 'installation_capability'})
+        return jsonify({'ok': False, 'error': 'invalid_unregister_capability'}), 401
+    raw_user_token = body.get('token')
+    user_token = (raw_user_token.strip()
+                  if isinstance(raw_user_token, str) else '')
     if not user_token:
         return jsonify({'ok': False, 'error': 'missing token'}), 400
+    bearer_matches = _request_bearer_matches(user_token)
     # SECURITY (Audit 2026-07-05): wie register-apns/prefs — Body-Token umgeht das
     # Pfad-Binding-Gate → expliziter Bearer-Match VOR jedem Registry-Zugriff.
     # Sonst könnte ein Angreifer mit beliebigem fremden user_token dessen
     # APNs-/Expo-Registrierung leeren (Push-Abschalt-DoS: Opfer bekommt still
     # keine DM-/Roster-Pushes mehr, bis die App sich neu registriert).
-    if not _request_bearer_matches(user_token):
+    if not bearer_matches:
         return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
     existing = _push_load(user_token) or {}
+    apns_token = (body.get('apns_token') or '').strip() or None
+    bundle_id = (body.get('bundle_id') or '').strip() or None
+    apns_env = (body.get('apns_env') or '').strip() or None
+    tombstoned = _push_installation_tombstone(
+        user_token, installation_id=installation_id, apns_token=apns_token,
+        bundle_id=bundle_id, apns_env=apns_env, reason='logout')
+    if SB_AVAILABLE and sb is not None and tombstoned is None:
+        response = jsonify({'ok': False, 'error': 'push_registry_unavailable'})
+        response.status_code = 503
+        response.headers['Retry-After'] = '5'
+        return response
     if not existing:
-        return jsonify({'ok': True, 'noop': True})
+        return jsonify({'ok': True, 'noop': not bool(tombstoned),
+                        'tombstoned': int(tombstoned or 0)})
     # apns/expo-Token leeren → _send_push_notification sendet nichts mehr an dieses
     # Gerät. Registry-Eintrag bleibt (kein neuer SB-Delete-Pfad nötig).
-    cleared = {**existing, 'apns_token': '', 'push_token': '',
-               'unregistered_at': datetime.now().isoformat()}
+    has_specific_identity = bool(installation_id or apns_token or bundle_id or apns_env)
+    legacy_matches = (not has_specific_identity
+                      or (apns_token and apns_token == existing.get('apns_token'))
+                      or (installation_id and installation_id == existing.get('installation_id')))
+    cleared = dict(existing)
+    if legacy_matches:
+        cleared.update({'apns_token': '', 'push_token': '',
+                        'unregistered_at': datetime.now().isoformat()})
     if _push_save(user_token, cleared):
-        return jsonify({'ok': True})
+        return jsonify({'ok': True, 'tombstoned': int(tombstoned or 0)})
     return jsonify({'ok': False, 'error': 'persist_failed'}), 500
 
 
@@ -23425,6 +23902,21 @@ def set_push_prefs():
 # kein Crash, keine Exception nach oben).
 
 _APNS_JWT_CACHE = {'token': None, 'iat': 0}
+_APNS_HTTP_CLIENT = None
+import threading as _push_threading
+_APNS_HTTP_CLIENT_LOCK = _push_threading.Lock()
+
+
+def _apns_http_client():
+    """One process-wide, thread-safe HTTP/2 connection pool for APNs."""
+    global _APNS_HTTP_CLIENT
+    if _APNS_HTTP_CLIENT is not None:
+        return _APNS_HTTP_CLIENT
+    with _APNS_HTTP_CLIENT_LOCK:
+        if _APNS_HTTP_CLIENT is None:
+            import httpx
+            _APNS_HTTP_CLIENT = httpx.Client(http2=True, timeout=10.0)
+    return _APNS_HTTP_CLIENT
 
 
 def _apns_get_jwt():
@@ -23518,164 +24010,188 @@ def _send_apns(apns_token, title, body, data=None, topic=None,
             if k != 'aps':
                 payload[k] = v
     try:
-        import httpx
+        client = _apns_http_client()
     except ImportError:
         print("[APNS] httpx not installed — add 'httpx[http2]' to requirements.txt")
         return False, 'no_httpx'
     try:
-        with httpx.Client(http2=True, timeout=10.0) as client:
-            resp = client.post(
-                f"https://{host}/3/device/{apns_token}",
-                headers={
-                    'authorization': f'bearer {jwt}',
-                    'apns-topic': topic,
-                    'apns-push-type': 'alert',
-                    'apns-priority': '10',
-                },
-                content=json.dumps(payload).encode('utf-8'),
-            )
-            if resp.status_code == 200:
-                return True, None
-            reason = None
-            try:
-                reason = (resp.json() or {}).get('reason')
-            except Exception:
-                pass
-            # 410 Unregistered / 400 BadDeviceToken → Caller löscht den Token.
-            # Alert-Hygiene (2026-07-06): Der Log-Metric-Alert `apns_send_failed`
-            # matcht "[APNS] send failed". Ein Erstversuch in der falschen
-            # Umgebung (Debug-Build = Sandbox-Token, prod antwortet
-            # BadDeviceToken; sandbox darf per Design nie GELERNT werden, also
-            # zahlt so ein Gerät den prod-Fehlversuch bei JEDEM Push) ist
-            # ERWARTET und wird vom Caller sofort per Gegen-Umgebung geheilt →
-            # der darf den Alert nicht triggern. Nur finale/echte Fehler
-            # (beide Umgebungen tot, TooManyRequests, BadTopic, Cert/JWT …)
-            # loggen weiterhin "send failed".
-            if retry_env_planned and reason in (
-                    'Unregistered', 'BadDeviceToken', 'ExpiredToken'):
-                print(f"[APNS] env probe rejected status={resp.status_code} "
-                      f"env={'sandbox' if use_sandbox else 'prod'} "
-                      f"reason={reason} (retrying other env)")
-            else:
-                print(f"[APNS] send failed status={resp.status_code} "
-                      f"env={'sandbox' if use_sandbox else 'prod'} body={resp.text[:200]}")
-            return False, reason or f'http_{resp.status_code}'
+        resp = client.post(
+            f"https://{host}/3/device/{apns_token}",
+            headers={
+                'authorization': f'bearer {jwt}',
+                'apns-topic': topic,
+                'apns-push-type': 'alert',
+                'apns-priority': '10',
+            },
+            content=json.dumps(payload).encode('utf-8'),
+        )
+        if resp.status_code == 200:
+            return True, None
+        reason = None
+        try:
+            reason = (resp.json() or {}).get('reason')
+        except Exception:
+            pass
+        # 410 Unregistered / 400 BadDeviceToken → Caller löscht den Token.
+        # Alert-Hygiene (2026-07-06): Der Log-Metric-Alert `apns_send_failed`
+        # matcht "[APNS] send failed". Ein Erstversuch in der falschen
+        # Umgebung (Debug-Build = Sandbox-Token, prod antwortet
+        # BadDeviceToken; sandbox darf per Design nie GELERNT werden, also
+        # zahlt so ein Gerät den prod-Fehlversuch bei JEDEM Push) ist
+        # ERWARTET und wird vom Caller sofort per Gegen-Umgebung geheilt →
+        # der darf den Alert nicht triggern. Nur finale/echte Fehler
+        # (beide Umgebungen tot, TooManyRequests, BadTopic, Cert/JWT …)
+        # loggen weiterhin "send failed".
+        if retry_env_planned and reason in (
+                'Unregistered', 'BadDeviceToken', 'ExpiredToken'):
+            print(f"[APNS] env probe rejected status={resp.status_code} "
+                  f"env={'sandbox' if use_sandbox else 'prod'} "
+                  f"reason={reason} (retrying other env)")
+        else:
+            print(f"[APNS] send failed status={resp.status_code} "
+                  f"env={'sandbox' if use_sandbox else 'prod'} body={resp.text[:200]}")
+        return False, reason or f'http_{resp.status_code}'
     except Exception as e:
         print(f"[APNS] transport error: {e}")
         return False, 'transport_error'
 
 
 def _send_push_notification(token, title, body, data=None,
-                            thread_id=None, badge=None, category=None):
-    """Push-Send mit APNs-Bevorzugung + Expo-Fallback (best effort).
+                            thread_id=None, badge=None, category=None,
+                            _return_detail=False):
+    """Fan out to every active installation, with one legacy Expo fallback.
 
-    1. Lade Push-Registry für `token`.
-    2. Wenn `apns_token` gesetzt UND APNS_AUTH_KEY konfiguriert → APNs HTTP/2.
-    3. Sonst Expo (legacy, für Web-Clients ohne native App).
-    4. Wenn weder noch → silent return False.
-
-    Token-Hygiene (2026-07-02): APNs 410 Unregistered / 400 BadDeviceToken
-    heißt "dieses Device-Token ist tot" (App deinstalliert, Token rotiert) →
-    apns_token wird aus user_push_tokens gelöscht, damit wir nicht ewig gegen
-    tote Tokens senden.
+    The public/legacy return value remains bool. The durable outbox asks for a
+    small detailed result so preference/no-installation outcomes complete
+    terminally while transport failures retry.
     """
     import os
+
+    def _result(ok, terminal, reason, delivered=0, attempted=0):
+        detail = {'ok': bool(ok), 'terminal': bool(terminal), 'reason': reason,
+                  'delivered': delivered, 'attempted': attempted}
+        return detail if _return_detail else bool(ok)
+
     if not token:
-        return False
-    reg = _push_load(token) or {}
-    if not reg:
-        return False
-    # Preference-Filter (2026-07-03): User-Prefs aus /api/push/prefs.
-    # Fail-open: nur bei EXPLIZITEM False unterdrücken — fehlender type,
-    # nicht gemappter type oder fehlende prefs → normal senden.
-    prefs = reg.get('prefs')
+        return _result(False, True, 'missing_user')
+    registrations, legacy = _push_delivery_registrations(token)
+
+    # Preferences remain account-wide in the legacy compatibility row.
+    prefs = (legacy or {}).get('prefs')
     push_type = (data or {}).get('type')
     if isinstance(prefs, dict) and push_type:
         pref_key = _PUSH_TYPE_TO_PREF.get(push_type)
         if pref_key is not None and prefs.get(pref_key) is False:
-            print(f"[PUSH] suppressed by pref user={token[:8]} "
+            print(f"[PUSH] suppressed user_ref={_push_token_ref(token)} "
                   f"type={push_type} pref={pref_key}")
-            return False
-    apns_token = (reg.get('apns_token') or '').strip()
-    expo_token = (reg.get('push_token') or '').strip()
-    apns_topic = (reg.get('bundle_id') or '').strip() or None
-    if apns_token and os.environ.get('APNS_AUTH_KEY', '').strip():
-        # Umgebungs-Wahl pro Gerät (Root-Cause 2026-07-03: Owner-Device lief
-        # auf einem Xcode-DEBUG-Build → das Device-Token ist ein SANDBOX-Token,
-        # prod-APNs antwortet 400 BadDeviceToken → Token wurde gepruned → ALLE
-        # weiteren Pushes wurden lautlos verworfen). Jetzt: gemerkte Umgebung
-        # (reg['apns_env'] in metadata-jsonb) zuerst; bei BadDeviceToken/
-        # Unregistered die GEGEN-Umgebung probieren und bei Erfolg lernen.
-        # Gepruned wird nur noch, wenn BEIDE Umgebungen das Token ablehnen.
-        env_pref = (reg.get('apns_env') or '').strip().lower()
+            return _result(True, True, 'suppressed_by_preference')
+
+    apns_configured = bool(os.environ.get('APNS_AUTH_KEY', '').strip())
+    delivered = 0
+    attempted = 0
+    reasons = []
+    dead_reasons = ('Unregistered', 'BadDeviceToken', 'ExpiredToken')
+
+    # Defensive de-duplication in case a partially migrated table contains the
+    # same endpoint twice. The DB unique constraint is the primary boundary.
+    seen = set()
+    for reg in registrations:
+        apns_token = (reg.get('apns_token') or '').strip()
+        if not apns_token:
+            continue
+        topic = (reg.get('bundle_id') or 'aerotax.AeroTax').strip()
+        env_pref = _push_normalized_environment(reg.get('apns_env'))
+        endpoint_key = (apns_token, topic, env_pref)
+        if endpoint_key in seen:
+            continue
+        seen.add(endpoint_key)
+        if not apns_configured:
+            reasons.append('no_jwt')
+            continue
+
+        attempted += 1
         if env_pref in ('sandbox', 'prod'):
             first_sandbox = env_pref == 'sandbox'
         else:
             first_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
-        ok, reason = _send_apns(apns_token, title, body, data=data,
-                                topic=apns_topic, thread_id=thread_id,
-                                badge=badge, use_sandbox=first_sandbox,
-                                retry_env_planned=True, category=category)
+        ok, reason = _send_apns(
+            apns_token, title, body, data=data, topic=topic,
+            thread_id=thread_id, badge=badge, use_sandbox=first_sandbox,
+            retry_env_planned=True, category=category)
         used_env = 'sandbox' if first_sandbox else 'prod'
-        if not ok and reason in ('Unregistered', 'BadDeviceToken', 'ExpiredToken'):
+        if not ok and reason in dead_reasons:
             alt_sandbox = not first_sandbox
-            ok2, reason2 = _send_apns(apns_token, title, body, data=data,
-                                      topic=apns_topic, thread_id=thread_id,
-                                      badge=badge, use_sandbox=alt_sandbox,
-                                      category=category)
+            ok2, reason2 = _send_apns(
+                apns_token, title, body, data=data, topic=topic,
+                thread_id=thread_id, badge=badge, use_sandbox=alt_sandbox,
+                category=category)
             if ok2:
                 ok, reason = True, None
                 used_env = 'sandbox' if alt_sandbox else 'prod'
-                # Nur 'prod' darf GELERNT werden. Sandbox-APNs nimmt fremde
-                # (Prod-)Tokens teils mit 200 an, stellt aber nie zu — genau so
-                # wurde Tibors Device am 03.07 fälschlich auf 'sandbox' gelernt
-                # und alle Chat-Pushes verschwanden lautlos. Echte Debug-Geräte
-                # zahlen dafür einen Prod-Fehlversuch pro Push (verschmerzbar);
-                # sauber wird das erst per Client-Hint bei der Registrierung.
-                if env_pref != used_env and used_env == 'prod':
+                # Keep the legacy environment hint for old fallback paths. New
+                # clients send the authoritative environment at registration.
+                if not reg.get('installation_id') and used_env == 'prod':
                     try:
-                        _push_save(token, {**reg, 'apns_env': used_env})
-                        print(f"[PUSH] apns env learned user={token[:8]} env={used_env}")
-                    except Exception as e:
-                        print(f"[PUSH] apns env persist failed for {token[:8]}: {e}")
+                        _push_save(token, {**legacy, 'apns_env': used_env})
+                    except Exception:
+                        pass
             else:
                 reason = reason2 or reason
         if ok:
-            # Erfolgs-Log (2026-07-03): vorher war ein erfolgreicher Send
-            # UNSICHTBAR in den Logs → „kommt kein Push an" war nicht von
-            # „wird gar nicht versucht" unterscheidbar.
-            print(f"[PUSH] apns ok user={token[:8]} env={used_env}")
-            return True
-        if reason in ('Unregistered', 'BadDeviceToken', 'ExpiredToken'):
-            # BEIDE Umgebungen lehnen ab → Device-Token ist wirklich tot →
-            # Registry bereinigen (wie unregister-apns).
-            try:
-                cleared = {**reg, 'apns_token': ''}
-                _push_save(token, cleared)
-                print(f"[PUSH] pruned dead apns token for user {token[:8]} reason={reason}")
-            except Exception as e:
-                print(f"[PUSH] prune failed for user {token[:8]}: {e}")
-        # APNs schlug fehl — falls Expo verfügbar, weiterversuchen.
-    elif apns_token and not os.environ.get('APNS_AUTH_KEY', '').strip():
-        print(f"[PUSH] APNS_AUTH_KEY not set — skipping APNs for user {token[:8]}")
-    if not expo_token:
-        return False
-    try:
-        import urllib.request
-        payload = json.dumps({
-            'to': expo_token, 'title': title, 'body': body,
-            'sound': 'default', 'priority': 'high',
-            **({'data': data} if data else {}),
-        }).encode('utf-8')
-        req = urllib.request.Request(
-            'https://exp.host/--/api/v2/push/send',
-            data=payload, method='POST',
-            headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
-        )
-        urllib.request.urlopen(req, timeout=10).read()
-        return True
-    except Exception:
-        return False
+            delivered += 1
+            _push_installation_delivery_update(reg, True)
+            print(f"[PUSH] apns ok user_ref={_push_token_ref(token)} "
+                  f"installation={str(reg.get('installation_id') or 'legacy')[:8]} "
+                  f"env={used_env}")
+            continue
+
+        reasons.append(reason or 'send_failed')
+        _push_installation_delivery_update(reg, False, reason=reason)
+        if reason in dead_reasons:
+            if reg.get('installation_id'):
+                _push_installation_tombstone(
+                    token, installation_id=reg.get('installation_id'),
+                    reason='apns_' + str(reason).lower())
+            else:
+                try:
+                    _push_save(token, {**legacy, 'apns_token': ''})
+                except Exception:
+                    pass
+            print(f"[PUSH] tombstoned dead installation "
+                  f"user_ref={_push_token_ref(token)} reason={reason}")
+
+    # Expo is a compatibility fallback, not an additional duplicate channel.
+    expo_token = ((legacy or {}).get('push_token') or '').strip()
+    if delivered == 0 and expo_token:
+        attempted += 1
+        try:
+            import urllib.request
+            payload = json.dumps({
+                'to': expo_token, 'title': title, 'body': body,
+                'sound': 'default', 'priority': 'high',
+                **({'data': data} if data else {}),
+            }).encode('utf-8')
+            req = urllib.request.Request(
+                'https://exp.host/--/api/v2/push/send',
+                data=payload, method='POST',
+                headers={'Content-Type': 'application/json',
+                         'Accept': 'application/json'},
+            )
+            urllib.request.urlopen(req, timeout=10).read()
+            delivered += 1
+        except Exception:
+            reasons.append('expo_transport_error')
+
+    if delivered:
+        return _result(True, True, 'delivered', delivered, attempted)
+    if (legacy or {}).get('_durable_registry_unavailable'):
+        return _result(False, False, 'push_registry_unavailable', 0, attempted)
+    if not seen and not expo_token:
+        return _result(True, True, 'no_active_installations', 0, attempted)
+    if seen and reasons and all(reason in dead_reasons for reason in reasons):
+        return _result(True, True, 'all_installations_tombstoned', 0, attempted)
+    return _result(False, False, ','.join(sorted(set(reasons))) or 'send_failed',
+                   0, attempted)
 
 
 # ── Fire-and-forget Push (2026-07-02) ────────────────────────────────────
@@ -23685,6 +24201,230 @@ def _send_push_notification(token, title, body, data=None,
 # sofort, der Push passiert im Hintergrund, Fehler werden gelogged statt den
 # Response zu kippen.
 _PUSH_EXECUTOR = None
+_PUSH_OUTBOX_MAX_ATTEMPTS = 8
+_PUSH_OUTBOX_BATCH = 20
+_PUSH_OUTBOX_WORKER_ID = f'{os.getpid()}-{uuid.uuid4().hex[:8]}'
+_PUSH_OUTBOX_METRICS = {
+    'enqueued': 0, 'deduplicated': 0, 'claimed': 0, 'delivered': 0,
+    'retried': 0, 'dead': 0, 'enqueue_fallback': 0,
+}
+_PUSH_OUTBOX_METRICS_LOCK = _push_threading.Lock()
+_PUSH_OUTBOX_DAEMON = None
+_PUSH_OUTBOX_WAKE = _push_threading.Event()
+
+
+def _push_metric(name, amount=1):
+    with _PUSH_OUTBOX_METRICS_LOCK:
+        _PUSH_OUTBOX_METRICS[name] = _PUSH_OUTBOX_METRICS.get(name, 0) + amount
+
+
+def _push_outbox_retry_seconds(attempts):
+    """Bounded exponential backoff: 15s, 30s, …, max 1h."""
+    try:
+        attempts = max(1, int(attempts))
+    except Exception:
+        attempts = 1
+    return min(3600, 15 * (2 ** min(attempts - 1, 8)))
+
+
+def _push_outbox_key(token, title, body, data, thread_id, badge, category,
+                     idempotency_key=None):
+    """Hash the producer key so DB/logs never contain account credentials."""
+    if idempotency_key:
+        raw = 'explicit:' + str(idempotency_key)
+    else:
+        identifiers = {
+            str(k): v for k, v in (data or {}).items()
+            if str(k) == 'id' or str(k).endswith('_id')
+        } if isinstance(data, dict) else {}
+        if identifiers:
+            raw = 'event:' + json.dumps(identifiers, sort_keys=True, default=str)
+        else:
+            # Payload-identical producer retries within one minute coalesce;
+            # later genuinely repeated reminders/reactions remain deliverable.
+            bucket = int(datetime.now(timezone.utc).timestamp() // 60)
+            raw = f'window:{bucket}'
+    material = json.dumps({
+        'key': raw, 'recipient': token, 'title': title, 'body': body,
+        'data': data or {}, 'thread_id': thread_id, 'badge': badge,
+        'category': category,
+    }, sort_keys=True, ensure_ascii=False, default=str)
+    return _hashlib.sha256(material.encode('utf-8')).hexdigest()
+
+
+def _push_outbox_enqueue(token, title, body, data=None, thread_id=None,
+                         badge=None, category=None, idempotency_key=None):
+    if not (SB_AVAILABLE and sb is not None and token):
+        return None
+    payload = {
+        'title': str(title or '')[:200],
+        'body': str(body or '')[:1000],
+        'data': data if isinstance(data, dict) else {},
+        'thread_id': str(thread_id)[:128] if thread_id else None,
+        'badge': badge,
+        'category': str(category)[:64] if category else None,
+    }
+    key = _push_outbox_key(token, title, body, data, thread_id, badge,
+                           category, idempotency_key=idempotency_key)
+    try:
+        result = sb.rpc('enqueue_push_outbox', {
+            'p_idempotency_key': key,
+            'p_user_token': token,
+            'p_payload': payload,
+        }).execute()
+        row = result.data
+        if isinstance(row, list):
+            row = row[0] if row else None
+        if not isinstance(row, dict):
+            return None
+        outbox_id = row.get('outbox_id') or row.get('id')
+        _push_metric('enqueued' if bool(row.get('inserted')) else 'deduplicated')
+        return str(outbox_id) if outbox_id else None
+    except Exception as e:
+        app.logger.error(
+            f'[push-outbox] enqueue_fail user_ref={_push_token_ref(token)} '
+            f'err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return None
+
+
+def _push_outbox_claim():
+    if not (SB_AVAILABLE and sb is not None):
+        return None
+    try:
+        result = sb.rpc('claim_push_outbox', {
+            'p_worker_id': _PUSH_OUTBOX_WORKER_ID,
+            'p_limit': _PUSH_OUTBOX_BATCH,
+            'p_lock_timeout_seconds': 120,
+        }).execute()
+        rows = [row for row in (result.data or []) if isinstance(row, dict)]
+        _push_metric('claimed', len(rows))
+        return rows
+    except Exception as e:
+        app.logger.error(
+            f'[push-outbox] claim_fail worker={_PUSH_OUTBOX_WORKER_ID} '
+            f'err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return None
+
+
+def _push_outbox_mark(row, delivery):
+    if not (SB_AVAILABLE and sb is not None and row.get('id')):
+        return False
+    attempts = int(row.get('attempts') or 1)
+    now = datetime.now(timezone.utc)
+    reason = str(delivery.get('reason') or 'send_failed')[:300]
+    terminal_success = bool(delivery.get('ok')) and bool(delivery.get('terminal'))
+    if terminal_success:
+        patch = {
+            'status': 'delivered', 'delivered_at': now.isoformat(),
+            'updated_at': now.isoformat(), 'locked_at': None, 'locked_by': None,
+            'last_error': None, 'payload': {}, 'user_token': None,
+        }
+        metric = 'delivered'
+    elif attempts >= _PUSH_OUTBOX_MAX_ATTEMPTS or delivery.get('terminal'):
+        patch = {
+            'status': 'dead', 'dead_at': now.isoformat(),
+            'updated_at': now.isoformat(), 'locked_at': None, 'locked_by': None,
+            'last_error': reason,
+        }
+        metric = 'dead'
+    else:
+        available = now + timedelta(seconds=_push_outbox_retry_seconds(attempts))
+        patch = {
+            'status': 'retry', 'available_at': available.isoformat(),
+            'updated_at': now.isoformat(), 'locked_at': None, 'locked_by': None,
+            'last_error': reason,
+        }
+        metric = 'retried'
+    try:
+        # Only the worker that still owns the processing lease may finalize.
+        # Without these predicates, a slow first worker could overwrite the
+        # result after its expired row was reclaimed by another process.
+        (sb.table('push_outbox').update(patch)
+         .eq('id', row['id']).eq('status', 'processing')
+         .eq('locked_by', _PUSH_OUTBOX_WORKER_ID).execute())
+        _push_metric(metric)
+        print(f"[PUSH-OUTBOX] {metric} id={str(row['id'])[:8]} "
+              f"attempt={attempts} reason={reason}")
+        return True
+    except Exception as e:
+        app.logger.error(
+            f'[push-outbox] mark_fail id={str(row.get("id"))[:8]} '
+            f'err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return False
+
+
+def _push_outbox_drain(max_batches=4):
+    """Claim and deliver bounded batches; safe to run concurrently."""
+    for _ in range(max_batches):
+        rows = _push_outbox_claim()
+        if not rows:
+            return
+        for row in rows:
+            payload = row.get('payload') or {}
+            token = row.get('user_token')
+            if not token or not isinstance(payload, dict):
+                delivery = {'ok': False, 'terminal': True,
+                            'reason': 'invalid_outbox_payload'}
+            else:
+                try:
+                    internal_job = ((payload.get('data') or {}).get('_internal_job')
+                                    if isinstance(payload.get('data'), dict)
+                                    else None)
+                    if internal_job == 'chat_fanout':
+                        job_data = payload.get('data') or {}
+                        ok = _chat_push_fanout_async(
+                            token, job_data.get('channel_id') or '',
+                            payload.get('body') or '',
+                            message_id=job_data.get('message_id'),
+                            _from_outbox=True)
+                        delivery = {
+                            'ok': bool(ok), 'terminal': bool(ok),
+                            'reason': ('chat_fanout_enqueued' if ok
+                                       else 'chat_fanout_retry'),
+                        }
+                    else:
+                        delivery = _send_push_notification(
+                            token, payload.get('title') or '',
+                            payload.get('body') or '', data=payload.get('data'),
+                            thread_id=payload.get('thread_id'),
+                            badge=payload.get('badge'),
+                            category=payload.get('category'),
+                            _return_detail=True)
+                except Exception as e:
+                    delivery = {'ok': False, 'terminal': False,
+                                'reason': f'{type(e).__name__}: {str(e)[:180]}'}
+            _push_outbox_mark(row, delivery)
+
+
+def _push_outbox_worker_loop():
+    """Periodic wake-up makes future retries and post-restart rows progress."""
+    while True:
+        _PUSH_OUTBOX_WAKE.wait(timeout=30.0)
+        _PUSH_OUTBOX_WAKE.clear()
+        try:
+            _push_outbox_drain()
+        except Exception as e:
+            app.logger.error(
+                f'[push-outbox] worker_loop_fail {type(e).__name__}: {str(e)[:160]}'
+            )
+
+
+def _ensure_push_outbox_worker():
+    global _PUSH_OUTBOX_DAEMON
+    if not (SB_AVAILABLE and sb is not None):
+        return False
+    if _PUSH_OUTBOX_DAEMON is None or not _PUSH_OUTBOX_DAEMON.is_alive():
+        with _PUSH_OUTBOX_METRICS_LOCK:
+            if _PUSH_OUTBOX_DAEMON is None or not _PUSH_OUTBOX_DAEMON.is_alive():
+                _PUSH_OUTBOX_DAEMON = _push_threading.Thread(
+                    target=_push_outbox_worker_loop,
+                    name='push-outbox-daemon', daemon=True)
+                _PUSH_OUTBOX_DAEMON.start()
+    _PUSH_OUTBOX_WAKE.set()
+    return True
 
 
 def _push_executor():
@@ -23697,21 +24437,39 @@ def _push_executor():
 
 
 def _push_notify_async(token, title, body, data=None, thread_id=None,
-                       badge=None, category=None):
-    """Nicht-blockierender Wrapper um _send_push_notification. Best-effort:
-    Submit-Fehler (Interpreter-Shutdown o.ä.) werden geschluckt+gelogged."""
-    def _job():
-        try:
-            _send_push_notification(token, title, body, data=data,
-                                    thread_id=thread_id, badge=badge,
-                                    category=category)
-        except Exception as e:
-            print(f"[PUSH] async send failed for {str(token)[:8]}: "
-                  f"{type(e).__name__}: {str(e)[:200]}")
+                       badge=None, category=None, idempotency_key=None):
+    """Durably enqueue, then schedule non-blocking delivery.
+
+    If the additive schema/store is unavailable, preserve old clients via the
+    previous direct executor send. That path is metered and never called durable.
+    """
+    outbox_id = _push_outbox_enqueue(
+        token, title, body, data=data, thread_id=thread_id, badge=badge,
+        category=category, idempotency_key=idempotency_key)
+    if outbox_id:
+        _ensure_push_outbox_worker()
+        return outbox_id
+    else:
+        _push_metric('enqueue_fallback')
+
+        def job():
+            try:
+                _send_push_notification(token, title, body, data=data,
+                                        thread_id=thread_id, badge=badge,
+                                        category=category)
+            except Exception as e:
+                print(f"[PUSH] fallback send failed user_ref={_push_token_ref(token)}: "
+                      f"{type(e).__name__}: {str(e)[:200]}")
     try:
-        _push_executor().submit(_job)
+        _push_executor().submit(job)
     except Exception as e:
         print(f"[PUSH] executor submit failed: {e}")
+    return outbox_id
+
+
+# Reclaim persisted pending/processing rows after a process restart, even when
+# no new notification is produced immediately.
+_ensure_push_outbox_worker()
 
 
 def _chat_push_preview(text):
@@ -23746,7 +24504,8 @@ def _chat_push_preview(text):
     return s[:140]
 
 
-def _chat_push_fanout_async(author_token, channel_id, text):
+def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
+                            _from_outbox=False):
     """Push-Fanout für Chat-Messages (DM- UND Group-Channels) — der HEADLINE-
     Fix für 'keine Push bei neuer Nachricht' (2026-07-02): der generische
     Send-Endpoint /api/crew-chat/<t>/channel/<id>/send hatte NIE einen
@@ -23758,12 +24517,31 @@ def _chat_push_fanout_async(author_token, channel_id, text):
       (best-effort — per-Code-Beigetretene ohne Members-Eintrag sind nicht
       adressierbar, Capability-Modell hat keine vollständige Mitgliederliste).
     - NIE an den Autor selbst; Block-/Mute-Listen des Empfängers respektiert.
-    - Läuft KOMPLETT im Push-Executor (Profil-Load + SB-Lookups = Netz-I/O).
+    The request path first persists one lightweight fanout job. The outbox
+    worker resolves recipients and atomically/idempotently enqueues one child
+    delivery per recipient. `_from_outbox` is worker-internal only.
     """
+    if not _from_outbox:
+        fanout_id = _push_outbox_enqueue(
+            author_token, '__internal_chat_fanout__', text,
+            data={'_internal_job': 'chat_fanout',
+                  'channel_id': channel_id,
+                  'message_id': message_id},
+            idempotency_key=(f'chat-fanout:{message_id}'
+                             if message_id else None))
+        if fanout_id:
+            _ensure_push_outbox_worker()
+            return fanout_id
+        # Additive-schema/store outage: preserve the old best-effort behavior
+        # for rollout compatibility. This path is observable and intentionally
+        # not described as durable.
+        _push_metric('enqueue_fallback')
+
     def _job():
         try:
             recipients = []
             group_name = None
+            recipient_lookup_failed = False
             cid = channel_id or ''
             if cid.startswith('dm__'):
                 parts = cid[len('dm__'):].split('__')
@@ -23809,8 +24587,9 @@ def _chat_push_fanout_async(author_token, channel_id, text):
                     except Exception as e:
                         print(f"[PUSH] group lookup failed gid={str(gid)[:12]}: "
                               f"{type(e).__name__}: {str(e)[:120]}")
+                        recipient_lookup_failed = True
             if not recipients:
-                return
+                return not recipient_lookup_failed
             sender_name = ''
             try:
                 sender_name = ((_profile_load(author_token) or {})
@@ -23827,7 +24606,11 @@ def _chat_push_fanout_async(author_token, channel_id, text):
                        author_token in _blocked_by(rcpt):
                         continue
                 except Exception:
-                    pass
+                    # Block/mute state is privacy-sensitive. Retry the durable
+                    # fanout instead of guessing "not blocked" during outage.
+                    if _from_outbox:
+                        return False
+                    continue
                 if is_group:
                     title = f"{sender_name} · {group_name}" if group_name else sender_name
                     payload_type = 'group_message'
@@ -23835,21 +24618,38 @@ def _chat_push_fanout_async(author_token, channel_id, text):
                     title = sender_name
                     payload_type = 'dm'
                 try:
-                    _send_push_notification(
-                        rcpt, title, preview,
-                        data={'type': payload_type, 'channel_id': cid,
-                              'from': author_token},
-                        thread_id=cid, badge=1)
+                    kwargs = {
+                        'data': {'type': payload_type, 'channel_id': cid,
+                                 'from': author_token},
+                        'thread_id': cid,
+                        'badge': 1,
+                        'idempotency_key': (f'chat:{message_id}:{rcpt}'
+                                            if message_id else None),
+                    }
+                    if _from_outbox:
+                        child_id = _push_outbox_enqueue(
+                            rcpt, title, preview, **kwargs)
+                        if not child_id:
+                            return False
+                    else:
+                        _push_notify_async(rcpt, title, preview, **kwargs)
                 except Exception as e:
-                    print(f"[PUSH] chat fanout send failed rcpt={str(rcpt)[:8]}: "
+                    print(f"[PUSH] chat fanout send failed "
+                          f"rcpt_ref={_push_token_ref(rcpt)}: "
                           f"{type(e).__name__}: {str(e)[:200]}")
+                    return False
+            return True
         except Exception as e:
             print(f"[PUSH] chat fanout failed ch={str(channel_id)[:24]}: "
                   f"{type(e).__name__}: {str(e)[:200]}")
+            return False
+    if _from_outbox:
+        return _job()
     try:
         _push_executor().submit(_job)
     except Exception as e:
         print(f"[PUSH] executor submit failed: {e}")
+    return None
 
 
 @app.route('/api/user/history/<token>/clear', methods=['POST'])
@@ -24172,52 +24972,108 @@ def _auth_upsert_user(email, rec):
 _TOKEN_VALIDATE_CACHE = {'tokens': None, 'expires': 0.0}
 _TOKEN_VALIDATE_CACHE_TTL = 60.0
 
-def _validate_token_exists(token):
-    """Returns user-email (str) wenn token in auth_users existiert, sonst None.
+
+class _TokenValidationState(Enum):
+    """Tri-state result: outages are neither valid nor invalid credentials."""
+    VALID = 'valid'
+    INVALID = 'invalid'
+    UNAVAILABLE = 'unavailable'
+
+
+class _TokenValidationResult:
+    __slots__ = ('state', 'email')
+
+    def __init__(self, state, email=None):
+        self.state = state
+        self.email = email
+
+
+class _AuthStoreUnavailable(RuntimeError):
+    """Raised by the legacy scalar wrapper so request routes become retryable."""
+
+
+def _validate_token(token):
+    """Validate a token without conflating an auth-store outage with a miss.
 
     Verwendet 60s in-process Cache. Bei Cache-Miss für ein unbekanntes
     Token wird der Cache einmal nachgeladen (cover-Pfad für frische Signups
     die noch nicht im Cache stehen) — danach bleibt der Cache für 60s gültig.
 
-    BUG-004 motiviert: vorher konnte jeder eine beliebige AT-...-string als
-    Token in URL packen und Posts/Comments unter forged Identität ablegen.
+    Semantik:
+      VALID       bekannte Credentials, auch aus einem stale-but-known Cache
+      INVALID     Store war erreichbar und Credential ist sicher unbekannt
+      UNAVAILABLE Store war nicht erreichbar und ein unbekanntes Credential
+                  kann nicht sicher klassifiziert werden (Caller antwortet 503)
     """
     if not token or not isinstance(token, str):
-        return None
+        return _TokenValidationResult(_TokenValidationState.INVALID)
     # Guest-Demo-Tokens werden separat behandelt (rejected vor diesem Helper)
     import time as _t
     now = _t.time()
     cached = _TOKEN_VALIDATE_CACHE['tokens']
     cache_stale = cached is None or _TOKEN_VALIDATE_CACHE['expires'] < now
+    refresh_unavailable = False
     if cache_stale:
         refreshed = _refresh_token_cache(now)
         if refreshed is not None:
             cached = refreshed
+            cache_stale = False
         elif cached is not None:
-            # FAIL-SAFE (User 2026-07-01 „App loggt mich IMMER WIEDER aus"): der Reload
+            # STALE-KNOWN-SAFE (User 2026-07-01 „App loggt mich IMMER WIEDER
+            # aus"): der Reload
             # (auth_users aus Supabase) schlug TRANSIENT fehl (Cold-Start/DB-Hickup/Timeout)
-            # → vorher wurde JEDES gültige Token als „unbekannt" gewertet → Gate 401
-            # unauthorized → Client-Logout. Jetzt: den STALE (aber echten) Cache weiter
-            # nutzen — gültige Tokens finden sich, geforgte bleiben abgewiesen.
-            pass
+            # → bekannte Credentials aus dem STALE (aber echten) Cache bleiben
+            # VALID. Ein darin unbekanntes Token wird dagegen UNAVAILABLE, nie
+            # mehr fail-open VALID.
+            refresh_unavailable = True
         else:
-            # Gar kein Cache jemals geladen UND Reload fehlgeschlagen → NICHT alle
-            # aussperren. Fail-open-Sentinel (non-None) → Gate lässt durch. Das
-            # Forged-Token-Risiko während eines DB-Ausfalls ist kleiner als ein
-            # flächendeckender Zwangs-Logout.
-            return '__auth_cache_unavailable__'
-    hit = cached.get(token)
+            # Cold start + Store-Ausfall: Credential-Wahrheit ist unbekannt.
+            return _TokenValidationResult(_TokenValidationState.UNAVAILABLE)
+    hit = (cached or {}).get(token)
+    if hit is not None:
+        return _TokenValidationResult(_TokenValidationState.VALID, hit)
+    if refresh_unavailable:
+        return _TokenValidationResult(_TokenValidationState.UNAVAILABLE)
     if hit is None and not cache_stale:
         # Token nicht im Cache, aber Cache ist nicht stale. Möglich: neuer
         # Signup seit letztem Refresh. Einmal force-refresh, dann erneut checken.
         fresh = _refresh_token_cache(now, force=True)
         if fresh is None:
-            # Force-Refresh fehlgeschlagen (DB-Hickup): NICHT 401 — das Token
-            # könnte ein frischer Signup sein. Fail-open-Sentinel wie oben;
-            # das Forged-Token-Risiko besteht nur während eines DB-Ausfalls.
-            return '__auth_cache_unavailable__'
+            # Das Token könnte ein frischer Signup sein: 503 statt 401 verhindert
+            # Client-Logout, ohne einen Angreifer als authentifiziert zu behandeln.
+            return _TokenValidationResult(_TokenValidationState.UNAVAILABLE)
         hit = fresh.get(token)
-    return hit
+    if hit is not None:
+        return _TokenValidationResult(_TokenValidationState.VALID, hit)
+    return _TokenValidationResult(_TokenValidationState.INVALID)
+
+
+def _validate_token_exists(token):
+    """Compatibility wrapper for legacy scalar call sites.
+
+    Returns only a verified email, `None` only for a proven invalid credential,
+    and raises `_AuthStoreUnavailable` for an outage. The Flask error handler
+    maps that exception to the same retryable 503 as the explicit auth gates;
+    this prevents old boolean call sites from treating UNAVAILABLE as either
+    valid (the old fail-open sentinel) or invalid (logout-prone 401).
+    """
+    result = _validate_token(token)
+    if result.state is _TokenValidationState.UNAVAILABLE:
+        raise _AuthStoreUnavailable('auth store unavailable')
+    return result.email if result.state is _TokenValidationState.VALID else None
+
+
+def _auth_store_unavailable_response():
+    """Transient auth failure that clients must retry and must not treat as logout."""
+    response = jsonify({'ok': False, 'error': 'auth_store_unavailable'})
+    response.status_code = 503
+    response.headers['Retry-After'] = '5'
+    return response
+
+
+@app.errorhandler(_AuthStoreUnavailable)
+def _handle_auth_store_unavailable(_exc):
+    return _auth_store_unavailable_response()
 
 
 def _refresh_token_cache(now=None, force=False):
@@ -24284,7 +25140,10 @@ def _token_auth_required(token):
         # Guest tokens haben keinen Auth-Record. Eigene Routes müssen
         # explizit 403 returnen wenn sie Guest blocken. Hier: pass-through.
         return None
-    if _validate_token_exists(token) is None:
+    validation = _validate_token(token)
+    if validation.state is _TokenValidationState.UNAVAILABLE:
+        return _auth_store_unavailable_response()
+    if validation.state is _TokenValidationState.INVALID:
         return jsonify({'ok': False, 'error': 'unauthorized'}), 401
     return None
 
@@ -24364,6 +25223,74 @@ def _email_valid(email: str) -> bool:
     return bool(_EMAIL_RX.match(email))
 
 
+def _notify_owner_new_signup(email, method='email'):
+    """Echtzeit-Benachrichtigung an den Owner bei JEDER neuen Anmeldung, inkl.
+    laufendem Gesamt-Zähler (Owner-Wunsch 2026-07-15). Läuft fire-and-forget im
+    Hintergrund-Thread → verlangsamt den Signup nicht und darf ihn NIE
+    fehlschlagen lassen (best-effort, alle Fehler geschluckt/geloggt)."""
+    def _run():
+        try:
+            api_key = os.environ.get('RESEND_API_KEY', '').strip()
+            # Persönlicher Owner-Posteingang (Echtzeit-Push aufs iPhone). Bewusst
+            # NICHT der Support-Verteiler (SUPPORT_NOTIFY_EMAIL=aerox@aerosteuer.de) —
+            # per SIGNUP_NOTIFY_EMAIL-Env übersteuerbar.
+            to_email = (os.environ.get('SIGNUP_NOTIFY_EMAIL')
+                        or 'miguel.schumann@icloud.com').strip()
+            if not api_key or not to_email:
+                app.logger.info('[signup-notify] kein RESEND_API_KEY/Empfänger — übersprungen')
+                return
+            # Laufender Gesamt-Zähler: leichtgewichtiges count=exact (keine Rows).
+            total = None
+            try:
+                if SB_AVAILABLE and sb is not None:
+                    r = sb.table('auth_users').select('token', count='exact').limit(1).execute()
+                    total = getattr(r, 'count', None)
+            except Exception:
+                total = None
+            from_addr = os.environ.get('SIGNUP_FROM_EMAIL',
+                                       'AeroX <noreply@aerosteuer.de>').strip()
+            total_str = f' #{total}' if isinstance(total, int) else ''
+            total_html = (f'<p style="font-size:22px;color:#0F1A3D;margin:12px 0">'
+                          f'<b>Gesamt: {total} Accounts</b></p>'
+                          if isinstance(total, int) else '')
+            html_body = f"""
+            <div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:20px">
+              <h2 style="color:#0F1A3D;margin:0 0 8px">Neue AeroX-Anmeldung</h2>
+              <p style="font-size:16px;color:#222;margin:4px 0"><b>{email}</b></p>
+              <p style="font-size:13px;color:#777;margin:2px 0">Methode: {method}</p>
+              {total_html}
+              <p style="color:#999;font-size:11px;margin-top:28px">
+                AeroX · automatische Echtzeit-Benachrichtigung, bitte nicht antworten.
+              </p>
+            </div>
+            """
+            import urllib.request
+            payload = json.dumps({
+                'from': from_addr,
+                'to': [to_email],
+                'subject': f'AeroX: neuer Account{total_str} · {email}',
+                'html': html_body,
+            }).encode()
+            req = urllib.request.Request(
+                'https://api.resend.com/emails',
+                data=payload,
+                headers={'Authorization': f'Bearer {api_key}',
+                         'Content-Type': 'application/json',
+                         'User-Agent': 'AeroX-Backend/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if 200 <= resp.status < 300:
+                    app.logger.info(f'[signup-notify] mail an {to_email[:3]}*** (total={total})')
+                else:
+                    app.logger.warning(f'[signup-notify] resend status {resp.status}')
+        except Exception as e:
+            app.logger.warning(f'[signup-notify] send failed: {e}')
+    try:
+        import threading as _threading
+        _threading.Thread(target=_run, daemon=True).start()
+    except Exception as e:
+        app.logger.warning(f'[signup-notify] thread start failed: {e}')
+
+
 @app.route('/api/auth/signup', methods=['POST'])
 def auth_signup():
     # Anti-Abuse: IP-Rate-Limit gegen Massen-Account-Erstellung (Enumeration,
@@ -24399,6 +25326,8 @@ def auth_signup():
     # im before_request-Auth-Gate sichtbar ist (sonst 401 bis 60s-TTL abläuft).
     try: _invalidate_token_cache()
     except Exception: pass
+    # Echtzeit-Owner-Mail + Zähler (fire-and-forget, blockt den Signup nicht).
+    _notify_owner_new_signup(email, method='E-Mail')
     return jsonify({'ok': True, 'token': token, 'email': email})
 
 
@@ -24576,6 +25505,8 @@ def auth_apple():
     _auth_upsert_user(email, rec)
     try: _invalidate_token_cache()
     except Exception: pass
+    # Echtzeit-Owner-Mail + Zähler bei NEUEM Apple-Account (fire-and-forget).
+    _notify_owner_new_signup(email, method='Apple')
     # Wenn Apple einen name geliefert hat (nur beim ersten Login) · ins Profile vorbefüllen
     if name:
         try:
@@ -24908,6 +25839,8 @@ def auth_delete_account():
             ('ical_events',       'user_token'),    # .eq('user_token', token)
             ('user_licenses',     'user_token'),    # .eq('user_token', token)
             ('user_push_tokens',  'user_token'),    # on_conflict='user_token'
+            ('push_installations','user_token'),    # multi-device APNs bindings
+            ('push_outbox',       'user_token'),    # undelivered push intent/PII
             ('layover_reviews',   'user_token'),    # on_conflict='iata,user_token,category'
             ('aircraft_health_reports', 'reported_by_token'),  # row['reported_by_token']
             ('hotel_room_reports',      'reported_by_token'),  # row['reported_by_token']
@@ -25052,6 +25985,39 @@ def auth_delete_account():
 # ════════════════════════════════════════════════════════════════════
 #  DSGVO Art. 15 — Auskunftsrecht / Datenexport  (Wave-1 BUG-005, 2026-06-02)
 # ════════════════════════════════════════════════════════════════════
+
+# Credential-artige Feldnamen, die NIE in den herunterladbaren Export gehören
+# (Owner-Fund 2026-07-15: der Export gab lebende Auth-Tokens — eigene UND fremde
+# aus Wall/Forum/DM/Friends/Family — sowie Push-Tokens preis). Art. 15 gibt dem
+# Nutzer SEINE Daten, aber keine Credentials.
+_EXPORT_SECRET_KEYS = {
+    'token', 'author_token', 'owner_token', 'friend_token', 'family_token',
+    'crew_token', 'user_token', 'mentioned_token', 'session_token',
+    'apns_token', 'expo_token', 'device_token', 'push_token', 'access_token',
+    'refresh_token',
+}
+
+def _redact_export_secrets(obj):
+    """Maskiert rekursiv Auth-/Push-Tokens und die geheime iCal-Feed-URL im
+    DSGVO-Export. Struktur und alle nicht-geheimen Inhalte bleiben unverändert;
+    fremde Account-Tokens (Freunde/Family/Autoren) werden NIE mit ausgegeben."""
+    if isinstance(obj, dict):
+        # Eine iCal-Feed-URL (`{url, events, ...}`) trägt oft ein Crew-Portal-
+        # Secret in der Query → maskieren; normale `*_url` (Avatar) bleiben.
+        is_feed = 'url' in obj and 'events' in obj
+        out = {}
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if kl in _EXPORT_SECRET_KEYS and isinstance(v, str) and v:
+                out[k] = '[redacted]'
+            elif kl == 'url' and is_feed and isinstance(v, str) and v:
+                out[k] = '[redacted]'
+            else:
+                out[k] = _redact_export_secrets(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_export_secrets(x) for x in obj]
+    return obj
 
 @app.route('/api/auth/export-data', methods=['GET', 'POST'])
 def auth_export_data():
@@ -25245,6 +26211,16 @@ def auth_export_data():
             export['push_tokens'] = r.data or []
         except Exception:
             pass
+        try:
+            # Installation metadata is personal data; raw APNs bearer-like
+            # endpoint tokens are intentionally omitted from the export JSON.
+            r = (sb.table('push_installations').select(
+                'id,bundle_id,environment,device_id,platform,active,'
+                'registered_at,account_bound_at,tombstoned_at,tombstone_reason')
+                .eq('user_token', token).execute())
+            export['push_installations'] = r.data or []
+        except Exception:
+            pass
         # Layover-Reviews (eigene)
         try:
             r = sb.table('layover_reviews').select('*').eq('user_token', token).execute()
@@ -25273,6 +26249,12 @@ def auth_export_data():
             export['tax_history'] = hist.get('entries') or []
         except Exception as e:
             export['_tax_sessions_error'] = str(e)[:200]
+
+    # ── Sicherheit: Credentials maskieren, BEVOR die Datei rausgeht ─────
+    # Art. 15 gibt dem Nutzer seine Daten, aber keine lebenden Auth-Tokens
+    # (eigene ODER fremde), Push-Tokens oder das Geheimnis in der iCal-Feed-URL
+    # (Owner-Fund 2026-07-15). Rekursiv über den gesamten Export.
+    export = _redact_export_secrets(export)
 
     # JSON-Response mit attachment-Header (iOS speichert als File)
     today_str = datetime.now().date().isoformat()
@@ -28660,19 +29642,24 @@ def ax_route_history(frm, to):
     # app.py:~12455) → kein app_context nötig. Die Merge-/Filter-/Quoten-Logik unten
     # bleibt BYTE-IDENTISCH — nur das Laden wird nebenläufig.
     def _fetch_day_rows(i):
-        d_i = (base - _td(days=i)).strftime('%Y-%m-%d')
-        r = (_departed_rows_from_store(store_key) if i == 0
-             else _board_rows_from_obs_for_date(
-                 d_i, store_key, None, dest_iata=to))
-        ar = []
-        if arr_key:
-            try:
-                ar = (_departed_rows_from_store(arr_key) if i == 0
-                      else _board_rows_from_obs_for_date(
-                          d_i, arr_key, None, dest_iata=frm))
-            except Exception:
-                ar = []
-        return i, (r, ar)
+        try:
+            d_i = (base - _td(days=i)).strftime('%Y-%m-%d')
+            r = (_departed_rows_from_store(store_key) if i == 0
+                 else _board_rows_from_obs_for_date(
+                     d_i, store_key, None, dest_iata=to))
+            ar = []
+            if arr_key:
+                try:
+                    ar = (_departed_rows_from_store(arr_key) if i == 0
+                          else _board_rows_from_obs_for_date(
+                              d_i, arr_key, None, dest_iata=frm))
+                except Exception:
+                    ar = []
+            return i, (r, ar)
+        finally:
+            # _RH_TPE is per request, unlike _SB_TIMEOUT_EXECUTOR. Its threads
+            # die after this map; release their thread-local Supabase pools.
+            _close_current_thread_supabase_client()
     _day_rows = {}
     if ndays > 1:
         from concurrent.futures import ThreadPoolExecutor as _RH_TPE
@@ -29056,7 +30043,7 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         if live and arr and arr_row is None:
             _live_scan(arr)
 
-    def _obs_lookup(ap, ftype, want_other):
+    def _obs_lookup(ap, ftype, want_other, lookup_date=None):
         """Warehouse-Row (heute: In-Memory-Store; sonst: SB-Read des Tages) für
         fn am Store-Key ap+ftype. Bevorzugt die Row, deren dest_iata zur
         bekannten Gegenseite passt (Mehrfach-Legs gleicher Flugnummer)."""
@@ -29064,18 +30051,19 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
             return None
         key = _store_key_for(ap, ftype)
         try:
-            if _is_today_at(ap):
+            row_date = (lookup_date or date_q)
+            if row_date is None or row_date == _airport_local_now(ap).strftime('%Y-%m-%d'):
                 rows = _departed_rows_from_store(key)
             else:
                 # ZUKUNFTS-Guard: für ein künftiges Datum kann es keine
                 # Beobachtung geben — den SB-Read gar nicht erst machen (Fan-out-
                 # Konsumenten fragen auch künftige Roster-Tage an).
                 try:
-                    if date_q > _airport_local_now(ap).strftime('%Y-%m-%d'):
+                    if row_date > _airport_local_now(ap).strftime('%Y-%m-%d'):
                         return None
                 except Exception:
                     pass
-                rows = _board_rows_from_obs_for_date(date_q, key, None)
+                rows = _board_rows_from_obs_for_date(row_date, key, None)
         except Exception:
             rows = []
         cands = [r for r in (rows or [])
@@ -29128,6 +30116,26 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         _au = _board_local_to_utc_iso(_asched, arr) if _asched else None
         if _du and _au and _au < _du:
             arr_row, arr_src = None, None
+            # Bei einem expliziten Betriebstag kann die passende ARR-Obs am Ziel
+            # auf dem lokalen Folgetag liegen (LH455 SFO->FRA). Erst nachdem die
+            # gleiche-Tags-Row als vorige Rotation verworfen wurde, genau d+1
+            # pruefen und nur physikalisch plausible 0..36 h akzeptieren.
+            if date_q and arr:
+                try:
+                    from datetime import datetime as _dt_bd, timedelta as _td_bd
+                    _next_date = (_dt_bd.strptime(date_q, '%Y-%m-%d')
+                                  + _td_bd(days=1)).strftime('%Y-%m-%d')
+                    _next_arr = _obs_lookup(arr, 'arrival', dep,
+                                            lookup_date=_next_date)
+                    _ns = ((_next_arr or {}).get('sched') or '').strip() or None
+                    _nu = _board_local_to_utc_iso(_ns, arr) if _ns else None
+                    if _nu:
+                        _dd = _dt_bd.fromisoformat(_du.replace('Z', '+00:00'))
+                        _nd = _dt_bd.fromisoformat(_nu.replace('Z', '+00:00'))
+                        if 0 <= (_nd - _dd).total_seconds() <= 36 * 3600:
+                            arr_row, arr_src = _next_arr, 'obs'
+                except Exception:
+                    pass
 
     if dep_row is None and arr_row is None:
         _FLIGHT_MERGE_CACHE[ckey] = (_t.time(), None)
@@ -29230,6 +30238,7 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
 _FLIGHT_AIRBORNE_STATES = {
     'departed', 'airborne', 'en-route', 'enroute', 'en route', 'in air',
     'in-air', 'inair', 'abgeflogen', 'gestartet', 'im flug', 'unterwegs',
+    'approach', 'approaching', 'final approach', 'on final', 'im anflug',
 }
 _FLIGHT_LANDED_STATES = {
     'landed', 'arrived', 'at gate', 'on ground', 'on blocks', 'on-blocks',
@@ -30256,6 +31265,36 @@ def ax_flight_info(flightno):
                     out['arr_status'] = _ff['arr_status']
                 if out.get('arr_delay_min') is None and _ff.get('arr_delay_min') is not None:
                     out['arr_delay_min'] = _ff['arr_delay_min']
+        except Exception:
+            pass
+
+    # BEWUSSTER DETAIL-/INFO-FALLBACK: nur authentifiziert + ?paid=1. Listen,
+    # Radar-Fan-out und automatische Polls setzen diesen Schalter nie. Bei einem
+    # vergangenen/aktiven Flug mit Planzeiten, aber ohne jede operative Zeit,
+    # free-first versuchen und erst danach den budgetierten Paid-Tier nutzen.
+    if out is not None and out.get('found') and not out.get('stale'):
+        try:
+            _paid_requested = ((request.args.get('paid') or '').lower()
+                               in ('1', 'true', 'yes'))
+            _authed = (request.headers.get('Authorization') or '').strip() \
+                .lower().startswith('bearer ')
+            _svc = (date_param or out.get('date') or '')[:10]
+            _status_text = ' '.join(str(x or '').lower() for x in (
+                out.get('status'), out.get('arr_status')))
+            _active = any(x in _status_text for x in (
+                'depart', 'airborn', 'enroute', 'en route', 'land', 'arriv',
+                'abgeflogen', 'gestartet', 'gelandet', 'angekommen'))
+            _past = bool(_svc and _svc < datetime.now(timezone.utc).strftime('%Y-%m-%d'))
+            if (_paid_requested and _authed and (_active or _past)
+                    and not (out.get('esti') or out.get('esti_arr'))):
+                from blueprints.aerox_data_blueprint import _flight_times_free_first
+                _tf = _flight_times_free_first(
+                    fn, _svc, out.get('origin'), out.get('dest'),
+                    allow_paid=True, require_operational=True)
+                for _src, _dst in (('sched_dep', 'sched'), ('est_dep', 'esti'),
+                                   ('sched_arr', 'sched_arr'), ('est_arr', 'esti_arr')):
+                    if _tf.get(_src) and not out.get(_dst):
+                        out[_dst] = _tf[_src]
         except Exception:
             pass
 
@@ -35459,7 +36498,8 @@ def _send_friend_request_core(token, target, notify=True):
             who = my_name.strip() or 'Jemand'
             _push_notify_async(target, 'Neue Folge-Anfrage',
                                f'{who} möchte dir folgen.',
-                               data={'type': 'friend_request', 'from': token})
+                               data={'type': 'friend_request', 'from': token},
+                               idempotency_key=f'friend-request:{token}:{target}')
         except Exception:
             pass
     return jsonify({'ok': True})
@@ -35589,7 +36629,8 @@ def redeem_friend_invite(token):
         who = my_name.strip() or 'Jemand'
         _push_notify_async(issuer, 'Neue Crew-Verbindung',
                            f'{who} ist jetzt mit dir verbunden.',
-                           data={'type': 'friend_accept', 'from': token})
+                           data={'type': 'friend_accept', 'from': token},
+                           idempotency_key=f'friend-connect:{token}:{issuer}')
     except Exception:
         pass
     return jsonify({'ok': True, 'connected': True})
@@ -35644,7 +36685,8 @@ def accept_friend_request(token):
         who = my_name.strip() or 'Jemand'
         _push_notify_async(from_token, 'Neue Crew-Verbindung',
                            f'{who} hat deine Anfrage angenommen.',
-                           data={'type': 'friend_accept', 'from': token})
+                           data={'type': 'friend_accept', 'from': token},
+                           idempotency_key=f'friend-accept:{token}:{from_token}')
     except Exception:
         pass
     return jsonify({'ok': True})

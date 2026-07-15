@@ -62,12 +62,15 @@ def _sector(flight='LH400', frm='FRA', to='MUC', dep_iso=None, **extra):
     return s
 
 
-def _merged(reg=None, delay_known=False):
-    return {'ok': True, 'delay_known': delay_known, 'reg': reg,
-            'delay_min': None, 'delay_side': None, 'dep_delay_min': None,
-            'arr_delay_min': None, 'status': None, 'cancelled': False,
-            'esti_dep': None, 'esti_arr': None,
-            'sides': {'dep': None, 'arr': None}}
+def _merged(reg=None, delay_known=False, **extra):
+    value = {'ok': True, 'delay_known': delay_known, 'reg': reg,
+             'delay_min': None, 'delay_side': None, 'dep_delay_min': None,
+             'arr_delay_min': None, 'status': None, 'cancelled': False,
+             'esti_dep': None, 'esti_arr': None,
+             'sched_dep': None, 'sched_arr': None,
+             'sides': {'dep': None, 'arr': None}}
+    value.update(extra)
+    return value
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -378,6 +381,99 @@ def test_friend_roster_carries_tail(client, monkeypatch):
         A._store.pop(friend, None)
 
 
+def test_friend_roster_carries_live_fields_free_only_once(client, monkeypatch):
+    """Bastis Friend-Kalender bekommt Istzeit/Status/Delay/Tail in EINEM
+    Enrichment-Pass; der Fan-out bleibt strukturell spend-frei."""
+    tok = 'MYTOKEN'
+    friend = 'BASTITOKEN'
+    now = _now()
+    today = now.date().isoformat()
+    estimated_arrival = _iso(
+        (now + timedelta(hours=1, minutes=17)).replace(microsecond=0))
+    day = {
+        'datum': today, 'klass': 'Z72', 'routing': 'FRA-MUC',
+        'reader_facts': {'layover_ort': 'MUC'},
+        'ical_sectors': [_sector(
+            flight='LH100', frm='FRA', to='MUC',
+            dep_iso=_iso(now - timedelta(minutes=25)),
+            arr_iso=_iso(now + timedelta(hours=1)))],
+    }
+    A._store[friend] = {'result_data': {'_tage_detail': [day]}}
+    monkeypatch.setattr(A, '_friends_load', lambda t: {'friends': [friend]})
+    monkeypatch.setattr(A, '_maybe_refresh_calendar_feed', lambda *a, **k: None)
+    monkeypatch.setattr(A, '_profile_homebase_cached', lambda *a, **k: 'FRA')
+    monkeypatch.setattr(A, '_tail_recently_active', lambda reg: True)
+    merged = MagicMock(return_value=_merged(
+        reg='D-AINJ', delay_known=True, delay_min=18, delay_side='arr',
+        dep_delay_min=11, arr_delay_min=18, status='Airborne',
+        esti_arr=estimated_arrival))
+    try:
+        with patch.object(A, '_flight_obs_merged', merged), \
+                patch.object(A, '_enrich_leg_tails',
+                             side_effect=AssertionError('duplicate tail pass')):
+            response = client.get(f'/api/user/friend-roster/{tok}/{friend}')
+        assert response.status_code == 200
+        sector = response.get_json()['days'][0]['ical_sectors'][0]
+        assert sector['status'] == 'Airborne'
+        assert sector['est_arr_iso'] == estimated_arrival
+        assert sector['delay_known'] is True
+        assert sector['delay_min'] == 18
+        assert sector['tail'] == 'D-AINJ'
+        assert merged.call_count == 1
+        assert merged.call_args.kwargs['free_only'] is True
+    finally:
+        A._store.pop(friend, None)
+
+
+def test_friend_roster_free_only_never_calls_paid_board(client, monkeypatch):
+    tok = 'MYTOKEN'
+    friend = 'FREEONLYFRIEND'
+    now = _now()
+    today = now.date().isoformat()
+    day = {
+        'datum': today, 'klass': 'Z72', 'routing': 'FRA-MUC',
+        'reader_facts': {},
+        'ical_sectors': [_sector(
+            flight='LH100', frm='FRA', to='MUC',
+            dep_iso=_iso(now - timedelta(minutes=15)),
+            arr_iso=_iso(now + timedelta(hours=1)))],
+    }
+    A._store[friend] = {'result_data': {'_tage_detail': [day]}}
+    monkeypatch.setattr(A, '_friends_load', lambda t: {'friends': [friend]})
+    monkeypatch.setattr(A, '_maybe_refresh_calendar_feed', lambda *a, **k: None)
+    monkeypatch.setattr(A, '_profile_homebase_cached', lambda *a, **k: 'FRA')
+    monkeypatch.setattr(A, '_tail_recently_active', lambda reg: True)
+
+    def free_board(airport, flight):
+        if airport == 'FRA':
+            return {'flight': flight, 'dest_iata': 'MUC',
+                    'sched': _iso(now - timedelta(minutes=15)),
+                    'esti': _iso(now - timedelta(minutes=3)),
+                    'delay_min': 12, 'delay_known': True,
+                    'status': 'Departed', 'reg': 'D-AINJ'}
+        if airport == 'MUC':
+            return {'_arr': True, 'flight': flight, 'dest_iata': 'FRA',
+                    'sched': _iso(now + timedelta(hours=1)),
+                    'esti': _iso(now + timedelta(hours=1, minutes=9)),
+                    'delay_min': 9, 'delay_known': True,
+                    'status': 'Airborne', 'reg': 'D-AINJ'}
+        return None
+
+    try:
+        with patch.object(A, '_flight_from_free_board', side_effect=free_board), \
+                patch.object(A, '_flight_from_live_board',
+                             side_effect=AssertionError('paid board reached')), \
+                patch.object(A, '_departed_rows_from_store', return_value=[]):
+            response = client.get(f'/api/user/friend-roster/{tok}/{friend}')
+        assert response.status_code == 200
+        sector = response.get_json()['days'][0]['ical_sectors'][0]
+        assert sector['delay_min'] == 9
+        assert sector['status'] == 'Airborne'
+        assert sector['tail'] == 'D-AINJ'
+    finally:
+        A._store.pop(friend, None)
+
+
 def test_friend_roster_no_tail_when_no_board(client, monkeypatch):
     tok = 'MYTOKEN'
     friend = 'FRIENDTOK'
@@ -422,7 +518,7 @@ def test_family_roster_carries_tail(monkeypatch):
 def test_friend_roster_not_friends_403_no_tail_call(client, monkeypatch):
     # Privacy-Gate: keine Freundschaft → 403, kein Roster, kein Tail-Fetch.
     monkeypatch.setattr(A, '_friends_load', lambda t: {'friends': []})
-    with patch.object(A, '_leg_tail',
+    with patch.object(A, '_enrich_leg_delays',
                       side_effect=AssertionError('no roster leak')):
         r = client.get('/api/user/friend-roster/MYTOKEN/STRANGER')
     assert r.status_code == 403

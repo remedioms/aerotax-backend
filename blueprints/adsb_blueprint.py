@@ -34,6 +34,7 @@ import hmac
 import json
 import math
 import os
+import re
 import time
 import logging
 import threading
@@ -3713,20 +3714,41 @@ def get_adsb_area():
             except _OpenSkyError as e:
                 tried.append({"upstream": "opensky", "ok": False, "reason": str(e)[:80]})
 
-    # ─── Satelliten-Fallback (Ozean/China/remote) ───
+    # ─── Satelliten-Fill (Ozean/China/remote) ───
     # adsb.lol/OpenSky sind über Ozean/China leer (kein Bodenempfänger) → sie geben
     # eine LEERE Liste zurück (kein Fehler). FR24 gRPC füllt genau diese Löcher via
-    # Aireon-Satellit/Partner-Feeds. Nur beim Rauszoomen (Übersicht) und nur wenn
-    # bisher NICHTS da ist (None ODER leer) — normaler Land-Traffic bleibt adsb.lol.
-    if (not aircraft) and radius >= _AREA_FR24_MIN_RADIUS_NM:
+    # Aireon-Satellit/Partner-Feeds. Beim echten Overview (>250 nm) wird gRPC
+    # ADDITIV gemerged: drei zufällige frische Store-Flieger dürfen den Fill nicht
+    # mehr blockieren und den restlichen Atlantik leer lassen. Bei <=250 nm bleibt
+    # es ein reiner Empty-Fallback, damit dichter Land-Traffic von adsb.lol kommt.
+    _need_grpc_fill = (radius > _AREA_RADIUS_CAP_NM) or (not aircraft)
+    if _need_grpc_fill and radius >= _AREA_FR24_MIN_RADIUS_NM:
         try:
             g_ac = _area_from_fr24_grpc(lat, lon, radius)
         except Exception as e:
             g_ac = None
             tried.append({"upstream": "fr24_grpc", "ok": False, "reason": str(e)[:80]})
         if g_ac:
-            aircraft = g_ac
-            source = "fr24_grpc"
+            if aircraft:
+                # Dedup über härteste verfügbare Flugzeug-Identität. Der direkte
+                # gRPC-Treffer kommt zuletzt und ersetzt einen ggf. älteren Store-
+                # Snapshot derselben Reg/Callsign, ohne andere freie Rows zu verlieren.
+                merged = {}
+                for ac in list(aircraft) + list(g_ac):
+                    reg = re.sub(r'[^A-Z0-9]', '', str(ac.get('reg') or '').upper())
+                    cs = re.sub(r'\s+', '', str(ac.get('callsign')
+                                                or ac.get('flight') or '').upper())
+                    hx = str(ac.get('hex') or '').strip().lower()
+                    ident = ('r:' + reg if reg else
+                             ('c:' + cs if cs else
+                              ('h:' + hx if hx else
+                               f"p:{ac.get('lat')}:{ac.get('lon')}")))
+                    merged[ident] = ac
+                aircraft = list(merged.values())
+                source = f"{source}+fr24_grpc"
+            else:
+                aircraft = g_ac
+                source = "fr24_grpc"
             tried.append({"upstream": "fr24_grpc", "ok": True, "count": len(g_ac)})
 
     if aircraft is None:

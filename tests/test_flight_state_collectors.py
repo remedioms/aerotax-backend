@@ -6,7 +6,7 @@ then resolves correctly — i.e. the collector+engine pipeline fixes the ghost b
 end-to-end, not just the hand-built fixtures in test_flight_state.py.
 """
 from blueprints.flight_state import (
-    resolve_flight_state, TAXI_OUT, AIRBORNE, LANDED, BOARDING, CANCELLED, SIMULATED,
+    resolve_flight_state, TAXI_OUT, AIRBORNE, APPROACH, LANDED, BOARDING, CANCELLED, SIMULATED,
 )
 from blueprints.flight_state_collectors import (
     classify_board_status, obs_from_board_merged, obs_from_aircraft_live,
@@ -53,6 +53,40 @@ def test_classify_tokenized_no_substring_false_positives():
     assert classify_board_status("Gate zu", "dep") == (BOARDING, False, False)
     assert classify_board_status("baggage delivery finished", "arr") == (LANDED, True, False)
     assert classify_board_status("im Flug", "dep") == (AIRBORNE, True, True)
+    assert classify_board_status("Final approach", "arr") == (APPROACH, True, True)
+    assert classify_board_status("Im Anflug", "arr") == (APPROACH, True, True)
+
+
+def test_arrival_final_approach_beats_departure_taxi_out():
+    keys = build_keys("LH1126", None, "FRA", "BCN")
+    obs = obs_from_board_merged({
+        "status_dep": "Abgeflogen",
+        "status_arr": "Final approach",
+    }, keys, now=NOW)
+    fs = resolve_flight_state(keys, obs, now=NOW)
+    assert fs["phase"] == APPROACH
+
+
+def test_stale_final_approach_converges_to_estimated_landed():
+    """A stale arrival-board phase must not outlive the canonical crew state."""
+    keys = build_keys(
+        "LH1126", "2026-07-15", "FRA", "BCN",
+        sched_dep_iso="2026-07-15T07:50:00Z",
+        sched_arr_iso="2026-07-15T09:55:00Z",
+    )
+    merged = {
+        "status_dep": "Abgeflogen",
+        "status_arr": "Final approach",
+        "esti_arr": "2026-07-15T10:08:00Z",
+        "delay_known": True,
+        "arr_delay_min": 13,
+    }
+    expected_arrival = 1_784_110_080  # 2026-07-15T10:08:00Z
+    obs = obs_from_board_merged(merged, keys, now=expected_arrival + 41 * 60)
+    fs = resolve_flight_state(keys, obs, now=expected_arrival + 41 * 60)
+    assert fs["phase"] == LANDED
+    assert fs["phase_conf"] == "estimated"
+    assert fs["live"] is None
 
 
 def test_daibv_taxi_ghost_fixed_end_to_end():

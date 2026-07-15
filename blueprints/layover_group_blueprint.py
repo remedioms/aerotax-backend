@@ -40,15 +40,20 @@ _DISK_DIR = os.environ.get('AEROTAX_STATE_DIR') or '/tmp/aerotax_state'
 # Bewusst NICHT `import app` zur Laufzeit: das fragile Cross-Modul-Binding lieferte
 # in der Praxis `SB_AVAILABLE=False` (SB-Branch wurde still übersprungen → Daten
 # nur auf Disk → pro Cloud-Run-Instanz → „verschwinden"). Ein eigener Client aus
-# SUPABASE_URL/SUPABASE_SERVICE_KEY ist robust und instanz-unabhängig.
+# SUPABASE_URL/SUPABASE_SERVICE_KEY ist robust und instanz-unabhängig. Auch hier
+# darf der supabase-py HTTP/2-Client nicht zwischen gunicorn-Threads geteilt
+# werden; derselbe Thread-local-Proxy wie in app.py hält die Pools isoliert.
 _SB = None
 try:
+    import atexit as _atexit
     from supabase import create_client as _create_sb
+    from supabase_threadlocal import ThreadLocalClientProxy as _ThreadLocalSB
     _SB_URL = os.environ.get('SUPABASE_URL', '')
     _SB_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
     if _SB_URL and _SB_KEY:
-        _SB = _create_sb(_SB_URL, _SB_KEY)
-        print('[layover_group] own Supabase client ready', flush=True)
+        _SB = _ThreadLocalSB(lambda: _create_sb(_SB_URL, _SB_KEY))
+        _atexit.register(_SB.close_all)
+        print('[layover_group] own thread-local Supabase clients ready', flush=True)
     else:
         print('[layover_group] SB env vars missing → disk-only', flush=True)
 except Exception as _e:

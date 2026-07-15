@@ -217,11 +217,24 @@ def test_bug005_export_with_valid_token(client, user):
     assert "attachment" in cd.lower()
     assert "aerox-export-" in cd
     export = json.loads(r.get_data(as_text=True))
-    assert export.get("meta", {}).get("token") == token
+    # Credentials sind im Export maskiert (Owner-Fund 2026-07-15): der eigene
+    # Auth-Token darf NICHT mehr im herunterladbaren JSON stehen.
+    assert export.get("meta", {}).get("token") == "[redacted]"
     assert export.get("meta", {}).get("email") == user["email"]
-    # Post should be in the export
+    # Post should be in the export (content-IDs bleiben, nur Tokens maskiert)
     post_ids = [p.get("id") for p in (export.get("wall_posts") or [])]
     assert post_id in post_ids, f"Created post {post_id!r} not in export: {post_ids!r}"
+    # KEIN Auth-Token (eigener oder fremder) darf irgendwo im Export auftauchen.
+    def _no_token_leak(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k.lower().endswith("token") and isinstance(v, str) and v:
+                    assert v == "[redacted]", f"token leak at {k}: {v!r}"
+                _no_token_leak(v)
+        elif isinstance(obj, list):
+            for x in obj:
+                _no_token_leak(x)
+    _no_token_leak(export)
 
 
 def test_bug005_export_missing_auth_returns_401(client):

@@ -22,6 +22,10 @@ from pathlib import Path
 import pytest
 
 os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
+# Legacy endpoint tests predate ubiquitous Authorization headers and exercise
+# route business logic, not binding. Production defaults to enforced; dedicated
+# auth contract tests cover that default and strict behavior explicitly.
+os.environ.setdefault('AEROX_REQUIRE_TOKEN_BINDING', '0')
 
 
 # Memoisierte Modul-Globals, die zwischen Tests geleert werden müssen.
@@ -47,6 +51,7 @@ _MEMO_GLOBALS = {
     '_UFLIGHT_MEMO': None,
     '_LIFECYCLE_MEMO': None,
     '_FREE_TIMES_MEMO': None,
+    '_FREE_CREW_LIVE_MEMO': None,
 }
 
 

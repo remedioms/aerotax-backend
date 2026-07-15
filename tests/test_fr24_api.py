@@ -12,19 +12,24 @@ import os
 os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
 
 from unittest.mock import patch
+from datetime import datetime, timezone
+import time
 import pytest
 
 import app  # noqa: F401 — registriert sys.modules['app'] für _life_app
 import blueprints.aerox_data_blueprint as BP
+from blueprints import paid_cost_control as PCC
 
 
 @pytest.fixture(autouse=True)
 def _reset_budget():
     BP._MEM_BUDGET.clear()
     BP._FR24_REG_CACHE.clear()
+    PCC.reset_local_state()
     yield
     BP._MEM_BUDGET.clear()
     BP._FR24_REG_CACHE.clear()
+    PCC.reset_local_state()
 
 
 _ICAO2IATA = {'EDDF': 'FRA', 'KJFK': 'JFK', 'KIAD': 'IAD', 'LEBL': 'BCN',
@@ -84,7 +89,8 @@ def test_flights_by_reg_normalizes_sorts_limits():
     ]}
     with patch.object(BP, '_fr24_token', return_value='tok'), \
          patch.object(BP, '_icao_to_iata', side_effect=lambda c: _ICAO2IATA.get(c)), \
-         patch.object(BP, '_fr24_get', return_value=resp) as mget:
+         patch.object(BP, '_fr24_get', side_effect=lambda _path, params: {
+             'data': resp['data'][-int(params['limit']):]}) as mget:
         legs = BP._fr24_flights_by_reg('D-AIHW', days=4, limit=2)
     # by-registration Call ging raus …
     assert mget.called
@@ -92,8 +98,12 @@ def test_flights_by_reg_normalizes_sorts_limits():
     assert mget.call_args[0][1]['registrations'] == 'D-AIHW'
     # … Ergebnis neueste-zuerst + Limit 2
     assert [l['flight_no'] for l in legs] == ['LH401', 'LH400']
-    # Credits PRO Ergebnis gezählt (3 Treffer → 3), nicht pauschal.
-    assert BP._budget_key_used(BP._fr24_budget_key()) == 3
+    # Provider hält limit=2 ein; Billing ist 2/<30d bzw. 3/>30d pro Treffer.
+    age = time.time() - datetime.fromisoformat(
+        '2026-07-08T19:00:00+00:00').replace(tzinfo=timezone.utc).timestamp()
+    assert BP._budget_key_used(BP._fr24_budget_key()) == 2 * (2 if age < 30*86400 else 3)
+    # Explizites Provider-Limit bindet die Maximalreserve hart.
+    assert mget.call_args[0][1]['limit'] == 2
 
 
 def test_no_token_returns_empty_no_call():
@@ -129,7 +139,10 @@ def test_cache_prevents_double_spend():
         b = BP._fr24_flights_by_reg('D-AIHW', days=4, limit=5)
     assert a == b and len(a) == 1
     assert mget.call_count == 1                     # nur EIN echter Call
-    assert BP._budget_key_used(BP._fr24_budget_key()) == 2   # nur EINMAL Credits
+    age = time.time() - datetime.fromisoformat(
+        '2026-07-08T09:00:00+00:00').replace(tzinfo=timezone.utc).timestamp()
+    expected = 2 if age < 30 * 86400 else 3
+    assert BP._budget_key_used(BP._fr24_budget_key()) == expected  # nur EINMAL
 
 
 def test_empty_result_is_negative_cached():
@@ -154,6 +167,14 @@ def test_flight_by_number_returns_status_schema():
     assert f['duration_min'] == 480
     assert f['reg'] == 'DAIHW' and f['aircraft'] == 'A346'
     assert f['callsign'] == 'DLH'          # echter Funkname für Live-Position
+
+
+def test_flight_by_number_hard_limits_provider_result_count():
+    with patch.object(BP, '_fr24_token', return_value='tok'), \
+         patch.object(BP, '_fr24_get', return_value={'data': []}) as mget:
+        BP._fr24_flight_by_number('LH400', '2026-07-08')
+    assert mget.call_args[0][1]['limit'] == 3
+    assert mget.call_args[0][1]['sort'] == 'desc'
 
 
 def test_flight_by_number_none_when_no_data():
@@ -260,6 +281,24 @@ def test_uflight_paid_miss_negative_cached():
         BP.resolve_unified_flight('XX9NEG', date='2026-07-09', allow_paid=True)
         BP.resolve_unified_flight('XX9NEG', date='2026-07-09', allow_paid=True)
     assert calls == [True, False]
+    BP._UFLIGHT_MEMO.clear()
+    BP._UFLIGHT_PAID_MISS.clear()
+
+
+def test_uflight_transient_paid_failure_uses_short_reason_ttl():
+    BP._UFLIGHT_MEMO.clear()
+    BP._UFLIGHT_PAID_MISS.clear()
+
+    def fake_core(q, date, csq, lat, lon, allow_paid, date_auto=False):
+        if allow_paid:
+            BP._FR24_CALL_CONTEXT.negative_reason = 'upstream_error'
+        return {'ok': True, 'found': False, 'query': q, 'date': date}
+
+    with patch.object(BP, '_resolve_unified_flight_core', side_effect=fake_core):
+        BP.resolve_unified_flight('XX9ERR', date='2026-07-09', allow_paid=True)
+    entry = BP._UFLIGHT_PAID_MISS[('XX9ERR', '2026-07-09', False)]
+    assert entry[1] == 'upstream_error'
+    assert entry[2] == 5 * 60
     BP._UFLIGHT_MEMO.clear()
     BP._UFLIGHT_PAID_MISS.clear()
 

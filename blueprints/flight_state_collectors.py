@@ -20,7 +20,7 @@ import time
 from typing import Optional
 
 from blueprints.flight_state import (
-    Observation, TAXI_OUT, AIRBORNE, LANDED, ARRIVED, BOARDING, CANCELLED,
+    Observation, TAXI_OUT, AIRBORNE, APPROACH, LANDED, ARRIVED, BOARDING, CANCELLED,
 )
 
 # ── board status classification (side-aware, TOKEN-based, pure) ────────────
@@ -32,6 +32,8 @@ _CANCELLED_TOK = frozenset(("cancelled", "canceled", "cancel", "annulliert",
                             "gestrichen", "storniert"))
 _ENROUTE_TOK = frozenset(("airborne",))                     # truly flying
 _ENROUTE_PH = (("en", "route"), ("im", "flug"), ("in", "air"), ("in", "flight"))
+_APPROACH_TOK = frozenset(("approach", "approaching", "anflug"))
+_APPROACH_PH = (("final", "approach"), ("on", "final"), ("im", "anflug"))
 _LANDED_TOK = frozenset(("landed", "gelandet", "arrived", "angekommen",
                          "aufgesetzt", "baggage", "gepaeck", "deboard",
                          "deboarding", "ausstieg"))
@@ -86,6 +88,11 @@ def classify_board_status(status, side: str):
     # explicit en-route/airborne wins on either side (board KNOWS it's flying)
     if ts & _ENROUTE_TOK or _has_phrase(toks, _ENROUTE_PH):
         return AIRBORNE, True, True
+    # Approach/final is an explicit airborne phase. In particular, an
+    # arrival-board "Final approach" must beat an older departure-board
+    # "Departed"/TAXI_OUT signal for the same leg.
+    if ts & _APPROACH_TOK or _has_phrase(toks, _APPROACH_PH):
+        return APPROACH, True, True
     if ts & _LANDED_TOK or _has_phrase(toks, _LANDED_PH):
         # arr-side landed is authoritative; dep-side 'landed' is nonsensical -> ignore
         return (LANDED, True, False) if side == "arr" else (None, False, False)
@@ -131,13 +138,14 @@ def obs_from_board_merged(m: dict, keys: dict, now: Optional[float] = None,
     out = []
     # -- phase (side-aware, hard/soft) --
     ph_dep, hard_dep, proven_dep = classify_board_status(m.get("status_dep"), "dep")
-    ph_arr, hard_arr, _ = classify_board_status(m.get("status_arr"), "arr")
+    ph_arr, hard_arr, proven_arr = classify_board_status(m.get("status_arr"), "arr")
     if m.get("cancelled"):
         out.append(Observation("phase_hard", CANCELLED, "board", obs_ts,
                                meta={"side": "dep", "cancelled": True}))
     if ph_arr:
         out.append(Observation("phase_hard" if hard_arr else "phase_soft", ph_arr,
-                               "board", obs_ts, meta={"side": "arr"}))
+                               "board", obs_ts,
+                               meta={"side": "arr", "proven_airborne": proven_arr}))
     if ph_dep:
         kind = "phase_hard" if hard_dep else "phase_soft"
         out.append(Observation(kind, ph_dep, "board", obs_ts,

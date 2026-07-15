@@ -61,7 +61,11 @@ def available():
 # = Worker × Limit, weiterhin beschränkt und far unter jeder Flag-Schwelle.
 import threading
 _RATE_LOCK = threading.Lock()
-_MAX_PER_MIN = int(os.environ.get("FR24_GRPC_MAX_PER_MIN", "90"))
+# Anonymer Free-Pfad: bewusst konservativ. Ein Worker darf im Mittel höchstens
+# 18 Calls/Minute verbrauchen (Korridorsuche kann 1-3 Boxen benötigen); darüber
+# fällt die App auf Store/ADS-B/LKG zurück. Der alte Default 90 war für mehrere
+# gleichzeitige Radar-Viewports unnötig aggressiv und erhöhte das Sperr-Risiko.
+_MAX_PER_MIN = int(os.environ.get("FR24_GRPC_MAX_PER_MIN", "18"))
 _FREEZE_S = float(os.environ.get("FR24_GRPC_FREEZE_S", "300"))
 _EMPTY_TRIP = int(os.environ.get("FR24_GRPC_EMPTY_TRIP", "8"))
 _rate = None  # lazy init (kein time.time() bei Import)
@@ -304,6 +308,10 @@ def inbound_by_route(from_lat, from_lon, to_lat, to_lon, callsign=None, reg=None
                 "lat": row.get("lat"), "lon": row.get("lon"),
                 "track": row.get("track"), "alt": row.get("alt"),
                 "speed": row.get("speed"),
+                # Echte Beobachtungszeit der LiveFeed-Zeile. Consumer dürfen
+                # einen direkten Treffer sonst nicht fälschlich mit "jetzt"
+                # stempeln; iOS nutzt diesen Wert für Live-vs-last-known.
+                "obs_ts": row.get("timestamp"),
                 "route_from": (route.get("from") or "").strip().upper() or None,
                 "route_to": (route.get("to") or "").strip().upper() or None,
                 "sched_dep": si.get("scheduled_departure"),

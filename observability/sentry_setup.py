@@ -22,7 +22,8 @@ Behavior:
 PII guard:
 * Never pass full tokens via tags; callers should always pre-truncate
   (e.g. token[:8]+"...").
-* before_send strips Authorization headers and cookies from event payloads.
+* before_send and before_send_transaction deep-scrub headers, query secrets,
+  long-lived path credentials, breadcrumbs and exception/message text.
 """
 
 from __future__ import annotations
@@ -31,30 +32,21 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
+from observability.redaction import redact_mapping, redact_text, redact_value
+
 
 _INITIALIZED: bool = False
 _SENTRY: Any = None  # holds the imported sentry_sdk module if loaded
 
 
 def _strip_sensitive(event: Dict[str, Any], _hint: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Sentry before_send hook: scrubs auth headers and cookie values."""
+    """Sentry before_send hook: deep-scrub secrets, URLs and path tokens."""
     try:
-        request = event.get("request") or {}
-        headers = request.get("headers") or {}
-        for key in list(headers.keys()):
-            lk = key.lower()
-            if lk in ("authorization", "cookie", "x-api-key", "x-auth-token"):
-                headers[key] = "[scrubbed]"
-        # also scrub from breadcrumbs
-        for crumb in event.get("breadcrumbs", {}).get("values", []):
-            data = crumb.get("data") or {}
-            for k in list(data.keys()):
-                if "token" in k.lower() or "auth" in k.lower() or "secret" in k.lower():
-                    data[k] = "[scrubbed]"
+        return redact_mapping(event)
     except Exception:
-        # never let scrubbing break the event
-        pass
-    return event
+        # Fail CLOSED: a broken scrubber must drop observability, never send the
+        # original potentially credential-bearing payload.
+        return None
 
 
 def init_sentry(dsn: Optional[str], environment: str = "dev") -> bool:
@@ -96,6 +88,7 @@ def init_sentry(dsn: Optional[str], environment: str = "dev") -> bool:
             send_default_pii=False,
             attach_stacktrace=True,
             before_send=_strip_sensitive,
+            before_send_transaction=_strip_sensitive,
             release=os.getenv("CLOUD_RUN_REVISION") or os.getenv("GIT_COMMIT_SHA"),
             max_breadcrumbs=50,
         )
@@ -110,9 +103,8 @@ def init_sentry(dsn: Optional[str], environment: str = "dev") -> bool:
 def capture_exception(exc: BaseException, tags: Optional[Dict[str, str]] = None) -> None:
     """Forward an exception to Sentry; no-op if not initialized.
 
-    Tags must contain only short, low-cardinality values. Callers MUST
-    pre-truncate any token-like value (token[:8]+"...") -- this function
-    does not scrub tag values.
+    Tags must contain only short, low-cardinality values. Secret-like tag keys
+    and credential shapes are centrally scrubbed even if a caller forgets.
     """
     if not _INITIALIZED or _SENTRY is None:
         return
@@ -120,7 +112,7 @@ def capture_exception(exc: BaseException, tags: Optional[Dict[str, str]] = None)
         with _SENTRY.push_scope() as scope:
             for k, v in (tags or {}).items():
                 try:
-                    scope.set_tag(k, str(v)[:200])
+                    scope.set_tag(k, str(redact_value(k, v))[:200])
                 except Exception:
                     pass
             _SENTRY.capture_exception(exc)
@@ -137,10 +129,10 @@ def capture_message(msg: str, level: str = "info", tags: Optional[Dict[str, str]
         with _SENTRY.push_scope() as scope:
             for k, v in (tags or {}).items():
                 try:
-                    scope.set_tag(k, str(v)[:200])
+                    scope.set_tag(k, str(redact_value(k, v))[:200])
                 except Exception:
                     pass
-            _SENTRY.capture_message(msg, level=level)
+            _SENTRY.capture_message(redact_text(msg), level=level)
     except Exception:
         pass
 

@@ -1232,3 +1232,41 @@ def test_basti_lh890_geschlossen_bleibt_am_boden():
     assert r['state'] != STATE_FLYING, r
     assert r['text']['title'] == 'Nächster Flug · LH890 · 10:10', r
     assert r.get('pre_phase') == 'boarding', r
+
+
+def test_sebastian_lh1126_final_approach_beats_departure_taxi_out():
+    """Production regression 2026-07-15: one flight, one state everywhere.
+
+    FRA reported the departure-side token ``Abgeflogen`` while the arrival
+    side already reported ``Final approach``.  The arrival-side observation
+    is stronger and must never regress the leg to pre-flight/taxi at FRA.
+    """
+    sectors = [{
+        'flight': 'LH1126', 'from': 'FRA', 'to': 'BCN',
+        'dep_iso': '2026-07-15T07:50:00Z',
+        'arr_iso': '2026-07-15T09:55:00Z',
+    }]
+    obs = {'LH1126': {
+        'status': 'Final approach',
+        'status_dep': 'Abgeflogen',
+        'status_arr': 'Final approach',
+        'est_dep_iso': '2026-07-15T07:50:00Z',
+        'est_arr_iso': '2026-07-15T10:08:00Z',
+        'dep_delay_min': 0,
+        'arr_delay_min': 13,
+        'delay_min': 13,
+        'delay_known': True,
+        'reg': 'D-AIDB',
+    }}
+    r = resolve_crew_live_state(
+        sectors, _obs(obs), _live({}),
+        datetime(2026, 7, 15, 10, 12, tzinfo=timezone.utc),
+        homebase='FRA',
+        city_lookup=lambda c: {'FRA': 'Frankfurt', 'BCN': 'Barcelona'}.get(c),
+    )
+
+    assert r['state'] == STATE_FLYING, r
+    assert r['current_leg']['flight_no'] == 'LH1126', r
+    assert r['current_leg']['status'] == 'Final approach', r
+    assert r['text']['title'] == 'Fliegt gerade', r
+    assert r.get('pre_phase') is None, r

@@ -139,7 +139,8 @@ def _merged_record(sched_arr='2026-07-09T13:05:00'):
 def test_flight_status_includes_duration(client):
     """duration_min (=125) + sched_arr erscheinen im flight_status, wenn beide
     Soll-Zeiten beobachtet sind — GRATIS, source bleibt aerox_obs_merged."""
-    with patch.object(A, '_validate_token_exists', return_value='u1'), \
+    with patch.object(A, '_validate_token', return_value=A._TokenValidationResult(
+            A._TokenValidationState.VALID, 'u1')), \
          patch.object(A, '_flight_obs_merged', return_value=_merged_record()):
         r = client.get('/api/flight/AT-DURTEST/status?number=LH1128')
     assert r.status_code == 200
@@ -154,7 +155,8 @@ def test_flight_status_includes_duration(client):
 
 def test_flight_status_duration_none_without_arr(client):
     """Kein sched_arr beobachtet → duration_min None (nichts erfunden)."""
-    with patch.object(A, '_validate_token_exists', return_value='u1'), \
+    with patch.object(A, '_validate_token', return_value=A._TokenValidationResult(
+            A._TokenValidationState.VALID, 'u1')), \
          patch.object(A, '_flight_obs_merged',
                       return_value=_merged_record(sched_arr=None)):
         r = client.get('/api/flight/AT-DURTEST/status?number=LH1128')
@@ -419,7 +421,8 @@ def test_flight_status_fr24_fallback_when_free_empty(client):
         'aircraft': 'A359', 'reg': 'DAIXS', 'dep_delay_min': None,
         'arr_delay_min': None, 'delay_min': None, 'delay_side': None,
     }
-    with patch.object(A, '_validate_token_exists', return_value='u1'), \
+    with patch.object(A, '_validate_token', return_value=A._TokenValidationResult(
+            A._TokenValidationState.VALID, 'u1')), \
          patch.object(A, '_flight_obs_merged', return_value=None), \
          patch.object(BP, '_fr24_available', return_value=True), \
          patch.object(BP, '_fr24_flight_by_number', return_value=fr), \
@@ -436,7 +439,8 @@ def test_flight_status_fr24_fallback_when_free_empty(client):
 def test_flight_status_no_fr24_when_free_has_data(client):
     """Freie Merge liefert etwas → FR24 wird NICHT angefasst (free-first)."""
     import blueprints.aerox_data_blueprint as BP
-    with patch.object(A, '_validate_token_exists', return_value='u1'), \
+    with patch.object(A, '_validate_token', return_value=A._TokenValidationResult(
+            A._TokenValidationState.VALID, 'u1')), \
          patch.object(A, '_flight_obs_merged', return_value=_merged_record()), \
          patch.object(BP, '_fr24_flight_by_number') as mfr:
         r = client.get('/api/flight/AT-FR24/status?number=LH1128')
@@ -524,6 +528,39 @@ def test_merged_keeps_valid_same_instance_arrival():
         m = A._flight_obs_merged('LH1128', date=None, dep_iata='FRA',
                                  arr_iata='BCN', live=False, free_only=True)
     assert m is not None and m['has_arr'] is True
+
+
+def test_merged_explicit_service_day_fetches_next_day_arrival():
+    """Expliziter Nachtflug-Betriebstag: gleiche-Tags-ARR ist die vorige
+    Rotation; die passende Ziel-ARR auf d+1 wird nachgezogen."""
+    dep_row = {'flight': 'LH455', 'sched': '2026-07-01T14:40:00',
+               'dest_iata': 'FRA', 'delay_min': 54, 'delay_known': True,
+               'status': 'Departed', 'cancelled': False}
+    previous_arr = {'flight': 'LH455', 'sched': '2026-07-01T10:25:00',
+                    'dest_iata': 'SFO', 'delay_min': 10, 'delay_known': True,
+                    'status': 'Arrived', 'cancelled': False}
+    matching_arr = {'flight': 'LH455', 'sched': '2026-07-02T10:25:00',
+                    'dest_iata': 'SFO', 'delay_min': 10, 'delay_known': True,
+                    'status': 'Expected', 'cancelled': False}
+
+    def history(day, key, _airline):
+        if key == 'SFO' and day == '2026-07-01':
+            return [dep_row]
+        if key == 'FRA#ARR' and day == '2026-07-01':
+            return [previous_arr]
+        if key == 'FRA#ARR' and day == '2026-07-02':
+            return [matching_arr]
+        return []
+
+    A._FLIGHT_MERGE_CACHE.clear()
+    with patch.object(A, '_board_rows_from_obs_for_date', side_effect=history):
+        m = A._flight_obs_merged('LH455', date='2026-07-01',
+                                 dep_iata='SFO', arr_iata='FRA',
+                                 live=False, free_only=True)
+
+    assert m is not None and m['has_arr'] is True
+    assert m['sched_arr'] == '2026-07-02T10:25:00'
+    assert m['status'] == 'Expected'
 
 
 # ─────────────────── resolve-callsign endpoint ───────────────────

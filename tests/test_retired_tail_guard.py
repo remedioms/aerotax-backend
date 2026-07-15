@@ -420,6 +420,37 @@ def test_flight_times_keeps_active_reg():
     assert d['aircraft'] == 'B744'
 
 
+def test_flight_times_board_request_falls_back_when_free_gate_is_missing():
+    """Eine freie Teilantwort darf den gezielten Gate-Fallback nicht stoppen."""
+    import blueprints.aerox_data_blueprint as BP
+    m = _merged(delay_known=True)
+    m.update({'dep_iata': 'FRA', 'arr_iata': 'BOS', 'sched_dep': '13:30',
+              'sched_arr': '15:40', 'gate_dep': None, 'terminal_dep': None,
+              'gate_arr': None, 'terminal_arr': None})
+    paid = MagicMock(status_code=200)
+    paid.json.return_value = [{
+        'departure': {'airport': {'iata': 'FRA'}, 'gate': 'Z69', 'terminal': '1'},
+        'arrival': {'airport': {'iata': 'BOS'}},
+        'airline': {'name': 'Lufthansa'}, 'status': 'Scheduled'}]
+    A._FLIGHT_TIMES_CACHE.clear()
+    try:
+        with patch.object(A, '_flight_obs_merged', return_value=m), \
+                patch.object(A, '_tail_recently_active', return_value=True), \
+                patch('requests.get', return_value=paid), \
+                patch.object(BP, '_paid_budget_ok', return_value=True), \
+                patch.object(BP, '_paid_budget_inc'), \
+                patch.dict(A.os.environ, {'AERODATABOX_KEY': 'test'}):
+            with A.app.test_request_context(
+                    '/api/flight-times/LH422?date=2026-07-15&require_board=1'):
+                response = A.flight_times('LH422')
+    finally:
+        A._FLIGHT_TIMES_CACHE.clear()
+    data = response.get_json()
+    assert data['ok'] is True
+    assert data['departure']['gate'] == 'Z69'
+    assert data['departure']['terminal'] == '1'
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Regressions-Sweep 2026-07-12 #14: NEGATIVE Verdikte heilen binnen 30 min —
 # eine Reg, die nach >60 Tagen Pause WIEDER fliegt (C-Check/Neuauslieferung/

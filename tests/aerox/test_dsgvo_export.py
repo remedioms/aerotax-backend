@@ -76,7 +76,9 @@ def test_export_contains_signup_data():
         # JSON-body check
         export = r.json()
         meta = export.get("meta") or {}
-        assert meta.get("token") == token, f"Export meta.token mismatch: {meta!r}"
+        # Credentials sind im Export maskiert (Owner-Fund 2026-07-15) — der eigene
+        # Auth-Token darf nicht mehr im Klartext im herunterladbaren JSON stehen.
+        assert meta.get("token") == "[redacted]", f"token should be redacted: {meta!r}"
         assert meta.get("email") == email, f"Export meta.email mismatch: {meta!r}"
         assert meta.get("dsgvo_article", "").startswith("Art. 15"), \
             f"DSGVO-Article marker missing: {meta!r}"

@@ -35,25 +35,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-
-# keys that look like full tokens or secrets -> auto-truncate / scrub
-_SENSITIVE_KEY_FRAGMENTS = ("authorization", "secret", "api_key", "apikey",
-                            "password", "passwd", "bearer", "cookie")
-_TOKEN_KEY_FRAGMENTS = ("token", "session_id", "device_id")
+from observability.redaction import redact_text, redact_value
 
 
 def _scrub_value(key: str, value: Any) -> Any:
-    """Best-effort PII guard for value entering a log line."""
-    if not isinstance(value, str):
-        return value
-    lk = key.lower()
-    if any(f in lk for f in _SENSITIVE_KEY_FRAGMENTS):
-        return "[scrubbed]"
-    # tokens: keep first 8 chars + suffix marker
-    if any(f in lk for f in _TOKEN_KEY_FRAGMENTS) and not lk.endswith("_short"):
-        if len(value) > 12:
-            return value[:8] + "..."
-    return value
+    """Central PII guard for a value entering a log line."""
+    return redact_value(key, value)
 
 
 def _iso_now() -> str:
@@ -97,8 +84,8 @@ class StructuredLogger:
             "ts": _iso_now(),
             "severity": self._LEVEL_MAP.get(level, level),  # Cloud Run convention
             "level": level,                                  # human convention
-            "logger": self.logger_name,
-            "event": event,
+            "logger": redact_text(str(self.logger_name)),
+            "event": redact_text(str(event)),
         }
 
         # request_id: explicit > Flask g.request_id (best-effort) > default > new
@@ -112,7 +99,7 @@ class StructuredLogger:
                 rid = None
         if rid is None:
             rid = self.default_request_id or str(uuid.uuid4())[:8]
-        record["request_id"] = rid
+        record["request_id"] = redact_text(str(rid))
 
         # merge user-supplied k/v, with scrubbing
         for k, v in kv.items():

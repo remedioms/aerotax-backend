@@ -1,0 +1,17 @@
+{
+  "manifest_version": "2026-06",
+  "manifest_hash": "49f770d588ce11f9b2a8d65fffc678d3711d7095fa21e063eb298d5a2ec1b394",
+  "source_provenance": "AeroX iOS AeroTax/Mehr/LegalViews.swift bundled user-visible source blocks; Stand: Juni 2026",
+  "documents": [
+    {
+      "id": "terms-of-service",
+      "version": "2026-06",
+      "hash": "8b536bb410abb374d89683adb655eca99a2d8c5bb21099ed053608f442baa3d9"
+    },
+    {
+      "id": "privacy-policy",
+      "version": "2026-06",
+      "hash": "4907813a93513e8238f2dfde26b0b914e507b2925c57d288b7aa5dd4923dd02a"
+    }
+  ]
+}

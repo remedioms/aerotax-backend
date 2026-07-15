@@ -93,6 +93,11 @@ NEAR_AIRPORT_KM = 8.0
 # back 40 min ago on an 11h long-haul with no ADS-B is airborne even though we
 # can't see it. Bounded by expected arrival so it can never outlive the flight.
 TAXI_OUT_MAX_S = 25 * 60
+# A board can leave ``Final approach`` stale after touchdown.  Without a live
+# airborne fix we stop carrying that phase beyond the same 40-minute arrival
+# grace used by the crew-state resolver.  This keeps flights_live/crew_state
+# monotonic without inventing an actual touchdown timestamp.
+APPROACH_ARRIVAL_GRACE_S = 40 * 60
 
 # Physik-Schranke gegen eine STALE Board-Landung (owner 2026-07-13, LH454
 # FRA->SFO: die Crew stand als "in San Francisco" auf der Live-Map, während der
@@ -587,9 +592,19 @@ def _phase_machine(observations, keys, raw_pos, near_origin, prior, now):
             fr24_stage = o
     board_enroute = None
     for o in _by(observations, kind="phase_hard", source="board"):
-        # board dep-side 'airborne/en-route' (NOT bare 'Abgeflogen'=off-block)
-        if o.value == AIRBORNE and o.meta.get("proven_airborne"):
+        # Explicit airborne/en-route/approach on either board side is proof
+        # (NOT bare departure-side 'Abgeflogen'=off-block).
+        if o.value in (AIRBORNE, APPROACH) and o.meta.get("proven_airborne"):
             board_enroute = o
+    # Provider boards occasionally never replace ``Final approach`` with a
+    # landed token.  Once its expected arrival is more than 40 minutes old and
+    # there is no current airborne telemetry, the only defensible lifecycle
+    # state is an *estimated* landing.  Otherwise flights_live remained
+    # APPROACH for hours while crew_state had already advanced to LANDED.
+    if board_enroute and board_enroute.value == APPROACH and not airborne_kin:
+        exp_arr = _expected_arr_ts(observations, keys)
+        if exp_arr is not None and now >= exp_arr + APPROACH_ARRIVAL_GRACE_S:
+            return R(LANDED, ESTIMATED, "approach_timeout", board_enroute.obs_ts)
     airborne_trigger = ev_off or fr24_stage or board_enroute or (airborne_kin and raw_pos)
     if airborne_trigger:
         src = ("warehouse_event" if ev_off else
@@ -599,6 +614,8 @@ def _phase_machine(observations, keys, raw_pos, near_origin, prior, now):
             if (ev_off or fr24_stage or board_enroute) else now
         conf = OBSERVED
         res = R(AIRBORNE, conf, src, ts)
+        if board_enroute and board_enroute.value == APPROACH:
+            res["phase"] = APPROACH
         # APPROACH refinement (wording only)
         if raw_pos:
             dep_ll, dst_ll = keys.get("dep_ll"), keys.get("arr_ll")

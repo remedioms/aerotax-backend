@@ -68,6 +68,7 @@ def _run_send_apns(**kwargs):
     fake_httpx = types.ModuleType('httpx')
     fake_httpx.Client = _Client
     with patch.dict(sys.modules, {'httpx': fake_httpx}), \
+            patch.object(A, '_APNS_HTTP_CLIENT', None), \
             patch.object(A, '_apns_get_jwt', return_value='jwt-test'):
         ok, reason = A._send_apns('feedfacefeedface', 'Titel', 'Body', **kwargs)
     assert ok is True and reason is None
