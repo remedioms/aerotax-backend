@@ -3941,8 +3941,28 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
                     + (1 if (row.get('sched') or '').strip() else 0)
                 viable.append((arr_dt, -richness, row))
         if viable:
+            # INSTANZ-VOR-FRÜHE-Soll-Zeit (Owner/Fable 2026-07-16, LH867 OSL→FRA,
+            # DREI-QUELLEN-LAGE): der bisherige Sort `(arr_dt, -richness)` wählt die
+            # FRÜHEST-ankommende Row als Basis (korrekt, um keine spätere Fremd-
+            # Rotation zu greifen) und zieht -richness NUR bei GLEICHER arr_dt heran.
+            # Fällt aber eine esti-LOSE Repoll-/Warehouse-Row derselben Tages-Instanz
+            # mit leicht FRÜHERER Soll-Ankunft an (08:45 vs echt 09:05, ΔSoll 20 min
+            # < 45-min-Instanz-Toleranz), gewinnt sie via arr_dt VOR der esti-Row —
+            # sched_arr würde 08:45 und est_arr fiele weg. Fix: den frühesten
+            # arr_dt-ANKER bestimmen und ALLE Rows derselben Instanz (arr_dt
+            # innerhalb _OBS_SAME_INSTANCE_SCHED_TOL_MIN um den Anker) danach NACH
+            # Informationslage (Richness) ranken — die esti-Row derselben Instanz
+            # gewinnt so die Basis, ohne dass eine echte spätere Fremd-Rotation
+            # angezogen wird (die liegt weit außerhalb der Instanz-Toleranz).
             viable.sort(key=lambda x: (x[0], x[1]))
-            chosen = viable[0][2]
+            _anchor_dt = viable[0][0]
+            _tol = _td(minutes=_OBS_SAME_INSTANCE_SCHED_TOL_MIN)
+            _same_inst = [v for v in viable
+                          if abs((v[0] - _anchor_dt).total_seconds()) <= _tol.total_seconds()]
+            # innerhalb der Instanz: reichste zuerst (x[1] = -richness), bei Gleich-
+            # stand die früheste arr_dt (stabil, konservativ).
+            _same_inst.sort(key=lambda x: (x[1], x[0]))
+            chosen = _same_inst[0][2]
             # STATUS-MERGE (analog _best): den JÜNGSTEN nicht-leeren Status der
             # gepaarten ARR-Kandidaten auf die gewählte Row legen — die aktuellste
             # Status-Meldung ohne die Ist-Zeit der esti-Row zu verlieren. cands

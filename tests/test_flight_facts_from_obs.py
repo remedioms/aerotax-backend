@@ -197,6 +197,49 @@ def test_bare_repoll_row_does_not_displace_esti_row(monkeypatch):
     assert f['dep_status'] == 'Delayed'
 
 
+def test_esti_arr_wins_over_earlier_sched_bare_within_instance(monkeypatch):
+    """LH867 OSL→FRA 2026-07-14, DREI-QUELLEN-LAGE (Owner/Fable 2026-07-16, live):
+    die esti-tragende ARR-Row (echte Beobachtung, sched=09:05, esti=08:56,
+    'Gepäckausgabe beendet') konkurriert mit ZWEI esti-losen ARR-Rows DERSELBEN
+    Tages-Instanz (Soll nur 20 min auseinander → innerhalb der 45-min-Toleranz):
+      • eine DE-Repoll-Row (sched=08:45, status='Geplant', esti=None) und
+      • eine EN-Warehouse-Row (sched=08:45, status='baggage delivery finished',
+        esti=None).
+    Die 08:45-Rows liegen mit ihrer FRÜHEREN Soll-Ankunft im `viable`-Sort auf
+    `arr_dt` VOR der echten 09:05-Row → früher wählte _best_arr_for_dep die
+    esti-lose 08:45-Row als Basis (sched_arr=08:45, KEIN est_arr). Jetzt muss die
+    esti-Row der SELBEN Instanz die Basis nach Informationslage gewinnen:
+    est_arr=08:56, sched_arr=09:05."""
+    # updated_at-desc (wie aus der DB): esti-lose Rows zuerst, esti-Row zuletzt.
+    arr_en = {'airport': 'FRA#ARR', 'flight': 'LH867', 'dest_iata': 'OSL',
+              'date': '2026-07-14', 'sched': '08:45', 'esti': None,
+              'gate': None, 'terminal': '1',
+              'status': 'baggage delivery finished', 'max_delay_min': 0}
+    arr_de = {'airport': 'FRA#ARR', 'flight': 'LH867', 'dest_iata': 'OSL',
+              'date': '2026-07-14', 'sched': '08:45', 'esti': None,
+              'gate': None, 'status': 'Geplant', 'max_delay_min': None}
+    dep_row = {'airport': 'OSL', 'flight': 'LH867', 'dest_iata': 'FRA',
+               'date': '2026-07-14', 'sched': '06:55', 'esti': '06:57',
+               'gate': 'D11', 'status': 'Delayed', 'max_delay_min': 2}
+    arr_esti = {'airport': 'FRA#ARR', 'flight': 'LH867', 'dest_iata': 'OSL',
+                'date': '2026-07-14', 'sched': '09:05', 'esti': '08:56',
+                'gate': 'A22', 'terminal': '1',
+                'status': 'Gepäckausgabe beendet', 'max_delay_min': 0}
+    monkeypatch.setattr(axd, '_sb', lambda: _FakeSB(
+        [arr_en, arr_de, dep_row, arr_esti]))
+    monkeypatch.setattr(axd, '_tail_active_guard', lambda r: True)
+    f = _flight_facts_from_obs('LH867', '2026-07-14',
+                               dep_iata='OSL', arr_iata='FRA')
+    # Die esti-Row der SELBEN Instanz gewinnt die Basis (Information vor Frische),
+    # obwohl ihre Soll-Ankunft SPÄTER liegt als die der esti-losen 08:45-Rows.
+    assert f['sched_arr'] == '2026-07-14T09:05:00+02:00'
+    assert f['est_arr'] == '2026-07-14T08:56:00+02:00'
+    # Ankunfts-plausibler Status bleibt erhalten (beide Kandidaten sind plausibel;
+    # die reale 'Gepäckausgabe beendet' ODER die EN-Variante sind ok).
+    assert any(_t in (f.get('arr_status') or '').lower()
+               for _t in ('gepäck', 'baggage'))
+
+
 def test_today_departure_drops_yday_arrival_side(monkeypatch):
     """D-AIZD/LH1346 live regression: DEP stammt vom angefragten Tag, die einzige
     ARR-Row aber vom Vortag. Die ARR-Seite (inkl. Landed/Delay/Gate) muss komplett
