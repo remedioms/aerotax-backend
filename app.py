@@ -36129,7 +36129,8 @@ def _punct_is_stale(cached_p, max_age_h=6):
         return True
 
 
-def _punct_persist_me(token, res, rank, total_crew, cached_p, name=None):
+def _punct_persist_me(token, res, rank, total_crew, cached_p, name=None,
+                      leaderboard=None, insufficient=None):
     """Schreibt den me-Block atomar in user_profiles.metadata.punctuality
     (_profile_metadata_merge_sb → NIE Voll-Overwrite, kein Avatar-Clobber).
     Nur bei status=='ok'. history: bestehende Liste (aus cached_p) lesen, Monat
@@ -36138,7 +36139,14 @@ def _punct_persist_me(token, res, rank, total_crew, cached_p, name=None):
 
     `name` wird MITgeschrieben (RESTFIX A), damit der lazy-Cache-Pfad
     (_punct_response_from_cache) einen echten Namen statt null liefert. Fehlt der
-    Parameter, bleibt ein bereits gecachter Name erhalten (kein Null-Clobber)."""
+    Parameter, bleibt ein bereits gecachter Name erhalten (kein Null-Clobber).
+
+    `leaderboard`/`insufficient` (WURZEL-FIX 2026-07-15, Audit 144/145): die
+    fertig-öffentlichen Zeilen (Tokens bereits via _punct_trunc_token gekürzt)
+    werden MITpersistiert, damit der lazy-Cache-Pfad eine VOLLSTÄNDIGE Antwort
+    liefern kann. Vorher war die Cache-Antwort self-only bei total_crew>1 →
+    der Client musste JEDES Mal mit refresh=1 nachladen (Doppel-Request pro
+    Feed-Load, Lazy-Cache faktisch ausgehebelt für User mit Friends)."""
     if not res or res.get('status') != 'ok':
         return None
     month_str = res.get('month')
@@ -36170,6 +36178,12 @@ def _punct_persist_me(token, res, rank, total_crew, cached_p, name=None):
         'updated_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         'history': prev_hist,
     }
+    # Volle öffentliche Rangliste mit in den Cache (bereits gekürzte Tokens;
+    # Größe ist durch die Friends-Zahl gebunden). Nur wenn übergeben — alte
+    # Aufrufer bleiben kompatibel.
+    if isinstance(leaderboard, list):
+        punct['leaderboard'] = leaderboard
+        punct['insufficient'] = insufficient if isinstance(insufficient, list) else []
     try:
         merged = _profile_metadata_merge_sb(token, {'punctuality': punct})
         if not merged:
@@ -36236,17 +36250,31 @@ def _punct_response_from_cache(cached_p, month_str, min_sample, stale=False):
         'cancelled': cached_p.get('cancelled'), 'no_signal': cached_p.get('no_signal'),
         'total_crew_ranked': cached_p.get('total_crew'),
     }
-    leaderboard = [{
-        'token': 'self', 'name': cached_p.get('name'), 'avatar_url': None,
-        'score': score, 'rank': cached_p.get('rank'),
-        'sample': cached_p.get('sample'), 'is_me': True,
-    }] if score is not None else []
+    # WURZEL-FIX (2026-07-15, Audit 144/145): trägt der Cache die volle
+    # öffentliche Rangliste (seit heute mitpersistiert), wird SIE serviert —
+    # die Antwort ist damit vollständig und der Client braucht kein
+    # refresh=1-Nachladen mehr (vorher: self-only-Zeile bei total_crew>1 ⇒
+    # garantierter Doppel-Request pro Feed-Load). Legacy-Caches ohne
+    # leaderboard-Feld fallen auf die alte self-only-Zeile zurück; der
+    # nächste Voll-Compute persistiert dann die volle Liste.
+    cached_lb = cached_p.get('leaderboard')
+    insufficient = cached_p.get('insufficient') if isinstance(
+        cached_p.get('insufficient'), list) else []
+    if isinstance(cached_lb, list) and cached_lb:
+        leaderboard = cached_lb
+    else:
+        leaderboard = [{
+            'token': 'self', 'name': cached_p.get('name'), 'avatar_url': None,
+            'score': score, 'rank': cached_p.get('rank'),
+            'sample': cached_p.get('sample'), 'is_me': True,
+        }] if score is not None else []
+        insufficient = []
     out = {
         'ok': True, 'month': month_str,
         'delay_threshold_min': cached_p.get('delay_threshold_min')
         or _PUNCTUALITY_DELAY_THRESHOLD_MIN,
         'min_sample': min_sample, 'cached': True,
-        'me': me, 'leaderboard': leaderboard, 'insufficient': [],
+        'me': me, 'leaderboard': leaderboard, 'insufficient': insufficient,
     }
     if stale:
         out['stale'] = True
@@ -36316,11 +36344,14 @@ def ax_crew_punctuality(token):
         return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
 
     me_member = next((m for m in lb['members'] if m['is_me']), None)
+    payload = _punct_response_from_leaderboard(lb, month_str, min_sample)
     if me_member is not None and me_member['res'].get('status') == 'ok':
         _punct_persist_me(token, me_member['res'], me_member.get('rank'),
                           lb['total_ranked'], cached_p,
-                          name=me_member.get('name'))
-    return jsonify(_punct_response_from_leaderboard(lb, month_str, min_sample))
+                          name=me_member.get('name'),
+                          leaderboard=payload.get('leaderboard'),
+                          insufficient=payload.get('insufficient'))
+    return jsonify(payload)
 
 
 @app.route('/api/moderation/<token>/report', methods=['POST'])

@@ -799,3 +799,81 @@ def test_getprofile_public_path_omits_punctuality():
     assert r.status_code == 200
     body = r.get_json()
     assert 'punctuality' not in body
+
+
+# ════════════════════════════════════════════════════════════════════
+# WURZEL-FIX 2026-07-15 (Audit 144/145): Cache-Antwort ist VOLLSTÄNDIG
+# ════════════════════════════════════════════════════════════════════
+
+def test_cache_response_serves_persisted_full_leaderboard():
+    """Trägt der Cache die mitpersistierte volle Rangliste, serviert der
+    lazy-Pfad SIE — nicht mehr die self-only-Zeile. Damit ist die Antwort
+    komplett (rows == total_crew) und der Client-Trigger
+    needsFullLeaderboardRefresh (rows < total) feuert nicht mehr →
+    kein Doppel-Request pro Feed-Load."""
+    cached = {
+        'month': '2026-07', 'name': 'Tibor Quaas', 'score': 89, 'rank': 1,
+        'sample': 9, 'total_crew': 4,
+        'leaderboard': [
+            {'token': 'self', 'name': 'Tibor Quaas', 'avatar_url': None,
+             'score': 89, 'rank': 1, 'sample': 9, 'is_me': True},
+            {'token': 'AT-abcd1', 'name': 'Julien', 'avatar_url': None,
+             'score': 84, 'rank': 2, 'sample': 7, 'is_me': False},
+            {'token': 'AT-efgh2', 'name': 'Nico', 'avatar_url': None,
+             'score': 71, 'rank': 3, 'sample': 5, 'is_me': False},
+        ],
+        'insufficient': [
+            {'token': 'AT-ijkl3', 'name': 'Jennifer', 'sample': 1,
+             'is_me': False},
+        ],
+    }
+    out = A._punct_response_from_cache(cached, '2026-07', 3)
+    assert out['cached'] is True
+    assert len(out['leaderboard']) == 3
+    assert [r['name'] for r in out['leaderboard']] == ['Tibor Quaas', 'Julien', 'Nico']
+    assert len(out['insufficient']) == 1
+    assert out['me']['total_crew_ranked'] == 4
+    # Client-Invariante: gewertete + unbewertete Zeilen decken total_crew ab.
+    assert len(out['leaderboard']) + len(out['insufficient']) == 4
+
+
+def test_cache_response_legacy_without_leaderboard_stays_self_only():
+    """Legacy-Cache ohne leaderboard-Feld → alte self-only-Zeile (der Client
+    lädt dann einmal mit refresh=1 nach und der Voll-Compute persistiert die
+    volle Liste — konvergiert)."""
+    cached = {'month': '2026-07', 'name': 'Tibor Quaas', 'score': 89,
+              'rank': 1, 'sample': 9, 'total_crew': 4}
+    out = A._punct_response_from_cache(cached, '2026-07', 3)
+    assert len(out['leaderboard']) == 1
+    assert out['leaderboard'][0]['is_me'] is True
+    assert out['insufficient'] == []
+
+
+def test_persist_me_stores_public_leaderboard_rows():
+    """_punct_persist_me nimmt die fertig-öffentlichen Zeilen (gekürzte
+    Tokens!) mit in den Cache-Block auf; alte Aufrufer ohne die Parameter
+    bleiben kompatibel (kein leaderboard-Feld)."""
+    captured = {}
+
+    def fake_merge(token, patch_dict):
+        captured.update(patch_dict)
+        return True
+
+    res = {'status': 'ok', 'score_pct': 89, 'sample': 9, 'on_time': 8,
+           'delayed': 1, 'cancelled': 0, 'no_signal': 0,
+           'delay_threshold_min': 15, 'month': '2026-07'}
+    rows = [{'token': 'self', 'name': 'T', 'score': 89, 'rank': 1,
+             'sample': 9, 'is_me': True, 'avatar_url': None},
+            {'token': 'AT-abcd1', 'name': 'J', 'score': 84, 'rank': 2,
+             'sample': 7, 'is_me': False, 'avatar_url': None}]
+    with patch.object(A, '_profile_metadata_merge_sb', side_effect=fake_merge):
+        A._punct_persist_me('AT-OWNER', res, 1, 2, None, name='T',
+                            leaderboard=rows, insufficient=[])
+    punct = captured.get('punctuality') or {}
+    assert punct.get('leaderboard') == rows
+    assert punct.get('insufficient') == []
+    # Legacy-Aufruf ohne die neuen Parameter → Feld fehlt (kein Nil-Müll).
+    captured.clear()
+    with patch.object(A, '_profile_metadata_merge_sb', side_effect=fake_merge):
+        A._punct_persist_me('AT-OWNER', res, 1, 2, None, name='T')
+    assert 'leaderboard' not in (captured.get('punctuality') or {})
