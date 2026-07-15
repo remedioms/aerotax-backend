@@ -251,3 +251,94 @@ def test_stale_departed_not_applied_when_arrival_observed(monkeypatch):
     # Ankunft beobachtet → FIX 3 rührt den Status nicht auf 'landed'.
     assert secs[0]['status'] == 'Abgeflogen'
     assert secs[0]['arr_delay_min'] == 12
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX 3b — LH890 FRA→RIX: kein sched_arr vom Board, Plan-Ankunft nur aus dem Leg
+# (arr_iso) bzw. — wenn auch die fehlt — aus dep + Großkreis/v_max. airborne→landed.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_stale_airborne_landed_from_leg_arr_iso_no_board_sched(monkeypatch):
+    # RIX wird nie geharvestet → weder Merge noch Facts liefern sched_arr; die
+    # Plan-Ankunft kommt allein aus der Leg-eigenen arr_iso. airborne + überfällig
+    # (> 30 h) → 'landed'.
+    dep = _now() - timedelta(hours=33)
+    arr = _now() - timedelta(hours=31)
+    secs = [_sector(flight='LH890', frm='FRA', to='RIX',
+                    dep_iso=_iso(dep), arr_iso=_iso(arr))]
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {})
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=False, status='airborne',
+                                           sched_arr=None)):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] == 'landed'
+    assert secs[0].get('est_arr_iso') is None
+
+
+def test_stale_airborne_landed_from_block_time_when_no_arr_anchor(monkeypatch):
+    # Kein arr_iso, kein board/facts sched_arr → Plan-Ankunft-Proxy = dep +
+    # Großkreis/v_max (früheste physikalisch mögliche Ankunft). 33 h alt → längst
+    # gelandet, obwohl KEIN einziger Ankunfts-Soll-Anker existiert.
+    dep = _now() - timedelta(hours=33)
+    secs = [_sector(flight='LH890', frm='FRA', to='RIX', dep_iso=_iso(dep))]
+    secs[0].pop('arr_iso', None)
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {})
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=False,
+                                           status='Abgeflogen')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] == 'landed'
+
+
+def test_stale_airborne_cancelled_stays(monkeypatch):
+    # Ein STORNIERTER Flug ist NIE „gelandet" — die Stale-Regel darf cancelled nicht
+    # überschreiben.
+    dep = _now() - timedelta(hours=33)
+    arr = _now() - timedelta(hours=31)
+    secs = [_sector(flight='LH890', frm='FRA', to='RIX',
+                    dep_iso=_iso(dep), arr_iso=_iso(arr))]
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {})
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=False, status='airborne',
+                                           cancelled=True)):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] != 'landed'
+    assert secs[0]['cancelled'] is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX 3c — „Geplant"-Leiche: Vergangenheits-Leg mit vorhandener est_arr, Status im
+# scheduled-Bucket ('Geplant'/None) + Plan-Ankunft lange vorbei → 'landed'.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_geplant_corpse_with_est_arr_becomes_landed(monkeypatch):
+    dep = _now() - timedelta(hours=15)
+    arr = _now() - timedelta(hours=13)
+    secs = [_sector(flight='LH893', frm='RIX', to='FRA',
+                    dep_iso=_iso(dep), arr_iso=_iso(arr))]
+    facts = {'est_arr': '2026-07-15T08:15:00+02:00', 'arr_status': 'Geplant'}
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: facts)
+    monkeypatch.setattr(A, '_tail_recently_active', lambda r: True)
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=False, status='Geplant')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] == 'landed'
+    # Ist-Ankunft bleibt erhalten (keine erfundene, aber die echte est_arr steht).
+    assert secs[0]['est_arr_iso'] == '2026-07-15T08:15:00+02:00'
+
+
+def test_geplant_corpse_without_est_arr_not_forced_landed(monkeypatch):
+    # Gegenprobe: 'Geplant' OHNE Ist-Ankunft → NICHT auf 'landed' zwingen (könnte
+    # ein echter Zukunfts-/verschobener Flug sein; nur mit belegter est_arr landen).
+    dep = _now() - timedelta(hours=15)
+    arr = _now() - timedelta(hours=13)
+    secs = [_sector(flight='LH893', frm='RIX', to='FRA',
+                    dep_iso=_iso(dep), arr_iso=_iso(arr))]
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {})
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=False, status='Geplant')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] != 'landed'

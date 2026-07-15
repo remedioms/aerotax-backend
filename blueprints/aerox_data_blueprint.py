@@ -3768,18 +3768,52 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     def _best(cands):
         # (1) ANGEFRAGTES Datum bevorzugen — sonst kann eine Vortags-Beobachtung
         #     desselben täglichen Flugs eine falsche (gestrige) Ist-Zeit liefern.
-        # (2) dann die inhaltsreichste Row (Gate, dann Soll) — nicht blind die jüngste.
+        # (2) dann die INFORMATIONSREICHSTE Row wählen — NICHT blind die jüngste.
+        #
+        # ROW-SELEKTIONS-HÄRTUNG (Owner/Fable 2026-07-15, LH867 OSL→FRA): das Board
+        # wird nach Ende der Beobachtung teils NACKT weiter-gepollt — eine spätere
+        # Row (updated_at neuer) trägt dann nur noch `status='Geplant'/'Delayed'`
+        # OHNE `esti`/`max_delay_min`, während die ältere Row die echte Ist-Zeit
+        # (esti) hält. Cands stehen `updated_at desc` → die nackte Repoll-Row stand
+        # vorn und verdrängte via Gate/Sched-Vorrang die esti-Row. Folge: est_dep/
+        # est_arr fielen weg (LH867 verlor 06:57/08:56). Jetzt gewinnt die Row mit
+        # der besten INFORMATIONSLAGE (esti > delay-Zahl > gate > sched > sonst
+        # jüngste); den JÜNGSTEN Status mergen wir separat drauf (s.u.), sodass eine
+        # jüngere nackte Row den frischen Status beisteuert, aber die Ist-Zeit NICHT
+        # verdrängt. Eine jüngere Row gewinnt die Basis nur bei ≥ gleicher Info-Lage.
         if not cands:
             return None
         same_day = [r for r in cands if (r.get('date') or '')[:10] == d]
         pool = same_day or cands
+
+        def _richness(r):
+            # höher = informationsreicher. esti (Ist-Zeit) ist das Wertvollste, das
+            # eine nackte Repoll-Row NIE unterbieten darf.
+            return (
+                4 if (r.get('esti') or '').strip() else 0,
+                2 if (r.get('max_delay_min') is not None) else 0,
+                1 if (r.get('gate') or '').strip() else 0,
+                1 if (r.get('sched') or '').strip() else 0,
+            )
+        # `pool` ist bereits updated_at-desc; ein stabiles max nach Info-Lage wählt
+        # bei GLEICHER Lage automatisch die jüngste (erste) Row — jünger gewinnt nur
+        # bei mindestens gleicher Information, nie eine ärmere nackte Row.
+        base = max(pool, key=_richness)
+        # STATUS-MERGE: den JÜNGSTEN nicht-leeren Status aus dem Pool auf die Basis
+        # legen (die nackte Repoll-Row liefert oft den aktuellsten Status, aber
+        # keine Zeit). Nur wenn er sich unterscheidet und die Basis-Row nicht selbst
+        # die jüngste ist — sonst unverändert. Kopie, um die Roh-Rows nicht zu
+        # mutieren (dieselben cands werden für die ARR-Paarung wiederverwendet).
+        newest_status = None
         for r in pool:
-            if (r.get('gate') or '').strip():
-                return r
-        for r in pool:
-            if (r.get('sched') or '').strip():
-                return r
-        return pool[0]
+            st = (r.get('status') or '').strip()
+            if st:
+                newest_status = st
+                break
+        if newest_status and (base.get('status') or '').strip() != newest_status:
+            base = dict(base)
+            base['status'] = newest_status
+        return base
 
     best_dep = _best(dep_cands)
 
@@ -3807,12 +3841,31 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
             parsed += 1
             seconds = (arr_dt - dep_dt).total_seconds()
             if -30 * 60 <= seconds <= 36 * 3600:
-                richness = (2 if (row.get('gate') or '').strip() else 0) \
+                # esti (Ist-Ankunft) ist das Wertvollste: eine nackte, spätere
+                # Repoll-Row (nur status='Geplant', esti leer) darf die esti-Row
+                # unter demselben Soll (gleiche arr_dt) NICHT verdrängen (LH867).
+                richness = (8 if (row.get('esti') or '').strip() else 0) \
+                    + (4 if (row.get('max_delay_min') is not None) else 0) \
+                    + (2 if (row.get('gate') or '').strip() else 0) \
                     + (1 if (row.get('sched') or '').strip() else 0)
                 viable.append((arr_dt, -richness, row))
         if viable:
             viable.sort(key=lambda x: (x[0], x[1]))
-            return viable[0][2], True
+            chosen = viable[0][2]
+            # STATUS-MERGE (analog _best): den JÜNGSTEN nicht-leeren Status der
+            # gepaarten ARR-Kandidaten auf die gewählte Row legen — die aktuellste
+            # Status-Meldung ohne die Ist-Zeit der esti-Row zu verlieren. cands
+            # steht updated_at-desc → erster nicht-leerer Status ist der jüngste.
+            _newest = None
+            for _r in cands:
+                _st = (_r.get('status') or '').strip()
+                if _st:
+                    _newest = _st
+                    break
+            if _newest and (chosen.get('status') or '').strip() != _newest:
+                chosen = dict(chosen)
+                chosen['status'] = _newest
+            return chosen, True
         # Parsebare, aber nur VOR dem Abflug liegende Rows gehoeren zur vorigen
         # Rotation. Nicht als Fallback durchreichen.
         return (None, False) if parsed else (_best(cands), False)

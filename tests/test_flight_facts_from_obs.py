@@ -156,6 +156,43 @@ def test_yday_gate_row_does_not_beat_today(monkeypatch):
     assert not f.get('stale')
 
 
+def test_bare_repoll_row_does_not_displace_esti_row(monkeypatch):
+    """LH867 OSL→FRA (Owner/Fable 2026-07-15): das Board wird nach Ende der
+    Beobachtung NACKT weiter-gepollt — eine spätere Row (updated_at neuer) trägt
+    nur noch `status='Geplant'/'Delayed'` OHNE esti, während die ältere Row die
+    echte Ist-Zeit hält. Da die Rows updated_at-desc kommen, stand die nackte Row
+    vorn und verdrängte via Gate/Sched-Vorrang die esti-Row → est_dep/est_arr
+    fielen weg. Jetzt gewinnt die informationsreichere (esti-)Row die Ist-Zeit;
+    der jüngste Status wird nur DRAUFGEMERGT, verdrängt die Zeit aber nicht."""
+    # updated_at-desc: die nackten Repoll-Rows zuerst, danach die esti-Rows.
+    arr_bare = {'airport': 'FRA#ARR', 'flight': 'LH867', 'dest_iata': 'OSL',
+                'date': '2026-07-14', 'sched': '08:30', 'esti': None,
+                'gate': None, 'status': 'Geplant', 'max_delay_min': None}
+    dep_bare = {'airport': 'OSL', 'flight': 'LH867', 'dest_iata': 'FRA',
+                'date': '2026-07-14', 'sched': '06:45', 'esti': None,
+                'gate': None, 'status': 'Delayed', 'max_delay_min': None}
+    arr_esti = {'airport': 'FRA#ARR', 'flight': 'LH867', 'dest_iata': 'OSL',
+                'date': '2026-07-14', 'sched': '08:30', 'esti': '08:56',
+                'gate': 'A22', 'terminal': '1',
+                'status': 'Gepäckausgabe beendet', 'max_delay_min': 26}
+    dep_esti = {'airport': 'OSL', 'flight': 'LH867', 'dest_iata': 'FRA',
+                'date': '2026-07-14', 'sched': '06:45', 'esti': '06:57',
+                'status': 'Departed', 'max_delay_min': 12}
+    monkeypatch.setattr(axd, '_sb', lambda: _FakeSB(
+        [arr_bare, dep_bare, arr_esti, dep_esti]))
+    monkeypatch.setattr(axd, '_tail_active_guard', lambda r: True)
+    f = _flight_facts_from_obs('LH867', '2026-07-14',
+                               dep_iata='OSL', arr_iata='FRA')
+    # Ist-Zeiten der esti-Row bleiben erhalten (nicht von der nackten Row verdrängt).
+    assert f['est_dep'] == '2026-07-14T06:57:00+02:00'
+    assert f['est_arr'] == '2026-07-14T08:56:00+02:00'
+    assert f['arr_delay_min'] == 26
+    assert f['dep_delay_min'] == 12
+    # Der jüngste (nackte) Status wird draufgemergt — aber die Zeit blieb.
+    assert f['arr_status'] == 'Geplant'
+    assert f['dep_status'] == 'Delayed'
+
+
 def test_today_departure_drops_yday_arrival_side(monkeypatch):
     """D-AIZD/LH1346 live regression: DEP stammt vom angefragten Tag, die einzige
     ARR-Row aber vom Vortag. Die ARR-Seite (inkl. Landed/Delay/Gate) muss komplett

@@ -31001,49 +31001,88 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         if not _raw_status and _facts:
             _raw_status = _facts.get('arr_status') or _facts.get('dep_status') \
                 or _raw_status
-        # ── FIX 3: STALE „ABGEFLOGEN" EHRLICH (Owner/Fable 2026-07-15) ─────────
-        # Ein dep-seitig „abgeflogen/airborne/departed/gestartet" gemeldeter Flug,
-        # für den KEINE Ankunfts-Beobachtung existiert (weder Ist-Ankunft noch ein
-        # arr-seitiger Status) und dessen PLAN-Ankunft mehr als 6 h vor jetzt liegt,
-        # ist längst gelandet — der bloße „Abgeflogen"-Status ist veraltet. Dann den
-        # Status ehrlich als 'landed' durchreichen (KEINE erfundene Ist-Zeit dabei).
-        # Geteilte Stelle → alle Consumer (Freunde-/Familien-Roster, Kalender, Feed)
-        # erben es. Konservativ: nur bei echtem Airborne-Bucket + fehlender Ankunft
-        # + klar überfälliger Plan-Ankunft. Wirft nie.
+        # ── FIX 3: STALE VERGANGENHEITS-STATUS EHRLICH (Owner/Fable 2026-07-15) ─
+        # Zwei Leichen aus dem Freunde-Roster (Vortage) ehrlich auf 'landed' setzen,
+        # OHNE eine Ist-Zeit zu erfinden:
+        #   (A) „ABGEFLOGEN"-LEICHE: dep-seitig airborne/abgeflogen/departed
+        #       gemeldet, KEINE Ankunfts-Beobachtung, Plan-Ankunft > 6 h vor jetzt
+        #       → längst gelandet, der Airborne-Status ist veraltet (LH890 FRA→RIX).
+        #   (B) „GEPLANT"-LEICHE: Status noch im scheduled-Bucket ('Geplant'/
+        #       'scheduled'/None), ABER es LIEGT eine Ist-Ankunft (est_arr) vor und
+        #       die Plan-Ankunft ist > 6 h vorbei → der Flug ist gelandet, nur der
+        #       nackte Repoll-Status hängt (LH893 RIX→FRA).
+        # PLAN-ANKUNFT (Kern des LH890-Bugs): RIX wird nie geharvestet → weder Board
+        # noch Facts liefern sched_arr. Darum als Fallback die Leg-eigene arr_iso der
+        # ical_sectors, und wenn auch die fehlt, die dep-Zeit + Großkreis/v_max (die
+        # FRÜHESTE physikalisch mögliche Ankunft — konservativ, unterschätzt nie den
+        # Ist-Zeitpunkt) als Plan-Ankunfts-Proxy. Cancelled-Flüge sind NIE gelandet.
         try:
-            if _flight_status_bucket(_raw_status) == 'airborne':
-                _has_arr_obs = bool(
-                    s.get('est_arr_iso') or s.get('arr_delay_min') is not None
-                    or (_facts and (_facts.get('arr_status')
-                                    or _facts.get('est_arr'))))
-                if not _has_arr_obs:
-                    # PLAN-Ankunft: Sektor-arr_iso (echt-UTC) bevorzugt, sonst der
-                    # Board/Facts-Soll (station-lokal → UTC).
-                    _sched_arr_utc = None
-                    for _sa_cand, _sa_conv in (
-                            (s.get('arr_iso'), False),
-                            (m.get('sched_arr'), True),
-                            ((_facts or {}).get('sched_arr'), False)):
-                        if not _sa_cand:
+            _bucket = _flight_status_bucket(_raw_status)
+            _has_est_arr = bool(s.get('est_arr_iso')
+                                or (_facts and _facts.get('est_arr')))
+            _has_arr_obs = bool(
+                _has_est_arr or s.get('arr_delay_min') is not None
+                or (_facts and _facts.get('arr_status')))
+            if not s.get('cancelled'):
+                # PLAN-Ankunft (UTC): Sektor-arr_iso (echt-UTC) bevorzugt, sonst
+                # Board/Facts-Soll (station-lokal → UTC), sonst dep + Großkreis/v_max.
+                _sched_arr_utc = None
+                for _sa_cand, _sa_conv in (
+                        (s.get('arr_iso'), False),
+                        (m.get('sched_arr'), True),
+                        ((_facts or {}).get('sched_arr'), False)):
+                    if not _sa_cand:
+                        continue
+                    try:
+                        _sa_iso = (_board_local_to_utc_iso(_sa_cand, to)
+                                   if _sa_conv else str(_sa_cand))
+                        if not _sa_iso:
                             continue
-                        try:
-                            if _sa_conv:
-                                _sa_iso = _board_local_to_utc_iso(_sa_cand, to)
-                            else:
-                                _sa_iso = str(_sa_cand)
-                            if not _sa_iso:
+                        _sa_dt = datetime.fromisoformat(
+                            _sa_iso.replace('Z', '+00:00'))
+                        if _sa_dt.tzinfo is None:
+                            _sa_dt = _sa_dt.replace(tzinfo=timezone.utc)
+                        _sched_arr_utc = _sa_dt
+                        break
+                    except Exception:
+                        continue
+                # Fallback: früheste physikalisch mögliche Ankunft aus dep-Zeit +
+                # Großkreis / v_max (LH890: kein sched_arr, keine arr_iso → hier).
+                if _sched_arr_utc is None:
+                    try:
+                        from blueprints.leg_status_gate import (
+                            earliest_possible_arrival_ts as _epa)
+                        from blueprints.aerox_data_blueprint import (
+                            _iata_latlon as _ll3)
+                        _dep_epoch = None
+                        for _dc in (s.get('est_dep_iso'), s.get('dep_iso')):
+                            if not _dc:
                                 continue
-                            _sa_dt = datetime.fromisoformat(
-                                _sa_iso.replace('Z', '+00:00'))
-                            if _sa_dt.tzinfo is None:
-                                _sa_dt = _sa_dt.replace(tzinfo=timezone.utc)
-                            _sched_arr_utc = _sa_dt
-                            break
-                        except Exception:
-                            continue
-                    if (_sched_arr_utc is not None
-                            and _sched_arr_utc < now - timedelta(hours=6)):
-                        _raw_status = 'landed'
+                            try:
+                                _dd = datetime.fromisoformat(
+                                    str(_dc).replace('Z', '+00:00'))
+                                if _dd.tzinfo is None:
+                                    _dd = _dd.replace(tzinfo=timezone.utc)
+                                _dep_epoch = _dd.timestamp()
+                                break
+                            except Exception:
+                                continue
+                        _eta = _epa(_dep_epoch, _ll3(frm), _ll3(to))
+                        if _eta is not None:
+                            _sched_arr_utc = datetime.fromtimestamp(
+                                _eta, tz=timezone.utc)
+                    except Exception:
+                        _sched_arr_utc = None
+                _overdue = (_sched_arr_utc is not None
+                            and _sched_arr_utc < now - timedelta(hours=6))
+                # (A) Airborne-Leiche: airborne + keine Ankunfts-Obs + überfällig.
+                if _bucket == 'airborne' and not _has_arr_obs and _overdue:
+                    _raw_status = 'landed'
+                # (B) Geplant-Leiche: scheduled-Bucket (oder gar kein Status),
+                #     aber Ist-Ankunft vorhanden + überfällig → gelandet.
+                elif (_bucket in ('grounded', None) and _has_est_arr
+                        and _overdue):
+                    _raw_status = 'landed'
         except Exception:
             pass
         # Physik-Schranken-Inputs vorab binden (auch der Engine-Block unten liest
