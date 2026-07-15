@@ -392,6 +392,33 @@ _DEP_GROUND_WORDS = ('boarding', 'einsteigen', 'last call', 'final call',
                      'check-in', 'checkin', 'go to gate', 'on time', 'ontime',
                      'pünktlich', 'puenktlich', 'scheduled', 'planmäßig',
                      'planmaessig')
+# Zwei BEWEIS-ARTEN (Julien LH423 2026-07-16, BOS postet „Delayed 75 Minutes"
+# und danach NIE „Departed"): aktive GATE-Wörter belegen Boden-Kontakt hart —
+# ein bloßes Plan-Echo/„Delayed" des Abflug-Boards ist dagegen nur so lange
+# ein Beweis, wie der angekündigte Abflug (inkl. gemeldetem Delay) + Karenz
+# nicht verstrichen ist. Wäre die Maschine dann noch am Boden, stünde ein
+# GRÖSSERER Delay am Board — ein eingefrorener Delay-Text heißt: sie ist weg.
+_DEP_GATE_WORDS = ('boarding', 'einsteigen', 'last call', 'final call',
+                   'letzter aufruf', 'gate', 'closed', 'geschlossen',
+                   'check-in', 'checkin', 'go to gate')
+_DEP_PLAN_ECHO_WORDS = ('on time', 'ontime', 'pünktlich', 'puenktlich',
+                        'scheduled', 'planmäßig', 'planmaessig')
+_DEP_DELAY_MIN_RE = _re.compile(r'(\d+)\s*min', _re.IGNORECASE)
+
+
+def _announced_dep_delay_min(o):
+    """Gemeldeter ABFLUG-Delay in Minuten: explizites dep_delay_min oder aus
+    dem status_dep-Text geparst („Delayed 75 Minutes" → 75). None wenn keins."""
+    try:
+        v = _num(o.get('dep_delay_min'))
+        if v is not None:
+            return max(0, int(v))
+        m = _DEP_DELAY_MIN_RE.search(str(o.get('status_dep') or ''))
+        if m:
+            return max(0, int(m.group(1)))
+    except Exception:
+        pass
+    return None
 # Reine VERSPÄTUNGS-Wörter: mehrdeutig (Abflug- ODER Ankunfts-Tafel). Sie zählen
 # NUR als Boden-Beweis, wenn sie NACHWEISLICH abflugseitig sind (status_dep /
 # dep_delay_min / delay_side=='dep') — ein bloßes gemergtes „Verspätet" kommt bei
@@ -415,37 +442,56 @@ def _dep_ground_proof(o, bucket_of=None):
     `arr_delay_min`/`delay_min`, KEIN status_dep, KEIN dep_delay_min) ist KEIN
     Boden-Beweis — das ist die ANKUNFTS-Tafel eines längst fliegenden Fluges
     (Julien/Tibor-Über-Ozean-Fall). Wirft nie."""
+    return _dep_ground_proof_kind(o, bucket_of) is not None
+
+
+def _dep_ground_proof_kind(o, bucket_of=None):
+    """Wie `_dep_ground_proof`, aber mit BEWEIS-ART: 'gate' = aktive Gate-/
+    Boarding-Aktivität (harter Beweis, Board schlägt Uhr), 'delay' = gemeldeter
+    Abflug-Delay/Plan-Echo (zeitlich begrenzter Beweis — gilt nur bis Soll-
+    Abflug + gemeldetem Delay + Karenz; Julien LH423: BOS fror auf „Delayed 75
+    Minutes" ein und postete nie „Departed"). None = kein Boden-Beweis."""
     try:
         if not isinstance(o, dict):
-            return False
+            return None
         sd = str(o.get('status_dep') or '').strip().lower()
         if sd and not ('deboard' in sd or 'ausstieg' in sd):
-            if any(t in sd for t in _DEP_GROUND_WORDS):
-                return True
+            if any(t in sd for t in _DEP_GATE_WORDS):
+                return 'gate'
+            # Plan-Echo („on time"/„scheduled") bleibt HARTER Beweis (Owner-
+            # Regel 2026-07-13, Sebastian: Board schlägt Uhr — gepinnt in
+            # test_past_dep_ohne_delay_neutral…). Nur DELAY-Meldungen sind
+            # zeitbegrenzt: ein eingefrorenes „Delayed 75 Minutes" ohne je ein
+            # „Departed" (Julien LH423, BOS) darf nicht ewig pinnen.
+            if any(t in sd for t in _DEP_PLAN_ECHO_WORDS):
+                return 'gate'
             bkt = bucket_of if callable(bucket_of) else _default_bucket
             if bkt(o.get('status_dep')) == 'grounded':
-                return True
+                # z.B. „Delayed 75 Minutes": dep-seitig, aber nur zeitbegrenzt.
+                return 'delay'
         # ABFLUG-Delay → das Abflug-Board hat die Verspätung gemeldet, der Flug
-        # steht noch am Gate. Ein expliziter dep_delay_min ODER delay_side=='dep'
-        # zählt; ein rein arr-seitiger Delay (nur arr_delay_min/delay_min) NICHT.
+        # steht noch am Gate (Basti-Fall LH900). Ein expliziter dep_delay_min
+        # ODER delay_side=='dep' zählt; rein arr-seitiger Delay NICHT.
         if _num(o.get('dep_delay_min')) is not None:
-            return True
+            return 'delay'
         if str(o.get('delay_side') or '').strip().lower() == 'dep':
-            return True
+            return 'delay'
         # Gemergter `status` OHNE Seiten-Split: ein eindeutiges Boden-Aktivitäts-
-        # Wort (Boarding/Gate/on time/scheduled/…) belegt den Abflug-Boden — die
-        # DEP-Tafel meldet den Flug „am Gate/pünktlich" (Basti „on time"-Fall).
-        # Ein bloßes „Verspätet"/„Delayed" (mehrdeutig, oft ARR-Tafel) zählt hier
-        # NICHT — das ist genau der Julien/Tibor-Über-Ozean-Fall.
+        # Wort (Boarding/Gate/…) belegt den Abflug-Boden hart; Plan-Echo („on
+        # time"/„scheduled", Basti-Fall) nur zeitbegrenzt. Ein bloßes
+        # „Verspätet"/„Delayed" (mehrdeutig, oft ARR-Tafel) zählt hier NICHT —
+        # das ist genau der Julien/Tibor-Über-Ozean-Fall.
         s = str(o.get('status') or '').strip().lower()
         if s and not ('deboard' in s or 'ausstieg' in s):
             if any(t in s for t in _DELAY_ONLY_WORDS):
-                return False
-            if any(t in s for t in _DEP_GROUND_WORDS):
-                return True
-        return False
+                return None
+            if any(t in s for t in _DEP_GATE_WORDS):
+                return 'gate'
+            if any(t in s for t in _DEP_PLAN_ECHO_WORDS):
+                return 'gate'   # Owner-Regel: „on time"-Board schlägt Uhr
+        return None
     except Exception:
-        return False
+        return None
 
 
 def _default_hhmm(d, _iata=None):
@@ -1156,7 +1202,18 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             # die echte Atlantik-Position sobald die Kachel die Maschine sieht).
             # Ein echter Abflug-Boden-Beweis (dep-Board Boarding/Gate/Delay) oder
             # ein annullierter Flug (oben schon gefangen) behält den Pin.
-            if (not _dep_ground_proof(o, bucket_of)
+            _proof = _dep_ground_proof_kind(o, bucket_of)
+            if _proof == 'delay':
+                # ZEITBEGRENZTER Beweis (Julien LH423 2026-07-16): BOS postete
+                # „Delayed 75 Minutes" und danach NIE „Departed". Ein dep-
+                # gemeldeter Delay hält den Pin nur bis eff_dep + gemeldetem
+                # Delay + Karenz — stünde die Maschine danach noch, meldete das
+                # Board einen GRÖSSEREN Delay. Eingefrorener Text ⇒ sie fliegt.
+                _ann = _announced_dep_delay_min(o) or 0
+                if now >= eff_dep + _dt.timedelta(
+                        minutes=_ann + _DEP_LIFTOFF_GRACE_MIN):
+                    _proof = None
+            if (_proof is None
                     and now >= eff_dep + _dt.timedelta(
                         minutes=_DEP_LIFTOFF_GRACE_MIN)):
                 # Live-Beweis darf trotzdem in BEIDE Richtungen kippen: sichtbar

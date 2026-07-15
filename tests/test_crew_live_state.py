@@ -841,6 +841,30 @@ def test_arr_verspaetet_est_dep_erst_in_zukunft_bleibt_pre_flight():
     assert r['state'] == STATE_PRE_FLIGHT
 
 
+def test_dep_delayed_minutes_beweis_laeuft_ab_dann_flying():
+    # Julien LH423 2026-07-16: BOS-Board postet „Delayed 75 Minutes" und danach
+    # NIE „Departed". Der dep-seitige Delay-Beweis gilt nur bis Soll-Abflug +
+    # 75 min + Karenz — danach übernimmt die Uhr: der Flug ist unterwegs.
+    r = _resolve(datetime(2026, 7, 10, 1, 0, tzinfo=timezone.utc),
+                 sectors=_LH455,
+                 obs={'LH455': {'status': 'Delayed 75 Minutes',
+                                'status_dep': 'Delayed 75 Minutes'}})
+    assert r['state'] == STATE_FLYING
+    assert r['confidence'] == CONF_PLAN
+    assert r['position'] is None
+
+
+def test_dep_delayed_minutes_beweis_haelt_im_delay_fenster():
+    # Gleicher Fall, aber erst 30 min nach Soll-Abflug — der gemeldete 75-min-
+    # Delay ist noch nicht verstrichen: der Flug steht glaubhaft noch am Gate
+    # (Basti-Muster), KEIN Zeit-Physik-Kippen.
+    r = _resolve(datetime(2026, 7, 9, 22, 45, tzinfo=timezone.utc),
+                 sectors=_LH455,
+                 obs={'LH455': {'status': 'Delayed 75 Minutes',
+                                'status_dep': 'Delayed 75 Minutes'}})
+    assert r['state'] == STATE_PRE_FLIGHT
+
+
 def test_norm_legs_reg_alias_fuellt_tail():
     # Tibor-Sektor keyt die Maschine als 'reg' statt 'tail' → das current_leg
     # muss die Reg trotzdem tragen (aircraft_live-Reg-Match).
