@@ -17195,23 +17195,75 @@ def _roster_snapshot_read(token):
     return payload or {}
 
 
-def _compute_roster_diff(old_tage, new_tage):
-    """Returns list of {datum, kind, old, new} where kind ∈ added/removed/modified."""
+def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
+    """Returns list of {datum, kind, old, new} where kind ∈ added/removed/modified.
+
+    RAUSCHREDUKTION (Jennifer Schenke 2026-07-16 „ein Haufen Dienstplanänderungen
+    im Feed, teilweise für die Zukunft, verstehe nicht was geändert wurde"). Zwei
+    Fluten waren die Ursache:
+
+    1) FERNE ZUKUNFTS-'added': Veröffentlicht LH einen neuen Monat, war JEDER neue
+       Tag ein 'added'-Eintrag → Flut. Das ist normales Roster-Wachstum, keine
+       Änderung, die der User prüfen muss. 'added' wird darum nur für NAHE Tage
+       gemeldet (heute … heute+near_added_days). Fernere neue Tage = still.
+
+    2) ANREICHERUNGS-'modified': Der Digest verglich routing/layover_ort/Zeiten
+       exakt. Das Backend reichert diese Felder aber NACH dem ersten Import an
+       (leer→gefüllt) → beim nächsten Sync sah der Diff „vorher leer, jetzt
+       gefüllt" und meldete JEDEN angereicherten Tag als 'modified', obwohl der
+       User nichts geändert hat. Jetzt zählt ein Feld nur als geändert, wenn
+       BEIDE Seiten einen nicht-leeren Wert tragen der sich UNTERSCHEIDET — ein
+       leer↔gefüllt-Übergang (Anreicherung/transientes Re-Parse) ist KEINE
+       Änderung. `klass` bleibt exakt verglichen (Tour↔Frei ist echte Änderung).
+    """
     old_by = {t.get('datum'): t for t in (old_tage or []) if isinstance(t, dict)}
     new_by = {t.get('datum'): t for t in (new_tage or []) if isinstance(t, dict)}
     changes = []
     keys = set(old_by.keys()) | set(new_by.keys())
-    def _digest(t):
-        if not t: return None
-        rf = t.get('reader_facts') or {}
-        return (t.get('klass'), t.get('routing'), rf.get('start_time'), rf.get('end_time'), rf.get('layover_ort'))
+
+    def _norm(v):
+        return (str(v).strip() if v is not None else '')
+
+    def _field_changed(av, bv):
+        # leer↔gefüllt zählt NICHT (Anreicherung/Re-Parse); nur ein echter
+        # Wert-Wechsel zwischen zwei nicht-leeren Werten.
+        a, b = _norm(av), _norm(bv)
+        return bool(a) and bool(b) and a != b
+
+    def _meaningfully_modified(a, b):
+        arf, brf = (a.get('reader_facts') or {}), (b.get('reader_facts') or {})
+        # klass exakt (auch leer↔gefüllt): ein Tag wird Tour / verliert Tour.
+        if _norm(a.get('klass')) != _norm(b.get('klass')):
+            return True
+        for af, bf in ((a.get('routing'), b.get('routing')),
+                       (arf.get('start_time'), brf.get('start_time')),
+                       (arf.get('end_time'), brf.get('end_time')),
+                       (arf.get('layover_ort'), brf.get('layover_ort'))):
+            if _field_changed(af, bf):
+                return True
+        return False
+
+    def _added_is_near(k):
+        if not today:
+            return True
+        try:
+            from datetime import date as _date
+            d = _date.fromisoformat(k[:10]); t = _date.fromisoformat(today[:10])
+            # NUR heute … heute+near_added_days melden. Fernere Zukunfts-Tage
+            # (veröffentlichter neuer Monat) und nachgetragene Vergangenheit
+            # (< heute) bleiben still — kein 'added'-Flut.
+            return 0 <= (d - t).days <= near_added_days
+        except Exception:
+            return True
+
     for k in sorted(keys):
         a, b = old_by.get(k), new_by.get(k)
         if a is None and b is not None:
-            changes.append({'datum': k, 'kind': 'added', 'new': b})
+            if _added_is_near(k):
+                changes.append({'datum': k, 'kind': 'added', 'new': b})
         elif b is None and a is not None:
             changes.append({'datum': k, 'kind': 'removed', 'old': a})
-        elif a and b and _digest(a) != _digest(b):
+        elif a and b and _meaningfully_modified(a, b):
             changes.append({'datum': k, 'kind': 'modified', 'old': a, 'new': b})
     return changes
 
@@ -17328,7 +17380,12 @@ def take_roster_snapshot(token):
     # 2026-06-29: „dachte mein Plan wird per Push verbunden"). Beim allerersten
     # Push nur still die Baseline setzen, Diff bleibt leer. Änderungen erst ab
     # dem ZWEITEN Push (echter Vorher/Nachher-Vergleich).
-    diff = _compute_roster_diff(old_tage, new_tage) if old_tage else []
+    _today_ymd = None
+    try:
+        _today_ymd = _airport_local_now('FRA').strftime('%Y-%m-%d')
+    except Exception:
+        _today_ymd = datetime.now().strftime('%Y-%m-%d')
+    diff = _compute_roster_diff(old_tage, new_tage, today=_today_ymd) if old_tage else []
     # Persist new snapshot (Supabase-first + Disk, multi-instance-sicher)
     if not _roster_snapshot_save(token, {
         'taken_at': datetime.now().isoformat(), 'tage': new_tage,
