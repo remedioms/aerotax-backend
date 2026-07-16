@@ -106,7 +106,16 @@ def _payload(row: dict, iata: str, arr: bool, source: str):
     fn = (row.get("flight") or "").replace(" ", "").upper()
     if not fn or not hhmm:
         return None
-    date_str = sched[:10]
+    # VERKEHRSTAG statt Poll-Tag (Folgetags-Kontaminations-Fix, s. scraper.service_day
+    # + LH867-Beweis). Trägt sched ein volles Datum (Normalfall in jedem Airport-
+    # Modul), ist das ein no-op = sched[:10]; nur date-lose Plan-Rows werden korrekt
+    # auf den Folgetag verschoben.
+    from . import scraper as _S
+    date_str = _S.service_day(
+        sched, tzname=row.get("_tz"),
+        status=(row.get("status") or ""),
+        esti=(row.get("esti") if isinstance(row.get("esti"), str) else ""),
+        cancelled=bool(row.get("cancelled")))
     max_delay = int(row.get("delay_min") or 0)
     base = {
         "date": date_str,

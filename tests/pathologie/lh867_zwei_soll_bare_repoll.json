@@ -1,0 +1,19 @@
+{
+  "id": "LH867",
+  "titel": "Zwei-Soll-Zeiten + nackter Repoll (Folgetags-Kontamination)",
+  "beschreibung": "FRA#ARR 2026-07-14 hat zwei Rows: die echte esti-Row (sched 09:05, esti 08:56, 'Gepäckausgabe beendet', upd 10:15) und eine Folgetags-Repoll-Row (sched 08:45, esti None, 'Geplant', upd 21:24). OSL-dep analog: Departed-esti-Row (06:57) + nackte Delayed-Row (upd 20:50). Die esti-Rows müssen gewinnen; die nackten Repoll-Stati verdrängen weder Zeit noch belegten Status.",
+  "query": {"flight": "LH867", "date": "2026-07-14", "dep_iata": "OSL", "arr_iata": "FRA"},
+  "rows": [
+    {"airport": "FRA#ARR", "flight": "LH867", "dest_iata": "OSL", "date": "2026-07-14", "sched": "08:45", "esti": null, "gate": null, "terminal": null, "status": "Geplant", "max_delay_min": null, "cancelled": false, "reg": null, "type_code": null, "updated_at": "2026-07-14T21:24:00+02:00"},
+    {"airport": "OSL", "flight": "LH867", "dest_iata": "FRA", "date": "2026-07-14", "sched": "06:35", "esti": null, "gate": null, "terminal": null, "status": "Delayed", "max_delay_min": null, "cancelled": false, "reg": null, "type_code": null, "updated_at": "2026-07-14T20:50:00+02:00"},
+    {"airport": "FRA#ARR", "flight": "LH867", "dest_iata": "OSL", "date": "2026-07-14", "sched": "09:05", "esti": "2026-07-14T08:56:00+0200", "gate": "A22", "terminal": "1", "status": "Gepäckausgabe beendet", "max_delay_min": 0, "cancelled": false, "reg": null, "type_code": null, "updated_at": "2026-07-14T10:15:00+02:00"},
+    {"airport": "OSL", "flight": "LH867", "dest_iata": "FRA", "date": "2026-07-14", "sched": "06:55", "esti": "2026-07-14T06:57:00", "gate": "D11", "terminal": null, "status": "Departed", "max_delay_min": 2, "cancelled": false, "reg": null, "type_code": null, "updated_at": "2026-07-14T05:04:00+02:00"}
+  ],
+  "facts_invarianten": {
+    "sched_arr": "2026-07-14T09:05:00+02:00",
+    "est_arr": "2026-07-14T08:56:00+02:00",
+    "est_dep": "2026-07-14T06:57:00+02:00"
+  },
+  "facts_status_enthaelt": {"arr_status": ["gepäck", "baggage"]},
+  "facts_status_nicht": {"arr_status": ["geplant"]}
+}

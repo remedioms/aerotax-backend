@@ -1,0 +1,15 @@
+{
+  "id": "OVERNIGHT_LEGIT",
+  "titel": "Übernacht-Legitim (Anti-False-Positive)",
+  "beschreibung": "Ein echter Übernachtflug: dep abends 21:45 Ortszeit (JFK), arr am Folgetag früh 04:50 Ortszeit (FRA), arr-Board 'Verspätet' mit est_arr am Folgetag. Die Ist-Ankunft am d+1 darf NICHT als wrong-day gescrubbt werden — sie ist physikalisch korrekt.",
+  "query": {"flight": "LH401", "date": "2026-07-14", "dep_iata": "JFK", "arr_iata": "FRA"},
+  "rows": [
+    {"airport": "JFK", "flight": "LH401", "dest_iata": "FRA", "date": "2026-07-14", "sched": "21:45", "esti": "2026-07-14T22:05:00", "gate": "B24", "terminal": "1", "status": "Abgeflogen", "max_delay_min": 20, "cancelled": false, "reg": null, "type_code": null, "updated_at": "2026-07-14T22:05:00-04:00"},
+    {"airport": "FRA#ARR", "flight": "LH401", "dest_iata": "JFK", "date": "2026-07-15", "sched": "04:50", "esti": "2026-07-15T05:20:00", "gate": null, "terminal": null, "status": "Verspätet", "max_delay_min": 30, "cancelled": false, "reg": null, "type_code": null, "updated_at": "2026-07-15T05:20:00+02:00"}
+  ],
+  "facts_invarianten": {
+    "sched_arr": "2026-07-15T04:50:00+02:00",
+    "est_arr": "2026-07-15T05:20:00+02:00"
+  },
+  "facts_nicht_gescrubbt": true
+}

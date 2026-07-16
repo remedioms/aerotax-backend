@@ -1,0 +1,28 @@
+{
+  "id": "LH423",
+  "titel": "Text-Delay im Status + naive Soll-Zeit, keine arr-Seite",
+  "beschreibung": "Nur die dep-Seite ist beobachtet. Der Delay steckt NUR im Status-Text ('Delayed 75 Minutes'), delay_min/esti sind leer, die Soll-Abflugzeit ist naiv (kein Offset). Der Merge muss den Text-Delay in harte Felder materialisieren (dep_delay_min=75, esti_dep=Soll+75, delay_side='dep'); crew_state pinnt bis Soll+75+Karenz pre_flight, danach flying; nie eine 'Ankunft vor Abflug'.",
+  "store": {
+    "FRA": [
+      {"flight": "LH423", "dest_iata": "MUC", "sched": "2026-07-15T17:45:00+02:00", "esti": null, "delay_min": 0, "delay_known": false, "cancelled": false, "status": "Delayed 75 Minutes", "reg": null}
+    ]
+  },
+  "query": {"flight": "LH423", "dep_iata": "FRA", "arr_iata": "MUC"},
+  "merged_optional_invarianten": {
+    "kommentar": "Nur asserten, WENN der Parallel-Agent den Text-Delay materialisiert hat (Feld gesetzt). Sonst tolerieren.",
+    "dep_delay_min": 75,
+    "esti_dep": "2026-07-15T19:00:00+02:00",
+    "delay_side": "dep"
+  },
+  "crew_state": {
+    "sectors": [
+      {"flight": "LH423", "from": "FRA", "to": "MUC", "dep_iso": "2026-07-15T15:45:00Z", "arr_iso": "2026-07-15T17:00:00Z"}
+    ],
+    "obs": {"LH423": {"dep_delay_min": 75, "status": "Delayed 75 Minutes"}},
+    "homebase": "MUC",
+    "faelle": [
+      {"now_iso": "2026-07-15T16:30:00Z", "erwartet_state": "pre_flight", "offen": false, "kommentar": "vor eff_dep (Soll 15:45Z + 75 = 17:00Z) → wartet am Boden (GRÜN)"},
+      {"now_iso": "2026-07-15T17:20:00Z", "erwartet_state": "flying", "offen": true, "reason": "offen: crew_state schiebt bei materialisiertem dep_delay auch die ARR-Grenze, sodass das 75-min-Leg pre_flight→landed springt und 'flying' nie zeigt (LH423-Klasse, Delay > Blockzeit).", "kommentar": "nach eff_dep sollte flying gelten — real bleibt es pre_flight bis landed"}
+    ]
+  }
+}

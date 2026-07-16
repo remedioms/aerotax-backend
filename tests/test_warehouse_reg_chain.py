@@ -212,6 +212,70 @@ def test_merge_persists_landed_past_arrival(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# _obs_service_day — Verkehrstag statt Poll-Tag (Folgetags-Kontaminations-Fix)
+# ══════════════════════════════════════════════════════════════════════════════
+from datetime import datetime as _DT
+
+
+def test_service_day_full_date_wins_over_poll_day():
+    # Fraport liefert volles Datum → das ist der Verkehrstag, Poll-Tag egal.
+    assert A._obs_service_day('2026-07-15T08:45:00+0200', '2026-07-14') == '2026-07-15'
+    assert A._obs_service_day('2026-07-16T05:10:00', '2026-07-16') == '2026-07-16'
+
+
+def test_service_day_hhmm_only_stale_plan_row_rolls_to_next_day():
+    # LH867-BEWEIS: nur HH:MM, sched 08:45 „Geplant", abends gepollt am 14.
+    # → Row gehört zum 15. (Soll 08:45), NICHT zum 14.
+    now = _DT(2026, 7, 14, 21, 24)
+    assert A._obs_service_day('08:45', '2026-07-14', now, status='Geplant') == '2026-07-15'
+
+
+def test_service_day_hhmm_actual_status_stays_today():
+    # Echtes Ist (esti/gelandet) → bleibt beim heutigen Tag, wird NICHT verschoben.
+    now = _DT(2026, 7, 14, 21, 24)
+    assert A._obs_service_day('08:45', '2026-07-14', now, status='Gelandet') == '2026-07-14'
+    assert A._obs_service_day('08:45', '2026-07-14', now, status='Geplant',
+                              esti='2026-07-14T09:10:00') == '2026-07-14'
+
+
+def test_service_day_hhmm_recent_plan_row_stays_today():
+    # 20:00-Flug, jetzt 21:24 (nur ~1.4h her) → NICHT >6h → bleibt heute.
+    now = _DT(2026, 7, 14, 21, 24)
+    assert A._obs_service_day('20:00', '2026-07-14', now, status='Geplant') == '2026-07-14'
+
+
+def test_merge_next_day_arrival_gets_keyed_under_its_own_day(monkeypatch):
+    # END-TO-END: eine abends gepollte Folgetags-Ankunft (volles Datum im sched)
+    # landet unter IHREM Datum, nicht unter dem Poll-Tag.
+    monkeypatch.setattr(A, '_delay_obs_flush_pending', lambda: None)
+    monkeypatch.setattr(A, '_delay_store_load_from_sb', lambda *a, **k: None)
+    writes = []
+    monkeypatch.setattr(A, '_delay_obs_write_through',
+                        lambda *a, **k: writes.append(a))
+    now_local = A._airport_local_now('FRA#ARR')
+    poll_day = now_local.strftime('%Y-%m-%d')
+    next_day = (now_local + timedelta(days=1)).strftime('%Y-%m-%d')
+    # Folgetags-Frühflug, plan-artig, ohne esti — genau der LH867-Fall.
+    sched = f'{next_day}T08:45:00'
+    row = {'flight': 'LH867', 'sched': sched, 'esti': '', 'status': 'Geplant',
+           'dest_iata': 'AMM', 'dest_name': 'Amman', 'airline': 'LH',
+           'delay_min': 0, 'cancelled': False}
+    A._merge_into_delay_store([row], poll_day, 'FRA#ARR')
+    key_next = (next_day, 'FRA#ARR', 'LH867', '08:45')
+    key_poll = (poll_day, 'FRA#ARR', 'LH867', '08:45')
+    # Der Flug ist am Poll-Tag noch NICHT passiert → er wird (falls überhaupt)
+    # unter dem FOLGETAG geführt, niemals unter dem Poll-Tag.
+    assert key_poll not in A._delay_store
+    # Wenn geschrieben, dann mit dem Folgetags-Datum.
+    for w in writes:
+        assert w[0] == next_day
+    A._delay_store.pop(key_next, None)
+    A._delay_store.pop(key_poll, None)
+    A._delay_store_meta.pop(key_next, None)
+    A._delay_store_meta.pop(key_poll, None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # /api/ax/flight-info — ARR-Row-Entspiegelung
 # ══════════════════════════════════════════════════════════════════════════════
 def _obs_row(airport, dest_iata, **kw):

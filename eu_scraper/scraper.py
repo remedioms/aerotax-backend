@@ -140,6 +140,66 @@ def delay_min(sched_iso, esti_iso) -> int:
         return 0
 
 
+# Plan-artige Board-Status (kein Ist) — Basis der Folgetags-Heuristik.
+_PLAN_LIKE_STATUS = {
+    "", "scheduled", "geplant", "planned", "boarding", "gate", "check-in",
+    "estimated", "delayed", "verspätet", "verspaetet", "expected", "on time",
+    "en route", "final call", "last call",
+}
+
+
+def service_day(sched_iso, tzname=None, status="", esti="", cancelled=False):
+    """VERKEHRSTAG (nicht Poll-Tag) einer Board-Row als 'YYYY-MM-DD'.
+
+    WHY (Folgetags-Kontaminations-Fix an der Quelle, 2026-07-15):
+    airport_delay_obs.date darf NIE den Poll-Tag tragen, wenn die Row zum Folgetag
+    gehört. Live-Beweis aus dem FRA-Poller: am 2026-07-14 abends bekam
+    'FRA#ARR date=2026-07-14' eine Row LH867 sched='08:45' status='Geplant' — das
+    war der LH867 vom 15. (Soll 08:45), fälschlich unter dem 14. abgelegt (ebenso
+    LH1126). Boards ankern ab ~05:00 Ortszeit und listen früh die Folgetags-Flüge.
+
+    Der eu_scraper baut `sched` in JEDEM Airport-Modul mit dem ECHTEN Quell-Datum
+    (utc_to_local_iso / ymd / date_ddmmyyyy), also ist `sched[:10]` hier im
+    Normalfall schon korrekt — diese Funktion ist die geteilte, defensive
+    Absicherung:
+      1) volles Datum im sched → das ist der Verkehrstag (Normalfall, no-op).
+      2) nur HH:MM (Quelle ohne Datum): liegt die Soll-Zeit >6 h in der lokalen
+         Vergangenheit UND ist der Status plan-artig (kein esti/Ist/cancel) →
+         Folgetag (date+1). Echtes Ist (departed/landed/esti/cancel) bleibt heute.
+    """
+    s = str(sched_iso or "")
+    # 1) Volles Datum im sched → maßgeblich.
+    if len(s) >= 10 and s[4:5] == "-" and s[7:8] == "-":
+        d = s[:10]
+        try:
+            datetime.strptime(d, "%Y-%m-%d")
+            return d
+        except Exception:
+            pass
+    # 2) Nur HH:MM → Heuristik gegen lokalen Jetzt-Tag.
+    z = _tz(tzname)
+    now = datetime.now(z).replace(tzinfo=None) if z is not None else datetime.utcnow()
+    fb = now.strftime("%Y-%m-%d")
+    if cancelled or (isinstance(esti, str) and esti.strip()):
+        return fb
+    st = (status or "").strip().lower()
+    if st and st not in _PLAN_LIKE_STATUS:
+        return fb
+    hhmm = s[11:16] if len(s) >= 16 else s[:5]
+    import re as _re
+    if not _re.match(r"^\d{1,2}:\d{2}$", hhmm):
+        return fb
+    try:
+        from datetime import timedelta as _td
+        sdt = datetime.strptime(f"{fb}T{hhmm.zfill(5)}", "%Y-%m-%dT%H:%M")
+    except Exception:
+        return fb
+    from datetime import timedelta as _td2
+    if sdt <= now - _td2(hours=6):
+        return (sdt + _td2(days=1)).strftime("%Y-%m-%d")
+    return fb
+
+
 def finalize(row: dict) -> dict:
     """Fill delay_min/delayed from sched vs esti; keep the row honest."""
     if not row.get("delay_min"):

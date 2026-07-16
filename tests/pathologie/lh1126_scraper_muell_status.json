@@ -1,0 +1,31 @@
+{
+  "id": "LH1126",
+  "titel": "Scraper-Müll-Status ('Boarding' auf ARR-Row)",
+  "beschreibung": "BCN#ARR 2026-07-15 trägt sched 11:55, esti 12:13, aber einen dep-typischen Müll-Status 'Boarding' auf der Ankunfts-Row. Zusätzlich eine FRA-dep-Row mit status None. Die Ist-Ankunft (12:13) bleibt, aber 'Boarding'/'grounded' darf für ein Vergangenheits-Leg mit est_arr nie stehen bleiben — es endet 'landed'.",
+  "query": {"flight": "LH1126", "date": "2026-07-15", "dep_iata": "FRA", "arr_iata": "BCN"},
+  "rows": [
+    {"airport": "FRA", "flight": "LH1126", "dest_iata": "BCN", "date": "2026-07-15", "sched": "09:50", "esti": "2026-07-15T10:05:00", "gate": null, "terminal": "1", "status": null, "max_delay_min": 15, "cancelled": false, "reg": null, "type_code": null, "updated_at": "2026-07-15T21:48:00+02:00"},
+    {"airport": "BCN#ARR", "flight": "LH1126", "dest_iata": "FRA", "date": "2026-07-15", "sched": "11:55", "esti": "2026-07-15T12:13:00", "gate": null, "terminal": null, "status": "Boarding", "max_delay_min": 18, "cancelled": false, "reg": null, "type_code": null, "updated_at": "2026-07-15T12:20:00+02:00"}
+  ],
+  "facts_invarianten": {
+    "est_arr": "2026-07-15T12:13:00+02:00"
+  },
+  "facts_status_nicht": {"arr_status": ["boarding"]},
+  "crew_state": {
+    "sectors": [
+      {"flight": "LH1126", "from": "FRA", "to": "BCN", "dep_iso": "2026-07-15T07:50:00Z", "arr_iso": "2026-07-15T09:55:00Z"}
+    ],
+    "obs": {"LH1126": {"status": "Boarding"}},
+    "homebase": "FRA",
+    "faelle": [
+      {"now_iso": "2026-07-15T22:00:00Z", "erwartet_state": "landed", "offen": true, "reason": "offen: ein 'Boarding'/grounded-Status hält ein 14h-alt Vergangenheits-Leg in crew_state auf pre_flight statt es zu landed altern zu lassen (LH1126-Scraper-Müll-Klasse).", "kommentar": "Vergangenheits-Leg mit belegter Plan-Ankunft SOLLTE landed sein, nie 'Boarding'/grounded."}
+    ]
+  },
+  "status_category": {
+    "now_iso": "2026-07-15T22:00:00+00:00",
+    "erwartet": "arrived",
+    "offen": true,
+    "reason": "offen: nach dem (korrekten) Scrub des Müll-'Boarding' fehlt jeder ARR-Status → _status_category_from_facts liefert None statt 'arrived' (kein Landungs-Beweis aus dem Board ableitbar).",
+    "kommentar": "Vergangenheits-Leg mit est_arr → 'arrived'/landed, nie 'Boarding'/grounded."
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "id": "LH890",
+  "titel": "dep-only, Ziel nie geharvestet",
+  "beschreibung": "FRA-dep 2026-07-14 sched 10:10, status 'Abgeflogen', upd 10:45; das Ziel (Warschau) wird nicht geharvestet, es gibt KEINE arr-Row. Weit nach der Plan-Ankunft darf der Flug nicht ewig 'Abgeflogen'/airborne bleiben — er muss zu 'landed' altern, OHNE eine Ist-Ankunft zu erfinden.",
+  "query": {"flight": "LH890", "date": "2026-07-14", "dep_iata": "FRA", "arr_iata": "WAW"},
+  "rows": [
+    {"airport": "FRA", "flight": "LH890", "dest_iata": "WAW", "date": "2026-07-14", "sched": "10:10", "esti": null, "gate": "A17", "terminal": "1", "status": "Abgeflogen", "max_delay_min": null, "cancelled": false, "reg": null, "type_code": null, "updated_at": "2026-07-14T10:45:00+02:00"}
+  ],
+  "facts_invarianten": {
+    "sched_dep": "2026-07-14T10:10:00+02:00"
+  },
+  "facts_abwesend": ["est_arr", "est_dep"],
+  "crew_state": {
+    "sectors": [
+      {"flight": "LH890", "from": "FRA", "to": "WAW", "dep_iso": "2026-07-14T08:10:00Z", "arr_iso": "2026-07-14T09:20:00Z"}
+    ],
+    "obs": {"LH890": {"status": "Abgeflogen"}},
+    "homebase": "FRA",
+    "faelle": [
+      {"now_iso": "2026-07-14T10:00:00Z", "erwartet_state": "landed", "offen": false, "kommentar": "kurz nach Plan-Ankunft altert der stale 'Abgeflogen'-Leg zu landed (kein Geister-airborne) — GRÜN"},
+      {"now_iso": "2026-07-14T18:00:00Z", "erwartet_state": "layover", "offen": false, "kommentar": ">6h danach: Tagesende an der Outstation → layover, nie stale airborne — GRÜN"}
+    ]
+  },
+  "status_category": {
+    "now_iso": "2026-07-14T18:00:00+00:00",
+    "erwartet": "arrived",
+    "offen": true,
+    "reason": "offen: _status_category_from_facts altert ein dep-seitiges 'Abgeflogen' ohne ARR-Board nicht zu 'arrived', sondern liefert stale 'enroute' (LH890-Klasse). Der landed-Beweis läuft über crew_state.",
+    "kommentar": ">6h nach Plan-Ankunft (~08:10Z) SOLLTE 'arrived'/landed liefern, ohne erfundene Ist-Zeit."
+  }
+}
