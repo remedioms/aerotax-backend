@@ -3755,6 +3755,242 @@ def _tail_active_guard(reg):
         return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  FR24-Ankunfts-Backfill für VERGANGENE Legs an Airports OHNE Board-Harvest
+#  (TLL/RIX/BOS/CMN/ARN/GVA …). Owner-Prinzip „einmal gefragt, dann für immer
+#  gespeichert": genau EINE bezahlte flight-summary-Abfrage pro (Flug, Datum) —
+#  das Ergebnis wird als echte airport_delay_obs-<ARR>#ARR-Row PERSISTIERT, sodass
+#  alle Leser (Facts/Merge/Sektoren/crew_state) es sofort UND für immer sehen und
+#  die Lücken-Prüfung (b) jede Wiederholung KOSTENLOS macht (Row-Dedupe).
+#
+#  Aktivierung nur unter FR24_ARR_BACKFILL=1 (Default AUS; scharf per Compose-Env).
+#  Gerufen NUR wenn: (a) das Leg vergangen ist (Ankunft > ~45 min vorbei, damit die
+#  Summary die Ist-Zeiten sicher trägt), (b) für (Flug,Datum) noch KEINE esti-
+#  tragende <arr>#ARR-Row existiert, (c) der Tages-/Monats-Credit-Deckel es erlaubt.
+#
+#  NEGATIVE-CACHE (Spend-Disziplin): ein Flug OHNE FR24-Daten darf nicht bei jedem
+#  Feed-Load erneut Credits ziehen. Bewusst NUR In-Memory (kein Müll-Marker in die
+#  Tabelle — die würde jeden echten Leser mit einer Pseudo-Row vergiften): pro
+#  Prozess maximal EIN Versuch pro (Flug,Datum) je 6 h.
+# ─────────────────────────────────────────────────────────────────────────────
+_FR24_ARR_BACKFILL_NEG = {}          # (flight, date) → ts des letzten Fehlversuchs
+_FR24_ARR_BACKFILL_NEG_TTL = 6 * 3600.0
+
+
+def _fr24_arr_backfill_enabled():
+    """Feature-Flag: Default AUS. Wird per Hetzner-Compose-Env scharf geschaltet."""
+    return (os.environ.get('FR24_ARR_BACKFILL') or '').strip() == '1'
+
+
+def _fr24_arr_backfill_neg_hit(flight_no, date):
+    """True, wenn für (Flug,Datum) in den letzten 6 h schon ein erfolgloser
+    FR24-Versuch lief — verhindert erneutes Credit-Spending pro Prozess."""
+    k = (flight_no, date)
+    ts = _FR24_ARR_BACKFILL_NEG.get(k)
+    if ts is None:
+        return False
+    if (time.time() - ts) >= _FR24_ARR_BACKFILL_NEG_TTL:
+        _FR24_ARR_BACKFILL_NEG.pop(k, None)
+        return False
+    return True
+
+
+def _fr24_arr_backfill_neg_mark(flight_no, date):
+    _FR24_ARR_BACKFILL_NEG[(flight_no, date)] = time.time()
+    if len(_FR24_ARR_BACKFILL_NEG) > 2000:      # LRU-artig, nie unbegrenzt wachsen
+        try:
+            for k, _v in sorted(_FR24_ARR_BACKFILL_NEG.items(),
+                                key=lambda kv: kv[1])[:500]:
+                _FR24_ARR_BACKFILL_NEG.pop(k, None)
+        except Exception:
+            _FR24_ARR_BACKFILL_NEG.clear()
+
+
+def _utc_iso_to_bare_local(v, iata, service_date):
+    """FR24-Summary-Zeit (absolut-UTC ISO, z.B. '2026-07-15T09:56:00Z') → bare
+    Stationszeit 'HH:MM' am Flughafen `iata` PLUS der lokale Verkehrstag ('YYYY-
+    MM-DD'). Genau das Format ECHTER Board-Rows (bare HH:MM station-lokal, siehe
+    Fixtures in test_flight_facts_from_obs). None bei unparsbar/unbekannter TZ —
+    dann nichts erfinden."""
+    if not v:
+        return None, None
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        from zoneinfo import ZoneInfo
+        from airport_tz import airport_tz as _atz
+        tzn = _atz((iata or '').upper().strip())
+        if not tzn:
+            return None, None
+        dt = _dt.fromisoformat(str(v).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        loc = dt.astimezone(ZoneInfo(tzn))
+        return loc.strftime('%H:%M'), loc.strftime('%Y-%m-%d')
+    except Exception:
+        return None, None
+
+
+def _fr24_arr_obs_exists(flight_no, date, arr_iata):
+    """(b)-Prüfung: existiert für (Flug, Datum ±1 Tag Nachtflug-Fenster) bereits
+    eine <arr>#ARR-Row MIT esti (Ist-Ankunft)? Dann ist die Lücke schon gefüllt
+    (echte Board-Row ODER ein früherer Backfill) → KEIN erneuter Call. Diese
+    Prüfung ist das, was jede Wiederholung kostenlos macht. Fail-CLOSED (True =
+    „existiert" → kein Call) bei DB-Fehlern: lieber einen Backfill auslassen als
+    doppelt bezahlen."""
+    sb = _sb()
+    if sb is None:
+        return True
+    ap = (arr_iata or '').upper().strip()
+    if not ap:
+        return True
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        sd = _dt.strptime((date or '')[:10], '%Y-%m-%d')
+        dates = [sd.strftime('%Y-%m-%d'),
+                 (sd + _td(days=1)).strftime('%Y-%m-%d'),
+                 (sd - _td(days=1)).strftime('%Y-%m-%d')]
+    except Exception:
+        dates = [(date or '')[:10]]
+    try:
+        q = (sb.table('airport_delay_obs')
+             .select('esti')
+             .in_('date', dates).eq('flight', flight_no)
+             .eq('airport', ap + '#ARR').limit(20).execute())
+    except Exception:
+        return True
+    for r in (q.data or []):
+        if (r.get('esti') or '').strip():
+            return True
+    return False
+
+
+def _fr24_fill_missing_arrival(flight_no, date, dep_iata, arr_iata):
+    """Füllt die Ist-Landung eines VERGANGENEN Legs an einem NICHT geharvesteten
+    Airport über die BESTEHENDE bezahlte FR24-flight-summary (_fr24_flight_by_number,
+    genau EIN Call) und PERSISTIERT sie als echte airport_delay_obs-<ARR>#ARR-Row.
+
+    Alle Gates sind hier gebündelt (Aufrufer muss nur „Leg ist vergangen + arr-Seite
+    leer" feststellen): (a) Ankunft > ~45 min vorbei — sonst hat die Summary die
+    Ist-Zeit noch nicht; (b) noch keine esti-<arr>#ARR-Row vorhanden; (c) Credit-
+    Deckel frei (steckt in _fr24_flight_by_number); + Negative-Cache. Best-effort,
+    wirft NIE, blockiert nie lange (der eine Summary-Call ist selbst getimeoutet).
+    Rückgabe: True, wenn eine Row geschrieben wurde (Aufrufer liest die Obs neu)."""
+    if not _fr24_arr_backfill_enabled():
+        return False
+    fn = (flight_no or '').replace(' ', '').upper().strip()
+    d = ((date or '').strip()[:10])
+    dep = (dep_iata or '').upper().strip() or None
+    arr = (arr_iata or '').upper().strip() or None
+    if len(fn) < 3 or not re.match(r'^\d{4}-\d{2}-\d{2}$', d) or not arr:
+        return False
+    # (Negative-Cache) — 1 Versuch pro (Flug,Datum) pro 6 h pro Prozess.
+    if _fr24_arr_backfill_neg_hit(fn, d):
+        return False
+    # (b) Lücke noch offen? (auch der Dedupe-Schutz gegen doppeltes Spending)
+    if _fr24_arr_obs_exists(fn, d, arr):
+        return False
+    if not _fr24_available():
+        return False
+    try:
+        # (c) Credit-Deckel steckt in _fr24_flight_by_number (kein Call bei Deckel).
+        #     Der Lookup ist singleflight/hart gecached → höchstens EIN echter Call
+        #     pro (Flug,Datum), Wiederholungen treffen den Result-Cache.
+        summary = _fr24_flight_by_number(fn, date=d) or {}
+    except Exception:
+        summary = {}
+    # (a) NUR wenn die Summary eine ECHTE Ist-Ankunft trägt (datetime_landed →
+    #     sched_arr im flight_status-Schema von _fr24_flight_by_number; est_arr ist
+    #     dort immer None). Ohne Ist-Ankunft: nichts schreiben, Negative-Cache setzen.
+    ist_arr_utc = summary.get('sched_arr')
+    ist_dep_utc = summary.get('sched_dep')
+    # Route-Konsistenz: der Summary-Treffer muss zum erwarteten Ziel passen (bzw. das
+    # erwartete Ziel unbekannt sein). Ein umgeleiteter/falscher Treffer darf keine
+    # fremde Ankunft in die ARR-Zeile schreiben.
+    s_arr_iata = (summary.get('arr_iata') or '').upper().strip() or None
+    route_ok = (s_arr_iata is None) or (s_arr_iata == arr)
+    arr_hhmm, arr_day = _utc_iso_to_bare_local(ist_arr_utc, arr, d)
+    if not (ist_arr_utc and route_ok and arr_hhmm and arr_day):
+        _fr24_arr_backfill_neg_mark(fn, d)
+        return False
+    # PERSISTENZ = DEDUPE: echte Board-Row-Form (bare 'HH:MM' station-lokal in
+    # sched/esti, airport='<ARR>#ARR', dest_iata=Herkunft). sched=esti=Ist-Landung:
+    # die Summary kennt KEINE Soll-Ankunft (nur Ist) → wir erfinden keinen Delay,
+    # setzen aber beide, damit der Merge sched_arr UND est_arr vollständig liefert.
+    sb = _sb()
+    if sb is None:
+        _fr24_arr_backfill_neg_mark(fn, d)
+        return False
+    from datetime import datetime as _dt2, timezone as _tz2
+    now_iso = _dt2.now(_tz2.utc).isoformat()
+    wrote = False
+    arr_payload = {
+        'date': arr_day, 'airport': arr + '#ARR', 'flight': fn,
+        'sched': arr_hhmm, 'esti': arr_hhmm,
+        'max_delay_min': 0, 'cancelled': False,
+        'status': 'Gelandet', 'updated_at': now_iso, 'source': 'fr24_backfill',
+    }
+    if dep or (summary.get('dep_iata') or '').strip():
+        arr_payload['dest_iata'] = dep or (summary.get('dep_iata') or '').upper()
+    try:
+        sb.table('airport_delay_obs').insert(arr_payload).execute()
+        wrote = True
+    except Exception:
+        # Schema-safe: läuft die `source`-Spalten-Migration noch nicht, ohne sie
+        # erneut versuchen — die Ankunft darf nicht an einer Provenance-Spalte
+        # scheitern (Muster _delay_obs_write_through).
+        try:
+            slim = {k: v for k, v in arr_payload.items() if k != 'source'}
+            sb.table('airport_delay_obs').insert(slim).execute()
+            wrote = True
+        except Exception:
+            wrote = False
+    # OPTIONAL die DEP-Seite: nur wenn die Summary einen Ist-Abflug liefert UND
+    # (best-effort) noch keine DEP-Zeile mit esti für den Abflug-Airport existiert.
+    if wrote and dep and ist_dep_utc:
+        dep_hhmm, dep_day = _utc_iso_to_bare_local(ist_dep_utc, dep, d)
+        if dep_hhmm and dep_day and not _fr24_dep_obs_exists(fn, dep_day, dep):
+            dep_payload = {
+                'date': dep_day, 'airport': dep, 'flight': fn,
+                'sched': dep_hhmm, 'esti': dep_hhmm,
+                'dest_iata': arr, 'max_delay_min': 0, 'cancelled': False,
+                'status': 'Abgeflogen', 'updated_at': now_iso,
+                'source': 'fr24_backfill',
+            }
+            try:
+                sb.table('airport_delay_obs').insert(dep_payload).execute()
+            except Exception:
+                try:
+                    slim = {k: v for k, v in dep_payload.items() if k != 'source'}
+                    sb.table('airport_delay_obs').insert(slim).execute()
+                except Exception:
+                    pass
+    if not wrote:
+        _fr24_arr_backfill_neg_mark(fn, d)
+    return wrote
+
+
+def _fr24_dep_obs_exists(flight_no, date, dep_iata):
+    """Wie _fr24_arr_obs_exists, aber für die DEP-Seite (airport='<DEP>' ohne #ARR)
+    MIT esti. Fail-CLOSED (True) bei Fehlern → keine doppelte DEP-Zeile."""
+    sb = _sb()
+    if sb is None:
+        return True
+    ap = (dep_iata or '').upper().strip()
+    if not ap:
+        return True
+    try:
+        q = (sb.table('airport_delay_obs')
+             .select('esti')
+             .eq('date', (date or '')[:10]).eq('flight', flight_no)
+             .eq('airport', ap).limit(20).execute())
+    except Exception:
+        return True
+    for r in (q.data or []):
+        if (r.get('esti') or '').strip():
+            return True
+    return False
+
+
 def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     """Board-Fakten EINES Flugs aus airport_delay_obs (DEP + <arr>#ARR gemergt).
     Timeout-sicher (eigener try, Fehler → {}), indizierte Filter (date+flight).
@@ -3781,22 +4017,49 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     # Nachtfluegen (LH455 SFO 14.07 -> FRA 15.07) liegt die passende ARR-Zeile
     # daher auf d+1; nur d/yday erwischte stattdessen die vorige Tagesrotation.
     dates = [d] + ([yday] if yday else []) + ([nday] if nday else [])
-    try:
-        q = (sb.table('airport_delay_obs')
-             .select('airport,flight,dest_iata,sched,esti,gate,terminal,'
-                     'status,max_delay_min,cancelled,reg,type_code,date')
-             .in_('date', dates).eq('flight', fn)
-             .order('updated_at', desc=True).limit(20).execute())
-    except Exception:
+
+    def _load_cands():
+        try:
+            q = (sb.table('airport_delay_obs')
+                 .select('airport,flight,dest_iata,sched,esti,gate,terminal,'
+                         'status,max_delay_min,cancelled,reg,type_code,date')
+                 .in_('date', dates).eq('flight', fn)
+                 .order('updated_at', desc=True).limit(20).execute())
+        except Exception:
+            return None
+        _dep, _arr = [], []
+        for r in (q.data or []):
+            ap = (r.get('airport') or '').upper()
+            if ap.endswith('#ARR'):
+                if arr is None or ap == arr + '#ARR':
+                    _arr.append(r)
+            elif dep is None or ap == dep:
+                _dep.append(r)
+        return _dep, _arr
+
+    _loaded = _load_cands()
+    if _loaded is None:
         return {}
-    dep_cands, arr_cands = [], []
-    for r in (q.data or []):
-        ap = (r.get('airport') or '').upper()
-        if ap.endswith('#ARR'):
-            if arr is None or ap == arr + '#ARR':
-                arr_cands.append(r)
-        elif dep is None or ap == dep:
-            dep_cands.append(r)
+    dep_cands, arr_cands = _loaded
+
+    # FR24-ANKUNFTS-BACKFILL (Owner „einmal gefragt, dann für immer gespeichert"):
+    # ist die ARR-Seite leer UND das Leg VERGANGEN (Verkehrstag vor heute, d.h. die
+    # Ankunft liegt sicher > ~45 min zurück — an nicht geharvesteten Airports wie
+    # TLL/RIX/BOS/CMN/ARN/GVA gibt es kein Ankunfts-Board), holen wir die Ist-Landung
+    # EINMALIG über die bestehende bezahlte flight-summary und PERSISTIEREN sie als
+    # echte <arr>#ARR-Row. Danach die Obs GENAU EINMAL neu lesen — ab jetzt sieht
+    # jeder Leser (und jeder Folge-Load) die Ankunft, ohne erneut zu bezahlen.
+    # Best-effort, wirft nie; ohne Flag/DB-Treffer sofort no-op (kein Overhead).
+    if not arr_cands and arr:
+        _today = time.strftime('%Y-%m-%d', time.gmtime())
+        if d < _today:
+            try:
+                if _fr24_fill_missing_arrival(fn, d, dep, arr):
+                    _loaded2 = _load_cands()
+                    if _loaded2 is not None:
+                        dep_cands, arr_cands = _loaded2
+            except Exception:
+                pass
 
     def _best(cands, is_arr=False):
         # (1) ANGEFRAGTES Datum bevorzugen — sonst kann eine Vortags-Beobachtung
