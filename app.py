@@ -12162,6 +12162,175 @@ def get_destination_leaderboard(iata, token):
                     'ranking': out[:21], 'my_rank': my_rank, 'my_count': my_count})
 
 
+# ── Hangout-Geo-Push (Owner-Wunsch 2026-07-16) ──────────────────────────────
+# Wenn ein User einen öffentlichen Treffpunkt-Pin (Hangout) erstellt, sollen
+# ALLE AeroX-User im ~100-km-Umkreis EINEN Push bekommen, damit der global
+# sichtbare Hangout auffindbar wird.
+#
+# STANDORT-QUELLE (ehrlichste vorhandene): Es gibt KEINE gespeicherte Live-GPS-
+# Koordinate pro User im Backend — das Profil trägt nur `current_city` (String)
+# und `location_source`. Die einzige verlässliche, serverseitige Positions-
+# Wahrheit ist der HEUTIGE Roster-Ort (Layover/Dienst-Airport) via
+# `_user_current_iata(token)` → Airport-Koordinate aus airports_compact.json.
+# Das ist dieselbe Quelle, die friends-today / Live-City nutzen. NÄHERUNG:
+# Airport-Zentrum statt exakter Aufenthaltsort; wer heute keinen 3-Letter-Roster-
+# Ort hat, hat für uns keine bekannte Position und wird ausgeschlossen.
+#
+# SICHERHEIT: Der eigentliche Sende-Fanout ist hinter dem Flag HANGOUT_GEO_PUSH
+# (Default '0' = AUS). Solange AUS: Auswahl läuft + wird geloggt, aber NICHTS
+# gesendet ("would notify N users"). 550 echte Produktions-User, APNs live.
+HANGOUT_GEO_PUSH_RADIUS_KM = 100.0
+HANGOUT_GEO_PUSH_MAX_RECIPIENTS = 300     # Vernunft-Deckel pro Hangout
+HANGOUT_GEO_PUSH_COOLDOWN_SEC = 30 * 60   # pro Ersteller max 1 Geo-Push / 30 min
+
+# In-Memory Cooldown-Map {creator_token: last_geo_push_epoch}. Reicht (best-effort
+# Anti-Spam); übersteht keinen Restart, was für einen 30-min-Deckel unkritisch ist.
+_hangout_geo_push_last = {}
+
+
+def _hangout_geo_push_enabled():
+    """Flag-Gate. Default AUS. Nur wenn HANGOUT_GEO_PUSH in {'1','true','on','yes'}
+    wird tatsächlich gesendet — sonst nur count-Logging."""
+    return os.environ.get('HANGOUT_GEO_PUSH', '0').strip().lower() in (
+        '1', 'true', 'on', 'yes')
+
+
+def _hangout_geo_push_cooldown_active(creator_token, now_epoch=None):
+    """True wenn der Ersteller innerhalb der Cooldown-Fensters schon einen
+    Geo-Push ausgelöst hat (Anti-Spam)."""
+    if not creator_token:
+        return False
+    import time as _t
+    now_epoch = now_epoch if now_epoch is not None else _t.time()
+    last = _hangout_geo_push_last.get(creator_token)
+    return last is not None and (now_epoch - last) < HANGOUT_GEO_PUSH_COOLDOWN_SEC
+
+
+def _users_near(lat, lon, radius_km=HANGOUT_GEO_PUSH_RADIUS_KM,
+                exclude_token=None):
+    """Reine Geo-Selektion: liefert die User-Tokens, deren zuletzt bekannte
+    Position (heutiger Roster-Ort → Airport-Koordinate) innerhalb radius_km um
+    (lat, lon) liegt. Haversine-Distanz.
+
+    Kandidaten = alle Tokens in user_push_tokens (nur wer ein Gerät hat, kann
+    überhaupt gepusht werden). Für jeden:
+      • Position via _user_current_iata → Airport-Koordinate; kein Ort ⇒ raus.
+      • Ausschluss: Ersteller selbst.
+      • Ausschluss: share_location == False (explizit; Default True).
+      • Ausschluss: Family-Konten (account_type == 'family').
+    Returns sortierte Liste (nach Distanz) von {token, iata, distance_km}.
+    Der Empfänger-Deckel wird NICHT hier, sondern im Fanout angewandt (damit
+    die reine Selektion testbar bleibt).
+    """
+    if lat is None or lon is None or not SB_AVAILABLE or sb is None:
+        return []
+    try:
+        lat = float(lat); lon = float(lon)
+    except (TypeError, ValueError):
+        return []
+
+    # Kandidaten-Tokens: alle registrierten Push-Empfänger (paginiert).
+    tokens = []
+    try:
+        for i in range(0, 20000, 1000):
+            r = (sb.table('user_push_tokens').select('user_token')
+                 .range(i, i + 999).execute())
+            batch = [x.get('user_token') for x in (r.data or []) if x.get('user_token')]
+            tokens.extend(batch)
+            if len(batch) < 1000:
+                break
+    except Exception as e:
+        app.logger.warning(
+            f'[hangout-geo] token_scan_fail err={type(e).__name__}: {str(e)[:120]}')
+        return []
+    tokens = [t for t in dict.fromkeys(tokens) if t and t != exclude_token]
+    if not tokens:
+        return []
+
+    profs = _profiles_load_bulk(tokens)
+    ap = _airports_compact_lookup()
+    out = []
+    for t in tokens:
+        prof = profs.get(t) or {}
+        # share_location AUS respektieren (explizites False; Default an).
+        if prof.get('share_location') is False:
+            continue
+        # Family-Konten ausschließen.
+        if _is_family_account(prof):
+            continue
+        iata = _user_current_iata(t)
+        if not iata:
+            continue
+        coord = ap.get(iata)
+        if not coord:
+            continue
+        d = _haversine_km(lat, lon, coord[0], coord[1])
+        if d <= radius_km:
+            out.append({'token': t, 'iata': iata, 'distance_km': round(d, 1)})
+    out.sort(key=lambda x: x['distance_km'])
+    return out
+
+
+def _hangout_notify_nearby(creator_token, lat, lon, iata, title, pin_id,
+                           now_epoch=None):
+    """Best-effort Geo-Fanout NACH erfolgreichem Pin-Insert. Wählt Empfänger im
+    Umkreis, wendet Deckel + Ersteller-Cooldown an. Sendet NUR wenn
+    HANGOUT_GEO_PUSH aktiv — sonst reines count-Logging ("would notify").
+    Returns dict {selected, sent, capped, cooldown, enabled} (für Tests/Logs).
+    Wirft nie (der Erstell-Response darf nie brechen)."""
+    import time as _t
+    now_epoch = now_epoch if now_epoch is not None else _t.time()
+    result = {'selected': 0, 'sent': 0, 'capped': False,
+              'cooldown': False, 'enabled': _hangout_geo_push_enabled()}
+    try:
+        if _hangout_geo_push_cooldown_active(creator_token, now_epoch):
+            result['cooldown'] = True
+            app.logger.info(
+                f'[hangout-geo] cooldown active creator={_push_token_ref(creator_token)} '
+                f'— skip iata={iata}')
+            return result
+
+        near = _users_near(lat, lon, exclude_token=creator_token)
+        result['selected'] = len(near)
+        if len(near) > HANGOUT_GEO_PUSH_MAX_RECIPIENTS:
+            result['capped'] = True
+            near = near[:HANGOUT_GEO_PUSH_MAX_RECIPIENTS]
+
+        place = (iata or '').upper() or 'deiner Nähe'
+        short_title = (title or 'Treffpunkt').strip()[:60]
+        body = f'Neuer Treffpunkt in {place}: {short_title}'
+        data = {'type': 'hangout_nearby', 'pin_id': pin_id,
+                'iata': iata, 'deep_link': f'aerox://hangout/{pin_id}'}
+
+        if not result['enabled']:
+            app.logger.info(
+                f'[hangout-geo] FLAG OFF — would notify {len(near)} users '
+                f'iata={iata} pin={pin_id}')
+            return result
+
+        # Cooldown erst NACH bestätigter Send-Absicht setzen.
+        _hangout_geo_push_last[creator_token] = now_epoch
+        sent = 0
+        for u in near:
+            try:
+                _push_outbox_enqueue(
+                    u['token'], 'AeroX Treffpunkt', body, data=data,
+                    thread_id=f'hangout__{pin_id}', category='community',
+                    idempotency_key=f'hangout-geo:{pin_id}:{_push_token_ref(u["token"])}')
+                sent += 1
+            except Exception:
+                continue
+        result['sent'] = sent
+        app.logger.info(
+            f'[hangout-geo] notified sent={sent} selected={result["selected"]} '
+            f'capped={result["capped"]} iata={iata} pin={pin_id}')
+        return result
+    except Exception as e:
+        app.logger.warning(
+            f'[hangout-geo] notify_fail err={type(e).__name__}: {str(e)[:160]}')
+        return result
+
+
 @app.route('/api/user/manual-pins/<token>', methods=['GET'])
 def list_manual_pins(token):
     """Eigene Pins (zur Verwaltung/Löschen)."""
@@ -12207,6 +12376,14 @@ def create_manual_pin(token):
     except Exception as e:
         app.logger.warning(f'[crew-dest] pin_insert_fail err={type(e).__name__}: {str(e)[:120]}')
         return jsonify({'ok': False, 'error': 'insert_failed'}), 500
+    # Best-effort Geo-Push an AeroX-User im ~100-km-Umkreis (nach dem Commit,
+    # try/except intern — bricht NIE den Erstell-Response). Sendet nur wenn
+    # HANGOUT_GEO_PUSH aktiv; sonst nur count-Logging. Deep-Link auf den Hangout.
+    try:
+        _hangout_notify_nearby(token, lat, lng, iata,
+                               title=(note or iata), pin_id=pin_id)
+    except Exception:
+        pass
     return jsonify({'ok': True, 'pin': {
         'id': pin_id, 'iata': iata, 'lat': lat, 'lng': lng,
         'date': pin_date, 'note': note}})
