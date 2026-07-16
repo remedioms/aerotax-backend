@@ -47,6 +47,19 @@ def test_name_match_profile_subset_of_contact():
     assert A._contacts_name_match('Miguel Schumann', contacts)
 
 
+def test_name_match_contact_subset_of_profile():
+    # Gegenrichtung (Owner „da fehlen Leute"): Kontakt „Ralf Quaas" (≥2 Tokens)
+    # muss ein Profil „Ralf Peter Quaas ✈️" finden — Profil hat einen Extra-Token.
+    contacts = [set(A._contacts_name_tokens('Ralf Quaas'))]
+    assert A._contacts_name_match('Ralf Peter Quaas ✈️', contacts)
+
+
+def test_name_match_reverse_still_needs_two_tokens():
+    # Ein-Wort-KONTAKT darf kein mehrteiliges Profil matchen (kein Übermatch).
+    contacts = [set(A._contacts_name_tokens('Quaas'))]
+    assert not A._contacts_name_match('Ralf Peter Quaas', contacts)
+
+
 def test_name_match_single_word_profile_only_exact():
     # Ein-Wort-Profilname darf NICHT jeden Kontakt mit dem Wort matchen
     contacts = [set(A._contacts_name_tokens('Miguel Schumann'))]

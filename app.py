@@ -10536,16 +10536,25 @@ def _contacts_name_match(profile_name, contact_token_sets):
     Regeln (konservativ, kein Substring-Raten):
       • Token-Set-Gleichheit (auch „Schumann, Miguel" umgedreht), ODER
       • Profilname hat ≥2 Tokens und ALLE stecken im Kontakt-Namen
-        (Titel/Emojis/Zusätze im Kontakt stören nicht).
-    Ein-Wort-Profilnamen matchen NUR exakt (sonst matcht „Miguel" jeden
-    Kontakt, der das Wort irgendwo trägt)."""
+        (Titel/Emojis/Zusätze im Kontakt stören nicht), ODER
+      • Kontakt-Name hat ≥2 Tokens und ALLE stecken im Profilnamen
+        (Gegenrichtung: Kontakt „Ralf Quaas" findet Profil „Ralf Peter
+        Quaas ✈️"). Owner 2026-07-16 „da fehlen Leute" — vorher matchte
+        NUR Profil⊆Kontakt, die Gegenrichtung fiel durch.
+    Ein-Wort-Namen matchen NUR exakt (sonst matcht „Miguel" jeden
+    Kontakt/jedes Profil, der/das das Wort irgendwo trägt)."""
     ps = set(_contacts_name_tokens(profile_name))
     if not ps:
         return False
     for cs in contact_token_sets:
         if ps == cs:
             return True
+        # Symmetrischer Subset-Match: die kleinere ≥2-Token-Menge muss
+        # vollständig in der größeren stecken. ≥2-Token-Schwelle gilt für die
+        # ENTHALTENE Menge → verhindert Ein-Wort-Übermatch in beide Richtungen.
         if len(ps) >= 2 and ps <= cs:
+            return True
+        if len(cs) >= 2 and cs <= ps:
             return True
     return False
 
