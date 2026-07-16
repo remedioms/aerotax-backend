@@ -775,6 +775,48 @@ def test_basti_boarding_beobachtet_schlaegt_verspaetet():
     assert r['pre_phase'] == PRE_BOARDING
 
 
+# ── Julien LH423 (2026-07-16): materialisierter Text-Delay speist current_leg ──
+# Der BOS-Board-Text „Delayed 75 Minutes" wird an der Merge-Grenze in
+# dep_delay_min=75 + est_dep_iso (sched+75) + delay_side='dep' materialisiert;
+# der Crew-Resolver erbt das → current_leg trägt die 75 und der pre_flight-Text
+# bekommt „Verspätet"-Semantik (ab dem prep-Fenster, NACH dem Soll-Abflug).
+_LH423 = [{'flight': 'LH423', 'from': 'BOS', 'to': 'FRA',
+           'dep_iso': '2026-07-09T22:40:00Z', 'arr_iso': '2026-07-10T06:50:00Z'}]
+
+# So sieht der Record NACH der Merge-Materialisierung aus (dep_delay_min +
+# absolute est_dep_iso = sched 22:40Z + 75 min = 23:55Z, delay_side='dep').
+_LH423_MERGED_OBS = {
+    'status': 'Delayed 75 Minutes', 'status_dep': 'Delayed 75 Minutes',
+    'dep_delay_min': 75, 'delay_side': 'dep', 'delay_known': True,
+    'est_dep_iso': '2026-07-09T23:55:00Z',
+}
+
+
+def test_julien_materialisierter_delay_speist_current_leg():
+    # now 23:20Z — NACH dem Soll-Abflug 22:40Z, im prep-Fenster des est_dep 23:55Z.
+    r = _resolve(datetime(2026, 7, 9, 23, 20, tzinfo=timezone.utc),
+                 sectors=_LH423, obs={'LH423': dict(_LH423_MERGED_OBS)})
+    assert r['state'] == STATE_PRE_FLIGHT
+    # pre_flight-Text bekommt „Verspätet"-Semantik (nicht Check-in).
+    assert r['pre_phase'] == PRE_DELAYED
+    assert r['pre_phase_label'] == 'Verspätet'
+    # current_leg trägt die materialisierte est_dep (sched+75) + delay.
+    cl = r['current_leg']
+    assert cl['est_dep_iso'] == '2026-07-09T23:55:00Z'
+    assert cl['delay_min'] == 75
+    assert cl['delay_side'] == 'dep'
+
+
+def test_julien_materialisierter_delay_checkin_vor_prep_fenster():
+    # Basti-Regel bleibt: früh (now 22:00Z, VOR Soll-Abflug 22:40 und vor
+    # est_dep−40 = 23:15) zeigt die normale Timeline (Check-in offen), NICHT
+    # „Verspätet" — kein alarmierender Dauer-Status.
+    r = _resolve(datetime(2026, 7, 9, 22, 0, tzinfo=timezone.utc),
+                 sectors=_LH423, obs={'LH423': dict(_LH423_MERGED_OBS)})
+    assert r['state'] == STATE_PRE_FLIGHT
+    assert r['pre_phase'] == PRE_CHECKIN
+
+
 # ── Julien/Tibor 2026-07-16: arr-seitiges „Verspätet" ist KEIN Boden-Beweis ──
 # Über-Ozean-Nachtflug OHNE Abflug-Board (BOS/SFO): der gemergte Board-Record
 # trägt die FRA-ANKUNFTS-Tafel („Verspätet", est arr in der Zukunft), also
@@ -799,6 +841,32 @@ def test_arr_verspaetet_ohne_dep_beweis_kippt_auf_flying():
     assert r['state'] == STATE_FLYING
     assert r['confidence'] == CONF_PLAN     # reine Uhr, kein Live/Board-Abflug
     assert r['position'] is None            # keine erfundene Position
+
+
+def test_flying_current_leg_bevorzugt_est_arr():
+    # „Wer fliegt gerade"-Karte (Tibor LH455): das current_leg der fliegenden Crew
+    # muss die IST-Ankunft (est_arr_iso) tragen, nicht die Soll (Owner-Bug: Karte
+    # zeigte Soll 06:00 obwohl est 06:45 bekannt). Soll-arr 06:00Z, est 06:45Z.
+    r = _resolve(datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc),
+                 sectors=_LH455,
+                 obs={'LH455': {'status': 'Verspätet', 'arr_delay_min': 45,
+                                'delay_side': 'arr',
+                                'est_arr_iso': '2026-07-10T06:45:00Z'}})
+    assert r['state'] == STATE_FLYING
+    cl = r['current_leg']
+    assert cl['est_arr_iso'] == '2026-07-10T06:45:00Z'   # IST bevorzugt
+    assert cl['arr_iso'] == '2026-07-10T06:00:00Z'       # Soll bleibt als Fallback
+    assert cl['delay_min'] == 45
+
+
+def test_flying_current_leg_faellt_auf_soll_wenn_kein_est():
+    # Ehrlich: fehlt jede IST-Ankunft, bleibt est_arr_iso None (iOS zeigt Soll).
+    r = _resolve(datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc),
+                 sectors=_LH455, obs={'LH455': {'status': 'Airborne'}})
+    assert r['state'] == STATE_FLYING
+    cl = r['current_leg']
+    assert cl['est_arr_iso'] is None
+    assert cl['arr_iso'] == '2026-07-10T06:00:00Z'
 
 
 def test_dep_boarding_aktiv_behaelt_pre_flight():

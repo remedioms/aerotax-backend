@@ -876,6 +876,82 @@ def test_merged_keeps_consistent_delay_no_scrub():
     assert m['status_arr'] == 'delayed'
 
 
+# ── Angekündigten Text-Delay an der Merge-Grenze materialisieren (Julien LH423 /
+#    Tibor LH455, 2026-07-16) ──────────────────────────────────────────────────
+# Manche Boards posten die Verspätung NUR im Status-TEXT („Delayed 75 Minutes")
+# und lassen delay_min/esti leer. An der EINEN geteilten Merge-Grenze wird sie in
+# die harten Felder (dep_delay_min + esti_dep + delay_side) materialisiert, sodass
+# ALLE Consumer (Bordkarten-Status, friend-roster, flight-info) den Delay erben.
+def test_merged_materializes_announced_dep_delay_text():
+    # BOS-Board (dep-Seite): „Delayed 75 Minutes", KEIN hartes delay_min, KEIN esti.
+    m = _run_merged({
+        'FRA': [_row(dest_iata='MUC', sched='2026-07-16T00:40:00+02:00',
+                     esti=None, delay_min=0, delay_known=False,
+                     status='Delayed 75 Minutes')],
+    })
+    assert m is not None
+    # dep_delay_min aus dem Text materialisiert …
+    assert m['dep_delay_min'] == 75
+    assert m['delay_known'] is True
+    assert m['delay_side'] == 'dep'
+    assert m['delay_min'] == 75
+    # … esti_dep = sched + 75 (gleiches ISO-Format wie der Nachbar-sched).
+    assert m['esti_dep'] == '2026-07-16T01:55:00+02:00'
+    # est_dep_iso wird daraus abgeleitet (absolute UTC — 01:55 +02:00 = 23:55 Z).
+    assert m['est_dep_iso'] == '2026-07-15T23:55:00Z'
+
+
+def test_merged_materializes_announced_arr_delay_text():
+    # FRA#ARR-Board (arr-Seite): „Delayed 35 Minutes" nur im Text → arr materialisiert.
+    m = _run_merged({
+        'MUC#ARR': [_row(flight='LH400', dest_iata='FRA',
+                         sched='2026-07-16T02:10:00+02:00', esti=None,
+                         delay_min=0, delay_known=False,
+                         status='Delayed 35 Minutes')],
+    })
+    assert m is not None
+    assert m['arr_delay_min'] == 35
+    assert m['delay_side'] == 'arr'
+    assert m['delay_min'] == 35
+    assert m['esti_arr'] == '2026-07-16T02:45:00+02:00'
+
+
+def test_merged_no_delay_text_stays_none():
+    # Kein Minuten-Delay im Text → NICHTS erfinden (dep_delay_min bleibt None).
+    m = _run_merged({
+        'FRA': [_row(dest_iata='MUC', sched='2026-07-16T00:40:00+02:00',
+                     esti=None, delay_min=0, delay_known=False,
+                     status='Boarding')],
+    })
+    assert m is not None
+    assert m['dep_delay_min'] is None
+    assert m['esti_dep'] is None
+
+
+def test_merged_delay_without_number_not_materialized():
+    # „Delayed" OHNE Minuten-Zahl (mehrdeutig, oft nur ARR-Tafel) → nichts materialisieren.
+    m = _run_merged({
+        'FRA': [_row(dest_iata='MUC', sched='2026-07-16T00:40:00+02:00',
+                     esti=None, delay_min=0, delay_known=False,
+                     status='Delayed')],
+    })
+    assert m is not None
+    assert m['dep_delay_min'] is None
+    assert m['esti_dep'] is None
+
+
+def test_merged_explicit_delay_not_overwritten_by_text():
+    # Hartes dep_delay_min (delay_known=True) bleibt maßgeblich — Text nicht doppelt.
+    m = _run_merged({
+        'FRA': [_row(dest_iata='MUC', sched='2026-07-16T00:40:00+02:00',
+                     esti='2026-07-16T01:20:00+02:00', delay_min=40,
+                     delay_known=True, status='Delayed 75 Minutes')],
+    })
+    assert m is not None
+    assert m['dep_delay_min'] == 40          # hartes 40, NICHT das Text-75
+    assert m['esti_dep'] == '2026-07-16T01:20:00+02:00'
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # get_briefings — Serve-Time-Enrichment (nur today/today+1)
 # ══════════════════════════════════════════════════════════════════════════════

@@ -30636,6 +30636,76 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         'sides': {'dep': dep_src, 'arr': arr_src},
         'has_dep': dep_row is not None, 'has_arr': arr_row is not None,
     }
+    # ANGEKÜNDIGTEN DELAY MATERIALISIEREN (Owner/Fable 2026-07-16, Julien LH423
+    # BOS→FRA + Tibor LH455 SFO→FRA): manche Boards posten die Verspätung NUR im
+    # Status-TEXT („Delayed 75 Minutes") und lassen `delay_min`/`esti` leer. Der
+    # gemergte Record trug dann dep_delay_min=None + esti_dep=None → JEDE Anzeige-
+    # Fläche (Bordkarten-Status, friend-roster est_dep_iso, flight-info) sah „kein
+    # Delay", obwohl das Board 75 min ankündigte. Hier — an der EINEN geteilten
+    # Merge-Grenze, damit alle Consumer es erben — materialisieren wir den
+    # angekündigten Delay in die harten Felder, WENN die Seite noch keinen kennt.
+    # Nur mit expliziter Minuten-Zahl (KEIN „Delayed" ohne Zahl → nichts erfinden).
+    # Die abgeleiteten est_*-Werte durchlaufen danach dieselbe est_*_iso-Ableitung
+    # UND denselben Wrong-Day-/Physik-Scrub wie echte esti (kein Guard-Bypass).
+    def _announced_delay_min_from_status(status_text):
+        try:
+            mm = re.search(r'(\d+)\s*min', str(status_text or ''), re.IGNORECASE)
+            if mm:
+                return max(0, int(mm.group(1)))
+        except Exception:
+            pass
+        return None
+
+    def _sched_plus_minutes(sched, n):
+        """`sched` (bare 'HH:MM' ODER Voll-/Teil-ISO) + n Minuten, im GLEICHEN
+        Format wie der Nachbar-`esti` der jeweiligen Seite (bare bleibt bare,
+        ISO bleibt ISO) — sodass _board_local_to_utc_iso denselben Pfad nimmt.
+        None wenn unparsbar. Wirft nie."""
+        if not sched or n is None:
+            return None
+        try:
+            from datetime import datetime as _dtm, timedelta as _tdm
+            s = str(sched).strip()
+            mm = re.match(r'^(\d{1,2}):(\d{2})$', s)
+            if mm:
+                base = _dtm(2000, 1, 1, int(mm.group(1)), int(mm.group(2)))
+                return (base + _tdm(minutes=int(n))).strftime('%H:%M')
+            dt = _dtm.fromisoformat(s.replace('Z', '+00:00'))
+            out = dt + _tdm(minutes=int(n))
+            if s.endswith('Z'):
+                return out.strftime('%Y-%m-%dT%H:%M:%SZ')
+            return out.isoformat()
+        except Exception:
+            return None
+
+    # dep-Seite: Delay nur ankündigt (kein hartes dep_delay_min) → materialisieren.
+    if rec.get('dep_delay_min') is None and rec.get('sched_dep'):
+        _ann_dep = _announced_delay_min_from_status(rec.get('status_dep'))
+        if _ann_dep is not None:
+            _mat_dep = _sched_plus_minutes(rec.get('sched_dep'), _ann_dep)
+            if _mat_dep is not None:
+                rec['dep_delay_min'] = _ann_dep
+                if not rec.get('esti_dep'):
+                    rec['esti_dep'] = _mat_dep
+                rec['delay_known'] = True
+                # best-delay/-side neu wählen: eine echte arr-Zahl behält Vorrang
+                # (arr-OTP ist die ehrlichere Metrik), sonst trägt jetzt die dep-Seite.
+                if rec.get('arr_delay_min') is None:
+                    rec['delay_min'] = _ann_dep
+                    rec['delay_side'] = 'dep'
+    # arr-Seite: analog, falls die ANKUNFTS-Tafel den Delay nur im Text trägt.
+    if rec.get('arr_delay_min') is None and rec.get('sched_arr'):
+        _ann_arr = _announced_delay_min_from_status(rec.get('status_arr'))
+        if _ann_arr is not None:
+            _mat_arr = _sched_plus_minutes(rec.get('sched_arr'), _ann_arr)
+            if _mat_arr is not None:
+                rec['arr_delay_min'] = _ann_arr
+                if not rec.get('esti_arr'):
+                    rec['esti_arr'] = _mat_arr
+                rec['delay_known'] = True
+                # arr gewinnt als beste Ein-Zahl (D15-OTP).
+                rec['delay_min'] = _ann_arr
+                rec['delay_side'] = 'arr'
     # ABSOLUTE-UTC EST-ZEITEN (ADDITIV, Owner 2026-07-13 „Live-Karte 8:40, Radar
     # paar Min später"): `esti_dep`/`esti_arr` sind ROH station-lokal (bare/naive,
     # oft OHNE Offset) — wer sie naiv als UTC parst, verschiebt sie um die
@@ -34817,6 +34887,78 @@ def _board_type_code(f):
     return ''
 
 
+# Plan-artige Board-Status (kein Ist/Actual) — Basis der Folgetags-Heuristik.
+# Deckungsgleich mit _PRE_DEP_STATUS (case-insensitiv), plus die englischen
+# Rohwerte, die manche EU-Quellen unnormalisiert liefern.
+_PLAN_LIKE_STATUS = (_PRE_DEP_STATUS | {
+    'estimated', 'delayed', 'verspätet', 'verspaetet', 'expected', 'new time',
+    'new gate', 'departs', 'now'})
+
+
+def _obs_service_day(sched, fallback_date, now_local=None,
+                     status=None, esti=None, cancelled=False):
+    """VERKEHRSTAG (nicht Poll-Tag) einer Board-Beobachtung als 'YYYY-MM-DD'.
+
+    WHY (ROOT-CAUSE „Folgetags-Kontamination an der Quelle", 2026-07-15):
+    airport_delay_obs.date wurde bisher mit dem POLL-Tag (`fallback_date`, meist
+    „heute") gestempelt — der `_merge_into_delay_store`-Key ignorierte das Datum,
+    das in `sched` bereits steckt. Der Fraport-/EU-Feed ankert das Board ab 05:00
+    Ortszeit und listet auch die frühen Flüge des FOLGETAGS. Live-Beweis:
+    am 2026-07-14 abends (upd 21:24) bekam „FRA#ARR date=2026-07-14" eine Row
+    LH867 sched='08:45' status='Geplant' — das ist der LH867 vom 15. (Soll 08:45),
+    fälschlich unter dem 14. abgelegt (ebenso LH1126). Die Lese-Seite musste das
+    mit Kompensationen abfangen; hier wird die QUELLE sauber:
+
+      1) Trägt `sched` ein volles, parsbares Datum (Fraport liefert
+         '2026-07-16T05:10:00+0200', inkl. Datum im Flug-`id`), ist DAS der
+         Verkehrstag — Poll-Tag egal. Fixt LH867 direkt.
+      2) Liefert `sched` nur HH:MM (Quellen ohne Datum): konservative Heuristik.
+         Liegt die Soll-Zeit >6 h in der VERGANGENHEIT (Airport-Lokalzeit) UND ist
+         der Status plan-artig (Geplant/Scheduled/leer, KEIN esti/Ist) → die Row
+         gehört zum FOLGETAG (date+1). Ein 08:45-„Geplant", das abends noch als
+         geplant im Board steht, ist niemals der heutige Morgen-Flug.
+
+    Flüge mit echtem Ist (departed/landed/esti/cancelled) bleiben IMMER beim
+    heutigen `fallback_date` — nur unbestätigte Plan-Rows werden verschoben.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    fb = str(fallback_date or '')[:10]
+    s = str(sched or '')
+    # 1) Volles Datum im sched → maßgeblicher Verkehrstag.
+    if len(s) >= 10 and s[4] == '-' and s[7] == '-':
+        d = s[:10]
+        try:
+            _dt.strptime(d, '%Y-%m-%d')
+            return d
+        except Exception:
+            pass
+    # 2) Nur HH:MM (kein Datum im sched) → Folgetags-Heuristik gegen fallback_date.
+    if not fb:
+        return fb
+    if cancelled or (isinstance(esti, str) and esti.strip()):
+        return fb  # echtes Ist/Prognose → heutiger Tag
+    st = (status or '').strip().lower()
+    if st and st not in _PLAN_LIKE_STATUS:
+        return fb  # departed/landed/… → heutiger Tag
+    hhmm = s[11:16] if len(s) >= 16 else s[:5]
+    import re as _re
+    if not _re.match(r'^\d{1,2}:\d{2}$', hhmm):
+        return fb
+    try:
+        sched_dt = _dt.strptime(f'{fb}T{hhmm.zfill(5)}', '%Y-%m-%dT%H:%M')
+    except Exception:
+        return fb
+    nl = now_local
+    if nl is None:
+        return fb
+    if isinstance(nl, _dt) and nl.tzinfo is not None:
+        nl = nl.replace(tzinfo=None)
+    # Soll >6 h in der Vergangenheit + plan-artig → Row ist der FOLGETAG.
+    if sched_dt <= nl - _td(hours=6):
+        return (sched_dt + _td(days=1)).strftime('%Y-%m-%d')
+    return fb
+
+
 def _merge_into_delay_store(flights, date_str, airport='FRA'):
     """Mergt beobachtete Delays aus flights in den globalen _delay_store.
     Nur max-Wert pro Flug — nie zurücksetzen, nie aus dem Store löschen.
@@ -34860,7 +35002,15 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
         # sched ist ISO: '2026-06-06T14:30:00' → [11:16] = 'HH:MM' als Diskriminator.
         # NICHT [:5] — das würde '2026-' liefern und alle Flüge desselben Tages kollidierten.
         hhmm = sched[11:16] if len(sched) >= 16 else sched
-        key = (date_str, airport, fn, hhmm)
+        # VERKEHRSTAG statt Poll-Tag (Folgetags-Kontaminations-Fix, s. _obs_service_day):
+        # der Board-Feed listet ab 05:00 auch die frühen Flüge des Folgetags —
+        # deren Row muss unter IHREM Datum landen, nicht unter „heute".
+        row_date = _obs_service_day(
+            sched, date_str, now_local,
+            status=(f.get('status') or ''),
+            esti=(f.get('esti') if isinstance(f.get('esti'), str) else ''),
+            cancelled=bool(f.get('cancelled')))
+        key = (row_date, airport, fn, hhmm)
         delay = f.get('delay_min') or 0
         cancelled = bool(f.get('cancelled'))
         # VOLLE Felder aus dem Live-Board festhalten (von→nach, Gate, Terminal,
@@ -34945,7 +35095,7 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
                 _delay_store[key] = 0
                 changed = True
         if cancelled:
-            _delay_store[(date_str, airport, fn, hhmm + '_cancelled')] = 1
+            _delay_store[(row_date, airport, fn, hhmm + '_cancelled')] = 1
             if not _delay_store_cancelled.get(key):
                 _delay_store_cancelled[key] = True
                 changed = True
@@ -34957,7 +35107,7 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
         if changed or (meta_changed and (key in _delay_store
                                          or _delay_store_cancelled.get(key))):
             _delay_obs_write_through(
-                date_str, fn, hhmm, _delay_store.get(key, 0),
+                row_date, fn, hhmm, _delay_store.get(key, 0),
                 cancelled or bool(_delay_store_cancelled.get(key)),
                 airport, f.get('status'), merged_meta)
 
