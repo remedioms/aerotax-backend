@@ -317,7 +317,11 @@ def test_geplant_corpse_with_est_arr_becomes_landed(monkeypatch):
     arr = _now() - timedelta(hours=13)
     secs = [_sector(flight='LH893', frm='RIX', to='FRA',
                     dep_iso=_iso(dep), arr_iso=_iso(arr))]
-    facts = {'est_arr': '2026-07-15T08:15:00+02:00', 'arr_status': 'Geplant'}
+    # est_arr RELATIV zum Leg (Ankunft 15 min vor Plan) — ein hart kodiertes
+    # Datum alterte hier täglich weiter und wurde ab >24h Abstand vom neuen
+    # Facts-Physik-Gate (korrekt!) verworfen → Test kippte datumsabhängig.
+    est_arr_iso = _iso(arr - timedelta(minutes=15))
+    facts = {'est_arr': est_arr_iso, 'arr_status': 'Geplant'}
     monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: facts)
     monkeypatch.setattr(A, '_tail_recently_active', lambda r: True)
     with patch.object(A, '_flight_obs_merged',
@@ -326,7 +330,7 @@ def test_geplant_corpse_with_est_arr_becomes_landed(monkeypatch):
                              past_horizon_h=24 * 35)
     assert secs[0]['status'] == 'landed'
     # Ist-Ankunft bleibt erhalten (keine erfundene, aber die echte est_arr steht).
-    assert secs[0]['est_arr_iso'] == '2026-07-15T08:15:00+02:00'
+    assert secs[0]['est_arr_iso'] == est_arr_iso
 
 
 def test_geplant_corpse_without_est_arr_not_forced_landed(monkeypatch):
