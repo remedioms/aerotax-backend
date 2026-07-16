@@ -639,6 +639,63 @@ def test_enrich_status_raw_gated_when_flag_off():
     assert 'phase' not in secs[0]               # Engine-Block lief nicht
 
 
+def test_enrich_overnight_arr_facts_use_arrival_day_not_dep_day(monkeypatch):
+    # ÜBERNACHT-ARR-DATUM (Tibor LH455-R4, 2026-07-16): ein Nachtflug
+    # (dep gestern Abend → arr heute früh) wird über den DEP-Tag gekeyt. Der
+    # Vergangenheits-Facts-Fallback fragte `_flight_facts_from_obs` mit dem
+    # DEP-Tag ab → für einen TÄGLICHEN Flug lieferte das die Ankunft der
+    # GESTRIGEN Rotation (est_arr ~24 h VOR sched_arr) und hängte sie ans Leg.
+    # Erwartet: das Physik-Gate verwirft die Fremd-Rotations-Ankunft und die
+    # arr-seitige Neu-Abfrage am ARR-Tag liefert die RICHTIGE Ist-Ankunft.
+    # Uhr DETERMINISTISCH einfrieren (kein Wall-Clock-Flake an der UTC-Tages-
+    # grenze): fixe „jetzt" am Vormittag des ARR-Tags.
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=timezone.utc)
+
+    class _FrozenDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is None else now.astimezone(tz)
+    monkeypatch.setattr(A, 'datetime', _FrozenDT)
+
+    dep = now - timedelta(hours=13)          # gestern Abend (15.07)
+    arr = now - timedelta(minutes=95)         # heute früh (~arr_iso, 16.07)
+    dep_day = dep.strftime('%Y-%m-%d')
+    arr_day = arr.strftime('%Y-%m-%d')
+    assert dep_day != arr_day                 # Übernacht-Prämisse
+    secs = [_sector(flight='LH455', frm='SFO', to='FRA',
+                    dep_iso=_iso(dep), arr_iso=_iso(arr))]
+
+    # DEP-Tag → gestrige Rotation (bogus arr ~24 h vor der Leg-Ankunft).
+    # ARR-Tag → korrekte Ist-Ankunft nahe der Leg-Soll-Ankunft.
+    bogus_arr = _iso(arr - timedelta(hours=24))
+    good_arr = _iso(arr + timedelta(minutes=16))
+
+    def _facts(fn, date, dep_iata=None, arr_iata=None):
+        d = (date or '')[:10]
+        if d == dep_day:
+            return {'dep_status': 'Abgeflogen', 'est_dep': _iso(dep),
+                    'est_arr': bogus_arr, 'arr_status': 'Gelandet',
+                    'arr_delay_min': 12, 'sched_arr': bogus_arr, 'reg': None}
+        if d == arr_day:
+            return {'dep_status': None, 'est_dep': None, 'est_arr': good_arr,
+                    'arr_status': 'Gelandet', 'arr_delay_min': 16,
+                    'sched_arr': _iso(arr), 'reg': None}
+        return {}
+
+    import blueprints.aerox_data_blueprint as ADB
+    with patch.object(A, '_flight_obs_merged', return_value=None), \
+            patch.object(ADB, '_flight_facts_from_obs', side_effect=_facts), \
+            patch.object(A, '_board_local_to_utc_iso',
+                         side_effect=lambda v, ap: v):
+        A._enrich_leg_delays(secs, dep_day, free_only=True)
+    # Die materialisierte Ist-Ankunft ist die HEUTIGE (ARR-Tag), NICHT die
+    # gestrige (~24 h zu früh).
+    assert secs[0].get('est_arr_iso') == good_arr
+    # und sie liegt NICHT physikalisch unmöglich weit vor der Leg-Soll-Ankunft.
+    _ea = datetime.fromisoformat(secs[0]['est_arr_iso'].replace('Z', '+00:00'))
+    assert _ea >= arr - timedelta(hours=A._OVERNIGHT_ARR_MARGIN_H)
+
+
 def test_enrich_empty_and_non_list_safe():
     assert A._enrich_leg_delays([], TODAY) == []
     assert A._enrich_leg_delays(None, TODAY) is None

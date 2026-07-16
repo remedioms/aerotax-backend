@@ -31002,6 +31002,42 @@ def _profile_homebase_cached(token):
     return hb or None
 
 
+# Übernacht-ARR-Physik-Marge (Tibor LH455-R4, 2026-07-16): liegt eine
+# facts-materialisierte est_arr mehr als so viele Stunden VOR der Leg-eigenen
+# Soll-Ankunft, gehört sie zu einer FREMDEN Tagesrotation (der datums-agnostische
+# ARR-Match griff die gestrige Ankunft) → verwerfen. 6 h deckt jeden realen
+# Delay/Frühankunft ab, ohne die ~24-h-Fremd-Rotation je durchzulassen.
+_OVERNIGHT_ARR_MARGIN_H = 6
+
+
+def _gate_facts_arr_against_leg(facts, leg_arr_iso):
+    """PUR: verwirft die ARR-Seite eines `_flight_facts_from_obs`-Ergebnisses,
+    wenn dessen `est_arr` physikalisch unmöglich weit VOR der Soll-Ankunft des
+    Legs (`leg_arr_iso`) liegt — das ist die datums-agnostisch gematchte Ankunft
+    einer FREMDEN Tagesrotation (Tibor LH455-R4). Der Rest der Facts (dep-Seite,
+    reg) bleibt unangetastet. Gibt `facts` (evtl. mutiert) zurück. Wirft nie."""
+    try:
+        if not isinstance(facts, dict) or not leg_arr_iso:
+            return facts
+        _ea = facts.get('est_arr')
+        if not _ea:
+            return facts
+        _ea_dt = datetime.fromisoformat(str(_ea).replace('Z', '+00:00'))
+        _la_dt = datetime.fromisoformat(str(leg_arr_iso).replace('Z', '+00:00'))
+        if _ea_dt.tzinfo is None:
+            _ea_dt = _ea_dt.replace(tzinfo=timezone.utc)
+        if _la_dt.tzinfo is None:
+            _la_dt = _la_dt.replace(tzinfo=timezone.utc)
+        if _ea_dt < _la_dt - timedelta(hours=_OVERNIGHT_ARR_MARGIN_H):
+            # Fremd-Rotations-Ankunft: arr-Seite verwerfen (dep/reg behalten).
+            for _k in ('est_arr', 'arr_delay_min', 'arr_status',
+                       'arr_gate', 'arr_terminal'):
+                facts[_k] = None
+        return facts
+    except Exception:
+        return facts
+
+
 def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                        past_horizon_h=30):
     """Reichert die Pro-Leg-Sektoren EINES Roster-Tages (ical_sectors[]) IN PLACE
@@ -31116,8 +31152,34 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
             except Exception:
                 leg_date = None
         leg_date = leg_date or (str(date or '')[:10] or None)
+        # MITTERNACHTS-LÜCKE (Flake test_friend_roster_free_only…, 2026-07-16):
+        # ein Leg, das kurz VOR UTC-Mitternacht abflog und noch in der Luft ist
+        # (dep < now < arr), hat einen leg_date = GESTERN (aus dep_iso), während das
+        # LIVE-Board an beiden Enden HEUTE ist. `_flight_obs_merged` gated seinen
+        # Live-Free-Board-Scan über `_is_today_at(date_q)` → mit date=gestern lief
+        # er GAR NICHT und der aktive Flug bekam 00:00–00:14 UTC keine Anreicherung
+        # (delay/status/tail = None). Für ein JETZT laufendes Leg das Live-Datum
+        # neutralisieren (date=None → Board wird gescannt); der datums-gezielte
+        # SB-Read pro Airport nutzt intern weiter `_airport_local_now`, bleibt also
+        # korrekt. Nur der Live-Scan-Gate wird geöffnet — kein Mehr-Spend
+        # (free_only unverändert). Fenster wie _active_sector_flight_numbers.
+        _merge_date = leg_date
         try:
-            m = _flight_obs_merged(op_fn, date=leg_date, dep_iata=frm,
+            _arr_dt = None
+            _ar = s.get('arr_iso')
+            if _ar:
+                _arr_dt = datetime.fromisoformat(str(_ar).replace('Z', '+00:00'))
+                if _arr_dt.tzinfo is None:
+                    _arr_dt = _arr_dt.replace(tzinfo=timezone.utc)
+            if (dep_dt is not None and _arr_dt is not None
+                    and dep_dt - timedelta(minutes=15) <= now
+                    <= _arr_dt + timedelta(minutes=10)
+                    and leg_date != now.strftime('%Y-%m-%d')):
+                _merge_date = None
+        except Exception:
+            _merge_date = leg_date
+        try:
+            m = _flight_obs_merged(op_fn, date=_merge_date, dep_iata=frm,
                                    arr_iata=to, live=True, free_only=free_only)
         except Exception:
             m = None
@@ -31148,6 +31210,46 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 _fc = _facts_from_obs(op_fn, leg_date, dep_iata=frm, arr_iata=to)
                 if isinstance(_fc, dict) and _fc:
                     _facts = _fc
+                # ── ÜBERNACHT-ARR-DATUM (Tibor LH455-R4, 2026-07-16) ──────────
+                # Ein Nachtflug (dep 15.07 abends → arr 16.07 08:25) wird über
+                # den DEP-Tag (15.07) gekeyt. `_flight_facts_from_obs` matcht
+                # die ARR-Row datums-genau am Tages-Key → für date=15 lieferte es
+                # die Ankunft der GESTRIGEN Rotation (est_arr 15.07 08:39) und
+                # hängte sie ans heutige Leg → est_arr lag ~24 h VOR sched_arr.
+                # Physik-Gate: liegt die facts-est_arr mehr als
+                # _OVERNIGHT_ARR_MARGIN_H VOR der Leg-eigenen Soll-Ankunft
+                # (arr_iso), ist es eine Fremd-Rotation → die arr-Seite verwerfen
+                # und, wenn das Leg tatsächlich über Nacht geht, mit dem ARR-Tag
+                # (arr_iso-Datum) neu abfragen. Nie eine implausible Ist-Ankunft
+                # ans Leg hängen. Wirft nie.
+                _facts = _gate_facts_arr_against_leg(_facts, s.get('arr_iso'))
+                _arr_day = None
+                try:
+                    _ar = s.get('arr_iso')
+                    if _ar:
+                        _adt = datetime.fromisoformat(
+                            str(_ar).replace('Z', '+00:00'))
+                        if _adt.tzinfo is None:
+                            _adt = _adt.replace(tzinfo=timezone.utc)
+                        _arr_day = _adt.strftime('%Y-%m-%d')
+                except Exception:
+                    _arr_day = None
+                if (_arr_day and leg_date and _arr_day != leg_date
+                        and (not _facts or not _facts.get('est_arr'))):
+                    _fc2 = _facts_from_obs(op_fn, _arr_day,
+                                           dep_iata=frm, arr_iata=to)
+                    _fc2 = _gate_facts_arr_against_leg(_fc2, s.get('arr_iso'))
+                    if isinstance(_fc2, dict) and _fc2 and _fc2.get('est_arr'):
+                        # ARR-Tag-Row bringt die richtige Ist-Ankunft; die DEP-Tag-
+                        # Facts (dep-Seite) bleiben Vorrang für dep_*/reg, die arr-
+                        # Seite kommt aus _fc2 (Lücken-Merge, nie überschreiben).
+                        if not _facts:
+                            _facts = _fc2
+                        else:
+                            for _ak in ('est_arr', 'arr_delay_min', 'arr_status',
+                                        'sched_arr', 'arr_gate', 'arr_terminal'):
+                                if _facts.get(_ak) is None and _fc2.get(_ak) is not None:
+                                    _facts[_ak] = _fc2.get(_ak)
             except Exception:
                 _facts = None
         if m is None:

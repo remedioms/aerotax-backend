@@ -428,7 +428,19 @@ def test_friend_roster_carries_live_fields_free_only_once(client, monkeypatch):
 def test_friend_roster_free_only_never_calls_paid_board(client, monkeypatch):
     tok = 'MYTOKEN'
     friend = 'FREEONLYFRIEND'
-    now = _now()
+    # Uhr DETERMINISTISCH einfrieren (2026-07-16): mit echtem _now() kippte der
+    # Test zwischen 00:00–00:14 UTC — der aktive Leg (dep now−15 min) fiel dann auf
+    # GESTERN, der leg_date-gegatete Live-Board-Scan lief nicht und Anreicherung =
+    # None. Das war ein ECHTER Produkt-Bug (Mitternachts-Lücke), jetzt gefixt (s.
+    # _enrich_leg_delays _merge_date-Neutralisierung für laufende Legs). Hier fest
+    # auf 00:05 UTC einfrieren, damit genau dieses Nacht-Fenster mitgeprüft wird.
+    now = datetime(2026, 7, 16, 0, 5, tzinfo=timezone.utc)
+
+    class _FrozenDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is None else now.astimezone(tz)
+    monkeypatch.setattr(A, 'datetime', _FrozenDT)
     today = now.date().isoformat()
     day = {
         'datum': today, 'klass': 'Z72', 'routing': 'FRA-MUC',
