@@ -31793,6 +31793,99 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         s['obs_sides'] = m.get('sides')
         if op_fn != fn and 'also_as' not in s:
             s['also_as'] = raw_fn        # gefaltete Marketing-Nummer bewahren
+    # ── KETTEN-LANDUNG (Owner/Fable 2026-07-16, Sebastian LH880 FRA→TLL) ──────
+    # Wer den FOLGEFLUG derselben Rotation fliegt, ist mit dem vorherigen
+    # gelandet. Tallinn (TLL) wird nie geharvestet → LH880 FRA→TLL bekommt keine
+    # Ankunfts-Beobachtung und klebt bis zur 6h-Überfällig-Regel auf „Abgeflogen".
+    # ABER der BEWEIS ist längst da: LH881 TLL→FRA (der nächste Sektor derselben
+    # Tages-Liste) ist bereits abgeflogen. Ein Sektor, der NACHWEISLICH den Boden
+    # verlassen hat, beweist die Landung des unmittelbar vorausgehenden Sektors.
+    #
+    # BEWEIS-SCHWELLE (Verspätungs-Realität): der spätere Sektor gilt nur als
+    # abgeflogen bei ECHTEM Signal — Status-Bucket airborne/landed ODER eine
+    # BEOBACHTETE est_dep in der Vergangenheit —, NICHT bloß weil seine Planzeit
+    # vorbei ist (er könnte selbst noch verspätet am Boden stehen).
+    #
+    # PHYSISCHER GUARD: nur wenn der spätere Sektor am selben Airport STARTET, an
+    # dem der frühere ANKOMMT (arr == nächster dep) — dann ist die Kette zwingend
+    # (dieselbe Person/Maschine musste erst landen). Sonst Regel NICHT anwenden.
+    #
+    # KEINE erfundene Ist-Zeit: nur `status='landed'`, est_arr bleibt wie es ist
+    # (leer wenn unbeobachtet). Cancelled wird NIE gelandet. Der frühere Sektor
+    # muss aktuell in einem NICHT-terminalen Bucket hängen (airborne/grounded/None).
+    #
+    # NACH dem Engine-Override (dieser Block läuft nach der GESAMTEN Enrichment-
+    # Schleife, wenn jeder Sektor seinen finalen `status`/`est_dep_iso` hat) → kein
+    # Engine-Block dreht die Ketten-Landung mehr zurück. Es wird KEIN Extra-Key an
+    # den Sektor gehängt (Golden-/Byte-Kompatibilität), nur `status='landed'`.
+    try:
+        def _dep_instant(_sec):
+            # frühester ECHTER Ist-Abflug (est_dep_iso, schon UTC) vor Plan-dep_iso;
+            # als UTC-datetime zum Vergleich der Reihenfolge (nicht Listen-Index —
+            # Über-Mitternacht-Sicherheit).
+            for _c in (_sec.get('est_dep_iso'), _sec.get('dep_iso')):
+                if not _c:
+                    continue
+                try:
+                    _d = datetime.fromisoformat(str(_c).replace('Z', '+00:00'))
+                    if _d.tzinfo is None:
+                        _d = _d.replace(tzinfo=timezone.utc)
+                    return _d
+                except Exception:
+                    continue
+            return None
+
+        def _observed_departed(_sec):
+            # ECHTER Abflug-Beweis: Status-Bucket airborne/landed ODER beobachtete
+            # est_dep_iso in der Vergangenheit. NICHT: bloß Planzeit vorbei.
+            _b = _flight_status_bucket(_sec.get('status'))
+            if _b in ('airborne', 'landed'):
+                return True
+            _ed = _sec.get('est_dep_iso')
+            if _ed:
+                try:
+                    _d = datetime.fromisoformat(str(_ed).replace('Z', '+00:00'))
+                    if _d.tzinfo is None:
+                        _d = _d.replace(tzinfo=timezone.utc)
+                    if _d <= now:
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        # Sektoren mit gültigem dep-Instant chronologisch (dep-Instant, nicht Index).
+        _ordered = []
+        for _sec in sectors:
+            if not isinstance(_sec, dict):
+                continue
+            _di = _dep_instant(_sec)
+            if _di is not None:
+                _ordered.append((_di, _sec))
+        _ordered.sort(key=lambda p: p[0])
+        for _i, (_di, _sec) in enumerate(_ordered):
+            if _sec.get('cancelled'):
+                continue
+            _bucket = _flight_status_bucket(_sec.get('status'))
+            if _bucket == 'landed':
+                continue        # schon terminal
+            if _bucket not in ('airborne', 'grounded', None):
+                continue
+            _arr = str(_sec.get('to') or '').strip().upper()
+            if len(_arr) != 3 or not _arr.isalpha():
+                continue
+            # ein SPÄTERER Sektor (dep-Instant > dieser), der am selben Airport
+            # startet UND nachweislich abgeflogen ist → Landung dieses Sektors.
+            for _dj, _later in _ordered[_i + 1:]:
+                if _dj <= _di:
+                    continue
+                _ldep = str(_later.get('from') or '').strip().upper()
+                if _ldep != _arr:
+                    continue        # physischer Guard: arr == nächster dep
+                if _observed_departed(_later):
+                    _sec['status'] = 'landed'
+                    break
+    except Exception:
+        pass        # Ketten-Regel best-effort, nie werfend
     # Rückflug-Turnaround erbt den Tail — mit ECHTER Homebase, wo der Caller sie
     # kennt (Audit 2026-07-05: Proxy allein ließ am Rückreisetag einen Homebase-
     # Hub-Turnaround durch, vom Owner explizit verboten).

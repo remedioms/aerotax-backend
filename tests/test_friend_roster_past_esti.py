@@ -415,3 +415,129 @@ def test_facts_landing_future_est_arr_does_not_flip(monkeypatch):
         A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'),
                              past_horizon_h=24 * 35)
     assert secs[0]['status'] != 'landed'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX D — KETTEN-LANDUNG (Sebastian LH880 FRA→TLL, Owner-Screenshot 2026-07-16):
+# Tallinn (TLL) wird nie geharvestet → LH880 FRA→TLL bekommt keine Ankunfts-Obs
+# und klebt auf „Abgeflogen". Aber der Folgeflug LH881 TLL→FRA (nächster Sektor
+# derselben Tages-Liste) ist bereits abgeflogen ⇒ der frühere Sektor MUSS gelandet
+# sein. `_flight_obs_merged` wird pro Sektor über dep_iata (`from`) gemockt.
+# ══════════════════════════════════════════════════════════════════════════════
+def _obs_by_from(mapping):
+    """side_effect-Fabrik: dep_iata (`from`) → gemergter Record.
+    `mapping` = {'FRA': _merged(...), 'TLL': _merged(...)}."""
+    def _fn(flight_no, date=None, dep_iata=None, arr_iata=None,
+            live=True, free_only=False, arr_date=None):
+        return mapping.get((dep_iata or '').upper())
+    return _fn
+
+
+def test_chain_landing_next_leg_departed_forces_landed(monkeypatch):
+    # Sektor1 FRA→TLL 'Abgeflogen' ohne arr-Obs, Sektor2 TLL→FRA 'Abgeflogen'
+    # (echter Beweis) ⇒ Sektor1 landed. arr==nächster dep (TLL) erfüllt.
+    dep1 = _now() - timedelta(hours=4)
+    arr1 = _now() - timedelta(hours=3)
+    dep2 = _now() - timedelta(hours=2)
+    secs = [_sector(flight='LH880', frm='FRA', to='TLL',
+                    dep_iso=_iso(dep1), arr_iso=_iso(arr1)),
+            _sector(flight='LH881', frm='TLL', to='FRA', dep_iso=_iso(dep2))]
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {})
+    with patch.object(A, '_flight_obs_merged',
+                      side_effect=_obs_by_from({
+                          'FRA': _merged(delay_known=False, status='Abgeflogen'),
+                          'TLL': _merged(delay_known=False, status='Abgeflogen'),
+                      })):
+        A._enrich_leg_delays(secs, dep1.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] == 'landed'
+    # keine erfundene Ist-Ankunft am unbeobachteten TLL.
+    assert secs[0].get('est_arr_iso') is None
+
+
+def test_chain_landing_next_leg_only_schedule_past_no_proof(monkeypatch):
+    # Sektor2 ist NICHT nachweislich abgeflogen (Status 'Geplant', keine est_dep,
+    # nur Planzeit vorbei) ⇒ Sektor1 bleibt unverändert (kein Beweis).
+    dep1 = _now() - timedelta(hours=4)
+    arr1 = _now() - timedelta(hours=3)
+    dep2 = _now() - timedelta(minutes=30)
+    secs = [_sector(flight='LH880', frm='FRA', to='TLL',
+                    dep_iso=_iso(dep1), arr_iso=_iso(arr1)),
+            _sector(flight='LH881', frm='TLL', to='FRA', dep_iso=_iso(dep2))]
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {})
+    with patch.object(A, '_flight_obs_merged',
+                      side_effect=_obs_by_from({
+                          'FRA': _merged(delay_known=False, status='Abgeflogen'),
+                          'TLL': _merged(delay_known=False, status='Geplant'),
+                      })):
+        A._enrich_leg_delays(secs, dep1.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] != 'landed'
+
+
+def test_chain_landing_requires_airport_match(monkeypatch):
+    # Sektor2 startet an ANDEREM Airport (RIX statt TLL) als Sektor1 ankommt ⇒
+    # physischer Guard verhindert die Ketten-Landung (keine zwingende Kette).
+    dep1 = _now() - timedelta(hours=4)
+    arr1 = _now() - timedelta(hours=3)
+    dep2 = _now() - timedelta(hours=2)
+    secs = [_sector(flight='LH880', frm='FRA', to='TLL',
+                    dep_iso=_iso(dep1), arr_iso=_iso(arr1)),
+            _sector(flight='LH881', frm='RIX', to='FRA', dep_iso=_iso(dep2))]
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {})
+    with patch.object(A, '_flight_obs_merged',
+                      side_effect=_obs_by_from({
+                          'FRA': _merged(delay_known=False, status='Abgeflogen'),
+                          'RIX': _merged(delay_known=False, status='Abgeflogen'),
+                      })):
+        A._enrich_leg_delays(secs, dep1.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] != 'landed'
+
+
+def test_chain_landing_cancelled_never_landed(monkeypatch):
+    # Sektor1 cancelled ⇒ nie landed, auch wenn der Folgeflug abgeflogen ist.
+    dep1 = _now() - timedelta(hours=4)
+    arr1 = _now() - timedelta(hours=3)
+    dep2 = _now() - timedelta(hours=2)
+    secs = [_sector(flight='LH880', frm='FRA', to='TLL',
+                    dep_iso=_iso(dep1), arr_iso=_iso(arr1)),
+            _sector(flight='LH881', frm='TLL', to='FRA', dep_iso=_iso(dep2))]
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {})
+    with patch.object(A, '_flight_obs_merged',
+                      side_effect=_obs_by_from({
+                          'FRA': _merged(delay_known=False, status='airborne',
+                                         cancelled=True),
+                          'TLL': _merged(delay_known=False, status='Abgeflogen'),
+                      })):
+        A._enrich_leg_delays(secs, dep1.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] != 'landed'
+    assert secs[0]['cancelled'] is True
+
+
+def test_chain_landing_survives_engine_override(monkeypatch):
+    # Wie der Live-Fall: mit aktivem Engine-Block darf die Engine-Projektion die
+    # Ketten-Landung nicht auf 'airborne' zurückdrehen (der Block läuft NACH dem
+    # Engine-Override der gesamten Schleife).
+    dep1 = _now() - timedelta(hours=4)
+    arr1 = _now() - timedelta(hours=3)
+    dep2 = _now() - timedelta(hours=2)
+    secs = [_sector(flight='LH880', frm='FRA', to='TLL',
+                    dep_iso=_iso(dep1), arr_iso=_iso(arr1)),
+            _sector(flight='LH881', frm='TLL', to='FRA', dep_iso=_iso(dep2))]
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {})
+    monkeypatch.setenv('FLIGHTSTATE_LIVE_FRIENDS', '1')
+    import blueprints.flight_state as FS
+    monkeypatch.setattr(FS, 'project_friend_leg',
+                        lambda fs: {'status': 'EN_ROUTE'})
+    import blueprints.warehouse_reader as WR
+    monkeypatch.setitem(WR._ENGINE_PHASE_TO_LEGACY, 'EN_ROUTE', 'airborne')
+    with patch.object(A, '_flight_obs_merged',
+                      side_effect=_obs_by_from({
+                          'FRA': _merged(delay_known=False, status='Abgeflogen'),
+                          'TLL': _merged(delay_known=False, status='Abgeflogen'),
+                      })):
+        A._enrich_leg_delays(secs, dep1.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] == 'landed'
