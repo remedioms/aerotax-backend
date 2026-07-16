@@ -12295,6 +12295,101 @@ def delete_friend_group(token, group_id):
     return jsonify({'ok': True})
 
 
+def _friend_group_row_by_id(group_id):
+    """Lädt die Gruppen-Zeile GLOBAL per `id` aus user_friend_groups (owner_token,
+    name, members). Die Gruppe liegt in der Friend-Group-Zeile ihres OWNERs — ein
+    per-Code beigetretenes Mitglied findet sie NICHT über den eigenen Token, daher
+    der id-basierte Lookup (identisch zum Push-Fanout, app.py ~24885)."""
+    if not (SB_AVAILABLE and sb is not None and group_id):
+        return None
+    try:
+        r = (sb.table('user_friend_groups')
+             .select('id,owner_token,name,members')
+             .eq('id', group_id).limit(1).execute())
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        app.logger.warning(
+            f'[fgroups] row_by_id_fail gid={group_id} err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+@app.route('/api/user/friend-groups/<token>/<group_id>/add-member', methods=['POST'])
+def add_member_to_group(token, group_id):
+    """Fügt EINE Person direkt zu einer Layover-Gruppe hinzu (Zweck-Gruppe auf Zeit
+    — KEINE Freundschaft als Voraussetzung, KEINE Freundschafts-Anfrage).
+
+    Body: {"target_token": "AT-…"}.
+
+    Regeln:
+    - Der Aufrufer (`token`, per BUG-004-Gate an den Bearer gebunden) MUSS selbst
+      Mitglied der Gruppe sein — Owner ODER in `members` (Capability-Modell: wer
+      via Code/QR beigetreten ist, steht spätestens nach dem ersten Post in
+      `members`, siehe Push-Fanout). Sonst 403.
+    - Das Ziel darf KEIN Family-Konto sein (Family-Pairing läuft über einen
+      anderen Pfad) → 400 `family_account_not_addable`.
+    - Idempotent: schon Mitglied ⇒ ok.
+    - Die Gruppe erscheint beim Hinzugefügten über denselben Mechanismus wie beim
+      Code-Beitritt (Push mit `type=group_added` + Invite-Code → das Gerät joint
+      lokal via JoinedGroupsStore). Er kann sie jederzeit verlassen.
+    """
+    body = request.get_json(silent=True) or {}
+    target = (body.get('target_token') or '').strip()
+    if not target:
+        return jsonify({'ok': False, 'error': 'target_token_required'}), 400
+    if target == token:
+        # Sich selbst hinzufügen ist ein No-Op-Erfolg (man ist bereits drin).
+        return jsonify({'ok': True, 'already_member': True})
+
+    row = _friend_group_row_by_id(group_id)
+    if not row:
+        return jsonify({'ok': False, 'error': 'group_not_found'}), 404
+
+    owner_token = row.get('owner_token') or ''
+    members = [m for m in (row.get('members') or []) if isinstance(m, str)]
+
+    # Aufrufer muss Mitglied sein (Owner oder in members).
+    if token != owner_token and token not in members:
+        return jsonify({'ok': False, 'error': 'not_a_member'}), 403
+
+    # Ziel darf kein Family-Konto sein.
+    if _is_family_account(target):
+        return jsonify({'ok': False, 'error': 'family_account_not_addable',
+                        'message': 'Familien-Konten können nicht hinzugefügt werden.'}), 400
+
+    already = (target == owner_token) or (target in members)
+    if not already:
+        new_members = members + [target]
+        try:
+            if SB_AVAILABLE and sb is not None:
+                sb.table('user_friend_groups').update(
+                    {'members': new_members}).eq('id', group_id).execute()
+        except Exception as e:
+            app.logger.error(
+                f'[fgroups] add_member_fail gid={group_id} err={type(e).__name__}: {str(e)[:200]}')
+            return jsonify({'ok': False, 'error': 'add_failed'}), 503
+
+    group_name = (row.get('name') or '').strip() or 'Layover-Chat'
+    # Best-effort Push: „X hat dich hinzugefügt" + Invite-Code, damit das Gerät des
+    # Hinzugefügten die Gruppe lokal joint (kein server-seitiges Group-Listing).
+    if not already:
+        try:
+            adder_name = ((_profile_load(token) or {}).get('profile') or {}).get('name') or 'Crew'
+            _push_outbox_enqueue(
+                target,
+                'Layover-Chat',
+                f'{adder_name} hat dich zu „{group_name}" hinzugefügt.',
+                data={'type': 'group_added', 'group_id': group_id,
+                      'group_name': group_name},
+                thread_id=f'group__{group_id}',
+                idempotency_key=f'group-added:{group_id}:{_push_token_ref(target)}')
+        except Exception:
+            pass
+
+    return jsonify({'ok': True, 'group_id': group_id, 'group_name': group_name,
+                    'already_member': bool(already)})
+
+
 @app.route('/api/user/friends-homebases/<token>', methods=['GET'])
 def get_friends_homebases(token):
     """OffBlock-Pattern: Liste Friends gruppiert nach Homebase.
