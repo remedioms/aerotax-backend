@@ -30562,6 +30562,20 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
             bf = None
         if not bf:
             return
+        # BETRIEBSTAG-GATE für den Live-Scan (Nico LH423 2026-07-16): das Live-
+        # Board zeigt mittags bereits den MORGIGEN Lauf derselben täglichen
+        # Flugnummer („Geplant", sched=17.07 06:50) — der wurde hier ungeprüft
+        # als arr_row übernommen und verdrängte die echte Landung des heutigen
+        # Laufs aus dem Warehouse (arr_date-Read kam nie dran, weil arr_row
+        # schon belegt war). Trägt die Board-Row ein VOLLES sched-Datum
+        # (Fraport tut das), muss es zum angefragten Betriebstag passen —
+        # sonst ist es eine fremde Instanz. Bare HH:MM bleibt ungeprüft (kein
+        # Datum vorhanden → altes Verhalten).
+        _want_day = day or date_q
+        _bsched = str(bf.get('sched') or '').strip()
+        if (_want_day and len(_bsched) >= 10 and _bsched[4:5] == '-'
+                and _bsched[:10] != _want_day):
+            return
         if bf.get('_arr'):
             if arr_row is None:
                 arr_row, arr_src = dict(bf), 'live'
