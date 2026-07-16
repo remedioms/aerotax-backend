@@ -37,6 +37,12 @@ _APPROACH_PH = (("final", "approach"), ("on", "final"), ("im", "anflug"))
 _LANDED_TOK = frozenset(("landed", "gelandet", "arrived", "angekommen",
                          "aufgesetzt", "baggage", "gepaeck", "deboard",
                          "deboarding", "ausstieg"))
+# Deutsche KOMPOSITA (Sebastian LH1139 2026-07-16): „Gepäckausgabe beendet"
+# tokenisiert zu 'gepaeckausgabe' — das exakte Token 'gepaeck' matchte NIE.
+# Die Engine sah dadurch keine Landung, blieb auf TAXI_OUT (dep-'Abgeflogen')
+# und der Kalender-Sektor stand als 'grounded'/„Erwartet", obwohl Roh-Status
+# und Facts die Landung längst trugen. Präfix-Stämme fangen die Komposita.
+_LANDED_PREFIX = ("gepaeck", "baggage", "deboard", "ausstieg")
 _LANDED_PH = (("at", "gate"), ("am", "gate"), ("on", "block"), ("on", "blocks"))
 # taxi/off-block tokens — side decides meaning (dep = TAXI_OUT, arr = LANDED/taxiing in).
 _TAXI_TOK = frozenset(("taxi", "taxiing", "rollt", "rolling", "pushback"))
@@ -93,7 +99,8 @@ def classify_board_status(status, side: str):
     # "Departed"/TAXI_OUT signal for the same leg.
     if ts & _APPROACH_TOK or _has_phrase(toks, _APPROACH_PH):
         return APPROACH, True, True
-    if ts & _LANDED_TOK or _has_phrase(toks, _LANDED_PH):
+    if (ts & _LANDED_TOK or _has_phrase(toks, _LANDED_PH)
+            or any(t.startswith(_LANDED_PREFIX) for t in toks)):
         # arr-side landed is authoritative; dep-side 'landed' is nonsensical -> ignore
         return (LANDED, True, False) if side == "arr" else (None, False, False)
     # taxi / off-block: dep side -> TAXI_OUT, arr side -> taxiing in after landing.

@@ -254,3 +254,14 @@ def test_build_keys_derives_sched_dep_ts():
     k2 = build_keys("LH2557", "2026-07-09", "FRA", "GVA",
                     sched_dep_iso=dep_iso, sched_dep_ts=123.0)
     assert k2["sched_dep_ts"] == 123.0
+
+
+def test_gepaeckausgabe_kompositum_ist_landung():
+    # Sebastian LH1139 (2026-07-16): 'Gepäckausgabe beendet' tokenisiert zu
+    # 'gepaeckausgabe' — das exakte Token 'gepaeck' matchte nie, die Engine
+    # blieb auf TAXI_OUT und der Kalender-Sektor stand als „Erwartet".
+    from blueprints.flight_state import LANDED
+    assert classify_board_status("Gepäckausgabe beendet", "arr") == (LANDED, True, False)
+    assert classify_board_status("Gepäckausgabe", "arr") == (LANDED, True, False)
+    # dep-seitig bleibt ein Landed-Wort bedeutungslos (kein Rueckwaerts-Signal).
+    assert classify_board_status("Gepäckausgabe beendet", "dep") == (None, False, False)
