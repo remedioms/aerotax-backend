@@ -31601,6 +31601,29 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                     _stale_forced_landed = True
         except Exception:
             pass
+        # (C) BEOBACHTETE FACTS-LANDUNG SOFORT (Sebastian LH1139 2026-07-16):
+        # der Live-Merge trug mittags nur noch die dep-Seite ('Boarding' vom
+        # Morgen — das Live-Board rotiert gelandete Flüge raus), die
+        # persistenten Facts aber eine ankunfts-plausible Landung
+        # ('Gepäckausgabe beendet') MIT Ist-Ankunft in der Vergangenheit.
+        # Das ist eine BEOBACHTETE Landung — sie darf nicht 6 h auf die
+        # Überfällig-Regel warten (Sektor stand bis dahin als 'grounded' =
+        # iOS „Erwartet"). Cancelled schlägt weiterhin alles.
+        if not _stale_forced_landed and not s.get('cancelled'):
+            try:
+                _fa_st = (_facts or {}).get('arr_status')
+                if _fa_st and _flight_status_bucket(_fa_st) == 'landed':
+                    _ea_raw = s.get('est_arr_iso') or (_facts or {}).get('est_arr')
+                    if _ea_raw:
+                        _ea_dt = datetime.fromisoformat(
+                            str(_ea_raw).replace('Z', '+00:00'))
+                        if _ea_dt.tzinfo is None:
+                            _ea_dt = _ea_dt.replace(tzinfo=timezone.utc)
+                        if _ea_dt <= now:
+                            _raw_status = 'landed'
+                            _stale_forced_landed = True
+            except Exception:
+                pass
         # Physik-Schranken-Inputs vorab binden (auch der Engine-Block unten liest
         # sie): so bleibt der Feinschliff-1-Status-Gate auch dann definiert, wenn
         # der Import unten scheitert (fail-open statt NameError).

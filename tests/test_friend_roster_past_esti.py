@@ -378,3 +378,40 @@ def test_stale_landed_survives_engine_override_lh890(monkeypatch):
                              past_horizon_h=24 * 35)
     # Ohne den FIX-B-Guard würde 'airborne' die Stale-Landung überschreiben.
     assert secs[0]['status'] == 'landed'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX C — Beobachtete Facts-Landung SOFORT (Sebastian LH1139 2026-07-16):
+# Merge nur dep-Seite ('Boarding' vom Morgen), Facts liefern 'Gepäckausgabe
+# beendet' + Ist-Ankunft 2h in der Vergangenheit → landed OHNE 6h-Wartezeit.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_facts_landing_flips_immediately_without_overdue(monkeypatch):
+    dep = _now() - timedelta(hours=5)
+    arr = _now() - timedelta(hours=2)
+    secs = [_sector(flight='LH1139', frm='BCN', to='FRA',
+                    dep_iso=_iso(dep), arr_iso=_iso(arr))]
+    est_arr_iso = _iso(arr - timedelta(minutes=16))
+    facts = {'est_arr': est_arr_iso, 'arr_status': 'Gepäckausgabe beendet'}
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: facts)
+    monkeypatch.setattr(A, '_tail_recently_active', lambda r: True)
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=False, status='Boarding')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] == 'landed'
+
+
+def test_facts_landing_future_est_arr_does_not_flip(monkeypatch):
+    # Gegenprobe: Facts-Landed-Status, aber Ist-Ankunft laege in der ZUKUNFT
+    # (Datenmuell) → NICHT auf landed zwingen.
+    dep = _now() - timedelta(hours=1)
+    arr = _now() + timedelta(hours=2)
+    secs = [_sector(flight='LH1139', frm='BCN', to='FRA',
+                    dep_iso=_iso(dep), arr_iso=_iso(arr))]
+    facts = {'est_arr': _iso(arr), 'arr_status': 'Gepäckausgabe beendet'}
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: facts)
+    with patch.object(A, '_flight_obs_merged',
+                      return_value=_merged(delay_known=False, status='Boarding')):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'),
+                             past_horizon_h=24 * 35)
+    assert secs[0]['status'] != 'landed'
