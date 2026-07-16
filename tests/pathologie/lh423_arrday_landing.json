@@ -1,0 +1,31 @@
+{
+  "id": "LH423_ARRDAY",
+  "titel": "Übernacht-Leg: ARR-Seite muss vom ANKUNFTSTAG gelesen werden (Nico LH423 BOS→FRA)",
+  "beschreibung": "Ein Übernacht-Leg keyt am ABFLUGTAG (15.07). Der Merge mit date=15 findet am Ziel (FRA#ARR) die gleichnamige Row des ABFLUGTAGS — bei Übernacht-Legs strukturell die FALSCHE Instanz (die gestrige Rotation: esti 07:44 'Geplant', eine Folgetags-Kontamination). Die echte Landung steht am ANKUNFTSTAG (16.07): esti 08:16 'baggage delivery', +86. Mit arr_date=16 liest die arr-Seite vom Ankunftstag → est_arr=08:16, status landed-bucket, delay 86. Der date-15-'Geplant'-Kontaminat wird von der Ankunftstags-Row verdrängt. Betrachtet am 16.07 nach der Landung.",
+  "query_dep_date": "2026-07-15",
+  "query_arr_date": "2026-07-16",
+  "airport_now_iso": "2026-07-16T11:59:00Z",
+  "query": {"flight": "LH423", "dep_iata": "BOS", "arr_iata": "FRA"},
+  "sb_rows": {
+    "BOS|2026-07-15": [
+      {"flight": "LH423", "dest_iata": "FRA", "sched": "17:45", "esti": null, "max_delay_min": 0, "cancelled": false, "status": "On Time", "reg": null}
+    ],
+    "FRA#ARR|2026-07-15": [
+      {"flight": "LH423", "dest_iata": "BOS", "sched": "06:50", "esti": "2026-07-15T07:44:00+02:00", "max_delay_min": 54, "cancelled": false, "status": "Geplant", "reg": null}
+    ]
+  },
+  "store_rows": {
+    "FRA#ARR": [
+      {"flight": "LH423", "dest_iata": "BOS", "sched": "06:50", "esti": "2026-07-16T08:16:00+02:00", "delay_min": 86, "delay_known": true, "cancelled": false, "status": "baggage delivery", "reg": "D-AIXA"}
+    ]
+  },
+  "merged_arrday_invarianten": {
+    "est_arr_iso": "2026-07-16T06:16:00Z",
+    "arr_delay_min": 86,
+    "delay_min": 86,
+    "delay_side": "arr",
+    "reg": "D-AIXA"
+  },
+  "merged_arrday_status_enthaelt": ["baggage", "landed", "gelandet", "arrived"],
+  "merged_depday_only_abwesend_est_arr": true
+}

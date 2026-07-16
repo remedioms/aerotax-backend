@@ -30466,7 +30466,7 @@ _FLIGHT_MERGE_TTL = 90
 
 
 def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
-                       live=True, free_only=False):
+                       live=True, free_only=False, arr_date=None):
     """EIN gemergter Record für einen Flug aus ALLEN verfügbaren Beobachtungen
     beider Seiten:
       • dep-Seite: Live-Board + Warehouse (airport_delay_obs) am ABFLUG-Flughafen
@@ -30478,6 +30478,15 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
 
     Args:
       date:      'YYYY-MM-DD' oder None (= heute am jeweiligen Flughafen).
+      arr_date:  ÜBERNACHT-LEG (Owner/Fable 2026-07-16, Nico LH423 BOS→FRA): der
+                 Betriebstag der ANKUNFTS-Seite, wenn er vom Abflugtag ABWEICHT
+                 (dep 15.07 abends → arr 16.07 früh). Ohne diesen Parameter keyt der
+                 gesamte Merge am Abflugtag (`date`) und die arr-Seite findet die
+                 gleichnamige, aber FALSCHE date-Row der gestrigen Rotation
+                 (esti 07:44 'Geplant' statt der echten date+1-Landung 08:16
+                 'baggage delivery'). Ist `arr_date` gesetzt und ≠ `date`, wird die
+                 arr-Seite (Live-Board-Gate UND Warehouse-Read) vom ANKUNFTSTAG
+                 gelesen; die dep-Seite bleibt am Abflugtag. None = altes Verhalten.
       dep_iata / arr_iata: bekannte Seiten; fehlt eine, wird sie best-effort aus
                  der gefundenen Gegenseite abgeleitet (Board-Row dest_iata).
       live:      False = nur Warehouse (kein Board-Scan).
@@ -30507,31 +30516,44 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
     dep = _norm_ap(dep_iata)
     arr = _norm_ap(arr_iata)
     date_q = (date or '').strip()[:10] or None
-    ckey = (fn, date_q or '', dep or '', arr or '', bool(live), bool(free_only))
+    # ÜBERNACHT-ANKUNFTSTAG (Nico LH423): eigener Betriebstag für die arr-Seite.
+    # Nur wirksam, wenn explizit gesetzt UND vom Abflugtag verschieden — sonst
+    # bleibt die arr-Seite exakt wie bisher an `date_q` gekeyt (kein Verhalten
+    # geändert für Nicht-Übernacht-Legs).
+    date_arr_q = (arr_date or '').strip()[:10] or None
+    if date_arr_q == date_q:
+        date_arr_q = None
+    ckey = (fn, date_q or '', dep or '', arr or '', bool(live), bool(free_only),
+            date_arr_q or '')
     hit = _FLIGHT_MERGE_CACHE.get(ckey)
     if hit and (_t.time() - hit[0]) < _FLIGHT_MERGE_TTL:
         return dict(hit[1]) if hit[1] is not None else None
 
-    def _is_today_at(ap):
-        """date_q ist None oder der heutige Betriebstag am Flughafen ap."""
-        if date_q is None:
+    def _is_today_at(ap, day=None):
+        """`day` (Default date_q) ist None oder der heutige Betriebstag am
+        Flughafen ap. Für die arr-Seite eines Übernacht-Legs wird `date_arr_q`
+        durchgereicht (der Live-Board-Scan der Ankunft gilt für den ANKUNFTSTAG)."""
+        dq = day if day is not None else date_q
+        if dq is None:
             return True
         try:
-            return _airport_local_now(ap).strftime('%Y-%m-%d') == date_q
+            return _airport_local_now(ap).strftime('%Y-%m-%d') == dq
         except Exception:
             return False
 
     dep_row = arr_row = None
     dep_src = arr_src = None    # 'live' | 'obs'
 
-    def _live_scan(ap):
+    def _live_scan(ap, day=None):
         """Board-Scan (dep+arr) EINES Flughafens; klassifiziert den Treffer als
         dep-/arr-Seite über das _arr-Flag. Best-effort, nie raise.
         free_only=True → NUR `_flight_from_free_board` (gecachte Boards +
         gratis Quellen FRA/native, allow_paid=False) — `_flight_from_live_board`
-        und damit jeder AeroDataBox-Zweig sind auf diesem Pfad unerreichbar."""
+        und damit jeder AeroDataBox-Zweig sind auf diesem Pfad unerreichbar.
+        `day` (Übernacht-Ankunft): das Board dieses Flughafens für den ANGE-
+        gebenen Betriebstag gaten (Default date_q)."""
         nonlocal dep_row, arr_row, dep_src, arr_src
-        if not ap or not _is_today_at(ap):
+        if not ap or not _is_today_at(ap, day):
             return
         try:
             bf = (_flight_from_free_board(ap, fn) if free_only
@@ -30552,7 +30574,7 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
     if live:
         _live_scan(dep)
         if arr and arr != dep:
-            _live_scan(arr)
+            _live_scan(arr, day=date_arr_q)
 
     # Fehlende Seite aus der gefundenen ableiten: dep-Row.dest_iata = Ziel,
     # arr-Row.dest_iata = HERKUNFT (Board-Konvention) — dann EINEN Nachzieh-Scan.
@@ -30563,7 +30585,7 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
     if arr is None and dep_row is not None:
         arr = _norm_ap(dep_row.get('dest_iata'))
         if live and arr and arr_row is None:
-            _live_scan(arr)
+            _live_scan(arr, day=date_arr_q)
 
     def _obs_lookup(ap, ftype, want_other, lookup_date=None):
         """Warehouse-Row (heute: In-Memory-Store; sonst: SB-Read des Tages) für
@@ -30608,7 +30630,8 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         if o is not None:
             dep_row, dep_src = dict(o), 'obs'
     if arr_row is None:
-        o = _obs_lookup(arr, 'arrival', dep)
+        # ÜBERNACHT: arr-Warehouse-Read vom ANKUNFTSTAG (date_arr_q), sonst wie bisher.
+        o = _obs_lookup(arr, 'arrival', dep, lookup_date=date_arr_q)
         if o is not None:
             arr_row, arr_src = dict(o), 'obs'
     # Zweite Ableitungs-Chance: Airports erst durch die obs-Row bekannt geworden.
@@ -30621,7 +30644,7 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
     if arr is None and dep_row is not None:
         arr = _norm_ap(dep_row.get('dest_iata'))
         if arr and arr_row is None:
-            o = _obs_lookup(arr, 'arrival', dep)
+            o = _obs_lookup(arr, 'arrival', dep, lookup_date=date_arr_q)
             if o is not None:
                 arr_row, arr_src = dict(o), 'obs'
 
@@ -31273,9 +31296,41 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 _merge_date = None
         except Exception:
             _merge_date = leg_date
+        # ── ÜBERNACHT-LEG: ARR-SEITE VOM ANKUNFTSTAG LESEN (Owner/Fable 2026-07-16,
+        # Nico LH423 BOS→FRA) ────────────────────────────────────────────────────
+        # Ein Übernacht-Leg (dep 15.07 abends → arr 16.07 früh) keyt am ABFLUGTAG.
+        # `_flight_obs_merged(date=leg_date=15)` findet dann die gleichnamige
+        # FRA#ARR-Row des ABFLUGTAGS — bei Übernacht-Legs strukturell die FALSCHE
+        # Instanz (die gestrige Rotation: esti 07:44 'Geplant') — und meldet „bedient".
+        # Die echte Landung steht am ANKUNFTSTAG (date=16: esti 08:16 'baggage
+        # delivery'). Darum die arr-Seite grundsätzlich vom Ankunftstag lesen, wenn
+        # das Leg über Nacht geht. „Über Nacht" = das ARR-Datum in der STATIONS-
+        # ORTSZEIT des Ziels ist ein anderer Kalendertag als der Leg-Tag. arr_iso ist
+        # echt-UTC → in die Ziel-TZ wandeln und den lokalen Tag nehmen (nicht den
+        # UTC-Tag: eine 07:45-CEST-Ankunft ist um 05:45Z schon der Ortstag 16.). Nur
+        # gesetzt, wenn wirklich verschieden — Nicht-Übernacht-Legs bleiben unberührt.
+        _arr_date_q = None
+        try:
+            _ar2 = s.get('arr_iso')
+            if _ar2 and leg_date:
+                _adt2 = datetime.fromisoformat(str(_ar2).replace('Z', '+00:00'))
+                if _adt2.tzinfo is None:
+                    _adt2 = _adt2.replace(tzinfo=timezone.utc)
+                _to_norm = _DE_ICAO_TO_IATA.get(to, to)
+                _tzname = ('Europe/Berlin' if _to_norm in ('FRA', 'EDDF')
+                           else airport_tz(_to_norm))
+                if _tzname:
+                    from zoneinfo import ZoneInfo as _ZI
+                    _arr_local_day = _adt2.astimezone(
+                        _ZI(_tzname)).strftime('%Y-%m-%d')
+                    if _arr_local_day != leg_date:
+                        _arr_date_q = _arr_local_day
+        except Exception:
+            _arr_date_q = None
         try:
             m = _flight_obs_merged(op_fn, date=_merge_date, dep_iata=frm,
-                                   arr_iata=to, live=True, free_only=free_only)
+                                   arr_iata=to, live=True, free_only=free_only,
+                                   arr_date=_arr_date_q)
         except Exception:
             m = None
         # ── VERGANGENHEITS-FALLBACK auf die persistente Blueprint-Quelle

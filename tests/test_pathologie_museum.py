@@ -360,6 +360,135 @@ def test_lh423_text_delay_materialized_if_present():
         assert _has_explicit_offset(m['est_dep_iso'])
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LH423_ARRDAY — Übernacht-Leg: ARR-Seite vom ANKUNFTSTAG lesen (arr_date-Pfad).
+# Eigener Test (nicht die generischen Blöcke): das Stück braucht ein gepinntes
+# „jetzt" (_airport_local_now) sowie getrennte SB-/Store-Rows pro Datum, weil
+# _flight_obs_merged für Vortage die SB-Persistenz und für heute den In-Memory-
+# Store liest. Betrachtet am 16.07 nach der Landung.
+# ══════════════════════════════════════════════════════════════════════════════
+def _merged_arrday(spec, monkeypatch):
+    """Ruft die ECHTE _flight_obs_merged mit date=Abflugtag + arr_date=Ankunftstag,
+    _airport_local_now gepinnt und SB-/Store-Rows pro Datum getrennt."""
+    A._FLIGHT_MERGE_CACHE.clear()
+    now = _piso(spec['airport_now_iso'])
+    sb_rows = spec.get('sb_rows', {})
+    store_rows = spec.get('store_rows', {})
+
+    def _fake_local_now(iata):
+        return now
+
+    def _fake_sb_for_date(date_str, airport='FRA', dest_iata=None):
+        d = str(date_str)[:10]
+        ap = (airport or '').upper()
+        return list(sb_rows.get(f'{ap}|{d}', []))
+
+    def _fake_store(key):
+        return list(store_rows.get(key, []))
+
+    q = spec['query']
+    with patch.object(A, '_airport_local_now', side_effect=_fake_local_now), \
+            patch.object(A, '_flight_from_free_board', return_value=None), \
+            patch.object(A, '_flight_from_live_board',
+                         MagicMock(side_effect=AssertionError('paid board!'))), \
+            patch.object(A, '_delay_obs_rows_for_date',
+                         side_effect=_fake_sb_for_date), \
+            patch.object(A, '_departed_rows_from_store', side_effect=_fake_store):
+        return A._flight_obs_merged(
+            q['flight'], date=spec['query_dep_date'],
+            dep_iata=q.get('dep_iata'), arr_iata=q.get('arr_iata'),
+            live=True, free_only=True, arr_date=spec.get('query_arr_date'))
+
+
+def _merged_depday(spec):
+    """Wie _merged_arrday, aber OHNE arr_date (altes Verhalten): die date-15-
+    'Geplant'-Kontamination darf NIE eine Ist-Ankunft ans Leg hängen."""
+    A._FLIGHT_MERGE_CACHE.clear()
+    now = _piso(spec['airport_now_iso'])
+    sb_rows = spec.get('sb_rows', {})
+    store_rows = spec.get('store_rows', {})
+    q = spec['query']
+    with patch.object(A, '_airport_local_now', side_effect=lambda iata: now), \
+            patch.object(A, '_flight_from_free_board', return_value=None), \
+            patch.object(A, '_flight_from_live_board',
+                         MagicMock(side_effect=AssertionError('paid board!'))), \
+            patch.object(A, '_delay_obs_rows_for_date',
+                         side_effect=lambda ds, airport='FRA', dest_iata=None:
+                         list(sb_rows.get(f'{(airport or "").upper()}|{str(ds)[:10]}', []))), \
+            patch.object(A, '_departed_rows_from_store',
+                         side_effect=lambda key: list(store_rows.get(key, []))):
+        return A._flight_obs_merged(
+            q['flight'], date=spec['query_dep_date'],
+            dep_iata=q.get('dep_iata'), arr_iata=q.get('arr_iata'),
+            live=True, free_only=True)
+
+
+def test_lh423_arrday_landing_reads_arrival_day(monkeypatch):
+    """Übernacht-Leg + arr-Tag-Landung ⇒ landed-Status + est_arr/-delay vom
+    Ankunftstag (16.07 08:16 'baggage delivery', +86), NICHT die date-15-'Geplant'-
+    Kontamination der gestrigen Rotation."""
+    spec = _load('lh423_arrday_landing.json')
+    m = _merged_arrday(spec, monkeypatch)
+    assert m is not None
+    inv = spec['merged_arrday_invarianten']
+    for k, want in inv.items():
+        assert m.get(k) == want, f'LH423_ARRDAY: {k}={m.get(k)!r} != {want!r}'
+    # Status ist ein Landed-Bucket-Token (iOS DelayLogic.phase → 'gelandet').
+    val = (m.get('status') or '').lower()
+    assert any(s in val for s in spec['merged_arrday_status_enthaelt']), \
+        f'LH423_ARRDAY: status={m.get("status")!r} ist kein Landed-Bucket'
+    from app import _flight_status_bucket
+    assert _flight_status_bucket(m.get('status')) == 'landed'
+    # est_arr trägt expliziten UTC-Offset (keine naive Zeit).
+    assert _has_explicit_offset(m.get('est_arr_iso'))
+
+
+def test_lh423_depday_only_drops_contaminant_arr(monkeypatch):
+    """OHNE arr_date (nur Abflugtag): die date-15-'Geplant'-Kontamination darf
+    KEINE Ist-Ankunft ans Leg hängen — der DAY-BOUNDARY-GUARD verwirft die falsche
+    Instanz, die echte Landung (date-16) wird ohne arr_date nicht gefunden. So ist
+    belegt, dass ERST arr_date die richtige Ankunft bringt (kein stiller Zufall)."""
+    spec = _load('lh423_arrday_landing.json')
+    if not spec.get('merged_depday_only_abwesend_est_arr'):
+        pytest.skip('nicht deklariert')
+    m = _merged_depday(spec)
+    assert m is not None
+    # Kein Ist-Ankunfts-Feld aus der falschen date-15-Instanz.
+    assert not m.get('est_arr_iso'), \
+        f'LH423_ARRDAY[depday]: est_arr_iso={m.get("est_arr_iso")!r} sollte leer sein'
+    assert m.get('arr_delay_min') is None
+
+
+def test_lh423_arrday_non_overnight_unchanged(monkeypatch):
+    """NICHT-Übernacht-Regression: dieselbe Query mit arr_date == dep-date (also
+    KEIN Übernacht-Fall) muss sich exakt wie ohne arr_date verhalten — die date-15-
+    Row bleibt die einzige arr-Quelle, keine date-16-Werte lecken durch."""
+    spec = _load('lh423_arrday_landing.json')
+    now = _piso(spec['airport_now_iso'])
+    sb_rows = spec.get('sb_rows', {})
+    store_rows = spec.get('store_rows', {})
+    q = spec['query']
+    A._FLIGHT_MERGE_CACHE.clear()
+    with patch.object(A, '_airport_local_now', side_effect=lambda iata: now), \
+            patch.object(A, '_flight_from_free_board', return_value=None), \
+            patch.object(A, '_flight_from_live_board',
+                         MagicMock(side_effect=AssertionError('paid board!'))), \
+            patch.object(A, '_delay_obs_rows_for_date',
+                         side_effect=lambda ds, airport='FRA', dest_iata=None:
+                         list(sb_rows.get(f'{(airport or "").upper()}|{str(ds)[:10]}', []))), \
+            patch.object(A, '_departed_rows_from_store',
+                         side_effect=lambda key: list(store_rows.get(key, []))):
+        # arr_date == dep-date → im Merge auf None normalisiert (kein Übernacht).
+        m_same = A._flight_obs_merged(
+            q['flight'], date=spec['query_dep_date'], dep_iata=q.get('dep_iata'),
+            arr_iata=q.get('arr_iata'), live=True, free_only=True,
+            arr_date=spec['query_dep_date'])
+    m_none = _merged_depday(spec)
+    # Beide Wege liefern denselben arr-seitigen Zustand (date-16-Landung leckt nicht).
+    assert m_same.get('est_arr_iso') == m_none.get('est_arr_iso')
+    assert m_same.get('arr_delay_min') == m_none.get('arr_delay_min')
+
+
 def test_museum_has_expected_inventory():
     """Absicherung, dass die Fixtures überhaupt geladen werden (kein leeres
     Museum durch Pfad-/Glob-Fehler) und die Kern-Stücke präsent sind."""
