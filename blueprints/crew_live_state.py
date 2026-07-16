@@ -67,6 +67,10 @@ CONF_PLAN = 'plan'             # reine Plan-Uhr (kein Gegenbeweis)
 _ARR_BUFFER_MIN = 40           # Verspätungs-Puffer ohne jede Beobachtung
 _LANDED_RECENT_MIN = 90        # „Gelandet in X" statt „Layover X" nach Landung
 _STALE_GROUNDED_MIN = 30       # grounded-Obs nach Plan-Ankunft+30' → Live-Check
+_STALE_GROUNDED_LANDED_MIN = 6 * 60  # grounded-Obs, deren Plan-Ankunft > 6 h vorbei
+                               # ist, ist Scraper-Müll auf einem alten Leg → als
+                               # geflogen altern (LH1126, Museum 2026-07-16); der
+                               # Owner-„Board schlägt Uhr" gilt nur für heutige Legs.
 _NEAR_AIRPORT_KM = 8.0         # „am Boden nahe Flughafen"-Radius (Gegencheck)
 _DEP_LIFTOFF_GRACE_MIN = 15    # Zeit-Physik-Umschalter (Julien/Tibor 2026-07-16):
                                # steht der Flug nach eff_dep + dieser Spanne immer
@@ -1219,12 +1223,21 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             if _proof == 'delay':
                 # ZEITBEGRENZTER Beweis (Julien LH423 2026-07-16): BOS postete
                 # „Delayed 75 Minutes" und danach NIE „Departed". Ein dep-
-                # gemeldeter Delay hält den Pin nur bis eff_dep + gemeldetem
-                # Delay + Karenz — stünde die Maschine danach noch, meldete das
-                # Board einen GRÖSSEREN Delay. Eingefrorener Text ⇒ sie fliegt.
+                # gemeldeter Delay hält den Pin nur bis zur ANGEKÜNDIGTEN
+                # Abflugzeit + Karenz — stünde die Maschine danach noch, meldete
+                # das Board einen GRÖSSEREN Delay. Eingefrorener Text ⇒ sie fliegt.
+                #
+                # DOPPELZÄHL-FIX (Museum 2026-07-16): der angekündigte Abflug ist
+                # `max(eff_dep, sched_dep + ann)` — NICHT `eff_dep + ann`. Ist der
+                # Delay bereits in eff_dep materialisiert (dep_delay_min gesetzt →
+                # eff_dep = sched + 75), zählte `eff_dep + ann` die 75 min DOPPELT
+                # (Flip 75 min zu spät). Kommt der Delay dagegen NUR aus dem Text
+                # (eff_dep = bare sched), liefert `sched + ann` denselben Zeitpunkt.
+                # max() deckt beide Fälle byte-gleich ab.
                 _ann = _announced_dep_delay_min(o) or 0
-                if now >= eff_dep + _dt.timedelta(
-                        minutes=_ann + _DEP_LIFTOFF_GRACE_MIN):
+                _announced_dep = max(eff_dep, leg['dep'] + _dt.timedelta(minutes=_ann))
+                if now >= _announced_dep + _dt.timedelta(
+                        minutes=_DEP_LIFTOFF_GRACE_MIN):
                     _proof = None
             if (_proof is None
                     and now >= eff_dep + _dt.timedelta(
@@ -1263,6 +1276,26 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                     leg['flown'] = True
                     last_flown_observed = True
                     continue
+            # ÜBERFÄLLIGKEITS-DECKEL (LH1126-Scraper-Müll, Museum 2026-07-16): ein
+            # 'Boarding'/grounded-Board-Status auf einem längst vergangenen Leg
+            # (Plan-Ankunft > _STALE_GROUNDED_LANDED_MIN vorbei) ist Scraper-Müll —
+            # kein Ewig-Pin auf pre_flight. Der Owner-Grundsatz „Board schlägt Uhr"
+            # gilt für HEUTIGE Legs; ist die Plan-Ankunft um Stunden überschritten,
+            # ist die Maschine physisch längst gelandet → als geflogen behandeln,
+            # ohne aircraft_live-Beweis (der bei alten Legs eh nicht mehr da ist).
+            # Klein genug (6 h), dass ein echt am Gate stehender heutiger Flug mit
+            # aktivem Boarding-Board (Basti/Sebastian) nie fälschlich „landet".
+            if now >= eff_arr + _dt.timedelta(minutes=_STALE_GROUNDED_LANDED_MIN):
+                leg['flown'] = True
+                # Scraper-Müll-Grounded: wir haben KEIN echtes Landungs-Signal
+                # (das Board log ja falsch) — die einzige belastbare Wahrheit ist
+                # „das Leg ist physisch durch". Anders als der airborne-Stale-Pfad
+                # (Flug ist weitergezogen → Layover) präsentieren wir das letzte
+                # bekannte Leg als frisch gelandet: STATE_LANDED unabhängig von der
+                # Recency (der Board-Müll erlaubt keine bessere Aussage).
+                leg['muell_landed'] = True
+                last_flown_observed = False
+                continue
             picked = ('waiting', idx, CONF_OBSERVED)
             break
         # Kein Board-Signal → Uhr, mit Live-Gegencheck an den Kipp-Punkten.
@@ -1312,7 +1345,10 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         dest = leg['arr_ap'] or (hb or '')
         eff_arr = leg.get('eff_arr') or leg['arr']
         conf = CONF_OBSERVED if last_flown_observed else CONF_PLAN
-        recent = (now - eff_arr) <= _dt.timedelta(minutes=_LANDED_RECENT_MIN)
+        # Scraper-Müll-Grounded-Deckel (LH1126): kein echtes Landungs-Signal, das
+        # Leg wird als frisch gelandet gezeigt (nicht Layover) — s.o. muell_landed.
+        recent = (now - eff_arr) <= _dt.timedelta(minutes=_LANDED_RECENT_MIN) \
+            or bool(leg.get('muell_landed'))
         landed_sub = (f'Gelandet {hhmm(eff_arr, dest)}'
                       if not leg['arr_synth'] else None)
         if hb and dest == hb:

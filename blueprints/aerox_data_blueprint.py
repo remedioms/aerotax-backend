@@ -3618,55 +3618,20 @@ def _obs_rows_to_facts(dep_row, arr_row):
 # VOR dem Soll-Abflug derselben Antwort liegt, gehört physikalisch zu einem anderen
 # Tag (ein Lauf landet nie lange vor seinem eigenen Abflug). Analog
 # app._FLIGHTS_LIVE_WRONG_DAY_MARGIN_MIN / crew_live_state._WRONG_DAY_MARGIN_MIN.
-# Soll-Zeit-Toleranz (min): zwei airport_delay_obs-Rows gehören zur SELBEN Tages-
-# Instanz eines Flugs nur, wenn ihre Soll-Zeit (`sched`) höchstens so weit
-# auseinanderliegt. Weicht die `sched` einer Row stärker ab, ist es eine FREMDE
-# Instanz (Folgetags-Repoll unter falschem Datum, andere Soll-Zeit) — sie darf die
-# Basis-/Zeit-Row NICHT verdrängen und ihren Status NICHT draufmergen (Owner/Fable
-# 2026-07-16, FIX A/C: LH867/LH1126 Folgetags-Row verunreinigte den Vortag).
-_OBS_SAME_INSTANCE_SCHED_TOL_MIN = 45
-
-# Ankunfts-plausible Status-Signalwörter (kleingeschrieben, Substring). NUR diese
-# dürfen von einer ARR-Row (‹Ziel›#ARR) als Merge-Status akzeptiert werden — ein
-# abflug-typischer Status ('Boarding'/'Gate…'/'Abgeflogen') auf einer ARR-Row ist
-# Scraper-Feld-Müll (LH1126 BCN#ARR trug 'Boarding') und wird ignoriert.
-_OBS_ARR_PLAUSIBLE_STATUS = (
-    'gelandet', 'landed', 'arrived', 'angekommen', 'at gate', 'on blocks',
-    'on-blocks', 'gepäck', 'gepaeck', 'baggage', 'diverted', 'umgeleitet',
-    'cancelled', 'canceled', 'annulliert', 'gestrichen', 'delayed', 'verspätet',
-    'verspaetet', 'estimated', 'erwartet', 'approach', 'anflug', 'final',
+# GETEILTE Row-/Instanz-/Status-Selektion (Struktur-Kur 2026-07-16): die drei
+# Regeln „esti schlägt bare", „Folgetags-Row = fremde Instanz", „ARR-Row nur mit
+# ankunfts-plausiblem Status" leben jetzt GENAU EINMAL in blueprints/obs_selection.
+# Hier nur noch dünne Aliase (byte-identisches Verhalten), damit die bestehenden
+# Nutzstellen unverändert bleiben und der Zwilling in app.py dieselbe Quelle
+# importieren kann. Details/Wurzel: Modul-Docstring von obs_selection.
+from blueprints.obs_selection import (
+    OBS_SAME_INSTANCE_SCHED_TOL_MIN as _OBS_SAME_INSTANCE_SCHED_TOL_MIN,
+    OBS_ARR_PLAUSIBLE_STATUS as _OBS_ARR_PLAUSIBLE_STATUS,
+    obs_sched_min as _obs_sched_min,
+    same_instance_sched as _obs_same_instance_sched,
+    arr_status_plausible as _obs_arr_status_plausible,
+    row_richness as _obs_row_richness,
 )
-
-
-def _obs_sched_min(row):
-    """Soll-Zeit einer Obs-Row als Minuten-seit-Mitternacht (0..1439), oder None.
-    Reine bare-'HH:MM'/ISO-Toleranz-Hilfe — vergleicht nur die Wanduhr-Minute,
-    keine TZ (beide Rows stehen in derselben Stations-Ortszeit). Wirft nie."""
-    s = (row.get('sched') or '').strip() if isinstance(row, dict) else ''
-    if not s:
-        return None
-    import re as _re2
-    m = _re2.search(r'(\d{1,2}):(\d{2})', s)
-    if not m:
-        return None
-    try:
-        return int(m.group(1)) * 60 + int(m.group(2))
-    except Exception:
-        return None
-
-
-def _obs_same_instance_sched(row, ref_row):
-    """True, wenn `row` zur SELBEN Tages-Instanz wie `ref_row` gehört (Soll-Zeit
-    innerhalb _OBS_SAME_INSTANCE_SCHED_TOL_MIN). Fehlt eine der Soll-Zeiten →
-    True (fail-open: nicht als fremd verwerfen, wenn wir es nicht sicher wissen).
-    Mitternachts-Wrap (23:55 vs 00:05) wird als klein behandelt."""
-    a = _obs_sched_min(row)
-    b = _obs_sched_min(ref_row)
-    if a is None or b is None:
-        return True
-    diff = abs(a - b)
-    diff = min(diff, 1440 - diff)      # zyklisch (Mitternacht)
-    return diff <= _OBS_SAME_INSTANCE_SCHED_TOL_MIN
 
 
 _TIMES_SELF_CONSISTENCY_DEP_MARGIN_MIN = 90
@@ -3887,18 +3852,15 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
                 continue
             if not _obs_same_instance_sched(r, base):
                 continue        # Fremd-Instanz (abweichende Soll-Zeit)
-            if is_arr and st.lower() not in (
-                    _OBS_ARR_PLAUSIBLE_STATUS) and not any(
-                    _t in st.lower() for _t in _OBS_ARR_PLAUSIBLE_STATUS):
+            if is_arr and not _obs_arr_status_plausible(st):
                 continue        # dep-typischer Müll auf einer ARR-Row
             newest_status = st
             break
         if newest_status and (base.get('status') or '').strip() != newest_status:
             base = dict(base)
             base['status'] = newest_status
-        elif is_arr and (base.get('status') or '').strip() and not any(
-                _t in (base.get('status') or '').lower()
-                for _t in _OBS_ARR_PLAUSIBLE_STATUS):
+        elif is_arr and (base.get('status') or '').strip() \
+                and not _obs_arr_status_plausible(base.get('status')):
             # Die Basis-Row selbst trägt einen abflug-typischen Müll-Status auf der
             # ARR-Seite → ehrlich entfernen (keine erfundene Ankunft, aber auch kein
             # 'Boarding' als Ankunfts-Status durchreichen).
@@ -3978,17 +3940,15 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
                     continue
                 if not _obs_same_instance_sched(_r, chosen):
                     continue
-                if _st.lower() not in _OBS_ARR_PLAUSIBLE_STATUS and not any(
-                        _t in _st.lower() for _t in _OBS_ARR_PLAUSIBLE_STATUS):
+                if not _obs_arr_status_plausible(_st):
                     continue
                 _newest = _st
                 break
             if _newest and (chosen.get('status') or '').strip() != _newest:
                 chosen = dict(chosen)
                 chosen['status'] = _newest
-            elif (chosen.get('status') or '').strip() and not any(
-                    _t in (chosen.get('status') or '').lower()
-                    for _t in _OBS_ARR_PLAUSIBLE_STATUS):
+            elif (chosen.get('status') or '').strip() \
+                    and not _obs_arr_status_plausible(chosen.get('status')):
                 # gewählte ARR-Row trägt selbst dep-Müll-Status → ehrlich entfernen.
                 chosen = dict(chosen)
                 chosen['status'] = None
@@ -4225,6 +4185,12 @@ _PHASE_TO_STATUS_CATEGORY = {
     # SCHEDULED/BOARDING/TAXI_OUT/UNKNOWN → kein Legacy-Wert (leer bleiben)
 }
 
+# Überfälligkeits-Deckel (Museum LH890/LH1126): liegt der späteste Plan-Anker eines
+# nachweislich gestarteten Fluges mehr als so lange zurück, ohne dass je ein
+# Ankunfts-Board eine Landung meldete, ist die Maschine längst gelandet → 'arrived'
+# (analog dem crew_state-Deckel). 6 h deckt jeden Linienflug + großzügigen Delay ab.
+_STALE_ARRIVED_AFTER_S = 6 * 3600
+
 
 def _iso_offset_to_epoch(iso):
     """Station-Offset-/Z-ISO (wie _obs_rows_to_facts sie liefert, z.B.
@@ -4310,6 +4276,34 @@ def _status_category_from_facts(flight, facts, now=None):
             sa_ep = _iso_offset_to_epoch(facts.get('sched_arr'))
             if sa_ep is not None and now < (sa_ep - 15 * 60):
                 cat = None            # implausibel früh → keine Geister-Landung
+        # ÜBERFÄLLIGKEITS-DECKEL (LH890/LH1126, Museum 2026-07-16): ein Flug, der
+        # nachweislich gestartet ist (dep-„Abgeflogen"/est_dep/enroute), aber dessen
+        # ZIEL nie geharvestet wird (Outstation ohne Ankunfts-Board, LH890→WAW) oder
+        # dessen einzige Ankunfts-Row ein gescrubbter Müll-Status war (LH1126 BCN
+        # 'Boarding' → weg), bleibt sonst ewig 'enroute'/None. Physik: liegt der
+        # späteste Plan-Anker (est_arr > sched_arr > est_dep > sched_dep) mehr als
+        # _STALE_ARRIVED_AFTER_S in der Vergangenheit UND gibt es KEIN frisches
+        # airborne-/grounded-Board, ist die Maschine längst gelandet → 'arrived'
+        # (analog zum crew_state-Überfälligkeits-Deckel; keine erfundene Ist-Zeit).
+        # Greift nur, wenn ein Abflug-Beweis existiert (nie „arrived" ins Blaue) und
+        # der Zustand noch nicht terminal/cancelled ist.
+        if cat in (None, 'enroute'):
+            _anchor = None
+            for _k in ('est_arr', 'sched_arr', 'est_dep', 'sched_dep'):
+                _ep = _iso_offset_to_epoch(facts.get(_k))
+                if _ep is not None and (_anchor is None or _ep > _anchor):
+                    _anchor = _ep
+            _dep_s = str(facts.get('dep_status') or '').strip().lower()
+            _departed = bool(
+                cat == 'enroute'
+                or facts.get('est_dep')
+                or any(w in _dep_s for w in (
+                    'abgeflogen', 'departed', 'airborne', 'boarding',
+                    'gate', 'gestartet')))
+            if (_anchor is not None
+                    and now >= _anchor + _STALE_ARRIVED_AFTER_S
+                    and _departed):
+                cat = 'arrived'
         return cat
     except Exception:
         return None

@@ -18,14 +18,14 @@
     "obs": {"LH1126": {"status": "Boarding"}},
     "homebase": "FRA",
     "faelle": [
-      {"now_iso": "2026-07-15T22:00:00Z", "erwartet_state": "landed", "offen": true, "reason": "offen: ein 'Boarding'/grounded-Status hält ein 14h-alt Vergangenheits-Leg in crew_state auf pre_flight statt es zu landed altern zu lassen (LH1126-Scraper-Müll-Klasse).", "kommentar": "Vergangenheits-Leg mit belegter Plan-Ankunft SOLLTE landed sein, nie 'Boarding'/grounded."}
+      {"now_iso": "2026-07-15T22:00:00Z", "erwartet_state": "landed", "offen": false, "reason": "GRÜN 2026-07-16: der Scraper-Müll-Grounded-Deckel (_STALE_GROUNDED_LANDED_MIN, Plan-Ankunft >6h vorbei) altert das Leg zu landed statt es auf pre_flight zu pinnen.", "kommentar": "Vergangenheits-Leg mit belegter Plan-Ankunft: landed, nie 'Boarding'/grounded."}
     ]
   },
   "status_category": {
     "now_iso": "2026-07-15T22:00:00+00:00",
     "erwartet": "arrived",
-    "offen": true,
-    "reason": "offen: nach dem (korrekten) Scrub des Müll-'Boarding' fehlt jeder ARR-Status → _status_category_from_facts liefert None statt 'arrived' (kein Landungs-Beweis aus dem Board ableitbar).",
+    "offen": false,
+    "reason": "GRÜN 2026-07-16: nach dem Scrub des Müll-'Boarding' greift der Überfälligkeits-Deckel — est_arr (12:13) liegt >6h vor now, Abflug ist über est_dep belegt → 'arrived'.",
     "kommentar": "Vergangenheits-Leg mit est_arr → 'arrived'/landed, nie 'Boarding'/grounded."
   }
 }

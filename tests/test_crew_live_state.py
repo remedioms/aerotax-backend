@@ -718,9 +718,18 @@ _LH900 = [{'flight': 'LH900', 'from': 'FRA', 'to': 'LHR',
 
 
 def test_basti_bekannter_delay_zeigt_verspaetet_nicht_prep():
-    # sched 08:00, est 08:20 (dep_delay 20), now 08:49 (29 min NACH est_dep),
-    # Board kennt die Verspätung (grounded-Status), kein Abflug-/Live-Beweis.
-    r = _resolve(_utc(8, 49), sectors=_LH900,
+    # sched 08:00, est 08:20 (dep_delay 20), now 08:30 (10 min NACH est_dep, aber
+    # NOCH im Delay-Boden-Beweis-Fenster est_dep + Karenz). Board kennt die
+    # Verspätung (grounded-Status), kein Abflug-/Live-Beweis. Erwartet: „Verspätet"
+    # + verspätete Abflugzeit, nicht „Flugvorbereitung".
+    #
+    # Zeit-Physik-Korrektur (Museum 2026-07-16, Doppelzähl-Fix): der gemeldete
+    # Delay hält den Boden-Beweis NUR bis zur ANGEKÜNDIGTEN Abflugzeit (est_dep
+    # 08:20) + Karenz (15 min) = 08:35 — NICHT bis est_dep + Delay + Karenz (der
+    # frühere Doppelzähler). Weit danach (08:49) ist die Maschine physisch weg →
+    # flying (s. test_basti_bekannter_delay_laeuft_ab_dann_flying). Diese Prüfung
+    # bleibt im gültigen Fenster (08:30), um die Verspätet-Prosa zu pinnen.
+    r = _resolve(_utc(8, 30), sectors=_LH900,
                  obs={'LH900': {'status': 'Verspätet', 'dep_delay_min': 20}})
     assert r['state'] == STATE_PRE_FLIGHT
     assert r['pre_phase'] == PRE_DELAYED
@@ -732,6 +741,19 @@ def test_basti_bekannter_delay_zeigt_verspaetet_nicht_prep():
     assert r['text']['subtitle'] == 'FRA → LHR · Verspätet 08:20'
     assert 'Flugvorbereitung' not in r['text']['subtitle']
     assert r['position'] is None       # kein erfundener Live-Flug
+
+
+def test_basti_bekannter_delay_laeuft_ab_dann_flying():
+    # Gegenstück (Museum 2026-07-16, Doppelzähl-Fix): weit NACH der angekündigten
+    # Abflugzeit (est_dep 08:20 + Karenz) — 08:49 — läuft der zeitbegrenzte
+    # Delay-Boden-Beweis ab und die Uhr übernimmt: die Maschine ist unterwegs.
+    # (Vorher hielt der Doppelzähler eff_dep + Delay + Karenz = 08:55 sie
+    # fälschlich noch am Boden.) Kein erfundener Live-Flug → CONF_PLAN, keine Pos.
+    r = _resolve(_utc(8, 49), sectors=_LH900,
+                 obs={'LH900': {'status': 'Verspätet', 'dep_delay_min': 20}})
+    assert r['state'] == STATE_FLYING
+    assert r['confidence'] == CONF_PLAN
+    assert r['position'] is None
 
 
 def test_basti_delay_vor_est_dep_timeline_noch_korrekt():

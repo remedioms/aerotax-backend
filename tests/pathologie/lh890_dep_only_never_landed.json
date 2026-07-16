@@ -24,8 +24,8 @@
   "status_category": {
     "now_iso": "2026-07-14T18:00:00+00:00",
     "erwartet": "arrived",
-    "offen": true,
-    "reason": "offen: _status_category_from_facts altert ein dep-seitiges 'Abgeflogen' ohne ARR-Board nicht zu 'arrived', sondern liefert stale 'enroute' (LH890-Klasse). Der landed-Beweis läuft über crew_state.",
+    "offen": false,
+    "reason": "GRÜN 2026-07-16: _status_category_from_facts altert einen dep-seitigen 'Abgeflogen'-Flug ohne ARR-Board über den Überfälligkeits-Deckel (spätester Plan-Anker >6h vorbei + Abflug-Beweis) zu 'arrived' — keine erfundene Ist-Zeit.",
     "kommentar": ">6h nach Plan-Ankunft (~08:10Z) SOLLTE 'arrived'/landed liefern, ohne erfundene Ist-Zeit."
   }
 }

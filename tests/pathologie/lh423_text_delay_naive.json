@@ -22,7 +22,7 @@
     "homebase": "MUC",
     "faelle": [
       {"now_iso": "2026-07-15T16:30:00Z", "erwartet_state": "pre_flight", "offen": false, "kommentar": "vor eff_dep (Soll 15:45Z + 75 = 17:00Z) → wartet am Boden (GRÜN)"},
-      {"now_iso": "2026-07-15T17:20:00Z", "erwartet_state": "flying", "offen": true, "reason": "offen: crew_state schiebt bei materialisiertem dep_delay auch die ARR-Grenze, sodass das 75-min-Leg pre_flight→landed springt und 'flying' nie zeigt (LH423-Klasse, Delay > Blockzeit).", "kommentar": "nach eff_dep sollte flying gelten — real bleibt es pre_flight bis landed"}
+      {"now_iso": "2026-07-15T17:20:00Z", "erwartet_state": "flying", "offen": false, "reason": "GRÜN 2026-07-16: der Doppelzähl-Fix (expiry = max(eff_dep, sched+ann) + Grace statt eff_dep + ann) lässt den Delay-Boden-Beweis ab dem angekündigten Abflug (17:00Z) + Karenz ablaufen → flying (CONF_PLAN).", "kommentar": "nach dem angekündigten Abflug + Karenz gilt flying"}
     ]
   }
 }
