@@ -53,6 +53,7 @@ _MEMO_GLOBALS = {
     '_LIFECYCLE_MEMO': None,
     '_FREE_TIMES_MEMO': None,
     '_FREE_CREW_LIVE_MEMO': None,
+    '_OBS_FACTS_MEMO': None,
 }
 
 

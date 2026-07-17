@@ -1086,6 +1086,13 @@ def test_duty_from_roster_day_klass_und_marker():
     assert duty_from_roster_day(None, None) is None
     # Prio: SBY schlägt alles.
     assert duty_from_roster_day('FREI', 'SBY 10:00') == 'standby'
+    # Visum/Visa (2026-07-17): administrativer Nicht-Dienst-Tag, KEIN Pickup.
+    # Robust gegen Case/Substring wie die übrigen Marker.
+    assert duty_from_roster_day(None, 'VISUM Botschaft 09:00') == 'visa'
+    assert duty_from_roster_day(None, 'US Visa Appointment') == 'visa'
+    assert duty_from_roster_day('Visum', None) == 'visa'
+    # Visum ist KEIN freier Tag ('free') und kein Dienst.
+    assert duty_from_roster_day('VISA', None) != 'free'
 
 
 class _FamQuery:

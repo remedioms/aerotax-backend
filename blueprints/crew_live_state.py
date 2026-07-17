@@ -1030,6 +1030,10 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         # wir nicht (nichts erfinden).
         if d in ('vacation', 'urlaub', 'vac'):
             return _result(STATE_HOME, title='Im Urlaub')
+        if d in ('visa', 'visum'):
+            # Administrativer Termin (Visum/Botschaft) — KEIN Dienst, kein
+            # Airport-Weg. STATE_HOME statt eines Dienst-Zustands ⇒ kein Pickup.
+            return _result(STATE_HOME, title='Visum-Termin')
         if d in ('free', 'frei', 'off'):
             return _result(STATE_HOME, title='Heute frei')
         # „Basis Frankfurt" NUR wenn wirklich kein Dienst (Owner-Vorgabe).
@@ -1627,8 +1631,8 @@ def spillover_wins(today_state, yesterday_state, now=None,
 # ── duty-Ableitung für Leg-lose Tage (B2-Nachfix, Regressions-Sweep #7) ──────
 
 def duty_from_roster_day(klass=None, marker=None):
-    """PUR: duty ('standby'|'vacation'|'free'|None) aus klass/marker des
-    Roster-Tages ableiten — Standby > Urlaub > Frei (B2 Tibor 2026-07-12).
+    """PUR: duty ('standby'|'vacation'|'visa'|'free'|None) aus klass/marker des
+    Roster-Tages ableiten — Standby > Urlaub > Visum > Frei (B2 Tibor 2026-07-12).
 
     GETEILT zwischen den beiden Resolver-Consumers (app._crew_state_for_day
     für friends-today UND family_watch._load_crew_status_for_family): der
@@ -1640,13 +1644,24 @@ def duty_from_roster_day(klass=None, marker=None):
 
     marker deckt auch reine iCal-Summaries ab ('OFF DAY …', 'SBY …',
     '… URLAUB …') — family_watch liest user_ical_briefings und hat KEIN
-    klass-Feld. Wirft nie."""
+    klass-Feld. Wirft nie.
+
+    'visa' (2026-07-17): ein Visum-/Visa-Termin ist ein administrativer NICHT-
+    Dienst-Tag — keine Anfahrt zur Homebase, kein Pickup/Commute. Vorher fehlte
+    der Marker → der Tag fiel auf None und wurde wie ein (Office-)Dienst-Tag
+    behandelt (Smart-Pickup ausgelöst). Jetzt eigene Nicht-Commute-Kategorie."""
     marker_up = str(marker or '').upper()
     klass_up = str(klass or '').strip().upper()
     if 'SBY' in marker_up:
         return 'standby'
     if klass_up in ('URLAUB', 'VAC', 'VACATION') or 'URLAUB' in marker_up:
         return 'vacation'
+    # Visum/Visa: Behörden-/Botschaftstermin, KEIN Dienst und KEIN Airport-Weg.
+    # Robust gegen Case/Substring wie die übrigen Marker ('VISUM'/'VISA' im
+    # Summary oder als klass). Vor FREI/OFF geprüft, damit ein „Visum" nie als
+    # freier Tag mit „Heute frei"-Text durchrutscht.
+    if klass_up in ('VISUM', 'VISA') or 'VISUM' in marker_up or 'VISA' in marker_up:
+        return 'visa'
     if klass_up in ('FREI', 'OFF', 'X', 'REST') or 'OFF DAY' in marker_up:
         return 'free'
     return None

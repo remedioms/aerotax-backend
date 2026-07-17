@@ -10396,12 +10396,19 @@ def user_search():
                 'token,name,homebase,airline,"position",metadata'
             )
             if q:
-                # ilike ist case-insensitive — name enthält Substring q
-                qbuilder = qbuilder.ilike('name', f'%{q}%')
+                # Word-start matching: q ist Präfix des vollen Namens ODER
+                # Präfix eines beliebigen Worts (nach Leerzeichen). Das verhindert
+                # Substring-Treffer wie „JohANnes" bei Suche „an".
+                # PostgREST or_()-Filter: name ILIKE 'q%' OR name ILIKE '% q%'
+                qbuilder = qbuilder.or_(
+                    f"name.ilike.{q}%,name.ilike.% {q}%"
+                )
             if airline:
+                # ilike ohne Wildcard = exakter case-insensitiver Vergleich
                 qbuilder = qbuilder.ilike('airline', airline)
             if homebase:
-                qbuilder = qbuilder.eq('homebase', homebase)
+                # ilike statt eq → case-insensitiv (DB-Werte können 'fra'/'FRA' mischen)
+                qbuilder = qbuilder.ilike('homebase', homebase)
             # Höheres SB-Limit als Endpoint-Limit, da blocks/self-filter
             # nachträglich Rows entfernen können.
             qbuilder = qbuilder.limit(max(limit * 3, 60))
@@ -10469,9 +10476,13 @@ def user_search():
                 a = (pr.get('airline') or '').strip().lower()
                 h = (pr.get('homebase') or '').strip().upper()
                 acct = (pr.get('account_type') or '').strip().lower()
-                # Match-Logik
-                if q and q not in name.lower():
-                    continue
+                # Match-Logik: Word-start (Präfix des vollen Namens ODER
+                # Präfix eines Name-Worts). Kein Substring-Match mehr.
+                if q:
+                    nl = name.lower()
+                    # Präfix des vollen Namens ODER nach einem Leerzeichen
+                    if not (nl.startswith(q) or f' {q}' in nl):
+                        continue
                 if airline and airline != a:
                     continue
                 if homebase and homebase != h:
@@ -17233,16 +17244,31 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
     def _norm(v):
         return (str(v).strip() if v is not None else '')
 
+    def _norm_cmp(v):
+        # Vergleichs-Normalform für Freitext-Felder (routing/layover/Zeiten):
+        # Case-fold + ALLE Whitespaces entfernt. So zählt reine Formatierung/
+        # Groß-/Kleinschreibung NICHT als Änderung („FRA-JFK" == „fra - jfk" ==
+        # „FRA-JFK "). Diese Felder tragen keine semantischen Leerzeichen
+        # (Routing/IATA/HH:MM) → Whitespace-Strip ist verlustfrei. Der Diff wird
+        # dadurch strikt konservativer (nie mehr Treffer), was genau die falschen
+        # „Dienstplan-Änderung"-Pushes killt.
+        s = _norm(v)
+        if not s:
+            return ''
+        return ''.join(s.split()).casefold()
+
     def _field_changed(av, bv):
         # leer↔gefüllt zählt NICHT (Anreicherung/Re-Parse); nur ein echter
-        # Wert-Wechsel zwischen zwei nicht-leeren Werten.
-        a, b = _norm(av), _norm(bv)
+        # Wert-Wechsel zwischen zwei nicht-leeren Werten — nach Case/Whitespace-
+        # Normalisierung (reine Formatierung ist keine substantielle Änderung).
+        a, b = _norm_cmp(av), _norm_cmp(bv)
         return bool(a) and bool(b) and a != b
 
     def _meaningfully_modified(a, b):
         arf, brf = (a.get('reader_facts') or {}), (b.get('reader_facts') or {})
-        # klass exakt (auch leer↔gefüllt): ein Tag wird Tour / verliert Tour.
-        if _norm(a.get('klass')) != _norm(b.get('klass')):
+        # klass: Case/Whitespace-normalisiert (auch leer↔gefüllt): ein Tag wird
+        # Tour / verliert Tour. „Z76" == „z76", aber Tour↔Frei bleibt echt.
+        if _norm_cmp(a.get('klass')) != _norm_cmp(b.get('klass')):
             return True
         for af, bf in ((a.get('routing'), b.get('routing')),
                        (arf.get('start_time'), brf.get('start_time')),
@@ -38899,7 +38925,11 @@ def _ev_extends_duty(summary):
     # OFF nur als eigenständiges Wort matchen (Tages-OFF), NICHT als Präfix —
     # sonst frisst `startswith('OFF')` ein „Office Day" und nullt dessen echte
     # DTEND (User-Bug 2026-06-23: Office-Tag verliert Endzeit/Stunden).
+    # VISUM/VISA (2026-07-17): ein Botschafts-/Visum-Termin ist KEIN Dienst und
+    # kein Airport-Weg — er darf das Duty-Fenster nicht aufspannen (sonst wird
+    # der Tag wie ein Office-Dienst behandelt und löst einen Smart-Pickup aus).
     if 'LAYOVER' in up or 'OFF DAY' in up or 'ABSENCE' in up \
+            or 'VISUM' in up or 'VISA' in up \
             or re.match(r'^OFF(?!ICE)', up):
         return False
     return True

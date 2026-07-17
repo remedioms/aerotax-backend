@@ -69,6 +69,15 @@ def _search(tmpdir, query, extra_qs=''):
         return client.get(f'/api/user/search?q={query}&token=AT-SEARCHER{extra_qs}')
 
 
+def _search_raw(tmpdir, qs):
+    """Suche mit beliebigem Query-String (kein q= vorausgesetzt)."""
+    with patch.object(A, 'SB_AVAILABLE', False), \
+         patch.object(A, '_USER_HISTORY_DIR', tmpdir), \
+         patch.object(A, '_blocked_by', return_value=set()):
+        client = A.app.test_client()
+        return client.get(f'/api/user/search?token=AT-SEARCHER&{qs}')
+
+
 def test_search_family_gets_role_marker(tmp_path):
     d = str(tmp_path)
     _write_disk_profiles(d, [_FAMILY_PROFILE, _CREW_PROFILE])
@@ -188,3 +197,138 @@ def test_family_pairing_path_untouched(tmp_path):
                         json={'email': email, 'password': 'Test12345!', 'token': token})
         except Exception:
             pass
+
+
+# ── BUG 1: Word-start name matching (disk-fallback path) ─────────────────────
+
+_WORD_START_PROFILES = [
+    {'token': 'AT-AN1', 'profile': {
+        'name': 'Andreas Müller', 'homebase': 'MUC', 'airline': 'Lufthansa',
+        'position': 'Pilot', 'account_type': 'crew',
+    }},
+    {'token': 'AT-AN2', 'profile': {
+        'name': 'Maria Andersen', 'homebase': 'MUC', 'airline': 'Lufthansa',
+        'position': 'FA', 'account_type': 'crew',
+    }},
+    {'token': 'AT-AN3', 'profile': {
+        # Substring match „an" liegt in „Johannes" — darf NICHT zurückkommen
+        'name': 'Johannes Bauer', 'homebase': 'MUC', 'airline': 'Lufthansa',
+        'position': 'FA', 'account_type': 'crew',
+    }},
+    {'token': 'AT-AN4', 'profile': {
+        # „an" liegt im Vornamen „Daniel" als Infix — darf NICHT zurückkommen
+        'name': 'Daniel Koch', 'homebase': 'MUC', 'airline': 'Lufthansa',
+        'position': 'FA', 'account_type': 'crew',
+    }},
+]
+
+
+def test_name_word_start_prefix_match(tmp_path):
+    """Suche 'an' findet Andreas (Namensstart) und Andersen (Wortstart Nachname),
+    aber NICHT Johannes (Infix) und NICHT Daniel (Infix im Vornamen)."""
+    d = str(tmp_path)
+    _write_disk_profiles(d, _WORD_START_PROFILES)
+    r = _search(d, 'an')
+    assert r.status_code == 200
+    names = {u['name'] for u in r.get_json()['users']}
+    assert 'Andreas Müller' in names          # Vorname startet mit 'an'
+    assert 'Maria Andersen' in names          # Nachname startet mit 'an'
+    assert 'Johannes Bauer' not in names      # 'an' nur als Infix
+    assert 'Daniel Koch' not in names         # 'an' nur als Infix im Vornamen
+
+
+def test_name_prefix_full_name_match(tmp_path):
+    """Suche 'and' findet Andreas und Andersen (Präfix), nicht Johannes/Daniel."""
+    d = str(tmp_path)
+    _write_disk_profiles(d, _WORD_START_PROFILES)
+    r = _search(d, 'and')
+    names = {u['name'] for u in r.get_json()['users']}
+    assert 'Andreas Müller' in names
+    assert 'Maria Andersen' in names
+    assert 'Johannes Bauer' not in names
+    assert 'Daniel Koch' not in names
+
+
+def test_name_case_insensitive_word_start(tmp_path):
+    """Suche ist case-insensitiv: 'AN' findet dieselben wie 'an'."""
+    d = str(tmp_path)
+    _write_disk_profiles(d, _WORD_START_PROFILES)
+    r = _search(d, 'AN')
+    names = {u['name'] for u in r.get_json()['users']}
+    assert 'Andreas Müller' in names
+    assert 'Maria Andersen' in names
+    assert 'Johannes Bauer' not in names
+
+
+# ── BUG 2: airline + homebase Filter (disk-fallback path) ────────────────────
+
+_FILTER_PROFILES = [
+    {'token': 'AT-LH1', 'profile': {
+        'name': 'Luisa Hoffmann', 'homebase': 'FRA', 'airline': 'Lufthansa',
+        'position': 'FA', 'account_type': 'crew',
+    }},
+    {'token': 'AT-EW1', 'profile': {
+        'name': 'Erik Wenzel', 'homebase': 'DUS', 'airline': 'Eurowings',
+        'position': 'Pilot', 'account_type': 'crew',
+    }},
+    {'token': 'AT-LH2', 'profile': {
+        'name': 'Lea Schmidt', 'homebase': 'MUC', 'airline': 'Lufthansa',
+        'position': 'Pilot', 'account_type': 'crew',
+    }},
+]
+
+
+def test_filter_airline_only_no_q(tmp_path):
+    """airline-Filter ohne q gibt nur die passende Airline zurück."""
+    d = str(tmp_path)
+    _write_disk_profiles(d, _FILTER_PROFILES)
+    r = _search_raw(d, 'airline=lufthansa')
+    assert r.status_code == 200
+    names = {u['name'] for u in r.get_json()['users']}
+    assert 'Luisa Hoffmann' in names
+    assert 'Lea Schmidt' in names
+    assert 'Erik Wenzel' not in names
+
+
+def test_filter_homebase_only_no_q(tmp_path):
+    """homebase-Filter ohne q gibt nur den passenden Homebase zurück."""
+    d = str(tmp_path)
+    _write_disk_profiles(d, _FILTER_PROFILES)
+    r = _search_raw(d, 'homebase=FRA')
+    assert r.status_code == 200
+    names = {u['name'] for u in r.get_json()['users']}
+    assert 'Luisa Hoffmann' in names
+    assert 'Erik Wenzel' not in names
+    assert 'Lea Schmidt' not in names
+
+
+def test_filter_airline_and_homebase_combined(tmp_path):
+    """Kombinierter Filter airline+homebase ohne q schneidet korrekt."""
+    d = str(tmp_path)
+    _write_disk_profiles(d, _FILTER_PROFILES)
+    r = _search_raw(d, 'airline=lufthansa&homebase=MUC')
+    assert r.status_code == 200
+    names = {u['name'] for u in r.get_json()['users']}
+    assert 'Lea Schmidt' in names          # Lufthansa + MUC
+    assert 'Luisa Hoffmann' not in names   # Lufthansa aber FRA
+    assert 'Erik Wenzel' not in names      # Eurowings
+
+
+def test_filter_airline_case_insensitive_disk(tmp_path):
+    """airline-Vergleich ist case-insensitiv (disk-Pfad): 'LUFTHANSA' == 'lufthansa'."""
+    d = str(tmp_path)
+    _write_disk_profiles(d, _FILTER_PROFILES)
+    r = _search_raw(d, 'airline=LUFTHANSA')
+    assert r.status_code == 200
+    names = {u['name'] for u in r.get_json()['users']}
+    assert 'Luisa Hoffmann' in names
+    assert 'Lea Schmidt' in names
+
+
+def test_no_filter_no_q_returns_400(tmp_path):
+    """Kein q und kein Filter → 400 min_query_or_filter_required."""
+    d = str(tmp_path)
+    _write_disk_profiles(d, _FILTER_PROFILES)
+    r = _search_raw(d, '')
+    assert r.status_code == 400
+    assert r.get_json().get('error') == 'min_query_or_filter_required'

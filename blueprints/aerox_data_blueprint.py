@@ -59,6 +59,21 @@ _FREE_CREW_LIVE_LOCK = threading.Lock()
 _FREE_CREW_LIVE_HIT_TTL = 45.0
 _FREE_CREW_LIVE_MISS_TTL = 15.0
 
+# Board-Fakten-Memo (Owner „Detail lädt langsam", Latenz-Sweep): _flight_facts_
+# from_obs macht einen Supabase-Read + spürbare CPU-Row-Selektion und wird auf dem
+# KRITISCHEN (seriellen) resolve-Pfad des Detail-Aggregats MEHRFACH mit identischem
+# (flight,date) aufgerufen — einmal im resolve selbst (aircraft_live-Miss →
+# Obs-Route), gleich danach im _enrich_flight_status_with_obs, und der Standalone-
+# uflight-Pfad noch einmal. Ein kurzes prozessweites Memo kollabiert diese zu EINER
+# DB-Runde + EINER Berechnung; TTL bleibt kurz, damit frische Board-Ist-Zeiten/Gates
+# nicht kleben. Key inkl. dep/arr, weil die (optionale) Airport-Constraint das
+# Ergebnis ändert. Best-effort: bei jedem Fehler fällt der Wrapper auf den echten
+# (uncached) Call zurück — nie eine Ausnahme aus dem Cache-Pfad durchreichen.
+_OBS_FACTS_MEMO = {}            # (flight, date, dep, arr) -> (stored_at, facts_dict)
+_OBS_FACTS_LOCK = threading.Lock()
+_OBS_FACTS_TTL = 30.0          # s — deckt einen Aggregat-Fan-out + Folge-Poll ab
+_OBS_FACTS_MEMO_MAX = 512
+
 
 def _ensure_db():
     """Entpackt die gebackene DB einmalig nach /tmp und öffnet sie read-only."""
@@ -3992,6 +4007,47 @@ def _fr24_dep_obs_exists(flight_no, date, dep_iata):
 
 
 def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
+    """Board-Fakten EINES Flugs (memoisiert). Kurzes prozessweites Cache über
+    (flight,date,dep,arr) — der Detail-Aggregat-Kaltstart ruft dieselbe (fn,date)-
+    Kombination auf dem seriellen resolve-Pfad mehrfach auf (resolve-Obs-Route +
+    _enrich + Standalone-uflight). Das Memo kollabiert diese redundanten Supabase-
+    Reads + Row-Selektionen zu EINEM Zug (TTL 30 s, damit Ist-Zeiten frisch
+    bleiben). Bei jedem Cache-Fehler transparenter Fallback auf den echten Call —
+    die berechnete Antwort ist byte-identisch zum ungecachten Pfad. Kopie raus,
+    damit Consumer (die Felder mutieren) das Memo nicht vergiften."""
+    fn = (flight_no or '').replace(' ', '').upper().strip()
+    d = ((date or '').strip()[:10]) or time.strftime('%Y-%m-%d', time.gmtime())
+    dep = (dep_iata or '').upper().strip() or None
+    arr = (arr_iata or '').upper().strip() or None
+    if not fn:
+        return {}
+    key = (fn, d, dep, arr)
+    now = time.time()
+    try:
+        with _OBS_FACTS_LOCK:
+            hit = _OBS_FACTS_MEMO.get(key)
+            if hit is not None and (now - hit[0]) < _OBS_FACTS_TTL:
+                return dict(hit[1])
+    except Exception:
+        pass
+    facts = _flight_facts_from_obs_uncached(flight_no, date,
+                                            dep_iata=dep_iata, arr_iata=arr_iata)
+    if not isinstance(facts, dict):
+        return facts
+    try:
+        with _OBS_FACTS_LOCK:
+            _OBS_FACTS_MEMO[key] = (now, dict(facts))
+            if len(_OBS_FACTS_MEMO) > _OBS_FACTS_MEMO_MAX:
+                # ältestes Viertel verwerfen (gleiche Politik wie _memo_put).
+                items = sorted(_OBS_FACTS_MEMO.items(), key=lambda kv: kv[1][0])
+                for k, _v in items[:len(items) // 4 or 1]:
+                    _OBS_FACTS_MEMO.pop(k, None)
+    except Exception:
+        pass
+    return facts
+
+
+def _flight_facts_from_obs_uncached(flight_no, date, dep_iata=None, arr_iata=None):
     """Board-Fakten EINES Flugs aus airport_delay_obs (DEP + <arr>#ARR gemergt).
     Timeout-sicher (eigener try, Fehler → {}), indizierte Filter (date+flight).
     Museums-Regs (Board-Altlast) werden am Ausgang gescrubbt — reg/type nur,

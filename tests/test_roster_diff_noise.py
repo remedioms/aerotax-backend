@@ -47,3 +47,31 @@ def test_removed_still_reported():
     new = []
     d = A._compute_roster_diff(old, new, today=TODAY)
     assert len(d) == 1 and d[0]['kind'] == 'removed'
+
+def test_semantically_identical_roster_yields_no_change():
+    # Kern-Regression (Tibor 2026-07-17): ein Roster, das sich NUR in
+    # Formatierung/Whitespace/Gross-Kleinschreibung unterscheidet, ist KEINE
+    # Aenderung → ZERO Diffs (kein falscher „Dienstplan-Aenderung"-Push).
+    old = [
+        _day('2026-07-16', klass='Z76', routing='FRA-JFK', start='08:00',
+             end='17:30', lay='JFK'),
+        _day('2026-07-17', klass='Frei'),
+    ]
+    new = [
+        # gleiche Substanz, andere Schreibweise/Whitespace/Case
+        _day('2026-07-16', klass='z76', routing=' FRA - JFK ', start='08:00',
+             end='17:30', lay='jfk'),
+        _day('2026-07-17', klass='FREI'),
+    ]
+    d = A._compute_roster_diff(old, new, today=TODAY)
+    assert d == []
+
+def test_exact_same_roster_yields_no_change():
+    # Byte-identisches Re-Sync (haeufigster Fall) → ZERO Diffs.
+    r = [
+        _day('2026-07-16', klass='Z76', routing='FRA-JFK', start='08:00',
+             end='17:30', lay='JFK'),
+        _day('2026-07-18', klass='Standby'),
+    ]
+    d = A._compute_roster_diff([dict(x) for x in r], [dict(x) for x in r], today=TODAY)
+    assert d == []
