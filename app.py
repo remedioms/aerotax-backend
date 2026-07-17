@@ -21421,7 +21421,7 @@ def forum_create_reply(token, thread_id):
             _push_notify_async(thread_author_token,
                                f'{author_name} hat geantwortet',
                                (text or '')[:120],
-                               data={'type': 'forum_reply'},
+                               data={'type': 'forum_reply', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or '')},
                                idempotency_key=(
                                    f'forum-reply:{reply.get("id")}:{thread_author_token}'))
         # Mentioned-User extra benachrichtigen (nicht doppelt wenn = thread-author)
@@ -21429,7 +21429,7 @@ def forum_create_reply(token, thread_id):
             _push_notify_async(mentioned_token,
                                f'{author_name} hat dich erwähnt',
                                (text or '')[:120],
-                               data={'type': 'forum_mention'},
+                               data={'type': 'forum_mention', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or '')},
                                idempotency_key=(
                                    f'forum-mention:{reply.get("id")}:{mentioned_token}'))
     except Exception:
@@ -22626,7 +22626,7 @@ def layover_rec_add_comment(token, rec_id):
                 _push_notify_async(parent_token,
                                    f'{commenter} hat dir geantwortet',
                                    (text or '')[:120],
-                                   data={'type': 'wall_comment_reply'},
+                                   data={'type': 'wall_comment_reply', 'post_id': str(rec_id), 'comment_id': str(comment.get('id') or ''), 'parent_comment_id': str(parent_comment_id or '')},
                                    idempotency_key=(
                                        f'layover-comment:{comment.get("id")}:{parent_token}'))
     except Exception:
