@@ -171,3 +171,51 @@ def test_outbound_layover_last_arrival_is_remote_station():
         ],
     }
     assert A._feed_nightstop_ort(kai) == 'JFK'
+
+
+# ── NACHT-TURNAROUND-GUARD (2026-07-17) ───────────────────────────────────────
+# Ankunft spätabends an einer Auswärts-Station, Rückabflug in den frühen
+# Morgenstunden des FOLGETAGS (<8h Boden) = KEIN Hotel-Layover. Ohne next_day
+# unverändert (byte-kompatibel); mit next_day fällt der Nightstop weg.
+def test_night_turnaround_next_day_departure_is_no_nightstop():
+    day_n = {
+        'datum': '2026-08-01',
+        'reader_facts': {},
+        'ical_sectors': [
+            {'flight': 'LH1050', 'from': 'FRA', 'to': 'NCE',
+             'dep_iso': '2026-08-01T18:00:00Z', 'arr_iso': '2026-08-01T20:00:00Z'},
+        ],
+    }
+    day_n1 = {
+        'datum': '2026-08-02',
+        'reader_facts': {},
+        'ical_sectors': [
+            {'flight': 'LH1051', 'from': 'NCE', 'to': 'FRA',
+             'dep_iso': '2026-08-02T00:30:00Z', 'arr_iso': '2026-08-02T02:10:00Z'},
+        ],
+    }
+    # ohne Kontext: bisheriges Verhalten (NCE als letzte same-day-Ankunft)
+    assert A._feed_nightstop_ort(day_n) == 'NCE'
+    # mit next_day: 4.5h Boden < 8h → Nacht-Turnaround, kein Nightstop
+    assert A._feed_nightstop_ort(day_n, next_day=day_n1) is None
+
+
+def test_real_layover_next_day_departure_over_8h_is_kept():
+    day_n = {
+        'datum': '2026-08-01',
+        'reader_facts': {},
+        'ical_sectors': [
+            {'flight': 'LH400', 'from': 'FRA', 'to': 'JFK',
+             'dep_iso': '2026-08-01T08:00:00Z', 'arr_iso': '2026-08-01T16:30:00Z'},
+        ],
+    }
+    day_n1 = {
+        'datum': '2026-08-02',
+        'reader_facts': {},
+        'ical_sectors': [
+            {'flight': 'LH401', 'from': 'JFK', 'to': 'FRA',
+             'dep_iso': '2026-08-02T21:00:00Z', 'arr_iso': '2026-08-03T06:15:00Z'},
+        ],
+    }
+    # >28h Boden → echter Layover, JFK bleibt Nightstop.
+    assert A._feed_nightstop_ort(day_n, next_day=day_n1) == 'JFK'

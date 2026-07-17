@@ -12651,7 +12651,7 @@ def _station_local_date(iso_utc, iata):
         return None
 
 
-def _feed_nightstop_ort(day, homebase=None):
+def _feed_nightstop_ort(day, homebase=None, next_day=None):
     """Der Übernachtungs-/Nightstop-Ort EINES Roster-Tages für die FEED-Flächen
     (friends-today `lay_eff`, Crew-Vergleich/Overlap-Edges, Family, Layover-Rec-
     Discover). Vereinheitlichte Ableitung — vorher las jede Fläche `reader_facts.
@@ -12696,6 +12696,7 @@ def _feed_nightstop_ort(day, homebase=None):
             [s for s in secs if isinstance(s, dict) and s.get('arr_iso')],
             key=lambda s: str(s.get('dep_iso') or s.get('arr_iso') or ''))
         last_same_day = None
+        last_arr_iso = None
         for s in ordered:
             to = str(s.get('to') or '').strip().upper()
             if not (len(to) == 3 and to.isalpha()):
@@ -12707,6 +12708,7 @@ def _feed_nightstop_ort(day, homebase=None):
                 continue
             if arr_date == datum:
                 last_same_day = to
+                last_arr_iso = s.get('arr_iso')
             # arr_date > datum (Red-Eye) ⇒ überspringen; arr_date < datum kommt
             # bei sauber sortierten Tages-Sektoren praktisch nicht vor.
         if last_same_day:
@@ -12714,6 +12716,31 @@ def _feed_nightstop_ort(day, homebase=None):
             # außerhalb → Reader-Fallback (typisch None), kein Basis-Pin.
             if hb and last_same_day == hb:
                 return fallback
+            # NACHT-TURNAROUND-GUARD (2026-07-17): verlässt die Crew `last_same_day`
+            # am FOLGETAG innerhalb von <8h wieder (Ankunft spätabends, Rückabflug
+            # in den frühen Morgenstunden — KEIN Hotel-Layover), ist es kein
+            # Nightstop. Ohne `next_day` (statische Feed-Flächen) unverändert. Nur
+            # additiv — dieselbe „echter Aufenthalt = 8h Boden"-Regel wie iOS
+            # TripStayRule/makeTourBlock, damit Backend und App EINE Wahrheit teilen.
+            if isinstance(next_day, dict) and last_arr_iso:
+                nsecs = next_day.get('ical_sectors')
+                if isinstance(nsecs, list):
+                    try:
+                        _arr = datetime.fromisoformat(
+                            str(last_arr_iso).replace('Z', '+00:00'))
+                        for ns in sorted(
+                                [x for x in nsecs
+                                 if isinstance(x, dict) and x.get('dep_iso')],
+                                key=lambda x: str(x.get('dep_iso') or '')):
+                            if str(ns.get('from') or '').strip().upper() != last_same_day:
+                                continue
+                            _dep = datetime.fromisoformat(
+                                str(ns.get('dep_iso')).replace('Z', '+00:00'))
+                            if 0 <= (_dep - _arr).total_seconds() < 8 * 3600:
+                                return fallback   # Nacht-Turnaround, kein Nightstop
+                            break
+                    except Exception:
+                        pass
             return last_same_day
     except Exception:
         return fallback
@@ -12754,7 +12781,7 @@ def get_friend_roster(token, friend_token):
     today = _date.today()
     cutoff = today + _td(days=days_limit)
     out = []
-    for day in tage:
+    for _i, day in enumerate(tage):
         if not isinstance(day, dict): continue
         d = day.get('datum')
         if not d: continue
@@ -12766,7 +12793,9 @@ def get_friend_roster(token, friend_token):
         rf = day.get('reader_facts') or {}
         # Nightstop = letzte Tages-Ankunft aus ical_sectors (Fallback: das rohe
         # reader_facts.layover_ort, das bei Turnaround-Tagen einen Vortags-Wert trug).
-        _lay = _feed_nightstop_ort(day)
+        # next_day → Nacht-Turnaround-Guard (Ankunft spät, Rückabflug <8h Folgetag).
+        _nd = tage[_i + 1] if _i + 1 < len(tage) else None
+        _lay = _feed_nightstop_ort(day, next_day=_nd)
         out.append({
             'datum': d,
             'klass': day.get('klass'),
@@ -29912,7 +29941,14 @@ def _airport_local_now(iata):
     voreilig als abgeflogen persistiert (Phantom) ODER bereits abgeflogene gar
     nicht als „passed" erkannt → die Tages-Stichprobe war systematisch falsch/
     unvollständig. Jetzt ankern wir an der ECHTEN Flughafen-Ortszeit."""
-    from datetime import datetime, timezone, timedelta
+    # KEIN lokaler `from datetime import datetime` mehr (2026-07-17): der lokale
+    # Import überschattete das modul-weite `datetime` und machte diese Funktion
+    # gegen einen eingefrorenen Test-Clock (monkeypatch A.datetime) IMMUN — ein
+    # datums-abhängiger Flake (`test_friend_roster_free_only…` grün nur am
+    # 2026-07-16, weil `_is_today_at` die ECHTE Uhr las statt der eingefrorenen).
+    # Modul-`datetime` (Zeile 18) ist in Produktion die echte Uhr → kein Verhaltens-
+    # unterschied, aber jetzt konsistent mockbar. timezone/timedelta waren hier
+    # ungenutzt.
     tzname = None
     try:
         ap = (iata or '').upper().strip().split('#', 1)[0]  # '#ARR'-Suffix entfernen

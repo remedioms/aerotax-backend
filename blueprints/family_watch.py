@@ -2290,7 +2290,7 @@ def _load_crew_roster_days(crew_token, days_limit):
     today = _date.today()
     cutoff = today + _td(days=days_limit)
     out = []
-    for day in tage:
+    for _i, day in enumerate(tage):
         if not isinstance(day, dict):
             continue
         d = day.get('datum')
@@ -2307,7 +2307,8 @@ def _load_crew_roster_days(crew_token, days_limit):
         # mit friends-today/Crew-Vergleich; Fallback = rohes reader_facts.
         # layover_ort, das bei Multi-Leg-Turnaround-Tagen einen Vortags-Wert trug).
         _ns = _app_attr('_feed_nightstop_ort')
-        _lay = _ns(day) if callable(_ns) else rf.get('layover_ort')
+        _nd = tage[_i + 1] if _i + 1 < len(tage) else None
+        _lay = _ns(day, next_day=_nd) if callable(_ns) else rf.get('layover_ort')
         out.append({
             'datum': d,
             'klass': day.get('klass'),
