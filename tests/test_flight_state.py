@@ -813,3 +813,51 @@ def test_diverted_crew_leg_kind_is_flown():
     assert _kind_for(DIVERTED) == "flown"
     assert _kind_for(LANDED) == "flown"
     assert _kind_for(AIRBORNE) == "flying"
+
+
+def test_signal_lost_near_dest_past_eta_lands_estimated():
+    """Lane/LX1719 2026-07-17 (Echtfall): der Harvester verlor die Maschine in
+    der ZRH-Warteschleife (5300 ft, ~26 km vom Ziel, gs 244), danach 31 min
+    Funkstille; die ETA war 26 min verstrichen. aircraft_live gilt 35 min als
+    frisch -> ohne die LOST_NEAR_DEST-Regel blieb die Phase AIRBORNE und der
+    Feed zeigte "IM FLUG". Physik (tief + nahe Ziel + Stille + ETA erreicht)
+    ueberstimmt die Freshness: LANDED (estimated), kein Live-Dot."""
+    ZRH = (47.4647, 8.5492)
+    BDS = (40.6576, 17.9478)
+    last = {"lat": 47.695, "lon": 8.504, "track": 257, "gs_kt": 244,
+            "alt_ft": 5300, "position_source": 3}
+    fs = resolve_flight_state(
+        keys={"flight": "LX1719", "date": "2026-07-09", "dep_iata": "BDS",
+              "arr_iata": "ZRH", "dep_ll": BDS, "arr_ll": ZRH,
+              "sched_dep_ts": NOW - 2.5 * 3600},
+        observations=[
+            Observation("position", last, "aircraft_live", NOW - 31 * 60),
+            Observation("arr_time", {"est": E._ts_to_iso(NOW - 26 * 60)},
+                        "board", NOW - 3600),
+        ], now=NOW)
+    assert fs["phase"] == LANDED
+    assert fs["phase_conf"] == ESTIMATED
+    assert fs["phase_source"] == "signal_lost_near_dest"
+    assert fs["live"] is None
+    assert fs["in_flight"] is False
+
+
+def test_signal_lost_near_dest_needs_silence_low_and_eta():
+    """Gegenprobe zur LOST_NEAR_DEST-Regel: ein FRISCHER Fix (5 min) in
+    derselben Lage bleibt AIRBORNE/APPROACH (Warteschleife ist real moeglich,
+    solange die Maschine sendet) - die Regel braucht die Funkstille."""
+    ZRH = (47.4647, 8.5492)
+    BDS = (40.6576, 17.9478)
+    last = {"lat": 47.695, "lon": 8.504, "track": 257, "gs_kt": 244,
+            "alt_ft": 5300, "position_source": 3}
+    fs = resolve_flight_state(
+        keys={"flight": "LX1719", "date": "2026-07-09", "dep_iata": "BDS",
+              "arr_iata": "ZRH", "dep_ll": BDS, "arr_ll": ZRH,
+              "sched_dep_ts": NOW - 2.5 * 3600},
+        observations=[
+            Observation("position", last, "aircraft_live", NOW - 5 * 60),
+            Observation("arr_time", {"est": E._ts_to_iso(NOW - 26 * 60)},
+                        "board", NOW - 3600),
+        ], now=NOW)
+    assert fs["phase"] in (AIRBORNE, APPROACH)
+    assert fs["in_flight"] is True

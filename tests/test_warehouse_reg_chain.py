@@ -697,3 +697,33 @@ def test_flight_info_p5_fill_uses_fresh_facts(client):
     b = r.get_json()
     assert b.get('esti_arr') == '2026-07-01T18:20:00+02:00'
     assert b.get('arr_status') == 'Gelandet'
+
+
+def test_service_day_plan_row_with_dated_esti_uses_esti_day():
+    """LH781-Echtfall 2026-07-17: Abend-Poll der FRA-ARR-Tafel (21:45 lokal)
+    listet den MORGIGEN Lauf als 'Geplant' mit voll datierter Prognose
+    esti='2026-07-14T06:25:00+0200', sched nur '06:40'. Der esti-Kurzschluss
+    stempelte die Row auf den Poll-Tag (13.) -> gleicher Key wie die ECHTE
+    Morgens-Ankunft des 13. -> ueberschrieben; flight-info lieferte die
+    Ist-Zeit des falschen Tages (iOS '+1.438 min'). Plan-artig + voll
+    datiertes esti => Verkehrstag = esti-Datum."""
+    from datetime import datetime
+    now = datetime(2026, 7, 13, 21, 45)
+    assert A._obs_service_day('06:40', '2026-07-13', now, status='Geplant',
+                              esti='2026-07-14T06:25:00+0200') == '2026-07-14'
+
+
+def test_service_day_actual_row_with_dated_esti_stays_on_poll_day():
+    """Gegenprobe: eine ECHTE Ist-Row (baggage delivery finished) mit voll
+    datiertem esti bleibt beim Poll-Tag — ein ueber Mitternacht verspaeteter
+    Lauf wandert NICHT auf den Folgetag."""
+    from datetime import datetime
+    now = datetime(2026, 7, 16, 16, 35)
+    assert A._obs_service_day('06:40', '2026-07-16', now,
+                              status='baggage delivery finished',
+                              esti='2026-07-16T06:22:00+0200') == '2026-07-16'
+    # Und ein nach Mitternacht datiertes Ist eines Abend-Abflugs bleibt ebenso
+    # beim Verkehrstag des Abflugs (Poll-Tag).
+    assert A._obs_service_day('23:40', '2026-07-12', datetime(2026, 7, 13, 0, 20),
+                              status='Departed',
+                              esti='2026-07-13T00:15:00+0200') == '2026-07-12'

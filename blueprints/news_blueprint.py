@@ -1013,14 +1013,24 @@ def _entry_image_url(entry):
 
 
 def _entry_hashtags(entry):
-    """Extrahiert RSS-Tags/Categories als hashtag-Liste."""
+    """Extrahiert RSS-Tags/Categories als hashtag-Liste.
+
+    Erlaubt Unicode-Buchstaben und -Ziffern damit Umlaute (Ö, Ü, Ä, ö, ü, ä)
+    und nicht-ASCII-Zeichen in Tags erhalten bleiben — z.B. „Österreich" statt
+    „sterreich" (Bug: [^a-zA-Z0-9] schnitt führendes Ö ab).
+    Bindestriche erlaubt für zusammengesetzte Tags wie „go-around".
+    """
     tags = entry.get('tags') or []
     out = []
     for t in tags:
         term = (t or {}).get('term') if isinstance(t, dict) else None
         if not term:
             continue
-        slug = re.sub(r'[^a-zA-Z0-9]', '', term)[:40]
+        # Behalte Unicode-Buchstaben (\w ohne _) + Ziffern + Bindestrich.
+        # re.UNICODE ist in Python 3 Standard → \w matcht Umlaute etc.
+        slug = re.sub(r'[^\w\-]', '', term.replace('_', '-'), flags=re.UNICODE)[:40]
+        # Entferne führende/abschließende Bindestriche die durch das Strip entstehen.
+        slug = slug.strip('-')
         if slug:
             out.append(slug)
     return out[:6]

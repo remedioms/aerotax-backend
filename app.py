@@ -35583,6 +35583,27 @@ def _obs_service_day(sched, fallback_date, now_local=None,
             return d
         except Exception:
             pass
+    # 1b) Volles Datum im ESTI einer PLAN-artigen Row (LH781-Fix 2026-07-17):
+    # Der Abend-Poll der ARR-Tafel listet den MORGIGEN Lauf als „Geplant" mit
+    # voll datierter Prognose ('2026-07-14T06:25:00+0200'). Der esti-Kurzschluss
+    # unten („esti ⇒ heutiger Tag") stempelte diese Folgetags-Row auf den
+    # Poll-Tag — gleicher (date,airport,flight,sched)-Key wie die ECHTE
+    # Morgens-Ankunft desselben Tages ⇒ sie wurde ÜBERSCHRIEBEN und flight-info
+    # lieferte die Ist-Zeit des falschen Tages (iOS zeigte „+1.438 min").
+    # Trägt das esti ein volles Datum UND ist der Status plan-artig (kein Ist),
+    # ist DAS der Verkehrstag. Echte Ist-Rows (departed/landed/baggage…) bleiben
+    # unberührt beim Poll-Tag — ein über Mitternacht verspäteter Abflug wandert
+    # dadurch NICHT auf den Folgetag.
+    if isinstance(esti, str):
+        e = esti.strip()
+        st0 = (status or '').strip().lower()
+        if (len(e) >= 10 and e[4] == '-' and e[7] == '-'
+                and (not st0 or st0 in _PLAN_LIKE_STATUS)):
+            try:
+                _dt.strptime(e[:10], '%Y-%m-%d')
+                return e[:10]
+            except Exception:
+                pass
     # 2) Nur HH:MM (kein Datum im sched) → Folgetags-Heuristik gegen fallback_date.
     if not fb:
         return fb

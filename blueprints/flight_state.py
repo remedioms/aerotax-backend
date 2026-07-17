@@ -84,6 +84,12 @@ MAX_AGE = {
 SIM_MAX_AGE_S = 45 * 60           # cap forward-sim at 45 min of last real fix
 ETA_OVERRUN_S = 30 * 60           # >30 min past ETA with no arrival -> UNKNOWN
 NEAR_AIRPORT_KM = 8.0
+# LOST_NEAR_DEST -> LANDED(estimated): Funkstille nach tiefem Fix nahe dem Ziel
+# + ETA erreicht (Lane/LX1719 2026-07-17 — Harvester verlor die Maschine in der
+# Warteschleife 12 min vor Touchdown, Phase blieb 30+ min AIRBORNE).
+LOST_NEAR_DEST_MIN_AGE_S = 10 * 60   # so lange Funkstille, bevor die Regel greift
+LOST_NEAR_DEST_KM = 50.0             # letzter Fix höchstens so weit vom Ziel
+LOST_NEAR_DEST_MAX_ALT_FT = 8000     # letzter Fix tief (Anflug), kein Überflieger
 
 # Plausible taxi-out window (off-block -> take-off). If a flight has been
 # off-block LONGER than this, is still before its expected arrival, and there is
@@ -800,6 +806,33 @@ def resolve_flight_state(keys: dict, observations: list, *, now: Optional[float]
 
         if live:
             progress = _progress(keys.get("dep_ll"), keys.get("arr_ll"), render_pos)
+
+    # LOST_NEAR_DEST -> LANDED(estimated) (Lane/LX1719 2026-07-17): der FR24-
+    # Harvester verlor die Maschine in der ZRH-Warteschleife auf 5300 ft, 12 min
+    # vor Touchdown — danach kam NIE wieder ein Fix und (euscraper-Lücke) keine
+    # ARR-Obs. Die 35-min-Freshness von aircraft_live hielt den 31-min-Fix für
+    # „live" → Feed zeigte 30+ min nach Landung „IM FLUG" bei 244 kt. Das
+    # Freshness-Fenster ist für Cruise-Abdeckungslöcher (Ozean) gebaut — im
+    # dichten Terminal-Luftraum unter ~8000 ft bedeutet >10 min Funkstille bei
+    # erreichter ETA: gelandet. Physik überstimmt hier die Freshness (analog
+    # approach_timeout, conf=ESTIMATED). Distanz+Höhen-Gate schützt Überflieger;
+    # ein echter frischer airborne-Fix ginge als neue Obs wieder durch T3.
+    if phase in IN_AIR and raw_pos and pos_ts:
+        _lost_age = now - pos_ts
+        _lost_alt = _num(raw_pos.get("alt_ft"))
+        _lost_arr_ll = keys.get("arr_ll")
+        _lost_dist = None
+        if _lost_arr_ll and None not in _lost_arr_ll and raw_pos.get("lat") is not None:
+            _lost_dist = _gc_km(raw_pos["lat"], raw_pos["lon"],
+                                _lost_arr_ll[0], _lost_arr_ll[1])
+        _lost_eta = (_iso_to_ts(eta_iso) if eta_iso else None) \
+            or _expected_arr_ts(observations, keys)
+        if (_lost_age > LOST_NEAR_DEST_MIN_AGE_S
+                and _lost_dist is not None and _lost_dist < LOST_NEAR_DEST_KM
+                and _lost_alt is not None and _lost_alt < LOST_NEAR_DEST_MAX_ALT_FT
+                and _lost_eta is not None and now >= _lost_eta):
+            phase, phase_conf, phase_source = LANDED, ESTIMATED, "signal_lost_near_dest"
+            live, progress, live_status = None, None, "lost"
 
     # hard cap: sim running too long past ETA with no arrival -> UNKNOWN
     if phase in IN_AIR and live and live["conf"] == SIMULATED:
