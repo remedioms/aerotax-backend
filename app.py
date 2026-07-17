@@ -17513,18 +17513,122 @@ def take_roster_snapshot(token):
     return jsonify({'ok': True, 'changes_count': len(diff), 'changes': diff})
 
 
+def _rc_local_hhmm(iso, iata):
+    """UTC-ISO → station-lokale HH:MM (airport_tz, Fallback Europe/Berlin). '' bei
+    Parse-Fehler. Wirft nie."""
+    try:
+        s = str(iso or '').strip()
+        if not s:
+            return ''
+        dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        ap = _DE_ICAO_TO_IATA.get((iata or '').upper(), (iata or '').upper())
+        tzname = ('Europe/Berlin' if ap in ('FRA', 'EDDF', '') else airport_tz(ap))
+        from zoneinfo import ZoneInfo as _ZI
+        return dt.astimezone(_ZI(tzname or 'Europe/Berlin')).strftime('%H:%M')
+    except Exception:
+        return ''
+
+
+def _roster_change_summary(entry):
+    """Kurzer, MENSCHLICHER Text WAS sich an einem Roster-Tag geändert hat (Julia
+    Sievert 2026-07-17: „ich sehe 1 bei Kalender, sehe aber nicht, WAS die Änderung
+    ist"). Rein aus dem im Change gespeicherten old/new abgeleitet — defensiv, nie
+    werfen, '' wenn nichts Nennenswertes ableitbar. Max ~3 Teile."""
+    try:
+        kind = entry.get('kind')
+
+        def _route(day):
+            secs = (day or {}).get('ical_sectors') or []
+            chain = []
+            for s in secs:
+                if not isinstance(s, dict):
+                    continue
+                for c in (str(s.get('from') or '').upper(), str(s.get('to') or '').upper()):
+                    if len(c) == 3 and c.isalpha() and (not chain or chain[-1] != c):
+                        chain.append(c)
+            if len(chain) >= 2:
+                return '-'.join(chain)
+            return str((day or {}).get('routing') or '').strip()
+
+        if kind == 'added':
+            r = _route(entry.get('new'))
+            return ('Neuer Dienst' + (f' · {r}' if r else '')).strip(' ·')
+        if kind == 'removed':
+            r = _route(entry.get('old'))
+            return ('Dienst entfernt' + (f' · {r}' if r else '')).strip(' ·')
+
+        a, b = entry.get('old') or {}, entry.get('new') or {}
+        parts = []
+        # Route/Strecke geändert.
+        ra, rb = _route(a), _route(b)
+        if ra and rb and ra != rb:
+            parts.append(f'Route {ra} → {rb}')
+        # Pro-Leg-Vergleich nach Flugnummer (Flugzeug/Reg + Zeiten).
+        def _by_flight(day):
+            out = {}
+            for s in (day.get('ical_sectors') or []):
+                if isinstance(s, dict):
+                    fn = str(s.get('flight') or '').replace(' ', '').upper()
+                    if fn:
+                        out.setdefault(fn, s)
+            return out
+        fa, fb = _by_flight(a), _by_flight(b)
+        for fn in [f for f in fb if f in fa]:
+            sa, sb = fa[fn], fb[fn]
+            rega = str(sa.get('reg') or sa.get('tail') or '').upper()
+            regb = str(sb.get('reg') or sb.get('tail') or '').upper()
+            if rega and regb and rega != regb:
+                parts.append(f'Flugzeug {fn}: {rega} → {regb}')
+            elif regb and not rega:
+                parts.append(f'Flugzeug {fn}: {regb}')
+            da, db = _rc_local_hhmm(sa.get('dep_iso'), sa.get('from')), _rc_local_hhmm(sb.get('dep_iso'), sb.get('from'))
+            if da and db and da != db:
+                parts.append(f'Abflug {fn}: {da} → {db}')
+            aa, ab = _rc_local_hhmm(sa.get('arr_iso'), sa.get('to')), _rc_local_hhmm(sb.get('arr_iso'), sb.get('to'))
+            if aa and ab and aa != ab:
+                parts.append(f'Ankunft {fn}: {aa} → {ab}')
+        if not parts:
+            # Kein Leg-Detail ableitbar (nur klass/Zeiten-Marker o.Ä.) → generisch,
+            # aber ehrlich statt leer.
+            return 'Dienst geändert'
+        return ' · '.join(parts[:3])
+    except Exception:
+        return ''
+
+
 @app.route('/api/user/roster-changes/<token>', methods=['GET'])
 def get_roster_changes(token):
-    """Liste aller pending + history Roster-Änderungen."""
+    """Liste aller pending + history Roster-Änderungen — jede mit einem kurzen
+    `summary` („WAS hat sich geändert", aus old/new abgeleitet)."""
     cp = _roster_changes_path(token)
     if not cp: return jsonify({'error': 'invalid token'}), 400
     try:
         with open(cp) as f: data = json.load(f)
     except FileNotFoundError:
         data = {'pending': [], 'history': []}
+
+    def _slim(entries):
+        out = []
+        for e in (entries or []):
+            if not isinstance(e, dict):
+                continue
+            # Nur die schlanken Felder + summary an den Client (old/new bleiben
+            # server-seitig, sparen Payload).
+            out.append({
+                'datum': e.get('datum'),
+                'kind': e.get('kind'),
+                'detected_at': e.get('detected_at'),
+                'status': e.get('status'),
+                'decision': e.get('decision'),
+                'summary': _roster_change_summary(e),
+            })
+        return out
+
     return jsonify({
-        'pending': data.get('pending') or [],
-        'history': (data.get('history') or [])[-50:],
+        'pending': _slim(data.get('pending')),
+        'history': _slim((data.get('history') or [])[-50:]),
     })
 
 
