@@ -193,7 +193,10 @@ def test_merge_persists_landed_past_arrival(monkeypatch):
     now_local = A._airport_local_now('FRA#ARR')
     sched = (now_local - timedelta(minutes=40)).strftime('%Y-%m-%dT%H:%M:00')
     esti = (now_local - timedelta(minutes=28)).strftime('%Y-%m-%dT%H:%M:00')
-    date_str = now_local.strftime('%Y-%m-%d')
+    # Midnight-robust (2026-07-18): der Store keyt nach dem SCHED-Datum. Kurz nach
+    # Mitternacht liegt `now-40min` schon auf GESTERN → `now`-Datum als Key-Tag
+    # mismatcht den Store (Flake). Das Betriebstag-/Key-Datum aus dem sched ziehen.
+    date_str = sched[:10]
     row = {'flight': 'LH919', 'sched': sched, 'esti': esti, 'status': 'Gelandet',
            'reg': 'DAINX', 'aircraft': 'A20N', 'dest_iata': 'LHR',
            'dest_name': 'London-Heathrow', 'airline': 'LH', 'gate': '',

@@ -39695,11 +39695,32 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
                 if fmin < _month_start:
                     fmin = _month_start
             dbg['window'] = f'{fmin}..{fmax}'
+            # ZUKUNFTS-GEIST-PRUNE (Jennifer Orhan 2026-07-18: stornierter SFO-Trip
+            # 31.07–01.08 überlebte, weil er HINTER dem geschrumpften Feed-Horizont
+            # (29.07) lag → außerhalb [fmin..fmax]). Der myTime-Feed IST die Wahrheit:
+            # schrumpft sein Horizont (Trip storniert/Plan geändert), sind unsere
+            # gespeicherten Tage DAHINTER veraltete Geister. Die räumen wir zusätzlich —
+            # ABER NUR ZUKUNFT (>= heute) und NUR wenn der Feed gesund BIS MINDESTENS
+            # HEUTE reicht (sonst würde ein abgelaufener/abgeschnittener Feed echte
+            # Zukunft löschen). Vergangenheit bleibt IMMER unangetastet (Historie) —
+            # ein paar Tage Sync-Delay-Grace deckt bereits das Monats-Fenster oben ab.
+            _today_str = datetime.now().strftime('%Y-%m-%d')
+            _future_prune_ok = fmax >= _today_str
+
+            def _is_stale_day(dkey):
+                if dkey in feed_dates:
+                    return False
+                if fmin <= dkey <= fmax:
+                    return True                    # in Feed-Spanne, nicht mehr im Feed → storniert
+                if _future_prune_ok and dkey > fmax and dkey >= _today_str:
+                    return True                    # Zukunfts-Geist HINTER dem Feed-Horizont
+                return False
+
             ical_keys = ('ical_summary', 'ical_location', 'ical_start_iso',
                          'ical_end_iso', 'ical_klass', 'ical_layover_ort',
                          'ical_imported_at', 'block_minutes')
             for dkey in list(briefings.keys()):
-                if fmin <= dkey <= fmax and dkey not in feed_dates:
+                if _is_stale_day(dkey):
                     b = briefings.get(dkey) or {}
                     if any(b.get(k) for k in ('ical_summary', 'ical_location',
                                               'ical_start_iso', 'ical_end_iso')):
@@ -39717,7 +39738,7 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
                 manual = dict(_manual_briefings_load(token) or {})
                 m_changed = False
                 for dkey in list(manual.keys()):
-                    if fmin <= dkey <= fmax and dkey not in feed_dates:
+                    if _is_stale_day(dkey):
                         mb = manual.get(dkey) or {}
                         if any(mb.get(k) for k in ('ical_summary', 'ical_location',
                                                    'ical_start_iso', 'ical_end_iso')):

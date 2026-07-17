@@ -4049,6 +4049,170 @@ def _fr24_dep_obs_exists(flight_no, date, dep_iata):
     return False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  PAID-FR24-ESKALATION für die In-Flight-Karte (/api/ax/flight-live)
+#  ───────────────────────────────────────────────────────────────────────────
+#  Root-Cause (SWISS LX8 ZRH→ORD, 2026-07-17): US-Airport ohne Ankunfts-Board +
+#  eine 3 h alte gRPC-Position → iOS simulierte den Grosskreis vorwaerts und zeigte
+#  „+21 min, fliegt, Ankunft 16:16 ORD", obwohl der Flug LANGST GELANDET war.
+#  Die free-Kette kann das nicht wissen (kein Board, keine frische Position). NUR
+#  in genau diesem „unzuverlaessig"-Fall (in-flight-Behauptung + ETA lange vorbei +
+#  Position stale + noch keine ARR-Obs) eskalieren wir auf EINEN bezahlten FR24-
+#  Summary-Call (_fr24_fill_missing_arrival — budget-gedeckelt, 6 h negativ-gecached,
+#  row-dedupt, hart auf FN|<fn>|<date> gecached → ein Crew-Poll bedient alle gratis)
+#  und stellen — egal ob der Call was liefert — die EHRLICHE Anzeige her: keine
+#  vorgespiegelte Live-Position/ETA mehr. Die harten Wachen bleiben
+#  _fr24_arr_backfill_enabled() (Default AUS!) + _fr24_budget_ok().
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _pos_is_stale(pos, max_age_min=30):
+    """True, wenn `pos` fehlt ODER sein Beobachtungs-Zeitstempel (obs_ts/seen_ts/ts)
+    aelter als max_age_min gegenueber jetzt (UTC) ist. Ohne Zeitstempel: stale=True
+    (wir koennen die Frische nicht belegen). Wirft NIE."""
+    try:
+        if not pos:
+            return True
+        raw = pos.get('obs_ts')
+        if raw is None:
+            raw = pos.get('seen_ts')
+        if raw is None:
+            raw = pos.get('ts')
+        if raw is None:
+            return True
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc)
+        ts = None
+        # numerischer Epoch (aircraft_live-Store: ts=time.time(); seen_ts evtl. Zahl)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            try:
+                ts = _dt.fromtimestamp(float(raw), _tz.utc)
+            except Exception:
+                ts = None
+        else:
+            # ISO-String (…Z / mit Offset). _iso_utc_dt akzeptiert nur aware ISO.
+            ts = _iso_utc_dt(str(raw))
+            if ts is None:
+                try:
+                    _p = _dt.fromisoformat(str(raw).strip().replace('Z', '+00:00'))
+                    ts = _p.astimezone(_tz.utc) if _p.tzinfo else None
+                except Exception:
+                    ts = None
+        if ts is None:
+            return True
+        age_min = (now - ts).total_seconds() / 60.0
+        return age_min > float(max_age_min)
+    except Exception:
+        return True
+
+
+def _est_arr_passed(payload, grace_min=10):
+    """True, wenn die (delay-korrigierte) Ankunft des Flugs komfortabel (grace_min)
+    in der VERGANGENHEIT liegt (UTC). Liest est_arr → sched_arr aus dem payload;
+    diese sind je nach Quelle bare Stationszeit 'HH:MM' ODER Offset-/Z-ISO. Beide
+    Formen werden bedient (Offset-ISO direkt, bare 'HH:MM' via Ziel-Station-TZ +
+    payload-Datum). Defensiv: unparsbar/unbekannte TZ → False (NIE eskalieren, wenn
+    die Ankunft unbekannt ist). Wirft NIE."""
+    try:
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        val = payload.get('est_arr') or payload.get('sched_arr')
+        if not val:
+            return False
+        s = str(val).strip()
+        arr_utc = None
+        if ('T' in s) or ('+' in s) or s.endswith('Z'):
+            # Offset-/Z-ISO → direkt aware-UTC
+            arr_utc = _iso_utc_dt(s)
+        else:
+            # bare 'HH:MM' station-lokal → mit payload-Datum + Ziel-Station-TZ nach
+            # UTC. _board_local_to_utc_iso braucht die Datums-Basis NICHT (es parst
+            # nur HH:MM), darum hier selbst kombinieren.
+            date = (payload.get('date') or '')[:10]
+            dest = payload.get('dest')
+            dest_iata = None
+            if isinstance(dest, dict):
+                dest_iata = dest.get('iata') or dest.get('code')
+            elif isinstance(dest, str):
+                dest_iata = dest
+            if not (date and dest_iata):
+                return False
+            m = re.match(r'^(\d{1,2}):(\d{2})$', s)
+            if not m:
+                return False
+            try:
+                from zoneinfo import ZoneInfo
+                from airport_tz import airport_tz as _atz
+                ap = (dest_iata or '').upper().strip().split('#', 1)[0]
+                tzn = 'Europe/Berlin' if ap in ('FRA', 'EDDF') else _atz(ap)
+                if not tzn:
+                    return False
+                base = _dt.strptime(date, '%Y-%m-%d')
+                loc = base.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                                   tzinfo=ZoneInfo(tzn))
+                arr_utc = loc.astimezone(_tz.utc)
+            except Exception:
+                return False
+        if arr_utc is None:
+            return False
+        now = _dt.now(_tz.utc)
+        return now >= arr_utc + _td(minutes=float(grace_min))
+    except Exception:
+        return False
+
+
+def _apply_paid_arrival_escalation(payload, flight_no, date, dep, dest, pos,
+                                   merged_fn):
+    """Gemeinsame Eskalations-Logik für Live-Flight-Consumer. Prüft, ob die
+    In-Flight-Behauptung des `payload` UNZUVERLÄSSIG ist (in-flight + ETA vorbei +
+    Position stale + keine ARR-Obs, ODER FLIGHTSTATE-'lost' nach ETA), eskaliert
+    dann auf EINEN bezahlten FR24-Backfill-Call (harte Wachen: enable-Flag +
+    Budget) und stellt IMMER die ehrliche Anzeige her (kein vorgespiegeltes
+    Live/ETA mehr). Mutiert `payload` in-place. Wirft NIE. Rückgabe: True, wenn als
+    unzuverlässig behandelt (payload wurde ehrlich gemacht)."""
+    try:
+        _paid_esc = (os.environ.get('FLIGHTLIVE_PAID_ESCALATE', '1')
+                     not in ('0', 'false', 'no'))
+        if not _paid_esc or not dest:
+            return False
+        unreliable = bool(
+            payload.get('in_flight')
+            and _est_arr_passed(payload, 10)
+            and _pos_is_stale(pos, 30)
+            and not _fr24_arr_obs_exists(flight_no, date, dest))
+        # FLIGHTSTATE-Engine hat schon 'lost' nach ETA gesagt → das zählt auch.
+        if (not unreliable and payload.get('live_status') == 'lost'
+                and _est_arr_passed(payload, 10)
+                and not _fr24_arr_obs_exists(flight_no, date, dest)):
+            unreliable = True
+        if not unreliable:
+            return False
+        try:
+            if _fr24_arr_backfill_enabled() and _fr24_budget_ok():
+                wrote = _fr24_fill_missing_arrival(flight_no, date, dep, dest)
+                if wrote and merged_fn:
+                    m2 = merged_fn(flight_no, date=date, dep_iata=dep,
+                                   arr_iata=dest, free_only=True) or {}
+                    if m2.get('sched_arr'):
+                        payload['sched_arr'] = m2.get('sched_arr')
+                    if m2.get('esti_arr'):
+                        payload['est_arr'] = m2.get('esti_arr')
+                    if m2.get('delay_known'):
+                        payload['arr_delay_min'] = m2.get('arr_delay_min')
+                    if m2.get('status_arr'):
+                        payload['status_arr'] = m2.get('status_arr')
+        except Exception:
+            pass
+        # NIE weiter eine Live-In-Flight-Schätzung vorspiegeln, wenn unzuverlässig.
+        payload['in_flight'] = False
+        payload['live'] = None
+        payload['progress'] = None
+        payload['live_status'] = payload.get('live_status') or 'lost'
+        payload['arr_unreliable'] = True
+        return True
+    except Exception:
+        return False
+
+
 def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     """Board-Fakten EINES Flugs (memoisiert). Kurzes prozessweites Cache über
     (flight,date,dep,arr) — der Detail-Aggregat-Kaltstart ruft dieselbe (fn,date)-
@@ -8701,6 +8865,13 @@ def ax_flight_live(token):
             payload['eta_conf'] = _fs['times']['eta_conf']
     except Exception:
         pass
+    # PAID-FR24-ESKALATION (Owner 2026-07-17, SWISS-LX8-Bug): NUR wenn die
+    # In-Flight-Behauptung nachweislich unzuverlässig ist (ETA lange vorbei +
+    # Position stale + kein Ankunfts-Board), sonst No-Op. Macht die Anzeige
+    # ehrlich (kein vorgespiegeltes Live/ETA) und füllt — budget-gedeckelt — die
+    # echte Ist-Landung nach. merged_fn wird nach dem paid-Write neu gelesen.
+    _apply_paid_arrival_escalation(payload, flight_no, date, dep, dest, pos,
+                                   merged_fn)
     return jsonify(_memo_put(mkey, payload))
 
 
