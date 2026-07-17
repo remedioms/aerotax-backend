@@ -39320,9 +39320,20 @@ def _ics_events_to_briefings(events, existing=None):
             if prev_summary and day_summary and prev_summary != day_summary \
                     and day_summary not in prev_summary:
                 merged_summary = f"{prev_summary} · {day_summary}"[:200]
+            # DOPPELT-GEFLOGENES-LEG-FIX (2026-07-17, Florian „Flo Z" Tag 17.07:
+            # BER-MUC-FCO-MUC-FCO): das Substring-Dedupe war für LAYOVER-Orts-
+            # Prefixe gedacht („MIA" ⊂ „FRA, FRA - MIA"), verschluckte aber ein
+            # REAL zweimal geflogenes Leg („MUC - FCO" stand schon in der Kette)
+            # → die Location-Kette endete scheinbar an der Homebase, iOS las den
+            # Tag als Turnaround: Tour gesplittet + FCO fehlte im Wetter/Pack.
+            # Leg-Segmente („XXX - YYY") bringen als WIEDERHOLUNG echte Route-
+            # Information → immer anhängen; nur Nicht-Leg-Werte (Orts-Prefixe)
+            # bleiben substring-dedupt.
+            _loc_is_leg = bool(re.match(r'^[A-Z]{3}\s*[-–]\s*[A-Z]{3}$',
+                                        (location or '').strip().upper()))
             merged_location = prev_location or location
             if prev_location and location and prev_location != location \
-                    and location not in prev_location:
+                    and (_loc_is_leg or location not in prev_location):
                 merged_location = f"{prev_location}, {location}"[:120]
             # earliest start, latest end — ABER nur duty-relevante Events
             # (Flug/Briefing/Standby) erweitern das Fenster; Layover/Off NICHT

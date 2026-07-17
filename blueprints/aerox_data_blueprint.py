@@ -8439,6 +8439,48 @@ def _build_plane_rotation(flight_no, date, dep=None, arr=None, reg_hint=None):
         leg['is_mine'] = (k == fn and (not dep or leg.get('origin') == _norm_iata(dep)))
         if leg['is_mine'] and my_leg is None:
             my_leg = leg
+
+    # KONTINUITÄTS-WÄCHTER (2026-07-17, LH423→D-ABYN-Korruption): eine korrupte
+    # Board-Obs kann der Rotations-Reg fremde Legs zuordnen (real beobachtet:
+    # LH498 FRA→MEX + LH423 BOS→FRA als „eine Maschine" — physikalisch
+    # unmöglich, die Karte zeigte B748 statt A343). Physik-Gate: das
+    # chronologisch letzte Leg VOR meinem Abflug muss mein Origin erreichen
+    # können (Ankunft + Großkreis-Flugzeit dest→origin @~850 km/h + 45 min
+    # Turnaround ≤ mein Soll-Abflug). Unerreichbar ⇒ Reg-Zuordnung korrupt ⇒
+    # ehrlich found:false statt fremder Rotation. Fehlende Zeiten/Koordinaten
+    # ⇒ Gate greift nicht (konservativ, keine legitime Lücken-Rotation killen).
+    if my_leg is not None:
+        _my_dep_dt = _iso_utc_dt(my_leg.get('sched_dep'))
+        _my_org = my_leg.get('origin')
+        if _my_dep_dt and _my_org:
+            _prev = None                     # (arr_dt, dest) des letzten Vor-Legs
+            for k in ordered:
+                leg = legs[k]
+                if leg.get('is_mine'):
+                    continue
+                _l_dep = _iso_utc_dt(leg.get('sched_dep'))
+                if _l_dep is None or _l_dep >= _my_dep_dt:
+                    continue
+                _arr_dt = _iso_utc_dt(leg.get('est_arr')) or _iso_utc_dt(leg.get('sched_arr'))
+                _dest = leg.get('destination')
+                if _arr_dt is None or not _dest:
+                    continue
+                if _prev is None or _arr_dt > _prev[0]:
+                    _prev = (_arr_dt, _dest)
+            if _prev and _prev[1] != _my_org:
+                _d_ll = _iata_latlon(_prev[1])
+                _o_ll = _iata_latlon(_my_org)
+                if _d_ll and _o_ll:
+                    from datetime import timedelta as _td_rot
+                    _fly_s = (_haversine_km(_d_ll[0], _d_ll[1],
+                                            _o_ll[0], _o_ll[1]) / 850.0) * 3600.0
+                    if _prev[0] + _td_rot(seconds=_fly_s + 45 * 60) > _my_dep_dt:
+                        out.update({'found': False, 'reg': None,
+                                    'aircraft_type': None, 'legs': [],
+                                    'reason': 'Rotations-Zuordnung unplausibel '
+                                              '(Reg-Konflikt zwischen Beobachtungen).'})
+                        return out
+
     out['legs'] = [legs[k] for k in ordered]
     out['found'] = True
 
