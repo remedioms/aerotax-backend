@@ -421,6 +421,41 @@ def _apply_taxi_gate(pos):
     return pos
 
 
+def _callsign_zero_variants(cs):
+    """Beide Zero-Padding-Formen eines ICAO-Funknamens als Query-Kandidaten
+    (Owner 2026-07-15, LX0042). Der abgeleitete Funkname und der vom FR24-gRPC-
+    Harvester gespeicherte können bei der führenden Null divergieren: SWR42 vs
+    SWR042. Wir bauען die gestrippte UND (falls die Original-Nummer gepaddet war)
+    die gepaddete Form. Reihenfolge = gestrippt zuerst (FR24 sendet meist
+    un-gepaddet). Duplikat-frei, Original-Reihenfolge stabil. Beide Formen
+    werden gebaut.
+
+    Ohne führende Null (SWR1719) ⇒ genau EIN Kandidat = kein zusätzlicher I/O.
+    Prefix (Buchstaben) bleibt unangetastet — nur der numerische Suffix wird
+    variiert; alphanumerische Suffixe (DLH8UA) ⇒ ein einziger Kandidat."""
+    c = (cs or '').strip().upper()
+    if not c:
+        return []
+    # numerischen Suffix isolieren
+    i = len(c)
+    while i > 0 and c[i - 1].isdigit():
+        i -= 1
+    pfx, num = c[:i], c[i:]
+    if not num:
+        return [c]
+    stripped = num.lstrip('0') or '0'
+    cands = [pfx + stripped]
+    if len(num) != len(stripped):          # war gepaddet → gepaddete Form auch anbieten
+        cands.append(pfx + num)
+    # Duplikate raus (falls c bereits == gestrippt), Reihenfolge halten
+    seen, out = set(), []
+    for x in cands + [c]:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
 def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=35):
     """Positions-Snapshot aus dem NAS-Harvester-Store (Supabase `aircraft_live`,
     gefüllt via FR24-**gRPC** — sieht AUCH über Russland/Ozean, wo freies ADS-B
@@ -477,7 +512,15 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
     if fn:
         rows = _query('flight', fn)
     if not rows and cs:
-        rows = _query('callsign', cs)
+        # Zero-Padding-robust (Owner 2026-07-15, LX0042 „keine live position"):
+        # der abgeleitete Funkname kann gestrippt (SWR42) ODER gepaddet (SWR042)
+        # ankommen, während der Harvester die jeweils ANDERE Form speichert.
+        # Beide Kandidaten probieren (Reihenfolge egal, erster Treffer gewinnt).
+        # Ohne Null-Padding (SWR1719) ist die Menge einelementig → kein Mehr-I/O.
+        for _cs_cand in _callsign_zero_variants(cs):
+            rows = _query('callsign', _cs_cand)
+            if rows:
+                break
     if not rows and rn:
         rows = _query('reg', rn)
     if not rows:
@@ -4450,10 +4493,22 @@ def _flight_times_free_first(flight_no, date, origin, dest,
             i += 1
         al = _airline_row(fn[:i]) or {}
         if al.get('icao') and fn[i:]:
-            cs = al['icao'] + fn[i:]
+            # Zero-Padding wie überall: FR24-gRPC sendet un-gepaddet (SWR42),
+            # nicht SWR042 (Owner 2026-07-15, LX0042). `lstrip('0') or fn[i:]`
+            # schützt vor der reinen Null-Nummer; ohne führende Null unverändert.
+            cs = al['icao'] + (fn[i:].lstrip('0') or fn[i:])
     out = {}
-    # 1) FREE gRPC (gratis) — Korridor braucht Route + Funkname
-    g = _grpc_times_free(cs, origin, dest) if (cs and origin and dest) else None
+    # 1) FREE gRPC (gratis) — Korridor braucht Route + Funkname. Der Korridor
+    # matcht den Funknamen EXAKT (fr24_grpc._norm_cs strippt keine Nullen),
+    # während der übergebene/abgeleitete Funkname bei der führenden Null von der
+    # gespeicherten Form abweichen kann. Beide Zero-Formen probieren (gestrippt
+    # zuerst); ohne Padding = ein Kandidat, kein Mehr-Aufruf.
+    g = None
+    if cs and origin and dest:
+        for _cs_cand in _callsign_zero_variants(cs):
+            g = _grpc_times_free(_cs_cand, origin, dest)
+            if g:
+                break
     if g:
         sd = _epoch_to_local_iso(g.get('sched_dep'), origin)
         sa = _epoch_to_local_iso(g.get('sched_arr'), dest)
@@ -4932,7 +4987,14 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
                 # ABGELEITET (ICAO+Nummer) — kann falsch sein (LH1412=DLH8UA):
                 # als derived markieren und den PAID-Tier dafür sperren (kein
                 # Credit-Spend auf einen geratenen Funknamen).
-                callsign = _al['icao'] + _num
+                # Führende Nullen STRIPPEN (Owner 2026-07-15, LX0042 „keine live
+                # position/Zeiten"): FR24-gRPC sendet den Funknamen typischerweise
+                # UN-gepaddet (SWR42, nicht SWR042). Die kanonische Form ist hier
+                # gestrippt — identisch zur Live-Positions-Ableitung (_live_cs), die
+                # schon `lstrip('0')` macht. `lstrip('0') or _num` schützt vor der
+                # (theoretischen) reinen Null-Nummer. LX1719 (keine Null) bleibt
+                # unverändert.
+                callsign = _al['icao'] + (_num.lstrip('0') or _num)
                 callsign_derived = True
         try:
             from blueprints.warehouse_reader import route_for_flight
