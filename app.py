@@ -11121,7 +11121,25 @@ def _push_installation_register(user_token, registry, unregister_token=None):
             data = data[0] if data else None
         if isinstance(data, dict):
             data = data.get('register_push_installation') or data.get('id')
-        return str(data) if data else None
+        inst_id = str(data) if data else None
+        if inst_id:
+            # Cross-Environment-Leichen desselben Geräts entsorgen: die DB-
+            # Eindeutigkeit gilt pro (apns_token,bundle_id,environment) — eine
+            # Migrations-Zeile mit env='unknown' überlebte deshalb neben der
+            # nativen 'prod'-Registrierung DESSELBEN Tokens, und jede Push ging
+            # doppelt ans Gerät (Sebastian Koch 2026-07-18). Beim (Re-)
+            # Registrieren stirbt jetzt jede ANDERE aktive Zeile mit demselben
+            # APNs-Token (best-effort, wirft nie).
+            try:
+                (sb.table('push_installations')
+                   .update({'active': False,
+                            'tombstoned_at': datetime.now(timezone.utc).isoformat(),
+                            'tombstone_reason': 'superseded_same_apns_token'})
+                   .eq('apns_token', apns_token).eq('active', True)
+                   .neq('id', inst_id).execute())
+            except Exception:
+                pass
+        return inst_id
     except Exception as e:
         app.logger.error(
             f'[push-install] register_fail user_ref={_push_token_ref(user_token)} '
@@ -25231,7 +25249,17 @@ def _send_push_notification(token, title, body, data=None,
             continue
         topic = (reg.get('bundle_id') or 'aerotax.AeroTax').strip()
         env_pref = _push_normalized_environment(reg.get('apns_env'))
-        endpoint_key = (apns_token, topic, env_pref)
+        # Dedupe auf der EFFEKTIVEN Umgebung, nicht dem Roh-Wert: eine
+        # Migrations-Zeile (env='unknown') und die native Registrierung
+        # (env='prod') tragen denselben APNs-Token, lösen aber zu DERSELBEN
+        # Ziel-Umgebung auf — mit env_pref im Key ging jede Push doppelt
+        # ans selbe Gerät (Sebastian Koch 2026-07-18, „doppelte Pushes").
+        if env_pref in ('sandbox', 'prod'):
+            first_sandbox = env_pref == 'sandbox'
+        else:
+            first_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
+        effective_env = 'sandbox' if first_sandbox else 'prod'
+        endpoint_key = (apns_token, topic, effective_env)
         if endpoint_key in seen:
             continue
         seen.add(endpoint_key)
@@ -25240,10 +25268,6 @@ def _send_push_notification(token, title, body, data=None,
             continue
 
         attempted += 1
-        if env_pref in ('sandbox', 'prod'):
-            first_sandbox = env_pref == 'sandbox'
-        else:
-            first_sandbox = os.environ.get('APNS_USE_SANDBOX', '').strip() == '1'
         ok, reason = _send_apns(
             apns_token, title, body, data=data, topic=topic,
             thread_id=thread_id, badge=badge, use_sandbox=first_sandbox,
