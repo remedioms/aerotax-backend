@@ -24370,6 +24370,17 @@ def get_user_calendar_pdf(token):
                 if tok != _pdf_hb:
                     routing = tok
                     break
+        if not routing:
+            # LAYOVER-Tage tragen KEINE Legs und im SUMMARY nur „LAYOVER (Tag k/n)"
+            # → die Übernachtungs-Stadt steht in `ical_location` (z.B. „BLR"). Ohne
+            # diesen Fallback blieb der Layover im gedruckten Plan ORTLOS (Cori Stone
+            # 2026-07-18: „bei meiner 5TT werden die Layover nicht richtig angezeigt").
+            import re as _re3
+            _loc = (bv.get('ical_location') or '').upper()
+            for tok in _re3.findall(r'\b([A-Z]{3})\b', _loc):
+                if tok != _pdf_hb:
+                    routing = tok
+                    break
         # Label-Mapping (Anzeigeklassen, decken sich grob mit KLASS_BG-Keys).
         if 'off day' in low or low == 'off' or 'rest day' in low:
             return 'Frei', ''
