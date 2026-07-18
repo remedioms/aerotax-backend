@@ -12878,6 +12878,9 @@ def get_friend_roster(token, friend_token):
     if not out:
         try:
             briefs = _ical_briefings_load(friend_token) or {}
+            # Homebase des Freundes (lazy, 10-min-Memo) — für den Same-Day-
+            # Turnaround-Guard von _feed_nightstop_ort im Fallback-Pfad.
+            _fb_hb = _profile_homebase_cached(friend_token) or None
             def _hhmm(x):
                 m = re.search(r'T(\d{2}:\d{2})', str(x or ''))
                 return m.group(1) if m else None
@@ -12922,17 +12925,47 @@ def get_friend_roster(token, friend_token):
                         if not dedup or dedup[-1] != c:
                             dedup.append(c)
                     routing = '-'.join(dedup) if len(dedup) >= 2 else None
+                # Nightstop wie im PRIMÄR-Pfad ableiten statt roh `ical_layover_ort`
+                # zu servieren: ein Same-Day-Turnaround ZURÜCK zur Homebase
+                # (ZRH-LIS-ZRH) trug sonst über den rohen Reader-Wert einen
+                # falschen „Layover" für reine Kalender-Freunde.
+                # `_feed_nightstop_ort` leitet den Nightstop aus den Sektoren ab und
+                # gibt bei einem Homebase-Turnaround den `reader_facts.layover_ort`-
+                # Fallback zurück — deshalb geben wir den rohen `ical_layover_ort`
+                # NUR als Fallback weiter, wenn KEINE belastbaren Sektoren vorliegen
+                # (leg-lose LAYOVER-Zeile → Ort bleibt erhalten). Bei echten Sektoren
+                # bleibt der Fallback leer, damit ein Heimkehr-Turnaround zu None
+                # auflöst statt zum Roh-Wert. next_day → Nacht-Turnaround-Guard.
+                try:
+                    _nd_iso = (_date.fromisoformat(datum) + _td(days=1)).isoformat()
+                except Exception:
+                    _nd_iso = None
+                _nd_row = briefs.get(_nd_iso) if _nd_iso else None
+                _row_secs = row.get('ical_sectors')
+                _has_secs = (isinstance(_row_secs, list)
+                             and any(isinstance(s, dict) and s.get('arr_iso')
+                                     for s in _row_secs))
+                _day_shape = {
+                    'datum': datum,
+                    'ical_sectors': _row_secs,
+                    'reader_facts': {
+                        'layover_ort': (None if _has_secs
+                                        else row.get('ical_layover_ort'))},
+                }
+                _nd_shape = ({'datum': _nd_iso,
+                              'ical_sectors': _nd_row.get('ical_sectors')}
+                             if isinstance(_nd_row, dict) else None)
+                _lay = _feed_nightstop_ort(_day_shape, homebase=_fb_hb,
+                                           next_day=_nd_shape)
                 out.append({
                     'datum': datum,
                     'klass': klass,
                     'marker': summ or None,
                     'routing': routing,
                     'eur': None,
-                    'layover_ort': row.get('ical_layover_ort'),
-                    'route_label': _route_label_cities(routing,
-                                                       row.get('ical_layover_ort')),
-                    'layover_city': (_iata_city_name(row.get('ical_layover_ort'))
-                                     if row.get('ical_layover_ort') else None),
+                    'layover_ort': _lay,
+                    'route_label': _route_label_cities(routing, _lay),
+                    'layover_city': (_iata_city_name(_lay) if _lay else None),
                     'start_time': _hhmm(row.get('ical_start_iso') or row.get('ical_start')),
                     'end_time': _hhmm(row.get('ical_end_iso') or row.get('ical_end')),
                     # Pro-Leg-Sektoren aus den Briefings durchreichen (s.o.) → Freunde-/
@@ -24391,6 +24424,30 @@ def get_user_calendar_pdf(token):
         if 'standby' in low or 'sby' in low or 'reserve' in low or 'bereitschaft' in low:
             return 'Standby', ''
         if 'layover' in low or legs or '-' in summary.replace(' ', ''):
+            # SAME-DAY-RETURN-GUARD (Audit 2026-07-18): endet der Flugtag mit
+            # seiner letzten Ankunft an der HOMEBASE (Turnaround FRA-LUX-FRA), ist
+            # es KEIN Ausland-Layover → Tour-Farbe (Z72) statt Layover-Farbe (Z76).
+            # Nur Label/Farbe, keine Steuerklassifikation. Ende = letztes Leg-`to`
+            # bzw. das letzte 3-Letter-Token einer Summary-Kette.
+            _ends_hb = False
+            if 'layover' not in low:
+                _last_to = ''
+                for lg in reversed(legs):
+                    if isinstance(lg, dict):
+                        _lt = (lg.get('to') or '').strip().upper()
+                        if len(_lt) == 3:
+                            _last_to = _lt
+                            break
+                if not _last_to:
+                    import re as _re4
+                    _chain = _re4.findall(r'\b([A-Z]{3})\b', summary)
+                    if len(_chain) >= 2:
+                        _last_to = _chain[-1]
+                if _last_to and _last_to == _pdf_hb:
+                    _ends_hb = True
+            if _ends_hb:
+                # Same-Day-Turnaround zurück nach Hause → Tour, kein Layover.
+                return 'Z72', routing
             # Aktiver Flugdiensttag / Layover → Z76 (Auslandstour) als Default-Farbe.
             return 'Z76', routing
         if summary:
