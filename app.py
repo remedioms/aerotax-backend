@@ -39506,6 +39506,66 @@ def _ics_iso_to_station_hhmm(iso_utc, iata):
         return None
 
 
+def _ics_parse_multi_leg_summary(summary):
+    """ALLE Flug-Legs einer SUMMARY → Liste[(flight, from, to)].
+
+    Edelweiss-Outlook packt MEHRERE Legs pipe-getrennt in EIN Duty-VEVENT
+    (DTSTART = erster Abflug, DTEND = letzte Ankunft):
+      'CC8 (WK38 SJO-LIR) | CC8 (WK38 LIR-ZRH)'
+      'CC3 (WK364 ZRH-JSI) | CC3 (WK364 JSI-PVK) | CC3 (WK364 PVK-ZRH)'
+    Vorher zog der Parser nur das ERSTE Routing und stempelte die GANZE
+    Dienstspanne darauf → Tages-Touren wirkten als One-Way (falscher „Layover"
+    RHO/SMI), beim Dreiecksflug fehlte der Rückflug (SJO-LIR ohne LIR-ZRH,
+    „steigt in LIR aus") und block_minutes war die Dienstspanne statt der
+    Flugzeit (Yanic Kittel 2026-07-18). Die Flugnummer ist der Klammer-Token
+    (WK38), NICHT der Dienst-Code davor ('CC8 (WK38' war der alte Fehlparse).
+    Ein-Leg-Summaries liefern exakt EIN Tupel (Fallback = bestehender
+    Single-Leg-Parser, Verhalten unverändert)."""
+    s = (summary or '').strip()
+    if not s:
+        return []
+    parts = [p.strip() for p in s.split('|') if p.strip()] if '|' in s else [s]
+    legs = []
+    for p in parts:
+        m = re.search(
+            r'\(([A-Z]{1,3}\s?\d{1,5})\s+([A-Z]{3})\s*[-–]\s*([A-Z]{3})\)?',
+            p.upper())
+        if m:
+            legs.append((re.sub(r'\s+', '', m.group(1)),
+                         m.group(2), m.group(3)))
+            continue
+        flt, frm, to = _ics_parse_flight_leg_summary(p)
+        if frm and to:
+            legs.append((flt, frm, to))
+    return legs
+
+
+def _ics_multi_leg_bounds(start_iso, end_iso, n):
+    """Gleichmäßige Leg-Zeitgrenzen über die Duty-Spanne: Liste von
+    (dep_iso, arr_iso) pro Leg. Erster Abflug = DTSTART, letzte Ankunft =
+    DTEND (echte Zeiten); die Zwischen-Grenzen sind interpoliert — das iCal
+    trägt pro Leg keine Zeiten, und eine plausible Reihenfolge ist für
+    Sektor-Picker/Live-State besser als eine Ganztags-Spanne auf Leg 1.
+    None wenn nicht interpolierbar (dann bleibt der Alt-Pfad)."""
+    if n < 2:
+        return None
+    try:
+        s = datetime.fromisoformat((start_iso or '').replace('Z', '+00:00'))
+        e = datetime.fromisoformat((end_iso or '').replace('Z', '+00:00'))
+    except Exception:
+        return None
+    total = (e - s).total_seconds()
+    if total <= 0:
+        return None
+    out = []
+    for i in range(n):
+        a = s + timedelta(seconds=total * i / n)
+        b = s + timedelta(seconds=total * (i + 1) / n)
+        out.append((a.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    b.strftime('%Y-%m-%dT%H:%M:%SZ')))
+    return out
+
+
 def _ics_parse_flight_leg_summary(summary):
     """Parst eine Flug-Leg-SUMMARY → (flight, from_iata, to_iata) oder Nones.
 
@@ -39897,6 +39957,13 @@ def _ics_events_to_briefings(events, existing=None):
                 if _ev_is_flight_leg(day_summary) and start_iso and end_iso:
                     dur = _iso_minutes_between(start_iso, end_iso)
                     if dur and 0 < dur < 24 * 60:
+                        # MULTI-LEG-DUTY (Edelweiss): die Spanne enthält die
+                        # Bodenzeit der Zwischenstopps — pro Stopp ~40 min
+                        # abziehen, sonst zählt ein ZRH-SMI-ZRH-Tagesumlauf
+                        # die Turnaround-Zeit als Block (Yanic: Spesen/EASA).
+                        _n_legs = len(_ics_parse_multi_leg_summary(summary))
+                        if _n_legs >= 2:
+                            dur = max(30, dur - 40 * (_n_legs - 1))
                         block_min += dur
                 existing_b['block_minutes'] = block_min
                 # ── Strukturierte Per-Leg-Liste (additiv) ───────────────────
@@ -39910,14 +39977,36 @@ def _ics_events_to_briefings(events, existing=None):
                 if date_str in block_reset_dates and 'legs' not in existing_b:
                     existing_b['legs'] = []
                 if _ev_is_flight_leg(day_summary):
-                    _flt, _frm, _to = _ics_parse_flight_leg_summary(summary)
-                    if _frm and _to:
+                    # MULTI-LEG-DUTY (Edelweiss): alle Legs des Events, Zeiten
+                    # über die Spanne interpoliert (Rand-Zeiten echt). Ein-Leg
+                    # bleibt der bisherige Pfad (echte DTSTART/DTEND-Zeiten).
+                    _parsed = _ics_parse_multi_leg_summary(summary)
+                    if len(_parsed) >= 2:
+                        _bounds = _ics_multi_leg_bounds(
+                            start_iso, end_iso, len(_parsed))
+                        _leg_items = [
+                            (f or '', frm2, to2,
+                             (_bounds[j][0] if _bounds else start_iso),
+                             (_bounds[j][1] if _bounds else end_iso))
+                            for j, (f, frm2, to2) in enumerate(_parsed)]
+                    elif len(_parsed) == 1:
+                        # Auch Ein-Leg über den neuen Extraktor: er liest beim
+                        # Edelweiss-Klammer-Format die ECHTE Flugnummer (WK36),
+                        # wo der Alt-Parser 'CC8 (WK36' lieferte; LH/SWISS
+                        # laufen intern durch den Alt-Parser → unverändert.
+                        _f1, _frm1, _to1 = _parsed[0]
+                        _leg_items = [(_f1 or '', _frm1, _to1, start_iso, end_iso)]
+                    else:
+                        _flt, _frm, _to = _ics_parse_flight_leg_summary(summary)
+                        _leg_items = ([(_flt or '', _frm, _to, start_iso, end_iso)]
+                                      if _frm and _to else [])
+                    for _lf, _lfrm, _lto, _ldep_iso, _larr_iso in _leg_items:
                         _leg = {
-                            'from': _frm,
-                            'to': _to,
-                            'flight': _flt or '',
-                            'dep': _ics_iso_to_station_hhmm(start_iso, _frm) or '',
-                            'arr': _ics_iso_to_station_hhmm(end_iso, _to) or '',
+                            'from': _lfrm,
+                            'to': _lto,
+                            'flight': _lf,
+                            'dep': _ics_iso_to_station_hhmm(_ldep_iso, _lfrm) or '',
+                            'arr': _ics_iso_to_station_hhmm(_larr_iso, _lto) or '',
                         }
                         _legs = existing_b.get('legs')
                         if not isinstance(_legs, list):
@@ -39972,6 +40061,23 @@ def _build_ical_sectors(events):
             if re.match(r'^\d{4}-\d{2}-\d{2}$', d_bucket):
                 d = d_bucket
         if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
+            continue
+        # MULTI-LEG-DUTY (Edelweiss-Outlook, Yanic 2026-07-18): ALLE pipe-
+        # getrennten Legs des Events als eigene Sektoren, Zeiten über die
+        # Duty-Spanne interpoliert (erster Abflug/letzte Ankunft = echt).
+        # Greift NUR bei ≥2 erkannten Legs — Ein-Leg-Pfad bleibt byte-identisch.
+        _mlegs = _ics_parse_multi_leg_summary(ev.get('summary') or '')
+        if len(_mlegs) >= 2:
+            _bounds = _ics_multi_leg_bounds(ev.get('start_iso'),
+                                            ev.get('end_iso'), len(_mlegs))
+            for _i, (_mf, _mfrm, _mto) in enumerate(_mlegs):
+                _dep, _arr = (_bounds[_i] if _bounds
+                              else (ev.get('start_iso') or '',
+                                    ev.get('end_iso') or ''))
+                sec_by_day.setdefault(d, []).append({
+                    'flight': _mf, 'from': _mfrm, 'to': _mto,
+                    'dep_iso': _dep, 'arr_iso': _arr,
+                })
             continue
         # SWISS-Format zuerst (space-separiert, kein „-"): „LX1270 ZRH 1236 CPH …".
         sw_flt, sw_frm, sw_to = _ics_parse_swiss_flight(summ)
