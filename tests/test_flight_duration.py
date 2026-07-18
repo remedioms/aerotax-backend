@@ -222,34 +222,30 @@ def test_route_history_no_duration_for_arr_only(client):
             assert 'duration_min' not in f or f['duration_min'] is None
 
 
-def test_route_history_windowed_escalates_on_zero_hits():
-    """Dünne Strecke (FRA-NBJ): days=3 hat 0 Beobachtungen → das Aggregat
-    weitet automatisch auf 7 Tage (Sweep 2026-07-10) statt ohne Flugzeit/
-    Landung zu bleiben. Bei Treffern im 3d-Fenster KEIN zweiter Call."""
+def test_route_history_windowed_single_wide_call():
+    """SEIT 2026-07-18 (Owner „LH506 sehr langsam"): EIN days=7-Call statt der
+    3-dann-7-Eskalation — auf dünnen Strecken liefen sonst ZWEI serielle
+    Supabase-Batches unter verschiedenen Memo-Keys. days=7 deckt beide Fälle."""
     import blueprints.aerox_data_blueprint as BP
     calls = []
 
     def fake_subcall(app_obj, path, view, *args):
         calls.append(path)
-        if 'days=3' in path:
-            return {'ok': True, 'total': 0, 'recent_days': []}
         return {'ok': True, 'total': 2,
                 'recent_days': [{'date': '2026-07-08', 'count': 2, 'flights': []}]}
 
     with patch.object(BP, '_detail_subcall', side_effect=fake_subcall):
         h = BP._route_history_windowed(A.app, 'FRA', 'NBJ')
     assert h is not None and h['total'] == 2
-    assert calls == ['/api/ax/route-history/FRA/NBJ?days=3',
-                     '/api/ax/route-history/FRA/NBJ?days=7']
+    assert calls == ['/api/ax/route-history/FRA/NBJ?days=7']
 
-    # Treffer schon im 3d-Fenster → genau EIN Call (Latenz-Sweet-Spot bleibt).
+    # Fehlschlag (ok=False) → None, weiterhin genau EIN Call.
     calls.clear()
     with patch.object(BP, '_detail_subcall',
                       side_effect=lambda *a: (calls.append(a[1]) or
-                                              {'ok': True, 'total': 5,
-                                               'recent_days': []})):
+                                              {'ok': False})):
         h2 = BP._route_history_windowed(A.app, 'FRA', 'JFK')
-    assert h2['total'] == 5 and calls == ['/api/ax/route-history/FRA/JFK?days=3']
+    assert h2 is None and calls == ['/api/ax/route-history/FRA/JFK?days=7']
 
 
 # ─────────────────────── tail-history endpoint wiring ───────────────────────

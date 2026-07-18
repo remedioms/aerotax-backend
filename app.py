@@ -12772,8 +12772,29 @@ def _feed_nightstop_ort(day, homebase=None, next_day=None):
             if arr_date == datum:
                 last_same_day = to
                 last_arr_iso = s.get('arr_iso')
-            # arr_date > datum (Red-Eye) ⇒ überspringen; arr_date < datum kommt
-            # bei sauber sortierten Tages-Sektoren praktisch nicht vor.
+            # arr_date > datum (Red-Eye) ⇒ unten als Nacht-Ziel behandelt;
+            # arr_date < datum kommt bei sortierten Tages-Sektoren nicht vor.
+        # RED-EYE-ABFLUGTAG (Lane 5.8., LX1886 ZRH 22:00 → OTP 01:10+1): startet
+        # NACH der letzten Same-Day-Ankunft noch ein Sektor, der erst am FOLGETAG
+        # auswärts ankommt, schläft die Crew DORT — nicht an der Same-Day-Station.
+        # Vorher lieferte der Tag „ZRH" (bzw. Fallback) → das OTP-Band im
+        # Freund-Kalender begann einen Tag zu spät. Nur der LETZTE Tages-Sektor
+        # zählt; Ziel == Homebase bleibt beim bisherigen Verhalten.
+        try:
+            _last = ordered[-1] if ordered else None
+            if isinstance(_last, dict):
+                _lt = str(_last.get('to') or '').strip().upper()
+                _l_arr = _station_local_date(_last.get('arr_iso'), _lt)
+                _l_dep_from = str(_last.get('from') or '').strip().upper()
+                _l_dep = _station_local_date(_last.get('dep_iso'), _l_dep_from) \
+                    if _last.get('dep_iso') else None
+                if (len(_lt) == 3 and _lt.isalpha()
+                        and _l_arr is not None and _l_arr > datum
+                        and (_l_dep is None or _l_dep == datum)
+                        and (not hb or _lt != hb)):
+                    return _lt
+        except Exception:
+            pass
         if last_same_day:
             # Same-Day-Turnaround zurück zur Homebase = keine Übernachtung
             # außerhalb → Reader-Fallback (typisch None), kein Basis-Pin.
@@ -12859,6 +12880,22 @@ def get_friend_roster(token, friend_token):
         # next_day → Nacht-Turnaround-Guard (Ankunft spät, Rückabflug <8h Folgetag).
         _nd = tage[_i + 1] if _i + 1 < len(tage) else None
         _lay = _feed_nightstop_ort(day, next_day=_nd)
+        # DATUM-REPARATUR (Lane 10.8., Owner „Touren komplett falsch"): einzelne
+        # Snapshot-Tage (mittlere LAYOVER-Tage aus Multi-Day-Expansion) kommen
+        # ohne `datum` an — die Zeile zerreißt client-seitig JEDES Tour-Band
+        # (Tag fällt raus → Lücke → Band splittet). Reparatur aus dem Vortag+1,
+        # wenn der Nachbar-Kontext passt; sonst ehrlich überspringen.
+        if not d and out:
+            try:
+                _prev_d = _date.fromisoformat(out[-1]['datum'])
+                _cand = (_prev_d + _td(days=1)).isoformat()
+                _nd_datum = (_nd or {}).get('datum')
+                if not _nd_datum or _nd_datum > _cand:
+                    d = _cand
+            except Exception:
+                pass
+        if not d:
+            continue
         out.append({
             'datum': d,
             'klass': day.get('klass'),
@@ -34575,6 +34612,48 @@ def airport_board(token):
             flights = _fetch_opensky_board(airport, ftype)
             src = 'opensky'
     if flights is None:
+        # NAS-EU-SCRAPER-FALLBACK (Owner 2026-07-18 „Zürich/MUC melden kein
+        # Scraping"): für ZRH/VIE/AENA & Co. gibt es KEINEN nativen Hetzner-
+        # Scraper — aber die NAS-Stunden-Gruppen schreiben ihre Boards nach
+        # airport_delay_obs (ZRH alle ~15 min). Die HEUTIGEN persistierten Rows
+        # SIND die Tafel. Vorher antwortete der Endpoint „Keine Board-Daten für
+        # ZRH", obwohl die Daten frisch in der DB lagen. `departed` wird aus der
+        # Soll-Zeit vs. Airport-Lokal-Jetzt abgeleitet (die Rekonstruktion
+        # stempelt sonst pauschal True — für eine LIVE-Tafel falsch).
+        try:
+            _sk_fb = _store_key_for(out_airport, ftype)
+            _ap_now = _airport_local_now(_sk_fb)
+            if _ap_now is not None:
+                _fb_rows = _board_rows_from_obs_for_date(
+                    _ap_now.strftime('%Y-%m-%d'), _sk_fb, airline or None)
+                # Callsign-Rohzeilen des FR24-Harvesters (SWR1TX, ohne Gate/
+                # Status/esti) sind keine Tafel-Zeilen → raus. Echte Board-Rows
+                # tragen entweder Signal-Felder oder eine IATA-Flugnummer.
+                import re as _re_fb
+                _fb_rows = [r for r in _fb_rows
+                            if r.get('gate') or r.get('status') or r.get('esti')
+                            or _re_fb.match(r'^[A-Z0-9]{2}\d{1,4}[A-Z]?$',
+                                            (r.get('flight') or ''))]
+                if _fb_rows:
+                    _now_naive = _ap_now.replace(tzinfo=None)
+                    for _r in _fb_rows:
+                        try:
+                            from datetime import datetime as _dtfb
+                            _bt = _dtfb.fromisoformat(_r.get('sched') or '')
+                            _r['departed'] = _bt <= _now_naive
+                            # Die Historien-Rekonstruktion stempelt Vor-Abflug-
+                            # Status pauschal zu Abgeflogen/Gelandet — für einen
+                            # NOCH KOMMENDEN Flug der Live-Tafel falsch.
+                            if not _r['departed'] and (_r.get('status') or '') in (
+                                    'Abgeflogen', 'Gelandet'):
+                                _r['status'] = ''
+                        except Exception:
+                            pass
+                    flights = _fb_rows
+                    src = 'airport_delay_obs'
+        except Exception as _e_fb:
+            print(f"[board] obs-fallback fail {out_airport}: {_e_fb}")
+    if flights is None:
         # GRACEFUL DEGRADE (User „bei der Tafel fehlen wieder Flüge"): bevor wir
         # eine LEERE Tafel / source_unavailable melden, die zuletzt erfolgreich
         # zusammengestellte Liste für GENAU diese Abfrage servieren (als `stale`
@@ -40122,6 +40201,21 @@ def _build_ical_sectors(events):
         })
     for d in sec_by_day:
         sec_by_day[d].sort(key=lambda x: x.get('dep_iso') or '')
+        # DOPPEL-LEG-DEDUPE (Daniel 13.7., LX2158 ZRH-PMI um 08:07 UND 09:30):
+        # dieselbe Flugnummer kann am selben Tag nicht zweimal dieselbe Strecke
+        # fliegen — das Duplikat stammt aus überlappenden iCal-Events (Update-
+        # Event neben dem alten). Erste (früheste) Instanz gewinnt. Echte
+        # Doppel-Umläufe haben unterschiedliche Flugnummern und bleiben.
+        _seen_legs = set()
+        _dedup = []
+        for s in sec_by_day[d]:
+            _k = (s.get('flight') or '', s.get('from') or '', s.get('to') or '')
+            if all(_k) and _k in _seen_legs:
+                continue
+            if all(_k):
+                _seen_legs.add(_k)
+            _dedup.append(s)
+        sec_by_day[d] = _dedup
     return sec_by_day
 
 

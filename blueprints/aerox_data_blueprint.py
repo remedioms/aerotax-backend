@@ -6480,14 +6480,14 @@ def _route_history_windowed(app_obj, origin, dest):
     eigene Beobachtungen, 0 Spend. None wenn auch das weite Fenster nichts hat
     UND der Call scheiterte (ok-aber-leer wird durchgereicht, ehrlich)."""
     view = _life_app('ax_route_history')
-    h = None
-    for nd in (3, 7):
-        h = _detail_subcall(app_obj, '/api/ax/route-history/%s/%s?days=%d'
-                            % (urllib.parse.quote(origin),
-                               urllib.parse.quote(dest), nd),
-                            view, origin, dest)
-        if (h or {}).get('ok') and (h.get('total') or 0) > 0:
-            return h
+    # EIN Aufruf mit days=7 statt 3-dann-7 (Owner 2026-07-18 „LH506 sehr
+    # langsam"): auf dünnen Strecken (0 Treffer in 3 Tagen) liefen ZWEI
+    # serielle Supabase-Batches — der zweite unter komplett neuen Memo-Keys.
+    # days=7 deckt beide Fälle in EINEM Batch; die Anzeige kürzt selbst.
+    h = _detail_subcall(app_obj, '/api/ax/route-history/%s/%s?days=7'
+                        % (urllib.parse.quote(origin),
+                           urllib.parse.quote(dest)),
+                        view, origin, dest)
     return h if (h or {}).get('ok') else None
 
 
@@ -6588,13 +6588,21 @@ def ax_flight_detail(query):
     # Kontexte sind thread-local; jeder _detail_subcall pusht seinen eigenen.
     from concurrent.futures import ThreadPoolExecutor
 
+    # GESAMT-Wall-Clock-Budget (Owner 2026-07-18 „Flugdaten brauchen sehr
+    # lange"): vorher hatte jeder Subcall SEIN 10-s-Timeout, das Aggregat als
+    # Ganzes aber keins — ein zäher Sub-Pfad hielt die Antwort bis zu 10 s.
+    # Jetzt kommt nach ~6 s die Antwort mit dem, was da ist (Partial); iOS
+    # rendert progressiv und das Memo wird unten im Hintergrund nachgewärmt.
+    _agg_deadline = time.time() + 6.0
+
     def _res(f, timeout=10):
-        # Timeout pro Subcall (hängender Provider darf das Bündel nicht halten);
-        # Fehler wie bisher pro Subcall isolieren → None.
+        # Timeout pro Subcall (hängender Provider darf das Bündel nicht halten),
+        # zusätzlich ans Gesamt-Budget geklemmt; Fehler pro Subcall → None.
         if f is None:
             return None
         try:
-            return f.result(timeout=timeout)
+            return f.result(timeout=min(
+                timeout, max(0.5, _agg_deadline - time.time())))
         except Exception:
             return None
 
@@ -6765,10 +6773,45 @@ def ax_flight_detail(query):
     out['photo'] = photo
     out['live'] = live
 
-    # LEERES Ergebnis (weder resolve noch info) NICHT 45s memoisieren — sonst
-    # klebt ein transienter Ausfall/Timeout als Negativ-Antwort im Cache.
-    if resolve_flight or info:
+    # LEERES Ergebnis (weder resolve noch info noch route) NICHT 45s
+    # memoisieren — sonst klebt ein transienter Ausfall als Negativ-Antwort im
+    # Cache. `route` zählt jetzt mit (Owner 2026-07-18 „LH506 langsam"):
+    # resolve kann leer sein (nofr24, Warehouse kalt), die lokal angereicherte
+    # Route ist aber da — vorher lief so JEDER Tap komplett kalt durch.
+    if resolve_flight or info or route:
         _memo_put(memo_key, out)
+
+    # MEMO-NACHWÄRMEN route-history (analog _warm_times unten): lief die
+    # History ins Budget-Timeout, holt ein Daemon sie fertig und patcht sie ins
+    # Detail-Memo — der NÄCHSTE Aufruf trägt sie sofort, statt wieder kalt zu
+    # laufen.
+    if history is None and origin and dest and (resolve_flight or info or route):
+        def _warm_history(app_obj, mkey, base_out, _o=origin, _d=dest):
+            try:
+                h = _route_history_windowed(app_obj, _o, _d)
+                if not h:
+                    return
+                cached = _memo_get(mkey) or dict(base_out)
+                merged = dict(cached)
+                merged['history'] = h
+                _memo_put(mkey, merged)
+            except Exception:
+                pass
+            finally:
+                # Thread-lokalen Supabase-Client schließen (gleiche Hygiene wie
+                # _warm_times — Daemon-Threads sammeln sonst Verbindungen an).
+                try:
+                    from app import _close_current_thread_supabase_client
+                    _close_current_thread_supabase_client()
+                except Exception:
+                    pass
+        try:
+            threading.Thread(target=_warm_history,
+                             args=(current_app._get_current_object(),
+                                   memo_key, out),
+                             daemon=True).start()
+        except Exception:
+            pass
 
     # MEMO-NACHWÄRMEN (Owner 2026-07-15): lief der freie gRPC-Zeiten-Korridor
     # ins 1.5-s-Timeout (Kaltstart), fehlen sched_arr/eta in DIESER Antwort. Ein
