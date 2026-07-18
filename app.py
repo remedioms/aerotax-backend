@@ -7175,9 +7175,54 @@ def cleanup_old_supabase_state():
             cleanup_old_job_chunks()
         except Exception as e:
             print(f"[cleanup] job_chunks fail: {str(e)[:120]}")
+        # airport_delay_obs-Retention (Egress-Fix): die Tabelle hatte KEINE
+        # Bereinigung → >1M breite Rows ohne Kappung. Einmal/Tag alte Tage löschen.
+        try:
+            prune_old_delay_obs()
+        except Exception as e:
+            print(f"[cleanup] delay_obs prune fail: {str(e)[:120]}")
     except Exception as e:
         # Outer catch — Cleanup-Loop niemals crashen lassen
         print(f"[cleanup] supabase state error: {str(e)[:120]}")
+
+
+# airport_delay_obs-Retention: Prozess-lokaler Throttle (max ~1×/Tag), damit der
+# 30-Min-Cleanup-Loop den Delete nicht bei jedem Durchlauf feuert.
+_delay_obs_prune_last_ts: float = 0.0
+_DELAY_OBS_RETENTION_DAYS = 14   # sicher: route-history kappt bei 7 Tagen
+_DELAY_OBS_PRUNE_MIN_INTERVAL_S = 20 * 3600   # ~1×/Tag/Prozess
+
+
+def prune_old_delay_obs(force=False):
+    """Löscht airport_delay_obs-Rows älter als `_DELAY_OBS_RETENTION_DAYS`
+    (Default 14 — die einzigen Konsumenten sind der In-Memory-Store „heute" und
+    route-history mit ≤7-Tage-Fenster). Hält die 16-spaltige Tabelle beschränkt,
+    damit der Egress nicht durch ungebremstes Wachstum explodiert.
+
+    Prozess-lokal auf ~1×/Tag gedrosselt (mehrere Instanzen prunen unabhängig,
+    idempotent). KEIN riesiger Einmal-Delete — der Backfill-Shrink läuft separat;
+    dieser Prune hält den Bestand nur GEHEND beschränkt und holt den Rückstand
+    über die Tage von selbst auf. Wirft NIE — loggt nur die Zeilenzahl.
+
+    `force=True` umgeht den Throttle (für Tests/manuelle Auslösung)."""
+    global _delay_obs_prune_last_ts
+    if not SB_AVAILABLE or sb is None:
+        return 0
+    now = time.time()
+    if not force and (now - _delay_obs_prune_last_ts) < _DELAY_OBS_PRUNE_MIN_INTERVAL_S:
+        return 0
+    _delay_obs_prune_last_ts = now
+    deleted = 0
+    try:
+        # Cutoff in der gespeicherten Form der `date`-Spalte: 'YYYY-MM-DD'.
+        cutoff = (datetime.utcnow() - timedelta(days=_DELAY_OBS_RETENTION_DAYS)).strftime('%Y-%m-%d')
+        res = sb.table('airport_delay_obs').delete().lt('date', cutoff).execute()
+        deleted = len((res and getattr(res, 'data', None)) or [])
+        if deleted:
+            print(f"[cleanup] airport_delay_obs: {deleted} rows (< {cutoff}) deleted")
+    except Exception as e:
+        print(f"[cleanup] airport_delay_obs prune fail: {str(e)[:120]}")
+    return deleted
 
 
 # Cleanup-Thread starten (in Tests deaktivierbar)
@@ -31030,7 +31075,12 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
                         return None
                 except Exception:
                     pass
-                rows = _board_rows_from_obs_for_date(row_date, key, None)
+                # Egress-Fix: nur die Rows DIESER Flugnummer aus der SB ziehen
+                # (DB-seitig gefiltert, führende-Null-Varianten inklusive) statt
+                # den ganzen Board-Tag zu laden und unten auf EINEN Flug zu
+                # filtern. Der Python-Post-Filter bleibt als Sicherheitsnetz.
+                rows = _board_rows_from_obs_for_date(row_date, key, None,
+                                                     flight=fn)
         except Exception:
             rows = []
         cands = [r for r in (rows or [])
@@ -35586,6 +35636,15 @@ def _crowdsource_flight_obs(flight, date_iso=None, source='aerodatabox'):
         return False
 
 
+# Egress-Fix: exakte Spaltenprojektion für den Poll-Loop-Vollreload statt
+# select('*'). Genau die Felder, die `_delay_store_load_from_sb` unten liest —
+# `date`/`airport` sind aus dem Filter bekannt, `updated_at`/`id` ungenutzt.
+_DELAY_STORE_LOAD_COLS = (
+    'flight,sched,max_delay_min,cancelled,dest_iata,dest_name,'
+    'gate,terminal,airline,esti,reg,type_code,status'
+)
+
+
 def _delay_store_load_from_sb(date_str, airport='FRA'):
     """Lädt die heutigen Delay-Beobachtungen aus airport_delay_obs zurück in den
     In-Memory-Store (einmal pro Betriebstag UND Airport). Damit überlebt die
@@ -35609,8 +35668,12 @@ def _delay_store_load_from_sb(date_str, airport='FRA'):
         offset = 0
         page = 1000
         while True:
+            # Egress-Fix: nur die Spalten projizieren, die diese Funktion unten
+            # tatsächlich liest — `date`/`airport` sind aus dem Filter bekannt,
+            # ungenutzte Spalten (z.B. updated_at/id) werden nicht übertragen.
             r = _sb_retry('delay_load',
-                          lambda: (sb.table('airport_delay_obs').select('*')
+                          lambda: (sb.table('airport_delay_obs').select(
+                              _DELAY_STORE_LOAD_COLS)
                                    .eq('date', date_str).eq('airport', airport)
                                    .range(offset, offset + page - 1).execute()))
             rows = r.data or []
@@ -36031,17 +36094,49 @@ def _punctuality_stats(flights, airport='FRA', airline=None):
             'scheduled_total': scheduled_total}
 
 
-def _delay_obs_rows_for_date(date_str, airport='FRA', dest_iata=None):
+def _obs_flight_variants(fn):
+    """Kleine Menge der Flugnummer-Schreibweisen, die der Python-Post-Filter in
+    `_flight_obs_merged._obs_lookup` akzeptiert (Leerzeichen-los/upper + führende-
+    Null-Toleranz SQ26↔SQ026). Damit kann der DB-Read serverseitig per
+    `.in_('flight', variants)` genau die Rows zurückgeben, die die Python-Logik
+    ohnehin behalten würde — statt den ganzen Board-Tag zu laden und lokal fast
+    alles wegzuwerfen. Baut Carrier-Prefix + Nummer aus `_fn_norm` und emittiert
+    0-, 1- und 2-fach nullaufgefüllte Nummer-Varianten (LH919/LH0919/LH00919).
+    Fällt bei unparsebarer Eingabe auf die reine upper/space-Form zurück."""
+    raw = str(fn or '').replace(' ', '').upper().strip()
+    if not raw:
+        return []
+    variants = {raw}
+    m = re.match(r'^([A-Z]{2}|[A-Z]\d|\d[A-Z]|[A-Z]{3})0*(\d{1,4})([A-Z]?)$', raw)
+    if m:
+        pre, num, suf = m.group(1), m.group(2), m.group(3)
+        n = int(num)
+        base = len(str(n))
+        # Bis zu 2 führende Nullen decken die real gespeicherten Formen ab
+        # (LH919 / LH0919 / LH00919 — Boards persistieren beide Padding-Stile).
+        for width in range(base, base + 3):
+            variants.add(f'{pre}{str(n).zfill(width)}{suf}')
+    return sorted(variants)
+
+
+def _delay_obs_rows_for_date(date_str, airport='FRA', dest_iata=None, flight=None):
     """Liest ALLE persistierten Delay-Beobachtungen eines BELIEBIGEN (auch
     vergangenen) Betriebstags direkt aus airport_delay_obs — OHNE den
     In-Memory-Store (_delay_store) zu beruehren. Der Store haelt nur den heutigen
     Tag; fuer „zurueck in der Zeit" (iOS-Tabelle) muessen wir die SB-Tabelle
     selbst abfragen. Gibt eine flache Liste roher Rows zurueck (leere Liste bei
-    SB-down/leer — der Caller degradiert dann ehrlich)."""
+    SB-down/leer — der Caller degradiert dann ehrlich).
+
+    `flight` (optional): eine EINZELNE Flugnummer. Ist sie gesetzt, filtert der
+    DB-Read serverseitig per `.in_('flight', _obs_flight_variants(flight))` auf
+    die paar Rows dieses Flugs statt den ganzen Board-Tag zu laden (Egress-Fix).
+    Die Varianten spiegeln exakt den Python-Post-Filter (führende-Null-Toleranz),
+    also aendert das die Ergebnismenge NICHT — nur wo gefiltert wird."""
     if not SB_AVAILABLE or sb is None or not date_str:
         return []
     airport = (airport or 'FRA').upper()
     dest_iata = (dest_iata or '').upper().strip() or None
+    fn_variants = _obs_flight_variants(flight) if flight else None
     out = []
     try:
         offset = 0
@@ -36054,6 +36149,11 @@ def _delay_obs_rows_for_date(date_str, airport='FRA', dest_iata=None):
             # zu laden und danach fast alles lokal wegzuwerfen.
             if dest_iata:
                 q = q.eq('dest_iata', dest_iata)
+            # Einzelflug-Lookup: nur die Rows dieser Flugnummer (inkl. führende-
+            # Null-Varianten) — statt den ganzen Tag zu ziehen und in Python auf
+            # EINEN Flug zu filtern (grösster Egress-Posten).
+            if fn_variants:
+                q = q.in_('flight', fn_variants)
             r = q.range(offset, offset + page - 1).execute()
             rows = r.data or []
             out.extend(rows)
@@ -36069,7 +36169,7 @@ def _delay_obs_rows_for_date(date_str, airport='FRA', dest_iata=None):
 
 
 def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None,
-                                  dest_iata=None):
+                                  dest_iata=None, flight=None):
     """Tafel-Zeilen eines BELIEBIGEN (auch vergangenen) Betriebstags aus den
     persistierten Beobachtungen (airport_delay_obs) rekonstruieren — für die
     iOS-Tafel „zurück in der Zeit" (#24: Tafeln pro Airport speichern → Historie).
@@ -36081,7 +36181,8 @@ def _board_rows_from_obs_for_date(date_str, airport='FRA', airline=None,
     seit 2026-06-13 AUCH die Ankunfts-Historie. Leere Liste bei SB-down/leer →
     Caller degradiert ehrlich."""
     is_arr = (airport or '').upper().endswith('#ARR')
-    rows = _delay_obs_rows_for_date(date_str, airport, dest_iata=dest_iata)
+    rows = _delay_obs_rows_for_date(date_str, airport, dest_iata=dest_iata,
+                                    flight=flight)
     airline = (airline or '').upper().strip()
     out = []
     for row in rows:

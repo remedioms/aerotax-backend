@@ -378,7 +378,7 @@ def _merged_arrday(spec, monkeypatch):
     def _fake_local_now(iata):
         return now
 
-    def _fake_sb_for_date(date_str, airport='FRA', dest_iata=None):
+    def _fake_sb_for_date(date_str, airport='FRA', dest_iata=None, flight=None):
         d = str(date_str)[:10]
         ap = (airport or '').upper()
         return list(sb_rows.get(f'{ap}|{d}', []))
@@ -413,7 +413,7 @@ def _merged_depday(spec):
             patch.object(A, '_flight_from_live_board',
                          MagicMock(side_effect=AssertionError('paid board!'))), \
             patch.object(A, '_delay_obs_rows_for_date',
-                         side_effect=lambda ds, airport='FRA', dest_iata=None:
+                         side_effect=lambda ds, airport='FRA', dest_iata=None, flight=None:
                          list(sb_rows.get(f'{(airport or "").upper()}|{str(ds)[:10]}', []))), \
             patch.object(A, '_departed_rows_from_store',
                          side_effect=lambda key: list(store_rows.get(key, []))):
@@ -474,7 +474,7 @@ def test_lh423_arrday_non_overnight_unchanged(monkeypatch):
             patch.object(A, '_flight_from_live_board',
                          MagicMock(side_effect=AssertionError('paid board!'))), \
             patch.object(A, '_delay_obs_rows_for_date',
-                         side_effect=lambda ds, airport='FRA', dest_iata=None:
+                         side_effect=lambda ds, airport='FRA', dest_iata=None, flight=None:
                          list(sb_rows.get(f'{(airport or "").upper()}|{str(ds)[:10]}', []))), \
             patch.object(A, '_departed_rows_from_store',
                          side_effect=lambda key: list(store_rows.get(key, []))):

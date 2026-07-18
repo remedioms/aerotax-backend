@@ -543,7 +543,7 @@ def test_merged_explicit_service_day_fetches_next_day_arrival():
                     'dest_iata': 'SFO', 'delay_min': 10, 'delay_known': True,
                     'status': 'Expected', 'cancelled': False}
 
-    def history(day, key, _airline):
+    def history(day, key, _airline, flight=None):
         if key == 'SFO' and day == '2026-07-01':
             return [dep_row]
         if key == 'FRA#ARR' and day == '2026-07-01':
