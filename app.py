@@ -9633,6 +9633,46 @@ def _sb_table_is_missing(tbl, err):
     return False
 
 
+def _fresh_crew_note(pr):
+    """crew_note {text, ts} aus dem Profil — NUR wenn <24h alt, sonst None.
+    (Boardkarten-Tap-Nachricht, Owner 2026-07-18: „für 24h an die Freunde".)"""
+    try:
+        text = (pr.get('crew_note_text') or '').strip()
+        ts = float(pr.get('crew_note_ts') or 0)
+        if text and ts > 0 and (time.time() - ts) < 24 * 3600:
+            return {'text': text[:180], 'ts': ts}
+    except Exception:
+        pass
+    return None
+
+
+@app.route('/api/user/crew-note/<token>', methods=['POST'])
+def set_crew_note(token):
+    """Kurznachricht der Crew an ihre Freunde (24h sichtbar, friends-today
+    reicht sie als `crew_note` durch). Leerer Text löscht. Kein eigener
+    Store — lebt als flache metadata-Keys im Profil (atomarer RPC-Merge)."""
+    body = request.get_json(silent=True) or {}
+    text = str(body.get('text') or '').strip()[:180]
+    now_ts = time.time()
+    patch = ({'crew_note_text': text, 'crew_note_ts': str(now_ts)}
+             if text else {'crew_note_text': None, 'crew_note_ts': None})
+    ok = _profile_metadata_merge_sb(token, patch)
+    if not ok:
+        # Fallback-Pfad wie andere Profil-Writes: read-merge-save best-effort.
+        try:
+            wrapper = _profile_load(token) or {}
+            inner = wrapper.get('profile') if isinstance(
+                wrapper.get('profile'), dict) else {}
+            md = dict(inner.get('metadata') or {})
+            md.update(patch)
+            inner['metadata'] = md
+            _profile_save(token, inner)
+            ok = True
+        except Exception as e:
+            print(f"[crew-note] save fail: {e}")
+    return jsonify({'ok': bool(ok), 'ts': now_ts if text else None})
+
+
 def _profile_metadata_merge_sb(token, patch):
     """Atomarer metadata-Merge (coalesce(metadata,'{}') || patch) via RPC.
     Returns True wenn der Merge server-seitig eine EXISTIERENDE Row traf
@@ -9756,6 +9796,9 @@ def _profile_load(token):
 _PROFILE_BULK_META_KEYS = (
     'avatar_url', 'share_location', 'current_city', 'location_source',
     'role', 'account_type',
+    # CREW-NOTE (Owner 2026-07-18, Boardkarten-Tap): 24h-Kurznachricht an die
+    # Freunde — friends-today reicht text+ts durch, iOS blendet nach 24h aus.
+    'crew_note_text', 'crew_note_ts',
     # PRE-FLIGHT-TIMELINE (2026-07-12): selbst angegebene Fahrzeit
     # Wohnung→Flughafen (Minuten) — friends-today reicht sie in die
     # „Fahrt zum Flughafen"-Phase des crew_state-Resolvers.
@@ -14124,6 +14167,12 @@ def get_friends_today(token):
             'name': pr.get('name') or '',
             'avatar_url': pr.get('avatar_url'),
             'homebase': pr.get('homebase') or '',
+            # CREW-NOTE (Boardkarten-Tap, 24h): ADDITIV-NUR-WENN-FRISCH — der
+            # Key fehlt komplett ohne Note, damit der Golden-Wire-Contract
+            # (tests/test_friends_today_golden.py ↔ iOS-Fixture) byte-gleich
+            # bleibt; iOS decodiert das Feld optional.
+            **({'crew_note': _fresh_crew_note(pr)}
+               if _fresh_crew_note(pr) else {}),
             # Standort-Stadt — nur wenn share_location an ist UND (Dienstplan-Modus)
             # serverseitig freigegeben: im roster-Modus (location_source != 'gps')
             # wird die GPS-current_city verworfen und stattdessen der heutige
