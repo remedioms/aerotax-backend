@@ -1326,10 +1326,25 @@ def test_layeff_fresh_delay_pin_still_holds(client, monkeypatch):
 # Zeiten hier relativ zu now: Leg1 dep −2h50, PLAN-ARR −35min; Leg2 dep +55min.
 def _setup_tibor_bcn_fra_arn(monkeypatch):
     tok = 'FRIENDTOKEN'
-    today = _date.today().isoformat()
-    d1, a1 = _now() - timedelta(minutes=170), _now() - timedelta(minutes=35)
-    d2, a2 = _now() + timedelta(minutes=55), _now() + timedelta(minutes=205)
-    d3, a3 = _now() + timedelta(minutes=250), _now() + timedelta(minutes=400)
+    # Uhr DETERMINISTISCH auf 12:00 UTC des echten Heute einfrieren (dynamisches
+    # Datum wegen des today-±1-Guards in _enrich_leg_delays): die Sektoren
+    # liegen relativ zu „jetzt" bei −170 … +400 min — mit Wall-Clock kippte a3
+    # bei Suite-Läufen nach ~17:20 UTC über Mitternacht, der Rückflug lag auf
+    # „morgen" und die Nightstop-Logik hielt ARN für einen Layover (Suite
+    # abends rot, vormittags grün). Mit fixem Mittag bleibt die Rotation ein
+    # Ein-Tages-Turn, egal wann die Tests laufen.
+    frozen = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0,
+                                                microsecond=0)
+
+    class _FrozenDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz is None else frozen.astimezone(tz)
+    monkeypatch.setattr(A, 'datetime', _FrozenDT)
+    today = frozen.date().isoformat()
+    d1, a1 = frozen - timedelta(minutes=170), frozen - timedelta(minutes=35)
+    d2, a2 = frozen + timedelta(minutes=55), frozen + timedelta(minutes=205)
+    d3, a3 = frozen + timedelta(minutes=250), frozen + timedelta(minutes=400)
     day = {
         'datum': today,
         'klass': 'Z72',

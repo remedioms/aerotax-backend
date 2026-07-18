@@ -22268,6 +22268,194 @@ def get_layover_recs(iata):
                     'recs': _public_layover_recs(recs)})
 
 
+# ── Per-Airline Crew-Hotel-Verzeichnis (dauerhafter Weg) ──────────────────────
+# Ersetzt die im iOS-Bundle hartcodierte, rein-Lufthansa Standardliste. Jede
+# Airline hat eigene Crewhotels → Defaults kommen ab jetzt vom Server, sind live
+# korrigierbar (YUL Delta→Sofitel, BOM alt) OHNE App-Update. Crew meldet als
+# `suggested`, Owner bestätigt zu `approved`. Mehrere Hotels pro Station bleiben
+# erlaubt (Optionen) — Korrektur = neues approven + falsches deaktivieren, NIE
+# blind alle same-Station-Einträge kollabieren.
+_CREW_HOTEL_DIR_TABLE = 'crew_hotel_directory'
+
+
+def _canonical_airline_key(airline):
+    """Kanonischer Airline-Schlüssel fürs Crew-Hotel-Verzeichnis. Profile tragen
+    mal „Lufthansa", mal „LH"/„DLH", mal „SWISS"/„LX" — alle müssen auf DENSELBEN
+    Bucket zeigen, sonst verfehlt der Serve den Seed. Unbekannte Airlines behalten
+    ihren getrimmten UPPER-Namen (eigener Bucket, crowdsource-gefüllt)."""
+    v = (airline or '').strip().lower()
+    if not v:
+        return ''
+    if 'lufthansa' in v or v in ('lh', 'dlh'):
+        return 'LUFTHANSA'
+    if 'swiss' in v or v in ('lx', 'swr'):
+        return 'SWISS'
+    return v.upper()
+
+
+def _crew_hotel_token_hash(token):
+    return _hashlib.sha256(('crewhotel:' + (token or '')).encode()).hexdigest()[:32]
+
+
+def _crew_hotel_dir_serve(airline):
+    """Approved+active Crewhotels EINER Airline. [] bei fehlender Airline/DB."""
+    a = (airline or '').strip().upper()
+    if not a or not SB_AVAILABLE:
+        return []
+    try:
+        r = sb.table(_CREW_HOTEL_DIR_TABLE).select(
+            'iata,base,hotel,transfer_min,votes').eq('airline', a).eq(
+            'status', 'approved').eq('active', True).limit(3000).execute()
+        return r.data or []
+    except Exception as e:
+        print(f"[crew-hotel] serve fail: {e}")
+        return []
+
+
+def _crew_hotel_admin_ok():
+    import hmac as _hmac
+    auth = request.headers.get('X-Admin-Token', '')
+    expected = _recovery_pepper()
+    return bool(expected and auth and _hmac.compare_digest(auth, expected))
+
+
+@app.route('/api/ax/crew-hotels', methods=['GET'])
+def ax_crew_hotels():
+    """Crew-Hotel-Verzeichnis für die Airline des anfragenden Tokens. Airline-
+    getrennt: ein SWISS-User bekommt NIE die LH-Liste. Ohne erkannte Airline →
+    leer (kein falscher Default). iOS cached das + fällt offline auf sein Bundle
+    (nur Lufthansa) zurück."""
+    token = _request_token()
+    raw_airline, _ = _viewer_airline_and_calendar(token)
+    airline = _canonical_airline_key(raw_airline)
+    if not airline:
+        return jsonify({'airline': '', 'count': 0, 'hotels': []})
+    hotels = _crew_hotel_dir_serve(airline)
+    return jsonify({'airline': airline, 'count': len(hotels), 'hotels': hotels})
+
+
+@app.route('/api/ax/crew-hotels/suggest', methods=['POST'])
+def ax_crew_hotels_suggest():
+    """Crew meldet ein korrektes/fehlendes Crewhotel als Vorschlag. Airline aus
+    dem Profil. Owner bestätigt später (kein direkter Live-Effekt = kein
+    Vandalismus). Doppelter Vorschlag → Vote hoch statt Duplikat."""
+    token = _request_token()
+    raw_airline, _ = _viewer_airline_and_calendar(token)
+    airline = _canonical_airline_key(raw_airline)
+    if not token or not airline:
+        return jsonify({'ok': False, 'error': 'no_airline'}), 400
+    body = request.get_json(silent=True) or {}
+    iata = (body.get('iata') or '').strip().upper()
+    hotel = (body.get('hotel') or '').strip()
+    if len(iata) != 3 or not iata.isalpha():
+        return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
+    if not hotel or len(hotel) > 160:
+        return jsonify({'ok': False, 'error': 'invalid_hotel'}), 400
+    base = (body.get('base') or '').strip().upper() or None
+    try:
+        tmin = max(0, min(600, int(body.get('transfer_min') or 0)))
+    except Exception:
+        tmin = 0
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'unavailable'}), 503
+    try:
+        existing = sb.table(_CREW_HOTEL_DIR_TABLE).select('id,votes').eq(
+            'airline', airline).eq('iata', iata).eq('hotel', hotel).eq(
+            'status', 'suggested').limit(1).execute()
+        if existing.data:
+            row = existing.data[0]
+            sb.table(_CREW_HOTEL_DIR_TABLE).update(
+                {'votes': (row.get('votes') or 1) + 1,
+                 'updated_at': datetime.now(timezone.utc).isoformat()}
+            ).eq('id', row['id']).execute()
+            return jsonify({'ok': True, 'status': 'voted'})
+        sb.table(_CREW_HOTEL_DIR_TABLE).insert({
+            'airline': airline, 'iata': iata, 'base': base, 'hotel': hotel,
+            'transfer_min': tmin, 'status': 'suggested',
+            'suggested_by': _crew_hotel_token_hash(token), 'votes': 1, 'active': True,
+        }).execute()
+        return jsonify({'ok': True, 'status': 'suggested'})
+    except Exception as e:
+        print(f"[crew-hotel] suggest fail: {e}")
+        return jsonify({'ok': False, 'error': 'db'}), 500
+
+
+@app.route('/api/admin/crew-hotels/pending', methods=['GET'])
+def admin_crew_hotels_pending():
+    """Owner: offene Crew-Vorschläge (nach Votes sortiert)."""
+    if not _crew_hotel_admin_ok():
+        return jsonify({'error': 'Unauthorized'}), 401
+    if not SB_AVAILABLE:
+        return jsonify({'count': 0, 'pending': []})
+    try:
+        r = sb.table(_CREW_HOTEL_DIR_TABLE).select('*').eq(
+            'status', 'suggested').order('votes', desc=True).limit(500).execute()
+        return jsonify({'count': len(r.data or []), 'pending': r.data or []})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/crew-hotels/approve', methods=['POST'])
+def admin_crew_hotels_approve():
+    """Owner bestätigt einen Vorschlag (per `id`) ODER korrigiert direkt
+    (airline/iata/hotel[/base/transfer_min]) — z.B. YUL Sofitel Sofort-Fix. Setzt
+    den Ziel-Eintrag approved+active. Kollabiert KEINE anderen Hotels der Station
+    (Optionen bleiben); zum Ablösen eines falschen Hotels dessen id an
+    /deactivate schicken."""
+    if not _crew_hotel_admin_ok():
+        return jsonify({'error': 'Unauthorized'}), 401
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'unavailable'}), 503
+    body = request.get_json(silent=True) or {}
+    rid = (body.get('id') or '').strip()
+    try:
+        if rid:
+            sb.table(_CREW_HOTEL_DIR_TABLE).update(
+                {'status': 'approved', 'active': True,
+                 'updated_at': datetime.now(timezone.utc).isoformat()}
+            ).eq('id', rid).execute()
+            return jsonify({'ok': True, 'id': rid})
+        airline = _canonical_airline_key(body.get('airline'))
+        iata = (body.get('iata') or '').strip().upper()
+        base = (body.get('base') or '').strip().upper() or None
+        hotel = (body.get('hotel') or '').strip()
+        if not airline or len(iata) != 3 or not iata.isalpha() or not hotel:
+            return jsonify({'ok': False, 'error': 'invalid'}), 400
+        try:
+            tmin = max(0, min(600, int(body.get('transfer_min') or 0)))
+        except Exception:
+            tmin = 0
+        ins = sb.table(_CREW_HOTEL_DIR_TABLE).insert({
+            'airline': airline, 'iata': iata, 'base': base, 'hotel': hotel,
+            'transfer_min': tmin, 'status': 'approved', 'votes': 1, 'active': True,
+        }).execute()
+        return jsonify({'ok': True, 'id': (ins.data or [{}])[0].get('id')})
+    except Exception as e:
+        print(f"[crew-hotel] approve fail: {e}")
+        return jsonify({'ok': False, 'error': 'db'}), 500
+
+
+@app.route('/api/admin/crew-hotels/deactivate', methods=['POST'])
+def admin_crew_hotels_deactivate():
+    """Owner: falsches/veraltetes Hotel (per `id`) aus der Live-Liste nehmen
+    (active=False). Behält die Zeile für Audit; entfernt sie nur aus dem Serve."""
+    if not _crew_hotel_admin_ok():
+        return jsonify({'error': 'Unauthorized'}), 401
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'unavailable'}), 503
+    rid = ((request.get_json(silent=True) or {}).get('id') or '').strip()
+    if not rid:
+        return jsonify({'ok': False, 'error': 'no_id'}), 400
+    try:
+        sb.table(_CREW_HOTEL_DIR_TABLE).update(
+            {'active': False, 'updated_at': datetime.now(timezone.utc).isoformat()}
+        ).eq('id', rid).execute()
+        return jsonify({'ok': True, 'id': rid})
+    except Exception as e:
+        print(f"[crew-hotel] deactivate fail: {e}")
+        return jsonify({'ok': False, 'error': 'db'}), 500
+
+
 def _layover_img_key(token):
     """Opaker, deterministischer Verzeichnis-Key — Token nie in public URL
     (gleiches Muster wie _wall_img_key/_avatar_img_key, eigener Salt)."""
@@ -22387,7 +22575,7 @@ def add_layover_rec(token):
         return jsonify({'ok': False, 'error': 'invalid_category',
                         'allowed_categories': sorted(LAYOVER_CATEGORIES)}), 400
     if not title or len(title) > 120: return jsonify({'ok': False, 'error': 'invalid_title'}), 400
-    if len(desc) > 800: return jsonify({'ok': False, 'error': 'desc_too_long'}), 413
+    if len(desc) > 2500: return jsonify({'ok': False, 'error': 'desc_too_long', 'max_len': 2500}), 413
     try:
         rating_n = int(rating) if rating is not None else 0
         rating_n = max(0, min(5, rating_n))
