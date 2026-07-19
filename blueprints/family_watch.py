@@ -482,10 +482,18 @@ def _fallback_next_tour_from_disk(status, crew_token, allowed_fields):
         if not legs:
             continue
         chain = [legs[0][0]] + [b for _, b in legs]
+        # ZIEL = ENDE der Tages-Kette, nicht das erste Leg (Owner 19.07:
+        # „Nächster Flug FRA → TLV obwohl Layover in Athen" — FRA-TLV-ATH ist
+        # EIN Reisetag, die Familie will wissen, WO die Crew ankommt/bleibt).
+        # Tagesrückkehr (Kette endet am Start): letzte AUSWÄRTS-Station zeigen
+        # (FRA-CAI-FRA → CAI), sonst hieße es sinnlos „FRA → FRA".
+        _arr = chain[-1]
+        if len(chain) >= 3 and _arr == chain[0]:
+            _arr = chain[-2]
         status['next_flight_dep_iata'] = legs[0][0]
-        status['next_flight_arr_iata'] = legs[0][1]
+        status['next_flight_arr_iata'] = _arr
         status['next_flight_dep_city'] = _iata_city_name(legs[0][0])
-        status['next_flight_arr_city'] = _iata_city_name(legs[0][1])
+        status['next_flight_arr_city'] = _iata_city_name(_arr)
         status['today_route_label'] = _route_label_cities('-'.join(chain))
         st = ev.get('ical_start_iso')
         if st:
@@ -1085,13 +1093,19 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                  .limit(10).execute())
             for br in (r.data or []):
                 summ = br.get('ical_summary') or ''
-                mleg = re.search(r'\b([A-Z]{3})-([A-Z]{3})\b', summ)
-                if not mleg:
+                _legs2 = re.findall(r'\b([A-Z]{3})-([A-Z]{3})\b', summ)
+                if not _legs2:
                     continue
-                status['next_flight_dep_iata'] = mleg.group(1)
-                status['next_flight_arr_iata'] = mleg.group(2)
-                status['next_flight_dep_city'] = _iata_city_name(mleg.group(1))
-                status['next_flight_arr_city'] = _iata_city_name(mleg.group(2))
+                # Gleiche Ketten-Regel wie oben (Ziel = Tages-Ende, Rückkehr →
+                # letzte Auswärts-Station) — beide Pfade EINE Wahrheit.
+                _chain2 = [_legs2[0][0]] + [b for _, b in _legs2]
+                _arr2 = _chain2[-1]
+                if len(_chain2) >= 3 and _arr2 == _chain2[0]:
+                    _arr2 = _chain2[-2]
+                status['next_flight_dep_iata'] = _legs2[0][0]
+                status['next_flight_arr_iata'] = _arr2
+                status['next_flight_dep_city'] = _iata_city_name(_legs2[0][0])
+                status['next_flight_arr_city'] = _iata_city_name(_arr2)
                 st = br.get('ical_start')
                 if st:
                     status['next_flight_etd_iso'] = _iso_utc_z(st)
