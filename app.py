@@ -18785,7 +18785,12 @@ def get_chat_messages(token, channel_id):
     # DELETE-Endpoint) werden NIE ausgeliefert. Ohne dieses Filter taucht eine
     # geloeschte Nachricht beim naechsten Poll/Reload (oder auf einem neuen Geraet)
     # wieder auf, weil der Server das Original sonst weiterhin zurueckgibt.
-    msgs = [m for m in msgs if not m.get('deleted')]
+    # Owner 2026-07-19: „Wünsche einen guten Flug"-Nachrichten (kind='goodflight')
+    # laufen wie die Family-Nachrichten als 24h-Feed-Glas — sie tauchen NICHT im
+    # Chats-Tab/DM-Verlauf auf. Ausgeliefert werden sie nur über die Inbox
+    # (goodflight_*-Felder in get_dm_inbox).
+    msgs = [m for m in msgs
+            if not m.get('deleted') and m.get('kind') != 'goodflight']
     since = float(request.args.get('since_ts') or 0)
     if since:
         msgs = [m for m in msgs if (m.get('ts') or 0) > since]
@@ -18852,6 +18857,12 @@ def send_chat_message(token, channel_id):
             'ts': time.time(),
             'iso': datetime.now().isoformat(),
         }
+        # Owner 2026-07-19: Bordkarten-Wunsch („Wünsche einen guten Flug") als
+        # markierte Nachricht — `kind` ist keine bekannte SB-Spalte, landet also
+        # (wie `deleted`) in metadata-jsonb und wird beim Laden re-hydratisiert.
+        # Whitelist statt freiem Client-Feld: nur 'goodflight' ist erlaubt.
+        if (body.get('kind') or '') == 'goodflight':
+            msg['kind'] = 'goodflight'
         # Per-Row-Insert (2026-07-01): nur die NEUE Message nach SB upserten
         # statt load-ALL (bis 2000) → append → save-ALL (bis 500 Rows) pro
         # Send. Disk-Cache lokal anhängen (SB-down-Fallback bleibt intakt).
@@ -19010,32 +19021,62 @@ def get_dm_inbox(token):
     # truncated Form pruefen — sonst zaehlt jede eigene Message faelschlich
     # als unread (Bug pre-2026-05-31).
     my_author_id = (token[:16] + '…') if token else ''
+    import time as _t
+    now = _t.time()
     for friend_token in friends:
         ch = _dm_channel(token, friend_token)
         if not ch: continue
         last_msg = None
         unread = 0
+        gf_in = None   # letzter eingehender „guten Flug"-Wunsch < 24h
+        gf_out = None  # letzter eigener „guten Flug"-Wunsch/Antwort < 24h
         try:
             # _dm_load_messages: SB primary, Disk fallback (P0 2026-06-01).
             # Soft-deletete Messages raus, sonst zeigt die Inbox eine geloeschte
             # Nachricht als letzte Preview bzw. zaehlt sie als unread.
             msgs = [m for m in (_dm_load_messages(ch) or []) if not m.get('deleted')]
-            if msgs:
-                last_msg = msgs[-1]
+            # Owner 2026-07-19: goodflight-Nachrichten („Wünsche einen guten
+            # Flug", Bordkarten-Tap) laufen wie die Family-Nachrichten als
+            # 24h-Feed-Glas — sie zaehlen hier NICHT als Chat (kein Preview,
+            # kein Unread-Badge) und werden separat als goodflight_* geliefert.
+            chat_msgs = [m for m in msgs if m.get('kind') != 'goodflight']
+            if chat_msgs:
+                last_msg = chat_msgs[-1]
                 seen_ts = float(last_seen.get(ch) or 0)
-                unread = sum(1 for m in msgs
+                unread = sum(1 for m in chat_msgs
                              if m.get('author_token') != my_author_id
                              and float(m.get('ts') or 0) > seen_ts)
+            for m in msgs:
+                if m.get('kind') != 'goodflight':
+                    continue
+                ts = float(m.get('ts') or 0)
+                if ts <= now - 86400:   # 24h-TTL wie beim Family-Feed-Status
+                    continue
+                if m.get('author_token') == my_author_id:
+                    if gf_out is None or ts > float(gf_out.get('ts') or 0):
+                        gf_out = m
+                else:
+                    if gf_in is None or ts > float(gf_in.get('ts') or 0):
+                        gf_in = m
         except Exception:
             pass
-        inbox.append({
+        entry = {
             'friend_token': friend_token,
             'channel_id': ch,
             'last_message_at': (last_msg or {}).get('ts'),
             'last_message_preview': ((last_msg or {}).get('text') or '')[:80],
             'last_message_from_me': (last_msg or {}).get('author_token') == my_author_id,
             'unread_count': unread,
-        })
+        }
+        # Additiv (iOS-Codable-sicher, alte Clients ignorieren die Felder):
+        # aktive „guten Flug"-Wuensche < 24h fuer die Feed-Glas-Karten.
+        if gf_in is not None:
+            entry['goodflight_text'] = (gf_in.get('text') or '')[:200]
+            entry['goodflight_at'] = gf_in.get('ts')
+        if gf_out is not None:
+            entry['goodflight_out_text'] = (gf_out.get('text') or '')[:200]
+            entry['goodflight_out_at'] = gf_out.get('ts')
+        inbox.append(entry)
     inbox.sort(key=lambda x: -(x.get('last_message_at') or 0))
     return jsonify({'count': len(inbox), 'inbox': inbox})
 
