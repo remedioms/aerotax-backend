@@ -122,12 +122,15 @@ def test_suggest_writes_suggested_row(client, monkeypatch):
                                      'transfer_min': 40}),
                     content_type='application/json')
     assert r.status_code == 200
-    assert r.get_json()['status'] == 'suggested'
+    # AUTO-FREIGABE-Politik (Owner 2026-07-19): Station OHNE aktives Hotel →
+    # erster Vorschlag geht SOFORT live (approved_new). Der Vorsichts-Pfad
+    # (suggested + 2-Stimmen-Promotion) gilt nur noch für BELEGTE Stationen.
+    assert r.get_json()['status'] == 'approved_new'
     assert len(fake.sink['inserts']) == 1
     _tbl, payload = fake.sink['inserts'][0]
     assert payload['airline'] == 'LUFTHANSA'
     assert payload['iata'] == 'YUL'          # normalisiert
-    assert payload['status'] == 'suggested'  # NIE direkt approved
+    assert payload['status'] == 'approved'
     assert payload['suggested_by'] and payload['suggested_by'] != 'AT-x'  # gehasht
 
 

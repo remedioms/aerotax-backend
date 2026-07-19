@@ -22553,6 +22553,22 @@ def ax_crew_hotels():
     if not airline:
         return jsonify({'airline': '', 'count': 0, 'hotels': []})
     hotels = _crew_hotel_dir_serve(airline)
+    # EIGENE offene Vorschläge SOFORT einblenden (Owner 2026-07-19: „für die
+    # Person, die es ändert, aber direkt"): der Melder sieht sein gemeldetes
+    # Hotel unmittelbar — für alle anderen bleibt es bis zur (Auto-)Freigabe
+    # unsichtbar. Fail-open: bei DB-Fehlern einfach die approved-Liste.
+    try:
+        mine = (sb.table(_CREW_HOTEL_DIR_TABLE).select(
+            'iata,base,hotel,transfer_min,votes').eq('airline', airline).eq(
+            'status', 'suggested').eq('active', True).eq(
+            'suggested_by', _crew_hotel_token_hash(token)).limit(50)
+            .execute().data) or []
+        if mine:
+            seen = {(h.get('iata'), (h.get('hotel') or '').lower()) for h in hotels}
+            hotels = hotels + [m for m in mine
+                               if (m.get('iata'), (m.get('hotel') or '').lower()) not in seen]
+    except Exception:
+        pass
     return jsonify({'airline': airline, 'count': len(hotels), 'hotels': hotels})
 
 
@@ -22581,20 +22597,53 @@ def ax_crew_hotels_suggest():
     if not SB_AVAILABLE:
         return jsonify({'ok': False, 'error': 'unavailable'}), 503
     try:
-        existing = sb.table(_CREW_HOTEL_DIR_TABLE).select('id,votes').eq(
-            'airline', airline).eq('iata', iata).eq('hotel', hotel).eq(
+        my_hash = _crew_hotel_token_hash(token)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # AUTO-FREIGABE (Owner 2026-07-19): hat die Station für diese Airline
+        # noch KEIN aktives Hotel, geht der erste Vorschlag SOFORT live —
+        # irgendeine Info schlägt keine Info, und Vandalismus-Risiko ist bei
+        # leerer Station minimal (Korrektur läuft dann über den Ände-Pfad).
+        active_rows = (sb.table(_CREW_HOTEL_DIR_TABLE).select('id,hotel').eq(
+            'airline', airline).eq('iata', iata).eq('status', 'approved').eq(
+            'active', True).limit(20).execute().data) or []
+        if not active_rows:
+            sb.table(_CREW_HOTEL_DIR_TABLE).insert({
+                'airline': airline, 'iata': iata, 'base': base, 'hotel': hotel,
+                'transfer_min': tmin, 'status': 'approved',
+                'suggested_by': my_hash, 'votes': 1, 'active': True,
+            }).execute()
+            return jsonify({'ok': True, 'status': 'approved_new'})
+        # ÄNDERUNG an belegter Station: gleicher Vorschlag einer ZWEITEN Crew
+        # (case-insensitiv) promotet automatisch auf approved und deaktiviert
+        # die bisherigen Einträge („raus wenn andere"). Der eigene Doppel-Tap
+        # zählt NICHT als zweite Stimme (kein Selbst-Approve).
+        existing = sb.table(_CREW_HOTEL_DIR_TABLE).select(
+            'id,votes,suggested_by').eq(
+            'airline', airline).eq('iata', iata).ilike('hotel', hotel).eq(
             'status', 'suggested').limit(1).execute()
         if existing.data:
             row = existing.data[0]
+            if row.get('suggested_by') == my_hash:
+                return jsonify({'ok': True, 'status': 'already_suggested'})
+            votes = (row.get('votes') or 1) + 1
+            if votes >= 2:
+                for old in active_rows:
+                    sb.table(_CREW_HOTEL_DIR_TABLE).update(
+                        {'active': False, 'updated_at': now_iso}
+                    ).eq('id', old['id']).execute()
+                sb.table(_CREW_HOTEL_DIR_TABLE).update(
+                    {'votes': votes, 'status': 'approved', 'active': True,
+                     'updated_at': now_iso}
+                ).eq('id', row['id']).execute()
+                return jsonify({'ok': True, 'status': 'approved_change'})
             sb.table(_CREW_HOTEL_DIR_TABLE).update(
-                {'votes': (row.get('votes') or 1) + 1,
-                 'updated_at': datetime.now(timezone.utc).isoformat()}
+                {'votes': votes, 'updated_at': now_iso}
             ).eq('id', row['id']).execute()
             return jsonify({'ok': True, 'status': 'voted'})
         sb.table(_CREW_HOTEL_DIR_TABLE).insert({
             'airline': airline, 'iata': iata, 'base': base, 'hotel': hotel,
             'transfer_min': tmin, 'status': 'suggested',
-            'suggested_by': _crew_hotel_token_hash(token), 'votes': 1, 'active': True,
+            'suggested_by': my_hash, 'votes': 1, 'active': True,
         }).execute()
         return jsonify({'ok': True, 'status': 'suggested'})
     except Exception as e:
