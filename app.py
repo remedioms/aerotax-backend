@@ -37379,6 +37379,16 @@ def _poll_boards_once(airports):
                     # Letzter Versuch über AeroDataBox-Board (env-gated).
                     rows, _src = (_native_board_cached(ap, ftype) or (None, None))
                     flights = rows
+                # MUC-QUOTA-LOCH-FALLBACK (Scraping-Audit 19.07: MUC hatte
+                # tagsüber 2-6h-Persistenz-Löcher — Muster passt zu erschöpfter
+                # AeroDataBox-Quota, prefer-ADB liefert dann None): der GRATIS
+                # native Scraper ist der zweite Versuch, bevor der Tick den
+                # Airport leer aufgibt.
+                if not flights and ap in _BOARD_PREFER_AERODATABOX:
+                    rows, _src = (_native_board_cached(ap, ftype,
+                                                       allow_paid=False)
+                                  or (None, None))
+                    flights = rows
                 if not flights:
                     results[tag] = 'no_flights'
                     continue
@@ -37443,6 +37453,16 @@ def internal_poll_boards():
             airports, sb if (SB_AVAILABLE and sb is not None) else None,
             lambda ap: _airport_local_now(ap))
         results = _poll_boards_once(due)
+        # OBSERVABILITY (Scraping-Audit 19.07: MUC/BER-Löcher waren unsichtbar,
+        # weil der Cron die Response nach /dev/null wirft): Fehl-/Leer-Ergebnisse
+        # der KERN-Airports landen ab jetzt im Container-Log — künftige Ausfälle
+        # sind damit in `docker logs aerotax-poll` mit Ursache greifbar.
+        _bad = {t: v for t, v in results.items()
+                if (isinstance(v, str)
+                    and t.split('#')[0] in ('FRA', 'MUC', 'BER', 'ZRH', 'DUS',
+                                            'HAM'))}
+        if _bad:
+            print(f"[poll-boards] degradiert: {_bad}")
         # EU-Fill NICHT mit-beschleunigen: bleibt im heutigen 10-min-Raster
         # (OpenSky-Rate-Limit/Tages-Budget), unabhängig vom Board-Takt.
         eu = None
