@@ -12765,6 +12765,38 @@ def _station_local_date(iso_utc, iata):
         return None
 
 
+_REAL_FLIGHT_RE = re.compile(r'^[A-Z]{2,3}\d{1,4}[A-Z]?$')
+
+
+def _is_real_flight_sector(s):
+    """Ground-Guard: gibt True zurück, wenn `s` ein echter Flug-Sektor ist.
+
+    Kriterien (alle müssen erfüllt sein):
+      • `flight` ist gesetzt und entspricht einem IATA-Flugnummer-Muster
+        ([A-Z]{2,3} + 1–4 Ziffern, optionaler Suffix-Buchstabe, z.B. LH400 / EW2191A).
+      • `from` und `to` sind je 3 alpha-Großbuchstaben (gültiges IATA-Paar).
+      • `from` != `to` (kein Same-Airport-Pseudoleg / Bodentransfer).
+
+    Boden-Events (Standby SB, Simulator, Training, Hotel-Transfer, Office-/
+    Positionierungs-Pseudo-Legs ohne Flugnummer) liefern False und werden von
+    `_feed_nightstop_ort` beim Bestimmen des Nightstop-Orts übersprungen.
+    Sektoren ohne `flight`-Feld (iCal via location-only IATA-IATA) sind
+    typischerweise Boden-Transfers — sie dürfen den Nightstop nie bestimmen.
+    """
+    if not isinstance(s, dict):
+        return False
+    flt = re.sub(r'\s+', '', str(s.get('flight') or '')).upper()
+    if not _REAL_FLIGHT_RE.match(flt):
+        return False
+    frm = str(s.get('from') or '').strip().upper()
+    to = str(s.get('to') or '').strip().upper()
+    if not (len(frm) == 3 and frm.isalpha() and len(to) == 3 and to.isalpha()):
+        return False
+    if frm == to:
+        return False
+    return True
+
+
 def _feed_nightstop_ort(day, homebase=None, next_day=None):
     """Der Übernachtungs-/Nightstop-Ort EINES Roster-Tages für die FEED-Flächen
     (friends-today `lay_eff`, Crew-Vergleich/Overlap-Edges, Family, Layover-Rec-
@@ -12805,9 +12837,16 @@ def _feed_nightstop_ort(day, homebase=None, next_day=None):
         return fallback
     hb = (homebase or '').strip().upper() or None
     try:
+        # GROUND-GUARD (2026-07-19): nur echte Flug-Sektoren (Flugnummer +
+        # gültiges from/to-IATA-Paar, from != to) bestimmen den Nightstop-Ort.
+        # Boden-Events (Standby, Training, Simulator, Hotel-Transfer, Positions-
+        # legs ohne Flugnummer) werden übersprungen. Verhalten für User mit rein
+        # echten Flug-Sektoren ist byte-identisch — der Guard greift nur, wenn
+        # ein Nicht-Flug-Event sonst den Nightstop-Ort bestimmt hätte.
         # nach Abflug sortieren (die Sektor-Reihenfolge ist die Flug-Reihenfolge)
         ordered = sorted(
-            [s for s in secs if isinstance(s, dict) and s.get('arr_iso')],
+            [s for s in secs
+             if isinstance(s, dict) and s.get('arr_iso') and _is_real_flight_sector(s)],
             key=lambda s: str(s.get('dep_iso') or s.get('arr_iso') or ''))
         last_same_day = None
         last_arr_iso = None
@@ -12865,7 +12904,8 @@ def _feed_nightstop_ort(day, homebase=None, next_day=None):
                             str(last_arr_iso).replace('Z', '+00:00'))
                         for ns in sorted(
                                 [x for x in nsecs
-                                 if isinstance(x, dict) and x.get('dep_iso')],
+                                 if isinstance(x, dict) and x.get('dep_iso')
+                                 and _is_real_flight_sector(x)],
                                 key=lambda x: str(x.get('dep_iso') or '')):
                             if str(ns.get('from') or '').strip().upper() != last_same_day:
                                 continue

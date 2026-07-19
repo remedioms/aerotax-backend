@@ -219,3 +219,103 @@ def test_real_layover_next_day_departure_over_8h_is_kept():
     }
     # >28h Boden → echter Layover, JFK bleibt Nightstop.
     assert A._feed_nightstop_ort(day_n, next_day=day_n1) == 'JFK'
+
+
+# ── GROUND-GUARD (2026-07-19) ─────────────────────────────────────────────────
+# Boden-Events (Standby, Training, Simulator, Hotel-Transfer, Pseudolegs ohne
+# Flugnummer) dürfen den Nightstop-Ort NICHT bestimmen. Nur echte Flug-Sektoren
+# (Flugnummer im IATA-Muster + from != to + je 3 alpha-Zeichen) zählen.
+
+def test_ground_event_no_flight_number_skipped():
+    """Sektor ohne Flugnummer (z.B. Hotel-Transfer via location-only FRA-MUC)
+    darf den Nightstop nicht bestimmen. Reader-Fallback bleibt."""
+    day = {
+        'datum': '2026-07-19',
+        'reader_facts': {'layover_ort': 'MIA'},
+        'ical_sectors': [
+            # Pseudo-Leg aus LOCATION „FRA-MUC", kein flight-Feld
+            {'flight': None, 'from': 'FRA', 'to': 'MUC',
+             'dep_iso': '2026-07-19T10:00:00Z', 'arr_iso': '2026-07-19T11:00:00Z'},
+        ],
+    }
+    # Ground-Guard überspringt das sektorlose Event → Reader-Fallback bleibt.
+    assert A._feed_nightstop_ort(day) == 'MIA'
+
+
+def test_ground_event_empty_flight_number_skipped():
+    """Sektor mit leerem flight-String wird als Boden-Event behandelt."""
+    day = {
+        'datum': '2026-07-19',
+        'reader_facts': {'layover_ort': 'JFK'},
+        'ical_sectors': [
+            {'flight': '', 'from': 'FRA', 'to': 'MUC',
+             'dep_iso': '2026-07-19T08:00:00Z', 'arr_iso': '2026-07-19T09:00:00Z'},
+        ],
+    }
+    assert A._feed_nightstop_ort(day) == 'JFK'
+
+
+def test_ground_event_same_airport_pseudoleg_skipped():
+    """from == to (z.B. Apron-Bus FRA→FRA) = kein Flug → Guard überspringt."""
+    day = {
+        'datum': '2026-07-19',
+        'reader_facts': {'layover_ort': 'LHR'},
+        'ical_sectors': [
+            # Pseudo-Leg gleicher Airport (Apron-Transfer, Ground-Positioning)
+            {'flight': 'LH9999', 'from': 'FRA', 'to': 'FRA',
+             'dep_iso': '2026-07-19T06:00:00Z', 'arr_iso': '2026-07-19T06:30:00Z'},
+        ],
+    }
+    assert A._feed_nightstop_ort(day) == 'LHR'
+
+
+def test_ground_event_mixed_real_and_pseudo_real_wins():
+    """Tag mit einem Boden-Event UND einem echten Flug-Sektor: nur der echte
+    Flug bestimmt den Nightstop (Guard filtert das Boden-Event heraus)."""
+    day = {
+        'datum': '2026-07-19',
+        'reader_facts': {'layover_ort': 'BER'},
+        'ical_sectors': [
+            # Boden-Event (kein flight) kommt zuerst → wird übersprungen
+            {'flight': None, 'from': 'FRA', 'to': 'MUC',
+             'dep_iso': '2026-07-19T06:00:00Z', 'arr_iso': '2026-07-19T07:00:00Z'},
+            # Echter Flug nach JFK
+            {'flight': 'LH400', 'from': 'FRA', 'to': 'JFK',
+             'dep_iso': '2026-07-19T08:00:00Z', 'arr_iso': '2026-07-19T16:30:00Z'},
+        ],
+    }
+    assert A._feed_nightstop_ort(day) == 'JFK'
+
+
+def test_real_flight_with_suffix_letter_passes_guard():
+    """Flugnummern mit Suffix-Buchstaben (z.B. EW2191A) werden als echte Flüge
+    erkannt — Guard lehnt sie NICHT fälschlich ab."""
+    day = {
+        'datum': '2026-07-19',
+        'reader_facts': {},
+        'ical_sectors': [
+            {'flight': 'EW2191A', 'from': 'CGN', 'to': 'PMI',
+             'dep_iso': '2026-07-19T07:00:00Z', 'arr_iso': '2026-07-19T09:30:00Z'},
+        ],
+    }
+    assert A._feed_nightstop_ort(day) == 'PMI'
+
+
+def test_ground_guard_does_not_affect_existing_real_flight_sectors():
+    """Sanity-Check: für Tage mit ausschliesslich echten Flug-Sektoren (wie
+    Florian, der Golden-Kai-Test usw.) ändert der Guard NICHTS — Ergebnis
+    byte-identisch mit dem Verhalten vor dem Guard."""
+    # Florian-Tag (unveränderter Referenz-Test)
+    assert A._feed_nightstop_ort(A.FLORIAN_DAY if hasattr(A, 'FLORIAN_DAY') else {
+        'datum': '2026-07-16',
+        'reader_facts': {'layover_ort': 'BER',
+                         'flight_numbers': ['LH1834', 'LH1835', 'LH1836']},
+        'ical_sectors': [
+            {'flight': 'LH1834', 'from': 'MUC', 'to': 'FCO',
+             'dep_iso': '2026-07-16T06:00:00Z', 'arr_iso': '2026-07-16T07:40:00Z'},
+            {'flight': 'LH1835', 'from': 'FCO', 'to': 'MUC',
+             'dep_iso': '2026-07-16T08:30:00Z', 'arr_iso': '2026-07-16T10:10:00Z'},
+            {'flight': 'LH1836', 'from': 'MUC', 'to': 'FCO',
+             'dep_iso': '2026-07-16T11:20:00Z', 'arr_iso': '2026-07-16T13:05:00Z'},
+        ],
+    }) == 'FCO'
