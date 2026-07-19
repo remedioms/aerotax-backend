@@ -10488,9 +10488,17 @@ def user_search():
                 # Präfix eines beliebigen Worts (nach Leerzeichen). Das verhindert
                 # Substring-Treffer wie „JohANnes" bei Suche „an".
                 # PostgREST or_()-Filter: name ILIKE 'q%' OR name ILIKE '% q%'
-                qbuilder = qbuilder.or_(
-                    f"name.ilike.{q}%,name.ilike.% {q}%"
-                )
+                #
+                # EIN-FELD-SUCHE (Owner 19.07 „Suche funktioniert nicht per
+                # Homebase oder Airline"): die iOS-Suche schickt ALLES als q —
+                # die separaten airline=/homebase=-Parameter nutzt kein Client.
+                # q matcht daher zusätzlich Airline-Präfix („condor", „swiss")
+                # und bei exakt 3 Buchstaben die Homebase („FRA", „ZRH").
+                _ors = [f"name.ilike.{q}%", f"name.ilike.% {q}%",
+                        f"airline.ilike.{q}%"]
+                if len(q) == 3 and q.isalpha():
+                    _ors.append(f"homebase.ilike.{q}")
+                qbuilder = qbuilder.or_(",".join(_ors))
             if airline:
                 # ilike ohne Wildcard = exakter case-insensitiver Vergleich
                 qbuilder = qbuilder.ilike('airline', airline)
