@@ -21455,7 +21455,7 @@ def _wall_posts_for_forum():
 
 @app.route('/api/forum/<token>/threads', methods=['GET'])
 def forum_list_threads(token):
-    """Query: ?category=cabin&sort=hot|new|active&limit=50"""
+    """Query: ?category=cabin&sort=hot|new|active|trending&limit=50"""
     category = (request.args.get('category') or '').strip().lower()
     sort = (request.args.get('sort') or 'active').strip().lower()
     limit = min(int(request.args.get('limit') or 50), 200)
@@ -21523,6 +21523,22 @@ def forum_list_threads(token):
             engagement = (t.get('like_count') or 0) + (t.get('reply_count') or 0) * 2
             return -(engagement / (age_h ** 1.5))
         threads.sort(key=hot_score)
+    elif sort == 'trending':
+        # Trending = Heiß diskutiert: (replies*2 + likes) gewichtet nach Aktivität
+        # der letzten 7 Tage. Threads ohne jüngste Aktivität verfallen auf 0.
+        # last_reply_ts jünger als 7 Tage → voller Score; älter → kein Score.
+        _7d = 7 * 24 * 3600
+        def trending_score(t):
+            last_ts = t.get('last_reply_ts') or t.get('created_ts') or 0
+            age_s = now - last_ts
+            if age_s > _7d:
+                return 0
+            # Aktivitäts-Score aus aktuellen Zählern
+            engagement = (t.get('like_count') or 0) + (t.get('reply_count') or 0) * 2
+            # Frische-Bonus: je jünger die letzte Aktivität, desto höher
+            recency = max(0.0, 1.0 - age_s / _7d)
+            return -(engagement * (0.5 + 0.5 * recency))
+        threads.sort(key=trending_score)
     else:  # active = last activity
         threads.sort(key=lambda t: -((t.get('last_reply_ts') or t.get('created_ts') or 0)))
 
