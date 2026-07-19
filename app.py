@@ -21669,6 +21669,40 @@ def forum_toggle_thread_like(token, thread_id):
 
 @app.route('/api/forum/<token>/threads/<thread_id>/replies', methods=['GET'])
 def forum_list_replies(token, thread_id):
+    # WALL-BRÜCKE LESEN (Owner 2026-07-19 „server geht nicht beim antworten
+    # im forum"): 'wall:<id>'-Threads sind gespiegelte Crew-Feed-Posts — ihre
+    # Diskussion lebt als Wall-Kommentare. Die werden hier in Reply-Form
+    # gemappt, damit der Forum-Thread dieselbe Unterhaltung zeigt wie der Feed.
+    if thread_id.startswith('wall:'):
+        post_id = thread_id[5:]
+        comments = _wall_comments_load(post_id) or []
+        _blk = _blocked_by(token)
+        if _blk:
+            comments = [c for c in comments if c.get('author_token') not in _blk]
+        out = []
+        for c in comments:
+            anon = bool(c.get('is_anonymous'))
+            r = {
+                'id': c.get('id'),
+                'thread_id': thread_id,
+                'body': c.get('text') or '',
+                'image_url': c.get('image_url'),
+                'gif_url': None,
+                'parent_reply_id': c.get('parent_comment_id'),
+                'author_short': None if anon else c.get('author_short'),
+                'author_name': (c.get('anon_handle') or 'Anonym') if anon
+                               else (c.get('author_name') or ''),
+                'created_at': c.get('created_at'),
+                'created_ts': c.get('ts') or 0,
+                'like_count': 0,
+                'liked_by_me': False,
+                'is_mine': (c.get('author_token') == token),
+            }
+            if not anon and c.get('author_avatar'):
+                r['author_avatar'] = c.get('author_avatar')
+            out.append(r)
+        out.sort(key=lambda r: (r.get('created_ts') or 0))
+        return jsonify({'thread_id': thread_id, 'count': len(out), 'replies': out})
     replies = _forum_load_replies(thread_id)
     # PRIVACY-FIX (Bug-Hunt): Replies geblockter Autoren ausblenden (wie die
     # Thread-Liste). Vorher sah der Blocker die Antworten der geblockten Person.
@@ -21724,6 +21758,35 @@ def forum_create_reply(token, thread_id):
     if len(raw_text) > 3000:
         return jsonify({'ok': False, 'error': 'too_long'}), 413
     text = _sanitize_user_text(raw_text, max_len=3000)
+
+    # WALL-BRÜCKE SCHREIBEN (Owner 2026-07-19): Antworten auf 'wall:<id>'-
+    # Threads liefen dokumentiert „ins Leere" (404 → für User „Server-
+    # Probleme"). Jetzt wird die Antwort als ECHTER Wall-Kommentar auf den
+    # Ursprungs-Post gebucht (interner Dispatch auf add_comment — gleiche
+    # Pushes/Zähler wie im Crew-Feed) und in Reply-Form beantwortet.
+    if thread_id.startswith('wall:'):
+        post_id = thread_id[5:]
+        if len(text) > 500:
+            return jsonify({'ok': False, 'error': 'too_long'}), 413
+        payload = {'text': text, 'image_url': image_url,
+                   'parent_comment_id': parent_reply_id}
+        with app.test_request_context(json=payload):
+            r = add_comment(token, post_id)
+        resp_obj = r[0] if isinstance(r, tuple) else r
+        status = r[1] if isinstance(r, tuple) else 200
+        data = (resp_obj.get_json(silent=True) or {}) if hasattr(resp_obj, 'get_json') else {}
+        if status != 200 or not data.get('ok'):
+            return resp_obj if not isinstance(r, tuple) else (resp_obj, status)
+        c = data.get('comment') or {}
+        return jsonify({'ok': True, 'reply': {
+            'id': c.get('id'), 'thread_id': thread_id,
+            'body': c.get('text') or '', 'image_url': c.get('image_url'),
+            'gif_url': None, 'parent_reply_id': c.get('parent_comment_id'),
+            'author_short': c.get('author_short'),
+            'author_name': c.get('author_name') or '',
+            'created_at': c.get('created_at'),
+            'created_ts': c.get('ts') or 0, 'like_count': 0,
+        }})
 
     # Per-Row-Lookup statt load-ALL (2026-07-01).
     target = _forum_thread_sb_get(thread_id)
