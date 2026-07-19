@@ -12765,7 +12765,11 @@ def _station_local_date(iso_utc, iata):
         return None
 
 
-_REAL_FLIGHT_RE = re.compile(r'^[A-Z]{2,3}\d{1,4}[A-Z]?$')
+# Airline-Präfix darf alphanumerisch sein (Tiefenprüfung 19.07: X3/W6/U2/4Y —
+# reine Buchstaben-Regex ließ TUIfly/Wizz/easyJet/Discover-Sektoren durchs
+# Ground-Guard-Raster fallen). Mindestens EIN Buchstabe im Präfix, damit
+# reine Zahlenketten (Gate-Nummern o.ä.) weiter rausfliegen.
+_REAL_FLIGHT_RE = re.compile(r'^(?:[A-Z]{2,3}|[A-Z]\d|\d[A-Z])\d{1,4}[A-Z]?$')
 
 
 def _is_real_flight_sector(s):
@@ -22563,7 +22567,9 @@ def _canonical_airline_key(airline):
     # Lufthansa City (VL, eigenes AOC + eigene Hotel-Verträge) VOR dem
     # 'lufthansa'-Substring prüfen — sonst fiele sie in den LH-Bucket
     # (Owner 2026-07-19). Deckt „Lufthansa City", „City Airlines", VL/CityLine ab.
-    if ('city' in v and ('lufthansa' in v or 'airlines' in v or 'cityline' in v)) or v == 'vl':
+    # Verschärft (Tiefenprüfung 19.07): „'airlines' in v" matchte fast jede
+    # Airline mit „City" im Namen (Sun City Airlines → LH-City-Bucket-Leak).
+    if 'lufthansa city' in v or 'cityline' in v or v == 'vl':
         return 'LUFTHANSA CITY'
     if 'lufthansa' in v or v in ('lh', 'dlh'):
         return 'LUFTHANSA'
@@ -22642,9 +22648,14 @@ def ax_crew_hotels_suggest():
     body = request.get_json(silent=True) or {}
     iata = (body.get('iata') or '').strip().upper()
     hotel = (body.get('hotel') or '').strip()
+    # SECURITY + Datenqualität (Tiefenprüfung 19.07): Zeichen-Whitelist.
+    # Entfernt insbesondere die SQL-LIKE-Wildcards %/_ — der Vote-Lookup
+    # unten läuft über .ilike; mit `hotel="%"` hätte EIN User via
+    # 2-Stimmen-Promotion das aktive Hotel jeder Station kippen können.
+    hotel = re.sub(r"[^0-9A-Za-zÀ-ÿ .,()&'\-/]", '', hotel).strip()
     if len(iata) != 3 or not iata.isalpha():
         return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
-    if not hotel or len(hotel) > 160:
+    if not hotel or len(hotel) > 160 or len(hotel) < 3:
         return jsonify({'ok': False, 'error': 'invalid_hotel'}), 400
     base = (body.get('base') or '').strip().upper() or None
     try:
@@ -40488,6 +40499,12 @@ def _build_ical_sectors(events):
                 if not ml:
                     continue
                 flight = None; frm = ml.group(1); to = ml.group(2)
+        # PSEUDO-LEG-GUARD (Tiefenprüfung 19.07, 46 „FRA-FRA"-Rows live):
+        # Simulator-/Trainings-Events tragen mitunter „FRA - FRA" — from==to
+        # ist nie ein echter Flug-Sektor (gleiche Regel wie
+        # _is_real_flight_sector) und würde EventDetails/primaryLeg vergiften.
+        if frm == to:
+            continue
         sec_by_day.setdefault(d, []).append({
             'flight': flight, 'from': frm, 'to': to,
             'dep_iso': (ev.get('start_iso') or ''), 'arr_iso': (ev.get('end_iso') or ''),
