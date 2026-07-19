@@ -22440,6 +22440,11 @@ def _canonical_airline_key(airline):
     v = (airline or '').strip().lower()
     if not v:
         return ''
+    # Lufthansa City (VL, eigenes AOC + eigene Hotel-Verträge) VOR dem
+    # 'lufthansa'-Substring prüfen — sonst fiele sie in den LH-Bucket
+    # (Owner 2026-07-19). Deckt „Lufthansa City", „City Airlines", VL/CityLine ab.
+    if ('city' in v and ('lufthansa' in v or 'airlines' in v or 'cityline' in v)) or v == 'vl':
+        return 'LUFTHANSA CITY'
     if 'lufthansa' in v or v in ('lh', 'dlh'):
         return 'LUFTHANSA'
     if 'swiss' in v or v in ('lx', 'swr'):
