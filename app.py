@@ -21884,7 +21884,9 @@ def forum_trending_hashtags(token):
 
 # ─── Crew Layover Recommendations (per Airport) ─────────────────────────────
 # Kategorien: food | sight | sleep | gym | transport | nightlife | shopping
-LAYOVER_CATEGORIES = {'food','sight','sleep','gym','transport','nightlife','shopping','coffee','other'}
+# 'airport' (2026-07-19, Jamie Geddes Rowe): Geschäfte/Restaurants AM Flughafen
+# — eigener Bereich, gespeist aus Guide-airport_fb-Seeds + Crew-Posts.
+LAYOVER_CATEGORIES = {'food','sight','sleep','gym','transport','nightlife','shopping','coffee','airport','other'}
 
 def _recs_dir():
     import os
