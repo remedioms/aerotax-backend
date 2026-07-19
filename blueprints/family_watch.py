@@ -494,6 +494,11 @@ def _fallback_next_tour_from_disk(status, crew_token, allowed_fields):
         status['next_flight_arr_iata'] = _arr
         status['next_flight_dep_city'] = _iata_city_name(legs[0][0])
         status['next_flight_arr_city'] = _iata_city_name(_arr)
+        # SMART BEIDES (Owner 19.07 „erster Flug ist auch TLV — beides
+        # stimmt"): die VOLLE Tages-Kette additiv mitliefern — neue Clients
+        # zeigen „FRA → TLV → ATH" (Flug UND Reiseziel auf einen Blick),
+        # alte Clients behalten dep→arr (arr = Reiseziel-Ende, s.o.).
+        status['next_flight_chain'] = chain
         status['today_route_label'] = _route_label_cities('-'.join(chain))
         st = ev.get('ical_start_iso')
         if st:
@@ -1106,6 +1111,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                 status['next_flight_arr_iata'] = _arr2
                 status['next_flight_dep_city'] = _iata_city_name(_legs2[0][0])
                 status['next_flight_arr_city'] = _iata_city_name(_arr2)
+                status['next_flight_chain'] = _chain2
                 st = br.get('ical_start')
                 if st:
                     status['next_flight_etd_iso'] = _iso_utc_z(st)
