@@ -35009,6 +35009,10 @@ def ax_transit():
         best_arr = None          # deren Ankunfts-datetime (zum Vergleich)
         fallback = None          # früheste Ankunft, falls keine pünktlich ist
         fallback_arr = None
+        # ALLE pünktlichen Kandidaten sammeln (Owner 2026-07-20, „warum kann
+        # man die Verbindung nicht aussuchen? ICE statt RE") — die App zeigt
+        # sie als wählbare Alternativen; `best` bleibt die Default-Empfehlung.
+        on_time_cands = []       # [(arr_dt, cand)]
         for legs in journeys:
             transit_legs = [l for l in legs if l['mode'] == 'transit']
             if not transit_legs:
@@ -35035,6 +35039,7 @@ def ax_transit():
                                               arr_dt <= target_dt + timedelta(minutes=2))
             if not on_time:
                 continue
+            on_time_cands.append((arr_dt, cand))
             # LATESTE pünktliche Ankunft gewinnt (am nächsten an der Zielzeit). Bei
             # fehlender Ankunftszeit (arr_dt None) nur als allererster Treffer nehmen.
             if best is None or (arr_dt is not None and
@@ -35061,6 +35066,37 @@ def ax_transit():
             'arrival_target': arrival_s,
             'legs': best['legs'],
         }
+        # WÄHLBARE Alternativen (Owner 2026-07-20): alle pünktlichen
+        # Verbindungen, späteste Ankunft zuerst (= Default-Empfehlung vorne),
+        # dedupliziert über (erste Linie, erste ÖPNV-Abfahrt), max. 4. Gleiche
+        # Feld-Shape wie das Top-Level, damit die App eine Wahl 1:1 als
+        # Ergebnis übernehmen kann. Additiv — alte Clients ignorieren den Key.
+        try:
+            alts = []
+            seen = set()
+            for arr_dt, cand in sorted(on_time_cands,
+                                       key=lambda x: (x[0] is None,
+                                                      -(x[0].timestamp() if x[0] else 0))):
+                first_line = next((l.get('line') for l in cand['legs']
+                                   if l['mode'] == 'transit'), None)
+                key = (first_line or '', cand.get('transit_dep') or '')
+                if key in seen:
+                    continue
+                seen.add(key)
+                alts.append({'leave_at': cand['leave_at'],
+                             'walk_to_stop_min': cand['walk_min'],
+                             'first_stop': cand['first_stop'],
+                             'first_dep': cand['transit_dep'],
+                             'first_dep_planned': cand.get('first_dep_planned'),
+                             'first_dep_delay_min': cand.get('first_dep_delay_min'),
+                             'last_arr': cand['last_arr'],
+                             'legs': cand['legs']})
+                if len(alts) >= 4:
+                    break
+            if len(alts) > 1:
+                out['alternatives'] = alts
+        except Exception:
+            pass
         if request.args.get('debug') == '1':
             out['debug'] = dbg
         return jsonify(out)
