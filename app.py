@@ -41450,8 +41450,10 @@ _CREWACCESS_MONTHS = {
 }
 _CREWACCESS_DAY_RE = re.compile(
     r'^(\d{1,2})\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b\s*(.*)$')
+# Leg-Zeile: optionale Prefix-Tokens (Tag + Pos, z.B. „ALT_F FO" oder „LCK
+# FO" im Published Roster; nur Pos „FO" im Preview) vor der Flugnummer.
 _CREWACCESS_LEG_RE = re.compile(
-    r'^(?:([A-Z]{1,3})\s+)?(\d{1,4}[A-Z]?)\s+([A-Z]{3})\s+([A-Z]{3})\s+'
+    r'^(?:[A-Z][A-Z0-9_]*\s+)*?(\d{1,4}[A-Z]?)\s+([A-Z]{3})\s+([A-Z]{3})\s+'
     r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})\b')
 _CREWACCESS_SBY_RE = re.compile(
     r'^(SBY[A-Z0-9]*)\s+([A-Z]{3})\s+(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})\b')
@@ -41461,7 +41463,9 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
     """CrewAccess-„Roster Preview"-Text → synthetisches ICS. Pure/testbar.
     Returns (ics_string, None) oder (None, error_code). Deterministisch,
     NICHTS wird erfunden: unbekannte Tages-Marker reisen als Roh-Summary mit."""
-    if 'Roster Preview' not in (text or '') or 'Planning period' not in (text or ''):
+    _head_ok = ('Roster Preview' in (text or '')
+                or 'Published Roster' in (text or ''))
+    if not _head_ok or 'Planning period' not in (text or ''):
         return None, 'unsupported_pdf_format'
     mp = re.search(r'Planning period:\s*([A-Za-z]+)\s+(\d{4})', text)
     month = _CREWACCESS_MONTHS.get((mp.group(1).lower() if mp else ''), 0)
@@ -41479,7 +41483,7 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
 
     events = []   # (uid_suffix, dtstart, dtend, summary, all_day)
 
-    def add_leg(d, pos, num, frm, to, t1, t2):
+    def add_leg(d, num, frm, to, t1, t2):
         h1, m1 = (int(x) for x in t1.split(':'))
         h2, m2 = (int(x) for x in t2.split(':'))
         start = datetime(d.year, d.month, d.day, h1, m1)
@@ -41542,6 +41546,13 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
                 add_timed(cur_day, sb.group(3), sb.group(4),
                           f'Standby {sb.group(2)}')
                 continue
+            # Voll-Layover-Tag mitten in der Rotation (Published Roster:
+            # „11 Thu Layover: MAN") — als LAYOVER-Event durchreichen (gleiches
+            # Vokabular wie die LH-iCal-Feeds).
+            ml = re.match(r'^Layover:?\s+([A-Z]{3})$', rest)
+            if ml:
+                add_all_day(cur_day, f'Layover {ml.group(1)}')
+                continue
             # Report-Zeit vor dem ersten Leg abstreifen („05:15 FO 2460 …").
             mr = re.match(r'^(\d{1,2}:\d{2})\s+(.*)$', rest)
             if mr:
@@ -41551,7 +41562,7 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
         lm = _CREWACCESS_LEG_RE.match(rest)
         if lm:
             add_leg(cur_day, lm.group(1), lm.group(2), lm.group(3),
-                    lm.group(4), lm.group(5), lm.group(6))
+                    lm.group(4), lm.group(5))
 
     if not events:
         return None, 'no_roster_days'

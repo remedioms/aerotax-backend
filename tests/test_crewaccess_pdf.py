@@ -33,6 +33,35 @@ FO 2502 MUC MAN 14:00 16:05 31D 12:30
 Created 16Jul2026 16:19 (UTC) by 000000X 1 ( 1)
 """
 
+# Published-Roster-Variante (Juni-Beispiel): Header „Published Roster",
+# Leg-Tags (ALT_F/LCK) vor der Position, Voll-Layover-Tag „Layover: MAN".
+SYN_PUBLISHED = """Published Roster
+Planning period: June 2026
+MUSTER, Test Crew
+Rank: FO Base: MUC
+Date Report (UTC) Tags Pos Activity From To Start (UTC) End (UTC) A/C Layover Trip ID
+03 Wed 03:15 ALT_F FO 1972 MUC CGN 04:39 05:46 32N 828921
+ALT_F FO 1973 CGN MUC 06:35 07:42 32N
+04 Thu 08:40 LCK FO 1938 MUC BER 10:11 11:15 32N 02046
+10 Wed 11:25 FO 2504 MUC MAN 20:10 22:17 32N 30:13
+11 Thu Layover: MAN
+12 Fri 04:55 FO 2505 MAN MUC 06:26 08:17 32N
+Created 26Jun2026 21:07 (UTC) by 000000X 1 ( 1)
+"""
+
+
+def test_published_roster_with_tags_and_layover_day():
+    ics, err = backend._crewaccess_text_to_ics(SYN_PUBLISHED, carrier='VL')
+    assert err is None
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    # Tags (ALT_F/LCK) vor der Position duerfen den Leg-Parse nicht brechen:
+    assert [s['flight'] for s in secs['2026-06-03']] == ['VL1972', 'VL1973']
+    assert [s['flight'] for s in secs['2026-06-04']] == ['VL1938']
+    # Voll-Layover-Tag als LAYOVER-Event (LH-Feed-Vokabular):
+    lay = [e for e in events if e['summary'] == 'Layover MAN']
+    assert len(lay) == 1 and lay[0]['start'] == '2026-06-11'
+
 
 def test_parser_builds_ics_with_all_day_types():
     ics, err = backend._crewaccess_text_to_ics(SYN_TEXT, carrier='VL')
