@@ -31807,6 +31807,31 @@ _FLIGHT_MERGE_CACHE: dict = {}
 _FLIGHT_MERGE_TTL = 90
 
 
+def _board_day_midnight_ok(want_day, bsched):
+    """Mitternachts-Toleranz für den Betriebstag-Vergleich (Parität zum iOS
+    `BoardObservationDateGate`, Sebastian LH686 2026-07-20): eine Board-Row mit
+    vollem sched-Datum, das um GENAU einen Tag vom gewünschten Verkehrstag
+    abweicht, ist NUR nahe der Tagesgrenze noch derselbe Lauf (Red-Eye rutscht
+    über Mitternacht) — Folgetag 00:00–02:59 bzw. Vortag 21:00–23:59. Alles
+    andere ist eine fremde Instanz derselben täglichen Flugnummer."""
+    try:
+        d_want = datetime.strptime(want_day, '%Y-%m-%d').date()
+        d_board = datetime.strptime(bsched[:10], '%Y-%m-%d').date()
+        diff = (d_board - d_want).days
+        if diff == 0:
+            return True
+        if len(bsched) < 13 or bsched[10] not in ('T', ' '):
+            return False
+        hour = int(bsched[11:13])
+        if diff == 1:
+            return hour < 3
+        if diff == -1:
+            return hour >= 21
+        return False
+    except Exception:
+        return False
+
+
 def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
                        live=True, free_only=False, arr_date=None):
     """EIN gemergter Record für einen Flug aus ALLEN verfügbaren Beobachtungen
@@ -31916,7 +31941,7 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         _want_day = day or date_q
         _bsched = str(bf.get('sched') or '').strip()
         if (_want_day and len(_bsched) >= 10 and _bsched[4:5] == '-'
-                and _bsched[:10] != _want_day):
+                and not _board_day_midnight_ok(_want_day, _bsched)):
             return
         if bf.get('_arr'):
             if arr_row is None:
