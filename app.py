@@ -41169,12 +41169,20 @@ def import_calendar_feed(token):
     events_count_1/events_count_2 (+ error_1/error_2 bei per-Link-Fehlern).
     """
     body = request.get_json(silent=True) or {}
+    # DIREKT-ICS (Roster-PDF Lufthansa City/Discover, 2026-07-20): der PDF-
+    # Endpoint (`import_roster_pdf`) synthetisiert aus dem CrewAccess-PDF ein
+    # ICS und reicht es hier DIREKT herein — exakt dieselbe Pipeline
+    # (Parse→Merge→Briefings→Reconcile→Sektoren), nur ohne URL-Fetch. Kein
+    # Security-Delta: der User kontrolliert auch jede Feed-URL selbst.
+    ics_text_direct = body.get('ics_text') if isinstance(body.get('ics_text'), str) else None
+    if ics_text_direct and len(ics_text_direct) > 1_000_000:
+        return jsonify({'ok': False, 'error': 'response_too_large'}), 413
     url = _normalize_feed_scheme(_sanitize_feed_url(body.get('url') or ''))
     # HTTP raus · nur HTTPS akzeptieren (sonst Klartext-Cookies leakable).
     # Leerer/unbrauchbarer Rest nach dem Sanitize = ungültige URL → bad_url,
     # damit alte Clients (die client-seitig NICHT sanitizen) eine ehrliche
     # „Link-unvollständig"-Meldung statt „fetch_failed" bekommen.
-    if not url.startswith('https://'):
+    if not ics_text_direct and not url.startswith('https://'):
         return jsonify({'ok': False, 'error': 'bad_url'}), 400
     # ── Zweit-Link auflösen ──────────────────────────────────────────────────
     # Explizit im Body ODER (wenn der Client keinen `url_2`-Key schickt — alte
@@ -41191,7 +41199,7 @@ def import_calendar_feed(token):
         if _url_2_raw:
             err_2 = 'bad_url_2'
         url_2 = ''
-    if not url_2 and 'url_2' not in body:
+    if not url_2 and 'url_2' not in body and not ics_text_direct:
         try:
             _pf = _profile_load(token) or {}
             for _src in ((_pf.get('profile') or {}), _pf):
@@ -41208,7 +41216,10 @@ def import_calendar_feed(token):
     # ── Link 1 (Duty/Primär) holen + parsen ─────────────────────────────────
     err_1 = None
     events_1 = []
-    text, ferr = _fetch_calendar_feed_text(url)
+    if ics_text_direct:
+        text, ferr = ics_text_direct, None
+    else:
+        text, ferr = _fetch_calendar_feed_text(url)
     if ferr in ('bad_url', 'internal_host_blocked'):
         # Format-/SSRF-Fehler des Primär-Links bleiben harte 400er (wie bisher) —
         # das ist ein Client-Eingabe-Problem, kein „anderer Link rettet es".
@@ -41308,6 +41319,11 @@ def import_calendar_feed(token):
         # _calendar_feed_note_refresh_failure / _maybe_refresh_calendar_feed).
         feed_obj.pop('refresh_fail_count', None)
         feed_obj.pop('last_refresh_fail_at', None)
+        if ics_text_direct:
+            # PDF-Import: kein URL-Zyklus (Auto-Refresh hat nichts zu holen) —
+            # Quelle ehrlich markieren, damit Diagnose/UI sie unterscheiden kann.
+            feed_obj['url'] = ''
+            feed_obj['source'] = 'pdf'
     # err_1 gesetzt → Slot 1 UNVERÄNDERT lassen (kein frisches imported_at über
     # einen gescheiterten Duty-Fetch stempeln — J5-Lektion; Backoff-Zähler hat
     # _calendar_feed_note_refresh_failure oben schon erhöht).
@@ -41412,6 +41428,210 @@ def import_calendar_feed(token):
         if err_2:
             _resp['error_2'] = err_2
     return jsonify(_resp)
+
+
+# ── CrewAccess-Roster-PDF (Lufthansa City VL / Discover 4Y, 2026-07-20) ──────
+# Beide Airlines haben KEINEN iCal-Export — die Crew bekommt den Plan als
+# „Roster Preview"-PDF aus CrewAccess. Format (verifiziert am City-Beispiel):
+#   Kopf   „Planning period: August 2026", alle Zeiten UTC.
+#   Tabelle ab Header „Date Report (UTC) …":
+#     03 Mon 05:15 FO 2460 MUC HEL 06:35 09:05 32N 831580   ← Tag + 1. Leg
+#            FO 2461 HEL MUC 09:50 12:25 32N                ← Folge-Leg
+#     01 Sat O            ← Off (O/OW) · 29 Sat U ← Urlaub
+#     19 Wed SBYL MUC 09:00 19:00                            ← Standby mit Zeiten
+#     12 Wed RES10                                           ← Reserve
+# Der Parser synthetisiert daraus ein ICS und schickt es durch die EINE
+# bestehende Feed-Pipeline (import_calendar_feed mit ics_text) — Briefings,
+# Sektoren, Reconcile, Nightstops kommen gratis und bleiben eine Wahrheit.
+_CREWACCESS_MONTHS = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+    'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11,
+    'december': 12,
+}
+_CREWACCESS_DAY_RE = re.compile(
+    r'^(\d{1,2})\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b\s*(.*)$')
+_CREWACCESS_LEG_RE = re.compile(
+    r'^(?:([A-Z]{1,3})\s+)?(\d{1,4}[A-Z]?)\s+([A-Z]{3})\s+([A-Z]{3})\s+'
+    r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})\b')
+_CREWACCESS_SBY_RE = re.compile(
+    r'^(SBY[A-Z0-9]*)\s+([A-Z]{3})\s+(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})\b')
+
+
+def _crewaccess_text_to_ics(text, carrier='VL'):
+    """CrewAccess-„Roster Preview"-Text → synthetisches ICS. Pure/testbar.
+    Returns (ics_string, None) oder (None, error_code). Deterministisch,
+    NICHTS wird erfunden: unbekannte Tages-Marker reisen als Roh-Summary mit."""
+    if 'Roster Preview' not in (text or '') or 'Planning period' not in (text or ''):
+        return None, 'unsupported_pdf_format'
+    mp = re.search(r'Planning period:\s*([A-Za-z]+)\s+(\d{4})', text)
+    month = _CREWACCESS_MONTHS.get((mp.group(1).lower() if mp else ''), 0)
+    if not mp or not month:
+        return None, 'no_planning_period'
+    year = int(mp.group(2))
+
+    from datetime import date as _date, timedelta as _td
+
+    def day_date(dom):
+        try:
+            return _date(year, month, int(dom))
+        except ValueError:
+            return None
+
+    events = []   # (uid_suffix, dtstart, dtend, summary, all_day)
+
+    def add_leg(d, pos, num, frm, to, t1, t2):
+        h1, m1 = (int(x) for x in t1.split(':'))
+        h2, m2 = (int(x) for x in t2.split(':'))
+        start = datetime(d.year, d.month, d.day, h1, m1)
+        end = datetime(d.year, d.month, d.day, h2, m2)
+        if end <= start:
+            end += _td(days=1)   # Red-Eye über Mitternacht (Zeiten sind UTC)
+        summary = f'{carrier}{num} {frm} - {to}'
+        events.append((f'leg-{len(events)}', start, end, summary, False))
+
+    def add_all_day(d, summary):
+        events.append((f'day-{len(events)}', d, d + _td(days=1), summary, True))
+
+    def add_timed(d, t1, t2, summary):
+        h1, m1 = (int(x) for x in t1.split(':'))
+        h2, m2 = (int(x) for x in t2.split(':'))
+        start = datetime(d.year, d.month, d.day, h1, m1)
+        end = datetime(d.year, d.month, d.day, h2, m2)
+        if end <= start:
+            end += _td(days=1)
+        events.append((f'tim-{len(events)}', start, end, summary, False))
+
+    in_table = False
+    cur_day = None
+    for raw in (text or '').splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith('Date Report'):
+            in_table = True
+            continue
+        if line.startswith('Created '):
+            in_table = False
+            continue
+        if not in_table:
+            continue
+        dm = _CREWACCESS_DAY_RE.match(line)
+        rest = line
+        if dm:
+            cur_day = day_date(dm.group(1))
+            rest = (dm.group(2) or '').strip()
+            if cur_day is None:
+                continue
+            if not rest:
+                continue
+            token_only = rest.split()
+            if len(token_only) == 1:
+                tok = token_only[0]
+                if tok in ('O', 'OW'):
+                    add_all_day(cur_day, 'Off Day')
+                elif tok == 'U':
+                    add_all_day(cur_day, 'Urlaub')
+                elif tok.startswith('RES'):
+                    add_all_day(cur_day, 'Reserve')
+                else:
+                    # Unbekannter Marker → ehrlich als Roh-Text durchreichen.
+                    add_all_day(cur_day, tok)
+                continue
+            sb = _CREWACCESS_SBY_RE.match(rest)
+            if sb:
+                add_timed(cur_day, sb.group(3), sb.group(4),
+                          f'Standby {sb.group(2)}')
+                continue
+            # Report-Zeit vor dem ersten Leg abstreifen („05:15 FO 2460 …").
+            mr = re.match(r'^(\d{1,2}:\d{2})\s+(.*)$', rest)
+            if mr:
+                rest = mr.group(2)
+        if cur_day is None:
+            continue
+        lm = _CREWACCESS_LEG_RE.match(rest)
+        if lm:
+            add_leg(cur_day, lm.group(1), lm.group(2), lm.group(3),
+                    lm.group(4), lm.group(5), lm.group(6))
+
+    if not events:
+        return None, 'no_roster_days'
+
+    lines = ['BEGIN:VCALENDAR', 'VERSION:2.0',
+             'PRODID:-//AeroX CrewAccess PDF Import//DE']
+    for uid, start, end, summary, all_day in events:
+        lines.append('BEGIN:VEVENT')
+        lines.append(f'UID:pdf-{year}{month:02d}-{uid}@aerox-roster')
+        if all_day:
+            lines.append(f'DTSTART;VALUE=DATE:{start.strftime("%Y%m%d")}')
+            lines.append(f'DTEND;VALUE=DATE:{end.strftime("%Y%m%d")}')
+        else:
+            lines.append(f'DTSTART:{start.strftime("%Y%m%dT%H%M%S")}Z')
+            lines.append(f'DTEND:{end.strftime("%Y%m%dT%H%M%S")}Z')
+        lines.append(f'SUMMARY:{summary}')
+        lines.append('END:VEVENT')
+    lines.append('END:VCALENDAR')
+    return '\r\n'.join(lines), None
+
+
+def _crewaccess_carrier_for(airline_hint, token):
+    """IATA-Prefix für die nackten PDF-Flugnummern: Discover→4Y, sonst VL
+    (Lufthansa City — die Format-Quelle). Hint vom Client gewinnt (im
+    Onboarding ist das Profil noch nicht gespeichert), sonst Profil."""
+    v = (airline_hint or '').lower()
+    if not v:
+        try:
+            v = (((_profile_load(token) or {}).get('profile') or {})
+                 .get('airline') or '').lower()
+        except Exception:
+            v = ''
+    return '4Y' if 'discover' in v else 'VL'
+
+
+@app.route('/api/user/roster-pdf/<token>/import', methods=['POST'])
+def import_roster_pdf(token):
+    """Roster-PDF-Upload (Lufthansa City/Discover — kein iCal-Export).
+    Multipart `pdf` (oder `file`) + optional Form-Feld `airline`.
+    Parst das CrewAccess-„Roster Preview"-PDF und schickt das Ergebnis durch
+    die bestehende Kalender-Import-Pipeline (Response-Shape = CalendarFeedResp,
+    additiv `source: pdf` + `period`)."""
+    f = request.files.get('pdf') or request.files.get('file')
+    if f is None:
+        return jsonify({'ok': False, 'error': 'no_pdf'}), 400
+    data = f.read()
+    if len(data) > 8 * 1024 * 1024:
+        return jsonify({'ok': False, 'error': 'too_large_8mb'}), 413
+    if not data[:5] == b'%PDF-':
+        return jsonify({'ok': False, 'error': 'invalid_pdf'}), 415
+    try:
+        import io
+        import pdfplumber
+        pages = []
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for pg in pdf.pages[:20]:
+                pages.append(pg.extract_text() or '')
+        text = '\n'.join(pages)
+    except Exception as e:
+        app.logger.warning(f'[roster-pdf] extract-fail: {type(e).__name__}: {str(e)[:160]}')
+        return jsonify({'ok': False, 'error': 'pdf_extract_failed'}), 422
+    carrier = _crewaccess_carrier_for(request.form.get('airline'), token)
+    ics, perr = _crewaccess_text_to_ics(text, carrier=carrier)
+    if perr:
+        return jsonify({'ok': False, 'error': perr}), 422
+    # Interner Dispatch in die EINE Feed-Pipeline (wallreply-Muster) — kein
+    # Fetch, volles Parse/Merge/Briefings/Reconcile/Sektoren-Verhalten.
+    with app.test_request_context(json={'ics_text': ics}):
+        rv = import_calendar_feed(token)
+    resp_obj, status = (rv if isinstance(rv, tuple) else (rv, 200))
+    try:
+        payload = resp_obj.get_json() or {}
+    except Exception:
+        payload = {}
+    if status == 200 and payload.get('ok'):
+        payload['source'] = 'pdf'
+        mp = re.search(r'Planning period:\s*([A-Za-z]+\s+\d{4})', text)
+        if mp:
+            payload['period'] = mp.group(1)
+    return jsonify(payload), status
 
 
 @app.route('/api/user/calendar-events/<token>/upload', methods=['POST'])
