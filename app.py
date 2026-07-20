@@ -16996,6 +16996,9 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
         def _do_refresh():
             try:
                 import urllib.request as _ur
+                # Bewusst OHNE 'url_2'-Key: der Import-Endpoint fällt dann auf
+                # den GESPEICHERTEN calendar_feed_2 zurück (LEON/AeroWest-
+                # Off-Days-Link wird beim Auto-Refresh also mitgezogen).
                 req = _ur.Request(
                     f'{base}/api/user/calendar-feed/{token}/import',
                     data=json.dumps({'url': url}).encode('utf-8'),
@@ -22815,6 +22818,9 @@ def _canonical_airline_key(airline):
         return 'LUFTHANSA'
     if 'swiss' in v or v in ('lx', 'swr'):
         return 'SWISS'
+    # AeroWest (LEON-Privatjet, Hannover, 2026-07-20): BEWUSST kein Sonderfall —
+    # „AeroWest" matcht keinen der Substring-Zweige oben und landet damit als
+    # eigener Bucket 'AEROWEST' (crowdsource-gefüllt), genau wie gewünscht.
     return v.upper()
 
 
@@ -39976,6 +39982,12 @@ def _parse_ics_to_events(text):
             v = value.strip()
             if k == 'SUMMARY':
                 current['summary'] = v[:120]
+            elif k == 'UID':
+                # RFC-5545-UID (LEON-Zwei-Feed-Merge, AeroWest 2026-07-20):
+                # stabiler Schlüssel fürs Dedupe, wenn Duty- und Off-Days-
+                # Kalender dasselbe VEVENT tragen. Additiv — alle bestehenden
+                # Konsumenten ignorieren unbekannte Event-Keys.
+                current['uid'] = v[:120]
             elif k == 'DESCRIPTION':
                 # SWISS trägt hier die EXPLIZITE Report-/Dep-/Arr-Zeit
                 # ("Reporting time: 11:15 (09:15Z)…"). RFC-5545-Zeilenfaltung ist
@@ -40692,6 +40704,34 @@ def _ics_events_to_briefings(events, existing=None):
     return briefings, imported
 
 
+# ── LEON-Dienstplan (leon.aero — z.B. AeroWest, Privatjet Hannover) ──────────
+# Verifiziertes Feed-Format (2026-07-20): SUMMARY `(AWH23E) Flight LBG - OXF`
+# (Callsign in Klammern + Route), LOCATION `LBG - OXF (D-CAWX)` (Route + dem
+# Leg zugewiesenes Kennzeichen in Klammern), DTSTART/DTEND in UTC.
+_LEON_SUMMARY_RE = re.compile(
+    r'^\(([A-Z]{2,3}[A-Z0-9]{1,4})\)\s*FLIGHT\s+([A-Z]{3})\s*-\s*([A-Z]{3})\b')
+# Kennzeichen in Klammern: Bindestrich-Regs (D-CAWX, OE-LXA, HB-JMB) plus
+# US-N-Nummern ohne Bindestrich (N123AB). Bewusst eng — nie raten.
+_LEON_REG_RE = re.compile(
+    r'\(((?:[A-Z0-9]{1,2}-[A-Z0-9]{2,5})|(?:N[0-9]{1,5}[A-Z]{0,2}))\)')
+
+
+def _ics_parse_leon_flight(summary_upper, location_upper=''):
+    """LEON-Flug-Event → (callsign, from, to, reg) oder (None, None, None, None).
+
+    Eingaben sind bereits UPPER-cased (so ruft `_build_ical_sectors` auf).
+    Non-Flight-LEON-Events (Duty/Off/Standby/…) matchen NICHT und laufen wie
+    bisher als Marker-Tage durch `_ics_events_to_briefings`. Pure/testbar."""
+    m = _LEON_SUMMARY_RE.match((summary_upper or '').strip())
+    if not m:
+        return None, None, None, None
+    reg = None
+    mr = _LEON_REG_RE.search(location_upper or '')
+    if mr:
+        reg = mr.group(1)
+    return m.group(1), m.group(2), m.group(3), reg
+
+
 def _build_ical_sectors(events):
     """Aus EINZEL-iCal-Events je Tag ein sectors[]-Array bauen (Flugnr + from/to +
     dep/arr-ISO) — die echten Pro-Leg-Flugzeiten, die der Tages-Merge sonst
@@ -40731,29 +40771,46 @@ def _build_ical_sectors(events):
                     'dep_iso': _dep, 'arr_iso': _arr,
                 })
             continue
-        # SWISS-Format zuerst (space-separiert, kein „-"): „LX1270 ZRH 1236 CPH …".
-        sw_flt, sw_frm, sw_to = _ics_parse_swiss_flight(summ)
-        if sw_frm and sw_to:
-            flight = sw_flt; frm = sw_frm; to = sw_to
+        # LEON (leon.aero, AeroWest): „(AWH23E) FLIGHT LBG - OXF" + Kennzeichen
+        # aus der LOCATION-Klammer „LBG - OXF (D-CAWX)". VOR dem generischen
+        # Regex — der fände sonst nur die Route ohne Callsign (Suffix-Buchstabe
+        # im Callsign passt nicht auf `[A-Z]{2,3}\d{1,4}`). Das Reg landet als
+        # `tail` am Sektor (Roster-deklarierte Maschine; die Board-Anreicherung
+        # überspringt Sektoren mit vorhandenem tail).
+        leon_reg = None
+        leon_flt, leon_frm, leon_to, leon_reg = _ics_parse_leon_flight(summ, loc)
+        if leon_frm and leon_to:
+            flight = leon_flt; frm = leon_frm; to = leon_to
         else:
-            m = re.search(r'([A-Z]{2,3}\s*\d{1,4})\s*:?\s*([A-Z]{3})\s*-\s*([A-Z]{3})', summ)
-            if m:
-                flight = re.sub(r'\s+', '', m.group(1)); frm = m.group(2); to = m.group(3)
+            # SWISS-Format zuerst (space-separiert, kein „-"): „LX1270 ZRH 1236 CPH …".
+            sw_flt, sw_frm, sw_to = _ics_parse_swiss_flight(summ)
+            if sw_frm and sw_to:
+                flight = sw_flt; frm = sw_frm; to = sw_to
             else:
-                ml = re.search(r'\b([A-Z]{3})\s*-\s*([A-Z]{3})\b', loc)
-                if not ml:
-                    continue
-                flight = None; frm = ml.group(1); to = ml.group(2)
+                m = re.search(r'([A-Z]{2,3}\s*\d{1,4})\s*:?\s*([A-Z]{3})\s*-\s*([A-Z]{3})', summ)
+                if m:
+                    flight = re.sub(r'\s+', '', m.group(1)); frm = m.group(2); to = m.group(3)
+                else:
+                    ml = re.search(r'\b([A-Z]{3})\s*-\s*([A-Z]{3})\b', loc)
+                    if not ml:
+                        continue
+                    flight = None; frm = ml.group(1); to = ml.group(2)
         # PSEUDO-LEG-GUARD (Tiefenprüfung 19.07, 46 „FRA-FRA"-Rows live):
         # Simulator-/Trainings-Events tragen mitunter „FRA - FRA" — from==to
         # ist nie ein echter Flug-Sektor (gleiche Regel wie
         # _is_real_flight_sector) und würde EventDetails/primaryLeg vergiften.
         if frm == to:
             continue
-        sec_by_day.setdefault(d, []).append({
+        _sec = {
             'flight': flight, 'from': frm, 'to': to,
             'dep_iso': (ev.get('start_iso') or ''), 'arr_iso': (ev.get('end_iso') or ''),
-        })
+        }
+        # LEON: Roster-deklariertes Kennzeichen als tail — echtes Assignment
+        # aus dem Dienstplan (Privatjet), kein Inferenz-Marker (`tail_inferred`
+        # bleibt leer → _strip_inferred_tails lässt es stehen).
+        if leon_reg:
+            _sec['tail'] = leon_reg
+        sec_by_day.setdefault(d, []).append(_sec)
     for d in sec_by_day:
         sec_by_day[d].sort(key=lambda x: x.get('dep_iso') or '')
         # DOPPEL-LEG-DEDUPE (Daniel 13.7., LX2158 ZRH-PMI um 08:07 UND 09:30):
@@ -40907,17 +40964,20 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
     return dbg
 
 
-def _calendar_feed_note_refresh_failure(token, url):
+def _calendar_feed_note_refresh_failure(token, url, slot='calendar_feed'):
     """Merkt einen fehlgeschlagenen Feed-Import im calendar_feed-Objekt
     (Fehlerzähler fürs exponentielle Backoff in _maybe_refresh_calendar_feed,
     Sweep-P3 2026-07-10). NUR wenn die scheiternde URL die GESPEICHERTE ist —
     eine frisch eingetippte Falsch-URL darf den funktionierenden Feed nicht
-    ausbremsen. Erfolgreicher Import räumt die Felder wieder. Wirft nie."""
+    ausbremsen. Erfolgreicher Import räumt die Felder wieder. Wirft nie.
+
+    `slot` (2026-07-20, LEON/AeroWest): 'calendar_feed' = Duty-/Primär-Link,
+    'calendar_feed_2' = Off-Days-Zweit-Link — Zähler werden pro Slot geführt."""
     try:
         prev_full = _profile_load(token) or {}
         feed_obj = {}
         for src in ((prev_full.get('profile') or {}), prev_full):
-            cand = src.get('calendar_feed')
+            cand = src.get(slot)
             if isinstance(cand, dict):
                 feed_obj = dict(cand)
                 break
@@ -40933,9 +40993,9 @@ def _calendar_feed_note_refresh_failure(token, url):
         disk_full = dict(_profile_load_from_disk(token) or {})
         disk_full['token'] = token
         profile = dict(disk_full.get('profile') or {})
-        profile['calendar_feed'] = feed_obj
+        profile[slot] = feed_obj
         disk_full['profile'] = profile
-        disk_full['calendar_feed'] = feed_obj
+        disk_full[slot] = feed_obj
         disk_full['_updated_at'] = datetime.now().isoformat()
         _profile_save(token, profile, full_disk_payload=disk_full)
     except Exception:
@@ -40971,38 +41031,38 @@ def _sanitize_feed_url(raw):
     return ''.join(out)
 
 
-@app.route('/api/user/calendar-feed/<token>/import', methods=['POST'])
-def import_calendar_feed(token):
-    """Lädt ein ICS-File von einer URL und speichert die Events als Roster-Hints.
-    SSRF-geschützt: nur HTTPS, keine privaten IPs, max 1 MB Response.
-    """
-    body = request.get_json(silent=True) or {}
-    url = _sanitize_feed_url(body.get('url') or '')
-    # webcal:// = der iOS/macOS-Link aus myTime „Roster Share" — gleiche Feed-URL,
-    # anderes Scheme. Ältere App-Builds normalisieren client-seitig noch nicht →
-    # hier server-seitig auf https heben (User-Test 2026-07-01: Verbinden blieb grau).
-    low = url.lower()
+def _normalize_feed_scheme(url):
+    """webcal:// / webcals:// → https:// (der iOS/macOS-Link aus myTime „Roster
+    Share" — gleiche Feed-URL, anderes Scheme). Geteilt vom Primär- und dem
+    LEON-Zweit-Link (AeroWest)."""
+    low = (url or '').lower()
     if low.startswith('webcal://'):
-        url = 'https://' + url[len('webcal://'):]
-    elif low.startswith('webcals://'):
-        url = 'https://' + url[len('webcals://'):]
-    # HTTP raus · nur HTTPS akzeptieren (sonst Klartext-Cookies leakable).
-    # Leerer/unbrauchbarer Rest nach dem Sanitize = ungültige URL → bad_url,
-    # damit alte Clients (die client-seitig NICHT sanitizen) eine ehrliche
-    # „Link-unvollständig"-Meldung statt „fetch_failed" bekommen.
+        return 'https://' + url[len('webcal://'):]
+    if low.startswith('webcals://'):
+        return 'https://' + url[len('webcals://'):]
+    return url
+
+
+def _fetch_calendar_feed_text(url):
+    """Validiert (https-only + SSRF-Block) und lädt EINE Feed-URL (max 1 MB).
+    Liefert (text, None) bei Erfolg, sonst (None, error_code) mit error_code in
+    {'bad_url','internal_host_blocked','response_too_large','fetch_failed'}.
+    Aus import_calendar_feed extrahiert (LEON-Zwei-Link, 2026-07-20), damit
+    Duty- und Off-Days-Link denselben Pfad nehmen — und Tests den Netz-Teil
+    an EINER Stelle monkeypatchen können."""
     if not url.startswith('https://'):
-        return jsonify({'ok': False, 'error': 'bad_url'}), 400
+        return None, 'bad_url'
     # SSRF-Block: Host darf nicht privat/loopback/link-local sein
     try:
         from urllib.parse import urlparse
         parsed = urlparse(url)
         host = parsed.hostname or ''
         if not host:
-            return jsonify({'ok': False, 'error': 'bad_url'}), 400
+            return None, 'bad_url'
         if _is_private_or_local_ip(host):
-            return jsonify({'ok': False, 'error': 'internal_host_blocked'}), 400
+            return None, 'internal_host_blocked'
     except Exception:
-        return jsonify({'ok': False, 'error': 'bad_url'}), 400
+        return None, 'bad_url'
     try:
         import urllib.request
         req = urllib.request.Request(url, headers={'User-Agent': 'AeroTax/1.0'})
@@ -41010,26 +41070,139 @@ def import_calendar_feed(token):
         with urllib.request.urlopen(req, timeout=20) as r:
             raw = r.read(1024 * 1024 + 1)
             if len(raw) > 1024 * 1024:
-                return jsonify({'ok': False, 'error': 'response_too_large'}), 413
-            text = raw.decode('utf-8', errors='replace')
+                return None, 'response_too_large'
+            return raw.decode('utf-8', errors='replace'), None
     except Exception as e:
         print(f'[import_calendar_feed] error: {type(e).__name__}: {str(e)[:300]}')
+        return None, 'fetch_failed'
+
+
+def _merge_feed_events(primary, secondary):
+    """Konkateniert die VEVENT-Listen zweier Feeds mit UID-Dedupe (LEON/AeroWest:
+    Duty- + Off-Days-Kalender können dasselbe Event tragen; der Duty-Kalender
+    gewinnt). Events OHNE UID werden NIE weggedupt (kein falsches Verschlucken).
+    Pure/testbar."""
+    out = list(primary or [])
+    seen = {e.get('uid') for e in out
+            if isinstance(e, dict) and e.get('uid')}
+    for e in (secondary or []):
+        u = e.get('uid') if isinstance(e, dict) else None
+        if u and u in seen:
+            continue
+        if u:
+            seen.add(u)
+        out.append(e)
+    return out
+
+
+@app.route('/api/user/calendar-feed/<token>/import', methods=['POST'])
+def import_calendar_feed(token):
+    """Lädt ein ICS-File von einer URL und speichert die Events als Roster-Hints.
+    SSRF-geschützt: nur HTTPS, keine privaten IPs, max 1 MB Response.
+
+    ZWEIT-LINK (LEON/AeroWest, 2026-07-20): optional `url_2` im Body — der
+    Off-Days-Kalender. Beide Feeds werden UNABHÄNGIG geholt (ein kaputter Link
+    blockiert den anderen nicht), die VEVENT-Listen per UID dedupe-konkateniert
+    und durch die EINE bestehende Pipeline geschickt. Response bleibt für den
+    Einzel-Link-Fall byte-identisch; mit `url_2` kommen additiv
+    events_count_1/events_count_2 (+ error_1/error_2 bei per-Link-Fehlern).
+    """
+    body = request.get_json(silent=True) or {}
+    url = _normalize_feed_scheme(_sanitize_feed_url(body.get('url') or ''))
+    # HTTP raus · nur HTTPS akzeptieren (sonst Klartext-Cookies leakable).
+    # Leerer/unbrauchbarer Rest nach dem Sanitize = ungültige URL → bad_url,
+    # damit alte Clients (die client-seitig NICHT sanitizen) eine ehrliche
+    # „Link-unvollständig"-Meldung statt „fetch_failed" bekommen.
+    if not url.startswith('https://'):
+        return jsonify({'ok': False, 'error': 'bad_url'}), 400
+    # ── Zweit-Link auflösen ──────────────────────────────────────────────────
+    # Explizit im Body ODER (wenn der Client keinen `url_2`-Key schickt — alte
+    # Builds, Server-Auto-Refresh, EventKit-Pfade) der GESPEICHERTE
+    # calendar_feed_2. Ohne diesen Fallback würde jeder Einzel-Link-Re-Sync die
+    # Off-Days-Events aus dem Import-Lauf verlieren.
+    _url_2_raw = _sanitize_feed_url(body.get('url_2') or '')
+    url_2 = _normalize_feed_scheme(_url_2_raw)
+    err_2 = None
+    if not url_2.startswith('https://'):
+        # Explizit geschickter, aber unbrauchbarer Zweit-Link → EHRLICH als
+        # per-Link-Fehler melden (nicht still weglassen); der Duty-Link
+        # importiert trotzdem.
+        if _url_2_raw:
+            err_2 = 'bad_url_2'
+        url_2 = ''
+    if not url_2 and 'url_2' not in body:
+        try:
+            _pf = _profile_load(token) or {}
+            for _src in ((_pf.get('profile') or {}), _pf):
+                _c2 = _src.get('calendar_feed_2')
+                if isinstance(_c2, dict):
+                    _u2 = _normalize_feed_scheme(
+                        _sanitize_feed_url(_c2.get('url') or ''))
+                    if _u2.startswith('https://'):
+                        url_2 = _u2
+                    break
+        except Exception:
+            pass
+
+    # ── Link 1 (Duty/Primär) holen + parsen ─────────────────────────────────
+    err_1 = None
+    events_1 = []
+    text, ferr = _fetch_calendar_feed_text(url)
+    if ferr in ('bad_url', 'internal_host_blocked'):
+        # Format-/SSRF-Fehler des Primär-Links bleiben harte 400er (wie bisher) —
+        # das ist ein Client-Eingabe-Problem, kein „anderer Link rettet es".
+        return jsonify({'ok': False, 'error': ferr}), 400
+    if ferr == 'response_too_large':
+        return jsonify({'ok': False, 'error': 'response_too_large'}), 413
+    if ferr:
         # Fehlerzähler fürs Refresh-Backoff (Sweep-P3): dauerhaft kaputte
         # gespeicherte URL sonst alle 45 min erneut probiert.
         _calendar_feed_note_refresh_failure(token, url)
-        return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': 'upstream_error'}), 502
-    # RFC-5545-konformer ICS-Parser via module-level pure functions —
-    # siehe _parse_ics_to_events oberhalb. Erlaubt isolierte Test-Coverage
-    # (tests/test_ical_parser.py) ohne Flask-Context.
-    try:
-        events = _parse_ics_to_events(text)
-    except Exception as _exc:
-        app.logger.warning(f'[ics] parse-fail: {type(_exc).__name__}: {str(_exc)[:200]}')
-        # J5-Fix (Sweep 2026-07-10): Parse-Fail NICHT als Erfolg maskieren —
-        # vorher wurde events=[] MIT frischem imported_at gespeichert (ok:true)
-        # und der 6h-Refresh-Throttle blockte jeden Retry → Roster fror still ein.
-        _calendar_feed_note_refresh_failure(token, url)   # Backoff-Zähler (P3)
-        return jsonify({'ok': False, 'error': 'ics_parse_failed'}), 502
+        if not url_2:
+            return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': 'upstream_error'}), 502
+        err_1 = 'fetch_failed'
+    if text is not None:
+        # RFC-5545-konformer ICS-Parser via module-level pure functions —
+        # siehe _parse_ics_to_events oberhalb. Erlaubt isolierte Test-Coverage
+        # (tests/test_ical_parser.py) ohne Flask-Context.
+        try:
+            events_1 = _parse_ics_to_events(text)
+        except Exception as _exc:
+            app.logger.warning(f'[ics] parse-fail: {type(_exc).__name__}: {str(_exc)[:200]}')
+            # J5-Fix (Sweep 2026-07-10): Parse-Fail NICHT als Erfolg maskieren —
+            # vorher wurde events=[] MIT frischem imported_at gespeichert (ok:true)
+            # und der 6h-Refresh-Throttle blockte jeden Retry → Roster fror still ein.
+            _calendar_feed_note_refresh_failure(token, url)   # Backoff-Zähler (P3)
+            if not url_2:
+                return jsonify({'ok': False, 'error': 'ics_parse_failed'}), 502
+            err_1 = 'ics_parse_failed'
+
+    # ── Link 2 (Off-Days) unabhängig holen + parsen ─────────────────────────
+    events_2 = []
+    if url_2:
+        text2, ferr2 = _fetch_calendar_feed_text(url_2)
+        if ferr2:
+            err_2 = f'{ferr2}_2'
+            if ferr2 == 'fetch_failed':
+                _calendar_feed_note_refresh_failure(token, url_2,
+                                                    slot='calendar_feed_2')
+        else:
+            try:
+                events_2 = _parse_ics_to_events(text2)
+            except Exception as _exc2:
+                app.logger.warning(
+                    f'[ics] parse-fail feed2: {type(_exc2).__name__}: {str(_exc2)[:200]}')
+                err_2 = 'ics_parse_failed_2'
+                _calendar_feed_note_refresh_failure(token, url_2,
+                                                    slot='calendar_feed_2')
+        if err_1 and err_2:
+            # BEIDE Links kaputt → ehrlicher Gesamtfehler (kein leerer
+            # „Erfolg", der das Reconcile-Fenster leerräumen würde).
+            return jsonify({'ok': False, 'error': err_1, 'error_2': err_2,
+                            'detail': 'upstream_error'}), 502
+
+    # Konkatenieren (UID-Dedupe, Duty gewinnt) → EINE Pipeline für alles.
+    events = _merge_feed_events(events_1, events_2)
     # SWISS-Nachbearbeitung (F1 Stations-Lokal-Buckets + F5 Layover-Synthese) —
     # no-op für LH-Feeds; wirft nie. VOR dem Persistieren, damit calendar_feed,
     # Briefings, Reconcile und Sektoren dieselbe (korrigierte) Event-Liste sehen.
@@ -41042,6 +41215,7 @@ def import_calendar_feed(token):
     # DIE Wurzel des eingefrorenen Rosters. SB-first laden (Disk ist ephemer),
     # eigene Felder gewinnen, fremde bleiben stehen.
     feed_obj = {}
+    feed_obj_2 = {}
     try:
         _prev_full = _profile_load(token) or {}
         for _src in ((_prev_full.get('profile') or {}), _prev_full):
@@ -41049,28 +41223,54 @@ def import_calendar_feed(token):
             if isinstance(_cand, dict):
                 feed_obj = dict(_cand)
                 break
+        for _src in ((_prev_full.get('profile') or {}), _prev_full):
+            _cand2 = _src.get('calendar_feed_2')
+            if isinstance(_cand2, dict):
+                feed_obj_2 = dict(_cand2)
+                break
     except Exception:
         feed_obj = {}
-    feed_obj.update({'url': url, 'events': events[:300],
-                     'imported_at': datetime.now().isoformat()})
-    # Sweep-P3 2026-07-10: EK-Reste räumen — 'source'/'ek_imported_at' stammen
-    # vom EKEventStore-Upload; die 'events' sind ab hier aber URL-Import. Die
-    # Marker wurden vom Merge nur kosmetisch mitgeschleppt und suggerierten
-    # die falsche Quelle. (Die Merge-Logik selbst bleibt unangetastet.)
-    feed_obj.pop('source', None)
-    feed_obj.pop('ek_imported_at', None)
-    # Erfolg räumt den Refresh-Backoff-Zähler (siehe
-    # _calendar_feed_note_refresh_failure / _maybe_refresh_calendar_feed).
-    feed_obj.pop('refresh_fail_count', None)
-    feed_obj.pop('last_refresh_fail_at', None)
+        feed_obj_2 = {}
+    if not err_1:
+        # Der Primär-Slot trägt die MERGED Event-Liste (Duty + Off-Days) — alle
+        # bestehenden Reader (Friend-Roster-Fallback, get_briefings-Pfade) sehen
+        # damit den kompletten Plan, ohne calendar_feed_2 kennen zu müssen.
+        feed_obj.update({'url': url, 'events': events[:300],
+                         'imported_at': datetime.now().isoformat()})
+        # Sweep-P3 2026-07-10: EK-Reste räumen — 'source'/'ek_imported_at' stammen
+        # vom EKEventStore-Upload; die 'events' sind ab hier aber URL-Import. Die
+        # Marker wurden vom Merge nur kosmetisch mitgeschleppt und suggerierten
+        # die falsche Quelle. (Die Merge-Logik selbst bleibt unangetastet.)
+        feed_obj.pop('source', None)
+        feed_obj.pop('ek_imported_at', None)
+        # Erfolg räumt den Refresh-Backoff-Zähler (siehe
+        # _calendar_feed_note_refresh_failure / _maybe_refresh_calendar_feed).
+        feed_obj.pop('refresh_fail_count', None)
+        feed_obj.pop('last_refresh_fail_at', None)
+    # err_1 gesetzt → Slot 1 UNVERÄNDERT lassen (kein frisches imported_at über
+    # einen gescheiterten Duty-Fetch stempeln — J5-Lektion; Backoff-Zähler hat
+    # _calendar_feed_note_refresh_failure oben schon erhöht).
+    if url_2 and not err_2:
+        # Zweit-Slot LEAN: nur URL + Zeitstempel + Zähler (die Events selbst
+        # liegen merged im Primär-Slot). Der Auto-Refresh/Einzel-Link-Sync
+        # findet den Off-Days-Link über diesen Slot wieder (Fallback oben).
+        feed_obj_2.update({'url': url_2,
+                           'imported_at': datetime.now().isoformat(),
+                           'events_count': len(events_2)})
+        feed_obj_2.pop('refresh_fail_count', None)
+        feed_obj_2.pop('last_refresh_fail_at', None)
     try:
         disk_full = dict(_profile_load_from_disk(token) or {})
         disk_full['token'] = token
         profile = dict(disk_full.get('profile') or {})
-        profile['calendar_feed'] = feed_obj
+        if not err_1:
+            profile['calendar_feed'] = feed_obj
+            # Backwards-compat: top-level calendar_feed bleibt für alte Reader.
+            disk_full['calendar_feed'] = feed_obj
+        if url_2 and not err_2:
+            profile['calendar_feed_2'] = feed_obj_2
+            disk_full['calendar_feed_2'] = feed_obj_2
         disk_full['profile'] = profile
-        # Backwards-compat: top-level calendar_feed bleibt für alte Reader.
-        disk_full['calendar_feed'] = feed_obj
         disk_full['_updated_at'] = datetime.now().isoformat()
         _profile_save(token, profile, full_disk_payload=disk_full)
     except Exception:
@@ -41096,8 +41296,16 @@ def import_calendar_feed(token):
         # RECONCILE (geteilter Helper): Tage im aktuellen Monatsfenster, die der neue
         # Feed nicht mehr enthält, von veralteten ical_*-Daten säubern (inkl. manueller
         # Map + Supabase). Tage AUSSERHALB des Fensters bleiben Historie.
-        _reconcile_dbg = _reconcile_month_briefings(
-            token, briefings, events[:200], full_clean=_full_clean)
+        # ABER: bei PARTIELLEM Feed-Fehler (ein LEON-Link tot, der andere ok)
+        # NICHT reconcilen — die merged Liste ist dann unvollständig und das
+        # Fenster-Räumen würde die Tage des kaputten Links löschen (Duty-Tage
+        # bei totem Duty-Link bzw. Off-Tage bei totem Off-Days-Link).
+        if err_1 or err_2:
+            _reconcile_dbg = {'skipped': 'partial_feed_failure',
+                              'feed_dates': 0, 'cleared': 0, 'window': None}
+        else:
+            _reconcile_dbg = _reconcile_month_briefings(
+                token, briefings, events[:200], full_clean=_full_clean)
         # Pro-Leg-Sektoren auch im ICS-URL-Pfad bewahren (gleich wie EKEvent-Upload).
         _attach_sectors(briefings, events[:200])
         if not _ical_briefings_save(token, briefings):
@@ -41124,12 +41332,25 @@ def import_calendar_feed(token):
             newest_date = keys[-1]
     except Exception:
         pass
-    return jsonify({'ok': True, 'events_count': len(events),
-                    'briefings_imported': imported_briefings,
-                    'total_briefings': total_briefings,
-                    'oldest_date': oldest_date,
-                    'newest_date': newest_date,
-                    'reconcile': _reconcile_dbg})
+    _resp = {'ok': True, 'events_count': len(events),
+             'briefings_imported': imported_briefings,
+             'total_briefings': total_briefings,
+             'oldest_date': oldest_date,
+             'newest_date': newest_date,
+             'reconcile': _reconcile_dbg}
+    # LEON-Zwei-Link (AeroWest): per-Link-Zähler + -Fehler ADDITIV, damit iOS
+    # den ehrlichen 0-Einträge-Hinweis pro Link zeigen kann („Dein Off-Days-
+    # Link liefert keine Einträge …"). Einzel-Link-Responses bleiben
+    # byte-identisch (keine neuen Keys). err_2 ohne url_2 = explizit
+    # geschickter, aber unbrauchbarer Zweit-Link (bad_url_2).
+    if url_2 or err_2:
+        _resp['events_count_1'] = len(events_1)
+        _resp['events_count_2'] = len(events_2)
+        if err_1:
+            _resp['error_1'] = err_1
+        if err_2:
+            _resp['error_2'] = err_2
+    return jsonify(_resp)
 
 
 @app.route('/api/user/calendar-events/<token>/upload', methods=['POST'])
