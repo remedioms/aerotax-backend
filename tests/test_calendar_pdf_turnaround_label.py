@@ -38,13 +38,21 @@ def _day_cell_lines(briefs, hb='FRA'):
     d = list(briefs.keys())[0]
     month = d[:7]
     A._store[tok] = {'result_data': {}}
+    # Stubs NUR für diesen Render — Originale IMMER restaurieren (Suite-Leak
+    # 2026-07-20: die global ersetzten Loader vergifteten jeden späteren Test,
+    # der echte Profil-/Briefing-Persistenz liest — test_crewaccess_pdf war
+    # Suite-rot, solo grün).
+    _orig = (A._manual_briefings_load, A._ical_briefings_load, A._profile_load)
     A._manual_briefings_load = lambda t: {}
     A._ical_briefings_load = lambda t: briefs
     A._profile_load = lambda t: {'profile': {'homebase': hb}}
-    client = A.app.test_client()
-    r = client.get(f'/api/user/calendar-pdf/{tok}?month={month}')
-    assert r.status_code == 200
-    assert r.data[:4] == b'%PDF'
+    try:
+        client = A.app.test_client()
+        r = client.get(f'/api/user/calendar-pdf/{tok}?month={month}')
+        assert r.status_code == 200
+        assert r.data[:4] == b'%PDF'
+    finally:
+        A._manual_briefings_load, A._ical_briefings_load, A._profile_load = _orig
     with pdfplumber.open(io.BytesIO(r.data)) as pdf:
         text = pdf.pages[0].extract_text() or ''
     # Footer-Legende („… · Z76 Ausland · …") NICHT mitzählen.
