@@ -12928,16 +12928,38 @@ def _feed_nightstop_ort(day, homebase=None, next_day=None):
     return fallback
 
 
+_FRIEND_ROSTER_MEMO = {}
+_FRIEND_ROSTER_MEMO_LOCK = _req_threading.Lock()
+_FRIEND_ROSTER_MEMO_TTL = 60.0
+
+
 @app.route('/api/user/friend-roster/<token>/<friend_token>', methods=['GET'])
 def get_friend_roster(token, friend_token):
     """Liefert das Roster eines Friends (Tag-Detail-Liste) für Tour-Compare.
     Privacy: nur wenn beide friends sind UND Friend hat share_roster=true im
     Profile (Default off). Honest empty array wenn nicht geteilt.
     Query: ?days=30 (default 30, max 90)
+
+    KURZ-MEMO (Kalender-8s-Profiling 2026-07-20): p50 lag bei 3,2 s PRO Freund
+    (mehrere Supabase-Reads + Städte-Labels je Tag) — bei 7 Freunden öffnete
+    der Kalender-Tab eine ~30s-Netz-Kette. 60 s Memo pro (Viewer, Freund,
+    days) kollabiert die Wiederhol-Läufe (jedes Tab-Öffnen!) auf einen Fetch;
+    Roster ändern sich nicht im Minutentakt, der Snapshot-Push invalidiert
+    über die TTL schnell genug. Fehler werden NIE memoisiert.
     """
     from datetime import date as _date, timedelta as _td
     from blueprints.aerox_data_blueprint import _route_label_cities, _iata_city_name
     days_limit = min(int(request.args.get('days') or 30), 90)
+    _memo_key = (token, friend_token, days_limit)
+    _now_mono = _req_time.monotonic()
+    # app.testing: Memo aus — Tests teilen Tokens über Testfälle hinweg und
+    # bekämen sonst die Antwort des VORHERIGEN Falls (gleiche Lektion wie der
+    # Signup-Limiter-Bypass vom Vormittag).
+    if not app.testing:
+        with _FRIEND_ROSTER_MEMO_LOCK:
+            _hit = _FRIEND_ROSTER_MEMO.get(_memo_key)
+            if _hit and _now_mono - _hit[0] < _FRIEND_ROSTER_MEMO_TTL:
+                return jsonify(_hit[1])
     # Friend-Check
     me = _friends_load(token)
     if friend_token not in (me.get('friends') or []):
@@ -13152,9 +13174,17 @@ def get_friend_roster(token, friend_token):
                                    past_horizon_h=24 * 35)
         except Exception:
             pass
-    return jsonify({'ok': True, 'shared': True, 'count': len(out),
-                    'days': out,
-                    'source': 'snapshot' if tage else 'ical_briefings'})
+    _payload = {'ok': True, 'shared': True, 'count': len(out),
+                'days': out,
+                'source': 'snapshot' if tage else 'ical_briefings'}
+    # Nur ERFOLGE memoisieren (60s, s. Docstring) + Memo klein halten.
+    with _FRIEND_ROSTER_MEMO_LOCK:
+        _FRIEND_ROSTER_MEMO[_memo_key] = (_req_time.monotonic(), _payload)
+        if len(_FRIEND_ROSTER_MEMO) > 500:
+            _cut = _req_time.monotonic() - _FRIEND_ROSTER_MEMO_TTL
+            for _k in [k for k, v in _FRIEND_ROSTER_MEMO.items() if v[0] < _cut]:
+                _FRIEND_ROSTER_MEMO.pop(_k, None)
+    return jsonify(_payload)
 
 
 def _active_sector_flight_numbers(day):
@@ -21918,6 +21948,12 @@ def forum_delete_thread(token, thread_id):
 def forum_toggle_thread_like(token, thread_id):
     if token.startswith('AT-GUEST-'):
         return jsonify({'ok': False, 'error': 'demo_mode_cannot_post'}), 403
+    # WALL-BRÜCKE LIKE (Log-Fund 2026-07-20: „wall:…/like → 404", gleiche
+    # Lücke wie zuvor die Antworten): Likes auf gespiegelte Crew-Feed-Posts
+    # laufen als ECHTER Wall-Like auf den Ursprungs-Post — gleicher Zähler
+    # im Feed wie im Forum. Antwort-Form ist identisch (like_count/liked_by_me).
+    if thread_id.startswith('wall:'):
+        return toggle_like(token, thread_id[5:])
     likes = _forum_load_likes(token)
     # Per-Row-Lookup statt load-ALL (2026-07-01).
     target = _forum_thread_sb_get(thread_id)
