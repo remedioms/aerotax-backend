@@ -17478,6 +17478,45 @@ def _roster_snapshot_read(token):
     return payload or {}
 
 
+def _rc_norm_cmp(v):
+    """Vergleichs-Normalform für Freitext-Felder (routing/layover/Zeiten):
+    Case-fold + ALLE Whitespaces entfernt. So zählt reine Formatierung/
+    Groß-/Kleinschreibung NICHT als Änderung („FRA-JFK" == „fra - jfk" ==
+    „FRA-JFK "). Diese Felder tragen keine semantischen Leerzeichen
+    (Routing/IATA/HH:MM) → Whitespace-Strip ist verlustfrei. Der Diff wird
+    dadurch strikt konservativer (nie mehr Treffer), was genau die falschen
+    „Dienstplan-Änderung"-Pushes killt."""
+    s = (str(v).strip() if v is not None else '')
+    if not s:
+        return ''
+    return ''.join(s.split()).casefold()
+
+
+def _rc_field_changed(av, bv):
+    """leer↔gefüllt zählt NICHT (Anreicherung/Re-Parse); nur ein echter
+    Wert-Wechsel zwischen zwei nicht-leeren Werten — nach Case/Whitespace-
+    Normalisierung (reine Formatierung ist keine substantielle Änderung)."""
+    a, b = _rc_norm_cmp(av), _rc_norm_cmp(bv)
+    return bool(a) and bool(b) and a != b
+
+
+def _rc_meaningfully_modified(a, b):
+    """Substanz-Check zweier Roster-Tage (Kern von _compute_roster_diff,
+    modul-weit hoisted damit das Pickup-Rauschen-Gate ihn wiederverwenden kann)."""
+    arf, brf = (a.get('reader_facts') or {}), (b.get('reader_facts') or {})
+    # klass: Case/Whitespace-normalisiert (auch leer↔gefüllt): ein Tag wird
+    # Tour / verliert Tour. „Z76" == „z76", aber Tour↔Frei bleibt echt.
+    if _rc_norm_cmp(a.get('klass')) != _rc_norm_cmp(b.get('klass')):
+        return True
+    for af, bf in ((a.get('routing'), b.get('routing')),
+                   (arf.get('start_time'), brf.get('start_time')),
+                   (arf.get('end_time'), brf.get('end_time')),
+                   (arf.get('layover_ort'), brf.get('layover_ort'))):
+        if _rc_field_changed(af, bf):
+            return True
+    return False
+
+
 def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
     """Returns list of {datum, kind, old, new} where kind ∈ added/removed/modified.
 
@@ -17498,48 +17537,14 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
        BEIDE Seiten einen nicht-leeren Wert tragen der sich UNTERSCHEIDET — ein
        leer↔gefüllt-Übergang (Anreicherung/transientes Re-Parse) ist KEINE
        Änderung. `klass` bleibt exakt verglichen (Tour↔Frei ist echte Änderung).
+
+    Feld-Vergleichslogik lebt modul-weit in _rc_norm_cmp/_rc_field_changed/
+    _rc_meaningfully_modified (geteilt mit dem Push-Pickup-Gate).
     """
     old_by = {t.get('datum'): t for t in (old_tage or []) if isinstance(t, dict)}
     new_by = {t.get('datum'): t for t in (new_tage or []) if isinstance(t, dict)}
     changes = []
     keys = set(old_by.keys()) | set(new_by.keys())
-
-    def _norm(v):
-        return (str(v).strip() if v is not None else '')
-
-    def _norm_cmp(v):
-        # Vergleichs-Normalform für Freitext-Felder (routing/layover/Zeiten):
-        # Case-fold + ALLE Whitespaces entfernt. So zählt reine Formatierung/
-        # Groß-/Kleinschreibung NICHT als Änderung („FRA-JFK" == „fra - jfk" ==
-        # „FRA-JFK "). Diese Felder tragen keine semantischen Leerzeichen
-        # (Routing/IATA/HH:MM) → Whitespace-Strip ist verlustfrei. Der Diff wird
-        # dadurch strikt konservativer (nie mehr Treffer), was genau die falschen
-        # „Dienstplan-Änderung"-Pushes killt.
-        s = _norm(v)
-        if not s:
-            return ''
-        return ''.join(s.split()).casefold()
-
-    def _field_changed(av, bv):
-        # leer↔gefüllt zählt NICHT (Anreicherung/Re-Parse); nur ein echter
-        # Wert-Wechsel zwischen zwei nicht-leeren Werten — nach Case/Whitespace-
-        # Normalisierung (reine Formatierung ist keine substantielle Änderung).
-        a, b = _norm_cmp(av), _norm_cmp(bv)
-        return bool(a) and bool(b) and a != b
-
-    def _meaningfully_modified(a, b):
-        arf, brf = (a.get('reader_facts') or {}), (b.get('reader_facts') or {})
-        # klass: Case/Whitespace-normalisiert (auch leer↔gefüllt): ein Tag wird
-        # Tour / verliert Tour. „Z76" == „z76", aber Tour↔Frei bleibt echt.
-        if _norm_cmp(a.get('klass')) != _norm_cmp(b.get('klass')):
-            return True
-        for af, bf in ((a.get('routing'), b.get('routing')),
-                       (arf.get('start_time'), brf.get('start_time')),
-                       (arf.get('end_time'), brf.get('end_time')),
-                       (arf.get('layover_ort'), brf.get('layover_ort'))):
-            if _field_changed(af, bf):
-                return True
-        return False
 
     def _added_is_near(k):
         if not today:
@@ -17561,7 +17566,7 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
                 changes.append({'datum': k, 'kind': 'added', 'new': b})
         elif b is None and a is not None:
             changes.append({'datum': k, 'kind': 'removed', 'old': a})
-        elif a and b and _meaningfully_modified(a, b):
+        elif a and b and _rc_meaningfully_modified(a, b):
             changes.append({'datum': k, 'kind': 'modified', 'old': a, 'new': b})
     return changes
 
@@ -17678,9 +17683,15 @@ def take_roster_snapshot(token):
     # 2026-06-29: „dachte mein Plan wird per Push verbunden"). Beim allerersten
     # Push nur still die Baseline setzen, Diff bleibt leer. Änderungen erst ab
     # dem ZWEITEN Push (echter Vorher/Nachher-Vergleich).
+    # „Heute" HOMEBASE-lokal (Flo Z 2026-07-20): das Vergangenheits-Gate für den
+    # Push muss am Tagesbegriff des Users hängen, nicht pauschal an FRA/Berlin.
     _today_ymd = None
     try:
-        _today_ymd = _airport_local_now('FRA').strftime('%Y-%m-%d')
+        _hb = _profile_homebase_cached(token) or 'FRA'
+    except Exception:
+        _hb = 'FRA'
+    try:
+        _today_ymd = _airport_local_now(_hb).strftime('%Y-%m-%d')
     except Exception:
         _today_ymd = datetime.now().strftime('%Y-%m-%d')
     diff = _compute_roster_diff(old_tage, new_tage, today=_today_ymd) if old_tage else []
@@ -17720,12 +17731,19 @@ def take_roster_snapshot(token):
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
     if diff:
         try:
-            n = len(diff)
-            kinds = {c.get('kind') for c in diff}
-            if n == 1:
-                body = 'Eine Änderung im Dienstplan erkannt — bitte prüfen.'
-            else:
-                body = f'{n} Änderungen im Dienstplan erkannt — bitte prüfen.'
+            # PUSH-GATES (Flo Z 2026-07-20) — die in-App-Liste behält ALLE
+            # Changes (oben schon persistiert), nur der Push wird gefiltert:
+            #   1) Vergangenheit (Tag < heute Homebase-lokal): Tour vorbei,
+            #      nichts mehr zu entscheiden → still.
+            #   2) Pickup-Abbau: LH entfernt die PU-Zeit nach der Tour aus
+            #      MyTime (reine Hygiene) → still, solange sonst nichts anders.
+            push_diff = [c for c in diff
+                         if not _roster_change_is_past(c, _today_ymd)
+                         and not _roster_change_is_pickup_prune(c)]
+            n = len(push_diff)
+            # PUSH-INHALT: konkrete erste Änderung („Di 22.07.: LH440 FRA-IAH
+            # neu" / „Mo 21.07.: Briefing 09:40 → 10:15") + „(+N weitere)".
+            body = _roster_changes_push_body(push_diff)
             # Lockscreen-Buttons (Annehmen/Ablehnen): category='DUTY_CHANGE'
             # matcht EXAKT die in iOS registrierte UNNotificationCategory
             # (PushService.registerActionCategories). roster_change_id = stabile
@@ -17734,14 +17752,15 @@ def take_roster_snapshot(token):
             # /api/user/roster-changes/<token>/decide wieder). Die Buttons
             # bestätigen NUR Kenntnisnahme (pending → history + Baseline),
             # sie mutieren NIE den Dienstplan selbst.
-            change_id = (diff[0].get('datum') or '*') if n == 1 else '*'
-            _push_notify_async(token, 'Dienstplan-Änderung', body,
-                               data={'type': 'roster_change',
-                                     'roster_change_id': str(change_id)},
-                               category='DUTY_CHANGE',
-                               idempotency_key=(
-                                   f'roster-change:{token}:{change_id}:'
-                                   f'{_hashlib.sha256(body.encode()).hexdigest()[:12]}'))
+            change_id = (push_diff[0].get('datum') or '*') if n == 1 else '*'
+            if n:
+                _push_notify_async(token, 'Dienstplan-Änderung', body,
+                                   data={'type': 'roster_change',
+                                         'roster_change_id': str(change_id)},
+                                   category='DUTY_CHANGE',
+                                   idempotency_key=(
+                                       f'roster-change:{token}:{change_id}:'
+                                       f'{_hashlib.sha256(body.encode()).hexdigest()[:12]}'))
         except Exception:
             pass
     return jsonify({'ok': True, 'changes_count': len(diff), 'changes': diff})
@@ -17765,6 +17784,193 @@ def _rc_local_hhmm(iso, iata):
         return ''
 
 
+def _rc_route_chain(day):
+    """Routing-Kette eines Roster-Tags („FRA-IAH-FRA") — bevorzugt aus den
+    ical_sectors, Fallback aufs routing-Freitextfeld. '' wenn nichts da."""
+    secs = (day or {}).get('ical_sectors') or []
+    chain = []
+    for s in secs:
+        if not isinstance(s, dict):
+            continue
+        for c in (str(s.get('from') or '').upper(), str(s.get('to') or '').upper()):
+            if len(c) == 3 and c.isalpha() and (not chain or chain[-1] != c):
+                chain.append(c)
+    if len(chain) >= 2:
+        return '-'.join(chain)
+    return str((day or {}).get('routing') or '').strip()
+
+
+def _rc_first_flight_no(day):
+    """Erste Flugnummer eines Roster-Tags („LH440") aus den ical_sectors. ''."""
+    for s in ((day or {}).get('ical_sectors') or []):
+        if isinstance(s, dict):
+            fn = str(s.get('flight') or '').replace(' ', '').upper()
+            if fn:
+                return fn
+    return ''
+
+
+def _rc_pickup_hhmm(day):
+    """Pickup-/PU-Zeit eines Roster-Tags als „HH:MM" oder ''. Quellen: ein
+    explizites `pickup`-Feld (HH:MM) sowie die Summary-artigen Freitexte
+    (marker/ical_summary/summary) via crew_live_state.parse_pickup_hhmm —
+    derselbe Server-Nachbau der iOS-Regexe („Pickup 1430" / „09:30 LT Pickup"),
+    den auch die Pre-Flight-Timeline nutzt. Wirft nie."""
+    try:
+        import re as _re_mod
+        day = day if isinstance(day, dict) else {}
+        v = str(day.get('pickup') or '').strip()
+        m = _re_mod.match(r'^(\d{1,2}):(\d{2})$', v) if v else None
+        if m and 0 <= int(m.group(1)) <= 23 and 0 <= int(m.group(2)) <= 59:
+            return f'{int(m.group(1)):02d}:{int(m.group(2)):02d}'
+        from blueprints.crew_live_state import parse_pickup_hhmm
+        for src in (v, day.get('marker'), day.get('ical_summary'),
+                    day.get('summary')):
+            hm = parse_pickup_hhmm(src)
+            if hm:
+                return f'{hm[0]:02d}:{hm[1]:02d}'
+    except Exception:
+        pass
+    return ''
+
+
+def _rc_sector_fingerprint(day):
+    """Vergleichs-Fingerprint der Flüge eines Tags (Flugnummer+Stationen+Zeiten)
+    — ändern sich die Legs, ist eine Änderung IMMER substanziell."""
+    out = []
+    for s in ((day or {}).get('ical_sectors') or []):
+        if isinstance(s, dict):
+            out.append((str(s.get('flight') or '').replace(' ', '').upper(),
+                        str(s.get('from') or '').upper(),
+                        str(s.get('to') or '').upper(),
+                        str(s.get('dep_iso') or ''),
+                        str(s.get('arr_iso') or '')))
+    return out
+
+
+def _roster_change_is_past(change, today_ymd):
+    """VERGANGENHEITS-GATE (Flo Z 2026-07-20: „Push kommt auch, wenn die Tour
+    vorbei ist"): Änderungen an Tagen VOR heute (Homebase-lokal) sind für den
+    User nicht mehr handlungsrelevant → kein Push. Die in-App-Liste
+    (/api/user/roster-changes) zeigt sie weiterhin. Wirft nie."""
+    try:
+        d = str((change or {}).get('datum') or '')[:10]
+        t = str(today_ymd or '')[:10]
+        # ISO-YYYY-MM-DD vergleicht lexikografisch korrekt.
+        return bool(d) and bool(t) and d < t
+    except Exception:
+        return False
+
+
+def _roster_change_is_pickup_prune(change):
+    """PICKUP-RAUSCHEN-GATE (Flo Z 2026-07-20): LH räumt die Pickup-/PU-Zeit
+    nach der Tour aus MyTime ab — reine Hygiene, keine Dienständerung. True
+    wenn ein 'modified'-Change NUR das Verschwinden der Pickup-Zeit ist:
+    Pickup in old vorhanden, in new weg, Flüge (Legs) identisch und — nachdem
+    der Pickup-Effekt auf die Startzeit neutralisiert wurde (Start fiel von der
+    Pickup- auf die Briefing-Zeit zurück) — keine substanzielle Änderung übrig.
+    NEUE/GEÄNDERTE Pickup-Zeit (old leer/anders, new gefüllt) bleibt
+    push-würdig → hier immer False. Wirft nie."""
+    try:
+        if (change or {}).get('kind') != 'modified':
+            return False
+        a = change.get('old') if isinstance(change.get('old'), dict) else {}
+        b = change.get('new') if isinstance(change.get('new'), dict) else {}
+        pa, pb = _rc_pickup_hhmm(a), _rc_pickup_hhmm(b)
+        if not pa or pb:
+            return False          # kein Pickup weggefallen → Gate greift nicht
+        if _rc_sector_fingerprint(a) != _rc_sector_fingerprint(b):
+            return False          # Legs geändert → echte Änderung
+        arf = dict(a.get('reader_facts') or {})
+        if _rc_norm_cmp(arf.get('start_time')) == _rc_norm_cmp(pa):
+            # Startzeit WAR die Pickup-Zeit → ihr Wegfall erklärt den Shift.
+            brf = (b.get('reader_facts') or {})
+            arf['start_time'] = brf.get('start_time')
+        a_neutral = dict(a)
+        a_neutral['reader_facts'] = arf
+        return not _rc_meaningfully_modified(a_neutral, b)
+    except Exception:
+        return False
+
+
+_RC_WEEKDAYS_DE = ('Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So')
+
+
+def _rc_datum_label(datum):
+    """ISO-Datum → kompaktes deutsches Label „Di 22.07". Fallback: Rohstring."""
+    try:
+        from datetime import date as _date
+        d = _date.fromisoformat(str(datum)[:10])
+        return f'{_RC_WEEKDAYS_DE[d.weekday()]} {d.day:02d}.{d.month:02d}'
+    except Exception:
+        return str(datum or '')[:10]
+
+
+def _roster_change_push_line(change):
+    """EINE kompakte Zeile WAS sich geändert hat — fürs Push-Body (Flo Z
+    2026-07-20: „WAS sich geändert hat, sieht man nicht"). Priorität: Route →
+    Abflug/Ankunft je Leg → Briefing/Dienstende → Layover → generisch. Nie
+    werfen, immer nicht-leer."""
+    try:
+        kind = (change or {}).get('kind')
+        a = change.get('old') if isinstance(change.get('old'), dict) else {}
+        b = change.get('new') if isinstance(change.get('new'), dict) else {}
+        if kind == 'added':
+            head = ' '.join(x for x in (_rc_first_flight_no(b),
+                                        _rc_route_chain(b)) if x)
+            return f'{head} neu' if head else 'Neuer Dienst'
+        if kind == 'removed':
+            return 'Dienst entfernt'
+        ra, rb = _rc_route_chain(a), _rc_route_chain(b)
+        if ra and rb and _rc_norm_cmp(ra) != _rc_norm_cmp(rb):
+            return f'Route {ra} → {rb}'
+        # Leg-Zeiten (lokal an der Station) — konkreter als reader_facts.
+        fa = {s[0]: s for s in _rc_sector_fingerprint(a)}
+        for fn, frm, to, dep, arr in _rc_sector_fingerprint(b):
+            old = fa.get(fn)
+            if not old:
+                continue
+            da, db = _rc_local_hhmm(old[3], old[1]), _rc_local_hhmm(dep, frm)
+            if da and db and da != db:
+                return f'{fn} Abflug {da} → {db}'
+            aa, ab = _rc_local_hhmm(old[4], old[2]), _rc_local_hhmm(arr, to)
+            if aa and ab and aa != ab:
+                return f'{fn} Ankunft {aa} → {ab}'
+        arf, brf = (a.get('reader_facts') or {}), (b.get('reader_facts') or {})
+        if _rc_field_changed(arf.get('start_time'), brf.get('start_time')):
+            return (f'Briefing {str(arf.get("start_time")).strip()} → '
+                    f'{str(brf.get("start_time")).strip()}')
+        if _rc_field_changed(arf.get('end_time'), brf.get('end_time')):
+            return (f'Dienstende {str(arf.get("end_time")).strip()} → '
+                    f'{str(brf.get("end_time")).strip()}')
+        if _rc_field_changed(arf.get('layover_ort'), brf.get('layover_ort')):
+            return (f'Layover {str(arf.get("layover_ort")).strip()} → '
+                    f'{str(brf.get("layover_ort")).strip()}')
+        return 'Dienst geändert'
+    except Exception:
+        return 'Dienst geändert'
+
+
+def _roster_changes_push_body(changes):
+    """Push-Body für den Dienstplan-Änderungs-Push: „<Wochentag DD.MM.>: <erste
+    konkrete Änderung>" + „(+N weitere)" bei mehreren. Max ~120 Zeichen,
+    wirft nie (Fallback = alter generischer Text)."""
+    try:
+        cs = [c for c in (changes or []) if isinstance(c, dict)]
+        if not cs:
+            return 'Änderung im Dienstplan erkannt — bitte prüfen.'
+        first = cs[0]
+        label = _rc_datum_label(first.get('datum'))
+        line = f'{label}: {_roster_change_push_line(first)}'.strip(': ')
+        if len(cs) > 1:
+            line += f' (+{len(cs) - 1} weitere)'
+        if len(line) > 120:
+            line = line[:119].rstrip() + '…'
+        return line
+    except Exception:
+        return 'Änderung im Dienstplan erkannt — bitte prüfen.'
+
+
 def _roster_change_summary(entry):
     """Kurzer, MENSCHLICHER Text WAS sich an einem Roster-Tag geändert hat (Julia
     Sievert 2026-07-17: „ich sehe 1 bei Kalender, sehe aber nicht, WAS die Änderung
@@ -17772,19 +17978,7 @@ def _roster_change_summary(entry):
     werfen, '' wenn nichts Nennenswertes ableitbar. Max ~3 Teile."""
     try:
         kind = entry.get('kind')
-
-        def _route(day):
-            secs = (day or {}).get('ical_sectors') or []
-            chain = []
-            for s in secs:
-                if not isinstance(s, dict):
-                    continue
-                for c in (str(s.get('from') or '').upper(), str(s.get('to') or '').upper()):
-                    if len(c) == 3 and c.isalpha() and (not chain or chain[-1] != c):
-                        chain.append(c)
-            if len(chain) >= 2:
-                return '-'.join(chain)
-            return str((day or {}).get('routing') or '').strip()
+        _route = _rc_route_chain
 
         if kind == 'added':
             r = _route(entry.get('new'))
@@ -21568,11 +21762,22 @@ def forum_list_threads(token):
     for t in threads:
         t['liked_by_me'] = t.get('id') in likes['threads']
         t['is_mine'] = (t.get('author_token') == token)
-        av = _resolve_av(t.get('author_token'))
-        if av:
-            t['author_avatar'] = av
-        elif not t.get('author_avatar'):
-            t.pop('author_avatar', None)
+        if t.get('is_anonymous'):
+            # Anonymer Thread: KEINE Profil-Reste ausliefern (analog
+            # get_comments-Säuberung) — insbesondere den Live-Avatar-Resolve
+            # überspringen, der sonst das echte Foto wieder anheften würde.
+            if not t.get('anon_handle'):
+                t['anon_handle'] = _anon_handle_for(t.get('author_token'),
+                                                    salt=t.get('id'))
+            for _k in ('author_name', 'author_role', 'author_airline',
+                       'author_homebase', 'author_avatar', 'author_short'):
+                t.pop(_k, None)
+        else:
+            av = _resolve_av(t.get('author_token'))
+            if av:
+                t['author_avatar'] = av
+            elif not t.get('author_avatar'):
+                t.pop('author_avatar', None)
         # Strip author_token from public response
         t.pop('author_token', None)
     return jsonify({'count': len(threads), 'threads': threads})
@@ -21598,6 +21803,16 @@ def forum_create_thread(token):
     # 'airline' = nur die eigene Airline. Default 'all'.
     scope = (body.get('scope') or 'all').strip().lower()
     if scope not in ('all', 'airline'):
+        scope = 'all'
+    # Anonymer Thread (Owner 2026-07-20, wie Wall-Post/-Kommentar): KEIN
+    # Author-Snapshot, stattdessen per-Item-gesalzener anon_handle. author_token
+    # bleibt NUR server-seitig für Ownership/Moderation (Löschen eigener
+    # anonymer Threads) und wird nie ausgeliefert.
+    is_anonymous = bool(body.get('is_anonymous'))
+    if is_anonymous:
+        # Anonym + airline-only widerspricht sich: ohne Author-Snapshot gibt es
+        # keine author_airline → der Thread wäre für ALLE unsichtbar, und die
+        # Airline wäre ohnehin ein Identitäts-Hinweis. Anonym ⇒ immer scope=all.
         scope = 'all'
 
     if category not in FORUM_CATEGORIES:
@@ -21629,7 +21844,7 @@ def forum_create_thread(token):
         'id': str(uuid.uuid4())[:12],
         'category_id': category,
         'author_token': token,
-        'author_short': token[:8],
+        'author_short': None if is_anonymous else token[:8],
         'title': title,
         'body': text,
         'image_url': image_url,
@@ -21641,8 +21856,14 @@ def forum_create_thread(token):
         'reply_count': 0,
         'last_reply_ts': None,
         'scope': scope,
+        'is_anonymous': is_anonymous,
     }
-    thread.update(_forum_author_snapshot(token))
+    if is_anonymous:
+        # Pseudonymer Handle statt Profil-Snapshot. Per-Thread-Salt → anonyme
+        # Threads eines Users sind untereinander NICHT verkettbar (wie Wall).
+        thread['anon_handle'] = _anon_handle_for(token, salt=thread['id'])
+    else:
+        thread.update(_forum_author_snapshot(token))
 
     # Per-Row-Insert statt load-ALL → append → save-ALL (2026-07-01).
     _forum_threads_save_to_supabase([thread])
@@ -21788,11 +22009,21 @@ def forum_list_replies(token, thread_id):
     for r in replies:
         r['liked_by_me'] = r.get('id') in likes['replies']
         r['is_mine'] = (r.get('author_token') == token)
-        av = _resolve_av(r.get('author_token'))
-        if av:
-            r['author_avatar'] = av
+        if r.get('is_anonymous'):
+            # Anonyme Antwort: Profil-Reste säubern (analog get_comments) und
+            # den Live-Avatar-Resolve überspringen (würde das Foto re-leaken).
+            if not r.get('anon_handle'):
+                r['anon_handle'] = _anon_handle_for(r.get('author_token'),
+                                                    salt=r.get('id'))
+            for _k in ('author_name', 'author_role', 'author_airline',
+                       'author_homebase', 'author_avatar', 'author_short'):
+                r.pop(_k, None)
         else:
-            r.pop('author_avatar', None)
+            av = _resolve_av(r.get('author_token'))
+            if av:
+                r['author_avatar'] = av
+            else:
+                r.pop('author_avatar', None)
         r.pop('author_token', None)
     replies.sort(key=lambda r: (r.get('created_ts') or 0))
     return jsonify({'thread_id': thread_id, 'count': len(replies), 'replies': replies})
@@ -21813,6 +22044,9 @@ def forum_create_reply(token, thread_id):
     gif_url = (body.get('gif_url') or '').strip() or None
     parent_reply_id = (body.get('parent_reply_id') or '').strip() or None
     mentioned_token = (body.get('mentioned_token') or '').strip() or None
+    # Anonyme Antwort (Owner 2026-07-20, wie add_comment): kein Author-Snapshot,
+    # per-Item-gesalzener anon_handle; author_token nur server-seitig (Ownership).
+    is_anonymous = bool(body.get('is_anonymous'))
 
     if not raw_text and not image_url:
         return jsonify({'ok': False, 'error': 'empty_reply'}), 400
@@ -21862,7 +22096,7 @@ def forum_create_reply(token, thread_id):
         'id': str(uuid.uuid4())[:10],
         'thread_id': thread_id,
         'author_token': token,
-        'author_short': token[:8],
+        'author_short': None if is_anonymous else token[:8],
         'body': text,
         'image_url': image_url,
         'gif_url': gif_url,
@@ -21871,8 +22105,13 @@ def forum_create_reply(token, thread_id):
         'created_at': datetime.now().isoformat(),
         'created_ts': time.time(),
         'like_count': 0,
+        'is_anonymous': is_anonymous,
     }
-    reply.update(_forum_author_snapshot(token))
+    if is_anonymous:
+        # Pseudonymer Handle statt Profil-Snapshot (per-Reply-Salt, wie Wall).
+        reply['anon_handle'] = _anon_handle_for(token, salt=reply['id'])
+    else:
+        reply.update(_forum_author_snapshot(token))
     # Add mentioned-user name snapshot (so UI can show "@Maria K." even after token is gone)
     if mentioned_token:
         try:
@@ -21902,7 +22141,8 @@ def forum_create_reply(token, thread_id):
     response_reply['liked_by_me'] = False
     # Push an Thread-Author (nicht-self) + optional an mentioned-User
     try:
-        author_name = reply.get('author_name') or 'Crew'
+        # Anonym: der Push darf den echten Namen nicht verraten.
+        author_name = 'Anonym' if is_anonymous else (reply.get('author_name') or 'Crew')
         thread_author_token = target.get('author_token')
         if thread_author_token and thread_author_token != token:
             _push_notify_async(thread_author_token,
@@ -26772,7 +27012,12 @@ def auth_signup():
     # Reset-Token-Brute-Force, Squatting). 15 Signups/Stunde/IP ist großzügig für
     # NAT (mehrere echte User), stoppt aber Bots.
     _ip = (request.headers.get('X-Forwarded-For', '') or request.remote_addr or '').split(',')[0].strip()
-    if _ip and _ip_rate_limited(_ip, 'signup', limit=15, window_sec=3600):
+    # TEST-BYPASS (Suite-Ordnungs-Rot 2026-07-20): der Flask-TestClient teilt
+    # EINE IP über die ganze pytest-Suite — sobald >15 Wegwerf-User über alle
+    # Testdateien entstehen, killt der Limiter NACHFOLGENDE Signup-Fixtures
+    # (reihenfolge-abhängige 429er in test_local_bugfix_smoke). Nur unter
+    # app.testing; Produktions-Verhalten unverändert.
+    if _ip and not app.testing and _ip_rate_limited(_ip, 'signup', limit=15, window_sec=3600):
         return jsonify({'ok': False, 'error': 'too_many_signups'}), 429
     # ZUSÄTZLICH durable (Supabase, instanz-übergreifend, fail-open).
     if _ip and _durable_auth_rate_limited(_ip, 'auth_signup_ip'):

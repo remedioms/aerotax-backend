@@ -27,6 +27,14 @@ import pytest
 
 import app as A
 
+# Dynamische ZUKUNFTS-Daten: seit dem Vergangenheits-Gate (Flo Z 2026-07-20)
+# pushen Änderungen an Tagen VOR heute nicht mehr — die Push-Tests müssen also
+# auf kommenden Tagen liegen, sonst testen sie das Gate statt des Pushes.
+from datetime import date, timedelta
+
+D1 = (date.today() + timedelta(days=2)).isoformat()
+D2 = (date.today() + timedelta(days=3)).isoformat()
+
 
 @pytest.fixture(autouse=True)
 def _pin_app():
@@ -116,8 +124,8 @@ def _tag(datum, klass='Flug', routing='FRA-JFK'):
 
 
 def test_single_change_pushes_datum_as_change_id(tmp_path):
-    old = [_tag('2026-07-15', routing='FRA-JFK')]
-    new = [_tag('2026-07-15', routing='FRA-MIA')]     # modified
+    old = [_tag(D1, routing='FRA-JFK')]
+    new = [_tag(D1, routing='FRA-MIA')]     # modified
     p1, p2, p3, p4, p5, p6, push, _cf = _snapshot_env(tmp_path, old)
     with p1, p2, p3, p4, p5, p6:
         client = A.app.test_client()
@@ -129,13 +137,13 @@ def test_single_change_pushes_datum_as_change_id(tmp_path):
     kwargs = push.call_args.kwargs
     assert kwargs['category'] == 'DUTY_CHANGE'
     assert kwargs['data']['type'] == 'roster_change'
-    assert kwargs['data']['roster_change_id'] == '2026-07-15'
+    assert kwargs['data']['roster_change_id'] == D1
 
 
 def test_multiple_changes_push_bulk_change_id(tmp_path):
-    old = [_tag('2026-07-15'), _tag('2026-07-16')]
-    new = [_tag('2026-07-15', routing='FRA-MIA'),
-           _tag('2026-07-16', routing='FRA-GRU')]
+    old = [_tag(D1), _tag(D2)]
+    new = [_tag(D1, routing='FRA-MIA'),
+           _tag(D2, routing='FRA-GRU')]
     p1, p2, p3, p4, p5, p6, push, _cf = _snapshot_env(tmp_path, old)
     with p1, p2, p3, p4, p5, p6:
         client = A.app.test_client()
@@ -154,7 +162,7 @@ def test_first_baseline_sends_no_push(tmp_path):
     with p1, p2, p3, p4, p5, p6:
         client = A.app.test_client()
         r = client.post('/api/user/roster-snapshot/testtoken123',
-                        json={'tage': [_tag('2026-07-15')]})
+                        json={'tage': [_tag(D1)]})
     assert r.status_code == 200
     assert push.call_count == 0
 
@@ -163,8 +171,8 @@ def test_first_baseline_sends_no_push(tmp_path):
 # Round-Trip: die vom Push gelieferte ID versteht der decide-Endpoint
 # ══════════════════════════════════════════════════════════════════════════════
 def test_decide_accepts_pushed_datum_id(tmp_path):
-    old = [_tag('2026-07-15')]
-    new = [_tag('2026-07-15', routing='FRA-MIA')]
+    old = [_tag(D1)]
+    new = [_tag(D1, routing='FRA-MIA')]
     p1, p2, p3, p4, p5, p6, push, changes_file = _snapshot_env(tmp_path, old)
     with p1, p2, p3, p4, p5, p6:
         client = A.app.test_client()
@@ -177,14 +185,14 @@ def test_decide_accepts_pushed_datum_id(tmp_path):
     data = json.loads(changes_file.read_text())
     # Kenntnisnahme: pending → history, KEINE Roster-Mutation.
     assert data['pending'] == []
-    assert data['history'][-1]['datum'] == '2026-07-15'
+    assert data['history'][-1]['datum'] == D1
     assert data['history'][-1]['status'] == 'accepted'
 
 
 def test_decide_accepts_bulk_star_id(tmp_path):
-    old = [_tag('2026-07-15'), _tag('2026-07-16')]
-    new = [_tag('2026-07-15', routing='FRA-MIA'),
-           _tag('2026-07-16', routing='FRA-GRU')]
+    old = [_tag(D1), _tag(D2)]
+    new = [_tag(D1, routing='FRA-MIA'),
+           _tag(D2, routing='FRA-GRU')]
     p1, p2, p3, p4, p5, p6, push, changes_file = _snapshot_env(tmp_path, old)
     with p1, p2, p3, p4, p5, p6:
         client = A.app.test_client()
