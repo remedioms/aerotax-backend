@@ -22865,6 +22865,11 @@ def _canonical_airline_key(airline):
         return 'LUFTHANSA'
     if 'swiss' in v or v in ('lx', 'swr'):
         return 'SWISS'
+    # ITA Airways (AZ/ITY, 2026-07-21): „ITA Airways"/„ITA"/„AZ"/„Alitalia"
+    # → EIN Hotel-Bucket. Kurz-Codes nur exakt (kein 'ita'-Substring — sonst
+    # fielen z.B. „Air ItaXY"-Fantasienamen mit hinein).
+    if 'ita airways' in v or 'alitalia' in v or v in ('az', 'ita', 'ity'):
+        return 'ITA AIRWAYS'
     # AeroWest (LEON-Privatjet, Hannover, 2026-07-20): BEWUSST kein Sonderfall —
     # „AeroWest" matcht keinen der Substring-Zweige oben und landet damit als
     # eigener Bucket 'AEROWEST' (crowdsource-gefüllt), genau wie gewünscht.
@@ -40235,6 +40240,11 @@ def _ev_is_flight_leg(summary):
         return True
     if re.match(r'^(LH|CL|EW|EN|LX|OS|SN|4Y)\s*\d', up):
         return True
+    # ITA/ER-Duty: „AZ2056 FCO LIN" (space-separiert, kein Bindestrich; DH-Legs
+    # sind oben schon ausgeschlossen). `(\s|$)` statt `$`: Multi-Day-Summaries
+    # tragen ein „ (Tag 1/2)"-Suffix.
+    if re.match(r'^[A-Z]{2}\d{1,4}\s+[A-Z]{3}\s+[A-Z]{3}(\s|$)', up):
+        return True
     return False
 
 
@@ -40386,6 +40396,12 @@ def _ics_parse_flight_leg_summary(summary):
     _sw_flt, _sw_frm, _sw_to = _ics_parse_swiss_flight(s)
     if _sw_frm and _sw_to:
         return _sw_flt, _sw_frm, _sw_to
+    # ITA/ER-Duty-Format („AZ2056 FCO LIN", space-separiert, kein „-") — sonst
+    # blieben legs[]/Block bei ITA-Profilen leer (nur Bindestrich-Parser lief).
+    _it_flt, _it_frm, _it_to, _it_dh = _ics_parse_ita_flight(s)
+    if _it_frm and _it_to:
+        return (('DH ' + _it_flt) if _it_dh and _it_flt else _it_flt,
+                _it_frm, _it_to)
     # Routing: erstes IATA-IATA-Paar (3 Buchstaben - 3 Buchstaben).
     m = re.search(r'\b([A-Za-z]{3})\s*-\s*([A-Za-z]{3})\b', s)
     if not m:
@@ -40559,6 +40575,321 @@ def _swissify_roster_events(events, token=None):
         except Exception:
             pass
     return events
+
+
+# ── ITA-Airways-Roster (ER-Duty/gigatools iCloud-Publish, 2026-07-21) ────────
+# ITA-Crews (AZ) pflegen ihren Plan über die „ER Duty"-App (com.gigatools.ER),
+# die einen Apple-Kalender füllt; die Crew teilt ihn als iCloud-„Öffentlicher
+# Kalender"-Link. Verifiziertes Format (echter Feed, 1385 Events 2023–2026):
+#   Flug:      SUMMARY „AZ2056 FCO LIN" · DESCRIPTION „32N/EIHJD" (Muster/Reg)
+#              · LOCATION = Abflug-IATA (KEIN Bindestrich, KEINE Zeiten im Text)
+#   Deadhead:  „DH AZ1740 FCO CTA" · „DH AF809 FDF CDG" · „DH SUPERF LIN FCO"
+#              (SUPERF = Boden-Transfer, kein Flug)
+#   Check-in:  „Report FCO" (auch „Report FCO Requested"), DTSTART = Report-Zeit
+#   Pickup:    „Pick Up" (DTSTART = Pickup-Zeit, oft 0-Dauer, keine LOCATION)
+#   Standby:   „RISERVA LINEA" / „RISERVA LINEA IMP."
+#   Hotel:     „<HOTELNAME> <Stadt>" (Übernacht-Spanne, LOCATION = Hotelname)
+# ⚠️ ZEIT-FALLE (am echten Feed bewiesen, AZ614 FCO–BOS 10:25→„14:22"):
+# ALLE Zeiten sind WANDUHR-Zeiten der jeweiligen Station, aber mit
+# TZID=Europe/Rome gestempelt. Unter Rome-Interpretation wäre FCO→BOS 3h57 —
+# physikalisch unmöglich; 14:22 ist Boston-Lokalzeit. `_itaify_roster_events`
+# re-verankert deshalb jede Zeit in der ECHTEN Stations-TZ (airport_tz).
+# Die Tages-Buckets (`start`/`end`) sind davon unabhängig korrekt: _ics_parse_dt
+# bucketet nach TZID-Wanduhr = dem im Feed geschriebenen (Stations-)Datum.
+_ITA_FLIGHT_RE = re.compile(
+    r'^\s*(DH\s+)?([A-Z]{2}\d{1,4})\s+([A-Z]{3})\s+([A-Z]{3})\s*$', re.I)
+_ITA_GROUND_DH_RE = re.compile(
+    r'^\s*DH\s+SUPERF\s+([A-Z]{3})\s+([A-Z]{3})\s*$', re.I)
+_ITA_REPORT_RE = re.compile(r'^\s*REPORT\s+([A-Z]{3})\b', re.I)
+_ITA_PICKUP_RE = re.compile(r'^\s*PICK\s*UP\s*$', re.I)
+_ITA_STANDBY_RE = re.compile(r'^\s*RISERVA\b', re.I)
+# Bekannte Boden-/Abwesenheits-Codes des ER-Duty-Feeds — NIE als Hotel deuten.
+_ITA_KNOWN_NONHOTEL_RE = re.compile(
+    r'^\s*(CORSO\b|VISITA\b|FERIE\b|RIPOSO\b|OFF\b|SIM\b)', re.I)
+# DESCRIPTION „32N/EIHJD" → Reg. Nur EI-Prefix (ITA-Flotte) — nie raten.
+_ITA_DESC_REG_RE = re.compile(r'^\s*[A-Z0-9]{2,4}/(EI[A-Z0-9]{3,4})\s*$')
+
+
+def _ics_parse_ita_flight(summary):
+    """ER-Duty-Flug-SUMMARY → (flight, from_iata, to_iata, is_dh) oder Nones.
+    „AZ2056 FCO LIN" → ('AZ2056','FCO','LIN',False);
+    „DH AF809 FDF CDG" → ('AF809','FDF','CDG',True). SUPERF matcht NICHT."""
+    m = _ITA_FLIGHT_RE.match((summary or '').strip())
+    if not m:
+        return None, None, None, False
+    return (m.group(2).upper(), m.group(3).upper(), m.group(4).upper(),
+            bool(m.group(1)))
+
+
+def _ics_is_ita_flight(summary):
+    """True für das ER-Duty-Flugmuster (auch DH-Legs)."""
+    return bool(summary and _ITA_FLIGHT_RE.match(summary.strip()))
+
+
+def _ita_desc_reg(description):
+    """DESCRIPTION „32N/EIHJD" → „EI-HJD" (Bindestrich-Reg) oder None."""
+    m = _ITA_DESC_REG_RE.match((description or '').strip())
+    if not m:
+        return None
+    raw = m.group(1).upper()
+    return raw[:2] + '-' + raw[2:]
+
+
+def _ita_retime_iso(iso_utc, iata):
+    """Rome-mislabelte UTC-Zeit → echte UTC-Zeit der Station `iata`.
+
+    Der Parser hat die Wanduhr-Zeit mit TZID=Europe/Rome nach UTC konvertiert.
+    Wir holen die Wanduhr zurück (astimezone Rome) und verankern sie in der
+    echten Stations-TZ. Rom/Italien-Stationen sind damit ein No-op. Liefert
+    (neuer_iso, wanduhr_hhmm) — bei Fehlern (unbekannte IATA/TZ) das Original."""
+    s = (iso_utc or '').strip()
+    if not s:
+        return iso_utc, None
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_ZI('UTC'))
+        wall = dt.astimezone(_ZI('Europe/Rome')).replace(tzinfo=None)
+        hhmm = wall.strftime('%H:%M')
+        tzname = None
+        try:
+            tzname = airport_tz(iata) if iata else None
+        except Exception:
+            tzname = None
+        if not tzname:
+            return iso_utc, hhmm
+        fixed = wall.replace(tzinfo=_ZI(tzname)).astimezone(_ZI('UTC'))
+        return fixed.strftime('%Y-%m-%dT%H:%M:%SZ'), hhmm
+    except Exception:
+        return iso_utc, None
+
+
+def _ita_wall_date_hhmm(iso_utc):
+    """Rome-Frame-Wanduhr (Datum, HH:MM) eines mislabelten ISO — für Buckets
+    und Summary-Umschreibungen (die Wanduhr ist die Feed-Wahrheit)."""
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        dt = datetime.fromisoformat((iso_utc or '').replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_ZI('UTC'))
+        wall = dt.astimezone(_ZI('Europe/Rome'))
+        return wall.strftime('%Y-%m-%d'), wall.strftime('%H:%M')
+    except Exception:
+        return None, None
+
+
+def _itaify_roster_events(events, token=None):
+    """ITA/ER-Duty-Feed-Nachbearbeitung (in-place; LH/SWISS/LEON unberührt).
+    No-op ohne AZ-Flüge im ER-Duty-Format. Wirft nie. Läuft in BEIDEN
+    Import-Pfaden direkt nach `_swissify_roster_events`.
+
+    I1 (Stations-Zeit-Fix): alle Flug-/Report-/Hotel-/Pickup-Zeiten von der
+       Rome-Fehletikettierung auf die echte Stations-TZ re-verankert (Block-
+       Minuten, dep/arr-Zeiten, Duty-Fenster wären sonst um die TZ-Differenz
+       falsch — FCO→BOS hätte 3h57 „Block").
+    I2 (Report → Briefing-Token): „Report GIG" wird zu „HH:MM LT Briefing GIG"
+       (Wanduhr-Zeit) — dasselbe Token, das der LH-/SWISS-Pfad und iOS
+       (briefingTimeFromSummary) bereits verstehen.
+    I3 (Pickup-Token): „Pick Up" trägt die Zeit nur im DTSTART → Summary wird
+       „Pickup HH:MM" (Wanduhr), damit Backend/iOS-Pickup-Parser sie lesen.
+    I4 (Layover-Synthese wie SWISS-F5): aufeinanderfolgende Legs a→b mit
+       a.to == b.from ≠ Homebase und 6–96 h Bodenzeit ⇒ synthetisches
+       LAYOVER-VEVENT (LOCATION=IATA) → ical_layover_ort/Nightstop gratis.
+    I5 (Hotel-Erkennung): Nicht-Flug-Events, deren Spanne einen I4-Gap
+       überlappt und die kein bekannter Code sind, gelten als Crew-Hotel →
+       Summary-Prefix „LAYOVER · " (iOS-Hotel-Klass; _ev_extends_duty=False
+       verhindert Duty-Aufblähung durchs Hotel-Ende am nächsten Morgen) +
+       Re-Timing in der Layover-Stations-TZ.
+    I6 (Standby): „RISERVA …" bekommt CATEGORIES standby → ical_klass."""
+    try:
+        flights = []   # (ev, flight, frm, to, is_dh, is_ground)
+        for ev in (events or []):
+            summ = (ev.get('summary') or '').strip()
+            flt, frm, to, is_dh = _ics_parse_ita_flight(summ)
+            if frm and to:
+                flights.append((ev, flt, frm, to, is_dh, False))
+                continue
+            mg = _ITA_GROUND_DH_RE.match(summ)
+            if mg:
+                flights.append((ev, None, mg.group(1).upper(),
+                                mg.group(2).upper(), True, True))
+        # Gate: nur aktiv, wenn der Feed echte (nicht-DH) AZ-Legs im ER-Format
+        # trägt — LH „AZ 123: FCO-LIN"-Prosa matcht das anker-strikte Muster nie.
+        if not any((f[1] or '').startswith('AZ') and not f[4] for f in flights):
+            return events
+        has_real_layover = any(
+            'LAYOVER' in (ev.get('summary') or '').upper() for ev in events)
+        # Original-(Rome-Frame)-Instants VOR dem Re-Timing sichern: innerhalb
+        # eines Outstation-Gaps teilen alle Events dieselbe Wanduhr-TZ → die
+        # Gap-Zuordnung von Hotels/Pickups ist im Original-Frame exakt.
+        orig = {id(ev): ((ev.get('start_iso') or ''), (ev.get('end_iso') or ''))
+                for ev in events}
+        # ── I1: Flüge re-verankern (dep in Abflug-TZ, arr in Ankunfts-TZ) ────
+        for ev, flt, frm, to, is_dh, is_ground in flights:
+            new_dep, _ = _ita_retime_iso(ev.get('start_iso'), frm)
+            new_arr, _ = _ita_retime_iso(ev.get('end_iso'), to)
+            ev['start_iso'] = new_dep
+            ev['end_iso'] = new_arr
+            # Buckets = Wanduhr-Datum (Feed-Wahrheit; im URL-Pfad schon so,
+            # im EKEvent-Pfad war der Bucket das falsche UTC-Datum).
+            wd_s, _ = _ita_wall_date_hhmm(orig[id(ev)][0])
+            wd_e, _ = _ita_wall_date_hhmm(orig[id(ev)][1])
+            if wd_s:
+                ev['start'] = wd_s
+            if wd_e:
+                ev['end'] = wd_e
+            ev['_multiday_dates'] = _ics_multiday_dates(ev)
+        # Homebase: Profil, sonst häufigste Nicht-DH-Abflugstation (FCO-typisch).
+        hb = ''
+        if token:
+            try:
+                pr = (_profile_load(token) or {}).get('profile') or {}
+                hb = str(pr.get('homebase') or '').strip().upper()
+            except Exception:
+                hb = ''
+        if len(hb) != 3 or not hb.isalpha():
+            from collections import Counter as _Ctr
+            deps = [f[2] for f in flights if not f[4]]
+            hb = _Ctr(deps).most_common(1)[0][0] if deps else ''
+        # ── I2/I3/I6: Report/Pickup/Riserva umschreiben ──────────────────────
+        pickups = []
+        for ev in events:
+            summ = (ev.get('summary') or '').strip()
+            mrep = _ITA_REPORT_RE.match(summ)
+            if mrep:
+                st = mrep.group(1).upper()
+                o_start = orig[id(ev)][0]
+                new_s, hhmm = _ita_retime_iso(o_start, st)
+                ev['start_iso'] = new_s
+                new_e, _ = _ita_retime_iso(orig[id(ev)][1], st)
+                ev['end_iso'] = new_e
+                if hhmm:
+                    ev['summary'] = f'{hhmm} LT Briefing {st}'
+                continue
+            if _ITA_PICKUP_RE.match(summ):
+                pickups.append(ev)
+                continue
+            if _ITA_STANDBY_RE.match(summ):
+                cats = ev.get('categories') or []
+                if 'standby' not in [c.lower() for c in cats]:
+                    ev['categories'] = list(cats) + ['standby']
+        # ── I4: Outstation-Gaps + Layover-Synthese ───────────────────────────
+        ordered = sorted(flights, key=lambda f: orig[id(f[0])][0])
+        gaps = []   # (iata, o_gap_start, o_gap_end, fixed_start, fixed_end)
+        for a, b in zip(ordered, ordered[1:]):
+            a_to, b_frm = a[3], b[2]
+            if not a_to or a_to != b_frm or a_to == hb:
+                continue
+            o_a_end = orig[id(a[0])][1]
+            o_b_start = orig[id(b[0])][0]
+            gap_min = _iso_minutes_between(o_a_end, o_b_start)
+            if gap_min is None or not (6 * 60 <= gap_min <= 96 * 60):
+                continue
+            gaps.append((a_to, o_a_end, o_b_start,
+                         (a[0].get('end_iso') or ''), (b[0].get('start_iso') or '')))
+        synth = []
+        if not has_real_layover:
+            for iata, _o1, _o2, f_start, f_end in gaps:
+                lay = {
+                    'summary': 'LAYOVER', 'location': iata,
+                    'start_iso': f_start, 'end_iso': f_end,
+                    'start': _ics_station_local_date(f_start, iata) or f_start[:10],
+                    'end': _ics_station_local_date(f_end, iata) or f_end[:10],
+                    '_is_date_only_start': False, '_is_date_only_end': False,
+                    '_ita_synth_layover': True,
+                }
+                lay['_multiday_dates'] = _ics_multiday_dates(lay)
+                synth.append(lay)
+        # ── I5: Hotels erkennen (Gap-Überlappung im Original-Frame) ──────────
+        flight_ids = {id(f[0]) for f in flights}
+        for ev in events:
+            if id(ev) in flight_ids:
+                continue
+            summ = (ev.get('summary') or '').strip()
+            up = summ.upper()
+            if (not summ or 'LAYOVER' in up or 'BRIEFING' in up
+                    or _ITA_PICKUP_RE.match(summ) or _ITA_STANDBY_RE.match(summ)
+                    or _ITA_REPORT_RE.match(summ)
+                    or _ITA_KNOWN_NONHOTEL_RE.match(summ)):
+                continue
+            o_s, o_e = orig[id(ev)]
+            dur_min = _iso_minutes_between(o_s, o_e)
+            if dur_min is None or dur_min < 3 * 60:
+                continue
+            for iata, g_s, g_e, _f1, _f2 in gaps:
+                ov = _iso_minutes_between(max(o_s, g_s), min(o_e, g_e))
+                if ov is not None and ov >= 3 * 60:
+                    new_s, _ = _ita_retime_iso(o_s, iata)
+                    new_e, _ = _ita_retime_iso(o_e, iata)
+                    ev['start_iso'] = new_s
+                    ev['end_iso'] = new_e
+                    ev['summary'] = f'LAYOVER · {summ}'[:120]
+                    wd_s, _ = _ita_wall_date_hhmm(o_s)
+                    wd_e, _ = _ita_wall_date_hhmm(o_e)
+                    if wd_s:
+                        ev['start'] = wd_s
+                    if wd_e:
+                        ev['end'] = wd_e
+                    ev['_multiday_dates'] = _ics_multiday_dates(ev)
+                    break
+        # ── I3: Pickups einer Station zuordnen + Token schreiben ─────────────
+        for ev in pickups:
+            o_s = orig[id(ev)][0]
+            st = ''
+            for iata, g_s, g_e, _f1, _f2 in gaps:
+                if g_s <= o_s <= g_e:
+                    st = iata
+                    break
+            if not st:
+                # Kein Gap (Pickup an der Homebase o.ä.) → Homebase/Rome-TZ.
+                st = hb
+            new_s, hhmm = _ita_retime_iso(o_s, st)
+            new_e, _ = _ita_retime_iso(orig[id(ev)][1], st)
+            ev['start_iso'] = new_s
+            ev['end_iso'] = new_e
+            if hhmm:
+                ev['summary'] = f'Pickup {hhmm}'
+        if synth:
+            events.extend(synth)
+    except Exception as e:
+        try:
+            app.logger.warning(
+                f'[ics-ita] itaify-fail: {type(e).__name__}: {str(e)[:160]}')
+        except Exception:
+            pass
+    return events
+
+
+def _select_relevant_feed_events(events, cap):
+    """Relevanz-Auswahl statt blindem `events[:cap]`-Slice.
+
+    LH/SWISS-Feeds liefern ein rollendes ~2-Monats-Fenster (< cap) → unverändert
+    (byte-identisches Verhalten). ER-Duty/iCloud-Feeds tragen aber JAHRE an
+    Historie in zufälliger Reihenfolge (echter ITA-Feed: 1385 Events seit 2023) —
+    ein blinder Prefix-Slice verlöre fast alle AKTUELLEN Dienste. Auswahl:
+    zuerst alle Events ab (heute − 45 Tage) chronologisch (bei Überlauf gewinnt
+    die nähere Zukunft), Rest-Plätze mit der jüngsten Vergangenheit auffüllen."""
+    try:
+        if not events or len(events) <= cap:
+            return events
+        def _k(ev):
+            return (ev.get('start_iso') or '') or ((ev.get('start') or '') + 'T00:00:00Z')
+        cutoff = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+        current, past = [], []
+        for ev in events:
+            d = ((ev.get('end') or ev.get('start') or '')
+                 or (ev.get('end_iso') or ev.get('start_iso') or '')[:10])
+            (current if d >= cutoff else past).append(ev)
+        current.sort(key=_k)
+        if len(current) >= cap:
+            return current[:cap]
+        past.sort(key=_k, reverse=True)
+        keep = past[:cap - len(current)]
+        keep.reverse()
+        return keep + current
+    except Exception:
+        return events[:cap]
 
 
 def _ics_events_to_briefings(events, existing=None):
@@ -40891,6 +41222,13 @@ def _build_ical_sectors(events):
             d_bucket = (ev.get('start') or '')[:10]
             if re.match(r'^\d{4}-\d{2}-\d{2}$', d_bucket):
                 d = d_bucket
+        # ITA/ER-Duty: gleiche Regel — Sektor auf den Stations-LOKALEN Bucket
+        # keyen (start_iso ist nach dem I1-Re-Timing echtes UTC; ein Abend-
+        # Abflug in EZE läge sonst auf dem UTC-Folgetag).
+        if _ics_is_ita_flight(ev.get('summary') or ''):
+            d_bucket = (ev.get('start') or '')[:10]
+            if re.match(r'^\d{4}-\d{2}-\d{2}$', d_bucket):
+                d = d_bucket
         if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
             continue
         # MULTI-LEG-DUTY (Edelweiss-Outlook, Yanic 2026-07-18): ALLE pipe-
@@ -40925,6 +41263,17 @@ def _build_ical_sectors(events):
             sw_flt, sw_frm, sw_to = _ics_parse_swiss_flight(summ)
             if sw_frm and sw_to:
                 flight = sw_flt; frm = sw_frm; to = sw_to
+            elif _ics_is_ita_flight(summ):
+                # ITA/ER-Duty „AZ2056 FCO LIN" (auch „DH AZ1740 …" — der DH-
+                # Marker fällt wie im LH-Pfad weg, die Crew SITZT im Flug).
+                # Boden-DH („DH SUPERF") matcht nicht → kein Pseudo-Sektor.
+                it_flt, it_frm, it_to, _it_dh = _ics_parse_ita_flight(summ)
+                flight = it_flt; frm = it_frm; to = it_to
+                # Roster-deklarierte Maschine aus DESCRIPTION „32N/EIHJD" →
+                # EI-HJD (wie LEON: echtes Assignment, kein tail_inferred).
+                _ita_reg = _ita_desc_reg(ev.get('description'))
+                if _ita_reg:
+                    leon_reg = _ita_reg
             else:
                 # Carrier-Code darf mit Ziffer beginnen (Discover „4Y50") —
                 # `[A-Z]{2,3}` allein ließ 4Y-Sektoren komplett leer laufen.
@@ -41378,6 +41727,13 @@ def import_calendar_feed(token):
     # no-op für LH-Feeds; wirft nie. VOR dem Persistieren, damit calendar_feed,
     # Briefings, Reconcile und Sektoren dieselbe (korrigierte) Event-Liste sehen.
     events = _swissify_roster_events(events, token=token)
+    # ITA/ER-Duty-Nachbearbeitung (I1 Stations-Zeit-Fix + I2-I6) — no-op für
+    # alle anderen Feeds; wirft nie.
+    events = _itaify_roster_events(events, token=token)
+    # Relevanz-Auswahl VOR den Caps: Jahre-lange iCloud-Feeds (ITA: 1385 Events
+    # seit 2023, unsortiert) würden sonst per Prefix-Slice die AKTUELLEN
+    # Dienste verlieren. ≤300 Events (LH/SWISS-Fenster) = unverändert.
+    events = _select_relevant_feed_events(events, 300)
     # Save Events — über _profile_save routen, damit calendar_feed in SB
     # (metadata-jsonb) landet und Cloud-Run-Redeploy überlebt.
     # MERGE statt ERSETZEN (ical-Clobber-Audit 2026-07-10): zwei Sync-Pfade
@@ -41467,8 +41823,10 @@ def import_calendar_feed(token):
     try:
         existing = dict(_ical_briefings_load(token) or {})
         # Cap auf 200 Events (Performance) — entspricht ~6 Monate LH-Crew-Plan.
+        # Relevanz-Auswahl statt Prefix-Slice (s.o., ITA-Jahres-Feeds).
+        _ev_sel = _select_relevant_feed_events(events, 200)
         briefings, imported_briefings = _ics_events_to_briefings(
-            events[:200], existing=existing)
+            _ev_sel, existing=existing)
         # RECONCILE (geteilter Helper): Tage im aktuellen Monatsfenster, die der neue
         # Feed nicht mehr enthält, von veralteten ical_*-Daten säubern (inkl. manueller
         # Map + Supabase). Tage AUSSERHALB des Fensters bleiben Historie.
@@ -41481,9 +41839,9 @@ def import_calendar_feed(token):
                               'feed_dates': 0, 'cleared': 0, 'window': None}
         else:
             _reconcile_dbg = _reconcile_month_briefings(
-                token, briefings, events[:200], full_clean=_full_clean)
+                token, briefings, _ev_sel, full_clean=_full_clean)
         # Pro-Leg-Sektoren auch im ICS-URL-Pfad bewahren (gleich wie EKEvent-Upload).
-        _attach_sectors(briefings, events[:200])
+        _attach_sectors(briefings, _ev_sel)
         if not _ical_briefings_save(token, briefings):
             _persist_err = 'briefings_persist_failed'
     except Exception as e:
@@ -42027,6 +42385,10 @@ def upload_calendar_events(token):
             adapted.append(adapted_ev)
         # SWISS-Nachbearbeitung (F1/F5) auch im EKEvent-Pfad — no-op für LH.
         adapted = _swissify_roster_events(adapted, token=token)
+        # ITA/ER-Duty auch hier (abonnierter iCloud-Kalender via EventKit trägt
+        # dieselben Rome-mislabelten Zeiten); Relevanz-Auswahl wie im URL-Pfad.
+        adapted = _itaify_roster_events(adapted, token=token)
+        adapted = _select_relevant_feed_events(adapted, 200)
         briefings, imported_briefings = _ics_events_to_briefings(
             adapted, existing=existing_briefings)
         # RECONCILE (FIX User C „Flüge im Kalender die ich nicht habe"): auch der
