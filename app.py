@@ -503,6 +503,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/roster-changes/',
     '/api/user/logbook-html/',
     '/api/user/logbook-pdf/',
+    '/api/user/logbook/',   # Cockpit-Flugbuch (Roster-Aggregat = PII)
     '/api/user/calendar-pdf/',
     '/api/user/ical/',
     '/api/user/stats/',
@@ -17097,6 +17098,225 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
         _req_threading.Thread(target=_do_refresh, daemon=True).start()
     except Exception:
         pass
+
+
+# ── Flugbuch (Cockpit-Logbuch, FCL.050-Stil) ────────────────────────────────
+# Pilot-Flugbuch aus dem Roster: per-Leg Blockzeit (OUT/IN) + Kennzeichen/Muster
+# (aus den Sektoren bzw. LH-Fakten) + manuelles Overlay (Landungen Tag/Nacht,
+# PF/PM, Nachtflugzeit, Bemerkung) + Summen pro Muster. „Der Dienstplan füllt
+# das Flugbuch vor" — Aggregation vorhandener Daten, nichts wird erfunden.
+_LOGBOOK_ENRICH_CAP = 60   # max LH-Fakten-Anreicherungen (Reg/Typ) pro Request
+
+
+def _logbook_leg_key(date, flight, frm, to):
+    return '|'.join([(date or '')[:10],
+                     (flight or '').upper().replace(' ', ''),
+                     (frm or '').upper(), (to or '').upper()])
+
+
+def _logbook_overlay_path(token):
+    import os
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    return os.path.join(_USER_HISTORY_DIR, f'logbook_{safe}.json') if safe else None
+
+
+def _logbook_overlay_load(token):
+    """Manuelles Overlay pro Leg-Key. Profil-Mirror (durable SB) als Basis,
+    dedizierte Disk-Datei (race-frei, frischer) drüber."""
+    import os
+    ov = {}
+    try:
+        p = ((_profile_load(token) or {}).get('profile') or {})
+        if isinstance(p.get('logbook_overlay'), dict):
+            ov.update(p['logbook_overlay'])
+    except Exception:
+        pass
+    try:
+        pth = _logbook_overlay_path(token)
+        if pth and os.path.exists(pth):
+            with open(pth) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                ov.update(d)
+    except Exception:
+        pass
+    return ov
+
+
+def _logbook_overlay_save(token, overlay):
+    ok = False
+    try:
+        pth = _logbook_overlay_path(token)
+        if pth:
+            _atomic_write_json(pth, overlay)
+            ok = True
+    except Exception as e:
+        app.logger.warning(f'[logbook] disk_save_fail: {type(e).__name__}')
+    try:  # durable SB-Mirror im Profil (überlebt Container-Neustart)
+        pf = _profile_load(token) or {}
+        prof = (pf.get('profile') or {})
+        prof['logbook_overlay'] = overlay
+        _profile_save(token, prof)
+        ok = True
+    except Exception:
+        pass
+    return ok
+
+
+def _logbook_block_min(dep_iso, arr_iso):
+    """Blockminuten aus zwei Offset-ISO-Zeiten (OUT/IN). None wenn unplausibel."""
+    try:
+        from datetime import datetime as _dt
+        d = _dt.fromisoformat((dep_iso or '').replace('Z', '+00:00'))
+        a = _dt.fromisoformat((arr_iso or '').replace('Z', '+00:00'))
+        m = int(round((a - d).total_seconds() / 60.0))
+        return m if 0 < m < 20 * 60 else None
+    except Exception:
+        return None
+
+
+@app.route('/api/user/logbook/<token>', methods=['GET'])
+def get_logbook(token):
+    """Cockpit-Flugbuch: per-Leg Blockzeiten + Kennzeichen/Muster + manuelles
+    Overlay, plus Summen pro Muster. Aggregiert die Roster-Sektoren
+    (ical_sectors) aller Tage; fehlende Reg/Typ werden gedrosselt via LH-Fakten
+    (gecacht) nachgezogen."""
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    try:
+        ical = _ical_briefings_load(token) or {}
+    except Exception:
+        ical = {}
+    try:
+        manual = _manual_briefings_load(token) or {}
+    except Exception:
+        manual = {}
+    # Sektoren stehen unter ical_sectors (i. d. R. in der iCal-Quelle).
+    sectors_by_day = {}
+    for src in (manual, ical):
+        for k, v in (src or {}).items():
+            if isinstance(v, dict) and isinstance(v.get('ical_sectors'), list):
+                sectors_by_day[k] = v['ical_sectors']
+    overlay = _logbook_overlay_load(token)
+    try:
+        from blueprints.aerox_data_blueprint import _flight_facts_from_obs
+    except Exception:
+        _flight_facts_from_obs = None
+
+    entries = []
+    enrich_used = 0
+    enrich_capped = False
+    for date in sorted(sectors_by_day.keys()):
+        for s in (sectors_by_day[date] or []):
+            if not isinstance(s, dict):
+                continue
+            flight = (s.get('flight') or '').upper().replace(' ', '')
+            frm = (s.get('from') or '').upper()
+            to = (s.get('to') or '').upper()
+            if not flight or len(frm) != 3 or len(to) != 3:
+                continue
+            dep_iso = s.get('dep_iso') or ''
+            arr_iso = s.get('arr_iso') or ''
+            reg = s.get('reg') or s.get('tail')
+            actype = s.get('type')
+            if (not reg or not actype) and _flight_facts_from_obs:
+                if enrich_used < _LOGBOOK_ENRICH_CAP:
+                    try:
+                        f = _flight_facts_from_obs(flight, date, frm, to) or {}
+                        reg = reg or f.get('reg')
+                        actype = actype or f.get('type')
+                    except Exception:
+                        pass
+                    enrich_used += 1
+                else:
+                    enrich_capped = True
+            key = _logbook_leg_key(date, flight, frm, to)
+            ov = overlay.get(key) or {}
+            entries.append({
+                'key': key, 'date': date, 'flight': flight,
+                'from': frm, 'to': to, 'dep_iso': dep_iso, 'arr_iso': arr_iso,
+                'block_min': _logbook_block_min(dep_iso, arr_iso),
+                'reg': reg or None, 'type': actype or None,
+                'ldg_day': ov.get('ldg_day'), 'ldg_night': ov.get('ldg_night'),
+                'to_day': ov.get('to_day'), 'to_night': ov.get('to_night'),
+                'pf': (bool(ov['pf']) if ov.get('pf') is not None else None),
+                'night_min': ov.get('night_min'), 'remarks': ov.get('remarks'),
+            })
+    if enrich_capped:
+        app.logger.info(f'[logbook] enrich-cap {_LOGBOOK_ENRICH_CAP} tok={token[:8]} '
+                        f'— restliche Legs ohne LH-Reg/Typ (bereits gespeicherte bleiben)')
+
+    by_type = {}
+    tot_block = tot_ldg = 0
+    dates_seen = set()
+    for e in entries:
+        bt = e.get('block_min') or 0
+        ld = (e.get('ldg_day') or 0) + (e.get('ldg_night') or 0)
+        tot_block += bt
+        tot_ldg += ld
+        dates_seen.add(e['date'])
+        t = e.get('type') or '—'
+        agg = by_type.setdefault(t, {'type': t, 'legs': 0, 'block_min': 0, 'landings': 0})
+        agg['legs'] += 1
+        agg['block_min'] += bt
+        agg['landings'] += ld
+    by_type_list = sorted(by_type.values(), key=lambda x: -x['block_min'])
+    return jsonify({
+        'ok': True,
+        'entries': entries,
+        'by_type': by_type_list,
+        'totals': {'legs': len(entries), 'block_min': tot_block,
+                   'landings': tot_ldg, 'days': len(dates_seen)},
+        'enrich_capped': enrich_capped,
+    })
+
+
+@app.route('/api/user/logbook/<token>/leg', methods=['POST'])
+def save_logbook_leg(token):
+    """Manuelles Overlay EINES Legs speichern (Landungen Tag/Nacht, Starts,
+    PF/PM, Nachtflugzeit-Minuten, Bemerkung). Identifiziert das Leg über
+    {date, flight, from, to}. Nur echte Werte; leeres Overlay = Eintrag raus."""
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    body = request.get_json(silent=True) or {}
+    date = (body.get('date') or '')[:10]
+    flight = (body.get('flight') or '').upper().replace(' ', '')
+    frm = (body.get('from') or '').upper()
+    to = (body.get('to') or '').upper()
+    if not (date and flight and len(frm) == 3 and len(to) == 3):
+        return jsonify({'ok': False, 'error': 'leg_incomplete'}), 400
+    key = _logbook_leg_key(date, flight, frm, to)
+    overlay = _logbook_overlay_load(token)
+    cur = dict(overlay.get(key) or {})
+
+    def _count(v):   # Landungen/Starts: 0..50
+        try:
+            n = int(v)
+            return n if 0 <= n <= 50 else None
+        except Exception:
+            return None
+
+    for f in ('ldg_day', 'ldg_night', 'to_day', 'to_night'):
+        if f in body:
+            cur[f] = _count(body.get(f))
+    if 'night_min' in body:
+        try:
+            n = int(body.get('night_min'))
+            cur['night_min'] = n if 0 <= n <= 20 * 60 else None
+        except Exception:
+            cur['night_min'] = None
+    if 'pf' in body:
+        cur['pf'] = bool(body.get('pf'))
+    if 'remarks' in body:
+        r = body.get('remarks')
+        cur['remarks'] = (str(r)[:500] if r else None)
+    cur = {k: v for k, v in cur.items() if v is not None}
+    if cur:
+        overlay[key] = cur
+    else:
+        overlay.pop(key, None)
+    _logbook_overlay_save(token, overlay)
+    return jsonify({'ok': True, 'key': key, 'overlay': cur})
 
 
 @app.route('/api/user/briefing/<token>', methods=['GET'])
