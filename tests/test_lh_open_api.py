@@ -129,20 +129,23 @@ def test_flight_facts_noop_for_non_group(monkeypatch):
 
 def test_merge_precedence():
     from blueprints.aerox_data_blueprint import _merge_lh_into_facts
-    obs = {"sched_dep": "OBS-DEP", "est_dep": "OBS-EST", "reg": "D-OLD",
-           "dep_status": "Board-Status"}
+    obs = {"sched_dep": "OBS-DEP", "est_dep": "OBS-EST", "dep_delay_min": 0,
+           "reg": "D-OLD", "dep_status": "Board-Status", "dep_iata": "FRA"}
     lh_facts = {"sched_dep": "LH-DEP", "gate": "C16", "reg": "D-NEW",
-                "est_dep": "LH-EST", "arr_status": "LH-ARR"}
+                "est_dep": "LH-EST", "dep_delay_min": 10, "arr_status": "LH-ARR"}
     out = _merge_lh_into_facts(obs, lh_facts)
-    # LH autoritativ: sched_dep + reg überschrieben, gate neu
+    # LH autoritativ: sched_dep + reg + gate überschrieben
     assert out["sched_dep"] == "LH-DEP"
     assert out["reg"] == "D-NEW"
     assert out["gate"] == "C16"
-    # Board-Ist bleibt (LH füllt nur Lücken): est_dep NICHT überschrieben
-    assert out["est_dep"] == "OBS-EST"
-    # dep_status (Board) bleibt, arr_status (Lücke) von LH gefüllt
+    # KONSISTENZ: Ist-Zeit UND Delay zusammen von LH (nicht est=LH, delay=Board)
+    assert out["est_dep"] == "LH-EST"
+    assert out["dep_delay_min"] == 10
+    # Status-Freitext (Board) bleibt, arr_status-Lücke von LH gefüllt
     assert out["dep_status"] == "Board-Status"
     assert out["arr_status"] == "LH-ARR"
+    # Routen-Identität bleibt Board (Match-Stabilität)
+    assert out["dep_iata"] == "FRA"
 
 
 def test_merge_empty_lh_is_noop():

@@ -4213,18 +4213,24 @@ def _apply_paid_arrival_escalation(payload, flight_no, date, dep, dest, pos,
         return False
 
 
-# LH gewinnt bei Plan-/Identitäts-Feldern (die die Airline selbst am besten
-# kennt); Board-Live-Felder bleiben Board, LH füllt dort nur Lücken.
-_LH_AUTHORITATIVE = ('sched_dep', 'sched_arr', 'gate', 'terminal',
-                     'arr_gate', 'arr_terminal', 'reg', 'type')
-_LH_FILL_ONLY = ('est_dep', 'est_arr', 'dep_delay_min', 'arr_delay_min',
-                 'dep_status', 'arr_status', 'cancelled', 'dep_iata', 'arr_iata')
+# LH ist für seine EIGENEN Flüge die autoritative Quelle bei allen
+# numerischen/Zeit-/Identitäts-Fakten. WICHTIG (Konsistenz): Ist-Zeit und Delay
+# gehören ZUSAMMEN — beide LH-autoritativ, sonst zeigt est=+10 neben delay=0
+# (Board sagt 0, LH-Zeit sagt +10). LH-Delay stammt aus derselben LH-Rechnung
+# (est−sched) und ist damit intern konsistent. NUR die Status-Freitexte
+# ('Flight Departed' vs Board-„Abgeflogen") + die Routen-Identität bleiben Board
+# (Vokabular-/Match-Stabilität) — LH füllt sie nur, wenn das Board schweigt.
+_LH_AUTHORITATIVE = ('sched_dep', 'sched_arr', 'est_dep', 'est_arr',
+                     'dep_delay_min', 'arr_delay_min', 'gate', 'terminal',
+                     'arr_gate', 'arr_terminal', 'reg', 'type', 'cancelled')
+_LH_FILL_ONLY = ('dep_status', 'arr_status', 'dep_iata', 'arr_iata')
 
 
 def _merge_lh_into_facts(obs, lh):
     """Board-Fakten + autoritative LH-Fakten → gemergtes Fakten-Dict.
-    LH überschreibt Plan-/Identitäts-Felder; Board-Ist-/Live-Felder bleiben,
-    LH füllt dort nur Lücken. Reine Funktion (trivial testbar)."""
+    LH überschreibt alle Zeit-/Delay-/Identitäts-Felder (konsistent aus einer
+    Quelle); Status-Freitext + Route bleiben Board, LH füllt nur Lücken. Reine
+    Funktion (trivial testbar)."""
     if not isinstance(lh, dict) or not lh:
         return obs
     out = dict(obs or {})
