@@ -40844,21 +40844,18 @@ def _itaify_roster_events(events, token=None):
                 continue
             gaps.append((a_to, o_a_end, o_b_start,
                          (a[0].get('end_iso') or ''), (b[0].get('start_iso') or '')))
-        synth = []
-        if not has_real_layover:
-            for iata, _o1, _o2, f_start, f_end in gaps:
-                lay = {
-                    'summary': 'LAYOVER', 'location': iata,
-                    'start_iso': f_start, 'end_iso': f_end,
-                    'start': _ics_station_local_date(f_start, iata) or f_start[:10],
-                    'end': _ics_station_local_date(f_end, iata) or f_end[:10],
-                    '_is_date_only_start': False, '_is_date_only_end': False,
-                    '_ita_synth_layover': True,
-                }
-                lay['_multiday_dates'] = _ics_multiday_dates(lay)
-                synth.append(lay)
         # ── I5: Hotels erkennen (Gap-Überlappung im Original-Frame) ──────────
+        # WICHTIG (Owner 2026-07-21, „das stimmt alles niemals"): der Hotelname
+        # darf NIE in den Marker — Wort-Fragmente wie „Tokio ARI" wurden sonst
+        # als IATA-Stationen gelesen (Phantom-Routing „FCO → ARI → HND"), und
+        # die Hotel-Spanne (Wanduhr 00:00) stempelte reinen Ruhetagen eine
+        # falsche „Briefing"-Startzeit. Das Hotel-Event wird deshalb in ein
+        # 1:1 LH-förmiges LAYOVER-Event umgeschrieben (SUMMARY 'LAYOVER',
+        # LOCATION=IATA, Spanne = echte Ankunft→Weiterflug) — identische
+        # Semantik wie der seit Wochen verifizierte LH-Pfad. Für Gaps mit
+        # Hotel entfällt die Synthese (kein Doppel-Event).
         flight_ids = {id(f[0]) for f in flights}
+        covered_gaps = set()
         for ev in events:
             if id(ev) in flight_ids:
                 continue
@@ -40873,22 +40870,35 @@ def _itaify_roster_events(events, token=None):
             dur_min = _iso_minutes_between(o_s, o_e)
             if dur_min is None or dur_min < 3 * 60:
                 continue
-            for iata, g_s, g_e, _f1, _f2 in gaps:
+            for gi, (iata, g_s, g_e, f_start, f_end) in enumerate(gaps):
                 ov = _iso_minutes_between(max(o_s, g_s), min(o_e, g_e))
                 if ov is not None and ov >= 3 * 60:
-                    new_s, _ = _ita_retime_iso(o_s, iata)
-                    new_e, _ = _ita_retime_iso(o_e, iata)
-                    ev['start_iso'] = new_s
-                    ev['end_iso'] = new_e
-                    ev['summary'] = f'LAYOVER · {summ}'[:120]
-                    wd_s, _ = _ita_wall_date_hhmm(o_s)
-                    wd_e, _ = _ita_wall_date_hhmm(o_e)
-                    if wd_s:
-                        ev['start'] = wd_s
-                    if wd_e:
-                        ev['end'] = wd_e
+                    ev['summary'] = 'LAYOVER'
+                    ev['location'] = iata
+                    ev['start_iso'] = f_start
+                    ev['end_iso'] = f_end
+                    ev['start'] = _ics_station_local_date(f_start, iata) or f_start[:10]
+                    ev['end'] = _ics_station_local_date(f_end, iata) or f_end[:10]
+                    ev['_is_date_only_start'] = False
+                    ev['_is_date_only_end'] = False
                     ev['_multiday_dates'] = _ics_multiday_dates(ev)
+                    covered_gaps.add(gi)
                     break
+        synth = []
+        if not has_real_layover:
+            for gi, (iata, _o1, _o2, f_start, f_end) in enumerate(gaps):
+                if gi in covered_gaps:
+                    continue
+                lay = {
+                    'summary': 'LAYOVER', 'location': iata,
+                    'start_iso': f_start, 'end_iso': f_end,
+                    'start': _ics_station_local_date(f_start, iata) or f_start[:10],
+                    'end': _ics_station_local_date(f_end, iata) or f_end[:10],
+                    '_is_date_only_start': False, '_is_date_only_end': False,
+                    '_ita_synth_layover': True,
+                }
+                lay['_multiday_dates'] = _ics_multiday_dates(lay)
+                synth.append(lay)
         # ── I3: Pickups einer Station zuordnen + Token schreiben ─────────────
         for ev in pickups:
             o_s = orig[id(ev)][0]

@@ -96,22 +96,42 @@ def test_pickup_token_with_wall_time():
 
 # ── I4/I5: Layover-Synthese + Hotel ──────────────────────────────────────────
 
-def test_layover_synth_sets_ort_and_hotel_prefix():
+def test_layover_synth_sets_ort_and_hotel_rewrite():
     events, briefings = _pipeline()
     assert briefings['2026-07-22'].get('ical_layover_ort') == 'YYZ'
     assert briefings['2026-07-23'].get('ical_layover_ort') == 'YYZ'
     # Heimkehr-Morgen (24.) bekommt KEINEN Layover-Ort (noon-span-Regel).
     assert briefings.get('2026-07-24', {}).get('ical_layover_ort') != 'YYZ'
-    hotel = next(e for e in events if 'CHELSEA' in (e.get('summary') or ''))
-    assert hotel['summary'].startswith('LAYOVER · ')
-    # Hotel-Ende (Pickup-Morgen) darf das Duty-Fenster NICHT aufblähen:
-    assert not backend._ev_extends_duty(hotel['summary'])
+    # Hotel-Event wird 1:1 LH-förmig: SUMMARY 'LAYOVER', LOCATION=IATA,
+    # Spanne = Ankunft→Weiterflug. Der HOTELNAME erscheint NIRGENDS im
+    # Marker (Owner-Bug: „Tokio Ari" wurde als Station ARI gelesen).
+    lays = [e for e in events if (e.get('summary') or '') == 'LAYOVER'
+            and e.get('location') == 'YYZ']
+    assert len(lays) == 1, f'genau EIN YYZ-LAYOVER (Hotel-rewrite, keine Doppel-Synthese): {len(lays)}'
+    lay = lays[0]
+    assert lay['start_iso'] == '2026-07-22T18:05:00Z'   # Ankunft AZ650
+    assert lay['end_iso'] == '2026-07-23T21:00:00Z'     # Abflug AZ651
+    assert not any('CHELSEA' in (e.get('summary') or '') for e in events)
+    assert not backend._ev_extends_duty(lay['summary'])
+    day23 = briefings['2026-07-23'].get('ical_summary') or ''
+    assert 'CHELSEA' not in day23
 
 
 def test_hotel_does_not_inflate_duty_end():
     _, briefings = _pipeline()
     # Tag 22: Duty-Ende = Flug-Ankunft 18:05Z, NICHT Hotel-Ende am 23.
     assert (briefings['2026-07-22'].get('ical_end_iso') or '') == '2026-07-22T18:05:00Z'
+
+
+def test_pure_hotel_day_gets_no_phantom_start_time():
+    # Reiner Ruhetag (Tag 2 des Layovers) darf KEINE Startzeit aus dem
+    # Hotel-Event erben (Owner-Bug: „Briefing 16:00" am Tokio-Ruhetag).
+    _, briefings = _pipeline()
+    d23 = briefings['2026-07-23']
+    # Tag-23-Start stammt vom Pickup/Report (Nachmittag Toronto), nie von
+    # einer Hotel-Wanduhr-Mitternacht.
+    start = d23.get('ical_start_iso') or ''
+    assert start >= '2026-07-23T17:40:00Z', start
 
 
 # ── I6: RISERVA → standby ────────────────────────────────────────────────────
