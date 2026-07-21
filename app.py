@@ -40925,7 +40925,9 @@ def _build_ical_sectors(events):
             if sw_frm and sw_to:
                 flight = sw_flt; frm = sw_frm; to = sw_to
             else:
-                m = re.search(r'([A-Z]{2,3}\s*\d{1,4})\s*:?\s*([A-Z]{3})\s*-\s*([A-Z]{3})', summ)
+                # Carrier-Code darf mit Ziffer beginnen (Discover „4Y50") —
+                # `[A-Z]{2,3}` allein ließ 4Y-Sektoren komplett leer laufen.
+                m = re.search(r'((?:[A-Z]{2,3}|\d[A-Z])\s*\d{1,4})\s*:?\s*([A-Z]{3})\s*-\s*([A-Z]{3})', summ)
                 if m:
                     flight = re.sub(r'\s+', '', m.group(1)); frm = m.group(2); to = m.group(3)
                 else:
@@ -41662,9 +41664,14 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
 
     if not events:
         return None, 'no_roster_days'
+    return _pdf_events_to_ics(events, year, month,
+                              prodid='AeroX CrewAccess PDF Import'), None
 
-    lines = ['BEGIN:VCALENDAR', 'VERSION:2.0',
-             'PRODID:-//AeroX CrewAccess PDF Import//DE']
+
+def _pdf_events_to_ics(events, year, month, prodid='AeroX Roster PDF Import'):
+    """Synthetische Event-Tupel (uid_suffix, start, end, summary, all_day)
+    → ICS-String. Geteilt von CrewAccess- und Discover-Roster-Parser."""
+    lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', f'PRODID:-//{prodid}//DE']
     for uid, start, end, summary, all_day in events:
         lines.append('BEGIN:VEVENT')
         lines.append(f'UID:pdf-{year}{month:02d}-{uid}@aerox-roster')
@@ -41677,7 +41684,7 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
         lines.append(f'SUMMARY:{summary}')
         lines.append('END:VEVENT')
     lines.append('END:VCALENDAR')
-    return '\r\n'.join(lines), None
+    return '\r\n'.join(lines)
 
 
 def _crewaccess_carrier_for(airline_hint, token):
@@ -41692,6 +41699,170 @@ def _crewaccess_carrier_for(airline_hint, token):
         except Exception:
             v = ''
     return '4Y' if 'discover' in v else 'VL'
+
+
+# ── Discover Airlines: natives „Roster"-PDF (myTime-Export) ──────────────
+# Anderes Format als CrewAccess: Kopf „Roster / Period: <Monat> <Jahr>",
+# Spalten „Date Report Release Tags Pos Activity From To Start End A/C
+# Layover Trip ID Flight Duty Rest" und explizit „All times local" —
+# Stations-ORTSZEIT statt UTC. Wire-Format bleibt UTC (Doku Kalender-Roster
+# §7.6): Konversion pro Station via airport_tz. Übernacht-Legs stehen auf
+# ZWEI Zeilen: Opener trägt nur From+Start, der Closer am Folgetag nur
+# To+End — teils OHNE eigene Datumszeile (der Ankunftstag fehlt dann im
+# Text komplett); Paarung über die Flugnummer, Ankunftsdatum wird dann aus
+# „Ende ≤ Start (UTC) → +1 Tag" abgeleitet. Trip-IDs brechen in eine
+# eigene Fortsetzungszeile um („20260704_21" / „0_200").
+_DISCOVER_HEADER = 'Date Report Release Tags Pos Activity From To Start End'
+_DISCOVER_LEG_RE = re.compile(
+    r'(?:^|\s)[A-Z]{2,3}\s+(\d{1,4}[A-Z]?)\s+([A-Z]{3})(?:\s+([A-Z]{3}))?\s+'
+    r'(\d{1,2}:\d{2})(?:\s+(\d{1,2}:\d{2}))?(?=\s|$)')
+_DISCOVER_GROUND_RE = re.compile(
+    r'(?:^|\s)(SBY[A-Z0-9]*|PREP)\s+([A-Z]{3})\s+'
+    r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})(?=\s|$)')
+
+
+def _discover_roster_text_to_ics(text, carrier='4Y'):
+    """Discover-„Roster"-PDF-Text → synthetisches ICS (Wire-UTC). Pure/testbar.
+    Returns (ics_string, None) oder (None, error_code). Deterministisch,
+    NICHTS wird erfunden: unbekannte Tages-Marker (OT/BOT/AU/…) reisen als
+    Roh-Summary mit; unschließbare Übernacht-Opener werden verworfen."""
+    t = text or ''
+    if 'Roster' not in t[:200] or _DISCOVER_HEADER not in t:
+        return None, 'unsupported_pdf_format'
+    mp = re.search(r'Period:\s*([A-Za-z]+)\s+(\d{4})', t)
+    month = _CREWACCESS_MONTHS.get((mp.group(1).lower() if mp else ''), 0)
+    if not mp or not month:
+        return None, 'no_planning_period'
+    year = int(mp.group(2))
+
+    from datetime import date as _date, timedelta as _td, timezone as _tzu
+    from zoneinfo import ZoneInfo as _ZI
+
+    def day_date(dom):
+        try:
+            return _date(year, month, int(dom))
+        except ValueError:
+            return None
+
+    def _stn_tz(iata):
+        # Fallback Europe/Berlin: Discover-Basen sind FRA/MUC.
+        for name in (airport_tz(iata), 'Europe/Berlin'):
+            if not name:
+                continue
+            try:
+                return _ZI(name)
+            except Exception:
+                continue
+        return _tzu.utc
+
+    def _utc(d, hhmm, iata):
+        h, m = (int(x) for x in hhmm.split(':'))
+        loc = datetime(d.year, d.month, d.day, h, m, tzinfo=_stn_tz(iata))
+        return loc.astimezone(_tzu.utc).replace(tzinfo=None)
+
+    events = []   # (uid_suffix, dtstart, dtend, summary, all_day)
+
+    def add_all_day(d, summary):
+        events.append((f'day-{len(events)}', d, d + _td(days=1), summary, True))
+
+    def add_timed(d, t1, t2, stn, summary):
+        start = _utc(d, t1, stn)
+        end = _utc(d, t2, stn)
+        if end <= start:
+            end += _td(days=1)
+        events.append((f'tim-{len(events)}', start, end, summary, False))
+
+    def add_leg(dep_d, num, frm, to, t1, t2, arr_d=None):
+        start = _utc(dep_d, t1, frm)
+        end = _utc(arr_d or dep_d, t2, to)
+        if arr_d is None and end <= start:
+            # Closer ohne eigene Datumszeile: Ankunft am Folgetag.
+            end = _utc(dep_d + _td(days=1), t2, to)
+        n = num.lstrip('0') or '0'
+        events.append((f'leg-{len(events)}', start, end,
+                       f'{carrier}{n} {frm} - {to}', False))
+
+    in_table = False
+    cur_day = None
+    pending = None   # offener Übernacht-Leg: (num, frm, start_hhmm, dep_date)
+    for raw in t.splitlines():
+        # Bid-Sterne („granted Bid") sind reine Marker-Tokens.
+        line = ' '.join(tok for tok in raw.split() if tok != '*')
+        if not line:
+            continue
+        if line.startswith('Date Report'):
+            in_table = True
+            continue
+        if line.startswith('Created ') or line.startswith('Monthly'):
+            in_table = False
+            continue
+        if not in_table:
+            continue
+        # Umbruch-Fortsetzung (Trip-ID/Tag): „0_200", „_006", „14:00 _270".
+        if '_' in line and re.fullmatch(
+                r'(?:\d{1,2}:\d{2}\s+)?[\dA-Za-z_]+', line):
+            continue
+        dated = False
+        rest = line
+        dm = _CREWACCESS_DAY_RE.match(line)
+        if dm:
+            nd = day_date(dm.group(1))
+            if nd is None:
+                continue
+            cur_day = nd
+            dated = True
+            rest = (dm.group(2) or '').strip()
+            if not rest:
+                continue
+        if cur_day is None:
+            continue
+        toks = rest.split()
+        if len(toks) == 1:
+            tok = toks[0]
+            if tok == '---':
+                continue   # leerer Platzhalter-Tag
+            if tok in ('O', 'OW', 'OFF'):
+                add_all_day(cur_day, 'Off Day')
+            elif tok == 'U':
+                add_all_day(cur_day, 'Urlaub')
+            elif tok.startswith('RES'):
+                add_all_day(cur_day, 'Reserve')
+            else:
+                # Unbekannter Marker (OT/BOT/AU/…) → ehrlich roh durchreichen.
+                add_all_day(cur_day, tok)
+            continue
+        ml = re.match(r'^Layover:?\s+([A-Z]{3})$', rest)
+        if ml:
+            add_all_day(cur_day, f'Layover {ml.group(1)}')
+            continue
+        gm = _DISCOVER_GROUND_RE.search(rest)
+        if gm:
+            code, stn = gm.group(1), gm.group(2)
+            label = f'Standby {stn}' if code.startswith('SBY') else f'{code} {stn}'
+            add_timed(cur_day, gm.group(3), gm.group(4), stn, label)
+            continue
+        lm = _DISCOVER_LEG_RE.search(rest)
+        if not lm:
+            continue
+        num, a1, a2, t1, t2 = lm.groups()
+        if a2 and t2:
+            # Kompletter Leg auf einer Zeile (inkl. Air-Return „TPA TPA").
+            add_leg(cur_day, num, a1, a2, t1, t2)
+        elif not a2 and not t2:
+            key = num.lstrip('0')
+            if pending and pending[0] == key:
+                p_num, p_frm, p_t1, p_dep = pending
+                add_leg(p_dep, num, p_frm, a1, p_t1, t1,
+                        arr_d=(cur_day if dated else None))
+                pending = None
+            else:
+                pending = (key, a1, t1, cur_day)
+        # a2 ohne t2 (oder umgekehrt): nicht beobachtet → auslassen statt raten.
+
+    if not events:
+        return None, 'no_roster_days'
+    return _pdf_events_to_ics(events, year, month,
+                              prodid='AeroX Discover Roster PDF Import'), None
 
 
 @app.route('/api/user/roster-pdf/<token>/import', methods=['POST'])
@@ -41722,6 +41893,10 @@ def import_roster_pdf(token):
         return jsonify({'ok': False, 'error': 'pdf_extract_failed'}), 422
     carrier = _crewaccess_carrier_for(request.form.get('airline'), token)
     ics, perr = _crewaccess_text_to_ics(text, carrier=carrier)
+    if perr == 'unsupported_pdf_format':
+        # Natives Discover-„Roster"-Format (myTime-Export) — die Format-
+        # Quelle impliziert den Carrier: 4Y, unabhängig vom Client-Hint.
+        ics, perr = _discover_roster_text_to_ics(text, carrier='4Y')
     if perr:
         return jsonify({'ok': False, 'error': perr}), 422
     # Interner Dispatch in die EINE Feed-Pipeline (wallreply-Muster) — kein
@@ -41735,7 +41910,8 @@ def import_roster_pdf(token):
         payload = {}
     if status == 200 and payload.get('ok'):
         payload['source'] = 'pdf'
-        mp = re.search(r'Planning period:\s*([A-Za-z]+\s+\d{4})', text)
+        mp = (re.search(r'Planning period:\s*([A-Za-z]+\s+\d{4})', text)
+              or re.search(r'Period:\s*([A-Za-z]+\s+\d{4})', text))
         if mp:
             payload['period'] = mp.group(1)
     return jsonify(payload), status
