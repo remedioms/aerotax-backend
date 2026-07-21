@@ -40735,6 +40735,156 @@ def _ita_wall_date_hhmm(iso_utc):
         return None, None
 
 
+# ── Drittanbieter-/Condor-Roster-Normalisierung (Audit 2026-07-21) ───────────
+# Echte-User-Audit über alle gespeicherten Feeds: 114 Condor-Crews (cube.aero)
+# und 5 offblock.de-Feeds (Lufthansa City VL, Eurowings, LH) hatten Format-
+# Lücken, die der LH-Pfad nicht versteht:
+#   Condor/cube:  SUMMARY „C/I" (Check-in, LOCATION=IATA, DTSTART=Report-Zeit),
+#                 „P/U" (Pickup, LOCATION=IATA, DTSTART=Pickup-Zeit),
+#                 Flüge „DE2080 FRA-LAX" (generisch ok). Emoji-Varianten aus
+#                 Dritt-Apps: „🕒 C/I: LEJ", „ℹ️ ORT: LEJ".
+#   offblock.de:  Flüge „VL1144: FRA ✈ BIO" (✈ statt Bindestrich) und teils
+#                 ICAO-Stationen „EW 7276: EDDH ✈ LOWS" — der Routing-Regex
+#                 fand NIE einen Sektor → Flugtage blieben unklassifiziert.
+# Die Normalisierung schreibt alles in die LH-Form um (eine Wahrheit, keine
+# neuen Downstream-Zweige): ✈→„-", ICAO→IATA, C/I→„HH:MM LT Briefing XXX",
+# P/U→„Pickup HH:MM" (Ortszeit der LOCATION-Station).
+_ICAO_TO_IATA_AIRPORTS = {v: k for k, v in _IATA_TO_ICAO.items()}
+_CONDOR_CI_RE = re.compile(r'^\s*C/I(?:\s*:\s*([A-Z]{3}))?\s*$', re.I)
+_CONDOR_PU_RE = re.compile(r'^\s*P/U(?:\s*:\s*([A-Z]{3}))?\s*$', re.I)
+# Führende Emoji-/Symbol-Präfixe („🕒 ", „ℹ️ ", „🆓 ", „✈️ ") fürs Matching
+# abstreifen — NUR wenn danach ein bekanntes Muster steht (nie blind kürzen).
+_EMOJI_PREFIX_RE = re.compile(r'^[^A-Za-z0-9]+\s*')
+
+
+def _ics_local_hhmm_at(iso_utc, iata):
+    """UTC-ISO → 'HH:MM' in der TZ der Station (None bei Fehler)."""
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        dt = datetime.fromisoformat((iso_utc or '').replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_ZI('UTC'))
+        tzname = None
+        try:
+            tzname = airport_tz(iata) if iata else None
+        except Exception:
+            tzname = None
+        return dt.astimezone(_ZI(tzname or 'Europe/Berlin')).strftime('%H:%M')
+    except Exception:
+        return None
+
+
+def _normalize_thirdparty_roster_events(events):
+    """In-place-Normalisierung fremder Roster-Dialekte auf die LH-Form.
+    Läuft in BEIDEN Import-Pfaden VOR _swissify/_itaify. Wirft nie; Feeds
+    ohne die Muster bleiben byte-identisch."""
+    try:
+        for ev in (events or []):
+            summ = (ev.get('summary') or '').strip()
+            if not summ:
+                continue
+            # offblock.de: „VL1144: FRA ✈ BIO" / „EW 7276: EDDH ✈ LOWS".
+            if '✈' in summ:
+                parts = re.sub(r'\s*✈\s*', ' - ', summ)
+                # ICAO-Stationen (4 Buchstaben) → IATA, nur bei bekanntem Mapping.
+                def _icao2iata(m):
+                    return _ICAO_TO_IATA_AIRPORTS.get(m.group(0).upper(), m.group(0))
+                parts = re.sub(r'\b[A-Z]{4}\b', _icao2iata, parts)
+                ev['summary'] = parts
+                summ = parts
+            loc3 = (ev.get('location') or '').strip().upper()
+            loc3 = loc3 if (len(loc3) == 3 and loc3.isalpha()) else ''
+            stripped = _EMOJI_PREFIX_RE.sub('', summ)
+            # Condor Check-in: „C/I" (LOCATION=IATA) bzw. „C/I: LEJ".
+            m = _CONDOR_CI_RE.match(stripped)
+            if m:
+                st = (m.group(1) or loc3).upper()
+                hhmm = _ics_local_hhmm_at(ev.get('start_iso'), st or None)
+                if hhmm and st:
+                    ev['summary'] = f'{hhmm} LT Briefing {st}'
+                continue
+            # Condor Pickup: „P/U" (LOCATION=IATA) bzw. „P/U: LAX".
+            m = _CONDOR_PU_RE.match(stripped)
+            if m:
+                st = (m.group(1) or loc3).upper()
+                hhmm = _ics_local_hhmm_at(ev.get('start_iso'), st or None)
+                if hhmm:
+                    ev['summary'] = f'Pickup {hhmm}'
+                continue
+    except Exception as e:
+        try:
+            app.logger.warning(
+                f'[ics-norm] thirdparty-fail: {type(e).__name__}: {str(e)[:120]}')
+        except Exception:
+            pass
+    return events
+
+
+def _generic_layover_synthesis(events, token=None):
+    """Layover-Synthese für Feeds OHNE eigene LAYOVER-Events (Condor/cube,
+    offblock, …): aufeinanderfolgende Flug-Legs a→b mit a.to == b.from ≠
+    Homebase und 6–96 h Bodenzeit ⇒ synthetisches LAYOVER-Event (LH-Form).
+    Läuft NACH _swissify/_itaify — SWISS/ITA haben dann schon LAYOVER-Events
+    (Gate greift), LH sowieso (myTime liefert echte). Edelweiss-Outlook wird
+    über sein „LAY"-Signal ausgenommen (eigene, verifizierte iOS-Absorption —
+    hier nichts doppeln). Wirft nie."""
+    try:
+        legs = []
+        for ev in (events or []):
+            summ = (ev.get('summary') or '')
+            up = summ.upper().strip()
+            if 'LAYOVER' in up:
+                return events          # Feed hat echte/synthetisierte Layover
+            if up == 'LAY':
+                return events          # Edelweiss-Outlook: eigener Pfad
+            flt, frm, to = _ics_parse_flight_leg_summary(summ)
+            if frm and to and _ev_is_flight_leg(summ):
+                legs.append((ev, frm, to))
+        if len(legs) < 2:
+            return events
+        hb = ''
+        if token:
+            try:
+                pr = (_profile_load(token) or {}).get('profile') or {}
+                hb = str(pr.get('homebase') or '').strip().upper()
+            except Exception:
+                hb = ''
+        if len(hb) != 3 or not hb.isalpha():
+            from collections import Counter as _Ctr
+            deps = [f[1] for f in legs]
+            hb = _Ctr(deps).most_common(1)[0][0] if deps else ''
+        ordered = sorted(legs, key=lambda l: l[0].get('start_iso') or '')
+        synth = []
+        for a, b in zip(ordered, ordered[1:]):
+            a_to, b_frm = a[2], b[1]
+            if not a_to or a_to != b_frm or a_to == hb:
+                continue
+            a_end = (a[0].get('end_iso') or '').strip()
+            b_start = (b[0].get('start_iso') or '').strip()
+            gap_min = _iso_minutes_between(a_end, b_start)
+            if gap_min is None or not (6 * 60 <= gap_min <= 96 * 60):
+                continue
+            lay = {
+                'summary': 'LAYOVER', 'location': a_to,
+                'start_iso': a_end, 'end_iso': b_start,
+                'start': _ics_station_local_date(a_end, a_to) or a_end[:10],
+                'end': _ics_station_local_date(b_start, a_to) or b_start[:10],
+                '_is_date_only_start': False, '_is_date_only_end': False,
+                '_generic_synth_layover': True,
+            }
+            lay['_multiday_dates'] = _ics_multiday_dates(lay)
+            synth.append(lay)
+        if synth:
+            events.extend(synth)
+    except Exception as e:
+        try:
+            app.logger.warning(
+                f'[ics-norm] layover-synth-fail: {type(e).__name__}: {str(e)[:120]}')
+        except Exception:
+            pass
+    return events
+
+
 def _itaify_roster_events(events, token=None):
     """ITA/ER-Duty-Feed-Nachbearbeitung (in-place; LH/SWISS/LEON unberührt).
     No-op ohne AZ-Flüge im ER-Duty-Format. Wirft nie. Läuft in BEIDEN
@@ -40782,7 +40932,14 @@ def _itaify_roster_events(events, token=None):
         orig = {id(ev): ((ev.get('start_iso') or ''), (ev.get('end_iso') or ''))
                 for ev in events}
         # ── I1: Flüge re-verankern (dep in Abflug-TZ, arr in Ankunfts-TZ) ────
+        # IDEMPOTENZ-SCHUTZ: das Re-Timing ist NICHT idempotent (die Arr-Wanduhr
+        # würde beim zweiten Lauf erneut verschoben). Der Import-Pfad parst zwar
+        # immer frisch, aber ein versehentlicher Doppel-Lauf (Replays/Tools)
+        # darf nie still Zeiten verfälschen.
+        if any(ev.get('_ita_retimed') for ev, *_rest in flights):
+            return events
         for ev, flt, frm, to, is_dh, is_ground in flights:
+            ev['_ita_retimed'] = True
             new_dep, _ = _ita_retime_iso(ev.get('start_iso'), frm)
             new_arr, _ = _ita_retime_iso(ev.get('end_iso'), to)
             ev['start_iso'] = new_dep
@@ -41792,10 +41949,15 @@ def import_calendar_feed(token):
     # SWISS-Nachbearbeitung (F1 Stations-Lokal-Buckets + F5 Layover-Synthese) —
     # no-op für LH-Feeds; wirft nie. VOR dem Persistieren, damit calendar_feed,
     # Briefings, Reconcile und Sektoren dieselbe (korrigierte) Event-Liste sehen.
+    # Drittanbieter-Dialekte (Condor C/I+P/U, offblock ✈/ICAO) → LH-Form.
+    events = _normalize_thirdparty_roster_events(events)
     events = _swissify_roster_events(events, token=token)
     # ITA/ER-Duty-Nachbearbeitung (I1 Stations-Zeit-Fix + I2-I6) — no-op für
     # alle anderen Feeds; wirft nie.
     events = _itaify_roster_events(events, token=token)
+    # Layover-Synthese für Feeds ohne LAYOVER-Events (Condor/offblock, no-op
+    # für LH/SWISS/ITA/Edelweiss — siehe Gates im Helper).
+    events = _generic_layover_synthesis(events, token=token)
     # Relevanz-Auswahl VOR den Caps: Jahre-lange iCloud-Feeds (ITA: 1385 Events
     # seit 2023, unsortiert) würden sonst per Prefix-Slice die AKTUELLEN
     # Dienste verlieren. ≤300 Events (LH/SWISS-Fenster) = unverändert.
@@ -42450,10 +42612,12 @@ def upload_calendar_events(token):
             adapted_ev['_multiday_dates'] = _ics_multiday_dates(adapted_ev)
             adapted.append(adapted_ev)
         # SWISS-Nachbearbeitung (F1/F5) auch im EKEvent-Pfad — no-op für LH.
+        adapted = _normalize_thirdparty_roster_events(adapted)
         adapted = _swissify_roster_events(adapted, token=token)
         # ITA/ER-Duty auch hier (abonnierter iCloud-Kalender via EventKit trägt
         # dieselben Rome-mislabelten Zeiten); Relevanz-Auswahl wie im URL-Pfad.
         adapted = _itaify_roster_events(adapted, token=token)
+        adapted = _generic_layover_synthesis(adapted, token=token)
         adapted = _select_relevant_feed_events(adapted, 200)
         briefings, imported_briefings = _ics_events_to_briefings(
             adapted, existing=existing_briefings)
