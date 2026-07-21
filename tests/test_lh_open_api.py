@@ -153,3 +153,16 @@ def test_merge_empty_lh_is_noop():
     obs = {"sched_dep": "X"}
     assert _merge_lh_into_facts(obs, {}) == obs
     assert _merge_lh_into_facts(obs, None) == obs
+
+
+def test_merge_stale_obs_yields_pure_lh():
+    """Stale (Vortags-)Board wird downstream verworfen — LH ist date-exakt und
+    darf NICHT mitverworfen werden: bei stale-Obs pur LH (ohne stale-Flag)."""
+    from blueprints.aerox_data_blueprint import _merge_lh_into_facts
+    stale_obs = {"sched_dep": "GESTERN", "stale": True, "obs_date": "2026-07-20"}
+    lh = {"sched_dep": "HEUTE-LH", "reg": "D-AIKP", "gate": "C16"}
+    out = _merge_lh_into_facts(stale_obs, lh)
+    assert out == lh                    # pur LH
+    assert "stale" not in out           # kein Verwerfen downstream
+    # ohne LH bleibt die stale-Obs unverändert (altes Verhalten)
+    assert _merge_lh_into_facts(stale_obs, {}) == stale_obs

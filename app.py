@@ -12929,6 +12929,39 @@ def _feed_nightstop_ort(day, homebase=None, next_day=None):
     return fallback
 
 
+def _summary_has_ground_duty(summary_upper):
+    """True wenn ein gemergter myTime-Tages-Summary neben Off-/Frei-Segmenten
+    ein eigenes Boden-DIENST-Segment trägt (Tanja 2026-07-21: „Off Day ·
+    Mandatory Training" — das EM-Training wurde als OFF/frei durchgereicht und
+    war im Kalender unsichtbar). myTime legt an solchen Tagen ZWEI VEVENTs an,
+    der Import merged sie mit „·" in EINEN Summary. Pro Segment: Frei-/Urlaub-/
+    Krank-/Layover-Segmente zählen nicht; Training/Sim/Check/EM/Medical/Pickup/
+    Standby/Office-Prose oder ein getimtes Segment („REC A320 0900 1700") IST
+    Dienst-Beweis. iOS-Spiegel: RosterEventClassifier.hasGroundDutyEvidence."""
+    _offish = ('OFF DAY', 'DAY OFF', 'FREE DAY', 'REST DAY', 'RECOVERY',
+               'ORTSTAG', '(REC)', 'ABSENCE', 'URLAUB', 'VACATION',
+               'KRANK', 'SICK', 'LAYOVER')
+    _duty = ('TRAINING', 'SCHULUNG', 'RECURRENT', 'SIMULATOR', 'BRIEFING',
+             'MEDICAL', 'SEMINAR', 'COURSE', 'CHECK', 'PICKUP', 'PICK UP',
+             'STANDBY', 'STBY', 'RISERVA', 'OFFICE', 'BÜRO', 'BUERO', 'GROUND')
+    _duty_codes = {'EM', 'SIM', 'OPC', 'LPC', 'CBT', 'TRG', 'GST', 'SEP'}
+    for seg in (summary_upper or '').split('·'):
+        s = seg.strip()
+        if not s or s in ('OFF', 'FREI', 'OF', 'X', 'FR', 'FREE', 'REC'):
+            continue
+        if any(t in s for t in _offish):
+            continue
+        if any(t in s for t in _duty):
+            return True
+        tokens = set(re.split(r'[^A-Z0-9ÄÖÜ]+', s))
+        if tokens & _duty_codes:
+            return True
+        # Getimtes Dienst-Segment: zwei Uhrzeiten (HH:MM oder HHMM)
+        if re.search(r'(\d{1,2}:\d{2}|\b\d{4}\b).*(\d{1,2}:\d{2}|\b\d{4}\b)', s):
+            return True
+    return False
+
+
 _FRIEND_ROSTER_MEMO = {}
 _FRIEND_ROSTER_MEMO_LOCK = _req_threading.Lock()
 _FRIEND_ROSTER_MEMO_TTL = 60.0
@@ -13068,7 +13101,14 @@ def get_friend_roster(token, friend_token):
                     continue
                 summ = (row.get('ical_summary') or '')
                 up = summ.upper()
-                klass = 'OFF' if 'OFF DAY' in up else ('Z76' if 'LAYOVER' in up else None)
+                # Tanja-Fix (2026-07-21): „Off Day · Mandatory Training" darf
+                # NICHT als OFF durchgereicht werden — das Off-Segment stempelt
+                # den Tag nur, wenn kein anderes Segment ein eigener Boden-
+                # Dienst ist (sonst klass=None → iOS-Classifier entscheidet
+                # über Marker/Zeiten und zeigt den Dienst 1:1).
+                klass = ('OFF' if ('OFF DAY' in up
+                                   and not _summary_has_ground_duty(up))
+                         else ('Z76' if 'LAYOVER' in up else None))
                 # F6: Routing PRIMÄR aus den Pro-Leg-Sektoren bauen (volle Kette
                 # ZRH-LIS-ZRH). Der LOCATION-Fallback sah bei SWISS nur die
                 # ABFLUG-Airports (LOCATION=Dep-Station je Leg) → verstümmelte
@@ -33402,6 +33442,22 @@ def _leg_tail(flight_no, date=None, dep_iata=None, arr_iata=None):
     frm = (str(dep_iata or '').strip().upper() or None)
     to = (str(arr_iata or '').strip().upper() or None)
     d = (str(date or '')[:10] or None)
+    # LH Open API (Engine A): autoritative, FRISCHE Reg aus erster Hand der
+    # Airline für LH-Group. Überschreibt die Board-Reg — die an Outstations oft
+    # fehlt (kein Abflug-Board geharvestet) oder veraltet ist — und umgeht den
+    # Museums-Scrub unten (die LH-Zuordnung IST die aktuelle Maschine). Nur wenn
+    # LH für genau dieses (Flug,Datum,Route)-Leg eine Reg kennt; sonst normaler
+    # Board-Pfad. Best-effort, wirft nie, no-op ohne Env/Nicht-Group.
+    try:
+        from blueprints.lh_open_api import (lh_flight_facts as _lh_facts,
+                                            is_lh_group as _lh_is_group)
+        if _lh_is_group(op_fn):
+            _lhf = _lh_facts(op_fn, d, frm, to)
+            _lhreg = _lhf.get('reg') if isinstance(_lhf, dict) else None
+            if _lhreg:
+                return _lhreg
+    except Exception:
+        pass
     try:
         m = _flight_obs_merged(op_fn, date=d, dep_iata=frm, arr_iata=to,
                                live=True, free_only=True)

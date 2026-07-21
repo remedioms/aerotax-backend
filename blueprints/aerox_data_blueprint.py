@@ -4233,6 +4233,12 @@ def _merge_lh_into_facts(obs, lh):
     Funktion (trivial testbar)."""
     if not isinstance(lh, dict) or not lh:
         return obs
+    # STALE-BOARD-FIX: ist die Board-Seite eine Vortags-/Fremdtag-Beobachtung
+    # (`stale`), wird sie downstream komplett verworfen — MITSAMT der guten
+    # LH-Daten. LH ist aber date-exakt (flightstatus für genau diesen Tag) →
+    # in dem Fall die stale Obs verwerfen und PUR LH nehmen (kein `stale`).
+    if (obs or {}).get('stale'):
+        return dict(lh)
     out = dict(obs or {})
     for k in _LH_AUTHORITATIVE:
         if lh.get(k) is not None:
