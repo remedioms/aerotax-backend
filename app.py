@@ -16960,11 +16960,21 @@ _feed_refresh_last_attempt = {}
 _feed_refresh_lock = _req_threading.Lock()
 
 
+def _server_ical_refresh_enabled():
+    """KILL-SWITCH (2026-07-21, LH-Calendar-Share-Warnung): steht die Env-Var
+    AEROX_SERVER_ICAL_REFRESH auf '0', hört der SERVER auf, myTime-Links selbst
+    zu ziehen — der Abruf läuft dann ausschließlich über die App auf dem Gerät
+    des Users (echte IP/eigener Share, kein Rechenzentrums-„Bot"-Muster). Kein
+    Redeploy der Logik nötig, nur die Env-Var flippen. Default: an (unverändert)."""
+    return (os.environ.get('AEROX_SERVER_ICAL_REFRESH', '1').strip() != '0')
+
+
 def _maybe_refresh_calendar_feed(token, base_url=None):
     """Stößt (gedrosselt, im Daemon-Thread) einen Re-Import des gespeicherten
-    calendar_feed an, wenn der letzte Import älter als 6 h ist. Wirft nie."""
+    calendar_feed an, wenn der letzte Import älter als 6 h ist. Wirft nie.
+    NO-OP wenn der Server-Refresh-Kill-Switch aus ist (Geräte-Abruf aktiv)."""
     try:
-        if not token:
+        if not token or not _server_ical_refresh_enabled():
             return
         now_ts = time.time()
         with _feed_refresh_lock:
@@ -41242,7 +41252,16 @@ def import_calendar_feed(token):
     # (Parse→Merge→Briefings→Reconcile→Sektoren), nur ohne URL-Fetch. Kein
     # Security-Delta: der User kontrolliert auch jede Feed-URL selbst.
     ics_text_direct = body.get('ics_text') if isinstance(body.get('ics_text'), str) else None
+    # GERÄTE-ABRUF (2026-07-21, LH-Calendar-Share-Warnung von „Alex"): die App
+    # holt die myTime-ICS SELBST vom Telefon des Users (echte Mobilfunk-IP,
+    # eigenes Gerät, eigener Share = reguläre Nutzung) und POSTet Duty- +
+    # Off-Days-Text hier. `ics_text_2` = der zweite Feed als Text (AeroWest/
+    # LEON-Off-Days). Additiv: fehlt er, greift der bestehende url_2/gespeichert-
+    # Fallback unverändert.
+    ics_text_2_direct = body.get('ics_text_2') if isinstance(body.get('ics_text_2'), str) else None
     if ics_text_direct and len(ics_text_direct) > 1_000_000:
+        return jsonify({'ok': False, 'error': 'response_too_large'}), 413
+    if ics_text_2_direct and len(ics_text_2_direct) > 1_000_000:
         return jsonify({'ok': False, 'error': 'response_too_large'}), 413
     url = _normalize_feed_scheme(_sanitize_feed_url(body.get('url') or ''))
     # HTTP raus · nur HTTPS akzeptieren (sonst Klartext-Cookies leakable).
@@ -41266,7 +41285,7 @@ def import_calendar_feed(token):
         if _url_2_raw:
             err_2 = 'bad_url_2'
         url_2 = ''
-    if not url_2 and 'url_2' not in body and not ics_text_direct:
+    if not url_2 and 'url_2' not in body and not ics_text_direct and not ics_text_2_direct:
         try:
             _pf = _profile_load(token) or {}
             for _src in ((_pf.get('profile') or {}), _pf):
@@ -41318,7 +41337,17 @@ def import_calendar_feed(token):
 
     # ── Link 2 (Off-Days) unabhängig holen + parsen ─────────────────────────
     events_2 = []
-    if url_2:
+    if ics_text_2_direct:
+        # Geräte-Abruf: der zweite Feed kommt schon als Text mit (kein Fetch).
+        try:
+            events_2 = _parse_ics_to_events(ics_text_2_direct)
+        except Exception as _exc2:
+            app.logger.warning(f'[ics] parse-fail feed2 (device): {type(_exc2).__name__}: {str(_exc2)[:160]}')
+            err_2 = 'ics_parse_failed_2'
+        if err_1 and err_2:
+            return jsonify({'ok': False, 'error': err_1, 'error_2': err_2,
+                            'detail': 'device_ics_parse'}), 502
+    elif url_2:
         text2, ferr2 = _fetch_calendar_feed_text(url_2)
         if ferr2:
             err_2 = f'{ferr2}_2'
@@ -41487,7 +41516,7 @@ def import_calendar_feed(token):
     # Link liefert keine Einträge …"). Einzel-Link-Responses bleiben
     # byte-identisch (keine neuen Keys). err_2 ohne url_2 = explizit
     # geschickter, aber unbrauchbarer Zweit-Link (bad_url_2).
-    if url_2 or err_2:
+    if url_2 or err_2 or ics_text_2_direct:
         _resp['events_count_1'] = len(events_1)
         _resp['events_count_2'] = len(events_2)
         if err_1:
