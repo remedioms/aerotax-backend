@@ -1330,12 +1330,39 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
             picked = ('flying', idx, CONF_PLAN)
             break
         # Uhr sagt „vorbei" — fliegt sie NACHWEISLICH noch (Delay ohne Obs)?
+        # FRISCHE-GATE (Jennifer JFK→FRA 2026-07-21): „nachweislich" verlangt
+        # einen FRISCHEN Fix. Vorher pinnte auch ein 7,5 h alter Ozean-Fix
+        # (letzter Kontakt vorm Funkloch, on_ground=false) den State ewig auf
+        # „fliegt", obwohl die Soll-Ankunft längst vorbei war — der Store
+        # liefert Last-Known-Positionen mit ECHTEM altem seen_ts absichtlich
+        # weiter. Nach window_end gilt: Position älter als 45 min ⇒ kein
+        # Beweis ⇒ Landung annehmen (Plan-Wahrheit).
         lv = _live(leg)
         if lv:
-            if not lv.get('on_ground'):
+            # Unbekanntes Alter (kein ts / unparsebar) zählt als frisch —
+            # der Prod-Store liefert IMMER seen_ts; das hält den Vertrag
+            # „airborne schlägt die Uhr" für ts-lose Test-/Alt-Quellen.
+            _fresh = True
+            _ts = lv.get('ts')
+            if _ts is not None:
+                _ep = None
+                try:
+                    _ep = float(_ts)
+                except (TypeError, ValueError):
+                    try:
+                        _d = _dt.datetime.fromisoformat(
+                            str(_ts).replace('Z', '+00:00'))
+                        if _d.tzinfo is None:
+                            _d = _d.replace(tzinfo=_dt.timezone.utc)
+                        _ep = _d.timestamp()
+                    except Exception:
+                        _ep = None
+                if _ep is not None:
+                    _fresh = (now.timestamp() - _ep) <= 45 * 60
+            if not lv.get('on_ground') and _fresh:
                 picked = ('flying', idx, CONF_OBSERVED)
                 break
-            if lv.get('near_dep'):
+            if lv.get('near_dep') and _fresh:
                 picked = ('waiting', idx, CONF_OBSERVED)
                 break
         leg['flown'] = True

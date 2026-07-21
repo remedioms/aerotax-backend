@@ -210,7 +210,10 @@ def test_airborne_beweis_schlaegt_uhr_nach_plan_ankunft():
     # 16:05 > Plan-Ankunft 15:20 + 40-min-Puffer → Uhr sagt „geflogen"; der
     # GRATIS-Store beweist: die Maschine fliegt NOCH → flying (kein Teleport).
     obs = {'LH1139': {'status': 'Gelandet'}, 'LH802': {'status': 'landed'}}
-    live = {'LH803': {'lat': 57.1, 'lon': 15.2, 'ts': 1783000000.0,
+    # ts FRISCH (4 min alt) — seit dem Frische-Gate (Jennifer 2026-07-21)
+    # beweist nur ein frischer Airborne-Fix weiteres Fliegen; das alte,
+    # zufällig wochenalte Hardcode-ts widersprach der Test-Intention.
+    live = {'LH803': {'lat': 57.1, 'lon': 15.2, 'ts': _utc(16, 1).timestamp(),
                       'source': 'aircraft_live', 'on_ground': False,
                       'near_dep': False, 'near_arr': False}}
     r = _resolve(_utc(16, 5), obs=obs, live=live)
@@ -1595,3 +1598,37 @@ def test_gleicher_tag_landung_bleibt_gueltig():
     # Gelandet am Tagesziel BCN (≠ hb) → Layover/Landed Barcelona, NICHT verworfen.
     assert r['state'] in (STATE_LANDED, STATE_LAYOVER), r
     assert 'Barcelona' in (r['text'].get('title') or ''), r
+
+
+# ── Frische-Gate nach Plan-Ankunft (Jennifer JFK→FRA, 2026-07-21) ────────────
+# Nach window_end „beweist" nur ein FRISCHER Airborne-Fix weiteres Fliegen.
+# Ein 7,5 h alter Ozean-Fix (letzter Kontakt vorm Funkloch, on_ground=false)
+# darf den State nicht ewig auf „fliegt" pinnen — Landung annehmen.
+
+_JFK_SECTORS = [
+    {'flight': 'LH401', 'from': 'JFK', 'to': 'FRA',
+     'dep_iso': '2026-07-08T22:05:00Z', 'arr_iso': '2026-07-09T03:37:00Z'},
+]
+
+
+def test_stale_airborne_fix_nach_ankunft_gilt_als_gelandet():
+    # 06:18 UTC — Soll-Ankunft 03:37 + Puffer längst vorbei; letzter Fix 22:44 (alt).
+    stale_ts = _utc(22, 44, day=8).timestamp()
+    r = _resolve(_utc(6, 18), sectors=_JFK_SECTORS,
+                 live={'LH401': {'on_ground': False, 'ts': stale_ts}})
+    assert r['state'] != STATE_FLYING, r
+
+
+def test_frischer_airborne_fix_nach_ankunft_bleibt_fliegend():
+    # Delay-Fall: Fix 4 min alt, airborne → weiter „fliegt" (beide Richtungen).
+    fresh_ts = _utc(4, 10).timestamp()
+    r = _resolve(_utc(4, 14), sectors=_JFK_SECTORS,
+                 live={'LH401': {'on_ground': False, 'ts': fresh_ts}})
+    assert r['state'] == STATE_FLYING, r
+
+
+def test_ts_loser_airborne_fix_behaelt_alten_vertrag():
+    # ts-lose Quelle (Alt-/Test-Lookup): airborne schlägt weiterhin die Uhr.
+    r = _resolve(_utc(4, 30), sectors=_JFK_SECTORS,
+                 live={'LH401': {'on_ground': False}})
+    assert r['state'] == STATE_FLYING, r
