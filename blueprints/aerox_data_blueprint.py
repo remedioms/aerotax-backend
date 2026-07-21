@@ -4213,6 +4213,30 @@ def _apply_paid_arrival_escalation(payload, flight_no, date, dep, dest, pos,
         return False
 
 
+# LH gewinnt bei Plan-/Identitäts-Feldern (die die Airline selbst am besten
+# kennt); Board-Live-Felder bleiben Board, LH füllt dort nur Lücken.
+_LH_AUTHORITATIVE = ('sched_dep', 'sched_arr', 'gate', 'terminal',
+                     'arr_gate', 'arr_terminal', 'reg', 'type')
+_LH_FILL_ONLY = ('est_dep', 'est_arr', 'dep_delay_min', 'arr_delay_min',
+                 'dep_status', 'arr_status', 'cancelled', 'dep_iata', 'arr_iata')
+
+
+def _merge_lh_into_facts(obs, lh):
+    """Board-Fakten + autoritative LH-Fakten → gemergtes Fakten-Dict.
+    LH überschreibt Plan-/Identitäts-Felder; Board-Ist-/Live-Felder bleiben,
+    LH füllt dort nur Lücken. Reine Funktion (trivial testbar)."""
+    if not isinstance(lh, dict) or not lh:
+        return obs
+    out = dict(obs or {})
+    for k in _LH_AUTHORITATIVE:
+        if lh.get(k) is not None:
+            out[k] = lh[k]
+    for k in _LH_FILL_ONLY:
+        if out.get(k) is None and lh.get(k) is not None:
+            out[k] = lh[k]
+    return out
+
+
 def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     """Board-Fakten EINES Flugs (memoisiert). Kurzes prozessweites Cache über
     (flight,date,dep,arr) — der Detail-Aggregat-Kaltstart ruft dieselbe (fn,date)-
@@ -4241,6 +4265,20 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
                                             dep_iata=dep_iata, arr_iata=arr_iata)
     if not isinstance(facts, dict):
         return facts
+    # ── LH Open API (Engine A, free-first): für LH-Group-Flüge die autoritativen
+    # Fakten aus erster Hand der Airline drüberlegen. LH gewinnt bei Plan-/
+    # Identitäts-Feldern (Soll-Zeiten, Gate, Terminal, Reg, Typ); das Live-Board
+    # bleibt Herr über Ist-/Delay-/Status-Felder (kontinuierlich gepollt) und LH
+    # füllt dort nur Lücken. No-op wenn nicht konfiguriert / kein Group-Flug →
+    # bestehendes Verhalten byte-identisch. Best-effort, wirft nie.
+    try:
+        from blueprints.lh_open_api import lh_flight_facts, is_lh_group
+        if is_lh_group(fn):
+            _lh = lh_flight_facts(fn, d, dep, arr)
+            if _lh:
+                facts = _merge_lh_into_facts(facts, _lh)
+    except Exception:
+        pass
     try:
         with _OBS_FACTS_LOCK:
             _OBS_FACTS_MEMO[key] = (now, dict(facts))

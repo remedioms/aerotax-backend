@@ -108,6 +108,7 @@ for _bp_path, _bp_name in [
     ('blueprints.flight_profile_blueprint',  'flight_profile_bp'),  # selbst-bauende Flug-DB + Crew-Ebene
     ('blueprints.aerox_data_blueprint',      'aerox_data_bp'),  # self-hosted Luftfahrt-DB (/api/ax/*)
     ('blueprints.legal_consent_blueprint',   'legal_consent_bp'),  # versioniertes accountgebundenes Consent-Ledger
+    ('blueprints.lh_open_api',               'lh_open_bp'),  # LH Open API — autoritative Flug-Fakten (free-first, Engine A)
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
