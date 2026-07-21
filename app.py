@@ -27408,6 +27408,37 @@ def auth_reset():
     return jsonify({'ok': True})
 
 
+@app.route('/api/auth/set-password', methods=['POST'])
+def auth_set_password():
+    """Passwort für ein Sign-in-with-Apple-Konto festlegen (Christoph Ernst,
+    Support 2026-07-21: „von Apple anmelden auf Passwort umstellen") — danach
+    funktioniert zusätzlich der E-Mail+Passwort-Login (die Apple-Anmeldung
+    bleibt parallel gültig). Body: {token, password[, old_password]}.
+    Hat das Konto schon ein Passwort, ist `old_password` Pflicht (kein stiller
+    Passwort-Tausch über einen geleakten Token)."""
+    body = request.get_json(silent=True) or {}
+    token = (body.get('token') or '').strip()
+    new_pw = body.get('password') or ''
+    if not token:
+        return jsonify({'ok': False, 'error': 'auth_required'}), 400
+    if len(new_pw) < 8:
+        return jsonify({'ok': False, 'error': 'password_too_short'}), 400
+    email, user = _auth_find_user_by('token', token)
+    if not user or not email:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 401
+    if user.get('password_hash'):
+        ok, _ = _password_verify(body.get('old_password') or '',
+                                 user.get('password_hash', ''))
+        if not ok:
+            return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
+    user['password_hash'] = _password_hash(new_pw)
+    _auth_upsert_user(email, user)
+    app.logger.info(f'[auth-setpw] Passwort gesetzt für {email[:3]}***')
+    # E-Mail zurückgeben — bei Apple-Konten oft die Private-Relay-Adresse;
+    # die UI zeigt sie an, damit klar ist, WOMIT man sich künftig anmeldet.
+    return jsonify({'ok': True, 'email': email})
+
+
 @app.route('/api/auth/delete-account', methods=['POST'])
 def auth_delete_account():
     """DSGVO Art. 17 · Apple Guideline 5.1.1(v) — kompletter Account-Wipe.
