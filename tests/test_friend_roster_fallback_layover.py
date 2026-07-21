@@ -32,6 +32,9 @@ def _iso(d, hhmm):
 def _drive(monkeypatch, briefs):
     """Ruft /api/user/friend-roster über den Fallback-Pfad (kein Snapshot) auf."""
     me_tok, friend_tok = 'me_tok', 'friend_tok'
+    # 60s-Endpoint-Memo leeren (kam 2026-07-20 dazu): sonst serviert jeder
+    # Folge-Test die gecachte Antwort des ersten (gleiche Token-Kombination).
+    A._FRIEND_ROSTER_MEMO.clear()
     monkeypatch.setattr(A, '_friends_load', lambda t: {'friends': [friend_tok]})
     monkeypatch.setattr(A, '_maybe_refresh_calendar_feed', lambda *a, **k: None)
     # Kein in-memory Snapshot, kein persistenter Snapshot → Fallback greift.
