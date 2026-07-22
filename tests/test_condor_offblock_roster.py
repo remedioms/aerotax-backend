@@ -102,13 +102,21 @@ def test_generic_synthesis_skips_lh_and_edelweiss():
     ]
     n_before = len(lh)
     assert len(backend._generic_layover_synthesis(lh)) == n_before
-    # Edelweiss-Outlook: „LAY"-Signal → eigener (verifizierter) Pfad, no-op.
+    # Edelweiss-Outlook (GEÄNDERT 2026-07-23, Yanic „PUJ Ende Juli fehlt"):
+    # „LAY" trägt NIE eine LOCATION → die Synthese läuft jetzt AUCH für
+    # Edelweiss und erzeugt das LH-Form-LAYOVER mit Ort aus den umgebenden
+    # WK-Legs (Multi-Leg-Endpunkte: der Dreiecks-Duty startet in SJO und
+    # endet ZRH → Layover-Ort = SJO, nicht LIR).
     wk = [
         _ev('CC9 (WK36 ZRH-SJO)', '2026-06-19T06:40:00Z', '2026-06-19T18:20:00Z'),
         _ev('LAY', '2026-06-19T22:26:00Z', '2026-06-21T18:00:00Z'),
         _ev('CC9 (WK38 SJO-LIR) | CC9 (WK38 LIR-ZRH)', '2026-06-21T19:20:00Z', '2026-06-22T07:40:00Z'),
     ]
-    assert len(backend._generic_layover_synthesis(wk)) == 3
+    out = backend._generic_layover_synthesis(wk)
+    lays = [e for e in out if e.get('summary') == 'LAYOVER']
+    assert len(lays) == 1 and lays[0]['location'] == 'SJO'
+    # Die LAY-Events selbst bleiben unangetastet stehen (iOS-Klassifikation).
+    assert any(e.get('summary') == 'LAY' for e in out)
 
 
 def test_pdf_import_protected_from_ek_reconcile(monkeypatch, tmp_path):

@@ -41773,6 +41773,107 @@ def _ics_multi_leg_bounds(start_iso, end_iso, n):
     return out
 
 
+# ── Edelweiss (WK) Duty-Fenster → echte Flugzeiten (Yanic 2026-07-23) ────────
+# Der Edelweiss-Outlook-Feed schreibt pro Dienst EIN VEVENT mit DTSTART =
+# REPORT-/Briefing-Zeit und DTEND = DIENST-ENDE — NICHT Abflug/Ankunft. Die
+# Pipeline nahm die Duty-Spanne 1:1 als Flugzeit: Briefing 45 min VOR dem
+# Report (doppelt falsch), Legs ohne Bodenzeit aneinandergeklebt, OUT-Flüge
+# 12 h „lang" (Yanic-Punkte 1/3/4). Offsets laut Yanic (Edelweiss-CCM) und
+# verifiziert gegen den echten Feed ↔ publizierte WK-Slots (WK4 ZRH-TPA:
+# Duty 09:40Z…22:00Z ↔ realer Abflug ~11:10Z, Ankunft ~21:30Z):
+#   Kurzstrecke (A320):            Abflug = Report + 1 h
+#   Langstrecke (A340/A350):       Abflug = Report + 1 h 30
+#   Dienst-Ende                    = letzte Ankunft + 30 min
+#   Bodenzeit zwischen Legs        ≈ 45 min (Yanic: „meistens 45/50 Minuten")
+# Kurz/Lang ohne Koordinaten über die airport_tz-Geographie: Europa + Mittel-
+# meerraum/Kanaren = A320-Radius; alles andere (Karibik/USA/Kanada/Malediven/
+# Grönland/Ostafrika) = Langstrecke. Grenzfall „A340/350 auf Kurzstrecke"
+# (1 h 30 Briefing) ist ohne Flottendaten nicht erkennbar → bewusst 1 h.
+_WK_REPORT_SHORT_MIN = 60
+_WK_REPORT_LONG_MIN = 90
+_WK_DUTY_END_MIN = 30
+_WK_GROUND_MIN = 45
+_WK_SHORT_HAUL_EXTRA_TZS = frozenset((
+    'Atlantic/Canary', 'Atlantic/Madeira', 'Atlantic/Reykjavik',
+    'Africa/Cairo', 'Africa/Casablanca', 'Africa/Tunis', 'Africa/Algiers',
+    'Africa/Tripoli', 'Asia/Nicosia', 'Asia/Famagusta', 'Asia/Beirut',
+    'Asia/Amman', 'Asia/Jerusalem', 'Asia/Tel_Aviv', 'Asia/Istanbul',
+    'Asia/Yerevan', 'Asia/Tbilisi', 'Asia/Baku',
+))
+_WK_DUTY_RE = re.compile(r'^[A-Z]{1,3}\d{0,2}\s*\(WK\s?\d')
+
+
+def _wk_station_is_short_haul(iata):
+    """A320-Radius per Zeitzonen-Geographie (True/False/None=unbekannt)."""
+    tz = airport_tz((iata or '').strip().upper())
+    if not tz:
+        return None
+    if tz.startswith('Europe/') or tz in _WK_SHORT_HAUL_EXTRA_TZS:
+        return True
+    return False
+
+
+def _edelweissify_roster_events(events, token=None):
+    """Stempelt Edelweiss-Duty-Events mit echten Pro-Leg-Zeiten.
+
+    Gate pro Event: SUMMARY im Outlook-Duty-Format „CC8 (WK34 ZRH-PUJ)…" —
+    LH-myTime („WK 123: ZRH - X" als Prosa-Leg mit ECHTEN Flugzeiten) matcht
+    das anker-strikte Muster nie. Ergebnis liegt als `_wk_leg_times`
+    [(dep_iso, arr_iso), …] + `_wk_block_minutes` am Event; die Konsumenten
+    (_build_ical_sectors, Legs-/Block-Aufbau in _ics_events_to_briefings)
+    bevorzugen die Stempel vor der Gleichverteilungs-Interpolation.
+    DTSTART/DTEND bleiben unangetastet (DTSTART = Report ist die korrekte
+    ical_start_iso/Briefing-Anzeige). Wirft nie; Fremd-Feeds byte-identisch."""
+    try:
+        for ev in (events or []):
+            summ = (ev.get('summary') or '').strip()
+            if not _WK_DUTY_RE.match(summ.upper()):
+                continue
+            legs = _ics_parse_multi_leg_summary(summ)
+            if not legs or not all((f or '').startswith('WK') for f, _, _ in legs):
+                continue
+            try:
+                s = datetime.fromisoformat(
+                    (ev.get('start_iso') or '').replace('Z', '+00:00'))
+                e = datetime.fromisoformat(
+                    (ev.get('end_iso') or '').replace('Z', '+00:00'))
+            except Exception:
+                continue
+            # Langstrecke, sobald EIN Leg-Endpunkt außerhalb des A320-Radius
+            # liegt; unbekannte Stationen entscheiden nicht (None ≠ False).
+            long_haul = any(
+                _wk_station_is_short_haul(st) is False
+                for _f, frm, to in legs for st in (frm, to))
+            rep_min = _WK_REPORT_LONG_MIN if long_haul else _WK_REPORT_SHORT_MIN
+            n = len(legs)
+            dep1 = s + timedelta(minutes=rep_min)
+            arrN = e - timedelta(minutes=_WK_DUTY_END_MIN)
+            flight_total = (arrN - dep1).total_seconds() / 60.0 \
+                - _WK_GROUND_MIN * (n - 1)
+            # Plausi-Gate: pro Leg müssen ≥ 25 min Flugzeit übrig bleiben,
+            # sonst ist das Fenster kein normaler Duty (z. B. verkürzte
+            # Sonder-Events) → Alt-Verhalten unangetastet lassen.
+            if flight_total < 25 * n:
+                continue
+            per_leg = flight_total / n
+            bounds = []
+            cur = dep1
+            for _i in range(n):
+                leg_end = cur + timedelta(minutes=per_leg)
+                bounds.append((cur.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                               leg_end.strftime('%Y-%m-%dT%H:%M:%SZ')))
+                cur = leg_end + timedelta(minutes=_WK_GROUND_MIN)
+            ev['_wk_leg_times'] = bounds
+            ev['_wk_block_minutes'] = int(flight_total)
+    except Exception as e:
+        try:
+            app.logger.warning(
+                f'[ics-wk] edelweissify-fail: {type(e).__name__}: {str(e)[:120]}')
+        except Exception:
+            pass
+    return events
+
+
 def _ics_parse_flight_leg_summary(summary):
     """Parst eine Flug-Leg-SUMMARY → (flight, from_iata, to_iata) oder Nones.
 
@@ -42160,21 +42261,41 @@ def _normalize_thirdparty_roster_events(events):
 
 def _generic_layover_synthesis(events, token=None):
     """Layover-Synthese für Feeds OHNE eigene LAYOVER-Events (Condor/cube,
-    offblock, …): aufeinanderfolgende Flug-Legs a→b mit a.to == b.from ≠
-    Homebase und 6–96 h Bodenzeit ⇒ synthetisches LAYOVER-Event (LH-Form).
-    Läuft NACH _swissify/_itaify — SWISS/ITA haben dann schon LAYOVER-Events
-    (Gate greift), LH sowieso (myTime liefert echte). Edelweiss-Outlook wird
-    über sein „LAY"-Signal ausgenommen (eigene, verifizierte iOS-Absorption —
-    hier nichts doppeln). Wirft nie."""
+    offblock, Edelweiss-Outlook, …): aufeinanderfolgende Flug-Legs a→b mit
+    a.to == b.from ≠ Homebase und 6–96 h Bodenzeit ⇒ synthetisches
+    LAYOVER-Event (LH-Form). Läuft NACH _swissify/_itaify — SWISS/ITA haben
+    dann schon LAYOVER-Events (Gate greift), LH sowieso (myTime liefert echte).
+
+    Edelweiss-Outlook (Yanic 2026-07-23): war früher über sein „LAY"-Signal
+    KOMPLETT ausgenommen — aber die LAY-Events sind teils ganztägig
+    (VALUE=DATE) und tragen NIE eine LOCATION, d.h. ical_layover_ort blieb
+    leer: der PUJ-Layover Ende Juli zeigte weder Ort im Kalender noch floss
+    er in die Spesen (All-Inclusive-Regel PUJ/POP) ein, und über die Monats-
+    grenze (Rückflug 1.8.) riss die Tour ab. Jetzt: LAY-Events bleiben
+    stehen (iOS-Klassifikation), zusätzlich synthetisieren wir LH-Form-
+    LAYOVER mit LOCATION aus den umgebenden WK-Legs; Grenzen bevorzugt aus
+    dem _edelweissify-Stempel (echte Ankunft → nächster Report). Obergrenze
+    für Edelweiss 120 h statt 96 h (All-Inclusive-Layover PUJ = 4 Nächte).
+    Wirft nie."""
     try:
         legs = []
+        saw_wk_lay = False
         for ev in (events or []):
             summ = (ev.get('summary') or '')
             up = summ.upper().strip()
             if 'LAYOVER' in up:
                 return events          # Feed hat echte/synthetisierte Layover
             if up == 'LAY':
-                return events          # Edelweiss-Outlook: eigener Pfad
+                saw_wk_lay = True      # Edelweiss-Outlook: LAY ohne Ort
+                continue
+            # Multi-Leg-Duty (Edelweiss): Endpunkte des GANZEN Duty-Blocks
+            # (erste Abflug- / letzte Ankunfts-Station) — der Ein-Leg-Parser
+            # sähe nur das erste Leg und ein Dreiecks-Dienst endete scheinbar
+            # an der Zwischenstation.
+            _ml = _ics_parse_multi_leg_summary(summ)
+            if len(_ml) >= 2 and _ev_is_flight_leg(summ):
+                legs.append((ev, _ml[0][1], _ml[-1][2]))
+                continue
             flt, frm, to = _ics_parse_flight_leg_summary(summ)
             if frm and to and _ev_is_flight_leg(summ):
                 legs.append((ev, frm, to))
@@ -42193,14 +42314,22 @@ def _generic_layover_synthesis(events, token=None):
             hb = _Ctr(deps).most_common(1)[0][0] if deps else ''
         ordered = sorted(legs, key=lambda l: l[0].get('start_iso') or '')
         synth = []
+        _max_gap_min = (120 if saw_wk_lay else 96) * 60
         for a, b in zip(ordered, ordered[1:]):
             a_to, b_frm = a[2], b[1]
             if not a_to or a_to != b_frm or a_to == hb:
                 continue
-            a_end = (a[0].get('end_iso') or '').strip()
-            b_start = (b[0].get('start_iso') or '').strip()
+            # Edelweiss-Stempel: echte letzte Ankunft / erster Abflug des
+            # Folge-Duty statt Duty-Ende/Report (macht die Layover-Spanne
+            # zur ehrlichen Boden-Zeit — Yanic-Punkt 4 „Layover verkürzt").
+            _a_wk = a[0].get('_wk_leg_times')
+            _b_wk = b[0].get('_wk_leg_times')
+            a_end = ((_a_wk[-1][1] if _a_wk else '')
+                     or (a[0].get('end_iso') or '')).strip()
+            b_start = ((_b_wk[0][0] if _b_wk else '')
+                       or (b[0].get('start_iso') or '')).strip()
             gap_min = _iso_minutes_between(a_end, b_start)
-            if gap_min is None or not (6 * 60 <= gap_min <= 96 * 60):
+            if gap_min is None or not (6 * 60 <= gap_min <= _max_gap_min):
                 continue
             lay = {
                 'summary': 'LAYOVER', 'location': a_to,
@@ -42650,16 +42779,24 @@ def _ics_events_to_briefings(events, existing=None):
                     block_reset_dates.add(date_str)
                 block_min = int(existing_b.get('block_minutes') or 0)
                 if _ev_is_flight_leg(day_summary) and start_iso and end_iso:
-                    dur = _iso_minutes_between(start_iso, end_iso)
-                    if dur and 0 < dur < 24 * 60:
-                        # MULTI-LEG-DUTY (Edelweiss): die Spanne enthält die
-                        # Bodenzeit der Zwischenstopps — pro Stopp ~40 min
-                        # abziehen, sonst zählt ein ZRH-SMI-ZRH-Tagesumlauf
-                        # die Turnaround-Zeit als Block (Yanic: Spesen/EASA).
-                        _n_legs = len(_ics_parse_multi_leg_summary(summary))
-                        if _n_legs >= 2:
-                            dur = max(30, dur - 40 * (_n_legs - 1))
-                        block_min += dur
+                    # Edelweiss-Duty mit _edelweissify-Stempel: Block = echte
+                    # Flugzeit-Summe (Duty-Fenster minus Report-/Boden-/
+                    # Duty-Ende-Offsets) statt der Offset-Heuristik unten.
+                    _wk_blk = ev.get('_wk_block_minutes')
+                    if _wk_blk and 0 < int(_wk_blk) < 24 * 60:
+                        block_min += int(_wk_blk)
+                    else:
+                        dur = _iso_minutes_between(start_iso, end_iso)
+                        if dur and 0 < dur < 24 * 60:
+                            # MULTI-LEG-DUTY (Edelweiss ohne Stempel): die
+                            # Spanne enthält die Bodenzeit der Zwischenstopps —
+                            # pro Stopp ~40 min abziehen, sonst zählt ein
+                            # ZRH-SMI-ZRH-Tagesumlauf die Turnaround-Zeit als
+                            # Block (Yanic: Spesen/EASA).
+                            _n_legs = len(_ics_parse_multi_leg_summary(summary))
+                            if _n_legs >= 2:
+                                dur = max(30, dur - 40 * (_n_legs - 1))
+                            block_min += dur
                 existing_b['block_minutes'] = block_min
                 # ── Strukturierte Per-Leg-Liste (additiv) ───────────────────
                 # Jedes Flug-Leg-VEVENT wird als {from,to,flight,dep,arr} in
@@ -42672,12 +42809,17 @@ def _ics_events_to_briefings(events, existing=None):
                 if date_str in block_reset_dates and 'legs' not in existing_b:
                     existing_b['legs'] = []
                 if _ev_is_flight_leg(day_summary):
-                    # MULTI-LEG-DUTY (Edelweiss): alle Legs des Events, Zeiten
-                    # über die Spanne interpoliert (Rand-Zeiten echt). Ein-Leg
-                    # bleibt der bisherige Pfad (echte DTSTART/DTEND-Zeiten).
+                    # MULTI-LEG-DUTY (Edelweiss): alle Legs des Events. Zeiten
+                    # bevorzugt aus dem _edelweissify-Stempel (echte Flug-
+                    # zeiten via Report-/Boden-/Duty-Ende-Offsets); Fallback
+                    # Gleichverteilungs-Interpolation. Ein-Leg ohne Stempel
+                    # bleibt der bisherige Pfad (DTSTART/DTEND).
                     _parsed = _ics_parse_multi_leg_summary(summary)
+                    _wkb = ev.get('_wk_leg_times')
+                    if _wkb and len(_wkb) != len(_parsed):
+                        _wkb = None
                     if len(_parsed) >= 2:
-                        _bounds = _ics_multi_leg_bounds(
+                        _bounds = _wkb or _ics_multi_leg_bounds(
                             start_iso, end_iso, len(_parsed))
                         _leg_items = [
                             (f or '', frm2, to2,
@@ -42690,7 +42832,9 @@ def _ics_events_to_briefings(events, existing=None):
                         # wo der Alt-Parser 'CC8 (WK36' lieferte; LH/SWISS
                         # laufen intern durch den Alt-Parser → unverändert.
                         _f1, _frm1, _to1 = _parsed[0]
-                        _leg_items = [(_f1 or '', _frm1, _to1, start_iso, end_iso)]
+                        _leg_items = [(_f1 or '', _frm1, _to1,
+                                       (_wkb[0][0] if _wkb else start_iso),
+                                       (_wkb[0][1] if _wkb else end_iso))]
                     else:
                         _flt, _frm, _to = _ics_parse_flight_leg_summary(summary)
                         _leg_items = ([(_flt or '', _frm, _to, start_iso, end_iso)]
@@ -42793,13 +42937,19 @@ def _build_ical_sectors(events):
         if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
             continue
         # MULTI-LEG-DUTY (Edelweiss-Outlook, Yanic 2026-07-18): ALLE pipe-
-        # getrennten Legs des Events als eigene Sektoren, Zeiten über die
-        # Duty-Spanne interpoliert (erster Abflug/letzte Ankunft = echt).
-        # Greift NUR bei ≥2 erkannten Legs — Ein-Leg-Pfad bleibt byte-identisch.
+        # getrennten Legs des Events als eigene Sektoren. Zeiten bevorzugt aus
+        # dem _edelweissify-Stempel (Report-/Boden-/Duty-Ende-Offsets = echte
+        # Flugzeiten, Yanic 2026-07-23); Fallback Gleichverteilungs-
+        # Interpolation. Greift auch bei EINEM gestempelten Leg (der alte
+        # Ein-Leg-Pfad nähme sonst Report→Duty-Ende als Flugzeit).
         _mlegs = _ics_parse_multi_leg_summary(ev.get('summary') or '')
-        if len(_mlegs) >= 2:
-            _bounds = _ics_multi_leg_bounds(ev.get('start_iso'),
-                                            ev.get('end_iso'), len(_mlegs))
+        _wk_bounds = ev.get('_wk_leg_times')
+        if _wk_bounds and len(_wk_bounds) != len(_mlegs):
+            _wk_bounds = None
+        if len(_mlegs) >= 2 or (_mlegs and _wk_bounds):
+            _bounds = _wk_bounds or _ics_multi_leg_bounds(ev.get('start_iso'),
+                                                          ev.get('end_iso'),
+                                                          len(_mlegs))
             for _i, (_mf, _mfrm, _mto) in enumerate(_mlegs):
                 _dep, _arr = (_bounds[_i] if _bounds
                               else (ev.get('start_iso') or '',
@@ -43303,8 +43453,11 @@ def import_calendar_feed(token):
     # ITA/ER-Duty-Nachbearbeitung (I1 Stations-Zeit-Fix + I2-I6) — no-op für
     # alle anderen Feeds; wirft nie.
     events = _itaify_roster_events(events, token=token)
-    # Layover-Synthese für Feeds ohne LAYOVER-Events (Condor/offblock, no-op
-    # für LH/SWISS/ITA/Edelweiss — siehe Gates im Helper).
+    # Edelweiss-Outlook: Duty-Fenster (Report→Dienst-Ende) → echte Flug-
+    # zeiten stempeln — no-op für alle anderen Feeds; wirft nie.
+    events = _edelweissify_roster_events(events, token=token)
+    # Layover-Synthese für Feeds ohne LAYOVER-Events (Condor/offblock/
+    # Edelweiss, no-op für LH/SWISS/ITA — siehe Gates im Helper).
     events = _generic_layover_synthesis(events, token=token)
     # Relevanz-Auswahl VOR den Caps: Jahre-lange iCloud-Feeds (ITA: 1385 Events
     # seit 2023, unsortiert) würden sonst per Prefix-Slice die AKTUELLEN
@@ -44041,6 +44194,7 @@ def upload_calendar_events(token):
         # ITA/ER-Duty auch hier (abonnierter iCloud-Kalender via EventKit trägt
         # dieselben Rome-mislabelten Zeiten); Relevanz-Auswahl wie im URL-Pfad.
         adapted = _itaify_roster_events(adapted, token=token)
+        adapted = _edelweissify_roster_events(adapted, token=token)
         adapted = _generic_layover_synthesis(adapted, token=token)
         adapted = _select_relevant_feed_events(adapted, 200)
         briefings, imported_briefings = _ics_events_to_briefings(
