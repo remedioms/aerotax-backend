@@ -506,6 +506,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/logbook-html/',
     '/api/user/logbook-pdf/',
     '/api/user/logbook/',   # Cockpit-Flugbuch (Roster-Aggregat = PII)
+    '/api/user/crewlog/',   # Crew-Logbuch (privat, PII)
     '/api/user/calendar-pdf/',
     '/api/user/ical/',
     '/api/user/stats/',
@@ -10248,6 +10249,21 @@ def put_user_profile(token):
     for k in safe_keys:
         if k in body and body.get(k):
             profile[k] = body.get(k)
+    # Handynummer (Owner 22.07., Kontakte-Matching): NIE roh speichern — nur
+    # SHA-256-Hashes (volle Ziffernfolge + letzte 9 Ziffern, überlebt +49/0-
+    # Formatierung; gleiche Ableitung wie der iOS-Adressbuch-Scan). Leerer
+    # String = Nummer entfernen. Landet via metadata-Merge in
+    # user_profiles.metadata.phone_hashes.
+    if 'phone' in body:
+        _raw_phone = str(body.get('phone') or '')
+        _digits = ''.join(ch for ch in _raw_phone if ch.isdigit())
+        if not _digits:
+            profile['phone_hashes'] = []
+        elif len(_digits) >= 7:
+            import hashlib as _hl_ph
+            profile['phone_hashes'] = sorted({
+                _hl_ph.sha256(_digits.encode()).hexdigest(),
+                _hl_ph.sha256(_digits[-9:].encode()).hexdigest()})
     # account_type: 'crew' | 'family' — validate strikt, sonst 400.
     if 'account_type' in body:
         at = body.get('account_type')
@@ -10704,16 +10720,19 @@ def _contacts_match_auth_rows():
 
 
 def _contacts_match_profile_rows():
-    """[(token, name)] aller Profile — SB primary (paginiert), Disk-Fallback."""
+    """[(token, name, phone_hashes)] aller Profile — SB primary (paginiert),
+    Disk-Fallback. phone_hashes aus metadata (SB) bzw. Profil-Dict (Disk)."""
     rows = []
     if SB_AVAILABLE and sb is not None:
         try:
             offset, page = 0, 1000
             while offset < 20000:
-                r = (sb.table('user_profiles').select('token,name')
+                r = (sb.table('user_profiles').select('token,name,metadata')
                      .range(offset, offset + page - 1).execute())
                 chunk = r.data or []
-                rows.extend((row.get('token'), row.get('name'))
+                rows.extend((row.get('token'), row.get('name'),
+                             ((row.get('metadata') or {})
+                              .get('phone_hashes') or []))
                             for row in chunk)
                 if len(chunk) < page:
                     break
@@ -10733,7 +10752,8 @@ def _contacts_match_profile_rows():
             except Exception:
                 continue
             pr = data.get('profile') or {}
-            rows.append((data.get('token'), pr.get('name')))
+            rows.append((data.get('token'), pr.get('name'),
+                         pr.get('phone_hashes') or []))
     except FileNotFoundError:
         pass
     return rows
@@ -10763,24 +10783,57 @@ def user_contacts_match():
         h = str(h or '').strip().lower()
         if _CONTACTS_HASH_RE.match(h):
             hashes.add(h)
+    phone_hashes = set()
+    for h in (data.get('phone_hashes') or [])[:2000]:
+        h = str(h or '').strip().lower()
+        if _CONTACTS_HASH_RE.match(h):
+            phone_hashes.add(h)
     contact_sets = []
     for n in (data.get('names') or [])[:500]:
         toks = _contacts_name_tokens(n)
         if toks:
             contact_sets.append(set(toks))
-    if not hashes and not contact_sets:
+    if not hashes and not contact_sets and not phone_hashes:
         return jsonify({'ok': True, 'count': 0, 'users': [],
-                        'checked': {'names': 0, 'email_hashes': 0}})
+                        'checked': {'names': 0, 'email_hashes': 0,
+                                    'phone_hashes': 0}})
 
-    matched = {}   # token -> 'email' | 'name' (email gewinnt als stärkere Basis)
+    matched = {}   # token -> 'email'|'phone'|'name' (starke Basen zuerst)
+    auth_rows = _contacts_match_auth_rows()
     if hashes:
-        for em, tok in _contacts_match_auth_rows():
+        for em, tok in auth_rows:
             if tok and em and _contacts_email_hash(em) in hashes:
                 matched[tok] = 'email'
+    # E-Mail-LOCALPART ↔ Kontakt-NAME (Owner 22.07. „so viel wie möglich
+    # matchen mit der Info, die wir haben"): viele Accounts registrieren
+    # vorname.nachname@… — der Localpart trägt den Namen der Kontaktkarte,
+    # auch wenn die ADRESSE selbst nicht im Adressbuch steht (Apple-Relay,
+    # Zweit-Mail). Streng: ≥2 Tokens BEIDSEITIG + Subset-Match in eine
+    # Richtung — nie „miguel@web.de" ↔ jeder Miguel.
     if contact_sets:
-        for tok, name in _contacts_match_profile_rows():
-            if tok and tok not in matched and \
-                    _contacts_name_match(name, contact_sets):
+        _two_tok = [cs for cs in contact_sets if len(cs) >= 2]
+        if _two_tok:
+            for em, tok in auth_rows:
+                if not tok or tok in matched or not em:
+                    continue
+                _lp = str(em).split('@', 1)[0]
+                _lp = _lp.replace('.', ' ').replace('_', ' ')
+                lp_toks = set(_contacts_name_tokens(_lp))
+                if len(lp_toks) < 2:
+                    continue
+                if any(lp_toks <= cs or cs <= lp_toks for cs in _two_tok):
+                    matched[tok] = 'name'
+    if contact_sets or phone_hashes:
+        for tok, name, ph in _contacts_match_profile_rows():
+            if not tok or tok in matched:
+                continue
+            # Telefon (stärkste Profil-Basis): Hash-Schnittmenge reicht.
+            if phone_hashes and any(
+                    str(x).strip().lower() in phone_hashes
+                    for x in (ph or [])[:6]):
+                matched[tok] = 'phone'
+                continue
+            if contact_sets and _contacts_name_match(name, contact_sets):
                 matched[tok] = 'name'
 
     blocked = _blocked_by(own)
@@ -10832,7 +10885,8 @@ def user_contacts_match():
     users.sort(key=lambda u: (u.get('name') or '').lower())
     return jsonify({'ok': True, 'count': len(users), 'users': users,
                     'checked': {'names': len(contact_sets),
-                                'email_hashes': len(hashes)}})
+                                'email_hashes': len(hashes),
+                                'phone_hashes': len(phone_hashes)}})
 
 
 @app.route('/api/user/lookup-by-short/<short>', methods=['GET'])
@@ -13205,26 +13259,69 @@ def get_friend_roster(token, friend_token):
     # Tail-Guard bereits mit. `free_only=True` ist hier hart: dieser N-Crew-Fanout
     # darf nie den bezahlten Board-Fallback öffnen. Genau EIN Enricher-Aufruf pro
     # Tages-Sektorliste; kein anschließender `_enrich_leg_tails`-Doppel-Fetch.
-    _hb = None   # echte Homebase des FREUNDES (lazy, 10-min-Memo) — Audit 2026-07-05
-    for _e in out:
+    # PARALLEL statt seriell (Profil-Kalender-Profiling 2026-07-22, Owner:
+    # „Freund-Profil zeigt erst ‚hat noch keinen Dienstplan geteilt'"): der
+    # Enricher macht pro Sektor bis zu 2–3 SEQUENTIELLE Supabase-Reads
+    # (dep-/arr-Warehouse + Day-Boundary-Nachlese, je ~100–150 ms PostgREST-
+    # Roundtrip) — bei einer 30-Tage-Tour (~25–30 Sektoren) addierte sich das
+    # auf gemessene 7–14 s PRO kaltem Request (Hetzner, 127.0.0.1:8080; das
+    # 60-s-Memo ist PRO Gunicorn-Worker, der nächste Worker zahlt wieder
+    # voll). Die Tage sind untereinander unabhängig → Fan-out über einen
+    # ThreadPoolExecutor (Muster wie friends-today ~13684): Wall-Clock ≈
+    # langsamster Tag statt Summe (gemessen ~1 s kalt). Gleiche Flüge über
+    # mehrere Tage/Nutzer teilen sich weiter die 90-s-memoisierten Leaf-Reads
+    # (_FLIGHT_MERGE_CACHE, GIL-sicheres dict — friends-today nutzt es bereits
+    # multi-threaded).
+    _enrich_days = [e for e in out
+                    if isinstance(e.get('ical_sectors'), list)
+                    and e.get('ical_sectors')]
+    if _enrich_days:
+        # Homebase EINMAL vor dem Fan-out (10-min-Memo) statt lazy im Loop —
+        # sonst rennen N Worker gleichzeitig in den kalten Profil-Read.
+        _hb = _profile_homebase_cached(friend_token) or ''
+        from concurrent.futures import ThreadPoolExecutor as _FR_TPE
+        from flask import current_app as _fr_cur_app
+        _fr_app_obj = _fr_cur_app._get_current_object()
+
+        def _fr_enrich_worker(_e):
+            """Enrichment EINES Tages im Worker-Thread. current_app existiert
+            dort nicht → App-+Request-Kontext des ECHTEN App-Objekts pushen
+            (Muster friends-today `_worker`). Wirft nie — ein Tages-Fehler
+            ließ auch vorher (try/except im Loop) nur diesen Tag nackt."""
+            try:
+                with _fr_app_obj.test_request_context(
+                        f'/api/user/friend-roster/{token}/{friend_token}'):
+                    # VERGANGENHEITS-HORIZONT (Owner/Fable 2026-07-15): das
+                    # Freunde-Roster-Sheet zeigt die 30-Tage-Tour-Retention.
+                    # Der Enrich-Fenster-Guard bleibt für alle anderen Aufrufer
+                    # bei 30 h, hier aber weit geöffnet, damit die für VORTAGE
+                    # persistierten Ist-Zeiten (airport_delay_obs) je Leg
+                    # gelesen werden — statt nackter „Gelandet/Abgeflogen".
+                    # free_only=True bleibt hart; der Live-Board-Scan bleibt
+                    # via _flight_obs_merged auf HEUTE begrenzt, nur der
+                    # datums-gezielte Warehouse-Read erreicht die alten Tage.
+                    _enrich_leg_delays(_e.get('ical_sectors'), _e.get('datum'),
+                                       free_only=True,
+                                       homebase=(_hb or None),
+                                       past_horizon_h=24 * 35)
+            except Exception:
+                pass
+            finally:
+                # Pool wird pro Request erzeugt/zerstört → den per-Thread-
+                # Supabase-Client schließen, sonst sammelt die Proxy-Registry
+                # tote Thread-Clients (gleiche Lektion wie friends-today).
+                _close_current_thread_supabase_client()
+
+        _fr_ex = _FR_TPE(max_workers=max(1, min(8, len(_enrich_days))))
         try:
-            _secs = _e.get('ical_sectors')
-            if isinstance(_secs, list) and _secs:
-                if _hb is None:
-                    _hb = _profile_homebase_cached(friend_token) or ''
-                # VERGANGENHEITS-HORIZONT (Owner/Fable 2026-07-15): das Freunde-
-                # Roster-Sheet zeigt die 30-Tage-Tour-Retention. Der Enrich-
-                # Fenster-Guard bleibt für alle anderen Aufrufer bei 30 h, hier
-                # aber weit geöffnet, damit die für VORTAGE persistierten Ist-
-                # Zeiten (airport_delay_obs) je Leg gelesen werden — statt nackter
-                # „Gelandet/Abgeflogen". free_only=True bleibt hart; der Live-
-                # Board-Scan bleibt via _flight_obs_merged auf HEUTE begrenzt,
-                # nur der datums-gezielte Warehouse-Read erreicht die alten Tage.
-                _enrich_leg_delays(_secs, _e.get('datum'), free_only=True,
-                                   homebase=(_hb or None),
-                                   past_horizon_h=24 * 35)
-        except Exception:
-            pass
+            for _f in [_fr_ex.submit(_fr_enrich_worker, e)
+                       for e in _enrich_days]:
+                try:
+                    _f.result()
+                except Exception:
+                    pass
+        finally:
+            _fr_ex.shutdown(wait=True)
     _payload = {'ok': True, 'shared': True, 'count': len(out),
                 'days': out,
                 'source': 'snapshot' if tage else 'ical_briefings'}
@@ -17525,6 +17622,119 @@ def upload_logbook_import(token):
     return jsonify({'ok': True,
                     'message': 'Import eingereicht — deine Einträge werden '
                                'übernommen.'})
+
+
+# ── Crew-Logbuch (Privat-Persistenz) ────────────────────────────────────────
+# PRIVACY GUARANTEE: Der Crew-Logbuch-Blob ist AUSSCHLIESSLICH dem Token-Inhaber
+# zugänglich. Sowohl GET als auch POST leiten den Zugriff STRIKT über den
+# Pfad-Token — es gibt keinen Cross-User-Read-Pfad (kein friends-Lookup, kein
+# Admin-Endpoint, der fremde Blobs zurückgibt). Der Blob ist opak; das Backend
+# interpretiert seinen Inhalt nicht. Datei-Pfad und SB-Schlüssel enthalten
+# nur den sicheren Token-Hash — kein User kann den Pfad eines anderen erraten.
+
+def _crewlog_path(token):
+    """Token → Disk-Pfad für den Crew-Logbuch-Blob.
+    Pattern identisch zu _logbook_overlay_path / _user_history_path:
+    Token sanitieren, USER_HISTORY_DIR nutzen."""
+    import os
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    if not safe:
+        return None
+    os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+    return os.path.join(_USER_HISTORY_DIR, f'crewlog_{safe}.json')
+
+
+def _crewlog_load(token):
+    """Lädt den Crew-Logbuch-Blob für DIESEN Token.
+    SB-Profil als durables Mirror (überlebt Container-Neustart),
+    Disk als frischer primärer Cache — identisches Muster wie _logbook_overlay_load."""
+    import os
+    blob = None
+    # Tier 1: Disk (frischer, kein Netz nötig)
+    try:
+        pth = _crewlog_path(token)
+        if pth and os.path.exists(pth):
+            with open(pth) as f:
+                blob = json.load(f)
+    except Exception:
+        pass
+    if blob is not None:
+        return blob
+    # Tier 2: SB-Profil als Fallback (Lazy-Restore nach Container-Neustart)
+    try:
+        p = ((_profile_load(token) or {}).get('profile') or {})
+        stored = p.get('crewlog_blob')
+        if isinstance(stored, dict):
+            return stored
+    except Exception:
+        pass
+    return None
+
+
+def _crewlog_save(token, blob):
+    """Persistiert den Crew-Logbuch-Blob für DIESEN Token auf Disk + SB-Profil.
+    Identisches Pattern wie _logbook_overlay_save / _profile_save."""
+    ok = False
+    # Disk: atomisches Schreiben (bestehende Datei wird atomar ersetzt)
+    try:
+        pth = _crewlog_path(token)
+        if pth:
+            _atomic_write_json(pth, blob)
+            ok = True
+    except Exception as e:
+        app.logger.warning(f'[crewlog] disk_save_fail: {type(e).__name__}')
+    # SB-Profil: durable Mirror (überlebt Container-Neustart / Disk-Verlust)
+    try:
+        pf = _profile_load(token) or {}
+        prof = (pf.get('profile') or {})
+        prof['crewlog_blob'] = blob
+        _profile_save(token, prof)
+        ok = True
+    except Exception:
+        pass
+    return ok
+
+
+@app.route('/api/user/crewlog/<token>', methods=['GET'])
+def get_crewlog(token):
+    """Gibt den privaten Crew-Logbuch-Blob des Token-Inhabers zurück.
+
+    PRIVACY: Nur der Pfad-Token kann auf seinen eigenen Blob zugreifen.
+    Es gibt keinen Endpoint, der einen fremden Blob zurückgibt. Der Bearer-
+    Binding-Check (_request_bearer_matches) stellt sicher, dass der Authorization-
+    Header denselben Token trägt wie der Pfad — verhindert Token-Spoofing.
+    """
+    if not token or not re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    blob = _crewlog_load(token)
+    if blob is None:
+        # Noch kein Logbuch gespeichert — leere Liste zurückgeben
+        return jsonify({'ok': True, 'people': []})
+    people = blob.get('people', []) if isinstance(blob, dict) else []
+    return jsonify({'ok': True, 'people': people})
+
+
+@app.route('/api/user/crewlog/<token>', methods=['POST'])
+def save_crewlog(token):
+    """Speichert den privaten Crew-Logbuch-Blob des Token-Inhabers.
+
+    Body: {people: [...]}  — opaker Blob, den das Backend nicht interpretiert.
+    PRIVACY: Der Blob wird AUSSCHLIESSLICH unter dem Pfad-Token gespeichert;
+    kein anderer User kann diesen Blob lesen (kein Cross-User-Read-Pfad,
+    kein friends-Lookup, kein Admin-Endpoint gibt fremde Blobs zurück).
+    """
+    if not token or not re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    body = request.get_json(silent=True) or {}
+    people = body.get('people')
+    if not isinstance(people, list):
+        return jsonify({'ok': False, 'error': 'invalid_body',
+                        'message': 'Body muss {people: [...]} sein.'}), 400
+    blob = {'people': people}
+    ok = _crewlog_save(token, blob)
+    if not ok:
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 503
+    return jsonify({'ok': True})
 
 
 @app.route('/api/user/briefing/<token>', methods=['GET'])

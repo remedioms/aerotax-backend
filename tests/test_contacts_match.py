@@ -84,9 +84,13 @@ def test_email_hash_canonical():
 _AUTH_ROWS = [('miguel@icloud.com', 'AT-MIGUEL'),
               ('jennifer@web.de', 'AT-JENNIFER'),
               ('tibor@gmx.de', 'AT-TIBOR')]
-_PROFILE_ROWS = [('AT-MIGUEL', 'Miguel Schumann'),
-                 ('AT-JENNIFER', 'Jennifer Orhan'),
-                 ('AT-ZOE', 'Zoe')]
+# 3-Tupel seit 22.07. (phone_hashes aus Profil-metadata) — Mock spiegelt
+# die ECHTE Signatur von _contacts_match_profile_rows.
+import hashlib as _hl_test
+PH_JEN = _hl_test.sha256(b'171234567').hexdigest()
+_PROFILE_ROWS = [('AT-MIGUEL', 'Miguel Schumann', []),
+                 ('AT-JENNIFER', 'Jennifer Orhan', [PH_JEN]),
+                 ('AT-ZOE', 'Zoe', [])]
 _PROFILES = {
     'AT-MIGUEL': {'name': 'Miguel Schumann', 'homebase': 'FRA',
                   'airline': 'Lufthansa', 'position': 'FA',
@@ -169,3 +173,28 @@ def test_endpoint_bad_hashes_ignored():
                                 _h('jennifer@web.de')]})
     data = r.get_json()
     assert {u['token'] for u in data['users']} == {'AT-JENNIFER'}
+
+
+def test_endpoint_matches_by_phone_hash():
+    # Telefon-Matching (Owner 22.07.): Kontakt-Nummer-Hash (letzte 9 Ziffern)
+    # trifft die im Profil hinterlegten phone_hashes.
+    r = _call({'token': 'AT-TIBOR', 'phone_hashes': [PH_JEN]})
+    d = r.get_json()
+    assert d['ok'] and d['count'] == 1
+    assert d['users'][0]['matched_by'] == 'phone'
+    assert d['checked']['phone_hashes'] == 1
+
+
+def test_endpoint_matches_contact_name_against_email_localpart():
+    # vorname.nachname@… matcht die Kontaktkarte, auch wenn die ADRESSE
+    # selbst nicht im Adressbuch steht (Apple-Relay). Nur >=2 Tokens.
+    auth = [('jennifer.orhan@web.de', 'AT-JENNIFER'),
+            ('miguel@web.de', 'AT-MIGUEL')]
+    with patch.object(A, '_contacts_match_auth_rows', return_value=auth), \
+         patch.object(A, '_contacts_match_profile_rows', return_value=[]):
+        r = _call({'token': 'AT-TIBOR',
+                   'names': ['Jennifer Orhan', 'Miguel']})
+    d = r.get_json()
+    toks = {u['token'] for u in d['users']}
+    assert 'AT-JENNIFER' in toks          # 2-Token-Localpart matcht
+    assert 'AT-MIGUEL' not in toks        # Ein-Wort nie (Übermatch)
