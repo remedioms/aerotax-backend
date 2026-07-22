@@ -706,26 +706,37 @@ FLIGHTOPS_SERVICES = (
 # EINE URL: /testflow → echter Crew-Login (TEST, anonymisierte echte Daten) →
 # /land tauscht Code→Token, zieht Duty Events und rendert sie. Custom-Scheme-
 # Redirect (aerox://) scheitert in Safari; HTTPS-Redirect wird akzeptiert.
-_TESTFLOW_SCOPE = 'https://cms.fra.dlh.de/publicCrewApiDev'
-_TESTFLOW_BASE = 'https://api-sandbox.lufthansa.com/v1/flight_operations/crew_services'
 _TESTFLOW_REDIRECT = 'https://api.aerosteuer.de/api/lh/flightops/land'
+# Umgebungs-Presets für den Verifikations-Flow (state-Präfix wählt die Env).
+_TESTFLOW_ENVS = {
+    'test': {'authorize': 'https://oauth-test.lufthansa.com/lhcrew/oauth/authorize',
+             'token': 'https://oauth-test.lufthansa.com/lhcrew/oauth/token',
+             'scope': 'https://cms.fra.dlh.de/publicCrewApiDev',
+             'base': 'https://api-sandbox.lufthansa.com/v1/flight_operations/crew_services'},
+    'prod': {'authorize': 'https://oauth.lufthansa.com/lhcrew/oauth/authorize',
+             'token': 'https://oauth.lufthansa.com/lhcrew/oauth/token',
+             'scope': 'https://cms.fra.dlh.de/publicCrewApi',
+             'base': 'https://api.lufthansa.com/v1/flight_operations/crew_services'},
+}
 
 
 @lh_flightops_bp.route('/api/lh/flightops/testflow', methods=['GET'])
 def flightops_testflow():
-    """Startet den TEST-Login (echte anonymisierte Daten). Nach Login landet der
-    Browser auf /land. Nur Verifikation — kein Secret, keine Persistenz."""
+    """Startet den echten Crew-Login zur Verifikation. `?env=prod` = offizielle
+    PROD-Endpoints, sonst TEST/Sandbox. Nach Login → /land."""
     if not flightops_configured():
         return 'not configured', 503
+    env = 'prod' if (request.args.get('env') or '').lower() == 'prod' else 'test'
+    cfg = _TESTFLOW_ENVS[env]
     verifier, challenge = _pkce_pair()
-    state = 'tf_' + secrets.token_urlsafe(16)
+    state = f'tf{env}_' + secrets.token_urlsafe(14)
     _flow_put(state, verifier, 'TESTFLOW')
     q = urllib.parse.urlencode({
         'response_type': 'code', 'client_id': _KEY,
-        'redirect_uri': _TESTFLOW_REDIRECT, 'scope': _TESTFLOW_SCOPE,
+        'redirect_uri': _TESTFLOW_REDIRECT, 'scope': cfg['scope'],
         'state': state, 'code_challenge': challenge,
         'code_challenge_method': 'S256'})
-    return redirect(f'{_AUTHORIZE_URL}?{q}')
+    return redirect(f"{cfg['authorize']}?{q}")
 
 
 @lh_flightops_bp.route('/api/lh/flightops/land', methods=['GET'])
@@ -744,18 +755,31 @@ def flightops_land():
     flow = _flow_take(state)
     if not flow:
         return _page('FlightOps', '<h2>Session abgelaufen</h2><p>Bitte /api/lh/flightops/testflow neu öffnen.</p>', 400)
+    # Env aus dem state-Präfix (tfprod_ / tftest_) → richtiger Token-Endpoint + Base
+    env = 'prod' if state.startswith('tfprod_') else 'test'
+    cfg = _TESTFLOW_ENVS[env]
     body = urllib.parse.urlencode({
         'grant_type': 'authorization_code', 'code': code,
         'redirect_uri': _TESTFLOW_REDIRECT, 'client_id': _KEY,
         'code_verifier': flow['verifier']}).encode()
-    tok = _token_request(body)
+    req_t = urllib.request.Request(cfg['token'], data=body,
+        headers={'Authorization': _basic_header(),
+                 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json'})
+    try:
+        with urllib.request.urlopen(req_t, timeout=15) as r:
+            _tj = json.loads(r.read().decode('utf-8'))
+        tok = {'access': _tj.get('access_token'), 'scope': _tj.get('scope')} if _tj.get('access_token') else None
+    except urllib.error.HTTPError as e:
+        return _page('FlightOps', f'<h2>Token-Austausch fehlgeschlagen ({env})</h2><pre>{_html.escape(e.read().decode("utf-8","ignore")[:400])}</pre>', 502)
+    except Exception as ex:
+        return _page('FlightOps', f'<h2>Token-Fehler: {type(ex).__name__}</h2>', 502)
     if not tok:
-        return _page('FlightOps', '<h2>Token-Austausch fehlgeschlagen</h2>', 502)
+        return _page('FlightOps', '<h2>Kein Token erhalten</h2>', 502)
     from datetime import datetime as _dt, timedelta as _td
     today = _dt.utcnow()
     fd = (today - _td(days=20)).strftime('%Y-%m-%d') + 'Z'
     td = (today + _td(days=40)).strftime('%Y-%m-%d') + 'Z'
-    url = _TESTFLOW_BASE + '/COMMON_DUTY_EVENTS?' + urllib.parse.urlencode({'fromDate': fd, 'toDate': td})
+    url = cfg['base'] + '/COMMON_DUTY_EVENTS?' + urllib.parse.urlencode({'fromDate': fd, 'toDate': td})
     req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + tok['access'], 'Accept': 'application/json'})
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
