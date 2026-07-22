@@ -8869,8 +8869,21 @@ def ax_flight_live(token):
     hexid, cs, pos, route = (_machine_live(reg, targeted=True)
                              if reg else (None, None, None, None))
     src, dst = _route_endpoints(route)
-    dep = src or _norm_iata((my or {}).get('dep_iata')) or q_dep or _norm_iata(sb_dep)
-    dest = dst or _norm_iata((my or {}).get('arr_iata')) or q_arr or _norm_iata(sb_arr)
+    # FLUG-IDENTITÄT SCHLÄGT MASCHINEN-AKTIVITÄT (Forum „Wo ist mein Flieger
+    # zeigt den 340 statt meiner 747" + LH712-Repro 2026-07-22): `route` ist
+    # die AKTUELLE/letzte Route der MASCHINE aus aircraft_live — bei einem
+    # stale Eintrag oder wenn der Tail gerade ein ANDERES Leg fliegt (D-AIXD:
+    # LH446 FRA–DEN, während LH712 FRA–ICN erst 15:35 abhebt), stand das
+    # fremde Leg VORNE und die Karte zeigte „LH712 → Denver" — inkl.
+    # kaskadiertem Falsch-Merge (aircraft_type/Zeiten der fremden Strecke).
+    # Jetzt gewinnen die Endpunkte des ANGEFRAGTEN Fluges (Dual-Side-Merge →
+    # Client-Roster → SB-Tages-Row); die Maschinen-Route bleibt NUR letzter
+    # Fallback, wenn der Flug selbst keine Endpunkte liefert. Fliegt die
+    # Maschine tatsächlich das angefragte Leg, sind beide identisch.
+    dep = (_norm_iata((my or {}).get('dep_iata')) or q_dep
+           or _norm_iata(sb_dep) or src)
+    dest = (_norm_iata((my or {}).get('arr_iata')) or q_arr
+            or _norm_iata(sb_arr) or dst)
     # Freies ADS-B ist über der SÜDROUTE (LH meidet russischen Luftraum!) und über
     # Ozean oft blind → pos=None → die iOS-Karte hängt in „Dein Flug live wird
     # geladen" und simuliert notfalls einen Großkreis ÜBER RUSSLAND (falsch, Owner

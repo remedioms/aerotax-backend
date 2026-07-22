@@ -730,3 +730,41 @@ def test_service_day_actual_row_with_dated_esti_stays_on_poll_day():
     assert A._obs_service_day('23:40', '2026-07-12', datetime(2026, 7, 13, 0, 20),
                               status='Departed',
                               esti='2026-07-13T00:15:00+0200') == '2026-07-12'
+
+
+def test_flight_live_own_leg_beats_foreign_machine_route(client, monkeypatch):
+    """Forum „Wo ist mein Flieger zeigt den 340 statt meiner 747" + LH712-Repro
+    (2026-07-22): der Tail fliegt laut aircraft_live gerade ein ANDERES Leg
+    (LH446 FRA–DEN) bzw. der Eintrag ist stale — die Route der MASCHINE darf
+    die Endpunkte des ANGEFRAGTEN Fluges (FRA–ICN) nicht überstimmen, sonst
+    zeigt die Karte „LH712 → Denver" samt Falsch-Merge der fremden Strecke."""
+    monkeypatch.setattr(BP, '_machine_live',
+                        lambda reg, want_route=True, targeted=False:
+                        ('3c6704', 'DLH446', _live_pos(),
+                         {'src': 'FRA', 'dst': 'DEN', 'source': 'aerox_board'}))
+    _patch_life_app(monkeypatch, _fake_sb([]),
+                    extra={'_flight_obs_merged': lambda *a, **k: None})
+    r = client.get('/api/ax/flight-live/TESTTOKEN'
+                   '?flight_no=LH712&date=2026-07-22&reg=D-AIXD'
+                   '&dep_iata=FRA&arr_iata=ICN')
+    assert r.status_code == 200
+    b = r.get_json()
+    assert (b['dep'] or {}).get('iata') == 'FRA'
+    assert (b['dest'] or {}).get('iata') == 'ICN', \
+        'Maschinen-Route (DEN) darf das eigene Leg (ICN) nicht überstimmen'
+
+
+def test_flight_live_machine_route_still_fallback(client, monkeypatch):
+    """Ohne eigene Leg-Endpunkte (kein Query, kein Merge, keine SB-Row) bleibt
+    die Maschinen-Route der letzte Fallback — Verhalten unverändert."""
+    monkeypatch.setattr(BP, '_machine_live',
+                        lambda reg, want_route=True, targeted=False:
+                        ('3c4b2f', 'DLH716', _live_pos(),
+                         {'src': 'FRA', 'dst': 'HND', 'source': 'warehouse'}))
+    _patch_life_app(monkeypatch, _fake_sb([]),
+                    extra={'_flight_obs_merged': lambda *a, **k: None})
+    r = client.get('/api/ax/flight-live/TESTTOKEN'
+                   '?flight_no=LH716&date=2026-07-05&reg=D-ABYO')
+    b = r.get_json()
+    assert (b['dep'] or {}).get('iata') == 'FRA'
+    assert (b['dest'] or {}).get('iata') == 'HND'
