@@ -20,6 +20,7 @@ Alles env-gesteuert, voll no-op ohne Creds → Commit/Deploy immer sicher:
   LH_FLIGHTOPS_REDIRECT_URI                     registrierte Callback-URL
 """
 import os
+import re
 import time
 import json
 import base64
@@ -69,28 +70,76 @@ def _pkce_pair():
     return verifier, challenge
 
 
-# ── State→Verifier-Store (kurzlebig, in-memory; Flow dauert Minuten) ─────────
+# ── State→Verifier-Store (kurzlebig, Flow dauert Minuten) ────────────────────
+# WICHTIG (Multi-Worker): gunicorn fährt mehrere Worker — `start` und `exchange`
+# landen oft auf VERSCHIEDENEN Workern. Ein reiner In-Memory-Dict wäre dann leer
+# → `state_invalid_or_expired`. Deshalb DISK-backed (alle Worker teilen das
+# Container-FS `_USER_HISTORY_DIR`), mit In-Memory-Fastpath. State ist
+# kurzlebig + single-use (nach exchange gelöscht).
 _flow_lock = threading.Lock()
-_flow_store = {}   # state -> (expires_at, {verifier, user_token})
+_flow_store = {}   # state -> (expires_at, {verifier, user_token})  (Fastpath)
 _FLOW_TTL = 900
 
 
+def _flow_dir():
+    try:
+        import app as _app
+        return _app._USER_HISTORY_DIR
+    except Exception:
+        return '/tmp'
+
+
+def _flow_path(state):
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', state or '')[:80]
+    return os.path.join(_flow_dir(), f'foflow_{safe}.json') if safe else None
+
+
 def _flow_put(state, verifier, user_token):
-    now = time.time()
+    exp = time.time() + _FLOW_TTL
+    rec = {'verifier': verifier, 'user_token': user_token, 'exp': exp}
     with _flow_lock:
-        _flow_store[state] = (now + _FLOW_TTL, {'verifier': verifier, 'user_token': user_token})
-        # aufräumen
-        for k in [k for k, v in _flow_store.items() if v[0] < now]:
-            _flow_store.pop(k, None)
+        _flow_store[state] = (exp, rec)
+    try:
+        p = _flow_path(state)
+        if p:
+            with open(p, 'w') as f:
+                json.dump(rec, f)
+    except Exception as e:
+        log.warning('[lh_flightops] flow_put disk: %s', type(e).__name__)
 
 
 def _flow_take(state):
     now = time.time()
+    # Fastpath: derselbe Worker
     with _flow_lock:
         hit = _flow_store.pop(state, None)
-    if not hit or hit[0] < now:
-        return None
-    return hit[1]
+    if hit and hit[0] >= now:
+        _flow_rm(state)
+        return hit[1]
+    # Cross-Worker: von Disk lesen (single-use → löschen)
+    try:
+        p = _flow_path(state)
+        if p and os.path.exists(p):
+            with open(p) as f:
+                rec = json.load(f)
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            if rec.get('exp', 0) >= now:
+                return {'verifier': rec.get('verifier'), 'user_token': rec.get('user_token')}
+    except Exception as e:
+        log.warning('[lh_flightops] flow_take disk: %s', type(e).__name__)
+    return None
+
+
+def _flow_rm(state):
+    try:
+        p = _flow_path(state)
+        if p and os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
 
 
 # ── Per-Crew-Token-Store (durable Profil-Mirror + Disk) ─────────────────────
