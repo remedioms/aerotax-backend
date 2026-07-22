@@ -18042,8 +18042,14 @@ def take_roster_snapshot(token):
             #      nichts mehr zu entscheiden → still.
             #   2) Pickup-Abbau: LH entfernt die PU-Zeit nach der Tour aus
             #      MyTime (reine Hygiene) → still, solange sonst nichts anders.
+            _now_hhmm = None
+            try:
+                _now_hhmm = (_airport_local_now(_hb).strftime('%H:%M')
+                             if _hb else datetime.now().strftime('%H:%M'))
+            except Exception:
+                _now_hhmm = datetime.now().strftime('%H:%M')
             push_diff = [c for c in diff
-                         if not _roster_change_is_past(c, _today_ymd)
+                         if not _roster_change_is_past(c, _today_ymd, _now_hhmm)
                          and not _roster_change_is_pickup_prune(c)]
             n = len(push_diff)
             # PUSH-INHALT: konkrete erste Änderung („Di 22.07.: LH440 FRA-IAH
@@ -18153,16 +18159,36 @@ def _rc_sector_fingerprint(day):
     return out
 
 
-def _roster_change_is_past(change, today_ymd):
+def _roster_change_is_past(change, today_ymd, now_hhmm=None):
     """VERGANGENHEITS-GATE (Flo Z 2026-07-20: „Push kommt auch, wenn die Tour
     vorbei ist"): Änderungen an Tagen VOR heute (Homebase-lokal) sind für den
     User nicht mehr handlungsrelevant → kein Push. Die in-App-Liste
-    (/api/user/roster-changes) zeigt sie weiterhin. Wirft nie."""
+    (/api/user/roster-changes) zeigt sie weiterhin. Wirft nie.
+
+    ERWEITERT (Ralf Spannagel 2026-07-22, „Ich bekomme jedesmal einen
+    Schreck"): LH spielt nach der Landung die TATSÄCHLICHEN Flugzeiten in
+    myTime ein — das ist ein Ist-Zeiten-Nachtrag am HEUTIGEN Tag, keine
+    handlungsrelevante Änderung. Ein Change am heutigen Tag gilt daher auch
+    als „vergangen", wenn der Dienst laut (neuer, sonst alter) Endzeit
+    bereits BEENDET ist (`end_time` < jetzt, Homebase-lokal). Red-Eyes
+    (end < start = Ende am Folgetag) werden NIE so unterdrückt."""
     try:
         d = str((change or {}).get('datum') or '')[:10]
         t = str(today_ymd or '')[:10]
         # ISO-YYYY-MM-DD vergleicht lexikografisch korrekt.
-        return bool(d) and bool(t) and d < t
+        if bool(d) and bool(t) and d < t:
+            return True
+        if d != t or not now_hhmm:
+            return False
+        day = (change.get('new') if isinstance(change.get('new'), dict) else None)             or (change.get('old') if isinstance(change.get('old'), dict) else None) or {}
+        rf = day.get('reader_facts') or {}
+        st = _rc_norm_cmp(rf.get('start_time'))
+        en = _rc_norm_cmp(rf.get('end_time'))
+        if not en or len(en) < 4:
+            return False
+        if st and en < st:
+            return False          # Red-Eye: Ende liegt am Folgetag
+        return en < str(now_hhmm)
     except Exception:
         return False
 
@@ -18323,10 +18349,54 @@ def _roster_change_summary(entry):
             if aa and ab and aa != ab:
                 parts.append(f'Ankunft {fn}: {aa} → {ab}')
         if not parts:
-            # Kein Leg-Detail ableitbar (nur klass/Zeiten-Marker o.Ä.) → generisch,
-            # aber ehrlich statt leer.
+            # Marker-basiertes Vorher→Nachher (Birgit Schepler 2026-07-22:
+            # „RB heute, SBY morgen, Do HYD — nicht zu sehen, lediglich der
+            # Rückflug"): die 4 geänderten Tage renderten alle nur „Dienst
+            # geändert" — der INHALT (Reserve → StandBy / Reserve → LH 752
+            # FRA-HYD / Reserve → Layover HYD) stand zwar im Change, wurde
+            # aber nie angezeigt. Kurzlabel aus dem Marker ableiten.
+            sa_, sb_ = _rc_marker_short(a), _rc_marker_short(b)
+            if sa_ and sb_ and sa_ != sb_:
+                return (sa_ + ' → ' + sb_)[:110]
+            if sb_ and not sa_:
+                return ('Neu: ' + sb_)[:110]
+            # Kein Leg-/Marker-Detail ableitbar → generisch, aber ehrlich.
             return 'Dienst geändert'
         return ' · '.join(parts[:3])
+    except Exception:
+        return ''
+
+
+def _rc_marker_short(day):
+    """Kurz-Label eines Roster-Tags aus dem (gemergten) Marker: bevorzugt das
+    Flug-Segment („LH 752: FRA-HYD"), sonst das erste inhaltliche Segment;
+    „(Tag k/N)"-Suffixe und Briefing-Zeitpräfixe fallen weg. '' wenn leer."""
+    try:
+        m = str((day or {}).get('marker') or '').strip()
+        if not m:
+            return ''
+        segs = [p.strip() for p in m.split('·') if p.strip()]
+        if not segs:
+            return ''
+        seg = ''
+        for p in segs:
+            up = p.upper()
+            if (re.search(r'\b[A-Z]{3}\s*-\s*[A-Z]{3}\b', up)
+                    and not up.startswith('LAYOVER')
+                    and 'BRIEFING' not in up):
+                seg = p
+                break
+        if not seg:
+            for p in segs:
+                up = p.upper()
+                if 'BRIEFING' not in up and 'PICKUP' not in up:
+                    seg = p
+                    break
+        if not seg:
+            seg = segs[0]
+        seg = re.sub(r'\s*\(Tag\s*\d+/\d+\)\s*', ' ', seg, flags=re.I)
+        seg = re.sub(r'^\d{1,2}:\d{2}\s*LT\s*', '', seg, flags=re.I)
+        return seg.strip(' ·').strip()[:40]
     except Exception:
         return ''
 
@@ -24740,6 +24810,7 @@ def _passport_stats_compute(token, rng):
     legs_without_duration = 0
     airports = set()
     airlines = set()
+    tails = set()
     countries = set()
     routes = Counter()
     years = set()
@@ -24773,6 +24844,12 @@ def _passport_stats_compute(token, rng):
             years.add(datum[:4])
             if not _passport_range_match(datum, rng):
                 continue
+            # Geflogene Maschinen (Remo Gisler 2026-07-22): jede im Roster
+            # deklarierte/gemessene Reg sammeln — nie erfunden; die Abdeckung
+            # wächst mit den Quellen (ITA/LEON deklarieren, LH via Boards).
+            _tl = str(s.get('tail') or s.get('reg') or '').strip().upper()
+            if 2 < len(_tl) <= 10:
+                tails.add(_tl)
             flights += 1
             day_counted = True
             airports.add(frm)
@@ -24833,6 +24910,8 @@ def _passport_stats_compute(token, rng):
         'airports_count': len(airports),
         'airlines': sorted(airlines),
         'airlines_count': len(airlines),
+        'tails': sorted(tails),
+        'tails_count': len(tails),
         'countries': sorted(countries),
         'countries_count': len(countries),
         'routes': routes_out,
@@ -33635,6 +33714,48 @@ def _tail_recently_active(reg):
         return True
 
 
+def _aircraft_live_reg_for_flight(flight_no, dep_iata=None, arr_iata=None):
+    """Reg der Maschine, die GERADE (Sichtung ≤45 min) unter dieser IATA-
+    Flugnummer fliegt — aus `aircraft_live` (NAS-Harvester, FR24-gRPC).
+    Route-Guard: wenn die Zeile origin/dest kennt, muss mind. eine Seite zum
+    Leg passen. None bei Miss/Fehler; wirft nie. In-process-Memo 120 s."""
+    import time as _t
+    fn = str(flight_no or '').replace(' ', '').upper()
+    if len(fn) < 3 or not SB_AVAILABLE or sb is None:
+        return None
+    now = _t.time()
+    hit = _ACLIVE_FLIGHT_CACHE.get(fn)
+    if hit and now < hit[0]:
+        return hit[1]
+    reg = None
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=45)
+                  ).strftime('%Y-%m-%dT%H:%M:%SZ')
+        r = (sb.table('aircraft_live')
+             .select('reg,reg_display,origin,dest,seen_ts')
+             .eq('flight', fn).gt('seen_ts', cutoff)
+             .order('seen_ts', desc=True).limit(1).execute())
+        row = (getattr(r, 'data', None) or [None])[0]
+        if row:
+            o = str(row.get('origin') or '').upper()
+            de = str(row.get('dest') or '').upper()
+            frm = str(dep_iata or '').upper()
+            to = str(arr_iata or '').upper()
+            route_known = bool(o or de)
+            route_ok = ((not route_known)
+                        or (frm and o == frm) or (to and de == to))
+            if route_ok:
+                reg = (row.get('reg_display') or row.get('reg') or '').strip() or None
+    except Exception:
+        reg = None
+    _ACLIVE_FLIGHT_CACHE[fn] = (now + 120, reg)
+    _cache_soft_cap(_ACLIVE_FLIGHT_CACHE, max_items=1000, drop=250)
+    return reg
+
+
+_ACLIVE_FLIGHT_CACHE = {}
+
+
 def _leg_tail(flight_no, date=None, dep_iata=None, arr_iata=None):
     """Flugzeug-Kennzeichen (`reg`/Tail) EINES Legs — NUR aus echten Board-/
     Warehouse-Beobachtungen, sonst None.
@@ -33684,11 +33805,20 @@ def _leg_tail(flight_no, date=None, dep_iata=None, arr_iata=None):
                                live=True, free_only=True)
     except Exception:
         m = None
-    if not m:
-        return None
-    reg = m.get('reg')
+    reg = (m or {}).get('reg')
     if isinstance(reg, str):
         reg = reg.strip()
+    if not reg:
+        # aircraft_live-LIVE-Fallback (Remo Gisler 2026-07-22, „Inbound SIN/MIA
+        # ohne Reg"): Outstation-Abfluege haben kein Board und die LH Open API
+        # kann ausfallen (596/Quota). Der NAS-Harvester schreibt aber die IATA-
+        # Flugnummer JEDER gerade fliegenden LH-Group-Maschine nach
+        # aircraft_live — die Reg der Maschine, die JETZT als diese Flugnummer
+        # unterwegs ist, ist eine MESSUNG (kein Raten). Nur jüngste Sichtung
+        # ≤45 min (max_age-Regel) — gestern geflogene Rotationen zählen nie.
+        reg = _aircraft_live_reg_for_flight(op_fn, dep_iata=frm, arr_iata=to)
+        if reg:
+            return reg
     if not reg:
         return None
     # Ausgemusterte-Tails-Wächter: Board-Quellen (Fraport) liefern für manche
