@@ -141,9 +141,10 @@ IMPORT_BLOB = {'legs': [
      'arr_iso': '2019-03-06T07:30:00+00:00',
      'block_min': 630, 'reg': 'D-AIXA', 'type': 'A359', 'pf': True,
      'ldg_night': 1, 'night_min': 400, 'role': 'FO'},
-    # Kollision mit Roster-Leg LH400 → Roster gewinnt
+    # Kollision mit Roster-Leg LH400 → Roster gewinnt, aber Landungen/PF
+    # aus dem Import bleiben als Fallback erhalten
     {'date': '2026-05-01', 'flight': 'LH400', 'from': 'FRA', 'to': 'JFK',
-     'block_min': 999, 'type': 'FAKE'},
+     'block_min': 999, 'type': 'FAKE', 'ldg_day': 1, 'pf': True},
     # kaputte Blockzeit (Platzhalter) → Leg bleibt, block_min fällt raus
     {'date': '2014-02-17', 'flight': 'LH2477', 'from': 'LHR', 'to': 'MUC',
      'block_min': 1439, 'type': 'A320'},
@@ -167,6 +168,9 @@ def test_import_merge_dedupe_and_sort():
     # Dedupe: LH400 nur EINMAL, und zwar aus dem Roster (type 346, nicht FAKE)
     lh400 = [e for e in r['entries'] if e['flight'] == 'LH400']
     assert len(lh400) == 1 and lh400[0]['type'] == '346'
+    # Überlapp-Fallback: CSV-Landungen/PF überleben die Roster-Dedupe
+    assert lh400[0]['ldg_day'] == 1 and lh400[0]['pf'] is True
+    assert lh400[0]['block_min'] == 520      # Blockzeit bleibt die vom Roster
     imp = {e['flight']: e for e in r['entries'] if e.get('source') == 'import'}
     assert imp['LH500']['block_min'] == 630 and imp['LH500']['pf'] is True
     assert imp['LH500']['reg'] == 'D-AIXA' and imp['LH500']['role'] == 'FO'
@@ -182,7 +186,8 @@ def test_import_totals_and_by_type():
     r = _get()
     assert r['totals']['legs'] == 5
     assert r['totals']['block_min'] == 520 + 450 + 60 + 630
-    assert r['totals']['landings'] == 1          # ldg_night des Import-Legs
+    # ldg_night des Import-Legs + ldg_day-Fallback auf dem Überlapp-Leg LH400
+    assert r['totals']['landings'] == 2
     bt = {t['type']: t for t in r['by_type']}
     assert bt['A359']['legs'] == 1 and bt['A359']['block_min'] == 630
 

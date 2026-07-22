@@ -17551,6 +17551,19 @@ def get_logbook(token):
     except Exception:
         _flight_facts_from_obs = None
 
+    # Import-Blob VOR der Roster-Schleife laden: bei Key-Kollision gewinnt das
+    # Roster-Leg, aber Landungen/PF/Nacht/Reg/Typ aus dem Import bleiben als
+    # Fallback erhalten (sonst verlöre ein Überlapp-Leg seine CSV-Landungen).
+    try:
+        imp = _logbook_import_load(token) or {}
+    except Exception:
+        imp = {}
+    imp_by_key = {}
+    for L in (imp.get('legs') or []):
+        if isinstance(L, dict):
+            imp_by_key[_logbook_leg_key(L.get('date'), L.get('flight'),
+                                        L.get('from'), L.get('to'))] = L
+
     entries = []
     enrich_used = 0
     enrich_capped = False
@@ -17563,10 +17576,12 @@ def get_logbook(token):
             to = (s.get('to') or '').upper()
             if not flight or len(frm) != 3 or len(to) != 3:
                 continue
+            key = _logbook_leg_key(date, flight, frm, to)
+            iv = imp_by_key.get(key) or {}
             dep_iso = s.get('dep_iso') or ''
             arr_iso = s.get('arr_iso') or ''
-            reg = s.get('reg') or s.get('tail')
-            actype = s.get('type')
+            reg = s.get('reg') or s.get('tail') or iv.get('reg')
+            actype = s.get('type') or iv.get('type')
             if (not reg or not actype) and _flight_facts_from_obs:
                 if enrich_used < _LOGBOOK_ENRICH_CAP:
                     try:
@@ -17578,17 +17593,20 @@ def get_logbook(token):
                     enrich_used += 1
                 else:
                     enrich_capped = True
-            key = _logbook_leg_key(date, flight, frm, to)
             ov = overlay.get(key) or {}
             entries.append({
                 'key': key, 'date': date, 'flight': flight,
                 'from': frm, 'to': to, 'dep_iso': dep_iso, 'arr_iso': arr_iso,
                 'block_min': _logbook_block_min(dep_iso, arr_iso),
                 'reg': reg or None, 'type': actype or None,
-                'ldg_day': ov.get('ldg_day'), 'ldg_night': ov.get('ldg_night'),
-                'to_day': ov.get('to_day'), 'to_night': ov.get('to_night'),
-                'pf': (bool(ov['pf']) if ov.get('pf') is not None else None),
-                'night_min': ov.get('night_min'), 'remarks': ov.get('remarks'),
+                'ldg_day': ov.get('ldg_day', iv.get('ldg_day')),
+                'ldg_night': ov.get('ldg_night', iv.get('ldg_night')),
+                'to_day': ov.get('to_day', iv.get('to_day')),
+                'to_night': ov.get('to_night', iv.get('to_night')),
+                'pf': (bool(ov['pf']) if ov.get('pf') is not None
+                       else iv.get('pf')),
+                'night_min': ov.get('night_min', iv.get('night_min')),
+                'remarks': ov.get('remarks', iv.get('remarks')),
             })
     if enrich_capped:
         app.logger.info(f'[logbook] enrich-cap {_LOGBOOK_ENRICH_CAP} tok={token[:8]} '
@@ -17599,17 +17617,9 @@ def get_logbook(token):
     # auch über importierte Werte. Import-Legs werden NICHT LH-enriched
     # (historisch, Reg/Typ stehen im Export).
     imported_count = 0
-    try:
-        imp = _logbook_import_load(token) or {}
-    except Exception:
-        imp = {}
-    if imp.get('legs'):
+    if imp_by_key:
         seen_keys = {e['key'] for e in entries}
-        for L in imp['legs']:
-            if not isinstance(L, dict):
-                continue
-            key = _logbook_leg_key(L.get('date'), L.get('flight'),
-                                   L.get('from'), L.get('to'))
+        for key, L in imp_by_key.items():
             if key in seen_keys:
                 continue
             seen_keys.add(key)
