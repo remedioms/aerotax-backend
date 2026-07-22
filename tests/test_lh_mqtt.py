@@ -1,6 +1,6 @@
 """LH-MQTT-Push-Notifications (Engine A2) — rein offline: kein Netz, kein
 Broker, kein Supabase. Blueprint-Logik läuft auf einer Mini-Flask-App (nur
-lh_mqtt_bp), die Seams `_briefing_rows`/`_do_push`/`lh_flight_facts` werden
+lh_mqtt_bp), die Seams `_sector_rows`/`_rows_for_flight`/`_do_push`/`lh_flight_facts` werden
 gemonkeypatcht. Topic-/Payload-Shapes sind die LIVE verifizierten
 (Broker-Smoke-Test 2026-07-22)."""
 import os
@@ -21,8 +21,7 @@ NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 
 def _rows(*sector_lists):
     """Briefing-Rows-Fixture: je ein User-Token pro Sektor-Liste."""
-    return [{'token': f'user{i}', 'datum': '2026-07-22',
-             'raw_event': {'ical_sectors': secs}}
+    return [{'token': f'user{i}', 'datum': '2026-07-22', 'sectors': secs}
             for i, secs in enumerate(sector_lists)]
 
 
@@ -130,7 +129,7 @@ def test_topics_endpoint(client, monkeypatch):
     dep = datetime.now(timezone.utc) + timedelta(hours=6)
     sector = dict(LH400, dep_iso=dep.isoformat())
     expected_date = dep.astimezone(ZoneInfo('Europe/Berlin')).date().isoformat()
-    monkeypatch.setattr(lh_mqtt, '_briefing_rows', lambda dates: _rows([sector]))
+    monkeypatch.setattr(lh_mqtt, '_sector_rows', lambda dates: _rows([sector]))
     r = client.get('/api/internal/lh-mqtt/topics')
     assert r.status_code == 200
     d = r.get_json()
@@ -148,8 +147,8 @@ def test_secret_gate(client, monkeypatch):
 
 def test_event_gate_change_pushes_all_affected(client, monkeypatch):
     pushes = []
-    monkeypatch.setattr(lh_mqtt, '_briefing_rows',
-                        lambda dates: _rows([LH400], [dict(LH400)]))
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight',
+                        lambda dates, c, n: _rows([LH400], [dict(LH400)]))
     monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
                         lambda *a, **k: {'gate': 'C16', 'terminal': '1'})
     monkeypatch.setattr(lh_mqtt, '_do_push',
@@ -168,7 +167,7 @@ def test_event_gate_change_pushes_all_affected(client, monkeypatch):
 
 def test_event_gate_without_fact_is_honest(client, monkeypatch):
     pushes = []
-    monkeypatch.setattr(lh_mqtt, '_briefing_rows', lambda dates: _rows([LH400]))
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: _rows([LH400]))
     monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {})
     monkeypatch.setattr(lh_mqtt, '_do_push',
                         lambda *a, **k: pushes.append(a))
@@ -179,7 +178,7 @@ def test_event_gate_without_fact_is_honest(client, monkeypatch):
 
 
 def test_event_small_delay_no_push(client, monkeypatch):
-    monkeypatch.setattr(lh_mqtt, '_briefing_rows', lambda dates: _rows([LH400]))
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: _rows([LH400]))
     monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {
         'dep_delay_min': 5, 'est_dep': '2026-07-22T17:15:00+02:00',
         'sched_dep': '2026-07-22T17:10:00+02:00'})
@@ -192,7 +191,7 @@ def test_event_small_delay_no_push(client, monkeypatch):
 
 def test_event_real_delay_pushes(client, monkeypatch):
     pushes = []
-    monkeypatch.setattr(lh_mqtt, '_briefing_rows', lambda dates: _rows([LH400]))
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: _rows([LH400]))
     monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {
         'dep_delay_min': 35, 'est_dep': '2026-07-22T17:45:00+02:00',
         'sched_dep': '2026-07-22T17:10:00+02:00'})
@@ -207,7 +206,7 @@ def test_event_real_delay_pushes(client, monkeypatch):
 
 def test_event_cancelled_pushes(client, monkeypatch):
     pushes = []
-    monkeypatch.setattr(lh_mqtt, '_briefing_rows', lambda dates: _rows([LH400]))
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: _rows([LH400]))
     monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {})
     monkeypatch.setattr(lh_mqtt, '_do_push',
                         lambda tok, title, body, **k: pushes.append(title))
@@ -219,7 +218,7 @@ def test_event_cancelled_pushes(client, monkeypatch):
 
 def test_event_departed_refreshes_nothing_and_pushes_nobody(client, monkeypatch):
     facts_calls = []
-    monkeypatch.setattr(lh_mqtt, '_briefing_rows', lambda dates: _rows([LH400]))
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: _rows([LH400]))
     monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
                         lambda *a, **k: facts_calls.append(a) or {})
     monkeypatch.setattr(lh_mqtt, '_do_push',
@@ -232,7 +231,7 @@ def test_event_departed_refreshes_nothing_and_pushes_nobody(client, monkeypatch)
 
 def test_event_no_affected_users_no_facts_call(client, monkeypatch):
     facts_calls = []
-    monkeypatch.setattr(lh_mqtt, '_briefing_rows', lambda dates: [])
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
     monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
                         lambda *a, **k: facts_calls.append(a) or {})
     d = client.post('/api/internal/lh-mqtt/event',
@@ -250,3 +249,49 @@ def test_status_endpoint(client):
     r = client.get('/api/lh/mqtt/status')
     d = r.get_json()
     assert r.status_code == 200 and d['ok'] and 'events' in d
+
+
+def test_iter_sectors_accepts_legacy_raw_event_shape():
+    rows = [{'token': 'u1',
+             'raw_event': {'ical_sectors': [dict(LH400)]}}]
+    assert [t for t, _ in lh_mqtt._iter_sectors(rows)] == ['u1']
+
+
+class _FakeQuery:
+    def __init__(self, rows):
+        self._rows = rows
+        self._start = 0
+
+    def select(self, *_a, **_k):
+        return self
+
+    def in_(self, *_a, **_k):
+        return self
+
+    def filter(self, *_a, **_k):
+        return self
+
+    def range(self, start, end):
+        self._start, self._end = start, end
+        return self
+
+    def execute(self):
+        class R:
+            pass
+        r = R()
+        r.data = self._rows[self._start:self._end + 1]
+        return r
+
+
+def test_sector_rows_paginates_past_postgrest_1000_cap(monkeypatch):
+    # 2026-07-22 live: 3682 Rows im 4-Tage-Fenster — ohne range() fehlten
+    # ~73% der User. Fake-Client mit 2500 Rows → alle kommen an.
+    all_rows = [{'token': f'u{i}', 'sectors': []} for i in range(2500)]
+
+    class _FakeSB:
+        def table(self, *_a):
+            return _FakeQuery(all_rows)
+
+    monkeypatch.setattr(lh_mqtt, '_sb', lambda: _FakeSB())
+    got = lh_mqtt._sector_rows(['2026-07-22'])
+    assert len(got) == 2500

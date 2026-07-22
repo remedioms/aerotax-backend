@@ -55,10 +55,11 @@ _TOPIC_RE = re.compile(r'^prd/FlightUpdate/([A-Z0-9]{2})/([A-Z0-9]{2})(\d{1,4})/
                        r'(\d{4}-\d{2}-\d{2})$')
 _FLIGHT_RE = re.compile(r'^([A-Z0-9]{2})(\d{1,4})[A-Z]?$')
 
-# Topic-Listen-Memo (der Daemon fragt alle ~5 min; SB nur 1×/min belasten)
+# Topic-Listen-Memo (der Daemon fragt alle ~5 min; SB entsprechend selten
+# belasten — der Voll-Fetch über alle User ist der teuerste Query hier)
 _topics_lock = threading.Lock()
 _topics_memo = {'ts': 0.0, 'topics': []}
-_TOPICS_TTL_S = 60
+_TOPICS_TTL_S = 240
 
 # Diagnose (pro Gunicorn-Worker — Status zeigt die Sicht EINES Workers)
 _stat_lock = threading.Lock()
@@ -123,27 +124,88 @@ def _sector_topic_dates(sector):
     return [(d + timedelta(days=off)).isoformat() for off in (-1, 0, 1)]
 
 
-def _briefing_rows(dates):
-    """EIN Supabase-Query über alle User (Muster wie poll_scheduler).
-    Test-Seam: wird im Test gemonkeypatcht. Wirft nie."""
+# Schlankes Select: NUR die Sektoren via jsonb-Pfad, nicht das ganze
+# raw_event (Voll-Payload wäre ~4× größer — Egress).
+_SECTOR_SELECT = 'token,datum,sectors:raw_event->ical_sectors'
+
+
+def _sb():
+    """Test-Seam: Supabase-Client oder None. Lazy-Import (Blueprint bleibt
+    ohne app-Import ladbar)."""
     try:
         from app import sb, SB_AVAILABLE
-        if not SB_AVAILABLE or sb is None:
-            return []
-        r = (sb.table('user_ical_briefings')
-             .select('token,datum,raw_event')
-             .in_('datum', list(dates)).execute())
-        return r.data or []
-    except Exception as e:
-        log.warning('[lh_mqtt] briefing rows fail: %s', type(e).__name__)
+        return sb if (SB_AVAILABLE and sb is not None) else None
+    except Exception:
+        return None
+
+
+def _sector_rows(dates):
+    """Alle Briefing-Rows der Daten — PAGINIERT. PostgREST kappt still bei
+    1000 Rows (live gemessen 2026-07-22: 3682 Rows im 4-Tage-Fenster — ohne
+    range() fehlten ~73% der User in Topics UND Push-Fanout). Wirft nie."""
+    client = _sb()
+    if client is None:
         return []
+    out = []
+    page = 1000
+    try:
+        for start in range(0, 40000, page):
+            r = (client.table('user_ical_briefings')
+                 .select(_SECTOR_SELECT)
+                 .in_('datum', list(dates))
+                 .range(start, start + page - 1).execute())
+            rows = r.data or []
+            out.extend(rows)
+            if len(rows) < page:
+                break
+    except Exception as e:
+        log.warning('[lh_mqtt] sector rows fail: %s', type(e).__name__)
+    return out
+
+
+def _rows_for_flight(dates, carrier, num):
+    """Nur die Rows, deren Sektoren GENAU diesen Flug tragen — jsonb-
+    Containment serverseitig (Bruchteil des Voll-Fetches; Live-Format ist
+    kompakt 'LH501', Space-/Padding-Varianten als Belt&Braces). Fallback bei
+    Query-Fehler: paginierter Voll-Fetch."""
+    client = _sb()
+    if client is None:
+        return []
+    variants = [f'{carrier}{num}', f'{carrier} {num}']
+    if len(num) < 4:
+        variants.append(f'{carrier}{num.zfill(4)}')
+    out, seen_tok_datum = [], set()
+    ok = False
+    for v in variants:
+        try:
+            r = (client.table('user_ical_briefings')
+                 .select(_SECTOR_SELECT)
+                 .in_('datum', list(dates))
+                 .filter('raw_event->ical_sectors', 'cs',
+                         f'[{{"flight":"{v}"}}]')
+                 .execute())
+            ok = True
+            for row in (r.data or []):
+                k = (row.get('token'), row.get('datum'))
+                if k not in seen_tok_datum:
+                    seen_tok_datum.add(k)
+                    out.append(row)
+        except Exception as e:
+            log.warning('[lh_mqtt] flight rows cs fail %s: %s', v,
+                        type(e).__name__)
+    if not ok:
+        return _sector_rows(dates)
+    return out
 
 
 def _iter_sectors(rows):
-    """(token, sector_dict) über alle Briefing-Rows."""
+    """(token, sector_dict) über alle Briefing-Rows (neue schlanke 'sectors'-
+    Shape, legacy raw_event.ical_sectors als Fallback)."""
     for row in rows or []:
-        raw = row.get('raw_event') or {}
-        secs = raw.get('ical_sectors') if isinstance(raw, dict) else None
+        secs = row.get('sectors')
+        if not isinstance(secs, list):
+            raw = row.get('raw_event') or {}
+            secs = raw.get('ical_sectors') if isinstance(raw, dict) else None
         if not isinstance(secs, list):
             continue
         tok = row.get('token')
@@ -182,7 +244,7 @@ def lh_mqtt_topics():
     now_utc = datetime.now(timezone.utc)
     dates = [(now_utc.date() + timedelta(days=off)).isoformat()
              for off in (-1, 0, 1, 2)]
-    topics = topics_for_rows(_briefing_rows(dates), now_utc)
+    topics = topics_for_rows(_sector_rows(dates), now_utc)
     with _topics_lock:
         _topics_memo['ts'] = now
         _topics_memo['topics'] = topics
@@ -332,7 +394,7 @@ def lh_mqtt_event():
         pass
     dates = ([(base + timedelta(days=off)).isoformat() for off in (-1, 0, 1)]
              if base else [topic_date])
-    rows = _briefing_rows(dates)
+    rows = _rows_for_flight(dates, carrier, num)
     affected = _users_for_flight(rows, carrier, num, topic_date)
 
     # Frische LH-Fakten (force umgeht den Memo — der Sinn des Push-Kanals ist
