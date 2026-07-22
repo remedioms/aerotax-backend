@@ -135,6 +135,50 @@ def test_duty_events_error_shape_is_none(monkeypatch):
     assert fo.duty_events('AT-U', '2016-10-01', '2016-10-31') is None
 
 
+def test_all_9_services_have_client_methods():
+    # Konsole 2026-07-22 listet genau diese 9 Services
+    assert set(fo.FLIGHTOPS_SERVICES) == {
+        'COMMON_DUTY_EVENTS', 'COMMON_CREWLIST', 'COMMON_CREW_ROTATION',
+        'COMMON_CHECK_IN_TIMES', 'COMMON_FLIGHT_LEG_DETAILS', 'COMMON_LANDING_REPORT',
+        'COMMON_CREW_HOTEL_INFO', 'COMMON_AIRPORT_WEATHER', 'COMMON_SIMULATOR_CREWLIST'}
+
+
+def test_client_methods_build_correct_paths(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fo, '_api_get',
+                        lambda tok, path, params=None: calls.append((path, params)) or {})
+    fo.crew_list('T', 'LH400', '2016-10-01', 'FRA', 'JFK', 'AC1')
+    fo.crew_rotation('T', '12345')
+    fo.landing_report('T', 'LH400', '2016-10-01', 'FRA')
+    fo.flight_leg_details('T', 'LH400', '2016-10-01', 'FRA', 'JFK')
+    fo.crew_hotel('T', 'jfk', provider='LHP')
+    fo.check_in_times('T', '2016-10-01', '2016-10-31')
+    fo.airport_weather('T', 'fra')
+    paths = [c[0] for c in calls]
+    assert '/COMMON_CREWLIST' in paths and '/COMMON_CREW_ROTATION' in paths
+    assert '/COMMON_LANDING_REPORT' in paths and '/COMMON_FLIGHT_LEG_DETAILS' in paths
+    assert '/COMMON_CREW_HOTEL_INFO' in paths and '/COMMON_CHECK_IN_TIMES' in paths
+    assert '/COMMON_AIRPORT_WEATHER' in paths
+    # Datum wird zu YYYY-MM-DDZ, Station upper
+    cl = dict(calls[0][1]); assert cl['flightDate'] == '2016-10-01Z' and cl['departureAirport'] == 'FRA'
+    hotel = dict(calls[4][1]); assert hotel['station'] == 'JFK'
+
+
+def test_landing_performed(monkeypatch):
+    monkeypatch.setattr(fo, 'landing_report',
+                        lambda *a: {'landingPerformed': True, 'tailsign': 'D-AIHY'})
+    assert fo.landing_performed('T', 'LH400', '2016-10-01', 'FRA') is True
+    monkeypatch.setattr(fo, 'landing_report',
+                        lambda *a: {'processingErrors': [{'code': 500}]})
+    assert fo.landing_performed('T', 'LH400', '2016-10-01', 'FRA') is None
+
+
+def test_service_get_rejects_bad_service(monkeypatch):
+    monkeypatch.setattr(fo, '_api_get', lambda tok, path, params=None: {'called': path})
+    assert fo.service_get('T', 'DROP TABLE') is None
+    assert fo.service_get('T', 'common_crewlist') == {'called': '/COMMON_CREWLIST'}
+
+
 def test_ping_endpoint(monkeypatch):
     monkeypatch.setattr(fo, '_KEY', ''); monkeypatch.setattr(fo, '_SECRET', '')
     import app as backend

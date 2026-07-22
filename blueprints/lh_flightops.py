@@ -286,6 +286,96 @@ def is_mock():
     return '/mock' in _BASE.lower() or 'sandbox' in _BASE.lower()
 
 
+# ── Alle Crew-Services (Resource-Pfade aus der Doku, 2026-07-22) ─────────────
+# Duty Events = Roster (oben). Die weiteren Services füttern bestehende
+# AeroX-Features: Landing Report → Flugbuch-Landungen, Flight Leg Details →
+# Flug-Fakten, Crew List → Crew-Feed, Crew Hotel → Hotel-Verzeichnis, Rotation.
+def crew_list(user_token, flight, date, dep, arr, access_code):
+    """COMMON_CREWLIST — wer fliegt mit (crewMembers[])."""
+    return _api_get(user_token, '/COMMON_CREWLIST', {
+        'flightDesignator': (flight or '').upper().replace(' ', ''),
+        'flightDate': _date_z(date), 'departureAirport': (dep or '').upper(),
+        'arrivalAirport': (arr or '').upper(), 'accessCode': access_code or ''})
+
+
+def crew_rotation(user_token, *rotation_numbers):
+    """COMMON_CREW_ROTATION — Rotations-Details (rotations[].shifts[].legs[])."""
+    params = {}
+    for i, rn in enumerate([r for r in rotation_numbers if r][:6]):
+        params['RN' if i == 0 else f'RN_{i + 1}'] = str(rn)
+    if not params:
+        return None
+    return _api_get(user_token, '/COMMON_CREW_ROTATION', params)
+
+
+def landing_report(user_token, flight, date, dep):
+    """COMMON_LANDING_REPORT — u. a. `landingPerformed` (Bool) für dieses Leg."""
+    return _api_get(user_token, '/COMMON_LANDING_REPORT', {
+        'flightDesignator': (flight or '').upper().replace(' ', ''),
+        'flightDate': _date_z(date), 'departureAirport': (dep or '').upper()})
+
+
+def flight_leg_details(user_token, flight, date=None, dep=None, arr=None):
+    """COMMON_FLIGHT_LEG_DETAILS — Reg/Muster/Gate/Blockzeit autoritativ."""
+    params = {'flightDesignator': (flight or '').upper().replace(' ', '')}
+    if date:
+        params['flightDate'] = _date_z(date)
+    if dep:
+        params['departureAirport'] = dep.upper()
+    if arr:
+        params['arrivalAirport'] = arr.upper()
+    return _api_get(user_token, '/COMMON_FLIGHT_LEG_DETAILS', params)
+
+
+def crew_hotel(user_token, station, provider=None):
+    """COMMON_CREW_HOTEL_INFO — Layover-Hotel-Infos für eine Station."""
+    params = {'station': (station or '').upper()}
+    if provider:
+        params['provider'] = provider
+    return _api_get(user_token, '/COMMON_CREW_HOTEL_INFO', params)
+
+
+def landing_performed(user_token, flight, date, dep):
+    """True/False/None — hat der eingeloggte Crew das Leg gelandet? Für die
+    Flugbuch-Auto-Füllung der Landungen. None = unbekannt/Fehler."""
+    r = landing_report(user_token, flight, date, dep)
+    if not isinstance(r, dict) or r.get('processingErrors'):
+        return None
+    lp = r.get('landingPerformed')
+    return bool(lp) if lp is not None else None
+
+
+def check_in_times(user_token, from_date=None, to_date=None, **extra):
+    """COMMON_CHECK_IN_TIMES — Report/Check-in-Zeiten (→ Pickup/Briefing).
+    Parameter noch nicht doku-verifiziert → flexibel (Datumsfenster + extra)."""
+    params = dict(extra)
+    if from_date:
+        params['fromDate'] = _date_z(from_date)
+    if to_date:
+        params['toDate'] = _date_z(to_date)
+    return _api_get(user_token, '/COMMON_CHECK_IN_TIMES', params)
+
+
+def airport_weather(user_token, station, **extra):
+    """COMMON_AIRPORT_WEATHER — Flughafenwetter (METAR/TAF-nah)."""
+    params = {'station': (station or '').upper(), **extra}
+    return _api_get(user_token, '/COMMON_AIRPORT_WEATHER', params)
+
+
+def simulator_crewlist(user_token, **params):
+    """COMMON_SIMULATOR_CREWLIST — Sim-Session-Crew."""
+    return _api_get(user_token, '/COMMON_SIMULATOR_CREWLIST', params)
+
+
+def service_get(user_token, service, params=None):
+    """Generischer Service-Call (für Diagnose/Verdrahtung). `service` ist der
+    COMMON_*-Name. Nur echte Services zulassen."""
+    s = (service or '').strip().upper()
+    if not s.startswith('COMMON_') or not re.fullmatch(r'COMMON_[A-Z_]+', s):
+        return None
+    return _api_get(user_token, '/' + s, params if isinstance(params, dict) else {})
+
+
 # Das einzige Fenster, für das der MOCK Daten hat (dokumentiertes Beispiel).
 _MOCK_WINDOW = ('2016-10-01', '2016-10-31')
 
@@ -488,3 +578,32 @@ def flightops_ping():
         'scope': _SCOPE,
         'redirect_uri': _REDIRECT_URI,
     })
+
+
+# Alle 9 Crew-Services (Konsole 2026-07-22) — der raw-Endpoint kann jeden davon
+# für den EIGENEN Token abfragen (Verdrahtung/Diagnose, sobald Mock/PROD live).
+FLIGHTOPS_SERVICES = (
+    'COMMON_DUTY_EVENTS', 'COMMON_CREWLIST', 'COMMON_CREW_ROTATION',
+    'COMMON_CHECK_IN_TIMES', 'COMMON_FLIGHT_LEG_DETAILS', 'COMMON_LANDING_REPORT',
+    'COMMON_CREW_HOTEL_INFO', 'COMMON_AIRPORT_WEATHER', 'COMMON_SIMULATOR_CREWLIST',
+)
+
+
+@lh_flightops_bp.route('/api/lh/flightops/raw/<token>', methods=['POST'])
+def flightops_raw(token):
+    """Verdrahtung/Diagnose: roher Service-Call für den EIGENEN Token (POST,
+    auth-gated). Body {service: 'COMMON_…', params: {…}}. Zeigt die echte
+    Response-Shape, sobald Mock/PROD antwortet — dann werden die Feature-Parser
+    (Crew-List/Hotel/Landing…) final verdrahtet."""
+    if not flightops_configured():
+        return jsonify({'ok': False, 'error': 'not_configured'}), 503
+    if not _valid_access(token):
+        return jsonify({'ok': False, 'error': 'not_connected'}), 401
+    body = request.get_json(silent=True) or {}
+    service = (body.get('service') or '').strip().upper()
+    if service not in FLIGHTOPS_SERVICES:
+        return jsonify({'ok': False, 'error': 'unknown_service',
+                        'services': list(FLIGHTOPS_SERVICES)}), 400
+    params = body.get('params') if isinstance(body.get('params'), dict) else {}
+    return jsonify({'ok': True, 'service': service,
+                    'response': service_get(token, service, params)})

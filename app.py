@@ -17019,6 +17019,12 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
     try:
         if not token or not _server_ical_refresh_enabled():
             return
+        # QUELLEN-PRIORITÄT: ist der User per FlightOps verbunden, ist DAS die
+        # primäre Quelle → Kalender-Abruf PAUSIERT (nicht gelöscht). Genau die
+        # Entlastung der myTime-Shares, die LH will. Reaktiviert automatisch,
+        # sobald FlightOps nicht mehr verbunden ist.
+        if _flightops_active(token):
+            return
         now_ts = time.time()
         with _feed_refresh_lock:
             if now_ts - _feed_refresh_last_attempt.get(token, 0) < _FEED_REFRESH_RETRY_GAP_S:
@@ -17097,6 +17103,51 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
                     f'[feed-refresh] tok={token[:8]} fail {type(e).__name__}: {str(e)[:120]}')
 
         _req_threading.Thread(target=_do_refresh, daemon=True).start()
+    except Exception:
+        pass
+
+
+# ── FlightOps (Engine B) — Server-seitiger Hintergrund-Refresh + Quellen-Pause ─
+_flightops_refresh_last = {}
+_flightops_refresh_lock = _req_threading.Lock()
+_FLIGHTOPS_REFRESH_GAP_S = 6 * 3600
+
+
+def _flightops_active(token):
+    """True wenn der User per FlightOps verbunden ist → dann ist FlightOps die
+    PRIMÄRE Roster-Quelle und der Kalender-Abruf wird pausiert (myTime-Share-Last
+    runter). Wirft nie."""
+    if not token:
+        return False
+    try:
+        from blueprints.lh_flightops import flightops_connected, flightops_configured
+        return bool(flightops_configured() and flightops_connected(token))
+    except Exception:
+        return False
+
+
+def _maybe_refresh_flightops(token):
+    """Gedrosselter server-seitiger Re-Import des FlightOps-Rosters im Daemon-
+    Thread. Der gespeicherte Refresh-Token holt neue Duty Events AUCH wenn die
+    App zu ist; die bestehende import→diff→push-Kette (import_calendar_feed)
+    feuert bei Plan-Änderungen. No-op ohne Verbindung. Wirft nie."""
+    try:
+        if not _flightops_active(token):
+            return
+        now_ts = time.time()
+        with _flightops_refresh_lock:
+            if now_ts - _flightops_refresh_last.get(token, 0) < _FLIGHTOPS_REFRESH_GAP_S:
+                return
+            _flightops_refresh_last[token] = now_ts
+
+        def _do():
+            try:
+                from blueprints.lh_flightops import flightops_import
+                with app.test_request_context(json={}):
+                    flightops_import(token)
+            except Exception as e:
+                app.logger.warning(f'[flightops-refresh] tok={token[:8]} {type(e).__name__}')
+        _req_threading.Thread(target=_do, daemon=True).start()
     except Exception:
         pass
 
@@ -17485,6 +17536,10 @@ def get_briefings(token):
     # Eigener Roster wird gelesen → ggf. den myTime-Feed frisch ziehen
     # (Pickup-Events erscheinen erst ~1 Tag vorher, siehe Helper-Doku).
     _maybe_refresh_calendar_feed(token)
+    # FlightOps (Engine B): verbundene Crew bekommt neue Duty Events auch im
+    # Hintergrund (gedrosselt) — Plan-Änderungen lösen die bestehende Push-Kette
+    # aus, ohne dass der User die App öffnet. No-op ohne Verbindung.
+    _maybe_refresh_flightops(token)
     try:
         data = dict(_manual_briefings_load(token) or {})
     except Exception as e:
