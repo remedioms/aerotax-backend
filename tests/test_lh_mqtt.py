@@ -325,6 +325,77 @@ def test_inbound_reg_mismatch_no_push(client, monkeypatch):
     assert d['pushed'] == 0
 
 
+def test_inbound_delay_pushes_before_feeder_departs(client, monkeypatch):
+    # Der Zubringer verspätet sich schon VOR seinem Start → Frühwarnung an die
+    # wartende Crew (est_dep-Event, Delay ≥15).
+    from datetime import datetime as dt, timezone as tz
+    now = dt.now(tz.utc)
+    facts = dict(INBOUND_FACTS, dep_delay_min=35,
+                 est_dep='2026-07-22T15:30:00+02:00',
+                 sched_dep='2026-07-22T14:55:00+02:00')
+    pushes = []
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: dict(facts))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: _rows([_layover_leg(now, tail='D-AIKP')]))
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: [])
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda tok, title, body, data=None, idempotency_key=None:
+                        pushes.append((title, body, data, idempotency_key)))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('New Estimated Departure',
+                                     flight='LH123')).get_json()
+    assert d['kind'] == 'est_dep' and d['pushed'] == 1
+    title, body, data, key = pushes[0]
+    assert 'verspätet sich' in title and 'LH400' in title
+    assert 'D-AIKP (LH123) startet in MUC erst 15:30 (+35 min)' in body
+    assert 'Ankunft in FRA ca. 14:30' in body
+    assert data['type'] == 'inbound_delay'
+    assert 'estdep:15:30' in key
+
+
+def test_inbound_delay_small_is_silent(client, monkeypatch):
+    facts = dict(INBOUND_FACTS, dep_delay_min=8,
+                 est_dep='2026-07-22T15:03:00+02:00')
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: dict(facts))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: pytest.fail('unter 15 min kein Station-Query'))
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda *a, **k: pytest.fail('+8 min pusht nicht'))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('New Estimated Departure',
+                                     flight='LH123')).get_json()
+    assert d['pushed'] == 0
+
+
+def test_est_dep_serves_direct_crew_and_inbound_watchers(client, monkeypatch):
+    # LH123 ist ROSTER-Flug von user0 UND Zubringer von user0s Kollegin (LH400
+    # ab FRA) → beide Pushes aus EINEM Event.
+    from datetime import datetime as dt, timezone as tz
+    now = dt.now(tz.utc)
+    facts = dict(INBOUND_FACTS, dep_delay_min=35,
+                 est_dep='2026-07-22T15:30:00+02:00',
+                 sched_dep='2026-07-22T14:55:00+02:00')
+    direct_leg = {'flight': 'LH123', 'from': 'MUC', 'to': 'FRA',
+                  'dep_iso': (now).isoformat()}
+    pushes = []
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight',
+                        lambda dates, c, n: _rows([direct_leg]))
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: dict(facts))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: _rows([_layover_leg(now, tail='D-AIKP')]))
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: [])
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda tok, title, body, data=None, idempotency_key=None:
+                        pushes.append(data['type']))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('New Estimated Departure',
+                                     flight='LH123')).get_json()
+    assert d['pushed'] == 2
+    assert sorted(pushes) == ['flight_update', 'inbound_delay']
+
+
 def test_inbound_topics_subscribe_feeder_flight(monkeypatch):
     from datetime import datetime as dt, timezone as tz, timedelta as td
     from zoneinfo import ZoneInfo

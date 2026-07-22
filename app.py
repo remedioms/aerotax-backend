@@ -11010,6 +11010,7 @@ _PUSH_TYPE_TO_PREF = {
     'flight_update': 'roster_change',
     'inbound_departure': 'roster_change',
     'inbound_arrival': 'roster_change',
+    'inbound_delay': 'roster_change',
 }
 
 
@@ -32444,6 +32445,116 @@ def _board_day_midnight_ok(want_day, bsched):
         return False
 
 
+# ── LH Open API → _flight_obs_merged (Engine A2, 2026-07-22) ─────────────────
+# Der ZWEITE Board-Leser bekommt dieselbe LH-Veredelung wie
+# _flight_facts_from_obs (der Blueprint-Merge) — bisher liefen Radar-Callout-
+# Fallback-Zeiten (_merged_times_for), Inbound-Kette und alle Tail-Pfad-
+# Consumer OHNE die autoritativen LH-Fakten. Bewusst FILL-ONLY (nie
+# überschreiben): die rec-Felder tragen Board-lokale Formate (bare HH:MM),
+# Überschreiben mit Offset-ISO würde bestehende Parser-Consumer brechen.
+# Outstation-Fall (gar keine Board-Seite): purer LH-Record statt None —
+# genau dort ist dieser Leser am blindesten (kein DEP-Board gescraped).
+
+_LH_OBS_FILL = (  # (rec-Key, lh-Key) — Shape-Adapter zwischen den zwei Welten
+    ('sched_dep', 'sched_dep'), ('esti_dep', 'est_dep'),
+    ('dep_delay_min', 'dep_delay_min'), ('gate_dep', 'gate'),
+    ('terminal_dep', 'terminal'),
+    ('sched_arr', 'sched_arr'), ('esti_arr', 'est_arr'),
+    ('arr_delay_min', 'arr_delay_min'), ('gate_arr', 'arr_gate'),
+    ('terminal_arr', 'arr_terminal'),
+    ('reg', 'reg'), ('aircraft', 'type'),
+    ('dep_iata', 'dep_iata'), ('arr_iata', 'arr_iata'),
+)
+
+
+def _lh_apply_obs_fill(rec, lh):
+    """PURE (testbar): LH-Fakten (Shape `_obs_rows_to_facts`) FILL-ONLY in die
+    `_flight_obs_merged`-Record-Shape. rec=None → minimaler purer LH-Record
+    (oder None, wenn LH nichts Brauchbares hat)."""
+    if not isinstance(lh, dict) or not lh:
+        return rec
+    out = dict(rec) if rec is not None else {
+        'flight': None, 'date': None, 'dep_iata': None, 'arr_iata': None,
+        'airline': None, 'dest_name': None, 'origin_name': None,
+        'sched_dep': None, 'esti_dep': None, 'dep_delay_min': None,
+        'gate_dep': None, 'terminal_dep': None, 'status_dep': None,
+        'dep_cancelled': None,
+        'sched_arr': None, 'esti_arr': None, 'arr_delay_min': None,
+        'gate_arr': None, 'terminal_arr': None, 'status_arr': None,
+        'arr_cancelled': None,
+        'status': None, 'cancelled': None, 'delay_min': None,
+        'delay_side': None, 'delay_known': False, 'reg': None,
+        'aircraft': None, 'sides': {'dep': None, 'arr': None},
+        'has_dep': False, 'has_arr': False,
+        'est_dep_iso': None, 'est_arr_iso': None,
+    }
+    filled = False
+    for rk, lk in _LH_OBS_FILL:
+        if out.get(rk) is None and lh.get(lk) is not None:
+            out[rk] = lh[lk]
+            filled = True
+    if out.get('cancelled') is None and lh.get('cancelled'):
+        out['cancelled'] = True
+        filled = True
+    # Absolute UTC-Est-Zeiten: LH liefert Offset-ISO → direkt nach UTC heben
+    # (KEIN _board_local_to_utc_iso — das würde den Offset doppelt anwenden).
+    for iso_k, lk in (('est_dep_iso', 'est_dep'), ('est_arr_iso', 'est_arr')):
+        if out.get(iso_k) is None and lh.get(lk):
+            try:
+                from datetime import datetime as _dtl, timezone as _tzl
+                _dv = _dtl.fromisoformat(str(lh[lk]))
+                if _dv.tzinfo is not None:
+                    out[iso_k] = _dv.astimezone(_tzl.utc).isoformat()
+                    filled = True
+            except Exception:
+                pass
+    # Beste Ein-Zahl nachziehen, wenn bisher KEINE Seite Delay-Wissen hatte
+    # (arr bleibt die ehrlichere Metrik — gleiche Politik wie der Board-Merge).
+    if out.get('delay_min') is None:
+        if out.get('arr_delay_min') is not None:
+            out['delay_min'] = out['arr_delay_min']
+            out['delay_side'] = 'arr'
+            out['delay_known'] = True
+        elif out.get('dep_delay_min') is not None:
+            out['delay_min'] = out['dep_delay_min']
+            out['delay_side'] = 'dep'
+            out['delay_known'] = True
+    if filled:
+        out['lh'] = True
+    return out if (rec is not None or filled) else None
+
+
+def _lh_fill_obs_merged(rec, fn, date_q, dep, arr):
+    """Gated impure Hülle um `_lh_apply_obs_fill`: LH nur ziehen, wenn dem
+    Board-Record KERN-Zeiten fehlen (Budget-Schutz — board-komplette Flüge
+    zahlen keinen LH-Call; das (flight,date)-Memo in lh_flight_facts dedupt
+    Fan-out-Pfade zusätzlich). Wirft nie."""
+    need = (rec is None or rec.get('sched_dep') is None
+            or rec.get('sched_arr') is None
+            or (rec.get('esti_arr') is None
+                and rec.get('arr_delay_min') is None))
+    if not need:
+        return rec
+    try:
+        from blueprints.lh_open_api import lh_flight_facts, is_lh_group
+        if not is_lh_group(fn):
+            return rec
+        import time as _tlh
+        d = (date_q or _tlh.strftime('%Y-%m-%d', _tlh.gmtime()))
+        lh = lh_flight_facts(fn, d, dep, arr)
+    except Exception:
+        return rec
+    out = _lh_apply_obs_fill(rec, lh)
+    if rec is None and out is not None:
+        out['flight'] = fn
+        out['date'] = date_q
+        if out.get('dep_iata') is None:
+            out['dep_iata'] = dep
+        if out.get('arr_iata') is None:
+            out['arr_iata'] = arr
+    return out
+
+
 def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
                        live=True, free_only=False, arr_date=None):
     """EIN gemergter Record für einen Flug aus ALLEN verfügbaren Beobachtungen
@@ -32681,9 +32792,17 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
                     pass
 
     if dep_row is None and arr_row is None:
-        _FLIGHT_MERGE_CACHE[ckey] = (_t.time(), None)
+        # Kein Board auf beiden Seiten (typisch Outstation) → LH Open API als
+        # letzte freie Quelle (Engine A2): purer LH-Record statt None.
+        _rec0 = None
+        try:
+            _rec0 = _lh_fill_obs_merged(None, fn, date_q, dep, arr)
+        except Exception:
+            _rec0 = None
+        _FLIGHT_MERGE_CACHE[ckey] = (_t.time(),
+                                     dict(_rec0) if _rec0 else None)
         _cache_soft_cap(_FLIGHT_MERGE_CACHE)
-        return None
+        return _rec0
 
     def _s(row, k):
         v = (row or {}).get(k)
@@ -32884,6 +33003,13 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
                 rec['delay_min'] = (rec.get('dep_delay_min'))
                 rec['delay_side'] = 'dep' if rec.get('dep_delay_min') is not None else 'arr'
             rec['esti_scrubbed'] = True
+    except Exception:
+        pass
+    # LH Open API (Engine A2): Lücken der Board-Sicht autoritativ füllen —
+    # NACH allen Scrubs (der LH-Fill soll nicht als „Fremd-Rotation" wieder
+    # rausfliegen; LH ist date-exakt). Fill-only, wirft nie.
+    try:
+        rec = _lh_fill_obs_merged(rec, fn, date_q, dep, arr)
     except Exception:
         pass
     _FLIGHT_MERGE_CACHE[ckey] = (_t.time(), dict(rec))

@@ -541,14 +541,19 @@ def _build_push(kind, flight_disp, topic_date, facts, sector):
     return None
 
 
-def _push_inbound(kind, event_flight, topic_date):
-    """Departed/Arrived eines (subscribten) Flugs: die Crews finden, deren
-    NÄCHSTES Leg am Ankunfts-Airport mit GENAU dieser Maschine geplant ist,
-    und ihnen den Zubringer-Status pushen — im Layover weiß man so, ob der
-    eigene Abflug pünktlich wird. Guard gegen die Früh-Rotation derselben
+def _push_inbound(kind, event_flight, topic_date, facts=None):
+    """Departed/Arrived/Est-Dep eines (subscribten) Flugs: die Crews finden,
+    deren NÄCHSTES Leg am Ankunfts-Airport mit GENAU dieser Maschine geplant
+    ist, und ihnen den Zubringer-Status pushen — im Layover weiß man so, ob
+    der eigene Abflug pünktlich wird (est_dep = Frühwarnung noch VOR dem
+    Zubringer-Start, ab 15 min). Guard gegen die Früh-Rotation derselben
     Maschine: der Event-Flug muss der BESTE (letzte) Board-Inbound vor dem
     Leg sein; ohne Board-Daten (Outstation) zählt der Maschinen-Match."""
-    facts = lh_flight_facts(event_flight, topic_date, force=True) or {}
+    facts = facts or lh_flight_facts(event_flight, topic_date, force=True) or {}
+    if kind == 'est_dep':
+        d = facts.get('dep_delay_min')
+        if not isinstance(d, int) or d < 15 or not facts.get('est_dep'):
+            return 0
     reg = facts.get('reg')
     arr = (facts.get('arr_iata') or '').strip().upper()
     if not reg or len(arr) != 3:
@@ -604,6 +609,22 @@ def _push_inbound(kind, event_flight, topic_date):
                 body += f' — Ankunft in {arr} ca. {est_arr}'
             body += f'{delay_txt}.'
             ptype = 'inbound_departure'
+            key = f'lhflup:inb:{event_flight}:{topic_date}:{kind}:{tok}'
+        elif kind == 'est_dep':
+            est_dep = _hhmm(facts.get('est_dep'))
+            dep_delay = facts.get('dep_delay_min')
+            title = f'Dein Flieger verspätet sich · {user_flight}'
+            body = f'{reg} ({event_flight}) startet'
+            if origin:
+                body += f' in {origin}'
+            body += f' erst {est_dep} (+{dep_delay} min)'
+            if est_arr:
+                body += f' — Ankunft in {arr} ca. {est_arr}'
+            body += '.'
+            ptype = 'inbound_delay'
+            # wert-basiert: neue Est-Zeit = neuer Push, gleiche nie doppelt
+            key = (f'lhflup:inb:{event_flight}:{topic_date}:estdep:'
+                   f'{est_dep}:{tok}')
         else:
             title = f'Dein Flieger ist gelandet · {user_flight}'
             body = f'{reg} ist in {arr} gelandet{delay_txt}'
@@ -611,7 +632,7 @@ def _push_inbound(kind, event_flight, topic_date):
                 body += f' — dein {user_flight} geht um {dep_local}'
             body += '.'
             ptype = 'inbound_arrival'
-        key = f'lhflup:inb:{event_flight}:{topic_date}:{kind}:{tok}'
+            key = f'lhflup:inb:{event_flight}:{topic_date}:{kind}:{tok}'
         try:
             _do_push(tok, title, body,
                      data={'type': ptype, 'flight': user_flight,
@@ -694,10 +715,13 @@ def lh_mqtt_event():
             except Exception as e:
                 log.warning('[lh_mqtt] push fail %s: %s', flight_disp,
                             type(e).__name__)
-    elif kind in ('departed', 'arrived'):
-        # Inbound-Watch: diese Maschine ist der Zubringer für wen?
+    if kind in ('departed', 'arrived', 'est_dep'):
+        # Inbound-Watch: diese Maschine ist der Zubringer für wen? est_dep
+        # zusätzlich zur Direkt-Crew — der Zubringer eines ANDEREN Legs kann
+        # sich schon VOR seinem Abflug verspäten (Layover-Frühwarnung).
         try:
-            pushed = _push_inbound(kind, flight_disp, topic_date)
+            pushed += _push_inbound(kind, flight_disp, topic_date,
+                                    facts=facts or None)
         except Exception as e:
             log.warning('[lh_mqtt] inbound push fail %s: %s', flight_disp,
                         type(e).__name__)
