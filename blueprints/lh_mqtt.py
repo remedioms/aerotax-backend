@@ -51,6 +51,11 @@ lh_mqtt_bp = Blueprint('lh_mqtt_bp', __name__)
 _SUB_PAST_H = 4
 _SUB_FUTURE_H = 48
 
+# Inbound-Watch (Owner 22.07.: „was cool ist, wann der Inbound-Flieger
+# abfliegt und ankommt — dann weiß man im Layover, ob es pünktlich ist"):
+# Legs mit Abflug in diesem Fenster bekommen die Maschinen-Zubringer-Topics.
+_INBOUND_DEP_WINDOW_H = 16
+
 _TOPIC_RE = re.compile(r'^prd/FlightUpdate/([A-Z0-9]{2})/([A-Z0-9]{2})(\d{1,4})/'
                        r'(\d{4}-\d{2}-\d{2})$')
 _FLIGHT_RE = re.compile(r'^([A-Z0-9]{2})(\d{1,4})[A-Z]?$')
@@ -198,6 +203,27 @@ def _rows_for_flight(dates, carrier, num):
     return out
 
 
+def _rows_from_station(dates, station):
+    """Nur Rows, deren Sektoren an dieser Station STARTEN (jsonb-Containment)
+    — für den Inbound-Watch am Ankunfts-Airport eines Events. Fallback:
+    paginierter Voll-Fetch."""
+    client = _sb()
+    if client is None:
+        return []
+    try:
+        r = (client.table('user_ical_briefings')
+             .select(_SECTOR_SELECT)
+             .in_('datum', list(dates))
+             .filter('raw_event->ical_sectors', 'cs',
+                     f'[{{"from":"{station}"}}]')
+             .execute())
+        return r.data or []
+    except Exception as e:
+        log.warning('[lh_mqtt] station rows cs fail %s: %s', station,
+                    type(e).__name__)
+        return _sector_rows(dates)
+
+
 def _iter_sectors(rows):
     """(token, sector_dict) über alle Briefing-Rows (neue schlanke 'sectors'-
     Shape, legacy raw_event.ical_sectors als Fallback)."""
@@ -232,6 +258,169 @@ def topics_for_rows(rows, now_utc):
     return sorted(topics)
 
 
+# ── Inbound-Watch: Maschinen-Zubringer eines Roster-Legs ─────────────────────
+
+def _sector_tail(s):
+    """Roster-Tail eines Sektors (gleiche Key-Kaskade wie crew_live_state).
+    Meist LEER — Tails werden nur in API-Antworten enriched, nicht in Supabase
+    zurückgeschrieben; dann greift die LH-autoritative Reg (_cached_leg_reg)."""
+    for k in ('tail', 'reg', 'ac_reg', 'registration', 'aircraft_reg'):
+        v = s.get(k)
+        if v:
+            return str(v)
+    return None
+
+
+# Reg-Memo entkoppelt vom 120s-Facts-Memo: Maschinen-Zuteilung ändert sich
+# selten — 45 min TTL hält den LH-Budget-Verbrauch der Topics-Rechnung klein.
+_reg_lock = threading.Lock()
+_reg_memo = {}
+_REG_TTL_S = 2700
+_REG_NEG_TTL_S = 600
+
+
+def _cached_leg_reg(flight_disp, date, dep, arr):
+    key = (flight_disp, date, dep, arr)
+    now = time.time()
+    with _reg_lock:
+        hit = _reg_memo.get(key)
+        if hit and now < hit[0]:
+            return hit[1]
+    reg = (lh_flight_facts(flight_disp, date, dep, arr) or {}).get('reg')
+    with _reg_lock:
+        _reg_memo[key] = (now + (_REG_TTL_S if reg else _REG_NEG_TTL_S), reg)
+        if len(_reg_memo) > 3000:
+            items = sorted(_reg_memo.items(), key=lambda kv: kv[1][0])
+            for k, _v in items[:len(items) // 4 or 1]:
+                _reg_memo.pop(k, None)
+    return reg
+
+
+def _station_tz(iata):
+    try:
+        from airport_tz import AIRPORT_TZ
+        from zoneinfo import ZoneInfo
+        name = AIRPORT_TZ.get((iata or '').upper(), (None, None))[1]
+        return ZoneInfo(name) if name else None
+    except Exception:
+        return None
+
+
+def _board_dt(date_str, val, tz):
+    """Board-Zeit ('14:30' | ISO) + Service-Datum → aware datetime (Board-
+    Zeiten sind stations-lokal) oder None."""
+    if not val or not date_str:
+        return None
+    v = str(val).strip()
+    try:
+        if 'T' in v:
+            d = datetime.fromisoformat(v.replace('Z', '+00:00'))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=tz)
+            return d
+        hh, mm = v[:5].split(':')
+        base = datetime.fromisoformat(date_str[:10])
+        return base.replace(hour=int(hh), minute=int(mm), tzinfo=tz)
+    except Exception:
+        return None
+
+
+def _arr_board_rows(stations, regs, dates):
+    """ARR-Board-Rows (airport='<Station>#ARR') für die Reg-Kandidaten —
+    EIN Batch-Query, Reg-Varianten mit/ohne Bindestrich. Wirft nie."""
+    client = _sb()
+    if client is None or not stations or not regs:
+        return []
+    from blueprints.lh_open_api import _norm_reg
+    variants = set()
+    for r in regs:
+        rn = str(r).replace('-', '').upper()
+        variants.add(rn)
+        variants.add(_norm_reg(rn))
+    try:
+        r = (client.table('airport_delay_obs')
+             .select('airport,flight,reg,sched,esti,date')
+             .in_('airport', [f'{s}#ARR' for s in sorted(stations)])
+             .in_('date', sorted(dates))
+             .in_('reg', sorted(variants)).execute())
+        return r.data or []
+    except Exception as e:
+        log.warning('[lh_mqtt] arr board rows fail: %s', type(e).__name__)
+        return []
+
+
+def _best_inbound_for_leg(arr_rows, frm, reg, dep_utc):
+    """Die LETZTE Board-Ankunft dieser Maschine vor dem Leg-Abflug — das ist
+    der Zubringer. Ohne Airport-TZ keine Aussage (lieber kein Inbound als der
+    falsche aus der Morgen-Rotation)."""
+    tz = _station_tz(frm)
+    if tz is None or dep_utc is None:
+        return None
+    dep_local = dep_utc.astimezone(tz)
+    rn = (reg or '').replace('-', '').upper()
+    best, best_dt = None, None
+    for row in arr_rows or []:
+        if (row.get('airport') or '') != f'{frm}#ARR':
+            continue
+        if str(row.get('reg') or '').replace('-', '').upper() != rn:
+            continue
+        dt = _board_dt(row.get('date'), row.get('esti') or row.get('sched'), tz)
+        if dt is None:
+            continue
+        if not (dep_local - timedelta(hours=12) <= dt
+                <= dep_local + timedelta(minutes=45)):
+            continue
+        if best_dt is None or dt > best_dt:
+            best, best_dt = row, dt
+    return best
+
+
+def inbound_topics_for_rows(rows, now_utc):
+    """Topics der Maschinen-Zubringer: pro Leg (Abflug −1h…+16h) die LH-
+    autoritative Reg holen, am Abflug-Airport die letzte ARR-Board-Ankunft
+    dieser Reg finden → deren Flug subscriben (Topic-Datum = Board-Service-
+    Datum, plus Vortag für Langstrecken-Zubringer, die lokal am Vortag
+    starteten)."""
+    lo = now_utc - timedelta(hours=1)
+    hi = now_utc + timedelta(hours=_INBOUND_DEP_WINDOW_H)
+    legs = []
+    for _tok, s in _iter_sectors(rows):
+        nf = _norm_flight(s.get('flight'))
+        if not nf or not is_lh_group(nf[0] + nf[1]):
+            continue
+        dep = _parse_iso_utc(s.get('dep_iso'))
+        frm = (s.get('from') or '').strip().upper()
+        if dep is None or len(frm) != 3 or not (lo <= dep <= hi):
+            continue
+        reg = _sector_tail(s) or _cached_leg_reg(
+            nf[0] + nf[1], dep.date().isoformat(), frm,
+            (s.get('to') or '').strip().upper() or None)
+        if reg:
+            legs.append((frm, str(reg).replace('-', '').upper(), dep))
+    if not legs:
+        return set()
+    dates = {(now_utc.date() + timedelta(days=o)).isoformat()
+             for o in (-1, 0, 1)}
+    obs = _arr_board_rows({f for f, _r, _d in legs},
+                          {r for _f, r, _d in legs}, dates)
+    topics = set()
+    for frm, reg, dep in legs:
+        row = _best_inbound_for_leg(obs, frm, reg, dep)
+        if not row:
+            continue
+        nf = _norm_flight(row.get('flight'))
+        try:
+            base = datetime.fromisoformat(str(row.get('date'))[:10]).date()
+        except Exception:
+            continue
+        if not nf:
+            continue
+        for off in (0, -1):
+            d = (base + timedelta(days=off)).isoformat()
+            topics.add(f'prd/FlightUpdate/{nf[0]}/{nf[0]}{nf[1]}/{d}')
+    return topics
+
+
 @lh_mqtt_bp.route('/api/internal/lh-mqtt/topics', methods=['GET'])
 def lh_mqtt_topics():
     if not _secret_ok():
@@ -244,7 +433,13 @@ def lh_mqtt_topics():
     now_utc = datetime.now(timezone.utc)
     dates = [(now_utc.date() + timedelta(days=off)).isoformat()
              for off in (-1, 0, 1, 2)]
-    topics = topics_for_rows(_sector_rows(dates), now_utc)
+    rows = _sector_rows(dates)
+    tset = set(topics_for_rows(rows, now_utc))
+    try:
+        tset |= inbound_topics_for_rows(rows, now_utc)
+    except Exception as e:
+        log.warning('[lh_mqtt] inbound topics fail: %s', type(e).__name__)
+    topics = sorted(tset)
     with _topics_lock:
         _topics_memo['ts'] = now
         _topics_memo['topics'] = topics
@@ -321,18 +516,6 @@ def _build_push(kind, flight_disp, topic_date, facts, sector):
     except Exception:
         nice_date = topic_date
 
-    if kind == 'gate':
-        gate = facts.get('gate')
-        term = facts.get('terminal')
-        where = None
-        if gate:
-            where = f'Gate {gate}' + (f' (Terminal {term})' if term else '')
-        body = (f'{route or flight_disp} am {nice_date}: {where}.' if where
-                else f'{route or flight_disp} am {nice_date}: neues Gate '
-                     'veröffentlicht — Details in der App.')
-        return (f'Gate-Änderung · {flight_disp}', body,
-                f'gate:{gate or "unbekannt"}')
-
     if kind == 'est_dep':
         delay = facts.get('dep_delay_min')
         est = _hhmm(facts.get('est_dep'))
@@ -356,6 +539,92 @@ def _build_push(kind, flight_disp, topic_date, facts, sector):
         return (f'Umleitung · {flight_disp}', body, 'diverted')
 
     return None
+
+
+def _push_inbound(kind, event_flight, topic_date):
+    """Departed/Arrived eines (subscribten) Flugs: die Crews finden, deren
+    NÄCHSTES Leg am Ankunfts-Airport mit GENAU dieser Maschine geplant ist,
+    und ihnen den Zubringer-Status pushen — im Layover weiß man so, ob der
+    eigene Abflug pünktlich wird. Guard gegen die Früh-Rotation derselben
+    Maschine: der Event-Flug muss der BESTE (letzte) Board-Inbound vor dem
+    Leg sein; ohne Board-Daten (Outstation) zählt der Maschinen-Match."""
+    facts = lh_flight_facts(event_flight, topic_date, force=True) or {}
+    reg = facts.get('reg')
+    arr = (facts.get('arr_iata') or '').strip().upper()
+    if not reg or len(arr) != 3:
+        return 0
+    rn = str(reg).replace('-', '').upper()
+    now_utc = datetime.now(timezone.utc)
+    dates = [(now_utc.date() + timedelta(days=o)).isoformat()
+             for o in (-1, 0, 1, 2)]
+    rows = _rows_from_station(dates[:3], arr)
+    est_arr = _hhmm(facts.get('est_arr') or facts.get('sched_arr'))
+    origin = facts.get('dep_iata')
+    delay = facts.get('arr_delay_min')
+    delay_txt = (f' ({delay:+d} min)'
+                 if isinstance(delay, int) and abs(delay) >= 5 else '')
+    obs = None
+    pushed = 0
+    seen = set()
+    for tok, s in _iter_sectors(rows):
+        if not tok or tok in seen:
+            continue
+        frm = (s.get('from') or '').strip().upper()
+        if frm != arr:
+            continue
+        dep = _parse_iso_utc(s.get('dep_iso'))
+        if dep is None or not (now_utc - timedelta(hours=1) <= dep
+                               <= now_utc + timedelta(
+                                   hours=_INBOUND_DEP_WINDOW_H)):
+            continue
+        nf = _norm_flight(s.get('flight'))
+        if not nf or not is_lh_group(nf[0] + nf[1]):
+            continue
+        user_flight = nf[0] + nf[1]
+        leg_reg = _sector_tail(s) or _cached_leg_reg(
+            user_flight, dep.date().isoformat(), frm,
+            (s.get('to') or '').strip().upper() or None)
+        if not leg_reg or str(leg_reg).replace('-', '').upper() != rn:
+            continue
+        if obs is None:
+            obs = _arr_board_rows({arr}, {rn}, set(dates[:3]))
+        best = _best_inbound_for_leg(obs, arr, rn, dep)
+        if best is not None:
+            bn = _norm_flight(best.get('flight'))
+            if bn and (bn[0] + bn[1]) != event_flight:
+                continue  # Event ist eine frühere Rotation der Maschine
+        tz = _station_tz(frm)
+        dep_local = dep.astimezone(tz).strftime('%H:%M') if tz else None
+        if kind == 'departed':
+            title = f'Dein Flieger ist gestartet · {user_flight}'
+            body = f'{reg} kommt als {event_flight}'
+            if origin:
+                body += f' aus {origin}'
+            if est_arr:
+                body += f' — Ankunft in {arr} ca. {est_arr}'
+            body += f'{delay_txt}.'
+            ptype = 'inbound_departure'
+        else:
+            title = f'Dein Flieger ist gelandet · {user_flight}'
+            body = f'{reg} ist in {arr} gelandet{delay_txt}'
+            if dep_local:
+                body += f' — dein {user_flight} geht um {dep_local}'
+            body += '.'
+            ptype = 'inbound_arrival'
+        key = f'lhflup:inb:{event_flight}:{topic_date}:{kind}:{tok}'
+        try:
+            _do_push(tok, title, body,
+                     data={'type': ptype, 'flight': user_flight,
+                           'date': dep.date().isoformat(),
+                           'inbound_flight': event_flight, 'reg': str(reg),
+                           'kind': kind},
+                     idempotency_key=key)
+            pushed += 1
+            seen.add(tok)
+        except Exception as e:
+            log.warning('[lh_mqtt] inbound push fail %s: %s', user_flight,
+                        type(e).__name__)
+    return pushed
 
 
 def _record_event(topic, kind, users, pushed):
@@ -398,20 +667,17 @@ def lh_mqtt_event():
     affected = _users_for_flight(rows, carrier, num, topic_date)
 
     # Frische LH-Fakten (force umgeht den Memo — der Sinn des Push-Kanals ist
-    # ja gerade: Fakten JETZT, nicht nach TTL). Leg-Wahl über den ersten
-    # betroffenen Sektor; ohne betroffene User reicht der Cache-Refresh nicht
-    # (kein Push, kein Bedarf) → Budget schonen, gar nicht erst ziehen.
+    # ja gerade: Fakten JETZT, nicht nach TTL). Gate-Events refreshen NUR die
+    # Fakten (Owner 22.07.: „Gate ist egal" — kein Push, aber die App zeigt
+    # so das frische Gate). Leg-Wahl über den ersten betroffenen Sektor.
     facts = {}
-    push_worthy = kind in ('gate', 'est_dep', 'cancelled', 'diverted')
-    if affected and push_worthy:
+    pushed = 0
+    if kind in ('gate', 'est_dep', 'cancelled', 'diverted') and affected:
         s0 = affected[0][1]
         facts = lh_flight_facts(flight_disp, topic_date,
                                 (s0.get('from') or '').strip().upper() or None,
                                 (s0.get('to') or '').strip().upper() or None,
                                 force=True) or {}
-
-    pushed = 0
-    if push_worthy:
         for tok, sector in affected:
             built = _build_push(kind, flight_disp, topic_date, facts, sector)
             if not built:
@@ -428,6 +694,13 @@ def lh_mqtt_event():
             except Exception as e:
                 log.warning('[lh_mqtt] push fail %s: %s', flight_disp,
                             type(e).__name__)
+    elif kind in ('departed', 'arrived'):
+        # Inbound-Watch: diese Maschine ist der Zubringer für wen?
+        try:
+            pushed = _push_inbound(kind, flight_disp, topic_date)
+        except Exception as e:
+            log.warning('[lh_mqtt] inbound push fail %s: %s', flight_disp,
+                        type(e).__name__)
 
     _record_event(topic, kind, len(affected), pushed)
     log.info('[lh_mqtt] event %s kind=%s users=%d pushed=%d', topic, kind,

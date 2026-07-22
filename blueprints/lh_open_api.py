@@ -40,10 +40,13 @@ _SECRET = (os.environ.get('LH_OPEN_API_SECRET') or os.environ.get('LH_SECRET') o
 
 # Lufthansa-Group OPERIERENDE Carrier (die AeroX-Crews fliegen). Verifiziert
 # 2026-07-21, dass die Open API LH/LX/4Y liefert; OS/SN/EW/EN/CL/WK sind
-# dieselbe Group. Bewusst KEINE Nicht-Group-Carrier — schont das 1.000/h-Budget
+# dieselbe Group. AZ (ITA Airways, Group seit 2025) verifiziert 2026-07-22:
+# flightstatus liefert volle AZ-Daten inkl. Actuals (AZ1157) und der
+# Notification-Broker streamt AZ-Events — Owner-Entscheid „ITA ist auch LH
+# Group". Bewusst KEINE Nicht-Group-Carrier — schont das 1.000/h-Budget
 # (Roster-Sektoren der Crew sind immer Group-Flüge). VL (Lufthansa City,
 # AeroX-Synthetik-Prefix) ist KEIN eigener API-Carrier → ausgelassen.
-_LH_GROUP = {'LH', 'LX', 'OS', 'SN', 'EW', '4Y', 'EN', 'CL', 'WK'}
+_LH_GROUP = {'LH', 'LX', 'OS', 'SN', 'EW', '4Y', 'EN', 'CL', 'WK', 'AZ'}
 
 # ── Token-Cache ──────────────────────────────────────────────────────────────
 _tok_lock = threading.Lock()

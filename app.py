@@ -11004,9 +11004,12 @@ _PUSH_TYPE_TO_PREF = {
     'family_reaction': 'family_message',
     'trade_interest': 'community',
     'trade_closed': 'community',
-    # LH-MQTT-Flug-Events (Gate/Verspätung/Annullierung) zählen zum
-    # Dienstplan-Pref — gleiche Nutzer-Erwartung wie roster_change.
+    # LH-MQTT-Flug-Events (Verspätung/Annullierung/Umleitung + Inbound-
+    # Zubringer gestartet/gelandet) zählen zum Dienstplan-Pref — gleiche
+    # Nutzer-Erwartung wie roster_change.
     'flight_update': 'roster_change',
+    'inbound_departure': 'roster_change',
+    'inbound_arrival': 'roster_change',
 }
 
 
@@ -22175,37 +22178,30 @@ def _forum_author_snapshot(token):
 
 
 def _wall_post_as_forum_thread(p):
-    """Projiziert einen Wall-Post in die Forum-Thread-Form, FALLS er einen
-    Forum-Kategorie-Hashtag trägt (#cabin/#cockpit/…). So erscheint ein im
-    Crew-Feed erstellter Post auch im passenden Forum-Board (BUG-3: Feed und
-    Forum sind getrennte Stores — wall_posts vs forum_threads — der Composer
-    hängt die Kategorie als ersten Hashtag an, hier lesen wir sie wieder).
+    """Projiziert einen Wall-Post in die Forum-Thread-Form. Kategorie = erster
+    Forum-Kategorie-Hashtag (#cabin/#cockpit/…), sonst 'general' — das Forum
+    ist die EINE Community-Fläche (Owner 2026-07-22 „forum alles"), JEDER
+    Feed-Post landet dort, nicht nur die mit explizitem Kategorie-Tag.
 
-    Read-only-Brücke: id mit Prefix 'wall:' (kollidiert nicht mit echten
-    Thread-IDs); Replies/Likes laufen im Forum gegen diese synthetische ID ins
-    Leere — Interaktion bleibt im Crew-Feed. Anonyme Posts werden NICHT
-    eingeblendet (kein Author-Snapshot, Identitäts-Schutz). Returns None wenn der
-    Post in kein Forum-Board gehört.
+    Brücke: id mit Prefix 'wall:' (kollidiert nicht mit echten Thread-IDs);
+    Replies laufen seit 2026-07-19 als echte Wall-Kommentare (Lese-/Schreib-
+    Bridge in forum_list_replies/forum_create_reply). Anonyme Posts werden MIT
+    gespiegelt (Owner 2026-07-22): is_anonymous + gespeicherter anon_handle
+    (gleicher Handle wie im Feed) statt Author-Snapshot — die Sanitizer-Schleife
+    in forum_list_threads strippt author_token + Profil-Reste wie bei nativen
+    anonymen Threads.
     """
-    if p.get('is_anonymous'):
-        return None
     tags = [str(t).lower() for t in (p.get('hashtags') or [])]
-    cat = next((t for t in tags if t in FORUM_CATEGORIES), None)
-    if not cat:
-        return None
+    cat = next((t for t in tags if t in FORUM_CATEGORIES), None) or 'general'
     text = (p.get('text') or '').strip()
     # Titel = erste Zeile/erster Satz (gekürzt), Body = voller Text.
     first_line = text.splitlines()[0].strip() if text else ''
     title = (first_line or 'Crew-Feed Beitrag')[:200]
-    return {
+    anon = bool(p.get('is_anonymous'))
+    out = {
         'id': 'wall:' + str(p.get('id') or ''),
         'category_id': cat,
         'author_token': p.get('author_token'),
-        'author_short': p.get('author_short'),
-        'author_name': p.get('author_name'),
-        'author_role': None,
-        'author_airline': p.get('author_airline'),
-        'author_homebase': p.get('author_homebase'),
         'title': title,
         'body': text,
         'image_url': p.get('image_url'),
@@ -22218,6 +22214,22 @@ def _wall_post_as_forum_thread(p):
         'last_reply_ts': None,
         'from_crew_feed': True,
     }
+    if anon:
+        out['is_anonymous'] = True
+        # Feed-Handle übernehmen (CruiseDrifter023 bleibt CruiseDrifter023) —
+        # Fallback auf denselben Salt wie der Wall-Create (post id).
+        out['anon_handle'] = (p.get('anon_handle')
+                              or _anon_handle_for(p.get('author_token'),
+                                                  salt=str(p.get('id') or '')))
+    else:
+        out.update({
+            'author_short': p.get('author_short'),
+            'author_name': p.get('author_name'),
+            'author_role': None,
+            'author_airline': p.get('author_airline'),
+            'author_homebase': p.get('author_homebase'),
+        })
+    return out
 
 
 def _wall_posts_for_forum():

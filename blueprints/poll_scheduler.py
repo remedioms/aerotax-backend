@@ -179,12 +179,23 @@ _DEMAND_MEMO = {'ts': 0.0, 'demanded': frozenset(ALWAYS_DEMAND), 'events': {}}
 
 
 def _fetch_sector_rows(sb, dates):
-    """EIN Query über alle User: datum ∈ {gestern, heute, morgen} (UTC-Keying
-    des Roster-Imports; das ±3h-Fenster kann Mitternacht kreuzen)."""
-    r = (sb.table('user_ical_briefings')
-         .select('datum,raw_event')
-         .in_('datum', dates).execute())
-    return r.data or []
+    """Query über alle User: datum ∈ {gestern, heute, morgen} (UTC-Keying
+    des Roster-Imports; das ±3h-Fenster kann Mitternacht kreuzen).
+    PAGINIERT: PostgREST kappt still bei 1000 Rows — live gemessen 2026-07-22
+    waren es 3682 Rows im Fenster, d.h. ohne range() fehlte der Demand der
+    meisten User (Airports wurden fälschlich als „ohne Bedarf" behandelt)."""
+    out = []
+    page = 1000
+    for start in range(0, 40000, page):
+        r = (sb.table('user_ical_briefings')
+             .select('datum,raw_event')
+             .in_('datum', dates)
+             .range(start, start + page - 1).execute())
+        rows = r.data or []
+        out.extend(rows)
+        if len(rows) < page:
+            break
+    return out
 
 
 def get_demand(sb, now_utc):

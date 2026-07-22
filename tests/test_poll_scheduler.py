@@ -190,6 +190,9 @@ class _FakeSB:
     def in_(self, _col, _vals):
         return self
 
+    def range(self, _start, _end):
+        return self
+
     def execute(self):
         self.calls += 1
         class R:  # noqa: N801

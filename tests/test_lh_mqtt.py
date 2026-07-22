@@ -145,36 +145,22 @@ def test_secret_gate(client, monkeypatch):
     assert r.status_code == 200
 
 
-def test_event_gate_change_pushes_all_affected(client, monkeypatch):
-    pushes = []
+def test_event_gate_refreshes_facts_but_never_pushes(client, monkeypatch):
+    # Owner 22.07.: „Gate ist egal" — Gate-Events refreshen nur die Fakten
+    # (frisches Gate in der App), pushen aber nie.
+    facts_calls = []
     monkeypatch.setattr(lh_mqtt, '_rows_for_flight',
                         lambda dates, c, n: _rows([LH400], [dict(LH400)]))
     monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
-                        lambda *a, **k: {'gate': 'C16', 'terminal': '1'})
+                        lambda *a, **k: facts_calls.append(k) or
+                        {'gate': 'C16', 'terminal': '1'})
     monkeypatch.setattr(lh_mqtt, '_do_push',
-                        lambda tok, title, body, data=None, idempotency_key=None:
-                        pushes.append((tok, title, body, data, idempotency_key)))
+                        lambda *a, **k: pytest.fail('Gate pusht nie'))
     r = client.post('/api/internal/lh-mqtt/event',
                     json=_event_body('New Gate Information'))
     d = r.get_json()
-    assert d['kind'] == 'gate' and d['users'] == 2 and d['pushed'] == 2
-    tok, title, body, data, key = pushes[0]
-    assert 'Gate-Änderung' in title and 'Gate C16' in body
-    assert data['type'] == 'flight_update'
-    # wertbasierter Dedupe-Key: gleiches Gate pusht nie doppelt
-    assert 'gate:C16' in key and tok in key
-
-
-def test_event_gate_without_fact_is_honest(client, monkeypatch):
-    pushes = []
-    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: _rows([LH400]))
-    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {})
-    monkeypatch.setattr(lh_mqtt, '_do_push',
-                        lambda *a, **k: pushes.append(a))
-    r = client.post('/api/internal/lh-mqtt/event',
-                    json=_event_body('New Gate Information'))
-    assert r.get_json()['pushed'] == 1
-    assert 'Details in der App' in pushes[0][2]
+    assert d['kind'] == 'gate' and d['users'] == 2 and d['pushed'] == 0
+    assert facts_calls and facts_calls[0].get('force') is True
 
 
 def test_event_small_delay_no_push(client, monkeypatch):
@@ -216,17 +202,145 @@ def test_event_cancelled_pushes(client, monkeypatch):
     assert 'annulliert' in pushes[0]
 
 
-def test_event_departed_refreshes_nothing_and_pushes_nobody(client, monkeypatch):
-    facts_calls = []
+def test_event_departed_without_inbound_reg_pushes_nobody(client, monkeypatch):
+    # Departed pusht die EIGENE Crew nie; ohne LH-Reg gibt es auch keinen
+    # Inbound-Watch → 0 Pushes.
     monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: _rows([LH400]))
-    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
-                        lambda *a, **k: facts_calls.append(a) or {})
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {})
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: pytest.fail('ohne Reg kein Station-Query'))
     monkeypatch.setattr(lh_mqtt, '_do_push',
-                        lambda *a, **k: pytest.fail('Departed pusht nie'))
+                        lambda *a, **k: pytest.fail('Departed pusht die eigene Crew nie'))
     d = client.post('/api/internal/lh-mqtt/event',
                     json=_event_body('Departed')).get_json()
     assert d['kind'] == 'departed' and d['pushed'] == 0
-    assert not facts_calls  # kein Budget-Verbrauch ohne Push-Anlass
+
+
+# ── Inbound-Watch (Zubringer-Maschine) ───────────────────────────────────────
+
+def _layover_leg(now_utc, tail=None, flight='LH400', frm='FRA'):
+    """Leg, das in 3h ab `frm` startet (dynamisch — _push_inbound rechnet mit
+    der echten Uhr)."""
+    from datetime import timedelta
+    s = {'flight': flight, 'from': frm, 'to': 'JFK',
+         'dep_iso': (now_utc + timedelta(hours=3)).isoformat()}
+    if tail:
+        s['tail'] = tail
+    return s
+
+
+INBOUND_FACTS = {'reg': 'D-AIKP', 'arr_iata': 'FRA', 'dep_iata': 'MUC',
+                 'est_arr': '2026-07-22T14:30:00+02:00', 'arr_delay_min': 10}
+
+
+def test_inbound_departed_pushes_layover_crew(client, monkeypatch):
+    from datetime import datetime as dt, timezone as tz
+    now = dt.now(tz.utc)
+    pushes = []
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: dict(INBOUND_FACTS))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: _rows([_layover_leg(now, tail='D-AIKP')]))
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: [])
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda tok, title, body, data=None, idempotency_key=None:
+                        pushes.append((tok, title, body, data, idempotency_key)))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Departed', flight='LH123')).get_json()
+    assert d['kind'] == 'departed' and d['pushed'] == 1
+    tok, title, body, data, key = pushes[0]
+    assert 'gestartet' in title and 'LH400' in title
+    assert 'D-AIKP kommt als LH123 aus MUC' in body
+    assert 'Ankunft in FRA ca. 14:30' in body and '(+10 min)' in body
+    assert data['type'] == 'inbound_departure'
+    assert data['inbound_flight'] == 'LH123' and data['flight'] == 'LH400'
+    assert 'lhflup:inb:LH123' in key
+
+
+def test_inbound_arrived_mentions_own_departure(client, monkeypatch):
+    from datetime import datetime as dt, timezone as tz
+    from zoneinfo import ZoneInfo
+    now = dt.now(tz.utc)
+    leg = _layover_leg(now, tail='D-AIKP')
+    dep_local = (now.astimezone(ZoneInfo('Europe/Berlin')) +
+                 __import__('datetime').timedelta(hours=3)).strftime('%H:%M')
+    pushes = []
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: dict(INBOUND_FACTS))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: _rows([leg]))
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: [])
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda tok, title, body, data=None, idempotency_key=None:
+                        pushes.append((title, body, data)))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Arrived', flight='LH123')).get_json()
+    assert d['pushed'] == 1
+    title, body, data = pushes[0]
+    assert 'gelandet' in title
+    assert 'D-AIKP ist in FRA gelandet' in body
+    assert f'dein LH400 geht um {dep_local}' in body
+    assert data['type'] == 'inbound_arrival'
+
+
+def test_inbound_early_rotation_is_filtered(client, monkeypatch):
+    # Board kennt einen SPÄTEREN Zubringer (LH999) → das Event der früheren
+    # Rotation (LH123) pusht nicht.
+    from datetime import datetime as dt, timezone as tz
+    from zoneinfo import ZoneInfo
+    now = dt.now(tz.utc)
+    arr_local = (now.astimezone(ZoneInfo('Europe/Berlin')) +
+                 __import__('datetime').timedelta(hours=2))
+    board = [{'airport': 'FRA#ARR', 'flight': 'LH999', 'reg': 'D-AIKP',
+              'sched': arr_local.strftime('%H:%M'), 'esti': None,
+              'date': arr_local.date().isoformat()}]
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: dict(INBOUND_FACTS))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: _rows([_layover_leg(now, tail='D-AIKP')]))
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: board)
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda *a, **k: pytest.fail('frühe Rotation pusht nicht'))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Departed', flight='LH123')).get_json()
+    assert d['pushed'] == 0
+
+
+def test_inbound_reg_mismatch_no_push(client, monkeypatch):
+    from datetime import datetime as dt, timezone as tz
+    now = dt.now(tz.utc)
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: dict(INBOUND_FACTS))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: _rows([_layover_leg(now, tail='D-AIXX')]))
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: [])
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda *a, **k: pytest.fail('fremde Maschine pusht nicht'))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Departed', flight='LH123')).get_json()
+    assert d['pushed'] == 0
+
+
+def test_inbound_topics_subscribe_feeder_flight(monkeypatch):
+    from datetime import datetime as dt, timezone as tz, timedelta as td
+    from zoneinfo import ZoneInfo
+    now = dt.now(tz.utc)
+    leg = _layover_leg(now)  # kein Roster-Tail → LH-autoritative Reg
+    arr_local = now.astimezone(ZoneInfo('Europe/Berlin')) + td(hours=2)
+    board = [{'airport': 'FRA#ARR', 'flight': 'LH123', 'reg': 'D-AIKP',
+              'sched': None, 'esti': arr_local.strftime('%H:%M'),
+              'date': arr_local.date().isoformat()}]
+    monkeypatch.setattr(lh_mqtt, '_cached_leg_reg',
+                        lambda *a, **k: 'D-AIKP')
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: board)
+    topics = lh_mqtt.inbound_topics_for_rows(_rows([leg]), now)
+    d0 = arr_local.date()
+    assert f'prd/FlightUpdate/LH/LH123/{d0.isoformat()}' in topics
+    assert f'prd/FlightUpdate/LH/LH123/{(d0 - td(days=1)).isoformat()}' in topics
 
 
 def test_event_no_affected_users_no_facts_call(client, monkeypatch):
