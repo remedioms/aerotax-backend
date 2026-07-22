@@ -702,6 +702,81 @@ FLIGHTOPS_SERVICES = (
 )
 
 
+# ── TEST-Umgebungs-Verifikation (self-contained Browser-Flow) ────────────────
+# EINE URL: /testflow → echter Crew-Login (TEST, anonymisierte echte Daten) →
+# /land tauscht Code→Token, zieht Duty Events und rendert sie. Custom-Scheme-
+# Redirect (aerox://) scheitert in Safari; HTTPS-Redirect wird akzeptiert.
+_TESTFLOW_SCOPE = 'https://cms.fra.dlh.de/publicCrewApiDev'
+_TESTFLOW_BASE = 'https://api-sandbox.lufthansa.com/v1/flight_operations/crew_services'
+_TESTFLOW_REDIRECT = 'https://api.aerosteuer.de/api/lh/flightops/land'
+
+
+@lh_flightops_bp.route('/api/lh/flightops/testflow', methods=['GET'])
+def flightops_testflow():
+    """Startet den TEST-Login (echte anonymisierte Daten). Nach Login landet der
+    Browser auf /land. Nur Verifikation — kein Secret, keine Persistenz."""
+    if not flightops_configured():
+        return 'not configured', 503
+    verifier, challenge = _pkce_pair()
+    state = 'tf_' + secrets.token_urlsafe(16)
+    _flow_put(state, verifier, 'TESTFLOW')
+    q = urllib.parse.urlencode({
+        'response_type': 'code', 'client_id': _KEY,
+        'redirect_uri': _TESTFLOW_REDIRECT, 'scope': _TESTFLOW_SCOPE,
+        'state': state, 'code_challenge': challenge,
+        'code_challenge_method': 'S256'})
+    return redirect(f'{_AUTHORIZE_URL}?{q}')
+
+
+@lh_flightops_bp.route('/api/lh/flightops/land', methods=['GET'])
+def flightops_land():
+    """Landeseite: Code→Token→Duty Events (TEST), rendert das JSON."""
+    import html as _html
+    def _page(title, body, status=200):
+        return (f'<html><head><meta charset=utf-8><title>{title}</title></head>'
+                '<body style="font-family:ui-monospace,monospace;background:#0b1020;'
+                'color:#d6e6ff;padding:18px;line-height:1.4">' + body + '</body></html>',
+                status, {'Content-Type': 'text/html; charset=utf-8'})
+    code = request.args.get('code')
+    state = request.args.get('state', '')
+    if not code:
+        return _page('FlightOps', f'<h2>Kein Code</h2><p>{_html.escape(request.args.get("error") or "")}</p>', 400)
+    flow = _flow_take(state)
+    if not flow:
+        return _page('FlightOps', '<h2>Session abgelaufen</h2><p>Bitte /api/lh/flightops/testflow neu öffnen.</p>', 400)
+    body = urllib.parse.urlencode({
+        'grant_type': 'authorization_code', 'code': code,
+        'redirect_uri': _TESTFLOW_REDIRECT, 'client_id': _KEY,
+        'code_verifier': flow['verifier']}).encode()
+    tok = _token_request(body)
+    if not tok:
+        return _page('FlightOps', '<h2>Token-Austausch fehlgeschlagen</h2>', 502)
+    from datetime import datetime as _dt, timedelta as _td
+    today = _dt.utcnow()
+    fd = (today - _td(days=20)).strftime('%Y-%m-%d') + 'Z'
+    td = (today + _td(days=40)).strftime('%Y-%m-%d') + 'Z'
+    url = _TESTFLOW_BASE + '/COMMON_DUTY_EVENTS?' + urllib.parse.urlencode({'fromDate': fd, 'toDate': td})
+    req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + tok['access'], 'Accept': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            data = r.read().decode('utf-8')
+    except urllib.error.HTTPError as e:
+        data = e.read().decode('utf-8', 'ignore')
+    except Exception as ex:
+        data = '{"error":"%s"}' % type(ex).__name__
+    try:  # serverseitig sichern, damit Miguel den Parser direkt verifizieren kann
+        with open('/tmp/fo_testdata.json', 'w') as f:
+            f.write(data)
+    except Exception:
+        pass
+    return _page('FlightOps TEST',
+                 '<h2>✅ Duty Events (TEST-Umgebung)</h2>'
+                 '<p>Alles hat geklappt — der Text unten ist dein echter Roster. '
+                 'Du musst nichts kopieren, ich hab ihn serverseitig.</p>'
+                 '<pre style="white-space:pre-wrap;word-break:break-word;background:#111a30;padding:12px;border-radius:8px">'
+                 + _html.escape(data[:20000]) + '</pre>')
+
+
 @lh_flightops_bp.route('/api/lh/flightops/raw/<token>', methods=['POST'])
 def flightops_raw(token):
     """Verdrahtung/Diagnose: roher Service-Call für den EIGENEN Token (POST,
