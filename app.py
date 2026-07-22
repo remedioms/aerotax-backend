@@ -43546,6 +43546,12 @@ _DISCOVER_LEG_RE = re.compile(
 _DISCOVER_GROUND_RE = re.compile(
     r'(?:^|\s)(SBY[A-Z0-9]*|PREP)\s+([A-Z]{3})\s+'
     r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})(?=\s|$)')
+# Report-Zeit: erstes HH:MM-Token am Anfang der „rest"-Zeile eines Duty-Tages.
+# Gilt NUR für dated-Zeilen (d.h. wenn _CREWACCESS_DAY_RE matcht), nicht für
+# Fortsetzungszeilen (Closer/Zweitzele). FDP-ext.-Zeilen tragen diese Zeit als
+# zweiten Token nach dem eigentlichen „HH:MM Release FDP ext." — aber da
+# Release immer das ZWEITE Token ist, bleibt das erste = Report. ✓
+_DISCOVER_REPORT_RE = re.compile(r'^(\d{1,2}:\d{2})\b')
 
 
 def _discover_roster_text_to_ics(text, carrier='4Y'):
@@ -43599,19 +43605,29 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
             end += _td(days=1)
         events.append((f'tim-{len(events)}', start, end, summary, False))
 
-    def add_leg(dep_d, num, frm, to, t1, t2, arr_d=None):
+    def add_leg(dep_d, num, frm, to, t1, t2, arr_d=None, briefing=None):
         start = _utc(dep_d, t1, frm)
         end = _utc(arr_d or dep_d, t2, to)
         if arr_d is None and end <= start:
             # Closer ohne eigene Datumszeile: Ankunft am Folgetag.
             end = _utc(dep_d + _td(days=1), t2, to)
         n = num.lstrip('0') or '0'
-        events.append((f'leg-{len(events)}', start, end,
-                       f'{carrier}{n} {frm} - {to}', False))
+        base = f'{carrier}{n} {frm} - {to}'
+        # Wenn eine echte Report-Zeit bekannt ist, wird sie als Briefing-Token
+        # in das Summary eingebettet — exakt das Format, das der iOS-Client via
+        # briefingTimeFromSummary() und _corrected_briefing_start_iso() erwartet:
+        # „HH:MM LT Briefing {STN} · {carrier}{n} {frm} - {to}".
+        # Der Station-Token nach „Briefing" ist der ABFLUGHAFEN des Legs (frm),
+        # damit _briefing_lt_station() die richtige TZ für die LT-Auflösung
+        # findet (Discover-Basen = FRA/MUC, Ortszeit lokaler Abflug).
+        summary = f'{briefing} LT Briefing {frm} · {base}' if briefing else base
+        events.append((f'leg-{len(events)}', start, end, summary, False))
 
     in_table = False
     cur_day = None
-    pending = None   # offener Übernacht-Leg: (num, frm, start_hhmm, dep_date)
+    pending = None          # offener Übernacht-Leg: (num, frm, start_hhmm, dep_date, briefing)
+    cur_day_report = None   # Report-Zeit (HH:MM) des aktuellen Duty-Tages
+    cur_day_first_flight_done = False  # True sobald erster Flug-Leg dieses Tages emittiert
     for raw in t.splitlines():
         # Bid-Sterne („granted Bid") sind reine Marker-Tokens.
         line = ' '.join(tok for tok in raw.split() if tok != '*')
@@ -43639,8 +43655,17 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
             cur_day = nd
             dated = True
             rest = (dm.group(2) or '').strip()
+            # Jede neue Datumszeile: Report-Tracking zurücksetzen.
+            cur_day_report = None
+            cur_day_first_flight_done = False
             if not rest:
                 continue
+            # Report-Zeit: erstes HH:MM-Token der rest-Zeile (= Spalte „Report"
+            # im PDF). Nur auf Datumszeilen auswerten — Fortsetzungszeilen (Closer,
+            # Zweitleg) tragen die Opener-Report-Zeit NICHT erneut.
+            rm = _DISCOVER_REPORT_RE.match(rest)
+            if rm:
+                cur_day_report = rm.group(1)
         if cur_day is None:
             continue
         toks = rest.split()
@@ -43674,16 +43699,26 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
         num, a1, a2, t1, t2 = lm.groups()
         if a2 and t2:
             # Kompletter Leg auf einer Zeile (inkl. Air-Return „TPA TPA").
-            add_leg(cur_day, num, a1, a2, t1, t2)
+            # Briefing-Token nur beim ersten Flug-Leg des Tages (Report gilt
+            # für den gesamten Dienst, nicht jede Sektion einzeln).
+            b = cur_day_report if not cur_day_first_flight_done else None
+            cur_day_first_flight_done = True
+            add_leg(cur_day, num, a1, a2, t1, t2, briefing=b)
         elif not a2 and not t2:
             key = num.lstrip('0')
             if pending and pending[0] == key:
-                p_num, p_frm, p_t1, p_dep = pending
+                p_num, p_frm, p_t1, p_dep, p_briefing = pending
                 add_leg(p_dep, num, p_frm, a1, p_t1, t1,
-                        arr_d=(cur_day if dated else None))
+                        arr_d=(cur_day if dated else None),
+                        briefing=p_briefing)
                 pending = None
+                cur_day_first_flight_done = True
             else:
-                pending = (key, a1, t1, cur_day)
+                # Übernacht-Opener: Report-Zeit mitgeben, damit der Closer
+                # (der auf einer anderen Datumszeile landet) das Token trägt.
+                b = cur_day_report if not cur_day_first_flight_done else None
+                cur_day_first_flight_done = True
+                pending = (key, a1, t1, cur_day, b)
         # a2 ohne t2 (oder umgekehrt): nicht beobachtet → auslassen statt raten.
 
     if not events:

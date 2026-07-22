@@ -174,6 +174,123 @@ def test_pipeline_roundtrip_sectors_and_briefings():
     assert '2026-05-25' not in secs
 
 
+
+# ── Briefing-Token aus Report-Spalte (Panu-Bug-Fix) ──────────────────────────
+
+# Minimal-Fixture mit den Schlüssel-Fällen aus den echten Jul/Mai-PDFs:
+#   • Einfacher Turnaround-Dienst (Jul 24): Report=12:00, Start=13:30 → YYC
+#   • Multi-Leg-Tag (Mai 22): Report=10:55, zwei Sektoren → Token nur auf Leg 1
+#   • FDP-ext.-Marker (Mai 16): Report=10:00 trotz „FDP ext." Zwischen-Token
+#   • Übernacht-Opener (Jul 06): Report=18:05 reist im pending mit → erscheint
+#     auf dem ausgeklappten Leg (Closer auf Folgetag)
+#   • SBY-then-Flight (Mai 08): Datumszeile ohne HH:MM am Anfang → kein Token
+_BRIEFING_FIXTURE = """\
+Roster
+Period: July 2026
+Crew member: TST, Test, Briefing
+Rank: CM Base: FRA
+Passports: DE (21May2030) Medical: MED (06Sep2027) Line check: Missing Qualifications: A320, A330
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+24 Fri 12:00 15:35 CM 076 FRA YYC 13:30 15:05 333 24:00 20260724_76_480 9:35 11:35 14:40
+25 Sat 15:35 CM 077 YYC 16:50 333
+26 Sun 10:45 CM 077 FRA 10:15 333 9:25 11:10 43:15
+Created 21Jul2026 09:45 (UTC) by TST 1 ( 1)
+"""
+
+_BRIEFING_FIXTURE_MAY = """\
+Roster
+Period: May 2026
+Crew member: TST, Test, Briefing
+Rank: CM Base: FRA
+Passports: DE (21May2030) Medical: MED (06Sep2027) Line check: Missing Qualifications: A320, A330
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+08 Fri CM SBY FRA 05:00 10:00 11151
+10:00 14:38 CM 052 FRA MSP 11:56 14:08 333 72:02 9:12 16:38 14:30
+16 Sat 10:00 17:04 FDP ext. CM 064 FRA TPA 12:28 16:34 333 25:46 20260516_64_270 10:06 13:04 15:04
+22 Fri 10:55 CM 518 FRA PMI 12:23 14:12 32A 05863 1:49
+17:44 CM 519 PMI FRA 15:09 17:29 32A 2:20 6:49 12:00
+Created 21Jul2026 09:58 (UTC) by TST 1 ( 1)
+"""
+
+_BRIEFING_FIXTURE_OVERNIGHT = """\
+Roster
+Period: July 2026
+Crew member: TST, Test, Briefing
+Rank: CM Base: FRA
+Passports: DE (21May2030) Medical: MED (06Sep2027) Line check: Missing Qualifications: A320, A330
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+06 Mon 18:05 CM 136 FRA 19:37 333 20260706_136_122
+07 Tue CM 136 MBA 05:12 333 8:35
+07:45 CM 136 MBA JRO 06:20 07:15 333 23:55 0:55 12:40 15:30
+Created 21Jul2026 09:45 (UTC) by TST 1 ( 1)
+"""
+
+
+def test_briefing_token_single_turnaround_yyc():
+    """Jul-24-Zeile: Report=12:00, Departure=13:30 (FRA→YYC).
+    Das ICS-Summary des Legs muss den Briefing-Token „12:00 LT Briefing FRA"
+    enthalten, damit iOS briefingTimeFromSummary() 12:00 statt 13:30 zeigt."""
+    ics, err = backend._discover_roster_text_to_ics(_BRIEFING_FIXTURE)
+    assert err is None, err
+    # Briefing-Token im Summary des FRA→YYC-Legs:
+    assert '12:00 LT Briefing FRA' in ics
+    assert '4Y76 FRA - YYC' in ics
+    # Vollformat: „12:00 LT Briefing FRA · 4Y76 FRA - YYC"
+    assert '12:00 LT Briefing FRA · 4Y76 FRA - YYC' in ics
+    # Der DTSTART bleibt der Abflug (13:30 FRA lokal = 11:30Z im Juli CEST):
+    assert 'DTSTART:20260724T113000Z' in ics
+    # Departure != Briefing: Briefing-Zeit (12:00 LT = 10:00Z) ≠ DTSTART (11:30Z).
+    assert 'DTSTART:20260724T100000Z' not in ics
+
+
+def test_briefing_token_multi_leg_day_first_only():
+    """Mai-22: Report=10:55 gilt für den Dienst (FRA→PMI→FRA).
+    Nur der ERSTE Leg trägt den Briefing-Token; der Rückflug-Leg darf ihn
+    nicht tragen (er hat keinen eigenen Briefing-Eintrag)."""
+    ics, err = backend._discover_roster_text_to_ics(_BRIEFING_FIXTURE_MAY)
+    assert err is None, err
+    # Erster Leg hat Token:
+    assert '10:55 LT Briefing FRA · 4Y518 FRA - PMI' in ics
+    # Zweiter Leg (PMI→FRA) hat keinen Briefing-Token:
+    assert '10:55 LT Briefing PMI' not in ics
+    assert '17:44 LT Briefing' not in ics
+
+
+def test_briefing_token_fdp_ext_row():
+    """Mai-16: Zeile mit „FDP ext. HH:MM" zwischen Release und Pos.
+    Das Report-Token (10:00) muss trotz des FDP-ext.-Einschubs erkannt werden."""
+    ics, err = backend._discover_roster_text_to_ics(_BRIEFING_FIXTURE_MAY)
+    assert err is None, err
+    assert '10:00 LT Briefing FRA · 4Y64 FRA - TPA' in ics
+
+
+def test_briefing_token_sby_then_flight_no_report():
+    """Mai-08: Datumszeile beginnt mit Pos (CM SBY …), kein HH:MM am Anfang.
+    Hier gibt es keinen Report → der Flug-Leg am selben Tag darf KEINEN
+    Briefing-Token erhalten (wir erfinden keine Zeit)."""
+    ics, err = backend._discover_roster_text_to_ics(_BRIEFING_FIXTURE_MAY)
+    assert err is None, err
+    # FRA→MSP-Leg ist da:
+    assert '4Y52 FRA - MSP' in ics
+    # Aber OHNE Briefing-Token:
+    assert 'LT Briefing FRA · 4Y52' not in ics
+
+
+def test_briefing_token_overnight_opener():
+    """Jul-06 Übernacht-Opener (FRA→MBA, kein Ankunfts-Airport auf der Zeile):
+    Report=18:05 muss beim aufgelösten Leg (MBA als Zwischenstopp→JRO) landen."""
+    ics, err = backend._discover_roster_text_to_ics(_BRIEFING_FIXTURE_OVERNIGHT)
+    assert err is None, err
+    # Der Opener-Leg FRA→MBA trägt den Briefing-Token:
+    assert '18:05 LT Briefing FRA' in ics
+    assert '18:05 LT Briefing FRA · 4Y136 FRA - MBA' in ics
+    # Der Folgetag-Closer (MBA→JRO) ist ein eigenständiger Leg und trägt keinen Token:
+    assert 'LT Briefing MBA · 4Y136 MBA - JRO' not in ics
+
+
 def test_endpoint_dispatch_via_real_pdf_upload():
     """E2E: echtes (reportlab-)PDF im Discover-Format → Endpoint erkennt das
     Format hinter dem CrewAccess-First-Dispatch, Antwort trägt source=pdf +
