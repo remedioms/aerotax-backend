@@ -17460,6 +17460,69 @@ def _logbook_block_min(dep_iso, arr_iso):
         return None
 
 
+# ── Flugbuch-Import-Store ───────────────────────────────────────────────────
+# Eingespielte Alt-Flugbücher (White-Glove: Upload-Mail → Owner → Einspielung)
+# liegen in der SB-Tabelle `ax_logbook_import` — EINE jsonb-Zeile pro Token
+# {legs, sim, filename, meta}. Bewusst KEIN Profil-Mirror: user_profiles wird
+# überall gelesen, eine 10k-Leg-Karriere wäre dort MB-Bloat. RLS ist auf der
+# Tabelle aktiv ohne Policies — nur der Service-Key (Backend) kommt ran.
+
+_LOGBOOK_IMPORT_CACHE_S = 6 * 3600
+
+
+def _logbook_import_path(token):
+    import os
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    return os.path.join(_USER_HISTORY_DIR,
+                        f'logbook_import_{safe}.json') if safe else None
+
+
+def _logbook_import_load(token):
+    """Import-Blob {legs, sim, ...} für den Token — oder None. Disk als
+    TTL-Cache, auch NEGATIV (kein Import → {}): sonst zahlt jeder
+    Flugbuch-Aufruf jedes Users eine SB-Runde. Bei SB-Fehler ist der stale
+    Disk-Cache besser als nichts."""
+    import os
+    import time as _t
+    pth = _logbook_import_path(token)
+    try:
+        if pth and os.path.exists(pth) \
+                and _t.time() - os.path.getmtime(pth) < _LOGBOOK_IMPORT_CACHE_S:
+            with open(pth) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    if SB_AVAILABLE:
+        def _q():
+            return sb.table('ax_logbook_import') \
+                .select('legs,sim,filename,imported_at') \
+                .eq('token', token).limit(1).execute()
+        r, failed = _supabase_execute_with_timeout('logbook_import_load', _q,
+                                                   timeout_s=8)
+        if not failed:
+            rows = getattr(r, 'data', None) or []
+            blob = rows[0] if rows and isinstance(rows[0], dict) else {}
+            if not isinstance(blob.get('legs'), list):
+                blob['legs'] = []
+            try:
+                if pth:
+                    _atomic_write_json(pth, blob)
+            except Exception:
+                pass
+            return blob
+    try:
+        if pth and os.path.exists(pth):
+            with open(pth) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return None
+
+
 @app.route('/api/user/logbook/<token>', methods=['GET'])
 def get_logbook(token):
     """Cockpit-Flugbuch: per-Leg Blockzeiten + Kennzeichen/Muster + manuelles
@@ -17531,6 +17594,50 @@ def get_logbook(token):
         app.logger.info(f'[logbook] enrich-cap {_LOGBOOK_ENRICH_CAP} tok={token[:8]} '
                         f'— restliche Legs ohne LH-Reg/Typ (bereits gespeicherte bleiben)')
 
+    # Eingespieltes Alt-Flugbuch unter die Roster-Legs mergen. Roster gewinnt
+    # bei gleichem Leg-Key (live angereichert); das manuelle Overlay gewinnt
+    # auch über importierte Werte. Import-Legs werden NICHT LH-enriched
+    # (historisch, Reg/Typ stehen im Export).
+    imported_count = 0
+    try:
+        imp = _logbook_import_load(token) or {}
+    except Exception:
+        imp = {}
+    if imp.get('legs'):
+        seen_keys = {e['key'] for e in entries}
+        for L in imp['legs']:
+            if not isinstance(L, dict):
+                continue
+            key = _logbook_leg_key(L.get('date'), L.get('flight'),
+                                   L.get('from'), L.get('to'))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            bm = L.get('block_min')
+            bm = bm if isinstance(bm, int) and 0 < bm < 20 * 60 else None
+            ov = overlay.get(key) or {}
+            entries.append({
+                'key': key, 'date': (L.get('date') or '')[:10],
+                'flight': (L.get('flight') or '').upper(),
+                'from': (L.get('from') or '').upper(),
+                'to': (L.get('to') or '').upper(),
+                'dep_iso': L.get('dep_iso') or '',
+                'arr_iso': L.get('arr_iso') or '',
+                'block_min': bm,
+                'reg': L.get('reg') or None, 'type': L.get('type') or None,
+                'ldg_day': ov.get('ldg_day', L.get('ldg_day')),
+                'ldg_night': ov.get('ldg_night', L.get('ldg_night')),
+                'to_day': ov.get('to_day', L.get('to_day')),
+                'to_night': ov.get('to_night', L.get('to_night')),
+                'pf': (bool(ov['pf']) if ov.get('pf') is not None
+                       else L.get('pf')),
+                'night_min': ov.get('night_min', L.get('night_min')),
+                'remarks': ov.get('remarks', L.get('remarks')),
+                'role': L.get('role'), 'source': 'import',
+            })
+            imported_count += 1
+        entries.sort(key=lambda e: (e.get('date') or '', e.get('dep_iso') or ''))
+
     by_type = {}
     tot_block = tot_ldg = 0
     dates_seen = set()
@@ -17552,6 +17659,7 @@ def get_logbook(token):
         'by_type': by_type_list,
         'totals': {'legs': len(entries), 'block_min': tot_block,
                    'landings': tot_ldg, 'days': len(dates_seen)},
+        'imported_legs': imported_count,
         'enrich_capped': enrich_capped,
     })
 

@@ -30,12 +30,21 @@ DAYS = {
 
 def _seed():
     backend._manual_briefings_save(TOKEN, DAYS)
-    # Overlay sauber starten
+    # Overlay + Import-Cache sauber starten (Disk-Dateien + Profil-Mirror)
+    for p in (backend._logbook_overlay_path(TOKEN),
+              backend._logbook_import_path(TOKEN)):
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
     try:
-        p = backend._logbook_overlay_path(TOKEN)
-        if p and os.path.exists(p):
-            os.remove(p)
-    except OSError:
+        pf = backend._profile_load(TOKEN) or {}
+        prof = (pf.get('profile') or {})
+        if prof.get('logbook_overlay'):
+            prof['logbook_overlay'] = {}
+            backend._profile_save(TOKEN, prof)
+    except Exception:
         pass
 
 
@@ -122,3 +131,75 @@ def test_clearing_overlay_removes_entry():
                  'to': 'JFK', 'ldg_day': None, 'pf': False})
     # pf False ist ein echter Wert → bleibt; ldg_day None raus
     assert 'ldg_day' not in out['overlay']
+
+
+# ── Import-Merge (ax_logbook_import, White-Glove-Einspielung) ───────────────
+
+IMPORT_BLOB = {'legs': [
+    {'date': '2019-03-05', 'flight': 'LH500', 'from': 'MUC', 'to': 'GRU',
+     'dep_iso': '2019-03-05T21:00:00+00:00',
+     'arr_iso': '2019-03-06T07:30:00+00:00',
+     'block_min': 630, 'reg': 'D-AIXA', 'type': 'A359', 'pf': True,
+     'ldg_night': 1, 'night_min': 400, 'role': 'FO'},
+    # Kollision mit Roster-Leg LH400 → Roster gewinnt
+    {'date': '2026-05-01', 'flight': 'LH400', 'from': 'FRA', 'to': 'JFK',
+     'block_min': 999, 'type': 'FAKE'},
+    # kaputte Blockzeit (Platzhalter) → Leg bleibt, block_min fällt raus
+    {'date': '2014-02-17', 'flight': 'LH2477', 'from': 'LHR', 'to': 'MUC',
+     'block_min': 1439, 'type': 'A320'},
+], 'sim': [{'date': '2019-04-01', 'place': 'FRA', 'code': 'RE359',
+            'duration_min': 240}]}
+
+
+def _seed_import(blob=IMPORT_BLOB):
+    backend._atomic_write_json(backend._logbook_import_path(TOKEN), blob)
+
+
+def test_import_merge_dedupe_and_sort():
+    _seed()
+    _seed_import()
+    r = _get()
+    assert r['imported_legs'] == 2
+    keys = [e['key'] for e in r['entries']]
+    # chronologisch: Import-Legs (2014/2019) vor den Roster-Legs (2026)
+    assert keys[0] == '2014-02-17|LH2477|LHR|MUC'
+    assert keys[1] == '2019-03-05|LH500|MUC|GRU'
+    # Dedupe: LH400 nur EINMAL, und zwar aus dem Roster (type 346, nicht FAKE)
+    lh400 = [e for e in r['entries'] if e['flight'] == 'LH400']
+    assert len(lh400) == 1 and lh400[0]['type'] == '346'
+    imp = {e['flight']: e for e in r['entries'] if e.get('source') == 'import'}
+    assert imp['LH500']['block_min'] == 630 and imp['LH500']['pf'] is True
+    assert imp['LH500']['reg'] == 'D-AIXA' and imp['LH500']['role'] == 'FO'
+    # 1439-Minuten-Platzhalter wird nicht als Blockzeit übernommen
+    assert imp['LH2477']['block_min'] is None
+    # Sim-Sessions erscheinen NICHT als Flug-Legs
+    assert not any(e['flight'] == 'SIM' for e in r['entries'])
+
+
+def test_import_totals_and_by_type():
+    _seed()
+    _seed_import()
+    r = _get()
+    assert r['totals']['legs'] == 5
+    assert r['totals']['block_min'] == 520 + 450 + 60 + 630
+    assert r['totals']['landings'] == 1          # ldg_night des Import-Legs
+    bt = {t['type']: t for t in r['by_type']}
+    assert bt['A359']['legs'] == 1 and bt['A359']['block_min'] == 630
+
+
+def test_overlay_wins_over_import():
+    _seed()
+    _seed_import()
+    with backend.app.test_request_context(json={
+            'date': '2019-03-05', 'flight': 'LH500', 'from': 'MUC', 'to': 'GRU',
+            'ldg_night': 2, 'pf': False, 'remarks': 'korrigiert'}):
+        assert backend.save_logbook_leg(TOKEN).get_json()['ok']
+    r = _get()
+    e = [x for x in r['entries'] if x['flight'] == 'LH500'][0]
+    assert e['ldg_night'] == 2 and e['pf'] is False and e['remarks'] == 'korrigiert'
+
+
+def test_no_import_store_keeps_logbook_unchanged():
+    _seed()
+    r = _get()
+    assert r['imported_legs'] == 0 and r['totals']['legs'] == 3
