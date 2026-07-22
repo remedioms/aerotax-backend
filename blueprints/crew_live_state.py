@@ -1017,7 +1017,11 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         d = str(duty or '').strip().lower()
         if d in ('standby', 'sby', 'reserve'):
             sub = f'Basis {city(hb)}' if hb else None
-            return _result(STATE_STANDBY, title='Standby', subtitle=sub)
+            # Anita (Forum 22.07.): RB/Reserve ist bei LH ein EIGENER Dienst,
+            # kein Standby — gleicher Zustand, ehrliches Label.
+            return _result(STATE_STANDBY,
+                           title='Reserve' if d == 'reserve' else 'Standby',
+                           subtitle=sub)
         if lay:
             return _result(STATE_LAYOVER, title=f'Layover {city(lay)}')
         # FREI/URLAUB (B2 Tibor 2026-07-12, „Wieso steht bei euch nicht das
@@ -1681,6 +1685,12 @@ def duty_from_roster_day(klass=None, marker=None):
     klass_up = str(klass or '').strip().upper()
     if 'SBY' in marker_up:
         return 'standby'
+    # RB/Reserve (Anita, Forum 22.07.: „habe RB, App zeigt SB"): eigener
+    # Dienst-Typ — Zustand wie Standby, aber ehrliches Label. 'RB' nur als
+    # ganzes Wort (sonst frisst es AIRBORNE o.ä.).
+    if ('RESERVE' in marker_up or klass_up in ('RES', 'RB', 'RESERVE')
+            or _re.search(r'(?<![A-Z])RB(?![A-Z])', marker_up)):
+        return 'reserve'
     if klass_up in ('URLAUB', 'VAC', 'VACATION') or 'URLAUB' in marker_up:
         return 'vacation'
     # Visum/Visa: Behörden-/Botschaftstermin, KEIN Dienst und KEIN Airport-Weg.

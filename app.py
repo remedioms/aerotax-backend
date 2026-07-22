@@ -22246,6 +22246,18 @@ def _wall_posts_for_forum():
     return out
 
 
+def _forum_public_image_url(u):
+    """Nur anzeigefähige Bild-Referenzen ausliefern: Server-Pfade ('/api/…')
+    und volle http-URLs bleiben; nackte Legacy-Dateinamen (Vor-1.10.5-Client
+    speicherte den Namen OHNE erfolgreichen Upload — die Bytes existieren
+    weder auf Disk noch in R2, live verifiziert 22.07. am Karaoke-Thread)
+    → None statt Endlos-Spinner im Client."""
+    u = (str(u or '').strip()) or None
+    if not u:
+        return None
+    return u if u.startswith(('/', 'http')) else None
+
+
 @app.route('/api/forum/<token>/threads', methods=['GET'])
 def forum_list_threads(token):
     """Query: ?category=cabin&sort=hot|new|active|trending&limit=50"""
@@ -22357,6 +22369,8 @@ def forum_list_threads(token):
     for t in threads:
         t['liked_by_me'] = t.get('id') in likes['threads']
         t['is_mine'] = (t.get('author_token') == token)
+        # Tote Legacy-Bild-Referenzen zentral rausfiltern (alle Clients).
+        t['image_url'] = _forum_public_image_url(t.get('image_url'))
         if t.get('is_anonymous'):
             # Anonymer Thread: KEINE Profil-Reste ausliefern (analog
             # get_comments-Säuberung) — insbesondere den Live-Avatar-Resolve
@@ -22575,7 +22589,7 @@ def forum_list_replies(token, thread_id):
                 'id': c.get('id'),
                 'thread_id': thread_id,
                 'body': c.get('text') or '',
-                'image_url': c.get('image_url'),
+                'image_url': _forum_public_image_url(c.get('image_url')),
                 'gif_url': None,
                 'parent_reply_id': c.get('parent_comment_id'),
                 'author_short': None if anon else c.get('author_short'),
