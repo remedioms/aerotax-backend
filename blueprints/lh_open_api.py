@@ -125,10 +125,14 @@ def _token():
 
 def _budget_ok():
     """5/sec-Throttle + Stunden-Budget. False (mit Log) wenn das Stunden-Budget
-    erschöpft ist — kein stiller Cap."""
+    erschöpft ist — kein stiller Cap. INCIDENT-LEHRE 2026-07-22 (Backend
+    unresponsive, sogar /api/health 30s): der Spacing-Sleep lief UNTERM
+    _rate_lock — jeder wartende Worker-Thread hing zusätzlich im Lock des
+    Vordermanns. Jetzt: Slot unterm Lock reservieren, schlafen DANACH."""
     global _last_call_ts, _hour_window, _hour_count, _budget_warned_hour
     now = time.time()
     hour = int(now // 3600)
+    wait = 0.0
     with _rate_lock:
         if hour != _hour_window:
             _hour_window = hour
@@ -140,13 +144,12 @@ def _budget_ok():
                             _HOUR_BUDGET)
                 _budget_warned_hour = hour
             return False
-        # sanftes 5/sec-Spacing
         wait = _MIN_INTERVAL - (now - _last_call_ts)
-        if wait > 0:
-            time.sleep(wait)
-        _last_call_ts = time.time()
+        _last_call_ts = now + max(0.0, wait)   # Slot reservieren
         _hour_count += 1
-        return True
+    if wait > 0:
+        time.sleep(wait)
+    return True
 
 
 def _get(path):
@@ -293,12 +296,45 @@ def _norm_reg(reg):
     return reg
 
 
-def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False):
+# ── Hintergrund-Warmup (Incident-Fix 2026-07-22) ────────────────────────────
+# Fan-out-Consumer (cached_only=True) blockieren NIE auf LH-HTTP: Memo-Miss
+# → {} sofort zurück + EIN dedupliziertes Warmup im Daemon-Thread; der
+# nächste Read innerhalb der TTL trifft dann den Memo.
+_warm_lock = threading.Lock()
+_warm_inflight = set()
+_WARM_MAX_INFLIGHT = 8
+
+
+def _warm_async(fn, d, dep, arr):
+    key = (fn, d, dep, arr)
+    with _warm_lock:
+        if key in _warm_inflight or len(_warm_inflight) >= _WARM_MAX_INFLIGHT:
+            return
+        _warm_inflight.add(key)
+
+    def _run():
+        try:
+            lh_flight_facts(fn, d, dep, arr)
+        except Exception:
+            pass
+        finally:
+            with _warm_lock:
+                _warm_inflight.discard(key)
+
+    threading.Thread(target=_run, daemon=True, name='lh-warm').start()
+
+
+def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
+                    cached_only=False):
     """Autoritative LH-Group-Flug-Fakten (Shape wie _obs_rows_to_facts) oder {}.
     Gecacht pro (flight,date,dep,arr). No-op wenn nicht konfiguriert / kein
     LH-Group-Flug. Wirft nie. force=True überspringt den Memo-READ (schreibt
     ihn aber neu) — für den MQTT-Push-Pfad, der per Definition frischer als
-    die TTL ist (Broker sagt „hat sich GERADE geändert")."""
+    die TTL ist (Broker sagt „hat sich GERADE geändert"). cached_only=True:
+    NIE blockieren — Memo-Hit liefert, Miss triggert nur ein Hintergrund-
+    Warmup und gibt {} (Pflicht für Fan-out-Pfade wie _flight_obs_merged;
+    Incident 2026-07-22: blockierende LH-Calls + Throttle-Sleeps im Request-
+    Pfad legten alle Gunicorn-Worker lahm)."""
     fn = (flight_no or '').replace(' ', '').upper().strip()
     d = ((date or '').strip()[:10])
     if not fn or not d or not lh_open_configured() or not is_lh_group(fn):
@@ -312,6 +348,9 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False):
             hit = _facts_memo.get(key)
             if hit and now < hit[0]:
                 return dict(hit[1])
+    if cached_only:
+        _warm_async(fn, d, dep, arr)
+        return {}
 
     data = _get(f'/operations/flightstatus/{urllib.parse.quote(fn)}/{d}')
     facts = {}

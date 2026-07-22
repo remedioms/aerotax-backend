@@ -32541,7 +32541,19 @@ def _lh_fill_obs_merged(rec, fn, date_q, dep, arr):
             return rec
         import time as _tlh
         d = (date_q or _tlh.strftime('%Y-%m-%d', _tlh.gmtime()))
-        lh = lh_flight_facts(fn, d, dep, arr)
+        # NUR betriebsnahe Tage (heute−1…+2). INCIDENT 2026-07-22: Konsumenten
+        # iterieren MONATE über diesen Merge (Logbuch/Historie — live gesehen
+        # WK34/2026-07-04 bis 2026-07-28) — jeder Tag ein LH-Call legte die
+        # Worker lahm und verbrannte die Quota. Historie hat eh keine besseren
+        # LH-Daten als das Warehouse.
+        from datetime import datetime as _dtg, timezone as _tzg
+        _dd = _dtg.strptime(d[:10], '%Y-%m-%d').date()
+        _t0 = _dtg.now(_tzg.utc).date()
+        if not (-1 <= (_dd - _t0).days <= 2):
+            return rec
+        # cached_only: NIE blockieren — Miss wärmt im Hintergrund, der nächste
+        # Read innerhalb der TTL bekommt die Fakten.
+        lh = lh_flight_facts(fn, d, dep, arr, cached_only=True)
     except Exception:
         return rec
     out = _lh_apply_obs_fill(rec, lh)

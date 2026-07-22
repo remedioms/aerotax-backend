@@ -166,3 +166,24 @@ def test_merge_stale_obs_yields_pure_lh():
     assert "stale" not in out           # kein Verwerfen downstream
     # ohne LH bleibt die stale-Obs unverändert (altes Verhalten)
     assert _merge_lh_into_facts(stale_obs, {}) == stale_obs
+
+
+def test_cached_only_never_blocks_and_warms(monkeypatch):
+    # cached_only: Memo-Hit liefert, Miss gibt {} + EIN Hintergrund-Warmup —
+    # nie HTTP im Aufrufer-Thread (Incident-Fix 2026-07-22).
+    import time as _t
+    monkeypatch.setattr(lh, '_KEY', 'k')
+    monkeypatch.setattr(lh, '_SECRET', 's')
+    warms = []
+    monkeypatch.setattr(lh, '_warm_async', lambda *a: warms.append(a))
+    monkeypatch.setattr(lh, '_get', lambda p: (_ for _ in ()).throw(
+        AssertionError('cached_only darf nie HTTP machen')))
+    lh._facts_memo.clear()
+    assert lh.lh_flight_facts('LH400', '2026-07-22', cached_only=True) == {}
+    assert len(warms) == 1
+    # Memo-Hit: liefert die Fakten ohne weiteres Warmup.
+    lh._facts_memo[('LH400', '2026-07-22', None, None)] = (
+        _t.time() + 60, {'gate': 'C16'})
+    assert lh.lh_flight_facts('LH400', '2026-07-22',
+                              cached_only=True) == {'gate': 'C16'}
+    assert len(warms) == 1

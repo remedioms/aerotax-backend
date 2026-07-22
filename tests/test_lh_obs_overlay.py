@@ -6,8 +6,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from datetime import datetime, timezone
+
 import app as A
 from blueprints import lh_open_api
+
+TODAY = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
 
 LH = {  # Shape wie _obs_rows_to_facts / lh_flight_facts
@@ -63,7 +67,7 @@ def test_gate_skips_lh_when_board_complete(monkeypatch):
                         lambda *a, **k: calls.append(a) or dict(LH))
     complete = {'sched_dep': '10:55', 'sched_arr': '13:35',
                 'esti_arr': '13:03', 'arr_delay_min': -32}
-    out = A._lh_fill_obs_merged(complete, 'LH400', '2026-07-22', 'FRA', 'JFK')
+    out = A._lh_fill_obs_merged(complete, 'LH400', TODAY, 'FRA', 'JFK')
     assert out is complete and not calls  # kein Budget-Verbrauch
 
 
@@ -78,7 +82,7 @@ def test_gate_fetches_for_gappy_board(monkeypatch):
              'esti_dep': None, 'dep_delay_min': None, 'terminal_dep': None,
              'gate_arr': None, 'terminal_arr': None, 'dep_iata': None,
              'arr_iata': None, 'cancelled': None}
-    out = A._lh_fill_obs_merged(gappy, 'LH400', '2026-07-22', 'FRA', 'JFK')
+    out = A._lh_fill_obs_merged(gappy, 'LH400', TODAY, 'FRA', 'JFK')
     assert calls and out['sched_arr'] == LH['sched_arr']
     assert out['sched_dep'] == '10:55'
 
@@ -87,12 +91,32 @@ def test_gate_ignores_non_group(monkeypatch):
     monkeypatch.setattr(lh_open_api, 'lh_flight_facts',
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError('kein LH-Call für Nicht-Group')))
-    assert A._lh_fill_obs_merged(None, 'UA900', '2026-07-22', None, None) is None
+    assert A._lh_fill_obs_merged(None, 'UA900', TODAY, None, None) is None
 
 
 def test_pure_lh_record_carries_identity(monkeypatch):
     monkeypatch.setattr(lh_open_api, 'lh_flight_facts',
                         lambda *a, **k: dict(LH))
-    out = A._lh_fill_obs_merged(None, 'LH400', '2026-07-22', 'FRA', 'JFK')
-    assert out['flight'] == 'LH400' and out['date'] == '2026-07-22'
+    out = A._lh_fill_obs_merged(None, 'LH400', TODAY, 'FRA', 'JFK')
+    assert out['flight'] == 'LH400' and out['date'] == TODAY
     assert out['dep_iata'] == 'FRA' and out['arr_iata'] == 'JFK'
+
+
+def test_gate_skips_far_and_historic_dates(monkeypatch):
+    # Incident 2026-07-22: Historie-Iterationen (Logbuch) feuerten pro Tag
+    # einen LH-Call → nur heute−1…+2 darf überhaupt LH sehen.
+    monkeypatch.setattr(lh_open_api, 'lh_flight_facts',
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError('historische Tage rufen LH nie')))
+    assert A._lh_fill_obs_merged(None, 'LH400', '2026-07-04', 'FRA', None) is None
+    assert A._lh_fill_obs_merged(None, 'LH400', '2099-01-01', 'FRA', None) is None
+
+
+def test_fill_uses_cached_only(monkeypatch):
+    seen = {}
+    def fake(fn, d, dep, arr, force=False, cached_only=False):
+        seen['cached_only'] = cached_only
+        return dict(LH)
+    monkeypatch.setattr(lh_open_api, 'lh_flight_facts', fake)
+    A._lh_fill_obs_merged(None, 'LH400', TODAY, 'FRA', 'JFK')
+    assert seen.get('cached_only') is True
