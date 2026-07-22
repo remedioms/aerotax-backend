@@ -44,10 +44,11 @@ _TOKEN_URL = (os.environ.get('LH_FLIGHTOPS_TOKEN_URL')
               or 'https://oauth-test.lufthansa.com/lhcrew/oauth/token').strip()
 _BASE = (os.environ.get('LH_FLIGHTOPS_BASE')
          or 'https://api-sandbox.lufthansa.com/v1/flight_operations/crew_services/mock').strip().rstrip('/')
-# MOCK-Scope: Doku nennt den Prefix https://mock.cms.fra.dlh.de/… — exakter Wert
-# aus der Konsole (env-überschreibbar). Default = plausibelster Mock-Crew-Scope.
+# MOCK-Scope: LIVE VERIFIZIERT 2026-07-22 — der Consent/Token liefert
+# `publicCrewApiDev` (Authorize akzeptiert auch `publicCrewApi`, mappt aber auf
+# Dev). Env-überschreibbar (für PROD ohne den mock-Prefix).
 _SCOPE = (os.environ.get('LH_FLIGHTOPS_SCOPE')
-          or 'https://mock.cms.fra.dlh.de/publicCrewApi').strip()
+          or 'https://mock.cms.fra.dlh.de/publicCrewApiDev').strip()
 # Muss GENAU der im Portal registrierten Callback-URL entsprechen (Custom-Scheme
 # für die iOS-ASWebAuthenticationSession).
 _REDIRECT_URI = (os.environ.get('LH_FLIGHTOPS_REDIRECT_URI')
@@ -204,10 +205,40 @@ def _api_get(user_token, path, params=None):
         return None
 
 
+def _date_z(d):
+    """'YYYY-MM-DD' → 'YYYY-MM-DDZ' (das von der API erwartete Format,
+    live verifiziert 2026-07-22). Schon vorhandenes Z bleibt."""
+    d = (d or '').strip()
+    return d if d.endswith('Z') else (d[:10] + 'Z' if len(d) >= 10 else d)
+
+
 def duty_events(user_token, from_date, to_date):
-    """COMMON_DUTY_EVENTS für ein Zeitfenster (YYYY-MM-DD) → Response-Dict."""
-    return _api_get(user_token, '/COMMON_DUTY_EVENTS',
-                    {'fromDate': from_date, 'toDate': to_date})
+    """COMMON_DUTY_EVENTS für ein Zeitfenster → Response-Dict oder None.
+    Datumsformat YYYY-MM-DDZ. HINWEIS: die MOCK-Umgebung liefert NUR für das
+    dokumentierte Beispiel-Fenster (2016-10-01Z..2016-10-31Z) Daten; echte
+    Fenster gehen erst gegen PROD."""
+    resp = _api_get(user_token, '/COMMON_DUTY_EVENTS',
+                    {'fromDate': _date_z(from_date), 'toDate': _date_z(to_date)})
+    # Gateway-/Backend-Fehler kommen als {processingErrors:[…]} MIT 200/4xx/5xx —
+    # nie als Duty-Events missdeuten.
+    if isinstance(resp, dict) and resp.get('processingErrors'):
+        try:
+            e = (resp['processingErrors'] or [{}])[0]
+            log.warning('[lh_flightops] duty_events upstream %s: %s',
+                        e.get('code'), (e.get('type') or '')[:60])
+        except Exception:
+            pass
+        return None
+    return resp
+
+
+def is_mock():
+    """True wenn die aktuelle Base die MOCK-Sandbox ist (nur Beispiel-Daten)."""
+    return '/mock' in _BASE.lower() or 'sandbox' in _BASE.lower()
+
+
+# Das einzige Fenster, für das der MOCK Daten hat (dokumentiertes Beispiel).
+_MOCK_WINDOW = ('2016-10-01', '2016-10-31')
 
 
 # ── Duty Events → synthetisches ICS (reuse der Roster-Pipeline) ─────────────
@@ -368,8 +399,14 @@ def flightops_import(token):
     body = request.get_json(silent=True) or {}
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     today = _dt.now(_tz.utc)
-    fd = (body.get('from_date') or (today - _td(days=7)).strftime('%Y-%m-%d'))
-    td = (body.get('to_date') or (today + _td(days=45)).strftime('%Y-%m-%d'))
+    # MOCK liefert nur das Beispiel-Fenster → dort default darauf, sonst echtes
+    # Fenster −7…+45 Tage. Body kann beides überschreiben.
+    if is_mock():
+        fd = body.get('from_date') or _MOCK_WINDOW[0]
+        td = body.get('to_date') or _MOCK_WINDOW[1]
+    else:
+        fd = body.get('from_date') or (today - _td(days=7)).strftime('%Y-%m-%d')
+        td = body.get('to_date') or (today + _td(days=45)).strftime('%Y-%m-%d')
     resp = duty_events(token, fd, td)
     if resp is None:
         return jsonify({'ok': False, 'error': 'duty_events_failed'}), 502

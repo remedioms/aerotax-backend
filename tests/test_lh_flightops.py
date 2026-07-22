@@ -116,6 +116,25 @@ def test_duty_events_to_ics_empty():
     assert fo.duty_events_to_ics(None) is None
 
 
+def test_date_z_format():
+    assert fo._date_z('2016-10-01') == '2016-10-01Z'
+    assert fo._date_z('2016-10-01Z') == '2016-10-01Z'
+    assert fo._date_z('2016-10-01T00:00:00') == '2016-10-01Z'
+
+
+def test_is_mock():
+    # Default-Base ist die Sandbox/mock
+    assert fo.is_mock() is True
+
+
+def test_duty_events_error_shape_is_none(monkeypatch):
+    monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
+    # _api_get liefert die Gateway-Fehler-Shape → duty_events muss None geben
+    monkeypatch.setattr(fo, '_api_get', lambda tok, path, params=None: {
+        'serviceHost': 'x', 'processingErrors': [{'code': 500, 'type': 'NoHttpResponse'}]})
+    assert fo.duty_events('AT-U', '2016-10-01', '2016-10-31') is None
+
+
 def test_ping_endpoint(monkeypatch):
     monkeypatch.setattr(fo, '_KEY', ''); monkeypatch.setattr(fo, '_SECRET', '')
     import app as backend
