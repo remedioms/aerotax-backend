@@ -670,7 +670,9 @@ def test_enrich_overnight_arr_facts_use_arrival_day_not_dep_day(monkeypatch):
     bogus_arr = _iso(arr - timedelta(hours=24))
     good_arr = _iso(arr + timedelta(minutes=16))
 
-    def _facts(fn, date, dep_iata=None, arr_iata=None):
+    # Mock spiegelt die ECHTE Signatur (inkl. lh_cached_only, 2026-07-22) —
+    # sonst schluckt der try/except im Enricher den TypeError still.
+    def _facts(fn, date, dep_iata=None, arr_iata=None, lh_cached_only=False):
         d = (date or '')[:10]
         if d == dep_day:
             return {'dep_status': 'Abgeflogen', 'est_dep': _iso(dep),

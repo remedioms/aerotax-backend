@@ -65,7 +65,7 @@ def _install(monkeypatch, grpc_delay=0.0, grpc_ret=None):
                         lambda *a, **k: (None, None, None, None))
 
     # Obs: Route bekannt, aber sched_arr FEHLT → triggert den Zeiten-Task
-    def _facts(fn, date, dep_iata=None, arr_iata=None):
+    def _facts(fn, date, dep_iata=None, arr_iata=None, lh_cached_only=False):
         return {'dep_iata': 'FRA', 'arr_iata': 'BEG', 'reg': 'D-AIXS',
                 'type': 'A320', 'sched_dep': '2026-07-15T10:00:00+02:00'}
     monkeypatch.setattr(BP, '_flight_facts_from_obs', _facts)

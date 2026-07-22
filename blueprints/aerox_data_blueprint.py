@@ -4249,7 +4249,8 @@ def _merge_lh_into_facts(obs, lh):
     return out
 
 
-def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
+def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None,
+                           lh_cached_only=False):
     """Board-Fakten EINES Flugs (memoisiert). Kurzes prozessweites Cache über
     (flight,date,dep,arr) — der Detail-Aggregat-Kaltstart ruft dieselbe (fn,date)-
     Kombination auf dem seriellen resolve-Pfad mehrfach auf (resolve-Obs-Route +
@@ -4257,7 +4258,16 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     Reads + Row-Selektionen zu EINEM Zug (TTL 30 s, damit Ist-Zeiten frisch
     bleiben). Bei jedem Cache-Fehler transparenter Fallback auf den echten Call —
     die berechnete Antwort ist byte-identisch zum ungecachten Pfad. Kopie raus,
-    damit Consumer (die Felder mutieren) das Memo nicht vergiften."""
+    damit Consumer (die Felder mutieren) das Memo nicht vergiften.
+
+    `lh_cached_only` (friend-roster-Kalt-Profiling 2026-07-22): Fan-out-Pfade
+    (N Legs parallel) dürfen NIE auf den blockierenden LH-Open-API-Call warten —
+    der 5/s-Throttle SERIALISIERT alle Worker-Threads global (~0,2 s Spacing +
+    RTT pro Flug, bei ~25–30 Vergangenheits-Legs 5–12 s Wall-Clock; genau die
+    Incident-Lehre von heute Vormittag in _flight_obs_merged). True = Memo-Hit
+    liefert, Miss triggert nur das Hintergrund-Warmup (nächster Read innerhalb
+    der LH-TTL ist dann komplett). Für alle anderen Aufrufer (Default False)
+    bleibt das Verhalten byte-identisch."""
     fn = (flight_no or '').replace(' ', '').upper().strip()
     d = ((date or '').strip()[:10]) or time.strftime('%Y-%m-%d', time.gmtime())
     dep = (dep_iata or '').upper().strip() or None
@@ -4286,7 +4296,12 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None):
     try:
         from blueprints.lh_open_api import lh_flight_facts, is_lh_group
         if is_lh_group(fn):
-            _lh = lh_flight_facts(fn, d, dep, arr)
+            # cached_only auf Fan-out-Pfaden (s. Docstring): Memo-Miss → {}
+            # sofort + Hintergrund-Warmup statt blockierendem, global
+            # gedrosseltem LH-HTTP-Roundtrip im Request-Thread. Das 30-s-Memo
+            # unten kann dadurch kurz board-only sein — gleiche bewusst
+            # akzeptierte Übergangslage wie im _FLIGHT_MERGE_CACHE.
+            _lh = lh_flight_facts(fn, d, dep, arr, cached_only=lh_cached_only)
             if _lh:
                 facts = _merge_lh_into_facts(facts, _lh)
     except Exception:
@@ -4331,17 +4346,54 @@ def _flight_facts_from_obs_uncached(flight_no, date, dep_iata=None, arr_iata=Non
     # daher auf d+1; nur d/yday erwischte stattdessen die vorige Tagesrotation.
     dates = [d] + ([yday] if yday else []) + ([nday] if nday else [])
 
-    def _load_cands():
+    _FACTS_OBS_COLS = ('airport', 'flight', 'dest_iata', 'sched', 'esti',
+                       'gate', 'terminal', 'status', 'max_delay_min',
+                       'cancelled', 'reg', 'type_code', 'date')
+
+    def _rows_from_prefetch():
+        """Batch-Prefetch-Konsult (friend-roster-Kalt-Profiling 2026-07-22):
+        get_friend_roster lädt die Rows aller Roster-Legs vorab in EINEM
+        Batch-Read (app._delay_obs_prefetch_batch) — dieser Read hier war sonst
+        ein weiterer ~100-ms-Roundtrip PRO Vergangenheits-Leg. Lokal wird die
+        DB-Query exakt nachgebildet: flight-eq, date-in, updated_at-desc
+        (Postgres-Default NULLS FIRST bei desc), limit 20, Spalten-Projektion.
+        None wenn nicht ALLE Tage geseedet sind → normaler Einzel-Read."""
         try:
-            q = (sb.table('airport_delay_obs')
-                 .select('airport,flight,dest_iata,sched,esti,gate,terminal,'
-                         'status,max_delay_min,cancelled,reg,type_code,date')
-                 .in_('date', dates).eq('flight', fn)
-                 .order('updated_at', desc=True).limit(20).execute())
+            _pre = _life_app('_delay_obs_prefetch_rows')
+            if _pre is None:
+                return None
+            parts = [_pre(_dx, fn) for _dx in dates]
+            if any(p is None for p in parts):
+                return None
+            flat = [r for p in parts for r in p if (r.get('flight') or '') == fn]
+            # updated_at desc mit NULLS FIRST (Postgres-Default für desc):
+            # reverse=True ⇒ größter Key zuerst; (1,) > (0, ts) stellt Nulls
+            # nach vorn, Rest absteigend nach ISO-Timestamp (uniform, sortiert
+            # lexikografisch korrekt).
+            flat.sort(key=lambda r: ((1,) if r.get('updated_at') is None
+                                     else (0, str(r.get('updated_at')))),
+                      reverse=True)
+            return [{c: r.get(c) for c in _FACTS_OBS_COLS} for r in flat[:20]]
         except Exception:
             return None
+
+    def _load_cands(skip_prefetch=False):
+        # skip_prefetch: nach einem FR24-Ankunfts-Backfill-WRITE muss der
+        # Re-Read die frisch geschriebene Row sehen — der (≤60 s alte)
+        # Prefetch-Seed wäre hier nachweislich stale.
+        rows = None if skip_prefetch else _rows_from_prefetch()
+        if rows is None:
+            try:
+                q = (sb.table('airport_delay_obs')
+                     .select('airport,flight,dest_iata,sched,esti,gate,terminal,'
+                             'status,max_delay_min,cancelled,reg,type_code,date')
+                     .in_('date', dates).eq('flight', fn)
+                     .order('updated_at', desc=True).limit(20).execute())
+            except Exception:
+                return None
+            rows = q.data or []
         _dep, _arr = [], []
-        for r in (q.data or []):
+        for r in rows:
             ap = (r.get('airport') or '').upper()
             if ap.endswith('#ARR'):
                 if arr is None or ap == arr + '#ARR':
@@ -4368,7 +4420,7 @@ def _flight_facts_from_obs_uncached(flight_no, date, dep_iata=None, arr_iata=Non
         if d < _today:
             try:
                 if _fr24_fill_missing_arrival(fn, d, dep, arr):
-                    _loaded2 = _load_cands()
+                    _loaded2 = _load_cands(skip_prefetch=True)
                     if _loaded2 is not None:
                         dep_cands, arr_cands = _loaded2
             except Exception:

@@ -13346,6 +13346,64 @@ def get_friend_roster(token, friend_token):
                     if isinstance(e.get('ical_sectors'), list)
                     and e.get('ical_sectors')]
     if _enrich_days:
+        # BATCH-PREFETCH der Leaf-Reads (Kalt-Profiling 2026-07-22): der Fan-out
+        # unten liest pro VERGANGENEM Sektor 3–5× airport_delay_obs einzeln
+        # (dep-/arr-Row, Folgetags-Probe, Facts-Read d±1) à ~100–130 ms — bei
+        # einer 30-Tage-Tour blieben trotz Tages-Parallelität 2–5,5 s Wall-Clock
+        # (Prod-Logs). Alle Reads sind (date, flight)-gezielt → EIN Batch-Read
+        # (~0,1 s, gemessen) seedet den Prefetch; _delay_obs_rows_for_date und
+        # der Facts-Read konsultieren ihn und filtern lokal DB-identisch.
+        # Best-effort: scheitert der Batch, laufen die Einzel-Reads wie bisher.
+        try:
+            try:
+                _cs_map = _ax_codeshare_map() or {}
+            except Exception:
+                _cs_map = {}
+            _pf_pairs = set()
+            _pf_now = datetime.now(timezone.utc)
+            for _e in _enrich_days:
+                for _s in (_e.get('ical_sectors') or []):
+                    if not isinstance(_s, dict):
+                        continue
+                    _fn0 = _fn_norm(str(_s.get('flight') or ''))
+                    if len(_fn0) < 3:
+                        continue
+                    # Codeshare→Operating falten wie der Enricher — die Reads
+                    # unten laufen alle unter der Operating-Nummer.
+                    _op_fn = _cs_map.get(_fn0, _fn0)
+                    # Leg-Datum wie im Enricher: dep_iso-Tag, sonst Tages-Key.
+                    _ld = None
+                    _dep_s = None
+                    try:
+                        if _s.get('dep_iso'):
+                            _dep_s = datetime.fromisoformat(
+                                str(_s['dep_iso']).replace('Z', '+00:00'))
+                            if _dep_s.tzinfo is None:
+                                _dep_s = _dep_s.replace(tzinfo=timezone.utc)
+                            _ld = _dep_s.strftime('%Y-%m-%d')
+                    except Exception:
+                        _ld = None
+                    _ld = _ld or str(_e.get('datum') or '')[:10]
+                    try:
+                        _ld_d = _date.fromisoformat(_ld)
+                    except Exception:
+                        continue
+                    # Tiefe Zukunft liest der Enricher nie (27-h-/Tages-Guard +
+                    # ZUKUNFTS-Guard in _obs_lookup) → nicht vorladen.
+                    if _dep_s is not None and _dep_s > _pf_now + timedelta(hours=27):
+                        continue
+                    if _ld_d > today + _td(days=1):
+                        continue
+                    # −1…+2 deckt alle Ziel-Daten der Leaf-Reads: Facts-Read
+                    # (d−1, d, d+1), Übernacht-arr-Tag (+1) samt seiner eigenen
+                    # d±1-Nachlese (+2) und die Folgetags-ARR-Probe (+1).
+                    for _off in (-1, 0, 1, 2):
+                        _pf_pairs.add(
+                            ((_ld_d + _td(days=_off)).isoformat(), _op_fn))
+            if _pf_pairs:
+                _delay_obs_prefetch_batch(_pf_pairs)
+        except Exception:
+            pass
         # Homebase EINMAL vor dem Fan-out (10-min-Memo) statt lazy im Loop —
         # sonst rennen N Worker gleichzeitig in den kalten Profil-Read.
         _hb = _profile_homebase_cached(friend_token) or ''
@@ -33842,7 +33900,13 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
             try:
                 from blueprints.aerox_data_blueprint import (
                     _flight_facts_from_obs as _facts_from_obs)
-                _fc = _facts_from_obs(op_fn, leg_date, dep_iata=frm, arr_iata=to)
+                # lh_cached_only: dieser Enricher IST ein Fan-out (friend-roster/
+                # Briefings, N Legs) — der blockierende LH-Open-API-Call ist
+                # global auf 5/s gedrosselt und serialisierte hier alle Worker
+                # (gemessen 7–14 s kalt, 22.07.). Miss → Hintergrund-Warmup,
+                # der nächste Request innerhalb der LH-TTL ist komplett.
+                _fc = _facts_from_obs(op_fn, leg_date, dep_iata=frm, arr_iata=to,
+                                      lh_cached_only=True)
                 if isinstance(_fc, dict) and _fc:
                     _facts = _fc
                 # ── ÜBERNACHT-ARR-DATUM (Tibor LH455-R4, 2026-07-16) ──────────
@@ -33872,7 +33936,8 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 if (_arr_day and leg_date and _arr_day != leg_date
                         and (not _facts or not _facts.get('est_arr'))):
                     _fc2 = _facts_from_obs(op_fn, _arr_day,
-                                           dep_iata=frm, arr_iata=to)
+                                           dep_iata=frm, arr_iata=to,
+                                           lh_cached_only=True)
                     _fc2 = _gate_facts_arr_against_leg(_fc2, s.get('arr_iso'))
                     if isinstance(_fc2, dict) and _fc2 and _fc2.get('est_arr'):
                         # ARR-Tag-Row bringt die richtige Ist-Ankunft; die DEP-Tag-
@@ -38276,6 +38341,98 @@ def _obs_flight_variants(fn):
     return sorted(variants)
 
 
+# ── BATCH-PREFETCH für airport_delay_obs-Einzelflug-Reads ────────────────────
+# WARUM (friend-roster-Profiling 2026-07-22): der Freund-Roster-Fan-out liest
+# pro VERGANGENEM Sektor 3–5× dieselbe Tabelle einzeln (dep-Row, arr-Row,
+# Folgetags-Probe, Facts-Read über d±1) — je ~100–130 ms PostgREST-Roundtrip.
+# Bei einer 30-Tage-Tour addierte sich das trotz Tages-ThreadPool auf 2–5,5 s
+# Wall-Clock (Prod-Logs 22.07.). Alle diese Reads sind (date, flight)-gezielt →
+# EIN or=(and(date.eq…,flight.in.(…)),…)-Batch-Read (gemessen ~0,1 s flat)
+# holt sie vorab; die Leaf-Reader konsultieren den Prefetch und filtern lokal
+# EXAKT wie die DB (airport/dest_iata/flight-Varianten) — Ergebnismenge
+# byte-identisch, nur der Ort des Filterns ändert sich (Muster wie der
+# `flight=in.(…)`-Egress-Fix von heute Vormittag in _route_track_flight_set).
+# Miss/abgelaufen → transparenter Fallback auf den bisherigen Einzel-Read.
+_DELAY_OBS_PREFETCH = {}            # (date, fn_norm) → (monotonic_ts, [raw rows])
+_DELAY_OBS_PREFETCH_LOCK = _req_threading.Lock()
+_DELAY_OBS_PREFETCH_TTL = 60.0      # ≤ Endpoint-Memo (60 s) — keine neue Stale-Grenze
+_DELAY_OBS_PREFETCH_MAX = 4000
+
+
+def _delay_obs_prefetch_batch(pairs):
+    """Lädt die airport_delay_obs-Rows ALLER (date_str, flight_no)-Paare in
+    EINEM paginierten Batch-Read und seedet den Prefetch — auch mit LEEREN
+    Listen für Paare ohne Rows (definitives „nichts da", spart den Einzel-Read).
+    Flug-Varianten wie der Einzel-Read (`_obs_flight_variants`). Best-effort:
+    bei jedem Fehler wird NICHTS geseedet (Leaf-Reader fallen auf ihre
+    bisherigen Einzel-Reads zurück). Wirft nie."""
+    try:
+        if not SB_AVAILABLE or sb is None or not pairs:
+            return
+        by_date = {}
+        want_keys = set()
+        for d, fn in pairs:
+            d = str(d or '')[:10]
+            fnn = _fn_norm(fn)
+            if len(d) != 10 or len(fnn) < 3:
+                continue
+            by_date.setdefault(d, set()).update(_obs_flight_variants(fn))
+            want_keys.add((d, fnn))
+        if not want_keys:
+            return
+        groups = []
+        for d in sorted(by_date):
+            vs = sorted(v for v in by_date[d] if re.match(r'^[A-Z0-9]+$', v))
+            if vs:
+                groups.append(f"and(date.eq.{d},flight.in.({','.join(vs)}))")
+        if not groups:
+            return
+        rows = []
+        offset = 0
+        page = 1000
+        while True:     # PostgREST kappt still bei 1000 → immer paginieren
+            r = (sb.table('airport_delay_obs').select('*')
+                 .or_(','.join(groups))
+                 .range(offset, offset + page - 1).execute())
+            chunk = r.data or []
+            rows.extend(chunk)
+            if len(chunk) < page:
+                break
+            offset += page
+        grouped = {k: [] for k in want_keys}
+        for row in rows:
+            k = (str(row.get('date') or '')[:10],
+                 _fn_norm(str(row.get('flight') or '')))
+            if k in grouped:
+                grouped[k].append(row)
+        now_mono = _req_time.monotonic()
+        with _DELAY_OBS_PREFETCH_LOCK:
+            for k, v in grouped.items():
+                _DELAY_OBS_PREFETCH[k] = (now_mono, v)
+            if len(_DELAY_OBS_PREFETCH) > _DELAY_OBS_PREFETCH_MAX:
+                cut = now_mono - _DELAY_OBS_PREFETCH_TTL
+                for k in [k for k, v in _DELAY_OBS_PREFETCH.items()
+                          if v[0] < cut]:
+                    _DELAY_OBS_PREFETCH.pop(k, None)
+    except Exception:
+        pass
+
+
+def _delay_obs_prefetch_rows(date_str, flight):
+    """Prefetch-Lookup: Row-KOPIEN für (date, flight) oder None (nicht/nicht
+    mehr geseedet → Caller macht seinen bisherigen Einzel-Read). Leere Liste
+    ist ein DEFINITIVES „keine Rows" aus dem Batch. Wirft nie."""
+    try:
+        key = (str(date_str or '')[:10], _fn_norm(flight))
+        with _DELAY_OBS_PREFETCH_LOCK:
+            hit = _DELAY_OBS_PREFETCH.get(key)
+        if hit is None or _req_time.monotonic() - hit[0] >= _DELAY_OBS_PREFETCH_TTL:
+            return None
+        return [dict(r) for r in hit[1]]
+    except Exception:
+        return None
+
+
 def _delay_obs_rows_for_date(date_str, airport='FRA', dest_iata=None, flight=None):
     """Liest ALLE persistierten Delay-Beobachtungen eines BELIEBIGEN (auch
     vergangenen) Betriebstags direkt aus airport_delay_obs — OHNE den
@@ -38294,6 +38451,16 @@ def _delay_obs_rows_for_date(date_str, airport='FRA', dest_iata=None, flight=Non
     airport = (airport or 'FRA').upper()
     dest_iata = (dest_iata or '').upper().strip() or None
     fn_variants = _obs_flight_variants(flight) if flight else None
+    # PREFETCH-KONSULT (nur Einzelflug-Lookups, s. Kommentar am Store): lokal
+    # EXAKT die DB-Filter nachbilden — airport ist Teil des Store-Keys (eq),
+    # dest_iata eq (NULL matcht nie, wie in SQL), flight in Varianten.
+    if fn_variants:
+        _pre = _delay_obs_prefetch_rows(date_str, flight)
+        if _pre is not None:
+            return [r for r in _pre
+                    if (r.get('airport') or '') == airport
+                    and (dest_iata is None or (r.get('dest_iata') or '') == dest_iata)
+                    and (r.get('flight') or '') in fn_variants]
     out = []
     try:
         offset = 0
