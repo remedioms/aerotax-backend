@@ -41823,10 +41823,35 @@ def _edelweissify_roster_events(events, token=None):
     (_build_ical_sectors, Legs-/Block-Aufbau in _ics_events_to_briefings)
     bevorzugen die Stempel vor der Gleichverteilungs-Interpolation.
     DTSTART/DTEND bleiben unangetastet (DTSTART = Report ist die korrekte
-    ical_start_iso/Briefing-Anzeige). Wirft nie; Fremd-Feeds byte-identisch."""
+    ical_start_iso/Briefing-Anzeige). Wirft nie; Fremd-Feeds byte-identisch.
+
+    LAY-ENTZEITUNG (Miguel 2026-07-23, „Darstellung falsch — Tag 6 blau statt
+    grau"): Die GETIMTEN LAY-Events tragen Outlook-Windows-TZIDs („W. Europe
+    Standard Time", „Egypt Standard Time"), die der ICS-Parser als UTC fehl-
+    liest → ein voller PUJ-Layover-Tag bekam ein Phantom-„Duty-Fenster"
+    00:37→24:00 (Balken blau statt Layover-grau, Duty-Ende des Vortags auf
+    Mitternacht aufgebläht — „LAY" fällt anders als „LAYOVER" nicht unter die
+    _ev_extends_duty-Ausnahme). Die ganztägigen LAY-Tage (VALUE=DATE, z. B.
+    29.–31.7.) hatten keine Zeiten und rendern korrekt. Fix: bare-LAY-Events
+    eines WK-Feeds werden zu reinen Datums-Markern entzeitet — die echte
+    Layover-SPANNE trägt das synthetisierte LAYOVER-Event (siehe
+    _generic_layover_synthesis), die lokalen Datums-Buckets (`start`/`end`)
+    stimmen unabhängig vom TZ-Fehler."""
     try:
+        has_wk = any(_WK_DUTY_RE.match((e.get('summary') or '').strip().upper())
+                     for e in (events or []))
+        if not has_wk:
+            return events
         for ev in (events or []):
             summ = (ev.get('summary') or '').strip()
+            if summ.upper() == 'LAY':
+                ev['start_iso'] = ''
+                ev['end_iso'] = ''
+                ev['_is_date_only_start'] = True
+                ev['_is_date_only_end'] = True
+                ev['_end_local_midnight'] = False
+                ev['_multiday_dates'] = _ics_multiday_dates(ev)
+                continue
             if not _WK_DUTY_RE.match(summ.upper()):
                 continue
             legs = _ics_parse_multi_leg_summary(summ)
