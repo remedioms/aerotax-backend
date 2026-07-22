@@ -81,16 +81,18 @@ def fetch_mqtt_credentials():
     return cid, jwt, (cm.get('endpoint') or _MQTT_HOST_FALLBACK)
 
 
-def _backend(path, method='GET', payload=None):
+def _backend(path, method='GET', payload=None, timeout=12):
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {'X-Poll-Secret': _POLL_SECRET}
     if data is not None:
         headers['Content-Type'] = 'application/json'
-    return _http_json(_BACKEND + path, method, data, headers, timeout=12)
+    return _http_json(_BACKEND + path, method, data, headers, timeout=timeout)
 
 
 def fetch_topics():
-    d = _backend('/api/internal/lh-mqtt/topics')
+    # 30s: der erste ungememote Topic-Aufbau (paginierter Voll-Fetch über
+    # alle User) direkt nach einem Deploy kann die 12s reißen.
+    d = _backend('/api/internal/lh-mqtt/topics', timeout=30)
     return set(d.get('topics') or [])
 
 
@@ -191,18 +193,22 @@ class Daemon:
                 backoff = 5
                 last_beat = 0.0
                 while True:
+                    refresh_ok = True
                     try:
                         self.refresh_topics()
                     except Exception as e:
+                        refresh_ok = False
                         _log(f'topic refresh fail: {type(e).__name__}')
                     if time.time() - last_beat > 600:
                         _log(f'beat connected={self.connected.is_set()} '
                              f'topics={len(self.subscribed)} '
                              f'msgs={self.msg_count} post_fail={self.post_fail}')
                         last_beat = time.time()
+                    # Nach fehlgeschlagenem Refresh (z.B. Backend bootet noch
+                    # nach Deploy) NICHT das volle Intervall blind bleiben.
                     # Verbindung tot und paho-Reconnect hilft nicht mehr →
                     # außen neu aufbauen (inkl. frischem JWT bei Auth-Probleme).
-                    for _ in range(_REFRESH_S):
+                    for _ in range(_REFRESH_S if refresh_ok else 20):
                         time.sleep(1)
                         if not self.connected.is_set():
                             break
