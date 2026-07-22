@@ -32892,8 +32892,14 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         'cancelled': (dep_cxl or arr_cxl),
         'delay_min': best_delay, 'delay_side': delay_side,
         'delay_known': bool(dep_known or arr_known),
-        'reg': _s(dep_row, 'reg') or _s(arr_row, 'reg'),
-        'aircraft': _s(dep_row, 'aircraft') or _s(arr_row, 'aircraft'),
+        # ARR-Reg SCHLÄGT DEP-Reg (Kurzstrecken-Tail-Audit 22.07., harter
+        # Beweis via aircraft_track): das Fraport-DEP-Board trägt bei Intraday-
+        # Maschinentausch die PLAN-Reg von VOR dem Swap (LH1182: Board D-AIZT,
+        # geflogen D-AIBJ — D-AIZT flog zeitgleich LH79), die ARR-Beobachtung
+        # ist die echte Maschine. Wrong-Day-/Rotation-Guards oben schützen die
+        # arr_row bereits.
+        'reg': _s(arr_row, 'reg') or _s(dep_row, 'reg'),
+        'aircraft': _s(arr_row, 'aircraft') or _s(dep_row, 'aircraft'),
         'sides': {'dep': dep_src, 'arr': arr_src},
         'has_dep': dep_row is not None, 'has_arr': arr_row is not None,
     }

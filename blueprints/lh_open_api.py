@@ -90,16 +90,23 @@ def is_lh_group(flight_no):
     return pfx in _LH_GROUP and fn[2:3].isdigit()
 
 
+_tok_fail_until = 0.0
+
+
 def _token():
     """Client-Credentials-Access-Token, gecacht bis kurz vor Ablauf. None bei
-    Fehler (Aufrufer fällt dann still auf die anderen Tiers zurück)."""
-    global _tok_val, _tok_exp
+    Fehler (Aufrufer fällt dann still auf die anderen Tiers zurück).
+    NEGATIV-CACHE 90s (Ausfall 22.07. abends: OAuth-403 → JEDER LH-Aufruf
+    machte einen eigenen blockierenden Token-Roundtrip, 67 Fails/5 min)."""
+    global _tok_val, _tok_exp, _tok_fail_until
     if not lh_open_configured():
         return None
     now = time.time()
     with _tok_lock:
         if _tok_val and now < _tok_exp:
             return _tok_val
+        if now < _tok_fail_until:
+            return None
     body = urllib.parse.urlencode({
         'client_id': _KEY, 'client_secret': _SECRET,
         'grant_type': 'client_credentials'}).encode()
@@ -120,6 +127,8 @@ def _token():
         return tok
     except Exception as e:
         log.warning('[lh_open] token fail: %s', type(e).__name__)
+        with _tok_lock:
+            _tok_fail_until = time.time() + 90
         return None
 
 
@@ -373,10 +382,12 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
                     chosen = lg
                     break
             else:
-                chosen = lg
+                # MEHR-LEG-GUARD (Tail-Audit 22.07.): ohne dep/arr bei einem
+                # Multi-Sektor-Flug (4Y136 FRA-MBA-JRO) wäre „erstes Leg"
+                # geraten — falsche Reg/Zeiten für Flugnummer-only-Caller.
+                # Ein-Leg-Flüge (der Normalfall) bleiben unverändert.
+                chosen = lg if len(legs) == 1 else None
                 break
-        if chosen is None and legs and not (dep or arr):
-            chosen = legs[0]
         if chosen is not None:
             facts = _leg_to_facts(chosen)
     except Exception as e:
