@@ -292,8 +292,11 @@ def duty_events(user_token, from_date, to_date):
 
 
 def is_mock():
-    """True wenn die aktuelle Base die MOCK-Sandbox ist (nur Beispiel-Daten)."""
-    return '/mock' in _BASE.lower() or 'sandbox' in _BASE.lower()
+    """True nur wenn die Base die MOCK-Umgebung ist (Pfad-Segment /mock, nur
+    statische Beispiel-Daten). TEST/Sandbox (api-sandbox OHNE /mock) hat ECHTE
+    anonymisierte Daten → NICHT als Mock behandeln (sonst würde das
+    2016-Beispielfenster statt des echten Roster-Fensters genutzt)."""
+    return '/mock' in _BASE.lower()
 
 
 # ── Alle Crew-Services (Resource-Pfade aus der Doku, 2026-07-22) ─────────────
