@@ -17648,6 +17648,25 @@ def get_logbook(token):
             imported_count += 1
         entries.sort(key=lambda e: (e.get('date') or '', e.get('dep_iso') or ''))
 
+    # Simulator-Sessions aus dem Import (FCL.050: FSTD-Zeit ist GETRENNT von
+    # der Flug-Blockzeit — sie zählt NICHT in totals/by_type, eigene Sektion).
+    sim_sessions = []
+    sim_total = 0
+    for s_ in (imp.get('sim') or []):
+        if not isinstance(s_, dict) or not s_.get('date'):
+            continue
+        dm = s_.get('duration_min')
+        dm = dm if isinstance(dm, int) and 0 < dm < 24 * 60 else None
+        sim_sessions.append({
+            'date': str(s_.get('date'))[:10],
+            'place': s_.get('place') or None,
+            'code': s_.get('code') or None,
+            'duration_min': dm,
+            'role': s_.get('role') or None,
+        })
+        sim_total += dm or 0
+    sim_sessions.sort(key=lambda x: x['date'], reverse=True)
+
     by_type = {}
     tot_block = tot_ldg = 0
     dates_seen = set()
@@ -17670,6 +17689,8 @@ def get_logbook(token):
         'totals': {'legs': len(entries), 'block_min': tot_block,
                    'landings': tot_ldg, 'days': len(dates_seen)},
         'imported_legs': imported_count,
+        'sim_sessions': sim_sessions,
+        'sim_total_min': sim_total,
         'enrich_capped': enrich_capped,
     })
 

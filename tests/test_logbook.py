@@ -208,3 +208,23 @@ def test_no_import_store_keeps_logbook_unchanged():
     _seed()
     r = _get()
     assert r['imported_legs'] == 0 and r['totals']['legs'] == 3
+
+
+def test_sim_sessions_separate_from_flight_totals():
+    _seed()
+    _seed_import()
+    r = _get()
+    # Sim-Session aus dem Import: eigene Sektion, neueste zuerst
+    assert r['sim_total_min'] == 240
+    assert r['sim_sessions'] == [{'date': '2019-04-01', 'place': 'FRA',
+                                  'code': 'RE359', 'duration_min': 240,
+                                  'role': None}]
+    # FCL.050: FSTD-Zeit zählt NICHT in die Flug-Totals/Muster-Summen
+    assert r['totals']['block_min'] == 520 + 450 + 60 + 630
+    assert not any(t['type'] == 'RE359' for t in r['by_type'])
+
+
+def test_sim_sessions_empty_without_import():
+    _seed()
+    r = _get()
+    assert r['sim_sessions'] == [] and r['sim_total_min'] == 0
