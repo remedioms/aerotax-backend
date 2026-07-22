@@ -110,6 +110,7 @@ for _bp_path, _bp_name in [
     ('blueprints.legal_consent_blueprint',   'legal_consent_bp'),  # versioniertes accountgebundenes Consent-Ledger
     ('blueprints.lh_open_api',               'lh_open_bp'),  # LH Open API — autoritative Flug-Fakten (free-first, Engine A)
     ('blueprints.lh_flightops',              'lh_flightops_bp'),  # LH FlightOps Crew API — Roster-Quelle (Engine B, Mock-Gerüst)
+    ('blueprints.lh_mqtt',                   'lh_mqtt_bp'),  # LH MQTT-Push-Notifications — Topics/Event-Fanout (Engine A2)
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
@@ -11003,6 +11004,9 @@ _PUSH_TYPE_TO_PREF = {
     'family_reaction': 'family_message',
     'trade_interest': 'community',
     'trade_closed': 'community',
+    # LH-MQTT-Flug-Events (Gate/Verspätung/Annullierung) zählen zum
+    # Dienstplan-Pref — gleiche Nutzer-Erwartung wie roster_change.
+    'flight_update': 'roster_change',
 }
 
 

@@ -284,10 +284,12 @@ def _norm_reg(reg):
     return reg
 
 
-def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None):
+def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False):
     """Autoritative LH-Group-Flug-Fakten (Shape wie _obs_rows_to_facts) oder {}.
     Gecacht pro (flight,date,dep,arr). No-op wenn nicht konfiguriert / kein
-    LH-Group-Flug. Wirft nie."""
+    LH-Group-Flug. Wirft nie. force=True überspringt den Memo-READ (schreibt
+    ihn aber neu) — für den MQTT-Push-Pfad, der per Definition frischer als
+    die TTL ist (Broker sagt „hat sich GERADE geändert")."""
     fn = (flight_no or '').replace(' ', '').upper().strip()
     d = ((date or '').strip()[:10])
     if not fn or not d or not lh_open_configured() or not is_lh_group(fn):
@@ -296,10 +298,11 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None):
     arr = (arr_iata or '').upper().strip() or None
     key = (fn, d, dep, arr)
     now = time.time()
-    with _facts_lock:
-        hit = _facts_memo.get(key)
-        if hit and now < hit[0]:
-            return dict(hit[1])
+    if not force:
+        with _facts_lock:
+            hit = _facts_memo.get(key)
+            if hit and now < hit[0]:
+                return dict(hit[1])
 
     data = _get(f'/operations/flightstatus/{urllib.parse.quote(fn)}/{d}')
     facts = {}

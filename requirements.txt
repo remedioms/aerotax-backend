@@ -34,6 +34,10 @@ boto3>=1.34.0
 # Dependency nötig. tzdata stellt sicher, dass zoneinfo('Europe/Berlin') auf jedem
 # (auch slim) Cloud-Run-Image verfügbar ist (EFA braucht lokale Abfahrtszeit).
 tzdata>=2024.1
+# LH-MQTT-Daemon (lh_mqtt_daemon.py, eigener Compose-Service): Verbindung zum
+# Lufthansa-Akamai-Notification-Broker (lhgopenapi.lufthansa.com:8883, TLS,
+# JWT-Auth). Nur der Daemon nutzt es — Backend-Worker importieren es nicht.
+paho-mqtt>=2.0,<3
 # FR24 gRPC per-flight Resolver (blueprints/fr24_grpc.py): anonyme Route/Detail/
 # Satelliten-Positionen über data-feed.flightradar24.com (AWS-ELB, NICHT der
 # Cloudflare-gewallte feed.js-Pfad — läuft aus Cloud-Run-DC-IP, verifiziert
