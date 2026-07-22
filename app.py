@@ -42190,6 +42190,16 @@ def import_calendar_feed(token):
     if ics_text_2_direct and len(ics_text_2_direct) > 1_000_000:
         return jsonify({'ok': False, 'error': 'response_too_large'}), 413
     url = _normalize_feed_scheme(_sanitize_feed_url(body.get('url') or ''))
+    # DISCOVER-GUARD (Echte-User-Audit 2026-07-22): 4 Discover-Crews fuegten
+    # crewaccess.cms.discover.aero-URLs ein — das Portal liefert dort KEIN
+    # iCal (Login-HTML), der Import meldete still "ok" mit 0 Events und der
+    # Roster blieb fuer immer leer. Ehrlicher Fehler statt stillem Erfolg;
+    # iOS zeigt die Meldung und der PDF-Weg bleibt der richtige.
+    if 'crewaccess.cms.discover.aero' in url:
+        return jsonify({'ok': False, 'error': 'discover_needs_pdf',
+                        'message': 'Discover bietet keinen Kalender-Link. '
+                                   'Bitte lade dein Roster-PDF aus CrewAccess '
+                                   'hoch (PDF auswaehlen).'}), 400
     # HTTP raus · nur HTTPS akzeptieren (sonst Klartext-Cookies leakable).
     # Leerer/unbrauchbarer Rest nach dem Sanitize = ungültige URL → bad_url,
     # damit alte Clients (die client-seitig NICHT sanitizen) eine ehrliche
