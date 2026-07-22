@@ -17320,6 +17320,154 @@ def save_logbook_leg(token):
     return jsonify({'ok': True, 'key': key, 'overlay': cur})
 
 
+# ── Flugbuch-Import-Upload (Owner-Wunsch 2026-07-22, Thomas-Rust-Anfrage) ────
+# Der User lädt den Export seiner bisherigen Logbuch-App hoch (LogTen /
+# ForeFlight / mccPILOTLOG / Safelog / Excel / PDF …). Die Datei geht als
+# Mail-Anhang an den Owner (Resend — gleiches Pattern wie Crash-/Support-
+# Mails) und wird dann serverseitig ins Flugbuch eingespielt. In der App
+# wirkt das als nativer Import-Flow („Import eingereicht, wird übernommen")
+# — bewusst OHNE „schick uns eine E-Mail"-Aufforderung.
+
+_LOGBOOK_IMPORT_MAX_BYTES = 15 * 1024 * 1024   # Resend-Attachment-Limit 40MB gesamt
+_LOGBOOK_IMPORT_EXTS = ('.csv', '.txt', '.tsv', '.xls', '.xlsx', '.numbers',
+                        '.pdf', '.json', '.zip')
+_LOGBOOK_IMPORT_TS = {}            # token -> [epoch, ...] (in-memory Throttle)
+_LOGBOOK_IMPORT_TS_LOCK = _req_threading.Lock()
+
+
+def _logbook_import_mail(token, filename, blob, note):
+    """Datei als Mail-Anhang an den Owner (SUPPORT_NOTIFY_EMAIL). True bei
+    Erfolg — der Upload gilt nur dann als angenommen (die Disk ist ephemer,
+    die Mail IST der Transportweg)."""
+    api_key = os.environ.get('RESEND_API_KEY', '').strip()
+    to_email = os.environ.get('SUPPORT_NOTIFY_EMAIL',
+                              'miguel.schumann@icloud.com').strip()
+    if not api_key:
+        print('[logbook-import] RESEND_API_KEY nicht gesetzt')
+        return False
+    try:
+        import urllib.request
+        import base64 as _b64
+        import hashlib as _hl
+        import html as _html
+        prof = {}
+        try:
+            prof = ((_profile_load(token) or {}).get('profile') or {})
+        except Exception:
+            pass
+        e = _html.escape
+        name = str(prof.get('name') or '—')
+        meta = (f"{name} · {prof.get('airline') or '—'} · "
+                f"{prof.get('homebase') or '—'}")
+        sha = _hl.sha256(blob).hexdigest()[:16]
+        subject = (f"[AeroX Flugbuch-Import] {name} · "
+                   f"{filename}").replace('\r', ' ').replace('\n', ' ')[:200]
+        html_body = (
+            f"<h2 style='font-family:sans-serif'>Flugbuch-Import eingereicht</h2>"
+            f"<p style='font-family:sans-serif;color:#444'>"
+            f"<b>User:</b> {e(token)}<br>"
+            f"<b>Profil:</b> {e(meta)}<br>"
+            f"<b>Datei:</b> {e(filename)} · {len(blob) // 1024} KB · "
+            f"sha256 {sha}<br>"
+            f"<b>Notiz:</b> {e(note or '—')}"
+            f"</p>"
+            f"<p style='font-family:sans-serif;font-size:12px;color:#888'>"
+            f"Datei parsen und via Import-Store ins Flugbuch des Tokens "
+            f"einspielen (Kette: Anhang → Legs → logbook).</p>"
+        )
+        payload = json.dumps({
+            'from': 'AeroX Flugbuch <support@aerosteuer.de>',
+            'to': [to_email],
+            'subject': subject,
+            'html': html_body,
+            'attachments': [{
+                'filename': filename,
+                'content': _b64.b64encode(blob).decode(),
+            }],
+        }).encode()
+        req = urllib.request.Request(
+            'https://api.resend.com/emails',
+            data=payload,
+            headers={'Authorization': f'Bearer {api_key}',
+                     'Content-Type': 'application/json',
+                     'User-Agent': 'AeroX-Backend/1.0'},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ok = 200 <= resp.status < 300
+            print(f'[logbook-import] mail status={resp.status} tok={token[:8]} '
+                  f'file={filename} {len(blob)}B')
+            return ok
+    except Exception as ex:
+        print(f'[logbook-import] mail fail: {type(ex).__name__}: {str(ex)[:200]}')
+        return False
+
+
+@app.route('/api/user/logbook/<token>/import-upload', methods=['POST'])
+def upload_logbook_import(token):
+    """Nimmt EINE Export-Datei entgegen (multipart `file` ODER JSON
+    {filename, data_b64}) und leitet sie als Mail-Anhang an den Owner.
+    Ehrliche Antworten: angenommen NUR wenn die Mail raus ist."""
+    import base64 as _b64
+    import time as _time
+    if not token or not re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    # Throttle: max 5 Uploads/24h pro Token (in-memory reicht — der 50MB-
+    # Flask-Cap begrenzt den Einzel-Request, hier geht's um Mail-Spam).
+    now = _time.time()
+    with _LOGBOOK_IMPORT_TS_LOCK:
+        ts = [t for t in _LOGBOOK_IMPORT_TS.get(token, []) if now - t < 86400]
+        if len(ts) >= 5:
+            return jsonify({'ok': False, 'error': 'too_many_uploads',
+                            'message': 'Maximal 5 Importe pro Tag — bitte '
+                                       'morgen erneut versuchen.'}), 429
+        ts.append(now)
+        _LOGBOOK_IMPORT_TS[token] = ts
+    filename, blob, note = None, None, None
+    f = request.files.get('file')
+    if f is not None:
+        filename = f.filename or 'flugbuch-export'
+        blob = f.read()
+        note = (request.form.get('note') or '')[:500]
+    else:
+        body = request.get_json(silent=True) or {}
+        filename = str(body.get('filename') or 'flugbuch-export')
+        note = str(body.get('note') or '')[:500]
+        try:
+            blob = _b64.b64decode(body.get('data_b64') or '', validate=True)
+        except Exception:
+            blob = None
+    if not blob:
+        return jsonify({'ok': False, 'error': 'no_file'}), 400
+    if len(blob) > _LOGBOOK_IMPORT_MAX_BYTES:
+        return jsonify({'ok': False, 'error': 'file_too_large',
+                        'message': 'Datei zu groß (max. 15 MB).'}), 413
+    # Dateiname säubern + Endungs-Whitelist (Export-Formate der Logbuch-Apps).
+    filename = re.sub(r'[^A-Za-z0-9._ ()-]', '_', filename)[-120:].strip() \
+        or 'flugbuch-export'
+    if not filename.lower().endswith(_LOGBOOK_IMPORT_EXTS):
+        return jsonify({'ok': False, 'error': 'unsupported_format',
+                        'message': 'Bitte einen Export als CSV, Excel, PDF '
+                                   'oder ZIP auswählen.'}), 415
+    # Disk-Kopie best-effort (ephemer, aber hilfreich bis zum nächsten Deploy).
+    try:
+        import os as _os
+        d = os.path.join(_USER_HISTORY_DIR, 'logbook_imports')
+        _os.makedirs(d, exist_ok=True)
+        safe_tok = re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]
+        with open(os.path.join(
+                d, f'{safe_tok}-{int(now)}-{filename}'), 'wb') as fh:
+            fh.write(blob)
+    except Exception:
+        pass
+    if not _logbook_import_mail(token, filename, blob, note):
+        return jsonify({'ok': False, 'error': 'delivery_failed',
+                        'message': 'Übertragung fehlgeschlagen — bitte später '
+                                   'erneut versuchen.'}), 502
+    return jsonify({'ok': True,
+                    'message': 'Import eingereicht — deine Einträge werden '
+                               'übernommen.'})
+
+
 @app.route('/api/user/briefing/<token>', methods=['GET'])
 def get_briefings(token):
     """Alle Briefing-Items (key: Datum) für User.
@@ -42915,10 +43063,19 @@ def upload_calendar_events(token):
         # ICS-URL-Feed aktiv UND frischer Import (<24h ≈ lebender 6h-Zyklus)?
         # Dann ist die URL-Seite die Autorität fürs Räumen (siehe Reconcile unten).
         try:
-            if (feed_obj_ios.get('url') or '').strip() and (feed_obj_ios.get('imported_at') or '').strip():
+            if (feed_obj_ios.get('imported_at') or '').strip():
                 _imp_age_s = (datetime.now() - datetime.fromisoformat(
                     feed_obj_ios['imported_at'])).total_seconds()
-                _url_feed_fresh = _imp_age_s < 4 * _FEED_REFRESH_MIN_AGE_S
+                if (feed_obj_ios.get('url') or '').strip():
+                    _url_feed_fresh = _imp_age_s < 4 * _FEED_REFRESH_MIN_AGE_S
+                elif feed_obj_ios.get('source') == 'pdf':
+                    # PDF-Import (Discover/City, Echte-User-Befund 2026-07-22):
+                    # source='pdf' hat url='' -> der EK-Push hielt sich fuer die
+                    # Autoritaet und RAEUMTE die frisch importierten PDF-Tage
+                    # wieder weg (User AT-553136915: 33 Events -> 4 Tage).
+                    # Ein PDF wird monatlich hochgeladen und hat KEINEN
+                    # Auto-Refresh -> 35 Tage Schutz; ?full=1 bleibt Override.
+                    _url_feed_fresh = _imp_age_s < 35 * 86400
         except Exception:
             pass
         _stamp = datetime.now().isoformat()

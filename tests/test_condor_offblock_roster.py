@@ -109,3 +109,37 @@ def test_generic_synthesis_skips_lh_and_edelweiss():
         _ev('CC9 (WK38 SJO-LIR) | CC9 (WK38 LIR-ZRH)', '2026-06-21T19:20:00Z', '2026-06-22T07:40:00Z'),
     ]
     assert len(backend._generic_layover_synthesis(wk)) == 3
+
+
+def test_pdf_import_protected_from_ek_reconcile(monkeypatch, tmp_path):
+    """Discover/City-PDF (source='pdf', url='') gilt 35 Tage als frischer Feed —
+    der EKEvent-Push darf die PDF-Tage nicht mehr wegräumen (Echte-User-Befund
+    2026-07-22: 33 PDF-Events → 4 Tage nach EK-Sync)."""
+    from datetime import datetime, timedelta
+    import json as _json
+    tok = 'AT-TEST-PDFGUARD-000000'
+    profile = {'profile': {'calendar_feed': {
+        'url': '', 'source': 'pdf',
+        'imported_at': (datetime.now() - timedelta(days=3)).isoformat(),
+        'events': []}}}
+    monkeypatch.setattr(backend, '_validate_token', lambda t: backend._TokenValidationResult(backend._TokenValidationState.VALID))
+    monkeypatch.setattr(backend, '_profile_load', lambda t: profile)
+    monkeypatch.setattr(backend, '_profile_save', lambda *a, **k: True)
+    monkeypatch.setattr(backend, '_ical_briefings_load', lambda t: {})
+    monkeypatch.setattr(backend, '_ical_briefings_save', lambda t, b: True)
+    called = {}
+    def _spy_reconcile(*a, **k):
+        called['reconcile'] = True
+        return {'feed_dates': 0, 'cleared': 0, 'window': None}
+    monkeypatch.setattr(backend, '_reconcile_month_briefings', _spy_reconcile)
+    monkeypatch.setattr(backend, '_user_profile_path',
+                        lambda t: str(tmp_path / 'p.json'))
+    c = backend.app.test_client()
+    r = c.post(f'/api/user/calendar-events/{tok}/upload',
+               headers={'Authorization': f'Bearer {tok}'},
+               json={'events': [{'summary': 'OFF',
+                                 'start_iso': '2026-07-25T00:00:00Z',
+                                 'end_iso': '2026-07-25T23:00:00Z'}]})
+    body = r.get_json() or {}
+    assert (body.get('reconcile') or {}).get('skipped') == 'url_feed_fresher', body
+    assert 'reconcile' not in called
