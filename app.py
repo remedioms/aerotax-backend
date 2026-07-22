@@ -10720,17 +10720,20 @@ def _contacts_match_auth_rows():
 
 
 def _contacts_match_profile_rows():
-    """[(token, name, phone_hashes)] aller Profile — SB primary (paginiert),
-    Disk-Fallback. phone_hashes aus metadata (SB) bzw. Profil-Dict (Disk)."""
+    """[(token, name, airline, phone_hashes)] aller Profile — SB primary
+    (paginiert), Disk-Fallback. phone_hashes aus metadata (SB) bzw.
+    Profil-Dict (Disk); airline für den Kürzel-Match („Miguel LH")."""
     rows = []
     if SB_AVAILABLE and sb is not None:
         try:
             offset, page = 0, 1000
             while offset < 20000:
-                r = (sb.table('user_profiles').select('token,name,metadata')
+                r = (sb.table('user_profiles')
+                     .select('token,name,airline,metadata')
                      .range(offset, offset + page - 1).execute())
                 chunk = r.data or []
                 rows.extend((row.get('token'), row.get('name'),
+                             row.get('airline'),
                              ((row.get('metadata') or {})
                               .get('phone_hashes') or []))
                             for row in chunk)
@@ -10753,10 +10756,71 @@ def _contacts_match_profile_rows():
                 continue
             pr = data.get('profile') or {}
             rows.append((data.get('token'), pr.get('name'),
+                         pr.get('airline'),
                          pr.get('phone_hashes') or []))
     except FileNotFoundError:
         pass
     return rows
+
+
+# Kontakt-Kürzel → Airline-Namensfragment (casefold-contains gegen das
+# Profil-airline-Feld). „Miguel LH" im Adressbuch = der Miguel von Lufthansa.
+_CONTACTS_AIRLINE_HINTS = {
+    'lh': 'lufthansa', 'dlh': 'lufthansa', 'lufthansa': 'lufthansa',
+    'lx': 'swiss', 'swiss': 'swiss',
+    'os': 'austrian', 'austrian': 'austrian',
+    'sn': 'brussels', 'ew': 'eurowings', 'eurowings': 'eurowings',
+    '4y': 'discover', 'discover': 'discover',
+    'de': 'condor', 'condor': 'condor',
+    'az': 'ita', 'ita': 'ita',
+    'wk': 'edelweiss', 'edelweiss': 'edelweiss',
+    'en': 'air dolomiti', 'cl': 'cityline',
+}
+
+
+def _contacts_loose_matches(contact_sets, profile_rows):
+    """PURE (Owner 22.07. „Miguel S. / Miguel LH soll matchen"): lockere
+    2-Token-Heuristiken, die NUR bei EINDEUTIGEM Treffer greifen (genau EIN
+    Profil passt) — sonst würde „Miguel LH" jeden Lufthansa-Miguel anspülen.
+      • Initial-Match: [vorname, einzelbuchstabe] ↔ Profil mit gleichem
+        Vornamen, dessen Nachname mit dem Buchstaben beginnt.
+      • Airline-Match: [vorname, kürzel∈_CONTACTS_AIRLINE_HINTS] ↔ Profil mit
+        gleichem Vornamen UND passender Airline.
+    profile_rows: [(token, name, airline, phone_hashes)]. → set(token)."""
+    out = set()
+    prepared = []
+    for tok, name, airline, _ph in profile_rows:
+        toks = _contacts_name_tokens(name)
+        if tok and toks:
+            prepared.append((tok, toks, str(airline or '').casefold()))
+    for cs in contact_sets:
+        if len(cs) != 2:
+            continue
+        toks = sorted(cs, key=len)
+        short, first = toks[0], toks[1]
+        if len(first) < 3:
+            continue          # zwei Kurz-Tokens → zu vage
+        hits = set()
+        if len(short) == 1:
+            # Initial: „miguel s" → Vorname miguel + Nachname S…
+            for tok, ptoks, _al in prepared:
+                if ptoks and ptoks[0] == first and any(
+                        t.startswith(short) for t in ptoks[1:]):
+                    hits.add(tok)
+        elif short in _CONTACTS_AIRLINE_HINTS or first in _CONTACTS_AIRLINE_HINTS:
+            hint = _CONTACTS_AIRLINE_HINTS.get(short)
+            vor = first
+            if hint is None:
+                hint = _CONTACTS_AIRLINE_HINTS.get(first)
+                vor = short
+            if len(vor) < 3:
+                continue
+            for tok, ptoks, al in prepared:
+                if ptoks and ptoks[0] == vor and hint in al:
+                    hits.add(tok)
+        if len(hits) == 1:    # nur EINDEUTIG (kein Fremden-Übermatch)
+            out |= hits
+    return out
 
 
 @app.route('/api/user/contacts-match', methods=['POST'])
@@ -10824,7 +10888,8 @@ def user_contacts_match():
                 if any(lp_toks <= cs or cs <= lp_toks for cs in _two_tok):
                     matched[tok] = 'name'
     if contact_sets or phone_hashes:
-        for tok, name, ph in _contacts_match_profile_rows():
+        prof_rows = _contacts_match_profile_rows()
+        for tok, name, _airline, ph in prof_rows:
             if not tok or tok in matched:
                 continue
             # Telefon (stärkste Profil-Basis): Hash-Schnittmenge reicht.
@@ -10835,6 +10900,11 @@ def user_contacts_match():
                 continue
             if contact_sets and _contacts_name_match(name, contact_sets):
                 matched[tok] = 'name'
+        # Lockere 2-Token-Heuristiken („Miguel S." / „Miguel LH") — nur
+        # EINDEUTIGE Treffer, siehe _contacts_loose_matches.
+        if contact_sets:
+            for tok in _contacts_loose_matches(contact_sets, prof_rows):
+                matched.setdefault(tok, 'name')
 
     blocked = _blocked_by(own)
     toks = [t for t in matched if t != own and t not in blocked][:100]
@@ -13268,7 +13338,7 @@ def get_friend_roster(token, friend_token):
     # 60-s-Memo ist PRO Gunicorn-Worker, der nächste Worker zahlt wieder
     # voll). Die Tage sind untereinander unabhängig → Fan-out über einen
     # ThreadPoolExecutor (Muster wie friends-today ~13684): Wall-Clock ≈
-    # langsamster Tag statt Summe (gemessen ~1 s kalt). Gleiche Flüge über
+    # langsamster Tag statt Summe (erwartet ~1–2 s kalt). Gleiche Flüge über
     # mehrere Tage/Nutzer teilen sich weiter die 90-s-memoisierten Leaf-Reads
     # (_FLIGHT_MERGE_CACHE, GIL-sicheres dict — friends-today nutzt es bereits
     # multi-threaded).
@@ -32183,7 +32253,7 @@ _ROUTE_HISTORY_MEMO = {}              # (frm, to, ndays) → (monotonic_ts, payl
 _ROUTE_HISTORY_MEMO_TTL_S = 120
 
 
-def _route_track_flight_set(frm, to, day, lo_iso, hi_iso):
+def _route_track_flight_set(frm, to, day, lo_iso, hi_iso, flight_nos=None):
     """Set der (auf `_fn_norm` normalisierten) Flugnummern, für die auf der
     Strecke frm→to am UTC-Tag `day` eine ECHTE geflogene Spur in aircraft_track
     existiert (Breadcrumbs vom Harvester + FR24-Rückschreibung) — dieselbe
@@ -32193,15 +32263,33 @@ def _route_track_flight_set(frm, to, day, lo_iso, hi_iso):
     aircraft_track.flight-Wert ist die rohe FR24-Nummer (LH174) → hier wie in der
     Historie mit `_fn_norm` normalisiert, damit der Vergleich mit dem
     normalisierten entry['flight'] (SQ026→SQ26) trifft. Best-effort: bei
-    fehlendem SB/Fehler leeres Set (has_track fällt auf False, nie Exception)."""
+    fehlendem SB/Fehler leeres Set (has_track fällt auf False, nie Exception).
+
+    `flight_nos` (LATENZ-WURZEL Flugsuche 2026-07-22): aircraft_track hat ~19,4 Mio
+    Breadcrumb-Rows und KEINEN Index auf (origin, dest) — der reine
+    origin/dest+seen_ts-Read kostete live 8–9 s PRO TAG (gemessen via PostgREST
+    direkt vom Hetzner-Host) und war damit der Kalt-Latenz-Pol der ganzen
+    Flug-Detailseite (route-history 9 s bei days=3, 18 s bei days=7; das
+    flight-detail-Aggregat wartete auf genau diesen Subcall). Die Spalte
+    `flight` IST indiziert (0,25 s) — und der Caller kennt die Flugnummern des
+    Tages bereits aus den Board-Rows. Also serverseitig zusätzlich per
+    `.in_('flight', …)` auf diese Nummern einschränken: das ändert die
+    has_track-Ergebnisse NICHT (der Set-Vergleich unten trifft ohnehin nur
+    Flugnummern, die als Entry existieren), lässt den Planner aber über den
+    flight-Index gehen. Leere Liste → gar keine Query (kein Flug am Tag = kein
+    Track). None → altes Verhalten (voller origin/dest-Scan) als Fallback."""
     if sb is None or not frm or not to:
         return set()
+    if flight_nos is not None and not flight_nos:
+        return set()
     try:
-        rows = (sb.table('aircraft_track')
-                .select('flight')
-                .eq('origin', frm).eq('dest', to)
-                .gte('seen_ts', lo_iso).lt('seen_ts', hi_iso)
-                .limit(4000).execute()).data or []
+        q = (sb.table('aircraft_track')
+             .select('flight')
+             .eq('origin', frm).eq('dest', to)
+             .gte('seen_ts', lo_iso).lt('seen_ts', hi_iso))
+        if flight_nos:
+            q = q.in_('flight', sorted(flight_nos))
+        rows = (q.limit(4000).execute()).data or []
     except Exception:
         return set()
     return {_fn_norm(r.get('flight')) for r in rows if r.get('flight')}
@@ -32288,18 +32376,16 @@ def ax_route_history(frm, to):
     # Flask-Kontext (reine Supabase-Reads, thread-safe wie der Friend-Roster-Fan-out
     # app.py:~12455) → kein app_context nötig. Die Merge-/Filter-/Quoten-Logik unten
     # bleibt BYTE-IDENTISCH — nur das Laden wird nebenläufig.
-    # INTRA-TAG-PARALLELITÄT (Perf-Fund 173, Audit 2026-07-15): die DREI
-    # voneinander unabhängigen I/O-Reads eines Tages (dep-Board, arr-Board,
-    # has_track-Set) liefen bisher SERIELL innerhalb von `_fetch_day_rows`.
-    # Für Tag 0 ist das der Kalt-Latenz-Pol: `_departed_rows_from_store` zieht
-    # beim ersten Airport-Kontakt des Workers eine VOLLE Tages-Ladung des
-    # Delay-Stores aus Supabase (`_delay_store_load_from_sb`, ~3 s an einem
-    # Hub wie FRA), danach kommen arr-Store (~1 s) und Track-Query (~0,5 s) —
-    # in Summe ~4,7 s (days=1 misst live genau das). Die drei Reads berühren
-    # keinen Flask-Kontext (reine Supabase-Reads, thread-safe wie der Roster-
-    # Fan-out) → nebenläufig ziehen, Merge-/Filter-/Quoten-Logik bleibt BYTE-
-    # IDENTISCH (nur das Laden wird parallel). Erwartung: Tag 0 ≈ max(dep, arr,
-    # track) statt Summe.
+    # INTRA-TAG-PARALLELITÄT (Perf-Fund 173, Audit 2026-07-15): dep- und
+    # arr-Board eines Tages sind voneinander unabhängig und laufen nebenläufig
+    # (die Reads berühren keinen Flask-Kontext — reine Supabase-Reads,
+    # thread-safe wie der Roster-Fan-out). Der has_track-Read lief hier
+    # ursprünglich als DRITTER Parallel-Task — seit 2026-07-22 läuft er
+    # bewusst NACH dep/arr, weil er deren Flugnummern als Index-Schlüssel
+    # braucht (Latenz-Wurzel-Doku an `_route_track_flight_set`: der unkeyed
+    # origin/dest-Scan auf aircraft_track kostete 8–9 s PRO TAG, der
+    # flight-gekeyte Read ~0,25 s). Merge-/Filter-/Quoten-Logik unten bleibt
+    # BYTE-IDENTISCH — nur das Laden ist nebenläufig bzw. index-gekeyt.
     def _fetch_dep(i, d_i):
         return (_departed_rows_from_store(store_key) if i == 0
                 else _board_rows_from_obs_for_date(
@@ -32315,7 +32401,7 @@ def ax_route_history(frm, to):
         except Exception:
             return []
 
-    def _fetch_trk(d_i):
+    def _fetch_trk(d_i, fns):
         # has_track-Existenz-Set (Perf-Fund 175): eine gebündelte Query je Tag.
         try:
             from datetime import datetime as _dtc, timezone as _tzc
@@ -32323,16 +32409,42 @@ def ax_route_history(frm, to):
             return _route_track_flight_set(
                 frm, to, d_i,
                 _d0.strftime('%Y-%m-%dT00:00:00Z'),
-                (_d0 + _td(days=1)).strftime('%Y-%m-%dT00:00:00Z'))
+                (_d0 + _td(days=1)).strftime('%Y-%m-%dT00:00:00Z'),
+                flight_nos=fns)
         except Exception:
             return set()
+
+    def _trk_query_fns(dep_rows, arr_rows):
+        """Flugnummern-Schlüsselliste für den flight-indizierten Track-Read
+        (Latenz-Wurzel 2026-07-22, Doku an `_route_track_flight_set`): pro
+        route-relevanter Board-Row die ROHE Schreibweise + `_fn_norm`-Variante
+        (Track trägt FR24-Schreibweise ohne führende Nullen: SQ026→SQ26) + die
+        Warehouse-Operating-Nummer aus cs_map (die Codeshare-Faltung kann einen
+        Entry auf eine NIE beobachtete Operating-Nummer umlabeln — deren Track
+        muss der Read trotzdem sehen). None = Fallback auf den alten
+        origin/dest-Scan, falls die Liste unerwartet groß würde (URL-Limit)."""
+        fns = set()
+        for rws, match in ((dep_rows or [], to), (arr_rows or [], frm)):
+            for r in rws:
+                if (r.get('dest_iata') or '').upper() != match:
+                    continue
+                raw = str(r.get('flight') or '').replace(' ', '').upper()
+                if not raw:
+                    continue
+                fns.add(raw)
+                n = _fn_norm(raw)
+                fns.add(n)
+                op = cs_map.get(n)
+                if op:
+                    fns.add(op)
+        return fns if len(fns) <= 300 else None
 
     def _fetch_day_rows(i):
         from concurrent.futures import ThreadPoolExecutor as _RH_TPE
         d_i = (base - _td(days=i)).strftime('%Y-%m-%d')
-        # Die drei Reads dieses Tages nebenläufig ziehen. Jeder Worker gibt
-        # danach seinen thread-lokalen Supabase-Pool frei (kurzlebige Threads,
-        # wie beim Tag-Fan-out) — sonst überleben tote HTTP/2-Pools den map().
+        # dep/arr nebenläufig ziehen. Jeder Worker gibt danach seinen
+        # thread-lokalen Supabase-Pool frei (kurzlebige Threads, wie beim
+        # Tag-Fan-out) — sonst überleben tote HTTP/2-Pools den map().
         def _dep_task():
             try:
                 return _fetch_dep(i, d_i)
@@ -32345,19 +32457,26 @@ def ax_route_history(frm, to):
             finally:
                 _close_current_thread_supabase_client()
 
-        def _trk_task():
-            try:
-                return _fetch_trk(d_i)
-            finally:
-                _close_current_thread_supabase_client()
-
-        with _RH_TPE(max_workers=3) as _sub_ex:
+        with _RH_TPE(max_workers=2) as _sub_ex:
             f_dep = _sub_ex.submit(_dep_task)
             f_arr = _sub_ex.submit(_arr_task)
-            f_trk = _sub_ex.submit(_trk_task)
             r = f_dep.result()
             ar = f_arr.result()
-            trk = f_trk.result()
+        # Track-Read bewusst NACH den Board-Reads (nicht mehr parallel dazu):
+        # er braucht die Flugnummern des Tages als Index-Schlüssel. Die
+        # Serialisierung kostet ~0,25 s, der unkeyed origin/dest-Scan kostete
+        # 8–9 s — Netto-Gewinn ~8 s pro Tag (Messung 2026-07-22, Hetzner→SB).
+        fns = _trk_query_fns(r, ar)
+        if fns is not None and not fns:
+            trk = set()      # kein Flug am Tag → gar keine Track-Query
+        else:
+            def _trk_task():
+                try:
+                    return _fetch_trk(d_i, fns)
+                finally:
+                    _close_current_thread_supabase_client()
+            with _RH_TPE(max_workers=1) as _trk_ex:
+                trk = _trk_ex.submit(_trk_task).result()
         return i, (r, ar, trk)
     _day_rows = {}
     if ndays > 1:

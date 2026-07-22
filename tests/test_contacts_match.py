@@ -88,9 +88,11 @@ _AUTH_ROWS = [('miguel@icloud.com', 'AT-MIGUEL'),
 # die ECHTE Signatur von _contacts_match_profile_rows.
 import hashlib as _hl_test
 PH_JEN = _hl_test.sha256(b'171234567').hexdigest()
-_PROFILE_ROWS = [('AT-MIGUEL', 'Miguel Schumann', []),
-                 ('AT-JENNIFER', 'Jennifer Orhan', [PH_JEN]),
-                 ('AT-ZOE', 'Zoe', [])]
+# 4-Tupel seit 22.07. spät (airline für Kürzel-Match) — Mock spiegelt
+# die ECHTE Signatur von _contacts_match_profile_rows.
+_PROFILE_ROWS = [('AT-MIGUEL', 'Miguel Schumann', 'Lufthansa', []),
+                 ('AT-JENNIFER', 'Jennifer Orhan', 'Lufthansa', [PH_JEN]),
+                 ('AT-ZOE', 'Zoe', 'Discover', [])]
 _PROFILES = {
     'AT-MIGUEL': {'name': 'Miguel Schumann', 'homebase': 'FRA',
                   'airline': 'Lufthansa', 'position': 'FA',
@@ -198,3 +200,25 @@ def test_endpoint_matches_contact_name_against_email_localpart():
     toks = {u['token'] for u in d['users']}
     assert 'AT-JENNIFER' in toks          # 2-Token-Localpart matcht
     assert 'AT-MIGUEL' not in toks        # Ein-Wort nie (Übermatch)
+
+
+
+def test_loose_match_initial_and_airline_unique_only():
+    rows = [('AT-MIGUEL', 'Miguel Schumann', 'Lufthansa', []),
+            ('AT-MSCHMIDT', 'Miguel Schmidt', 'Condor', []),
+            ('AT-PETRA', 'Petra Schumann', 'Lufthansa', [])]
+    sets = [set(A._contacts_name_tokens(n))
+            for n in ('Miguel S.', 'Miguel LH', 'Petra LH', 'Miguel', 'Zoe D')]
+    hits = A._contacts_loose_matches(sets, rows)
+    # „Miguel S." ist MEHRDEUTIG (Schumann+Schmidt) → kein Treffer;
+    # „Miguel LH" eindeutig (nur einer bei Lufthansa) → Treffer;
+    # „Petra LH" eindeutig → Treffer; Ein-Wort nie.
+    assert hits == {'AT-MIGUEL', 'AT-PETRA'}
+
+
+def test_loose_match_endpoint_flows_as_name():
+    r = _call({'token': 'AT-TIBOR', 'names': ['Miguel LH']})
+    d = r.get_json()
+    toks = {u['token'] for u in d['users']}
+    assert toks == {'AT-MIGUEL'}
+    assert d['users'][0]['matched_by'] == 'name'
