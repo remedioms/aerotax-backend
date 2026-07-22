@@ -85,39 +85,67 @@ def test_discover_parser_rejects_foreign_text():
 
 
 def test_local_times_become_utc():
-    """„All times local" → Wire-UTC via airport_tz (FRA=UTC+2, PHL=UTC-4 im Mai)."""
+    """„All times local" → Wire-UTC via airport_tz (FRA=UTC+2, PHL=UTC-4 im Mai).
+    Legs verwenden DTSTART;TZID=<stn> (lokale Abflugzeit); UTC-Äquivalente werden
+    über _parse_ics_to_events / _build_ical_sectors verifiziert."""
     ics, err = backend._discover_roster_text_to_ics(SYN_TEXT)
     assert err is None
     # Führende Null der Activity wird gestrippt: 050 → 4Y50.
     assert '4Y50 FRA - PHL' in ics
     assert '4Y050' not in ics
-    # FRA 13:21 lokal = 11:21Z; PHL 15:47 lokal = 19:47Z (= 8:26 Block wie PDF).
-    assert 'DTSTART:20260501T112100Z' in ics
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    # FRA 13:21 lokal (UTC+2 CEST) = 11:21Z; PHL 15:47 lokal (UTC-4 EDT) = 19:47Z (= 8:26 Block wie PDF).
+    d1 = secs.get('2026-05-01') or []
+    assert [(s['flight'], s['from'], s['to']) for s in d1] == [('4Y50', 'FRA', 'PHL')]
+    assert d1[0]['dep_iso'] == '2026-05-01T11:21:00Z'
+    assert d1[0]['arr_iso'] == '2026-05-01T19:47:00Z'
+    # DTEND für Legs bleibt UTC-Z-Format — einfach prüfbar im ICS-String.
     assert 'DTEND:20260501T194700Z' in ics
-    # Standby FRA 05:00 lokal = 03:00Z.
+    # Standby FRA 05:00 lokal = 03:00Z — SBY/PREP bleiben UTC-Z.
     assert 'Standby FRA' in ics
     assert 'DTSTART:20260507T030000Z' in ics
 
 
 def test_overnight_closer_with_dated_row():
-    """Übernacht-Leg auf zwei Zeilen, Closer MIT Datumszeile (03→04)."""
+    """Übernacht-Leg auf zwei Zeilen, Closer MIT Datumszeile (03→04).
+    DTSTART wird als TZID=America/New_York-Lokalzeit emittiert; dep_iso und
+    arr_iso werden über _build_ical_sectors verifiziert."""
     ics, err = backend._discover_roster_text_to_ics(SYN_TEXT)
     assert err is None
-    # PHL 19:12 lokal (03.) = 23:12Z; FRA 09:04 lokal (04.) = 07:04Z (= 7:52).
     assert '4Y51 PHL - FRA' in ics
-    assert 'DTSTART:20260503T231200Z' in ics
+    # DTEND bleibt UTC-Z — direkt prüfbar.
     assert 'DTEND:20260504T070400Z' in ics
+    # UTC-Äquivalente via Sector-Pipeline: PHL 19:12 (UTC-4) = 23:12Z; FRA 09:04 (UTC+2) = 07:04Z.
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    d3 = secs.get('2026-05-03') or []
+    assert [(s['flight'], s['from'], s['to']) for s in d3] == [('4Y51', 'PHL', 'FRA')]
+    assert d3[0]['dep_iso'] == '2026-05-03T23:12:00Z'
+    assert d3[0]['arr_iso'] == '2026-05-04T07:04:00Z'
 
 
 def test_overnight_closer_without_date_row():
     """Der Ankunftstag kann im Text KOMPLETT fehlen (echtes Beispiel: „18 Mon"
-    existiert nicht als Zeile) — Ankunftsdatum via „Ende ≤ Start → +1 Tag"."""
+    existiert nicht als Zeile) — Ankunftsdatum via „Ende ≤ Start → +1 Tag".
+    DTSTART wird als TZID=America/New_York-Lokalzeit emittiert (TPA lokal 21:54,
+    UTC 01:54Z am 18.); dep_iso = 2026-05-18T01:54:00Z; arr_iso = 11:11Z."""
     ics, err = backend._discover_roster_text_to_ics(SYN_TEXT)
     assert err is None
-    # TPA 21:54 lokal (17.) = 01:54Z am 18.; FRA 13:11 lokal = 11:11Z am 18.
     assert '4Y65 TPA - FRA' in ics
-    assert 'DTSTART:20260518T015400Z' in ics
+    # DTEND bleibt UTC-Z — direkt prüfbar.
     assert 'DTEND:20260518T111100Z' in ics
+    # DTSTART trägt lokale TPA-Zeit mit TZID (21:54 EDT = 01:54Z am 18.):
+    assert 'DTSTART;TZID=America/New_York:20260517T215400' in ics
+    # _build_ical_sectors keyed auf start_iso[:10] = UTC-Datum (2026-05-18):
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    d18 = secs.get('2026-05-18') or []
+    assert any(s.get('flight') == '4Y65' and s.get('from') == 'TPA' and s.get('to') == 'FRA'
+               for s in d18), f'4Y65 TPA-FRA not on May 18, secs={list(secs.keys())}'
+    tpa_fra = next(s for s in d18 if s.get('flight') == '4Y65' and s.get('to') == 'FRA')
+    assert tpa_fra['dep_iso'] == '2026-05-18T01:54:00Z'
+    assert tpa_fra['arr_iso'] == '2026-05-18T11:11:00Z'
     # Der Air-Return davor bleibt als eigenes Event erhalten:
     assert '4Y65 TPA - TPA' in ics
 
@@ -232,7 +260,8 @@ Created 21Jul2026 09:45 (UTC) by TST 1 ( 1)
 def test_briefing_token_single_turnaround_yyc():
     """Jul-24-Zeile: Report=12:00, Departure=13:30 (FRA→YYC).
     Das ICS-Summary des Legs muss den Briefing-Token „12:00 LT Briefing FRA"
-    enthalten, damit iOS briefingTimeFromSummary() 12:00 statt 13:30 zeigt."""
+    enthalten, damit iOS briefingTimeFromSummary() 12:00 statt 13:30 zeigt.
+    DTSTART wird jetzt als TZID=Europe/Berlin-Lokalzeit emittiert (statt UTC-Z)."""
     ics, err = backend._discover_roster_text_to_ics(_BRIEFING_FIXTURE)
     assert err is None, err
     # Briefing-Token im Summary des FRA→YYC-Legs:
@@ -240,10 +269,17 @@ def test_briefing_token_single_turnaround_yyc():
     assert '4Y76 FRA - YYC' in ics
     # Vollformat: „12:00 LT Briefing FRA · 4Y76 FRA - YYC"
     assert '12:00 LT Briefing FRA · 4Y76 FRA - YYC' in ics
-    # Der DTSTART bleibt der Abflug (13:30 FRA lokal = 11:30Z im Juli CEST):
-    assert 'DTSTART:20260724T113000Z' in ics
-    # Departure != Briefing: Briefing-Zeit (12:00 LT = 10:00Z) ≠ DTSTART (11:30Z).
-    assert 'DTSTART:20260724T100000Z' not in ics
+    # DTSTART via TZID=Europe/Berlin in Lokalzeit (13:30 FRA = 11:30Z CEST):
+    assert 'DTSTART;TZID=Europe/Berlin:20260724T133000' in ics
+    # UTC-Äquivalenz via Sector-Pipeline: dep_iso = 11:30Z.
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    d24 = secs.get('2026-07-24') or []
+    assert any(s.get('flight') == '4Y76' for s in d24), f'4Y76 not on Jul 24, secs={list(secs.keys())}'
+    d24_76 = next(s for s in d24 if s.get('flight') == '4Y76')
+    assert d24_76['dep_iso'] == '2026-07-24T11:30:00Z'
+    # Departure != Briefing: Briefing-Zeit (12:00 LT = 10:00Z) ≠ dep_iso (11:30Z).
+    assert d24_76['dep_iso'] != '2026-07-24T10:00:00Z'
 
 
 def test_briefing_token_multi_leg_day_first_only():
@@ -334,3 +370,120 @@ def test_endpoint_dispatch_via_real_pdf_upload():
     assert payload.get('source') == 'pdf'
     assert payload.get('period') == 'May 2026'
     assert payload.get('briefings_imported', 0) >= 5
+
+
+# ── Outstation-Origin Overnight Return — Date-Placement Bug (Panu-Regression) ─
+#
+# Bug: für Outstation-Abflug-Übernachtlegs (z.B. PHL→FRA, YYC→FRA) wurde das
+# Briefing-Event auf dem ANKUNFTSTAG platziert statt auf dem ABFLUGTAG.
+# Ursache: `_ics_parse_dt` konvertierte UTC-Z-DTSTART nach Europe/Berlin →
+# bei Abflügen > 22:00Z rollte die Lokalzeit auf den Folgetag (23:12Z PHL =
+# 01:12 Berlin = nächster Kalender-Tag).
+# Fix: Discover-Legs emittieren DTSTART;TZID=<AbflugstationTZ>:<Lokalzeit>,
+# sodass der Tages-Bucket = Abflugtag der Abflugstation (korrekt).
+#
+# Confirmed failing cases from panu's real PDFs (26:05.pdf / 26:07.pdf):
+#   • May 03: 4Y51 PHL→FRA, Report 16:25 PHL local, dep 19:12 PHL local
+#   • Jul 25: 4Y77 YYC→FRA, Report 15:35 YYC local, dep 16:50 YYC local
+
+_OUTSTATION_OVERNIGHT_MAY = """\
+Roster
+Period: May 2026
+Crew member: PNX, Reuter, Panuwat
+Rank: CM Base: FRA
+Passports: DE (21May2030) Medical: MED (06Sep2027) Line check: Missing Qualifications: A320, A330
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+* 01 Fri 11:45 16:17 CM * 050 FRA PHL 13:21 15:47 333 48:08 20260501_50
+_006
+8:26 10:32 14:20
+* 02 Sat * Layover: PHL
+* 03 Sun 16:25 CM * 051 PHL 19:12 332
+* 04 Mon 09:34 CM * 051 FRA 09:04 332 7:52 11:09 44:26
+Created 21Jul2026 09:58 (UTC) by U753456 1 ( 1)
+"""
+
+_OUTSTATION_OVERNIGHT_JUL = """\
+Roster
+Period: July 2026
+Crew member: PNX, Reuter, Panuwat
+Rank: CM Base: FRA
+Passports: DE (21May2030) Medical: MED (06Sep2027) Line check: Missing Qualifications: A320, A330
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+24 Fri 12:00 15:35 CM 076 FRA YYC 13:30 15:05 333 24:00 20260724_76
+_480
+9:35 11:35 14:40
+25 Sat 15:35 CM 077 YYC 16:50 333
+26 Sun 10:45 CM 077 FRA 10:15 333 9:25 11:10 43:15
+Created 21Jul2026 09:45 (UTC) by U753456 1 ( 1)
+"""
+
+
+def test_outstation_overnight_phl_fra_departs_on_may03():
+    """May 03: 4Y51 PHL→FRA — Outstation-Overnight-Opener.
+    Report=16:25 PHL local, dep=19:12 PHL local (EDT = UTC-4).
+    Das Leg-Event MUSS auf May 03 (Abflugtag) landen, nicht auf May 04.
+    start_iso = 2026-05-03T23:12:00Z (19:12 EDT = 23:12Z am 3.), korrekt.
+    Briefing-Token „16:25 LT Briefing PHL" muss auf dem May-03-Briefing
+    erscheinen (= _corrected_briefing_start_iso ergibt 20:25Z am 3.).
+    NICHT REGRESSIEREN: 4Y50 FRA→PHL (May 01) bleibt auf May 01."""
+    ics, err = backend._discover_roster_text_to_ics(_OUTSTATION_OVERNIGHT_MAY)
+    assert err is None, err
+    # Summary vorhanden
+    assert '4Y51 PHL - FRA' in ics
+    assert '16:25 LT Briefing PHL · 4Y51 PHL - FRA' in ics
+    # DTSTART emittiert als TZID=America/New_York Lokalzeit (19:12 local May 03)
+    assert 'DTSTART;TZID=America/New_York:20260503T191200' in ics
+    # DTEND bleibt UTC-Z (FRA 09:04 CEST = 07:04Z May 04)
+    assert 'DTEND:20260504T070400Z' in ics
+    # Sektor landet via _build_ical_sectors auf 2026-05-03 (start_iso[:10] = UTC-Datum)
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    d3 = secs.get('2026-05-03') or []
+    assert any(s.get('flight') == '4Y51' and s.get('from') == 'PHL' and s.get('to') == 'FRA'
+               for s in d3), f'4Y51 PHL-FRA not on May 03; secs={list(secs.keys())}'
+    leg = next(s for s in d3 if s.get('flight') == '4Y51')
+    assert leg['dep_iso'] == '2026-05-03T23:12:00Z', leg['dep_iso']
+    assert leg['arr_iso'] == '2026-05-04T07:04:00Z', leg['arr_iso']
+    # Briefing-Event auf May 03 (start = local TPA/PHL date = 2026-05-03)
+    ev_51 = next((e for e in events if '4Y51 PHL - FRA' in (e.get('summary') or '')), None)
+    assert ev_51 is not None
+    assert ev_51.get('start') == '2026-05-03', (
+        f'Briefing event start={ev_51.get("start")!r}, expected 2026-05-03 (departure day)')
+    # Nicht Regression: FRA→PHL-Leg (May 01) bleibt auf May 01
+    d1 = secs.get('2026-05-01') or []
+    assert any(s.get('flight') == '4Y50' for s in d1), 'FRA-PHL regression: not on May 01'
+
+
+def test_outstation_overnight_yyc_fra_departs_on_jul25():
+    """Jul 25: 4Y77 YYC→FRA — Outstation-Overnight-Opener.
+    Report=15:35 YYC local, dep=16:50 YYC local (MDT = UTC-6).
+    Das Leg-Event MUSS auf Jul 25 (Abflugtag) landen, nicht auf Jul 26.
+    start_iso = 2026-07-25T22:50:00Z (16:50 MDT = 22:50Z am 25.), korrekt.
+    NICHT REGRESSIEREN: 4Y76 FRA→YYC (Jul 24) bleibt auf Jul 24."""
+    ics, err = backend._discover_roster_text_to_ics(_OUTSTATION_OVERNIGHT_JUL)
+    assert err is None, err
+    assert '4Y77 YYC - FRA' in ics
+    assert '15:35 LT Briefing YYC · 4Y77 YYC - FRA' in ics
+    # DTSTART als TZID=America/Edmonton Lokalzeit (16:50 local Jul 25)
+    assert 'DTSTART;TZID=America/Edmonton:20260725T165000' in ics
+    # DTEND bleibt UTC-Z (FRA 10:15 CEST = 08:15Z Jul 26)
+    assert 'DTEND:20260726T081500Z' in ics
+    # Sektor auf 2026-07-25 (start_iso[:10] = UTC-Datum = 2026-07-25)
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    d25 = secs.get('2026-07-25') or []
+    assert any(s.get('flight') == '4Y77' and s.get('from') == 'YYC' and s.get('to') == 'FRA'
+               for s in d25), f'4Y77 YYC-FRA not on Jul 25; secs={list(secs.keys())}'
+    leg = next(s for s in d25 if s.get('flight') == '4Y77')
+    assert leg['dep_iso'] == '2026-07-25T22:50:00Z', leg['dep_iso']
+    assert leg['arr_iso'] == '2026-07-26T08:15:00Z', leg['arr_iso']
+    # Briefing-Event auf Jul 25 (start = local YYC date = 2026-07-25)
+    ev_77 = next((e for e in events if '4Y77 YYC - FRA' in (e.get('summary') or '')), None)
+    assert ev_77 is not None
+    assert ev_77.get('start') == '2026-07-25', (
+        f'Briefing event start={ev_77.get("start")!r}, expected 2026-07-25 (departure day)')
+    # Nicht Regression: FRA→YYC-Leg (Jul 24) bleibt auf Jul 24
+    d24 = secs.get('2026-07-24') or []
+    assert any(s.get('flight') == '4Y76' for s in d24), 'FRA-YYC regression: not on Jul 24'

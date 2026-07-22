@@ -43496,15 +43496,31 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
 
 
 def _pdf_events_to_ics(events, year, month, prodid='AeroX Roster PDF Import'):
-    """Synthetische Event-Tupel (uid_suffix, start, end, summary, all_day)
-    → ICS-String. Geteilt von CrewAccess- und Discover-Roster-Parser."""
+    """Synthetische Event-Tupel (uid_suffix, start, end, summary, all_day[, dep_tzid])
+    → ICS-String. Geteilt von CrewAccess- und Discover-Roster-Parser.
+
+    Optionales 6. Element `dep_tzid`: IANA-TZ-Name der ABFLUGSTATION. Wenn
+    gesetzt und das Event zeitbehaftet (not all_day) ist, wird DTSTART mit
+    TZID emittiert (lokale Abflugzeit, nicht UTC+Z). `start` muss dann die
+    LOKALE Abflugzeit enthalten (naive datetime in Stations-TZ).
+    Das erlaubt `_ics_parse_dt` den richtigen Tages-Bucket (Abflug-Station-
+    Lokal-Datum) zu ermitteln, statt auf Europe/Berlin zu fallen und dabei
+    bei späten UTC-Zeiten auf den Folgetag zu rollen.
+    """
     lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', f'PRODID:-//{prodid}//DE']
-    for uid, start, end, summary, all_day in events:
+    for ev_tuple in events:
+        uid, start, end, summary, all_day = ev_tuple[:5]
+        dep_tzid = ev_tuple[5] if len(ev_tuple) > 5 else None
         lines.append('BEGIN:VEVENT')
         lines.append(f'UID:pdf-{year}{month:02d}-{uid}@aerox-roster')
         if all_day:
             lines.append(f'DTSTART;VALUE=DATE:{start.strftime("%Y%m%d")}')
             lines.append(f'DTEND;VALUE=DATE:{end.strftime("%Y%m%d")}')
+        elif dep_tzid:
+            # Abflug-Station-Lokalzeit mit TZID → _ics_parse_dt keyed auf den
+            # korrekten lokalen Datum der Abflug-Station (statt Europe/Berlin).
+            lines.append(f'DTSTART;TZID={dep_tzid}:{start.strftime("%Y%m%dT%H%M%S")}')
+            lines.append(f'DTEND:{end.strftime("%Y%m%dT%H%M%S")}Z')
         else:
             lines.append(f'DTSTART:{start.strftime("%Y%m%dT%H%M%S")}Z')
             lines.append(f'DTEND:{end.strftime("%Y%m%dT%H%M%S")}Z')
@@ -43606,7 +43622,13 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
         events.append((f'tim-{len(events)}', start, end, summary, False))
 
     def add_leg(dep_d, num, frm, to, t1, t2, arr_d=None, briefing=None):
-        start = _utc(dep_d, t1, frm)
+        h, m = (int(x) for x in t1.split(':'))
+        dep_tz = _stn_tz(frm)
+        # start_local = Abflugzeit in Stations-Lokalzeit (für DTSTART;TZID=…)
+        start_local = datetime(dep_d.year, dep_d.month, dep_d.day, h, m,
+                               tzinfo=dep_tz)
+        # start_utc = für DTEND-Berechnung und als Fallback
+        start = start_local.astimezone(_tzu.utc).replace(tzinfo=None)
         end = _utc(arr_d or dep_d, t2, to)
         if arr_d is None and end <= start:
             # Closer ohne eigene Datumszeile: Ankunft am Folgetag.
@@ -43621,7 +43643,17 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
         # damit _briefing_lt_station() die richtige TZ für die LT-Auflösung
         # findet (Discover-Basen = FRA/MUC, Ortszeit lokaler Abflug).
         summary = f'{briefing} LT Briefing {frm} · {base}' if briefing else base
-        events.append((f'leg-{len(events)}', start, end, summary, False))
+        # TZID-Fix: DTSTART mit Abflugstation-Lokalzeit emittieren, damit
+        # _ics_parse_dt den korrekten Tages-Bucket (Abflugdatum der Station)
+        # ermittelt — statt auf Europe/Berlin zu fallen und bei späten UTC-Zeiten
+        # (Outstation-Abflug > 22:00Z) auf den Folgetag zu rollen.
+        # dep_tzid = IANA-Name der Abflugstation-TZ (z.B. „America/New_York").
+        dep_tzid = getattr(dep_tz, 'key', None)  # ZoneInfo hat .key; UTC-fallback hat keins
+        # start_local muss als naive datetime an _pdf_events_to_ics übergeben
+        # werden (TZID ist bereits im Tuple-Slot kodiert).
+        start_naive_local = start_local.replace(tzinfo=None)
+        events.append((f'leg-{len(events)}', start_naive_local, end, summary,
+                        False, dep_tzid))
 
     in_table = False
     cur_day = None
