@@ -14,8 +14,9 @@ für Ownership/Moderation und wird nie ausgeliefert):
     UND ein Airline-Identitäts-Hinweis).
   - Ownership: Autor kann den eigenen anonymen Thread/Reply löschen.
   - Nicht-anonym bleibt unverändert (Author-Snapshot aus dem Profil).
-  - wall:-Brücke: anonyme Wall-Posts werden weiterhin NICHT ins Forum
-    gespiegelt (Regression-Guard, Verhalten unverändert).
+  - wall:-Brücke (Owner 2026-07-22 „forum alles"): JEDER Wall-Post wird ins
+    Forum gespiegelt — anonyme sauber sanitisiert (kein Author-Leak, gleicher
+    anon_handle wie im Feed), Posts ohne Kategorie-Hashtag landen in 'general'.
 
 Run:
     AEROTAX_ALLOW_BOOT_WITHOUT_KEY=1 pytest tests/aerox/test_forum_anonymous.py -v
@@ -227,10 +228,11 @@ def test_non_anonymous_reply_keeps_author_snapshot(client, author, viewer):
 
 
 # ─────────────────────────────────────────────────────────────────
-# wall:-Brücke — anonyme Wall-Posts bleiben draußen (unverändert)
+# wall:-Brücke — „forum alles" (Owner 2026-07-22): JEDER Wall-Post
+# erscheint im Forum; anonyme sanitisiert mit Feed-identischem Handle.
 # ─────────────────────────────────────────────────────────────────
 
-def test_wall_anonymous_post_not_bridged_into_forum(client, author):
+def test_wall_anonymous_post_bridged_sanitized(client, author, viewer):
     r = client.post(f"/api/wall/{author['token']}/post", json={
         "text": "Anonymer Feed-Post mit Kategorie\n\n#general",
         "is_anonymous": True,
@@ -240,8 +242,34 @@ def test_wall_anonymous_post_not_bridged_into_forum(client, author):
     post_id = post.get("id")
     assert post_id, "Wall-Post-Create lieferte keine id"
 
-    ids = {x.get("id") for x in _list_threads(client, author["token"])}
-    assert f"wall:{post_id}" not in ids, (
-        "Anonymer Wall-Post darf NICHT ins Forum gespiegelt werden "
-        "(wall:-Brücke muss anonyme Posts weiter ausblenden)."
+    threads = {x.get("id"): x for x in _list_threads(client, viewer["token"])}
+    th = threads.get(f"wall:{post_id}")
+    assert th is not None, (
+        "Anonymer Wall-Post MUSS ins Forum gespiegelt werden "
+        "(Owner 2026-07-22: forum alles)."
     )
+    _assert_no_author_leak(th, "wall-bridge anon thread")
+    assert th.get("category_id") == "general"
+    # Handle identisch zum Feed — der User bleibt unter demselben Pseudonym
+    # ansprechbar, egal ob man den Post im Feed oder im Forum sieht.
+    if post.get("anon_handle"):
+        assert th.get("anon_handle") == post.get("anon_handle")
+    # Ownership bleibt: der Autor sieht is_mine=true (Löschen im Feed möglich).
+    mine = {x.get("id"): x for x in _list_threads(client, author["token"])}
+    assert (mine.get(f"wall:{post_id}") or {}).get("is_mine") is True
+
+
+def test_wall_post_without_category_lands_in_general(client, author):
+    r = client.post(f"/api/wall/{author['token']}/post", json={
+        "text": "Feed-Post ohne Kategorie-Hashtag",
+    }, headers=_bearer(author["token"]))
+    assert r.status_code == 200, r.get_data(as_text=True)[:300]
+    post = json.loads(r.get_data(as_text=True)).get("post") or {}
+    post_id = post.get("id")
+    assert post_id, "Wall-Post-Create lieferte keine id"
+
+    threads = {x.get("id"): x for x in _list_threads(client, author["token"])}
+    th = threads.get(f"wall:{post_id}")
+    assert th is not None, "Wall-Post ohne Kategorie-Hashtag fehlt im Forum"
+    assert th.get("category_id") == "general"
+    assert th.get("author_name") == author["name"]

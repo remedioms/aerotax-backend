@@ -22472,6 +22472,12 @@ def forum_create_thread(token):
 
 @app.route('/api/forum/<token>/threads/<thread_id>', methods=['DELETE'])
 def forum_delete_thread(token, thread_id):
+    # WALL-BRÜCKE LÖSCHEN (2026-07-22, „forum alles"): gespiegelte Crew-Feed-
+    # Posts tragen is_mine=true → der Forum-Löschen-Button muss funktionieren.
+    # Dispatch auf den echten Wall-Delete (gleicher Ownership-Check + Cleanup
+    # von Comments/Likes/Bild dort).
+    if thread_id.startswith('wall:'):
+        return delete_wall_post(token, thread_id[5:])
     # Per-Row-Lookup + gezielter Disk-Filter (2026-07-01) statt load-ALL/save-ALL.
     target = _forum_thread_sb_get(thread_id)
     if target is None:
