@@ -488,7 +488,8 @@ _MOCK_WINDOW = ('2016-10-01', '2016-10-31')
 
 
 # ── Duty Events → synthetisches ICS (reuse der Roster-Pipeline) ─────────────
-_FLIGHT_CATS = {'flight', 'flight_other'}
+# nach Normalisierung (Unterstriche raus): 'flight_other' → 'flightother'
+_FLIGHT_CATS = {'flight', 'flightother'}
 
 
 def duty_events_to_ics(resp):
@@ -517,8 +518,13 @@ def duty_events_to_ics(resp):
         for ev in (d.get('events') or []):
             if not isinstance(ev, dict):
                 continue
-            cat = (ev.get('eventCategory') or '').lower()
-            etype = (ev.get('eventType') or '').lower()
+            # Robust gegen Doku-Diskrepanz: eventType kommt GROSS + ohne
+            # Unterstrich ('FLIGHT','GROUNDEVENT','BRIEFING','HOTEL'), mein
+            # früherer Code prüfte 'ground_event'. Normalisieren: lower +
+            # Unterstriche/Whitespace raus → 'groundevent'. (Owner/Claude-Web-
+            # Hinweis 2026-07-22, final gegen Live-JSON prüfen.)
+            cat = re.sub(r'[_\s]', '', (ev.get('eventCategory') or '').lower())
+            etype = re.sub(r'[_\s]', '', (ev.get('eventType') or '').lower())
             frm = (ev.get('startLocation') or '').upper().strip()
             to = (ev.get('endLocation') or '').upper().strip()
             det = (ev.get('eventDetails') or '').strip()
@@ -549,7 +555,7 @@ def duty_events_to_ics(resp):
                 summary = f'Layover {to or frm}'
             elif cat in ('sim',):
                 summary = 'Simulator'
-            elif cat in ('abs', 'lic', 'duty', 'ground_event') or etype in ('briefing', 'ground_event'):
+            elif cat in ('abs', 'lic', 'duty') or etype in ('briefing', 'groundevent'):
                 summary = det or cat.upper() or 'Duty'
             else:
                 summary = det or cat.upper() or 'Event'

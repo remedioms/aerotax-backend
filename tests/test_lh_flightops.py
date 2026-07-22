@@ -68,22 +68,24 @@ def test_exchange_rejects_bad_state(monkeypatch):
     assert r.status_code == 400 and r.get_json()['error'] == 'state_invalid_or_expired'
 
 
-# Response-Shape exakt aus der Doku (rosterDays[].events[])
+# Response-Shape aus der Doku — eventType GROSS + ohne Unterstrich
+# ('FLIGHT','HOTEL','GROUNDEVENT'), testet die Normalisierung (Claude-Web-Hinweis
+# 2026-07-22: Doku nutzt Großschreibung, nicht 'ground_event').
 DUTY = {
     "pkNumber": "123456A",
     "rosterDays": [
         {"day": "2026-05-01T00:00:00Z", "events": [
-            {"eventType": "flight", "eventCategory": "flight",
+            {"eventType": "FLIGHT", "eventCategory": "FLIGHT",
              "eventDetails": "LH400", "wholeDay": False,
              "startTime": "2026-05-01T08:55:00Z", "startLocation": "FRA",
              "endTime": "2026-05-01T17:35:00Z", "endLocation": "JFK",
              "eventAttributes": {"rotationId": 1, "dayOfShift": 1}}]},
         {"day": "2026-05-02T00:00:00Z", "events": [
-            {"eventType": "hotel", "eventCategory": "flight",
+            {"eventType": "HOTEL", "eventCategory": "FLIGHT",
              "eventDetails": "Layover", "wholeDay": True,
              "startLocation": "JFK", "endLocation": "JFK"}]},
         {"day": "2026-05-05T00:00:00Z", "events": [
-            {"eventType": "ground_event", "eventCategory": "off",
+            {"eventType": "GROUNDEVENT", "eventCategory": "OFF",
              "eventDetails": "", "wholeDay": True}]},
     ],
 }
