@@ -173,6 +173,52 @@ def test_landing_performed(monkeypatch):
     assert fo.landing_performed('T', 'LH400', '2016-10-01', 'FRA') is None
 
 
+# Echte MOCK-Responses (live gezogen 2026-07-22) — gegen die Realität testen.
+REAL_LANDING = {"pkNumber": "123456A", "flightDesignator": "LH400",
+                "flightDate": "2016-10-01Z", "departureAirport": "FRA",
+                "destinationAirport": "XYZ", "tailsign": "DAISQ",
+                "events": {"aircraft": {"out": "2016-10-01T10:04:00Z",
+                                        "off": "2016-10-01T10:18:00Z",
+                                        "on": "2016-10-01T13:44:00Z",
+                                        "in": "2016-10-01T14:02:00Z"}},
+                "landingPerformed": "true", "lowVisibilityApproach": "unkown"}
+REAL_CREWLIST = {"flightDesignator": "LH400", "crewMembers": [
+    {"pkNumber": "095599C", "crewPosition": "CP", "lastName": "ROENELT",
+     "firstName": "SOEREN", "dutyCode": "OD"},
+    {"pkNumber": "681411I", "crewPosition": "FO", "lastName": "ABBAS",
+     "firstName": "BENJAMIN", "dutyCode": "OD"}]}
+REAL_HOTEL = {"provider": "LHP", "station": "DUB", "hotelInformation": [
+    {"forAirline": "Lufthansa",
+     "hotelContact": {"company": "Crowne Plaza Hotel", "lastName": "M",
+                      "phone": "+353 1 443 1234", "mobilePhone": ""},
+     "hotelTransferContact": {"company": "Crowne Plaza shuttle bus",
+                              "phone": "+353 1 443 1234"}}]}
+
+
+def test_landing_facts_string_bool_and_blocktime(monkeypatch):
+    # landingPerformed kommt als STRING 'true' — muss echtes True werden
+    monkeypatch.setattr(fo, 'landing_report', lambda *a: REAL_LANDING)
+    f = fo.landing_report_facts('T', 'LH400', '2016-10-01', 'FRA')
+    assert f['landed'] is True
+    assert f['tail'] == 'D-AISQ'
+    assert f['block_min'] == 238          # 10:04 → 14:02 = 3:58
+    assert fo.landing_performed('T', 'LH400', '2016-10-01', 'FRA') is True
+
+
+def test_parse_crew_list_real():
+    cl = fo.parse_crew_list(REAL_CREWLIST)
+    assert cl[0] == {'position': 'CP', 'name': 'Soeren Roenelt',
+                     'pk': '095599C', 'duty': 'OD'}
+    assert cl[1]['position'] == 'FO' and cl[1]['name'] == 'Benjamin Abbas'
+
+
+def test_parse_crew_hotel_real():
+    h = fo.parse_crew_hotel(REAL_HOTEL)
+    assert h[0]['hotel'] == 'Crowne Plaza Hotel'
+    assert h[0]['airline'] == 'Lufthansa' and h[0]['station'] == 'DUB'
+    assert h[0]['transfer'] == 'Crowne Plaza shuttle bus'
+
+
 def test_service_get_rejects_bad_service(monkeypatch):
     monkeypatch.setattr(fo, '_api_get', lambda tok, path, params=None: {'called': path})
     assert fo.service_get('T', 'DROP TABLE') is None

@@ -335,14 +335,107 @@ def crew_hotel(user_token, station, provider=None):
     return _api_get(user_token, '/COMMON_CREW_HOTEL_INFO', params)
 
 
-def landing_performed(user_token, flight, date, dep):
-    """True/False/None — hat der eingeloggte Crew das Leg gelandet? Für die
-    Flugbuch-Auto-Füllung der Landungen. None = unbekannt/Fehler."""
+def _truthy(v):
+    """LH liefert Booleans teils als STRING ('true'/'false' — live 2026-07-22)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() == 'true'
+    return None
+
+
+def landing_report_facts(user_token, flight, date, dep):
+    """Landing Report → normalisierte Fakten (gegen ECHTE Mock-Shape 2026-07-22):
+    {landed: bool|None, tail, dep_iso, arr_iso, block_min}. OUT/IN = Block
+    (aircraft.out/in), off/on = Flugzeit. None-Werte weggelassen. Pure-nah."""
     r = landing_report(user_token, flight, date, dep)
     if not isinstance(r, dict) or r.get('processingErrors'):
+        return {}
+    ev = (r.get('events') or {}).get('aircraft') or {}
+    out = _valid_iso(ev.get('out'))
+    _in = _valid_iso(ev.get('in'))
+    facts = {'landed': _truthy(r.get('landingPerformed'))}
+    tail = _norm_reg(r.get('tailsign'))
+    if tail:
+        facts['tail'] = tail
+    if out:
+        facts['dep_iso'] = out
+    if _in:
+        facts['arr_iso'] = _in
+    bm = _block_min_iso(out, _in)
+    if bm is not None:
+        facts['block_min'] = bm
+    return facts
+
+
+def _valid_iso(v):
+    return v if (isinstance(v, str) and 'T' in v) else None
+
+
+def _norm_reg(reg):
+    """'DAISQ' → 'D-AISQ' (heuristisch, verbreitete Präfixe)."""
+    r = (reg or '').upper().replace('-', '').strip()
+    if not r:
         return None
-    lp = r.get('landingPerformed')
-    return bool(lp) if lp is not None else None
+    for p in ('D', 'HB', 'OE', 'OO', '9H', 'I', 'G', 'F', 'EI', 'LX'):
+        if r.startswith(p) and len(r) > len(p):
+            return p + '-' + r[len(p):]
+    return r
+
+
+def _block_min_iso(a, b):
+    try:
+        from datetime import datetime as _dt
+        d = _dt.fromisoformat((a or '').replace('Z', '+00:00'))
+        e = _dt.fromisoformat((b or '').replace('Z', '+00:00'))
+        m = int(round((e - d).total_seconds() / 60.0))
+        return m if 0 < m < 20 * 60 else None
+    except Exception:
+        return None
+
+
+def landing_performed(user_token, flight, date, dep):
+    """True/False/None — hat der eingeloggte Crew das Leg gelandet?"""
+    return landing_report_facts(user_token, flight, date, dep).get('landed')
+
+
+def parse_crew_list(resp):
+    """COMMON_CREWLIST-Response → normalisierte Liste (echte Shape 2026-07-22).
+    [{position, name, pk}] — für „Wer fliegt mit". Pure/testbar."""
+    if not isinstance(resp, dict):
+        return []
+    out = []
+    for m in (resp.get('crewMembers') or []):
+        if not isinstance(m, dict):
+            continue
+        first = (m.get('firstName') or '').strip().title()
+        last = (m.get('lastName') or '').strip().title()
+        name = ' '.join(x for x in (first, last) if x)
+        out.append({'position': (m.get('crewPosition') or '').strip(),
+                    'name': name or None, 'pk': m.get('pkNumber'),
+                    'duty': m.get('dutyCode')})
+    return out
+
+
+def parse_crew_hotel(resp):
+    """COMMON_CREW_HOTEL_INFO → [{airline, hotel, phone, transfer, transfer_phone}]
+    (echte Shape 2026-07-22). Pure/testbar."""
+    if not isinstance(resp, dict):
+        return []
+    out = []
+    for h in (resp.get('hotelInformation') or []):
+        if not isinstance(h, dict):
+            continue
+        hc = h.get('hotelContact') or {}
+        tc = h.get('hotelTransferContact') or {}
+        out.append({
+            'airline': h.get('forAirline'),
+            'hotel': hc.get('company'), 'phone': hc.get('phone') or None,
+            'transfer': tc.get('company') or None,
+            'transfer_phone': tc.get('phone') or None,
+            'station': resp.get('station'),
+        })
+    return out
 
 
 def check_in_times(user_token, from_date=None, to_date=None, **extra):
@@ -607,3 +700,27 @@ def flightops_raw(token):
     params = body.get('params') if isinstance(body.get('params'), dict) else {}
     return jsonify({'ok': True, 'service': service,
                     'response': service_get(token, service, params)})
+
+
+@lh_flightops_bp.route('/api/lh/flightops/crewlist/<token>', methods=['POST'])
+def flightops_crewlist(token):
+    """„Wer fliegt mit" für ein Leg (COMMON_CREWLIST → normalisiert). Body
+    {flight, date, dep, arr, access}. Parser gegen echte Shape verifiziert."""
+    if not _valid_access(token):
+        return jsonify({'ok': False, 'error': 'not_connected'}), 401
+    b = request.get_json(silent=True) or {}
+    resp = crew_list(token, b.get('flight'), b.get('date'), b.get('dep'),
+                     b.get('arr'), b.get('access'))
+    return jsonify({'ok': True, 'crew': parse_crew_list(resp)})
+
+
+@lh_flightops_bp.route('/api/lh/flightops/hotel/<token>', methods=['POST'])
+def flightops_hotel(token):
+    """Layover-Hotel für eine Station (COMMON_CREW_HOTEL_INFO → normalisiert).
+    Body {station, provider?}. Parser gegen echte Shape verifiziert."""
+    if not _valid_access(token):
+        return jsonify({'ok': False, 'error': 'not_connected'}), 401
+    b = request.get_json(silent=True) or {}
+    resp = crew_hotel(token, b.get('station'), b.get('provider'))
+    return jsonify({'ok': True, 'hotels': parse_crew_hotel(resp),
+                    'station': (b.get('station') or '').upper()})
