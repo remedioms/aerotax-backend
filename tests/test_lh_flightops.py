@@ -152,13 +152,16 @@ def test_client_methods_build_correct_paths(monkeypatch):
     fo.landing_report('T', 'LH400', '2016-10-01', 'FRA')
     fo.flight_leg_details('T', 'LH400', '2016-10-01', 'FRA', 'JFK')
     fo.crew_hotel('T', 'jfk', provider='LHP')
-    fo.check_in_times('T', '2016-10-01', '2016-10-31')
+    fo.check_in_times('T', 'LH400', '2016-10-01', 'FRA', 'JFK')
     fo.airport_weather('T', 'fra')
     paths = [c[0] for c in calls]
     assert '/COMMON_CREWLIST' in paths and '/COMMON_CREW_ROTATION' in paths
     assert '/COMMON_LANDING_REPORT' in paths and '/COMMON_FLIGHT_LEG_DETAILS' in paths
     assert '/COMMON_CREW_HOTEL_INFO' in paths and '/COMMON_CHECK_IN_TIMES' in paths
     assert '/COMMON_AIRPORT_WEATHER' in paths
+    # Check-In: doku-bestätigte Params (nicht Datumsfenster)
+    ci = dict([c for c in calls if c[0] == '/COMMON_CHECK_IN_TIMES'][0][1])
+    assert ci['flightDesignator'] == 'LH400' and ci['dutyType'] == 'OD' and ci['crewCategory'] == 'COC'
     # Datum wird zu YYYY-MM-DDZ, Station upper
     cl = dict(calls[0][1]); assert cl['flightDate'] == '2016-10-01Z' and cl['departureAirport'] == 'FRA'
     hotel = dict(calls[4][1]); assert hotel['station'] == 'JFK'

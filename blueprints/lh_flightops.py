@@ -37,6 +37,16 @@ from flask import Blueprint, jsonify, request, redirect
 log = logging.getLogger('aerotax')
 lh_flightops_bp = Blueprint('lh_flightops_bp', __name__)
 
+# DREI UMGEBUNGEN (Owner-Doku 2026-07-22) — alles env-gesteuert, also nur ein
+# Config-Flip, KEIN Umbau:
+#   1) MOCK (Default): statische Testdaten. base .../crew_services/mock,
+#      scope https://mock.cms.fra.dlh.de/publicCrewApiDev, Login = Google
+#      Authenticator (jeder), OAuth oauth-test.lufthansa.com.
+#   2) TEST/Sandbox: ECHTE anonymisierte Testdaten. base OHNE /mock
+#      (.../crew_services), scope https://cms.fra.dlh.de/publicCrewApiDev,
+#      braucht gültigen RSA-Token (echte Crew), OAuth oauth-test.
+#   3) PROD: base https://api.lufthansa.com/v1/flight_operations/crew_services,
+#      scope https://cms.fra.dlh.de/publicCrewApi, OAuth oauth.lufthansa.com.
 _KEY = (os.environ.get('LH_FLIGHTOPS_KEY') or '').strip()
 _SECRET = (os.environ.get('LH_FLIGHTOPS_SECRET') or '').strip()
 _AUTHORIZE_URL = (os.environ.get('LH_FLIGHTOPS_AUTHORIZE_URL')
@@ -438,14 +448,18 @@ def parse_crew_hotel(resp):
     return out
 
 
-def check_in_times(user_token, from_date=None, to_date=None, **extra):
-    """COMMON_CHECK_IN_TIMES — Report/Check-in-Zeiten (→ Pickup/Briefing).
-    Parameter noch nicht doku-verifiziert → flexibel (Datumsfenster + extra)."""
-    params = dict(extra)
-    if from_date:
-        params['fromDate'] = _date_z(from_date)
-    if to_date:
-        params['toDate'] = _date_z(to_date)
+def check_in_times(user_token, flight, date, dep, arr,
+                   duty_type='OD', crew_category='COC', **extra):
+    """COMMON_CHECK_IN_TIMES — Briefing-/Check-in-Zeiten je FLUG (→ Pickup/
+    Report). Doku-bestätigte Parameter (Owner 2026-07-22): flightDesignator,
+    flightDate, departureAirport, arrivalAirport, dutyType (OD/DH),
+    crewCategory (COC=Cockpit / CAB=Cabin). Das war die 409-Ursache (vorher
+    fälschlich Datumsfenster)."""
+    params = {
+        'flightDesignator': (flight or '').upper().replace(' ', ''),
+        'flightDate': _date_z(date), 'departureAirport': (dep or '').upper(),
+        'arrivalAirport': (arr or '').upper(),
+        'dutyType': duty_type, 'crewCategory': crew_category, **extra}
     return _api_get(user_token, '/COMMON_CHECK_IN_TIMES', params)
 
 
