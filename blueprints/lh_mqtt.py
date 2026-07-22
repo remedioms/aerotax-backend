@@ -272,11 +272,13 @@ def _sector_tail(s):
 
 
 # Reg-Memo entkoppelt vom 120s-Facts-Memo: Maschinen-Zuteilung ändert sich
-# selten — 45 min TTL hält den LH-Budget-Verbrauch der Topics-Rechnung klein.
+# intraday kaum — 3h TTL hält den LH-Budget-Verbrauch der Topics-Rechnung
+# klein (Quota-Lehre 22.07.: pro-Key-Limit, pro-Prozess-Zähler ×3 Worker —
+# jede Verlängerung hier wirkt dreifach).
 _reg_lock = threading.Lock()
 _reg_memo = {}
-_REG_TTL_S = 2700
-_REG_NEG_TTL_S = 600
+_REG_TTL_S = 3 * 3600
+_REG_NEG_TTL_S = 1800
 
 
 def _cached_leg_reg(flight_disp, date, dep, arr):

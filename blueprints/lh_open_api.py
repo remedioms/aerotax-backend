@@ -53,11 +53,17 @@ _tok_lock = threading.Lock()
 _tok_val = None
 _tok_exp = 0.0
 
-# ── 5/sec-Throttle + Stunden-Budget (Public-Plan: 1.000/h, wir kappen bei 900) ─
+# ── 5/sec-Throttle + Stunden-Budget ──────────────────────────────────────────
+# ACHTUNG (live gelernt 2026-07-22, „Developer Over Rate" bis auf den OAuth-
+# Endpoint): die 1.000/h-Quota gilt PRO KEY, dieser Zähler aber PRO PROZESS —
+# und produktiv laufen 3 Backend-Gunicorn-Worker + 1 Poll-Worker (+ Daemon,
+# der selbst kaum ruft). 900/h pro Prozess konnte also ~4× überziehen und
+# legte den MQTT-Daemon (kein Token mehr) lahm. 220 × 4 Prozesse ≈ 880/h
+# Aggregat-Obergrenze mit Marge.
 _rate_lock = threading.Lock()
 _last_call_ts = 0.0
 _MIN_INTERVAL = 0.22            # ≈ 4,5 Calls/sec, unter dem 5/sec-Limit
-_HOUR_BUDGET = 900             # Sicherheitsmarge unter 1.000/h
+_HOUR_BUDGET = 220             # PRO PROZESS (s.o.) — Aggregat < 1.000/h
 _hour_window = 0               # aktuelle Stunde (epoch // 3600)
 _hour_count = 0
 _budget_warned_hour = -1
