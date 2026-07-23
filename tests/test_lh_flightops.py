@@ -572,3 +572,22 @@ def test_exchange_endpoint_unwraps_token_tuple(monkeypatch):
     r2 = backend.app.test_client().post('/api/lh/flightops/oauth/exchange',
                                         json={'code': 'C', 'state': 'STATE-TUP2'})
     assert r2.status_code == 502
+
+
+def test_refresh_fatal_race_guard_skips_flag_when_rotated(monkeypatch):
+    """LH rotiert den Refresh-Token bei JEDEM Refresh (live 2026-07-23) — ein
+    paralleler Refresh darf beim Verlierer des Races KEIN needs_relogin
+    ausloesen. Simuliert: beim Re-Load nach dem fatal-Fehler liegt schon ein
+    NEUER (rotierter) Refresh-Token mit gueltigem Access im Store."""
+    import time as _t
+    stale = {'access': 'OLD', 'refresh': 'R1', 'expires_at': 0}
+    fresh = {'access': 'NEWACC', 'refresh': 'R2', 'expires_at': _t.time() + 3000}
+    loads = [dict(stale), dict(fresh)]
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok: loads.pop(0))
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('Race darf nichts speichern/flaggen')))
+    monkeypatch.setattr(fo, '_refresh', lambda r: (
+        None, {'http': 401, 'oauth': 'invalid_token', 'fatal': True}))
+    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
+        AssertionError('Race darf keinen Re-Login-Push senden')))
+    assert fo._valid_access('AT-U') == 'NEWACC'

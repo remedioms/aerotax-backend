@@ -282,6 +282,16 @@ def _valid_access(user_token):
             _tokens_save(user_token, nt)
             return nt['access']
         if err and err.get('fatal'):
+            # ROTATIONS-RACE-GUARD (empirisch 2026-07-23: LH rotiert den
+            # Refresh-Token bei JEDEM Refresh): hat ein PARALLELER Refresh
+            # (Cron vs. get_briefings) zwischen unserem Load und diesem Call
+            # schon rotiert, ist UNSER Token nur stale — der Grant lebt. Dann
+            # NICHT flaggen/pushen, sondern den frischen Stand nutzen.
+            cur = _tokens_load(user_token)
+            if (cur.get('refresh') or '') != (t.get('refresh') or ''):
+                if cur.get('access') and time.time() < (cur.get('expires_at') or 0):
+                    return cur['access']
+                return None
             t['needs_relogin'] = True
             t['relogin_at'] = time.time()
             t.pop('access', None)
