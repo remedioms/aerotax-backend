@@ -371,9 +371,13 @@ def test_inbound_delay_small_is_silent(client, monkeypatch):
 
 def test_est_dep_serves_direct_crew_and_inbound_watchers(client, monkeypatch):
     # LH123 ist ROSTER-Flug von user0 UND Zubringer von user0s Kollegin (LH400
-    # ab FRA) → beide Pushes aus EINEM Event.
+    # ab FRA) → beide Pushes aus EINEM Event. Topic-Datum = LOKALES Abflugdatum
+    # des Sektors (Broker-Keying) — dynamisch aus `now`, sonst wird der Test
+    # nach Mitternacht datumsabhängig rot (so geschehen am 2026-07-23).
     from datetime import datetime as dt, timezone as tz
+    from zoneinfo import ZoneInfo
     now = dt.now(tz.utc)
+    topic_date = now.astimezone(ZoneInfo('Europe/Berlin')).date().isoformat()
     facts = dict(INBOUND_FACTS, dep_delay_min=35,
                  est_dep='2026-07-22T15:30:00+02:00',
                  sched_dep='2026-07-22T14:55:00+02:00')
@@ -391,7 +395,8 @@ def test_est_dep_serves_direct_crew_and_inbound_watchers(client, monkeypatch):
                         pushes.append(data['type']))
     d = client.post('/api/internal/lh-mqtt/event',
                     json=_event_body('New Estimated Departure',
-                                     flight='LH123')).get_json()
+                                     flight='LH123',
+                                     date=topic_date)).get_json()
     assert d['pushed'] == 2
     assert sorted(pushes) == ['flight_update', 'inbound_delay']
 
