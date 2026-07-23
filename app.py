@@ -17497,7 +17497,7 @@ def _logbook_import_load(token):
     if SB_AVAILABLE:
         def _q():
             return sb.table('ax_logbook_import') \
-                .select('legs,sim,filename,imported_at') \
+                .select('legs,sim,meta,filename,imported_at') \
                 .eq('token', token).limit(1).execute()
         r, failed = _supabase_execute_with_timeout('logbook_import_load', _q,
                                                    timeout_s=8)
@@ -17643,7 +17643,8 @@ def get_logbook(token):
                        else L.get('pf')),
                 'night_min': ov.get('night_min', L.get('night_min')),
                 'remarks': ov.get('remarks', L.get('remarks')),
-                'role': L.get('role'), 'source': 'import',
+                'role': L.get('role'), 'pic_name': L.get('pic_name'),
+                'source': 'import',
             })
             imported_count += 1
         entries.sort(key=lambda e: (e.get('date') or '', e.get('dep_iso') or ''))
@@ -17663,9 +17664,21 @@ def get_logbook(token):
             'code': s_.get('code') or None,
             'duration_min': dm,
             'role': s_.get('role') or None,
+            'instructor': s_.get('instructor') or None,
         })
         sim_total += dm or 0
     sim_sessions.sort(key=lambda x: x['date'], reverse=True)
+
+    # Übertrag aus dem Vor-Logbuch (FCL.050 „Total from previous pages") —
+    # eigenes Feld, wird NICHT in totals.block_min eingerechnet (die Summe
+    # bleibt die Summe der sichtbaren Legs; der Übertrag ist eine Fußnote).
+    carryover_min = 0
+    try:
+        c = (imp.get('meta') or {}).get('carryover_min')
+        if isinstance(c, int) and 0 < c < 60000 * 60:
+            carryover_min = c
+    except Exception:
+        pass
 
     by_type = {}
     tot_block = tot_ldg = 0
@@ -17691,6 +17704,7 @@ def get_logbook(token):
         'imported_legs': imported_count,
         'sim_sessions': sim_sessions,
         'sim_total_min': sim_total,
+        'carryover_min': carryover_min,
         'enrich_capped': enrich_capped,
     })
 

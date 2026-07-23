@@ -140,7 +140,8 @@ IMPORT_BLOB = {'legs': [
      'dep_iso': '2019-03-05T21:00:00+00:00',
      'arr_iso': '2019-03-06T07:30:00+00:00',
      'block_min': 630, 'reg': 'D-AIXA', 'type': 'A359', 'pf': True,
-     'ldg_night': 1, 'night_min': 400, 'role': 'FO'},
+     'ldg_night': 1, 'night_min': 400, 'role': 'FO',
+     'pic_name': 'MUSTERMANN, M.'},
     # Kollision mit Roster-Leg LH400 → Roster gewinnt, aber Landungen/PF
     # aus dem Import bleiben als Fallback erhalten
     {'date': '2026-05-01', 'flight': 'LH400', 'from': 'FRA', 'to': 'JFK',
@@ -149,7 +150,8 @@ IMPORT_BLOB = {'legs': [
     {'date': '2014-02-17', 'flight': 'LH2477', 'from': 'LHR', 'to': 'MUC',
      'block_min': 1439, 'type': 'A320'},
 ], 'sim': [{'date': '2019-04-01', 'place': 'FRA', 'code': 'RE359',
-            'duration_min': 240}]}
+            'duration_min': 240, 'instructor': 'HOHL, J.'}],
+   'meta': {'carryover_min': 7800}}
 
 
 def _seed_import(blob=IMPORT_BLOB):
@@ -218,7 +220,11 @@ def test_sim_sessions_separate_from_flight_totals():
     assert r['sim_total_min'] == 240
     assert r['sim_sessions'] == [{'date': '2019-04-01', 'place': 'FRA',
                                   'code': 'RE359', 'duration_min': 240,
-                                  'role': None}]
+                                  'role': None, 'instructor': 'HOHL, J.'}]
+    # FCL.050-Extras aus dem PDF-Abgleich
+    assert r['carryover_min'] == 7800
+    lh500 = [e for e in r['entries'] if e['flight'] == 'LH500'][0]
+    assert lh500['pic_name'] == 'MUSTERMANN, M.'
     # FCL.050: FSTD-Zeit zählt NICHT in die Flug-Totals/Muster-Summen
     assert r['totals']['block_min'] == 520 + 450 + 60 + 630
     assert not any(t['type'] == 'RE359' for t in r['by_type'])
@@ -228,3 +234,4 @@ def test_sim_sessions_empty_without_import():
     _seed()
     r = _get()
     assert r['sim_sessions'] == [] and r['sim_total_min'] == 0
+    assert r['carryover_min'] == 0
