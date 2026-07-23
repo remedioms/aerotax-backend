@@ -775,6 +775,85 @@ def _resolve_link_params(user_token, service, flight, date, dep=None, arr=None):
     return _links_find(fresh, service, flight, date, dep, arr)
 
 
+def _store_own_pk(user_token, pk):
+    """LH-Personalnummer im Profil-Mirror ablegen (metadata.lh_pk_number).
+    Idempotent, wirft nie."""
+    if not pk:
+        return
+    try:
+        import app as _app
+        pf = _app._profile_load(user_token) or {}
+        prof = (pf.get('profile') or {})
+        if prof.get('lh_pk_number') == pk:
+            return
+        prof['lh_pk_number'] = pk
+        _app._profile_save(user_token, prof)
+    except Exception as e:
+        log.warning('[lh_flightops] store_pk: %s', type(e).__name__)
+
+
+def _match_aerox_profiles(members):
+    """Crew-Listen-Mitglieder → AeroX-PUBLIC-Profile (best-effort, wirft nie).
+    Primär EXAKT über die LH-Personalnummer (metadata.lh_pk_number — beim
+    Duty-Events-Import jedes verbundenen Users gespeichert), Fallback exakter
+    Name (case-insensitiv, NUR eindeutige Treffer) + Lufthansa-Airline.
+    Response-Felder = exakt die Public-Shape von /api/user/search (token/name/
+    airline/homebase/position/avatar_url) — nie email/apple_sub/internal;
+    Family-Accounts nie. Rückgabe: {pk-oder-name-Key: public_profile}."""
+    try:
+        import app as _app
+        if not getattr(_app, 'SB_AVAILABLE', False) or not members:
+            return {}
+        sel = 'token,name,airline,homebase,position,metadata'
+        by_pk = {}
+        pks = [str(m.get('pk') or '').strip() for m in members]
+        pks = [p for p in pks if p]
+        if pks:
+            r = (_app.sb.table('user_profiles').select(sel)
+                 .in_('metadata->>lh_pk_number', pks).limit(60).execute())
+            for row in (r.data or []):
+                md = row.get('metadata') or {}
+                by_pk[str(md.get('lh_pk_number') or '').strip()] = row
+        by_name = {}
+        need = [m for m in members
+                if str(m.get('pk') or '').strip() not in by_pk
+                and (m.get('name') or '').strip()]
+        for m in need[:12]:
+            try:
+                r = (_app.sb.table('user_profiles').select(sel)
+                     .ilike('name', m['name'].strip()).limit(3).execute())
+                cand = [row for row in (r.data or [])
+                        if 'lufthansa' in str(row.get('airline') or '').lower()]
+                if len(cand) == 1:
+                    by_name[m['name'].strip().lower()] = cand[0]
+            except Exception:
+                continue
+
+        def _pub(row):
+            md = row.get('metadata') or {}
+            if str(md.get('account_type') or '').strip().lower() == 'family':
+                return None
+            if not row.get('token'):
+                return None
+            return {'token': row.get('token'), 'name': row.get('name'),
+                    'airline': row.get('airline'),
+                    'homebase': row.get('homebase'),
+                    'position': row.get('position'),
+                    'avatar_url': md.get('avatar_url')}
+
+        out = {}
+        for m in members:
+            row = (by_pk.get(str(m.get('pk') or '').strip())
+                   or by_name.get(str(m.get('name') or '').strip().lower()))
+            p = _pub(row) if row else None
+            if p:
+                out[str(m.get('pk') or m.get('name') or '')] = p
+        return out
+    except Exception as e:
+        log.warning('[lh_flightops] profile_match: %s', type(e).__name__)
+        return {}
+
+
 def parse_check_in_times(resp):
     """COMMON_CHECK_IN_TIMES → kompakte Zeiten-Map (nur dokumentierte Felder,
     ISO-Werte unverändert durchgereicht). Pure/testbar."""
@@ -899,6 +978,12 @@ def flightops_import(token):
     links = extract_duty_links(resp)
     if links:
         _links_save(token, links)
+    # Eigene LH-Personalnummer persistieren (Owner 2026-07-23 „Crews mit AeroX-
+    # Profilen verbinden"): die pkNumber aus der Duty-Events-Response ist DER
+    # exakte Schlüssel, über den andere verbundene User diesen Account in ihrer
+    # Crew-Liste wiederfinden (COMMON_CREWLIST liefert pkNumber pro Mitglied).
+    _store_own_pk(token, (resp.get('pkNumber') or '').strip()
+                  if isinstance(resp, dict) else '')
     ics = duty_events_to_ics(resp)
     if not ics:
         return jsonify({'ok': True, 'events_count': 0, 'source': 'flightops',
@@ -1081,7 +1166,15 @@ def flightops_crewlist(token):
     resp = crew_list(token, flight, date, dep, arr, access)
     if not isinstance(resp, dict) or resp.get('processingErrors'):
         return jsonify({'ok': False, 'error': 'crewlist_unavailable'}), 502
-    return jsonify({'ok': True, 'crew': parse_crew_list(resp)})
+    crew = parse_crew_list(resp)
+    # AeroX-Profil-Verknüpfung (Owner 2026-07-23): wer aus der Crew ist selbst
+    # auf AeroX? → Avatar/Profil direkt aus der Liste öffnen.
+    matches = _match_aerox_profiles(crew)
+    for m in crew:
+        p = matches.get(str(m.get('pk') or m.get('name') or ''))
+        if p:
+            m['aerox'] = p
+    return jsonify({'ok': True, 'crew': crew})
 
 
 @lh_flightops_bp.route('/api/lh/flightops/checkin/<token>', methods=['POST'])

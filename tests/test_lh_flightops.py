@@ -591,3 +591,48 @@ def test_refresh_fatal_race_guard_skips_flag_when_rotated(monkeypatch):
     monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
         AssertionError('Race darf keinen Re-Login-Push senden')))
     assert fo._valid_access('AT-U') == 'NEWACC'
+
+
+def test_crewlist_endpoint_attaches_aerox_profiles(monkeypatch):
+    """Owner 2026-07-23: Crew-Mitglieder mit AeroX-Account bekommen ihr
+    PUBLIC-Profil (token/avatar/…) an den Listen-Eintrag — Match primär via
+    LH-Personalnummer."""
+    _pass_auth_gate(monkeypatch)
+    monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
+    monkeypatch.setattr(fo, '_valid_access', lambda tok: 'ACC')
+    monkeypatch.setattr(fo, '_links_load',
+                        lambda tok: fo.extract_duty_links(DUTY_LINKS))
+    monkeypatch.setattr(fo, 'crew_list',
+                        lambda tok, f, d, dep, arr, ac: REAL_CREWLIST)
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members: {
+        '095599C': {'token': 'AT-SOEREN', 'name': 'Soeren Roenelt',
+                    'airline': 'Lufthansa', 'homebase': 'FRA',
+                    'position': 'CP', 'avatar_url': 'https://cdn/x.jpg'}})
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/AT-U',
+                                       headers={'Authorization': 'Bearer AT-U'},
+                                       json={'flight': 'LH400',
+                                             'date': '2026-07-24'})
+    crew = r.get_json()['crew']
+    assert crew[0]['aerox']['token'] == 'AT-SOEREN'
+    assert crew[0]['aerox']['avatar_url'] == 'https://cdn/x.jpg'
+    assert 'aerox' not in crew[1]          # kein Match → Feld fehlt
+
+
+def test_store_own_pk_idempotent(monkeypatch):
+    import app as backend
+    saved = []
+    monkeypatch.setattr(backend, '_profile_load',
+                        lambda tok: {'profile': {'name': 'M'}})
+    monkeypatch.setattr(backend, '_profile_save',
+                        lambda tok, prof: saved.append(dict(prof)) or True)
+    fo._store_own_pk('AT-U', '123456A')
+    assert saved[-1]['lh_pk_number'] == '123456A'
+    # unverändert → kein zweiter Save
+    monkeypatch.setattr(backend, '_profile_load',
+                        lambda tok: {'profile': {'lh_pk_number': '123456A'}})
+    n = len(saved)
+    fo._store_own_pk('AT-U', '123456A')
+    assert len(saved) == n
+    fo._store_own_pk('AT-U', '')       # leer → no-op
+    assert len(saved) == n
