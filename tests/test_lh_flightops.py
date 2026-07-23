@@ -548,3 +548,27 @@ def test_refresh_all_work_counts_and_releases_lock(monkeypatch):
     st = fo._refresh_all_state
     assert st['running'] is False
     assert st['last']['ok'] == 2 and st['last']['skipped'] == 1
+
+
+def test_exchange_endpoint_unwraps_token_tuple(monkeypatch):
+    """Regression Live-500 2026-07-23: _token_request liefert (tok, err) —
+    der Exchange-Endpoint muss das reine Token-Dict speichern. Mockt bewusst
+    _token_request (NICHT _exchange_code), damit der echte Unwrap-Pfad läuft."""
+    monkeypatch.setattr(fo, '_KEY', 'CID'); monkeypatch.setattr(fo, '_SECRET', 'SEC')
+    fo._flow_put('STATE-TUP', 'VERIFIER', 'AT-USER-TUP')
+    monkeypatch.setattr(fo, '_token_request', lambda body: (
+        {'access': 'ACC2', 'refresh': 'REF2', 'scope': 'sc', 'expires_at': 9e18}, None))
+    saved = {}
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saved.update({tok: t}) or True)
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/oauth/exchange',
+                                       json={'code': 'C', 'state': 'STATE-TUP'})
+    assert r.status_code == 200 and r.get_json()['connected'] is True
+    assert saved['AT-USER-TUP']['access'] == 'ACC2'
+    # und der Fehlerfall bleibt ein sauberer 502, kein 500
+    fo._flow_put('STATE-TUP2', 'VERIFIER', 'AT-USER-TUP')
+    monkeypatch.setattr(fo, '_token_request', lambda body: (
+        None, {'http': 400, 'oauth': 'invalid_grant', 'fatal': True}))
+    r2 = backend.app.test_client().post('/api/lh/flightops/oauth/exchange',
+                                        json={'code': 'C', 'state': 'STATE-TUP2'})
+    assert r2.status_code == 502

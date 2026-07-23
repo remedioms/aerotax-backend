@@ -183,12 +183,16 @@ def _basic_header():
 
 
 def _exchange_code(code, verifier):
-    """authorization_code → Token-Dict oder None. Client-Secret via Basic-Header."""
+    """authorization_code → Token-Dict oder None. Client-Secret via Basic-Header.
+    WICHTIG: _token_request liefert seit der Refresh-Härtung (tok, err) — hier
+    NUR das Token-Dict weitergeben (Live-500 am 23.07.: das Tupel wanderte bis
+    in _tokens_save/tok.get und crashte den Exchange NACH erfolgreichem LH-Login)."""
     body = urllib.parse.urlencode({
         'grant_type': 'authorization_code', 'code': code,
         'redirect_uri': _REDIRECT_URI, 'client_id': _KEY,
         'code_verifier': verifier}).encode()
-    return _token_request(body)
+    tok, _err = _token_request(body)
+    return tok
 
 
 def _refresh(refresh_token):
