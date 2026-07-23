@@ -487,3 +487,44 @@ def test_outstation_overnight_yyc_fra_departs_on_jul25():
     # Nicht Regression: FRA→YYC-Leg (Jul 24) bleibt auf Jul 24
     d24 = secs.get('2026-07-24') or []
     assert any(s.get('flight') == '4Y76' for s in d24), 'FRA-YYC regression: not on Jul 24'
+
+
+def test_attach_sectors_backfills_flight_from_legs():
+    """Nico-L-Fall (2026-07-23, Discover): VEVENT-Summary gibt nur die Route
+    her (flight=None im Sektor), aber der Tages-Parser hat die Nummern in
+    `legs` ('4Y 1224' MIT Leerzeichen). _attach_sectors muss die fehlenden
+    Sektor-Flugnummern routen-gleich und Reihenfolge-stabil auffüllen —
+    sonst können Feed/Live-Karte/Radar den Flug nie auflösen."""
+    briefings = {'2026-07-23': {
+        'legs': [
+            {'flight': '4Y 1224', 'from': 'FRA', 'to': 'HER',
+             'dep': '13:45', 'arr': '17:45'},
+            {'flight': '4Y 1225', 'from': 'HER', 'to': 'FRA',
+             'dep': '18:35', 'arr': '20:55'},
+        ],
+    }}
+    events = [
+        {'summary': 'Flugdienst', 'location': 'FRA - HER',
+         'start_iso': '2026-07-23T11:45:00Z', 'end_iso': '2026-07-23T14:45:00Z'},
+        {'summary': 'Flugdienst', 'location': 'HER - FRA',
+         'start_iso': '2026-07-23T15:35:00Z', 'end_iso': '2026-07-23T18:55:00Z'},
+    ]
+    backend._attach_sectors(briefings, events)
+    secs = briefings['2026-07-23']['ical_sectors']
+    assert [(s['flight'], s['from'], s['to']) for s in secs] == [
+        ('4Y1224', 'FRA', 'HER'), ('4Y1225', 'HER', 'FRA')]
+
+
+def test_attach_sectors_backfill_never_overwrites_parsed_flight():
+    """Backfill füllt NUR None-Flüge — ein aus dem Summary geparster Flug
+    gewinnt immer (legs könnten stale sein)."""
+    briefings = {'2026-07-23': {
+        'legs': [{'flight': '4Y 9999', 'from': 'FRA', 'to': 'HER'}],
+    }}
+    events = [
+        {'summary': '4Y 1224: FRA - HER', 'location': '',
+         'start_iso': '2026-07-23T11:45:00Z', 'end_iso': '2026-07-23T14:45:00Z'},
+    ]
+    backend._attach_sectors(briefings, events)
+    secs = briefings['2026-07-23']['ical_sectors']
+    assert secs[0]['flight'] == '4Y1224'

@@ -43106,10 +43106,32 @@ def _attach_sectors(briefings, events):
     """Hängt die aus `events` gebauten Pro-Leg-Sektoren an die Tagessätze."""
     try:
         for d, secs in _build_ical_sectors(events).items():
-            if isinstance(briefings.get(d), dict):
-                briefings[d]['ical_sectors'] = secs
-            else:
-                briefings.setdefault(d, {})['ical_sectors'] = secs
+            day = briefings.get(d)
+            if not isinstance(day, dict):
+                day = {}
+                briefings[d] = day
+            # FLUGNUMMERN-BACKFILL (Nico L, Discover 2026-07-23): manche Quellen
+            # tragen die Flugnummer NUR im Tages-Parser (`legs`: '4Y 1224'),
+            # die VEVENT-Summaries geben bloß die Route her → Sektor-flight
+            # bleibt None und Feed/Live-Karte/Radar können den Flug nicht
+            # auflösen. Fehlende Sektor-Flugnummern aus den routen-gleichen
+            # legs auffüllen — Reihenfolge-stabil (Doppel-Umlauf: n-ter Sektor
+            # derselben Route ↔ n-tes Leg derselben Route).
+            _pool = {}
+            for _lg in (day.get('legs') or []):
+                _fl = re.sub(r'\s+', '', str(_lg.get('flight') or '')).upper()
+                _fr = str(_lg.get('from') or '').upper().strip()
+                _to = str(_lg.get('to') or '').upper().strip()
+                if (_fr and _to and
+                        re.fullmatch(r'(?:[A-Z]{2,3}|\d[A-Z])\d{1,4}[A-Z]?', _fl)):
+                    _pool.setdefault((_fr, _to), []).append(_fl)
+            for _s in secs:
+                if not _s.get('flight'):
+                    _q = _pool.get(((_s.get('from') or '').upper(),
+                                    (_s.get('to') or '').upper()))
+                    if _q:
+                        _s['flight'] = _q.pop(0)
+            day['ical_sectors'] = secs
     except Exception as e:
         app.logger.warning(f'[ical-briefings] sectors-attach-fail: {str(e)[:160]}')
 
