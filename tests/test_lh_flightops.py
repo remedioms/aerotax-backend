@@ -285,6 +285,12 @@ def test_token_request_classifies_fatal_vs_transient(monkeypatch):
                         _mk(400, b'{"error":"invalid_grant"}'))
     tok, err = fo._token_request(b'x=1')
     assert tok is None and err['fatal'] is True and err['oauth'] == 'invalid_grant'
+    # LIVE 2026-07-23: 401 invalid_token beim Refresh = toter Grant (stale
+    # Sandbox-Tokens nach Prod-Key-Wechsel) -> fatal
+    monkeypatch.setattr('urllib.request.urlopen',
+                        _mk(401, b'{"error":"invalid_token"}'))
+    tok, err = fo._token_request(b'x=1')
+    assert tok is None and err['fatal'] is True
     monkeypatch.setattr('urllib.request.urlopen',
                         _mk(503, b'{"error":"service_unavailable"}'))
     tok, err = fo._token_request(b'x=1')

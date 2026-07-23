@@ -200,10 +200,13 @@ def _refresh(refresh_token):
     return _token_request(body)
 
 
-# OAuth-Fehler, bei denen der Grant DEFINITIV tot ist (Doku Token_Endpoint) —
-# nur dann Re-Login verlangen. Alles andere (service_unavailable=Wartung,
-# 403 Rate-Limit, 5xx, Netz) ist transient: Tokens BEHALTEN, später erneut.
-_FATAL_OAUTH_ERRORS = ('invalid_grant', 'invalid_client')
+# OAuth-Fehler, bei denen der Grant DEFINITIV tot ist — nur dann Re-Login
+# verlangen. Doku (Token_Endpoint) nennt invalid_grant/invalid_client;
+# `invalid_token` LIVE beobachtet (2026-07-23, 401 beim Refresh mit stalen
+# Sandbox-Tokens nach dem Prod-Key-Wechsel) — ebenfalls toter Grant. Alles
+# andere (service_unavailable=Wartung, 403 Rate-Limit, 5xx, Netz) ist
+# transient: Tokens BEHALTEN, später erneut.
+_FATAL_OAUTH_ERRORS = ('invalid_grant', 'invalid_client', 'invalid_token')
 
 
 def _token_request(body):
