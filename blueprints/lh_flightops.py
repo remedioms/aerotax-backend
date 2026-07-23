@@ -634,6 +634,37 @@ def flightops_oauth_exchange():
     return jsonify({'ok': True, 'connected': True, 'scope': tok.get('scope')})
 
 
+@lh_flightops_bp.route('/lh/oauth/callback', methods=['GET'])
+def flightops_oauth_callback_relay():
+    """HTTPS-OAuth-Callback für PROD. Das LH-Prod-Portal akzeptiert KEINE Custom-
+    Scheme-Redirect-URIs (nur https://) — also registrieren wir hier eine HTTPS-
+    Callback-URL (`https://api.aerosteuer.de/lh/oauth/callback`, = LH_FLIGHTOPS_
+    REDIRECT_URI). LH leitet nach dem Consent HIERHER mit ?code&state (oder ?error).
+    Diese Route macht KEINEN Token-Austausch — sie bounced NUR zurück ins App-
+    Scheme `aerox://lhcrew/callback?...`, das die ASWebAuthenticationSession der App
+    abfängt; die App tauscht den Code dann über /api/lh/flightops/oauth/exchange
+    (state-gebunden, verifier serverseitig). So bleibt die iOS-App unverändert.
+    Bounce via JS/Meta-Refresh statt `Location: aerox://…` (robust gegen Proxies/
+    CDN, die einen non-http Location-Header verwerfen)."""
+    args = {}
+    for k in ('code', 'state', 'error', 'error_description'):
+        v = request.args.get(k)
+        if v:
+            args[k] = v
+    target = 'aerox://lhcrew/callback'
+    if args:
+        target += '?' + urllib.parse.urlencode(args)
+    tesc = target.replace('&', '&amp;').replace('"', '%22')
+    tjs = target.replace('\\', '\\\\').replace('"', '\\"')
+    page = ('<!doctype html><html><head><meta charset=utf-8>'
+            f'<meta http-equiv="refresh" content="0;url={tesc}">'
+            f'<script>location.replace("{tjs}")</script></head>'
+            '<body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;'
+            'background:#0b1020;color:#d6e6ff;padding:24px;line-height:1.4">'
+            'Zurück zur AeroX-App…</body></html>')
+    return page, 200, {'Content-Type': 'text/html; charset=utf-8'}
+
+
 @lh_flightops_bp.route('/api/lh/flightops/status/<token>', methods=['GET'])
 def flightops_status(token):
     """Ist dieser User mit FlightOps verbunden?"""
