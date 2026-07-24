@@ -17772,10 +17772,51 @@ _LOGBOOK_IMPORT_TS = {}            # token -> [epoch, ...] (in-memory Throttle)
 _LOGBOOK_IMPORT_TS_LOCK = _req_threading.Lock()
 
 
-def _logbook_import_mail(token, filename, blob, note):
-    """Datei als Mail-Anhang an den Owner (SUPPORT_NOTIFY_EMAIL). True bei
-    Erfolg — der Upload gilt nur dann als angenommen (die Disk ist ephemer,
-    die Mail IST der Transportweg)."""
+def _logbook_upload_store(token, filename, blob, note):
+    """Upload durabel in SB `ax_logbook_upload` ablegen (data_b64 als Text —
+    PostgREST-bytea-Encoding vermeiden). Primärer Transportweg seit 07-24:
+    der Owner zieht die Datei direkt aus der Tabelle statt aus dem
+    Mail-Anhang. RLS an ohne Policies — nur Service-Key. True bei Erfolg."""
+    if not SB_AVAILABLE:
+        return False
+    try:
+        import base64 as _b64
+        import hashlib as _hl
+        prof = {}
+        try:
+            prof = ((_profile_load(token) or {}).get('profile') or {})
+        except Exception:
+            pass
+        row = {
+            'token': token,
+            'name': (prof.get('name') or None),
+            'airline': (prof.get('airline') or None),
+            'homebase': (prof.get('homebase') or None),
+            'filename': filename,
+            'sha256': _hl.sha256(blob).hexdigest(),
+            'size_bytes': len(blob),
+            'note': (note or None),
+            'data_b64': _b64.b64encode(blob).decode(),
+        }
+
+        def _do():
+            return sb.table('ax_logbook_upload').insert(row).execute()
+        # 20-MB-Base64-Payload braucht Luft — 30s statt Default-5s.
+        _, failed = _supabase_execute_with_timeout('logbook_upload_store',
+                                                   _do, timeout_s=30)
+        if not failed:
+            print(f'[logbook-import] sb-store ok tok={token[:8]} '
+                  f'file={filename} {len(blob)}B')
+        return not failed
+    except Exception as ex:
+        print(f'[logbook-import] sb-store fail: {type(ex).__name__}: {str(ex)[:200]}')
+        return False
+
+
+def _logbook_import_mail(token, filename, blob, note, stored=False):
+    """Benachrichtigungs-Mail an den Owner (SUPPORT_NOTIFY_EMAIL), mit der
+    Datei als Anhang als Redundanz. Seit 07-24 ist der SB-Upload-Store der
+    primäre Transportweg; die Mail sagt, ob die Datei dort liegt."""
     api_key = os.environ.get('RESEND_API_KEY', '').strip()
     to_email = os.environ.get('SUPPORT_NOTIFY_EMAIL',
                               'miguel.schumann@icloud.com').strip()
@@ -17809,8 +17850,12 @@ def _logbook_import_mail(token, filename, blob, note):
             f"<b>Notiz:</b> {e(note or '—')}"
             f"</p>"
             f"<p style='font-family:sans-serif;font-size:12px;color:#888'>"
-            f"Datei parsen und via Import-Store ins Flugbuch des Tokens "
-            f"einspielen (Kette: Anhang → Legs → logbook).</p>"
+            + ("Datei liegt im Upload-Store (SB ax_logbook_upload) — von "
+               "dort einspielen; Anhang ist nur Redundanz."
+               if stored else
+               "SB-Store FEHLGESCHLAGEN — Anhang ist der einzige Weg an "
+               "die Datei.")
+            + " (Kette: Datei → Legs → logbook).</p>"
         )
         payload = json.dumps({
             'from': 'AeroX Flugbuch <support@aerosteuer.de>',
@@ -17896,7 +17941,13 @@ def upload_logbook_import(token):
             fh.write(blob)
     except Exception:
         pass
-    if not _logbook_import_mail(token, filename, blob, note):
+    # Zwei durable Wege: SB-Upload-Store (primär, Owner zieht direkt aus der
+    # Tabelle) + Owner-Mail mit Anhang (Redundanz/Benachrichtigung). Ehrlich
+    # angenommen nur, wenn MINDESTENS EINER durchkam — die Container-Disk
+    # allein ist ephemer.
+    stored = _logbook_upload_store(token, filename, blob, note)
+    mailed = _logbook_import_mail(token, filename, blob, note, stored=stored)
+    if not (stored or mailed):
         return jsonify({'ok': False, 'error': 'delivery_failed',
                         'message': 'Übertragung fehlgeschlagen — bitte später '
                                    'erneut versuchen.'}), 502

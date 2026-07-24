@@ -22,15 +22,18 @@ def _client():
     return A.app.test_client()
 
 
-def _post(client, token, filename, blob, mail_ok=True, monkeypatch=None):
+def _post(client, token, filename, blob, mail_ok=True, store_ok=False,
+          monkeypatch=None):
     sent = {}
 
-    def fake_mail(tok, fn, data, note):
+    def fake_mail(tok, fn, data, note, stored=False):
         sent.update({'token': tok, 'filename': fn, 'bytes': len(data),
-                     'note': note})
+                     'note': note, 'stored_flag': stored})
         return mail_ok
 
     monkeypatch.setattr(A, '_logbook_import_mail', fake_mail)
+    monkeypatch.setattr(A, '_logbook_upload_store',
+                        lambda tok, fn, data, note: store_ok)
     r = client.post(f'/api/user/logbook/{token}/import-upload', json={
         'filename': filename,
         'data_b64': base64.b64encode(blob).decode(),
@@ -46,6 +49,15 @@ def test_upload_csv_sends_mail_and_acks(monkeypatch):
     assert r.get_json()['ok'] is True
     assert sent['filename'] == 'LogTenExport.csv'
     assert sent['bytes'] > 0
+
+
+def test_upload_ok_when_only_sb_store_succeeds(monkeypatch):
+    # Mail down, aber SB-Upload-Store hat die Datei → Upload gilt (durabel).
+    A._LOGBOOK_IMPORT_TS.clear()
+    r, sent = _post(_client(), 'tok_upload_sb', 'Export.csv', b'a,b,c',
+                    mail_ok=False, store_ok=True, monkeypatch=monkeypatch)
+    assert r.status_code == 200 and r.get_json()['ok'] is True
+    assert sent['stored_flag'] is True     # Mail weiss vom SB-Store
 
 
 def test_upload_rejected_when_mail_fails(monkeypatch):
