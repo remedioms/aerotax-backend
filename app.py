@@ -17681,6 +17681,7 @@ def get_logbook(token):
         pass
 
     by_type = {}
+    by_year = {}
     tot_block = tot_ldg = 0
     dates_seen = set()
     for e in entries:
@@ -17694,11 +17695,23 @@ def get_logbook(token):
         agg['legs'] += 1
         agg['block_min'] += bt
         agg['landings'] += ld
+        # Jahres-Statistik (Kevin-Feedback: importierte Historie soll in den
+        # Stats sichtbar sein — HIER, nicht im Roster-Stats-Tab/Kalender).
+        y = (e.get('date') or '')[:4]
+        if len(y) == 4 and y.isdigit():
+            ya = by_year.setdefault(y, {'year': y, 'legs': 0, 'block_min': 0,
+                                        'landings': 0})
+            ya['legs'] += 1
+            ya['block_min'] += bt
+            ya['landings'] += ld
     by_type_list = sorted(by_type.values(), key=lambda x: -x['block_min'])
+    by_year_list = sorted(by_year.values(), key=lambda x: x['year'],
+                          reverse=True)
     return jsonify({
         'ok': True,
         'entries': entries,
         'by_type': by_type_list,
+        'by_year': by_year_list,
         'totals': {'legs': len(entries), 'block_min': tot_block,
                    'landings': tot_ldg, 'days': len(dates_seen)},
         'imported_legs': imported_count,

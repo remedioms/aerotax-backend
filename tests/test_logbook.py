@@ -235,3 +235,18 @@ def test_sim_sessions_empty_without_import():
     r = _get()
     assert r['sim_sessions'] == [] and r['sim_total_min'] == 0
     assert r['carryover_min'] == 0
+
+
+def test_by_year_aggregation_includes_import():
+    _seed()
+    _seed_import()
+    r = _get()
+    by = {y['year']: y for y in r['by_year']}
+    # absteigend sortiert, Import-Jahre enthalten
+    assert [y['year'] for y in r['by_year']] == ['2026', '2019', '2014']
+    assert by['2019'] == {'year': '2019', 'legs': 1, 'block_min': 630,
+                          'landings': 1}
+    assert by['2026']['legs'] == 3
+    # Platzhalter-Leg 2014 ohne Blockzeit zählt als Leg, nicht als Stunden
+    assert by['2014'] == {'year': '2014', 'legs': 1, 'block_min': 0,
+                          'landings': 0}
