@@ -118,6 +118,54 @@ def test_duty_events_to_ics_empty():
     assert fo.duty_events_to_ics(None) is None
 
 
+# Miguels echter SFO-Tag (2026-07-28): BRIEFING kommt MIT startTime aber OHNE
+# endTime — vorher fiel es dadurch in den Ganztags-Zweig und die echte
+# Report-Zeit (06:35Z = 08:35 LT FRA) ging verloren; die App riet Abflug−60
+# („falsche Briefing-Zeiten seit dem Update", Miguel + Thomas Radlmeier).
+DUTY_BRIEFING = {
+    "pkNumber": "123456A",
+    "rosterDays": [
+        {"day": "2026-07-28T00:00:00Z", "events": [
+            {"eventType": "BRIEFING", "eventCategory": "DUTY",
+             "eventDetails": "Briefing", "wholeDay": False,
+             "startTime": "2026-07-28T06:35:00Z", "startLocation": "FRA",
+             "endTime": None, "endLocation": "FRA"},
+            {"eventType": "FLIGHT", "eventCategory": "FLIGHT",
+             "eventDetails": "LH454", "wholeDay": False,
+             "startTime": "2026-07-28T08:25:00Z", "startLocation": "FRA",
+             "endTime": "2026-07-28T19:55:00Z", "endLocation": "SFO"}]},
+    ],
+}
+
+
+def test_duty_events_to_ics_briefing_keeps_report_time():
+    """BRIEFING ohne endTime bleibt ZEITBEHAFTET (echte Report-Zeit) und trägt
+    den kanonischen LH-Marker „HH:MM LT Briefing FRA" in Station-Ortszeit —
+    exakt die Form, die _corrected_briefing_start_iso + iOS lesen."""
+    ics = fo.duty_events_to_ics(DUTY_BRIEFING)
+    assert ics is not None
+    # Zeitbehaftet mit der ECHTEN Report-Zeit, kein VALUE=DATE-Ganztag mehr.
+    assert 'DTSTART:20260728T063500Z' in ics
+    assert 'DTSTART;VALUE=DATE:20260728' not in ics
+    # Kanonischer Marker in FRA-Ortszeit (Juli = UTC+2 → 08:35).
+    assert '08:35 LT Briefing FRA' in ics
+
+
+def test_duty_events_to_ics_briefing_drives_day_start():
+    """Durch die Roster-Pipeline: der Tag beginnt am BRIEFING (06:35Z), nicht
+    am Abflug (08:25Z) — genau das war der gemeldete Fehler."""
+    import app as backend
+    ics = fo.duty_events_to_ics(DUTY_BRIEFING)
+    events = backend._parse_ics_to_events(ics)
+    briefing = [e for e in events if 'LT Briefing' in (e.get('summary') or '')]
+    assert len(briefing) == 1
+    assert (briefing[0].get('start_iso') or '').startswith('2026-07-28T06:35')
+    # Flug-Sektor bleibt unangetastet.
+    secs = backend._build_ical_sectors(events)
+    d = secs.get('2026-07-28') or []
+    assert [(s['flight'], s['from'], s['to']) for s in d] == [('LH454', 'FRA', 'SFO')]
+
+
 def test_date_z_format():
     assert fo._date_z('2016-10-01') == '2016-10-01Z'
     assert fo._date_z('2016-10-01Z') == '2016-10-01Z'

@@ -672,6 +672,30 @@ def duty_events_to_ics(resp):
                           f'DTSTART:{st}', f'DTEND:{en}',
                           f'SUMMARY:{summary}', 'END:VEVENT']
                 continue
+            # BRIEFING (Miguel/Thomas 2026-07-24 „falsche Briefing-Zeiten seit
+            # dem Update"): FlightOps liefert Briefings MIT startTime, aber
+            # systematisch OHNE endTime → der alte `st and en`-Zweig griff nie
+            # und das Event fiel in den GANZTAGS-Zweig — die echte Report-Zeit
+            # ging verloren, `ical_start` des Tages wurde der ABFLUG und die
+            # App riet Abflug−60 (Langstrecke real ~110 min Vorlauf). Jetzt:
+            # zeitbehaftetes Event im kanonischen LH-Marker-Format
+            # „HH:MM LT Briefing FRA" (Station-ORTSZEIT) — exakt die Form, die
+            # _corrected_briefing_start_iso (app.py) und iOS
+            # briefingTimeFromSummary bereits lesen; kein weiterer Code nötig.
+            if etype == 'briefing' and st:
+                summary = f'Briefing {frm}'.strip() if len(frm) == 3 else 'Briefing'
+                try:
+                    import app as _app   # lazy wie import_calendar_feed (kein Import-Zirkel)
+                    hhmm = _app._ics_local_hhmm_at(
+                        ev.get('startTime'), frm if len(frm) == 3 else None)
+                    if hhmm and len(frm) == 3:
+                        summary = f'{hhmm} LT Briefing {frm}'
+                except Exception:
+                    pass
+                lines += ['BEGIN:VEVENT', f'UID:{uid}',
+                          f'DTSTART:{st}', f'DTEND:{en or st}',
+                          f'SUMMARY:{summary}', 'END:VEVENT']
+                continue
             # Nicht-Flug: Marker/Standby/Hotel/Layover
             summary = None
             if cat in ('off',):
@@ -694,9 +718,12 @@ def duty_events_to_ics(resp):
                 lines += ['BEGIN:VEVENT', f'UID:{uid}',
                           f'DTSTART;VALUE=DATE:{day}', f'DTEND;VALUE=DATE:{nd}',
                           f'SUMMARY:{summary}', 'END:VEVENT']
-            elif st and en:
+            elif st:
+                # Zeitbehaftete Events OHNE endTime (FlightOps lässt endTime
+                # öfter null) behalten ihre echte Startzeit — vorher fielen
+                # sie in den Ganztags-Zweig und verloren die Uhrzeit.
                 lines += ['BEGIN:VEVENT', f'UID:{uid}',
-                          f'DTSTART:{st}', f'DTEND:{en}',
+                          f'DTSTART:{st}', f'DTEND:{en or st}',
                           f'SUMMARY:{summary}', 'END:VEVENT']
             elif day:
                 nd = _next_day(day)
