@@ -12107,7 +12107,31 @@ def _user_future_layovers(token, days_ahead=60):
     return out
 
 
+# TTL-Memo für _user_current_iata (Perf-Sweep 2026-07-24): /api/user/friends
+# rief die Funktion PRO FREUND auf; bei kaltem _store hieß das ein
+# _roster_snapshot_read (Supabase) PRO FREUND — N sequenzielle Reads machten
+# den Friends-Endpoint ~1,5 s langsam. Der heutige Roster-Ort ändert sich
+# höchstens beim Roster-Update → 10 min TTL ist ehrlich.
+_CURRENT_IATA_MEMO = {}
+_CURRENT_IATA_LOCK = _req_threading.Lock()
+_CURRENT_IATA_TTL = 600.0
+
+
 def _user_current_iata(token):
+    now = time.time()
+    with _CURRENT_IATA_LOCK:
+        hit = _CURRENT_IATA_MEMO.get(token)
+        if hit is not None and (now - hit[1]) < _CURRENT_IATA_TTL:
+            return hit[0]
+    val = _user_current_iata_uncached(token)
+    with _CURRENT_IATA_LOCK:
+        _CURRENT_IATA_MEMO[token] = (val, now)
+        if len(_CURRENT_IATA_MEMO) > 5000:   # Speicher-Deckel, praktisch nie
+            _CURRENT_IATA_MEMO.clear()
+    return val
+
+
+def _user_current_iata_uncached(token):
     """IATA des Flughafens, an dem der User HEUTE physisch ist — gleiche Quelle
     wie friends_today/Live-City (heutiger Roster-Tag, reader_facts.layover_ort).
     Anders als _user_future_layovers NICHT auf Z76 gefiltert: wer heute an einem
