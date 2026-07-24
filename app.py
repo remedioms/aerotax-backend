@@ -25674,6 +25674,53 @@ def _passport_briefings_merged(token):
                 data[k] = cur
     except Exception:
         pass
+    # FLUGBUCH-IMPORT einmischen (Kevin 2026-07-25: „Statistik berücksichtigt
+    # nur die selbst geladenen Flüge … alte Flüge aus dem Flugbuch-Import
+    # erscheinen in Statistik und Crew-Passport nicht"): importierte
+    # Karriere-Legs als synthetische Tagessätze — NUR Legs, die das Roster
+    # nicht schon trägt (Roster gewinnt bei Überlapp, gleiche Key-Semantik wie
+    # get_logbook). block_min reist mit, damit die Flugzeit-Summe historische
+    # Legs ohne route-history-Lookup ehrlich zählt.
+    try:
+        imp = _logbook_import_load(token) or {}
+        legs = imp.get('legs') or []
+        if legs:
+            existing = set()
+            for k, v in data.items():
+                if not isinstance(v, dict):
+                    continue
+                for s in (v.get('ical_sectors') or []):
+                    if isinstance(s, dict):
+                        existing.add(_logbook_leg_key(
+                            k, s.get('flight'), s.get('from'), s.get('to')))
+            for L in legs:
+                if not isinstance(L, dict):
+                    continue
+                d = (L.get('date') or '')[:10]
+                frm = (L.get('from') or '').strip().upper()
+                to = (L.get('to') or '').strip().upper()
+                if not re.match(r'^\d{4}-\d{2}-\d{2}$', d) \
+                        or len(frm) != 3 or len(to) != 3:
+                    continue
+                key = _logbook_leg_key(d, L.get('flight'), frm, to)
+                if key in existing:
+                    continue
+                existing.add(key)
+                bm = L.get('block_min')
+                sec = {'flight': (L.get('flight') or '').upper() or None,
+                       'from': frm, 'to': to,
+                       'dep_iso': L.get('dep_iso') or None,
+                       'arr_iso': L.get('arr_iso') or None,
+                       'reg': L.get('reg') or None,
+                       'type': L.get('type') or None,
+                       'block_min': bm if isinstance(bm, int) and 0 < bm < 20 * 60 else None}
+                day = data.get(d)
+                if not isinstance(day, dict):
+                    day = {}
+                    data[d] = day
+                day.setdefault('ical_sectors', []).append(sec)
+    except Exception:
+        pass
     return data
 
 
@@ -25800,7 +25847,9 @@ def _passport_stats_compute(token, rng):
             for ent in (ca, cb):
                 if ent and ent[2]:
                     countries.add(ent[2])
-            # Flugzeit: arr−dep wenn beide da und plausibel; sonst der
+            # Flugzeit: arr−dep wenn beide da und plausibel; sonst die echte
+            # Import-Blockzeit (Flugbuch-Legs, Kevin 2026-07-25 — spart bei
+            # 1000+ Karriere-Legs auch das route-history-Budget); sonst der
             # route-history-Median; sonst fällt das Leg aus der Zeit-Summe.
             dep = _parse_iso(s.get('dep_iso'))
             arr = _parse_iso(s.get('arr_iso'))
@@ -25811,6 +25860,10 @@ def _passport_stats_compute(token, rng):
                     delta += 24 * 60   # Mitternachts-Wrap (naive iCal-Zeiten)
                 if 0 < delta < 20 * 60:
                     mins = delta
+            if mins is None:
+                bm = s.get('block_min')
+                if isinstance(bm, (int, float)) and 0 < bm < 20 * 60:
+                    mins = float(bm)
             if mins is None:
                 mins = _passport_route_duration_min(frm, to, dur_budget)
             if mins is not None:

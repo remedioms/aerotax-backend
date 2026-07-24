@@ -58,6 +58,9 @@ def synth_days(monkeypatch):
     }
     monkeypatch.setattr(A, "_manual_briefings_load", lambda t: days)
     monkeypatch.setattr(A, "_ical_briefings_load", lambda t: {})
+    # Flugbuch-Import default leer (deterministisch; einzelne Tests
+    # überschreiben das gezielt).
+    monkeypatch.setattr(A, "_logbook_import_load", lambda t: {})
     # route-history-Fallback deterministisch: JFK→FRA kennt 430 min.
     monkeypatch.setattr(
         A, "_passport_route_duration_min",
@@ -144,9 +147,32 @@ def test_compute_missing_arr_without_fallback_drops_minutes(synth_days, monkeypa
     assert p["legs_without_duration"] == 1
 
 
+def test_compute_includes_logbook_import(synth_days, monkeypatch):
+    """Kevin 2026-07-25: importierte Karriere-Legs (ax_logbook_import) zählen
+    in Passport/Statistik — Überlapp mit Roster-Legs zählt NICHT doppelt,
+    block_min speist die Zeit-Summe ohne route-history-Lookup."""
+    monkeypatch.setattr(A, "_logbook_import_load", lambda t: {"legs": [
+        # Historischer Karriere-Leg (weit vor App-Nutzung).
+        {"date": "2019-05-10", "flight": "LH500", "from": "FRA", "to": "GIG",
+         "reg": "D-ABYT", "type": "B747", "block_min": 690},
+        # Überlapp mit Roster-Leg 2026-07-01 LH400 FRA-JFK → Roster gewinnt.
+        {"date": "2026-07-01", "flight": "LH400", "from": "FRA", "to": "JFK",
+         "block_min": 999},
+        # Kaputter Eintrag → still ignoriert.
+        {"date": "kein-datum", "flight": "XX1", "from": "AAA", "to": "BBB"},
+    ]})
+    p = A._passport_stats_compute(TOKEN, "all")
+    assert p["flights"] == 6                      # 5 Roster + 1 Import (Dedupe!)
+    assert "2019" in p["years"]
+    assert p["first_date"] == "2019-05-10"
+    # Import-Blockzeit zählt; der Überlapp-Leg behält die Roster-510 (nicht 999).
+    assert p["minutes_flown"] == 510 + 430 + 645 + 500 + 115 + 690
+
+
 def test_compute_empty_state(monkeypatch):
     monkeypatch.setattr(A, "_manual_briefings_load", lambda t: {})
     monkeypatch.setattr(A, "_ical_briefings_load", lambda t: {})
+    monkeypatch.setattr(A, "_logbook_import_load", lambda t: {})
     p = A._passport_stats_compute(TOKEN, "all")
     assert p["has_data"] is False
     assert p["flights"] == 0 and p["routes"] == [] and p["years"] == []
