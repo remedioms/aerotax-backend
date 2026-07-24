@@ -62,8 +62,18 @@ _tok_exp = 0.0
 # Aggregat-Obergrenze mit Marge.
 _rate_lock = threading.Lock()
 _last_call_ts = 0.0
-_MIN_INTERVAL = 0.22            # ≈ 4,5 Calls/sec, unter dem 5/sec-Limit
+# QPS-LEHRE (Owner 2026-07-24 „warum immer über dem Limit?"): auch das
+# 5/sec-Limit gilt PRO KEY, dieser Throttle aber PRO PROZESS. 0.22s pro
+# Prozess erlaubte mit 4 rufenden Prozessen (3 Gunicorn-Worker + Poll)
+# ~18 Calls/sec Aggregat-Bursts → „Developer Over Rate"-403-Salven, obwohl
+# die Stunden-Quote längst passte (61 Calls/h und trotzdem 40× 403).
+# 0.9s ≈ 1,1/sec pro Prozess → ≤ ~4,4/sec Aggregat mit Marge.
+_MIN_INTERVAL = 0.9
 _HOUR_BUDGET = 220             # PRO PROZESS (s.o.) — Aggregat < 1.000/h
+# 403-Cool-down: meldet LH „Over Rate", kurz komplett aussetzen (Fallback-
+# Tiers übernehmen), statt weitere Budget-Slots in die 403-Wand zu feuern.
+_rate_penalty_until = 0.0
+_RATE_PENALTY_SEC = 60.0
 _hour_window = 0               # aktuelle Stunde (epoch // 3600)
 _hour_count = 0
 _budget_warned_hour = -1
@@ -140,6 +150,8 @@ def _budget_ok():
     Vordermanns. Jetzt: Slot unterm Lock reservieren, schlafen DANACH."""
     global _last_call_ts, _hour_window, _hour_count, _budget_warned_hour
     now = time.time()
+    if now < _rate_penalty_until:
+        return False               # Over-Rate-Cool-down aktiv → Fallback-Tiers
     hour = int(now // 3600)
     wait = 0.0
     with _rate_lock:
@@ -176,6 +188,11 @@ def _get(path):
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
+        if e.code == 403:
+            # „Developer Over Rate": kurzer Voll-Stopp statt 403-Salve —
+            # jeder weitere Call verbrennt nur Budget gegen dieselbe Wand.
+            global _rate_penalty_until
+            _rate_penalty_until = time.time() + _RATE_PENALTY_SEC
         if e.code not in (404,):     # 404 = Flug an dem Tag nicht geflogen (normal)
             log.warning('[lh_open] GET %s -> HTTP %s', path.split('?')[0], e.code)
         return None
