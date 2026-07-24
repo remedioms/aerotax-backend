@@ -17657,7 +17657,9 @@ def get_logbook(token):
         if not isinstance(s_, dict) or not s_.get('date'):
             continue
         dm = s_.get('duration_min')
-        dm = dm if isinstance(dm, int) and 0 < dm < 24 * 60 else None
+        # <= 24h: OffBlock-Exporte tragen Sammel-Sim-Überträge als exakt
+        # 24:00-Session (Sünje-Import) — die wäre mit < sonst „—".
+        dm = dm if isinstance(dm, int) and 0 < dm <= 24 * 60 else None
         sim_sessions.append({
             'date': str(s_.get('date'))[:10],
             'place': s_.get('place') or None,
