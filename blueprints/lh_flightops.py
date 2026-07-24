@@ -262,18 +262,57 @@ def _notify_relogin(user_token):
         log.warning('[lh_flightops] relogin push fail: %s', type(e).__name__)
 
 
+# Pro-User-Refresh-Lock (in-process): serialisiert parallele Refreshes
+# INNERHALB eines Containers (gunicorn-Threads). Cross-Container (Backend vs.
+# Poll-Cron, KEIN shared Volume — Stand teilt nur der SB-Profil-Mirror) schützt
+# zusätzlich der CAS-/Grace-Pfad in _valid_access.
+_user_refresh_locks = {}
+_user_refresh_locks_guard = threading.Lock()
+
+
+def _user_refresh_lock(user_token):
+    with _user_refresh_locks_guard:
+        lk = _user_refresh_locks.get(user_token)
+        if lk is None:
+            lk = threading.Lock()
+            _user_refresh_locks[user_token] = lk
+        return lk
+
+
 def _valid_access(user_token):
     """Gültigen Access-Token holen (Auto-Refresh). None wenn nicht verbunden.
     Refresh-Fehler werden DIFFERENZIERT: nur ein toter Grant (invalid_grant/
     invalid_client) markiert needs_relogin (+ einmaliger Push); transiente
     Fehler (Wartung/Rate-Limit/Netz) lassen die Tokens unangetastet — der
-    nächste Versuch refresht normal weiter."""
+    nächste Versuch refresht normal weiter.
+
+    RACE-HÄRTUNG (Miguels Grant nachts verloren, 2026-07-24 03:01Z): LH
+    rotiert den Refresh-Token bei JEDEM Refresh. Laufen zwei Refreshes
+    parallel (Backend-Request vs. Poll-Cron im ANDEREN Container), gewinnt
+    einer die Rotation, der Verlierer bekommt fatal invalid_token — und
+    ÜBERSCHRIEB vorher im Flag-Pfad den frischen Stand des Gewinners mit
+    needs_relogin + verbranntem Refresh → Grant endgültig tot, User muss neu
+    einloggen. Jetzt: (1) in-process Lock + Doppel-Check, (2) im Fatal-Pfad
+    GRACE-RELOAD (kurz warten, dann SB-Stand neu laden) — nur wenn der
+    persistierte Refresh noch UNSER verbrannter ist, wird geflaggt; und
+    geflaggt wird auf dem FRISCH geladenen Stand, nie ein alter Dict-Snapshot
+    zurückgeschrieben."""
     t = _tokens_load(user_token)
     if not t.get('access') or t.get('needs_relogin'):
         return None
     if time.time() < (t.get('expires_at') or 0):
         return t['access']
-    if t.get('refresh'):
+    if not t.get('refresh'):
+        return None
+    with _user_refresh_lock(user_token):
+        # Doppel-Check im Lock: ein paralleler Thread kann eben rotiert haben
+        # → dessen frische Tokens nutzen statt den verbrannten nochmal zu
+        # verheizen.
+        t = _tokens_load(user_token)
+        if t.get('needs_relogin') or not t.get('refresh'):
+            return None
+        if t.get('access') and time.time() < (t.get('expires_at') or 0):
+            return t['access']
         nt, err = _refresh(t['refresh'])
         if nt:
             # Rotiert der Server den Refresh-Token, den NEUEN persistieren;
@@ -282,22 +321,31 @@ def _valid_access(user_token):
             _tokens_save(user_token, nt)
             return nt['access']
         if err and err.get('fatal'):
-            # ROTATIONS-RACE-GUARD (empirisch 2026-07-23: LH rotiert den
-            # Refresh-Token bei JEDEM Refresh): hat ein PARALLELER Refresh
-            # (Cron vs. get_briefings) zwischen unserem Load und diesem Call
-            # schon rotiert, ist UNSER Token nur stale — der Grant lebt. Dann
-            # NICHT flaggen/pushen, sondern den frischen Stand nutzen.
+            # GRACE-RELOAD: der Save des parallelen Gewinners (anderer
+            # Container) kann noch in-flight sein — kurz warten, dann den
+            # durablen Stand neu laden. Refresh dort schon ein ANDERER
+            # → wir waren nur der Race-Verlierer, Grant lebt: nichts flaggen.
+            time.sleep(_FATAL_GRACE_SEC)
             cur = _tokens_load(user_token)
             if (cur.get('refresh') or '') != (t.get('refresh') or ''):
                 if cur.get('access') and time.time() < (cur.get('expires_at') or 0):
                     return cur['access']
                 return None
-            t['needs_relogin'] = True
-            t['relogin_at'] = time.time()
-            t.pop('access', None)
-            _tokens_save(user_token, t)
+            # Wirklich toter Grant: auf dem FRISCHEN Stand flaggen (nie den
+            # alten Snapshot zurückschreiben — der könnte inzwischen Neueres
+            # überschreiben).
+            cur['needs_relogin'] = True
+            cur['relogin_at'] = time.time()
+            cur.pop('access', None)
+            _tokens_save(user_token, cur)
             _notify_relogin(user_token)
     return None
+
+
+# Wartezeit vor dem endgültigen Toter-Grant-Flag (Fatal-Pfad) — gibt dem
+# parallelen Race-Gewinner Zeit, seine rotierten Tokens zu persistieren.
+# Modul-Konstante, damit Tests sie auf 0 patchen können.
+_FATAL_GRACE_SEC = 2.0
 
 
 def flightops_connected(user_token):

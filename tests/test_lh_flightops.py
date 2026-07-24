@@ -305,6 +305,7 @@ def test_token_request_classifies_fatal_vs_transient(monkeypatch):
 def test_refresh_fatal_marks_relogin_and_pushes_once(monkeypatch):
     import time as _t
     saved = {}
+    monkeypatch.setattr(fo, '_FATAL_GRACE_SEC', 0)   # kein echtes Warten im Test
     monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
         'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10})
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saved.update(t) or True)
@@ -321,6 +322,30 @@ def test_refresh_fatal_marks_relogin_and_pushes_once(monkeypatch):
         AssertionError('toter Grant darf nicht weiter refreshen')))
     assert fo.flightops_connected('AT-U') is False
     assert fo._valid_access('AT-U') is None
+
+
+def test_refresh_fatal_race_loser_does_not_kill_winner(monkeypatch):
+    """Cross-Container-Rotations-Race (Miguels Grant 2026-07-24 03:01Z tot):
+    LH rotiert den Refresh-Token bei JEDEM Refresh. Unser Refresh mit 'R'
+    schlägt fatal fehl (der PARALLELE Gewinner — Poll-Cron im anderen
+    Container — hat 'R' schon verbraucht und R2/NEW persistiert). Der
+    Verlierer darf dann: NICHT flaggen, NICHT pushen, den Gewinner-Stand
+    NIE überschreiben — und liefert dessen frischen Access weiter."""
+    import time as _t
+    monkeypatch.setattr(fo, '_FATAL_GRACE_SEC', 0)
+    states = [
+        {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10},   # vor Lock
+        {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10},   # im Lock
+        {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999}, # Grace-Reload
+    ]
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok: states.pop(0))
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('Race-Verlierer darf den Gewinner-Stand nicht überschreiben')))
+    monkeypatch.setattr(fo, '_refresh', lambda r: (
+        None, {'http': 401, 'oauth': 'invalid_token', 'fatal': True}))
+    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
+        AssertionError('Race-Verlierer darf keinen Re-Login-Push senden')))
+    assert fo._valid_access('AT-U') == 'NEW'
 
 
 def test_refresh_transient_keeps_tokens(monkeypatch):
