@@ -18795,6 +18795,9 @@ def take_roster_snapshot(token):
             #      nichts mehr zu entscheiden → still.
             #   2) Pickup-Abbau: LH entfernt die PU-Zeit nach der Tour aus
             #      MyTime (reine Hygiene) → still, solange sonst nichts anders.
+            #   3) Blockzeiten-Drift (Florian 2026-07-24): gleiche Legs, gleiche
+            #      PU, gleicher erster Abflug, gleiches Briefing — nur Minuten-
+            #      Pflege an End-/Zwischenzeiten → still.
             _now_hhmm = None
             try:
                 _now_hhmm = (_airport_local_now(_hb).strftime('%H:%M')
@@ -18803,7 +18806,8 @@ def take_roster_snapshot(token):
                 _now_hhmm = datetime.now().strftime('%H:%M')
             push_diff = [c for c in diff
                          if not _roster_change_is_past(c, _today_ymd, _now_hhmm)
-                         and not _roster_change_is_pickup_prune(c)]
+                         and not _roster_change_is_pickup_prune(c)
+                         and not _roster_change_is_blocktime_drift(c)]
             n = len(push_diff)
             # PUSH-INHALT: konkrete erste Änderung („Di 22.07.: LH440 FRA-IAH
             # neu" / „Mo 21.07.: Briefing 09:40 → 10:15") + „(+N weitere)".
@@ -18910,6 +18914,73 @@ def _rc_sector_fingerprint(day):
                         str(s.get('dep_iso') or ''),
                         str(s.get('arr_iso') or '')))
     return out
+
+
+def _rc_sector_structure(day):
+    """Struktur-Fingerprint der Flüge OHNE Zeiten (Flugnummer + Stationen) —
+    fürs Blockzeiten-Drift-Gate: gleiche Legs, nur Zeiten gedriftet."""
+    out = []
+    for s in ((day or {}).get('ical_sectors') or []):
+        if isinstance(s, dict):
+            out.append((str(s.get('flight') or '').replace(' ', '').upper(),
+                        str(s.get('from') or '').upper(),
+                        str(s.get('to') or '').upper()))
+    return out
+
+
+def _rc_first_dep_local_hhmm(day):
+    """Station-lokale Abflugzeit („HH:MM") des ERSTEN Flug-Sektors eines
+    Roster-Tags, '' wenn nicht auflösbar. Wirft nie."""
+    try:
+        for s in ((day or {}).get('ical_sectors') or []):
+            if isinstance(s, dict) and str(s.get('dep_iso') or '').strip():
+                return _rc_local_hhmm(s.get('dep_iso'), s.get('from'))
+    except Exception:
+        pass
+    return ''
+
+
+def _roster_change_is_blocktime_drift(change):
+    """BLOCKZEITEN-RAUSCHEN-GATE (Florian 2026-07-24: „Derzeit wird jede
+    Änderung von MyTime angezeigt … auch wenn die Blockzeiten aktualisiert
+    werden. Nur wenn sich die PU-Zeit oder die Abflugzeit vom ersten Flug des
+    Tages ändert, liegen definitiv Änderungen vor"): True für einen
+    'modified'-Change, bei dem NUR Zeiten im Tagesverlauf gedriftet sind
+    (LH-Blockzeiten-/Ist-Zeiten-Pflege, typisch end_time/Zwischen-Leg-Minuten),
+    während alles Entscheidungsrelevante unverändert blieb:
+      · gleiche Legs (Flugnummern + Stationen, Zeiten bewusst ausgenommen),
+      · gleiche klass/Route/Layover-Ort,
+      · gleiches Briefing (start_time),
+      · gleiche Pickup-Zeit,
+      · gleicher ERSTER Abflug (station-lokal; nur wenn beidseitig auflösbar).
+    Ändert sich irgendetwas davon → False (Push bleibt). Nur der Push wird
+    gefiltert — die in-App-Liste zeigt weiterhin ALLE Changes. Wirft nie."""
+    try:
+        if (change or {}).get('kind') != 'modified':
+            return False
+        a = change.get('old') if isinstance(change.get('old'), dict) else {}
+        b = change.get('new') if isinstance(change.get('new'), dict) else {}
+        sa, sb = _rc_sector_structure(a), _rc_sector_structure(b)
+        if not sa or sa != sb:
+            return False          # Legs geändert / keine Legs → kein Drift-Fall
+        if _rc_norm_cmp(a.get('klass')) != _rc_norm_cmp(b.get('klass')):
+            return False
+        arf = (a.get('reader_facts') or {})
+        brf = (b.get('reader_facts') or {})
+        for af, bf in ((a.get('routing'), b.get('routing')),
+                       (arf.get('layover_ort'), brf.get('layover_ort')),
+                       (arf.get('start_time'), brf.get('start_time'))):
+            if _rc_field_changed(af, bf):
+                return False      # Route/Layover/Briefing geändert → echt
+        if _rc_pickup_hhmm(a) != _rc_pickup_hhmm(b):
+            return False          # PU neu/geändert/weg → echt (Wegfall deckt
+                                  # separat das Pickup-Prune-Gate ab)
+        da, db = _rc_first_dep_local_hhmm(a), _rc_first_dep_local_hhmm(b)
+        if da and db and da != db:
+            return False          # erster Abflug geändert → definitiv echt
+        return True               # übrig: reine Blockzeiten-/Endzeit-Pflege
+    except Exception:
+        return False
 
 
 def _roster_change_is_past(change, today_ymd, now_hhmm=None):
@@ -21996,13 +22067,29 @@ def add_comment(token, post_id):
             _tp = next((p for p in (_wall_load_posts_from_disk() or [])
                         if p.get('id') == post_id), None)
         post_author = (_tp or {}).get('author_token')
+        commenter_name = name or 'Crew'
         if post_author and post_author != token:
-            commenter_name = name or 'Crew'
             _push_notify_async(post_author,
                                f'{commenter_name} hat kommentiert',
                                (text or '')[:120],
                                data={'type': 'wall_comment', 'post_id': post_id},
                                idempotency_key=f'wall-comment:{c.get("id")}:{post_author}')
+        # ANTWORT AUF EINEN KOMMENTAR (Florian 2026-07-24, gleiches Loch wie im
+        # Forum): der Autor des parent-Kommentars bekam von Antworten auf SEINEN
+        # Kommentar keinen Push — nur der Post-Autor. Der `comments`-Stream ist
+        # hier schon geladen; dedupt gegen self + Post-Autor. Payload-type bleibt
+        # 'wall_comment' (alle Builds routen den Tap damit zum Post).
+        if parent_comment_id:
+            parent = next((p for p in comments
+                           if p.get('id') == parent_comment_id), None)
+            parent_author = (parent or {}).get('author_token')
+            if (parent_author and parent_author != token
+                    and parent_author != post_author):
+                _push_notify_async(parent_author,
+                                   f'{commenter_name} hat auf deinen Kommentar geantwortet',
+                                   (text or '')[:120],
+                                   data={'type': 'wall_comment', 'post_id': post_id},
+                                   idempotency_key=f'wall-comment-parent:{c.get("id")}:{parent_author}')
     except Exception:
         pass
     return jsonify({'ok': True, 'comment': response_c})
@@ -23322,6 +23409,27 @@ def forum_create_reply(token, thread_id):
                                data={'type': 'forum_mention', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or '')},
                                idempotency_key=(
                                    f'forum-mention:{reply.get("id")}:{mentioned_token}'))
+        # ANTWORT AUF EINEN KOMMENTAR (Florian 2026-07-24: „Auf meinen weiteren
+        # Kommentar hast Du nicht geantwortet … [keine] Benachrichtigung"):
+        # bisher wurde NUR der Thread-Autor gepusht — der Autor des parent-Reply
+        # erfuhr von Antworten auf SEINEN Kommentar nichts. Jetzt zusätzlich den
+        # parent-Reply-Autor benachrichtigen (dedupt gegen self/Thread-Autor/
+        # Mention, damit niemand doppelt gepusht wird).
+        if parent_reply_id:
+            parent = _forum_reply_sb_get(parent_reply_id)
+            if parent is None:
+                parent = next((r for r in (_forum_replies_load_from_disk(thread_id) or [])
+                               if r.get('id') == parent_reply_id), None)
+            parent_author = (parent or {}).get('author_token')
+            if (parent_author and parent_author != token
+                    and parent_author != thread_author_token
+                    and parent_author != mentioned_token):
+                _push_notify_async(parent_author,
+                                   f'{author_name} hat auf deinen Kommentar geantwortet',
+                                   (text or '')[:120],
+                                   data={'type': 'forum_reply', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or '')},
+                                   idempotency_key=(
+                                       f'forum-reply-parent:{reply.get("id")}:{parent_author}'))
     except Exception:
         pass
     return jsonify({'ok': True, 'reply': response_reply})
@@ -25010,6 +25118,11 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 _AIRPORT_RAIL_SNAP = [
     (50.05130, 8.57175, 'Frankfurt Flughafen Regionalbahnhof'),   # FRA — OSM-verifiziert
     (48.35377, 11.78613, 'München Flughafen Terminal (S1/S8)'),   # MUC — OSM-verifiziert
+    # MUC-Basis (Florian 2026-07-24): das FOC liegt am S-Bahn-Halt „Besucherpark",
+    # EINE Station VOR dem Terminal. iOS sendet für MUC-Crews jetzt die
+    # Besucherpark-Koordinate als Ziel — der nächste Snap ist damit diese Station
+    # (Terminal-Ziele anderer Nutzer snappen weiter aufs Terminal, nearest wins).
+    (48.35213, 11.76419, 'München Flughafen Besucherpark'),       # MUC FOC — OSM-verifiziert
 ]
 _AIRPORT_RAIL_SNAP_KM = 3.0
 
