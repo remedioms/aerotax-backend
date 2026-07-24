@@ -376,6 +376,70 @@ def test_refresh_rotation_persists_new_keeps_old(monkeypatch):
     assert saved['refresh'] == 'R1'      # keine Rotation → bewährter bleibt
 
 
+def test_crewlist_serves_cache_when_grant_dead(monkeypatch):
+    """Last-Good-Cache (Owner 2026-07-24): toter Grant → letzte Liste mit
+    cached:true statt 401 — die Crew-Fläche ist nie leer."""
+    monkeypatch.setattr(fo, '_valid_access', lambda tok: None)
+    monkeypatch.setattr(fo, '_crew_cache_get', lambda tok, f, d: {
+        'flight': 'LH582', 'date': '2026-07-26',
+        'crew': [{'name': 'MUSTERMANN, MAX', 'pk': '1', 'category': 'CPT'}],
+        'cached_at': 1234.0})
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/testtok-fo',
+                                       json={'flight': 'LH582', 'date': '2026-07-26'})
+    d = r.get_json()
+    assert r.status_code == 200 and d['ok'] is True
+    assert d['cached'] is True and d['crew'][0]['name'] == 'MUSTERMANN, MAX'
+
+
+def test_crewlist_dead_grant_without_cache_stays_401(monkeypatch):
+    monkeypatch.setattr(fo, '_valid_access', lambda tok: None)
+    monkeypatch.setattr(fo, '_crew_cache_get', lambda tok, f, d: None)
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/testtok-fo',
+                                       json={'flight': 'LH582', 'date': '2026-07-26'})
+    assert r.status_code == 401
+    assert r.get_json()['error'] == 'not_connected'
+
+
+def test_crewlist_success_populates_cache(monkeypatch):
+    monkeypatch.setattr(fo, '_valid_access', lambda tok: 'ACC')
+    monkeypatch.setattr(fo, '_resolve_link_params', lambda *a, **k: {
+        'accessCode': 'SECRET42', 'departureAirport': 'FRA',
+        'arrivalAirport': 'CAI'})
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: {'crewMembers': []})
+    monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [
+        {'name': 'MUSTERMANN, MAX', 'pk': '1', 'category': 'CPT'}])
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda crew: {})
+    put = {}
+    monkeypatch.setattr(fo, '_crew_cache_put',
+                        lambda tok, f, d, crew: put.update(
+                            {'flight': f, 'date': d, 'n': len(crew)}))
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/testtok-fo',
+                                       json={'flight': 'LH582', 'date': '2026-07-26'})
+    assert r.status_code == 200 and r.get_json()['ok'] is True
+    assert put == {'flight': 'LH582', 'date': '2026-07-26', 'n': 1}
+
+
+def test_crew_cache_put_get_lru(monkeypatch):
+    """Cache-Helper direkt: Put/Get über den Profil-Mirror + LRU-Kappung."""
+    store = {}
+    import app as backend
+    monkeypatch.setattr(backend, '_profile_load',
+                        lambda tok: {'profile': dict(store)})
+    monkeypatch.setattr(backend, '_profile_save',
+                        lambda tok, prof: store.update(prof) or True)
+    for i in range(fo._CREW_CACHE_MAX + 3):
+        fo._crew_cache_put('AT-U', f'LH{i}', '2026-07-26',
+                           [{'name': f'N{i}'}])
+    lst = store['flightops_crew_cache']
+    assert len(lst) == fo._CREW_CACHE_MAX          # LRU-gekappt
+    assert fo._crew_cache_get('AT-U', 'LH0', '2026-07-26') is None  # rausgealtert
+    hit = fo._crew_cache_get('AT-U', f'LH{fo._CREW_CACHE_MAX + 2}', '2026-07-26')
+    assert hit and hit['crew'][0]['name'] == f'N{fo._CREW_CACHE_MAX + 2}'
+
+
 def test_status_reports_needs_relogin(monkeypatch):
     monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
         'refresh': 'R', 'needs_relogin': True, 'scope': 's'})

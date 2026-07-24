@@ -1191,17 +1191,68 @@ def flightops_raw(token):
                     'response': service_get(token, service, params)})
 
 
+# ── Crew-Listen Last-Good-Cache (Owner 2026-07-24: „Crew soll gecached
+# bleiben, damit bei totem Grant nichts Leeres dasteht") ─────────────────────
+# Durabel im Profil-Mirror (wie flightops_tokens — überlebt Redeploys, alle
+# Container sehen denselben Stand). LRU-gekappt auf die letzten Legs, damit
+# das Profil nicht wächst; ein Crew-Eintrag ist klein (Name/PK/Kategorie).
+_CREW_CACHE_MAX = 8
+
+
+def _crew_cache_get(token, flight, date):
+    try:
+        import app as _app
+        prof = ((_app._profile_load(token) or {}).get('profile') or {})
+        for e in (prof.get('flightops_crew_cache') or []):
+            if (str(e.get('flight') or '') == str(flight or '')
+                    and str(e.get('date') or '')[:10] == str(date or '')[:10]):
+                return e
+    except Exception:
+        pass
+    return None
+
+
+def _crew_cache_put(token, flight, date, crew):
+    try:
+        import app as _app
+        pf = _app._profile_load(token) or {}
+        prof = (pf.get('profile') or {})
+        lst = [e for e in (prof.get('flightops_crew_cache') or [])
+               if not (str(e.get('flight') or '') == str(flight or '')
+                       and str(e.get('date') or '')[:10] == str(date or '')[:10])]
+        lst.append({'flight': flight, 'date': str(date or '')[:10],
+                    'crew': crew, 'cached_at': time.time()})
+        prof['flightops_crew_cache'] = lst[-_CREW_CACHE_MAX:]
+        _app._profile_save(token, prof)
+    except Exception as e:
+        log.warning('[lh_flightops] crew_cache_put: %s', type(e).__name__)
+
+
 @lh_flightops_bp.route('/api/lh/flightops/crewlist/<token>', methods=['POST'])
 def flightops_crewlist(token):
     """„Wer fliegt mit" für ein Leg (COMMON_CREWLIST → normalisiert). Body
     {flight, date, dep, arr, access?}. Ohne `access` wird der accessCode aus
     den Duty-Events-_links aufgelöst (Cache → Live-Nachladen des Tages) — die
-    App muss ihn also NICHT kennen. Parser gegen echte Shape verifiziert."""
-    if not _valid_access(token):
-        return jsonify({'ok': False, 'error': 'not_connected'}), 401
+    App muss ihn also NICHT kennen. Parser gegen echte Shape verifiziert.
+
+    LAST-GOOD-CACHE (Owner 2026-07-24): jede erfolgreiche Liste wird pro Leg
+    im Profil-Mirror persistiert. Ist der Grant tot (needs_relogin), der
+    accessCode nicht auflösbar oder LH down, kommt die LETZTE Liste mit
+    `cached:true` statt eines Fehlers — die Crew-Fläche ist nie leer, ein
+    Relogin fällt im Feature nicht als Loch auf."""
     b = request.get_json(silent=True) or {}
     flight, date = b.get('flight'), b.get('date')
     dep, arr = b.get('dep'), b.get('arr')
+
+    def _cached():
+        e = _crew_cache_get(token, flight, date)
+        if e and e.get('crew'):
+            return jsonify({'ok': True, 'crew': e['crew'], 'cached': True,
+                            'cached_at': e.get('cached_at')})
+        return None
+
+    if not _valid_access(token):
+        return _cached() or (jsonify({'ok': False, 'error': 'not_connected'}), 401)
     access = (b.get('access') or '').strip()
     if not access:
         p = _resolve_link_params(token, 'crewlist', flight, date, dep, arr) or {}
@@ -1210,10 +1261,10 @@ def flightops_crewlist(token):
         arr = arr or p.get('arrivalAirport')
     if not access:
         # Kein Link = Flug nicht im eigenen Roster → LH würde eh 401/403 geben.
-        return jsonify({'ok': False, 'error': 'no_access_code'}), 404
+        return _cached() or (jsonify({'ok': False, 'error': 'no_access_code'}), 404)
     resp = crew_list(token, flight, date, dep, arr, access)
     if not isinstance(resp, dict) or resp.get('processingErrors'):
-        return jsonify({'ok': False, 'error': 'crewlist_unavailable'}), 502
+        return _cached() or (jsonify({'ok': False, 'error': 'crewlist_unavailable'}), 502)
     crew = parse_crew_list(resp)
     # AeroX-Profil-Verknüpfung (Owner 2026-07-23): wer aus der Crew ist selbst
     # auf AeroX? → Avatar/Profil direkt aus der Liste öffnen.
@@ -1222,6 +1273,8 @@ def flightops_crewlist(token):
         p = matches.get(str(m.get('pk') or m.get('name') or ''))
         if p:
             m['aerox'] = p
+    if crew:
+        _crew_cache_put(token, flight, date, crew)
     return jsonify({'ok': True, 'crew': crew})
 
 
