@@ -407,6 +407,18 @@ def _claim_refresh_sb(user_token, rt):
             'p_token': user_token, 'p_refresh': rt, 'p_rt8': _rt8(rt),
             'p_ttl': _REFRESH_GUARD_SEC})
         if not ok:
+            # LAST-HÄRTUNG (25.07. abends, 33 Grants verbrannt): unter Cron-/
+            # Abend-Last kann der RPC-Call transient scheitern — der stille
+            # Soft-Guard-Fallback öffnet dann genau das Reuse-Race, das der
+            # Claim schließen soll. EINMAL kurz retryen und den Fallback
+            # SICHTBAR loggen (vorher: lautlos → im Log unauffindbar).
+            time.sleep(0.5)
+            ok, data = _app._social_rpc_call('flightops_claim_refresh', {
+                'p_token': user_token, 'p_refresh': rt, 'p_rt8': _rt8(rt),
+                'p_ttl': _REFRESH_GUARD_SEC})
+        if not ok:
+            log.warning('[lh_flightops] claim_rpc_unavailable -> soft-guard '
+                        '(Reuse-Race-Restfenster!) token=%s', user_token[:8])
             return None
         if isinstance(data, list) and data:
             data = (next(iter(data[0].values()), None)
