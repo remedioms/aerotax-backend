@@ -5591,7 +5591,13 @@ def _aircraft_live_flightid(reg, flight_no, max_age_h=20):
                            time.gmtime(time.time() - max_age_h * 3600))
     fn = (flight_no or '').strip().upper() or None
     rn = re.sub(r'[^A-Z0-9]', '', (reg or '').upper()) or None
-    for col, val in (('flight', fn), ('reg', rn)):
+    # CALLSIGN-FALLBACK (Owner 2026-07-25 „BCN-FRA gestrichelt"): einige
+    # iOS-Karten (LiveFlightMapCard/RadarAreaMapView) schicken den ICAO-
+    # Funknamen (DLH08F) als flight-Parameter — der matcht weder `flight`
+    # (IATA LH1131) noch `reg`. Die Spalte `callsign` existiert im
+    # aircraft_live-Snapshot → dritter Versuch, damit der hex-lose Tier-2-
+    # Trail (flown_trail_by_flightid) auch für diese Aufrufer greift.
+    for col, val in (('flight', fn), ('reg', rn), ('callsign', fn)):
         if not val:
             continue
         try:

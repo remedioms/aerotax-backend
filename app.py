@@ -13260,9 +13260,29 @@ def get_friend_roster(token, friend_token):
             # Homebase des Freundes (lazy, 10-min-Memo) — für den Same-Day-
             # Turnaround-Guard von _feed_nightstop_ort im Fallback-Pfad.
             _fb_hb = _profile_homebase_cached(friend_token) or None
+            # TZ-FIX (Owner 2026-07-25 „Freunde-Kalender Take-off/Landezeiten
+            # falsch"): der alte Regex-Slice T(\d{2}:\d{2}) gab ROHES UTC als
+            # Wanduhr aus (05:35Z statt 07:35 FRA) — der Snapshot-Primärpfad
+            # liefert Homebase-LOKALE Zeiten (iOS hhmmFromISO-Kanon), der
+            # Fallback muss denselben Kontrakt erfüllen. ISO → Homebase-TZ
+            # des FREUNDES (airport_tz), Fallback Europe/Berlin.
+            from zoneinfo import ZoneInfo as _FbZI
+            try:
+                _fb_tz = _FbZI(airport_tz(_fb_hb) or 'Europe/Berlin')
+            except Exception:
+                _fb_tz = _FbZI('Europe/Berlin')
             def _hhmm(x):
-                m = re.search(r'T(\d{2}:\d{2})', str(x or ''))
-                return m.group(1) if m else None
+                s = str(x or '')
+                try:
+                    dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        # Offsetlose ical_start-Strings sind bereits UTC
+                        # (Backend schreibt +00:00) — defensiv so ankern.
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt.astimezone(_fb_tz).strftime('%H:%M')
+                except Exception:
+                    m = re.search(r'T(\d{2}:\d{2})', s)
+                    return m.group(1) if m else None
             for datum, row in briefs.items():
                 if not isinstance(row, dict) or len(str(datum)) != 10:
                     continue
