@@ -94,10 +94,13 @@ DUTY = {
 def test_duty_events_to_ics_flight_and_markers():
     ics = fo.duty_events_to_ics(DUTY)
     assert ics is not None
-    assert 'LH400: FRA-JFK' in ics
+    # myTime-Paritaet: Flugnummer mit Space + LOCATION-Zeile (Routing-Quelle!).
+    assert 'LH 400: FRA-JFK' in ics
+    assert 'LOCATION:FRA - JFK' in ics
     assert 'DTSTART:20260501T085500Z' in ics
     assert 'DTEND:20260501T173500Z' in ics
-    assert 'Layover JFK' in ics           # hotel-Event → Layover
+    assert 'Layover [JFK]' in ics         # hotel-Event → Layover [IATA]
+    assert 'LOCATION:JFK' in ics          # ohne LOCATION kein ical_layover_ort
     assert 'Off Day' in ics               # off-Kategorie
     assert 'DTSTART;VALUE=DATE:20260505' in ics
 
@@ -111,6 +114,67 @@ def test_duty_events_to_ics_roundtrips_through_parser():
     secs = backend._build_ical_sectors(events)
     d = secs.get('2026-05-01') or []
     assert [(s['flight'], s['from'], s['to']) for s in d] == [('LH400', 'FRA', 'JFK')]
+
+
+# Tims echter KRK-Morgen (2026-07-25, „Fehler im Feed"): Live-Shape der
+# FlightOps-API — DH-Deadhead in eventDetails, Hotel-Event OHNE Zeiten
+# (wholeDay=false, endLocation null), OFFDUTY/GROUNDEVENT mit det='FREE'.
+# Ohne LOCATION-Zeilen hatte der Tag kein Routing (flownSectors=0) und iOS
+# stufte den 4-Leg-Diensttag mit Layover-Marker als reinen Ruhetag ein →
+# der Feed sprang am Layover-Morgen auf den MORGIGEN Umlauf.
+DUTY_TIM = {
+    "pkNumber": "123456A",
+    "rosterDays": [
+        {"day": "2026-07-25T00:00:00Z", "events": [
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "DH LH1623", "wholeDay": False,
+             "startTime": "2026-07-25T11:25:00Z", "startLocation": "KRK",
+             "endTime": "2026-07-25T12:50:00Z", "endLocation": "MUC"},
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH2068", "wholeDay": False,
+             "startTime": "2026-07-25T15:15:00Z", "startLocation": "MUC",
+             "endTime": "2026-07-25T16:30:00Z", "endLocation": "HAM"},
+            {"eventType": "HOTEL", "eventCategory": "hotel",
+             "eventDetails": "Hotel", "wholeDay": False,
+             "startTime": None, "endTime": None,
+             "startLocation": "BRE", "endLocation": None}]},
+        {"day": "2026-07-27T00:00:00Z", "events": [
+            {"eventType": "GROUNDEVENT", "eventCategory": "OFFDUTY",
+             "eventDetails": "FREE", "wholeDay": True,
+             "startLocation": "MUC", "endLocation": "MUC"}]},
+    ],
+}
+
+
+def test_duty_events_to_ics_deadhead_and_locations():
+    ics = fo.duty_events_to_ics(DUTY_TIM)
+    assert ics is not None
+    # Deadhead-Flag bleibt erhalten, Flugnummer im myTime-Format.
+    assert 'DH LH 1623: KRK-MUC' in ics
+    assert 'LOCATION:KRK - MUC' in ics
+    assert 'LH 2068: MUC-HAM' in ics
+    # Hotel ohne Zeiten → Datums-Event über die Nacht (Tag..Tag+2, DTEND
+    # exklusiv) mit IATA-LOCATION — Quelle für ical_layover_ort.
+    assert 'Layover [BRE]' in ics
+    assert 'LOCATION:BRE' in ics
+    assert 'DTEND;VALUE=DATE:20260727' in ics
+    # OFFDUTY/FREE → myTime-Prosa.
+    assert 'Off Day (FREE)' in ics
+
+
+def test_duty_events_to_ics_day_gets_routing_and_layover_ort():
+    """Durch die echte Import-Pipeline: der Diensttag bekommt LOCATION-Routing
+    (flownSectors-Quelle im Client) und den Layover-Ort aus dem Hotel-Event."""
+    import app as backend
+    ics = fo.duty_events_to_ics(DUTY_TIM)
+    events = backend._parse_ics_to_events(ics)
+    briefings, _ = backend._ics_events_to_briefings(events)
+    b = briefings.get('2026-07-25') or {}
+    loc = (b.get('ical_location') or '')
+    assert 'KRK - MUC' in loc and 'MUC - HAM' in loc
+    assert (b.get('ical_layover_ort') or '') == 'BRE'
+    # Layover-Marker reist im Summary mit (Übernachtungs-Spanne Tag 1/2).
+    assert 'Layover [BRE]' in (b.get('ical_summary') or '')
 
 
 def test_duty_events_to_ics_empty():
@@ -306,7 +370,7 @@ def test_duty_events_to_ics_single_day_scalar_shape():
                    'startTime': '2026-05-01T08:55:00Z', 'startLocation': 'FRA',
                    'endTime': '2026-05-01T17:35:00Z', 'endLocation': 'JFK'}}}
     ics = fo.duty_events_to_ics(resp)
-    assert ics and 'LH400: FRA-JFK' in ics
+    assert ics and 'LH 400: FRA-JFK' in ics
 
 
 def test_parsers_single_element_scalar_shape():

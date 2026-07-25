@@ -738,10 +738,21 @@ def duty_events_to_ics(resp):
                 import re as _re
                 m = _re.search(r'\b([A-Z]{2}|\d[A-Z])\s?\d{1,4}[A-Z]?\b', det.upper())
                 flt = (m.group(0).replace(' ', '') if m else '').strip()
-                summary = (f'{flt}: {frm}-{to}' if flt else f'{frm}-{to}')
+                # myTime-PARITAET (Tim/KRK 2026-07-25): Feed-Import und iOS kennen
+                # die myTime-VEVENT-Form — 'DH LH 1623: KRK-MUC' + LOCATION
+                # 'KRK - MUC'. Ohne LOCATION bekam der Tag kein Routing
+                # (flownSectors=0) und iOS stufte einen 4-Leg-Diensttag mit
+                # Layover-Nacht als reinen Ruhetag ein → der Feed sprang am
+                # Layover-Morgen auf den MORGIGEN Umlauf. Deadhead-Flag steht in
+                # eventDetails ('DH LH1623') und darf nicht verworfen werden.
+                flt_disp = _re.sub(r'^([A-Z]{2}|\d[A-Z])(?=\d)', r'\g<1> ', flt)
+                is_dh = det.upper().strip().startswith('DH ')
+                summary = ((f'DH {flt_disp}' if is_dh else flt_disp) + f': {frm}-{to}'
+                           if flt else f'{frm}-{to}')
                 lines += ['BEGIN:VEVENT', f'UID:{uid}',
                           f'DTSTART:{st}', f'DTEND:{en}',
-                          f'SUMMARY:{summary}', 'END:VEVENT']
+                          f'SUMMARY:{summary}',
+                          f'LOCATION:{frm} - {to}', 'END:VEVENT']
                 continue
             # BRIEFING (Miguel/Thomas 2026-07-24 „falsche Briefing-Zeiten seit
             # dem Update"): FlightOps liefert Briefings MIT startTime, aber
@@ -769,38 +780,63 @@ def duty_events_to_ics(resp):
                 continue
             # Nicht-Flug: Marker/Standby/Hotel/Layover
             summary = None
-            if cat in ('off',):
-                summary = 'Off Day'
+            loc_line = None
+            if cat in ('off', 'offduty'):
+                # myTime-Paritaet: 'Off Day (FREE)' / 'Off Day (ORTSTAG)' statt
+                # nacktem Code — iOS-Klassifikation kennt beide, aber die App
+                # zeigt den Marker 1:1 (live kommt cat='OFFDUTY', det='FREE').
+                summary = f'Off Day ({det})' if det else 'Off Day'
             elif cat in ('vac',):
                 summary = 'Urlaub'
             elif cat in ('res', 'frs'):
                 summary = f'Standby {frm}' if len(frm) == 3 else 'Standby'
             elif etype == 'hotel' or cat == 'hotel':
-                summary = f'Layover {to or frm}'
+                # myTime-Paritaet (Tim/KRK 2026-07-25): 'Layover [BRE]' + die
+                # IATA als LOCATION — NUR mit LOCATION setzt der Feed-Import
+                # `ical_layover_ort` (Nightstop/Hotel-Karten/isHomebaseNight).
+                # Live trägt das Hotel-Event die Stadt in startLocation,
+                # endLocation ist null.
+                _hiata = (to or frm)
+                summary = f'Layover [{_hiata}]' if len(_hiata) == 3 else 'Layover'
+                if len(_hiata) == 3:
+                    loc_line = f'LOCATION:{_hiata}'
             elif cat in ('sim',):
                 summary = 'Simulator'
             elif cat in ('abs', 'lic', 'duty') or etype in ('briefing', 'groundevent'):
                 summary = det or cat.upper() or 'Duty'
             else:
                 summary = det or cat.upper() or 'Event'
+            if loc_line is None and len(frm) == 3:
+                # Boden-/Marker-Events tragen ihre Station (myTime: Off Day @MUC).
+                loc_line = f'LOCATION:{frm}'
             day = (d.get('day') or '')[:10].replace('-', '')
+            is_hotel = (etype == 'hotel' or cat == 'hotel')
             if ev.get('wholeDay') and day:
                 nd = _next_day(day)
                 lines += ['BEGIN:VEVENT', f'UID:{uid}',
                           f'DTSTART;VALUE=DATE:{day}', f'DTEND;VALUE=DATE:{nd}',
-                          f'SUMMARY:{summary}', 'END:VEVENT']
-            elif st:
+                          f'SUMMARY:{summary}'] \
+                    + ([loc_line] if loc_line else []) + ['END:VEVENT']
+            elif st and not is_hotel:
                 # Zeitbehaftete Events OHNE endTime (FlightOps lässt endTime
                 # öfter null) behalten ihre echte Startzeit — vorher fielen
                 # sie in den Ganztags-Zweig und verloren die Uhrzeit.
                 lines += ['BEGIN:VEVENT', f'UID:{uid}',
                           f'DTSTART:{st}', f'DTEND:{en or st}',
-                          f'SUMMARY:{summary}', 'END:VEVENT']
+                          f'SUMMARY:{summary}'] \
+                    + ([loc_line] if loc_line else []) + ['END:VEVENT']
             elif day:
-                nd = _next_day(day)
+                # Hotel-Events (Nacht am Layover-Ort) spannen wie im myTime-Feed
+                # über die Nacht in den Folgetag — so bekommt der Folge-Morgen
+                # sein 'Layover [XXX] (Tag 2/2)'-Segment und der Import kann den
+                # Nightstop dem richtigen Tag zuordnen. FlightOps liefert für
+                # Hotel-Events keine Zeiten (startTime/endTime null, wholeDay
+                # false) → Datums-Event Tag..Tag+2 (DTEND exklusiv).
+                nd = _next_day(_next_day(day)) if is_hotel else _next_day(day)
                 lines += ['BEGIN:VEVENT', f'UID:{uid}',
                           f'DTSTART;VALUE=DATE:{day}', f'DTEND;VALUE=DATE:{nd}',
-                          f'SUMMARY:{summary}', 'END:VEVENT']
+                          f'SUMMARY:{summary}'] \
+                    + ([loc_line] if loc_line else []) + ['END:VEVENT']
     lines.append('END:VCALENDAR')
     if n == 0:
         return None
