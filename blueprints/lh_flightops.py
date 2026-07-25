@@ -248,18 +248,14 @@ def _token_request(body):
 
 
 def _notify_relogin(user_token):
-    """Einmaliger Push wenn der LH-Grant endgültig tot ist (invalid_grant) —
-    der User soll EINMAL neu verbinden statt still einen stalen Roster zu
-    haben. Wirft nie; Dedupe über den needs_relogin-Flag-Übergang."""
-    try:
-        import app as _app
-        _app._send_push_notification(
-            user_token, 'Lufthansa-Verbindung abgelaufen',
-            'Bitte verbinde AeroX einmal neu mit deinem Lufthansa-Konto, '
-            'damit dein Dienstplan aktuell bleibt.',
-            data={'type': 'flightops_relogin'})
-    except Exception as e:
-        log.warning('[lh_flightops] relogin push fail: %s', type(e).__name__)
+    """KEIN Push mehr bei totem Grant (Owner 2026-07-25: „ich will nicht
+    einmal eine Push — die App wirkt sonst unzuverlässig"). Der Relogin-Weg
+    ist die „Neu verbinden"-Marken-Karte im Dienstplan-Screen (+ Mehr);
+    needs_relogin-Flag + Status-Endpoint tragen den Zustand. Funktion bleibt
+    als Hook (Tests prüfen weiterhin, dass sie im Race-/Transient-Fall NICHT
+    gerufen wird)."""
+    log.info('[lh_flightops] grant tot, relogin nötig (kein Push, Owner): %s',
+             user_token[:8])
 
 
 # Pro-User-Refresh-Lock (in-process): serialisiert parallele Refreshes
