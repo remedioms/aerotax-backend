@@ -6642,13 +6642,32 @@ _DETAIL_STALE_TTL = 20 * 60
 _DETAIL_SWR_INFLIGHT = set()
 _DETAIL_SWR_LOCK = threading.Lock()
 
+# Eigener Memo-Topf NUR fürs Detail-Aggregat (Live-Messung 2026-07-25: warm
+# 36 ms, aber 1 s später wieder 5 s kalt): _LIFECYCLE_MEMO ist der geteilte
+# 400er-Topf ALLER heißen Endpoints — unter Prod-Last (Feeds pollen dauernd)
+# wird das teuer gerechnete Aggregat binnen Sekunden verdrängt, SWR liefe ins
+# Leere. Detail-Antworten sind wenige KB → 300 Einträge sind unkritisch.
+_DETAIL_MEMO = {}
+_DETAIL_MEMO_MAX = 300
 
-def _memo_get_stale(key, max_age_s):
-    """Wie _memo_get, aber mit eigenem (längerem) Frische-Fenster."""
-    hit = _LIFECYCLE_MEMO.get(key)
+
+def _detail_memo_get(key, max_age_s):
+    hit = _DETAIL_MEMO.get(key)
     if hit and (time.time() - hit[0]) < max_age_s:
         return dict(hit[1])
     return None
+
+
+def _detail_memo_put(key, payload):
+    _DETAIL_MEMO[key] = (time.time(), dict(payload))
+    if len(_DETAIL_MEMO) > _DETAIL_MEMO_MAX:
+        try:
+            items = sorted(_DETAIL_MEMO.items(), key=lambda kv: kv[1][0])
+            for k, _v in items[:len(items) // 4 or 1]:
+                _DETAIL_MEMO.pop(k, None)
+        except Exception:
+            _DETAIL_MEMO.clear()
+    return payload
 
 
 def _detail_swr_refresh(q, is_cs, date_q):
@@ -6704,12 +6723,12 @@ def ax_flight_detail(query):
 
     memo_key = ('flight_detail', q, '1' if is_cs else '0', date_q or '')
     if not fresh:
-        cached = _memo_get(memo_key)
+        cached = _detail_memo_get(memo_key, _LIFECYCLE_TTL)
         if cached is not None:
             return jsonify(cached)
         # SWR: junger-aber-abgelaufener Stand → sofort liefern + im
         # Hintergrund frisch rechnen (s. _detail_swr_refresh oben).
-        stale_hit = _memo_get_stale(memo_key, _DETAIL_STALE_TTL)
+        stale_hit = _detail_memo_get(memo_key, _DETAIL_STALE_TTL)
         if stale_hit is not None:
             _detail_swr_refresh(q, is_cs, date_q)
             return jsonify(stale_hit)
@@ -6972,7 +6991,7 @@ def ax_flight_detail(query):
     # resolve kann leer sein (nofr24, Warehouse kalt), die lokal angereicherte
     # Route ist aber da — vorher lief so JEDER Tap komplett kalt durch.
     if resolve_flight or info or route:
-        _memo_put(memo_key, out)
+        _detail_memo_put(memo_key, out)
 
     # MEMO-NACHWÄRMEN route-history (analog _warm_times unten): lief die
     # History ins Budget-Timeout, holt ein Daemon sie fertig und patcht sie ins
@@ -6984,10 +7003,10 @@ def ax_flight_detail(query):
                 h = _route_history_windowed(app_obj, _o, _d)
                 if not h:
                     return
-                cached = _memo_get(mkey) or dict(base_out)
+                cached = _detail_memo_get(mkey, _DETAIL_STALE_TTL) or dict(base_out)
                 merged = dict(cached)
                 merged['history'] = h
-                _memo_put(mkey, merged)
+                _detail_memo_put(mkey, merged)
             except Exception:
                 pass
             finally:
@@ -7031,7 +7050,7 @@ def ax_flight_detail(query):
                     return
                 merged = dict(base_out)
                 merged['resolve'] = rflight
-                _memo_put(mkey, merged)
+                _detail_memo_put(mkey, merged)
             except Exception:
                 pass
             finally:
