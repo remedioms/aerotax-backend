@@ -28338,74 +28338,6 @@ def _email_valid(email: str) -> bool:
     return bool(_EMAIL_RX.match(email))
 
 
-def _notify_owner_new_signup(email, method='email'):
-    """Echtzeit-Benachrichtigung an den Owner bei JEDER neuen Anmeldung, inkl.
-    laufendem Gesamt-Zähler (Owner-Wunsch 2026-07-15). Läuft fire-and-forget im
-    Hintergrund-Thread → verlangsamt den Signup nicht und darf ihn NIE
-    fehlschlagen lassen (best-effort, alle Fehler geschluckt/geloggt)."""
-    def _run():
-        try:
-            api_key = os.environ.get('RESEND_API_KEY', '').strip()
-            # Persönlicher Owner-Posteingang (Echtzeit-Push aufs iPhone). Bewusst
-            # NICHT der Support-Verteiler (SUPPORT_NOTIFY_EMAIL=aerox@aerosteuer.de) —
-            # per SIGNUP_NOTIFY_EMAIL-Env übersteuerbar.
-            to_email = (os.environ.get('SIGNUP_NOTIFY_EMAIL')
-                        or 'miguel.schumann@icloud.com').strip()
-            if not api_key or not to_email:
-                app.logger.info('[signup-notify] kein RESEND_API_KEY/Empfänger — übersprungen')
-                return
-            # Laufender Gesamt-Zähler: leichtgewichtiges count=exact (keine Rows).
-            total = None
-            try:
-                if SB_AVAILABLE and sb is not None:
-                    r = sb.table('auth_users').select('token', count='exact').limit(1).execute()
-                    total = getattr(r, 'count', None)
-            except Exception:
-                total = None
-            from_addr = os.environ.get('SIGNUP_FROM_EMAIL',
-                                       'AeroX <noreply@aerosteuer.de>').strip()
-            total_str = f' #{total}' if isinstance(total, int) else ''
-            total_html = (f'<p style="font-size:22px;color:#0F1A3D;margin:12px 0">'
-                          f'<b>Gesamt: {total} Accounts</b></p>'
-                          if isinstance(total, int) else '')
-            html_body = f"""
-            <div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:20px">
-              <h2 style="color:#0F1A3D;margin:0 0 8px">Neue AeroX-Anmeldung</h2>
-              <p style="font-size:16px;color:#222;margin:4px 0"><b>{email}</b></p>
-              <p style="font-size:13px;color:#777;margin:2px 0">Methode: {method}</p>
-              {total_html}
-              <p style="color:#999;font-size:11px;margin-top:28px">
-                AeroX · automatische Echtzeit-Benachrichtigung, bitte nicht antworten.
-              </p>
-            </div>
-            """
-            import urllib.request
-            payload = json.dumps({
-                'from': from_addr,
-                'to': [to_email],
-                'subject': f'AeroX: neuer Account{total_str} · {email}',
-                'html': html_body,
-            }).encode()
-            req = urllib.request.Request(
-                'https://api.resend.com/emails',
-                data=payload,
-                headers={'Authorization': f'Bearer {api_key}',
-                         'Content-Type': 'application/json',
-                         'User-Agent': 'AeroX-Backend/1.0'})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if 200 <= resp.status < 300:
-                    app.logger.info(f'[signup-notify] mail an {to_email[:3]}*** (total={total})')
-                else:
-                    app.logger.warning(f'[signup-notify] resend status {resp.status}')
-        except Exception as e:
-            app.logger.warning(f'[signup-notify] send failed: {e}')
-    try:
-        import threading as _threading
-        _threading.Thread(target=_run, daemon=True).start()
-    except Exception as e:
-        app.logger.warning(f'[signup-notify] thread start failed: {e}')
-
-
 @app.route('/api/auth/signup', methods=['POST'])
 def auth_signup():
     # Anti-Abuse: IP-Rate-Limit gegen Massen-Account-Erstellung (Enumeration,
@@ -28446,8 +28378,9 @@ def auth_signup():
     # im before_request-Auth-Gate sichtbar ist (sonst 401 bis 60s-TTL abläuft).
     try: _invalidate_token_cache()
     except Exception: pass
-    # Echtzeit-Owner-Mail + Zähler (fire-and-forget, blockt den Signup nicht).
-    _notify_owner_new_signup(email, method='E-Mail')
+    # Owner-Benachrichtigung: seit 2026-07-25 KEINE Echtzeit-Mail mehr pro
+    # Signup (bei 60-400/Tag lief die Inbox voll) — der tägliche Digest-Cron
+    # auf dem Hetzner-Host (/opt/aerox/signup_digest_wrapper.sh) übernimmt.
     return jsonify({'ok': True, 'token': token, 'email': email})
 
 
@@ -28625,8 +28558,8 @@ def auth_apple():
     _auth_upsert_user(email, rec)
     try: _invalidate_token_cache()
     except Exception: pass
-    # Echtzeit-Owner-Mail + Zähler bei NEUEM Apple-Account (fire-and-forget).
-    _notify_owner_new_signup(email, method='Apple')
+    # Keine Echtzeit-Owner-Mail mehr pro Signup (2026-07-25) — täglicher
+    # Digest-Cron auf dem Host übernimmt, siehe auth_signup.
     # Wenn Apple einen name geliefert hat (nur beim ersten Login) · ins Profile vorbefüllen
     if name:
         try:
