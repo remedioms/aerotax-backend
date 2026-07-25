@@ -6649,12 +6649,34 @@ _DETAIL_SWR_LOCK = threading.Lock()
 # Leere. Detail-Antworten sind wenige KB → 300 Einträge sind unkritisch.
 _DETAIL_MEMO = {}
 _DETAIL_MEMO_MAX = 300
+# CROSS-WORKER-Disk-Spiegel (Prod fährt gunicorn --workers 3, Compose
+# überschreibt das Dockerfile!): drei Prozesse = drei getrennte Memos →
+# Round-Robin traf den warmen Worker nur zu 1/3 (Live-Messung 4ms/6,5s/114ms).
+# /tmp ist im Container prozess-übergreifend; ein KB-JSON-Read ist sub-ms.
+_DETAIL_DISK_DIR = '/tmp/ax_detail_cache'
+
+
+def _detail_disk_path(key):
+    h = hashlib.sha256(repr(key).encode()).hexdigest()[:24]
+    return os.path.join(_DETAIL_DISK_DIR, h + '.json')
 
 
 def _detail_memo_get(key, max_age_s):
     hit = _DETAIL_MEMO.get(key)
     if hit and (time.time() - hit[0]) < max_age_s:
         return dict(hit[1])
+    # Disk-Spiegel (anderer Worker hat gerechnet) → ins eigene Memo hydrieren.
+    try:
+        p = _detail_disk_path(key)
+        st = os.stat(p)
+        if (time.time() - st.st_mtime) < max_age_s:
+            with open(p) as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                _DETAIL_MEMO[key] = (st.st_mtime, payload)
+                return dict(payload)
+    except Exception:
+        pass
     return None
 
 
@@ -6667,6 +6689,26 @@ def _detail_memo_put(key, payload):
                 _DETAIL_MEMO.pop(k, None)
         except Exception:
             _DETAIL_MEMO.clear()
+    # Atomarer Disk-Spiegel für die anderen Worker (tmp+rename, wirft nie).
+    try:
+        os.makedirs(_DETAIL_DISK_DIR, exist_ok=True)
+        p = _detail_disk_path(key)
+        tmp = '%s.tmp%d' % (p, os.getpid())
+        with open(tmp, 'w') as f:
+            json.dump(payload, f)
+        os.replace(tmp, p)
+        names = os.listdir(_DETAIL_DISK_DIR)
+        if len(names) > 600:
+            full = sorted((os.path.join(_DETAIL_DISK_DIR, n) for n in names),
+                          key=lambda x: (os.path.getmtime(x)
+                                         if os.path.exists(x) else 0))
+            for fpath in full[:len(full) // 2]:
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+    except Exception:
+        pass
     return payload
 
 

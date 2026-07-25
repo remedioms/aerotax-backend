@@ -35531,12 +35531,22 @@ def ax_flight_info(flightno):
                 'depart', 'airborn', 'enroute', 'en route', 'land', 'arriv',
                 'abgeflogen', 'gestartet', 'gelandet', 'angekommen'))
             _past = bool(_svc and _svc < datetime.now(timezone.utc).strftime('%Y-%m-%d'))
-            if (_paid_requested and _authed and (_active or _past)
-                    and not (out.get('esti') or out.get('esti_arr'))):
+            # ABFLUG-LÜCKE (Owner 2026-07-25 „paid fr24 zusätzlich zu free
+            # fr24", LH1133 BCN→FRA): GEPLANTE Flüge, deren Abflug-Board wir
+            # nicht harvesten (BCN & Co.), haben keinerlei dep-Plan — dafür
+            # den budgetierten Paid-Tier zulassen (free-gRPC zuerst, Hard-
+            # Cache + 5-min-Drossel in _flight_times_free_first, ~1 Spend pro
+            # Flug+Tag). require_operational entfällt in diesem Fall — die
+            # SOLL-Zeit ist genau das Gesuchte.
+            _dep_gap = (not out.get('sched') and out.get('origin')
+                        and out.get('dest'))
+            _ops_case = ((_active or _past)
+                         and not (out.get('esti') or out.get('esti_arr')))
+            if _paid_requested and _authed and (_ops_case or _dep_gap):
                 from blueprints.aerox_data_blueprint import _flight_times_free_first
                 _tf = _flight_times_free_first(
                     fn, _svc, out.get('origin'), out.get('dest'),
-                    allow_paid=True, require_operational=True)
+                    allow_paid=True, require_operational=not _dep_gap)
                 for _src, _dst in (('sched_dep', 'sched'), ('est_dep', 'esti'),
                                    ('sched_arr', 'sched_arr'), ('est_arr', 'esti_arr')):
                     if _tf.get(_src) and not out.get(_dst):
