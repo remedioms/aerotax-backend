@@ -5579,6 +5579,33 @@ def _iso_to_epoch(s):
         return None
 
 
+def _aircraft_live_flightid(reg, flight_no, max_age_h=20):
+    """FR24-flightid aus `aircraft_live` (NAS-Harvester-Snapshot) — Schlüssel
+    für den hex-losen Tier-2-Trail (flown_trail_by_flightid). Nur frische
+    Snapshots (heutiger Flug); FR24 liefert den Trail per ID auch kurz nach
+    der Landung noch. Flug-Match vor Reg-Match (Aircraft-Swap-Lektion)."""
+    sb = _sb()
+    if sb is None:
+        return None
+    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                           time.gmtime(time.time() - max_age_h * 3600))
+    fn = (flight_no or '').strip().upper() or None
+    rn = re.sub(r'[^A-Z0-9]', '', (reg or '').upper()) or None
+    for col, val in (('flight', fn), ('reg', rn)):
+        if not val:
+            continue
+        try:
+            rows = (sb.table('aircraft_live').select('flightid')
+                    .eq(col, val).gt('updated_at', cutoff)
+                    .limit(1).execute()).data or []
+        except Exception:
+            rows = []
+        fid = rows[0].get('flightid') if rows else None
+        if fid:
+            return fid
+    return None
+
+
 def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso, fresh_max_s=None):
     """Tier 1: die ECHTE geflogene Spur aus der eigenen aircraft_track-Tabelle
     (Breadcrumbs vom Harvester + FR24-Rückschreibungen). Isoliert EIN Leg:
@@ -6027,11 +6054,16 @@ def ax_flown_track():
                 pos = None
             if pos and pos.get('lat') is not None:
                 t_lat, t_lon = pos.get('lat'), pos.get('lon')
-        # FR24-Detail matcht in der Praxis nur zuverlässig über den HEX (reg ohne
+        # FR24-Detail matcht über live_feed nur zuverlässig per HEX (reg ohne
         # Bindestrich / IATA-Callsign matchen die FR24-Feed-Rows oft NICHT → leer).
         # No-Match-Empties triggern zudem den Freeze-on-Empties-Limiter und legen FR24
-        # kurz ganz lahm. Darum Tier 2 NUR mit hex aufrufen (Radar-Tap liefert ihn
-        # immer); ohne hex sauber auf great_circle (LH-Group hat eh Tier-1-Crumbs).
+        # kurz ganz lahm. Darum der live_feed-Weg NUR mit hex (Radar-Tap liefert ihn
+        # immer). HEX-LOSE Aufrufer (Suche/MyPlane/Crew-Karten — Owner 2026-07-25
+        # „paar ohne strecke, andere nur gepunktet") gehen stattdessen DIREKT über
+        # die FR24-flightid aus aircraft_live (NAS-Harvester): exakter ID-Fetch,
+        # kein Match-Risiko — vorher war Tier 2 für sie komplett aus und alles
+        # fiel auf den gepunkteten Großkreis.
+        trail = None
         if q_hex and t_lat is not None and t_lon is not None:
             try:
                 from blueprints import fr24_grpc
@@ -6044,28 +6076,36 @@ def ax_flown_track():
                     callsign=flight_no, lat=t_lat, lon=t_lon)
             except Exception:
                 trail = None
-            if trail and trail.get('points'):
-                tw_reg = re.sub(r'[^A-Z0-9]', '', (trail.get('reg') or reg or '').upper())
-                _flown_track_writeback(tw_reg, trail)
-                # Ersetzen, wenn der Trail mindestens gleich gut ist — oder die
-                # eigene Spur STALE war (dann ist der frische Trail immer die
-                # bessere Wahrheit, auch wenn er kürzer ist).
-                if len(trail['points']) >= len(points) \
-                        or (tier1_stale and len(trail['points']) >= 2):
-                    source = 'fr24_trail'
-                    reg = reg or tw_reg
-                    if tier1_stale:
-                        # Route der STALE-Spur nicht durchreichen — explizite
-                        # Request-Route > Trail-Route > Segment-Ableitung.
-                        dep = req_dep or trail.get('origin') or dep
-                        arr = req_arr or trail.get('dest') or arr
-                    else:
-                        dep = dep or trail.get('origin')
-                        arr = arr or trail.get('dest')
-                    points = [{'lat': p['lat'], 'lon': p['lon'], 'alt': p.get('alt_ft'),
-                               'gs': p.get('gs_kt'), 'trk': p.get('track_deg'),
-                               'ts': p.get('ts')} for p in trail['points']]
-                    tier1_stale = False
+        if trail is None and not q_hex:
+            fid = _aircraft_live_flightid(reg or None, flight_no)
+            if fid:
+                try:
+                    from blueprints import fr24_grpc
+                    trail = fr24_grpc.flown_trail_by_flightid(fid)
+                except Exception:
+                    trail = None
+        if trail and trail.get('points'):
+            tw_reg = re.sub(r'[^A-Z0-9]', '', (trail.get('reg') or reg or '').upper())
+            _flown_track_writeback(tw_reg, trail)
+            # Ersetzen, wenn der Trail mindestens gleich gut ist — oder die
+            # eigene Spur STALE war (dann ist der frische Trail immer die
+            # bessere Wahrheit, auch wenn er kürzer ist).
+            if len(trail['points']) >= len(points) \
+                    or (tier1_stale and len(trail['points']) >= 2):
+                source = 'fr24_trail'
+                reg = reg or tw_reg
+                if tier1_stale:
+                    # Route der STALE-Spur nicht durchreichen — explizite
+                    # Request-Route > Trail-Route > Segment-Ableitung.
+                    dep = req_dep or trail.get('origin') or dep
+                    arr = req_arr or trail.get('dest') or arr
+                else:
+                    dep = dep or trail.get('origin')
+                    arr = arr or trail.get('dest')
+                points = [{'lat': p['lat'], 'lon': p['lon'], 'alt': p.get('alt_ft'),
+                           'gs': p.get('gs_kt'), 'trk': p.get('track_deg'),
+                           'ts': p.get('ts')} for p in trail['points']]
+                tier1_stale = False
 
     # Stale-Fallback-Plausibilität: konnte Tier 2 die veraltete Spur NICHT
     # ersetzen, behalten wir sie nur, wenn sie zur mitgegebenen Live-Position

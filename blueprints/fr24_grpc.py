@@ -524,6 +524,40 @@ def detail_card(callsign=None, hex=None, reg=None, lat=None, lon=None):
     return {k: v for k, v in card.items() if v is not None}
 
 
+async def _detail_by_fid_async(provider, fid):
+    """flight_details DIREKT per FR24-flightid — kein live_feed-Matching."""
+    from fr24 import FR24  # noqa: F811
+    async with _client_for(provider) as f:
+        det = await asyncio.wait_for(
+            f.flight_details.fetch(flight_id=fid), timeout=_TIMEOUT_S)
+        d = det.to_dict()
+        return {"row": {}, "detail": d} if d else None
+
+
+def flown_trail_by_flightid(fid):
+    """Trail DIREKT über die FR24-flightid (aircraft_live.flightid aus dem
+    NAS-Harvester) — funktioniert damit auch für HEX-LOSE Aufrufer (Suche/
+    MyPlane/Crew-Karten), für die das live_feed-Hex-Matching nie zuverlässig
+    war. Kein No-Match-Empty-Risiko (die ID ist exakt) → kein Futter für den
+    Freeze-on-Empties-Limiter. Gleiche Rückgabe-Shape wie flown_trail();
+    None wenn keine Spur."""
+    if not available() or not fid:
+        return None
+    if not _allow_call():
+        return None
+    for provider in _providers():
+        try:
+            td = _run(_detail_by_fid_async(provider, fid))
+        except Exception as e:
+            log.warning("fr24_grpc fid-trail provider=%s fehlgeschlagen: %s", provider, e)
+            td = None
+        if td:
+            _note_result(True)
+            return _shape_trail(td)
+    _note_result(False)
+    return None
+
+
 def flown_trail(callsign=None, hex=None, reg=None, lat=None, lon=None):
     """Die ECHTE jüngste geflogene Spur eines Flugs aus FR24-`flight_details`
     (`flight_trail_list`) — Punkte lat/lon/alt/gs/track/ts. Für /api/ax/flown-track
@@ -534,6 +568,12 @@ def flown_trail(callsign=None, hex=None, reg=None, lat=None, lon=None):
     td = tap_detail(callsign=callsign, hex=hex, reg=reg, lat=lat, lon=lon)
     if not td:
         return None
+    return _shape_trail(td, fallback_reg=reg)
+
+
+def _shape_trail(td, fallback_reg=None):
+    """{row, detail} → flown_trail-Rückgabe (geteilt mit by-flightid)."""
+    reg = fallback_reg
     d = td.get("detail") or {}
     trail = d.get("flight_trail_list") or []
     if not trail:
