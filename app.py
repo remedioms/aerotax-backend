@@ -9678,6 +9678,21 @@ def set_crew_note(token):
     return jsonify({'ok': bool(ok), 'ts': now_ts if text else None})
 
 
+@app.route('/api/user/app-open/<token>', methods=['POST'])
+def track_app_open(token):
+    """Foreground-Open-Stempel (2026-07-25): die iOS-App pingt hier beim
+    Aktivwerden (scenePhase .active, client-seitig gedrosselt). Einziger
+    Zweck: ehrliche DAU/WAU — user_profiles.updated_at taugt nicht (wird
+    auch durch Freunde-Views server-seitig gebumpt) und roster_snapshots
+    kommt auch aus dem BGAppRefresh. Eine Row pro (token, Tag) in
+    ax_app_opens, opens zählt Sessions. Fire-and-forget: antwortet immer
+    200, damit ein Analytics-Ausfall nie den App-Start stört."""
+    body = request.get_json(silent=True) or {}
+    build = str(body.get('build') or '').strip()[:32] or None
+    ok, _ = _social_rpc_call('ax_app_open', {'p_token': token, 'p_build': build})
+    return jsonify({'ok': bool(ok)})
+
+
 def _profile_metadata_merge_sb(token, patch):
     """Atomarer metadata-Merge (coalesce(metadata,'{}') || patch) via RPC.
     Returns True wenn der Merge server-seitig eine EXISTIERENDE Row traf
