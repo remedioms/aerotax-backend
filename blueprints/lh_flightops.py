@@ -313,6 +313,33 @@ def _valid_access(user_token):
             return None
         if t.get('access') and time.time() < (t.get('expires_at') or 0):
             return t['access']
+        # CROSS-CONTAINER-GUARD (2. Grant-Verlust Miguels, 2026-07-25 02:54Z):
+        # LH revoziert bei Refresh-Token-REUSE die GANZE Token-Familie — der
+        # In-Process-Lock schützt nicht vorm Backend↔Poll-Container-Paar, und
+        # der Grace-Reload rettet nur das Flag, nicht den Grant. Darum VOR dem
+        # LH-Call einen kurzlebigen Guard (rt-Hash + ts) DURABEL in den
+        # Token-Stand schreiben; sieht ein anderer Prozess einen frischen
+        # Guard für DENSELBEN Refresh-Token, wartet er und übernimmt die
+        # rotierten Tokens des Gewinners, statt den RT doppelt zu verheizen.
+        g = t.get('refresh_guard') or {}
+        if (isinstance(g, dict)
+                and g.get('rt8') == _rt8(t.get('refresh'))
+                and (time.time() - (g.get('ts') or 0)) < _REFRESH_GUARD_SEC):
+            time.sleep(_GUARD_WAIT_SEC)
+            cur = _tokens_load(user_token)
+            if cur.get('needs_relogin'):
+                return None
+            if cur.get('access') and time.time() < (cur.get('expires_at') or 0):
+                return cur['access']
+            if (cur.get('refresh') or '') != (t.get('refresh') or ''):
+                # Gewinner hat rotiert (access nur schon wieder abgelaufen) —
+                # mit DESSEN frischem RT weitermachen, nie mit unserem alten.
+                t = cur
+            # Guard abgelaufen / Refresher gescheitert → selbst versuchen.
+        guard_t = dict(t)
+        guard_t['refresh_guard'] = {'rt8': _rt8(t.get('refresh')),
+                                    'ts': time.time()}
+        _tokens_save(user_token, guard_t)
         nt, err = _refresh(t['refresh'])
         if nt:
             # Rotiert der Server den Refresh-Token, den NEUEN persistieren;
@@ -346,6 +373,16 @@ def _valid_access(user_token):
 # parallelen Race-Gewinner Zeit, seine rotierten Tokens zu persistieren.
 # Modul-Konstante, damit Tests sie auf 0 patchen können.
 _FATAL_GRACE_SEC = 2.0
+
+# Cross-Container-Refresh-Guard: Lebensdauer des durablen „ich refreshe
+# gerade DIESEN RT"-Markers und Wartezeit des Verlierers (Tests patchen auf 0).
+_REFRESH_GUARD_SEC = 15.0
+_GUARD_WAIT_SEC = 4.0
+
+
+def _rt8(rt):
+    """Kurzer, log-sicherer Fingerabdruck eines Refresh-Tokens."""
+    return hashlib.sha256((rt or '').encode()).hexdigest()[:8]
 
 
 def flightops_connected(user_token):

@@ -352,20 +352,24 @@ def test_token_request_classifies_fatal_vs_transient(monkeypatch):
 
 def test_refresh_fatal_marks_relogin_and_pushes_once(monkeypatch):
     import time as _t
-    saved = {}
+    saves = []
     monkeypatch.setattr(fo, '_FATAL_GRACE_SEC', 0)   # kein echtes Warten im Test
     monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
         'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10})
-    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saved.update(t) or True)
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
     monkeypatch.setattr(fo, '_refresh', lambda r: (
         None, {'http': 400, 'oauth': 'invalid_grant', 'fatal': True}))
     pushes = []
     monkeypatch.setattr(fo, '_notify_relogin', lambda tok: pushes.append(tok))
     assert fo._valid_access('AT-U') is None
-    assert saved.get('needs_relogin') is True and 'access' not in saved
+    # Save 1 = Cross-Container-Guard (Tokens unverändert), Save 2 = Flag.
+    assert saves[0]['refresh_guard']['rt8'] == fo._rt8('R')
+    assert saves[0]['access'] == 'OLD' and saves[0]['refresh'] == 'R'
+    flagged = saves[-1]
+    assert flagged.get('needs_relogin') is True and 'access' not in flagged
     assert pushes == ['AT-U']
     # needs_relogin → connected False + kein weiterer Refresh-Versuch
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: dict(saved))
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok: dict(flagged))
     monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
         AssertionError('toter Grant darf nicht weiter refreshen')))
     assert fo.flightops_connected('AT-U') is False
@@ -387,8 +391,14 @@ def test_refresh_fatal_race_loser_does_not_kill_winner(monkeypatch):
         {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999}, # Grace-Reload
     ]
     monkeypatch.setattr(fo, '_tokens_load', lambda tok: states.pop(0))
-    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
-        AssertionError('Race-Verlierer darf den Gewinner-Stand nicht überschreiben')))
+
+    def _save_only_guard(tok, t):
+        # Erlaubt ist NUR der Cross-Container-Guard-Save (Tokens identisch,
+        # kein Flag) — alles andere würde den Gewinner-Stand überschreiben.
+        assert t.get('access') == 'OLD' and t.get('refresh') == 'R'
+        assert not t.get('needs_relogin') and t.get('refresh_guard')
+        return True
+    monkeypatch.setattr(fo, '_tokens_save', _save_only_guard)
     monkeypatch.setattr(fo, '_refresh', lambda r: (
         None, {'http': 401, 'oauth': 'invalid_token', 'fatal': True}))
     monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
@@ -406,7 +416,48 @@ def test_refresh_transient_keeps_tokens(monkeypatch):
     monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
         AssertionError('transient darf keinen Re-Login-Push senden')))
     assert fo._valid_access('AT-U') is None
-    assert saved == []          # Tokens UNANGETASTET → nächster Versuch normal
+    # Einziger Save = Cross-Container-Guard; Tokens selbst UNANGETASTET →
+    # nächster Versuch refresht normal weiter.
+    assert len(saved) == 1
+    assert saved[0]['access'] == 'OLD' and saved[0]['refresh'] == 'R'
+    assert not saved[0].get('needs_relogin')
+    assert saved[0]['refresh_guard']['rt8'] == fo._rt8('R')
+
+
+def test_refresh_guard_loser_adopts_winner_without_lh_call(monkeypatch):
+    """Cross-Container-Guard (2. Grant-Verlust 2026-07-25 02:54Z): Sieht ein
+    Prozess einen FRISCHEN Guard für DENSELBEN Refresh-Token, wartet er und
+    übernimmt die rotierten Tokens des Gewinners — KEIN LH-Call, KEIN Save
+    (sonst würde der stale Stand den Gewinner clobbern)."""
+    import time as _t
+    monkeypatch.setattr(fo, '_GUARD_WAIT_SEC', 0)
+    guarded = {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10,
+               'refresh_guard': {'rt8': fo._rt8('R'), 'ts': _t.time()}}
+    states = [dict(guarded), dict(guarded),                             # vor/im Lock
+              {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999}]
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok: states.pop(0))
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('Guard-Verlierer darf nichts zurückschreiben')))
+    monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
+        AssertionError('Guard-Verlierer darf den RT nicht doppelt verheizen')))
+    assert fo._valid_access('AT-U') == 'NEW'
+
+
+def test_refresh_guard_stale_does_not_block(monkeypatch):
+    """Abgelaufener Guard (Refresher gecrasht o.ä.) darf den Refresh nicht
+    dauerhaft blockieren — nach _REFRESH_GUARD_SEC wird normal refresht."""
+    import time as _t
+    saves = []
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
+        'access': 'OLD', 'refresh': 'R', 'expires_at': 0,
+        'refresh_guard': {'rt8': fo._rt8('R'), 'ts': _t.time() - 9999}})
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
+    monkeypatch.setattr(fo, '_refresh', lambda r: (
+        {'access': 'NEW', 'refresh': 'R2', 'scope': 's', 'expires_at': 9e18}, None))
+    assert fo._valid_access('AT-U') == 'NEW'
+    # frischer Guard geschrieben, dann rotierte Tokens OHNE Guard persistiert
+    assert saves[0]['refresh_guard']['ts'] > _t.time() - 60
+    assert saves[-1]['refresh'] == 'R2' and 'refresh_guard' not in saves[-1]
 
 
 def test_refresh_rotation_persists_new_keeps_old(monkeypatch):
