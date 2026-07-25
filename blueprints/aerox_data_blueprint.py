@@ -6633,6 +6633,51 @@ def _route_history_windowed(app_obj, origin, dest):
     return h if (h or {}).get('ok') else None
 
 
+# ── STALE-WHILE-REVALIDATE fürs Detail-Aggregat (Owner 2026-07-25 „backend
+# was instant lädt statt 5-10sek"): abgelaufener, aber junger Aggregat-Stand
+# wird SOFORT ausgeliefert, während EIN Hintergrund-Thread (Single-Flight pro
+# Key) frisch rechnet und das Memo überschreibt — wiederholte Flug-Öffnungen
+# antworten damit in Millisekunden statt 4-5 s Kalt-Fan-out.
+_DETAIL_STALE_TTL = 20 * 60
+_DETAIL_SWR_INFLIGHT = set()
+_DETAIL_SWR_LOCK = threading.Lock()
+
+
+def _memo_get_stale(key, max_age_s):
+    """Wie _memo_get, aber mit eigenem (längerem) Frische-Fenster."""
+    hit = _LIFECYCLE_MEMO.get(key)
+    if hit and (time.time() - hit[0]) < max_age_s:
+        return dict(hit[1])
+    return None
+
+
+def _detail_swr_refresh(q, is_cs, date_q):
+    key = ('flight_detail', q, '1' if is_cs else '0', date_q or '')
+    with _DETAIL_SWR_LOCK:
+        if key in _DETAIL_SWR_INFLIGHT:
+            return
+        _DETAIL_SWR_INFLIGHT.add(key)
+    from flask import current_app
+    app_obj = current_app._get_current_object()
+
+    def _work():
+        try:
+            path = '/api/ax/flight-detail/%s?fresh=1%s%s' % (
+                urllib.parse.quote(q),
+                '&callsign=1' if is_cs else '',
+                ('&date=' + urllib.parse.quote(date_q)) if date_q else '')
+            _detail_subcall(app_obj, path, ax_flight_detail, q)
+        finally:
+            with _DETAIL_SWR_LOCK:
+                _DETAIL_SWR_INFLIGHT.discard(key)
+            try:
+                from app import _close_current_thread_supabase_client
+                _close_current_thread_supabase_client()
+            except Exception:
+                pass
+    threading.Thread(target=_work, daemon=True, name='detail-swr').start()
+
+
 @aerox_data_bp.route('/api/ax/flight-detail/<query>', methods=['GET'])
 def ax_flight_detail(query):
     """EIN-Call-Aggregat für die Flug-Detailseite (Owner 2026-07-09: „Detailseite lädt
@@ -6662,6 +6707,12 @@ def ax_flight_detail(query):
         cached = _memo_get(memo_key)
         if cached is not None:
             return jsonify(cached)
+        # SWR: junger-aber-abgelaufener Stand → sofort liefern + im
+        # Hintergrund frisch rechnen (s. _detail_swr_refresh oben).
+        stale_hit = _memo_get_stale(memo_key, _DETAIL_STALE_TTL)
+        if stale_hit is not None:
+            _detail_swr_refresh(q, is_cs, date_q)
+            return jsonify(stale_hit)
 
     def _qs(**kw):
         parts = ["%s=%s" % (k, urllib.parse.quote(str(v))) for k, v in kw.items() if v]

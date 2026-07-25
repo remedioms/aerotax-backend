@@ -35340,13 +35340,25 @@ def ax_flight_info(flightno):
                 # Ankunfts-Board → der Flug kommt VON dest_iata, geht NACH board_ap.
                 origin = (bf.get('dest_iata') if arr else board_ap)
                 dest = (board_ap if arr else bf.get('dest_iata'))
+                # RICHTUNGS-SEMANTIK (Owner 2026-07-25, LH1133 „Abflug=Landung
+                # 19:20"): eine ARR-Board-Row trägt ANKUNFTS-Zeiten — die
+                # dep-semantischen Felder sched/esti dürfen daraus NIE befüllt
+                # werden (Bordkarte zeigte sonst die Landung als Abflug); sie
+                # wandern in sched_arr/esti_arr. dest_name der ARR-Row ist zudem
+                # der HERKUNFTS-Name (Barcelona bei BCN→FRA) → weglassen, iOS
+                # löst Städtenamen selbst aus AirportDB.
                 out = {
                     'ok': True, 'found': True, 'flight': fn, 'source': 'live_board',
                     'origin': origin, 'dest': dest,
-                    'dest_name': bf.get('dest_name'), 'airline': bf.get('airline'),
+                    'dest_name': (None if arr else bf.get('dest_name')),
+                    'airline': bf.get('airline'),
                     'gate': bf.get('gate'), 'terminal': bf.get('terminal'),
-                    'status': bf.get('status'), 'sched': bf.get('sched'),
-                    'esti': bf.get('esti'), 'delay_min': bf.get('delay_min'),
+                    'status': bf.get('status'),
+                    'sched': (None if arr else bf.get('sched')),
+                    'esti': (None if arr else bf.get('esti')),
+                    'sched_arr': (bf.get('sched') if arr else None),
+                    'esti_arr': (bf.get('esti') if arr else None),
+                    'delay_min': bf.get('delay_min'),
                     'cancelled': bf.get('cancelled'), 'date': (bf.get('sched') or '')[:10] or None,
                     'reg': b_reg, 'type': b_type,
                     'recent_regs': ([{'reg': b_reg, 'type': b_type,
@@ -35358,9 +35370,15 @@ def ax_flight_info(flightno):
                 # Historie war von einem alten Tag, aber das Live-Board hat den
                 # HEUTIGEN Umlauf → das Board ist die Wahrheit für alle operativen
                 # Felder. Strecke/recent_regs (Identität/Historie) bleiben erhalten.
+                # ARR-Row: Zeiten sind ANKUNFTS-Zeiten → nur sched_arr/esti_arr.
                 out['date'] = (bf.get('sched') or '')[:10] or out.get('date')
-                out['sched'] = bf.get('sched') or out.get('sched')
-                out['esti'] = bf.get('esti')
+                if arr:
+                    out['sched_arr'] = bf.get('sched') or out.get('sched_arr')
+                    out['esti_arr'] = bf.get('esti')
+                    out['esti'] = None
+                else:
+                    out['sched'] = bf.get('sched') or out.get('sched')
+                    out['esti'] = bf.get('esti')
                 out['status'] = bf.get('status')
                 out['delay_min'] = bf.get('delay_min')
                 out['cancelled'] = bf.get('cancelled')
@@ -35384,8 +35402,12 @@ def ax_flight_info(flightno):
                                                'date': (bf.get('sched') or '')[:10]}]
                 if bf.get('gate') and not out.get('gate'):
                     out['gate'] = bf.get('gate')
+                # ARR-Row-esti = Ankunfts-Zeit → esti_arr, nie dep-esti.
                 if bf.get('esti'):
-                    out['esti'] = bf.get('esti')
+                    if arr:
+                        out['esti_arr'] = bf.get('esti')
+                    else:
+                        out['esti'] = bf.get('esti')
 
     # Immer noch stale (Live-Board hatte den heutigen Umlauf nicht — z.B. Flug ist
     # heute schon abgeflogen und aus dem now→+27h-Fenster raus): die operativen
