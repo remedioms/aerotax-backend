@@ -6739,6 +6739,110 @@ def _detail_swr_refresh(q, is_cs, date_q):
     threading.Thread(target=_work, daemon=True, name='detail-swr').start()
 
 
+# ── ROSTER-WARMER (Owner 2026-07-25 „alle LH-Group-Flüge schon immer warm"):
+# Cron-getriggert (poll-tick.sh → :8080, X-Poll-Secret) sammelt er die
+# DISTINCT (Flug, Servicetag) aus ALLEN User-Briefings (heute + morgen) und
+# rechnet jedes kalte Detail-Aggregat vor — via Disk-Spiegel teilen sich alle
+# drei Gunicorn-Worker den warmen Stand, jedes Flug-Öffnen ist damit instant.
+# Single-Flight über flock (3 Worker!), Drossel 1 Flug/s (unter dem
+# 90/min-Rate-Limit des Endpoints), Kappe 500 Flüge.
+_WARM_LOCK_PATH = '/tmp/ax_detail_warm.lock'
+_WARM_MAX_FLIGHTS = 500
+_WARM_SKIP_FRESH_S = 15 * 60
+
+
+def _warm_targets_from_briefings():
+    """DISTINCT (flight_no, service_date) aus allen User-Briefings heute+morgen
+    (dep_iso des Legs bestimmt den Servicetag, sonst der Kalendertag)."""
+    try:
+        import app as _app
+        sb = getattr(_app, 'sb', None)
+        if sb is None:
+            return []
+        today = time.strftime('%Y-%m-%d', time.gmtime())
+        tomorrow = time.strftime('%Y-%m-%d', time.gmtime(time.time() + 86400))
+        rows = (sb.table('user_ical_briefings')
+                .select('datum,raw_event')
+                .gte('datum', today).lte('datum', tomorrow)
+                .limit(6000).execute()).data or []
+    except Exception:
+        return []
+    seen = set()
+    out = []
+    for r in rows:
+        ev = r.get('raw_event') or {}
+        secs = ev.get('ical_sectors') if isinstance(ev, dict) else None
+        for s in (secs or []):
+            fn = str((s or {}).get('flight') or '').replace(' ', '').upper()
+            if len(fn) < 3:
+                continue
+            d = (str((s or {}).get('dep_iso') or '')[:10]
+                 or str(r.get('datum') or '')[:10])
+            key = (fn, d)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+            if len(out) >= _WARM_MAX_FLIGHTS:
+                return out
+    return out
+
+
+@aerox_data_bp.route('/api/internal/warm-flight-details', methods=['POST'])
+def ax_warm_flight_details():
+    """Startet den Warm-Lauf als Daemon-Thread und antwortet sofort (der
+    Lauf selbst dauert je nach Kalt-Anteil Minuten). AUTH wie poll-boards:
+    X-Poll-Secret == ADSB_POLL_SECRET, ohne Secret nur localhost."""
+    from flask import request
+    secret = (os.environ.get('ADSB_POLL_SECRET') or '').strip()
+    if secret:
+        if (request.headers.get('X-Poll-Secret') or '').strip() != secret:
+            return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    elif request.remote_addr not in ('127.0.0.1', '::1', None):
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    targets = _warm_targets_from_briefings()
+    from flask import current_app
+    app_obj = current_app._get_current_object()
+
+    def _work():
+        import fcntl
+        try:
+            lf = open(_WARM_LOCK_PATH, 'w')
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception:
+            return          # ein anderer Worker wärmt bereits
+        warmed = skipped = 0
+        try:
+            for fn, d in targets:
+                mkey = ('flight_detail', fn, '0', d or '')
+                if _detail_memo_get(mkey, _WARM_SKIP_FRESH_S) is not None:
+                    skipped += 1
+                    continue
+                try:
+                    _detail_subcall(app_obj,
+                                    '/api/ax/flight-detail/%s?fresh=1&date=%s'
+                                    % (urllib.parse.quote(fn), d),
+                                    ax_flight_detail, fn)
+                    warmed += 1
+                except Exception:
+                    pass
+                time.sleep(1.0)
+            _log.info('[warm-details] fertig: %d gewärmt, %d übersprungen',
+                      warmed, skipped)
+        finally:
+            try:
+                lf.close()
+            except Exception:
+                pass
+            try:
+                from app import _close_current_thread_supabase_client
+                _close_current_thread_supabase_client()
+            except Exception:
+                pass
+    threading.Thread(target=_work, daemon=True, name='detail-warmer').start()
+    return jsonify({'ok': True, 'targets': len(targets)})
+
+
 @aerox_data_bp.route('/api/ax/flight-detail/<query>', methods=['GET'])
 def ax_flight_detail(query):
     """EIN-Call-Aggregat für die Flug-Detailseite (Owner 2026-07-09: „Detailseite lädt
