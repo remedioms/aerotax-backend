@@ -95,7 +95,15 @@ def test_off_plus_training_day_is_not_klass_off(monkeypatch):
     assert d in days
     assert days[d]['klass'] is None, days[d]['klass']
     assert days[d]['marker'] == 'Off Day · Mandatory Training'
-    assert days[d]['start_time'] == '06:00', days[d]['start_time']
+    # TZ-Kontrakt seit 2026-07-25 (Freunde-Zeiten-Fix): der Fallback liefert
+    # HOMEBASE-LOKALE Wanduhrzeit (Berlin ohne bekannte Homebase), nicht mehr
+    # den rohen UTC-Slice. 06:00Z = 08:00 CEST bzw. 07:00 CET — DST-robust
+    # gegen das echte Testdatum gerechnet.
+    from zoneinfo import ZoneInfo
+    from datetime import datetime, timezone
+    _exp = datetime.fromisoformat(f"{d}T06:00:00+00:00").astimezone(
+        ZoneInfo('Europe/Berlin')).strftime('%H:%M')
+    assert days[d]['start_time'] == _exp, days[d]['start_time']
 
 
 def test_pure_off_day_stays_klass_off(monkeypatch):

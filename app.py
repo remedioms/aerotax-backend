@@ -35351,6 +35351,20 @@ def ax_flight_info(flightno):
             bf = _flight_from_live_board(board_ap, fn)
         except Exception:
             bf = None
+        # TAGES-GUARD (Owner 2026-07-25, Tibor LH690 „Boarding obwohl er erst
+        # morgen fliegt"): das Live-Board zeigt IMMER den heutigen Umlauf einer
+        # täglichen Flugnummer. Fragt der Client explizit einen ANDEREN Tag an
+        # (?date=morgen, Vorabend-Bordkarte), darf die heutige Row nicht als
+        # Antwort durchgehen — sonst erbt der Morgen-Flug Boarding/Gate/Zeiten
+        # von heute. Board-sched-Datum (falls vorhanden) muss date_param
+        # matchen; ohne Board-Datum zählt der lokale Kalendertag am Airport.
+        if bf is not None and date_param:
+            _bf_date = (bf.get('sched') or '')[:10]
+            if _bf_date:
+                if _bf_date != date_param:
+                    bf = None
+            elif today_local and date_param != today_local:
+                bf = None
         if bf is not None:
             arr = bf.get('_arr')
             b_reg = (bf.get('reg') or '').strip().upper() or None
