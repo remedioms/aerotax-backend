@@ -788,6 +788,12 @@ def duty_events_to_ics(resp):
                 summary = f'Off Day ({det})' if det else 'Off Day'
             elif cat in ('vac',):
                 summary = 'Urlaub'
+            elif cat in ('absence',):
+                # Live-Shape (Remo 2026-07-25): Urlaub kommt als
+                # eventCategory=ABSENCE, eventDetails='U1' — der nackte Code
+                # fiel durch und iOS klassifizierte den Urlaubstag als Dienst.
+                # myTime-Prosa 'Absence (U1)' → iOS mappt ABSENCE auf Urlaub.
+                summary = f'Absence ({det})' if det else 'Absence'
             elif cat in ('res', 'frs'):
                 summary = f'Standby {frm}' if len(frm) == 3 else 'Standby'
             elif etype == 'hotel' or cat == 'hotel':

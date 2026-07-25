@@ -142,6 +142,10 @@ DUTY_TIM = {
             {"eventType": "GROUNDEVENT", "eventCategory": "OFFDUTY",
              "eventDetails": "FREE", "wholeDay": True,
              "startLocation": "MUC", "endLocation": "MUC"}]},
+        {"day": "2026-07-28T00:00:00Z", "events": [
+            {"eventType": "GROUNDEVENT", "eventCategory": "ABSENCE",
+             "eventDetails": "U1", "wholeDay": True,
+             "startLocation": "FRA", "endLocation": "FRA"}]},
     ],
 }
 
@@ -160,6 +164,9 @@ def test_duty_events_to_ics_deadhead_and_locations():
     assert 'DTEND;VALUE=DATE:20260727' in ics
     # OFFDUTY/FREE → myTime-Prosa.
     assert 'Off Day (FREE)' in ics
+    # ABSENCE/U1 (Urlaub) → 'Absence (U1)' — iOS mappt ABSENCE auf Urlaub;
+    # der nackte Code 'U1' machte den Urlaubstag sonst zum Dienst (Remo).
+    assert 'Absence (U1)' in ics
 
 
 def test_duty_events_to_ics_day_gets_routing_and_layover_ort():
