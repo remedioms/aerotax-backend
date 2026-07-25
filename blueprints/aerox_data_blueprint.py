@@ -537,6 +537,12 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
         'track': r.get('track'), 'gs': r.get('gs_kt'), 'alt': r.get('alt_ft'),
         'on_ground': bool(r.get('on_ground')),
         'source': 'aircraft_live', 'seen_ts': r.get('seen_ts'),
+        # ECHTER Funkname aus dem Harvester-Snapshot (FR24-Audit 2026-07-25):
+        # LH-Callsigns sind alphanumerisch (LH1131 = DLH08F) — iOS kann ihn
+        # NICHT aus der Flugnummer ableiten und lief mit „DLH1131" bei
+        # adsb.lol ins Leere. Mit durchgereichtem Callsign pollt der Client
+        # die echte Kennung.
+        'callsign': (r.get('callsign') or '').strip().upper() or None,
     })
     reg_disp = (r.get('reg_display') or r.get('reg') or '').strip().upper() or None
     ac_type = (r.get('ac_type') or '').strip().upper() or None
@@ -5991,10 +5997,19 @@ def ax_flown_track():
         try:
             sb = _sb()
             if sb is not None:
-                fr = (sb.table('flights').select('tail')
+                # RED-EYE-TOLERANZ (FR24-Audit 2026-07-25): service_date ist
+                # das LOKALE Abflugdatum — ein Übernacht-Flug, der JETZT fliegt,
+                # hängt am gestrigen service_date (EW6807/LX139-Befund: „Row
+                # fehlt" war in Wahrheit der Datums-Anker). Heute+gestern
+                # abfragen, jüngstes gewinnt; die Frische-Gates unten schützen
+                # weiter vor fremden alten Rotationen.
+                _sd = date or time.strftime('%Y-%m-%d', time.gmtime())
+                _sd_prev = time.strftime(
+                    '%Y-%m-%d', time.gmtime(time.time() - 86400)) if not date else (
+                    _sd)  # explizites ?date bleibt exakt (Historien-Ansicht)
+                fr = (sb.table('flights').select('tail,service_date')
                       .eq('op_flight_no', flight_no)
-                      .eq('service_date',
-                          date or time.strftime('%Y-%m-%d', time.gmtime()))
+                      .in_('service_date', sorted({_sd, _sd_prev}))
                       .order('service_date', desc=True).limit(3).execute()
                       ).data or []
                 tail = next((r.get('tail') for r in fr if r.get('tail')), None)
