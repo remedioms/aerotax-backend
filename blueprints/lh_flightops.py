@@ -316,15 +316,22 @@ def _valid_access(user_token):
         # CROSS-CONTAINER-GUARD (2. Grant-Verlust Miguels, 2026-07-25 02:54Z):
         # LH revoziert bei Refresh-Token-REUSE die GANZE Token-Familie — der
         # In-Process-Lock schützt nicht vorm Backend↔Poll-Container-Paar, und
-        # der Grace-Reload rettet nur das Flag, nicht den Grant. Darum VOR dem
-        # LH-Call einen kurzlebigen Guard (rt-Hash + ts) DURABEL in den
-        # Token-Stand schreiben; sieht ein anderer Prozess einen frischen
-        # Guard für DENSELBEN Refresh-Token, wartet er und übernimmt die
-        # rotierten Tokens des Gewinners, statt den RT doppelt zu verheizen.
-        g = t.get('refresh_guard') or {}
-        if (isinstance(g, dict)
-                and g.get('rt8') == _rt8(t.get('refresh'))
-                and (time.time() - (g.get('ts') or 0)) < _REFRESH_GUARD_SEC):
+        # der Grace-Reload rettet nur das Flag, nicht den Grant. Darum holt
+        # sich der Refresher VOR dem LH-Call ein Claim für DIESEN Refresh-
+        # Token: primär ATOMAR via RPC flightops_claim_refresh (Row-Lock im
+        # UPDATE — genau ein Gewinner pro RT), Fallback ohne RPC = Soft-Guard
+        # (rt-Hash + ts durabel speichern, ~100ms-Restfenster). Der Verlierer
+        # wartet und übernimmt die rotierten Tokens des Gewinners, statt den
+        # RT doppelt zu verheizen — und schreibt dabei NIE zurück.
+        claimed = _claim_refresh_sb(user_token, t.get('refresh'))
+        if claimed is None:
+            g = t.get('refresh_guard') or {}
+            lost = (isinstance(g, dict)
+                    and g.get('rt8') == _rt8(t.get('refresh'))
+                    and (time.time() - (g.get('ts') or 0)) < _REFRESH_GUARD_SEC)
+        else:
+            lost = not claimed
+        if lost:
             time.sleep(_GUARD_WAIT_SEC)
             cur = _tokens_load(user_token)
             if cur.get('needs_relogin'):
@@ -335,11 +342,17 @@ def _valid_access(user_token):
                 # Gewinner hat rotiert (access nur schon wieder abgelaufen) —
                 # mit DESSEN frischem RT weitermachen, nie mit unserem alten.
                 t = cur
-            # Guard abgelaufen / Refresher gescheitert → selbst versuchen.
-        guard_t = dict(t)
-        guard_t['refresh_guard'] = {'rt8': _rt8(t.get('refresh')),
-                                    'ts': time.time()}
-        _tokens_save(user_token, guard_t)
+            # Guard abgelaufen / Refresher gescheitert → selbst versuchen,
+            # aber wieder nur mit gewonnenem Claim.
+            claimed = _claim_refresh_sb(user_token, t.get('refresh'))
+            if claimed is False:
+                return None   # immer noch fremdes Claim — nächster Request erbt
+        if claimed is None:
+            # RPC nicht verfügbar → Soft-Guard best-effort persistieren.
+            guard_t = dict(t)
+            guard_t['refresh_guard'] = {'rt8': _rt8(t.get('refresh')),
+                                        'ts': time.time()}
+            _tokens_save(user_token, guard_t)
         nt, err = _refresh(t['refresh'])
         if nt:
             # Rotiert der Server den Refresh-Token, den NEUEN persistieren;
@@ -383,6 +396,31 @@ _GUARD_WAIT_SEC = 4.0
 def _rt8(rt):
     """Kurzer, log-sicherer Fingerabdruck eines Refresh-Tokens."""
     return hashlib.sha256((rt or '').encode()).hexdigest()[:8]
+
+
+def _claim_refresh_sb(user_token, rt):
+    """Atomares Cross-Container-Claim via RPC flightops_claim_refresh.
+    True = Zuschlag gewonnen (Guard server-seitig gesetzt), False = ein
+    anderer Prozess refresht DIESEN RT gerade, None = RPC nicht verfügbar
+    (Caller fällt auf den Soft-Guard zurück)."""
+    if not rt:
+        return None
+    try:
+        import app as _app
+        ok, data = _app._social_rpc_call('flightops_claim_refresh', {
+            'p_token': user_token, 'p_refresh': rt, 'p_rt8': _rt8(rt),
+            'p_ttl': _REFRESH_GUARD_SEC})
+        if not ok:
+            return None
+        if isinstance(data, list) and data:
+            data = (next(iter(data[0].values()), None)
+                    if isinstance(data[0], dict) else data[0])
+        if isinstance(data, bool):
+            return data
+        return None
+    except Exception as e:
+        log.warning('[lh_flightops] claim_rpc_fail: %s', type(e).__name__)
+        return None
 
 
 def flightops_connected(user_token):

@@ -443,6 +443,57 @@ def test_refresh_guard_loser_adopts_winner_without_lh_call(monkeypatch):
     assert fo._valid_access('AT-U') == 'NEW'
 
 
+def test_refresh_claim_rpc_loser_adopts_winner(monkeypatch):
+    """Atomares RPC-Claim: False = anderer Prozess refresht DIESEN RT gerade
+    → warten, neu laden, Gewinner-Tokens übernehmen. KEIN LH-Call, KEIN
+    Save — auch ganz OHNE lokalen Soft-Guard im geladenen Stand."""
+    import time as _t
+    monkeypatch.setattr(fo, '_GUARD_WAIT_SEC', 0)
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: False)
+    old = {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10}
+    states = [dict(old), dict(old),
+              {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999}]
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok: states.pop(0))
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('Claim-Verlierer darf nichts zurückschreiben')))
+    monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
+        AssertionError('Claim-Verlierer darf den RT nicht doppelt verheizen')))
+    assert fo._valid_access('AT-U') == 'NEW'
+
+
+def test_refresh_claim_rpc_winner_skips_guard_save(monkeypatch):
+    """Claim True = Guard wurde server-seitig atomar gesetzt → kein
+    zusätzlicher Soft-Guard-Save; einziger Save sind die rotierten Tokens."""
+    saves = []
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: True)
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
+        'access': 'OLD', 'refresh': 'R', 'expires_at': 0})
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
+    monkeypatch.setattr(fo, '_refresh', lambda r: (
+        {'access': 'NEW', 'refresh': 'R2', 'scope': 's', 'expires_at': 9e18}, None))
+    assert fo._valid_access('AT-U') == 'NEW'
+    assert len(saves) == 1 and saves[0]['refresh'] == 'R2'
+    assert 'refresh_guard' not in saves[0]
+
+
+def test_refresh_claim_rpc_still_foreign_gives_up(monkeypatch):
+    """Nach Warten+Reload ist der RT unverändert und das Claim IMMER NOCH
+    fremd → aufgeben (None) statt busy-loopen oder LH anfassen."""
+    import time as _t
+    monkeypatch.setattr(fo, '_GUARD_WAIT_SEC', 0)
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: False)
+    old = {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10}
+    states = [dict(old), dict(old), dict(old)]
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok: states.pop(0))
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('kein Save ohne Claim')))
+    monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
+        AssertionError('kein LH-Call ohne Claim')))
+    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
+        AssertionError('kein Push ohne Claim')))
+    assert fo._valid_access('AT-U') is None
+
+
 def test_refresh_guard_stale_does_not_block(monkeypatch):
     """Abgelaufener Guard (Refresher gecrasht o.ä.) darf den Refresh nicht
     dauerhaft blockieren — nach _REFRESH_GUARD_SEC wird normal refresht."""
